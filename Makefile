@@ -2270,11 +2270,11 @@ install: all installdirs
 	  done; \
 	fi
 	$(POST_INSTALL)
-	$(DESTDIR)$(bindir)/paslangc -o /tmp/paslang-install-hello $(srcdir)/testdata/hello.paslang
-	/tmp/paslang-install-hello
-	rm -f /tmp/paslang-install-hello
-	$(DESTDIR)$(bindir)/paslangc -target arm64 -o /tmp/paslang-install-a64 $(srcdir)/testdata/heapspan.paslang
-	rm -f /tmp/paslang-install-a64
+	$(DESTDIR)$(bindir)/paslangc -o $(BUILDDIR)/paslang-install-hello $(srcdir)/testdata/hello.paslang
+	$(BUILDDIR)/paslang-install-hello
+	rm -f $(BUILDDIR)/paslang-install-hello
+	$(DESTDIR)$(bindir)/paslangc -target arm64 -o $(BUILDDIR)/paslang-install-a64 $(srcdir)/testdata/heapspan.paslang
+	rm -f $(BUILDDIR)/paslang-install-a64
 
 install-strip:
 	$(MAKE) INSTALL_PROGRAM='$(INSTALL_PROGRAM) -s' install
@@ -2338,12 +2338,12 @@ installdirs:
 	mkdir -p $(DESTDIR)$(bindir) $(DESTDIR)$(libdir)/paslang $(DESTDIR)$(libdir)/paslang/aarch64
 
 installcheck:
-	$(DESTDIR)$(bindir)/paslangc -o /tmp/paslang-installcheck $(srcdir)/testdata/hello.paslang
-	/tmp/paslang-installcheck
-	rm -f /tmp/paslang-installcheck
-	$(DESTDIR)$(bindir)/paslangc -o /tmp/paslang-installcheck-who $(srcdir)/examples/pasroutines/who.paslang
-	/tmp/paslang-installcheck-who
-	rm -f /tmp/paslang-installcheck-who
+	$(DESTDIR)$(bindir)/paslangc -o $(BUILDDIR)/paslang-installcheck $(srcdir)/testdata/hello.paslang
+	$(BUILDDIR)/paslang-installcheck
+	rm -f $(BUILDDIR)/paslang-installcheck
+	$(DESTDIR)$(bindir)/paslangc -o $(BUILDDIR)/paslang-installcheck-who $(srcdir)/examples/pasroutines/who.paslang
+	$(BUILDDIR)/paslang-installcheck-who
+	rm -f $(BUILDDIR)/paslang-installcheck-who
 
 mostlyclean:
 
