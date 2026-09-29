@@ -1,0 +1,361 @@
+{ A terminal server and its client (P114): a line protocol over TCP,
+  one routine per session, the sessions in a map guarded by a mutex,
+  and say broadcasts to every other session through its channel, so a
+  session's writer is one routine and no two write at once.
+
+    termd [port]            serve (2323 by default) until killed
+    termd -unix path        serve on a Unix-domain socket at path
+                            (@name for an abstract one) and the client
+                            connects with -connect path
+    termd -connect host port   a client: your lines go up, its answers
+                            come down, until quit, an empty line or
+                            the end of the input
+    termd -selftest [n]     n sessions (2000 by default) run the
+                            commands and check every answer
+
+  The commands: help, name <yours>, who, echo <text>, say <text>,
+  count, quit. }
+program termd;
+
+uses pasnet, paslib;
+
+type
+  PSession = ^TSession;
+  TSession = record
+    Fd: Integer;
+    Name: string;
+    Out: chan of string;      { lines to write, one writer routine; a
+                                line of one LF alone tells it to close }
+  end;
+
+var
+  sessions: map[Integer] of PSession;
+  guard: Mutex;
+  nextId, quitCount, bad: Integer;
+  done: WaitGroup;
+
+{ The writer of a session: what the channel brings goes to the socket. }
+procedure Writer(S: PSession);
+var
+  line: string;
+begin
+  while True do
+  begin
+    line := Recv(S^.Out);
+    if line = #10 then          { no line holds an LF: the end }
+      Break;
+    TcpWrite(S^.Fd, line + #10);
+  end;
+  TcpClose(S^.Fd);
+end;
+
+procedure Broadcast(From: PSession; const Text: string);
+var
+  id: Integer;
+  s: PSession;
+begin
+  guard.Lock;
+  for id, s in sessions do
+    if s <> From then
+      Send(s^.Out, '[' + From^.Name + '] ' + Text);
+  guard.Unlock;
+end;
+
+function Who: string;
+var
+  id: Integer;
+  s: PSession;
+begin
+  Result := '';
+  guard.Lock;
+  for id, s in sessions do
+    Result := Result + s^.Name + ' ';
+  guard.Unlock;
+end;
+
+procedure Session(Fd: Integer);
+var
+  s: PSession;
+  buf, line, cmd, arg: string;
+  i, id: Integer;
+begin
+  New(s);
+  s^.Fd := Fd;
+  s^.Out := MakeChan(64);
+  guard.Lock;
+  nextId := nextId + 1;
+  id := nextId;
+  s^.Name := 'guest' + IntToStr(id);
+  sessions[id] := s;
+  guard.Unlock;
+  pas Writer(s);
+  Send(s^.Out, 'welcome ' + s^.Name + ', type help');
+  buf := '';
+  while TcpReadLine(Fd, buf, line) do
+  begin
+    i := 1;
+    while (i <= Length(line)) and (line[i] <> ' ') do
+      i := i + 1;
+    cmd := Copy(line, 1, i - 1);
+    arg := Copy(line, i + 1, Length(line) - i);
+    if cmd = 'help' then
+      Send(s^.Out, 'help name who echo say count quit')
+    else if cmd = 'name' then
+    begin
+      if arg <> '' then
+      begin
+        guard.Lock;
+        s^.Name := arg;
+        guard.Unlock;
+      end;
+      Send(s^.Out, 'you are ' + s^.Name);
+    end
+    else if cmd = 'who' then
+      Send(s^.Out, Who)
+    else if cmd = 'echo' then
+      Send(s^.Out, arg)
+    else if cmd = 'say' then
+    begin
+      Broadcast(s, arg);
+      Send(s^.Out, 'said');
+    end
+    else if cmd = 'count' then
+    begin
+      guard.Lock;
+      Send(s^.Out, IntToStr(Length(sessions)));
+      guard.Unlock;
+    end
+    else if cmd = 'quit' then
+    begin
+      { the session is over before bye goes out, so a client that has
+        read bye finds the count updated }
+      guard.Lock;
+      Delete(sessions, id);
+      quitCount := quitCount + 1;
+      guard.Unlock;
+      Send(s^.Out, 'bye');
+      Send(s^.Out, #10);
+      Exit;
+    end
+    else
+      Send(s^.Out, 'what? ' + cmd);
+  end;
+  { the peer went without quit: not counted as one }
+  guard.Lock;
+  Delete(sessions, id);
+  guard.Unlock;
+  Send(s^.Out, #10);        { the writer closes the socket }
+end;
+
+procedure Listen(L: Integer);
+var
+  c: Integer;
+begin
+  while True do
+  begin
+    c := TcpAccept(L);
+    if c < 0 then
+      Break;
+    pas Session(c);
+  end;
+end;
+
+function Expect(C: Integer; var Buf: string; const Cmd, Want: string): Boolean;
+var
+  line: string;
+begin
+  Result := False;
+  if TcpWrite(C, Cmd + #10) < 0 then
+    Exit;
+  if not TcpReadLine(C, Buf, line) then
+    Exit;
+  Result := line = Want;
+end;
+
+{ A connection that has said welcome, or -1: the greeting is read with
+  a deadline and a new connection tried when it does not come. A burst
+  of connections past the kernel's SYN backlog is answered with SYN
+  cookies, and one whose last ACK meets a full accept queue is dropped
+  with nothing kept to retry it: the client holds a connection the
+  server never had, and where the server speaks first both would wait
+  for ever. }
+function Greeted(Port: Integer; var Buf: string): Integer;
+var
+  k, c: Integer;
+  line: string;
+begin
+  Result := -1;
+  for k := 1 to 5 do
+  begin
+    c := TcpConnectTo('127.0.0.1', Port);
+    if c >= 0 then
+    begin
+      Buf := TcpReadDeadline(c, 512, 3000);
+      if (Buf <> '') and TcpReadLine(c, Buf, line) and (Copy(line, 1, 8) = 'welcome ') then
+      begin
+        Result := c;
+        Exit;
+      end;
+      TcpClose(c);
+    end;
+  end;
+end;
+
+{ A client of the self-test: the commands, every answer checked. }
+procedure Client(Port, Id: Integer);
+var
+  c: Integer;
+  buf: string;
+  ok: Boolean;
+begin
+  buf := '';
+  c := Greeted(Port, buf);
+  if c < 0 then
+  begin
+    AtomicAdd(@bad, 1);
+    done.Done;
+    Exit;
+  end;
+  ok := Expect(c, buf, 'name user' + IntToStr(Id), 'you are user' + IntToStr(Id));
+  ok := ok and Expect(c, buf, 'echo hello ' + IntToStr(Id), 'hello ' + IntToStr(Id));
+  ok := ok and Expect(c, buf, 'nothing', 'what? nothing');
+  ok := ok and Expect(c, buf, 'quit', 'bye');
+  if not ok then
+    AtomicAdd(@bad, 1);
+  TcpClose(c);
+  done.Done;
+end;
+
+procedure SelfTest(N: Integer);
+var
+  l, i: Integer;
+begin
+  RaiseFdLimit;
+  New(sessions);
+  l := TcpListen(0);
+  if l < 0 then
+  begin
+    WriteLn('termd: cannot listen');
+    Halt(1);
+  end;
+  pas Listen(l);
+  done.Add(N);
+  for i := 1 to N do
+    pas Client(TcpPort(l), i);
+  done.Wait;
+  WriteLn(N, ' sessions, ', quitCount, ' quit, ', bad, ' bad');
+  if (quitCount <> N) or (bad <> 0) then
+    Halt(1);
+  Halt(0);                { the server routine parks for ever: end without waiting for it }
+end;
+
+{ The client: stdin up, the answers down, in two routines. }
+procedure Down(C: Integer);
+var
+  buf, line: string;
+begin
+  buf := '';
+  while TcpReadLine(C, buf, line) do
+    WriteLn(line);
+  done.Done;
+end;
+
+procedure Connect(const Host: string; Port: Integer);
+var
+  c: Integer;
+  line: string;
+begin
+  if (Host <> '') and ((Host[1] = '/') or (Host[1] = '@')) then
+    c := UnixConnect(Host)          { a Unix-domain socket: the path alone }
+  else
+    c := TcpConnectTo(Host, Port);
+  if c < 0 then
+  begin
+    WriteLn('termd: cannot connect to ', Host, ':', Port);
+    Halt(1);
+  end;
+  done.Add(1);
+  pas Down(c);
+  while True do
+  begin
+    ReadLn(line);
+    if line = '' then             { an empty line, or the end of the input }
+      line := 'quit';
+    if TcpWrite(c, line + #10) < 0 then
+      Break;
+    if line = 'quit' then
+      Break;
+  end;
+  done.Wait;
+  TcpClose(c);
+end;
+
+function StrToIntDef(const S: string; Def: Integer): Integer;
+var
+  v, i: Integer;
+begin
+  v := 0;
+  if S = '' then
+  begin
+    Result := Def;
+    Exit;
+  end;
+  for i := 1 to Length(S) do
+  begin
+    if (S[i] < '0') or (S[i] > '9') then
+    begin
+      Result := Def;
+      Exit;
+    end;
+    v := v * 10 + Ord(S[i]) - 48;
+  end;
+  Result := v;
+end;
+
+var
+  port, l: Integer;
+begin
+  if (ParamCount >= 1) and (ParamStr(1) = '-selftest') then
+  begin
+    if ParamCount >= 2 then
+      SelfTest(StrToIntDef(ParamStr(2), 2000))
+    else
+      SelfTest(2000);
+    Exit;
+  end;
+  if (ParamCount >= 2) and (ParamStr(1) = '-connect') then
+  begin
+    if ParamCount >= 3 then
+      Connect(ParamStr(2), StrToIntDef(ParamStr(3), 2323))
+    else
+      Connect(ParamStr(2), 2323);
+    Exit;
+  end;
+  if (ParamCount >= 2) and (ParamStr(1) = '-unix') then
+  begin
+    New(sessions);
+    RaiseFdLimit;
+    l := UnixListen(ParamStr(2));
+    if l < 0 then
+    begin
+      WriteLn('termd: cannot listen at ', ParamStr(2));
+      Halt(1);
+    end;
+    WriteLn('termd: listening at ', ParamStr(2), '; termd -connect ', ParamStr(2));
+    Listen(l);
+    Exit;
+  end;
+  New(sessions);
+  port := 2323;
+  if ParamCount >= 1 then
+    port := StrToIntDef(ParamStr(1), 2323);
+  RaiseFdLimit;
+  l := TcpListenAt('', port, 1024);
+  if l < 0 then
+  begin
+    WriteLn('termd: cannot listen on port ', port);
+    Halt(1);
+  end;
+  WriteLn('termd: listening on port ', TcpPort(l), '; termd -connect 127.0.0.1 ', TcpPort(l));
+  Listen(l);
+end.

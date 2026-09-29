@@ -1,0 +1,871 @@
+{$mode objfpc}{$H+}
+
+{ Bootstrap helpers for paslangc. All ours: strings, files, processes. }
+unit paslib;
+
+interface
+
+{ The source being compiled, which Die names after the message (1.0.90):
+  in a build of many units 'at 57:19' said where but not in which file. }
+var
+  DieWhere: string;
+
+procedure Die(const Msg: string);
+function ToLower(const S: string): string;
+function IntToStr(N: Int64): string;
+function StrToInt64(const S: string; out V: Int64): Boolean;
+function IntToHex2(B: Byte): string;
+function ChangeExt(const Path, Ext: string): string;
+function BaseName(const Path: string): string;
+function DirName(const Path: string): string;
+function JoinPath(const A, B: string): string;
+function HashHex(const S: string): string;
+function HasSuffix(const S, Suf: string): Boolean;
+function ReadFile(const Path: string; out Data: string): Boolean;
+function ReadPrefix(const Path: string; MaxN: Int64; out Data: string): Boolean;
+function WriteFile(const Path, Data: string): Boolean;
+function FileExists(const Path: string): Boolean;
+function EnsureDir(const Path: string): Boolean;
+function CopyFile(const Src, Dst: string): Boolean;
+function LookPath(const Exe: string): string;
+function Run(const Exe: string; const Args: array of string): LongInt;
+function RunCapture(const Exe: string; const Args: array of string; out Output: string): LongInt;
+function GetEnv(const Name: string): string;
+function ReadLink(const Path: string; out Target: string): Boolean;
+function ListDir(const Path: string): string;
+function FileOpen(const Path: string): Int64;
+function FileCreate(const Path: string): Int64;
+function FileAppend(const Path: string): Int64;
+function FileEdit(const Path: string): Int64;
+function FileRead(Fd: Int64; MaxN: Int64): string;
+function FileWrite(Fd: Int64; const Data: string): Int64;
+function FileSeek(Fd, Offset, Whence: Int64): Int64;
+function FileTell(Fd: Int64): Int64;
+function FileEnd(Fd: Int64): Int64;
+procedure FileClose(Fd: Int64);
+function FileSize(const Path: string): Int64;
+
+implementation
+
+uses
+  paslinux;
+
+{$WARN 4055 OFF}
+
+procedure Die(const Msg: string);
+begin
+  if DieWhere <> '' then
+    WriteLn(ErrOutput, 'paslangc: ', Msg, ' in ', DieWhere)
+  else
+    WriteLn(ErrOutput, 'paslangc: ', Msg);
+  Halt(1);
+end;
+
+function ToLower(const S: string): string;
+var
+  i: SizeInt;
+  c: Char;
+begin
+  Result := '';
+  SetLength(Result, Length(S));
+  for i := 1 to Length(S) do
+  begin
+    c := S[i];
+    if (c >= 'A') and (c <= 'Z') then
+      Result[i] := Char(Ord(c) + 32)
+    else
+      Result[i] := c;
+  end;
+end;
+
+const
+  { The hundred digit pairs, 00 to 99, for IntToStr. }
+  DigitPairs = '00010203040506070809101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899';
+
+{ Two digits a step from the table of pairs, one division by 100 each
+  (a multiply since P94), into a buffer, and one allocation at the end,
+  as Go's strconv.formatBits. The value is kept at or below zero, so
+  Low(Int64), which has no positive twin, comes out whole; the old
+  version negated it, overflowed and printed a lone minus sign (P94). }
+{ The digits go through pointers, b into buf and dp into DigitPairs:
+  every index here is in range by construction (i from 24 down, at most
+  19 digits and a sign; r below 100), and the checks every index has
+  since P87 cost b2str a tenth of its time, one compare for each byte. }
+function IntToStr(N: Int64): string;
+var
+  buf: array[0..23] of Char;
+  b, dp: PChar;
+  i, n2: LongInt;
+  q, r, t: Int64;
+begin
+  b := @buf[0];
+  dp := @DigitPairs[1];
+  if N > 0 then
+    q := -N
+  else
+    q := N;
+  i := 24;
+  while q <= -100 do
+  begin
+    t := q div 100;
+    r := t * 100 - q;
+    q := t;
+    i := i - 2;
+    b[i] := dp[r * 2];
+    b[i + 1] := dp[r * 2 + 1];
+  end;
+  r := -q;
+  if r >= 10 then
+  begin
+    i := i - 2;
+    b[i] := dp[r * 2];
+    b[i + 1] := dp[r * 2 + 1];
+  end
+  else
+  begin
+    i := i - 1;
+    b[i] := Char(Ord('0') + r);
+  end;
+  if N < 0 then
+  begin
+    i := i - 1;
+    b[i] := '-';
+  end;
+  n2 := 24 - i;
+  Result := '';
+  SetLength(Result, n2);
+  Move(b[i], Result[1], n2);
+end;
+
+function StrToInt64(const S: string; out V: Int64): Boolean;
+var
+  i: SizeInt;
+  neg: Boolean;
+  d: LongInt;
+  acc: Int64;
+begin
+  Result := False;
+  V := 0;
+  if Length(S) = 0 then
+    Exit;
+  i := 1;
+  neg := False;
+  if S[1] = '-' then
+  begin
+    neg := True;
+    i := 2;
+    if Length(S) < 2 then
+      Exit;
+  end;
+  acc := 0;
+  while i <= Length(S) do
+  begin
+    d := Ord(S[i]) - Ord('0');
+    if (d < 0) or (d > 9) then
+      Exit;
+    acc := acc * 10 + d;
+    Inc(i);
+  end;
+  if neg then
+    V := -acc
+  else
+    V := acc;
+  Result := True;
+end;
+
+function IntToHex2(B: Byte): string;
+var
+  hi, lo: Integer;
+  a, c: Char;
+begin
+  hi := (B shr 4) and 15;
+  lo := B and 15;
+  if hi < 10 then
+    a := Char(48 + hi)
+  else
+    a := Char(65 + hi - 10);
+  if lo < 10 then
+    c := Char(48 + lo)
+  else
+    c := Char(65 + lo - 10);
+  Result := '' + a + c;
+end;
+
+function HasSuffix(const S, Suf: string): Boolean;
+var
+  n, m: SizeInt;
+begin
+  n := Length(S);
+  m := Length(Suf);
+  if m > n then
+  begin
+    Result := False;
+    Exit;
+  end;
+  Result := Copy(S, n - m + 1, m) = Suf;
+end;
+
+function BaseName(const Path: string): string;
+var
+  i, slash: SizeInt;
+begin
+  slash := 0;
+  for i := Length(Path) downto 1 do
+    if Path[i] = '/' then
+    begin
+      slash := i;
+      Break;
+    end;
+  Result := Copy(Path, slash + 1, Length(Path) - slash);
+end;
+
+function DirName(const Path: string): string;
+var
+  i, slash: SizeInt;
+begin
+  slash := 0;
+  for i := Length(Path) downto 1 do
+    if Path[i] = '/' then
+    begin
+      slash := i;
+      Break;
+    end;
+  if slash <= 1 then
+    Result := '.'
+  else
+    Result := Copy(Path, 1, slash - 1);
+end;
+
+function JoinPath(const A, B: string): string;
+begin
+  if A = '' then
+    Result := B
+  else if A[Length(A)] = '/' then
+    Result := A + B
+  else
+    Result := A + '/' + B;
+end;
+
+function HashHex(const S: string): string;
+const
+  Hx: array[0..15] of Char = '0123456789abcdef';
+var
+  hv: QWord;
+  i: SizeInt;
+begin
+  hv := 5381;
+  for i := 1 to Length(S) do
+    hv := ((hv shl 5) + hv + Ord(S[i])) and $FFFFFFFF;
+  Result := '';
+  SetLength(Result, 8);
+  for i := 8 downto 1 do
+  begin
+    Result[i] := Hx[hv and 15];
+    hv := hv shr 4;
+  end;
+end;
+
+function ChangeExt(const Path, Ext: string): string;
+var
+  i, dot: SizeInt;
+begin
+  dot := 0;
+  for i := Length(Path) downto 1 do
+  begin
+    if Path[i] = '/' then
+      Break;
+    if Path[i] = '.' then
+    begin
+      dot := i;
+      Break;
+    end;
+  end;
+  if dot = 0 then
+    Result := Path + Ext
+  else
+    Result := Copy(Path, 1, dot - 1) + Ext;
+end;
+
+function CString(const S: string): PChar;
+var
+  n: SizeInt;
+begin
+  n := Length(S);
+  GetMem(Result, n + 1);
+  if n > 0 then
+    Move(S[1], Result^, n);
+  Result[n] := #0;
+end;
+
+function EnsureDir(const Path: string): Boolean;
+var
+  p: PChar;
+  r: Int64;
+begin
+  p := CString(Path);
+  r := OsMkdir(Int64(p), 493);
+  FreeMem(p);
+  Result := (r = 0) or (r = -17);
+end;
+
+function FileExists(const Path: string): Boolean;
+var
+  p: PChar;
+  r: Int64;
+begin
+  p := CString(Path);
+  r := OsAccess(Int64(p), 0);
+  FreeMem(p);
+  Result := r = 0;
+end;
+
+function ReadFile(const Path: string; out Data: string): Boolean;
+var
+  p: PChar;
+  fd, n: Int64;
+  buf: array[0..4095] of Char;
+  total: string;
+begin
+  Result := False;
+  Data := '';
+  p := CString(Path);
+  fd := OsOpen(Int64(p), ORdonly, 0);
+  FreeMem(p);
+  if fd < 0 then
+    Exit;
+  total := '';
+  repeat
+    n := OsRead(fd, Int64(@buf[0]), SizeOf(buf));
+    if n < 0 then
+    begin
+      OsClose(fd);
+      Exit;
+    end;
+    if n = 0 then
+      Break;
+    SetLength(total, Length(total) + n);
+    Move(buf[0], total[Length(total) - n + 1], n);
+  until False;
+  OsClose(fd);
+  Data := total;
+  Result := True;
+end;
+
+function ReadPrefix(const Path: string; MaxN: Int64; out Data: string): Boolean;
+var
+  p: PChar;
+  fd, n, want, got: Int64;
+  buf: array[0..4095] of Char;
+begin
+  Result := False;
+  Data := '';
+  if MaxN <= 0 then
+    Exit;
+  p := CString(Path);
+  fd := OsOpen(Int64(p), ORdonly, 0);
+  FreeMem(p);
+  if fd < 0 then
+    Exit;
+  got := 0;
+  while got < MaxN do
+  begin
+    want := MaxN - got;
+    if want > 4096 then
+      want := 4096;
+    n := OsRead(fd, Int64(@buf[0]), want);
+    if n < 0 then
+    begin
+      OsClose(fd);
+      Exit;
+    end;
+    if n = 0 then
+      Break;
+    SetLength(Data, Length(Data) + n);
+    Move(buf[0], Data[Length(Data) - n + 1], n);
+    got := got + n;
+  end;
+  OsClose(fd);
+  Result := True;
+end;
+
+function WriteFile(const Path, Data: string): Boolean;
+var
+  p: PChar;
+  fd, n, left: Int64;
+  off: SizeInt;
+begin
+  Result := False;
+  p := CString(Path);
+  fd := OsOpen(Int64(p), OWronly or OCreat or OTrunc, 420);
+  FreeMem(p);
+  if fd < 0 then
+    Exit;
+  off := 1;
+  left := Length(Data);
+  while left > 0 do
+  begin
+    n := OsWrite(fd, Int64(@Data[off]), left);
+    if n <= 0 then
+    begin
+      OsClose(fd);
+      Exit;
+    end;
+    Inc(off, n);
+    Dec(left, n);
+  end;
+  OsClose(fd);
+  Result := True;
+end;
+
+function CopyFile(const Src, Dst: string): Boolean;
+var
+  data: string;
+begin
+  Result := False;
+  if not ReadFile(Src, data) then
+    Exit;
+  Result := WriteFile(Dst, data);
+end;
+
+{ A name with no slash is looked for in PATH, as a shell does, so a
+  program that runs paslangc works from any directory. A name that
+  already has a slash is taken as it stands. }
+function LookPath(const Exe: string): string;
+var
+  dirs, dir, cand: string;
+  i: SizeInt;
+begin
+  Result := Exe;
+  if Exe = '' then
+    Exit;
+  for i := 1 to Length(Exe) do
+    if Exe[i] = '/' then
+      Exit;
+  dirs := GetEnv('PATH');
+  if dirs = '' then
+    dirs := '/usr/local/bin:/usr/bin:/bin';
+  dir := '';
+  for i := 1 to Length(dirs) + 1 do
+  begin
+    if (i > Length(dirs)) or (dirs[i] = ':') then
+    begin
+      if dir <> '' then
+      begin
+        cand := JoinPath(dir, Exe);
+        if FileExists(cand) then
+        begin
+          Result := cand;
+          Exit;
+        end;
+      end;
+      dir := '';
+    end
+    else
+      dir := dir + dirs[i];
+  end;
+end;
+
+function Run(const Exe: string; const Args: array of string): LongInt;
+var
+  pid, st, r, execNr, exitNr: Int64;
+  argv: array of PChar;
+  i: SizeInt;
+  path: PChar;
+begin
+  argv := nil;
+  SetLength(argv, Length(Args) + 2);
+  argv[0] := CString(LookPath(Exe));
+  for i := 0 to High(Args) do
+    argv[i + 1] := CString(Args[i]);
+  argv[High(argv)] := nil;
+  path := argv[0];
+  { The child of a fork has one thread and a copy of every lock, so it
+    may only run raw system calls until execve: Sys1 and Sys3 have no
+    prologue and no stack check, the Os wrappers do. }
+  execNr := NrExecve;
+  exitNr := NrExit;
+  pid := OsFork;
+  if pid < 0 then
+  begin
+    Result := 127;
+  end
+  else if pid = 0 then
+  begin
+    r := Sys3(execNr, Int64(path), Int64(@argv[0]), 0);
+    r := Sys1(exitNr, 127);
+    Result := 127;
+  end
+  else
+  begin
+    st := 0;
+    r := OsWait(pid, Int64(@st), 0, 0);
+    if r < 0 then
+      Result := 127
+    else
+      Result := LongInt((st shr 8) and 255);
+  end;
+  for i := 0 to High(argv) - 1 do
+    if argv[i] <> nil then
+      FreeMem(argv[i]);
+end;
+
+function ReadLink(const Path: string; out Target: string): Boolean;
+var
+  p: PChar;
+  buf: array[0..4095] of Char;
+  n: Int64;
+begin
+  Result := False;
+  Target := '';
+  p := CString(Path);
+  n := OsReadlink(Int64(p), Int64(@buf[0]), 4096);
+  FreeMem(p);
+  if (n <= 0) or (n > 4096) then
+    Exit;
+  SetLength(Target, n);
+  Move(buf[0], Target[1], n);
+  Result := True;
+end;
+
+function GetEnv(const Name: string): string;
+var
+  data, pair, key: string;
+  i, start: SizeInt;
+begin
+  Result := '';
+  if not ReadFile('/proc/self/environ', data) then
+    Exit;
+  start := 1;
+  i := 1;
+  while i <= Length(data) + 1 do
+  begin
+    if (i > Length(data)) or (data[i] = #0) then
+    begin
+      if i > start then
+      begin
+        pair := Copy(data, start, i - start);
+        if Length(pair) >= Length(Name) + 1 then
+        begin
+          key := Copy(pair, 1, Length(Name));
+          if (key = Name) and (Length(pair) >= Length(Name) + 1) and
+            (pair[Length(Name) + 1] = '=') then
+          begin
+            Result := Copy(pair, Length(Name) + 2, Length(pair));
+            Exit;
+          end;
+        end;
+      end;
+      start := i + 1;
+    end;
+    Inc(i);
+  end;
+end;
+
+function RunCapture(const Exe: string; const Args: array of string; out Output: string): LongInt;
+var
+  pid, st, r, n, rd, wr, execNr, exitNr, closeNr, dupNr: Int64;
+  argv: array of PChar;
+  i: SizeInt;
+  path: PChar;
+  pipev: Int64;
+  buf: array[0..4095] of Char;
+  total: string;
+begin
+  { See Run: the child runs raw system calls only. }
+  execNr := NrExecve;
+  exitNr := NrExit;
+  closeNr := NrClose;
+  dupNr := NrDup2;
+  Output := '';
+  argv := nil;
+  SetLength(argv, Length(Args) + 2);
+  argv[0] := CString(LookPath(Exe));
+  for i := 0 to High(Args) do
+    argv[i + 1] := CString(Args[i]);
+  argv[High(argv)] := nil;
+  path := argv[0];
+  pipev := 0;
+  r := OsPipe(Int64(@pipev));
+  if r < 0 then
+  begin
+    Result := 127;
+    Exit;
+  end;
+  rd := pipev and $FFFFFFFF;
+  wr := (pipev shr 32) and $FFFFFFFF;
+  pid := OsFork;
+  if pid < 0 then
+  begin
+    OsClose(rd);
+    OsClose(wr);
+    Result := 127;
+  end
+  else if pid = 0 then
+  begin
+    r := Sys1(closeNr, rd);
+    r := Sys3(dupNr, wr, 1, 0);
+    r := Sys3(dupNr, wr, 2, 0);
+    r := Sys1(closeNr, wr);
+    r := Sys3(execNr, Int64(path), Int64(@argv[0]), 0);
+    r := Sys1(exitNr, 127);
+    Result := 127;
+  end
+  else
+  begin
+    OsClose(wr);
+    total := '';
+    repeat
+      n := OsRead(rd, Int64(@buf[0]), 4096);
+      if n < 0 then
+        Break;
+      if n = 0 then
+        Break;
+      SetLength(total, Length(total) + n);
+      Move(buf[0], total[Length(total) - n + 1], n);
+    until False;
+    OsClose(rd);
+    Output := total;
+    st := 0;
+    r := OsWait(pid, Int64(@st), 0, 0);
+    if r < 0 then
+      Result := 127
+    else
+      Result := LongInt((st shr 8) and 255);
+  end;
+  for i := 0 to High(argv) - 1 do
+    if argv[i] <> nil then
+      FreeMem(argv[i]);
+end;
+
+function ListDir(const Path: string): string;
+var
+  p: PChar;
+  fd, n, off, reclen, j, namelen, total, k: Int64;
+  buf: array[0..4095] of Char;
+  name: string;
+  names: array of string;
+begin
+  Result := '';
+  name := '';
+  names := nil;
+  total := 0;
+  p := CString(Path);
+  fd := OsOpen(Int64(p), ORdonly or ODirectory or ONonblock, 0);
+  FreeMem(p);
+  if fd < 0 then
+    Exit;
+  repeat
+    n := OsGetdents(fd, Int64(@buf[0]), 4096);
+    if n = -11 then
+      WaitFd(fd)
+    else if n <= 0 then
+      Break
+    else
+    begin
+      off := 0;
+      while off + 19 < n do
+      begin
+        reclen := Ord(buf[off + 16]) + Ord(buf[off + 17]) * 256;
+        if reclen < 20 then
+          Break;
+        namelen := 0;
+        j := off + 19;
+        while (j < off + reclen) and (j < n) and (Ord(buf[j]) <> 0) do
+        begin
+          Inc(namelen);
+          Inc(j);
+        end;
+        SetLength(name, namelen);
+        if namelen > 0 then
+          Move(buf[off + 19], name[1], namelen);
+        if (name <> '.') and (name <> '..') then
+        begin
+          { gathered, joined once below: a directory of thousands of
+            entries appended to a growing string was quadratic (1.1.1) }
+          SetLength(names, Length(names) + 1);
+          names[High(names)] := name + #10;
+          total := total + namelen + 1;
+        end;
+        off := off + reclen;
+      end;
+    end;
+  until False;
+  OsClose(fd);
+  SetLength(Result, total);
+  k := 1;
+  for j := 0 to High(names) do
+  begin
+    Move(names[j][1], Result[k], Length(names[j]));
+    k := k + Length(names[j]);
+  end;
+end;
+
+function FileSize(const Path: string): Int64;
+var
+  p: PChar;
+  fd: Int64;
+  st: array[0..255] of Char;
+begin
+  Result := -1;
+  p := CString(Path);
+  fd := OsOpen(Int64(p), ORdonly, 0);
+  FreeMem(p);
+  if fd < 0 then
+    Exit;
+  if OsFstat(fd, Int64(@st[0])) < 0 then
+  begin
+    OsClose(fd);
+    Exit;
+  end;
+  OsClose(fd);
+  Result := Ord(st[48]) + Ord(st[49]) * 256 + Ord(st[50]) * 65536 +
+    Ord(st[51]) * 16777216 + Ord(st[52]) * 4294967296 +
+    Ord(st[53]) * 1099511627776 + Ord(st[54]) * 281474976710656 +
+    Ord(st[55]) * 72057594037927936;
+end;
+
+{ ---- files a piece at a time (P77) --------------------------------
+
+  ReadFile and WriteFile carry a whole file in one string, which is
+  right for a source file and wrong for a log or for anything larger
+  than memory. These are the same syscalls with the handle left open,
+  as Go's os.File does it: open, read, write, seek, close. A handle is
+  the kernel's own file descriptor, so it can be given to anything else
+  that takes one. Below zero means it could not be opened. }
+
+function NrLseek: Int64;
+begin
+  if Amd64 = 0 then
+    Result := 62
+  else
+    Result := 8;
+end;
+
+{ Open an existing file to read it. }
+function FileOpen(const Path: string): Int64;
+var
+  p: PChar;
+begin
+  p := CString(Path);
+  Result := OsOpen(Int64(p), ORdonly, 0);
+  FreeMem(p);
+end;
+
+{ Make it, or empty it if it was there, and open it to write. }
+function FileCreate(const Path: string): Int64;
+var
+  p: PChar;
+begin
+  p := CString(Path);
+  Result := OsOpen(Int64(p), OWronly or OCreat or OTrunc, 420);
+  FreeMem(p);
+end;
+
+{ Open it to add at the end, making it if it is not there. Every write
+  goes to the end, whatever the position says, which is what a log
+  wants when two programs write to it. }
+function FileAppend(const Path: string): Int64;
+var
+  p: PChar;
+begin
+  p := CString(Path);
+  Result := OsOpen(Int64(p), OWronly or OCreat or OAppend, 420);
+  FreeMem(p);
+end;
+
+{ Open it to read and to write, keeping what is there. }
+function FileEdit(const Path: string): Int64;
+var
+  p: PChar;
+begin
+  p := CString(Path);
+  Result := OsOpen(Int64(p), ORdwr, 0);
+  FreeMem(p);
+end;
+
+{ Up to MaxN bytes from where the handle stands. An empty answer is
+  the end of the file. }
+function FileRead(Fd: Int64; MaxN: Int64): string;
+var
+  buf: array[0..4095] of Char;
+  n, want, got: Int64;
+begin
+  Result := '';
+  if (Fd < 0) or (MaxN <= 0) then
+    Exit;
+  got := 0;
+  while got < MaxN do
+  begin
+    want := MaxN - got;
+    if want > 4096 then
+      want := 4096;
+    n := OsRead(Fd, Int64(@buf[0]), want);
+    if n = -11 then
+    begin
+      WaitFd(Fd);
+      Continue;
+    end;
+    if n <= 0 then
+      Break;
+    SetLength(Result, Length(Result) + n);
+    Move(buf[0], Result[Length(Result) - n + 1], n);
+    got := got + n;
+  end;
+end;
+
+{ Every byte of Data, however many writes that takes. The answer is
+  how many went; anything less than the length is an error. }
+function FileWrite(Fd: Int64; const Data: string): Int64;
+var
+  n, left: Int64;
+  off: SizeInt;
+begin
+  Result := 0;
+  if (Fd < 0) or (Length(Data) = 0) then
+    Exit;
+  off := 1;
+  left := Length(Data);
+  while left > 0 do
+  begin
+    n := OsWrite(Fd, Int64(@Data[off]), left);
+    if n = -11 then
+    begin
+      WaitFd(Fd);
+      Continue;
+    end;
+    if n <= 0 then
+      Exit;
+    off := off + n;
+    left := left - n;
+    Result := Result + n;
+  end;
+end;
+
+{ Where the next read or write will happen. Whence is 0 from the
+  start, 1 from where it stands, 2 from the end. The answer is the new
+  position, or below zero. }
+function FileSeek(Fd, Offset, Whence: Int64): Int64;
+begin
+  Result := -1;
+  if Fd < 0 then
+    Exit;
+  Result := Sys3(NrLseek, Fd, Offset, Whence);
+end;
+
+function FileTell(Fd: Int64): Int64;
+begin
+  Result := FileSeek(Fd, 0, 1);
+end;
+
+function FileEnd(Fd: Int64): Int64;
+begin
+  Result := FileSeek(Fd, 0, 2);
+end;
+
+procedure FileClose(Fd: Int64);
+begin
+  if Fd >= 0 then
+    OsClose(Fd);
+end;
+
+end.

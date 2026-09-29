@@ -1,0 +1,1493 @@
+{$mode objfpc}{$H+}
+
+unit pasast;
+
+interface
+
+const
+  TyNone = 0;
+  TyInteger = 1;
+  TyBoolean = 2;
+  TyString = 3;
+  TyChar = 4;
+  TyReal = 5;
+  { P99 (1.0.87): one id for each row of the integers in TYPES.md, and two
+    kept for Single (P101) and the untyped Pointer (P102). Every builtin
+    has the same id in every compilation and every .pi (PASLANGI5). }
+  TyByte = 6;
+  TyInt8 = 7;
+  TyWord = 8;
+  TyInt16 = 9;
+  TyUInt32 = 10;
+  TyInt32 = 11;
+  TySingle = 12;
+  TyPointer = 13;
+  { IEEE binary128 in software (P103, 1.0.114): two words, no pointer. }
+  TyQuad = 14;
+  { V128 and V256 (P106, 1.0.125): 16 and 32 bytes the vector words take
+    as lanes of 8, 16, 32 or 64 bits; a record of no fields to the rest
+    of the compiler, so assignment, parameters, fields, arrays and views
+    work as for any record. }
+  TyV128 = 15;
+  TyV256 = 16;
+  TyLastBuiltin = 16;
+  { A class member's visibility (1.0.137), as FPC enforces it. }
+  VisPublic = 0;
+  VisProtected = 1;
+  VisPrivate = 2;
+  VisStrictProtected = 3;
+  VisStrictPrivate = 4;
+
+  { MakeChan(n) buffers up to this many values (1.0.136): a word each,
+    512 MiB, under the heap's largest block of 1 GiB; -1 divided by zero
+    in the heap and 2^61 wrote past the ring. }
+  ChanCapMax = 67108864;
+
+type
+  TBinOp = (
+    boAdd, boSub, boMul, boDiv, boMod,
+    boEq, boNe, boLt, boLe, boGt, boGe,
+    boAnd, boOr, boXor, boConcat, boIn, boIs, boAs, boShl, boShr,
+    boSlash
+  , boSar, boRol, boRor, boMulHi, boMulHiS);
+
+  { uoConv: L converted to the node's type, a narrow integer, keeping
+    the low bits (P99); a conversion that widens needs no node. The bit
+    words of P105 (1.0.117) work in L's width: uoPopCnt, uoClz and uoCtz
+    give an Integer, uoRbit and uoBswap L's type. }
+  TUnOp = (uoNeg, uoNot, uoConv, uoPopCnt, uoClz, uoCtz, uoRbit, uoBswap);
+
+  TExprKind = (
+    ekInt, ekStr, ekVar, ekBin, ekUn, ekCall,
+    ekField, ekDeref, ekIndex, ekNil, ekMakeChan, ekRecv,
+    ekMethod, ekMethPtr, ekCtor, ekSet, ekRange, ekAddr, ekProp, ekReal,
+    ekProcPtr
+  );
+
+  PExpr = ^TExpr;
+  TExprArray = array of PExpr;
+  TExpr = record
+    Kind: TExprKind;
+    Num: Int64;
+    Str: string;
+    Name: string;
+    Bin: TBinOp;
+    Un: TUnOp;
+    L, R: PExpr;
+    Args: TExprArray;
+    Typ: LongInt;
+    Off: LongInt;
+    Flags: LongInt;   { bit 0: an integer constant with no type of its own, a literal or a plain const, that takes the type an integer context wants (P99); bit 4: an address that is a var or out argument (1.1.1) }
+    Hi: Int64;        { a Quad literal's high word; Num holds the low one (P103) }
+    QLo: Int64;       { with Hi, a real constant's binary128 value when Flags bit 1 is set (1.0.115) }
+  end;
+
+  TStmtKind = (
+    skAssign, skWrite, skWriteLn, skIf, skWhile, skFor, skRepeat,
+    skBlock, skCase, skCall, skNew, skPas, skSend, skClose, skSelect,
+    skReadLn, skSleep, skTry, skRaise, skWith, skForIn, skExit, skHalt, skInc, skDec,
+    skBreak, skContinue, skAsm
+  );
+
+  PStmt = ^TStmt;
+  TStmtArray = array of PStmt;
+
+  TCaseArm = record
+    Vals: array of Int64;     { each label, or the low end of a range }
+    His: array of Int64;      { its high end: Vals[i]..His[i] (1.0.78) }
+    Strs: array of string;    { the labels of a case of a string (1.0.78) }
+    Body: PStmt;
+  end;
+  TCaseArmArray = array of TCaseArm;
+
+  TSelKind = (selSend, selRecv, selDefault);
+  TSelArm = record
+    Kind: TSelKind;
+    Chan: PExpr;
+    Val: PExpr;
+    Dest: string;
+    Body: PStmt;
+  end;
+  TSelArmArray = array of TSelArm;
+
+  TStmt = record
+    Kind: TStmtKind;
+    Line: LongInt;
+    Name: string;
+    E, E2: PExpr;
+    Dest: PExpr;
+    Args: TExprArray;
+    ThenSt, ElseSt, Body: PStmt;
+    Down: Boolean;
+    Stmts: TStmtArray;
+    Arms: TCaseArmArray;
+    Sels: TSelArmArray;
+  end;
+
+  TTypeKind = (tykNone, tykInteger, tykBoolean, tykString, tykRecord, tykPointer, tykArray, tykChan, tykClass, tykMethod, tykGeneric, tykParam, tykEnum, tykSubrange, tykSet, tykInterface, tykReal, tykMap, tykProc, tykQuad, tykTree, tykHeap, tykStore);
+
+  { Vis of a class's member (1.0.137): 0 public or published, 1
+    protected, 2 private, 3 strict protected, 4 strict private (VisPublic
+    and on); a record's fields and an interface's methods are 0. }
+  TField = record
+    Name: string;
+    Off: LongInt;
+    Typ: LongInt;
+    Vis: Byte;
+  end;
+  TFieldArray = array of TField;
+
+  TMethInfo = record
+    Name: string;
+    Sym: string;
+    IsCtor: Boolean;
+    IsVirt: Boolean;
+    IsFunc: Boolean;
+    Slot: LongInt;
+    NParams: LongInt;
+    RetTyp: LongInt;
+    ParamTyps: array of LongInt;
+    ByRef: array of Boolean;
+    IsAbs: Boolean;
+    Vis: Byte;
+  end;
+  TMethArray = array of TMethInfo;
+
+  TPropInfo = record
+    Name: string;
+    Typ: LongInt;
+    ReadOff: LongInt;
+    WriteOff: LongInt;
+    ReadName: string;
+    WriteName: string;
+    NIndex: LongInt;
+    IsPublished: Boolean;
+    Vis: Byte;
+  end;
+  TPropArray = array of TPropInfo;
+
+  TTypeDef = record
+    Name: string;
+    Kind: TTypeKind;
+    Size: LongInt;
+    Fields: TFieldArray;
+    Meths: TMethArray;
+    Props: TPropArray;
+    VmtN: LongInt;
+    Parent: LongInt;
+    Elem: LongInt;
+    Elem2: LongInt;
+    Lo, Hi: Int64;
+    Ifaces: array of LongInt;
+    Imported: Boolean;    { came from a unit's .pi: its VMT lives there }
+  end;
+  TTypeDefArray = array of TTypeDef;
+
+  TStrArray = array of string;
+
+  TVarDecl = record
+    Name: string;
+    Typ: LongInt;
+    Init: string;
+    Sym: string;      { the name in the assembly when not Name: unit.Name for a unit's global (1.0.76) }
+    Ext: Boolean;     { another unit's global: its storage is there }
+    Pub: Boolean;     { in a unit's interface: exported }
+    Rel: array of LongInt;   { a typed constant: the offsets in Init that hold a string's data address (1.0.77) }
+    RelStr: TStrArray;       { and those strings }
+  end;
+  TVarDeclArray = array of TVarDecl;
+
+  TParam = record
+    Name: string;
+    Typ: LongInt;
+    ByRef: Boolean;
+    IsConst: Boolean;   { const: the caller's value itself, never changed nor copied in (1.1.1) }
+    HasDef: Boolean;
+    Def: Int64;
+    DefStr: string;
+  end;
+  TParamArray = array of TParam;
+
+  TProc = record
+    Name: string;
+    Sym: string;
+    IsFunc: Boolean;
+    IsExt: Boolean;
+    InIface: Boolean;
+    Params: TParamArray;
+    Locals: TVarDeclArray;
+    RetTyp: LongInt;
+    Nest: LongInt;
+    ParentSym: string;
+    ClassTyp: LongInt;
+    IsCtor: Boolean;
+    IsFwd: Boolean;
+    IsOver: Boolean;
+    InPlace: Boolean;  { declared inline: put in place where it is called whatever its size (P112) }
+    Safe: Boolean;   { declared safe: no raw pointer work in its body (P102) }
+    Body: PStmt;
+    { Closures (P109, 1.0.134): a routine with a closure anywhere inside
+      keeps the variables its nested routines use (Shared) in a heap
+      box, so they outlive its frame; a closure made in a loop whose
+      counter it uses copies that pass's cells (Pins) when it is made. }
+    Boxing: Boolean;
+    IsAnon: Boolean;
+    Shared: TStrArray;
+    Pins: TStrArray;
+  end;
+  TProcArray = array of TProc;
+
+
+  TConstDecl = record
+    Name: string;
+    Value: Int64;
+    Typ: LongInt;   { TyInteger (also an enum), TyReal, TyString, TyChar, TyBoolean }
+    Str: string;
+    QLo, QHi: Int64;  { a real one worked out in binary128 too (P103, 1.0.115) }
+    HasQ: Boolean;
+  end;
+  TConstDeclArray = array of TConstDecl;
+
+  TProgram = record
+    IsUnit: Boolean;
+    IsPackage: Boolean;
+    Safe: Boolean;       { declared safe unit or program (P102) }
+    CheckPtr: Boolean;   { compiled with -checkptr (P104) }
+    InlineMax: LongInt;  { -inline: the largest body put in place where it is called, 0 none (P112) }
+    Debug: Boolean;      { compiled with -debug (P118): a hook at every statement, the tables of section pasdbg, the debugger unit }
+    Name: string;
+    SrcName: string;
+    UsesNames: TStrArray;
+    LinkObjs: TStrArray;
+    Checksum: string;
+    DepNames: TStrArray;    { every unit loaded while this one compiled }
+    DepSums: TStrArray;     { and the interface checksum each one had }
+    Types: TTypeDefArray;
+    TypeNames: array of string;
+    IfaceTypes: LongInt;   { how many types a unit's interface had declared: a named type past them is the implementation's, and its .pi does not name it (P110) }
+    CpuSet: Int64;         { the processor the code is compiled for (-cpu, P111): the bits CpuFeatBit names }
+    TypeIds: array of LongInt;
+    Vars: TVarDeclArray;
+    Procs: TProcArray;
+    Consts: TConstDeclArray;
+    Body: PStmt;
+    InitBody: PStmt;
+    FiniBody: PStmt;
+  end;
+
+function ProcSym(const UnitName, ProcName: string): string;
+function IsIntId(T: LongInt): Boolean;
+function IsNarrowId(T: LongInt): Boolean;
+function WrapInt(V: Int64; T: LongInt): Int64;
+function IntBits(T: LongInt): LongInt;
+function FoldBitUn(Op: TUnOp; V: Int64; T: LongInt): Int64;
+function WidthUn(Op: TUnOp): Boolean;
+function BitUnOp(Op: TUnOp): Boolean;
+function FoldMulHi(A, B: Int64; Signed: Boolean): Int64;
+function CpuFeatBit(const Name: string; Arm: Boolean): LongInt;
+function CpuSetOf(const Spec: string; Arm: Boolean; Native: Int64; out Err: string): Int64;
+
+function WritesFirst(S: PStmt; const N, Alias: string): Boolean;
+function NewInt(V: Int64): PExpr;
+function NewReal(V: Int64): PExpr;
+function NewStr(const S: string): PExpr;
+function NewVar(const N: string; Typ: LongInt): PExpr;
+function NewBin(Op: TBinOp; A, B: PExpr): PExpr;
+function NewUn(Op: TUnOp; A: PExpr): PExpr;
+function NewCall(const N: string; const Args: TExprArray; Typ: LongInt): PExpr;
+function NewNil: PExpr;
+function NewMakeChan(Elem: LongInt): PExpr;
+function NewRecv(C: PExpr): PExpr;
+function NewMethod(SelfE: PExpr; const Sym: string; const Args: TExprArray; Typ, Slot: LongInt): PExpr;
+function NewProcPtr(const Sym: string; Typ: LongInt): PExpr;
+function NewMethPtr(SelfE: PExpr; const Sym: string; Slot: LongInt): PExpr;
+function NewCtor(const Sym: string; Typ, Sz: LongInt): PExpr;
+function NewField(Base: PExpr; const N: string; Typ, Off: LongInt): PExpr;
+function NewProp(Base: PExpr; Typ, ReadOff, WriteOff: LongInt;
+  const ReadMeth, WriteMeth: string): PExpr;
+function NewDeref(Base: PExpr; Typ: LongInt): PExpr;
+function NewIndex(Base, Ix: PExpr; Typ: LongInt): PExpr;
+function NewSet(const Elems: TExprArray; Typ: LongInt): PExpr;
+function NewRange(A, B: PExpr): PExpr;
+function NewAddr(E: PExpr): PExpr;
+function NewStmt(K: TStmtKind): PStmt;
+
+implementation
+
+function ProcSym(const UnitName, ProcName: string): string;
+var
+  u, n: string;
+  i: SizeInt;
+begin
+  u := '';
+  n := '';
+  for i := 1 to Length(UnitName) do
+    if (UnitName[i] >= 'A') and (UnitName[i] <= 'Z') then
+      u := u + Char(Ord(UnitName[i]) + 32)
+    else
+      u := u + UnitName[i];
+  for i := 1 to Length(ProcName) do
+    if (ProcName[i] >= 'A') and (ProcName[i] <= 'Z') then
+      n := n + Char(Ord(ProcName[i]) + 32)
+    else
+      n := n + ProcName[i];
+  if u = '' then
+    Result := 'p_' + n
+  else
+    Result := 'p_' + u + '_' + n;
+end;
+
+{ Integer or one of the narrow integers (P99); Char is not one. }
+function IsIntId(T: LongInt): Boolean;
+begin
+  Result := (T = TyInteger) or ((T >= TyByte) and (T <= TyInt32));
+end;
+
+{ Byte to Int32: the integers narrower than a word (P99). }
+function IsNarrowId(T: LongInt): Boolean;
+begin
+  Result := (T >= TyByte) and (T <= TyInt32);
+end;
+
+{ A unary operation worked out in the width the context gives (P99):
+  - and not. A conversion and the bit words keep their operand's. }
+function WidthUn(Op: TUnOp): Boolean;
+begin
+  Result := (Op = uoNeg) or (Op = uoNot);
+end;
+
+{ The bit words of P105 (1.0.117). }
+function BitUnOp(Op: TUnOp): Boolean;
+begin
+  Result := (Op = uoPopCnt) or (Op = uoClz) or (Op = uoCtz) or (Op = uoRbit) or
+    (Op = uoBswap);
+end;
+
+{ CpuHas's names (P106, 1.0.124): the bit of rt_cpufeat that says a
+  feature is there, on arm64 when Arm says so and on amd64 if not; 64
+  when that machine always has it, -1 when it never does, -2 for a name
+  neither machine knows. amd64's bits are cpuid's, gated by what the
+  kernel saves (xgetbv); arm64's are AT_HWCAP's low 32 bits with
+  AT_HWCAP2's low 32 above them. A few names are both machines' (aes,
+  pclmul/pmull, crc32, sha1, sha2, rng, fma, lzcnt, popcnt, simd128). }
+function CpuFeatBit(const Name: string; Arm: Boolean): LongInt;
+var
+  n: string;
+  i: SizeInt;
+  x, a: LongInt;
+begin
+  n := Name;
+  for i := 1 to Length(n) do
+    if (n[i] >= 'A') and (n[i] <= 'Z') then
+      n[i] := Chr(Ord(n[i]) + 32);
+  x := -2;
+  a := -2;
+  if n = 'sse2' then
+  begin
+    x := 64;
+    a := -1;
+  end
+  else if n = 'sse3' then
+  begin
+    x := 1;
+    a := -1;
+  end
+  else if n = 'ssse3' then
+  begin
+    x := 2;
+    a := -1;
+  end
+  else if n = 'sse41' then
+  begin
+    x := 3;
+    a := -1;
+  end
+  else if n = 'sse42' then
+  begin
+    x := 4;
+    a := -1;
+  end
+  else if n = 'popcnt' then
+  begin
+    x := 5;
+    a := 1;
+  end
+  else if n = 'aes' then
+  begin
+    x := 6;
+    a := 3;
+  end
+  else if n = 'pclmul' then
+  begin
+    x := 7;
+    a := 4;
+  end
+  else if n = 'pmull' then
+  begin
+    x := 7;
+    a := 4;
+  end
+  else if n = 'avx' then
+  begin
+    x := 8;
+    a := -1;
+  end
+  else if n = 'fma' then
+  begin
+    x := 9;
+    a := 64;
+  end
+  else if n = 'f16c' then
+  begin
+    x := 10;
+    a := -1;
+  end
+  else if n = 'movbe' then
+  begin
+    x := 11;
+    a := -1;
+  end
+  else if n = 'rdrand' then
+  begin
+    x := 12;
+    a := 48;
+  end
+  else if n = 'rng' then
+  begin
+    x := 12;
+    a := 48;
+  end
+  else if n = 'avx2' then
+  begin
+    x := 13;
+    a := -1;
+  end
+  else if n = 'bmi1' then
+  begin
+    x := 14;
+    a := -1;
+  end
+  else if n = 'bmi2' then
+  begin
+    x := 15;
+    a := -1;
+  end
+  else if n = 'adx' then
+  begin
+    x := 16;
+    a := -1;
+  end
+  else if n = 'rdseed' then
+  begin
+    x := 17;
+    a := -1;
+  end
+  else if n = 'sha' then
+  begin
+    x := 18;
+    a := -1;
+  end
+  else if n = 'sha1' then
+  begin
+    x := 18;
+    a := 5;
+  end
+  else if n = 'sha2' then
+  begin
+    x := 18;
+    a := 6;
+  end
+  else if n = 'erms' then
+  begin
+    x := 19;
+    a := -1;
+  end
+  else if n = 'avx512f' then
+  begin
+    x := 20;
+    a := -1;
+  end
+  else if n = 'avx512bw' then
+  begin
+    x := 21;
+    a := -1;
+  end
+  else if n = 'avx512vl' then
+  begin
+    x := 22;
+    a := -1;
+  end
+  else if n = 'avx512dq' then
+  begin
+    x := 23;
+    a := -1;
+  end
+  else if n = 'vaes' then
+  begin
+    x := 24;
+    a := -1;
+  end
+  else if n = 'vpclmulqdq' then
+  begin
+    x := 25;
+    a := -1;
+  end
+  else if n = 'gfni' then
+  begin
+    x := 26;
+    a := -1;
+  end
+  else if n = 'lzcnt' then
+  begin
+    x := 27;
+    a := 64;
+  end
+  else if n = 'avx512vbmi' then
+  begin
+    x := 28;
+    a := -1;
+  end
+  else if n = 'avx512vnni' then
+  begin
+    x := 29;
+    a := -1;
+  end
+  else if n = 'cx16' then
+  begin
+    x := 30;
+    a := 64;
+  end
+  else if n = 'crc32' then
+  begin
+    x := 4;
+    a := 7;
+  end
+  else if n = 'simd128' then
+  begin
+    x := 64;
+    a := 1;
+  end
+  else if n = 'simd256' then
+  begin
+    x := 13;
+    a := -1;
+  end
+  else if n = 'fp' then
+  begin
+    x := -1;
+    a := 0;
+  end
+  else if n = 'neon' then
+  begin
+    x := -1;
+    a := 1;
+  end
+  else if n = 'asimd' then
+  begin
+    x := -1;
+    a := 1;
+  end
+  else if n = 'atomics' then
+  begin
+    x := -1;
+    a := 8;
+  end
+  else if n = 'lse' then
+  begin
+    x := -1;
+    a := 8;
+  end
+  else if n = 'fphp' then
+  begin
+    x := -1;
+    a := 9;
+  end
+  else if n = 'asimdhp' then
+  begin
+    x := -1;
+    a := 10;
+  end
+  else if n = 'rdm' then
+  begin
+    x := -1;
+    a := 12;
+  end
+  else if n = 'jscvt' then
+  begin
+    x := -1;
+    a := 13;
+  end
+  else if n = 'fcma' then
+  begin
+    x := -1;
+    a := 14;
+  end
+  else if n = 'lrcpc' then
+  begin
+    x := -1;
+    a := 15;
+  end
+  else if n = 'dcpop' then
+  begin
+    x := -1;
+    a := 16;
+  end
+  else if n = 'sha3' then
+  begin
+    x := -1;
+    a := 17;
+  end
+  else if n = 'sm3' then
+  begin
+    x := -1;
+    a := 18;
+  end
+  else if n = 'sm4' then
+  begin
+    x := -1;
+    a := 19;
+  end
+  else if n = 'dotprod' then
+  begin
+    x := -1;
+    a := 20;
+  end
+  else if n = 'sha512' then
+  begin
+    x := -1;
+    a := 21;
+  end
+  else if n = 'sve' then
+  begin
+    x := -1;
+    a := 22;
+  end
+  else if n = 'fhm' then
+  begin
+    x := -1;
+    a := 23;
+  end
+  else if n = 'dit' then
+  begin
+    x := -1;
+    a := 24;
+  end
+  else if n = 'uscat' then
+  begin
+    x := -1;
+    a := 25;
+  end
+  else if n = 'ilrcpc' then
+  begin
+    x := -1;
+    a := 26;
+  end
+  else if n = 'flagm' then
+  begin
+    x := -1;
+    a := 27;
+  end
+  else if n = 'ssbs' then
+  begin
+    x := -1;
+    a := 28;
+  end
+  else if n = 'sb' then
+  begin
+    x := -1;
+    a := 29;
+  end
+  else if n = 'paca' then
+  begin
+    x := -1;
+    a := 30;
+  end
+  else if n = 'pacg' then
+  begin
+    x := -1;
+    a := 31;
+  end
+  else if n = 'dcpodp' then
+  begin
+    x := -1;
+    a := 32;
+  end
+  else if n = 'sve2' then
+  begin
+    x := -1;
+    a := 33;
+  end
+  else if n = 'sveaes' then
+  begin
+    x := -1;
+    a := 34;
+  end
+  else if n = 'svepmull' then
+  begin
+    x := -1;
+    a := 35;
+  end
+  else if n = 'svebitperm' then
+  begin
+    x := -1;
+    a := 36;
+  end
+  else if n = 'svesha3' then
+  begin
+    x := -1;
+    a := 37;
+  end
+  else if n = 'svesm4' then
+  begin
+    x := -1;
+    a := 38;
+  end
+  else if n = 'flagm2' then
+  begin
+    x := -1;
+    a := 39;
+  end
+  else if n = 'frint' then
+  begin
+    x := -1;
+    a := 40;
+  end
+  else if n = 'svei8mm' then
+  begin
+    x := -1;
+    a := 41;
+  end
+  else if n = 'svef32mm' then
+  begin
+    x := -1;
+    a := 42;
+  end
+  else if n = 'svef64mm' then
+  begin
+    x := -1;
+    a := 43;
+  end
+  else if n = 'svebf16' then
+  begin
+    x := -1;
+    a := 44;
+  end
+  else if n = 'i8mm' then
+  begin
+    x := -1;
+    a := 45;
+  end
+  else if n = 'bf16' then
+  begin
+    x := -1;
+    a := 46;
+  end
+  else if n = 'dgh' then
+  begin
+    x := -1;
+    a := 47;
+  end
+  else if n = 'bti' then
+  begin
+    x := -1;
+    a := 49;
+  end
+  else if n = 'mte' then
+  begin
+    x := -1;
+    a := 50;
+  end;
+  if Arm then
+    Result := a
+  else
+    Result := x;
+end;
+
+{ The processor a program is compiled for (-cpu, P111): the bits
+  CpuFeatBit names, read from names joined by + (or ,): base (SSE2; fp
+  and asimd on arm64), native (what the machine compiling has), max
+  (every feature the target names), the x86-64 psABI levels v2, v3 and
+  v4 on amd64, v8.1, v8.2 and crypto on arm64, and any feature name of
+  CpuHas. Err names a word it does not know, or one the target never
+  has. }
+function CpuNamesBits(const Names: string; Arm: Boolean): Int64;
+var
+  i, start: SizeInt;
+  b: LongInt;
+begin
+  Result := 0;
+  start := 1;
+  for i := 1 to Length(Names) + 1 do
+    if (i > Length(Names)) or (Names[i] = ' ') then
+    begin
+      if i > start then
+      begin
+        b := CpuFeatBit(Copy(Names, start, i - start), Arm);
+        if (b >= 0) and (b < 64) then
+          Result := Result or (Int64(1) shl b);
+      end;
+      start := i + 1;
+    end;
+end;
+
+function CpuSetOf(const Spec: string; Arm: Boolean; Native: Int64; out Err: string): Int64;
+const
+  V2 = 'sse3 ssse3 sse41 sse42 popcnt cx16';
+  V3 = 'avx avx2 bmi1 bmi2 fma f16c movbe lzcnt';
+  V4 = 'avx512f avx512bw avx512vl avx512dq';
+  MaxX = 'sse3 ssse3 sse41 sse42 popcnt aes pclmul avx fma f16c movbe rdrand avx2 bmi1 bmi2 adx rdseed sha erms ' +
+    'avx512f avx512bw avx512vl avx512dq vaes vpclmulqdq gfni lzcnt avx512vbmi avx512vnni cx16';
+  A81 = 'crc32 atomics rdm';
+  A82 = 'fphp asimdhp dcpop';
+  ACrypto = 'aes pmull sha1 sha2';
+  MaxA = 'fp asimd aes pmull sha1 sha2 crc32 atomics fphp asimdhp rdm jscvt fcma lrcpc dcpop sha3 sm3 sm4 ' +
+    'dotprod sha512 sve fhm dit uscat ilrcpc flagm ssbs sb paca pacg';
+var
+  i, start: SizeInt;
+  tok, l: string;
+  b: LongInt;
+begin
+  Err := '';
+  Result := 0;
+  if Arm then
+    Result := CpuNamesBits('fp asimd', True);
+  start := 1;
+  for i := 1 to Length(Spec) + 1 do
+    if (i > Length(Spec)) or (Spec[i] = '+') or (Spec[i] = ',') then
+    begin
+      tok := Copy(Spec, start, i - start);
+      start := i + 1;
+      if tok = '' then
+        Continue;
+      l := tok;
+      for b := 1 to Length(l) do
+        if (l[b] >= 'A') and (l[b] <= 'Z') then
+          l[b] := Chr(Ord(l[b]) + 32);
+      if l = 'base' then
+        Continue
+      else if l = 'native' then
+        Result := Result or Native
+      else if l = 'max' then
+      begin
+        if Arm then
+          Result := Result or CpuNamesBits(MaxA, True)
+        else
+          Result := Result or CpuNamesBits(MaxX, False);
+      end
+      else if (not Arm) and (l = 'v2') then
+        Result := Result or CpuNamesBits(V2, False)
+      else if (not Arm) and (l = 'v3') then
+        Result := Result or CpuNamesBits(V2 + ' ' + V3, False)
+      else if (not Arm) and (l = 'v4') then
+        Result := Result or CpuNamesBits(V2 + ' ' + V3 + ' ' + V4, False)
+      else if Arm and (l = 'v8.1') then
+        Result := Result or CpuNamesBits(A81, True)
+      else if Arm and (l = 'v8.2') then
+        Result := Result or CpuNamesBits(A81 + ' ' + A82, True)
+      else if Arm and (l = 'crypto') then
+        Result := Result or CpuNamesBits(ACrypto, True)
+      else
+      begin
+        b := CpuFeatBit(l, Arm);
+        if b = 64 then
+          Continue;
+        if b < 0 then
+        begin
+          Err := tok;
+          Exit;
+        end;
+        Result := Result or (Int64(1) shl b);
+      end;
+    end;
+end;
+
+{ The high word of the 128-bit product of A and B (P106, 1.0.121),
+  worked out in 32-bit halves: unsigned, or signed, which is the
+  unsigned one less B when A is negative and less A when B is. }
+function FoldMulHi(A, B: Int64; Signed: Boolean): Int64;
+var
+  a0, a1, b0, b1, p00, p01, p10, p11, mid, m32: Int64;
+begin
+  m32 := 4294967295;
+  a0 := A and m32;
+  a1 := (A shr 32) and m32;
+  b0 := B and m32;
+  b1 := (B shr 32) and m32;
+  p00 := a0 * b0;
+  p01 := a0 * b1;
+  p10 := a1 * b0;
+  p11 := a1 * b1;
+  mid := ((p00 shr 32) and m32) + (p01 and m32) + (p10 and m32);
+  Result := p11 + ((p01 shr 32) and m32) + ((p10 shr 32) and m32) + ((mid shr 32) and m32);
+  if Signed then
+  begin
+    if A < 0 then
+      Result := Result - B;
+    if B < 0 then
+      Result := Result - A;
+  end;
+end;
+
+{ The bits of integer type T: 8, 16, 32 or 64; a Char has 8 (P105). }
+function IntBits(T: LongInt): LongInt;
+begin
+  if (T = TyByte) or (T = TyInt8) or (T = TyChar) then
+    Result := 8
+  else if (T = TyWord) or (T = TyInt16) then
+    Result := 16
+  else if (T = TyUInt32) or (T = TyInt32) then
+    Result := 32
+  else
+    Result := 64;
+end;
+
+{ A bit word of P105 on the constant V of type T, in T's width: the
+  count of ones, of leading and of trailing zeros (T's width when V is
+  0), the bits reversed, the bytes reversed (1.0.117). }
+function FoldBitUn(Op: TUnOp; V: Int64; T: LongInt): Int64;
+var
+  w, i: LongInt;
+  u, r: Int64;
+begin
+  w := IntBits(T);
+  u := V;
+  if w < 64 then
+    u := V and ((Int64(1) shl w) - 1);
+  r := 0;
+  if Op = uoPopCnt then
+  begin
+    for i := 0 to w - 1 do
+      if ((u shr i) and 1) = 1 then
+        r := r + 1;
+  end
+  else if Op = uoClz then
+  begin
+    r := w;
+    for i := w - 1 downto 0 do
+      if ((u shr i) and 1) = 1 then
+      begin
+        r := w - 1 - i;
+        Break;
+      end;
+  end
+  else if Op = uoCtz then
+  begin
+    r := w;
+    for i := 0 to w - 1 do
+      if ((u shr i) and 1) = 1 then
+      begin
+        r := i;
+        Break;
+      end;
+  end
+  else if Op = uoRbit then
+  begin
+    for i := 0 to w - 1 do
+      if ((u shr i) and 1) = 1 then
+        r := r or (Int64(1) shl (w - 1 - i));
+    r := WrapInt(r, T);
+  end
+  else if Op = uoBswap then
+  begin
+    for i := 0 to w div 8 - 1 do
+      r := r or (((u shr (8 * i)) and 255) shl (8 * (w div 8 - 1 - i)));
+    r := WrapInt(r, T);
+  end
+  else
+    r := V;
+  Result := r;
+end;
+
+{ V as integer type T keeps it: the low bits, extended by the sign for
+  Int8, Int16 and Int32 and by zeros for the others (P99). }
+function WrapInt(V: Int64; T: LongInt): Int64;
+begin
+  Result := V;
+  if T = TyByte then
+    Result := V and 255
+  else if T = TyInt8 then
+  begin
+    Result := V and 255;
+    if Result >= 128 then
+      Result := Result - 256;
+  end
+  else if T = TyWord then
+    Result := V and 65535
+  else if T = TyInt16 then
+  begin
+    Result := V and 65535;
+    if Result >= 32768 then
+      Result := Result - 65536;
+  end
+  else if T = TyUInt32 then
+    Result := V and 4294967295
+  else if T = TyInt32 then
+  begin
+    Result := V and 4294967295;
+    if Result >= 2147483648 then
+      Result := Result - 4294967296;
+  end;
+end;
+
+
+{ ---- Written before read (P112) ----
+
+  Whether every path through S writes the variable N (or Alias, a
+  function's own name standing for Result) before anything reads it.
+  The prologue need not zero such a local and a routine put in place
+  need not either. The walk is conservative: a statement of a kind it
+  does not model, a call of DumpLocals, an address taken, count as
+  reads; Exit, Halt, Break and Continue end their path. With an Alias
+  the name is the result, which the caller reads at every Exit and at
+  the end. }
+
+function NmEq(const A, B: string): Boolean;
+var
+  i: SizeInt;
+  x, y: Char;
+begin
+  Result := False;
+  if Length(A) <> Length(B) then
+    Exit;
+  for i := 1 to Length(A) do
+  begin
+    x := A[i];
+    y := B[i];
+    if (x >= 'A') and (x <= 'Z') then
+      x := Chr(Ord(x) + 32);
+    if (y >= 'A') and (y <= 'Z') then
+      y := Chr(Ord(y) + 32);
+    if x <> y then
+      Exit;
+  end;
+  Result := True;
+end;
+
+function IsN(const Name, N, Alias: string): Boolean;
+begin
+  Result := NmEq(Name, N) or ((Alias <> '') and NmEq(Name, Alias));
+end;
+
+function ReadsN(E: PExpr; const N, Alias: string): Boolean;
+var
+  i: SizeInt;
+begin
+  Result := False;
+  if E = nil then
+    Exit;
+  if (E^.Kind = ekVar) and IsN(E^.Name, N, Alias) then
+  begin
+    Result := True;
+    Exit;
+  end;
+  Result := ReadsN(E^.L, N, Alias) or ReadsN(E^.R, N, Alias);
+  for i := 0 to High(E^.Args) do
+    if not Result then
+      Result := ReadsN(E^.Args[i], N, Alias);
+end;
+
+function WalkW(S: PStmt; const N, Alias: string; var Asg: Boolean): Boolean;
+var
+  i: SizeInt;
+  a1, a2, all: Boolean;
+begin
+  Result := True;
+  if S = nil then
+    Exit;
+  case S^.Kind of
+    skAssign:
+      begin
+        if (not Asg) and ReadsN(S^.E, N, Alias) then
+        begin
+          Result := False;
+          Exit;
+        end;
+        if (S^.Dest <> nil) and (S^.Dest^.Kind = ekVar) and IsN(S^.Dest^.Name, N, Alias) then
+          Asg := True
+        else if (S^.Dest = nil) and IsN(S^.Name, N, Alias) then
+          Asg := True
+        else if (not Asg) and ReadsN(S^.Dest, N, Alias) then
+          Result := False;
+      end;
+    skInc, skDec:
+      if (not Asg) and (ReadsN(S^.Dest, N, Alias) or ReadsN(S^.E, N, Alias)) then
+        Result := False;
+    skIf:
+      begin
+        if (not Asg) and ReadsN(S^.E, N, Alias) then
+        begin
+          Result := False;
+          Exit;
+        end;
+        a1 := Asg;
+        if not WalkW(S^.ThenSt, N, Alias, a1) then
+        begin
+          Result := False;
+          Exit;
+        end;
+        a2 := Asg;
+        if not WalkW(S^.ElseSt, N, Alias, a2) then
+        begin
+          Result := False;
+          Exit;
+        end;
+        Asg := a1 and a2;
+      end;
+    skWhile:
+      begin
+        if (not Asg) and ReadsN(S^.E, N, Alias) then
+        begin
+          Result := False;
+          Exit;
+        end;
+        a1 := Asg;
+        Result := WalkW(S^.Body, N, Alias, a1);
+      end;
+    skRepeat:
+      begin
+        a1 := Asg;
+        if not WalkW(S^.Body, N, Alias, a1) then
+        begin
+          Result := False;
+          Exit;
+        end;
+        if (not a1) and ReadsN(S^.E, N, Alias) then
+          Result := False;
+      end;
+    skFor:
+      begin
+        if (not Asg) and (ReadsN(S^.E, N, Alias) or ReadsN(S^.E2, N, Alias)) then
+        begin
+          Result := False;
+          Exit;
+        end;
+        a1 := Asg;
+        if IsN(S^.Name, N, Alias) then
+          a1 := True;
+        Result := WalkW(S^.Body, N, Alias, a1);
+      end;
+    skBlock:
+      for i := 0 to High(S^.Stmts) do
+        if not WalkW(S^.Stmts[i], N, Alias, Asg) then
+        begin
+          Result := False;
+          Exit;
+        end;
+    skCase:
+      begin
+        if (not Asg) and ReadsN(S^.E, N, Alias) then
+        begin
+          Result := False;
+          Exit;
+        end;
+        all := True;
+        for i := 0 to High(S^.Arms) do
+        begin
+          a1 := Asg;
+          if not WalkW(S^.Arms[i].Body, N, Alias, a1) then
+          begin
+            Result := False;
+            Exit;
+          end;
+          all := all and a1;
+        end;
+        a2 := Asg;
+        if not WalkW(S^.ElseSt, N, Alias, a2) then
+        begin
+          Result := False;
+          Exit;
+        end;
+        Asg := all and a2;
+      end;
+    skCall, skWrite, skWriteLn, skSend, skClose, skSleep:
+      begin
+        if (S^.Kind = skCall) and (S^.Name = 'rt_dumplocs') and (not Asg) then
+        begin
+          Result := False;
+          Exit;
+        end;
+        if (not Asg) and ReadsN(S^.E, N, Alias) then
+        begin
+          Result := False;
+          Exit;
+        end;
+        for i := 0 to High(S^.Args) do
+          if (not Asg) and ReadsN(S^.Args[i], N, Alias) then
+          begin
+            Result := False;
+            Exit;
+          end;
+      end;
+    skExit:
+      begin
+        if (not Asg) and ReadsN(S^.E, N, Alias) then
+        begin
+          Result := False;
+          Exit;
+        end;
+        if (Alias <> '') and (not Asg) then
+        begin
+          Result := False;
+          Exit;
+        end;
+        Asg := True;
+      end;
+    skHalt:
+      begin
+        if (not Asg) and ReadsN(S^.E, N, Alias) then
+        begin
+          Result := False;
+          Exit;
+        end;
+        Asg := True;
+      end;
+    skBreak, skContinue:
+      Asg := True;
+  else
+    if not Asg then
+      Result := False;
+  end;
+end;
+
+function WritesFirst(S: PStmt; const N, Alias: string): Boolean;
+var
+  asg: Boolean;
+begin
+  asg := False;
+  Result := WalkW(S, N, Alias, asg);
+  if Result and (Alias <> '') and (not asg) then
+    Result := False;
+end;
+
+function NewInt(V: Int64): PExpr;
+begin
+  New(Result);
+  Result^ := Default(TExpr);
+  Result^.Kind := ekInt;
+  Result^.Num := V;
+  Result^.Typ := TyInteger;
+end;
+
+function NewReal(V: Int64): PExpr;
+begin
+  New(Result);
+  Result^ := Default(TExpr);
+  Result^.Kind := ekReal;
+  Result^.Num := V;
+  Result^.Typ := TyReal;
+end;
+
+function NewStr(const S: string): PExpr;
+begin
+  New(Result);
+  Result^ := Default(TExpr);
+  Result^.Kind := ekStr;
+  Result^.Str := S;
+  Result^.Typ := TyString;
+end;
+
+function NewVar(const N: string; Typ: LongInt): PExpr;
+begin
+  New(Result);
+  Result^ := Default(TExpr);
+  Result^.Kind := ekVar;
+  Result^.Name := N;
+  Result^.Typ := Typ;
+end;
+
+function NewBin(Op: TBinOp; A, B: PExpr): PExpr;
+begin
+  New(Result);
+  Result^ := Default(TExpr);
+  Result^.Kind := ekBin;
+  Result^.Bin := Op;
+  Result^.L := A;
+  Result^.R := B;
+  if Op = boConcat then
+    Result^.Typ := TyString
+  else if (Op = boEq) or (Op = boNe) or (Op = boLt) or (Op = boLe) or
+    (Op = boGt) or (Op = boGe) or (Op = boIn) then
+    Result^.Typ := TyBoolean
+  else if ((Op = boAnd) or (Op = boOr) or (Op = boXor)) and (A <> nil) and
+    (B <> nil) and (A^.Typ = TyBoolean) and (B^.Typ = TyBoolean) then
+    Result^.Typ := TyBoolean
+  else
+    Result^.Typ := TyInteger;
+end;
+
+function NewUn(Op: TUnOp; A: PExpr): PExpr;
+begin
+  New(Result);
+  Result^ := Default(TExpr);
+  Result^.Kind := ekUn;
+  Result^.Un := Op;
+  Result^.L := A;
+  if Op = uoNot then
+    Result^.Typ := TyBoolean
+  else if (A <> nil) and ((A^.Typ = TyReal) or (A^.Typ = TySingle)) then
+    Result^.Typ := A^.Typ
+  else
+    Result^.Typ := TyInteger;
+end;
+
+function NewCall(const N: string; const Args: TExprArray; Typ: LongInt): PExpr;
+begin
+  New(Result);
+  Result^ := Default(TExpr);
+  Result^.Kind := ekCall;
+  Result^.Name := N;
+  Result^.Args := Args;
+  Result^.Typ := Typ;
+end;
+
+function NewNil: PExpr;
+begin
+  New(Result);
+  Result^ := Default(TExpr);
+  Result^.Kind := ekNil;
+  Result^.Typ := TyNone;
+end;
+
+function NewMakeChan(Elem: LongInt): PExpr;
+begin
+  New(Result);
+  Result^ := Default(TExpr);
+  Result^.Kind := ekMakeChan;
+  Result^.Typ := Elem;
+end;
+
+function NewRecv(C: PExpr): PExpr;
+begin
+  New(Result);
+  Result^ := Default(TExpr);
+  Result^.Kind := ekRecv;
+  Result^.L := C;
+  Result^.Typ := TyInteger;
+end;
+
+function NewMethod(SelfE: PExpr; const Sym: string; const Args: TExprArray; Typ, Slot: LongInt): PExpr;
+begin
+  New(Result);
+  Result^ := Default(TExpr);
+  Result^.Kind := ekMethod;
+  Result^.L := SelfE;
+  Result^.Name := Sym;
+  Result^.Args := Args;
+  Result^.Typ := Typ;
+  Result^.Off := Slot;
+end;
+
+{ The address of a plain routine, as a value of a routine type. }
+function NewProcPtr(const Sym: string; Typ: LongInt): PExpr;
+begin
+  New(Result);
+  Result^ := Default(TExpr);
+  Result^.Kind := ekProcPtr;
+  Result^.Name := Sym;
+  Result^.Typ := Typ;
+end;
+
+function NewMethPtr(SelfE: PExpr; const Sym: string; Slot: LongInt): PExpr;
+begin
+  New(Result);
+  Result^ := Default(TExpr);
+  Result^.Kind := ekMethPtr;
+  Result^.L := SelfE;
+  Result^.Name := Sym;
+  Result^.Off := Slot;
+  Result^.Typ := 0;
+end;
+
+function NewCtor(const Sym: string; Typ, Sz: LongInt): PExpr;
+begin
+  New(Result);
+  Result^ := Default(TExpr);
+  Result^.Kind := ekCtor;
+  Result^.Name := Sym;
+  Result^.Typ := Typ;
+  Result^.Off := Sz;
+end;
+
+function NewField(Base: PExpr; const N: string; Typ, Off: LongInt): PExpr;
+begin
+  New(Result);
+  Result^ := Default(TExpr);
+  Result^.Kind := ekField;
+  Result^.L := Base;
+  Result^.Name := N;
+  Result^.Typ := Typ;
+  Result^.Off := Off;
+end;
+
+function NewProp(Base: PExpr; Typ, ReadOff, WriteOff: LongInt;
+  const ReadMeth, WriteMeth: string): PExpr;
+begin
+  New(Result);
+  Result^ := Default(TExpr);
+  Result^.Kind := ekProp;
+  Result^.L := Base;
+  Result^.Typ := Typ;
+  Result^.Off := ReadOff;
+  Result^.Num := WriteOff;
+  Result^.Name := ReadMeth;
+  Result^.Str := WriteMeth;
+end;
+
+function NewDeref(Base: PExpr; Typ: LongInt): PExpr;
+begin
+  New(Result);
+  Result^ := Default(TExpr);
+  Result^.Kind := ekDeref;
+  Result^.L := Base;
+  Result^.Typ := Typ;
+end;
+
+function NewIndex(Base, Ix: PExpr; Typ: LongInt): PExpr;
+begin
+  New(Result);
+  Result^ := Default(TExpr);
+  Result^.Kind := ekIndex;
+  Result^.L := Base;
+  Result^.R := Ix;
+  Result^.Typ := Typ;
+end;
+
+function NewSet(const Elems: TExprArray; Typ: LongInt): PExpr;
+begin
+  New(Result);
+  Result^ := Default(TExpr);
+  Result^.Kind := ekSet;
+  Result^.Args := Elems;
+  Result^.Typ := Typ;
+end;
+
+function NewRange(A, B: PExpr): PExpr;
+begin
+  New(Result);
+  Result^ := Default(TExpr);
+  Result^.Kind := ekRange;
+  Result^.L := A;
+  Result^.R := B;
+  Result^.Typ := A^.Typ;
+end;
+
+function NewAddr(E: PExpr): PExpr;
+begin
+  New(Result);
+  Result^ := Default(TExpr);
+  Result^.Kind := ekAddr;
+  Result^.L := E;
+  if E <> nil then
+    Result^.Typ := E^.Typ
+  else
+    Result^.Typ := TyInteger;
+end;
+
+function NewStmt(K: TStmtKind): PStmt;
+begin
+  New(Result);
+  Result^ := Default(TStmt);
+  Result^.Kind := K;
+end;
+
+end.

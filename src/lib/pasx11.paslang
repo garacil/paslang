@@ -1,0 +1,1071 @@
+{$mode objfpc}{$H+}
+
+{ Raw X11 on a Unix socket. No Xlib. The UI G parks with WaitFd. }
+unit pasx11;
+
+interface
+
+type
+  TX11 = class
+    Fd: Int64;
+    Root: Int64;
+    DeleteAtom: Int64;   { WM_DELETE_WINDOW, once SetProtocols ran }
+    Base: Int64;
+    Mask: Int64;
+    Seq: Int64;
+    White: Int64;
+    Black: Int64;
+    MinKey: Integer;
+    MaxKey: Integer;
+    Fid: Int64;
+    Ascent: Integer;
+    Descent: Integer;
+    MinCh: Integer;
+    MaxCh: Integer;
+    Wids: string;
+    InBuf: string;
+    EvQ: string;
+    ScreenW: Integer;   { the root window, so a program can open big }
+    ScreenH: Integer;
+    KFirst: Integer;
+    KPer: Integer;
+    KSyms: string;
+    Owned: string;
+    LastErr: Integer;
+    LastOp: Integer;
+    constructor Create;
+    function Connect: Boolean;
+    function AllocId: Int64;
+    procedure SendPkt(const B: string);
+    function Pull(N: Integer): string;
+    function ReadReply: string;
+    function CanRead: Boolean;
+    function CreateWin(W, H: Integer): Int64;
+    function CreateGc(Win: Int64): Int64;
+    procedure MapWin(Win: Int64);
+    procedure SetTitle(Win: Int64; const S: string);
+    procedure SetClass(Win: Int64; const Instance, Cls: string);
+    procedure RaiseWin(Win: Int64);
+    procedure SetWinType(Win: Int64);
+    procedure SetProtocols(Win: Int64);
+    procedure Activate(Win: Int64);
+    function IsCloseEvent(const Ev: string): Boolean;
+    procedure SetFg(Gc, Pix: Int64);
+    procedure SetBg(Gc, Pix: Int64);
+    function Atom(const Name: string): Int64;
+    procedure AnswerSel(const Ev: string);
+    function TakeProp(Win, Prop: Int64): string;
+    procedure LoadFont;
+    function TextWidth(const S: string): Integer;
+    procedure FillRect(Win, Gc: Int64; X, Y, W, H: Integer; Pix: Int64);
+    procedure DrawLine(Win, Gc: Int64; X1, Y1, X2, Y2: Integer; Pix: Int64);
+    procedure DrawText(Win, Gc: Int64; X, Y: Integer; const S: string; Pix: Int64);
+    procedure SetClip(Gc: Int64; X, Y, W, H: Integer);
+    function Sync: Boolean;
+    function NextEvent: string;
+    function Queued: Integer;
+    procedure SendClick(Win: Int64; Kind, Button, X, Y: Integer);
+    procedure SendKey(Win: Int64; KeyCode: Integer);
+    function Keysym(Code: Integer): Int64;
+    function KeysymShift(Code: Integer; Shift: Boolean): Int64;
+    function ClipRound(Win: Int64; const Data: string): string;
+    function PixelAt(Win: Int64; X, Y: Integer): Int64;
+  end;
+
+implementation
+
+uses
+  paslinux, paslib;
+
+constructor TX11.Create;
+begin
+  Fd := -1;
+  Root := 0;
+  DeleteAtom := 0;
+  Base := 0;
+  Mask := 0;
+  Seq := 0;
+  White := 0;
+  Black := 0;
+  MinKey := 0;
+  MaxKey := 0;
+  Fid := 0;
+  Ascent := 0;
+  Descent := 0;
+  MinCh := 0;
+  MaxCh := 0;
+  Wids := '';
+  InBuf := '';
+  EvQ := '';
+  ScreenW := 0;
+  ScreenH := 0;
+  KFirst := 0;
+  KPer := 0;
+  KSyms := '';
+  Owned := '';
+  LastErr := 0;
+  LastOp := 0;
+end;
+
+function Blank(N: Integer): string;
+var
+  i: Integer;
+begin
+  Result := '';
+  SetLength(Result, N);
+  for i := 1 to N do
+    Result[i] := #0;
+end;
+
+function XPad(N: Integer): Integer;
+begin
+  Result := (N + 3) and (-4);
+end;
+
+procedure Put16(var B: string; Off, V: Integer);
+begin
+  B[Off] := Char(V and 255);
+  B[Off + 1] := Char((V shr 8) and 255);
+end;
+
+procedure Put32(var B: string; Off: Integer; V: Int64);
+begin
+  B[Off] := Char(V and 255);
+  B[Off + 1] := Char((V shr 8) and 255);
+  B[Off + 2] := Char((V shr 16) and 255);
+  B[Off + 3] := Char((V shr 24) and 255);
+end;
+
+function Get16(const B: string; Off: Integer): Integer;
+begin
+  Result := Ord(B[Off]) or (Ord(B[Off + 1]) shl 8);
+end;
+
+function Get32(const B: string; Off: Integer): Int64;
+begin
+  Result := Ord(B[Off]) or (Ord(B[Off + 1]) shl 8) or
+    (Ord(B[Off + 2]) shl 16) or (Ord(B[Off + 3]) shl 24);
+end;
+
+function EvKind(const E: string): Integer;
+begin
+  Result := Ord(E[1]) and 127;
+end;
+
+procedure TX11.SendPkt(const B: string);
+var
+  off, n, k: Int64;
+begin
+  off := 1;
+  n := Length(B);
+  while off <= n do
+  begin
+    k := Sys3(SysWrite, Fd, Int64(@B[off]), n - off + 1);
+    if k <= 0 then
+      Exit;
+    off := off + k;
+  end;
+end;
+
+function TX11.Pull(N: Integer): string;
+var
+  tmp: string;
+  k, have: Int64;
+begin
+  Result := '';
+  if N <= 0 then
+    Exit;
+  while Length(InBuf) < N do
+  begin
+    WaitFd(Fd);
+    tmp := Blank(4096);
+    k := Sys3(SysRead, Fd, Int64(@tmp[1]), 4096);
+    if k <= 0 then
+      Exit;
+    SetLength(tmp, k);
+    InBuf := InBuf + tmp;
+  end;
+  Result := Copy(InBuf, 1, N);
+  have := Length(InBuf) - N;
+  if have > 0 then
+    InBuf := Copy(InBuf, N + 1, have)
+  else
+    InBuf := '';
+end;
+
+function TX11.AllocId: Int64;
+begin
+  Seq := Seq + 1;
+  Result := Base or (Seq and Mask);
+end;
+
+function TX11.Connect: Boolean;
+var
+  disp, path, auth, setup, rest, sock, num: string;
+  addr: array[0..111] of Char;
+  i, n, extra: Integer;
+  p: Int64;
+begin
+  Result := False;
+  disp := GetEnv('DISPLAY');
+  if disp = '' then
+    disp := ':0';
+  { DISPLAY is :N or :N.S. Take every digit of N, not the first one:
+    with one digit :99 went to the socket of display 9. }
+  path := '/tmp/.X11-unix/X0';
+  if (Length(disp) >= 2) and (disp[1] = ':') then
+  begin
+    num := '';
+    n := 2;
+    while (n <= Length(disp)) and (disp[n] >= '0') and (disp[n] <= '9') do
+    begin
+      num := num + disp[n];
+      n := n + 1;
+    end;
+    if num <> '' then
+      path := '/tmp/.X11-unix/X' + num;
+  end;
+  for i := 0 to 111 do
+    addr[i] := #0;
+  addr[0] := Char(AfUnix);
+  addr[1] := #0;
+  n := Length(path);
+  for i := 1 to n do
+    addr[i + 1] := path[i];
+  Fd := Sys3(SysSocket, AfUnix, SockStream, 0);
+  if Fd < 0 then
+    Exit;
+  p := Sys3(SysConnect, Fd, Int64(@addr[0]), 110);
+  if p < 0 then
+  begin
+    Sys1(SysClose, Fd);
+    Fd := -1;
+    Exit;
+  end;
+  auth := GetEnv('XAUTHORITY');
+  if auth = '' then
+  begin
+    sock := GetEnv('HOME');
+    if sock <> '' then
+      auth := JoinPath(sock, '.Xauthority');
+  end;
+  setup := Blank(12);
+  setup[1] := 'l';
+  Put16(setup, 3, 11);
+  if (auth <> '') and ReadFile(auth, rest) and (Length(rest) > 20) then
+  begin
+    i := 1;
+    while i + 8 <= Length(rest) do
+    begin
+      i := i + 2;
+      n := (Ord(rest[i]) shl 8) or Ord(rest[i + 1]);
+      i := i + 2 + n;
+      if i + 2 > Length(rest) then
+        Break;
+      n := (Ord(rest[i]) shl 8) or Ord(rest[i + 1]);
+      i := i + 2 + n;
+      if i + 2 > Length(rest) then
+        Break;
+      n := (Ord(rest[i]) shl 8) or Ord(rest[i + 1]);
+      i := i + 2;
+      if i + n > Length(rest) then
+        Break;
+      sock := Copy(rest, i, n);
+      i := i + n;
+      if i + 2 > Length(rest) then
+        Break;
+      extra := (Ord(rest[i]) shl 8) or Ord(rest[i + 1]);
+      i := i + 2;
+      if i + extra - 1 > Length(rest) then
+        Break;
+      if (sock = 'MIT-MAGIC-COOKIE-1') and (extra > 0) then
+      begin
+        setup := Blank(12 + XPad(Length(sock)) + XPad(extra));
+        setup[1] := 'l';
+        Put16(setup, 3, 11);
+        Put16(setup, 7, Length(sock));
+        Put16(setup, 9, extra);
+        for n := 1 to Length(sock) do
+          setup[12 + n] := sock[n];
+        for n := 1 to extra do
+          setup[12 + XPad(Length(sock)) + n] := rest[i + n - 1];
+      end;
+      i := i + extra;
+    end;
+  end;
+  if Sys3(SysWrite, Fd, Int64(@setup[1]), Length(setup)) <> Length(setup) then
+  begin
+    Sys1(SysClose, Fd);
+    Fd := -1;
+    Exit;
+  end;
+  setup := Pull(8);
+  if (Length(setup) < 8) or (setup[1] <> #1) then
+  begin
+    Sys1(SysClose, Fd);
+    Fd := -1;
+    Exit;
+  end;
+  extra := Get16(setup, 7) * 4;
+  rest := Pull(extra);
+  if Length(rest) < extra then
+  begin
+    Sys1(SysClose, Fd);
+    Fd := -1;
+    Exit;
+  end;
+  Base := Get32(rest, 5);
+  Mask := Get32(rest, 9);
+  MinKey := Ord(rest[27]);
+  MaxKey := Ord(rest[28]);
+  n := Get16(rest, 17);
+  i := 33 + XPad(n) + Ord(rest[22]) * 8;
+  if i + 15 <= Length(rest) then
+  begin
+    Root := Get32(rest, i);
+    White := Get32(rest, i + 8);
+    Black := Get32(rest, i + 12);
+    { The screen block: width and height in pixels at offsets 20 and 22. }
+    ScreenW := Get16(rest, i + 20);
+    ScreenH := Get16(rest, i + 22);
+  end;
+  Result := Root <> 0;
+end;
+
+function TX11.CreateWin(W, H: Integer): Int64;
+var
+  req: string;
+  id: Int64;
+begin
+  id := AllocId;
+  req := Blank(40);
+  req[1] := Char(1);
+  req[2] := #0;
+  Put16(req, 3, 10);
+  Put32(req, 5, id);
+  Put32(req, 9, Root);
+  Put16(req, 13, 40);
+  Put16(req, 15, 40);
+  Put16(req, 17, W);
+  Put16(req, 19, H);
+  Put16(req, 21, 0);
+  Put16(req, 23, 1);
+  Put32(req, 25, 0);
+  { Background pixel and event mask, and no override-redirect: this is
+    an ordinary top-level window, so the window manager gives it a
+    frame and a title bar like any other program. }
+  Put32(req, 29, 2050);
+  Put32(req, 33, White);
+  Put32(req, 37, 32845);
+  SendPkt(req);
+  Result := id;
+end;
+
+{ The name the window manager shows on the frame (WM_NAME, atom 39,
+  type STRING, atom 31). }
+procedure TX11.SetTitle(Win: Int64; const S: string);
+var
+  req: string;
+  i, n: Integer;
+begin
+  n := Length(S);
+  if n > 200 then
+    n := 200;
+  req := Blank(24 + XPad(n));
+  req[1] := Char(18);
+  req[2] := #0;
+  Put16(req, 3, Length(req) div 4);
+  Put32(req, 5, Win);
+  Put32(req, 9, 39);
+  Put32(req, 13, 31);
+  req[17] := Char(8);
+  Put32(req, 21, n);
+  for i := 1 to n do
+    req[24 + i] := S[i];
+  SendPkt(req);
+end;
+
+{ WM_CLASS (atom 67): the instance name and the class name, each one
+  ending in a zero byte. A desktop uses it to know which application a
+  window belongs to: without it KDE shows no entry in the task bar and
+  the window is easy to lose behind another. }
+procedure TX11.SetClass(Win: Int64; const Instance, Cls: string);
+var
+  req: string;
+  i, n: Integer;
+begin
+  n := Length(Instance) + 1 + Length(Cls) + 1;
+  req := Blank(24 + XPad(n));
+  req[1] := Char(18);
+  req[2] := #0;
+  Put16(req, 3, Length(req) div 4);
+  Put32(req, 5, Win);
+  Put32(req, 9, 67);
+  Put32(req, 13, 31);
+  req[17] := Char(8);
+  Put32(req, 21, n);
+  for i := 1 to Length(Instance) do
+    req[24 + i] := Instance[i];
+  req[24 + Length(Instance) + 1] := #0;
+  for i := 1 to Length(Cls) do
+    req[24 + Length(Instance) + 1 + i] := Cls[i];
+  req[24 + n] := #0;
+  SendPkt(req);
+end;
+
+{ ConfigureWindow with the stacking mode alone: the window goes to the
+  top, so it opens in front of what was there and not behind it. }
+procedure TX11.RaiseWin(Win: Int64);
+var
+  req: string;
+begin
+  req := Blank(16);
+  req[1] := Char(12);
+  Put16(req, 3, 4);
+  Put32(req, 5, Win);
+  Put16(req, 9, 64);
+  Put32(req, 13, 0);
+  SendPkt(req);
+end;
+
+
+{ What a desktop needs to treat a window as an application window and
+  to put it in front: its kind, the protocols it answers, a request to
+  activate it, and the atom that says the frame's close button was
+  pressed. Without these KDE shows no task-bar entry, may leave the
+  window behind another and has no way to ask it to close. }
+procedure TX11.SetWinType(Win: Int64);
+var
+  req: string;
+  aType, aNormal: Int64;
+begin
+  aType := Atom('_NET_WM_WINDOW_TYPE');
+  aNormal := Atom('_NET_WM_WINDOW_TYPE_NORMAL');
+  if (aType = 0) or (aNormal = 0) then
+    Exit;
+  req := Blank(28);
+  req[1] := Char(18);
+  req[2] := #0;
+  Put16(req, 3, 7);
+  Put32(req, 5, Win);
+  Put32(req, 9, aType);
+  Put32(req, 13, 4);
+  req[17] := Char(32);
+  Put32(req, 21, 1);
+  Put32(req, 25, aNormal);
+  SendPkt(req);
+end;
+
+{ WM_PROTOCOLS = WM_DELETE_WINDOW: the window manager then sends a
+  ClientMessage instead of killing the connection when the close
+  button is pressed. DeleteAtom is what that message carries. }
+procedure TX11.SetProtocols(Win: Int64);
+var
+  req: string;
+  aProt: Int64;
+begin
+  aProt := Atom('WM_PROTOCOLS');
+  DeleteAtom := Atom('WM_DELETE_WINDOW');
+  if (aProt = 0) or (DeleteAtom = 0) then
+    Exit;
+  req := Blank(28);
+  req[1] := Char(18);
+  req[2] := #0;
+  Put16(req, 3, 7);
+  Put32(req, 5, Win);
+  Put32(req, 9, aProt);
+  Put32(req, 13, 4);
+  req[17] := Char(32);
+  Put32(req, 21, 1);
+  Put32(req, 25, DeleteAtom);
+  SendPkt(req);
+end;
+
+{ Ask the desktop to bring this window to the front and give it the
+  keyboard, the way a program asks for it (_NET_ACTIVE_WINDOW sent to
+  the root with SubstructureRedirect and SubstructureNotify). }
+procedure TX11.Activate(Win: Int64);
+var
+  ev, req: string;
+  aAct: Int64;
+begin
+  aAct := Atom('_NET_ACTIVE_WINDOW');
+  if aAct = 0 then
+    Exit;
+  ev := Blank(32);
+  ev[1] := Char(33);
+  ev[2] := Char(32);
+  Put16(ev, 3, 0);
+  Put32(ev, 5, Win);
+  Put32(ev, 9, aAct);
+  Put32(ev, 13, 1);
+  Put32(ev, 17, 0);
+  Put32(ev, 21, 0);
+  req := Blank(12) + ev;
+  req[1] := Char(25);
+  req[2] := #0;
+  Put16(req, 3, Length(req) div 4);
+  Put32(req, 5, Root);
+  Put32(req, 9, 1572864);
+  SendPkt(req);
+end;
+
+{ True when this event is the window manager asking the window to
+  close. }
+function TX11.IsCloseEvent(const Ev: string): Boolean;
+begin
+  Result := False;
+  if Length(Ev) < 32 then
+    Exit;
+  if (Ord(Ev[1]) and 127) <> 33 then
+    Exit;
+  Result := (DeleteAtom <> 0) and (Get32(Ev, 13) = DeleteAtom);
+end;
+
+function TX11.CreateGc(Win: Int64): Int64;
+var
+  req: string;
+  id: Int64;
+begin
+  id := AllocId;
+  req := Blank(16);
+  req[1] := Char(55);
+  Put16(req, 3, 4);
+  Put32(req, 5, id);
+  Put32(req, 9, Win);
+  SendPkt(req);
+  Result := id;
+end;
+
+procedure TX11.MapWin(Win: Int64);
+var
+  req: string;
+begin
+  req := Blank(8);
+  req[1] := Char(8);
+  Put16(req, 3, 2);
+  Put32(req, 5, Win);
+  SendPkt(req);
+end;
+
+procedure TX11.SetFg(Gc, Pix: Int64);
+var
+  req: string;
+begin
+  req := Blank(16);
+  req[1] := Char(56);
+  Put16(req, 3, 4);
+  Put32(req, 5, Gc);
+  Put32(req, 9, 4);
+  Put32(req, 13, Pix);
+  SendPkt(req);
+end;
+
+{ DrawText is ImageText8: it paints the character cell with the GC
+  background before the glyphs. A new GC has background 1, so white
+  text on a black bar left a box of pixel 1 around every letter.
+  Whoever draws text sets the background to the surface behind it. }
+procedure TX11.SetBg(Gc, Pix: Int64);
+var
+  req: string;
+begin
+  req := Blank(16);
+  req[1] := Char(56);
+  Put16(req, 3, 4);
+  Put32(req, 5, Gc);
+  Put32(req, 9, 8);
+  Put32(req, 13, Pix);
+  SendPkt(req);
+end;
+
+procedure TX11.LoadFont;
+var
+  req, name, rep: string;
+  i, nprop, ninfo, c, w, off: Integer;
+begin
+  Fid := AllocId;
+  name := 'fixed';
+  req := Blank(12 + XPad(Length(name)));
+  req[1] := Char(45);
+  Put16(req, 3, Length(req) div 4);
+  Put32(req, 5, Fid);
+  Put16(req, 9, Length(name));
+  for i := 1 to Length(name) do
+    req[12 + i] := name[i];
+  SendPkt(req);
+  req := Blank(8);
+  req[1] := Char(47);
+  Put16(req, 3, 2);
+  Put32(req, 5, Fid);
+  SendPkt(req);
+  rep := ReadReply;
+  if (Length(rep) < 60) or (rep[1] <> #1) then
+    Exit;
+  Ascent := Get16(rep, 53);
+  Descent := Get16(rep, 55);
+  MinCh := Get16(rep, 41);
+  MaxCh := Get16(rep, 43);
+  nprop := Get16(rep, 47);
+  ninfo := Get32(rep, 57);
+  Wids := Blank(256);
+  off := 61 + nprop * 8;
+  if (ninfo > 0) and (off + 12 <= Length(rep) + 1) then
+  begin
+    for c := MinCh to MaxCh do
+    begin
+      i := c - MinCh;
+      if (i >= 0) and (i < ninfo) and (off + i * 12 + 5 <= Length(rep)) then
+      begin
+        w := Get16(rep, off + i * 12 + 4);
+        if (w > 0) and (w < 256) and (c >= 0) and (c < 256) then
+          Wids[c + 1] := Char(w);
+      end;
+    end;
+  end
+  else
+  begin
+    w := Get16(rep, 29);
+    if (w <= 0) or (w > 255) then
+      w := Get16(rep, 13);
+    for c := 0 to 255 do
+      Wids[c + 1] := Char(w and 255);
+  end;
+  req := Blank(8);
+  req[1] := Char(101);
+  Put16(req, 3, 2);
+  req[5] := Char(MinKey);
+  req[6] := Char(MaxKey - MinKey + 1);
+  SendPkt(req);
+  rep := ReadReply;
+  if (Length(rep) < 32) or (rep[1] <> #1) then
+    Exit;
+  KPer := Ord(rep[2]);
+  KFirst := MinKey;
+  if Length(rep) > 32 then
+    KSyms := Copy(rep, 33, Length(rep) - 32);
+end;
+
+function TX11.TextWidth(const S: string): Integer;
+var
+  i, c: Integer;
+begin
+  Result := 0;
+  if Length(Wids) < 256 then
+  begin
+    Result := -1;
+    Exit;
+  end;
+  for i := 1 to Length(S) do
+  begin
+    c := Ord(S[i]);
+    if (c >= 0) and (c < 256) then
+      Result := Result + Ord(Wids[c + 1]);
+  end;
+end;
+
+procedure TX11.FillRect(Win, Gc: Int64; X, Y, W, H: Integer; Pix: Int64);
+var
+  req: string;
+begin
+  SetFg(Gc, Pix);
+  req := Blank(20);
+  req[1] := Char(70);
+  Put16(req, 3, 5);
+  Put32(req, 5, Win);
+  Put32(req, 9, Gc);
+  Put16(req, 13, X);
+  Put16(req, 15, Y);
+  Put16(req, 17, W);
+  Put16(req, 19, H);
+  SendPkt(req);
+end;
+
+procedure TX11.DrawLine(Win, Gc: Int64; X1, Y1, X2, Y2: Integer; Pix: Int64);
+var
+  req: string;
+begin
+  SetFg(Gc, Pix);
+  req := Blank(20);
+  req[1] := Char(65);
+  Put16(req, 3, 5);
+  Put32(req, 5, Win);
+  Put32(req, 9, Gc);
+  Put16(req, 13, X1);
+  Put16(req, 15, Y1);
+  Put16(req, 17, X2);
+  Put16(req, 19, Y2);
+  SendPkt(req);
+end;
+
+procedure TX11.DrawText(Win, Gc: Int64; X, Y: Integer; const S: string; Pix: Int64);
+var
+  req: string;
+  n, i: Integer;
+begin
+  n := Length(S);
+  if n = 0 then
+    Exit;
+  if n > 80 then
+    n := 80;
+  req := Blank(16);
+  req[1] := Char(56);
+  Put16(req, 3, 4);
+  Put32(req, 5, Gc);
+  Put32(req, 9, 16384);
+  Put32(req, 13, Fid);
+  SendPkt(req);
+  SetFg(Gc, Pix);
+  req := Blank(XPad(16 + n));
+  req[1] := Char(76);
+  req[2] := Char(n);
+  Put16(req, 3, Length(req) div 4);
+  Put32(req, 5, Win);
+  Put32(req, 9, Gc);
+  Put16(req, 13, X);
+  Put16(req, 15, Y);
+  for i := 1 to n do
+    req[16 + i] := S[i];
+  SendPkt(req);
+end;
+
+procedure TX11.SetClip(Gc: Int64; X, Y, W, H: Integer);
+var
+  req: string;
+begin
+  req := Blank(20);
+  req[1] := Char(59);
+  Put16(req, 3, 5);
+  Put32(req, 5, Gc);
+  Put16(req, 9, 0);
+  Put16(req, 11, 0);
+  Put16(req, 13, X);
+  Put16(req, 15, Y);
+  Put16(req, 17, W);
+  Put16(req, 19, H);
+  SendPkt(req);
+end;
+
+function TX11.ReadReply: string;
+var
+  rep, extra: string;
+  n, guard: Integer;
+begin
+  Result := '';
+  guard := 0;
+  while guard < 40 do
+  begin
+    Inc(guard);
+    rep := Pull(32);
+    if Length(rep) < 32 then
+      Exit;
+    if rep[1] = #1 then
+    begin
+      n := Get32(rep, 5);
+      if n > 0 then
+      begin
+        extra := Pull(n * 4);
+        if Length(extra) < n * 4 then
+          Exit;
+        rep := rep + extra;
+      end;
+      Result := rep;
+      Exit;
+    end;
+    if rep[1] = #0 then
+    begin
+      Result := rep;
+      Exit;
+    end;
+    EvQ := EvQ + rep;
+  end;
+end;
+
+function TX11.CanRead: Boolean;
+var
+  pfd, r: Int64;
+begin
+  if (Length(InBuf) > 0) or (Length(EvQ) > 0) then
+  begin
+    Result := True;
+    Exit;
+  end;
+  pfd := (Fd and $FFFFFFFF) or (Int64(1) shl 32);
+  r := Sys3(SysPoll, Int64(@pfd), 1, 300);
+  Result := r > 0;
+end;
+
+function TX11.Sync: Boolean;
+var
+  req, rep: string;
+  i: Integer;
+begin
+  Result := False;
+  LastErr := 0;
+  LastOp := 0;
+  req := Blank(4);
+  req[1] := Char(43);
+  Put16(req, 3, 1);
+  SendPkt(req);
+  for i := 1 to 6 do
+  begin
+    if not CanRead then
+      Exit;
+    rep := ReadReply;
+    if Length(rep) < 11 then
+      Exit;
+    if rep[1] = #1 then
+    begin
+      Result := True;
+      Exit;
+    end;
+    if rep[1] = #0 then
+    begin
+      LastErr := Ord(rep[2]);
+      LastOp := Ord(rep[11]);
+    end;
+  end;
+end;
+
+function TX11.NextEvent: string;
+var
+  ev: string;
+  i: Integer;
+begin
+  Result := '';
+  for i := 1 to 40 do
+  begin
+    if Length(EvQ) >= 32 then
+    begin
+      ev := Copy(EvQ, 1, 32);
+      if Length(EvQ) > 32 then
+        EvQ := Copy(EvQ, 33, Length(EvQ) - 32)
+      else
+        EvQ := '';
+    end
+    else
+      ev := Pull(32);
+    if Length(ev) < 32 then
+      Exit;
+    if (Ord(ev[1]) <> 0) and ((Ord(ev[1]) and 127) <> 1) then
+    begin
+      Result := ev;
+      Exit;
+    end;
+  end;
+end;
+
+function TX11.Queued: Integer;
+begin
+  Result := Length(EvQ) div 32;
+end;
+
+procedure TX11.SendClick(Win: Int64; Kind, Button, X, Y: Integer);
+var
+  ev, req: string;
+  i: Integer;
+begin
+  ev := Blank(32);
+  ev[1] := Char(Kind);
+  ev[2] := Char(Button);
+  Put32(ev, 9, Root);
+  Put32(ev, 13, Win);
+  Put16(ev, 21, X);
+  Put16(ev, 23, Y);
+  Put16(ev, 25, X);
+  Put16(ev, 27, Y);
+  ev[31] := #1;
+  req := Blank(44);
+  req[1] := Char(25);
+  Put16(req, 3, 11);
+  Put32(req, 5, Win);
+  Put32(req, 9, 0);
+  for i := 1 to 32 do
+    req[12 + i] := ev[i];
+  SendPkt(req);
+end;
+
+procedure TX11.SendKey(Win: Int64; KeyCode: Integer);
+begin
+  SendClick(Win, 2, KeyCode, 4, 4);
+end;
+
+function TX11.Keysym(Code: Integer): Int64;
+begin
+  Result := KeysymShift(Code, False);
+end;
+
+{ The keyboard gives KPer symbols per key: the first is the key on its
+  own, the second the key with shift. A key with no second symbol, or
+  a letter, answers with the first one, upper-cased for a letter. }
+function TX11.KeysymShift(Code: Integer; Shift: Boolean): Int64;
+var
+  off: Integer;
+  plain: Int64;
+begin
+  Result := 0;
+  if (KPer <= 0) or (Length(KSyms) < 4) then
+    Exit;
+  if (Code < KFirst) or (Code > MaxKey) then
+    Exit;
+  off := (Code - KFirst) * KPer * 4;
+  if off + 4 > Length(KSyms) then
+    Exit;
+  plain := Get32(KSyms, off + 1);
+  Result := plain;
+  if not Shift then
+    Exit;
+  if (KPer >= 2) and (off + 8 <= Length(KSyms)) then
+  begin
+    Result := Get32(KSyms, off + 5);
+    if Result = 0 then
+      Result := plain;
+  end;
+  if (Result = plain) and (plain >= 97) and (plain <= 122) then
+    Result := plain - 32;
+end;
+
+function TX11.Atom(const Name: string): Int64;
+var
+  req, rep: string;
+  i: Integer;
+begin
+  Result := 0;
+  req := Blank(8 + XPad(Length(Name)));
+  req[1] := Char(16);
+  Put16(req, 3, Length(req) div 4);
+  Put16(req, 5, Length(Name));
+  for i := 1 to Length(Name) do
+    req[8 + i] := Name[i];
+  SendPkt(req);
+  rep := ReadReply;
+  if (Length(rep) >= 32) and (rep[1] = #1) then
+    Result := Get32(rep, 9);
+end;
+
+procedure TX11.AnswerSel(const Ev: string);
+var
+  req, data: string;
+  i, n: Integer;
+  requestor, sel, tgt, prop: Int64;
+begin
+  requestor := Get32(Ev, 13);
+  sel := Get32(Ev, 17);
+  tgt := Get32(Ev, 21);
+  prop := Get32(Ev, 25);
+  data := Owned;
+  n := Length(data);
+  req := Blank(24 + XPad(n));
+  req[1] := Char(18);
+  Put16(req, 3, Length(req) div 4);
+  Put32(req, 5, requestor);
+  Put32(req, 9, prop);
+  Put32(req, 13, tgt);
+  req[17] := Char(8);
+  Put32(req, 21, n);
+  for i := 1 to n do
+    req[24 + i] := data[i];
+  SendPkt(req);
+  req := Blank(44);
+  req[1] := Char(25);
+  Put16(req, 3, 11);
+  Put32(req, 5, requestor);
+  data := Blank(32);
+  data[1] := Char(31);
+  Put32(data, 9, requestor);
+  Put32(data, 13, sel);
+  Put32(data, 17, tgt);
+  Put32(data, 21, prop);
+  for i := 1 to 32 do
+    req[12 + i] := data[i];
+  SendPkt(req);
+end;
+
+function TX11.TakeProp(Win, Prop: Int64): string;
+var
+  req, rep: string;
+  n: Integer;
+begin
+  Result := '';
+  req := Blank(24);
+  req[1] := Char(20);
+  req[2] := #1;
+  Put16(req, 3, 6);
+  Put32(req, 5, Win);
+  Put32(req, 9, Prop);
+  Put32(req, 13, 0);
+  Put32(req, 17, 0);
+  Put32(req, 21, 256);
+  SendPkt(req);
+  rep := ReadReply;
+  if (Length(rep) < 32) or (rep[1] <> #1) then
+    Exit;
+  n := Get32(rep, 17);
+  if (n > 0) and (n <= Length(rep) - 32) then
+    Result := Copy(rep, 33, n);
+end;
+
+function TX11.ClipRound(Win: Int64; const Data: string): string;
+var
+  req, ev: string;
+  i, k: Integer;
+  aClip, aUtf, aProp: Int64;
+begin
+  Result := '';
+  Owned := Data;
+  aClip := Atom('CLIPBOARD');
+  aUtf := Atom('UTF8_STRING');
+  aProp := Atom('PASLANG_SEL');
+  if (aClip = 0) or (aUtf = 0) or (aProp = 0) then
+    Exit;
+  req := Blank(16);
+  req[1] := Char(22);
+  Put16(req, 3, 4);
+  Put32(req, 5, Win);
+  Put32(req, 9, aClip);
+  SendPkt(req);
+  req := Blank(24);
+  req[1] := Char(24);
+  Put16(req, 3, 6);
+  Put32(req, 5, Win);
+  Put32(req, 9, aClip);
+  Put32(req, 13, aUtf);
+  Put32(req, 17, aProp);
+  SendPkt(req);
+  for i := 1 to 20 do
+  begin
+    ev := NextEvent;
+    if Length(ev) < 32 then
+      Exit;
+    k := Ord(ev[1]) and 127;
+    if k = 30 then
+      AnswerSel(ev)
+    else if k = 31 then
+    begin
+      Result := TakeProp(Win, aProp);
+      Exit;
+    end;
+  end;
+end;
+
+function TX11.PixelAt(Win: Int64; X, Y: Integer): Int64;
+var
+  req, rep: string;
+begin
+  Result := -1;
+  req := Blank(20);
+  req[1] := Char(73);
+  req[2] := Char(2);
+  Put16(req, 3, 5);
+  Put32(req, 5, Win);
+  Put16(req, 9, X);
+  Put16(req, 11, Y);
+  Put16(req, 13, 1);
+  Put16(req, 15, 1);
+  Put32(req, 17, -1);
+  SendPkt(req);
+  rep := ReadReply;
+  if (Length(rep) >= 36) and (rep[1] = #1) then
+    Result := Get32(rep, 33);
+end;
+
+end.

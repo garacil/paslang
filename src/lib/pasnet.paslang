@@ -1,0 +1,2010 @@
+{$mode objfpc}{$H+}
+
+{ TCP and UDP on the scheduler. Accept, connect, read, write, and a
+  blocked datagram receive park the G. The descriptor is nonblocking.
+  P114 (1.1.1): both address families and names, the peer of a
+  datagram, the options a server sets, one direction shut, lines and
+  counted reads over a buffer, the descriptor limit, and the DNS
+  messages of a resolver and a server. P117: Unix-domain sockets,
+  stream and datagram, a path or an abstract name, a pair, the peer's
+  credentials, a descriptor passed with a message, and a wait on
+  several descriptors. }
+unit pasnet;
+
+interface
+
+function TcpListen(Port: Integer): Integer;
+function TcpPort(Fd: Integer): Integer;
+function TcpAccept(Fd: Integer): Integer;
+function TcpConnect(const Host: string; Port: Integer): Integer;
+function TcpRead(Fd, MaxN: Integer): string;
+function TcpWrite(Fd: Integer; const Data: string): Integer;
+procedure TcpClose(Fd: Integer);
+
+function UdpBind(Port: Integer): Integer;
+function UdpPort(Fd: Integer): Integer;
+function UdpSend(Fd: Integer; const Host: string; Port: Integer;
+  const Data: string): Integer;
+function UdpRecv(Fd, MaxN: Integer): string;
+procedure UdpClose(Fd: Integer);
+
+function TcpListen6(Port: Integer): Integer;
+function TcpConnect6(Port: Integer): Integer;
+function TcpAccept6(Fd: Integer): Integer;
+function TcpReadDeadline(Fd, MaxN, Ms: Integer): string;
+
+{ Addresses (P114, 1.1.1): a host is a dotted quad, an IPv6 literal
+  (::1, fe80::1, ::ffff:1.2.3.4, with or without brackets) or a name,
+  which Resolve turns into a dotted quad by /etc/hosts and then the
+  first nameserver of /etc/resolv.conf over UDP. }
+function HostToV4(const S: string; out Ip: Integer): Boolean;
+function HostToV6(const S: string; var A: array[0..15] of Byte): Boolean;
+function V4ToStr(Ip: Integer): string;
+function V6ToStr(const A: array[0..15] of Byte): string;
+function IsV6Text(const S: string): Boolean;
+function Resolve(const Host: string): string;
+
+{ TCP for servers: an address of either family, the backlog, the peer,
+  one direction shut, keep-alive, the buffers, lines and counted reads
+  over a per-connection buffer the caller keeps. }
+function TcpListenAt(const Host: string; Port, Backlog: Integer): Integer;
+function TcpConnectTo(const Host: string; Port: Integer): Integer;
+function TcpPeer(Fd: Integer): string;
+function TcpLocal(Fd: Integer): string;
+procedure TcpShutdown(Fd, How: Integer);
+procedure TcpKeepAlive(Fd: Integer; On: Boolean);
+procedure SockBuffers(Fd, RecvBytes, SendBytes: Integer);
+function TcpReadLine(Fd: Integer; var Buf: string; out Line: string): Boolean;
+function TcpReadN(Fd, N: Integer; var Buf: string; out Data: string): Boolean;
+
+{ UDP with the peer's address, either family, datagrams to 65507 bytes. }
+function UdpBindAt(const Host: string; Port: Integer): Integer;
+function UdpSendTo(Fd: Integer; const Host: string; Port: Integer; const Data: string): Integer;
+function UdpRecvFrom(Fd, MaxN: Integer; out Host: string; out Port: Integer): string;
+function UdpRecvFromMs(Fd, MaxN, Ms: Integer; out Host: string; out Port: Integer): string;
+
+{ The descriptor limit raised to what the system allows: the new soft
+  limit. A server of tens of thousands of connections calls it first. }
+function RaiseFdLimit: Integer;
+
+{ DNS messages (RFC 1035) for a resolver or a server: a question for
+  an A record, the first A of an answer, the name a question asks,
+  and the answers a server sends back: an A record, or no such name. }
+function DnsQueryA(const Name: string; Id: Integer): string;
+function DnsAnswerA(const Msg: string; Id: Integer): string;
+function DnsQuestionName(const Msg: string): string;
+function DnsReplyA(const Query: string; Ip4, Ttl: Integer): string;
+function DnsReplyNx(const Query: string): string;
+
+{ Unix-domain sockets (P117, 1.1.1): a path, or an abstract name when
+  it starts with '@' (Linux: no file is made). A stream socket listens,
+  accepts and connects; NetRead, NetWrite, TcpRead, TcpWrite,
+  TcpReadLine, TcpShutdown and TcpClose serve it as they serve TCP. A
+  datagram socket sends to a path and receives with the sender's. A
+  pair is two connected stream sockets in this process. UnixPeer gives
+  the process, user and group at the other end; UnixSendFd passes a
+  descriptor with a message and UnixRecvFd takes it. Every wait parks
+  the routine on the poller. }
+function UnixListen(const Path: string): Integer;
+function UnixConnect(const Path: string): Integer;
+function UnixAccept(Fd: Integer): Integer;
+function UnixBind(const Path: string): Integer;
+function UnixSendTo(Fd: Integer; const Path, Data: string): Integer;
+function UnixRecvFrom(Fd, MaxN: Integer; out From: string): string;
+function UnixPair(out A, B: Integer): Boolean;
+function UnixPeer(Fd: Integer; out Pid, Uid, Group: Integer): Boolean;
+function UnixSendFd(Fd, Passed: Integer; const Data: string): Integer;
+function UnixRecvFd(Fd, MaxN: Integer; out Passed: Integer): string;
+procedure UnixClose(Fd: Integer);
+procedure UnixUnlink(const Path: string);
+
+{ A wait on several descriptors at once (P117): the first of Fds that
+  is ready for Ev (1 to read, 4 to write) within Ms milliseconds, as
+  an index into Fds, or -1 when the time runs out; the routine parks. }
+function WaitAny(const Fds: array of Integer; Ev, Ms: Integer): Integer;
+
+implementation
+
+uses
+  paslib;
+
+const
+  PnSocket = 41;
+  PnBind = 49;
+  PnSendto = 44;
+  PnRecvfrom = 45;
+  PnClose = 3;
+  SockDgramNb = 526338;
+
+function HostV4(const S: string): Integer;
+var
+  i, n, v, acc, dots, c: Integer;
+begin
+  n := Length(S);
+  acc := 0;
+  v := 0;
+  dots := 0;
+  i := 1;
+  while i <= n do
+  begin
+    c := Ord(S[i]);
+    if (c >= 48) and (c <= 57) then
+      v := v * 10 + (c - 48)
+    else if c = 46 then
+    begin
+      acc := acc * 256 + v;
+      v := 0;
+      dots := dots + 1;
+    end
+    else
+      Halt(1);
+    i := i + 1;
+  end;
+  if dots <> 3 then
+    Halt(1);
+  Result := acc * 256 + v;
+end;
+
+function TcpListen(Port: Integer): Integer;
+begin
+  Result := NetListen(Port);
+end;
+
+function TcpPort(Fd: Integer): Integer;
+begin
+  Result := NetPort(Fd);
+end;
+
+function TcpAccept(Fd: Integer): Integer;
+begin
+  Result := NetAccept(Fd);
+end;
+
+function TcpConnect(const Host: string; Port: Integer): Integer;
+begin
+  Result := NetConnect(HostV4(Host), Port);
+end;
+
+function TcpRead(Fd, MaxN: Integer): string;
+begin
+  NetRead(Fd, MaxN, Result);
+end;
+
+function TcpWrite(Fd: Integer; const Data: string): Integer;
+begin
+  Result := NetWrite(Fd, Data);
+end;
+
+procedure TcpClose(Fd: Integer);
+begin
+  NetClose(Fd);
+end;
+
+function SnSocket: Integer;
+begin
+  if Amd64 = 0 then
+    Result := 198
+  else
+    Result := PnSocket;
+end;
+
+function SnBind: Integer;
+begin
+  if Amd64 = 0 then
+    Result := 200
+  else
+    Result := PnBind;
+end;
+
+function SnSendto: Integer;
+begin
+  if Amd64 = 0 then
+    Result := 206
+  else
+    Result := PnSendto;
+end;
+
+function SnRecvfrom: Integer;
+begin
+  if Amd64 = 0 then
+    Result := 207
+  else
+    Result := PnRecvfrom;
+end;
+
+function SnClose: Integer;
+begin
+  if Amd64 = 0 then
+    Result := 57
+  else
+    Result := PnClose;
+end;
+
+procedure FillAddr(var Sa: array[0..15] of Char; Ip, Port: Integer);
+var
+  i: Integer;
+begin
+  for i := 0 to 15 do
+    Sa[i] := Char(0);
+  Sa[0] := Char(2);
+  Sa[2] := Char(Port div 256);
+  Sa[3] := Char(Port mod 256);
+  Sa[4] := Char(Ip div 16777216);
+  Sa[5] := Char((Ip div 65536) mod 256);
+  Sa[6] := Char((Ip div 256) mod 256);
+  Sa[7] := Char(Ip mod 256);
+end;
+
+function UdpBind(Port: Integer): Integer;
+var
+  fd, n: Integer;
+  sa: array[0..15] of Char;
+begin
+  fd := Syscall(SnSocket, 2, SockDgramNb, 0);
+  if fd < 0 then
+  begin
+    Result := -1;
+    Exit;
+  end;
+  FillAddr(sa, 0, Port);
+  n := Syscall(SnBind, fd, @sa, 16);
+  if n < 0 then
+  begin
+    n := Syscall(SnClose, fd);
+    Result := -1;
+    Exit;
+  end;
+  Result := fd;
+end;
+
+function UdpPort(Fd: Integer): Integer;
+begin
+  Result := NetPort(Fd);
+end;
+
+function UdpSend(Fd: Integer; const Host: string; Port: Integer;
+  const Data: string): Integer;
+var
+  sa: array[0..15] of Char;
+  n: Integer;
+begin
+  n := Length(Data);
+  if n > 65507 then
+    n := 65507;
+  FillAddr(sa, HostV4(Host), Port);
+  while True do
+  begin
+    Result := Syscall(SnSendto, Fd, Pointer(Data), n, 0, @sa, 16);
+    if Result <> -11 then
+      Break;
+    n := WaitIo(Fd, 4);
+    n := Length(Data);
+    if n > 65507 then
+      n := 65507;
+  end;
+end;
+
+function UdpRecv(Fd, MaxN: Integer): string;
+var
+  s: string;
+  n: Integer;
+begin
+  if MaxN < 1 then
+    MaxN := 1;
+  if MaxN > 65536 then
+    MaxN := 65536;
+  s := '';
+  SetLength(s, MaxN);
+  while True do
+  begin
+    n := Syscall(SnRecvfrom, Fd, Pointer(s), MaxN, 0, 0, 0);
+    if n >= 0 then
+      Break;
+    if n <> -11 then
+    begin
+      Result := '';
+      Exit;
+    end;
+    n := WaitIo(Fd, 1);
+  end;
+  SetLength(s, n);
+  Result := s;
+end;
+
+procedure UdpClose(Fd: Integer);
+var
+  n: Integer;
+begin
+  n := Syscall(SnClose, Fd);
+end;
+
+function SnListen: Integer;
+begin
+  if Amd64 = 0 then
+    Result := 201
+  else
+    Result := 50;
+end;
+
+function SnConnect: Integer;
+begin
+  if Amd64 = 0 then
+    Result := 203
+  else
+    Result := 42;
+end;
+
+function SnSetsockopt: Integer;
+begin
+  if Amd64 = 0 then
+    Result := 208
+  else
+    Result := 54;
+end;
+
+function SnGetsockopt: Integer;
+begin
+  if Amd64 = 0 then
+    Result := 209
+  else
+    Result := 55;
+end;
+
+procedure Fill6(var Sa: array[0..27] of Char; Port: Integer; Loop: Boolean);
+var
+  i: Integer;
+begin
+  for i := 0 to 27 do
+    Sa[i] := Char(0);
+  Sa[0] := Char(10);
+  Sa[2] := Char(Port div 256);
+  Sa[3] := Char(Port mod 256);
+  if Loop then
+    Sa[23] := Char(1);
+end;
+
+procedure SetNoDelay(Fd: Integer);
+var
+  one, n: Integer;
+begin
+  one := 1;
+  n := Syscall(SnSetsockopt, Fd, 6, 1, @one, 4);
+end;
+
+function TcpListen6(Port: Integer): Integer;
+var
+  fd, n: Integer;
+  sa: array[0..27] of Char;
+begin
+  fd := Syscall(SnSocket, 10, 526337, 0);
+  if fd < 0 then
+  begin
+    Result := -1;
+    Exit;
+  end;
+  Fill6(sa, Port, False);
+  n := Syscall(SnBind, fd, @sa, 28);
+  if n < 0 then
+  begin
+    n := Syscall(SnClose, fd);
+    Result := -1;
+    Exit;
+  end;
+  n := Syscall(SnListen, fd, 4096);
+  if n < 0 then
+  begin
+    n := Syscall(SnClose, fd);
+    Result := -1;
+    Exit;
+  end;
+  Result := fd;
+end;
+
+function TcpConnect6(Port: Integer): Integer;
+var
+  fd, n, err, olen: Integer;
+  sa: array[0..27] of Char;
+begin
+  fd := Syscall(SnSocket, 10, 526337, 0);
+  if fd < 0 then
+  begin
+    Result := -1;
+    Exit;
+  end;
+  Fill6(sa, Port, True);
+  n := Syscall(SnConnect, fd, @sa, 28);
+  if n < 0 then
+  begin
+    if n <> -115 then
+    begin
+      n := Syscall(SnClose, fd);
+      Result := -1;
+      Exit;
+    end;
+    n := WaitIo(fd, 4);
+    err := 0;
+    olen := 4;
+    n := Syscall(SnGetsockopt, fd, 1, 4, @err, @olen);
+    if (n < 0) or (err <> 0) then
+    begin
+      n := Syscall(SnClose, fd);
+      Result := -1;
+      Exit;
+    end;
+  end;
+  SetNoDelay(fd);
+  Result := fd;
+end;
+
+function TcpAccept6(Fd: Integer): Integer;
+begin
+  Result := TcpAccept(Fd);
+  if Result >= 0 then
+    SetNoDelay(Result);
+end;
+
+function SnRead: Integer;
+begin
+  if Amd64 = 0 then
+    Result := 63
+  else
+    Result := 0;
+end;
+
+function TcpReadDeadline(Fd, MaxN, Ms: Integer): string;
+var
+  buf: array[0..511] of Char;
+  s: string;
+  n, i: Integer;
+begin
+  if MaxN < 1 then
+    MaxN := 1;
+  if MaxN > 512 then
+    MaxN := 512;
+  n := Syscall(SnRead, Fd, @buf, MaxN);
+  if n < 0 then
+  begin
+    if n <> -11 then
+    begin
+      Result := '';
+      Exit;
+    end;
+    n := WaitMs(Fd, 1, Ms);
+    n := Syscall(SnRead, Fd, @buf, MaxN);
+  end;
+  if n <= 0 then
+  begin
+    Result := '';
+    Exit;
+  end;
+  s := '';
+  SetLength(s, n);
+  for i := 1 to n do
+    s[i] := buf[i - 1];
+  Result := s;
+end;
+
+{ ---- P114: addresses, both families, the peer, the options ---- }
+
+function SnAccept4: Integer;
+begin
+  if Amd64 = 0 then
+    Result := 202
+  else
+    Result := 288;
+end;
+
+function SnGetsockname: Integer;
+begin
+  if Amd64 = 0 then
+    Result := 204
+  else
+    Result := 51;
+end;
+
+function SnGetpeername: Integer;
+begin
+  if Amd64 = 0 then
+    Result := 205
+  else
+    Result := 52;
+end;
+
+function SnShutdown: Integer;
+begin
+  if Amd64 = 0 then
+    Result := 210
+  else
+    Result := 48;
+end;
+
+function SnPrlimit: Integer;
+begin
+  if Amd64 = 0 then
+    Result := 261
+  else
+    Result := 302;
+end;
+
+function SnWrite: Integer;
+begin
+  if Amd64 = 0 then
+    Result := 64
+  else
+    Result := 1;
+end;
+
+function IsV6Text(const S: string): Boolean;
+var
+  i: Integer;
+begin
+  Result := False;
+  for i := 1 to Length(S) do
+    if S[i] = ':' then
+    begin
+      Result := True;
+      Exit;
+    end;
+end;
+
+{ A dotted quad, or False: no Halt, a name goes to Resolve. }
+function HostToV4(const S: string; out Ip: Integer): Boolean;
+var
+  i, n, v, acc, dots, c, digits: Integer;
+begin
+  Result := False;
+  Ip := 0;
+  n := Length(S);
+  if n = 0 then
+    Exit;
+  acc := 0;
+  v := 0;
+  dots := 0;
+  digits := 0;
+  for i := 1 to n do
+  begin
+    c := Ord(S[i]);
+    if (c >= 48) and (c <= 57) then
+    begin
+      v := v * 10 + (c - 48);
+      digits := digits + 1;
+      if v > 255 then
+        Exit;
+    end
+    else if c = 46 then
+    begin
+      if digits = 0 then
+        Exit;
+      acc := acc * 256 + v;
+      v := 0;
+      digits := 0;
+      dots := dots + 1;
+    end
+    else
+      Exit;
+  end;
+  if (dots <> 3) or (digits = 0) then
+    Exit;
+  Ip := acc * 256 + v;
+  Result := True;
+end;
+
+function V4ToStr(Ip: Integer): string;
+begin
+  Result := IntToStr((Ip shr 24) and 255) + '.' + IntToStr((Ip shr 16) and 255) + '.' +
+    IntToStr((Ip shr 8) and 255) + '.' + IntToStr(Ip and 255);
+end;
+
+function HexVal(C: Char): Integer;
+begin
+  if (C >= '0') and (C <= '9') then
+    Result := Ord(C) - 48
+  else if (C >= 'a') and (C <= 'f') then
+    Result := Ord(C) - 87
+  else if (C >= 'A') and (C <= 'F') then
+    Result := Ord(C) - 55
+  else
+    Result := -1;
+end;
+
+function IntToHex4(V: Integer): string;
+const
+  Digits = '0123456789abcdef';
+var
+  i, d: Integer;
+begin
+  Result := '';
+  if V = 0 then
+  begin
+    Result := '0';
+    Exit;
+  end;
+  while V > 0 do
+  begin
+    d := V and 15;
+    Result := Digits[d + 1] + Result;
+    V := V shr 4;
+  end;
+end;
+
+{ An IPv6 literal into its 16 bytes: groups of hex, one :: for the
+  zeros left out, a dotted quad as the last 32 bits; brackets allowed. }
+function HostToV6(const S: string; var A: array[0..15] of Byte): Boolean;
+var
+  t: string;
+  i, n, g, v, d, gap, ngroups, k, ip4: Integer;
+  groups: array[0..7] of Integer;
+  tail: string;
+begin
+  Result := False;
+  t := S;
+  n := Length(t);
+  if (n >= 2) and (t[1] = '[') and (t[n] = ']') then
+  begin
+    t := Copy(t, 2, n - 2);
+    n := Length(t);
+  end;
+  if n = 0 then
+    Exit;
+  for i := 0 to 7 do
+    groups[i] := 0;
+  { a dotted quad at the end: its 32 bits are the last two groups }
+  tail := '';
+  k := n;
+  while (k >= 1) and (t[k] <> ':') do
+    k := k - 1;
+  if (k >= 1) and (k < n) then
+  begin
+    tail := Copy(t, k + 1, n - k);
+    if HostToV4(tail, ip4) then
+    begin
+      t := Copy(t, 1, k) + IntToHex4(ip4 shr 16) + ':' + IntToHex4(ip4 and 65535);
+      n := Length(t);
+    end;
+  end;
+  gap := -1;
+  ngroups := 0;
+  i := 1;
+  v := 0;
+  d := 0;
+  while i <= n do
+  begin
+    if t[i] = ':' then
+    begin
+      if (i + 1 <= n) and (t[i + 1] = ':') then
+      begin
+        if gap >= 0 then
+          Exit;
+        if d > 0 then
+        begin
+          if ngroups >= 8 then
+            Exit;
+          groups[ngroups] := v;
+          ngroups := ngroups + 1;
+        end;
+        gap := ngroups;
+        v := 0;
+        d := 0;
+        i := i + 2;
+        Continue;
+      end;
+      if (d = 0) and (i <> 1) then
+        Exit;
+      if d > 0 then
+      begin
+        if ngroups >= 8 then
+          Exit;
+        groups[ngroups] := v;
+        ngroups := ngroups + 1;
+      end;
+      v := 0;
+      d := 0;
+      i := i + 1;
+      Continue;
+    end;
+    g := HexVal(t[i]);
+    if (g < 0) or (d >= 4) then
+      Exit;
+    v := v * 16 + g;
+    d := d + 1;
+    i := i + 1;
+  end;
+  if d > 0 then
+  begin
+    if ngroups >= 8 then
+      Exit;
+    groups[ngroups] := v;
+    ngroups := ngroups + 1;
+  end;
+  if gap < 0 then
+  begin
+    if ngroups <> 8 then
+      Exit;
+  end
+  else
+  begin
+    if ngroups >= 8 then
+      Exit;
+    { open the gap: the groups after it move to the end }
+    k := 8 - ngroups;
+    i := ngroups - 1;
+    while i >= gap do
+    begin
+      groups[i + k] := groups[i];
+      i := i - 1;
+    end;
+    for i := gap to gap + k - 1 do
+      groups[i] := 0;
+  end;
+  for i := 0 to 7 do
+  begin
+    A[2 * i] := Byte(groups[i] shr 8);
+    A[2 * i + 1] := Byte(groups[i] and 255);
+  end;
+  Result := True;
+end;
+
+{ The 16 bytes as text, the longest zrun of zero groups as :: (RFC 5952). }
+function V6ToStr(const A: array[0..15] of Byte): string;
+var
+  groups: array[0..7] of Integer;
+  i, best, bestLen, zrun, zlen: Integer;
+  mapped: Boolean;
+begin
+  for i := 0 to 7 do
+    groups[i] := Integer(A[2 * i]) * 256 + Integer(A[2 * i + 1]);
+  { an IPv4 address carried in IPv6 (::ffff:a.b.c.d) reads as one }
+  mapped := groups[5] = 65535;
+  for i := 0 to 4 do
+    if groups[i] <> 0 then
+      mapped := False;
+  if mapped then
+  begin
+    Result := '::ffff:' + V4ToStr(Integer(A[12]) shl 24 + Integer(A[13]) shl 16 + Integer(A[14]) shl 8 + Integer(A[15]));
+    Exit;
+  end;
+  best := -1;
+  bestLen := 0;
+  zrun := -1;
+  zlen := 0;
+  for i := 0 to 7 do
+  begin
+    if groups[i] = 0 then
+    begin
+      if zrun < 0 then
+      begin
+        zrun := i;
+        zlen := 0;
+      end;
+      zlen := zlen + 1;
+      if (zlen > bestLen) and (zlen >= 2) then
+      begin
+        best := zrun;
+        bestLen := zlen;
+      end;
+    end
+    else
+      zrun := -1;
+  end;
+  Result := '';
+  i := 0;
+  while i < 8 do
+  begin
+    if i = best then
+    begin
+      Result := Result + '::';
+      i := i + bestLen;
+      Continue;
+    end;
+    if (Result <> '') and (Result[Length(Result)] <> ':') then
+      Result := Result + ':';
+    Result := Result + IntToHex4(groups[i]);
+    i := i + 1;
+  end;
+  if Result = '' then
+    Result := '::';
+end;
+
+{ sockaddr_in (16 bytes) and sockaddr_in6 (28 bytes) from a host: the
+  family and the size filled in; False when the host is neither. }
+function FillSockaddr(const Host: string; Port: Integer; var Sa: array[0..27] of Byte;
+  out Size: Integer): Boolean;
+var
+  ip4, i: Integer;
+  a6: array[0..15] of Byte;
+begin
+  Result := False;
+  Size := 0;
+  for i := 0 to 27 do
+    Sa[i] := 0;
+  if (Host = '') or (Host = '0.0.0.0') or HostToV4(Host, ip4) then
+  begin
+    if (Host = '') or (Host = '0.0.0.0') then
+      ip4 := 0;
+    Sa[0] := 2;
+    Sa[1] := 0;
+    Sa[2] := Byte((Port shr 8) and 255);
+    Sa[3] := Byte(Port and 255);
+    Sa[4] := Byte((ip4 shr 24) and 255);
+    Sa[5] := Byte((ip4 shr 16) and 255);
+    Sa[6] := Byte((ip4 shr 8) and 255);
+    Sa[7] := Byte(ip4 and 255);
+    Size := 16;
+    Result := True;
+    Exit;
+  end;
+  if HostToV6(Host, a6) then
+  begin
+    Sa[0] := 10;
+    Sa[1] := 0;
+    Sa[2] := Byte((Port shr 8) and 255);
+    Sa[3] := Byte(Port and 255);
+    for i := 0 to 15 do
+      Sa[8 + i] := a6[i];
+    Size := 28;
+    Result := True;
+  end;
+end;
+
+{ 'host:port' from a sockaddr of either family, [host]:port for IPv6. }
+function SockaddrText(const Sa: array[0..27] of Byte): string;
+var
+  a6: array[0..15] of Byte;
+  i, ip4, port: Integer;
+begin
+  port := Integer(Sa[2]) * 256 + Integer(Sa[3]);
+  if Sa[0] = 2 then
+  begin
+    ip4 := (Integer(Sa[4]) shl 24) or (Integer(Sa[5]) shl 16) or (Integer(Sa[6]) shl 8) or Integer(Sa[7]);
+    Result := V4ToStr(ip4) + ':' + IntToStr(port);
+  end
+  else if Sa[0] = 10 then
+  begin
+    for i := 0 to 15 do
+      a6[i] := Sa[8 + i];
+    Result := '[' + V6ToStr(a6) + ']:' + IntToStr(port);
+  end
+  else
+    Result := '';
+end;
+
+procedure SetOptInt(Fd, Level, Opt, V: Integer);
+var
+  n: Integer;
+begin
+  n := Syscall(SnSetsockopt, Fd, Level, Opt, @V, 4);
+end;
+
+{ A listening socket at Host (any address when '' or 0.0.0.0 or ::),
+  nonblocking, SO_REUSEADDR and TCP_NODELAY as NetListen sets them;
+  NetAccept parks on it as on NetListen's. }
+function TcpListenAt(const Host: string; Port, Backlog: Integer): Integer;
+var
+  sa: array[0..27] of Byte;
+  fd, n, size, fam: Integer;
+begin
+  Result := -1;
+  if not FillSockaddr(Host, Port, sa, size) then
+    Exit;
+  fam := sa[0];
+  fd := Syscall(SnSocket, fam, 526337, 0);
+  if fd < 0 then
+    Exit;
+  SetOptInt(fd, 1, 2, 1);     { SOL_SOCKET SO_REUSEADDR }
+  SetOptInt(fd, 6, 1, 1);     { IPPROTO_TCP TCP_NODELAY }
+  if fam = 10 then
+    SetOptInt(fd, 41, 26, 0); { IPPROTO_IPV6 IPV6_V6ONLY off: IPv4 too }
+  n := Syscall(SnBind, fd, @sa, size);
+  if n < 0 then
+  begin
+    n := Syscall(SnClose, fd);
+    Exit;
+  end;
+  if Backlog < 1 then
+    Backlog := 4096;
+  n := Syscall(SnListen, fd, Backlog);
+  if n < 0 then
+  begin
+    n := Syscall(SnClose, fd);
+    Exit;
+  end;
+  Result := fd;
+end;
+
+{ A connection to Host: a literal of either family or a name; parks
+  while the connection is made. }
+function TcpConnectTo(const Host: string; Port: Integer): Integer;
+var
+  sa: array[0..27] of Byte;
+  fd, n, size, err, olen, ip4: Integer;
+  h: string;
+begin
+  Result := -1;
+  h := Host;
+  if (not HostToV4(h, ip4)) and (not IsV6Text(h)) then
+  begin
+    h := Resolve(h);
+    if h = '' then
+      Exit;
+  end;
+  if not FillSockaddr(h, Port, sa, size) then
+    Exit;
+  if sa[0] = 2 then
+  begin
+    Result := NetConnect((Integer(sa[4]) shl 24) or (Integer(sa[5]) shl 16) or (Integer(sa[6]) shl 8) or Integer(sa[7]), Port);
+    Exit;
+  end;
+  fd := Syscall(SnSocket, 10, 526337, 0);
+  if fd < 0 then
+    Exit;
+  n := Syscall(SnConnect, fd, @sa, size);
+  if n < 0 then
+  begin
+    if n <> -115 then
+    begin
+      n := Syscall(SnClose, fd);
+      Exit;
+    end;
+    n := WaitIo(fd, 4);
+    err := 0;
+    olen := 4;
+    n := Syscall(SnGetsockopt, fd, 1, 4, @err, @olen);
+    if (n < 0) or (err <> 0) then
+    begin
+      n := Syscall(SnClose, fd);
+      Exit;
+    end;
+  end;
+  SetNoDelay(fd);
+  Result := fd;
+end;
+
+function TcpPeer(Fd: Integer): string;
+var
+  sa: array[0..27] of Byte;
+  len, n, i: Integer;
+begin
+  for i := 0 to 27 do
+    sa[i] := 0;
+  len := 28;
+  n := Syscall(SnGetpeername, Fd, @sa, @len);
+  if n < 0 then
+    Result := ''
+  else
+    Result := SockaddrText(sa);
+end;
+
+function TcpLocal(Fd: Integer): string;
+var
+  sa: array[0..27] of Byte;
+  len, n, i: Integer;
+begin
+  for i := 0 to 27 do
+    sa[i] := 0;
+  len := 28;
+  n := Syscall(SnGetsockname, Fd, @sa, @len);
+  if n < 0 then
+    Result := ''
+  else
+    Result := SockaddrText(sa);
+end;
+
+{ How: 0 no more reading, 1 no more writing (the peer reads the end of
+  the stream), 2 both. }
+procedure TcpShutdown(Fd, How: Integer);
+var
+  n: Integer;
+begin
+  n := Syscall(SnShutdown, Fd, How);
+end;
+
+procedure TcpKeepAlive(Fd: Integer; On: Boolean);
+begin
+  if On then
+    SetOptInt(Fd, 1, 9, 1)
+  else
+    SetOptInt(Fd, 1, 9, 0);
+end;
+
+{ The kernel's buffers of a socket, TCP or UDP: a datagram server
+  under load wants a receive buffer of megabytes, or datagrams are
+  dropped while its routine is busy. }
+procedure SockBuffers(Fd, RecvBytes, SendBytes: Integer);
+begin
+  if RecvBytes > 0 then
+    SetOptInt(Fd, 1, 8, RecvBytes);   { SO_RCVBUF }
+  if SendBytes > 0 then
+    SetOptInt(Fd, 1, 7, SendBytes);   { SO_SNDBUF }
+end;
+
+{ A line from the connection, the LF and a CR before it left out; Buf
+  keeps what came after it for the next call. False at the end of the
+  stream, with whatever was left in Line. }
+function TcpReadLine(Fd: Integer; var Buf: string; out Line: string): Boolean;
+var
+  i, n: Integer;
+  part: string;
+begin
+  Result := False;
+  Line := '';
+  while True do
+  begin
+    n := Length(Buf);
+    for i := 1 to n do
+      if Buf[i] = #10 then
+      begin
+        if (i > 1) and (Buf[i - 1] = #13) then
+          Line := Copy(Buf, 1, i - 2)
+        else
+          Line := Copy(Buf, 1, i - 1);
+        Buf := Copy(Buf, i + 1, n - i);
+        Result := True;
+        Exit;
+      end;
+    if n > 1048576 then
+      Exit;
+    { a kilobyte a read: a request's lines are short, and what a read
+      leaves over is copied into Buf (4 KB a read doubled the heap of
+      ten thousand connections) }
+    NetRead(Fd, 1024, part);
+    if part = '' then
+    begin
+      Line := Buf;
+      Buf := '';
+      Exit;
+    end;
+    Buf := Buf + part;
+  end;
+end;
+
+{ Exactly N bytes, from Buf first; False at the end of the stream. }
+function TcpReadN(Fd, N: Integer; var Buf: string; out Data: string): Boolean;
+var
+  part: string;
+  want: Integer;
+begin
+  Result := False;
+  Data := '';
+  while Length(Buf) < N do
+  begin
+    want := N - Length(Buf);
+    if want > 65536 then
+      want := 65536;
+    NetRead(Fd, want, part);
+    if part = '' then
+      Exit;
+    Buf := Buf + part;
+  end;
+  Data := Copy(Buf, 1, N);
+  Buf := Copy(Buf, N + 1, Length(Buf) - N);
+  Result := True;
+end;
+
+{ ---- UDP with the peer ---- }
+
+function UdpBindAt(const Host: string; Port: Integer): Integer;
+var
+  sa: array[0..27] of Byte;
+  fd, n, size: Integer;
+begin
+  Result := -1;
+  if not FillSockaddr(Host, Port, sa, size) then
+    Exit;
+  fd := Syscall(SnSocket, sa[0], SockDgramNb, 0);
+  if fd < 0 then
+    Exit;
+  { SO_REUSEADDR only for a port asked for: on a datagram socket bound
+    to port 0 it lets the kernel give two sockets the same port, and
+    the answers of one arrive at the other (found by dnsd's self-test) }
+  if Port <> 0 then
+    SetOptInt(fd, 1, 2, 1);
+  if sa[0] = 10 then
+    SetOptInt(fd, 41, 26, 0);
+  n := Syscall(SnBind, fd, @sa, size);
+  if n < 0 then
+  begin
+    n := Syscall(SnClose, fd);
+    Exit;
+  end;
+  Result := fd;
+end;
+
+function UdpSendTo(Fd: Integer; const Host: string; Port: Integer; const Data: string): Integer;
+var
+  sa: array[0..27] of Byte;
+  size, n, ip4: Integer;
+  h: string;
+begin
+  Result := -1;
+  h := Host;
+  if (not HostToV4(h, ip4)) and (not IsV6Text(h)) then
+  begin
+    h := Resolve(h);
+    if h = '' then
+      Exit;
+  end;
+  if not FillSockaddr(h, Port, sa, size) then
+    Exit;
+  n := Length(Data);
+  if n > 65507 then
+    n := 65507;
+  { the socket's send buffer may be full while the routine is ahead of
+    the kernel (a server answering thousands at once): park until it
+    drains, as NetWrite does, instead of losing the datagram }
+  while True do
+  begin
+    Result := Syscall(SnSendto, Fd, Pointer(Data), n, 0, @sa, size);
+    if Result <> -11 then
+      Break;
+    n := WaitIo(Fd, 4);
+    n := Length(Data);
+    if n > 65507 then
+      n := 65507;
+  end;
+end;
+
+{ A datagram and where it came from; parks until one comes. Empty on an
+  error, with Host ''. }
+function UdpRecvFrom(Fd, MaxN: Integer; out Host: string; out Port: Integer): string;
+var
+  sa: array[0..27] of Byte;
+  len, n, i: Integer;
+  s: string;
+begin
+  Host := '';
+  Port := 0;
+  Result := '';
+  if MaxN < 1 then
+    MaxN := 1;
+  if MaxN > 65536 then
+    MaxN := 65536;
+  s := '';
+  SetLength(s, MaxN);
+  while True do
+  begin
+    for i := 0 to 27 do
+      sa[i] := 0;
+    len := 28;
+    n := Syscall(SnRecvfrom, Fd, Pointer(s), MaxN, 0, @sa, @len);
+    if n >= 0 then
+      Break;
+    if n <> -11 then
+      Exit;
+    n := WaitIo(Fd, 1);
+  end;
+  SetLength(s, n);
+  Result := s;
+  Port := Integer(sa[2]) * 256 + Integer(sa[3]);
+  if sa[0] = 2 then
+    Host := V4ToStr((Integer(sa[4]) shl 24) or (Integer(sa[5]) shl 16) or (Integer(sa[6]) shl 8) or Integer(sa[7]))
+  else if sa[0] = 10 then
+    Host := SockaddrText(sa);
+  if (Host <> '') and (Host[1] = '[') then
+  begin
+    { the address alone, without the port }
+    i := 2;
+    while (i <= Length(Host)) and (Host[i] <> ']') do
+      i := i + 1;
+    Host := Copy(Host, 2, i - 2);
+  end;
+end;
+
+{ ---- the limit ---- }
+
+function RaiseFdLimit: Integer;
+var
+  lim: array[0..1] of Integer;
+  n: Integer;
+begin
+  Result := 0;
+  lim[0] := 0;
+  lim[1] := 0;
+  n := Syscall(SnPrlimit, 0, 7, 0, @lim);
+  if n < 0 then
+    Exit;
+  Result := lim[0];
+  if lim[1] > lim[0] then
+  begin
+    lim[0] := lim[1];
+    n := Syscall(SnPrlimit, 0, 7, @lim, 0);
+    if n = 0 then
+      Result := lim[0];
+  end;
+end;
+
+{ ---- the resolver ---- }
+
+var
+  DnsCount: Integer;
+
+{ The first field of a line of /etc/hosts whose later fields hold the
+  name; '' when none. }
+function HostsLookup(const Name: string): string;
+var
+  text, line, tok, first: string;
+  i, n, k: Integer;
+  c: Char;
+  fields: Integer;
+  found: Boolean;
+begin
+  Result := '';
+  if not ReadFile('/etc/hosts', text) then
+    Exit;
+  n := Length(text);
+  i := 1;
+  while i <= n do
+  begin
+    k := i;
+    while (k <= n) and (text[k] <> #10) do
+      k := k + 1;
+    line := Copy(text, i, k - i);
+    i := k + 1;
+    { the comment goes }
+    for k := 1 to Length(line) do
+      if line[k] = '#' then
+      begin
+        line := Copy(line, 1, k - 1);
+        Break;
+      end;
+    first := '';
+    fields := 0;
+    found := False;
+    tok := '';
+    for k := 1 to Length(line) + 1 do
+    begin
+      if k <= Length(line) then
+        c := line[k]
+      else
+        c := ' ';
+      if (c = ' ') or (c = #9) then
+      begin
+        if tok <> '' then
+        begin
+          fields := fields + 1;
+          if fields = 1 then
+            first := tok
+          else if ToLower(tok) = ToLower(Name) then
+            found := True;
+          tok := '';
+        end;
+      end
+      else
+        tok := tok + c;
+    end;
+    if found and (first <> '') then
+    begin
+      Result := first;
+      Exit;
+    end;
+  end;
+end;
+
+function NameServer: string;
+var
+  text, line, tok: string;
+  i, n, k: Integer;
+  ip4: Integer;
+begin
+  Result := '';
+  if not ReadFile('/etc/resolv.conf', text) then
+    Exit;
+  n := Length(text);
+  i := 1;
+  while i <= n do
+  begin
+    k := i;
+    while (k <= n) and (text[k] <> #10) do
+      k := k + 1;
+    line := Copy(text, i, k - i);
+    i := k + 1;
+    if Copy(line, 1, 11) = 'nameserver ' then
+    begin
+      tok := '';
+      for k := 12 to Length(line) do
+        if (line[k] <> ' ') and (line[k] <> #9) and (line[k] <> #13) then
+          tok := tok + line[k]
+        else if tok <> '' then
+          Break;
+      if HostToV4(tok, ip4) then
+      begin
+        Result := tok;
+        Exit;
+      end;
+    end;
+  end;
+end;
+
+{ A DNS question for an A record of Name, the standard query (RFC
+  1035), identifier Id. }
+function DnsQueryA(const Name: string; Id: Integer): string;
+var
+  q, lab: string;
+  i: Integer;
+begin
+  q := Chr(Id shr 8) + Chr(Id and 255) + #1#0 + #0#1 + #0#0 + #0#0 + #0#0;
+  lab := '';
+  for i := 1 to Length(Name) + 1 do
+  begin
+    if (i > Length(Name)) or (Name[i] = '.') then
+    begin
+      if lab <> '' then
+        q := q + Chr(Length(lab)) + lab;
+      lab := '';
+    end
+    else
+      lab := lab + Name[i];
+  end;
+  q := q + #0 + #0#1 + #0#1;
+  Result := q;
+end;
+
+{ The name at position P of a message, compression followed; P moves
+  past it. }
+function DnsSkipName(const M: string; var P: Integer): Boolean;
+var
+  n, guard: Integer;
+begin
+  Result := False;
+  guard := 0;
+  while P <= Length(M) do
+  begin
+    n := Ord(M[P]);
+    if n = 0 then
+    begin
+      P := P + 1;
+      Result := True;
+      Exit;
+    end;
+    if (n and 192) = 192 then
+    begin
+      P := P + 2;
+      Result := True;
+      Exit;
+    end;
+    P := P + 1 + n;
+    guard := guard + 1;
+    if guard > 128 then
+      Exit;
+  end;
+end;
+
+{ The first A record of an answer to the query with Id, as a dotted
+  quad; '' when the answer has none. }
+function DnsAnswerA(const Msg: string; Id: Integer): string;
+var
+  p, qd, an, i, typ, rdlen, ip4: Integer;
+begin
+  Result := '';
+  if Length(Msg) < 12 then
+    Exit;
+  if Ord(Msg[1]) * 256 + Ord(Msg[2]) <> Id then
+    Exit;
+  qd := Ord(Msg[5]) * 256 + Ord(Msg[6]);
+  an := Ord(Msg[7]) * 256 + Ord(Msg[8]);
+  p := 13;
+  for i := 1 to qd do
+  begin
+    if not DnsSkipName(Msg, p) then
+      Exit;
+    p := p + 4;
+  end;
+  for i := 1 to an do
+  begin
+    if not DnsSkipName(Msg, p) then
+      Exit;
+    if p + 9 > Length(Msg) then
+      Exit;
+    typ := Ord(Msg[p]) * 256 + Ord(Msg[p + 1]);
+    rdlen := Ord(Msg[p + 8]) * 256 + Ord(Msg[p + 9]);
+    p := p + 10;
+    if (typ = 1) and (rdlen = 4) and (p + 3 <= Length(Msg)) then
+    begin
+      ip4 := (Ord(Msg[p]) shl 24) or (Ord(Msg[p + 1]) shl 16) or (Ord(Msg[p + 2]) shl 8) or Ord(Msg[p + 3]);
+      Result := V4ToStr(ip4);
+      Exit;
+    end;
+    p := p + rdlen;
+  end;
+end;
+
+{ A datagram if one is waiting, without parking: '' when none. }
+function UdpRecvNow(Fd, MaxN: Integer; out Host: string; out Port: Integer): string;
+var
+  sa: array[0..27] of Byte;
+  len, n, i: Integer;
+  s: string;
+begin
+  Host := '';
+  Port := 0;
+  Result := '';
+  if MaxN < 1 then
+    MaxN := 1;
+  if MaxN > 65536 then
+    MaxN := 65536;
+  s := '';
+  SetLength(s, MaxN);
+  for i := 0 to 27 do
+    sa[i] := 0;
+  len := 28;
+  n := Syscall(SnRecvfrom, Fd, Pointer(s), MaxN, 0, @sa, @len);
+  if n <= 0 then
+    Exit;
+  SetLength(s, n);
+  Result := s;
+  Port := Integer(sa[2]) * 256 + Integer(sa[3]);
+  if sa[0] = 2 then
+    Host := V4ToStr((Integer(sa[4]) shl 24) or (Integer(sa[5]) shl 16) or (Integer(sa[6]) shl 8) or Integer(sa[7]));
+end;
+
+{ A datagram within Ms milliseconds, or '' with Host '' when none came:
+  a client of a lossy protocol asks again. }
+function UdpRecvFromMs(Fd, MaxN, Ms: Integer; out Host: string; out Port: Integer): string;
+var
+  n: Integer;
+begin
+  Result := UdpRecvNow(Fd, MaxN, Host, Port);
+  if Result <> '' then
+    Exit;
+  n := WaitMs(Fd, 1, Ms);
+  Result := UdpRecvNow(Fd, MaxN, Host, Port);
+end;
+
+{ Host as a dotted quad: a literal is itself, else /etc/hosts, else the
+  first nameserver of /etc/resolv.conf asked over UDP, two seconds and
+  two tries; '' when nothing knows it. }
+function Resolve(const Host: string): string;
+var
+  ip4, fd, id, n, tries, port: Integer;
+  ns, q, m, from: string;
+begin
+  Result := '';
+  if Host = '' then
+    Exit;
+  if HostToV4(Host, ip4) then
+  begin
+    Result := Host;
+    Exit;
+  end;
+  if ToLower(Host) = 'localhost' then
+  begin
+    Result := '127.0.0.1';
+    Exit;
+  end;
+  Result := HostsLookup(Host);
+  if Result <> '' then
+    Exit;
+  ns := NameServer;
+  if ns = '' then
+    Exit;
+  fd := UdpBindAt('', 0);
+  if fd < 0 then
+    Exit;
+  DnsCount := DnsCount + 1;
+  id := (DnsCount * 40503 + 12345) and 65535;
+  q := DnsQueryA(Host, id);
+  for tries := 1 to 2 do
+  begin
+    n := UdpSendTo(fd, ns, 53, q);
+    if n < 0 then
+      Break;
+    m := UdpRecvFromMs(fd, 4096, 2000, from, port);
+    if m <> '' then
+    begin
+      Result := DnsAnswerA(m, id);
+      if Result <> '' then
+        Break;
+    end;
+  end;
+  UdpClose(fd);
+end;
+
+
+{ The name the first question of Msg asks, dots between its labels. }
+function DnsQuestionName(const Msg: string): string;
+var
+  p, n, i: Integer;
+begin
+  Result := '';
+  if Length(Msg) < 13 then
+    Exit;
+  p := 13;
+  while p <= Length(Msg) do
+  begin
+    n := Ord(Msg[p]);
+    if n = 0 then
+      Exit;
+    if (n and 192) <> 0 then
+    begin
+      Result := '';
+      Exit;
+    end;
+    if p + n > Length(Msg) then
+    begin
+      Result := '';
+      Exit;
+    end;
+    if Result <> '' then
+      Result := Result + '.';
+    for i := 1 to n do
+      Result := Result + Msg[p + i];
+    p := p + 1 + n;
+  end;
+  Result := '';
+end;
+
+{ The header and the question of Query, as a response: the flags say
+  a standard answer, the counts one question and An answers. }
+function DnsReplyHead(const Query: string; Flags, An: Integer): string;
+var
+  p: Integer;
+begin
+  Result := '';
+  if Length(Query) < 12 then
+    Exit;
+  p := 13;
+  if not DnsSkipName(Query, p) then
+    Exit;
+  p := p + 4;
+  if p - 1 > Length(Query) then
+    Exit;
+  Result := Copy(Query, 1, 2) + Chr(Flags shr 8) + Chr(Flags and 255) + #0#1 +
+    Chr(An shr 8) + Chr(An and 255) + #0#0 + #0#0 + Copy(Query, 13, p - 13);
+end;
+
+{ An answer with one A record for the name asked (a pointer to the
+  question's name), time to live Ttl seconds. }
+function DnsReplyA(const Query: string; Ip4, Ttl: Integer): string;
+var
+  h: string;
+begin
+  h := DnsReplyHead(Query, $8180, 1);
+  if h = '' then
+  begin
+    Result := '';
+    Exit;
+  end;
+  Result := h + #192#12 + #0#1 + #0#1 + Chr((Ttl shr 24) and 255) + Chr((Ttl shr 16) and 255) +
+    Chr((Ttl shr 8) and 255) + Chr(Ttl and 255) + #0#4 +
+    Chr((Ip4 shr 24) and 255) + Chr((Ip4 shr 16) and 255) + Chr((Ip4 shr 8) and 255) + Chr(Ip4 and 255);
+end;
+
+{ No such name (NXDOMAIN, code 3), the question echoed. }
+function DnsReplyNx(const Query: string): string;
+begin
+  Result := DnsReplyHead(Query, $8183, 0);
+end;
+
+
+{ ---- P117: Unix-domain sockets ---- }
+
+function SnSocketpair: Integer;
+begin
+  if Amd64 = 0 then
+    Result := 199
+  else
+    Result := 53;
+end;
+
+function SnSendmsg: Integer;
+begin
+  if Amd64 = 0 then
+    Result := 211
+  else
+    Result := 46;
+end;
+
+function SnRecvmsg: Integer;
+begin
+  if Amd64 = 0 then
+    Result := 212
+  else
+    Result := 47;
+end;
+
+function SnEpollCreate1: Integer;
+begin
+  if Amd64 = 0 then
+    Result := 20
+  else
+    Result := 291;
+end;
+
+function SnEpollCtl: Integer;
+begin
+  if Amd64 = 0 then
+    Result := 21
+  else
+    Result := 233;
+end;
+
+function SnEpollWait: Integer;
+begin
+  { epoll_pwait on arm64, with no signal mask }
+  if Amd64 = 0 then
+    Result := 22
+  else
+    Result := 232;
+end;
+
+{ sockaddr_un: the family and the path, 110 bytes; an abstract name is
+  a leading zero byte and the name, its length counted exactly. }
+function FillUnixAddr(const Path: string; var Sa: array[0..109] of Byte; out Size: Integer): Boolean;
+var
+  i, n: Integer;
+begin
+  Result := False;
+  Size := 0;
+  for i := 0 to 109 do
+    Sa[i] := 0;
+  Sa[0] := 1;
+  n := Length(Path);
+  if (n = 0) or (n > 107) then
+    Exit;
+  if Path[1] = '@' then
+  begin
+    { abstract: byte 0 then the name, and the size says where it ends }
+    for i := 2 to n do
+      Sa[2 + i - 1] := Byte(Ord(Path[i]));
+    Size := 2 + n;
+  end
+  else
+  begin
+    for i := 1 to n do
+      Sa[1 + i] := Byte(Ord(Path[i]));
+    Size := 2 + n + 1;
+  end;
+  Result := True;
+end;
+
+{ The path of a sockaddr_un of Size bytes, '@name' for an abstract one. }
+function UnixAddrText(const Sa: array[0..109] of Byte; Size: Integer): string;
+var
+  i: Integer;
+begin
+  Result := '';
+  if Size <= 2 then
+    Exit;
+  if Sa[2] = 0 then
+  begin
+    Result := '@';
+    for i := 3 to Size - 1 do
+      Result := Result + Chr(Sa[i]);
+  end
+  else
+    for i := 2 to Size - 1 do
+    begin
+      if Sa[i] = 0 then
+        Break;
+      Result := Result + Chr(Sa[i]);
+    end;
+end;
+
+procedure UnixUnlink(const Path: string);
+var
+  n: Integer;
+  p: string;
+begin
+  if (Path = '') or (Path[1] = '@') then
+    Exit;
+  p := Path + #0;
+  if Amd64 = 0 then
+    n := Syscall(35, -100, Pointer(p), 0)     { unlinkat(AT_FDCWD, path, 0) }
+  else
+    n := Syscall(87, Pointer(p));
+end;
+
+{ A listening stream socket at Path: the file there is removed first,
+  as a server restarting expects; nonblocking, backlog 4096. NetAccept
+  and TcpAccept park on it. }
+function UnixListen(const Path: string): Integer;
+var
+  sa: array[0..109] of Byte;
+  fd, n, size: Integer;
+begin
+  Result := -1;
+  if not FillUnixAddr(Path, sa, size) then
+    Exit;
+  UnixUnlink(Path);
+  fd := Syscall(SnSocket, 1, 526337, 0);
+  if fd < 0 then
+    Exit;
+  n := Syscall(SnBind, fd, @sa, size);
+  if n < 0 then
+  begin
+    n := Syscall(SnClose, fd);
+    Exit;
+  end;
+  n := Syscall(SnListen, fd, 4096);
+  if n < 0 then
+  begin
+    n := Syscall(SnClose, fd);
+    Exit;
+  end;
+  Result := fd;
+end;
+
+function UnixAccept(Fd: Integer): Integer;
+begin
+  Result := NetAccept(Fd);
+end;
+
+{ A connection to the socket at Path. A nonblocking connect to a Unix
+  socket is made at once, or says EAGAIN while the listener's backlog
+  is full: then the routine parks a moment and tries again. }
+function UnixConnect(const Path: string): Integer;
+var
+  sa: array[0..109] of Byte;
+  fd, n, size, tries: Integer;
+begin
+  Result := -1;
+  if not FillUnixAddr(Path, sa, size) then
+    Exit;
+  fd := Syscall(SnSocket, 1, 526337, 0);
+  if fd < 0 then
+    Exit;
+  tries := 0;
+  while True do
+  begin
+    n := Syscall(SnConnect, fd, @sa, size);
+    if n >= 0 then
+      Break;
+    if (n <> -11) or (tries >= 100) then
+    begin
+      n := Syscall(SnClose, fd);
+      Exit;
+    end;
+    tries := tries + 1;
+    Sleep(1);
+  end;
+  Result := fd;
+end;
+
+{ A datagram socket bound at Path ('' for one with no name, which can
+  send but not be sent to). }
+function UnixBind(const Path: string): Integer;
+var
+  sa: array[0..109] of Byte;
+  fd, n, size: Integer;
+begin
+  Result := -1;
+  fd := Syscall(SnSocket, 1, SockDgramNb, 0);
+  if fd < 0 then
+    Exit;
+  if Path <> '' then
+  begin
+    if not FillUnixAddr(Path, sa, size) then
+    begin
+      n := Syscall(SnClose, fd);
+      Exit;
+    end;
+    UnixUnlink(Path);
+    n := Syscall(SnBind, fd, @sa, size);
+    if n < 0 then
+    begin
+      n := Syscall(SnClose, fd);
+      Exit;
+    end;
+  end;
+  Result := fd;
+end;
+
+function UnixSendTo(Fd: Integer; const Path, Data: string): Integer;
+var
+  sa: array[0..109] of Byte;
+  size, n: Integer;
+begin
+  Result := -1;
+  if not FillUnixAddr(Path, sa, size) then
+    Exit;
+  n := Length(Data);
+  while True do
+  begin
+    Result := Syscall(SnSendto, Fd, Pointer(Data), n, 0, @sa, size);
+    if Result <> -11 then
+      Break;
+    n := WaitIo(Fd, 4);
+    n := Length(Data);
+  end;
+end;
+
+function UnixRecvFrom(Fd, MaxN: Integer; out From: string): string;
+var
+  sa: array[0..109] of Byte;
+  len, n, i: Integer;
+  s: string;
+begin
+  From := '';
+  Result := '';
+  if MaxN < 1 then
+    MaxN := 1;
+  if MaxN > 65536 then
+    MaxN := 65536;
+  s := '';
+  SetLength(s, MaxN);
+  while True do
+  begin
+    for i := 0 to 109 do
+      sa[i] := 0;
+    len := 110;
+    n := Syscall(SnRecvfrom, Fd, Pointer(s), MaxN, 0, @sa, @len);
+    if n >= 0 then
+      Break;
+    if n <> -11 then
+      Exit;
+    n := WaitIo(Fd, 1);
+  end;
+  SetLength(s, n);
+  Result := s;
+  From := UnixAddrText(sa, len);
+end;
+
+{ Two stream sockets joined to each other, nonblocking: a routine of
+  this process at each end. }
+function UnixPair(out A, B: Integer): Boolean;
+var
+  sv: array[0..1] of Integer;
+  n: Integer;
+begin
+  sv[0] := 0;
+  sv[1] := 0;
+  n := Syscall(SnSocketpair, 1, 526337, 0, @sv);
+  Result := n >= 0;
+  if Result then
+  begin
+    A := sv[0] and $FFFFFFFF;
+    B := (sv[0] shr 32) and $FFFFFFFF;
+  end
+  else
+  begin
+    A := -1;
+    B := -1;
+  end;
+end;
+
+{ SO_PEERCRED: the process, user and group of the other end of a
+  stream socket. }
+function UnixPeer(Fd: Integer; out Pid, Uid, Group: Integer): Boolean;
+var
+  cred: array[0..1] of Integer;
+  len, n: Integer;
+begin
+  cred[0] := 0;
+  cred[1] := 0;
+  len := 12;
+  n := Syscall(SnGetsockopt, Fd, 1, 17, @cred, @len);
+  Result := n >= 0;
+  Pid := cred[0] and $FFFFFFFF;
+  Uid := (cred[0] shr 32) and $FFFFFFFF;
+  Group := cred[1] and $FFFFFFFF;
+end;
+
+{ A message with a descriptor along (SCM_RIGHTS): msghdr of 56 bytes
+  (name, name length, the iovec, its count, the control, its length,
+  flags), the control a cmsghdr of 24 bytes (length 20, SOL_SOCKET,
+  SCM_RIGHTS, the descriptor). The receiver gets its own descriptor
+  for the same open file. }
+function UnixSendFd(Fd, Passed: Integer; const Data: string): Integer;
+var
+  msg: array[0..6] of Integer;
+  iov: array[0..1] of Integer;
+  ctl: array[0..2] of Integer;
+  n: Integer;
+begin
+  iov[0] := Integer(Pointer(Data));
+  iov[1] := Length(Data);
+  ctl[0] := 20;
+  ctl[1] := 1 + (1 shl 32);            { level SOL_SOCKET 1, type SCM_RIGHTS 1 }
+  ctl[2] := Passed and $FFFFFFFF;
+  msg[0] := 0;
+  msg[1] := 0;
+  msg[2] := Integer(@iov);
+  msg[3] := 1;
+  msg[4] := Integer(@ctl);
+  msg[5] := 24;
+  msg[6] := 0;
+  while True do
+  begin
+    Result := Syscall(SnSendmsg, Fd, @msg, 16384);   { MSG_NOSIGNAL: EPIPE, never SIGPIPE }
+    if Result <> -11 then
+      Break;
+    n := WaitIo(Fd, 4);
+  end;
+end;
+
+function UnixRecvFd(Fd, MaxN: Integer; out Passed: Integer): string;
+var
+  msg: array[0..6] of Integer;
+  iov: array[0..1] of Integer;
+  ctl: array[0..2] of Integer;
+  n: Integer;
+  s: string;
+begin
+  Passed := -1;
+  Result := '';
+  if MaxN < 1 then
+    MaxN := 1;
+  if MaxN > 65536 then
+    MaxN := 65536;
+  s := '';
+  SetLength(s, MaxN);
+  while True do
+  begin
+    iov[0] := Integer(Pointer(s));
+    iov[1] := MaxN;
+    ctl[0] := 0;
+    ctl[1] := 0;
+    ctl[2] := 0;
+    msg[0] := 0;
+    msg[1] := 0;
+    msg[2] := Integer(@iov);
+    msg[3] := 1;
+    msg[4] := Integer(@ctl);
+    msg[5] := 24;
+    msg[6] := 0;
+    n := Syscall(SnRecvmsg, Fd, @msg, 0);
+    if n >= 0 then
+      Break;
+    if n <> -11 then
+      Exit;
+    n := WaitIo(Fd, 1);
+  end;
+  SetLength(s, n);
+  Result := s;
+  if (msg[5] >= 20) and (ctl[0] >= 20) and ((ctl[1] and $FFFFFFFF) = 1) and ((ctl[1] shr 32) = 1) then
+    Passed := ctl[2] and $FFFFFFFF;
+end;
+
+procedure UnixClose(Fd: Integer);
+begin
+  NetClose(Fd);
+end;
+
+{ An epoll set of this wait alone, level-triggered, and the routine
+  parks on it as on any descriptor: the set is readable when a member
+  is. Then one look without waiting says which. }
+function WaitAny(const Fds: array of Integer; Ev, Ms: Integer): Integer;
+var
+  ep, i, n, k: Integer;
+  evt: array[0..1] of Integer;
+  evs: array[0..15] of Integer;
+begin
+  Result := -1;
+  ep := Syscall(SnEpollCreate1, 524288);
+  if ep < 0 then
+    Exit;
+  for i := 0 to High(Fds) do
+  begin
+    if Amd64 = 0 then
+    begin
+      { arm64's epoll_event is not packed: events, a pad, then the data }
+      evt[0] := Ev;
+      evt[1] := i;
+    end
+    else
+    begin
+      { amd64's is packed: events (4), data (8) }
+      evt[0] := Ev or (Int64(i) shl 32);
+      evt[1] := i shr 32;
+    end;
+    n := Syscall(SnEpollCtl, ep, 1, Fds[i], @evt);
+  end;
+  n := WaitMs(ep, 1, Ms);
+  for i := 0 to 15 do
+    evs[i] := 0;
+  if Amd64 = 0 then
+    n := Syscall(SnEpollWait, ep, @evs, 8, 0, 0, 0)
+  else
+    n := Syscall(SnEpollWait, ep, @evs, 8, 0);
+  if n > 0 then
+  begin
+    if Amd64 = 0 then
+      k := evs[1]
+    else
+      k := (evs[0] shr 32) or ((evs[1] and $FFFFFFFF) shl 32);
+    if (k >= 0) and (k <= High(Fds)) then
+      Result := k;
+  end;
+  n := Syscall(SnClose, ep);
+end;
+
+end.

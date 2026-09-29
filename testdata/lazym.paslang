@@ -1,0 +1,137 @@
+{ P91: an M starts when there is work for it. A program begins with two
+  threads, main and sysmon (it had one per P besides); a cycle gives a
+  thread to the Ms it may mark with, HeapStat(15); a routine alone that
+  is preempted wakes no M; work for every P
+  gives every M one, the Ps and sysmon at most. Routines that sleep are
+  woken on time while main runs without parking, and main, asleep while
+  every M runs a routine that never parks, wakes: a due timer fires on
+  any M that schedules. qemu's own thread is not counted. }
+program lazym;
+
+uses
+  paslib, pastime;
+
+var
+  wg, tw: waitgroup;
+  mask: array[0..3] of Integer;
+  stop, acc, ticks, i, n, t0, t1, t2, lim, k, x: Integer;
+  tm: Int64;
+
+{ The program's threads: those of /proc/self/task but qemu's own
+  (call_rcu), which runs the arm64 build beside the program's. }
+function Threads: Integer;
+var
+  l, name, c: string;
+  i: Integer;
+begin
+  Result := 0;
+  l := ListDir('/proc/self/task');
+  name := '';
+  for i := 1 to Length(l) do
+    if l[i] = Chr(10) then
+    begin
+      if (name <> '.') and (name <> '..') and (name <> '') then
+        if ReadFile('/proc/self/task/' + name + '/comm', c) then
+          if Copy(c, 1, 8) <> 'call_rcu' then
+            Result := Result + 1;
+      name := '';
+    end
+    else
+      name := name + l[i];
+end;
+
+{ The Ps as the runtime counts them (rt_ncpu): the CPUs of the first 64
+  in the affinity mask, 2 to 32. }
+function NCpu: Integer;
+var
+  r, m: Integer;
+begin
+  if Amd64 = 1 then
+    r := Syscall(204, 0, 32, Integer(@mask))
+  else
+    r := Syscall(123, 0, 32, Integer(@mask));
+  Result := 0;
+  if r > 0 then
+  begin
+    m := mask[0];
+    while m <> 0 do
+    begin
+      Result := Result + (m and 1);
+      m := (m shr 1) and 9223372036854775807;
+    end;
+  end;
+  if Result < 2 then
+    Result := 2;
+  if Result > 32 then
+    Result := 32;
+end;
+
+procedure Spin(K: Integer);
+var
+  y: Integer;
+begin
+  y := K;
+  while stop = 0 do
+    y := y * 3 + 1;
+  AtomicAdd(@acc, y and 1);
+  wg.Done;
+end;
+
+procedure Tick(K: Integer);
+var
+  j: Integer;
+begin
+  for j := 1 to 5 do
+  begin
+    Sleep(10);
+    AtomicAdd(@ticks, 1);
+  end;
+  tw.Done;
+end;
+
+begin
+  t0 := Threads;
+  WriteLn('start ', t0);
+  GcCollect;
+  t1 := Threads;
+  lim := HeapStat(15);
+  WriteLn('after a cycle ', t1 = lim + 1, ' ', t1 >= 2);
+  { Main alone runs 100 ms without parking and is preempted about ten
+    times: no M wakes for it, since nothing else waits to run (1.0.71:
+    each preemption started a thread for nothing). }
+  tm := Monotonic;
+  x := 0;
+  while Monotonic - tm < 100000000 do
+    x := x + 1;
+  WriteLn('alone ', Threads = t1);
+  { sleepers while main never parks: their timers need a poller }
+  tw.Add(4);
+  for i := 1 to 4 do
+    pas Tick(i);
+  x := 0;
+  k := 0;
+  while (ticks < 20) and (k < 400000000) do
+  begin
+    x := x * 7 + k;
+    k := k + 1;
+  end;
+  tw.Wait;
+  WriteLn('ticks ', ticks, ' on time ', k < 400000000);
+  { work for every P }
+  n := NCpu;
+  stop := 0;
+  wg.Add(n * 2);
+  for i := 1 to n * 2 do
+    pas Spin(i);
+  t2 := 0;
+  k := 0;
+  while (t2 < n + 1) and (k < 3000) do
+  begin
+    Sleep(1);
+    t2 := Threads;
+    k := k + 1;
+  end;
+  AtomicAdd(@stop, 1);
+  wg.Wait;
+  WriteLn('every P ', t2 = n + 1, ' never more ', Threads <= n + 1);
+end.

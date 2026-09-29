@@ -1,0 +1,532 @@
+{$mode objfpc}{$H+}
+
+{ Core sync. mutex, rwmutex, waitgroup, cond and once are language
+  types whose zero value is ready to use; a local or a global of these
+  types needs no constructor. Waiting parks the G: there is no second
+  scheduler and no OS thread is blocked. The compiler turns mu.Lock,
+  wg.Add(n), c.Wait(mu), lock ... do and once ... do into calls of the
+  routines below; user code never names them. }
+unit pasroutines;
+
+interface
+
+type
+  { Go's sync.Mutex (P98). State: bit 0 locked, bit 1 a waiter is awake
+    (Unlock need not wake another), bit 2 starving (the mutex goes from
+    hand to hand in queue order), and the number of parked routines from
+    bit 3. Parking takes no lock: a new waiter pushes itself on Arrived
+    with one CAS, and the one routine that may take waiters out (the
+    holder of the awake bit, or the owner while starving) serves them
+    from its own queue, Head to Tail, refilled from Arrived in arrival
+    order. A woken waiter that lost the race goes back to the front. }
+  TPasMutex = record
+    State: Integer;
+    Arrived: Integer;
+    Head: Integer;
+    Tail: Integer;
+  end;
+
+  { Writer preferred: once a writer waits, new readers wait too, so a
+    stream of readers cannot starve it. }
+  TPasRWMutex = record
+    Spin: Integer;
+    Readers: Integer;
+    Writer: Integer;
+    Waiting: Integer;
+    ReadQ: Integer;
+    WriteQ: Integer;
+  end;
+
+  TPasWaitGroup = record
+    Count: Integer;
+    Spin: Integer;
+    Head: Integer;
+  end;
+
+  TPasCond = record
+    Spin: Integer;
+    Head: Integer;
+  end;
+
+  { Fired, not Done: a field named Done hid the Boolean init.Done, so not
+    init.Done flipped the bits of the Integer (1.0.74). }
+  TPasOnce = record
+    Fired: Integer;
+    Running: Integer;
+    Spin: Integer;
+    Head: Integer;
+  end;
+
+procedure PasMutexLock(var M: TPasMutex);
+procedure PasMutexUnlock(var M: TPasMutex);
+function PasMutexTryLock(var M: TPasMutex): Boolean;
+procedure PasRWLock(var R: TPasRWMutex);
+procedure PasRWUnlock(var R: TPasRWMutex);
+procedure PasRWBeginRead(var R: TPasRWMutex);
+procedure PasRWEndRead(var R: TPasRWMutex);
+procedure PasWaitGroupAdd(var W: TPasWaitGroup; Delta: Integer);
+procedure PasWaitGroupDone(var W: TPasWaitGroup);
+procedure PasWaitGroupWait(var W: TPasWaitGroup);
+procedure PasCondWait(var C: TPasCond; var M: TPasMutex);
+procedure PasCondSignal(var C: TPasCond);
+procedure PasCondBroadcast(var C: TPasCond);
+function PasOnceBegin(var O: TPasOnce): Boolean;
+procedure PasOnceEnd(var O: TPasOnce);
+function PasOnceDone(var O: TPasOnce): Boolean;
+function Goid: Integer;
+function NumGoroutine: Integer;
+procedure Yield;
+procedure PasReadLn(Dest: Pointer);
+
+implementation
+
+{ Every runtime fatal error exits 1, like the map and the domain errors. }
+procedure Fatal(const Msg: string);
+begin
+  WriteLn(ErrOutput, Msg);
+  Halt(1);
+end;
+
+{ ---- mutex ---- }
+
+{ The slow path of Lock, Go's lockSlow. A waiter spins while the holder
+  runs, a few rounds and only when CanSpin says the time is not taken
+  from other routines; otherwise it counts itself in State and parks.
+  WaitPush does the count and the push in one primitive, with no place
+  to be preempted between them, so the Unlock that sees the count finds
+  the routine queued at once or a few instructions later (Go's
+  semaphore count does that job there). A woken waiter that lost the
+  race still holds the awake bit, so the queue is its own: WaitFront
+  puts it back at the front and then counts it. A lock here, taken by
+  every waiter, was where b3spawn spent its time (P98). A routine that
+  waited more than a millisecond turns the mutex to starvation mode,
+  where Unlock hands it straight to the first in the queue and a
+  newcomer queues instead of taking it; the last waiter, or one that
+  waited less, turns it back. The clock is read once before the first
+  park and, after a wake, only while not starving yet. }
+procedure MutexLockSlow(var M: TPasMutex);
+var
+  wait0, t, old, nw, iter, j: Integer;
+  starving, awoke, queued: Boolean;
+begin
+  wait0 := 0;
+  t := 0;
+  starving := False;
+  awoke := False;
+  iter := 0;
+  old := M.State;
+  while True do
+  begin
+    if ((old and 5) = 1) and (iter < 4) and CanSpin then
+    begin
+      { Tell Unlock that a waiter is awake, so it wakes no other. }
+      if (not awoke) and ((old and 2) = 0) and ((old shr 3) <> 0) and
+        AtomicCas(@M.State, old, old or 2) then
+        awoke := True;
+      for j := 1 to 30 do
+        Pause;
+      iter := iter + 1;
+      old := M.State;
+      Continue;
+    end;
+    nw := old;
+    if (old and 4) = 0 then
+      nw := nw or 1;
+    if (old and 5) <> 0 then
+      nw := nw + 8;
+    if starving and ((old and 1) <> 0) then
+      nw := nw or 4;
+    if awoke then
+    begin
+      if (nw and 2) = 0 then
+        Fatal('paslang: inconsistent mutex state');
+      nw := nw and (-3);
+    end;
+    if (old and 5) = 0 then
+    begin
+      { Free and not starving: this CAS takes it. }
+      if AtomicCas(@M.State, old, nw) then
+        Exit;
+      old := M.State;
+      Continue;
+    end;
+    if (wait0 = 0) and (t = 0) then
+      t := Nanotime;
+    if wait0 = 0 then
+      queued := WaitPush(@M.State, old, nw, @M.Arrived)
+    else
+      queued := WaitFront(@M.State, old, nw, @M.Head);
+    if not queued then
+    begin
+      old := M.State;
+      Continue;
+    end;
+    if wait0 = 0 then
+      wait0 := t;
+    ParkMarked;
+    if not starving then
+      starving := Nanotime - wait0 > 1000000;
+    old := M.State;
+    if (old and 4) <> 0 then
+    begin
+      { Handed over in starvation mode: the locked bit is not set yet
+        and this routine still counts as a waiter. }
+      if ((old and 3) <> 0) or ((old shr 3) = 0) then
+        Fatal('paslang: inconsistent mutex state');
+      nw := 1 - 8;
+      if (not starving) or ((old shr 3) = 1) then
+        nw := nw - 4;
+      AtomicAdd(@M.State, nw);
+      Exit;
+    end;
+    awoke := True;
+    iter := 0;
+  end;
+end;
+
+procedure PasMutexLock(var M: TPasMutex);
+begin
+  if AtomicCas(@M.State, 0, 1) then
+    Exit;
+  MutexLockSlow(M);
+end;
+
+{ The slow path of Unlock, Go's unlockSlow: wake one waiter, unless none
+  is parked or one is already awake or the mutex was taken meanwhile; in
+  starvation mode hand it to the first waiter. }
+procedure MutexUnlockSlow(var M: TPasMutex; nw: Integer);
+var
+  old, g: Integer;
+  starve: Boolean;
+begin
+  if ((nw + 1) and 1) = 0 then
+    Fatal('paslang: unlock of an unlocked mutex');
+  starve := (nw and 4) <> 0;
+  if not starve then
+  begin
+    old := nw;
+    while True do
+    begin
+      if ((old shr 3) = 0) or ((old and 7) <> 0) then
+        Exit;
+      if AtomicCas(@M.State, old, (old - 8) or 2) then
+        Break;
+      old := M.State;
+    end;
+  end;
+  { A waiter that counted itself may still be pushing itself. }
+  g := WaitTake(@M.Arrived, @M.Head);
+  while g = 0 do
+  begin
+    Pause;
+    g := WaitTake(@M.Arrived, @M.Head);
+  end;
+  ReadyG(g);
+  { Starving: the waiter owns the mutex now and runs next, on this M,
+    while this routine waits at the tail of the queue (Go's handoff). }
+  if starve then
+    Goyield;
+end;
+
+procedure PasMutexUnlock(var M: TPasMutex);
+var
+  nw: Integer;
+begin
+  nw := AtomicAdd(@M.State, -1);
+  if nw <> 0 then
+    MutexUnlockSlow(M, nw);
+end;
+
+{ Go's TryLock: a free mutex is taken even with waiters parked, unless
+  it is starving. }
+function PasMutexTryLock(var M: TPasMutex): Boolean;
+var
+  old: Integer;
+begin
+  Result := False;
+  old := M.State;
+  if (old and 5) <> 0 then
+    Exit;
+  Result := AtomicCas(@M.State, old, old or 1);
+end;
+
+{ ---- rwmutex ---- }
+
+procedure PasRWBeginRead(var R: TPasRWMutex);
+begin
+  SpinLock(@R.Spin);
+  while (R.Writer <> 0) or (R.Waiting <> 0) do
+  begin
+    QWait(@R.ReadQ);
+    ParkUnlock(@R.Spin);
+    SpinLock(@R.Spin);
+  end;
+  R.Readers := R.Readers + 1;
+  SpinUnlock(@R.Spin);
+end;
+
+procedure PasRWEndRead(var R: TPasRWMutex);
+var
+  g: Integer;
+begin
+  SpinLock(@R.Spin);
+  R.Readers := R.Readers - 1;
+  if R.Readers = 0 then
+  begin
+    g := QWake1(@R.WriteQ);
+    if g <> 0 then
+      ReadyG(g);
+  end;
+  SpinUnlock(@R.Spin);
+end;
+
+procedure PasRWLock(var R: TPasRWMutex);
+begin
+  SpinLock(@R.Spin);
+  R.Waiting := R.Waiting + 1;
+  while (R.Writer <> 0) or (R.Readers <> 0) do
+  begin
+    QWait(@R.WriteQ);
+    ParkUnlock(@R.Spin);
+    SpinLock(@R.Spin);
+  end;
+  R.Waiting := R.Waiting - 1;
+  R.Writer := 1;
+  SpinUnlock(@R.Spin);
+end;
+
+procedure PasRWUnlock(var R: TPasRWMutex);
+var
+  g: Integer;
+begin
+  SpinLock(@R.Spin);
+  R.Writer := 0;
+  g := QWake1(@R.WriteQ);
+  if g <> 0 then
+    ReadyG(g)
+  else
+  begin
+    g := QWake1(@R.ReadQ);
+    while g <> 0 do
+    begin
+      ReadyG(g);
+      g := QWake1(@R.ReadQ);
+    end;
+  end;
+  SpinUnlock(@R.Spin);
+end;
+
+{ ---- waitgroup ---- }
+
+procedure PasWaitGroupAdd(var W: TPasWaitGroup; Delta: Integer);
+var
+  g, n: Integer;
+begin
+  { The count moves with one atomic add, as Go's WaitGroup does; the
+    lock is taken only by the call that brings it to zero, to wake the
+    waiters, and by Wait (P98). }
+  n := AtomicAdd(@W.Count, Delta);
+  if n < 0 then
+    Fatal('paslang: negative waitgroup counter');
+  if n <> 0 then
+    Exit;
+  SpinLock(@W.Spin);
+  g := QWake1(@W.Head);
+  while g <> 0 do
+  begin
+    ReadyG(g);
+    g := QWake1(@W.Head);
+  end;
+  SpinUnlock(@W.Spin);
+end;
+
+procedure PasWaitGroupDone(var W: TPasWaitGroup);
+begin
+  PasWaitGroupAdd(W, -1);
+end;
+
+procedure PasWaitGroupWait(var W: TPasWaitGroup);
+begin
+  if AtomicAdd(@W.Count, 0) = 0 then
+    Exit;
+  SpinLock(@W.Spin);
+  if AtomicAdd(@W.Count, 0) = 0 then
+  begin
+    SpinUnlock(@W.Spin);
+    Exit;
+  end;
+  QWait(@W.Head);
+  ParkUnlock(@W.Spin);
+end;
+
+{ ---- cond ---- }
+
+procedure PasCondWait(var C: TPasCond; var M: TPasMutex);
+begin
+  { Queue first, then release the mutex, then park: a Signal that lands
+    between the release and the park still finds this routine queued. }
+  SpinLock(@C.Spin);
+  QWait(@C.Head);
+  PasMutexUnlock(M);
+  ParkUnlock(@C.Spin);
+  PasMutexLock(M);
+end;
+
+procedure PasCondSignal(var C: TPasCond);
+var
+  g: Integer;
+begin
+  SpinLock(@C.Spin);
+  g := QWake1(@C.Head);
+  SpinUnlock(@C.Spin);
+  if g <> 0 then
+    ReadyG(g);
+end;
+
+procedure PasCondBroadcast(var C: TPasCond);
+var
+  g: Integer;
+begin
+  SpinLock(@C.Spin);
+  g := QWake1(@C.Head);
+  while g <> 0 do
+  begin
+    ReadyG(g);
+    g := QWake1(@C.Head);
+  end;
+  SpinUnlock(@C.Spin);
+end;
+
+{ ---- once ---- }
+
+{ True for the routine that must run the block. Every other routine
+  waits until that block has finished and then gets False. }
+function PasOnceBegin(var O: TPasOnce): Boolean;
+begin
+  Result := False;
+  if O.Fired <> 0 then
+    Exit;
+  SpinLock(@O.Spin);
+  if O.Fired <> 0 then
+  begin
+    SpinUnlock(@O.Spin);
+    Exit;
+  end;
+  if O.Running <> 0 then
+  begin
+    QWait(@O.Head);
+    ParkUnlock(@O.Spin);
+    Exit;
+  end;
+  O.Running := 1;
+  SpinUnlock(@O.Spin);
+  Result := True;
+end;
+
+procedure PasOnceEnd(var O: TPasOnce);
+var
+  g: Integer;
+begin
+  SpinLock(@O.Spin);
+  O.Fired := 1;
+  O.Running := 0;
+  g := QWake1(@O.Head);
+  while g <> 0 do
+  begin
+    ReadyG(g);
+    g := QWake1(@O.Head);
+  end;
+  SpinUnlock(@O.Spin);
+end;
+
+function PasOnceDone(var O: TPasOnce): Boolean;
+begin
+  Result := O.Fired <> 0;
+end;
+
+{ ---- the scheduler seen from a routine ---- }
+
+function Goid: Integer;
+begin
+  Result := GId;
+end;
+
+function NumGoroutine: Integer;
+begin
+  Result := GCount;
+end;
+
+procedure Yield;
+begin
+  Gosched;
+end;
+
+{ ---- ReadLn (1.0.57) ---- }
+
+{ ReadLn reads standard input through one buffer that lives as long as
+  the program, so the bytes after a line wait for the next ReadLn: each
+  call had 256 bytes of its own, dropped whatever came after the first
+  line and cut a longer line. A line ends at a line feed, which is not
+  kept, or at the end of the input. Standard input is non-blocking, so
+  a routine waiting for input parks on the poller (WaitFd) and its M
+  runs others; one routine reads at a time, the rest wait on InMu. The
+  runtime's rt_readln jumps here with Dest, the string to fill. }
+type
+  PStr = ^string;
+
+var
+  InBuf: array[0..4095] of Char;
+  InPos, InEnd: Integer;
+  InMu: TPasMutex;
+
+procedure PasReadLn(Dest: Pointer);
+var
+  line: string;
+  n, k, old, nr: Integer;
+  done: Boolean;
+begin
+  line := '';
+  if Amd64 = 1 then
+    nr := 0
+  else
+    nr := 63;
+  PasMutexLock(InMu);
+  done := False;
+  while not done do
+    if InPos >= InEnd then
+    begin
+      n := Syscall(nr, 0, Int64(@InBuf[0]), 4096);
+      if n > 0 then
+      begin
+        InPos := 0;
+        InEnd := n;
+      end
+      else if n = -11 then
+        k := WaitFd(0)
+      else if n <> -4 then
+        done := True;
+    end
+    else
+    begin
+      k := InPos;
+      while (k < InEnd) and (InBuf[k] <> #10) do
+        k := k + 1;
+      if k > InPos then
+      begin
+        old := Length(line);
+        SetLength(line, old + k - InPos);
+        Move(InBuf[InPos], line[old + 1], k - InPos);
+      end;
+      if k < InEnd then
+      begin
+        InPos := k + 1;
+        done := True;
+      end
+      else
+        InPos := InEnd;
+    end;
+  PasMutexUnlock(InMu);
+  PStr(Dest)^ := line;
+end;
+
+end.

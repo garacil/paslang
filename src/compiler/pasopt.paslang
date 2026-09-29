@@ -1,0 +1,1598 @@
+{$mode objfpc}{$H+}
+
+{ SSA-lite: const fold, dead-code, a constant function's value in place,
+  and inline by measure (P112). Never drops morestack. }
+unit pasopt;
+
+interface
+
+uses
+  pasast;
+
+var
+  InlineTrace: Boolean;   { -inline-trace: say on stderr why a routine stays a call (P112) }
+
+procedure Optimize(var Prog: TProgram);
+
+implementation
+
+uses
+  paslib;
+
+type
+  PProgram = ^TProgram;
+  TOpt = class
+  private
+    FProcs: TProcArray;
+    FProg: PProgram;
+    FMax: LongInt;          { -inline: the largest body put in place, 0 none }
+    FCur: LongInt;          { the routine being rewritten, -1 for the program's body }
+    FN: LongInt;            { the count of bodies put in place: the hidden names carry it }
+    FDone: LongInt;         { how many a pass put in place }
+    FOk: array of LongInt;  { per routine: 0 not yet measured, 1 goes in, 2 stays a call }
+    FQuiet: array of LongInt; { per routine: 0 not yet looked at, 1 writes and calls nothing, 2 does }
+    FMapFrom: TStrArray;    { the callee's names ... }
+    FMapTo: TExprArray;     { ... and what stands for each in the copy }
+    function SameId(const A, B: string): Boolean;
+    function Scalar(T: LongInt): Boolean;
+    procedure MapName(const N: string; E: PExpr);
+    function Mapped(const N: string; out E: PExpr): Boolean;
+    function CloneE(E: PExpr): PExpr;
+    function CopyE(E: PExpr): PExpr;
+    function CopyS(S: PStmt): PStmt;
+    function SizeE(E: PExpr): LongInt;
+    function SizeS(S: PStmt): LongInt;
+    function PlainE(E: PExpr; const Own: string): Boolean;
+    function PlainS(S: PStmt; const Own: string; Loops: LongInt): Boolean;
+    function Inlinable(Idx: LongInt): Boolean;
+    function Hidden(const Base: string; T: LongInt): PExpr;
+    function ZeroOf(T: LongInt): PExpr;
+    function CallerLocal(const N: string): Boolean;
+    function PlaceOK(E: PExpr): Boolean;
+    function Pure(E: PExpr): Boolean;
+    function Ahead(E: PExpr): Boolean;
+    function QuietE(E: PExpr): Boolean;
+    function QuietS(S: PStmt): Boolean;
+    function Quiet(Idx: LongInt): Boolean;
+    function FirstCall(E: PExpr): PExpr;
+    procedure ReplaceE(var E: PExpr; C, H: PExpr);
+    function ForCounter(S: PStmt; const N: string): Boolean;
+    function Dumps(S: PStmt): Boolean;
+    function RootName(E: PExpr): string;
+    function AddrOf(E: PExpr; const N: string): Boolean;
+    function WritesName(S: PStmt; const N: string): Boolean;
+    function UnrollAt(S: PStmt): PStmt;
+    function InList(const L: TStrArray; const N: string): Boolean;
+    function AddStmt(Blk: PStmt; St: PStmt): PStmt;
+    function InlineAt(S: PStmt): PStmt;
+    function HoistAt(S: PStmt): PStmt;
+    function OwnContinue(S: PStmt; Loops: LongInt): Boolean;
+    function LoopAt(S: PStmt): PStmt;
+    function InlineS(S: PStmt): PStmt;
+    function FindProc(const Sym: string): LongInt;
+    function FoldExpr(E: PExpr): PExpr;
+    function FoldStmt(S: PStmt): PStmt;
+    function InlineCall(E: PExpr): PExpr;
+    function IsEmptyProc(const Pr: TProc): Boolean;
+    function ConstResult(const Pr: TProc; out V: Int64): Boolean;
+  public
+    procedure Run(var Prog: TProgram);
+  end;
+
+function TOpt.SameId(const A, B: string): Boolean;
+begin
+  Result := ToLower(A) = ToLower(B);
+end;
+
+function TOpt.FindProc(const Sym: string): LongInt;
+var
+  i: SizeInt;
+begin
+  Result := -1;
+  for i := 0 to High(FProcs) do
+    if FProcs[i].Sym = Sym then
+    begin
+      Result := LongInt(i);
+      Exit;
+    end;
+end;
+
+function TOpt.IsEmptyProc(const Pr: TProc): Boolean;
+begin
+  Result := False;
+  if Pr.IsFunc or Pr.IsExt or Pr.IsCtor or (Pr.Nest > 0) or (Pr.ClassTyp <> 0) then
+    Exit;
+  if Length(Pr.Params) <> 0 then
+    Exit;
+  if Pr.Body = nil then
+  begin
+    Result := True;
+    Exit;
+  end;
+  if (Pr.Body^.Kind = skBlock) and (Length(Pr.Body^.Stmts) = 0) then
+    Result := True;
+end;
+
+function TOpt.ConstResult(const Pr: TProc; out V: Int64): Boolean;
+var
+  st: PStmt;
+begin
+  Result := False;
+  V := 0;
+  if (not Pr.IsFunc) or Pr.IsExt or Pr.IsCtor or (Pr.Nest > 0) or (Pr.ClassTyp <> 0) then
+    Exit;
+  if Length(Pr.Params) <> 0 then
+    Exit;
+  if Pr.Body = nil then
+    Exit;
+  st := Pr.Body;
+  if (st^.Kind = skBlock) and (Length(st^.Stmts) = 1) then
+    st := st^.Stmts[0];
+  if st^.Kind <> skAssign then
+    Exit;
+  if st^.Dest = nil then
+    Exit;
+  if st^.Dest^.Kind <> ekVar then
+    Exit;
+  if not SameId(st^.Dest^.Name, 'Result') then
+    Exit;
+  if (st^.E = nil) or (st^.E^.Kind <> ekInt) then
+    Exit;
+  V := st^.E^.Num;
+  Result := True;
+end;
+
+function TOpt.InlineCall(E: PExpr): PExpr;
+var
+  i: LongInt;
+  v: Int64;
+begin
+  Result := E;
+  if (E = nil) or (E^.Kind <> ekCall) then
+    Exit;
+  if Length(E^.Args) <> 0 then
+    Exit;
+  i := FindProc(E^.Name);
+  if i < 0 then
+    Exit;
+  if ConstResult(FProcs[i], v) then
+    Result := NewInt(v);
+end;
+
+function TOpt.FoldExpr(E: PExpr): PExpr;
+var
+  l, r, c: PExpr;
+  v: Int64;
+  i: SizeInt;
+begin
+  Result := E;
+  if E = nil then
+    Exit;
+  if E^.Kind = ekBin then
+  begin
+    l := Self.FoldExpr(E^.L);
+    r := Self.FoldExpr(E^.R);
+    E^.L := l;
+    E^.R := r;
+    if (l <> nil) and (r <> nil) and (l^.Kind = ekInt) and (r^.Kind = ekInt) then
+    begin
+      v := 0;
+      case E^.Bin of
+        boAdd: v := l^.Num + r^.Num;
+        boSub: v := l^.Num - r^.Num;
+        boMul: v := l^.Num * r^.Num;
+        boDiv:
+          begin
+            if r^.Num = 0 then
+              Exit;
+            v := l^.Num div r^.Num;
+          end;
+        boMod:
+          begin
+            if r^.Num = 0 then
+              Exit;
+            v := l^.Num mod r^.Num;
+          end;
+        boEq: if l^.Num = r^.Num then v := 1 else v := 0;
+        boNe: if l^.Num <> r^.Num then v := 1 else v := 0;
+        boLt: if l^.Num < r^.Num then v := 1 else v := 0;
+        boLe: if l^.Num <= r^.Num then v := 1 else v := 0;
+        boGt: if l^.Num > r^.Num then v := 1 else v := 0;
+        boGe: if l^.Num >= r^.Num then v := 1 else v := 0;
+        boAnd:
+          if E^.Typ = TyBoolean then
+          begin
+            if (l^.Num <> 0) and (r^.Num <> 0) then
+              v := 1
+            else
+              v := 0;
+          end
+          else
+            v := l^.Num and r^.Num;
+        boOr:
+          if E^.Typ = TyBoolean then
+          begin
+            if (l^.Num <> 0) or (r^.Num <> 0) then
+              v := 1
+            else
+              v := 0;
+          end
+          else
+            v := l^.Num or r^.Num;
+        boXor:
+          if E^.Typ = TyBoolean then
+          begin
+            if (l^.Num <> 0) xor (r^.Num <> 0) then
+              v := 1
+            else
+              v := 0;
+          end
+          else
+            v := l^.Num xor r^.Num;
+        boShl: v := l^.Num shl r^.Num;
+        boMulHi: v := FoldMulHi(l^.Num, r^.Num, False);
+        boMulHiS: v := FoldMulHi(l^.Num, r^.Num, True);
+        boShr:
+          { Arithmetic in Int8, Int16 and Int32 (P99). }
+          if (E^.Typ = TyInt8) or (E^.Typ = TyInt16) or (E^.Typ = TyInt32) then
+          begin
+            if l^.Num < 0 then
+              v := ((l^.Num xor -1) shr r^.Num) xor -1
+            else
+              v := l^.Num shr r^.Num;
+          end
+          else
+            v := l^.Num shr r^.Num;
+      else
+        Exit;
+      end;
+      c := NewInt(v);
+      { A folded Char stays a Char: Succ('y') printed 122 (1.0.74). }
+      if (E^.Typ = TyBoolean) or (E^.Typ = TyChar) then
+        c^.Typ := E^.Typ;
+      { A narrow integer keeps its type and its low bits (P99). }
+      if IsNarrowId(E^.Typ) then
+      begin
+        c^.Num := WrapInt(v, E^.Typ);
+        c^.Typ := E^.Typ;
+      end;
+      Result := c;
+      Exit;
+    end;
+    { A Boolean and or or with a constant side (1.0.124). They
+      short-circuit, so False and X is False and True or X is True with
+      X never run, True and X and False or X are X; on the right, X and
+      True and X or False are X. X and False keeps X, which runs. So a
+      CpuHas the target never has takes its branch out of the program. }
+    if (E^.Typ = TyBoolean) and ((E^.Bin = boAnd) or (E^.Bin = boOr)) and
+      (l <> nil) and (r <> nil) then
+    begin
+      if l^.Kind = ekInt then
+      begin
+        if (E^.Bin = boAnd) = (l^.Num <> 0) then
+          Result := r
+        else
+        begin
+          Result := NewInt(Ord(l^.Num <> 0));
+          Result^.Typ := TyBoolean;
+        end;
+        Exit;
+      end;
+      if (r^.Kind = ekInt) and ((E^.Bin = boAnd) = (r^.Num <> 0)) then
+      begin
+        Result := l;
+        Exit;
+      end;
+    end;
+    if (E^.Bin = boConcat) and (l <> nil) and (r <> nil) and
+      (l^.Kind = ekStr) and (r^.Kind = ekStr) then
+    begin
+      Result := NewStr(l^.Str + r^.Str);
+      Exit;
+    end;
+  end
+  else if E^.Kind = ekUn then
+  begin
+    l := Self.FoldExpr(E^.L);
+    E^.L := l;
+    if (l <> nil) and (l^.Kind = ekReal) and (E^.Un = uoNeg) then
+    begin
+      v := 1;
+      { A Single's sign is bit 31 (P101). }
+      if l^.Typ = TySingle then
+        v := v shl 31
+      else
+        v := v shl 63;
+      Result := NewReal(l^.Num xor v);
+      Result^.Typ := l^.Typ;
+      Exit;
+    end;
+    if (l <> nil) and (l^.Kind = ekInt) then
+    begin
+      if E^.Un = uoConv then
+      begin
+        Result := NewInt(WrapInt(l^.Num, E^.Typ));
+        Result^.Typ := E^.Typ;
+      end
+      else if BitUnOp(E^.Un) then
+      begin
+        Result := NewInt(FoldBitUn(E^.Un, l^.Num, l^.Typ));
+        Result^.Typ := E^.Typ;
+      end
+      else if E^.Un = uoNeg then
+      begin
+        Result := NewInt(-l^.Num);
+        if IsNarrowId(E^.Typ) then
+        begin
+          Result^.Num := WrapInt(-l^.Num, E^.Typ);
+          Result^.Typ := E^.Typ;
+        end;
+      end
+      else if E^.Typ = TyBoolean then
+      begin
+        if l^.Num = 0 then
+          Result := NewInt(1)
+        else
+          Result := NewInt(0);
+        Result^.Typ := TyBoolean;
+      end
+      else
+      begin
+        { xor -1 and not not: 1.0.73, which builds this file, read not
+          of an integer as a Boolean not (1.0.74). }
+        Result := NewInt(WrapInt(l^.Num xor -1, E^.Typ));
+        Result^.Typ := E^.Typ;
+      end;
+      Exit;
+    end;
+  end
+  else if E^.Kind = ekCall then
+  begin
+    for i := 0 to High(E^.Args) do
+      E^.Args[i] := Self.FoldExpr(E^.Args[i]);
+    Result := InlineCall(E);
+  end
+  else if E^.Kind = ekRecv then
+    E^.L := Self.FoldExpr(E^.L)
+  else if (E^.Kind = ekField) or (E^.Kind = ekDeref) or (E^.Kind = ekUn) then
+    E^.L := Self.FoldExpr(E^.L)
+  else if E^.Kind = ekIndex then
+  begin
+    E^.L := Self.FoldExpr(E^.L);
+    E^.R := Self.FoldExpr(E^.R);
+  end;
+end;
+
+function TOpt.FoldStmt(S: PStmt): PStmt;
+var
+  i: SizeInt;
+  idx: LongInt;
+  nst: PStmt;
+begin
+  Result := S;
+  if S = nil then
+    Exit;
+  S^.E := Self.FoldExpr(S^.E);
+  S^.E2 := Self.FoldExpr(S^.E2);
+  if S^.Dest <> nil then
+    S^.Dest := Self.FoldExpr(S^.Dest);
+  for i := 0 to High(S^.Args) do
+    S^.Args[i] := Self.FoldExpr(S^.Args[i]);
+  S^.ThenSt := Self.FoldStmt(S^.ThenSt);
+  S^.ElseSt := Self.FoldStmt(S^.ElseSt);
+  S^.Body := Self.FoldStmt(S^.Body);
+  for i := 0 to High(S^.Stmts) do
+    S^.Stmts[i] := Self.FoldStmt(S^.Stmts[i]);
+  for i := 0 to High(S^.Arms) do
+    S^.Arms[i].Body := Self.FoldStmt(S^.Arms[i].Body);
+  for i := 0 to High(S^.Sels) do
+  begin
+    S^.Sels[i].Chan := Self.FoldExpr(S^.Sels[i].Chan);
+    S^.Sels[i].Val := Self.FoldExpr(S^.Sels[i].Val);
+    S^.Sels[i].Body := Self.FoldStmt(S^.Sels[i].Body);
+  end;
+  if (S^.Kind = skIf) and (S^.E <> nil) and (S^.E^.Kind = ekInt) then
+  begin
+    if S^.E^.Num = 0 then
+      Result := S^.ElseSt
+    else
+      Result := S^.ThenSt;
+    Exit;
+  end;
+  if (S^.Kind = skWhile) and (S^.E <> nil) and (S^.E^.Kind = ekInt) and (S^.E^.Num = 0) then
+  begin
+    nst := NewStmt(skBlock);
+    nst^.Line := S^.Line;
+    Result := nst;
+    Exit;
+  end;
+  if (S^.Kind = skCall) and (S^.E = nil) and (Length(S^.Args) = 0) then
+  begin
+    idx := FindProc(S^.Name);
+    if (idx >= 0) and IsEmptyProc(FProcs[idx]) then
+    begin
+      nst := NewStmt(skBlock);
+      nst^.Line := S^.Line;
+      Result := nst;
+    end;
+  end;
+end;
+
+{ ---- Inline by measure (P112, 1.1.1) ----
+
+  A call of a routine of this unit is replaced by the routine's body
+  where the call is, when the routine is plain and small: no nested
+  routine, closure, method or constructor; parameters, locals and
+  result of a scalar type (an integer, a Boolean, an enumeration, a
+  subrange, a pointer); a body of assignments, ifs, loops, cases,
+  calls, Write and WriteLn, Inc and Dec, Halt, Break and Continue
+  inside its own loops, and nothing else (no Exit, try, raise, with,
+  pas, select, ReadLn, New, asm); never itself. The measure is the
+  count of statements and expression nodes against Prog.InlineMax
+  (-inline N, 40 by default; 0 keeps one copy of every routine); a
+  routine declared inline goes in whatever its size. The sites are a
+  call statement, an assignment whose right side is the call, and,
+  through a hidden variable, an if whose condition is the call (alone,
+  under a unary operator, or the left operand of an operator whose
+  other operand makes no call), an assignment of such an expression
+  and a call statement whose first argument is the call. The
+  parameters become hidden variables of the caller (inl.N.name)
+  assigned from the arguments in order; a var or out parameter is the
+  place given, when the place's address is not one the routine could
+  change; a constant given to a const parameter is the constant; the
+  locals are hidden variables set to zero as the prologue would set
+  them; Result is a hidden variable the assignment takes. Every
+  statement and expression of the body is copied, so nothing of the
+  routine's is shared with the copy, and the lines stay the routine's,
+  so a stop inside reports its own line. }
+
+function TOpt.Scalar(T: LongInt): Boolean;
+var
+  k: TTypeKind;
+begin
+  Result := False;
+  if (T < 0) or (T > High(FProg^.Types)) then
+    Exit;
+  k := FProg^.Types[T].Kind;
+  Result := (k = tykInteger) or (k = tykBoolean) or (k = tykEnum) or
+    (k = tykSubrange) or (k = tykPointer);
+end;
+
+procedure TOpt.MapName(const N: string; E: PExpr);
+var
+  k: SizeInt;
+begin
+  k := Length(FMapFrom);
+  SetLength(FMapFrom, k + 1);
+  SetLength(FMapTo, k + 1);
+  FMapFrom[k] := ToLower(N);
+  FMapTo[k] := E;
+end;
+
+function TOpt.Mapped(const N: string; out E: PExpr): Boolean;
+var
+  k: SizeInt;
+  lname: string;
+begin
+  Result := False;
+  E := nil;
+  lname := ToLower(N);
+  for k := High(FMapFrom) downto 0 do
+    if FMapFrom[k] = lname then
+    begin
+      E := FMapTo[k];
+      Result := True;
+      Exit;
+    end;
+end;
+
+{ A copy of an expression as it is: what stands for a name is copied
+  this way, its own names untouched. }
+function TOpt.CloneE(E: PExpr): PExpr;
+var
+  i: SizeInt;
+begin
+  Result := nil;
+  if E = nil then
+    Exit;
+  New(Result);
+  Result^ := E^;
+  Result^.L := CloneE(E^.L);
+  Result^.R := CloneE(E^.R);
+  Result^.Args := nil;
+  SetLength(Result^.Args, Length(E^.Args));
+  for i := 0 to High(E^.Args) do
+    Result^.Args[i] := CloneE(E^.Args[i]);
+end;
+
+{ A copy of the callee's expression with its names replaced. }
+function TOpt.CopyE(E: PExpr): PExpr;
+var
+  i: SizeInt;
+  m: PExpr;
+begin
+  Result := nil;
+  if E = nil then
+    Exit;
+  if (E^.Kind = ekVar) and Mapped(E^.Name, m) then
+  begin
+    Result := CloneE(m);
+    { a cast retypes the name's node in place (PByte(p)[j]): the
+      stand-in takes the type the node had }
+    if (E^.Typ <> 0) and (Result^.Typ <> E^.Typ) then
+      Result^.Typ := E^.Typ;
+    Exit;
+  end;
+  New(Result);
+  Result^ := E^;
+  Result^.L := CopyE(E^.L);
+  Result^.R := CopyE(E^.R);
+  Result^.Args := nil;
+  SetLength(Result^.Args, Length(E^.Args));
+  for i := 0 to High(E^.Args) do
+    Result^.Args[i] := CopyE(E^.Args[i]);
+end;
+
+function TOpt.CopyS(S: PStmt): PStmt;
+var
+  i, j: SizeInt;
+  m: PExpr;
+begin
+  Result := nil;
+  if S = nil then
+    Exit;
+  New(Result);
+  Result^ := S^;
+  { a for's counter is a name: its hidden variable }
+  if (S^.Kind = skFor) and Mapped(S^.Name, m) and (m^.Kind = ekVar) then
+    Result^.Name := m^.Name;
+  Result^.E := CopyE(S^.E);
+  Result^.E2 := CopyE(S^.E2);
+  Result^.Dest := CopyE(S^.Dest);
+  Result^.Args := nil;
+  SetLength(Result^.Args, Length(S^.Args));
+  for i := 0 to High(S^.Args) do
+    Result^.Args[i] := CopyE(S^.Args[i]);
+  Result^.ThenSt := CopyS(S^.ThenSt);
+  Result^.ElseSt := CopyS(S^.ElseSt);
+  Result^.Body := CopyS(S^.Body);
+  Result^.Stmts := nil;
+  SetLength(Result^.Stmts, Length(S^.Stmts));
+  for i := 0 to High(S^.Stmts) do
+    Result^.Stmts[i] := CopyS(S^.Stmts[i]);
+  Result^.Arms := nil;
+  SetLength(Result^.Arms, Length(S^.Arms));
+  for i := 0 to High(S^.Arms) do
+  begin
+    Result^.Arms[i].Vals := nil;
+    SetLength(Result^.Arms[i].Vals, Length(S^.Arms[i].Vals));
+    for j := 0 to High(S^.Arms[i].Vals) do
+      Result^.Arms[i].Vals[j] := S^.Arms[i].Vals[j];
+    Result^.Arms[i].His := nil;
+    SetLength(Result^.Arms[i].His, Length(S^.Arms[i].His));
+    for j := 0 to High(S^.Arms[i].His) do
+      Result^.Arms[i].His[j] := S^.Arms[i].His[j];
+    Result^.Arms[i].Strs := nil;
+    SetLength(Result^.Arms[i].Strs, Length(S^.Arms[i].Strs));
+    for j := 0 to High(S^.Arms[i].Strs) do
+      Result^.Arms[i].Strs[j] := S^.Arms[i].Strs[j];
+    Result^.Arms[i].Body := CopyS(S^.Arms[i].Body);
+  end;
+  Result^.Sels := nil;
+end;
+
+{ The measure of a body: its statements and expression nodes. }
+function TOpt.SizeE(E: PExpr): LongInt;
+var
+  i: SizeInt;
+begin
+  Result := 0;
+  if E = nil then
+    Exit;
+  Result := 1 + SizeE(E^.L) + SizeE(E^.R);
+  for i := 0 to High(E^.Args) do
+    Result := Result + SizeE(E^.Args[i]);
+end;
+
+function TOpt.SizeS(S: PStmt): LongInt;
+var
+  i: SizeInt;
+begin
+  Result := 0;
+  if S = nil then
+    Exit;
+  Result := 1 + SizeE(S^.E) + SizeE(S^.E2) + SizeE(S^.Dest) + SizeS(S^.ThenSt) +
+    SizeS(S^.ElseSt) + SizeS(S^.Body);
+  for i := 0 to High(S^.Args) do
+    Result := Result + SizeE(S^.Args[i]);
+  for i := 0 to High(S^.Stmts) do
+    Result := Result + SizeS(S^.Stmts[i]);
+  for i := 0 to High(S^.Arms) do
+    Result := Result + SizeS(S^.Arms[i].Body);
+end;
+
+{ The body's shape: the statements allowed, Break and Continue only
+  inside a loop of its own, no call of the routine itself, nothing
+  that names a routine or a method as a value. }
+function TOpt.PlainE(E: PExpr; const Own: string): Boolean;
+var
+  i: SizeInt;
+begin
+  Result := True;
+  if E = nil then
+    Exit;
+  if (E^.Kind = ekCall) and (E^.Name = Own) then
+  begin
+    Result := False;
+    Exit;
+  end;
+  if (E^.Kind = ekProcPtr) or (E^.Kind = ekMethPtr) or (E^.Kind = ekCtor) or
+    (E^.Kind = ekMethod) or (E^.Kind = ekProp) then
+  begin
+    Result := False;
+    Exit;
+  end;
+  Result := PlainE(E^.L, Own) and PlainE(E^.R, Own);
+  for i := 0 to High(E^.Args) do
+    if Result then
+      Result := PlainE(E^.Args[i], Own);
+end;
+
+function TOpt.PlainS(S: PStmt; const Own: string; Loops: LongInt): Boolean;
+var
+  i: SizeInt;
+begin
+  Result := True;
+  if S = nil then
+    Exit;
+  case S^.Kind of
+    skAssign, skInc, skDec, skWrite, skWriteLn, skIf, skBlock, skCase, skHalt,
+    skWhile, skRepeat, skFor, skSleep, skSend, skClose:
+      Result := True;
+    skCall:
+      Result := S^.Name <> Own;
+    skBreak, skContinue:
+      Result := Loops > 0;
+  else
+    Result := False;
+  end;
+  if not Result then
+    Exit;
+  if (S^.Kind = skWhile) or (S^.Kind = skRepeat) or (S^.Kind = skFor) then
+    Loops := Loops + 1;
+  Result := PlainE(S^.E, Own) and PlainE(S^.E2, Own) and PlainE(S^.Dest, Own) and
+    PlainS(S^.ThenSt, Own, Loops) and PlainS(S^.ElseSt, Own, Loops) and
+    PlainS(S^.Body, Own, Loops);
+  for i := 0 to High(S^.Args) do
+    if Result then
+      Result := PlainE(S^.Args[i], Own);
+  for i := 0 to High(S^.Stmts) do
+    if Result then
+      Result := PlainS(S^.Stmts[i], Own, Loops);
+  for i := 0 to High(S^.Arms) do
+    if Result then
+      Result := PlainS(S^.Arms[i].Body, Own, Loops);
+  if Length(S^.Sels) > 0 then
+    Result := False;
+end;
+
+{ Whether the routine goes in where it is called: measured once. }
+function TOpt.Inlinable(Idx: LongInt): Boolean;
+var
+  i: SizeInt;
+  pr: TProc;
+  why: string;
+begin
+  if FOk[Idx] = 0 then
+  begin
+    pr := FProcs[Idx];
+    why := '';
+    if pr.IsExt then
+      why := 'another unit''s'
+    else if pr.IsCtor or (pr.ClassTyp <> 0) then
+      why := 'a method'
+    else if pr.IsAnon or pr.Boxing or (Length(pr.Shared) > 0) or (Length(pr.Pins) > 0) then
+      why := 'a closure or one that keeps variables for closures'
+    else if pr.Nest > 0 then
+      why := 'nested in another routine'
+    else if pr.Body = nil then
+      why := 'without a body'
+    else if pr.IsFunc and (not Scalar(pr.RetTyp)) then
+      why := 'its result is not a scalar';
+    for i := 0 to High(pr.Params) do
+      if (why = '') and (not Scalar(pr.Params[i].Typ)) then
+        why := 'parameter ' + pr.Params[i].Name + ' is not a scalar';
+    for i := 0 to High(pr.Locals) do
+      if (why = '') and (not Scalar(pr.Locals[i].Typ)) then
+        why := 'local ' + pr.Locals[i].Name + ' is not a scalar';
+    for i := 0 to High(FProcs) do
+      if (why = '') and (FProcs[i].Nest > 0) and
+        (SameId(FProcs[i].ParentSym, pr.Sym) or SameId(FProcs[i].ParentSym, pr.Name)) then
+        why := 'has a nested routine';
+    if (why = '') and Dumps(pr.Body) then
+      why := 'calls DumpLocals';
+    if (why = '') and (not PlainS(pr.Body, pr.Sym, 0)) then
+      why := 'its body has a statement that stays in its own frame (Exit, try, raise, with, pas, select, ReadLn, New, asm), or names a routine as a value, or calls itself';
+    if (why = '') and (not pr.InPlace) and (SizeS(pr.Body) > FMax) then
+      why := 'measures ' + IntToStr(SizeS(pr.Body)) + ' against -inline ' + IntToStr(FMax);
+    if why = '' then
+      FOk[Idx] := 1
+    else
+    begin
+      FOk[Idx] := 2;
+      if InlineTrace then
+        WriteLn(ErrOutput, 'inline: ', pr.Name, ' stays a call: ', why);
+    end;
+  end;
+  Result := FOk[Idx] = 1;
+end;
+
+{ A hidden variable of the routine being rewritten, or a global for
+  the program's body. }
+function TOpt.Hidden(const Base: string; T: LongInt): PExpr;
+var
+  nm: string;
+  n: SizeInt;
+  d: TVarDecl;
+begin
+  nm := 'inl.' + IntToStr(FN) + '.' + Base;
+  d := Default(TVarDecl);
+  d.Name := nm;
+  d.Typ := T;
+  if FCur >= 0 then
+  begin
+    n := Length(FProg^.Procs[FCur].Locals);
+    SetLength(FProg^.Procs[FCur].Locals, n + 1);
+    FProg^.Procs[FCur].Locals[n] := d;
+  end
+  else
+  begin
+    if FProg^.IsUnit then
+      d.Sym := FProg^.Name + '.' + nm;
+    n := Length(FProg^.Vars);
+    SetLength(FProg^.Vars, n + 1);
+    FProg^.Vars[n] := d;
+  end;
+  Result := NewVar(nm, T);
+end;
+
+function TOpt.ZeroOf(T: LongInt): PExpr;
+begin
+  if FProg^.Types[T].Kind = tykPointer then
+    Result := NewNil
+  else
+  begin
+    Result := NewInt(0);
+    Result^.Typ := T;
+  end;
+end;
+
+{ A parameter or local of the routine being rewritten: nothing the
+  callee does reaches it. }
+function TOpt.CallerLocal(const N: string): Boolean;
+var
+  i: SizeInt;
+begin
+  Result := False;
+  if FCur < 0 then
+    Exit;
+  for i := 0 to High(FProcs[FCur].Params) do
+    if SameId(FProcs[FCur].Params[i].Name, N) then
+    begin
+      Result := True;
+      Exit;
+    end;
+  for i := 0 to High(FProcs[FCur].Locals) do
+    if SameId(FProcs[FCur].Locals[i].Name, N) then
+    begin
+      Result := True;
+      Exit;
+    end;
+end;
+
+{ A place given for a var or out parameter that may stand in the body
+  as it is: its address is one the routine cannot change. A variable;
+  a field of a record in such a place, or of an object a caller's
+  variable holds; an element of a static array in such a place, or of
+  a dynamic one a caller's variable holds, at a constant or a caller's
+  variable; what a caller's pointer variable points to. }
+function TOpt.PlaceOK(E: PExpr): Boolean;
+var
+  b, ix: PExpr;
+  k: TTypeKind;
+begin
+  Result := False;
+  if E = nil then
+    Exit;
+  case E^.Kind of
+    ekVar:
+      Result := True;
+    ekField:
+      begin
+        b := E^.L;
+        if b = nil then
+          Exit;
+        k := FProg^.Types[b^.Typ].Kind;
+        if k = tykRecord then
+          Result := PlaceOK(b)
+        else
+          Result := (b^.Kind = ekVar) and CallerLocal(b^.Name);
+      end;
+    ekIndex:
+      begin
+        b := E^.L;
+        ix := E^.R;
+        if (b = nil) or (ix = nil) then
+          Exit;
+        if not ((ix^.Kind = ekInt) or ((ix^.Kind = ekVar) and CallerLocal(ix^.Name))) then
+          Exit;
+        k := FProg^.Types[b^.Typ].Kind;
+        if (k = tykArray) and (FProg^.Types[b^.Typ].Hi >= FProg^.Types[b^.Typ].Lo) then
+          Result := PlaceOK(b)
+        else
+          Result := (b^.Kind = ekVar) and CallerLocal(b^.Name);
+      end;
+    ekDeref:
+      Result := (E^.L <> nil) and (E^.L^.Kind = ekVar) and CallerLocal(E^.L^.Name);
+  else
+    Result := False;
+  end;
+end;
+
+{ An expression that makes no call: reads and arithmetic only. }
+function TOpt.Pure(E: PExpr): Boolean;
+begin
+  Result := False;
+  if E = nil then
+    Exit;
+  case E^.Kind of
+    ekInt, ekNil, ekStr, ekReal, ekVar:
+      Result := True;
+    ekField, ekDeref, ekUn:
+      Result := Pure(E^.L);
+    ekIndex, ekBin:
+      Result := Pure(E^.L) and Pure(E^.R);
+  else
+    Result := False;
+  end;
+end;
+
+{ An expression evaluated ahead of a call put in place, whose value
+  the routine cannot change: constants, the caller's own variables and
+  the hidden ones, an address of a variable, and arithmetic on those. }
+function TOpt.Ahead(E: PExpr): Boolean;
+begin
+  Result := False;
+  if E = nil then
+    Exit;
+  case E^.Kind of
+    ekInt, ekNil, ekStr, ekReal:
+      Result := True;
+    ekVar:
+      Result := CallerLocal(E^.Name) or (Copy(E^.Name, 1, 4) = 'inl.');
+    ekUn:
+      Result := Ahead(E^.L);
+    ekBin:
+      Result := Ahead(E^.L) and Ahead(E^.R);
+    ekAddr:
+      Result := (E^.L <> nil) and (E^.L^.Kind = ekVar);
+  else
+    Result := False;
+  end;
+end;
+
+{ A body that writes nothing and calls nothing: its value may be taken
+  ahead of the arguments Write puts out before it. }
+function TOpt.QuietE(E: PExpr): Boolean;
+var
+  i: SizeInt;
+begin
+  Result := True;
+  if E = nil then
+    Exit;
+  if (E^.Kind = ekCall) or (E^.Kind = ekRecv) or (E^.Kind = ekMakeChan) or
+    (E^.Kind = ekCtor) or (E^.Kind = ekMethod) then
+  begin
+    Result := False;
+    Exit;
+  end;
+  Result := QuietE(E^.L) and QuietE(E^.R);
+  for i := 0 to High(E^.Args) do
+    if Result then
+      Result := QuietE(E^.Args[i]);
+end;
+
+function TOpt.QuietS(S: PStmt): Boolean;
+var
+  i: SizeInt;
+begin
+  Result := True;
+  if S = nil then
+    Exit;
+  if (S^.Kind = skWrite) or (S^.Kind = skWriteLn) or (S^.Kind = skCall) or
+    (S^.Kind = skSend) or (S^.Kind = skClose) or (S^.Kind = skSleep) or (S^.Kind = skHalt) then
+  begin
+    Result := False;
+    Exit;
+  end;
+  Result := QuietE(S^.E) and QuietE(S^.E2) and QuietE(S^.Dest) and QuietS(S^.ThenSt) and
+    QuietS(S^.ElseSt) and QuietS(S^.Body);
+  for i := 0 to High(S^.Args) do
+    if Result then
+      Result := QuietE(S^.Args[i]);
+  for i := 0 to High(S^.Stmts) do
+    if Result then
+      Result := QuietS(S^.Stmts[i]);
+  for i := 0 to High(S^.Arms) do
+    if Result then
+      Result := QuietS(S^.Arms[i].Body);
+end;
+
+function TOpt.Quiet(Idx: LongInt): Boolean;
+begin
+  if FQuiet[Idx] = 0 then
+  begin
+    if QuietS(FProcs[Idx].Body) then
+      FQuiet[Idx] := 1
+    else
+      FQuiet[Idx] := 2;
+  end;
+  Result := FQuiet[Idx] = 1;
+end;
+
+{ The call evaluated first in E that goes in, or nil: down the left
+  operands, into a right operand only past a safe left one and never
+  past a Boolean and or or, into a call's arguments in order past safe
+  ones. }
+function TOpt.FirstCall(E: PExpr): PExpr;
+var
+  i: SizeInt;
+  idx: LongInt;
+begin
+  Result := nil;
+  if E = nil then
+    Exit;
+  case E^.Kind of
+    ekCall:
+      begin
+        idx := FindProc(E^.Name);
+        if (idx >= 0) and FProcs[idx].IsFunc and (FCur <> idx) and Inlinable(idx) then
+        begin
+          Result := E;
+          Exit;
+        end;
+        for i := 0 to High(E^.Args) do
+        begin
+          if (E^.Args[i] <> nil) and (E^.Args[i]^.Kind <> ekAddr) then
+            Result := FirstCall(E^.Args[i]);
+          if Result <> nil then
+            Exit;
+          if not Ahead(E^.Args[i]) then
+            Exit;
+        end;
+      end;
+    ekUn, ekDeref, ekField:
+      Result := FirstCall(E^.L);
+    ekIndex:
+      begin
+        Result := FirstCall(E^.L);
+        if (Result = nil) and Ahead(E^.L) then
+          Result := FirstCall(E^.R);
+      end;
+    ekBin:
+      begin
+        Result := FirstCall(E^.L);
+        if (Result = nil) and Ahead(E^.L) and
+          (not ((E^.Typ = TyBoolean) and ((E^.Bin = boAnd) or (E^.Bin = boOr)))) then
+          Result := FirstCall(E^.R);
+      end;
+  else
+    Result := nil;
+  end;
+end;
+
+procedure TOpt.ReplaceE(var E: PExpr; C, H: PExpr);
+var
+  i: SizeInt;
+begin
+  if E = nil then
+    Exit;
+  if E = C then
+  begin
+    E := H;
+    Exit;
+  end;
+  ReplaceE(E^.L, C, H);
+  ReplaceE(E^.R, C, H);
+  for i := 0 to High(E^.Args) do
+    ReplaceE(E^.Args[i], C, H);
+end;
+
+function TOpt.ForCounter(S: PStmt; const N: string): Boolean;
+var
+  i: SizeInt;
+begin
+  Result := False;
+  if S = nil then
+    Exit;
+  if (S^.Kind = skFor) and SameId(S^.Name, N) then
+  begin
+    Result := True;
+    Exit;
+  end;
+  Result := ForCounter(S^.ThenSt, N) or ForCounter(S^.ElseSt, N) or ForCounter(S^.Body, N);
+  for i := 0 to High(S^.Stmts) do
+    if not Result then
+      Result := ForCounter(S^.Stmts[i], N);
+  for i := 0 to High(S^.Arms) do
+    if not Result then
+      Result := ForCounter(S^.Arms[i].Body, N);
+end;
+
+function TOpt.InList(const L: TStrArray; const N: string): Boolean;
+var
+  i: SizeInt;
+begin
+  Result := False;
+  for i := 0 to High(L) do
+    if L[i] = N then
+    begin
+      Result := True;
+      Exit;
+    end;
+end;
+
+function TOpt.AddStmt(Blk: PStmt; St: PStmt): PStmt;
+var
+  n: SizeInt;
+begin
+  n := Length(Blk^.Stmts);
+  SetLength(Blk^.Stmts, n + 1);
+  Blk^.Stmts[n] := St;
+  Result := St;
+end;
+
+{ DumpLocals prints the frame's variables by name: a routine that
+  calls it keeps its frame, and takes nothing into it. }
+function TOpt.Dumps(S: PStmt): Boolean;
+var
+  i: SizeInt;
+begin
+  Result := False;
+  if S = nil then
+    Exit;
+  if (S^.Kind = skCall) and (S^.Name = 'rt_dumplocs') then
+  begin
+    Result := True;
+    Exit;
+  end;
+  Result := Dumps(S^.ThenSt) or Dumps(S^.ElseSt) or Dumps(S^.Body);
+  for i := 0 to High(S^.Stmts) do
+    if not Result then
+      Result := Dumps(S^.Stmts[i]);
+  for i := 0 to High(S^.Arms) do
+    if not Result then
+      Result := Dumps(S^.Arms[i].Body);
+  for i := 0 to High(S^.Sels) do
+    if not Result then
+      Result := Dumps(S^.Sels[i].Body);
+end;
+
+{ ---- Loops of a constant, small count unrolled (P112) ----
+
+  for i := a to b do body, with a and b constants, four passes or
+  fewer and a small plain body that neither changes i nor takes its
+  address, becomes the body copied once per pass with the pass's
+  value in i's place, then i := b, as the loop leaves it. }
+
+function TOpt.RootName(E: PExpr): string;
+begin
+  Result := '';
+  if E = nil then
+    Exit;
+  case E^.Kind of
+    ekVar:
+      Result := E^.Name;
+    ekIndex, ekField, ekDeref:
+      Result := RootName(E^.L);
+  else
+    Result := '';
+  end;
+end;
+
+function TOpt.AddrOf(E: PExpr; const N: string): Boolean;
+var
+  i: SizeInt;
+begin
+  Result := False;
+  if E = nil then
+    Exit;
+  if (E^.Kind = ekAddr) and SameId(RootName(E^.L), N) then
+  begin
+    Result := True;
+    Exit;
+  end;
+  Result := AddrOf(E^.L, N) or AddrOf(E^.R, N);
+  for i := 0 to High(E^.Args) do
+    if not Result then
+      Result := AddrOf(E^.Args[i], N);
+end;
+
+function TOpt.WritesName(S: PStmt; const N: string): Boolean;
+var
+  i: SizeInt;
+begin
+  Result := False;
+  if S = nil then
+    Exit;
+  if ((S^.Kind = skAssign) or (S^.Kind = skInc) or (S^.Kind = skDec)) and
+    SameId(RootName(S^.Dest), N) then
+  begin
+    Result := True;
+    Exit;
+  end;
+  if (S^.Kind = skFor) and SameId(S^.Name, N) then
+  begin
+    Result := True;
+    Exit;
+  end;
+  Result := AddrOf(S^.E, N) or AddrOf(S^.E2, N) or AddrOf(S^.Dest, N) or
+    WritesName(S^.ThenSt, N) or WritesName(S^.ElseSt, N) or WritesName(S^.Body, N);
+  for i := 0 to High(S^.Args) do
+    if not Result then
+      Result := AddrOf(S^.Args[i], N);
+  for i := 0 to High(S^.Stmts) do
+    if not Result then
+      Result := WritesName(S^.Stmts[i], N);
+  for i := 0 to High(S^.Arms) do
+    if not Result then
+      Result := WritesName(S^.Arms[i].Body, N);
+end;
+
+function TOpt.UnrollAt(S: PStmt): PStmt;
+var
+  a, b, cnt, k, sz: Int64;
+  blk, st: PStmt;
+  v: PExpr;
+begin
+  Result := nil;
+  if (S = nil) or (S^.Kind <> skFor) or (S^.E = nil) or (S^.E2 = nil) or
+    (S^.E^.Kind <> ekInt) or (S^.E2^.Kind <> ekInt) or (S^.Body = nil) then
+    Exit;
+  a := S^.E^.Num;
+  b := S^.E2^.Num;
+  if S^.Down then
+    cnt := a - b + 1
+  else
+    cnt := b - a + 1;
+  if (cnt < 1) or (cnt > 4) then
+    Exit;
+  sz := SizeS(S^.Body);
+  if (sz > 16) or (sz * cnt > 40) then
+    Exit;
+  if not PlainS(S^.Body, '', 0) then
+    Exit;
+  if WritesName(S^.Body, S^.Name) then
+    Exit;
+  blk := NewStmt(skBlock);
+  blk^.Line := S^.Line;
+  for k := 0 to cnt - 1 do
+  begin
+    v := NewInt(a);
+    if S^.Down then
+      v^.Num := a - k
+    else
+      v^.Num := a + k;
+    v^.Typ := S^.E^.Typ;
+    FMapFrom := nil;
+    FMapTo := nil;
+    MapName(S^.Name, v);
+    AddStmt(blk, CopyS(S^.Body));
+    FMapFrom := nil;
+    FMapTo := nil;
+  end;
+  { the counter holds the limit after the loop }
+  st := AddStmt(blk, NewStmt(skAssign));
+  st^.Line := S^.Line;
+  st^.Dest := NewVar(S^.Name, S^.E^.Typ);
+  st^.E := NewInt(b);
+  st^.E^.Typ := S^.E^.Typ;
+  Inc(FDone);
+  Result := blk;
+end;
+
+{ The call at S, a call statement or an assignment whose right side is
+  the call, becomes a block; nil when the call stays. }
+function TOpt.InlineAt(S: PStmt): PStmt;
+var
+  idx: LongInt;
+  pr: TProc;
+  args: TExprArray;
+  i, k: SizeInt;
+  blk, st: PStmt;
+  hv, arg, res: PExpr;
+  refs: TStrArray;
+begin
+  Result := nil;
+  if S = nil then
+    Exit;
+  if (S^.Kind = skCall) and (S^.E = nil) then
+  begin
+    idx := FindProc(S^.Name);
+    args := S^.Args;
+  end
+  else if (S^.Kind = skAssign) and (S^.E <> nil) and (S^.E^.Kind = ekCall) and
+    (S^.Dest <> nil) then
+  begin
+    idx := FindProc(S^.E^.Name);
+    args := S^.E^.Args;
+  end
+  else
+    Exit;
+  if idx < 0 then
+    Exit;
+  if (FCur >= 0) and (FCur = idx) then
+    Exit;
+  if not Inlinable(idx) then
+    Exit;
+  pr := FProcs[idx];
+  if (S^.Kind = skAssign) and (not pr.IsFunc) then
+    Exit;
+  if Length(args) <> Length(pr.Params) then
+    Exit;
+  { the places given for var and out parameters }
+  for i := 0 to High(pr.Params) do
+    if pr.Params[i].ByRef then
+    begin
+      arg := args[i];
+      if (arg <> nil) and (arg^.Kind = ekAddr) then
+        arg := arg^.L;
+      if not PlaceOK(arg) then
+        Exit;
+      if (arg^.Kind <> ekVar) and ForCounter(pr.Body, pr.Params[i].Name) then
+        Exit;
+    end;
+  Inc(FN);
+  FMapFrom := nil;
+  FMapTo := nil;
+  blk := NewStmt(skBlock);
+  blk^.Line := S^.Line;
+  { the roots of the places given for var parameters: a value
+    parameter given the same variable keeps its own copy }
+  refs := nil;
+  for i := 0 to High(pr.Params) do
+    if pr.Params[i].ByRef then
+    begin
+      arg := args[i];
+      if (arg <> nil) and (arg^.Kind = ekAddr) then
+        arg := arg^.L;
+      k := Length(refs);
+      SetLength(refs, k + 1);
+      refs[k] := ToLower(RootName(arg));
+    end;
+  { the parameters, in order }
+  for i := 0 to High(pr.Params) do
+  begin
+    arg := args[i];
+    if pr.Params[i].ByRef then
+    begin
+      if (arg <> nil) and (arg^.Kind = ekAddr) then
+        arg := arg^.L;
+      MapName(pr.Params[i].Name, arg);
+    end
+    else if (arg <> nil) and ((arg^.Kind = ekInt) or (arg^.Kind = ekNil)) and
+      (pr.Params[i].IsConst or (not WritesName(pr.Body, pr.Params[i].Name))) then
+      MapName(pr.Params[i].Name, arg)
+    else if (arg <> nil) and (arg^.Kind = ekVar) and (arg^.Typ = pr.Params[i].Typ) and
+      CallerLocal(arg^.Name) and (not InList(refs, ToLower(arg^.Name))) and
+      (not WritesName(pr.Body, pr.Params[i].Name)) then
+      { a value parameter the body never changes, given a variable of
+        the caller's own that nothing in the body can reach: the
+        variable itself stands in, no hidden copy (1.1.1) }
+      MapName(pr.Params[i].Name, arg)
+    else
+    begin
+      hv := Hidden(pr.Params[i].Name, pr.Params[i].Typ);
+      st := AddStmt(blk, NewStmt(skAssign));
+      st^.Line := S^.Line;
+      st^.Dest := hv;
+      st^.E := arg;
+      MapName(pr.Params[i].Name, hv);
+    end;
+  end;
+  { the locals, zero as the prologue leaves them, unless every path
+    of the body writes one before reading it }
+  for i := 0 to High(pr.Locals) do
+  begin
+    hv := Hidden(pr.Locals[i].Name, pr.Locals[i].Typ);
+    if not WritesFirst(pr.Body, pr.Locals[i].Name, '') then
+    begin
+      st := AddStmt(blk, NewStmt(skAssign));
+      st^.Line := S^.Line;
+      st^.Dest := hv;
+      st^.E := ZeroOf(pr.Locals[i].Typ);
+    end;
+    MapName(pr.Locals[i].Name, hv);
+  end;
+  res := nil;
+  if pr.IsFunc then
+  begin
+    res := Hidden('result', pr.RetTyp);
+    if not WritesFirst(pr.Body, 'result', pr.Name) then
+    begin
+      st := AddStmt(blk, NewStmt(skAssign));
+      st^.Line := S^.Line;
+      st^.Dest := res;
+      st^.E := ZeroOf(pr.RetTyp);
+    end;
+    MapName('result', res);
+    MapName(pr.Name, res);
+  end;
+  AddStmt(blk, CopyS(pr.Body));
+  if S^.Kind = skAssign then
+  begin
+    st := AddStmt(blk, NewStmt(skAssign));
+    st^.Line := S^.Line;
+    st^.Dest := S^.Dest;
+    st^.E := CloneE(res);
+  end;
+  FMapFrom := nil;
+  FMapTo := nil;
+  Inc(FDone);
+  Result := blk;
+end;
+
+{ A call evaluated first in an if's or case's expression, an
+  assignment's right side, or the arguments of a call statement, Write
+  or WriteLn (past those written before it only when its body writes
+  and calls nothing) goes through a hidden variable: the block that
+  sets it, then S with the variable in the call's place; nil when
+  nothing is taken. }
+function TOpt.HoistAt(S: PStmt): PStmt;
+var
+  c, hv: PExpr;
+  idx: LongInt;
+  i: SizeInt;
+  st, r, blk: PStmt;
+begin
+  Result := nil;
+  if S = nil then
+    Exit;
+  c := nil;
+  case S^.Kind of
+    skIf, skCase:
+      c := FirstCall(S^.E);
+    skAssign:
+      begin
+        c := FirstCall(S^.E);
+        { the place written, whose address is taken after the value:
+          a call in it goes ahead when the value is ahead-safe }
+        if (c = nil) and Ahead(S^.E) then
+          c := FirstCall(S^.Dest);
+      end;
+    skCall, skWrite, skWriteLn:
+      if S^.E = nil then
+        for i := 0 to High(S^.Args) do
+        begin
+          if (S^.Args[i] <> nil) and (S^.Args[i]^.Kind <> ekAddr) then
+            c := FirstCall(S^.Args[i]);
+          if c <> nil then
+          begin
+            if (i > 0) and (S^.Kind <> skCall) and (not Quiet(FindProc(c^.Name))) then
+              c := nil;
+            Break;
+          end;
+          if not Ahead(S^.Args[i]) then
+            Break;
+        end;
+  else
+    c := nil;
+  end;
+  if c = nil then
+    Exit;
+  idx := FindProc(c^.Name);
+  if idx < 0 then
+    Exit;
+  Inc(FN);
+  hv := Hidden('h', FProcs[idx].RetTyp);
+  st := NewStmt(skAssign);
+  st^.Line := S^.Line;
+  st^.Dest := hv;
+  st^.E := c;
+  r := InlineAt(st);
+  if r = nil then
+    Exit;
+  case S^.Kind of
+    skIf, skCase:
+      ReplaceE(S^.E, c, CloneE(hv));
+    skAssign:
+      begin
+        ReplaceE(S^.E, c, CloneE(hv));
+        ReplaceE(S^.Dest, c, CloneE(hv));
+      end;
+  else
+    for i := 0 to High(S^.Args) do
+      ReplaceE(S^.Args[i], c, CloneE(hv));
+  end;
+  blk := NewStmt(skBlock);
+  blk^.Line := S^.Line;
+  AddStmt(blk, r);
+  AddStmt(blk, S);
+  Result := blk;
+end;
+
+{ A Continue at the loop's own level (not one of a loop inside). }
+function TOpt.OwnContinue(S: PStmt; Loops: LongInt): Boolean;
+var
+  i: SizeInt;
+begin
+  Result := False;
+  if S = nil then
+    Exit;
+  if S^.Kind = skContinue then
+  begin
+    Result := Loops = 0;
+    Exit;
+  end;
+  if (S^.Kind = skWhile) or (S^.Kind = skRepeat) or (S^.Kind = skFor) or (S^.Kind = skForIn) then
+    Loops := Loops + 1;
+  Result := OwnContinue(S^.ThenSt, Loops) or OwnContinue(S^.ElseSt, Loops) or
+    OwnContinue(S^.Body, Loops);
+  for i := 0 to High(S^.Stmts) do
+    if not Result then
+      Result := OwnContinue(S^.Stmts[i], Loops);
+  for i := 0 to High(S^.Arms) do
+    if not Result then
+      Result := OwnContinue(S^.Arms[i].Body, Loops);
+  for i := 0 to High(S^.Sels) do
+    if not Result then
+      Result := OwnContinue(S^.Sels[i].Body, Loops);
+end;
+
+{ A while whose condition makes a call that goes in becomes
+  while True do begin if not C then Break; B end, a Continue in B
+  reaching the test as before; a repeat ... until C with no Continue
+  of its own becomes repeat B; if C then Break until False. The if
+  then takes the call through a hidden variable. }
+function TOpt.LoopAt(S: PStmt): PStmt;
+var
+  nw, blk, st: PStmt;
+  c: PExpr;
+begin
+  Result := nil;
+  if (S = nil) or (S^.E = nil) then
+    Exit;
+  if (S^.Kind <> skWhile) and (S^.Kind <> skRepeat) then
+    Exit;
+  if (S^.Kind = skRepeat) and OwnContinue(S^.Body, 0) then
+    Exit;
+  if FirstCall(S^.E) = nil then
+    Exit;
+  nw := NewStmt(S^.Kind);
+  nw^.Line := S^.Line;
+  blk := NewStmt(skBlock);
+  blk^.Line := S^.Line;
+  st := NewStmt(skIf);
+  st^.Line := S^.Line;
+  if S^.Kind = skWhile then
+  begin
+    c := NewUn(uoNot, S^.E);
+    c^.Typ := TyBoolean;
+    st^.E := c;
+    st^.ThenSt := NewStmt(skBreak);
+    st^.ThenSt^.Line := S^.Line;
+    AddStmt(blk, st);
+    AddStmt(blk, S^.Body);
+    nw^.E := NewInt(1);
+    nw^.E^.Typ := TyBoolean;
+  end
+  else
+  begin
+    AddStmt(blk, S^.Body);
+    st^.E := S^.E;
+    st^.ThenSt := NewStmt(skBreak);
+    st^.ThenSt^.Line := S^.Line;
+    AddStmt(blk, st);
+    nw^.E := NewInt(0);
+    nw^.E^.Typ := TyBoolean;
+  end;
+  nw^.Body := blk;
+  Inc(FDone);
+  Result := nw;
+end;
+
+{ The walk over a routine: what a step produces is walked on, so a
+  call put in place has its own calls put in place in the same pass
+  and a statement with several calls takes them one after another. }
+function TOpt.InlineS(S: PStmt): PStmt;
+var
+  i: SizeInt;
+  r: PStmt;
+begin
+  Result := S;
+  if S = nil then
+    Exit;
+  r := InlineAt(S);
+  if r = nil then
+    r := HoistAt(S);
+  if r = nil then
+    r := LoopAt(S);
+  if r = nil then
+    r := UnrollAt(S);
+  if r <> nil then
+    S := r;
+  Result := S;
+  S^.ThenSt := InlineS(S^.ThenSt);
+  S^.ElseSt := InlineS(S^.ElseSt);
+  S^.Body := InlineS(S^.Body);
+  for i := 0 to High(S^.Stmts) do
+    S^.Stmts[i] := InlineS(S^.Stmts[i]);
+  for i := 0 to High(S^.Arms) do
+    S^.Arms[i].Body := InlineS(S^.Arms[i].Body);
+  for i := 0 to High(S^.Sels) do
+    S^.Sels[i].Body := InlineS(S^.Sels[i].Body);
+end;
+
+procedure TOpt.Run(var Prog: TProgram);
+var
+  i: SizeInt;
+  pass: LongInt;
+begin
+  FProg := @Prog;
+  FProcs := Prog.Procs;
+  FMax := Prog.InlineMax;
+  FN := 0;
+  FCur := -1;
+  for i := 0 to High(Prog.Procs) do
+    if (not Prog.Procs[i].IsExt) and (Prog.Procs[i].Body <> nil) then
+      Prog.Procs[i].Body := FoldStmt(Prog.Procs[i].Body);
+  Prog.Body := FoldStmt(Prog.Body);
+  if FMax > 0 then
+  begin
+    { Inline by measure (P112): six passes at most, a call whose
+      argument is a call gives the second the next pass. }
+    FOk := nil;
+    SetLength(FOk, Length(Prog.Procs));
+    FQuiet := nil;
+    SetLength(FQuiet, Length(Prog.Procs));
+    for pass := 1 to 6 do
+    begin
+      FDone := 0;
+      for i := 0 to High(Prog.Procs) do
+        if (not Prog.Procs[i].IsExt) and (Prog.Procs[i].Body <> nil) and
+          (not Prog.Procs[i].Boxing) and (not Dumps(Prog.Procs[i].Body)) then
+        begin
+          FCur := LongInt(i);
+          Prog.Procs[i].Body := InlineS(Prog.Procs[i].Body);
+        end;
+      FCur := -1;
+      if not Dumps(Prog.Body) then
+        Prog.Body := InlineS(Prog.Body);
+      Prog.InitBody := InlineS(Prog.InitBody);
+      Prog.FiniBody := InlineS(Prog.FiniBody);
+      FProcs := Prog.Procs;
+      if FDone = 0 then
+        Break;
+    end;
+    for i := 0 to High(Prog.Procs) do
+      if (not Prog.Procs[i].IsExt) and (Prog.Procs[i].Body <> nil) then
+        Prog.Procs[i].Body := FoldStmt(Prog.Procs[i].Body);
+    Prog.Body := FoldStmt(Prog.Body);
+    Prog.InitBody := FoldStmt(Prog.InitBody);
+    Prog.FiniBody := FoldStmt(Prog.FiniBody);
+  end;
+end;
+
+procedure Optimize(var Prog: TProgram);
+var
+  o: TOpt;
+begin
+  o := TOpt.Create;
+  try
+    o.Run(Prog);
+  finally
+    o.Free;
+  end;
+end;
+
+end.

@@ -1,0 +1,3327 @@
+{$mode objfpc}{$H+}
+
+{ The heap and its collector, in the shape of Go's (P95a, P95b,
+  docs/GC.md): pages of 8 KiB, spans of Go's 68 size classes, a span
+  class per size and noscan, an mcache per P with one run of free slots
+  per class, a table from page to span, and a mark and sweep with the
+  world stopped. The assembly of rt_alloc takes a block from the P's
+  mcache without a lock; this unit is its slow path (the next run of
+  free slots, a span of its own for a large block, the first mapping)
+  and the collector.
+
+  Every routine here takes H, the address of rt_heapstate, the one block
+  of heap state the runtime and this unit share. Nothing here allocates
+  on the heap. The slow paths run on the routine's own stack with
+  preemption off (G+184), entered from rt_alloc with every register
+  saved; a cycle runs on a routine record of its own (HGcG), whose
+  stack is big enough never to grow, with every other M stopped; the
+  M that claimed it (HGcBusy) lets it go once it has left that stack.
+
+  A runtime with the collector sets HGcOn. The stage links this unit
+  with the installed runtime, whose state may end before HGcOn's
+  fields: with HGcOn 0 nothing past it is touched, nothing is
+  collected and the heap only grows, as in 1.0.54. }
+unit pasheap;
+
+interface
+
+function PasHeapInit(H: Pointer; NProc: Integer): Integer;
+function PasHeapRefill(H, MC: Pointer; SC: Integer): Integer;
+function PasHeapLarge(H: Pointer; Size, Typ: Integer): Integer;
+function PasHeapCheck(H: Pointer): Integer;
+function PasHeapMask(H: Pointer; Addr: Integer): Integer;
+function PasMemBase(H: Pointer; Addr: Integer): Integer;
+function PasMemSize(H: Pointer; Addr: Integer): Integer;
+function PasStrBlock(H: Pointer; Addr, Len: Integer): Integer;
+procedure PasGcCycle(H: Pointer);
+function PasHeapStat(H: Pointer; K: Integer): Integer;
+function PasStackAdjust(G: Pointer; OldLo, OldHi: Integer): Integer;
+function PasGcWorker(H: Pointer; Idx: Integer): Integer;
+function PasRotMem(Dst, Src, Src2, Bytes, KindC, N: Integer): Integer;
+
+implementation
+
+const
+  PageSize = 8192;
+  PageShift = 13;
+  { The heap grows in place from a base address, as Go's arenas from
+    its hints, and the page-to-span table, one word per page, grows in
+    place below it. Nothing is reserved ahead: an address space limit
+    (ulimit -v, which counts reservations too) sees only what is mapped.
+    A base that is taken moves on by HintStep. }
+  HeapHint = 274877906944;
+  HintStep = 68719476736;
+  HeapReserve = 68719476736;
+  TableReserve = 67108864;
+  { MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE }
+  MapNoReplace = 1048610;
+  { The heap is mapped in steps of this much. }
+  MapStep = 4194304;
+  { Span records are carved from mappings of this much, bitmaps from
+    mappings of BitsStep. }
+  PoolStep = 1048576;
+  BitsStep = 262144;
+  { An mcache: tiny block, tiny offset, two spare words, then one entry
+    of four words (cursor, limit, span, spare) per span class. }
+  MCacheEntries = 136;
+  MCacheSize = 4608;
+  { Objects up to this size with pointers keep their bits in the span. }
+  MaxHeapBits = 512;
+
+  { rt_heapstate, in bytes. }
+  HLock = 0;
+  HBase = 8;
+  HLimit = 16;
+  HMapped = 24;
+  HCursor = 32;
+  HMapEnd = 40;
+  HTable = 48;
+  HPool = 56;
+  HPoolEnd = 64;
+  HNSpans = 72;
+  HClass2Size = 80;
+  HClass2Pages = 88;
+  HCap = 96;
+  HMCaches = 104;
+  HNProc = 112;
+  HMCacheSize = 120;
+  HSpans = 128;
+  { The roots (1.0.55): every routine record (array, count, capacity,
+    lock), the table of globals every object file adds to (address,
+    size, GC word per entry) and the Ms. }
+  HAllGs = 136;
+  HNAllGs = 144;
+  HAllGLock = 160;
+  HRootsStart = 168;
+  HRootsEnd = 176;
+  HAllM = 184;
+  { The collector (1.0.58), when HGcOn is 1. The runtime reads HGcOn to
+    HGcG itself: HGcWaiting while a cycle stops the world, HStopWait
+    the Ms it still waits for, HGcGen the cycles ended (a stopped M
+    sleeps on it), HGcBusy while a cycle is claimed. }
+  HGcOn = 192;
+  HGcWaiting = 200;
+  HStopWait = 208;
+  HGcGen = 216;
+  HGcBusy = 224;
+  HGcG = 232;
+  { Pacing: the bytes handed out since the last cycle plus what it
+    found alive; the next cycle when they reach HGoal; PASLANG_GC. }
+  HAllocated = 240;
+  HGoal = 248;
+  HGcPercent = 256;
+  HNumGC = 264;
+  HLive = 272;
+  { PASLANG_GCSTRESS=n: a cycle every n-th refill; PASLANG_GCPOISON=1:
+    a freed block is filled with $de. }
+  HStressN = 280;
+  HStressLeft = 288;
+  HPoison = 296;
+  { The tables block (below), free span records, the bitmap pool. }
+  HTables = 304;
+  HFreeRecs = 312;
+  HBitsPool = 320;
+  HBitsEnd = 328;
+  { Bytes: given back to the kernel, in free runs, in free runs still
+    resident, in spans in use. }
+  HReleased = 360;
+  HFreeBytes = 368;
+  HFreeDirty = 376;
+  HInUse = 384;
+  HPauseLast = 392;
+  HPauseTotal = 400;
+  { From the runtime: the environment, the persistent heap's chunks
+    (next, end, then blocks), the address of its bump pointer and its
+    first, static megabyte. }
+  HEnvp = 408;
+  HPersist = 416;
+  HPersistCur = 424;
+  HPersistStatic = 432;
+  PersistStaticSize = 1048576;
+  { The stack maps (1.0.60, P95c): the table the linker gathered from
+    every object file (a return address and its descriptor per call of
+    compiled code); where a parked or preempted routine resumes and the
+    bytes its return address and saved registers take there; the bytes
+    a prologue's stack check pushes above its return address; and for
+    PASLANG_GCVERIFY the switch, the blocks only a word-by-word reading
+    of the stacks kept (poisoned), and the frames whose map did not fit. }
+  HMapsStart = 440;
+  HMapsEnd = 448;
+  HPkRes = 456;
+  HPkResSize = 464;
+  HProBytes = 472;
+  HVerify = 480;
+  HVerifyN = 488;
+  HMapMiss = 496;
+  { What the runtime that linked this unit can do (1.0.61): bit 0, it
+    moves a stack whose guard is MoveAsked and adjusts it with
+    PasStackAdjust. A stage links these units with the runtime of the
+    compiler installed before, which took that guard for a growth and
+    doubled the stack at every cycle. }
+  HRtCaps = 504;
+  { the word XXH3's long path read for AVX2 until P111 (-cpu decides
+    it when the program is compiled); the slot stays, unused }
+  HAvx2 = 512;
+  { Marking on every M (P95d): the phase the runtime's waiting Ms look
+    for (a stopped or idle M that has not joined it runs PasGcWorker),
+    and the worker records (WorkerSize each, one per M). }
+  HMarkEpoch = 520;
+  HWorkers = 528;
+  { The Ms a cycle may mark with (P91): rt_gcms gives threads to that
+    many before it runs, the Ps at most. }
+  HGcWant = 536;
+  WorkerSize = 512;
+  ObletSize = 131072;
+  DefWorkers = 16;
+  { A worker record: the routine record its checks read (guard at 16,
+    M at 32, lock count at 184), then its grey stack (base, top, end),
+    the blocks it queued this cycle and a count for its donations. }
+  WGrey = 256;
+  WTop = 264;
+  WEnd = 272;
+  WMarked = 280;
+  WPops = 288;
+
+  { The tables block: the spans with free slots of each span class
+    (the central lists), the free page runs by length (bucket 0 for 128
+    pages and more), the free bitmaps by length in words. }
+  TCentral = 0;
+  TRuns = 1088;
+  TBits = 2112;
+  TablesSize = 4096;
+  RunBuckets = 128;
+
+  { A span record, in bytes. A free run of pages is a record too. }
+  SBase = 0;
+  SLimit = 8;
+  SNPages = 16;
+  SElemSize = 24;
+  SNElems = 32;
+  SClass = 40;
+  SFreeIndex = 48;
+  SAllocCount = 56;
+  SHeapBits = 64;
+  SLargeType = 72;
+  SNext = 80;
+  SAll = 88;
+  SAllocBits = 96;
+  SMarkBits = 104;
+  SState = 112;
+  SPrev = 120;
+  SNWords = 128;
+  SDivMul = 136;
+  SNeedZero = 144;
+  SReleased = 152;
+  SpanRecSize = 160;
+  StFree = 0;
+  StSmall = 1;
+  StLarge = 2;
+  StRun = 3;
+
+  { A routine record. }
+  GStackLo = 0;
+  GStackHi = 8;
+  GGuard = 16;
+  GGuard2 = 24;
+  GM = 32;
+  GSavedSP = 40;
+  GSavedPC = 48;
+  GSavedBP = 56;
+  GStatus = 152;
+  GTry = 224;
+  GLink = 248;
+  GLocks = 184;
+  { 272 from 1.0.129: G+256 holds the routine's Carry (P108) }
+  GRecSize = 272;
+  GDead = 4;
+  { An M record, and what the collector knows of it in MState: running,
+    idle, in a system call, stopped by itself, and idle or in a system
+    call when a cycle counted it as stopped. }
+  MRecSize = 128;
+  MCurG = 16;
+  MFutex = 48;
+  MState = 120;
+  MsRun = 0;
+  MsIdle = 1;
+  MsSyscall = 2;
+  MsStopped = 4;
+  MsIdleTaken = 5;
+  MsSyscallTaken = 6;
+
+  { The guard sysmon writes: no stack pointer is above it, so the next
+    prologue or loop head of the routine takes the preemption path. }
+  Poisoned = -1314;
+  { The guard a cycle writes under PASLANG_GCVERIFY: the next check of
+    the routine moves its stack, at the same size (P95c). }
+  MoveAsked = -1315;
+  GcStackSize = 262144;
+  MinGoal = 4194304;
+  GreyMin = 65536;
+  { $dededededededede }
+  PoisonWord = -2314885530818453538;
+
+type
+  PInt = ^Integer;
+  PCh = ^Char;
+
+var
+  ZeroBuf: array[0..511] of Integer;
+  { The words of the marking are grouped by who writes them, each group
+    MPad (64 bytes) away from the next, so that no two groups share a
+    cache line: MBase, MEnd and MTable, read for every pointer, sat on
+    the line of the counters the waiting workers add to, and every such
+    add made every worker read them again from another core. }
+  MPadA: array[0..7] of Integer;
+  { Written once a cycle. While a cycle marks: the heap's range and
+    table; the worker records; the jobs of the roots, MNJobs of them;
+    MParallel when more than one worker may mark, and a mark bit is then
+    set by compare and swap. PASLANG_GCWORKERS=n: at most n workers mark
+    a cycle, 0 every M; DefWorkers when it says nothing: past about 16
+    on a machine of 32 threads waking them cost more than they marked. }
+  MBase, MEnd, MTable: Integer;
+  MWorkers, MNJobs, MParallel, MMaxWorkers, MLastWorkers: Integer;
+  MPadB: array[0..7] of Integer;
+  { The next root job, handed out by an atomic add (P95d). }
+  MMarkJob: Integer;
+  MPadC: array[0..7] of Integer;
+  { MMarkActive workers mark and MMarkWait of them have nothing; one
+    may join while MMarkOpen, MMarkJoined have. }
+  MMarkActive, MMarkWait, MMarkOpen, MMarkJoined: Integer;
+  MPadD: array[0..7] of Integer;
+  { The shared grey stack, under MShLock, takes what a busy worker gives
+    to an idle one; MShCount blocks on it are not claimed yet. }
+  MShLock, MSh, MShTop, MShEnd: Integer;
+  MPadE: array[0..7] of Integer;
+  MShCount: Integer;
+  MPadF: array[0..7] of Integer;
+  { The stack maps, sorted (SortMaps): the first entry and how many;
+    the .pk_res layout and a prologue's push; under PASLANG_GCVERIFY,
+    1 while the word-by-word pass marks, which poisons what it adds. }
+  MapLo, MapN, MPkRes, MPkSize, MProBytes: Integer;
+  MVerify, MVerifyRec, MVerifyN, MMapMiss: Integer;
+  { The stacks PasStackAdjust moved (HeapStat 13). }
+  MMoves: Integer;
+  { The last cycle's parts in nanoseconds: stopping the world and
+    taking the mcaches back, marking, sweeping (HeapStat 16 to 18). }
+  MStopNs, MMarkNs, MSweepNs: Integer;
+
+function RdW(A: Integer): Integer;
+begin
+  Result := PInt(A)^;
+end;
+
+procedure WrW(A, V: Integer);
+begin
+  PInt(A)^ := V;
+end;
+
+function SysMmap(Addr, Len, Prot, Flags: Integer): Integer;
+var
+  n: Integer;
+begin
+  if Amd64 = 1 then
+    n := 9
+  else
+    n := 222;
+  Result := Syscall(n, Addr, Len, Prot, Flags, -1, 0);
+end;
+
+function SysMunmap(Addr, Len: Integer): Integer;
+var
+  n: Integer;
+begin
+  if Amd64 = 1 then
+    n := 11
+  else
+    n := 215;
+  Result := Syscall(n, Addr, Len);
+end;
+
+function MapFailed(R: Integer): Boolean;
+begin
+  Result := (R < 0) and (R > -4096);
+end;
+
+procedure SysMprotect(Addr, Len, Prot: Integer);
+var
+  n: Integer;
+begin
+  if Amd64 = 1 then
+    n := 10
+  else
+    n := 226;
+  n := Syscall(n, Addr, Len, Prot);
+end;
+
+procedure SysMadvise(Addr, Len, Advice: Integer);
+var
+  n: Integer;
+begin
+  if Amd64 = 1 then
+    n := 28
+  else
+    n := 233;
+  n := Syscall(n, Addr, Len, Advice);
+end;
+
+function NrFutex: Integer;
+begin
+  if Amd64 = 1 then
+    Result := 202
+  else
+    Result := 98;
+end;
+
+{ FUTEX_WAIT_PRIVATE on the low word of A while it holds V, at most Ns
+  nanoseconds when Ns is not 0. }
+procedure FutexWait(A, V, Ns: Integer);
+var
+  ts: array[0..1] of Integer;
+  r: Integer;
+begin
+  ts[0] := 0;
+  ts[1] := Ns;
+  if Ns > 0 then
+    r := Syscall(NrFutex, A, 128, V, Int64(@ts[0]))
+  else
+    r := Syscall(NrFutex, A, 128, V, 0);
+end;
+
+{ FUTEX_WAKE_PRIVATE, everyone waiting on A. }
+procedure FutexWake(A: Integer);
+var
+  r: Integer;
+begin
+  r := Syscall(NrFutex, A, 129, 2147483647);
+end;
+
+{ A fatal error inside a cycle: Msg and a line feed on standard error,
+  exit 1, as every fatal error of the runtime does. Nothing here may
+  allocate, so the line feed is a byte of its own, not a concatenation. }
+procedure Die(const Msg: string);
+var
+  r, nl: Integer;
+begin
+  nl := 10;
+  if Amd64 = 1 then
+  begin
+    r := Syscall(1, 2, Int64(@Msg[1]), Length(Msg));
+    r := Syscall(1, 2, Int64(@nl), 1);
+    r := Syscall(231, 1);
+  end
+  else
+  begin
+    r := Syscall(64, 2, Int64(@Msg[1]), Length(Msg));
+    r := Syscall(64, 2, Int64(@nl), 1);
+    r := Syscall(94, 1);
+  end;
+end;
+
+procedure ZeroMem(A, N: Integer);
+var
+  k: Integer;
+  p: Pointer;
+begin
+  while N > 0 do
+  begin
+    k := N;
+    if k > 4096 then
+      k := 4096;
+    p := Pointer(A);
+    Move(ZeroBuf[0], p^, k);
+    A := A + k;
+    N := N - k;
+  end;
+end;
+
+procedure FillWords(A, N, V: Integer);
+var
+  i: Integer;
+begin
+  for i := 0 to N div 8 - 1 do
+    PInt(A + i * 8)^ := V;
+end;
+
+function PopBits(X: Integer): Integer;
+begin
+  X := X - ((X shr 1) and 6148914691236517205);
+  X := (X and 3689348814741910323) + ((X shr 2) and 3689348814741910323);
+  X := (X + (X shr 4)) and 1085102592571150095;
+  Result := (X * 72340172838076673) shr 56;
+end;
+
+{ ---- the environment ---- }
+
+{ The address of the value when the variable at E is Name (with its
+  '='), else 0. }
+function EnvIs(E: Integer; const Name: string): Integer;
+var
+  i: Integer;
+begin
+  Result := 0;
+  for i := 1 to Length(Name) do
+    if Ord(PCh(E + i - 1)^) <> Ord(Name[i]) then
+      Exit;
+  Result := E + Length(Name);
+end;
+
+{ A decimal number, or -1 for off. }
+function EnvNum(A: Integer): Integer;
+var
+  c: Integer;
+begin
+  Result := 0;
+  c := Ord(PCh(A)^);
+  if c = Ord('o') then
+  begin
+    Result := -1;
+    Exit;
+  end;
+  while (c >= 48) and (c <= 57) do
+  begin
+    Result := Result * 10 + c - 48;
+    A := A + 1;
+    c := Ord(PCh(A)^);
+  end;
+end;
+
+procedure ReadEnv(H0: Integer);
+var
+  p, e, v, n: Integer;
+begin
+  p := RdW(H0 + HEnvp);
+  if p = 0 then
+    Exit;
+  while RdW(p) <> 0 do
+  begin
+    e := RdW(p);
+    v := EnvIs(e, 'PASLANG_GC=');
+    if v <> 0 then
+      WrW(H0 + HGcPercent, EnvNum(v));
+    v := EnvIs(e, 'PASLANG_GCSTRESS=');
+    if v <> 0 then
+    begin
+      n := EnvNum(v);
+      WrW(H0 + HStressN, n);
+      WrW(H0 + HStressLeft, n);
+    end;
+    v := EnvIs(e, 'PASLANG_GCPOISON=');
+    if v <> 0 then
+      WrW(H0 + HPoison, EnvNum(v));
+    v := EnvIs(e, 'PASLANG_GCVERIFY=');
+    if v <> 0 then
+      WrW(H0 + HVerify, EnvNum(v));
+    v := EnvIs(e, 'PASLANG_GCWORKERS=');
+    if v <> 0 then
+      MMaxWorkers := EnvNum(v);
+    p := p + 8;
+  end;
+end;
+
+{ ---- stack maps (P95c) ----
+
+  Every call of compiled code has an entry: its return address and a
+  descriptor. Word 0 of a descriptor is the kind (bits 0-7: 0 a call
+  in a body, 1 a prologue's stack check) and the number n of words
+  from the frame pointer down to the stack pointer at the call (the
+  rest); then (n + 63) div 64 words of bits, bit i for the word at
+  fp - 8(i + 1) that may hold a pointer; then as many for those among
+  them nobody knows (what a register held for a caller). }
+
+{ Swap entries I and J. }
+procedure MapSwap(I, J: Integer);
+var
+  a, d: Integer;
+begin
+  a := PInt(MapLo + I * 16)^;
+  d := PInt(MapLo + I * 16 + 8)^;
+  PInt(MapLo + I * 16)^ := PInt(MapLo + J * 16)^;
+  PInt(MapLo + I * 16 + 8)^ := PInt(MapLo + J * 16 + 8)^;
+  PInt(MapLo + J * 16)^ := a;
+  PInt(MapLo + J * 16 + 8)^ := d;
+end;
+
+procedure MapSift(Start, Count: Integer);
+var
+  r, c: Integer;
+begin
+  r := Start;
+  while r * 2 + 1 < Count do
+  begin
+    c := r * 2 + 1;
+    if (c + 1 < Count) and (PInt(MapLo + c * 16)^ < PInt(MapLo + (c + 1) * 16)^) then
+      c := c + 1;
+    if PInt(MapLo + r * 16)^ >= PInt(MapLo + c * 16)^ then
+      Exit;
+    MapSwap(r, c);
+    r := c;
+  end;
+end;
+
+{ The table by address, once at the start. The linker lays the object
+  files' pieces in the order of their code, so it is sorted already and
+  the check is all it costs; else a heap sort. }
+procedure SortMaps(H0: Integer);
+var
+  i, e: Integer;
+  sorted: Boolean;
+begin
+  MapLo := RdW(H0 + HMapsStart);
+  e := RdW(H0 + HMapsEnd);
+  MapN := 0;
+  MPkRes := RdW(H0 + HPkRes);
+  MPkSize := RdW(H0 + HPkResSize);
+  MProBytes := RdW(H0 + HProBytes);
+  MVerify := RdW(H0 + HVerify);
+  if (MapLo = 0) or (e <= MapLo) or (MPkSize = 0) or (MProBytes = 0) then
+  begin
+    MapLo := 0;
+    Exit;
+  end;
+  MapN := (e - MapLo) div 16;
+  sorted := True;
+  for i := 1 to MapN - 1 do
+    if PInt(MapLo + i * 16)^ < PInt(MapLo + (i - 1) * 16)^ then
+      sorted := False;
+  if sorted then
+    Exit;
+  for i := MapN div 2 - 1 downto 0 do
+    MapSift(i, MapN);
+  for i := MapN - 1 downto 1 do
+  begin
+    MapSwap(0, i);
+    MapSift(0, i);
+  end;
+end;
+
+{ The descriptor of return address Pc, or 0. }
+function MapFind(Pc: Integer): Integer;
+var
+  l, r, m, a: Integer;
+begin
+  Result := 0;
+  l := 0;
+  r := MapN - 1;
+  while l <= r do
+  begin
+    m := (l + r) shr 1;
+    a := PInt(MapLo + m * 16)^;
+    if a = Pc then
+    begin
+      Result := PInt(MapLo + m * 16 + 8)^;
+      Exit;
+    end;
+    if a < Pc then
+      l := m + 1
+    else
+      r := m - 1;
+  end;
+end;
+
+{ Msg, the hexadecimal digits of V and a line feed on standard error,
+  and exit 1; nothing allocates. }
+procedure DieHex(const Msg: string; V: Integer);
+var
+  buf: array[0..19] of Char;
+  i, d, r, nl: Integer;
+begin
+  for i := 0 to 15 do
+  begin
+    d := (V shr ((15 - i) * 4)) and 15;
+    if d < 10 then
+      buf[i] := Chr(48 + d)
+    else
+      buf[i] := Chr(87 + d);
+  end;
+  nl := 10;
+  if Amd64 = 1 then
+  begin
+    r := Syscall(1, 2, Int64(@Msg[1]), Length(Msg));
+    r := Syscall(1, 2, Int64(@buf[0]), 16);
+    r := Syscall(1, 2, Int64(@nl), 1);
+    r := Syscall(231, 1);
+  end
+  else
+  begin
+    r := Syscall(64, 2, Int64(@Msg[1]), Length(Msg));
+    r := Syscall(64, 2, Int64(@buf[0]), 16);
+    r := Syscall(64, 2, Int64(@nl), 1);
+    r := Syscall(94, 1);
+  end;
+end;
+
+{ ---- start ---- }
+
+{ The collector's own state: the tables block, and the routine record
+  a cycle runs on, with a stack of GcStackSize behind a guard page, not
+  on the list of every record (it holds nothing to keep) and never
+  preempted (G+184 1). }
+function GcInit(H0: Integer): Boolean;
+var
+  tb, s, g: Integer;
+begin
+  Result := False;
+  tb := SysMmap(0, TablesSize, 3, 34);
+  if MapFailed(tb) then
+    Exit;
+  WrW(H0 + HTables, tb);
+  { A worker record per M for the marking (P95d); the runtime finds
+    them at +528. }
+  s := SysMmap(0, ((RdW(H0 + HNProc) * WorkerSize) + 4095) and (-4096), 3, 34);
+  if MapFailed(s) then
+    Exit;
+  MWorkers := s;
+  WrW(H0 + HWorkers, s);
+  MMaxWorkers := DefWorkers;
+  s := SysMmap(0, GcStackSize, 3, 34);
+  if MapFailed(s) then
+    Exit;
+  SysMprotect(s, 4096, 0);
+  g := s + 4096;
+  WrW(g + GStackLo, s);
+  WrW(g + GStackHi, s + GcStackSize);
+  WrW(g + GGuard, s + 4368);
+  WrW(g + GGuard2, s + 4368);
+  WrW(g + GLocks, 1);
+  WrW(H0 + HGcG, g);
+  WrW(H0 + HGcPercent, 100);
+  WrW(H0 + HGoal, MinGoal);
+  ReadEnv(H0);
+  SortMaps(H0);
+  s := RdW(H0 + HNProc);
+  if (MMaxWorkers > 0) and (MMaxWorkers < s) then
+    s := MMaxWorkers;
+  WrW(H0 + HGcWant, s);
+  Result := True;
+end;
+
+{ Find the heap its base: the first MapStep of the heap and the table
+  page that describes it must be free there. Returns the address of the
+  mcaches, one per P, or 0 when no base and no memory could be had. }
+function PasHeapInit(H: Pointer; NProc: Integer): Integer;
+var
+  h0, r, t, mc, n, i, base: Integer;
+begin
+  Result := 0;
+  h0 := Integer(H);
+  base := 0;
+  for i := 0 to 15 do
+    if base = 0 then
+    begin
+      t := HeapHint + i * HintStep;
+      r := SysMmap(t, 4096, 3, MapNoReplace);
+      if r = t then
+      begin
+        r := SysMmap(t + TableReserve, MapStep, 3, MapNoReplace);
+        if r = t + TableReserve then
+          base := t + TableReserve
+        else
+        begin
+          if (r > 0) or (r < -4095) then
+            SysMunmap(r, MapStep);
+          SysMunmap(t, 4096);
+        end;
+      end
+      else if (r > 0) or (r < -4095) then
+        SysMunmap(r, 4096);
+    end;
+  if base = 0 then
+    Exit;
+  WrW(h0 + HTable, base - TableReserve);
+  WrW(h0 + HBase, base);
+  WrW(h0 + HLimit, base + HeapReserve);
+  WrW(h0 + HCursor, base);
+  WrW(h0 + HMapEnd, base + MapStep);
+  AtomicAdd(PInt(h0 + HMapped), MapStep);
+  WrW(h0 + HNProc, NProc);
+  WrW(h0 + HMCacheSize, MCacheSize);
+  n := ((NProc * MCacheSize) + 4095) and (-4096);
+  { PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS }
+  mc := SysMmap(0, n, 3, 34);
+  if MapFailed(mc) then
+    Exit;
+  WrW(h0 + HMCaches, mc);
+  if RdW(h0 + HGcOn) <> 0 then
+    if not GcInit(h0) then
+      Exit;
+  Result := mc;
+end;
+
+{ ---- pages ---- }
+
+{ Map the heap up to at least Need bytes past the cursor: the heap in
+  steps of MapStep, the matching part of the table with it. False when
+  the cap is reached or the kernel refuses. }
+function MapMore(H0, Need: Integer): Boolean;
+var
+  start, len, r, tlo, thi: Integer;
+begin
+  Result := False;
+  start := RdW(H0 + HMapEnd);
+  len := ((RdW(H0 + HCursor) + Need - start) + MapStep - 1) and (-MapStep);
+  if start + len > RdW(H0 + HLimit) then
+    Exit;
+  if RdW(H0 + HMapped) + len > RdW(H0 + HCap) then
+    Exit;
+  r := SysMmap(start, len, 3, MapNoReplace);
+  if r <> start then
+  begin
+    if (r > 0) or (r < -4095) then
+      SysMunmap(r, len);
+    Exit;
+  end;
+  { The table pages for the new part; the first one may be mapped
+    already, with the part before. }
+  tlo := RdW(H0 + HTable) + ((start - RdW(H0 + HBase)) shr PageShift) * 8;
+  thi := RdW(H0 + HTable) + ((start + len - RdW(H0 + HBase)) shr PageShift) * 8;
+  tlo := (tlo + 4095) and (-4096);
+  thi := (thi + 4095) and (-4096);
+  if thi > tlo then
+  begin
+    r := SysMmap(tlo, thi - tlo, 3, MapNoReplace);
+    if r <> tlo then
+    begin
+      if (r > 0) or (r < -4095) then
+        SysMunmap(r, thi - tlo);
+      Exit;
+    end;
+  end;
+  WrW(H0 + HMapEnd, start + len);
+  AtomicAdd(PInt(H0 + HMapped), len);
+  Result := True;
+end;
+
+{ NPages fresh pages from the cursor, or 0. }
+function AllocPages(H0, NPages: Integer): Integer;
+var
+  need: Integer;
+begin
+  Result := 0;
+  need := NPages * PageSize;
+  if RdW(H0 + HCursor) + need > RdW(H0 + HMapEnd) then
+    if not MapMore(H0, need) then
+      Exit;
+  Result := RdW(H0 + HCursor);
+  WrW(H0 + HCursor, Result + need);
+end;
+
+{ A span record, zero: a freed one, else from the pool. }
+function NewSpanRec(H0: Integer): Integer;
+var
+  r: Integer;
+begin
+  Result := 0;
+  if RdW(H0 + HGcOn) <> 0 then
+  begin
+    r := RdW(H0 + HFreeRecs);
+    if r <> 0 then
+    begin
+      WrW(H0 + HFreeRecs, RdW(r + SNext));
+      ZeroMem(r, SpanRecSize);
+      Result := r;
+      Exit;
+    end;
+  end;
+  if RdW(H0 + HPool) + SpanRecSize > RdW(H0 + HPoolEnd) then
+  begin
+    r := SysMmap(0, PoolStep, 3, 34);
+    if MapFailed(r) then
+      Exit;
+    WrW(H0 + HPool, r);
+    WrW(H0 + HPoolEnd, r + PoolStep);
+  end;
+  Result := RdW(H0 + HPool);
+  WrW(H0 + HPool, Result + SpanRecSize);
+end;
+
+procedure FreeSpanRec(H0, R: Integer);
+begin
+  WrW(R + SState, StFree);
+  WrW(R + SNext, RdW(H0 + HFreeRecs));
+  WrW(H0 + HFreeRecs, R);
+end;
+
+{ A bitmap of NW words, zero: a freed one of that length, else from
+  the pool. 0 when no memory. }
+function NewBits(H0, NW: Integer): Integer;
+var
+  t, r: Integer;
+begin
+  Result := 0;
+  t := RdW(H0 + HTables) + TBits + NW * 8;
+  r := RdW(t);
+  if r <> 0 then
+  begin
+    WrW(t, RdW(r));
+    ZeroMem(r, NW * 8);
+    Result := r;
+    Exit;
+  end;
+  if RdW(H0 + HBitsPool) + NW * 8 > RdW(H0 + HBitsEnd) then
+  begin
+    r := SysMmap(0, BitsStep, 3, 34);
+    if MapFailed(r) then
+      Exit;
+    WrW(H0 + HBitsPool, r);
+    WrW(H0 + HBitsEnd, r + BitsStep);
+  end;
+  Result := RdW(H0 + HBitsPool);
+  WrW(H0 + HBitsPool, Result + NW * 8);
+end;
+
+procedure FreeBits(H0, B, NW: Integer);
+var
+  t: Integer;
+begin
+  if B = 0 then
+    Exit;
+  t := RdW(H0 + HTables) + TBits + NW * 8;
+  WrW(B, RdW(t));
+  WrW(t, B);
+end;
+
+{ The table entry of the page that holds A. }
+function PageSlot(H0, A: Integer): Integer;
+begin
+  Result := RdW(H0 + HTable) + ((A - RdW(H0 + HBase)) shr PageShift) * 8;
+end;
+
+function RunBucket(NP: Integer): Integer;
+begin
+  if NP < RunBuckets then
+    Result := NP
+  else
+    Result := 0;
+end;
+
+procedure LinkRun(H0, R: Integer);
+var
+  t, h: Integer;
+begin
+  t := RdW(H0 + HTables) + TRuns + RunBucket(RdW(R + SNPages)) * 8;
+  h := RdW(t);
+  WrW(R + SPrev, 0);
+  WrW(R + SNext, h);
+  if h <> 0 then
+    WrW(h + SPrev, R);
+  WrW(t, R);
+end;
+
+procedure UnlinkRun(H0, R: Integer);
+var
+  t, p, n: Integer;
+begin
+  p := RdW(R + SPrev);
+  n := RdW(R + SNext);
+  if p <> 0 then
+    WrW(p + SNext, n)
+  else
+  begin
+    t := RdW(H0 + HTables) + TRuns + RunBucket(RdW(R + SNPages)) * 8;
+    WrW(t, n);
+  end;
+  if n <> 0 then
+    WrW(n + SPrev, p);
+  WrW(R + SPrev, 0);
+  WrW(R + SNext, 0);
+end;
+
+{ A free run's first and last page point to it in the table; the pages
+  between may still name an old span, which marking sees is not in use
+  or does not hold the address. }
+procedure MarkRunEnds(H0, R: Integer);
+begin
+  WrW(PageSlot(H0, RdW(R + SBase)), R);
+  WrW(PageSlot(H0, RdW(R + SBase) + (RdW(R + SNPages) - 1) * PageSize), R);
+end;
+
+{ Run R takes in its neighbour Q, a free run already off its list. A
+  run given back to the kernel joined with one that is not counts as
+  resident from then on. }
+procedure Absorb(H0, R, Q: Integer);
+var
+  qb: Integer;
+begin
+  if RdW(Q + SReleased) <> RdW(R + SReleased) then
+  begin
+    if RdW(Q + SReleased) <> 0 then
+      qb := RdW(Q + SNPages) * PageSize
+    else
+      qb := RdW(R + SNPages) * PageSize;
+    WrW(H0 + HReleased, RdW(H0 + HReleased) - qb);
+    WrW(H0 + HFreeDirty, RdW(H0 + HFreeDirty) + qb);
+    WrW(R + SReleased, 0);
+  end;
+  if RdW(Q + SBase) < RdW(R + SBase) then
+    WrW(R + SBase, RdW(Q + SBase));
+  WrW(R + SNPages, RdW(R + SNPages) + RdW(Q + SNPages));
+  WrW(R + SNeedZero, RdW(R + SNeedZero) or RdW(Q + SNeedZero));
+  FreeSpanRec(H0, Q);
+end;
+
+{ R, whose pages are free now (StRun, dirty, resident), joins the free
+  runs on each side of it and goes on its list. }
+procedure AddRun(H0, R: Integer);
+var
+  b, e, q: Integer;
+begin
+  WrW(H0 + HFreeBytes, RdW(H0 + HFreeBytes) + RdW(R + SNPages) * PageSize);
+  WrW(H0 + HFreeDirty, RdW(H0 + HFreeDirty) + RdW(R + SNPages) * PageSize);
+  b := RdW(R + SBase);
+  if b > RdW(H0 + HBase) then
+  begin
+    q := RdW(PageSlot(H0, b - PageSize));
+    if q <> 0 then
+      if (RdW(q + SState) = StRun) and
+        (RdW(q + SBase) + RdW(q + SNPages) * PageSize = b) then
+      begin
+        UnlinkRun(H0, q);
+        Absorb(H0, R, q);
+      end;
+  end;
+  e := RdW(R + SBase) + RdW(R + SNPages) * PageSize;
+  if e < RdW(H0 + HCursor) then
+  begin
+    q := RdW(PageSlot(H0, e));
+    if q <> 0 then
+      if (RdW(q + SState) = StRun) and (RdW(q + SBase) = e) then
+      begin
+        UnlinkRun(H0, q);
+        Absorb(H0, R, q);
+      end;
+  end;
+  MarkRunEnds(H0, R);
+  LinkRun(H0, R);
+end;
+
+{ NP pages: the shortest free run that holds them (its rest stays a
+  run), else fresh pages. Dirty is 1 when they held something. }
+function AllocRun(H0, NP: Integer; var Dirty: Integer): Integer;
+var
+  t, i, r, best, m: Integer;
+begin
+  Result := 0;
+  Dirty := 0;
+  t := RdW(H0 + HTables) + TRuns;
+  r := 0;
+  i := NP;
+  while (r = 0) and (i < RunBuckets) do
+  begin
+    r := RdW(t + i * 8);
+    i := i + 1;
+  end;
+  if r = 0 then
+  begin
+    best := 0;
+    r := RdW(t);
+    while r <> 0 do
+    begin
+      if RdW(r + SNPages) >= NP then
+        if (best = 0) or (RdW(r + SNPages) < RdW(best + SNPages)) then
+          best := r;
+      r := RdW(r + SNext);
+    end;
+    r := best;
+  end;
+  if r = 0 then
+  begin
+    Result := AllocPages(H0, NP);
+    Exit;
+  end;
+  UnlinkRun(H0, r);
+  m := RdW(r + SNPages);
+  Result := RdW(r + SBase);
+  Dirty := RdW(r + SNeedZero);
+  WrW(H0 + HFreeBytes, RdW(H0 + HFreeBytes) - NP * PageSize);
+  if RdW(r + SReleased) = 0 then
+    WrW(H0 + HFreeDirty, RdW(H0 + HFreeDirty) - NP * PageSize)
+  else
+    WrW(H0 + HReleased, RdW(H0 + HReleased) - NP * PageSize);
+  if m > NP then
+  begin
+    WrW(r + SBase, Result + NP * PageSize);
+    WrW(r + SNPages, m - NP);
+    MarkRunEnds(H0, r);
+    LinkRun(H0, r);
+  end
+  else
+    FreeSpanRec(H0, r);
+end;
+
+{ ---- spans ---- }
+
+{ A span of NPages pages for objects of ElemSize bytes in span class SC:
+  its record, its entries in the table, its pointer bits when it keeps
+  them, and with the collector its alloc and mark bitmaps. The caller
+  holds the heap lock. }
+function NewSpan(H0, NPages, ElemSize, SC: Integer): Integer;
+var
+  base, sp, i, bytes, bm, t, dirty, nw, gc: Integer;
+begin
+  Result := 0;
+  gc := RdW(H0 + HGcOn);
+  dirty := 0;
+  if gc <> 0 then
+    base := AllocRun(H0, NPages, dirty)
+  else
+    base := AllocPages(H0, NPages);
+  if base = 0 then
+    Exit;
+  sp := NewSpanRec(H0);
+  if sp = 0 then
+    Exit;
+  bytes := NPages * PageSize;
+  WrW(sp + SBase, base);
+  WrW(sp + SNPages, NPages);
+  WrW(sp + SElemSize, ElemSize);
+  WrW(sp + SClass, SC);
+  if (SC shr 1) = 0 then
+    WrW(sp + SState, StLarge)
+  else
+    WrW(sp + SState, StSmall);
+  WrW(sp + SNeedZero, dirty);
+  if ((SC and 1) = 0) and (ElemSize <= MaxHeapBits) then
+  begin
+    { One bit per word of the span, at its end. }
+    bm := bytes div 64;
+    WrW(sp + SHeapBits, base + bytes - bm);
+    WrW(sp + SNElems, (bytes - bm) div ElemSize);
+  end
+  else
+    WrW(sp + SNElems, bytes div ElemSize);
+  WrW(sp + SLimit, base + RdW(sp + SNElems) * ElemSize);
+  { Go's divMagic: the slot of an offset is (off * DivMul) shr 32. }
+  WrW(sp + SDivMul, 4294967295 div ElemSize + 1);
+  if gc <> 0 then
+  begin
+    nw := (RdW(sp + SNElems) + 63) shr 6;
+    WrW(sp + SNWords, nw);
+    WrW(sp + SAllocBits, NewBits(H0, nw));
+    WrW(sp + SMarkBits, NewBits(H0, nw));
+    if (RdW(sp + SAllocBits) = 0) or (RdW(sp + SMarkBits) = 0) then
+      Exit;
+    WrW(H0 + HInUse, RdW(H0 + HInUse) + bytes);
+  end;
+  t := PageSlot(H0, base);
+  for i := 0 to NPages - 1 do
+    WrW(t + i * 8, sp);
+  WrW(sp + SAll, RdW(H0 + HSpans));
+  WrW(H0 + HSpans, sp);
+  WrW(H0 + HNSpans, RdW(H0 + HNSpans) + 1);
+  Result := sp;
+end;
+
+{ The next run of free slots of span Sp from its FreeIndex into mcache
+  entry E: the first slot whose alloc bit is clear up to the next that
+  is set. Slots below FreeIndex are taken or were handed out; a fresh
+  span, all clear, is one run. False when none is left. With Bits (the
+  runtime says so, heap state +504 bit 2) entry word 24 gets the free
+  slots of the 64 after the run, bit k for slot j + k, and rt_alloc
+  takes its next runs from there without a call (1.0.68, Go's
+  allocCache): a span swept with every other slot free took a call into
+  pasheap per slot, and a program that made one string to keep and one
+  to drop spent twice as long making them after its first cycle. }
+function NextRun(Sp, E: Integer; Bits: Boolean): Boolean;
+var
+  i, j, n, ab, w, esz, base, c, k, q: Integer;
+begin
+  n := PInt(Sp + SNElems)^;
+  i := PInt(Sp + SFreeIndex)^;
+  ab := PInt(Sp + SAllocBits)^;
+  if ab <> 0 then
+    while i < n do
+    begin
+      w := PInt(ab + (i shr 6) * 8)^;
+      if ((i and 63) = 0) and (w = -1) then
+        i := i + 64
+      else if ((w shr (i and 63)) and 1) = 1 then
+        i := i + 1
+      else
+        Break;
+    end;
+  if i >= n then
+  begin
+    PInt(Sp + SFreeIndex)^ := n;
+    Result := False;
+    Exit;
+  end;
+  j := i + 1;
+  if ab = 0 then
+    j := n
+  else
+    while j < n do
+    begin
+      w := PInt(ab + (j shr 6) * 8)^;
+      if ((j and 63) = 0) and (w = 0) then
+        j := j + 64
+      else if ((w shr (j and 63)) and 1) = 0 then
+        j := j + 1
+      else
+        Break;
+    end;
+  if j > n then
+    j := n;
+  PInt(Sp + SFreeIndex)^ := j;
+  esz := PInt(Sp + SElemSize)^;
+  base := PInt(Sp + SBase)^;
+  PInt(E)^ := base + i * esz;
+  PInt(E + 8)^ := base + j * esz;
+  PInt(E + 16)^ := Sp;
+  c := 0;
+  if Bits and (ab <> 0) and (j < n) then
+  begin
+    q := j shr 6;
+    k := j and 63;
+    w := PInt(ab + q * 8)^;
+    if k <> 0 then
+    begin
+      w := w shr k;
+      if q + 1 < (n + 63) shr 6 then
+        w := w or (PInt(ab + (q + 1) * 8)^ shl (64 - k))
+      else
+        w := w or ((-1) shl (64 - k));
+    end;
+    c := w xor (-1);
+    if n - j < 64 then
+      c := c and ((1 shl (n - j)) - 1);
+  end;
+  PInt(E + 24)^ := c;
+  Result := True;
+end;
+
+{ The run in entry E is the P's now, counted for the pacing with the
+  free slots of word 24 (rt_alloc hands them out uncounted). True when
+  its slots held something and rt_alloc must clear it (rep stosq does it
+  far faster than Move); without the collector nothing is reused. }
+function HandOut(H0, Sp, E: Integer): Boolean;
+var
+  n: Integer;
+begin
+  Result := False;
+  n := PInt(E + 8)^ - PInt(E)^;
+  if PInt(H0 + HGcOn)^ = 0 then
+  begin
+    if PInt(Sp + SNeedZero)^ <> 0 then
+      ZeroMem(PInt(E)^, n);
+    Exit;
+  end;
+  if PInt(E + 24)^ <> 0 then
+    n := n + PopBits(PInt(E + 24)^) * PInt(Sp + SElemSize)^;
+  AtomicAdd(PInt(H0 + HAllocated), n);
+  Result := PInt(Sp + SNeedZero)^ <> 0;
+end;
+
+{ Is a cycle due? Every n-th time under PASLANG_GCSTRESS, else when
+  the bytes handed out reach the goal (never with PASLANG_GC=off). The
+  refill that asked for a cycle asks again after it, and counts as the
+  first of the next n: with n = 1 the count started at n, so the retry
+  found another cycle due and the program never got past it (1.0.60). }
+function GcDue(H0: Integer): Boolean;
+var
+  left: Integer;
+begin
+  Result := False;
+  if RdW(H0 + HStressN) > 0 then
+  begin
+    left := RdW(H0 + HStressLeft) - 1;
+    if left <= 0 then
+    begin
+      WrW(H0 + HStressLeft, RdW(H0 + HStressN) + 1);
+      Result := True;
+      Exit;
+    end;
+    WrW(H0 + HStressLeft, left);
+  end;
+  if RdW(H0 + HGcPercent) < 0 then
+    Exit;
+  Result := RdW(H0 + HAllocated) >= RdW(H0 + HGoal);
+end;
+
+{ The mcache entry of span class SC (and 255) ran out: the next run of
+  its span, else, unless a cycle is due, a span with free slots of that
+  class, else a new one. 1 done, 3 done and the run must be cleared, 0
+  out of memory, 2 collect first; with 256 in SC a cycle was asked for
+  and could not run, so none is due. }
+function PasHeapRefill(H, MC: Pointer; SC: Integer): Integer;
+var
+  h0, k, cls, size, npages, sp, e, t: Integer;
+  gc, bits: Boolean;
+begin
+  Result := 0;
+  h0 := Integer(H);
+  k := SC and 255;
+  gc := PInt(h0 + HGcOn)^ <> 0;
+  bits := (PInt(h0 + HRtCaps)^ and 4) <> 0;
+  e := Integer(MC) + 32 + k * 32;
+  sp := PInt(e + 16)^;
+  if sp <> 0 then
+  begin
+    { The cursor is a whole number of slots from the base: the index by
+      the span's multiplier, as MarkPtr finds one, not by a division. }
+    PInt(sp + SFreeIndex)^ := ((PInt(e)^ - PInt(sp + SBase)^) * PInt(sp + SDivMul)^) shr 32;
+    if NextRun(sp, e, bits) then
+    begin
+      if HandOut(h0, sp, e) then
+        Result := 3
+      else
+        Result := 1;
+      Exit;
+    end;
+    WrW(e + 16, 0);
+  end;
+  if gc and ((SC and 256) = 0) then
+    if GcDue(h0) then
+    begin
+      Result := 2;
+      Exit;
+    end;
+  cls := k shr 1;
+  size := RdW(RdW(h0 + HClass2Size) + cls * 8);
+  npages := RdW(RdW(h0 + HClass2Pages) + cls * 8);
+  SpinLock(PInt(h0 + HLock));
+  sp := 0;
+  if gc then
+  begin
+    t := RdW(h0 + HTables) + TCentral + k * 8;
+    sp := RdW(t);
+    if sp <> 0 then
+    begin
+      WrW(t, RdW(sp + SNext));
+      WrW(sp + SNext, 0);
+      { Taken: an empty span that is used again is kept (Sweep). }
+      WrW(sp + SReleased, 0);
+    end;
+  end;
+  if sp = 0 then
+    sp := NewSpan(h0, npages, size, k);
+  SpinUnlock(PInt(h0 + HLock));
+  if sp = 0 then
+    Exit;
+  if not NextRun(sp, e, bits) then
+    Exit;
+  if HandOut(h0, sp, e) then
+    Result := 3
+  else
+    Result := 1;
+end;
+
+{ A block of Size bytes in a span of its own; Typ is its GC word (0 no
+  pointer, 1 every word, else a descriptor), kept in the span, with 2
+  added when a cycle was asked for and could not run. The address, 0
+  when the heap is full, 1 to collect first; with the collector 4 is
+  added when the pages held something and rt_alloc must clear them. }
+function PasHeapLarge(H: Pointer; Size, Typ: Integer): Integer;
+var
+  h0, npages, sp, sc, ty: Integer;
+  gc: Boolean;
+begin
+  Result := 0;
+  h0 := Integer(H);
+  gc := RdW(h0 + HGcOn) <> 0;
+  ty := Typ and (-3);
+  if gc and ((Typ and 2) = 0) then
+    if GcDue(h0) then
+    begin
+      Result := 1;
+      Exit;
+    end;
+  npages := (Size + PageSize - 1) div PageSize;
+  sc := 0;
+  if ty = 0 then
+    sc := 1;
+  SpinLock(PInt(h0 + HLock));
+  sp := NewSpan(h0, npages, npages * PageSize, sc);
+  if sp <> 0 then
+  begin
+    WrW(sp + SLargeType, ty);
+    WrW(sp + SFreeIndex, 1);
+  end;
+  SpinUnlock(PInt(h0 + HLock));
+  if sp = 0 then
+    Exit;
+  Result := RdW(sp + SBase);
+  if gc then
+  begin
+    AtomicAdd(PInt(h0 + HAllocated), npages * PageSize);
+    if RdW(sp + SNeedZero) <> 0 then
+      Result := Result + 4;
+  end
+  else if RdW(sp + SNeedZero) <> 0 then
+    ZeroMem(Result, npages * PageSize);
+end;
+
+{ ---- stopping the world ---- }
+
+{ Every M but this cycle's own stops: an idle M or one in a system call
+  is counted here and stops by itself when it comes back (rt_gcidle,
+  rt_syscall); a running one is asked to, through the guard of its
+  routine, and counts itself when it reaches a safe point (rt_gcstopm).
+  Waits until none is left. }
+procedure StopTheWorld(H0: Integer);
+var
+  me, allm, n, i, m, s, g, left: Integer;
+begin
+  me := RdW(RdW(H0 + HGcG) + GM);
+  allm := RdW(H0 + HAllM);
+  n := RdW(H0 + HNProc);
+  WrW(H0 + HStopWait, n - 1);
+  AtomicAdd(PInt(H0 + HGcWaiting), 1);
+  while True do
+  begin
+    for i := 0 to n - 1 do
+    begin
+      m := allm + i * MRecSize;
+      if m <> me then
+      begin
+        s := RdW(m + MState);
+        if s = MsIdle then
+        begin
+          if AtomicCas(PInt(m + MState), MsIdle, MsIdleTaken) then
+            AtomicAdd(PInt(H0 + HStopWait), -1);
+        end
+        else if s = MsSyscall then
+        begin
+          if AtomicCas(PInt(m + MState), MsSyscall, MsSyscallTaken) then
+            AtomicAdd(PInt(H0 + HStopWait), -1);
+        end
+        else if s = MsRun then
+        begin
+          g := RdW(m + MCurG);
+          if g <> 0 then
+            WrW(g + GGuard, Poisoned);
+        end;
+      end;
+    end;
+    left := RdW(H0 + HStopWait);
+    if left = 0 then
+      Break;
+    FutexWait(H0 + HStopWait, left, 50000);
+  end;
+end;
+
+{ Every M goes back to what it was doing; the stopped ones sleep on
+  HGcGen until it moves. }
+procedure StartTheWorld(H0: Integer);
+var
+  me, allm, n, i, m, s: Integer;
+begin
+  me := RdW(RdW(H0 + HGcG) + GM);
+  allm := RdW(H0 + HAllM);
+  n := RdW(H0 + HNProc);
+  for i := 0 to n - 1 do
+  begin
+    m := allm + i * MRecSize;
+    if m <> me then
+    begin
+      s := RdW(m + MState);
+      if s = MsStopped then
+        WrW(m + MState, MsRun)
+      else if s = MsIdleTaken then
+        AtomicCas(PInt(m + MState), MsIdleTaken, MsIdle)
+      else if s = MsSyscallTaken then
+        AtomicCas(PInt(m + MState), MsSyscallTaken, MsSyscall);
+    end;
+  end;
+  WrW(H0 + HGcWaiting, 0);
+  AtomicAdd(PInt(H0 + HGcGen), 1);
+  FutexWake(H0 + HGcGen);
+end;
+
+{ The world stood still: the heap lock is free and every other M is
+  stopped, idle or in a system call as the cycle counted it. A fatal
+  error otherwise, before the cycle takes anything. }
+procedure CheckStopped(H0: Integer);
+var
+  me, allm, i, m, s: Integer;
+begin
+  if RdW(H0 + HLock) <> 0 then
+    Die('paslang: collector: the heap lock is held while the world stops');
+  me := RdW(RdW(H0 + HGcG) + GM);
+  allm := RdW(H0 + HAllM);
+  for i := 0 to RdW(H0 + HNProc) - 1 do
+  begin
+    m := allm + i * MRecSize;
+    s := RdW(m + MState);
+    if (m <> me) and (s <> MsStopped) and (s <> MsIdleTaken) and (s <> MsSyscallTaken) then
+      Die('paslang: collector: an M runs while the world stops');
+  end;
+end;
+
+{ Every P's mcache gives its runs back: a span's FreeIndex goes back to
+  the entry's cursor, so the slots not handed out are free again. }
+procedure FlushCaches(H0: Integer);
+var
+  mc, p, e, ent, sp, last: Integer;
+begin
+  mc := PInt(H0 + HMCaches)^;
+  for p := 0 to PInt(H0 + HNProc)^ - 1 do
+  begin
+    PInt(mc + p * MCacheSize)^ := 0;
+    PInt(mc + p * MCacheSize + 8)^ := 0;
+    ent := mc + p * MCacheSize + 32;
+    last := ent + (MCacheEntries - 1) * 32;
+    { An entry without a span has an empty run (cursor = limit) and
+      stays as it is. }
+    while ent <= last do
+    begin
+      sp := PInt(ent + 16)^;
+      if sp <> 0 then
+      begin
+        PInt(sp + SFreeIndex)^ := (PInt(ent)^ - PInt(sp + SBase)^) div PInt(sp + SElemSize)^;
+        PInt(ent)^ := 0;
+        PInt(ent + 8)^ := 0;
+        PInt(ent + 16)^ := 0;
+        PInt(ent + 24)^ := 0;
+      end;
+      ent := ent + 32;
+    end;
+  end;
+end;
+
+{ ---- mark ---- }
+
+procedure GreyGrow(W: Integer);
+var
+  n, nb, r, g, t: Integer;
+  src, dst: Pointer;
+begin
+  g := PInt(W + WGrey)^;
+  t := PInt(W + WTop)^;
+  n := PInt(W + WEnd)^ - g;
+  if n < GreyMin then
+    nb := GreyMin
+  else
+    nb := n * 2;
+  r := SysMmap(0, nb, 3, 34);
+  if MapFailed(r) then
+    Die('paslang: out of memory for the collector''s grey stack');
+  if t > g then
+  begin
+    src := Pointer(g);
+    dst := Pointer(r);
+    Move(src^, dst^, t - g);
+  end;
+  if g <> 0 then
+    SysMunmap(g, n);
+  PInt(W + WTop)^ := r + (t - g);
+  PInt(W + WGrey)^ := r;
+  PInt(W + WEnd)^ := r + nb;
+end;
+
+{ The grey stack of worker W. }
+procedure GreyPush(W, A: Integer);
+var
+  t: Integer;
+begin
+  t := PInt(W + WTop)^;
+  if t >= PInt(W + WEnd)^ then
+  begin
+    GreyGrow(W);
+    t := PInt(W + WTop)^;
+  end;
+  PInt(t)^ := A;
+  PInt(W + WTop)^ := t + 8;
+end;
+
+{ PASLANG_GCVERIFY (P95c): a block the stack maps did not keep but a
+  word-by-word reading of the stacks does is filled with $de and kept,
+  never handed out again, so a program that still uses it, which means a
+  pointer the maps left out, reads nonsense at once. A block with a type
+  word in front keeps that word, which the cycles read. }
+procedure VerifyPoison(Sp, Obj: Integer);
+begin
+  MVerifyN := MVerifyN + 1;
+  if PInt(Sp + SState)^ = StLarge then
+    FillWords(Obj, PInt(Sp + SNPages)^ * PageSize, PoisonWord)
+  else if ((PInt(Sp + SClass)^ and 1) = 0) and (PInt(Sp + SHeapBits)^ = 0) then
+    FillWords(Obj + 8, PInt(Sp + SElemSize)^ - 8, PoisonWord)
+  else
+    FillWords(Obj, PInt(Sp + SElemSize)^, PoisonWord);
+end;
+
+{ P is inside the heap: mark the block that holds it, if a block is
+  allocated there, and queue it when it holds pointers. A slot is taken
+  when it is below its span's FreeIndex or its alloc bit is set. }
+procedure MarkPtr(W, P: Integer);
+var
+  sp, st, idx, off, mb, bit, v: Integer;
+begin
+  sp := PInt(MTable + ((P - MBase) shr PageShift) * 8)^;
+  if sp = 0 then
+    Exit;
+  st := PInt(sp + SState)^;
+  if st = StSmall then
+  begin
+    if P >= PInt(sp + SLimit)^ then
+      Exit;
+    off := P - PInt(sp + SBase)^;
+    if off < 0 then
+      Exit;
+    idx := (off * PInt(sp + SDivMul)^) shr 32;
+    if idx >= PInt(sp + SFreeIndex)^ then
+      if ((PInt(PInt(sp + SAllocBits)^ + (idx shr 6) * 8)^ shr (idx and 63)) and 1) = 0 then
+        Exit;
+    mb := PInt(sp + SMarkBits)^ + (idx shr 6) * 8;
+    bit := 1 shl (idx and 63);
+    v := PInt(mb)^;
+    if (v and bit) <> 0 then
+      Exit;
+    { Several Ms mark at once: the bit is theirs who swaps it in. }
+    if MParallel = 0 then
+      PInt(mb)^ := v or bit
+    else
+      while not AtomicCas(PInt(mb), v, v or bit) do
+      begin
+        v := PInt(mb)^;
+        if (v and bit) <> 0 then
+          Exit;
+      end;
+    if MVerifyRec <> 0 then
+      VerifyPoison(sp, PInt(sp + SBase)^ + idx * PInt(sp + SElemSize)^);
+    if (PInt(sp + SClass)^ and 1) = 1 then
+      Exit;
+    GreyPush(W, PInt(sp + SBase)^ + idx * PInt(sp + SElemSize)^);
+  end
+  else if st = StLarge then
+  begin
+    off := P - PInt(sp + SBase)^;
+    if (off < 0) or (off >= PInt(sp + SNPages)^ * PageSize) then
+      Exit;
+    mb := PInt(sp + SMarkBits)^;
+    if (PInt(mb)^ and 1) <> 0 then
+      Exit;
+    if MParallel = 0 then
+      PInt(mb)^ := 1
+    else if not AtomicCas(PInt(mb), 0, 1) then
+      Exit;
+    if MVerifyRec <> 0 then
+      VerifyPoison(sp, PInt(sp + SBase)^);
+    if PInt(sp + SLargeType)^ = 0 then
+      Exit;
+    GreyPush(W, PInt(sp + SBase)^);
+  end;
+end;
+
+{ Every word from Lo to Hi that points into the heap: a stack, a
+  routine or M record, a block of GetMem. }
+procedure ScanRange(W, Lo, Hi: Integer);
+var
+  a, v, b, e: Integer;
+begin
+  b := MBase;
+  e := MEnd;
+  a := (Lo + 7) and (-8);
+  while a + 8 <= Hi do
+  begin
+    v := PInt(a)^;
+    if (v >= b) and (v < e) then
+      MarkPtr(W, v);
+    a := a + 8;
+  end;
+end;
+
+{ A frame by its map D: the n words under Fp whose bit is set. }
+procedure ScanFrame(W, D, Fp, N: Integer);
+var
+  i, j, bits, v, b, e: Integer;
+begin
+  b := MBase;
+  e := MEnd;
+  j := 0;
+  while j * 64 < N do
+  begin
+    bits := PInt(D + 8 + j * 8)^;
+    i := j * 64;
+    while bits <> 0 do
+    begin
+      if (bits and 1) = 1 then
+      begin
+        v := PInt(Fp - 8 * (i + 1))^;
+        if (v >= b) and (v < e) then
+          MarkPtr(W, v);
+      end;
+      bits := bits shr 1;
+      if bits < 0 then
+        bits := bits and 9223372036854775807;
+      i := i + 1;
+    end;
+    j := j + 1;
+  end;
+end;
+
+{ A frame the walk could not read by a map that fits: word by word, and
+  under PASLANG_GCVERIFY a fatal error, since every frame of compiled
+  code has a map and every stop keeps the chain of frame pointers. }
+procedure MapMiss(const Why: string; Pc: Integer);
+begin
+  AtomicAdd(@MMapMiss, 1);
+  if MVerify <> 0 then
+    DieHex(Why, Pc);
+end;
+
+{ A stopped routine's stack (P95c), frame by frame from where it stopped,
+  up the chain of frame pointers. A frame whose return address has a map
+  is read by it; the runtime's own code, which has none, and the frame
+  that called it are read word by word, as Go reads a frame it has no
+  map for. A routine parked or preempted stopped at .pk_res: its return
+  address and saved registers first, then the frame of the code that
+  called. A prologue's stack check has no frame yet: its caller's return
+  address is just above. The first frame's caller is 0. }
+procedure ScanStack(W, G, Lo, Hi: Integer);
+var
+  sp, fp, pc, d, n, st, nfp: Integer;
+begin
+  sp := RdW(G + GSavedSP);
+  if (sp < Lo) or (sp > Hi) then
+  begin
+    ScanRange(W, Lo, Hi);
+    Exit;
+  end;
+  if MapN = 0 then
+  begin
+    ScanRange(W, sp, Hi);
+    Exit;
+  end;
+  fp := RdW(G + GSavedBP);
+  pc := 0;
+  st := RdW(G + GStatus) and 4294967295;
+  if (st >= 1) and (st <= 3) and (RdW(G + GSavedPC) = MPkRes) then
+  begin
+    pc := RdW(sp);
+    ScanRange(W, sp, sp + MPkSize);
+    sp := sp + MPkSize;
+  end;
+  while True do
+  begin
+    d := 0;
+    if pc <> 0 then
+      d := MapFind(pc);
+    if (d <> 0) and ((RdW(d) and 255) = 1) then
+    begin
+      pc := RdW(sp);
+      sp := sp + MProBytes;
+      Continue;
+    end;
+    if (fp < sp) or (fp >= Hi) or ((fp and 7) <> 0) then
+    begin
+      ScanRange(W, sp, Hi);
+      if d <> 0 then
+        MapMiss('paslang: stack map: no frame pointer to follow at pc 0x', pc);
+      Exit;
+    end;
+    if d <> 0 then
+    begin
+      n := RdW(d) shr 8;
+      if fp - 8 * n = sp then
+        ScanFrame(W, d, fp, n)
+      else
+      begin
+        ScanRange(W, sp, fp);
+        MapMiss('paslang: stack map: the map does not fit its frame at pc 0x', pc);
+      end;
+    end
+    else
+      ScanRange(W, sp, fp);
+    pc := RdW(fp + 8);
+    nfp := RdW(fp);
+    sp := fp + 16;
+    if nfp = 0 then
+    begin
+      ScanRange(W, sp, Hi);
+      Exit;
+    end;
+    if (nfp <= fp) or (nfp >= Hi) then
+    begin
+      ScanRange(W, sp, Hi);
+      Exit;
+    end;
+    fp := nfp;
+  end;
+end;
+
+{ ---- a stack that moved (P95c) ---- }
+
+{ The word at A, when it points into the old stack, moves by Delta. }
+procedure AdjWord(A, OldLo, OldHi, Delta: Integer);
+var
+  w: Integer;
+begin
+  w := PInt(A)^;
+  if (w >= OldLo) and (w < OldHi) then
+    PInt(A)^ := w + Delta;
+end;
+
+procedure AdjRange(Lo, Hi, OldLo, OldHi, Delta: Integer);
+var
+  a: Integer;
+begin
+  a := (Lo + 7) and (-8);
+  while a + 8 <= Hi do
+  begin
+    AdjWord(a, OldLo, OldHi, Delta);
+    a := a + 8;
+  end;
+end;
+
+{ A frame by its map: the words its bits name. }
+procedure AdjFrame(D, Fp, N, OldLo, OldHi, Delta: Integer);
+var
+  i, j, bits: Integer;
+begin
+  j := 0;
+  while j * 64 < N do
+  begin
+    bits := PInt(D + 8 + j * 8)^;
+    i := j * 64;
+    while bits <> 0 do
+    begin
+      if (bits and 1) = 1 then
+        AdjWord(Fp - 8 * (i + 1), OldLo, OldHi, Delta);
+      bits := bits shr 1;
+      i := i + 1;
+    end;
+    j := j + 1;
+  end;
+end;
+
+{ rt_newstack copied the stack of routine G from [OldLo, OldHi) to its
+  new one, whose bounds, guard and stack pointer (G+40) the record says
+  already: the copy's words that point into the old stack move with it.
+  The walk is ScanStack's: a frame with a map moves the words the map
+  names, the runtime's own code and the frame that called it every word
+  that points there, and every frame record its link. The routine
+  stopped at a stack check: on amd64 its return address is at G+40 and
+  the frame starts above it; on arm64 it is in G+240. Then the record's
+  own words: frame pointer, arguments, static link, the head of its try
+  records, and x6 and x7 on arm64. Under PASLANG_GCVERIFY the old copy
+  is filled with $de, so an address the maps did not move reads
+  nonsense. It runs on the M's system stack, r14 or x28 at a record of
+  its own (rt_nsadjust), and allocates nothing. }
+function PasStackAdjust(G: Pointer; OldLo, OldHi: Integer): Integer;
+var
+  g0, hi, delta, sp, sp0, fp, pc, d, n, nfp, i: Integer;
+begin
+  Result := 0;
+  MMoves := MMoves + 1;
+  g0 := Integer(G);
+  hi := RdW(g0 + GStackHi);
+  delta := hi - OldHi;
+  sp := RdW(g0 + GSavedSP);
+  sp0 := sp;
+  AdjWord(g0 + GSavedBP, OldLo, OldHi, delta);
+  for i := 0 to 6 do
+    AdjWord(g0 + 72 + i * 8, OldLo, OldHi, delta);
+  AdjWord(g0 + GLink, OldLo, OldHi, delta);
+  AdjWord(g0 + GTry, OldLo, OldHi, delta);
+  if Amd64 = 0 then
+  begin
+    AdjWord(g0 + 160, OldLo, OldHi, delta);
+    AdjWord(g0 + 168, OldLo, OldHi, delta);
+  end;
+  fp := RdW(g0 + GSavedBP);
+  if MapN = 0 then
+    AdjRange(sp, hi, OldLo, OldHi, delta)
+  else
+  begin
+    if Amd64 = 1 then
+    begin
+      pc := RdW(sp);
+      sp := sp + 8;
+    end
+    else
+      pc := RdW(g0 + 240);
+    while True do
+    begin
+      d := 0;
+      if pc <> 0 then
+        d := MapFind(pc);
+      if (d <> 0) and ((RdW(d) and 255) = 1) then
+      begin
+        pc := RdW(sp);
+        sp := sp + MProBytes;
+        Continue;
+      end;
+      if (fp < sp) or (fp >= hi) or ((fp and 7) <> 0) then
+      begin
+        AdjRange(sp, hi, OldLo, OldHi, delta);
+        if d <> 0 then
+          MapMiss('paslang: stack map: no frame pointer to follow at pc 0x', pc);
+        Break;
+      end;
+      if d <> 0 then
+      begin
+        n := RdW(d) shr 8;
+        if fp - 8 * n = sp then
+          AdjFrame(d, fp, n, OldLo, OldHi, delta)
+        else
+        begin
+          AdjRange(sp, fp, OldLo, OldHi, delta);
+          MapMiss('paslang: stack map: the map does not fit its frame at pc 0x', pc);
+        end;
+      end
+      else
+        AdjRange(sp, fp, OldLo, OldHi, delta);
+      AdjWord(fp, OldLo, OldHi, delta);
+      pc := RdW(fp + 8);
+      nfp := RdW(fp);
+      sp := fp + 16;
+      if nfp = 0 then
+      begin
+        AdjRange(sp, hi, OldLo, OldHi, delta);
+        Break;
+      end;
+      if (nfp <= fp) or (nfp >= hi) then
+      begin
+        AdjRange(sp, hi, OldLo, OldHi, delta);
+        Break;
+      end;
+      fp := nfp;
+    end;
+  end;
+  if MVerify <> 0 then
+    FillWords(sp0 - delta, OldHi - (sp0 - delta), PoisonWord);
+end;
+
+{ NWords words from A, whose GC word is Typ: every word for 1, else the
+  words the descriptor's element marks, the element repeated. }
+procedure ScanTiled(W, A, NWords, Typ, J0: Integer);
+var
+  ew, i, j, v, b, e: Integer;
+begin
+  if Typ = 0 then
+    Exit;
+  if Typ = 1 then
+  begin
+    ScanRange(W, A, A + NWords * 8);
+    Exit;
+  end;
+  b := MBase;
+  e := MEnd;
+  ew := PInt(Typ)^ div 8;
+  if ew <= 0 then
+    Exit;
+  { J0 is the word of the element at A: an oblet starts inside one. }
+  j := J0 mod ew;
+  for i := 0 to NWords - 1 do
+  begin
+    if ((PInt(Typ + 16 + (j shr 6) * 8)^ shr (j and 63)) and 1) = 1 then
+    begin
+      v := PInt(A + i * 8)^;
+      if (v >= b) and (v < e) then
+        MarkPtr(W, v);
+    end;
+    j := j + 1;
+    if j = ew then
+      j := 0;
+  end;
+end;
+
+{ The shared grey stack (P95d): Give moves blocks from the bottom of
+  W's stack to it, Put the oblets from its top, Take half of it (at
+  most 256) back to an empty W; under MShLock. }
+procedure ShLock;
+begin
+  { Read before swapping: the waiters spin on their own copy of the
+    word, not on the bus. }
+  while True do
+  begin
+    if MShLock = 0 then
+      if AtomicCas(@MShLock, 0, 1) then
+        Exit;
+    Pause;
+  end;
+end;
+
+procedure ShUnlock;
+begin
+  if not AtomicCas(@MShLock, 1, 0) then
+    Die('paslang: collector: the shared grey stack was not locked');
+end;
+
+{ Room for K more blocks on the shared stack, under MShLock. }
+procedure ShRoom(K: Integer);
+var
+  n, nb, r: Integer;
+  src, dst: Pointer;
+begin
+  if MShTop + K * 8 <= MShEnd then
+    Exit;
+  n := MShEnd - MSh;
+  nb := n * 2;
+  if nb < GreyMin then
+    nb := GreyMin;
+  while nb < MShTop - MSh + K * 8 do
+    nb := nb * 2;
+  r := SysMmap(0, nb, 3, 34);
+  if MapFailed(r) then
+    Die('paslang: out of memory for the collector''s grey stack');
+  if MShTop > MSh then
+  begin
+    src := Pointer(MSh);
+    dst := Pointer(r);
+    Move(src^, dst^, MShTop - MSh);
+  end;
+  if MSh <> 0 then
+    SysMunmap(MSh, n);
+  MShTop := r + (MShTop - MSh);
+  MSh := r;
+  MShEnd := r + nb;
+end;
+
+{ Give only when the lock is free: a worker that would wait for it
+  scans on instead (another is giving already). What goes is the bottom
+  of W's stack, the blocks pushed first: in a tree they are the roots of
+  the largest parts, so the worker that takes them is busy for long.
+  The top, the deepest and smallest, was given first: a taker was done
+  with it at once and waited again, and the workers spent their time
+  handing blocks over. }
+procedure ShGive(W, K: Integer);
+var
+  n, g: Integer;
+  src, dst: Pointer;
+begin
+  if MShLock <> 0 then
+    Exit;
+  if not AtomicCas(@MShLock, 0, 1) then
+    Exit;
+  ShRoom(K);
+  g := PInt(W + WGrey)^;
+  src := Pointer(g);
+  dst := Pointer(MShTop);
+  Move(src^, dst^, K * 8);
+  MShTop := MShTop + K * 8;
+  AtomicAdd(@MShCount, K);
+  ShUnlock;
+  n := PInt(W + WTop)^ - g - K * 8;
+  src := Pointer(g + K * 8);
+  dst := Pointer(g);
+  Move(src^, dst^, n);
+  PInt(W + WTop)^ := g + n;
+end;
+
+{ The K blocks on top of W's stack go to the shared one whatever it
+  holds: the oblets of a large object, which every worker may take at
+  once. On W's own stack they went out by halves, one give per oblet
+  scanned, and an array of 32 MB marked no faster with 16 workers than
+  with 8. }
+procedure ShPut(W, K: Integer);
+var
+  t: Integer;
+  src, dst: Pointer;
+begin
+  ShLock;
+  ShRoom(K);
+  t := PInt(W + WTop)^ - K * 8;
+  src := Pointer(t);
+  dst := Pointer(MShTop);
+  Move(src^, dst^, K * 8);
+  PInt(W + WTop)^ := t;
+  MShTop := MShTop + K * 8;
+  AtomicAdd(@MShCount, K);
+  ShUnlock;
+end;
+
+function ShTake(W: Integer): Boolean;
+var
+  c, k, t: Integer;
+  src, dst: Pointer;
+begin
+  Result := False;
+  { Claim first, lock after: of the workers that saw blocks there only
+    the one whose claim goes through takes the lock. When every waiter
+    locked, the first took everything, the others queued on the lock in
+    turn to find nothing, and the worker that gave waited behind them.
+    A giver counts its blocks after it pushed them, so there are always
+    as many as were claimed. Half of them, at most 256: the next waiter
+    finds the other half. }
+  repeat
+    c := MShCount;
+    if c <= 0 then
+      Exit;
+    k := (c + 1) div 2;
+    if k > 256 then
+      k := 256;
+  until AtomicCas(@MShCount, c, c - k);
+  t := PInt(W + WTop)^;
+  while t + k * 8 > PInt(W + WEnd)^ do
+  begin
+    GreyGrow(W);
+    t := PInt(W + WTop)^;
+  end;
+  ShLock;
+  MShTop := MShTop - k * 8;
+  src := Pointer(MShTop);
+  dst := Pointer(t);
+  Move(src^, dst^, k * 8);
+  ShUnlock;
+  PInt(W + WTop)^ := t + k * 8;
+  Result := True;
+end;
+
+{ A grey block: its pointer words by the bits in its span, the type in
+  its header word, or the type of its large span. A large block marked
+  in parallel is scanned in oblets of ObletSize, Go's: the first one,
+  from the start, puts the others on the shared stack, which any worker
+  may take; an oblet is its address in the block. The result is the
+  block's weight for Drain: 1, or 16 for a large block or an oblet. }
+function ScanObj(W, Obj: Integer): Integer;
+var
+  sp, esz, hb, bit0, i, v, words, b, e, k, base, size, n, o: Integer;
+begin
+  Result := 1;
+  sp := PInt(MTable + ((Obj - MBase) shr PageShift) * 8)^;
+  if PInt(sp + SState)^ = StLarge then
+  begin
+    Result := 16;
+    base := PInt(sp + SBase)^;
+    size := PInt(sp + SNPages)^ * PageSize;
+    if Obj = base then
+    begin
+      n := size;
+      if (MParallel <> 0) and (size > ObletSize) and (PInt(sp + SLargeType)^ <> 0) then
+      begin
+        o := base + ObletSize;
+        k := 0;
+        while o < base + size do
+        begin
+          GreyPush(W, o);
+          o := o + ObletSize;
+          k := k + 1;
+        end;
+        ShPut(W, k);
+        n := ObletSize;
+      end;
+    end
+    else
+    begin
+      n := base + size - Obj;
+      if n > ObletSize then
+        n := ObletSize;
+    end;
+    ScanTiled(W, Obj, n div 8, PInt(sp + SLargeType)^, (Obj - base) div 8);
+    Exit;
+  end;
+  esz := PInt(sp + SElemSize)^;
+  hb := PInt(sp + SHeapBits)^;
+  if hb = 0 then
+  begin
+    ScanTiled(W, Obj + 8, (esz - 8) shr 3, PInt(Obj)^, 0);
+    Exit;
+  end;
+  b := MBase;
+  e := MEnd;
+  bit0 := (Obj - PInt(sp + SBase)^) shr 3;
+  words := esz shr 3;
+  for i := 0 to words - 1 do
+  begin
+    k := bit0 + i;
+    if ((PInt(hb + (k shr 6) * 8)^ shr (k and 63)) and 1) = 1 then
+    begin
+      v := PInt(Obj + i * 8)^;
+      if (v >= b) and (v < e) then
+        MarkPtr(W, v);
+    end;
+  end;
+end;
+
+{ W's grey blocks, each scanned; every 16 blocks' weight (ScanObj),
+  when another worker waits, the shared stack is empty and W holds four
+  or more, half of them go there. Only when it is empty, as Go's gcDrain
+  balances only when work.full is: a worker that gave on every block
+  while someone waited took the lock once per block. Every 16: the words
+  it reads to know are written by the waiting workers, and read on every
+  block they made Drain eleven times as slow with 13 workers as with
+  one. By weight: an oblet of 128 KB is one block, and a worker that
+  held oblets gave only every 16 of them, 4 ms, while the others
+  waited. }
+procedure Drain(W: Integer);
+var
+  o, t, n, c, nxt, k: Integer;
+begin
+  c := 0;
+  nxt := 16;
+  k := 0;
+  while PInt(W + WTop)^ > PInt(W + WGrey)^ do
+  begin
+    t := PInt(W + WTop)^ - 8;
+    PInt(W + WTop)^ := t;
+    o := PInt(t)^;
+    c := c + ScanObj(W, o);
+    k := k + 1;
+    if c >= nxt then
+    begin
+      nxt := c + 16;
+      if MParallel <> 0 then
+        if (MMarkWait > 0) and (MShCount = 0) then
+        begin
+          n := (PInt(W + WTop)^ - PInt(W + WGrey)^) div 8;
+          if n >= 4 then
+            ShGive(W, n div 2);
+        end;
+    end;
+  end;
+  PInt(W + WMarked)^ := PInt(W + WMarked)^ + k;
+end;
+
+{ Root job J: 0 the globals by their types, 1 the Ms, 2 the persistent
+  heap, then every routine record that has not finished, whole, and its
+  stack (ScanStack). }
+procedure MarkJob(H0, W, J: Integer);
+var
+  r, e, g, lo, hi, allm, c, hp, st: Integer;
+begin
+  if J = 0 then
+  begin
+    r := RdW(H0 + HRootsStart);
+    e := RdW(H0 + HRootsEnd);
+    while r < e do
+    begin
+      ScanTiled(W, RdW(r), RdW(r + 8) div 8, RdW(r + 16), 0);
+      r := r + 24;
+    end;
+  end
+  else if J = 1 then
+  begin
+    allm := RdW(H0 + HAllM);
+    ScanRange(W, allm, allm + RdW(H0 + HNProc) * MRecSize);
+  end
+  else if J = 2 then
+  begin
+    hp := 0;
+    if RdW(H0 + HPersistCur) <> 0 then
+      hp := RdW(RdW(H0 + HPersistCur));
+    st := RdW(H0 + HPersistStatic);
+    if st <> 0 then
+    begin
+      if (hp >= st) and (hp <= st + PersistStaticSize) then
+        ScanRange(W, st, hp)
+      else
+        ScanRange(W, st, st + PersistStaticSize);
+    end;
+    c := RdW(H0 + HPersist);
+    while c <> 0 do
+    begin
+      if (hp >= c) and (hp <= RdW(c + 8)) then
+        ScanRange(W, c + 16, hp)
+      else
+        ScanRange(W, c + 16, RdW(c + 8));
+      c := RdW(c);
+    end;
+  end
+  else
+  begin
+    g := RdW(RdW(H0 + HAllGs) + (J - 3) * 8);
+    if (RdW(g + GStatus) and 4294967295) <> GDead then
+    begin
+      ScanRange(W, g, g + GRecSize);
+      lo := RdW(g + GStackLo);
+      hi := RdW(g + GStackHi);
+      ScanStack(W, g, lo, hi);
+    end;
+  end;
+end;
+
+{ A worker's marking: root jobs while there are, what it queued, then
+  what others gave; with nothing left it waits, and the marking ends
+  when every worker in it waits and nothing is shared (Go's gcDrain and
+  its nwait). }
+procedure MarkWork(H0, W: Integer);
+var
+  j: Integer;
+begin
+  while True do
+  begin
+    j := MNJobs;
+    if MMarkJob < MNJobs then
+      j := AtomicAdd(@MMarkJob, 1) - 1;
+    if j < MNJobs then
+    begin
+      MarkJob(H0, W, j);
+      PInt(W + WMarked)^ := PInt(W + WMarked)^ + 1;
+      Drain(W);
+      Continue;
+    end;
+    Drain(W);
+    if ShTake(W) then
+      Continue;
+    AtomicAdd(@MMarkWait, 1);
+    while True do
+    begin
+      if MShCount > 0 then
+      begin
+        AtomicAdd(@MMarkWait, -1);
+        if ShTake(W) then
+          Break;
+        AtomicAdd(@MMarkWait, 1);
+      end
+      else if MMarkWait >= MMarkActive then
+      begin
+        AtomicAdd(@MMarkWait, -1);
+        Exit;
+      end;
+      Pause;
+    end;
+  end;
+end;
+
+{ W joins the marking while it is open, and while fewer than
+  PASLANG_GCWORKERS have (the cycle's own M has its place already). }
+procedure JoinMark(H0, W: Integer);
+begin
+  if MMarkOpen <> 0 then
+    if (MMaxWorkers <= 0) or (AtomicAdd(@MMarkJoined, 1) <= MMaxWorkers) then
+    begin
+      AtomicAdd(@MMarkActive, 1);
+      if MMarkOpen <> 0 then
+        MarkWork(H0, W);
+      AtomicAdd(@MMarkActive, -1);
+    end;
+end;
+
+{ An M that waits for a cycle to end marks with it (rt_gcwork, on its
+  own system stack, r14 or x28 at its worker record). }
+function PasGcWorker(H: Pointer; Idx: Integer): Integer;
+begin
+  JoinMark(Integer(H), MWorkers + Idx * WorkerSize);
+  Result := 0;
+end;
+
+{ PASLANG_GCVERIFY, after the marking by the maps: every stack again,
+  word by word, as the collector read them before the maps (P95c), by
+  this cycle's own worker alone. What this adds, nothing but the maps'
+  word could keep; it is poisoned and kept (VerifyPoison). }
+procedure VerifyStacks(H0, W: Integer);
+var
+  i, n, g, lo, hi, sp, par: Integer;
+begin
+  par := MParallel;
+  MParallel := 0;
+  MVerifyRec := 1;
+  n := RdW(H0 + HNAllGs);
+  for i := 0 to n - 1 do
+  begin
+    g := RdW(RdW(H0 + HAllGs) + i * 8);
+    if (RdW(g + GStatus) and 4294967295) <> GDead then
+    begin
+      lo := RdW(g + GStackLo);
+      hi := RdW(g + GStackHi);
+      sp := RdW(g + GSavedSP);
+      if (sp < lo) or (sp > hi) then
+        sp := lo;
+      ScanRange(W, sp, hi);
+    end;
+  end;
+  Drain(W);
+  MVerifyRec := 0;
+  MParallel := par;
+  WrW(H0 + HVerifyN, RdW(H0 + HVerifyN) + MVerifyN);
+  MVerifyN := 0;
+end;
+
+{ The marking of a cycle (P95d): the jobs, the counts, the shared stack
+  empty; open; a new phase that every M waiting for this cycle looks
+  for, a stopped one on HGcGen and an idle one on its own futex word;
+  this cycle's M marks too; closed, and done when no worker is left in
+  it. MLastWorkers counts the workers that scanned anything. }
+procedure MarkAll(H0: Integer);
+var
+  me, allm, n, i, m, w: Integer;
+begin
+  allm := RdW(H0 + HAllM);
+  n := RdW(H0 + HNProc);
+  me := (RdW(RdW(H0 + HGcG) + GM) - allm) div MRecSize;
+  MNJobs := 3 + RdW(H0 + HNAllGs);
+  MMarkJob := 0;
+  MMarkWait := 0;
+  MMarkJoined := 1;
+  MShTop := MSh;
+  MShCount := 0;
+  for i := 0 to n - 1 do
+  begin
+    PInt(MWorkers + i * WorkerSize + WMarked)^ := 0;
+    PInt(MWorkers + i * WorkerSize + WPops)^ := 0;
+  end;
+  MParallel := 0;
+  if (n > 1) and ((RdW(H0 + HRtCaps) and 2) <> 0) and (MMaxWorkers <> 1) then
+    MParallel := 1;
+  AtomicAdd(@MMarkOpen, 1);
+  if MParallel <> 0 then
+  begin
+    AtomicAdd(PInt(H0 + HMarkEpoch), 1);
+    FutexWake(H0 + HGcGen);
+    { Idle Ms sleep on their own word: as many as may join. }
+    w := 1;
+    for i := 0 to n - 1 do
+    begin
+      m := allm + i * MRecSize;
+      if (RdW(m + MState) = MsIdleTaken) and ((MMaxWorkers <= 0) or (w < MMaxWorkers)) then
+      begin
+        FutexWake(m + MFutex);
+        w := w + 1;
+      end;
+    end;
+  end;
+  AtomicAdd(@MMarkActive, 1);
+  MarkWork(H0, MWorkers + me * WorkerSize);
+  AtomicAdd(@MMarkActive, -1);
+  AtomicAdd(@MMarkOpen, -1);
+  while MMarkActive > 0 do
+    Pause;
+  w := 0;
+  for i := 0 to n - 1 do
+    if PInt(MWorkers + i * WorkerSize + WMarked)^ > 0 then
+      w := w + 1;
+  MLastWorkers := w;
+end;
+
+{ PASLANG_GCVERIFY: every routine moves its stack at its next check, so
+  the maps adjust stacks as often as cycles run (P95c). }
+procedure AskMoves(H0: Integer);
+var
+  i, n, g: Integer;
+begin
+  if (RdW(H0 + HRtCaps) and 1) = 0 then
+    Exit;
+  n := RdW(H0 + HNAllGs);
+  for i := 0 to n - 1 do
+  begin
+    g := RdW(RdW(H0 + HAllGs) + i * 8);
+    if (RdW(g + GStatus) and 4294967295) <> GDead then
+      WrW(g + GGuard, MoveAsked);
+  end;
+end;
+
+{ ---- sweep ---- }
+
+{ PASLANG_GCPOISON: the blocks of Sp taken before the cycle and not
+  marked are filled with $de, so a pointer kept where the collector
+  does not look reads nonsense at once. }
+procedure PoisonFreed(Sp: Integer);
+var
+  i, n, fi, ab, mb, esz, base: Integer;
+  taken: Boolean;
+begin
+  n := RdW(Sp + SNElems);
+  fi := RdW(Sp + SFreeIndex);
+  ab := RdW(Sp + SAllocBits);
+  mb := RdW(Sp + SMarkBits);
+  esz := RdW(Sp + SElemSize);
+  base := RdW(Sp + SBase);
+  for i := 0 to n - 1 do
+  begin
+    taken := (i < fi) or (((PInt(ab + (i shr 6) * 8)^ shr (i and 63)) and 1) = 1);
+    if taken then
+      if ((PInt(mb + (i shr 6) * 8)^ shr (i and 63)) and 1) = 0 then
+        FillWords(base + i * esz, esz, PoisonWord);
+  end;
+end;
+
+{ A span with nothing alive: its bitmaps back to the pool, its record
+  becomes the free run of its pages. }
+procedure FreeSpan(H0, Sp: Integer);
+var
+  nw: Integer;
+begin
+  nw := RdW(Sp + SNWords);
+  FreeBits(H0, RdW(Sp + SAllocBits), nw);
+  FreeBits(H0, RdW(Sp + SMarkBits), nw);
+  WrW(H0 + HInUse, RdW(H0 + HInUse) - RdW(Sp + SNPages) * PageSize);
+  WrW(Sp + SState, StRun);
+  WrW(Sp + SAllocBits, 0);
+  WrW(Sp + SMarkBits, 0);
+  WrW(Sp + SHeapBits, 0);
+  WrW(Sp + SLargeType, 0);
+  WrW(Sp + SAll, 0);
+  WrW(Sp + SNeedZero, 1);
+  WrW(Sp + SReleased, 0);
+  AddRun(H0, Sp);
+end;
+
+{ Every span: the mark bits become the alloc bits (Go's sweep), an empty
+  span frees its pages, one with free slots goes on its class's central
+  list, and what is alive is counted. }
+function Sweep(H0: Integer): Integer;
+var
+  sp, nx, all, n, live, st, nw, ab, mb, cnt, i, t, sc, poison: Integer;
+  keep: Boolean;
+begin
+  live := 0;
+  all := 0;
+  n := 0;
+  t := RdW(H0 + HTables);
+  for i := 0 to MCacheEntries - 1 do
+    WrW(t + TCentral + i * 8, 0);
+  poison := RdW(H0 + HPoison);
+  sp := RdW(H0 + HSpans);
+  while sp <> 0 do
+  begin
+    nx := RdW(sp + SAll);
+    st := RdW(sp + SState);
+    nw := RdW(sp + SNWords);
+    ab := RdW(sp + SAllocBits);
+    mb := RdW(sp + SMarkBits);
+    keep := True;
+    if st = StSmall then
+    begin
+      cnt := 0;
+      for i := 0 to nw - 1 do
+        cnt := cnt + PopBits(PInt(mb + i * 8)^);
+      if poison <> 0 then
+        PoisonFreed(sp);
+      WrW(sp + SAllocBits, mb);
+      WrW(sp + SMarkBits, ab);
+      ZeroMem(ab, nw * 8);
+      WrW(sp + SFreeIndex, 0);
+      WrW(sp + SAllocCount, cnt);
+      WrW(sp + SNeedZero, 1);
+      { An empty span stays a span one cycle more, on its central list,
+        since a program that makes garbage at a steady rate takes it
+        again at once (rebuilding it, its record, bitmaps and pages, was
+        the most of b2str's cost); one still unused at the next sweep
+        (SReleased counts the sweeps it went through empty) frees its
+        pages. }
+      if (cnt = 0) and (RdW(sp + SReleased) >= 1) then
+      begin
+        FreeSpan(H0, sp);
+        keep := False;
+      end
+      else
+      begin
+        if cnt = 0 then
+          WrW(sp + SReleased, 1)
+        else
+          WrW(sp + SReleased, 0);
+        live := live + cnt * RdW(sp + SElemSize);
+        if cnt < RdW(sp + SNElems) then
+        begin
+          sc := RdW(sp + SClass);
+          WrW(sp + SNext, RdW(t + TCentral + sc * 8));
+          WrW(t + TCentral + sc * 8, sp);
+        end;
+      end;
+    end
+    else if (PInt(mb)^ and 1) = 0 then
+    begin
+      if poison <> 0 then
+        FillWords(RdW(sp + SBase), RdW(sp + SNPages) * PageSize, PoisonWord);
+      FreeSpan(H0, sp);
+      keep := False;
+    end
+    else
+    begin
+      PInt(mb)^ := 0;
+      live := live + RdW(sp + SNPages) * PageSize;
+    end;
+    if keep then
+    begin
+      WrW(sp + SAll, all);
+      all := sp;
+      n := n + 1;
+    end;
+    sp := nx;
+  end;
+  WrW(H0 + HSpans, all);
+  WrW(H0 + HNSpans, n);
+  Result := live;
+end;
+
+{ Go's scavenger, at the end of a cycle: free runs still resident past
+  an eighth of the goal (at least 1 MiB) go back to the kernel, the
+  longest first; their pages read as zero after, so they need no
+  clearing when used again. }
+procedure Scavenge(H0: Integer);
+var
+  target, t, i, b, r, len: Integer;
+begin
+  target := RdW(H0 + HGoal) div 8;
+  if target < 1048576 then
+    target := 1048576;
+  t := RdW(H0 + HTables) + TRuns;
+  i := 0;
+  while (RdW(H0 + HFreeDirty) > target) and (i < RunBuckets) do
+  begin
+    if i = 0 then
+      b := 0
+    else
+      b := RunBuckets - i;
+    r := RdW(t + b * 8);
+    while (r <> 0) and (RdW(H0 + HFreeDirty) > target) do
+    begin
+      if RdW(r + SReleased) = 0 then
+      begin
+        len := RdW(r + SNPages) * PageSize;
+        SysMadvise(RdW(r + SBase), len, 4);
+        WrW(r + SReleased, 1);
+        WrW(r + SNeedZero, 0);
+        WrW(H0 + HFreeDirty, RdW(H0 + HFreeDirty) - len);
+        WrW(H0 + HReleased, RdW(H0 + HReleased) + len);
+      end;
+      r := RdW(r + SNext);
+    end;
+    i := i + 1;
+  end;
+end;
+
+{ One cycle, on the collector's own routine record (rt_gccollect put it
+  there): stop the world, take back the mcaches' runs, mark from the
+  roots, sweep, set the next goal, give memory back, start the world. }
+procedure PasGcCycle(H: Pointer);
+var
+  h0, t0, t1, live, pct, goal, dt: Integer;
+begin
+  h0 := Integer(H);
+  t0 := Nanotime;
+  StopTheWorld(h0);
+  CheckStopped(h0);
+  FlushCaches(h0);
+  MBase := RdW(h0 + HBase);
+  MEnd := RdW(h0 + HCursor);
+  MTable := RdW(h0 + HTable);
+  t1 := Nanotime;
+  MStopNs := t1 - t0;
+  MarkAll(h0);
+  MMarkNs := Nanotime - t1;
+  if MVerify <> 0 then
+    VerifyStacks(h0, MWorkers + ((RdW(RdW(h0 + HGcG) + GM) - RdW(h0 + HAllM)) div MRecSize) * WorkerSize);
+  WrW(h0 + HMapMiss, RdW(h0 + HMapMiss) + MMapMiss);
+  MMapMiss := 0;
+  t1 := Nanotime;
+  live := Sweep(h0);
+  MSweepNs := Nanotime - t1;
+  pct := RdW(h0 + HGcPercent);
+  if pct < 0 then
+    pct := 100;
+  goal := live + (live div 100) * pct;
+  if goal < MinGoal then
+    goal := MinGoal;
+  WrW(h0 + HLive, live);
+  WrW(h0 + HGoal, goal);
+  WrW(h0 + HAllocated, live);
+  Scavenge(h0);
+  if MVerify <> 0 then
+    AskMoves(h0);
+  WrW(h0 + HNumGC, RdW(h0 + HNumGC) + 1);
+  dt := Nanotime - t0;
+  WrW(h0 + HPauseLast, dt);
+  WrW(h0 + HPauseTotal, RdW(h0 + HPauseTotal) + dt);
+  StartTheWorld(h0);
+  { HGcBusy is let go by rt_gccollect once it is off the collector's
+    stack: let go here, another M took the next cycle and that stack
+    while this one was still returning on it. }
+end;
+
+{ ---- looking at the heap ---- }
+
+{ The span that holds address A, or 0 when A is not in the heap. }
+function SpanOf(H0, A: Integer): Integer;
+begin
+  Result := 0;
+  if (A < RdW(H0 + HBase)) or (A >= RdW(H0 + HCursor)) then
+    Exit;
+  Result := RdW(PageSlot(H0, A));
+end;
+
+{ The pointer bits of the first 64 words of a block whose GC word is
+  Typ and whose words are Words: every word for 1, the descriptor's
+  element tiled over the block otherwise. }
+function TileMask(Typ, Words: Integer): Integer;
+var
+  esz, ew, m0, off: Integer;
+begin
+  Result := 0;
+  if Typ = 0 then
+    Exit;
+  if Words > 64 then
+    Words := 64;
+  if Typ = 1 then
+  begin
+    if Words >= 64 then
+      Result := -1
+    else
+      Result := (1 shl Words) - 1;
+    Exit;
+  end;
+  esz := RdW(Typ);
+  ew := esz div 8;
+  m0 := RdW(Typ + 16);
+  if ew <= 0 then
+    Exit;
+  off := 0;
+  while off < Words do
+  begin
+    Result := Result or (m0 shl off);
+    off := off + ew;
+  end;
+  if Words < 64 then
+    Result := Result and ((1 shl Words) - 1);
+end;
+
+{ The pointer bits the heap keeps for the block that holds A, first 64
+  words: what the collector scans. -1 when A is not in a block of the
+  heap. For tests: make check compares them with what each type says. }
+function PasHeapMask(H: Pointer; Addr: Integer): Integer;
+var
+  h0, sp, base, esz, obj, idx, hb, bit, w, i, st: Integer;
+begin
+  Result := -1;
+  h0 := Integer(H);
+  sp := SpanOf(h0, Addr);
+  if sp = 0 then
+    Exit;
+  st := RdW(sp + SState);
+  if (RdW(h0 + HGcOn) <> 0) and (st <> StSmall) and (st <> StLarge) then
+    Exit;
+  base := RdW(sp + SBase);
+  esz := RdW(sp + SElemSize);
+  if (RdW(sp + SClass) shr 1) = 0 then
+  begin
+    { A large block: its type is in the span. }
+    Result := TileMask(RdW(sp + SLargeType), esz div 8);
+    Exit;
+  end;
+  Result := 0;
+  if (RdW(sp + SClass) and 1) = 1 then
+    Exit;
+  idx := (Addr - base) div esz;
+  obj := base + idx * esz;
+  hb := RdW(sp + SHeapBits);
+  if hb <> 0 then
+  begin
+    w := esz div 8;
+    if w > 64 then
+      w := 64;
+    bit := (obj - base) div 8;
+    for i := 0 to w - 1 do
+      if ((RdW(hb + ((bit + i) shr 6) * 8) shr ((bit + i) and 63)) and 1) = 1 then
+        Result := Result or (1 shl i);
+  end
+  else
+    { A header word before the block holds its type. }
+    Result := TileMask(RdW(obj), (esz - 8) div 8);
+end;
+
+{ The heap object that holds Addr (P104): its first byte and its size,
+  the block's (at least what was asked), or 0 and 0 when Addr is in no
+  object: a header word, past a span's slots, outside the heap. A scan
+  class above 512 bytes keeps a header word before the object. }
+function ObjOf(H0, Addr: Integer; out Size: Integer): Integer;
+var
+  sp, st, base, esz, idx, obj: Integer;
+begin
+  Result := 0;
+  Size := 0;
+  sp := SpanOf(H0, Addr);
+  if sp = 0 then
+    Exit;
+  st := RdW(sp + SState);
+  base := RdW(sp + SBase);
+  esz := RdW(sp + SElemSize);
+  if st = StLarge then
+  begin
+    if (Addr < base) or (Addr >= base + esz) then
+      Exit;
+    Result := base;
+    Size := esz;
+    Exit;
+  end;
+  if st <> StSmall then
+    Exit;
+  if (Addr < base) or (Addr >= RdW(sp + SLimit)) then
+    Exit;
+  { Every slot counts, taken or not: the slots a routine's cache hands
+    out are not in the span's bits until the collector gathers them, and
+    a slot a reachable pointer holds is never a free one. }
+  idx := (Addr - base) div esz;
+  obj := base + idx * esz;
+  Size := esz;
+  if ((RdW(sp + SClass) and 1) = 0) and (RdW(sp + SHeapBits) = 0) then
+  begin
+    obj := obj + 8;
+    Size := esz - 8;
+  end;
+  if Addr < obj then
+  begin
+    Size := 0;
+    Exit;
+  end;
+  Result := obj;
+end;
+
+function PasMemBase(H: Pointer; Addr: Integer): Integer;
+var
+  sz: Integer;
+begin
+  Result := ObjOf(Integer(H), Addr, sz);
+end;
+
+function PasMemSize(H: Pointer; Addr: Integer): Integer;
+begin
+  ObjOf(Integer(H), Addr, Result);
+end;
+
+{ The words Addr, Len are a string of the heap (1.0.136): its header
+  byte, one before the characters, and the characters lie in one object
+  of the heap (rt_stralloc). One of 16 bytes or more is a block of its
+  own; a smaller one lies at any offset of a tiny block of 16, packed
+  with other small values. For rt_strshare's checked runs: a string in
+  the variant part of a record shares its words with the other arms, so
+  they may hold anything; a literal's header already says shared. }
+function PasStrBlock(H: Pointer; Addr, Len: Integer): Integer;
+var
+  base, sz: Integer;
+begin
+  Result := 0;
+  if Len <= 0 then
+    Exit;
+  base := ObjOf(Integer(H), Addr - 1, sz);
+  if base = 0 then
+    Exit;
+  if (sz > 16) and (base <> Addr - 1) then
+    Exit;
+  if (Addr - 1 - base) + Len + 1 > sz then
+    Exit;
+  Result := 1;
+end;
+
+{ Count what does not hold in the collector's roots: every routine
+  record with a stack below its top and a status it can have, at least
+  the main one; every global entry on a word, of whole words, with a GC
+  word that is 1 or a descriptor of whole words. }
+function CheckRoots(H0: Integer): Integer;
+var
+  bad, i, g, n, r, e, w: Integer;
+begin
+  bad := 0;
+  SpinLock(PInt(H0 + HAllGLock));
+  n := RdW(H0 + HNAllGs);
+  if n < 1 then
+    bad := bad + 1;
+  for i := 0 to n - 1 do
+  begin
+    g := RdW(RdW(H0 + HAllGs) + i * 8);
+    if (g = 0) or (RdW(g + GStackLo) >= RdW(g + GStackHi)) then
+      bad := bad + 1
+    else if (RdW(g + GStatus) and 4294967295) > GDead then
+      bad := bad + 1;
+  end;
+  SpinUnlock(PInt(H0 + HAllGLock));
+  r := RdW(H0 + HRootsStart);
+  e := RdW(H0 + HRootsEnd);
+  if ((e - r) mod 24) <> 0 then
+    bad := bad + 1
+  else
+    while r < e do
+    begin
+      w := RdW(r + 16);
+      if ((RdW(r) and 7) <> 0) or (RdW(r + 8) <= 0) or ((RdW(r + 8) and 7) <> 0) then
+        bad := bad + 1
+      else if w <> 1 then
+        if (w = 0) or (RdW(w) <= 0) or ((RdW(w) and 7) <> 0) then
+          bad := bad + 1;
+      r := r + 24;
+    end;
+  Result := bad;
+end;
+
+{ With the collector: every span in use has its bitmaps, a FreeIndex it
+  can have and no mark bit set; every span on a central list is of its
+  class and has a free slot; every free run is on the list of its
+  length and its first and last page name it; and the bytes add up: in
+  use and free make the heap, resident and given back make the free. }
+function CheckGc(H0: Integer): Integer;
+var
+  bad, sp, i, j, cnt, nw, inuse, free, dirty, rel, t, r: Integer;
+begin
+  bad := 0;
+  inuse := 0;
+  sp := RdW(H0 + HSpans);
+  while sp <> 0 do
+  begin
+    if (RdW(sp + SState) <> StSmall) and (RdW(sp + SState) <> StLarge) then
+      bad := bad + 1;
+    nw := RdW(sp + SNWords);
+    if (RdW(sp + SAllocBits) = 0) or (RdW(sp + SMarkBits) = 0) or (nw < 1) then
+      bad := bad + 1
+    else
+      for i := 0 to nw - 1 do
+        if RdW(RdW(sp + SMarkBits) + i * 8) <> 0 then
+          bad := bad + 1;
+    if (RdW(sp + SFreeIndex) < 0) or (RdW(sp + SFreeIndex) > RdW(sp + SNElems)) then
+      bad := bad + 1;
+    inuse := inuse + RdW(sp + SNPages) * PageSize;
+    sp := RdW(sp + SAll);
+  end;
+  if inuse <> RdW(H0 + HInUse) then
+    bad := bad + 1;
+  t := RdW(H0 + HTables);
+  for i := 0 to MCacheEntries - 1 do
+  begin
+    sp := RdW(t + TCentral + i * 8);
+    while sp <> 0 do
+    begin
+      if (RdW(sp + SState) <> StSmall) or (RdW(sp + SClass) <> i) then
+        bad := bad + 1
+      else
+      begin
+        cnt := 0;
+        for j := 0 to RdW(sp + SNWords) - 1 do
+          cnt := cnt + PopBits(RdW(RdW(sp + SAllocBits) + j * 8));
+        if cnt >= RdW(sp + SNElems) then
+          bad := bad + 1;
+      end;
+      sp := RdW(sp + SNext);
+    end;
+  end;
+  free := 0;
+  dirty := 0;
+  rel := 0;
+  for i := 0 to RunBuckets - 1 do
+  begin
+    r := RdW(t + TRuns + i * 8);
+    while r <> 0 do
+    begin
+      if (RdW(r + SState) <> StRun) or (RunBucket(RdW(r + SNPages)) <> i) then
+        bad := bad + 1;
+      if RdW(PageSlot(H0, RdW(r + SBase))) <> r then
+        bad := bad + 1;
+      if RdW(PageSlot(H0, RdW(r + SBase) + (RdW(r + SNPages) - 1) * PageSize)) <> r then
+        bad := bad + 1;
+      free := free + RdW(r + SNPages) * PageSize;
+      if RdW(r + SReleased) <> 0 then
+        rel := rel + RdW(r + SNPages) * PageSize
+      else
+        dirty := dirty + RdW(r + SNPages) * PageSize;
+      r := RdW(r + SNext);
+    end;
+  end;
+  if free <> RdW(H0 + HFreeBytes) then
+    bad := bad + 1;
+  if (dirty <> RdW(H0 + HFreeDirty)) or (rel <> RdW(H0 + HReleased)) then
+    bad := bad + 1;
+  if inuse + free <> RdW(H0 + HCursor) - RdW(H0 + HBase) then
+    bad := bad + 1;
+  Result := bad;
+end;
+
+{ Walk every span and count what does not hold: a span inside the
+  mapped heap and on a page boundary, its pages pointing back to it in
+  the table, its objects inside it, its class and size agreeing, its
+  bits where they belong; every mcache entry inside its span; the roots
+  (CheckRoots); and the collector's lists (CheckGc). 0 is a sound heap.
+  It runs with preemption off (rt_heapcheck goes through rt_gocall), so
+  no cycle moves the heap under it. }
+function PasHeapCheck(H: Pointer): Integer;
+var
+  h0, sp, bad, base, np, i, t, cls, sc, esz, n, mc, p, e, cur, lim, span: Integer;
+begin
+  h0 := Integer(H);
+  bad := 0;
+  n := 0;
+  sp := RdW(h0 + HSpans);
+  while sp <> 0 do
+  begin
+    n := n + 1;
+    base := RdW(sp + SBase);
+    np := RdW(sp + SNPages);
+    esz := RdW(sp + SElemSize);
+    sc := RdW(sp + SClass);
+    cls := sc shr 1;
+    if (base < RdW(h0 + HBase)) or (base + np * PageSize > RdW(h0 + HCursor)) or
+      ((base and (PageSize - 1)) <> 0) or (np < 1) then
+      bad := bad + 1;
+    t := PageSlot(h0, base);
+    for i := 0 to np - 1 do
+      if RdW(t + i * 8) <> sp then
+        bad := bad + 1;
+    if RdW(sp + SLimit) > base + np * PageSize then
+      bad := bad + 1;
+    if RdW(sp + SLimit) <> base + RdW(sp + SNElems) * esz then
+      bad := bad + 1;
+    if cls <> 0 then
+    begin
+      if RdW(RdW(h0 + HClass2Size) + cls * 8) <> esz then
+        bad := bad + 1;
+      if ((sc and 1) = 0) and (esz <= MaxHeapBits) then
+      begin
+        if RdW(sp + SHeapBits) <> base + np * PageSize - np * PageSize div 64 then
+          bad := bad + 1;
+      end
+      else if RdW(sp + SHeapBits) <> 0 then
+        bad := bad + 1;
+    end;
+    sp := RdW(sp + SAll);
+  end;
+  if n <> RdW(h0 + HNSpans) then
+    bad := bad + 1;
+  mc := RdW(h0 + HMCaches);
+  for p := 0 to RdW(h0 + HNProc) - 1 do
+    for e := 0 to MCacheEntries - 1 do
+    begin
+      cur := RdW(mc + p * MCacheSize + 32 + e * 32);
+      lim := RdW(mc + p * MCacheSize + 40 + e * 32);
+      span := RdW(mc + p * MCacheSize + 48 + e * 32);
+      if span <> 0 then
+        if (cur < RdW(span + SBase)) or (cur > lim) or (lim > RdW(span + SLimit)) or
+          (RdW(span + SClass) <> e) then
+          bad := bad + 1;
+    end;
+  bad := bad + CheckRoots(h0);
+  if RdW(h0 + HGcOn) <> 0 then
+    bad := bad + CheckGc(h0);
+  Result := bad;
+end;
+
+{ HeapStat(K) for programs and tests: 0 cycles run, 1 bytes alive after
+  the last, 2 the goal, 3 bytes mapped, 4 bytes given back to the
+  kernel, 5 bytes in spans in use, 6 bytes in free runs, 7 bytes handed
+  out plus alive, 8 nanoseconds the world stood still in all, 9 in the
+  last cycle, 10 1 when the runtime has the collector, 11-13 the checks
+  of PASLANG_GCVERIFY, 14 the workers that marked in the last cycle, 15
+  how many may mark one (the Ps, PASLANG_GCWORKERS or DefWorkers), 16
+  to 18 the last cycle's stop, mark and sweep in nanoseconds. }
+function PasHeapStat(H: Pointer; K: Integer): Integer;
+var
+  h0, n: Integer;
+begin
+  h0 := Integer(H);
+  Result := 0;
+  if K = 3 then
+    Result := RdW(h0 + HMapped)
+  else if RdW(h0 + HGcOn) = 0 then
+    Result := 0
+  else if K = 0 then
+    Result := RdW(h0 + HNumGC)
+  else if K = 1 then
+    Result := RdW(h0 + HLive)
+  else if K = 2 then
+    Result := RdW(h0 + HGoal)
+  else if K = 4 then
+    Result := RdW(h0 + HReleased)
+  else if K = 5 then
+    Result := RdW(h0 + HInUse)
+  else if K = 6 then
+    Result := RdW(h0 + HFreeBytes)
+  else if K = 7 then
+    Result := RdW(h0 + HAllocated)
+  else if K = 8 then
+    Result := RdW(h0 + HPauseTotal)
+  else if K = 9 then
+    Result := RdW(h0 + HPauseLast)
+  else if K = 10 then
+    Result := 1
+  else if K = 11 then
+    Result := RdW(h0 + HVerifyN)
+  else if K = 12 then
+    Result := RdW(h0 + HMapMiss)
+  else if K = 13 then
+    Result := MMoves
+  else if K = 14 then
+    Result := MLastWorkers
+  else if K = 16 then
+    Result := MStopNs
+  else if K = 17 then
+    Result := MMarkNs
+  else if K = 18 then
+    Result := MSweepNs
+  else if K = 15 then
+  begin
+    Result := 1;
+    n := RdW(h0 + HNProc);
+    if (n > 1) and ((RdW(h0 + HRtCaps) and 2) <> 0) and (MMaxWorkers <> 1) then
+      if (MMaxWorkers <= 0) or (MMaxWorkers > n) then
+        Result := n
+      else
+        Result := MMaxWorkers;
+  end;
+end;
+
+{ The rotation and shift words over memory (P108, 1.0.130): a record, a
+  static array, a Quad, a vector, a string's characters or a slice's
+  elements as one number of Bytes * 8 bits, bit i being bit i mod 8 of
+  byte i div 8, as for the bit words. Dst gets the result (the emitter
+  gives a block of its own: Src and Src2 are never written); KindC is
+  the word (the emitter's numbers: 1 to 10 as rt_rot, 11 RotateLeft, 12
+  RotateRight, 20 FunnelLeft and 21 FunnelRight, Src hi and Src2 lo)
+  plus 256 times Carry; the result is the new Carry. Every output word
+  is at most two 64-bit reads of the source at a bit offset (RotGet),
+  or-ed, plus the bit Carry brings into a ring and the sign's copies. }
+
+{ The byte and the bit a read at bit offset O starts at: O div 8 and O
+  mod 8 rounded down, O may be negative. }
+procedure RotSplit(O: Integer; var Q, R: Integer);
+begin
+  if O >= 0 then
+    Q := O shr 3
+  else
+    Q := -((7 - O) shr 3);
+  R := O - Q * 8;
+end;
+
+{ The 64 bits of the Bytes bytes at Src from bit P up, bits outside them
+  0; P may be negative. }
+function RotGet(Src, Bytes, P: Integer): Integer;
+var
+  q, r, lo, hi, i, b: Integer;
+begin
+  Result := 0;
+  if (P >= Bytes * 8) or (P <= -64) then
+    Exit;
+  RotSplit(P, q, r);
+  if (q >= 0) and (q + 9 <= Bytes) then
+  begin
+    lo := PInt(Src + q)^;
+    hi := PByte(Src + q + 8)^;
+  end
+  else
+  begin
+    lo := 0;
+    hi := 0;
+    for i := 0 to 8 do
+      if (q + i >= 0) and (q + i < Bytes) then
+      begin
+        b := PByte(Src + q + i)^;
+        if i < 8 then
+          lo := lo or (b shl (i * 8))
+        else
+          hi := b;
+      end;
+  end;
+  if r = 0 then
+    Result := lo
+  else
+    Result := (lo shr r) or (hi shl (64 - r));
+end;
+
+function RotBit(Src, I: Integer): Integer;
+begin
+  Result := (PByte(Src + (I shr 3))^ shr (I and 7)) and 1;
+end;
+
+function PasRotMem(Dst, Src, Src2, Bytes, KindC, N: Integer): Integer;
+var
+  kind, c, nb, k, m, w, i, v, u, oa, ob, ring, fill: Integer;
+  a, b, qa, ra, qb, rb, q, lo, hi, nw, pd, pa: Integer;
+begin
+  kind := KindC and 255;
+  c := (KindC shr 8) and 1;
+  Result := c;
+  nb := Bytes * 8;
+  a := Src;
+  b := 0;
+  oa := 0;
+  ob := 0;
+  ring := -1;
+  fill := nb;
+  if ((kind = 11) or (kind = 12)) and (N < 0) and (nb > 0) then
+  begin
+    { RotateLeft and RotateRight are rol and ror: a negative count
+      turns the other way, as it does in a register (1.0.147). N mod nb
+      is in (-nb, 0]; adding nb gives the same turn as a count from 0. }
+    N := N mod nb;
+    if N < 0 then
+      N := N + nb;
+  end;
+  if N <= 0 then
+  begin
+    { nothing changes: the value, or the funnel's hi (left) or lo }
+    if kind = 21 then
+      a := Src2;
+  end
+  else if nb = 0 then
+  begin
+    { no bits: a shift to Carry has run out of them }
+    if (kind = 8) or (kind = 9) or (kind = 10) then
+      Result := 0;
+    Exit;
+  end
+  else
+    case kind of
+      1, 2, 11, 12:
+        begin
+          k := N mod nb;
+          if (kind = 2) or (kind = 12) then
+            k := (nb - k) mod nb;
+          { left k: bit j is bit j - k, and the top k come round }
+          oa := -k;
+          b := Src;
+          ob := nb - k;
+        end;
+      3, 4:
+        begin
+          k := N mod (nb + 1);
+          if kind = 4 then
+            k := (nb + 1 - k) mod (nb + 1);
+          if k > 0 then
+          begin
+            oa := -k;
+            b := Src;
+            ob := nb + 1 - k;
+            ring := k - 1;
+            Result := RotBit(Src, nb - k);
+          end;
+        end;
+      5, 8:
+        begin
+          if kind = 8 then
+          begin
+            if N <= nb then
+              Result := RotBit(Src, nb - N)
+            else
+              Result := 0;
+          end;
+          if N > nb then
+            N := nb + 64;
+          oa := -N;
+        end;
+      6, 9:
+        begin
+          if kind = 9 then
+          begin
+            if N <= nb then
+              Result := RotBit(Src, N - 1)
+            else
+              Result := 0;
+          end;
+          if N > nb then
+            N := nb + 64;
+          oa := N;
+        end;
+      7, 10:
+        begin
+          m := N;
+          if m > nb then
+            m := nb;
+          if kind = 10 then
+            Result := RotBit(Src, m - 1);
+          if N > nb then
+            N := nb + 64;
+          oa := N;
+          if RotBit(Src, nb - 1) = 1 then
+            fill := nb - m;
+        end;
+      20, 21:
+        begin
+          if N > 2 * nb then
+            N := 2 * nb + 64;
+          if kind = 20 then
+          begin
+            { the top half of hi:lo shifted left }
+            oa := -N;
+            b := Src2;
+            ob := nb - N;
+          end
+          else
+          begin
+            { the low half of hi:lo shifted right }
+            a := Src2;
+            oa := N;
+            b := Src;
+            ob := N - nb;
+          end;
+        end;
+    end;
+  { Inside the value a read is one or two loads at a byte and a bit
+    that stay the same from word to word; at its ends, RotGet. }
+  RotSplit(oa, qa, ra);
+  RotSplit(ob, qb, rb);
+  { The run of words whose read of a lies inside the value, 16 bytes of
+    it: one loop of the machine's own (1.0.130), two loads and a shrdq
+    on amd64, an ldp and three shifts on arm64. Nothing else can reach
+    such a word: b's offset is a's plus or minus the width (plus it and
+    1 through Carry), so b's read is then wholly past the end or wholly
+    below the start, its bits 0; the ring's bit is below a's first bit,
+    so its word reads a from below 0; and a word the sign's copies reach
+    reads a past the end. }
+  lo := 0;
+  if -qa > lo then
+    lo := -qa;
+  hi := Bytes - 16 - qa;
+  if Bytes - 8 < hi then
+    hi := Bytes - 8;
+  w := 0;
+  while w < Bytes do
+  begin
+    nw := 0;
+    if (w >= lo) and (w <= hi) then
+      nw := (hi - w) div 8 + 1;
+    if nw > 0 then
+    begin
+      pd := Dst + w;
+      pa := a + w + qa;
+      asm amd64 (pd: in rdi; pa: in rsi; ra: in rdx; nw: in r10)
+        movl %edx, %ecx
+      1:
+        movq (%rsi), %rax
+        movq 8(%rsi), %r11
+        shrdq %cl, %r11, %rax
+        movq %rax, (%rdi)
+        addq $8, %rsi
+        addq $8, %rdi
+        decq %r10
+        jnz 1b
+      end;
+      asm arm64 (pd: in x0; pa: in x1; ra: in x2; nw: in x3)
+        mov x6, #63
+        sub x7, x6, x2
+      1:
+        ldp x9, x10, [x1], #8
+        lsr x9, x9, x2
+        lsl x10, x10, #1
+        lsl x10, x10, x7
+        orr x9, x9, x10
+        str x9, [x0], #8
+        subs x3, x3, #1
+        b.ne 1b
+      end;
+      w := w + nw * 8;
+      Continue;
+    end;
+    i := w * 8;
+    q := w + qa;
+    if (q >= 0) and (q + 9 <= Bytes) then
+    begin
+      v := PInt(a + q)^;
+      if ra <> 0 then
+        v := (v shr ra) or (PByte(a + q + 8)^ shl (64 - ra));
+    end
+    else
+      v := RotGet(a, Bytes, i + oa);
+    if b <> 0 then
+    begin
+      q := w + qb;
+      if (q >= 0) and (q + 9 <= Bytes) then
+      begin
+        u := PInt(b + q)^;
+        if rb <> 0 then
+          u := (u shr rb) or (PByte(b + q + 8)^ shl (64 - rb));
+      end
+      else
+        u := RotGet(b, Bytes, i + ob);
+      v := v or u;
+    end;
+    if (ring >= i) and (ring < i + 64) and (c = 1) then
+      v := v or (1 shl (ring - i));
+    if fill < i + 64 then
+    begin
+      if fill <= i then
+        v := -1
+      else
+        v := v or (-1 shl (fill - i));
+    end;
+    if w + 8 <= Bytes then
+      PInt(Dst + w)^ := v
+    else
+      for k := 0 to Bytes - w - 1 do
+        PByte(Dst + w + k)^ := Byte((v shr (k * 8)) and 255);
+    w := w + 8;
+  end;
+  if (N > 0) and ((kind = 1) or (kind = 2)) then
+  begin
+    if kind = 1 then
+      Result := RotBit(Dst, 0)
+    else
+      Result := RotBit(Dst, nb - 1);
+  end;
+end;
+
+end.

@@ -1,0 +1,377 @@
+{$mode objfpc}{$H+}
+
+{ The clock. Go keeps this in time; here it is a unit of its own, over
+  clock_gettime and nothing else: no libc, no timezone files.
+
+  Two clocks, and they are not the same. The wall clock says what time
+  it is and can jump, backwards even, when somebody or something sets
+  it. The monotonic clock says nothing about the date and never goes
+  back, so it is the one to measure with. NowUnix and NowNanos read the
+  first; Monotonic and Since read the second.
+
+  Dates are UTC. Turning a moment into a date uses the civil-from-days
+  algorithm (Howard Hinnant's), which is arithmetic and needs no table,
+  and DateToUnix is its inverse, so the two round-trip. }
+unit pastime;
+
+interface
+
+const
+  NsPerUs = 1000;
+  NsPerMs = 1000000;
+  NsPerSec = 1000000000;
+  SecPerMin = 60;
+  SecPerHour = 3600;
+  SecPerDay = 86400;
+
+type
+  { A moment taken apart, UTC. Wday is 0 for Sunday. }
+  TDate = record
+    Year: Integer;
+    Month: Integer;
+    Day: Integer;
+    Hour: Integer;
+    Minute: Integer;
+    Second: Integer;
+    Nano: Integer;
+    Wday: Integer;
+    Yday: Integer;
+  end;
+
+{ The wall clock. }
+function NowUnix: Int64;
+function NowNanos: Int64;
+
+{ The clock that never goes back, for measuring. }
+function Monotonic: Int64;
+function Since(T0: Int64): Int64;
+
+{ Nanoseconds, said in the units people use. }
+function Millis(Ns: Int64): Int64;
+function Micros(Ns: Int64): Int64;
+function SecsOf(Ns: Int64): Int64;
+function Duration(Ns: Int64): string;
+
+{ A moment and a date, both ways. }
+function UnixToDate(T: Int64): TDate;
+function DateToUnix(Y, M, D, HH, MM, SS: Integer): Int64;
+function IsLeap(Y: Integer): Boolean;
+function DaysInMonth(Y, M: Integer): Integer;
+
+{ Written out, as an ISO date is written. }
+function DateStr(T: Int64): string;
+function TimeStr(T: Int64): string;
+function StampStr(T: Int64): string;
+function DateOf(const D: TDate): string;
+function TimeOf(const D: TDate): string;
+function StampOf(const D: TDate): string;
+function WeekdayName(W: Integer): string;
+function MonthName(M: Integer): string;
+
+implementation
+
+uses
+  paslinux;
+
+const
+  ClockRealtime = 0;
+  ClockMonotonic = 1;
+
+{ The call is the same on both machines, the number is not: 228 on
+  amd64 and 113 on arm64. Amd64 is the compiler constant that says
+  which one is being built. }
+function NrClockGettime: Int64;
+begin
+  if Amd64 = 0 then
+    Result := 113
+  else
+    Result := 228;
+end;
+
+{ Both clocks come from the same call; the answer is two words, the
+  seconds and the nanoseconds inside that second. }
+function ReadClock(Which: Int64; out Secs, Nsecs: Int64): Boolean;
+var
+  ts: array[0..1] of Int64;
+  r: Int64;
+begin
+  ts[0] := 0;
+  ts[1] := 0;
+  r := Sys2(NrClockGettime, Which, Int64(@ts[0]));
+  Secs := ts[0];
+  Nsecs := ts[1];
+  Result := r = 0;
+end;
+
+function NowUnix: Int64;
+var
+  s, n: Int64;
+begin
+  Result := 0;
+  if ReadClock(ClockRealtime, s, n) then
+    Result := s;
+end;
+
+function NowNanos: Int64;
+var
+  s, n: Int64;
+begin
+  Result := 0;
+  if ReadClock(ClockRealtime, s, n) then
+    Result := s * NsPerSec + n;
+end;
+
+function Monotonic: Int64;
+var
+  s, n: Int64;
+begin
+  Result := 0;
+  if ReadClock(ClockMonotonic, s, n) then
+    Result := s * NsPerSec + n;
+end;
+
+function Since(T0: Int64): Int64;
+begin
+  Result := Monotonic - T0;
+end;
+
+function Millis(Ns: Int64): Int64;
+begin
+  Result := Ns div NsPerMs;
+end;
+
+function Micros(Ns: Int64): Int64;
+begin
+  Result := Ns div NsPerUs;
+end;
+
+function SecsOf(Ns: Int64): Int64;
+begin
+  Result := Ns div NsPerSec;
+end;
+
+function Digits(V: Int64; N: Integer): string;
+var
+  s: string;
+begin
+  s := '';
+  if V < 0 then
+    V := 0;
+  repeat
+    s := Char(48 + (V mod 10)) + s;
+    V := V div 10;
+  until V = 0;
+  while Length(s) < N do
+    s := '0' + s;
+  Result := s;
+end;
+
+{ A length of time in the largest unit that keeps it readable, the way
+  a person would say it. }
+function Duration(Ns: Int64): string;
+var
+  neg: Boolean;
+begin
+  neg := Ns < 0;
+  if neg then
+    Ns := -Ns;
+  if Ns < 1000 then
+    Result := Digits(Ns, 1) + 'ns'
+  else if Ns < NsPerMs then
+    Result := Digits(Ns div NsPerUs, 1) + '.' +
+      Digits((Ns mod NsPerUs) div 100, 1) + 'us'
+  else if Ns < NsPerSec then
+    Result := Digits(Ns div NsPerMs, 1) + '.' +
+      Digits((Ns mod NsPerMs) div 100000, 1) + 'ms'
+  else if Ns < 60 * Int64(NsPerSec) then
+    Result := Digits(Ns div NsPerSec, 1) + '.' +
+      Digits((Ns mod NsPerSec) div 100000000, 1) + 's'
+  else
+    Result := Digits(Ns div (60 * Int64(NsPerSec)), 1) + 'm' +
+      Digits((Ns div NsPerSec) mod 60, 2) + 's';
+  if neg then
+    Result := '-' + Result;
+end;
+
+function IsLeap(Y: Integer): Boolean;
+begin
+  Result := ((Y mod 4) = 0) and (((Y mod 100) <> 0) or ((Y mod 400) = 0));
+end;
+
+function DaysInMonth(Y, M: Integer): Integer;
+begin
+  Result := 31;
+  if (M = 4) or (M = 6) or (M = 9) or (M = 11) then
+    Result := 30
+  else if M = 2 then
+  begin
+    Result := 28;
+    if IsLeap(Y) then
+      Result := 29;
+  end;
+end;
+
+{ Days from 1970-01-01 to that date, and back. The year is shifted so
+  that it starts in March: then the length of February, leap year and
+  all, falls at the end and the month lengths follow a straight line. }
+function DaysFromCivil(Y, M, D: Integer): Int64;
+var
+  era, yoe, doy, doe: Int64;
+  y2: Int64;
+begin
+  y2 := Y;
+  if M <= 2 then
+    y2 := y2 - 1;
+  if y2 >= 0 then
+    era := y2 div 400
+  else
+    era := (y2 - 399) div 400;
+  yoe := y2 - era * 400;
+  if M > 2 then
+    doy := (153 * (M - 3) + 2) div 5 + D - 1
+  else
+    doy := (153 * (M + 9) + 2) div 5 + D - 1;
+  doe := yoe * 365 + yoe div 4 - yoe div 100 + doy;
+  Result := era * 146097 + doe - 719468;
+end;
+
+procedure CivilFromDays(Z: Int64; out Y, M, D: Integer);
+var
+  era, doe, yoe, doy, mp, y2: Int64;
+begin
+  Z := Z + 719468;
+  if Z >= 0 then
+    era := Z div 146097
+  else
+    era := (Z - 146096) div 146097;
+  doe := Z - era * 146097;
+  yoe := (doe - doe div 1460 + doe div 36524 - doe div 146096) div 365;
+  y2 := yoe + era * 400;
+  doy := doe - (365 * yoe + yoe div 4 - yoe div 100);
+  mp := (5 * doy + 2) div 153;
+  D := doy - (153 * mp + 2) div 5 + 1;
+  if mp < 10 then
+    M := mp + 3
+  else
+    M := mp - 9;
+  if M <= 2 then
+    y2 := y2 + 1;
+  Y := y2;
+end;
+
+function UnixToDate(T: Int64): TDate;
+var
+  days, secs: Int64;
+  y, m, d: Integer;
+begin
+  days := T div SecPerDay;
+  secs := T mod SecPerDay;
+  { div truncates towards zero, so a moment before 1970 needs the day
+    it fell in, not the one after. }
+  if secs < 0 then
+  begin
+    secs := secs + SecPerDay;
+    days := days - 1;
+  end;
+  CivilFromDays(days, y, m, d);
+  Result.Year := y;
+  Result.Month := m;
+  Result.Day := d;
+  Result.Hour := secs div SecPerHour;
+  Result.Minute := (secs mod SecPerHour) div SecPerMin;
+  Result.Second := secs mod SecPerMin;
+  Result.Nano := 0;
+  { 1970-01-01 was a Thursday, which is 4. }
+  Result.Wday := (days + 4) mod 7;
+  if Result.Wday < 0 then
+    Result.Wday := Result.Wday + 7;
+  Result.Yday := days - DaysFromCivil(y, 1, 1) + 1;
+end;
+
+function DateToUnix(Y, M, D, HH, MM, SS: Integer): Int64;
+begin
+  Result := DaysFromCivil(Y, M, D) * SecPerDay + Int64(HH) * SecPerHour +
+    Int64(MM) * SecPerMin + SS;
+end;
+
+function DateOf(const D: TDate): string;
+begin
+  Result := Digits(D.Year, 4) + '-' + Digits(D.Month, 2) + '-' +
+    Digits(D.Day, 2);
+end;
+
+function TimeOf(const D: TDate): string;
+begin
+  Result := Digits(D.Hour, 2) + ':' + Digits(D.Minute, 2) + ':' +
+    Digits(D.Second, 2);
+end;
+
+function StampOf(const D: TDate): string;
+begin
+  Result := DateOf(D) + ' ' + TimeOf(D);
+end;
+
+function DateStr(T: Int64): string;
+begin
+  Result := DateOf(UnixToDate(T));
+end;
+
+function TimeStr(T: Int64): string;
+begin
+  Result := TimeOf(UnixToDate(T));
+end;
+
+function StampStr(T: Int64): string;
+begin
+  Result := StampOf(UnixToDate(T));
+end;
+
+function WeekdayName(W: Integer): string;
+begin
+  Result := '';
+  if W = 0 then
+    Result := 'Sunday'
+  else if W = 1 then
+    Result := 'Monday'
+  else if W = 2 then
+    Result := 'Tuesday'
+  else if W = 3 then
+    Result := 'Wednesday'
+  else if W = 4 then
+    Result := 'Thursday'
+  else if W = 5 then
+    Result := 'Friday'
+  else if W = 6 then
+    Result := 'Saturday';
+end;
+
+function MonthName(M: Integer): string;
+begin
+  Result := '';
+  if M = 1 then
+    Result := 'January'
+  else if M = 2 then
+    Result := 'February'
+  else if M = 3 then
+    Result := 'March'
+  else if M = 4 then
+    Result := 'April'
+  else if M = 5 then
+    Result := 'May'
+  else if M = 6 then
+    Result := 'June'
+  else if M = 7 then
+    Result := 'July'
+  else if M = 8 then
+    Result := 'August'
+  else if M = 9 then
+    Result := 'September'
+  else if M = 10 then
+    Result := 'October'
+  else if M = 11 then
+    Result := 'November'
+  else if M = 12 then
+    Result := 'December';
+end;
+
+end.

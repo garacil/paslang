@@ -1,0 +1,940 @@
+{$mode objfpc}{$H+}
+
+unit paslex;
+
+interface
+
+type
+  TTokKind = (
+    tkEof,
+    tkIdent,
+    tkString,
+    tkInt,
+    tkProgram,
+    tkPas,
+    tkChan,
+    tkSelect,
+    tkSend,
+    tkRecv,
+    tkClose,
+    tkMakeChan,
+    tkMap,
+    tkLock,
+    tkOnce,
+    tkMutex,
+    tkRWMutex,
+    tkWaitGroup,
+    tkCond,
+    tkReadLn,
+    tkSleep,
+    tkTry,
+    tkExcept,
+    tkRaise,
+    tkUnit,
+    tkPackage,
+    tkSafe,
+    tkContains,
+    tkInterface,
+    tkImplementation,
+    tkUses,
+    tkBegin,
+    tkEnd,
+    tkWriteLn,
+    tkWrite,
+    tkVar,
+    tkConst,
+    tkType,
+    tkRecord,
+    tkClass,
+    tkConstructor,
+    tkDestructor,
+    tkVirtual,
+    tkProperty,
+    tkRead,
+    tkObject,
+    tkArray,
+    tkStringKw,
+    tkNil,
+    tkNew,
+    tkInteger,
+    tkBoolean,
+    tkIf,
+    tkThen,
+    tkElse,
+    tkWhile,
+    tkDo,
+    tkFor,
+    tkTo,
+    tkDownto,
+    tkRepeat,
+    tkUntil,
+    tkCase,
+    tkOf,
+    tkProcedure,
+    tkFunction,
+    tkGeneric,
+    tkSpecialize,
+    tkSet,
+    tkIn,
+    tkIs,
+    tkAs,
+    tkWith,
+    tkShlKw,
+    tkShrKw,
+    tkExit,
+    tkHalt,
+    tkFinally,
+    tkInitialization,
+    tkFinalization,
+    tkInherited,
+    tkBreak,
+    tkContinue,
+    tkAsm,
+    tkOut,
+    tkDivKw,
+    tkModKw,
+    tkAnd,
+    tkOr,
+    tkNot,
+    tkXor,
+    tkTrue,
+    tkFalse,
+    tkSemi,
+    tkComma,
+    tkColon,
+    tkAssign,
+    tkLParen,
+    tkRParen,
+    tkLBrack,
+    tkRBrack,
+    tkCaret,
+    tkAt,
+    tkDot,
+    tkDotDot,
+    tkPlus,
+    tkMinus,
+    tkStar,
+    tkSlash,
+    tkEq,
+    tkNe,
+    tkLt,
+    tkLe,
+    tkGt,
+    tkGe,
+    tkChar,
+    tkReal,
+    tkTree,
+    tkHeap,
+    tkStore
+  );
+
+  TToken = record
+    Kind: TTokKind;
+    Lexeme: string;
+    IntVal: Int64;
+    Line, Col: LongInt;
+  end;
+
+  TLexer = class
+  private
+    FSrc: string;
+    FPos: SizeInt;
+    FLine, FCol: LongInt;
+    FCh: Char;
+    FDefs: array of string;
+    procedure Advance;
+    procedure SkipSpace;
+    function Defined(const N: string): Boolean;
+    procedure Define(const N: string; On: Boolean);
+    function Directive(out Arg: string): string;
+    procedure SkipBranch(AtElse: Boolean);
+    function Peek: Char;
+    function Ident: TToken;
+    function Number: TToken;
+    function StrLit: TToken;
+  public
+    function NextSolid: Char;
+    constructor Create(const ASrc: string);
+    procedure SetTarget(Arm: Boolean);
+    function Next: TToken;
+    function BlankToLineEnd: Boolean;
+    function RawBlock: string;
+    function NextIsAsm: Boolean;
+  end;
+
+implementation
+
+uses
+  paslib, pasfmt;
+
+function IsAlpha(C: Char): Boolean;
+begin
+  Result := ((C >= 'A') and (C <= 'Z')) or ((C >= 'a') and (C <= 'z')) or (C = '_');
+end;
+
+function IsDigit(C: Char): Boolean;
+begin
+  Result := (C >= '0') and (C <= '9');
+end;
+
+function IsHex(C: Char): Boolean;
+begin
+  Result := ((C >= '0') and (C <= '9')) or
+    ((C >= 'A') and (C <= 'F')) or
+    ((C >= 'a') and (C <= 'f'));
+end;
+
+constructor TLexer.Create(const ASrc: string);
+begin
+  inherited Create;
+  FSrc := ASrc;
+  FPos := 0;
+  FLine := 1;
+  FCol := 0;
+  FDefs := nil;
+  SetTarget(False);
+  Advance;
+end;
+
+{ The names the ifdef directive knows (P106, 1.0.121): PASLANG, the system, and the
+  processor under FPC's own names, so one source builds with either
+  compiler and on either machine. }
+procedure TLexer.SetTarget(Arm: Boolean);
+begin
+  Define('CPUX86_64', False);
+  Define('CPUAMD64', False);
+  Define('CPUAARCH64', False);
+  Define('PASLANG', True);
+  Define('LINUX', True);
+  Define('UNIX', True);
+  Define('CPU64', True);
+  if Arm then
+    Define('CPUAARCH64', True)
+  else
+  begin
+    Define('CPUX86_64', True);
+    Define('CPUAMD64', True);
+  end;
+end;
+
+function TLexer.Defined(const N: string): Boolean;
+var
+  i: SizeInt;
+begin
+  Result := False;
+  for i := 0 to High(FDefs) do
+    if FDefs[i] = ToLower(N) then
+    begin
+      Result := True;
+      Exit;
+    end;
+end;
+
+procedure TLexer.Define(const N: string; On: Boolean);
+var
+  i, cnt: SizeInt;
+  u: string;
+begin
+  u := ToLower(N);
+  for i := 0 to High(FDefs) do
+    if FDefs[i] = u then
+    begin
+      if not On then
+        FDefs[i] := '';
+      Exit;
+    end;
+  if On then
+  begin
+    cnt := Length(FDefs);
+    SetLength(FDefs, cnt + 1);
+    FDefs[cnt] := u;
+  end;
+end;
+
+{ A directive at FCh = '$' inside braces: its word in lower case and its
+  first argument, the closing brace eaten. }
+function TLexer.Directive(out Arg: string): string;
+begin
+  Result := '';
+  Arg := '';
+  Advance;
+  while (FCh <> #0) and (FCh <> '}') and IsAlpha(FCh) do
+  begin
+    Result := Result + FCh;
+    Advance;
+  end;
+  Result := ToLower(Result);
+  while (FCh = ' ') or (FCh = #9) do
+    Advance;
+  while (FCh <> #0) and (FCh <> '}') and (IsAlpha(FCh) or ((FCh >= '0') and (FCh <= '9'))) do
+  begin
+    Arg := Arg + FCh;
+    Advance;
+  end;
+  while (FCh <> #0) and (FCh <> '}') do
+    Advance;
+  if FCh = '}' then
+    Advance;
+end;
+
+{ The branch not taken, skipped to its else directive (when AtElse) or
+  its endif, the ones of the branches inside counted. }
+procedure TLexer.SkipBranch(AtElse: Boolean);
+var
+  depth: LongInt;
+  d, arg: string;
+begin
+  depth := 0;
+  while FCh <> #0 do
+  begin
+    if (FCh = '{') and (Peek = '$') then
+    begin
+      Advance;
+      d := Directive(arg);
+      if (d = 'ifdef') or (d = 'ifndef') or (d = 'if') then
+        Inc(depth)
+      else if d = 'endif' then
+      begin
+        if depth = 0 then
+          Exit;
+        Dec(depth);
+      end
+      else if (d = 'else') and (depth = 0) and AtElse then
+        Exit;
+    end
+    else
+      Advance;
+  end;
+end;
+
+{ The rest of the line is blanks or a // comment (P106, 1.0.127: an asm
+  header ends its line). Nothing is read. }
+function TLexer.BlankToLineEnd: Boolean;
+var
+  i: SizeInt;
+begin
+  i := FPos;
+  while (i <= Length(FSrc)) and ((FSrc[i] = ' ') or (FSrc[i] = #9) or (FSrc[i] = #13)) do
+    Inc(i);
+  Result := (i > Length(FSrc)) or (FSrc[i] = #10) or
+    ((FSrc[i] = '/') and (i < Length(FSrc)) and (FSrc[i + 1] = '/'));
+end;
+
+{ An asm block's lines (1.0.127), not read as tokens: from the line after
+  the header to the one whose first word is end, where the lexer stops,
+  so the next token is that end. }
+function TLexer.RawBlock: string;
+var
+  i: SizeInt;
+  w: string;
+begin
+  Result := '';
+  while (FCh <> #10) and (FCh <> #0) do
+    Advance;
+  if FCh = #10 then
+    Advance;
+  while FCh <> #0 do
+  begin
+    i := FPos;
+    while (i <= Length(FSrc)) and ((FSrc[i] = ' ') or (FSrc[i] = #9)) do
+      Inc(i);
+    if (i + 2 <= Length(FSrc)) and (ToLower(Copy(FSrc, i, 3)) = 'end') and
+      ((i + 3 > Length(FSrc)) or not (IsAlpha(FSrc[i + 3]) or IsDigit(FSrc[i + 3]) or
+      (FSrc[i + 3] = ':'))) then
+    begin
+      while FPos < i do
+        Advance;
+      Exit;
+    end;
+    w := '';
+    while (FCh <> #10) and (FCh <> #0) do
+    begin
+      w := w + FCh;
+      Advance;
+    end;
+    Result := Result + w + #10;
+    if FCh = #10 then
+      Advance;
+  end;
+end;
+
+{ The next word, past blanks and line ends, is asm and a blank: the block
+  for another machine beside this one (1.0.127). Nothing is read. }
+function TLexer.NextIsAsm: Boolean;
+var
+  i: SizeInt;
+begin
+  i := FPos;
+  while (i <= Length(FSrc)) and ((FSrc[i] = ' ') or (FSrc[i] = #9) or (FSrc[i] = #10) or
+    (FSrc[i] = #13)) do
+    Inc(i);
+  { asm or its synonym assembler (1.0.136: assembler arm64 beside
+    assembler amd64 said "asm arm64 alone") }
+  Result := (i + 3 <= Length(FSrc)) and (ToLower(Copy(FSrc, i, 3)) = 'asm') and
+    ((FSrc[i + 3] = ' ') or (FSrc[i + 3] = #9));
+  if not Result then
+    Result := (i + 9 <= Length(FSrc)) and (ToLower(Copy(FSrc, i, 9)) = 'assembler') and
+      ((FSrc[i + 9] = ' ') or (FSrc[i + 9] = #9));
+end;
+
+procedure TLexer.Advance;
+begin
+  if FPos >= Length(FSrc) then
+  begin
+    FCh := #0;
+    Exit;
+  end;
+  Inc(FPos);
+  FCh := FSrc[FPos];
+  if FCh = #10 then
+  begin
+    Inc(FLine);
+    FCol := 0;
+  end
+  else
+    Inc(FCol);
+end;
+
+function TLexer.Peek: Char;
+begin
+  if FPos >= Length(FSrc) then
+    Result := #0
+  else
+    Result := FSrc[FPos + 1];
+end;
+
+{ The first character after the current token that is not a space or a
+  line end (1.0.131): var sleep: says sleep is a reserved word. }
+function TLexer.NextSolid: Char;
+var
+  p: SizeInt;
+begin
+  Result := FCh;
+  p := FPos;
+  while (Result = ' ') or (Result = #9) or (Result = #10) or (Result = #13) do
+  begin
+    Inc(p);
+    if p > Length(FSrc) then
+    begin
+      Result := #0;
+      Exit;
+    end;
+    Result := FSrc[p];
+  end;
+end;
+
+procedure TLexer.SkipSpace;
+var
+  d, arg: string;
+begin
+  while True do
+  begin
+    while (FCh = ' ') or (FCh = #9) or (FCh = #10) or (FCh = #13) do
+      Advance;
+    if (FCh = '/') and (Peek = '/') then
+    begin
+      while (FCh <> #0) and (FCh <> #10) do
+        Advance;
+      Continue;
+    end;
+    if (FCh = '{') and (Peek = '$') then
+    begin
+      Advance;
+      d := Directive(arg);
+      if (d = 'ifdef') or (d = 'ifndef') then
+      begin
+        if Defined(arg) <> (d = 'ifdef') then
+          SkipBranch(True);
+      end
+      else if d = 'else' then
+        SkipBranch(False)
+      else if d = 'define' then
+        Define(arg, True)
+      else if d = 'undef' then
+        Define(arg, False);
+      Continue;
+    end;
+    if FCh = '{' then
+    begin
+      Advance;
+      while (FCh <> #0) and (FCh <> '}') do
+        Advance;
+      if FCh = '}' then
+        Advance;
+      Continue;
+    end;
+    Break;
+  end;
+end;
+
+function Keyword(const S: string): TTokKind;
+var
+  u: string;
+begin
+  u := ToLower(S);
+  if u = 'program' then
+    Result := tkProgram
+  else if u = 'pas' then
+    Result := tkPas
+  else if u = 'chan' then
+    Result := tkChan
+  else if u = 'select' then
+    Result := tkSelect
+  else if u = 'send' then
+    Result := tkSend
+  else if u = 'recv' then
+    Result := tkRecv
+  else if u = 'close' then
+    Result := tkClose
+  else if u = 'makechan' then
+    Result := tkMakeChan
+  else if u = 'map' then
+    Result := tkMap
+  else if u = 'tree' then
+    Result := tkTree
+  else if u = 'heap' then
+    Result := tkHeap
+  else if u = 'store' then
+    Result := tkStore
+  else if u = 'lock' then
+    Result := tkLock
+  else if u = 'once' then
+    Result := tkOnce
+  else if u = 'mutex' then
+    Result := tkMutex
+  else if u = 'rwmutex' then
+    Result := tkRWMutex
+  else if u = 'waitgroup' then
+    Result := tkWaitGroup
+  else if u = 'cond' then
+    Result := tkCond
+  else if u = 'readln' then
+    Result := tkReadLn
+  else if u = 'sleep' then
+    Result := tkSleep
+  else if u = 'try' then
+    Result := tkTry
+  else if u = 'except' then
+    Result := tkExcept
+  else if u = 'raise' then
+    Result := tkRaise
+  else if u = 'unit' then
+    Result := tkUnit
+  else if u = 'package' then
+    Result := tkPackage
+  else if u = 'safe' then
+    Result := tkSafe
+  else if u = 'contains' then
+    Result := tkContains
+  else if u = 'interface' then
+    Result := tkInterface
+  else if u = 'implementation' then
+    Result := tkImplementation
+  else if u = 'uses' then
+    Result := tkUses
+  else if u = 'begin' then
+    Result := tkBegin
+  else if u = 'end' then
+    Result := tkEnd
+  else if u = 'writeln' then
+    Result := tkWriteLn
+  else if u = 'write' then
+    Result := tkWrite
+  else if u = 'var' then
+    Result := tkVar
+  else if u = 'const' then
+    Result := tkConst
+  else if u = 'type' then
+    Result := tkType
+  else if u = 'record' then
+    Result := tkRecord
+  else if u = 'class' then
+    Result := tkClass
+  else if u = 'constructor' then
+    Result := tkConstructor
+  else if u = 'destructor' then
+    Result := tkDestructor
+  else if u = 'virtual' then
+    Result := tkVirtual
+  else if u = 'property' then
+    Result := tkProperty
+  else if u = 'read' then
+    Result := tkRead
+  else if u = 'object' then
+    Result := tkObject
+  else if u = 'array' then
+    Result := tkArray
+  else if u = 'string' then
+    Result := tkStringKw
+  else if u = 'nil' then
+    Result := tkNil
+  else if u = 'new' then
+    Result := tkNew
+  else if u = 'integer' then
+    Result := tkInteger
+  else if u = 'boolean' then
+    Result := tkBoolean
+  else if u = 'if' then
+    Result := tkIf
+  else if u = 'then' then
+    Result := tkThen
+  else if u = 'else' then
+    Result := tkElse
+  else if u = 'while' then
+    Result := tkWhile
+  else if u = 'do' then
+    Result := tkDo
+  else if u = 'for' then
+    Result := tkFor
+  else if u = 'to' then
+    Result := tkTo
+  else if u = 'downto' then
+    Result := tkDownto
+  else if u = 'repeat' then
+    Result := tkRepeat
+  else if u = 'until' then
+    Result := tkUntil
+  else if u = 'case' then
+    Result := tkCase
+  else if u = 'of' then
+    Result := tkOf
+  else if u = 'procedure' then
+    Result := tkProcedure
+  else if u = 'function' then
+    Result := tkFunction
+  else if u = 'generic' then
+    Result := tkGeneric
+  else if u = 'specialize' then
+    Result := tkSpecialize
+  else if u = 'set' then
+    Result := tkSet
+  else if u = 'in' then
+    Result := tkIn
+  else if u = 'is' then
+    Result := tkIs
+  else if u = 'as' then
+    Result := tkAs
+  else if u = 'with' then
+    Result := tkWith
+  else if u = 'shl' then
+    Result := tkShlKw
+  else if u = 'shr' then
+    Result := tkShrKw
+  else if u = 'exit' then
+    Result := tkExit
+  else if u = 'halt' then
+    Result := tkHalt
+  else if u = 'finally' then
+    Result := tkFinally
+  else if u = 'initialization' then
+    Result := tkInitialization
+  else if u = 'finalization' then
+    Result := tkFinalization
+  else if u = 'inherited' then
+    Result := tkInherited
+  else if u = 'break' then
+    Result := tkBreak
+  else if u = 'continue' then
+    Result := tkContinue
+  else if (u = 'asm') or (u = 'assembler') then
+    Result := tkAsm
+  else if u = 'out' then
+    Result := tkOut
+  else if u = 'div' then
+    Result := tkDivKw
+  else if u = 'mod' then
+    Result := tkModKw
+  else if u = 'and' then
+    Result := tkAnd
+  else if u = 'or' then
+    Result := tkOr
+  else if u = 'not' then
+    Result := tkNot
+  else if u = 'xor' then
+    Result := tkXor
+  else if u = 'true' then
+    Result := tkTrue
+  else if u = 'false' then
+    Result := tkFalse
+  else
+    Result := tkIdent;
+end;
+
+function TLexer.Ident: TToken;
+var
+  start: SizeInt;
+  startCol: LongInt;
+begin
+  start := FPos;
+  startCol := FCol;
+  while IsAlpha(FCh) or IsDigit(FCh) do
+    Advance;
+  Result := Default(TToken);
+  Result.Lexeme := Copy(FSrc, start, FPos - start);
+  Result.Kind := Keyword(Result.Lexeme);
+  Result.Line := FLine;
+  Result.Col := startCol;
+end;
+
+function TLexer.Number: TToken;
+var
+  start: SizeInt;
+  startCol: LongInt;
+  s, t: string;
+  bits: Int64;
+  isReal: Boolean;
+begin
+  start := FPos;
+  startCol := FCol;
+  isReal := False;
+  while IsDigit(FCh) do
+    Advance;
+  if (FCh = '.') and (Peek <> '.') then
+  begin
+    isReal := True;
+    Advance;
+    while IsDigit(FCh) do
+      Advance;
+  end;
+  if (FCh = 'e') or (FCh = 'E') then
+  begin
+    isReal := True;
+    Advance;
+    if (FCh = '+') or (FCh = '-') then
+      Advance;
+    if not IsDigit(FCh) then
+      Die('bad real at ' + IntToStr(FLine));
+    while IsDigit(FCh) do
+      Advance;
+  end;
+  s := Copy(FSrc, start, FPos - start);
+  Result := Default(TToken);
+  Result.Lexeme := s;
+  Result.Line := FLine;
+  Result.Col := startCol;
+  if isReal then
+  begin
+    { The nearest double, exactly (1.0.79): a subnormal was 0 and a
+      mantissa beyond 18 digits was rounded twice. }
+    bits := 0;
+    if not PasParseReal(s, bits) then
+      Die('bad real at ' + IntToStr(FLine));
+    Result.Kind := tkReal;
+    Result.IntVal := bits;
+  end
+  else
+  begin
+    Result.Kind := tkInt;
+    if not StrToInt64(s, Result.IntVal) then
+      Die('bad integer at ' + IntToStr(FLine));
+    { Past 2^63 - 1 the digits wrapped (1.0.136): 9223372036854775808
+      was -9223372036854775808 and 18446744073709551616 was 0. Exactly
+      2^63 goes through, for the minus the parser may read before it,
+      under its own name. }
+    start := 1;
+    while (start < Length(s)) and (s[start] = '0') do
+      start := start + 1;
+    t := Copy(s, start, Length(s) - start + 1);
+    if (Length(t) > 19) or ((Length(t) = 19) and (t > '9223372036854775808')) then
+      Die('constant ' + s + ' does not fit Integer at ' + IntToStr(FLine) + ':' +
+        IntToStr(startCol));
+    if t = '9223372036854775808' then
+      Result.Lexeme := t;
+  end;
+end;
+
+function TLexer.StrLit: TToken;
+var
+  startCol: LongInt;
+  buf: string;
+begin
+  startCol := FCol;
+  Advance;
+  buf := '';
+  while FCh <> #0 do
+  begin
+    if FCh = '''' then
+    begin
+      if Peek = '''' then
+      begin
+        buf := buf + '''';
+        Advance;
+        Advance;
+        Continue;
+      end;
+      Advance;
+      Break;
+    end;
+    buf := buf + FCh;
+    Advance;
+  end;
+  Result := Default(TToken);
+  Result.Kind := tkString;
+  Result.Lexeme := buf;
+  Result.Line := FLine;
+  Result.Col := startCol;
+end;
+
+function TLexer.Next: TToken;
+var
+  startCol: LongInt;
+  v, d: Int64;
+  nd: LongInt;
+  txt: string;
+  function Punct(K: TTokKind): TToken;
+  begin
+    Result := Default(TToken);
+    Result.Kind := K;
+    Result.Lexeme := FCh;
+    Result.Line := FLine;
+    Result.Col := FCol;
+    Advance;
+  end;
+begin
+  SkipSpace;
+  Result := Default(TToken);
+  Result.Line := FLine;
+  Result.Col := FCol;
+  if FCh = #0 then
+  begin
+    Result.Kind := tkEof;
+    Exit;
+  end;
+  if IsAlpha(FCh) then
+  begin
+    Result := Ident;
+    Exit;
+  end;
+  if IsDigit(FCh) then
+  begin
+    Result := Number;
+    Exit;
+  end;
+  if FCh = '''' then
+  begin
+    Result := StrLit;
+    Exit;
+  end;
+  if (FCh = '#') and IsDigit(Peek) then
+  begin
+    Advance;
+    Result := Number;
+    Result.Kind := tkChar;
+    Exit;
+  end;
+  if FCh = '$' then
+  begin
+    Advance;
+    startCol := FCol;
+    v := 0;
+    nd := 0;
+    txt := '$';
+    if not IsHex(FCh) then
+      Die('hex integer at ' + IntToStr(FLine));
+    while IsHex(FCh) do
+    begin
+      if (FCh >= '0') and (FCh <= '9') then
+        d := Ord(FCh) - Ord('0')
+      else if (FCh >= 'A') and (FCh <= 'F') then
+        d := Ord(FCh) - Ord('A') + 10
+      else
+        d := Ord(FCh) - Ord('a') + 10;
+      txt := txt + FCh;
+      { A hex constant is the word's bits, 16 digits at most (1.0.136):
+        a 17th dropped the first off the top, $10000000000000001 was 1. }
+      if (v <> 0) or (d <> 0) then
+        nd := nd + 1;
+      v := (v shl 4) or d;
+      Advance;
+    end;
+    if nd > 16 then
+      Die('constant ' + txt + ' does not fit Integer at ' + IntToStr(FLine) + ':' +
+        IntToStr(startCol));
+    Result := Default(TToken);
+    Result.Kind := tkInt;
+    Result.IntVal := v;
+    Result.Lexeme := '$';
+    Result.Line := FLine;
+    Result.Col := startCol;
+    Exit;
+  end;
+  if (FCh = '.') and (Peek = '.') then
+  begin
+    Result := Default(TToken);
+    Result.Kind := tkDotDot;
+    Result.Lexeme := '..';
+    Result.Line := FLine;
+    Result.Col := FCol;
+    Advance;
+    Advance;
+    Exit;
+  end;
+  if (FCh = ':') and (Peek = '=') then
+  begin
+    Result := Default(TToken);
+    Result.Kind := tkAssign;
+    Result.Lexeme := ':=';
+    Result.Line := FLine;
+    Result.Col := FCol;
+    Advance;
+    Advance;
+    Exit;
+  end;
+  if (FCh = '<') and (Peek = '>') then
+  begin
+    Result := Default(TToken);
+    Result.Kind := tkNe;
+    Result.Lexeme := '<>';
+    Result.Line := FLine;
+    Result.Col := FCol;
+    Advance;
+    Advance;
+    Exit;
+  end;
+  if (FCh = '<') and (Peek = '=') then
+  begin
+    Result := Default(TToken);
+    Result.Kind := tkLe;
+    Result.Lexeme := '<=';
+    Result.Line := FLine;
+    Result.Col := FCol;
+    Advance;
+    Advance;
+    Exit;
+  end;
+  if (FCh = '>') and (Peek = '=') then
+  begin
+    Result := Default(TToken);
+    Result.Kind := tkGe;
+    Result.Lexeme := '>=';
+    Result.Line := FLine;
+    Result.Col := FCol;
+    Advance;
+    Advance;
+    Exit;
+  end;
+  case FCh of
+    ';': Result := Punct(tkSemi);
+    ',': Result := Punct(tkComma);
+    ':': Result := Punct(tkColon);
+    '(': Result := Punct(tkLParen);
+    ')': Result := Punct(tkRParen);
+    '[': Result := Punct(tkLBrack);
+    ']': Result := Punct(tkRBrack);
+    '^': Result := Punct(tkCaret);
+    '@': Result := Punct(tkAt);
+    '%': Result := Punct(tkAt);
+    '.': Result := Punct(tkDot);
+    '+': Result := Punct(tkPlus);
+    '-': Result := Punct(tkMinus);
+    '*': Result := Punct(tkStar);
+    '/': Result := Punct(tkSlash);
+    '=': Result := Punct(tkEq);
+    '<': Result := Punct(tkLt);
+    '>': Result := Punct(tkGt);
+  else
+    Die('unexpected character at ' + IntToStr(FLine) + ':' + IntToStr(FCol));
+  end;
+end;
+
+end.

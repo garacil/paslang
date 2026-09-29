@@ -1,0 +1,148 @@
+{ P110: the store, a log-structured merge store on the native tree,
+  checked against a map of what was written: puts, deletes and puts
+  again; a crash (StoreAbandon leaves the log, drops the memtable) and
+  the recovery from the log; a log with a torn tail (junk appended
+  after the last record) cut off on open; StoreClose writing the
+  memtable as a run; enough writes for the log to flush by itself and
+  for the runs to be merged into one; keys with #0 and #255, the empty
+  key, the empty value, a value of 300 KB. On both machines and under
+  the collector's stress. }
+program store1;
+
+uses paslib;
+
+const
+  P = '/tmp/paslang-store1';
+
+var
+  db: store;
+  m: map[string] of string;
+  gone: map[string] of Integer;
+  k, v: string;
+  i, r, ok, bad, n: Integer;
+  fd: Int64;
+
+procedure Unlink(const Path: string);
+var
+  z: string;
+begin
+  z := Path + #0;
+  if Amd64 = 1 then
+    Syscall(87, Integer(@z[1]))
+  else
+    Syscall(35, -100, Integer(@z[1]), 0);
+end;
+
+function Val(I, Len: Integer): string;
+var
+  j: Integer;
+begin
+  SetLength(Result, Len);
+  for j := 1 to Len do
+    Result[j] := Char(((I * 31 + j * 7) and 255));
+end;
+
+procedure Check(const Tag: string);
+begin
+  ok := 0;
+  bad := 0;
+  for k, v in m do
+    if (k in db) and (StoreGet(db, k) = v) then
+      ok := ok + 1
+    else
+      bad := bad + 1;
+  for k, i in gone do
+    if (k in db) or (StoreGet(db, k) <> '') then
+      bad := bad + 1;
+  WriteLn(Tag, ' ', ok, ' ', bad, ' ', Length(gone));
+end;
+
+procedure Put(const Key, Value: string);
+begin
+  StorePut(db, Key, Value);
+  m[Key] := Value;
+  if Key in gone then
+    Delete(gone, Key);
+end;
+
+procedure Del(const Key: string);
+begin
+  StoreDelete(db, Key);
+  if Key in m then
+    Delete(m, Key);
+  gone[Key] := 1;
+end;
+
+begin
+  Unlink(P);
+  Unlink(P + '.wal');
+  Unlink(P + '.new');
+  New(m);
+  New(gone);
+  db := StoreOpen(P);
+  WriteLn('none' in db, ' ', StoreGet(db, 'none') = '');
+  for i := 1 to 3000 do
+    Put('k' + PasFmtInt(i, 0), Val(i, 10 + (i mod 50)));
+  Put('', 'empty key');
+  Put('empty value', '');
+  Put('bin' + #0 + #255 + 'x', 'binary');
+  Put('big', Val(7, 300000));
+  Check('put');
+  WriteLn('' in db, ' ', StoreGet(db, ''), ' ', 'empty value' in db, ' ', Length(StoreGet(db, 'big')));
+  { a crash: the log is on disk, the memtable is gone }
+  StoreSync(db);
+  StoreAbandon(db);
+  db := StoreOpen(P);
+  Check('crash1');
+  for i := 1 to 500 do
+    Del('k' + PasFmtInt(i * 6, 0));
+  for i := 1 to 200 do
+    Put('k' + PasFmtInt(i * 6, 0), 'again' + PasFmtInt(i, 0));
+  Del('big');
+  StoreSync(db);
+  StoreAbandon(db);
+  db := StoreOpen(P);
+  Check('crash2');
+  { a torn tail: junk after the last record is cut off }
+  StoreAbandon(db);
+  fd := FileAppend(P + '.wal');
+  FileWrite(fd, #7#0#0#0 + 'junk!');
+  FileClose(fd);
+  db := StoreOpen(P);
+  Check('torn');
+  { the memtable becomes a run; the log is empty after a close }
+  StoreClose(db);
+  WriteLn(FileSize(P + '.wal'));
+  db := StoreOpen(P);
+  Check('run1');
+  WriteLn('' in db, ' ', StoreGet(db, ''), ' ', 'big' in db);
+  { enough for the log to flush by itself and for the runs to be merged }
+  for r := 1 to 6 do
+  begin
+    for i := 1 to 700 do
+      Put('r' + PasFmtInt(r, 0) + '-' + PasFmtInt(i, 0), Val(r * 1000 + i, 2000));
+    for i := 1 to 100 do
+      Del('k' + PasFmtInt(i * 7 + r, 0));
+    for i := 1 to 50 do
+      Put('k' + PasFmtInt(i * 11 + r, 0), 'round' + PasFmtInt(r, 0));
+    StoreClose(db);
+    db := StoreOpen(P);
+    Check('round' + PasFmtInt(r, 0));
+  end;
+  n := 0;
+  for k, v in m do
+    n := n + Length(v);
+  WriteLn(Length(m), ' ', n, ' ', FileSize(P) div 1000000, ' ', FileSize(P) > n);
+  Put('big', Val(9, 300000));
+  Check('big');
+  StoreAbandon(db);
+  db := StoreOpen(P);
+  WriteLn(Length(StoreGet(db, 'big')), ' ', StoreGet(db, 'big') = Val(9, 300000));
+  Del('big');
+  StoreClose(db);
+  db := StoreOpen(P);
+  Check('end');
+  StoreClose(db);
+  Unlink(P);
+  Unlink(P + '.wal');
+end.

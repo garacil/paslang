@@ -1,0 +1,483 @@
+{$mode objfpc}{$H+}
+
+program paslangc;
+
+uses
+  paslib, paslex, pasparse, pasast, pasopt, pasemit, pasiface, pashelp;
+
+procedure DumpLex(const Src: string);
+var
+  lx: TLexer;
+  t: TToken;
+  n: LongInt;
+begin
+  lx := TLexer.Create(Src);
+  n := 0;
+  repeat
+    t := lx.Next;
+    WriteLn(IntToStr(n), ' k=', IntToStr(Ord(t.Kind)), ' [', t.Lexeme, '] @',
+      IntToStr(t.Line), ':', IntToStr(t.Col));
+    Inc(n);
+  until (t.Kind = tkEof) or (n > 40);
+  lx.Free;
+end;
+
+procedure AddPath(var Paths: TStrArray; const P: string);
+var
+  n: SizeInt;
+begin
+  n := Length(Paths);
+  SetLength(Paths, n + 1);
+  Paths[n] := P;
+end;
+
+{ The core units (pasroutines, pasmap, pashash, pastree, pasheap, pasfmt, pasquad) and the
+  library units live beside the compiler in
+  lib/paslang, and in lib/paslang/aarch64 for the arm64 target. }
+procedure AddInstalledLib(var Paths: TStrArray; ForArm: Boolean);
+var
+  exe, lib, env: string;
+begin
+  env := GetEnv('PASLANG_LIB');
+  if env <> '' then
+    AddPath(Paths, env);
+  if not ReadLink('/proc/self/exe', exe) then
+    Exit;
+  lib := JoinPath(DirName(DirName(exe)), 'lib/paslang');
+  if ForArm then
+    lib := JoinPath(lib, 'aarch64');
+  AddPath(Paths, lib);
+end;
+
+{$ifdef FPC}
+{$else}
+function ToolIsAarch64(const Path: string): Boolean;
+var
+  s: string;
+  mach: LongInt;
+begin
+  Result := False;
+  if not ReadPrefix(Path, 20, s) then
+    Exit;
+  if Length(s) < 20 then
+    Exit;
+  if (Ord(s[1]) <> 127) or (s[2] <> 'E') or (s[3] <> 'L') or (s[4] <> 'F') then
+    Exit;
+  mach := Ord(s[19]) + Ord(s[20]) * 256;
+  Result := mach = 183;
+end;
+{$endif}
+
+var
+  { -checkptr (P104): every pointer step and access held to its object. }
+  checkPtr: Boolean;
+  cpuSpec: string;    { -cpu: the processor the code is compiled for (P111) }
+  inlineMax: LongInt; { -inline: the largest routine put in place where it is called (P112) }
+  inlineArg: Int64;
+  cpuSet: Int64;
+  cpuErr: string;
+
+procedure Assemble(const SPath, OPath: string; arm: Boolean);
+var
+  asBin: string;
+  asArgs: array of string;
+begin
+  asArgs := nil;
+  if arm then
+  begin
+    asBin := '/usr/bin/aarch64-linux-gnu-as';
+    {$ifdef FPC}
+    {$else}
+    if Amd64 = 0 then
+    begin
+      asBin := '/usr/bin/as';
+      if not ToolIsAarch64(asBin) then
+        asBin := '/usr/bin/aarch64-linux-gnu-as';
+    end;
+    {$endif}
+    SetLength(asArgs, 4);
+    asArgs[0] := '-g';
+    asArgs[1] := '-o';
+    asArgs[2] := OPath;
+    asArgs[3] := SPath;
+  end
+  else
+  begin
+    asBin := '/usr/bin/as';
+    SetLength(asArgs, 5);
+    asArgs[0] := '--64';
+    asArgs[1] := '-g';
+    asArgs[2] := '-o';
+    asArgs[3] := OPath;
+    asArgs[4] := SPath;
+  end;
+  if Run(asBin, asArgs) <> 0 then
+    Die('as failed');
+end;
+
+{ The machine this compiler runs on, and what it has (P111). }
+function HostArm: Boolean;
+begin
+{$ifdef CPUAARCH64}
+  Result := True;
+{$else}
+  Result := False;
+{$endif}
+end;
+
+function NativeCpu: Int64;
+begin
+{$ifdef PASLANG}
+  Result := CpuFeatures;
+{$else}
+  Result := 0;
+{$endif}
+end;
+
+procedure CompileUnit(const SrcPath, OutBase: string; const UPath: TStrArray; arm: Boolean);
+var
+  src, asmText, sPath, oPath, piPath, piText, dir: string;
+  prog: TProgram;
+begin
+  if not ReadFile(SrcPath, src) then
+    Die('cannot read ' + SrcPath);
+  DieWhere := SrcPath;
+  prog := ParseSource(src, UPath, arm, cpuSet);
+  prog.SrcName := SrcPath;
+  prog.CheckPtr := checkPtr;
+  prog.InlineMax := inlineMax;
+  prog.Debug := DebugMode;
+  if not prog.IsUnit then
+    Die('package contains non-unit ' + SrcPath);
+  Optimize(prog);
+  if arm then
+    asmText := EmitArm64(prog)
+  else
+    asmText := EmitAmd64(prog);
+  DieWhere := '';
+  if not EnsureDir('build') then
+    Die('cannot create build/');
+  dir := DirName(OutBase);
+  if (dir <> '.') and (dir <> 'build') then
+    if not EnsureDir(dir) then
+      Die('cannot create ' + dir);
+  sPath := ChangeExt(OutBase, '.s');
+  oPath := ChangeExt(OutBase, '.o');
+  if not WriteFile(sPath, asmText) then
+    Die('cannot write ' + sPath);
+  Assemble(sPath, oPath, arm);
+  piPath := ChangeExt(oPath, '.pi');
+  piText := FormatIface(prog);
+  if not WriteFile(piPath, piText) then
+    Die('cannot write ' + piPath);
+end;
+
+var
+  srcPath, outPath, sPath, oPath, src, piPath, piText, topic: string;
+  installDir, pkgDir, uSrc, uBase, stamp, uname: string;
+  i: LongInt;
+  prog: TProgram;
+  asmText: string;
+  upath, fu, pkgPath: TStrArray;
+  compileOnly, doLex, arm: Boolean;
+  ldBin: string;
+  ldArgs: array of string;
+  ldPath: string;
+  u: SizeInt;
+begin
+  srcPath := '';
+  outPath := '';
+  installDir := '';
+  compileOnly := False;
+  doLex := False;
+  arm := False;
+  {$ifdef FPC}
+  {$else}
+  if Amd64 = 0 then
+    arm := True;
+  {$endif}
+  upath := nil;
+  fu := nil;
+  pkgPath := nil;
+  ldArgs := nil;
+  inlineMax := 40;
+  i := 1;
+  while i <= ParamCount do
+  begin
+    if ParamStr(i) = '-o' then
+    begin
+      Inc(i);
+      if i > ParamCount then
+        Die('missing argument for -o');
+      outPath := ParamStr(i);
+    end
+    else if ParamStr(i) = '-c' then
+      compileOnly := True
+    else if ParamStr(i) = '-checkptr' then
+      checkPtr := True
+    else if ParamStr(i) = '-inline-trace' then
+      InlineTrace := True
+    else if ParamStr(i) = '-debug' then
+    begin
+      { the debugger inside the executable (P118): the parser's flag, and
+        no routine put in place, so every line is where it was written }
+      DebugMode := True;
+      inlineMax := 0;
+    end
+    else if ParamStr(i) = '-inline' then
+    begin
+      Inc(i);
+      if i > ParamCount then
+        Die('missing argument for -inline');
+      if (not StrToInt64(ParamStr(i), inlineArg)) or (inlineArg < 0) or (inlineArg > 100000) then
+        Die('-inline ' + ParamStr(i) + ': a count from 0 to 100000 is wanted');
+      inlineMax := LongInt(inlineArg);
+    end
+    else if ParamStr(i) = '-cpu' then
+    begin
+      Inc(i);
+      if i > ParamCount then
+        Die('missing argument for -cpu');
+      cpuSpec := ParamStr(i);
+    end
+    else if ParamStr(i) = '-Fu' then
+    begin
+      Inc(i);
+      if i > ParamCount then
+        Die('missing argument for -Fu');
+      AddPath(fu, ParamStr(i));
+    end
+    else if ParamStr(i) = '-install' then
+    begin
+      Inc(i);
+      if i > ParamCount then
+        Die('missing argument for -install');
+      installDir := ParamStr(i);
+    end
+    else if (ParamStr(i) = '-v') or (ParamStr(i) = '--version') then
+    begin
+      PrintBanner;
+      Halt(0);
+    end
+    else if (ParamStr(i) = '-h') or (ParamStr(i) = '--help') then
+    begin
+      topic := '';
+      if ParamStr(i) = '-h' then
+        topic := 'short'
+      else if (i < ParamCount) and (Length(ParamStr(i + 1)) > 0) and
+        (ParamStr(i + 1)[1] <> '-') then
+      begin
+        topic := ParamStr(i + 1);
+        Inc(i);
+      end;
+      PrintBanner;
+      WriteLn('');
+      PrintHelp(topic);
+      Halt(0);
+    end
+    else if ParamStr(i) = '-target' then
+    begin
+      Inc(i);
+      if i > ParamCount then
+        Die('missing argument for -target');
+      if ParamStr(i) = 'arm64' then
+        arm := True
+      else if (ParamStr(i) = 'amd64') or (ParamStr(i) = 'intel64') then
+        arm := False
+      else
+        Die('unknown target ' + ParamStr(i));
+    end
+    else if ParamStr(i) = '--lex' then
+      doLex := True
+    else
+      srcPath := ParamStr(i);
+    Inc(i);
+  end;
+  if srcPath = '' then
+  begin
+    PrintBanner;
+    WriteLn('');
+    PrintHelp('short');
+    Halt(0);
+  end;
+  if not HasSuffix(srcPath, '.paslang') then
+    Die('source must be .paslang');
+  if not FileExists(srcPath) then
+    Die('cannot read ' + srcPath);
+
+  if not ReadFile(srcPath, src) then
+    Die('cannot read ' + srcPath);
+  if doLex then
+  begin
+    DumpLex(src);
+    Halt(0);
+  end;
+  for u := 0 to High(fu) do
+    AddPath(upath, fu[u]);
+  AddInstalledLib(upath, arm);
+  if arm then
+    AddPath(upath, 'build/a64');
+  AddPath(upath, 'build');
+  AddPath(upath, '.');
+  AddPath(upath, DirName(srcPath));
+  DieWhere := srcPath;
+  { The processor the code is compiled for (-cpu, P111): what this
+    machine has when the target is this machine, the base processor
+    when compiling across, unless -cpu says. }
+  if cpuSpec = '' then
+  begin
+    if arm = HostArm then
+      cpuSpec := 'native'
+    else
+      cpuSpec := 'base';
+  end;
+  cpuSet := CpuSetOf(cpuSpec, arm, NativeCpu, cpuErr);
+  if cpuErr <> '' then
+  begin
+    if arm then
+      Die('-cpu ' + cpuSpec + ': ' + cpuErr + ' is no feature of arm64 (base, native, max, v8.1, v8.2, crypto, or a name of CpuHas)')
+    else
+      Die('-cpu ' + cpuSpec + ': ' + cpuErr + ' is no feature of amd64 (base, native, max, v2, v3, v4, or a name of CpuHas)');
+  end;
+  prog := ParseSource(src, upath, arm, cpuSet);
+  prog.SrcName := srcPath;
+  prog.CheckPtr := checkPtr;
+  prog.InlineMax := inlineMax;
+  prog.Debug := DebugMode;
+  if not prog.IsPackage then
+    Optimize(prog);
+
+  if prog.IsPackage then
+  begin
+    if installDir = '' then
+      Die('package requires -install dir');
+    if not EnsureDir(installDir) then
+      Die('cannot create ' + installDir);
+    pkgDir := DirName(srcPath);
+    pkgPath := upath;
+    AddPath(pkgPath, pkgDir);
+    AddPath(pkgPath, installDir);
+    stamp := 'PASLANGPKG1' + #10 + 'NAME ' + ToLower(prog.Name) + #10 + 'VER 1' + #10;
+    for u := 0 to High(prog.UsesNames) do
+    begin
+      uname := ToLower(prog.UsesNames[u]);
+      uSrc := JoinPath(pkgDir, uname + '.paslang');
+      if not FileExists(uSrc) then
+        Die('missing package unit ' + uSrc);
+      if arm then
+      begin
+        if not EnsureDir('build') then
+          Die('cannot create build/');
+        if not EnsureDir('build/a64') then
+          Die('cannot create build/a64');
+        uBase := JoinPath('build/a64', uname);
+      end
+      else
+        uBase := JoinPath('build', uname);
+      CompileUnit(uSrc, uBase, pkgPath, arm);
+      if not CopyFile(ChangeExt(uBase, '.pi'), JoinPath(installDir, uname + '.pi')) then
+        Die('cannot install ' + uname + '.pi');
+      if not CopyFile(ChangeExt(uBase, '.o'), JoinPath(installDir, uname + '.o')) then
+        Die('cannot install ' + uname + '.o');
+      stamp := stamp + 'UNIT ' + uname + #10;
+    end;
+    if not WriteFile(JoinPath(installDir, ToLower(prog.Name) + '.pkg'), stamp) then
+      Die('cannot write package stamp');
+    Halt(0);
+  end;
+
+  if arm then
+    asmText := EmitArm64(prog)
+  else
+    asmText := EmitAmd64(prog);
+  DieWhere := '';
+
+  if not EnsureDir('build') then
+    Die('cannot create build/');
+  if outPath = '' then
+  begin
+    if prog.IsUnit then
+    begin
+      { An arm64 unit goes to build/a64, beside the arm64 core units,
+        so it never replaces the amd64 object of the same name. }
+      if arm then
+      begin
+        if not EnsureDir('build/a64') then
+          Die('cannot create build/a64');
+        outPath := JoinPath('build/a64', ToLower(prog.Name));
+      end
+      else
+        outPath := JoinPath('build', ToLower(prog.Name));
+    end
+    else
+      outPath := 'a.out';
+  end;
+  if DirName(outPath) = '.' then
+  begin
+    sPath := 'build/' + ChangeExt(BaseName(outPath), '.s');
+    oPath := 'build/' + ChangeExt(BaseName(outPath), '.o');
+  end
+  else
+  begin
+    if not EnsureDir(DirName(outPath)) then
+      Die('cannot create ' + DirName(outPath));
+    sPath := ChangeExt(outPath, '.s');
+    oPath := ChangeExt(outPath, '.o');
+  end;
+  if not WriteFile(sPath, asmText) then
+    Die('cannot write ' + sPath);
+  Assemble(sPath, oPath, arm);
+
+  if prog.IsUnit then
+  begin
+    piPath := ChangeExt(oPath, '.pi');
+    piText := FormatIface(prog);
+    if not WriteFile(piPath, piText) then
+      Die('cannot write ' + piPath);
+  end
+  else if not compileOnly then
+  begin
+    { Only the code the program reaches is linked (1.1.1): every
+      routine sits in a section of its own and its stack maps in one
+      linked to it; the script lays those maps inside pasgcmaps, between
+      the symbols the runtime reads, and --gc-sections drops the rest. }
+    ldPath := ChangeExt(oPath, '.ld');
+    if not WriteFile(ldPath,
+      'SECTIONS' + #10 + '{' + #10 + '  pasgcmaps :' + #10 + '  {' + #10 +
+      '    __start_pasgcmaps = .;' + #10 + '    KEEP(*(pasgcmaps))' + #10 +
+      '    *(pasgcmaps.*)' + #10 + '    __stop_pasgcmaps = .;' + #10 + '  }' + #10 +
+      '}' + #10 + 'INSERT AFTER .data;' + #10) then
+      Die('cannot write ' + ldPath);
+    ldArgs := nil;
+    SetLength(ldArgs, 6 + Length(prog.LinkObjs));
+    ldArgs[0] := '-o';
+    ldArgs[1] := outPath;
+    ldArgs[2] := '--gc-sections';
+    ldArgs[3] := '-T';
+    ldArgs[4] := ldPath;
+    ldArgs[5] := oPath;
+    for u := 0 to High(prog.LinkObjs) do
+    begin
+      if not FileExists(prog.LinkObjs[u]) then
+        Die('missing object ' + prog.LinkObjs[u]);
+      ldArgs[6 + u] := prog.LinkObjs[u];
+    end;
+    if arm then
+    begin
+      ldBin := '/usr/bin/aarch64-linux-gnu-ld';
+      {$ifdef FPC}
+      {$else}
+      if Amd64 = 0 then
+      begin
+        ldBin := '/usr/bin/ld';
+        if not ToolIsAarch64(ldBin) then
+          ldBin := '/usr/bin/aarch64-linux-gnu-ld';
+      end;
+      {$endif}
+    end
+    else
+      ldBin := '/usr/bin/ld';
+    if Run(ldBin, ldArgs) <> 0 then
+      Die('ld failed');
+  end;
+end.

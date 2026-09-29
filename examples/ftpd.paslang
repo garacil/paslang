@@ -1,0 +1,811 @@
+{ An FTP server and its client (P119): RFC 959 over TCP, the control
+  connection a line protocol and a passive data connection for each
+  listing or transfer, a routine per session, the files under the
+  directory it is given. Any user name and password are accepted.
+
+    ftpd [port] [dir]        serve (2121, the current directory) until killed
+    ftpd -client host port user pass ls | cat name | get name | put name
+                             a client: a listing, a file printed, a
+                             file fetched into the current directory,
+                             a file sent
+    ftpd -selftest [n]       n client sessions (2000 by default) in this
+                             process over a temporary directory: each
+                             logs in, makes a directory of its own,
+                             sends a file there, lists it, fetches it
+                             back and checks it, removes both, quits
+
+  The commands: USER, PASS, SYST, TYPE, PWD, CWD, CDUP, MKD, RMD, PASV,
+  EPSV, LIST, NLST, RETR, STOR, DELE, SIZE, NOOP, QUIT. make check runs
+  the self-test on both machines.
+
+  Passive mode opens a listening port and a connection for every
+  listing or transfer, and a closed connection keeps its port for a
+  minute (TIME_WAIT): on one address the kernel's ephemeral ports
+  (32768 to 60999) hold about five thousand sessions at once, not ten;
+  a server for more gives each address its own range. }
+program ftpd;
+
+uses pasnet, paslib;
+
+type
+  PSession = ^TSession;
+  TSession = record
+    Fd: Integer;
+    Root: string;             { the directory served }
+    Cwd: string;              { the current directory under it, '' for the root }
+    User: string;
+    LoggedIn: Boolean;
+    DataL: Integer;           { the listener of PASV, 0 for none }
+  end;
+
+var
+  stored, fetched, bad: Integer;   { the counters of the self-test }
+  done: WaitGroup;
+
+{ ---- small words ---- }
+
+function StrToIntDef(const S: string; Def: Integer): Integer;
+var
+  v, i: Integer;
+begin
+  v := 0;
+  if S = '' then
+  begin
+    Result := Def;
+    Exit;
+  end;
+  for i := 1 to Length(S) do
+  begin
+    if (S[i] < '0') or (S[i] > '9') then
+    begin
+      Result := Def;
+      Exit;
+    end;
+    v := v * 10 + Ord(S[i]) - 48;
+  end;
+  Result := v;
+end;
+
+function UpperOf(const S: string): string;
+var
+  i: Integer;
+begin
+  Result := S;
+  for i := 1 to Length(Result) do
+    if (Result[i] >= 'a') and (Result[i] <= 'z') then
+      Result[i] := Chr(Ord(Result[i]) - 32);
+end;
+
+{ The line without its CR: the protocol ends lines in CRLF. }
+function Trimmed(const S: string): string;
+begin
+  Result := S;
+  while (Result <> '') and ((Result[Length(Result)] = #13) or (Result[Length(Result)] = ' ')) do
+    SetLength(Result, Length(Result) - 1);
+end;
+
+{ The first word of S and the rest after the space. }
+procedure HeadRest(const S: string; out Head, Rest: string);
+var
+  i: Integer;
+begin
+  i := 1;
+  while (i <= Length(S)) and (S[i] <> ' ') do
+    i := i + 1;
+  Head := Copy(S, 1, i - 1);
+  while (i <= Length(S)) and (S[i] = ' ') do
+    i := i + 1;
+  Rest := Copy(S, i, Length(S) - i + 1);
+end;
+
+{ Whether Sub occurs in S. }
+function Has(const S, Sub: string): Boolean;
+var
+  i, j: Integer;
+begin
+  Result := False;
+  if (Sub = '') or (Length(Sub) > Length(S)) then
+    Exit;
+  for i := 1 to Length(S) - Length(Sub) + 1 do
+  begin
+    j := 1;
+    while (j <= Length(Sub)) and (S[i + j - 1] = Sub[j]) do
+      j := j + 1;
+    if j > Length(Sub) then
+    begin
+      Result := True;
+      Exit;
+    end;
+  end;
+end;
+
+function IsDir(const Path: string): Boolean;
+begin
+  Result := FileExists(Path + '/.');
+end;
+
+{ A path under the root from the client's word: absolute from the root
+  or relative to the current directory, . and .. resolved, never above
+  the root. '' is the root itself. }
+function Under(S: PSession; const Arg: string): string;
+var
+  parts: array of string;
+  p, piece: string;
+  i, n: Integer;
+begin
+  if (Arg <> '') and (Arg[1] = '/') then
+    p := Arg
+  else if S^.Cwd = '' then
+    p := Arg
+  else
+    p := S^.Cwd + '/' + Arg;
+  parts := nil;
+  piece := '';
+  for i := 1 to Length(p) + 1 do
+  begin
+    if (i > Length(p)) or (p[i] = '/') then
+    begin
+      if piece = '..' then
+      begin
+        if Length(parts) > 0 then
+          SetLength(parts, Length(parts) - 1);
+      end
+      else if (piece <> '') and (piece <> '.') then
+      begin
+        SetLength(parts, Length(parts) + 1);
+        parts[High(parts)] := piece;
+      end;
+      piece := '';
+    end
+    else
+      piece := piece + p[i];
+  end;
+  Result := '';
+  n := Length(parts);
+  for i := 0 to n - 1 do
+    if i = 0 then
+      Result := parts[i]
+    else
+      Result := Result + '/' + parts[i];
+end;
+
+function RealPath(S: PSession; const Rel: string): string;
+begin
+  if Rel = '' then
+    Result := S^.Root
+  else
+    Result := S^.Root + '/' + Rel;
+end;
+
+procedure RemoveFile(const Path: string);
+var
+  z: string;
+begin
+  z := Path + #0;
+  if Amd64 = 1 then
+    Syscall(87, Integer(@z[1]))
+  else
+    Syscall(35, -100, Integer(@z[1]), 0);
+end;
+
+procedure RemoveDir(const Path: string);
+var
+  z: string;
+begin
+  z := Path + #0;
+  if Amd64 = 1 then
+    Syscall(84, Integer(@z[1]))
+  else
+    Syscall(35, -100, Integer(@z[1]), 512);
+end;
+
+{ Everything a data connection brings until its end. }
+function ReadAll(D: Integer): string;
+var
+  piece: string;
+begin
+  Result := '';
+  while True do
+  begin
+    piece := TcpRead(D, 65536);
+    if piece = '' then
+      Break;
+    Result := Result + piece;
+  end;
+end;
+
+{ ---- the server ---- }
+
+procedure Reply(S: PSession; const Text: string);
+begin
+  TcpWrite(S^.Fd, Text + #13#10);
+end;
+
+{ A listing in the form clients expect, one file a line. The lines are
+  gathered and joined once: a directory of thousands of files listed by
+  thousands of sessions must not copy a growing string for each. }
+function Listing(S: PSession; const Rel: string; NamesOnly: Boolean): string;
+var
+  names, name, full, dir: string;
+  lines: array of string;
+  i, j, n, total: Integer;
+begin
+  Result := '';
+  dir := RealPath(S, Rel);
+  names := ListDir(dir);
+  lines := nil;
+  total := 0;
+  i := 1;
+  while i <= Length(names) do
+  begin
+    j := i;
+    while (j <= Length(names)) and (names[j] <> #10) do
+      j := j + 1;
+    name := Copy(names, i, j - i);
+    i := j + 1;
+    if name = '' then
+      Continue;
+    if NamesOnly then
+      name := name + #13#10
+    else
+    begin
+      full := dir + '/' + name;
+      if IsDir(full) then
+        name := 'drwxr-xr-x 1 paslang paslang        0 Jan  1 00:00 ' + name + #13#10
+      else
+        name := '-rw-r--r-- 1 paslang paslang ' + IntToStr(FileSize(full)) +
+          ' Jan  1 00:00 ' + name + #13#10;
+    end;
+    SetLength(lines, Length(lines) + 1);
+    lines[High(lines)] := name;
+    total := total + Length(name);
+  end;
+  SetLength(Result, total);
+  n := 1;
+  for i := 0 to High(lines) do
+  begin
+    Move(lines[i][1], Result[n], Length(lines[i]));
+    n := n + Length(lines[i]);
+  end;
+end;
+
+{ The passive data connection: a listener on a port the kernel picks,
+  told to the client in the form the command asks for; the transfer
+  command that follows accepts the one connection. }
+procedure Passive(S: PSession; Extended: Boolean);
+var
+  host, local: string;
+  port, i: Integer;
+begin
+  if S^.DataL > 0 then
+    TcpClose(S^.DataL);
+  S^.DataL := TcpListenAt('', 0, 1);
+  if S^.DataL < 0 then
+  begin
+    S^.DataL := 0;
+    Reply(S, '425 cannot open a data port');
+    Exit;
+  end;
+  port := TcpPort(S^.DataL);
+  if Extended then
+  begin
+    Reply(S, '229 Entering Extended Passive Mode (|||' + IntToStr(port) + '|)');
+    Exit;
+  end;
+  { the address the client reached us at, in the dotted form }
+  local := TcpLocal(S^.Fd);
+  i := Length(local);
+  while (i > 0) and (local[i] <> ':') do
+    i := i - 1;
+  host := Copy(local, 1, i - 1);
+  if (host = '') or (host[1] = '[') then
+    host := '127.0.0.1';
+  for i := 1 to Length(host) do
+    if host[i] = '.' then
+      host[i] := ',';
+  Reply(S, '227 Entering Passive Mode (' + host + ',' + IntToStr(port div 256) + ',' +
+    IntToStr(port mod 256) + ')');
+end;
+
+{ The connection of the transfer, or 0 with the refusal sent. }
+function DataConn(S: PSession): Integer;
+begin
+  if S^.DataL = 0 then
+  begin
+    Reply(S, '425 use PASV first');
+    Result := 0;
+    Exit;
+  end;
+  Reply(S, '150 opening the data connection');
+  Result := TcpAccept(S^.DataL);
+  TcpClose(S^.DataL);
+  S^.DataL := 0;
+  if Result < 0 then
+  begin
+    Reply(S, '425 no data connection');
+    Result := 0;
+  end;
+end;
+
+procedure Session(C: Integer; const Root: string);
+var
+  s: TSession;
+  buf, line, cmd, arg, rel, data: string;
+  d: Integer;
+begin
+  s.Fd := C;
+  s.Root := Root;
+  s.Cwd := '';
+  s.User := '';
+  s.LoggedIn := False;
+  s.DataL := 0;
+  buf := '';
+  Reply(@s, '220 paslang ftpd ready');
+  while TcpReadLine(C, buf, line) do
+  begin
+    HeadRest(Trimmed(line), cmd, arg);
+    cmd := UpperOf(cmd);
+    if cmd = 'USER' then
+    begin
+      s.User := arg;
+      Reply(@s, '331 password, please');
+    end
+    else if cmd = 'PASS' then
+    begin
+      s.LoggedIn := True;
+      Reply(@s, '230 logged in as ' + s.User);
+    end
+    else if cmd = 'QUIT' then
+    begin
+      Reply(@s, '221 bye');
+      Break;
+    end
+    else if cmd = 'NOOP' then
+      Reply(@s, '200 ok')
+    else if cmd = 'SYST' then
+      Reply(@s, '215 UNIX Type: L8')
+    else if not s.LoggedIn then
+      Reply(@s, '530 log in first')
+    else if cmd = 'TYPE' then
+      Reply(@s, '200 type ' + arg)
+    else if cmd = 'PWD' then
+      Reply(@s, '257 "/' + s.Cwd + '" is the current directory')
+    else if (cmd = 'CWD') or (cmd = 'CDUP') then
+    begin
+      if cmd = 'CDUP' then
+        rel := Under(@s, '..')
+      else
+        rel := Under(@s, arg);
+      if IsDir(RealPath(@s, rel)) then
+      begin
+        s.Cwd := rel;
+        Reply(@s, '250 now in /' + rel);
+      end
+      else
+        Reply(@s, '550 no such directory');
+    end
+    else if cmd = 'PASV' then
+      Passive(@s, False)
+    else if cmd = 'EPSV' then
+      Passive(@s, True)
+    else if (cmd = 'LIST') or (cmd = 'NLST') then
+    begin
+      rel := Under(@s, arg);
+      if not IsDir(RealPath(@s, rel)) then
+        Reply(@s, '550 no such directory')
+      else
+      begin
+        d := DataConn(@s);
+        if d > 0 then
+        begin
+          TcpWrite(d, Listing(@s, rel, cmd = 'NLST'));
+          TcpClose(d);
+          Reply(@s, '226 listing sent');
+        end;
+      end;
+    end
+    else if cmd = 'RETR' then
+    begin
+      rel := Under(@s, arg);
+      if (rel = '') or not ReadFile(RealPath(@s, rel), data) then
+        Reply(@s, '550 no such file')
+      else
+      begin
+        d := DataConn(@s);
+        if d > 0 then
+        begin
+          TcpWrite(d, data);
+          TcpClose(d);
+          Reply(@s, '226 file sent');
+        end;
+      end;
+    end
+    else if cmd = 'STOR' then
+    begin
+      rel := Under(@s, arg);
+      if rel = '' then
+        Reply(@s, '553 a file name, please')
+      else
+      begin
+        d := DataConn(@s);
+        if d > 0 then
+        begin
+          data := ReadAll(d);
+          TcpClose(d);
+          if WriteFile(RealPath(@s, rel), data) then
+            Reply(@s, '226 file stored')
+          else
+            Reply(@s, '550 cannot write ' + arg);
+        end;
+      end;
+    end
+    else if cmd = 'MKD' then
+    begin
+      rel := Under(@s, arg);
+      if (rel = '') or IsDir(RealPath(@s, rel)) then
+        Reply(@s, '550 cannot make ' + arg)
+      else if EnsureDir(RealPath(@s, rel)) then
+        Reply(@s, '257 "/' + rel + '" made')
+      else
+        Reply(@s, '550 cannot make ' + arg);
+    end
+    else if cmd = 'RMD' then
+    begin
+      rel := Under(@s, arg);
+      if (rel = '') or not IsDir(RealPath(@s, rel)) then
+        Reply(@s, '550 no such directory')
+      else
+      begin
+        RemoveDir(RealPath(@s, rel));
+        if IsDir(RealPath(@s, rel)) then
+          Reply(@s, '550 not empty')
+        else
+          Reply(@s, '250 removed');
+      end;
+    end
+    else if cmd = 'DELE' then
+    begin
+      rel := Under(@s, arg);
+      if (rel = '') or not FileExists(RealPath(@s, rel)) then
+        Reply(@s, '550 no such file')
+      else
+      begin
+        RemoveFile(RealPath(@s, rel));
+        Reply(@s, '250 deleted');
+      end;
+    end
+    else if cmd = 'SIZE' then
+    begin
+      rel := Under(@s, arg);
+      if (rel = '') or not FileExists(RealPath(@s, rel)) then
+        Reply(@s, '550 no such file')
+      else
+        Reply(@s, '213 ' + IntToStr(FileSize(RealPath(@s, rel))));
+    end
+    else
+      Reply(@s, '502 ' + cmd + ' is not a command here');
+  end;
+  if s.DataL > 0 then
+    TcpClose(s.DataL);
+  TcpClose(C);
+end;
+
+procedure Listen(L: Integer; const Root: string);
+var
+  c: Integer;
+begin
+  while True do
+  begin
+    c := TcpAccept(L);
+    if c < 0 then
+      Break;
+    pas Session(c, Root);
+  end;
+end;
+
+{ ---- the client ---- }
+
+{ The reply to a command: its lines up to the last one of the code,
+  the code given back; 0 when the connection ends. }
+function Answer(C: Integer; var Buf: string; out Text: string): Integer;
+var
+  line: string;
+begin
+  Result := 0;
+  Text := '';
+  while TcpReadLine(C, Buf, line) do
+  begin
+    line := Trimmed(line);
+    Text := Text + line + #10;
+    if (Length(line) >= 4) and (line[4] = ' ') then
+    begin
+      Result := StrToIntDef(Copy(line, 1, 3), 0);
+      Exit;
+    end;
+  end;
+end;
+
+function Ask(C: Integer; var Buf: string; const Cmd: string; out Text: string): Integer;
+begin
+  TcpWrite(C, Cmd + #13#10);
+  Result := Answer(C, Buf, Text);
+end;
+
+{ PASV, and a connection to the port its reply names: h1,h2,h3,h4,p1,p2. }
+function OpenData(C: Integer; var Buf: string; const Host: string): Integer;
+var
+  text, num: string;
+  i, k, port: Integer;
+  parts: array[0..5] of Integer;
+begin
+  Result := -1;
+  if Ask(C, Buf, 'PASV', text) <> 227 then
+    Exit;
+  i := 1;
+  while (i <= Length(text)) and (text[i] <> '(') do
+    i := i + 1;
+  i := i + 1;
+  for k := 0 to 5 do
+  begin
+    num := '';
+    while (i <= Length(text)) and (text[i] >= '0') and (text[i] <= '9') do
+    begin
+      num := num + text[i];
+      i := i + 1;
+    end;
+    parts[k] := StrToIntDef(num, 0);
+    i := i + 1;
+  end;
+  port := parts[4] * 256 + parts[5];
+  Result := TcpConnectTo(Host, port);
+end;
+
+{ The client of the command line: prints every reply. }
+procedure Client(const Host: string; Port: Integer; const User, Pass, Cmd, Name: string);
+var
+  c, d, code: Integer;
+  buf, text, data: string;
+begin
+  c := TcpConnectTo(Host, Port);
+  if c < 0 then
+  begin
+    WriteLn('ftpd: cannot connect to ', Host, ' port ', Port);
+    Halt(1);
+  end;
+  buf := '';
+  Answer(c, buf, text);
+  Write(text);
+  Ask(c, buf, 'USER ' + User, text);
+  Write(text);
+  if Ask(c, buf, 'PASS ' + Pass, text) <> 230 then
+  begin
+    Write(text);
+    Halt(1);
+  end;
+  Write(text);
+  if (Cmd = 'ls') or (Cmd = 'cat') or (Cmd = 'get') then
+  begin
+    d := OpenData(c, buf, Host);
+    if d < 0 then
+    begin
+      WriteLn('ftpd: no data connection');
+      Halt(1);
+    end;
+    if Cmd = 'ls' then
+      code := Ask(c, buf, 'LIST', text)
+    else
+      code := Ask(c, buf, 'RETR ' + Name, text);
+    Write(text);
+    if code <> 150 then
+      Halt(1);
+    data := ReadAll(d);
+    TcpClose(d);
+    if Cmd = 'get' then
+    begin
+      if WriteFile(BaseName(Name), data) then
+        WriteLn(Length(data), ' bytes into ', BaseName(Name))
+      else
+        WriteLn('ftpd: cannot write ', BaseName(Name));
+    end
+    else
+      Write(data);
+    Answer(c, buf, text);
+    Write(text);
+  end
+  else if Cmd = 'put' then
+  begin
+    if not ReadFile(Name, data) then
+    begin
+      WriteLn('ftpd: cannot read ', Name);
+      Halt(1);
+    end;
+    d := OpenData(c, buf, Host);
+    if d < 0 then
+    begin
+      WriteLn('ftpd: no data connection');
+      Halt(1);
+    end;
+    code := Ask(c, buf, 'STOR ' + BaseName(Name), text);
+    Write(text);
+    if code <> 150 then
+      Halt(1);
+    TcpWrite(d, data);
+    TcpClose(d);
+    Answer(c, buf, text);
+    Write(text);
+  end
+  else
+    WriteLn('ftpd: ls, cat name, get name or put name');
+  Ask(c, buf, 'QUIT', text);
+  Write(text);
+  TcpClose(c);
+end;
+
+{ ---- the self-test ---- }
+
+{ A connection that has said its greeting, or -1: the greeting is read
+  with a deadline and a new connection tried when it does not come. A
+  burst of connections past the kernel's SYN backlog is answered with
+  SYN cookies, and one whose last ACK meets a full accept queue is
+  dropped with nothing kept to retry it: the client holds a connection
+  the server never had, and where the server speaks first both would
+  wait for ever (termd has the same). }
+function Greeted(Port: Integer; var Buf: string): Integer;
+var
+  k, c: Integer;
+  text: string;
+begin
+  Result := -1;
+  for k := 1 to 5 do
+  begin
+    c := TcpConnectTo('127.0.0.1', Port);
+    if c >= 0 then
+    begin
+      Buf := TcpReadDeadline(c, 512, 3000);
+      if (Buf <> '') and (Answer(c, Buf, text) = 220) then
+      begin
+        Result := c;
+        Exit;
+      end;
+      TcpClose(c);
+    end;
+  end;
+end;
+
+{ One session: log in, make a directory and go there, store a file,
+  list, fetch it back and compare, remove the file and the directory. }
+procedure TestClient(Port, Id: Integer);
+var
+  c, d: Integer;
+  buf, text, name, sub, body, back: string;
+  ok: Boolean;
+begin
+  ok := False;
+  buf := '';
+  c := Greeted(Port, buf);
+  if c >= 0 then
+  begin
+    name := 'f' + IntToStr(Id) + '.txt';
+    sub := 'd' + IntToStr(Id);
+    body := 'hello from session ' + IntToStr(Id) + #10;
+    body := body + body + body + body;
+    ok := (Ask(c, buf, 'USER test', text) = 331) and
+      (Ask(c, buf, 'PASS x', text) = 230) and (Ask(c, buf, 'MKD ' + sub, text) = 257) and
+      (Ask(c, buf, 'CWD ' + sub, text) = 250) and
+      (Ask(c, buf, 'PWD', text) = 257) and (Copy(text, 1, 6 + Length(sub)) = '257 "/' + sub);
+    if ok then
+    begin
+      d := OpenData(c, buf, '127.0.0.1');
+      ok := (d >= 0) and (Ask(c, buf, 'STOR ' + name, text) = 150);
+      if ok then
+      begin
+        TcpWrite(d, body);
+        TcpClose(d);
+        ok := Answer(c, buf, text) = 226;
+      end;
+    end;
+    if ok then
+      AtomicAdd(@stored, 1);
+    if ok then
+    begin
+      d := OpenData(c, buf, '127.0.0.1');
+      ok := (d >= 0) and (Ask(c, buf, 'NLST', text) = 150);
+      if ok then
+      begin
+        back := ReadAll(d);
+        TcpClose(d);
+        ok := (Answer(c, buf, text) = 226) and Has(back, name + #13#10);
+      end;
+    end;
+    if ok then
+    begin
+      d := OpenData(c, buf, '127.0.0.1');
+      ok := (d >= 0) and (Ask(c, buf, 'RETR ' + name, text) = 150);
+      if ok then
+      begin
+        back := ReadAll(d);
+        TcpClose(d);
+        ok := (Answer(c, buf, text) = 226) and (back = body);
+      end;
+    end;
+    if ok then
+      AtomicAdd(@fetched, 1);
+    if ok then
+      ok := (Ask(c, buf, 'DELE ' + name, text) = 250) and (Ask(c, buf, 'CDUP', text) = 250) and
+        (Ask(c, buf, 'RMD ' + sub, text) = 250);
+    Ask(c, buf, 'QUIT', text);
+    TcpClose(c);
+  end;
+  if not ok then
+    AtomicAdd(@bad, 1);
+  done.Done;
+end;
+
+procedure SelfTest(N: Integer);
+var
+  l, i, lim: Integer;
+  dir: string;
+begin
+  lim := RaiseFdLimit;
+  if lim < 8 * N + 64 then
+    N := (lim - 64) div 8;
+  l := TcpListen(0);
+  if l < 0 then
+  begin
+    WriteLn('ftpd: cannot listen');
+    Halt(1);
+  end;
+  dir := '/tmp/paslang-ftpd-' + IntToStr(TcpPort(l));
+  if not EnsureDir(dir) then
+  begin
+    WriteLn('ftpd: cannot make ', dir);
+    Halt(1);
+  end;
+  pas Listen(l, dir);
+  done.Add(N);
+  for i := 1 to N do
+    pas TestClient(TcpPort(l), i);
+  done.Wait;
+  RemoveDir(dir);
+  WriteLn(N, ' sessions, ', stored, ' stored, ', fetched, ' fetched, ', bad, ' bad');
+  if (stored <> N) or (fetched <> N) or (bad <> 0) then
+    Halt(1);
+  Halt(0);                { the server routine parks for ever: end without waiting for it }
+end;
+
+var
+  port, l: Integer;
+  root: string;
+begin
+  if (ParamCount >= 1) and (ParamStr(1) = '-selftest') then
+  begin
+    if ParamCount >= 2 then
+      SelfTest(StrToIntDef(ParamStr(2), 2000))
+    else
+      SelfTest(2000);
+    Exit;
+  end;
+  if (ParamCount >= 6) and (ParamStr(1) = '-client') then
+  begin
+    if ParamCount >= 7 then
+      Client(ParamStr(2), StrToIntDef(ParamStr(3), 21), ParamStr(4), ParamStr(5), ParamStr(6), ParamStr(7))
+    else
+      Client(ParamStr(2), StrToIntDef(ParamStr(3), 21), ParamStr(4), ParamStr(5), ParamStr(6), '');
+    Exit;
+  end;
+  port := 2121;
+  if ParamCount >= 1 then
+    port := StrToIntDef(ParamStr(1), 2121);
+  root := '.';
+  if ParamCount >= 2 then
+    root := ParamStr(2);
+  RaiseFdLimit;
+  l := TcpListenAt('', port, 1024);
+  if l < 0 then
+  begin
+    WriteLn('ftpd: cannot listen on port ', port);
+    Halt(1);
+  end;
+  WriteLn('ftpd: listening on port ', TcpPort(l), ', serving ', root);
+  Listen(l, root);
+end.

@@ -1,0 +1,4058 @@
+{$mode objfpc}{$H+}
+
+{ The hash words of the language (P111): Md5, Sha1, Sha224, Sha256,
+  Sha384, Sha512, Sha3_224, Sha3_256, Sha3_384, Sha3_512, the HMAC of
+  each of the first six, Crc32, Crc32c, Adler32, Fnv1a32, Fnv1a64,
+  Murmur3, SipHash, Hex, and the Merkle words on Sha256. Each algorithm
+  is written here as its standard writes it (RFC 1321, FIPS 180-4,
+  FIPS 202, RFC 2104, RFC 1952, RFC 3720, RFC 1950, MurmurHash3 and
+  SipHash-2-4 as their authors published them, RFC 9162), in Pascal
+  with its rounds written out (a loop only over the blocks), and the
+  block routines of SHA-1, SHA-256, SHA-512 and the CRCs have a second
+  body on the processor's own instructions, in asm blocks written after
+  Go 1.23's crypto/sha1, sha256, sha512 and hash/crc32 assembly for
+  each machine (docs/ref/go1.23) and read against the Intel SDM and the
+  Arm ARM (docs/ref/asm): SHA-1 and SHA-256 on SHA-NI (amd64) and on
+  FEAT_SHA1 and FEAT_SHA256 (arm64), SHA-512 on FEAT_SHA512 (arm64;
+  amd64's SHA512 extension has no processor here to answer for it, so
+  the Pascal rounds serve there), CRC32C on SSE4.2's crc32 and on
+  FEAT_CRC32, CRC32 on PCLMULQDQ folding and on FEAT_CRC32.
+
+  Each word that has such a body is exported twice, XxxCpu on the
+  processor's instructions and XxxBase in Pascal: the
+  compiler calls one or the other by -cpu, and the program tests
+  nothing at run time; PASLANG_CPU=base no longer reaches here. A
+  digest is a string of its bytes; Hex writes one out. This unit is
+  written by scripts/hashgen.py from its template (the rounds are
+  written out by it, the arm64 kernels come through
+  scripts/asm_from_go.py); the text here is the source the compiler
+  reads, and the script is run again after a change. }
+unit pashash;
+
+interface
+
+function PasHex(const S: string): string;
+function PasMd5(const S: string): string;
+function PasSha1Cpu(const S: string): string;
+function PasSha1Base(const S: string): string;
+function PasSha224Cpu(const S: string): string;
+function PasSha224Base(const S: string): string;
+function PasSha256Cpu(const S: string): string;
+function PasSha256Base(const S: string): string;
+function PasSha384Cpu(const S: string): string;
+function PasSha384Base(const S: string): string;
+function PasSha512Cpu(const S: string): string;
+function PasSha512Base(const S: string): string;
+function PasSha3(const S: string; Bits: Integer): string;
+function PasHmacCpu(Alg: Integer; const Key, Msg: string): string;
+function PasHmacBase(Alg: Integer; const Key, Msg: string): string;
+function PasCrc32Cpu(const S: string; Crc: Integer): Integer;
+function PasCrc32Base(const S: string; Crc: Integer): Integer;
+function PasCrc32cCpu(const S: string; Crc: Integer): Integer;
+function PasCrc32cBase(const S: string; Crc: Integer): Integer;
+function PasAdler32(const S: string; Adler: Integer): Integer;
+function PasFnv1a32(const S: string): Integer;
+function PasFnv1a64(const S: string): Integer;
+function PasMurmur3(const S: string; Seed: Integer): Integer;
+function PasSipHash(const S: string; K0, K1: Integer): Integer;
+function PasMerkleRootCpu(const Leaves: array of string): string;
+function PasMerkleRootBase(const Leaves: array of string): string;
+function PasMerkleProofCpu(const Leaves: array of string; Index: Integer): string;
+function PasMerkleProofBase(const Leaves: array of string; Index: Integer): string;
+function PasMerkleCheckCpu(const Leaf: string; Index, Count: Integer; const Proof, Root: string): Boolean;
+function PasMerkleCheckBase(const Leaf: string; Index, Count: Integer; const Proof, Root: string): Boolean;
+
+implementation
+
+const
+  { FIPS 180-4, 4.2.2: the first 32 bits of the fractional parts of
+    the cube roots of the first 64 primes, for the SHA-256 kernels }
+
+  K256: array[0..63] of UInt32 = (
+    $428a2f98, $71374491, $b5c0fbcf, $e9b5dba5, $3956c25b, $59f111f1, $923f82a4, $ab1c5ed5,
+    $d807aa98, $12835b01, $243185be, $550c7dc3, $72be5d74, $80deb1fe, $9bdc06a7, $c19bf174,
+    $e49b69c1, $efbe4786, $0fc19dc6, $240ca1cc, $2de92c6f, $4a7484aa, $5cb0a9dc, $76f988da,
+    $983e5152, $a831c66d, $b00327c8, $bf597fc7, $c6e00bf3, $d5a79147, $06ca6351, $14292967,
+    $27b70a85, $2e1b2138, $4d2c6dfc, $53380d13, $650a7354, $766a0abb, $81c2c92e, $92722c85,
+    $a2bfe8a1, $a81a664b, $c24b8b70, $c76c51a3, $d192e819, $d6990624, $f40e3585, $106aa070,
+    $19a4c116, $1e376c08, $2748774c, $34b0bcb5, $391c0cb3, $4ed8aa4a, $5b9cca4f, $682e6ff3,
+    $748f82ee, $78a5636f, $84c87814, $8cc70208, $90befffa, $a4506ceb, $bef9a3f7, $c67178f2);
+  { FIPS 180-4, 4.2.3: the same of the first 80 primes, 64 bits, for the
+    SHA-512 kernel }
+  K512: array[0..79] of Integer = (
+    $428a2f98d728ae22, $7137449123ef65cd, $b5c0fbcfec4d3b2f, $e9b5dba58189dbbc,
+    $3956c25bf348b538, $59f111f1b605d019, $923f82a4af194f9b, $ab1c5ed5da6d8118,
+    $d807aa98a3030242, $12835b0145706fbe, $243185be4ee4b28c, $550c7dc3d5ffb4e2,
+    $72be5d74f27b896f, $80deb1fe3b1696b1, $9bdc06a725c71235, $c19bf174cf692694,
+    $e49b69c19ef14ad2, $efbe4786384f25e3, $0fc19dc68b8cd5b5, $240ca1cc77ac9c65,
+    $2de92c6f592b0275, $4a7484aa6ea6e483, $5cb0a9dcbd41fbd4, $76f988da831153b5,
+    $983e5152ee66dfab, $a831c66d2db43210, $b00327c898fb213f, $bf597fc7beef0ee4,
+    $c6e00bf33da88fc2, $d5a79147930aa725, $06ca6351e003826f, $142929670a0e6e70,
+    $27b70a8546d22ffc, $2e1b21385c26c926, $4d2c6dfc5ac42aed, $53380d139d95b3df,
+    $650a73548baf63de, $766a0abb3c77b2a8, $81c2c92e47edaee6, $92722c851482353b,
+    $a2bfe8a14cf10364, $a81a664bbc423001, $c24b8b70d0f89791, $c76c51a30654be30,
+    $d192e819d6ef5218, $d69906245565a910, $f40e35855771202a, $106aa07032bbd1b8,
+    $19a4c116b8d2d0c8, $1e376c085141ab53, $2748774cdf8eeb99, $34b0bcb5e19b48a8,
+    $391c0cb3c5c95a63, $4ed8aa4ae3418acb, $5b9cca4f7763e373, $682e6ff3d6b2b8a3,
+    $748f82ee5defb2fc, $78a5636f43172f60, $84c87814a1f0ab72, $8cc702081a6439ec,
+    $90befffa23631e28, $a4506cebde82bde9, $bef9a3f7b2c67915, $c67178f2e372532b,
+    $ca273eceea26619c, $d186b8c721c0c207, $eada7dd6cde0eb1e, $f57d4f7fee6ed178,
+    $06f067aa72176fba, $0a637dc5a2c898a6, $113f9804bef90dae, $1b710b35131c471b,
+    $28db77f523047d84, $32caab7b40c72493, $3c9ebe0a15c9bebc, $431d67c49c100d4c,
+    $4cc5d4becb3e42b6, $597f299cfc657e2a, $5fcb6fab3ad6faec, $6c44198c4a475817);
+  { FIPS 202, 3.2.5: the round constants of Keccak-f[1600] }
+  KeccakRC: array[0..23] of Integer = (
+    $0000000000000001, $0000000000008082, $800000000000808a, $8000000080008000,
+    $000000000000808b, $0000000080000001, $8000000080008081, $8000000000008009,
+    $000000000000008a, $0000000000000088, $0000000080008009, $000000008000000a,
+    $000000008000808b, $800000000000008b, $8000000000008089, $8000000000008003,
+    $8000000000008002, $8000000000000080, $000000000000800a, $800000008000000a,
+    $8000000080008081, $8000000000008080, $0000000080000001, $8000000080008008);
+
+  { FIPS 180-4, 5.3: the initial hash values }
+  H256: array[0..7] of UInt32 = ($6a09e667, $bb67ae85, $3c6ef372, $a54ff53a,
+    $510e527f, $9b05688c, $1f83d9ab, $5be0cd19);
+  H224: array[0..7] of UInt32 = ($c1059ed8, $367cd507, $3070dd17, $f70e5939,
+    $ffc00b31, $68581511, $64f98fa7, $befa4fa4);
+  H512: array[0..7] of Integer = ($6a09e667f3bcc908, $bb67ae8584caa73b,
+    $3c6ef372fe94f82b, $a54ff53a5f1d36f1, $510e527fade682d1, $9b05688c2b3e6c1f,
+    $1f83d9abfb41bd6b, $5be0cd19137e2179);
+  H384: array[0..7] of Integer = ($cbbb9d5dc1059ed8, $629a292a367cd507,
+    $9159015a3070dd17, $152fecd8f70e5939, $67332667ffc00b31, $8eb44a8768581511,
+    $db0c2e0d64f98fa7, $47b5481dbefa4fa4);
+  { FIPS 180-4, 4.2.1: the four SHA-1 constants, for the arm64 kernel }
+  K1: array[0..3] of UInt32 = ($5a827999, $6ed9eba1, $8f1bbcdc, $ca62c1d6);
+
+
+var
+  Crc32Tab: array[0..255] of UInt32;
+  Crc32cTab: array[0..255] of UInt32;
+  TabsReady: Integer;   { 1 once the tables are built, released after them }
+
+function PasHex(const S: string): string;
+const
+  Digs = '0123456789abcdef';
+var
+  i, b: Integer;
+begin
+  SetLength(Result, Length(S) * 2);
+  for i := 1 to Length(S) do
+  begin
+    b := Ord(S[i]);
+    Result[i * 2 - 1] := Digs[(b shr 4) + 1];
+    Result[i * 2] := Digs[(b and 15) + 1];
+  end;
+end;
+
+{ The tail of a message for a 64-byte block hash (FIPS 180-4, 5.1.1;
+  RFC 1321, 3.1-3.2): a 1 bit, zeros, and the length in bits, big-endian
+  for SHA and little-endian for MD5, in one block or two, at Buf. }
+procedure Tail64(const S: string; Buf: Pointer; out NBlocks: Integer; LittleLen: Boolean);
+var
+  n, off, rest, i, bits: Integer;
+begin
+  n := Length(S);
+  off := (n div 64) * 64;
+  rest := n - off;
+  for i := 0 to 127 do
+    PByte(Buf)[i] := 0;
+  for i := 0 to rest - 1 do
+    PByte(Buf)[i] := Byte(S[off + 1 + i]);
+  PByte(Buf)[rest] := 128;
+  if rest < 56 then
+    NBlocks := 1
+  else
+    NBlocks := 2;
+  bits := n * 8;
+  if LittleLen then
+    StoreLE64(Pointer(Integer(Buf) + NBlocks * 64 - 8), bits)
+  else
+    StoreBE64(Pointer(Integer(Buf) + NBlocks * 64 - 8), bits);
+end;
+
+
+{ ---- SHA-256 and SHA-224 (FIPS 180-4, 6.2 and 6.3): the rounds written
+  out, the message schedule in a ring of sixteen words ---- }
+
+procedure Sha256BlocksPlain(State, Data: Pointer; N: Integer);
+var
+  w0, w1, w2, w3, w4, w5, w6, w7, w8, w9, w10, w11, w12, w13, w14, w15: UInt32;
+  a, b, c, d, e, f, g, h: UInt32;
+  j: Integer;
+  p: Pointer;
+begin
+  for j := 0 to N - 1 do
+  begin
+    p := Pointer(Integer(Data) + j * 64);
+    w0 := LoadBE32(p);
+    w1 := LoadBE32(Pointer(Integer(p) + 4));
+    w2 := LoadBE32(Pointer(Integer(p) + 8));
+    w3 := LoadBE32(Pointer(Integer(p) + 12));
+    w4 := LoadBE32(Pointer(Integer(p) + 16));
+    w5 := LoadBE32(Pointer(Integer(p) + 20));
+    w6 := LoadBE32(Pointer(Integer(p) + 24));
+    w7 := LoadBE32(Pointer(Integer(p) + 28));
+    w8 := LoadBE32(Pointer(Integer(p) + 32));
+    w9 := LoadBE32(Pointer(Integer(p) + 36));
+    w10 := LoadBE32(Pointer(Integer(p) + 40));
+    w11 := LoadBE32(Pointer(Integer(p) + 44));
+    w12 := LoadBE32(Pointer(Integer(p) + 48));
+    w13 := LoadBE32(Pointer(Integer(p) + 52));
+    w14 := LoadBE32(Pointer(Integer(p) + 56));
+    w15 := LoadBE32(Pointer(Integer(p) + 60));
+    a := LoadLE32(State);
+    b := LoadLE32(Pointer(Integer(State) + 4));
+    c := LoadLE32(Pointer(Integer(State) + 8));
+    d := LoadLE32(Pointer(Integer(State) + 12));
+    e := LoadLE32(Pointer(Integer(State) + 16));
+    f := LoadLE32(Pointer(Integer(State) + 20));
+    g := LoadLE32(Pointer(Integer(State) + 24));
+    h := LoadLE32(Pointer(Integer(State) + 28));
+    h := h + (RotateRight(e, 6) xor RotateRight(e, 11) xor RotateRight(e, 25)) +
+      ((e and f) xor ((not e) and g)) + $428a2f98 + w0;
+    d := d + h;
+    h := h + (RotateRight(a, 2) xor RotateRight(a, 13) xor RotateRight(a, 22)) +
+      ((a and b) xor (a and c) xor (b and c));
+    g := g + (RotateRight(d, 6) xor RotateRight(d, 11) xor RotateRight(d, 25)) +
+      ((d and e) xor ((not d) and f)) + $71374491 + w1;
+    c := c + g;
+    g := g + (RotateRight(h, 2) xor RotateRight(h, 13) xor RotateRight(h, 22)) +
+      ((h and a) xor (h and b) xor (a and b));
+    f := f + (RotateRight(c, 6) xor RotateRight(c, 11) xor RotateRight(c, 25)) +
+      ((c and d) xor ((not c) and e)) + $b5c0fbcf + w2;
+    b := b + f;
+    f := f + (RotateRight(g, 2) xor RotateRight(g, 13) xor RotateRight(g, 22)) +
+      ((g and h) xor (g and a) xor (h and a));
+    e := e + (RotateRight(b, 6) xor RotateRight(b, 11) xor RotateRight(b, 25)) +
+      ((b and c) xor ((not b) and d)) + $e9b5dba5 + w3;
+    a := a + e;
+    e := e + (RotateRight(f, 2) xor RotateRight(f, 13) xor RotateRight(f, 22)) +
+      ((f and g) xor (f and h) xor (g and h));
+    d := d + (RotateRight(a, 6) xor RotateRight(a, 11) xor RotateRight(a, 25)) +
+      ((a and b) xor ((not a) and c)) + $3956c25b + w4;
+    h := h + d;
+    d := d + (RotateRight(e, 2) xor RotateRight(e, 13) xor RotateRight(e, 22)) +
+      ((e and f) xor (e and g) xor (f and g));
+    c := c + (RotateRight(h, 6) xor RotateRight(h, 11) xor RotateRight(h, 25)) +
+      ((h and a) xor ((not h) and b)) + $59f111f1 + w5;
+    g := g + c;
+    c := c + (RotateRight(d, 2) xor RotateRight(d, 13) xor RotateRight(d, 22)) +
+      ((d and e) xor (d and f) xor (e and f));
+    b := b + (RotateRight(g, 6) xor RotateRight(g, 11) xor RotateRight(g, 25)) +
+      ((g and h) xor ((not g) and a)) + $923f82a4 + w6;
+    f := f + b;
+    b := b + (RotateRight(c, 2) xor RotateRight(c, 13) xor RotateRight(c, 22)) +
+      ((c and d) xor (c and e) xor (d and e));
+    a := a + (RotateRight(f, 6) xor RotateRight(f, 11) xor RotateRight(f, 25)) +
+      ((f and g) xor ((not f) and h)) + $ab1c5ed5 + w7;
+    e := e + a;
+    a := a + (RotateRight(b, 2) xor RotateRight(b, 13) xor RotateRight(b, 22)) +
+      ((b and c) xor (b and d) xor (c and d));
+    h := h + (RotateRight(e, 6) xor RotateRight(e, 11) xor RotateRight(e, 25)) +
+      ((e and f) xor ((not e) and g)) + $d807aa98 + w8;
+    d := d + h;
+    h := h + (RotateRight(a, 2) xor RotateRight(a, 13) xor RotateRight(a, 22)) +
+      ((a and b) xor (a and c) xor (b and c));
+    g := g + (RotateRight(d, 6) xor RotateRight(d, 11) xor RotateRight(d, 25)) +
+      ((d and e) xor ((not d) and f)) + $12835b01 + w9;
+    c := c + g;
+    g := g + (RotateRight(h, 2) xor RotateRight(h, 13) xor RotateRight(h, 22)) +
+      ((h and a) xor (h and b) xor (a and b));
+    f := f + (RotateRight(c, 6) xor RotateRight(c, 11) xor RotateRight(c, 25)) +
+      ((c and d) xor ((not c) and e)) + $243185be + w10;
+    b := b + f;
+    f := f + (RotateRight(g, 2) xor RotateRight(g, 13) xor RotateRight(g, 22)) +
+      ((g and h) xor (g and a) xor (h and a));
+    e := e + (RotateRight(b, 6) xor RotateRight(b, 11) xor RotateRight(b, 25)) +
+      ((b and c) xor ((not b) and d)) + $550c7dc3 + w11;
+    a := a + e;
+    e := e + (RotateRight(f, 2) xor RotateRight(f, 13) xor RotateRight(f, 22)) +
+      ((f and g) xor (f and h) xor (g and h));
+    d := d + (RotateRight(a, 6) xor RotateRight(a, 11) xor RotateRight(a, 25)) +
+      ((a and b) xor ((not a) and c)) + $72be5d74 + w12;
+    h := h + d;
+    d := d + (RotateRight(e, 2) xor RotateRight(e, 13) xor RotateRight(e, 22)) +
+      ((e and f) xor (e and g) xor (f and g));
+    c := c + (RotateRight(h, 6) xor RotateRight(h, 11) xor RotateRight(h, 25)) +
+      ((h and a) xor ((not h) and b)) + $80deb1fe + w13;
+    g := g + c;
+    c := c + (RotateRight(d, 2) xor RotateRight(d, 13) xor RotateRight(d, 22)) +
+      ((d and e) xor (d and f) xor (e and f));
+    b := b + (RotateRight(g, 6) xor RotateRight(g, 11) xor RotateRight(g, 25)) +
+      ((g and h) xor ((not g) and a)) + $9bdc06a7 + w14;
+    f := f + b;
+    b := b + (RotateRight(c, 2) xor RotateRight(c, 13) xor RotateRight(c, 22)) +
+      ((c and d) xor (c and e) xor (d and e));
+    a := a + (RotateRight(f, 6) xor RotateRight(f, 11) xor RotateRight(f, 25)) +
+      ((f and g) xor ((not f) and h)) + $c19bf174 + w15;
+    e := e + a;
+    a := a + (RotateRight(b, 2) xor RotateRight(b, 13) xor RotateRight(b, 22)) +
+      ((b and c) xor (b and d) xor (c and d));
+    w0 := w0 + (RotateRight(w1, 7) xor RotateRight(w1, 18) xor (w1 shr 3)) + w9 +
+      (RotateRight(w14, 17) xor RotateRight(w14, 19) xor (w14 shr 10));
+    h := h + (RotateRight(e, 6) xor RotateRight(e, 11) xor RotateRight(e, 25)) +
+      ((e and f) xor ((not e) and g)) + $e49b69c1 + w0;
+    d := d + h;
+    h := h + (RotateRight(a, 2) xor RotateRight(a, 13) xor RotateRight(a, 22)) +
+      ((a and b) xor (a and c) xor (b and c));
+    w1 := w1 + (RotateRight(w2, 7) xor RotateRight(w2, 18) xor (w2 shr 3)) + w10 +
+      (RotateRight(w15, 17) xor RotateRight(w15, 19) xor (w15 shr 10));
+    g := g + (RotateRight(d, 6) xor RotateRight(d, 11) xor RotateRight(d, 25)) +
+      ((d and e) xor ((not d) and f)) + $efbe4786 + w1;
+    c := c + g;
+    g := g + (RotateRight(h, 2) xor RotateRight(h, 13) xor RotateRight(h, 22)) +
+      ((h and a) xor (h and b) xor (a and b));
+    w2 := w2 + (RotateRight(w3, 7) xor RotateRight(w3, 18) xor (w3 shr 3)) + w11 +
+      (RotateRight(w0, 17) xor RotateRight(w0, 19) xor (w0 shr 10));
+    f := f + (RotateRight(c, 6) xor RotateRight(c, 11) xor RotateRight(c, 25)) +
+      ((c and d) xor ((not c) and e)) + $0fc19dc6 + w2;
+    b := b + f;
+    f := f + (RotateRight(g, 2) xor RotateRight(g, 13) xor RotateRight(g, 22)) +
+      ((g and h) xor (g and a) xor (h and a));
+    w3 := w3 + (RotateRight(w4, 7) xor RotateRight(w4, 18) xor (w4 shr 3)) + w12 +
+      (RotateRight(w1, 17) xor RotateRight(w1, 19) xor (w1 shr 10));
+    e := e + (RotateRight(b, 6) xor RotateRight(b, 11) xor RotateRight(b, 25)) +
+      ((b and c) xor ((not b) and d)) + $240ca1cc + w3;
+    a := a + e;
+    e := e + (RotateRight(f, 2) xor RotateRight(f, 13) xor RotateRight(f, 22)) +
+      ((f and g) xor (f and h) xor (g and h));
+    w4 := w4 + (RotateRight(w5, 7) xor RotateRight(w5, 18) xor (w5 shr 3)) + w13 +
+      (RotateRight(w2, 17) xor RotateRight(w2, 19) xor (w2 shr 10));
+    d := d + (RotateRight(a, 6) xor RotateRight(a, 11) xor RotateRight(a, 25)) +
+      ((a and b) xor ((not a) and c)) + $2de92c6f + w4;
+    h := h + d;
+    d := d + (RotateRight(e, 2) xor RotateRight(e, 13) xor RotateRight(e, 22)) +
+      ((e and f) xor (e and g) xor (f and g));
+    w5 := w5 + (RotateRight(w6, 7) xor RotateRight(w6, 18) xor (w6 shr 3)) + w14 +
+      (RotateRight(w3, 17) xor RotateRight(w3, 19) xor (w3 shr 10));
+    c := c + (RotateRight(h, 6) xor RotateRight(h, 11) xor RotateRight(h, 25)) +
+      ((h and a) xor ((not h) and b)) + $4a7484aa + w5;
+    g := g + c;
+    c := c + (RotateRight(d, 2) xor RotateRight(d, 13) xor RotateRight(d, 22)) +
+      ((d and e) xor (d and f) xor (e and f));
+    w6 := w6 + (RotateRight(w7, 7) xor RotateRight(w7, 18) xor (w7 shr 3)) + w15 +
+      (RotateRight(w4, 17) xor RotateRight(w4, 19) xor (w4 shr 10));
+    b := b + (RotateRight(g, 6) xor RotateRight(g, 11) xor RotateRight(g, 25)) +
+      ((g and h) xor ((not g) and a)) + $5cb0a9dc + w6;
+    f := f + b;
+    b := b + (RotateRight(c, 2) xor RotateRight(c, 13) xor RotateRight(c, 22)) +
+      ((c and d) xor (c and e) xor (d and e));
+    w7 := w7 + (RotateRight(w8, 7) xor RotateRight(w8, 18) xor (w8 shr 3)) + w0 +
+      (RotateRight(w5, 17) xor RotateRight(w5, 19) xor (w5 shr 10));
+    a := a + (RotateRight(f, 6) xor RotateRight(f, 11) xor RotateRight(f, 25)) +
+      ((f and g) xor ((not f) and h)) + $76f988da + w7;
+    e := e + a;
+    a := a + (RotateRight(b, 2) xor RotateRight(b, 13) xor RotateRight(b, 22)) +
+      ((b and c) xor (b and d) xor (c and d));
+    w8 := w8 + (RotateRight(w9, 7) xor RotateRight(w9, 18) xor (w9 shr 3)) + w1 +
+      (RotateRight(w6, 17) xor RotateRight(w6, 19) xor (w6 shr 10));
+    h := h + (RotateRight(e, 6) xor RotateRight(e, 11) xor RotateRight(e, 25)) +
+      ((e and f) xor ((not e) and g)) + $983e5152 + w8;
+    d := d + h;
+    h := h + (RotateRight(a, 2) xor RotateRight(a, 13) xor RotateRight(a, 22)) +
+      ((a and b) xor (a and c) xor (b and c));
+    w9 := w9 + (RotateRight(w10, 7) xor RotateRight(w10, 18) xor (w10 shr 3)) + w2 +
+      (RotateRight(w7, 17) xor RotateRight(w7, 19) xor (w7 shr 10));
+    g := g + (RotateRight(d, 6) xor RotateRight(d, 11) xor RotateRight(d, 25)) +
+      ((d and e) xor ((not d) and f)) + $a831c66d + w9;
+    c := c + g;
+    g := g + (RotateRight(h, 2) xor RotateRight(h, 13) xor RotateRight(h, 22)) +
+      ((h and a) xor (h and b) xor (a and b));
+    w10 := w10 + (RotateRight(w11, 7) xor RotateRight(w11, 18) xor (w11 shr 3)) + w3 +
+      (RotateRight(w8, 17) xor RotateRight(w8, 19) xor (w8 shr 10));
+    f := f + (RotateRight(c, 6) xor RotateRight(c, 11) xor RotateRight(c, 25)) +
+      ((c and d) xor ((not c) and e)) + $b00327c8 + w10;
+    b := b + f;
+    f := f + (RotateRight(g, 2) xor RotateRight(g, 13) xor RotateRight(g, 22)) +
+      ((g and h) xor (g and a) xor (h and a));
+    w11 := w11 + (RotateRight(w12, 7) xor RotateRight(w12, 18) xor (w12 shr 3)) + w4 +
+      (RotateRight(w9, 17) xor RotateRight(w9, 19) xor (w9 shr 10));
+    e := e + (RotateRight(b, 6) xor RotateRight(b, 11) xor RotateRight(b, 25)) +
+      ((b and c) xor ((not b) and d)) + $bf597fc7 + w11;
+    a := a + e;
+    e := e + (RotateRight(f, 2) xor RotateRight(f, 13) xor RotateRight(f, 22)) +
+      ((f and g) xor (f and h) xor (g and h));
+    w12 := w12 + (RotateRight(w13, 7) xor RotateRight(w13, 18) xor (w13 shr 3)) + w5 +
+      (RotateRight(w10, 17) xor RotateRight(w10, 19) xor (w10 shr 10));
+    d := d + (RotateRight(a, 6) xor RotateRight(a, 11) xor RotateRight(a, 25)) +
+      ((a and b) xor ((not a) and c)) + $c6e00bf3 + w12;
+    h := h + d;
+    d := d + (RotateRight(e, 2) xor RotateRight(e, 13) xor RotateRight(e, 22)) +
+      ((e and f) xor (e and g) xor (f and g));
+    w13 := w13 + (RotateRight(w14, 7) xor RotateRight(w14, 18) xor (w14 shr 3)) + w6 +
+      (RotateRight(w11, 17) xor RotateRight(w11, 19) xor (w11 shr 10));
+    c := c + (RotateRight(h, 6) xor RotateRight(h, 11) xor RotateRight(h, 25)) +
+      ((h and a) xor ((not h) and b)) + $d5a79147 + w13;
+    g := g + c;
+    c := c + (RotateRight(d, 2) xor RotateRight(d, 13) xor RotateRight(d, 22)) +
+      ((d and e) xor (d and f) xor (e and f));
+    w14 := w14 + (RotateRight(w15, 7) xor RotateRight(w15, 18) xor (w15 shr 3)) + w7 +
+      (RotateRight(w12, 17) xor RotateRight(w12, 19) xor (w12 shr 10));
+    b := b + (RotateRight(g, 6) xor RotateRight(g, 11) xor RotateRight(g, 25)) +
+      ((g and h) xor ((not g) and a)) + $06ca6351 + w14;
+    f := f + b;
+    b := b + (RotateRight(c, 2) xor RotateRight(c, 13) xor RotateRight(c, 22)) +
+      ((c and d) xor (c and e) xor (d and e));
+    w15 := w15 + (RotateRight(w0, 7) xor RotateRight(w0, 18) xor (w0 shr 3)) + w8 +
+      (RotateRight(w13, 17) xor RotateRight(w13, 19) xor (w13 shr 10));
+    a := a + (RotateRight(f, 6) xor RotateRight(f, 11) xor RotateRight(f, 25)) +
+      ((f and g) xor ((not f) and h)) + $14292967 + w15;
+    e := e + a;
+    a := a + (RotateRight(b, 2) xor RotateRight(b, 13) xor RotateRight(b, 22)) +
+      ((b and c) xor (b and d) xor (c and d));
+    w0 := w0 + (RotateRight(w1, 7) xor RotateRight(w1, 18) xor (w1 shr 3)) + w9 +
+      (RotateRight(w14, 17) xor RotateRight(w14, 19) xor (w14 shr 10));
+    h := h + (RotateRight(e, 6) xor RotateRight(e, 11) xor RotateRight(e, 25)) +
+      ((e and f) xor ((not e) and g)) + $27b70a85 + w0;
+    d := d + h;
+    h := h + (RotateRight(a, 2) xor RotateRight(a, 13) xor RotateRight(a, 22)) +
+      ((a and b) xor (a and c) xor (b and c));
+    w1 := w1 + (RotateRight(w2, 7) xor RotateRight(w2, 18) xor (w2 shr 3)) + w10 +
+      (RotateRight(w15, 17) xor RotateRight(w15, 19) xor (w15 shr 10));
+    g := g + (RotateRight(d, 6) xor RotateRight(d, 11) xor RotateRight(d, 25)) +
+      ((d and e) xor ((not d) and f)) + $2e1b2138 + w1;
+    c := c + g;
+    g := g + (RotateRight(h, 2) xor RotateRight(h, 13) xor RotateRight(h, 22)) +
+      ((h and a) xor (h and b) xor (a and b));
+    w2 := w2 + (RotateRight(w3, 7) xor RotateRight(w3, 18) xor (w3 shr 3)) + w11 +
+      (RotateRight(w0, 17) xor RotateRight(w0, 19) xor (w0 shr 10));
+    f := f + (RotateRight(c, 6) xor RotateRight(c, 11) xor RotateRight(c, 25)) +
+      ((c and d) xor ((not c) and e)) + $4d2c6dfc + w2;
+    b := b + f;
+    f := f + (RotateRight(g, 2) xor RotateRight(g, 13) xor RotateRight(g, 22)) +
+      ((g and h) xor (g and a) xor (h and a));
+    w3 := w3 + (RotateRight(w4, 7) xor RotateRight(w4, 18) xor (w4 shr 3)) + w12 +
+      (RotateRight(w1, 17) xor RotateRight(w1, 19) xor (w1 shr 10));
+    e := e + (RotateRight(b, 6) xor RotateRight(b, 11) xor RotateRight(b, 25)) +
+      ((b and c) xor ((not b) and d)) + $53380d13 + w3;
+    a := a + e;
+    e := e + (RotateRight(f, 2) xor RotateRight(f, 13) xor RotateRight(f, 22)) +
+      ((f and g) xor (f and h) xor (g and h));
+    w4 := w4 + (RotateRight(w5, 7) xor RotateRight(w5, 18) xor (w5 shr 3)) + w13 +
+      (RotateRight(w2, 17) xor RotateRight(w2, 19) xor (w2 shr 10));
+    d := d + (RotateRight(a, 6) xor RotateRight(a, 11) xor RotateRight(a, 25)) +
+      ((a and b) xor ((not a) and c)) + $650a7354 + w4;
+    h := h + d;
+    d := d + (RotateRight(e, 2) xor RotateRight(e, 13) xor RotateRight(e, 22)) +
+      ((e and f) xor (e and g) xor (f and g));
+    w5 := w5 + (RotateRight(w6, 7) xor RotateRight(w6, 18) xor (w6 shr 3)) + w14 +
+      (RotateRight(w3, 17) xor RotateRight(w3, 19) xor (w3 shr 10));
+    c := c + (RotateRight(h, 6) xor RotateRight(h, 11) xor RotateRight(h, 25)) +
+      ((h and a) xor ((not h) and b)) + $766a0abb + w5;
+    g := g + c;
+    c := c + (RotateRight(d, 2) xor RotateRight(d, 13) xor RotateRight(d, 22)) +
+      ((d and e) xor (d and f) xor (e and f));
+    w6 := w6 + (RotateRight(w7, 7) xor RotateRight(w7, 18) xor (w7 shr 3)) + w15 +
+      (RotateRight(w4, 17) xor RotateRight(w4, 19) xor (w4 shr 10));
+    b := b + (RotateRight(g, 6) xor RotateRight(g, 11) xor RotateRight(g, 25)) +
+      ((g and h) xor ((not g) and a)) + $81c2c92e + w6;
+    f := f + b;
+    b := b + (RotateRight(c, 2) xor RotateRight(c, 13) xor RotateRight(c, 22)) +
+      ((c and d) xor (c and e) xor (d and e));
+    w7 := w7 + (RotateRight(w8, 7) xor RotateRight(w8, 18) xor (w8 shr 3)) + w0 +
+      (RotateRight(w5, 17) xor RotateRight(w5, 19) xor (w5 shr 10));
+    a := a + (RotateRight(f, 6) xor RotateRight(f, 11) xor RotateRight(f, 25)) +
+      ((f and g) xor ((not f) and h)) + $92722c85 + w7;
+    e := e + a;
+    a := a + (RotateRight(b, 2) xor RotateRight(b, 13) xor RotateRight(b, 22)) +
+      ((b and c) xor (b and d) xor (c and d));
+    w8 := w8 + (RotateRight(w9, 7) xor RotateRight(w9, 18) xor (w9 shr 3)) + w1 +
+      (RotateRight(w6, 17) xor RotateRight(w6, 19) xor (w6 shr 10));
+    h := h + (RotateRight(e, 6) xor RotateRight(e, 11) xor RotateRight(e, 25)) +
+      ((e and f) xor ((not e) and g)) + $a2bfe8a1 + w8;
+    d := d + h;
+    h := h + (RotateRight(a, 2) xor RotateRight(a, 13) xor RotateRight(a, 22)) +
+      ((a and b) xor (a and c) xor (b and c));
+    w9 := w9 + (RotateRight(w10, 7) xor RotateRight(w10, 18) xor (w10 shr 3)) + w2 +
+      (RotateRight(w7, 17) xor RotateRight(w7, 19) xor (w7 shr 10));
+    g := g + (RotateRight(d, 6) xor RotateRight(d, 11) xor RotateRight(d, 25)) +
+      ((d and e) xor ((not d) and f)) + $a81a664b + w9;
+    c := c + g;
+    g := g + (RotateRight(h, 2) xor RotateRight(h, 13) xor RotateRight(h, 22)) +
+      ((h and a) xor (h and b) xor (a and b));
+    w10 := w10 + (RotateRight(w11, 7) xor RotateRight(w11, 18) xor (w11 shr 3)) + w3 +
+      (RotateRight(w8, 17) xor RotateRight(w8, 19) xor (w8 shr 10));
+    f := f + (RotateRight(c, 6) xor RotateRight(c, 11) xor RotateRight(c, 25)) +
+      ((c and d) xor ((not c) and e)) + $c24b8b70 + w10;
+    b := b + f;
+    f := f + (RotateRight(g, 2) xor RotateRight(g, 13) xor RotateRight(g, 22)) +
+      ((g and h) xor (g and a) xor (h and a));
+    w11 := w11 + (RotateRight(w12, 7) xor RotateRight(w12, 18) xor (w12 shr 3)) + w4 +
+      (RotateRight(w9, 17) xor RotateRight(w9, 19) xor (w9 shr 10));
+    e := e + (RotateRight(b, 6) xor RotateRight(b, 11) xor RotateRight(b, 25)) +
+      ((b and c) xor ((not b) and d)) + $c76c51a3 + w11;
+    a := a + e;
+    e := e + (RotateRight(f, 2) xor RotateRight(f, 13) xor RotateRight(f, 22)) +
+      ((f and g) xor (f and h) xor (g and h));
+    w12 := w12 + (RotateRight(w13, 7) xor RotateRight(w13, 18) xor (w13 shr 3)) + w5 +
+      (RotateRight(w10, 17) xor RotateRight(w10, 19) xor (w10 shr 10));
+    d := d + (RotateRight(a, 6) xor RotateRight(a, 11) xor RotateRight(a, 25)) +
+      ((a and b) xor ((not a) and c)) + $d192e819 + w12;
+    h := h + d;
+    d := d + (RotateRight(e, 2) xor RotateRight(e, 13) xor RotateRight(e, 22)) +
+      ((e and f) xor (e and g) xor (f and g));
+    w13 := w13 + (RotateRight(w14, 7) xor RotateRight(w14, 18) xor (w14 shr 3)) + w6 +
+      (RotateRight(w11, 17) xor RotateRight(w11, 19) xor (w11 shr 10));
+    c := c + (RotateRight(h, 6) xor RotateRight(h, 11) xor RotateRight(h, 25)) +
+      ((h and a) xor ((not h) and b)) + $d6990624 + w13;
+    g := g + c;
+    c := c + (RotateRight(d, 2) xor RotateRight(d, 13) xor RotateRight(d, 22)) +
+      ((d and e) xor (d and f) xor (e and f));
+    w14 := w14 + (RotateRight(w15, 7) xor RotateRight(w15, 18) xor (w15 shr 3)) + w7 +
+      (RotateRight(w12, 17) xor RotateRight(w12, 19) xor (w12 shr 10));
+    b := b + (RotateRight(g, 6) xor RotateRight(g, 11) xor RotateRight(g, 25)) +
+      ((g and h) xor ((not g) and a)) + $f40e3585 + w14;
+    f := f + b;
+    b := b + (RotateRight(c, 2) xor RotateRight(c, 13) xor RotateRight(c, 22)) +
+      ((c and d) xor (c and e) xor (d and e));
+    w15 := w15 + (RotateRight(w0, 7) xor RotateRight(w0, 18) xor (w0 shr 3)) + w8 +
+      (RotateRight(w13, 17) xor RotateRight(w13, 19) xor (w13 shr 10));
+    a := a + (RotateRight(f, 6) xor RotateRight(f, 11) xor RotateRight(f, 25)) +
+      ((f and g) xor ((not f) and h)) + $106aa070 + w15;
+    e := e + a;
+    a := a + (RotateRight(b, 2) xor RotateRight(b, 13) xor RotateRight(b, 22)) +
+      ((b and c) xor (b and d) xor (c and d));
+    w0 := w0 + (RotateRight(w1, 7) xor RotateRight(w1, 18) xor (w1 shr 3)) + w9 +
+      (RotateRight(w14, 17) xor RotateRight(w14, 19) xor (w14 shr 10));
+    h := h + (RotateRight(e, 6) xor RotateRight(e, 11) xor RotateRight(e, 25)) +
+      ((e and f) xor ((not e) and g)) + $19a4c116 + w0;
+    d := d + h;
+    h := h + (RotateRight(a, 2) xor RotateRight(a, 13) xor RotateRight(a, 22)) +
+      ((a and b) xor (a and c) xor (b and c));
+    w1 := w1 + (RotateRight(w2, 7) xor RotateRight(w2, 18) xor (w2 shr 3)) + w10 +
+      (RotateRight(w15, 17) xor RotateRight(w15, 19) xor (w15 shr 10));
+    g := g + (RotateRight(d, 6) xor RotateRight(d, 11) xor RotateRight(d, 25)) +
+      ((d and e) xor ((not d) and f)) + $1e376c08 + w1;
+    c := c + g;
+    g := g + (RotateRight(h, 2) xor RotateRight(h, 13) xor RotateRight(h, 22)) +
+      ((h and a) xor (h and b) xor (a and b));
+    w2 := w2 + (RotateRight(w3, 7) xor RotateRight(w3, 18) xor (w3 shr 3)) + w11 +
+      (RotateRight(w0, 17) xor RotateRight(w0, 19) xor (w0 shr 10));
+    f := f + (RotateRight(c, 6) xor RotateRight(c, 11) xor RotateRight(c, 25)) +
+      ((c and d) xor ((not c) and e)) + $2748774c + w2;
+    b := b + f;
+    f := f + (RotateRight(g, 2) xor RotateRight(g, 13) xor RotateRight(g, 22)) +
+      ((g and h) xor (g and a) xor (h and a));
+    w3 := w3 + (RotateRight(w4, 7) xor RotateRight(w4, 18) xor (w4 shr 3)) + w12 +
+      (RotateRight(w1, 17) xor RotateRight(w1, 19) xor (w1 shr 10));
+    e := e + (RotateRight(b, 6) xor RotateRight(b, 11) xor RotateRight(b, 25)) +
+      ((b and c) xor ((not b) and d)) + $34b0bcb5 + w3;
+    a := a + e;
+    e := e + (RotateRight(f, 2) xor RotateRight(f, 13) xor RotateRight(f, 22)) +
+      ((f and g) xor (f and h) xor (g and h));
+    w4 := w4 + (RotateRight(w5, 7) xor RotateRight(w5, 18) xor (w5 shr 3)) + w13 +
+      (RotateRight(w2, 17) xor RotateRight(w2, 19) xor (w2 shr 10));
+    d := d + (RotateRight(a, 6) xor RotateRight(a, 11) xor RotateRight(a, 25)) +
+      ((a and b) xor ((not a) and c)) + $391c0cb3 + w4;
+    h := h + d;
+    d := d + (RotateRight(e, 2) xor RotateRight(e, 13) xor RotateRight(e, 22)) +
+      ((e and f) xor (e and g) xor (f and g));
+    w5 := w5 + (RotateRight(w6, 7) xor RotateRight(w6, 18) xor (w6 shr 3)) + w14 +
+      (RotateRight(w3, 17) xor RotateRight(w3, 19) xor (w3 shr 10));
+    c := c + (RotateRight(h, 6) xor RotateRight(h, 11) xor RotateRight(h, 25)) +
+      ((h and a) xor ((not h) and b)) + $4ed8aa4a + w5;
+    g := g + c;
+    c := c + (RotateRight(d, 2) xor RotateRight(d, 13) xor RotateRight(d, 22)) +
+      ((d and e) xor (d and f) xor (e and f));
+    w6 := w6 + (RotateRight(w7, 7) xor RotateRight(w7, 18) xor (w7 shr 3)) + w15 +
+      (RotateRight(w4, 17) xor RotateRight(w4, 19) xor (w4 shr 10));
+    b := b + (RotateRight(g, 6) xor RotateRight(g, 11) xor RotateRight(g, 25)) +
+      ((g and h) xor ((not g) and a)) + $5b9cca4f + w6;
+    f := f + b;
+    b := b + (RotateRight(c, 2) xor RotateRight(c, 13) xor RotateRight(c, 22)) +
+      ((c and d) xor (c and e) xor (d and e));
+    w7 := w7 + (RotateRight(w8, 7) xor RotateRight(w8, 18) xor (w8 shr 3)) + w0 +
+      (RotateRight(w5, 17) xor RotateRight(w5, 19) xor (w5 shr 10));
+    a := a + (RotateRight(f, 6) xor RotateRight(f, 11) xor RotateRight(f, 25)) +
+      ((f and g) xor ((not f) and h)) + $682e6ff3 + w7;
+    e := e + a;
+    a := a + (RotateRight(b, 2) xor RotateRight(b, 13) xor RotateRight(b, 22)) +
+      ((b and c) xor (b and d) xor (c and d));
+    w8 := w8 + (RotateRight(w9, 7) xor RotateRight(w9, 18) xor (w9 shr 3)) + w1 +
+      (RotateRight(w6, 17) xor RotateRight(w6, 19) xor (w6 shr 10));
+    h := h + (RotateRight(e, 6) xor RotateRight(e, 11) xor RotateRight(e, 25)) +
+      ((e and f) xor ((not e) and g)) + $748f82ee + w8;
+    d := d + h;
+    h := h + (RotateRight(a, 2) xor RotateRight(a, 13) xor RotateRight(a, 22)) +
+      ((a and b) xor (a and c) xor (b and c));
+    w9 := w9 + (RotateRight(w10, 7) xor RotateRight(w10, 18) xor (w10 shr 3)) + w2 +
+      (RotateRight(w7, 17) xor RotateRight(w7, 19) xor (w7 shr 10));
+    g := g + (RotateRight(d, 6) xor RotateRight(d, 11) xor RotateRight(d, 25)) +
+      ((d and e) xor ((not d) and f)) + $78a5636f + w9;
+    c := c + g;
+    g := g + (RotateRight(h, 2) xor RotateRight(h, 13) xor RotateRight(h, 22)) +
+      ((h and a) xor (h and b) xor (a and b));
+    w10 := w10 + (RotateRight(w11, 7) xor RotateRight(w11, 18) xor (w11 shr 3)) + w3 +
+      (RotateRight(w8, 17) xor RotateRight(w8, 19) xor (w8 shr 10));
+    f := f + (RotateRight(c, 6) xor RotateRight(c, 11) xor RotateRight(c, 25)) +
+      ((c and d) xor ((not c) and e)) + $84c87814 + w10;
+    b := b + f;
+    f := f + (RotateRight(g, 2) xor RotateRight(g, 13) xor RotateRight(g, 22)) +
+      ((g and h) xor (g and a) xor (h and a));
+    w11 := w11 + (RotateRight(w12, 7) xor RotateRight(w12, 18) xor (w12 shr 3)) + w4 +
+      (RotateRight(w9, 17) xor RotateRight(w9, 19) xor (w9 shr 10));
+    e := e + (RotateRight(b, 6) xor RotateRight(b, 11) xor RotateRight(b, 25)) +
+      ((b and c) xor ((not b) and d)) + $8cc70208 + w11;
+    a := a + e;
+    e := e + (RotateRight(f, 2) xor RotateRight(f, 13) xor RotateRight(f, 22)) +
+      ((f and g) xor (f and h) xor (g and h));
+    w12 := w12 + (RotateRight(w13, 7) xor RotateRight(w13, 18) xor (w13 shr 3)) + w5 +
+      (RotateRight(w10, 17) xor RotateRight(w10, 19) xor (w10 shr 10));
+    d := d + (RotateRight(a, 6) xor RotateRight(a, 11) xor RotateRight(a, 25)) +
+      ((a and b) xor ((not a) and c)) + $90befffa + w12;
+    h := h + d;
+    d := d + (RotateRight(e, 2) xor RotateRight(e, 13) xor RotateRight(e, 22)) +
+      ((e and f) xor (e and g) xor (f and g));
+    w13 := w13 + (RotateRight(w14, 7) xor RotateRight(w14, 18) xor (w14 shr 3)) + w6 +
+      (RotateRight(w11, 17) xor RotateRight(w11, 19) xor (w11 shr 10));
+    c := c + (RotateRight(h, 6) xor RotateRight(h, 11) xor RotateRight(h, 25)) +
+      ((h and a) xor ((not h) and b)) + $a4506ceb + w13;
+    g := g + c;
+    c := c + (RotateRight(d, 2) xor RotateRight(d, 13) xor RotateRight(d, 22)) +
+      ((d and e) xor (d and f) xor (e and f));
+    w14 := w14 + (RotateRight(w15, 7) xor RotateRight(w15, 18) xor (w15 shr 3)) + w7 +
+      (RotateRight(w12, 17) xor RotateRight(w12, 19) xor (w12 shr 10));
+    b := b + (RotateRight(g, 6) xor RotateRight(g, 11) xor RotateRight(g, 25)) +
+      ((g and h) xor ((not g) and a)) + $bef9a3f7 + w14;
+    f := f + b;
+    b := b + (RotateRight(c, 2) xor RotateRight(c, 13) xor RotateRight(c, 22)) +
+      ((c and d) xor (c and e) xor (d and e));
+    w15 := w15 + (RotateRight(w0, 7) xor RotateRight(w0, 18) xor (w0 shr 3)) + w8 +
+      (RotateRight(w13, 17) xor RotateRight(w13, 19) xor (w13 shr 10));
+    a := a + (RotateRight(f, 6) xor RotateRight(f, 11) xor RotateRight(f, 25)) +
+      ((f and g) xor ((not f) and h)) + $c67178f2 + w15;
+    e := e + a;
+    a := a + (RotateRight(b, 2) xor RotateRight(b, 13) xor RotateRight(b, 22)) +
+      ((b and c) xor (b and d) xor (c and d));
+    StoreLE32(State, LoadLE32(State) + a);
+    StoreLE32(Pointer(Integer(State) + 4), LoadLE32(Pointer(Integer(State) + 4)) + b);
+    StoreLE32(Pointer(Integer(State) + 8), LoadLE32(Pointer(Integer(State) + 8)) + c);
+    StoreLE32(Pointer(Integer(State) + 12), LoadLE32(Pointer(Integer(State) + 12)) + d);
+    StoreLE32(Pointer(Integer(State) + 16), LoadLE32(Pointer(Integer(State) + 16)) + e);
+    StoreLE32(Pointer(Integer(State) + 20), LoadLE32(Pointer(Integer(State) + 20)) + f);
+    StoreLE32(Pointer(Integer(State) + 24), LoadLE32(Pointer(Integer(State) + 24)) + g);
+    StoreLE32(Pointer(Integer(State) + 28), LoadLE32(Pointer(Integer(State) + 28)) + h);
+  end;
+end;
+
+{ The SHA-NI rounds after Go's sha256block_amd64.s (Intel SHA
+  extensions: SHA256RNDS2, SHA256MSG1, SHA256MSG2, SDM vol. 2B), on the
+  state as (A B E F) and (C D G H); the arm64 rounds after Go's
+  sha256block_arm64.s (SHA256H, SHA256H2, SHA256SU0, SHA256SU1, Arm ARM
+  C7.2.289-292). }
+procedure Sha256BlocksCpu(State, Data: Pointer; N: Integer);
+var
+  k: Pointer;
+  bytes: Integer;
+begin
+  k := @K256[0];
+  bytes := N * 64;
+  asm amd64 (State: in rdi; Data: in rsi; N: in rdx; k: in rax)
+    movdqu (%rdi), %xmm1
+    movdqu 16(%rdi), %xmm2
+    pshufd $0xb1, %xmm1, %xmm1
+    pshufd $0x1b, %xmm2, %xmm2
+    movdqa %xmm1, %xmm7
+    palignr $8, %xmm2, %xmm1
+    pblendw $0xf0, %xmm7, %xmm2
+    movabsq $0x0405060700010203, %rcx
+    movq %rcx, %xmm8
+    movabsq $0x0c0d0e0f08090a0b, %rcx
+    pinsrq $1, %rcx, %xmm8
+    1:
+    movdqa %xmm1, %xmm9
+    movdqa %xmm2, %xmm10
+    movdqu 0(%rsi), %xmm0
+    pshufb %xmm8, %xmm0
+    movdqa %xmm0, %xmm3
+    paddd 0(%rax), %xmm0
+    sha256rnds2 %xmm1, %xmm2
+    pshufd $0x0e, %xmm0, %xmm0
+    sha256rnds2 %xmm2, %xmm1
+    movdqu 16(%rsi), %xmm0
+    pshufb %xmm8, %xmm0
+    movdqa %xmm0, %xmm4
+    paddd 16(%rax), %xmm0
+    sha256rnds2 %xmm1, %xmm2
+    pshufd $0x0e, %xmm0, %xmm0
+    sha256rnds2 %xmm2, %xmm1
+    sha256msg1 %xmm4, %xmm3
+    movdqu 32(%rsi), %xmm0
+    pshufb %xmm8, %xmm0
+    movdqa %xmm0, %xmm5
+    paddd 32(%rax), %xmm0
+    sha256rnds2 %xmm1, %xmm2
+    pshufd $0x0e, %xmm0, %xmm0
+    sha256rnds2 %xmm2, %xmm1
+    sha256msg1 %xmm5, %xmm4
+    movdqu 48(%rsi), %xmm0
+    pshufb %xmm8, %xmm0
+    movdqa %xmm0, %xmm6
+    paddd 48(%rax), %xmm0
+    sha256rnds2 %xmm1, %xmm2
+    movdqa %xmm6, %xmm7
+    palignr $4, %xmm5, %xmm7
+    paddd %xmm7, %xmm3
+    sha256msg2 %xmm6, %xmm3
+    pshufd $0x0e, %xmm0, %xmm0
+    sha256rnds2 %xmm2, %xmm1
+    sha256msg1 %xmm6, %xmm5
+    movdqa %xmm3, %xmm0
+    paddd 64(%rax), %xmm0
+    sha256rnds2 %xmm1, %xmm2
+    movdqa %xmm3, %xmm7
+    palignr $4, %xmm6, %xmm7
+    paddd %xmm7, %xmm4
+    sha256msg2 %xmm3, %xmm4
+    pshufd $0x0e, %xmm0, %xmm0
+    sha256rnds2 %xmm2, %xmm1
+    sha256msg1 %xmm3, %xmm6
+    movdqa %xmm4, %xmm0
+    paddd 80(%rax), %xmm0
+    sha256rnds2 %xmm1, %xmm2
+    movdqa %xmm4, %xmm7
+    palignr $4, %xmm3, %xmm7
+    paddd %xmm7, %xmm5
+    sha256msg2 %xmm4, %xmm5
+    pshufd $0x0e, %xmm0, %xmm0
+    sha256rnds2 %xmm2, %xmm1
+    sha256msg1 %xmm4, %xmm3
+    movdqa %xmm5, %xmm0
+    paddd 96(%rax), %xmm0
+    sha256rnds2 %xmm1, %xmm2
+    movdqa %xmm5, %xmm7
+    palignr $4, %xmm4, %xmm7
+    paddd %xmm7, %xmm6
+    sha256msg2 %xmm5, %xmm6
+    pshufd $0x0e, %xmm0, %xmm0
+    sha256rnds2 %xmm2, %xmm1
+    sha256msg1 %xmm5, %xmm4
+    movdqa %xmm6, %xmm0
+    paddd 112(%rax), %xmm0
+    sha256rnds2 %xmm1, %xmm2
+    movdqa %xmm6, %xmm7
+    palignr $4, %xmm5, %xmm7
+    paddd %xmm7, %xmm3
+    sha256msg2 %xmm6, %xmm3
+    pshufd $0x0e, %xmm0, %xmm0
+    sha256rnds2 %xmm2, %xmm1
+    sha256msg1 %xmm6, %xmm5
+    movdqa %xmm3, %xmm0
+    paddd 128(%rax), %xmm0
+    sha256rnds2 %xmm1, %xmm2
+    movdqa %xmm3, %xmm7
+    palignr $4, %xmm6, %xmm7
+    paddd %xmm7, %xmm4
+    sha256msg2 %xmm3, %xmm4
+    pshufd $0x0e, %xmm0, %xmm0
+    sha256rnds2 %xmm2, %xmm1
+    sha256msg1 %xmm3, %xmm6
+    movdqa %xmm4, %xmm0
+    paddd 144(%rax), %xmm0
+    sha256rnds2 %xmm1, %xmm2
+    movdqa %xmm4, %xmm7
+    palignr $4, %xmm3, %xmm7
+    paddd %xmm7, %xmm5
+    sha256msg2 %xmm4, %xmm5
+    pshufd $0x0e, %xmm0, %xmm0
+    sha256rnds2 %xmm2, %xmm1
+    sha256msg1 %xmm4, %xmm3
+    movdqa %xmm5, %xmm0
+    paddd 160(%rax), %xmm0
+    sha256rnds2 %xmm1, %xmm2
+    movdqa %xmm5, %xmm7
+    palignr $4, %xmm4, %xmm7
+    paddd %xmm7, %xmm6
+    sha256msg2 %xmm5, %xmm6
+    pshufd $0x0e, %xmm0, %xmm0
+    sha256rnds2 %xmm2, %xmm1
+    sha256msg1 %xmm5, %xmm4
+    movdqa %xmm6, %xmm0
+    paddd 176(%rax), %xmm0
+    sha256rnds2 %xmm1, %xmm2
+    movdqa %xmm6, %xmm7
+    palignr $4, %xmm5, %xmm7
+    paddd %xmm7, %xmm3
+    sha256msg2 %xmm6, %xmm3
+    pshufd $0x0e, %xmm0, %xmm0
+    sha256rnds2 %xmm2, %xmm1
+    sha256msg1 %xmm6, %xmm5
+    movdqa %xmm3, %xmm0
+    paddd 192(%rax), %xmm0
+    sha256rnds2 %xmm1, %xmm2
+    movdqa %xmm3, %xmm7
+    palignr $4, %xmm6, %xmm7
+    paddd %xmm7, %xmm4
+    sha256msg2 %xmm3, %xmm4
+    pshufd $0x0e, %xmm0, %xmm0
+    sha256rnds2 %xmm2, %xmm1
+    sha256msg1 %xmm3, %xmm6
+    movdqa %xmm4, %xmm0
+    paddd 208(%rax), %xmm0
+    sha256rnds2 %xmm1, %xmm2
+    movdqa %xmm4, %xmm7
+    palignr $4, %xmm3, %xmm7
+    paddd %xmm7, %xmm5
+    sha256msg2 %xmm4, %xmm5
+    pshufd $0x0e, %xmm0, %xmm0
+    sha256rnds2 %xmm2, %xmm1
+    movdqa %xmm5, %xmm0
+    paddd 224(%rax), %xmm0
+    sha256rnds2 %xmm1, %xmm2
+    movdqa %xmm5, %xmm7
+    palignr $4, %xmm4, %xmm7
+    paddd %xmm7, %xmm6
+    sha256msg2 %xmm5, %xmm6
+    pshufd $0x0e, %xmm0, %xmm0
+    sha256rnds2 %xmm2, %xmm1
+    movdqa %xmm6, %xmm0
+    movdqu 240(%rax), %xmm11
+    paddd %xmm11, %xmm0
+    sha256rnds2 %xmm1, %xmm2
+    pshufd $0x0e, %xmm0, %xmm0
+    sha256rnds2 %xmm2, %xmm1
+    paddd %xmm9, %xmm1
+    paddd %xmm10, %xmm2
+    addq $64, %rsi
+    decq %rdx
+    jnz 1b
+    pshufd $0x1b, %xmm1, %xmm1
+    pshufd $0xb1, %xmm2, %xmm2
+    movdqa %xmm1, %xmm7
+    pblendw $0xf0, %xmm2, %xmm1
+    palignr $8, %xmm7, %xmm2
+    movdqu %xmm1, (%rdi)
+    movdqu %xmm2, 16(%rdi)
+  end;
+  asm arm64 (State: in x0; Data: in x1; k: in x2; bytes: in x3)
+    ld1 {v0.4s, v1.4s}, [x0]
+    ld1 {v16.4s, v17.4s, v18.4s, v19.4s}, [x2], #64
+    ld1 {v20.4s, v21.4s, v22.4s, v23.4s}, [x2], #64
+    ld1 {v24.4s, v25.4s, v26.4s, v27.4s}, [x2], #64
+    ld1 {v28.4s, v29.4s, v30.4s, v31.4s}, [x2]
+    1:
+    ld1 {v4.16b}, [x1], #16
+    ld1 {v5.16b}, [x1], #16
+    ld1 {v6.16b}, [x1], #16
+    ld1 {v7.16b}, [x1], #16
+    mov v2.16b, v0.16b
+    mov v3.16b, v1.16b
+    mov v8.16b, v2.16b
+    rev32 v4.16b, v4.16b
+    rev32 v5.16b, v5.16b
+    rev32 v6.16b, v6.16b
+    rev32 v7.16b, v7.16b
+    add v9.4s, v4.4s, v16.4s
+    sha256su0 v4.4s, v5.4s
+    sha256h q2, q3, v9.4s
+    sha256h2 q3, q8, v9.4s
+    mov v8.16b, v2.16b
+    add v9.4s, v5.4s, v17.4s
+    sha256su0 v5.4s, v6.4s
+    sha256su1 v4.4s, v6.4s, v7.4s
+    sha256h q2, q3, v9.4s
+    sha256h2 q3, q8, v9.4s
+    mov v8.16b, v2.16b
+    add v9.4s, v6.4s, v18.4s
+    sha256su0 v6.4s, v7.4s
+    sha256su1 v5.4s, v7.4s, v4.4s
+    sha256h q2, q3, v9.4s
+    sha256h2 q3, q8, v9.4s
+    mov v8.16b, v2.16b
+    add v9.4s, v7.4s, v19.4s
+    sha256su0 v7.4s, v4.4s
+    sha256su1 v6.4s, v4.4s, v5.4s
+    sha256h q2, q3, v9.4s
+    sha256h2 q3, q8, v9.4s
+    mov v8.16b, v2.16b
+    add v9.4s, v4.4s, v20.4s
+    sha256su0 v4.4s, v5.4s
+    sha256su1 v7.4s, v5.4s, v6.4s
+    sha256h q2, q3, v9.4s
+    sha256h2 q3, q8, v9.4s
+    mov v8.16b, v2.16b
+    add v9.4s, v5.4s, v21.4s
+    sha256su0 v5.4s, v6.4s
+    sha256su1 v4.4s, v6.4s, v7.4s
+    sha256h q2, q3, v9.4s
+    sha256h2 q3, q8, v9.4s
+    mov v8.16b, v2.16b
+    add v9.4s, v6.4s, v22.4s
+    sha256su0 v6.4s, v7.4s
+    sha256su1 v5.4s, v7.4s, v4.4s
+    sha256h q2, q3, v9.4s
+    sha256h2 q3, q8, v9.4s
+    mov v8.16b, v2.16b
+    add v9.4s, v7.4s, v23.4s
+    sha256su0 v7.4s, v4.4s
+    sha256su1 v6.4s, v4.4s, v5.4s
+    sha256h q2, q3, v9.4s
+    sha256h2 q3, q8, v9.4s
+    mov v8.16b, v2.16b
+    add v9.4s, v4.4s, v24.4s
+    sha256su0 v4.4s, v5.4s
+    sha256su1 v7.4s, v5.4s, v6.4s
+    sha256h q2, q3, v9.4s
+    sha256h2 q3, q8, v9.4s
+    mov v8.16b, v2.16b
+    add v9.4s, v5.4s, v25.4s
+    sha256su0 v5.4s, v6.4s
+    sha256su1 v4.4s, v6.4s, v7.4s
+    sha256h q2, q3, v9.4s
+    sha256h2 q3, q8, v9.4s
+    mov v8.16b, v2.16b
+    add v9.4s, v6.4s, v26.4s
+    sha256su0 v6.4s, v7.4s
+    sha256su1 v5.4s, v7.4s, v4.4s
+    sha256h q2, q3, v9.4s
+    sha256h2 q3, q8, v9.4s
+    mov v8.16b, v2.16b
+    add v9.4s, v7.4s, v27.4s
+    sha256su0 v7.4s, v4.4s
+    sha256su1 v6.4s, v4.4s, v5.4s
+    sha256h q2, q3, v9.4s
+    sha256h2 q3, q8, v9.4s
+    mov v8.16b, v2.16b
+    add v9.4s, v4.4s, v28.4s
+    sha256h q2, q3, v9.4s
+    sha256h2 q3, q8, v9.4s
+    mov v8.16b, v2.16b
+    sha256su1 v7.4s, v5.4s, v6.4s
+    add v9.4s, v5.4s, v29.4s
+    sha256h q2, q3, v9.4s
+    sha256h2 q3, q8, v9.4s
+    mov v8.16b, v2.16b
+    add v9.4s, v6.4s, v30.4s
+    sha256h q2, q3, v9.4s
+    sha256h2 q3, q8, v9.4s
+    mov v8.16b, v2.16b
+    add v9.4s, v7.4s, v31.4s
+    sha256h q2, q3, v9.4s
+    sha256h2 q3, q8, v9.4s
+    mov v8.16b, v2.16b
+    sub x3, x3, #64
+    add v0.4s, v0.4s, v2.4s
+    add v1.4s, v1.4s, v3.4s
+    cbnz x3, 1b
+    st1 {v0.4s, v1.4s}, [x0]
+  end;
+end;
+
+{ ---- SHA-1 (FIPS 180-4, 6.1) ---- }
+
+procedure Sha1BlocksPlain(State, Data: Pointer; N: Integer);
+var
+  w0, w1, w2, w3, w4, w5, w6, w7, w8, w9, w10, w11, w12, w13, w14, w15: UInt32;
+  a, b, c, d, e: UInt32;
+  j: Integer;
+  p: Pointer;
+begin
+  for j := 0 to N - 1 do
+  begin
+    p := Pointer(Integer(Data) + j * 64);
+    w0 := LoadBE32(p);
+    w1 := LoadBE32(Pointer(Integer(p) + 4));
+    w2 := LoadBE32(Pointer(Integer(p) + 8));
+    w3 := LoadBE32(Pointer(Integer(p) + 12));
+    w4 := LoadBE32(Pointer(Integer(p) + 16));
+    w5 := LoadBE32(Pointer(Integer(p) + 20));
+    w6 := LoadBE32(Pointer(Integer(p) + 24));
+    w7 := LoadBE32(Pointer(Integer(p) + 28));
+    w8 := LoadBE32(Pointer(Integer(p) + 32));
+    w9 := LoadBE32(Pointer(Integer(p) + 36));
+    w10 := LoadBE32(Pointer(Integer(p) + 40));
+    w11 := LoadBE32(Pointer(Integer(p) + 44));
+    w12 := LoadBE32(Pointer(Integer(p) + 48));
+    w13 := LoadBE32(Pointer(Integer(p) + 52));
+    w14 := LoadBE32(Pointer(Integer(p) + 56));
+    w15 := LoadBE32(Pointer(Integer(p) + 60));
+    a := LoadLE32(State);
+    b := LoadLE32(Pointer(Integer(State) + 4));
+    c := LoadLE32(Pointer(Integer(State) + 8));
+    d := LoadLE32(Pointer(Integer(State) + 12));
+    e := LoadLE32(Pointer(Integer(State) + 16));
+    e := e + RotateLeft(a, 5) + ((b and c) xor ((not b) and d)) + $5a827999 + w0;
+    b := RotateLeft(b, 30);
+    d := d + RotateLeft(e, 5) + ((a and b) xor ((not a) and c)) + $5a827999 + w1;
+    a := RotateLeft(a, 30);
+    c := c + RotateLeft(d, 5) + ((e and a) xor ((not e) and b)) + $5a827999 + w2;
+    e := RotateLeft(e, 30);
+    b := b + RotateLeft(c, 5) + ((d and e) xor ((not d) and a)) + $5a827999 + w3;
+    d := RotateLeft(d, 30);
+    a := a + RotateLeft(b, 5) + ((c and d) xor ((not c) and e)) + $5a827999 + w4;
+    c := RotateLeft(c, 30);
+    e := e + RotateLeft(a, 5) + ((b and c) xor ((not b) and d)) + $5a827999 + w5;
+    b := RotateLeft(b, 30);
+    d := d + RotateLeft(e, 5) + ((a and b) xor ((not a) and c)) + $5a827999 + w6;
+    a := RotateLeft(a, 30);
+    c := c + RotateLeft(d, 5) + ((e and a) xor ((not e) and b)) + $5a827999 + w7;
+    e := RotateLeft(e, 30);
+    b := b + RotateLeft(c, 5) + ((d and e) xor ((not d) and a)) + $5a827999 + w8;
+    d := RotateLeft(d, 30);
+    a := a + RotateLeft(b, 5) + ((c and d) xor ((not c) and e)) + $5a827999 + w9;
+    c := RotateLeft(c, 30);
+    e := e + RotateLeft(a, 5) + ((b and c) xor ((not b) and d)) + $5a827999 + w10;
+    b := RotateLeft(b, 30);
+    d := d + RotateLeft(e, 5) + ((a and b) xor ((not a) and c)) + $5a827999 + w11;
+    a := RotateLeft(a, 30);
+    c := c + RotateLeft(d, 5) + ((e and a) xor ((not e) and b)) + $5a827999 + w12;
+    e := RotateLeft(e, 30);
+    b := b + RotateLeft(c, 5) + ((d and e) xor ((not d) and a)) + $5a827999 + w13;
+    d := RotateLeft(d, 30);
+    a := a + RotateLeft(b, 5) + ((c and d) xor ((not c) and e)) + $5a827999 + w14;
+    c := RotateLeft(c, 30);
+    e := e + RotateLeft(a, 5) + ((b and c) xor ((not b) and d)) + $5a827999 + w15;
+    b := RotateLeft(b, 30);
+    w0 := RotateLeft(w13 xor w8 xor w2 xor w0, 1);
+    d := d + RotateLeft(e, 5) + ((a and b) xor ((not a) and c)) + $5a827999 + w0;
+    a := RotateLeft(a, 30);
+    w1 := RotateLeft(w14 xor w9 xor w3 xor w1, 1);
+    c := c + RotateLeft(d, 5) + ((e and a) xor ((not e) and b)) + $5a827999 + w1;
+    e := RotateLeft(e, 30);
+    w2 := RotateLeft(w15 xor w10 xor w4 xor w2, 1);
+    b := b + RotateLeft(c, 5) + ((d and e) xor ((not d) and a)) + $5a827999 + w2;
+    d := RotateLeft(d, 30);
+    w3 := RotateLeft(w0 xor w11 xor w5 xor w3, 1);
+    a := a + RotateLeft(b, 5) + ((c and d) xor ((not c) and e)) + $5a827999 + w3;
+    c := RotateLeft(c, 30);
+    w4 := RotateLeft(w1 xor w12 xor w6 xor w4, 1);
+    e := e + RotateLeft(a, 5) + (b xor c xor d) + $6ed9eba1 + w4;
+    b := RotateLeft(b, 30);
+    w5 := RotateLeft(w2 xor w13 xor w7 xor w5, 1);
+    d := d + RotateLeft(e, 5) + (a xor b xor c) + $6ed9eba1 + w5;
+    a := RotateLeft(a, 30);
+    w6 := RotateLeft(w3 xor w14 xor w8 xor w6, 1);
+    c := c + RotateLeft(d, 5) + (e xor a xor b) + $6ed9eba1 + w6;
+    e := RotateLeft(e, 30);
+    w7 := RotateLeft(w4 xor w15 xor w9 xor w7, 1);
+    b := b + RotateLeft(c, 5) + (d xor e xor a) + $6ed9eba1 + w7;
+    d := RotateLeft(d, 30);
+    w8 := RotateLeft(w5 xor w0 xor w10 xor w8, 1);
+    a := a + RotateLeft(b, 5) + (c xor d xor e) + $6ed9eba1 + w8;
+    c := RotateLeft(c, 30);
+    w9 := RotateLeft(w6 xor w1 xor w11 xor w9, 1);
+    e := e + RotateLeft(a, 5) + (b xor c xor d) + $6ed9eba1 + w9;
+    b := RotateLeft(b, 30);
+    w10 := RotateLeft(w7 xor w2 xor w12 xor w10, 1);
+    d := d + RotateLeft(e, 5) + (a xor b xor c) + $6ed9eba1 + w10;
+    a := RotateLeft(a, 30);
+    w11 := RotateLeft(w8 xor w3 xor w13 xor w11, 1);
+    c := c + RotateLeft(d, 5) + (e xor a xor b) + $6ed9eba1 + w11;
+    e := RotateLeft(e, 30);
+    w12 := RotateLeft(w9 xor w4 xor w14 xor w12, 1);
+    b := b + RotateLeft(c, 5) + (d xor e xor a) + $6ed9eba1 + w12;
+    d := RotateLeft(d, 30);
+    w13 := RotateLeft(w10 xor w5 xor w15 xor w13, 1);
+    a := a + RotateLeft(b, 5) + (c xor d xor e) + $6ed9eba1 + w13;
+    c := RotateLeft(c, 30);
+    w14 := RotateLeft(w11 xor w6 xor w0 xor w14, 1);
+    e := e + RotateLeft(a, 5) + (b xor c xor d) + $6ed9eba1 + w14;
+    b := RotateLeft(b, 30);
+    w15 := RotateLeft(w12 xor w7 xor w1 xor w15, 1);
+    d := d + RotateLeft(e, 5) + (a xor b xor c) + $6ed9eba1 + w15;
+    a := RotateLeft(a, 30);
+    w0 := RotateLeft(w13 xor w8 xor w2 xor w0, 1);
+    c := c + RotateLeft(d, 5) + (e xor a xor b) + $6ed9eba1 + w0;
+    e := RotateLeft(e, 30);
+    w1 := RotateLeft(w14 xor w9 xor w3 xor w1, 1);
+    b := b + RotateLeft(c, 5) + (d xor e xor a) + $6ed9eba1 + w1;
+    d := RotateLeft(d, 30);
+    w2 := RotateLeft(w15 xor w10 xor w4 xor w2, 1);
+    a := a + RotateLeft(b, 5) + (c xor d xor e) + $6ed9eba1 + w2;
+    c := RotateLeft(c, 30);
+    w3 := RotateLeft(w0 xor w11 xor w5 xor w3, 1);
+    e := e + RotateLeft(a, 5) + (b xor c xor d) + $6ed9eba1 + w3;
+    b := RotateLeft(b, 30);
+    w4 := RotateLeft(w1 xor w12 xor w6 xor w4, 1);
+    d := d + RotateLeft(e, 5) + (a xor b xor c) + $6ed9eba1 + w4;
+    a := RotateLeft(a, 30);
+    w5 := RotateLeft(w2 xor w13 xor w7 xor w5, 1);
+    c := c + RotateLeft(d, 5) + (e xor a xor b) + $6ed9eba1 + w5;
+    e := RotateLeft(e, 30);
+    w6 := RotateLeft(w3 xor w14 xor w8 xor w6, 1);
+    b := b + RotateLeft(c, 5) + (d xor e xor a) + $6ed9eba1 + w6;
+    d := RotateLeft(d, 30);
+    w7 := RotateLeft(w4 xor w15 xor w9 xor w7, 1);
+    a := a + RotateLeft(b, 5) + (c xor d xor e) + $6ed9eba1 + w7;
+    c := RotateLeft(c, 30);
+    w8 := RotateLeft(w5 xor w0 xor w10 xor w8, 1);
+    e := e + RotateLeft(a, 5) + ((b and c) xor (b and d) xor (c and d)) + $8f1bbcdc + w8;
+    b := RotateLeft(b, 30);
+    w9 := RotateLeft(w6 xor w1 xor w11 xor w9, 1);
+    d := d + RotateLeft(e, 5) + ((a and b) xor (a and c) xor (b and c)) + $8f1bbcdc + w9;
+    a := RotateLeft(a, 30);
+    w10 := RotateLeft(w7 xor w2 xor w12 xor w10, 1);
+    c := c + RotateLeft(d, 5) + ((e and a) xor (e and b) xor (a and b)) + $8f1bbcdc + w10;
+    e := RotateLeft(e, 30);
+    w11 := RotateLeft(w8 xor w3 xor w13 xor w11, 1);
+    b := b + RotateLeft(c, 5) + ((d and e) xor (d and a) xor (e and a)) + $8f1bbcdc + w11;
+    d := RotateLeft(d, 30);
+    w12 := RotateLeft(w9 xor w4 xor w14 xor w12, 1);
+    a := a + RotateLeft(b, 5) + ((c and d) xor (c and e) xor (d and e)) + $8f1bbcdc + w12;
+    c := RotateLeft(c, 30);
+    w13 := RotateLeft(w10 xor w5 xor w15 xor w13, 1);
+    e := e + RotateLeft(a, 5) + ((b and c) xor (b and d) xor (c and d)) + $8f1bbcdc + w13;
+    b := RotateLeft(b, 30);
+    w14 := RotateLeft(w11 xor w6 xor w0 xor w14, 1);
+    d := d + RotateLeft(e, 5) + ((a and b) xor (a and c) xor (b and c)) + $8f1bbcdc + w14;
+    a := RotateLeft(a, 30);
+    w15 := RotateLeft(w12 xor w7 xor w1 xor w15, 1);
+    c := c + RotateLeft(d, 5) + ((e and a) xor (e and b) xor (a and b)) + $8f1bbcdc + w15;
+    e := RotateLeft(e, 30);
+    w0 := RotateLeft(w13 xor w8 xor w2 xor w0, 1);
+    b := b + RotateLeft(c, 5) + ((d and e) xor (d and a) xor (e and a)) + $8f1bbcdc + w0;
+    d := RotateLeft(d, 30);
+    w1 := RotateLeft(w14 xor w9 xor w3 xor w1, 1);
+    a := a + RotateLeft(b, 5) + ((c and d) xor (c and e) xor (d and e)) + $8f1bbcdc + w1;
+    c := RotateLeft(c, 30);
+    w2 := RotateLeft(w15 xor w10 xor w4 xor w2, 1);
+    e := e + RotateLeft(a, 5) + ((b and c) xor (b and d) xor (c and d)) + $8f1bbcdc + w2;
+    b := RotateLeft(b, 30);
+    w3 := RotateLeft(w0 xor w11 xor w5 xor w3, 1);
+    d := d + RotateLeft(e, 5) + ((a and b) xor (a and c) xor (b and c)) + $8f1bbcdc + w3;
+    a := RotateLeft(a, 30);
+    w4 := RotateLeft(w1 xor w12 xor w6 xor w4, 1);
+    c := c + RotateLeft(d, 5) + ((e and a) xor (e and b) xor (a and b)) + $8f1bbcdc + w4;
+    e := RotateLeft(e, 30);
+    w5 := RotateLeft(w2 xor w13 xor w7 xor w5, 1);
+    b := b + RotateLeft(c, 5) + ((d and e) xor (d and a) xor (e and a)) + $8f1bbcdc + w5;
+    d := RotateLeft(d, 30);
+    w6 := RotateLeft(w3 xor w14 xor w8 xor w6, 1);
+    a := a + RotateLeft(b, 5) + ((c and d) xor (c and e) xor (d and e)) + $8f1bbcdc + w6;
+    c := RotateLeft(c, 30);
+    w7 := RotateLeft(w4 xor w15 xor w9 xor w7, 1);
+    e := e + RotateLeft(a, 5) + ((b and c) xor (b and d) xor (c and d)) + $8f1bbcdc + w7;
+    b := RotateLeft(b, 30);
+    w8 := RotateLeft(w5 xor w0 xor w10 xor w8, 1);
+    d := d + RotateLeft(e, 5) + ((a and b) xor (a and c) xor (b and c)) + $8f1bbcdc + w8;
+    a := RotateLeft(a, 30);
+    w9 := RotateLeft(w6 xor w1 xor w11 xor w9, 1);
+    c := c + RotateLeft(d, 5) + ((e and a) xor (e and b) xor (a and b)) + $8f1bbcdc + w9;
+    e := RotateLeft(e, 30);
+    w10 := RotateLeft(w7 xor w2 xor w12 xor w10, 1);
+    b := b + RotateLeft(c, 5) + ((d and e) xor (d and a) xor (e and a)) + $8f1bbcdc + w10;
+    d := RotateLeft(d, 30);
+    w11 := RotateLeft(w8 xor w3 xor w13 xor w11, 1);
+    a := a + RotateLeft(b, 5) + ((c and d) xor (c and e) xor (d and e)) + $8f1bbcdc + w11;
+    c := RotateLeft(c, 30);
+    w12 := RotateLeft(w9 xor w4 xor w14 xor w12, 1);
+    e := e + RotateLeft(a, 5) + (b xor c xor d) + $ca62c1d6 + w12;
+    b := RotateLeft(b, 30);
+    w13 := RotateLeft(w10 xor w5 xor w15 xor w13, 1);
+    d := d + RotateLeft(e, 5) + (a xor b xor c) + $ca62c1d6 + w13;
+    a := RotateLeft(a, 30);
+    w14 := RotateLeft(w11 xor w6 xor w0 xor w14, 1);
+    c := c + RotateLeft(d, 5) + (e xor a xor b) + $ca62c1d6 + w14;
+    e := RotateLeft(e, 30);
+    w15 := RotateLeft(w12 xor w7 xor w1 xor w15, 1);
+    b := b + RotateLeft(c, 5) + (d xor e xor a) + $ca62c1d6 + w15;
+    d := RotateLeft(d, 30);
+    w0 := RotateLeft(w13 xor w8 xor w2 xor w0, 1);
+    a := a + RotateLeft(b, 5) + (c xor d xor e) + $ca62c1d6 + w0;
+    c := RotateLeft(c, 30);
+    w1 := RotateLeft(w14 xor w9 xor w3 xor w1, 1);
+    e := e + RotateLeft(a, 5) + (b xor c xor d) + $ca62c1d6 + w1;
+    b := RotateLeft(b, 30);
+    w2 := RotateLeft(w15 xor w10 xor w4 xor w2, 1);
+    d := d + RotateLeft(e, 5) + (a xor b xor c) + $ca62c1d6 + w2;
+    a := RotateLeft(a, 30);
+    w3 := RotateLeft(w0 xor w11 xor w5 xor w3, 1);
+    c := c + RotateLeft(d, 5) + (e xor a xor b) + $ca62c1d6 + w3;
+    e := RotateLeft(e, 30);
+    w4 := RotateLeft(w1 xor w12 xor w6 xor w4, 1);
+    b := b + RotateLeft(c, 5) + (d xor e xor a) + $ca62c1d6 + w4;
+    d := RotateLeft(d, 30);
+    w5 := RotateLeft(w2 xor w13 xor w7 xor w5, 1);
+    a := a + RotateLeft(b, 5) + (c xor d xor e) + $ca62c1d6 + w5;
+    c := RotateLeft(c, 30);
+    w6 := RotateLeft(w3 xor w14 xor w8 xor w6, 1);
+    e := e + RotateLeft(a, 5) + (b xor c xor d) + $ca62c1d6 + w6;
+    b := RotateLeft(b, 30);
+    w7 := RotateLeft(w4 xor w15 xor w9 xor w7, 1);
+    d := d + RotateLeft(e, 5) + (a xor b xor c) + $ca62c1d6 + w7;
+    a := RotateLeft(a, 30);
+    w8 := RotateLeft(w5 xor w0 xor w10 xor w8, 1);
+    c := c + RotateLeft(d, 5) + (e xor a xor b) + $ca62c1d6 + w8;
+    e := RotateLeft(e, 30);
+    w9 := RotateLeft(w6 xor w1 xor w11 xor w9, 1);
+    b := b + RotateLeft(c, 5) + (d xor e xor a) + $ca62c1d6 + w9;
+    d := RotateLeft(d, 30);
+    w10 := RotateLeft(w7 xor w2 xor w12 xor w10, 1);
+    a := a + RotateLeft(b, 5) + (c xor d xor e) + $ca62c1d6 + w10;
+    c := RotateLeft(c, 30);
+    w11 := RotateLeft(w8 xor w3 xor w13 xor w11, 1);
+    e := e + RotateLeft(a, 5) + (b xor c xor d) + $ca62c1d6 + w11;
+    b := RotateLeft(b, 30);
+    w12 := RotateLeft(w9 xor w4 xor w14 xor w12, 1);
+    d := d + RotateLeft(e, 5) + (a xor b xor c) + $ca62c1d6 + w12;
+    a := RotateLeft(a, 30);
+    w13 := RotateLeft(w10 xor w5 xor w15 xor w13, 1);
+    c := c + RotateLeft(d, 5) + (e xor a xor b) + $ca62c1d6 + w13;
+    e := RotateLeft(e, 30);
+    w14 := RotateLeft(w11 xor w6 xor w0 xor w14, 1);
+    b := b + RotateLeft(c, 5) + (d xor e xor a) + $ca62c1d6 + w14;
+    d := RotateLeft(d, 30);
+    w15 := RotateLeft(w12 xor w7 xor w1 xor w15, 1);
+    a := a + RotateLeft(b, 5) + (c xor d xor e) + $ca62c1d6 + w15;
+    c := RotateLeft(c, 30);
+    StoreLE32(State, LoadLE32(State) + a);
+    StoreLE32(Pointer(Integer(State) + 4), LoadLE32(Pointer(Integer(State) + 4)) + b);
+    StoreLE32(Pointer(Integer(State) + 8), LoadLE32(Pointer(Integer(State) + 8)) + c);
+    StoreLE32(Pointer(Integer(State) + 12), LoadLE32(Pointer(Integer(State) + 12)) + d);
+    StoreLE32(Pointer(Integer(State) + 16), LoadLE32(Pointer(Integer(State) + 16)) + e);
+  end;
+end;
+
+{ SHA-NI: SHA1RNDS4, SHA1NEXTE, SHA1MSG1, SHA1MSG2 (SDM vol. 2B), four
+  rounds a step with the state as (A B C D) high to low and E in the
+  top dword, the message schedule a group of four words ahead; arm64
+  after Go's sha1block_arm64.s (SHA1C, SHA1P, SHA1M, SHA1H, SHA1SU0,
+  SHA1SU1, Arm ARM C7.2.283-288). }
+procedure Sha1BlocksCpu(State, Data: Pointer; N: Integer);
+var
+  k: Pointer;
+  bytes: Integer;
+begin
+  k := @K1[0];
+  bytes := N * 64;
+  asm amd64 (State: in rdi; Data: in rsi; N: in rdx)
+    movdqu (%rdi), %xmm0
+    pshufd $0x1b, %xmm0, %xmm0
+    pxor %xmm1, %xmm1
+    pinsrd $3, 16(%rdi), %xmm1
+    movabsq $0x08090a0b0c0d0e0f, %rcx
+    movq %rcx, %xmm7
+    movabsq $0x0001020304050607, %rcx
+    pinsrq $1, %rcx, %xmm7
+    1:
+    movdqa %xmm0, %xmm8
+    movdqa %xmm1, %xmm9
+    movdqu 0(%rsi), %xmm3
+    pshufb %xmm7, %xmm3
+    paddd %xmm3, %xmm1
+    movdqa %xmm0, %xmm2
+    sha1rnds4 $0, %xmm1, %xmm0
+    movdqu 16(%rsi), %xmm4
+    pshufb %xmm7, %xmm4
+    sha1nexte %xmm4, %xmm2
+    movdqa %xmm0, %xmm1
+    sha1rnds4 $0, %xmm2, %xmm0
+    sha1msg1 %xmm4, %xmm3
+    movdqu 32(%rsi), %xmm5
+    pshufb %xmm7, %xmm5
+    sha1nexte %xmm5, %xmm1
+    movdqa %xmm0, %xmm2
+    sha1rnds4 $0, %xmm1, %xmm0
+    sha1msg1 %xmm5, %xmm4
+    pxor %xmm5, %xmm3
+    movdqu 48(%rsi), %xmm6
+    pshufb %xmm7, %xmm6
+    sha1nexte %xmm6, %xmm2
+    movdqa %xmm0, %xmm1
+    sha1msg2 %xmm6, %xmm3
+    sha1rnds4 $0, %xmm2, %xmm0
+    sha1msg1 %xmm6, %xmm5
+    pxor %xmm6, %xmm4
+    sha1nexte %xmm3, %xmm1
+    movdqa %xmm0, %xmm2
+    sha1msg2 %xmm3, %xmm4
+    sha1rnds4 $0, %xmm1, %xmm0
+    sha1msg1 %xmm3, %xmm6
+    pxor %xmm3, %xmm5
+    sha1nexte %xmm4, %xmm2
+    movdqa %xmm0, %xmm1
+    sha1msg2 %xmm4, %xmm5
+    sha1rnds4 $1, %xmm2, %xmm0
+    sha1msg1 %xmm4, %xmm3
+    pxor %xmm4, %xmm6
+    sha1nexte %xmm5, %xmm1
+    movdqa %xmm0, %xmm2
+    sha1msg2 %xmm5, %xmm6
+    sha1rnds4 $1, %xmm1, %xmm0
+    sha1msg1 %xmm5, %xmm4
+    pxor %xmm5, %xmm3
+    sha1nexte %xmm6, %xmm2
+    movdqa %xmm0, %xmm1
+    sha1msg2 %xmm6, %xmm3
+    sha1rnds4 $1, %xmm2, %xmm0
+    sha1msg1 %xmm6, %xmm5
+    pxor %xmm6, %xmm4
+    sha1nexte %xmm3, %xmm1
+    movdqa %xmm0, %xmm2
+    sha1msg2 %xmm3, %xmm4
+    sha1rnds4 $1, %xmm1, %xmm0
+    sha1msg1 %xmm3, %xmm6
+    pxor %xmm3, %xmm5
+    sha1nexte %xmm4, %xmm2
+    movdqa %xmm0, %xmm1
+    sha1msg2 %xmm4, %xmm5
+    sha1rnds4 $1, %xmm2, %xmm0
+    sha1msg1 %xmm4, %xmm3
+    pxor %xmm4, %xmm6
+    sha1nexte %xmm5, %xmm1
+    movdqa %xmm0, %xmm2
+    sha1msg2 %xmm5, %xmm6
+    sha1rnds4 $2, %xmm1, %xmm0
+    sha1msg1 %xmm5, %xmm4
+    pxor %xmm5, %xmm3
+    sha1nexte %xmm6, %xmm2
+    movdqa %xmm0, %xmm1
+    sha1msg2 %xmm6, %xmm3
+    sha1rnds4 $2, %xmm2, %xmm0
+    sha1msg1 %xmm6, %xmm5
+    pxor %xmm6, %xmm4
+    sha1nexte %xmm3, %xmm1
+    movdqa %xmm0, %xmm2
+    sha1msg2 %xmm3, %xmm4
+    sha1rnds4 $2, %xmm1, %xmm0
+    sha1msg1 %xmm3, %xmm6
+    pxor %xmm3, %xmm5
+    sha1nexte %xmm4, %xmm2
+    movdqa %xmm0, %xmm1
+    sha1msg2 %xmm4, %xmm5
+    sha1rnds4 $2, %xmm2, %xmm0
+    sha1msg1 %xmm4, %xmm3
+    pxor %xmm4, %xmm6
+    sha1nexte %xmm5, %xmm1
+    movdqa %xmm0, %xmm2
+    sha1msg2 %xmm5, %xmm6
+    sha1rnds4 $2, %xmm1, %xmm0
+    sha1msg1 %xmm5, %xmm4
+    pxor %xmm5, %xmm3
+    sha1nexte %xmm6, %xmm2
+    movdqa %xmm0, %xmm1
+    sha1msg2 %xmm6, %xmm3
+    sha1rnds4 $3, %xmm2, %xmm0
+    sha1msg1 %xmm6, %xmm5
+    pxor %xmm6, %xmm4
+    sha1nexte %xmm3, %xmm1
+    movdqa %xmm0, %xmm2
+    sha1msg2 %xmm3, %xmm4
+    sha1rnds4 $3, %xmm1, %xmm0
+    sha1msg1 %xmm3, %xmm6
+    pxor %xmm3, %xmm5
+    sha1nexte %xmm4, %xmm2
+    movdqa %xmm0, %xmm1
+    sha1msg2 %xmm4, %xmm5
+    sha1rnds4 $3, %xmm2, %xmm0
+    pxor %xmm4, %xmm6
+    sha1nexte %xmm5, %xmm1
+    movdqa %xmm0, %xmm2
+    sha1msg2 %xmm5, %xmm6
+    sha1rnds4 $3, %xmm1, %xmm0
+    sha1nexte %xmm6, %xmm2
+    movdqa %xmm0, %xmm1
+    sha1rnds4 $3, %xmm2, %xmm0
+    sha1nexte %xmm9, %xmm1
+    paddd %xmm8, %xmm0
+    addq $64, %rsi
+    decq %rdx
+    jnz 1b
+    pshufd $0x1b, %xmm0, %xmm0
+    movdqu %xmm0, (%rdi)
+    pextrd $3, %xmm1, 16(%rdi)
+  end;
+  asm arm64 (State: in x0; Data: in x1; k: in x2; bytes: in x3)
+    ld1 {v0.4s}, [x0], #16
+    ldr s20, [x0]
+    sub x0, x0, #16
+    1:
+    ld1 {v4.16b}, [x1], #16
+    ld1 {v5.16b}, [x1], #16
+    ld1 {v6.16b}, [x1], #16
+    ld1 {v7.16b}, [x1], #16
+    ld1 {v19.4s}, [x2]
+    mov v2.16b, v0.16b
+    mov s1, v20.s[0]
+    mov v3.16b, v2.16b
+    dup v17.4s, v19.s[0]
+    rev32 v4.16b, v4.16b
+    rev32 v5.16b, v5.16b
+    rev32 v6.16b, v6.16b
+    rev32 v7.16b, v7.16b
+    dup v18.4s, v19.s[1]
+    add v16.4s, v4.4s, v17.4s
+    sha1su0 v4.4s, v5.4s, v6.4s
+    sha1c q2, s1, v16.4s
+    sha1h s1, s3
+    mov v3.16b, v2.16b
+    sha1su1 v4.4s, v7.4s
+    add v16.4s, v5.4s, v17.4s
+    sha1su0 v5.4s, v6.4s, v7.4s
+    sha1c q2, s1, v16.4s
+    sha1h s1, s3
+    mov v3.16b, v2.16b
+    sha1su1 v5.4s, v4.4s
+    add v16.4s, v6.4s, v17.4s
+    sha1su0 v6.4s, v7.4s, v4.4s
+    sha1c q2, s1, v16.4s
+    sha1h s1, s3
+    mov v3.16b, v2.16b
+    sha1su1 v6.4s, v5.4s
+    add v16.4s, v7.4s, v17.4s
+    sha1su0 v7.4s, v4.4s, v5.4s
+    sha1c q2, s1, v16.4s
+    sha1h s1, s3
+    mov v3.16b, v2.16b
+    sha1su1 v7.4s, v6.4s
+    add v16.4s, v4.4s, v17.4s
+    sha1su0 v4.4s, v5.4s, v6.4s
+    sha1c q2, s1, v16.4s
+    sha1h s1, s3
+    mov v3.16b, v2.16b
+    sha1su1 v4.4s, v7.4s
+    dup v17.4s, v19.s[2]
+    add v16.4s, v5.4s, v18.4s
+    sha1su0 v5.4s, v6.4s, v7.4s
+    sha1p q2, s1, v16.4s
+    sha1h s1, s3
+    mov v3.16b, v2.16b
+    sha1su1 v5.4s, v4.4s
+    add v16.4s, v6.4s, v18.4s
+    sha1su0 v6.4s, v7.4s, v4.4s
+    sha1p q2, s1, v16.4s
+    sha1h s1, s3
+    mov v3.16b, v2.16b
+    sha1su1 v6.4s, v5.4s
+    add v16.4s, v7.4s, v18.4s
+    sha1su0 v7.4s, v4.4s, v5.4s
+    sha1p q2, s1, v16.4s
+    sha1h s1, s3
+    mov v3.16b, v2.16b
+    sha1su1 v7.4s, v6.4s
+    add v16.4s, v4.4s, v18.4s
+    sha1su0 v4.4s, v5.4s, v6.4s
+    sha1p q2, s1, v16.4s
+    sha1h s1, s3
+    mov v3.16b, v2.16b
+    sha1su1 v4.4s, v7.4s
+    add v16.4s, v5.4s, v18.4s
+    sha1su0 v5.4s, v6.4s, v7.4s
+    sha1p q2, s1, v16.4s
+    sha1h s1, s3
+    mov v3.16b, v2.16b
+    sha1su1 v5.4s, v4.4s
+    dup v18.4s, v19.s[3]
+    add v16.4s, v6.4s, v17.4s
+    sha1su0 v6.4s, v7.4s, v4.4s
+    sha1m q2, s1, v16.4s
+    sha1h s1, s3
+    mov v3.16b, v2.16b
+    sha1su1 v6.4s, v5.4s
+    add v16.4s, v7.4s, v17.4s
+    sha1su0 v7.4s, v4.4s, v5.4s
+    sha1m q2, s1, v16.4s
+    sha1h s1, s3
+    mov v3.16b, v2.16b
+    sha1su1 v7.4s, v6.4s
+    add v16.4s, v4.4s, v17.4s
+    sha1su0 v4.4s, v5.4s, v6.4s
+    sha1m q2, s1, v16.4s
+    sha1h s1, s3
+    mov v3.16b, v2.16b
+    sha1su1 v4.4s, v7.4s
+    add v16.4s, v5.4s, v17.4s
+    sha1su0 v5.4s, v6.4s, v7.4s
+    sha1m q2, s1, v16.4s
+    sha1h s1, s3
+    mov v3.16b, v2.16b
+    sha1su1 v5.4s, v4.4s
+    add v16.4s, v6.4s, v17.4s
+    sha1su0 v6.4s, v7.4s, v4.4s
+    sha1m q2, s1, v16.4s
+    sha1h s1, s3
+    mov v3.16b, v2.16b
+    sha1su1 v6.4s, v5.4s
+    add v16.4s, v7.4s, v18.4s
+    sha1su0 v7.4s, v4.4s, v5.4s
+    sha1p q2, s1, v16.4s
+    sha1h s1, s3
+    mov v3.16b, v2.16b
+    sha1su1 v7.4s, v6.4s
+    add v16.4s, v4.4s, v18.4s
+    sha1p q2, s1, v16.4s
+    sha1h s1, s3
+    mov v3.16b, v2.16b
+    add v16.4s, v5.4s, v18.4s
+    sha1p q2, s1, v16.4s
+    sha1h s1, s3
+    mov v3.16b, v2.16b
+    add v16.4s, v6.4s, v18.4s
+    sha1p q2, s1, v16.4s
+    sha1h s1, s3
+    mov v3.16b, v2.16b
+    add v16.4s, v7.4s, v18.4s
+    sha1p q2, s1, v16.4s
+    sha1h s1, s3
+    mov v3.16b, v2.16b
+    sub x3, x3, #64
+    add v0.4s, v0.4s, v2.4s
+    add v20.4s, v20.4s, v1.4s
+    cbnz x3, 1b
+    st1 {v0.4s}, [x0], #16
+    str s20, [x0]
+  end;
+end;
+
+{ ---- SHA-512 and SHA-384 (FIPS 180-4, 6.4 and 6.5) ---- }
+
+procedure Sha512BlocksPlain(State, Data: Pointer; N: Integer);
+var
+  w0, w1, w2, w3, w4, w5, w6, w7, w8, w9, w10, w11, w12, w13, w14, w15: Integer;
+  a, b, c, d, e, f, g, h: Integer;
+  j: Integer;
+  p: Pointer;
+begin
+  for j := 0 to N - 1 do
+  begin
+    p := Pointer(Integer(Data) + j * 128);
+    w0 := LoadBE64(p);
+    w1 := LoadBE64(Pointer(Integer(p) + 8));
+    w2 := LoadBE64(Pointer(Integer(p) + 16));
+    w3 := LoadBE64(Pointer(Integer(p) + 24));
+    w4 := LoadBE64(Pointer(Integer(p) + 32));
+    w5 := LoadBE64(Pointer(Integer(p) + 40));
+    w6 := LoadBE64(Pointer(Integer(p) + 48));
+    w7 := LoadBE64(Pointer(Integer(p) + 56));
+    w8 := LoadBE64(Pointer(Integer(p) + 64));
+    w9 := LoadBE64(Pointer(Integer(p) + 72));
+    w10 := LoadBE64(Pointer(Integer(p) + 80));
+    w11 := LoadBE64(Pointer(Integer(p) + 88));
+    w12 := LoadBE64(Pointer(Integer(p) + 96));
+    w13 := LoadBE64(Pointer(Integer(p) + 104));
+    w14 := LoadBE64(Pointer(Integer(p) + 112));
+    w15 := LoadBE64(Pointer(Integer(p) + 120));
+    a := LoadLE64(State);
+    b := LoadLE64(Pointer(Integer(State) + 8));
+    c := LoadLE64(Pointer(Integer(State) + 16));
+    d := LoadLE64(Pointer(Integer(State) + 24));
+    e := LoadLE64(Pointer(Integer(State) + 32));
+    f := LoadLE64(Pointer(Integer(State) + 40));
+    g := LoadLE64(Pointer(Integer(State) + 48));
+    h := LoadLE64(Pointer(Integer(State) + 56));
+    h := h + (RotateRight(e, 14) xor RotateRight(e, 18) xor RotateRight(e, 41)) +
+      ((e and f) xor ((not e) and g)) + $428a2f98d728ae22 + w0;
+    d := d + h;
+    h := h + (RotateRight(a, 28) xor RotateRight(a, 34) xor RotateRight(a, 39)) +
+      ((a and b) xor (a and c) xor (b and c));
+    g := g + (RotateRight(d, 14) xor RotateRight(d, 18) xor RotateRight(d, 41)) +
+      ((d and e) xor ((not d) and f)) + $7137449123ef65cd + w1;
+    c := c + g;
+    g := g + (RotateRight(h, 28) xor RotateRight(h, 34) xor RotateRight(h, 39)) +
+      ((h and a) xor (h and b) xor (a and b));
+    f := f + (RotateRight(c, 14) xor RotateRight(c, 18) xor RotateRight(c, 41)) +
+      ((c and d) xor ((not c) and e)) + $b5c0fbcfec4d3b2f + w2;
+    b := b + f;
+    f := f + (RotateRight(g, 28) xor RotateRight(g, 34) xor RotateRight(g, 39)) +
+      ((g and h) xor (g and a) xor (h and a));
+    e := e + (RotateRight(b, 14) xor RotateRight(b, 18) xor RotateRight(b, 41)) +
+      ((b and c) xor ((not b) and d)) + $e9b5dba58189dbbc + w3;
+    a := a + e;
+    e := e + (RotateRight(f, 28) xor RotateRight(f, 34) xor RotateRight(f, 39)) +
+      ((f and g) xor (f and h) xor (g and h));
+    d := d + (RotateRight(a, 14) xor RotateRight(a, 18) xor RotateRight(a, 41)) +
+      ((a and b) xor ((not a) and c)) + $3956c25bf348b538 + w4;
+    h := h + d;
+    d := d + (RotateRight(e, 28) xor RotateRight(e, 34) xor RotateRight(e, 39)) +
+      ((e and f) xor (e and g) xor (f and g));
+    c := c + (RotateRight(h, 14) xor RotateRight(h, 18) xor RotateRight(h, 41)) +
+      ((h and a) xor ((not h) and b)) + $59f111f1b605d019 + w5;
+    g := g + c;
+    c := c + (RotateRight(d, 28) xor RotateRight(d, 34) xor RotateRight(d, 39)) +
+      ((d and e) xor (d and f) xor (e and f));
+    b := b + (RotateRight(g, 14) xor RotateRight(g, 18) xor RotateRight(g, 41)) +
+      ((g and h) xor ((not g) and a)) + $923f82a4af194f9b + w6;
+    f := f + b;
+    b := b + (RotateRight(c, 28) xor RotateRight(c, 34) xor RotateRight(c, 39)) +
+      ((c and d) xor (c and e) xor (d and e));
+    a := a + (RotateRight(f, 14) xor RotateRight(f, 18) xor RotateRight(f, 41)) +
+      ((f and g) xor ((not f) and h)) + $ab1c5ed5da6d8118 + w7;
+    e := e + a;
+    a := a + (RotateRight(b, 28) xor RotateRight(b, 34) xor RotateRight(b, 39)) +
+      ((b and c) xor (b and d) xor (c and d));
+    h := h + (RotateRight(e, 14) xor RotateRight(e, 18) xor RotateRight(e, 41)) +
+      ((e and f) xor ((not e) and g)) + $d807aa98a3030242 + w8;
+    d := d + h;
+    h := h + (RotateRight(a, 28) xor RotateRight(a, 34) xor RotateRight(a, 39)) +
+      ((a and b) xor (a and c) xor (b and c));
+    g := g + (RotateRight(d, 14) xor RotateRight(d, 18) xor RotateRight(d, 41)) +
+      ((d and e) xor ((not d) and f)) + $12835b0145706fbe + w9;
+    c := c + g;
+    g := g + (RotateRight(h, 28) xor RotateRight(h, 34) xor RotateRight(h, 39)) +
+      ((h and a) xor (h and b) xor (a and b));
+    f := f + (RotateRight(c, 14) xor RotateRight(c, 18) xor RotateRight(c, 41)) +
+      ((c and d) xor ((not c) and e)) + $243185be4ee4b28c + w10;
+    b := b + f;
+    f := f + (RotateRight(g, 28) xor RotateRight(g, 34) xor RotateRight(g, 39)) +
+      ((g and h) xor (g and a) xor (h and a));
+    e := e + (RotateRight(b, 14) xor RotateRight(b, 18) xor RotateRight(b, 41)) +
+      ((b and c) xor ((not b) and d)) + $550c7dc3d5ffb4e2 + w11;
+    a := a + e;
+    e := e + (RotateRight(f, 28) xor RotateRight(f, 34) xor RotateRight(f, 39)) +
+      ((f and g) xor (f and h) xor (g and h));
+    d := d + (RotateRight(a, 14) xor RotateRight(a, 18) xor RotateRight(a, 41)) +
+      ((a and b) xor ((not a) and c)) + $72be5d74f27b896f + w12;
+    h := h + d;
+    d := d + (RotateRight(e, 28) xor RotateRight(e, 34) xor RotateRight(e, 39)) +
+      ((e and f) xor (e and g) xor (f and g));
+    c := c + (RotateRight(h, 14) xor RotateRight(h, 18) xor RotateRight(h, 41)) +
+      ((h and a) xor ((not h) and b)) + $80deb1fe3b1696b1 + w13;
+    g := g + c;
+    c := c + (RotateRight(d, 28) xor RotateRight(d, 34) xor RotateRight(d, 39)) +
+      ((d and e) xor (d and f) xor (e and f));
+    b := b + (RotateRight(g, 14) xor RotateRight(g, 18) xor RotateRight(g, 41)) +
+      ((g and h) xor ((not g) and a)) + $9bdc06a725c71235 + w14;
+    f := f + b;
+    b := b + (RotateRight(c, 28) xor RotateRight(c, 34) xor RotateRight(c, 39)) +
+      ((c and d) xor (c and e) xor (d and e));
+    a := a + (RotateRight(f, 14) xor RotateRight(f, 18) xor RotateRight(f, 41)) +
+      ((f and g) xor ((not f) and h)) + $c19bf174cf692694 + w15;
+    e := e + a;
+    a := a + (RotateRight(b, 28) xor RotateRight(b, 34) xor RotateRight(b, 39)) +
+      ((b and c) xor (b and d) xor (c and d));
+    w0 := w0 + (RotateRight(w1, 1) xor RotateRight(w1, 8) xor (w1 shr 7)) + w9 +
+      (RotateRight(w14, 19) xor RotateRight(w14, 61) xor (w14 shr 6));
+    h := h + (RotateRight(e, 14) xor RotateRight(e, 18) xor RotateRight(e, 41)) +
+      ((e and f) xor ((not e) and g)) + $e49b69c19ef14ad2 + w0;
+    d := d + h;
+    h := h + (RotateRight(a, 28) xor RotateRight(a, 34) xor RotateRight(a, 39)) +
+      ((a and b) xor (a and c) xor (b and c));
+    w1 := w1 + (RotateRight(w2, 1) xor RotateRight(w2, 8) xor (w2 shr 7)) + w10 +
+      (RotateRight(w15, 19) xor RotateRight(w15, 61) xor (w15 shr 6));
+    g := g + (RotateRight(d, 14) xor RotateRight(d, 18) xor RotateRight(d, 41)) +
+      ((d and e) xor ((not d) and f)) + $efbe4786384f25e3 + w1;
+    c := c + g;
+    g := g + (RotateRight(h, 28) xor RotateRight(h, 34) xor RotateRight(h, 39)) +
+      ((h and a) xor (h and b) xor (a and b));
+    w2 := w2 + (RotateRight(w3, 1) xor RotateRight(w3, 8) xor (w3 shr 7)) + w11 +
+      (RotateRight(w0, 19) xor RotateRight(w0, 61) xor (w0 shr 6));
+    f := f + (RotateRight(c, 14) xor RotateRight(c, 18) xor RotateRight(c, 41)) +
+      ((c and d) xor ((not c) and e)) + $0fc19dc68b8cd5b5 + w2;
+    b := b + f;
+    f := f + (RotateRight(g, 28) xor RotateRight(g, 34) xor RotateRight(g, 39)) +
+      ((g and h) xor (g and a) xor (h and a));
+    w3 := w3 + (RotateRight(w4, 1) xor RotateRight(w4, 8) xor (w4 shr 7)) + w12 +
+      (RotateRight(w1, 19) xor RotateRight(w1, 61) xor (w1 shr 6));
+    e := e + (RotateRight(b, 14) xor RotateRight(b, 18) xor RotateRight(b, 41)) +
+      ((b and c) xor ((not b) and d)) + $240ca1cc77ac9c65 + w3;
+    a := a + e;
+    e := e + (RotateRight(f, 28) xor RotateRight(f, 34) xor RotateRight(f, 39)) +
+      ((f and g) xor (f and h) xor (g and h));
+    w4 := w4 + (RotateRight(w5, 1) xor RotateRight(w5, 8) xor (w5 shr 7)) + w13 +
+      (RotateRight(w2, 19) xor RotateRight(w2, 61) xor (w2 shr 6));
+    d := d + (RotateRight(a, 14) xor RotateRight(a, 18) xor RotateRight(a, 41)) +
+      ((a and b) xor ((not a) and c)) + $2de92c6f592b0275 + w4;
+    h := h + d;
+    d := d + (RotateRight(e, 28) xor RotateRight(e, 34) xor RotateRight(e, 39)) +
+      ((e and f) xor (e and g) xor (f and g));
+    w5 := w5 + (RotateRight(w6, 1) xor RotateRight(w6, 8) xor (w6 shr 7)) + w14 +
+      (RotateRight(w3, 19) xor RotateRight(w3, 61) xor (w3 shr 6));
+    c := c + (RotateRight(h, 14) xor RotateRight(h, 18) xor RotateRight(h, 41)) +
+      ((h and a) xor ((not h) and b)) + $4a7484aa6ea6e483 + w5;
+    g := g + c;
+    c := c + (RotateRight(d, 28) xor RotateRight(d, 34) xor RotateRight(d, 39)) +
+      ((d and e) xor (d and f) xor (e and f));
+    w6 := w6 + (RotateRight(w7, 1) xor RotateRight(w7, 8) xor (w7 shr 7)) + w15 +
+      (RotateRight(w4, 19) xor RotateRight(w4, 61) xor (w4 shr 6));
+    b := b + (RotateRight(g, 14) xor RotateRight(g, 18) xor RotateRight(g, 41)) +
+      ((g and h) xor ((not g) and a)) + $5cb0a9dcbd41fbd4 + w6;
+    f := f + b;
+    b := b + (RotateRight(c, 28) xor RotateRight(c, 34) xor RotateRight(c, 39)) +
+      ((c and d) xor (c and e) xor (d and e));
+    w7 := w7 + (RotateRight(w8, 1) xor RotateRight(w8, 8) xor (w8 shr 7)) + w0 +
+      (RotateRight(w5, 19) xor RotateRight(w5, 61) xor (w5 shr 6));
+    a := a + (RotateRight(f, 14) xor RotateRight(f, 18) xor RotateRight(f, 41)) +
+      ((f and g) xor ((not f) and h)) + $76f988da831153b5 + w7;
+    e := e + a;
+    a := a + (RotateRight(b, 28) xor RotateRight(b, 34) xor RotateRight(b, 39)) +
+      ((b and c) xor (b and d) xor (c and d));
+    w8 := w8 + (RotateRight(w9, 1) xor RotateRight(w9, 8) xor (w9 shr 7)) + w1 +
+      (RotateRight(w6, 19) xor RotateRight(w6, 61) xor (w6 shr 6));
+    h := h + (RotateRight(e, 14) xor RotateRight(e, 18) xor RotateRight(e, 41)) +
+      ((e and f) xor ((not e) and g)) + $983e5152ee66dfab + w8;
+    d := d + h;
+    h := h + (RotateRight(a, 28) xor RotateRight(a, 34) xor RotateRight(a, 39)) +
+      ((a and b) xor (a and c) xor (b and c));
+    w9 := w9 + (RotateRight(w10, 1) xor RotateRight(w10, 8) xor (w10 shr 7)) + w2 +
+      (RotateRight(w7, 19) xor RotateRight(w7, 61) xor (w7 shr 6));
+    g := g + (RotateRight(d, 14) xor RotateRight(d, 18) xor RotateRight(d, 41)) +
+      ((d and e) xor ((not d) and f)) + $a831c66d2db43210 + w9;
+    c := c + g;
+    g := g + (RotateRight(h, 28) xor RotateRight(h, 34) xor RotateRight(h, 39)) +
+      ((h and a) xor (h and b) xor (a and b));
+    w10 := w10 + (RotateRight(w11, 1) xor RotateRight(w11, 8) xor (w11 shr 7)) + w3 +
+      (RotateRight(w8, 19) xor RotateRight(w8, 61) xor (w8 shr 6));
+    f := f + (RotateRight(c, 14) xor RotateRight(c, 18) xor RotateRight(c, 41)) +
+      ((c and d) xor ((not c) and e)) + $b00327c898fb213f + w10;
+    b := b + f;
+    f := f + (RotateRight(g, 28) xor RotateRight(g, 34) xor RotateRight(g, 39)) +
+      ((g and h) xor (g and a) xor (h and a));
+    w11 := w11 + (RotateRight(w12, 1) xor RotateRight(w12, 8) xor (w12 shr 7)) + w4 +
+      (RotateRight(w9, 19) xor RotateRight(w9, 61) xor (w9 shr 6));
+    e := e + (RotateRight(b, 14) xor RotateRight(b, 18) xor RotateRight(b, 41)) +
+      ((b and c) xor ((not b) and d)) + $bf597fc7beef0ee4 + w11;
+    a := a + e;
+    e := e + (RotateRight(f, 28) xor RotateRight(f, 34) xor RotateRight(f, 39)) +
+      ((f and g) xor (f and h) xor (g and h));
+    w12 := w12 + (RotateRight(w13, 1) xor RotateRight(w13, 8) xor (w13 shr 7)) + w5 +
+      (RotateRight(w10, 19) xor RotateRight(w10, 61) xor (w10 shr 6));
+    d := d + (RotateRight(a, 14) xor RotateRight(a, 18) xor RotateRight(a, 41)) +
+      ((a and b) xor ((not a) and c)) + $c6e00bf33da88fc2 + w12;
+    h := h + d;
+    d := d + (RotateRight(e, 28) xor RotateRight(e, 34) xor RotateRight(e, 39)) +
+      ((e and f) xor (e and g) xor (f and g));
+    w13 := w13 + (RotateRight(w14, 1) xor RotateRight(w14, 8) xor (w14 shr 7)) + w6 +
+      (RotateRight(w11, 19) xor RotateRight(w11, 61) xor (w11 shr 6));
+    c := c + (RotateRight(h, 14) xor RotateRight(h, 18) xor RotateRight(h, 41)) +
+      ((h and a) xor ((not h) and b)) + $d5a79147930aa725 + w13;
+    g := g + c;
+    c := c + (RotateRight(d, 28) xor RotateRight(d, 34) xor RotateRight(d, 39)) +
+      ((d and e) xor (d and f) xor (e and f));
+    w14 := w14 + (RotateRight(w15, 1) xor RotateRight(w15, 8) xor (w15 shr 7)) + w7 +
+      (RotateRight(w12, 19) xor RotateRight(w12, 61) xor (w12 shr 6));
+    b := b + (RotateRight(g, 14) xor RotateRight(g, 18) xor RotateRight(g, 41)) +
+      ((g and h) xor ((not g) and a)) + $06ca6351e003826f + w14;
+    f := f + b;
+    b := b + (RotateRight(c, 28) xor RotateRight(c, 34) xor RotateRight(c, 39)) +
+      ((c and d) xor (c and e) xor (d and e));
+    w15 := w15 + (RotateRight(w0, 1) xor RotateRight(w0, 8) xor (w0 shr 7)) + w8 +
+      (RotateRight(w13, 19) xor RotateRight(w13, 61) xor (w13 shr 6));
+    a := a + (RotateRight(f, 14) xor RotateRight(f, 18) xor RotateRight(f, 41)) +
+      ((f and g) xor ((not f) and h)) + $142929670a0e6e70 + w15;
+    e := e + a;
+    a := a + (RotateRight(b, 28) xor RotateRight(b, 34) xor RotateRight(b, 39)) +
+      ((b and c) xor (b and d) xor (c and d));
+    w0 := w0 + (RotateRight(w1, 1) xor RotateRight(w1, 8) xor (w1 shr 7)) + w9 +
+      (RotateRight(w14, 19) xor RotateRight(w14, 61) xor (w14 shr 6));
+    h := h + (RotateRight(e, 14) xor RotateRight(e, 18) xor RotateRight(e, 41)) +
+      ((e and f) xor ((not e) and g)) + $27b70a8546d22ffc + w0;
+    d := d + h;
+    h := h + (RotateRight(a, 28) xor RotateRight(a, 34) xor RotateRight(a, 39)) +
+      ((a and b) xor (a and c) xor (b and c));
+    w1 := w1 + (RotateRight(w2, 1) xor RotateRight(w2, 8) xor (w2 shr 7)) + w10 +
+      (RotateRight(w15, 19) xor RotateRight(w15, 61) xor (w15 shr 6));
+    g := g + (RotateRight(d, 14) xor RotateRight(d, 18) xor RotateRight(d, 41)) +
+      ((d and e) xor ((not d) and f)) + $2e1b21385c26c926 + w1;
+    c := c + g;
+    g := g + (RotateRight(h, 28) xor RotateRight(h, 34) xor RotateRight(h, 39)) +
+      ((h and a) xor (h and b) xor (a and b));
+    w2 := w2 + (RotateRight(w3, 1) xor RotateRight(w3, 8) xor (w3 shr 7)) + w11 +
+      (RotateRight(w0, 19) xor RotateRight(w0, 61) xor (w0 shr 6));
+    f := f + (RotateRight(c, 14) xor RotateRight(c, 18) xor RotateRight(c, 41)) +
+      ((c and d) xor ((not c) and e)) + $4d2c6dfc5ac42aed + w2;
+    b := b + f;
+    f := f + (RotateRight(g, 28) xor RotateRight(g, 34) xor RotateRight(g, 39)) +
+      ((g and h) xor (g and a) xor (h and a));
+    w3 := w3 + (RotateRight(w4, 1) xor RotateRight(w4, 8) xor (w4 shr 7)) + w12 +
+      (RotateRight(w1, 19) xor RotateRight(w1, 61) xor (w1 shr 6));
+    e := e + (RotateRight(b, 14) xor RotateRight(b, 18) xor RotateRight(b, 41)) +
+      ((b and c) xor ((not b) and d)) + $53380d139d95b3df + w3;
+    a := a + e;
+    e := e + (RotateRight(f, 28) xor RotateRight(f, 34) xor RotateRight(f, 39)) +
+      ((f and g) xor (f and h) xor (g and h));
+    w4 := w4 + (RotateRight(w5, 1) xor RotateRight(w5, 8) xor (w5 shr 7)) + w13 +
+      (RotateRight(w2, 19) xor RotateRight(w2, 61) xor (w2 shr 6));
+    d := d + (RotateRight(a, 14) xor RotateRight(a, 18) xor RotateRight(a, 41)) +
+      ((a and b) xor ((not a) and c)) + $650a73548baf63de + w4;
+    h := h + d;
+    d := d + (RotateRight(e, 28) xor RotateRight(e, 34) xor RotateRight(e, 39)) +
+      ((e and f) xor (e and g) xor (f and g));
+    w5 := w5 + (RotateRight(w6, 1) xor RotateRight(w6, 8) xor (w6 shr 7)) + w14 +
+      (RotateRight(w3, 19) xor RotateRight(w3, 61) xor (w3 shr 6));
+    c := c + (RotateRight(h, 14) xor RotateRight(h, 18) xor RotateRight(h, 41)) +
+      ((h and a) xor ((not h) and b)) + $766a0abb3c77b2a8 + w5;
+    g := g + c;
+    c := c + (RotateRight(d, 28) xor RotateRight(d, 34) xor RotateRight(d, 39)) +
+      ((d and e) xor (d and f) xor (e and f));
+    w6 := w6 + (RotateRight(w7, 1) xor RotateRight(w7, 8) xor (w7 shr 7)) + w15 +
+      (RotateRight(w4, 19) xor RotateRight(w4, 61) xor (w4 shr 6));
+    b := b + (RotateRight(g, 14) xor RotateRight(g, 18) xor RotateRight(g, 41)) +
+      ((g and h) xor ((not g) and a)) + $81c2c92e47edaee6 + w6;
+    f := f + b;
+    b := b + (RotateRight(c, 28) xor RotateRight(c, 34) xor RotateRight(c, 39)) +
+      ((c and d) xor (c and e) xor (d and e));
+    w7 := w7 + (RotateRight(w8, 1) xor RotateRight(w8, 8) xor (w8 shr 7)) + w0 +
+      (RotateRight(w5, 19) xor RotateRight(w5, 61) xor (w5 shr 6));
+    a := a + (RotateRight(f, 14) xor RotateRight(f, 18) xor RotateRight(f, 41)) +
+      ((f and g) xor ((not f) and h)) + $92722c851482353b + w7;
+    e := e + a;
+    a := a + (RotateRight(b, 28) xor RotateRight(b, 34) xor RotateRight(b, 39)) +
+      ((b and c) xor (b and d) xor (c and d));
+    w8 := w8 + (RotateRight(w9, 1) xor RotateRight(w9, 8) xor (w9 shr 7)) + w1 +
+      (RotateRight(w6, 19) xor RotateRight(w6, 61) xor (w6 shr 6));
+    h := h + (RotateRight(e, 14) xor RotateRight(e, 18) xor RotateRight(e, 41)) +
+      ((e and f) xor ((not e) and g)) + $a2bfe8a14cf10364 + w8;
+    d := d + h;
+    h := h + (RotateRight(a, 28) xor RotateRight(a, 34) xor RotateRight(a, 39)) +
+      ((a and b) xor (a and c) xor (b and c));
+    w9 := w9 + (RotateRight(w10, 1) xor RotateRight(w10, 8) xor (w10 shr 7)) + w2 +
+      (RotateRight(w7, 19) xor RotateRight(w7, 61) xor (w7 shr 6));
+    g := g + (RotateRight(d, 14) xor RotateRight(d, 18) xor RotateRight(d, 41)) +
+      ((d and e) xor ((not d) and f)) + $a81a664bbc423001 + w9;
+    c := c + g;
+    g := g + (RotateRight(h, 28) xor RotateRight(h, 34) xor RotateRight(h, 39)) +
+      ((h and a) xor (h and b) xor (a and b));
+    w10 := w10 + (RotateRight(w11, 1) xor RotateRight(w11, 8) xor (w11 shr 7)) + w3 +
+      (RotateRight(w8, 19) xor RotateRight(w8, 61) xor (w8 shr 6));
+    f := f + (RotateRight(c, 14) xor RotateRight(c, 18) xor RotateRight(c, 41)) +
+      ((c and d) xor ((not c) and e)) + $c24b8b70d0f89791 + w10;
+    b := b + f;
+    f := f + (RotateRight(g, 28) xor RotateRight(g, 34) xor RotateRight(g, 39)) +
+      ((g and h) xor (g and a) xor (h and a));
+    w11 := w11 + (RotateRight(w12, 1) xor RotateRight(w12, 8) xor (w12 shr 7)) + w4 +
+      (RotateRight(w9, 19) xor RotateRight(w9, 61) xor (w9 shr 6));
+    e := e + (RotateRight(b, 14) xor RotateRight(b, 18) xor RotateRight(b, 41)) +
+      ((b and c) xor ((not b) and d)) + $c76c51a30654be30 + w11;
+    a := a + e;
+    e := e + (RotateRight(f, 28) xor RotateRight(f, 34) xor RotateRight(f, 39)) +
+      ((f and g) xor (f and h) xor (g and h));
+    w12 := w12 + (RotateRight(w13, 1) xor RotateRight(w13, 8) xor (w13 shr 7)) + w5 +
+      (RotateRight(w10, 19) xor RotateRight(w10, 61) xor (w10 shr 6));
+    d := d + (RotateRight(a, 14) xor RotateRight(a, 18) xor RotateRight(a, 41)) +
+      ((a and b) xor ((not a) and c)) + $d192e819d6ef5218 + w12;
+    h := h + d;
+    d := d + (RotateRight(e, 28) xor RotateRight(e, 34) xor RotateRight(e, 39)) +
+      ((e and f) xor (e and g) xor (f and g));
+    w13 := w13 + (RotateRight(w14, 1) xor RotateRight(w14, 8) xor (w14 shr 7)) + w6 +
+      (RotateRight(w11, 19) xor RotateRight(w11, 61) xor (w11 shr 6));
+    c := c + (RotateRight(h, 14) xor RotateRight(h, 18) xor RotateRight(h, 41)) +
+      ((h and a) xor ((not h) and b)) + $d69906245565a910 + w13;
+    g := g + c;
+    c := c + (RotateRight(d, 28) xor RotateRight(d, 34) xor RotateRight(d, 39)) +
+      ((d and e) xor (d and f) xor (e and f));
+    w14 := w14 + (RotateRight(w15, 1) xor RotateRight(w15, 8) xor (w15 shr 7)) + w7 +
+      (RotateRight(w12, 19) xor RotateRight(w12, 61) xor (w12 shr 6));
+    b := b + (RotateRight(g, 14) xor RotateRight(g, 18) xor RotateRight(g, 41)) +
+      ((g and h) xor ((not g) and a)) + $f40e35855771202a + w14;
+    f := f + b;
+    b := b + (RotateRight(c, 28) xor RotateRight(c, 34) xor RotateRight(c, 39)) +
+      ((c and d) xor (c and e) xor (d and e));
+    w15 := w15 + (RotateRight(w0, 1) xor RotateRight(w0, 8) xor (w0 shr 7)) + w8 +
+      (RotateRight(w13, 19) xor RotateRight(w13, 61) xor (w13 shr 6));
+    a := a + (RotateRight(f, 14) xor RotateRight(f, 18) xor RotateRight(f, 41)) +
+      ((f and g) xor ((not f) and h)) + $106aa07032bbd1b8 + w15;
+    e := e + a;
+    a := a + (RotateRight(b, 28) xor RotateRight(b, 34) xor RotateRight(b, 39)) +
+      ((b and c) xor (b and d) xor (c and d));
+    w0 := w0 + (RotateRight(w1, 1) xor RotateRight(w1, 8) xor (w1 shr 7)) + w9 +
+      (RotateRight(w14, 19) xor RotateRight(w14, 61) xor (w14 shr 6));
+    h := h + (RotateRight(e, 14) xor RotateRight(e, 18) xor RotateRight(e, 41)) +
+      ((e and f) xor ((not e) and g)) + $19a4c116b8d2d0c8 + w0;
+    d := d + h;
+    h := h + (RotateRight(a, 28) xor RotateRight(a, 34) xor RotateRight(a, 39)) +
+      ((a and b) xor (a and c) xor (b and c));
+    w1 := w1 + (RotateRight(w2, 1) xor RotateRight(w2, 8) xor (w2 shr 7)) + w10 +
+      (RotateRight(w15, 19) xor RotateRight(w15, 61) xor (w15 shr 6));
+    g := g + (RotateRight(d, 14) xor RotateRight(d, 18) xor RotateRight(d, 41)) +
+      ((d and e) xor ((not d) and f)) + $1e376c085141ab53 + w1;
+    c := c + g;
+    g := g + (RotateRight(h, 28) xor RotateRight(h, 34) xor RotateRight(h, 39)) +
+      ((h and a) xor (h and b) xor (a and b));
+    w2 := w2 + (RotateRight(w3, 1) xor RotateRight(w3, 8) xor (w3 shr 7)) + w11 +
+      (RotateRight(w0, 19) xor RotateRight(w0, 61) xor (w0 shr 6));
+    f := f + (RotateRight(c, 14) xor RotateRight(c, 18) xor RotateRight(c, 41)) +
+      ((c and d) xor ((not c) and e)) + $2748774cdf8eeb99 + w2;
+    b := b + f;
+    f := f + (RotateRight(g, 28) xor RotateRight(g, 34) xor RotateRight(g, 39)) +
+      ((g and h) xor (g and a) xor (h and a));
+    w3 := w3 + (RotateRight(w4, 1) xor RotateRight(w4, 8) xor (w4 shr 7)) + w12 +
+      (RotateRight(w1, 19) xor RotateRight(w1, 61) xor (w1 shr 6));
+    e := e + (RotateRight(b, 14) xor RotateRight(b, 18) xor RotateRight(b, 41)) +
+      ((b and c) xor ((not b) and d)) + $34b0bcb5e19b48a8 + w3;
+    a := a + e;
+    e := e + (RotateRight(f, 28) xor RotateRight(f, 34) xor RotateRight(f, 39)) +
+      ((f and g) xor (f and h) xor (g and h));
+    w4 := w4 + (RotateRight(w5, 1) xor RotateRight(w5, 8) xor (w5 shr 7)) + w13 +
+      (RotateRight(w2, 19) xor RotateRight(w2, 61) xor (w2 shr 6));
+    d := d + (RotateRight(a, 14) xor RotateRight(a, 18) xor RotateRight(a, 41)) +
+      ((a and b) xor ((not a) and c)) + $391c0cb3c5c95a63 + w4;
+    h := h + d;
+    d := d + (RotateRight(e, 28) xor RotateRight(e, 34) xor RotateRight(e, 39)) +
+      ((e and f) xor (e and g) xor (f and g));
+    w5 := w5 + (RotateRight(w6, 1) xor RotateRight(w6, 8) xor (w6 shr 7)) + w14 +
+      (RotateRight(w3, 19) xor RotateRight(w3, 61) xor (w3 shr 6));
+    c := c + (RotateRight(h, 14) xor RotateRight(h, 18) xor RotateRight(h, 41)) +
+      ((h and a) xor ((not h) and b)) + $4ed8aa4ae3418acb + w5;
+    g := g + c;
+    c := c + (RotateRight(d, 28) xor RotateRight(d, 34) xor RotateRight(d, 39)) +
+      ((d and e) xor (d and f) xor (e and f));
+    w6 := w6 + (RotateRight(w7, 1) xor RotateRight(w7, 8) xor (w7 shr 7)) + w15 +
+      (RotateRight(w4, 19) xor RotateRight(w4, 61) xor (w4 shr 6));
+    b := b + (RotateRight(g, 14) xor RotateRight(g, 18) xor RotateRight(g, 41)) +
+      ((g and h) xor ((not g) and a)) + $5b9cca4f7763e373 + w6;
+    f := f + b;
+    b := b + (RotateRight(c, 28) xor RotateRight(c, 34) xor RotateRight(c, 39)) +
+      ((c and d) xor (c and e) xor (d and e));
+    w7 := w7 + (RotateRight(w8, 1) xor RotateRight(w8, 8) xor (w8 shr 7)) + w0 +
+      (RotateRight(w5, 19) xor RotateRight(w5, 61) xor (w5 shr 6));
+    a := a + (RotateRight(f, 14) xor RotateRight(f, 18) xor RotateRight(f, 41)) +
+      ((f and g) xor ((not f) and h)) + $682e6ff3d6b2b8a3 + w7;
+    e := e + a;
+    a := a + (RotateRight(b, 28) xor RotateRight(b, 34) xor RotateRight(b, 39)) +
+      ((b and c) xor (b and d) xor (c and d));
+    w8 := w8 + (RotateRight(w9, 1) xor RotateRight(w9, 8) xor (w9 shr 7)) + w1 +
+      (RotateRight(w6, 19) xor RotateRight(w6, 61) xor (w6 shr 6));
+    h := h + (RotateRight(e, 14) xor RotateRight(e, 18) xor RotateRight(e, 41)) +
+      ((e and f) xor ((not e) and g)) + $748f82ee5defb2fc + w8;
+    d := d + h;
+    h := h + (RotateRight(a, 28) xor RotateRight(a, 34) xor RotateRight(a, 39)) +
+      ((a and b) xor (a and c) xor (b and c));
+    w9 := w9 + (RotateRight(w10, 1) xor RotateRight(w10, 8) xor (w10 shr 7)) + w2 +
+      (RotateRight(w7, 19) xor RotateRight(w7, 61) xor (w7 shr 6));
+    g := g + (RotateRight(d, 14) xor RotateRight(d, 18) xor RotateRight(d, 41)) +
+      ((d and e) xor ((not d) and f)) + $78a5636f43172f60 + w9;
+    c := c + g;
+    g := g + (RotateRight(h, 28) xor RotateRight(h, 34) xor RotateRight(h, 39)) +
+      ((h and a) xor (h and b) xor (a and b));
+    w10 := w10 + (RotateRight(w11, 1) xor RotateRight(w11, 8) xor (w11 shr 7)) + w3 +
+      (RotateRight(w8, 19) xor RotateRight(w8, 61) xor (w8 shr 6));
+    f := f + (RotateRight(c, 14) xor RotateRight(c, 18) xor RotateRight(c, 41)) +
+      ((c and d) xor ((not c) and e)) + $84c87814a1f0ab72 + w10;
+    b := b + f;
+    f := f + (RotateRight(g, 28) xor RotateRight(g, 34) xor RotateRight(g, 39)) +
+      ((g and h) xor (g and a) xor (h and a));
+    w11 := w11 + (RotateRight(w12, 1) xor RotateRight(w12, 8) xor (w12 shr 7)) + w4 +
+      (RotateRight(w9, 19) xor RotateRight(w9, 61) xor (w9 shr 6));
+    e := e + (RotateRight(b, 14) xor RotateRight(b, 18) xor RotateRight(b, 41)) +
+      ((b and c) xor ((not b) and d)) + $8cc702081a6439ec + w11;
+    a := a + e;
+    e := e + (RotateRight(f, 28) xor RotateRight(f, 34) xor RotateRight(f, 39)) +
+      ((f and g) xor (f and h) xor (g and h));
+    w12 := w12 + (RotateRight(w13, 1) xor RotateRight(w13, 8) xor (w13 shr 7)) + w5 +
+      (RotateRight(w10, 19) xor RotateRight(w10, 61) xor (w10 shr 6));
+    d := d + (RotateRight(a, 14) xor RotateRight(a, 18) xor RotateRight(a, 41)) +
+      ((a and b) xor ((not a) and c)) + $90befffa23631e28 + w12;
+    h := h + d;
+    d := d + (RotateRight(e, 28) xor RotateRight(e, 34) xor RotateRight(e, 39)) +
+      ((e and f) xor (e and g) xor (f and g));
+    w13 := w13 + (RotateRight(w14, 1) xor RotateRight(w14, 8) xor (w14 shr 7)) + w6 +
+      (RotateRight(w11, 19) xor RotateRight(w11, 61) xor (w11 shr 6));
+    c := c + (RotateRight(h, 14) xor RotateRight(h, 18) xor RotateRight(h, 41)) +
+      ((h and a) xor ((not h) and b)) + $a4506cebde82bde9 + w13;
+    g := g + c;
+    c := c + (RotateRight(d, 28) xor RotateRight(d, 34) xor RotateRight(d, 39)) +
+      ((d and e) xor (d and f) xor (e and f));
+    w14 := w14 + (RotateRight(w15, 1) xor RotateRight(w15, 8) xor (w15 shr 7)) + w7 +
+      (RotateRight(w12, 19) xor RotateRight(w12, 61) xor (w12 shr 6));
+    b := b + (RotateRight(g, 14) xor RotateRight(g, 18) xor RotateRight(g, 41)) +
+      ((g and h) xor ((not g) and a)) + $bef9a3f7b2c67915 + w14;
+    f := f + b;
+    b := b + (RotateRight(c, 28) xor RotateRight(c, 34) xor RotateRight(c, 39)) +
+      ((c and d) xor (c and e) xor (d and e));
+    w15 := w15 + (RotateRight(w0, 1) xor RotateRight(w0, 8) xor (w0 shr 7)) + w8 +
+      (RotateRight(w13, 19) xor RotateRight(w13, 61) xor (w13 shr 6));
+    a := a + (RotateRight(f, 14) xor RotateRight(f, 18) xor RotateRight(f, 41)) +
+      ((f and g) xor ((not f) and h)) + $c67178f2e372532b + w15;
+    e := e + a;
+    a := a + (RotateRight(b, 28) xor RotateRight(b, 34) xor RotateRight(b, 39)) +
+      ((b and c) xor (b and d) xor (c and d));
+    w0 := w0 + (RotateRight(w1, 1) xor RotateRight(w1, 8) xor (w1 shr 7)) + w9 +
+      (RotateRight(w14, 19) xor RotateRight(w14, 61) xor (w14 shr 6));
+    h := h + (RotateRight(e, 14) xor RotateRight(e, 18) xor RotateRight(e, 41)) +
+      ((e and f) xor ((not e) and g)) + $ca273eceea26619c + w0;
+    d := d + h;
+    h := h + (RotateRight(a, 28) xor RotateRight(a, 34) xor RotateRight(a, 39)) +
+      ((a and b) xor (a and c) xor (b and c));
+    w1 := w1 + (RotateRight(w2, 1) xor RotateRight(w2, 8) xor (w2 shr 7)) + w10 +
+      (RotateRight(w15, 19) xor RotateRight(w15, 61) xor (w15 shr 6));
+    g := g + (RotateRight(d, 14) xor RotateRight(d, 18) xor RotateRight(d, 41)) +
+      ((d and e) xor ((not d) and f)) + $d186b8c721c0c207 + w1;
+    c := c + g;
+    g := g + (RotateRight(h, 28) xor RotateRight(h, 34) xor RotateRight(h, 39)) +
+      ((h and a) xor (h and b) xor (a and b));
+    w2 := w2 + (RotateRight(w3, 1) xor RotateRight(w3, 8) xor (w3 shr 7)) + w11 +
+      (RotateRight(w0, 19) xor RotateRight(w0, 61) xor (w0 shr 6));
+    f := f + (RotateRight(c, 14) xor RotateRight(c, 18) xor RotateRight(c, 41)) +
+      ((c and d) xor ((not c) and e)) + $eada7dd6cde0eb1e + w2;
+    b := b + f;
+    f := f + (RotateRight(g, 28) xor RotateRight(g, 34) xor RotateRight(g, 39)) +
+      ((g and h) xor (g and a) xor (h and a));
+    w3 := w3 + (RotateRight(w4, 1) xor RotateRight(w4, 8) xor (w4 shr 7)) + w12 +
+      (RotateRight(w1, 19) xor RotateRight(w1, 61) xor (w1 shr 6));
+    e := e + (RotateRight(b, 14) xor RotateRight(b, 18) xor RotateRight(b, 41)) +
+      ((b and c) xor ((not b) and d)) + $f57d4f7fee6ed178 + w3;
+    a := a + e;
+    e := e + (RotateRight(f, 28) xor RotateRight(f, 34) xor RotateRight(f, 39)) +
+      ((f and g) xor (f and h) xor (g and h));
+    w4 := w4 + (RotateRight(w5, 1) xor RotateRight(w5, 8) xor (w5 shr 7)) + w13 +
+      (RotateRight(w2, 19) xor RotateRight(w2, 61) xor (w2 shr 6));
+    d := d + (RotateRight(a, 14) xor RotateRight(a, 18) xor RotateRight(a, 41)) +
+      ((a and b) xor ((not a) and c)) + $06f067aa72176fba + w4;
+    h := h + d;
+    d := d + (RotateRight(e, 28) xor RotateRight(e, 34) xor RotateRight(e, 39)) +
+      ((e and f) xor (e and g) xor (f and g));
+    w5 := w5 + (RotateRight(w6, 1) xor RotateRight(w6, 8) xor (w6 shr 7)) + w14 +
+      (RotateRight(w3, 19) xor RotateRight(w3, 61) xor (w3 shr 6));
+    c := c + (RotateRight(h, 14) xor RotateRight(h, 18) xor RotateRight(h, 41)) +
+      ((h and a) xor ((not h) and b)) + $0a637dc5a2c898a6 + w5;
+    g := g + c;
+    c := c + (RotateRight(d, 28) xor RotateRight(d, 34) xor RotateRight(d, 39)) +
+      ((d and e) xor (d and f) xor (e and f));
+    w6 := w6 + (RotateRight(w7, 1) xor RotateRight(w7, 8) xor (w7 shr 7)) + w15 +
+      (RotateRight(w4, 19) xor RotateRight(w4, 61) xor (w4 shr 6));
+    b := b + (RotateRight(g, 14) xor RotateRight(g, 18) xor RotateRight(g, 41)) +
+      ((g and h) xor ((not g) and a)) + $113f9804bef90dae + w6;
+    f := f + b;
+    b := b + (RotateRight(c, 28) xor RotateRight(c, 34) xor RotateRight(c, 39)) +
+      ((c and d) xor (c and e) xor (d and e));
+    w7 := w7 + (RotateRight(w8, 1) xor RotateRight(w8, 8) xor (w8 shr 7)) + w0 +
+      (RotateRight(w5, 19) xor RotateRight(w5, 61) xor (w5 shr 6));
+    a := a + (RotateRight(f, 14) xor RotateRight(f, 18) xor RotateRight(f, 41)) +
+      ((f and g) xor ((not f) and h)) + $1b710b35131c471b + w7;
+    e := e + a;
+    a := a + (RotateRight(b, 28) xor RotateRight(b, 34) xor RotateRight(b, 39)) +
+      ((b and c) xor (b and d) xor (c and d));
+    w8 := w8 + (RotateRight(w9, 1) xor RotateRight(w9, 8) xor (w9 shr 7)) + w1 +
+      (RotateRight(w6, 19) xor RotateRight(w6, 61) xor (w6 shr 6));
+    h := h + (RotateRight(e, 14) xor RotateRight(e, 18) xor RotateRight(e, 41)) +
+      ((e and f) xor ((not e) and g)) + $28db77f523047d84 + w8;
+    d := d + h;
+    h := h + (RotateRight(a, 28) xor RotateRight(a, 34) xor RotateRight(a, 39)) +
+      ((a and b) xor (a and c) xor (b and c));
+    w9 := w9 + (RotateRight(w10, 1) xor RotateRight(w10, 8) xor (w10 shr 7)) + w2 +
+      (RotateRight(w7, 19) xor RotateRight(w7, 61) xor (w7 shr 6));
+    g := g + (RotateRight(d, 14) xor RotateRight(d, 18) xor RotateRight(d, 41)) +
+      ((d and e) xor ((not d) and f)) + $32caab7b40c72493 + w9;
+    c := c + g;
+    g := g + (RotateRight(h, 28) xor RotateRight(h, 34) xor RotateRight(h, 39)) +
+      ((h and a) xor (h and b) xor (a and b));
+    w10 := w10 + (RotateRight(w11, 1) xor RotateRight(w11, 8) xor (w11 shr 7)) + w3 +
+      (RotateRight(w8, 19) xor RotateRight(w8, 61) xor (w8 shr 6));
+    f := f + (RotateRight(c, 14) xor RotateRight(c, 18) xor RotateRight(c, 41)) +
+      ((c and d) xor ((not c) and e)) + $3c9ebe0a15c9bebc + w10;
+    b := b + f;
+    f := f + (RotateRight(g, 28) xor RotateRight(g, 34) xor RotateRight(g, 39)) +
+      ((g and h) xor (g and a) xor (h and a));
+    w11 := w11 + (RotateRight(w12, 1) xor RotateRight(w12, 8) xor (w12 shr 7)) + w4 +
+      (RotateRight(w9, 19) xor RotateRight(w9, 61) xor (w9 shr 6));
+    e := e + (RotateRight(b, 14) xor RotateRight(b, 18) xor RotateRight(b, 41)) +
+      ((b and c) xor ((not b) and d)) + $431d67c49c100d4c + w11;
+    a := a + e;
+    e := e + (RotateRight(f, 28) xor RotateRight(f, 34) xor RotateRight(f, 39)) +
+      ((f and g) xor (f and h) xor (g and h));
+    w12 := w12 + (RotateRight(w13, 1) xor RotateRight(w13, 8) xor (w13 shr 7)) + w5 +
+      (RotateRight(w10, 19) xor RotateRight(w10, 61) xor (w10 shr 6));
+    d := d + (RotateRight(a, 14) xor RotateRight(a, 18) xor RotateRight(a, 41)) +
+      ((a and b) xor ((not a) and c)) + $4cc5d4becb3e42b6 + w12;
+    h := h + d;
+    d := d + (RotateRight(e, 28) xor RotateRight(e, 34) xor RotateRight(e, 39)) +
+      ((e and f) xor (e and g) xor (f and g));
+    w13 := w13 + (RotateRight(w14, 1) xor RotateRight(w14, 8) xor (w14 shr 7)) + w6 +
+      (RotateRight(w11, 19) xor RotateRight(w11, 61) xor (w11 shr 6));
+    c := c + (RotateRight(h, 14) xor RotateRight(h, 18) xor RotateRight(h, 41)) +
+      ((h and a) xor ((not h) and b)) + $597f299cfc657e2a + w13;
+    g := g + c;
+    c := c + (RotateRight(d, 28) xor RotateRight(d, 34) xor RotateRight(d, 39)) +
+      ((d and e) xor (d and f) xor (e and f));
+    w14 := w14 + (RotateRight(w15, 1) xor RotateRight(w15, 8) xor (w15 shr 7)) + w7 +
+      (RotateRight(w12, 19) xor RotateRight(w12, 61) xor (w12 shr 6));
+    b := b + (RotateRight(g, 14) xor RotateRight(g, 18) xor RotateRight(g, 41)) +
+      ((g and h) xor ((not g) and a)) + $5fcb6fab3ad6faec + w14;
+    f := f + b;
+    b := b + (RotateRight(c, 28) xor RotateRight(c, 34) xor RotateRight(c, 39)) +
+      ((c and d) xor (c and e) xor (d and e));
+    w15 := w15 + (RotateRight(w0, 1) xor RotateRight(w0, 8) xor (w0 shr 7)) + w8 +
+      (RotateRight(w13, 19) xor RotateRight(w13, 61) xor (w13 shr 6));
+    a := a + (RotateRight(f, 14) xor RotateRight(f, 18) xor RotateRight(f, 41)) +
+      ((f and g) xor ((not f) and h)) + $6c44198c4a475817 + w15;
+    e := e + a;
+    a := a + (RotateRight(b, 28) xor RotateRight(b, 34) xor RotateRight(b, 39)) +
+      ((b and c) xor (b and d) xor (c and d));
+    StoreLE64(State, LoadLE64(State) + a);
+    StoreLE64(Pointer(Integer(State) + 8), LoadLE64(Pointer(Integer(State) + 8)) + b);
+    StoreLE64(Pointer(Integer(State) + 16), LoadLE64(Pointer(Integer(State) + 16)) + c);
+    StoreLE64(Pointer(Integer(State) + 24), LoadLE64(Pointer(Integer(State) + 24)) + d);
+    StoreLE64(Pointer(Integer(State) + 32), LoadLE64(Pointer(Integer(State) + 32)) + e);
+    StoreLE64(Pointer(Integer(State) + 40), LoadLE64(Pointer(Integer(State) + 40)) + f);
+    StoreLE64(Pointer(Integer(State) + 48), LoadLE64(Pointer(Integer(State) + 48)) + g);
+    StoreLE64(Pointer(Integer(State) + 56), LoadLE64(Pointer(Integer(State) + 56)) + h);
+  end;
+end;
+
+{ arm64 after Go's sha512block_arm64.s: SHA512H, SHA512H2, SHA512SU0,
+  SHA512SU1 (Arm ARM C7.2.293-296), the state in v8-v11, the message
+  in v12-v19, the constants streamed through v20-v31. On amd64 the
+  SHA512 extension has no processor here to answer for it: the Pascal
+  rounds serve both bodies. }
+procedure Sha512BlocksCpu(State, Data: Pointer; N: Integer);
+{$ifdef CPUAARCH64}
+var
+  k: Pointer;
+  bytes: Integer;
+begin
+  k := @K512[0];
+  bytes := N * 128;
+  asm arm64 (State: in x0; Data: in x1; bytes: in x2; k: in x3)
+    ld1 {v8.2d, v9.2d, v10.2d, v11.2d}, [x0]
+    1:
+    mov v0.16b, v8.16b
+    mov v1.16b, v9.16b
+    mov v2.16b, v10.16b
+    mov v3.16b, v11.16b
+    ld1 {v12.2d, v13.2d, v14.2d, v15.2d}, [x1], #64
+    ld1 {v16.2d, v17.2d, v18.2d, v19.2d}, [x1], #64
+    rev64 v12.16b, v12.16b
+    rev64 v13.16b, v13.16b
+    rev64 v14.16b, v14.16b
+    rev64 v15.16b, v15.16b
+    rev64 v16.16b, v16.16b
+    rev64 v17.16b, v17.16b
+    rev64 v18.16b, v18.16b
+    rev64 v19.16b, v19.16b
+    mov x4, x3
+    ld1 {v20.2d, v21.2d, v22.2d, v23.2d}, [x4], #64
+    ld1 {v24.2d}, [x4], #16
+    add v5.2d, v20.2d, v12.2d
+    ext v6.16b, v2.16b, v3.16b, #8
+    ext v5.16b, v5.16b, v5.16b, #8
+    ext v7.16b, v1.16b, v2.16b, #8
+    add v3.2d, v3.2d, v5.2d
+    ext v5.16b, v16.16b, v17.16b, #8
+    sha512su0 v12.2d, v13.2d
+    sha512h q3, q6, v7.2d
+    sha512su1 v12.2d, v19.2d, v5.2d
+    add v4.2d, v1.2d, v3.2d
+    sha512h2 q3, q1, v0.2d
+    ld1 {v25.2d}, [x4], #16
+    add v5.2d, v21.2d, v13.2d
+    ext v6.16b, v4.16b, v2.16b, #8
+    ext v5.16b, v5.16b, v5.16b, #8
+    ext v7.16b, v0.16b, v4.16b, #8
+    add v2.2d, v2.2d, v5.2d
+    ext v5.16b, v17.16b, v18.16b, #8
+    sha512su0 v13.2d, v14.2d
+    sha512h q2, q6, v7.2d
+    sha512su1 v13.2d, v12.2d, v5.2d
+    add v1.2d, v0.2d, v2.2d
+    sha512h2 q2, q0, v3.2d
+    ld1 {v26.2d}, [x4], #16
+    add v5.2d, v22.2d, v14.2d
+    ext v6.16b, v1.16b, v4.16b, #8
+    ext v5.16b, v5.16b, v5.16b, #8
+    ext v7.16b, v3.16b, v1.16b, #8
+    add v4.2d, v4.2d, v5.2d
+    ext v5.16b, v18.16b, v19.16b, #8
+    sha512su0 v14.2d, v15.2d
+    sha512h q4, q6, v7.2d
+    sha512su1 v14.2d, v13.2d, v5.2d
+    add v0.2d, v3.2d, v4.2d
+    sha512h2 q4, q3, v2.2d
+    ld1 {v27.2d}, [x4], #16
+    add v5.2d, v23.2d, v15.2d
+    ext v6.16b, v0.16b, v1.16b, #8
+    ext v5.16b, v5.16b, v5.16b, #8
+    ext v7.16b, v2.16b, v0.16b, #8
+    add v1.2d, v1.2d, v5.2d
+    ext v5.16b, v19.16b, v12.16b, #8
+    sha512su0 v15.2d, v16.2d
+    sha512h q1, q6, v7.2d
+    sha512su1 v15.2d, v14.2d, v5.2d
+    add v3.2d, v2.2d, v1.2d
+    sha512h2 q1, q2, v4.2d
+    ld1 {v28.2d}, [x4], #16
+    add v5.2d, v24.2d, v16.2d
+    ext v6.16b, v3.16b, v0.16b, #8
+    ext v5.16b, v5.16b, v5.16b, #8
+    ext v7.16b, v4.16b, v3.16b, #8
+    add v0.2d, v0.2d, v5.2d
+    ext v5.16b, v12.16b, v13.16b, #8
+    sha512su0 v16.2d, v17.2d
+    sha512h q0, q6, v7.2d
+    sha512su1 v16.2d, v15.2d, v5.2d
+    add v2.2d, v4.2d, v0.2d
+    sha512h2 q0, q4, v1.2d
+    ld1 {v29.2d}, [x4], #16
+    add v5.2d, v25.2d, v17.2d
+    ext v6.16b, v2.16b, v3.16b, #8
+    ext v5.16b, v5.16b, v5.16b, #8
+    ext v7.16b, v1.16b, v2.16b, #8
+    add v3.2d, v3.2d, v5.2d
+    ext v5.16b, v13.16b, v14.16b, #8
+    sha512su0 v17.2d, v18.2d
+    sha512h q3, q6, v7.2d
+    sha512su1 v17.2d, v16.2d, v5.2d
+    add v4.2d, v1.2d, v3.2d
+    sha512h2 q3, q1, v0.2d
+    ld1 {v30.2d}, [x4], #16
+    add v5.2d, v26.2d, v18.2d
+    ext v6.16b, v4.16b, v2.16b, #8
+    ext v5.16b, v5.16b, v5.16b, #8
+    ext v7.16b, v0.16b, v4.16b, #8
+    add v2.2d, v2.2d, v5.2d
+    ext v5.16b, v14.16b, v15.16b, #8
+    sha512su0 v18.2d, v19.2d
+    sha512h q2, q6, v7.2d
+    sha512su1 v18.2d, v17.2d, v5.2d
+    add v1.2d, v0.2d, v2.2d
+    sha512h2 q2, q0, v3.2d
+    ld1 {v31.2d}, [x4], #16
+    add v5.2d, v27.2d, v19.2d
+    ext v6.16b, v1.16b, v4.16b, #8
+    ext v5.16b, v5.16b, v5.16b, #8
+    ext v7.16b, v3.16b, v1.16b, #8
+    add v4.2d, v4.2d, v5.2d
+    ext v5.16b, v15.16b, v16.16b, #8
+    sha512su0 v19.2d, v12.2d
+    sha512h q4, q6, v7.2d
+    sha512su1 v19.2d, v18.2d, v5.2d
+    add v0.2d, v3.2d, v4.2d
+    sha512h2 q4, q3, v2.2d
+    ld1 {v24.2d}, [x4], #16
+    add v5.2d, v28.2d, v12.2d
+    ext v6.16b, v0.16b, v1.16b, #8
+    ext v5.16b, v5.16b, v5.16b, #8
+    ext v7.16b, v2.16b, v0.16b, #8
+    add v1.2d, v1.2d, v5.2d
+    ext v5.16b, v16.16b, v17.16b, #8
+    sha512su0 v12.2d, v13.2d
+    sha512h q1, q6, v7.2d
+    sha512su1 v12.2d, v19.2d, v5.2d
+    add v3.2d, v2.2d, v1.2d
+    sha512h2 q1, q2, v4.2d
+    ld1 {v25.2d}, [x4], #16
+    add v5.2d, v29.2d, v13.2d
+    ext v6.16b, v3.16b, v0.16b, #8
+    ext v5.16b, v5.16b, v5.16b, #8
+    ext v7.16b, v4.16b, v3.16b, #8
+    add v0.2d, v0.2d, v5.2d
+    ext v5.16b, v17.16b, v18.16b, #8
+    sha512su0 v13.2d, v14.2d
+    sha512h q0, q6, v7.2d
+    sha512su1 v13.2d, v12.2d, v5.2d
+    add v2.2d, v4.2d, v0.2d
+    sha512h2 q0, q4, v1.2d
+    ld1 {v26.2d}, [x4], #16
+    add v5.2d, v30.2d, v14.2d
+    ext v6.16b, v2.16b, v3.16b, #8
+    ext v5.16b, v5.16b, v5.16b, #8
+    ext v7.16b, v1.16b, v2.16b, #8
+    add v3.2d, v3.2d, v5.2d
+    ext v5.16b, v18.16b, v19.16b, #8
+    sha512su0 v14.2d, v15.2d
+    sha512h q3, q6, v7.2d
+    sha512su1 v14.2d, v13.2d, v5.2d
+    add v4.2d, v1.2d, v3.2d
+    sha512h2 q3, q1, v0.2d
+    ld1 {v27.2d}, [x4], #16
+    add v5.2d, v31.2d, v15.2d
+    ext v6.16b, v4.16b, v2.16b, #8
+    ext v5.16b, v5.16b, v5.16b, #8
+    ext v7.16b, v0.16b, v4.16b, #8
+    add v2.2d, v2.2d, v5.2d
+    ext v5.16b, v19.16b, v12.16b, #8
+    sha512su0 v15.2d, v16.2d
+    sha512h q2, q6, v7.2d
+    sha512su1 v15.2d, v14.2d, v5.2d
+    add v1.2d, v0.2d, v2.2d
+    sha512h2 q2, q0, v3.2d
+    ld1 {v28.2d}, [x4], #16
+    add v5.2d, v24.2d, v16.2d
+    ext v6.16b, v1.16b, v4.16b, #8
+    ext v5.16b, v5.16b, v5.16b, #8
+    ext v7.16b, v3.16b, v1.16b, #8
+    add v4.2d, v4.2d, v5.2d
+    ext v5.16b, v12.16b, v13.16b, #8
+    sha512su0 v16.2d, v17.2d
+    sha512h q4, q6, v7.2d
+    sha512su1 v16.2d, v15.2d, v5.2d
+    add v0.2d, v3.2d, v4.2d
+    sha512h2 q4, q3, v2.2d
+    ld1 {v29.2d}, [x4], #16
+    add v5.2d, v25.2d, v17.2d
+    ext v6.16b, v0.16b, v1.16b, #8
+    ext v5.16b, v5.16b, v5.16b, #8
+    ext v7.16b, v2.16b, v0.16b, #8
+    add v1.2d, v1.2d, v5.2d
+    ext v5.16b, v13.16b, v14.16b, #8
+    sha512su0 v17.2d, v18.2d
+    sha512h q1, q6, v7.2d
+    sha512su1 v17.2d, v16.2d, v5.2d
+    add v3.2d, v2.2d, v1.2d
+    sha512h2 q1, q2, v4.2d
+    ld1 {v30.2d}, [x4], #16
+    add v5.2d, v26.2d, v18.2d
+    ext v6.16b, v3.16b, v0.16b, #8
+    ext v5.16b, v5.16b, v5.16b, #8
+    ext v7.16b, v4.16b, v3.16b, #8
+    add v0.2d, v0.2d, v5.2d
+    ext v5.16b, v14.16b, v15.16b, #8
+    sha512su0 v18.2d, v19.2d
+    sha512h q0, q6, v7.2d
+    sha512su1 v18.2d, v17.2d, v5.2d
+    add v2.2d, v4.2d, v0.2d
+    sha512h2 q0, q4, v1.2d
+    ld1 {v31.2d}, [x4], #16
+    add v5.2d, v27.2d, v19.2d
+    ext v6.16b, v2.16b, v3.16b, #8
+    ext v5.16b, v5.16b, v5.16b, #8
+    ext v7.16b, v1.16b, v2.16b, #8
+    add v3.2d, v3.2d, v5.2d
+    ext v5.16b, v15.16b, v16.16b, #8
+    sha512su0 v19.2d, v12.2d
+    sha512h q3, q6, v7.2d
+    sha512su1 v19.2d, v18.2d, v5.2d
+    add v4.2d, v1.2d, v3.2d
+    sha512h2 q3, q1, v0.2d
+    ld1 {v24.2d}, [x4], #16
+    add v5.2d, v28.2d, v12.2d
+    ext v6.16b, v4.16b, v2.16b, #8
+    ext v5.16b, v5.16b, v5.16b, #8
+    ext v7.16b, v0.16b, v4.16b, #8
+    add v2.2d, v2.2d, v5.2d
+    ext v5.16b, v16.16b, v17.16b, #8
+    sha512su0 v12.2d, v13.2d
+    sha512h q2, q6, v7.2d
+    sha512su1 v12.2d, v19.2d, v5.2d
+    add v1.2d, v0.2d, v2.2d
+    sha512h2 q2, q0, v3.2d
+    ld1 {v25.2d}, [x4], #16
+    add v5.2d, v29.2d, v13.2d
+    ext v6.16b, v1.16b, v4.16b, #8
+    ext v5.16b, v5.16b, v5.16b, #8
+    ext v7.16b, v3.16b, v1.16b, #8
+    add v4.2d, v4.2d, v5.2d
+    ext v5.16b, v17.16b, v18.16b, #8
+    sha512su0 v13.2d, v14.2d
+    sha512h q4, q6, v7.2d
+    sha512su1 v13.2d, v12.2d, v5.2d
+    add v0.2d, v3.2d, v4.2d
+    sha512h2 q4, q3, v2.2d
+    ld1 {v26.2d}, [x4], #16
+    add v5.2d, v30.2d, v14.2d
+    ext v6.16b, v0.16b, v1.16b, #8
+    ext v5.16b, v5.16b, v5.16b, #8
+    ext v7.16b, v2.16b, v0.16b, #8
+    add v1.2d, v1.2d, v5.2d
+    ext v5.16b, v18.16b, v19.16b, #8
+    sha512su0 v14.2d, v15.2d
+    sha512h q1, q6, v7.2d
+    sha512su1 v14.2d, v13.2d, v5.2d
+    add v3.2d, v2.2d, v1.2d
+    sha512h2 q1, q2, v4.2d
+    ld1 {v27.2d}, [x4], #16
+    add v5.2d, v31.2d, v15.2d
+    ext v6.16b, v3.16b, v0.16b, #8
+    ext v5.16b, v5.16b, v5.16b, #8
+    ext v7.16b, v4.16b, v3.16b, #8
+    add v0.2d, v0.2d, v5.2d
+    ext v5.16b, v19.16b, v12.16b, #8
+    sha512su0 v15.2d, v16.2d
+    sha512h q0, q6, v7.2d
+    sha512su1 v15.2d, v14.2d, v5.2d
+    add v2.2d, v4.2d, v0.2d
+    sha512h2 q0, q4, v1.2d
+    ld1 {v28.2d}, [x4], #16
+    add v5.2d, v24.2d, v16.2d
+    ext v6.16b, v2.16b, v3.16b, #8
+    ext v5.16b, v5.16b, v5.16b, #8
+    ext v7.16b, v1.16b, v2.16b, #8
+    add v3.2d, v3.2d, v5.2d
+    ext v5.16b, v12.16b, v13.16b, #8
+    sha512su0 v16.2d, v17.2d
+    sha512h q3, q6, v7.2d
+    sha512su1 v16.2d, v15.2d, v5.2d
+    add v4.2d, v1.2d, v3.2d
+    sha512h2 q3, q1, v0.2d
+    ld1 {v29.2d}, [x4], #16
+    add v5.2d, v25.2d, v17.2d
+    ext v6.16b, v4.16b, v2.16b, #8
+    ext v5.16b, v5.16b, v5.16b, #8
+    ext v7.16b, v0.16b, v4.16b, #8
+    add v2.2d, v2.2d, v5.2d
+    ext v5.16b, v13.16b, v14.16b, #8
+    sha512su0 v17.2d, v18.2d
+    sha512h q2, q6, v7.2d
+    sha512su1 v17.2d, v16.2d, v5.2d
+    add v1.2d, v0.2d, v2.2d
+    sha512h2 q2, q0, v3.2d
+    ld1 {v30.2d}, [x4], #16
+    add v5.2d, v26.2d, v18.2d
+    ext v6.16b, v1.16b, v4.16b, #8
+    ext v5.16b, v5.16b, v5.16b, #8
+    ext v7.16b, v3.16b, v1.16b, #8
+    add v4.2d, v4.2d, v5.2d
+    ext v5.16b, v14.16b, v15.16b, #8
+    sha512su0 v18.2d, v19.2d
+    sha512h q4, q6, v7.2d
+    sha512su1 v18.2d, v17.2d, v5.2d
+    add v0.2d, v3.2d, v4.2d
+    sha512h2 q4, q3, v2.2d
+    ld1 {v31.2d}, [x4], #16
+    add v5.2d, v27.2d, v19.2d
+    ext v6.16b, v0.16b, v1.16b, #8
+    ext v5.16b, v5.16b, v5.16b, #8
+    ext v7.16b, v2.16b, v0.16b, #8
+    add v1.2d, v1.2d, v5.2d
+    ext v5.16b, v15.16b, v16.16b, #8
+    sha512su0 v19.2d, v12.2d
+    sha512h q1, q6, v7.2d
+    sha512su1 v19.2d, v18.2d, v5.2d
+    add v3.2d, v2.2d, v1.2d
+    sha512h2 q1, q2, v4.2d
+    ld1 {v24.2d}, [x4], #16
+    add v5.2d, v28.2d, v12.2d
+    ext v6.16b, v3.16b, v0.16b, #8
+    ext v5.16b, v5.16b, v5.16b, #8
+    ext v7.16b, v4.16b, v3.16b, #8
+    add v0.2d, v0.2d, v5.2d
+    ext v5.16b, v16.16b, v17.16b, #8
+    sha512su0 v12.2d, v13.2d
+    sha512h q0, q6, v7.2d
+    sha512su1 v12.2d, v19.2d, v5.2d
+    add v2.2d, v4.2d, v0.2d
+    sha512h2 q0, q4, v1.2d
+    ld1 {v25.2d}, [x4], #16
+    add v5.2d, v29.2d, v13.2d
+    ext v6.16b, v2.16b, v3.16b, #8
+    ext v5.16b, v5.16b, v5.16b, #8
+    ext v7.16b, v1.16b, v2.16b, #8
+    add v3.2d, v3.2d, v5.2d
+    ext v5.16b, v17.16b, v18.16b, #8
+    sha512su0 v13.2d, v14.2d
+    sha512h q3, q6, v7.2d
+    sha512su1 v13.2d, v12.2d, v5.2d
+    add v4.2d, v1.2d, v3.2d
+    sha512h2 q3, q1, v0.2d
+    ld1 {v26.2d}, [x4], #16
+    add v5.2d, v30.2d, v14.2d
+    ext v6.16b, v4.16b, v2.16b, #8
+    ext v5.16b, v5.16b, v5.16b, #8
+    ext v7.16b, v0.16b, v4.16b, #8
+    add v2.2d, v2.2d, v5.2d
+    ext v5.16b, v18.16b, v19.16b, #8
+    sha512su0 v14.2d, v15.2d
+    sha512h q2, q6, v7.2d
+    sha512su1 v14.2d, v13.2d, v5.2d
+    add v1.2d, v0.2d, v2.2d
+    sha512h2 q2, q0, v3.2d
+    ld1 {v27.2d}, [x4], #16
+    add v5.2d, v31.2d, v15.2d
+    ext v6.16b, v1.16b, v4.16b, #8
+    ext v5.16b, v5.16b, v5.16b, #8
+    ext v7.16b, v3.16b, v1.16b, #8
+    add v4.2d, v4.2d, v5.2d
+    ext v5.16b, v19.16b, v12.16b, #8
+    sha512su0 v15.2d, v16.2d
+    sha512h q4, q6, v7.2d
+    sha512su1 v15.2d, v14.2d, v5.2d
+    add v0.2d, v3.2d, v4.2d
+    sha512h2 q4, q3, v2.2d
+    ld1 {v28.2d}, [x4], #16
+    add v5.2d, v24.2d, v16.2d
+    ext v6.16b, v0.16b, v1.16b, #8
+    ext v5.16b, v5.16b, v5.16b, #8
+    ext v7.16b, v2.16b, v0.16b, #8
+    add v1.2d, v1.2d, v5.2d
+    ext v5.16b, v12.16b, v13.16b, #8
+    sha512su0 v16.2d, v17.2d
+    sha512h q1, q6, v7.2d
+    sha512su1 v16.2d, v15.2d, v5.2d
+    add v3.2d, v2.2d, v1.2d
+    sha512h2 q1, q2, v4.2d
+    ld1 {v29.2d}, [x4], #16
+    add v5.2d, v25.2d, v17.2d
+    ext v6.16b, v3.16b, v0.16b, #8
+    ext v5.16b, v5.16b, v5.16b, #8
+    ext v7.16b, v4.16b, v3.16b, #8
+    add v0.2d, v0.2d, v5.2d
+    ext v5.16b, v13.16b, v14.16b, #8
+    sha512su0 v17.2d, v18.2d
+    sha512h q0, q6, v7.2d
+    sha512su1 v17.2d, v16.2d, v5.2d
+    add v2.2d, v4.2d, v0.2d
+    sha512h2 q0, q4, v1.2d
+    ld1 {v30.2d}, [x4], #16
+    add v5.2d, v26.2d, v18.2d
+    ext v6.16b, v2.16b, v3.16b, #8
+    ext v5.16b, v5.16b, v5.16b, #8
+    ext v7.16b, v1.16b, v2.16b, #8
+    add v3.2d, v3.2d, v5.2d
+    ext v5.16b, v14.16b, v15.16b, #8
+    sha512su0 v18.2d, v19.2d
+    sha512h q3, q6, v7.2d
+    sha512su1 v18.2d, v17.2d, v5.2d
+    add v4.2d, v1.2d, v3.2d
+    sha512h2 q3, q1, v0.2d
+    ld1 {v31.2d}, [x4], #16
+    add v5.2d, v27.2d, v19.2d
+    ext v6.16b, v4.16b, v2.16b, #8
+    ext v5.16b, v5.16b, v5.16b, #8
+    ext v7.16b, v0.16b, v4.16b, #8
+    add v2.2d, v2.2d, v5.2d
+    ext v5.16b, v15.16b, v16.16b, #8
+    sha512su0 v19.2d, v12.2d
+    sha512h q2, q6, v7.2d
+    sha512su1 v19.2d, v18.2d, v5.2d
+    add v1.2d, v0.2d, v2.2d
+    sha512h2 q2, q0, v3.2d
+    ld1 {v24.2d}, [x4], #16
+    add v5.2d, v28.2d, v12.2d
+    ext v6.16b, v1.16b, v4.16b, #8
+    ext v5.16b, v5.16b, v5.16b, #8
+    ext v7.16b, v3.16b, v1.16b, #8
+    add v4.2d, v4.2d, v5.2d
+    sha512h q4, q6, v7.2d
+    add v0.2d, v3.2d, v4.2d
+    sha512h2 q4, q3, v2.2d
+    ld1 {v25.2d}, [x4], #16
+    add v5.2d, v29.2d, v13.2d
+    ext v6.16b, v0.16b, v1.16b, #8
+    ext v5.16b, v5.16b, v5.16b, #8
+    ext v7.16b, v2.16b, v0.16b, #8
+    add v1.2d, v1.2d, v5.2d
+    sha512h q1, q6, v7.2d
+    add v3.2d, v2.2d, v1.2d
+    sha512h2 q1, q2, v4.2d
+    ld1 {v26.2d}, [x4], #16
+    add v5.2d, v30.2d, v14.2d
+    ext v6.16b, v3.16b, v0.16b, #8
+    ext v5.16b, v5.16b, v5.16b, #8
+    ext v7.16b, v4.16b, v3.16b, #8
+    add v0.2d, v0.2d, v5.2d
+    sha512h q0, q6, v7.2d
+    add v2.2d, v4.2d, v0.2d
+    sha512h2 q0, q4, v1.2d
+    ld1 {v27.2d}, [x4], #16
+    add v5.2d, v31.2d, v15.2d
+    ext v6.16b, v2.16b, v3.16b, #8
+    ext v5.16b, v5.16b, v5.16b, #8
+    ext v7.16b, v1.16b, v2.16b, #8
+    add v3.2d, v3.2d, v5.2d
+    sha512h q3, q6, v7.2d
+    add v4.2d, v1.2d, v3.2d
+    sha512h2 q3, q1, v0.2d
+    add v5.2d, v24.2d, v16.2d
+    ext v6.16b, v4.16b, v2.16b, #8
+    ext v5.16b, v5.16b, v5.16b, #8
+    ext v7.16b, v0.16b, v4.16b, #8
+    add v2.2d, v2.2d, v5.2d
+    sha512h q2, q6, v7.2d
+    add v1.2d, v0.2d, v2.2d
+    sha512h2 q2, q0, v3.2d
+    add v5.2d, v25.2d, v17.2d
+    ext v6.16b, v1.16b, v4.16b, #8
+    ext v5.16b, v5.16b, v5.16b, #8
+    ext v7.16b, v3.16b, v1.16b, #8
+    add v4.2d, v4.2d, v5.2d
+    sha512h q4, q6, v7.2d
+    add v0.2d, v3.2d, v4.2d
+    sha512h2 q4, q3, v2.2d
+    add v5.2d, v26.2d, v18.2d
+    ext v6.16b, v0.16b, v1.16b, #8
+    ext v5.16b, v5.16b, v5.16b, #8
+    ext v7.16b, v2.16b, v0.16b, #8
+    add v1.2d, v1.2d, v5.2d
+    sha512h q1, q6, v7.2d
+    add v3.2d, v2.2d, v1.2d
+    sha512h2 q1, q2, v4.2d
+    add v5.2d, v27.2d, v19.2d
+    ext v6.16b, v3.16b, v0.16b, #8
+    ext v5.16b, v5.16b, v5.16b, #8
+    ext v7.16b, v4.16b, v3.16b, #8
+    add v0.2d, v0.2d, v5.2d
+    sha512h q0, q6, v7.2d
+    add v2.2d, v4.2d, v0.2d
+    sha512h2 q0, q4, v1.2d
+    add v8.2d, v8.2d, v0.2d
+    add v9.2d, v9.2d, v1.2d
+    add v10.2d, v10.2d, v2.2d
+    add v11.2d, v11.2d, v3.2d
+    sub x2, x2, #128
+    cbnz x2, 1b
+    st1 {v8.2d, v9.2d, v10.2d, v11.2d}, [x0]
+  end;
+end;
+{$else}
+begin
+  Sha512BlocksPlain(State, Data, N);
+end;
+{$endif}
+
+
+{ ---- MD5 (RFC 1321) ---- }
+
+procedure Md5Blocks(State, Data: Pointer; N: Integer);
+var
+  m0, m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11, m12, m13, m14, m15: UInt32;
+  a, b, c, d: UInt32;
+  j: Integer;
+  p: Pointer;
+begin
+  for j := 0 to N - 1 do
+  begin
+    p := Pointer(Integer(Data) + j * 64);
+    m0 := LoadLE32(p);
+    m1 := LoadLE32(Pointer(Integer(p) + 4));
+    m2 := LoadLE32(Pointer(Integer(p) + 8));
+    m3 := LoadLE32(Pointer(Integer(p) + 12));
+    m4 := LoadLE32(Pointer(Integer(p) + 16));
+    m5 := LoadLE32(Pointer(Integer(p) + 20));
+    m6 := LoadLE32(Pointer(Integer(p) + 24));
+    m7 := LoadLE32(Pointer(Integer(p) + 28));
+    m8 := LoadLE32(Pointer(Integer(p) + 32));
+    m9 := LoadLE32(Pointer(Integer(p) + 36));
+    m10 := LoadLE32(Pointer(Integer(p) + 40));
+    m11 := LoadLE32(Pointer(Integer(p) + 44));
+    m12 := LoadLE32(Pointer(Integer(p) + 48));
+    m13 := LoadLE32(Pointer(Integer(p) + 52));
+    m14 := LoadLE32(Pointer(Integer(p) + 56));
+    m15 := LoadLE32(Pointer(Integer(p) + 60));
+    a := LoadLE32(State);
+    b := LoadLE32(Pointer(Integer(State) + 4));
+    c := LoadLE32(Pointer(Integer(State) + 8));
+    d := LoadLE32(Pointer(Integer(State) + 12));
+    a := b + RotateLeft(a + ((b and c) or ((not b) and d)) + $d76aa478 + m0, 7);
+    d := a + RotateLeft(d + ((a and b) or ((not a) and c)) + $e8c7b756 + m1, 12);
+    c := d + RotateLeft(c + ((d and a) or ((not d) and b)) + $242070db + m2, 17);
+    b := c + RotateLeft(b + ((c and d) or ((not c) and a)) + $c1bdceee + m3, 22);
+    a := b + RotateLeft(a + ((b and c) or ((not b) and d)) + $f57c0faf + m4, 7);
+    d := a + RotateLeft(d + ((a and b) or ((not a) and c)) + $4787c62a + m5, 12);
+    c := d + RotateLeft(c + ((d and a) or ((not d) and b)) + $a8304613 + m6, 17);
+    b := c + RotateLeft(b + ((c and d) or ((not c) and a)) + $fd469501 + m7, 22);
+    a := b + RotateLeft(a + ((b and c) or ((not b) and d)) + $698098d8 + m8, 7);
+    d := a + RotateLeft(d + ((a and b) or ((not a) and c)) + $8b44f7af + m9, 12);
+    c := d + RotateLeft(c + ((d and a) or ((not d) and b)) + $ffff5bb1 + m10, 17);
+    b := c + RotateLeft(b + ((c and d) or ((not c) and a)) + $895cd7be + m11, 22);
+    a := b + RotateLeft(a + ((b and c) or ((not b) and d)) + $6b901122 + m12, 7);
+    d := a + RotateLeft(d + ((a and b) or ((not a) and c)) + $fd987193 + m13, 12);
+    c := d + RotateLeft(c + ((d and a) or ((not d) and b)) + $a679438e + m14, 17);
+    b := c + RotateLeft(b + ((c and d) or ((not c) and a)) + $49b40821 + m15, 22);
+    a := b + RotateLeft(a + ((d and b) or ((not d) and c)) + $f61e2562 + m1, 5);
+    d := a + RotateLeft(d + ((c and a) or ((not c) and b)) + $c040b340 + m6, 9);
+    c := d + RotateLeft(c + ((b and d) or ((not b) and a)) + $265e5a51 + m11, 14);
+    b := c + RotateLeft(b + ((a and c) or ((not a) and d)) + $e9b6c7aa + m0, 20);
+    a := b + RotateLeft(a + ((d and b) or ((not d) and c)) + $d62f105d + m5, 5);
+    d := a + RotateLeft(d + ((c and a) or ((not c) and b)) + $02441453 + m10, 9);
+    c := d + RotateLeft(c + ((b and d) or ((not b) and a)) + $d8a1e681 + m15, 14);
+    b := c + RotateLeft(b + ((a and c) or ((not a) and d)) + $e7d3fbc8 + m4, 20);
+    a := b + RotateLeft(a + ((d and b) or ((not d) and c)) + $21e1cde6 + m9, 5);
+    d := a + RotateLeft(d + ((c and a) or ((not c) and b)) + $c33707d6 + m14, 9);
+    c := d + RotateLeft(c + ((b and d) or ((not b) and a)) + $f4d50d87 + m3, 14);
+    b := c + RotateLeft(b + ((a and c) or ((not a) and d)) + $455a14ed + m8, 20);
+    a := b + RotateLeft(a + ((d and b) or ((not d) and c)) + $a9e3e905 + m13, 5);
+    d := a + RotateLeft(d + ((c and a) or ((not c) and b)) + $fcefa3f8 + m2, 9);
+    c := d + RotateLeft(c + ((b and d) or ((not b) and a)) + $676f02d9 + m7, 14);
+    b := c + RotateLeft(b + ((a and c) or ((not a) and d)) + $8d2a4c8a + m12, 20);
+    a := b + RotateLeft(a + (b xor c xor d) + $fffa3942 + m5, 4);
+    d := a + RotateLeft(d + (a xor b xor c) + $8771f681 + m8, 11);
+    c := d + RotateLeft(c + (d xor a xor b) + $6d9d6122 + m11, 16);
+    b := c + RotateLeft(b + (c xor d xor a) + $fde5380c + m14, 23);
+    a := b + RotateLeft(a + (b xor c xor d) + $a4beea44 + m1, 4);
+    d := a + RotateLeft(d + (a xor b xor c) + $4bdecfa9 + m4, 11);
+    c := d + RotateLeft(c + (d xor a xor b) + $f6bb4b60 + m7, 16);
+    b := c + RotateLeft(b + (c xor d xor a) + $bebfbc70 + m10, 23);
+    a := b + RotateLeft(a + (b xor c xor d) + $289b7ec6 + m13, 4);
+    d := a + RotateLeft(d + (a xor b xor c) + $eaa127fa + m0, 11);
+    c := d + RotateLeft(c + (d xor a xor b) + $d4ef3085 + m3, 16);
+    b := c + RotateLeft(b + (c xor d xor a) + $04881d05 + m6, 23);
+    a := b + RotateLeft(a + (b xor c xor d) + $d9d4d039 + m9, 4);
+    d := a + RotateLeft(d + (a xor b xor c) + $e6db99e5 + m12, 11);
+    c := d + RotateLeft(c + (d xor a xor b) + $1fa27cf8 + m15, 16);
+    b := c + RotateLeft(b + (c xor d xor a) + $c4ac5665 + m2, 23);
+    a := b + RotateLeft(a + (c xor (b or (not d))) + $f4292244 + m0, 6);
+    d := a + RotateLeft(d + (b xor (a or (not c))) + $432aff97 + m7, 10);
+    c := d + RotateLeft(c + (a xor (d or (not b))) + $ab9423a7 + m14, 15);
+    b := c + RotateLeft(b + (d xor (c or (not a))) + $fc93a039 + m5, 21);
+    a := b + RotateLeft(a + (c xor (b or (not d))) + $655b59c3 + m12, 6);
+    d := a + RotateLeft(d + (b xor (a or (not c))) + $8f0ccc92 + m3, 10);
+    c := d + RotateLeft(c + (a xor (d or (not b))) + $ffeff47d + m10, 15);
+    b := c + RotateLeft(b + (d xor (c or (not a))) + $85845dd1 + m1, 21);
+    a := b + RotateLeft(a + (c xor (b or (not d))) + $6fa87e4f + m8, 6);
+    d := a + RotateLeft(d + (b xor (a or (not c))) + $fe2ce6e0 + m15, 10);
+    c := d + RotateLeft(c + (a xor (d or (not b))) + $a3014314 + m6, 15);
+    b := c + RotateLeft(b + (d xor (c or (not a))) + $4e0811a1 + m13, 21);
+    a := b + RotateLeft(a + (c xor (b or (not d))) + $f7537e82 + m4, 6);
+    d := a + RotateLeft(d + (b xor (a or (not c))) + $bd3af235 + m11, 10);
+    c := d + RotateLeft(c + (a xor (d or (not b))) + $2ad7d2bb + m2, 15);
+    b := c + RotateLeft(b + (d xor (c or (not a))) + $eb86d391 + m9, 21);
+    StoreLE32(State, LoadLE32(State) + a);
+    StoreLE32(Pointer(Integer(State) + 4), LoadLE32(Pointer(Integer(State) + 4)) + b);
+    StoreLE32(Pointer(Integer(State) + 8), LoadLE32(Pointer(Integer(State) + 8)) + c);
+    StoreLE32(Pointer(Integer(State) + 12), LoadLE32(Pointer(Integer(State) + 12)) + d);
+  end;
+end;
+
+function PasMd5(const S: string): string;
+var
+  st: array[0..3] of UInt32;
+  buf: array[0..127] of Byte;
+  i, n, nb: Integer;
+begin
+  st[0] := $67452301;
+  st[1] := $efcdab89;
+  st[2] := $98badcfe;
+  st[3] := $10325476;
+  n := Length(S) div 64;
+  if n > 0 then
+    Md5Blocks(@st[0], Pointer(S), n);
+  Tail64(S, @buf[0], nb, True);
+  Md5Blocks(@st[0], @buf[0], nb);
+  SetLength(Result, 16);
+  for i := 0 to 3 do
+    StoreLE32(@Result[i * 4 + 1], st[i]);
+end;
+
+{ ---- SHA-3 (FIPS 202): the sponge with rate 1600 - 2 d bits and the
+  01 suffix ---- }
+
+{ Keccak-f[1600] (FIPS 202, 3.2 and 3.3): the 25 lanes in variables, each
+  step written out, the 24 rounds in a loop, the round constants and
+  the rotations of Table 2 in place. }
+procedure KeccakF(A: Pointer);
+var
+  a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20, a21, a22, a23, a24: Integer;
+  b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15, b16, b17, b18, b19, b20, b21, b22, b23, b24: Integer;
+  c0, c1, c2, c3, c4, d0, d1, d2, d3, d4: Integer;
+  r: Integer;
+begin
+  a0 := LoadLE64(A);
+  a1 := LoadLE64(Pointer(Integer(A) + 8));
+  a2 := LoadLE64(Pointer(Integer(A) + 16));
+  a3 := LoadLE64(Pointer(Integer(A) + 24));
+  a4 := LoadLE64(Pointer(Integer(A) + 32));
+  a5 := LoadLE64(Pointer(Integer(A) + 40));
+  a6 := LoadLE64(Pointer(Integer(A) + 48));
+  a7 := LoadLE64(Pointer(Integer(A) + 56));
+  a8 := LoadLE64(Pointer(Integer(A) + 64));
+  a9 := LoadLE64(Pointer(Integer(A) + 72));
+  a10 := LoadLE64(Pointer(Integer(A) + 80));
+  a11 := LoadLE64(Pointer(Integer(A) + 88));
+  a12 := LoadLE64(Pointer(Integer(A) + 96));
+  a13 := LoadLE64(Pointer(Integer(A) + 104));
+  a14 := LoadLE64(Pointer(Integer(A) + 112));
+  a15 := LoadLE64(Pointer(Integer(A) + 120));
+  a16 := LoadLE64(Pointer(Integer(A) + 128));
+  a17 := LoadLE64(Pointer(Integer(A) + 136));
+  a18 := LoadLE64(Pointer(Integer(A) + 144));
+  a19 := LoadLE64(Pointer(Integer(A) + 152));
+  a20 := LoadLE64(Pointer(Integer(A) + 160));
+  a21 := LoadLE64(Pointer(Integer(A) + 168));
+  a22 := LoadLE64(Pointer(Integer(A) + 176));
+  a23 := LoadLE64(Pointer(Integer(A) + 184));
+  a24 := LoadLE64(Pointer(Integer(A) + 192));
+  for r := 0 to 23 do
+  begin
+    c0 := a0 xor a5 xor a10 xor a15 xor a20;
+    c1 := a1 xor a6 xor a11 xor a16 xor a21;
+    c2 := a2 xor a7 xor a12 xor a17 xor a22;
+    c3 := a3 xor a8 xor a13 xor a18 xor a23;
+    c4 := a4 xor a9 xor a14 xor a19 xor a24;
+    d0 := c4 xor RotateLeft(c1, 1);
+    d1 := c0 xor RotateLeft(c2, 1);
+    d2 := c1 xor RotateLeft(c3, 1);
+    d3 := c2 xor RotateLeft(c4, 1);
+    d4 := c3 xor RotateLeft(c0, 1);
+    a0 := a0 xor d0;
+    a1 := a1 xor d1;
+    a2 := a2 xor d2;
+    a3 := a3 xor d3;
+    a4 := a4 xor d4;
+    a5 := a5 xor d0;
+    a6 := a6 xor d1;
+    a7 := a7 xor d2;
+    a8 := a8 xor d3;
+    a9 := a9 xor d4;
+    a10 := a10 xor d0;
+    a11 := a11 xor d1;
+    a12 := a12 xor d2;
+    a13 := a13 xor d3;
+    a14 := a14 xor d4;
+    a15 := a15 xor d0;
+    a16 := a16 xor d1;
+    a17 := a17 xor d2;
+    a18 := a18 xor d3;
+    a19 := a19 xor d4;
+    a20 := a20 xor d0;
+    a21 := a21 xor d1;
+    a22 := a22 xor d2;
+    a23 := a23 xor d3;
+    a24 := a24 xor d4;
+    b0 := a0;
+    b10 := RotateLeft(a1, 1);
+    b20 := RotateLeft(a2, 62);
+    b5 := RotateLeft(a3, 28);
+    b15 := RotateLeft(a4, 27);
+    b16 := RotateLeft(a5, 36);
+    b1 := RotateLeft(a6, 44);
+    b11 := RotateLeft(a7, 6);
+    b21 := RotateLeft(a8, 55);
+    b6 := RotateLeft(a9, 20);
+    b7 := RotateLeft(a10, 3);
+    b17 := RotateLeft(a11, 10);
+    b2 := RotateLeft(a12, 43);
+    b12 := RotateLeft(a13, 25);
+    b22 := RotateLeft(a14, 39);
+    b23 := RotateLeft(a15, 41);
+    b8 := RotateLeft(a16, 45);
+    b18 := RotateLeft(a17, 15);
+    b3 := RotateLeft(a18, 21);
+    b13 := RotateLeft(a19, 8);
+    b14 := RotateLeft(a20, 18);
+    b24 := RotateLeft(a21, 2);
+    b9 := RotateLeft(a22, 61);
+    b19 := RotateLeft(a23, 56);
+    b4 := RotateLeft(a24, 14);
+    a0 := b0 xor ((not b1) and b2);
+    a1 := b1 xor ((not b2) and b3);
+    a2 := b2 xor ((not b3) and b4);
+    a3 := b3 xor ((not b4) and b0);
+    a4 := b4 xor ((not b0) and b1);
+    a5 := b5 xor ((not b6) and b7);
+    a6 := b6 xor ((not b7) and b8);
+    a7 := b7 xor ((not b8) and b9);
+    a8 := b8 xor ((not b9) and b5);
+    a9 := b9 xor ((not b5) and b6);
+    a10 := b10 xor ((not b11) and b12);
+    a11 := b11 xor ((not b12) and b13);
+    a12 := b12 xor ((not b13) and b14);
+    a13 := b13 xor ((not b14) and b10);
+    a14 := b14 xor ((not b10) and b11);
+    a15 := b15 xor ((not b16) and b17);
+    a16 := b16 xor ((not b17) and b18);
+    a17 := b17 xor ((not b18) and b19);
+    a18 := b18 xor ((not b19) and b15);
+    a19 := b19 xor ((not b15) and b16);
+    a20 := b20 xor ((not b21) and b22);
+    a21 := b21 xor ((not b22) and b23);
+    a22 := b22 xor ((not b23) and b24);
+    a23 := b23 xor ((not b24) and b20);
+    a24 := b24 xor ((not b20) and b21);
+    a0 := a0 xor KeccakRC[r];
+  end;
+  StoreLE64(A, a0);
+  StoreLE64(Pointer(Integer(A) + 8), a1);
+  StoreLE64(Pointer(Integer(A) + 16), a2);
+  StoreLE64(Pointer(Integer(A) + 24), a3);
+  StoreLE64(Pointer(Integer(A) + 32), a4);
+  StoreLE64(Pointer(Integer(A) + 40), a5);
+  StoreLE64(Pointer(Integer(A) + 48), a6);
+  StoreLE64(Pointer(Integer(A) + 56), a7);
+  StoreLE64(Pointer(Integer(A) + 64), a8);
+  StoreLE64(Pointer(Integer(A) + 72), a9);
+  StoreLE64(Pointer(Integer(A) + 80), a10);
+  StoreLE64(Pointer(Integer(A) + 88), a11);
+  StoreLE64(Pointer(Integer(A) + 96), a12);
+  StoreLE64(Pointer(Integer(A) + 104), a13);
+  StoreLE64(Pointer(Integer(A) + 112), a14);
+  StoreLE64(Pointer(Integer(A) + 120), a15);
+  StoreLE64(Pointer(Integer(A) + 128), a16);
+  StoreLE64(Pointer(Integer(A) + 136), a17);
+  StoreLE64(Pointer(Integer(A) + 144), a18);
+  StoreLE64(Pointer(Integer(A) + 152), a19);
+  StoreLE64(Pointer(Integer(A) + 160), a20);
+  StoreLE64(Pointer(Integer(A) + 168), a21);
+  StoreLE64(Pointer(Integer(A) + 176), a22);
+  StoreLE64(Pointer(Integer(A) + 184), a23);
+  StoreLE64(Pointer(Integer(A) + 192), a24);
+end;
+
+function PasSha3(const S: string; Bits: Integer): string;
+var
+  a: array[0..24] of Integer;
+  blk: array[0..143] of Byte;
+  rate, i, j, n, off, rest, lanes: Integer;
+  t: Integer;
+begin
+  if not ((Bits = 224) or (Bits = 256) or (Bits = 384) or (Bits = 512)) then
+  begin
+    WriteLn(ErrOutput, 'paslang: Sha3 takes 224, 256, 384 or 512 bits');
+    Halt(1);
+  end;
+  rate := 200 - 2 * (Bits div 8);
+  lanes := rate div 8;
+  for i := 0 to 24 do
+    a[i] := 0;
+  n := Length(S) div rate;
+  for j := 0 to n - 1 do
+  begin
+    for i := 0 to lanes - 1 do
+      a[i] := a[i] xor LoadLE64(Pointer(Integer(Pointer(S)) + j * rate + i * 8));
+    KeccakF(@a[0]);
+  end;
+  off := n * rate;
+  rest := Length(S) - off;
+  for i := 0 to 143 do
+    blk[i] := 0;
+  for i := 0 to rest - 1 do
+    blk[i] := Byte(S[off + 1 + i]);
+  blk[rest] := blk[rest] xor $06;
+  blk[rate - 1] := blk[rate - 1] xor $80;
+  for i := 0 to lanes - 1 do
+    a[i] := a[i] xor LoadLE64(@blk[i * 8]);
+  KeccakF(@a[0]);
+  SetLength(Result, Bits div 8);
+  i := 0;
+  while i < Bits div 8 do
+  begin
+    t := a[i div 8];
+    for j := 0 to 7 do
+      if i + j < Bits div 8 then
+        Result[i + j + 1] := Char((t shr (8 * j)) and 255);
+    i := i + 8;
+  end;
+end;
+
+{ ---- CRC-32 (RFC 1952, the polynomial of Ethernet and zlib) and
+  CRC-32C (RFC 3720, Castagnoli), reflected; the table of 256 entries
+  built the first time a Pascal path needs it ---- }
+
+{ Two routines building the tables at once write the same values; the
+  flag is stored after them and read before them, so a routine that
+  sees it sees the tables. }
+procedure BuildTabs;
+var
+  i, j: Integer;
+  c, cc: UInt32;
+begin
+  if AtomicLoad(TabsReady) <> 0 then
+    Exit;
+  for i := 0 to 255 do
+  begin
+    c := UInt32(i);
+    cc := UInt32(i);
+    for j := 0 to 7 do
+    begin
+      if (c and 1) <> 0 then
+        c := (c shr 1) xor $edb88320
+      else
+        c := c shr 1;
+      if (cc and 1) <> 0 then
+        cc := (cc shr 1) xor $82f63b78
+      else
+        cc := cc shr 1;
+    end;
+    Crc32Tab[i] := c;
+    Crc32cTab[i] := cc;
+  end;
+  AtomicStore(TabsReady, 1);
+end;
+
+function Crc32Plain(Crc: UInt32; P: Pointer; N: Integer; Castagnoli: Boolean): UInt32;
+var
+  i: Integer;
+  b: Integer;
+begin
+  Result := Crc;
+  if Castagnoli then
+    for i := 0 to N - 1 do
+    begin
+      b := PByte(P)[i];
+      Result := Crc32cTab[(Result xor b) and 255] xor (Result shr 8);
+    end
+  else
+    for i := 0 to N - 1 do
+    begin
+      b := PByte(P)[i];
+      Result := Crc32Tab[(Result xor b) and 255] xor (Result shr 8);
+    end;
+end;
+
+{ CRC32C on the processor: SSE4.2's crc32 eight bytes a step (SDM vol.
+  2A, CRC32), FEAT_CRC32's CRC32CX two words a step after Go's
+  crc32_arm64.s (Arm ARM C6.2.136). }
+function Crc32cCpu(Crc: UInt32; P: Pointer; N: Integer): UInt32;
+var
+  c: UInt32;
+begin
+  c := Crc;
+  asm amd64 (P: in rsi; N: in rcx; c: inout rax)
+    1:
+    cmpq $8, %rcx
+    jb 2f
+    crc32q (%rsi), %rax
+    addq $8, %rsi
+    subq $8, %rcx
+    jmp 1b
+    2:
+    testq %rcx, %rcx
+    jz 3f
+    crc32b (%rsi), %eax
+    incq %rsi
+    decq %rcx
+    jmp 2b
+    3:
+  end;
+  asm arm64 (P: in x1; N: in x2; c: inout x0)
+    1:
+    cmp x2, #16
+    b.lt 2f
+    ldp x8, x10, [x1], #16
+    crc32cx w0, w0, x8
+    crc32cx w0, w0, x10
+    sub x2, x2, #16
+    b 1b
+    2:
+    tbz x2, #3, 3f
+    ldr x10, [x1], #8
+    crc32cx w0, w0, x10
+    3:
+    tbz x2, #2, 4f
+    ldr w10, [x1], #4
+    crc32cw w0, w0, w10
+    4:
+    tbz x2, #1, 5f
+    ldrh w10, [x1], #2
+    crc32ch w0, w0, w10
+    5:
+    tbz x2, #0, 6f
+    ldrb w10, [x1]
+    crc32cb w0, w0, w10
+    6:
+  end;
+  Result := c;
+end;
+
+{$ifndef CPUAARCH64}
+{ Three crc32q chains at once (1.1.1), after Go's castagnoliSSE42Triple:
+  crc32q takes three cycles but three of them run together, so three
+  pieces of a buffer are summed in the time of one; A, B and C are the
+  three CRCs, PA, PB and PC the pieces, Rounds how many 24-byte steps.
+  Folding by PCLMULQDQ with Castagnoli's constants gave 18 GB/s here,
+  this 33, so the fold was dropped. }
+procedure Crc32cTriple(var A, B, C: UInt32; PA, PB, PC: Pointer; Rounds: Integer);
+var
+  ca, cb, cc: UInt32;
+begin
+  ca := A;
+  cb := B;
+  cc := C;
+  asm amd64 (ca: inout rax; cb: inout rcx; cc: inout rdx; PA: in rsi; PB: in rdi; PC: in r8; Rounds: in r9)
+    1:
+    crc32q (%rsi), %rax
+    crc32q (%rdi), %rcx
+    crc32q (%r8), %rdx
+    crc32q 8(%rsi), %rax
+    crc32q 8(%rdi), %rcx
+    crc32q 8(%r8), %rdx
+    crc32q 16(%rsi), %rax
+    crc32q 16(%rdi), %rcx
+    crc32q 16(%r8), %rdx
+    addq $24, %rsi
+    addq $24, %rdi
+    addq $24, %r8
+    decq %r9
+    jnz 1b
+  end;
+  A := ca;
+  B := cb;
+  C := cc;
+end;
+
+const
+  CrcK1 = 168;
+  CrcK2 = 1344;
+
+var
+  { CRC(i000, O), CRC(0i00, O), CRC(00i0, O), CRC(000i, O) for O of K
+    zero bytes, K1 and K2: the CRC of a piece carried over the pieces
+    after it (Go's castagnoliShift). Built at first use. }
+  CrcShiftK1: array[0..3] of array[0..255] of UInt32;
+  CrcShiftK2: array[0..3] of array[0..255] of UInt32;
+  CrcShiftReady: Integer;
+
+procedure BuildCrcShift;
+var
+  zeros: array[0..1343] of Byte;
+  b, i: Integer;
+begin
+  if AtomicLoad(CrcShiftReady) <> 0 then
+    Exit;
+  for i := 0 to High(zeros) do
+    zeros[i] := 0;
+  for b := 0 to 3 do
+    for i := 0 to 255 do
+    begin
+      CrcShiftK1[b][i] := Crc32cCpu(UInt32(i) shl (b * 8), @zeros[0], CrcK1);
+      CrcShiftK2[b][i] := Crc32cCpu(UInt32(i) shl (b * 8), @zeros[0], CrcK2);
+    end;
+  AtomicStore(CrcShiftReady, 1);
+end;
+
+function CrcShift1(Crc: UInt32): UInt32;
+begin
+  Result := CrcShiftK1[3][Crc shr 24] xor CrcShiftK1[2][(Crc shr 16) and 255] xor
+    CrcShiftK1[1][(Crc shr 8) and 255] xor CrcShiftK1[0][Crc and 255];
+end;
+
+function CrcShift2(Crc: UInt32): UInt32;
+begin
+  Result := CrcShiftK2[3][Crc shr 24] xor CrcShiftK2[2][(Crc shr 16) and 255] xor
+    CrcShiftK2[1][(Crc shr 8) and 255] xor CrcShiftK2[0][Crc and 255];
+end;
+
+{ Go's updateCastagnoli: the buffer in three pieces of K2 (then K1)
+  bytes summed together, the CRC of the first two carried over the
+  bytes after them by the tables, the rest by one chain. }
+function Crc32cFast(Crc: UInt32; P: Pointer; N: Integer): UInt32;
+var
+  a, b, c: UInt32;
+  q, delta: Integer;
+begin
+  Result := Crc;
+  q := Integer(P);
+  if N >= CrcK1 * 3 then
+  begin
+    delta := q and 7;
+    if delta <> 0 then
+    begin
+      delta := 8 - delta;
+      Result := Crc32cCpu(Result, Pointer(q), delta);
+      q := q + delta;
+      N := N - delta;
+    end;
+    BuildCrcShift;
+  end;
+  while N >= CrcK2 * 3 do
+  begin
+    a := Result;
+    b := 0;
+    c := 0;
+    Crc32cTriple(a, b, c, Pointer(q), Pointer(q + CrcK2), Pointer(q + 2 * CrcK2), CrcK2 div 24);
+    Result := CrcShift2(CrcShift2(a) xor b) xor c;
+    q := q + 3 * CrcK2;
+    N := N - 3 * CrcK2;
+  end;
+  while N >= CrcK1 * 3 do
+  begin
+    a := Result;
+    b := 0;
+    c := 0;
+    Crc32cTriple(a, b, c, Pointer(q), Pointer(q + CrcK1), Pointer(q + 2 * CrcK1), CrcK1 div 24);
+    Result := CrcShift1(CrcShift1(a) xor b) xor c;
+    q := q + 3 * CrcK1;
+    N := N - 3 * CrcK1;
+  end;
+  if N > 0 then
+    Result := Crc32cCpu(Result, Pointer(q), N);
+end;
+{$endif}
+
+{ CRC32 on the processor: on arm64 FEAT_CRC32's CRC32X as above (Arm
+  ARM C6.2.135); on amd64 the folding by PCLMULQDQ after Go's
+  crc32_amd64.s ieeeCLMUL (Intel, Fast CRC Computation for Generic
+  Polynomials Using PCLMULQDQ Instruction), which takes at least 64
+  bytes and a whole number of 16-byte pieces: N is that, the caller
+  finishes the rest. }
+function Crc32Cpu(Crc: UInt32; P: Pointer; N: Integer): UInt32;
+var
+  c: UInt32;
+begin
+  c := Crc;
+  asm amd64 (P: in rsi; N: in rcx; c: inout rax)
+    movd %eax, %xmm0
+    movdqu (%rsi), %xmm1
+    movdqu 16(%rsi), %xmm2
+    movdqu 32(%rsi), %xmm3
+    movdqu 48(%rsi), %xmm4
+    pxor %xmm0, %xmm1
+    addq $64, %rsi
+    subq $64, %rcx
+    cmpq $64, %rcx
+    jb 2f
+    movabsq $0x154442bd4, %rdx
+    movq %rdx, %xmm0
+    movabsq $0x1c6e41596, %rdx
+    pinsrq $1, %rdx, %xmm0
+    1:
+    movdqa %xmm1, %xmm5
+    movdqa %xmm2, %xmm6
+    movdqa %xmm3, %xmm7
+    movdqa %xmm4, %xmm8
+    pclmulqdq $0, %xmm0, %xmm1
+    pclmulqdq $0, %xmm0, %xmm2
+    pclmulqdq $0, %xmm0, %xmm3
+    pclmulqdq $0, %xmm0, %xmm4
+    movdqu (%rsi), %xmm11
+    movdqu 16(%rsi), %xmm12
+    movdqu 32(%rsi), %xmm13
+    movdqu 48(%rsi), %xmm14
+    pclmulqdq $0x11, %xmm0, %xmm5
+    pclmulqdq $0x11, %xmm0, %xmm6
+    pclmulqdq $0x11, %xmm0, %xmm7
+    pclmulqdq $0x11, %xmm0, %xmm8
+    pxor %xmm5, %xmm1
+    pxor %xmm6, %xmm2
+    pxor %xmm7, %xmm3
+    pxor %xmm8, %xmm4
+    pxor %xmm11, %xmm1
+    pxor %xmm12, %xmm2
+    pxor %xmm13, %xmm3
+    pxor %xmm14, %xmm4
+    addq $64, %rsi
+    subq $64, %rcx
+    cmpq $64, %rcx
+    jge 1b
+    2:
+    movabsq $0x1751997d0, %rdx
+    movq %rdx, %xmm0
+    movabsq $0x0ccaa009e, %rdx
+    pinsrq $1, %rdx, %xmm0
+    movdqa %xmm1, %xmm5
+    pclmulqdq $0, %xmm0, %xmm1
+    pclmulqdq $0x11, %xmm0, %xmm5
+    pxor %xmm5, %xmm1
+    pxor %xmm2, %xmm1
+    movdqa %xmm1, %xmm5
+    pclmulqdq $0, %xmm0, %xmm1
+    pclmulqdq $0x11, %xmm0, %xmm5
+    pxor %xmm5, %xmm1
+    pxor %xmm3, %xmm1
+    movdqa %xmm1, %xmm5
+    pclmulqdq $0, %xmm0, %xmm1
+    pclmulqdq $0x11, %xmm0, %xmm5
+    pxor %xmm5, %xmm1
+    pxor %xmm4, %xmm1
+    cmpq $16, %rcx
+    jb 4f
+    3:
+    movdqu (%rsi), %xmm10
+    movdqa %xmm1, %xmm5
+    pclmulqdq $0, %xmm0, %xmm1
+    pclmulqdq $0x11, %xmm0, %xmm5
+    pxor %xmm5, %xmm1
+    pxor %xmm10, %xmm1
+    subq $16, %rcx
+    addq $16, %rsi
+    cmpq $16, %rcx
+    jge 3b
+    4:
+    pcmpeqb %xmm3, %xmm3
+    pclmulqdq $1, %xmm1, %xmm0
+    psrldq $8, %xmm1
+    pxor %xmm0, %xmm1
+    movdqa %xmm1, %xmm2
+    movabsq $0x163cd6124, %rdx
+    movq %rdx, %xmm0
+    psrlq $32, %xmm3
+    psrldq $4, %xmm2
+    pand %xmm3, %xmm1
+    pclmulqdq $0, %xmm0, %xmm1
+    pxor %xmm2, %xmm1
+    movabsq $0x1db710641, %rdx
+    movq %rdx, %xmm0
+    movabsq $0x1f7011641, %rdx
+    pinsrq $1, %rdx, %xmm0
+    movdqa %xmm1, %xmm2
+    pand %xmm3, %xmm1
+    pclmulqdq $0x10, %xmm0, %xmm1
+    pand %xmm3, %xmm1
+    pclmulqdq $0, %xmm0, %xmm1
+    pxor %xmm2, %xmm1
+    pextrd $1, %xmm1, %eax
+  end;
+  asm arm64 (P: in x1; N: in x2; c: inout x0)
+    1:
+    cmp x2, #16
+    b.lt 2f
+    ldp x8, x10, [x1], #16
+    crc32x w0, w0, x8
+    crc32x w0, w0, x10
+    sub x2, x2, #16
+    b 1b
+    2:
+    tbz x2, #3, 3f
+    ldr x10, [x1], #8
+    crc32x w0, w0, x10
+    3:
+    tbz x2, #2, 4f
+    ldr w10, [x1], #4
+    crc32w w0, w0, w10
+    4:
+    tbz x2, #1, 5f
+    ldrh w10, [x1], #2
+    crc32h w0, w0, w10
+    5:
+    tbz x2, #0, 6f
+    ldrb w10, [x1]
+    crc32b w0, w0, w10
+    6:
+  end;
+  Result := c;
+end;
+
+function PasCrc32Base(const S: string; Crc: Integer): Integer;
+var
+  c: UInt32;
+begin
+  BuildTabs;
+  c := UInt32(Crc);
+  c := not c;
+  if Length(S) > 0 then
+    c := Crc32Plain(c, Pointer(S), Length(S), False);
+  c := not c;
+  Result := c;
+end;
+
+function PasCrc32Cpu(const S: string; Crc: Integer): Integer;
+var
+  c: UInt32;
+  n, done: Integer;
+begin
+  c := UInt32(Crc);
+  c := not c;
+  n := Length(S);
+  done := 0;
+  if n > 0 then
+  begin
+{$ifdef CPUAARCH64}
+    c := Crc32Cpu(c, Pointer(S), n);
+    done := n;
+{$else}
+    if n >= 64 then
+    begin
+      done := n - (n mod 16);
+      c := Crc32Cpu(c, Pointer(S), done);
+    end;
+{$endif}
+    if done < n then
+    begin
+      BuildTabs;
+      c := Crc32Plain(c, Pointer(Integer(Pointer(S)) + done), n - done, False);
+    end;
+  end;
+  c := not c;
+  Result := c;
+end;
+
+function PasCrc32cBase(const S: string; Crc: Integer): Integer;
+var
+  c: UInt32;
+begin
+  BuildTabs;
+  c := UInt32(Crc);
+  c := not c;
+  if Length(S) > 0 then
+    c := Crc32Plain(c, Pointer(S), Length(S), True);
+  c := not c;
+  Result := c;
+end;
+
+function PasCrc32cCpu(const S: string; Crc: Integer): Integer;
+var
+  c: UInt32;
+  n, done: Integer;
+begin
+  c := UInt32(Crc);
+  c := not c;
+  n := Length(S);
+  done := 0;
+{$ifndef CPUAARCH64}
+  if n > 0 then
+  begin
+    c := Crc32cFast(c, Pointer(S), n);
+    done := n;
+  end;
+{$endif}
+  if done < n then
+    c := Crc32cCpu(c, Pointer(Integer(Pointer(S)) + done), n - done);
+  c := not c;
+  Result := c;
+end;
+
+{ ---- Adler-32 (RFC 1950), in runs of 5552 bytes between reductions ---- }
+
+function PasAdler32(const S: string; Adler: Integer): Integer;
+var
+  a, b: Integer;
+  i, n, run: Integer;
+begin
+  a := Adler and $ffff;
+  b := (Adler shr 16) and $ffff;
+  i := 1;
+  n := Length(S);
+  while i <= n do
+  begin
+    run := n - i + 1;
+    if run > 5552 then
+      run := 5552;
+    while run > 0 do
+    begin
+      a := a + Ord(S[i]);
+      b := b + a;
+      i := i + 1;
+      run := run - 1;
+    end;
+    a := a mod 65521;
+    b := b mod 65521;
+  end;
+  Result := (b shl 16) or a;
+end;
+
+{ ---- FNV-1a, 32 and 64 bits (Fowler, Noll, Vo) ---- }
+
+function PasFnv1a32(const S: string): Integer;
+var
+  h: UInt32;
+  i: Integer;
+begin
+  h := $811c9dc5;
+  for i := 1 to Length(S) do
+  begin
+    h := h xor UInt32(Ord(S[i]));
+    h := h * $01000193;
+  end;
+  Result := h;
+end;
+
+function PasFnv1a64(const S: string): Integer;
+var
+  h, i: Integer;
+begin
+  h := $cbf29ce484222325;
+  for i := 1 to Length(S) do
+  begin
+    h := h xor Ord(S[i]);
+    h := h * $100000001b3;
+  end;
+  Result := h;
+end;
+
+{ ---- MurmurHash3, the 32-bit x86 variant (Austin Appleby) ---- }
+
+function PasMurmur3(const S: string; Seed: Integer): Integer;
+var
+  h, k: UInt32;
+  i, n, blocks: Integer;
+begin
+  h := UInt32(Seed);
+  n := Length(S);
+  blocks := n div 4;
+  for i := 0 to blocks - 1 do
+  begin
+    k := LoadLE32(Pointer(Integer(Pointer(S)) + i * 4));
+    k := k * $cc9e2d51;
+    k := RotateLeft(k, 15);
+    k := k * $1b873593;
+    h := h xor k;
+    h := RotateLeft(h, 13);
+    h := h * 5 + $e6546b64;
+  end;
+  k := 0;
+  if (n and 3) >= 3 then
+    k := k xor UInt32(Ord(S[blocks * 4 + 3]) shl 16);
+  if (n and 3) >= 2 then
+    k := k xor UInt32(Ord(S[blocks * 4 + 2]) shl 8);
+  if (n and 3) >= 1 then
+  begin
+    k := k xor UInt32(Ord(S[blocks * 4 + 1]));
+    k := k * $cc9e2d51;
+    k := RotateLeft(k, 15);
+    k := k * $1b873593;
+    h := h xor k;
+  end;
+  h := h xor UInt32(n);
+  h := h xor (h shr 16);
+  h := h * $85ebca6b;
+  h := h xor (h shr 13);
+  h := h * $c2b2ae35;
+  h := h xor (h shr 16);
+  Result := h;
+end;
+
+{ ---- SipHash-2-4 (Aumasson and Bernstein), a 128-bit key in two
+  words, 64 bits out, each round written out ---- }
+
+function PasSipHash(const S: string; K0, K1: Integer): Integer;
+var
+  v0, v1, v2, v3, m, b: Integer;
+  i, n, blocks, j: Integer;
+begin
+  v0 := K0 xor $736f6d6570736575;
+  v1 := K1 xor $646f72616e646f6d;
+  v2 := K0 xor $6c7967656e657261;
+  v3 := K1 xor $7465646279746573;
+  n := Length(S);
+  blocks := n div 8;
+  for i := 0 to blocks - 1 do
+  begin
+    m := LoadLE64(Pointer(Integer(Pointer(S)) + i * 8));
+    v3 := v3 xor m;
+    v0 := v0 + v1;
+    v1 := RotateLeft(v1, 13);
+    v1 := v1 xor v0;
+    v0 := RotateLeft(v0, 32);
+    v2 := v2 + v3;
+    v3 := RotateLeft(v3, 16);
+    v3 := v3 xor v2;
+    v0 := v0 + v3;
+    v3 := RotateLeft(v3, 21);
+    v3 := v3 xor v0;
+    v2 := v2 + v1;
+    v1 := RotateLeft(v1, 17);
+    v1 := v1 xor v2;
+    v2 := RotateLeft(v2, 32);
+    v0 := v0 + v1;
+    v1 := RotateLeft(v1, 13);
+    v1 := v1 xor v0;
+    v0 := RotateLeft(v0, 32);
+    v2 := v2 + v3;
+    v3 := RotateLeft(v3, 16);
+    v3 := v3 xor v2;
+    v0 := v0 + v3;
+    v3 := RotateLeft(v3, 21);
+    v3 := v3 xor v0;
+    v2 := v2 + v1;
+    v1 := RotateLeft(v1, 17);
+    v1 := v1 xor v2;
+    v2 := RotateLeft(v2, 32);
+    v0 := v0 xor m;
+  end;
+  b := n shl 56;
+  for j := 0 to (n and 7) - 1 do
+    b := b or (Ord(S[blocks * 8 + 1 + j]) shl (8 * j));
+  v3 := v3 xor b;
+    v0 := v0 + v1;
+    v1 := RotateLeft(v1, 13);
+    v1 := v1 xor v0;
+    v0 := RotateLeft(v0, 32);
+    v2 := v2 + v3;
+    v3 := RotateLeft(v3, 16);
+    v3 := v3 xor v2;
+    v0 := v0 + v3;
+    v3 := RotateLeft(v3, 21);
+    v3 := v3 xor v0;
+    v2 := v2 + v1;
+    v1 := RotateLeft(v1, 17);
+    v1 := v1 xor v2;
+    v2 := RotateLeft(v2, 32);
+    v0 := v0 + v1;
+    v1 := RotateLeft(v1, 13);
+    v1 := v1 xor v0;
+    v0 := RotateLeft(v0, 32);
+    v2 := v2 + v3;
+    v3 := RotateLeft(v3, 16);
+    v3 := v3 xor v2;
+    v0 := v0 + v3;
+    v3 := RotateLeft(v3, 21);
+    v3 := v3 xor v0;
+    v2 := v2 + v1;
+    v1 := RotateLeft(v1, 17);
+    v1 := v1 xor v2;
+    v2 := RotateLeft(v2, 32);
+  v0 := v0 xor b;
+  v2 := v2 xor $ff;
+    v0 := v0 + v1;
+    v1 := RotateLeft(v1, 13);
+    v1 := v1 xor v0;
+    v0 := RotateLeft(v0, 32);
+    v2 := v2 + v3;
+    v3 := RotateLeft(v3, 16);
+    v3 := v3 xor v2;
+    v0 := v0 + v3;
+    v3 := RotateLeft(v3, 21);
+    v3 := v3 xor v0;
+    v2 := v2 + v1;
+    v1 := RotateLeft(v1, 17);
+    v1 := v1 xor v2;
+    v2 := RotateLeft(v2, 32);
+    v0 := v0 + v1;
+    v1 := RotateLeft(v1, 13);
+    v1 := v1 xor v0;
+    v0 := RotateLeft(v0, 32);
+    v2 := v2 + v3;
+    v3 := RotateLeft(v3, 16);
+    v3 := v3 xor v2;
+    v0 := v0 + v3;
+    v3 := RotateLeft(v3, 21);
+    v3 := v3 xor v0;
+    v2 := v2 + v1;
+    v1 := RotateLeft(v1, 17);
+    v1 := v1 xor v2;
+    v2 := RotateLeft(v2, 32);
+    v0 := v0 + v1;
+    v1 := RotateLeft(v1, 13);
+    v1 := v1 xor v0;
+    v0 := RotateLeft(v0, 32);
+    v2 := v2 + v3;
+    v3 := RotateLeft(v3, 16);
+    v3 := v3 xor v2;
+    v0 := v0 + v3;
+    v3 := RotateLeft(v3, 21);
+    v3 := v3 xor v0;
+    v2 := v2 + v1;
+    v1 := RotateLeft(v1, 17);
+    v1 := v1 xor v2;
+    v2 := RotateLeft(v2, 32);
+    v0 := v0 + v1;
+    v1 := RotateLeft(v1, 13);
+    v1 := v1 xor v0;
+    v0 := RotateLeft(v0, 32);
+    v2 := v2 + v3;
+    v3 := RotateLeft(v3, 16);
+    v3 := v3 xor v2;
+    v0 := v0 + v3;
+    v3 := RotateLeft(v3, 21);
+    v3 := v3 xor v0;
+    v2 := v2 + v1;
+    v1 := RotateLeft(v1, 17);
+    v1 := v1 xor v2;
+    v2 := RotateLeft(v2, 32);
+  Result := v0 xor v1 xor v2 xor v3;
+end;
+
+
+function Sha256OfCpu(const S: string; Init: Pointer; OutWords: Integer): string;
+var
+  st: array[0..7] of UInt32;
+  buf: array[0..127] of Byte;
+  i, n, nb: Integer;
+begin
+  for i := 0 to 7 do
+    st[i] := LoadLE32(Pointer(Integer(Init) + i * 4));
+  n := Length(S) div 64;
+  if n > 0 then
+    Sha256BlocksCpu(@st[0], Pointer(S), n);
+  Tail64(S, @buf[0], nb, False);
+  Sha256BlocksCpu(@st[0], @buf[0], nb);
+  SetLength(Result, OutWords * 4);
+  for i := 0 to OutWords - 1 do
+    StoreBE32(@Result[i * 4 + 1], st[i]);
+end;
+
+function PasSha256Cpu(const S: string): string;
+begin
+  Result := Sha256OfCpu(S, @H256[0], 8);
+end;
+
+function PasSha224Cpu(const S: string): string;
+begin
+  Result := Sha256OfCpu(S, @H224[0], 7);
+end;
+
+function PasSha1Cpu(const S: string): string;
+var
+  st: array[0..4] of UInt32;
+  buf: array[0..127] of Byte;
+  i, n, nb: Integer;
+begin
+  st[0] := $67452301;
+  st[1] := $efcdab89;
+  st[2] := $98badcfe;
+  st[3] := $10325476;
+  st[4] := $c3d2e1f0;
+  n := Length(S) div 64;
+  if n > 0 then
+    Sha1BlocksCpu(@st[0], Pointer(S), n);
+  Tail64(S, @buf[0], nb, False);
+  Sha1BlocksCpu(@st[0], @buf[0], nb);
+  SetLength(Result, 20);
+  for i := 0 to 4 do
+    StoreBE32(@Result[i * 4 + 1], st[i]);
+end;
+
+function Sha512OfCpu(const S: string; Init: Pointer; OutWords: Integer): string;
+var
+  st: array[0..7] of Integer;
+  buf: array[0..255] of Byte;
+  i, n, off, rest, nb: Integer;
+begin
+  for i := 0 to 7 do
+    st[i] := LoadLE64(Pointer(Integer(Init) + i * 8));
+  n := Length(S) div 128;
+  if n > 0 then
+    Sha512BlocksCpu(@st[0], Pointer(S), n);
+  { FIPS 180-4, 5.1.2: a 1 bit, zeros, the length in 128 bits }
+  off := n * 128;
+  rest := Length(S) - off;
+  for i := 0 to 255 do
+    buf[i] := 0;
+  for i := 0 to rest - 1 do
+    buf[i] := Byte(S[off + 1 + i]);
+  buf[rest] := 128;
+  if rest < 112 then
+    nb := 1
+  else
+    nb := 2;
+  StoreBE64(@buf[nb * 128 - 8], Length(S) * 8);
+  Sha512BlocksCpu(@st[0], @buf[0], nb);
+  SetLength(Result, OutWords * 8);
+  for i := 0 to OutWords - 1 do
+    StoreBE64(@Result[i * 8 + 1], st[i]);
+end;
+
+function PasSha512Cpu(const S: string): string;
+begin
+  Result := Sha512OfCpu(S, @H512[0], 8);
+end;
+
+function PasSha384Cpu(const S: string): string;
+begin
+  Result := Sha512OfCpu(S, @H384[0], 6);
+end;
+
+function HashByCpu(Alg: Integer; const S: string): string;
+begin
+  case Alg of
+    0: Result := PasMd5(S);
+    1: Result := PasSha1Cpu(S);
+    2: Result := PasSha224Cpu(S);
+    3: Result := PasSha256Cpu(S);
+    4: Result := PasSha384Cpu(S);
+  else
+    Result := PasSha512Cpu(S);
+  end;
+end;
+
+{ HMAC (RFC 2104): H((K xor opad) || H((K xor ipad) || M)), the key
+  hashed first when longer than the block. }
+function PasHmacCpu(Alg: Integer; const Key, Msg: string): string;
+var
+  blk, i: Integer;
+  k, ipad, opad: string;
+begin
+  if Alg >= 4 then
+    blk := 128
+  else
+    blk := 64;
+  k := Key;
+  if Length(k) > blk then
+    k := HashByCpu(Alg, k);
+  SetLength(ipad, blk);
+  SetLength(opad, blk);
+  for i := 1 to blk do
+  begin
+    if i <= Length(k) then
+    begin
+      ipad[i] := Char(Ord(k[i]) xor $36);
+      opad[i] := Char(Ord(k[i]) xor $5c);
+    end
+    else
+    begin
+      ipad[i] := Char($36);
+      opad[i] := Char($5c);
+    end;
+  end;
+  Result := HashByCpu(Alg, opad + HashByCpu(Alg, ipad + Msg));
+end;
+
+{ The Merkle tree of RFC 9162: a leaf is SHA-256 of 0x00 and the entry,
+  a node SHA-256 of 0x01 and its two children, the split of n leaves at
+  the greatest power of two below n. }
+function MTHCpu(const Items: array of string; Lo, Hi: Integer): string;
+var
+  n, k: Integer;
+begin
+  n := Hi - Lo;
+  if n = 0 then
+  begin
+    Result := PasSha256Cpu('');
+    Exit;
+  end;
+  if n = 1 then
+  begin
+    Result := PasSha256Cpu(Char(0) + Items[Lo]);
+    Exit;
+  end;
+  k := 1;
+  while k * 2 < n do
+    k := k * 2;
+  Result := PasSha256Cpu(Char(1) + MTHCpu(Items, Lo, Lo + k) + MTHCpu(Items, Lo + k, Hi));
+end;
+
+function PasMerkleRootCpu(const Leaves: array of string): string;
+begin
+  Result := MTHCpu(Leaves, 0, Length(Leaves));
+end;
+
+function PathCpu(const Items: array of string; Index, Lo, Hi: Integer): string;
+var
+  n, k: Integer;
+begin
+  n := Hi - Lo;
+  if n <= 1 then
+  begin
+    Result := '';
+    Exit;
+  end;
+  k := 1;
+  while k * 2 < n do
+    k := k * 2;
+  if Index < Lo + k then
+    Result := PathCpu(Items, Index, Lo, Lo + k) + MTHCpu(Items, Lo + k, Hi)
+  else
+    Result := PathCpu(Items, Index, Lo + k, Hi) + MTHCpu(Items, Lo, Lo + k);
+end;
+
+function PasMerkleProofCpu(const Leaves: array of string; Index: Integer): string;
+begin
+  if (Index < 0) or (Index >= Length(Leaves)) then
+  begin
+    WriteLn(ErrOutput, 'paslang: merkle index');
+    Halt(1);
+  end;
+  Result := PathCpu(Leaves, Index, 0, Length(Leaves));
+end;
+
+{ RFC 9162, 2.1.3.2: the proof walked from the leaf up. }
+function PasMerkleCheckCpu(const Leaf: string; Index, Count: Integer;
+  const Proof, Root: string): Boolean;
+var
+  r, p: string;
+  fn, sn, i: Integer;
+begin
+  Result := False;
+  if (Index < 0) or (Index >= Count) then
+    Exit;
+  if Length(Proof) mod 32 <> 0 then
+    Exit;
+  r := PasSha256Cpu(Char(0) + Leaf);
+  fn := Index;
+  sn := Count - 1;
+  i := 1;
+  while i + 31 <= Length(Proof) do
+  begin
+    if sn = 0 then
+      Exit;
+    p := Copy(Proof, i, 32);
+    if ((fn and 1) <> 0) or (fn = sn) then
+    begin
+      r := PasSha256Cpu(Char(1) + p + r);
+      while ((fn and 1) = 0) and (fn <> 0) do
+      begin
+        fn := fn shr 1;
+        sn := sn shr 1;
+      end;
+    end
+    else
+      r := PasSha256Cpu(Char(1) + r + p);
+    fn := fn shr 1;
+    sn := sn shr 1;
+    i := i + 32;
+  end;
+  Result := (sn = 0) and (r = Root);
+end;
+
+
+function Sha256OfBase(const S: string; Init: Pointer; OutWords: Integer): string;
+var
+  st: array[0..7] of UInt32;
+  buf: array[0..127] of Byte;
+  i, n, nb: Integer;
+begin
+  for i := 0 to 7 do
+    st[i] := LoadLE32(Pointer(Integer(Init) + i * 4));
+  n := Length(S) div 64;
+  if n > 0 then
+    Sha256BlocksPlain(@st[0], Pointer(S), n);
+  Tail64(S, @buf[0], nb, False);
+  Sha256BlocksPlain(@st[0], @buf[0], nb);
+  SetLength(Result, OutWords * 4);
+  for i := 0 to OutWords - 1 do
+    StoreBE32(@Result[i * 4 + 1], st[i]);
+end;
+
+function PasSha256Base(const S: string): string;
+begin
+  Result := Sha256OfBase(S, @H256[0], 8);
+end;
+
+function PasSha224Base(const S: string): string;
+begin
+  Result := Sha256OfBase(S, @H224[0], 7);
+end;
+
+function PasSha1Base(const S: string): string;
+var
+  st: array[0..4] of UInt32;
+  buf: array[0..127] of Byte;
+  i, n, nb: Integer;
+begin
+  st[0] := $67452301;
+  st[1] := $efcdab89;
+  st[2] := $98badcfe;
+  st[3] := $10325476;
+  st[4] := $c3d2e1f0;
+  n := Length(S) div 64;
+  if n > 0 then
+    Sha1BlocksPlain(@st[0], Pointer(S), n);
+  Tail64(S, @buf[0], nb, False);
+  Sha1BlocksPlain(@st[0], @buf[0], nb);
+  SetLength(Result, 20);
+  for i := 0 to 4 do
+    StoreBE32(@Result[i * 4 + 1], st[i]);
+end;
+
+function Sha512OfBase(const S: string; Init: Pointer; OutWords: Integer): string;
+var
+  st: array[0..7] of Integer;
+  buf: array[0..255] of Byte;
+  i, n, off, rest, nb: Integer;
+begin
+  for i := 0 to 7 do
+    st[i] := LoadLE64(Pointer(Integer(Init) + i * 8));
+  n := Length(S) div 128;
+  if n > 0 then
+    Sha512BlocksPlain(@st[0], Pointer(S), n);
+  { FIPS 180-4, 5.1.2: a 1 bit, zeros, the length in 128 bits }
+  off := n * 128;
+  rest := Length(S) - off;
+  for i := 0 to 255 do
+    buf[i] := 0;
+  for i := 0 to rest - 1 do
+    buf[i] := Byte(S[off + 1 + i]);
+  buf[rest] := 128;
+  if rest < 112 then
+    nb := 1
+  else
+    nb := 2;
+  StoreBE64(@buf[nb * 128 - 8], Length(S) * 8);
+  Sha512BlocksPlain(@st[0], @buf[0], nb);
+  SetLength(Result, OutWords * 8);
+  for i := 0 to OutWords - 1 do
+    StoreBE64(@Result[i * 8 + 1], st[i]);
+end;
+
+function PasSha512Base(const S: string): string;
+begin
+  Result := Sha512OfBase(S, @H512[0], 8);
+end;
+
+function PasSha384Base(const S: string): string;
+begin
+  Result := Sha512OfBase(S, @H384[0], 6);
+end;
+
+function HashByBase(Alg: Integer; const S: string): string;
+begin
+  case Alg of
+    0: Result := PasMd5(S);
+    1: Result := PasSha1Base(S);
+    2: Result := PasSha224Base(S);
+    3: Result := PasSha256Base(S);
+    4: Result := PasSha384Base(S);
+  else
+    Result := PasSha512Base(S);
+  end;
+end;
+
+{ HMAC (RFC 2104): H((K xor opad) || H((K xor ipad) || M)), the key
+  hashed first when longer than the block. }
+function PasHmacBase(Alg: Integer; const Key, Msg: string): string;
+var
+  blk, i: Integer;
+  k, ipad, opad: string;
+begin
+  if Alg >= 4 then
+    blk := 128
+  else
+    blk := 64;
+  k := Key;
+  if Length(k) > blk then
+    k := HashByBase(Alg, k);
+  SetLength(ipad, blk);
+  SetLength(opad, blk);
+  for i := 1 to blk do
+  begin
+    if i <= Length(k) then
+    begin
+      ipad[i] := Char(Ord(k[i]) xor $36);
+      opad[i] := Char(Ord(k[i]) xor $5c);
+    end
+    else
+    begin
+      ipad[i] := Char($36);
+      opad[i] := Char($5c);
+    end;
+  end;
+  Result := HashByBase(Alg, opad + HashByBase(Alg, ipad + Msg));
+end;
+
+{ The Merkle tree of RFC 9162: a leaf is SHA-256 of 0x00 and the entry,
+  a node SHA-256 of 0x01 and its two children, the split of n leaves at
+  the greatest power of two below n. }
+function MTHBase(const Items: array of string; Lo, Hi: Integer): string;
+var
+  n, k: Integer;
+begin
+  n := Hi - Lo;
+  if n = 0 then
+  begin
+    Result := PasSha256Base('');
+    Exit;
+  end;
+  if n = 1 then
+  begin
+    Result := PasSha256Base(Char(0) + Items[Lo]);
+    Exit;
+  end;
+  k := 1;
+  while k * 2 < n do
+    k := k * 2;
+  Result := PasSha256Base(Char(1) + MTHBase(Items, Lo, Lo + k) + MTHBase(Items, Lo + k, Hi));
+end;
+
+function PasMerkleRootBase(const Leaves: array of string): string;
+begin
+  Result := MTHBase(Leaves, 0, Length(Leaves));
+end;
+
+function PathBase(const Items: array of string; Index, Lo, Hi: Integer): string;
+var
+  n, k: Integer;
+begin
+  n := Hi - Lo;
+  if n <= 1 then
+  begin
+    Result := '';
+    Exit;
+  end;
+  k := 1;
+  while k * 2 < n do
+    k := k * 2;
+  if Index < Lo + k then
+    Result := PathBase(Items, Index, Lo, Lo + k) + MTHBase(Items, Lo + k, Hi)
+  else
+    Result := PathBase(Items, Index, Lo + k, Hi) + MTHBase(Items, Lo, Lo + k);
+end;
+
+function PasMerkleProofBase(const Leaves: array of string; Index: Integer): string;
+begin
+  if (Index < 0) or (Index >= Length(Leaves)) then
+  begin
+    WriteLn(ErrOutput, 'paslang: merkle index');
+    Halt(1);
+  end;
+  Result := PathBase(Leaves, Index, 0, Length(Leaves));
+end;
+
+{ RFC 9162, 2.1.3.2: the proof walked from the leaf up. }
+function PasMerkleCheckBase(const Leaf: string; Index, Count: Integer;
+  const Proof, Root: string): Boolean;
+var
+  r, p: string;
+  fn, sn, i: Integer;
+begin
+  Result := False;
+  if (Index < 0) or (Index >= Count) then
+    Exit;
+  if Length(Proof) mod 32 <> 0 then
+    Exit;
+  r := PasSha256Base(Char(0) + Leaf);
+  fn := Index;
+  sn := Count - 1;
+  i := 1;
+  while i + 31 <= Length(Proof) do
+  begin
+    if sn = 0 then
+      Exit;
+    p := Copy(Proof, i, 32);
+    if ((fn and 1) <> 0) or (fn = sn) then
+    begin
+      r := PasSha256Base(Char(1) + p + r);
+      while ((fn and 1) = 0) and (fn <> 0) do
+      begin
+        fn := fn shr 1;
+        sn := sn shr 1;
+      end;
+    end
+    else
+      r := PasSha256Base(Char(1) + r + p);
+    fn := fn shr 1;
+    sn := sn shr 1;
+    i := i + 32;
+  end;
+  Result := (sn = 0) and (r = Root);
+end;
+
+
+end.

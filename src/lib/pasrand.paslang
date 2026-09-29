@@ -1,0 +1,221 @@
+{$mode objfpc}{$H+}
+
+{ Random numbers. Go keeps this in math/rand, with a source you own for
+  work that has to repeat and a global one for everything else; that is
+  the shape copied here. Pascal's Random, with one hidden state and a
+  Randomize that nobody remembers to call, is the part left behind.
+
+  The stream is xoshiro256**, seeded through splitmix64 so that even a
+  seed of 1 spreads into four words that look nothing alike. It is fast
+  and its numbers pass the usual tests; it is not for cryptography, and
+  nothing here pretends otherwise.
+
+  A TRand is a record the caller owns, so two routines each have their
+  own and neither waits for the other. The global one is the same
+  generator behind a mutex. }
+unit pasrand;
+
+interface
+
+uses
+  pasroutines;
+
+type
+  TRand = record
+    S0, S1, S2, S3: Int64;
+  end;
+
+{ A generator of your own. }
+procedure RandInit(var R: TRand; Seed: Int64);
+function RandNext(var R: TRand): Int64;
+function RandBelow(var R: TRand; N: Int64): Int64;
+function RandRange(var R: TRand; Lo, Hi: Int64): Int64;
+function RandReal(var R: TRand): Real;
+function RandBool(var R: TRand): Boolean;
+
+{ The one everybody shares. Seeded from the kernel the first time it is
+  used, unless RandSeed says otherwise. }
+procedure RandSeed(Seed: Int64);
+procedure Randomize;
+function RandInt: Int64;
+function RandN(N: Int64): Int64;
+function RandRangeN(Lo, Hi: Int64): Int64;
+function RandFloat: Real;
+
+implementation
+
+uses
+  paslinux;
+
+const
+  MaxPos = 9223372036854775807;
+
+var
+  Gbl: TRand;
+  GblLock: TPasMutex;
+  GblReady: Boolean;
+
+{ splitmix64: one word in, one word out, good enough to make the four
+  words of state out of a single seed. }
+function SplitMix(var X: Int64): Int64;
+var
+  z: Int64;
+begin
+  X := X + Int64(-7046029254386353131);
+  z := X;
+  z := (z xor (z shr 30)) * Int64(-4658895280553007687);
+  z := (z xor (z shr 27)) * Int64(-7723592293110705685);
+  Result := z xor (z shr 31);
+end;
+
+procedure RandInit(var R: TRand; Seed: Int64);
+var
+  x: Int64;
+begin
+  x := Seed;
+  R.S0 := SplitMix(x);
+  R.S1 := SplitMix(x);
+  R.S2 := SplitMix(x);
+  R.S3 := SplitMix(x);
+  { All four words zero is the one state the generator cannot leave. }
+  if (R.S0 = 0) and (R.S1 = 0) and (R.S2 = 0) and (R.S3 = 0) then
+    R.S0 := Int64(-1);
+end;
+
+function Rotl(X: Int64; K: Integer): Int64;
+begin
+  Result := (X shl K) or (X shr (64 - K));
+end;
+
+{ xoshiro256**: the whole 64 bits, sign included. }
+function RandNext(var R: TRand): Int64;
+var
+  t: Int64;
+begin
+  Result := Rotl(R.S1 * 5, 7) * 9;
+  t := R.S1 shl 17;
+  R.S2 := R.S2 xor R.S0;
+  R.S3 := R.S3 xor R.S1;
+  R.S1 := R.S1 xor R.S2;
+  R.S0 := R.S0 xor R.S3;
+  R.S2 := R.S2 xor t;
+  R.S3 := Rotl(R.S3, 45);
+end;
+
+{ Zero up to N, N left out. The tail is thrown away instead of taken
+  modulo, so every value is as likely as every other. }
+function RandBelow(var R: TRand; N: Int64): Int64;
+var
+  v, zone: Int64;
+begin
+  Result := 0;
+  if N <= 1 then
+    Exit;
+  zone := MaxPos - (MaxPos mod N);
+  repeat
+    v := RandNext(R) shr 1;
+  until v < zone;
+  Result := v mod N;
+end;
+
+function RandRange(var R: TRand; Lo, Hi: Int64): Int64;
+begin
+  if Hi < Lo then
+  begin
+    Result := Lo;
+    Exit;
+  end;
+  Result := Lo + RandBelow(R, Hi - Lo + 1);
+end;
+
+{ Zero up to one, one left out, from the top 53 bits, which is as much
+  as a binary64 can hold. }
+function RandReal(var R: TRand): Real;
+var
+  v: Int64;
+begin
+  v := RandNext(R) shr 11;
+  Result := Real(v) / 9007199254740992.0;
+end;
+
+function RandBool(var R: TRand): Boolean;
+begin
+  Result := (RandNext(R) shr 63) <> 0;
+end;
+
+{ The kernel's own randomness, for a seed nobody can guess. }
+function NrGetrandom: Int64;
+begin
+  if Amd64 = 0 then
+    Result := 278
+  else
+    Result := 318;
+end;
+
+function KernelSeed: Int64;
+var
+  v: Int64;
+  n: Int64;
+begin
+  v := 0;
+  n := Sys3(NrGetrandom, Int64(@v), 8, 0);
+  if (n <> 8) or (v = 0) then
+    v := 88172645463325252;
+  Result := v;
+end;
+
+procedure RandSeed(Seed: Int64);
+begin
+  PasMutexLock(GblLock);
+  RandInit(Gbl, Seed);
+  GblReady := True;
+  PasMutexUnlock(GblLock);
+end;
+
+procedure Randomize;
+begin
+  RandSeed(KernelSeed);
+end;
+
+procedure NeedGbl;
+begin
+  if not GblReady then
+  begin
+    RandInit(Gbl, KernelSeed);
+    GblReady := True;
+  end;
+end;
+
+function RandInt: Int64;
+begin
+  PasMutexLock(GblLock);
+  NeedGbl;
+  Result := RandNext(Gbl);
+  PasMutexUnlock(GblLock);
+end;
+
+function RandN(N: Int64): Int64;
+begin
+  PasMutexLock(GblLock);
+  NeedGbl;
+  Result := RandBelow(Gbl, N);
+  PasMutexUnlock(GblLock);
+end;
+
+function RandRangeN(Lo, Hi: Int64): Int64;
+begin
+  PasMutexLock(GblLock);
+  NeedGbl;
+  Result := RandRange(Gbl, Lo, Hi);
+  PasMutexUnlock(GblLock);
+end;
+
+function RandFloat: Real;
+begin
+  PasMutexLock(GblLock);
+  NeedGbl;
+  Result := RandReal(Gbl);
+  PasMutexUnlock(GblLock);
+end;
+
+end.

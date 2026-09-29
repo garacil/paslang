@@ -1,0 +1,94 @@
+{ Programs where every routine is parked for a while but something can
+  still wake one: a timer, a socket, a routine in a queue, a value in a
+  buffer. The deadlock detector (1.0.139) must stay quiet through all of
+  them, on both machines. }
+program nodeadlock;
+
+uses pasnet;
+
+var
+  c, buf: chan of Integer;
+  echo: chan of string;
+  stages: array[0..5] of chan of Integer;
+  i, l, fd: Integer;
+
+procedure Late;
+begin
+  Sleep(30);                          { main waits on c; only a timer is pending }
+  Send(c, 7);
+end;
+
+procedure Server(L: Integer);
+var
+  s: Integer;
+  got, part: string;
+begin
+  s := TcpAccept(L);
+  if s < 0 then
+    Halt(1);
+  got := '';
+  while Length(got) < 4 do
+  begin
+    part := TcpRead(s, 64);           { parked on the poller until Poker writes }
+    if Length(part) = 0 then
+      Halt(1);
+    got := got + part;
+  end;
+  TcpClose(s);
+  Send(echo, got);
+end;
+
+procedure Poker(Fd: Integer);
+var
+  s: string;
+begin
+  s := TcpReadDeadline(Fd, 64, 30);   { nothing comes: the deadline is a timerfd on the poller }
+  if Length(s) <> 0 then
+    Halt(1);
+  if TcpWrite(Fd, 'ping') < 0 then
+    Halt(1);
+end;
+
+procedure Stage(K: Integer);
+var
+  v: Integer;
+begin
+  v := Recv(stages[K]);
+  Send(stages[K + 1], v + 1);
+end;
+
+procedure Drain;
+var
+  k: Integer;
+begin
+  for k := 1 to 3 do
+    WriteLn('drain ', Recv(buf));
+end;
+
+begin
+  c := MakeChan();
+  pas Late;
+  WriteLn('late ', Recv(c));
+  echo := MakeChan();
+  l := TcpListen(0);
+  if l < 0 then
+    Halt(1);
+  pas Server(l);
+  fd := TcpConnect('127.0.0.1', TcpPort(l));
+  if fd < 0 then
+    Halt(1);
+  pas Poker(fd);
+  WriteLn('echo ', Recv(echo));       { main on a channel, two routines on the poller }
+  TcpClose(fd);
+  TcpClose(l);
+  for i := 0 to 5 do
+    stages[i] := MakeChan();
+  for i := 0 to 4 do
+    pas Stage(i);
+  Send(stages[0], 0);
+  WriteLn('chain ', Recv(stages[5])); { a value handed along five parked routines }
+  buf := MakeChan(3);
+  pas Drain;                          { parks on the empty buffer }
+  for i := 1 to 3 do
+    Send(buf, i * 10);
+end.                                  { main ends; Drain empties the buffer after }

@@ -1,0 +1,889 @@
+{$mode objfpc}{$H+}
+unit pasfmt;
+
+{ Write and WriteLn formatting (1.0.79), a core unit every program sees.
+  A real prints exactly: its binary value times 10^D, rounded to the
+  nearest integer (a tie to the even one) with integers as long as it
+  takes, so 1e20 and 2.675 print what they are (2.5e-7 rounds to 0.0 at
+  the default of one decimal and prints whole as 2.5e-7:0:9); x:w pads
+  any value to w columns and x:w:d gives a real d decimals. }
+
+interface
+
+function PasFmtReal(X: Double; W, D: Integer): string;
+function PasFmtInt(V: Int64; W: Integer): string;
+function PasFmtStr(const S: string; W: Integer): string;
+function PasParseReal(const S: string; out Bits: Int64): Boolean;
+function PasParseSingle(const S: string; out Bits: Int64): Boolean;
+function PasF64ToF32(B: Int64): Int64;
+function PasF32ToF64(B: Int64): Int64;
+function PasParseQuad(const S: string; out Lo, Hi: Int64): Boolean;
+function PasFmtQuad(Lo, Hi: Int64; W, D: Integer): string;
+
+implementation
+
+type
+  TBig = array of Int64;
+
+{ Limbs of 32 bits, low first, each in an Int64 so a limb times 10^9
+  plus a carry stays below 2^63. }
+
+procedure BigTrim(var A: TBig);
+var
+  n: Integer;
+begin
+  n := Length(A);
+  while (n > 1) and (A[n - 1] = 0) do
+    n := n - 1;
+  SetLength(A, n);
+end;
+
+procedure BigMulSmall(var A: TBig; M: Int64);
+var
+  i: Integer;
+  t, cy: Int64;
+begin
+  cy := 0;
+  for i := 0 to High(A) do
+  begin
+    t := A[i] * M + cy;
+    A[i] := t and 4294967295;
+    cy := t shr 32;
+  end;
+  while cy <> 0 do
+  begin
+    SetLength(A, Length(A) + 1);
+    A[High(A)] := cy and 4294967295;
+    cy := cy shr 32;
+  end;
+end;
+
+procedure BigShl(var A: TBig; N: Integer);
+var
+  words, bits, i, old: Integer;
+  cur, cy: Int64;
+begin
+  words := N div 32;
+  bits := N mod 32;
+  old := Length(A);
+  SetLength(A, old + words + 1);
+  for i := old + words to High(A) do
+    A[i] := 0;
+  for i := old - 1 downto 0 do
+    A[i + words] := A[i];
+  for i := 0 to words - 1 do
+    A[i] := 0;
+  if bits > 0 then
+  begin
+    cy := 0;
+    for i := words to High(A) do
+    begin
+      cur := (A[i] shl bits) or cy;
+      cy := (A[i] shr (32 - bits)) and 4294967295;
+      A[i] := cur and 4294967295;
+    end;
+  end;
+  BigTrim(A);
+end;
+
+function BigBit(const A: TBig; N: Integer): Boolean;
+var
+  w: Integer;
+begin
+  w := N div 32;
+  Result := False;
+  if w < Length(A) then
+    Result := ((A[w] shr (N mod 32)) and 1) = 1;
+end;
+
+{ Any bit below N set? }
+function BigLowAny(const A: TBig; N: Integer): Boolean;
+var
+  i, w: Integer;
+begin
+  Result := False;
+  w := N div 32;
+  for i := 0 to w - 1 do
+    if (i < Length(A)) and (A[i] <> 0) then
+    begin
+      Result := True;
+      Exit;
+    end;
+  if (w < Length(A)) and ((N mod 32) > 0) then
+    if (A[w] and ((Int64(1) shl (N mod 32)) - 1)) <> 0 then
+      Result := True;
+end;
+
+{ A shifted right by N bits, rounded to the nearest, a tie to even. }
+procedure BigShrRound(var A: TBig; N: Integer);
+var
+  up: Boolean;
+  words, bits, i: Integer;
+begin
+  up := False;
+  if BigBit(A, N - 1) then
+  begin
+    if BigLowAny(A, N - 1) then
+      up := True
+    else
+      up := BigBit(A, N);
+  end;
+  words := N div 32;
+  bits := N mod 32;
+  if words >= Length(A) then
+  begin
+    SetLength(A, 1);
+    A[0] := 0;
+  end
+  else
+  begin
+    for i := 0 to High(A) - words do
+      A[i] := A[i + words];
+    SetLength(A, Length(A) - words);
+    if bits > 0 then
+    begin
+      for i := 0 to High(A) do
+      begin
+        A[i] := A[i] shr bits;
+        if i < High(A) then
+          A[i] := A[i] or ((A[i + 1] shl (32 - bits)) and 4294967295);
+      end;
+    end;
+  end;
+  if up then
+  begin
+    i := 0;
+    while True do
+    begin
+      if i > High(A) then
+      begin
+        SetLength(A, Length(A) + 1);
+        A[i] := 0;
+      end;
+      A[i] := A[i] + 1;
+      if A[i] <= 4294967295 then
+        Break;
+      A[i] := 0;
+      i := i + 1;
+    end;
+  end;
+  BigTrim(A);
+end;
+
+{ A div M, the remainder in R; M below 2^31. }
+procedure BigDivSmall(var A: TBig; M: Int64; out R: Int64);
+var
+  i: Integer;
+  rem, cur: Int64;
+begin
+  rem := 0;
+  for i := High(A) downto 0 do
+  begin
+    cur := rem * 4294967296 + A[i];
+    A[i] := cur div M;
+    rem := cur mod M;
+  end;
+  R := rem;
+  BigTrim(A);
+end;
+
+function BigIsZero(const A: TBig): Boolean;
+begin
+  Result := (Length(A) = 1) and (A[0] = 0);
+end;
+
+function BigToDec(A: TBig): string;
+var
+  r: Int64;
+  chunk: string;
+  k: Integer;
+begin
+  Result := '';
+  if BigIsZero(A) then
+  begin
+    Result := '0';
+    Exit;
+  end;
+  while not BigIsZero(A) do
+  begin
+    BigDivSmall(A, 1000000000, r);
+    chunk := '';
+    for k := 1 to 9 do
+    begin
+      chunk := Chr(48 + r mod 10) + chunk;
+      r := r div 10;
+    end;
+    Result := chunk + Result;
+  end;
+  k := 1;
+  while (k < Length(Result)) and (Result[k] = '0') do
+    k := k + 1;
+  Result := Copy(Result, k, Length(Result) - k + 1);
+end;
+
+function BigBitLen(const A: TBig): Integer;
+var
+  top: Int64;
+begin
+  Result := (Length(A) - 1) * 32;
+  top := A[High(A)];
+  while top <> 0 do
+  begin
+    Result := Result + 1;
+    top := top shr 1;
+  end;
+end;
+
+function BigCmp(const A, B: TBig): Integer;
+var
+  i: Integer;
+begin
+  Result := 0;
+  if Length(A) <> Length(B) then
+  begin
+    if Length(A) > Length(B) then
+      Result := 1
+    else
+      Result := -1;
+    Exit;
+  end;
+  for i := High(A) downto 0 do
+    if A[i] <> B[i] then
+    begin
+      if A[i] > B[i] then
+        Result := 1
+      else
+        Result := -1;
+      Exit;
+    end;
+end;
+
+{ A := A - B, for A >= B. }
+procedure BigSub(var A: TBig; const B: TBig);
+var
+  i: Integer;
+  borrow, t: Int64;
+begin
+  borrow := 0;
+  for i := 0 to High(A) do
+  begin
+    t := A[i] - borrow;
+    if i <= High(B) then
+      t := t - B[i];
+    if t < 0 then
+    begin
+      t := t + 4294967296;
+      borrow := 1;
+    end
+    else
+      borrow := 0;
+    A[i] := t;
+  end;
+  BigTrim(A);
+end;
+
+{ Q := A div B, R := A mod B, bit by bit: the literals are short. }
+procedure BigDivMod(const A, B: TBig; out Q, R: TBig);
+var
+  i, n: Integer;
+begin
+  Q := nil;
+  SetLength(Q, Length(A));
+  for i := 0 to High(Q) do
+    Q[i] := 0;
+  R := nil;
+  SetLength(R, 1);
+  R[0] := 0;
+  n := BigBitLen(A);
+  for i := n - 1 downto 0 do
+  begin
+    BigShl(R, 1);
+    if BigBit(A, i) then
+      R[0] := R[0] or 1;
+    if BigCmp(R, B) >= 0 then
+    begin
+      BigSub(R, B);
+      Q[i div 32] := Q[i div 32] or (Int64(1) shl (i mod 32));
+    end;
+  end;
+  BigTrim(Q);
+end;
+
+procedure BigAddSmall(var A: TBig; V: Int64);
+var
+  i: Integer;
+  t: Int64;
+begin
+  i := 0;
+  while V <> 0 do
+  begin
+    if i > High(A) then
+    begin
+      SetLength(A, Length(A) + 1);
+      A[i] := 0;
+    end;
+    t := A[i] + V;
+    A[i] := t and 4294967295;
+    V := t shr 32;
+    i := i + 1;
+  end;
+end;
+
+{ The binary float nearest to Q * 2^-S, and a little more when Sticky: P
+  significant bits (53 for a double, 24 for a single), EMin the power of
+  two of the smallest subnormal's bit (1074, 149), EMax the exponent field
+  of infinity (2047, 255); a tie goes to the even one, below the normal
+  range the subnormals, then 0 (P101 made it take the precision). }
+function RoundToFloat(const Q: TBig; S: Integer; Sticky: Boolean; P, EMin: Integer;
+  EMax: Int64): Int64;
+var
+  L, shift, i: Integer;
+  m, e, field, top, hidden: Int64;
+  rbit, lower: Boolean;
+begin
+  Result := 0;
+  if BigIsZero(Q) then
+    Exit;
+  L := BigBitLen(Q);
+  shift := L - P;
+  if S - EMin > shift then
+    shift := S - EMin;
+  m := 0;
+  for i := 0 to P - 1 do
+    if (shift + i >= 0) and BigBit(Q, shift + i) then
+      m := m or (Int64(1) shl i);
+  rbit := False;
+  lower := Sticky;
+  if shift > 0 then
+  begin
+    rbit := BigBit(Q, shift - 1);
+    if (shift > 1) and BigLowAny(Q, shift - 1) then
+      lower := True;
+  end;
+  if rbit and (lower or ((m and 1) = 1)) then
+    m := m + 1;
+  e := shift - S;
+  top := Int64(1) shl P;
+  hidden := Int64(1) shl (P - 1);
+  if m = top then
+  begin
+    m := hidden;
+    e := e + 1;
+  end;
+  if m >= hidden then
+  begin
+    field := e + EMin + 1;
+    if field >= EMax then
+      Result := EMax shl (P - 1)
+    else
+      Result := (field shl (P - 1)) or (m - hidden);
+  end
+  else
+    Result := m;
+end;
+
+function RoundToDouble(const Q: TBig; S: Integer; Sticky: Boolean): Int64;
+begin
+  Result := RoundToFloat(Q, S, Sticky, 53, 1074, 2047);
+end;
+
+{ S as the nearest float of P significant bits: the digits as one
+  integer, times or divided by the power of ten exactly, rounded once, a
+  tie to even, subnormals kept (1.0.79 for doubles, P101 for singles). }
+{ The number S says, as an integer D of NDig significant digits times
+  10^Exp10: [+|-]digits[.digits][e[+|-]digits]. False when S is not one.
+  Shared by the double, the single and the quad (P103). }
+function ScanReal(const S: string; out Neg: Boolean; out D: TBig; out NDig, Exp10: Integer): Boolean;
+var
+  i, n, nfrac, ex: Integer;
+  eneg, anyd: Boolean;
+begin
+  Result := False;
+  Neg := False;
+  NDig := 0;
+  Exp10 := 0;
+  n := Length(S);
+  i := 1;
+  if (i <= n) and ((S[i] = '+') or (S[i] = '-')) then
+  begin
+    Neg := S[i] = '-';
+    i := i + 1;
+  end;
+  D := nil;
+  SetLength(D, 1);
+  D[0] := 0;
+  nfrac := 0;
+  anyd := False;
+  while (i <= n) and (S[i] >= '0') and (S[i] <= '9') do
+  begin
+    BigMulSmall(D, 10);
+    BigAddSmall(D, Ord(S[i]) - 48);
+    if not BigIsZero(D) then
+      NDig := NDig + 1;
+    anyd := True;
+    i := i + 1;
+  end;
+  if (i <= n) and (S[i] = '.') then
+  begin
+    i := i + 1;
+    while (i <= n) and (S[i] >= '0') and (S[i] <= '9') do
+    begin
+      BigMulSmall(D, 10);
+      BigAddSmall(D, Ord(S[i]) - 48);
+      if not BigIsZero(D) then
+        NDig := NDig + 1;
+      nfrac := nfrac + 1;
+      anyd := True;
+      i := i + 1;
+    end;
+  end;
+  if not anyd then
+    Exit;
+  ex := 0;
+  if (i <= n) and ((S[i] = 'e') or (S[i] = 'E')) then
+  begin
+    i := i + 1;
+    eneg := False;
+    if (i <= n) and ((S[i] = '+') or (S[i] = '-')) then
+    begin
+      eneg := S[i] = '-';
+      i := i + 1;
+    end;
+    if (i > n) or (S[i] < '0') or (S[i] > '9') then
+      Exit;
+    while (i <= n) and (S[i] >= '0') and (S[i] <= '9') do
+    begin
+      if ex < 100000 then
+        ex := ex * 10 + Ord(S[i]) - 48;
+      i := i + 1;
+    end;
+    if eneg then
+      ex := -ex;
+  end;
+  if i <= n then
+    Exit;
+  Exp10 := ex - nfrac;
+  Result := True;
+end;
+
+function ParseRealP(const S: string; IsSingle: Boolean; out Bits: Int64): Boolean;
+var
+  i, ndig, s2, p, emin, big, small, exp10: Integer;
+  emax: Int64;
+  neg: Boolean;
+  d, pw, num, q, r: TBig;
+begin
+  Bits := 0;
+  if IsSingle then
+  begin
+    p := 24;
+    emin := 149;
+    emax := 255;
+    big := 40;
+    small := -50;
+  end
+  else
+  begin
+    p := 53;
+    emin := 1074;
+    emax := 2047;
+    big := 310;
+    small := -330;
+  end;
+  Result := ScanReal(S, neg, d, ndig, exp10);
+  if not Result then
+    Exit;
+  if BigIsZero(d) then
+    Bits := 0
+  else if exp10 + ndig > big then
+    Bits := emax shl (p - 1)
+  else if exp10 + ndig < small then
+    Bits := 0
+  else if exp10 >= 0 then
+  begin
+    for i := 1 to exp10 do
+      BigMulSmall(d, 10);
+    Bits := RoundToFloat(d, 0, False, p, emin, emax);
+  end
+  else
+  begin
+    pw := nil;
+    SetLength(pw, 1);
+    pw[0] := 1;
+    for i := 1 to -exp10 do
+      BigMulSmall(pw, 10);
+    s2 := p + 2 + BigBitLen(pw) - BigBitLen(d);
+    if s2 < 0 then
+      s2 := 0;
+    num := d;
+    BigShl(num, s2);
+    BigDivMod(num, pw, q, r);
+    Bits := RoundToFloat(q, s2, not BigIsZero(r), p, emin, emax);
+  end;
+  if neg then
+  begin
+    if IsSingle then
+      Bits := Bits or (Int64(1) shl 31)
+    else
+      Bits := Bits or (Int64(1) shl 63);
+  end;
+end;
+
+{ Q / 2^S as the nearest binary128 (P103), a tie to even, subnormals
+  kept, past the top infinity: RoundToFloat for 113 bits, the
+  significand in two words. }
+procedure RoundToQuad(const Q: TBig; S: Integer; Sticky: Boolean; out Lo, Hi: Int64);
+var
+  L, shift, i: Integer;
+  mlo, mhi, e, field: Int64;
+  rbit, lower: Boolean;
+begin
+  Lo := 0;
+  Hi := 0;
+  if BigIsZero(Q) then
+    Exit;
+  L := BigBitLen(Q);
+  shift := L - 113;
+  if S - 16494 > shift then
+    shift := S - 16494;
+  mlo := 0;
+  mhi := 0;
+  for i := 0 to 112 do
+    if (shift + i >= 0) and BigBit(Q, shift + i) then
+    begin
+      if i < 64 then
+        mlo := mlo or (Int64(1) shl i)
+      else
+        mhi := mhi or (Int64(1) shl (i - 64));
+    end;
+  rbit := False;
+  lower := Sticky;
+  if shift > 0 then
+  begin
+    rbit := BigBit(Q, shift - 1);
+    if (shift > 1) and BigLowAny(Q, shift - 1) then
+      lower := True;
+  end;
+  if rbit and (lower or ((mlo and 1) = 1)) then
+  begin
+    mlo := mlo + 1;
+    if mlo = 0 then
+      mhi := mhi + 1;
+  end;
+  e := shift - S;
+  if (mhi = Int64(1) shl 49) and (mlo = 0) then
+  begin
+    mhi := Int64(1) shl 48;
+    e := e + 1;
+  end;
+  if mhi >= Int64(1) shl 48 then
+  begin
+    field := e + 16495;
+    if field >= 32767 then
+    begin
+      Hi := Int64(32767) shl 48;
+      Exit;
+    end;
+    Hi := (field shl 48) or (mhi - (Int64(1) shl 48));
+    Lo := mlo;
+  end
+  else
+  begin
+    Hi := mhi;
+    Lo := mlo;
+  end;
+end;
+
+{ S as the nearest binary128 (P103), rounded once from its digits, a tie
+  to even, subnormals kept. False when S is not a number. }
+function PasParseQuad(const S: string; out Lo, Hi: Int64): Boolean;
+var
+  i, ndig, exp10, s2: Integer;
+  neg: Boolean;
+  d, pw, num, q, r: TBig;
+begin
+  Lo := 0;
+  Hi := 0;
+  Result := ScanReal(S, neg, d, ndig, exp10);
+  if not Result then
+    Exit;
+  if BigIsZero(d) then
+    Hi := 0
+  else if exp10 + ndig > 4934 then
+    Hi := Int64(32767) shl 48
+  else if exp10 + ndig < -4970 then
+    Hi := 0
+  else if exp10 >= 0 then
+  begin
+    for i := 1 to exp10 do
+      BigMulSmall(d, 10);
+    RoundToQuad(d, 0, False, Lo, Hi);
+  end
+  else
+  begin
+    pw := nil;
+    SetLength(pw, 1);
+    pw[0] := 1;
+    for i := 1 to -exp10 do
+      BigMulSmall(pw, 10);
+    s2 := 115 + BigBitLen(pw) - BigBitLen(d);
+    if s2 < 0 then
+      s2 := 0;
+    num := d;
+    BigShl(num, s2);
+    BigDivMod(num, pw, q, r);
+    RoundToQuad(q, s2, not BigIsZero(r), Lo, Hi);
+  end;
+  if neg then
+    Hi := Hi or (Int64(1) shl 63);
+end;
+
+{ S as the nearest double (1.0.79): the digits as one integer, times or
+  divided by the power of ten exactly, rounded once, a tie to even,
+  subnormals kept. False when S is not a number:
+  [+|-]digits[.digits][e[+|-]digits]. }
+function PasParseReal(const S: string; out Bits: Int64): Boolean;
+begin
+  Result := ParseRealP(S, False, Bits);
+end;
+
+{ S as the nearest single (P101), rounded once from the digits: parsing
+  to a double first and rounding that again can miss by one. The bits in
+  the low 32. }
+function PasParseSingle(const S: string; out Bits: Int64): Boolean;
+begin
+  Result := ParseRealP(S, True, Bits);
+end;
+
+{ The single nearest to the double with bits B (P101), a tie to even:
+  its value exactly as an integer times a power of two, rounded once.
+  Infinity stays infinity, a NaN a quiet NaN with the top of its
+  payload. The bits in the low 32. }
+function PasF64ToF32(B: Int64): Int64;
+var
+  sign, ex, man: Int64;
+  q: TBig;
+  s: Integer;
+begin
+  sign := (B shr 63) and 1;
+  ex := (B shr 52) and 2047;
+  man := B and ((Int64(1) shl 52) - 1);
+  if ex = 2047 then
+  begin
+    if man = 0 then
+      Result := Int64(255) shl 23
+    else
+      Result := (Int64(255) shl 23) or (Int64(1) shl 22) or (man shr 29);
+  end
+  else if (ex = 0) and (man = 0) then
+    Result := 0
+  else
+  begin
+    if ex = 0 then
+      ex := 1
+    else
+      man := man or (Int64(1) shl 52);
+    { value = man * 2^(ex - 1075) }
+    q := nil;
+    SetLength(q, 3);
+    q[0] := man and 4294967295;
+    q[1] := man shr 32;
+    q[2] := 0;
+    BigTrim(q);
+    s := 1075 - ex;
+    if s < 0 then
+    begin
+      BigShl(q, -s);
+      s := 0;
+    end;
+    Result := RoundToFloat(q, s, False, 24, 149, 255);
+  end;
+  Result := Result or (sign shl 31);
+end;
+
+{ The double with the value of the single with bits B, exactly. }
+function PasF32ToF64(B: Int64): Int64;
+var
+  sign, ex, man: Int64;
+begin
+  sign := (B shr 31) and 1;
+  ex := (B shr 23) and 255;
+  man := B and ((Int64(1) shl 23) - 1);
+  if ex = 255 then
+    Result := (Int64(2047) shl 52) or (man shl 29)
+  else if (ex = 0) and (man = 0) then
+    Result := 0
+  else if ex = 0 then
+  begin
+    { A subnormal man * 2^-149 is a normal double. }
+    ex := 1;
+    while (man and (Int64(1) shl 23)) = 0 do
+    begin
+      man := man shl 1;
+      ex := ex - 1;
+    end;
+    man := man and ((Int64(1) shl 23) - 1);
+    Result := ((ex - 127 + 1023) shl 52) or (man shl 29);
+  end
+  else
+    Result := ((ex - 127 + 1023) shl 52) or (man shl 29);
+  Result := Result or (sign shl 63);
+end;
+
+function Pad(const S: string; W: Integer): string;
+begin
+  Result := S;
+  while Length(Result) < W do
+    Result := ' ' + Result;
+end;
+
+{ The number Big * 2^Shift, negative when Neg, with D decimals (6, the
+  zeros at the end dropped but one kept, when D is below 0), rounded
+  once, exactly, a tie to even; padded to W. Shared by the double and
+  the quad (P103). }
+function FmtExact(var Big: TBig; Shift: Integer; Neg: Boolean; W, D: Integer): string;
+var
+  s, digits, ip, fp: string;
+  dd, i: Integer;
+begin
+  dd := D;
+  if dd < 0 then
+    dd := 6;
+  i := dd;
+  while i >= 9 do
+  begin
+    BigMulSmall(Big, 1000000000);
+    i := i - 9;
+  end;
+  while i > 0 do
+  begin
+    BigMulSmall(Big, 10);
+    i := i - 1;
+  end;
+  if Shift > 0 then
+    BigShl(Big, Shift)
+  else if Shift < 0 then
+    BigShrRound(Big, -Shift);
+  digits := BigToDec(Big);
+  while Length(digits) <= dd do
+    digits := '0' + digits;
+  ip := Copy(digits, 1, Length(digits) - dd);
+  fp := Copy(digits, Length(digits) - dd + 1, dd);
+  if D < 0 then
+  begin
+    i := Length(fp);
+    while (i > 1) and (fp[i] = '0') do
+      i := i - 1;
+    fp := Copy(fp, 1, i);
+  end;
+  if dd = 0 then
+    s := ip
+  else
+    s := ip + '.' + fp;
+  if Neg then
+    s := '-' + s;
+  Result := Pad(s, W);
+end;
+
+function PasFmtReal(X: Double; W, D: Integer): string;
+var
+  bits, m, e: Int64;
+  neg: Boolean;
+  big: TBig;
+  s: string;
+begin
+  bits := 0;
+  Move(X, bits, 8);
+  neg := bits < 0;
+  e := (bits shr 52) and 2047;
+  m := bits and 4503599627370495;
+  if e = 2047 then
+  begin
+    if m <> 0 then
+      s := 'NaN'
+    else if neg then
+      s := '-Inf'
+    else
+      s := '+Inf';
+    Result := Pad(s, W);
+    Exit;
+  end;
+  if e = 0 then
+    e := 1
+  else
+    m := m or 4503599627370496;
+  big := nil;
+  SetLength(big, 2);
+  big[0] := m and 4294967295;
+  big[1] := m shr 32;
+  BigTrim(big);
+  Result := FmtExact(big, e - 1075, neg, W, D);
+end;
+
+{ A binary128 (P103) exactly with D decimals, as PasFmtReal does a
+  double. }
+function PasFmtQuad(Lo, Hi: Int64; W, D: Integer): string;
+var
+  e, mh: Int64;
+  neg: Boolean;
+  big: TBig;
+  s: string;
+begin
+  neg := Hi < 0;
+  e := (Hi shr 48) and 32767;
+  mh := Hi and 281474976710655;
+  if e = 32767 then
+  begin
+    if (mh <> 0) or (Lo <> 0) then
+      s := 'NaN'
+    else if neg then
+      s := '-Inf'
+    else
+      s := '+Inf';
+    Result := Pad(s, W);
+    Exit;
+  end;
+  if e = 0 then
+    e := 1
+  else
+    mh := mh or 281474976710656;
+  big := nil;
+  SetLength(big, 4);
+  big[0] := Lo and 4294967295;
+  big[1] := Lo shr 32;
+  big[2] := mh and 4294967295;
+  big[3] := mh shr 32;
+  BigTrim(big);
+  Result := FmtExact(big, e - 16495, neg, W, D);
+end;
+
+function PasFmtInt(V: Int64; W: Integer): string;
+var
+  neg: Boolean;
+  u: Int64;
+  s: string;
+begin
+  s := '';
+  neg := V < 0;
+  u := V;
+  if u = 0 then
+    s := '0';
+  while u <> 0 do
+  begin
+    if neg then
+      s := Chr(48 - u mod 10) + s
+    else
+      s := Chr(48 + u mod 10) + s;
+    u := u div 10;
+  end;
+  if neg then
+    s := '-' + s;
+  Result := Pad(s, W);
+end;
+
+function PasFmtStr(const S: string; W: Integer): string;
+begin
+  Result := Pad(S, W);
+end;
+
+end.

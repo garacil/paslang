@@ -1,0 +1,416 @@
+{ A chat server (P119): rooms over TCP, a line protocol. A routine
+  reads each client's lines; a second routine writes to it what its
+  channel brings, and a select on that channel and a stop channel ends
+  the writer when the reader is gone. A line said in a room goes to
+  every other member through their channels, so no two routines write
+  to one socket at once and a slow reader holds nobody else up beyond
+  the size of its channel.
+
+    chat [port]              serve (2324 by default) until killed
+    chat -connect host port  a client: your lines go up, the room's
+                             come down, until quit or the end of input
+    chat -selftest [n]       n clients (2000 by default) in rooms of
+                             ten, each says one line and reads the
+                             other nine, in this same process
+
+  The commands: name <yours>, join <room>, who, quit; any other line
+  is said to the room. }
+program chat;
+
+uses pasnet, paslib;
+
+const
+  RoomSize = 10;
+
+type
+  PClient = ^TClient;
+  TClient = record
+    Fd: Integer;
+    Name, Room: string;
+    Out: chan of string;
+    Stop: chan of Integer;
+  end;
+  PRoom = ^TRoom;
+  TRoom = record
+    Members: map[Integer] of PClient;
+  end;
+
+var
+  rooms: map[string] of PRoom;
+  guard: Mutex;
+  nextId, said, delivered, bad: Integer;
+  joined, done: WaitGroup;
+
+function StrToIntDef(const S: string; Def: Integer): Integer;
+var
+  v, i: Integer;
+begin
+  v := 0;
+  if S = '' then
+  begin
+    Result := Def;
+    Exit;
+  end;
+  for i := 1 to Length(S) do
+  begin
+    if (S[i] < '0') or (S[i] > '9') then
+    begin
+      Result := Def;
+      Exit;
+    end;
+    v := v * 10 + Ord(S[i]) - 48;
+  end;
+  Result := v;
+end;
+
+{ The first word of S and the rest after the space. }
+procedure HeadRest(const S: string; out Head, Rest: string);
+var
+  i: Integer;
+begin
+  i := 1;
+  while (i <= Length(S)) and (S[i] <> ' ') do
+    i := i + 1;
+  Head := Copy(S, 1, i - 1);
+  while (i <= Length(S)) and (S[i] = ' ') do
+    i := i + 1;
+  Rest := Copy(S, i, Length(S) - i + 1);
+end;
+
+{ ---- the server ---- }
+
+{ The writer: lines from the channel to the socket, until the stop. }
+procedure Writer(C: PClient);
+var
+  line: string;
+  x: Integer;
+  more: Boolean;
+begin
+  more := True;
+  while more do
+    select
+      Recv(C^.Out, line):
+        if TcpWrite(C^.Fd, line + #10) < 0 then
+          more := False;
+      Recv(C^.Stop, x):
+        more := False;
+    end;
+  TcpClose(C^.Fd);
+end;
+
+{ Under the guard: the client out of its room, the room gone when empty. }
+procedure Leave(C: PClient);
+var
+  r: PRoom;
+begin
+  if C^.Room = '' then
+    Exit;
+  r := rooms[C^.Room];
+  if r <> nil then
+  begin
+    Delete(r^.Members, C^.Fd);
+    if Length(r^.Members) = 0 then
+      Delete(rooms, C^.Room);
+  end;
+  C^.Room := '';
+end;
+
+procedure Enter(C: PClient; const Name: string);
+var
+  r: PRoom;
+begin
+  guard.Lock;
+  Leave(C);
+  r := rooms[Name];
+  if r = nil then
+  begin
+    New(r);
+    New(r^.Members);
+    rooms[Name] := r;
+  end;
+  r^.Members[C^.Fd] := C;
+  C^.Room := Name;
+  guard.Unlock;
+end;
+
+{ The line to every other member of the client's room. }
+procedure Say(C: PClient; const Text: string);
+var
+  r: PRoom;
+  id: Integer;
+  m: PClient;
+begin
+  guard.Lock;
+  r := nil;
+  if C^.Room <> '' then
+    r := rooms[C^.Room];
+  if r <> nil then
+    for id, m in r^.Members do
+      if m <> C then
+        Send(m^.Out, '[' + C^.Name + '] ' + Text);
+  guard.Unlock;
+end;
+
+function Who(C: PClient): string;
+var
+  r: PRoom;
+  id: Integer;
+  m: PClient;
+begin
+  Result := '';
+  guard.Lock;
+  r := nil;
+  if C^.Room <> '' then
+    r := rooms[C^.Room];
+  if r <> nil then
+    for id, m in r^.Members do
+      if Result = '' then
+        Result := m^.Name
+      else
+        Result := Result + ' ' + m^.Name;
+  guard.Unlock;
+  if Result = '' then
+    Result := 'nobody: join a room first';
+end;
+
+{ The reader of a client: its lines, the commands, the rest said. }
+procedure Serve(Fd: Integer);
+var
+  c: PClient;
+  buf, line, cmd, arg: string;
+begin
+  New(c);
+  c^.Fd := Fd;
+  c^.Name := 'guest' + IntToStr(AtomicAdd(@nextId, 1));
+  c^.Room := '';
+  c^.Out := MakeChan(256);
+  c^.Stop := MakeChan(1);
+  pas Writer(c);
+  Send(c^.Out, 'welcome ' + c^.Name + ': name <yours>, join <room>, who, quit; anything else is said');
+  buf := '';
+  while TcpReadLine(Fd, buf, line) do
+  begin
+    HeadRest(line, cmd, arg);
+    if cmd = 'quit' then
+      Break
+    else if (cmd = 'name') and (arg <> '') then
+    begin
+      c^.Name := arg;
+      Send(c^.Out, 'you are ' + arg);
+    end
+    else if (cmd = 'join') and (arg <> '') then
+    begin
+      Enter(c, arg);
+      Send(c^.Out, 'in ' + arg + ' with ' + Who(c));
+    end
+    else if cmd = 'who' then
+      Send(c^.Out, Who(c))
+    else if line <> '' then
+    begin
+      Say(c, line);
+      AtomicAdd(@said, 1);
+    end;
+  end;
+  guard.Lock;
+  Leave(c);
+  guard.Unlock;
+  Send(c^.Stop, 1);
+end;
+
+procedure Listen(L: Integer);
+var
+  c: Integer;
+begin
+  while True do
+  begin
+    c := TcpAccept(L);
+    if c < 0 then
+      Break;
+    pas Serve(c);
+  end;
+end;
+
+{ ---- the client ---- }
+
+procedure Down(C: Integer);
+var
+  buf, line: string;
+begin
+  buf := '';
+  while TcpReadLine(C, buf, line) do
+    WriteLn(line);
+  Halt(0);
+end;
+
+procedure Connect(const Host: string; Port: Integer);
+var
+  c: Integer;
+  line: string;
+begin
+  c := TcpConnectTo(Host, Port);
+  if c < 0 then
+  begin
+    WriteLn('chat: cannot connect to ', Host, ' port ', Port);
+    Halt(1);
+  end;
+  pas Down(c);
+  while True do
+  begin
+    ReadLn(line);
+    if line = '' then             { an empty line, or the end of the input }
+      line := 'quit';
+    if TcpWrite(c, line + #10) < 0 then
+      Break;
+    if line = 'quit' then
+      Break;
+  end;
+  Sleep(100);
+  TcpClose(c);
+end;
+
+{ ---- the self-test ---- }
+
+{ A connection that has said its greeting, or -1: the greeting is read
+  with a deadline and a new connection tried when it does not come. A
+  burst of connections past the kernel's SYN backlog is answered with
+  SYN cookies, and one whose last ACK meets a full accept queue is
+  dropped with nothing kept to retry it: the client holds a connection
+  the server never had, and where the server speaks first both would
+  wait for ever (termd has the same). }
+function Greeted(Port: Integer; var Buf: string): Integer;
+var
+  k, c: Integer;
+  line: string;
+begin
+  Result := -1;
+  for k := 1 to 5 do
+  begin
+    c := TcpConnectTo('127.0.0.1', Port);
+    if c >= 0 then
+    begin
+      Buf := TcpReadDeadline(c, 512, 3000);
+      if (Buf <> '') and TcpReadLine(c, Buf, line) and (Copy(line, 1, 8) = 'welcome ') then
+      begin
+        Result := c;
+        Exit;
+      end;
+      TcpClose(c);
+    end;
+  end;
+end;
+
+{ A client: named, in its room, then (everyone in) one line said and
+  the others' lines read. The room of client i is i div RoomSize. }
+procedure TestClient(Port, Id, Expect: Integer);
+var
+  c, got: Integer;
+  buf, line: string;
+  ok: Boolean;
+begin
+  ok := False;
+  got := 0;
+  buf := '';
+  c := Greeted(Port, buf);
+  if c >= 0 then
+  begin
+    ok := True;
+    if ok then
+    begin
+      TcpWrite(c, 'name c' + IntToStr(Id) + #10);
+      ok := TcpReadLine(c, buf, line) and (line = 'you are c' + IntToStr(Id));
+    end;
+    if ok then
+    begin
+      TcpWrite(c, 'join room' + IntToStr(Id div RoomSize) + #10);
+      ok := TcpReadLine(c, buf, line) and (Copy(line, 1, 3) = 'in ');
+    end;
+    joined.Done;
+    joined.Wait;                      { everyone is in before anyone speaks }
+    if ok then
+    begin
+      TcpWrite(c, 'hi from c' + IntToStr(Id) + #10);
+      while (got < Expect) and TcpReadLine(c, buf, line) do
+        if (Copy(line, 1, 2) = '[c') and (Copy(line, Length(line) - 7, 8) = 'hi from ') or
+          (Length(line) > 10) and (Copy(line, 1, 2) = '[c') then
+          got := got + 1
+        else
+        begin
+          ok := False;
+          Break;
+        end;
+      ok := ok and (got = Expect);
+    end;
+    TcpWrite(c, 'quit' + #10);
+    TcpClose(c);
+  end
+  else
+    joined.Done;
+  AtomicAdd(@delivered, got);
+  if not ok then
+    AtomicAdd(@bad, 1);
+  done.Done;
+end;
+
+procedure SelfTest(N: Integer);
+var
+  l, i, lim, size, expect: Integer;
+begin
+  lim := RaiseFdLimit;
+  if lim < 2 * N + 64 then
+    N := (lim - 64) div 2;
+  l := TcpListen(0);
+  if l < 0 then
+  begin
+    WriteLn('chat: cannot listen');
+    Halt(1);
+  end;
+  New(rooms);
+  pas Listen(l);
+  done.Add(N);
+  joined.Add(N);
+  expect := 0;
+  for i := 0 to N - 1 do
+  begin
+    size := N - (i div RoomSize) * RoomSize;
+    if size > RoomSize then
+      size := RoomSize;
+    expect := expect + size - 1;
+    pas TestClient(TcpPort(l), i, size - 1);
+  end;
+  done.Wait;
+  WriteLn(N, ' clients, ', said, ' said, ', delivered, ' delivered of ', expect, ', ', bad, ' bad');
+  if (said <> N) or (delivered <> expect) or (bad <> 0) then
+    Halt(1);
+  Halt(0);                { the server routine parks for ever: end without waiting for it }
+end;
+
+var
+  port, l: Integer;
+begin
+  if (ParamCount >= 1) and (ParamStr(1) = '-selftest') then
+  begin
+    if ParamCount >= 2 then
+      SelfTest(StrToIntDef(ParamStr(2), 2000))
+    else
+      SelfTest(2000);
+    Exit;
+  end;
+  if (ParamCount >= 3) and (ParamStr(1) = '-connect') then
+  begin
+    Connect(ParamStr(2), StrToIntDef(ParamStr(3), 2324));
+    Exit;
+  end;
+  port := 2324;
+  if ParamCount >= 1 then
+    port := StrToIntDef(ParamStr(1), 2324);
+  RaiseFdLimit;
+  l := TcpListenAt('', port, 1024);
+  if l < 0 then
+  begin
+    WriteLn('chat: cannot listen on port ', port);
+    Halt(1);
+  end;
+  WriteLn('chat: rooms on port ', TcpPort(l));
+  New(rooms);
+  Listen(l);
+end.

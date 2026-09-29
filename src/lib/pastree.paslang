@@ -1,0 +1,2360 @@
+{$mode objfpc}{$H+}
+
+{ Ordered map, binary heap and the store (P110). tree[K] of V is a
+  B+ tree: at most 32 keys in a node, values only in the leaves, leaves
+  linked in key order (SQLite's table b-tree, Knuth vol. 3). Rust's
+  BTreeMap is the ordered-map words, not this layout: its nodes hold 11
+  keys and a value in every node. heap of T is Go's binary min-heap.
+  The store is an LSM tree: the memtable is this B+, a log recovers it,
+  and a close writes a B+ on disk. Sha256 and the Merkle words live in
+  pashash. }
+unit pastree;
+
+interface
+
+uses pashash;
+
+function PasTreeNew(Desc: Pointer): Pointer;
+function PasTreeGet(T, Key, Desc: Pointer): Pointer;
+function PasTreePut(T, Key, Desc: Pointer): Pointer;
+function PasTreeGetI(T: Pointer; K: Integer; Desc: Pointer): Pointer;
+function PasTreePutI(T: Pointer; K: Integer; Desc: Pointer): Pointer;
+function PasTreeDelete(T, Key, Desc: Pointer): Boolean;
+procedure PasTreeClear(T, Desc: Pointer);
+function PasTreeStep(T, It, Lo, Hi, Way, Desc: Pointer): Pointer;
+function PasTreeBound(T, Key, OutKey, Desc: Pointer; Op: Integer): Boolean;
+function PasTreeRank(T, Key, Desc: Pointer): Integer;
+function PasTreeKeyAt(T: Pointer; Index: Integer; OutKey, Desc: Pointer): Boolean;
+function PasTreePop(T, OutKey, OutVal, Desc: Pointer; Hi: Integer): Boolean;
+function PasTreeSplit(T, Key, Desc: Pointer): Pointer;
+procedure PasTreeJoin(A, B, Desc: Pointer);
+function PasHeapNew(Desc: Pointer): Pointer;
+procedure PasHeapPush(H, Val, Desc: Pointer);
+function PasHeapPop(H, OutV, Desc: Pointer): Boolean;
+function PasHeapLow(H, OutV, Desc: Pointer): Boolean;
+procedure PasHeapEmpty;
+function PasStoreOpen(const Path: string): Pointer;
+procedure PasStorePut(S: Pointer; const K, V: string);
+function PasStoreGet(S: Pointer; const K: string): string;
+function PasStoreHas(S: Pointer; const K: string): Boolean;
+procedure PasStoreDelete(S: Pointer; const K: string);
+procedure PasStoreSync(S: Pointer);
+procedure PasStoreClose(S: Pointer);
+procedure PasStoreAbandon(S: Pointer);
+
+implementation
+
+const
+  MaxK = 32;
+  Hdr = 48;
+  OffParent = 0;
+  OffNext = 8;
+  OffPrev = 16;
+  OffCount = 24;
+  OffLeaf = 32;
+  OffTotal = 40;
+
+type
+  TDesc = record
+    KeyKind: Integer;
+    KeySize: Integer;
+    ValSize: Integer;
+    SlotPtr: Integer;
+  end;
+  PDesc = ^TDesc;
+  PStr = ^string;
+  PInt = ^Integer;
+
+procedure Die(const Msg: string);
+begin
+  WriteLn(ErrOutput, Msg);
+  Halt(1);
+end;
+
+function Rd(P: Pointer; Off: Integer): Integer;
+begin
+  Result := PInt(Integer(P) + Off)^;
+end;
+
+procedure Wr(P: Pointer; Off, V: Integer);
+begin
+  PInt(Integer(P) + Off)^ := V;
+end;
+
+function StrideOf(D: PDesc): Integer;
+begin
+  if D^.ValSize <= 0 then
+    Result := D^.KeySize
+  else
+    Result := D^.KeySize + ((D^.ValSize + 7) and (-8));
+end;
+
+function SlotAt(Node: Pointer; I, Stride: Integer): Pointer;
+begin
+  Result := Pointer(Integer(Node) + Hdr + I * Stride);
+end;
+
+{ A leaf keeps its keys together and its values after them (1.1.1):
+  key i at Hdr + i * KeySize, as in an inner node, and value i at
+  Hdr + MaxK * KeySize + i * Vsz, Vsz the value rounded up to 8. A
+  search touches the keys' cache lines alone, half of what it touched
+  with each value beside its key. }
+function VszOf(D: PDesc): Integer;
+begin
+  if D^.ValSize <= 0 then
+    Result := 0
+  else
+    Result := (D^.ValSize + 7) and (-8);
+end;
+
+function LeafVal(Node: Pointer; I: Integer; D: PDesc): Pointer;
+begin
+  Result := Pointer(Integer(Node) + Hdr + MaxK * D^.KeySize + I * VszOf(D));
+end;
+
+function IKey(Node: Pointer; I, Ksz: Integer): Pointer;
+begin
+  Result := Pointer(Integer(Node) + Hdr + I * Ksz);
+end;
+
+function ChildAt(Node: Pointer; I, Ksz: Integer): Pointer;
+begin
+  Result := Pointer(Integer(Node) + Hdr + MaxK * Ksz + I * 8);
+end;
+
+function GetChild(Node: Pointer; I, Ksz: Integer): Pointer;
+begin
+  Result := Pointer(PInt(ChildAt(Node, I, Ksz))^);
+end;
+
+procedure SetChild(Node, Ch: Pointer; I, Ksz: Integer);
+begin
+  PInt(ChildAt(Node, I, Ksz))^ := Integer(Ch);
+  if Ch <> nil then
+    Wr(Ch, OffParent, Integer(Node));
+end;
+
+procedure CopyBytes(Src, Dst: Pointer; N: Integer);
+begin
+  if N > 0 then
+    Move(PInt(Src)^, PInt(Dst)^, N);
+end;
+
+function CmpAt(A, B: Pointer; D: PDesc): Integer;
+var
+  sa, sb: string;
+  x, y: Integer;
+  rx, ry: Real;
+  sx, sy: Single;
+begin
+  if D^.KeyKind = 1 then
+  begin
+    sa := PStr(A)^;
+    sb := PStr(B)^;
+    if sa < sb then
+      Result := -1
+    else if sa > sb then
+      Result := 1
+    else
+      Result := 0;
+  end
+  else if D^.KeyKind = 2 then
+  begin
+    Move(PInt(A)^, rx, 8);
+    Move(PInt(B)^, ry, 8);
+    if rx < ry then
+      Result := -1
+    else if rx > ry then
+      Result := 1
+    else
+      Result := 0;
+  end
+  else if D^.KeyKind = 3 then
+  begin
+    { a Single, in the low four bytes of its slot }
+    Move(PInt(A)^, sx, 4);
+    Move(PInt(B)^, sy, 4);
+    if sx < sy then
+      Result := -1
+    else if sx > sy then
+      Result := 1
+    else
+      Result := 0;
+  end
+  else
+  begin
+    x := PInt(A)^;
+    y := PInt(B)^;
+    if x < y then
+      Result := -1
+    else if x > y then
+      Result := 1
+    else
+      Result := 0;
+  end;
+end;
+
+{ A node holds its parent, its neighbours and, inside, its children or
+  its string keys, so the collector scans every node; the keys of an
+  integer tree are then candidates it looks up and drops. }
+function MakeNode(Leaf: Integer; D: PDesc): Pointer;
+var
+  bytes, i, stride: Integer;
+  p: Pointer;
+begin
+  if Leaf = 1 then
+    bytes := Hdr + MaxK * D^.KeySize + MaxK * VszOf(D)
+  else
+    bytes := Hdr + MaxK * D^.KeySize + (MaxK + 1) * 8;
+  { rt_alloc hands out zeroed blocks (a mapping the kernel zeroed, or a
+    reused run zeroed when handed out): no second clear (1.1.1) }
+  GetMem(p, bytes);
+  Wr(p, OffLeaf, Leaf);
+  Result := p;
+end;
+
+procedure Bubble(Node: Pointer; Ksz: Integer);
+var
+  s, i, c: Integer;
+  ch: Pointer;
+begin
+  while Node <> nil do
+  begin
+    if Rd(Node, OffLeaf) = 1 then
+      Wr(Node, OffTotal, Rd(Node, OffCount))
+    else
+    begin
+      s := 0;
+      c := Rd(Node, OffCount);
+      for i := 0 to c do
+      begin
+        ch := GetChild(Node, i, Ksz);
+        if ch <> nil then
+          s := s + Rd(ch, OffTotal);
+      end;
+      Wr(Node, OffTotal, s);
+    end;
+    Node := Pointer(Rd(Node, OffParent));
+  end;
+end;
+
+function LowerLeaf(Node, Key: Pointer; D: PDesc): Integer; inline;
+var
+  lo, hi, mid, stride, k, base: Integer;
+begin
+  stride := D^.KeySize;
+  lo := 0;
+  hi := PInt(Integer(Node) + OffCount)^;
+  base := Integer(Node) + Hdr;
+  if D^.KeyKind = 0 then
+  begin
+    k := PInt(Key)^;
+    while lo < hi do
+    begin
+      mid := (lo + hi) shr 1;
+      if PInt(base + (mid shl 3))^ < k then
+        lo := mid + 1
+      else
+        hi := mid;
+    end;
+  end
+  else
+    while lo < hi do
+    begin
+      mid := (lo + hi) shr 1;
+      if CmpAt(Pointer(base + mid * stride), Key, D) < 0 then
+        lo := mid + 1
+      else
+        hi := mid;
+    end;
+  Result := lo;
+end;
+
+{ One key more or less under every node above a leaf (1.1.1): a walk
+  up adding Delta, where Bubble summed every child at every level for
+  each insert. Bubble stays for the splits and the merges, whose
+  children change. }
+procedure BubbleAdd(Node: Pointer; Delta: Integer);
+var
+  n: Integer;
+begin
+  n := Integer(Node);
+  while n <> 0 do
+  begin
+    PInt(n + OffTotal)^ := PInt(n + OffTotal)^ + Delta;
+    n := PInt(n + OffParent)^;
+  end;
+end;
+
+{ The search in a node (1.1.1): a binary search without a call per key,
+  an integer key compared in place and a string or a real through
+  CmpAt. In an inner node the answer is the child to take, the number
+  of keys not above the key; in a leaf the lower bound, the first slot
+  whose key is not below it. A linear scan calling CmpAt for every key
+  took 0.45 us a lookup in a tree of a million; this takes 0.1. }
+function SearchInner(Node, Key: Pointer; D: PDesc): Integer;
+var
+  lo, hi, mid, ksz, k, base: Integer;
+begin
+  ksz := D^.KeySize;
+  lo := 0;
+  hi := PInt(Integer(Node) + OffCount)^;
+  base := Integer(Node) + Hdr;
+  if D^.KeyKind = 0 then
+  begin
+    k := PInt(Key)^;
+    while lo < hi do
+    begin
+      mid := (lo + hi) shr 1;
+      if PInt(base + mid * ksz)^ <= k then
+        lo := mid + 1
+      else
+        hi := mid;
+    end;
+  end
+  else
+    while lo < hi do
+    begin
+      mid := (lo + hi) shr 1;
+      if CmpAt(Key, Pointer(base + mid * ksz), D) >= 0 then
+        lo := mid + 1
+      else
+        hi := mid;
+    end;
+  Result := lo;
+end;
+
+function FindLeaf(Root, Key: Pointer; D: PDesc): Pointer; inline;
+var
+  node, i, kids, ksz, lo, hi, mid, k, base: Integer;
+begin
+  node := Integer(Root);
+  ksz := D^.KeySize;
+  kids := Hdr + MaxK * ksz;
+  if D^.KeyKind = 0 then
+  begin
+    { the search written here for an integer key: no call per level }
+    k := PInt(Key)^;
+    while PInt(node + OffLeaf)^ = 0 do
+    begin
+      lo := 0;
+      hi := PInt(node + OffCount)^;
+      base := node + Hdr;
+      while lo < hi do
+      begin
+        mid := (lo + hi) shr 1;
+        if PInt(base + (mid shl 3))^ <= k then
+          lo := mid + 1
+        else
+          hi := mid;
+      end;
+      node := PInt(node + kids + (lo shl 3))^;
+    end;
+  end
+  else
+    while PInt(node + OffLeaf)^ = 0 do
+    begin
+      i := SearchInner(Pointer(node), Key, D);
+      node := PInt(node + kids + i * 8)^;
+    end;
+  Result := Pointer(node);
+end;
+
+function Leftmost(Root: Pointer; Ksz: Integer): Pointer;
+begin
+  Result := Root;
+  if Result = nil then
+    Exit;
+  while Rd(Result, OffLeaf) = 0 do
+    Result := GetChild(Result, 0, Ksz);
+end;
+
+function Rightmost(Root: Pointer; Ksz: Integer): Pointer;
+var
+  c: Integer;
+begin
+  Result := Root;
+  if Result = nil then
+    Exit;
+  while Rd(Result, OffLeaf) = 0 do
+  begin
+    c := Rd(Result, OffCount);
+    Result := GetChild(Result, c, Ksz);
+  end;
+end;
+
+{ The bytes from Src on, N of them, moved up by Step (from the top) or
+  down by Step. Move reads every byte before it writes one, so the
+  overlap either way is right; it moves 16 bytes at a time where a word
+  loop with a stack check per word took a third of an insert (1.1.1). }
+procedure MoveWords(Src, N, Step: Integer; Up: Boolean); inline;
+begin
+  if N > 0 then
+  begin
+    if Up then
+      Move(PInt(Src)^, PInt(Src + Step)^, N)
+    else
+      Move(PInt(Src + Step)^, PInt(Src)^, N);
+  end;
+end;
+
+{ The keys and the values of a leaf from From up moved one place up
+  (Delta > 0) or down, in place of a copy call per slot (1.1.1). }
+procedure ShiftLeaf(Node: Pointer; From, Delta: Integer; D: PDesc);
+var
+  c, ksz, vsz: Integer;
+begin
+  c := PInt(Integer(Node) + OffCount)^;
+  ksz := D^.KeySize;
+  vsz := VszOf(D);
+  if Delta > 0 then
+  begin
+    MoveWords(Integer(Node) + Hdr + From * ksz, (c - From) * ksz, ksz, True);
+    if vsz > 0 then
+      MoveWords(Integer(LeafVal(Node, From, D)), (c - From) * vsz, vsz, True);
+  end
+  else
+  begin
+    MoveWords(Integer(Node) + Hdr + From * ksz, (c - From - 1) * ksz, ksz, False);
+    if vsz > 0 then
+      MoveWords(Integer(LeafVal(Node, From, D)), (c - From - 1) * vsz, vsz, False);
+  end;
+end;
+
+{ The keys of an inner node from From up moved one place up (Delta > 0)
+  or down, and the children with them: one Move each (1.1.1; a copy
+  call per key and per child, with the child's parent written again,
+  made a split cost a microsecond). }
+procedure ShiftKeys(Node: Pointer; From, Delta, Ksz: Integer);
+var
+  c: Integer;
+begin
+  c := Rd(Node, OffCount);
+  if Delta > 0 then
+  begin
+    if c > From then
+      Move(PInt(IKey(Node, From, Ksz))^, PInt(IKey(Node, From + 1, Ksz))^, (c - From) * Ksz);
+  end
+  else if c - 1 > From then
+    Move(PInt(IKey(Node, From + 1, Ksz))^, PInt(IKey(Node, From, Ksz))^, (c - 1 - From) * Ksz);
+end;
+
+procedure ShiftKids(Node: Pointer; From, Delta, Ksz: Integer);
+var
+  c: Integer;
+begin
+  c := Rd(Node, OffCount);
+  if Delta > 0 then
+  begin
+    if c >= From then
+      Move(PInt(ChildAt(Node, From, Ksz))^, PInt(ChildAt(Node, From + 1, Ksz))^, (c - From + 1) * 8);
+  end
+  else if c > From then
+    Move(PInt(ChildAt(Node, From + 1, Ksz))^, PInt(ChildAt(Node, From, Ksz))^, (c - From) * 8);
+end;
+
+procedure LinkLeaf(Left, Right: Pointer);
+begin
+  Wr(Right, OffPrev, Integer(Left));
+  Wr(Right, OffNext, Rd(Left, OffNext));
+  if Rd(Left, OffNext) <> 0 then
+    Wr(Pointer(Rd(Left, OffNext)), OffPrev, Integer(Right));
+  Wr(Left, OffNext, Integer(Right));
+end;
+
+procedure UnlinkLeaf(Node: Pointer);
+begin
+  if Rd(Node, OffPrev) <> 0 then
+    Wr(Pointer(Rd(Node, OffPrev)), OffNext, Rd(Node, OffNext));
+  if Rd(Node, OffNext) <> 0 then
+    Wr(Pointer(Rd(Node, OffNext)), OffPrev, Rd(Node, OffPrev));
+  Wr(Node, OffNext, 0);
+  Wr(Node, OffPrev, 0);
+end;
+
+{ The totals through a split (1.1.1). A node above a split keeps its
+  total: the halves hold its keys between them. Each inner split sums
+  its two halves from their children, but the new leaf is attached
+  only after the chain of splits, so the half that receives it, and
+  the half above that one at every level split in the chain, and a
+  root made in the chain, are short by the new leaf's keys: SplitLeaf
+  sums those again from their children once the leaf is in. Bubble,
+  which summed every child up to the root at every split, stays for
+  the deletes. }
+procedure SumFromChildren(Node: Pointer; Ksz: Integer);
+var
+  s, i, c: Integer;
+  ch: Pointer;
+begin
+  if Rd(Node, OffLeaf) = 1 then
+  begin
+    Wr(Node, OffTotal, Rd(Node, OffCount));
+    Exit;
+  end;
+  s := 0;
+  c := Rd(Node, OffCount);
+  for i := 0 to c do
+  begin
+    ch := GetChild(Node, i, Ksz);
+    if ch <> nil then
+      s := s + Rd(ch, OffTotal);
+  end;
+  Wr(Node, OffTotal, s);
+end;
+
+procedure InsertSep(var Root: Pointer; Parent, Left, Sep, Right: Pointer; D: PDesc;
+  var Depth: Integer; var NewRoot: Boolean); forward;
+procedure SplitInner(var Root: Pointer; Node: Pointer; D: PDesc;
+  var Depth: Integer; var NewRoot: Boolean); forward;
+
+procedure InsertSep(var Root: Pointer; Parent, Left, Sep, Right: Pointer; D: PDesc;
+  var Depth: Integer; var NewRoot: Boolean);
+var
+  neu, idx, c, ksz, kids: Integer;
+begin
+  ksz := D^.KeySize;
+  if Parent = nil then
+  begin
+    neu := Integer(MakeNode(0, D));
+    CopyBytes(Sep, IKey(Pointer(neu), 0, ksz), ksz);
+    SetChild(Pointer(neu), Left, 0, ksz);
+    SetChild(Pointer(neu), Right, 1, ksz);
+    Wr(Pointer(neu), OffCount, 1);
+    Wr(Pointer(neu), OffTotal, Rd(Left, OffTotal) + Rd(Right, OffTotal));
+    Root := Pointer(neu);
+    NewRoot := True;
+    Exit;
+  end;
+  if Rd(Parent, OffCount) >= MaxK then
+  begin
+    SplitInner(Root, Parent, D, Depth, NewRoot);
+    Depth := Depth + 1;
+    Parent := Pointer(Rd(Left, OffParent));
+  end;
+  c := Rd(Parent, OffCount);
+  idx := 0;
+  kids := Integer(Parent) + Hdr + MaxK * ksz;
+  while (idx <= c) and (PInt(kids + idx * 8)^ <> Integer(Left)) do
+    idx := idx + 1;
+  if idx > c then
+    Die('paslang: tree split');
+  ShiftKeys(Parent, idx, 1, ksz);
+  ShiftKids(Parent, idx + 1, 1, ksz);
+  CopyBytes(Sep, IKey(Parent, idx, ksz), ksz);
+  SetChild(Parent, Right, idx + 1, ksz);
+  Wr(Parent, OffCount, c + 1);
+end;
+
+procedure SplitLeaf(var Root: Pointer; Leaf: Pointer; D: PDesc);
+var
+  right, n: Pointer;
+  i, stride, ksz, depth: Integer;
+  sep: array[0..31] of Byte;
+  newRoot: Boolean;
+begin
+  stride := D^.KeySize;
+  ksz := D^.KeySize;
+  right := MakeNode(1, D);
+  CopyBytes(IKey(Leaf, 16, ksz), IKey(right, 0, ksz), 16 * ksz);
+  if D^.ValSize > 0 then
+    CopyBytes(LeafVal(Leaf, 16, D), LeafVal(right, 0, D), 16 * VszOf(D));
+  Wr(Leaf, OffCount, 16);
+  Wr(right, OffCount, 16);
+  { the new leaf's total before the separator goes up: Bubble sums the
+    children's totals, and a fresh node's was 0 until its own insert }
+  Wr(Leaf, OffTotal, 16);
+  Wr(right, OffTotal, 16);
+  LinkLeaf(Leaf, right);
+  CopyBytes(SlotAt(right, 0, stride), @sep[0], ksz);
+  depth := 0;
+  newRoot := False;
+  InsertSep(Root, Pointer(Rd(Leaf, OffParent)), Leaf, @sep[0], right, D, depth, newRoot);
+  { the halves on the new leaf's path, one per level split, summed
+    again now that the leaf is in; and a root made in the chain }
+  n := Pointer(Rd(right, OffParent));
+  for i := 1 to depth do
+  begin
+    SumFromChildren(n, ksz);
+    n := Pointer(Rd(n, OffParent));
+  end;
+  if newRoot then
+    SumFromChildren(Root, ksz);
+end;
+
+procedure SplitInner(var Root: Pointer; Node: Pointer; D: PDesc;
+  var Depth: Integer; var NewRoot: Boolean);
+var
+  right: Pointer;
+  i, ksz, tot: Integer;
+  sep: array[0..31] of Byte;
+  ch: Pointer;
+begin
+  ksz := D^.KeySize;
+  right := MakeNode(0, D);
+  CopyBytes(IKey(Node, 16, ksz), @sep[0], ksz);
+  { keys 17..31 and children 17..32 go to the right half in one move
+    each; the children take their new parent (1.1.1) }
+  CopyBytes(IKey(Node, 17, ksz), IKey(right, 0, ksz), 15 * ksz);
+  CopyBytes(ChildAt(Node, 17, ksz), ChildAt(right, 0, ksz), 16 * 8);
+  for i := 0 to 15 do
+  begin
+    ch := GetChild(right, i, ksz);
+    if ch <> nil then
+      Wr(ch, OffParent, Integer(right));
+  end;
+  Wr(right, OffCount, 15);
+  Wr(Node, OffCount, 16);
+  { each half's total from its children, before the separator goes up }
+  tot := 0;
+  for i := 0 to 15 do
+    tot := tot + Rd(GetChild(right, i, ksz), OffTotal);
+  Wr(right, OffTotal, tot);
+  tot := 0;
+  for i := 0 to 16 do
+    tot := tot + Rd(GetChild(Node, i, ksz), OffTotal);
+  Wr(Node, OffTotal, tot);
+  InsertSep(Root, Pointer(Rd(Node, OffParent)), Node, @sep[0], right, D, Depth, NewRoot);
+end;
+
+
+procedure Hold(T: Pointer);
+begin
+  if Rd(T, 24) <> 0 then
+    Die('paslang: concurrent tree writes');
+  Wr(T, 24, 1);
+end;
+
+procedure Release(T: Pointer);
+begin
+  Wr(T, 24, 0);
+end;
+
+{ The tree: its count, its root, a flag that it has a root and the
+  write hold; the root is a pointer, so the block is scanned. }
+function PasTreeNew(Desc: Pointer): Pointer;
+var
+  p: Pointer;
+begin
+  GetMem(p, 32);
+  Wr(p, 0, 0);
+  Wr(p, 8, 0);
+  Wr(p, 16, 0);
+  Wr(p, 24, 0);
+  Result := p;
+end;
+
+function PasTreeGet(T, Key, Desc: Pointer): Pointer;
+var
+  d: PDesc;
+  leaf, p, stride, slot, lo, hi, mid, k, base, c: Integer;
+begin
+  Result := nil;
+  if (T = nil) or (PInt(T)^ = 0) then
+    Exit;
+  d := PDesc(Desc);
+  leaf := Integer(FindLeaf(Pointer(PInt(Integer(T) + 8)^), Key, d));
+  stride := d^.KeySize;
+  c := PInt(leaf + OffCount)^;
+  base := leaf + Hdr;
+  if d^.KeyKind = 0 then
+  begin
+    { the lower bound written here for an integer key }
+    k := PInt(Key)^;
+    lo := 0;
+    hi := c;
+    while lo < hi do
+    begin
+      mid := (lo + hi) shr 1;
+      if PInt(base + (mid shl 3))^ < k then
+        lo := mid + 1
+      else
+        hi := mid;
+    end;
+    if (lo >= c) or (PInt(base + (lo shl 3))^ <> k) then
+      Exit;
+    p := lo;
+  end
+  else
+  begin
+    p := LowerLeaf(Pointer(leaf), Key, d);
+    if (p >= c) or (CmpAt(Pointer(base + p * stride), Key, d) <> 0) then
+      Exit;
+  end;
+  if d^.ValSize <= 0 then
+    Result := Pointer(base + p * stride)
+  else
+    Result := Pointer(base + MaxK * stride + p * ((d^.ValSize + 7) and (-8)));
+end;
+
+function PasTreePut(T, Key, Desc: Pointer): Pointer;
+var
+  d: PDesc;
+  root, leaf: Pointer;
+  p, stride, ksz, tr, lf, c, lo, hi, mid, k, base, i, src, n, vsz, vb: Integer;
+begin
+  if T = nil then
+    Die('paslang: nil tree');
+  d := PDesc(Desc);
+  tr := Integer(T);
+  if PInt(tr + 24)^ <> 0 then
+    Die('paslang: concurrent tree writes');
+  PInt(tr + 24)^ := 1;
+  ksz := d^.KeySize;
+  stride := ksz;
+  root := Pointer(PInt(tr + 8)^);
+  if root = nil then
+  begin
+    leaf := MakeNode(1, d);
+    CopyBytes(Key, SlotAt(leaf, 0, stride), ksz);
+    Wr(leaf, OffCount, 1);
+    Wr(leaf, OffTotal, 1);
+    Wr(T, 8, Integer(leaf));
+    Wr(T, 0, 1);
+    Wr(T, 16, 1);
+    Release(T);
+    if d^.ValSize > 0 then
+      Result := LeafVal(leaf, 0, d)
+    else
+      Result := SlotAt(leaf, 0, stride);
+    if d^.ValSize > 0 then
+    begin
+      p := 0;
+      while p < d^.ValSize do
+      begin
+        PInt(Integer(Result) + p)^ := 0;
+        p := p + 8;
+      end;
+    end;
+    Exit;
+  end;
+  { The common insert written out (1.1.1): the lower bound of an
+    integer key, the shift, the key and the totals in place, where a
+    call per step (LowerLeaf, ShiftSlots, CopyBytes, Bubble, Hold,
+    Release, Rd, Wr) took most of the time of a million inserts. }
+  leaf := FindLeaf(root, Key, d);
+  lf := Integer(leaf);
+  c := PInt(lf + OffCount)^;
+  base := lf + Hdr;
+  if d^.KeyKind = 0 then
+  begin
+    k := PInt(Key)^;
+    lo := 0;
+    hi := c;
+    while lo < hi do
+    begin
+      mid := (lo + hi) shr 1;
+      if PInt(base + (mid shl 3))^ < k then
+        lo := mid + 1
+      else
+        hi := mid;
+    end;
+    p := lo;
+    if (p < c) and (PInt(base + (p shl 3))^ = k) then
+    begin
+      PInt(tr + 24)^ := 0;
+      if d^.ValSize <= 0 then
+        Result := Pointer(base + p * stride)
+      else
+        Result := Pointer(base + MaxK * ksz + p * ((d^.ValSize + 7) and (-8)));
+      Exit;
+    end;
+  end
+  else
+  begin
+    p := LowerLeaf(leaf, Key, d);
+    if (p < c) and (CmpAt(Pointer(base + p * stride), Key, d) = 0) then
+    begin
+      PInt(tr + 24)^ := 0;
+      if d^.ValSize > 0 then
+        Result := LeafVal(leaf, p, d)
+      else
+        Result := Pointer(base + p * stride);
+      Exit;
+    end;
+  end;
+  if c >= MaxK then
+  begin
+    { the split keeps 16 keys and moves the other 16 to a new leaf after
+      this one, whose first key goes up as the separator: a key below it
+      (p up to 16) stays here at p, one above goes there at p - 16. No
+      second descent from the root (1.1.1: it cost 100 ns a split). }
+    root := Pointer(PInt(tr + 8)^);
+    SplitLeaf(root, leaf, d);
+    PInt(tr + 8)^ := Integer(root);
+    if p > 16 then
+    begin
+      lf := PInt(lf + OffNext)^;
+      p := p - 16;
+    end;
+    c := PInt(lf + OffCount)^;
+    base := lf + Hdr;
+  end;
+  if (ksz = 8) and (d^.ValSize = 8) then
+  begin
+    { an 8-byte key and an 8-byte value, tree[Integer] of Integer and its
+      kin: one loop shifts both, with constant strides and no call, where
+      two Moves and the multiplies around them cost a tenth of an insert
+      (1.1.1) }
+    vb := base + MaxK * 8;
+    for i := c - 1 downto p do
+    begin
+      PInt(base + (i shl 3) + 8)^ := PInt(base + (i shl 3))^;
+      PInt(vb + (i shl 3) + 8)^ := PInt(vb + (i shl 3))^;
+    end;
+    PInt(base + (p shl 3))^ := PInt(Key)^;
+    Result := Pointer(vb + (p shl 3));
+    PInt(vb + (p shl 3))^ := 0;
+    PInt(lf + OffCount)^ := c + 1;
+    PInt(tr)^ := PInt(tr)^ + 1;
+    n := lf;
+    while n <> 0 do
+    begin
+      PInt(n + OffTotal)^ := PInt(n + OffTotal)^ + 1;
+      n := PInt(n + OffParent)^;
+    end;
+    PInt(tr + 24)^ := 0;
+    Exit;
+  end;
+  src := base + p * ksz;
+  MoveWords(src, (c - p) * ksz, ksz, True);
+  if ksz = 8 then
+    PInt(src)^ := PInt(Key)^
+  else
+  begin
+    i := 0;
+    while i < ksz do
+    begin
+      PInt(src + i)^ := PInt(Integer(Key) + i)^;
+      i := i + 8;
+    end;
+  end;
+  vsz := (d^.ValSize + 7) and (-8);
+  if d^.ValSize > 0 then
+  begin
+    Result := Pointer(base + MaxK * ksz + p * vsz);
+    MoveWords(Integer(Result), (c - p) * vsz, vsz, True);
+    if vsz = 8 then
+      PInt(Integer(Result))^ := 0
+    else
+    begin
+      i := 0;
+      while i < vsz do
+      begin
+        PInt(Integer(Result) + i)^ := 0;
+        i := i + 8;
+      end;
+    end;
+  end
+  else
+    Result := Pointer(src);
+  PInt(lf + OffCount)^ := c + 1;
+  PInt(tr)^ := PInt(tr)^ + 1;
+  n := lf;
+  while n <> 0 do
+  begin
+    PInt(n + OffTotal)^ := PInt(n + OffTotal)^ + 1;
+    n := PInt(n + OffParent)^;
+  end;
+  PInt(tr + 24)^ := 0;
+end;
+
+{ t[k] and t[k] := v of a tree whose key compares as an integer (not a
+  string, not a real) and whose value takes one 8-byte slot, the key by
+  value (1.1.1): the compiler calls these instead of PasTreeGet and
+  PasTreePut, and the key no longer goes through memory nor the
+  descriptor through a dozen reads and tests on the way; the descriptor
+  is for the split alone. A node's children are at Hdr + MaxK * 8, a
+  leaf's values at the same offset. }
+function PasTreeGetI(T: Pointer; K: Integer; Desc: Pointer): Pointer;
+var
+  node, lo, hi, mid, c, base: Integer;
+begin
+  Result := nil;
+  if (T = nil) or (PInt(T)^ = 0) then
+    Exit;
+  node := PInt(Integer(T) + 8)^;
+  while PInt(node + OffLeaf)^ = 0 do
+  begin
+    lo := 0;
+    hi := PInt(node + OffCount)^;
+    base := node + Hdr;
+    while lo < hi do
+    begin
+      mid := (lo + hi) shr 1;
+      if PInt(base + (mid shl 3))^ <= K then
+        lo := mid + 1
+      else
+        hi := mid;
+    end;
+    node := PInt(base + MaxK * 8 + (lo shl 3))^;
+  end;
+  c := PInt(node + OffCount)^;
+  base := node + Hdr;
+  lo := 0;
+  hi := c;
+  while lo < hi do
+  begin
+    mid := (lo + hi) shr 1;
+    if PInt(base + (mid shl 3))^ < K then
+      lo := mid + 1
+    else
+      hi := mid;
+  end;
+  if (lo < c) and (PInt(base + (lo shl 3))^ = K) then
+    Result := Pointer(base + MaxK * 8 + (lo shl 3));
+end;
+
+function PasTreePutI(T: Pointer; K: Integer; Desc: Pointer): Pointer;
+var
+  root: Pointer;
+  tr, node, lo, hi, mid, c, base, p, i, vb, n: Integer;
+begin
+  if (T = nil) or (PInt(Integer(T) + 8)^ = 0) then
+  begin
+    { a nil tree dies there, and the first key makes the root }
+    Result := PasTreePut(T, @K, Desc);
+    Exit;
+  end;
+  tr := Integer(T);
+  if PInt(tr + 24)^ <> 0 then
+    Die('paslang: concurrent tree writes');
+  PInt(tr + 24)^ := 1;
+  node := PInt(tr + 8)^;
+  while PInt(node + OffLeaf)^ = 0 do
+  begin
+    lo := 0;
+    hi := PInt(node + OffCount)^;
+    base := node + Hdr;
+    while lo < hi do
+    begin
+      mid := (lo + hi) shr 1;
+      if PInt(base + (mid shl 3))^ <= K then
+        lo := mid + 1
+      else
+        hi := mid;
+    end;
+    node := PInt(base + MaxK * 8 + (lo shl 3))^;
+  end;
+  c := PInt(node + OffCount)^;
+  base := node + Hdr;
+  lo := 0;
+  hi := c;
+  while lo < hi do
+  begin
+    mid := (lo + hi) shr 1;
+    if PInt(base + (mid shl 3))^ < K then
+      lo := mid + 1
+    else
+      hi := mid;
+  end;
+  if (lo < c) and (PInt(base + (lo shl 3))^ = K) then
+  begin
+    PInt(tr + 24)^ := 0;
+    Result := Pointer(base + MaxK * 8 + (lo shl 3));
+    Exit;
+  end;
+  p := lo;
+  if c >= MaxK then
+  begin
+    { as PasTreePut: the half the key belongs to, no second descent }
+    root := Pointer(PInt(tr + 8)^);
+    SplitLeaf(root, Pointer(node), PDesc(Desc));
+    PInt(tr + 8)^ := Integer(root);
+    if p > 16 then
+    begin
+      node := PInt(node + OffNext)^;
+      p := p - 16;
+    end;
+    c := PInt(node + OffCount)^;
+    base := node + Hdr;
+  end;
+  vb := base + MaxK * 8;
+  for i := c - 1 downto p do
+  begin
+    PInt(base + (i shl 3) + 8)^ := PInt(base + (i shl 3))^;
+    PInt(vb + (i shl 3) + 8)^ := PInt(vb + (i shl 3))^;
+  end;
+  PInt(base + (p shl 3))^ := K;
+  Result := Pointer(vb + (p shl 3));
+  PInt(vb + (p shl 3))^ := 0;
+  PInt(node + OffCount)^ := c + 1;
+  PInt(tr)^ := PInt(tr)^ + 1;
+  n := node;
+  while n <> 0 do
+  begin
+    PInt(n + OffTotal)^ := PInt(n + OffTotal)^ + 1;
+    n := PInt(n + OffParent)^;
+  end;
+  PInt(tr + 24)^ := 0;
+end;
+
+procedure DropChild(var Root: Pointer; Parent: Pointer; Idx, Ksz: Integer);
+var
+  only, gp: Pointer;
+  gi, gc: Integer;
+begin
+  if Idx = 0 then
+  begin
+    ShiftKeys(Parent, 0, -1, Ksz);
+    ShiftKids(Parent, 0, -1, Ksz);
+  end
+  else
+  begin
+    ShiftKeys(Parent, Idx - 1, -1, Ksz);
+    ShiftKids(Parent, Idx, -1, Ksz);
+  end;
+  Wr(Parent, OffCount, Rd(Parent, OffCount) - 1);
+  if Rd(Parent, OffCount) > 0 then
+  begin
+    Bubble(Parent, Ksz);
+    Exit;
+  end;
+  only := GetChild(Parent, 0, Ksz);
+  gp := Pointer(Rd(Parent, OffParent));
+  if gp = nil then
+  begin
+    Wr(only, OffParent, 0);
+    Root := only;
+    Exit;
+  end;
+  gc := Rd(gp, OffCount);
+  gi := 0;
+  while (gi <= gc) and (Integer(GetChild(gp, gi, Ksz)) <> Integer(Parent)) do
+    gi := gi + 1;
+  SetChild(gp, only, gi, Ksz);
+  Bubble(only, Ksz);
+end;
+
+function PasTreeDelete(T, Key, Desc: Pointer): Boolean;
+var
+  d: PDesc;
+  root, leaf, parent: Pointer;
+  p, stride, ksz, idx, c: Integer;
+begin
+  Result := False;
+  if (T = nil) or (Rd(T, 0) = 0) then
+    Exit;
+  d := PDesc(Desc);
+  Hold(T);
+  stride := d^.KeySize;
+  ksz := d^.KeySize;
+  root := Pointer(Rd(T, 8));
+  leaf := FindLeaf(root, Key, d);
+  p := LowerLeaf(leaf, Key, d);
+  if (p >= Rd(leaf, OffCount)) or (CmpAt(SlotAt(leaf, p, stride), Key, d) <> 0) then
+  begin
+    Release(T);
+    Exit;
+  end;
+  ShiftLeaf(leaf, p, -1, d);
+  Wr(leaf, OffCount, Rd(leaf, OffCount) - 1);
+  Wr(T, 0, Rd(T, 0) - 1);
+  if Rd(leaf, OffCount) = 0 then
+  begin
+    UnlinkLeaf(leaf);
+    parent := Pointer(Rd(leaf, OffParent));
+    if parent = nil then
+    begin
+      Wr(T, 8, 0);
+      Wr(T, 16, 0);
+    end
+    else
+    begin
+      c := Rd(parent, OffCount);
+      idx := 0;
+      while (idx <= c) and (Integer(GetChild(parent, idx, ksz)) <> Integer(leaf)) do
+        idx := idx + 1;
+      DropChild(root, parent, idx, ksz);
+      Wr(T, 8, Integer(root));
+    end;
+  end
+  else
+    BubbleAdd(leaf, -1);
+  Release(T);
+  Result := True;
+end;
+
+procedure PasTreeClear(T, Desc: Pointer);
+begin
+  if T = nil then
+    Exit;
+  Hold(T);
+  Wr(T, 0, 0);
+  Wr(T, 8, 0);
+  Wr(T, 16, 0);
+  Release(T);
+end;
+
+function InRange(Slot, Lo, Hi: Pointer; D: PDesc): Boolean;
+begin
+  Result := True;
+  if (Lo <> nil) and (CmpAt(Slot, Lo, D) < 0) then
+    Result := False;
+  if (Hi <> nil) and (CmpAt(Slot, Hi, D) > 0) then
+    Result := False;
+end;
+
+function PasTreeStep(T, It, Lo, Hi, Way, Desc: Pointer): Pointer;
+var
+  d: PDesc;
+  node: Pointer;
+  idx, stride, ksz, phase, rev: Integer;
+begin
+  Result := nil;
+  if (T = nil) or (Rd(T, 0) = 0) then
+    Exit;
+  if Rd(T, 24) <> 0 then
+    Die('paslang: tree walk during a write');
+  d := PDesc(Desc);
+  stride := d^.KeySize;
+  ksz := d^.KeySize;
+  phase := Rd(It, 16);
+  rev := Integer(Way);
+  if phase = 0 then
+  begin
+    if rev = 0 then
+    begin
+      if Lo = nil then
+      begin
+        node := Leftmost(Pointer(Rd(T, 8)), ksz);
+        idx := 0;
+      end
+      else
+      begin
+        node := FindLeaf(Pointer(Rd(T, 8)), Lo, d);
+        idx := LowerLeaf(node, Lo, d);
+        if idx >= Rd(node, OffCount) then
+        begin
+          node := Pointer(Rd(node, OffNext));
+          idx := 0;
+        end;
+      end;
+    end
+    else
+    begin
+      if Hi = nil then
+      begin
+        node := Rightmost(Pointer(Rd(T, 8)), ksz);
+        idx := Rd(node, OffCount) - 1;
+      end
+      else
+      begin
+        node := FindLeaf(Pointer(Rd(T, 8)), Hi, d);
+        idx := LowerLeaf(node, Hi, d);
+        if not ((idx < Rd(node, OffCount)) and
+          (CmpAt(SlotAt(node, idx, stride), Hi, d) = 0)) then
+          idx := idx - 1;
+        if idx < 0 then
+        begin
+          node := Pointer(Rd(node, OffPrev));
+          if node <> nil then
+            idx := Rd(node, OffCount) - 1;
+        end;
+      end;
+    end;
+    Wr(It, 16, 1);
+  end
+  else
+  begin
+    node := Pointer(Rd(It, 0));
+    idx := Rd(It, 8);
+    if rev = 0 then
+    begin
+      idx := idx + 1;
+      if (node <> nil) and (idx >= Rd(node, OffCount)) then
+      begin
+        node := Pointer(Rd(node, OffNext));
+        idx := 0;
+      end;
+    end
+    else
+    begin
+      idx := idx - 1;
+      if idx < 0 then
+      begin
+        if node <> nil then
+          node := Pointer(Rd(node, OffPrev));
+        if node <> nil then
+          idx := Rd(node, OffCount) - 1;
+      end;
+    end;
+  end;
+  if (node = nil) or (idx < 0) or (idx >= Rd(node, OffCount)) then
+    Exit;
+  if not InRange(SlotAt(node, idx, stride), Lo, Hi, d) then
+    Exit;
+  Wr(It, 0, Integer(node));
+  Wr(It, 8, idx);
+  { the value's place, for the loop's v and for Split, Join and the store }
+  if d^.ValSize > 0 then
+    PInt(Integer(It) + 24)^ := Integer(node) + Hdr + MaxK * ksz + idx * ((d^.ValSize + 7) and (-8));
+  Result := SlotAt(node, idx, stride);
+end;
+
+function PasTreeBound(T, Key, OutKey, Desc: Pointer; Op: Integer): Boolean;
+var
+  d: PDesc;
+  node: Pointer;
+  p, stride, ksz: Integer;
+begin
+  Result := False;
+  if (T = nil) or (Rd(T, 0) = 0) then
+  begin
+    if (Op = 0) or (Op = 1) then
+      Die('paslang: empty tree');
+    Exit;
+  end;
+  d := PDesc(Desc);
+  stride := d^.KeySize;
+  ksz := d^.KeySize;
+  if Op = 0 then
+  begin
+    node := Leftmost(Pointer(Rd(T, 8)), ksz);
+    CopyBytes(SlotAt(node, 0, stride), OutKey, ksz);
+    Result := True;
+    Exit;
+  end;
+  if Op = 1 then
+  begin
+    node := Rightmost(Pointer(Rd(T, 8)), ksz);
+    CopyBytes(SlotAt(node, Rd(node, OffCount) - 1, stride), OutKey, ksz);
+    Result := True;
+    Exit;
+  end;
+  node := FindLeaf(Pointer(Rd(T, 8)), Key, d);
+  p := LowerLeaf(node, Key, d);
+  if Op = 2 then
+  begin
+    if (p < Rd(node, OffCount)) and (CmpAt(SlotAt(node, p, stride), Key, d) = 0) then
+      p := p + 1;
+    if p >= Rd(node, OffCount) then
+    begin
+      node := Pointer(Rd(node, OffNext));
+      p := 0;
+    end;
+  end
+  else if Op = 3 then
+  begin
+    p := p - 1;
+    if p < 0 then
+    begin
+      node := Pointer(Rd(node, OffPrev));
+      if node <> nil then
+        p := Rd(node, OffCount) - 1;
+    end;
+  end
+  else if Op = 4 then
+  begin
+    if not ((p < Rd(node, OffCount)) and (CmpAt(SlotAt(node, p, stride), Key, d) = 0)) then
+      p := p - 1;
+    if p < 0 then
+    begin
+      node := Pointer(Rd(node, OffPrev));
+      if node <> nil then
+        p := Rd(node, OffCount) - 1;
+    end;
+  end
+  else
+  begin
+    if p >= Rd(node, OffCount) then
+    begin
+      node := Pointer(Rd(node, OffNext));
+      p := 0;
+    end;
+  end;
+  if (node = nil) or (p < 0) then
+  begin
+    if Op = 4 then
+      Die('paslang: tree floor');
+    if Op = 5 then
+      Die('paslang: tree ceil');
+    if Op = 2 then
+      Die('paslang: tree succ');
+    Die('paslang: tree pred');
+  end;
+  CopyBytes(SlotAt(node, p, stride), OutKey, ksz);
+  Result := True;
+end;
+
+function PasTreeRank(T, Key, Desc: Pointer): Integer;
+var
+  d: PDesc;
+  node, ch: Pointer;
+  i, c, ksz, below: Integer;
+begin
+  Result := 0;
+  if (T = nil) or (Rd(T, 0) = 0) then
+    Exit;
+  d := PDesc(Desc);
+  ksz := d^.KeySize;
+  node := Pointer(Rd(T, 8));
+  below := 0;
+  while Rd(node, OffLeaf) = 0 do
+  begin
+    c := Rd(node, OffCount);
+    i := 0;
+    while (i < c) and (CmpAt(Key, IKey(node, i, ksz), d) >= 0) do
+    begin
+      ch := GetChild(node, i, ksz);
+      below := below + Rd(ch, OffTotal);
+      i := i + 1;
+    end;
+    node := GetChild(node, i, ksz);
+  end;
+  Result := below + LowerLeaf(node, Key, d);
+end;
+
+function PasTreeKeyAt(T: Pointer; Index: Integer; OutKey, Desc: Pointer): Boolean;
+var
+  d: PDesc;
+  node, ch: Pointer;
+  i, c, ksz, tot, stride: Integer;
+begin
+  if T = nil then
+    Die('paslang: tree index');
+  if (Index < 0) or (Index >= Rd(T, 0)) then
+    Die('paslang: tree index');
+  d := PDesc(Desc);
+  ksz := d^.KeySize;
+  stride := d^.KeySize;
+  node := Pointer(Rd(T, 8));
+  while Rd(node, OffLeaf) = 0 do
+  begin
+    c := Rd(node, OffCount);
+    i := 0;
+    while i <= c do
+    begin
+      ch := GetChild(node, i, ksz);
+      tot := Rd(ch, OffTotal);
+      if Index < tot then
+        Break;
+      Index := Index - tot;
+      i := i + 1;
+    end;
+    node := GetChild(node, i, ksz);
+  end;
+  CopyBytes(SlotAt(node, Index, stride), OutKey, ksz);
+  Result := True;
+end;
+
+function PasTreePop(T, OutKey, OutVal, Desc: Pointer; Hi: Integer): Boolean;
+var
+  d: PDesc;
+  node: Pointer;
+  idx, stride, ksz: Integer;
+  keyb: array[0..31] of Byte;
+begin
+  Result := False;
+  if (T = nil) or (Rd(T, 0) = 0) then
+    Exit;
+  d := PDesc(Desc);
+  ksz := d^.KeySize;
+  stride := d^.KeySize;
+  if Hi = 0 then
+  begin
+    node := Leftmost(Pointer(Rd(T, 8)), ksz);
+    idx := 0;
+  end
+  else
+  begin
+    node := Rightmost(Pointer(Rd(T, 8)), ksz);
+    idx := Rd(node, OffCount) - 1;
+  end;
+  CopyBytes(SlotAt(node, idx, stride), @keyb[0], ksz);
+  CopyBytes(@keyb[0], OutKey, ksz);
+  if (OutVal <> nil) and (d^.ValSize > 0) then
+    CopyBytes(LeafVal(node, idx, d), OutVal, d^.ValSize);
+  Result := PasTreeDelete(T, @keyb[0], Desc);
+end;
+
+function PasTreeSplit(T, Key, Desc: Pointer): Pointer;
+var
+  d: PDesc;
+  it: array[0..3] of Integer;
+  slot, neu: Pointer;
+  stride: Integer;
+  keyb: array[0..31] of Byte;
+  keys, vals: array of string;
+  nk, i: Integer;
+  raw: string;
+begin
+  if T = nil then
+    Die('paslang: nil tree');
+  d := PDesc(Desc);
+  neu := PasTreeNew(Desc);
+  stride := d^.KeySize;
+  nk := 0;
+  keys := nil;
+  vals := nil;
+  it[0] := 0;
+  it[1] := 0;
+  it[2] := 0;
+  it[3] := 0;
+  slot := PasTreeStep(T, @it[0], Key, nil, nil, Desc);
+  while slot <> nil do
+  begin
+    SetLength(keys, nk + 1);
+    SetLength(vals, nk + 1);
+    raw := '';
+    SetLength(raw, d^.KeySize);
+    CopyBytes(slot, @raw[1], d^.KeySize);
+    keys[nk] := raw;
+    if d^.ValSize > 0 then
+    begin
+      raw := '';
+      SetLength(raw, d^.ValSize);
+      CopyBytes(Pointer(it[3]), @raw[1], d^.ValSize);
+      vals[nk] := raw;
+    end;
+    nk := nk + 1;
+    slot := PasTreeStep(T, @it[0], Key, nil, nil, Desc);
+  end;
+  for i := 0 to nk - 1 do
+  begin
+    CopyBytes(@keys[i][1], @keyb[0], d^.KeySize);
+    PasTreeDelete(T, @keyb[0], Desc);
+  end;
+  for i := 0 to nk - 1 do
+  begin
+    CopyBytes(@keys[i][1], @keyb[0], d^.KeySize);
+    slot := PasTreePut(neu, @keyb[0], Desc);
+    if d^.ValSize > 0 then
+      CopyBytes(@vals[i][1], slot, d^.ValSize);
+  end;
+  Result := neu;
+end;
+
+{ Join(a, b): every entry of b goes into a, b's value winning on a key
+  both hold, and b is left empty. }
+procedure PasTreeJoin(A, B, Desc: Pointer);
+var
+  d: PDesc;
+  it: array[0..3] of Integer;
+  slot: Pointer;
+begin
+  if (A = nil) or (B = nil) then
+    Die('paslang: nil tree');
+  if (Rd(B, 0) = 0) or (A = B) then
+    Exit;
+  d := PDesc(Desc);
+  it[0] := 0;
+  it[1] := 0;
+  it[2] := 0;
+  it[3] := 0;
+  slot := PasTreeStep(B, @it[0], nil, nil, nil, Desc);
+  while slot <> nil do
+  begin
+    if d^.ValSize > 0 then
+      { PasTreePut gives the value's place already }
+      CopyBytes(Pointer(it[3]), PasTreePut(A, slot, Desc), d^.ValSize)
+    else
+      PasTreePut(A, slot, Desc);
+    slot := PasTreeStep(B, @it[0], nil, nil, nil, Desc);
+  end;
+  PasTreeClear(B, Desc);
+end;
+
+function HeapAt(H: Pointer; I, Sz: Integer): Pointer;
+begin
+  Result := Pointer(Rd(H, 16) + I * Sz);
+end;
+
+function PasHeapNew(Desc: Pointer): Pointer;
+var
+  p: Pointer;
+begin
+  { the count, the room, the elements' block (a pointer) and a spare }
+  GetMem(p, 32);
+  Wr(p, 0, 0);
+  Wr(p, 8, 0);
+  Wr(p, 16, 0);
+  Wr(p, 24, 0);
+  Result := p;
+end;
+
+procedure HeapSwap(H: Pointer; I, J, Sz: Integer);
+var
+  a, b: Pointer;
+  tmp: array[0..63] of Byte;
+begin
+  if Sz > 64 then
+    Die('paslang: heap element');
+  a := HeapAt(H, I, Sz);
+  b := HeapAt(H, J, Sz);
+  CopyBytes(a, @tmp[0], Sz);
+  CopyBytes(b, a, Sz);
+  CopyBytes(@tmp[0], b, Sz);
+end;
+
+procedure SiftUp(H: Pointer; I: Integer; D: PDesc);
+var
+  p: Integer;
+begin
+  while I > 0 do
+  begin
+    p := (I - 1) div 2;
+    if CmpAt(HeapAt(H, I, D^.KeySize), HeapAt(H, p, D^.KeySize), D) < 0 then
+    begin
+      HeapSwap(H, I, p, D^.KeySize);
+      I := p;
+    end
+    else
+      Exit;
+  end;
+end;
+
+procedure SiftDown(H: Pointer; I: Integer; D: PDesc);
+var
+  n, left, right, best: Integer;
+begin
+  n := Rd(H, 0);
+  while True do
+  begin
+    left := I * 2 + 1;
+    right := left + 1;
+    best := I;
+    if (left < n) and (CmpAt(HeapAt(H, left, D^.KeySize), HeapAt(H, best, D^.KeySize), D) < 0) then
+      best := left;
+    if (right < n) and (CmpAt(HeapAt(H, right, D^.KeySize), HeapAt(H, best, D^.KeySize), D) < 0) then
+      best := right;
+    if best = I then
+      Exit;
+    HeapSwap(H, I, best, D^.KeySize);
+    I := best;
+  end;
+end;
+
+procedure PasHeapPush(H, Val, Desc: Pointer);
+var
+  d: PDesc;
+  n, room, sz: Integer;
+  neu: Pointer;
+begin
+  if H = nil then
+    Die('paslang: nil heap');
+  d := PDesc(Desc);
+  sz := d^.KeySize;
+  n := Rd(H, 0);
+  room := Rd(H, 8);
+  if n = room then
+  begin
+    if room = 0 then
+      room := 16
+    else
+      room := room * 2;
+    if d^.SlotPtr = 0 then
+      GetMem(neu, room * sz, 0)
+    else
+      GetMem(neu, room * sz);
+    if n > 0 then
+      CopyBytes(Pointer(Rd(H, 16)), neu, n * sz);
+    Wr(H, 16, Integer(neu));
+    Wr(H, 8, room);
+  end;
+  CopyBytes(Val, HeapAt(H, n, sz), sz);
+  Wr(H, 0, n + 1);
+  SiftUp(H, n, d);
+end;
+
+function PasHeapPop(H, OutV, Desc: Pointer): Boolean;
+var
+  d: PDesc;
+  n, sz: Integer;
+begin
+  Result := False;
+  if (H = nil) or (Rd(H, 0) = 0) then
+    Exit;
+  d := PDesc(Desc);
+  sz := d^.KeySize;
+  CopyBytes(HeapAt(H, 0, sz), OutV, sz);
+  n := Rd(H, 0) - 1;
+  Wr(H, 0, n);
+  if n > 0 then
+  begin
+    CopyBytes(HeapAt(H, n, sz), HeapAt(H, 0, sz), sz);
+    SiftDown(H, 0, d);
+  end;
+  Result := True;
+end;
+
+{ Low(h): the top of the heap, its least element, left in place. }
+function PasHeapLow(H, OutV, Desc: Pointer): Boolean;
+var
+  d: PDesc;
+begin
+  Result := False;
+  if (H = nil) or (Rd(H, 0) = 0) then
+    Exit;
+  d := PDesc(Desc);
+  CopyBytes(HeapAt(H, 0, d^.KeySize), OutV, d^.KeySize);
+  Result := True;
+end;
+
+procedure PasHeapEmpty;
+begin
+  Die('paslang: empty heap');
+end;
+
+{ ---- The store (P110): a log-structured merge store on the native
+  tree, after LevelDB's design (docs/ref/trees/leveldb-impl.md) and
+  O'Neil's LSM tree. Two files: <path>, the table, and <path>.wal, the
+  log. A put or a delete goes to the log first, then to the memtable, a
+  tree[string] of string of the values and a tree of string of the
+  deleted keys. A log record carries its CRC32C; on open the log is
+  replayed, and a torn tail (a crash in the middle of a write) is cut
+  off. When the log passes WalFlush bytes, or the store is closed, the
+  memtable becomes a new run of the table: data blocks of about
+  BlockSize bytes holding entries in key order (an entry longer than a
+  block is a block of its own) and an index block with each data
+  block's last key and place, a B+ tree of two levels whose index the
+  store keeps in memory. A read looks at the memtable, then at the runs,
+  the newest first. Past MaxRuns runs they are all merged into one,
+  written to <path>.new and moved over <path> in one rename, which also
+  gives the space of the old runs back; a deleted key is a tombstone in
+  a run until that merge. The header page of the table names the runs
+  and is written after their blocks reached the disk, so a crash
+  between them leaves the old runs whole. ---- }
+
+const
+  StMagic = $54534c50;
+  StVersion = 1;
+  HdrSize = 4096;
+  BlockSize = 4096;
+  WalFlush = 1048576;
+  MaxRuns = 4;
+  OpPut = 1;
+  OpDel = 2;
+
+type
+  TIdx = record
+    Key: string;          { the block's last key }
+    Off, Len: Integer;    { the block in the table }
+  end;
+  TRun = record
+    Off, Len: Integer;    { the data blocks }
+    IdxOff, IdxLen: Integer;
+    Keys: Integer;
+    Index: array of TIdx;
+  end;
+  TStore = record
+    Fd, WFd: Integer;
+    Path: string;
+    Mem, Dead: Pointer;
+    MemDesc, DeadDesc: TDesc;
+    WalBytes: Integer;
+    Used: Integer;        { bytes of the table in use: the header and the runs }
+    Runs: array of TRun;  { the newest last }
+  end;
+  PStore = ^TStore;
+  TRunWriter = record
+    Fd, Start, Pos: Integer;
+    Blk: string;          { the block being filled, its entries }
+    Count: Integer;
+    Last: string;         { the last key in Blk }
+    Parts: array of string;   { the index entries so far }
+    Keys: Integer;
+  end;
+  TCursor = record        { a reader over a run's entries in key order }
+    Run: Integer;
+    Blk: string;
+    BlkIdx, Pos, Left: Integer;
+    Key, Val: string;
+    Tomb, Done: Boolean;
+  end;
+
+function ZPath(const S: string): Pointer;
+var
+  p: Pointer;
+  i: Integer;
+begin
+  GetMem(p, Length(S) + 1, 0);
+  for i := 1 to Length(S) do
+    PChar(Integer(p) + i - 1)^ := S[i];
+  PChar(Integer(p) + Length(S))^ := #0;
+  Result := p;
+end;
+
+function OsOpen(Path: Pointer): Integer;
+begin
+  if Amd64 = 1 then
+    Result := Syscall(2, Integer(Path), 66, 420)
+  else
+    Result := Syscall(56, -100, Integer(Path), 66, 420);
+end;
+
+function OsClose(Fd: Integer): Integer;
+begin
+  if Amd64 = 1 then
+    Result := Syscall(3, Fd)
+  else
+    Result := Syscall(57, Fd);
+end;
+
+function OsPread(Fd, Buf, N, Off: Integer): Integer;
+begin
+  if Amd64 = 1 then
+    Result := Syscall(17, Fd, Buf, N, Off)
+  else
+    Result := Syscall(67, Fd, Buf, N, Off);
+end;
+
+function OsPwrite(Fd, Buf, N, Off: Integer): Integer;
+begin
+  if Amd64 = 1 then
+    Result := Syscall(18, Fd, Buf, N, Off)
+  else
+    Result := Syscall(68, Fd, Buf, N, Off);
+end;
+
+function OsSize(Fd: Integer): Integer;
+begin
+  if Amd64 = 1 then
+    Result := Syscall(8, Fd, 0, 2)
+  else
+    Result := Syscall(62, Fd, 0, 2);
+end;
+
+function OsSync(Fd: Integer): Integer;
+begin
+  if Amd64 = 1 then
+    Result := Syscall(74, Fd)
+  else
+    Result := Syscall(82, Fd);
+end;
+
+function OsTrunc(Fd, N: Integer): Integer;
+begin
+  if Amd64 = 1 then
+    Result := Syscall(77, Fd, N)
+  else
+    Result := Syscall(46, Fd, N);
+end;
+
+function OsRename(OldP, NewP: Pointer): Integer;
+begin
+  if Amd64 = 1 then
+    Result := Syscall(82, Integer(OldP), Integer(NewP))
+  else
+    Result := Syscall(38, -100, Integer(OldP), -100, Integer(NewP));
+end;
+
+{ N bytes at Off of Fd, into or out of Buf, all of them or the program
+  stops. }
+procedure StoreIo(Fd, Off, Buf, N: Integer; WriteIt: Boolean);
+var
+  got: Integer;
+begin
+  while N > 0 do
+  begin
+    if WriteIt then
+      got := OsPwrite(Fd, Buf, N, Off)
+    else
+      got := OsPread(Fd, Buf, N, Off);
+    if got <= 0 then
+      Die('paslang: store io');
+    Off := Off + got;
+    Buf := Buf + got;
+    N := N - got;
+  end;
+end;
+
+function ReadBlock(Fd, Off, Len: Integer): string;
+begin
+  SetLength(Result, Len);
+  if Len > 0 then
+    StoreIo(Fd, Off, Integer(@Result[1]), Len, False);
+end;
+
+procedure WriteAt(Fd, Off: Integer; const Data: string);
+begin
+  if Length(Data) > 0 then
+    StoreIo(Fd, Off, Integer(@Data[1]), Length(Data), True);
+end;
+
+function U32Str(V: Integer): string;
+begin
+  SetLength(Result, 4);
+  StoreLE32(@Result[1], V);
+end;
+
+function U64Str(V: Integer): string;
+begin
+  SetLength(Result, 8);
+  StoreLE64(@Result[1], V);
+end;
+
+{ The parts as one string, in one copy of each. }
+function JoinAll(const Parts: array of string): string;
+var
+  i, n, at: Integer;
+begin
+  n := 0;
+  for i := 0 to High(Parts) do
+    n := n + Length(Parts[i]);
+  SetLength(Result, n);
+  at := 1;
+  for i := 0 to High(Parts) do
+  begin
+    if Length(Parts[i]) > 0 then
+      CopyBytes(@Parts[i][1], @Result[at], Length(Parts[i]));
+    at := at + Length(Parts[i]);
+  end;
+end;
+
+procedure WriteHeader(Fd, Used: Integer; const Runs: array of TRun);
+var
+  h, pad: string;
+  i: Integer;
+begin
+  h := U32Str(StMagic) + U32Str(StVersion) + U64Str(Used) + U32Str(Length(Runs)) + U32Str(0);
+  for i := 0 to High(Runs) do
+    h := h + U64Str(Runs[i].Off) + U64Str(Runs[i].Len) + U64Str(Runs[i].IdxOff) +
+      U64Str(Runs[i].IdxLen) + U64Str(Runs[i].Keys);
+  if Length(h) > HdrSize then
+    Die('paslang: store runs');
+  SetLength(pad, HdrSize - Length(h));
+  for i := 1 to Length(pad) do
+    pad[i] := Char(0);
+  WriteAt(Fd, 0, h + pad);
+end;
+
+procedure LoadIndex(Fd: Integer; var R: TRun);
+var
+  blk: string;
+  p, n, i, klen: Integer;
+begin
+  blk := ReadBlock(Fd, R.IdxOff, R.IdxLen);
+  n := LoadLE32(@blk[1]);
+  SetLength(R.Index, n);
+  p := 5;
+  for i := 0 to n - 1 do
+  begin
+    klen := LoadLE32(@blk[p]);
+    R.Index[i].Key := Copy(blk, p + 4, klen);
+    R.Index[i].Off := LoadLE64(@blk[p + 4 + klen]);
+    R.Index[i].Len := LoadLE64(@blk[p + 12 + klen]);
+    p := p + 20 + klen;
+  end;
+end;
+
+{ The entry of Key in the run: 1 a value (in Val), 2 a tombstone, 0
+  none. The index finds the first block whose last key is not below
+  Key; the block is read and walked. }
+function RunFind(Fd: Integer; const R: TRun; const Key: string; out Val: string): Integer;
+var
+  lo, hi, mid, p, n, i, klen, vlen, fl: Integer;
+  blk, k: string;
+begin
+  Result := 0;
+  lo := 0;
+  hi := Length(R.Index) - 1;
+  while lo < hi do
+  begin
+    mid := (lo + hi) div 2;
+    if R.Index[mid].Key < Key then
+      lo := mid + 1
+    else
+      hi := mid;
+  end;
+  if (lo > High(R.Index)) or (R.Index[lo].Key < Key) then
+    Exit;
+  blk := ReadBlock(Fd, R.Index[lo].Off, R.Index[lo].Len);
+  n := LoadLE32(@blk[1]);
+  p := 5;
+  for i := 0 to n - 1 do
+  begin
+    klen := LoadLE32(@blk[p]);
+    vlen := LoadLE32(@blk[p + 4]);
+    fl := Ord(blk[p + 8]);
+    k := Copy(blk, p + 9, klen);
+    if k = Key then
+    begin
+      if fl = 1 then
+        Result := 2
+      else
+      begin
+        Result := 1;
+        Val := Copy(blk, p + 9 + klen, vlen);
+      end;
+      Exit;
+    end;
+    if k > Key then
+      Exit;
+    p := p + 9 + klen + vlen;
+  end;
+end;
+
+procedure RwOpen(var W: TRunWriter; Fd, Start: Integer);
+begin
+  W.Fd := Fd;
+  W.Start := Start;
+  W.Pos := Start;
+  W.Blk := '';
+  W.Count := 0;
+  W.Last := '';
+  W.Parts := nil;
+  W.Keys := 0;
+end;
+
+procedure RwFlushBlock(var W: TRunWriter);
+var
+  n: Integer;
+begin
+  if W.Count = 0 then
+    Exit;
+  WriteAt(W.Fd, W.Pos, U32Str(W.Count) + W.Blk);
+  n := Length(W.Parts);
+  SetLength(W.Parts, n + 1);
+  W.Parts[n] := U32Str(Length(W.Last)) + W.Last + U64Str(W.Pos) + U64Str(4 + Length(W.Blk));
+  W.Pos := W.Pos + 4 + Length(W.Blk);
+  W.Blk := '';
+  W.Count := 0;
+end;
+
+procedure RwAdd(var W: TRunWriter; const K, V: string; Tomb: Boolean);
+var
+  e: string;
+begin
+  if Tomb then
+    e := U32Str(Length(K)) + U32Str(0) + Char(1) + K
+  else
+    e := U32Str(Length(K)) + U32Str(Length(V)) + Char(0) + K + V;
+  if (W.Count > 0) and (Length(W.Blk) + Length(e) > BlockSize - 4) then
+    RwFlushBlock(W);
+  W.Blk := W.Blk + e;
+  W.Count := W.Count + 1;
+  W.Last := K;
+  W.Keys := W.Keys + 1;
+end;
+
+procedure RwClose(var W: TRunWriter; out R: TRun);
+var
+  idx: string;
+begin
+  RwFlushBlock(W);
+  R.Off := W.Start;
+  R.Len := W.Pos - W.Start;
+  R.IdxOff := W.Pos;
+  idx := U32Str(Length(W.Parts)) + JoinAll(W.Parts);
+  WriteAt(W.Fd, W.Pos, idx);
+  R.IdxLen := Length(idx);
+  R.Keys := W.Keys;
+  R.Index := nil;
+  W.Pos := W.Pos + Length(idx);
+end;
+
+procedure CurLoad(S: PStore; var C: TCursor);
+begin
+  C.Blk := ReadBlock(S^.Fd, S^.Runs[C.Run].Index[C.BlkIdx].Off, S^.Runs[C.Run].Index[C.BlkIdx].Len);
+  C.Left := LoadLE32(@C.Blk[1]);
+  C.Pos := 5;
+end;
+
+procedure CurNext(S: PStore; var C: TCursor);
+var
+  klen, vlen: Integer;
+begin
+  while C.Left = 0 do
+  begin
+    C.BlkIdx := C.BlkIdx + 1;
+    if C.BlkIdx > High(S^.Runs[C.Run].Index) then
+    begin
+      C.Done := True;
+      Exit;
+    end;
+    CurLoad(S, C);
+  end;
+  klen := LoadLE32(@C.Blk[C.Pos]);
+  vlen := LoadLE32(@C.Blk[C.Pos + 4]);
+  C.Tomb := Ord(C.Blk[C.Pos + 8]) = 1;
+  C.Key := Copy(C.Blk, C.Pos + 9, klen);
+  C.Val := Copy(C.Blk, C.Pos + 9 + klen, vlen);
+  C.Pos := C.Pos + 9 + klen + vlen;
+  C.Left := C.Left - 1;
+end;
+
+{ Every run into one, in <path>.new, then moved over <path>: the
+  newest run's entry wins a key, and a tombstone is dropped, since no
+  older run remains under it. }
+procedure Compact(S: PStore);
+var
+  cur: array of TCursor;
+  w: TRunWriter;
+  r: TRun;
+  runs: array of TRun;
+  i, best, nfd: Integer;
+  np, kbest: string;
+begin
+  np := S^.Path + '.new';
+  nfd := OsOpen(ZPath(np));
+  if nfd < 0 then
+    Die('paslang: store open ' + np);
+  if OsTrunc(nfd, 0) < 0 then
+    Die('paslang: store io');
+  SetLength(cur, Length(S^.Runs));
+  for i := 0 to High(cur) do
+  begin
+    cur[i].Run := i;
+    cur[i].BlkIdx := -1;
+    cur[i].Left := 0;
+    cur[i].Done := False;
+    CurNext(S, cur[i]);
+  end;
+  RwOpen(w, nfd, HdrSize);
+  while True do
+  begin
+    best := -1;
+    for i := High(cur) downto 0 do
+      if not cur[i].Done then
+        if (best < 0) or (cur[i].Key < cur[best].Key) then
+          best := i;
+    if best < 0 then
+      Break;
+    { the key kept apart: the winner's cursor moves on inside the loop
+      below, and its next key must not take the others past their own }
+    kbest := cur[best].Key;
+    if not cur[best].Tomb then
+      RwAdd(w, kbest, cur[best].Val, False);
+    for i := 0 to High(cur) do
+      if (not cur[i].Done) and (cur[i].Key = kbest) then
+        CurNext(S, cur[i]);
+  end;
+  RwClose(w, r);
+  if OsSync(nfd) < 0 then
+    Die('paslang: store sync');
+  runs := nil;
+  if r.Keys > 0 then
+  begin
+    SetLength(runs, 1);
+    runs[0] := r;
+  end;
+  WriteHeader(nfd, w.Pos, runs);
+  if OsSync(nfd) < 0 then
+    Die('paslang: store sync');
+  if OsRename(ZPath(np), ZPath(S^.Path)) < 0 then
+    Die('paslang: store rename');
+  OsClose(S^.Fd);
+  S^.Fd := nfd;
+  S^.Used := w.Pos;
+  S^.Runs := runs;
+  if Length(S^.Runs) > 0 then
+    LoadIndex(S^.Fd, S^.Runs[0]);
+end;
+
+{ The memtable as a new run, the log emptied. }
+procedure FlushMem(S: PStore);
+var
+  w: TRunWriter;
+  r: TRun;
+  itm, itd: array[0..3] of Integer;
+  sm, sd: Pointer;
+  km, kd: string;
+  n: Integer;
+begin
+  if (Rd(S^.Mem, 0) = 0) and (Rd(S^.Dead, 0) = 0) then
+    Exit;
+  RwOpen(w, S^.Fd, S^.Used);
+  itm[0] := 0;
+  itm[1] := 0;
+  itm[2] := 0;
+  itm[3] := 0;
+  itd[0] := 0;
+  itd[1] := 0;
+  itd[2] := 0;
+  itd[3] := 0;
+  sm := PasTreeStep(S^.Mem, @itm[0], nil, nil, nil, @S^.MemDesc);
+  sd := PasTreeStep(S^.Dead, @itd[0], nil, nil, nil, @S^.DeadDesc);
+  while (sm <> nil) or (sd <> nil) do
+  begin
+    if sm <> nil then
+      km := PStr(sm)^;
+    if sd <> nil then
+      kd := PStr(sd)^;
+    if (sd = nil) or ((sm <> nil) and (km < kd)) then
+    begin
+      RwAdd(w, km, PStr(Pointer(itm[3]))^, False);
+      sm := PasTreeStep(S^.Mem, @itm[0], nil, nil, nil, @S^.MemDesc);
+    end
+    else if (sm = nil) or (kd < km) then
+    begin
+      RwAdd(w, kd, '', True);
+      sd := PasTreeStep(S^.Dead, @itd[0], nil, nil, nil, @S^.DeadDesc);
+    end
+    else
+    begin
+      RwAdd(w, km, PStr(Pointer(itm[3]))^, False);
+      sm := PasTreeStep(S^.Mem, @itm[0], nil, nil, nil, @S^.MemDesc);
+      sd := PasTreeStep(S^.Dead, @itd[0], nil, nil, nil, @S^.DeadDesc);
+    end;
+  end;
+  RwClose(w, r);
+  if OsSync(S^.Fd) < 0 then
+    Die('paslang: store sync');
+  n := Length(S^.Runs);
+  SetLength(S^.Runs, n + 1);
+  S^.Runs[n] := r;
+  S^.Used := w.Pos;
+  WriteHeader(S^.Fd, S^.Used, S^.Runs);
+  if OsSync(S^.Fd) < 0 then
+    Die('paslang: store sync');
+  LoadIndex(S^.Fd, S^.Runs[n]);
+  PasTreeClear(S^.Mem, @S^.MemDesc);
+  PasTreeClear(S^.Dead, @S^.DeadDesc);
+  if OsTrunc(S^.WFd, 0) < 0 then
+    Die('paslang: store io');
+  S^.WalBytes := 0;
+  if Length(S^.Runs) > MaxRuns then
+    Compact(S);
+end;
+
+{ A put or a delete into the memtable: the key and the value copied,
+  so the caller's strings stay its own. }
+procedure MemApply(S: PStore; Op: Integer; const K, V: string);
+var
+  kk, vv: string;
+  slot: Pointer;
+begin
+  kk := Copy(K, 1, Length(K));
+  if Op = OpPut then
+  begin
+    vv := Copy(V, 1, Length(V));
+    slot := PasTreePut(S^.Mem, @kk, @S^.MemDesc);
+    CopyBytes(@vv, slot, 16);
+    PasTreeDelete(S^.Dead, @kk, @S^.DeadDesc);
+  end
+  else
+  begin
+    PasTreeDelete(S^.Mem, @kk, @S^.MemDesc);
+    PasTreePut(S^.Dead, @kk, @S^.DeadDesc);
+  end;
+end;
+
+procedure AppendWal(S: PStore; Op: Integer; const K, V: string);
+var
+  body, rec: string;
+begin
+  body := Char(Op) + U32Str(Length(K)) + U32Str(Length(V)) + K + V;
+  rec := U32Str(Length(body)) + U32Str(PasCrc32cBase(body, 0)) + body;
+  WriteAt(S^.WFd, S^.WalBytes, rec);
+  S^.WalBytes := S^.WalBytes + Length(rec);
+end;
+
+{ The log replayed into the memtable; a record that is short or whose
+  CRC does not match ends it, and the file is cut there. }
+procedure Replay(S: PStore);
+var
+  size, pos, len, crc, op, klen, vlen: Integer;
+  rh, body: string;
+begin
+  size := OsSize(S^.WFd);
+  pos := 0;
+  while pos + 8 <= size do
+  begin
+    rh := ReadBlock(S^.WFd, pos, 8);
+    len := LoadLE32(@rh[1]);
+    crc := LoadLE32(@rh[5]);
+    if (len < 9) or (pos + 8 + len > size) then
+      Break;
+    body := ReadBlock(S^.WFd, pos + 8, len);
+    if PasCrc32cBase(body, 0) <> crc then
+      Break;
+    op := Ord(body[1]);
+    klen := LoadLE32(@body[2]);
+    vlen := LoadLE32(@body[6]);
+    if (9 + klen + vlen <> len) or ((op <> OpPut) and (op <> OpDel)) then
+      Break;
+    MemApply(S, op, Copy(body, 10, klen), Copy(body, 10 + klen, vlen));
+    pos := pos + 8 + len;
+  end;
+  if pos < size then
+    if OsTrunc(S^.WFd, pos) < 0 then
+      Die('paslang: store io');
+  S^.WalBytes := pos;
+end;
+
+function PasStoreOpen(const Path: string): Pointer;
+var
+  s: PStore;
+  size, n, i, at: Integer;
+  h: string;
+begin
+  New(s);
+  s^.Path := Path;
+  s^.MemDesc.KeyKind := 1;
+  s^.MemDesc.KeySize := 16;
+  s^.MemDesc.ValSize := 16;
+  s^.MemDesc.SlotPtr := 1;
+  s^.DeadDesc.KeyKind := 1;
+  s^.DeadDesc.KeySize := 16;
+  s^.DeadDesc.ValSize := 0;
+  s^.DeadDesc.SlotPtr := 1;
+  s^.Mem := PasTreeNew(@s^.MemDesc);
+  s^.Dead := PasTreeNew(@s^.DeadDesc);
+  s^.Fd := OsOpen(ZPath(Path));
+  if s^.Fd < 0 then
+    Die('paslang: store open ' + Path);
+  size := OsSize(s^.Fd);
+  { A file shorter than the header page is a store only when it starts
+    with the magic (a first open cut off while it wrote the header);
+    anything else is another program's file and is left as it is,
+    before the log is made beside it (1.1.1: it was taken for a new
+    store and overwritten). An empty file is a new store. }
+  if (size > 0) and (size < HdrSize) then
+  begin
+    h := ReadBlock(s^.Fd, 0, size);
+    if (size < 4) or (LoadLE32(@h[1]) <> StMagic) then
+      Die('paslang: store magic ' + Path);
+  end
+  else if size >= HdrSize then
+  begin
+    h := ReadBlock(s^.Fd, 0, HdrSize);
+    if (LoadLE32(@h[1]) <> StMagic) or (LoadLE32(@h[5]) <> StVersion) then
+      Die('paslang: store magic ' + Path);
+  end;
+  s^.WFd := OsOpen(ZPath(Path + '.wal'));
+  if s^.WFd < 0 then
+    Die('paslang: store open ' + Path + '.wal');
+  s^.Runs := nil;
+  if size < HdrSize then
+  begin
+    s^.Used := HdrSize;
+    WriteHeader(s^.Fd, s^.Used, s^.Runs);
+    if OsSync(s^.Fd) < 0 then
+      Die('paslang: store sync');
+  end
+  else
+  begin
+    h := ReadBlock(s^.Fd, 0, HdrSize);
+    if (LoadLE32(@h[1]) <> StMagic) or (LoadLE32(@h[5]) <> StVersion) then
+      Die('paslang: store magic ' + Path);
+    s^.Used := LoadLE64(@h[9]);
+    n := LoadLE32(@h[17]);
+    SetLength(s^.Runs, n);
+    for i := 0 to n - 1 do
+    begin
+      at := 25 + i * 40;
+      s^.Runs[i].Off := LoadLE64(@h[at]);
+      s^.Runs[i].Len := LoadLE64(@h[at + 8]);
+      s^.Runs[i].IdxOff := LoadLE64(@h[at + 16]);
+      s^.Runs[i].IdxLen := LoadLE64(@h[at + 24]);
+      s^.Runs[i].Keys := LoadLE64(@h[at + 32]);
+      LoadIndex(s^.Fd, s^.Runs[i]);
+    end;
+  end;
+  Replay(s);
+  Result := s;
+end;
+
+procedure PasStorePut(S: Pointer; const K, V: string);
+var
+  st: PStore;
+begin
+  if S = nil then
+    Die('paslang: nil store');
+  st := PStore(S);
+  AppendWal(st, OpPut, K, V);
+  MemApply(st, OpPut, K, V);
+  if st^.WalBytes >= WalFlush then
+    FlushMem(st);
+end;
+
+procedure PasStoreDelete(S: Pointer; const K: string);
+var
+  st: PStore;
+begin
+  if S = nil then
+    Die('paslang: nil store');
+  st := PStore(S);
+  AppendWal(st, OpDel, K, '');
+  MemApply(st, OpDel, K, '');
+  if st^.WalBytes >= WalFlush then
+    FlushMem(st);
+end;
+
+{ 1 with the value, 2 deleted, 0 never seen: the memtable, then the
+  runs, the newest first. }
+function StoreLook(S: PStore; const K: string; out V: string): Integer;
+var
+  slot: Pointer;
+  i: Integer;
+begin
+  slot := PasTreeGet(S^.Mem, @K, @S^.MemDesc);
+  if slot <> nil then
+  begin
+    V := PStr(slot)^;
+    Result := 1;
+    Exit;
+  end;
+  if PasTreeGet(S^.Dead, @K, @S^.DeadDesc) <> nil then
+  begin
+    Result := 2;
+    Exit;
+  end;
+  for i := High(S^.Runs) downto 0 do
+  begin
+    Result := RunFind(S^.Fd, S^.Runs[i], K, V);
+    if Result <> 0 then
+      Exit;
+  end;
+  Result := 0;
+end;
+
+function PasStoreGet(S: Pointer; const K: string): string;
+var
+  v: string;
+begin
+  Result := '';
+  if S = nil then
+    Exit;
+  if StoreLook(PStore(S), K, v) = 1 then
+    Result := v;
+end;
+
+function PasStoreHas(S: Pointer; const K: string): Boolean;
+var
+  v: string;
+begin
+  Result := False;
+  if S = nil then
+    Exit;
+  Result := StoreLook(PStore(S), K, v) = 1;
+end;
+
+procedure PasStoreSync(S: Pointer);
+begin
+  if S = nil then
+    Exit;
+  if OsSync(PStore(S)^.WFd) < 0 then
+    Die('paslang: store sync');
+end;
+
+procedure PasStoreClose(S: Pointer);
+var
+  st: PStore;
+begin
+  if S = nil then
+    Exit;
+  st := PStore(S);
+  FlushMem(st);
+  if OsSync(st^.Fd) < 0 then
+    Die('paslang: store sync');
+  OsClose(st^.Fd);
+  OsClose(st^.WFd);
+  st^.Fd := -1;
+  st^.WFd := -1;
+end;
+
+procedure PasStoreAbandon(S: Pointer);
+var
+  st: PStore;
+begin
+  if S = nil then
+    Exit;
+  st := PStore(S);
+  OsClose(st^.Fd);
+  OsClose(st^.WFd);
+  st^.Fd := -1;
+  st^.WFd := -1;
+end;
+
+end.

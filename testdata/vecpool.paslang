@@ -1,0 +1,251 @@
+program vecpool;
+
+{ Vectors kept in registers across the statements of a loop (P107,
+  1.0.128), written by scripts/vecmodel.py with the output its model
+  works out: V128 and V256 accumulators, loads copied to a variable,
+  floats, reductions beside promoted integers, a variable used through a
+  view (not promoted), nested loops with a select and a shift by a
+  variable, a tree deep enough to leave only some variables a register,
+  a global in the main program, and four routines running such loops
+  while the main one allocates, so the collector stops them at their
+  loops' checks, which spill and reload the registers. }
+
+uses
+  paslib;
+
+type
+  PV1 = ^V128;
+  PV2 = ^V256;
+
+var
+  buf: array[0..8191] of Byte;
+  fl: array[0..1023] of Single;
+  seed, i: Integer;
+  gacc: V128;
+  gp: PV1;
+  res: array[0..3] of Integer;
+  cnts: array[0..3] of Integer;
+  done: chan of Integer;
+  junk: string;
+
+function Next: Integer;
+begin
+  seed := seed xor (seed shl 13);
+  seed := seed xor (seed shr 7);
+  seed := seed xor (seed shl 17);
+  Result := seed;
+end;
+
+function H128(v: V128): Integer;
+var
+  j: Integer;
+begin
+  Result := 0;
+  for j := 0 to 15 do
+    Result := Result * 1099511628211 + (v as array[0..15] of Byte)[j];
+end;
+
+function H256(v: V256): Integer;
+var
+  j: Integer;
+begin
+  Result := 0;
+  for j := 0 to 31 do
+    Result := Result * 1099511628211 + (v as array[0..31] of Byte)[j];
+end;
+
+function Dot(n: Integer): Integer;
+var
+  acc, acc2, x: V128;
+  p: PV1;
+  i: Integer;
+begin
+  p := PV1(@buf[0]);
+  acc := VSplat32(0);
+  acc2 := VSplat32(7);
+  for i := 0 to n - 1 do
+  begin
+    x := p[i];
+    acc := VAdd32(acc, VMul32(x, x));
+    acc2 := VXor(acc2, VShrU32(acc, 3));
+  end;
+  Result := H128(acc) * 31 + H128(acc2);
+end;
+
+function Wide(n: Integer): Integer;
+var
+  m, s, x: V256;
+  q: PV2;
+  i: Integer;
+begin
+  q := PV2(@buf[0]);
+  m := VSplat8(0);
+  s := VSplat16(0);
+  for i := 0 to n - 1 do
+  begin
+    x := q[i];
+    m := VMaxU8(m, x);
+    s := VAdd16(s, VZipLo8(x, VSplat8(0)));
+    s := VAdd16(s, VZipHi8(x, VSplat8(0)));
+  end;
+  Result := H256(m) * 31 + H256(s);
+end;
+
+function FDot(n: Integer): Integer;
+var
+  a, b: V256;
+  f: PV2;
+  i: Integer;
+begin
+  f := PV2(@fl[0]);
+  a := VSplatF32(0.0);
+  b := VSplatF32(1.0);
+  for i := 0 to n - 1 do
+  begin
+    a := VAddF32(a, VMulF32(f[i], VSplatF32(0.5)));
+    b := VMaxF32(b, f[i]);
+  end;
+  Result := H256(a) * 31 + H256(b);
+end;
+
+function CountBig(n: Integer): Integer;
+var
+  lim: V128;
+  p: PV1;
+  i, c, s: Integer;
+begin
+  p := PV1(@buf[0]);
+  lim := VSplat8(200);
+  c := 0;
+  s := 0;
+  for i := 0 to n - 1 do
+  begin
+    c := c + PopCount(VMoveMask8(VCmpGtU8(p[i], lim)));
+    s := s + VSumU8(p[i]);
+  end;
+  Result := c * 100000 + s;
+end;
+
+function Declined(n: Integer): Integer;
+var
+  acc: V128;
+  p: PV1;
+  i: Integer;
+begin
+  p := PV1(@buf[0]);
+  acc := VSplat8(1);
+  for i := 0 to n - 1 do
+  begin
+    acc := VAdd8(acc, p[i]);
+    (acc as array[0..15] of Byte)[i and 15] := Byte(i);
+  end;
+  Result := H128(acc);
+end;
+
+function Nested(n: Integer): Integer;
+var
+  a, b, m: V128;
+  p: PV1;
+  i, j, k: Integer;
+begin
+  p := PV1(@buf[0]);
+  a := VSplat16(1);
+  b := VSplat16(-1);
+  m := VSplat16(0);
+  for i := 0 to 7 do
+    for j := 0 to n - 1 do
+    begin
+      k := (i + j) and 15;
+      m := VCmpGtS16(p[j], a);
+      a := VSelect(m, VAdd16(a, VShl16(p[j], k)), VSub16(a, b));
+      b := VAddSatS16(b, VShrS16(a, 2));
+    end;
+  Result := (H128(a) * 31 + H128(b)) * 31 + H128(m);
+end;
+
+function Deep(n: Integer): Integer;
+var
+  a, b, c, d, e, f, g, h: V128;
+  p: PV1;
+  i: Integer;
+begin
+  p := PV1(@buf[0]);
+  a := VSplat8(1);
+  b := VSplat8(2);
+  c := VSplat8(3);
+  d := VSplat8(4);
+  e := VSplat8(5);
+  f := VSplat8(6);
+  g := VSplat8(7);
+  h := VSplat8(8);
+  for i := 0 to n - 1 do
+  begin
+    a := VAdd8(a, VAdd8(b, VAdd8(c, VAdd8(d, VXor(e, p[i])))));
+    b := VSub8(b, a);
+    c := VXor(c, VShl16(b, 1));
+    d := VAvgU8(d, c);
+    e := VMaxU8(e, d);
+    f := VAdd16(f, e);
+    g := VXor(g, f);
+    h := VSub8(h, g);
+  end;
+  Result := H128(a);
+  Result := Result * 31 + H128(b);
+  Result := Result * 31 + H128(c);
+  Result := Result * 31 + H128(d);
+  Result := Result * 31 + H128(e);
+  Result := Result * 31 + H128(f);
+  Result := Result * 31 + H128(g);
+  Result := Result * 31 + H128(h);
+end;
+
+procedure Worker(id: Integer);
+var
+  acc, acc2: V256;
+  q: PV2;
+  r, i, c: Integer;
+begin
+  q := PV2(@buf[0]);
+  acc := VSplat32(id);
+  acc2 := VSplat32(id * 7);
+  c := 0;
+  for r := 1 to 30000 do
+    for i := 0 to 127 do
+    begin
+      acc := VAdd32(acc, q[i]);
+      acc2 := VXor(acc2, VShl32(q[i], 1));
+      c := c + 1;
+    end;
+  res[id] := H256(acc) * 31 + H256(acc2);
+  cnts[id] := c;
+  Send(done, 1);
+end;
+
+begin
+  seed := 7777777;
+  for i := 0 to 1023 do
+    (buf as array[0..1023] of Integer)[i] := Next;
+  for i := 0 to 1023 do
+    fl[i] := ((i * 7) mod 23) - 11;
+  WriteLn('Dot ', Dot(512));
+  WriteLn('Wide ', Wide(256));
+  WriteLn('FDot ', FDot(128));
+  WriteLn('CountBig ', CountBig(512));
+  WriteLn('Declined ', Declined(512));
+  WriteLn('Nested ', Nested(64));
+  WriteLn('Deep ', Deep(256));
+  gp := PV1(@buf[0]);
+  gacc := VSplat8(3);
+  for i := 0 to 511 do
+    gacc := VAvgU8(gacc, gp[i]);
+  WriteLn('Global ', H128(gacc));
+  done := MakeChan(4);
+  for i := 0 to 3 do
+    pas Worker(i);
+  for i := 0 to 200000 do
+    junk := 'x' + IntToStr(i);
+  for i := 0 to 3 do
+    seed := seed + Recv(done);
+  for i := 0 to 3 do
+    WriteLn('worker ', i, ' ', res[i], ' ', cnts[i]);
+end.

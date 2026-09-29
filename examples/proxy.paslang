@@ -1,0 +1,260 @@
+{ A reverse proxy (P119): every connection accepted is joined to a new
+  connection to the backend, and two routines copy the bytes, one each
+  way, until each side ends; the proxy sees no protocol, so HTTP,
+  WebSocket or anything over TCP goes through as it is. Ten thousand
+  connections are twenty thousand parked routines.
+
+    proxy [port] host backendport   listen (8082 by default) and forward
+                                    to host:backendport until killed
+    proxy -selftest [n]             a small HTTP backend, the proxy in
+                                    front, n clients (2000 by default)
+                                    through it with three requests each
+                                    on a kept-alive connection, every
+                                    answer checked, in this same process
+
+  make check runs the self-test on both machines. }
+program proxy;
+
+uses pasnet, paslib;
+
+const
+  Requests = 3;
+
+var
+  forwarded, served, bad: Integer;
+  done: WaitGroup;
+
+function StrToIntDef(const S: string; Def: Integer): Integer;
+var
+  v, i: Integer;
+begin
+  v := 0;
+  if S = '' then
+  begin
+    Result := Def;
+    Exit;
+  end;
+  for i := 1 to Length(S) do
+  begin
+    if (S[i] < '0') or (S[i] > '9') then
+    begin
+      Result := Def;
+      Exit;
+    end;
+    v := v * 10 + Ord(S[i]) - 48;
+  end;
+  Result := v;
+end;
+
+function Token(const S: string; var I: Integer): string;
+var
+  j: Integer;
+begin
+  j := I;
+  while (j <= Length(S)) and (S[j] <> ' ') do
+    j := j + 1;
+  Result := Copy(S, I, j - I);
+  I := j;
+  while (I <= Length(S)) and (S[I] = ' ') do
+    I := I + 1;
+end;
+
+{ ---- the proxy ---- }
+
+{ One direction: what comes from A goes to B until A ends, then B is
+  told there is no more (its write side shut); the last of the two
+  routines to end closes both. }
+procedure Copy1(A, B: Integer; Left: PInteger);
+var
+  data: string;
+begin
+  while True do
+  begin
+    data := TcpRead(A, 65536);
+    if data = '' then
+      Break;
+    if TcpWrite(B, data) < 0 then
+      Break;
+  end;
+  TcpShutdown(B, 1);
+  if AtomicAdd(Left, -1) = 0 then
+  begin
+    TcpClose(A);
+    TcpClose(B);
+    FreeMem(Left);
+  end;
+end;
+
+procedure Relay(C: Integer; const Host: string; Port: Integer);
+var
+  b: Integer;
+  left: PInteger;
+begin
+  b := TcpConnectTo(Host, Port);
+  if b < 0 then
+  begin
+    TcpClose(C);
+    AtomicAdd(@bad, 1);
+    Exit;
+  end;
+  AtomicAdd(@forwarded, 1);
+  GetMem(left, 8);
+  left^ := 2;
+  pas Copy1(C, b, left);
+  Copy1(b, C, left);
+end;
+
+procedure Listen(L: Integer; const Host: string; Port: Integer);
+var
+  c: Integer;
+begin
+  while True do
+  begin
+    c := TcpAccept(L);
+    if c < 0 then
+      Break;
+    pas Relay(c, Host, Port);
+  end;
+end;
+
+{ ---- the backend of the self-test: GET /hello, kept alive ---- }
+
+procedure Backend(C: Integer);
+var
+  buf, line, method, path: string;
+  i: Integer;
+  body: string;
+begin
+  buf := '';
+  while TcpReadLine(C, buf, line) do
+  begin
+    if line = '' then
+      Continue;
+    i := 1;
+    method := Token(line, i);
+    path := Token(line, i);
+    while TcpReadLine(C, buf, line) and (line <> '') do
+      ;
+    if (method = 'GET') and (path = '/hello') then
+      body := 'hello through the proxy' + #10
+    else
+      body := 'no' + #10;
+    if TcpWrite(C, 'HTTP/1.1 200 OK' + #13#10 + 'Content-Length: ' + IntToStr(Length(body)) + #13#10 +
+      'Connection: keep-alive' + #13#10 + #13#10 + body) < 0 then
+      Break;
+    AtomicAdd(@served, 1);
+  end;
+  TcpClose(C);
+end;
+
+procedure BackendListen(L: Integer);
+var
+  c: Integer;
+begin
+  while True do
+  begin
+    c := TcpAccept(L);
+    if c < 0 then
+      Break;
+    pas Backend(c);
+  end;
+end;
+
+{ A client through the proxy: Requests requests on one connection. }
+procedure Client(Port, Id: Integer);
+var
+  c, k, i, n: Integer;
+  buf, line, body: string;
+  ok: Boolean;
+begin
+  c := TcpConnectTo('127.0.0.1', Port);
+  if c < 0 then
+  begin
+    AtomicAdd(@bad, 1);
+    done.Done;
+    Exit;
+  end;
+  buf := '';
+  for k := 1 to Requests do
+  begin
+    if TcpWrite(c, 'GET /hello HTTP/1.1' + #13#10 + 'Host: self' + #13#10 + #13#10) < 0 then
+    begin
+      AtomicAdd(@bad, 1);
+      Break;
+    end;
+    ok := TcpReadLine(c, buf, line) and (line = 'HTTP/1.1 200 OK');
+    n := -1;
+    while ok and TcpReadLine(c, buf, line) and (line <> '') do
+    begin
+      i := 1;
+      if Token(line, i) = 'Content-Length:' then
+        n := StrToIntDef(Token(line, i), -1);
+    end;
+    if ok and (n >= 0) then
+      ok := TcpReadN(c, n, buf, body) and (body = 'hello through the proxy' + #10)
+    else
+      ok := False;
+    if not ok then
+    begin
+      AtomicAdd(@bad, 1);
+      Break;
+    end;
+  end;
+  TcpClose(c);
+  done.Done;
+end;
+
+procedure SelfTest(N: Integer);
+var
+  b, l, i, lim: Integer;
+begin
+  lim := RaiseFdLimit;
+  if lim < 4 * N + 64 then
+    N := (lim - 64) div 4;
+  b := TcpListen(0);
+  l := TcpListen(0);
+  if (b < 0) or (l < 0) then
+  begin
+    WriteLn('proxy: cannot listen');
+    Halt(1);
+  end;
+  pas BackendListen(b);
+  pas Listen(l, '127.0.0.1', TcpPort(b));
+  done.Add(N);
+  for i := 1 to N do
+    pas Client(TcpPort(l), i);
+  done.Wait;
+  WriteLn(N, ' clients, ', forwarded, ' forwarded, ', N * Requests, ' requests, ', served, ' served, ',
+    bad, ' bad');
+  if (forwarded <> N) or (served <> N * Requests) or (bad <> 0) then
+    Halt(1);
+  Halt(0);                { the server routines park for ever: end without waiting for them }
+end;
+
+var
+  port, l: Integer;
+begin
+  if (ParamCount >= 1) and (ParamStr(1) = '-selftest') then
+  begin
+    if ParamCount >= 2 then
+      SelfTest(StrToIntDef(ParamStr(2), 2000))
+    else
+      SelfTest(2000);
+    Exit;
+  end;
+  if ParamCount < 3 then
+  begin
+    WriteLn('proxy [port] host backendport, or proxy -selftest [n]');
+    Halt(2);
+  end;
+  port := StrToIntDef(ParamStr(1), 8082);
+  RaiseFdLimit;
+  l := TcpListenAt('', port, 1024);
+  if l < 0 then
+  begin
+    WriteLn('proxy: cannot listen on port ', port);
+    Halt(1);
+  end;
+  WriteLn('proxy: port ', TcpPort(l), ' to ', ParamStr(2), ':', ParamStr(3));
+  Listen(l, ParamStr(2), StrToIntDef(ParamStr(3), 80));
+end.

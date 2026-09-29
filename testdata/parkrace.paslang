@@ -1,0 +1,116 @@
+{ P82 y P84: rutinas aparcando en sockets, una y otra vez.
+
+  P84: bajo carga se perdia una respuesta de cada cuatrocientas. No era
+  la red: era la misma carrera del asignador que P83. Dos rutinas
+  construyendo cadenas a la vez se llevaban el mismo bloque y una
+  escribia sobre la otra, asi que el 'pong' que llegaba ya no era
+  'pong'. Con rt_alloc atomico no se pierde ninguna.
+
+  P82: routines parking on sockets, over and over. A routine that
+  parks on a file descriptor marks itself parked and then moves to the
+  m stack to run the scheduler loop. Between those two steps another
+  thread can ready it, take it off the queue and run it, and running it
+  writes that thread's m into the G. Reading the m after the mark
+  handed the parking thread somebody else's m, and two threads ended up
+  on one stack: the second returned into nothing.
+
+  The window is a few instructions wide, so it takes a crowd of parks
+  to find it: eight pairs of routines, each pair doing fifty rounds of
+  connect, write, read, close, and every one of those four parks. }
+program parkrace;
+
+uses
+  pasnet, pasroutines;
+
+const
+  Pairs = 8;
+  Rounds = 50;
+
+var
+  wg: TPasWaitGroup;
+  mu: TPasMutex;
+  lfd: Integer;
+  served: Integer;
+  answered: Integer;
+
+procedure Bump(var N: Integer);
+begin
+  PasMutexLock(mu);
+  N := N + 1;
+  PasMutexUnlock(mu);
+end;
+
+{ The listening side: one routine answers every connection in turn. }
+procedure Listen;
+var
+  i, c: Integer;
+  got, part: string;
+begin
+  for i := 1 to Pairs * Rounds do
+  begin
+    c := TcpAccept(lfd);
+    if c < 0 then
+      Break;
+    got := '';
+    while Length(got) < 4 do
+    begin
+      part := TcpRead(c, 64);
+      if Length(part) = 0 then
+        Break;
+      got := got + part;
+    end;
+    if got = 'ping' then
+      if TcpWrite(c, 'pong') = 4 then
+        Bump(served);
+    TcpClose(c);
+  end;
+  PasWaitGroupDone(wg);
+end;
+
+{ The calling side: one routine does its rounds one after another. }
+procedure Caller(Port: Integer);
+var
+  i, c: Integer;
+  got, part: string;
+begin
+  for i := 1 to Rounds do
+  begin
+    c := TcpConnect('127.0.0.1', Port);
+    if c < 0 then
+      Break;
+    if TcpWrite(c, 'ping') = 4 then
+    begin
+      got := '';
+      while Length(got) < 4 do
+      begin
+        part := TcpRead(c, 64);
+        if Length(part) = 0 then
+          Break;
+        got := got + part;
+      end;
+      if got = 'pong' then
+        Bump(answered);
+    end;
+    TcpClose(c);
+  end;
+  PasWaitGroupDone(wg);
+end;
+
+var
+  i, port: Integer;
+
+begin
+  served := 0;
+  answered := 0;
+  lfd := TcpListen(0);
+  if lfd < 0 then
+    Halt(1);
+  port := TcpPort(lfd);
+  PasWaitGroupAdd(wg, 1 + Pairs);
+  pas Listen;
+  for i := 1 to Pairs do
+    pas Caller(port);
+  PasWaitGroupWait(wg);
+  TcpClose(lfd);
+  WriteLn(served, ' ', answered);
+end.

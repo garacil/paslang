@@ -1,0 +1,184 @@
+{ A DNS server over UDP on routines (P114): a table of names and IPv4
+  addresses, an A answer for each, NXDOMAIN for the rest, the question
+  echoed as the protocol asks (RFC 1035). One routine reads datagrams
+  and answers; the peer's address comes with each datagram.
+
+    dnsd [port]             serve (5353 by default) until killed; try
+                            dig @127.0.0.1 -p 5353 one.example
+    dnsd -selftest [n]      n client routines (2000 by default) ask a
+                            name each and check the answer
+
+  The names served: one.example 10.0.0.1, two.example 10.0.0.2, and
+  n.example for any number n up to 65535 as 10.(n div 256).(n mod 256)
+  with a leading 10.0. }
+program dnsd;
+
+uses pasnet, paslib;
+
+var
+  answered, missed, bad: Integer;
+  done: WaitGroup;
+
+{ The address of a name, 0 when the table has none. }
+function Lookup(const Name: string): Integer;
+var
+  n: string;
+  v, i: Integer;
+begin
+  Result := 0;
+  n := Name;
+  if (Length(n) > 0) and (n[Length(n)] = '.') then
+    n := Copy(n, 1, Length(n) - 1);
+  if n = 'one.example' then
+    Result := $0A000001
+  else if n = 'two.example' then
+    Result := $0A000002
+  else if (Length(n) > 8) and (Copy(n, Length(n) - 7, 8) = '.example') then
+  begin
+    v := 0;
+    for i := 1 to Length(n) - 8 do
+    begin
+      if (n[i] < '0') or (n[i] > '9') then
+        Exit;
+      v := v * 10 + Ord(n[i]) - 48;
+      if v > 65535 then
+        Exit;
+    end;
+    Result := $0A000000 + v;
+  end;
+end;
+
+procedure Serve(Fd: Integer);
+var
+  q, host, name, reply: string;
+  port, ip: Integer;
+begin
+  while True do
+  begin
+    q := UdpRecvFrom(Fd, 512, host, port);
+    if q = '' then
+      Break;
+    name := DnsQuestionName(q);
+    if name = '' then
+    begin
+      AtomicAdd(@bad, 1);
+      Continue;
+    end;
+    ip := Lookup(name);
+    if ip = 0 then
+    begin
+      reply := DnsReplyNx(q);
+      AtomicAdd(@missed, 1);
+    end
+    else
+    begin
+      reply := DnsReplyA(q, ip, 60);
+      AtomicAdd(@answered, 1);
+    end;
+    UdpSendTo(Fd, host, port, reply);
+  end;
+end;
+
+{ A client of the self-test: asks for Id.example, expects 10.x.y. }
+procedure Client(Port, Id: Integer);
+var
+  fd, n, p, ip: Integer;
+  q, m, host, got, want: string;
+begin
+  fd := UdpBindAt('', 0);
+  if fd < 0 then
+  begin
+    AtomicAdd(@bad, 1);
+    done.Done;
+    Exit;
+  end;
+  q := DnsQueryA(IntToStr(Id) + '.example', Id and 65535);
+  got := '';
+  { a datagram may be lost: three tries, two seconds each, as a
+    resolver does }
+  for n := 1 to 3 do
+  begin
+    if UdpSendTo(fd, '127.0.0.1', Port, q) < 0 then
+      Break;
+    m := UdpRecvFromMs(fd, 512, 2000, host, p);
+    got := DnsAnswerA(m, Id and 65535);
+    if got <> '' then
+      Break;
+  end;
+  want := '10.0.' + IntToStr(Id shr 8) + '.' + IntToStr(Id and 255);
+  if got <> want then
+    AtomicAdd(@bad, 1);
+  UdpClose(fd);
+  done.Done;
+end;
+
+procedure SelfTest(N: Integer);
+var
+  s, i, port: Integer;
+begin
+  RaiseFdLimit;
+  s := UdpBindAt('', 0);
+  if s < 0 then
+  begin
+    WriteLn('dnsd: cannot bind');
+    Halt(1);
+  end;
+  SockBuffers(s, 8388608, 0);   { the queries of thousands of clients at once }
+  port := UdpPort(s);
+  pas Serve(s);
+  done.Add(N);
+  for i := 1 to N do
+    pas Client(port, i);
+  done.Wait;
+  WriteLn(N, ' clients, ', answered, ' answered, ', missed, ' missed, ', bad, ' bad');
+  if (answered <> N) or (bad <> 0) then
+    Halt(1);
+  Halt(0);                { the server routine parks for ever: end without waiting for it }
+end;
+
+function StrToIntDef(const S: string; Def: Integer): Integer;
+var
+  v, i: Integer;
+begin
+  v := 0;
+  if S = '' then
+  begin
+    Result := Def;
+    Exit;
+  end;
+  for i := 1 to Length(S) do
+  begin
+    if (S[i] < '0') or (S[i] > '9') then
+    begin
+      Result := Def;
+      Exit;
+    end;
+    v := v * 10 + Ord(S[i]) - 48;
+  end;
+  Result := v;
+end;
+
+var
+  port, s: Integer;
+begin
+  if (ParamCount >= 1) and (ParamStr(1) = '-selftest') then
+  begin
+    if ParamCount >= 2 then
+      SelfTest(StrToIntDef(ParamStr(2), 2000))
+    else
+      SelfTest(2000);
+    Exit;
+  end;
+  port := 5353;
+  if ParamCount >= 1 then
+    port := StrToIntDef(ParamStr(1), 5353);
+  s := UdpBindAt('', port);
+  if s < 0 then
+  begin
+    WriteLn('dnsd: cannot bind port ', port);
+    Halt(1);
+  end;
+  SockBuffers(s, 8388608, 0);
+  WriteLn('dnsd: serving one.example, two.example and <n>.example on UDP port ', UdpPort(s));
+  Serve(s);
+end.

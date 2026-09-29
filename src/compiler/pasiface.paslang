@@ -1,0 +1,719 @@
+{$mode objfpc}{$H+}
+
+{ Compiled unit interface (.pi). Not a source include. }
+unit pasiface;
+
+interface
+
+uses
+  pasast;
+
+type
+  TIfaceProc = record
+    Name: string;
+    Sym: string;
+    IsFunc: Boolean;
+    RetTyp: LongInt;
+    ParamTyps: array of LongInt;
+    ByRef: array of Boolean;
+    HasDef: array of Boolean;
+    Def: array of Int64;
+    DefStr: array of string;
+  end;
+
+  TIfaceConst = record
+    Name: string;
+    Value: Int64;
+    Typ: LongInt;
+    Str: string;
+    QLo, QHi: Int64;
+    HasQ: Boolean;
+  end;
+
+  TIfaceVar = record
+    Name: string;
+    Typ: LongInt;
+    Sym: string;
+  end;
+
+  TUnitIface = record
+    Name: string;
+    Checksum: string;
+    UsesNames: TStrArray;
+    DepNames: TStrArray;
+    DepSums: TStrArray;
+    Procs: array of TIfaceProc;
+    Consts: array of TIfaceConst;
+    Vars: array of TIfaceVar;
+    TypeNames: TStrArray;
+    TypeIds: array of LongInt;
+    Types: TTypeDefArray;
+    Safe: Boolean;       { the unit was declared safe (P102) }
+    CheckPtr: Boolean;   { compiled with -checkptr (P104) }
+  end;
+
+function IfaceBody(const Prog: TProgram): string;
+function FormatIface(const Prog: TProgram): string;
+function ParseIface(const Data: string; out Iface: TUnitIface): Boolean;
+
+implementation
+
+uses
+  paslib;
+
+function HexOf(const S: string): string;
+var
+  i, b: SizeInt;
+  function Dig(N: Integer): Char;
+  begin
+    if N < 10 then
+      Result := Char(Ord('0') + N)
+    else
+      Result := Char(Ord('a') + N - 10);
+  end;
+begin
+  Result := 's';
+  for i := 1 to Length(S) do
+  begin
+    b := Ord(S[i]);
+    Result := Result + Dig(b div 16) + Dig(b mod 16);
+  end;
+end;
+
+function Unhex(const T: string; out S: string): Boolean;
+var
+  i, hi, lo: SizeInt;
+  function Val(C: Char): Integer;
+  begin
+    if (C >= '0') and (C <= '9') then
+      Result := Ord(C) - Ord('0')
+    else if (C >= 'a') and (C <= 'f') then
+      Result := Ord(C) - Ord('a') + 10
+    else
+      Result := -1;
+  end;
+begin
+  Result := False;
+  S := '';
+  if (Length(T) < 1) or (T[1] <> 's') then
+    Exit;
+  if ((Length(T) - 1) mod 2) <> 0 then
+    Exit;
+  i := 2;
+  while i < Length(T) do
+  begin
+    hi := Val(T[i]);
+    lo := Val(T[i + 1]);
+    if (hi < 0) or (lo < 0) then
+      Exit;
+    S := S + Char(hi * 16 + lo);
+    i := i + 2;
+  end;
+  Result := True;
+end;
+
+function LineOf(const S: string; var P: SizeInt): string;
+var
+  start: SizeInt;
+begin
+  Result := '';
+  if P > Length(S) then
+    Exit;
+  start := P;
+  while (P <= Length(S)) and (S[P] <> #10) do
+    Inc(P);
+  Result := Copy(S, start, P - start);
+  if (Length(Result) > 0) and (Result[Length(Result)] = #13) then
+    SetLength(Result, Length(Result) - 1);
+  if (P <= Length(S)) and (S[P] = #10) then
+    Inc(P);
+end;
+
+procedure SplitWs(const S: string; var Parts: TStrArray);
+var
+  i, n, start: SizeInt;
+begin
+  Parts := nil;
+  i := 1;
+  while i <= Length(S) do
+  begin
+    while (i <= Length(S)) and ((S[i] = ' ') or (S[i] = #9)) do
+      Inc(i);
+    if i > Length(S) then
+      Break;
+    start := i;
+    while (i <= Length(S)) and (S[i] <> ' ') and (S[i] <> #9) do
+      Inc(i);
+    n := Length(Parts);
+    SetLength(Parts, n + 1);
+    Parts[n] := Copy(S, start, i - start);
+  end;
+end;
+
+function TypeNameOf(const Prog: TProgram; Tid: SizeInt): string;
+var
+  j: SizeInt;
+begin
+  Result := '_';
+  if (Tid < 0) or (Tid > High(Prog.Types)) then
+    Exit;
+  for j := 0 to High(Prog.TypeNames) do
+    if Prog.TypeIds[j] = Tid then
+    begin
+      Result := Prog.TypeNames[j];
+      Exit;
+    end;
+  { a type the implementation named stays its own: an importer may not
+    name it, and it is no reserved name of a core unit (P110) }
+  if (Prog.Types[Tid].Name <> '') and ((Prog.IfaceTypes <= 0) or (Tid < Prog.IfaceTypes)) then
+    Result := Prog.Types[Tid].Name;
+end;
+
+function IfaceBody(const Prog: TProgram): string;
+var
+  i, j, k, tid: SizeInt;
+  line, kind, tname, mname, msym: string;
+  td: TTypeDef;
+begin
+  Result := 'UNIT ' + ToLower(Prog.Name) + #10;
+  { SAFE: a safe unit, which does no raw pointer work (P102). }
+  if Prog.Safe then
+    Result := Result + 'SAFE' + #10;
+  { CHECKPTR: compiled with -checkptr (P104). }
+  if Prog.CheckPtr then
+    Result := Result + 'CHECKPTR' + #10;
+  for i := 0 to High(Prog.UsesNames) do
+    Result := Result + 'USE ' + ToLower(Prog.UsesNames[i]) + #10;
+  { CONST name value [kind [hex]]: no kind is an integer, as it always
+    was; s is a string with its bytes in hex, r a real (value = bits),
+    b a Boolean, c a Char (P97). }
+  for i := 0 to High(Prog.Consts) do
+  begin
+    line := 'CONST ' + Prog.Consts[i].Name + ' ' + IntToStr(Prog.Consts[i].Value);
+    if Prog.Consts[i].Typ = TyString then
+      line := line + ' s ' + HexOf(Prog.Consts[i].Str)
+    else if Prog.Consts[i].Typ = TyReal then
+    begin
+      { r, then the binary128 words a Quad takes it with (1.0.115); a
+        reader before then stops at r. }
+      line := line + ' r';
+      if Prog.Consts[i].HasQ then
+        line := line + ' ' + IntToStr(Prog.Consts[i].QLo) + ' ' + IntToStr(Prog.Consts[i].QHi);
+    end
+    else if Prog.Consts[i].Typ = TyBoolean then
+      line := line + ' b'
+    else if Prog.Consts[i].Typ = TyChar then
+      line := line + ' c';
+    Result := Result + line + #10;
+  end;
+  for tid := 0 to High(Prog.Types) do
+  begin
+    td := Prog.Types[tid];
+    if (td.Kind = tykNone) and (td.Name = '') and (Length(td.Fields) = 0) then
+      Continue;
+    tname := TypeNameOf(Prog, tid);
+    Result := Result + 'TYPE ' + tname + ' ' + IntToStr(tid) + ' ' +
+      IntToStr(Ord(td.Kind)) + ' ' + IntToStr(td.Size) + ' ' +
+      IntToStr(td.Elem) + ' ' + IntToStr(td.Lo) + ' ' + IntToStr(td.Hi) + ' ' +
+      IntToStr(Length(td.Fields)) + ' ' + IntToStr(td.Elem2) + #10;
+    { CLASS parent vmtn iface...: a class's or an interface's parent, its
+      VMT's length and the interfaces it implements (PASLANGI13, 1.0.137):
+      an importer lost them, so a descendant's new virtual methods took
+      the parent's slots and an imported class implemented nothing. }
+    if (td.Kind = tykClass) or (td.Kind = tykInterface) then
+    begin
+      line := 'CLASS ' + IntToStr(td.Parent) + ' ' + IntToStr(td.VmtN);
+      for j := 0 to High(td.Ifaces) do
+        line := line + ' ' + IntToStr(td.Ifaces[j]);
+      Result := Result + line + #10;
+    end;
+    { FLD name off typ vis: vis is the member's visibility (1.0.137) }
+    for j := 0 to High(td.Fields) do
+      Result := Result + 'FLD ' + td.Fields[j].Name + ' ' +
+        IntToStr(td.Fields[j].Off) + ' ' + IntToStr(td.Fields[j].Typ) + ' ' +
+        IntToStr(td.Fields[j].Vis) + #10;
+    for j := 0 to High(td.Meths) do
+    begin
+      { A routine type keeps its signature in Meths[0] and has no name
+        and no symbol; an empty word would swallow a space and the line
+        would not read back, so it is written as _ (P81). }
+      mname := td.Meths[j].Name;
+      if mname = '' then
+        mname := '_';
+      msym := td.Meths[j].Sym;
+      if msym = '' then
+        msym := '_';
+      line := 'METH ' + mname + ' ' + msym + ' ';
+      if td.Meths[j].IsCtor then
+        line := line + '1 '
+      else
+        line := line + '0 ';
+      if td.Meths[j].IsVirt then
+        line := line + '1 '
+      else
+        line := line + '0 ';
+      if td.Meths[j].IsFunc then
+        line := line + '1 '
+      else
+        line := line + '0 ';
+      { the visibility after the result type (1.0.137) }
+      line := line + IntToStr(td.Meths[j].Slot) + ' ' +
+        IntToStr(td.Meths[j].NParams) + ' ' + IntToStr(td.Meths[j].RetTyp) + ' ' +
+        IntToStr(td.Meths[j].Vis);
+      for k := 0 to High(td.Meths[j].ParamTyps) do
+        line := line + ' ' + IntToStr(td.Meths[j].ParamTyps[k]);
+      for k := 0 to High(td.Meths[j].ByRef) do
+        if td.Meths[j].ByRef[k] then
+          line := line + ' 1'
+        else
+          line := line + ' 0';
+      if td.Meths[j].IsAbs then
+        line := line + ' 1';
+      Result := Result + line + #10;
+    end;
+    { PROP name typ read write readoff writeoff nindex published vis: a
+      class's properties (1.0.137; an importer had none); _ for no
+      accessor }
+    for j := 0 to High(td.Props) do
+    begin
+      mname := td.Props[j].ReadName;
+      if mname = '' then
+        mname := '_';
+      msym := td.Props[j].WriteName;
+      if msym = '' then
+        msym := '_';
+      line := 'PROP ' + td.Props[j].Name + ' ' + IntToStr(td.Props[j].Typ) + ' ' +
+        mname + ' ' + msym + ' ' + IntToStr(td.Props[j].ReadOff) + ' ' +
+        IntToStr(td.Props[j].WriteOff) + ' ' + IntToStr(td.Props[j].NIndex);
+      if td.Props[j].IsPublished then
+        line := line + ' 1'
+      else
+        line := line + ' 0';
+      Result := Result + line + ' ' + IntToStr(td.Props[j].Vis) + #10;
+    end;
+  end;
+  { VAR name type symbol: a global of the interface (1.0.76). An old
+    loader skips the line. }
+  for i := 0 to High(Prog.Vars) do
+    if Prog.Vars[i].Pub and (not Prog.Vars[i].Ext) and (Prog.Vars[i].Sym <> '') then
+      Result := Result + 'VAR ' + Prog.Vars[i].Name + ' ' + IntToStr(Prog.Vars[i].Typ) +
+        ' ' + Prog.Vars[i].Sym + #10;
+  for i := 0 to High(Prog.Procs) do
+  begin
+    if not Prog.Procs[i].InIface then
+      Continue;
+    if Prog.Procs[i].IsFunc then
+      kind := 'F'
+    else
+      kind := 'P';
+    line := 'FUNC ' + Prog.Procs[i].Name + ' ' + Prog.Procs[i].Sym + ' ' +
+      kind + ' ' + IntToStr(Prog.Procs[i].RetTyp) + ' ' +
+      IntToStr(Length(Prog.Procs[i].Params));
+    for j := 0 to High(Prog.Procs[i].Params) do
+      line := line + ' ' + IntToStr(Prog.Procs[i].Params[j].Typ);
+    for j := 0 to High(Prog.Procs[i].Params) do
+      if Prog.Procs[i].Params[j].ByRef then
+        line := line + ' 1'
+      else
+        line := line + ' 0';
+    for j := 0 to High(Prog.Procs[i].Params) do
+      if Prog.Procs[i].Params[j].HasDef then
+      begin
+        if (Prog.Procs[i].Params[j].Typ >= 0) and
+          (Prog.Procs[i].Params[j].Typ <= High(Prog.Types)) and
+          ((Prog.Types[Prog.Procs[i].Params[j].Typ].Kind = tykString) or
+          (Prog.Types[Prog.Procs[i].Params[j].Typ].Kind = tykQuad)) then
+          line := line + ' ' + IntToStr(j) + ' ' + HexOf(Prog.Procs[i].Params[j].DefStr)
+        else
+          line := line + ' ' + IntToStr(j) + ' ' + IntToStr(Prog.Procs[i].Params[j].Def);
+      end;
+    Result := Result + line + #10;
+  end;
+end;
+
+{ PASLANGI13 (1.0.137): every member of a class says its visibility
+  (FLD, METH, PROP), a class its parent, VMT length and interfaces
+  (CLASS), and its properties are there (PROP).
+  PASLANGI12 (1.0.133): a routine value is 16 bytes, its code and an
+  environment, and a nested routine's entry says its depth.
+  PASLANGI11 (1.0.125): V128 and V256 are builtin ids 15 and 16, so
+  every type after the builtins moved by two.
+  PASLANGI10 (1.0.114): Quad is builtin id 14, so every type after the
+  builtins moved by one.
+  PASLANGI9 (1.0.110): a unit compiled with -checkptr says CHECKPTR.
+  PASLANGI8 (1.0.108): a safe unit says SAFE after its name.
+  PASLANGI7 (1.0.104): Single is IEEE binary32 in 4 bytes, so a record
+  holding one lies otherwise than in a PASLANGI6 unit.
+  PASLANGI6 (1.0.91): the narrow integers are 1, 2 and 4 bytes and a
+  record's fields lie at their natural alignment, so a PASLANGI5 unit's
+  layouts are others. PASLANGI5 (1.0.87): the narrow integers have builtin ids 6 to 11 and
+  Single and Pointer 12 and 13 (pasast), so a unit's own types start at
+  14; the loader refuses a PASLANGI4 unit, and checks the builtins a .pi
+  lists against its own. PASLANGI4 (1.0.58): a field that holds a pointer starts on a word, so
+  the offsets of a PASLANGI3 unit's records may be others, and the
+  loader refuses one. PASLANGI3 (1.0.55): as PASLANGI2, whose units did
+  not yet list their globals for the collector (the pasgcroots
+  section). PASLANGI2 (1.0.49): after the body, whose checksum is SUM, one line
+  DEP name sum for every unit that was loaded while this one compiled,
+  the core units too, with the SUM its interface had then. The loader
+  refuses a unit whose DEP no longer matches: its copy of those types
+  is another version (a unit compiled against the three-word mutex
+  would lay out the four-word one wrong). The DEP lines stay outside
+  SUM, so a unit's checksum changes only with its own interface and two
+  units that use each other can both be current. }
+function FormatIface(const Prog: TProgram): string;
+var
+  body, deps: string;
+  i: SizeInt;
+begin
+  body := IfaceBody(Prog);
+  deps := '';
+  for i := 0 to High(Prog.DepNames) do
+    if i <= High(Prog.DepSums) then
+      deps := deps + 'DEP ' + ToLower(Prog.DepNames[i]) + ' ' + Prog.DepSums[i] + #10;
+  Result := 'PASLANGI13' + #10 + 'SUM ' + HashHex(body) + #10 + body + deps;
+end;
+
+function ParseIface(const Data: string; out Iface: TUnitIface): Boolean;
+var
+  p: SizeInt;
+  line: string;
+  parts: TStrArray;
+  n, np, i, k, tid, base, idx: SizeInt;
+  v: Int64;
+  body, got: string;
+  cur: LongInt;
+  dp: SizeInt;
+begin
+  Result := False;
+  Iface := Default(TUnitIface);
+  Iface.UsesNames := nil;
+  Iface.Procs := nil;
+  Iface.Consts := nil;
+  Iface.TypeNames := nil;
+  Iface.Types := nil;
+  cur := -1;
+  parts := nil;
+  p := 1;
+  line := LineOf(Data, p);
+  if line <> 'PASLANGI13' then
+    Exit;
+  line := LineOf(Data, p);
+  SplitWs(line, parts);
+  if (Length(parts) <> 2) or (parts[0] <> 'SUM') then
+    Exit;
+  Iface.Checksum := parts[1];
+  { The body ends where the DEP lines start. }
+  dp := p;
+  while (dp <= Length(Data)) and (Copy(Data, dp, 4) <> 'DEP ') do
+  begin
+    while (dp <= Length(Data)) and (Data[dp] <> #10) do
+      Inc(dp);
+    Inc(dp);
+  end;
+  body := Copy(Data, p, dp - p);
+  got := HashHex(body);
+  if got <> Iface.Checksum then
+    Exit;
+  while p <= Length(Data) do
+  begin
+    line := LineOf(Data, p);
+    if line = '' then
+      Continue;
+    SplitWs(line, parts);
+    if Length(parts) = 0 then
+      Continue;
+    if (parts[0] = 'UNIT') and (Length(parts) >= 2) then
+      Iface.Name := parts[1]
+    else if (parts[0] = 'CONST') and (Length(parts) >= 3) then
+    begin
+      n := Length(Iface.Consts);
+      SetLength(Iface.Consts, n + 1);
+      Iface.Consts[n].Name := parts[1];
+      if not StrToInt64(parts[2], v) then
+        Exit;
+      Iface.Consts[n].Value := v;
+      Iface.Consts[n].Typ := TyInteger;
+      Iface.Consts[n].Str := '';
+      if Length(parts) >= 4 then
+      begin
+        if parts[3] = 's' then
+        begin
+          Iface.Consts[n].Typ := TyString;
+          if Length(parts) >= 5 then
+            if not Unhex(parts[4], Iface.Consts[n].Str) then
+              Exit;
+        end
+        else if parts[3] = 'r' then
+        begin
+          Iface.Consts[n].Typ := TyReal;
+          if (Length(parts) >= 6) and StrToInt64(parts[4], v) then
+          begin
+            Iface.Consts[n].QLo := v;
+            if StrToInt64(parts[5], v) then
+            begin
+              Iface.Consts[n].QHi := v;
+              Iface.Consts[n].HasQ := True;
+            end;
+          end;
+        end
+        else if parts[3] = 'b' then
+          Iface.Consts[n].Typ := TyBoolean
+        else if parts[3] = 'c' then
+          Iface.Consts[n].Typ := TyChar;
+      end;
+    end
+    else if (parts[0] = 'TYPE') and (Length(parts) >= 8) then
+    begin
+      if not StrToInt64(parts[2], v) then
+        Exit;
+      tid := SizeInt(v);
+      if parts[1] <> '_' then
+      begin
+        n := Length(Iface.TypeNames);
+        SetLength(Iface.TypeNames, n + 1);
+        SetLength(Iface.TypeIds, n + 1);
+        Iface.TypeNames[n] := parts[1];
+        Iface.TypeIds[n] := LongInt(tid);
+      end;
+      if tid >= Length(Iface.Types) then
+        SetLength(Iface.Types, tid + 1);
+      Iface.Types[tid] := Default(TTypeDef);
+      if parts[1] <> '_' then
+        Iface.Types[tid].Name := parts[1];
+      if not StrToInt64(parts[3], v) then
+        Exit;
+      Iface.Types[tid].Kind := TTypeKind(v);
+      if not StrToInt64(parts[4], v) then
+        Exit;
+      Iface.Types[tid].Size := LongInt(v);
+      if not StrToInt64(parts[5], v) then
+        Exit;
+      Iface.Types[tid].Elem := LongInt(v);
+      if not StrToInt64(parts[6], v) then
+        Exit;
+      Iface.Types[tid].Lo := v;
+      if not StrToInt64(parts[7], v) then
+        Exit;
+      Iface.Types[tid].Hi := v;
+      { parts[8] is the field count. parts[9] is the value type of a
+        map; older interfaces stop at the field count. }
+      Iface.Types[tid].Elem2 := 0;
+      if Length(parts) >= 10 then
+      begin
+        if not StrToInt64(parts[9], v) then
+          Exit;
+        Iface.Types[tid].Elem2 := LongInt(v);
+      end;
+      cur := LongInt(tid);
+      Iface.Types[tid].Fields := nil;
+      Iface.Types[tid].Meths := nil;
+      Iface.Types[tid].Props := nil;
+    end
+    else if (parts[0] = 'FLD') and (Length(parts) >= 4) and (cur >= 0) then
+    begin
+      n := Length(Iface.Types[cur].Fields);
+      SetLength(Iface.Types[cur].Fields, n + 1);
+      Iface.Types[cur].Fields[n].Name := parts[1];
+      if not StrToInt64(parts[2], v) then
+        Exit;
+      Iface.Types[cur].Fields[n].Off := LongInt(v);
+      if not StrToInt64(parts[3], v) then
+        Exit;
+      Iface.Types[cur].Fields[n].Typ := LongInt(v);
+      if not StrToInt64(parts[4], v) then
+        Exit;
+      Iface.Types[cur].Fields[n].Vis := Byte(v);
+    end
+    else if (parts[0] = 'CLASS') and (Length(parts) >= 3) and (cur >= 0) then
+    begin
+      if not StrToInt64(parts[1], v) then
+        Exit;
+      Iface.Types[cur].Parent := LongInt(v);
+      if not StrToInt64(parts[2], v) then
+        Exit;
+      Iface.Types[cur].VmtN := LongInt(v);
+      SetLength(Iface.Types[cur].Ifaces, Length(parts) - 3);
+      for i := 3 to High(parts) do
+      begin
+        if not StrToInt64(parts[i], v) then
+          Exit;
+        Iface.Types[cur].Ifaces[i - 3] := LongInt(v);
+      end;
+    end
+    else if (parts[0] = 'PROP') and (Length(parts) = 10) and (cur >= 0) then
+    begin
+      n := Length(Iface.Types[cur].Props);
+      SetLength(Iface.Types[cur].Props, n + 1);
+      Iface.Types[cur].Props[n].Name := parts[1];
+      if not StrToInt64(parts[2], v) then
+        Exit;
+      Iface.Types[cur].Props[n].Typ := LongInt(v);
+      Iface.Types[cur].Props[n].ReadName := parts[3];
+      if parts[3] = '_' then
+        Iface.Types[cur].Props[n].ReadName := '';
+      Iface.Types[cur].Props[n].WriteName := parts[4];
+      if parts[4] = '_' then
+        Iface.Types[cur].Props[n].WriteName := '';
+      if not StrToInt64(parts[5], v) then
+        Exit;
+      Iface.Types[cur].Props[n].ReadOff := LongInt(v);
+      if not StrToInt64(parts[6], v) then
+        Exit;
+      Iface.Types[cur].Props[n].WriteOff := LongInt(v);
+      if not StrToInt64(parts[7], v) then
+        Exit;
+      Iface.Types[cur].Props[n].NIndex := LongInt(v);
+      Iface.Types[cur].Props[n].IsPublished := parts[8] <> '0';
+      if not StrToInt64(parts[9], v) then
+        Exit;
+      Iface.Types[cur].Props[n].Vis := Byte(v);
+    end
+    else if (parts[0] = 'METH') and (Length(parts) >= 10) and (cur >= 0) then
+    begin
+      n := Length(Iface.Types[cur].Meths);
+      SetLength(Iface.Types[cur].Meths, n + 1);
+      Iface.Types[cur].Meths[n].Name := parts[1];
+      if parts[1] = '_' then
+        Iface.Types[cur].Meths[n].Name := '';
+      Iface.Types[cur].Meths[n].Sym := parts[2];
+      if parts[2] = '_' then
+        Iface.Types[cur].Meths[n].Sym := '';
+      Iface.Types[cur].Meths[n].IsCtor := parts[3] <> '0';
+      Iface.Types[cur].Meths[n].IsVirt := parts[4] <> '0';
+      Iface.Types[cur].Meths[n].IsFunc := parts[5] <> '0';
+      if not StrToInt64(parts[6], v) then
+        Exit;
+      Iface.Types[cur].Meths[n].Slot := LongInt(v);
+      if not StrToInt64(parts[7], v) then
+        Exit;
+      np := SizeInt(v);
+      Iface.Types[cur].Meths[n].NParams := LongInt(np);
+      if not StrToInt64(parts[8], v) then
+        Exit;
+      Iface.Types[cur].Meths[n].RetTyp := LongInt(v);
+      if not StrToInt64(parts[9], v) then
+        Exit;
+      Iface.Types[cur].Meths[n].Vis := Byte(v);
+      SetLength(Iface.Types[cur].Meths[n].ParamTyps, np);
+      SetLength(Iface.Types[cur].Meths[n].ByRef, np);
+      if (Length(parts) <> 10 + np) and (Length(parts) <> 10 + 2 * np) and
+        (Length(parts) <> 10 + 2 * np + 1) then
+        Exit;
+      for i := 0 to np - 1 do
+      begin
+        k := 10 + i;
+        if not StrToInt64(parts[k], v) then
+          Exit;
+        Iface.Types[cur].Meths[n].ParamTyps[i] := LongInt(v);
+      end;
+      if Length(parts) >= 10 + 2 * np then
+        for i := 0 to np - 1 do
+        begin
+          k := 10 + np + i;
+          if not StrToInt64(parts[k], v) then
+            Exit;
+          Iface.Types[cur].Meths[n].ByRef[i] := v <> 0;
+        end;
+      Iface.Types[cur].Meths[n].IsAbs := False;
+      if Length(parts) = 10 + 2 * np + 1 then
+      begin
+        if not StrToInt64(parts[Length(parts) - 1], v) then
+          Exit;
+        Iface.Types[cur].Meths[n].IsAbs := v <> 0;
+      end;
+    end
+    else if (parts[0] = 'SAFE') and (Length(parts) = 1) then
+      Iface.Safe := True
+    else if (parts[0] = 'CHECKPTR') and (Length(parts) = 1) then
+      Iface.CheckPtr := True
+    else if (parts[0] = 'USE') and (Length(parts) >= 2) then
+    begin
+      n := Length(Iface.UsesNames);
+      SetLength(Iface.UsesNames, n + 1);
+      Iface.UsesNames[n] := parts[1];
+    end
+    else if (parts[0] = 'VAR') and (Length(parts) = 4) then
+    begin
+      n := Length(Iface.Vars);
+      SetLength(Iface.Vars, n + 1);
+      Iface.Vars[n].Name := parts[1];
+      if not StrToInt64(parts[2], v) then
+        Exit;
+      Iface.Vars[n].Typ := LongInt(v);
+      Iface.Vars[n].Sym := parts[3];
+    end
+    else if (parts[0] = 'DEP') and (Length(parts) = 3) then
+    begin
+      n := Length(Iface.DepNames);
+      SetLength(Iface.DepNames, n + 1);
+      SetLength(Iface.DepSums, n + 1);
+      Iface.DepNames[n] := parts[1];
+      Iface.DepSums[n] := parts[2];
+    end
+    else if (parts[0] = 'FUNC') and (Length(parts) >= 6) then
+    begin
+      n := Length(Iface.Procs);
+      SetLength(Iface.Procs, n + 1);
+      Iface.Procs[n].Name := parts[1];
+      Iface.Procs[n].Sym := parts[2];
+      Iface.Procs[n].IsFunc := parts[3] = 'F';
+      if not StrToInt64(parts[4], v) then
+        Exit;
+      Iface.Procs[n].RetTyp := LongInt(v);
+      if not StrToInt64(parts[5], v) then
+        Exit;
+      np := SizeInt(v);
+      SetLength(Iface.Procs[n].ParamTyps, np);
+      SetLength(Iface.Procs[n].ByRef, np);
+      SetLength(Iface.Procs[n].HasDef, np);
+      SetLength(Iface.Procs[n].Def, np);
+      SetLength(Iface.Procs[n].DefStr, np);
+      base := 6 + np;
+      if Length(parts) >= 6 + 2 * np then
+        base := 6 + 2 * np;
+      if Length(parts) < base then
+        Exit;
+      if ((Length(parts) - base) mod 2) <> 0 then
+        Exit;
+      for i := 0 to np - 1 do
+      begin
+        k := 6 + i;
+        if not StrToInt64(parts[k], v) then
+          Exit;
+        Iface.Procs[n].ParamTyps[i] := LongInt(v);
+      end;
+      if base = 6 + 2 * np then
+        for i := 0 to np - 1 do
+        begin
+          k := 6 + np + i;
+          if not StrToInt64(parts[k], v) then
+            Exit;
+          Iface.Procs[n].ByRef[i] := v <> 0;
+        end;
+      k := base;
+      while k < Length(parts) do
+      begin
+        if not StrToInt64(parts[k], v) then
+          Exit;
+        idx := SizeInt(v);
+        if (idx < 0) or (idx >= np) then
+          Exit;
+        if not StrToInt64(parts[k + 1], v) then
+        begin
+          if not Unhex(parts[k + 1], Iface.Procs[n].DefStr[idx]) then
+            Exit;
+          v := 0;
+        end;
+        Iface.Procs[n].HasDef[idx] := True;
+        Iface.Procs[n].Def[idx] := v;
+        k := k + 2;
+      end;
+    end
+    else
+      Exit;
+  end;
+  Result := Iface.Name <> '';
+end;
+
+end.

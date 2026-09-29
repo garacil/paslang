@@ -1,0 +1,1211 @@
+{$mode objfpc}{$H+}
+unit pasquad;
+
+{ IEEE binary128 in software (P103): only integer work, so the same bits
+  on amd64 and arm64. A value is two words as it lies in memory: Lo, the
+  low 64 bits of the fraction; Hi, the sign (bit 63), the exponent (bits
+  62 to 48, bias 16383) and the top 48 bits of the fraction. Every
+  routine takes the words by value and gives the result's words through
+  out parameters, so the unit needs no Quad type of its own and compiles
+  with any paslang and with FPC. Rounding is to the nearest, a tie to
+  even; subnormals are kept; an invalid operation gives the quiet NaN
+  with Hi = $7FFF800000000000, and a NaN operand comes back quiet. }
+
+interface
+
+procedure PasQAdd(ALo, AHi, BLo, BHi: Int64; out RLo, RHi: Int64);
+procedure PasQSub(ALo, AHi, BLo, BHi: Int64; out RLo, RHi: Int64);
+procedure PasQMul(ALo, AHi, BLo, BHi: Int64; out RLo, RHi: Int64);
+procedure PasQDiv(ALo, AHi, BLo, BHi: Int64; out RLo, RHi: Int64);
+procedure PasQSqrt(ALo, AHi: Int64; out RLo, RHi: Int64);
+function PasQCmp(ALo, AHi, BLo, BHi: Int64): Int64;
+procedure PasQFromInt(I: Int64; out RLo, RHi: Int64);
+procedure PasQFromDouble(D: Int64; out RLo, RHi: Int64);
+function PasQToDouble(ALo, AHi: Int64): Int64;
+function PasQToSingle(ALo, AHi: Int64): Int64;
+function PasQToInt(ALo, AHi, Mode: Int64; out Ok: Boolean): Int64;
+procedure PasQInt(ALo, AHi: Int64; out RLo, RHi: Int64);
+
+implementation
+
+const
+  SignBit = -9223372036854775807 - 1;
+  Frac48 = 281474976710655;
+  Hidden48 = 281474976710656;
+  QuietHi = 140737488355328;
+  InfHi = 9223090561878065152;
+  NaNHi = 9223231299366420480;
+  Low32 = 4294967295;
+
+{ A < B as unsigned 64-bit numbers. }
+function ULt(A, B: Int64): Boolean;
+begin
+  Result := (A xor SignBit) < (B xor SignBit);
+end;
+
+{ H:L is one unsigned 128-bit number, H the high word. }
+function Lt128(AH, AL, BH, BL: Int64): Boolean;
+begin
+  if AH <> BH then
+    Result := ULt(AH, BH)
+  else
+    Result := ULt(AL, BL);
+end;
+
+{ The 128-bit sums and differences: add and adc, sub and sbb with
+  paslang's own words (P106, 1.0.122), an unsigned compare for the carry
+  where FPC builds this unit. }
+procedure Add128(var H, L: Int64; BH, BL: Int64);
+var
+  t: Int64;
+{$ifdef PASLANG}
+  c: Int64;
+{$endif}
+begin
+{$ifdef PASLANG}
+  L := AddCarry(L, BL, 0, c);
+  H := AddCarry(H, BH, c, c);
+{$else}
+  t := L + BL;
+  H := H + BH;
+  if ULt(t, L) then
+    H := H + 1;
+  L := t;
+{$endif}
+end;
+
+procedure Sub128(var H, L: Int64; BH, BL: Int64);
+{$ifdef PASLANG}
+var
+  b: Int64;
+{$endif}
+begin
+{$ifdef PASLANG}
+  L := SubBorrow(L, BL, 0, b);
+  H := SubBorrow(H, BH, b, b);
+{$else}
+  if ULt(L, BL) then
+    H := H - 1;
+  L := L - BL;
+  H := H - BH;
+{$endif}
+end;
+
+procedure Shl128(var H, L: Int64; N: Int64);
+begin
+  if N <= 0 then
+    Exit;
+  if N >= 128 then
+  begin
+    H := 0;
+    L := 0;
+  end
+  else if N >= 64 then
+  begin
+    H := L shl (N - 64);
+    L := 0;
+  end
+  else
+  begin
+    H := (H shl N) or (L shr (64 - N));
+    L := L shl N;
+  end;
+end;
+
+{ H:L shifted right by N; a bit that falls off sets Sticky. }
+procedure Shr128(var H, L: Int64; N: Int64; var Sticky: Boolean);
+begin
+  if N <= 0 then
+    Exit;
+  if N >= 128 then
+  begin
+    if (H <> 0) or (L <> 0) then
+      Sticky := True;
+    H := 0;
+    L := 0;
+  end
+  else if N >= 64 then
+  begin
+    if L <> 0 then
+      Sticky := True;
+    if (N > 64) and ((H shl (128 - N)) <> 0) then
+      Sticky := True;
+    L := H shr (N - 64);
+    H := 0;
+  end
+  else
+  begin
+    if (L shl (64 - N)) <> 0 then
+      Sticky := True;
+    L := (L shr N) or (H shl (64 - N));
+    H := H shr N;
+  end;
+end;
+
+function Clz64(X: Int64): Int64;
+var
+  n: Int64;
+begin
+{$ifdef PASLANG}
+  { bsr, clz (P106, 1.0.122) }
+  Result := LeadingZeros(X);
+  Exit;
+{$endif}
+  if X = 0 then
+  begin
+    Result := 64;
+    Exit;
+  end;
+  n := 0;
+  if (X shr 32) = 0 then
+  begin
+    n := n + 32;
+    X := X shl 32;
+  end;
+  if (X shr 48) = 0 then
+  begin
+    n := n + 16;
+    X := X shl 16;
+  end;
+  if (X shr 56) = 0 then
+  begin
+    n := n + 8;
+    X := X shl 8;
+  end;
+  if (X shr 60) = 0 then
+  begin
+    n := n + 4;
+    X := X shl 4;
+  end;
+  if (X shr 62) = 0 then
+  begin
+    n := n + 2;
+    X := X shl 2;
+  end;
+  if (X shr 63) = 0 then
+    n := n + 1;
+  Result := n;
+end;
+
+function LeadZeros(H, L: Int64): Int64;
+begin
+  if H <> 0 then
+    Result := Clz64(H)
+  else
+    Result := 64 + Clz64(L);
+end;
+
+{ A * B as an unsigned 128-bit H:L, from four products of 32-bit
+  halves. }
+procedure Mul64(A, B: Int64; out H, L: Int64);
+var
+  a0, a1, b0, b1, p00, p01, p10, p11, mid: Int64;
+begin
+{$ifdef PASLANG}
+  { mulq, umulh and mul (P106, 1.0.122) }
+  H := MulHi(A, B);
+  L := A * B;
+  Exit;
+{$endif}
+  a0 := A and Low32;
+  a1 := A shr 32;
+  b0 := B and Low32;
+  b1 := B shr 32;
+  p00 := a0 * b0;
+  p01 := a0 * b1;
+  p10 := a1 * b0;
+  p11 := a1 * b1;
+  mid := (p00 shr 32) + (p01 and Low32) + (p10 and Low32);
+  L := (mid shl 32) or (p00 and Low32);
+  H := p11 + (p01 shr 32) + (p10 shr 32) + (mid shr 32);
+end;
+
+{ The parts of A: its class (0 zero, 1 finite, 2 infinite, 3 NaN), its
+  sign, and a finite one as SH:SL * 2^E with the top bit of SH:SL at
+  112, a subnormal made so too. }
+procedure Unpack(ALo, AHi: Int64; out Cls, Sign, E, SH, SL: Int64);
+var
+  f, n: Int64;
+begin
+  Sign := AHi shr 63;
+  f := (AHi shr 48) and 32767;
+  SH := AHi and Frac48;
+  SL := ALo;
+  E := 0;
+  if f = 32767 then
+  begin
+    if (SH = 0) and (SL = 0) then
+      Cls := 2
+    else
+      Cls := 3;
+  end
+  else if f = 0 then
+  begin
+    if (SH = 0) and (SL = 0) then
+      Cls := 0
+    else
+    begin
+      Cls := 1;
+      n := LeadZeros(SH, SL) - 15;
+      Shl128(SH, SL, n);
+      E := -16494 - n;
+    end;
+  end
+  else
+  begin
+    Cls := 1;
+    SH := SH or Hidden48;
+    E := f - 16495;
+  end;
+end;
+
+{ The binary128 nearest to (-1)^Sign * (H:L + a bit below it when
+  Sticky) * 2^E, a tie to even: subnormals kept, past the top infinity.
+  H:L is any non-zero 128-bit number. }
+procedure RoundPack(Sign, E, H, L: Int64; Sticky: Boolean; out RLo, RHi: Int64);
+var
+  n, be, k: Int64;
+  half, st: Boolean;
+begin
+  n := LeadZeros(H, L);
+  Shl128(H, L, n);
+  E := E - n;
+  be := E + 16510;
+  if be >= 32767 then
+  begin
+    RLo := 0;
+    RHi := InfHi or (Sign shl 63);
+    Exit;
+  end;
+  k := 15;
+  if be <= 0 then
+  begin
+    k := 16 - be;
+    be := 0;
+  end;
+  st := Sticky;
+  Shr128(H, L, k - 1, st);
+  half := (L and 1) = 1;
+  L := (L shr 1) or (H shl 63);
+  H := H shr 1;
+  if half and (st or ((L and 1) = 1)) then
+    Add128(H, L, 0, 1);
+  if be > 0 then
+    H := H + ((be - 1) shl 48);
+  RLo := L;
+  RHi := H or (Sign shl 63);
+end;
+
+{ The NaN an operation with a NaN operand gives: A's if A is one, else
+  B's, made quiet. }
+procedure NaNOf(ALo, AHi, BLo, BHi: Int64; out RLo, RHi: Int64);
+begin
+  if (((AHi shr 48) and 32767) = 32767) and (((AHi and Frac48) <> 0) or (ALo <> 0)) then
+  begin
+    RLo := ALo;
+    RHi := AHi or QuietHi;
+  end
+  else
+  begin
+    RLo := BLo;
+    RHi := BHi or QuietHi;
+  end;
+end;
+
+procedure DefaultNaN(out RLo, RHi: Int64);
+begin
+  RLo := 0;
+  RHi := NaNHi;
+end;
+
+{$ifdef PASLANG}
+{ The fast paths of paslang's words (P106, 1.0.122): two normal numbers,
+  their sum or difference, their product, with no call. The significands
+  sit 10 bits up, the bits that fall off one jam into its lowest bit (a
+  result that is not exact is odd there, so it is never a false tie),
+  one step of normalization, round to nearest even at bit 10, pack. A
+  difference that may cancel (exponents one apart or less), a result
+  that may be subnormal, or an operand that is zero, subnormal, infinite
+  or a NaN, go the general way. }
+function FastAdd(ALo, AHi, BLo, BHi: Int64; out RLo, RHi: Int64): Boolean;
+var
+  fa, fb, sa, sb, ah, al, bh, bl, t, d, k, e, c, rem: Int64;
+  jam: Boolean;
+begin
+  Result := False;
+  fa := (AHi shr 48) and 32767;
+  fb := (BHi shr 48) and 32767;
+  if (fa = 0) or (fb = 0) or (fa = 32767) or (fb = 32767) then
+    Exit;
+  sa := AHi shr 63;
+  sb := BHi shr 63;
+  ah := (AHi and Frac48) or Hidden48;
+  al := ALo;
+  bh := (BHi and Frac48) or Hidden48;
+  bl := BLo;
+  if (fb > fa) or ((fb = fa) and ((bh > ah) or ((bh = ah) and ULt(al, bl)))) then
+  begin
+    t := sa; sa := sb; sb := t;
+    t := fa; fa := fb; fb := t;
+    t := ah; ah := bh; bh := t;
+    t := al; al := bl; bl := t;
+  end;
+  d := fa - fb;
+  if (sa <> sb) and ((d <= 1) or (fa <= 2)) then
+    Exit;
+  RLo := 0;
+  RHi := 0;
+  ah := (ah shl 10) or (al shr 54);
+  al := al shl 10;
+  bh := (bh shl 10) or (bl shr 54);
+  bl := bl shl 10;
+  if d >= 128 then
+  begin
+    bh := 0;
+    bl := 1;
+  end
+  else if d >= 64 then
+  begin
+    k := d - 64;
+    jam := bl <> 0;
+    if k = 0 then
+      bl := bh
+    else
+    begin
+      if (bh shl (64 - k)) <> 0 then
+        jam := True;
+      bl := bh shr k;
+    end;
+    bh := 0;
+    if jam then
+      bl := bl or 1;
+  end
+  else if d > 0 then
+  begin
+    jam := (bl shl (64 - d)) <> 0;
+    bl := (bl shr d) or (bh shl (64 - d));
+    bh := bh shr d;
+    if jam then
+      bl := bl or 1;
+  end;
+  e := fa;
+  if sa = sb then
+  begin
+    al := AddCarry(al, bl, 0, c);
+    ah := ah + bh + c;
+    if (ah shr 59) <> 0 then
+    begin
+      al := (al shr 1) or (ah shl 63) or (al and 1);
+      ah := ah shr 1;
+      e := e + 1;
+    end;
+  end
+  else
+  begin
+    al := SubBorrow(al, bl, 0, c);
+    ah := ah - bh - c;
+    if (ah shr 58) = 0 then
+    begin
+      ah := (ah shl 1) or (al shr 63);
+      al := al shl 1;
+      e := e - 1;
+    end;
+  end;
+  rem := al and 1023;
+  if (rem > 512) or ((rem = 512) and ((al and 1024) <> 0)) then
+  begin
+    al := AddCarry(al, 1024, 0, c);
+    ah := ah + c;
+    if (ah shr 59) <> 0 then
+    begin
+      al := (al shr 1) or (ah shl 63);
+      ah := ah shr 1;
+      e := e + 1;
+    end;
+  end;
+  Result := True;
+  if e >= 32767 then
+  begin
+    RLo := 0;
+    RHi := InfHi or (sa shl 63);
+    Exit;
+  end;
+  RLo := (al shr 10) or (ah shl 54);
+  RHi := ((ah shr 10) and Frac48) or (e shl 48) or (sa shl 63);
+end;
+
+function FastMul(ALo, AHi, BLo, BHi: Int64; out RLo, RHi: Int64): Boolean;
+var
+  fa, fb, s, ah, al, bh, bl, e, k, c1, c2, c3, c4, c5, c, rem: Int64;
+  w0, w1, w2, w3, nl, nh: Int64;
+begin
+  Result := False;
+  fa := (AHi shr 48) and 32767;
+  fb := (BHi shr 48) and 32767;
+  if (fa = 0) or (fb = 0) or (fa = 32767) or (fb = 32767) then
+    Exit;
+  e := fa + fb - 16383;
+  if (e <= 0) or (e >= 32767) then
+    Exit;
+  RLo := 0;
+  RHi := 0;
+  s := (AHi xor BHi) shr 63;
+  ah := (AHi and Frac48) or Hidden48;
+  al := ALo;
+  bh := (BHi and Frac48) or Hidden48;
+  bl := BLo;
+  { the 226-bit product in w3:w2:w1:w0, four products and their carries }
+  w0 := al * bl;
+  w1 := AddCarry(MulHi(al, bl), al * bh, 0, c1);
+  w1 := AddCarry(w1, ah * bl, 0, c2);
+  w2 := AddCarry(MulHi(al, bh), MulHi(ah, bl), 0, c3);
+  w2 := AddCarry(w2, ah * bh, 0, c4);
+  w2 := AddCarry(w2, c1 + c2, 0, c5);
+  w3 := MulHi(ah, bh) + c3 + c4 + c5;
+  { its top bit at 224 or 225, brought to 122 with the rest jammed }
+  if (w3 shr 33) <> 0 then
+  begin
+    k := 39;
+    e := e + 1;
+  end
+  else
+    k := 38;
+  if e >= 32767 then
+  begin
+    Result := True;
+    RHi := InfHi or (s shl 63);
+    Exit;
+  end;
+  nl := (w1 shr k) or (w2 shl (64 - k));
+  nh := (w2 shr k) or (w3 shl (64 - k));
+  if (w0 <> 0) or ((w1 shl (64 - k)) <> 0) then
+    nl := nl or 1;
+  rem := nl and 1023;
+  if (rem > 512) or ((rem = 512) and ((nl and 1024) <> 0)) then
+  begin
+    nl := AddCarry(nl, 1024, 0, c);
+    nh := nh + c;
+    if (nh shr 59) <> 0 then
+    begin
+      nl := (nl shr 1) or (nh shl 63);
+      nh := nh shr 1;
+      e := e + 1;
+    end;
+  end;
+  Result := True;
+  if e >= 32767 then
+  begin
+    RLo := 0;
+    RHi := InfHi or (s shl 63);
+    Exit;
+  end;
+  RLo := (nl shr 10) or (nh shl 54);
+  RHi := ((nh shr 10) and Frac48) or (e shl 48) or (s shl 63);
+end;
+{$endif}
+
+procedure PasQAdd(ALo, AHi, BLo, BHi: Int64; out RLo, RHi: Int64);
+var
+  ca, sa, ea, ah, al, cb, sb, eb, bh, bl, t: Int64;
+  st: Boolean;
+begin
+{$ifdef PASLANG}
+  if FastAdd(ALo, AHi, BLo, BHi, RLo, RHi) then
+    Exit;
+{$endif}
+  Unpack(ALo, AHi, ca, sa, ea, ah, al);
+  Unpack(BLo, BHi, cb, sb, eb, bh, bl);
+  if (ca = 3) or (cb = 3) then
+  begin
+    NaNOf(ALo, AHi, BLo, BHi, RLo, RHi);
+    Exit;
+  end;
+  if ca = 2 then
+  begin
+    if (cb = 2) and (sa <> sb) then
+      DefaultNaN(RLo, RHi)
+    else
+    begin
+      RLo := ALo;
+      RHi := AHi;
+    end;
+    Exit;
+  end;
+  if cb = 2 then
+  begin
+    RLo := BLo;
+    RHi := BHi;
+    Exit;
+  end;
+  if ca = 0 then
+  begin
+    if cb = 0 then
+    begin
+      RLo := 0;
+      RHi := (sa and sb) shl 63;
+    end
+    else
+    begin
+      RLo := BLo;
+      RHi := BHi;
+    end;
+    Exit;
+  end;
+  if cb = 0 then
+  begin
+    RLo := ALo;
+    RHi := AHi;
+    Exit;
+  end;
+  { a is the larger in magnitude }
+  if (eb > ea) or ((eb = ea) and Lt128(ah, al, bh, bl)) then
+  begin
+    t := sa;
+    sa := sb;
+    sb := t;
+    t := ea;
+    ea := eb;
+    eb := t;
+    t := ah;
+    ah := bh;
+    bh := t;
+    t := al;
+    al := bl;
+    bl := t;
+  end;
+  Shl128(ah, al, 14);
+  Shl128(bh, bl, 14);
+  st := False;
+  Shr128(bh, bl, ea - eb, st);
+  { the bits that fell off b jam into its lowest bit: 14 bits below
+    the rounding place keep the rounding right, a sum or a difference }
+  if st then
+    bl := bl or 1;
+  if sa = sb then
+    Add128(ah, al, bh, bl)
+  else
+  begin
+    Sub128(ah, al, bh, bl);
+    if (ah = 0) and (al = 0) then
+    begin
+      RLo := 0;
+      RHi := 0;
+      Exit;
+    end;
+  end;
+  RoundPack(sa, ea - 14, ah, al, False, RLo, RHi);
+end;
+
+procedure PasQSub(ALo, AHi, BLo, BHi: Int64; out RLo, RHi: Int64);
+begin
+  PasQAdd(ALo, AHi, BLo, BHi xor SignBit, RLo, RHi);
+end;
+
+procedure PasQMul(ALo, AHi, BLo, BHi: Int64; out RLo, RHi: Int64);
+var
+  ca, sa, ea, ah, al, cb, sb, eb, bh, bl, s: Int64;
+  h00, l00, h01, l01, h10, l10, h11, l11: Int64;
+  w0, w1, w2, w3, c, ph, pl: Int64;
+  st: Boolean;
+begin
+{$ifdef PASLANG}
+  if FastMul(ALo, AHi, BLo, BHi, RLo, RHi) then
+    Exit;
+{$endif}
+  Unpack(ALo, AHi, ca, sa, ea, ah, al);
+  Unpack(BLo, BHi, cb, sb, eb, bh, bl);
+  if (ca = 3) or (cb = 3) then
+  begin
+    NaNOf(ALo, AHi, BLo, BHi, RLo, RHi);
+    Exit;
+  end;
+  s := sa xor sb;
+  if (ca = 2) or (cb = 2) then
+  begin
+    if (ca = 0) or (cb = 0) then
+      DefaultNaN(RLo, RHi)
+    else
+    begin
+      RLo := 0;
+      RHi := InfHi or (s shl 63);
+    end;
+    Exit;
+  end;
+  if (ca = 0) or (cb = 0) then
+  begin
+    RLo := 0;
+    RHi := s shl 63;
+    Exit;
+  end;
+  { the 226-bit product in four words w3:w2:w1:w0 }
+  Mul64(al, bl, h00, l00);
+  Mul64(al, bh, h01, l01);
+  Mul64(ah, bl, h10, l10);
+  Mul64(ah, bh, h11, l11);
+  w0 := l00;
+  w1 := h00;
+  w2 := 0;
+  w3 := h11;
+  c := 0;
+  Add128(c, w1, 0, l01);
+  Add128(c, w1, 0, l10);
+  w2 := c;
+  c := 0;
+  Add128(c, w2, 0, h01);
+  Add128(c, w2, 0, h10);
+  Add128(c, w2, 0, l11);
+  w3 := w3 + c;
+  { its top bit is at 224 or 225: the top 128 bits, the rest sticky }
+  st := (w0 <> 0) or ((w1 shl 30) <> 0);
+  pl := (w1 shr 34) or (w2 shl 30);
+  ph := (w2 shr 34) or (w3 shl 30);
+  RoundPack(s, ea + eb + 98, ph, pl, st, RLo, RHi);
+end;
+
+{$ifdef PASLANG}
+{$ifdef CPUX86_64}
+{ A quotient of two normal numbers by divq (1.0.122): Knuth's algorithm D
+  in base 2^64, the divisor B shifted up 15 into two words whose top bit
+  is set, the dividend A shifted up 138 into four, so the two quotient
+  digits hold A * 2^123 / B, 123 or 124 bits; the remainder is the
+  sticky bit. arm64 has no 128-by-64 division: it keeps the base-2^30
+  one. A result that may be subnormal or infinite goes the general way. }
+function FastDiv(ALo, AHi, BLo, BHi: Int64; out RLo, RHi: Int64): Boolean;
+var
+  fa, fb, s, e, v1, v0, u0, u1, u2, u3, qh, rh, c, b, j, ph, pl, t0, t1, t2, rem: Int64;
+  q: array[0..1] of Int64;
+  ov: Boolean;
+begin
+  Result := False;
+  fa := (AHi shr 48) and 32767;
+  fb := (BHi shr 48) and 32767;
+  if (fa = 0) or (fb = 0) or (fa = 32767) or (fb = 32767) then
+    Exit;
+  e := fa - fb + 16383;
+  if (e <= 1) or (e >= 32766) then
+    Exit;
+  RLo := 0;
+  RHi := 0;
+  s := (AHi xor BHi) shr 63;
+  t0 := (BHi and Frac48) or Hidden48;
+  v1 := (t0 shl 15) or (BLo shr 49);
+  v0 := BLo shl 15;
+  t0 := (AHi and Frac48) or Hidden48;
+  u3 := (t0 shl 10) or (ALo shr 54);
+  u2 := ALo shl 10;
+  u1 := 0;
+  u0 := 0;
+  for j := 1 downto 0 do
+  begin
+    { the digit's estimate from the top two words over v1 }
+    if u3 = v1 then
+    begin
+      qh := -1;
+      rh := AddCarry(u2, v1, 0, c);
+      ov := c <> 0;
+    end
+    else
+    begin
+      DivMod128(u3, u2, v1, qh, rh);
+      ov := False;
+    end;
+    while not ov do
+    begin
+      ph := MulHi(qh, v0);
+      pl := qh * v0;
+      if not Lt128(rh, u1, ph, pl) then
+        Break;
+      qh := qh - 1;
+      rh := AddCarry(rh, v1, 0, c);
+      ov := c <> 0;
+    end;
+    { u3:u2:u1 minus qh times v1:v0 }
+    t0 := qh * v0;
+    t1 := AddCarry(MulHi(qh, v0), qh * v1, 0, c);
+    t2 := MulHi(qh, v1) + c;
+    u1 := SubBorrow(u1, t0, 0, b);
+    u2 := SubBorrow(u2, t1, b, b);
+    u3 := SubBorrow(u3, t2, b, b);
+    if b <> 0 then
+    begin
+      qh := qh - 1;
+      u1 := AddCarry(u1, v0, 0, c);
+      u2 := AddCarry(u2, v1, c, c);
+      u3 := u3 + c;
+    end;
+    q[j] := qh;
+    { the next digit: the words move up one }
+    u3 := u2;
+    u2 := u1;
+    u1 := u0;
+    u0 := 0;
+  end;
+  { the remainder, now u3:u2, is the sticky bit }
+  pl := q[0];
+  ph := q[1];
+  if (ph shr 59) <> 0 then
+  begin
+    pl := (pl shr 1) or (ph shl 63) or (pl and 1);
+    ph := ph shr 1;
+  end
+  else
+    e := e - 1;
+  if (u3 <> 0) or (u2 <> 0) then
+    pl := pl or 1;
+  rem := pl and 1023;
+  if (rem > 512) or ((rem = 512) and ((pl and 1024) <> 0)) then
+  begin
+    pl := AddCarry(pl, 1024, 0, c);
+    ph := ph + c;
+    if (ph shr 59) <> 0 then
+    begin
+      pl := (pl shr 1) or (ph shl 63);
+      ph := ph shr 1;
+      e := e + 1;
+    end;
+  end;
+  Result := True;
+  RLo := (pl shr 10) or (ph shl 54);
+  RHi := ((ph shr 10) and Frac48) or (e shl 48) or (s shl 63);
+end;
+{$endif}
+{$endif}
+
+procedure PasQDiv(ALo, AHi, BLo, BHi: Int64; out RLo, RHi: Int64);
+var
+  ca, sa, ea, ah, al, cb, sb, eb, bh, bl, s, e: Int64;
+  u: array[0..8] of Int64;
+  v: array[0..3] of Int64;
+  q: array[0..4] of Int64;
+  j, i, qh, rh, t, borrow, cy, p, qhi, qlo: Int64;
+  st: Boolean;
+begin
+{$ifdef PASLANG}
+{$ifdef CPUX86_64}
+  if FastDiv(ALo, AHi, BLo, BHi, RLo, RHi) then
+    Exit;
+{$endif}
+{$endif}
+  Unpack(ALo, AHi, ca, sa, ea, ah, al);
+  Unpack(BLo, BHi, cb, sb, eb, bh, bl);
+  if (ca = 3) or (cb = 3) then
+  begin
+    NaNOf(ALo, AHi, BLo, BHi, RLo, RHi);
+    Exit;
+  end;
+  s := sa xor sb;
+  if ((ca = 2) and (cb = 2)) or ((ca = 0) and (cb = 0)) then
+  begin
+    DefaultNaN(RLo, RHi);
+    Exit;
+  end;
+  if (ca = 2) or (cb = 0) then
+  begin
+    RLo := 0;
+    RHi := InfHi or (s shl 63);
+    Exit;
+  end;
+  if (ca = 0) or (cb = 2) then
+  begin
+    RLo := 0;
+    RHi := s shl 63;
+    Exit;
+  end;
+  { Knuth's algorithm D in base 2^30, so every product and every two-digit
+    numerator stays below 2^63: the divisor, its top bit at 112, shifted
+    up 7 into four digits whose top one has its high bit set; the
+    dividend, the other significand shifted up 127, into eight digits and
+    a ninth that is 0. The quotient, sa / sb * 2^120, has 120 or 121
+    bits: five digits, and the remainder is the sticky bit. }
+  v[0] := (bl shl 7) and 1073741823;
+  v[1] := ((bl shr 23) or (bh shl 41)) and 1073741823;
+  v[2] := ((bl shr 53) or (bh shl 11)) and 1073741823;
+  v[3] := (bh shr 19) and 1073741823;
+  u[0] := 0;
+  u[1] := 0;
+  u[2] := 0;
+  u[3] := 0;
+  u[4] := (al shl 7) and 1073741823;
+  u[5] := ((al shr 23) or (ah shl 41)) and 1073741823;
+  u[6] := ((al shr 53) or (ah shl 11)) and 1073741823;
+  u[7] := (ah shr 19) and 1073741823;
+  u[8] := 0;
+  for j := 4 downto 0 do
+  begin
+    t := u[j + 4] * 1073741824 + u[j + 3];
+    qh := t div v[3];
+    rh := t mod v[3];
+    while (qh >= 1073741824) or (qh * v[2] > rh * 1073741824 + u[j + 2]) do
+    begin
+      qh := qh - 1;
+      rh := rh + v[3];
+      if rh >= 1073741824 then
+        Break;
+    end;
+    { u[j..j+4] minus qh times the divisor }
+    borrow := 0;
+    cy := 0;
+    for i := 0 to 3 do
+    begin
+      p := qh * v[i] + cy;
+      cy := p shr 30;
+      t := u[i + j] - (p and 1073741823) - borrow;
+      if t < 0 then
+      begin
+        t := t + 1073741824;
+        borrow := 1;
+      end
+      else
+        borrow := 0;
+      u[i + j] := t;
+    end;
+    t := u[j + 4] - cy - borrow;
+    if t < 0 then
+    begin
+      { one too many: the divisor back }
+      u[j + 4] := t + 1073741824;
+      qh := qh - 1;
+      cy := 0;
+      for i := 0 to 3 do
+      begin
+        t := u[i + j] + v[i] + cy;
+        u[i + j] := t and 1073741823;
+        cy := t shr 30;
+      end;
+      u[j + 4] := (u[j + 4] + cy) and 1073741823;
+    end
+    else
+      u[j + 4] := t;
+    q[j] := qh;
+  end;
+  st := (u[0] <> 0) or (u[1] <> 0) or (u[2] <> 0) or (u[3] <> 0);
+  { q0 + q1 2^30 + q2 2^60 + q3 2^90 + q4 2^120 in two words }
+  qlo := q[0] or (q[1] shl 30) or (q[2] shl 60);
+  qhi := (q[2] shr 4) or (q[3] shl 26) or (q[4] shl 56);
+  e := ea - eb - 120;
+  RoundPack(s, e, qhi, qlo, st, RLo, RHi);
+end;
+
+{ Bit J of H:L, 0 outside it. }
+function Bit128(H, L, J: Int64): Int64;
+begin
+  if (J < 0) or (J >= 128) then
+    Result := 0
+  else if J >= 64 then
+    Result := (H shr (J - 64)) and 1
+  else
+    Result := (L shr J) and 1;
+end;
+
+procedure PasQSqrt(ALo, AHi: Int64; out RLo, RHi: Int64);
+var
+  ca, sa, ea, ah, al, sh, npairs, i, two, remh, reml, rooth, rootl, th, tl, bit, t: Int64;
+  ge: Boolean;
+begin
+  Unpack(ALo, AHi, ca, sa, ea, ah, al);
+  if ca = 3 then
+  begin
+    RLo := ALo;
+    RHi := AHi or QuietHi;
+    Exit;
+  end;
+  if ca = 0 then
+  begin
+    RLo := ALo;
+    RHi := AHi;
+    Exit;
+  end;
+  if sa = 1 then
+  begin
+    DefaultNaN(RLo, RHi);
+    Exit;
+  end;
+  if ca = 2 then
+  begin
+    RLo := ALo;
+    RHi := AHi;
+    Exit;
+  end;
+  { the root of (ah:al shl sh) * 2^(ea - sh), ea - sh even, one bit a
+    pass, two bits of the radicand a pass; the 128-bit steps are written
+    out, since a call a step made the root the slowest operation }
+  if ((ea - 115) and 1) = 0 then
+    sh := 115
+  else
+    sh := 116;
+  npairs := (113 + sh + 1) div 2;
+  remh := 0;
+  reml := 0;
+  rooth := 0;
+  rootl := 0;
+  { the radicand's first pair at the top of ah:al, so each pass takes
+    the top two bits with shifts by constants (a shift by a variable
+    count costs a push and a pop around it); zeros come in below }
+  bit := 127 - (2 * npairs - 1 - sh);
+  ah := (ah shl bit) or (al shr (64 - bit));
+  al := al shl bit;
+  for i := npairs - 1 downto 0 do
+  begin
+    two := ah shr 62;
+    ah := (ah shl 2) or (al shr 62);
+    al := al shl 2;
+    remh := (remh shl 2) or (reml shr 62);
+    reml := (reml shl 2) or two;
+    th := (rooth shl 2) or (rootl shr 62);
+    tl := (rootl shl 2) or 1;
+    rooth := (rooth shl 1) or (rootl shr 63);
+    rootl := rootl shl 1;
+    if remh <> th then
+      ge := (remh xor SignBit) > (th xor SignBit)
+    else
+      ge := (reml xor SignBit) >= (tl xor SignBit);
+    if ge then
+    begin
+      t := reml - tl;
+      if (reml xor SignBit) < (tl xor SignBit) then
+        remh := remh - 1;
+      reml := t;
+      remh := remh - th;
+      rootl := rootl or 1;
+    end;
+  end;
+  RoundPack(0, (ea - sh) div 2, rooth, rootl, (remh <> 0) or (reml <> 0), RLo, RHi);
+end;
+
+{ -1, 0 or 1 as A is below, equal to or above B; 2 when either is a
+  NaN. -0 equals 0. }
+function PasQCmp(ALo, AHi, BLo, BHi: Int64): Int64;
+var
+  ma, mb: Int64;
+  sa, sb: Int64;
+begin
+  ma := AHi and (not SignBit);
+  mb := BHi and (not SignBit);
+  if ((ma shr 48) = 32767) and (((ma and Frac48) <> 0) or (ALo <> 0)) then
+  begin
+    Result := 2;
+    Exit;
+  end;
+  if ((mb shr 48) = 32767) and (((mb and Frac48) <> 0) or (BLo <> 0)) then
+  begin
+    Result := 2;
+    Exit;
+  end;
+  if (ma = 0) and (ALo = 0) and (mb = 0) and (BLo = 0) then
+  begin
+    Result := 0;
+    Exit;
+  end;
+  sa := AHi shr 63;
+  sb := BHi shr 63;
+  if sa <> sb then
+  begin
+    if sa = 1 then
+      Result := -1
+    else
+      Result := 1;
+    Exit;
+  end;
+  if (ma = mb) and (ALo = BLo) then
+    Result := 0
+  else if Lt128(ma, ALo, mb, BLo) then
+    Result := -1
+  else
+    Result := 1;
+  if sa = 1 then
+    Result := -Result;
+end;
+
+procedure PasQFromInt(I: Int64; out RLo, RHi: Int64);
+var
+  sign: Int64;
+begin
+  if I = 0 then
+  begin
+    RLo := 0;
+    RHi := 0;
+    Exit;
+  end;
+  sign := 0;
+  if I < 0 then
+  begin
+    sign := 1;
+    I := -I;
+  end;
+  RoundPack(sign, 0, 0, I, False, RLo, RHi);
+end;
+
+procedure PasQFromDouble(D: Int64; out RLo, RHi: Int64);
+var
+  sign, e, f: Int64;
+begin
+  sign := D shr 63;
+  e := (D shr 52) and 2047;
+  f := D and 4503599627370495;
+  if e = 2047 then
+  begin
+    RLo := f shl 60;
+    RHi := InfHi or (sign shl 63) or (f shr 4);
+    if f <> 0 then
+      RHi := RHi or QuietHi;
+  end
+  else if e = 0 then
+  begin
+    if f = 0 then
+    begin
+      RLo := 0;
+      RHi := sign shl 63;
+    end
+    else
+      RoundPack(sign, -1074, 0, f, False, RLo, RHi);
+  end
+  else
+    RoundPack(sign, e - 1075, 0, f or 4503599627370496, False, RLo, RHi);
+end;
+
+{ The float of P significant bits nearest to (-1)^Sign * H:L * 2^E, a
+  tie to even: Bias its exponent bias, MaxF the exponent field of
+  infinity, the sign at bit SignPos. P is 53 or 24. }
+function RoundSmall(Sign, E, H, L, P, Bias, MaxF, SignPos: Int64): Int64;
+var
+  n, be, k, m: Int64;
+  half, st: Boolean;
+begin
+  n := LeadZeros(H, L);
+  Shl128(H, L, n);
+  E := E - n;
+  be := E + 127 + Bias;
+  if be >= MaxF then
+  begin
+    Result := (MaxF shl (P - 1)) or (Sign shl SignPos);
+    Exit;
+  end;
+  k := 128 - P;
+  if be <= 0 then
+  begin
+    k := k + 1 - be;
+    be := 0;
+  end;
+  st := False;
+  Shr128(H, L, k - 1, st);
+  half := (L and 1) = 1;
+  m := L shr 1;
+  if half and (st or ((m and 1) = 1)) then
+    m := m + 1;
+  if be > 0 then
+    m := m + ((be - 1) shl (P - 1));
+  if (m shr (P - 1)) >= MaxF then
+    m := MaxF shl (P - 1);
+  Result := m or (Sign shl SignPos);
+end;
+
+function PasQToDouble(ALo, AHi: Int64): Int64;
+var
+  c, s, e, h, l: Int64;
+begin
+  Unpack(ALo, AHi, c, s, e, h, l);
+  if c = 3 then
+    Result := (s shl 63) or 9221120237041090560 or ((AHi and Frac48) shl 4) or (ALo shr 60)
+  else if c = 2 then
+    Result := (s shl 63) or 9218868437227405312
+  else if c = 0 then
+    Result := s shl 63
+  else
+    Result := RoundSmall(s, e, h, l, 53, 1023, 2047, 63);
+end;
+
+function PasQToSingle(ALo, AHi: Int64): Int64;
+var
+  c, s, e, h, l: Int64;
+begin
+  Unpack(ALo, AHi, c, s, e, h, l);
+  if c = 3 then
+    Result := (s shl 31) or 2143289344 or ((AHi and Frac48) shr 26)
+  else if c = 2 then
+    Result := (s shl 31) or 2139095040
+  else if c = 0 then
+    Result := s shl 31
+  else
+    Result := RoundSmall(s, e, h, l, 24, 127, 255, 31);
+end;
+
+{ A as an Integer: Mode 0 toward zero (Trunc), 1 to the nearest with a
+  tie to even (Round), 2 toward minus infinity (Floor), 3 toward plus
+  infinity (Ceil). Ok is False for a NaN, an infinity or a value no
+  Integer holds. }
+function PasQToInt(ALo, AHi, Mode: Int64; out Ok: Boolean): Int64;
+var
+  c, s, e, h, l, ih, il: Int64;
+  half, st, up: Boolean;
+begin
+  Result := 0;
+  Ok := False;
+  Unpack(ALo, AHi, c, s, e, h, l);
+  if (c = 2) or (c = 3) then
+    Exit;
+  Ok := True;
+  if c = 0 then
+    Exit;
+  if e >= 0 then
+  begin
+    Ok := False;
+    Exit;
+  end;
+  ih := h;
+  il := l;
+  st := False;
+  Shr128(ih, il, -e - 1, st);
+  half := (il and 1) = 1;
+  il := (il shr 1) or (ih shl 63);
+  ih := ih shr 1;
+  up := False;
+  if Mode = 1 then
+    up := half and (st or ((il and 1) = 1))
+  else if Mode = 2 then
+    up := (s = 1) and (half or st)
+  else if Mode = 3 then
+    up := (s = 0) and (half or st);
+  if up then
+    Add128(ih, il, 0, 1);
+  if ih <> 0 then
+    Ok := False
+  else if s = 0 then
+  begin
+    Ok := il >= 0;
+    Result := il;
+  end
+  else
+  begin
+    Ok := (il >= 0) or (il = SignBit);
+    Result := -il;
+  end;
+end;
+
+{ A toward zero, as a Quad. }
+procedure PasQInt(ALo, AHi: Int64; out RLo, RHi: Int64);
+var
+  c, s, e, h, l: Int64;
+  st: Boolean;
+begin
+  Unpack(ALo, AHi, c, s, e, h, l);
+  if (c <> 1) or (e >= 0) then
+  begin
+    if c = 3 then
+      RHi := AHi or QuietHi
+    else
+      RHi := AHi;
+    RLo := ALo;
+    Exit;
+  end;
+  st := False;
+  Shr128(h, l, -e, st);
+  if (h = 0) and (l = 0) then
+  begin
+    RLo := 0;
+    RHi := s shl 63;
+  end
+  else
+    RoundPack(s, 0, h, l, False, RLo, RHi);
+end;
+
+end.

@@ -1,0 +1,139 @@
+{ Word frequencies: a map and pasroutines working together.
+
+  What the program does, step by step:
+  1. Fills a slice of six lines of text.
+  2. Creates the map freq with New(freq, 64): word -> count, with room
+     for 64 words before the table first grows.
+  3. Tells the waitgroup wg to expect four Done calls, then starts four
+     Worker routines with pas. Each worker takes every fourth line
+     (worker K takes the lines K, K + 4, K + 8, ...).
+  4. Every worker splits its lines into words and adds one to the count
+     of each word in the shared map. The mutex mu lets one writer in at
+     a time; a map is not safe for two routines writing at once.
+  5. wg.Wait parks the main routine until the four workers have called
+     Done. The thread is not blocked: it runs the workers meanwhile.
+  6. Prints the number of distinct words, copies the keys into a slice,
+     sorts them (a map walks its entries in no fixed order) and prints
+     each word with its count.
+  7. Reads one count with TryGet and tests one missing word with in.
+
+  Routines:
+  - Less(A, B): True when A sorts before B, comparing byte by byte and,
+    on a common prefix, by length. Used by the sort; it gives the same
+    order as < on strings.
+  - CountLine(Line): walks the bytes of Line, cuts each run of non-space
+    bytes with Copy, and under lock mu adds one to freq[word]. A missing
+    key reads as 0, so the first occurrence needs no special case.
+  - Worker(K): calls CountLine on the lines K, K + Workers, K + 2 *
+    Workers, ... and then calls wg.Done to say it has finished.
+  - The main routine: steps 1 to 7 above, including the insertion sort
+    over the key slice.
+
+  The output is the same on every run: the sums do not depend on which
+  worker counted which line, and the printing order is the sorted one. }
+program wordcount;
+
+const
+  Workers = 4;
+
+var
+  text: array of string;         { the lines to count }
+  freq: map[string] of Integer;  { word -> count, shared by every worker }
+  mu: mutex;                     { guards freq; ready without Create }
+  wg: waitgroup;                 { counts the running workers }
+
+{ True when A sorts before B, byte by byte. }
+function Less(const A, B: string): Boolean;
+var
+  i, n: Integer;
+begin
+  n := Length(A);
+  if Length(B) < n then
+    n := Length(B);
+  for i := 1 to n do
+    if A[i] <> B[i] then
+    begin
+      Result := A[i] < B[i];
+      Exit;
+    end;
+  Result := Length(A) < Length(B);
+end;
+
+{ Splits a line on spaces and counts each word in the shared map. }
+procedure CountLine(const Line: string);
+var
+  i, start: Integer;
+  w: string;
+begin
+  start := 1;
+  for i := 1 to Length(Line) + 1 do
+    if (i > Length(Line)) or (Line[i] = ' ') then
+    begin
+      if i > start then
+      begin
+        w := Copy(Line, start, i - start);
+        lock mu do                { one writer at a time; released after the statement }
+          freq[w] := freq[w] + 1; { a missing key reads as 0, so no test is needed }
+      end;
+      start := i + 1;
+    end;
+end;
+
+{ Worker K takes the lines K, K + Workers, K + 2 * Workers, ... }
+procedure Worker(K: Integer);
+var
+  i: Integer;
+begin
+  i := K;
+  while i <= High(text) do
+  begin
+    CountLine(text[i]);
+    i := i + Workers;
+  end;
+  wg.Done;                       { one worker less to wait for }
+end;
+
+var
+  keys: array of string;
+  k, tmp: string;
+  i, j, n: Integer;
+
+begin
+  SetLength(text, 6);
+  text[0] := 'the quick brown fox';
+  text[1] := 'jumps over the lazy dog';
+  text[2] := 'the dog sleeps';
+  text[3] := 'the fox runs';
+  text[4] := 'quick quick quick';
+  text[5] := 'lazy dog lazy fox';
+  New(freq, 64);                 { room for 64 words before the table grows }
+  wg.Add(Workers);               { four Done calls are expected }
+  for i := 0 to Workers - 1 do
+    pas Worker(i);               { each worker is a routine on the scheduler }
+  wg.Wait;                       { parks until the count is back to zero }
+  WriteLn(Length(freq), ' distinct words');
+  SetLength(keys, Length(freq)); { collect the keys, then sort them }
+  n := 0;
+  for k in freq do
+  begin
+    keys[n] := k;
+    n := n + 1;
+  end;
+  for i := 1 to n - 1 do         { insertion sort on the key array }
+  begin
+    tmp := keys[i];
+    j := i - 1;
+    while (j >= 0) and Less(tmp, keys[j]) do
+    begin
+      keys[j + 1] := keys[j];
+      j := j - 1;
+    end;
+    keys[j + 1] := tmp;
+  end;
+  for i := 0 to n - 1 do
+    WriteLn(keys[i], ' ', freq[keys[i]]);
+  if TryGet(freq, 'the', i) then { read and test in one step }
+    WriteLn('the appears ', i, ' times');
+  if not ('cat' in freq) then    { in tests membership without inserting }
+    WriteLn('no cat');
+end.

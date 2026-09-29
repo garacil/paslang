@@ -1,0 +1,246 @@
+{ An HTTP/1.1 server on routines (P114): one routine per connection,
+  parked on the runtime's poller while it waits, so ten thousand open
+  connections are ten thousand small stacks and no threads. Keep-alive
+  by default, as the protocol says; GET / is a page, GET /hello a
+  greeting, GET /stats the counters, anything else 404.
+
+    httpd [port]            serve (8080 by default) until killed
+    httpd -selftest [n]     n client routines (2000 by default), three
+                            requests each on one kept-alive connection,
+                            in this same process; prints the totals
+
+  make check runs the self-test on both machines. }
+program httpd;
+
+uses pasnet, paslib;
+
+const
+  Requests = 3;
+
+var
+  served, opened, bad: Integer;   { the counters, AtomicAdd from every routine }
+  done: WaitGroup;
+
+function Header(Code: Integer; const Text: string; const Body: string; KeepAlive: Boolean): string;
+var
+  h: string;
+begin
+  h := 'HTTP/1.1 ' + IntToStr(Code) + ' ' + Text + #13#10 +
+    'Content-Type: text/plain; charset=utf-8' + #13#10 +
+    'Content-Length: ' + IntToStr(Length(Body)) + #13#10;
+  if KeepAlive then
+    h := h + 'Connection: keep-alive' + #13#10
+  else
+    h := h + 'Connection: close' + #13#10;
+  Result := h + #13#10 + Body;
+end;
+
+{ The word from position I of S up to the next space, I moved past it. }
+function Token(const S: string; var I: Integer): string;
+var
+  j: Integer;
+begin
+  j := I;
+  while (j <= Length(S)) and (S[j] <> ' ') do
+    j := j + 1;
+  Result := Copy(S, I, j - I);
+  I := j;
+  while (I <= Length(S)) and (S[I] = ' ') do
+    I := I + 1;
+end;
+
+function Answer(const Method, Path: string; KeepAlive: Boolean): string;
+var
+  body: string;
+begin
+  if Method <> 'GET' then
+  begin
+    Result := Header(405, 'Method Not Allowed', 'only GET' + #10, KeepAlive);
+    Exit;
+  end;
+  if Path = '/' then
+    body := 'paslang httpd: a routine per connection, parked between requests.' + #10 +
+      'Try /hello and /stats.' + #10
+  else if Path = '/hello' then
+    body := 'hello' + #10
+  else if Path = '/stats' then
+    body := 'connections ' + IntToStr(opened) + #10 + 'requests ' + IntToStr(served) + #10 +
+      'bad ' + IntToStr(bad) + #10
+  else
+  begin
+    Result := Header(404, 'Not Found', 'no ' + Path + #10, KeepAlive);
+    Exit;
+  end;
+  Result := Header(200, 'OK', body, KeepAlive);
+end;
+
+{ One connection: requests until the peer closes or asks to. }
+procedure Serve(C: Integer);
+var
+  buf, line, method, path, version, key: string;
+  i: Integer;
+  keep, more: Boolean;
+begin
+  AtomicAdd(@opened, 1);
+  buf := '';
+  more := True;
+  while more do
+  begin
+    if not TcpReadLine(C, buf, line) then
+      Break;
+    if line = '' then
+      Continue;                       { a stray empty line between requests }
+    i := 1;
+    method := Token(line, i);
+    path := Token(line, i);
+    version := Token(line, i);
+    keep := version <> 'HTTP/1.0';
+    { the headers up to the empty line; Connection may change keep }
+    while TcpReadLine(C, buf, line) and (line <> '') do
+    begin
+      i := 1;
+      key := Token(line, i);
+      if (key = 'Connection:') or (key = 'connection:') then
+        keep := Token(line, i) <> 'close';
+    end;
+    if (method = '') or (path = '') then
+    begin
+      AtomicAdd(@bad, 1);
+      Break;
+    end;
+    if TcpWrite(C, Answer(method, path, keep)) < 0 then
+      Break;
+    AtomicAdd(@served, 1);
+    more := keep;
+  end;
+  TcpClose(C);
+end;
+
+procedure Listen(L: Integer);
+var
+  c: Integer;
+begin
+  while True do
+  begin
+    c := TcpAccept(L);
+    if c < 0 then
+      Break;
+    pas Serve(c);
+  end;
+end;
+
+function StrToIntDef(const S: string; Def: Integer): Integer;
+var
+  v, i: Integer;
+begin
+  v := 0;
+  if S = '' then
+  begin
+    Result := Def;
+    Exit;
+  end;
+  for i := 1 to Length(S) do
+  begin
+    if (S[i] < '0') or (S[i] > '9') then
+    begin
+      Result := Def;
+      Exit;
+    end;
+    v := v * 10 + Ord(S[i]) - 48;
+  end;
+  Result := v;
+end;
+
+{ A client of the self-test: one connection, Requests requests, each
+  answer checked. }
+procedure Client(Port, Id: Integer);
+var
+  c, k, i, n: Integer;
+  buf, line, body: string;
+  ok: Boolean;
+begin
+  c := TcpConnectTo('127.0.0.1', Port);
+  if c < 0 then
+  begin
+    AtomicAdd(@bad, 1);
+    done.Done;
+    Exit;
+  end;
+  buf := '';
+  for k := 1 to Requests do
+  begin
+    if TcpWrite(c, 'GET /hello HTTP/1.1' + #13#10 + 'Host: self' + #13#10 + #13#10) < 0 then
+    begin
+      AtomicAdd(@bad, 1);
+      Break;
+    end;
+    ok := TcpReadLine(c, buf, line) and (line = 'HTTP/1.1 200 OK');
+    n := -1;
+    while ok and TcpReadLine(c, buf, line) and (line <> '') do
+    begin
+      i := 1;
+      if Token(line, i) = 'Content-Length:' then
+        n := StrToIntDef(Token(line, i), -1);
+    end;
+    if ok and (n >= 0) then
+      ok := TcpReadN(c, n, buf, body) and (body = 'hello' + #10)
+    else
+      ok := False;
+    if not ok then
+    begin
+      AtomicAdd(@bad, 1);
+      Break;
+    end;
+  end;
+  TcpClose(c);
+  done.Done;
+end;
+
+procedure SelfTest(N: Integer);
+var
+  l, i, lim: Integer;
+begin
+  lim := RaiseFdLimit;
+  if lim < 2 * N + 64 then
+    N := (lim - 64) div 2;
+  l := TcpListen(0);
+  if l < 0 then
+  begin
+    WriteLn('httpd: cannot listen');
+    Halt(1);
+  end;
+  pas Listen(l);
+  done.Add(N);
+  for i := 1 to N do
+    pas Client(TcpPort(l), i);
+  done.Wait;
+  WriteLn(N, ' clients, ', N * Requests, ' requests, ', served, ' served, ', bad, ' bad');
+  if (served <> N * Requests) or (bad <> 0) then
+    Halt(1);
+  Halt(0);                { the server routine parks for ever: end without waiting for it }
+end;
+
+var
+  port, l: Integer;
+begin
+  if (ParamCount >= 1) and (ParamStr(1) = '-selftest') then
+  begin
+    if ParamCount >= 2 then
+      SelfTest(StrToIntDef(ParamStr(2), 2000))
+    else
+      SelfTest(2000);
+    Exit;
+  end;
+  port := 8080;
+  if ParamCount >= 1 then
+    port := StrToIntDef(ParamStr(1), 8080);
+  RaiseFdLimit;
+  l := TcpListenAt('', port, 1024);
+  if l < 0 then
+  begin
+    WriteLn('httpd: cannot listen on port ', port);
+    Halt(1);
+  end;
+  WriteLn('httpd: listening on port ', TcpPort(l), ' (GET /, /hello, /stats)');
+  Listen(l);
+end.
