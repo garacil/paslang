@@ -1,4 +1,20 @@
 #!/usr/bin/env python3
+# This file is part of paslang.
+# Copyright (C) 2026 Germán Luis Aracil Boned <garacil@tucall.com>
+#
+# paslang is free software: you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# paslang is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with paslang.  If not, see <https://www.gnu.org/licenses/>.
+
 """The exact model of testdata/hash1.paslang (P111): Python's hashlib,
 hmac and zlib for the standards, and the reference definitions of
 CRC-32C, FNV-1a, MurmurHash3 (x86, 32 bits) and SipHash-2-4, run over

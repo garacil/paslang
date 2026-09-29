@@ -1,4 +1,20 @@
 #!/usr/bin/env python3
+# This file is part of paslang.
+# Copyright (C) 2026 Germán Luis Aracil Boned <garacil@tucall.com>
+#
+# paslang is free software: you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# paslang is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with paslang.  If not, see <https://www.gnu.org/licenses/>.
+
 """Writes docs/manual/index.html, the paslang book in one page, from the
 canonical Markdown: the programmer's manual (docs/MANUAL.md, every
 program of which make check runs) and the chapters a programmer needs
@@ -412,12 +428,23 @@ JS = r'''
 '''
 
 
+NOTICE_MARK = '\n---\n\nCopyright (C) '
+NOTICE = ('Copyright (C) 2026 Germán Luis Aracil Boned. Permission is granted to copy, '
+          'distribute and/or modify this document under the terms of the GNU Free '
+          'Documentation License, Version 1.3 or any later version published by the Free '
+          'Software Foundation; with no Invariant Sections, no Front-Cover Texts, and no '
+          'Back-Cover Texts. A copy of the license is included in the file COPYING.DOC.')
+LICENSE_CSS = '.license{margin-top:3em;padding-top:1em;border-top:1px solid currentColor;font-size:.85em;opacity:.75}'
+
+
 def main():
     used = set()
     sections = []
     nav = []
     for part, name, label in PARTS:
         md = (DOCS / name).read_text(encoding='utf-8')
+        # Each chapter ends with the license notice; the page has it once.
+        md = md.split(NOTICE_MARK)[0]
         toc = []
         body = render(md, part, used, toc)
         sections.append('<section id="s-%s"><div class="partbanner">%s</div>%s</section>' % (part, esc(label), body))
@@ -445,12 +472,13 @@ def main():
 </nav>
 <main>
 %s
+<footer class="license"><p>%s</p></footer>
 </main>
 </div>
 <script>%s</script>
 </body>
 </html>
-''' % (CSS, ''.join(nav), '\n'.join(sections), JS)
+''' % (CSS + LICENSE_CSS, ''.join(nav), '\n'.join(sections), esc(NOTICE), JS)
     OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_text(page, encoding='utf-8')
     print('wrote', OUT, len(page), 'bytes,', sum(1 for _ in re.finditer(r'<h[23] ', page)), 'sections')

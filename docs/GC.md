@@ -448,3 +448,13 @@ rehash, Go's 52, and below Go only with the table split; p1alloccap from
 death at 256 MiB to a few MB. The runs replaced them (the table under
 "Where it stands"): b2str 11–12 MB against Go's 12–14, b5map 48 MB with
 the table split against Go's 52–54, p1alloccap to the end in 12 MB.
+
+---
+
+Copyright (C) 2026 Germán Luis Aracil Boned.
+
+Permission is granted to copy, distribute and/or modify this document
+under the terms of the GNU Free Documentation License, Version 1.3 or
+any later version published by the Free Software Foundation; with no
+Invariant Sections, no Front-Cover Texts, and no Back-Cover Texts. A
+copy of the license is included in the file COPYING.DOC.

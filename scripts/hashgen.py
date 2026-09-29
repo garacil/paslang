@@ -1,4 +1,20 @@
 #!/usr/bin/env python3
+# This file is part of paslang.
+# Copyright (C) 2026 Germán Luis Aracil Boned <garacil@tucall.com>
+#
+# paslang is free software: you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# paslang is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with paslang.  If not, see <https://www.gnu.org/licenses/>.
+
 """Writes src/lib/pashash.paslang (P111): every hash in Pascal with its
 rounds written out (a loop only over the blocks), a second body on the
 processor's instructions for SHA-1, SHA-256, SHA-512 (arm64) and the
@@ -688,7 +704,27 @@ def consts(name, typ, vals, fmt, per):
     return '\n'.join(L)
 
 
-HEAD = r'''{$mode objfpc}{$H+}
+HEAD = r'''{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacil@tucall.com>
+
+  paslang is free software: you can redistribute it and/or modify it
+  under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+
+  paslang is distributed in the hope that it will be useful, but
+  WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+  General Public License for more details.
+
+  Under Section 7 of GPL version 3, you are granted additional
+  permissions described in the paslang Runtime Library Exception,
+  version 1.0, in the file COPYING.RUNTIME.
+
+  You should have received a copy of the GNU General Public License
+  along with paslang.  If not, see <https://www.gnu.org/licenses/>. }
+
+{$mode objfpc}{$H+}
 
 { The hash words of the language (P111): Md5, Sha1, Sha224, Sha256,
   Sha384, Sha512, Sha3_224, Sha3_256, Sha3_384, Sha3_512, the HMAC of

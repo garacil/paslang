@@ -1,3 +1,19 @@
+# This file is part of paslang.
+# Copyright (C) 2026 Germán Luis Aracil Boned <garacil@tucall.com>
+#
+# paslang is free software: you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# paslang is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with paslang.  If not, see <https://www.gnu.org/licenses/>.
+
 # GNU installation directories. ./configure writes config.mk.
 # Defaults match the GNU coding standards, so make works before configure.
 -include config.mk
@@ -180,6 +196,9 @@ $(OUTDIR)/paslangc: $(PASLANG_SRC) $(CORE_UNITS) | $(OUTDIR) $(UNITDIR) $(HOSTDI
 	  echo "bootstrap paslangc via fpc"; \
 	  $(MAKE) hostsrc; \
 	  $(HOSTC) $(FLAGS) $(HOSTDIR)/paslangc.pas; \
+	  echo "paslangc by itself"; \
+	  $(MAKE) stage HOST="$(OUTDIR)/paslangc" STAGE="$(BUILDDIR)/paslangc.self"; \
+	  mv "$(BUILDDIR)/paslangc.self" "$(OUTDIR)/paslangc"; \
 	fi
 
 # The compiler reproduces itself: bin/paslangc builds the compiler into
@@ -2266,7 +2285,7 @@ install-strip:
 # bin (lib/paslang/aarch64 for the arm64 target). The amd64 archive also
 # carries the arm64 units, so its compiler can compile for arm64 with the
 # cross binutils. build/pkg/paslang-<version>-linux-<machine>.tar.gz.
-PKGDOCS := README.md LICENSE-GO docs/MANUAL.md docs/HELP.md docs/TYPES.md \
+PKGDOCS := README.md AUTHORS COPYING COPYING.RUNTIME COPYING.DOC LICENSE-GO docs/MANUAL.md docs/HELP.md docs/TYPES.md \
 	docs/GC.md docs/QUAD.md docs/KERNELS.md docs/VISION.md docs/CONSTRAINTS.md
 package: all compilers $(OUTDIR)/pasdbg
 	@set -e; \

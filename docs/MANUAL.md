@@ -5574,9 +5574,13 @@ begin
       AtomicAdd(@bad, 1);
       Break;
     end;
+    AtomicAdd(@served, 1);            { counted before the answer leaves: its client can end, and
+                                        the self-test read the count, before this routine runs again }
     if TcpWrite(C, Answer(method, path, keep)) < 0 then
+    begin
+      AtomicAdd(@served, -1);
       Break;
-    AtomicAdd(@served, 1);
+    end;
     more := keep;
   end;
   TcpClose(C);
@@ -7667,8 +7671,8 @@ begin
         Broadcast(c, payload)
       else
       begin
+        AtomicAdd(@echoed, 1);        { counted before the echo leaves: its client can end first }
         Send(c^.Out, Frame(op, payload, False, 0));
-        AtomicAdd(@echoed, 1);
       end;
     end;
   end;
@@ -8064,8 +8068,8 @@ begin
       Send(c^.Out, Who(c))
     else if line <> '' then
     begin
+      AtomicAdd(@said, 1);            { counted before the line leaves: the clients can end first }
       Say(c, line);
-      AtomicAdd(@said, 1);
     end;
   end;
   guard.Lock;
@@ -8425,10 +8429,13 @@ begin
       body := 'hello through the proxy' + #10
     else
       body := 'no' + #10;
+    AtomicAdd(@served, 1);            { counted before the answer leaves: its client can end first }
     if TcpWrite(C, 'HTTP/1.1 200 OK' + #13#10 + 'Content-Length: ' + IntToStr(Length(body)) + #13#10 +
       'Connection: keep-alive' + #13#10 + #13#10 + body) < 0 then
+    begin
+      AtomicAdd(@served, -1);
       Break;
-    AtomicAdd(@served, 1);
+    end;
   end;
   TcpClose(C);
 end;
@@ -9528,3 +9535,13 @@ The whole source tree is checked with `make check`: the golden programs
 in `testdata/`, the examples of this manual, the network tests, the
 stage-2 rebuild of the compiler by itself, and the arm64 build under
 qemu.
+
+---
+
+Copyright (C) 2026 Germán Luis Aracil Boned.
+
+Permission is granted to copy, distribute and/or modify this document
+under the terms of the GNU Free Documentation License, Version 1.3 or
+any later version published by the Free Software Foundation; with no
+Invariant Sections, no Front-Cover Texts, and no Back-Cover Texts. A
+copy of the license is included in the file COPYING.DOC.

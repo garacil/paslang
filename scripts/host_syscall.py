@@ -1,4 +1,20 @@
 #!/usr/bin/env python3
+# This file is part of paslang.
+# Copyright (C) 2026 Germán Luis Aracil Boned <garacil@tucall.com>
+#
+# paslang is free software: you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# paslang is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with paslang.  If not, see <https://www.gnu.org/licenses/>.
+
 """FPC bootstrap only: adapt the host copies in build/host so FPC takes them.
 
 paslangc compiles Syscall and Amd64 itself; FPC needs help:
@@ -57,9 +73,14 @@ MACRO = "{$MACRO ON}{$DEFINE Amd64:=1}{$DEFINE LongInt:=Int64}{$DEFINE Integer:=
 def adapt(path: Path) -> None:
     text = path.read_text()
     if MACRO not in text:
-        if not text.startswith(HEAD):
+        # The mode comes first, after the license notice if the file has one.
+        at = text.find(HEAD)
+        lead = text[:at]
+        if at < 0 or (lead and not (lead.startswith("{ This file is part of paslang.")
+                                    and lead.rstrip().endswith("}") and lead.count("}") == 1)):
             sys.exit("%s: does not start with %s" % (path, HEAD))
-        text = HEAD + MACRO + text[len(HEAD):]
+        at += len(HEAD)
+        text = text[:at] + MACRO + text[at:]
     if path.name == "paslinux.pas" and "function Syscall(" not in text:
         needle = "implementation\n"
         if needle not in text:

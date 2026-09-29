@@ -266,3 +266,13 @@ nearly equal values (cancellation); 18 fixed cases cover the ties to
 even, overflow, the smallest subnormal halved, 2^63 and -2^63 into an
 `Integer`, 2.5 and 3.5 rounded, exact cancellation, the invalid
 operations and NaN operands.
+
+---
+
+Copyright (C) 2026 Germán Luis Aracil Boned.
+
+Permission is granted to copy, distribute and/or modify this document
+under the terms of the GNU Free Documentation License, Version 1.3 or
+any later version published by the Free Software Foundation; with no
+Invariant Sections, no Front-Cover Texts, and no Back-Cover Texts. A
+copy of the license is included in the file COPYING.DOC.

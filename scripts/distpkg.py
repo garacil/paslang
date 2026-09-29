@@ -1,4 +1,20 @@
 #!/usr/bin/env python3
+# This file is part of paslang.
+# Copyright (C) 2026 Germán Luis Aracil Boned <garacil@tucall.com>
+#
+# paslang is free software: you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# paslang is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with paslang.  If not, see <https://www.gnu.org/licenses/>.
+
 """The packages of the distributions, for amd64 and arm64.
 
 From the release archives `make package` lays out in build/pkg (bin,
@@ -32,7 +48,7 @@ PKG = os.path.join(ROOT, "build", "pkg")
 DIST = os.path.join(PKG, "dist")
 WORK = os.path.join(PKG, "work")
 URL = "https://github.com/garacil/paslang"
-AUTHOR = "Germán Aracil <garacil@tucall.com>"
+AUTHOR = "Germán Luis Aracil Boned <garacil@tucall.com>"
 SUMMARY = "A new Pascal on a Go-shaped engine: compiler, runtime and library"
 LONG = [
     "paslang is Pascal with Go's engine underneath: 64-bit integers, UTF-8",
@@ -43,6 +59,69 @@ LONG = [
     "for GNU/Linux on amd64 and arm64, with no libc; a program compiled with",
     "-debug carries its own debugger, and pasdbg is its terminal.",
 ]
+LICENSE = ["GPL-3.0-or-later", "GPL-3.0-or-later WITH AdditionRef-paslang-Runtime-Library-exception-1.0",
+           "GFDL-1.3-no-invariants-or-later", "BSD-3-Clause"]
+COPYRIGHT = """Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: paslang
+Upstream-Contact: Germán Luis Aracil Boned <garacil@tucall.com>
+Source: %s
+
+Files: *
+Copyright: 2026 Germán Luis Aracil Boned <garacil@tucall.com>
+License: GPL-3+
+
+Files: src/lib/* src/compiler/pasemit.paslang
+Comment: the runtime library: the units, and the runtime paslangc writes
+ into every program it compiles.
+Copyright: 2026 Germán Luis Aracil Boned <garacil@tucall.com>
+License: GPL-3+ with paslang Runtime Library exception
+
+Files: src/lib/pashash.paslang
+Comment: the SHA-1, SHA-256, SHA-512 and CRC kernels follow the assembly
+ of Go 1.23.
+Copyright: 2026 Germán Luis Aracil Boned <garacil@tucall.com>
+ 2009 The Go Authors
+License: GPL-3+ with paslang Runtime Library exception and BSD-3-clause
+
+Files: docs/*
+Copyright: 2026 Germán Luis Aracil Boned <garacil@tucall.com>
+License: GFDL-NIV-1.3+
+
+License: GPL-3+
+ paslang is free software: you can redistribute it and/or modify it
+ under the terms of the GNU General Public License as published by
+ the Free Software Foundation, either version 3 of the License, or
+ (at your option) any later version.
+ .
+ paslang is distributed in the hope that it will be useful, but
+ WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ General Public License for more details.
+ .
+ The complete text of the GNU General Public License version 3 is in
+ /usr/share/doc/paslang/COPYING (on Debian systems also in
+ /usr/share/common-licenses/GPL-3).
+
+License: GPL-3+ with paslang Runtime Library exception
+ The GNU General Public License, version 3 or later, as above, with
+ the additional permissions of the paslang Runtime Library Exception,
+ version 1.0, under section 7 of the GPL: a program compiled with
+ paslang may be conveyed under terms of its author's choice. The
+ complete text of the exception is in
+ /usr/share/doc/paslang/COPYING.RUNTIME.
+
+License: BSD-3-clause
+ The complete text of Go's license is in /usr/share/doc/paslang/LICENSE-GO.
+
+License: GFDL-NIV-1.3+
+ Permission is granted to copy, distribute and/or modify this document
+ under the terms of the GNU Free Documentation License, Version 1.3 or
+ any later version published by the Free Software Foundation; with no
+ Invariant Sections, no Front-Cover Texts, and no Back-Cover Texts.
+ .
+ The complete text of the license is in /usr/share/doc/paslang/COPYING.DOC
+ (on Debian systems also in /usr/share/common-licenses/GFDL-1.3).
+"""
 MACHINES = [
     # (release archive name, deb, rpm, arch, slackware)
     ("amd64", "amd64", "x86_64", "x86_64", "x86_64"),
@@ -73,11 +152,7 @@ def stage(v, machine):
             os.chmod(p, 0o755 if dirpath.endswith("/usr/bin") else 0o644)
     doc = os.path.join(root, "usr/share/doc/paslang")
     with open(os.path.join(doc, "copyright"), "w") as f:
-        f.write("paslang\nCopyright 2026 Germán Aracil <garacil@tucall.com>\n"
-                "Source: %s\n\n"
-                "The SHA-1, SHA-256, SHA-512 and CRC kernels of src/lib/pashash.paslang\n"
-                "follow the assembly of Go 1.23; Go's license, which covers those parts,\n"
-                "is in LICENSE-GO beside this file.\n" % URL)
+        f.write(COPYRIGHT % URL)
     return root
 
 
@@ -117,7 +192,7 @@ def rpm(v, root, arch, machine):
 Version: %(v)s
 Release: 1
 Summary: %(summary)s
-License: LicenseRef-paslang AND BSD-3-Clause
+License: %(license)s
 URL: %(url)s
 Packager: %(author)s
 Requires: binutils
@@ -141,6 +216,7 @@ cp -a %(root)s/usr %%{buildroot}/
 /usr/share/doc/paslang
 /usr/share/paslang
 """ % {"v": v, "summary": SUMMARY, "url": URL, "author": AUTHOR, "suggests": suggests,
+       "license": " AND ".join(LICENSE),
        "long": "\n".join(LONG), "root": root}
     sp = os.path.join(top, "SPECS", "paslang.spec")
     with open(sp, "w") as f:
@@ -162,7 +238,7 @@ pkgrel=1
 pkgdesc='%(summary)s'
 arch=('x86_64' 'aarch64')
 url='%(url)s'
-license=('LicenseRef-paslang' 'BSD-3-Clause')
+license=(%(license)s)
 depends=('binutils')
 optdepends=('aarch64-linux-gnu-binutils: compile for arm64 on an x86-64 machine'
             'gdb: read the DWARF of a compiled program')
@@ -170,8 +246,11 @@ options=('!strip' '!debug' '!emptydirs')
 
 package() {
   cp -a '%(root)s/usr' "$pkgdir/"
+  install -Dm644 -t "$pkgdir/usr/share/licenses/paslang" \\
+    '%(root)s/usr/share/doc/paslang/COPYING.RUNTIME' '%(root)s/usr/share/doc/paslang/LICENSE-GO'
 }
-""" % {"v": v, "summary": SUMMARY, "url": URL, "root": root}
+""" % {"v": v, "summary": SUMMARY, "url": URL, "root": root,
+       "license": " ".join("'%s'" % l for l in LICENSE)}
     with open(os.path.join(b, "PKGBUILD"), "w") as f:
         f.write(pkgbuild)
     conf = open("/etc/makepkg.conf").read()

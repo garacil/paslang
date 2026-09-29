@@ -1,8 +1,25 @@
 #!/usr/bin/env python3
+# This file is part of paslang.
+# Copyright (C) 2026 Germán Luis Aracil Boned <garacil@tucall.com>
+#
+# paslang is free software: you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# paslang is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with paslang.  If not, see <https://www.gnu.org/licenses/>.
+
 """The manual and the examples must not drift.
 
 Every ```pascal block of docs/MANUAL.md that declares a program or a unit
-must be byte for byte the file of that name under examples/, and the
+must be byte for byte the file of that name under examples/ (after the
+license notice that heads the file), and the
 ``` block that follows a line reading "prints" must be that file's .out.
 Every example program must have an .out and be named in the examples
 block of the Makefile. Exit 1 on the first difference, with the reason.
@@ -24,6 +41,15 @@ def find_source(name: str) -> Path | None:
         if cand.exists():
             return cand
     return None
+
+
+def program_text(src: Path) -> str:
+    """The file without the license notice that heads it: the manual
+    shows the program alone."""
+    text = src.read_text()
+    if text.startswith("{ This file is part of paslang."):
+        text = text[text.index("}\n") + 2:].lstrip("\n")
+    return text
 
 
 def blocks(text: str):
@@ -59,7 +85,7 @@ def main() -> int:
             problems.append(f"manual block for {name} has no file under examples/")
             continue
         seen.add(src)
-        if src.read_text() != body:
+        if program_text(src) != body:
             problems.append(f"{src.relative_to(ROOT)} differs from its block in the manual")
         # The output block: the next fenced block after a line "prints".
         k = after
