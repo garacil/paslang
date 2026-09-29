@@ -33,13 +33,30 @@
   its own until the client lets it go; the others run on. Without the
   variable the hooks cost a call each and nothing listens. The tables
   the compiler writes into the section pasdbg say the routines, their
-  lines and their variables; the runtime gives the list of routines. }
+  lines and their variables; the runtime gives the list of routines.
+
+  The console (P120, 1.1.1): the program's first argument may ask for
+  it. --debug-mode runs the program with a console on its terminal,
+  stopped before its first statement; --debug-listen SOCKET serves the
+  socket and waits, stopped there, for a client; --debug-attach SOCKET
+  makes the executable a console for the program that listens there.
+  The words are taken out of the command line the program sees. The
+  console speaks the protocol like any client: gdb's short words, the
+  routine it stopped in as the one the commands act on, the source
+  around a stop, one variable, an empty line that repeats a step, and
+  Ctrl-C that stops every routine. pasdbg is the same console. }
 unit pasdebug;
 
 interface
 
 procedure PasDebugStart(HeapState, Tables, TablesEnd: Pointer);
 procedure PasDebugLine(Line: Integer; Fn, Frame: Pointer);
+
+{ A console on this terminal for the program that listens at Sock: it
+  connects (waiting up to five seconds for the program to listen) and
+  reads commands until quit or the end of the input. Owned says the
+  program is this process: quit ends it. }
+procedure PasDebugConsole(const Sock: string; Owned: Boolean);
 
 implementation
 
@@ -102,6 +119,8 @@ var
   PauseAll: Boolean;
   Stops: chan of Integer;
   SockPath: string;
+  Mode: Integer;          { 0 PASLANG_DEBUG's socket, 1 --debug-mode, 2 --debug-listen }
+  Interrupted: Boolean;   { Ctrl-C in a console: set by the handler CatchInterrupt installs }
 
 { ---- the tables ---- }
 
@@ -536,6 +555,107 @@ begin
   TcpWrite(C, S + #10);
 end;
 
+{ A break from its text: a line, file:line or a routine. Msg is the
+  reply, "break <n> at <text>" or the error. }
+function AddBreak(const A: string; out Msg: string): Boolean;
+var
+  k, n, f: Integer;
+begin
+  Result := False;
+  if A = '' then
+  begin
+    Msg := 'error: break line | break file:line | break routine';
+    Exit;
+  end;
+  k := 0;
+  for n := 1 to Length(A) do
+    if A[n] = ':' then
+      k := n;
+  f := -1;
+  if (k = 0) and (IntArg(A, 0) <= 0) then
+  begin
+    f := FnByName(A);
+    if f < 0 then
+    begin
+      Msg := 'error: no routine ' + A;
+      Exit;
+    end;
+  end;
+  Guard.Lock;
+  BreakNum := BreakNum + 1;
+  SetLength(Breaks, Length(Breaks) + 1);
+  Breaks[High(Breaks)].Num := BreakNum;
+  Breaks[High(Breaks)].Src := '';
+  Breaks[High(Breaks)].Line := 0;
+  Breaks[High(Breaks)].Fn := 0;
+  Breaks[High(Breaks)].Text := A;
+  if k > 0 then
+  begin
+    Breaks[High(Breaks)].Src := Copy(A, 1, k - 1);
+    Breaks[High(Breaks)].Line := IntArg(Copy(A, k + 1, Length(A) - k), 0);
+  end
+  else if f >= 0 then
+    Breaks[High(Breaks)].Fn := Fns[f].Start
+  else
+    Breaks[High(Breaks)].Line := IntArg(A, 0);
+  Guard.Unlock;
+  Msg := 'break ' + IntToStr(BreakNum) + ' at ' + A;
+  Result := True;
+end;
+
+{ list file:first [count]: Count lines of a source of the program from
+  First, each "<n><tab><text>". The file is read where the program
+  runs, by its name in the tables or its base name. }
+procedure ListSource(C: Integer; const Spec: string; Count: Integer);
+var
+  k, i, n, first: Integer;
+  name, path, text: string;
+begin
+  k := 0;
+  for i := 1 to Length(Spec) do
+    if Spec[i] = ':' then
+      k := i;
+  if k = 0 then
+  begin
+    Reply(C, 'error: list file:line [count]');
+    Exit;
+  end;
+  name := Copy(Spec, 1, k - 1);
+  first := IntArg(Copy(Spec, k + 1, Length(Spec) - k), 1);
+  if first < 1 then
+    first := 1;
+  path := '';
+  for i := 0 to High(Fns) do
+    if (Fns[i].Src = name) or (BaseName(Fns[i].Src) = name) then
+    begin
+      path := Fns[i].Src;
+      Break;
+    end;
+  if path = '' then
+  begin
+    Reply(C, 'error: no source ' + name);
+    Exit;
+  end;
+  if not ReadFile(path, text) then
+  begin
+    Reply(C, 'error: cannot read ' + path);
+    Exit;
+  end;
+  n := 1;
+  i := 1;
+  while (i <= Length(text)) and (n < first + Count) do
+  begin
+    k := i;
+    while (k <= Length(text)) and (text[k] <> #10) do
+      k := k + 1;
+    if n >= first then
+      Reply(C, IntToStr(n) + #9 + Copy(text, i, k - i));
+    n := n + 1;
+    i := k + 1;
+  end;
+  Reply(C, 'ok');
+end;
+
 { The frames of a stopped routine: its own, then up the chain of frame
   pointers while the return address is in a routine the tables know.
   Want -1 lists them; Want n gives frame n's pointer and routine. }
@@ -652,6 +772,7 @@ begin
   st^.Stopped := False;
   st^.Step := Mode;
   st^.StepFrame := st^.Frame;
+  PauseAll := False;
   Guard.Unlock;
   Send(st^.Resume, 1);
   Reply(C, 'ok');
@@ -686,13 +807,15 @@ begin
 end;
 
 { The program again from the start with the words given, the socket
-  the same: execve of /proc/self/exe with the environment as it is. }
+  the same: execve of /proc/self/exe with the environment as it is, the
+  words that asked for the debugger before those given, and the breaks
+  in PASLANG_DEBUG_BREAKS for the new program to set again. }
 procedure RunAgain(C: Integer; const Args: string);
 var
   argv: array of PChar;
   envp: array of PChar;
   env, w, exe: string;
-  i, k, n: Integer;
+  i, k, n, m: Integer;
   words: array of string;
 begin
   words := nil;
@@ -705,11 +828,27 @@ begin
     SetLength(words, Length(words) + 1);
     words[High(words)] := w;
   end;
-  SetLength(argv, Length(words) + 2);
-  argv[0] := CString(ParamStr(0));
+  SetLength(argv, Length(words) + 4);
+  m := 0;
+  argv[m] := CString(ParamStr(0));
+  m := m + 1;
+  if Mode = 1 then
+  begin
+    argv[m] := CString('--debug-mode');
+    m := m + 1;
+  end
+  else if Mode = 2 then
+  begin
+    argv[m] := CString('--debug-listen');
+    argv[m + 1] := CString(SockPath);
+    m := m + 2;
+  end;
   for k := 0 to High(words) do
-    argv[k + 1] := CString(words[k]);
-  argv[High(argv)] := nil;
+  begin
+    argv[m] := CString(words[k]);
+    m := m + 1;
+  end;
+  argv[m] := nil;
   envp := nil;
   if ReadFile('/proc/self/environ', env) then
   begin
@@ -719,13 +858,27 @@ begin
       k := i;
       while (k <= Length(env)) and (env[k] <> #0) do
         k := k + 1;
-      if k > i then
+      if (k > i) and (Copy(env, i, 21) <> 'PASLANG_DEBUG_BREAKS=') then
       begin
         SetLength(envp, Length(envp) + 1);
         envp[High(envp)] := CString(Copy(env, i, k - i));
       end;
       i := k + 1;
     end;
+  end;
+  w := '';
+  Guard.Lock;
+  for k := 0 to High(Breaks) do
+  begin
+    if w <> '' then
+      w := w + ',';
+    w := w + Breaks[k].Text;
+  end;
+  Guard.Unlock;
+  if w <> '' then
+  begin
+    SetLength(envp, Length(envp) + 1);
+    envp[High(envp)] := CString('PASLANG_DEBUG_BREAKS=' + w);
   end;
   SetLength(envp, Length(envp) + 1);
   envp[High(envp)] := nil;
@@ -741,7 +894,7 @@ end;
 
 procedure Session(C: Integer);
 var
-  buf, line, cmd, a, b: string;
+  buf, line, cmd, a, b, msg: string;
   i, g, n, k, f: Integer;
   st: PGState;
   ok: Boolean;
@@ -759,7 +912,7 @@ begin
     else if cmd = 'help' then
     begin
       Reply(C, 'routines | stopped | wait [ms] | where g | vars g [frame] | globals | functions');
-      Reply(C, 'break line | break file:line | break routine | breaks | delete n');
+      Reply(C, 'break line | break file:line | break routine | breaks | delete n | list file:line [n]');
       Reply(C, 'step g | next g | continue g | stop [g] | run [args...] | quit');
       Reply(C, 'ok');
     end
@@ -784,8 +937,13 @@ begin
         select
           Recv(Stops, g):
             begin
-              ok := True;
-              Break;
+              { a stop someone already saw through stopped, and let go
+                on, is not one to report }
+              Guard.Lock;
+              ok := StateOf(g)^.Stopped;
+              Guard.Unlock;
+              if ok then
+                Break;
             end;
         else
           begin
@@ -850,44 +1008,16 @@ begin
     end
     else if cmd = 'break' then
     begin
-      if a = '' then
-        Reply(C, 'error: break line | break file:line | break routine')
-      else
+      if AddBreak(a, msg) then
       begin
-        k := 0;
-        for n := 1 to Length(a) do
-          if a[n] = ':' then
-            k := n;
-        f := -1;
-        if (k = 0) and (IntArg(a, 0) <= 0) then
-        begin
-          f := FnByName(a);
-          if f < 0 then
-          begin
-            Reply(C, 'error: no routine ' + a);
-            Continue;
-          end;
-        end;
-        BreakNum := BreakNum + 1;
-        SetLength(Breaks, Length(Breaks) + 1);
-        Breaks[High(Breaks)].Num := BreakNum;
-        Breaks[High(Breaks)].Src := '';
-        Breaks[High(Breaks)].Line := 0;
-        Breaks[High(Breaks)].Fn := 0;
-        Breaks[High(Breaks)].Text := a;
-        if k > 0 then
-        begin
-          Breaks[High(Breaks)].Src := Copy(a, 1, k - 1);
-          Breaks[High(Breaks)].Line := IntArg(Copy(a, k + 1, Length(a) - k), 0);
-        end
-        else if f >= 0 then
-          Breaks[High(Breaks)].Fn := Fns[f].Start
-        else
-          Breaks[High(Breaks)].Line := IntArg(a, 0);
-        Reply(C, 'break ' + IntToStr(BreakNum) + ' at ' + a);
+        Reply(C, msg);
         Reply(C, 'ok');
-      end;
+      end
+      else
+        Reply(C, msg);
     end
+    else if cmd = 'list' then
+      ListSource(C, a, IntArg(b, 10))
     else if cmd = 'breaks' then
     begin
       for k := 0 to High(Breaks) do
@@ -898,6 +1028,7 @@ begin
     begin
       n := IntArg(a, -1);
       ok := False;
+      Guard.Lock;
       for k := 0 to High(Breaks) do
         if Breaks[k].Num = n then
         begin
@@ -906,6 +1037,7 @@ begin
           ok := True;
           Break;
         end;
+      Guard.Unlock;
       if ok then
         Reply(C, 'ok')
       else
@@ -938,6 +1070,11 @@ begin
       Reply(C, 'error: unknown command ' + cmd + ' (help)');
   end;
   TcpClose(C);
+  { the client is gone: its breaks with it, and every routine runs on }
+  Guard.Lock;
+  Breaks := nil;
+  Armed := False;
+  Guard.Unlock;
   ResumeAll;
 end;
 
@@ -976,12 +1113,741 @@ begin
   end;
 end;
 
+{ ---- the command line and Ctrl-C ---- }
+
+{ The first K words after the program's name leave its command line:
+  argv moves up K words and its first word goes with it, so the
+  environment, which the runtime finds after argv's end, stays where it
+  was. }
+procedure DropArgs(K: Integer);
+begin
+  asm amd64 (K: in rdi)
+    movq rt_argv(%rip), %rax
+    movq (%rax), %rcx
+    leaq (%rax,%rdi,8), %rax
+    movq %rcx, (%rax)
+    movq %rax, rt_argv(%rip)
+    subq %rdi, rt_argc(%rip)
+  end;
+  asm arm64 (K: in x0)
+    adrp x9, rt_argv
+    add x9, x9, :lo12:rt_argv
+    ldr x10, [x9]
+    ldr x11, [x10]
+    add x10, x10, x0, lsl #3
+    str x11, [x10]
+    str x10, [x9]
+    adrp x9, rt_argc
+    add x9, x9, :lo12:rt_argc
+    ldr x10, [x9]
+    sub x10, x10, x0
+    str x10, [x9]
+  end;
+end;
+
+{ Ctrl-C sets Interrupted instead of ending the process: a handler of
+  SIGINT that stores 1 and returns, on the signal stack, the system
+  call it broke restarted. }
+procedure CatchInterrupt;
+begin
+  asm amd64
+    jmp 92f
+  91:
+    movq $1, v_pasdebug.interrupted(%rip)
+    ret
+  92:
+    subq $32, %rsp
+    leaq 91b(%rip), %rax
+    movq %rax, (%rsp)
+    movq $469762048, 8(%rsp)
+    leaq rt_sigreturn(%rip), %rax
+    movq %rax, 16(%rsp)
+    movq $0, 24(%rsp)
+    movq $2, %rdi
+    movq %rsp, %rsi
+    xorq %rdx, %rdx
+    movq $8, %r10
+    movq $13, %rax
+    syscall
+    addq $32, %rsp
+  end;
+  asm arm64
+    b 92f
+  91:
+    adrp x9, v_pasdebug.interrupted
+    add x9, x9, :lo12:v_pasdebug.interrupted
+    mov x10, #1
+    str x10, [x9]
+    ret
+  92:
+    sub sp, sp, #32
+    adr x10, 91b
+    str x10, [sp]
+    movz x10, #0x1800, lsl #16
+    str x10, [sp, #8]
+    str xzr, [sp, #16]
+    str xzr, [sp, #24]
+    mov x0, #2
+    mov x1, sp
+    mov x2, #0
+    mov x3, #8
+    mov x8, #134
+    svc #0
+    add sp, sp, #32
+  end;
+end;
+
+function IsTty(Fd: Integer): Boolean;
+var
+  t: array[0..63] of Byte;
+begin
+  if Amd64 = 0 then
+    Result := Syscall(29, Fd, $5401, Integer(@t[0])) >= 0
+  else
+    Result := Syscall(16, Fd, $5401, Integer(@t[0])) >= 0;
+end;
+
+function GetPid: Integer;
+begin
+  if Amd64 = 0 then
+    Result := Syscall(172)
+  else
+    Result := Syscall(39);
+end;
+
+{ ---- the console ---- }
+
+type
+  TStrs = array of string;
+
+var
+  KC: Integer;           { the connection to the program's debugger }
+  KBuf: string;          { its bytes after the last line read }
+  KGone: Boolean;        { the program closed it: it ended or ran again }
+  KCur, KFrame: Integer; { the routine the commands act on, and its frame }
+  KFn, KSrc: string;     { where that routine stopped: its routine and file }
+  KLine: Integer;
+  KListSrc: string;      { what list shows next }
+  KListAt: Integer;
+  KLast: string;         { what an empty line repeats }
+
+function Clean(const S: string): string;
+var
+  i, j: Integer;
+begin
+  i := 1;
+  j := Length(S);
+  while (i <= j) and ((S[i] = ' ') or (S[i] = #9) or (S[i] = #13)) do
+    i := i + 1;
+  while (j >= i) and ((S[j] = ' ') or (S[j] = #9) or (S[j] = #13)) do
+    j := j - 1;
+  Result := Copy(S, i, j - i + 1);
+end;
+
+function PadL(const S: string; W: Integer): string;
+begin
+  Result := S;
+  while Length(Result) < W do
+    Result := ' ' + Result;
+end;
+
+{ One line of the terminal, a byte at a time: a line read ahead would
+  be lost to a run, which starts the program again in this process. }
+function ReadCmd(out Line: string): Boolean;
+var
+  ch: string;
+begin
+  Line := '';
+  while True do
+  begin
+    ch := TcpRead(0, 1);
+    if ch = '' then
+    begin
+      Result := Line <> '';
+      Exit;
+    end;
+    if ch = #10 then
+    begin
+      Result := True;
+      Exit;
+    end;
+    Line := Line + ch;
+  end;
+end;
+
+{ A request and its reply: the lines before "ok", True; the lines up to
+  an "error: ...", which they end with, False. }
+function Ask(const Req: string; out Lines: TStrs): Boolean;
+var
+  l: string;
+begin
+  Result := False;
+  Lines := nil;
+  if KGone then
+    Exit;
+  if TcpWrite(KC, Req + #10) < 0 then
+  begin
+    KGone := True;
+    Exit;
+  end;
+  while TcpReadLine(KC, KBuf, l) do
+  begin
+    if l = 'ok' then
+    begin
+      Result := True;
+      Exit;
+    end;
+    SetLength(Lines, Length(Lines) + 1);
+    Lines[High(Lines)] := l;
+    if Copy(l, 1, 7) = 'error: ' then
+      Exit;
+  end;
+  KGone := True;
+end;
+
+procedure Show(const Lines: TStrs);
+var
+  i: Integer;
+begin
+  for i := 0 to High(Lines) do
+    WriteLn(Lines[i]);
+end;
+
+function LastColon(const S: string): Integer;
+var
+  i: Integer;
+begin
+  Result := 0;
+  for i := 1 to Length(S) do
+    if S[i] = ':' then
+      Result := i;
+end;
+
+{ "stopped g3 at Work f.paslang:29" from wait, or "g3 stopped at Work
+  f.paslang:29" from stopped: g3 becomes the routine the commands act
+  on, at that place. }
+function TakeStop(const L: string): Boolean;
+var
+  i, k, g: Integer;
+  w, last, prev: string;
+begin
+  Result := False;
+  i := 1;
+  g := -1;
+  last := '';
+  prev := '';
+  while True do
+  begin
+    w := Word1(L, i);
+    if w = '' then
+      Break;
+    if (g < 0) and (Length(w) > 1) and (w[1] = 'g') then
+      g := IntArg(Copy(w, 2, Length(w) - 1), -1);
+    prev := last;
+    last := w;
+  end;
+  if g < 0 then
+    Exit;
+  KCur := g;
+  KFrame := 0;
+  KFn := prev;
+  k := LastColon(last);
+  KSrc := Copy(last, 1, k - 1);
+  KLine := IntArg(Copy(last, k + 1, Length(last) - k), 0);
+  KListSrc := KSrc;
+  KListAt := KLine - 5;
+  if KListAt < 1 then
+    KListAt := 1;
+  Result := True;
+end;
+
+{ Count lines of Src from First, the line a routine stopped at marked. }
+procedure ShowSource(const Src: string; First, Count: Integer);
+var
+  ls: TStrs;
+  i, t, n: Integer;
+  mark: string;
+begin
+  if First < 1 then
+    First := 1;
+  if not Ask('list ' + Src + ':' + IntToStr(First) + ' ' + IntToStr(Count), ls) then
+  begin
+    Show(ls);
+    Exit;
+  end;
+  for i := 0 to High(ls) do
+  begin
+    t := 1;
+    while (t <= Length(ls[i])) and (ls[i][t] <> #9) do
+      t := t + 1;
+    n := IntArg(Copy(ls[i], 1, t - 1), 0);
+    if (n = KLine) and (Src = KSrc) then
+      mark := '=> '
+    else
+      mark := '   ';
+    WriteLn(mark, PadL(IntToStr(n), 4), '  ', Copy(ls[i], t + 1, Length(ls[i]) - t));
+  end;
+end;
+
+procedure ShowStop;
+begin
+  WriteLn('g', KCur, ' stopped at ', KFn, ' ', KSrc, ':', KLine);
+  ShowSource(KSrc, KLine, 1);
+end;
+
+{ After continue, step, next or stop: until a routine stops, which
+  becomes the one the commands act on, or the program ends, or Limit ms
+  pass (0: no limit). Ctrl-C stops every routine at its next statement;
+  a second one gives the prompt back while the program runs on (a
+  routine waiting for input or a lock reaches no statement). }
+function WaitStop(Limit: Integer): Boolean;
+var
+  ls: TStrs;
+  ok: Boolean;
+  waited, hits: Integer;
+begin
+  Result := False;
+  waited := 0;
+  hits := 0;
+  while True do
+  begin
+    if Interrupted then
+    begin
+      Interrupted := False;
+      hits := hits + 1;
+      if hits > 1 then
+      begin
+        WriteLn('interrupt: the prompt again; the program runs on (wait waits for a stop)');
+        Exit;
+      end;
+      Ask('stop', ls);
+      WriteLn('interrupt: every routine stops at its next statement');
+    end;
+    ok := Ask('wait 200', ls);
+    if KGone then
+    begin
+      WriteLn('the program ended');
+      Exit;
+    end;
+    if ok and (Length(ls) > 0) and TakeStop(ls[0]) then
+    begin
+      ShowStop;
+      Result := True;
+      Exit;
+    end;
+    waited := waited + 200;
+    if (Limit > 0) and (waited >= Limit) then
+    begin
+      WriteLn('nothing stopped in ', Limit, ' ms: the routines are stopped already or wait for something (wait waits more)');
+      Exit;
+    end;
+  end;
+end;
+
+{ The routines stopped now; the first becomes the current one. }
+procedure ShowStopped;
+var
+  ls: TStrs;
+  i: Integer;
+begin
+  if Ask('stopped', ls) and (Length(ls) > 0) then
+  begin
+    for i := 1 to High(ls) do
+      WriteLn(ls[i]);
+    if TakeStop(ls[0]) then
+      ShowStop;
+  end
+  else
+    WriteLn('the program runs: break sets a break, stop stops every routine');
+end;
+
+{ file:line of a routine of the program, from functions. }
+function FnPlace(const Name: string): string;
+var
+  ls: TStrs;
+  i, j: Integer;
+  w: string;
+begin
+  Result := '';
+  if not Ask('functions', ls) then
+    Exit;
+  for i := 0 to High(ls) do
+  begin
+    j := 1;
+    w := Word1(ls[i], j);
+    if ToLower(w) = ToLower(Name) then
+    begin
+      Result := Word1(ls[i], j);
+      Exit;
+    end;
+  end;
+end;
+
+{ Connected when the greeting comes: a connection the program closes
+  without it (the program was starting again, as after run, and the old
+  one took the connection with it) is tried again, for five seconds. }
+function Connect(const Sock: string): Boolean;
+var
+  tries: Integer;
+  l: string;
+begin
+  Result := False;
+  KGone := False;
+  tries := 0;
+  while tries < 250 do
+  begin
+    KBuf := '';
+    KC := UnixConnect(Sock);
+    if KC >= 0 then
+    begin
+      if TcpReadLine(KC, KBuf, l) then
+      begin
+        Result := True;
+        Exit;
+      end;
+      TcpClose(KC);
+    end;
+    Sleep(20);
+    tries := tries + 1;
+  end;
+end;
+
+procedure ConsoleHelp;
+begin
+  WriteLn('  run [args] (r)            start the program again; the breaks stay');
+  WriteLn('  break [line | file:line | routine] (b)   a break; alone, at this line');
+  WriteLn('  breaks (info b)   delete n (d)');
+  WriteLn('  continue (c)   step (s)   next (n)   the current routine: on, a statement, over calls');
+  WriteLn('  stop                      every routine at its next statement (Ctrl-C too)');
+  WriteLn('  where (bt)   frame n (f)  the frames; the one vars and print read');
+  WriteLn('  vars (locals)   globals   print name (p)');
+  WriteLn('  list [line | file:line | routine] (l)   the source around the stop, or there');
+  WriteLn('  routines   routine n (g n)   functions   wait');
+  WriteLn('  quit (q)                  leave; under --debug-mode, the program ends too');
+  WriteLn('  An empty line repeats continue, step, next or list; any other line goes');
+  WriteLn('  to the program''s debugger as it is (raw help lists those requests).');
+end;
+
+procedure PasDebugConsole(const Sock: string; Owned: Boolean);
+var
+  line, cmd, a, rest, place: string;
+  i, n, k: Integer;
+  ls: TStrs;
+  echo, found: Boolean;
+begin
+  CatchInterrupt;
+  echo := not IsTty(0);
+  KCur := 0;
+  KFrame := 0;
+  KFn := '';
+  KSrc := '';
+  KLine := 0;
+  KListSrc := '';
+  KListAt := 1;
+  KLast := '';
+  if not Connect(Sock) then
+  begin
+    WriteLn(ErrOutput, 'pasdbg: nothing listens at ', Sock);
+    Exit;
+  end;
+  WriteLn('paslang debugger: help for the commands');
+  if Owned then
+    WaitStop(0)
+  else
+    ShowStopped;
+  while not KGone do
+  begin
+    Write('(pasdbg) ');
+    if not ReadCmd(line) then
+    begin
+      WriteLn;
+      Break;
+    end;
+    if echo then
+      WriteLn(line);
+    line := Clean(line);
+    if line = '' then
+      line := KLast;
+    KLast := '';
+    if line = '' then
+      Continue;
+    i := 1;
+    cmd := ToLower(Word1(line, i));
+    rest := Clean(Copy(line, i, Length(line) - i + 1));
+    a := Word1(line, i);
+    if (cmd = 'q') or (cmd = 'quit') or (cmd = 'exit') then
+      Break
+    else if (cmd = 'h') or (cmd = 'help') then
+      ConsoleHelp
+    else if cmd = 'raw' then
+    begin
+      Ask(rest, ls);
+      Show(ls);
+    end
+    else if (cmd = 'r') or (cmd = 'run') then
+    begin
+      Ask('run ' + rest, ls);
+      if Owned then
+        while True do
+          Sleep(1000);   { the program starts again in this process }
+      TcpClose(KC);
+      if not Connect(Sock) then
+      begin
+        WriteLn('the program does not listen again at ', Sock);
+        Exit;
+      end;
+      WriteLn('the program started again');
+      ShowStopped;
+    end
+    else if (cmd = 'b') or (cmd = 'break') then
+    begin
+      if (a = '') and (KLine > 0) then
+        a := KSrc + ':' + IntToStr(KLine);
+      Ask('break ' + a, ls);
+      Show(ls);
+    end
+    else if (cmd = 'd') or (cmd = 'delete') then
+    begin
+      if Ask('delete ' + a, ls) then
+        WriteLn('break ', a, ' deleted')
+      else
+        Show(ls);
+    end
+    else if (cmd = 'breaks') or (((cmd = 'i') or (cmd = 'info')) and
+      ((a = 'b') or (a = 'break') or (a = 'breaks') or (a = 'breakpoints'))) then
+    begin
+      if Ask('breaks', ls) and (Length(ls) = 0) then
+        WriteLn('no breaks')
+      else
+        Show(ls);
+    end
+    else if (cmd = 'c') or (cmd = 'continue') or (cmd = 's') or (cmd = 'step') or
+      (cmd = 'n') or (cmd = 'next') then
+    begin
+      if KCur <= 0 then
+        WriteLn('no routine is stopped: stop, or break and wait')
+      else
+      begin
+        if (cmd = 'c') or (cmd = 'continue') then
+          line := 'continue'
+        else if (cmd = 's') or (cmd = 'step') then
+          line := 'step'
+        else
+          line := 'next';
+        Interrupted := False;
+        if Ask(line + ' g' + IntToStr(KCur), ls) then
+        begin
+          KLast := line;
+          WaitStop(0);
+        end
+        else
+          Show(ls);
+      end;
+    end
+    else if cmd = 'stop' then
+    begin
+      Interrupted := False;
+      if Ask('stop', ls) then
+        WaitStop(1000)
+      else
+        Show(ls);
+    end
+    else if cmd = 'wait' then
+    begin
+      Interrupted := False;
+      WaitStop(0);
+    end
+    else if (cmd = 'bt') or (cmd = 'where') or (cmd = 'backtrace') then
+    begin
+      if Ask('where g' + IntToStr(KCur), ls) then
+        for k := 0 to High(ls) do
+          WriteLn('#', ls[k])
+      else
+        Show(ls);
+    end
+    else if (cmd = 'f') or (cmd = 'frame') then
+    begin
+      n := IntArg(a, 0);
+      found := False;
+      if Ask('where g' + IntToStr(KCur), ls) then
+        for k := 0 to High(ls) do
+        begin
+          i := 1;
+          if IntArg(Word1(ls[k], i), -1) = n then
+          begin
+            WriteLn('#', ls[k]);
+            KFrame := n;
+            found := True;
+          end;
+        end
+      else
+        Show(ls);
+      if not found then
+        WriteLn('no frame ', n);
+    end
+    else if (cmd = 'vars') or (cmd = 'locals') or
+      (((cmd = 'i') or (cmd = 'info')) and (a = 'locals')) then
+    begin
+      if Ask('vars g' + IntToStr(KCur) + ' ' + IntToStr(KFrame), ls) and (Length(ls) = 0) then
+        WriteLn('no local variables')
+      else
+        Show(ls);
+    end
+    else if cmd = 'globals' then
+    begin
+      Ask('globals', ls);
+      Show(ls);
+    end
+    else if (cmd = 'p') or (cmd = 'print') then
+    begin
+      if a = '' then
+        WriteLn('print name')
+      else
+      begin
+        found := False;
+        if (KCur > 0) and Ask('vars g' + IntToStr(KCur) + ' ' + IntToStr(KFrame), ls) then
+          for k := 0 to High(ls) do
+            if ToLower(Copy(ls[k], 1, Length(a) + 3)) = ToLower(a) + ' = ' then
+            begin
+              WriteLn(ls[k]);
+              found := True;
+            end;
+        if (not found) and Ask('globals', ls) then
+          for k := 0 to High(ls) do
+            if ToLower(Copy(ls[k], 1, Length(a) + 3)) = ToLower(a) + ' = ' then
+            begin
+              WriteLn(ls[k]);
+              found := True;
+            end;
+        if not found then
+          WriteLn('no variable ', a, ' here');
+      end;
+    end
+    else if (cmd = 'l') or (cmd = 'list') then
+    begin
+      place := '';
+      if a = '' then
+      begin
+        if KListSrc = '' then
+        begin
+          place := FnPlace('main');
+          k := LastColon(place);
+          KListSrc := Copy(place, 1, k - 1);
+          KListAt := IntArg(Copy(place, k + 1, Length(place) - k), 1) - 5;
+        end;
+      end
+      else
+      begin
+        k := LastColon(a);
+        if k > 0 then
+          place := a
+        else if IntArg(a, 0) > 0 then
+        begin
+          if KListSrc = '' then
+          begin
+            place := FnPlace('main');
+            KListSrc := Copy(place, 1, LastColon(place) - 1);
+          end;
+          place := KListSrc + ':' + a;
+        end
+        else
+          place := FnPlace(a);
+        if place = '' then
+        begin
+          WriteLn('no line or routine ', a);
+          Continue;
+        end;
+        k := LastColon(place);
+        KListSrc := Copy(place, 1, k - 1);
+        KListAt := IntArg(Copy(place, k + 1, Length(place) - k), 1) - 5;
+      end;
+      if KListAt < 1 then
+        KListAt := 1;
+      if KListSrc <> '' then
+      begin
+        ShowSource(KListSrc, KListAt, 10);
+        KListAt := KListAt + 10;
+        KLast := 'list';
+      end;
+    end
+    else if (cmd = 'g') or (cmd = 'routine') or (cmd = 'thread') then
+    begin
+      n := GArg(a);
+      found := False;
+      if Ask('stopped', ls) then
+        for k := 0 to High(ls) do
+        begin
+          i := 1;
+          if GArg(Word1(ls[k], i)) = n then
+          begin
+            TakeStop(ls[k]);
+            ShowStop;
+            found := True;
+          end;
+        end;
+      if not found then
+        WriteLn('g', n, ' is not stopped');
+    end
+    else if (cmd = 'routines') or (((cmd = 'i') or (cmd = 'info')) and (a = 'threads')) then
+    begin
+      Ask('routines', ls);
+      Show(ls);
+    end
+    else if cmd = 'functions' then
+    begin
+      Ask('functions', ls);
+      Show(ls);
+    end
+    else
+    begin
+      Ask(line, ls);
+      Show(ls);
+    end;
+  end;
+  if not KGone then
+    Ask('quit', ls);
+  TcpClose(KC);
+  if Owned then
+    Halt(0);
+end;
+
+{ --debug-mode: this process's console, as a routine of it that the
+  program does not wait for. }
+procedure Local;
+begin
+  Daemon;
+  PasDebugConsole(SockPath, True);
+  Halt(1);
+end;
+
 procedure PasDebugStart(HeapState, Tables, TablesEnd: Pointer);
 var
-  l: Integer;
+  l, i, k: Integer;
+  a, w, msg: string;
 begin
   HeapAddr := Integer(HeapState);
-  SockPath := GetEnv('PASLANG_DEBUG');
+  Mode := 0;
+  a := ParamStr(1);
+  if a = '--debug-mode' then
+  begin
+    DropArgs(1);
+    Mode := 1;
+    SockPath := '@pasdbg-' + IntToStr(GetPid);
+  end
+  else if ((a = '--debug-listen') or (a = '--debug-attach')) and (ParamCount >= 2) then
+  begin
+    SockPath := ParamStr(2);
+    DropArgs(2);
+    if a = '--debug-attach' then
+    begin
+      { this executable is a console for another process }
+      PasDebugConsole(SockPath, False);
+      Halt(0);
+    end;
+    Mode := 2;
+  end
+  else
+    SockPath := GetEnv('PASLANG_DEBUG');
   if SockPath = '' then
     Exit;
   ReadTables(Tables, TablesEnd);
@@ -991,9 +1857,39 @@ begin
   if l < 0 then
   begin
     WriteLn(ErrOutput, 'paslang: -debug cannot listen at ', SockPath);
+    if Mode > 0 then
+      Halt(1);
     Exit;
   end;
+  { the breaks a run carried over }
+  w := GetEnv('PASLANG_DEBUG_BREAKS');
+  i := 1;
+  while i <= Length(w) do
+  begin
+    k := i;
+    while (k <= Length(w)) and (w[k] <> ',') do
+      k := k + 1;
+    if k > i then
+      AddBreak(Copy(w, i, k - i), msg);
+    i := k + 1;
+  end;
+  if Mode > 0 then
+  begin
+    { the main routine stops before its first statement }
+    Armed := True;
+    Guard.Lock;
+    StateOf(Goid)^.Freeze := True;
+    Guard.Unlock;
+  end;
   pas Serve(l);
+  if Mode = 1 then
+    pas Local;
 end;
+
+finalization
+  { the main routine reached its end.: under --debug-mode the console
+    says so (a Halt ends the program without it) }
+  if Mode = 1 then
+    WriteLn('the program ended');
 
 end.

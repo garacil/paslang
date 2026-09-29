@@ -595,6 +595,22 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	if ! nm $(BUILDDIR)/debug1 | grep -q p_pasdebug_pasdebugline; then echo "the -debug program has no debugger"; exit 1; fi; \
 	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(OUTDIR)/pasdbg cmd/pasdbg/pasdbg.paslang; \
 	echo ok debug; \
+	echo "==== debug console ===="; \
+	$(OUTDIR)/paslangc -debug -Fu $(BUILDDIR) -o $(BUILDDIR)/debug2 testdata/debug2.paslang; \
+	DEBUG2_ENV=yes timeout 60 $(BUILDDIR)/debug2 --debug-mode one two < testdata/debug2.in > $(BUILDDIR)/debug2.got 2>&1; \
+	diff -u testdata/debug2.out $(BUILDDIR)/debug2.got; \
+	DEBUG2_ENV=yes timeout 60 $(BUILDDIR)/debug2 --debug-mode < testdata/debug2run.in > $(BUILDDIR)/debug2run.got 2>&1; \
+	diff -u testdata/debug2run.out $(BUILDDIR)/debug2run.got; \
+	for t in debug2attach debug2attrun; do \
+	  s=@paslang-$$t-$$$$; \
+	  DEBUG2_ENV=yes timeout 60 $(BUILDDIR)/debug2 --debug-listen $$s x y > $(BUILDDIR)/$$t.prog 2>&1 & p=$$!; \
+	  timeout 60 $(BUILDDIR)/debug2 --debug-attach $$s < testdata/$$t.in > $(BUILDDIR)/$$t.got 2>&1; \
+	  wait $$p; \
+	  echo '--- the program' >> $(BUILDDIR)/$$t.got; \
+	  cat $(BUILDDIR)/$$t.prog >> $(BUILDDIR)/$$t.got; \
+	  diff -u testdata/$$t.out $(BUILDDIR)/$$t.got; \
+	done; \
+	echo ok debug-console; \
 	echo "==== tcppark ===="; \
 	$(OUTDIR)/paslangc -c src/lib/pasnet.paslang; \
 	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/tcppark testdata/tcppark.paslang; \
@@ -2144,6 +2160,18 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	PASLANG_DEBUG=@paslang-debug1-arm-$$$$ timeout 120 $(QEMU_A64) $(BUILDDIR)/debug1-arm @paslang-debug1-arm-$$$$ > $(BUILDDIR)/debug1-arm.got; \
 	diff -u testdata/debug1.out $(BUILDDIR)/debug1-arm.got; \
 	echo ok debug-arm; \
+	echo "==== debug console arm64 ===="; \
+	$(OUTDIR)/paslangc -target arm64 -debug -Fu $(BUILDDIR)/a64 -o $(BUILDDIR)/debug2-arm testdata/debug2.paslang; \
+	DEBUG2_ENV=yes timeout 120 $(QEMU_A64) $(BUILDDIR)/debug2-arm --debug-mode one two < testdata/debug2.in > $(BUILDDIR)/debug2-arm.got 2>&1; \
+	diff -u testdata/debug2.out $(BUILDDIR)/debug2-arm.got; \
+	s=@paslang-debug2attach-arm-$$$$; \
+	DEBUG2_ENV=yes timeout 120 $(QEMU_A64) $(BUILDDIR)/debug2-arm --debug-listen $$s x y > $(BUILDDIR)/debug2attach-arm.prog 2>&1 & p=$$!; \
+	timeout 120 $(QEMU_A64) $(BUILDDIR)/debug2-arm --debug-attach $$s < testdata/debug2attach.in > $(BUILDDIR)/debug2attach-arm.got 2>&1; \
+	wait $$p; \
+	echo '--- the program' >> $(BUILDDIR)/debug2attach-arm.got; \
+	cat $(BUILDDIR)/debug2attach-arm.prog >> $(BUILDDIR)/debug2attach-arm.got; \
+	diff -u testdata/debug2attach.out $(BUILDDIR)/debug2attach-arm.got; \
+	echo ok debug-console-arm; \
 	echo "==== network servers arm64 ===="; \
 	$(OUTDIR)/paslangc -target arm64 -c src/lib/pasnet.paslang; \
 	for t in httpd dnsd termd ftpd ntpd wsd chat proxy; do \

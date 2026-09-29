@@ -9095,13 +9095,17 @@ program runs as it is until the environment names a socket:
 $ paslangc -debug prog.paslang
 $ PASLANG_DEBUG=/tmp/prog.sock ./a.out args...      # a path
 $ PASLANG_DEBUG=@prog ./a.out args...               # an abstract name
-$ pasdbg /tmp/prog.sock                             # the terminal
+$ pasdbg /tmp/prog.sock                             # the console
 ```
+
+or the program's first argument asks for the console (below):
+`./a.out --debug-mode args...` runs it with a console on its own
+terminal.
 
 Then it listens there, one client at a time, and answers a text
 protocol: one request a line, a reply of lines that ends in `ok` or
-`error: ...`. `pasdbg <socket>` is a terminal for it (`bin/pasdbg`,
-built from `cmd/pasdbg` by `make` and installed with the compiler); `pasdbg <socket> <command>` sends one command and prints
+`error: ...`. `pasdbg <socket>` is the console for it (`bin/pasdbg`,
+built from `cmd/pasdbg` by `make` and installed with the compiler); `pasdbg <socket> <request>` sends one request and prints
 the reply; and any program that opens the socket (an editor, a script,
 another paslang program) speaks the same lines. Without `-debug` a
 program carries none of it, and without the variable the hooks cost a
@@ -9111,11 +9115,12 @@ call each and nothing listens.
 |---|---|
 | `routines` | every live routine: `g<n> <state>`, the state `running`, `ready`, `waiting` or `parked`, followed by `at <routine> <file>:<line>` for one the debugger has seen a statement of, or `stopped at <routine> <file>:<line>` for one it stopped |
 | `stopped` | the routines stopped by the debugger and where each is |
-| `wait [ms]` | waits until a routine stops (5000 ms by default) and says which and where; `error: nothing stopped in <ms> ms` otherwise |
+| `wait [ms]` | waits until a routine stops (5000 ms by default) and says which and where; `error: nothing stopped in <ms> ms` otherwise; a stop already seen through `stopped` and let go on is not reported |
 | `where g<n>` | the frames of a stopped routine, its own first: `<depth> <routine> <file>:<line>`, up the frame pointers while the return address is in a routine the tables know |
 | `vars g<n> [frame]` | the variables of a frame (0, its own, by default): `name = value`, an integer as a number, a string quoted the Pascal way (`'it''s'#10`), a real with six decimals, a Boolean, a Char, a pointer as `nil` or `$hex`, anything else as `<n bytes>`; a variable a closure holds is read through its box |
 | `globals` | the program's global variables the same way |
 | `functions` | every routine with its source and first line, and `main` |
+| `list <file>:<line> [n]` | n lines (10 by default) of a source of the program from that line, each `<line><tab><text>`; the file by its name in the tables or its base name, read where the program runs |
 | `break <line>`, `break <file>:<line>`, `break <routine>` | a break at a line of the program (or of that file) or at every entry of a routine; the reply numbers it |
 | `breaks` | the breaks set |
 | `delete <n>` | removes one |
@@ -9125,7 +9130,7 @@ call each and nothing listens.
 | `stop [g<n>]` | stops one routine, or every routine, at its next statement |
 | `run [args...]` | starts the program again from the beginning with those words as its command line, the environment (and the socket) the same, and closes the session |
 | `help` | the commands |
-| `quit` | ends the session; every stopped routine runs on |
+| `quit` | ends the session; its breaks go and every stopped routine runs on |
 
 A routine that stops parks on a channel of its own and the others run
 on; the socket is served by a routine of the program, so the program
@@ -9321,6 +9326,91 @@ ok
 ok
 total 63
 ```
+
+### The console
+
+A program compiled with `-debug` takes one of three words as its first
+argument, and the words leave its command line before it starts:
+`ParamCount` and `ParamStr` see the rest, and the environment is as it
+was.
+
+| Word | What the program does |
+|---|---|
+| `--debug-mode args...` | runs with a console on its terminal, stopped before its first statement |
+| `--debug-listen <socket> args...` | serves the socket and waits there, stopped before its first statement, for a console or any client |
+| `--debug-attach <socket>` | does not run: it is a console for the program that listens at the socket (waiting up to five seconds for it) |
+
+`pasdbg <socket>` is the same console, for a program started with
+`PASLANG_DEBUG` (which runs at once) or `--debug-listen`. The console
+speaks the protocol above; the routine that stopped last is the one its
+commands act on, so `step` needs no `g<n>`:
+
+```
+$ paslangc -debug -o debug2 testdata/debug2.paslang
+$ ./debug2 --debug-mode one two
+paslang debugger: help for the commands
+g1 stopped at main debug2.paslang:26
+=>   26    name := 'debug2';
+(pasdbg) b Square
+break 1 at Square
+(pasdbg) c
+args 2 one two
+env 
+g1 stopped at Square debug2.paslang:19
+=>   19    r := X * X;
+(pasdbg) bt
+#0 Square debug2.paslang:19
+#1 main debug2.paslang:31
+(pasdbg) p X
+X = 1
+(pasdbg) n
+g1 stopped at Square debug2.paslang:20
+=>   20    Result := r;
+(pasdbg) d 1
+break 1 deleted
+(pasdbg) c
+total 14 of debug2
+the program ended
+```
+
+| Command | Short | What it does |
+|---|---|---|
+| `break [line \| file:line \| routine]` | `b` | a break; alone, at the line the routine stopped at |
+| `breaks`, `info b` | | the breaks |
+| `delete n` | `d` | removes one |
+| `continue` | `c` | lets the current routine run until a routine stops or the program ends |
+| `step` | `s` | to its next statement, in any routine |
+| `next` | `n` | to its next statement in this frame or an outer one |
+| `stop` | | every routine at its next statement (waits a second for one) |
+| `wait` | | waits for a routine to stop |
+| `where` | `bt` | the frames, `#0` its own |
+| `frame n` | `f` | the frame `vars` and `print` read |
+| `vars`, `locals` | | the frame's variables |
+| `globals` | | the program's global variables |
+| `print name` | `p` | one variable, of the frame or global |
+| `list [line \| file:line \| routine]` | `l` | ten lines around the stop, or around there; again, the next ten |
+| `routines` | | every routine and where it is |
+| `routine n` | `g` | makes a stopped routine the current one |
+| `functions` | | the routines of the program |
+| `run [args]` | `r` | starts the program again with those arguments, the breaks kept |
+| `quit` | `q` | leaves: under `--debug-mode` the program ends; otherwise it runs on without its breaks |
+| `help` | `h` | the commands |
+
+An empty line repeats `continue`, `step`, `next` or `list`. Any other
+line, or `raw` and a request, goes to the program's debugger as it is.
+While the program runs, Ctrl-C stops every routine at its next
+statement; a second Ctrl-C gives the prompt back and the program runs
+on, since a routine waiting for input or a lock reaches no statement.
+The end of the input (Ctrl-D) is `quit`. Under `--debug-mode` the
+program and the console share the terminal, and the console reads it
+only while something is stopped: a program that reads its standard
+input is debugged with `--debug-listen` in one terminal and
+`--debug-attach` (or `pasdbg`) in another. `run` starts the program
+again in the same process with the same words, the breaks passed in
+`PASLANG_DEBUG_BREAKS`; the console of `--debug-attach` connects again
+to the new one. `testdata/debug2.paslang` runs under `make check` with
+the commands on standard input, under `--debug-mode` and under
+`--debug-listen` with `--debug-attach`, on both machines.
 
 ## 18. Limits and differences from other Pascals
 

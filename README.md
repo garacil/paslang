@@ -40,8 +40,13 @@ Source files use the `.paslang` extension.
   a collector that reads compiled frames through the compiler's stack
   maps.
 - **A debugger inside the executable.** A program compiled with `-debug`
-  answers a line protocol on a Unix socket: routines, frames, variables
-  and their values, breakpoints, stepping. `pasdbg` is its terminal.
+  carries its own debugger: `./prog --debug-mode` runs it into a console
+  on its terminal, stopped before its first statement, with gdb's short
+  commands (break, step, next, continue, print, backtrace, list), and
+  Ctrl-C stops it; `./prog --debug-listen <socket>` waits for a console
+  that `./prog --debug-attach <socket>` or `pasdbg` opens from another
+  terminal. Underneath, a line protocol on a Unix socket: routines,
+  frames, variables and their values, breakpoints, stepping.
 
 `examples/` has HTTP, DNS, FTP, NTP, WebSocket, chat, terminal and proxy
 servers, each with a self-test of thousands of clients in one process.
