@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # This file is part of paslang.
-# Copyright (C) 2026 Germán Luis Aracil Boned <garacil@tucall.com>
+# Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
 #
 # paslang is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -48,7 +48,7 @@ PKG = os.path.join(ROOT, "build", "pkg")
 DIST = os.path.join(PKG, "dist")
 WORK = os.path.join(PKG, "work")
 URL = "https://github.com/garacil/paslang"
-AUTHOR = "Germán Luis Aracil Boned <garacil@tucall.com>"
+AUTHOR = "Germán Luis Aracil Boned <garacilb@gmail.com>"
 SUMMARY = "A new Pascal on a Go-shaped engine: compiler, runtime and library"
 LONG = [
     "paslang is Pascal with Go's engine underneath: 64-bit integers, UTF-8",
@@ -63,28 +63,28 @@ LICENSE = ["GPL-3.0-or-later", "GPL-3.0-or-later WITH AdditionRef-paslang-Runtim
            "GFDL-1.3-no-invariants-or-later", "BSD-3-Clause"]
 COPYRIGHT = """Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: paslang
-Upstream-Contact: Germán Luis Aracil Boned <garacil@tucall.com>
+Upstream-Contact: Germán Luis Aracil Boned <garacilb@gmail.com>
 Source: %s
 
 Files: *
-Copyright: 2026 Germán Luis Aracil Boned <garacil@tucall.com>
+Copyright: 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
 License: GPL-3+
 
 Files: src/lib/* src/compiler/pasemit.paslang
 Comment: the runtime library: the units, and the runtime paslangc writes
  into every program it compiles.
-Copyright: 2026 Germán Luis Aracil Boned <garacil@tucall.com>
+Copyright: 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
 License: GPL-3+ with paslang Runtime Library exception
 
 Files: src/lib/pashash.paslang
 Comment: the SHA-1, SHA-256, SHA-512 and CRC kernels follow the assembly
  of Go 1.23.
-Copyright: 2026 Germán Luis Aracil Boned <garacil@tucall.com>
+Copyright: 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
  2009 The Go Authors
 License: GPL-3+ with paslang Runtime Library exception and BSD-3-clause
 
 Files: docs/*
-Copyright: 2026 Germán Luis Aracil Boned <garacil@tucall.com>
+Copyright: 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
 License: GFDL-NIV-1.3+
 
 License: GPL-3+
