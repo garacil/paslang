@@ -226,6 +226,12 @@ type
     function CoreType(K: TTokKind): LongInt;
     function CoreCall(const PName: string; Base: PExpr; const Extra: TExprArray): PExpr;
     function CoreProc(const PName: string; const Args: TExprArray; Ret: LongInt): PExpr;
+    function VmtOf(E: PExpr): PExpr;
+    function IsClassWord(const Name: string): Boolean;
+    function ClassWord(Base: PExpr; const Name: string; const Args: TExprArray): PExpr;
+    function MethIndexNamed(Typ: LongInt; const Name: string): LongInt;
+    function OuterDtorCall(E: PExpr): Boolean;
+    function DtorStmt(E: PExpr; ALine: LongInt): PStmt;
     procedure CheckOutVar(V: PExpr; Typ: LongInt; const What: string);
     procedure CheckLeaves(E: PExpr; const What: string);
     function CoreMethod(Base: PExpr; const MName: string): PExpr;
@@ -4181,11 +4187,11 @@ begin
   FCoreNames[k] := N;
 end;
 
-{ The seven units the language is built on: LoadCore links them into
+{ The eight units the language is built on: LoadCore links them into
   every program and unit without a uses clause. }
 function TParser.IsCoreUnit(const AName: string): Boolean;
 begin
-  Result := SameId(AName, 'pasroutines') or SameId(AName, 'pasmap') or
+  Result := SameId(AName, 'pasobject') or SameId(AName, 'pasroutines') or SameId(AName, 'pasmap') or
     SameId(AName, 'pashash') or SameId(AName, 'pastree') or
     SameId(AName, 'pasheap') or SameId(AName, 'pasfmt') or SameId(AName, 'pasquad');
 end;
@@ -5263,7 +5269,7 @@ var
   nn, i, n: SizeInt;
   off, sz, t, slot, nindex, keepSlot: LongInt;
   mname, rname, wname, baseSym: string;
-  isVirt, isAbs, isFunc, isCtor, byref, pub, eq, msafe: Boolean;
+  isVirt, isAbs, isFunc, isCtor, isDtor, byref, pub, eq, msafe: Boolean;
   npar: LongInt;
   pt: LongInt;
   parent, ov: LongInt;
@@ -5333,6 +5339,37 @@ begin
       FTok := FLex.Next;
     end;
     Eat(tkRParen);
+  end;
+  { A class with no parent descends from TObject (P121), as in Object
+    Pascal: TObject's virtual methods take the first slots, Free and the
+    class words reach every object. TObject itself, in the core unit
+    pasobject, is the one class with no parent. }
+  if (parent = 0) and (not SameId(AName, 'TObject')) and NamedType('TObject', t) and
+    (TypeOf(t).Kind = tykClass) then
+  begin
+    parent := t;
+    par := TypeOf(parent);
+    n := Length(par.Fields);
+    SetLength(td.Fields, n);
+    for i := 0 to n - 1 do
+      td.Fields[i] := par.Fields[i];
+    n := Length(par.Meths);
+    SetLength(td.Meths, n);
+    for i := 0 to n - 1 do
+      td.Meths[i] := par.Meths[i];
+    n := Length(par.Props);
+    SetLength(td.Props, n);
+    for i := 0 to n - 1 do
+      td.Props[i] := par.Props[i];
+    for i := 0 to High(par.Ifaces) do
+    begin
+      n := Length(td.Ifaces);
+      SetLength(td.Ifaces, n + 1);
+      td.Ifaces[n] := par.Ifaces[i];
+    end;
+    off := par.Size;
+    slot := par.VmtN;
+    td.Parent := parent;
   end;
   while FTok.Kind <> tkEnd do
   begin
@@ -5454,6 +5491,7 @@ begin
       (FTok.Kind = tkConstructor) or (FTok.Kind = tkDestructor) then
     begin
       isCtor := FTok.Kind = tkConstructor;
+      isDtor := FTok.Kind = tkDestructor;
       isFunc := FTok.Kind = tkFunction;
       FTok := FLex.Next;
       if FTok.Kind <> tkIdent then
@@ -5584,6 +5622,7 @@ begin
       td.Meths[n].Name := mname;
       td.Meths[n].Sym := baseSym;
       td.Meths[n].IsCtor := isCtor;
+      td.Meths[n].IsDtor := isDtor;
       td.Meths[n].IsVirt := isVirt or ((ov >= 0) and td.Meths[n].IsVirt);
       td.Meths[n].IsAbs := isAbs;
       td.Meths[n].IsFunc := isFunc;
@@ -6195,6 +6234,15 @@ begin
       have := True;
   if not have then
   begin
+    { ClassName and its kin alone in a method are Self's (P121) }
+    if IsClassWord(AName) then
+    begin
+      args := nil;
+      if FTok.Kind = tkLParen then
+        args := ParseArgList;
+      Result := ClassWord(NewVar('self', FClassTyp), AName, args);
+      Exit;
+    end;
     { Free alone in a method is Self.Free (1.0.137) }
     if SameId(AName, 'Free') and (FTok.Kind <> tkLParen) then
     begin
@@ -6299,7 +6347,14 @@ begin
         end;
         if not found then
         begin
-          if SameId(name, 'Free') then
+          if IsClassWord(name) then
+          begin
+            { ClassName, InstanceSize, ClassNameIs of the object's class
+              (P121), read from its method table }
+            E := ClassWord(E, name, args);
+            found := True;
+          end
+          else if SameId(name, 'Free') then
           begin
             { Flags 16: x.Free, which calls x's Destroy when x is not nil
               (1.0.137); the statement makes it (FreeStmt) }
@@ -9129,6 +9184,8 @@ begin
         args[id] := NewAddr(args[id]);
     Result := NewMethod(NewVar('self', FClassTyp), st.Meths[i].Sym,
       args, st.Meths[i].RetTyp, -1);
+    { Flags 32: an inherited call, never an outermost destructor (P121) }
+    Result^.Flags := Result^.Flags or 32;
   end;
   if Result = nil then
   begin
@@ -12497,6 +12554,12 @@ begin
         end
         else if (e^.Kind = ekMethod) and ((e^.Flags and 16) <> 0) then
           st := FreeStmt(e^.L, lno)
+        else if OuterDtorCall(e) then
+        begin
+          if e^.Kind = ekMethPtr then
+            NoArgsCall(e);
+          st := DtorStmt(e, lno);
+        end
         else if e^.Kind = ekMethod then
         begin
           st := NewStmt(skCall);
@@ -13120,7 +13183,10 @@ begin
   if Copy(data, 1, 11) = 'PASLANGI12' + #10 then
     Die(path + ' was compiled by a paslang older than 1.0.137; compile ' +
       AName + ' again');
-  if (Copy(data, 1, 8) = 'PASLANGI') and (Copy(data, 1, 11) <> 'PASLANGI13' + #10) then
+  if Copy(data, 1, 11) = 'PASLANGI13' + #10 then
+    Die(path + ' was compiled by a paslang older than 1.1.2; compile ' +
+      AName + ' again');
+  if (Copy(data, 1, 8) = 'PASLANGI') and (Copy(data, 1, 11) <> 'PASLANGI14' + #10) then
     Die(path + ' was compiled by a newer paslang (' + FirstLine(data) +
       '); compile ' + AName + ' again with this one');
   if not ParseIface(data, iface) then
@@ -13232,6 +13298,10 @@ procedure TParser.LoadCore;
 begin
   if IsCoreUnit(FUnitName) then
     Exit;
+  { TObject (P121): the root of every class, so first; a class declared
+    after it with no parent descends from it. }
+  if FindPi('pasobject') <> '' then
+    LoadUnit('pasobject', False);
   { Quad's arithmetic (P103): linked into every program, 17 KB, so a unit
     that works in Quad inside needs nothing of the program. }
   if FindPi('pasquad') <> '' then
@@ -13416,10 +13486,10 @@ end;
   A class without a constructor of its own gets the plain allocation. }
 function TParser.ParseCtorCall(Id: LongInt): PExpr;
 var
-  st: TTypeDef;
+  st, rt: TTypeDef;
   mname: string;
   args: TExprArray;
-  i, k, best, byCount, named, nline, ncol: LongInt;
+  i, k, best, byCount, named, nline, ncol, root, ai, ri: LongInt;
   fits: Boolean;
 begin
   if FTok.Kind <> tkDot then
@@ -13472,6 +13542,20 @@ begin
   if ClassAbstract(Id) then
     Die('abstract class ' + st.Name);
   Result^.Args := args;
+  { TObject's own Create and AfterConstruction do nothing (P121): no call
+    is written for them. A class that overrides AfterConstruction has it
+    called on the new object, which is of that class, so directly. }
+  if NamedType('TObject', root) and (TypeOf(root).Kind = tykClass) and (Id <> root) then
+  begin
+    rt := TypeOf(root);
+    for i := 0 to High(rt.Meths) do
+      if (rt.Meths[i].Sym = Result^.Name) and rt.Meths[i].IsCtor then
+        Result^.Name := '';
+    ai := MethIndexNamed(Id, 'AfterConstruction');
+    ri := MethIndexNamed(root, 'AfterConstruction');
+    if (ai >= 0) and (ri >= 0) and (st.Meths[ai].Sym <> rt.Meths[ri].Sym) then
+      Result^.Str := st.Meths[ai].Sym;
+  end;
 end;
 
 { mu.Lock, wg.Add(2), c.Wait(mu): the methods of the sync types. }
@@ -14703,40 +14787,138 @@ begin
   end;
 end;
 
-{ x.Free (1.0.137), as in Delphi and FPC: x once, into a hidden local, and
-  its Destroy when it is not nil, through its slot when Destroy is
-  virtual. The memory stays with the collector. With no Destroy, Free
-  frees nothing, as before; x is still worked out when it calls. }
+{ x.Free (1.0.137), as in Delphi and FPC: pasobject's PasObjFree (P121),
+  x worked out once, then its BeforeDestruction and Destroy through
+  their slots when x is not nil. The memory stays with the collector. }
 function TParser.FreeStmt(X: PExpr; ALine: LongInt): PStmt;
 var
-  di: SizeInt;
+  a: TExprArray;
+  e: PExpr;
+begin
+  a := nil;
+  SetLength(a, 1);
+  a[0] := X;
+  e := CoreProc('PasObjFree', a, TyNone);
+  Result := NewStmt(skCall);
+  Result^.Line := ALine;
+  Result^.Name := e^.Name;
+  Result^.Args := e^.Args;
+end;
+
+{ The method table of the object E points at: its first word (P121), a
+  load through E as it is (a constructor's node names its class by its
+  type, so E keeps it). E is worked out once, where the table is read. }
+function TParser.VmtOf(E: PExpr): PExpr;
+begin
+  Result := NewDeref(E, TyPointer);
+end;
+
+{ The class words (P121): what every object and every class answers,
+  from its method table, as TObject's class methods do in FPC. }
+function TParser.IsClassWord(const Name: string): Boolean;
+begin
+  Result := SameId(Name, 'ClassName') or SameId(Name, 'InstanceSize') or
+    SameId(Name, 'ClassNameIs');
+end;
+
+function TParser.ClassWord(Base: PExpr; const Name: string; const Args: TExprArray): PExpr;
+var
+  a: TExprArray;
+begin
+  a := nil;
+  if SameId(Name, 'ClassName') or SameId(Name, 'InstanceSize') then
+  begin
+    if Length(Args) <> 0 then
+      Die(Name + ' takes no arguments' + HerePos);
+    SetLength(a, 1);
+    a[0] := VmtOf(Base);
+    if SameId(Name, 'ClassName') then
+      Result := CoreProc('PasClassName', a, TyString)
+    else
+      Result := CoreProc('PasInstanceSize', a, TyInteger);
+  end
+  else
+  begin
+    if Length(Args) <> 1 then
+      Die('ClassNameIs takes a name' + HerePos);
+    SetLength(a, 2);
+    a[0] := VmtOf(Base);
+    a[1] := StrArg(TyString, Args[0]);
+    if not IsStrTyp(a[1]^.Typ) then
+      Die('ClassNameIs takes a string, not ' + TypName(a[1]^.Typ) + HerePos);
+    Result := CoreProc('PasClassNameIs', a, TyBoolean);
+  end;
+end;
+
+{ The index of the method named Name that takes no arguments in class
+  Typ, -1 when it has none (P121). }
+function TParser.MethIndexNamed(Typ: LongInt; const Name: string): LongInt;
+var
+  st: TTypeDef;
+  i: SizeInt;
+begin
+  Result := -1;
+  st := TypeOf(Typ);
+  for i := 0 to High(st.Meths) do
+    if SameId(st.Meths[i].Name, Name) and (st.Meths[i].NParams = 0) then
+      Result := LongInt(i);
+end;
+
+{ A call of a destructor that is not an inherited one (P121): an
+  outermost call, which ends the object. }
+function TParser.OuterDtorCall(E: PExpr): Boolean;
+var
+  st: TTypeDef;
+  i: SizeInt;
+begin
+  Result := False;
+  { x.Destroy with no ( is a method value the statement calls (ekMethPtr),
+    x.Destroy(...) a call (ekMethod) }
+  if ((E^.Kind <> ekMethod) and (E^.Kind <> ekMethPtr)) or ((E^.Flags and 32) <> 0) or
+    (E^.L = nil) or (TypeOf(E^.L^.Typ).Kind <> tykClass) then
+    Exit;
+  st := TypeOf(E^.L^.Typ);
+  for i := 0 to High(st.Meths) do
+    if (st.Meths[i].Sym = E^.Name) and st.Meths[i].IsDtor then
+      Result := True;
+end;
+
+{ x.Destroy as a statement (P121), as Object Pascal runs it: x once, into
+  a hidden local, its BeforeDestruction through its slot, then the
+  destructor. }
+function TParser.DtorStmt(E: PExpr; ALine: LongInt): PStmt;
+var
   hid: string;
-  asg, call, ifs: PStmt;
+  asg, bd, call: PStmt;
+  bi: LongInt;
+  st: TTypeDef;
 begin
   Result := NewStmt(skBlock);
   Result^.Line := ALine;
-  di := DestroyOf(X^.Typ);
-  if (di < 0) and not ExprHasCall(X) then
-    Exit;
-  hid := HiddenNamed('free.', X^.Typ);
+  st := TypeOf(E^.L^.Typ);
+  hid := HiddenNamed('dtor.', E^.L^.Typ);
   asg := NewStmt(skAssign);
   asg^.Line := ALine;
-  asg^.Dest := NewVar(hid, X^.Typ);
-  asg^.E := X;
+  asg^.Dest := NewVar(hid, E^.L^.Typ);
+  asg^.E := E^.L;
   AppendStmt(Result, asg);
-  if di < 0 then
-    Exit;
+  bi := MethIndexNamed(E^.L^.Typ, 'BeforeDestruction');
+  if bi >= 0 then
+  begin
+    bd := NewStmt(skCall);
+    bd^.Line := ALine;
+    bd^.Name := st.Meths[bi].Sym;
+    bd^.E := NewVar(hid, E^.L^.Typ);
+    bd^.E2 := NewInt(st.Meths[bi].Slot);
+    AppendStmt(Result, bd);
+  end;
   call := NewStmt(skCall);
   call^.Line := ALine;
-  call^.Name := FTypes[X^.Typ].Meths[di].Sym;
-  call^.E := NewVar(hid, X^.Typ);
-  call^.E2 := NewInt(FTypes[X^.Typ].Meths[di].Slot);
-  ifs := NewStmt(skIf);
-  ifs^.Line := ALine;
-  ifs^.E := ApplyOp(boNe, NewVar(hid, X^.Typ), NewNil);
-  ifs^.ThenSt := call;
-  ifs^.ElseSt := nil;
-  AppendStmt(Result, ifs);
+  call^.Name := E^.Name;
+  call^.Args := E^.Args;
+  call^.E := NewVar(hid, E^.L^.Typ);
+  call^.E2 := NewInt(E^.Off);
+  AppendStmt(Result, call);
 end;
 
 { A hidden variable of type T named Base + a number (a local in a
@@ -15012,7 +15194,7 @@ var
   td: TTypeDef;
   typs: array of LongInt;
   refs: array of Boolean;
-  guard: PStmt;
+  fargs: TExprArray;
 begin
   if (FTok.Kind = tkProcedure) or (FTok.Kind = tkFunction) then
   begin
@@ -15032,27 +15214,12 @@ begin
   call := NewStmt(skCall);
   if (e^.Kind = ekMethod) and ((e^.Flags and 16) <> 0) then
   begin
-    { pas x.Free (1.0.137): x now, and in the new routine its Destroy
-      when x is not nil; with no Destroy there is nothing to run }
-    i := DestroyOf(e^.L^.Typ);
-    if i < 0 then
-    begin
-      Result := FreeStmt(e^.L, FTok.Line);
-      Exit;
-    end;
-    call^.Name := FTypes[e^.L^.Typ].Meths[i].Sym;
-    call^.E := e^.L;
-    call^.E2 := NewInt(FTypes[e^.L^.Typ].Meths[i].Slot);
-    Result := PasThunk(call, typs);
-    { PasThunk's closure is the last routine: its call goes under the
-      test, on the object's cell }
-    guard := NewStmt(skIf);
-    guard^.E := ApplyOp(boNe, NewDeref(NewVar(call^.E^.L^.Name, call^.E^.L^.Typ),
-      call^.E^.Typ), NewNil);
-    guard^.ThenSt := call;
-    guard^.ElseSt := nil;
-    FProg.Procs[High(FProg.Procs)].Body^.Stmts[0] := guard;
-    Exit;
+    { pas x.Free (1.0.137): x now, and in the new routine pasobject's
+      PasObjFree, BeforeDestruction and Destroy when x is not nil (P121) }
+    fargs := nil;
+    SetLength(fargs, 1);
+    fargs[0] := e^.L;
+    e := CoreProc('PasObjFree', fargs, TyNone);
   end;
   if e^.Kind = ekCall then
   begin

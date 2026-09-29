@@ -87,8 +87,9 @@ in a unit's implementation is another variable.
 A unit is how a program of your own is split into parts. What the
 language itself provides (strings, maps, trees, heaps, the store, the
 hash words, the rotations, the sync types, the calculation set, the
-collector) is in the language and needs no `uses`: it is written as
-seven core units that every program links without naming them (§15).
+collector, `TObject`) is in the language and needs no `uses`: it is
+written as eight core units that every program links without naming
+them (§15).
 The unit below is a programmer's own:
 
 `examples/units/geometry.paslang`:
@@ -167,8 +168,9 @@ a unit's `.pi` in each `-Fu` directory in the order given, then in
 only), in `build`, in
 `.`, and beside the source file, and reads the first one it finds.
 
-Seven units are part of the language and need no `uses`; every program
-links them. `pasroutines` (the sync types), `pasfmt` (what `Write`
+Eight units are part of the language and need no `uses`; every program
+links them. `pasobject` (`TObject`, the root of every class),
+`pasroutines` (the sync types), `pasfmt` (what `Write`
 prints), `pashash` (the hash words) and `pastree` (the ordered tree,
 the heap and the store) also put their names in every program;
 `pasmap` (the hash map), `pasheap` (the heap and the collector) and
@@ -3033,6 +3035,35 @@ bare `inherited` with no ancestor that has the method does nothing
 points to it any more (§17), destructor or not; there is no reference
 counting.
 
+### TObject, the root of every class
+
+A class declared with no parent descends from `TObject`, which the
+core unit `pasobject` declares (§15): every object has what it has.
+
+| Member | What it does |
+|---|---|
+| `constructor Create` | makes the object; a class without a constructor of its own still has it |
+| `destructor Destroy; virtual` | does nothing; a class overrides it, and `Free` calls it |
+| `procedure AfterConstruction; virtual` | called on a new object when its constructor has run, when the class overrides it |
+| `procedure BeforeDestruction; virtual` | called before `Destroy` when `Free` or an outermost `x.Destroy` ends the object; an `inherited Destroy` does not call it |
+| `function Equals(Obj: TObject): Boolean; virtual` | `Obj` is the same object |
+| `function GetHashCode: Int64; virtual` | the object's address |
+| `function ToString: string; virtual` | the class's name |
+| `ClassName` | the name of the object's class, as declared |
+| `ClassNameIs(name)` | the name compared with ASCII letters in either case |
+| `InstanceSize` | the bytes an object of the class takes |
+
+The class words (`ClassName`, `ClassNameIs`, `InstanceSize`) read the
+object's method table, which carries the class's name, as a string
+literal lies (so `ClassName` gives it back without a copy), and the
+size of an instance; inside a method they are `Self`'s. `TObject`'s own
+`Create` and `AfterConstruction` do nothing, so no call is written for
+them: a constructor costs what its own body costs. A method declared
+again with the signature of an inherited virtual one overrides it, with
+`override` written or not, so `destructor Destroy;` in any class is the
+one `Free` runs. The memory of an object goes back to the collector
+when nothing points to it, whatever the destructor does.
+
 ### Published properties
 
 A published property that reads or writes a field can be reached by its
@@ -5315,11 +5346,14 @@ prints
 
 ## 15. The core library and pasnet
 
-Seven units, the core, are compiled into `build/` (and `build/a64/`
+Eight units, the core, are compiled into `build/` (and `build/a64/`
 for arm64) by `make`, for the base processor (`-cpu base`, so the
 installed toolchain runs on any machine), and installed beside the
 compiler by `make install`. Every program links them without `uses`:
 
+- `pasobject` declares `TObject`, the root of every class, and the
+  routines the class words call: the name, the parent and the size a
+  class's method table carries (§7).
 - `pasroutines` implements `mutex`, `rwmutex`, `waitgroup`, `cond` and
   `once`, the `lock` and `once` statements, `Goid`, `NumGoroutine`,
   `Yield` and `ReadLn`. It is Pascal over the park and wake words of the
@@ -5336,8 +5370,8 @@ compiler by `make install`. Every program links them without `uses`:
 - `pasheap` is the heap's slow paths and the collector (§17).
 - `pasquad` is the arithmetic of `Quad`, in software (§14).
 
-The names of `pasroutines`, `pasfmt`, `pashash` and `pastree` are every
-program's, as those of a unit in `uses` are; `pasmap`, `pasheap` and
+The names of `pasobject`, `pasroutines`, `pasfmt`, `pashash` and
+`pastree` are every program's, as those of a unit in `uses` are; `pasmap`, `pasheap` and
 `pasquad` are only linked (`uses pasquad` brings its names in). Their
 routines are there for the compiler, and a program may call them too:
 
@@ -9562,7 +9596,8 @@ its place:
   TPasRWMutex TPasWaitGroup TPasCond TPasOnce` with their `PasMutexLock`
   … `PasOnceDone` routines, pasfmt's `PasFmtReal` … `PasFmtQuad`,
   pashash's `PasHex PasMd5 PasSha1Cpu` … `PasMerkleCheckBase` and
-  pastree's `PasTreeNew` … `PasStoreAbandon`. A core unit declares its
+  pastree's `PasTreeNew` … `PasStoreAbandon`, and pasobject's `TObject`
+  with `PasClassName` … `PasObjFree`. A core unit declares its
   own exports; nothing else may, and a unit's implementation types are
   its own (an importer cannot name them, and they are not reserved).
 
@@ -9571,8 +9606,8 @@ method, a property or an enumeration member of one of these names is a
 compile error that names it, at the name: `Length is a reserved word,
 not a name at 5:3`. A unit's `.pi` is not checked for these names when
 it loads. The compiler loads only a `.pi` of the format it writes,
-`PASLANGI13` since 1.0.137, and refuses an older one: `build/geometry.pi
-was compiled by a paslang older than 1.0.137; compile geometry again`.
+`PASLANGI14` since 1.1.2, and refuses an older one: `build/geometry.pi
+was compiled by a paslang older than 1.1.2; compile geometry again`.
 
 `safe` before `program`, `unit`, `procedure`, `function`,
 `constructor` or `destructor` (a method's declaration in its class
