@@ -105,20 +105,42 @@ the manual, the servers' self-tests and the arm64 build under qemu.
 `make install` puts `paslangc` and `pasdbg` in `$(prefix)/bin` and the
 units in `$(prefix)/lib/paslang` (the arm64 ones in
 `lib/paslang/aarch64`); `./configure --prefix=...` chooses the prefix.
-`make package` writes the two release archives under `build/pkg`.
+`make package` writes the two release archives under `build/pkg`, and
+`make distpkg` the packages of the distributions under `build/pkg/dist`.
 
 ## Binary packages
 
-Each release has a package for each machine:
-`paslang-<version>-linux-amd64.tar.gz` and
-`paslang-<version>-linux-arm64.tar.gz`. Unpack one anywhere: the
-compiler finds its units in `lib/paslang` beside its `bin`.
+Each release carries, for amd64 and arm64, a package for each family of
+distributions and a relocatable archive; `SHA256SUMS` lists them all.
+Each installs `paslangc` and `pasdbg` in `/usr/bin`, the units in
+`/usr/lib/paslang`, the manual in `/usr/share/doc/paslang` and the
+examples in `/usr/share/paslang/examples`, and pulls in GNU binutils,
+which the compiler needs for `as` and `ld`.
+
+| Distribution | amd64 | arm64 | Install |
+|---|---|---|---|
+| Debian, Ubuntu | `paslang_<v>-1_amd64.deb` | `paslang_<v>-1_arm64.deb` | `sudo apt install ./paslang_<v>-1_amd64.deb` |
+| Fedora, RHEL, openSUSE | `paslang-<v>-1.x86_64.rpm` | `paslang-<v>-1.aarch64.rpm` | `sudo dnf install ./paslang-<v>-1.x86_64.rpm` (`sudo zypper install` on openSUSE) |
+| Arch | `paslang-<v>-1-x86_64.pkg.tar.zst` | `paslang-<v>-1-aarch64.pkg.tar.zst` | `sudo pacman -U paslang-<v>-1-x86_64.pkg.tar.zst` |
+| Slackware | `paslang-<v>-x86_64-1.tgz` | `paslang-<v>-aarch64-1.tgz` | `sudo installpkg paslang-<v>-x86_64-1.tgz` |
+| Any, unpacked anywhere | `paslang-<v>-linux-amd64.tar.gz` | `paslang-<v>-linux-arm64.tar.gz` | `tar xzf paslang-<v>-linux-amd64.tar.gz` |
+
+Once a package is installed the compiler is ready:
 
 ```
-tar xzf paslang-<version>-linux-amd64.tar.gz
-paslang-<version>-linux-amd64/bin/paslangc -o hello hello.paslang
+paslangc -o hello hello.paslang
 ./hello
 ```
+
+An unpacked archive works the same from its own `bin`
+(`paslang-<v>-linux-amd64/bin/paslangc`): the compiler finds its units in
+`lib/paslang` beside its `bin`. On amd64, `paslangc -target arm64`
+compiles for arm64 once the cross binutils are installed
+(`binutils-aarch64-linux-gnu` on Debian, `aarch64-linux-gnu-binutils` on
+Arch).
+
+`make release-assets` builds all of them into `build/pkg/release`, with
+`SHA256SUMS`; it needs `dpkg-deb`, `rpmbuild` and `makepkg`.
 
 ## Documentation
 

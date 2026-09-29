@@ -42,7 +42,7 @@ PASLANG_SRC := \
 	src/lib/paslinux.paslang \
 	cmd/paslangc/paslangc.paslang
 
-.PHONY: package bench-rounds all hello check check-arm64 clean hostsrc self self-arm64 stage compilers core core-arm64 libs libs-arm64 bench manual \
+.PHONY: package distpkg release-assets bench-rounds all hello check check-arm64 clean hostsrc self self-arm64 stage compilers core core-arm64 libs libs-arm64 bench manual \
 	install install-strip uninstall installdirs installcheck \
 	mostlyclean distclean maintainer-clean
 
@@ -2296,6 +2296,20 @@ package: all compilers $(OUTDIR)/pasdbg
 	  tar -C $(BUILDDIR)/pkg --owner=0 --group=0 --numeric-owner -czf $$d.tar.gz $$n; \
 	  echo "$$d.tar.gz"; \
 	done
+
+# The packages of the distributions, for amd64 and arm64
+# (scripts/distpkg.py): .deb, .rpm, Arch's .pkg.tar.zst and Slackware's
+# .tgz, each installing under /usr, into build/pkg/dist.
+distpkg: package
+	python3 scripts/distpkg.py
+
+# Everything a release carries, in build/pkg/release: the two archives
+# of make package, the packages of make distpkg, and SHA256SUMS of them
+# all. Every release uploads the whole directory.
+release-assets: distpkg
+	@set -e; rm -rf $(BUILDDIR)/pkg/release; mkdir -p $(BUILDDIR)/pkg/release; \
+	cp $(BUILDDIR)/pkg/paslang-*-linux-*.tar.gz $(BUILDDIR)/pkg/dist/* $(BUILDDIR)/pkg/release/; \
+	cd $(BUILDDIR)/pkg/release && sha256sum * > SHA256SUMS && cat SHA256SUMS
 
 uninstall:
 	rm -f $(DESTDIR)$(bindir)/paslangc $(DESTDIR)$(bindir)/paslangc-arm64 $(DESTDIR)$(bindir)/pasdbg
