@@ -122,6 +122,9 @@ paslang-<version>-linux-amd64/bin/paslangc -o hello hello.paslang
 
 ## Documentation
 
+The [wiki](https://github.com/garacil/paslang/wiki) has all of it, one page a
+chapter, with the installation, the examples and the benchmarks.
+
 | File | What |
 |---|---|
 | [docs/MANUAL.md](docs/MANUAL.md) | The programmer's manual; every program in it lives in `examples/` and runs under `make check` |
