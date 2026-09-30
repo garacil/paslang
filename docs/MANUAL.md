@@ -283,7 +283,11 @@ called, as in Free Pascal. `var Current: TSettings absolute Settings;`
 is another name for the variable `Settings`, of the same type: a
 global, a routine's variable or a parameter; a unit exports it as that
 variable. To see a variable as another type, a view does it:
-`PByte(@x)^` (1.1.19, P144; both were syntax errors).
+`PByte(@x)^` (1.1.19, P144; both were syntax errors). `var Window: Word
+absolute Settings.Window;` is another name for that field of a global
+record, and of a record inside it, `Settings.Inner.Hi`, as SysUtils'
+`TwoDigitYearCenturyWindow` is `DefaultFormatSettings`' field of that
+name (1.1.32, P162).
 
 `examples/values.paslang`:
 

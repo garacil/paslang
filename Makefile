@@ -902,7 +902,11 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	echo "==== variables with a value and absolute rejects (P144) ===="; \
 	for f in 'absnone:unknown variable nothing at 3:21' 'abstwo:absolute names one variable at a time at 4:15' \
 	  'abstype:b: Byte absolute x: Integer; absolute is another name for a variable of its own type' \
-	  'twoinit:one variable at a time takes a value at 3:15'; do \
+	  'twoinit:one variable at a time takes a value at 3:15' \
+	  'absfieldlocal:absolute names a field of a global record, and p is local to a routine at 12:23' \
+	  'absfieldint:absolute names a variable or a field of a record, and n is Integer, no record at 6:23' \
+	  'absfieldnone:TPoint has no field Z at 11:23' \
+	  'absfieldtype:b: Byte absolute p.Y: Integer; absolute is another name for a variable of its own type'; do \
 	  n=$${f%%:*}; w=$${f#*:}; \
 	  if $(OUTDIR)/paslangc -o $(BUILDDIR)/varbad_$$n testdata/varbad/$$n.paslang >$(BUILDDIR)/varbad_$$n.err 2>&1; then \
 	    echo "$$n should fail"; exit 1; \
@@ -1725,6 +1729,15 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/hideimpl-arm testdata/units/hideimpl.paslang; \
 	timeout 60 $(QEMU_A64) $(BUILDDIR)/hideimpl-arm > $(BUILDDIR)/hideimpl-arm.got; \
 	diff -u testdata/units/hideimpl.out $(BUILDDIR)/hideimpl-arm.got; \
+	: absolute names a field of a global record, in a program and through a unit, P162; \
+	$(OUTDIR)/paslangc testdata/units/absu.paslang; \
+	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/absuse testdata/units/absuse.paslang; \
+	$(BUILDDIR)/absuse > $(BUILDDIR)/absuse.got; \
+	diff -u testdata/units/absuse.out $(BUILDDIR)/absuse.got; \
+	$(OUTDIR)/paslangc -target arm64 testdata/units/absu.paslang; \
+	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/absuse-arm testdata/units/absuse.paslang; \
+	timeout 60 $(QEMU_A64) $(BUILDDIR)/absuse-arm > $(BUILDDIR)/absuse-arm.got; \
+	diff -u testdata/units/absuse.out $(BUILDDIR)/absuse-arm.got; \
 	: two units that declare the same class, interface, record and helper names, P154; \
 	$(OUTDIR)/paslangc testdata/units/twina.paslang; \
 	$(OUTDIR)/paslangc testdata/units/twinb.paslang; \
