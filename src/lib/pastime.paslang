@@ -21,7 +21,8 @@
 {$mode objfpc}{$H+}
 
 { The clock. Go keeps this in time; here it is a unit of its own, over
-  clock_gettime and nothing else: no libc, no timezone files.
+  clock_gettime and, for the local zone, the system's TZif files: no
+  libc.
 
   Two clocks, and they are not the same. The wall clock says what time
   it is and can jump, backwards even, when somebody or something sets
@@ -31,7 +32,10 @@
 
   Dates are UTC. Turning a moment into a date uses the civil-from-days
   algorithm (Howard Hinnant's), which is arithmetic and needs no table,
-  and DateToUnix is its inverse, so the two round-trip. }
+  and DateToUnix is its inverse, so the two round-trip. The local clock
+  (P131) is Go's time.Local: the zone $TZ names, /etc/localtime when it
+  is not set, UTC when it is empty; UnixToLocalDate and LocalDateToUnix
+  turn a moment into the local date and back. }
 unit pastime;
 
 interface
@@ -78,6 +82,15 @@ function DateToUnix(Y, M, D, HH, MM, SS: Integer): Int64;
 function IsLeap(Y: Integer): Boolean;
 function DaysInMonth(Y, M: Integer): Integer;
 
+{ The local clock (P131): the zone's name ('Local', 'UTC' or $TZ's), its
+  abbreviation, offset in seconds east of UTC and daylight saving at a
+  moment, and a moment and the local date, both ways. }
+function LocalZoneName: string;
+procedure LocalZoneAt(T: Int64; out Abbrev: string; out Offset: Int64; out IsDST: Boolean);
+function LocalOffset(T: Int64): Int64;
+function UnixToLocalDate(T: Int64): TDate;
+function LocalDateToUnix(Y, M, D, HH, MM, SS: Integer): Int64;
+
 { Written out, as an ISO date is written. }
 function DateStr(T: Int64): string;
 function TimeStr(T: Int64): string;
@@ -91,7 +104,7 @@ function MonthName(M: Integer): string;
 implementation
 
 uses
-  paslinux;
+  paslinux, paslib;
 
 const
   ClockRealtime = 0;
@@ -312,6 +325,699 @@ function DateToUnix(Y, M, D, HH, MM, SS: Integer): Int64;
 begin
   Result := DaysFromCivil(Y, M, D) * SecPerDay + Int64(HH) * SecPerHour +
     Int64(MM) * SecPerMin + SS;
+end;
+
+{ ---- the local time zone (P131) ---- }
+
+{ As Go's time.Local (golang's src/time: zoneinfo_unix.go's initLocal,
+  zoneinfo_read.go's LoadLocationFromTZData, zoneinfo.go's lookup,
+  lookupFirstZone and tzset, time.go's Date): the zones a TZif file
+  lists, the moments the local clock changed from one to another, and
+  the POSIX rule its last line gives for the moments after the last
+  one. Read once, the first time a routine asks. Go's license covers
+  the port (LICENSE-GO). }
+
+type
+  TZoneKind = record
+    Offset: Int64;      { seconds east of UTC }
+    IsDST: Boolean;
+    Abbrev: string;
+  end;
+  TZoneTx = record
+    When: Int64;        { the Unix second the zone begins }
+    Index: Int64;       { into ZKinds }
+  end;
+
+const
+  { Go's alpha and omega: the first and the last moment }
+  ZAlpha = Low(Int64);
+  ZOmega = High(Int64);
+
+var
+  ZOnce: once;
+  ZName: string;
+  ZKinds: array of TZoneKind;
+  ZTx: array of TZoneTx;
+  ZExtend: string;
+
+{ A big-endian number of 4 bytes at P (1-based) of D, unsigned; Bad when
+  D has not the bytes. }
+function ZBig4(const D: string; var P: Int64; var Bad: Boolean): Int64;
+begin
+  Result := 0;
+  if P + 3 > Length(D) then
+  begin
+    Bad := True;
+    Exit;
+  end;
+  Result := (Int64(Ord(D[P])) shl 24) or (Int64(Ord(D[P + 1])) shl 16) or
+    (Int64(Ord(D[P + 2])) shl 8) or Int64(Ord(D[P + 3]));
+  P := P + 4;
+end;
+
+{ The zones of TZif data D (LoadLocationFromTZData): False when D is
+  not one. Version 2 and 3 files hold the 32-bit data and then the same
+  in 64 bits, which is the one read. }
+function ZParse(const D: string): Boolean;
+var
+  p, version, i, k, nz, ntx, pt, pz, pzd, pab, e: Int64;
+  n: array[0..5] of Int64;
+  bad, is64: Boolean;
+  abbrev: string;
+  sz, hw: Int64;
+begin
+  Result := False;
+  if (Length(D) < 44) or (Copy(D, 1, 4) <> 'TZif') then
+    Exit;
+  case D[5] of
+    #0: version := 1;
+    '2': version := 2;
+    '3': version := 3;
+  else
+    Exit;
+  end;
+  p := 21;
+  bad := False;
+  { UTC/local indicators, standard/wall indicators, leap seconds,
+    transition times, local time zones, characters of abbreviations }
+  for i := 0 to 5 do
+    n[i] := ZBig4(D, p, bad);
+  if bad then
+    Exit;
+  is64 := False;
+  if version > 1 then
+  begin
+    { skip the 32-bit data and the second header }
+    p := p + n[3] * 4 + n[3] + n[4] * 6 + n[5] + n[2] * 8 + n[1] + n[0] + 4 + 16;
+    for i := 0 to 5 do
+      n[i] := ZBig4(D, p, bad);
+    if bad then
+      Exit;
+    is64 := True;
+  end;
+  if is64 then
+    sz := 8
+  else
+    sz := 4;
+  ntx := n[3];
+  nz := n[4];
+  pt := p;
+  pz := pt + ntx * sz;
+  pzd := pz + ntx;
+  pab := pzd + nz * 6;
+  e := pab + n[5] + n[2] * (sz + 4) + n[1] + n[0];
+  if (e - 1 > Length(D)) or (nz = 0) then
+    Exit;
+  abbrev := Copy(D, pab, n[5]);
+  { the zones: utcoff[4] isdst[1] abbrind[1] }
+  ZKinds := nil;
+  SetLength(ZKinds, nz);
+  p := pzd;
+  for i := 0 to nz - 1 do
+  begin
+    ZKinds[i].Offset := ZBig4(D, p, bad);
+    if ZKinds[i].Offset >= 2147483648 then
+      ZKinds[i].Offset := ZKinds[i].Offset - 4294967296;
+    ZKinds[i].IsDST := D[p] <> #0;
+    k := Ord(D[p + 1]);
+    p := p + 2;
+    if k >= Length(abbrev) then
+      Exit;
+    ZKinds[i].Abbrev := '';
+    while (k < Length(abbrev)) and (abbrev[k + 1] <> #0) do
+    begin
+      ZKinds[i].Abbrev := ZKinds[i].Abbrev + abbrev[k + 1];
+      k := k + 1;
+    end;
+  end;
+  { the transitions }
+  ZTx := nil;
+  SetLength(ZTx, ntx);
+  p := pt;
+  for i := 0 to ntx - 1 do
+  begin
+    if is64 then
+    begin
+      { two reads that each move p: in two statements, not one expression
+        whose operands may be read in either order }
+      hw := ZBig4(D, p, bad);
+      ZTx[i].When := (hw shl 32) or ZBig4(D, p, bad);
+    end
+    else
+    begin
+      ZTx[i].When := ZBig4(D, p, bad);
+      if ZTx[i].When >= 2147483648 then
+        ZTx[i].When := ZTx[i].When - 4294967296;
+    end;
+    ZTx[i].Index := Ord(D[pz + i]);
+    if ZTx[i].Index >= nz then
+      Exit;
+  end;
+  if bad then
+    Exit;
+  { none: one that covers all time, as a fixed zone (Etc/GMT0) }
+  if ntx = 0 then
+  begin
+    SetLength(ZTx, 1);
+    ZTx[0].When := ZAlpha;
+    ZTx[0].Index := 0;
+  end;
+  { the POSIX rule for after the last transition: the rest, \n...\n }
+  ZExtend := '';
+  if (Length(D) - e + 1 > 2) and (D[e] = #10) and (D[Length(D)] = #10) then
+    ZExtend := Copy(D, e + 1, Length(D) - e - 1);
+  Result := True;
+end;
+
+{ Load the zone of the file Name in one of the Dirs (loadLocation): the
+  first that reads and parses. }
+function ZLoad(const Name: string; const Dirs: array of string): Boolean;
+var
+  i: Integer;
+  path, data: string;
+begin
+  Result := False;
+  for i := 0 to High(Dirs) do
+  begin
+    if Dirs[i] <> '' then
+      path := Dirs[i] + '/' + Name
+    else
+      path := Name;
+    if ReadFile(path, data) and ZParse(data) then
+    begin
+      Result := True;
+      Exit;
+    end;
+  end;
+end;
+
+{ Which zone the local clock is (initLocal): $TZ not set, /etc/localtime;
+  set to '', UTC; a name, with a colon before it dropped, an absolute
+  path or a file under the systems' zoneinfo directories, and UTC for
+  UTC; anything that does not load, UTC. }
+procedure ZInit;
+var
+  tz: string;
+  ok: Boolean;
+begin
+  ZKinds := nil;
+  ZTx := nil;
+  ZExtend := '';
+  ZName := 'UTC';
+  ok := LookupEnv('TZ', tz);
+  if not ok then
+  begin
+    if ZLoad('localtime', ['/etc']) then
+    begin
+      ZName := 'Local';
+      Exit;
+    end;
+  end
+  else if tz <> '' then
+  begin
+    if tz[1] = ':' then
+      tz := Copy(tz, 2, Length(tz) - 1);
+    if (tz <> '') and (tz[1] = '/') then
+    begin
+      if ZLoad(tz, ['']) then
+      begin
+        if tz = '/etc/localtime' then
+          ZName := 'Local'
+        else
+          ZName := tz;
+        Exit;
+      end;
+    end
+    else if (tz <> '') and (tz <> 'UTC') then
+    begin
+      if ZLoad(tz, ['/usr/share/zoneinfo/', '/usr/share/lib/zoneinfo/', '/usr/lib/locale/TZ/',
+        '/etc/zoneinfo']) then
+      begin
+        ZName := tz;
+        Exit;
+      end;
+    end;
+  end;
+  { UTC: no zones }
+  ZKinds := nil;
+  ZTx := nil;
+  ZExtend := '';
+end;
+
+{ ---- the POSIX rule (tzset) ---- }
+
+{ A number at S[P..] between Lo and Hi (tzsetNum). }
+function ZNum(const S: string; var P: Int64; Lo, Hi: Int64; out N: Int64): Boolean;
+var
+  q: Int64;
+begin
+  Result := False;
+  N := 0;
+  q := P;
+  while (q <= Length(S)) and (S[q] >= '0') and (S[q] <= '9') do
+  begin
+    N := N * 10 + Ord(S[q]) - 48;
+    if N > Hi then
+      Exit;
+    q := q + 1;
+  end;
+  if (q = P) or (N < Lo) then
+    Exit;
+  P := q;
+  Result := True;
+end;
+
+{ A zone's name, <...> or three letters or more (tzsetName). }
+function ZRuleName(const S: string; var P: Int64; out Name: string): Boolean;
+var
+  q: Int64;
+begin
+  Result := False;
+  Name := '';
+  if P > Length(S) then
+    Exit;
+  if S[P] = '<' then
+  begin
+    q := P + 1;
+    while (q <= Length(S)) and (S[q] <> '>') do
+      q := q + 1;
+    if q > Length(S) then
+      Exit;
+    Name := Copy(S, P + 1, q - P - 1);
+    P := q + 1;
+    Result := True;
+    Exit;
+  end;
+  q := P;
+  while (q <= Length(S)) and not (((S[q] >= '0') and (S[q] <= '9')) or (S[q] = ',') or
+    (S[q] = '-') or (S[q] = '+')) do
+    q := q + 1;
+  if q - P < 3 then
+    Exit;
+  Name := Copy(S, P, q - P);
+  P := q;
+  Result := True;
+end;
+
+{ An offset, [+-]hh[:mm[:ss]], in seconds (tzsetOffset). }
+function ZRuleOffset(const S: string; var P: Int64; out Off: Int64): Boolean;
+var
+  neg: Boolean;
+  h, m, ss: Int64;
+begin
+  Result := False;
+  Off := 0;
+  if P > Length(S) then
+    Exit;
+  neg := False;
+  if S[P] = '+' then
+    P := P + 1
+  else if S[P] = '-' then
+  begin
+    P := P + 1;
+    neg := True;
+  end;
+  if not ZNum(S, P, 0, 24 * 7, h) then
+    Exit;
+  Off := h * SecPerHour;
+  if (P <= Length(S)) and (S[P] = ':') then
+  begin
+    P := P + 1;
+    if not ZNum(S, P, 0, 59, m) then
+      Exit;
+    Off := Off + m * SecPerMin;
+    if (P <= Length(S)) and (S[P] = ':') then
+    begin
+      P := P + 1;
+      if not ZNum(S, P, 0, 59, ss) then
+        Exit;
+      Off := Off + ss;
+    end;
+  end;
+  if neg then
+    Off := -Off;
+  Result := True;
+end;
+
+type
+  { Jn (a day from 1 to 365, no February 29), n (from 0, with it), or
+    Mm.w.d (the w-th weekday d of month m, 5 the last); its time }
+  TZRule = record
+    Kind: Integer;     { 0 Julian, 1 day of year, 2 month week day }
+    Day, Week, Mon, Time: Int64;
+  end;
+
+{ A rule, with /time or 2am (tzsetRule). }
+function ZRule(const S: string; var P: Int64; out R: TZRule): Boolean;
+begin
+  Result := False;
+  R.Kind := 0;
+  R.Day := 0;
+  R.Week := 0;
+  R.Mon := 0;
+  R.Time := 0;
+  if P > Length(S) then
+    Exit;
+  if S[P] = 'J' then
+  begin
+    P := P + 1;
+    if not ZNum(S, P, 1, 365, R.Day) then
+      Exit;
+    R.Kind := 0;
+  end
+  else if S[P] = 'M' then
+  begin
+    P := P + 1;
+    if not ZNum(S, P, 1, 12, R.Mon) or (P > Length(S)) or (S[P] <> '.') then
+      Exit;
+    P := P + 1;
+    if not ZNum(S, P, 1, 5, R.Week) or (P > Length(S)) or (S[P] <> '.') then
+      Exit;
+    P := P + 1;
+    if not ZNum(S, P, 0, 6, R.Day) then
+      Exit;
+    R.Kind := 2;
+  end
+  else
+  begin
+    if not ZNum(S, P, 0, 365, R.Day) then
+      Exit;
+    R.Kind := 1;
+  end;
+  if (P > Length(S)) or (S[P] <> '/') then
+  begin
+    R.Time := 2 * SecPerHour;
+    Result := True;
+    Exit;
+  end;
+  P := P + 1;
+  Result := ZRuleOffset(S, P, R.Time);
+end;
+
+{ The seconds from the start of Year to where rule R takes effect, at
+  offset Off (tzruleTime; Zeller's congruence for the weekday). }
+function ZRuleTime(Year: Int64; const R: TZRule; Off: Int64): Int64;
+const
+  Before: array[1..12] of Int64 = (0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334);
+var
+  s, m1, yy0, yy1, yy2, dow, d, i: Int64;
+begin
+  s := 0;
+  case R.Kind of
+    0:
+      begin
+        s := (R.Day - 1) * SecPerDay;
+        if IsLeap(Year) and (R.Day >= 60) then
+          s := s + SecPerDay;
+      end;
+    1:
+      s := R.Day * SecPerDay;
+    2:
+      begin
+        m1 := (R.Mon + 9) mod 12 + 1;
+        yy0 := Year;
+        if R.Mon <= 2 then
+          yy0 := yy0 - 1;
+        yy1 := yy0 div 100;
+        yy2 := yy0 mod 100;
+        dow := ((26 * m1 - 2) div 10 + 1 + yy2 + yy2 div 4 + yy1 div 4 - 2 * yy1) mod 7;
+        if dow < 0 then
+          dow := dow + 7;
+        { the day of the month of the first weekday R.Day }
+        d := R.Day - dow;
+        if d < 0 then
+          d := d + 7;
+        for i := 1 to R.Week - 1 do
+        begin
+          if d + 7 >= DaysInMonth(Year, R.Mon) then
+            Break;
+          d := d + 7;
+        end;
+        d := d + Before[R.Mon];
+        if IsLeap(Year) and (R.Mon > 2) then
+          d := d + 1;
+        s := d * SecPerDay;
+      end;
+  end;
+  Result := s + R.Time - Off;
+end;
+
+{ The zone the POSIX rule S gives at Unix second Tm, after the last
+  transition LastTx (tzset); False when S does not read. }
+function ZTzset(const S: string; LastTx, Tm: Int64; out Abbrev: string; out Offset: Int64;
+  out Start, Stop: Int64; out IsDST: Boolean): Boolean;
+var
+  p, stdOff, dstOff, t, days, secs, ysec, ystart, startSec, endSec: Int64;
+  stdName, dstName, tn: string;
+  startRule, endRule: TZRule;
+  stdIsDST, dstIsDST, tb: Boolean;
+  y, m, d: Integer;
+begin
+  Result := False;
+  Abbrev := '';
+  Offset := 0;
+  Start := 0;
+  Stop := 0;
+  IsDST := False;
+  p := 1;
+  if not ZRuleName(S, p, stdName) or not ZRuleOffset(S, p, stdOff) then
+    Exit;
+  { the rule's numbers are added to local time to give UTC; an offset
+    here is added to UTC }
+  stdOff := -stdOff;
+  if (p > Length(S)) or (S[p] = ',') then
+  begin
+    Abbrev := stdName;
+    Offset := stdOff;
+    Start := LastTx;
+    Stop := ZOmega;
+    Result := True;
+    Exit;
+  end;
+  if not ZRuleName(S, p, dstName) then
+    Exit;
+  if (p > Length(S)) or (S[p] = ',') then
+    dstOff := stdOff + SecPerHour
+  else
+  begin
+    if not ZRuleOffset(S, p, dstOff) then
+      Exit;
+    dstOff := -dstOff;
+  end;
+  if p > Length(S) then
+  begin
+    { tzcode's default rules }
+    ZTzset := ZTzset(S + ',M3.2.0,M11.1.0', LastTx, Tm, Abbrev, Offset, Start, Stop, IsDST);
+    Exit;
+  end;
+  if (S[p] <> ',') and (S[p] <> ';') then
+    Exit;
+  p := p + 1;
+  if not ZRule(S, p, startRule) or (p > Length(S)) or (S[p] <> ',') then
+    Exit;
+  p := p + 1;
+  if not ZRule(S, p, endRule) or (p <= Length(S)) then
+    Exit;
+  { the year of Tm, and its second in the year }
+  days := Tm div SecPerDay;
+  secs := Tm mod SecPerDay;
+  if secs < 0 then
+  begin
+    secs := secs + SecPerDay;
+    days := days - 1;
+  end;
+  CivilFromDays(days, y, m, d);
+  ysec := (days - DaysFromCivil(y, 1, 1)) * SecPerDay + secs;
+  ystart := Tm - ysec;
+  startSec := ZRuleTime(y, startRule, stdOff);
+  endSec := ZRuleTime(y, endRule, dstOff);
+  dstIsDST := True;
+  stdIsDST := False;
+  { the southern hemisphere: the labels kept, the roles swapped }
+  if endSec < startSec then
+  begin
+    t := startSec;
+    startSec := endSec;
+    endSec := t;
+    tn := stdName;
+    stdName := dstName;
+    dstName := tn;
+    t := stdOff;
+    stdOff := dstOff;
+    dstOff := t;
+    tb := stdIsDST;
+    stdIsDST := dstIsDST;
+    dstIsDST := tb;
+  end;
+  if ysec < startSec then
+  begin
+    Abbrev := stdName;
+    Offset := stdOff;
+    Start := ystart;
+    Stop := startSec + ystart;
+    IsDST := stdIsDST;
+  end
+  else if ysec >= endSec then
+  begin
+    Abbrev := stdName;
+    Offset := stdOff;
+    Start := endSec + ystart;
+    Stop := ystart + 365 * SecPerDay;
+    IsDST := stdIsDST;
+  end
+  else
+  begin
+    Abbrev := dstName;
+    Offset := dstOff;
+    Start := startSec + ystart;
+    Stop := endSec + ystart;
+    IsDST := dstIsDST;
+  end;
+  Result := True;
+end;
+
+{ The zone of the first moments, before the first transition
+  (lookupFirstZone). }
+function ZFirstKind: Int64;
+var
+  i: Int64;
+  used: Boolean;
+begin
+  used := False;
+  for i := 0 to High(ZTx) do
+    if ZTx[i].Index = 0 then
+      used := True;
+  Result := 0;
+  if not used then
+    Exit;
+  if (Length(ZTx) > 0) and ZKinds[ZTx[0].Index].IsDST then
+    for i := ZTx[0].Index - 1 downto 0 do
+      if not ZKinds[i].IsDST then
+      begin
+        Result := i;
+        Exit;
+      end;
+  for i := 0 to High(ZKinds) do
+    if not ZKinds[i].IsDST then
+    begin
+      Result := i;
+      Exit;
+    end;
+  Result := 0;
+end;
+
+{ The local zone at Unix second Tm, and the moments it began and ends
+  (lookup): a binary search of the transitions, the POSIX rule after the
+  last. }
+procedure ZLookup(Tm: Int64; out Abbrev: string; out Offset: Int64; out Start, Stop: Int64;
+  out IsDST: Boolean);
+var
+  lo, hi, mid, k: Int64;
+  ea: string;
+  eo, es, ee: Int64;
+  ed: Boolean;
+begin
+  once ZOnce do
+    ZInit;
+  if Length(ZKinds) = 0 then
+  begin
+    Abbrev := 'UTC';
+    Offset := 0;
+    Start := ZAlpha;
+    Stop := ZOmega;
+    IsDST := False;
+    Exit;
+  end;
+  if (Length(ZTx) = 0) or (Tm < ZTx[0].When) then
+  begin
+    k := ZFirstKind;
+    Abbrev := ZKinds[k].Abbrev;
+    Offset := ZKinds[k].Offset;
+    Start := ZAlpha;
+    if Length(ZTx) > 0 then
+      Stop := ZTx[0].When
+    else
+      Stop := ZOmega;
+    IsDST := ZKinds[k].IsDST;
+    Exit;
+  end;
+  Stop := ZOmega;
+  lo := 0;
+  hi := Length(ZTx);
+  while hi - lo > 1 do
+  begin
+    mid := (lo + hi) shr 1;
+    if Tm < ZTx[mid].When then
+    begin
+      Stop := ZTx[mid].When;
+      hi := mid;
+    end
+    else
+      lo := mid;
+  end;
+  k := ZTx[lo].Index;
+  Abbrev := ZKinds[k].Abbrev;
+  Offset := ZKinds[k].Offset;
+  Start := ZTx[lo].When;
+  IsDST := ZKinds[k].IsDST;
+  if (lo = High(ZTx)) and (ZExtend <> '') then
+    if ZTzset(ZExtend, Start, Tm, ea, eo, es, ee, ed) then
+    begin
+      Abbrev := ea;
+      Offset := eo;
+      Start := es;
+      Stop := ee;
+      IsDST := ed;
+    end;
+end;
+
+function LocalZoneName: string;
+begin
+  once ZOnce do
+    ZInit;
+  Result := ZName;
+end;
+
+procedure LocalZoneAt(T: Int64; out Abbrev: string; out Offset: Int64; out IsDST: Boolean);
+var
+  s, e: Int64;
+begin
+  ZLookup(T, Abbrev, Offset, s, e, IsDST);
+end;
+
+function LocalOffset(T: Int64): Int64;
+var
+  a: string;
+  s, e: Int64;
+  d: Boolean;
+begin
+  ZLookup(T, a, Result, s, e, d);
+end;
+
+function UnixToLocalDate(T: Int64): TDate;
+begin
+  Result := UnixToDate(T + LocalOffset(T));
+end;
+
+{ The moment the local clock shows as that date and time (Go's Date):
+  the offset at the moment read as UTC, and if the moment the offset
+  gives falls outside that zone's span, the offset there. A time the
+  clock skipped or showed twice takes one of them, as Go's does. }
+function LocalDateToUnix(Y, M, D, HH, MM, SS: Integer): Int64;
+var
+  a: string;
+  off, s, e, utc: Int64;
+  dst: Boolean;
+begin
+  Result := DateToUnix(Y, M, D, HH, MM, SS);
+  ZLookup(Result, a, off, s, e, dst);
+  if off <> 0 then
+  begin
+    utc := Result - off;
+    if (utc < s) or (utc >= e) then
+      ZLookup(utc, a, off, s, e, dst);
+    Result := Result - off;
+  end;
 end;
 
 function DateOf(const D: TDate): string;

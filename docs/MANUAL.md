@@ -9389,7 +9389,8 @@ args)` runs a program with an `array of string` of arguments and waits
 for it, giving the status it ended with; `RunCapture(exe, args, out
 output)` also collects what it wrote to standard output; `LookPath(exe)`
 finds a name with no slash in `PATH`, as a shell does. `GetEnv(name)`
-reads the environment, `IntToStr`, `StrToInt64(s, out v)`,
+reads the environment, `LookupEnv(name, out value)` too and says
+whether the name is set at all (`TZ=` is set and empty), `IntToStr`, `StrToInt64(s, out v)`,
 `IntToHex2(b)`, `ToLower`, `HasSuffix`, `ChangeExt`, `BaseName`,
 `DirName` and `JoinPath` shape strings and paths.
 
@@ -9408,7 +9409,18 @@ the moment of a date; `DateStr`, `TimeStr` and `StampStr` write a
 moment, and `DateOf`, `TimeOf` and `StampOf` a `TDate`, the way an ISO
 date is written, `WeekdayName` and `MonthName` name its day and month,
 and `Duration` says a length of time the way a person would.
-Dates are UTC: there is no timezone file to read and none is read.
+Those dates are UTC. The local clock is Go's `time.Local` (P131): the
+zone `TZ` names (a name under `/usr/share/zoneinfo`, `:Europe/Madrid`
+too, or a TZif file's path), `/etc/localtime` when `TZ` is not set, UTC
+when it is set and empty; read once, the first time a routine asks.
+`LocalZoneAt(t, out abbrev, out offset, out isDST)` gives a moment's
+zone (`CEST`, 7200 seconds east of UTC, daylight saving time),
+`LocalOffset(t)` its offset alone and `LocalZoneName` the zone's name;
+`UnixToLocalDate(t)` is the local date of a moment, and
+`LocalDateToUnix(y, m, d, hh, mm, ss)` the moment the local clock shows
+as that date, a time the clock skipped or showed twice taking one of
+its two offsets as Go's `time.Date` does. Past the file's last
+transition the POSIX rule at its end goes on, in 2080 as in 2026.
 
 `NowUnix` is seconds and `NowNanos` nanoseconds of the wall clock,
 `Monotonic` nanoseconds of `CLOCK_MONOTONIC` and `Since(t0)` is
@@ -9785,6 +9797,72 @@ sum  |  1238.00|  1,238.00|
 1.234.567,89 -42.50$
 ```
 
+**Dates and times.** A `TDateTime` is a `Double`, the days since
+1899-12-30 and the time the fraction of a day (`TDate` and `TTime` are
+the same type), as in Free Pascal: `EncodeDate`, `EncodeTime` and their
+`Try` forms, `DecodeDate`, `DecodeDateFully`, `DecodeTime`,
+`ComposeDateTime`, `DayOfWeek` (1 for Sunday), `IsLeapYear`,
+`IncMonth` and `IncAMonth` (the last day of a shorter month), `ReplaceDate`
+and `ReplaceTime`, `TTimeStamp` with `DateTimeToTimeStamp`,
+`TimeStampToDateTime`, `MSecsToTimeStamp` and `TimeStampToMSecs`,
+`TSystemTime` with `DateTimeToSystemTime` and `SystemTimeToDateTime`,
+`FloatToDateTime`, and `HoursPerDay`, `MSecsPerDay`, `DateDelta`,
+`UnixDateDelta`, `MonthDays`, `MinDateTime` and `MaxDateTime`.
+`Now`, `Date`, `Time`, `NowUTC`, `GetLocalTime`, `GetUniversalTime` and
+`CurrentYear` read the wall clock in the local zone `pastime` gives (Go's
+`time.Local`: `TZ`, `/etc/localtime`, the TZif files), and so do
+`GetLocalTimeOffset` (the minutes to add to the local time to have UTC,
+now or at a date given as UTC or as local time), `UniversalTimeToLocal`,
+`LocalTimeToUniversal`, `DateTimeToFileDate`, `UniversalToFileDate`,
+`FileDateToDateTime` and `FileDateToUniversal` (a file's date is its
+Unix second). `FormatDateTime` and `DateTimeToString` write Free
+Pascal's patterns: `d` to `dddddd`, `m` to `mmmm` (minutes after an
+hour), `yy` and `yyyy`, `h`, `n`, `s`, `z` and `zzz`, `t` and `tt`, `c`
+and `f`, `am/pm`, `a/p` and `ampm` for a 12-hour clock, `/` and `:` the
+settings' separators, text in quotes, and with `[fdoInterval]` the hours,
+minutes or seconds of a whole interval in brackets, `[h]:nn`.
+`DateToStr`, `TimeToStr` and `DateTimeToStr` write the settings' short
+date and long time. `StrToDate` reads a day, a month and a year in the
+order of the short date format (or one given, with its separator), a
+year of two digits placed by `TwoDigitYearCenturyWindow`, a day and a
+month alone of this year; `StrToTime` an hour and optional minutes,
+seconds and milliseconds with an AM or a PM; `StrToDateTime` both; each
+with its `Try` and `Def` forms and a `TFormatSettings`, and a bad one
+raises `EConvertError` with Free Pascal's message. Each setting is also
+a variable of its own name, `ShortDateFormat`, `DateSeparator`,
+`DecimalSeparator` and the rest, another name for the field of
+`DefaultFormatSettings` (`absolute`, P162), as in Free Pascal.
+
+`examples/dates.paslang`:
+
+```pascal
+{ SysUtils: a date and a time as a TDateTime, written and read back,
+  a month later, taken apart, and the hours of an interval. }
+program dates;
+
+uses sysutils;
+
+var
+  start, due, back: TDateTime;
+  y, m, d: Word;
+begin
+  start := EncodeDate(2026, 1, 31) + EncodeTime(9, 30, 0, 0);
+  WriteLn(FormatDateTime('dddd d mmmm yyyy, hh:nn', start));    { Saturday 31 January 2026, 09:30 }
+  due := IncMonth(start, 1);                        { February has no 31st: its last day }
+  DecodeDate(due, y, m, d);
+  WriteLn(y, '-', m, '-', d, ' ', FormatSettings.ShortDayNames[DayOfWeek(due)]);   { 2026-2-28 Sat }
+  back := StrToDateTime('28-2-2026 17:45');         { d/m/y, the default settings }
+  WriteLn(FormatDateTime('[h]:nn', back - start, [fdoInterval]));  { 680:15 }
+  WriteLn(DateToStr(back), ' ', TimeToStr(back));   { 28-2-26 17:45:00 }
+  try
+    back := EncodeDate(2026, 2, 29);
+  except
+    on e: EConvertError do
+      WriteLn(e.Message);            { 2026-2-29 is not a valid date specification }
+  end;
+end.
+```
+
 What differs from Free Pascal's, as paslang differs (§19): `Integer` is
 64 bits, so `StrToInt` takes what `StrToInt64` takes; the `Ansi` words
 change the ASCII letters of UTF-8 text and leave the other bytes;
@@ -9796,7 +9874,10 @@ prints `paslang: uncaught raise in the main routine: EConvertError: ...`
 and the program stops with status 1. A real is written with its own
 digits rounded once, every digit asked for, a precision of 1 as one
 digit, NaN as `NaN`; FormatFloat's empty section and a value that rounds
-to 0, and Format's letters it does not know, as §19 says.
+to 0, and Format's letters it does not know, as §19 says. The local
+clock is Go's, a date's own offset and daylight saving time at any date,
+and a year Free Pascal takes as a `Word` is an `Integer`, as §19 says of
+the dates too.
 
 ## 18. The runtime model
 
@@ -10437,6 +10518,31 @@ the commands on standard input, under `--debug-mode` and under
   n whatever its range, so `set of 60..140` takes 32 bytes; a list in
   brackets may mix a constant and an integer variable (`[60, n]`),
   which Free Pascal refuses as a type conflict.
+- SysUtils' dates and times (P131) follow Free Pascal 3.3.1's sources
+  where they differ from its 3.2.2: 23:59:60, a leap second, is a time
+  (the next midnight); an interval before 0 is written with its sign,
+  `[hh]` and `[nn]` with two digits; a `#0` separator is none (3.2.2
+  ends the text there); a number too long for its field is a bad date
+  format, as 3.3.1's `Val` says; `TSystemTime` has the Windows names
+  (`wYear` ...); `UniversalToFileDate`, `FileDateToUniversal`,
+  `UniversalTimeToLocal`, `LocalTimeToUniversal` and the forms of
+  `GetLocalTimeOffset` with a date are 3.3.1's. A year, a month, an
+  hour Free Pascal takes as a `Word` value is an `Integer`: a year of
+  70000 is no date, where the `Word` made it 4464-1-1 without a word.
+  The counts of an interval are 64 bits (3.2.2 wraps them at 2^31 into
+  negative numbers); a text has no 255-character limit (3.2.2 cuts it
+  there); a letter that is no directive is written as it is (3.2.2
+  writes it in capitals, `x` as `X`). The local clock is Go's
+  `time.Local`: `TZ` is read, and every date has its own offset and
+  daylight saving time (3.2.2 reads `/etc/localtime` alone and applies
+  the offset of the day the program started to every date, so a January
+  file date in Madrid is an hour off in summer), a moment before 1970 is
+  its own day and second (3.2.2 mirrors it about midnight, `-1` as
+  1970-01-01 00:00:01), a moment past 2038 is itself (3.2.2 wraps it to
+  1902), `UniversalTimeToLocal` and `LocalTimeToUniversal` of one
+  argument add the zone's offset to the second (Kolkata's +5:21:10
+  before 1942; Free Pascal counts whole minutes), and `GetUniversalTime`
+  fills the day of the week too, where 3.2.2 leaves it as it was.
 - An exception object is not freed when its handler ends, as Free
   Pascal frees it: the collector takes it back when nothing points to
   it, so a handler may keep it or raise it again with `raise E`.
