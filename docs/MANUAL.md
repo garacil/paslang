@@ -3141,6 +3141,36 @@ interface's method takes `const`, `var` and `out` parameters as a
 class's does (1.0.136; `const` was a syntax error there, and a `var`
 argument went as its value).
 
+`TFoo = class(TParent);` declares a class with nothing of its own, the
+parent's members and nothing else, as Object Pascal does; a family of
+exception classes is written so (`EConvertError = class(Exception);`).
+`TFoo = class;` and `IFoo = interface;` declare a class or an
+interface forward, so that types can name each other: a later type
+declaration in the same declarations (a program's, a routine's, or a
+unit's interface part) declares it whole, and it is the same type.
+Until then it can be named, as a field's, a parameter's or a result's
+type, in `class of TFoo` and in `^TFoo`, but it is no parent and no
+interface a class implements; declarations that end with one still
+forward, a class declared forward and completed as an interface or as
+a record, and a class that names itself as its parent are errors
+(`forward type TFoo not resolved at 3:3`). The whole declaration may
+come after a `var` or a routine, as Free Pascal allows (1.1.14, P139;
+the short form was `class member`, and nothing could be declared
+forward).
+
+```pascal
+type
+  TNode = class;                  { forward: TList names it }
+  TList = class
+    First: TNode;
+  end;
+  TNode = class                   { the same type, whole }
+    Next: TNode;
+    Owner: TList;
+  end;
+  TMark = class(TNode);           { nothing of its own }
+```
+
 `is` never stops: of `nil` it is False for every class. `as` stops the
 program when the object is not of the class named (`a` holding a `TC`,
 `a as TB`), with `paslang: as failed` on standard error and exit

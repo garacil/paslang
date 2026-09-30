@@ -76,8 +76,8 @@ SELF_UNITS := \
 A64DIR := $(BUILDDIR)/a64
 
 # The golden tests: testdata/<t>.paslang must print testdata/<t>.out.
-GOLDEN := hello arith ifthen loops const caseof procs recfn records ptrs arrs strs grow paswork pingpong chclose sel exc excg nest cls gen enums sets dbg opt gdbg inherit rtti args8 mevent slice chlit armmeth propacc runes variant opadd args20 iface opmore props pindex dwarfloc shift dynnil xor inhcall isas sysid forward defaults abstract overload methov strdef trig logexp arctan invpow logx trig2 hyper miscmath xxh32 xxh64 map1 map2 sync1 sync2 finexit zerolocal pchar selx selstress wrchar chstr lookpath strcmp dupparam recarg funcval constk regloop reszero divconst bareln gctypes chr charcat heapspan blobzero gcbasic mapsplit stackmap trygrow growgc xxh3 mapgetstr bounds fairq sized fwdptr constexpr int2real typedconst caserange emptystmt writefmt realparse realfmt valpar strcow chanany chanbuf memmove overnarrow slicegrow fatexit narrow narrowmem recalign narrowbounds dwarfnarrow narrowgo forlimit bce inplace narrowasm slicereg forrun addrform bcerun inspine framearr realstep f32conv single dwarfreal ptrtyped ptrarith ptrsafe memview checkptr ptrreach cpwalk realint quadcore quadfmt quad quadconst dwarfquad bitops declorder convchain bitwords bitmem bitany views blocks wide ifdef quadfast memwords cpuwords vectors vecmore inlineasm vecpool addrlocal rotwords rotmem ctxwords append funcval2 closures pasargs ifaceargs vshrs64 auditfix closurebox audit2 visibility freedestroy reservedall nodeadlock mapfix tree1 tree2 hash1 store1 immwide constref inline1 stackargs mainexit networds charcmp unixsock sigpipe sleepmany deadlines strfill narrowpop tobject1 excobj1 excobj2 excobj3 classref1 ctorargs aconst1 aconst2 methdef1 set256 subrange1 subrange2 helper1 helper2 strwords strkern slicedit strcmpk scope1
-GOLDEN_A64 := map1 map2 sync1 sync2 finexit zerolocal pchar pingpong sel chclose paswork selx selstress wrchar args8 arith arrs caseof chlit cls const enums exc excg gen grow hyper ifthen inherit loops mevent miscmath nest procs ptrs recfn records sets strs trig2 xxh32 xxh64 rtti gdbg chstr strcmp recarg funcval constk regloop reszero divconst bareln gctypes chr charcat heapspan blobzero gcbasic mapsplit stackmap trygrow growgc xxh3 mapgetstr bounds fairq sized fwdptr constexpr int2real typedconst caserange emptystmt writefmt realparse realfmt valpar strcow chanany chanbuf memmove overnarrow slicegrow fatexit narrow narrowmem recalign narrowbounds dwarfnarrow narrowgo forlimit bce inplace narrowasm slicereg forrun addrform bcerun inspine framearr realstep f32conv single dwarfreal ptrtyped ptrarith ptrsafe memview checkptr ptrreach cpwalk realint quadcore quadfmt quad quadconst dwarfquad bitops declorder convchain bitwords bitmem bitany views blocks wide ifdef quadfast memwords cpuwords vectors vecmore inlineasm vecpool addrlocal rotwords rotmem ctxwords append funcval2 closures pasargs ifaceargs vshrs64 auditfix closurebox audit2 visibility freedestroy reservedall nodeadlock mapfix tree1 tree2 hash1 store1 immwide constref inline1 stackargs mainexit networds charcmp unixsock sigpipe sleepmany deadlines strfill narrowpop tobject1 excobj1 excobj2 excobj3 classref1 ctorargs aconst1 aconst2 methdef1 set256 subrange1 subrange2 helper1 helper2 strwords strkern slicedit strcmpk scope1
+GOLDEN := hello arith ifthen loops const caseof procs recfn records ptrs arrs strs grow paswork pingpong chclose sel exc excg nest cls gen enums sets dbg opt gdbg inherit rtti args8 mevent slice chlit armmeth propacc runes variant opadd args20 iface opmore props pindex dwarfloc shift dynnil xor inhcall isas sysid forward defaults abstract overload methov strdef trig logexp arctan invpow logx trig2 hyper miscmath xxh32 xxh64 map1 map2 sync1 sync2 finexit zerolocal pchar selx selstress wrchar chstr lookpath strcmp dupparam recarg funcval constk regloop reszero divconst bareln gctypes chr charcat heapspan blobzero gcbasic mapsplit stackmap trygrow growgc xxh3 mapgetstr bounds fairq sized fwdptr constexpr int2real typedconst caserange emptystmt writefmt realparse realfmt valpar strcow chanany chanbuf memmove overnarrow slicegrow fatexit narrow narrowmem recalign narrowbounds dwarfnarrow narrowgo forlimit bce inplace narrowasm slicereg forrun addrform bcerun inspine framearr realstep f32conv single dwarfreal ptrtyped ptrarith ptrsafe memview checkptr ptrreach cpwalk realint quadcore quadfmt quad quadconst dwarfquad bitops declorder convchain bitwords bitmem bitany views blocks wide ifdef quadfast memwords cpuwords vectors vecmore inlineasm vecpool addrlocal rotwords rotmem ctxwords append funcval2 closures pasargs ifaceargs vshrs64 auditfix closurebox audit2 visibility freedestroy reservedall nodeadlock mapfix tree1 tree2 hash1 store1 immwide constref inline1 stackargs mainexit networds charcmp unixsock sigpipe sleepmany deadlines strfill narrowpop tobject1 excobj1 excobj2 excobj3 classref1 ctorargs aconst1 aconst2 methdef1 set256 subrange1 subrange2 helper1 helper2 strwords strkern slicedit strcmpk scope1 classfwd
+GOLDEN_A64 := map1 map2 sync1 sync2 finexit zerolocal pchar pingpong sel chclose paswork selx selstress wrchar args8 arith arrs caseof chlit cls const enums exc excg gen grow hyper ifthen inherit loops mevent miscmath nest procs ptrs recfn records sets strs trig2 xxh32 xxh64 rtti gdbg chstr strcmp recarg funcval constk regloop reszero divconst bareln gctypes chr charcat heapspan blobzero gcbasic mapsplit stackmap trygrow growgc xxh3 mapgetstr bounds fairq sized fwdptr constexpr int2real typedconst caserange emptystmt writefmt realparse realfmt valpar strcow chanany chanbuf memmove overnarrow slicegrow fatexit narrow narrowmem recalign narrowbounds dwarfnarrow narrowgo forlimit bce inplace narrowasm slicereg forrun addrform bcerun inspine framearr realstep f32conv single dwarfreal ptrtyped ptrarith ptrsafe memview checkptr ptrreach cpwalk realint quadcore quadfmt quad quadconst dwarfquad bitops declorder convchain bitwords bitmem bitany views blocks wide ifdef quadfast memwords cpuwords vectors vecmore inlineasm vecpool addrlocal rotwords rotmem ctxwords append funcval2 closures pasargs ifaceargs vshrs64 auditfix closurebox audit2 visibility freedestroy reservedall nodeadlock mapfix tree1 tree2 hash1 store1 immwide constref inline1 stackargs mainexit networds charcmp unixsock sigpipe sleepmany deadlines strfill narrowpop tobject1 excobj1 excobj2 excobj3 classref1 ctorargs aconst1 aconst2 methdef1 set256 subrange1 subrange2 helper1 helper2 strwords strkern slicedit strcmpk scope1 classfwd
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -819,6 +819,22 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'unknown identifier Q at 13:4' $(BUILDDIR)/scopebad_outside.err; \
 	grep -q 'unknown identifier K at 10:12' $(BUILDDIR)/scopebad_constout.err; \
 	echo ok scopebad; \
+	echo "==== short class forms rejects (P139) ===="; \
+	for f in 'unresolved:forward type TA not resolved at 3:3' \
+	  'asparent:TA is not declared whole yet: a parent class is declared before the classes that descend from it at 4:14' \
+	  'selfparent:TA is not declared whole yet: a parent class is declared before the classes that descend from it at 3:14' \
+	  'ifparent:IX is not declared whole yet: a parent interface is declared before the interfaces that descend from it at 4:18' \
+	  'implements:IX is not declared whole yet: an interface is declared before the classes that implement it at 4:23' \
+	  'mismatch:TA was declared forward as a class at 5:8' 'mismatch2:TA was declared forward as a class at 5:8' \
+	  'ifclass:IX was declared forward as an interface at 5:8' 'helper:TA was declared forward as a class at 4:8' \
+	  'twice:duplicate type TA at 4:3' 'done:duplicate type TA at 5:3' 'inner:forward type TA not resolved at 4:3'; do \
+	  n=$${f%%:*}; w=$${f#*:}; \
+	  if $(OUTDIR)/paslangc -o $(BUILDDIR)/classfwdbad_$$n testdata/classfwdbad/$$n.paslang >$(BUILDDIR)/classfwdbad_$$n.err 2>&1; then \
+	    echo "$$n should fail"; exit 1; \
+	  fi; \
+	  grep -qF "$$w" $(BUILDDIR)/classfwdbad_$$n.err || { cat $(BUILDDIR)/classfwdbad_$$n.err; exit 1; }; \
+	done; \
+	echo ok classfwdbad; \
 	echo "==== forward pointer rejects ===="; \
 	for f in fwdopen:TX:4:9 fwdvar:TZ:4:7 fwdlater:TW:4:9; do \
 	  n=$${f%%:*}; w=$${f#*:}; \
@@ -1596,6 +1612,19 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/shaduse-arm testdata/units/shaduse.paslang; \
 	timeout 60 $(QEMU_A64) $(BUILDDIR)/shaduse-arm > $(BUILDDIR)/shaduse-arm.got; \
 	diff -u testdata/units/shaduse.out $(BUILDDIR)/shaduse-arm.got; \
+	: classes that name each other in a unit, P139: a forward class, its descendant before its parent; \
+	$(OUTDIR)/paslangc testdata/units/clsfwdu.paslang; \
+	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/clsfwduse testdata/units/clsfwduse.paslang; \
+	$(BUILDDIR)/clsfwduse > $(BUILDDIR)/clsfwduse.got; \
+	diff -u testdata/units/clsfwduse.out $(BUILDDIR)/clsfwduse.got; \
+	if $(OUTDIR)/paslangc -o $(BUILDDIR)/clsfwdbadu testdata/units/clsfwdbadu.paslang > $(BUILDDIR)/clsfwdbadu.err 2>&1; then \
+	  echo 'a forward class of the interface declared in the implementation should be refused'; exit 1; \
+	fi; \
+	grep -q 'forward type TLeaf not resolved at 6:3' $(BUILDDIR)/clsfwdbadu.err; \
+	$(OUTDIR)/paslangc -target arm64 testdata/units/clsfwdu.paslang; \
+	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/clsfwduse-arm testdata/units/clsfwduse.paslang; \
+	timeout 60 $(QEMU_A64) $(BUILDDIR)/clsfwduse-arm > $(BUILDDIR)/clsfwduse-arm.got; \
+	diff -u testdata/units/clsfwduse.out $(BUILDDIR)/clsfwduse-arm.got; \
 	$(OUTDIR)/paslangc testdata/units/safeu.paslang; \
 	grep -q '^SAFE$$' $(BUILDDIR)/safeu.pi; \
 	if grep -q '^SAFE$$' $(BUILDDIR)/adder.pi; then echo "adder.pi says SAFE for a unit that is not safe"; exit 1; fi; \

@@ -110,6 +110,9 @@ type
     FHelperTyp: LongInt;      { the helper whose method is being read (P127), 0 outside one }
     FConstScope, FTypeScope, FProcScope: SizeInt;  { where the routine being read begins its constants, type names and nested routines in the tables (P137) }
     FScopeTypes: TStrArray;   { the type names the routine being read declares (P137) }
+    FFwdTypes: array of LongInt;  { the classes and interfaces declared forward and not whole yet (P139) }
+    FFwdAt: TStrArray;        { where each of them was declared forward }
+    FFwdScope: SizeInt;       { where the routine being read begins its forward types (P139) }
     FModNoAddr: Boolean;      { ExprMod: an address taken is not a change (the const check, 1.1.1) }
     FProcs: array of TProcEnt;
     FOps: array of TOpEnt;
@@ -435,6 +438,12 @@ type
     function ForwardPtr(const AName, At: string): LongInt;
     procedure ResolvePending(const AName: string; Id: LongInt);
     procedure CheckPending;
+    function FwdIdx(const AName: string): SizeInt;
+    function IsFwdType(Id: LongInt): Boolean;
+    procedure DeclareFwd(const AName: string; Kind: TTypeKind; const At: string);
+    procedure FwdKindIs(Fwd: SizeInt; Kind: TTypeKind; const AName, At: string);
+    function TakeFwd(const AName: string): LongInt;
+    procedure CheckFwdTypes;
     function InternMethod: LongInt;
     function NeedsArgs(const M: TMethInfo): Boolean;
     function InternMethodSig(IsFn: Boolean; Ret: LongInt;
@@ -2707,6 +2716,97 @@ begin
   for m := 0 to High(FPendingPtr) do
     if FPendingPtr[m] <> '' then
       Die('unknown type ' + FPendingPtr[m] + ' at ' + FPendingAt[m]);
+end;
+
+{ The classes and interfaces declared forward (P139): TFoo = class; and
+  IFoo = interface; name a type that the same declarations (a unit's
+  interface part, a program's or a routine's) declare whole later, as
+  Object Pascal's. Until then it is a type to name, for a field, a
+  parameter, a class of or a pointer, and not yet a parent or an
+  interface to implement. The forward type and the whole one are the
+  same type. }
+function TParser.FwdIdx(const AName: string): SizeInt;
+var
+  i: SizeInt;
+begin
+  Result := -1;
+  for i := FFwdScope to High(FFwdTypes) do
+    if SameId(FTypes[FFwdTypes[i]].Name, AName) then
+    begin
+      Result := i;
+      Exit;
+    end;
+end;
+
+function TParser.IsFwdType(Id: LongInt): Boolean;
+var
+  i: SizeInt;
+begin
+  Result := False;
+  for i := 0 to High(FFwdTypes) do
+    if FFwdTypes[i] = Id then
+      Result := True;
+end;
+
+procedure TParser.DeclareFwd(const AName: string; Kind: TTypeKind; const At: string);
+var
+  td: TTypeDef;
+  t: LongInt;
+  n: SizeInt;
+begin
+  if (FwdIdx(AName) >= 0) or ((FNest = 0) and NamedType(AName, t)) then
+    Die('duplicate type ' + AName + ' at ' + At);
+  td := Default(TTypeDef);
+  td.Kind := Kind;
+  td.Name := AName;
+  if Kind = tykInterface then
+    td.Size := 16
+  else
+    td.Size := 8;
+  n := Length(FFwdTypes);
+  SetLength(FFwdTypes, n + 1);
+  FFwdTypes[n] := AddNamedType(AName, td);
+  AppendStr(FFwdAt, At);
+end;
+
+{ The whole declaration of a forward type is of its kind; At is where
+  its type begins. }
+procedure TParser.FwdKindIs(Fwd: SizeInt; Kind: TTypeKind; const AName, At: string);
+begin
+  if (Fwd < 0) or (FTypes[FFwdTypes[Fwd]].Kind = Kind) then
+    Exit;
+  if FTypes[FFwdTypes[Fwd]].Kind = tykClass then
+    Die(AName + ' was declared forward as a class' + At)
+  else
+    Die(AName + ' was declared forward as an interface' + At);
+end;
+
+{ The forward type AName is declared whole now: its id, out of the
+  list; -1 when it was not declared forward. }
+function TParser.TakeFwd(const AName: string): LongInt;
+var
+  i, j: SizeInt;
+begin
+  Result := -1;
+  i := FwdIdx(AName);
+  if i < 0 then
+    Exit;
+  Result := FFwdTypes[i];
+  for j := i to High(FFwdTypes) - 1 do
+  begin
+    FFwdTypes[j] := FFwdTypes[j + 1];
+    FFwdAt[j] := FFwdAt[j + 1];
+  end;
+  SetLength(FFwdTypes, Length(FFwdTypes) - 1);
+  SetLength(FFwdAt, Length(FFwdAt) - 1);
+end;
+
+{ At the end of the declarations every forward type of theirs is whole. }
+procedure TParser.CheckFwdTypes;
+begin
+  if Length(FFwdTypes) > FFwdScope then
+    Die('forward type ' + FTypes[FFwdTypes[FFwdScope]].Name + ' not resolved at ' +
+      FFwdAt[FFwdScope]);
 end;
 
 function TParser.InternArray(Elem: LongInt; Lo, Hi: Int64): LongInt;
@@ -6438,12 +6538,14 @@ var
   mname: string;
   isFunc, byref: Boolean;
 begin
-  Eat(tkInterface);
   td := Default(TTypeDef);
   td.Kind := tykInterface;
   td.Name := AName;
   td.Size := 16;
-  Result := AddNamedType(AName, td);
+  { an interface declared forward is the same type (P139) }
+  Result := TakeFwd(AName);
+  if Result < 0 then
+    Result := AddNamedType(AName, td);
   td.Meths := nil;
   slot := 0;
   parent := 0;
@@ -6454,6 +6556,10 @@ begin
       Die('parent interface');
     if not NamedType(FTok.Lexeme, parent) then
       Die('unknown identifier ' + FTok.Lexeme);
+    { one declared forward, or this one, is not whole yet (P139) }
+    if (parent = Result) or IsFwdType(parent) then
+      Die(FTok.Lexeme + ' is not declared whole yet: a parent interface is declared before ' +
+        'the interfaces that descend from it' + HerePos);
     par := TypeOf(parent);
     if par.Kind <> tykInterface then
       Die('parent interface');
@@ -7184,7 +7290,7 @@ var
   off, sz, t, slot, nindex, keepSlot: LongInt;
   mname, rname, wname, baseSym, gname, mpos: string;
   isVirt, isAbs, isFunc, isCtor, isDtor, byref, pub, eq, msafe: Boolean;
-  isClassM, isStat, cvarMode, isStatField: Boolean;
+  isClassM, isStat, cvarMode, isStatField, short: Boolean;
   npar: LongInt;
   pt: LongInt;
   parent, ov: LongInt;
@@ -7195,7 +7301,10 @@ begin
   td.Kind := tykClass;
   td.Name := AName;
   td.Size := 8;
-  Result := AddNamedType(AName, td);
+  { a class declared forward is the same type (P139) }
+  Result := TakeFwd(AName);
+  if Result < 0 then
+    Result := AddNamedType(AName, td);
   td.Fields := nil;
   td.Meths := nil;
   td.Props := nil;
@@ -7204,6 +7313,7 @@ begin
   parent := 0;
   pub := True;
   vis := VisPublic;
+  short := False;
   if FTok.Kind = tkLParen then
   begin
     FTok := FLex.Next;
@@ -7213,6 +7323,15 @@ begin
         Die('class or interface');
       if not NamedType(FTok.Lexeme, t) then
         Die('unknown identifier ' + FTok.Lexeme);
+      { one declared forward, or this one, is not whole yet (P139) }
+      if (t = Result) or IsFwdType(t) then
+      begin
+        if TypeOf(t).Kind = tykInterface then
+          Die(FTok.Lexeme + ' is not declared whole yet: an interface is declared before ' +
+            'the classes that implement it' + HerePos);
+        Die(FTok.Lexeme + ' is not declared whole yet: a parent class is declared before ' +
+          'the classes that descend from it' + HerePos);
+      end;
       FTok := FLex.Next;
       if TypeOf(t).Kind = tykClass then
       begin
@@ -7258,6 +7377,8 @@ begin
       FTok := FLex.Next;
     end;
     Eat(tkRParen);
+    { TFoo = class(TParent); is a class with nothing of its own (P139) }
+    short := FTok.Kind = tkSemi;
   end;
   { A class with no parent descends from TObject (P121), as in Object
     Pascal: TObject's virtual methods take the first slots, Free and the
@@ -7295,7 +7416,7 @@ begin
     td.Parent := parent;
   end;
   cvarMode := False;
-  while FTok.Kind <> tkEnd do
+  while (not short) and (FTok.Kind <> tkEnd) do
   begin
     { The sections set what code may use the members that follow
       (1.0.137, as FPC): public and published anywhere, protected, private,
@@ -7660,7 +7781,7 @@ begin
       Continue;
     end;
     if FTok.Kind <> tkIdent then
-      Die('class member');
+      Die('class member' + HerePos);
     names := nil;
     nn := 0;
     while True do
@@ -7719,7 +7840,8 @@ begin
       off := off + sz;
     end;
   end;
-  Eat(tkEnd);
+  if not short then
+    Eat(tkEnd);
   for i := 0 to High(td.Props) do
   begin
     if td.Props[i].ReadName <> '' then
@@ -7947,9 +8069,9 @@ end;
 
 procedure TParser.ParseTypeSection;
 var
-  name: string;
+  name, at, kat: string;
   td: TTypeDef;
-  n: SizeInt;
+  n, fwd: SizeInt;
   off: LongInt;
   id: LongInt;
   outer: Boolean;
@@ -7968,8 +8090,11 @@ begin
     end;
     CheckName(FTok.Lexeme);
     name := FTok.Lexeme;
+    at := IntToStr(FTok.Line) + ':' + IntToStr(FTok.Col);
+    { a class or an interface declared forward, declared whole now (P139) }
+    fwd := FwdIdx(name);
     { a routine's type is its own (P137) }
-    if FNest > 0 then
+    if (FNest > 0) and (fwd < 0) then
     begin
       if TypeNameIdx(name) >= FTypeScope then
         Die('duplicate type ' + name + HerePos);
@@ -7978,6 +8103,9 @@ begin
     end;
     FTok := FLex.Next;
     Eat(tkEq);
+    kat := HerePos;
+    if (FTok.Kind <> tkClass) and (FTok.Kind <> tkInterface) then
+      FwdKindIs(fwd, tykNone, name, kat);
     if FTok.Kind = tkLParen then
       ParseEnumType(name)
     else if FTok.Kind = tkType then
@@ -7992,9 +8120,16 @@ begin
     else if FTok.Kind = tkClass then
     begin
       { class of T, a class reference type (P123), or a class; class
-        helper for C (P127) }
+        helper for C (P127); class; declares one forward (P139) }
       FTok := FLex.Next;
-      if IsHelperWord then
+      if IsHelperWord or (FTok.Kind = tkOf) then
+        FwdKindIs(fwd, tykNone, name, kat);
+      if FTok.Kind = tkSemi then
+      begin
+        DeclareFwd(name, tykClass, at);
+        Eat(tkSemi);
+      end
+      else if IsHelperWord then
       begin
         ParseHelperType(name, 2);
         Eat(tkSemi);
@@ -8011,13 +8146,20 @@ begin
       end
       else
       begin
+        FwdKindIs(fwd, tykClass, name, kat);
         ParseClassType(name);
         Eat(tkSemi);
       end;
     end
     else if FTok.Kind = tkInterface then
     begin
-      ParseIfaceType(name);
+      { interface; declares one forward (P139) }
+      FwdKindIs(fwd, tykInterface, name, kat);
+      FTok := FLex.Next;
+      if FTok.Kind = tkSemi then
+        DeclareFwd(name, tykInterface, at)
+      else
+        ParseIfaceType(name);
       Eat(tkSemi);
     end
     else if FTok.Kind = tkRecord then
@@ -19120,7 +19262,7 @@ var
   savedExc: LongInt;
   savedSelfRef, savedNoSelf: Boolean;
   savedHelper: LongInt;
-  savedCScope, savedTScope, savedPScope, j: SizeInt;
+  savedCScope, savedTScope, savedPScope, savedFScope, j: SizeInt;
   savedSTypes: TStrArray;
   keep: Boolean;
 begin
@@ -19172,6 +19314,8 @@ begin
     here, and go at its end (P137) }
   savedCScope := FConstScope;
   savedTScope := FTypeScope;
+  savedFScope := FFwdScope;
+  FFwdScope := Length(FFwdTypes);
   savedPScope := FProcScope;
   savedSTypes := FScopeTypes;
   FConstScope := Length(FConsts);
@@ -19260,6 +19404,7 @@ begin
       FProg.Procs[n] := child;
     end;
   end;
+  CheckFwdTypes;
   FInBody := True;
   Pr.Body := Self.ParseBlock;
   for i := 0 to High(FLimits) do
@@ -19307,6 +19452,7 @@ begin
   SetLength(FProcs, j);
   FConstScope := savedCScope;
   FTypeScope := savedTScope;
+  FFwdScope := savedFScope;
   FProcScope := savedPScope;
   FScopeTypes := savedSTypes;
   FConstNames := savedConst;
@@ -19662,6 +19808,8 @@ begin
       Break;
     end;
   end;
+  { the declarations end: their forward types are whole (P139) }
+  CheckFwdTypes;
 end;
 
 function TParser.ParseProgram: TProgram;
