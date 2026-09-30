@@ -137,7 +137,7 @@ of an element reads the size of the type it has there
 
 ## Real numbers
 
-`Real` and `Double` are one type: IEEE binary64, 8 bytes. `Single` is
+`Real`, `Double` and `Extended` are one type: IEEE binary64, 8 bytes (`Extended` since 1.1.20, P145, as Free Pascal has it on arm64 and Win64). `Single` is
 IEEE binary32, 4 bytes, worked out in 32 bits (`addss`, `fadd s`), as
 Go's `float32` (1.0.104; before it was binary64 under another name).
 The rules are the integers' (P99):

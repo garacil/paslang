@@ -7279,7 +7279,7 @@ end;
 { The passive data connection: a listener on a port the kernel picks,
   told to the client in the form the command asks for; the transfer
   command that follows accepts the one connection. }
-procedure Passive(S: PSession; Extended: Boolean);
+procedure Passive(S: PSession; Epsv: Boolean);
 var
   host, local: string;
   port, i: Integer;
@@ -7294,7 +7294,7 @@ begin
     Exit;
   end;
   port := TcpPort(S^.DataL);
-  if Extended then
+  if Epsv then
   begin
     Reply(S, '229 Entering Extended Passive Mode (|||' + IntToStr(port) + '|)');
     Exit;
@@ -10308,7 +10308,7 @@ its place:
 - the predefined types and their pointers: `Byte UInt8 Int8 ShortInt
   Word UInt16 Int16 SmallInt UInt32 LongWord DWord Int32 Int64 LongInt
   SizeInt NativeInt PtrInt Cardinal QWord UInt64 Rune Char AnsiChar Real
-  Double Single Quad Pointer PChar` and `PByte PUInt8 PInt8 PShortInt
+  Double Extended Single Quad Pointer PChar` and `PByte PUInt8 PInt8 PShortInt
   PWord PUInt16 PInt16 PSmallInt PDWord PLongWord PUInt32 PInt32
   PInteger PInt64 PSingle PDouble PQuad PBoolean PPointer`;
 - what the core units export (§15), predefined in every program and
