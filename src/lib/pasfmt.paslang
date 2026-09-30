@@ -39,6 +39,7 @@ function PasF64ToF32(B: Int64): Int64;
 function PasF32ToF64(B: Int64): Int64;
 function PasParseQuad(const S: string; out Lo, Hi: Int64): Boolean;
 function PasFmtQuad(Lo, Hi: Int64; W, D: Integer): string;
+function PasQuadDigits(Lo, Hi: Int64; Mode, N: Int64; out Dp: Int64): string;
 
 implementation
 
@@ -134,11 +135,39 @@ begin
       Result := True;
 end;
 
+{ A shifted right by N bits, the bits below dropped. }
+procedure BigShrTrunc(var A: TBig; N: Integer);
+var
+  words, bits, i: Integer;
+begin
+  words := N div 32;
+  bits := N mod 32;
+  if words >= Length(A) then
+  begin
+    SetLength(A, 1);
+    A[0] := 0;
+    Exit;
+  end;
+  for i := 0 to High(A) - words do
+    A[i] := A[i + words];
+  SetLength(A, Length(A) - words);
+  if bits > 0 then
+  begin
+    for i := 0 to High(A) do
+    begin
+      A[i] := A[i] shr bits;
+      if i < High(A) then
+        A[i] := A[i] or ((A[i + 1] shl (32 - bits)) and 4294967295);
+    end;
+  end;
+  BigTrim(A);
+end;
+
 { A shifted right by N bits, rounded to the nearest, a tie to even. }
 procedure BigShrRound(var A: TBig; N: Integer);
 var
   up: Boolean;
-  words, bits, i: Integer;
+  i: Integer;
 begin
   up := False;
   if BigBit(A, N - 1) then
@@ -148,28 +177,7 @@ begin
     else
       up := BigBit(A, N);
   end;
-  words := N div 32;
-  bits := N mod 32;
-  if words >= Length(A) then
-  begin
-    SetLength(A, 1);
-    A[0] := 0;
-  end
-  else
-  begin
-    for i := 0 to High(A) - words do
-      A[i] := A[i + words];
-    SetLength(A, Length(A) - words);
-    if bits > 0 then
-    begin
-      for i := 0 to High(A) do
-      begin
-        A[i] := A[i] shr bits;
-        if i < High(A) then
-          A[i] := A[i] or ((A[i + 1] shl (32 - bits)) and 4294967295);
-      end;
-    end;
-  end;
+  BigShrTrunc(A, N);
   if up then
   begin
     i := 0;
@@ -212,6 +220,8 @@ begin
   Result := (Length(A) = 1) and (A[0] = 0);
 end;
 
+{ The decimal digits of A, which is used up: an array passed by value is
+  the same array, and the divisions leave it 0. }
 function BigToDec(A: TBig): string;
 var
   r: Int64;
@@ -750,11 +760,23 @@ begin
   Result := Result or (sign shl 63);
 end;
 
+{ S right-aligned in W columns: one string made, the spaces and then S
+  (P129; it put one space before the string at a time). }
 function Pad(const S: string; W: Integer): string;
+var
+  n: Integer;
 begin
-  Result := S;
-  while Length(Result) < W do
-    Result := ' ' + Result;
+  n := W - Length(S);
+  if n <= 0 then
+  begin
+    Result := S;
+    Exit;
+  end;
+  Result := '';
+  SetLength(Result, W);
+  FillChar(Result[1], n, 32);
+  if Length(S) > 0 then
+    Move(S[1], Result[n + 1], Length(S));
 end;
 
 { The number Big * 2^Shift, negative when Neg, with D decimals (6, the
@@ -877,28 +899,372 @@ begin
   Result := FmtExact(big, e - 16495, neg, W, D);
 end;
 
+{ ---- the digits of a Quad (P129) ---- }
+
+{ 10^K, K from 0 to 9. }
+function SmallPow10(K: Int64): Int64;
+begin
+  Result := 1;
+  while K > 0 do
+  begin
+    Result := Result * 10;
+    K := K - 1;
+  end;
+end;
+
+function BigCopy(const A: TBig): TBig;
+var
+  i: Integer;
+begin
+  Result := nil;
+  SetLength(Result, Length(A));
+  for i := 0 to High(A) do
+    Result[i] := A[i];
+end;
+
+{ A times 10^K, K not below 0. }
+procedure BigMulPow10(var A: TBig; K: Int64);
+begin
+  while K >= 9 do
+  begin
+    BigMulSmall(A, 1000000000);
+    K := K - 9;
+  end;
+  if K > 0 then
+    BigMulSmall(A, SmallPow10(K));
+end;
+
+{ What a floor dropped, against half the last unit it kept, is a class:
+  0 nothing, 1 less than a half, 2 a half, 3 more. }
+
+{ A divided by 10^K, K above 0, and Cls the class of what the division
+  dropped: nine digits at a time from the lowest, so the last remainder
+  is the top of the dropped part and the ones before only say whether it
+  goes on. }
+procedure BigDivPow10(var A: TBig; K: Int64; out Cls: Integer);
+var
+  r, t, top, half: Int64;
+  lowNZ: Boolean;
+begin
+  lowNZ := False;
+  top := 0;
+  t := 1;
+  while K > 0 do
+  begin
+    t := K;
+    if t > 9 then
+      t := 9;
+    BigDivSmall(A, SmallPow10(t), r);
+    K := K - t;
+    if K > 0 then
+      lowNZ := lowNZ or (r <> 0)
+    else
+      top := r;
+  end;
+  half := 5 * SmallPow10(t - 1);
+  if top > half then
+    Cls := 3
+  else if top = half then
+  begin
+    if lowNZ then
+      Cls := 3
+    else
+      Cls := 2;
+  end
+  else if (top = 0) and not lowNZ then
+    Cls := 0
+  else
+    Cls := 1;
+end;
+
+{ floor(M * 2^E * 10^P) in D, and in Cls the class of what the floor
+  dropped: the power of 10 first, exactly (a product, or a division whose
+  remainder is kept as its class), then the power of 2, whose dropped
+  bits say the rest (the half bit, and any bit below it or a remainder
+  of the division). }
+procedure QuadScale(const M: TBig; E, P: Int64; out D: TBig; out Cls: Integer);
+var
+  s: Int64;
+  dc: Integer;
+  half, rest: Boolean;
+begin
+  D := BigCopy(M);
+  s := 0;
+  if E >= 0 then
+    BigShl(D, E)
+  else
+    s := -E;
+  dc := 0;
+  if P > 0 then
+    BigMulPow10(D, P)
+  else if P < 0 then
+    BigDivPow10(D, -P, dc);
+  if s = 0 then
+  begin
+    Cls := dc;
+    Exit;
+  end;
+  half := BigBit(D, s - 1);
+  rest := (dc <> 0) or BigLowAny(D, s - 1);
+  BigShrTrunc(D, s);
+  if half then
+  begin
+    if rest then
+      Cls := 3
+    else
+      Cls := 2;
+  end
+  else if rest then
+    Cls := 1
+  else
+    Cls := 0;
+end;
+
+{ D rounded by what its floor dropped: up above a half, and at a half
+  when D is odd (a tie to even). }
+procedure BigRoundCls(var D: TBig; Cls: Integer);
+begin
+  if (Cls = 3) or ((Cls = 2) and ((D[0] and 1) <> 0)) then
+    BigAddSmall(D, 1);
+end;
+
+{ floor(X * log10 2), and floor(X * log10 2 + log10 3/4): uscale.go's
+  log10Pow2 and skewed with constants of 32 bits, exact for every X from
+  -17000 to 17000 (checked against 80 digits), the range of a Quad; Go's
+  of 18 and 21 bits are exact for a Double's. }
+function Log10Pow2Q(X: Int64): Int64;
+begin
+  Result := (X * 1292913986) sar 32;
+end;
+
+function SkewedQ(X: Int64): Int64;
+begin
+  Result := (X * 1292913986 - 536607788) sar 32;
+end;
+
+{ The significand of a Quad with its hidden bit, M, and the power of 2
+  of its last bit, E: the magnitude is M * 2^E. Field is the exponent
+  field; Kind 0 a number, 1 a zero, 2 an infinity or a NaN. }
+procedure QuadParts(Lo, Hi: Int64; out M: TBig; out E, Field: Int64; out Kind: Integer);
+var
+  mh: Int64;
+begin
+  Field := (Hi shr 48) and 32767;
+  mh := Hi and 281474976710655;
+  M := nil;
+  SetLength(M, 4);
+  E := 0;
+  if Field = 32767 then
+  begin
+    Kind := 2;
+    Exit;
+  end;
+  if Field = 0 then
+    E := 1
+  else
+  begin
+    E := Field;
+    mh := mh or 281474976710656;
+  end;
+  E := E - 16495;
+  M[0] := Lo and 4294967295;
+  M[1] := Lo shr 32;
+  M[2] := mh and 4294967295;
+  M[3] := mh shr 32;
+  BigTrim(M);
+  if BigIsZero(M) then
+    Kind := 1
+  else
+    Kind := 0;
+end;
+
+{ The digits of a Quad's magnitude as Go writes a float64's (ftoa.go;
+  uscale.go's shortFloat and fixedWidthFloat), with exact arithmetic in
+  place of the unrounded scaling, which Go works out for 64 bits: Mode 0
+  the fewest digits that read back as the Quad, the nearest of them when
+  two do; 1 N significant digits; 2 the digits to N places after the
+  point (below 0, a place before it). Rounded once, a tie to even. The
+  magnitude is 0.Result * 10^Dp; Result has no trailing zero and is ''
+  (Dp 0) for a zero, a value that rounds to 0, or one not finite. }
+function PasQuadDigits(Lo, Hi: Int64; Mode, N: Int64; out Dp: Int64): string;
+var
+  m, d, t, dmin, dmax, one: TBig;
+  e, field, p, k, pt, r: Int64;
+  kind, cls: Integer;
+  skew, incl: Boolean;
+  s: string;
+  i: Integer;
+begin
+  Result := '';
+  Dp := 0;
+  QuadParts(Lo, Hi, m, e, field, kind);
+  if kind <> 0 then
+    Exit;
+  if Mode = 0 then
+  begin
+    { the values that round to the Quad: half its last bit either side,
+      a quarter below when it is a power of 2 whose neighbour below has
+      half its spacing; the bounds too when its last bit is 0 (a tie
+      goes to it). In quarters of that bit, scaled by 10^p, p chosen so
+      that the interval spans 1 to 10 units (shortFloat's). }
+    skew := (field > 1) and (Lo = 0) and ((Hi and 281474976710655) = 0);
+    incl := (m[0] and 1) = 0;
+    one := nil;
+    SetLength(one, 1);
+    t := BigCopy(m);
+    BigShl(t, 2);
+    if skew then
+    begin
+      one[0] := 1;
+      p := -SkewedQ(e);
+    end
+    else
+    begin
+      one[0] := 2;
+      p := -Log10Pow2Q(e);
+    end;
+    BigSub(t, one);
+    QuadScale(t, e - 2, p, dmin, cls);
+    if (cls <> 0) or not incl then
+      BigAddSmall(dmin, 1);
+    t := BigCopy(m);
+    BigShl(t, 2);
+    BigAddSmall(t, 2);
+    QuadScale(t, e - 2, p, dmax, cls);
+    if (cls = 0) and not incl then
+    begin
+      one[0] := 1;
+      BigSub(dmax, one);
+    end;
+    { a multiple of 10 among them is a digit fewer }
+    t := BigCopy(dmax);
+    BigDivSmall(t, 10, r);
+    d := BigCopy(t);
+    BigMulSmall(d, 10);
+    if BigCmp(d, dmin) >= 0 then
+    begin
+      s := BigToDec(t);
+      pt := Length(s) - p + 1;
+    end
+    else
+    begin
+      if BigCmp(dmin, dmax) < 0 then
+      begin
+        QuadScale(m, e, p, d, cls);
+        BigRoundCls(d, cls);
+      end
+      else
+        d := dmin;
+      s := BigToDec(d);
+      pt := Length(s) - p;
+    end;
+  end
+  else if Mode = 1 then
+  begin
+    { the place of the point first, from the bits and then checked: k
+      digits (one when N asks for none) must come out }
+    k := N;
+    if k < 1 then
+      k := 1;
+    pt := Log10Pow2Q(BigBitLen(m) + e - 1) + 1;
+    repeat
+      QuadScale(m, e, k - pt, d, cls);
+      s := BigToDec(BigCopy(d));
+      if Length(s) > k then
+        pt := pt + 1
+      else if Length(s) < k then
+        pt := pt - 1
+      else
+        Break;
+    until False;
+    p := k - pt;
+    if N < 1 then
+    begin
+      p := N - pt;
+      QuadScale(m, e, p, d, cls);
+    end;
+    BigRoundCls(d, cls);
+    s := BigToDec(d);
+    if s = '0' then
+      Exit;
+    pt := Length(s) - p;
+  end
+  else
+  begin
+    QuadScale(m, e, N, d, cls);
+    BigRoundCls(d, cls);
+    s := BigToDec(d);
+    if s = '0' then
+      Exit;
+    pt := Length(s) - N;
+  end;
+  i := Length(s);
+  while (i > 1) and (s[i] = '0') do
+    i := i - 1;
+  Result := Copy(s, 1, i);
+  Dp := pt;
+end;
+
+const
+  DigitPairs = '00010203040506070809101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899';
+
+{ V in decimal, right-aligned in W columns (P129, from paslib's IntToStr,
+  which calls it now): two digits at a time from DigitPairs, from the
+  end of a buffer, as Go's strconv.formatBits; the value is kept at or
+  below zero, so Low(Int64), which has no positive twin, comes out whole;
+  one string made. It put one digit before the string at a time, a
+  string made for each. The digits go through pointers, b into buf and
+  dp into DigitPairs: every index is in range by construction (i from 24
+  down, at most 19 digits and a sign; r below 100). }
 function PasFmtInt(V: Int64; W: Integer): string;
 var
-  neg: Boolean;
-  u: Int64;
-  s: string;
+  buf: array[0..23] of Char;
+  b, dp: PChar;
+  i, n, sp: Integer;
+  q, r, t: Int64;
 begin
-  s := '';
-  neg := V < 0;
-  u := V;
-  if u = 0 then
-    s := '0';
-  while u <> 0 do
+  b := @buf[0];
+  dp := @DigitPairs[1];
+  if V > 0 then
+    q := -V
+  else
+    q := V;
+  i := 24;
+  while q <= -100 do
   begin
-    if neg then
-      s := Chr(48 - u mod 10) + s
-    else
-      s := Chr(48 + u mod 10) + s;
-    u := u div 10;
+    t := q div 100;
+    r := t * 100 - q;
+    q := t;
+    i := i - 2;
+    b[i] := dp[r * 2];
+    b[i + 1] := dp[r * 2 + 1];
   end;
-  if neg then
-    s := '-' + s;
-  Result := Pad(s, W);
+  r := -q;
+  if r >= 10 then
+  begin
+    i := i - 2;
+    b[i] := dp[r * 2];
+    b[i + 1] := dp[r * 2 + 1];
+  end
+  else
+  begin
+    i := i - 1;
+    b[i] := Char(Ord('0') + r);
+  end;
+  if V < 0 then
+  begin
+    i := i - 1;
+    b[i] := '-';
+  end;
+  n := 24 - i;
+  sp := W - n;
+  if sp < 0 then
+    sp := 0;
+  Result := '';
+  SetLength(Result, n + sp);
+  if sp > 0 then
+    FillChar(Result[1], sp, 32);
+  Move(b[i], Result[sp + 1], n);
 end;
 
 function PasFmtStr(const S: string; W: Integer): string;

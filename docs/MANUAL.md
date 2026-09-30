@@ -9606,8 +9606,9 @@ slept at least 30ms: 1
 
 `uses sysutils` gives Free Pascal's unit of the name, its routines and
 classes with Free Pascal's names, parameters and results, written for
-paslang: the text of each was read in Free Pascal 3.2.2's sources and
-its output compared with Free Pascal's (`testdata/sysutils1`). It is a
+paslang: the text of each was read in Free Pascal's sources (3.3.1, the
+line after 3.2.2) and its output compared with Free Pascal 3.2.2's
+(`testdata/sysutils1`, `fmtfloat1`, `format1`). It is a
 library unit like `pastime`, installed with the compiler and built for
 each processor level (§21), so its string words run on the kernels of
 the processor a program is compiled for.
@@ -9640,8 +9641,9 @@ end.
 ```
 
 **Exceptions.** `Exception` holds a `Message` and a `HelpContext`
-(`Create(msg)`, `CreateHelp(msg, ctx)`), and its `ToString` is `ClassName:
-Message`, what an exception nobody catches prints. Free Pascal's classes
+(`Create(msg)`, `CreateHelp(msg, ctx)`, and `CreateFmt(fmt, args)` and
+`CreateFmtHelp`, the message made by `Format`), and its `ToString` is
+`ClassName: Message`, what an exception nobody catches prints. Free Pascal's classes
 are there with their parents: `EExternal`, `EIntError`, `EDivByZero`,
 `ERangeError`, `EIntOverflow`, `EMathError`, `EInvalidOp`, `EZeroDivide`,
 `EOverflow`, `EUnderflow`, `EInOutError` (with `ErrorCode`), `EHeapMemoryError`,
@@ -9684,15 +9686,87 @@ record under the other name (`absolute`, §3), so a program that sets
 `FormatSettings.DecimalSeparator := ','` changes what every routine
 reads.
 
+**Reals as text.** `FloatToStr` writes the fewest digits that read back
+as the value, as Go's `strconv` does: `0.1 + 0.2` is `0.30000000000000004`,
+`1/3` is `0.3333333333333333`, in the decimal form while the exponent is
+above -6 and below 15 and as `1.5E20` beyond. `FloatToStrF(x, format,
+precision, digits)` takes Free Pascal's five formats: `ffGeneral`
+(`precision` significant digits, the decimal form while the exponent is
+below it), `ffExponent` (`d.dddE+ddd`, the exponent with at least
+`digits` digits and at most 4), `ffFixed` (`digits` places), `ffNumber`
+(with the thousands separator) and `ffCurrency` (the settings'
+`CurrencyString`, `CurrencyFormat`, `NegCurrFormat` and
+`CurrencyDecimals`). `FormatFloat(pattern, x)` reads Free Pascal's
+patterns: up to three sections, for a positive value, a negative one and
+zero; `0` a digit always written, `#` one written when there is one, `.`
+the point, `,` the thousands, `E+` and `E-` an exponent, text in quotes
+as it is. `FloatToDecimal` gives the digits and the place of the point
+in a `TFloatRec`. Each takes a `Double`, a `Single`, an `Int64` or a
+`Quad` as its own value (a `Single`'s fewest digits are its own, `0.1`;
+an `Int64`'s are exact; a `Quad`'s are worked out exactly, all 113 bits,
+by `pasfmt`'s `PasQuadDigits`), and each has a form with a
+`TFormatSettings`. The digits are rounded once from the exact value, a
+tie to even: `2.5` with no decimals is `2`, and `1.005` with two is
+`1.00`, since the `Double` is 1.00499999999999989...
+
+**Format.** `Format(fmt, [args])` reads Free Pascal's directives,
+`%[index:][-][width][.precision]type`: `d`, `u` and `x` an integer (64
+bits), `e`, `f`, `g`, `n` and `m` a real in the formats above (`%e` and
+`%g` with no precision the fewest digits), `s` a string, a `Char` or a
+`PChar`, `p` a pointer, `b` a `Boolean`, `o` an object's `ToString` or a
+class's name, `%%` a `%`, and `*` for a width or a precision taken from
+the list. A missing argument, one of another kind or a letter that is no
+directive raises `EConvertError` with Free Pascal's message (`Invalid
+argument index in format "%d %d"`). `FmtStr(res, fmt, args)` is the
+procedure form.
+
+```pascal
+{ SysUtils: a small report with Format, FormatFloat, FloatToStr and
+  settings of another country. }
+program report;
+
+uses sysutils;
+
+var
+  names: array[0..2] of string = ('tea', 'lamp', 'sum');
+  prices: array[0..2] of Double = (3.5, 1234.5, 1238);
+  i: Integer;
+  fs: TFormatSettings;
+begin
+  for i := 0 to 2 do
+    WriteLn(Format('%-5s|%9.2f|%10s|', [names[i], prices[i], FormatFloat('#,##0.00', prices[i])]));
+  WriteLn(FloatToStr(0.1 + 0.2), ' ', FloatToStr(1 / 3));     { the fewest digits that read back }
+  WriteLn(FloatToStrF(2.5, ffFixed, 0, 0), ' ', Format('%.3e', [6.02214076e23]));
+  fs := DefaultFormatSettings;
+  fs.DecimalSeparator := ',';
+  fs.ThousandSeparator := '.';
+  WriteLn(FormatFloat('#,##0.00', 1234567.891, fs), ' ', FloatToStrF(-42.5, ffCurrency, 0, 2));
+end.
+```
+
+prints
+
+```
+tea  |     3.50|      3.50|
+lamp |  1234.50|  1,234.50|
+sum  |  1238.00|  1,238.00|
+0.30000000000000004 0.3333333333333333
+2 6.02E+023
+1.234.567,89 -42.50$
+```
+
 What differs from Free Pascal's, as paslang differs (§19): `Integer` is
 64 bits, so `StrToInt` takes what `StrToInt64` takes; the `Ansi` words
 change the ASCII letters of UTF-8 text and leave the other bytes;
 `GetBaseException` is the object it is called on, since paslang keeps no
 list of the exceptions being handled; `StringReplace` with a count,
-`EInOutArgumentException` and `GetBaseException` come from Free
-Pascal's sources after 3.2.2; an exception nobody catches prints
-`paslang: uncaught raise in the main routine: EConvertError: ...` and
-the program stops with status 1.
+`EInOutArgumentException`, `GetBaseException` and Format's `%b` and `%o`
+come from Free Pascal's sources after 3.2.2; an exception nobody catches
+prints `paslang: uncaught raise in the main routine: EConvertError: ...`
+and the program stops with status 1. A real is written with its own
+digits rounded once, every digit asked for, a precision of 1 as one
+digit, NaN as `NaN`; FormatFloat's empty section and a value that rounds
+to 0, and Format's letters it does not know, as §19 says.
 
 ## 18. The runtime model
 
@@ -10304,7 +10378,29 @@ the commands on standard input, under `--debug-mode` and under
   on it (`'x'.Twice` is string's helper), where Free Pascal takes it for
   a `Char`. A helper has no constructor.
 - `Write` prints no set, as Free Pascal; it prints a `Boolean` as 1 or
-  0, where Free Pascal writes TRUE and FALSE. A set's bit n is element
+  0, where Free Pascal writes TRUE and FALSE.
+- SysUtils writes a real with the digits of the value itself, rounded
+  once, a tie to even, and with no precision asked the fewest that read
+  back, as Go's `strconv` does (P129). Free Pascal rounds an
+  approximation of 17 or 18 digits (Grisu) and then rounds that again,
+  stops at 15, 17 or 18 digits and writes zeros after them:
+  `FloatToStr(0.1 + 0.2)` is `0.3` there, `2.5` with no decimals `3`,
+  `1.005` with two `1.01`, and `1e100` in full
+  `99999999999999999996700...`. A `Single`, an `Int64` and a `Quad` are
+  written as their own values (Free Pascal writes a `Single` through its
+  `Extended`: `0.1000000015`). Every digit asked for is written (Free
+  Pascal: 18 at most); a precision of 1 is one digit (Free Pascal writes
+  two, whatever it is asked); NaN, +Inf and -Inf are spelled as paslang
+  and Go spell them (Free Pascal: `Nan`, and its `FormatFloat` of a NaN
+  stops with `EInvalidOp`). `FormatFloat` takes the first section for an
+  empty one (Free Pascal writes the general form, as its test of an
+  empty section is never true) and writes a value that rounds to 0 with
+  no sign and no digit for `#`, as `FloatToDecimal` gives it the exponent
+  0 (Free Pascal keeps the exponent and the sign from before rounding and
+  writes `-0` and `.00`). `Format`'s integers are 64 bits (`%x` of -1 is
+  `FFFFFFFFFFFFFFFF`, `%.20x` twenty digits), and a letter that is no
+  directive is an `EConvertError`, where Free Pascal writes nothing for
+  it, or the text of the directive before it again. A set's bit n is element
   n whatever its range, so `set of 60..140` takes 32 bytes; a list in
   brackets may mix a constant and an integer variable (`[60, n]`),
   which Free Pascal refuses as a type conflict.

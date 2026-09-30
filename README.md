@@ -193,7 +193,9 @@ the GPL.
 
 The SHA-1, SHA-256, SHA-512 and CRC kernels of `src/lib/pashash.paslang`
 and the string kernels of `src/lib/passtr.paslang` follow the assembly
-of Go 1.23 for each machine; Go's license, which covers those parts, is
-in [LICENSE-GO](LICENSE-GO).
+of Go 1.23 for each machine, and the digits of a real in
+`src/rtl/sysutils.paslang` follow Go's `strconv` (its unrounded scaling
+and its table of powers of 10); Go's license, which covers those parts,
+is in [LICENSE-GO](LICENSE-GO).
 
 Copyright (C) 2026 Germán Luis Aracil Boned.
