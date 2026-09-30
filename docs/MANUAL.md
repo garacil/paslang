@@ -313,7 +313,7 @@ The sizes are fixed and the same on both targets:
 | `^T`, a class, a map, a chan | 8 | one machine word; `nil` is zero |
 | `array of T` | 24 | a slice: pointer, length, capacity |
 | `array[a..b] of T` | (b-a+1) × SizeOf(T) | fixed, no header |
-| `set of T` | 8 | a 64-bit bitset for elements 0..63 |
+| `set of T` | 8 or 32 | a bitset: one word for elements 0..63, 32 bytes up to 255 |
 | `procedure of object`, `function ... of object` | 16 | code pointer and Self |
 | a routine value, `procedure(...)`, `function(...): T` | 16 | code pointer and environment (§5) |
 | an interface value | 16 | object and method table |
@@ -441,14 +441,44 @@ are checked are in §6.
 stopped on them with `Default type`).
 `SizeOf(T)` and `SizeOf(expr)` give sizes.
 
-A set, `set of T`, is one word of bits for a `T` whose values lie in
-0..63: a `Boolean`, an enumeration or a subrange such as `0..63` (`set
-of Byte` and `set of Char` are refused, their values pass 63). `[1,
-3..5]` is a set and `[]` the empty one; `+` is the union, `*` the
-intersection, `-` the difference, `=` and `<>` compare, `x in s` tests
-and `for x in s do` walks the members from the lowest. A set goes only
-where a set goes: `i := [1, 2]` is a compile error (1.0.136; it stored
-the bitmask).
+A set, `set of T`, is a bitset for a `T` whose values lie in 0..255:
+`Char`, `Byte`, a `Boolean`, an enumeration or a subrange. Up to
+element 63 it is one word; past it, 32 bytes (`set of Char`, `set of
+Byte`). `[1, 3..5]` is a set and `[]` the empty one; `+` is the union,
+`*` the intersection, `-` the difference, `=` and `<>` compare, `<=`
+and `>=` test a subset and a superset, `x in s` tests, `Include(s, x)`
+and `Exclude(s, x)` change the variable, and `for x in s do` walks the
+members from the lowest:
+
+```pascal
+type
+  TChars = set of Char;
+const
+  Blanks: TChars = [' ', #9];
+var
+  ident: TChars;
+  c: Char;
+begin
+  ident := ['a'..'z', 'A'..'Z', '0'..'9', '_'];
+  Include(ident, '$');
+  if not ('-' in ident) and (Blanks * ident = []) then
+    for c in ident - ['a'..'z', 'A'..'Z'] do
+      Write(c);                     { $0123456789_ }
+  WriteLn;
+end.
+```
+
+A list takes its type from its elements and from where it goes; sets
+of one kind and other ranges meet in the set that holds both, and a
+set goes into another of its kind keeping what that one can hold, as
+Free Pascal does. An element out of the set's range is in no set (`x
+in s` is false); a list's element known only at run time outside the
+set's range stops the program. A list of strings or reals is a list,
+not a set: it goes where a slice or an open array goes, and `for s in
+['ab', 'cd'] do` walks it in its order. A set goes only where a set
+goes: `i := [1, 2]` is a compile error (1.0.136; it stored the
+bitmask), and `Write` does not print one. On a processor with AVX2 an
+operation on two sets of 32 bytes is one instruction (TYPES.md, Sets).
 
 Every local variable starts as zero: an `Integer` is 0, a `string` is
 empty, a slice and a map are `nil`, a record has zero fields.
@@ -9889,6 +9919,11 @@ the commands on standard input, under `--debug-mode` and under
   output is closed.
 - `Close`, like `Send`, is a keyword (a channel's), so no method or
   routine takes the name.
+- `Write` prints no set, as Free Pascal; it prints a `Boolean` as 1 or
+  0, where Free Pascal writes TRUE and FALSE. A set's bit n is element
+  n whatever its range, so `set of 60..140` takes 32 bytes; a list in
+  brackets may mix a constant and an integer variable (`[60, n]`),
+  which Free Pascal refuses as a type conflict.
 - An exception object is not freed when its handler ends, as Free
   Pascal frees it: the collector takes it back when nothing points to
   it, so a handler may keep it or raise it again with `raise E`.

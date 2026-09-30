@@ -56,6 +56,7 @@ const
   MsgClone = 'paslang: clone failed';
   MsgIndex = 'paslang: index ';
   MsgBit = 'paslang: bit ';
+  MsgSet = 'paslang: set element ';
   MsgBlk1 = 'paslang: logic on ';
   MsgBlk2 = ' and ';
   MsgBlk3 = ' bytes';
@@ -226,6 +227,7 @@ type
     FStoreSrc: PExpr;     { the value StoreTo stores, when the statement knows it (1.0.82) }
     FStrMaps: array of LongInt;  { the types whose string maps .rodata carries (1.0.82) }
     FZeroMax: LongInt;    { the biggest record a closed channel gives as zero (.Lzeroblk, 1.0.83) }
+    FSetImgs: TStrArray;  { the constant sets of 32 bytes (P126), .Lsetc<n> in .rodata, 64 hex digits each }
     FSym: array of TSym;
     FFrame: LongInt;
     FStrs: array of string;
@@ -622,6 +624,15 @@ type
     procedure EmitDumpLocals;
     procedure DbgCode(Typ: LongInt; out Code, Size: LongInt);
     function IsClassVar(const N: string): Boolean;
+    function IsWSet(Id: LongInt): Boolean;
+    procedure EmitSetCheck(T: LongInt);
+    procedure EmitWSetLit(E: PExpr);
+    procedure EmitSetBin(E: PExpr);
+    procedure EmitSetFor(S: PStmt);
+    procedure EmitSetIncl(E: PExpr);
+    procedure EmitSetConv(E: PExpr);
+    procedure SetAndWord(M: Int64);
+    function SetConst(const W: TInt64Arr): string;
     procedure EmitConstArr(E: PExpr);
     procedure EmitDebugTables(const Prog: TProgram);
     procedure ShiftArgs(N, NReg, Reg0: LongInt);
@@ -1850,10 +1861,969 @@ begin
   end;
 end;
 
+function HexWord(V: Int64): string;
+var
+  i, d: LongInt;
+begin
+  Result := '';
+  for i := 15 downto 0 do
+  begin
+    d := LongInt((V shr (i * 4)) and 15);
+    if d < 10 then
+      Result := Result + Char(48 + d)
+    else
+      Result := Result + Char(87 + d);
+  end;
+  Result := '0x' + Result;
+end;
+
+{ ---- Sets (P126) ----
+
+  A set of up to 64 elements is one word, bit n the element whose ordinal
+  is n; one of up to 256, 32 bytes, a block as a record is, whose
+  expression gives its address. Union, intersection and difference of
+  two of 32 bytes are one ymm instruction on a processor with AVX2 (-cpu,
+  vpor, vpand, vpandn), two SSE2 ones otherwise, two NEON ones on arm64
+  (orr, and, bic); = is a compare, <= a subset (vptest's CF on AVX2 and
+  SSE4.1: the second operand and not the first is empty). x in s tests
+  the bit, and an x out of the set's range is in no set. }
+
+{ The label of the constant set of 32 bytes whose words are W, one in
+  .rodata for each distinct value. }
+function TEmitter.SetConst(const W: TInt64Arr): string;
+var
+  img: string;
+  i: SizeInt;
+begin
+  img := Copy(HexWord(W[0]), 3, 16) + Copy(HexWord(W[1]), 3, 16) +
+    Copy(HexWord(W[2]), 3, 16) + Copy(HexWord(W[3]), 3, 16);
+  for i := 0 to High(FSetImgs) do
+    if FSetImgs[i] = img then
+    begin
+      Result := '.Lsetc' + IntToStr(i);
+      Exit;
+    end;
+  i := Length(FSetImgs);
+  SetLength(FSetImgs, i + 1);
+  FSetImgs[i] := img;
+  Result := '.Lsetc' + IntToStr(i);
+end;
+
+{ The element in rax or x0 lies in set type T's range, or the program
+  stops: paslang: set element N out of range [LO..HI] at line L. }
+procedure TEmitter.EmitSetCheck(T: LongInt);
+var
+  lo, hi: Int64;
+  ok: string;
+begin
+  lo := FTypes[T].Lo;
+  hi := FTypes[T].Hi;
+  ok := Lab;
+  if FArm then
+  begin
+    if lo = 0 then
+      Line('  cmp x0, #' + IntToStr(hi))
+    else
+    begin
+      Line('  sub x9, x0, #' + IntToStr(lo));
+      Line('  cmp x9, #' + IntToStr(hi - lo));
+    end;
+    Line('  b.ls ' + ok);
+    Imm('x1', lo);
+    Imm('x2', hi);
+    Line('  bl rt_setfail');
+  end
+  else
+  begin
+    if lo = 0 then
+      Line('  cmpq $' + IntToStr(hi) + ', %rax')
+    else
+    begin
+      Line('  movq %rax, %rcx');
+      Line('  subq $' + IntToStr(lo) + ', %rcx');
+      Line('  cmpq $' + IntToStr(hi - lo) + ', %rcx');
+    end;
+    Line('  jbe ' + ok);
+    Line('  movq %rax, %rdi');
+    Line('  movq $' + IntToStr(lo) + ', %rsi');
+    Line('  movq $' + IntToStr(hi) + ', %rdx');
+    Line('  call rt_setfail');
+  end;
+  Line(ok + ':');
+end;
+
+{ [a, b..c] of a set of 32 bytes: its address. All constant, the set in
+  .rodata; else a scratch region cleared and each element's bit set,
+  each element checked against the set's range. }
+procedure TEmitter.EmitWSetLit(E: PExpr);
+var
+  i: SizeInt;
+  allc: Boolean;
+  bits: TInt64Arr;
+  lo, hi, v, one: Int64;
+  off: LongInt;
+  a, b, c, d: string;
+begin
+  allc := True;
+  for i := 0 to High(E^.Args) do
+    if E^.Args[i]^.Kind = ekRange then
+    begin
+      if (E^.Args[i]^.L^.Kind <> ekInt) or (E^.Args[i]^.R^.Kind <> ekInt) then
+        allc := False;
+    end
+    else if E^.Args[i]^.Kind <> ekInt then
+      allc := False;
+  if allc then
+  begin
+    bits := nil;
+    SetLength(bits, 4);
+    for i := 0 to 3 do
+      bits[i] := 0;
+    one := 1;
+    for i := 0 to High(E^.Args) do
+    begin
+      if E^.Args[i]^.Kind = ekRange then
+      begin
+        lo := E^.Args[i]^.L^.Num;
+        hi := E^.Args[i]^.R^.Num;
+      end
+      else
+      begin
+        lo := E^.Args[i]^.Num;
+        hi := lo;
+      end;
+      v := lo;
+      while v <= hi do
+      begin
+        bits[v shr 6] := bits[v shr 6] or (one shl (v and 63));
+        v := v + 1;
+      end;
+    end;
+    if FArm then
+      LeaS(SetConst(bits), 'x0')
+    else
+      Line('  leaq ' + SetConst(bits) + '(%rip), %rax');
+    Exit;
+  end;
+  off := ScratchT(32, E^.Typ);
+  if FArm then
+  begin
+    AddFP('x11', off);
+    Line('  stp xzr, xzr, [x11]');
+    Line('  stp xzr, xzr, [x11, #16]');
+  end
+  else
+  begin
+    Line('  pxor %xmm0, %xmm0');
+    Line('  movdqu %xmm0, ' + IntToStr(off) + '(%rbp)');
+    Line('  movdqu %xmm0, ' + IntToStr(off + 16) + '(%rbp)');
+  end;
+  for i := 0 to High(E^.Args) do
+    if E^.Args[i]^.Kind = ekRange then
+    begin
+      EmitExpr(E^.Args[i]^.L);
+      if E^.Args[i]^.L^.Kind <> ekInt then
+        EmitSetCheck(E^.Typ);
+      if FArm then
+        PshK('x0', 0)
+      else
+        PushK('rax', 0);
+      EmitExpr(E^.Args[i]^.R);
+      if E^.Args[i]^.R^.Kind <> ekInt then
+        EmitSetCheck(E^.Typ);
+      { lo..hi a word at a time: the first word from lo's bit up,
+        the whole words between, the last up to hi's bit }
+      a := Lab;
+      b := Lab;
+      c := Lab;
+      d := Lab;
+      if FArm then
+      begin
+        Line('  mov x14, x0');
+        Ppop('x15');
+        Line('  cmp x15, x14');
+        Line('  b.gt ' + b);
+        AddFP('x11', off);
+        Line('  lsr x9, x15, #6');
+        Line('  lsr x10, x14, #6');
+        Line('  mov x12, #-1');
+        Line('  lsl x12, x12, x15');
+        Line('  mov x13, #-2');
+        Line('  lsl x13, x13, x14');
+        Line('  mvn x13, x13');
+        Line('  cmp x9, x10');
+        Line('  b.ne ' + a);
+        Line('  and x12, x12, x13');
+        Line('  ldr x14, [x11, x9, lsl #3]');
+        Line('  orr x14, x14, x12');
+        Line('  str x14, [x11, x9, lsl #3]');
+        Line('  b ' + b);
+        Line(a + ':');
+        Line('  ldr x14, [x11, x9, lsl #3]');
+        Line('  orr x14, x14, x12');
+        Line('  str x14, [x11, x9, lsl #3]');
+        Line('  mov x12, #-1');
+        Line(c + ':');
+        Line('  add x9, x9, #1');
+        Line('  cmp x9, x10');
+        Line('  b.hs ' + d);
+        Line('  str x12, [x11, x9, lsl #3]');
+        Line('  b ' + c);
+        Line(d + ':');
+        Line('  ldr x14, [x11, x10, lsl #3]');
+        Line('  orr x14, x14, x13');
+        Line('  str x14, [x11, x10, lsl #3]');
+        Line(b + ':');
+      end
+      else
+      begin
+        Line('  movq %rax, %r8');
+        Line('  popq %rcx');
+        Line('  cmpq %r8, %rcx');
+        Line('  jg ' + b);
+        Line('  movq %rcx, %rdx');
+        Line('  shrq $6, %rdx');
+        Line('  movq %r8, %r9');
+        Line('  shrq $6, %r9');
+        Line('  movq $-1, %rax');
+        Line('  shlq %cl, %rax');
+        Line('  movq %r8, %rcx');
+        Line('  movq $-2, %r10');
+        Line('  shlq %cl, %r10');
+        Line('  notq %r10');
+        Line('  cmpq %rdx, %r9');
+        Line('  jne ' + a);
+        Line('  andq %r10, %rax');
+        Line('  orq %rax, ' + IntToStr(off) + '(%rbp,%rdx,8)');
+        Line('  jmp ' + b);
+        Line(a + ':');
+        Line('  orq %rax, ' + IntToStr(off) + '(%rbp,%rdx,8)');
+        Line(c + ':');
+        Line('  incq %rdx');
+        Line('  cmpq %r9, %rdx');
+        Line('  jae ' + d);
+        Line('  movq $-1, ' + IntToStr(off) + '(%rbp,%rdx,8)');
+        Line('  jmp ' + c);
+        Line(d + ':');
+        Line('  orq %r10, ' + IntToStr(off) + '(%rbp,%r9,8)');
+        Line(b + ':');
+      end;
+    end
+    else
+    begin
+      EmitExpr(E^.Args[i]);
+      if E^.Args[i]^.Kind <> ekInt then
+        EmitSetCheck(E^.Typ);
+      if FArm then
+      begin
+        AddFP('x11', off);
+        Line('  lsr x9, x0, #6');
+        Line('  and x10, x0, #63');
+        Line('  ldr x12, [x11, x9, lsl #3]');
+        Line('  mov x13, #1');
+        Line('  lsl x13, x13, x10');
+        Line('  orr x12, x12, x13');
+        Line('  str x12, [x11, x9, lsl #3]');
+      end
+      else
+      begin
+        { bts of a register (its bit mod 64), not of memory, whose bit
+          string form is the slow one }
+        Line('  movq %rax, %rdx');
+        Line('  shrq $6, %rdx');
+        Line('  xorl %r8d, %r8d');
+        Line('  btsq %rax, %r8');
+        Line('  orq %r8, ' + IntToStr(off) + '(%rbp,%rdx,8)');
+      end;
+    end;
+  if FArm then
+    AddFP('x0', off)
+  else
+    Line('  leaq ' + IntToStr(off) + '(%rbp), %rax');
+end;
+
+{ A set's operation (EmitExpr): x in s, and s op t of two sets. }
+procedure TEmitter.EmitSetBin(E: PExpr);
+var
+  wide, avx, sse41, bmi: Boolean;
+  op: TBinOp;
+  dst: LongInt;
+  a, cc, sub, sup: string;
+begin
+  op := E^.Bin;
+  avx := (not FArm) and HasFeat(CpuFeatBit('avx2', False));
+  sse41 := (not FArm) and HasFeat(CpuFeatBit('sse41', False));
+  bmi := (not FArm) and HasFeat(CpuFeatBit('bmi1', False));
+  if op = boIn then
+  begin
+    { the element, unsigned against the set's last bit: an element out
+      of it, negative too, is in no set }
+    wide := IsWSet(E^.R^.Typ);
+    EmitExpr(E^.L);
+    if FArm then
+      PshK('x0', 0)
+    else
+      PushK('rax', 0);
+    EmitExpr(E^.R);
+    a := Lab;
+    if FArm then
+    begin
+      Ppop('x1');
+      Line('  mov x2, xzr');
+      if wide then
+        Line('  cmp x1, #255')
+      else
+        Line('  cmp x1, #63');
+      Line('  b.hi ' + a);
+      if wide then
+      begin
+        Line('  lsr x9, x1, #6');
+        Line('  ldr x0, [x0, x9, lsl #3]');
+      end;
+      Line('  lsr x9, x0, x1');
+      Line('  and x2, x9, #1');
+      Line(a + ':');
+      Line('  mov x0, x2');
+    end
+    else
+    begin
+      Line('  popq %rcx');
+      Line('  xorl %edx, %edx');
+      if wide then
+        Line('  cmpq $255, %rcx')
+      else
+        Line('  cmpq $63, %rcx');
+      Line('  ja ' + a);
+      if wide then
+      begin
+        Line('  movq %rcx, %r8');
+        Line('  shrq $6, %r8');
+        Line('  movq (%rax,%r8,8), %rax');
+      end;
+      Line('  btq %rcx, %rax');
+      Line('  setc %dl');
+      Line(a + ':');
+      Line('  movq %rdx, %rax');
+    end;
+    Exit;
+  end;
+  wide := IsWSet(E^.L^.Typ);
+  EmitExpr(E^.L);
+  if FArm then
+    PshK('x0', VCls(E^.L^.Typ, 0))
+  else
+    PushK('rax', VCls(E^.L^.Typ, 0));
+  EmitExpr(E^.R);
+  if not wide then
+  begin
+    { a word: L in rcx or x1, R in rax or x0 }
+    if FArm then
+    begin
+      Ppop('x1');
+      case op of
+        boAdd: Line('  orr x0, x1, x0');
+        boSub: Line('  bic x0, x1, x0');
+        boMul: Line('  and x0, x1, x0');
+        boEq, boNe:
+          begin
+            Line('  cmp x1, x0');
+            if op = boEq then
+              Line('  cset x0, eq')
+            else
+              Line('  cset x0, ne');
+          end;
+        boLe, boGe:
+          begin
+            if op = boLe then
+              Line('  bic x9, x1, x0')
+            else
+              Line('  bic x9, x0, x1');
+            Line('  cmp x9, #0');
+            Line('  cset x0, eq');
+          end;
+      end;
+    end
+    else
+    begin
+      Line('  popq %rcx');
+      case op of
+        boAdd: Line('  orq %rcx, %rax');
+        boSub:
+          if bmi then
+            Line('  andnq %rcx, %rax, %rax')
+          else
+          begin
+            Line('  notq %rax');
+            Line('  andq %rcx, %rax');
+          end;
+        boMul: Line('  andq %rcx, %rax');
+        boEq, boNe:
+          begin
+            Line('  xorl %edx, %edx');
+            Line('  cmpq %rax, %rcx');
+            if op = boEq then
+              Line('  sete %dl')
+            else
+              Line('  setne %dl');
+            Line('  movq %rdx, %rax');
+          end;
+        boLe, boGe:
+          begin
+            { L <= R: L and not R is empty; L >= R: R and not L; andn
+              sets ZF by what it leaves (BMI1) }
+            Line('  xorl %edx, %edx');
+            if bmi and (op = boLe) then
+              Line('  andnq %rcx, %rax, %rax')
+            else if bmi then
+              Line('  andnq %rax, %rcx, %rax')
+            else
+            begin
+              if op = boLe then
+              begin
+                Line('  notq %rax');
+                Line('  andq %rcx, %rax');
+              end
+              else
+              begin
+                Line('  notq %rcx');
+                Line('  andq %rcx, %rax');
+              end;
+              Line('  testq %rax, %rax');
+            end;
+            Line('  sete %dl');
+            Line('  movq %rdx, %rax');
+          end;
+      end;
+    end;
+    Exit;
+  end;
+  { 32 bytes: L's address in rcx or x1, R's in rax or x0 }
+  if FArm then
+  begin
+    Ppop('x1');
+    Line('  ldp q0, q1, [x1]');
+    Line('  ldp q2, q3, [x0]');
+    case op of
+      boAdd, boSub, boMul:
+        begin
+          if op = boAdd then
+            cc := 'orr'
+          else if op = boSub then
+            cc := 'bic'
+          else
+            cc := 'and';
+          Line('  ' + cc + ' v0.16b, v0.16b, v2.16b');
+          Line('  ' + cc + ' v1.16b, v1.16b, v3.16b');
+          dst := ScratchT(32, E^.Typ);
+          AddFP('x9', dst);
+          Line('  stp q0, q1, [x9]');
+          AddFP('x0', dst);
+        end;
+      boEq, boNe, boLe, boGe:
+        begin
+          if (op = boEq) or (op = boNe) then
+          begin
+            Line('  eor v0.16b, v0.16b, v2.16b');
+            Line('  eor v1.16b, v1.16b, v3.16b');
+          end
+          else if op = boLe then
+          begin
+            Line('  bic v0.16b, v0.16b, v2.16b');
+            Line('  bic v1.16b, v1.16b, v3.16b');
+          end
+          else
+          begin
+            Line('  bic v0.16b, v2.16b, v0.16b');
+            Line('  bic v1.16b, v3.16b, v1.16b');
+          end;
+          Line('  orr v0.16b, v0.16b, v1.16b');
+          Line('  umov x9, v0.d[0]');
+          Line('  umov x10, v0.d[1]');
+          Line('  orr x9, x9, x10');
+          Line('  cmp x9, #0');
+          if op = boNe then
+            Line('  cset x0, ne')
+          else
+            Line('  cset x0, eq');
+        end;
+    end;
+    Exit;
+  end;
+  Line('  popq %rcx');
+  case op of
+    boAdd, boSub, boMul:
+      begin
+        dst := ScratchT(32, E^.Typ);
+        if avx then
+        begin
+          if op = boSub then
+          begin
+            Line('  vmovdqu (%rax), %ymm1');
+            Line('  vpandn (%rcx), %ymm1, %ymm0');
+          end
+          else
+          begin
+            Line('  vmovdqu (%rcx), %ymm0');
+            if op = boAdd then
+              Line('  vpor (%rax), %ymm0, %ymm0')
+            else
+              Line('  vpand (%rax), %ymm0, %ymm0');
+          end;
+          Line('  vmovdqu %ymm0, ' + IntToStr(dst) + '(%rbp)');
+          Line('  vzeroupper');
+        end
+        else
+        begin
+          Line('  movdqu (%rcx), %xmm0');
+          Line('  movdqu 16(%rcx), %xmm1');
+          Line('  movdqu (%rax), %xmm2');
+          Line('  movdqu 16(%rax), %xmm3');
+          if op = boAdd then
+          begin
+            Line('  por %xmm2, %xmm0');
+            Line('  por %xmm3, %xmm1');
+          end
+          else if op = boMul then
+          begin
+            Line('  pand %xmm2, %xmm0');
+            Line('  pand %xmm3, %xmm1');
+          end
+          else
+          begin
+            { pandn: dst = not dst and src }
+            Line('  pandn %xmm0, %xmm2');
+            Line('  pandn %xmm1, %xmm3');
+            Line('  movdqa %xmm2, %xmm0');
+            Line('  movdqa %xmm3, %xmm1');
+          end;
+          Line('  movdqu %xmm0, ' + IntToStr(dst) + '(%rbp)');
+          Line('  movdqu %xmm1, ' + IntToStr(dst + 16) + '(%rbp)');
+        end;
+        Line('  leaq ' + IntToStr(dst) + '(%rbp), %rax');
+      end;
+    boEq, boNe:
+      begin
+        if avx then
+        begin
+          Line('  vmovdqu (%rcx), %ymm0');
+          Line('  vpxor (%rax), %ymm0, %ymm0');
+          Line('  xorl %eax, %eax');
+          Line('  vptest %ymm0, %ymm0');
+          if op = boEq then
+            Line('  setz %al')
+          else
+            Line('  setnz %al');
+          Line('  vzeroupper');
+        end
+        else
+        begin
+          Line('  movdqu (%rcx), %xmm0');
+          Line('  movdqu 16(%rcx), %xmm1');
+          Line('  movdqu (%rax), %xmm2');
+          Line('  movdqu 16(%rax), %xmm3');
+          Line('  pcmpeqb %xmm2, %xmm0');
+          Line('  pcmpeqb %xmm3, %xmm1');
+          Line('  pand %xmm1, %xmm0');
+          Line('  pmovmskb %xmm0, %edx');
+          Line('  xorl %eax, %eax');
+          Line('  cmpl $65535, %edx');
+          if op = boEq then
+            Line('  sete %al')
+          else
+            Line('  setne %al');
+        end;
+      end;
+    boLe, boGe:
+      begin
+        { L <= R: (V)PTEST R, L sets CF when L and not R is empty; for
+          >= the operands swap: sub the one that is in, sup the other }
+        if op = boGe then
+        begin
+          sub := 'rax';
+          sup := 'rcx';
+        end
+        else
+        begin
+          sub := 'rcx';
+          sup := 'rax';
+        end;
+        if avx then
+        begin
+          Line('  vmovdqu (%' + sup + '), %ymm1');
+          Line('  xorl %edx, %edx');
+          Line('  vptest (%' + sub + '), %ymm1');
+          Line('  setc %dl');
+          Line('  vzeroupper');
+          Line('  movq %rdx, %rax');
+        end
+        else if sse41 then
+        begin
+          Line('  movdqu (%' + sup + '), %xmm2');
+          Line('  movdqu 16(%' + sup + '), %xmm3');
+          Line('  movdqu (%' + sub + '), %xmm0');
+          Line('  movdqu 16(%' + sub + '), %xmm1');
+          Line('  xorl %edx, %edx');
+          Line('  pandn %xmm0, %xmm2');
+          Line('  pandn %xmm1, %xmm3');
+          Line('  por %xmm3, %xmm2');
+          Line('  ptest %xmm2, %xmm2');
+          Line('  setz %dl');
+          Line('  movq %rdx, %rax');
+        end
+        else
+        begin
+          Line('  movdqu (%' + sup + '), %xmm2');
+          Line('  movdqu 16(%' + sup + '), %xmm3');
+          Line('  movdqu (%' + sub + '), %xmm0');
+          Line('  movdqu 16(%' + sub + '), %xmm1');
+          Line('  pandn %xmm0, %xmm2');
+          Line('  pandn %xmm1, %xmm3');
+          Line('  por %xmm3, %xmm2');
+          Line('  pxor %xmm4, %xmm4');
+          Line('  pcmpeqb %xmm4, %xmm2');
+          Line('  pmovmskb %xmm2, %edx');
+          Line('  xorl %eax, %eax');
+          Line('  cmpl $65535, %edx');
+          Line('  sete %al');
+        end;
+      end;
+  end;
+end;
+
+{ rax or x0 and M, the word of a set's range (P126): a run of ones, a
+  logical immediate on arm64. }
+procedure TEmitter.SetAndWord(M: Int64);
+begin
+  if M = -1 then
+    Exit;
+  if FArm then
+  begin
+    if M = 0 then
+      Line('  mov x0, xzr')
+    else
+      Line('  and x0, x0, #' + HexWord(M));
+  end
+  else if M = 0 then
+    Line('  xorl %eax, %eax')
+  else if (M >= -2147483648) and (M <= 2147483647) then
+    Line('  andq $' + IntToStr(M) + ', %rax')
+  else
+  begin
+    Line('  movabsq $' + IntToStr(M) + ', %rcx');
+    Line('  andq %rcx, %rax');
+  end;
+end;
+
+{ A set made one of another range of its kind (P126, rt_setconv): the
+  elements outside the new range dropped, as FPC does, the word widened
+  to 32 bytes or the 32 bytes narrowed to their first word; a range
+  that holds the old one keeps every bit. }
+procedure TEmitter.EmitSetConv(E: PExpr);
+var
+  src, dst, off, i: LongInt;
+  m: TInt64Arr;
+  v: Int64;
+  full: Boolean;
+  mlab: string;
+begin
+  src := E^.Args[0]^.Typ;
+  dst := E^.Typ;
+  EmitExpr(E^.Args[0]);
+  full := (FTypes[dst].Lo <= FTypes[src].Lo) and (FTypes[dst].Hi >= FTypes[src].Hi);
+  m := nil;
+  SetLength(m, 4);
+  for i := 0 to 3 do
+    m[i] := 0;
+  v := FTypes[dst].Lo;
+  while v <= FTypes[dst].Hi do
+  begin
+    m[v shr 6] := m[v shr 6] or (Int64(1) shl (v and 63));
+    v := v + 1;
+  end;
+  if (not IsWSet(src)) and (not IsWSet(dst)) then
+  begin
+    if not full then
+      SetAndWord(m[0]);
+  end
+  else if not IsWSet(dst) then
+  begin
+    if FArm then
+      Line('  ldr x0, [x0]')
+    else
+      Line('  movq (%rax), %rax');
+    SetAndWord(m[0]);
+  end
+  else if not IsWSet(src) then
+  begin
+    if not full then
+      SetAndWord(m[0]);
+    off := ScratchT(32, dst);
+    if FArm then
+    begin
+      AddFP('x9', off);
+      Line('  stp x0, xzr, [x9]');
+      Line('  stp xzr, xzr, [x9, #16]');
+      AddFP('x0', off);
+    end
+    else
+    begin
+      Line('  xorl %ecx, %ecx');
+      Line('  movq %rax, ' + IntToStr(off) + '(%rbp)');
+      Line('  movq %rcx, ' + IntToStr(off + 8) + '(%rbp)');
+      Line('  movq %rcx, ' + IntToStr(off + 16) + '(%rbp)');
+      Line('  movq %rcx, ' + IntToStr(off + 24) + '(%rbp)');
+      Line('  leaq ' + IntToStr(off) + '(%rbp), %rax');
+    end;
+  end
+  else if not full then
+  begin
+    { 32 bytes and the range's 32, from .rodata }
+    mlab := SetConst(m);
+    off := ScratchT(32, dst);
+    if FArm then
+    begin
+      Line('  ldp q0, q1, [x0]');
+      LeaS(mlab, 'x9');
+      Line('  ldp q2, q3, [x9]');
+      Line('  and v0.16b, v0.16b, v2.16b');
+      Line('  and v1.16b, v1.16b, v3.16b');
+      AddFP('x0', off);
+      Line('  stp q0, q1, [x0]');
+    end
+    else
+    begin
+      if HasFeat(CpuFeatBit('avx2', False)) then
+      begin
+        Line('  vmovdqu (%rax), %ymm0');
+        Line('  vpand ' + mlab + '(%rip), %ymm0, %ymm0');
+        Line('  vmovdqu %ymm0, ' + IntToStr(off) + '(%rbp)');
+        Line('  vzeroupper');
+      end
+      else
+      begin
+        Line('  movdqu (%rax), %xmm0');
+        Line('  movdqu 16(%rax), %xmm1');
+        Line('  pand ' + mlab + '(%rip), %xmm0');
+        Line('  pand ' + mlab + '+16(%rip), %xmm1');
+        Line('  movdqu %xmm0, ' + IntToStr(off) + '(%rbp)');
+        Line('  movdqu %xmm1, ' + IntToStr(off + 16) + '(%rbp)');
+      end;
+      Line('  leaq ' + IntToStr(off) + '(%rbp), %rax');
+    end;
+  end;
+end;
+
+{ Include(s, x) and Exclude(s, x) of a set (P126): x checked against
+  the set's range, then its bit set or cleared in the word of s it is
+  in, one load and one store (bts and btr of a register, orr and bic
+  of a mask); a constant x names its word and bit. }
+procedure TEmitter.EmitSetIncl(E: PExpr);
+var
+  incl: Boolean;
+  st: LongInt;
+  x: PExpr;
+  w, b: Int64;
+  m: string;
+begin
+  st := E^.Args[0]^.L^.Typ;
+  x := E^.Args[1];
+  incl := E^.Args[2]^.Num = 1;
+  if x^.Kind = ekInt then
+  begin
+    w := x^.Num shr 6;
+    b := x^.Num and 63;
+    EmitExpr(E^.Args[0]);
+    if FArm then
+    begin
+      if incl then
+        m := HexWord(Int64(1) shl b)
+      else
+        m := HexWord(not (Int64(1) shl b));
+      Line('  ldr x9, [x0, #' + IntToStr(w * 8) + ']');
+      if incl then
+        Line('  orr x9, x9, #' + m)
+      else
+        Line('  and x9, x9, #' + m);
+      Line('  str x9, [x0, #' + IntToStr(w * 8) + ']');
+    end
+    else if incl then
+      Line('  btsq $' + IntToStr(b) + ', ' + IntToStr(w * 8) + '(%rax)')
+    else
+      Line('  btrq $' + IntToStr(b) + ', ' + IntToStr(w * 8) + '(%rax)');
+    Exit;
+  end;
+  EmitExpr(x);
+  EmitSetCheck(st);
+  if FArm then
+    PshK('x0', 0)
+  else
+    PushK('rax', 0);
+  EmitExpr(E^.Args[0]);
+  if FArm then
+  begin
+    Ppop('x1');
+    if IsWSet(st) then
+    begin
+      Line('  lsr x9, x1, #6');
+      Line('  add x0, x0, x9, lsl #3');
+    end;
+    Line('  ldr x2, [x0]');
+    Line('  mov x9, #1');
+    Line('  lsl x9, x9, x1');
+    if incl then
+      Line('  orr x2, x2, x9')
+    else
+      Line('  bic x2, x2, x9');
+    Line('  str x2, [x0]');
+  end
+  else
+  begin
+    Line('  popq %rcx');
+    if IsWSet(st) then
+    begin
+      Line('  movq %rcx, %rdx');
+      Line('  shrq $6, %rdx');
+      Line('  leaq (%rax,%rdx,8), %rax');
+    end;
+    Line('  movq (%rax), %rdx');
+    if incl then
+      Line('  btsq %rcx, %rdx')
+    else
+      Line('  btrq %rcx, %rdx');
+    Line('  movq %rdx, (%rax)');
+  end;
+end;
+
+{ for x in s: a copy of the set on the stack with the word it is at and
+  that word's bits left, so the body may change s, and break and continue
+  work as in any loop: the lowest bit left is the next element (tzcnt on
+  BMI1, bsf before; rbit and clz on arm64), cleared before the body. }
+procedure TEmitter.EmitSetFor(S: PStmt);
+var
+  wide, bmi: Boolean;
+  nw: LongInt;
+  next, have, done: string;
+begin
+  wide := IsWSet(S^.E^.Typ);
+  if wide then
+    nw := 4
+  else
+    nw := 1;
+  bmi := (not FArm) and HasFeat(CpuFeatBit('bmi1', False));
+  next := Lab;
+  have := Lab;
+  done := Lab;
+  EmitExpr(S^.E);
+  if FArm then
+  begin
+    MapHint4(0, 0, 0, 0);
+    Line('  sub sp, sp, #32');
+    MapHint2(0, 0);
+    Line('  sub sp, sp, #16');
+    if wide then
+    begin
+      Line('  ldp q0, q1, [x0]');
+      Line('  stp q0, q1, [sp]');
+    end
+    else
+      Line('  str x0, [sp]');
+    Line('  str xzr, [sp, #32]');
+    Line('  ldr x9, [sp]');
+    Line('  str x9, [sp, #40]');
+    PushLoop(done, next);
+    Line(next + ':');
+    Line('  ldr x9, [sp, #40]');
+    Line('  cbnz x9, ' + have);
+    Line('  ldr x10, [sp, #32]');
+    Line('  add x10, x10, #1');
+    Line('  cmp x10, #' + IntToStr(nw));
+    Line('  b.ge ' + done);
+    Line('  str x10, [sp, #32]');
+    Line('  ldr x9, [sp, x10, lsl #3]');
+    Line('  str x9, [sp, #40]');
+    Line('  b ' + next);
+    Line(have + ':');
+    Line('  rbit x11, x9');
+    Line('  clz x11, x11');
+    Line('  sub x12, x9, #1');
+    Line('  and x9, x9, x12');
+    Line('  str x9, [sp, #40]');
+    Line('  ldr x10, [sp, #32]');
+    Line('  add x0, x11, x10, lsl #6');
+    StoreVar(S^.Name);
+    EmitStmt(S^.Body);
+    Line('  b ' + next);
+    Line(done + ':');
+    Line('  add sp, sp, #48');
+  end
+  else
+  begin
+    MapHint4(0, 0, 0, 0);
+    Line('  subq $32, %rsp');
+    MapHint2(0, 0);
+    Line('  subq $16, %rsp');
+    if wide then
+    begin
+      Line('  movdqu (%rax), %xmm0');
+      Line('  movdqu 16(%rax), %xmm1');
+      Line('  movdqu %xmm0, (%rsp)');
+      Line('  movdqu %xmm1, 16(%rsp)');
+    end
+    else
+      Line('  movq %rax, (%rsp)');
+    Line('  movq $0, 32(%rsp)');
+    Line('  movq (%rsp), %rax');
+    Line('  movq %rax, 40(%rsp)');
+    PushLoop(done, next);
+    Line(next + ':');
+    Line('  movq 40(%rsp), %rax');
+    Line('  testq %rax, %rax');
+    Line('  jnz ' + have);
+    Line('  movq 32(%rsp), %rcx');
+    Line('  incq %rcx');
+    Line('  cmpq $' + IntToStr(nw) + ', %rcx');
+    Line('  jge ' + done);
+    Line('  movq %rcx, 32(%rsp)');
+    Line('  movq (%rsp,%rcx,8), %rax');
+    Line('  movq %rax, 40(%rsp)');
+    Line('  jmp ' + next);
+    Line(have + ':');
+    if bmi then
+    begin
+      Line('  tzcntq %rax, %rcx');
+      Line('  blsrq %rax, %rax');
+    end
+    else
+    begin
+      Line('  bsfq %rax, %rcx');
+      Line('  leaq -1(%rax), %rdx');
+      Line('  andq %rdx, %rax');
+    end;
+    Line('  movq %rax, 40(%rsp)');
+    Line('  movq 32(%rsp), %rax');
+    Line('  shlq $6, %rax');
+    Line('  addq %rcx, %rax');
+    StoreVar(S^.Name);
+    EmitStmt(S^.Body);
+    Line('  jmp ' + next);
+    Line(done + ':');
+    Line('  addq $48, %rsp');
+  end;
+  PopLoop;
+end;
+
 function TEmitter.IsBlob(Id: LongInt): Boolean;
 begin
   Result := (TKind(Id) = tykRecord) or
-    ((TKind(Id) = tykArray) and (not IsDyn(Id)));
+    ((TKind(Id) = tykArray) and (not IsDyn(Id))) or IsWSet(Id);
+end;
+
+{ A set of 32 bytes (P126), a block: an expression of one gives its
+  address. }
+function TEmitter.IsWSet(Id: LongInt): Boolean;
+begin
+  Result := (TKind(Id) = tykSet) and (Id >= 0) and (Id <= High(FTypes)) and
+    (FTypes[Id].Size = 32);
 end;
 
 { Scratch slots for temporaries live below the locals and grow down;
@@ -2469,22 +3439,6 @@ begin
     LeaS(W, Reg)
   else
     Line('  leaq ' + W + '(%rip), %' + Reg);
-end;
-
-function HexWord(V: Int64): string;
-var
-  i, d: LongInt;
-begin
-  Result := '';
-  for i := 15 downto 0 do
-  begin
-    d := LongInt((V shr (i * 4)) and 15);
-    if d < 10 then
-      Result := Result + Char(48 + d)
-    else
-      Result := Result + Char(87 + d);
-  end;
-  Result := '0x' + Result;
 end;
 
 procedure TEmitter.EmitGcDesc(const Sym, Name: string; Size: LongInt; const W: TGcBits);
@@ -4316,6 +5270,9 @@ begin
     Exit;
   if (E^.Bin <> boEq) and (E^.Bin <> boNe) and (E^.Bin <> boLt) and
     (E^.Bin <> boLe) and (E^.Bin <> boGt) and (E^.Bin <> boGe) then
+    Exit;
+  { a set's comparison is EmitSetBin's (P126): <= is a subset }
+  if (TKind(E^.L^.Typ) = tykSet) or (TKind(E^.R^.Typ) = tykSet) then
     Exit;
   if not (((E^.L^.Kind = ekInt) or PlainOrd(E^.L, ls)) and
     ((E^.R^.Kind = ekInt) or PlainOrd(E^.R, rs))) then
@@ -8863,6 +9820,18 @@ begin
       Line('  str x0, [x28, #272]')
     else
       Line('  movq %rax, 272(%r14)');
+    Exit;
+  end;
+  if E^.Name = 'rt_setincl' then
+  begin
+    Result := True;
+    EmitSetIncl(E);
+    Exit;
+  end;
+  if E^.Name = 'rt_setconv' then
+  begin
+    Result := True;
+    EmitSetConv(E);
     Exit;
   end;
   if EmitWideFn(E) or EmitAtomicFn(E) or EmitCpuFn(E) or EmitVecFn(E) or EmitRotFn(E) then
@@ -15391,6 +16360,18 @@ begin
       Line('  xorq %rax, %rax');
     Exit;
   end;
+  { a set's operation (P126) }
+  if (E^.Kind = ekBin) and (((E^.Bin = boIn) and (TKind(E^.R^.Typ) = tykSet)) or
+    ((E^.Bin <> boIn) and (E^.L <> nil) and (TKind(E^.L^.Typ) = tykSet))) then
+  begin
+    EmitSetBin(E);
+    Exit;
+  end;
+  if (E^.Kind = ekSet) and IsWSet(E^.Typ) then
+  begin
+    EmitWSetLit(E);
+    Exit;
+  end;
   { An integer expression without calls is worked out in the register
     pool, with no stack traffic (P93). }
   if ((E^.Kind = ekBin) or (E^.Kind = ekUn) or (E^.Kind = ekIndex) or
@@ -15975,8 +16956,12 @@ else if E^.Name = 'rt_high' then
               Psh('x20');
               Psh('x22');
               EmitExpr(E^.Args[i]^.L);
+              if E^.Args[i]^.L^.Kind <> ekInt then
+                EmitSetCheck(E^.Typ);
               Line('  mov x20, x0');
               EmitExpr(E^.Args[i]^.R);
+              if E^.Args[i]^.R^.Kind <> ekInt then
+                EmitSetCheck(E^.Typ);
               Line('  mov x22, x0');
               a := Lab;
               b := Lab;
@@ -15995,6 +16980,8 @@ else if E^.Name = 'rt_high' then
             else
             begin
               EmitExpr(E^.Args[i]);
+              if E^.Args[i]^.Kind <> ekInt then
+                EmitSetCheck(E^.Typ);
               Line('  mov x9, #1');
               Line('  lsl x9, x9, x0');
               Line('  orr x19, x19, x9');
@@ -16928,8 +17915,12 @@ else if E^.Name = 'rt_high' then
             Line('  pushq %r12');
             Line('  pushq %r13');
             EmitExpr(E^.Args[i]^.L);
+            if E^.Args[i]^.L^.Kind <> ekInt then
+              EmitSetCheck(E^.Typ);
             Line('  movq %rax, %r12');
             EmitExpr(E^.Args[i]^.R);
+            if E^.Args[i]^.R^.Kind <> ekInt then
+              EmitSetCheck(E^.Typ);
             Line('  movq %rax, %r13');
             a := Lab;
             b := Lab;
@@ -16946,6 +17937,8 @@ else if E^.Name = 'rt_high' then
           else
           begin
             EmitExpr(E^.Args[i]);
+            if E^.Args[i]^.Kind <> ekInt then
+              EmitSetCheck(E^.Typ);
             Line('  btsq %rax, %rbx');
           end;
         Line('  movq %rbx, %rax');
@@ -18124,32 +19117,7 @@ begin
           end
           else
           begin
-          td := FTypes[S^.E^.Typ];
-          a := Lab;
-          b := Lab;
-          c := Lab;
-          PushLoop(c, a);
-          EmitExpr(S^.E);
-          Psh('x19');
-          Line('  mov x19, x0');
-          Imm('x0', td.Lo);
-          Line('  b ' + b);
-          Line(a + ':');
-          Line('  add x0, x0, #1');
-          Line(b + ':');
-          Imm('x9', td.Hi);
-          Line('  cmp x0, x9');
-          Line('  b.gt ' + c);
-          Line('  lsr x9, x19, x0');
-          Line('  tbz x9, #0, ' + a);
-          PshK('x0', 0);
-          StoreVar(S^.Name);
-          EmitStmt(S^.Body);
-          Ppop('x0');
-          Line('  b ' + a);
-          Line(c + ':');
-          Ppop('x19');
-          PopLoop;
+          EmitSetFor(S);
           end;
         end;
       skFor:
@@ -18852,29 +19820,7 @@ begin
         end
         else
         begin
-        td := FTypes[S^.E^.Typ];
-        a := Lab;
-        b := Lab;
-        c := Lab;
-        EmitExpr(S^.E);
-        Line('  pushq %rbx');
-        Line('  movq %rax, %rbx');
-        Line('  movq $' + IntToStr(td.Lo) + ', %rax');
-        Line('  jmp ' + b);
-        Line(a + ':');
-        Line('  incq %rax');
-        Line(b + ':');
-        Line('  cmpq $' + IntToStr(td.Hi) + ', %rax');
-        Line('  jg ' + c);
-        Line('  btq %rax, %rbx');
-        Line('  jnc ' + a);
-        PushK('rax', 0);
-        StoreVar(S^.Name);
-        EmitStmt(S^.Body);
-        Line('  popq %rax');
-        Line('  jmp ' + a);
-        Line(c + ':');
-        Line('  popq %rbx');
+        EmitSetFor(S);
         end;
       end;
     skFor:
@@ -20178,7 +21124,8 @@ begin
   if not Result then
     Exit;
   if RealBin(E) or (TKind(E^.Typ) = tykSet) or (TKind(E^.Typ) = tykReal) or
-    IsFat(E^.Typ) or IsBlob(E^.Typ) then
+    IsFat(E^.Typ) or IsBlob(E^.Typ) or (TKind(E^.L^.Typ) = tykSet) or
+    (TKind(E^.R^.Typ) = tykSet) then
     Result := False;
 end;
 
@@ -22096,6 +23043,9 @@ begin
     Exit;
   if (E^.Bin <> boEq) and (E^.Bin <> boNe) and (E^.Bin <> boLt) and
     (E^.Bin <> boLe) and (E^.Bin <> boGt) and (E^.Bin <> boGe) then
+    Exit;
+  { a set's comparison is EmitSetBin's (P126): <= is a subset }
+  if (TKind(E^.L^.Typ) = tykSet) or (TKind(E^.R^.Typ) = tykSet) then
     Exit;
   if not OrdBinOp(E) then
     Exit;
@@ -27354,6 +28304,12 @@ begin
   Line('  leaq .Lbbit(%rip), %rax');
   Line('  movq $' + IntToStr(Length(MsgBit)) + ', %rcx');
   Line('  jmp .bf_go');
+  { rt_setfail (P126): a set's element out of its range, paslang: set
+    element N out of range [LO..HI] at line L }
+  Line('rt_setfail:');
+  Line('  leaq .Lbset(%rip), %rax');
+  Line('  movq $' + IntToStr(Length(MsgSet)) + ', %rcx');
+  Line('  jmp .bf_go');
   Line('rt_boundsfail:');
   Line('  leaq .Lbidx(%rip), %rax');
   Line('  movq $' + IntToStr(Length(MsgIndex)) + ', %rcx');
@@ -31996,6 +32952,8 @@ begin
     Line('  .ascii "' + MsgChanCap2 + '"');
     Line('.Lbbit:');
     Line('  .ascii "' + MsgBit + '"');
+    Line('.Lbset:');
+    Line('  .ascii "' + MsgSet + '"');
     Line('.Lblk1:');
     Line('  .ascii "' + MsgBlk1 + '"');
     Line('.Lfun1:');
@@ -32668,6 +33626,18 @@ begin
     begin
       Line('.Lgd' + IntToStr(i) + ':');
       Line(FDescOut[i]);
+    end;
+  end;
+  { the constant sets of 32 bytes (P126), aligned for a vector load }
+  if Length(FSetImgs) > 0 then
+  begin
+    Line('.section .rodata');
+    Line('.balign 32');
+    for i := 0 to High(FSetImgs) do
+    begin
+      Line('.Lsetc' + IntToStr(i) + ':');
+      Line('  .quad 0x' + Copy(FSetImgs[i], 1, 16) + ', 0x' + Copy(FSetImgs[i], 17, 16) +
+        ', 0x' + Copy(FSetImgs[i], 33, 16) + ', 0x' + Copy(FSetImgs[i], 49, 16));
     end;
   end;
   EmitDwarfLocals;
@@ -35703,6 +36673,10 @@ begin
   Line('rt_bitfail:');
   LeaS('.Lbbit', 'x9');
   Line('  mov x10, #' + IntToStr(Length(MsgBit)));
+  Line('  b .abf_go');
+  Line('rt_setfail:');
+  LeaS('.Lbset', 'x9');
+  Line('  mov x10, #' + IntToStr(Length(MsgSet)));
   Line('  b .abf_go');
   Line('rt_boundsfail:');
   LeaS('.Lbidx', 'x9');

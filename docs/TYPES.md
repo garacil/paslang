@@ -253,19 +253,41 @@ Enumerations and subranges stay Pascal; each is an 8-byte integer.
 
 ## Sets
 
-`set of T` is one 8-byte word, a bitset: bit n is the element whose
-ordinal is n. `T` is a `Boolean`, an enumeration or a subrange whose
-values lie in 0..63 (`set of 0..63`, `set of TDay`); a range past it is
-`set too large`, and `set of Byte`, `set of Char` or `set of Integer` is
-refused (`set of ordinal type`), since their values pass 63. `[1, 3..5]`
-is a set value and `[]` the empty one; `+` is the union, `*` the
-intersection, `-` the difference, `=` and `<>` compare, `x in s` tests
-one element, and `for x in s do` walks the members from the lowest. A
-set goes only where a set goes: `i := [1, 2]` is a compile error
-(1.0.136; it stored the bitmask, 6). The bit words see its 64 bits
-(`PopCount(s)` counts the members). `Include` and `Exclude` are the
-tree's words (below) and refused on a set: `s := s + [x]` and
-`s := s - [x]` are the same thing.
+`set of T` is a bitset: bit n is the element whose ordinal is n. `T`
+is `Char`, `Byte`, `Boolean`, an enumeration or a subrange whose values
+lie in 0..255. A set whose last element is 63 or less is one 8-byte
+word (`set of 0..63`, `set of TDay`); past it, 32 bytes, the 256 bits,
+a block as a record is (`set of Char`, `set of Byte`, `set of 60..140`,
+an enumeration of more than 64 names). `set of Integer` and a range
+past 255 are refused. `[1, 3..5]` is a set value and `[]` the empty
+one; `+` is the union, `*` the intersection, `-` the difference, `=`
+and `<>` compare, `<=` and `>=` test a subset and a superset, `x in s`
+tests one element, `Include(s, x)` and `Exclude(s, x)` set and clear
+one in the variable, and `for x in s do` walks the members from the
+lowest. An element out of the set's range is in no set: `x in s` is
+false, and a list's element known only at run time, or `Include`'s,
+stops the program (`paslang: set element 300 out of range [0..255] at
+line L`); a constant one is a compile error. On a processor with AVX2
+(`-cpu`) an operation on two sets of 32 bytes is one instruction
+(`vpor`, `vpand`, `vpandn`, `vptest`); SSE2 does it in two, arm64 NEON
+in two (`docs/KERNELS.md`).
+
+A list in brackets takes its type from its elements (`['a', 'z']` a set
+of Char, `[Red]` of TColor, `[1, 200]` of 0..255) and from where it
+goes. Sets of one kind of element and other ranges meet in the set
+that holds both, and a set goes into another of its kind dropping
+the elements the other cannot hold, as Free Pascal does: with `a: set
+of 0..7` and `b: set of Byte`, `b := a + [150]` holds 150, and `a :=
+b` keeps b's elements up to 7. A set of Char and one of Byte are of
+other kinds. A list of what no set holds, `['ab', 'cd']` or `[1.5]`,
+is a list: it goes where a slice, an open array or an array of const
+goes, and `for s in ['ab', 'cd'] do` walks it in its order. A set goes
+only where a set goes: `i := [1, 2]` is a compile error (1.0.136; it
+stored the bitmask, 6); `Write` does not print a set. The bit words
+count and find its bits (`PopCount(s)` counts the members,
+`TrailingZeros(s)` is the lowest). Before 1.1.7 a set held 0..63 only,
+`x in s` of an x past 63 tested bit x mod 64, and `[1] <= [0, 2]` was
+true.
 
 ## `string` — not ShortString
 

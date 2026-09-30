@@ -29,6 +29,8 @@ for each machine (its license is in `LICENSE-GO`);
 | `rt_xxh3` long path | XXH3 over 1 KiB blocks (maps, `XxHash3`) | amd64 AVX2 (`avx2`); arm64 NEON, part of the base (one body, no choice) | the SSE2 stripes | `testdata/xxh3` against xxhash 0.8 | `src/compiler/pasemit.paslang`, `EmitXxh3X86` and `EmitXxh3Arm` |
 | `PopCount` | bits set | `popcnt` | the SWAR count | `testdata/bitwords` | `pasemit`, `uoPopCnt` and `rt_popcntmem` |
 | `V256` words | 32-byte vectors | AVX2 (`avx2`); `VShuffle8` SSSE3 (`ssse3`) | two SSE2 halves | `testdata/vectors`, `vecmore`, `vecpool` | `pasemit`, `EmitVecStmt` |
+| Sets of 32 bytes | `+ - *` of two sets of up to 256 elements, `=`, `<>`, and `<=` and `>=` as subset tests; a set made one of another range | amd64 AVX2 (`avx2`): one `vpor`, `vpand`, `vpandn`, and `vptest` whose CF says the subset; SSE4.1 (`sse41`) `ptest` for the subset; arm64 NEON, part of the base (`orr`, `and`, `bic`, `eor` on two q registers) | two SSE2 halves, `pcmpeqb` and `pmovmskb` for the tests | `testdata/set256` against Free Pascal 3.2.2, native, `-cpu v2` and `-cpu base`, arm64 `max` and `base` | `pasemit`, `EmitSetBin`, `EmitSetConv` |
+| Set walk and words | `for x in s`, the next element; `x - y` and the subset of sets of one word | BMI1 (`bmi1`): `tzcnt` and `blsr`, `andn` (whose ZF is the subset test); arm64 `rbit` and `clz`, part of the base | `bsf`, and `lea` and `and`; `not` and `and` | `testdata/set256`, as above | `pasemit`, `EmitSetFor`, `EmitSetBin` |
 
 Words with no kernel yet (the Pascal body serves every processor):
 MD5 (no instruction exists), SHA-3 (arm64 FEAT_SHA3 could serve it),

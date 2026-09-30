@@ -88,6 +88,7 @@ type
     FNoSelf: Boolean;        { the body read is a static class method's: no Self at all (P123) }
     FCPropSets: array of PExpr;   { class properties read (P123): the node, and its static setter, for an assignment }
     FParamType: Boolean;     { a parameter's type is read: array of const may be it (P124) }
+    FNoEq: Boolean;          { a subrange's bound is read: = is the declaration's, not a comparison (P126) }
     FCPropSetSyms: TStrArray;
     FSymChain: TStrArray;  { the routines being parsed, outermost first }
     FBoxing: TStrArray;    { the routines that hold a closure inside }
@@ -387,11 +388,26 @@ type
     function TypeBound(Id: LongInt; Hi: Boolean): PExpr;
     function InternPtr(Elem: LongInt): LongInt;
     function InternClassRef(Cls: LongInt): LongInt;
+    function IsWideSet(Id: LongInt): Boolean;
+    function SetElem(var E: PExpr): LongInt;
+    function SetElemOk(E: PExpr): Boolean;
+    procedure NoList(E: PExpr);
+    function SetFamily(T: LongInt): LongInt;
+    function SetForVar(E: PExpr; VT: LongInt): PExpr;
+    function SetCovers(T, U: LongInt): Boolean;
+    function SetUnion(A, B: LongInt): LongInt;
+    function SetHome(E: PExpr; T: LongInt): LongInt;
+    function SetConvTo(E: PExpr; T: LongInt): PExpr;
+    procedure SetElemFits(var E: PExpr; T: LongInt);
+    function SetLitTo(E: PExpr; T: LongInt): PExpr;
+    function SetJoin(A, B: LongInt): LongInt;
+    procedure SetPair(var L, R: PExpr);
+    function SetImage(E: PExpr; out Img: string): Boolean;
+    function SetFromImage(const Img: string; T: LongInt): PExpr;
     function InternConstArr: LongInt;
     function IsConstArr(T: LongInt): Boolean;
     function ParamType(ByRef: Boolean): LongInt;
     procedure ParseDefault(PT: LongInt; out OutV: Int64; out OutS: string);
-    function ConstSetBits(E: PExpr): Int64;
     function DefaultArg(Typ: LongInt; Def: Int64; const DefStr: string): PExpr;
     procedure FillMethDefs(const M: TMethInfo; var Args: TExprArray);
     procedure MethParamDefault(var M: TMethInfo; NNames: SizeInt; ByRef: Boolean; T: LongInt);
@@ -444,6 +460,7 @@ type
     procedure ParseGenericType;
     function ParseSelect: PStmt;
     function AddNamedType(const AName: string; const Td: TTypeDef): LongInt;
+    function ParseBound: Int64;
     function ParseType: LongInt;
     function ParseIntConst: Int64;
     function ParseRecPart(var Td: TTypeDef; Start: LongInt; Stop: TTokKind): LongInt;
@@ -887,7 +904,7 @@ begin
   else if k = tykPointer then
     Result := 'a pointer'
   else if k = tykSet then
-    Result := 'a set'
+    Result := 'set of ' + TypName(TypeOf(T).Elem)
   else if k = tykMap then
     { by its key and value (1.0.140): two maps in one message were both
       "a map" }
@@ -1543,7 +1560,7 @@ end;
 function TParser.IsBlobTyp(Id: LongInt): Boolean;
 begin
   Result := (TypeOf(Id).Kind = tykRecord) or
-    ((TypeOf(Id).Kind = tykArray) and (TypeOf(Id).Hi >= TypeOf(Id).Lo));
+    ((TypeOf(Id).Kind = tykArray) and (TypeOf(Id).Hi >= TypeOf(Id).Lo)) or IsWideSet(Id);
 end;
 
 { Does a value of type Id hold a pointer the collector must see: a
@@ -2740,15 +2757,22 @@ begin
     lo := 0;
     hi := 1;
   end
+  else if (Elem = TyChar) or (Elem = TyByte) then
+  begin
+    { set of Char and set of Byte (P126) }
+    lo := 0;
+    hi := 255;
+  end
   else if (td.Kind = tykEnum) or (td.Kind = tykSubrange) then
   begin
     lo := td.Lo;
     hi := td.Hi;
   end
   else
-    Die('set of ordinal type');
-  if (lo < 0) or (hi > 63) then
-    Die('set too large');
+    Die('a set is of Char, Byte, Boolean, an enumeration or a subrange, not ' + TypName(Elem) +
+      HerePos);
+  if (lo < 0) or (hi > 255) then
+    Die('a set holds elements 0 to 255, not ' + IntToStr(lo) + '..' + IntToStr(hi) + HerePos);
   n := Length(FTypes);
   SetLength(FTypes, n + 1);
   FTypes[n] := Default(TTypeDef);
@@ -2756,8 +2780,438 @@ begin
   FTypes[n].Elem := Elem;
   FTypes[n].Lo := lo;
   FTypes[n].Hi := hi;
-  FTypes[n].Size := 8;
+  { one word up to element 63; 32 bytes, the 256 bits, past it (P126) }
+  if hi <= 63 then
+    FTypes[n].Size := 8
+  else
+    FTypes[n].Size := 32;
   Result := LongInt(n);
+end;
+
+{ A set of 32 bytes (P126): a block, as a record is. }
+function TParser.IsWideSet(Id: LongInt): Boolean;
+begin
+  Result := (TypeOf(Id).Kind = tykSet) and (TypeOf(Id).Size = 32);
+end;
+
+{ The ordinal set element E is, a one-character literal its Char, and
+  the type its set is of (P126): Char, Byte, an enumeration, a
+  subrange, a Boolean; an integer of another type is 0..255, or 0..63
+  for a constant that fits. }
+function TParser.SetElem(var E: PExpr): LongInt;
+var
+  k: TTypeKind;
+begin
+  if (E^.Kind = ekStr) and (Length(E^.Str) = 1) then
+  begin
+    E := NewInt(Ord(E^.Str[1]));
+    E^.Typ := TyChar;
+  end;
+  CheckTyped(E);
+  k := TypeOf(E^.Typ).Kind;
+  if (E^.Typ = TyChar) or (E^.Typ = TyByte) or (k = tykEnum) or (k = tykSubrange) or
+    (k = tykBoolean) then
+    Result := E^.Typ
+  else if IsIntId(E^.Typ) or (k = tykInteger) then
+  begin
+    if (E^.Kind = ekInt) and (E^.Num >= 0) and (E^.Num <= 63) then
+      Result := InternSubrange(0, 63)
+    else
+      Result := InternSubrange(0, 255);
+  end
+  else
+  begin
+    Die('a set holds ordinals, not ' + TypName(E^.Typ) + HerePos);
+    Result := TyInteger;
+  end;
+end;
+
+{ E could be a set's element (P126): an ordinal, a one-character
+  literal, a constant of 0..255; SetElem says why another is not. }
+function TParser.SetElemOk(E: PExpr): Boolean;
+var
+  k: TTypeKind;
+begin
+  if E^.Kind = ekRange then
+  begin
+    Result := SetElemOk(E^.L) and SetElemOk(E^.R);
+    Exit;
+  end;
+  if (E^.Kind = ekStr) and (Length(E^.Str) = 1) then
+  begin
+    Result := True;
+    Exit;
+  end;
+  if (E^.Kind = ekInt) and ((E^.Num < 0) or (E^.Num > 255)) then
+  begin
+    Result := False;
+    Exit;
+  end;
+  k := TypeOf(E^.Typ).Kind;
+  Result := (E^.Typ = TyChar) or (E^.Typ = TyByte) or (k = tykEnum) or (k = tykSubrange) or
+    (k = tykBoolean) or IsIntId(E^.Typ) or (k = tykInteger);
+end;
+
+{ A list in brackets of what no set holds (Flags bit 64, P126) is a list
+  only: a slice, an open array, an array of const or for x in take it.
+  Where a set goes it stops, and the first element no set holds says
+  why. }
+procedure TParser.NoList(E: PExpr);
+var
+  i: SizeInt;
+  a: PExpr;
+begin
+  if (E = nil) or (E^.Kind <> ekSet) or ((E^.Flags and 64) = 0) then
+    Exit;
+  for i := 0 to High(E^.Args) do
+  begin
+    if E^.Args[i]^.Kind = ekRange then
+      a := E^.Args[i]^.L
+    else
+      a := E^.Args[i];
+    if not SetElemOk(a) and (a^.Kind <> ekInt) then
+      SetElem(a);
+    if (E^.Args[i]^.Kind = ekRange) and not SetElemOk(E^.Args[i]^.R) and
+      (E^.Args[i]^.R^.Kind <> ekInt) then
+    begin
+      a := E^.Args[i]^.R;
+      SetElem(a);
+    end;
+  end;
+  Die('set element out of 0..255' + HerePos);
+end;
+
+{ The bytes of constant set E, 8 or 32 as its type (P126); False when
+  an element is not constant. }
+function TParser.SetImage(E: PExpr; out Img: string): Boolean;
+var
+  i: SizeInt;
+  lo, hi, v, one, w: Int64;
+  vt: LongInt;
+  str: string;
+  sz, lo0, hi0: LongInt;
+  bits: array[0..3] of Int64;
+  k: SizeInt;
+begin
+  NoList(E);
+  Result := False;
+  Img := '';
+  sz := TypeOf(E^.Typ).Size;
+  lo0 := LongInt(TypeOf(E^.Typ).Lo);
+  hi0 := LongInt(TypeOf(E^.Typ).Hi);
+  for k := 0 to 3 do
+    bits[k] := 0;
+  one := 1;
+  for i := 0 to High(E^.Args) do
+  begin
+    if E^.Args[i]^.Kind = ekRange then
+    begin
+      if not (ConstFold(E^.Args[i]^.L, lo, vt, str) and ConstFold(E^.Args[i]^.R, hi, vt, str)) then
+        Exit;
+    end
+    else
+    begin
+      if not ConstFold(E^.Args[i], lo, vt, str) then
+        Exit;
+      hi := lo;
+    end;
+    if (lo < lo0) or (hi > hi0) then
+      Die('set element out of ' + IntToStr(lo0) + '..' + IntToStr(hi0) + ' at ' + FConstAt);
+    v := lo;
+    while v <= hi do
+    begin
+      w := v shr 6;
+      bits[w] := bits[w] or (one shl (v and 63));
+      v := v + 1;
+    end;
+  end;
+  SetLength(Img, sz);
+  for k := 0 to sz - 1 do
+    Img[k + 1] := Char((bits[k div 8] shr (8 * (k mod 8))) and 255);
+  Result := True;
+end;
+
+{ The constant set of type T whose bytes are Img (P126): a list of its
+  elements, runs as ranges. }
+function TParser.SetFromImage(const Img: string; T: LongInt): PExpr;
+var
+  args: TExprArray;
+  v, st: LongInt;
+  n: SizeInt;
+  a, b: PExpr;
+  et: LongInt;
+
+  function Has(X: LongInt): Boolean;
+  begin
+    Result := (X div 8 < Length(Img)) and (((Ord(Img[X div 8 + 1]) shr (X mod 8)) and 1) = 1);
+  end;
+
+begin
+  args := nil;
+  et := TypeOf(T).Elem;
+  v := 0;
+  while v < Length(Img) * 8 do
+  begin
+    if Has(v) then
+    begin
+      st := v;
+      while (v + 1 < Length(Img) * 8) and Has(v + 1) do
+        v := v + 1;
+      a := NewInt(st);
+      a^.Typ := et;
+      n := Length(args);
+      SetLength(args, n + 1);
+      if v > st then
+      begin
+        b := NewInt(v);
+        b^.Typ := et;
+        args[n] := NewRange(a, b);
+      end
+      else
+        args[n] := a;
+    end;
+    v := v + 1;
+  end;
+  Result := NewSet(args, T);
+end;
+
+{ The element type of a list whose elements so far are of type A (0 for
+  none) and B (P126): a typed element (Char, Byte, an enumeration)
+  decides; integers take the wider range. }
+function TParser.SetJoin(A, B: LongInt): LongInt;
+
+  function KindWord(T: LongInt): string;
+  begin
+    if TypeOf(T).Kind = tykEnum then
+      Result := TypName(T)
+    else if SetFamily(T) = TyChar then
+      Result := 'a Char'
+    else if SetFamily(T) = TyBoolean then
+      Result := 'a Boolean'
+    else
+      Result := 'an integer';
+  end;
+
+begin
+  if (A <> 0) and (SetFamily(A) <> SetFamily(B)) then
+    Die('a list in brackets holds elements of one kind, not ' + KindWord(A) + ' and ' +
+      KindWord(B) + HerePos);
+  if A = 0 then
+    Result := B
+  else if (TypeOf(A).Kind = tykSubrange) and (TypeOf(A).Elem = TyInteger) then
+  begin
+    if (TypeOf(B).Kind = tykSubrange) and (TypeOf(B).Elem = TyInteger) and
+      (TypeOf(B).Hi > TypeOf(A).Hi) then
+      Result := B
+    else if (TypeOf(B).Kind = tykSubrange) and (TypeOf(B).Elem = TyInteger) then
+      Result := A
+    else
+      Result := B;
+  end
+  else
+    Result := A;
+end;
+
+{ An element of set type T (P126): of its element's kind, a constant in
+  its range. }
+procedure TParser.SetElemFits(var E: PExpr; T: LongInt);
+var
+  et, want: LongInt;
+begin
+  et := SetElem(E);
+  want := TypeOf(T).Elem;
+  if want = TyChar then
+  begin
+    if E^.Typ <> TyChar then
+      Die(TypName(E^.Typ) + ' is no element of a set of Char' + HerePos);
+  end
+  else if TypeOf(want).Kind = tykEnum then
+  begin
+    if not SameTyp(TypeOf(E^.Typ).Elem, TypeOf(want).Elem) and not SameTyp(E^.Typ, want) then
+      Die(TypName(E^.Typ) + ' is no element of a set of ' + TypName(want) + HerePos);
+  end
+  else if TypeOf(want).Kind = tykBoolean then
+  begin
+    if TypeOf(E^.Typ).Kind <> tykBoolean then
+      Die(TypName(E^.Typ) + ' is no element of a set of Boolean' + HerePos);
+  end
+  else if E^.Typ = TyChar then
+    Die('a Char is no element of a set of ' + TypName(want) + ': Ord(c) is' + HerePos);
+  if (E^.Kind = ekInt) and ((E^.Num < TypeOf(T).Lo) or (E^.Num > TypeOf(T).Hi)) then
+    Die('set element out of ' + IntToStr(TypeOf(T).Lo) + '..' + IntToStr(TypeOf(T).Hi) + HerePos);
+  if et = 0 then
+    Exit;
+end;
+
+{ The list in brackets E made a set of type T (P126), each element
+  checked. }
+function TParser.SetLitTo(E: PExpr; T: LongInt): PExpr;
+var
+  i: SizeInt;
+  a, b: PExpr;
+begin
+  NoList(E);
+  for i := 0 to High(E^.Args) do
+    if E^.Args[i]^.Kind = ekRange then
+    begin
+      a := E^.Args[i]^.L;
+      b := E^.Args[i]^.R;
+      SetElemFits(a, T);
+      SetElemFits(b, T);
+      E^.Args[i]^.L := a;
+      E^.Args[i]^.R := b;
+    end
+    else
+    begin
+      a := E^.Args[i];
+      SetElemFits(a, T);
+      E^.Args[i] := a;
+    end;
+  E^.Typ := T;
+  Result := E;
+end;
+
+{ Two set operands of one kind (P126): a list takes the other side's
+  type; two sets are of one element type. }
+procedure TParser.SetPair(var L, R: PExpr);
+var
+  u: LongInt;
+begin
+  NoList(L);
+  NoList(R);
+  if (L^.Kind = ekSet) and IsSetTyp(R^.Typ) and (R^.Kind <> ekSet) then
+    L := SetLitTo(L, SetHome(L, R^.Typ))
+  else if (R^.Kind = ekSet) and IsSetTyp(L^.Typ) and (L^.Kind <> ekSet) then
+    R := SetLitTo(R, SetHome(R, L^.Typ));
+  if not (IsSetTyp(L^.Typ) and IsSetTyp(R^.Typ)) then
+    Die('a set goes with a set' + HerePos);
+  if L^.Typ = R^.Typ then
+    Exit;
+  if SetFamily(TypeOf(L^.Typ).Elem) <> SetFamily(TypeOf(R^.Typ).Elem) then
+    Die(TypName(L^.Typ) + ' and ' + TypName(R^.Typ) + ' are sets of other elements' + HerePos);
+  { two ranges of one kind: both as the set that covers them }
+  u := SetUnion(L^.Typ, R^.Typ);
+  L := SetConvTo(L, u);
+  R := SetConvTo(R, u);
+end;
+
+{ Set type T holds every element of set type U (P126). }
+function TParser.SetCovers(T, U: LongInt): Boolean;
+begin
+  Result := (TypeOf(T).Lo <= TypeOf(U).Lo) and (TypeOf(T).Hi >= TypeOf(U).Hi);
+end;
+
+{ The set type two sets of one kind of element meet in (P126): the one
+  that covers the other, else of both ranges: of the integers from the
+  lower low to the higher high, of Char, of the whole enumeration. }
+function TParser.SetUnion(A, B: LongInt): LongInt;
+var
+  f: LongInt;
+  lo, hi: Int64;
+begin
+  if SetCovers(A, B) then
+    Result := A
+  else if SetCovers(B, A) then
+    Result := B
+  else
+  begin
+    f := SetFamily(TypeOf(A).Elem);
+    if f <> 0 then
+      Result := InternSet(f)
+    else
+    begin
+      lo := TypeOf(A).Lo;
+      if TypeOf(B).Lo < lo then
+        lo := TypeOf(B).Lo;
+      hi := TypeOf(A).Hi;
+      if TypeOf(B).Hi > hi then
+        hi := TypeOf(B).Hi;
+      Result := InternSet(InternSubrange(lo, hi));
+    end;
+  end;
+end;
+
+{ The set type list E takes beside a set of type T (P126): T when every
+  element is a constant in T's range, or when T holds every element of
+  its kind; else the type that covers both, as FPC's s + [x] holds an x
+  that s cannot. }
+function TParser.SetHome(E: PExpr; T: LongInt): LongInt;
+var
+  i: SizeInt;
+  fits: Boolean;
+
+  procedure Fit(A: PExpr);
+  begin
+    if not ((A^.Kind = ekInt) and (A^.Num >= TypeOf(T).Lo) and (A^.Num <= TypeOf(T).Hi)) then
+      fits := False;
+  end;
+
+begin
+  fits := True;
+  for i := 0 to High(E^.Args) do
+    if E^.Args[i]^.Kind = ekRange then
+    begin
+      Fit(E^.Args[i]^.L);
+      Fit(E^.Args[i]^.R);
+    end
+    else
+      Fit(E^.Args[i]);
+  if fits or (SetFamily(TypeOf(E^.Typ).Elem) <> SetFamily(TypeOf(T).Elem)) or
+    SetCovers(T, E^.Typ) then
+    Result := T
+  else
+    Result := SetUnion(T, E^.Typ);
+end;
+
+{ E, a set, made one of set type T of its kind of element (P126): a list
+  typed as T; another set with the elements outside T's range dropped,
+  as FPC does, its word widened to 32 bytes or 32 narrowed to a word
+  (rt_setconv). }
+function TParser.SetConvTo(E: PExpr; T: LongInt): PExpr;
+var
+  a: TExprArray;
+begin
+  if E^.Kind = ekSet then
+  begin
+    Result := SetLitTo(E, T);
+    Exit;
+  end;
+  Result := E;
+  if E^.Typ = T then
+    Exit;
+  if SetFamily(TypeOf(E^.Typ).Elem) <> SetFamily(TypeOf(T).Elem) then
+    Die(TypName(E^.Typ) + ' and ' + TypName(T) + ' are sets of other elements' + HerePos);
+  a := nil;
+  SetLength(a, 1);
+  a[0] := E;
+  Result := NewCall('rt_setconv', a, T);
+end;
+
+{ The kind of ordinal T is, for a set's element (P126): Char's,
+  Boolean's, or an integer's (0), which an enumeration's is too, as a
+  subrange of one (Mon..Fri) is a subrange of the integers. }
+function TParser.SetFamily(T: LongInt): LongInt;
+begin
+  if (TypeOf(T).Kind = tykSubrange) and (TypeOf(T).Elem > 0) then
+    T := TypeOf(T).Elem;
+  if T = TyChar then
+    Result := T
+  else if TypeOf(T).Kind = tykBoolean then
+    Result := TyBoolean
+  else
+    Result := 0;
+end;
+
+{ for x in E, E a set (P126): a list is of x's kind, and x holds the
+  set's elements. }
+function TParser.SetForVar(E: PExpr; VT: LongInt): PExpr;
+begin
+  Result := E;
+  if (E^.Kind = ekSet) and ((VT = TyByte) or (SetFamily(VT) <> 0)) then
+    Result := SetLitTo(E, InternSet(VT));
+  if SetFamily(TypeOf(Result^.Typ).Elem) <> SetFamily(VT) then
+    Die('for x in ' + TypName(Result^.Typ) + ': x is a ' + TypName(VT) +
+      ', not an element of it' + HerePos);
 end;
 
 function TParser.IsSetTyp(Id: LongInt): Boolean;
@@ -3248,6 +3702,18 @@ begin
     (TypeOf(Want).Kind <> tykClassRef) and (TypeOf(Want).Kind <> tykParam) and
     (TypeOf(Want).Kind <> tykGeneric) then
     Die(TypName(E^.Typ) + ' does not go into ' + TypName(Want) + HerePos);
+  { a list in brackets where a set goes is of that set's type, and a set
+    goes where a set of its elements goes (P126) }
+  if IsSetTyp(Want) and (E^.Kind = ekSet) then
+  begin
+    Result := SetLitTo(E, Want);
+    Exit;
+  end;
+  if IsSetTyp(Want) and IsSetTyp(E^.Typ) and (E^.Typ <> Want) then
+  begin
+    Result := SetConvTo(Result, Want);
+    Exit;
+  end;
   { A set goes only where a set goes (1.0.136): i := [1, 2] stored its
     bitmask, 6, and P([3]) passed 8. }
   if (TypeOf(E^.Typ).Kind = tykSet) and (Want <> TyNone) and
@@ -4618,30 +5084,18 @@ begin
       end;
     ekSet:
       begin
-        { [1, 3, 5..7]: the 64-bit set of those elements (1.0.77). }
-        one := 1;
-        for si := 0 to High(E^.Args) do
+        { [1, 3, 5..7]: a word set's bits in V (1.0.77); a set of 32
+          bytes its bytes in S (P126) }
+        if not SetImage(E, ls) then
+          Exit;
+        if Length(ls) = 32 then
+          S := ls
+        else
         begin
-          if E^.Args[si]^.Kind = ekRange then
-          begin
-            if not ConstFold(E^.Args[si]^.L, lv, lt, ls) then
-              Exit;
-            if not ConstFold(E^.Args[si]^.R, rv, rt, rs) then
-              Exit;
-          end
-          else
-          begin
-            if not ConstFold(E^.Args[si], lv, lt, ls) then
-              Exit;
-            rv := lv;
-          end;
-          if (lv < 0) or (rv > 63) then
-            Die('set element out of 0..63 at ' + FConstAt);
-          while lv <= rv do
-          begin
-            V := V or (one shl lv);
-            lv := lv + 1;
-          end;
+          one := 0;
+          for si := 8 downto 1 do
+            one := (one shl 8) or Ord(ls[si]);
+          V := one;
         end;
         T := E^.Typ;
         Result := True;
@@ -5133,6 +5587,8 @@ begin
   end
   else if IsQuadTyp(Typ) and (Length(DefStr) = 16) then
     Result := QuadLitW(BytesWord(DefStr, 0), BytesWord(DefStr, 8))
+  else if IsWideSet(Typ) then
+    Result := SetFromImage(DefStr, Typ)
   else if (k = tykPointer) or (k = tykClass) or (k = tykClassRef) or (k = tykProc) or
     (k = tykMethod) or (k = tykInterface) or IsDynTyp(Typ) then
   begin
@@ -5232,6 +5688,18 @@ begin
   else if TypeOf(t).Kind = tykReal then
     Die('integer constant at ' + at + ' near ' + near + ', which is not an integer');
   Result := v;
+end;
+
+{ A subrange's bound (P126): a constant that ends before =, which is
+  the declaration's (const S: set of 0..63 = [1]). }
+function TParser.ParseBound: Int64;
+var
+  noeq: Boolean;
+begin
+  noeq := FNoEq;
+  FNoEq := True;
+  Result := ParseIntConst;
+  FNoEq := noeq;
 end;
 
 function TParser.ParseType: LongInt;
@@ -5477,9 +5945,9 @@ begin
   end
   else if (k = tkInt) or (k = tkMinus) then
   begin
-    lo := ParseIntConst;
+    lo := ParseBound;
     Eat(tkDotDot);
-    hi := ParseIntConst;
+    hi := ParseBound;
     t := InternSubrange(lo, hi);
   end
   else if k = tkSpecialize then
@@ -5511,9 +5979,9 @@ begin
       if not FindConst(FTok.Lexeme, lo) then
         Die('unknown type ' + FTok.Lexeme + ' at ' + IntToStr(FTok.Line) + ':' +
           IntToStr(FTok.Col));
-      lo := ParseIntConst;
+      lo := ParseBound;
       Eat(tkDotDot);
-      hi := ParseIntConst;
+      hi := ParseBound;
       t := InternSubrange(lo, hi);
     end;
   end
@@ -6624,6 +7092,10 @@ begin
         Die('Write does not print a record: write its fields' + HerePos);
       if (e <> nil) and (TypeOf(e^.Typ).Kind = tykArray) then
         Die('Write does not print an array: write its elements' + HerePos);
+      if (e <> nil) and (e^.Kind = ekSet) and ((e^.Flags and 64) <> 0) then
+        Die('Write does not print a list: write its elements' + HerePos);
+      if (e <> nil) and (TypeOf(e^.Typ).Kind = tykSet) then
+        Die('Write does not print a set: x in s tests an element' + HerePos);
       w := nil;
       d := nil;
       if FTok.Kind = tkColon then
@@ -6649,8 +7121,11 @@ function TParser.ParseArgList: TExprArray;
 var
   n: SizeInt;
   args: TExprArray;
+  noeq: Boolean;
 begin
   args := nil;
+  noeq := FNoEq;
+  FNoEq := False;
   Eat(tkLParen);
   if FTok.Kind <> tkRParen then
   begin
@@ -6665,6 +7140,7 @@ begin
     end;
   end;
   Eat(tkRParen);
+  FNoEq := noeq;
   Result := args;
 end;
 
@@ -7153,7 +7629,7 @@ var
   id, ftyp, foff: LongInt;
   e, e2: PExpr;
   etyp: LongInt;
-  have, ctorHere: Boolean;
+  have, ctorHere, lst, noeq: Boolean;
   k: TTypeKind;
 begin
   Result := nil;
@@ -8275,16 +8751,31 @@ begin
           (FTok.Kind = tkLParen) then
         begin
           { Include(t, k) puts k into a tree, Exclude(t, k) takes it out
-            (P110); a set grows with s := s + [x] }
+            (P110); Include(s, x) and Exclude(s, x) set and clear x's bit
+            of the set variable s (P126), x in s's range }
           args := ParseArgList;
-          if (Length(args) <> 2) or (TypeOf(args[0]^.Typ).Kind <> tykTree) then
-            Die(name + ' takes a tree and a key; a set changes with s := s + [x] or s - [x]' +
-              HerePos);
-          args[1] := MapKeyArg(args[0], args[1]);
-          if SameId(name, 'Include') then
-            Result := NewCall('rt_treeadd', args, TyNone)
+          if (Length(args) = 2) and IsSetTyp(args[0]^.Typ) then
+          begin
+            CheckOutVar(args[0], args[0]^.Typ, name + '(s, x): s');
+            e := args[1];
+            SetElemFits(e, args[0]^.Typ);
+            args[1] := e;
+            args[0] := NewAddr(MapPutPlace(args[0]));
+            args[0]^.Flags := args[0]^.Flags or 16;
+            SetLength(args, 3);
+            args[2] := NewInt(Ord(SameId(name, 'Include')));
+            Result := NewCall('rt_setincl', args, TyNone);
+          end
           else
-            Result := NewCall('rt_treedel', args, TyBoolean);
+          begin
+            if (Length(args) <> 2) or (TypeOf(args[0]^.Typ).Kind <> tykTree) then
+              Die(name + ' takes a tree and a key, or a set and an element' + HerePos);
+            args[1] := MapKeyArg(args[0], args[1]);
+            if SameId(name, 'Include') then
+              Result := NewCall('rt_treeadd', args, TyNone)
+            else
+              Result := NewCall('rt_treedel', args, TyBoolean);
+          end;
         end
         else if (SameId(name, 'PopLow') or SameId(name, 'PopHigh')) and
           (FTok.Kind = tkLParen) then
@@ -9109,7 +9600,9 @@ begin
           for i := 0 to High(FConsts) do
             if SameId(FConsts[i].Name, name) then
             begin
-              if FConsts[i].Typ = TyString then
+              if IsWideSet(FConsts[i].Typ) then
+                Result := SetFromImage(FConsts[i].Str, FConsts[i].Typ)
+              else if FConsts[i].Typ = TyString then
                 Result := NewStr(FConsts[i].Str)
               else if FConsts[i].Typ = TyReal then
               begin
@@ -9204,7 +9697,10 @@ begin
     tkLParen:
       begin
         FTok := FLex.Next;
+        noeq := FNoEq;
+        FNoEq := False;
         Result := ParseExpr;
+        FNoEq := noeq;
         Eat(tkRParen);
         Result := ParsePostfix(Result);
       end;
@@ -9248,20 +9744,44 @@ begin
           end;
         end;
         Eat(tkRBrack);
-        etyp := TyInteger;
-        if Length(args) > 0 then
+        { typed by its elements (P126): Char, Byte, an enumeration; an
+          integer constant of 0..63 a word, else 0..255; the context
+          (SetPair, ValArg) types it again where a set is known. A list
+          of what no set holds is a list (NoList): ['ab', 'cd'], [1.5],
+          [1, 1000] go where a slice or an open array goes. }
+        lst := False;
+        for i := 0 to High(args) do
+          if not SetElemOk(args[i]) then
+            lst := True;
+        if lst then
         begin
-          if args[0]^.Kind = ekRange then
-            etyp := args[0]^.L^.Typ
-          else
-            etyp := args[0]^.Typ;
+          Result := NewSet(args, InternSet(InternSubrange(0, 63)));
+          Result^.Flags := Result^.Flags or 64;
+          Exit;
         end;
-        if (TypeOf(etyp).Kind = tykEnum) or (TypeOf(etyp).Kind = tykSubrange) or
-          (TypeOf(etyp).Kind = tykBoolean) then
-          id := InternSet(etyp)
-        else
-          id := InternSet(InternSubrange(0, 63));
+        etyp := 0;
+        for i := 0 to High(args) do
+          if args[i]^.Kind = ekRange then
+          begin
+            e := args[i]^.L;
+            etyp := SetJoin(etyp, SetElem(e));
+            args[i]^.L := e;
+            e := args[i]^.R;
+            etyp := SetJoin(etyp, SetElem(e));
+            args[i]^.R := e;
+          end
+          else
+          begin
+            e := args[i];
+            etyp := SetJoin(etyp, SetElem(e));
+            args[i] := e;
+          end;
+        if etyp = 0 then
+          etyp := InternSubrange(0, 63);
+        id := InternSet(etyp);
         Result := NewSet(args, id);
+        { constant elements in the set's range }
+        Result := SetLitTo(Result, id);
       end;
   else
     Die('an expression is expected, not ' + FTok.Lexeme + ' at ' +
@@ -9402,6 +9922,27 @@ begin
   else if (TypeOf(L^.Typ).Kind = tykRecord) or
     (TypeOf(R^.Typ).Kind = tykRecord) then
     Die(BinWord(Op) + ' does not take a record' + HerePos)
+  else if IsSetTyp(L^.Typ) or IsSetTyp(R^.Typ) then
+  begin
+    { sets (P126): union, difference, intersection, equality and the
+      subset and superset <= and >= }
+    SetPair(L, R);
+    if (Op = boAdd) or (Op = boSub) or (Op = boMul) then
+    begin
+      Result := NewBin(Op, L, R);
+      Result^.Typ := L^.Typ;
+    end
+    else if (Op = boEq) or (Op = boNe) or (Op = boLe) or (Op = boGe) then
+    begin
+      Result := NewBin(Op, L, R);
+      Result^.Typ := TyBoolean;
+    end
+    else
+    begin
+      Die(BinWord(Op) + ' does not take a set: +, -, *, =, <>, <= and >= do' + HerePos);
+      Result := nil;
+    end;
+  end
   else if IsQuadTyp(L^.Typ) or IsQuadTyp(R^.Typ) then
     Result := QuadBin(Op, L, R)
   else if (Op = boAdd) and (IsStrTyp(L^.Typ) or IsStrTyp(R^.Typ)) then
@@ -9709,6 +10250,22 @@ begin
         Result := NewCall('rt_treein', mk, TyBoolean)
       else
         Result := NewCall('rt_mapin', mk, TyBoolean);
+    end
+    else if IsSetTyp(Result^.R^.Typ) then
+    begin
+      { x in s (P126): x of the set's kind; a list takes x's kind; an x
+        outside the set's range is in no set }
+      NoList(Result^.R);
+      e := Result^.L;
+      id := SetElem(e);
+      Result^.L := e;
+      if (Result^.R^.Kind = ekSet) and (Length(Result^.R^.Args) = 0) then
+        Result^.R := SetLitTo(Result^.R, InternSet(id))
+      else if (Result^.R^.Kind = ekSet) and (TypeOf(id).Kind <> tykSubrange) then
+        Result^.R := SetLitTo(Result^.R, InternSet(id));
+      if (TypeOf(Result^.R^.Typ).Elem = TyChar) <> (Result^.L^.Typ = TyChar) then
+        Die(TypName(Result^.L^.Typ) + ' is no element of ' + TypName(Result^.R^.Typ) + HerePos);
+      Result^.Typ := TyBoolean;
     end;
     Exit;
   end;
@@ -9739,7 +10296,17 @@ begin
     Exit;
   end;
   case FTok.Kind of
-    tkEq: op := boEq;
+    tkEq:
+      begin
+        { const S: set of 0..63 = [1]: the bound ends before = (P126;
+          63 = [1] was read as a comparison), as FPC's ef_accept_equal }
+        if FNoEq then
+        begin
+          Result := e;
+          Exit;
+        end;
+        op := boEq;
+      end;
     tkNe: op := boNe;
     tkLt: op := boLt;
     tkLe: op := boLe;
@@ -12365,6 +12932,8 @@ var
   args: TExprArray;
   shared: Boolean;
   ck: string;
+  fi: SizeInt;
+  fl: PExpr;
 begin
   st := nil;
   nst := nil;
@@ -12821,6 +13390,20 @@ begin
           nst := Self.ParseStmt;
           st^.Body := nst;
           CheckTyped(st^.E);
+          { for x in [a, b] (P126), as FPC: a list of what no set holds
+            is walked in its order, a slice of x's type; one of ordinals
+            is a set, walked from its least element, of x's kind }
+          if (st^.E^.Kind = ekSet) and ((st^.E^.Flags and 64) <> 0) then
+          begin
+            for fi := 0 to High(st^.E^.Args) do
+              if st^.E^.Args[fi]^.Kind = ekRange then
+                NoList(st^.E);
+            fl := NewNil;
+            fl^.Typ := InternArray(VarTyp(name), 0, -1);
+            st^.E := AppendCall(fl, st^.E^.Args, 0);
+          end
+          else if IsSetTyp(st^.E^.Typ) then
+            st^.E := SetForVar(st^.E, VarTyp(name));
           if IsStrTyp(st^.E^.Typ) and (ValSize(VarTyp(name)) < 8) then
             Die('for ' + name + ' in a string walks its code points: ' + name +
               ' is a Rune or an Integer, not ' + TypName(VarTyp(name)) + HerePos);
@@ -13331,10 +13914,28 @@ var
   str, at, fname: string;
   i, cnt, fi, n: LongInt;
   dr: Double;
+  se: PExpr;
 begin
   td := TypeOf(T);
   k := td.Kind;
   at := IntToStr(FTok.Line) + ':' + IntToStr(FTok.Col);
+  if k = tykSet then
+  begin
+    { a set's bytes, its elements in its range (P126) }
+    FConstAt := at;
+    se := ParseExpr;
+    if se^.Kind <> ekSet then
+      Die('a set constant is a list in brackets at ' + at);
+    for i := 0 to High(se^.Args) do
+      if (se^.Args[i]^.Kind = ekInt) and ((se^.Args[i]^.Num < td.Lo) or (se^.Args[i]^.Num > td.Hi)) then
+        Die('set element out of ' + IntToStr(td.Lo) + '..' + IntToStr(td.Hi) + ' at ' + at);
+    se := SetLitTo(se, T);
+    if not SetImage(se, str) then
+      Die('a set constant holds constants at ' + at);
+    for i := 1 to Length(str) do
+      Img[Off + i] := str[i];
+    Exit;
+  end;
   if k = tykArray then
   begin
     if td.Hi < td.Lo then
@@ -13862,7 +14463,12 @@ begin
   if Copy(data, 1, 11) = 'PASLANGI15' + #10 then
     Die(path + ' was compiled by a paslang older than 1.1.6; compile ' +
       AName + ' again');
-  if (Copy(data, 1, 8) = 'PASLANGI') and (Copy(data, 1, 11) <> 'PASLANGI16' + #10) then
+  { From 1.1.7 a set constant says its type and a set of 32 bytes its
+    bytes (P126). }
+  if Copy(data, 1, 11) = 'PASLANGI16' + #10 then
+    Die(path + ' was compiled by a paslang older than 1.1.7; compile ' +
+      AName + ' again');
+  if (Copy(data, 1, 8) = 'PASLANGI') and (Copy(data, 1, 11) <> 'PASLANGI17' + #10) then
     Die(path + ' was compiled by a newer paslang (' + FirstLine(data) +
       '); compile ' + AName + ' again with this one');
   if not ParseIface(data, iface) then
@@ -13929,8 +14535,9 @@ begin
   for j := 0 to High(iface.Consts) do
     if not FindConst(iface.Consts[j].Name, cv) then
     begin
+      { a set constant's type is the unit's (P126) }
       AddConstEnt(iface.Consts[j].Name, iface.Consts[j].Value,
-        iface.Consts[j].Typ, iface.Consts[j].Str);
+        MapImport(iface.Consts[j].Typ), iface.Consts[j].Str);
       if iface.Consts[j].HasQ then
       begin
         FConsts[High(FConsts)].QLo := iface.Consts[j].QLo;
@@ -14859,9 +15466,22 @@ begin
   end;
   if dk = tykSet then
   begin
+    { a set's default: its bits in a word, its bytes for a set of 32
+      (P126) }
+    FConstAt := HerePos;
     e := ParseExpr;
-    OutV := ConstSetBits(e);
+    if e^.Kind <> ekSet then
+      Die('a set''s default is a list in brackets of constants' + HerePos);
+    e := SetLitTo(e, t);
+    if not SetImage(e, ds) then
+      Die('a set''s default is a list of constants' + HerePos);
+    OutV := 0;
     OutS := '';
+    if Length(ds) = 32 then
+      OutS := ds
+    else
+      for dql := 8 downto 1 do
+        OutV := (OutV shl 8) or Ord(ds[dql]);
     Exit;
   end;
   { Any constant expression, checked against the parameter's type
@@ -14936,40 +15556,6 @@ begin
   end;
   OutV := dv;
   OutS := ds;
-end;
-
-{ The bits of a constant set, E a list in brackets of constants and
-  ranges (P125). }
-function TParser.ConstSetBits(E: PExpr): Int64;
-var
-  i: SizeInt;
-  lo, hi, v: Int64;
-  vt: LongInt;
-  str: string;
-begin
-  Result := 0;
-  if E^.Kind <> ekSet then
-    Die('a set''s default is a list in brackets of constants' + HerePos);
-  for i := 0 to High(E^.Args) do
-  begin
-    if E^.Args[i]^.Kind = ekRange then
-    begin
-      if not (ConstFold(E^.Args[i]^.L, lo, vt, str) and ConstFold(E^.Args[i]^.R, hi, vt, str)) then
-        Die('a set''s default is a list of constants' + HerePos);
-    end
-    else
-    begin
-      if not ConstFold(E^.Args[i], lo, vt, str) then
-        Die('a set''s default is a list of constants' + HerePos);
-      if (TypeOf(vt).Kind = tykString) and (Length(str) = 1) then
-        lo := Ord(str[1]);
-      hi := lo;
-    end;
-    if (lo < 0) or (hi > 63) then
-      Die('a set''s default holds elements 0 to 63' + HerePos);
-    for v := lo to hi do
-      Result := Result or (Int64(1) shl v);
-  end;
 end;
 
 function TParser.ParseProcHead: TProc;
@@ -15268,7 +15854,7 @@ var
 begin
   k := TypeOf(T).Kind;
   Result := (k = tykString) or (k = tykRecord) or (k = tykArray) or
-    (k = tykInterface) or (k = tykMethod) or (k = tykQuad) or (k = tykProc);
+    (k = tykInterface) or (k = tykMethod) or (k = tykQuad) or (k = tykProc) or IsWideSet(T);
 end;
 
 { E is N, a field of N or an element of N; an element of a dynamic array
