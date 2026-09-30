@@ -2879,9 +2879,13 @@ the shared elements shared: after `t := s`, `SetLength(t, 8)` when
 `s`'s block had room, then `t[1] := 20`, `s[1]` is 20 too; the length
 is `t`'s own, the elements up to `s`'s length are still one. A copy
 with a block of its own is `t := nil; t := Append(t, s)`: `Append` to a
-nil slice allocates. `Copy`, `Insert` and `Delete` are string words, so
-`t := Copy(xs, 0, 2)` of a slice is refused (`Copy takes a string, not
-array of Integer`), and `s[i..j]` shares (below); it can be taken again
+nil slice allocates, and so does `Copy(xs, i, n)` (and `Copy(xs, i)`,
+to the end), whose elements are a new slice's, as Free Pascal's
+(1.1.11): 0-based, a start below 0 shortening the count, a count cut
+to what is left. `Insert(x, xs, i)` (an element, a slice or a list in
+brackets, before `xs[i]`) and `Delete(xs, i, n)` make a new slice for
+`xs`, so one that shared its elements keeps them; `s[i..j]` shares
+(below); it can be taken again
 of what it gave, so `u := s[1..3]; u := u[1..2]` is `s[2..3]`. A nil
 slice is a slice: `Length` 0, `High` -1, `= nil` true, `for x in` over
 it does nothing, and `Append` or `SetLength` gives it a block; a
@@ -5436,7 +5440,8 @@ byte in front, no required trailing zero. Assignment copies the pointer
 and the length; concatenation allocates a new buffer. `'ab'#10'c'` is one
 string with a newline inside. `s[i]` is a byte, 1-based. `Length` counts
 bytes and `for r in s do` walks Unicode scalars. `Copy(s, from, count)`
-cuts, `SetLength(s, n)` sizes, `=` and `<>` compare bytes. `<`, `<=`,
+cuts, `SetLength(s, n)` sizes, `=` and `<>` compare bytes, 64 at a
+time on AVX2 or SSE2 (or NEON) as Go's `memequal` does. `<`, `<=`,
 `>` and `>=` compare them byte by byte as well: the first byte that
 differs decides, and when one string is a prefix of the other the
 shorter one comes first, so a list of names sorts the way you expect.
@@ -10096,8 +10101,8 @@ the commands on standard input, under `--debug-mode` and under
 - `Str(x, s)` of a real without a width writes what `Write(x)` writes
   (`2.5`), where Free Pascal writes ` 2.500000000E+00`; `Integer` is 64
   bits, so `Val` into one reads 64 bits, where Free Pascal's `Integer`
-  is 32. `Copy`, `Insert` and `Delete` take strings; a slice's elements
-  are copied with `a[i..j]` and `Append`.
+  is 32. `Insert` and `Delete` of a slice read it more than once: one
+  a call reaches is put in a variable first.
 - A one-character literal is a string where a helper's method is called
   on it (`'x'.Twice` is string's helper), where Free Pascal takes it for
   a `Char`. A helper has no constructor.

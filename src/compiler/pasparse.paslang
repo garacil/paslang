@@ -452,6 +452,7 @@ type
     function AsStr(E: PExpr): PExpr;
     function ParseStrStmt: PStmt;
     function ParseValStmt: PStmt;
+    function SliceEdit(E: PExpr): PStmt;
     function ClassOfTarget: LongInt;
     function ParseIfaceType(const AName: string): LongInt;
     function InternChan(Elem: LongInt): LongInt;
@@ -9926,6 +9927,14 @@ begin
             args[1] := MapKeyArg(args[0], args[1]);
             Result := NewCall('rt_treedel', args, TyBoolean);
           end
+          else if (Length(args) = 3) and IsDynTyp(args[0]^.Typ) then
+          begin
+            { Delete(a, i, n) of a slice (P136): the statement makes it }
+            CheckOutVar(args[0], args[0]^.Typ, 'Delete(a, i, n): a');
+            args[1] := ValArg(TyInteger, args[1]);
+            args[2] := ValArg(TyInteger, args[2]);
+            Result := NewCall('rt_slicedel', args, TyNone);
+          end
           else if (Length(args) = 3) and IsStrTyp(args[0]^.Typ) then
           begin
             { Delete(s, i, n) of a string (P134) }
@@ -9963,10 +9972,6 @@ begin
           if (Length(args) < 2) or (Length(args) > 3) then
             Die('Copy takes a string, an index and a count, or a string and an index' + HerePos);
           CheckTyped(args[0]);
-          if not (IsStrTyp(args[0]^.Typ) or IsCharT(args[0]^.Typ) or (args[0]^.Kind = ekStr)) then
-            Die('Copy takes a string, not ' + TypName(args[0]^.Typ) +
-              ': a slice''s elements are a[i..j]' + HerePos);
-          args[0] := AsStr(args[0]);
           if Length(args) = 2 then
           begin
             SetLength(args, 3);
@@ -9974,7 +9979,27 @@ begin
           end;
           args[1] := ValArg(TyInteger, args[1]);
           args[2] := ValArg(TyInteger, args[2]);
-          Result := NewCall('rt_copy', args, TyString);
+          if IsDynTyp(args[0]^.Typ) then
+          begin
+            { Copy(a, i, n) and Copy(a, i) of a slice (P136): a new one
+              of the elements from a[i], Free Pascal's clamps; the cut is
+              a view, appended to nil }
+            e := NewNil;
+            e^.Typ := args[0]^.Typ;
+            e2 := NewCall('rt_slicecut', args, args[0]^.Typ);
+            args := nil;
+            SetLength(args, 2);
+            args[0] := e;
+            args[1] := e2;
+            Result := NewCall('rt_appendslice', args, e^.Typ);
+          end
+          else
+          begin
+            if not (IsStrTyp(args[0]^.Typ) or IsCharT(args[0]^.Typ) or (args[0]^.Kind = ekStr)) then
+              Die('Copy takes a string or a slice, not ' + TypName(args[0]^.Typ) + HerePos);
+            args[0] := AsStr(args[0]);
+            Result := NewCall('rt_copy', args, TyString);
+          end;
         end
         else if SameId(name, 'Pos') and (FTok.Kind = tkLParen) then
         begin
@@ -10009,9 +10034,16 @@ begin
           if Length(args) <> 3 then
             Die('Insert takes what to insert, a string variable and a place' + HerePos);
           CheckTyped(args[1]);
+          if IsDynTyp(args[1]^.Typ) then
+          begin
+            { Insert(x, a, i) of a slice (P136): the statement makes it }
+            CheckOutVar(args[1], args[1]^.Typ, 'Insert(x, a, i): a');
+            args[2] := ValArg(TyInteger, args[2]);
+            Result := NewCall('rt_sliceins', args, TyNone);
+            Exit;
+          end;
           if not IsStrTyp(args[1]^.Typ) then
-            Die('Insert takes a string variable, not ' + TypName(args[1]^.Typ) +
-              ': a slice grows with Append' + HerePos);
+            Die('Insert takes a string or a slice variable, not ' + TypName(args[1]^.Typ) + HerePos);
           CheckOutVar(args[1], args[1]^.Typ, 'Insert(src, s, i): s');
           args[0] := AsStr(args[0]);
           args[2] := ValArg(TyInteger, args[2]);
@@ -11807,6 +11839,123 @@ begin
       Exit;
   Result := False;
 end;
+
+{ Insert(x, a, i) and Delete(a, i, n) of a slice (P136), as Free
+  Pascal's: a new slice made of views of a (rt_slicecut) and what goes
+  in, appended to nil, so a slice that shared a's elements keeps them.
+  Insert puts x (an element, a slice or a list) before a[i], at the
+  front when i is below 0, at the end past it; Delete takes n elements
+  out from a[i] and does nothing when i is out of a or n is not above
+  0. a is read more than once: a variable or a place that calls
+  nothing. }
+function TParser.SliceEdit(E: PExpr): PStmt;
+var
+  a, x, ti, tn, nl, part, cut: PExpr;
+  pre: TStmtArray;
+  args: TExprArray;
+  st, ifs: PStmt;
+  t: LongInt;
+
+  function Span(Lo, N: PExpr): PExpr;
+  var
+    ca: TExprArray;
+  begin
+    ca := nil;
+    SetLength(ca, 3);
+    ca[0] := a;
+    ca[1] := Lo;
+    ca[2] := N;
+    Result := NewCall('rt_slicecut', ca, t);
+  end;
+
+  function Count: PExpr;
+  var
+    la: TExprArray;
+  begin
+    la := nil;
+    SetLength(la, 1);
+    la[0] := a;
+    Result := NewCall('rt_length', la, TyInteger);
+  end;
+
+  function Joined(L, R: PExpr): PExpr;
+  var
+    ja: TExprArray;
+  begin
+    ja := nil;
+    SetLength(ja, 2);
+    ja[0] := L;
+    ja[1] := R;
+    Result := NewCall('rt_appendslice', ja, t);
+  end;
+
+begin
+  pre := nil;
+  if E^.Name = 'rt_sliceins' then
+  begin
+    x := E^.Args[0];
+    a := E^.Args[1];
+  end
+  else
+    a := E^.Args[0];
+  t := a^.Typ;
+  if ExprHasCall(a) then
+    Die('a slice that a call reaches is edited in a variable: put it in one first' + HerePos);
+  nl := NewNil;
+  nl^.Typ := t;
+  Result := NewStmt(skBlock);
+  if E^.Name = 'rt_sliceins' then
+  begin
+    ti := HiddenVar(TyInteger, pre, E^.Args[2]);
+    part := Joined(nl, Span(NewInt(0), ti));
+    CheckTyped(x);
+    if (x^.Kind = ekSet) or IsDynTyp(x^.Typ) and SameTyp(x^.Typ, t) then
+    begin
+      if x^.Kind = ekSet then
+        part := AppendCall(part, x^.Args, 0)
+      else
+        part := Joined(part, x);
+    end
+    else
+    begin
+      args := nil;
+      SetLength(args, 1);
+      args[0] := x;
+      part := AppendCall(part, args, 0);
+    end;
+    part := Joined(part, Span(ti, NewInt(High(Int64))));
+    st := NewStmt(skAssign);
+    st^.Dest := a;
+    st^.E := part;
+    SetLength(Result^.Stmts, Length(pre) + 1);
+    Result^.Stmts[0] := pre[0];
+    Result^.Stmts[1] := st;
+    Exit;
+  end;
+  ti := HiddenVar(TyInteger, pre, E^.Args[1]);
+  tn := HiddenVar(TyInteger, pre, E^.Args[2]);
+  { n cut to what is left, then the elements before and after }
+  st := NewStmt(skIf);
+  st^.E := ApplyOp(boGt, tn, ApplyOp(boSub, Count, ti));
+  st^.ThenSt := NewStmt(skAssign);
+  st^.ThenSt^.Dest := tn;
+  st^.ThenSt^.E := ApplyOp(boSub, Count, ti);
+  cut := Joined(Joined(nl, Span(NewInt(0), ti)), Span(ApplyOp(boAdd, ti, tn), NewInt(High(Int64))));
+  ifs := NewStmt(skIf);
+  ifs^.E := ApplyOp(boAnd, ApplyOp(boAnd, ApplyOp(boGe, ti, NewInt(0)),
+    ApplyOp(boLt, ti, Count)), ApplyOp(boGt, tn, NewInt(0)));
+  ifs^.ThenSt := NewStmt(skBlock);
+  SetLength(ifs^.ThenSt^.Stmts, 2);
+  ifs^.ThenSt^.Stmts[0] := st;
+  ifs^.ThenSt^.Stmts[1] := NewStmt(skAssign);
+  ifs^.ThenSt^.Stmts[1]^.Dest := a;
+  ifs^.ThenSt^.Stmts[1]^.E := cut;
+  SetLength(Result^.Stmts, 3);
+  Result^.Stmts[0] := pre[0];
+  Result^.Stmts[1] := pre[1];
+  Result^.Stmts[2] := ifs;
+end;
+
 
 { The integer a bit word of P105 works on (1.0.117): an integer of any
   width or a Char; its width is its type's (IntBits). }
@@ -14907,6 +15056,8 @@ begin
               st := BlockStmt(e, st^.E);
           end;
         end
+        else if (e^.Kind = ekCall) and ((e^.Name = 'rt_sliceins') or (e^.Name = 'rt_slicedel')) then
+          st := SliceEdit(e)
         else if e^.Kind = ekCall then
         begin
           st := NewStmt(skCall);
