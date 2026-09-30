@@ -1676,6 +1676,15 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/shaduse-arm testdata/units/shaduse.paslang; \
 	timeout 60 $(QEMU_A64) $(BUILDDIR)/shaduse-arm > $(BUILDDIR)/shaduse-arm.got; \
 	diff -u testdata/units/shaduse.out $(BUILDDIR)/shaduse-arm.got; \
+	: a program hides a unit type with its own, P155: a record, an alias, an enumeration, a class; \
+	$(OUTDIR)/paslangc testdata/units/hideu.paslang; \
+	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/hideuse testdata/units/hideuse.paslang; \
+	$(BUILDDIR)/hideuse > $(BUILDDIR)/hideuse.got; \
+	diff -u testdata/units/hideuse.out $(BUILDDIR)/hideuse.got; \
+	$(OUTDIR)/paslangc -target arm64 testdata/units/hideu.paslang; \
+	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/hideuse-arm testdata/units/hideuse.paslang; \
+	timeout 60 $(QEMU_A64) $(BUILDDIR)/hideuse-arm > $(BUILDDIR)/hideuse-arm.got; \
+	diff -u testdata/units/hideuse.out $(BUILDDIR)/hideuse-arm.got; \
 	: two units that declare the same class, interface, record and helper names, P154; \
 	$(OUTDIR)/paslangc testdata/units/twina.paslang; \
 	$(OUTDIR)/paslangc testdata/units/twinb.paslang; \
@@ -1994,7 +2003,9 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  'procproc:duplicate identifier Half (a routine with the same parameters) at 8:10' \
 	  'typetwice:duplicate type TPoint at 7:3' \
 	  'varconst:duplicate identifier Count (a variable of the name) at 7:3' \
-	  'varproc:duplicate identifier Show (a routine of the name) at 9:3'; do \
+	  'varproc:duplicate identifier Show (a routine of the name) at 9:3' \
+	  'aliastwice:duplicate type TPoint at 7:3' 'enumtwice:duplicate type TKind at 7:3' \
+	  'reftwice:duplicate type TShapeClass at 7:3'; do \
 	  n=$${f%%:*}; w=$${f#*:}; \
 	  if $(OUTDIR)/paslangc -o $(BUILDDIR)/dupw_$$n testdata/dupwhere/$$n.paslang >$(BUILDDIR)/dupw_$$n.err 2>&1; then \
 	    echo "$$n should fail"; exit 1; \

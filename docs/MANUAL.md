@@ -10450,7 +10450,11 @@ the commands on standard input, under `--debug-mode` and under
   object code too (its table is `vmt_ua_tshape`, its methods
   `p_ua_tshape_name`), and `ua.TShape` and `ub.TShape` are two classes
   (1.1.28, P154; the program did not link, and the two were taken for
-  one when their sizes matched).
+  one when their sizes matched). A type is declared once where it is,
+  whatever its kind, an alias `T = Integer` and a class reference too;
+  a program's own type of a name a unit it uses declares hides the
+  unit's, which stays `ua.TPoint` (1.1.29, P155; an alias took the name
+  in silence, and a record of the unit's name was refused).
 - A map key cannot be a record, a real, a slice, a map or a method value.
 - A map is not safe for concurrent writers; the runtime stops the
   program when it catches that.
