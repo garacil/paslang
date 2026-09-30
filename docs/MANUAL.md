@@ -10136,6 +10136,11 @@ the commands on standard input, under `--debug-mode` and under
   error, and `-9223372036854775808` is written as such.
 - A program's variable or routine may not take the name of a variable of
   a unit it uses: `duplicate identifier Counter (a variable of unit uv)`.
+- When two units a program uses have a name in common, the later one in
+  `uses` hides the earlier one's, as in Free Pascal (a routine of the
+  same parameters, a constant, a variable, a type that is another); a
+  unit's name reaches its own names, hidden or not: `ua.Twice`,
+  `ua.Count`, `var b: ua.TBox` (1.1.13).
 - A map key cannot be a record, a real, a slice, a map or a method value.
 - A map is not safe for concurrent writers; the runtime stops the
   program when it catches that.

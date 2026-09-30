@@ -1581,6 +1581,21 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/helpuse-arm testdata/units/helpuse.paslang; \
 	timeout 60 $(QEMU_A64) $(BUILDDIR)/helpuse-arm > $(BUILDDIR)/helpuse-arm.got; \
 	diff -u testdata/units/helpuse.out $(BUILDDIR)/helpuse-arm.got; \
+	: one name in two units, P138: the last unit in uses hides, the unit name reaches; \
+	$(OUTDIR)/paslangc testdata/units/shada.paslang; \
+	$(OUTDIR)/paslangc testdata/units/shadb.paslang; \
+	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/shaduse testdata/units/shaduse.paslang; \
+	$(BUILDDIR)/shaduse > $(BUILDDIR)/shaduse.got; \
+	diff -u testdata/units/shaduse.out $(BUILDDIR)/shaduse.got; \
+	if $(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/shadbad testdata/units/shadbad.paslang > $(BUILDDIR)/shadbad.err 2>&1; then \
+	  echo 'a name its unit does not have should be refused'; exit 1; \
+	fi; \
+	grep -q 'unknown identifier shada.Nope at 4:21' $(BUILDDIR)/shadbad.err; \
+	$(OUTDIR)/paslangc -target arm64 testdata/units/shada.paslang; \
+	$(OUTDIR)/paslangc -target arm64 testdata/units/shadb.paslang; \
+	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/shaduse-arm testdata/units/shaduse.paslang; \
+	timeout 60 $(QEMU_A64) $(BUILDDIR)/shaduse-arm > $(BUILDDIR)/shaduse-arm.got; \
+	diff -u testdata/units/shaduse.out $(BUILDDIR)/shaduse-arm.got; \
 	$(OUTDIR)/paslangc testdata/units/safeu.paslang; \
 	grep -q '^SAFE$$' $(BUILDDIR)/safeu.pi; \
 	if grep -q '^SAFE$$' $(BUILDDIR)/adder.pi; then echo "adder.pi says SAFE for a unit that is not safe"; exit 1; fi; \

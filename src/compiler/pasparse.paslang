@@ -44,6 +44,7 @@ type
     Txt: string;    { the text of a string constant }
     QLo, QHi: Int64;  { a real one worked out in binary128 too (P103, 1.0.115) }
     HasQ: Boolean;
+    Owner: string;  { the unit it comes from (P138) }
   end;
 
   TOpEnt = record
@@ -64,11 +65,13 @@ type
     Def: array of Int64;
     DefStr: array of string;
     Nest: LongInt;     { a nested routine's depth: 0 at the top (1.0.133) }
+    Owner: string;     { the unit it comes from, '' for the one being compiled (P138) }
   end;
 
   TTypeName = record
     Name: string;
     Id: LongInt;
+    Owner: string;     { the unit it comes from (P138) }
   end;
 
   TParser = class
@@ -450,6 +453,8 @@ type
     function IsHelperWord: Boolean;
     function RecFieldIdx(T: LongInt; const AName: string): SizeInt;
     function TypeDot(T: LongInt): PExpr;
+    function IsUsedUnit(const AName: string): Boolean;
+    function SameProcIdx(const AName: string; const Params: TParamArray): SizeInt;
     function ConstIdx(const AName: string): SizeInt;
     function TypeNameIdx(const AName: string): SizeInt;
     function LocalProcNamed(const AName: string): Boolean;
@@ -4617,6 +4622,37 @@ begin
   CheckMemberName(AName);
 end;
 
+{ AName is a unit this one uses, not a core unit (P138): its name
+  qualifies its names, ua.Twice. }
+function TParser.IsUsedUnit(const AName: string): Boolean;
+begin
+  Result := HasStr(FLoaded, ToLower(AName)) and not IsCoreUnit(AName);
+end;
+
+{ The index of the routine AName of these parameters, -1 when there is
+  none (P138). }
+function TParser.SameProcIdx(const AName: string; const Params: TParamArray): SizeInt;
+var
+  i, j: SizeInt;
+  same: Boolean;
+begin
+  Result := -1;
+  for i := 0 to High(FProcs) do
+    if SameId(FProcs[i].Name, AName) and (FProcs[i].NParams = Length(Params)) then
+    begin
+      same := True;
+      for j := 0 to High(Params) do
+        if (j > High(FProcs[i].ParamTyp)) or (FProcs[i].ParamTyp[j] <> Params[j].Typ) or
+          ((j <= High(FProcs[i].ByRef)) and (FProcs[i].ByRef[j] <> Params[j].ByRef)) then
+          same := False;
+      if same then
+      begin
+        Result := i;
+        Exit;
+      end;
+    end;
+end;
+
 { The index of constant AName, the innermost, -1 when there is none
   (P137). }
 function TParser.ConstIdx(const AName: string): SizeInt;
@@ -6100,6 +6136,7 @@ end;
 
 function TParser.ParseType: LongInt;
 var
+  tname: string;
   id, elem, t: LongInt;
   lo, hi: Int64;
   k: TTokKind;
@@ -6357,6 +6394,18 @@ begin
   end
   else if k = tkIdent then
   begin
+    { ua.TPoint, a type of a unit named by the unit (P138) }
+    if IsUsedUnit(FTok.Lexeme) and (FLex.NextSolid = '.') then
+    begin
+      tname := ToLower(FTok.Lexeme);
+      FTok := FLex.Next;
+      Eat(tkDot);
+      if not NamedType(tname + '.' + FTok.Lexeme, id) then
+        Die('unknown type ' + FTok.Lexeme + ' of unit ' + tname + HerePos);
+      FTok := FLex.Next;
+      Result := id;
+      Exit;
+    end;
     if NamedType(FTok.Lexeme, id) then
     begin
       FTok := FLex.Next;
@@ -8836,6 +8885,16 @@ begin
         nline := FTok.Line;
         ncol := FTok.Col;
         FTok := FLex.Next;
+        { ua.Twice: a name of the unit ua, found through ua even when a
+          later unit's name hides it (P138) }
+        if (FTok.Kind = tkDot) and IsUsedUnit(name) and not IsVarName(name) then
+        begin
+          FTok := FLex.Next;
+          if FTok.Lexeme = '' then
+            Fail('a name of unit ' + name);
+          name := ToLower(name) + '.' + FTok.Lexeme;
+          FTok := FLex.Next;
+        end;
         { in a helper's method (P127), a member of the helper, or a field
           of the record it is for, is Self's, as a class's member is in
           a method of the class; a local or a parameter of the name
@@ -15602,12 +15661,34 @@ begin
       Continue;
     if Iface.TypeNames[i] = '_' then
       Continue;
-    if NamedType(Iface.TypeNames[i], id) then
+    k := TypeNameIdx(Iface.TypeNames[i]);
+    { a unit's interface lists the types it took from others too: the
+      same type again keeps the first name }
+    if (k >= 0) and ((FTypeNames[k].Owner = '') or (FTypeNames[k].Owner = ToLower(Iface.Name)) or
+      IsCoreUnit(Iface.Name) or SameTyp(FTypeNames[k].Id, FImportMap[old])) then
       Continue;
+    if (k < 0) and NamedType(Iface.TypeNames[i], id) then
+      Continue;
+    { a later unit's type hides the earlier unit's (P138): the plain name
+      goes, the qualified one stays }
+    if k >= 0 then
+    begin
+      for nw := k to High(FTypeNames) - 1 do
+        FTypeNames[nw] := FTypeNames[nw + 1];
+      SetLength(FTypeNames, Length(FTypeNames) - 1);
+    end;
     nw := Length(FTypeNames);
     SetLength(FTypeNames, nw + 1);
     FTypeNames[nw].Name := Iface.TypeNames[i];
     FTypeNames[nw].Id := FImportMap[old];
+    if not IsCoreUnit(Iface.Name) then
+    begin
+      FTypeNames[nw].Owner := ToLower(Iface.Name);
+      SetLength(FTypeNames, nw + 2);
+      FTypeNames[nw + 1].Name := ToLower(Iface.Name) + '.' + Iface.TypeNames[i];
+      FTypeNames[nw + 1].Id := FImportMap[old];
+      FTypeNames[nw + 1].Owner := ToLower(Iface.Name);
+    end;
   end;
   for i := 0 to mx - 1 do
   begin
@@ -15734,9 +15815,8 @@ procedure TParser.LoadUnitBody(const AName: string; LinkOnly: Boolean);
 var
   path, data, sum: string;
   iface: TUnitIface;
-  i, j, n: SizeInt;
+  i, j, n, k: SizeInt;
   pr: TProc;
-  cv: Int64;
   again: Boolean;
 begin
   { A unit linked before without its names (LoadCore links pasquad into
@@ -15899,21 +15979,58 @@ begin
           pr.Params[j].DefStr := '';
       end;
     end;
-    if SameProc(pr.Name, pr.Params) then
+    k := SameProcIdx(pr.Name, pr.Params);
+    if (k >= 0) and ((FProcs[k].Sym = pr.Sym) or IsCoreUnit(AName) or (FProcs[k].Owner = '')) then
       Continue;
+    { a later unit's routine of the name and parameters hides the earlier
+      unit's, which its unit's name still reaches (P138): the plain name
+      goes, the qualified one stays }
+    if k >= 0 then
+    begin
+      for n := k to High(FProcs) - 1 do
+        FProcs[n] := FProcs[n + 1];
+      SetLength(FProcs, Length(FProcs) - 1);
+    end;
     AddProcEnt(iface.Procs[i].Name, iface.Procs[i].Sym, iface.Procs[i].IsFunc,
       Length(iface.Procs[i].ParamTyps), pr.RetTyp);
     ApplyParams(pr.Name, pr.Params);
+    if not IsCoreUnit(AName) then
+    begin
+      FProcs[High(FProcs)].Owner := ToLower(AName);
+      AddProcEnt(ToLower(AName) + '.' + iface.Procs[i].Name, iface.Procs[i].Sym,
+        iface.Procs[i].IsFunc, Length(iface.Procs[i].ParamTyps), pr.RetTyp);
+      FProcs[High(FProcs)].Owner := ToLower(AName);
+      ApplyParams(ToLower(AName) + '.' + iface.Procs[i].Name, pr.Params);
+    end;
     n := Length(FProg.Procs);
     SetLength(FProg.Procs, n + 1);
     FProg.Procs[n] := pr;
   end;
   for j := 0 to High(iface.Consts) do
-    if not FindConst(iface.Consts[j].Name, cv) then
+  begin
+    k := ConstIdx(iface.Consts[j].Name);
+    if (k >= 0) and ((FConsts[k].Owner = '') or (FConsts[k].Owner = ToLower(AName)) or
+      IsCoreUnit(AName)) then
+      Continue;
+    { a later unit's constant hides the earlier unit's (P138): the plain
+      name goes, the qualified one stays }
+    if k >= 0 then
+    begin
+      for n := k to High(FConsts) - 1 do
+        FConsts[n] := FConsts[n + 1];
+      SetLength(FConsts, Length(FConsts) - 1);
+    end;
+    for n := 0 to Ord(not IsCoreUnit(AName)) do
     begin
       { a set constant's type is the unit's (P126) }
-      AddConstEnt(iface.Consts[j].Name, iface.Consts[j].Value,
-        MapImport(iface.Consts[j].Typ), iface.Consts[j].Txt);
+      if n = 0 then
+        AddConstEnt(iface.Consts[j].Name, iface.Consts[j].Value,
+          MapImport(iface.Consts[j].Typ), iface.Consts[j].Txt)
+      else
+        AddConstEnt(ToLower(AName) + '.' + iface.Consts[j].Name, iface.Consts[j].Value,
+          MapImport(iface.Consts[j].Typ), iface.Consts[j].Txt);
+      if not IsCoreUnit(AName) then
+        FConsts[High(FConsts)].Owner := ToLower(AName);
       if iface.Consts[j].HasQ then
       begin
         FConsts[High(FConsts)].QLo := iface.Consts[j].QLo;
@@ -15921,6 +16038,7 @@ begin
         FConsts[High(FConsts)].HasQ := True;
       end;
     end;
+  end;
   { The unit's interface globals: the name, and the storage in its
     object (1.0.76). A class variable (P123) is one too, named by its
     symbol, which the class's members give. }
@@ -15935,9 +16053,21 @@ begin
       FVars[High(FVars)].Ext := True;
       Continue;
     end;
+    { a later unit's variable hides the earlier unit's, which is then
+      named by its unit, ua.Count (P138) }
+    for k := 0 to High(FVars) do
+      if SameId(FVars[k].Name, iface.Vars[j].Name) and FVars[k].Ext and
+        (FVars[k].Sym <> iface.Vars[j].Sym) then
+        FVars[k].Name := '.' + FVars[k].Sym;
     AddVar(iface.Vars[j].Name, MapImport(iface.Vars[j].Typ), False);
     FVars[High(FVars)].Sym := iface.Vars[j].Sym;
     FVars[High(FVars)].Ext := True;
+    if not IsCoreUnit(AName) then
+    begin
+      AddVar(ToLower(AName) + '.' + iface.Vars[j].Name, MapImport(iface.Vars[j].Typ), False);
+      FVars[High(FVars)].Sym := iface.Vars[j].Sym;
+      FVars[High(FVars)].Ext := True;
+    end;
   end;
   { A core unit's exports are reserved names everywhere else (1.0.138):
     its routines, constants, variables and types. }
