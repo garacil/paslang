@@ -105,6 +105,8 @@ type
     FConstNames: TStrArray;   { the const parameters of the routines being read, outermost first (1.1.1) }
     FHelpers: array of LongInt;  { the helpers in scope, in the order declared or loaded (P127) }
     FHelperTyp: LongInt;      { the helper whose method is being read (P127), 0 outside one }
+    FConstScope, FTypeScope, FProcScope: SizeInt;  { where the routine being read begins its constants, type names and nested routines in the tables (P137) }
+    FScopeTypes: TStrArray;   { the type names the routine being read declares (P137) }
     FModNoAddr: Boolean;      { ExprMod: an address taken is not a change (the const check, 1.1.1) }
     FProcs: array of TProcEnt;
     FOps: array of TOpEnt;
@@ -448,6 +450,10 @@ type
     function IsHelperWord: Boolean;
     function RecFieldIdx(T: LongInt; const AName: string): SizeInt;
     function TypeDot(T: LongInt): PExpr;
+    function ConstIdx(const AName: string): SizeInt;
+    function TypeNameIdx(const AName: string): SizeInt;
+    function LocalProcNamed(const AName: string): Boolean;
+    procedure LocalDup(const AName: string; Skip: Char);
     function EnumNames(T: LongInt): string;
     function AsStr(E: PExpr): PExpr;
     function ParseStrStmt: PStmt;
@@ -1718,7 +1724,8 @@ var
 begin
   Result := False;
   Id := TyNone;
-  for i := 0 to High(FTypeNames) do
+  { the innermost first: a routine's type hides the program's (P137) }
+  for i := High(FTypeNames) downto 0 do
     if SameId(FTypeNames[i].Name, AName) then
     begin
       Id := FTypeNames[i].Id;
@@ -3386,7 +3393,9 @@ var
   dummy: LongInt;
 begin
   CheckName(AName);
-  if NamedType(AName, dummy) then
+  if FNest > 0 then
+    LocalDup(AName, 't')
+  else if NamedType(AName, dummy) then
     Die('duplicate type ' + AName);
   n := Length(FTypes);
   SetLength(FTypes, n + 1);
@@ -3406,7 +3415,8 @@ var
 begin
   Result := False;
   V := 0;
-  for i := 0 to High(FConsts) do
+  { the innermost first: a routine's constant hides the program's (P137) }
+  for i := High(FConsts) downto 0 do
     if SameId(FConsts[i].Name, AName) then
     begin
       V := FConsts[i].Value;
@@ -3552,7 +3562,8 @@ var
 begin
   Result := False;
   P := Default(TProcEnt);
-  for i := 0 to High(FProcs) do
+  { the innermost first: a nested routine hides the program's (P137) }
+  for i := High(FProcs) downto 0 do
     if SameId(FProcs[i].Name, AName) then
     begin
       P := FProcs[i];
@@ -4485,7 +4496,9 @@ var
   same: Boolean;
 begin
   Result := False;
-  for i := 0 to High(FProcs) do
+  { a routine of the scope being read (P137): a nested one may take a
+    name the program's routines have }
+  for i := FProcScope to High(FProcs) do
     if SameId(FProcs[i].Name, AName) and (FProcs[i].NParams = Length(Params)) then
     begin
       same := True;
@@ -4505,21 +4518,28 @@ function TParser.ResolveProc(const AName: string; const Args: TExprArray;
   out P: TProcEnt): Boolean;
 var
   i, j, nseen, nmatch, need: SizeInt;
+  inner: LongInt;
   ok: Boolean;
   hit: TProcEnt;
   c, cost, best: LongInt;
 begin
   Result := False;
   P := Default(TProcEnt);
+  { the innermost routines of the name, which hide the outer ones (P137):
+    the deepest nesting that has one }
+  inner := -1;
+  for i := 0 to High(FProcs) do
+    if SameId(FProcs[i].Name, AName) and (FProcs[i].Nest > inner) then
+      inner := FProcs[i].Nest;
   nseen := 0;
   for i := 0 to High(FProcs) do
-    if SameId(FProcs[i].Name, AName) then
+    if SameId(FProcs[i].Name, AName) and (FProcs[i].Nest = inner) then
       Inc(nseen);
   nmatch := 0;
   best := -1;
   hit := Default(TProcEnt);
   for i := 0 to High(FProcs) do
-    if SameId(FProcs[i].Name, AName) then
+    if SameId(FProcs[i].Name, AName) and (FProcs[i].Nest = inner) then
     begin
       if Length(Args) > FProcs[i].NParams then
         Continue;
@@ -4592,7 +4612,58 @@ begin
     end;
   if FIsFunc and SameId(AName, FFuncName) then
     Die('duplicate identifier ' + AName + ' (it is the function)');
+  if FNest > 0 then
+    LocalDup(AName, 'v');
   CheckMemberName(AName);
+end;
+
+{ The index of constant AName, the innermost, -1 when there is none
+  (P137). }
+function TParser.ConstIdx(const AName: string): SizeInt;
+begin
+  Result := High(FConsts);
+  while (Result >= 0) and not SameId(FConsts[Result].Name, AName) do
+    Result := Result - 1;
+end;
+
+function TParser.TypeNameIdx(const AName: string): SizeInt;
+begin
+  Result := High(FTypeNames);
+  while (Result >= 0) and not SameId(FTypeNames[Result].Name, AName) do
+    Result := Result - 1;
+end;
+
+{ The routine being read has a nested routine AName (P137). }
+function TParser.LocalProcNamed(const AName: string): Boolean;
+var
+  i: SizeInt;
+begin
+  Result := False;
+  for i := FProcScope to High(FProcs) do
+    if SameId(FProcs[i].Name, AName) and (FProcs[i].Nest = FNest) then
+      Result := True;
+end;
+
+{ AName, declared in the routine being read as a constant (Skip c), a
+  type (t), a variable (v) or a nested routine (p), is no other name of
+  that routine: a variable, a parameter, a constant, a type or a nested
+  routine of it (P137). A name of the program's may be hidden. }
+procedure TParser.LocalDup(const AName: string; Skip: Char);
+begin
+  if (Skip <> 'v') and IsLocalName(AName) then
+    Die('duplicate identifier ' + AName + ' (the routine has a variable or a parameter of the name)' +
+      HerePos);
+  if (Skip <> 'c') and (ConstIdx(AName) >= FConstScope) then
+    Die('duplicate identifier ' + AName + ' (the routine has a constant of the name)' + HerePos);
+  if (Skip <> 'c') and (Skip <> 't') and (TypeNameIdx(AName) >= FTypeScope) then
+    Die('duplicate identifier ' + AName + ' (the routine has a type of the name)' + HerePos);
+  if (Skip = 'c') and (ConstIdx(AName) >= FConstScope) then
+    Die('duplicate identifier ' + AName + HerePos);
+  if (Skip = 't') and (TypeNameIdx(AName) >= FTypeScope) then
+    Die('duplicate type ' + AName + HerePos);
+  if (Skip <> 'p') and LocalProcNamed(AName) then
+    Die('duplicate identifier ' + AName + ' (the routine has a nested routine of the name)' +
+      HerePos);
 end;
 
 { A local or a parameter of a method may not take the name of a field
@@ -5282,7 +5353,10 @@ var
   cv: Int64;
 begin
   CheckName(AName);
-  if FindConst(AName, cv) or IsVarName(AName) or FindProc(AName, dummy) then
+  if FNest > 0 then
+    { a routine's constant: of it alone (P137) }
+    LocalDup(AName, 'c')
+  else if FindConst(AName, cv) or IsVarName(AName) or FindProc(AName, dummy) then
     Die('duplicate identifier ' + AName);
   len := Length(FConsts);
   SetLength(FConsts, len + 1);
@@ -7845,6 +7919,14 @@ begin
     end;
     CheckName(FTok.Lexeme);
     name := FTok.Lexeme;
+    { a routine's type is its own (P137) }
+    if FNest > 0 then
+    begin
+      if TypeNameIdx(name) >= FTypeScope then
+        Die('duplicate type ' + name + HerePos);
+      LocalDup(name, 't');
+      AppendStr(FScopeTypes, name);
+    end;
     FTok := FLex.Next;
     Eat(tkEq);
     if FTok.Kind = tkLParen then
@@ -18908,6 +18990,9 @@ var
   savedExc: LongInt;
   savedSelfRef, savedNoSelf: Boolean;
   savedHelper: LongInt;
+  savedCScope, savedTScope, savedPScope, j: SizeInt;
+  savedSTypes: TStrArray;
+  keep: Boolean;
 begin
   anon := FAnonBody;
   FAnonBody := False;
@@ -18953,6 +19038,16 @@ begin
   savedHelper := FHelperTyp;
   if Pr.HelperTyp <> 0 then
     FHelperTyp := Pr.HelperTyp;
+  { the routine's own constants, type names and nested routines start
+    here, and go at its end (P137) }
+  savedCScope := FConstScope;
+  savedTScope := FTypeScope;
+  savedPScope := FProcScope;
+  savedSTypes := FScopeTypes;
+  FConstScope := Length(FConsts);
+  FTypeScope := Length(FTypeNames);
+  FProcScope := Length(FProcs);
+  FScopeTypes := nil;
   { a class helper's method sees the object's members as its own (P127) }
   if (Pr.HelperTyp <> 0) and (TypeOf(Pr.HelperTyp).Lo = 2) and
     (Length(Pr.Params) > 0) and SameId(Pr.Params[0].Name, 'self') then
@@ -19058,6 +19153,32 @@ begin
   SetLength(FSymChain, Length(FSymChain) - 1);
   if not anon then
     Eat(tkSemi);
+  { the routine's names go: its constants, the types it named, its nested
+    routines; the types themselves stay, what was compiled uses them }
+  SetLength(FConsts, FConstScope);
+  j := FTypeScope;
+  for i := FTypeScope to High(FTypeNames) do
+  begin
+    keep := not HasStr(FScopeTypes, FTypeNames[i].Name);
+    if keep then
+    begin
+      FTypeNames[j] := FTypeNames[i];
+      j := j + 1;
+    end;
+  end;
+  SetLength(FTypeNames, j);
+  j := FProcScope;
+  for i := FProcScope to High(FProcs) do
+    if FProcs[i].Nest < FNest then
+    begin
+      FProcs[j] := FProcs[i];
+      j := j + 1;
+    end;
+  SetLength(FProcs, j);
+  FConstScope := savedCScope;
+  FTypeScope := savedTScope;
+  FProcScope := savedPScope;
+  FScopeTypes := savedSTypes;
   FConstNames := savedConst;
   FExcDepth := savedExc;
   FHelperTyp := savedHelper;
@@ -19178,6 +19299,8 @@ begin
   begin
     if SameProc(pr.Name, pr.Params) then
       Die('duplicate identifier ' + pr.Name);
+    if pr.Nest > 0 then
+      LocalDup(pr.Name, 'p');
     AddProcEnt(pr.Name, pr.Sym, pr.IsFunc, Length(pr.Params), pr.RetTyp);
     FProcs[High(FProcs)].Nest := pr.Nest;
     ApplyParams(pr.Name, pr.Params);

@@ -2315,6 +2315,13 @@ later 1
 5
 ```
 
+A routine's constants, types and nested routines are its own, as in
+every Pascal (1.1.12): seen in it and in the routines it nests, gone
+after it, so two routines may each have a nested `Sub` or a constant
+`K`, and a name declared inside hides the program's of the name. Inside
+one routine a variable, a parameter, a constant, a type and a nested
+routine may not share a name.
+
 A routine takes up to 32 parameters. `var` passes the caller's variable,
 `out` the same but for results only, `const` promises not to change it.
 A parameter without them is a copy: a routine that changes its string,
