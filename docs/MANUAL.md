@@ -82,7 +82,11 @@ interface, a `.pi` file, and links its `.o`; it never reparses the unit
 source. The constants, types, routines and variables of the interface
 are the user's; a variable there is the unit's one copy, which the
 program reads and writes. A global of the program with the name of one
-in a unit's implementation is another variable.
+in a unit's implementation is another variable. A name the program
+declares hides the one of that name a unit it uses declares, whatever
+the kind of either, and a variable or a parameter of a routine hides it
+inside the routine; the unit's name still reaches it (`geometry.Area`),
+and a later unit in `uses` hides an earlier one's the same way (§19).
 
 A unit is how a program of your own is split into parts. What the
 language itself provides (strings, maps, trees, heaps, the store, the
@@ -4575,19 +4579,19 @@ arm and the answer in another takes whichever comes first.
 
 ```pascal
 { select with a timer: the arm that is ready first runs. Nobody sends
-  on never, so the timer arm wins; the server answers when asked, so a
+  on never, so the alarm arm wins; the server answers when asked, so a
   plain Recv then parks until its answer comes. When two arms are ready
   at once, the first one written runs. }
 program timeout;
 
 var
-  never, ask, reply, timer, a, b: chan of Integer;
+  never, ask, reply, alarm, a, b: chan of Integer;
   x: Integer;
 
 procedure Timer(Ms: Integer);
 begin
   Sleep(Ms);                       { parks; the thread serves other routines }
-  Send(timer, Ms);
+  Send(alarm, Ms);
 end;
 
 procedure Server;
@@ -4602,12 +4606,12 @@ begin
   never := MakeChan();
   ask := MakeChan();
   reply := MakeChan();
-  timer := MakeChan();
+  alarm := MakeChan();
   pas Server;
   pas Timer(20);
   select                           { parks with a waiter on both channels }
     Recv(never, x): WriteLn('answer ', x);
-    Recv(timer, x): WriteLn('no answer in ', x, ' ms');
+    Recv(alarm, x): WriteLn('no answer in ', x, ' ms');
   end;
   Send(ask, 21);                   { the server wakes and answers }
   x := Recv(reply);
@@ -10430,22 +10434,38 @@ the commands on standard input, under `--debug-mode` and under
 - A hexadecimal literal is the word's bit pattern, so `$8000000000000000`
   and above are negative; a decimal literal above 2^63 - 1 is a compile
   error, and `-9223372036854775808` is written as such.
-- A program's variable or routine may not take the name of a variable of
-  a unit it uses: `duplicate identifier Counter (a variable of unit uv)`.
-- A name is declared once where it is, and the message says where the
-  second one is and what the first is: `duplicate identifier Half (a
-  routine with the same parameters) at 8:10` (1.1.26, P151). A parameter
-  or a local may not take the name of a routine of its unit or program
-  either (`duplicate identifier Format (a routine of the name) at
-  8:16`), where Free Pascal lets it hide the routine (its SysUtils calls
-  a parameter of `FloatToStrF` `format`): inside, a call of the routine
-  would find the parameter, and paslang says so where it is written.
+- A name is declared once where it is, whatever its kinds (a variable
+  and a routine, a type and a constant), and the message says where
+  the second one is and what the first is: `duplicate identifier Half
+  (a routine with the same parameters) at 8:10` (1.1.26, P151),
+  `duplicate identifier Count (a variable of the name) at 7:3` (1.1.30,
+  P158; a type, a variable and a routine of one name compiled in
+  silence). A parameter or a local may not take the name of a routine
+  of its unit or program either (`duplicate identifier Format (a routine
+  of the name) at 8:16`), where Free Pascal lets it hide the routine
+  (its SysUtils calls a parameter of `FloatToStrF` `format`): inside, a
+  call of the routine would find the parameter, and paslang says so
+  where it is written.
+- A name a program declares hides a used unit's of that name, whatever
+  the kind of either, as in Free Pascal: a program with SysUtils in its
+  `uses` may have a variable `Date`, a constant `EmptyStr`, a type
+  `TBytes` or a routine `Trim` of its own, and a routine's variable or
+  parameter hides a unit's routine, constant or type inside the routine
+  (1.1.30, P158; they were duplicates of the unit's, which made every
+  name of a unit a reserved word for its users, and from 1.0.136 a
+  program's variable of a unit variable's name was refused). A
+  program's routine hides the unit's routine of the same parameters;
+  one of other parameters is an overload of it, where Free Pascal hides
+  every routine of the name unless the program's says `overload`.
 - When two units a program uses have a name in common, the later one in
-  `uses` hides the earlier one's, as in Free Pascal (a routine of the
-  same parameters, a constant, a variable, a type that is another); a
-  unit's name reaches its own names, hidden or not: `ua.Twice`,
-  `ua.Count`, `var b: ua.TBox` (1.1.13), and `x is ua.TSquare`,
-  `x as ua.TShape`. Two units may each declare a class, an interface,
+  `uses` hides the earlier one's, as in Free Pascal, whatever the kind
+  of either (a routine of the same parameters, a constant, a variable, a
+  type; of another kind from 1.1.30, P158); a unit's names hide the ones
+  of a unit its implementation uses. A unit's name reaches its own
+  names, hidden or not: `ua.Twice`, `ua.Count`, `var b: ua.TBox`
+  (1.1.13), `x is ua.TSquare`, `x as ua.TShape`, and a type wherever a
+  type goes: `SizeOf(ua.TBox)`, `High(ua.TColor)`, `class(ua.TBase)`,
+  `class of ua.TShape`, `^ua.TBox`, `on E: ua.EFail` (1.1.30, P158). Two units may each declare a class, an interface,
   a helper or a record of one name: each is the unit's own, in the
   object code too (its table is `vmt_ua_tshape`, its methods
   `p_ua_tshape_name`), and `ua.TShape` and `ub.TShape` are two classes

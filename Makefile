@@ -86,8 +86,8 @@ LVL_A64 := v8.2+crypto
 A64_OBJDUMP ?= aarch64-linux-gnu-objdump
 
 # The golden tests: testdata/<t>.paslang must print testdata/<t>.out.
-GOLDEN := hello arith ifthen loops const caseof procs recfn records ptrs arrs strs grow paswork pingpong chclose sel exc excg nest cls gen enums sets dbg opt gdbg inherit rtti args8 mevent slice chlit armmeth propacc runes variant opadd args20 iface opmore props pindex dwarfloc shift dynnil xor inhcall isas sysid forward defaults abstract overload methov strdef trig logexp arctan invpow logx trig2 hyper miscmath xxh32 xxh64 map1 map2 sync1 sync2 finexit zerolocal pchar selx selstress wrchar chstr lookpath strcmp dupparam recarg funcval constk regloop reszero divconst bareln gctypes chr charcat heapspan blobzero gcbasic mapsplit stackmap trygrow growgc xxh3 mapgetstr bounds fairq sized fwdptr constexpr int2real typedconst caserange emptystmt writefmt realparse realfmt valpar strcow chanany chanbuf memmove overnarrow slicegrow fatexit narrow narrowmem recalign narrowbounds dwarfnarrow narrowgo forlimit bce inplace narrowasm slicereg forrun addrform bcerun inspine framearr realstep f32conv single dwarfreal ptrtyped ptrarith ptrsafe memview checkptr ptrreach cpwalk realint quadcore quadfmt quad quadconst dwarfquad bitops declorder convchain bitwords bitmem bitany views blocks wide ifdef quadfast memwords cpuwords vectors vecmore inlineasm vecpool addrlocal rotwords rotmem ctxwords append funcval2 closures pasargs ifaceargs vshrs64 auditfix closurebox audit2 visibility freedestroy reservedall nodeadlock mapfix tree1 tree2 hash1 store1 immwide constref inline1 stackargs mainexit networds charcmp unixsock sigpipe sleepmany deadlines strfill narrowpop tobject1 excobj1 excobj2 excobj3 classref1 ctorargs aconst1 aconst2 methdef1 set256 subrange1 subrange2 helper1 helper2 strwords strkern slicedit strcmpk scope1 classfwd ifacebind overconv overrank valunsigned sysutils1 sysutils2 initvar extended1 valround valround2 cmpwords fmtfloat1 fmtfloat2 format1 realtext quadtext valrange
-GOLDEN_A64 := map1 map2 sync1 sync2 finexit zerolocal pchar pingpong sel chclose paswork selx selstress wrchar args8 arith arrs caseof chlit cls const enums exc excg gen grow hyper ifthen inherit loops mevent miscmath nest procs ptrs recfn records sets strs trig2 xxh32 xxh64 rtti gdbg chstr strcmp recarg funcval constk regloop reszero divconst bareln gctypes chr charcat heapspan blobzero gcbasic mapsplit stackmap trygrow growgc xxh3 mapgetstr bounds fairq sized fwdptr constexpr int2real typedconst caserange emptystmt writefmt realparse realfmt valpar strcow chanany chanbuf memmove overnarrow slicegrow fatexit narrow narrowmem recalign narrowbounds dwarfnarrow narrowgo forlimit bce inplace narrowasm slicereg forrun addrform bcerun inspine framearr realstep f32conv single dwarfreal ptrtyped ptrarith ptrsafe memview checkptr ptrreach cpwalk realint quadcore quadfmt quad quadconst dwarfquad bitops declorder convchain bitwords bitmem bitany views blocks wide ifdef quadfast memwords cpuwords vectors vecmore inlineasm vecpool addrlocal rotwords rotmem ctxwords append funcval2 closures pasargs ifaceargs vshrs64 auditfix closurebox audit2 visibility freedestroy reservedall nodeadlock mapfix tree1 tree2 hash1 store1 immwide constref inline1 stackargs mainexit networds charcmp unixsock sigpipe sleepmany deadlines strfill narrowpop tobject1 excobj1 excobj2 excobj3 classref1 ctorargs aconst1 aconst2 methdef1 set256 subrange1 subrange2 helper1 helper2 strwords strkern slicedit strcmpk scope1 classfwd ifacebind overconv overrank valunsigned sysutils1 sysutils2 initvar extended1 valround valround2 cmpwords fmtfloat1 fmtfloat2 format1 realtext quadtext valrange
+GOLDEN := hello arith ifthen loops const caseof procs recfn records ptrs arrs strs grow paswork pingpong chclose sel exc excg nest cls gen enums sets dbg opt gdbg inherit rtti args8 mevent slice chlit armmeth propacc runes variant opadd args20 iface opmore props pindex dwarfloc shift dynnil xor inhcall isas sysid forward defaults abstract overload methov strdef trig logexp arctan invpow logx trig2 hyper miscmath xxh32 xxh64 map1 map2 sync1 sync2 finexit zerolocal pchar selx selstress wrchar chstr lookpath strcmp dupparam recarg funcval constk regloop reszero divconst bareln gctypes chr charcat heapspan blobzero gcbasic mapsplit stackmap trygrow growgc xxh3 mapgetstr bounds fairq sized fwdptr constexpr int2real typedconst caserange emptystmt writefmt realparse realfmt valpar strcow chanany chanbuf memmove overnarrow slicegrow fatexit narrow narrowmem recalign narrowbounds dwarfnarrow narrowgo forlimit bce inplace narrowasm slicereg forrun addrform bcerun inspine framearr realstep f32conv single dwarfreal ptrtyped ptrarith ptrsafe memview checkptr ptrreach cpwalk realint quadcore quadfmt quad quadconst dwarfquad bitops declorder convchain bitwords bitmem bitany views blocks wide ifdef quadfast memwords cpuwords vectors vecmore inlineasm vecpool addrlocal rotwords rotmem ctxwords append funcval2 closures pasargs ifaceargs vshrs64 auditfix closurebox audit2 visibility freedestroy reservedall nodeadlock mapfix tree1 tree2 hash1 store1 immwide constref inline1 stackargs mainexit networds charcmp unixsock sigpipe sleepmany deadlines strfill narrowpop tobject1 excobj1 excobj2 excobj3 classref1 ctorargs aconst1 aconst2 methdef1 set256 subrange1 subrange2 helper1 helper2 strwords strkern slicedit strcmpk scope1 classfwd ifacebind overconv overrank valunsigned sysutils1 sysutils2 initvar extended1 valround valround2 cmpwords fmtfloat1 fmtfloat2 format1 realtext quadtext valrange hidesys
+GOLDEN_A64 := map1 map2 sync1 sync2 finexit zerolocal pchar pingpong sel chclose paswork selx selstress wrchar args8 arith arrs caseof chlit cls const enums exc excg gen grow hyper ifthen inherit loops mevent miscmath nest procs ptrs recfn records sets strs trig2 xxh32 xxh64 rtti gdbg chstr strcmp recarg funcval constk regloop reszero divconst bareln gctypes chr charcat heapspan blobzero gcbasic mapsplit stackmap trygrow growgc xxh3 mapgetstr bounds fairq sized fwdptr constexpr int2real typedconst caserange emptystmt writefmt realparse realfmt valpar strcow chanany chanbuf memmove overnarrow slicegrow fatexit narrow narrowmem recalign narrowbounds dwarfnarrow narrowgo forlimit bce inplace narrowasm slicereg forrun addrform bcerun inspine framearr realstep f32conv single dwarfreal ptrtyped ptrarith ptrsafe memview checkptr ptrreach cpwalk realint quadcore quadfmt quad quadconst dwarfquad bitops declorder convchain bitwords bitmem bitany views blocks wide ifdef quadfast memwords cpuwords vectors vecmore inlineasm vecpool addrlocal rotwords rotmem ctxwords append funcval2 closures pasargs ifaceargs vshrs64 auditfix closurebox audit2 visibility freedestroy reservedall nodeadlock mapfix tree1 tree2 hash1 store1 immwide constref inline1 stackargs mainexit networds charcmp unixsock sigpipe sleepmany deadlines strfill narrowpop tobject1 excobj1 excobj2 excobj3 classref1 ctorargs aconst1 aconst2 methdef1 set256 subrange1 subrange2 helper1 helper2 strwords strkern slicedit strcmpk scope1 classfwd ifacebind overconv overrank valunsigned sysutils1 sysutils2 initvar extended1 valround valround2 cmpwords fmtfloat1 fmtfloat2 format1 realtext quadtext valrange hidesys
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -1217,13 +1217,11 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  'succlast:Succ past the last value of TColor at 4:21' \
 	  'predfirst:Pred before the first value of TColor at 4:20' \
 	  'subrreal:a real does not go into TSmall: Trunc or Round says how at 7:10' \
-	  'unitvardup:duplicate identifier DieWhere (a variable of unit paslib) at 5:5' \
 	  'dupglobal:duplicate identifier a at 4:5' \
 	  'dechuge:constant 9223372036854775809 does not fit Integer at 6:8' \
 	  'dec63:constant 9223372036854775808 does not fit Integer: -9223372036854775808 is the lowest at 6:8' \
 	  'hexhuge:constant $$10000000000000001 does not fit Integer at 6:9' \
 	  'highmap:High takes an array, a slice, a string, an ordinal or a tree, not map[Integer] of Integer at 9:15' \
-	  'unitprocdup:duplicate identifier DieWhere (a variable of unit paslib)' \
 	  'visprivfield:FPriv is private to TVisBase at 11:5' \
 	  'visstrictpriv:FSecret is strict private to TA at 23:13' \
 	  'visprot:FProt is protected to TVisBase at 12:13' \
@@ -1685,6 +1683,37 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/hideuse-arm testdata/units/hideuse.paslang; \
 	timeout 60 $(QEMU_A64) $(BUILDDIR)/hideuse-arm > $(BUILDDIR)/hideuse-arm.got; \
 	diff -u testdata/units/hideuse.out $(BUILDDIR)/hideuse-arm.got; \
+	: a program hides every kind of a unit name with every kind of its own, P158; \
+	$(OUTDIR)/paslangc testdata/units/hidek.paslang; \
+	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/hidekuse testdata/units/hidekuse.paslang; \
+	$(BUILDDIR)/hidekuse > $(BUILDDIR)/hidekuse.got; \
+	diff -u testdata/units/hidekuse.out $(BUILDDIR)/hidekuse.got; \
+	$(OUTDIR)/paslangc -target arm64 testdata/units/hidek.paslang; \
+	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/hidekuse-arm testdata/units/hidekuse.paslang; \
+	timeout 60 $(QEMU_A64) $(BUILDDIR)/hidekuse-arm > $(BUILDDIR)/hidekuse-arm.got; \
+	diff -u testdata/units/hidekuse.out $(BUILDDIR)/hidekuse-arm.got; \
+	: a later unit hides an earlier unit name of another kind, and a unit type is reached in every place, P158; \
+	$(OUTDIR)/paslangc testdata/units/hidea.paslang; \
+	$(OUTDIR)/paslangc testdata/units/hideb.paslang; \
+	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/hideab testdata/units/hideab.paslang; \
+	$(BUILDDIR)/hideab > $(BUILDDIR)/hideab.got; \
+	diff -u testdata/units/hideab.out $(BUILDDIR)/hideab.got; \
+	$(OUTDIR)/paslangc -target arm64 testdata/units/hidea.paslang; \
+	$(OUTDIR)/paslangc -target arm64 testdata/units/hideb.paslang; \
+	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/hideab-arm testdata/units/hideab.paslang; \
+	timeout 60 $(QEMU_A64) $(BUILDDIR)/hideab-arm > $(BUILDDIR)/hideab-arm.got; \
+	diff -u testdata/units/hideab.out $(BUILDDIR)/hideab-arm.got; \
+	: a unit names hide those of a unit its implementation uses, P158; \
+	$(OUTDIR)/paslangc testdata/units/hidelo.paslang; \
+	$(OUTDIR)/paslangc -Fu $(BUILDDIR) testdata/units/hidehi.paslang; \
+	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/hideimpl testdata/units/hideimpl.paslang; \
+	$(BUILDDIR)/hideimpl > $(BUILDDIR)/hideimpl.got; \
+	diff -u testdata/units/hideimpl.out $(BUILDDIR)/hideimpl.got; \
+	$(OUTDIR)/paslangc -target arm64 testdata/units/hidelo.paslang; \
+	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) testdata/units/hidehi.paslang; \
+	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/hideimpl-arm testdata/units/hideimpl.paslang; \
+	timeout 60 $(QEMU_A64) $(BUILDDIR)/hideimpl-arm > $(BUILDDIR)/hideimpl-arm.got; \
+	diff -u testdata/units/hideimpl.out $(BUILDDIR)/hideimpl-arm.got; \
 	: two units that declare the same class, interface, record and helper names, P154; \
 	$(OUTDIR)/paslangc testdata/units/twina.paslang; \
 	$(OUTDIR)/paslangc testdata/units/twinb.paslang; \
@@ -2005,7 +2034,13 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  'varconst:duplicate identifier Count (a variable of the name) at 7:3' \
 	  'varproc:duplicate identifier Show (a routine of the name) at 9:3' \
 	  'aliastwice:duplicate type TPoint at 7:3' 'enumtwice:duplicate type TKind at 7:3' \
-	  'reftwice:duplicate type TShapeClass at 7:3'; do \
+	  'reftwice:duplicate type TShapeClass at 7:3' \
+	  'procvar:duplicate identifier Show (a variable of the name) at 6:11' \
+	  'typevar:duplicate identifier TCount (a type of the name) at 7:3' \
+	  'vartype:duplicate identifier Count (a variable of the name) at 7:3' \
+	  'consttype:duplicate identifier Size (a constant of the name) at 7:3' \
+	  'typeproc:duplicate identifier TShow (a type of the name) at 6:11' \
+	  'enumvar:duplicate identifier Green (a constant of the name) at 7:3'; do \
 	  n=$${f%%:*}; w=$${f#*:}; \
 	  if $(OUTDIR)/paslangc -o $(BUILDDIR)/dupw_$$n testdata/dupwhere/$$n.paslang >$(BUILDDIR)/dupw_$$n.err 2>&1; then \
 	    echo "$$n should fail"; exit 1; \
