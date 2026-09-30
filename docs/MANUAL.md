@@ -2784,7 +2784,13 @@ any view: `q := PByte(GetMem(64, 0))`. `FreeMem(p)` does nothing, the
 collector gives back what nothing reaches. `Move(a, b, n)` copies `n` bytes
 between two variables; to copy through pointers write `Move(p^, q^, n)`.
 `FillChar(x, n, v)` writes the byte (or `Char`) `v` `n` times from `x`
-on. `Low`, `High` and `Length` work on static arrays, slices and
+on. `CompareByte(a, b, n)` is the difference of the first bytes of `a`
+and `b` that differ, 0 when their `n` bytes are equal, and `IndexByte(x,
+n, v)` the place from 0 of the byte `v` among the first `n` of `x`, -1
+when it is not there: Free Pascal's System words, on the processor's
+vectors (AVX2, SSE2, NEON; `docs/KERNELS.md`). A count not above 0
+reads nothing, where Free Pascal reads without an end (1.1.22, P147).
+`Low`, `High` and `Length` work on static arrays, slices and
 strings: a string's `Low` is 1, its first index, and its `High` its
 length (1.0.136; `Low` gave 0). `Length` also counts the entries of a
 map, a tree or a heap and is 1 for a `Char`, and `Low(h)` of a heap is
@@ -10266,8 +10272,8 @@ its place:
 - the slice words `Append` and `Cap`;
 - the ordinal, string, slice, map and memory words `Ord Chr Succ Pred Low
   High Odd SizeOf Length Copy Delete Clear TryGet Default Assigned
-  SetLength Inc Dec GetMem FreeMem Move FillChar View MemBase MemSize
-  MemEnd`, and Pascal's string words `Pos Insert Concat UpCase LowerCase
+  SetLength Inc Dec GetMem FreeMem Move FillChar CompareByte IndexByte
+  View MemBase MemSize MemEnd`, and Pascal's string words `Pos Insert Concat UpCase LowerCase
   StringOfChar Str Val` (1.1.10);
 - the tree, heap and store words (§11): `Rank KeyAt PopLow PopHigh Split
   Join Include Exclude Push Pop StoreOpen StorePut StoreGet StoreDelete

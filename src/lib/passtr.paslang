@@ -55,6 +55,12 @@ function PasIndexBytePlain(P: Pointer; N, C: Int64): Int64;
 function PasMemEqCpu(A, B: Pointer; N: Int64): Boolean;
 function PasMemEqBase(A, B: Pointer; N: Int64): Boolean;
 function PasMemEqPlain(A, B: Pointer; N: Int64): Boolean;
+function PasCmpByteCpu(A, B: Pointer; N: Int64): Int64;
+function PasCmpByteBase(A, B: Pointer; N: Int64): Int64;
+function PasCmpBytePlain(A, B: Pointer; N: Int64): Int64;
+function PasCaseCmpCpu(A, B: Pointer; N: Int64): Int64;
+function PasCaseCmpBase(A, B: Pointer; N: Int64): Int64;
+function PasCaseCmpPlain(A, B: Pointer; N: Int64): Int64;
 procedure PasCaseMapCpu(Src, Dst: Pointer; N: Int64; Upper: Boolean);
 procedure PasCaseMapBase(Src, Dst: Pointer; N: Int64; Upper: Boolean);
 procedure PasCaseMapPlain(Src, Dst: Pointer; N: Int64; Upper: Boolean);
@@ -152,7 +158,7 @@ begin
     jmp 9f
     5:
     testq %rbx, %rbx
-    je 3b
+    jle 3b
     leaq 16(%rsi), %rax
     testw $0xff0, %ax
     je 6f
@@ -205,7 +211,8 @@ begin
     9:
   end;
   asm arm64 (P: in x0; C: in x1; N: in x2; Result: out x0)
-    cbz x2, 9f
+    cmp x2, #0
+    b.le 9f
     mov x11, x0
     movz w5, #0x0401
     movk w5, #0x4010, lsl #16
@@ -307,7 +314,7 @@ begin
     jmp 9f
     5:
     testq %rbx, %rbx
-    je 3b
+    jle 3b
     leaq 16(%rsi), %rax
     testw $0xff0, %ax
     je 6f
@@ -333,7 +340,8 @@ begin
     9:
   end;
   asm arm64 (P: in x0; C: in x1; N: in x2; Result: out x0)
-    cbz x2, 9f
+    cmp x2, #0
+    b.le 9f
     mov x11, x0
     movz w5, #0x0401
     movk w5, #0x4010, lsl #16
@@ -742,6 +750,792 @@ begin
     9:
     mov x0, xzr
     11:
+  end;
+end;
+
+{ ---- CmpByte ---- }
+
+{ CompareByte (P147): the difference of the first bytes of A and B that
+  differ, 0 when their N bytes are equal or N is not above 0: the
+  reference the kernels are held to. }
+function PasCmpBytePlain(A, B: Pointer; N: Int64): Int64;
+var
+  i: Int64;
+begin
+  Result := 0;
+  for i := 0 to N - 1 do
+    if PByte(A)[i] <> PByte(B)[i] then
+    begin
+      Result := Int64(PByte(A)[i]) - Int64(PByte(B)[i]);
+      Exit;
+    end;
+end;
+
+{ After Go's cmpbody (compare_amd64.s), with the place of the first
+  difference kept, since the result is its bytes' difference: AVX2's
+  vpcmpeqb over 64 bytes a step, then 32, the last 32 read ending at the
+  end; the mask of equal bytes inverted by xor (not sets no flag) and bsf
+  for the first one that differs. Under 32 bytes the SSE2 path of the
+  base. On arm64 NEON, part of the base: cmeq over 16 bytes, not, and a
+  64-bit syndrome of four bits a byte (shrn by 4), rbit and clz for the
+  first; under 16, two 8-byte words and eor, under 8 a byte at a time. }
+function PasCmpByteCpu(A, B: Pointer; N: Int64): Int64;
+begin
+  asm amd64 (A: in rsi; B: in rdi; N: in rbx; Result: out rax)
+    xorl %eax, %eax
+    cmpq $32, %rbx
+    jl 20f
+    1:
+    cmpq $64, %rbx
+    jb 3f
+    vmovdqu (%rsi), %ymm0
+    vmovdqu 32(%rsi), %ymm1
+    vpcmpeqb (%rdi), %ymm0, %ymm0
+    vpcmpeqb 32(%rdi), %ymm1, %ymm1
+    vpand %ymm0, %ymm1, %ymm2
+    vpmovmskb %ymm2, %edx
+    cmpl $0xffffffff, %edx
+    jne 2f
+    addq $64, %rsi
+    addq $64, %rdi
+    subq $64, %rbx
+    jmp 1b
+    2:
+    vpmovmskb %ymm0, %edx
+    xorl $0xffffffff, %edx
+    jnz 6f
+    vpmovmskb %ymm1, %edx
+    xorl $0xffffffff, %edx
+    addq $32, %rsi
+    addq $32, %rdi
+    jmp 6f
+    3:
+    cmpq $32, %rbx
+    jb 4f
+    vmovdqu (%rsi), %ymm0
+    vpcmpeqb (%rdi), %ymm0, %ymm0
+    vpmovmskb %ymm0, %edx
+    xorl $0xffffffff, %edx
+    jnz 6f
+    addq $32, %rsi
+    addq $32, %rdi
+    subq $32, %rbx
+    4:
+    testq %rbx, %rbx
+    jz 8f
+    leaq -32(%rsi,%rbx), %rsi
+    leaq -32(%rdi,%rbx), %rdi
+    vmovdqu (%rsi), %ymm0
+    vpcmpeqb (%rdi), %ymm0, %ymm0
+    vpmovmskb %ymm0, %edx
+    xorl $0xffffffff, %edx
+    jz 8f
+    6:
+    vzeroupper
+    bsfl %edx, %edx
+    movzbl (%rsi,%rdx), %eax
+    movzbl (%rdi,%rdx), %ecx
+    subq %rcx, %rax
+    jmp 9f
+    8:
+    vzeroupper
+    xorl %eax, %eax
+    jmp 9f
+    20:
+    cmpq $16, %rbx
+    jl 30f
+    movdqu (%rsi), %xmm0
+    movdqu (%rdi), %xmm1
+    pcmpeqb %xmm1, %xmm0
+    pmovmskb %xmm0, %edx
+    xorl $0xffff, %edx
+    jnz 26f
+    leaq -16(%rsi,%rbx), %rsi
+    leaq -16(%rdi,%rbx), %rdi
+    movdqu (%rsi), %xmm0
+    movdqu (%rdi), %xmm1
+    pcmpeqb %xmm1, %xmm0
+    pmovmskb %xmm0, %edx
+    xorl $0xffff, %edx
+    jz 9f
+    26:
+    bsfl %edx, %edx
+    movzbl (%rsi,%rdx), %eax
+    movzbl (%rdi,%rdx), %ecx
+    subq %rcx, %rax
+    jmp 9f
+    30:
+    cmpq $8, %rbx
+    jl 32f
+    movq (%rsi), %rcx
+    movq (%rdi), %rdx
+    xorq %rcx, %rdx
+    jnz 31f
+    leaq -8(%rsi,%rbx), %rsi
+    leaq -8(%rdi,%rbx), %rdi
+    movq (%rsi), %rcx
+    movq (%rdi), %rdx
+    xorq %rcx, %rdx
+    jz 9f
+    31:
+    bsfq %rdx, %rdx
+    shrq $3, %rdx
+    movzbl (%rsi,%rdx), %eax
+    movzbl (%rdi,%rdx), %ecx
+    subq %rcx, %rax
+    jmp 9f
+    32:
+    testq %rbx, %rbx
+    jle 9f
+    33:
+    movzbl (%rsi), %eax
+    movzbl (%rdi), %ecx
+    subq %rcx, %rax
+    jnz 9f
+    incq %rsi
+    incq %rdi
+    decq %rbx
+    jnz 33b
+    9:
+  end;
+  asm arm64 (A: in x0; B: in x1; N: in x2; Result: out x0)
+    mov x3, x0
+    mov x0, #0
+    cmp x2, #16
+    b.lt 20f
+    1:
+    ldr q0, [x3]
+    ldr q1, [x1]
+    cmeq v2.16b, v0.16b, v1.16b
+    not v2.16b, v2.16b
+    shrn v3.8b, v2.8h, #4
+    fmov x4, d3
+    cbnz x4, 6f
+    add x3, x3, #16
+    add x1, x1, #16
+    sub x2, x2, #16
+    cmp x2, #16
+    b.hs 1b
+    cbz x2, 9f
+    sub x5, x2, #16
+    add x3, x3, x5
+    add x1, x1, x5
+    ldr q0, [x3]
+    ldr q1, [x1]
+    cmeq v2.16b, v0.16b, v1.16b
+    not v2.16b, v2.16b
+    shrn v3.8b, v2.8h, #4
+    fmov x4, d3
+    cbz x4, 9f
+    6:
+    rbit x4, x4
+    clz x4, x4
+    lsr x4, x4, #2
+    ldrb w5, [x3, x4]
+    ldrb w6, [x1, x4]
+    sub x0, x5, x6
+    b 9f
+    20:
+    cmp x2, #8
+    b.lt 22f
+    ldr x5, [x3]
+    ldr x6, [x1]
+    eor x7, x5, x6
+    cbnz x7, 21f
+    sub x4, x2, #8
+    add x3, x3, x4
+    add x1, x1, x4
+    ldr x5, [x3]
+    ldr x6, [x1]
+    eor x7, x5, x6
+    cbz x7, 9f
+    21:
+    rbit x7, x7
+    clz x7, x7
+    lsr x7, x7, #3
+    ldrb w5, [x3, x7]
+    ldrb w6, [x1, x7]
+    sub x0, x5, x6
+    b 9f
+    22:
+    cmp x2, #0
+    b.le 9f
+    23:
+    ldrb w5, [x3], #1
+    ldrb w6, [x1], #1
+    subs x0, x5, x6
+    b.ne 9f
+    subs x2, x2, #1
+    b.ne 23b
+    9:
+  end;
+end;
+
+{ The base: SSE2's pcmpeqb over 16 bytes a step, the last 16 read ending
+  at the end; under 16 as the Cpu body. On arm64 the NEON body. }
+function PasCmpByteBase(A, B: Pointer; N: Int64): Int64;
+begin
+  asm amd64 (A: in rsi; B: in rdi; N: in rbx; Result: out rax)
+    xorl %eax, %eax
+    cmpq $16, %rbx
+    jl 30f
+    1:
+    movdqu (%rsi), %xmm0
+    movdqu (%rdi), %xmm1
+    pcmpeqb %xmm1, %xmm0
+    pmovmskb %xmm0, %edx
+    xorl $0xffff, %edx
+    jnz 26f
+    addq $16, %rsi
+    addq $16, %rdi
+    subq $16, %rbx
+    cmpq $16, %rbx
+    jae 1b
+    testq %rbx, %rbx
+    jz 9f
+    leaq -16(%rsi,%rbx), %rsi
+    leaq -16(%rdi,%rbx), %rdi
+    movdqu (%rsi), %xmm0
+    movdqu (%rdi), %xmm1
+    pcmpeqb %xmm1, %xmm0
+    pmovmskb %xmm0, %edx
+    xorl $0xffff, %edx
+    jz 9f
+    26:
+    bsfl %edx, %edx
+    movzbl (%rsi,%rdx), %eax
+    movzbl (%rdi,%rdx), %ecx
+    subq %rcx, %rax
+    jmp 9f
+    30:
+    cmpq $8, %rbx
+    jl 32f
+    movq (%rsi), %rcx
+    movq (%rdi), %rdx
+    xorq %rcx, %rdx
+    jnz 31f
+    leaq -8(%rsi,%rbx), %rsi
+    leaq -8(%rdi,%rbx), %rdi
+    movq (%rsi), %rcx
+    movq (%rdi), %rdx
+    xorq %rcx, %rdx
+    jz 9f
+    31:
+    bsfq %rdx, %rdx
+    shrq $3, %rdx
+    movzbl (%rsi,%rdx), %eax
+    movzbl (%rdi,%rdx), %ecx
+    subq %rcx, %rax
+    jmp 9f
+    32:
+    testq %rbx, %rbx
+    jle 9f
+    33:
+    movzbl (%rsi), %eax
+    movzbl (%rdi), %ecx
+    subq %rcx, %rax
+    jnz 9f
+    incq %rsi
+    incq %rdi
+    decq %rbx
+    jnz 33b
+    9:
+  end;
+  asm arm64 (A: in x0; B: in x1; N: in x2; Result: out x0)
+    mov x3, x0
+    mov x0, #0
+    cmp x2, #16
+    b.lt 20f
+    1:
+    ldr q0, [x3]
+    ldr q1, [x1]
+    cmeq v2.16b, v0.16b, v1.16b
+    not v2.16b, v2.16b
+    shrn v3.8b, v2.8h, #4
+    fmov x4, d3
+    cbnz x4, 6f
+    add x3, x3, #16
+    add x1, x1, #16
+    sub x2, x2, #16
+    cmp x2, #16
+    b.hs 1b
+    cbz x2, 9f
+    sub x5, x2, #16
+    add x3, x3, x5
+    add x1, x1, x5
+    ldr q0, [x3]
+    ldr q1, [x1]
+    cmeq v2.16b, v0.16b, v1.16b
+    not v2.16b, v2.16b
+    shrn v3.8b, v2.8h, #4
+    fmov x4, d3
+    cbz x4, 9f
+    6:
+    rbit x4, x4
+    clz x4, x4
+    lsr x4, x4, #2
+    ldrb w5, [x3, x4]
+    ldrb w6, [x1, x4]
+    sub x0, x5, x6
+    b 9f
+    20:
+    cmp x2, #8
+    b.lt 22f
+    ldr x5, [x3]
+    ldr x6, [x1]
+    eor x7, x5, x6
+    cbnz x7, 21f
+    sub x4, x2, #8
+    add x3, x3, x4
+    add x1, x1, x4
+    ldr x5, [x3]
+    ldr x6, [x1]
+    eor x7, x5, x6
+    cbz x7, 9f
+    21:
+    rbit x7, x7
+    clz x7, x7
+    lsr x7, x7, #3
+    ldrb w5, [x3, x7]
+    ldrb w6, [x1, x7]
+    sub x0, x5, x6
+    b 9f
+    22:
+    cmp x2, #0
+    b.le 9f
+    23:
+    ldrb w5, [x3], #1
+    ldrb w6, [x1], #1
+    subs x0, x5, x6
+    b.ne 9f
+    subs x2, x2, #1
+    b.ne 23b
+    9:
+  end;
+end;
+
+{ ---- CaseCmp ---- }
+
+{ CompareText's comparison (P147): the difference of the first bytes of A
+  and B that differ once the ASCII letters of both are capitals, 0 when
+  their N bytes are equal so, or N is not above 0: the reference the
+  kernels are held to. }
+function PasCaseCmpPlain(A, B: Pointer; N: Int64): Int64;
+var
+  i, c, d: Int64;
+begin
+  Result := 0;
+  for i := 0 to N - 1 do
+  begin
+    c := PByte(A)[i];
+    d := PByte(B)[i];
+    if (c >= 97) and (c <= 122) then
+      c := c - 32;
+    if (d >= 97) and (d <= 122) then
+      d := d - 32;
+    if c <> d then
+    begin
+      Result := c - d;
+      Exit;
+    end;
+  end;
+end;
+
+{ CmpByte's walk with both runs made capitals first, as CaseMap makes
+  them: a byte less 'a' that is at most 25 is a letter, whose bit 32
+  goes (vpsubb, vpminub and vpcmpeqb mark them, vpand keeps 32 of the
+  mark, vpxor clears it); AVX2 32 bytes a step, the last 32 read ending
+  at the end, then the place of the first difference by bsf and its two
+  bytes made capitals again. Under 32 bytes the SSE2 body of the base.
+  On arm64 NEON, part of the base: sub, cmhi against 26, and and eor
+  make the capitals over 16 bytes, cmeq, not and shrn find the place. }
+function PasCaseCmpCpu(A, B: Pointer; N: Int64): Int64;
+begin
+  asm amd64 (A: in rsi; B: in rdi; N: in rbx; Result: out rax)
+    xorl %eax, %eax
+    cmpq $32, %rbx
+    jl 20f
+    movl $0x61616161, %ecx
+    vmovd %ecx, %xmm7
+    vpbroadcastd %xmm7, %ymm7
+    movl $0x19191919, %ecx
+    vmovd %ecx, %xmm6
+    vpbroadcastd %xmm6, %ymm6
+    movl $0x20202020, %ecx
+    vmovd %ecx, %xmm5
+    vpbroadcastd %xmm5, %ymm5
+    1:
+    vmovdqu (%rsi), %ymm0
+    vmovdqu (%rdi), %ymm1
+    vpsubb %ymm7, %ymm0, %ymm2
+    vpminub %ymm6, %ymm2, %ymm3
+    vpcmpeqb %ymm3, %ymm2, %ymm2
+    vpand %ymm5, %ymm2, %ymm2
+    vpxor %ymm2, %ymm0, %ymm0
+    vpsubb %ymm7, %ymm1, %ymm2
+    vpminub %ymm6, %ymm2, %ymm3
+    vpcmpeqb %ymm3, %ymm2, %ymm2
+    vpand %ymm5, %ymm2, %ymm2
+    vpxor %ymm2, %ymm1, %ymm1
+    vpcmpeqb %ymm1, %ymm0, %ymm0
+    vpmovmskb %ymm0, %edx
+    xorl $0xffffffff, %edx
+    jnz 6f
+    addq $32, %rsi
+    addq $32, %rdi
+    subq $32, %rbx
+    cmpq $32, %rbx
+    jae 1b
+    testq %rbx, %rbx
+    jz 8f
+    leaq -32(%rsi,%rbx), %rsi
+    leaq -32(%rdi,%rbx), %rdi
+    movq $32, %rbx
+    jmp 1b
+    6:
+    vzeroupper
+    bsfl %edx, %edx
+    jmp 40f
+    8:
+    vzeroupper
+    xorl %eax, %eax
+    jmp 9f
+    20:
+    cmpq $16, %rbx
+    jl 30f
+    movl $0x61616161, %ecx
+    movd %ecx, %xmm7
+    pshufd $0, %xmm7, %xmm7
+    movl $0x19191919, %ecx
+    movd %ecx, %xmm6
+    pshufd $0, %xmm6, %xmm6
+    movl $0x20202020, %ecx
+    movd %ecx, %xmm5
+    pshufd $0, %xmm5, %xmm5
+    21:
+    movdqu (%rsi), %xmm0
+    movdqu (%rdi), %xmm1
+    movdqa %xmm0, %xmm2
+    psubb %xmm7, %xmm2
+    movdqa %xmm2, %xmm3
+    pminub %xmm6, %xmm3
+    pcmpeqb %xmm3, %xmm2
+    pand %xmm5, %xmm2
+    pxor %xmm2, %xmm0
+    movdqa %xmm1, %xmm2
+    psubb %xmm7, %xmm2
+    movdqa %xmm2, %xmm3
+    pminub %xmm6, %xmm3
+    pcmpeqb %xmm3, %xmm2
+    pand %xmm5, %xmm2
+    pxor %xmm2, %xmm1
+    pcmpeqb %xmm1, %xmm0
+    pmovmskb %xmm0, %edx
+    xorl $0xffff, %edx
+    jnz 26f
+    addq $16, %rsi
+    addq $16, %rdi
+    subq $16, %rbx
+    cmpq $16, %rbx
+    jae 21b
+    testq %rbx, %rbx
+    jz 9f
+    leaq -16(%rsi,%rbx), %rsi
+    leaq -16(%rdi,%rbx), %rdi
+    movq $16, %rbx
+    jmp 21b
+    26:
+    bsfl %edx, %edx
+    jmp 40f
+    30:
+    testq %rbx, %rbx
+    jle 9f
+    xorl %edx, %edx
+    31:
+    movzbl (%rsi,%rdx), %eax
+    leal -97(%rax), %r8d
+    cmpl $25, %r8d
+    ja 32f
+    subl $32, %eax
+    32:
+    movzbl (%rdi,%rdx), %ecx
+    leal -97(%rcx), %r8d
+    cmpl $25, %r8d
+    ja 33f
+    subl $32, %ecx
+    33:
+    subq %rcx, %rax
+    jnz 9f
+    incq %rdx
+    cmpq %rbx, %rdx
+    jb 31b
+    jmp 9f
+    40:
+    movzbl (%rsi,%rdx), %eax
+    leal -97(%rax), %r8d
+    cmpl $25, %r8d
+    ja 41f
+    subl $32, %eax
+    41:
+    movzbl (%rdi,%rdx), %ecx
+    leal -97(%rcx), %r8d
+    cmpl $25, %r8d
+    ja 42f
+    subl $32, %ecx
+    42:
+    subq %rcx, %rax
+    9:
+  end;
+  asm arm64 (A: in x0; B: in x1; N: in x2; Result: out x0)
+    mov x3, x0
+    mov x0, #0
+    cmp x2, #16
+    b.lt 30f
+    movi v7.16b, #0x61
+    movi v6.16b, #26
+    movi v5.16b, #0x20
+    1:
+    ldr q0, [x3]
+    ldr q1, [x1]
+    sub v2.16b, v0.16b, v7.16b
+    cmhi v2.16b, v6.16b, v2.16b
+    and v2.16b, v2.16b, v5.16b
+    eor v0.16b, v0.16b, v2.16b
+    sub v2.16b, v1.16b, v7.16b
+    cmhi v2.16b, v6.16b, v2.16b
+    and v2.16b, v2.16b, v5.16b
+    eor v1.16b, v1.16b, v2.16b
+    cmeq v2.16b, v0.16b, v1.16b
+    not v2.16b, v2.16b
+    shrn v3.8b, v2.8h, #4
+    fmov x4, d3
+    cbnz x4, 6f
+    add x3, x3, #16
+    add x1, x1, #16
+    sub x2, x2, #16
+    cmp x2, #16
+    b.hs 1b
+    cbz x2, 9f
+    sub x5, x2, #16
+    add x3, x3, x5
+    add x1, x1, x5
+    mov x2, #16
+    b 1b
+    6:
+    rbit x4, x4
+    clz x4, x4
+    lsr x4, x4, #2
+    b 40f
+    30:
+    cmp x2, #0
+    b.le 9f
+    mov x4, #0
+    31:
+    ldrb w5, [x3, x4]
+    sub w8, w5, #97
+    cmp w8, #25
+    b.hi 32f
+    sub w5, w5, #32
+    32:
+    ldrb w6, [x1, x4]
+    sub w8, w6, #97
+    cmp w8, #25
+    b.hi 33f
+    sub w6, w6, #32
+    33:
+    subs x0, x5, x6
+    b.ne 9f
+    add x4, x4, #1
+    cmp x4, x2
+    b.lo 31b
+    b 9f
+    40:
+    ldrb w5, [x3, x4]
+    sub w8, w5, #97
+    cmp w8, #25
+    b.hi 41f
+    sub w5, w5, #32
+    41:
+    ldrb w6, [x1, x4]
+    sub w8, w6, #97
+    cmp w8, #25
+    b.hi 42f
+    sub w6, w6, #32
+    42:
+    sub x0, x5, x6
+    9:
+  end;
+end;
+
+{ The base: SSE2 16 bytes a step, the last 16 ending at the end; under
+  16 a byte at a time. On arm64 the NEON body. }
+function PasCaseCmpBase(A, B: Pointer; N: Int64): Int64;
+begin
+  asm amd64 (A: in rsi; B: in rdi; N: in rbx; Result: out rax)
+    xorl %eax, %eax
+    cmpq $16, %rbx
+    jl 30f
+    movl $0x61616161, %ecx
+    movd %ecx, %xmm7
+    pshufd $0, %xmm7, %xmm7
+    movl $0x19191919, %ecx
+    movd %ecx, %xmm6
+    pshufd $0, %xmm6, %xmm6
+    movl $0x20202020, %ecx
+    movd %ecx, %xmm5
+    pshufd $0, %xmm5, %xmm5
+    21:
+    movdqu (%rsi), %xmm0
+    movdqu (%rdi), %xmm1
+    movdqa %xmm0, %xmm2
+    psubb %xmm7, %xmm2
+    movdqa %xmm2, %xmm3
+    pminub %xmm6, %xmm3
+    pcmpeqb %xmm3, %xmm2
+    pand %xmm5, %xmm2
+    pxor %xmm2, %xmm0
+    movdqa %xmm1, %xmm2
+    psubb %xmm7, %xmm2
+    movdqa %xmm2, %xmm3
+    pminub %xmm6, %xmm3
+    pcmpeqb %xmm3, %xmm2
+    pand %xmm5, %xmm2
+    pxor %xmm2, %xmm1
+    pcmpeqb %xmm1, %xmm0
+    pmovmskb %xmm0, %edx
+    xorl $0xffff, %edx
+    jnz 26f
+    addq $16, %rsi
+    addq $16, %rdi
+    subq $16, %rbx
+    cmpq $16, %rbx
+    jae 21b
+    testq %rbx, %rbx
+    jz 9f
+    leaq -16(%rsi,%rbx), %rsi
+    leaq -16(%rdi,%rbx), %rdi
+    movq $16, %rbx
+    jmp 21b
+    26:
+    bsfl %edx, %edx
+    jmp 40f
+    30:
+    testq %rbx, %rbx
+    jle 9f
+    xorl %edx, %edx
+    31:
+    movzbl (%rsi,%rdx), %eax
+    leal -97(%rax), %r8d
+    cmpl $25, %r8d
+    ja 32f
+    subl $32, %eax
+    32:
+    movzbl (%rdi,%rdx), %ecx
+    leal -97(%rcx), %r8d
+    cmpl $25, %r8d
+    ja 33f
+    subl $32, %ecx
+    33:
+    subq %rcx, %rax
+    jnz 9f
+    incq %rdx
+    cmpq %rbx, %rdx
+    jb 31b
+    jmp 9f
+    40:
+    movzbl (%rsi,%rdx), %eax
+    leal -97(%rax), %r8d
+    cmpl $25, %r8d
+    ja 41f
+    subl $32, %eax
+    41:
+    movzbl (%rdi,%rdx), %ecx
+    leal -97(%rcx), %r8d
+    cmpl $25, %r8d
+    ja 42f
+    subl $32, %ecx
+    42:
+    subq %rcx, %rax
+    9:
+  end;
+  asm arm64 (A: in x0; B: in x1; N: in x2; Result: out x0)
+    mov x3, x0
+    mov x0, #0
+    cmp x2, #16
+    b.lt 30f
+    movi v7.16b, #0x61
+    movi v6.16b, #26
+    movi v5.16b, #0x20
+    1:
+    ldr q0, [x3]
+    ldr q1, [x1]
+    sub v2.16b, v0.16b, v7.16b
+    cmhi v2.16b, v6.16b, v2.16b
+    and v2.16b, v2.16b, v5.16b
+    eor v0.16b, v0.16b, v2.16b
+    sub v2.16b, v1.16b, v7.16b
+    cmhi v2.16b, v6.16b, v2.16b
+    and v2.16b, v2.16b, v5.16b
+    eor v1.16b, v1.16b, v2.16b
+    cmeq v2.16b, v0.16b, v1.16b
+    not v2.16b, v2.16b
+    shrn v3.8b, v2.8h, #4
+    fmov x4, d3
+    cbnz x4, 6f
+    add x3, x3, #16
+    add x1, x1, #16
+    sub x2, x2, #16
+    cmp x2, #16
+    b.hs 1b
+    cbz x2, 9f
+    sub x5, x2, #16
+    add x3, x3, x5
+    add x1, x1, x5
+    mov x2, #16
+    b 1b
+    6:
+    rbit x4, x4
+    clz x4, x4
+    lsr x4, x4, #2
+    b 40f
+    30:
+    cmp x2, #0
+    b.le 9f
+    mov x4, #0
+    31:
+    ldrb w5, [x3, x4]
+    sub w8, w5, #97
+    cmp w8, #25
+    b.hi 32f
+    sub w5, w5, #32
+    32:
+    ldrb w6, [x1, x4]
+    sub w8, w6, #97
+    cmp w8, #25
+    b.hi 33f
+    sub w6, w6, #32
+    33:
+    subs x0, x5, x6
+    b.ne 9f
+    add x4, x4, #1
+    cmp x4, x2
+    b.lo 31b
+    b 9f
+    40:
+    ldrb w5, [x3, x4]
+    sub w8, w5, #97
+    cmp w8, #25
+    b.hi 41f
+    sub w5, w5, #32
+    41:
+    ldrb w6, [x1, x4]
+    sub w8, w6, #97
+    cmp w8, #25
+    b.hi 42f
+    sub w6, w6, #32
+    42:
+    sub x0, x5, x6
+    9:
   end;
 end;
 
