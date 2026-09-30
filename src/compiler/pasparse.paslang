@@ -393,6 +393,8 @@ type
     function SetElemOk(E: PExpr): Boolean;
     procedure NoList(E: PExpr);
     function SetFamily(T: LongInt): LongInt;
+    function IsCharT(T: LongInt): Boolean;
+    function AsChar(E: PExpr): PExpr;
     function SetForVar(E: PExpr; VT: LongInt): PExpr;
     function SetCovers(T, U: LongInt): Boolean;
     function SetUnion(A, B: LongInt): LongInt;
@@ -451,6 +453,7 @@ type
     procedure CheckTryGetVar(M, V: PExpr);
     function InternArray(Elem: LongInt; Lo, Hi: Int64): LongInt;
     function InternSubrange(Lo, Hi: Int64): LongInt;
+    function InternSubOf(Host: LongInt; Lo, Hi: Int64): LongInt;
     function InternSet(Elem: LongInt): LongInt;
     function IsSetTyp(Id: LongInt): Boolean;
     procedure ParseEnumType(const AName: string);
@@ -460,7 +463,9 @@ type
     procedure ParseGenericType;
     function ParseSelect: PStmt;
     function AddNamedType(const AName: string; const Td: TTypeDef): LongInt;
-    function ParseBound: Int64;
+    function ParseBound(out T: LongInt): Int64;
+    function SubHost(A, B: LongInt): LongInt;
+    function ParseSubrange: LongInt;
     function ParseType: LongInt;
     function ParseIntConst: Int64;
     function ParseRecPart(var Td: TTypeDef; Start: LongInt; Stop: TTokKind): LongInt;
@@ -2547,7 +2552,7 @@ begin
     end
     else if v^.Kind = ekNil then
       kd := VrPointer
-    else if v^.Typ = TyChar then
+    else if IsCharT(v^.Typ) then
       kd := VrChar
     else if (v^.Typ = TyBoolean) or (k = tykBoolean) then
       kd := VrBoolean
@@ -2714,14 +2719,26 @@ begin
 end;
 
 function TParser.InternSubrange(Lo, Hi: Int64): LongInt;
+begin
+  Result := InternSubOf(TyInteger, Lo, Hi);
+end;
+
+{ The subrange Lo..Hi of host type Host (P135): the integers', Char's
+  ('0'..'9') or an enumeration's (Mon..Fri). Its values are its host's;
+  it is 8 bytes, as every subrange. }
+function TParser.InternSubOf(Host: LongInt; Lo, Hi: Int64): LongInt;
 var
   i, n: SizeInt;
 begin
   if Hi < Lo then
-    Die('bad subrange');
+    Die('bad subrange: ' + IntToStr(Lo) + ' is above ' + IntToStr(Hi) + HerePos);
+  if (Host = TyChar) and ((Lo < 0) or (Hi > 255)) then
+    Die('a subrange of Char lies in #0..#255' + HerePos);
+  if (TypeOf(Host).Kind = tykEnum) and ((Lo < TypeOf(Host).Lo) or (Hi > TypeOf(Host).Hi)) then
+    Die('a subrange of ' + TypName(Host) + ' lies in its members' + HerePos);
   for i := 0 to High(FTypes) do
     if (FTypes[i].Kind = tykSubrange) and (FTypes[i].Lo = Lo) and
-      (FTypes[i].Hi = Hi) then
+      (FTypes[i].Hi = Hi) and (FTypes[i].Elem = Host) then
     begin
       Result := LongInt(i);
       Exit;
@@ -2733,7 +2750,7 @@ begin
   FTypes[n].Lo := Lo;
   FTypes[n].Hi := Hi;
   FTypes[n].Size := 8;
-  FTypes[n].Elem := TyInteger;
+  FTypes[n].Elem := Host;
   Result := LongInt(n);
 end;
 
@@ -2998,6 +3015,9 @@ begin
       KindWord(B) + HerePos);
   if A = 0 then
     Result := B
+  else if (A <> B) and (SetFamily(A) <> 0) and not SameTyp(A, B) then
+    { 'a' and a '0'..'9', Red and a Green..Blue: of their host (P135) }
+    Result := SetFamily(A)
   else if (TypeOf(A).Kind = tykSubrange) and (TypeOf(A).Elem = TyInteger) then
   begin
     if (TypeOf(B).Kind = tykSubrange) and (TypeOf(B).Elem = TyInteger) and
@@ -3020,23 +3040,14 @@ var
 begin
   et := SetElem(E);
   want := TypeOf(T).Elem;
-  if want = TyChar then
+  { of the set's kind of element (P135: an enumeration's subrange is of
+    the enumeration, '0'..'9' of Char) }
+  if SetFamily(E^.Typ) <> SetFamily(want) then
   begin
-    if E^.Typ <> TyChar then
-      Die(TypName(E^.Typ) + ' is no element of a set of Char' + HerePos);
-  end
-  else if TypeOf(want).Kind = tykEnum then
-  begin
-    if not SameTyp(TypeOf(E^.Typ).Elem, TypeOf(want).Elem) and not SameTyp(E^.Typ, want) then
-      Die(TypName(E^.Typ) + ' is no element of a set of ' + TypName(want) + HerePos);
-  end
-  else if TypeOf(want).Kind = tykBoolean then
-  begin
-    if TypeOf(E^.Typ).Kind <> tykBoolean then
-      Die(TypName(E^.Typ) + ' is no element of a set of Boolean' + HerePos);
-  end
-  else if E^.Typ = TyChar then
-    Die('a Char is no element of a set of ' + TypName(want) + ': Ord(c) is' + HerePos);
+    if (SetFamily(E^.Typ) = TyChar) and (SetFamily(want) = 0) then
+      Die('a Char is no element of a set of ' + TypName(want) + ': Ord(c) is' + HerePos);
+    Die(TypName(E^.Typ) + ' is no element of a set of ' + TypName(want) + HerePos);
+  end;
   if (E^.Kind = ekInt) and ((E^.Num < TypeOf(T).Lo) or (E^.Num > TypeOf(T).Hi)) then
     Die('set element out of ' + IntToStr(TypeOf(T).Lo) + '..' + IntToStr(TypeOf(T).Hi) + HerePos);
   if et = 0 then
@@ -3188,18 +3199,37 @@ begin
 end;
 
 { The kind of ordinal T is, for a set's element (P126): Char's,
-  Boolean's, or an integer's (0), which an enumeration's is too, as a
-  subrange of one (Mon..Fri) is a subrange of the integers. }
+  Boolean's, an enumeration's (the enumeration, whose subranges are of
+  it since P135), or an integer's (0). }
 function TParser.SetFamily(T: LongInt): LongInt;
 begin
   if (TypeOf(T).Kind = tykSubrange) and (TypeOf(T).Elem > 0) then
     T := TypeOf(T).Elem;
-  if T = TyChar then
+  if (T = TyChar) or (TypeOf(T).Kind = tykEnum) then
     Result := T
   else if TypeOf(T).Kind = tykBoolean then
     Result := TyBoolean
   else
     Result := 0;
+end;
+
+{ E, a value of a subrange of Char, as a Char (P135): the code the same,
+  the type the one the string words know. }
+function TParser.AsChar(E: PExpr): PExpr;
+begin
+  Result := E;
+  if (E <> nil) and (E^.Typ <> TyChar) and IsCharT(E^.Typ) then
+  begin
+    Result := NewUn(uoConv, E);
+    Result^.Typ := TyChar;
+  end;
+end;
+
+{ A value of type T is a Char: Char itself or a subrange of it, '0'..'9'
+  (P135). }
+function TParser.IsCharT(T: LongInt): Boolean;
+begin
+  Result := (T = TyChar) or ((TypeOf(T).Kind = tykSubrange) and (TypeOf(T).Elem = TyChar));
 end;
 
 { for x in E, E a set (P126): a list is of x's kind, and x holds the
@@ -3560,17 +3590,20 @@ begin
   Result := E;
   if E = nil then
     Exit;
-  if (Want = TyChar) and (E^.Kind = ekStr) and (Length(E^.Str) = 1) then
+  if IsCharT(Want) and (E^.Kind = ekStr) and (Length(E^.Str) = 1) then
   begin
+    { a character where a Char goes, of '0'..'9' too, in its range (P135) }
+    if (Ord(E^.Str[1]) < TypeOf(Want).Lo) or ((Want <> TyChar) and (Ord(E^.Str[1]) > TypeOf(Want).Hi)) then
+      Die('constant #' + IntToStr(Ord(E^.Str[1])) + ' does not fit ' + TypName(Want) + HerePos);
     Result := NewInt(Ord(E^.Str[1]));
-    Result^.Typ := TyChar;
+    Result^.Typ := Want;
     Exit;
   end;
-  if (E^.Typ <> TyChar) or (not IsStrTyp(Want)) then
+  if (not IsCharT(E^.Typ)) or (not IsStrTyp(Want)) then
     Exit;
   a := nil;
   SetLength(a, 1);
-  a[0] := E;
+  a[0] := AsChar(E);
   Result := NewCall('rt_chstr', a, TyString);
 end;
 
@@ -5692,14 +5725,68 @@ end;
 
 { A subrange's bound (P126): a constant that ends before =, which is
   the declaration's (const S: set of 0..63 = [1]). }
-function TParser.ParseBound: Int64;
+function TParser.ParseBound(out T: LongInt): Int64;
 var
   noeq: Boolean;
+  at, near, str: string;
+  e: PExpr;
 begin
   noeq := FNoEq;
   FNoEq := True;
-  Result := ParseIntConst;
+  at := IntToStr(FTok.Line) + ':' + IntToStr(FTok.Col);
+  near := FTok.Lexeme;
+  FConstAt := at;
+  e := ParseExpr;
+  FConstAt := at;
   FNoEq := noeq;
+  if not ConstFold(e, Result, T, str) then
+    Die('integer constant at ' + at + ' near ' + near);
+  if TypeOf(T).Kind = tykString then
+  begin
+    if Length(str) <> 1 then
+      Die('integer constant at ' + at + ' near ' + near + ', which is not an integer');
+    Result := Ord(str[1]);
+    T := TyChar;
+  end
+  else if TypeOf(T).Kind = tykReal then
+    Die('integer constant at ' + at + ' near ' + near + ', which is not an integer');
+end;
+
+{ The type a subrange's bounds of types A and B are values of (P135):
+  Char, an enumeration, Boolean, or the integers. A subrange of one is
+  its host's too: Mon..Fri's bounds may be another subrange's. }
+function TParser.SubHost(A, B: LongInt): LongInt;
+
+  function Host(T: LongInt): LongInt;
+  begin
+    if (TypeOf(T).Kind = tykSubrange) and (TypeOf(T).Elem > 0) then
+      T := TypeOf(T).Elem;
+    if (T = TyChar) or (TypeOf(T).Kind = tykEnum) then
+      Result := T
+    else if TypeOf(T).Kind = tykBoolean then
+      Result := TyBoolean
+    else
+      Result := TyInteger;
+  end;
+
+begin
+  Result := Host(A);
+  if (Host(B) <> Result) and not SameTyp(Host(B), Result) then
+    Die('a subrange''s bounds are of one type, not ' + TypName(Host(A)) + ' and ' +
+      TypName(Host(B)) + HerePos);
+end;
+
+{ The subrange Lo..Hi of the constants of lo's type LT and hi's HT
+  (P135): a subrange of Char, of an enumeration or of the integers. }
+function TParser.ParseSubrange: LongInt;
+var
+  lo, hi: Int64;
+  lt, ht: LongInt;
+begin
+  lo := ParseBound(lt);
+  Eat(tkDotDot);
+  hi := ParseBound(ht);
+  Result := InternSubOf(SubHost(lt, ht), lo, hi);
 end;
 
 function TParser.ParseType: LongInt;
@@ -5943,13 +6030,9 @@ begin
     elem := Self.ParseType;
     t := InternSet(elem);
   end
-  else if (k = tkInt) or (k = tkMinus) then
-  begin
-    lo := ParseBound;
-    Eat(tkDotDot);
-    hi := ParseBound;
-    t := InternSubrange(lo, hi);
-  end
+  else if (k = tkInt) or (k = tkMinus) or (k = tkString) or (k = tkChar) then
+    { 1..10, '0'..'9', #0..#31 (P135) }
+    t := ParseSubrange
   else if k = tkSpecialize then
   begin
     FTok := FLex.Next;
@@ -5979,10 +6062,8 @@ begin
       if not FindConst(FTok.Lexeme, lo) then
         Die('unknown type ' + FTok.Lexeme + ' at ' + IntToStr(FTok.Line) + ':' +
           IntToStr(FTok.Col));
-      lo := ParseBound;
-      Eat(tkDotDot);
-      hi := ParseBound;
-      t := InternSubrange(lo, hi);
+      { Mon..Fri, a subrange of the enumeration (P135) }
+      t := ParseSubrange;
     end;
   end
   else
@@ -7058,7 +7139,7 @@ begin
     Die('decimals are for a real at ' + IntToStr(FTok.Line) + ':' + IntToStr(FTok.Col));
   SetLength(extra, 1);
   extra[0] := W;
-  if (E^.Typ = TyChar) or (k = tykString) then
+  if IsCharT(E^.Typ) or (k = tykString) then
     Result := CoreCall('PasFmtStr', StrArg(TyString, E), extra)
   else if (k = tykInteger) or (k = tykBoolean) or (k = tykEnum) or
     (k = tykSubrange) then
@@ -7108,7 +7189,8 @@ begin
           d := ParseExpr;
         end;
       end;
-      St^.Args[n] := FmtArg(e, w, d);
+      { a subrange of Char prints as a Char (P135) }
+      St^.Args[n] := FmtArg(AsChar(e), w, d);
       if FTok.Kind <> tkComma then
         Break;
       FTok := FLex.Next;
@@ -7835,7 +7917,7 @@ begin
           { of what has a length (1.0.136): Length(5) gave an address and
             Length(r) of a Real 1; a Char is a string of one }
           CheckTyped(args[0]);
-          if args[0]^.Typ = TyChar then
+          if IsCharT(args[0]^.Typ) then
             args[0] := StrArg(TyString, args[0]);
           k := TypeOf(args[0]^.Typ).Kind;
           if not (IsStrTyp(args[0]^.Typ) or IsDynTyp(args[0]^.Typ) or (k = tykArray) or
@@ -9948,19 +10030,26 @@ begin
   else if (Op = boAdd) and (IsStrTyp(L^.Typ) or IsStrTyp(R^.Typ)) then
   begin
     { A string joins a string or a Char; s + 1 dropped the 1 (1.0.116). }
-    if not ((IsStrTyp(L^.Typ) or (L^.Typ = TyChar)) and
-      (IsStrTyp(R^.Typ) or (R^.Typ = TyChar))) then
+    if not ((IsStrTyp(L^.Typ) or IsCharT(L^.Typ)) and
+      (IsStrTyp(R^.Typ) or IsCharT(R^.Typ))) then
       Die('+ joins a string with a string or a Char' + HerePos);
-    Result := NewBin(boConcat, L, R);
+    Result := NewBin(boConcat, AsChar(L), AsChar(R));
   end
-  else if (Op = boAdd) and (L^.Typ = TyChar) and (R^.Typ = TyChar) then
+  else if (Op = boAdd) and IsCharT(L^.Typ) and IsCharT(R^.Typ) then
     { Two characters join into a string, as in every Pascal. They were
       added as numbers: a + b printed 102 for '4' and '2', and s := a + b
       left s empty (1.0.53). }
-    Result := NewBin(boConcat, StrArg(TyString, L), R)
+    Result := NewBin(boConcat, StrArg(TyString, AsChar(L)), AsChar(R))
   else if ((Op = boEq) or (Op = boNe) or (Op = boLt) or (Op = boLe) or
     (Op = boGt) or (Op = boGe)) and
-    ((IsStrTyp(L^.Typ) and (R^.Typ = TyChar)) or ((L^.Typ = TyChar) and IsStrTyp(R^.Typ))) then
+    ((IsCharT(L^.Typ) and (R^.Kind = ekStr) and (Length(R^.Str) = 1)) or
+    ((L^.Kind = ekStr) and (Length(L^.Str) = 1) and IsCharT(R^.Typ))) then
+    { a Char against a one-character literal compares the codes (P135),
+      not two strings of one byte }
+    Result := ApplyOp(Op, StrArg(TyChar, L), StrArg(TyChar, R))
+  else if ((Op = boEq) or (Op = boNe) or (Op = boLt) or (Op = boLe) or
+    (Op = boGt) or (Op = boGe)) and
+    ((IsStrTyp(L^.Typ) and IsCharT(R^.Typ)) or (IsCharT(L^.Typ) and IsStrTyp(R^.Typ))) then
     { A string against a Char compares as against the one-byte string
       (1.1.1): the string's pointer was compared with the character's
       code, so s = #0 was False for a string holding a NUL, and s = c
@@ -10263,7 +10352,7 @@ begin
         Result^.R := SetLitTo(Result^.R, InternSet(id))
       else if (Result^.R^.Kind = ekSet) and (TypeOf(id).Kind <> tykSubrange) then
         Result^.R := SetLitTo(Result^.R, InternSet(id));
-      if (TypeOf(Result^.R^.Typ).Elem = TyChar) <> (Result^.L^.Typ = TyChar) then
+      if SetFamily(TypeOf(Result^.R^.Typ).Elem) <> SetFamily(Result^.L^.Typ) then
         Die(TypName(Result^.L^.Typ) + ' is no element of ' + TypName(Result^.R^.Typ) + HerePos);
       Result^.Typ := TyBoolean;
     end;
@@ -13447,9 +13536,10 @@ begin
             NoReal(st^.E, TypName(VarTyp(name)));
             NoReal(st^.E2, TypName(VarTyp(name)));
           end;
-          { The counter's type is the context of both ends (P99). }
-          st^.E := CoerceInt(st^.E, VarTyp(name));
-          st^.E2 := CoerceInt(st^.E2, VarTyp(name));
+          { The counter's type is the context of both ends (P99); a
+            character is a Char's end, of '0'..'9' too (P135). }
+          st^.E := CoerceInt(StrArg(VarTyp(name), st^.E), VarTyp(name));
+          st^.E2 := CoerceInt(StrArg(VarTyp(name), st^.E2), VarTyp(name));
           Eat(tkDo);
           pk0 := Length(FProg.Procs);
           nst := Self.ParseStmt;
@@ -14468,7 +14558,12 @@ begin
   if Copy(data, 1, 11) = 'PASLANGI16' + #10 then
     Die(path + ' was compiled by a paslang older than 1.1.7; compile ' +
       AName + ' again');
-  if (Copy(data, 1, 8) = 'PASLANGI') and (Copy(data, 1, 11) <> 'PASLANGI17' + #10) then
+  { From 1.1.8 an enumeration's member says its type and a subrange its
+    host (P135). }
+  if Copy(data, 1, 11) = 'PASLANGI17' + #10 then
+    Die(path + ' was compiled by a paslang older than 1.1.8; compile ' +
+      AName + ' again');
+  if (Copy(data, 1, 8) = 'PASLANGI') and (Copy(data, 1, 11) <> 'PASLANGI18' + #10) then
     Die(path + ' was compiled by a newer paslang (' + FirstLine(data) +
       '); compile ' + AName + ' again with this one');
   if not ParseIface(data, iface) then
@@ -15542,7 +15637,7 @@ begin
   end
   else
   begin
-    if (t = TyChar) and (dk = tykString) and (Length(ds) = 1) then
+    if IsCharT(t) and (dk = tykString) and (Length(ds) = 1) then
       dv := Ord(ds[1])
     else if (dk = tykString) or (dk = tykReal) then
       Die('default value must be an ordinal constant');

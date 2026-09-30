@@ -304,7 +304,7 @@ The sizes are fixed and the same on both targets:
 | `Integer`, `LongInt`, `Int64`, `SizeInt`, `NativeInt`, `PtrInt`, `Cardinal`, `QWord`, `UInt64`, `Rune` | 8 | one signed 64-bit integer under every name |
 | `Byte` `UInt8` · `Int8` `ShortInt` · `Word` `UInt16` · `Int16` `SmallInt` · `UInt32` `LongWord` `DWord` · `Int32` | 1, 1, 2, 2, 4, 4 | six types (the names between dots are one), whose values keep their width: `Byte` 0..255, `Int8` −128..127, `Word` 0..65535, `Int16` −32768..32767, `UInt32` 0..4294967295, `Int32` −2147483648..2147483647; 1, 2 or 4 bytes in memory (a local or a global keeps a word's slot); `High(T)` and `Low(T)` are constants of the type; the names are reserved words (§19) |
 | `Boolean` | 8 | `False` is 0, `True` is 1; only a Boolean goes into one, `Boolean(x)` turns a number or a pointer into one (§3) |
-| an enumeration, a subrange | 8 | an integer |
+| an enumeration, a subrange | 8 | an integer; a subrange's values are its host's: `1..10` integers, `'0'..'9'` characters, `Mon..Fri` the enumeration's members |
 | `Char`, `AnsiChar` | 1 | a byte, its own type: `Ord(c)` is its code |
 | `string` | 16 | pointer and byte length; no 255 cap, no trailing zero; the characters are copied on the first write after they are shared |
 | `Real`, `Double` | 8 | one IEEE binary64 |
@@ -426,7 +426,15 @@ real out of `Integer`'s range stop the program with
 `real out of integer range at line N`, the same on both machines
 (-2^63 itself converts). `Single` and `Quad` are in §14.
 
-An enumeration and a subrange are integers. `Ord(x)` reads any ordinal;
+An enumeration and a subrange are integers. A subrange is of a host
+type, the type of its bounds, and its values are the host's: `TDigit =
+'0'..'9'` is a subrange of `Char`, so a `TDigit` prints as a character,
+joins a string, compares with a `Char` and takes a `'7'`; `TWork =
+Mon..Fri` is a subrange of the enumeration, whose members it takes and
+into which it goes, and `set of TWork` is a set of that enumeration's
+kind (`[Red]` of another is refused). A constant out of the subrange is
+a compile error (`constant #120 does not fit TDigit`).
+`Ord(x)` reads any ordinal;
 `Succ(x)` and `Pred(x)` are the next and the previous value, of the same
 type. `Chr(n)` is the `Char` whose code is `n`: a constant past 255 is a
 compile error, and a value that varies keeps its low byte (`Chr(i)` of

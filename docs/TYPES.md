@@ -249,7 +249,14 @@ has a base type of its width and sign (1.0.92, `dwarfnarrow`), and a
 `Single` or `Double` local a float of 4 or 8 bytes (1.0.104,
 `dwarfreal`).
 
-Enumerations and subranges stay Pascal; each is an 8-byte integer.
+Enumerations and subranges stay Pascal; each is an 8-byte integer. A
+subrange is of its bounds' type, its host (1.1.8): `1..10` of the
+integers, `'0'..'9'` and `#0..#31` of `Char`, `Mon..Fri` of the
+enumeration. Its values are the host's, so a subrange of `Char` prints,
+joins and compares as a `Char`, a subrange of an enumeration takes and
+gives the enumeration's members, and a set of either is a set of the
+host's kind. Before 1.1.8 `'0'..'9'` was refused and `Mon..Fri` was a
+subrange of the integers.
 
 ## Sets
 
