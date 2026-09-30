@@ -2879,8 +2879,8 @@ the shared elements shared: after `t := s`, `SetLength(t, 8)` when
 `s`'s block had room, then `t[1] := 20`, `s[1]` is 20 too; the length
 is `t`'s own, the elements up to `s`'s length are still one. A copy
 with a block of its own is `t := nil; t := Append(t, s)`: `Append` to a
-nil slice allocates. `Copy` is a string word, its result a string, so
-`t := Copy(xs, 0, 2)` of a slice is refused (`string does not go into
+nil slice allocates. `Copy`, `Insert` and `Delete` are string words, so
+`t := Copy(xs, 0, 2)` of a slice is refused (`Copy takes a string, not
 array of Integer`), and `s[i..j]` shares (below); it can be taken again
 of what it gave, so `u := s[1..3]; u := u[1..2]` is `s[2..3]`. A nil
 slice is a slice: `Length` 0, `High` -1, `= nil` true, `for x in` over
@@ -5441,6 +5441,24 @@ cuts, `SetLength(s, n)` sizes, `=` and `<>` compare bytes. `<`, `<=`,
 differs decides, and when one string is a prefix of the other the
 shorter one comes first, so a list of names sorts the way you expect.
 `IntToStr` and `StrToInt64` of `uses paslib` convert (§15).
+
+Pascal's string words are there, as Free Pascal has them (1.1.10):
+`Pos(sub, s)` and `Pos(sub, s, from)` give the place from 1 of `sub`
+in `s`, 0 when it is not there (a `Char` too); `Insert(src, s, i)` puts
+`src` before `s[i]`; `Delete(s, i, n)` takes `n` characters out from
+`s[i]`; `Copy(s, i)` is the rest from `s[i]`; `Concat(a, b, ...)` is
+`a + b + ...`; `UpCase` and `LowerCase` of a `Char` or of a string
+change its ASCII letters; `StringOfChar(c, n)` is `n` times `c`;
+`Str(x:w:d, s)` puts in `s` what `Write` would write (an
+enumeration's member by its name, padded on the right); and `Val(s, v,
+code)` reads a number into `v` (decimal, `$` or `0x` hexadecimal, `%`
+binary, `&` octal, blanks first), a real or an enumeration's member,
+`code` 0 or the place of the first character it could not read. An
+index out of the string does what Free Pascal does: `Insert` at 0
+puts in front, `Delete` past the end does nothing, `Copy` from 0
+starts at 1. `Pos` searches with the processor's vectors (AVX2, SSE2 or
+NEON) for the first byte and compares the rest 64 bytes at a time, as
+Go's `strings.Index` does (`docs/KERNELS.md`).
 
 The hash words take a string and give its digest as a string of bytes
 (`Hex(s)` writes any string as lowercase hex): `Md5`, `Sha1`, `Sha224`,
@@ -10075,6 +10093,11 @@ the commands on standard input, under `--debug-mode` and under
   output is closed.
 - `Close`, like `Send`, is a keyword (a channel's), so no method or
   routine takes the name.
+- `Str(x, s)` of a real without a width writes what `Write(x)` writes
+  (`2.5`), where Free Pascal writes ` 2.500000000E+00`; `Integer` is 64
+  bits, so `Val` into one reads 64 bits, where Free Pascal's `Integer`
+  is 32. `Copy`, `Insert` and `Delete` take strings; a slice's elements
+  are copied with `a[i..j]` and `Append`.
 - A one-character literal is a string where a helper's method is called
   on it (`'x'.Twice` is string's helper), where Free Pascal takes it for
   a `Char`. A helper has no constructor.
@@ -10152,7 +10175,8 @@ its place:
 - the ordinal, string, slice, map and memory words `Ord Chr Succ Pred Low
   High Odd SizeOf Length Copy Delete Clear TryGet Default Assigned
   SetLength Inc Dec GetMem FreeMem Move FillChar View MemBase MemSize
-  MemEnd`;
+  MemEnd`, and Pascal's string words `Pos Insert Concat UpCase LowerCase
+  StringOfChar Str Val` (1.1.10);
 - the tree, heap and store words (§11): `Rank KeyAt PopLow PopHigh Split
   Join Include Exclude Push Pop StoreOpen StorePut StoreGet StoreDelete
   StoreSync StoreClose StoreAbandon`, and the types `tree`, `heap` and

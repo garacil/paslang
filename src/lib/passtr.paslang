@@ -1,0 +1,1481 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+
+  paslang is free software: you can redistribute it and/or modify it
+  under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+
+  paslang is distributed in the hope that it will be useful, but
+  WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+  General Public License for more details.
+
+  Under Section 7 of GPL version 3, you are granted additional
+  permissions described in the paslang Runtime Library Exception,
+  version 1.0, in the file COPYING.RUNTIME.
+
+  You should have received a copy of the GNU General Public License
+  along with paslang.  If not, see <https://www.gnu.org/licenses/>. }
+
+{$mode objfpc}{$H+}
+
+{ The standard string words of the language (P134): Pos, Insert, Delete
+  of a string, StringOfChar, UpCase and LowerCase of a string, Val's
+  reading of a number, a real and an enumeration's member. Their hot
+  cores are kernels, one per machine, after Go 1.23's internal/bytealg
+  (docs/ref/go1.23), each with a body on the processor's extension
+  (Cpu), one on the base processor (Base) and the Pascal it does
+  (Plain), which the tests hold them to:
+
+  IndexByte, the first place of a byte: AVX2's vpcmpeqb over 32 bytes,
+  SSE2's pcmpeqb over 16 (indexbyte_amd64.s), NEON's cmeq over 32 bytes
+  and a syndrome whose trailing zeros are the place (indexbyte_arm64.s).
+  MemEq, whether two runs of bytes are equal: 64 bytes a step on AVX2
+  or SSE2, eight bytes a step on the rest (equal_amd64.s); NEON's 64 a
+  step and eight after (equal_arm64.s).
+  CaseMap, a string's ASCII letters to upper or lower case: a byte is a
+  letter when its distance from 'a' (or 'A') is below 26, which pminub
+  and pcmpeqb tell on AVX2 and SSE2 and cmhi on NEON, and its case bit,
+  32, flips.
+
+  Pos searches as Go's strings.Index does: IndexByte finds the first
+  byte, MemEq checks the rest, and when the first byte keeps matching
+  where the rest does not, Rabin-Karp takes over, so the search stays
+  linear. On arm64 NEON is part of the base processor: its Cpu and Base
+  bodies are one. }
+
+unit passtr;
+
+interface
+
+function PasIndexByteCpu(P: Pointer; N, C: Int64): Int64;
+function PasIndexByteBase(P: Pointer; N, C: Int64): Int64;
+function PasIndexBytePlain(P: Pointer; N, C: Int64): Int64;
+function PasMemEqCpu(A, B: Pointer; N: Int64): Boolean;
+function PasMemEqBase(A, B: Pointer; N: Int64): Boolean;
+function PasMemEqPlain(A, B: Pointer; N: Int64): Boolean;
+procedure PasCaseMapCpu(Src, Dst: Pointer; N: Int64; Upper: Boolean);
+procedure PasCaseMapBase(Src, Dst: Pointer; N: Int64; Upper: Boolean);
+procedure PasCaseMapPlain(Src, Dst: Pointer; N: Int64; Upper: Boolean);
+
+function PasPosCpu(const Sub, S: string; Offset: Int64): Int64;
+function PasPosBase(const Sub, S: string; Offset: Int64): Int64;
+function PasPosCharCpu(C: Char; const S: string; Offset: Int64): Int64;
+function PasPosCharBase(C: Char; const S: string; Offset: Int64): Int64;
+function PasUpperCpu(const S: string): string;
+function PasUpperBase(const S: string): string;
+function PasLowerCpu(const S: string): string;
+function PasLowerBase(const S: string): string;
+
+procedure PasInsertStr(const Src: string; var S: string; Index: Int64);
+procedure PasDeleteStr(var S: string; Index, Count: Int64);
+function PasStringOfChar(C: Char; N: Int64): string;
+
+function PasValInt(const S: string; Unsigned: Boolean; out Code: Int64): Int64;
+function PasValReal(const S: string; out Code: Int64): Double;
+function PasValEnum(const S: string; const Names: string; out Code: Int64): Int64;
+function PasEnumName(V: Int64; const Names: string; W: Int64): string;
+
+implementation
+
+uses pasfmt;
+
+const
+  PrimeRK = 16777619;
+
+{ ---- IndexByte ---- }
+
+{ The place of byte C in P[0..N-1] from 0, -1 when it is not there: the
+  reference the kernels are held to. }
+function PasIndexBytePlain(P: Pointer; N, C: Int64): Int64;
+var
+  i: Int64;
+  b: Int64;
+begin
+  Result := -1;
+  b := C and 255;
+  for i := 0 to N - 1 do
+    if PByte(P)[i] = b then
+    begin
+      Result := i;
+      Exit;
+    end;
+end;
+
+{ AVX2 over 32 bytes a step, SSE2 under 32 and at the tail, after Go's
+  indexbytebody (indexbyte_amd64.s): the byte in every lane, vpcmpeqb,
+  vptest to tell a match, vpmovmskb and bsf for its place; a run under
+  16 bytes is read in one load that stays inside its page. NEON on
+  arm64, after indexbyte_arm64.s: 32 aligned bytes a step, each match a
+  bit of a 64-bit syndrome (two bits a byte, 0x40100401 the lanes'
+  weights), rbit and clz for the first. }
+function PasIndexByteCpu(P: Pointer; N, C: Int64): Int64;
+begin
+  asm amd64 (P: in rsi; N: in rbx; C: in rax; Result: out rax)
+    movd %eax, %xmm0
+    punpcklbw %xmm0, %xmm0
+    punpcklbw %xmm0, %xmm0
+    pshufd $0, %xmm0, %xmm0
+    cmpq $16, %rbx
+    jl 5f
+    movq %rsi, %rdi
+    cmpq $32, %rbx
+    ja 8f
+    leaq -16(%rsi,%rbx), %rax
+    jmp 2f
+    1:
+    movdqu (%rdi), %xmm1
+    pcmpeqb %xmm0, %xmm1
+    pmovmskb %xmm1, %edx
+    bsfl %edx, %edx
+    jnz 4f
+    addq $16, %rdi
+    2:
+    cmpq %rax, %rdi
+    jb 1b
+    movq %rax, %rdi
+    movdqu (%rax), %xmm1
+    pcmpeqb %xmm0, %xmm1
+    pmovmskb %xmm1, %edx
+    bsfl %edx, %edx
+    jnz 4f
+    3:
+    movq $-1, %rax
+    jmp 9f
+    4:
+    subq %rsi, %rdi
+    addq %rdx, %rdi
+    movq %rdi, %rax
+    jmp 9f
+    5:
+    testq %rbx, %rbx
+    je 3b
+    leaq 16(%rsi), %rax
+    testw $0xff0, %ax
+    je 6f
+    movdqu (%rsi), %xmm1
+    pcmpeqb %xmm0, %xmm1
+    pmovmskb %xmm1, %edx
+    bsfl %edx, %edx
+    jz 3b
+    cmpl %ebx, %edx
+    jae 3b
+    movq %rdx, %rax
+    jmp 9f
+    6:
+    movdqu -16(%rsi,%rbx), %xmm1
+    pcmpeqb %xmm0, %xmm1
+    pmovmskb %xmm1, %edx
+    movl %ebx, %ecx
+    shll %cl, %edx
+    shrl $16, %edx
+    bsfl %edx, %edx
+    jz 3b
+    movq %rdx, %rax
+    jmp 9f
+    8:
+    vpbroadcastb %xmm0, %ymm1
+    leaq -32(%rsi,%rbx), %r11
+    7:
+    vmovdqu (%rdi), %ymm2
+    vpcmpeqb %ymm1, %ymm2, %ymm3
+    vptest %ymm3, %ymm3
+    jnz 10f
+    addq $32, %rdi
+    cmpq %r11, %rdi
+    jl 7b
+    movq %r11, %rdi
+    vmovdqu (%rdi), %ymm2
+    vpcmpeqb %ymm1, %ymm2, %ymm3
+    vptest %ymm3, %ymm3
+    jnz 10f
+    vzeroupper
+    movq $-1, %rax
+    jmp 9f
+    10:
+    vpmovmskb %ymm3, %edx
+    bsfl %edx, %edx
+    subq %rsi, %rdi
+    addq %rdi, %rdx
+    movq %rdx, %rax
+    vzeroupper
+    9:
+  end;
+  asm arm64 (P: in x0; C: in x1; N: in x2; Result: out x0)
+    cbz x2, 9f
+    mov x11, x0
+    movz w5, #0x0401
+    movk w5, #0x4010, lsl #16
+    dup v0.16b, w1
+    bic x3, x0, #0x1f
+    dup v5.4s, w5
+    ands x9, x0, #0x1f
+    and x10, x2, #0x1f
+    b.eq 2f
+    ld1 {v1.16b, v2.16b}, [x3], #32
+    sub x4, x9, #0x20
+    adds x2, x2, x4
+    cmeq v3.16b, v1.16b, v0.16b
+    cmeq v4.16b, v2.16b, v0.16b
+    and v3.16b, v3.16b, v5.16b
+    and v4.16b, v4.16b, v5.16b
+    addp v6.16b, v3.16b, v4.16b
+    addp v6.16b, v6.16b, v6.16b
+    mov x6, v6.d[0]
+    lsl x4, x9, #1
+    lsr x6, x6, x4
+    lsl x6, x6, x4
+    b.ls 4f
+    cbnz x6, 5f
+    2:
+    ld1 {v1.16b, v2.16b}, [x3], #32
+    subs x2, x2, #0x20
+    cmeq v3.16b, v1.16b, v0.16b
+    cmeq v4.16b, v2.16b, v0.16b
+    b.ls 3f
+    orr v6.16b, v3.16b, v4.16b
+    addp v6.2d, v6.2d, v6.2d
+    mov x6, v6.d[0]
+    cbz x6, 2b
+    3:
+    and v3.16b, v3.16b, v5.16b
+    and v4.16b, v4.16b, v5.16b
+    addp v6.16b, v3.16b, v4.16b
+    addp v6.16b, v6.16b, v6.16b
+    mov x6, v6.d[0]
+    b.hs 5f
+    4:
+    add x4, x9, x10
+    and x4, x4, #0x1f
+    sub x4, x4, #0x20
+    neg x4, x4, lsl #1
+    lsl x6, x6, x4
+    lsr x6, x6, x4
+    5:
+    cbz x6, 9f
+    rbit x6, x6
+    sub x3, x3, #0x20
+    clz x6, x6
+    add x0, x3, x6, lsr #1
+    sub x0, x0, x11
+    b 10f
+    9:
+    mov x0, #-1
+    10:
+  end;
+end;
+
+{ The base processor's: SSE2 alone on amd64, the same NEON on arm64. }
+function PasIndexByteBase(P: Pointer; N, C: Int64): Int64;
+begin
+  asm amd64 (P: in rsi; N: in rbx; C: in rax; Result: out rax)
+    movd %eax, %xmm0
+    punpcklbw %xmm0, %xmm0
+    punpcklbw %xmm0, %xmm0
+    pshufd $0, %xmm0, %xmm0
+    cmpq $16, %rbx
+    jl 5f
+    movq %rsi, %rdi
+    leaq -16(%rsi,%rbx), %rax
+    jmp 2f
+    1:
+    movdqu (%rdi), %xmm1
+    pcmpeqb %xmm0, %xmm1
+    pmovmskb %xmm1, %edx
+    bsfl %edx, %edx
+    jnz 4f
+    addq $16, %rdi
+    2:
+    cmpq %rax, %rdi
+    jb 1b
+    movq %rax, %rdi
+    movdqu (%rax), %xmm1
+    pcmpeqb %xmm0, %xmm1
+    pmovmskb %xmm1, %edx
+    bsfl %edx, %edx
+    jnz 4f
+    3:
+    movq $-1, %rax
+    jmp 9f
+    4:
+    subq %rsi, %rdi
+    addq %rdx, %rdi
+    movq %rdi, %rax
+    jmp 9f
+    5:
+    testq %rbx, %rbx
+    je 3b
+    leaq 16(%rsi), %rax
+    testw $0xff0, %ax
+    je 6f
+    movdqu (%rsi), %xmm1
+    pcmpeqb %xmm0, %xmm1
+    pmovmskb %xmm1, %edx
+    bsfl %edx, %edx
+    jz 3b
+    cmpl %ebx, %edx
+    jae 3b
+    movq %rdx, %rax
+    jmp 9f
+    6:
+    movdqu -16(%rsi,%rbx), %xmm1
+    pcmpeqb %xmm0, %xmm1
+    pmovmskb %xmm1, %edx
+    movl %ebx, %ecx
+    shll %cl, %edx
+    shrl $16, %edx
+    bsfl %edx, %edx
+    jz 3b
+    movq %rdx, %rax
+    9:
+  end;
+  asm arm64 (P: in x0; C: in x1; N: in x2; Result: out x0)
+    cbz x2, 9f
+    mov x11, x0
+    movz w5, #0x0401
+    movk w5, #0x4010, lsl #16
+    dup v0.16b, w1
+    bic x3, x0, #0x1f
+    dup v5.4s, w5
+    ands x9, x0, #0x1f
+    and x10, x2, #0x1f
+    b.eq 2f
+    ld1 {v1.16b, v2.16b}, [x3], #32
+    sub x4, x9, #0x20
+    adds x2, x2, x4
+    cmeq v3.16b, v1.16b, v0.16b
+    cmeq v4.16b, v2.16b, v0.16b
+    and v3.16b, v3.16b, v5.16b
+    and v4.16b, v4.16b, v5.16b
+    addp v6.16b, v3.16b, v4.16b
+    addp v6.16b, v6.16b, v6.16b
+    mov x6, v6.d[0]
+    lsl x4, x9, #1
+    lsr x6, x6, x4
+    lsl x6, x6, x4
+    b.ls 4f
+    cbnz x6, 5f
+    2:
+    ld1 {v1.16b, v2.16b}, [x3], #32
+    subs x2, x2, #0x20
+    cmeq v3.16b, v1.16b, v0.16b
+    cmeq v4.16b, v2.16b, v0.16b
+    b.ls 3f
+    orr v6.16b, v3.16b, v4.16b
+    addp v6.2d, v6.2d, v6.2d
+    mov x6, v6.d[0]
+    cbz x6, 2b
+    3:
+    and v3.16b, v3.16b, v5.16b
+    and v4.16b, v4.16b, v5.16b
+    addp v6.16b, v3.16b, v4.16b
+    addp v6.16b, v6.16b, v6.16b
+    mov x6, v6.d[0]
+    b.hs 5f
+    4:
+    add x4, x9, x10
+    and x4, x4, #0x1f
+    sub x4, x4, #0x20
+    neg x4, x4, lsl #1
+    lsl x6, x6, x4
+    lsr x6, x6, x4
+    5:
+    cbz x6, 9f
+    rbit x6, x6
+    sub x3, x3, #0x20
+    clz x6, x6
+    add x0, x3, x6, lsr #1
+    sub x0, x0, x11
+    b 10f
+    9:
+    mov x0, #-1
+    10:
+  end;
+end;
+
+{ ---- MemEq ---- }
+
+function PasMemEqPlain(A, B: Pointer; N: Int64): Boolean;
+var
+  i: Int64;
+begin
+  Result := False;
+  for i := 0 to N - 1 do
+    if PByte(A)[i] <> PByte(B)[i] then
+      Exit;
+  Result := True;
+end;
+
+{ Go's memeqbody (equal_amd64.s): 64 bytes a step on AVX2 (Cpu) or
+  SSE2 (Base), 8 a step below 64, the last 8 read ending at the end;
+  under 8, one load of each that stays inside its page, shifted to the
+  bytes wanted. On arm64 equal_arm64.s: 64 bytes a step compared as
+  words by NEON, 16 by two ldp, then 8, 4, 2 and 1. }
+function PasMemEqCpu(A, B: Pointer; N: Int64): Boolean;
+begin
+  asm amd64 (A: in rsi; B: in rdi; N: in rbx; Result: out rax)
+    cmpq $8, %rbx
+    jb 5f
+    cmpq $64, %rbx
+    jb 3f
+    1:
+    cmpq $64, %rbx
+    jb 2f
+    vmovdqu (%rsi), %ymm0
+    vmovdqu (%rdi), %ymm1
+    vmovdqu 32(%rsi), %ymm2
+    vmovdqu 32(%rdi), %ymm3
+    vpcmpeqb %ymm1, %ymm0, %ymm4
+    vpcmpeqb %ymm2, %ymm3, %ymm5
+    vpand %ymm4, %ymm5, %ymm6
+    vpmovmskb %ymm6, %edx
+    addq $64, %rsi
+    addq $64, %rdi
+    subq $64, %rbx
+    cmpl $0xffffffff, %edx
+    je 1b
+    vzeroupper
+    xorl %eax, %eax
+    jmp 9f
+    2:
+    vzeroupper
+    3:
+    cmpq $8, %rbx
+    jbe 4f
+    movq (%rsi), %rcx
+    movq (%rdi), %rdx
+    addq $8, %rsi
+    addq $8, %rdi
+    subq $8, %rbx
+    cmpq %rdx, %rcx
+    je 3b
+    xorl %eax, %eax
+    jmp 9f
+    4:
+    movq -8(%rsi,%rbx), %rcx
+    movq -8(%rdi,%rbx), %rdx
+    xorl %eax, %eax
+    cmpq %rdx, %rcx
+    sete %al
+    jmp 9f
+    5:
+    movl $0, %eax
+    cmpq $0, %rbx
+    je 8f
+    leaq 0(,%rbx,8), %rcx
+    negq %rcx
+    cmpb $0xf8, %sil
+    ja 6f
+    movq (%rsi), %rsi
+    jmp 7f
+    6:
+    movq -8(%rsi,%rbx), %rsi
+    shrq %cl, %rsi
+    7:
+    cmpb $0xf8, %dil
+    ja 10f
+    movq (%rdi), %rdi
+    jmp 11f
+    10:
+    movq -8(%rdi,%rbx), %rdi
+    shrq %cl, %rdi
+    11:
+    subq %rsi, %rdi
+    shlq %cl, %rdi
+    movl $0, %eax
+    8:
+    sete %al
+    9:
+  end;
+  asm arm64 (A: in x0; B: in x1; N: in x2; Result: out x0)
+    cbz x2, 8f
+    cmp x2, #1
+    b.eq 7f
+    cmp x2, #16
+    b.lo 4f
+    bic x3, x2, #0x3f
+    cbz x3, 2f
+    add x6, x0, x3
+    1:
+    ld1 {v0.2d, v1.2d, v2.2d, v3.2d}, [x0], #64
+    ld1 {v4.2d, v5.2d, v6.2d, v7.2d}, [x1], #64
+    cmeq v8.2d, v0.2d, v4.2d
+    cmeq v9.2d, v1.2d, v5.2d
+    cmeq v10.2d, v2.2d, v6.2d
+    cmeq v11.2d, v3.2d, v7.2d
+    and v8.16b, v8.16b, v9.16b
+    and v8.16b, v8.16b, v10.16b
+    and v8.16b, v8.16b, v11.16b
+    cmp x0, x6
+    mov x4, v8.d[0]
+    mov x5, v8.d[1]
+    cbz x4, 9f
+    cbz x5, 9f
+    b.ne 1b
+    and x2, x2, #0x3f
+    cbz x2, 8f
+    2:
+    bic x3, x2, #0xf
+    cbz x3, 4f
+    add x6, x0, x3
+    3:
+    ldp x4, x5, [x0], #16
+    ldp x7, x9, [x1], #16
+    eor x7, x4, x7
+    cbnz x7, 9f
+    eor x9, x5, x9
+    cbnz x9, 9f
+    cmp x0, x6
+    b.ne 3b
+    and x2, x2, #0xf
+    cbz x2, 8f
+    4:
+    tbz x2, #3, 5f
+    ldr x4, [x0]
+    ldr x5, [x1]
+    eor x5, x4, x5
+    cbnz x5, 9f
+    sub x6, x2, #8
+    ldr x4, [x0, x6]
+    ldr x5, [x1, x6]
+    eor x5, x4, x5
+    cbnz x5, 9f
+    b 8f
+    5:
+    tbz x2, #2, 6f
+    ldr w4, [x0]
+    ldr w5, [x1]
+    eor w5, w4, w5
+    cbnz w5, 9f
+    sub x6, x2, #4
+    ldr w4, [x0, x6]
+    ldr w5, [x1, x6]
+    eor w5, w4, w5
+    cbnz w5, 9f
+    b 8f
+    6:
+    tbz x2, #1, 10f
+    ldrh w4, [x0], #2
+    ldrh w5, [x1], #2
+    cmp w4, w5
+    b.ne 9f
+    10:
+    tbz x2, #0, 8f
+    7:
+    ldrb w4, [x0]
+    ldrb w5, [x1]
+    cmp w4, w5
+    b.ne 9f
+    8:
+    mov x0, #1
+    b 11f
+    9:
+    mov x0, xzr
+    11:
+  end;
+end;
+
+function PasMemEqBase(A, B: Pointer; N: Int64): Boolean;
+begin
+  asm amd64 (A: in rsi; B: in rdi; N: in rbx; Result: out rax)
+    cmpq $8, %rbx
+    jb 5f
+    1:
+    cmpq $64, %rbx
+    jb 3f
+    movdqu (%rsi), %xmm0
+    movdqu (%rdi), %xmm1
+    movdqu 16(%rsi), %xmm2
+    movdqu 16(%rdi), %xmm3
+    movdqu 32(%rsi), %xmm4
+    movdqu 32(%rdi), %xmm5
+    movdqu 48(%rsi), %xmm6
+    movdqu 48(%rdi), %xmm7
+    pcmpeqb %xmm1, %xmm0
+    pcmpeqb %xmm3, %xmm2
+    pcmpeqb %xmm5, %xmm4
+    pcmpeqb %xmm7, %xmm6
+    pand %xmm2, %xmm0
+    pand %xmm6, %xmm4
+    pand %xmm4, %xmm0
+    pmovmskb %xmm0, %edx
+    addq $64, %rsi
+    addq $64, %rdi
+    subq $64, %rbx
+    cmpl $0xffff, %edx
+    je 1b
+    xorl %eax, %eax
+    jmp 9f
+    3:
+    cmpq $8, %rbx
+    jbe 4f
+    movq (%rsi), %rcx
+    movq (%rdi), %rdx
+    addq $8, %rsi
+    addq $8, %rdi
+    subq $8, %rbx
+    cmpq %rdx, %rcx
+    je 3b
+    xorl %eax, %eax
+    jmp 9f
+    4:
+    movq -8(%rsi,%rbx), %rcx
+    movq -8(%rdi,%rbx), %rdx
+    xorl %eax, %eax
+    cmpq %rdx, %rcx
+    sete %al
+    jmp 9f
+    5:
+    movl $0, %eax
+    cmpq $0, %rbx
+    je 8f
+    leaq 0(,%rbx,8), %rcx
+    negq %rcx
+    cmpb $0xf8, %sil
+    ja 6f
+    movq (%rsi), %rsi
+    jmp 7f
+    6:
+    movq -8(%rsi,%rbx), %rsi
+    shrq %cl, %rsi
+    7:
+    cmpb $0xf8, %dil
+    ja 10f
+    movq (%rdi), %rdi
+    jmp 11f
+    10:
+    movq -8(%rdi,%rbx), %rdi
+    shrq %cl, %rdi
+    11:
+    subq %rsi, %rdi
+    shlq %cl, %rdi
+    movl $0, %eax
+    8:
+    sete %al
+    9:
+  end;
+  asm arm64 (A: in x0; B: in x1; N: in x2; Result: out x0)
+    cbz x2, 8f
+    cmp x2, #1
+    b.eq 7f
+    cmp x2, #16
+    b.lo 4f
+    bic x3, x2, #0x3f
+    cbz x3, 2f
+    add x6, x0, x3
+    1:
+    ld1 {v0.2d, v1.2d, v2.2d, v3.2d}, [x0], #64
+    ld1 {v4.2d, v5.2d, v6.2d, v7.2d}, [x1], #64
+    cmeq v8.2d, v0.2d, v4.2d
+    cmeq v9.2d, v1.2d, v5.2d
+    cmeq v10.2d, v2.2d, v6.2d
+    cmeq v11.2d, v3.2d, v7.2d
+    and v8.16b, v8.16b, v9.16b
+    and v8.16b, v8.16b, v10.16b
+    and v8.16b, v8.16b, v11.16b
+    cmp x0, x6
+    mov x4, v8.d[0]
+    mov x5, v8.d[1]
+    cbz x4, 9f
+    cbz x5, 9f
+    b.ne 1b
+    and x2, x2, #0x3f
+    cbz x2, 8f
+    2:
+    bic x3, x2, #0xf
+    cbz x3, 4f
+    add x6, x0, x3
+    3:
+    ldp x4, x5, [x0], #16
+    ldp x7, x9, [x1], #16
+    eor x7, x4, x7
+    cbnz x7, 9f
+    eor x9, x5, x9
+    cbnz x9, 9f
+    cmp x0, x6
+    b.ne 3b
+    and x2, x2, #0xf
+    cbz x2, 8f
+    4:
+    tbz x2, #3, 5f
+    ldr x4, [x0]
+    ldr x5, [x1]
+    eor x5, x4, x5
+    cbnz x5, 9f
+    sub x6, x2, #8
+    ldr x4, [x0, x6]
+    ldr x5, [x1, x6]
+    eor x5, x4, x5
+    cbnz x5, 9f
+    b 8f
+    5:
+    tbz x2, #2, 6f
+    ldr w4, [x0]
+    ldr w5, [x1]
+    eor w5, w4, w5
+    cbnz w5, 9f
+    sub x6, x2, #4
+    ldr w4, [x0, x6]
+    ldr w5, [x1, x6]
+    eor w5, w4, w5
+    cbnz w5, 9f
+    b 8f
+    6:
+    tbz x2, #1, 10f
+    ldrh w4, [x0], #2
+    ldrh w5, [x1], #2
+    cmp w4, w5
+    b.ne 9f
+    10:
+    tbz x2, #0, 8f
+    7:
+    ldrb w4, [x0]
+    ldrb w5, [x1]
+    cmp w4, w5
+    b.ne 9f
+    8:
+    mov x0, #1
+    b 11f
+    9:
+    mov x0, xzr
+    11:
+  end;
+end;
+
+{ ---- CaseMap ---- }
+
+{ Dst[i] := Src[i] with the ASCII letters to upper case (Upper) or to
+  lower case: a byte b is a letter to flip when b - First, a byte's
+  wrap, is at most 25, First 'a' or 'A', and its bit 32 flips. }
+procedure PasCaseMapPlain(Src, Dst: Pointer; N: Int64; Upper: Boolean);
+var
+  i, b, first: Int64;
+begin
+  if Upper then
+    first := 97
+  else
+    first := 65;
+  for i := 0 to N - 1 do
+  begin
+    b := PByte(Src)[i];
+    if ((b - first) and 255) <= 25 then
+      b := b xor 32;
+    PByte(Dst)[i] := Byte(b);
+  end;
+end;
+
+{ 32 bytes a step on AVX2 and 16 after, 16 on SSE2 (Base): vpsubb takes
+  First away, vpminub against 25 and vpcmpeqb mark the letters, vpand
+  keeps 32 there and vpxor flips it; the last bytes one by one. NEON on
+  arm64: sub, cmhi against 26, and, eor, 16 bytes a step. }
+procedure PasCaseMapCpu(Src, Dst: Pointer; N: Int64; Upper: Boolean);
+begin
+  asm amd64 (Src: in rsi; Dst: in rdi; N: in rcx; Upper: in rdx)
+    movl $97, %r10d
+    testq %rdx, %rdx
+    jnz 1f
+    movl $65, %r10d
+    1:
+    vmovd %r10d, %xmm0
+    vpbroadcastb %xmm0, %ymm0
+    movl $25, %eax
+    vmovd %eax, %xmm1
+    vpbroadcastb %xmm1, %ymm1
+    movl $32, %eax
+    vmovd %eax, %xmm2
+    vpbroadcastb %xmm2, %ymm2
+    2:
+    cmpq $32, %rcx
+    jb 3f
+    vmovdqu (%rsi), %ymm3
+    vpsubb %ymm0, %ymm3, %ymm4
+    vpminub %ymm1, %ymm4, %ymm5
+    vpcmpeqb %ymm4, %ymm5, %ymm5
+    vpand %ymm2, %ymm5, %ymm5
+    vpxor %ymm5, %ymm3, %ymm3
+    vmovdqu %ymm3, (%rdi)
+    addq $32, %rsi
+    addq $32, %rdi
+    subq $32, %rcx
+    jmp 2b
+    3:
+    cmpq $16, %rcx
+    jb 4f
+    vmovdqu (%rsi), %xmm3
+    vpsubb %xmm0, %xmm3, %xmm4
+    vpminub %xmm1, %xmm4, %xmm5
+    vpcmpeqb %xmm4, %xmm5, %xmm5
+    vpand %xmm2, %xmm5, %xmm5
+    vpxor %xmm5, %xmm3, %xmm3
+    vmovdqu %xmm3, (%rdi)
+    addq $16, %rsi
+    addq $16, %rdi
+    subq $16, %rcx
+    4:
+    testq %rcx, %rcx
+    jz 9f
+    5:
+    movzbl (%rsi), %r8d
+    movl %r8d, %r9d
+    subl %r10d, %r9d
+    andl $255, %r9d
+    cmpl $25, %r9d
+    ja 6f
+    xorl $32, %r8d
+    6:
+    movb %r8b, (%rdi)
+    incq %rsi
+    incq %rdi
+    decq %rcx
+    jnz 5b
+    9:
+    vzeroupper
+  end;
+  asm arm64 (Src: in x0; Dst: in x1; N: in x2; Upper: in x3)
+    mov w4, #97
+    cbnz x3, 1f
+    mov w4, #65
+    1:
+    dup v0.16b, w4
+    movi v1.16b, #26
+    movi v2.16b, #32
+    2:
+    cmp x2, #16
+    b.lo 3f
+    ldr q3, [x0], #16
+    sub v4.16b, v3.16b, v0.16b
+    cmhi v5.16b, v1.16b, v4.16b
+    and v5.16b, v5.16b, v2.16b
+    eor v3.16b, v3.16b, v5.16b
+    str q3, [x1], #16
+    sub x2, x2, #16
+    b 2b
+    3:
+    cbz x2, 9f
+    ldrb w5, [x0], #1
+    sub w6, w5, w4
+    and w6, w6, #255
+    cmp w6, #25
+    b.hi 4f
+    eor w5, w5, #32
+    4:
+    strb w5, [x1], #1
+    sub x2, x2, #1
+    b 3b
+    9:
+  end;
+end;
+
+procedure PasCaseMapBase(Src, Dst: Pointer; N: Int64; Upper: Boolean);
+begin
+  asm amd64 (Src: in rsi; Dst: in rdi; N: in rcx; Upper: in rdx)
+    movl $97, %r10d
+    testq %rdx, %rdx
+    jnz 1f
+    movl $65, %r10d
+    1:
+    movd %r10d, %xmm0
+    punpcklbw %xmm0, %xmm0
+    punpcklbw %xmm0, %xmm0
+    pshufd $0, %xmm0, %xmm0
+    movl $0x19191919, %eax
+    movd %eax, %xmm1
+    pshufd $0, %xmm1, %xmm1
+    movl $0x20202020, %eax
+    movd %eax, %xmm2
+    pshufd $0, %xmm2, %xmm2
+    2:
+    cmpq $16, %rcx
+    jb 4f
+    movdqu (%rsi), %xmm3
+    movdqa %xmm3, %xmm4
+    psubb %xmm0, %xmm4
+    movdqa %xmm4, %xmm5
+    pminub %xmm1, %xmm5
+    pcmpeqb %xmm4, %xmm5
+    pand %xmm2, %xmm5
+    pxor %xmm5, %xmm3
+    movdqu %xmm3, (%rdi)
+    addq $16, %rsi
+    addq $16, %rdi
+    subq $16, %rcx
+    jmp 2b
+    4:
+    testq %rcx, %rcx
+    jz 9f
+    5:
+    movzbl (%rsi), %r8d
+    movl %r8d, %r9d
+    subl %r10d, %r9d
+    andl $255, %r9d
+    cmpl $25, %r9d
+    ja 6f
+    xorl $32, %r8d
+    6:
+    movb %r8b, (%rdi)
+    incq %rsi
+    incq %rdi
+    decq %rcx
+    jnz 5b
+    9:
+  end;
+  asm arm64 (Src: in x0; Dst: in x1; N: in x2; Upper: in x3)
+    mov w4, #97
+    cbnz x3, 1f
+    mov w4, #65
+    1:
+    dup v0.16b, w4
+    movi v1.16b, #26
+    movi v2.16b, #32
+    2:
+    cmp x2, #16
+    b.lo 3f
+    ldr q3, [x0], #16
+    sub v4.16b, v3.16b, v0.16b
+    cmhi v5.16b, v1.16b, v4.16b
+    and v5.16b, v5.16b, v2.16b
+    eor v3.16b, v3.16b, v5.16b
+    str q3, [x1], #16
+    sub x2, x2, #16
+    b 2b
+    3:
+    cbz x2, 9f
+    ldrb w5, [x0], #1
+    sub w6, w5, w4
+    and w6, w6, #255
+    cmp w6, #25
+    b.hi 4f
+    eor w5, w5, #32
+    4:
+    strb w5, [x1], #1
+    sub x2, x2, #1
+    b 3b
+    9:
+  end;
+end;
+
+{ ---- Pos ---- }
+
+{ Rabin-Karp over S[From..N-1] for Sub (Go's IndexRabinKarp): the place
+  from 0 in S, -1 when there is none. }
+function RabinKarp(Sp, Sb: PByte; N, NS, From: Int64; Cpu: Boolean): Int64;
+var
+  hs, pw, sq, h: UInt32;
+  i, k: Int64;
+begin
+  Result := -1;
+  hs := 0;
+  for i := 0 to NS - 1 do
+    hs := hs * PrimeRK + Sb[i];
+  pw := 1;
+  sq := PrimeRK;
+  k := NS;
+  while k > 0 do
+  begin
+    if (k and 1) <> 0 then
+      pw := pw * sq;
+    sq := sq * sq;
+    k := k shr 1;
+  end;
+  if N - From < NS then
+    Exit;
+  h := 0;
+  for i := From to From + NS - 1 do
+    h := h * PrimeRK + Sp[i];
+  i := From + NS;
+  while True do
+  begin
+    if h = hs then
+    begin
+      if Cpu then
+      begin
+        if PasMemEqCpu(@Sp[i - NS], Sb, NS) then
+        begin
+          Result := i - NS;
+          Exit;
+        end;
+      end
+      else if PasMemEqBase(@Sp[i - NS], Sb, NS) then
+      begin
+        Result := i - NS;
+        Exit;
+      end;
+    end;
+    if i >= N then
+      Exit;
+    h := h * PrimeRK + Sp[i];
+    h := h - pw * Sp[i - NS];
+    i := i + 1;
+  end;
+end;
+
+{ The place from 0 of Sub (NS bytes) in S (N bytes) from byte From on,
+  -1 when it is not there: Go's stringslite.Index, IndexByte to the
+  next first byte, MemEq for the rest, Rabin-Karp once the first byte
+  has matched too often in vain. }
+function IndexOf(Sp, Sb: PByte; N, NS, From: Int64; Cpu: Boolean): Int64;
+var
+  c0, c1: Int64;
+  i, t, o, fails: Int64;
+  eq: Boolean;
+begin
+  Result := -1;
+  if NS > N - From then
+    Exit;
+  c0 := Sb[0];
+  if NS = 1 then
+  begin
+    if Cpu then
+      o := PasIndexByteCpu(@Sp[From], N - From, c0)
+    else
+      o := PasIndexByteBase(@Sp[From], N - From, c0);
+    if o >= 0 then
+      Result := From + o;
+    Exit;
+  end;
+  c1 := Sb[1];
+  i := From;
+  t := N - NS + 1;
+  fails := 0;
+  while i < t do
+  begin
+    if Sp[i] <> c0 then
+    begin
+      if Cpu then
+        o := PasIndexByteCpu(@Sp[i + 1], t - i - 1, c0)
+      else
+        o := PasIndexByteBase(@Sp[i + 1], t - i - 1, c0);
+      if o < 0 then
+        Exit;
+      i := i + o + 1;
+    end;
+    if Sp[i + 1] = c1 then
+    begin
+      if Cpu then
+        eq := PasMemEqCpu(@Sp[i], Sb, NS)
+      else
+        eq := PasMemEqBase(@Sp[i], Sb, NS);
+      if eq then
+      begin
+        Result := i;
+        Exit;
+      end;
+    end;
+    i := i + 1;
+    fails := fails + 1;
+    if (fails >= 4 + (i shr 4)) and (i < t) then
+    begin
+      Result := RabinKarp(Sp, Sb, N, NS, i, Cpu);
+      Exit;
+    end;
+  end;
+end;
+
+{ Pos(Sub, S, Offset), as Free Pascal: the place from 1 of the first
+  Sub in S at Offset or after, 0 when there is none, when Sub is empty
+  or when Offset is below 1 or past S. }
+function PosOf(const Sub, S: string; Offset: Int64; Cpu: Boolean): Int64;
+var
+  r: Int64;
+begin
+  Result := 0;
+  if (Length(Sub) = 0) or (Offset < 1) or (Offset > Length(S)) then
+    Exit;
+  r := IndexOf(PByte(@S[1]), PByte(@Sub[1]), Length(S), Length(Sub), Offset - 1, Cpu);
+  if r >= 0 then
+    Result := r + 1;
+end;
+
+function PasPosCpu(const Sub, S: string; Offset: Int64): Int64;
+begin
+  Result := PosOf(Sub, S, Offset, True);
+end;
+
+function PasPosBase(const Sub, S: string; Offset: Int64): Int64;
+begin
+  Result := PosOf(Sub, S, Offset, False);
+end;
+
+function PasPosCharCpu(C: Char; const S: string; Offset: Int64): Int64;
+var
+  r: Int64;
+begin
+  Result := 0;
+  if (Offset < 1) or (Offset > Length(S)) then
+    Exit;
+  r := PasIndexByteCpu(@S[Offset], Length(S) - Offset + 1, Ord(C));
+  if r >= 0 then
+    Result := Offset + r;
+end;
+
+function PasPosCharBase(C: Char; const S: string; Offset: Int64): Int64;
+var
+  r: Int64;
+begin
+  Result := 0;
+  if (Offset < 1) or (Offset > Length(S)) then
+    Exit;
+  r := PasIndexByteBase(@S[Offset], Length(S) - Offset + 1, Ord(C));
+  if r >= 0 then
+    Result := Offset + r;
+end;
+
+{ ---- Case ---- }
+
+function MapCase(const S: string; Upper, Cpu: Boolean): string;
+begin
+  Result := '';
+  if Length(S) = 0 then
+    Exit;
+  SetLength(Result, Length(S));
+  if Cpu then
+    PasCaseMapCpu(@S[1], @Result[1], Length(S), Upper)
+  else
+    PasCaseMapBase(@S[1], @Result[1], Length(S), Upper);
+end;
+
+function PasUpperCpu(const S: string): string;
+begin
+  Result := MapCase(S, True, True);
+end;
+
+function PasUpperBase(const S: string): string;
+begin
+  Result := MapCase(S, True, False);
+end;
+
+function PasLowerCpu(const S: string): string;
+begin
+  Result := MapCase(S, False, True);
+end;
+
+function PasLowerBase(const S: string): string;
+begin
+  Result := MapCase(S, False, False);
+end;
+
+{ ---- Insert, Delete, StringOfChar ---- }
+
+{ Insert(Src, S, Index), as Free Pascal: Src goes in before S[Index],
+  at the start when Index is below 1, at the end when it is past S. }
+procedure PasInsertStr(const Src: string; var S: string; Index: Int64);
+var
+  n, k: Int64;
+  r: string;
+begin
+  k := Length(Src);
+  if k = 0 then
+    Exit;
+  n := Length(S);
+  if Index < 1 then
+    Index := 1;
+  if Index > n + 1 then
+    Index := n + 1;
+  r := '';
+  SetLength(r, n + k);
+  if Index > 1 then
+    Move(S[1], r[1], Index - 1);
+  Move(Src[1], r[Index], k);
+  if Index <= n then
+    Move(S[Index], r[Index + k], n - Index + 1);
+  S := r;
+end;
+
+{ Delete(S, Index, Count), as Free Pascal: Count characters from
+  S[Index] on, to the end when there are fewer; nothing when Index is
+  below 1 or past S or Count is not above 0. }
+procedure PasDeleteStr(var S: string; Index, Count: Int64);
+var
+  n: Int64;
+  r: string;
+begin
+  n := Length(S);
+  if (Index < 1) or (Index > n) or (Count <= 0) then
+    Exit;
+  if Count > n - Index + 1 then
+    Count := n - Index + 1;
+  r := '';
+  SetLength(r, n - Count);
+  if Index > 1 then
+    Move(S[1], r[1], Index - 1);
+  if Index + Count <= n then
+    Move(S[Index + Count], r[Index], n - Index - Count + 1);
+  S := r;
+end;
+
+{ N characters C, none when N is not above 0. }
+function PasStringOfChar(C: Char; N: Int64): string;
+begin
+  Result := '';
+  if N <= 0 then
+    Exit;
+  SetLength(Result, N);
+  FillChar(Result[1], N, Ord(C));
+end;
+
+{ ---- Val ---- }
+
+{ A number's text as Free Pascal's Val reads it: blanks and tabs first,
+  a sign, then decimal digits, or $ (or 0x or x) and hexadecimal ones,
+  % and binary ones, & and octal ones; a NUL ends it. Code is 0, or the
+  place from 1 of the first character that is none of it (the end's
+  place when the digits are missing, the digit's where 64 bits
+  overflow); an unsigned type's number takes no minus, the place of
+  its first digit said. }
+function PasValInt(const S: string; Unsigned: Boolean; out Code: Int64): Int64;
+var
+  i, n, base, d, acc: Int64;
+  neg: Boolean;
+  c: Char;
+begin
+  Result := 0;
+  n := Length(S);
+  i := 1;
+  while (i <= n) and ((S[i] = ' ') or (S[i] = #9)) do
+    i := i + 1;
+  Code := i;
+  if (i > n) or (S[i] = #0) then
+    Exit;
+  neg := False;
+  if S[i] = '-' then
+  begin
+    neg := True;
+    i := i + 1;
+  end
+  else if S[i] = '+' then
+    i := i + 1;
+  base := 10;
+  if i <= n then
+  begin
+    if S[i] = '$' then
+    begin
+      base := 16;
+      i := i + 1;
+    end
+    else if S[i] = '%' then
+    begin
+      base := 2;
+      i := i + 1;
+    end
+    else if S[i] = '&' then
+    begin
+      base := 8;
+      i := i + 1;
+    end
+    else if (S[i] = 'x') or (S[i] = 'X') then
+    begin
+      base := 16;
+      i := i + 1;
+    end
+    else if (S[i] = '0') and (i < n) and ((S[i + 1] = 'x') or (S[i + 1] = 'X')) then
+    begin
+      base := 16;
+      i := i + 2;
+    end;
+  end;
+  Code := i;
+  if (i > n) or (S[i] = #0) then
+    Exit;
+  if neg and Unsigned then
+    Exit;
+  acc := 0;
+  while (i <= n) and (S[i] <> #0) do
+  begin
+    c := S[i];
+    if (c >= '0') and (c <= '9') then
+      d := Ord(c) - 48
+    else if (c >= 'a') and (c <= 'f') then
+      d := Ord(c) - 87
+    else if (c >= 'A') and (c <= 'F') then
+      d := Ord(c) - 55
+    else
+      d := 99;
+    if d >= base then
+    begin
+      Code := i;
+      Result := 0;
+      Exit;
+    end;
+    if base = 10 then
+    begin
+      { worked out below zero, where Int64 reaches one further }
+      if (acc < -922337203685477580) or ((acc = -922337203685477580) and (d > 8)) then
+      begin
+        Code := i;
+        Result := 0;
+        Exit;
+      end;
+      acc := acc * 10 - d;
+    end
+    else
+    begin
+      { hexadecimal, octal, binary: any 64 bits }
+      if (base = 16) and ((acc shr 60) <> 0) or (base = 8) and ((acc shr 61) <> 0) or
+        (base = 2) and ((acc shr 63) <> 0) then
+      begin
+        Code := i;
+        Result := 0;
+        Exit;
+      end;
+      if base = 16 then
+        acc := (acc shl 4) or d
+      else if base = 8 then
+        acc := (acc shl 3) or d
+      else
+        acc := (acc shl 1) or d;
+    end;
+    i := i + 1;
+  end;
+  if base = 10 then
+  begin
+    if neg then
+      Result := acc
+    else if acc = Low(Int64) then
+    begin
+      { 2^63 has no Int64: the last digit overflows }
+      Code := i - 1;
+      Exit;
+    end
+    else
+      Result := -acc;
+  end
+  else if neg then
+    Result := -acc
+  else
+    Result := acc;
+  Code := 0;
+end;
+
+{ A real's text as Val reads it: blanks, a sign, digits with a point
+  among or after them, an exponent; Code as PasValInt's. The value is
+  the nearest Double, pasfmt's PasParseReal. }
+function PasValReal(const S: string; out Code: Int64): Double;
+var
+  i, n, start, nd, k: Int64;
+  t: string;
+  bits: Int64;
+begin
+  Result := 0;
+  n := Length(S);
+  i := 1;
+  while (i <= n) and ((S[i] = ' ') or (S[i] = #9)) do
+    i := i + 1;
+  Code := i;
+  if (i > n) or (S[i] = #0) then
+    Exit;
+  start := i;
+  if (S[i] = '-') or (S[i] = '+') then
+    i := i + 1;
+  nd := 0;
+  while (i <= n) and (S[i] >= '0') and (S[i] <= '9') do
+  begin
+    i := i + 1;
+    nd := nd + 1;
+  end;
+  if (i <= n) and (S[i] = '.') then
+  begin
+    i := i + 1;
+    while (i <= n) and (S[i] >= '0') and (S[i] <= '9') do
+    begin
+      i := i + 1;
+      nd := nd + 1;
+    end;
+  end;
+  if nd = 0 then
+  begin
+    Code := i;
+    Exit;
+  end;
+  if (i <= n) and ((S[i] = 'e') or (S[i] = 'E')) then
+  begin
+    i := i + 1;
+    if (i <= n) and ((S[i] = '-') or (S[i] = '+')) then
+      i := i + 1;
+    if (i > n) or (S[i] < '0') or (S[i] > '9') then
+    begin
+      Code := i;
+      Exit;
+    end;
+    while (i <= n) and (S[i] >= '0') and (S[i] <= '9') do
+      i := i + 1;
+  end;
+  if (i <= n) and (S[i] <> #0) then
+  begin
+    Code := i;
+    Exit;
+  end;
+  { the digits as PasParseReal reads them: a 0 before a leading point
+    and after a trailing one }
+  t := '';
+  for k := start to i - 1 do
+  begin
+    if (S[k] = '.') and ((k = start) or (S[k - 1] < '0') or (S[k - 1] > '9')) then
+      t := t + '0';
+    t := t + S[k];
+    if (S[k] = '.') and ((k = i - 1) or (S[k + 1] < '0') or (S[k + 1] > '9')) then
+      t := t + '0';
+  end;
+  if (Length(t) > 0) and (t[1] = '+') then
+    t := Copy(t, 2, Length(t) - 1);
+  if not PasParseReal(t, bits) then
+  begin
+    Code := start;
+    Exit;
+  end;
+  Result := (bits as Double);
+  Code := 0;
+end;
+
+{ Names: an enumeration's members, each followed by a NUL; the one S
+  names, whatever its case, and Code 0; else -1 and Code 1. }
+function PasValEnum(const S: string; const Names: string; out Code: Int64): Int64;
+var
+  i, k, st: Int64;
+  w: string;
+begin
+  Result := 0;
+  Code := 1;
+  k := 0;
+  st := 1;
+  for i := 1 to Length(Names) do
+    if Names[i] = #0 then
+    begin
+      w := Copy(Names, st, i - st);
+      if (Length(w) = Length(S)) and (MapCase(w, True, False) = MapCase(S, True, False)) then
+      begin
+        Result := k;
+        Code := 0;
+        Exit;
+      end;
+      k := k + 1;
+      st := i + 1;
+    end;
+end;
+
+{ The name of member V of the enumeration whose names Names holds, as
+  PasValEnum reads them; its number when V is none of them. Width W pads
+  it on the right with blanks, as Free Pascal's Str does. }
+function PasEnumName(V: Int64; const Names: string; W: Int64): string;
+var
+  i, k, st: Int64;
+begin
+  k := 0;
+  st := 1;
+  for i := 1 to Length(Names) do
+    if Names[i] = #0 then
+    begin
+      if k = V then
+      begin
+        Result := Copy(Names, st, i - st);
+        while Length(Result) < W do
+          Result := Result + ' ';
+        Exit;
+      end;
+      k := k + 1;
+      st := i + 1;
+    end;
+  Result := PasFmtInt(V, W);
+end;
+
+end.

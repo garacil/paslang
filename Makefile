@@ -76,8 +76,8 @@ SELF_UNITS := \
 A64DIR := $(BUILDDIR)/a64
 
 # The golden tests: testdata/<t>.paslang must print testdata/<t>.out.
-GOLDEN := hello arith ifthen loops const caseof procs recfn records ptrs arrs strs grow paswork pingpong chclose sel exc excg nest cls gen enums sets dbg opt gdbg inherit rtti args8 mevent slice chlit armmeth propacc runes variant opadd args20 iface opmore props pindex dwarfloc shift dynnil xor inhcall isas sysid forward defaults abstract overload methov strdef trig logexp arctan invpow logx trig2 hyper miscmath xxh32 xxh64 map1 map2 sync1 sync2 finexit zerolocal pchar selx selstress wrchar chstr lookpath strcmp dupparam recarg funcval constk regloop reszero divconst bareln gctypes chr charcat heapspan blobzero gcbasic mapsplit stackmap trygrow growgc xxh3 mapgetstr bounds fairq sized fwdptr constexpr int2real typedconst caserange emptystmt writefmt realparse realfmt valpar strcow chanany chanbuf memmove overnarrow slicegrow fatexit narrow narrowmem recalign narrowbounds dwarfnarrow narrowgo forlimit bce inplace narrowasm slicereg forrun addrform bcerun inspine framearr realstep f32conv single dwarfreal ptrtyped ptrarith ptrsafe memview checkptr ptrreach cpwalk realint quadcore quadfmt quad quadconst dwarfquad bitops declorder convchain bitwords bitmem bitany views blocks wide ifdef quadfast memwords cpuwords vectors vecmore inlineasm vecpool addrlocal rotwords rotmem ctxwords append funcval2 closures pasargs ifaceargs vshrs64 auditfix closurebox audit2 visibility freedestroy reservedall nodeadlock mapfix tree1 tree2 hash1 store1 immwide constref inline1 stackargs mainexit networds charcmp unixsock sigpipe sleepmany deadlines strfill narrowpop tobject1 excobj1 excobj2 excobj3 classref1 ctorargs aconst1 aconst2 methdef1 set256 subrange1 subrange2 helper1 helper2
-GOLDEN_A64 := map1 map2 sync1 sync2 finexit zerolocal pchar pingpong sel chclose paswork selx selstress wrchar args8 arith arrs caseof chlit cls const enums exc excg gen grow hyper ifthen inherit loops mevent miscmath nest procs ptrs recfn records sets strs trig2 xxh32 xxh64 rtti gdbg chstr strcmp recarg funcval constk regloop reszero divconst bareln gctypes chr charcat heapspan blobzero gcbasic mapsplit stackmap trygrow growgc xxh3 mapgetstr bounds fairq sized fwdptr constexpr int2real typedconst caserange emptystmt writefmt realparse realfmt valpar strcow chanany chanbuf memmove overnarrow slicegrow fatexit narrow narrowmem recalign narrowbounds dwarfnarrow narrowgo forlimit bce inplace narrowasm slicereg forrun addrform bcerun inspine framearr realstep f32conv single dwarfreal ptrtyped ptrarith ptrsafe memview checkptr ptrreach cpwalk realint quadcore quadfmt quad quadconst dwarfquad bitops declorder convchain bitwords bitmem bitany views blocks wide ifdef quadfast memwords cpuwords vectors vecmore inlineasm vecpool addrlocal rotwords rotmem ctxwords append funcval2 closures pasargs ifaceargs vshrs64 auditfix closurebox audit2 visibility freedestroy reservedall nodeadlock mapfix tree1 tree2 hash1 store1 immwide constref inline1 stackargs mainexit networds charcmp unixsock sigpipe sleepmany deadlines strfill narrowpop tobject1 excobj1 excobj2 excobj3 classref1 ctorargs aconst1 aconst2 methdef1 set256 subrange1 subrange2 helper1 helper2
+GOLDEN := hello arith ifthen loops const caseof procs recfn records ptrs arrs strs grow paswork pingpong chclose sel exc excg nest cls gen enums sets dbg opt gdbg inherit rtti args8 mevent slice chlit armmeth propacc runes variant opadd args20 iface opmore props pindex dwarfloc shift dynnil xor inhcall isas sysid forward defaults abstract overload methov strdef trig logexp arctan invpow logx trig2 hyper miscmath xxh32 xxh64 map1 map2 sync1 sync2 finexit zerolocal pchar selx selstress wrchar chstr lookpath strcmp dupparam recarg funcval constk regloop reszero divconst bareln gctypes chr charcat heapspan blobzero gcbasic mapsplit stackmap trygrow growgc xxh3 mapgetstr bounds fairq sized fwdptr constexpr int2real typedconst caserange emptystmt writefmt realparse realfmt valpar strcow chanany chanbuf memmove overnarrow slicegrow fatexit narrow narrowmem recalign narrowbounds dwarfnarrow narrowgo forlimit bce inplace narrowasm slicereg forrun addrform bcerun inspine framearr realstep f32conv single dwarfreal ptrtyped ptrarith ptrsafe memview checkptr ptrreach cpwalk realint quadcore quadfmt quad quadconst dwarfquad bitops declorder convchain bitwords bitmem bitany views blocks wide ifdef quadfast memwords cpuwords vectors vecmore inlineasm vecpool addrlocal rotwords rotmem ctxwords append funcval2 closures pasargs ifaceargs vshrs64 auditfix closurebox audit2 visibility freedestroy reservedall nodeadlock mapfix tree1 tree2 hash1 store1 immwide constref inline1 stackargs mainexit networds charcmp unixsock sigpipe sleepmany deadlines strfill narrowpop tobject1 excobj1 excobj2 excobj3 classref1 ctorargs aconst1 aconst2 methdef1 set256 subrange1 subrange2 helper1 helper2 strwords strkern
+GOLDEN_A64 := map1 map2 sync1 sync2 finexit zerolocal pchar pingpong sel chclose paswork selx selstress wrchar args8 arith arrs caseof chlit cls const enums exc excg gen grow hyper ifthen inherit loops mevent miscmath nest procs ptrs recfn records sets strs trig2 xxh32 xxh64 rtti gdbg chstr strcmp recarg funcval constk regloop reszero divconst bareln gctypes chr charcat heapspan blobzero gcbasic mapsplit stackmap trygrow growgc xxh3 mapgetstr bounds fairq sized fwdptr constexpr int2real typedconst caserange emptystmt writefmt realparse realfmt valpar strcow chanany chanbuf memmove overnarrow slicegrow fatexit narrow narrowmem recalign narrowbounds dwarfnarrow narrowgo forlimit bce inplace narrowasm slicereg forrun addrform bcerun inspine framearr realstep f32conv single dwarfreal ptrtyped ptrarith ptrsafe memview checkptr ptrreach cpwalk realint quadcore quadfmt quad quadconst dwarfquad bitops declorder convchain bitwords bitmem bitany views blocks wide ifdef quadfast memwords cpuwords vectors vecmore inlineasm vecpool addrlocal rotwords rotmem ctxwords append funcval2 closures pasargs ifaceargs vshrs64 auditfix closurebox audit2 visibility freedestroy reservedall nodeadlock mapfix tree1 tree2 hash1 store1 immwide constref inline1 stackargs mainexit networds charcmp unixsock sigpipe sleepmany deadlines strfill narrowpop tobject1 excobj1 excobj2 excobj3 classref1 ctorargs aconst1 aconst2 methdef1 set256 subrange1 subrange2 helper1 helper2 strwords strkern
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -90,6 +90,7 @@ CORE_UNITS := \
 	src/lib/pastree.paslang \
 	src/lib/pasheap.paslang \
 	src/lib/pasfmt.paslang \
+	src/lib/passtr.paslang \
 	src/lib/pasquad.paslang
 
 # The library units a program reaches with a uses clause. They are not
@@ -459,7 +460,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/stackmap.out $(BUILDDIR)/stackmap.vgot; \
 	echo ok stackmaps; \
 	echo "==== the base processor (-cpu base) ===="; \
-	for t in vectors vecmore vecpool bitwords xxh3 inlineasm hash1 tree1 store1 mapsplit set256; do \
+	for t in vectors vecmore vecpool bitwords xxh3 inlineasm hash1 tree1 store1 mapsplit set256 strwords strkern; do \
 	  $(OUTDIR)/paslangc -cpu base -o $(BUILDDIR)/$$t-base testdata/$$t.paslang; \
 	  $(BUILDDIR)/$$t-base > $(BUILDDIR)/$$t.bgot; \
 	  diff -u testdata/$$t.out $(BUILDDIR)/$$t.bgot; \
@@ -478,6 +479,9 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	if grep -qw 'ptest' $(BUILDDIR)/set256-base.s; then echo "set256-base.s carries SSE4.1"; exit 1; fi; \
 	if grep -qw 'tzcntq' $(BUILDDIR)/set256-base.s; then echo "set256-base.s carries BMI1"; exit 1; fi; \
 	grep -qw 'vptest' $(BUILDDIR)/set256.s; \
+	grep -q 'p_passtr_pasposcpu' $(BUILDDIR)/strwords.s; \
+	grep -q 'p_passtr_pasupperbase' $(BUILDDIR)/strwords-base.s; \
+	if grep -q 'p_passtr_pasposcpu' $(BUILDDIR)/strwords-base.s; then echo "strwords-base.s calls the AVX2 search"; exit 1; fi; \
 	grep -qw 'tzcntq' $(BUILDDIR)/set256.s; \
 	grep -qw 'ptest' $(BUILDDIR)/set256-v2.s; \
 	if grep -qw 'vptest' $(BUILDDIR)/set256-v2.s; then echo "set256-v2.s carries AVX2"; exit 1; fi; \
@@ -777,6 +781,24 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'a helper descends from a helper of its kind at 9:22' $(BUILDDIR)/helpbad_otherkind.err; \
 	grep -q 'Integer has no members: Twice needs a record, an object or a helper for Integer at 6:13' $(BUILDDIR)/helpbad_nomember.err; \
 	echo ok helpbad; \
+	echo "==== string word rejects (P134) ===="; \
+	for n in copyslice insertconst insertslice strstring strdec valchar valcode soc upint posname valname; do \
+	  if $(OUTDIR)/paslangc -o $(BUILDDIR)/strbad_$$n testdata/strbad/$$n.paslang >$(BUILDDIR)/strbad_$$n.err 2>&1; then \
+	    echo "$$n should fail"; exit 1; \
+	  fi; \
+	done; \
+	grep -q 'Copy takes a string, not array of Integer: a slice.s elements are a\[i..j\] at 6:21' $(BUILDDIR)/strbad_copyslice.err; \
+	grep -q 'Insert(src, s, i): s needs a variable at 3:24' $(BUILDDIR)/strbad_insertconst.err; \
+	grep -q 'Insert takes a string variable, not array of Integer: a slice grows with Append at 5:18' $(BUILDDIR)/strbad_insertslice.err; \
+	grep -q 'Str takes a number or an enumeration.s member, not string at 5:16' $(BUILDDIR)/strbad_strstring.err; \
+	grep -q 'decimals are for a real at 5:16' $(BUILDDIR)/strbad_strdec.err; \
+	grep -q 'Val reads a number, a real or an enumeration.s member, not Char at 6:20' $(BUILDDIR)/strbad_valchar.err; \
+	grep -q 'Val(s, v, code): code is an integer variable, not string at 6:20' $(BUILDDIR)/strbad_valcode.err; \
+	grep -q 'StringOfChar takes a Char, not string at 3:32' $(BUILDDIR)/strbad_soc.err; \
+	grep -q 'a string or a Char goes here, not Integer at 3:20' $(BUILDDIR)/strbad_upint.err; \
+	grep -q 'Pos is a reserved word, not a name at 3:3' $(BUILDDIR)/strbad_posname.err; \
+	grep -q 'Val is a reserved word, not a name at 2:10' $(BUILDDIR)/strbad_valname.err; \
+	echo ok strbad; \
 	echo "==== forward pointer rejects ===="; \
 	for f in fwdopen:TX:4:9 fwdvar:TZ:4:7 fwdlater:TW:4:9; do \
 	  n=$${f%%:*}; w=$${f#*:}; \
@@ -1937,7 +1959,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	  echo ok $$t-arm; \
 	done; \
 	echo "==== the base processor arm64 ===="; \
-	for t in hash1 tree1 store1 vectors bitwords set256; do \
+	for t in hash1 tree1 store1 vectors bitwords set256 strwords strkern; do \
 	  $(OUTDIR)/paslangc -target arm64 -cpu base -o $(BUILDDIR)/$$t-arm-base testdata/$$t.paslang; \
 	  timeout 120 $(QEMU_A64) $(BUILDDIR)/$$t-arm-base > $(BUILDDIR)/$$t-arm.bgot; \
 	  diff -u testdata/$$t.out $(BUILDDIR)/$$t-arm.bgot; \
