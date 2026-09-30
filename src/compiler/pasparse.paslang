@@ -98,6 +98,7 @@ type
     FCPropSetSyms: TStrArray;
     FSymChain: TStrArray;  { the routines being parsed, outermost first }
     FBoxing: TStrArray;    { the routines that hold a closure inside }
+    FEscapedWith: TStrArray; { Owner/name: pointer bindings a with's closures pin (P166) }
     FSafeNames: TStrArray;  { routines a header declared safe, for their bodies }
     FLex: TLexer;
     FTok: TToken;
@@ -138,6 +139,7 @@ type
     FConstBase, FTypeBase, FProcBase: SizeInt;  { where the outermost routine being read begins its names in the tables (P159) }
     FClassTyp: LongInt;
     FWith: array of PExpr;
+    FMethodSyms, FMethodNames, FMethodAt: TStrArray; { concrete own declarations, not imported/inherited (P167) }
     FUnitName: string;
     FIsUnit: Boolean;
     FInImpl: Boolean;
@@ -266,6 +268,7 @@ type
     function OuterDtorCall(E: PExpr): Boolean;
     function DtorStmt(E: PExpr; ALine: LongInt): PStmt;
     function ParseStmtsTilEnd: PStmt;
+    function ParseWith(ALine: LongInt): PStmt;
     function ParseExcept(Tr: PStmt; ALine: LongInt): PStmt;
     function ParseRaise(ALine: LongInt): PStmt;
     procedure CheckOutVar(V: PExpr; Typ: LongInt; const What: string);
@@ -295,6 +298,8 @@ type
     procedure CopyValueParams(var Pr: TProc; const Kids: array of PStmt);
     function IndexOfProc(const AName: string): SizeInt;
     procedure ParseDecls(NeedBody: Boolean);
+    procedure RememberMethod(const Sym, Name, At: string);
+    procedure CheckMethodBodies;
     function ParseUnit: TProgram;
     function ParsePackage: TProgram;
     function TypeOf(Id: LongInt): TTypeDef;
@@ -566,6 +571,11 @@ type
     function ParseAnon: PExpr;
     procedure MarkBoxing;
     procedure ComputeShared(var Pr: TProc; K0: SizeInt);
+    procedure WithValueFlow(E: PExpr; var Roots, Boxed: TStrArray);
+    procedure WithAddressFlow(E: PExpr; var Roots, Boxed: TStrArray);
+    procedure WithStmtFlow(S: PStmt; var Roots, Boxed: TStrArray);
+    function NestedUnder(const Sym, Parent: string; K0: SizeInt): Boolean;
+    procedure PinCaptured(const Name: string; K0: SizeInt);
     procedure PerIter(St: PStmt; const Counters: array of string; K0: SizeInt);
     function RenameCell(S: PStmt; const N, Cell: string; CT, T: LongInt): PStmt;
     function RenameCellE(E: PExpr; const N, Cell: string; CT, T: LongInt): PExpr;
@@ -7936,6 +7946,7 @@ begin
   td.Meths[n].IsStatic := isStat;
   td.Meths[n].IsCtor := isCtor;
   td.Meths[n].Vis := vis;
+  RememberMethod(baseSym, AName + '.' + mname, mpos);
 end;
 
 { A helper (P127): type helper for a simple type, record helper for a
@@ -8779,6 +8790,7 @@ begin
         td.Meths[n].RetTyp := TyNone;
         td.Meths[n].Vis := vis;
         td.Meths[n].Slot := -1;
+        RememberMethod(td.Meths[n].Sym, AName + '.' + mname, mpos);
         AddProcEnt(td.Meths[n].Sym, td.Meths[n].Sym, False, 0, TyNone);
         if isCtor then
           AppendStr(FClassCtors, td.Meths[n].Sym)
@@ -8851,6 +8863,8 @@ begin
       end
       else if ov < 0 then
         td.Meths[n].Slot := -1;
+      if not isAbs then
+        RememberMethod(td.Meths[n].Sym, AName + '.' + mname, mpos);
       AddProcEnt(td.Meths[n].Sym, td.Meths[n].Sym, isFunc, npar, t);
       Continue;
     end;
@@ -16075,21 +16089,7 @@ begin
         NoRealCond(st^.E);
       end;
     tkWith:
-      begin
-        FTok := FLex.Next;
-        e := ParseExpr;
-        if TypeOf(e^.Typ).Kind <> tykRecord then
-          Die('with record');
-        Eat(tkDo);
-        n := Length(FWith);
-        SetLength(FWith, n + 1);
-        FWith[n] := e;
-        nst := Self.ParseStmt;
-        SetLength(FWith, n);
-        st := NewStmt(skWith);
-        st^.E := e;
-        st^.Body := nst;
-      end;
+      st := ParseWith(lno);
     tkFor:
       begin
         FTok := FLex.Next;
@@ -19440,14 +19440,112 @@ end;
   refused, as Delphi refuses it. Hidden names (with a dot) are the
   compiler's own, but for the name an on handler gives its object
   (P122), which is the program's. }
+{ Captured with bindings: a small backwards data-flow graph, after
+  Go's escape.go. A copied pointer/value propagates its source, while
+  an escaping address also boxes its storage. Fields share their
+  containing location; a dereference propagates the pointer value.
+  This follows local pointer aliases without boxing a mere value copy
+  of a var parameter. Iteration in ComputeShared finds transitive flow. }
+procedure TParser.WithValueFlow(E: PExpr; var Roots, Boxed: TStrArray);
+var
+  i: SizeInt;
+begin
+  if E = nil then
+    Exit;
+  if E^.Kind = ekAddr then
+  begin
+    WithAddressFlow(E^.L, Roots, Boxed);
+    Exit;
+  end;
+  if E^.Kind = ekVar then
+  begin
+    if TypHasPtr(E^.Typ, 0) and not HasStr(Roots, E^.Name) then
+      AppendStr(Roots, E^.Name);
+    Exit;
+  end;
+  WithValueFlow(E^.L, Roots, Boxed);
+  if E^.Kind <> ekIndex then
+    WithValueFlow(E^.R, Roots, Boxed);
+  for i := 0 to High(E^.Args) do
+    WithValueFlow(E^.Args[i], Roots, Boxed);
+end;
+
+procedure TParser.WithAddressFlow(E: PExpr; var Roots, Boxed: TStrArray);
+begin
+  if E = nil then
+    Exit;
+  case E^.Kind of
+    ekVar:
+      begin
+        if not HasStr(Boxed, E^.Name) then
+          AppendStr(Boxed, E^.Name);
+        WithValueFlow(E, Roots, Boxed);
+      end;
+    ekField:
+      WithAddressFlow(E^.L, Roots, Boxed);
+    ekIndex:
+      if IsDynTyp(E^.L^.Typ) then
+        WithValueFlow(E^.L, Roots, Boxed)
+      else
+        WithAddressFlow(E^.L, Roots, Boxed);
+    ekDeref:
+      WithValueFlow(E^.L, Roots, Boxed);
+    ekUn:
+      WithAddressFlow(E^.L, Roots, Boxed);
+  else
+    WithValueFlow(E, Roots, Boxed);
+  end;
+end;
+
+procedure TParser.WithStmtFlow(S: PStmt; var Roots, Boxed: TStrArray);
+var
+  e: PExpr;
+  i: SizeInt;
+begin
+  if S = nil then
+    Exit;
+  if S^.Kind = skAssign then
+  begin
+    e := S^.Dest;
+    while (e <> nil) and ((e^.Kind = ekField) or (e^.Kind = ekIndex) or
+      (e^.Kind = ekDeref)) do
+      e := e^.L;
+    if (e <> nil) and (e^.Kind = ekVar) and HasStr(Roots, e^.Name) then
+      WithValueFlow(S^.E, Roots, Boxed);
+  end;
+  WithStmtFlow(S^.ThenSt, Roots, Boxed);
+  WithStmtFlow(S^.ElseSt, Roots, Boxed);
+  WithStmtFlow(S^.Body, Roots, Boxed);
+  for i := 0 to High(S^.Stmts) do
+    WithStmtFlow(S^.Stmts[i], Roots, Boxed);
+  for i := 0 to High(S^.Arms) do
+    WithStmtFlow(S^.Arms[i].Body, Roots, Boxed);
+  for i := 0 to High(S^.Sels) do
+    WithStmtFlow(S^.Sels[i].Body, Roots, Boxed);
+end;
+
 procedure TParser.ComputeShared(var Pr: TProc; K0: SizeInt);
 var
-  names: TStrArray;
+  names, roots, boxed: TStrArray;
   refs: array of Boolean;
-  i, k, n: SizeInt;
+  i, k, n, nr, nb: SizeInt;
   used: Boolean;
   d: TVarDecl;
+  prefix: string;
 begin
+  roots := nil;
+  boxed := nil;
+  prefix := Pr.Sym + '/';
+  for i := 0 to High(FEscapedWith) do
+    if Copy(FEscapedWith[i], 1, Length(prefix)) = prefix then
+      AppendStr(roots, Copy(FEscapedWith[i], Length(prefix) + 1,
+        Length(FEscapedWith[i]) - Length(prefix)));
+  if Length(roots) > 0 then
+    repeat
+      nr := Length(roots);
+      nb := Length(boxed);
+      WithStmtFlow(Pr.Body, roots, boxed);
+    until (nr = Length(roots)) and (nb = Length(boxed));
   names := nil;
   refs := nil;
   if Pr.ClassTyp <> 0 then
@@ -19471,9 +19569,9 @@ begin
   Pr.Shared := nil;
   for i := 0 to High(names) do
   begin
-    if HasDot(names[i]) and (OnVarUser(names[i]) = '') then
+    used := HasStr(boxed, names[i]);
+    if HasDot(names[i]) and (OnVarUser(names[i]) = '') and not used then
       Continue;
-    used := False;
     for k := K0 to High(FProg.Procs) do
       if StmtNames(FProg.Procs[k].Body, names[i]) then
         used := True;
@@ -19501,6 +19599,79 @@ begin
   n := Length(Pr.Locals);
   SetLength(Pr.Locals, n + 1);
   Pr.Locals[n] := d;
+end;
+
+{ Lexical ancestry of a routine parsed after K0. The parser constructs
+  this tree, so walking it needs no guessed depth limit. }
+function TParser.NestedUnder(const Sym, Parent: string; K0: SizeInt): Boolean;
+var
+  up: string;
+  i: SizeInt;
+  found: Boolean;
+begin
+  up := Sym;
+  while up <> '' do
+  begin
+    if up = Parent then
+    begin
+      Result := True;
+      Exit;
+    end;
+    found := False;
+    for i := K0 to High(FProg.Procs) do
+      if (not found) and (FProg.Procs[i].Sym = up) then
+      begin
+        up := FProg.Procs[i].ParentSym;
+        found := True;
+      end;
+    if not found then
+      Break;
+  end;
+  Result := False;
+end;
+
+{ A closure keeps the current value of a hidden cell pointer, not the
+  parent's mutable slot. Its extra environment is also the link of
+  its descendants; a descendant's use counts even when the closure's
+  own body does not name the cell. Shared by with and per-loop cells. }
+procedure TParser.PinCaptured(const Name: string; K0: SizeInt);
+var
+  par: string;
+  k, j, m: SizeInt;
+  used: Boolean;
+begin
+  par := '';
+  if FNest > 0 then
+  begin
+    if FFuncSym <> '' then
+      par := FFuncSym
+    else
+      par := ProcSym(FUnitName, FFuncName);
+  end;
+  for k := K0 to High(FProg.Procs) do
+    if FProg.Procs[k].IsAnon and (FProg.Procs[k].ParentSym = par) then
+    begin
+      used := False;
+      for j := K0 to High(FProg.Procs) do
+        if StmtNames(FProg.Procs[j].Body, Name) and
+          NestedUnder(FProg.Procs[j].Sym, FProg.Procs[k].Sym, K0) then
+          used := True;
+      if not used then
+        Continue;
+      if Length(FProg.Procs[k].Pins) = 0 then
+      begin
+        if FProg.Procs[k].Nest = 0 then
+          FProg.Procs[k].Nest := 1
+        else
+        begin
+          for m := K0 to High(FProg.Procs) do
+            if NestedUnder(FProg.Procs[m].Sym, FProg.Procs[k].Sym, K0) then
+              Inc(FProg.Procs[m].Nest);
+        end;
+      end;
+      if not HasStr(FProg.Procs[k].Pins, Name) then
+        AppendStr(FProg.Procs[k].Pins, Name);
+    end;
 end;
 
 { N in E seen through Cell: every read and write of the counter goes to
@@ -19599,8 +19770,8 @@ end;
   the counter at the pass's end, so the body may still change it. }
 procedure TParser.PerIter(St: PStmt; const Counters: array of string; K0: SizeInt);
 var
-  i, k, j, m: SizeInt;
-  c, cell, par, up: string;
+  i, k, j: SizeInt;
+  c, cell: string;
   ct, pt: LongInt;
   hit, own: Boolean;
   cellv: PExpr;
@@ -19608,15 +19779,6 @@ var
   d: TVarDecl;
   n: SizeInt;
 begin
-  if FNest > 0 then
-  begin
-    if FFuncSym <> '' then
-      par := FFuncSym
-    else
-      par := ProcSym(FUnitName, FFuncName);
-  end
-  else
-    par := '';
   for i := 0 to High(Counters) do
   begin
     c := Counters[i];
@@ -19665,43 +19827,7 @@ begin
       if not own then
         FProg.Procs[k].Body := RenameCell(FProg.Procs[k].Body, c, cell, pt, ct);
     end;
-    { a closure made right in the pass pins the cell; one level more
-      (its scope box) for it and what is nested in it }
-    for k := K0 to High(FProg.Procs) do
-      if FProg.Procs[k].IsAnon and (FProg.Procs[k].ParentSym = par) and
-        StmtNames(FProg.Procs[k].Body, cell) then
-      begin
-        if Length(FProg.Procs[k].Pins) = 0 then
-        begin
-          if FProg.Procs[k].Nest = 0 then
-            FProg.Procs[k].Nest := 1
-          else
-          begin
-            Inc(FProg.Procs[k].Nest);
-            for m := K0 to High(FProg.Procs) do
-            begin
-              up := FProg.Procs[m].ParentSym;
-              j := 0;
-              while (up <> '') and (up <> FProg.Procs[k].Sym) and (j < 64) do
-              begin
-                own := False;
-                for n := K0 to High(FProg.Procs) do
-                  if (not own) and (FProg.Procs[n].Sym = up) then
-                  begin
-                    up := FProg.Procs[n].ParentSym;
-                    own := True;
-                  end;
-                if not own then
-                  up := '';
-                Inc(j);
-              end;
-              if (up <> '') and (m <> k) then
-                Inc(FProg.Procs[m].Nest);
-            end;
-          end;
-        end;
-        AppendStr(FProg.Procs[k].Pins, cell);
-      end;
+    PinCaptured(cell, K0);
     { the pass: a new cell with the counter's value, the body, and the
       cell back to the counter }
     blk := NewStmt(skBlock);
@@ -20157,6 +20283,169 @@ begin
     end;
   end;
   Result := VarSym(nm);
+end;
+
+{ A with binds its operand once (P166). Free Pascal's reference,
+  13.2.8, specifies a saved address and with A, B as nested withs;
+  Go's spec, Order of evaluation, likewise never repeats a call for
+  each use of its result. Keep a place's address, not its expression;
+  a value gets its own record first. Typed hidden pointers are roots
+  and stack-map entries, so a collection or a moving stack keeps them.
+  Flag 16 makes CopyValueParams copy a record that this alias may write.
+  A const record remains read-only; its helper methods still use copies.
+  Captured bindings obey Go's escape.go invariants: no pointer in a
+  closure may outlive its stack object. A place's local root goes into
+  its owner's box; an owned value gets a fresh heap cell per entry;
+  PinCaptured freezes the binding pointer, not the reusable slot. }
+function TParser.ParseWith(ALine: LongInt): PStmt;
+var
+  base, cbase, i, n, k, k0, p0, j: SizeInt;
+  t, pt: LongInt;
+  e, a, v, maproot, part: PExpr;
+  indexes: TExprArray;
+  body, block, alloc: PStmt;
+  root, temp, cell: string;
+  readonly, origins, bindings, temps: TStrArray;
+  typs: array of LongInt;
+  captured: Boolean;
+begin
+  base := Length(FWith);
+  cbase := Length(FConstNames);
+  readonly := nil;
+  origins := nil;
+  bindings := nil;
+  temps := nil;
+  typs := nil;
+  k0 := Length(FProg.Procs);
+  Result := NewStmt(skBlock);
+  Result^.Line := ALine;
+  FTok := FLex.Next;
+  repeat
+    e := ParseExpr;
+    t := e^.Typ;
+    if TypeOf(t).Kind <> tykRecord then
+      Die('with record' + HerePos);
+    root := RootName(e);
+    temp := '';
+    maproot := MapPlaceRoot(e);
+    if maproot <> nil then
+    begin
+      { An entry is a logical place, not a stable table-slot address.
+        Save the container, key and any indexes once; member accesses
+        resolve the entry again, so growth never leaves a stale slot. }
+      for j := 0 to 1 do
+      begin
+        a := HiddenVar(maproot^.Args[j]^.Typ, Result^.Stmts, maproot^.Args[j]);
+        maproot^.Args[j] := a;
+        AppendStr(bindings, a^.Name);
+        AppendStr(temps, a^.Name);
+        SetLength(typs, Length(bindings));
+        typs[High(typs)] := a^.Typ;
+      end;
+      part := e;
+      indexes := nil;
+      while part <> maproot do
+      begin
+        if part^.Kind = ekIndex then
+        begin
+          SetLength(indexes, Length(indexes) + 1);
+          indexes[High(indexes)] := part;
+        end;
+        part := part^.L;
+      end;
+      for j := High(indexes) downto 0 do
+      begin
+        a := HiddenVar(indexes[j]^.R^.Typ, Result^.Stmts, indexes[j]^.R);
+        indexes[j]^.R := a;
+        AppendStr(bindings, a^.Name);
+        AppendStr(temps, a^.Name);
+        SetLength(typs, Length(bindings));
+        typs[High(typs)] := a^.Typ;
+      end;
+      { Check the lookup and subindexes even when the body is empty. }
+      a := HiddenVar(t, Result^.Stmts, e);
+      v := e;
+    end
+    else if (root <> '') and HasStr(FConstNames, root) then
+    begin
+      v := HiddenVar(t, Result^.Stmts, e);
+      AppendStr(readonly, v^.Name);
+      AppendStr(origins, root);
+      AppendStr(FConstNames, v^.Name);
+      temp := v^.Name;
+      AppendStr(bindings, v^.Name);
+    end
+    else
+    begin
+      p0 := Length(Result^.Stmts);
+      a := BlockAddr(e, Result^.Stmts);
+      a^.Typ := InternPtr(t);
+      a^.Flags := a^.Flags or 16;
+      if (Length(Result^.Stmts) > p0) and (a^.L <> nil) and (a^.L^.Kind = ekVar) then
+        temp := a^.L^.Name;
+      v := HiddenVar(a^.Typ, Result^.Stmts, a);
+      AppendStr(bindings, v^.Name);
+      v := NewDeref(v, t);
+    end;
+    if maproot = nil then
+    begin
+      AppendStr(temps, temp);
+      SetLength(typs, Length(bindings));
+      typs[High(typs)] := t;
+    end;
+    n := Length(FWith);
+    SetLength(FWith, n + 1);
+    FWith[n] := v;
+    if FTok.Kind <> tkComma then
+      Break;
+    FTok := FLex.Next;
+  until False;
+  Eat(tkDo);
+  body := Self.ParseStmt;
+  for i := 0 to High(readonly) do
+  begin
+    if StmtMod(body, readonly[i]) then
+      Die(origins[i] + ' is a const parameter: a with may not change it at line ' +
+        IntToStr(ALine));
+    for k := k0 to High(FProg.Procs) do
+      if StmtMod(FProg.Procs[k].Body, readonly[i]) then
+        Die(origins[i] + ' is a const parameter: a closure in a with may not change it at line ' +
+          IntToStr(ALine));
+  end;
+  SetLength(FConstNames, cbase);
+  SetLength(FWith, base);
+  for i := 0 to High(Result^.Stmts) do
+    Result^.Stmts[i]^.Line := ALine;
+  AppendStmt(Result, body);
+  for i := 0 to High(bindings) do
+  begin
+    captured := False;
+    for k := k0 to High(FProg.Procs) do
+      if StmtNames(FProg.Procs[k].Body, bindings[i]) then
+        captured := True;
+    if not captured then
+      Continue;
+    if temps[i] <> '' then
+    begin
+      pt := InternPtr(typs[i]);
+      cell := HiddenNamed('with.value', pt);
+      alloc := NewStmt(skNew);
+      alloc^.Line := ALine;
+      alloc^.Dest := NewVar(cell, pt);
+      block := NewStmt(skBlock);
+      block^.Line := ALine;
+      AppendStmt(block, alloc);
+      AppendStmt(block, Result);
+      Result := RenameCell(block, temps[i], cell, pt, typs[i]);
+      for k := k0 to High(FProg.Procs) do
+        FProg.Procs[k].Body := RenameCell(FProg.Procs[k].Body, temps[i], cell, pt, typs[i]);
+      if bindings[i] = temps[i] then
+        bindings[i] := cell;
+    end;
+    if FFuncSym <> '' then
+      AppendStr(FEscapedWith, FFuncSym + '/' + bindings[i]);
+    PinCaptured(bindings[i], k0);
+  end;
 end;
 
 { for x in d, d a slice or a static array (1.0.134): each element in
@@ -21316,6 +21605,34 @@ begin
   CheckFwdTypes;
 end;
 
+{ A concrete method is an implicit forward declaration, including one
+  that no call reaches. Check our own declarations at source completion,
+  rather than waiting for a linker failure (or dead-code elimination
+  hiding it). Positions are parser-only; imported methods already have
+  their bodies in their unit, so the compiled interface needs no change. }
+procedure TParser.RememberMethod(const Sym, Name, At: string);
+begin
+  AppendStr(FMethodSyms, Sym);
+  AppendStr(FMethodNames, Name);
+  AppendStr(FMethodAt, At);
+end;
+
+procedure TParser.CheckMethodBodies;
+var
+  i, k: SizeInt;
+  found: Boolean;
+begin
+  for i := 0 to High(FMethodSyms) do
+  begin
+    found := False;
+    for k := 0 to High(FProg.Procs) do
+      if (FProg.Procs[k].Sym = FMethodSyms[i]) and (FProg.Procs[k].Body <> nil) then
+        found := True;
+    if not found then
+      Die('missing body of ' + FMethodNames[i] + FMethodAt[i]);
+  end;
+end;
+
 function TParser.ParseProgram: TProgram;
 var
   prog: TProgram;
@@ -21357,6 +21674,7 @@ begin
     LifeCalls(FClassDtors, True));
   FProg.Vars := FVars;
   Eat(tkDot);
+  CheckMethodBodies;
   for i := 0 to High(FProg.Procs) do
     if FProg.Procs[i].IsFwd and (FProg.Procs[i].Body = nil) then
       Die('missing body of ' + FProg.Procs[i].Name);
@@ -21434,6 +21752,7 @@ begin
   FProg.FiniBody := JoinStmts(FProg.FiniBody, LifeCalls(FClassDtors, True));
   Eat(tkEnd);
   Eat(tkDot);
+  CheckMethodBodies;
   FProg.Vars := FVars;
   FProg.Types := FTypes;
   FProg.UsesNames := FUsesNames;

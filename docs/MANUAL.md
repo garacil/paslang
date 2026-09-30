@@ -2921,6 +2921,37 @@ record's fields, methods and properties before names around it.
 `testdata/recmeth.paslang` and `testdata/units/recuse.paslang` exercise
 these operations, including records exported by a compiled unit.
 
+`with E do` evaluates `E` exactly once, even for an empty body. For a
+variable, indexed element or dereference it saves that place's address;
+for a function result it saves a record of its own. Thus `with a[Next]
+do begin X := 7; Y := 8 end` calls `Next` once and changes one element,
+and `with Make(5) do WriteLn(X, Y)` calls `Make` once. Changing a pointer
+inside `with p^ do` does not change the saved record. `with A, B do`
+is `with A do with B do`: the operands are evaluated left to right,
+and the last record's members take precedence. A value parameter is
+still the routine's own copy when changed through a `with`; a `const`
+record may be read but not assigned through it. The hidden addresses
+are tracked across collection and stack growth
+(`testdata/withonce.paslang`). A closure created inside keeps the
+binding it saw, not a later `with`'s address. A captured local record
+lives in its routine's heap box; a captured function result has a
+distinct heap cell at each entry. Both remain valid after the routine
+returns (`testdata/withcapture.paslang`).
+
+A map or tree entry is a logical place, not a permanent table-slot
+address. `with m[NextKey] do` saves the container and key once (and
+any indexes into a record's static arrays, in order); its members
+resolve that same entry even after insertions grow the table or split
+a leaf. Reassigning `m` does not change the saved container. A missing
+entry reads as a zero record without inserting it; writing a member
+inserts it. A closure keeps the saved container, key and indexes
+(`testdata/withmap.paslang`).
+
+Every concrete method declared here needs an implementation in the
+program or the unit's implementation section, even if never called.
+The compiler reports a missing body at its declaration, before linking.
+Abstract class methods do not need bodies.
+
 `Append(s, a, b)` is `s` with `a` and `b` after its elements, a slice of
 `s`'s type, as Go's `append` (1.0.132); `Append(s, u)` with `u` of `s`'s
 type adds `u`'s elements, `s`'s own too. `Cap(s)` is its capacity. A

@@ -89,6 +89,12 @@ A64_OBJDUMP ?= aarch64-linux-gnu-objdump
 GOLDEN := hello arith ifthen loops const caseof procs recfn records ptrs arrs strs grow paswork pingpong chclose sel exc excg nest cls gen enums sets dbg opt gdbg inherit rtti args8 mevent slice chlit armmeth propacc runes variant opadd args20 iface opmore props pindex dwarfloc shift dynnil xor inhcall isas sysid forward defaults abstract overload methov strdef trig logexp arctan invpow logx trig2 hyper miscmath xxh32 xxh64 map1 map2 sync1 sync2 finexit zerolocal pchar selx selstress wrchar chstr lookpath strcmp dupparam recarg funcval constk regloop reszero divconst bareln gctypes chr charcat heapspan blobzero gcbasic mapsplit stackmap trygrow growgc xxh3 mapgetstr bounds fairq sized fwdptr constexpr int2real typedconst caserange emptystmt writefmt realparse realfmt valpar strcow chanany chanbuf memmove overnarrow slicegrow fatexit narrow narrowmem recalign narrowbounds dwarfnarrow narrowgo forlimit bce inplace narrowasm slicereg forrun addrform bcerun inspine framearr realstep f32conv single dwarfreal ptrtyped ptrarith ptrsafe memview checkptr ptrreach cpwalk realint quadcore quadfmt quad quadconst dwarfquad bitops declorder convchain bitwords bitmem bitany views blocks wide ifdef quadfast memwords cpuwords vectors vecmore inlineasm vecpool addrlocal rotwords rotmem ctxwords append funcval2 closures pasargs ifaceargs vshrs64 auditfix closurebox audit2 visibility freedestroy reservedall nodeadlock mapfix tree1 tree2 hash1 store1 immwide constref inline1 stackargs mainexit networds charcmp unixsock sigpipe sleepmany deadlines strfill narrowpop tobject1 excobj1 excobj2 excobj3 classref1 ctorargs aconst1 aconst2 methdef1 set256 subrange1 subrange2 helper1 helper2 strwords strkern slicedit strcmpk scope1 classfwd ifacebind overconv overrank valunsigned sysutils1 sysutils2 initvar extended1 valround valround2 cmpwords fmtfloat1 fmtfloat2 format1 realtext quadtext valrange hidesys arrindex constround dates1 dates2 nestscope recmeth
 GOLDEN_A64 := map1 map2 sync1 sync2 finexit zerolocal pchar pingpong sel chclose paswork selx selstress wrchar args8 arith arrs caseof chlit cls const enums exc excg gen grow hyper ifthen inherit loops mevent miscmath nest procs ptrs recfn records sets strs trig2 xxh32 xxh64 rtti gdbg chstr strcmp recarg funcval constk regloop reszero divconst bareln gctypes chr charcat heapspan blobzero gcbasic mapsplit stackmap trygrow growgc xxh3 mapgetstr bounds fairq sized fwdptr constexpr int2real typedconst caserange emptystmt writefmt realparse realfmt valpar strcow chanany chanbuf memmove overnarrow slicegrow fatexit narrow narrowmem recalign narrowbounds dwarfnarrow narrowgo forlimit bce inplace narrowasm slicereg forrun addrform bcerun inspine framearr realstep f32conv single dwarfreal ptrtyped ptrarith ptrsafe memview checkptr ptrreach cpwalk realint quadcore quadfmt quad quadconst dwarfquad bitops declorder convchain bitwords bitmem bitany views blocks wide ifdef quadfast memwords cpuwords vectors vecmore inlineasm vecpool addrlocal rotwords rotmem ctxwords append funcval2 closures pasargs ifaceargs vshrs64 auditfix closurebox audit2 visibility freedestroy reservedall nodeadlock mapfix tree1 tree2 hash1 store1 immwide constref inline1 stackargs mainexit networds charcmp unixsock sigpipe sleepmany deadlines strfill narrowpop tobject1 excobj1 excobj2 excobj3 classref1 ctorargs aconst1 aconst2 methdef1 set256 subrange1 subrange2 helper1 helper2 strwords strkern slicedit strcmpk scope1 classfwd ifacebind overconv overrank valunsigned sysutils1 sysutils2 initvar extended1 valround valround2 cmpwords fmtfloat1 fmtfloat2 format1 realtext quadtext valrange hidesys arrindex constround dates1 dates2 nestscope recmeth
 
+# P166: record operands bind once, including a with inside recursion.
+GOLDEN += withonce withcapture withmap
+GOLDEN_A64 += withonce withcapture withmap
+GOLDEN += treewide
+GOLDEN_A64 += treewide
+
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
 # uses clause. They are compiled by paslangc itself, once per target.
@@ -852,6 +858,35 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'TR declares no method Thrice of these parameters at 12:13' $(BUILDDIR)/recbad_nodecl.err; \
 	grep -q 'TR is a record with no methods at 6:13' $(BUILDDIR)/recbad_plainrec.err; \
 	echo ok recbad; \
+	echo "==== with rejects (P166) ===="; \
+	for target in amd64 arm64; do \
+	  if $(OUTDIR)/paslangc -target $$target -o $(BUILDDIR)/withbad_$$target testdata/withbad/constwrite.paslang >$(BUILDDIR)/withbad_$$target.err 2>&1; then \
+	    echo "a with must not change a const record"; exit 1; \
+	  fi; \
+	  grep -qF 'R is a const parameter: a with may not change it at line 11' $(BUILDDIR)/withbad_$$target.err; \
+	  for n in constcapture varcapture; do \
+	    if $(OUTDIR)/paslangc -target $$target -o $(BUILDDIR)/withbad_$$n-$$target testdata/withbad/$$n.paslang >$(BUILDDIR)/withbad_$$n-$$target.err 2>&1; then \
+	      echo "$$n should fail"; exit 1; \
+	    fi; \
+	  done; \
+	  grep -qF 'R is a const parameter: a closure in a with may not change it at line 12' $(BUILDDIR)/withbad_constcapture-$$target.err; \
+	  grep -qF 'R is a var parameter of Capture, which has a closure inside' $(BUILDDIR)/withbad_varcapture-$$target.err; \
+	done; \
+	echo ok withbad; \
+	echo "==== unresolved method bodies (P167) ===="; \
+	for target in amd64 arm64; do \
+	  for n in rec cls help ctor static life over unitrec; do \
+	    if $(OUTDIR)/paslangc -target $$target -o $(BUILDDIR)/methbodybad_$$n-$$target testdata/methbodybad/$$n.paslang >$(BUILDDIR)/methbodybad_$$n-$$target.err 2>&1; then \
+	      echo "$$n must require a method body"; exit 1; \
+	    fi; \
+	    grep -qF 'paslangc: missing body of ' $(BUILDDIR)/methbodybad_$$n-$$target.err; \
+	  done; \
+	  for f in 'rec:TR.Twice at 5:14' 'cls:TC.Twice at 4:14' 'help:TH.Twice at 5:14' 'ctor:TR.Create at 5:17' 'static:TC.Twice at 4:20' 'life:TC.Start at 4:23' 'over:TR.Twice at 6:14' 'unitrec:TR.Twice at 6:14'; do \
+	    n=$${f%%:*}; msg=$${f#*:}; \
+	    grep -qF "missing body of $$msg" $(BUILDDIR)/methbodybad_$$n-$$target.err; \
+	  done; \
+	done; \
+	echo ok methbodybad; \
 	echo "==== string word rejects (P134) ===="; \
 	for n in copyslice insertconst insertslice editcall strstring strdec valchar valcode soc upint posname valname; do \
 	  if $(OUTDIR)/paslangc -o $(BUILDDIR)/strbad_$$n testdata/strbad/$$n.paslang >$(BUILDDIR)/strbad_$$n.err 2>&1; then \

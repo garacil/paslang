@@ -538,6 +538,8 @@ type
     function TreeKey(T: LongInt): LongInt;
     function TreeVal(T: LongInt): LongInt;
     procedure LoadSlot(Sz: LongInt);
+    procedure LoadCollectionValue(T: LongInt);
+    procedure FreezeCollectionBlob(T: LongInt);
     procedure KeyScratch(E: PExpr; out Off: LongInt);
     function EmitTreeCall(E: PExpr): Boolean;
     function TreeIntSlot(Typ: LongInt): Boolean;
@@ -6500,6 +6502,123 @@ begin
     Line('  movq (%rax), %rax');
 end;
 
+{ Maps and trees return a slot pointer, not a string-shaped value.
+  Follow the value's actual representation; a missing block points at
+  a typed zero block, as Go's current maps/runtime.go mapaccess1_fat.
+  Intel SDM MOV/TEST/Jcc/XOR/LEA and Arm ARM LDR/CBZ/MOV/ADRP. }
+procedure TEmitter.LoadCollectionValue(T: LongInt);
+var
+  missing, done: string;
+begin
+  missing := Lab;
+  done := Lab;
+  if FArm then
+  begin
+    Line('  cbz x0, ' + missing);
+    if not IsBlob(T) then
+    begin
+      if IsDyn(T) then
+        Line('  ldr x3, [x0, #16]');
+      if IsFat(T) then
+        Line('  ldr x2, [x0, #8]');
+      Line('  ldr x0, [x0]');
+    end;
+    Line('  b ' + done);
+    Line(missing + ':');
+    if IsBlob(T) then
+    begin
+      if TSize(T) > FZeroMax then
+        FZeroMax := TSize(T);
+      LeaS('.Lzeroblk', 'x0');
+    end
+    else
+      Line('  mov x0, xzr');
+    if IsFat(T) then
+      Line('  mov x2, xzr');
+    if IsDyn(T) then
+      Line('  mov x3, xzr');
+  end
+  else
+  begin
+    Line('  testq %rax, %rax');
+    Line('  jz ' + missing);
+    if not IsBlob(T) then
+    begin
+      if IsDyn(T) then
+        Line('  movq 16(%rax), %r8');
+      if IsFat(T) then
+        Line('  movq 8(%rax), %rdx');
+      Line('  movq (%rax), %rax');
+    end;
+    Line('  jmp ' + done);
+    Line(missing + ':');
+    if IsBlob(T) then
+    begin
+      if TSize(T) > FZeroMax then
+        FZeroMax := TSize(T);
+      Line('  leaq .Lzeroblk(%rip), %rax');
+    end
+    else
+      Line('  xorl %eax, %eax');
+    if IsFat(T) then
+      Line('  xorl %edx, %edx');
+    if IsDyn(T) then
+      Line('  xorl %r8d, %r8d');
+  end;
+  Line(done + ':');
+end;
+
+{ An insertion can grow a map or shift a tree's leaf. Freeze the value
+  before evaluating the destination: t[b] := t[a] must not copy a stale
+  slot, and strings must already be shared if the destination changes
+  their source. ScratchT gives the copy its exact stack-map roots. }
+procedure TEmitter.FreezeCollectionBlob(T: LongInt);
+var
+  off: LongInt;
+  have, smap: string;
+begin
+  off := ScratchT(TSize(T), T);
+  have := Lab;
+  smap := StrMap(T);
+  if TSize(T) > FZeroMax then
+    FZeroMax := TSize(T);
+  if FArm then
+  begin
+    Line('  cbnz x0, ' + have);
+    LeaS('.Lzeroblk', 'x0');
+    Line(have + ':');
+    Line('  mov x1, x0');
+    AddFP('x0', off);
+    Imm('x2', TSize(T));
+    Line('  bl rt_memcpy');
+    if smap <> '' then
+    begin
+      AddFP('x0', off);
+      LeaS(smap, 'x1');
+      Line('  bl rt_strshare');
+    end;
+    AddFP('x0', off);
+  end
+  else
+  begin
+    Line('  testq %rax, %rax');
+    Line('  jnz ' + have);
+    Line('  leaq .Lzeroblk(%rip), %rax');
+    Line(have + ':');
+    Line('  movq %rax, %rsi');
+    Line('  leaq ' + IntToStr(off) + '(%rbp), %rdi');
+    Line('  movq $' + IntToStr(TSize(T)) + ', %rcx');
+    Line('  call rt_memcpy');
+    if smap <> '' then
+    begin
+      Line('  leaq ' + IntToStr(off) + '(%rbp), %rdi');
+      Line('  leaq ' + smap + '(%rip), %rsi');
+      Line('  call rt_strshare');
+    end;
+    Line('  leaq ' + IntToStr(off) + '(%rbp), %rax');
+  end;
+end;
+
 procedure TEmitter.KeyScratch(E: PExpr; out Off: LongInt);
 begin
   Off := ScratchT(16, E^.Typ);
@@ -6666,19 +6785,13 @@ begin
       end
       else if E^.Name = 'rt_treeget' then
       begin
-        a := Lab;
-        b := Lab;
-        Line('  cbz x0, ' + a);
         if FTypes[E^.Args[0]^.Typ].Elem2 < 0 then
-          Line('  mov x0, #1')
+        begin
+          Line('  cmp x0, #0');
+          Line('  cset x0, ne');
+        end
         else
-          LoadSlot(TreeVal(E^.Args[0]^.Typ));
-        Line('  b ' + b);
-        Line(a + ':');
-        Line('  mov x0, xzr');
-        if TreeVal(E^.Args[0]^.Typ) > 8 then
-          Line('  mov x2, xzr');
-        Line(b + ':');
+          LoadCollectionValue(E^.Typ);
       end;
     end
     else
@@ -6718,20 +6831,14 @@ begin
       end
       else if E^.Name = 'rt_treeget' then
       begin
-        a := Lab;
-        b := Lab;
-        Line('  testq %rax, %rax');
-        Line('  jz ' + a);
         if FTypes[E^.Args[0]^.Typ].Elem2 < 0 then
-          Line('  movq $1, %rax')
+        begin
+          Line('  testq %rax, %rax');
+          Line('  movq $0, %rax');
+          Line('  setne %al');
+        end
         else
-          LoadSlot(TreeVal(E^.Args[0]^.Typ));
-        Line('  jmp ' + b);
-        Line(a + ':');
-        Line('  xorq %rax, %rax');
-        if TreeVal(E^.Args[0]^.Typ) > 8 then
-          Line('  xorq %rdx, %rdx');
-        Line(b + ':');
+          LoadCollectionValue(E^.Typ);
       end;
     end;
     Exit;
@@ -7217,102 +7324,8 @@ begin
 end;
 
 procedure TEmitter.EmitTreeStore(Dest: PExpr);
-var
-  off: LongInt;
-  desc: string;
-  bykey: Boolean;
 begin
-  desc := '.LdescTree_' + IntToStr(Dest^.Args[0]^.Typ);
-  { t[k] := v with a key that compares as an integer and a value in one
-    8-byte slot: the key by value to PasTreePutI (1.1.1) }
-  bykey := TreeIntSlot(Dest^.Args[0]^.Typ) and not IsFat(Dest^.Typ);
-  if FArm then
-  begin
-    if IsFat(Dest^.Typ) then
-    begin
-      if IsStr(Dest^.Typ) then
-        ShareStr;
-      PshK('x2', 0);
-      PshK('x0', 0);
-    end
-    else
-      PshK('x0', 0);
-    EmitExpr(Dest^.Args[0]);
-    PshK('x0', 0);
-    if bykey then
-    begin
-      EmitExpr(Dest^.Args[1]);
-      Line('  mov x1, x0');
-      Ppop('x0');
-      LeaS(desc, 'x2');
-      Line('  bl p_pastree_pastreeputi');
-    end
-    else
-    begin
-      KeyScratch(Dest^.Args[1], off);
-      Ppop('x0');
-      Imm('x1', off);
-      Line('  add x1, x29, x1');
-      LeaS(desc, 'x2');
-      Line('  bl p_pastree_pastreeput');
-    end;
-    if IsFat(Dest^.Typ) then
-    begin
-      Line('  ldr x1, [sp]');
-      Line('  str x1, [x0]');
-      Line('  ldr x1, [sp, #16]');
-      Line('  str x1, [x0, #8]');
-      Line('  add sp, sp, #32');
-    end
-    else
-    begin
-      Line('  ldr x1, [sp]');
-      Line('  str x1, [x0]');
-      Line('  add sp, sp, #16');
-    end;
-  end
-  else
-  begin
-    if IsFat(Dest^.Typ) then
-    begin
-      if IsStr(Dest^.Typ) then
-        ShareStr;
-      PushK('rdx', 0);
-      PushK('rax', 0);
-    end
-    else
-      PushK('rax', 0);
-    EmitExpr(Dest^.Args[0]);
-    PushK('rax', 0);
-    if bykey then
-    begin
-      EmitExpr(Dest^.Args[1]);
-      Line('  movq %rax, %rsi');
-      Line('  popq %rdi');
-      Line('  leaq ' + desc + '(%rip), %rdx');
-      Line('  call p_pastree_pastreeputi');
-    end
-    else
-    begin
-      KeyScratch(Dest^.Args[1], off);
-      Line('  popq %rdi');
-      Line('  leaq ' + IntToStr(off) + '(%rbp), %rsi');
-      Line('  leaq ' + desc + '(%rip), %rdx');
-      Line('  call p_pastree_pastreeput');
-    end;
-    if IsFat(Dest^.Typ) then
-    begin
-      Line('  popq %rcx');
-      Line('  movq %rcx, (%rax)');
-      Line('  popq %rcx');
-      Line('  movq %rcx, 8(%rax)');
-    end
-    else
-    begin
-      Line('  popq %rcx');
-      Line('  movq %rcx, (%rax)');
-    end;
-  end;
+  EmitMapStore(Dest);
 end;
 
 { for k, v in t, for k in t, downto, and over t[a..b] (P110): the
@@ -7323,7 +7336,7 @@ end;
 procedure TEmitter.EmitTreeFor(S: PStmt);
 var
   a, b, desc, smap, slow, have, got: string;
-  ksz, vsz, kt, vt, loff, hoff: LongInt;
+  ksz, vsz, vstride, kt, vt, loff, hoff: LongInt;
   base, lo, hi: PExpr;
   fast: Boolean;
 begin
@@ -7341,6 +7354,7 @@ begin
   vt := FTypes[base^.Typ].Elem2;
   ksz := TreeKey(base^.Typ);
   vsz := TreeVal(base^.Typ);
+  vstride := Align8(vsz);
   loff := 0;
   hoff := 0;
   if lo <> nil then
@@ -7391,7 +7405,7 @@ begin
       Line('  str x2, [sp, #8]');
       if vsz > 0 then
       begin
-        Imm('x3', vsz);
+        Imm('x3', vstride);
         Line('  mul x4, x2, x3');
         Line('  add x4, x1, x4');
         Imm('x3', 48 + 32 * ksz);
@@ -7428,7 +7442,7 @@ begin
     PshK('x0', 1);
     EmitAddr(NewVar(S^.Name, kt));
     Line('  ldr x1, [sp]');
-    Imm('x2', ksz);
+    Imm('x2', TSize(kt));
     Line('  bl rt_memcpy');
     smap := StrMap(kt);
     if smap <> '' then
@@ -7489,7 +7503,7 @@ begin
       Line('  movq %rsi, 8(%rsp)');
       if vsz > 0 then
       begin
-        Line('  imulq $' + IntToStr(vsz) + ', %rsi, %rcx');
+        Line('  imulq $' + IntToStr(vstride) + ', %rsi, %rcx');
         Line('  leaq ' + IntToStr(48 + 32 * ksz) + '(%rdi,%rcx), %rcx');
         Line('  movq %rcx, 24(%rsp)');
       end;
@@ -7524,7 +7538,7 @@ begin
     EmitAddr(NewVar(S^.Name, kt));
     Line('  movq %rax, %rdi');
     Line('  movq (%rsp), %rsi');
-    Line('  movq $' + IntToStr(ksz) + ', %rcx');
+    Line('  movq $' + IntToStr(TSize(kt)) + ', %rcx');
     Line('  call rt_memcpy');
     smap := StrMap(kt);
     if smap <> '' then
@@ -7565,8 +7579,10 @@ end;
 procedure TEmitter.EmitMapStore(Dest: PExpr);
 var
   off: LongInt;
-  smap: string;
+  smap, desc: string;
 begin
+  if IsBlob(Dest^.Typ) then
+    FreezeCollectionBlob(Dest^.Typ);
   if FArm then
   begin
     if IsBlob(Dest^.Typ) then
@@ -7589,7 +7605,27 @@ begin
       PshK('x0', VCls(Dest^.Typ, 0));
     EmitExpr(Dest^.Args[0]);
     PshK('x0', VCls(Dest^.Args[0]^.Typ, 0));
-    if IsStr(Dest^.Args[1]^.Typ) then
+    if Dest^.Name = 'rt_treeget' then
+    begin
+      desc := '.LdescTree_' + IntToStr(Dest^.Args[0]^.Typ);
+      if TreeIntSlot(Dest^.Args[0]^.Typ) then
+      begin
+        EmitExpr(Dest^.Args[1]);
+        Line('  mov x1, x0');
+        Ppop('x0');
+        LeaS(desc, 'x2');
+        Line('  bl p_pastree_pastreeputi');
+      end
+      else
+      begin
+        KeyScratch(Dest^.Args[1], off);
+        Ppop('x0');
+        AddFP('x1', off);
+        LeaS(desc, 'x2');
+        Line('  bl p_pastree_pastreeput');
+      end;
+    end
+    else if IsStr(Dest^.Args[1]^.Typ) then
     begin
       off := ScratchT(16, Dest^.Args[1]^.Typ);
       EmitExpr(Dest^.Args[1]);
@@ -7670,7 +7706,27 @@ begin
       PushK('rax', VCls(Dest^.Typ, 0));
     EmitExpr(Dest^.Args[0]);
     PushK('rax', VCls(Dest^.Args[0]^.Typ, 0));
-    if IsStr(Dest^.Args[1]^.Typ) then
+    if Dest^.Name = 'rt_treeget' then
+    begin
+      desc := '.LdescTree_' + IntToStr(Dest^.Args[0]^.Typ);
+      if TreeIntSlot(Dest^.Args[0]^.Typ) then
+      begin
+        EmitExpr(Dest^.Args[1]);
+        Line('  movq %rax, %rsi');
+        Line('  popq %rdi');
+        Line('  leaq ' + desc + '(%rip), %rdx');
+        Line('  call p_pastree_pastreeputi');
+      end
+      else
+      begin
+        KeyScratch(Dest^.Args[1], off);
+        Line('  popq %rdi');
+        Line('  leaq ' + IntToStr(off) + '(%rbp), %rsi');
+        Line('  leaq ' + desc + '(%rip), %rdx');
+        Line('  call p_pastree_pastreeput');
+      end;
+    end
+    else if IsStr(Dest^.Args[1]^.Typ) then
     begin
       off := ScratchT(16, Dest^.Args[1]^.Typ);
       EmitExpr(Dest^.Args[1]);
@@ -16774,45 +16830,7 @@ begin
           if E^.Name = 'rt_mapget' then
           begin
             Line('  bl ' + a);
-            a := Lab;
-            b := Lab;
-            Line('  cbz x0, ' + a);
-            if IsBlob(E^.Typ) then
-            begin
-            end
-            else if IsDyn(E^.Typ) then
-            begin
-              Line('  ldr x3, [x0, #16]');
-              Line('  ldr x2, [x0, #8]');
-              Line('  ldr x0, [x0]');
-            end
-            else if IsFat(E^.Typ) then
-            begin
-              Line('  ldr x2, [x0, #8]');
-              Line('  ldr x0, [x0]');
-            end
-            else
-              Line('  ldr x0, [x0]');
-            Line('  b ' + b);
-            Line(a + ':');
-            if IsBlob(E^.Typ) then
-            begin
-              { a missing record reads from the zero block (1.0.140):
-                m[k].X went through a nil slot pointer }
-              if TSize(E^.Typ) > FZeroMax then
-                FZeroMax := TSize(E^.Typ);
-              LeaS('.Lzeroblk', 'x0');
-            end
-            else
-              Line('  mov x0, xzr');
-            if IsDyn(E^.Typ) then
-            begin
-              Line('  mov x2, xzr');
-              Line('  mov x3, xzr');
-            end
-            else if IsFat(E^.Typ) then
-              Line('  mov x2, xzr');
-            Line(b + ':');
+            LoadCollectionValue(E^.Typ);
           end
           else if E^.Name = 'rt_mapin' then
           begin
@@ -17701,46 +17719,7 @@ else if E^.Name = 'rt_high' then
           if E^.Name = 'rt_mapget' then
           begin
             Line('  call ' + a);
-            a := Lab;
-            b := Lab;
-            Line('  testq %rax, %rax');
-            Line('  jz ' + a);
-            if IsBlob(E^.Typ) then
-            begin
-            end
-            else if IsDyn(E^.Typ) then
-            begin
-              Line('  movq 8(%rax), %rdx');
-              Line('  movq 16(%rax), %r8');
-              Line('  movq (%rax), %rax');
-            end
-            else if IsFat(E^.Typ) then
-            begin
-              Line('  movq 8(%rax), %rdx');
-              Line('  movq (%rax), %rax');
-            end
-            else
-              Line('  movq (%rax), %rax');
-            Line('  jmp ' + b);
-            Line(a + ':');
-            if IsBlob(E^.Typ) then
-            begin
-              { a missing record reads from the zero block (1.0.140):
-                m[k].X went through a nil slot pointer }
-              if TSize(E^.Typ) > FZeroMax then
-                FZeroMax := TSize(E^.Typ);
-              Line('  leaq .Lzeroblk(%rip), %rax');
-            end
-            else
-              Line('  xorl %eax, %eax');
-            if IsDyn(E^.Typ) then
-            begin
-              Line('  xorl %edx, %edx');
-              Line('  xorl %r8d, %r8d');
-            end
-            else if IsFat(E^.Typ) then
-              Line('  xorl %edx, %edx');
-            Line(b + ':');
+            LoadCollectionValue(E^.Typ);
           end
           else if E^.Name = 'rt_mapin' then
           begin
