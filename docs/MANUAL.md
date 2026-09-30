@@ -2367,9 +2367,15 @@ later 1
 A routine's constants, types and nested routines are its own, as in
 every Pascal (1.1.12): seen in it and in the routines it nests, gone
 after it, so two routines may each have a nested `Sub` or a constant
-`K`, and a name declared inside hides the program's of the name. Inside
-one routine a variable, a parameter, a constant, a type and a nested
-routine may not share a name.
+`K`, and a name declared inside hides the ones of the routines around
+it and the program's, whatever the kinds of the two, as in Free Pascal:
+a nested function `X` is called where a global variable `X` is around
+it, and a constant or a type of a routine hides a routine, a variable
+or a constant around it (1.1.36, P159; the global variable was read in
+silence, and the other kinds were refused). Inside one routine a
+variable, a parameter, a constant, a type and a nested routine may not
+share a name, and a variable or a parameter may not take the name of a
+routine around it (§19).
 
 A routine takes up to 32 parameters. `var` passes the caller's variable,
 `out` the same but for results only, `const` promises not to change it.
@@ -10566,8 +10572,9 @@ the commands on standard input, under `--debug-mode` and under
   `duplicate identifier Count (a variable of the name) at 7:3` (1.1.30,
   P158; a type, a variable and a routine of one name compiled in
   silence). A parameter or a local may not take the name of a routine
-  of its unit or program either (`duplicate identifier Format (a routine
-  of the name) at 8:16`), where Free Pascal lets it hide the routine
+  of its unit, its program or a routine around it either (`duplicate
+  identifier Format (a routine of the name) at 8:16`), where Free
+  Pascal lets it hide the routine
   (its SysUtils calls a parameter of `FloatToStrF` `format`): inside, a
   call of the routine would find the parameter, and paslang says so
   where it is written.

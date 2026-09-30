@@ -45,6 +45,7 @@ type
     QLo, QHi: Int64;  { a real one worked out in binary128 too (P103, 1.0.115) }
     HasQ: Boolean;
     Owner: string;  { the unit it comes from (P138) }
+    Nest: LongInt;  { the depth of the routine that declares it, 0 at the top (P159) }
   end;
 
   TOpEnt = record
@@ -72,6 +73,7 @@ type
     Name: string;
     Id: LongInt;
     Owner: string;     { the unit it comes from (P138) }
+    Nest: LongInt;     { the depth of the routine that names it, 0 at the top (P159) }
   end;
 
   TParser = class
@@ -128,6 +130,8 @@ type
     FRetTyp: LongInt;
     FNest: LongInt;
     FScopes: array of TVarDeclArray;
+    FScopeLevels: array of LongInt;  { the depth of each routine's variables in FScopes (P159) }
+    FConstBase, FTypeBase, FProcBase: SizeInt;  { where the outermost routine being read begins its names in the tables (P159) }
     FClassTyp: LongInt;
     FWith: array of PExpr;
     FUnitName: string;
@@ -455,7 +459,9 @@ type
     procedure OwnDup(const AName: string; Kind: Char);
     procedure HideUnitNames(const AName: string; Kind: Char; const Params: TParamArray;
       const Keep: string);
-    function LocalHides(const AName: string): Boolean;
+    function HiddenAbove(const AName: string; L: LongInt): Boolean;
+    function ScopeLevel(S: SizeInt): LongInt;
+    function OwnLocalName(const AName: string): Boolean;
     function TypeAhead(out Id: LongInt): Boolean;
     function AheadName: string;
     procedure SkipTypeName;
@@ -1946,10 +1952,9 @@ begin
   Result := False;
   Id := TyNone;
   { the innermost first: a routine's type hides the program's (P137),
-    and its variable or parameter a used unit's type (P158) }
+    and a deeper name of any kind the type (P158, P159) }
   for i := High(FTypeNames) downto 0 do
-    if SameId(FTypeNames[i].Name, AName) and ((FTypeNames[i].Owner = '') or
-      not LocalHides(AName)) then
+    if SameId(FTypeNames[i].Name, AName) and not HiddenAbove(AName, FTypeNames[i].Nest) then
     begin
       Id := FTypeNames[i].Id;
       Result := True;
@@ -3817,6 +3822,7 @@ begin
   SetLength(FTypeNames, m + 1);
   FTypeNames[m].Name := AName;
   FTypeNames[m].Id := LongInt(n);
+  FTypeNames[m].Nest := FNest;
   ResolvePending(AName, LongInt(n));
   Result := LongInt(n);
 end;
@@ -3827,11 +3833,14 @@ var
 begin
   Result := False;
   V := 0;
-  { the innermost first: a routine's constant hides the program's (P137),
-    and its variable or parameter a used unit's constant (P158) }
+  { the innermost first: a routine's constant hides the program's (P137);
+    a deeper name of any kind hides the constant (P158, P159), and the
+    constants around it with it }
   for i := High(FConsts) downto 0 do
-    if SameId(FConsts[i].Name, AName) and ((FConsts[i].Owner = '') or not LocalHides(AName)) then
+    if SameId(FConsts[i].Name, AName) then
     begin
+      if HiddenAbove(AName, FConsts[i].Nest) then
+        Exit;
       V := FConsts[i].Value;
       Result := True;
       Exit;
@@ -3868,19 +3877,30 @@ begin
         Exit;
       end;
   end;
+  { a variable of a routine around, or a global, that a deeper name of
+    another kind does not hide (P159) }
   for s := High(FScopes) downto 0 do
     for i := 0 to High(FScopes[s]) do
       if SameId(FScopes[s][i].Name, AName) then
       begin
-        Result := True;
+        Result := not HiddenAbove(AName, ScopeLevel(s));
         Exit;
       end;
   for i := High(FVars) downto 0 do
     if SameId(FVars[i].Name, AName) then
     begin
-      Result := True;
+      Result := not HiddenAbove(AName, 0);
       Exit;
     end;
+end;
+
+{ The depth of the variables FScopes[S] holds (P159). }
+function TParser.ScopeLevel(S: SizeInt): LongInt;
+begin
+  if S <= High(FScopeLevels) then
+    Result := FScopeLevels[S]
+  else
+    Result := 1;
 end;
 
 function TParser.VarTyp(const AName: string): LongInt;
@@ -3917,13 +3937,15 @@ begin
     for i := 0 to High(FScopes[s]) do
       if SameId(FScopes[s][i].Name, AName) then
       begin
-        Result := FScopes[s][i].Typ;
+        if not HiddenAbove(AName, ScopeLevel(s)) then
+          Result := FScopes[s][i].Typ;
         Exit;
       end;
   for i := High(FVars) downto 0 do
     if SameId(FVars[i].Name, AName) then
     begin
-      Result := FVars[i].Typ;
+      if not HiddenAbove(AName, 0) then
+        Result := FVars[i].Typ;
       Exit;
     end;
 end;
@@ -3956,14 +3978,14 @@ begin
     for i := 0 to High(FScopes[s]) do
       if SameId(FScopes[s][i].Name, AName) then
       begin
-        if FScopes[s][i].Sym <> '' then
+        if (FScopes[s][i].Sym <> '') and not HiddenAbove(AName, ScopeLevel(s)) then
           Result := FScopes[s][i].Sym;
         Exit;
       end;
   for i := High(FVars) downto 0 do
     if SameId(FVars[i].Name, AName) then
     begin
-      if FVars[i].Sym <> '' then
+      if (FVars[i].Sym <> '') and not HiddenAbove(AName, 0) then
         Result := FVars[i].Sym;
       Exit;
     end;
@@ -3976,9 +3998,9 @@ begin
   Result := False;
   P := Default(TProcEnt);
   { the innermost first: a nested routine hides the program's (P137),
-    and a variable or a parameter a used unit's routine (P158) }
+    and a deeper name of any kind the routine (P158, P159) }
   for i := High(FProcs) downto 0 do
-    if SameId(FProcs[i].Name, AName) and ((FProcs[i].Owner = '') or not LocalHides(AName)) then
+    if SameId(FProcs[i].Name, AName) and not HiddenAbove(AName, FProcs[i].Nest) then
     begin
       P := FProcs[i];
       Result := True;
@@ -4986,27 +5008,23 @@ var
 begin
   Result := False;
   P := Default(TProcEnt);
-  { a variable or a parameter of the name hides a used unit's routines
-    (P158) }
-  hid := LocalHides(AName);
   { the innermost routines of the name, which hide the outer ones (P137):
-    the deepest nesting that has one }
+    the deepest nesting that has one, and none a deeper name of another
+    kind hides (P158, P159) }
   inner := -1;
   for i := 0 to High(FProcs) do
-    if SameId(FProcs[i].Name, AName) and (FProcs[i].Nest > inner) and
-      ((FProcs[i].Owner = '') or not hid) then
+    if SameId(FProcs[i].Name, AName) and (FProcs[i].Nest > inner) then
       inner := FProcs[i].Nest;
+  hid := (inner >= 0) and HiddenAbove(AName, inner);
   nseen := 0;
   for i := 0 to High(FProcs) do
-    if SameId(FProcs[i].Name, AName) and (FProcs[i].Nest = inner) and
-      ((FProcs[i].Owner = '') or not hid) then
+    if SameId(FProcs[i].Name, AName) and (FProcs[i].Nest = inner) and not hid then
       Inc(nseen);
   nmatch := 0;
   best := -1;
   hit := Default(TProcEnt);
   for i := 0 to High(FProcs) do
-    if SameId(FProcs[i].Name, AName) and (FProcs[i].Nest = inner) and
-      ((FProcs[i].Owner = '') or not hid) then
+    if SameId(FProcs[i].Name, AName) and (FProcs[i].Nest = inner) and not hid then
     begin
       if Length(Args) > FProcs[i].NParams then
         Continue;
@@ -5267,23 +5285,55 @@ begin
       i := i + 1;
 end;
 
-{ A variable or a parameter of the routine being read, or of one around
-  it, is named AName (P158): there it hides a used unit's routine,
-  constant or type of the name, as in Free Pascal (a parameter Date
-  beside SysUtils' Date). The routine's own and the program's names it
-  may not take (P75, P151). }
-function TParser.LocalHides(const AName: string): Boolean;
+{ A declaration of AName inside a routine deeper than depth L (P159):
+  a variable or a parameter of the routine being read (depth FNest) or of
+  one around it, and a constant, a type or a nested routine of them,
+  which the tables keep after the outermost routine's base while it is
+  read. It hides what is declared at L and around it, whatever its kind,
+  as in Free Pascal: a nested function X beside a global variable X is
+  the function inside, where the global's value was read. }
+function TParser.HiddenAbove(const AName: string; L: LongInt): Boolean;
 var
   i, s: SizeInt;
 begin
+  Result := False;
+  if FNest <= L then
+    Exit;
   Result := True;
   for i := 0 to High(FLocals) do
     if SameId(FLocals[i].Name, AName) then
       Exit;
   for s := 0 to High(FScopes) do
-    for i := 0 to High(FScopes[s]) do
-      if SameId(FScopes[s][i].Name, AName) then
-        Exit;
+    if (s <= High(FScopeLevels)) and (FScopeLevels[s] > L) then
+      for i := 0 to High(FScopes[s]) do
+        if SameId(FScopes[s][i].Name, AName) then
+          Exit;
+  for i := FConstBase to High(FConsts) do
+    if (FConsts[i].Nest > L) and SameId(FConsts[i].Name, AName) then
+      Exit;
+  for i := FTypeBase to High(FTypeNames) do
+    if (FTypeNames[i].Nest > L) and SameId(FTypeNames[i].Name, AName) then
+      Exit;
+  for i := FProcBase to High(FProcs) do
+    if (FProcs[i].Nest > L) and SameId(FProcs[i].Name, AName) then
+      Exit;
+  Result := False;
+end;
+
+{ AName is a variable or a parameter of the routine being read, or the
+  function itself (its result): no constant, type or nested routine of
+  the routine may take it (P75, P137). Those of a routine around it an
+  inner name hides (P159). }
+function TParser.OwnLocalName(const AName: string): Boolean;
+var
+  i: SizeInt;
+begin
+  Result := True;
+  if FIsFunc and (SameId(AName, 'result') or SameId(AName, FFuncName)) then
+    Exit;
+  for i := 0 to High(FLocals) do
+    if SameId(FLocals[i].Name, AName) then
+      Exit;
   Result := False;
 end;
 
@@ -5351,7 +5401,9 @@ end;
   routine of it (P137). A name of the program's may be hidden. }
 procedure TParser.LocalDup(const AName: string; Skip: Char);
 begin
-  if (Skip <> 'v') and IsLocalName(AName) then
+  { the routine's own variables and parameters; those of a routine
+    around it the name hides (P159) }
+  if (Skip <> 'v') and OwnLocalName(AName) then
     Die('duplicate identifier ' + AName + ' (the routine has a variable or a parameter of the name)' +
       HerePos);
   if (Skip <> 'c') and (ConstIdx(AName) >= FConstScope) then
@@ -6067,15 +6119,20 @@ var
 begin
   CheckName(AName);
   { the program's global hides a used unit's names (P158); a local or a
-    parameter hides them where it is (LocalHides) }
+    parameter hides them where it is (HiddenAbove) }
   if (not Local) and (FImporting = 0) then
   begin
     HideUnitNames(AName, 'v', nil, '');
     OwnDup(AName, 'v');
   end;
+  { a constant of its own depth; one around it a routine's variable
+    hides, as in Free Pascal (P159) }
   for i := High(FConsts) downto 0 do
-    if (FConsts[i].Owner = '') and SameId(FConsts[i].Name, AName) then
+    if (FConsts[i].Owner = '') and ((not Local) or (FConsts[i].Nest = FNest)) and
+      SameId(FConsts[i].Name, AName) then
       Die('duplicate identifier ' + AName + ' (a constant of the name)' + DupAt);
+  { a routine of the program's or around it, at any depth: inside, a call
+    of it would find the variable (P151) }
   for i := High(FProcs) downto 0 do
     if (FProcs[i].Owner = '') and SameId(FProcs[i].Name, AName) then
       Die('duplicate identifier ' + AName + ' (a routine of the name)' + DupAt);
@@ -6130,6 +6187,7 @@ begin
   FConsts[len].Value := V;
   FConsts[len].Typ := Typ;
   FConsts[len].Txt := S;
+  FConsts[len].Nest := FNest;
 end;
 
 { The value of an untyped constant: an integer, a real, a string (with
@@ -6596,17 +6654,19 @@ begin
   while (i > 0) and (AName[i] <> '.') do
     Dec(i);
   CheckName(Copy(AName, i + 1, Length(AName) - i));
-  if FindConst(AName, cv) then
+  { a constant of the top level; a nested routine hides the constants
+    around it, its own routine's LocalDup tells (P159) }
+  if (FNest = 0) and FindConst(AName, cv) then
     Die('duplicate identifier ' + AName + ' (a constant of the name)' + DupAt);
   { a routine of the top level may not take the name of a variable of
     the program's (P158); one of a used unit's it hides, which the
-    routine's head did before (and a later unit's routine, LoadUnit).
-    A nested routine may take a global's name, not a unit's (1.0.136:
-    it hid the unit's variable in silence; P159) }
-  if i = 0 then
+    routine's head did before (and a later unit's routine, LoadUnit). A
+    nested routine hides the variables around it, a global or a unit's
+    too, as in Free Pascal (P159; 1.0.136 refused a unit's, as its name
+    read the variable in silence) }
+  if (i = 0) and (FNest = 0) then
     for len := 0 to High(FVars) do
-      if SameId(FVars[len].Name, AName) and ((FNest = 0) or
-        (FVars[len].Ext and not FVars[len].Alias)) then
+      if SameId(FVars[len].Name, AName) then
         Die('duplicate identifier ' + AName + ' (a variable of the name)' + DupAt);
   len := Length(FProcs);
   SetLength(FProcs, len + 1);
@@ -8882,6 +8942,7 @@ begin
         SetLength(FTypeNames, n + 1);
         FTypeNames[n].Name := name;
         FTypeNames[n].Id := id;
+        FTypeNames[n].Nest := FNest;
       end
       else
       begin
@@ -8930,6 +8991,7 @@ begin
       SetLength(FTypeNames, n + 1);
       FTypeNames[n].Name := name;
       FTypeNames[n].Id := id;
+      FTypeNames[n].Nest := FNest;
       ResolvePending(name, id);
     end;
   end;
@@ -11794,8 +11856,7 @@ begin
           Result^.Typ := TyInteger;
           Result^.Flags := 1;
           for i := 0 to High(FConsts) do
-            if SameId(FConsts[i].Name, name) and ((FConsts[i].Owner = '') or
-              not LocalHides(name)) then
+            if SameId(FConsts[i].Name, name) and not HiddenAbove(name, FConsts[i].Nest) then
             begin
               if IsWideSet(FConsts[i].Typ) then
                 Result := SetFromImage(FConsts[i].Txt, FConsts[i].Typ)
@@ -20247,6 +20308,7 @@ var
   kids: array of PStmt;
   k0, k1: SizeInt;
   savedScopes: array of TVarDeclArray;
+  savedLevels: array of LongInt;
   savedFunc: string;
   savedFuncSym: string;
   savedIsFunc: Boolean;
@@ -20287,11 +20349,22 @@ begin
   if Pr.Safe or HasStr(FSafeNames, Pr.Name) or
     ((Pr.ClassTyp <> 0) and HasStr(FSafeNames, TypeOf(Pr.ClassTyp).Name + '.' + Pr.Name)) then
     FSafe := True;
+  savedLevels := FScopeLevels;
   if Length(FLocals) > 0 then
   begin
     n := Length(FScopes);
     SetLength(FScopes, n + 1);
     FScopes[n] := FLocals;
+    { the variables of the routine around, at its depth (P159) }
+    SetLength(FScopeLevels, n + 1);
+    FScopeLevels[n] := FNest;
+  end;
+  { the outermost routine's names begin here in the tables (P159) }
+  if FNest = 0 then
+  begin
+    FConstBase := Length(FConsts);
+    FTypeBase := Length(FTypeNames);
+    FProcBase := Length(FProcs);
   end;
   FLocals := nil;
   FParamN := 0;
@@ -20471,6 +20544,7 @@ begin
   FNoSelf := savedNoSelf;
   FLocals := savedLocals;
   FScopes := savedScopes;
+  FScopeLevels := savedLevels;
   FFuncName := savedFunc;
   FFuncSym := savedFuncSym;
   FIsFunc := savedIsFunc;
