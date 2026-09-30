@@ -10422,6 +10422,14 @@ the commands on standard input, under `--debug-mode` and under
   error, and `-9223372036854775808` is written as such.
 - A program's variable or routine may not take the name of a variable of
   a unit it uses: `duplicate identifier Counter (a variable of unit uv)`.
+- A name is declared once where it is, and the message says where the
+  second one is and what the first is: `duplicate identifier Half (a
+  routine with the same parameters) at 8:10` (1.1.26, P151). A parameter
+  or a local may not take the name of a routine of its unit or program
+  either (`duplicate identifier Format (a routine of the name) at
+  8:16`), where Free Pascal lets it hide the routine (its SysUtils calls
+  a parameter of `FloatToStrF` `format`): inside, a call of the routine
+  would find the parameter, and paslang says so where it is written.
 - When two units a program uses have a name in common, the later one in
   `uses` hides the earlier one's, as in Free Pascal (a routine of the
   same parameters, a constant, a variable, a type that is another); a

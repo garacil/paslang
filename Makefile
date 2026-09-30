@@ -1968,6 +1968,23 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'it is a method of TA' $(BUILDDIR)/dup_meth.err; \
 	grep -q 'duplicate identifier Lab (it is a method of TA)' $(BUILDDIR)/dup_parammeth.err; \
 	echo ok dupbad; \
+	echo "==== duplicate names say where, P151 ===="; \
+	for f in 'constproc:duplicate identifier Area (a constant of the name) at 6:10' \
+	  'constvar:duplicate identifier Limit (a constant of the name) at 7:3' \
+	  'enumconst:duplicate identifier Red (a constant of the name) at 7:20' \
+	  'localtwice:duplicate identifier b (the routine already has one) at 6:3' \
+	  'paramproc:duplicate identifier Format (a routine of the name) at 8:16' \
+	  'procproc:duplicate identifier Half (a routine with the same parameters) at 8:10' \
+	  'typetwice:duplicate type TPoint at 7:3' \
+	  'varconst:duplicate identifier Count (a variable of the name) at 7:3' \
+	  'varproc:duplicate identifier Show (a routine of the name) at 9:3'; do \
+	  n=$${f%%:*}; w=$${f#*:}; \
+	  if $(OUTDIR)/paslangc -o $(BUILDDIR)/dupw_$$n testdata/dupwhere/$$n.paslang >$(BUILDDIR)/dupw_$$n.err 2>&1; then \
+	    echo "$$n should fail"; exit 1; \
+	  fi; \
+	  grep -qF "$$w" $(BUILDDIR)/dupw_$$n.err || { cat $(BUILDDIR)/dupw_$$n.err; exit 1; }; \
+	done; \
+	echo ok dupwhere; \
 	echo "==== wgneg ===="; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/wgneg testdata/wgneg.paslang; \
 	set +e; $(BUILDDIR)/wgneg > $(BUILDDIR)/wgneg.got 2> $(BUILDDIR)/wgneg.err; rc=$$?; set -e; \
