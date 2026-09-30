@@ -175,7 +175,7 @@ prints), `pashash` (the hash words) and `pastree` (the ordered tree,
 the heap and the store) also put their names in every program;
 `pasmap` (the hash map), `pasheap` (the heap and the collector) and
 `pasquad` (`Quad`) are only linked. Of each unit only the routines the
-program reaches stay in it (§20). Section 15 describes them.
+program reaches stay in it (§21). Section 15 describes them.
 
 ### Packages
 
@@ -219,13 +219,13 @@ either machine:
 {$endif}
 ```
 
-The processor the code is compiled for (`-cpu`, §20) names its
+The processor the code is compiled for (`-cpu`, §21) names its
 features too: `CPU_AVX2`, `CPU_SSE42`, `CPU_BMI1`, `CPU_SHA2` on amd64,
 `CPU_CRC32`, `CPU_AES`, `CPU_PMULL`, `CPU_SHA2` on arm64, one for every
 feature name `-cpu` takes, each defined when that processor has it. A
 unit or a program chooses its bodies with them when it is compiled, as
 the language's own words choose their kernels, and nothing is tested at
-run time; a unit's build for a level (§20) takes that level's (1.1.23,
+run time; a unit's build for a level (§21) takes that level's (1.1.23,
 P148):
 
 ```
@@ -328,7 +328,7 @@ The sizes are fixed and the same on both targets:
 | Type | Size | Notes |
 |------|------|-------|
 | `Integer`, `LongInt`, `Int64`, `SizeInt`, `NativeInt`, `PtrInt`, `Cardinal`, `QWord`, `UInt64`, `Rune` | 8 | one signed 64-bit integer under every name |
-| `Byte` `UInt8` · `Int8` `ShortInt` · `Word` `UInt16` · `Int16` `SmallInt` · `UInt32` `LongWord` `DWord` · `Int32` | 1, 1, 2, 2, 4, 4 | six types (the names between dots are one), whose values keep their width: `Byte` 0..255, `Int8` −128..127, `Word` 0..65535, `Int16` −32768..32767, `UInt32` 0..4294967295, `Int32` −2147483648..2147483647; 1, 2 or 4 bytes in memory (a local or a global keeps a word's slot); `High(T)` and `Low(T)` are constants of the type; the names are reserved words (§19) |
+| `Byte` `UInt8` · `Int8` `ShortInt` · `Word` `UInt16` · `Int16` `SmallInt` · `UInt32` `LongWord` `DWord` · `Int32` | 1, 1, 2, 2, 4, 4 | six types (the names between dots are one), whose values keep their width: `Byte` 0..255, `Int8` −128..127, `Word` 0..65535, `Int16` −32768..32767, `UInt32` 0..4294967295, `Int32` −2147483648..2147483647; 1, 2 or 4 bytes in memory (a local or a global keeps a word's slot); `High(T)` and `Low(T)` are constants of the type; the names are reserved words (§20) |
 | `Boolean` | 8 | `False` is 0, `True` is 1; only a Boolean goes into one, `Boolean(x)` turns a number or a pointer into one (§3) |
 | an enumeration, a subrange | 8 | an integer; a subrange's values are its host's: `1..10` integers, `'0'..'9'` characters, `Mon..Fri` the enumeration's members |
 | `Char`, `AnsiChar` | 1 | a byte, its own type: `Ord(c)` is its code |
@@ -566,7 +566,7 @@ indicated type's, as for `+` (§3): `i := b rol 1` rotates in `Integer`
 (400), `Byte(b rol 1)` rotates the byte (145).
 
 These seven words are reserved (1.0.131): no variable, field or routine
-takes their names (§19).
+takes their names (§20).
 Each instruction is one machine instruction on a register (`rolb`,
 `rorw`, `sarq`; `ror`, `asr` on arm64); a byte or a halfword rotation
 on arm64 is two shifts and an `orr`.
@@ -821,7 +821,7 @@ record, an array, a string or a slice whole, the highest bit being bit
 7 of its last byte. `SetBits` takes the
 low `width` bits of a value that varies, and a constant must fit the
 field. The counts are `Integer`s. The bit words' names are reserved
-(1.0.131, §19).
+(1.0.131, §20).
 
 The code is the machine's own: `SetBit(b, 3, 1)` is `orb $8` on `b`'s
 byte, or `orq $8` on the register a loop keeps it in; `IsBitSet` a
@@ -829,7 +829,7 @@ shift and an `and`; `TrailingZeros` `bsf` over a sentinel bit and
 `LeadingZeros` `bsr` (`rbit` + `clz` and `clz` on arm64); `ByteSwap`
 `bswap` or `rev`; `ReverseBits` `rbit` on arm64 and a `bswap` with three
 swaps on amd64, which has no bit reversal; `PopCount` `popcnt` when the
-processor the program is compiled for has it (`-cpu`, §20) and twelve
+processor the program is compiled for has it (`-cpu`, §21) and twelve
 instructions when it does not, `cnt` on arm64. On memory a constant bit is one instruction
 on its byte, and a count over a record or a string a loop in the
 runtime, eight bytes a step.
@@ -980,7 +980,7 @@ turns a `Byte`'s 8 bits and gives 3; alone, 64 bits).
   program stops: `a funnel of 3 and 4 bytes at line L`. An empty string
   or slice has no bits: it comes back empty, and a shift to Carry leaves
   0 there.
-- Their names are reserved (1.0.131, §19): no variable, routine, field
+- Their names are reserved (1.0.131, §20): no variable, routine, field
   or type takes one.
 
 ```
@@ -1565,7 +1565,7 @@ prints
 ```
 
 `AtomicAdd(@v, d)` and `AtomicCas(@v, old, new)` are the runtime's
-words (§17): unlike the words above they take the address of an
+words (§18): unlike the words above they take the address of an
 `Integer`, and a narrower one is refused (`AtomicAdd needs an 8-byte
 integer, not a Byte`), as is the variable itself where its address
 goes (`AtomicAdd takes the address of an Integer, as AtomicAdd(@v,
@@ -1682,14 +1682,14 @@ and the function's result stay in memory. amd64 gives up to eight
 registers (xmm15 down, fewer when a statement's tree is deep: the
 tree's registers come first), arm64 v8 to v15; a V256 takes two on
 arm64 and in SSE2. On amd64 such a run is compiled once, for the
-processor `-cpu` names (§20): for AVX2 when it has AVX2 (a V256 in one
+processor `-cpu` names (§21): for AVX2 when it has AVX2 (a V256 in one
 ymm register, every instruction VEX, `vpmulld` and the other SSE4.1
 instructions SSE2 lacks), for SSE2 otherwise; nothing is tested at run
 time. A constant `VSplat16(255)` is one load of 32 bytes the
 object file holds.
 
 On amd64 a V128 is SSE2 and a V256 is AVX2 when the program is
-compiled for a processor with it (`-cpu`, §20; the default is the
+compiled for a processor with it (`-cpu`, §21; the default is the
 machine compiling), or two SSE2 halves otherwise; nothing is decided at
 run time. `-cpu base` compiles the SSE2 paths, to test them on one
 machine. `VShuffle8` is SSSE3's `pshufb` when the set has it and a loop
@@ -1851,7 +1851,7 @@ else
 see the baseline processor, SSE2 on amd64 and NEON on arm64 and nothing
 more. The language's own words do not ask them: the vectors, `PopCount`,
 the maps' hash and the hash words are chosen when the program is
-compiled (`-cpu`, §20), and `-cpu base` compiles their base paths.
+compiled (`-cpu`, §21), and `-cpu base` compiles their base paths.
 
 `CpuFeatures` holds, on amd64, bit 0 `sse2`, 1 `sse3`, 2 `ssse3`, 3
 `sse41`, 4 `sse42`, 5 `popcnt`, 6 `aes`, 7 `pclmul`, 8 `avx`, 9 `fma`, 10
@@ -1911,7 +1911,7 @@ written by a system call
 `CpuHas` is decided when the program is compiled, so the string `neon`
 is nowhere in the amd64 program and `sse2` nowhere in the arm64 one:
 what a machine can never run is not in its program. The constant
-`Amd64` (§17) says which machine the program is compiled for, as
+`Amd64` (§18) says which machine the program is compiled for, as
 `CpuHas` says what that machine has; the first picks a system call
 number (`write` is 1 on amd64 and 64 on arm64), the second the code for
 a feature. Bit 0 of `CpuFeatures` is 1 on both machines because it is
@@ -2396,7 +2396,7 @@ runs under `make check` both ways. `-inline-trace` says on the error
 output why a routine called in one of those places stays a call; a
 routine called only elsewhere stays a call without a line. To debug a routine that goes in
 place, compile with `-inline 0`: a debugger then finds the routine and
-its variables where the source has them (`-debug`, §17, does so by
+its variables where the source has them (`-debug`, §18, does so by
 itself).
 
 ```
@@ -2707,7 +2707,7 @@ same way (a `var` or `out` parameter cannot be: `X is a var parameter
 of Make, which has a closure inside: a closure may outlive the variable
 it points at; copy it to a local`). The variables live as long as a
 value that keeps them does: their block is on the heap, and the
-collector takes it back when the last closure over it is gone (§17).
+collector takes it back when the last closure over it is gone (§18).
 One call, one block: the two closures one call of `Tally` makes share
 `sum`, and two calls of `Adder` keep two `N`s. An anonymous routine
 written where no routine encloses it, as `Each`'s argument is, keeps
@@ -3079,7 +3079,7 @@ does. The option is chosen per unit (its `.pi` says `CHECKPTR`). The
 last object found is kept in the routine's record, so a loop that only
 walks a pointer takes about 11 times its time, a list walk about 5 and
 code without pointers the same (`make bench` measures it on `b8ptr`);
-without the option no check is emitted at all. `safe` code (§19) has no
+without the option no check is emitted at all. `safe` code (§20) has no
 raw pointer work to check.
 
 ## 7. Classes and interfaces
@@ -3271,7 +3271,7 @@ declares its own method named `Free` calls that. `pas obj.Free` runs the
 destructor as a routine. `inherited Destroy`, `inherited Create` or a
 bare `inherited` with no ancestor that has the method does nothing
 (1.0.137; it was an error). An object's memory goes back when nothing
-points to it any more (§17), destructor or not; there is no reference
+points to it any more (§18), destructor or not; there is no reference
 counting.
 
 ### TObject, the root of every class
@@ -4350,7 +4350,7 @@ done
 ```
 
 `pas` starts a routine: a G, scheduled by the runtime over OS threads,
-at most one running Pascal code for each CPU the program may use (§17). What follows `pas` is a call as a
+at most one running Pascal code for each CPU the program may use (§18). What follows `pas` is a call as a
 statement writes it (1.0.135): `pas Name(a, b, c)` with any number of
 arguments of any type, `pas f` or `pas f(a)` of a routine value or a
 closure, `pas obj.M(a)` of a method (a class's or an interface's),
@@ -4418,7 +4418,7 @@ never reorders what went through it. `Close(c)` wakes every receiver
 parked on `c`, each with the zero value; a `Send` on a closed channel,
 plain or as an arm of a `select`, stops the program with `paslang:
 send on closed channel`, and a second `Close` with `paslang: close of
-closed channel` (§17). The zero value is the only sign of a closed
+closed channel` (§18). The zero value is the only sign of a closed
 channel a receiver gets, so a stream that ends by a `Close` must not
 carry the zero value as data: `pipeline` below sends job numbers from 1.
 
@@ -5589,7 +5589,7 @@ the core unit `pashash`, and SHA-1, SHA-256, SHA-512 and the CRCs also
 have a body on the processor's own instructions (SHA-NI, SSE4.2's
 `crc32`, PCLMULQDQ on amd64; FEAT_SHA1, FEAT_SHA256, FEAT_SHA512,
 FEAT_CRC32 on arm64) that the program calls when it is compiled for a
-processor that has them (`-cpu`, §20, and `docs/KERNELS.md`).
+processor that has them (`-cpu`, §21, and `docs/KERNELS.md`).
 
 `examples/hashes.paslang`:
 
@@ -5706,7 +5706,7 @@ in an `Integer`, so a hash with the top bit set prints negative.
 Every word here takes the bytes of a string and is written as its
 standard writes it. A digest
 comes back as a string of raw bytes, a checksum or a fast hash as an
-`Integer`. The words are reserved (§19): no routine or variable of a
+`Integer`. The words are reserved (§20): no routine or variable of a
 program takes their names.
 
 | Word | Algorithm | Gives | Takes | On the processor (`-cpu`) | Use it for |
@@ -5736,7 +5736,7 @@ chosen value is easy to make. SipHash sits between: fast, and safe as a
 table's hash while its key is secret. A word with a body on the
 processor's instructions and one in Pascal gives the same bytes from
 both (`make check` runs `testdata/hash1` both ways on both machines);
-the choice is made when the program is compiled (`-cpu`, §20).
+the choice is made when the program is compiled (`-cpu`, §21).
 
 ### Hashing anything
 
@@ -6071,7 +6071,7 @@ compiler by `make install`. Every program links them without `uses`:
 - `pasroutines` implements `mutex`, `rwmutex`, `waitgroup`, `cond` and
   `once`, the `lock` and `once` statements, `Goid`, `NumGoroutine`,
   `Yield` and `ReadLn`. It is Pascal over the park and wake words of the
-  scheduler (§17).
+  scheduler (§18).
 - `pasfmt` writes and reads reals for `Write`, `WriteLn` and `x:w:d`
   (1.0.79): a real printed exactly, a literal read as the nearest double.
 - `pasmap` implements `map[K] of V`: a Swiss table in Pascal, a
@@ -6081,7 +6081,7 @@ compiler by `make install`. Every program links them without `uses`:
   second body on the processor's instructions; `Hex`; the Merkle words.
 - `pastree` implements `tree[K] of V`, `tree of K`, `heap of T` and
   the `store` (§11); it names `pashash` for the log's CRC.
-- `pasheap` is the heap's slow paths and the collector (§17).
+- `pasheap` is the heap's slow paths and the collector (§18).
 - `pasquad` is the arithmetic of `Quad`, in software (§14).
 
 The names of `pasobject`, `pasroutines`, `pasfmt`, `pashash` and
@@ -6104,7 +6104,7 @@ routines are there for the compiler, and a program may call them too:
 | `pasfmt` | `PasF64ToF32(b)`, `PasF32ToF64(b)` | the bits of a double rounded to the nearest single, of a single widened to a double |
 | `pasfmt` | `PasParseQuad(s, out lo, hi): Boolean`, `PasFmtQuad(lo, hi, w, d): string` | a `Quad`'s two words from text, and to text as `PasFmtReal` |
 | `pashash` | `PasHex(s)`, `PasMd5(s)`, `PasSha3(s, bits)`, `PasAdler32(s, adler)`, `PasFnv1a32(s)`, `PasFnv1a64(s)`, `PasMurmur3(s, seed)`, `PasSipHash(s, k0, k1)` | the bodies of `Hex`, `Md5`, `Sha3_*`, `Adler32`, `Fnv1a32`, `Fnv1a64`, `Murmur3` and `SipHash`, one each |
-| `pashash` | `PasSha1Cpu(s)`, `PasSha1Base(s)`, and the same pairs for `Sha224`, `Sha256`, `Sha384`, `Sha512`; `PasHmacCpu(alg, key, msg)`, `PasHmacBase` (alg 0 MD5, 1 SHA-1, 2 SHA-224, 3 SHA-256, 4 SHA-384, 5 SHA-512); `PasCrc32Cpu(s, crc)`, `PasCrc32Base`, `PasCrc32cCpu`, `PasCrc32cBase`; `PasMerkleRootCpu(leaves)`, `PasMerkleRootBase`, `PasMerkleProofCpu(leaves, i)`, `PasMerkleProofBase`, `PasMerkleCheckCpu(leaf, i, n, proof, root)`, `PasMerkleCheckBase` | the two bodies of each word, the `Cpu` one on the processor's instructions and the `Base` one in Pascal; the compiler calls one by `-cpu` (§20), a program that calls `Cpu` itself answers for the processor it runs on |
+| `pashash` | `PasSha1Cpu(s)`, `PasSha1Base(s)`, and the same pairs for `Sha224`, `Sha256`, `Sha384`, `Sha512`; `PasHmacCpu(alg, key, msg)`, `PasHmacBase` (alg 0 MD5, 1 SHA-1, 2 SHA-224, 3 SHA-256, 4 SHA-384, 5 SHA-512); `PasCrc32Cpu(s, crc)`, `PasCrc32Base`, `PasCrc32cCpu`, `PasCrc32cBase`; `PasMerkleRootCpu(leaves)`, `PasMerkleRootBase`, `PasMerkleProofCpu(leaves, i)`, `PasMerkleProofBase`, `PasMerkleCheckCpu(leaf, i, n, proof, root)`, `PasMerkleCheckBase` | the two bodies of each word, the `Cpu` one on the processor's instructions and the `Base` one in Pascal; the compiler calls one by `-cpu` (§21), a program that calls `Cpu` itself answers for the processor it runs on |
 | `pastree` | `PasTreeNew`, `PasTreeGet`, `PasTreePut`, `PasTreeDelete`, `PasTreeClear`, `PasTreeStep`, `PasTreeBound`, `PasTreeRank`, `PasTreeKeyAt`, `PasTreePop`, `PasTreeSplit`, `PasTreeJoin`, `PasHeapNew`, `PasHeapPush`, `PasHeapPop`, `PasHeapLow`, `PasHeapEmpty` | the tree and heap words, taking the compiler's descriptor of the type (key kind and sizes) and keys by address: written for the compiler, not for a program, which has `t[k]`, `Push` and the rest |
 | `pastree` | `PasStoreOpen(path): Pointer`, `PasStorePut(db, k, v)`, `PasStoreGet(db, k): string`, `PasStoreHas(db, k): Boolean`, `PasStoreDelete(db, k)`, `PasStoreSync(db)`, `PasStoreClose(db)`, `PasStoreAbandon(db)` | the store words; `k in db` is `PasStoreHas` |
 
@@ -9602,7 +9602,99 @@ slept at least 30ms: 1
 50 would go at 2
 ```
 
-## 17. The runtime model
+## 17. SysUtils
+
+`uses sysutils` gives Free Pascal's unit of the name, its routines and
+classes with Free Pascal's names, parameters and results, written for
+paslang: the text of each was read in Free Pascal 3.2.2's sources and
+its output compared with Free Pascal's (`testdata/sysutils1`). It is a
+library unit like `pastime`, installed with the compiler and built for
+each processor level (§21), so its string words run on the kernels of
+the processor a program is compiled for.
+
+```pascal
+{ SysUtils: strings to numbers and back, a case-blind comparison, a
+  replacement, and the exception a bad number raises. }
+program convert;
+
+uses sysutils;
+
+var
+  line: string;
+  n: Integer;
+  x: Double;
+begin
+  line := Trim('  42 ');
+  n := StrToInt(line);
+  if TryStrToFloat('2.5', x) then
+    WriteLn(n * x:0:1);                               { 105.0 }
+  WriteLn(UpperCase('abc'), ' ', CompareText('Abc', 'aBD'));  { ABC -1 }
+  WriteLn(StringReplace('a-b-c', '-', '+', [rfReplaceAll]));  { a+b+c }
+  try
+    n := StrToInt('12x');
+  except
+    on e: EConvertError do
+      WriteLn(e.Message);            { "12x" is an invalid integer }
+  end;
+end.
+```
+
+**Exceptions.** `Exception` holds a `Message` and a `HelpContext`
+(`Create(msg)`, `CreateHelp(msg, ctx)`), and its `ToString` is `ClassName:
+Message`, what an exception nobody catches prints. Free Pascal's classes
+are there with their parents: `EExternal`, `EIntError`, `EDivByZero`,
+`ERangeError`, `EIntOverflow`, `EMathError`, `EInvalidOp`, `EZeroDivide`,
+`EOverflow`, `EUnderflow`, `EInOutError` (with `ErrorCode`), `EHeapMemoryError`,
+`EOutOfMemory`, `EInvalidPointer`, `EInvalidCast`, `EVariantError` (with
+`CreateCode`), `EAccessViolation`, `EConvertError`, `EFormatError`,
+`EAbort`, `EAbstractError`, `EAssertionFailed`, `EOSError` (with
+`ErrorCode`), `EArgumentException` and its `EArgumentOutOfRangeException`
+and `EArgumentNilException`, `ENotImplemented`, `ENotSupportedException`,
+`EFileNotFoundException`, `EDirectoryNotFoundException`, `EListError`,
+`EOperationCancelled` and the rest of `sysutilh.inc`. `ExceptObject` and
+`ExceptAddr` are the object and the place of the raise an except part
+handles, `nil` outside one; `Abort` raises `EAbort`, `OutOfMemoryError`
+`EOutOfMemory`.
+
+**Strings.** `UpperCase`, `LowerCase`, `AnsiUpperCase`, `AnsiLowerCase`;
+`CompareStr` (the difference of the first bytes that differ, on the
+`CompareByte` kernel), `CompareText` (the same with ASCII letters as
+capitals, on its own kernel), `SameStr`, `SameText`, `AnsiCompareStr`,
+`AnsiCompareText`, `AnsiSameStr`, `AnsiSameText`, `CompareMem`; `Trim`,
+`TrimLeft`, `TrimRight`; `QuotedStr`, `AnsiQuotedStr`, `AnsiDequotedStr`;
+`AnsiPos`, `LeftStr`, `RightStr`; `StringReplace` with `rfReplaceAll`
+and `rfIgnoreCase`, and with the count of replacements as its last
+parameter; `IsDelimiter`, `LastDelimiter`, `AdjustLineBreaks`, `WrapText`
+(both forms), `IsValidIdent`, `CharInSet`, `AppendStr`, `BytesOf`,
+`StringOf`, `TBytes`, `TSysCharSet`.
+
+**Integers and Booleans.** `IntToStr`, `UIntToStr`, `IntToHex` (and its
+one-argument form, sixteen digits); `StrToInt`, `StrToInt64`,
+`StrToQWord`, `StrToUInt64`, `StrToDWord`, `StrToUInt`, each with its
+`Def` and `Try` forms, reading what `Val` reads (decimal, `$`, `0x`, `%`,
+`&`); `BoolToStr` (`-1` and `0`, or `TrueBoolStrs` and `FalseBoolStrs`,
+or two strings given), `StrToBool`, `StrToBoolDef`, `TryStrToBool`.
+
+**Reals and the settings.** `StrToFloat`, `StrToFloatDef` and
+`TryStrToFloat` (into a `Double` or a `Single`, rounded once), each with a
+`TFormatSettings` too: no thousands separator, and the settings'
+decimal separator. `DefaultFormatSettings` holds Free Pascal's values
+(`.`, `,`, `$`, the month and day names), and `FormatSettings` is the same
+record under the other name (`absolute`, §3), so a program that sets
+`FormatSettings.DecimalSeparator := ','` changes what every routine
+reads.
+
+What differs from Free Pascal's, as paslang differs (§19): `Integer` is
+64 bits, so `StrToInt` takes what `StrToInt64` takes; the `Ansi` words
+change the ASCII letters of UTF-8 text and leave the other bytes;
+`GetBaseException` is the object it is called on, since paslang keeps no
+list of the exceptions being handled; `StringReplace` with a count,
+`EInOutArgumentException` and `GetBaseException` come from Free
+Pascal's sources after 3.2.2; an exception nobody catches prints
+`paslang: uncaught raise in the main routine: EConvertError: ...` and
+the program stops with status 1.
+
+## 18. The runtime model
 
 A running program is a set of routines, Gs, on a set of OS threads, Ms.
 At most one M runs Pascal code for each CPU the program may use (its
@@ -9884,7 +9976,7 @@ A routine that stops parks on a channel of its own and the others run
 on; the socket is served by a routine of the program, so the program
 must be scheduling for the debugger to answer: a program spinning in a
 loop that calls nothing is reached at its next routine entry or loop
-head, as the monitor reaches it (§17). A stopped routine holds whatever
+head, as the monitor reaches it (§18). A stopped routine holds whatever
 locks it holds. The serving routine is not one the program waits for
 when its main routine ends.
 
@@ -10160,7 +10252,7 @@ to the new one. `testdata/debug2.paslang` runs under `make check` with
 the commands on standard input, under `--debug-mode` and under
 `--debug-listen` with `--debug-attach`, on both machines.
 
-## 18. Limits and differences from other Pascals
+## 19. Limits and differences from other Pascals
 
 - `Byte`, `Word`, `Int32` and the rest keep their width in their values
   and in memory, and a record's fields lie at their natural alignment:
@@ -10255,7 +10347,7 @@ the commands on standard input, under `--debug-mode` and under
   stops with `paslang: all routines are asleep: deadlock` (§10).
 - The target is GNU/Linux only, kernel 6.13 or newer, amd64 and arm64.
 
-## 19. Reserved words
+## 20. Reserved words
 
 The lexer reserves these words, in any case of letters; none can name
 a variable, a type or a routine, and one where a name goes says so:
@@ -10285,7 +10377,7 @@ its place:
 - the bit operators `nand nor xnor andnot sar rol ror`;
 - the declaration words `forward overload override abstract public
   private published protected strict operator inline cdecl nostackframe`,
-  and `packed`, which has no place at all: it is refused everywhere (§18);
+  and `packed`, which has no place at all: it is refused everywhere (§19);
 - the slice words `Append` and `Cap`;
 - the ordinal, string, slice, map and memory words `Ord Chr Succ Pred Low
   High Odd SizeOf Length Copy Delete Clear TryGet Default Assigned
@@ -10372,7 +10464,7 @@ run time.
 `WriteLn`, `Write`, `ReadLn`, `New`, `Sleep`, `MakeChan`, `Send`,
 `Recv` and `Close` are keywords (above) and are never names.
 
-## 20. Command reference
+## 21. Command reference
 
 ```
 paslangc [options] file.paslang
@@ -10385,7 +10477,7 @@ paslangc [options] file.paslang
 | `-checkptr` | check every pointer step and access against its object while the program runs (§6) |
 | `-inline <n>` | inline by measure (§5): a plain routine of the unit whose body counts `n` statements and expression nodes or fewer goes in place where it is called; a routine declared `inline` goes in whatever its size; `-inline 0` keeps one copy of every routine and every loop; 40 by default |
 | `-inline-trace` | say on the error output why each routine of the unit stays a call |
-| `-debug` | the debugger inside the executable (§17): `uses pasdebug`, a call of the debugger at every statement, the tables of the routines, variables and lines; `-inline 0` and no variable in a register; run with `PASLANG_DEBUG=<socket>` and speak to it with `pasdbg <socket>` |
+| `-debug` | the debugger inside the executable (§18): `uses pasdebug`, a call of the debugger at every statement, the tables of the routines, variables and lines; `-inline 0` and no variable in a register; run with `PASLANG_DEBUG=<socket>` and speak to it with `pasdbg <socket>` |
 | `-Fu <dir>` | a directory of compiled units, repeatable |
 | `-install <dir>` | compile a package and install its units there |
 | `-target amd64`, `-target intel64`, `-target arm64` | the machine to emit for; on amd64 the arm64 output is cross-assembled with `aarch64-linux-gnu-as` and `-ld`, and an arm64 machine uses its own `as` and `ld` |

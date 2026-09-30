@@ -183,7 +183,7 @@ paslang is free software.
 | Part | License |
 |---|---|
 | The compiler (`src/compiler`, `cmd/paslangc`), `pasdbg`, the scripts, the tests and the examples | [GNU General Public License](COPYING), version 3 or any later version |
-| The runtime library: the units of `src/lib` and the runtime `paslangc` writes into every program | GPL version 3 or later with the [paslang Runtime Library Exception](COPYING.RUNTIME) |
+| The runtime library: the units of `src/lib` and `src/rtl` and the runtime `paslangc` writes into every program | GPL version 3 or later with the [paslang Runtime Library Exception](COPYING.RUNTIME) |
 | The manual and the documentation in `docs/` | [GNU Free Documentation License](COPYING.DOC), version 1.3 or any later version, with no Invariant Sections, no Front-Cover Texts and no Back-Cover Texts |
 
 The Runtime Library Exception lets a program compiled with paslang be
@@ -192,7 +192,8 @@ and the units are linked into it; the runtime library itself stays under
 the GPL.
 
 The SHA-1, SHA-256, SHA-512 and CRC kernels of `src/lib/pashash.paslang`
-follow the assembly of Go 1.23 for each machine; Go's license, which
-covers those parts, is in [LICENSE-GO](LICENSE-GO).
+and the string kernels of `src/lib/passtr.paslang` follow the assembly
+of Go 1.23 for each machine; Go's license, which covers those parts, is
+in [LICENSE-GO](LICENSE-GO).
 
 Copyright (C) 2026 Germán Luis Aracil Boned.

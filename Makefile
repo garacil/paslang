@@ -86,8 +86,8 @@ LVL_A64 := v8.2+crypto
 A64_OBJDUMP ?= aarch64-linux-gnu-objdump
 
 # The golden tests: testdata/<t>.paslang must print testdata/<t>.out.
-GOLDEN := hello arith ifthen loops const caseof procs recfn records ptrs arrs strs grow paswork pingpong chclose sel exc excg nest cls gen enums sets dbg opt gdbg inherit rtti args8 mevent slice chlit armmeth propacc runes variant opadd args20 iface opmore props pindex dwarfloc shift dynnil xor inhcall isas sysid forward defaults abstract overload methov strdef trig logexp arctan invpow logx trig2 hyper miscmath xxh32 xxh64 map1 map2 sync1 sync2 finexit zerolocal pchar selx selstress wrchar chstr lookpath strcmp dupparam recarg funcval constk regloop reszero divconst bareln gctypes chr charcat heapspan blobzero gcbasic mapsplit stackmap trygrow growgc xxh3 mapgetstr bounds fairq sized fwdptr constexpr int2real typedconst caserange emptystmt writefmt realparse realfmt valpar strcow chanany chanbuf memmove overnarrow slicegrow fatexit narrow narrowmem recalign narrowbounds dwarfnarrow narrowgo forlimit bce inplace narrowasm slicereg forrun addrform bcerun inspine framearr realstep f32conv single dwarfreal ptrtyped ptrarith ptrsafe memview checkptr ptrreach cpwalk realint quadcore quadfmt quad quadconst dwarfquad bitops declorder convchain bitwords bitmem bitany views blocks wide ifdef quadfast memwords cpuwords vectors vecmore inlineasm vecpool addrlocal rotwords rotmem ctxwords append funcval2 closures pasargs ifaceargs vshrs64 auditfix closurebox audit2 visibility freedestroy reservedall nodeadlock mapfix tree1 tree2 hash1 store1 immwide constref inline1 stackargs mainexit networds charcmp unixsock sigpipe sleepmany deadlines strfill narrowpop tobject1 excobj1 excobj2 excobj3 classref1 ctorargs aconst1 aconst2 methdef1 set256 subrange1 subrange2 helper1 helper2 strwords strkern slicedit strcmpk scope1 classfwd ifacebind overconv overrank valunsigned initvar extended1 valround valround2 cmpwords
-GOLDEN_A64 := map1 map2 sync1 sync2 finexit zerolocal pchar pingpong sel chclose paswork selx selstress wrchar args8 arith arrs caseof chlit cls const enums exc excg gen grow hyper ifthen inherit loops mevent miscmath nest procs ptrs recfn records sets strs trig2 xxh32 xxh64 rtti gdbg chstr strcmp recarg funcval constk regloop reszero divconst bareln gctypes chr charcat heapspan blobzero gcbasic mapsplit stackmap trygrow growgc xxh3 mapgetstr bounds fairq sized fwdptr constexpr int2real typedconst caserange emptystmt writefmt realparse realfmt valpar strcow chanany chanbuf memmove overnarrow slicegrow fatexit narrow narrowmem recalign narrowbounds dwarfnarrow narrowgo forlimit bce inplace narrowasm slicereg forrun addrform bcerun inspine framearr realstep f32conv single dwarfreal ptrtyped ptrarith ptrsafe memview checkptr ptrreach cpwalk realint quadcore quadfmt quad quadconst dwarfquad bitops declorder convchain bitwords bitmem bitany views blocks wide ifdef quadfast memwords cpuwords vectors vecmore inlineasm vecpool addrlocal rotwords rotmem ctxwords append funcval2 closures pasargs ifaceargs vshrs64 auditfix closurebox audit2 visibility freedestroy reservedall nodeadlock mapfix tree1 tree2 hash1 store1 immwide constref inline1 stackargs mainexit networds charcmp unixsock sigpipe sleepmany deadlines strfill narrowpop tobject1 excobj1 excobj2 excobj3 classref1 ctorargs aconst1 aconst2 methdef1 set256 subrange1 subrange2 helper1 helper2 strwords strkern slicedit strcmpk scope1 classfwd ifacebind overconv overrank valunsigned initvar extended1 valround valround2 cmpwords
+GOLDEN := hello arith ifthen loops const caseof procs recfn records ptrs arrs strs grow paswork pingpong chclose sel exc excg nest cls gen enums sets dbg opt gdbg inherit rtti args8 mevent slice chlit armmeth propacc runes variant opadd args20 iface opmore props pindex dwarfloc shift dynnil xor inhcall isas sysid forward defaults abstract overload methov strdef trig logexp arctan invpow logx trig2 hyper miscmath xxh32 xxh64 map1 map2 sync1 sync2 finexit zerolocal pchar selx selstress wrchar chstr lookpath strcmp dupparam recarg funcval constk regloop reszero divconst bareln gctypes chr charcat heapspan blobzero gcbasic mapsplit stackmap trygrow growgc xxh3 mapgetstr bounds fairq sized fwdptr constexpr int2real typedconst caserange emptystmt writefmt realparse realfmt valpar strcow chanany chanbuf memmove overnarrow slicegrow fatexit narrow narrowmem recalign narrowbounds dwarfnarrow narrowgo forlimit bce inplace narrowasm slicereg forrun addrform bcerun inspine framearr realstep f32conv single dwarfreal ptrtyped ptrarith ptrsafe memview checkptr ptrreach cpwalk realint quadcore quadfmt quad quadconst dwarfquad bitops declorder convchain bitwords bitmem bitany views blocks wide ifdef quadfast memwords cpuwords vectors vecmore inlineasm vecpool addrlocal rotwords rotmem ctxwords append funcval2 closures pasargs ifaceargs vshrs64 auditfix closurebox audit2 visibility freedestroy reservedall nodeadlock mapfix tree1 tree2 hash1 store1 immwide constref inline1 stackargs mainexit networds charcmp unixsock sigpipe sleepmany deadlines strfill narrowpop tobject1 excobj1 excobj2 excobj3 classref1 ctorargs aconst1 aconst2 methdef1 set256 subrange1 subrange2 helper1 helper2 strwords strkern slicedit strcmpk scope1 classfwd ifacebind overconv overrank valunsigned sysutils1 sysutils2 initvar extended1 valround valround2 cmpwords
+GOLDEN_A64 := map1 map2 sync1 sync2 finexit zerolocal pchar pingpong sel chclose paswork selx selstress wrchar args8 arith arrs caseof chlit cls const enums exc excg gen grow hyper ifthen inherit loops mevent miscmath nest procs ptrs recfn records sets strs trig2 xxh32 xxh64 rtti gdbg chstr strcmp recarg funcval constk regloop reszero divconst bareln gctypes chr charcat heapspan blobzero gcbasic mapsplit stackmap trygrow growgc xxh3 mapgetstr bounds fairq sized fwdptr constexpr int2real typedconst caserange emptystmt writefmt realparse realfmt valpar strcow chanany chanbuf memmove overnarrow slicegrow fatexit narrow narrowmem recalign narrowbounds dwarfnarrow narrowgo forlimit bce inplace narrowasm slicereg forrun addrform bcerun inspine framearr realstep f32conv single dwarfreal ptrtyped ptrarith ptrsafe memview checkptr ptrreach cpwalk realint quadcore quadfmt quad quadconst dwarfquad bitops declorder convchain bitwords bitmem bitany views blocks wide ifdef quadfast memwords cpuwords vectors vecmore inlineasm vecpool addrlocal rotwords rotmem ctxwords append funcval2 closures pasargs ifaceargs vshrs64 auditfix closurebox audit2 visibility freedestroy reservedall nodeadlock mapfix tree1 tree2 hash1 store1 immwide constref inline1 stackargs mainexit networds charcmp unixsock sigpipe sleepmany deadlines strfill narrowpop tobject1 excobj1 excobj2 excobj3 classref1 ctorargs aconst1 aconst2 methdef1 set256 subrange1 subrange2 helper1 helper2 strwords strkern slicedit strcmpk scope1 classfwd ifacebind overconv overrank valunsigned sysutils1 sysutils2 initvar extended1 valround valround2 cmpwords
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -115,7 +115,8 @@ LIB_UNITS := \
 	src/lib/pasrand.paslang \
 	src/lib/passort.paslang \
 	src/lib/pastime.paslang \
-	src/lib/pasx11.paslang
+	src/lib/pasx11.paslang \
+	src/rtl/sysutils.paslang
 
 all: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(OUTDIR)/pasdbg
 
@@ -494,7 +495,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/stackmap.out $(BUILDDIR)/stackmap.vgot; \
 	echo ok stackmaps; \
 	echo "==== the base processor (-cpu base) ===="; \
-	for t in vectors vecmore vecpool bitwords xxh3 inlineasm hash1 tree1 store1 mapsplit set256 strwords strkern strcmpk cmpwords; do \
+	for t in vectors vecmore vecpool bitwords xxh3 inlineasm hash1 tree1 store1 mapsplit set256 strwords strkern strcmpk cmpwords sysutils1; do \
 	  $(OUTDIR)/paslangc -cpu base -o $(BUILDDIR)/$$t-base testdata/$$t.paslang; \
 	  $(BUILDDIR)/$$t-base > $(BUILDDIR)/$$t.bgot; \
 	  diff -u testdata/$$t.out $(BUILDDIR)/$$t.bgot; \
@@ -1707,6 +1708,13 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	done; \
 	objdump -d --no-show-raw-insn $(BUILDDIR)/lvluse-base | awk '/<p_lvlu_check>:/,/ret/' | grep -q pascrc32cbase; \
 	objdump -d --no-show-raw-insn $(BUILDDIR)/lvluse-$(LVL_X64) | awk '/<p_lvlu_check>:/,/ret/' | grep -q pascrc32ccpu; \
+	for c in base $(LVL_X64); do \
+	  $(OUTDIR)/paslangc -cpu $$c -o $(BUILDDIR)/sysutils1-$$c testdata/sysutils1.paslang; \
+	  $(BUILDDIR)/sysutils1-$$c > $(BUILDDIR)/sysutils1-$$c.got; \
+	  diff -u testdata/sysutils1.out $(BUILDDIR)/sysutils1-$$c.got; \
+	done; \
+	objdump -d --no-show-raw-insn $(BUILDDIR)/sysutils1-base | awk '/<p_sysutils_uppercase>:/,/ret/' | grep -q pasupperbase; \
+	objdump -d --no-show-raw-insn $(BUILDDIR)/sysutils1-$(LVL_X64) | awk '/<p_sysutils_uppercase>:/,/ret/' | grep -q pasuppercpu; \
 	$(OUTDIR)/paslangc -target arm64 -cpu base testdata/units/lvlu.paslang; \
 	$(OUTDIR)/paslangc -target arm64 -cpu $(LVL_A64) -c -Fu $(A64DIR) -o '$(A64DIR)/$(LVL_A64)/lvlu' testdata/units/lvlu.paslang; \
 	for c in base max; do \
@@ -2050,7 +2058,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	test "$$ticks" -lt 20; \
 	echo "ok idlecpu ($$ticks user ticks after one second)"; \
 	echo "==== examples ===="; \
-	for t in hello values control routines varargs records classes registry helpers generics errors excobjects bank concurrent fanin maps sync wordcount strings maths narrow pointers single quad bits rotations carry bigrot bitfields wide atomics views vectors machine assembly hashes closures slices properties cleanup pipeline kvstore sorting timeout digest bitmap trees; do \
+	for t in hello values control routines varargs records classes registry helpers convert generics errors excobjects bank concurrent fanin maps sync wordcount strings maths narrow pointers single quad bits rotations carry bigrot bitfields wide atomics views vectors machine assembly hashes closures slices properties cleanup pipeline kvstore sorting timeout digest bitmap trees; do \
 	  $(OUTDIR)/paslangc -o $(BUILDDIR)/ex_$$t examples/$$t.paslang; \
 	  $(BUILDDIR)/ex_$$t > $(BUILDDIR)/ex_$$t.got; \
 	  diff -u examples/$$t.out $(BUILDDIR)/ex_$$t.got; \
@@ -2125,7 +2133,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	  echo ok $$t-arm; \
 	done; \
 	echo "==== the base processor arm64 ===="; \
-	for t in hash1 tree1 store1 vectors bitwords set256 strwords strkern strcmpk cmpwords; do \
+	for t in hash1 tree1 store1 vectors bitwords set256 strwords strkern strcmpk cmpwords sysutils1; do \
 	  $(OUTDIR)/paslangc -target arm64 -cpu base -o $(BUILDDIR)/$$t-arm-base testdata/$$t.paslang; \
 	  timeout 120 $(QEMU_A64) $(BUILDDIR)/$$t-arm-base > $(BUILDDIR)/$$t-arm.bgot; \
 	  diff -u testdata/$$t.out $(BUILDDIR)/$$t-arm.bgot; \
@@ -2326,7 +2334,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	done; \
 	echo ok deadlock-arm; \
 	echo "==== examples arm64 ===="; \
-	for t in hello values control routines varargs records classes registry helpers generics errors excobjects bank concurrent fanin maps sync wordcount strings maths narrow pointers single quad bits rotations carry bigrot bitfields wide atomics views vectors machine assembly hashes closures slices properties cleanup pipeline kvstore sorting timeout digest bitmap trees; do \
+	for t in hello values control routines varargs records classes registry helpers convert generics errors excobjects bank concurrent fanin maps sync wordcount strings maths narrow pointers single quad bits rotations carry bigrot bitfields wide atomics views vectors machine assembly hashes closures slices properties cleanup pipeline kvstore sorting timeout digest bitmap trees; do \
 	  $(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/ex_$$t-arm examples/$$t.paslang; \
 	  timeout 60 $(QEMU_A64) $(BUILDDIR)/ex_$$t-arm > $(BUILDDIR)/ex_$$t-arm.got; \
 	  diff -u examples/$$t.out $(BUILDDIR)/ex_$$t-arm.got; \
