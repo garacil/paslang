@@ -359,7 +359,7 @@ The sizes are fixed and the same on both targets:
 | `Real`, `Double` | 8 | one IEEE binary64 |
 | `Single` | 4 | IEEE binary32, worked out in 32 bits; with a Double it widens, and a Double becomes a Single only through `Single(x)` |
 | `Quad` | 16 | IEEE binary128 in software, the same bits on both machines; everything widens to it, and it becomes a Double only through `Double(x)` (§14) |
-| `^T`, a class, a map, a chan | 8 | one machine word; `nil` is zero |
+| `^T`, a class, a map, a chan | 8 | one machine word; `nil` is zero; two pointer types to one type are one type, whichever unit declares them, `PChar` too (1.1.34, P164) |
 | `array of T` | 24 | a slice: pointer, length, capacity |
 | `array[a..b] of T`, `array[I] of T` | (b-a+1) × SizeOf(T) | fixed, no header; the index a range or an ordinal type `I` (`Boolean`, `Char`, `Byte`, an enumeration, a subrange), and `array[1..3, 1..4] of T` is `array[1..3] of array[1..4] of T` |
 | `set of T` | 8 or 32 | a bitset: one word for elements 0..63, 32 bytes up to 255 |

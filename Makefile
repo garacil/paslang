@@ -1739,6 +1739,21 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/absuse-arm testdata/units/absuse.paslang; \
 	timeout 60 $(QEMU_A64) $(BUILDDIR)/absuse-arm > $(BUILDDIR)/absuse-arm.got; \
 	diff -u testdata/units/absuse.out $(BUILDDIR)/absuse-arm.got; \
+	: a pointer type is one type whichever unit brings it, both uses orders, P164; \
+	$(OUTDIR)/paslangc testdata/units/ptra.paslang; \
+	$(OUTDIR)/paslangc testdata/units/ptrb.paslang; \
+	for p in ptrause ptrbuse; do \
+	  $(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/$$p testdata/units/$$p.paslang; \
+	  $(BUILDDIR)/$$p > $(BUILDDIR)/$$p.got; \
+	  diff -u testdata/units/ptrause.out $(BUILDDIR)/$$p.got; \
+	done; \
+	$(OUTDIR)/paslangc -target arm64 testdata/units/ptra.paslang; \
+	$(OUTDIR)/paslangc -target arm64 testdata/units/ptrb.paslang; \
+	for p in ptrause ptrbuse; do \
+	  $(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/$$p-arm testdata/units/$$p.paslang; \
+	  timeout 60 $(QEMU_A64) $(BUILDDIR)/$$p-arm > $(BUILDDIR)/$$p-arm.got; \
+	  diff -u testdata/units/ptrause.out $(BUILDDIR)/$$p-arm.got; \
+	done; \
 	: two units that declare the same class, interface, record and helper names, P154; \
 	$(OUTDIR)/paslangc testdata/units/twina.paslang; \
 	$(OUTDIR)/paslangc testdata/units/twinb.paslang; \
