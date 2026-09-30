@@ -349,6 +349,14 @@ breaks C-shaped layout.
   (`array of T` for a `^T`, bytes for a `Pointer`), capacity 0, its
   index checked; a length below 0 stops the program.
 
+**`array of const`** (1.1.5) is a parameter's type: a slice of
+`TVarRec`, 32 bytes each, the kind at 0 and the value at 8 (a string's
+two words at 8 and 16, a `Quad` at 16). A list in brackets is built in a
+scratch region of the caller's frame, typed as an array of `TVarRec`, so
+the stack maps name its pointer words for the collector and a stack
+that grows moves them; the value words are cleared before the values
+are worked out. The callee cannot keep it (MANUAL §5).
+
 ## Records and pointers
 
 - `record` … `end`: C field order and alignment. No hidden vptr.

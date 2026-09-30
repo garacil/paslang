@@ -87,6 +87,7 @@ type
     FSelfClassRef: Boolean;  { the body read is a class method's: Self is the class, no object (P123) }
     FNoSelf: Boolean;        { the body read is a static class method's: no Self at all (P123) }
     FCPropSets: array of PExpr;   { class properties read (P123): the node, and its static setter, for an assignment }
+    FParamType: Boolean;     { a parameter's type is read: array of const may be it (P124) }
     FCPropSetSyms: TStrArray;
     FSymChain: TStrArray;  { the routines being parsed, outermost first }
     FBoxing: TStrArray;    { the routines that hold a closure inside }
@@ -386,6 +387,11 @@ type
     function TypeBound(Id: LongInt; Hi: Boolean): PExpr;
     function InternPtr(Elem: LongInt): LongInt;
     function InternClassRef(Cls: LongInt): LongInt;
+    function InternConstArr: LongInt;
+    function IsConstArr(T: LongInt): Boolean;
+    function ParamType(ByRef: Boolean): LongInt;
+    function ConstArrOf(E: PExpr): PExpr;
+    procedure NoConstArr(const Args: TExprArray; const Where: string);
     function ClassValue(Cls: LongInt): PExpr;
     function ClassMember(Cls: LongInt; VmtE: PExpr; const AName: string;
       ALine, ACol: LongInt; out Res: PExpr): Boolean;
@@ -865,6 +871,8 @@ begin
     Result := 'an enumeration'
   else if k = tykRecord then
     Result := 'a record'
+  else if (k = tykArray) and (TypeOf(T).Elem2 = ConstArrMark) then
+    Result := 'array of const'
   else if (k = tykArray) and IsDynTyp(T) then
     Result := 'array of ' + TypName(TypeOf(T).Elem)
   else if k = tykArray then
@@ -2422,6 +2430,149 @@ begin
   Result^.Str := 'vmt_' + ToLower(TypeOf(Cls).Name);
 end;
 
+{ array of const (P124): a slice of TVarRec, marked, one type. }
+function TParser.InternConstArr: LongInt;
+var
+  i, n: SizeInt;
+  vr: LongInt;
+begin
+  if (not NamedType('TVarRec', vr)) or (TypeOf(vr).Kind <> tykRecord) then
+    Die('array of const needs TVarRec, which pasobject brings' + HerePos);
+  for i := 0 to High(FTypes) do
+    if (FTypes[i].Kind = tykArray) and (FTypes[i].Elem2 = ConstArrMark) and
+      (FTypes[i].Elem = vr) then
+    begin
+      Result := LongInt(i);
+      Exit;
+    end;
+  n := Length(FTypes);
+  SetLength(FTypes, n + 1);
+  FTypes[n] := Default(TTypeDef);
+  FTypes[n].Kind := tykArray;
+  FTypes[n].Elem := vr;
+  FTypes[n].Elem2 := ConstArrMark;
+  FTypes[n].Lo := 0;
+  FTypes[n].Hi := -1;
+  FTypes[n].Size := 24;
+  Result := LongInt(n);
+end;
+
+function TParser.IsConstArr(T: LongInt): Boolean;
+begin
+  Result := (TypeOf(T).Kind = tykArray) and (TypeOf(T).Elem2 = ConstArrMark);
+end;
+
+{ A parameter's type, where array of const may go, given and never a
+  var or out parameter (P124). }
+function TParser.ParamType(ByRef: Boolean): LongInt;
+var
+  was: Boolean;
+begin
+  was := FParamType;
+  FParamType := True;
+  Result := Self.ParseType;
+  FParamType := was;
+  if ByRef and IsConstArr(Result) then
+    Die('an array of const is given to a routine, not a var or out parameter' + HerePos);
+end;
+
+{ The list [a, b, ...] where an array of const goes (P124): each value
+  with its kind, in a TVarRec of the caller's frame, which the emitter
+  fills (rt_constarr); the kinds in Str, one byte each, and the frame's
+  array type in Num. An integer of any width is a 64-bit vtInteger, a
+  Single a Double (vtExtended), a one-character literal a vtChar, as in
+  Free Pascal; a record, an array, a set or a map is no such value. }
+function TParser.ConstArrOf(E: PExpr): PExpr;
+var
+  i: SizeInt;
+  v: PExpr;
+  k: TTypeKind;
+  kinds: string;
+  vals: TExprArray;
+  vr: LongInt;
+  kd: LongInt;
+begin
+  vals := nil;
+  kinds := '';
+  SetLength(vals, Length(E^.Args));
+  for i := 0 to High(E^.Args) do
+  begin
+    v := E^.Args[i];
+    if v^.Kind = ekRange then
+      Die('an array of const takes values, not a range' + HerePos);
+    CheckTyped(v);
+    k := TypeOf(v^.Typ).Kind;
+    if (v^.Kind = ekStr) and (Length(v^.Str) = 1) then
+    begin
+      kd := VrChar;
+      v := NewInt(Ord(v^.Str[1]));
+      v^.Typ := TyChar;
+    end
+    else if v^.Kind = ekNil then
+      kd := VrPointer
+    else if v^.Typ = TyChar then
+      kd := VrChar
+    else if (v^.Typ = TyBoolean) or (k = tykBoolean) then
+      kd := VrBoolean
+    else if IsIntId(v^.Typ) or (k = tykInteger) then
+    begin
+      { a narrow integer widens to the 64 bits of VInteger }
+      kd := VrInteger;
+      v := CoerceInt(v, TyInteger);
+    end
+    else if (k = tykSubrange) or (k = tykEnum) then
+      kd := VrInteger
+    else if k = tykQuad then
+      kd := VrQuad
+    else if k = tykReal then
+    begin
+      kd := VrExtended;
+      v := ValArg(TyReal, v);
+    end
+    else if k = tykString then
+      kd := VrAnsiString
+    else if (k = tykPointer) and (TypeOf(v^.Typ).Elem = TyChar) then
+      kd := VrPChar
+    else if k = tykPointer then
+      kd := VrPointer
+    else if k = tykClass then
+      kd := VrObject
+    else if k = tykClassRef then
+      kd := VrClass
+    else if k = tykInterface then
+      kd := VrInterface
+    else if k = tykProc then
+      kd := VrPointer
+    else
+    begin
+      Die('an array of const takes ordinals, reals, strings, pointers, objects, classes and ' +
+        'interfaces, not ' + TypName(v^.Typ) + HerePos);
+      kd := 0;
+    end;
+    vals[i] := v;
+    kinds := kinds + Char(kd);
+  end;
+  Result := NewCall('rt_constarr', vals, InternConstArr);
+  Result^.Str := kinds;
+  vr := TypeOf(InternConstArr).Elem;
+  if Length(vals) > 0 then
+    Result^.Num := InternArray(vr, 0, Length(vals) - 1)
+  else
+    Result^.Num := 0;
+end;
+
+{ No argument of Args is an array of const (P124): Where runs the call
+  after the frame that built the list may be gone. }
+procedure TParser.NoConstArr(const Args: TExprArray; const Where: string);
+var
+  i: SizeInt;
+begin
+  for i := 0 to High(Args) do
+    if (Args[i] <> nil) and IsConstArr(Args[i]^.Typ) then
+      Die(Where + ' passes values, and an array of const lives for the call it is given to' +
+        HerePos);
+end;
+
 { A pointer to a type not declared yet (PNode = ^TNode before TNode) gets
   a type of its own, shared only by the uses of that same name, until
   AddNamedType patches its Elem. It was the interned ^Integer until
@@ -2495,7 +2646,7 @@ var
 begin
   for i := 0 to High(FTypes) do
     if (FTypes[i].Kind = tykArray) and (FTypes[i].Elem = Elem) and
-      (FTypes[i].Lo = Lo) and (FTypes[i].Hi = Hi) then
+      (FTypes[i].Lo = Lo) and (FTypes[i].Hi = Hi) and (FTypes[i].Elem2 <> ConstArrMark) then
     begin
       Result := LongInt(i);
       Exit;
@@ -2985,6 +3136,25 @@ begin
   { VSplat8(1) where a V256 goes is a V256 (1.0.125). }
   if IsVecTyp(Want) and VecFlex(E) then
     VecFit(E, Want);
+  { array of const (P124): a list in brackets is built for the call;
+    another array of const passes on, and a slice of TVarRec goes too.
+    Given, one is read, indexed, measured, walked, or passed on: it
+    goes nowhere else, so nothing keeps it past the call. }
+  if IsConstArr(Want) then
+  begin
+    if E^.Kind = ekSet then
+    begin
+      Result := ConstArrOf(E);
+      Exit;
+    end;
+    if not (IsConstArr(E^.Typ) or (IsDynTyp(E^.Typ) and SameTyp(TypeOf(E^.Typ).Elem,
+      TypeOf(Want).Elem))) then
+      Die(TypName(E^.Typ) + ' does not go into an array of const: [a, b, ...] does' + HerePos);
+    Exit;
+  end;
+  if IsConstArr(E^.Typ) and (Want <> TyNone) then
+    Die('an array of const is read, indexed, measured, walked or passed on to another, ' +
+      'not kept in ' + TypName(Want) + HerePos);
   { [a, b] where a slice goes is a slice (1.0.132), not a set. }
   if IsDynTyp(Want) and (E^.Kind = ekSet) then
   begin
@@ -4970,7 +5140,7 @@ var
   id, elem, t: LongInt;
   lo, hi: Int64;
   k: TTokKind;
-  isFn, pref: Boolean;
+  isFn, pref, outerParam: Boolean;
   ptyps: array of LongInt;
   prefs: array of Boolean;
   pret, pt: LongInt;
@@ -5061,7 +5231,7 @@ begin
             FTok := FLex.Next;
           end;
           Eat(tkColon);
-          pt := Self.ParseType;
+          pt := ParamType(pref);
           for pidx := 1 to pn do
           begin
             SetLength(ptyps, Length(ptyps) + 1);
@@ -5181,8 +5351,22 @@ begin
     else
     begin
       Eat(tkOf);
-      elem := Self.ParseType;
-      t := InternArray(elem, 0, -1);
+      if FTok.Kind = tkConst then
+      begin
+        { array of const (P124), a parameter's type }
+        if not FParamType then
+          Die('array of const is the type of a parameter' + HerePos);
+        FTok := FLex.Next;
+        t := InternConstArr;
+      end
+      else
+      begin
+        outerParam := FParamType;
+        FParamType := False;
+        elem := Self.ParseType;
+        FParamType := outerParam;
+        t := InternArray(elem, 0, -1);
+      end;
     end;
   end
   else if k = tkSet then
@@ -5329,7 +5513,7 @@ begin
             FTok := FLex.Next;
           end;
           Eat(tkColon);
-          t := Self.ParseType;
+          t := ParamType(byref);
           for i := 0 to nn - 1 do
           begin
             SetLength(td.Meths[n].ParamTyps, npar + 1);
@@ -5723,7 +5907,7 @@ begin
               FTok := FLex.Next;
             end;
             Eat(tkColon);
-            pt := Self.ParseType;
+            pt := ParamType(byref);
             for i := 0 to nn - 1 do
             begin
               if npar >= 32 then
@@ -9068,6 +9252,9 @@ begin
         end;
       Exit;
     end;
+    { @ of an array of const would keep it past the call (P124) }
+    if IsConstArr(e^.Typ) then
+      Die('an array of const lives for the call: its address is not taken' + HerePos);
     { @m[k] is refused (1.0.140): the slot moves when the map grows. A
       var argument of m[k] holds the slot for the call alone. }
     if MapPlaceRoot(e) <> nil then
@@ -13682,10 +13869,35 @@ end;
 { The core units are part of the language: every program and unit sees
   pasroutines (mutex, waitgroup, ...) and links pasmap (map[K] of V)
   without a uses clause. The core units themselves are compiled bare. }
+const
+  { TVarRec's kinds (P124), Free Pascal's names and numbers; vtQuad is
+    paslang's, the ones paslang does not make are there for the code that
+    names them }
+  VtNames: array[0..19] of string = ('vtInteger', 'vtBoolean', 'vtChar', 'vtExtended',
+    'vtString', 'vtPointer', 'vtPChar', 'vtObject', 'vtClass', 'vtWideChar', 'vtPWideChar',
+    'vtAnsiString', 'vtCurrency', 'vtVariant', 'vtInterface', 'vtWideString', 'vtInt64',
+    'vtQWord', 'vtUnicodeString', 'vtQuad');
+  VtValues: array[0..19] of Int64 = (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+    16, 17, 18, 19);
+
+{ A field of a record the compiler lays out itself (P124: TVarRec). }
+procedure AddRecField(var Td: TTypeDef; const N: string; Off, Typ: LongInt);
+var
+  k: SizeInt;
+begin
+  k := Length(Td.Fields);
+  SetLength(Td.Fields, k + 1);
+  Td.Fields[k].Name := N;
+  Td.Fields[k].Off := Off;
+  Td.Fields[k].Typ := Typ;
+  Td.Fields[k].Vis := VisPublic;
+end;
+
 procedure TParser.LoadCore;
 var
-  t, tc: LongInt;
+  t, tc, vr: LongInt;
   n: SizeInt;
+  rd: TTypeDef;
 begin
   if IsCoreUnit(FUnitName) then
     Exit;
@@ -13703,6 +13915,35 @@ begin
     FTypeNames[n].Name := 'TClass';
     FTypeNames[n].Id := InternClassRef(t);
     AddCoreName('TClass');
+  end;
+  { TVarRec and its kinds (P124), what an array of const holds: the
+    kind, and the value in the record itself, a string's two words and a
+    Quad too, so nothing points at a copy }
+  if NamedType('TObject', t) and NamedType('TClass', tc) and not NamedType('TVarRec', vr) then
+  begin
+    rd := Default(TTypeDef);
+    rd.Kind := tykRecord;
+    rd.Name := 'TVarRec';
+    rd.Size := 32;
+    AddRecField(rd, 'VType', 0, TyInteger);
+    AddRecField(rd, 'VInteger', 8, TyInteger);
+    AddRecField(rd, 'VBoolean', 8, TyBoolean);
+    AddRecField(rd, 'VChar', 8, TyChar);
+    AddRecField(rd, 'VExtended', 8, TyReal);
+    AddRecField(rd, 'VPointer', 8, TyPointer);
+    AddRecField(rd, 'VPChar', 8, InternPtr(TyChar));
+    AddRecField(rd, 'VObject', 8, t);
+    AddRecField(rd, 'VClass', 8, tc);
+    AddRecField(rd, 'VAnsiString', 8, TyString);
+    AddRecField(rd, 'VInterface', 8, TyPointer);
+    AddRecField(rd, 'VQuad', 16, TyQuad);
+    vr := AddNamedType('TVarRec', rd);
+    AddCoreName('TVarRec');
+    for n := 0 to High(VtNames) do
+    begin
+      AddConstEnt(VtNames[n], VtValues[n], TyInteger, '');
+      AddCoreName(VtNames[n]);
+    end;
   end;
   { Quad's arithmetic (P103): linked into every program, 17 KB, so a unit
     that works in Quad inside needs nothing of the program. }
@@ -14598,7 +14839,7 @@ begin
           FTok := FLex.Next;
         end;
         Eat(tkColon);
-        t := Self.ParseType;
+        t := ParamType(byref);
         for i := 0 to nn - 1 do
         begin
           n := Length(pr.Params);
@@ -15335,6 +15576,10 @@ begin
         used := True;
     if not used then
       Continue;
+    if (i < Length(Pr.Params) + Ord(Pr.ClassTyp <> 0)) and (i >= Ord(Pr.ClassTyp <> 0)) and
+      IsConstArr(Pr.Params[i - Ord(Pr.ClassTyp <> 0)].Typ) then
+      Die(names[i] + ', an array of const, lives for the call: a closure in ' + Pr.Name +
+        ' may not keep it' + HerePos);
     if refs[i] then
       Die(names[i] + ' is a var parameter of ' + Pr.Name +
         ', which has a closure inside: a closure may outlive the variable it points at; copy it to a local' +
@@ -16258,6 +16503,7 @@ begin
     Die('pas takes a call: pas F(a, b), pas f, pas obj.M(a) or pas procedure begin ... end' + HerePos);
   name := FTok.Lexeme;
   e := ParsePrimary;
+  NoConstArr(e^.Args, 'pas');
   typs := nil;
   refs := nil;
   call := NewStmt(skCall);

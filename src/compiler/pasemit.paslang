@@ -622,6 +622,7 @@ type
     procedure EmitDumpLocals;
     procedure DbgCode(Typ: LongInt; out Code, Size: LongInt);
     function IsClassVar(const N: string): Boolean;
+    procedure EmitConstArr(E: PExpr);
     procedure EmitDebugTables(const Prog: TProgram);
     procedure ShiftArgs(N, NReg, Reg0: LongInt);
     procedure EmitLink(CalleeNest: LongInt);
@@ -1673,6 +1674,91 @@ end;
 function TEmitter.InternStrFat(const S: string): string;
 begin
   Result := '.Lsf' + Copy(InternStr(S), 4, 32);
+end;
+
+{ The list of an array of const (P124), in the frame; see EmitRealFn. }
+procedure TEmitter.EmitConstArr(E: PExpr);
+var
+  n, i, kd: LongInt;
+  off, base: LongInt;
+begin
+  n := LongInt(Length(E^.Args));
+  if n = 0 then
+  begin
+    if FArm then
+    begin
+      Line('  mov x0, xzr');
+      Line('  mov x2, xzr');
+      Line('  mov x3, xzr');
+    end
+    else
+    begin
+      Line('  xorl %eax, %eax');
+      Line('  xorl %edx, %edx');
+      Line('  xorl %r8d, %r8d');
+    end;
+    Exit;
+  end;
+  off := ScratchT(n * 32, LongInt(E^.Num));
+  for i := 0 to n - 1 do
+  begin
+    base := off + 32 * i;
+    if FArm then
+      StFP('xzr', base + 8)
+    else
+      Line('  movq $0, ' + IntToStr(base + 8) + '(%rbp)');
+  end;
+  for i := 0 to n - 1 do
+  begin
+    base := off + 32 * i;
+    kd := Ord(E^.Str[i + 1]);
+    EmitExpr(E^.Args[i]);
+    if FArm then
+    begin
+      if kd = VrAnsiString then
+      begin
+        StFP('x0', base + 8);
+        StFP('x2', base + 16);
+      end
+      else if kd = VrQuad then
+      begin
+        StFP('x0', base + 16);
+        StFP('x2', base + 24);
+      end
+      else
+        StFP('x0', base + 8);
+      Imm('x9', kd);
+      StFP('x9', base);
+    end
+    else
+    begin
+      if kd = VrAnsiString then
+      begin
+        Line('  movq %rax, ' + IntToStr(base + 8) + '(%rbp)');
+        Line('  movq %rdx, ' + IntToStr(base + 16) + '(%rbp)');
+      end
+      else if kd = VrQuad then
+      begin
+        Line('  movq %rax, ' + IntToStr(base + 16) + '(%rbp)');
+        Line('  movq %rdx, ' + IntToStr(base + 24) + '(%rbp)');
+      end
+      else
+        Line('  movq %rax, ' + IntToStr(base + 8) + '(%rbp)');
+      Line('  movq $' + IntToStr(kd) + ', ' + IntToStr(base) + '(%rbp)');
+    end;
+  end;
+  if FArm then
+  begin
+    AddFP('x0', off);
+    Imm('x2', n);
+    Imm('x3', n);
+  end
+  else
+  begin
+    Line('  leaq ' + IntToStr(off) + '(%rbp), %rax');
+    Line('  movq $' + IntToStr(n) + ', %rdx');
+    Line('  movq $' + IntToStr(n) + ', %r8');
+  end;
 end;
 
 { The routine has Self, the first argument: a method, but a static class
@@ -8736,6 +8822,17 @@ begin
   Result := False;
   if E = nil then
     Exit;
+  { [a, b, ...] where an array of const goes (P124): a TVarRec per value
+    in a scratch region of the frame, typed so the stack maps see its
+    pointers and a moved stack moves them; the value words cleared first,
+    so the collector reads no stale word while a value is worked out;
+    then each kind and value, and the slice of them. }
+  if E^.Name = 'rt_constarr' then
+  begin
+    Result := True;
+    EmitConstArr(E);
+    Exit;
+  end;
   { A class as a value (P123): the address of its method table, whose
     label the call's Str names. }
   if E^.Name = 'rt_classref' then

@@ -2390,6 +2390,102 @@ error (1.0.135; it ran on whatever the registers held). A call through one passe
 slice as every other call does (on amd64 it passed a string's first
 word alone until 1.0.133).
 
+### array of const
+
+A parameter of type `array of const` takes a list in brackets of values
+of any simple kind, as `Format` does (1.1.5):
+
+`examples/varargs.paslang`:
+
+```pascal
+{ array of const: a routine that takes a list of values of any simple
+  kind, each with its kind, and prints them as a log line. }
+program varargs;
+
+procedure Log(const Level: string; const Args: array of const);
+var
+  i: Int64;
+begin
+  Write('[', Level, ']');
+  for i := 0 to High(Args) do
+    case Args[i].VType of
+      vtInteger: Write(' ', Args[i].VInteger);
+      vtBoolean: Write(' ', Args[i].VBoolean);
+      vtChar: Write(' ', Args[i].VChar);
+      vtExtended: Write(' ', Args[i].VExtended:0:2);
+      vtAnsiString: Write(' ', Args[i].VAnsiString);
+      vtObject: Write(' <', Args[i].VObject.ClassName, '>');
+      vtClass: Write(' class ', Args[i].VClass.ClassName);
+      vtPointer: Write(' pointer');
+    else
+      Write(' kind ', Args[i].VType);
+    end;
+  WriteLn;
+end;
+
+procedure Warn(const Args: array of const);
+begin
+  Log('warn', Args);                  { passed on as it came }
+end;
+
+type
+  TJob = class
+  end;
+
+var
+  job: TJob;
+  n: Int64;
+
+begin
+  job := TJob.Create;
+  n := 42;
+  Log('info', ['started', n, 'jobs,', 0.75, 'load']);
+  Log('info', [job, TJob, 'x', True, nil]);
+  Warn(['disk at', 91, '%']);
+  Log('empty', []);
+end.
+```
+
+prints
+
+```
+[info] started 42 jobs, 0.75 load
+[info] <TJob> class TJob x 1 pointer
+[warn] disk at 91 %
+[empty]
+```
+
+The routine sees an array of `TVarRec`, indexed from 0: `VType` says the
+kind of each value and the field of that kind holds it.
+
+| Kind | Values | Field |
+|---|---|---|
+| `vtInteger` | every integer, of any width, an enumeration | `VInteger: Int64` |
+| `vtBoolean` | a Boolean | `VBoolean` |
+| `vtChar` | a `Char`, a one-character literal | `VChar` |
+| `vtExtended` | a `Double`, a `Single` (widened) | `VExtended: Double` |
+| `vtQuad` | a `Quad` | `VQuad` |
+| `vtAnsiString` | a string | `VAnsiString: string` |
+| `vtPChar` | a `PChar` | `VPChar` |
+| `vtPointer` | a pointer, `nil`, a routine value (its code) | `VPointer` |
+| `vtObject` | an object | `VObject: TObject` |
+| `vtClass` | a class, a class reference | `VClass: TClass` |
+| `vtInterface` | an interface (its object) | `VInterface: Pointer` |
+
+`TVarRec`, the kinds and their Free Pascal numbers are words of the
+language; the kinds paslang does not make (`vtInt64`, `vtWideString`,
+…) are there with their numbers for code that names them. The value is
+in the record itself, a string's two words and a `Quad` too, where Free
+Pascal keeps a pointer to a copy.
+
+The list is built in the caller's frame, not on the heap, and lives for
+the call: the routine reads it, indexes it, measures it (`Length`,
+`High`), walks it (`for x in`) and passes it on to another `array of
+const`, and nothing else. Keeping it (`x := Args`), taking its address,
+a closure that holds it, `pas` with one, and a `var` one are compile
+errors. A slice of `TVarRec` of the program's goes where an `array of
+const` goes too. `array of const` is only a parameter's type.
+
 ### Closures
 
 An anonymous routine is a value, in Delphi's syntax (1.0.134):
@@ -9778,6 +9874,10 @@ the commands on standard input, under `--debug-mode` and under
   there is no packed layout.
 - `private`, `strict private`, `protected` and `strict protected` are
   held to (1.0.137); `Free` calls `Destroy` when there is one (§7).
+- An integer of any width goes into an `array of const` as a
+  `vtInteger` of 64 bits (Free Pascal makes an `Int64` a `vtInt64` and a
+  `QWord` a `vtQWord`), and a string or a real lies in the `TVarRec`
+  itself.
 - `TClass` is the compiler's own name for `class of TObject`, a word
   of the language as `TObject` is. A program's class destructors run
   after its last statement, where Free Pascal runs them after the
@@ -9907,8 +10007,9 @@ its place:
   … `PasOnceDone` routines, pasfmt's `PasFmtReal` … `PasFmtQuad`,
   pashash's `PasHex PasMd5 PasSha1Cpu` … `PasMerkleCheckBase` and
   pastree's `PasTreeNew` … `PasStoreAbandon`, and pasobject's `TObject`
-  with `PasClassName` … `PasUncaught`, and `TClass`, `class of
-  TObject`, the compiler's. A core unit declares its
+  with `PasClassName` … `PasUncaught`, and the compiler's `TClass`
+  (`class of TObject`), `TVarRec` and its kinds `vtInteger` …
+  `vtQuad`. A core unit declares its
   own exports; nothing else may, and a unit's implementation types are
   its own (an importer cannot name them, and they are not reserved).
 
