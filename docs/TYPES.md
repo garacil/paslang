@@ -377,6 +377,14 @@ breaks C-shaped layout.
   an instance, and the length and the address of the class's name,
   which lies as a string literal does. Inside a method `Self` is that
   pointer. A plain `record` has no VMT.
+- `class of T` (1.1.4) is one word: the address of a class's method
+  table, T's or a descendant's; `TClass` is `class of TObject`. The
+  table's word at -48 is an instance's GC descriptor, so an object made
+  through a reference is laid out and scanned as its class's. A class
+  method's `Self` is such a word; a virtual one is read from slot n of
+  it (the call's slot `ClsSlotBase - n`), an object's virtual method
+  from slot n of the table the object's first word points at. A class
+  variable is a global named `Class.Name`.
 - An exception object is any object: `raise X` puts it in the raising
   routine's record, at G+272, and where it was raised at G+280 (1.1.3);
   a handler's `on E: T` is `is`, a walk up the parents' method tables.

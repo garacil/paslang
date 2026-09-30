@@ -81,6 +81,13 @@ type
     FAnonN: LongInt;
     FCellN: LongInt;
     FExcDepth: LongInt;    { except parts being read around the statement (P122): raise; raises their object again }
+    FClassCtors: TStrArray; { the class constructors and destructors declared here (P123), run when the unit starts and ends }
+    FClassDtors: TStrArray;
+    FNextClassMeth: Boolean; { class was read before the routine head that follows (P123) }
+    FSelfClassRef: Boolean;  { the body read is a class method's: Self is the class, no object (P123) }
+    FNoSelf: Boolean;        { the body read is a static class method's: no Self at all (P123) }
+    FCPropSets: array of PExpr;   { class properties read (P123): the node, and its static setter, for an assignment }
+    FCPropSetSyms: TStrArray;
     FSymChain: TStrArray;  { the routines being parsed, outermost first }
     FBoxing: TStrArray;    { the routines that hold a closure inside }
     FSafeNames: TStrArray;  { routines a header declared safe, for their bodies }
@@ -240,6 +247,14 @@ type
     procedure CheckLeaves(E: PExpr; const What: string);
     function CoreMethod(Base: PExpr; const MName: string): PExpr;
     function ParseCtorCall(Id: LongInt): PExpr;
+    function MakeCtor(Id: LongInt; const CName: string; var CArgs: TExprArray;
+      CLine, CCol: LongInt): PExpr;
+    function ClassDot(Id: LongInt): PExpr;
+    function ClassWordVmt(Vmt: PExpr; const Name: string; const Args: TExprArray): PExpr;
+    function ClassPropRead(Cls: LongInt; I: SizeInt; ALine, ACol: LongInt): PExpr;
+    function CPropSetter(E: PExpr): string;
+    function LifeCalls(const Syms: TStrArray; Reverse: Boolean): PStmt;
+    function SelfVmt: PExpr;
     function CoreLockStmt(E: PExpr; Shared: Boolean; Body: PStmt): PStmt;
     function CoreOnceStmt(E: PExpr; Body: PStmt): PStmt;
     function FindPi(const AName: string): string;
@@ -370,6 +385,15 @@ type
     function HoistLimit(F: PStmt; T: LongInt): PStmt;
     function TypeBound(Id: LongInt; Hi: Boolean): PExpr;
     function InternPtr(Elem: LongInt): LongInt;
+    function InternClassRef(Cls: LongInt): LongInt;
+    function ClassValue(Cls: LongInt): PExpr;
+    function ClassMember(Cls: LongInt; VmtE: PExpr; const AName: string;
+      ALine, ACol: LongInt; out Res: PExpr): Boolean;
+    function ClassMethCall(Cls: LongInt; VmtE: PExpr; Mi: SizeInt; var Args: TExprArray): PExpr;
+    function CtorThrough(Cls: LongInt; VmtE: PExpr; const AName: string; ALine, ACol: LongInt): PExpr;
+    function CVarIndex(Cls: LongInt; const AName: string): SizeInt;
+    function Retyped(E: PExpr; T: LongInt): PExpr;
+    function ClassPropNamed(Cls: LongInt; const AName: string): Boolean;
     function PendingSlot(Id: LongInt): Boolean;
     function ForwardPtr(const AName, At: string): LongInt;
     procedure ResolvePending(const AName: string; Id: LongInt);
@@ -383,6 +407,7 @@ type
     function InternProc(IsFn: Boolean; Ret: LongInt;
       const Typs: array of LongInt; const Refs: array of Boolean): LongInt;
     function ParseClassType(const AName: string): LongInt;
+    function ClassOfTarget: LongInt;
     function ParseIfaceType(const AName: string): LongInt;
     function InternChan(Elem: LongInt): LongInt;
     function InternMap(Key, Val: LongInt): LongInt;
@@ -873,6 +898,8 @@ begin
     Result := 'an interface'
   else if k = tykClass then
     Result := 'an object'
+  else if k = tykClassRef then
+    Result := 'class of ' + TypName(TypeOf(T).Elem)
   else
     Result := 'this value';
 end;
@@ -2367,6 +2394,34 @@ begin
   Result := LongInt(n);
 end;
 
+{ class of Cls (P123): one type for each class, as a pointer type is. }
+function TParser.InternClassRef(Cls: LongInt): LongInt;
+var
+  i, n: SizeInt;
+begin
+  for i := 0 to High(FTypes) do
+    if (FTypes[i].Kind = tykClassRef) and (FTypes[i].Elem = Cls) then
+    begin
+      Result := LongInt(i);
+      Exit;
+    end;
+  n := Length(FTypes);
+  SetLength(FTypes, n + 1);
+  FTypes[n] := Default(TTypeDef);
+  FTypes[n].Kind := tykClassRef;
+  FTypes[n].Size := 8;
+  FTypes[n].Elem := Cls;
+  Result := LongInt(n);
+end;
+
+{ The class Cls as a value (P123): the address of its method table, of
+  type class of Cls. }
+function TParser.ClassValue(Cls: LongInt): PExpr;
+begin
+  Result := NewCall('rt_classref', nil, InternClassRef(Cls));
+  Result^.Str := 'vmt_' + ToLower(TypeOf(Cls).Name);
+end;
+
 { A pointer to a type not declared yet (PNode = ^TNode before TNode) gets
   a type of its own, shared only by the uses of that same name, until
   AddNamedType patches its Elem. It was the interned ^Integer until
@@ -2988,6 +3043,21 @@ begin
       Die(TypName(E^.Typ) + ' does not go into ' + TypName(Want) + '; x as T sees its bytes' +
         HerePos);
   end;
+  { A class reference goes where a reference to its class or to an
+    ancestor goes, and only there (P123): TClass takes any. }
+  if (TypeOf(Want).Kind = tykClassRef) and (E^.Kind <> ekNil) then
+  begin
+    if TypeOf(E^.Typ).Kind <> tykClassRef then
+      Die(TypName(E^.Typ) + ' does not go into ' + TypName(Want) + HerePos);
+    if not ClassUnder(TypeOf(E^.Typ).Elem, TypeOf(Want).Elem) then
+      Die(TypName(E^.Typ) + ' does not go into ' + TypName(Want) + ': ' +
+        TypeOf(TypeOf(E^.Typ).Elem).Name + ' does not descend from ' +
+        TypeOf(TypeOf(Want).Elem).Name + HerePos);
+  end;
+  if (TypeOf(E^.Typ).Kind = tykClassRef) and (Want <> TyNone) and
+    (TypeOf(Want).Kind <> tykClassRef) and (TypeOf(Want).Kind <> tykParam) and
+    (TypeOf(Want).Kind <> tykGeneric) then
+    Die(TypName(E^.Typ) + ' does not go into ' + TypName(Want) + HerePos);
   { A set goes only where a set goes (1.0.136): i := [1, 2] stored its
     bitmask, 6, and P([3]) passed 8. }
   if (TypeOf(E^.Typ).Kind = tykSet) and (Want <> TyNone) and
@@ -3602,6 +3672,13 @@ begin
     end;
 end;
 
+{ A method a call may name: all but a class constructor or destructor
+  (P123), which only the program's start and end run. }
+function CallableMeth(const M: TMethInfo): Boolean;
+begin
+  Result := not (M.IsClassMeth and (M.IsCtor or M.IsDtor));
+end;
+
 function TParser.PickMeth(const Meths: TMethArray; const AName: string;
   var Args: TExprArray; HaveArgs: Boolean; out Idx: SizeInt): Boolean;
 var
@@ -3614,7 +3691,7 @@ begin
   nseen := 0;
   only := -1;
   for i := 0 to High(Meths) do
-    if SameId(Meths[i].Name, AName) then
+    if SameId(Meths[i].Name, AName) and CallableMeth(Meths[i]) then
     begin
       Inc(nseen);
       only := i;
@@ -3631,7 +3708,7 @@ begin
   nmatch := 0;
   best := -1;
   for i := 0 to High(Meths) do
-    if SameId(Meths[i].Name, AName) then
+    if SameId(Meths[i].Name, AName) and CallableMeth(Meths[i]) then
     begin
       ok := False;
       cost := 0;
@@ -3850,6 +3927,9 @@ begin
     else if Kind = 1 then
       up := (Idx <= High(FTypes[par].Meths)) and
         (FTypes[par].Meths[Idx].Sym = FTypes[Result].Meths[Idx].Sym)
+    else if Kind = 3 then
+      up := (Idx <= High(FTypes[par].CVars)) and
+        (FTypes[par].CVars[Idx].Sym = FTypes[Result].CVars[Idx].Sym)
     else
       up := (Idx <= High(FTypes[par].Props)) and
         SameId(FTypes[par].Props[Idx].Name, FTypes[Result].Props[Idx].Name);
@@ -3905,6 +3985,11 @@ begin
   begin
     v := FTypes[Cls].Meths[Idx].Vis;
     nm := FTypes[Cls].Meths[Idx].Name;
+  end
+  else if Kind = 3 then
+  begin
+    v := FTypes[Cls].CVars[Idx].Vis;
+    nm := FTypes[Cls].CVars[Idx].Name;
   end
   else
   begin
@@ -4915,6 +5000,14 @@ begin
     Result := LongInt(pn);
     Exit;
   end;
+  if k = tkClass then
+  begin
+    { class of T where a type goes (P123) }
+    FTok := FLex.Next;
+    Eat(tkOf);
+    Result := ClassOfTarget;
+    Exit;
+  end;
   if (k = tkInteger) or ((k = tkIdent) and SameId(FTok.Lexeme, 'Integer')) then
   begin
     FTok := FLex.Next;
@@ -5266,21 +5359,62 @@ begin
   FTypes[Result] := td;
 end;
 
+{ The symbol's end of a class constructor or destructor (P123), which
+  keeps it apart from an object's Create and Destroy. }
+function ClassLifeTag(IsCtor: Boolean): string;
+begin
+  if IsCtor then
+    Result := '_cc'
+  else
+    Result := '_cd';
+end;
+
+function LifeWord(IsCtor: Boolean): string;
+begin
+  if IsCtor then
+    Result := 'constructor'
+  else
+    Result := 'destructor';
+end;
+
+function ClassMethWord(IsClass: Boolean): string;
+begin
+  if IsClass then
+    Result := ' class method'
+  else
+    Result := 'n object''s method';
+end;
+
+{ The class after class of (P123), its reference type the result. }
+function TParser.ClassOfTarget: LongInt;
+var
+  t: LongInt;
+begin
+  if not IsName then
+    Die('class of takes a class' + HerePos);
+  if (not NamedType(FTok.Lexeme, t)) or (TypeOf(t).Kind <> tykClass) then
+    Die('class of takes a class, not ' + FTok.Lexeme + HerePos);
+  FTok := FLex.Next;
+  Result := InternClassRef(t);
+end;
+
+{ A class, read after its word class (the caller took it, to tell it
+  from class of). }
 function TParser.ParseClassType(const AName: string): LongInt;
 var
   td: TTypeDef;
   names: array of string;
   nn, i, n: SizeInt;
   off, sz, t, slot, nindex, keepSlot: LongInt;
-  mname, rname, wname, baseSym: string;
+  mname, rname, wname, baseSym, gname, mpos: string;
   isVirt, isAbs, isFunc, isCtor, isDtor, byref, pub, eq, msafe: Boolean;
+  isClassM, isStat, cvarMode, isStatField: Boolean;
   npar: LongInt;
   pt: LongInt;
   parent, ov: LongInt;
   par: TTypeDef;
   vis: Byte;
 begin
-  Eat(tkClass);
   td := Default(TTypeDef);
   td.Kind := tykClass;
   td.Name := AName;
@@ -5322,6 +5456,11 @@ begin
         SetLength(td.Props, n);
         for i := 0 to n - 1 do
           td.Props[i] := par.Props[i];
+        { a parent's class variables are the descendant's too (P123) }
+        n := Length(par.CVars);
+        SetLength(td.CVars, n);
+        for i := 0 to n - 1 do
+          td.CVars[i] := par.CVars[i];
         n := Length(par.Ifaces);
         SetLength(td.Ifaces, n);
         for i := 0 to n - 1 do
@@ -5365,6 +5504,10 @@ begin
     SetLength(td.Props, n);
     for i := 0 to n - 1 do
       td.Props[i] := par.Props[i];
+    n := Length(par.CVars);
+    SetLength(td.CVars, n);
+    for i := 0 to n - 1 do
+      td.CVars[i] := par.CVars[i];
     for i := 0 to High(par.Ifaces) do
     begin
       n := Length(td.Ifaces);
@@ -5375,6 +5518,7 @@ begin
     slot := par.VmtN;
     td.Parent := parent;
   end;
+  cvarMode := False;
   while FTok.Kind <> tkEnd do
   begin
     { The sections set what code may use the members that follow
@@ -5404,8 +5548,37 @@ begin
       FTok := FLex.Next;
       if FTok.Kind = tkSemi then
         FTok := FLex.Next;
+      cvarMode := False;
       Continue;
     end;
+    { var starts fields again, class var class variables (P123): what
+      follows until the next section, method or property }
+    if FTok.Kind = tkVar then
+    begin
+      FTok := FLex.Next;
+      cvarMode := False;
+      Continue;
+    end;
+    { class before a method, a property or var (P123) }
+    isClassM := False;
+    if FTok.Kind = tkClass then
+    begin
+      FTok := FLex.Next;
+      if FTok.Kind = tkVar then
+      begin
+        FTok := FLex.Next;
+        cvarMode := True;
+        Continue;
+      end;
+      if (FTok.Kind <> tkProperty) and (FTok.Kind <> tkProcedure) and
+        (FTok.Kind <> tkFunction) and (FTok.Kind <> tkConstructor) and
+        (FTok.Kind <> tkDestructor) then
+        Die('class goes before a method, a property or var' + HerePos);
+      isClassM := True;
+    end;
+    if (FTok.Kind = tkProperty) or (FTok.Kind = tkProcedure) or (FTok.Kind = tkFunction) or
+      (FTok.Kind = tkConstructor) or (FTok.Kind = tkDestructor) or (FTok.Kind = tkSafe) then
+      cvarMode := False;
     if FTok.Kind = tkProperty then
     begin
       FTok := FLex.Next;
@@ -5478,8 +5651,11 @@ begin
         if SameId(td.Fields[i].Name, wname) then
           td.Props[n].WriteOff := td.Fields[i].Off;
       end;
-      td.Props[n].IsPublished := pub;
+      td.Props[n].IsPublished := pub and not isClassM;
       td.Props[n].Vis := vis;
+      td.Props[n].IsClass := isClassM;
+      if isClassM and (nindex > 0) then
+        Die('a class property has no index' + HerePos);
       Continue;
     end;
     msafe := False;
@@ -5497,10 +5673,13 @@ begin
       isCtor := FTok.Kind = tkConstructor;
       isDtor := FTok.Kind = tkDestructor;
       isFunc := FTok.Kind = tkFunction;
+      if msafe and isClassM then
+        Die('safe goes before class' + HerePos);
       FTok := FLex.Next;
       if FTok.Kind <> tkIdent then
         Die('method name');
       mname := FTok.Lexeme;
+      mpos := HerePos;
       CheckName(mname);
       { A method declared safe: its body is read as safe code (P102). }
       if msafe then
@@ -5571,6 +5750,7 @@ begin
       Eat(tkSemi);
       isVirt := False;
       isAbs := False;
+      isStat := False;
       while True do
       begin
         if (FTok.Kind = tkVirtual) or
@@ -5584,15 +5764,58 @@ begin
           isVirt := True;
           isAbs := True;
         end
+        else if (FTok.Kind = tkIdent) and SameId(FTok.Lexeme, 'static') then
+        begin
+          { a static class method (P123): no Self, a routine in the
+            class's name space }
+          if not isClassM then
+            Die('static goes after a class method' + HerePos);
+          isStat := True;
+        end
         else
           Break;
         FTok := FLex.Next;
         if FTok.Kind = tkSemi then
           FTok := FLex.Next;
       end;
+      if isStat and isVirt then
+        Die('a static class method is not virtual' + mpos);
+      { a class constructor or destructor (P123): no parameters, run when
+        the program or unit starts and ends, by no one else; a symbol of
+        its own, so an object's Create is another method }
+      if isClassM and (isCtor or isDtor) then
+      begin
+        if npar > 0 then
+          Die('a class ' + LifeWord(isCtor) + ' takes no parameters' + mpos);
+        if isVirt then
+          Die('a class constructor or destructor is not virtual' + mpos);
+        for i := 0 to n - 1 do
+          if td.Meths[i].IsClassMeth and (td.Meths[i].IsCtor = isCtor) and
+            (td.Meths[i].IsDtor = isDtor) and OwnMeth(td.Meths[i].Sym,
+            ProcSym('', AName + '_' + td.Meths[i].Name) + ClassLifeTag(isCtor)) then
+            Die('a class has one class ' + LifeWord(isCtor) + mpos);
+        td.Meths[n].Name := mname;
+        td.Meths[n].Sym := ProcSym('', AName + '_' + mname) + ClassLifeTag(isCtor);
+        td.Meths[n].IsCtor := isCtor;
+        td.Meths[n].IsDtor := isDtor;
+        td.Meths[n].IsClassMeth := True;
+        td.Meths[n].IsStatic := True;
+        td.Meths[n].IsFunc := False;
+        td.Meths[n].NParams := 0;
+        td.Meths[n].RetTyp := TyNone;
+        td.Meths[n].Vis := vis;
+        td.Meths[n].Slot := -1;
+        AddProcEnt(td.Meths[n].Sym, td.Meths[n].Sym, False, 0, TyNone);
+        if isCtor then
+          AppendStr(FClassCtors, td.Meths[n].Sym)
+        else
+          AppendStr(FClassDtors, td.Meths[n].Sym);
+        Continue;
+      end;
       baseSym := ProcSym('', AName + '_' + mname);
       for i := 0 to n - 1 do
-        if SameId(td.Meths[i].Name, mname) and (td.Meths[i].NParams = npar) then
+        if SameId(td.Meths[i].Name, mname) and (td.Meths[i].NParams = npar) and
+          not (td.Meths[i].IsClassMeth and (td.Meths[i].IsCtor or td.Meths[i].IsDtor)) then
         begin
           eq := True;
           for nn := 0 to npar - 1 do
@@ -5604,6 +5827,11 @@ begin
         end;
       if (ov >= 0) and OwnMeth(td.Meths[ov].Sym, baseSym) then
         Die('duplicate identifier ' + mname);
+      if (ov >= 0) and (td.Meths[ov].IsClassMeth <> isClassM) then
+        Die(mname + ' is declared again as a' + ClassMethWord(isClassM) + ', the parent''s is a' +
+          ClassMethWord(td.Meths[ov].IsClassMeth) + mpos);
+      if (ov >= 0) and td.Meths[ov].IsStatic and isVirt then
+        Die(mname + ' is static in the parent: it has no slot to override' + mpos);
       if ov >= 0 then
       begin
         keepSlot := td.Meths[ov].Slot;
@@ -5633,6 +5861,8 @@ begin
       td.Meths[n].NParams := npar;
       td.Meths[n].RetTyp := t;
       td.Meths[n].Vis := vis;
+      td.Meths[n].IsClassMeth := isClassM;
+      td.Meths[n].IsStatic := isStat;
       if isVirt then
       begin
         td.Meths[n].IsVirt := True;
@@ -5665,10 +5895,38 @@ begin
     Eat(tkColon);
     t := Self.ParseType;
     Eat(tkSemi);
+    { x: T; static; is a class variable as class var declares one (P123) }
+    isStatField := False;
+    if (FTok.Kind = tkIdent) and SameId(FTok.Lexeme, 'static') then
+    begin
+      FTok := FLex.Next;
+      Eat(tkSemi);
+      isStatField := True;
+    end;
     sz := ValSize(t);
     for i := 0 to nn - 1 do
     begin
       FieldDup(td, names[i]);
+      if cvarMode or isStatField then
+      begin
+        { a global of the class's, Class.Name, exported with the class
+          when the class is in an interface }
+        gname := AName + '.' + names[i];
+        AddVar(gname, t, False);
+        if FUnitName <> '' then
+        begin
+          FVars[High(FVars)].Sym := FUnitName + '.' + gname;
+          FVars[High(FVars)].Pub := not FInImpl;
+        end;
+        n := Length(td.CVars);
+        SetLength(td.CVars, n + 1);
+        td.CVars[n].Name := names[i];
+        td.CVars[n].Typ := t;
+        td.CVars[n].Vis := vis;
+        td.CVars[n].Off := -1;
+        td.CVars[n].Sym := VarSym(gname);
+        Continue;
+      end;
       n := Length(td.Fields);
       SetLength(td.Fields, n + 1);
       td.Fields[n].Name := names[i];
@@ -5934,8 +6192,23 @@ begin
       ParseEnumType(name)
     else if FTok.Kind = tkClass then
     begin
-      ParseClassType(name);
-      Eat(tkSemi);
+      { class of T, a class reference type (P123), or a class }
+      FTok := FLex.Next;
+      if FTok.Kind = tkOf then
+      begin
+        FTok := FLex.Next;
+        id := ClassOfTarget;
+        Eat(tkSemi);
+        n := Length(FTypeNames);
+        SetLength(FTypeNames, n + 1);
+        FTypeNames[n].Name := name;
+        FTypeNames[n].Id := id;
+      end
+      else
+      begin
+        ParseClassType(name);
+        Eat(tkSemi);
+      end;
     end
     else if FTok.Kind = tkInterface then
     begin
@@ -6211,24 +6484,40 @@ end;
 function TParser.SelfMember(const AName: string; ALine, ACol: LongInt): PExpr;
 var
   i, mi: SizeInt;
-  have: Boolean;
+  have, noObj: Boolean;
   args: TExprArray;
 begin
   Result := nil;
   if FClassTyp = 0 then
     Exit;
+  { a class method has the class and no object (P123) }
+  noObj := FSelfClassRef or FNoSelf;
   for i := 0 to High(FTypes[FClassTyp].Fields) do
     if SameId(FTypes[FClassTyp].Fields[i].Name, AName) then
     begin
+      if noObj then
+        Die(AName + ' is a field of an object, and a class method has none at ' +
+          IntToStr(ALine) + ':' + IntToStr(ACol));
       CheckVis(FClassTyp, 0, i, ALine, ACol);
       Result := NewField(NewVar('self', FClassTyp), FTypes[FClassTyp].Fields[i].Name,
         FTypes[FClassTyp].Fields[i].Typ, FTypes[FClassTyp].Fields[i].Off);
       Exit;
     end;
+  { a class variable or a class property of the class, in any method
+    (P123) }
+  if (not IsLocalName(AName)) and ((CVarIndex(FClassTyp, AName) >= 0) or
+    ClassPropNamed(FClassTyp, AName)) then
+  begin
+    ClassMember(FClassTyp, SelfVmt, AName, ALine, ACol, Result);
+    Exit;
+  end;
   if not IsLocalName(AName) then
     for i := 0 to High(FTypes[FClassTyp].Props) do
       if SameId(FTypes[FClassTyp].Props[i].Name, AName) then
       begin
+        if noObj then
+          Die(AName + ' is a property of an object, and a class method has none at ' +
+            IntToStr(ALine) + ':' + IntToStr(ACol));
         Result := PropAccess(NewVar('self', FClassTyp), i, ALine, ACol);
         Exit;
       end;
@@ -6238,29 +6527,53 @@ begin
       have := True;
   if not have then
   begin
-    { ClassName and its kin alone in a method are Self's (P121) }
+    { ClassName and its kin alone in a method are Self's (P121), the
+      class's in a class method (P123) }
     if IsClassWord(AName) then
     begin
       args := nil;
       if FTok.Kind = tkLParen then
         args := ParseArgList;
-      Result := ClassWord(NewVar('self', FClassTyp), AName, args);
+      Result := ClassWordVmt(SelfVmt, AName, args);
       Exit;
     end;
     { Free alone in a method is Self.Free (1.0.137) }
-    if SameId(AName, 'Free') and (FTok.Kind <> tkLParen) then
+    if SameId(AName, 'Free') and (FTok.Kind <> tkLParen) and not noObj then
     begin
       Result := NewMethod(NewVar('self', FClassTyp), '', nil, TyNone, -1);
       Result^.Flags := 16;
     end;
     Exit;
   end;
+  { a constructor alone in a class method makes an object of Self's
+    class, the class it was called for (P123) }
+  if noObj then
+    for i := 0 to High(FTypes[FClassTyp].Meths) do
+      if SameId(FTypes[FClassTyp].Meths[i].Name, AName) and
+        FTypes[FClassTyp].Meths[i].IsCtor and CallableMeth(FTypes[FClassTyp].Meths[i]) then
+      begin
+        Result := CtorThrough(FClassTyp, SelfVmt, AName, ALine, ACol);
+        Exit;
+      end;
   args := nil;
   have := FTok.Kind = tkLParen;
   if have then
     args := ParseArgList;
-  if PickMeth(FTypes[FClassTyp].Meths, AName, args, have, mi) then
+  if PickMeth(FTypes[FClassTyp].Meths, AName, args, have, mi) and
+    FTypes[FClassTyp].Meths[mi].IsClassMeth then
   begin
+    { a class method: Self's class, the class in a class method (P123) }
+    CheckVis(FClassTyp, 1, mi, ALine, ACol);
+    if Length(args) <> FTypes[FClassTyp].Meths[mi].NParams then
+      Die('wrong number of arguments for ' + AName + HerePos);
+    Result := ClassMethCall(FClassTyp, SelfVmt, mi, args);
+  end
+  else if (mi >= 0) and (mi <= High(FTypes[FClassTyp].Meths)) and
+    SameId(FTypes[FClassTyp].Meths[mi].Name, AName) then
+  begin
+    if noObj then
+      Die(AName + ' is an object''s method, and a class method has no object at ' +
+        IntToStr(ALine) + ':' + IntToStr(ACol));
     CheckVis(FClassTyp, 1, mi, ALine, ACol);
     for i := 0 to High(args) do
       if (i <= High(FTypes[FClassTyp].Meths[mi].ByRef)) and FTypes[FClassTyp].Meths[mi].ByRef[i] then
@@ -6328,7 +6641,17 @@ begin
             args := ParseArgList;
             have := True;
           end;
-          if PickMeth(st.Meths, name, args, have, mi) then
+          if PickMeth(st.Meths, name, args, have, mi) and st.Meths[mi].IsClassMeth then
+          begin
+            { a class method on an object: Self is the object's class
+              (P123) }
+            CheckVis(cls, 1, mi, nline, ncol);
+            if Length(args) <> st.Meths[mi].NParams then
+              Die('wrong number of arguments for ' + st.Name + '.' + name + HerePos);
+            E := ClassMethCall(cls, VmtOf(E), mi, args);
+            found := True;
+          end
+          else if (mi >= 0) and (mi <= High(st.Meths)) and SameId(st.Meths[mi].Name, name) then
           begin
             CheckVis(cls, 1, mi, nline, ncol);
             if have then
@@ -6349,6 +6672,9 @@ begin
             found := True;
           end;
         end;
+        { an object's class variable or class property (P123) }
+        if (not found) and ((CVarIndex(cls, name) >= 0) or ClassPropNamed(cls, name)) then
+          found := ClassMember(cls, VmtOf(E), name, nline, ncol, E);
         if not found then
         begin
           if IsClassWord(name) then
@@ -6369,6 +6695,13 @@ begin
           else
             Die('unknown member ' + name);
         end;
+      end
+      else if st.Kind = tykClassRef then
+      begin
+        { a member of the class a reference holds (P123) }
+        if not ClassMember(st.Elem, E, name, nline, ncol, E) then
+          Die('unknown class member ' + TypeOf(st.Elem).Name + '.' + name + ' at ' +
+            IntToStr(nline) + ':' + IntToStr(ncol));
       end
       else if st.Kind = tykInterface then
       begin
@@ -6529,7 +6862,7 @@ var
   id, ftyp, foff: LongInt;
   e, e2: PExpr;
   etyp: LongInt;
-  have: Boolean;
+  have, ctorHere: Boolean;
   k: TTypeKind;
 begin
   Result := nil;
@@ -8420,19 +8753,42 @@ begin
               st := TypeOf(FClassTyp);
               have := False;
               for i := 0 to High(st.Meths) do
-                if SameId(st.Meths[i].Name, name) then
+                if SameId(st.Meths[i].Name, name) and CallableMeth(st.Meths[i]) then
                   have := True;
-              if have then
+              { a constructor called in a class method makes an object of
+                Self's class (P123) }
+              ctorHere := False;
+              if have and (FSelfClassRef or FNoSelf) then
+                for i := 0 to High(st.Meths) do
+                  if SameId(st.Meths[i].Name, name) and st.Meths[i].IsCtor and
+                    CallableMeth(st.Meths[i]) then
+                    ctorHere := True;
+              if ctorHere then
+                Result := CtorThrough(FClassTyp, SelfVmt, name, nline, ncol)
+              else if have then
               begin
                 args := ParseArgList;
                 if PickMeth(st.Meths, name, args, True, mi) then
                 begin
                   CheckVis(FClassTyp, 1, mi, nline, ncol);
-                  for id := 0 to High(args) do
-                    if (id <= High(st.Meths[mi].ByRef)) and st.Meths[mi].ByRef[id] then
-                      args[id] := NewAddr(args[id]);
-                  Result := NewMethod(NewVar('self', FClassTyp), st.Meths[mi].Sym,
-                    args, st.Meths[mi].RetTyp, st.Meths[mi].Slot);
+                  if st.Meths[mi].IsClassMeth then
+                  begin
+                    { a class method: Self's class (P123) }
+                    if Length(args) <> st.Meths[mi].NParams then
+                      Die('wrong number of arguments for ' + name + HerePos);
+                    Result := ClassMethCall(FClassTyp, SelfVmt, mi, args);
+                  end
+                  else
+                  begin
+                    if FSelfClassRef or FNoSelf then
+                      Die(name + ' is an object''s method, and a class method has no object at ' +
+                        IntToStr(nline) + ':' + IntToStr(ncol));
+                    for id := 0 to High(args) do
+                      if (id <= High(st.Meths[mi].ByRef)) and st.Meths[mi].ByRef[id] then
+                        args[id] := NewAddr(args[id]);
+                    Result := NewMethod(NewVar('self', FClassTyp), st.Meths[mi].Sym,
+                      args, st.Meths[mi].RetTyp, st.Meths[mi].Slot);
+                  end;
                 end;
               end;
             end;
@@ -8529,7 +8885,7 @@ begin
               Result := NewCall(pe.Sym, args, pe.RetTyp);
             end
             else if NamedType(name, id) and (TypeOf(id).Kind = tykClass) then
-              Result := ParseCtorCall(id)
+              Result := ClassDot(id)
             else if SameId(name, 'Pi') then
               Result := NewPi
             else
@@ -8546,7 +8902,7 @@ begin
           Result := NewCall(pe.Sym, args, pe.RetTyp);
         end
         else if NamedType(name, id) and (TypeOf(id).Kind = tykClass) then
-          Result := ParseCtorCall(id)
+          Result := ClassDot(id)
         else if SameId(name, 'Pi') then
           Result := NewPi
         else
@@ -10709,7 +11065,11 @@ begin
   for i := 0 to High(Td.Fields) do
     if SameId(Td.Fields[i].Name, N) then
       Die(N + ' is a field already' + HerePos);
+  for i := 0 to High(Td.CVars) do
+    if SameId(Td.CVars[i].Name, N) then
+      Die(N + ' is a class variable already' + HerePos);
 end;
+
 
 { Carry and the rotation and shift family (P108, 1.0.129). Carry is a
   bit of the running routine's own (G+256), as a processor has one per
@@ -12495,6 +12855,14 @@ begin
               e := MapPutPlace(e);
             if (e^.Kind = ekCall) and (e^.Name = 'rt_carry') then
               st := CarryAssign(ParseExpr)
+            else if (e^.Kind = ekCall) and (e^.Name = 'rt_cpropset') then
+            begin
+              { a class property's static setter, with the value (P123) }
+              st := NewStmt(skCall);
+              st^.Name := CPropSetter(e);
+              SetLength(st^.Args, 1);
+              st^.Args[0] := ValArg(e^.Typ, ParseExpr);
+            end
             else if IsValueView(e) then
               st := ViewStore(e, ParseExpr)
             else
@@ -13011,6 +13379,9 @@ begin
     for j := 0 to High(FTypes[nw].Props) do
       if (FTypes[nw].Props[j].Typ >= 0) and (FTypes[nw].Props[j].Typ < mx) then
         FTypes[nw].Props[j].Typ := FImportMap[FTypes[nw].Props[j].Typ];
+    for j := 0 to High(FTypes[nw].CVars) do
+      if (FTypes[nw].CVars[j].Typ >= 0) and (FTypes[nw].CVars[j].Typ < mx) then
+        FTypes[nw].CVars[j].Typ := FImportMap[FTypes[nw].CVars[j].Typ];
     for j := 0 to High(FTypes[nw].Meths) do
     begin
       if (FTypes[nw].Meths[j].RetTyp >= 0) and (FTypes[nw].Meths[j].RetTyp < mx) then
@@ -13073,6 +13444,17 @@ end;
 
 { A unit's names were checked when it was compiled; its .pi is read with
   the check off (1.0.131). }
+{ A name with a dot: a class variable's global (Class.Name, P123). }
+function HasDotName(const S: string): Boolean;
+var
+  i: SizeInt;
+begin
+  Result := False;
+  for i := 1 to Length(S) do
+    if S[i] = '.' then
+      Result := True;
+end;
+
 procedure TParser.LoadUnit(const AName: string; LinkOnly: Boolean);
 var
   was: Boolean;
@@ -13177,7 +13559,12 @@ begin
   if Copy(data, 1, 11) = 'PASLANGI13' + #10 then
     Die(path + ' was compiled by a paslang older than 1.1.2; compile ' +
       AName + ' again');
-  if (Copy(data, 1, 8) = 'PASLANGI') and (Copy(data, 1, 11) <> 'PASLANGI14' + #10) then
+  { From 1.1.4 a class says its class variables and class properties
+    (P123). }
+  if Copy(data, 1, 11) = 'PASLANGI14' + #10 then
+    Die(path + ' was compiled by a paslang older than 1.1.4; compile ' +
+      AName + ' again');
+  if (Copy(data, 1, 8) = 'PASLANGI') and (Copy(data, 1, 11) <> 'PASLANGI15' + #10) then
     Die(path + ' was compiled by a newer paslang (' + FirstLine(data) +
       '); compile ' + AName + ' again with this one');
   if not ParseIface(data, iface) then
@@ -13254,9 +13641,19 @@ begin
       end;
     end;
   { The unit's interface globals: the name, and the storage in its
-    object (1.0.76). }
+    object (1.0.76). A class variable (P123) is one too, named by its
+    symbol, which the class's members give. }
   for j := 0 to High(iface.Vars) do
   begin
+    if HasDotName(iface.Vars[j].Name) then
+    begin
+      if IsVarName(iface.Vars[j].Sym) then
+        Continue;
+      AddVar(iface.Vars[j].Sym, MapImport(iface.Vars[j].Typ), False);
+      FVars[High(FVars)].Sym := iface.Vars[j].Sym;
+      FVars[High(FVars)].Ext := True;
+      Continue;
+    end;
     AddVar(iface.Vars[j].Name, MapImport(iface.Vars[j].Typ), False);
     FVars[High(FVars)].Sym := iface.Vars[j].Sym;
     FVars[High(FVars)].Ext := True;
@@ -13286,6 +13683,9 @@ end;
   pasroutines (mutex, waitgroup, ...) and links pasmap (map[K] of V)
   without a uses clause. The core units themselves are compiled bare. }
 procedure TParser.LoadCore;
+var
+  t, tc: LongInt;
+  n: SizeInt;
 begin
   if IsCoreUnit(FUnitName) then
     Exit;
@@ -13293,6 +13693,17 @@ begin
     after it with no parent descends from it. }
   if FindPi('pasobject') <> '' then
     LoadUnit('pasobject', False);
+  { TClass, class of TObject (P123): a word of the language, as TObject
+    is; the compiler names it, so pasobject stays what an installed
+    older compiler reads }
+  if NamedType('TObject', t) and (TypeOf(t).Kind = tykClass) and not NamedType('TClass', tc) then
+  begin
+    n := Length(FTypeNames);
+    SetLength(FTypeNames, n + 1);
+    FTypeNames[n].Name := 'TClass';
+    FTypeNames[n].Id := InternClassRef(t);
+    AddCoreName('TClass');
+  end;
   { Quad's arithmetic (P103): linked into every program, 17 KB, so a unit
     that works in Quad inside needs nothing of the program. }
   if FindPi('pasquad') <> '' then
@@ -13477,11 +13888,9 @@ end;
   A class without a constructor of its own gets the plain allocation. }
 function TParser.ParseCtorCall(Id: LongInt): PExpr;
 var
-  st, rt: TTypeDef;
   mname: string;
   args: TExprArray;
-  i, k, best, byCount, named, nline, ncol, root, ai, ri: LongInt;
-  fits: Boolean;
+  nline, ncol: LongInt;
 begin
   if FTok.Kind <> tkDot then
     Die('class constructor');
@@ -13495,12 +13904,30 @@ begin
   args := nil;
   if FTok.Kind = tkLParen then
     args := ParseArgList;
+  Result := MakeCtor(Id, mname, args, nline, ncol);
+end;
+
+{ Id.CName(CArgs), the arguments read: the constructor that takes them,
+  a new object of class Id. }
+function TParser.MakeCtor(Id: LongInt; const CName: string; var CArgs: TExprArray;
+  CLine, CCol: LongInt): PExpr;
+var
+  st, rt: TTypeDef;
+  mname: string;
+  args: TExprArray;
+  i, k, best, byCount, named, nline, ncol, root, ai, ri: LongInt;
+  fits: Boolean;
+begin
+  mname := CName;
+  args := CArgs;
+  nline := CLine;
+  ncol := CCol;
   st := TypeOf(Id);
   best := -1;
   byCount := -1;
   named := 0;
   for i := High(st.Meths) downto 0 do
-    if SameId(st.Meths[i].Name, mname) and st.Meths[i].IsCtor then
+    if SameId(st.Meths[i].Name, mname) and st.Meths[i].IsCtor and CallableMeth(st.Meths[i]) then
     begin
       Inc(named);
       if st.Meths[i].NParams <> Length(args) then
@@ -13547,6 +13974,331 @@ begin
     if (ai >= 0) and (ri >= 0) and (st.Meths[ai].Sym <> rt.Meths[ri].Sym) then
       Result^.Str := st.Meths[ai].Sym;
   end;
+  CArgs := args;
+end;
+
+function TParser.ClassPropNamed(Cls: LongInt; const AName: string): Boolean;
+var
+  i: SizeInt;
+begin
+  Result := False;
+  for i := 0 to High(FTypes[Cls].Props) do
+    if FTypes[Cls].Props[i].IsClass and SameId(FTypes[Cls].Props[i].Name, AName) then
+      Result := True;
+end;
+
+{ The index of class Cls's class variable AName, -1 when it has none
+  (P123). }
+function TParser.CVarIndex(Cls: LongInt; const AName: string): SizeInt;
+var
+  i: SizeInt;
+begin
+  Result := -1;
+  for i := 0 to High(FTypes[Cls].CVars) do
+    if SameId(FTypes[Cls].CVars[i].Name, AName) then
+    begin
+      Result := i;
+      Exit;
+    end;
+end;
+
+{ A call of class method Mi of class Cls (P123), its arguments picked:
+  a static one is a routine's call; any other passes VmtE, the class (its
+  method table; nil, Cls's own), as Self, and a virtual one is found in
+  that table's slot, so a descendant's override runs for a descendant. }
+function TParser.ClassMethCall(Cls: LongInt; VmtE: PExpr; Mi: SizeInt; var Args: TExprArray): PExpr;
+var
+  m: TMethInfo;
+  k: SizeInt;
+  slot: LongInt;
+begin
+  m := FTypes[Cls].Meths[Mi];
+  for k := 0 to High(Args) do
+    if (k <= High(m.ByRef)) and m.ByRef[k] then
+    begin
+      Args[k] := NewAddr(Args[k]);
+      Args[k]^.Flags := Args[k]^.Flags or 16;
+    end;
+  if m.IsStatic then
+  begin
+    Result := NewCall(m.Sym, Args, m.RetTyp);
+    Exit;
+  end;
+  if VmtE = nil then
+    VmtE := ClassValue(Cls);
+  slot := -1;
+  if m.IsVirt and (m.Slot >= 0) then
+    slot := ClsSlotBase - m.Slot;
+  Result := NewMethod(VmtE, m.Sym, Args, m.RetTyp, slot);
+end;
+
+{ VmtE.AName(...), VmtE a class reference of class Cls (P123): a new
+  object of the class VmtE holds, of its size, made by constructor
+  AName: that class's own when the constructor is virtual, else Cls's;
+  then its AfterConstruction through its slot. }
+function TParser.CtorThrough(Cls: LongInt; VmtE: PExpr; const AName: string; ALine, ACol: LongInt): PExpr;
+var
+  args: TExprArray;
+  k, root, ri: LongInt;
+  st: TTypeDef;
+begin
+  args := nil;
+  if FTok.Kind = tkLParen then
+    args := ParseArgList;
+  Result := MakeCtor(Cls, AName, args, ALine, ACol);
+  Result^.L := VmtE;
+  Result^.Num := -1;
+  Result^.Str := '';
+  st := TypeOf(Cls);
+  for k := 0 to High(st.Meths) do
+    if (st.Meths[k].Sym = Result^.Name) and st.Meths[k].IsCtor and st.Meths[k].IsVirt and
+      (st.Meths[k].Slot >= 0) then
+      Result^.Num := st.Meths[k].Slot;
+  if NamedType('TObject', root) and (TypeOf(root).Kind = tykClass) then
+  begin
+    ri := MethIndexNamed(root, 'AfterConstruction');
+    if (ri >= 0) and (TypeOf(root).Meths[ri].Slot >= 0) then
+      Result^.R := NewInt(TypeOf(root).Meths[ri].Slot);
+  end;
+end;
+
+{ Self's class as a table (P123): Self in a class method, Self's in an
+  object's method, the class itself in a static one. }
+function TParser.SelfVmt: PExpr;
+begin
+  if FSelfClassRef then
+    Result := NewVar('self', InternClassRef(FClassTyp))
+  else if FNoSelf then
+    Result := ClassValue(FClassTyp)
+  else
+    Result := VmtOf(NewVar('self', FClassTyp));
+end;
+
+{ A call of each routine of Syms, last first when Reverse; nil for none
+  (P123). }
+function TParser.LifeCalls(const Syms: TStrArray; Reverse: Boolean): PStmt;
+var
+  i: SizeInt;
+  st: PStmt;
+begin
+  Result := nil;
+  if Length(Syms) = 0 then
+    Exit;
+  Result := NewStmt(skBlock);
+  for i := 0 to High(Syms) do
+  begin
+    st := NewStmt(skCall);
+    if Reverse then
+      st^.Name := Syms[High(Syms) - i]
+    else
+      st^.Name := Syms[i];
+    AppendStmt(Result, st);
+  end;
+end;
+
+{ A then B, either nil (P123). }
+function JoinStmts(A, B: PStmt): PStmt;
+begin
+  if A = nil then
+    Result := B
+  else if B = nil then
+    Result := A
+  else
+  begin
+    Result := NewStmt(skBlock);
+    SetLength(Result^.Stmts, 2);
+    Result^.Stmts[0] := A;
+    Result^.Stmts[1] := B;
+  end;
+end;
+
+{ The static setter of the class property E is the read of, or '' when
+  E is none (P123). }
+function TParser.CPropSetter(E: PExpr): string;
+var
+  i: SizeInt;
+begin
+  Result := '';
+  for i := 0 to High(FCPropSets) do
+    if FCPropSets[i] = E then
+      Result := FCPropSetSyms[i];
+end;
+
+{ Class property I of class Cls (P123), read or, right before :=,
+  written: a class variable is its own place; a static class method reads
+  it, or writes it in the assignment that follows (CPropSetter). }
+function TParser.ClassPropRead(Cls: LongInt; I: SizeInt; ALine, ACol: LongInt): PExpr;
+var
+  st: TTypeDef;
+  pr: TPropInfo;
+  k, ci, ns: SizeInt;
+  args: TExprArray;
+  acc: string;
+  writing: Boolean;
+begin
+  st := TypeOf(Cls);
+  pr := st.Props[I];
+  CheckVis(Cls, 2, I, ALine, ACol);
+  writing := FTok.Kind = tkAssign;
+  if writing then
+    acc := pr.WriteName
+  else
+    acc := pr.ReadName;
+  if acc = '' then
+  begin
+    if writing then
+      Die(pr.Name + ' is read only' + HerePos);
+    Die(pr.Name + ' is written only' + HerePos);
+  end;
+  ci := CVarIndex(Cls, acc);
+  if ci >= 0 then
+  begin
+    Result := NewVar(st.CVars[ci].Sym, st.CVars[ci].Typ);
+    Exit;
+  end;
+  for k := 0 to High(st.Meths) do
+    if SameId(st.Meths[k].Name, acc) and st.Meths[k].IsClassMeth and CallableMeth(st.Meths[k]) then
+    begin
+      if not st.Meths[k].IsStatic then
+        Die(acc + ', the accessor of class property ' + pr.Name +
+          ', is a static class method or a class variable at ' + IntToStr(ALine) + ':' +
+          IntToStr(ACol));
+      if writing then
+      begin
+        { the setter, called by the assignment; the node stands for the
+          property until then }
+        Result := NewCall('rt_cpropset', nil, pr.Typ);
+        ns := Length(FCPropSets);
+        SetLength(FCPropSets, ns + 1);
+        SetLength(FCPropSetSyms, ns + 1);
+        FCPropSets[ns] := Result;
+        FCPropSetSyms[ns] := st.Meths[k].Sym;
+        Exit;
+      end;
+      args := nil;
+      Result := NewCall(st.Meths[k].Sym, args, st.Meths[k].RetTyp);
+      Exit;
+    end;
+  Die('unknown accessor ' + acc + ' of class property ' + pr.Name + HerePos);
+  Result := nil;
+end;
+
+{ AName after Cls., after a class reference, or after an object of class
+  Cls (P123): a class variable, a class property, a class method (called
+  with the arguments that follow), a constructor (a new object; VmtE's
+  class when VmtE is a reference) or a class word. VmtE gives the class's
+  method table, nil Cls's own. False when AName is none of these. }
+function TParser.ClassMember(Cls: LongInt; VmtE: PExpr; const AName: string;
+  ALine, ACol: LongInt; out Res: PExpr): Boolean;
+var
+  st: TTypeDef;
+  i, mi: SizeInt;
+  args: TExprArray;
+  have, anyMeth, anyCtor: Boolean;
+begin
+  Result := True;
+  Res := nil;
+  st := TypeOf(Cls);
+  i := CVarIndex(Cls, AName);
+  if i >= 0 then
+  begin
+    CheckVis(Cls, 3, i, ALine, ACol);
+    Res := NewVar(st.CVars[i].Sym, st.CVars[i].Typ);
+    Exit;
+  end;
+  for i := 0 to High(st.Props) do
+    if st.Props[i].IsClass and SameId(st.Props[i].Name, AName) then
+    begin
+      Res := ClassPropRead(Cls, i, ALine, ACol);
+      Exit;
+    end;
+  anyMeth := False;
+  anyCtor := False;
+  for i := 0 to High(st.Meths) do
+    if SameId(st.Meths[i].Name, AName) and CallableMeth(st.Meths[i]) then
+    begin
+      if st.Meths[i].IsCtor then
+        anyCtor := True
+      else if st.Meths[i].IsClassMeth then
+        anyMeth := True;
+    end;
+  if anyCtor then
+  begin
+    if VmtE = nil then
+    begin
+      args := nil;
+      if FTok.Kind = tkLParen then
+        args := ParseArgList;
+      Res := MakeCtor(Cls, AName, args, ALine, ACol);
+    end
+    else
+      Res := CtorThrough(Cls, VmtE, AName, ALine, ACol);
+    Exit;
+  end;
+  if anyMeth then
+  begin
+    args := nil;
+    have := FTok.Kind = tkLParen;
+    if have then
+      args := ParseArgList;
+    if not PickMeth(st.Meths, AName, args, have, mi) then
+      Die('unknown class method ' + AName + HerePos);
+    CheckVis(Cls, 1, mi, ALine, ACol);
+    if not st.Meths[mi].IsClassMeth then
+      Die(AName + ' is an object''s method: it is called on an object' + HerePos);
+    if Length(args) <> st.Meths[mi].NParams then
+      Die('wrong number of arguments for ' + st.Name + '.' + AName + HerePos);
+    Res := ClassMethCall(Cls, VmtE, mi, args);
+    Exit;
+  end;
+  if IsClassWord(AName) then
+  begin
+    args := nil;
+    if FTok.Kind = tkLParen then
+      args := ParseArgList;
+    if VmtE = nil then
+      VmtE := ClassValue(Cls);
+    Res := ClassWordVmt(VmtE, AName, args);
+    Exit;
+  end;
+  { an object's member through the class: there is no object }
+  for i := 0 to High(st.Meths) do
+    if SameId(st.Meths[i].Name, AName) and CallableMeth(st.Meths[i]) then
+      Die(AName + ' is an object''s method: it is called on an object, not on ' + st.Name +
+        ' at ' + IntToStr(ALine) + ':' + IntToStr(ACol));
+  for i := 0 to High(st.Fields) do
+    if SameId(st.Fields[i].Name, AName) then
+      Die(AName + ' is a field of an object: it is read from an object, not from ' + st.Name +
+        ' at ' + IntToStr(ALine) + ':' + IntToStr(ACol));
+  for i := 0 to High(st.Props) do
+    if SameId(st.Props[i].Name, AName) then
+      Die(AName + ' is a property of an object: it is read from an object, not from ' +
+        st.Name + ' at ' + IntToStr(ALine) + ':' + IntToStr(ACol));
+  Result := False;
+end;
+
+{ Id read where a value goes (P123): Id.Member (ClassMember), or the
+  class itself, a class reference. }
+function TParser.ClassDot(Id: LongInt): PExpr;
+var
+  mname: string;
+  nline, ncol: LongInt;
+begin
+  if FTok.Kind <> tkDot then
+  begin
+    Result := ClassValue(Id);
+    Exit;
+  end;
+  FTok := FLex.Next;
+  if not IsName then
+    Die('a member of ' + TypeOf(Id).Name + ' is expected' + HerePos);
+  mname := FTok.Lexeme;
+  nline := FTok.Line;
+  ncol := FTok.Col;
+  FTok := FLex.Next;
+  if not ClassMember(Id, nil, mname, nline, ncol, Result) then
+    Die('unknown class member ' + TypeOf(Id).Name + '.' + mname + ' at ' +
+      IntToStr(nline) + ':' + IntToStr(ncol));
 end;
 
 { mu.Lock, wg.Add(2), c.Wait(mu): the methods of the sync types. }
@@ -13737,13 +14489,19 @@ var
   args: TExprArray;
   nst: PStmt;
   pd: TProcEnt;
-  anon: Boolean;
+  anon, isClassM, isDtorH, found: Boolean;
+  st: TTypeDef;
+  hpos: string;
 begin
   anon := FAnonHead;
+  hpos := '';
   FAnonHead := False;
   pr := Default(TProc);
   pr.Safe := FNextSafe;
   FNextSafe := False;
+  isClassM := FNextClassMeth;
+  FNextClassMeth := False;
+  isDtorH := FTok.Kind = tkDestructor;
   pr.IsCtor := FTok.Kind = tkConstructor;
   pr.IsFunc := FTok.Kind = tkFunction;
   if (FTok.Kind <> tkProcedure) and (FTok.Kind <> tkFunction) and
@@ -13767,8 +14525,31 @@ begin
     if not NamedType(pr.Name, pr.ClassTyp) then
       Die('unknown class ' + pr.Name);
     pr.Name := FTok.Lexeme;
+    hpos := HerePos;
     FTok := FLex.Next;
     pr.Sym := ProcSym('', TypeOf(pr.ClassTyp).Name + '_' + pr.Name);
+  end;
+  if isClassM and (pr.ClassTyp = 0) then
+    Die('class goes before the body of a class method, TClass.Name' + HerePos);
+  { a class constructor or destructor (P123): the one the class declares,
+    no parameters, no Self }
+  if isClassM and (pr.IsCtor or isDtorH) then
+  begin
+    st := TypeOf(pr.ClassTyp);
+    found := False;
+    for oi := 0 to High(st.Meths) do
+      if st.Meths[oi].IsClassMeth and (st.Meths[oi].IsCtor = pr.IsCtor) and
+        (st.Meths[oi].IsDtor = isDtorH) and SameId(st.Meths[oi].Name, pr.Name) and
+        (st.Meths[oi].Sym = ProcSym('', st.Name + '_' + pr.Name) + ClassLifeTag(pr.IsCtor)) then
+        found := True;
+    if not found then
+      Die(st.Name + ' declares no class ' + LifeWord(pr.IsCtor) + ' ' + pr.Name + hpos);
+    pr.Sym := ProcSym('', st.Name + '_' + pr.Name) + ClassLifeTag(pr.IsCtor);
+    pr.IsCtor := False;
+    pr.NoSelf := True;
+    Eat(tkSemi);
+    Result := pr;
+    Exit;
   end;
   if pr.Safe then
   begin
@@ -14015,8 +14796,26 @@ begin
           if (pr.Params[n].Typ <> TypeOf(pr.ClassTyp).Meths[oi].ParamTyps[n]) or
             (pr.Params[n].ByRef <> TypeOf(pr.ClassTyp).Meths[oi].ByRef[n]) then
             eqm := False;
-        if eqm then
+        if eqm and not (TypeOf(pr.ClassTyp).Meths[oi].IsClassMeth and
+          (TypeOf(pr.ClassTyp).Meths[oi].IsCtor or TypeOf(pr.ClassTyp).Meths[oi].IsDtor)) then
+        begin
           pr.Sym := TypeOf(pr.ClassTyp).Meths[oi].Sym;
+          { class says so on both heads, or on neither (P123); a class
+            method's Self is the class, a static one's none }
+          if TypeOf(pr.ClassTyp).Meths[oi].IsClassMeth <> isClassM then
+          begin
+            if isClassM then
+              Die(pr.Name + ' is declared as an object''s method, not a class method' + hpos)
+            else
+              Die(pr.Name + ' is declared as a class method: class goes before its body' + hpos);
+          end;
+          if isClassM then
+          begin
+            pr.NoSelf := TypeOf(pr.ClassTyp).Meths[oi].IsStatic;
+            if not pr.NoSelf then
+              pr.SelfTyp := InternClassRef(pr.ClassTyp);
+          end;
+        end;
       end;
   end;
   Result := pr;
@@ -14800,9 +15599,20 @@ end;
 { The method table of the object E points at: its first word (P121), a
   load through E as it is (a constructor's node names its class by its
   type, so E keeps it). E is worked out once, where the table is read. }
+{ The method table of object E, its first word. }
 function TParser.VmtOf(E: PExpr): PExpr;
 begin
   Result := NewDeref(E, TyPointer);
+end;
+
+{ E, a method table, as another type: a copy of the node, so the one
+  the caller holds keeps its own (P123: a class reference passed to
+  pasobject's routines, which take a Pointer, and ClassType's TClass). }
+function TParser.Retyped(E: PExpr; T: LongInt): PExpr;
+begin
+  New(Result);
+  Result^ := E^;
+  Result^.Typ := T;
 end;
 
 { The class words (P121): what every object and every class answers,
@@ -14810,31 +15620,62 @@ end;
 function TParser.IsClassWord(const Name: string): Boolean;
 begin
   Result := SameId(Name, 'ClassName') or SameId(Name, 'InstanceSize') or
-    SameId(Name, 'ClassNameIs');
+    SameId(Name, 'ClassNameIs') or SameId(Name, 'ClassType') or
+    SameId(Name, 'ClassParent') or SameId(Name, 'InheritsFrom');
 end;
 
 function TParser.ClassWord(Base: PExpr; const Name: string; const Args: TExprArray): PExpr;
+begin
+  Result := ClassWordVmt(VmtOf(Base), Name, Args);
+end;
+
+{ A class word of the class whose method table Vmt is (P121; P123:
+  ClassType, ClassParent, InheritsFrom, and a table given, a class
+  reference's or a class's own). }
+function TParser.ClassWordVmt(Vmt: PExpr; const Name: string; const Args: TExprArray): PExpr;
 var
   a: TExprArray;
+  tc: LongInt;
 begin
   a := nil;
-  if SameId(Name, 'ClassName') or SameId(Name, 'InstanceSize') then
+  { TClass, class of TObject, is the compiler's (P123) }
+  if (not NamedType('TClass', tc)) or (TypeOf(tc).Kind <> tykClassRef) then
+    tc := TyPointer;
+  if SameId(Name, 'ClassName') or SameId(Name, 'InstanceSize') or
+    SameId(Name, 'ClassType') or SameId(Name, 'ClassParent') then
   begin
     if Length(Args) <> 0 then
       Die(Name + ' takes no arguments' + HerePos);
     SetLength(a, 1);
-    a[0] := VmtOf(Base);
+    a[0] := Retyped(Vmt, TyPointer);
     if SameId(Name, 'ClassName') then
       Result := CoreProc('PasClassName', a, TyString)
+    else if SameId(Name, 'InstanceSize') then
+      Result := CoreProc('PasInstanceSize', a, TyInteger)
+    else if SameId(Name, 'ClassParent') then
+      Result := CoreProc('PasClassParent', a, tc)
     else
-      Result := CoreProc('PasInstanceSize', a, TyInteger);
+      { the object's class, a TClass (P123) }
+      Result := Retyped(Vmt, tc);
+  end
+  else if SameId(Name, 'InheritsFrom') then
+  begin
+    if Length(Args) <> 1 then
+      Die('InheritsFrom takes a class' + HerePos);
+    CheckTyped(Args[0]);
+    if TypeOf(Args[0]^.Typ).Kind <> tykClassRef then
+      Die('InheritsFrom takes a class, not ' + TypName(Args[0]^.Typ) + HerePos);
+    SetLength(a, 2);
+    a[0] := Retyped(Vmt, TyPointer);
+    a[1] := Retyped(Args[0], TyPointer);
+    Result := CoreProc('PasInheritsFrom', a, TyBoolean);
   end
   else
   begin
     if Length(Args) <> 1 then
       Die('ClassNameIs takes a name' + HerePos);
     SetLength(a, 2);
-    a[0] := VmtOf(Base);
+    a[0] := Retyped(Vmt, TyPointer);
     a[1] := StrArg(TyString, Args[0]);
     if not IsStrTyp(a[1]^.Typ) then
       Die('ClassNameIs takes a string, not ' + TypName(a[1]^.Typ) + HerePos);
@@ -15714,6 +16555,7 @@ var
   seen, savedSafe, anon: Boolean;
   savedConst: TStrArray;
   savedExc: LongInt;
+  savedSelfRef, savedNoSelf: Boolean;
 begin
   anon := FAnonBody;
   FAnonBody := False;
@@ -15754,10 +16596,24 @@ begin
   FNest := Pr.Nest + 1;
   SetLength(FSymChain, Length(FSymChain) + 1);
   FSymChain[High(FSymChain)] := Pr.Sym;
+  savedSelfRef := FSelfClassRef;
+  savedNoSelf := FNoSelf;
   if Pr.ClassTyp <> 0 then
   begin
     FClassTyp := Pr.ClassTyp;
-    AddVar('self', Pr.ClassTyp, True);
+    { a class method's Self is the class, a static one has none (P123) }
+    FSelfClassRef := False;
+    FNoSelf := Pr.NoSelf;
+    if Pr.NoSelf then
+    begin
+    end
+    else if Pr.SelfTyp <> 0 then
+    begin
+      FSelfClassRef := True;
+      AddVar('self', Pr.SelfTyp, True);
+    end
+    else
+      AddVar('self', Pr.ClassTyp, True);
   end;
   if Pr.IsFunc then
     AddVar('result', Pr.RetTyp, True);
@@ -15843,6 +16699,8 @@ begin
     Eat(tkSemi);
   FConstNames := savedConst;
   FExcDepth := savedExc;
+  FSelfClassRef := savedSelfRef;
+  FNoSelf := savedNoSelf;
   FLocals := savedLocals;
   FScopes := savedScopes;
   FFuncName := savedFunc;
@@ -16148,9 +17006,21 @@ begin
         begin
           FTok := FLex.Next;
           if (FTok.Kind <> tkProcedure) and (FTok.Kind <> tkFunction) and
-            (FTok.Kind <> tkConstructor) and (FTok.Kind <> tkDestructor) then
+            (FTok.Kind <> tkConstructor) and (FTok.Kind <> tkDestructor) and
+            (FTok.Kind <> tkClass) then
             Die('safe goes before a routine, a unit or a program' + HerePos);
           FNextSafe := True;
+        end;
+      tkClass:
+        begin
+          { the body of a class method, constructor or destructor (P123) }
+          FTok := FLex.Next;
+          if (FTok.Kind <> tkProcedure) and (FTok.Kind <> tkFunction) and
+            (FTok.Kind <> tkConstructor) and (FTok.Kind <> tkDestructor) then
+            Die('class goes before the body of a class method' + HerePos);
+          if not NeedBody then
+            Die('a class method belongs to a class' + HerePos);
+          FNextClassMeth := True;
         end;
       tkProcedure, tkFunction, tkConstructor, tkDestructor:
         begin
@@ -16214,6 +17084,10 @@ begin
   FProg.LinkObjs := FLinkObjs;
   FInBody := False;
   FProg.Body := ParseBlock;
+  { the class constructors before the program, the destructors after
+    it, last first (P123) }
+  FProg.Body := JoinStmts(JoinStmts(LifeCalls(FClassCtors, False), FProg.Body),
+    LifeCalls(FClassDtors, True));
   FProg.Vars := FVars;
   Eat(tkDot);
   for i := 0 to High(FProg.Procs) do
@@ -16287,6 +17161,10 @@ begin
     FTok := FLex.Next;
     FProg.FiniBody := ParseLifeBlock(tkEnd);
   end;
+  { the class constructors before the unit's initialization, the
+    destructors after its finalization, last first (P123) }
+  FProg.InitBody := JoinStmts(LifeCalls(FClassCtors, False), FProg.InitBody);
+  FProg.FiniBody := JoinStmts(FProg.FiniBody, LifeCalls(FClassDtors, True));
   Eat(tkEnd);
   Eat(tkDot);
   FProg.Vars := FVars;

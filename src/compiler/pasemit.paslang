@@ -621,6 +621,7 @@ type
       out Sym: string; out Slot: LongInt);
     procedure EmitDumpLocals;
     procedure DbgCode(Typ: LongInt; out Code, Size: LongInt);
+    function IsClassVar(const N: string): Boolean;
     procedure EmitDebugTables(const Prog: TProgram);
     procedure ShiftArgs(N, NReg, Reg0: LongInt);
     procedure EmitLink(CalleeNest: LongInt);
@@ -1672,6 +1673,13 @@ end;
 function TEmitter.InternStrFat(const S: string): string;
 begin
   Result := '.Lsf' + Copy(InternStr(S), 4, 32);
+end;
+
+{ The routine has Self, the first argument: a method, but a static class
+  method (P123), which has none. }
+function HasSelf(const Pr: TProc): Boolean;
+begin
+  Result := (Pr.ClassTyp <> 0) and not Pr.NoSelf;
 end;
 
 function TEmitter.TSize(Id: LongInt): LongInt;
@@ -7802,6 +7810,14 @@ begin
     Line('  ldr x16, [x16]');
     Line('  blr x16');
   end
+  else if Slot <= ClsSlotBase then
+  begin
+    { a class method's virtual call (P123): x0, Self, is the table }
+    Imm('x17', (ClsSlotBase - Slot) * 8);
+    Line('  add x16, x0, x17');
+    Line('  ldr x16, [x16]');
+    Line('  blr x16');
+  end
   else
     Line('  bl ' + Name);
   if ntot > 8 then
@@ -8720,6 +8736,17 @@ begin
   Result := False;
   if E = nil then
     Exit;
+  { A class as a value (P123): the address of its method table, whose
+    label the call's Str names. }
+  if E^.Name = 'rt_classref' then
+  begin
+    Result := True;
+    if FArm then
+      LeaS(E^.Str, 'x0')
+    else
+      Line('  leaq ' + E^.Str + '(%rip), %rax');
+    Exit;
+  end;
   { The routine's exception object, G+272 (P122): a handler reads it
     and puts the one it replaced back when it ends. }
   if E^.Name = 'rt_excget' then
@@ -15255,9 +15282,9 @@ end;
 
 procedure TEmitter.EmitExprRaw(E: PExpr);
 var
-  i, nreg: SizeInt;
+  i, nreg, nuser, ntot, ns: SizeInt;
   a, b: string;
-  off: LongInt;
+  off, soff: LongInt;
 begin
   if E = nil then
   begin
@@ -15346,36 +15373,92 @@ begin
         end;
       ekCtor:
         begin
-          Imm('x0', E^.Off);
-          GcArg(GcWordInst(E^.Typ), 'x1');
-          Line('  bl rt_alloc');
+          if E^.L <> nil then
+          begin
+            { through a class reference (P123): the class it holds says
+              the size, the descriptor and the table }
+            EmitExpr(E^.L);
+            PshK('x0', 0);
+            Line('  ldr x1, [x0, #-48]');
+            Line('  ldr x0, [x0, #-24]');
+            Line('  bl rt_alloc');
+            Ppop('x1');
+            Line('  str x1, [x0]');
+          end
+          else
+          begin
+            Imm('x0', E^.Off);
+            GcArg(GcWordInst(E^.Typ), 'x1');
+            Line('  bl rt_alloc');
+            LeaS('vmt_' + ToLower(FTypes[E^.Typ].Name), 'x1');
+            Line('  str x1, [x0]');
+          end;
+          { the object twice: one kept for the result, one Self; then the
+            arguments, the ninth word on in the stack as EmitArmMeth
+            passes them (a constructor took seven arguments at most) }
           PshK('x0', 1);
-          LeaS('vmt_' + ToLower(FTypes[E^.Typ].Name), 'x1');
-          Line('  str x1, [x0]');
-          nreg := Length(E^.Args);
-          if nreg > 7 then
-            Die('constructor arguments');
-          for i := 0 to nreg - 1 do
+          PshK('x0', 1);
+          nuser := Length(E^.Args);
+          if nuser > 32 then
+            Die('at most 32 arguments');
+          for i := 0 to nuser - 1 do
           begin
             EmitArgVal(E^.Args[i]);
             PshK('x0', ACls(E^.Args[i]));
           end;
-          if nreg = 0 then
-            Line('  ldr x0, [sp]')
+          ntot := nuser + 1;
+          if ntot > 8 then
+            nreg := 8
           else
-            Line('  ldr x0, [sp, #' + IntToStr(nreg * 16) + ']');
+            nreg := ntot;
           for i := 0 to nreg - 1 do
-            Line('  ldr ' + ArgR(LongInt(i + 1)) + ', [sp, #' +
-              IntToStr((nreg - 1 - i) * 16) + ']');
-          if E^.Name <> '' then
-            Line('  bl ' + E^.Name);
-          if nreg > 0 then
+            Line('  ldr ' + ArgR(LongInt(i)) + ', [sp, #' + IntToStr((nuser - i) * 16) + ']');
+          soff := 0;
+          if ntot > 8 then
           begin
-            Imm('x16', nreg * 16);
+            ns := ntot - 8;
+            soff := (ns * 8 + 15) and (-16);
+            for i := 0 to ns - 1 do
+            begin
+              Line('  ldr x16, [sp, #' + IntToStr((ns - 1 - i) * 16) + ']');
+              Line('  str x16, [sp, #' + IntToStr(ntot * 16 - soff + i * 8) + ']');
+            end;
+            Imm('x16', ntot * 16 - soff);
+            Line('  add sp, sp, x16');
+          end
+          else
+          begin
+            Imm('x16', ntot * 16);
             Line('  add sp, sp, x16');
           end;
-          { the class's AfterConstruction on the new object (P121) }
-          if E^.Str <> '' then
+          if (E^.L <> nil) and (E^.Num >= 0) then
+          begin
+            { a virtual constructor, the held class's own (P123) }
+            Line('  ldr x16, [x0]');
+            Imm('x17', E^.Num * 8);
+            Line('  add x16, x16, x17');
+            Line('  ldr x16, [x16]');
+            Line('  blr x16');
+          end
+          else if E^.Name <> '' then
+            Line('  bl ' + E^.Name);
+          if soff > 0 then
+          begin
+            Imm('x16', soff);
+            Line('  add sp, sp, x16');
+          end;
+          { the class's AfterConstruction on the new object (P121); through
+            its slot when the class is the one a reference held (P123) }
+          if E^.R <> nil then
+          begin
+            Line('  ldr x0, [sp]');
+            Line('  ldr x16, [x0]');
+            Imm('x17', E^.R^.Num * 8);
+            Line('  add x16, x16, x17');
+            Line('  ldr x16, [x16]');
+            Line('  blr x16');
+          end
+          else if E^.Str <> '' then
           begin
             Line('  ldr x0, [sp]');
             Line('  bl ' + E^.Str);
@@ -16140,12 +16223,28 @@ else if E^.Name = 'rt_high' then
       end;
     ekCtor:
       begin
-        Line('  movq $' + IntToStr(E^.Off) + ', %rdi');
-        GcArg(GcWordInst(E^.Typ), 'rsi');
-        Line('  call rt_alloc');
-        PushK('rax', 1);
-        Line('  leaq vmt_' + ToLower(FTypes[E^.Typ].Name) + '(%rip), %rcx');
-        Line('  movq %rcx, (%rax)');
+        if E^.L <> nil then
+        begin
+          { through a class reference (P123): the class it holds says the
+            size, the descriptor and the table }
+          EmitExpr(E^.L);
+          PushK('rax', 0);
+          Line('  movq -24(%rax), %rdi');
+          Line('  movq -48(%rax), %rsi');
+          Line('  call rt_alloc');
+          Line('  popq %rcx');
+          PushK('rax', 1);
+          Line('  movq %rcx, (%rax)');
+        end
+        else
+        begin
+          Line('  movq $' + IntToStr(E^.Off) + ', %rdi');
+          GcArg(GcWordInst(E^.Typ), 'rsi');
+          Line('  call rt_alloc');
+          PushK('rax', 1);
+          Line('  leaq vmt_' + ToLower(FTypes[E^.Typ].Name) + '(%rip), %rcx');
+          Line('  movq %rcx, (%rax)');
+        end;
         for i := 0 to High(E^.Args) do
         begin
           EmitArgVal(E^.Args[i]);
@@ -16160,12 +16259,25 @@ else if E^.Name = 'rt_high' then
           Line('  movq ' + IntToStr((Length(E^.Args) - nreg) * 8) + '(%rsp), %rdi')
         else
           Line('  movq (%rsp), %rdi');
-        if E^.Name <> '' then
+        if (E^.L <> nil) and (E^.Num >= 0) then
+        begin
+          { a virtual constructor, the held class's own (P123) }
+          Line('  movq (%rdi), %rax');
+          Line('  call *' + IntToStr(E^.Num * 8) + '(%rax)');
+        end
+        else if E^.Name <> '' then
           Line('  call ' + E^.Name);
         if Length(E^.Args) > nreg then
           Line('  addq $' + IntToStr((Length(E^.Args) - nreg) * 8) + ', %rsp');
-        { the class's AfterConstruction on the new object (P121) }
-        if E^.Str <> '' then
+        { the class's AfterConstruction on the new object (P121); through
+          its slot when the class is the one a reference held (P123) }
+        if E^.R <> nil then
+        begin
+          Line('  movq (%rsp), %rdi');
+          Line('  movq (%rdi), %rax');
+          Line('  call *' + IntToStr(E^.R^.Num * 8) + '(%rax)');
+        end
+        else if E^.Str <> '' then
         begin
           Line('  movq (%rsp), %rdi');
           Line('  call ' + E^.Str);
@@ -16265,6 +16377,9 @@ else if E^.Name = 'rt_high' then
             Line('  movq (%rdi), %rax');
             Line('  call *' + IntToStr(E^.Off * 8) + '(%rax)');
           end
+          else if E^.Off <= ClsSlotBase then
+            { a class method's virtual call (P123): Self is the table }
+            Line('  call *' + IntToStr((ClsSlotBase - E^.Off) * 8) + '(%rdi)')
           else
             Line('  call ' + E^.Name);
           if Length(E^.Args) > nreg then
@@ -17035,6 +17150,29 @@ begin
     Result := N;
 end;
 
+{ N is a class variable's global (P123): Class.Name, of a class declared
+  here that has that class variable. }
+function TEmitter.IsClassVar(const N: string): Boolean;
+var
+  i, j, d: SizeInt;
+  cls, nm: string;
+begin
+  Result := False;
+  d := 0;
+  for i := Length(N) downto 1 do
+    if (d = 0) and (N[i] = '.') then
+      d := i;
+  if d < 2 then
+    Exit;
+  cls := Copy(N, 1, d - 1);
+  nm := Copy(N, d + 1, Length(N) - d);
+  for i := 0 to High(FTypes) do
+    if (FTypes[i].Kind = tykClass) and SameSym(FTypes[i].Name, cls) then
+      for j := 0 to High(FTypes[i].CVars) do
+        if SameSym(FTypes[i].CVars[j].Name, nm) then
+          Result := True;
+end;
+
 procedure TEmitter.DbgCode(Typ: LongInt; out Code, Size: LongInt);
 var
   k: TTypeKind;
@@ -17060,7 +17198,7 @@ begin
     Code := 7
   else if k = tykReal then
     Code := 6
-  else if (k = tykPointer) or (k = tykClass) or (k = tykProc) then
+  else if (k = tykPointer) or (k = tykClass) or (k = tykProc) or (k = tykClassRef) then
     Code := 8
   else if (k = tykEnum) or (k = tykSubrange) then
     Code := 9
@@ -17130,7 +17268,8 @@ begin
   begin
     if Prog.Vars[v].Ext then
       Continue;
-    if DbgHidden(Prog.Vars[v].Name) then
+    { a class variable (P123), Class.Name, is the program's own }
+    if DbgHidden(Prog.Vars[v].Name) and not IsClassVar(Prog.Vars[v].Name) then
       Continue;
     DbgCode(Prog.Vars[v].Typ, code, size);
     Line('  .quad 2, ' + VarLabel(GlobName(Prog.Vars[v])) + ', ' + InternStr(DbgName(Prog.Vars[v].Name)) +
@@ -18105,6 +18244,8 @@ begin
             Line('  movq (%rdi), %rax');
             Line('  call *' + IntToStr(S^.E2^.Num * 8) + '(%rax)');
           end
+          else if (S^.E2 <> nil) and (S^.E2^.Num <= ClsSlotBase) then
+            Line('  call *' + IntToStr((ClsSlotBase - S^.E2^.Num) * 8) + '(%rdi)')
           else
             Line('  call ' + S^.Name);
           if Length(S^.Args) > nreg then
@@ -22168,13 +22309,17 @@ begin
   slot := 0;
   if Pr.Nest > 0 then
     slot := 8;
-  if Pr.ClassTyp <> 0 then
+  if HasSelf(Pr) then
   begin
     slot := slot + 8;
     FSym[n].Name := 'self';
     FSym[n].Off := -LongInt(slot);
     FSym[n].Global := False;
-    FSym[n].Typ := Pr.ClassTyp;
+    { a class method's Self is the class, its table (P123) }
+    if Pr.SelfTyp <> 0 then
+      FSym[n].Typ := Pr.SelfTyp
+    else
+      FSym[n].Typ := Pr.ClassTyp;
     FSym[n].Up := 0;
     FSym[n].ByRef := False;
     FSym[n].Reg := '';
@@ -22193,13 +22338,13 @@ begin
       nlim := 8
     else
       nlim := 6;
-    if i + Ord(Pr.ClassTyp <> 0) < nlim then
+    if i + Ord(HasSelf(Pr)) < nlim then
     begin
       slot := slot + 8;
       FSym[n].Off := -LongInt(slot);
     end
     else
-      FSym[n].Off := 16 + (i + Ord(Pr.ClassTyp <> 0) - nlim) * 8;
+      FSym[n].Off := 16 + (i + Ord(HasSelf(Pr)) - nlim) * 8;
     Inc(n);
   end;
   FHasRes := Pr.IsFunc;
@@ -22321,12 +22466,12 @@ begin
     MapBegin;
     if Pr.Nest > 0 then
       StFP('x27', -8);
-    if Pr.ClassTyp <> 0 then
+    if HasSelf(Pr) then
       StFP('x0', -8 * LongInt(1 + Ord(Pr.Nest > 0)));
     for i := 0 to nargs - 1 do
-      if i + Ord(Pr.ClassTyp <> 0) < 8 then
-        StFP(ArgR(LongInt(i + Ord(Pr.ClassTyp <> 0))),
-          -8 * LongInt(i + 1 + Ord(Pr.Nest > 0) + Ord(Pr.ClassTyp <> 0)));
+      if i + Ord(HasSelf(Pr)) < 8 then
+        StFP(ArgR(LongInt(i + Ord(HasSelf(Pr)))),
+          -8 * LongInt(i + 1 + Ord(Pr.Nest > 0) + Ord(HasSelf(Pr))));
     if loc1 > loc0 then
       ZeroLocals(Pr, LongInt(loc0));
     { The slot is whole words, so a value of 3 bytes clears one: counted
@@ -22394,12 +22539,12 @@ begin
     MapBegin;
     if Pr.Nest > 0 then
       Line('  movq %r10, -8(%rbp)');
-    if Pr.ClassTyp <> 0 then
+    if HasSelf(Pr) then
       Line('  movq %rdi, -8(%rbp)');
     for i := 0 to nargs - 1 do
-      if i + Ord(Pr.ClassTyp <> 0) < 6 then
-        Line('  movq %' + ArgReg(LongInt(i + Ord(Pr.ClassTyp <> 0))) + ', ' +
-          IntToStr(-8 * LongInt(i + 1 + Ord(Pr.Nest > 0) + Ord(Pr.ClassTyp <> 0))) + '(%rbp)');
+      if i + Ord(HasSelf(Pr)) < 6 then
+        Line('  movq %' + ArgReg(LongInt(i + Ord(HasSelf(Pr)))) + ', ' +
+          IntToStr(-8 * LongInt(i + 1 + Ord(Pr.Nest > 0) + Ord(HasSelf(Pr)))) + '(%rbp)');
     { Locals start as zero, so a string, a slice, a map or a sync
       record is ready to use, as in Go. So does the whole of Result: a
       string, a slice or a record the routine never assigns comes back
@@ -31995,6 +32140,11 @@ begin
   end;
   if sz = 0 then
     FRootWords := nil;
+  { every class declared here: its method table carries its instance's
+    descriptor (P123), for an object made through a class reference }
+  for i := 0 to High(FTypes) do
+    if (FTypes[i].Kind = tykClass) and (not FTypes[i].Imported) then
+      GcWordInst(LongInt(i));
   EmitGcTypes;
   { The strings of the typed constants, before the table is written. }
   for i := 0 to High(Prog.Vars) do
@@ -32100,8 +32250,11 @@ begin
           Line('  .quad ' + IntToStr(j));
         end;
       Line('  .quad 0');
-      { before the slots (P121): -40 the name's address, -32 its length,
-        -24 an instance's size, -16 the parent's table, -8 the RTTI }
+      { before the slots (P121): -48 an instance's GC word (P123, for
+        an object made through a class reference), -40 the name's
+        address, -32 its length, -24 an instance's size, -16 the
+        parent's table, -8 the RTTI }
+      Line('  .quad ' + GcWordInst(LongInt(i)));
       Line('  .quad .Lcn' + IntToStr(i));
       Line('  .quad ' + IntToStr(Length(FTypes[i].Name)));
       Line('  .quad ' + IntToStr(FTypes[i].Size));

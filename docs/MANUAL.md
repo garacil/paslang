@@ -3065,6 +3065,159 @@ one `Free` runs. The memory of an object goes back to the collector
 when nothing points to it, whatever the destructor does. An object of
 any class can be raised (§9).
 
+### Class methods, class references and class variables
+
+A class can be worked with before any object exists (1.1.4):
+
+`examples/registry.paslang`:
+
+```pascal
+{ Class methods and class references: a registry of shape classes
+  that makes an object of whichever class a name picks, through a
+  virtual constructor, and counts them in a class variable. }
+program registry;
+
+type
+  TShape = class
+  private
+    class var FMade: Int64;           { one for the class and its descendants }
+  public
+    Size: Int64;
+    constructor Create(ASize: Int64); virtual;
+    class function Kind: string; virtual;   { Self is the class }
+    class function Describe: string;
+    class property Made: Int64 read FMade;
+    function Area: Int64; virtual;
+  end;
+
+  TSquare = class(TShape)
+    class function Kind: string; override;
+    function Area: Int64; override;
+  end;
+
+  TTriangle = class(TShape)
+    class function Kind: string; override;
+    function Area: Int64; override;
+  end;
+
+  TShapeClass = class of TShape;      { holds TShape or a descendant }
+
+constructor TShape.Create(ASize: Int64);
+begin
+  Size := ASize;
+  FMade := FMade + 1;
+end;
+
+class function TShape.Kind: string;
+begin
+  Result := 'shape';
+end;
+
+class function TShape.Describe: string;
+begin
+  Result := ClassName + ' draws a ' + Kind;   { the class it was called for }
+end;
+
+function TShape.Area: Int64;
+begin
+  Result := 0;
+end;
+
+class function TSquare.Kind: string;
+begin
+  Result := 'square';
+end;
+
+function TSquare.Area: Int64;
+begin
+  Result := Size * Size;
+end;
+
+class function TTriangle.Kind: string;
+begin
+  Result := 'triangle';
+end;
+
+function TTriangle.Area: Int64;
+begin
+  Result := Size * Size div 2;
+end;
+
+var
+  classes: array[0..2] of TShapeClass;
+
+function Find(const Name: string): TShapeClass;
+var
+  i: Int64;
+begin
+  Result := nil;
+  for i := 0 to 2 do
+    if classes[i].Kind = Name then
+      Result := classes[i];
+end;
+
+var
+  c: TShapeClass;
+  s: TShape;
+
+begin
+  classes[0] := TShape;               { a class is a value }
+  classes[1] := TSquare;
+  classes[2] := TTriangle;
+  WriteLn(TSquare.Describe);
+  c := Find('triangle');
+  s := c.Create(6);                   { an object of the class c holds }
+  WriteLn(s.ClassName, ' ', s.Area);
+  s := Find('square').Create(5);
+  WriteLn(s.ClassName, ' ', s.Area, ' ', Ord(s.InheritsFrom(TShape)));
+  WriteLn(TShape.Made, ' made');
+end.
+```
+
+prints
+
+```
+TSquare draws a square
+TTriangle 18
+TSquare 25 1
+2 made
+```
+
+- `class function` and `class procedure` declare a class method; its
+  body says `class` too (`class function TShape.Kind`). Inside it `Self`
+  is the class, not an object: the class it was called for, so
+  `ClassName` and a virtual class method answer for a descendant when a
+  descendant's name, a descendant's object or a reference holding a
+  descendant calls it. It reaches the class's class variables, class
+  properties and other class methods, and makes objects with a
+  constructor, of `Self`'s class; a field or an object's method is a
+  compile error there. A class method can be `virtual`, overridden and
+  `abstract`, and it takes a slot in the method table as an object's
+  method does. `static` after one makes a routine in the class's name
+  space with no `Self` at all.
+- `class of T` is a class reference: one word, the address of a class's
+  method table, that holds `T` or a class that descends from it (a
+  compile error otherwise). A class's name where a value goes is the
+  class; `TClass` is `class of TObject` and holds any class. Through a
+  reference: its class methods, `ClassName`, `ClassNameIs`,
+  `InstanceSize`, `ClassParent` and `InheritsFrom(C)`, and a
+  constructor, which makes an object of the class it holds, of that
+  class's size: a `virtual` constructor, overridden, runs the held
+  class's own. `x.ClassType` is the class of object `x`; `=` and `<>`
+  compare two references.
+- `class var` starts class variables, and `x: T; static;` declares one:
+  one variable for the class and all its descendants, a global the
+  program or unit holds (the debugger shows it as `TShape.FMade`).
+- `class property` reads and writes a class variable, or goes through a
+  `static` class method.
+- `class constructor` and `class destructor` (no parameters, one of
+  each per class) run before the unit's `initialization` part, or the
+  program's first statement, and after its `finalization`, or its last
+  statement, last first.
+
+A class method call costs what a method call costs: `Self` is the table
+the class or the object already has, and a virtual one reads one slot.
+
 ### Published properties
 
 A published property that reads or writes a field can be reached by its
@@ -9625,6 +9778,12 @@ the commands on standard input, under `--debug-mode` and under
   there is no packed layout.
 - `private`, `strict private`, `protected` and `strict protected` are
   held to (1.0.137); `Free` calls `Destroy` when there is one (§7).
+- `TClass` is the compiler's own name for `class of TObject`, a word
+  of the language as `TObject` is. A program's class destructors run
+  after its last statement, where Free Pascal runs them after the
+  output is closed.
+- `Close`, like `Send`, is a keyword (a channel's), so no method or
+  routine takes the name.
 - An exception object is not freed when its handler ends, as Free
   Pascal frees it: the collector takes it back when nothing points to
   it, so a handler may keep it or raise it again with `raise E`.
@@ -9748,7 +9907,8 @@ its place:
   … `PasOnceDone` routines, pasfmt's `PasFmtReal` … `PasFmtQuad`,
   pashash's `PasHex PasMd5 PasSha1Cpu` … `PasMerkleCheckBase` and
   pastree's `PasTreeNew` … `PasStoreAbandon`, and pasobject's `TObject`
-  with `PasClassName` … `PasUncaught`. A core unit declares its
+  with `PasClassName` … `PasUncaught`, and `TClass`, `class of
+  TObject`, the compiler's. A core unit declares its
   own exports; nothing else may, and a unit's implementation types are
   its own (an importer cannot name them, and they are not reserved).
 
@@ -9757,8 +9917,8 @@ method, a property or an enumeration member of one of these names is a
 compile error that names it, at the name: `Length is a reserved word,
 not a name at 5:3`. A unit's `.pi` is not checked for these names when
 it loads. The compiler loads only a `.pi` of the format it writes,
-`PASLANGI14` since 1.1.2, and refuses an older one: `build/geometry.pi
-was compiled by a paslang older than 1.1.2; compile geometry again`.
+`PASLANGI15` since 1.1.4, and refuses an older one: `build/geometry.pi
+was compiled by a paslang older than 1.1.4; compile geometry again`.
 
 `safe` before `program`, `unit`, `procedure`, `function`,
 `constructor` or `destructor` (a method's declaration in its class
