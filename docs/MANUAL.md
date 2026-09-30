@@ -10444,7 +10444,13 @@ the commands on standard input, under `--debug-mode` and under
   `uses` hides the earlier one's, as in Free Pascal (a routine of the
   same parameters, a constant, a variable, a type that is another); a
   unit's name reaches its own names, hidden or not: `ua.Twice`,
-  `ua.Count`, `var b: ua.TBox` (1.1.13).
+  `ua.Count`, `var b: ua.TBox` (1.1.13), and `x is ua.TSquare`,
+  `x as ua.TShape`. Two units may each declare a class, an interface,
+  a helper or a record of one name: each is the unit's own, in the
+  object code too (its table is `vmt_ua_tshape`, its methods
+  `p_ua_tshape_name`), and `ua.TShape` and `ub.TShape` are two classes
+  (1.1.28, P154; the program did not link, and the two were taken for
+  one when their sizes matched).
 - A map key cannot be a record, a real, a slice, a map or a method value.
 - A map is not safe for concurrent writers; the runtime stops the
   program when it catches that.
