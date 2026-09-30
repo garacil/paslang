@@ -509,6 +509,8 @@ type
     procedure CheckForInMap(MT: LongInt; const KName, VName: string);
     procedure CheckTryGetVar(M, V: PExpr);
     function InternArray(Elem: LongInt; Lo, Hi: Int64): LongInt;
+    function InternArrayIdx(Elem: LongInt; Lo, Hi: Int64; Idx: LongInt): LongInt;
+    function OrdBounds(Id: LongInt; out Lo, Hi: Int64): Boolean;
     function InternSubrange(Lo, Hi: Int64): LongInt;
     function InternSubOf(Host: LongInt; Lo, Hi: Int64): LongInt;
     function InternSet(Elem: LongInt): LongInt;
@@ -1646,38 +1648,17 @@ end;
 function TParser.TypeBound(Id: LongInt; Hi: Boolean): PExpr;
 var
   td: TTypeDef;
-  v: Int64;
+  v, blo, bhi: Int64;
   t: LongInt;
 begin
   td := TypeOf(Id);
   t := Id;
-  if IsIntId(Id) then
+  if OrdBounds(Id, blo, bhi) then
   begin
     if Hi then
-      v := IntHi(Id)
+      v := bhi
     else
-      v := IntLo(Id);
-  end
-  else if Id = TyChar then
-  begin
-    if Hi then
-      v := 255
-    else
-      v := 0;
-  end
-  else if Id = TyBoolean then
-  begin
-    if Hi then
-      v := 1
-    else
-      v := 0;
-  end
-  else if (td.Kind = tykEnum) or (td.Kind = tykSubrange) then
-  begin
-    if Hi then
-      v := td.Hi
-    else
-      v := td.Lo;
+      v := blo;
   end
   else if (td.Kind = tykArray) and (td.Hi >= td.Lo) then
   begin
@@ -1685,7 +1666,11 @@ begin
       v := td.Hi
     else
       v := td.Lo;
-    t := TyInteger;
+    { of the index's type (P161): High of an array[TColor] is a TColor }
+    if (td.Elem2 > 0) and (td.Elem2 <> ConstArrMark) then
+      t := td.Elem2
+    else
+      t := TyInteger;
   end
   else
   begin
@@ -3034,13 +3019,22 @@ begin
 end;
 
 function TParser.InternArray(Elem: LongInt; Lo, Hi: Int64): LongInt;
+begin
+  Result := InternArrayIdx(Elem, Lo, Hi, 0);
+end;
+
+{ A static array of Elem from Lo to Hi whose index is of type Idx, 0 for
+  the integers (P161: array[Boolean], array[TColor], array[Char] keep
+  their index type, which Low and High are of, in Elem2); Hi below Lo
+  is a dynamic array. }
+function TParser.InternArrayIdx(Elem: LongInt; Lo, Hi: Int64; Idx: LongInt): LongInt;
 var
   i, n: SizeInt;
   count: Int64;
 begin
   for i := 0 to High(FTypes) do
     if (FTypes[i].Kind = tykArray) and (FTypes[i].Elem = Elem) and
-      (FTypes[i].Lo = Lo) and (FTypes[i].Hi = Hi) and (FTypes[i].Elem2 <> ConstArrMark) then
+      (FTypes[i].Lo = Lo) and (FTypes[i].Hi = Hi) and (FTypes[i].Elem2 = Idx) then
     begin
       Result := LongInt(i);
       Exit;
@@ -3064,10 +3058,48 @@ begin
   FTypes[n] := Default(TTypeDef);
   FTypes[n].Kind := tykArray;
   FTypes[n].Elem := Elem;
+  FTypes[n].Elem2 := Idx;
   FTypes[n].Lo := Lo;
   FTypes[n].Hi := Hi;
   FTypes[n].Size := LongInt(count) * ValSize(Elem);
   Result := LongInt(n);
+end;
+
+{ The values of an ordinal type Id, for an array's index and High and
+  Low (P161): an integer type's, Char's, Boolean's, an enumeration's or
+  a subrange's. }
+function TParser.OrdBounds(Id: LongInt; out Lo, Hi: Int64): Boolean;
+var
+  td: TTypeDef;
+begin
+  Result := True;
+  td := TypeOf(Id);
+  if IsIntId(Id) then
+  begin
+    Lo := IntLo(Id);
+    Hi := IntHi(Id);
+  end
+  else if Id = TyChar then
+  begin
+    Lo := 0;
+    Hi := 255;
+  end
+  else if Id = TyBoolean then
+  begin
+    Lo := 0;
+    Hi := 1;
+  end
+  else if (td.Kind = tykEnum) or (td.Kind = tykSubrange) then
+  begin
+    Lo := td.Lo;
+    Hi := td.Hi;
+  end
+  else
+  begin
+    Lo := 0;
+    Hi := -1;
+    Result := False;
+  end;
 end;
 
 function TParser.InternSubrange(Lo, Hi: Int64): LongInt;
@@ -6848,6 +6880,9 @@ var
   pn, pidx: SizeInt;
   rtd: TTypeDef;
   roff: LongInt;
+  ilos, ihis: array of Int64;
+  iidx: array of LongInt;
+  iats: array of string;
 begin
   k := FTok.Kind;
   t := TyInteger;
@@ -7041,14 +7076,53 @@ begin
     FTok := FLex.Next;
     if FTok.Kind = tkLBrack then
     begin
-      FTok := FLex.Next;
-      lo := ParseIntConst;
-      Eat(tkDotDot);
-      hi := ParseIntConst;
+      { each index a range or an ordinal type, array[Boolean],
+        array[TColor], array[Char] (P161); several are an array of
+        arrays, the first the outermost: array[1..3, 1..4] of T is
+        array[1..3] of array[1..4] of T }
+      pn := 0;
+      ilos := nil;
+      ihis := nil;
+      iidx := nil;
+      iats := nil;
+      repeat
+        FTok := FLex.Next;
+        SetLength(iats, pn + 1);
+        iats[pn] := HerePos;
+        if (FTok.Kind = tkInteger) or (FTok.Kind = tkBoolean) or TypeAhead(id) then
+          id := Self.ParseType
+        else
+          id := ParseSubrange;
+        if not OrdBounds(id, lo, hi) then
+          Die('an array''s index is an ordinal type or a range, not ' + TypName(id) + HerePos);
+        SetLength(ilos, pn + 1);
+        SetLength(ihis, pn + 1);
+        SetLength(iidx, pn + 1);
+        ilos[pn] := lo;
+        ihis[pn] := hi;
+        { a range of the integers keeps Integer as its index's type }
+        if (id = TyInteger) or ((TypeOf(id).Kind = tykSubrange) and
+          (TypeOf(id).Elem = TyInteger)) then
+          iidx[pn] := 0
+        else
+          iidx[pn] := id;
+        pn := pn + 1;
+      until FTok.Kind <> tkComma;
       Eat(tkRBrack);
       Eat(tkOf);
       elem := Self.ParseType;
-      t := InternArray(elem, lo, hi);
+      for pidx := pn - 1 downto 0 do
+      begin
+        { hi - lo + 1 elements in 2^31 - 1 bytes at most: an index of the
+          integers, or of a width that fills memory, is refused, where
+          its size wrapped in silence }
+        if (ihis[pidx] - ilos[pidx] < 0) or (ihis[pidx] - ilos[pidx] >= 2147483647) or
+          ((ihis[pidx] - ilos[pidx] + 1) * Int64(ValSize(elem)) > 2147483647) then
+          Die('an array from ' + IntToStr(ilos[pidx]) + ' to ' + IntToStr(ihis[pidx]) + ' of ' +
+            TypName(elem) + ' does not fit in 2147483647 bytes' + iats[pidx]);
+        elem := InternArrayIdx(elem, ilos[pidx], ihis[pidx], iidx[pidx]);
+      end;
+      t := elem;
     end
     else
     begin
@@ -9401,7 +9475,11 @@ begin
         end;
         Continue;
       end;
-      Eat(tkRBrack);
+      { m[i, j] is m[i][j] (P161): the comma opens the next index }
+      if FTok.Kind = tkComma then
+        FTok.Kind := tkLBrack
+      else
+        Eat(tkRBrack);
       st := TypeOf(E^.Typ);
       if (st.Kind <> tykMap) and (st.Kind <> tykTree) then
         NoReal(ix, 'Integer');

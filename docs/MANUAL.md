@@ -257,6 +257,18 @@ beyond 255 are compile errors. An array bound, a subrange, a `case`
 label and a default value take the same expressions:
 `array[0..N - 1] of Integer`.
 
+An array's index is a range or an ordinal type, as in Free Pascal:
+`array[Boolean] of TDayTable`, `array[TColor] of string`,
+`array[Char] of Byte`, `array['a'..'z'] of Integer`; `Low` and `High`
+of such an array are of that type, so `for c := Low(a) to High(a)` runs
+over the colours. Several indexes declare an array of arrays, the first
+the outermost, and `m[i, j]` is `m[i][j]`: `const Grid: array[1..2,
+1..2] of Integer = ((1, 2), (3, 4))` has `Grid[2, 1] = 3` (1.1.31, P161;
+a type name as an index said unknown identifier, a comma a syntax
+error). An array fits in 2^31 - 1 bytes: `array[Integer] of Byte` and
+a range that runs backwards are compile errors (a backward range made a
+dynamic array in silence).
+
 A typed constant, `Limit: Integer = 10`, is a variable that starts with
 its value, as in every Pascal: the program may change it. An array
 takes `(a, b, c)`, an `array of Char` a string of its length, a record
@@ -342,7 +354,7 @@ The sizes are fixed and the same on both targets:
 | `Quad` | 16 | IEEE binary128 in software, the same bits on both machines; everything widens to it, and it becomes a Double only through `Double(x)` (§14) |
 | `^T`, a class, a map, a chan | 8 | one machine word; `nil` is zero |
 | `array of T` | 24 | a slice: pointer, length, capacity |
-| `array[a..b] of T` | (b-a+1) × SizeOf(T) | fixed, no header |
+| `array[a..b] of T`, `array[I] of T` | (b-a+1) × SizeOf(T) | fixed, no header; the index a range or an ordinal type `I` (`Boolean`, `Char`, `Byte`, an enumeration, a subrange), and `array[1..3, 1..4] of T` is `array[1..3] of array[1..4] of T` |
 | `set of T` | 8 or 32 | a bitset: one word for elements 0..63, 32 bytes up to 255 |
 | `procedure of object`, `function ... of object` | 16 | code pointer and Self |
 | a routine value, `procedure(...)`, `function(...): T` | 16 | code pointer and environment (§5) |
