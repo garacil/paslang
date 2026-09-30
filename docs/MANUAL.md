@@ -3062,7 +3062,8 @@ them: a constructor costs what its own body costs. A method declared
 again with the signature of an inherited virtual one overrides it, with
 `override` written or not, so `destructor Destroy;` in any class is the
 one `Free` runs. The memory of an object goes back to the collector
-when nothing points to it, whatever the destructor does.
+when nothing points to it, whatever the destructor does. An object of
+any class can be raised (§9).
 
 ### Published properties
 
@@ -3294,24 +3295,34 @@ finally on exit
 `raise` unwinds the current routine to the nearest `except` part, running
 every `finally` on the way. A `finally` also runs when its block is left
 with `exit`, `break` or `continue`. An exception with no handler ends the
-routine that raised it; in the main routine that ends the program. There
-are no exception objects: `raise` carries no value. The idiom is to
-record the reason in a field or a variable before raising and read it
-in the handler.
+routine that raised it; in the main routine that ends the program.
+`raise` alone, as here, raises no object; `raise X` raises an object of
+a class, which the handler reads (below).
 
 `examples/cleanup.paslang` releases what each frame holds as a raise
 goes up through three frames:
 
 ```pascal
 { finally across frames: each frame releases what it holds, innermost
-  first, as a raise goes up to its handler; a raise in an except part
-  goes on to the next handler up; a store the raise cut short is not made. }
+  first, as a raise goes up to its handler; raise; in an except part
+  hands the object on to the next handler up; a store the raise cut
+  short is not made. }
 program cleanup;
+
+type
+  ELoad = class                     { what a failed load raises }
+    Reason: string;
+    constructor Create(const AReason: string);
+  end;
 
 var
   open: Integer;                    { resources held right now }
-  reason: string;                   { why the last raise happened }
   n: Integer;
+
+constructor ELoad.Create(const AReason: string);
+begin
+  Reason := AReason;
+end;
 
 procedure Track(const What: string; Delta: Integer);
 begin
@@ -3324,10 +3335,7 @@ begin
   Track('open parser', 1);
   try
     if S = '' then
-    begin
-      reason := 'empty input';
-      raise;                        { up through both finally parts }
-    end;
+      raise ELoad.Create('empty input');   { up through both finally parts }
     Result := Length(S);
   finally
     Track('close parser', -1);      { first }
@@ -3350,14 +3358,15 @@ begin
     WriteLn('loaded ', n);          { 30 }
     n := Load('');                  { raises two frames down: n is not stored }
   except
-    WriteLn('failed: ', reason, ', n still ', n);   { third: the handler }
+    on E: ELoad do
+      WriteLn('failed: ', E.Reason, ', n still ', n);   { third: the handler }
   end;
   try
     try
       Load('');
     except
       WriteLn('inner handler');
-      raise;                        { again: to the next handler up }
+      raise;                        { the same object: to the next handler up }
     end;
   except
     WriteLn('outer handler');
@@ -3394,7 +3403,8 @@ in `Result` and the main routine `n := Load('')`, and neither store was
 made, so `n` keeps its 30; a function that raises gives no value back.
 A `raise` in an `except` part is a raise like any other: it leaves that
 handler and goes on to the next `except` up, running the `finally`
-parts between. A `raise` that finds no handler in any frame of its
+parts between; `raise;` there hands on the object the handler took. A
+`raise` that finds no handler in any frame of its
 routine (a `pas` routine, or the main one) still runs the `finally`
 parts of the frames it leaves, then ends the routine where it is
 (`rt_raise` goes to `rt_goexit`), so a `wg.Done` in plain code after
@@ -3402,12 +3412,141 @@ the call is never reached, and one in a `finally` is. In the main
 routine an uncaught `raise` ends the program: `paslang: uncaught raise
 in the main routine` on the error output and exit status 1 (1.0.147;
 before, the scheduler was left with nothing to run and said
-`deadlock`). `testdata/fatal/mainraise` shows both.
+`deadlock`). `testdata/fatal/mainraise` shows both. When the raise
+carried an object, the line goes on with what the object's `ToString`
+says, its class's name unless the class says more:
+`paslang: uncaught raise in the main routine: EOops`
+(`testdata/fatal/raiseobj`, 1.1.3).
+
+### Exception objects
+
+`raise X` raises the object `X`, of any class (1.1.3). An `except`
+part with `on` handlers runs the first one whose class the object is
+or descends from:
+
+`examples/excobjects.paslang`:
+
+```pascal
+{ Exception objects: raise carries an object of any class; an except
+  part runs the first on handler whose class the object is or descends
+  from, with a name for the object in that handler alone; raise; in a
+  handler hands the same object on to the next handler out. }
+program excobjects;
+
+type
+  EParse = class                        { any class can be raised }
+    Line: Integer;
+    Text: string;
+    constructor Create(ALine: Integer; const AText: string);
+  end;
+
+  EEmpty = class(EParse)                { a kind of EParse }
+  end;
+
+var
+  total: Integer;
+
+constructor EParse.Create(ALine: Integer; const AText: string);
+begin
+  Line := ALine;
+  Text := AText;
+end;
+
+function Digits(const S: string; Line: Integer): Integer;
+var
+  i: Integer;
+begin
+  if S = '' then
+    raise EEmpty.Create(Line, 'empty line');
+  Result := 0;
+  for i := 1 to Length(S) do
+  begin
+    if (S[i] < '0') or (S[i] > '9') then
+      raise EParse.Create(Line, 'not a digit: ' + S[i]);
+    Result := Result * 10 + Ord(S[i]) - Ord('0');
+  end;
+end;
+
+procedure Add(const S: string; Line: Integer);
+begin
+  try
+    total := total + Digits(S, Line);   { no store when Digits raises }
+  except
+    on E: EEmpty do                     { the first handler that fits runs }
+      WriteLn('line ', E.Line, ' skipped: ', E.Text);
+    on E: EParse do
+    begin
+      WriteLn('line ', E.Line, ' refused: ', E.Text);
+      if E.Line > 4 then
+        raise;                          { the same object, to the handler out }
+    end;
+  end;
+end;
+
+begin
+  total := 0;
+  try
+    Add('12', 1);
+    Add('', 2);
+    Add('7x', 3);
+    Add('30', 4);
+    Add('9z', 5);
+    Add('100', 6);                      { not reached }
+  except
+    on E: EParse do
+      WriteLn('stopped at line ', E.Line, ' by ', E.ClassName);
+  else
+    WriteLn('not an EParse');           { any other object, or none }
+  end;
+  WriteLn('total ', total);
+end.
+```
+
+prints
+
+```
+line 2 skipped: empty line
+line 3 refused: not a digit: x
+line 5 refused: not a digit: z
+stopped at line 5 by EParse
+total 42
+```
+
+- `on E: T do statement` takes an object of class `T` or of a class
+  that descends from it; `E` is a variable of type `T` that holds the
+  object, seen by that handler's statement alone (it hides a variable
+  of the routine with that name). `on T do statement` takes it without
+  a name. Handlers are separated by `;` and tried in order, so a
+  descendant's handler goes before its parent's.
+- `else` and statements after the last handler run when none takes the
+  object, and when the raise carried none. With no `else`, the raise
+  goes on to the next `except` out, running the `finally` parts
+  between: the handlers of an `except` part choose what they take.
+- An `except` part with no `on` takes every raise, object or not.
+- `raise;` anywhere inside an `except` part raises the object that
+  part took again (outside one, it raises no object). `raise E` raises
+  the object itself again too: the object is not freed when a handler
+  ends, and a handler may keep it; the collector takes it back when
+  nothing points to it.
+- `raise X at A` says where the object was raised, `A` a pointer; with
+  no `at`, it is the address the raising call returns to.
+- The object belongs to the routine that raised it: a routine started
+  with `pas` raises and handles its own, whatever the others do. It is
+  held in the routine's record while a handler runs; when an `except`
+  part ends, by its end, `exit`, `break` or `continue`, the routine
+  holds again the object it held before the `try`, so `raise;` in an
+  outer handler hands on that handler's object, and a `finally` part
+  that handled a raise of its own lets the first one go on.
+
+What it costs: `raise` is two stores and a jump to the handler; a
+handler's test is `is`, a walk up the object's parents to the class
+named; nothing is copied and nothing is allocated but the object.
 
 ### Classes and exceptions together
 
-`examples/bank.paslang` puts both to work: methods that raise, a
-descendant that adds a rule before deferring to the inherited method,
+`examples/bank.paslang` puts both to work: methods that raise an
+exception object, a descendant that adds a rule before deferring to
+the inherited method,
 a class that catches and counts, and a routine whose uncaught raise
 ends only itself. In the main routine an uncaught `raise` ends the
 program instead, with `paslang: uncaught raise in the main routine` on
@@ -3417,15 +3556,14 @@ the error output and exit status 1 (1.0.147):
 { Classes and exceptions: a small bank.
 
   What the program does, step by step:
-  1. Declares TAccount: an owner, a balance, and LastError, the reason
-     of the last refused operation. raise carries no value in paslang,
-     so a class records why it raised in a field before raising; the
-     handler reads it.
-  2. Declares TSavings, a TAccount that must keep a minimum balance. It
-     overrides Withdraw and calls the inherited one when the rule holds.
+  1. Declares EBank, the object a refused operation raises: its Reason
+     says why, and the handler that takes it reads it.
+  2. Declares TAccount, an owner and a balance, and TSavings, a
+     TAccount that must keep a minimum balance. TSavings overrides
+     Withdraw and calls the inherited one when the rule holds.
   3. Declares TAudit, which applies operations to any account through
      the parent type and counts them: every attempt in a try/finally,
-     every failure in a try/except.
+     every failure in a try/except, whose handler keeps the reason.
   4. Creates one account of each class through their constructors,
      applies six operations (deposits, withdrawals, one bad amount, one
      that breaks the minimum, one with no funds) and prints, for each,
@@ -3438,30 +3576,36 @@ the error output and exit status 1 (1.0.147):
   7. Prints the audit totals and the final balances.
 
   Routines:
+  - EBank.Create(AReason): the reason.
   - TAccount.Create(AOwner, Start): sets the owner and the opening
     balance.
-  - TAccount.Deposit(Amount): adds Amount; an amount below 1 sets
-    LastError to bad amount and raises.
+  - TAccount.Deposit(Amount): adds Amount; an amount below 1 raises an
+    EBank that says bad amount.
   - TAccount.Withdraw(Amount): virtual; takes Amount; more than the
-    balance sets LastError to insufficient funds and raises.
+    balance raises an EBank that says insufficient funds.
   - TAccount.Balance: a property that reads the private balance.
   - TSavings.Create(AOwner, Start, AMinimum): the parent constructor,
     then the minimum.
-  - TSavings.Withdraw(Amount): override; sets LastError to below
-    minimum and raises when the balance would drop under the minimum,
+  - TSavings.Withdraw(Amount): override; raises an EBank that says
+    below minimum when the balance would drop under the minimum,
     otherwise defers to the inherited Withdraw.
   - TAudit.Apply(Acc, Op, Amount): runs Deposit or Withdraw by Op, d
-    or w, inside try/except; returns True when it went through. The
-    finally part counts the attempt whether it raised or not.
+    or w, inside try/except; returns True when it went through, else
+    keeps the EBank's reason in LastReason. The finally part counts
+    the attempt whether it raised or not.
   - Risky: raises with no except part; its finally calls wg.Done.
   - The main routine: steps 4 to 7. }
 program bank;
 
 type
+  EBank = class                      { what a refused operation raises }
+    Reason: string;
+    constructor Create(const AReason: string);
+  end;
+
   TAccount = class
     FOwner: string;
     FBalance: Integer;
-    LastError: string;               { why the last operation raised }
     constructor Create(const AOwner: string; Start: Integer);
     procedure Deposit(Amount: Integer);
     procedure Withdraw(Amount: Integer); virtual;
@@ -3477,8 +3621,14 @@ type
   TAudit = class
     Attempts: Integer;
     Failures: Integer;
+    LastReason: string;              { why the last refused operation was }
     function Apply(Acc: TAccount; const Op: string; Amount: Integer): Boolean;
   end;
+
+constructor EBank.Create(const AReason: string);
+begin
+  Reason := AReason;
+end;
 
 constructor TAccount.Create(const AOwner: string; Start: Integer);
 begin
@@ -3489,20 +3639,14 @@ end;
 procedure TAccount.Deposit(Amount: Integer);
 begin
   if Amount < 1 then
-  begin
-    LastError := 'bad amount';
-    raise;                           { unwinds to the nearest except }
-  end;
+    raise EBank.Create('bad amount'); { unwinds to the nearest except }
   FBalance := FBalance + Amount;
 end;
 
 procedure TAccount.Withdraw(Amount: Integer);
 begin
   if Amount > FBalance then
-  begin
-    LastError := 'insufficient funds';
-    raise;
-  end;
+    raise EBank.Create('insufficient funds');
   FBalance := FBalance - Amount;
 end;
 
@@ -3515,10 +3659,7 @@ end;
 procedure TSavings.Withdraw(Amount: Integer);
 begin
   if FBalance - Amount < FMinimum then
-  begin
-    LastError := 'below minimum';
-    raise;
-  end;
+    raise EBank.Create('below minimum');
   inherited Withdraw(Amount);        { the parent's checks and the update }
 end;
 
@@ -3533,7 +3674,11 @@ begin
         Acc.Withdraw(Amount);        { the override runs for a TSavings }
       Result := True;
     except
-      Failures := Failures + 1;      { the raise from inside the method lands here }
+      on E: EBank do                 { the raise from inside the method lands here }
+      begin
+        Failures := Failures + 1;
+        LastReason := E.Reason;
+      end;
     end;
   finally
     Attempts := Attempts + 1;        { counted either way }
@@ -3546,7 +3691,7 @@ var
 procedure Risky;
 begin
   try
-    raise;                           { no except part in this routine }
+    raise EBank.Create('risky');     { no except part in this routine }
   finally
     wg.Done;                         { still runs on the way out }
   end;
@@ -3581,7 +3726,7 @@ begin
     if audit.Apply(acc, ops[i], amounts[i]) then
       WriteLn(acc.FOwner, ' ', ops[i], ' ', amounts[i], ' ok, balance ', acc.Balance)
     else
-      WriteLn(acc.FOwner, ' ', ops[i], ' ', amounts[i], ' refused: ', acc.LastError);
+      WriteLn(acc.FOwner, ' ', ops[i], ' ', amounts[i], ' refused: ', audit.LastReason);
   end;
   if saving is TSavings then         { is asks the class at run time }
     WriteLn('minimum of ', saving.FOwner, ' is ', (saving as TSavings).FMinimum);
@@ -5353,7 +5498,8 @@ compiler by `make install`. Every program links them without `uses`:
 
 - `pasobject` declares `TObject`, the root of every class, and the
   routines the class words call: the name, the parent and the size a
-  class's method table carries (§7).
+  class's method table carries (§7); `PasUncaught` writes the line of
+  an exception object nobody handled (§9).
 - `pasroutines` implements `mutex`, `rwmutex`, `waitgroup`, `cond` and
   `once`, the `lock` and `once` statements, `Goid`, `NumGoroutine`,
   `Yield` and `ReadLn`. It is Pascal over the park and wake words of the
@@ -9479,6 +9625,11 @@ the commands on standard input, under `--debug-mode` and under
   there is no packed layout.
 - `private`, `strict private`, `protected` and `strict protected` are
   held to (1.0.137); `Free` calls `Destroy` when there is one (§7).
+- An exception object is not freed when its handler ends, as Free
+  Pascal frees it: the collector takes it back when nothing points to
+  it, so a handler may keep it or raise it again with `raise E`.
+  `raise;` outside an `except` part raises no object, where Free
+  Pascal refuses it (§9).
 - A value parameter is the routine's own copy: a change the routine
   makes to the caller's variable some other way (a global passed in,
   through a pointer, through a call) never shows in it (1.0.136; a
@@ -9597,7 +9748,7 @@ its place:
   … `PasOnceDone` routines, pasfmt's `PasFmtReal` … `PasFmtQuad`,
   pashash's `PasHex PasMd5 PasSha1Cpu` … `PasMerkleCheckBase` and
   pastree's `PasTreeNew` … `PasStoreAbandon`, and pasobject's `TObject`
-  with `PasClassName` … `PasObjFree`. A core unit declares its
+  with `PasClassName` … `PasUncaught`. A core unit declares its
   own exports; nothing else may, and a unit's implementation types are
   its own (an importer cannot name them, and they are not reserved).
 

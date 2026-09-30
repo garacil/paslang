@@ -368,10 +368,20 @@ breaks C-shaped layout.
   and then the value. `testdata/props.paslang`, `testdata/pindex.paslang`.
 - `^T`: one machine word; the pointers are the next section.
 - A class value is one pointer to an object in the collected heap,
-  whose first word points to the class's method table (VMT); the word
-  before the method table points to the table of its published
-  properties (the RTTI that `PropKind` and its kin read, MANUAL §7).
-  Inside a method `Self` is that pointer. A plain `record` has no VMT.
+  whose first word points to the class's method table (VMT). A class
+  with no parent descends from `TObject` (the core unit `pasobject`,
+  1.1.2), whose virtual methods take the first six slots. The words
+  before the method table are, from the nearest: the table of its
+  published properties (the RTTI that `PropKind` and its kin read,
+  MANUAL §7), the parent's method table (0 for `TObject`), the size of
+  an instance, and the length and the address of the class's name,
+  which lies as a string literal does. Inside a method `Self` is that
+  pointer. A plain `record` has no VMT.
+- An exception object is any object: `raise X` puts it in the raising
+  routine's record, at G+272, and where it was raised at G+280 (1.1.3);
+  a handler's `on E: T` is `is`, a walk up the parents' method tables.
+  The collector reads the routine record whole, so the object lives
+  while a handler has it.
 - `I = interface` is a 16-byte value: the object pointer and a method
   table. `TBox = class(I)` or `class(TParent, I)` lists what the class
   implements. `G := Obj` is checked from the static class, including

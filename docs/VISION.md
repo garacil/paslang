@@ -143,7 +143,8 @@ If a builtin cannot honour G/M/P, it does not ship.
 - Wait = event: channel, timer, epoll. Stdlib `read`/`connect` go
   through netpoll so an M in a real syscall **drops its P**.
 
-Panic / `try`/`except` state lives **on the G**, not in a pthread threadvar.
+Panic / `try`/`except` state lives **on the G**, not in a pthread threadvar:
+the try records (G+224) and the object a raise carries (G+272, 1.1.3).
 `threadvar` is not a word of paslang (a syntax error): a routine may run
 on any M and move between them, so data per OS thread would mean
 nothing to it. Goroutine-local data is a different primitive if we add

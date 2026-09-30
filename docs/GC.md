@@ -172,10 +172,12 @@ conservatively, word by word, and does not move what it finds that way.
    a section `pasgcroots`, which the linker gathers
    (`__start_pasgcroots`, `__stop_pasgcroots`). Every routine record: its
    argument and saved-register words, through a list of all records
-   (Go's `allgs`). Every stack: see D1. The runtime keeps no heap pointer
-   of its own today (`raise` carries no object; channel buffers are heap
-   objects; waiting entries live on the waiting routine's stack); a
-   runtime word that ever holds one goes on a short list of roots.
+   (Go's `allgs`). Every stack: see D1. The runtime's one heap pointer
+   of its own is in the routine record, which is read whole: the object
+   a raise carries, at G+272 (1.1.3). Channel buffers are heap objects,
+   and waiting entries live on the waiting routine's stack; a runtime
+   word that ever holds one outside a routine record goes on a short
+   list of roots.
 5. **Stopping the world.** A word of the heap state, `HGcWaiting`;
    every running routine's guard poisoned as sysmon does; an M stops in
    `rt_gcstopm`, from `rt_mloop` (where a yield and a preemption at

@@ -80,6 +80,7 @@ type
     FAnonBody: Boolean;     { the next routine body ends without a semicolon }
     FAnonN: LongInt;
     FCellN: LongInt;
+    FExcDepth: LongInt;    { except parts being read around the statement (P122): raise; raises their object again }
     FSymChain: TStrArray;  { the routines being parsed, outermost first }
     FBoxing: TStrArray;    { the routines that hold a closure inside }
     FSafeNames: TStrArray;  { routines a header declared safe, for their bodies }
@@ -232,6 +233,9 @@ type
     function MethIndexNamed(Typ: LongInt; const Name: string): LongInt;
     function OuterDtorCall(E: PExpr): Boolean;
     function DtorStmt(E: PExpr; ALine: LongInt): PStmt;
+    function ParseStmtsTilEnd: PStmt;
+    function ParseExcept(Tr: PStmt; ALine: LongInt): PStmt;
+    function ParseRaise(ALine: LongInt): PStmt;
     procedure CheckOutVar(V: PExpr; Typ: LongInt; const What: string);
     procedure CheckLeaves(E: PExpr; const What: string);
     function CoreMethod(Base: PExpr; const MName: string): PExpr;
@@ -12013,24 +12017,14 @@ begin
         begin
           st^.Name := 'finally';
           FTok := FLex.Next;
+          st^.ElseSt := ParseStmtsTilEnd;
+          Eat(tkEnd);
         end
         else
-          Eat(tkExcept);
-        st^.ElseSt := NewStmt(skBlock);
-        st^.ElseSt^.Stmts := nil;
-        while (FTok.Kind <> tkEnd) and (FTok.Kind <> tkEof) do
         begin
-          while FTok.Kind = tkSemi do
-            FTok := FLex.Next;
-          if FTok.Kind = tkEnd then
-            Break;
-          n := Length(st^.ElseSt^.Stmts);
-          SetLength(st^.ElseSt^.Stmts, n + 1);
-          st^.ElseSt^.Stmts[n] := Self.ParseStmt;
-          if FTok.Kind = tkSemi then
-            FTok := FLex.Next;
+          Eat(tkExcept);
+          st := ParseExcept(st, lno);
         end;
-        Eat(tkEnd);
       end;
     tkBreak:
       begin
@@ -12043,10 +12037,7 @@ begin
         FTok := FLex.Next;
       end;
     tkRaise:
-      begin
-        st := NewStmt(skRaise);
-        FTok := FLex.Next;
-      end;
+      st := ParseRaise(lno);
     tkIf:
       begin
         st := NewStmt(skIf);
@@ -14504,7 +14495,8 @@ end;
   the same ones through its link, after the frame too. A var parameter
   points at its caller's variable, which a closure may outlive: it is
   refused, as Delphi refuses it. Hidden names (with a dot) are the
-  compiler's own. }
+  compiler's own, but for the name an on handler gives its object
+  (P122), which is the program's. }
 procedure TParser.ComputeShared(var Pr: TProc; K0: SizeInt);
 var
   names: TStrArray;
@@ -14536,7 +14528,7 @@ begin
   Pr.Shared := nil;
   for i := 0 to High(names) do
   begin
-    if HasDot(names[i]) then
+    if HasDot(names[i]) and (OnVarUser(names[i]) = '') then
       Continue;
     used := False;
     for k := K0 to High(FProg.Procs) do
@@ -14919,6 +14911,222 @@ begin
   call^.E := NewVar(hid, E^.L^.Typ);
   call^.E2 := NewInt(E^.Off);
   AppendStmt(Result, call);
+end;
+
+{ The statements up to the end of a finally or an except part, the end
+  not taken. }
+function TParser.ParseStmtsTilEnd: PStmt;
+var
+  n: SizeInt;
+begin
+  Result := NewStmt(skBlock);
+  Result^.Stmts := nil;
+  while (FTok.Kind <> tkEnd) and (FTok.Kind <> tkEof) do
+  begin
+    while FTok.Kind = tkSemi do
+      FTok := FLex.Next;
+    if FTok.Kind = tkEnd then
+      Break;
+    n := Length(Result^.Stmts);
+    SetLength(Result^.Stmts, n + 1);
+    Result^.Stmts[n] := Self.ParseStmt;
+    if FTok.Kind = tkSemi then
+      FTok := FLex.Next;
+  end;
+end;
+
+{ raise (P122): raise X raises the object X, of a class; raise X at A
+  says A, a pointer, is where (else the return address of the call that
+  raises); raise; in an except part raises its object again, and
+  anywhere else raises no object, as raise did before objects. }
+function TParser.ParseRaise(ALine: LongInt): PStmt;
+var
+  k: TTypeKind;
+  at: string;
+begin
+  Result := NewStmt(skRaise);
+  Result^.Line := ALine;
+  FTok := FLex.Next;
+  if (FTok.Kind = tkSemi) or (FTok.Kind = tkEnd) or (FTok.Kind = tkElse) or
+    (FTok.Kind = tkUntil) or (FTok.Kind = tkExcept) or (FTok.Kind = tkFinally) or
+    (FTok.Kind = tkEof) then
+  begin
+    if FExcDepth > 0 then
+      Result^.Name := 'reraise';
+    Exit;
+  end;
+  at := HerePos;
+  Result^.E := ParseExpr;
+  CheckTyped(Result^.E);
+  if (Result^.E^.Kind <> ekNil) and (TypeOf(Result^.E^.Typ).Kind <> tykClass) then
+    Die('raise takes an object of a class, not ' + TypName(Result^.E^.Typ) + at);
+  if (FTok.Kind = tkIdent) and SameId(FTok.Lexeme, 'at') then
+  begin
+    FTok := FLex.Next;
+    at := HerePos;
+    Result^.E2 := ParseExpr;
+    CheckTyped(Result^.E2);
+    k := TypeOf(Result^.E2^.Typ).Kind;
+    if (Result^.E2^.Kind <> ekNil) and (k <> tykPointer) then
+      Die('raise ... at takes a pointer, not ' + TypName(Result^.E2^.Typ) + at);
+  end;
+end;
+
+{ The except part of Tr (P122), read after except, and the statement it
+  all becomes. The object raised is in the routine's slot, G+272: the
+  statement keeps the slot's value from before the try in a hidden
+  variable and puts it back when the except part ends, so raise; in an
+  outer except part raises that one's object again, and so does the
+  runtime when a finally part took a raise and handled it.
+
+  A plain except part takes every raise. With on handlers the object is
+  read once and the first handler whose class it is or descends from
+  runs (is, so no object matches none), with its name for the object if
+  one is given, a variable of that class that only the handler sees
+  (it hides a variable of the routine by that name, as the handler's
+  own scope does in Object Pascal); else the else part runs, or, with
+  none, the object goes on to the handler out (raise;). The except part
+  is a try with no record of its own ('epilogue'): its ending runs on
+  an exit, a break or a continue out of it as a finally part would,
+  and a raise from it passes it by. }
+function TParser.ParseExcept(Tr: PStmt; ALine: LongInt): PStmt;
+var
+  outer, cur, hv, nm, tat: string;
+  id: LongInt;
+  epi, asg, ifst, last, hs, body, rs: PStmt;
+  args: TExprArray;
+  d: TVarDecl;
+  n, i: SizeInt;
+  lno: LongInt;
+begin
+  outer := HiddenNamed('exc.', TyPointer);
+  Result := NewStmt(skBlock);
+  Result^.Line := ALine;
+  asg := NewStmt(skAssign);
+  asg^.Line := ALine;
+  asg^.Dest := NewVar(outer, TyPointer);
+  asg^.E := NewCall('rt_excget', nil, TyPointer);
+  AppendStmt(Result, asg);
+  AppendStmt(Result, Tr);
+  Tr^.ElseSt := NewStmt(skBlock);
+  Tr^.ElseSt^.Line := ALine;
+  epi := NewStmt(skTry);
+  epi^.Name := 'epilogue';
+  epi^.Line := ALine;
+  epi^.ElseSt := NewStmt(skCall);
+  epi^.ElseSt^.Line := ALine;
+  epi^.ElseSt^.Name := 'rt_excset';
+  args := nil;
+  SetLength(args, 1);
+  args[0] := NewVar(outer, TyPointer);
+  epi^.ElseSt^.Args := args;
+  Inc(FExcDepth);
+  if (FTok.Kind = tkIdent) and SameId(FTok.Lexeme, 'on') then
+  begin
+    cur := HiddenNamed('exc.', TyPointer);
+    asg := NewStmt(skAssign);
+    asg^.Line := ALine;
+    asg^.Dest := NewVar(cur, TyPointer);
+    asg^.E := NewCall('rt_excget', nil, TyPointer);
+    AppendStmt(Tr^.ElseSt, asg);
+    last := nil;
+    while (FTok.Kind = tkIdent) and SameId(FTok.Lexeme, 'on') do
+    begin
+      lno := FTok.Line;
+      FTok := FLex.Next;
+      if not IsName then
+        Die('on takes a class: on E: T do, or on T do' + HerePos);
+      tat := HerePos;
+      nm := FTok.Lexeme;
+      FTok := FLex.Next;
+      if FTok.Kind = tkColon then
+      begin
+        FTok := FLex.Next;
+        if not IsName then
+          Die('on ' + nm + ': takes a class' + HerePos);
+        tat := HerePos;
+        if not NamedType(FTok.Lexeme, id) then
+          Die('unknown type ' + FTok.Lexeme + tat);
+        FTok := FLex.Next;
+      end
+      else
+      begin
+        if not NamedType(nm, id) then
+          Die('unknown type ' + nm + tat);
+        nm := '';
+      end;
+      if TypeOf(id).Kind <> tykClass then
+        Die('on takes a class, not ' + TypName(id) + tat);
+      Eat(tkDo);
+      hv := '';
+      if nm <> '' then
+      begin
+        { the handler's name, first among the locals while its
+          statement is read }
+        hv := HiddenNamed(nm + '.on', id);
+        d := Default(TVarDecl);
+        d.Name := nm;
+        d.Typ := id;
+        d.Sym := hv;
+        n := Length(FLocals);
+        SetLength(FLocals, n + 1);
+        for i := n downto 1 do
+          FLocals[i] := FLocals[i - 1];
+        FLocals[0] := d;
+        Inc(FParamN);
+      end;
+      hs := Self.ParseStmt;
+      if nm <> '' then
+      begin
+        n := Length(FLocals);
+        for i := 0 to n - 2 do
+          FLocals[i] := FLocals[i + 1];
+        SetLength(FLocals, n - 1);
+        Dec(FParamN);
+        body := NewStmt(skBlock);
+        body^.Line := lno;
+        asg := NewStmt(skAssign);
+        asg^.Line := lno;
+        asg^.Dest := NewVar(hv, id);
+        asg^.E := NewVar(cur, TyPointer);
+        AppendStmt(body, asg);
+        AppendStmt(body, hs);
+      end
+      else
+        body := hs;
+      ifst := NewStmt(skIf);
+      ifst^.Line := lno;
+      ifst^.E := NewBin(boIs, NewVar(cur, TyPointer), NewInt(id));
+      ifst^.E^.Typ := TyBoolean;
+      ifst^.ThenSt := body;
+      if last = nil then
+        epi^.ThenSt := ifst
+      else
+        last^.ElseSt := ifst;
+      last := ifst;
+      if FTok.Kind <> tkSemi then
+        Break;
+      while FTok.Kind = tkSemi do
+        FTok := FLex.Next;
+    end;
+    if FTok.Kind = tkElse then
+    begin
+      FTok := FLex.Next;
+      last^.ElseSt := ParseStmtsTilEnd;
+    end
+    else
+    begin
+      rs := NewStmt(skRaise);
+      rs^.Line := ALine;
+      rs^.Name := 'reraise';
+      last^.ElseSt := rs;
+    end;
+  end
+  else
+    epi^.ThenSt := ParseStmtsTilEnd;
+  Dec(FExcDepth);
+  Eat(tkEnd);
+  AppendStmt(Tr^.ElseSt, epi);
 end;
 
 { A hidden variable of type T named Base + a number (a local in a
@@ -15505,9 +15713,12 @@ var
   child: TProc;
   seen, savedSafe, anon: Boolean;
   savedConst: TStrArray;
+  savedExc: LongInt;
 begin
   anon := FAnonBody;
   FAnonBody := False;
+  savedExc := FExcDepth;
+  FExcDepth := 0;
   savedLocals := FLocals;
   savedLimits := FLimits;
   savedInBody := FInBody;
@@ -15631,6 +15842,7 @@ begin
   if not anon then
     Eat(tkSemi);
   FConstNames := savedConst;
+  FExcDepth := savedExc;
   FLocals := savedLocals;
   FScopes := savedScopes;
   FFuncName := savedFunc;

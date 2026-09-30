@@ -252,6 +252,7 @@ type
     FCont: array of string;
     FTryFin: array of PStmt;
     FTryDep: array of LongInt;
+    FTryRec: array of Boolean;  { the entry has a try record on the G; a handler's epilogue has none (P122) }
     FEpi: string;
     FScratchOff: LongInt;
     FScratchCur: LongInt;
@@ -412,6 +413,7 @@ type
     procedure PushTry(Fin: PStmt);
     procedure PopTry;
     procedure UnwindTry(MinDep: LongInt);
+    procedure PushEpi(Fin: PStmt);
     procedure EmitSyscall(const Args: TExprArray);
     function FindSym(const N: string): TSym;
     procedure EmitAddr(E: PExpr);
@@ -2711,12 +2713,26 @@ begin
   n := Length(FTryFin);
   SetLength(FTryFin, n + 1);
   SetLength(FTryDep, n + 1);
+  SetLength(FTryRec, n + 1);
+  FTryRec[n] := True;
   FTryFin[n] := Fin;
   FTryDep[n] := LongInt(Length(FBrk));
   { The words pushed with its 32-byte record, for the stack maps: an
     unwind goes back to the depth before the record (P95c). }
   SetLength(FTryPush, n + 1);
   FTryPush[n] := LongInt(Length(FPushK));
+end;
+
+{ A handler's body (P122): Fin, its epilogue, runs on an exit, break or
+  continue out of it as a finally part does, but there is no try record
+  on the G, so a raise from inside passes it by. }
+procedure TEmitter.PushEpi(Fin: PStmt);
+var
+  n: SizeInt;
+begin
+  PushTry(Fin);
+  n := Length(FTryRec);
+  FTryRec[n - 1] := False;
 end;
 
 procedure TEmitter.PopTry;
@@ -2728,6 +2744,7 @@ begin
   begin
     SetLength(FTryFin, n - 1);
     SetLength(FTryDep, n - 1);
+    SetLength(FTryRec, n - 1);
   end;
   if Length(FTryPush) > 0 then
     SetLength(FTryPush, Length(FTryPush) - 1);
@@ -2744,6 +2761,7 @@ var
   savedFin: array of PStmt;
   savedDep: array of LongInt;
   savedPush: array of LongInt;
+  savedRec: array of Boolean;
   savedK: array of Byte;
   fin: PStmt;
 begin
@@ -2757,48 +2775,59 @@ begin
   while (i >= 0) and (FTryDep[i] >= MinDep) do
   begin
     fin := FTryFin[i];
-    FMapSpOk := True;
-    if FArm then
+    { a try record comes off the G and the stack goes back to it; a
+      handler's epilogue (P122) has none }
+    if (i > High(FTryRec)) or FTryRec[i] then
     begin
-      Line('  ldr x9, [x28, #224]');
-      Line('  ldr x10, [x9]');
-      Line('  str x10, [x28, #224]');
-      Line('  ldr x10, [x9, #16]');
-      Line('  mov sp, x10');
-    end
-    else
-    begin
-      Line('  movq 224(%r14), %rax');
-      Line('  movq (%rax), %rcx');
-      Line('  movq %rcx, 224(%r14)');
-      Line('  movq 16(%rax), %rsp');
+      FMapSpOk := True;
+      if FArm then
+      begin
+        Line('  ldr x9, [x28, #224]');
+        Line('  ldr x10, [x9]');
+        Line('  str x10, [x28, #224]');
+        Line('  ldr x10, [x9, #16]');
+        Line('  mov sp, x10');
+      end
+      else
+      begin
+        Line('  movq 224(%r14), %rax');
+        Line('  movq (%rax), %rcx');
+        Line('  movq %rcx, 224(%r14)');
+        Line('  movq 16(%rax), %rsp');
+      end;
+      FMapSpOk := False;
+      if (i <= High(FTryPush)) and (FTryPush[i] >= 4) and
+        (FTryPush[i] - 4 <= Length(FPushK)) then
+        SetLength(FPushK, FTryPush[i] - 4);
     end;
-    FMapSpOk := False;
-    if (i <= High(FTryPush)) and (FTryPush[i] >= 4) and
-      (FTryPush[i] - 4 <= Length(FPushK)) then
-      SetLength(FPushK, FTryPush[i] - 4);
     if fin <> nil then
     begin
       savedFin := FTryFin;
       savedDep := FTryDep;
       savedPush := FTryPush;
+      savedRec := FTryRec;
       FTryFin := nil;
       FTryDep := nil;
       FTryPush := nil;
+      FTryRec := nil;
       SetLength(FTryFin, i);
       SetLength(FTryDep, i);
       SetLength(FTryPush, i);
+      SetLength(FTryRec, i);
       for j := 0 to i - 1 do
       begin
         FTryFin[j] := savedFin[j];
         FTryDep[j] := savedDep[j];
         if j <= High(savedPush) then
           FTryPush[j] := savedPush[j];
+        if j <= High(savedRec) then
+          FTryRec[j] := savedRec[j];
       end;
       EmitStmt(fin);
       FTryFin := savedFin;
       FTryDep := savedDep;
       FTryPush := savedPush;
+      FTryRec := savedRec;
     end;
     Dec(i);
   end;
@@ -8691,6 +8720,27 @@ begin
   Result := False;
   if E = nil then
     Exit;
+  { The routine's exception object, G+272 (P122): a handler reads it
+    and puts the one it replaced back when it ends. }
+  if E^.Name = 'rt_excget' then
+  begin
+    Result := True;
+    if FArm then
+      Line('  ldr x0, [x28, #272]')
+    else
+      Line('  movq 272(%r14), %rax');
+    Exit;
+  end;
+  if E^.Name = 'rt_excset' then
+  begin
+    Result := True;
+    EmitExpr(E^.Args[0]);
+    if FArm then
+      Line('  str x0, [x28, #272]')
+    else
+      Line('  movq %rax, 272(%r14)');
+    Exit;
+  end;
   if EmitWideFn(E) or EmitAtomicFn(E) or EmitCpuFn(E) or EmitVecFn(E) or EmitRotFn(E) then
   begin
     Result := True;
@@ -16962,15 +17012,27 @@ end;
   10 anything else, and the offset inside its heap box when a closure
   holds it, -1 otherwise. The debugger unit reads them between
   __start_pasdbg and __stop_pasdbg. }
-{ A name the tables leave out: none, Self, or a hidden one (a dot in it). }
+{ A name the tables leave out: none, Self, or a hidden one (a dot in
+  it) but for an on handler's (P122). }
 function DbgHidden(const N: string): Boolean;
 var
   i: SizeInt;
 begin
   Result := (N = '') or SameSym(N, 'self');
+  if OnVarUser(N) <> '' then
+    Exit;
   for i := 1 to Length(N) do
     if N[i] = '.' then
       Result := True;
+end;
+
+{ The name the tables give: an on handler's object by the handler's
+  name for it (P122). }
+function DbgName(const N: string): string;
+begin
+  Result := OnVarUser(N);
+  if Result = '' then
+    Result := N;
 end;
 
 procedure TEmitter.DbgCode(Typ: LongInt; out Code, Size: LongInt);
@@ -17038,7 +17100,8 @@ begin
         box := IntToStr(FOwnSyms[p][v].BoxOff)
       else
         box := '-1';
-      Line('  .quad ' + InternStr(FOwnSyms[p][v].Name) + ', ' + IntToStr(Length(FOwnSyms[p][v].Name)) +
+      Line('  .quad ' + InternStr(DbgName(FOwnSyms[p][v].Name)) + ', ' +
+        IntToStr(Length(DbgName(FOwnSyms[p][v].Name))) +
         ', ' + IntToStr(FOwnSyms[p][v].Off) + ', ' + IntToStr(code) + ', ' + IntToStr(size) + ', ' + box);
     end;
   end;
@@ -17070,8 +17133,8 @@ begin
     if DbgHidden(Prog.Vars[v].Name) then
       Continue;
     DbgCode(Prog.Vars[v].Typ, code, size);
-    Line('  .quad 2, ' + VarLabel(GlobName(Prog.Vars[v])) + ', ' + InternStr(Prog.Vars[v].Name) + ', ' +
-      IntToStr(Length(Prog.Vars[v].Name)) + ', ' + IntToStr(code) + ', ' + IntToStr(size) + ', 0, 0, 0, 0, 0, 0');
+    Line('  .quad 2, ' + VarLabel(GlobName(Prog.Vars[v])) + ', ' + InternStr(DbgName(Prog.Vars[v].Name)) +
+      ', ' + IntToStr(Length(DbgName(Prog.Vars[v].Name))) + ', ' + IntToStr(code) + ', ' + IntToStr(size) + ', 0, 0, 0, 0, 0, 0');
   end;
   if not Prog.IsUnit then
     Line('  .quad 1, pas_main, .Lmainend, ' + InternStr('main') + ', 4, ' + InternStr(src) + ', ' +
@@ -17608,8 +17671,42 @@ begin
           Line('  bl rt_sleep');
         end;
       skRaise:
-        Line('  bl rt_raise');
+        { raise; in a handler raises G+272 again; raise alone elsewhere
+          raises no object; raise X [at A] raises X from A, or from the
+          call's return address (P122) }
+        if S^.Name = 'reraise' then
+          Line('  bl rt_raise')
+        else if S^.E = nil then
+        begin
+          Line('  mov x0, xzr');
+          Line('  mov x1, xzr');
+          Line('  bl rt_raiseobj');
+        end
+        else
+        begin
+          EmitExpr(S^.E);
+          if S^.E2 <> nil then
+          begin
+            PshK('x0', 1);
+            EmitExpr(S^.E2);
+            Line('  mov x1, x0');
+            Ppop('x0');
+          end
+          else
+            Line('  mov x1, xzr');
+          Line('  bl rt_raiseobj');
+        end;
       skTry:
+        if S^.Name = 'epilogue' then
+        begin
+          { a handler's body (P122): ElseSt after it, and before an exit,
+            break or continue out of it; no record }
+          PushEpi(S^.ElseSt);
+          EmitStmt(S^.ThenSt);
+          PopTry;
+          EmitStmt(S^.ElseSt);
+        end
+        else
         begin
           a := Lab;
           b := Lab;
@@ -18301,8 +18398,45 @@ begin
         Line('  call rt_sleep');
       end;
     skRaise:
-      Line('  call rt_raise');
+      { raise; in a handler raises G+272 again; raise alone elsewhere
+        raises no object; raise X [at A] raises X from A, or from the
+        call's return address (P122) }
+      if S^.Name = 'reraise' then
+        Line('  call rt_raise')
+      else if S^.E = nil then
+      begin
+        Line('  xorl %edi, %edi');
+        Line('  xorl %esi, %esi');
+        Line('  call rt_raiseobj');
+      end
+      else
+      begin
+        EmitExpr(S^.E);
+        if S^.E2 <> nil then
+        begin
+          PushK('rax', 1);
+          EmitExpr(S^.E2);
+          Line('  movq %rax, %rsi');
+          Line('  popq %rdi');
+        end
+        else
+        begin
+          Line('  movq %rax, %rdi');
+          Line('  xorl %esi, %esi');
+        end;
+        Line('  call rt_raiseobj');
+      end;
     skTry:
+      if S^.Name = 'epilogue' then
+      begin
+        { a handler's body (P122): ElseSt after it, and before an exit,
+          break or continue out of it; no record }
+        PushEpi(S^.ElseSt);
+        EmitStmt(S^.ThenSt);
+        PopTry;
+        EmitStmt(S^.ElseSt);
+      end
+      else
       begin
         a := Lab;
         b := Lab;
@@ -21957,6 +22091,7 @@ var
   sysw: Boolean;
   savedTF: array of PStmt;
   savedTD: array of LongInt;
+  savedTR: array of Boolean;
   loc0, loc1: SizeInt;
 begin
   saved := FSym;
@@ -21966,8 +22101,10 @@ begin
   savedResTyp := FResTyp;
   savedTF := FTryFin;
   savedTD := FTryDep;
+  savedTR := FTryRec;
   FTryFin := nil;
   FTryDep := nil;
+  FTryRec := nil;
 
   FNest := Pr.Nest;
   parentN := 0;
@@ -22346,6 +22483,7 @@ begin
   FResTyp := savedResTyp;
   FTryFin := savedTF;
   FTryDep := savedTD;
+  FTryRec := savedTR;
   FLocAddr := nil;
 end;
 
@@ -23686,7 +23824,7 @@ begin
   Line('  movq %r12, 0(%rax)');
   Line('  leaq 8192(%r12), %rcx');
   Line('  movq %rcx, 8(%rax)');
-  Line('  leaq 4368(%r12), %rcx');
+  Line('  leaq 4384(%r12), %rcx');
   Line('  movq %rcx, 16(%rax)');
   Line('  movq %rcx, 24(%rax)');
   Line('  movq %rax, %rdi');
@@ -23749,7 +23887,7 @@ begin
   Line('  movq %rbx, 0(%r12)');
   Line('  leaq 8192(%rbx), %rcx');
   Line('  movq %rcx, 8(%r12)');
-  Line('  leaq 4368(%rbx), %rcx');
+  Line('  leaq 4384(%rbx), %rcx');
   Line('  movq %rcx, 16(%r12)');
   Line('  movq %rcx, 24(%r12)');
   Line('  movq %r12, %rax');
@@ -23791,6 +23929,9 @@ begin
   Line('  movq $0, 184(%rax)');
   { a routine starts with Carry 0 (P108): the record may be a reused one }
   Line('  movq $0, 256(%rax)');
+  { and no exception in flight (P122) }
+  Line('  movq $0, 272(%rax)');
+  Line('  movq $0, 280(%rax)');
   { -checkptr's cache of the last object (G+160 and +168, free on amd64;
     1.0.111) starts empty in a reused record. }
   Line('  movq $0, 160(%rax)');
@@ -25182,6 +25323,17 @@ procedure TEmitter.EmitChan;
 begin
   { Chan: 0 lock, 8 closed, 16 recvq first/last, 32 sendq first/last.
     G+152 status (0 run,1 park,2 wait,3 ready), G+192 qnext, G+200 elem. }
+  { rt_raiseobj (P122): rdi the object, rsi where it was raised (0: the
+    caller's return address) into G+272 and G+280, then the unwinding of
+    rt_raise, which raises the object G+272 holds again }
+  Line('.globl rt_raiseobj');
+  Line('rt_raiseobj:');
+  Line('  movq %rdi, 272(%r14)');
+  Line('  testq %rsi, %rsi');
+  Line('  jnz .ro_at');
+  Line('  movq (%rsp), %rsi');
+  Line('.ro_at:');
+  Line('  movq %rsi, 280(%r14)');
   Line('.globl rt_raise');
   Line('rt_raise:');
   Line('  movq 224(%r14), %rax');
@@ -25196,14 +25348,29 @@ begin
     main routine ends the program with a line on stderr and status 1,
     where it left the scheduler with nothing to run and the deadlock
     message. }
+  Line('.weak p_pasobject_pasuncaught');
   Line('rt_uncaught:');
   Line('  cmpq rt_maing(%rip), %r14');
   Line('  jne rt_goexit');
+  { an object (P122): pasobject's PasUncaught names its class on stderr,
+    on a stack aligned as a call wants it; weak, so a program without
+    pasobject still links }
+  Line('  movq 272(%r14), %rdi');
+  Line('  testq %rdi, %rdi');
+  Line('  jz .uc_plain');
+  Line('  movabsq $p_pasobject_pasuncaught, %rax');
+  Line('  testq %rax, %rax');
+  Line('  jz .uc_plain');
+  Line('  andq $-16, %rsp');
+  Line('  call *%rax');
+  Line('  jmp .uc_exit');
+  Line('.uc_plain:');
   Line('  leaq .Luncaught(%rip), %rsi');
   Line('  movq $44, %rdx');
   Line('  movq $2, %rdi');
   Line('  movq $1, %rax');
   Line('  syscall');
+  Line('.uc_exit:');
   Line('  movq $1, %rdi');
   Line('  call rt_exit');
   Line('');
@@ -32010,7 +32177,7 @@ begin
     Line('rt_nslock:');
     Line('  .quad 0');
     Line('rt_nsg:');
-    Line('  .space 272');
+    Line('  .space 288');
     Line('.align 8');
     Line('rt_heapp:');
     Line('  .quad 0');
@@ -32164,8 +32331,9 @@ begin
     Line('  .space 512');
     Line('.align 8');
     Line('rt_g:');
-    { a routine's record: 272 bytes from 1.0.129, G+256 its Carry (P108) }
-    Line('  .space 272');
+    { a routine's record: 288 bytes from 1.1.3, G+256 its Carry (P108), G+272
+      the object being raised and G+280 where (P122) }
+    Line('  .space 288');
     Line('rt_allm:');
     Line('  .space 4096');
     Line('rt_allp:');
@@ -37678,7 +37846,7 @@ begin
   Imm('x9', 32768);
   Line('  add x9, x20, x9');
   Line('  str x9, [x0, #8]');
-  Imm('x9', 4368);
+  Imm('x9', 4384);
   Line('  add x9, x20, x9');
   Line('  str x9, [x0, #16]');
   Line('  str x9, [x0, #24]');
@@ -37746,7 +37914,7 @@ begin
   Imm('x9', 32768);
   Line('  add x9, x19, x9');
   Line('  str x9, [x20, #8]');
-  Imm('x9', 4368);
+  Imm('x9', 4384);
   Line('  add x9, x19, x9');
   Line('  str x9, [x20, #16]');
   Line('  str x9, [x20, #24]');
@@ -37799,6 +37967,8 @@ begin
   Line('  str xzr, [x0, #184]');
   { a routine starts with Carry 0 (P108) }
   Line('  str xzr, [x0, #256]');
+  Line('  str xzr, [x0, #272]');
+  Line('  str xzr, [x0, #280]');
   { -checkptr's cache (G+120 and the 32 bits at +156 on arm64). }
   Line('  str xzr, [x0, #120]');
   Line('  str wzr, [x0, #156]');
@@ -38475,6 +38645,15 @@ begin
   { raise: unwind to the newest try frame of this G (G+224): frame+0 is
     the previous frame, +8 the saved fp, +16 the sp to restore, +24 the
     handler. No frame: the routine ends. }
+  { rt_raiseobj (P122): x0 the object, x1 where (0: the return address)
+    into G+272 and G+280, then rt_raise's unwinding }
+  Line('.globl rt_raiseobj');
+  Line('rt_raiseobj:');
+  Line('  str x0, [x28, #272]');
+  Line('  cbnz x1, .ro_at');
+  Line('  mov x1, x30');
+  Line('.ro_at:');
+  Line('  str x1, [x28, #280]');
   Line('.globl rt_raise');
   Line('rt_raise:');
   Line('  ldr x9, [x28, #224]');
@@ -38488,15 +38667,26 @@ begin
   Line('  br x10');
   { as on amd64 (1.0.147): the main routine ends the program with a line
     and status 1, any other ends alone }
+  Line('.weak p_pasobject_pasuncaught');
   Line('rt_uncaught:');
   LdS('rt_maing', 'x9');
   Line('  cmp x9, x28');
   Line('  b.ne rt_goexit');
+  { an object (P122): pasobject's PasUncaught names its class; its
+    address from the literal pool, 0 when the weak symbol is absent }
+  Line('  ldr x0, [x28, #272]');
+  Line('  cbz x0, .uc_plain');
+  Line('  ldr x9, =p_pasobject_pasuncaught');
+  Line('  cbz x9, .uc_plain');
+  Line('  blr x9');
+  Line('  b .uc_exit');
+  Line('.uc_plain:');
   LeaS('.Luncaught', 'x1');
   Line('  mov x2, #44');
   Line('  mov x0, #2');
   Line('  mov x8, #64');
   Line('  svc #0');
+  Line('.uc_exit:');
   Line('  mov x0, #1');
   Line('  bl rt_exit');
   Line('');

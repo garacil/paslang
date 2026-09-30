@@ -36,6 +36,10 @@ Source files use the `.paslang` extension.
   instructions; a word with a kernel (SHA-1, SHA-256, SHA-512, the CRCs,
   XXH3, `PopCount`, the vectors) has a body for the processor's
   extensions and a plain one, and nothing is tested at run time.
+- **Classes and exceptions with objects.** Every class descends from
+  `TObject`; `raise` carries an object of any class, and an `except`
+  part picks it by class with `on E: T do` handlers. The object belongs
+  to the routine that raised it, and the collector takes it back.
 - **Inline assembly** per machine, `Quad` (IEEE binary128), vectors, and
   a collector that reads compiled frames through the compiler's stack
   maps.
