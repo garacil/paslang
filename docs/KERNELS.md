@@ -11,6 +11,15 @@ for a processor the machine is not dies with an illegal instruction, as
 with `-march=native`. `-cpu base` compiles the base paths and `make check`
 runs the tests both ways on both machines.
 
+A unit chooses its kernels where it is compiled. So every installed unit
+is built twice (P143): for the base processor, and for one level of each
+machine, x86-64-v3 (`v3`) and ARMv8.2 with crypto (`v8.2+crypto`), in a
+directory of that name beside the base build. A program whose `-cpu` has
+every feature of the level links the level's objects; the interfaces are
+the same. A unit's `UpCase` of a string calls `PasUpperCpu` in a program
+compiled `-cpu native` on an AVX2 machine and `PasUpperBase` under `-cpu
+base`, as Go compiles every package at the program's `GOAMD64`.
+
 The manuals: Intel's Software Developer's Manual and Arm's Architecture
 Reference Manual (what each instruction does), Intel's optimization
 manual, AMD's software optimization guide for family 19h and Arm's for

@@ -75,6 +75,16 @@ SELF_UNITS := \
 
 A64DIR := $(BUILDDIR)/a64
 
+# Every unit is built again for one processor level of each machine
+# (P143), x86-64-v3 and ARMv8.2 with its crypto extension, in a
+# directory beside the base build: a program compiled for a -cpu with
+# every feature of the level links those objects, so a unit's words
+# that choose a kernel by -cpu take the program's, as Go compiles every
+# package at its GOAMD64 level. The interfaces (.pi) are the same.
+LVL_X64 := v3
+LVL_A64 := v8.2+crypto
+A64_OBJDUMP ?= aarch64-linux-gnu-objdump
+
 # The golden tests: testdata/<t>.paslang must print testdata/<t>.out.
 GOLDEN := hello arith ifthen loops const caseof procs recfn records ptrs arrs strs grow paswork pingpong chclose sel exc excg nest cls gen enums sets dbg opt gdbg inherit rtti args8 mevent slice chlit armmeth propacc runes variant opadd args20 iface opmore props pindex dwarfloc shift dynnil xor inhcall isas sysid forward defaults abstract overload methov strdef trig logexp arctan invpow logx trig2 hyper miscmath xxh32 xxh64 map1 map2 sync1 sync2 finexit zerolocal pchar selx selstress wrchar chstr lookpath strcmp dupparam recarg funcval constk regloop reszero divconst bareln gctypes chr charcat heapspan blobzero gcbasic mapsplit stackmap trygrow growgc xxh3 mapgetstr bounds fairq sized fwdptr constexpr int2real typedconst caserange emptystmt writefmt realparse realfmt valpar strcow chanany chanbuf memmove overnarrow slicegrow fatexit narrow narrowmem recalign narrowbounds dwarfnarrow narrowgo forlimit bce inplace narrowasm slicereg forrun addrform bcerun inspine framearr realstep f32conv single dwarfreal ptrtyped ptrarith ptrsafe memview checkptr ptrreach cpwalk realint quadcore quadfmt quad quadconst dwarfquad bitops declorder convchain bitwords bitmem bitany views blocks wide ifdef quadfast memwords cpuwords vectors vecmore inlineasm vecpool addrlocal rotwords rotmem ctxwords append funcval2 closures pasargs ifaceargs vshrs64 auditfix closurebox audit2 visibility freedestroy reservedall nodeadlock mapfix tree1 tree2 hash1 store1 immwide constref inline1 stackargs mainexit networds charcmp unixsock sigpipe sleepmany deadlines strfill narrowpop tobject1 excobj1 excobj2 excobj3 classref1 ctorargs aconst1 aconst2 methdef1 set256 subrange1 subrange2 helper1 helper2 strwords strkern slicedit strcmpk scope1 classfwd ifacebind overconv overrank valunsigned
 GOLDEN_A64 := map1 map2 sync1 sync2 finexit zerolocal pchar pingpong sel chclose paswork selx selstress wrchar args8 arith arrs caseof chlit cls const enums exc excg gen grow hyper ifthen inherit loops mevent miscmath nest procs ptrs recfn records sets strs trig2 xxh32 xxh64 rtti gdbg chstr strcmp recarg funcval constk regloop reszero divconst bareln gctypes chr charcat heapspan blobzero gcbasic mapsplit stackmap trygrow growgc xxh3 mapgetstr bounds fairq sized fwdptr constexpr int2real typedconst caserange emptystmt writefmt realparse realfmt valpar strcow chanany chanbuf memmove overnarrow slicegrow fatexit narrow narrowmem recalign narrowbounds dwarfnarrow narrowgo forlimit bce inplace narrowasm slicereg forrun addrform bcerun inspine framearr realstep f32conv single dwarfreal ptrtyped ptrarith ptrsafe memview checkptr ptrreach cpwalk realint quadcore quadfmt quad quadconst dwarfquad bitops declorder convchain bitwords bitmem bitany views blocks wide ifdef quadfast memwords cpuwords vectors vecmore inlineasm vecpool addrlocal rotwords rotmem ctxwords append funcval2 closures pasargs ifaceargs vshrs64 auditfix closurebox audit2 visibility freedestroy reservedall nodeadlock mapfix tree1 tree2 hash1 store1 immwide constref inline1 stackargs mainexit networds charcmp unixsock sigpipe sleepmany deadlines strfill narrowpop tobject1 excobj1 excobj2 excobj3 classref1 ctorargs aconst1 aconst2 methdef1 set256 subrange1 subrange2 helper1 helper2 strwords strkern slicedit strcmpk scope1 classfwd ifacebind overconv overrank valunsigned
@@ -120,6 +130,12 @@ libs: $(OUTDIR)/paslangc core $(LIB_UNITS) | $(BUILDDIR)
 	  b=$$(basename $$u .paslang); \
 	  echo "lib $$b"; \
 	  $(OUTDIR)/paslangc -cpu base -c -Fu $(BUILDDIR) -o $(BUILDDIR)/$$b $$u; \
+	done; \
+	mkdir -p $(BUILDDIR)/$(LVL_X64); \
+	for u in $(LIB_UNITS); do \
+	  b=$$(basename $$u .paslang); \
+	  echo "lib $(LVL_X64) $$b"; \
+	  $(OUTDIR)/paslangc -cpu $(LVL_X64) -c -Fu $(BUILDDIR) -o $(BUILDDIR)/$(LVL_X64)/$$b $$u; \
 	done
 
 # The library units for arm64 too (1.0.80): the installed compiler could
@@ -130,6 +146,12 @@ libs-arm64: $(OUTDIR)/paslangc core-arm64 $(LIB_UNITS) | $(BUILDDIR)
 	  b=$$(basename $$u .paslang); \
 	  echo "lib-arm64 $$b"; \
 	  $(OUTDIR)/paslangc -target arm64 -cpu base -c -Fu $(A64DIR) -o $(A64DIR)/$$b $$u; \
+	done; \
+	mkdir -p '$(A64DIR)/$(LVL_A64)'; \
+	for u in $(LIB_UNITS); do \
+	  b=$$(basename $$u .paslang); \
+	  echo "lib-arm64 $(LVL_A64) $$b"; \
+	  $(OUTDIR)/paslangc -target arm64 -cpu $(LVL_A64) -c -Fu $(A64DIR) -o '$(A64DIR)/$(LVL_A64)'/$$b $$u; \
 	done
 
 core: $(OUTDIR)/paslangc $(CORE_UNITS) | $(BUILDDIR)
@@ -138,6 +160,12 @@ core: $(OUTDIR)/paslangc $(CORE_UNITS) | $(BUILDDIR)
 	  b=$$(basename $$u .paslang); \
 	  echo "core $$b"; \
 	  $(OUTDIR)/paslangc -cpu base -c -Fu $(BUILDDIR) -o $(BUILDDIR)/$$b $$u; \
+	done; \
+	mkdir -p $(BUILDDIR)/$(LVL_X64); \
+	for u in $(CORE_UNITS); do \
+	  b=$$(basename $$u .paslang); \
+	  echo "core $(LVL_X64) $$b"; \
+	  $(OUTDIR)/paslangc -cpu $(LVL_X64) -c -Fu $(BUILDDIR) -o $(BUILDDIR)/$(LVL_X64)/$$b $$u; \
 	done
 
 core-arm64: $(OUTDIR)/paslangc $(CORE_UNITS) | $(BUILDDIR)
@@ -146,6 +174,12 @@ core-arm64: $(OUTDIR)/paslangc $(CORE_UNITS) | $(BUILDDIR)
 	  b=$$(basename $$u .paslang); \
 	  echo "core-arm64 $$b"; \
 	  $(OUTDIR)/paslangc -target arm64 -cpu base -c -Fu $(A64DIR) -o $(A64DIR)/$$b $$u; \
+	done; \
+	mkdir -p '$(A64DIR)/$(LVL_A64)'; \
+	for u in $(CORE_UNITS); do \
+	  b=$$(basename $$u .paslang); \
+	  echo "core-arm64 $(LVL_A64) $$b"; \
+	  $(OUTDIR)/paslangc -target arm64 -cpu $(LVL_A64) -c -Fu $(A64DIR) -o '$(A64DIR)/$(LVL_A64)'/$$b $$u; \
 	done
 
 compilers: $(OUTDIR)/paslangc core $(OUTDIR)/paslangc-arm64
@@ -853,6 +887,17 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  grep -qF "$$w" $(BUILDDIR)/overbad_$$n.err || { cat $(BUILDDIR)/overbad_$$n.err; exit 1; }; \
 	done; \
 	echo ok overbad; \
+	echo "==== variables with a value and absolute rejects (P144) ===="; \
+	for f in 'absnone:unknown variable nothing at 3:21' 'abstwo:absolute names one variable at a time at 4:15' \
+	  'abstype:b: Byte absolute x: Integer; absolute is another name for a variable of its own type' \
+	  'twoinit:one variable at a time takes a value at 3:15'; do \
+	  n=$${f%%:*}; w=$${f#*:}; \
+	  if $(OUTDIR)/paslangc -o $(BUILDDIR)/varbad_$$n testdata/varbad/$$n.paslang >$(BUILDDIR)/varbad_$$n.err 2>&1; then \
+	    echo "$$n should fail"; exit 1; \
+	  fi; \
+	  grep -qF "$$w" $(BUILDDIR)/varbad_$$n.err || { cat $(BUILDDIR)/varbad_$$n.err; exit 1; }; \
+	done; \
+	echo ok varbad; \
 	echo "==== forward pointer rejects ===="; \
 	for f in fwdopen:TX:4:9 fwdvar:TZ:4:7 fwdlater:TW:4:9; do \
 	  n=$${f%%:*}; w=$${f#*:}; \
@@ -1643,6 +1688,25 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/clsfwduse-arm testdata/units/clsfwduse.paslang; \
 	timeout 60 $(QEMU_A64) $(BUILDDIR)/clsfwduse-arm > $(BUILDDIR)/clsfwduse-arm.got; \
 	diff -u testdata/units/clsfwduse.out $(BUILDDIR)/clsfwduse-arm.got; \
+	: a unit built for a processor level, P143: a program links the build its -cpu allows; \
+	$(OUTDIR)/paslangc -cpu base testdata/units/lvlu.paslang; \
+	$(OUTDIR)/paslangc -cpu $(LVL_X64) -c -Fu $(BUILDDIR) -o $(BUILDDIR)/$(LVL_X64)/lvlu testdata/units/lvlu.paslang; \
+	for c in base $(LVL_X64); do \
+	  $(OUTDIR)/paslangc -cpu $$c -Fu $(BUILDDIR) -o $(BUILDDIR)/lvluse-$$c testdata/units/lvluse.paslang; \
+	  $(BUILDDIR)/lvluse-$$c > $(BUILDDIR)/lvluse-$$c.got; \
+	  diff -u testdata/units/lvluse.out $(BUILDDIR)/lvluse-$$c.got; \
+	done; \
+	objdump -d --no-show-raw-insn $(BUILDDIR)/lvluse-base | awk '/<p_lvlu_check>:/,/ret/' | grep -q pascrc32cbase; \
+	objdump -d --no-show-raw-insn $(BUILDDIR)/lvluse-$(LVL_X64) | awk '/<p_lvlu_check>:/,/ret/' | grep -q pascrc32ccpu; \
+	$(OUTDIR)/paslangc -target arm64 -cpu base testdata/units/lvlu.paslang; \
+	$(OUTDIR)/paslangc -target arm64 -cpu $(LVL_A64) -c -Fu $(A64DIR) -o '$(A64DIR)/$(LVL_A64)/lvlu' testdata/units/lvlu.paslang; \
+	for c in base max; do \
+	  $(OUTDIR)/paslangc -target arm64 -cpu $$c -Fu $(A64DIR) -o $(BUILDDIR)/lvluse-arm-$$c testdata/units/lvluse.paslang; \
+	  timeout 60 $(QEMU_A64) $(BUILDDIR)/lvluse-arm-$$c > $(BUILDDIR)/lvluse-arm-$$c.got; \
+	  diff -u testdata/units/lvluse.out $(BUILDDIR)/lvluse-arm-$$c.got; \
+	done; \
+	$(A64_OBJDUMP) -d --no-show-raw-insn $(BUILDDIR)/lvluse-arm-base | awk '/<p_lvlu_check>:/,/ret/' | grep -q pascrc32cbase; \
+	$(A64_OBJDUMP) -d --no-show-raw-insn $(BUILDDIR)/lvluse-arm-max | awk '/<p_lvlu_check>:/,/ret/' | grep -q pascrc32ccpu; \
 	$(OUTDIR)/paslangc testdata/units/safeu.paslang; \
 	grep -q '^SAFE$$' $(BUILDDIR)/safeu.pi; \
 	if grep -q '^SAFE$$' $(BUILDDIR)/adder.pi; then echo "adder.pi says SAFE for a unit that is not safe"; exit 1; fi; \
@@ -2599,16 +2663,26 @@ install: all installdirs
 	  $(INSTALL_PROGRAM) $(OUTDIR)/paslangc-arm64 $(DESTDIR)$(bindir)/paslangc-arm64; \
 	fi
 	$(PRE_INSTALL)
-	$(INSTALL_DATA) $(BUILDDIR)/pasobject.pi $(BUILDDIR)/pasobject.o $(BUILDDIR)/pasroutines.pi $(BUILDDIR)/pasroutines.o $(BUILDDIR)/pasmap.pi $(BUILDDIR)/pasmap.o $(BUILDDIR)/pashash.pi $(BUILDDIR)/pashash.o $(BUILDDIR)/pastree.pi $(BUILDDIR)/pastree.o $(BUILDDIR)/pasheap.pi $(BUILDDIR)/pasheap.o $(BUILDDIR)/pasfmt.pi $(BUILDDIR)/pasfmt.o $(BUILDDIR)/pasquad.pi $(BUILDDIR)/pasquad.o $(DESTDIR)$(libdir)/paslang/
-	for u in $(LIB_UNITS); do \
+	: every core unit, passtr too, P143: a list written out left it behind; \
+	for u in $(CORE_UNITS) $(LIB_UNITS); do \
 	  b=$$(basename $$u .paslang); \
 	  $(INSTALL_DATA) $(BUILDDIR)/$$b.pi $(BUILDDIR)/$$b.o $(DESTDIR)$(libdir)/paslang/; \
 	done
+	: the level builds, P143; \
+	mkdir -p $(DESTDIR)$(libdir)/paslang/$(LVL_X64); \
+	for u in $(CORE_UNITS) $(LIB_UNITS); do \
+	  b=$$(basename $$u .paslang); \
+	  $(INSTALL_DATA) $(BUILDDIR)/$(LVL_X64)/$$b.o $(DESTDIR)$(libdir)/paslang/$(LVL_X64)/; \
+	done
 	if [ -f $(A64DIR)/pasmap.o ]; then \
-	  $(INSTALL_DATA) $(A64DIR)/pasobject.pi $(A64DIR)/pasobject.o $(A64DIR)/pasroutines.pi $(A64DIR)/pasroutines.o $(A64DIR)/pasmap.pi $(A64DIR)/pasmap.o $(A64DIR)/pashash.pi $(A64DIR)/pashash.o $(A64DIR)/pastree.pi $(A64DIR)/pastree.o $(A64DIR)/pasheap.pi $(A64DIR)/pasheap.o $(A64DIR)/pasfmt.pi $(A64DIR)/pasfmt.o $(A64DIR)/pasquad.pi $(A64DIR)/pasquad.o $(DESTDIR)$(libdir)/paslang/aarch64/; \
-	  for u in $(LIB_UNITS); do \
+	  for u in $(CORE_UNITS) $(LIB_UNITS); do \
 	    b=$$(basename $$u .paslang); \
 	    $(INSTALL_DATA) $(A64DIR)/$$b.pi $(A64DIR)/$$b.o $(DESTDIR)$(libdir)/paslang/aarch64/; \
+	  done; \
+	  mkdir -p '$(DESTDIR)$(libdir)/paslang/aarch64/$(LVL_A64)'; \
+	  for u in $(CORE_UNITS) $(LIB_UNITS); do \
+	    b=$$(basename $$u .paslang); \
+	    $(INSTALL_DATA) '$(A64DIR)/$(LVL_A64)'/$$b.o '$(DESTDIR)$(libdir)/paslang/aarch64/$(LVL_A64)/'; \
 	  done; \
 	fi
 	$(POST_INSTALL)
@@ -2636,11 +2710,13 @@ package: all compilers $(OUTDIR)/pasdbg
 	for m in amd64 arm64; do \
 	  n=paslang-$$v-linux-$$m; d=$(BUILDDIR)/pkg/$$n; \
 	  rm -rf $$d $$d.tar.gz; \
-	  mkdir -p $$d/bin $$d/lib/paslang/aarch64 $$d/share/doc/paslang/manual $$d/share/paslang; \
+	  mkdir -p $$d/bin $$d/lib/paslang/aarch64 $$d/lib/paslang/$(LVL_X64) "$$d/lib/paslang/aarch64/$(LVL_A64)" \
+	    $$d/share/doc/paslang/manual $$d/share/paslang; \
 	  if [ $$m = amd64 ]; then \
 	    cp $(OUTDIR)/paslangc $(OUTDIR)/pasdbg $$d/bin/; \
 	    for u in $(CORE_UNITS) $(LIB_UNITS); do \
 	      b=$$(basename $$u .paslang); cp $(BUILDDIR)/$$b.pi $(BUILDDIR)/$$b.o $$d/lib/paslang/; \
+	      cp $(BUILDDIR)/$(LVL_X64)/$$b.o $$d/lib/paslang/$(LVL_X64)/; \
 	    done; \
 	  else \
 	    cp $(OUTDIR)/paslangc-arm64 $$d/bin/paslangc; \
@@ -2649,6 +2725,7 @@ package: all compilers $(OUTDIR)/pasdbg
 	  fi; \
 	  for u in $(CORE_UNITS) $(LIB_UNITS); do \
 	    b=$$(basename $$u .paslang); cp $(A64DIR)/$$b.pi $(A64DIR)/$$b.o $$d/lib/paslang/aarch64/; \
+	    cp '$(A64DIR)/$(LVL_A64)'/$$b.o "$$d/lib/paslang/aarch64/$(LVL_A64)/"; \
 	  done; \
 	  cp $(PKGDOCS) $$d/share/doc/paslang/; \
 	  cp docs/manual/index.html $$d/share/doc/paslang/manual/; \
@@ -2681,7 +2758,8 @@ uninstall:
 	rm -rf $(DESTDIR)$(libdir)/paslang
 
 installdirs:
-	mkdir -p $(DESTDIR)$(bindir) $(DESTDIR)$(libdir)/paslang $(DESTDIR)$(libdir)/paslang/aarch64
+	mkdir -p $(DESTDIR)$(bindir) $(DESTDIR)$(libdir)/paslang $(DESTDIR)$(libdir)/paslang/aarch64 \
+	  $(DESTDIR)$(libdir)/paslang/$(LVL_X64) '$(DESTDIR)$(libdir)/paslang/aarch64/$(LVL_A64)'
 
 installcheck:
 	$(DESTDIR)$(bindir)/paslangc -o $(BUILDDIR)/paslang-installcheck $(srcdir)/testdata/hello.paslang
