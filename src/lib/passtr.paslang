@@ -79,6 +79,8 @@ procedure PasDeleteStr(var S: string; Index, Count: Int64);
 function PasStringOfChar(C: Char; N: Int64): string;
 
 function PasValInt(const S: string; Unsigned: Boolean; out Code: Int64): Int64;
+function PasValRange(const S: string; Lo, Hi: Int64; Unsigned: Boolean; Bits: Int64;
+  out Code: Int64): Int64;
 function PasValReal(const S: string; out Code: Int64): Double;
 function PasValSingle(const S: string; out Code: Int64): Single;
 function PasValQuadLo(const S: string; out Code, Hi: Int64): Int64;
@@ -2012,20 +2014,33 @@ end;
 
 { ---- Val ---- }
 
-{ A number's text as Free Pascal's Val reads it: blanks and tabs first,
-  a sign, then decimal digits, or $ (or 0x or x) and hexadecimal ones,
-  % and binary ones, & and octal ones; a NUL ends it. Code is 0, or the
-  place from 1 of the first character that is none of it (the end's
-  place when the digits are missing, the digit's where 64 bits
-  overflow); an unsigned type's number takes no minus, the place of
-  its first digit said. }
-function PasValInt(const S: string; Unsigned: Boolean; out Code: Int64): Int64;
+{ A number's text as Free Pascal's Val reads it, into a type whose values
+  go from Lo to Hi (P149): blanks and tabs first, a sign, then decimal
+  digits, or $ (or 0x or x) and hexadecimal ones, % and binary ones, &
+  and octal ones; a NUL ends it. Unsigned: Hi is read unsigned (-1 is
+  2^64 - 1) and a minus is refused at its place. Bits: the width of an
+  integer type, whose whole pattern a number in another base may fill
+  ($FF into a ShortInt is -1); 0 for a subrange, whose bounds hold in
+  every base. Code is 0, or the place from 1 of the first character that
+  is none of the number (the end's when the digits are missing), of the
+  digit that takes it past its type, or of the last digit of a number
+  below a subrange's lowest value: Free Pascal 3.3.1's Val
+  (rtl/inc/sstrings.inc checks the destination's size; its 3.2.2 kept
+  the low bits of an unsigned one, as this did, a value lost without a
+  word). On an error the value is 0, or Lo when 0 is not one of the
+  type's, where Free Pascal says the variable is undefined. }
+function PasValRange(const S: string; Lo, Hi: Int64; Unsigned: Boolean; Bits: Int64;
+  out Code: Int64): Int64;
 var
-  i, n, base, d, acc: Int64;
+  i, n, base, d, acc, v, bad: Int64;
   neg: Boolean;
   c: Char;
 begin
-  Result := 0;
+  if (Lo <= 0) and (Unsigned or (Hi >= 0)) then
+    bad := 0
+  else
+    bad := Lo;
+  Result := bad;
   n := Length(S);
   i := 1;
   while (i <= n) and ((S[i] = ' ') or (S[i] = #9)) do
@@ -2036,6 +2051,9 @@ begin
   neg := False;
   if S[i] = '-' then
   begin
+    { an unsigned type takes no minus: its place }
+    if Unsigned then
+      Exit;
     neg := True;
     i := i + 1;
   end
@@ -2073,8 +2091,6 @@ begin
   Code := i;
   if (i > n) or (S[i] = #0) then
     Exit;
-  if neg and Unsigned then
-    Exit;
   acc := 0;
   while (i <= n) and (S[i] <> #0) do
   begin
@@ -2087,75 +2103,99 @@ begin
       d := Ord(c) - 55
     else
       d := 99;
+    Code := i;
     if d >= base then
-    begin
-      Code := i;
-      Result := 0;
       Exit;
-    end;
     if (base = 10) and Unsigned then
     begin
-      { an unsigned number to 2^64 - 1, as Free Pascal's Val reads one
-        for a QWord, a Cardinal, a Word or a Byte (P142): acc stays below
-        2^63 until the last step, which may set the top bit }
-      if (acc > 1844674407370955161) or ((acc = 1844674407370955161) and (d > 5)) then
-      begin
-        Code := i;
-        Result := 0;
+      { counted up to 2^64 - 1 (P142), compared unsigned: past 2^63 acc
+        has its top bit set, and a 21st digit went through a signed
+        test and wrapped (found by P149's model); then not past Hi }
+      if ((acc xor Low(Int64)) > (1844674407370955161 xor Low(Int64))) or
+        ((acc = 1844674407370955161) and (d > 5)) then
         Exit;
-      end;
       acc := acc * 10 + d;
+      if (acc xor Low(Int64)) > (Hi xor Low(Int64)) then
+        Exit;
     end
     else if base = 10 then
     begin
-      { worked out below zero, where Int64 reaches one further }
+      { worked out below zero, where Int64 reaches one further; not past
+        Lo, or -Hi for a positive number (Hi is at most 2^63 - 1) }
       if (acc < -922337203685477580) or ((acc = -922337203685477580) and (d > 8)) then
-      begin
-        Code := i;
-        Result := 0;
         Exit;
-      end;
       acc := acc * 10 - d;
+      if neg and (acc < Lo) then
+        Exit;
+      if (not neg) and (acc < -Hi) then
+        Exit;
     end
     else
     begin
-      { hexadecimal, octal, binary: any 64 bits }
+      { hexadecimal, octal, binary: any 64 bits, then the width's pattern
+        or the bounds; a negative one's magnitude up to -Lo }
       if (base = 16) and ((acc shr 60) <> 0) or (base = 8) and ((acc shr 61) <> 0) or
         (base = 2) and ((acc shr 63) <> 0) then
-      begin
-        Code := i;
-        Result := 0;
         Exit;
-      end;
       if base = 16 then
         acc := (acc shl 4) or d
       else if base = 8 then
         acc := (acc shl 3) or d
       else
         acc := (acc shl 1) or d;
+      if neg then
+      begin
+        if (acc xor Low(Int64)) > ((-Lo) xor Low(Int64)) then
+          Exit;
+      end
+      else if (Bits > 0) and (Bits < 64) then
+      begin
+        if (acc shr Bits) <> 0 then
+          Exit;
+      end
+      else if (Bits = 0) and ((acc xor Low(Int64)) > (Hi xor Low(Int64))) then
+        Exit;
     end;
     i := i + 1;
   end;
   if (base = 10) and Unsigned then
-    Result := acc
+    v := acc
   else if base = 10 then
   begin
     if neg then
-      Result := acc
-    else if acc = Low(Int64) then
-    begin
-      { 2^63 has no Int64: the last digit overflows }
-      Code := i - 1;
-      Exit;
-    end
+      v := acc
     else
-      Result := -acc;
+      v := -acc;
   end
   else if neg then
-    Result := -acc
+    v := -acc
+  else if (Bits > 0) and (Bits < 64) and not Unsigned then
+    { the width's pattern, its top bit the sign }
+    v := (acc shl (64 - Bits)) sar (64 - Bits)
   else
-    Result := acc;
+    v := acc;
+  { a subrange's lowest value above the digits, or its highest below a
+    negative number's: the number, whole, is out of it }
+  Code := i - 1;
+  if Unsigned then
+  begin
+    if (v xor Low(Int64)) < (Lo xor Low(Int64)) then
+      Exit;
+  end
+  else if (v < Lo) or (v > Hi) then
+    Exit;
   Code := 0;
+  Result := v;
+end;
+
+{ Val's reading into 64 bits (P134): an Integer's range, or with Unsigned
+  a QWord's, 0 to 2^64 - 1 (P142). }
+function PasValInt(const S: string; Unsigned: Boolean; out Code: Int64): Int64;
+begin
+  if Unsigned then
+    Result := PasValRange(S, 0, -1, True, 64, Code)
+  else
+    Result := PasValRange(S, Low(Int64), High(Int64), False, 64, Code);
 end;
 
 { A real's text as Val reads it: blanks, a sign, digits with a point

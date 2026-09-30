@@ -5554,11 +5554,17 @@ change its ASCII letters; `StringOfChar(c, n)` is `n` times `c`;
 enumeration's member by its name, padded on the right); and `Val(s, v,
 code)` reads a number into `v` (decimal, `$` or `0x` hexadecimal, `%`
 binary, `&` octal, blanks first), a real or an enumeration's member,
-`code` 0 or the place of the first character it could not read. Into
-an unsigned type (`Byte`, `Word`, `UInt32`, a subrange from 0) it
-reads a decimal number up to 2^64 - 1 and keeps its low bits, as Free
-Pascal does: `'300'` into a `Byte` is 44, code 0 (1.1.17, P142; past
-2^63 was an error). Into a `Single` it reads the nearest `Single`,
+`code` 0 or the place of the first character it could not read. An
+integer is read into its own type: a number past it is an error at the
+digit that goes past (`'300'` into a `Byte` is code 3), a minus into an
+unsigned type is an error at its place, and a hexadecimal, octal or
+binary number may fill the width's pattern (`'$FF'` into an `Int8` is
+-1), as Free Pascal 3.3.1's `Val` reads; a subrange's bounds hold in
+every base, and a number below a positive one's lowest value is an
+error at its last digit. On an error the variable is 0, or its type's
+lowest value when 0 is not one of them (Free Pascal leaves it
+undefined). Free Pascal 3.2.2 kept the low bits, `'300'` into a `Byte`
+44 with code 0, and so did paslang until 1.1.27 (P149). Into a `Single` it reads the nearest `Single`,
 rounded once from the digits as Go's `ParseFloat` and paslang's
 literals do (Free Pascal reads an `Extended` and rounds that again, so
 a number just below the midpoint of two `Single`s can come out one
@@ -9674,7 +9680,8 @@ parameter; `IsDelimiter`, `LastDelimiter`, `AdjustLineBreaks`, `WrapText`
 one-argument form, sixteen digits); `StrToInt`, `StrToInt64`,
 `StrToQWord`, `StrToUInt64`, `StrToDWord`, `StrToUInt`, each with its
 `Def` and `Try` forms, reading what `Val` reads (decimal, `$`, `0x`, `%`,
-`&`); `BoolToStr` (`-1` and `0`, or `TrueBoolStrs` and `FalseBoolStrs`,
+`&`) into its type's range: a `DWord` past 2^32 - 1 is an error, where
+its low 32 bits were kept (P149); `BoolToStr` (`-1` and `0`, or `TrueBoolStrs` and `FalseBoolStrs`,
 or two strings given), `StrToBool`, `StrToBoolDef`, `TryStrToBool`.
 
 **Reals and the settings.** `StrToFloat`, `StrToFloatDef` and
@@ -10372,7 +10379,10 @@ the commands on standard input, under `--debug-mode` and under
 - `Str(x, s)` of a real without a width writes what `Write(x)` writes
   (`2.5`), where Free Pascal writes ` 2.500000000E+00`; `Integer` is 64
   bits, so `Val` into one reads 64 bits, where Free Pascal's `Integer`
-  is 32. `Insert` and `Delete` of a slice read it more than once: one
+  is 32. `Val` of a number past its variable's type is an error, as in
+  Free Pascal 3.3.1, where 3.2.2 kept the low bits: a value lost without
+  a word; a subrange is held to its own bounds, where Free Pascal holds
+  it to the bytes it takes. `Insert` and `Delete` of a slice read it more than once: one
   a call reaches is put in a variable first.
 - A one-character literal is a string where a helper's method is called
   on it (`'x'.Twice` is string's helper), where Free Pascal takes it for
