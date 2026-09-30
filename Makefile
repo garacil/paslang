@@ -1716,6 +1716,17 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	done; \
 	$(A64_OBJDUMP) -d --no-show-raw-insn $(BUILDDIR)/lvluse-arm-base | awk '/<p_lvlu_check>:/,/ret/' | grep -q pascrc32cbase; \
 	$(A64_OBJDUMP) -d --no-show-raw-insn $(BUILDDIR)/lvluse-arm-max | awk '/<p_lvlu_check>:/,/ret/' | grep -q pascrc32ccpu; \
+	: the ifdef words of -cpu, P148: one CPU_ word for each feature; \
+	for c in base $(LVL_X64); do \
+	  $(OUTDIR)/paslangc -cpu $$c -o $(BUILDDIR)/cpudefs-$$c testdata/cpudefs.paslang; \
+	  $(BUILDDIR)/cpudefs-$$c > $(BUILDDIR)/cpudefs-$$c.got; \
+	  diff -u testdata/cpudefs-$$c.out $(BUILDDIR)/cpudefs-$$c.got; \
+	done; \
+	for c in base max; do \
+	  $(OUTDIR)/paslangc -target arm64 -cpu $$c -o $(BUILDDIR)/cpudefs-arm-$$c testdata/cpudefs.paslang; \
+	  timeout 60 $(QEMU_A64) $(BUILDDIR)/cpudefs-arm-$$c > $(BUILDDIR)/cpudefs-arm-$$c.got; \
+	  diff -u testdata/cpudefs-arm-$$c.out $(BUILDDIR)/cpudefs-arm-$$c.got; \
+	done; \
 	$(OUTDIR)/paslangc testdata/units/safeu.paslang; \
 	grep -q '^SAFE$$' $(BUILDDIR)/safeu.pi; \
 	if grep -q '^SAFE$$' $(BUILDDIR)/adder.pi; then echo "adder.pi says SAFE for a unit that is not safe"; exit 1; fi; \

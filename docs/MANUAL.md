@@ -219,6 +219,23 @@ either machine:
 {$endif}
 ```
 
+The processor the code is compiled for (`-cpu`, §20) names its
+features too: `CPU_AVX2`, `CPU_SSE42`, `CPU_BMI1`, `CPU_SHA2` on amd64,
+`CPU_CRC32`, `CPU_AES`, `CPU_PMULL`, `CPU_SHA2` on arm64, one for every
+feature name `-cpu` takes, each defined when that processor has it. A
+unit or a program chooses its bodies with them when it is compiled, as
+the language's own words choose their kernels, and nothing is tested at
+run time; a unit's build for a level (§20) takes that level's (1.1.23,
+P148):
+
+```
+{$ifdef CPU_AVX2}
+  r := PasCaseCmpCpu(p, q, n);   { vpcmpeqb, 32 bytes a step }
+{$else}
+  r := PasCaseCmpBase(p, q, n);  { the SSE2 or NEON body }
+{$endif}
+```
+
 Any other directive (`{$mode objfpc}`, `{$H+}`) is read as a comment.
 
 ## 3. Values and types
