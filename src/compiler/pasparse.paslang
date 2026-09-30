@@ -103,6 +103,8 @@ type
     FBlockOpen: LongInt;      { block logic nodes of the statement being read that no assignment took yet (1.0.120) }
     FInBody: Boolean;         { reading a routine's body, not the program's or a unit's block }
     FConstNames: TStrArray;   { the const parameters of the routines being read, outermost first (1.1.1) }
+    FHelpers: array of LongInt;  { the helpers in scope, in the order declared or loaded (P127) }
+    FHelperTyp: LongInt;      { the helper whose method is being read (P127), 0 outside one }
     FModNoAddr: Boolean;      { ExprMod: an address taken is not a change (the const check, 1.1.1) }
     FProcs: array of TProcEnt;
     FOps: array of TOpEnt;
@@ -437,6 +439,15 @@ type
     function InternProc(IsFn: Boolean; Ret: LongInt;
       const Typs: array of LongInt; const Refs: array of Boolean): LongInt;
     function ParseClassType(const AName: string): LongInt;
+    function ParseHelperType(const AName: string; HKind: LongInt): LongInt;
+    function HelperFor(T: LongInt): LongInt;
+    function HelperHas(H: LongInt; const AName: string): Boolean;
+    function HelperSelf(Obj: PExpr; H: LongInt): PExpr;
+    function HelperMember(Obj: PExpr; H: LongInt; const AName: string; ALine, ACol: LongInt): PExpr;
+    function HelperCall(Obj: PExpr; Owner: LongInt; const M: TMethInfo; var Args: TExprArray; const AName: string): PExpr;
+    function IsHelperWord: Boolean;
+    function RecFieldIdx(T: LongInt; const AName: string): SizeInt;
+    function TypeDot(T: LongInt): PExpr;
     function ClassOfTarget: LongInt;
     function ParseIfaceType(const AName: string): LongInt;
     function InternChan(Elem: LongInt): LongInt;
@@ -4725,6 +4736,42 @@ end;
 { AName is Result, the function's name, or a local or a parameter of the
   routine being read or of one around it: a name a member of Self does
   not hide. }
+{ T.Member after a type's name, FTok on the dot (P127): a static method
+  of the helper for T. }
+function TParser.TypeDot(T: LongInt): PExpr;
+var
+  mname: string;
+  ml, mc: LongInt;
+begin
+  Eat(tkDot);
+  if FTok.Lexeme = '' then
+    Fail('member name');
+  mname := FTok.Lexeme;
+  ml := FTok.Line;
+  mc := FTok.Col;
+  FTok := FLex.Next;
+  if (HelperFor(T) = 0) or not HelperHas(HelperFor(T), mname) then
+    Die('unknown member ' + mname + ' of ' + TypName(T) + ': no helper for it has one' +
+      HerePos);
+  Result := HelperMember(nil, HelperFor(T), mname, ml, mc);
+end;
+
+{ The index of record type T's field AName, -1 when it has none (P127). }
+function TParser.RecFieldIdx(T: LongInt; const AName: string): SizeInt;
+var
+  i: SizeInt;
+begin
+  Result := -1;
+  if TypeOf(T).Kind <> tykRecord then
+    Exit;
+  for i := 0 to High(FTypes[T].Fields) do
+    if SameId(FTypes[T].Fields[i].Name, AName) then
+    begin
+      Result := i;
+      Exit;
+    end;
+end;
+
 function TParser.IsLocalName(const AName: string): Boolean;
 var
   i, k: SizeInt;
@@ -6233,6 +6280,591 @@ end;
 
 { A class, read after its word class (the caller took it, to tell it
   from class of). }
+{ The word helper after type, record or class (P127): helper, then for
+  or the parent in parentheses; a record's first field may still be
+  named helper. }
+function TParser.IsHelperWord: Boolean;
+var
+  c: Char;
+begin
+  Result := False;
+  if (FTok.Kind <> tkIdent) or not SameId(FTok.Lexeme, 'helper') then
+    Exit;
+  c := FLex.NextSolid;
+  Result := (c = '(') or (c = 'f') or (c = 'F');
+end;
+
+{ A helper (P127): type helper for a simple type, record helper for a
+  record, class helper for a class (HKind 0, 1, 2, kept in Lo), with a
+  helper it descends from in parentheses. Its members are methods, a
+  class one static, and properties read and written through them; it
+  has no fields. Each method is a routine named Helper.Method whose
+  first parameter is Self: the value, by reference, for a type or a
+  record helper, the object for a class helper; a static one has none.
+  The last helper declared for a type is the one in scope, as in FPC;
+  one that descends from another has that one's members too. }
+function TParser.ParseHelperType(const AName: string; HKind: LongInt): LongInt;
+var
+  td: TTypeDef;
+  parent, target, t, pt, npar: LongInt;
+  n, i, nn, ov: SizeInt;
+  names: array of string;
+  mname, rname, wname, baseSym, mpos: string;
+  isFunc, isClassM, isStat, byref, eq: Boolean;
+  tk: TTypeKind;
+  vis: Byte;
+  nindex: LongInt;
+begin
+  FTok := FLex.Next;
+  parent := 0;
+  if FTok.Kind = tkLParen then
+  begin
+    FTok := FLex.Next;
+    if (FTok.Kind <> tkIdent) or (not NamedType(FTok.Lexeme, parent)) or
+      (TypeOf(parent).Kind <> tykHelper) then
+      Die('a helper descends from a helper' + HerePos);
+    if TypeOf(parent).Lo <> HKind then
+      Die('a helper descends from a helper of its kind' + HerePos);
+    FTok := FLex.Next;
+    Eat(tkRParen);
+  end;
+  Eat(tkFor);
+  target := Self.ParseType;
+  tk := TypeOf(target).Kind;
+  if (HKind = 2) and (tk <> tykClass) then
+    Die('a class helper is for a class, not ' + TypName(target) + HerePos);
+  if (HKind = 1) and (tk <> tykRecord) then
+    Die('a record helper is for a record, not ' + TypName(target) + HerePos);
+  if (HKind = 0) and ((tk = tykRecord) or (tk = tykClass) or (tk = tykInterface) or
+    (tk = tykProc) or (tk = tykMethod) or (tk = tykClassRef) or (tk = tykHelper) or
+    (tk = tykGeneric) or (tk = tykParam)) then
+    Die('a type helper is for a simple type: record helper for a record, class helper ' +
+      'for a class, not ' + TypName(target) + HerePos);
+  if (parent <> 0) and (HKind <> 2) and not SameTyp(TypeOf(parent).Elem, target) then
+    Die('a helper descends from a helper for its type, ' + TypName(target) + HerePos);
+  td := Default(TTypeDef);
+  td.Kind := tykHelper;
+  td.Elem := target;
+  td.Parent := parent;
+  td.Lo := HKind;
+  td.Size := 0;
+  Result := AddNamedType(AName, td);
+  td.Meths := nil;
+  td.Props := nil;
+  vis := VisPublic;
+  while FTok.Kind <> tkEnd do
+  begin
+    if (FTok.Kind = tkIdent) and (SameId(FTok.Lexeme, 'public') or
+      SameId(FTok.Lexeme, 'private') or SameId(FTok.Lexeme, 'published') or
+      SameId(FTok.Lexeme, 'protected') or SameId(FTok.Lexeme, 'strict')) then
+    begin
+      if SameId(FTok.Lexeme, 'strict') then
+      begin
+        FTok := FLex.Next;
+        if (FTok.Kind = tkIdent) and SameId(FTok.Lexeme, 'private') then
+          vis := VisStrictPrivate
+        else if (FTok.Kind = tkIdent) and SameId(FTok.Lexeme, 'protected') then
+          vis := VisStrictProtected
+        else
+          Die('strict goes before private or protected' + HerePos);
+      end
+      else if SameId(FTok.Lexeme, 'private') then
+        vis := VisPrivate
+      else if SameId(FTok.Lexeme, 'protected') then
+        vis := VisProtected
+      else
+        vis := VisPublic;
+      FTok := FLex.Next;
+      Continue;
+    end;
+    isClassM := False;
+    if FTok.Kind = tkClass then
+    begin
+      FTok := FLex.Next;
+      isClassM := True;
+    end;
+    if FTok.Kind = tkProperty then
+    begin
+      if isClassM then
+        Die('a helper''s property is read from a value' + HerePos);
+      FTok := FLex.Next;
+      if FTok.Kind <> tkIdent then
+        Die('property name');
+      mname := FTok.Lexeme;
+      CheckName(mname);
+      FTok := FLex.Next;
+      nindex := 0;
+      if FTok.Kind = tkLBrack then
+      begin
+        FTok := FLex.Next;
+        while FTok.Kind <> tkRBrack do
+        begin
+          if (FTok.Kind = tkConst) or (FTok.Kind = tkVar) then
+            FTok := FLex.Next;
+          nn := 0;
+          while FTok.Kind = tkIdent do
+          begin
+            Inc(nn);
+            FTok := FLex.Next;
+            if FTok.Kind = tkComma then
+              FTok := FLex.Next
+            else
+              Break;
+          end;
+          if nn = 0 then
+            Die('index name');
+          Eat(tkColon);
+          Self.ParseType;
+          nindex := nindex + LongInt(nn);
+          if FTok.Kind = tkSemi then
+            FTok := FLex.Next;
+        end;
+        Eat(tkRBrack);
+      end;
+      Eat(tkColon);
+      t := Self.ParseType;
+      rname := '';
+      wname := '';
+      while FTok.Kind <> tkSemi do
+      begin
+        if FTok.Kind = tkRead then
+        begin
+          FTok := FLex.Next;
+          rname := FTok.Lexeme;
+          FTok := FLex.Next;
+        end
+        else if FTok.Kind = tkWrite then
+        begin
+          FTok := FLex.Next;
+          wname := FTok.Lexeme;
+          FTok := FLex.Next;
+        end
+        else
+          Die('property');
+      end;
+      Eat(tkSemi);
+      if (rname = '') and (wname = '') then
+        Die('a property reads or writes through a method' + HerePos);
+      n := Length(td.Props);
+      SetLength(td.Props, n + 1);
+      td.Props[n].Name := mname;
+      td.Props[n].Typ := t;
+      td.Props[n].ReadOff := -1;
+      td.Props[n].WriteOff := -1;
+      td.Props[n].ReadName := rname;
+      td.Props[n].WriteName := wname;
+      td.Props[n].NIndex := nindex;
+      td.Props[n].Vis := vis;
+      Continue;
+    end;
+    if (FTok.Kind = tkConstructor) or (FTok.Kind = tkDestructor) then
+      Die('a helper has no constructor or destructor: a static class function makes a value' +
+        HerePos);
+    if (FTok.Kind <> tkProcedure) and (FTok.Kind <> tkFunction) then
+    begin
+      if isClassM then
+        Die('class goes before a helper''s method' + HerePos);
+      Die('a helper has methods and properties, no fields' + HerePos);
+    end;
+    isFunc := FTok.Kind = tkFunction;
+    FTok := FLex.Next;
+    if FTok.Kind <> tkIdent then
+      Die('method name');
+    mname := FTok.Lexeme;
+    mpos := HerePos;
+    CheckName(mname);
+    FTok := FLex.Next;
+    npar := 0;
+    n := Length(td.Meths);
+    SetLength(td.Meths, n + 1);
+    td.Meths[n] := Default(TMethInfo);
+    td.Meths[n].Slot := -1;
+    td.Meths[n].ParamTyps := nil;
+    td.Meths[n].ByRef := nil;
+    if FTok.Kind = tkLParen then
+    begin
+      FTok := FLex.Next;
+      if FTok.Kind <> tkRParen then
+      begin
+        while True do
+        begin
+          byref := False;
+          if (FTok.Kind = tkVar) or (FTok.Kind = tkOut) then
+          begin
+            byref := True;
+            FTok := FLex.Next;
+          end
+          else if FTok.Kind = tkConst then
+            FTok := FLex.Next;
+          names := nil;
+          nn := 0;
+          while True do
+          begin
+            if not IsName then
+              Die('parameter name');
+            SetLength(names, nn + 1);
+            CheckName(FTok.Lexeme);
+            if SameId(FTok.Lexeme, 'self') then
+              Die('duplicate identifier Self' + HerePos);
+            names[nn] := FTok.Lexeme;
+            Inc(nn);
+            FTok := FLex.Next;
+            if FTok.Kind <> tkComma then
+              Break;
+            FTok := FLex.Next;
+          end;
+          Eat(tkColon);
+          pt := ParamType(byref);
+          for i := 0 to nn - 1 do
+          begin
+            if npar >= 31 then
+              Die('at most 31 parameters and Self');
+            SetLength(td.Meths[n].ParamTyps, npar + 1);
+            SetLength(td.Meths[n].ByRef, npar + 1);
+            td.Meths[n].ParamTyps[npar] := pt;
+            td.Meths[n].ByRef[npar] := byref;
+            Inc(npar);
+          end;
+          MethParamDefault(td.Meths[n], nn, byref, pt);
+          if FTok.Kind <> tkSemi then
+            Break;
+          FTok := FLex.Next;
+        end;
+      end;
+      Eat(tkRParen);
+    end;
+    DefaultsLast(td.Meths[n]);
+    t := TyNone;
+    if isFunc then
+    begin
+      Eat(tkColon);
+      t := Self.ParseType;
+    end;
+    Eat(tkSemi);
+    isStat := False;
+    while True do
+    begin
+      if (FTok.Kind = tkIdent) and SameId(FTok.Lexeme, 'overload') then
+      begin
+      end
+      else if (FTok.Kind = tkIdent) and SameId(FTok.Lexeme, 'inline') then
+      begin
+      end
+      else if (FTok.Kind = tkIdent) and SameId(FTok.Lexeme, 'static') then
+      begin
+        if not isClassM then
+          Die('static goes after a class method' + HerePos);
+        isStat := True;
+      end
+      else if (FTok.Kind = tkVirtual) or ((FTok.Kind = tkIdent) and
+        (SameId(FTok.Lexeme, 'override') or SameId(FTok.Lexeme, 'abstract'))) then
+        Die('a helper''s method is not virtual: a helper has no method table' + HerePos)
+      else
+        Break;
+      FTok := FLex.Next;
+      if FTok.Kind = tkSemi then
+        FTok := FLex.Next;
+    end;
+    if isClassM and not isStat then
+      Die('a helper''s class method is static: class function F: T; static;' + mpos);
+    baseSym := ProcSym('', AName + '_' + mname);
+    ov := -1;
+    for i := 0 to n - 1 do
+      if SameId(td.Meths[i].Name, mname) then
+      begin
+        ov := i;
+        eq := td.Meths[i].NParams = npar;
+        if eq then
+          for nn := 0 to npar - 1 do
+            if (td.Meths[i].ParamTyps[nn] <> td.Meths[n].ParamTyps[nn]) or
+              (td.Meths[i].ByRef[nn] <> td.Meths[n].ByRef[nn]) then
+              eq := False;
+        if eq then
+          Die('duplicate identifier ' + mname + mpos);
+      end;
+    if ov >= 0 then
+    begin
+      baseSym := baseSym + '_o';
+      for nn := 0 to npar - 1 do
+        baseSym := baseSym + '_' + IntToStr(td.Meths[n].ParamTyps[nn]);
+    end;
+    td.Meths[n].Name := mname;
+    td.Meths[n].Sym := baseSym;
+    td.Meths[n].IsFunc := isFunc;
+    td.Meths[n].NParams := npar;
+    td.Meths[n].RetTyp := t;
+    td.Meths[n].IsClassMeth := isClassM;
+    td.Meths[n].IsStatic := isStat;
+    td.Meths[n].Vis := vis;
+  end;
+  Eat(tkEnd);
+  { a property's methods are the helper's or its parent's }
+  FTypes[Result].Meths := td.Meths;
+  FTypes[Result].Props := td.Props;
+  for n := 0 to High(td.Props) do
+  begin
+    if (td.Props[n].ReadName <> '') and not HelperHas(Result, td.Props[n].ReadName) then
+      Die(AName + '.' + td.Props[n].Name + ' reads through ' + td.Props[n].ReadName +
+        ', which is no method of the helper');
+    if (td.Props[n].WriteName <> '') and not HelperHas(Result, td.Props[n].WriteName) then
+      Die(AName + '.' + td.Props[n].Name + ' writes through ' + td.Props[n].WriteName +
+        ', which is no method of the helper');
+  end;
+  n := Length(FHelpers);
+  SetLength(FHelpers, n + 1);
+  FHelpers[n] := Result;
+end;
+
+{ The helper in scope for type T (P127): the last declared or loaded for
+  it, a class helper for T or an ancestor; 0 when there is none. }
+function TParser.HelperFor(T: LongInt): LongInt;
+var
+  i: SizeInt;
+  h, tg: LongInt;
+begin
+  Result := 0;
+  if T <= 0 then
+    Exit;
+  for i := High(FHelpers) downto 0 do
+  begin
+    h := FHelpers[i];
+    tg := FTypes[h].Elem;
+    if FTypes[h].Lo = 2 then
+    begin
+      if (TypeOf(T).Kind = tykClass) and ClassUnder(T, tg) then
+      begin
+        Result := h;
+        Exit;
+      end;
+    end
+    else if (T = tg) or SameTyp(T, tg) then
+    begin
+      Result := h;
+      Exit;
+    end;
+  end;
+end;
+
+{ Helper H, or one it descends from, has a method or a property named
+  AName (P127). }
+function TParser.HelperHas(H: LongInt; const AName: string): Boolean;
+var
+  i: SizeInt;
+begin
+  Result := False;
+  while H > 0 do
+  begin
+    for i := 0 to High(FTypes[H].Meths) do
+      if SameId(FTypes[H].Meths[i].Name, AName) then
+      begin
+        Result := True;
+        Exit;
+      end;
+    for i := 0 to High(FTypes[H].Props) do
+      if SameId(FTypes[H].Props[i].Name, AName) then
+      begin
+        Result := True;
+        Exit;
+      end;
+    H := FTypes[H].Parent;
+  end;
+end;
+
+{ The Self argument of a call of helper H's method on Obj (P127): the
+  object for a class helper; else the value's address, a var argument,
+  when Obj is a variable the routine may change, and a hidden copy's
+  when it is a value, a constant or a const parameter (rt_tmpaddr). }
+function TParser.HelperSelf(Obj: PExpr; H: LongInt): PExpr;
+var
+  a: TExprArray;
+  pre: TStmtArray;
+  tv: PExpr;
+  root: string;
+  i: SizeInt;
+  place: Boolean;
+begin
+  if FTypes[H].Lo = 2 then
+  begin
+    Result := Obj;
+    Exit;
+  end;
+  place := (Obj^.Kind = ekVar) or (Obj^.Kind = ekField) or (Obj^.Kind = ekIndex) or
+    (Obj^.Kind = ekDeref);
+  if place then
+  begin
+    root := RootName(Obj);
+    for i := 0 to High(FConstNames) do
+      if (root <> '') and SameId(root, FConstNames[i]) then
+        place := False;
+  end;
+  if place then
+  begin
+    Result := NewAddr(Obj);
+    Result^.Flags := Result^.Flags or 16;
+    Exit;
+  end;
+  pre := nil;
+  tv := HiddenVar(Obj^.Typ, pre, nil);
+  a := nil;
+  SetLength(a, 2);
+  a[0] := NewAddr(tv);
+  a[1] := Obj;
+  Result := NewCall('rt_tmpaddr', a, InternPtr(Obj^.Typ));
+end;
+
+{ A call of method M of helper Owner on Obj, nil for a static one reached
+  through the type (P127): Self first, then the arguments, a var one by
+  its address. }
+function TParser.HelperCall(Obj: PExpr; Owner: LongInt; const M: TMethInfo;
+  var Args: TExprArray; const AName: string): PExpr;
+var
+  all: TExprArray;
+  k, first: SizeInt;
+begin
+  for k := 0 to High(Args) do
+    if (k <= High(M.ByRef)) and M.ByRef[k] then
+      Args[k] := NewAddr(Args[k]);
+  all := nil;
+  first := 0;
+  if not M.IsStatic then
+  begin
+    if Obj = nil then
+      Die(TypeOf(Owner).Name + '.' + AName + ' is a method of a value, not of the type' +
+        HerePos);
+    first := 1;
+    SetLength(all, Length(Args) + 1);
+    all[0] := HelperSelf(Obj, Owner);
+  end
+  else
+    SetLength(all, Length(Args));
+  for k := 0 to High(Args) do
+    all[k + first] := Args[k];
+  Result := NewCall(M.Sym, all, M.RetTyp);
+end;
+
+{ Obj.AName through helper H (P127): a method with its arguments, or a
+  property read through its method, the index in brackets; a property
+  written, Obj.P := x, is a call of its write method that the
+  assignment makes (Flags 128, the value's type in Typ). Obj is
+  nil for a static method named through the type (Integer.Parse). }
+function TParser.HelperMember(Obj: PExpr; H: LongInt; const AName: string;
+  ALine, ACol: LongInt): PExpr;
+var
+  owner, hh: LongInt;
+  mi, px, k: SizeInt;
+  args: TExprArray;
+  have: Boolean;
+  pr: TPropInfo;
+  rname: string;
+begin
+  { a property of the helper or of one it descends from }
+  mi := -1;
+  hh := H;
+  owner := 0;
+  px := -1;
+  while (hh > 0) and (owner = 0) do
+  begin
+    for k := 0 to High(FTypes[hh].Props) do
+      if SameId(FTypes[hh].Props[k].Name, AName) then
+      begin
+        owner := hh;
+        px := k;
+      end;
+    hh := FTypes[hh].Parent;
+  end;
+  if owner <> 0 then
+  begin
+    pr := FTypes[owner].Props[px];
+    if (pr.Vis = VisStrictPrivate) and (FHelperTyp <> owner) then
+      Die(pr.Name + ' is strict private to ' + FTypes[owner].Name + HerePos);
+    if (pr.Vis = VisPrivate) and FTypes[owner].Imported then
+      Die(pr.Name + ' is private to ' + FTypes[owner].Name + '''s unit' + HerePos);
+    args := nil;
+    if pr.NIndex > 0 then
+    begin
+      Eat(tkLBrack);
+      while True do
+      begin
+        SetLength(args, Length(args) + 1);
+        args[High(args)] := ParseExpr;
+        if FTok.Kind <> tkComma then
+          Break;
+        FTok := FLex.Next;
+      end;
+      Eat(tkRBrack);
+      if Length(args) <> pr.NIndex then
+        Die(pr.Name + ' takes ' + IntToStr(pr.NIndex) + ' index' + HerePos);
+    end;
+    if (FTok.Kind = tkAssign) and (pr.WriteName <> '') then
+    begin
+      { the write: its method takes the index and the value, which the
+        assignment adds (Flags 128) }
+      hh := owner;
+      mi := -1;
+      while (hh > 0) and (mi < 0) do
+      begin
+        for k := 0 to High(FTypes[hh].Meths) do
+          if SameId(FTypes[hh].Meths[k].Name, pr.WriteName) and
+            (FTypes[hh].Meths[k].NParams = pr.NIndex + 1) and not FTypes[hh].Meths[k].IsFunc then
+            mi := k;
+        if mi < 0 then
+          hh := FTypes[hh].Parent;
+      end;
+      if mi < 0 then
+        Die(pr.Name + ' writes through ' + pr.WriteName + ', which is no procedure of the ' +
+          'index and the value' + HerePos);
+      if FTypes[hh].Meths[mi].ByRef[pr.NIndex] then
+        Die(pr.WriteName + ' takes the value, not a var parameter' + HerePos);
+      for k := 0 to High(args) do
+        args[k] := ValArg(FTypes[hh].Meths[mi].ParamTyps[k], args[k]);
+      Result := HelperCall(Obj, hh, FTypes[hh].Meths[mi], args, pr.WriteName);
+      Result^.Flags := Result^.Flags or 128;
+      Result^.Typ := FTypes[hh].Meths[mi].ParamTyps[pr.NIndex];
+      Exit;
+    end;
+    if pr.ReadName = '' then
+      Die(pr.Name + ' is written, not read: it has no read method' + HerePos);
+    rname := pr.ReadName;
+    hh := owner;
+    if not PickMeth(FTypes[hh].Meths, rname, args, True, mi) then
+    begin
+      hh := FTypes[owner].Parent;
+      while (hh > 0) and not PickMeth(FTypes[hh].Meths, rname, args, True, mi) do
+        hh := FTypes[hh].Parent;
+      if hh = 0 then
+        Die(pr.Name + ' reads through ' + rname + ', which takes other arguments' + HerePos);
+    end;
+    Result := HelperCall(Obj, hh, FTypes[hh].Meths[mi], args, rname);
+    Result^.Typ := pr.Typ;
+    Exit;
+  end;
+  args := nil;
+  have := False;
+  if FTok.Kind = tkLParen then
+  begin
+    args := ParseArgList;
+    have := True;
+  end;
+  hh := H;
+  mi := -1;
+  while hh > 0 do
+  begin
+    if PickMeth(FTypes[hh].Meths, AName, args, have, mi) then
+      Break;
+    hh := FTypes[hh].Parent;
+  end;
+  if hh = 0 then
+    Die('unknown member ' + AName + ' of ' + FTypes[H].Name + ' at ' + IntToStr(ALine) + ':' +
+      IntToStr(ACol));
+  if (FTypes[hh].Meths[mi].Vis = VisStrictPrivate) and (FHelperTyp <> hh) then
+    Die(AName + ' is strict private to ' + FTypes[hh].Name + HerePos);
+  if (FTypes[hh].Meths[mi].Vis = VisPrivate) and FTypes[hh].Imported then
+    Die(AName + ' is private to ' + FTypes[hh].Name + '''s unit' + HerePos);
+  if (not have) and NeedsArgs(FTypes[hh].Meths[mi]) then
+    Die(AName + ' takes arguments' + HerePos);
+  Result := HelperCall(Obj, hh, FTypes[hh].Meths[mi], args, AName);
+end;
+
 function TParser.ParseClassType(const AName: string): LongInt;
 var
   td: TTypeDef;
@@ -7029,11 +7661,26 @@ begin
     Eat(tkEq);
     if FTok.Kind = tkLParen then
       ParseEnumType(name)
+    else if FTok.Kind = tkType then
+    begin
+      { type helper for T (P127) }
+      FTok := FLex.Next;
+      if not IsHelperWord then
+        Die('type goes before helper here: type helper for T' + HerePos);
+      ParseHelperType(name, 0);
+      Eat(tkSemi);
+    end
     else if FTok.Kind = tkClass then
     begin
-      { class of T, a class reference type (P123), or a class }
+      { class of T, a class reference type (P123), or a class; class
+        helper for C (P127) }
       FTok := FLex.Next;
-      if FTok.Kind = tkOf then
+      if IsHelperWord then
+      begin
+        ParseHelperType(name, 2);
+        Eat(tkSemi);
+      end
+      else if FTok.Kind = tkOf then
       begin
         FTok := FLex.Next;
         id := ClassOfTarget;
@@ -7057,6 +7704,13 @@ begin
     else if FTok.Kind = tkRecord then
     begin
       FTok := FLex.Next;
+      if IsHelperWord then
+      begin
+        { record helper for R (P127) }
+        ParseHelperType(name, 1);
+        Eat(tkSemi);
+        Continue;
+      end;
       td := Default(TTypeDef);
       td.Kind := tykRecord;
       td.Fields := nil;
@@ -7455,6 +8109,13 @@ begin
       nline := FTok.Line;
       ncol := FTok.Col;
       FTok := FLex.Next;
+      { a member of the value's helper (P127), before the type's own: a
+        helper's method hides a class's of the name, as in FPC }
+      if (E^.Typ > 0) and (HelperFor(E^.Typ) <> 0) and HelperHas(HelperFor(E^.Typ), name) then
+      begin
+        E := HelperMember(E, HelperFor(E^.Typ), name, nline, ncol);
+        Continue;
+      end;
       cls := E^.Typ;
       st := TypeOf(E^.Typ);
       found := False;
@@ -7593,7 +8254,15 @@ begin
           E := CoreMethod(E, name);
       end
       else
-        Die('not a record');
+      begin
+        { a value with no members of its own: its helper's (P127) }
+        if (E^.Typ > 0) and (HelperFor(E^.Typ) <> 0) then
+          Die(name + ' is no member of ' + TypName(E^.Typ) + ': the helper in scope, ' +
+            FTypes[HelperFor(E^.Typ)].Name + ', has none' + ' at ' + IntToStr(nline) + ':' +
+            IntToStr(ncol));
+        Die(TypName(E^.Typ) + ' has no members: ' + name + ' needs a record, an object or a ' +
+          'helper for ' + TypName(E^.Typ) + ' at ' + IntToStr(nline) + ':' + IntToStr(ncol));
+      end;
     end
     else if (FTok.Kind = tkLParen) and (TypeOf(E^.Typ).Kind = tykProc) then
     begin
@@ -7768,6 +8437,9 @@ begin
         end
         else
           Result := NewStr(buf);
+        { 'text'.Method of a string's helper (P127) }
+        if (FTok.Kind = tkDot) and (HelperFor(Result^.Typ) <> 0) then
+          Result := ParsePostfix(Result);
       end;
     tkTrue:
       begin
@@ -7819,6 +8491,12 @@ begin
         { Integer(p): a pointer, class, map, chan or ordinal seen as a
           machine word. No code is generated. }
         FTok := FLex.Next;
+        if FTok.Kind = tkDot then
+        begin
+          { Integer.Parse: a static method of Integer's helper (P127) }
+          Result := ParsePostfix(TypeDot(TyInteger));
+          Exit;
+        end;
         Eat(tkLParen);
         e := ParseExpr;
         Eat(tkRParen);
@@ -7851,10 +8529,23 @@ begin
     tkBoolean:
       begin
         FTok := FLex.Next;
+        if FTok.Kind = tkDot then
+        begin
+          Result := ParsePostfix(TypeDot(TyBoolean));
+          Exit;
+        end;
         Eat(tkLParen);
         e := ParseExpr;
         Eat(tkRParen);
         Result := BoolOf(e);
+      end;
+    tkStringKw:
+      begin
+        { string.Join: a static method of string's helper (P127) }
+        FTok := FLex.Next;
+        if FTok.Kind <> tkDot then
+          Die('string is a type here: string.Method names a helper''s static method' + HerePos);
+        Result := ParsePostfix(TypeDot(TyString));
       end;
     tkRecv:
       begin
@@ -7875,7 +8566,32 @@ begin
         nline := FTok.Line;
         ncol := FTok.Col;
         FTok := FLex.Next;
-        if SameId(name, 'SrcLine') then
+        { in a helper's method (P127), a member of the helper, or a field
+          of the record it is for, is Self's, as a class's member is in
+          a method of the class; a local or a parameter of the name
+          comes first }
+        if (FHelperTyp <> 0) and (not IsLocalName(name)) and HelperHas(FHelperTyp, name) then
+        begin
+          if IsVarName('self') then
+            Result := HelperMember(NewVar('self', TypeOf(FHelperTyp).Elem), FHelperTyp, name,
+              nline, ncol)
+          else
+            Result := HelperMember(nil, FHelperTyp, name, nline, ncol);
+        end
+        else if (FHelperTyp <> 0) and (not IsLocalName(name)) and (TypeOf(FHelperTyp).Lo = 1) and
+          IsVarName('self') and (RecFieldIdx(TypeOf(FHelperTyp).Elem, name) >= 0) then
+        begin
+          i := RecFieldIdx(TypeOf(FHelperTyp).Elem, name);
+          st := TypeOf(TypeOf(FHelperTyp).Elem);
+          Result := NewField(NewVar('self', TypeOf(FHelperTyp).Elem), st.Fields[i].Name,
+            st.Fields[i].Typ, st.Fields[i].Off);
+        end
+        { Integer.Parse, TPoint.Make: a static method of the type's
+          helper (P127) }
+        else if (FTok.Kind = tkDot) and NamedType(name, id) and (TypeOf(id).Kind <> tykClass) and
+          (TypeOf(id).Kind <> tykHelper) and (HelperFor(id) <> 0) and (not IsVarName(name)) then
+          Result := TypeDot(id)
+        else if SameId(name, 'SrcLine') then
         begin
           if FTok.Kind = tkLParen then
           begin
@@ -13801,7 +14517,17 @@ begin
         begin
           FTok := FLex.Next;
           CheckTyped(e);
-          if (e^.Kind = ekCall) and (e^.Name = 'rt_treeget') and
+          if (e^.Kind = ekCall) and ((e^.Flags and 128) <> 0) then
+          begin
+            { s.P := x of a helper's property (P127): its write method,
+              the value last }
+            st := NewStmt(skCall);
+            st^.Name := e^.Name;
+            st^.Args := e^.Args;
+            SetLength(st^.Args, Length(st^.Args) + 1);
+            st^.Args[High(st^.Args)] := ValArg(e^.Typ, ParseExpr);
+          end
+          else if (e^.Kind = ekCall) and (e^.Name = 'rt_treeget') and
             (TypeOf(e^.Args[0]^.Typ).Elem2 < 0) then
           begin
             { t[k] := True puts k into a tree of K, t[k] := False takes
@@ -14378,6 +15104,15 @@ begin
             FImportMap[FTypes[nw].Meths[j].ParamTyps[k]];
     end;
   end;
+  { a unit's helpers are in scope where it is used (P127), after the
+    ones before them }
+  for i := 0 to mx - 1 do
+    if (Iface.Types[i].Kind = tykHelper) and (FImportMap[i] > TyLastBuiltin) then
+    begin
+      j := Length(FHelpers);
+      SetLength(FHelpers, j + 1);
+      FHelpers[j] := FImportMap[i];
+    end;
 end;
 
 function TParser.MapImport(Id: LongInt): LongInt;
@@ -14563,7 +15298,11 @@ begin
   if Copy(data, 1, 11) = 'PASLANGI17' + #10 then
     Die(path + ' was compiled by a paslang older than 1.1.8; compile ' +
       AName + ' again');
-  if (Copy(data, 1, 8) = 'PASLANGI') and (Copy(data, 1, 11) <> 'PASLANGI18' + #10) then
+  { From 1.1.9 a unit carries its helpers (P127). }
+  if Copy(data, 1, 11) = 'PASLANGI18' + #10 then
+    Die(path + ' was compiled by a paslang older than 1.1.9; compile ' +
+      AName + ' again');
+  if (Copy(data, 1, 8) = 'PASLANGI') and (Copy(data, 1, 11) <> 'PASLANGI19' + #10) then
     Die(path + ' was compiled by a newer paslang (' + FirstLine(data) +
       '); compile ' + AName + ' again with this one');
   if not ParseIface(data, iface) then
@@ -15932,6 +16671,34 @@ begin
           end;
         end;
       end;
+  end;
+  { a helper's method (P127): a routine named Helper.Method, Self its
+    first parameter (by reference for a type or a record helper), none
+    for a static one }
+  if (pr.ClassTyp <> 0) and (TypeOf(pr.ClassTyp).Kind = tykHelper) then
+  begin
+    found := False;
+    for oi := 0 to High(TypeOf(pr.ClassTyp).Meths) do
+      if TypeOf(pr.ClassTyp).Meths[oi].Sym = pr.Sym then
+        found := True;
+    if not found then
+      Die(TypeOf(pr.ClassTyp).Name + ' declares no method ' + pr.Name + ' of these parameters' +
+        hpos);
+    pr.HelperTyp := pr.ClassTyp;
+    pr.ClassTyp := 0;
+    pr.SelfTyp := 0;
+    pr.Name := TypeOf(pr.HelperTyp).Name + '.' + pr.Name;
+    if not pr.NoSelf then
+    begin
+      SetLength(pr.Params, Length(pr.Params) + 1);
+      for n := High(pr.Params) downto 1 do
+        pr.Params[n] := pr.Params[n - 1];
+      pr.Params[0] := Default(TParam);
+      pr.Params[0].Name := 'self';
+      pr.Params[0].Typ := TypeOf(pr.HelperTyp).Elem;
+      pr.Params[0].ByRef := TypeOf(pr.HelperTyp).Lo <> 2;
+    end;
+    pr.NoSelf := False;
   end;
   Result := pr;
 end;
@@ -17676,6 +18443,7 @@ var
   savedConst: TStrArray;
   savedExc: LongInt;
   savedSelfRef, savedNoSelf: Boolean;
+  savedHelper: LongInt;
 begin
   anon := FAnonBody;
   FAnonBody := False;
@@ -17718,6 +18486,15 @@ begin
   FSymChain[High(FSymChain)] := Pr.Sym;
   savedSelfRef := FSelfClassRef;
   savedNoSelf := FNoSelf;
+  savedHelper := FHelperTyp;
+  if Pr.HelperTyp <> 0 then
+    FHelperTyp := Pr.HelperTyp;
+  { a class helper's method sees the object's members as its own (P127) }
+  if (Pr.HelperTyp <> 0) and (TypeOf(Pr.HelperTyp).Lo = 2) and
+    (Length(Pr.Params) > 0) and SameId(Pr.Params[0].Name, 'self') then
+    FClassTyp := TypeOf(Pr.HelperTyp).Elem
+  else if Pr.HelperTyp <> 0 then
+    FClassTyp := 0;
   if Pr.ClassTyp <> 0 then
   begin
     FClassTyp := Pr.ClassTyp;
@@ -17819,6 +18596,7 @@ begin
     Eat(tkSemi);
   FConstNames := savedConst;
   FExcDepth := savedExc;
+  FHelperTyp := savedHelper;
   FSelfClassRef := savedSelfRef;
   FNoSelf := savedNoSelf;
   FLocals := savedLocals;

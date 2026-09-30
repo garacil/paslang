@@ -3357,6 +3357,154 @@ TSquare 25 1
 A class method call costs what a method call costs: `Self` is the table
 the class or the object already has, and a virtual one reads one slot.
 
+### Helpers
+
+A helper adds methods to a type that is already declared, a builtin one
+too, without a descendant and without touching the type (1.1.9):
+`type helper for T` for a simple type (a string, an integer, a real, a
+Char, a Boolean, an enumeration, a set), `record helper for R` for a
+record and `class helper for C` for a class.
+
+`examples/helpers.paslang`:
+
+```pascal
+{ Helpers: methods added to string, to Integer and to a record without
+  touching them. Self is the value, and a method may change it. }
+program helpers;
+
+type
+  TTextHelper = type helper for string
+    function Reversed: string;
+    function Count(C: Char): Int64;
+    procedure Surround(const L, R: string);
+    function GetWide: Boolean;
+    property Wide: Boolean read GetWide;
+  end;
+
+  TNumHelper = type helper for Int64
+    function Digits: Int64;
+    class function Biggest(A, B: Int64): Int64; static;
+  end;
+
+  TSpan = record
+    First, Last: Int64;
+  end;
+
+  TSpanHelper = record helper for TSpan
+    function Len: Int64;
+    procedure Widen(By: Int64 = 1);
+  end;
+
+function TTextHelper.Reversed: string;
+var
+  i: Int64;
+begin
+  Result := '';
+  for i := Length(Self) downto 1 do
+    Result := Result + Self[i];
+end;
+
+function TTextHelper.Count(C: Char): Int64;
+var
+  i: Int64;
+begin
+  Result := 0;
+  for i := 1 to Length(Self) do
+    if Self[i] = C then
+      Result := Result + 1;
+end;
+
+procedure TTextHelper.Surround(const L, R: string);
+begin
+  Self := L + Self + R;               { changes the caller's string }
+end;
+
+function TTextHelper.GetWide: Boolean;
+begin
+  Result := Length(Self) > 8;
+end;
+
+function TNumHelper.Digits: Int64;
+var
+  n: Int64;
+begin
+  Result := 1;
+  n := Self;
+  while n >= 10 do
+  begin
+    n := n div 10;
+    Result := Result + 1;
+  end;
+end;
+
+class function TNumHelper.Biggest(A, B: Int64): Int64;
+begin
+  if A > B then
+    Result := A
+  else
+    Result := B;
+end;
+
+function TSpanHelper.Len: Int64;
+begin
+  Result := Last - First + 1;         { the record's fields, as Self's }
+end;
+
+procedure TSpanHelper.Widen(By: Int64);
+begin
+  First := First - By;
+  Last := Last + By;
+end;
+
+var
+  s: string;
+  n: Int64;
+  sp: TSpan;
+
+begin
+  s := 'paslang';
+  WriteLn(s.Reversed, ' ', s.Count('a'), ' ', Ord(s.Wide));
+  s.Surround('<', '>');
+  WriteLn(s, ' ', Ord(s.Wide), ' ', 'level'.Reversed);
+  n := 40961;
+  WriteLn(n.Digits, ' ', Int64.Biggest(n, 7), ' ', n.Biggest(3, 9));
+  sp.First := 10;
+  sp.Last := 14;
+  sp.Widen;
+  sp.Widen(3);
+  WriteLn(sp.First, '..', sp.Last, ' ', sp.Len);
+end.
+```
+
+prints
+
+```
+gnalsap 2 0
+<paslang> 1 level
+5 40961 9
+6..18 13
+```
+
+- A helper's methods are called on a value of the type, `s.Reversed`, a
+  literal or a constant too (`'level'.Reversed`), and read one another
+  and a record's fields without `Self.`. Inside one, `Self` is the
+  value, by reference: a method that assigns `Self` or a field changes
+  the caller's variable. On a value that is no variable (a literal, a
+  result, a `const` parameter) it works on a copy.
+- A `class function ... static;` is called through a value or through
+  the type's name, `Int64.Biggest`, `string.Join`. A helper's class
+  method is always static, and a helper has no fields, no constructor
+  and no virtual method.
+- `property P: T read GetP write SetP;` reads and writes through the
+  helper's methods, with an index in brackets as a class's does.
+- `type helper(TBase) for string` descends from another helper for the
+  same type and has its methods too. The helper in scope for a type is
+  the last one declared or brought by `uses`, as in Free Pascal: a
+  second helper for `Int64` hides the first unless it descends from it.
+  `private` and `strict private` hold as in a class.
+- A helper's method is a routine whose first parameter is `Self`; a call
+  costs what a routine's call costs.
+
 ### Published properties
 
 A published property that reads or writes a field can be reached by its
@@ -9927,6 +10075,9 @@ the commands on standard input, under `--debug-mode` and under
   output is closed.
 - `Close`, like `Send`, is a keyword (a channel's), so no method or
   routine takes the name.
+- A one-character literal is a string where a helper's method is called
+  on it (`'x'.Twice` is string's helper), where Free Pascal takes it for
+  a `Char`. A helper has no constructor.
 - `Write` prints no set, as Free Pascal; it prints a `Boolean` as 1 or
   0, where Free Pascal writes TRUE and FALSE. A set's bit n is element
   n whatever its range, so `set of 60..140` takes 32 bytes; a list in
