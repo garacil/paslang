@@ -251,9 +251,12 @@ its interface and keeps those of its implementation. A constant is any
 expression of constants: `Size = N * 4 + 1`, `Mask = not 0 shr 1`,
 `Greeting = Name + '!'`, `Half = 1 / 2`, `Last = Chr(Ord('A') + 25)`,
 `Words = SizeOf(Integer) * 8`, with `Ord`, `Chr`, `Succ`, `Pred`, `Abs`,
-`Sqr`, `Odd` and the `Length` of a string. The compiler works it out; an
-integer that leaves the 64-bit range, a division by zero and a `Chr`
-beyond 255 are compile errors. An array bound, a subrange, a `case`
+`Sqr`, `Odd`, the `Length` of a string, and `Int`, `Trunc`, `Round` and
+`Frac` of a real, which give what the program would (`Round` a tie to
+even; `UnixDateDelta = Trunc(UnixEpoch)`, 1.1.33, P163). The compiler
+works it out; an integer that leaves the 64-bit range (a `Trunc` or a
+`Round` too), a division by zero and a `Chr` beyond 255 are compile
+errors. An array bound, a subrange, a `case`
 label and a default value take the same expressions:
 `array[0..N - 1] of Integer`.
 
