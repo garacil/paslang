@@ -390,6 +390,12 @@ type
     function InternConstArr: LongInt;
     function IsConstArr(T: LongInt): Boolean;
     function ParamType(ByRef: Boolean): LongInt;
+    procedure ParseDefault(PT: LongInt; out OutV: Int64; out OutS: string);
+    function ConstSetBits(E: PExpr): Int64;
+    function DefaultArg(Typ: LongInt; Def: Int64; const DefStr: string): PExpr;
+    procedure FillMethDefs(const M: TMethInfo; var Args: TExprArray);
+    procedure MethParamDefault(var M: TMethInfo; NNames: SizeInt; ByRef: Boolean; T: LongInt);
+    procedure DefaultsLast(const M: TMethInfo);
     function ConstArrOf(E: PExpr): PExpr;
     procedure NoConstArr(const Args: TExprArray; const Where: string);
     function ClassValue(Cls: LongInt): PExpr;
@@ -2105,11 +2111,25 @@ begin
       ' arguments and none are written' + HerePos);
 end;
 
+{ The arguments a call of M must give: those before the first with a
+  default (P125). }
+function MinArgs(const M: TMethInfo): LongInt;
+var
+  i: LongInt;
+begin
+  Result := M.NParams;
+  for i := M.NParams - 1 downto 0 do
+    if (i <= High(M.HasDef)) and M.HasDef[i] then
+      Result := i
+    else
+      Exit;
+end;
+
 { M takes an argument that has no default: a use of it with no ( cannot
   be a call. }
 function TParser.NeedsArgs(const M: TMethInfo): Boolean;
 begin
-  Result := M.NParams > 0;
+  Result := MinArgs(M) > 0;
 end;
 
 { A method value's type with its signature (1.0.135): code and Self,
@@ -3872,6 +3892,12 @@ begin
   begin
     Idx := only;
     CoerceArgs(Meths[Idx].ParamTyps, Meths[Idx].ByRef, Args);
+    if HaveArgs or not NeedsArgs(Meths[Idx]) then
+      FillMethDefs(Meths[Idx], Args);
+    { a call gives every argument that has no default, and no more (P125;
+      a method called with too few took whatever the registers held) }
+    if HaveArgs and (Length(Args) <> Meths[Idx].NParams) then
+      Die('wrong number of arguments for ' + AName + HerePos);
     Result := True;
     Exit;
   end;
@@ -3883,8 +3909,8 @@ begin
       ok := False;
       cost := 0;
       if not HaveArgs then
-        ok := Meths[i].NParams = 0
-      else if Meths[i].NParams = Length(Args) then
+        ok := MinArgs(Meths[i]) = 0
+      else if (Length(Args) >= MinArgs(Meths[i])) and (Length(Args) <= Meths[i].NParams) then
       begin
         ok := True;
         for j := 0 to High(Args) do
@@ -3917,6 +3943,7 @@ begin
   if nmatch = 1 then
   begin
     CoerceArgs(Meths[Idx].ParamTyps, Meths[Idx].ByRef, Args);
+    FillMethDefs(Meths[Idx], Args);
     Result := True;
     Exit;
   end;
@@ -5079,32 +5106,104 @@ begin
   CoerceArgs(P.ParamTyp, P.ByRef, Args);
   for i := n to P.NParams - 1 do
   begin
-    if (i > High(P.HasDef)) or (not P.HasDef[i]) then
+    if (i > High(P.HasDef)) or (not P.HasDef[i]) or (i > High(P.ParamTyp)) then
       Die('wrong number of arguments for ' + P.Name);
-    if (i <= High(P.ParamTyp)) and (P.ParamTyp[i] = TyString) then
-    begin
-      if i <= High(P.DefStr) then
-        e := NewStr(P.DefStr[i])
-      else
-        e := NewStr('');
-    end
-    else if (i <= High(P.ParamTyp)) and (TypeOf(P.ParamTyp[i]).Kind = tykReal) then
-    begin
-      e := NewReal(P.Def[i]);
-      e^.Typ := P.ParamTyp[i];
-    end
-    else if (i <= High(P.ParamTyp)) and IsQuadTyp(P.ParamTyp[i]) and
-      (i <= High(P.DefStr)) and (Length(P.DefStr[i]) = 16) then
-      e := QuadLitW(BytesWord(P.DefStr[i], 0), BytesWord(P.DefStr[i], 8))
+    if i <= High(P.DefStr) then
+      e := DefaultArg(P.ParamTyp[i], P.Def[i], P.DefStr[i])
     else
-    begin
-      e := NewInt(P.Def[i]);
-      if i <= High(P.ParamTyp) then
-        e^.Typ := P.ParamTyp[i];
-    end;
+      e := DefaultArg(P.ParamTyp[i], P.Def[i], '');
     SetLength(Args, i + 1);
     Args[i] := e;
   end;
+end;
+
+{ The argument a default value stands for, of parameter type Typ
+  (P125: nil for a pointer's kin, a set's bits). }
+function TParser.DefaultArg(Typ: LongInt; Def: Int64; const DefStr: string): PExpr;
+var
+  k: TTypeKind;
+begin
+  k := TypeOf(Typ).Kind;
+  if Typ = TyString then
+    Result := NewStr(DefStr)
+  else if k = tykReal then
+  begin
+    Result := NewReal(Def);
+    Result^.Typ := Typ;
+  end
+  else if IsQuadTyp(Typ) and (Length(DefStr) = 16) then
+    Result := QuadLitW(BytesWord(DefStr, 0), BytesWord(DefStr, 8))
+  else if (k = tykPointer) or (k = tykClass) or (k = tykClassRef) or (k = tykProc) or
+    (k = tykMethod) or (k = tykInterface) or IsDynTyp(Typ) then
+  begin
+    Result := NewNil;
+    Result^.Typ := Typ;
+  end
+  else
+  begin
+    Result := NewInt(Def);
+    Result^.Typ := Typ;
+  end;
+end;
+
+{ A method's missing arguments, when each has a default (P125); left as
+  they are otherwise, for the caller to say what is wrong. }
+procedure TParser.FillMethDefs(const M: TMethInfo; var Args: TExprArray);
+var
+  i, n: SizeInt;
+begin
+  n := Length(Args);
+  if n >= M.NParams then
+    Exit;
+  for i := n to M.NParams - 1 do
+    if (i > High(M.HasDef)) or (not M.HasDef[i]) then
+      Exit;
+  for i := n to M.NParams - 1 do
+  begin
+    SetLength(Args, i + 1);
+    if i <= High(M.DefStr) then
+      Args[i] := DefaultArg(M.ParamTyps[i], M.Def[i], M.DefStr[i])
+    else
+      Args[i] := DefaultArg(M.ParamTyps[i], M.Def[i], '');
+  end;
+end;
+
+{ = value after a method's parameter of type T (P125), the last NNames
+  of M's parameters read: one parameter, not var or out. }
+procedure TParser.MethParamDefault(var M: TMethInfo; NNames: SizeInt; ByRef: Boolean; T: LongInt);
+var
+  n: SizeInt;
+  dv: Int64;
+  ds: string;
+begin
+  n := Length(M.ParamTyps);
+  SetLength(M.HasDef, n);
+  SetLength(M.Def, n);
+  SetLength(M.DefStr, n);
+  if FTok.Kind <> tkEq then
+    Exit;
+  if NNames <> 1 then
+    Die('default value can only be assigned to one parameter' + HerePos);
+  if ByRef then
+    Die('default on var parameter' + HerePos);
+  FTok := FLex.Next;
+  ParseDefault(T, dv, ds);
+  M.HasDef[n - 1] := True;
+  M.Def[n - 1] := dv;
+  M.DefStr[n - 1] := ds;
+end;
+
+procedure TParser.DefaultsLast(const M: TMethInfo);
+var
+  i: SizeInt;
+  seen: Boolean;
+begin
+  seen := False;
+  for i := 0 to High(M.HasDef) do
+    if M.HasDef[i] then
+      seen := True
+    else if seen then
+      Die('default parameters must be last' + HerePos);
 end;
 
 { An ordinal constant expression: array bounds, subranges, case labels.
@@ -5522,6 +5621,7 @@ begin
             td.Meths[n].ByRef[npar] := byref;
             Inc(npar);
           end;
+          MethParamDefault(td.Meths[n], nn, byref, t);
           if FTok.Kind <> tkSemi then
             Break;
           FTok := FLex.Next;
@@ -5918,6 +6018,8 @@ begin
               td.Meths[n].ByRef[npar] := byref;
               Inc(npar);
             end;
+            { a default value (P125) }
+            MethParamDefault(td.Meths[n], nn, byref, pt);
             if FTok.Kind <> tkSemi then
               Break;
             FTok := FLex.Next;
@@ -5925,6 +6027,7 @@ begin
         end;
         Eat(tkRParen);
       end;
+      DefaultsLast(td.Meths[n]);
       t := TyNone;
       if isFunc then
       begin
@@ -6023,6 +6126,9 @@ begin
           isVirt := True;
         td.Meths[ov].ParamTyps := td.Meths[n].ParamTyps;
         td.Meths[ov].ByRef := td.Meths[n].ByRef;
+        td.Meths[ov].HasDef := td.Meths[n].HasDef;
+        td.Meths[ov].Def := td.Meths[n].Def;
+        td.Meths[ov].DefStr := td.Meths[n].DefStr;
         td.Meths[ov].Slot := keepSlot;
         SetLength(td.Meths, n);
         n := ov;
@@ -6895,6 +7001,7 @@ begin
             args := nil;
             if FTok.Kind = tkLParen then
               args := ParseArgList;
+            FillMethDefs(st.Meths[i], args);
             if Length(args) <> st.Meths[i].NParams then
               Die('wrong number of arguments');
             { converted and by address as a class's method takes them
@@ -13751,7 +13858,11 @@ begin
   if Copy(data, 1, 11) = 'PASLANGI14' + #10 then
     Die(path + ' was compiled by a paslang older than 1.1.4; compile ' +
       AName + ' again');
-  if (Copy(data, 1, 8) = 'PASLANGI') and (Copy(data, 1, 11) <> 'PASLANGI15' + #10) then
+  { From 1.1.6 a method says its parameters' defaults (P125). }
+  if Copy(data, 1, 11) = 'PASLANGI15' + #10 then
+    Die(path + ' was compiled by a paslang older than 1.1.6; compile ' +
+      AName + ' again');
+  if (Copy(data, 1, 8) = 'PASLANGI') and (Copy(data, 1, 11) <> 'PASLANGI16' + #10) then
     Die(path + ' was compiled by a newer paslang (' + FirstLine(data) +
       '); compile ' + AName + ' again with this one');
   if not ParseIface(data, iface) then
@@ -14171,7 +14282,7 @@ begin
     if SameId(st.Meths[i].Name, mname) and st.Meths[i].IsCtor and CallableMeth(st.Meths[i]) then
     begin
       Inc(named);
-      if st.Meths[i].NParams <> Length(args) then
+      if (Length(args) < MinArgs(st.Meths[i])) or (Length(args) > st.Meths[i].NParams) then
         Continue;
       if byCount < 0 then
         byCount := i;
@@ -14189,7 +14300,10 @@ begin
   if best >= 0 then
     CheckVis(Id, 1, best, nline, ncol);
   if best >= 0 then
+  begin
     CoerceArgs(st.Meths[best].ParamTyps, st.Meths[best].ByRef, args);
+    FillMethDefs(st.Meths[best], args);
+  end;
   if best >= 0 then
     Result := NewCtor(st.Meths[best].Sym, Id, st.Size)
   else if named > 0 then
@@ -14715,6 +14829,149 @@ begin
     end;
 end;
 
+{ A parameter's default value (1.0.74; P125: a method's too, nil, and a
+  set's), read after =, for a parameter of type T: an ordinal's or a
+  set's value in Dv (a set's bits), a string's in Ds, a real's bits, a
+  Quad's 16 bytes in Ds; nil for a pointer, an object, a class, a
+  routine value, an interface or a slice is 0. }
+procedure TParser.ParseDefault(PT: LongInt; out OutV: Int64; out OutS: string);
+var
+  dv, dql, dqh: Int64;
+  dt: LongInt;
+  dk: TTypeKind;
+  dr: Double;
+  ds: string;
+  t: LongInt;
+  e: PExpr;
+begin
+  t := PT;
+  dk := TypeOf(t).Kind;
+  if FTok.Kind = tkNil then
+  begin
+    if not ((dk = tykPointer) or (dk = tykClass) or (dk = tykClassRef) or (dk = tykProc) or
+      (dk = tykMethod) or (dk = tykInterface) or IsDynTyp(t)) then
+      Die('nil is the default of a pointer, an object, a class, a routine, an interface ' +
+        'or a slice, not of ' + TypName(t) + HerePos);
+    FTok := FLex.Next;
+    OutV := 0;
+    OutS := '';
+    Exit;
+  end;
+  if dk = tykSet then
+  begin
+    e := ParseExpr;
+    OutV := ConstSetBits(e);
+    OutS := '';
+    Exit;
+  end;
+  { Any constant expression, checked against the parameter's type
+    (1.0.74): an integer converts to a real, and a one-character
+    string is a Char and a Char a string. }
+  ParseConstValue(dv, dt, ds);
+  dk := TypeOf(dt).Kind;
+  if IsQuadTyp(t) then
+  begin
+    { A Quad's default (1.0.115): its binary128 value, kept as its
+      16 bytes, which the .pi carries too. }
+    if (dk = tykReal) and FConstHasQ then
+      ds := QuadBytes(FConstQLo, FConstQHi)
+    else if (dk = tykInteger) or (dk = tykSubrange) then
+    begin
+      PasQFromInt(dv, dql, dqh);
+      ds := QuadBytes(dql, dqh);
+    end
+    else
+      Die('default value must be a number' + HerePos);
+    dv := 0;
+  end
+  else if TypeOf(t).Kind = tykString then
+  begin
+    if dt = TyChar then
+      ds := Char(dv)
+    else if dk <> tykString then
+      Die('default value must be a string');
+    dv := 0;
+  end
+  else if TypeOf(t).Kind = tykReal then
+  begin
+    if (dk = tykInteger) and (t = TySingle) then
+    begin
+      if not PasParseSingle(IntToStr(dv), dv) then
+        dv := 0;
+    end
+    else if dk = tykInteger then
+    begin
+      dr := dv;
+      dv := RealBits(dr);
+    end
+    else if dk <> tykReal then
+      Die('default value must be a real')
+    else if t = TySingle then
+    begin
+      { A Single parameter's default is binary32 (P101), rounded
+        once from its digits when it has them (1.0.115). }
+      dql := 0;
+      if (ds <> '') and PasParseSingle(ds, dql) then
+        dv := dql
+      else
+        dv := PasF64ToF32(dv);
+      if (dv and $7FFFFFFF) = $7F800000 then
+        Die('default value does not fit Single' + HerePos);
+    end;
+    ds := '';
+  end
+  else
+  begin
+    if (t = TyChar) and (dk = tykString) and (Length(ds) = 1) then
+      dv := Ord(ds[1])
+    else if (dk = tykString) or (dk = tykReal) then
+      Die('default value must be an ordinal constant');
+    if (TypeOf(t).Kind <> tykInteger) and (TypeOf(t).Kind <> tykBoolean) and
+      (TypeOf(t).Kind <> tykEnum) and (TypeOf(t).Kind <> tykSubrange) then
+      Die('default value must be an ordinal constant');
+    if IsNarrowId(t) and (not FitsInt(dv, t)) then
+      Die('default value ' + IntToStr(dv) + ' does not fit ' +
+        FTypes[t].Name + HerePos);
+    ds := '';
+  end;
+  OutV := dv;
+  OutS := ds;
+end;
+
+{ The bits of a constant set, E a list in brackets of constants and
+  ranges (P125). }
+function TParser.ConstSetBits(E: PExpr): Int64;
+var
+  i: SizeInt;
+  lo, hi, v: Int64;
+  vt: LongInt;
+  str: string;
+begin
+  Result := 0;
+  if E^.Kind <> ekSet then
+    Die('a set''s default is a list in brackets of constants' + HerePos);
+  for i := 0 to High(E^.Args) do
+  begin
+    if E^.Args[i]^.Kind = ekRange then
+    begin
+      if not (ConstFold(E^.Args[i]^.L, lo, vt, str) and ConstFold(E^.Args[i]^.R, hi, vt, str)) then
+        Die('a set''s default is a list of constants' + HerePos);
+    end
+    else
+    begin
+      if not ConstFold(E^.Args[i], lo, vt, str) then
+        Die('a set''s default is a list of constants' + HerePos);
+      if (TypeOf(vt).Kind = tykString) and (Length(str) = 1) then
+        lo := Ord(str[1]);
+      hi := lo;
+    end;
+    if (lo < 0) or (hi > 63) then
+      Die('a set''s default holds elements 0 to 63' + HerePos);
+    for v := lo to hi do
+      Result := Result or (Int64(1) shl v);
+  end;
+end;
+
 function TParser.ParseProcHead: TProc;
 var
   pr: TProc;
@@ -14722,10 +14979,7 @@ var
   nn, i, n, oi: SizeInt;
   t: LongInt;
   byref, isconst, seenDef, eqm: Boolean;
-  dv, dql, dqh: Int64;
-  dt: LongInt;
-  dk: TTypeKind;
-  dr: Double;
+  dv: Int64;
   ds: string;
   args: TExprArray;
   nst: PStmt;
@@ -14860,76 +15114,7 @@ begin
           if byref then
             Die('default on var parameter');
           FTok := FLex.Next;
-          { Any constant expression, checked against the parameter's type
-            (1.0.74): an integer converts to a real, and a one-character
-            string is a Char and a Char a string. }
-          ParseConstValue(dv, dt, ds);
-          dk := TypeOf(dt).Kind;
-          if IsQuadTyp(t) then
-          begin
-            { A Quad's default (1.0.115): its binary128 value, kept as its
-              16 bytes, which the .pi carries too. }
-            if (dk = tykReal) and FConstHasQ then
-              ds := QuadBytes(FConstQLo, FConstQHi)
-            else if (dk = tykInteger) or (dk = tykSubrange) then
-            begin
-              PasQFromInt(dv, dql, dqh);
-              ds := QuadBytes(dql, dqh);
-            end
-            else
-              Die('default value must be a number' + HerePos);
-            dv := 0;
-          end
-          else if TypeOf(t).Kind = tykString then
-          begin
-            if dt = TyChar then
-              ds := Char(dv)
-            else if dk <> tykString then
-              Die('default value must be a string');
-            dv := 0;
-          end
-          else if TypeOf(t).Kind = tykReal then
-          begin
-            if (dk = tykInteger) and (t = TySingle) then
-            begin
-              if not PasParseSingle(IntToStr(dv), dv) then
-                dv := 0;
-            end
-            else if dk = tykInteger then
-            begin
-              dr := dv;
-              dv := RealBits(dr);
-            end
-            else if dk <> tykReal then
-              Die('default value must be a real')
-            else if t = TySingle then
-            begin
-              { A Single parameter's default is binary32 (P101), rounded
-                once from its digits when it has them (1.0.115). }
-              dql := 0;
-              if (ds <> '') and PasParseSingle(ds, dql) then
-                dv := dql
-              else
-                dv := PasF64ToF32(dv);
-              if (dv and $7FFFFFFF) = $7F800000 then
-                Die('default value does not fit Single' + HerePos);
-            end;
-            ds := '';
-          end
-          else
-          begin
-            if (t = TyChar) and (dk = tykString) and (Length(ds) = 1) then
-              dv := Ord(ds[1])
-            else if (dk = tykString) or (dk = tykReal) then
-              Die('default value must be an ordinal constant');
-            if (TypeOf(t).Kind <> tykInteger) and (TypeOf(t).Kind <> tykBoolean) and
-              (TypeOf(t).Kind <> tykEnum) and (TypeOf(t).Kind <> tykSubrange) then
-              Die('default value must be an ordinal constant');
-            if IsNarrowId(t) and (not FitsInt(dv, t)) then
-              Die('default value ' + IntToStr(dv) + ' does not fit ' +
-                FTypes[t].Name + HerePos);
-            ds := '';
-          end;
+          ParseDefault(t, dv, ds);
           pr.Params[Length(pr.Params) - 1].HasDef := True;
           pr.Params[Length(pr.Params) - 1].Def := dv;
           pr.Params[Length(pr.Params) - 1].DefStr := ds;
@@ -15041,6 +15226,14 @@ begin
           (TypeOf(pr.ClassTyp).Meths[oi].IsCtor or TypeOf(pr.ClassTyp).Meths[oi].IsDtor)) then
         begin
           pr.Sym := TypeOf(pr.ClassTyp).Meths[oi].Sym;
+          { the body's head repeats the declaration's defaults or none
+            (P125) }
+          for n := 0 to High(pr.Params) do
+            if pr.Params[n].HasDef and ((n > High(TypeOf(pr.ClassTyp).Meths[oi].HasDef)) or
+              (not TypeOf(pr.ClassTyp).Meths[oi].HasDef[n]) or
+              (TypeOf(pr.ClassTyp).Meths[oi].Def[n] <> pr.Params[n].Def) or
+              (TypeOf(pr.ClassTyp).Meths[oi].DefStr[n] <> pr.Params[n].DefStr)) then
+              Die('the default of ' + pr.Params[n].Name + ' is the declaration''s' + hpos);
           { class says so on both heads, or on neither (P123); a class
             method's Self is the class, a static one's none }
           if TypeOf(pr.ClassTyp).Meths[oi].IsClassMeth <> isClassM then

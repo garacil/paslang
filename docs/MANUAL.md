@@ -2334,8 +2334,13 @@ inline: Count stays a call: its body has a statement that stays in its own frame
 inline: Big stays a call: measures 88 against -inline 40
 ```
 A default value is a constant expression of the parameter's type (an
-integer one converts for a real parameter), and once a parameter has a
-default every later parameter needs one. `overload` marks routines that
+integer one converts for a real parameter), `nil` for a pointer, an
+object, a class, a routine value, an interface or a slice, and a
+constant set in brackets for a set (1.1.6); once a parameter has a
+default every later parameter needs one. A method, a constructor, a
+class method and an interface's method take defaults as a routine does
+(1.1.6); a method's body may repeat its declaration's defaults or leave
+them out. A call gives every argument that has no default, and no more. `overload` marks routines that
 share a name; the call picks the one whose argument types fit best: the
 same types first, then an integer that widens without losing a value
 (the nearer width first, the same sign before the other: a `Byte` goes
@@ -9862,7 +9867,7 @@ the commands on standard input, under `--debug-mode` and under
   `const` or plain: pass `a[Low(a)..High(a)]`, a slice that shares its
   elements. `var a: array of T` passes a slice by reference, so a
   `SetLength` inside changes the caller's.
-- No default value on a method, on `var` or `out`, or in a record.
+- No default value on `var` or `out`, or in a record.
 - `cdecl` and `nostackframe` are skipped; `inline` after a routine's
   head puts it in place wherever it is called, whatever its size (§5;
   under `-inline 0` it stays a call). A routine whose body
