@@ -2440,8 +2440,14 @@ constant set in brackets for a set (1.1.6); once a parameter has a
 default every later parameter needs one. A method, a constructor, a
 class method and an interface's method take defaults as a routine does
 (1.1.6); a method's body may repeat its declaration's defaults or leave
-them out. A call gives every argument that has no default, and no more. `overload` marks routines that
-share a name; the call picks the one whose argument types fit best: the
+them out. A call gives every argument that has no default, and no more. Routines of one name
+declared together, in one routine, the program or a unit, are overloads
+with or without `overload`; the routines of a name inside a routine,
+the program's own and a later unit's hide the ones around them and an
+earlier unit's, whatever their parameters, unless they are declared
+`overload`, as in Free Pascal: a program's `Half(X: Double)` beside a
+unit's `Half(X: Integer)` makes `Half(3)` the program's, and declared
+`overload` the unit's (1.1.37, P160). The call picks the one whose argument types fit best: the
 same types first, then an integer that widens without losing a value
 (the nearer width first, the same sign before the other: a `Byte` goes
 to `Word` before `Int16`, an `Int8` never to `Word`), then an integer
@@ -10586,13 +10592,15 @@ the commands on standard input, under `--debug-mode` and under
   (1.1.30, P158; they were duplicates of the unit's, which made every
   name of a unit a reserved word for its users, and from 1.0.136 a
   program's variable of a unit variable's name was refused). A
-  program's routine hides the unit's routine of the same parameters;
-  one of other parameters is an overload of it, where Free Pascal hides
-  every routine of the name unless the program's says `overload`.
+  program's routine hides the unit's routines of its name whatever
+  their parameters unless it is declared `overload` (1.1.37, P160; one
+  of other parameters was always an overload, so `Half(3)` called the
+  unit's `Half(Integer)` beside the program's `Half(Double)`).
 - When two units a program uses have a name in common, the later one in
   `uses` hides the earlier one's, as in Free Pascal, whatever the kind
-  of either (a routine of the same parameters, a constant, a variable, a
-  type; of another kind from 1.1.30, P158); a unit's names hide the ones
+  of either (a constant, a variable, a type; of another kind from 1.1.30,
+  P158; a routine every routine of its name unless it is declared
+  `overload`, from 1.1.37, P160, the same parameters before); a unit's names hide the ones
   of a unit its implementation uses. A unit's name reaches its own
   names, hidden or not: `ua.Twice`, `ua.Count`, `var b: ua.TBox`
   (1.1.13), `x is ua.TSquare`, `x as ua.TShape`, and a type wherever a
