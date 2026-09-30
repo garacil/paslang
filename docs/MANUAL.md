@@ -2393,7 +2393,20 @@ to `Word` before `Int16`, an `Int8` never to `Word`), then an integer
 for a real. A constant with no type of its own is an `Integer`, so
 `Put(5)` takes `Put(x: Word)` before `Put(x: Byte)`, and `Int8` before
 `Byte`; `Put(300)` takes `Word`. A `var` parameter takes its own type
-alone. Two routines that fit equally well are an ambiguous call. `forward` declares a routine before its
+alone. Two routines that fit equally well are an ambiguous call.
+Beyond those, an argument fits every parameter a call converts it into,
+priced as Free Pascal ranks it: a subrange for its host, a list in
+brackets for an `array of const` or for a set of its kind (the two
+tie), then for a slice, `nil` for a reference, a pointer for `Pointer`,
+an object for an ancestor (the nearest first), a class reference for
+another (they tie), a `Char` for a string, an object for an interface
+it implements or for `Pointer` (they tie). `F('x')` takes `F(C: Char)`
+before `F(const S: string)`; `F(k)` with a `TGrand` takes `F(X: TKid)`
+before `F(X: TBase)`; `F([1, 2])` takes `array of const` before `array of
+Int64`. A list of elements of more than one kind, `[n, 'x']`, is a list:
+an `array of const` takes it, a set does not (1.1.16, P141; only the
+exact types, the integers and the reals matched, so `F(c)` with a Char
+for `F(const S: string)` found no overload). `forward` declares a routine before its
 body; the later header must repeat the same signature.
 
 A routine is also a value. The type is written the way the header is:
