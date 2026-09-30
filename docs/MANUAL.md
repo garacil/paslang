@@ -243,6 +243,15 @@ takes `(a, b, c)`, an `array of Char` a string of its length, a record
 pointer, class or routine `nil`. One declared in a routine is a static
 variable: it keeps its value from call to call.
 
+A variable may be declared with its value too, `var Count: Integer =
+40;`, with the values a typed constant takes: a global starts with it,
+and a routine's variable takes it again every time the routine is
+called, as in Free Pascal. `var Current: TSettings absolute Settings;`
+is another name for the variable `Settings`, of the same type: a
+global, a routine's variable or a parameter; a unit exports it as that
+variable. To see a variable as another type, a view does it:
+`PByte(@x)^` (1.1.19, P144; both were syntax errors).
+
 `examples/values.paslang`:
 
 ```pascal

@@ -110,6 +110,7 @@ type
     FHelperTyp: LongInt;      { the helper whose method is being read (P127), 0 outside one }
     FConstScope, FTypeScope, FProcScope: SizeInt;  { where the routine being read begins its constants, type names and nested routines in the tables (P137) }
     FScopeTypes: TStrArray;   { the type names the routine being read declares (P137) }
+    FVarInits: array of PStmt;  { the routine being read's variables with a value, set as it starts (P144) }
     FFwdTypes: array of LongInt;  { the classes and interfaces declared forward and not whole yet (P139) }
     FFwdAt: TStrArray;        { where each of them was declared forward }
     FFwdScope: SizeInt;       { where the routine being read begins its forward types (P139) }
@@ -15686,8 +15687,10 @@ end;
 procedure TParser.ParseVarSection(var Vars: TVarDeclArray; Local: Boolean);
 var
   names, ats: array of string;
-  nn, i, n: SizeInt;
-  t: LongInt;
+  nn, i, n, k: SizeInt;
+  t, tt, sz: LongInt;
+  tname, tsym, img, hid: string;
+  d: TVarDecl;
 begin
   Eat(tkVar);
   while (FTok.Kind = tkIdent) or ReservedHere(':,') do
@@ -15710,6 +15713,102 @@ begin
     end;
     Eat(tkColon);
     t := ParseType;
+    { x: T absolute y (P144): another name for the variable y, of its
+      type; no storage of its own. A view, PT(@y)^, sees y as another
+      type. }
+    if (FTok.Kind = tkIdent) and SameId(FTok.Lexeme, 'absolute') then
+    begin
+      if nn > 1 then
+        Die('absolute names one variable at a time' + HerePos);
+      FTok := FLex.Next;
+      if FTok.Kind <> tkIdent then
+        Die('absolute takes the variable it is another name for' + HerePos);
+      tname := FTok.Lexeme;
+      if not IsVarName(tname) then
+        Die('unknown variable ' + tname + HerePos);
+      tt := VarTyp(tname);
+      if not SameTyp(tt, t) then
+        Die(names[0] + ': ' + TypName(t) + ' absolute ' + tname + ': ' + TypName(tt) +
+          '; absolute is another name for a variable of its own type, and a view, PT(@x)^, ' +
+          'sees one as another' + HerePos);
+      tsym := VarSym(tname);
+      FTok := FLex.Next;
+      Eat(tkSemi);
+      if Local then
+        CheckLocalName(names[0])
+      else
+        CheckGlobalName(names[0], ats[0]);
+      AddVar(names[0], t, Local);
+      if Local then
+        FLocals[High(FLocals)].Sym := tsym
+      else
+      begin
+        FVars[High(FVars)].Sym := tsym;
+        FVars[High(FVars)].Ext := True;
+        FVars[High(FVars)].Alias := True;
+        FVars[High(FVars)].Pub := FIsUnit and not FInImpl;
+      end;
+      Continue;
+    end;
+    { x: T = value (P144): a global starts with the value, as a typed
+      constant does; a routine's variable takes it at every call, from
+      a hidden constant of the routine's. }
+    if FTok.Kind = tkEq then
+    begin
+      if nn > 1 then
+        Die('one variable at a time takes a value' + HerePos);
+      FTok := FLex.Next;
+      d := Default(TVarDecl);
+      sz := ValSize(t);
+      if sz < 8 then
+        sz := 8;
+      sz := (sz + 7) and (-8);
+      img := '';
+      SetLength(img, sz);
+      for k := 1 to sz do
+        img[k] := #0;
+      ParseTypedInit(t, 0, img, d);
+      SortRel(d);
+      Eat(tkSemi);
+      if Local then
+      begin
+        CheckLocalName(names[0]);
+        AddVar(names[0], t, True);
+        n := Length(Vars);
+        SetLength(Vars, n + 1);
+        Vars[n].Name := names[0];
+        Vars[n].Typ := t;
+        hid := FFuncSym + '.' + names[0] + '.init';
+        AddVar(hid, t, False);
+        FVars[High(FVars)].Init := img;
+        FVars[High(FVars)].Rel := d.Rel;
+        FVars[High(FVars)].RelStr := d.RelStr;
+        n := Length(FVarInits);
+        SetLength(FVarInits, n + 1);
+        FVarInits[n] := NewStmt(skAssign);
+        FVarInits[n]^.Line := FTok.Line;
+        FVarInits[n]^.Dest := NewVar(VarSym(names[0]), t);
+        FVarInits[n]^.E := NewVar(hid, t);
+      end
+      else
+      begin
+        CheckGlobalName(names[0], ats[0]);
+        AddVar(names[0], t, False);
+        if FIsUnit then
+        begin
+          FVars[High(FVars)].Sym := FUnitName + '.' + names[0];
+          FVars[High(FVars)].Pub := not FInImpl;
+        end;
+        FVars[High(FVars)].Init := img;
+        FVars[High(FVars)].Rel := d.Rel;
+        FVars[High(FVars)].RelStr := d.RelStr;
+        n := Length(Vars);
+        SetLength(Vars, n + 1);
+        Vars[n].Name := names[0];
+        Vars[n].Typ := t;
+      end;
+      Continue;
+    end;
     Eat(tkSemi);
     for i := 0 to nn - 1 do
     begin
@@ -19565,6 +19664,8 @@ var
   savedSelfRef, savedNoSelf: Boolean;
   savedHelper: LongInt;
   savedCScope, savedTScope, savedPScope, savedFScope, j: SizeInt;
+  savedInits: array of PStmt;
+  initb: PStmt;
   savedSTypes: TStrArray;
   keep: Boolean;
 begin
@@ -19618,6 +19719,8 @@ begin
   savedTScope := FTypeScope;
   savedFScope := FFwdScope;
   FFwdScope := Length(FFwdTypes);
+  savedInits := FVarInits;
+  FVarInits := nil;
   savedPScope := FProcScope;
   savedSTypes := FScopeTypes;
   FConstScope := Length(FConsts);
@@ -19709,6 +19812,13 @@ begin
   CheckFwdTypes;
   FInBody := True;
   Pr.Body := Self.ParseBlock;
+  { the variables with a value take it first (P144) }
+  if Length(FVarInits) > 0 then
+  begin
+    initb := NewStmt(skBlock);
+    initb^.Stmts := FVarInits;
+    Pr.Body := JoinStmts(initb, Pr.Body);
+  end;
   for i := 0 to High(FLimits) do
   begin
     n := Length(Pr.Locals);
@@ -19755,6 +19865,7 @@ begin
   FConstScope := savedCScope;
   FTypeScope := savedTScope;
   FFwdScope := savedFScope;
+  FVarInits := savedInits;
   FProcScope := savedPScope;
   FScopeTypes := savedSTypes;
   FConstNames := savedConst;
