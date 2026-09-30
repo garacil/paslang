@@ -3141,6 +3141,20 @@ interface's method takes `const`, `var` and `out` parameters as a
 class's does (1.0.136; `const` was a syntax error there, and a `var`
 argument went as its value).
 
+An object goes wherever its interface goes: into a variable, as an
+argument (`Show(sq)` for `procedure Show(S: IShape)`), as a function's
+result or `Exit(obj)`, into an element or a field. The interface value
+is the object and its class's table for that interface. A call through
+it runs the object's own method, and a virtual one is looked up in the
+object's table, so a descendant's override runs as it does through the
+class. A class goes only into an interface that it or an ancestor
+lists; an interface goes where its parent interface goes, but an object
+whose class lists `IMore` does not go into an `IBase` variable, as in
+Free Pascal (`TA does not implement IBase at 24:17`) (1.1.15, P140; only
+an assignment bound an object, an argument went as the object alone
+and a call through it died, and the class's method ran, not the
+override).
+
 `TFoo = class(TParent);` declares a class with nothing of its own, the
 parent's members and nothing else, as Object Pascal does; a family of
 exception classes is written so (`EConvertError = class(Exception);`).

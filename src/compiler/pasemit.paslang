@@ -619,6 +619,7 @@ type
     procedure EmitMethVal(Target: PExpr; const Args: TExprArray);
     procedure EmitIfaceCall(Obj: PExpr; const Args: TExprArray; Slot: LongInt);
     procedure EmitIfaceBind(Src, Dest: PExpr);
+    function IfaceTab(Cls, Iface: LongInt): string;
     procedure LookupMeth(ClassId: LongInt; const Meth: string;
       out Sym: string; out Slot: LongInt);
     procedure EmitDumpLocals;
@@ -8960,39 +8961,37 @@ begin
   end;
 end;
 
-procedure TEmitter.EmitIfaceBind(Src, Dest: PExpr);
+{ Class Cls's table for interface Iface, one it or an ancestor lists:
+  the parser refused the others (P140). A parent of a listed interface
+  has no table of its own, as in Free Pascal. An interface two units'
+  .pi both carry is two types with one name here, as its table's symbol
+  has (1.0.137). }
+function TEmitter.IfaceTab(Cls, Iface: LongInt): string;
 var
-  i, p: LongInt;
+  i: LongInt;
   ok: Boolean;
-  cname, iname: string;
 begin
   ok := False;
-  if (Src^.Typ >= 0) and (Src^.Typ <= High(FTypes)) then
-    for i := 0 to High(FTypes[Src^.Typ].Ifaces) do
-    begin
-      p := FTypes[Src^.Typ].Ifaces[i];
-      while p <> 0 do
-      begin
-        { an interface two units' .pi both carry is two types with one
-          name here, as its table's symbol has (1.0.137) }
-        if (p = Dest^.Typ) or (ToLower(FTypes[p].Name) = ToLower(FTypes[Dest^.Typ].Name)) then
-          ok := True;
-        if ok or (p = FTypes[p].Parent) then
-          Break;
-        p := FTypes[p].Parent;
-      end;
-      if ok then
-        Break;
-    end;
+  if (Cls >= 0) and (Cls <= High(FTypes)) then
+    for i := 0 to High(FTypes[Cls].Ifaces) do
+      if (FTypes[Cls].Ifaces[i] = Iface) or
+        (ToLower(FTypes[FTypes[Cls].Ifaces[i]].Name) = ToLower(FTypes[Iface].Name)) then
+        ok := True;
   if not ok then
     Die('class does not implement interface');
-  cname := ToLower(FTypes[Src^.Typ].Name);
-  iname := ToLower(FTypes[Dest^.Typ].Name);
+  Result := 'ivmt_' + ToLower(FTypes[Cls].Name) + '_' + ToLower(FTypes[Iface].Name);
+end;
+
+procedure TEmitter.EmitIfaceBind(Src, Dest: PExpr);
+var
+  tab: string;
+begin
+  tab := IfaceTab(Src^.Typ, Dest^.Typ);
   EmitExpr(Src);
   if FArm then
-    LeaS('ivmt_' + cname + '_' + iname, 'x2')
+    LeaS(tab, 'x2')
   else
-    Line('  leaq ivmt_' + cname + '_' + iname + '(%rip), %rdx');
+    Line('  leaq ' + tab + '(%rip), %rdx');
   StoreTo(Dest);
 end;
 
@@ -9861,6 +9860,18 @@ begin
   begin
     Result := True;
     EmitSetConv(E);
+    Exit;
+  end;
+  { an object bound to an interface (P140): the object, and in the
+    second word its class's table for the interface }
+  if E^.Name = 'rt_ifacebind' then
+  begin
+    Result := True;
+    EmitExpr(E^.Args[0]);
+    if FArm then
+      LeaS(IfaceTab(E^.Args[0]^.Typ, E^.Typ), 'x2')
+    else
+      Line('  leaq ' + IfaceTab(E^.Args[0]^.Typ, E^.Typ) + '(%rip), %rdx');
     Exit;
   end;
   { the address of a hidden variable that holds a value (P127): Self of
@@ -32842,7 +32853,7 @@ end;
 function TEmitter.Emit(const Prog: TProgram): string;
 var
   i, j, k, mi: SizeInt;
-  sz, rp: LongInt;
+  sz, rp, slot: LongInt;
   sruns: TInt64Arr;
   msym: string;
   gw: TGcBits;
@@ -33684,14 +33695,50 @@ begin
           for k := 0 to High(FTypes[FTypes[i].Ifaces[j]].Meths) do
           begin
             msym := '';
+            slot := -1;
             for mi := 0 to High(FTypes[i].Meths) do
               if ToLower(FTypes[i].Meths[mi].Name) =
                 ToLower(FTypes[FTypes[i].Ifaces[j]].Meths[k].Name) then
+              begin
                 msym := FTypes[i].Meths[mi].Sym;
+                slot := -1;
+                if FTypes[i].Meths[mi].IsVirt and (not FTypes[i].Meths[mi].IsClassMeth) then
+                  slot := FTypes[i].Meths[mi].Slot;
+              end;
             if msym = '' then
               Die('interface method ' +
                 FTypes[FTypes[i].Ifaces[j]].Meths[k].Name);
-            Line('  .quad ' + msym);
+            if slot < 0 then
+              Line('  .quad ' + msym)
+            else
+            begin
+              { a virtual method through the interface is the object's
+                own, an override too (P140), as in Free Pascal: a thunk
+                reads it from the object's table, Self in rdi or x0, and
+                jumps there. The entry held the class's method, so a
+                descendant's override was never called. }
+              Line('  .quad .Lith' + IntToStr(i) + '_' + IntToStr(j) + '_' + IntToStr(k));
+              Line('.pushsection .text');
+              Line('.Lith' + IntToStr(i) + '_' + IntToStr(j) + '_' + IntToStr(k) + ':');
+              if FArm then
+              begin
+                Line('  ldr x16, [x0]');
+                if slot * 8 <= 32760 then
+                  Line('  ldr x16, [x16, #' + IntToStr(slot * 8) + ']')
+                else
+                begin
+                  Imm('x17', slot * 8);
+                  Line('  ldr x16, [x16, x17]');
+                end;
+                Line('  br x16');
+              end
+              else
+              begin
+                Line('  movq (%rdi), %rax');
+                Line('  jmpq *' + IntToStr(slot * 8) + '(%rax)');
+              end;
+              Line('.popsection');
+            end;
           end;
       end;
     end;
