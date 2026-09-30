@@ -2862,6 +2862,65 @@ with `A := 1` and `B := 2`, `I` reads both at once, 8589934593. The
 record is as long as its longest variant needs, and nothing checks the
 tag: `A` after `I := 5` is 5.
 
+A record may also declare methods, constructors and properties. They
+add no hidden field and do not change its layout. An instance method
+receives the record as `Self`, by reference; its fields and other
+members are visible without a prefix:
+
+```pascal
+type
+  TVector = record
+    X, Y: Integer;
+    constructor Create(AX, AY: Integer);
+    function GetLengthSquared: Integer;
+    procedure Scale(K: Integer);
+    class function Zero: TVector; static;
+    property LengthSquared: Integer read GetLengthSquared;
+  end;
+
+constructor TVector.Create(AX, AY: Integer);
+begin
+  X := AX;
+  Y := AY;
+end;
+
+function TVector.GetLengthSquared: Integer;
+begin
+  Result := X * X + Y * Y;
+end;
+
+procedure TVector.Scale(K: Integer);
+begin
+  X := X * K;
+  Y := Y * K;
+end;
+
+class function TVector.Zero: TVector;
+begin
+  Result := TVector.Create(0, 0);
+end;
+```
+
+`v := TVector.Create(3, 4)` constructs a new, initially zero record;
+`v.LengthSquared` is 25. `v.Create(6, 8)` instead runs the constructor
+on `v` itself, keeping any field it does not assign. Calling another
+constructor from a constructor also uses that same `Self`, including
+its string fields (§19). A method on a function result works on that
+value; on a variable it changes the variable. A `class` method in a
+record must be `static`, has no `Self`, and can be called as
+`TVector.Zero` or `v.Zero`. A property reads or writes a field, or goes
+through its declared accessor methods, with indexes as in a class.
+
+Members are public until a visibility section says otherwise.
+`private` is visible within the declaring unit; `strict private` only
+inside the record's own methods. Fields precede the methods and
+properties. A record has no inheritance, protected section, virtual
+method or instance destructor. A record helper can add more methods
+without hiding the record's own members. `with v do` finds the
+record's fields, methods and properties before names around it.
+`testdata/recmeth.paslang` and `testdata/units/recuse.paslang` exercise
+these operations, including records exported by a compiled unit.
+
 `Append(s, a, b)` is `s` with `a` and `b` after its elements, a slice of
 `s`'s type, as Go's `append` (1.0.132); `Append(s, u)` with `u` of `s`'s
 type adds `u`'s elements, `s`'s own too. `Cap(s)` is its capacity. A
@@ -3628,8 +3687,13 @@ gnalsap 2 0
   result, a `const` parameter) it works on a copy.
 - A `class function ... static;` is called through a value or through
   the type's name, `Int64.Biggest`, `string.Join`. A helper's class
-  method is always static, and a helper has no fields, no constructor
-  and no virtual method.
+  method is always static, and a helper has no fields and no virtual
+  method.
+- A type or record helper may declare a constructor. `T.Create(...)`
+  returns a new zero-initialized value of the helped type;
+  `v.Create(...)` runs it on `v`. Inside it, `Self` is that value by
+  reference, just as in a record's constructor. A class helper does
+  not yet declare a constructor.
 - `property P: T read GetP write SetP;` reads and writes through the
   helper's methods, with an index in brackets as a class's does.
 - `type helper(TBase) for string` descends from another helper for the
@@ -10502,7 +10566,15 @@ the commands on standard input, under `--debug-mode` and under
   a call reaches is put in a variable first.
 - A one-character literal is a string where a helper's method is called
   on it (`'x'.Twice` is string's helper), where Free Pascal takes it for
-  a `Char`. A helper has no constructor.
+  a `Char`.
+- A record constructor called on a variable, or from another
+  constructor, changes that same record and keeps the string fields
+  it assigns. Free Pascal 3.2.2 loses those strings when the call
+  returns, although its numeric fields survive. paslang does not
+  reproduce that defect: `r.Create('name')` keeps `r`'s new name, and
+  a constructor called from another receives the same `Self`.
+  `testdata/recmeth.paslang` checks both forms and the type and record
+  helper constructors too.
 - `Write` prints no set, as Free Pascal; it prints a `Boolean` as 1 or
   0, where Free Pascal writes TRUE and FALSE.
 - SysUtils writes a real with the digits of the value itself, rounded

@@ -86,8 +86,8 @@ LVL_A64 := v8.2+crypto
 A64_OBJDUMP ?= aarch64-linux-gnu-objdump
 
 # The golden tests: testdata/<t>.paslang must print testdata/<t>.out.
-GOLDEN := hello arith ifthen loops const caseof procs recfn records ptrs arrs strs grow paswork pingpong chclose sel exc excg nest cls gen enums sets dbg opt gdbg inherit rtti args8 mevent slice chlit armmeth propacc runes variant opadd args20 iface opmore props pindex dwarfloc shift dynnil xor inhcall isas sysid forward defaults abstract overload methov strdef trig logexp arctan invpow logx trig2 hyper miscmath xxh32 xxh64 map1 map2 sync1 sync2 finexit zerolocal pchar selx selstress wrchar chstr lookpath strcmp dupparam recarg funcval constk regloop reszero divconst bareln gctypes chr charcat heapspan blobzero gcbasic mapsplit stackmap trygrow growgc xxh3 mapgetstr bounds fairq sized fwdptr constexpr int2real typedconst caserange emptystmt writefmt realparse realfmt valpar strcow chanany chanbuf memmove overnarrow slicegrow fatexit narrow narrowmem recalign narrowbounds dwarfnarrow narrowgo forlimit bce inplace narrowasm slicereg forrun addrform bcerun inspine framearr realstep f32conv single dwarfreal ptrtyped ptrarith ptrsafe memview checkptr ptrreach cpwalk realint quadcore quadfmt quad quadconst dwarfquad bitops declorder convchain bitwords bitmem bitany views blocks wide ifdef quadfast memwords cpuwords vectors vecmore inlineasm vecpool addrlocal rotwords rotmem ctxwords append funcval2 closures pasargs ifaceargs vshrs64 auditfix closurebox audit2 visibility freedestroy reservedall nodeadlock mapfix tree1 tree2 hash1 store1 immwide constref inline1 stackargs mainexit networds charcmp unixsock sigpipe sleepmany deadlines strfill narrowpop tobject1 excobj1 excobj2 excobj3 classref1 ctorargs aconst1 aconst2 methdef1 set256 subrange1 subrange2 helper1 helper2 strwords strkern slicedit strcmpk scope1 classfwd ifacebind overconv overrank valunsigned sysutils1 sysutils2 initvar extended1 valround valround2 cmpwords fmtfloat1 fmtfloat2 format1 realtext quadtext valrange hidesys arrindex constround dates1 dates2 nestscope
-GOLDEN_A64 := map1 map2 sync1 sync2 finexit zerolocal pchar pingpong sel chclose paswork selx selstress wrchar args8 arith arrs caseof chlit cls const enums exc excg gen grow hyper ifthen inherit loops mevent miscmath nest procs ptrs recfn records sets strs trig2 xxh32 xxh64 rtti gdbg chstr strcmp recarg funcval constk regloop reszero divconst bareln gctypes chr charcat heapspan blobzero gcbasic mapsplit stackmap trygrow growgc xxh3 mapgetstr bounds fairq sized fwdptr constexpr int2real typedconst caserange emptystmt writefmt realparse realfmt valpar strcow chanany chanbuf memmove overnarrow slicegrow fatexit narrow narrowmem recalign narrowbounds dwarfnarrow narrowgo forlimit bce inplace narrowasm slicereg forrun addrform bcerun inspine framearr realstep f32conv single dwarfreal ptrtyped ptrarith ptrsafe memview checkptr ptrreach cpwalk realint quadcore quadfmt quad quadconst dwarfquad bitops declorder convchain bitwords bitmem bitany views blocks wide ifdef quadfast memwords cpuwords vectors vecmore inlineasm vecpool addrlocal rotwords rotmem ctxwords append funcval2 closures pasargs ifaceargs vshrs64 auditfix closurebox audit2 visibility freedestroy reservedall nodeadlock mapfix tree1 tree2 hash1 store1 immwide constref inline1 stackargs mainexit networds charcmp unixsock sigpipe sleepmany deadlines strfill narrowpop tobject1 excobj1 excobj2 excobj3 classref1 ctorargs aconst1 aconst2 methdef1 set256 subrange1 subrange2 helper1 helper2 strwords strkern slicedit strcmpk scope1 classfwd ifacebind overconv overrank valunsigned sysutils1 sysutils2 initvar extended1 valround valround2 cmpwords fmtfloat1 fmtfloat2 format1 realtext quadtext valrange hidesys arrindex constround dates1 dates2 nestscope
+GOLDEN := hello arith ifthen loops const caseof procs recfn records ptrs arrs strs grow paswork pingpong chclose sel exc excg nest cls gen enums sets dbg opt gdbg inherit rtti args8 mevent slice chlit armmeth propacc runes variant opadd args20 iface opmore props pindex dwarfloc shift dynnil xor inhcall isas sysid forward defaults abstract overload methov strdef trig logexp arctan invpow logx trig2 hyper miscmath xxh32 xxh64 map1 map2 sync1 sync2 finexit zerolocal pchar selx selstress wrchar chstr lookpath strcmp dupparam recarg funcval constk regloop reszero divconst bareln gctypes chr charcat heapspan blobzero gcbasic mapsplit stackmap trygrow growgc xxh3 mapgetstr bounds fairq sized fwdptr constexpr int2real typedconst caserange emptystmt writefmt realparse realfmt valpar strcow chanany chanbuf memmove overnarrow slicegrow fatexit narrow narrowmem recalign narrowbounds dwarfnarrow narrowgo forlimit bce inplace narrowasm slicereg forrun addrform bcerun inspine framearr realstep f32conv single dwarfreal ptrtyped ptrarith ptrsafe memview checkptr ptrreach cpwalk realint quadcore quadfmt quad quadconst dwarfquad bitops declorder convchain bitwords bitmem bitany views blocks wide ifdef quadfast memwords cpuwords vectors vecmore inlineasm vecpool addrlocal rotwords rotmem ctxwords append funcval2 closures pasargs ifaceargs vshrs64 auditfix closurebox audit2 visibility freedestroy reservedall nodeadlock mapfix tree1 tree2 hash1 store1 immwide constref inline1 stackargs mainexit networds charcmp unixsock sigpipe sleepmany deadlines strfill narrowpop tobject1 excobj1 excobj2 excobj3 classref1 ctorargs aconst1 aconst2 methdef1 set256 subrange1 subrange2 helper1 helper2 strwords strkern slicedit strcmpk scope1 classfwd ifacebind overconv overrank valunsigned sysutils1 sysutils2 initvar extended1 valround valround2 cmpwords fmtfloat1 fmtfloat2 format1 realtext quadtext valrange hidesys arrindex constround dates1 dates2 nestscope recmeth
+GOLDEN_A64 := map1 map2 sync1 sync2 finexit zerolocal pchar pingpong sel chclose paswork selx selstress wrchar args8 arith arrs caseof chlit cls const enums exc excg gen grow hyper ifthen inherit loops mevent miscmath nest procs ptrs recfn records sets strs trig2 xxh32 xxh64 rtti gdbg chstr strcmp recarg funcval constk regloop reszero divconst bareln gctypes chr charcat heapspan blobzero gcbasic mapsplit stackmap trygrow growgc xxh3 mapgetstr bounds fairq sized fwdptr constexpr int2real typedconst caserange emptystmt writefmt realparse realfmt valpar strcow chanany chanbuf memmove overnarrow slicegrow fatexit narrow narrowmem recalign narrowbounds dwarfnarrow narrowgo forlimit bce inplace narrowasm slicereg forrun addrform bcerun inspine framearr realstep f32conv single dwarfreal ptrtyped ptrarith ptrsafe memview checkptr ptrreach cpwalk realint quadcore quadfmt quad quadconst dwarfquad bitops declorder convchain bitwords bitmem bitany views blocks wide ifdef quadfast memwords cpuwords vectors vecmore inlineasm vecpool addrlocal rotwords rotmem ctxwords append funcval2 closures pasargs ifaceargs vshrs64 auditfix closurebox audit2 visibility freedestroy reservedall nodeadlock mapfix tree1 tree2 hash1 store1 immwide constref inline1 stackargs mainexit networds charcmp unixsock sigpipe sleepmany deadlines strfill narrowpop tobject1 excobj1 excobj2 excobj3 classref1 ctorargs aconst1 aconst2 methdef1 set256 subrange1 subrange2 helper1 helper2 strwords strkern slicedit strcmpk scope1 classfwd ifacebind overconv overrank valunsigned sysutils1 sysutils2 initvar extended1 valround valround2 cmpwords fmtfloat1 fmtfloat2 format1 realtext quadtext valrange hidesys arrindex constround dates1 dates2 nestscope recmeth
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -828,10 +828,30 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'Hidden is strict private to TH at 24:19' $(BUILDDIR)/helpbad_strict.err; \
 	grep -q 'TH.Twice is a method of a value, not of the type at 13:24' $(BUILDDIR)/helpbad_typecall.err; \
 	grep -q 'TH declares no method Thrice of these parameters at 12:13' $(BUILDDIR)/helpbad_nodecl.err; \
-	grep -q 'a helper has no constructor or destructor: a static class function makes a value at 4:5' $(BUILDDIR)/helpbad_ctor.err; \
+	grep -q 'a class helper has no constructor: a static class function makes an object at 7:5' $(BUILDDIR)/helpbad_ctor.err; \
 	grep -q 'a helper descends from a helper of its kind at 9:22' $(BUILDDIR)/helpbad_otherkind.err; \
 	grep -q 'Integer has no members: Twice needs a record, an object or a helper for Integer at 6:13' $(BUILDDIR)/helpbad_nomember.err; \
 	echo ok helpbad; \
+	echo "==== record member rejects (P165) ===="; \
+	for n in strictf strictm virt prot dtor clsctor nostat fieldafter typecall ctorres selfrec nodecl plainrec; do \
+	  if $(OUTDIR)/paslangc -o $(BUILDDIR)/recbad_$$n testdata/recbad/$$n.paslang >$(BUILDDIR)/recbad_$$n.err 2>&1; then \
+	    echo "$$n should fail"; exit 1; \
+	  fi; \
+	done; \
+	grep -q 'FN is strict private to TR at 17:5' $(BUILDDIR)/recbad_strictf.err; \
+	grep -q 'Hidden is strict private to TR at 17:11' $(BUILDDIR)/recbad_strictm.err; \
+	grep -q 'a record.s method is not virtual: a record has no method table at 6:21' $(BUILDDIR)/recbad_virt.err; \
+	grep -q 'a record has no descendants: private, strict private or public at 7:3' $(BUILDDIR)/recbad_prot.err; \
+	grep -q 'a record has no destructor at 6:5' $(BUILDDIR)/recbad_dtor.err; \
+	grep -q 'a record has no class constructor at 6:11' $(BUILDDIR)/recbad_clsctor.err; \
+	grep -q 'a record.s class method is static: class function F: T; static; at 6:20' $(BUILDDIR)/recbad_nostat.err; \
+	grep -q 'a record.s fields come before its methods and properties, or after private or public at 7:5' $(BUILDDIR)/recbad_fieldafter.err; \
+	grep -q 'TR.Twice is a method of a value, not of the type at 13:19' $(BUILDDIR)/recbad_typecall.err; \
+	grep -q 'unknown identifier Result at 10:9' $(BUILDDIR)/recbad_ctorres.err; \
+	grep -q 'a record holds no field of its own type: TR at 6:14' $(BUILDDIR)/recbad_selfrec.err; \
+	grep -q 'TR declares no method Thrice of these parameters at 12:13' $(BUILDDIR)/recbad_nodecl.err; \
+	grep -q 'TR is a record with no methods at 6:13' $(BUILDDIR)/recbad_plainrec.err; \
+	echo ok recbad; \
 	echo "==== string word rejects (P134) ===="; \
 	for n in copyslice insertconst insertslice editcall strstring strdec valchar valcode soc upint posname valname; do \
 	  if $(OUTDIR)/paslangc -o $(BUILDDIR)/strbad_$$n testdata/strbad/$$n.paslang >$(BUILDDIR)/strbad_$$n.err 2>&1; then \
@@ -1765,6 +1785,23 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/nestuse-arm testdata/units/nestuse.paslang; \
 	timeout 60 $(QEMU_A64) $(BUILDDIR)/nestuse-arm > $(BUILDDIR)/nestuse-arm.got; \
 	diff -u testdata/units/nestuse.out $(BUILDDIR)/nestuse-arm.got; \
+	: records with methods and properties across a unit, and their private members, P165; \
+	$(OUTDIR)/paslangc testdata/units/recu.paslang; \
+	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/recuse testdata/units/recuse.paslang; \
+	$(BUILDDIR)/recuse > $(BUILDDIR)/recuse.got; \
+	diff -u testdata/units/recuse.out $(BUILDDIR)/recuse.got; \
+	$(OUTDIR)/paslangc -target arm64 testdata/units/recu.paslang; \
+	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/recuse-arm testdata/units/recuse.paslang; \
+	timeout 60 $(QEMU_A64) $(BUILDDIR)/recuse-arm > $(BUILDDIR)/recuse-arm.got; \
+	diff -u testdata/units/recuse.out $(BUILDDIR)/recuse-arm.got; \
+	for p in recpriv1 recpriv2 recpriv3; do \
+	  if $(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/$$p testdata/units/$$p.paslang > $(BUILDDIR)/$$p.err 2>&1; then \
+	    echo "$$p should fail"; exit 1; \
+	  fi; \
+	done; \
+	grep -q 'FPeak is private to TStack.s unit at 8:13' $(BUILDDIR)/recpriv1.err; \
+	grep -q 'GetCount is private to TStack.s unit at 8:21' $(BUILDDIR)/recpriv2.err; \
+	grep -q 'FCents is strict private to TMoney at 9:13' $(BUILDDIR)/recpriv3.err; \
 	: the local clock under five zones, a TZif file each, against Go, P131; \
 	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/zone1 testdata/zone1.paslang; \
 	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/dates3 testdata/dates3.paslang; \

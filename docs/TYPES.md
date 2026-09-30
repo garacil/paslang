@@ -396,6 +396,14 @@ are worked out. The callee cannot keep it (MANUAL §5).
   that holds a pointer on a word; the size rounds up to the most aligned
   field, so `record B: Byte; W: Word; I: Int32 end` is 8 bytes
   (`testdata/narrowmem.paslang`, `recalign.paslang`, `variant.paslang`).
+- Methods, constructors and properties add no storage to a record.
+  Instance methods receive `Self` by reference; static class methods
+  have no receiver. `T.Create(...)` returns a new zero-initialized
+  value, while `v.Create(...)` operates on `v` itself. A helper's
+  methods use the same calling convention. These members travel in a
+  unit's compiled interface without changing the record's field
+  offsets or GC descriptor (`testdata/recmeth.paslang`,
+  `testdata/units/recu.paslang`).
 - `operator` defines `+ - * / div mod = <> < <= > >=` as a function.
   Integer, string, and set operations stay builtin when no operator is
   declared. A record without one is an error. `testdata/opadd.paslang`,
