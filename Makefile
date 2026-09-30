@@ -2374,11 +2374,15 @@ distpkg: package
 	python3 scripts/distpkg.py
 
 # Everything a release carries, in build/pkg/release: the two archives
-# of make package, the packages of make distpkg, and SHA256SUMS of them
-# all. Every release uploads the whole directory.
+# of make package for this version (an older version's, left in
+# build/pkg, stays out), the packages of make distpkg, and SHA256SUMS of
+# them all. Every release uploads the whole directory.
 release-assets: distpkg
-	@set -e; rm -rf $(BUILDDIR)/pkg/release; mkdir -p $(BUILDDIR)/pkg/release; \
-	cp $(BUILDDIR)/pkg/paslang-*-linux-*.tar.gz $(BUILDDIR)/pkg/dist/* $(BUILDDIR)/pkg/release/; \
+	@set -e; \
+	v=$$($(OUTDIR)/paslangc -v | grep -o 'paslangc  *[0-9][0-9.]*' | head -1 | awk '{print $$2}'); \
+	test -n "$$v"; \
+	rm -rf $(BUILDDIR)/pkg/release; mkdir -p $(BUILDDIR)/pkg/release; \
+	cp $(BUILDDIR)/pkg/paslang-$$v-linux-*.tar.gz $(BUILDDIR)/pkg/dist/* $(BUILDDIR)/pkg/release/; \
 	cd $(BUILDDIR)/pkg/release && sha256sum * > SHA256SUMS && cat SHA256SUMS
 
 uninstall:
