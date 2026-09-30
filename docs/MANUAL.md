@@ -5522,7 +5522,11 @@ change its ASCII letters; `StringOfChar(c, n)` is `n` times `c`;
 enumeration's member by its name, padded on the right); and `Val(s, v,
 code)` reads a number into `v` (decimal, `$` or `0x` hexadecimal, `%`
 binary, `&` octal, blanks first), a real or an enumeration's member,
-`code` 0 or the place of the first character it could not read. An
+`code` 0 or the place of the first character it could not read. Into
+an unsigned type (`Byte`, `Word`, `UInt32`, a subrange from 0) it
+reads a decimal number up to 2^64 - 1 and keeps its low bits, as Free
+Pascal does: `'300'` into a `Byte` is 44, code 0 (1.1.17, P142; past
+2^63 was an error). An
 index out of the string does what Free Pascal does: `Insert` at 0
 puts in front, `Delete` past the end does nothing, `Copy` from 0
 starts at 1. `Pos` searches with the processor's vectors (AVX2, SSE2 or
