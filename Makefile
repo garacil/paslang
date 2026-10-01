@@ -94,6 +94,8 @@ GOLDEN += withonce withcapture withmap
 GOLDEN_A64 += withonce withcapture withmap
 GOLDEN += treewide
 GOLDEN_A64 += treewide
+GOLDEN += recstatic
+GOLDEN_A64 += recstatic
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -849,7 +851,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'a record.s method is not virtual: a record has no method table at 6:21' $(BUILDDIR)/recbad_virt.err; \
 	grep -q 'a record has no descendants: private, strict private or public at 7:3' $(BUILDDIR)/recbad_prot.err; \
 	grep -q 'a record has no destructor at 6:5' $(BUILDDIR)/recbad_dtor.err; \
-	grep -q 'a record has no class constructor at 6:11' $(BUILDDIR)/recbad_clsctor.err; \
+	grep -qF 'missing body of TR.Init at 6:23' $(BUILDDIR)/recbad_clsctor.err; \
 	grep -q 'a record.s class method is static: class function F: T; static; at 6:20' $(BUILDDIR)/recbad_nostat.err; \
 	grep -q 'a record.s fields come before its methods and properties, or after private or public at 7:5' $(BUILDDIR)/recbad_fieldafter.err; \
 	grep -q 'TR.Twice is a method of a value, not of the type at 13:19' $(BUILDDIR)/recbad_typecall.err; \
@@ -887,6 +889,27 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  done; \
 	done; \
 	echo ok methbodybad; \
+	echo "==== record static rejects (P168) ===="; \
+	for target in amd64 arm64; do \
+	  for f in 'strictvar:X is strict private to TR at 6:18' 'strictprop:P is strict private to TR at 7:18' 'twoctor:a record has one class constructor at 4:21' 'lifeparams:a class constructor takes no parameters at 3:21' 'fielddup:X is a class variable already at 5:13' 'missing:missing body of TR.Start at 3:21'; do \
+	    n=$${f%%:*}; msg=$${f#*:}; \
+	    if $(OUTDIR)/paslangc -target $$target -o $(BUILDDIR)/recstaticbad_$$n-$$target testdata/recstaticbad/$$n.paslang >$(BUILDDIR)/recstaticbad_$$n-$$target.err 2>&1; then \
+	      echo "$$n must fail"; exit 1; \
+	    fi; \
+	    grep -qF "$$msg" $(BUILDDIR)/recstaticbad_$$n-$$target.err; \
+	  done; \
+	done; \
+	echo ok recstaticbad; \
+	for target in amd64 arm64; do \
+	  for f in 'gettype:TR.P requires a static getter of Integer' 'setvar:TR.P requires a static setter of Integer' 'varprop:TR.P: class variable Text has type string, not Integer'; do \
+	    n=$${f%%:*}; msg=$${f#*:}; \
+	    if $(OUTDIR)/paslangc -target $$target -o $(BUILDDIR)/recstaticbad_$$n-$$target testdata/recstaticbad/$$n.paslang >$(BUILDDIR)/recstaticbad_$$n-$$target.err 2>&1; then \
+	      echo "$$n must fail"; exit 1; \
+	    fi; \
+	    grep -qF "$$msg" $(BUILDDIR)/recstaticbad_$$n-$$target.err; \
+	  done; \
+	done
+	@set -e; \
 	echo "==== string word rejects (P134) ===="; \
 	for n in copyslice insertconst insertslice editcall strstring strdec valchar valcode soc upint posname valname; do \
 	  if $(OUTDIR)/paslangc -o $(BUILDDIR)/strbad_$$n testdata/strbad/$$n.paslang >$(BUILDDIR)/strbad_$$n.err 2>&1; then \
@@ -1630,6 +1653,9 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  grep -qF "$$w" $(BUILDDIR)/$$n-arm.got || { cat $(BUILDDIR)/$$n-arm.got; exit 1; }; \
 	done; \
 	echo ok forward-rejects; \
+	:
+	@set -e; \
+	xrun=""; if command -v Xvfb >/dev/null 2>&1; then xrun="env DISPLAY=:99"; fi; \
 	echo "==== units ===="; \
 	$(OUTDIR)/paslangc testdata/units/adder.paslang; \
 	$(OUTDIR)/paslangc testdata/units/dbl.paslang; \
@@ -1838,6 +1864,29 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'GetCount is private to TStack.s unit at 8:21' $(BUILDDIR)/recpriv2.err; \
 	grep -q 'FCents is strict private to TMoney at 9:13' $(BUILDDIR)/recpriv3.err; \
 	: the local clock under five zones, a TZif file each, against Go, P131; \
+	: record class state and lifetime across a unit, P168 and P174; \
+	for inl in 0 40; do \
+	  for u in initinla initinlb; do $(OUTDIR)/paslangc -inline $$inl testdata/units/$$u.paslang; done; \
+	  $(OUTDIR)/paslangc -inline $$inl -Fu $(BUILDDIR) -o $(BUILDDIR)/initinluse testdata/units/initinluse.paslang; \
+	  $(BUILDDIR)/initinluse > $(BUILDDIR)/initinluse.got; \
+	  diff -u testdata/units/initinluse.out $(BUILDDIR)/initinluse.got; \
+	  for u in initinla initinlb; do $(OUTDIR)/paslangc -inline $$inl -target arm64 testdata/units/$$u.paslang; done; \
+	  $(OUTDIR)/paslangc -inline $$inl -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/initinluse-arm testdata/units/initinluse.paslang; \
+	  timeout 60 $(QEMU_A64) $(BUILDDIR)/initinluse-arm > $(BUILDDIR)/initinluse-arm.got; \
+	  diff -u testdata/units/initinluse.out $(BUILDDIR)/initinluse-arm.got; \
+	  $(OUTDIR)/paslangc -inline $$inl testdata/units/recsu.paslang; \
+	  $(OUTDIR)/paslangc -inline $$inl -Fu $(BUILDDIR) -o $(BUILDDIR)/recsuse testdata/units/recsuse.paslang; \
+	  $(BUILDDIR)/recsuse > $(BUILDDIR)/recsuse.got; \
+	  diff -u testdata/units/recsuse.out $(BUILDDIR)/recsuse.got; \
+	  $(OUTDIR)/paslangc -inline $$inl -target arm64 testdata/units/recsu.paslang; \
+	  $(OUTDIR)/paslangc -inline $$inl -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/recsuse-arm testdata/units/recsuse.paslang; \
+	  timeout 60 $(QEMU_A64) $(BUILDDIR)/recsuse-arm > $(BUILDDIR)/recsuse-arm.got; \
+	  diff -u testdata/units/recsuse.out $(BUILDDIR)/recsuse-arm.got; \
+	done; \
+	if $(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/recspriv testdata/units/recspriv.paslang >$(BUILDDIR)/recspriv.err 2>&1; then \
+	  echo 'a record class variable must remain private across a unit'; exit 1; \
+	fi; \
+	grep -qF 'FCount is private to TCache at 3:22' $(BUILDDIR)/recspriv.err; \
 	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/zone1 testdata/zone1.paslang; \
 	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/dates3 testdata/dates3.paslang; \
 	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/zone1-arm testdata/zone1.paslang; \

@@ -504,6 +504,7 @@ type
     function RecMemberAhead: Boolean;
     function RecordHelper(Rec: LongInt): LongInt;
     procedure MakeRecordHelper(Rec: LongInt; const AName: string; const Members: TTypeDef);
+    procedure CheckRecordClassProps(H: LongInt);
     function RecFieldIdx(T: LongInt; const AName: string): SizeInt;
     procedure CheckRecField(T: LongInt; I: SizeInt; ALine, ACol: LongInt);
     function WithIdx(const AName: string): SizeInt;
@@ -5633,8 +5634,11 @@ begin
   end
   else
   begin
-    ok := (FClassTyp <> 0) and ((FClassTyp = owner) or
-      (TypeStemOf(FTypes[FClassTyp]) = TypeStemOf(FTypes[owner])));
+    if FTypes[owner].Kind = tykHelper then
+      ok := FHelperTyp = owner
+    else
+      ok := (FClassTyp <> 0) and ((FClassTyp = owner) or
+        (TypeStemOf(FTypes[FClassTyp]) = TypeStemOf(FTypes[owner])));
     what := 'strict private';
   end;
   if not ok then
@@ -7629,6 +7633,7 @@ begin
   td.Size := 0;
   td.Meths := Members.Meths;
   td.Props := Members.Props;
+  td.CVars := Members.CVars;
   n := Length(FTypes);
   SetLength(FTypes, n + 1);
   FTypes[n] := td;
@@ -7652,6 +7657,55 @@ begin
       Die(AName + '.' + td.Props[k].Name + ' writes ' + td.Props[k].WriteName +
         ', which is no field or method of the record');
   end;
+  CheckRecordClassProps(LongInt(n));
+end;
+
+{ Static accessors must implement the declared property's type and
+  arity, even if the property is never used (P168). Class storage is
+  checked here too; it is not an instance field with a similar name. }
+procedure TParser.CheckRecordClassProps(H: LongInt);
+var
+  i, j, side, ci: SizeInt;
+  td: TTypeDef;
+  pr: TPropInfo;
+  acc, role: string;
+  good: Boolean;
+begin
+  td := TypeOf(H);
+  for i := 0 to High(td.Props) do
+  begin
+    pr := td.Props[i];
+    if not pr.IsClass then Continue;
+    for side := 0 to 1 do
+    begin
+      if side = 0 then begin acc := pr.ReadName; role := 'getter' end
+      else begin acc := pr.WriteName; role := 'setter' end;
+      if acc = '' then Continue;
+      ci := CVarIndex(H, acc);
+      if ci >= 0 then
+      begin
+        if not SameTyp(td.CVars[ci].Typ, pr.Typ) then
+          Die(td.Name + '.' + pr.Name + ': class variable ' + acc + ' has type ' +
+            TypName(td.CVars[ci].Typ) + ', not ' + TypName(pr.Typ) + HerePos);
+        Continue;
+      end;
+      good := False;
+      for j := 0 to High(td.Meths) do
+        if SameId(td.Meths[j].Name, acc) and td.Meths[j].IsStatic and
+          CallableMeth(td.Meths[j]) and (td.Meths[j].NParams = side) and
+          (td.Meths[j].IsFunc = (side = 0)) then
+        begin
+          if side = 0 then
+            good := SameTyp(td.Meths[j].RetTyp, pr.Typ)
+          else
+            good := not td.Meths[j].ByRef[0] and SameTyp(td.Meths[j].ParamTyps[0], pr.Typ);
+          if good then Break;
+        end;
+      if not good then
+        Die(td.Name + '.' + pr.Name + ' requires a static ' + role + ' of ' +
+          TypName(pr.Typ) + HerePos);
+    end;
+  end;
 end;
 
 { A record's member begins here (P165): a method, a constructor, a
@@ -7660,7 +7714,7 @@ function TParser.RecMemberAhead: Boolean;
 begin
   Result := (FTok.Kind = tkProcedure) or (FTok.Kind = tkFunction) or
     (FTok.Kind = tkConstructor) or (FTok.Kind = tkDestructor) or (FTok.Kind = tkClass) or
-    (FTok.Kind = tkProperty) or ((FTok.Kind = tkIdent) and (SameId(FTok.Lexeme, 'private') or
+    (FTok.Kind = tkProperty) or (FTok.Kind = tkVar) or ((FTok.Kind = tkIdent) and (SameId(FTok.Lexeme, 'private') or
     SameId(FTok.Lexeme, 'public') or SameId(FTok.Lexeme, 'protected') or
     SameId(FTok.Lexeme, 'published') or SameId(FTok.Lexeme, 'strict')));
 end;
@@ -7693,8 +7747,9 @@ var
   pt, npar, t: LongInt;
   n, i, nn, ov: SizeInt;
   names: array of string;
-  mname, rname, wname, baseSym, mpos, Who: string;
-  isFunc, isClassM, isStat, byref, eq, isCtor: Boolean;
+  mname, rname, wname, baseSym, mpos, Who, gname: string;
+  isFunc, isClassM, isStat, byref, eq, isCtor, isDtor: Boolean;
+  check: TTypeDef;
   nindex: LongInt;
 begin
   if Rec <> 0 then
@@ -7707,9 +7762,92 @@ begin
     FTok := FLex.Next;
     isClassM := True;
   end;
+  if isClassM and (FTok.Kind = tkVar) and (Rec <> 0) then
+  begin
+    FTok := FLex.Next;
+    while (FTok.Kind = tkIdent) and not RecMemberAhead do
+    begin
+      names := nil;
+      repeat
+        CheckName(FTok.Lexeme);
+        AppendStr(names, FTok.Lexeme);
+        FTok := FLex.Next;
+        if FTok.Kind <> tkComma then Break;
+        FTok := FLex.Next;
+      until False;
+      Eat(tkColon);
+      t := Self.ParseType;
+      Eat(tkSemi);
+      check := Td;
+      check.Fields := Fields;
+      for i := 0 to High(names) do
+      begin
+        FieldDup(check, names[i]);
+        for n := 0 to High(Td.Meths) do
+          if SameId(Td.Meths[n].Name, names[i]) then
+            Die(names[i] + ' is a method already' + HerePos);
+        for n := 0 to High(Td.Props) do
+          if SameId(Td.Props[n].Name, names[i]) then
+            Die(names[i] + ' is a property already' + HerePos);
+        gname := AName + '.' + names[i];
+        AddVar(gname, t, False);
+        if FUnitName <> '' then
+        begin
+          FVars[High(FVars)].Sym := FUnitName + '.' + gname;
+          FVars[High(FVars)].Pub := not FInImpl;
+        end;
+        n := Length(Td.CVars);
+        SetLength(Td.CVars, n + 1);
+        Td.CVars[n] := Default(TField);
+        Td.CVars[n].Name := names[i];
+        Td.CVars[n].Typ := t;
+        Td.CVars[n].Vis := Vis;
+        Td.CVars[n].Off := -1;
+        Td.CVars[n].Sym := VarSym(gname);
+        check.CVars := Td.CVars;
+      end;
+    end;
+    Exit;
+  end;
+  if isClassM and (Rec <> 0) and
+    ((FTok.Kind = tkConstructor) or (FTok.Kind = tkDestructor)) then
+  begin
+    isCtor := FTok.Kind = tkConstructor;
+    isDtor := not isCtor;
+    FTok := FLex.Next;
+    if FTok.Kind <> tkIdent then Die('method name');
+    mname := FTok.Lexeme;
+    mpos := HerePos;
+    CheckName(mname);
+    FTok := FLex.Next;
+    if FTok.Kind = tkLParen then
+      Die('a class ' + LifeWord(isCtor) + ' takes no parameters' + mpos);
+    Eat(tkSemi);
+    for i := 0 to High(Td.Meths) do
+      if Td.Meths[i].IsClassMeth and ((isCtor and Td.Meths[i].IsCtor) or
+        (isDtor and Td.Meths[i].IsDtor)) then
+        Die('a record has one class ' + LifeWord(isCtor) + mpos);
+    n := Length(Td.Meths);
+    SetLength(Td.Meths, n + 1);
+    Td.Meths[n] := Default(TMethInfo);
+    Td.Meths[n].Name := mname;
+    Td.Meths[n].Sym := ProcSym('', StemOfName(AName) + '_' + mname) + ClassLifeTag(isCtor);
+    Td.Meths[n].IsCtor := isCtor;
+    Td.Meths[n].IsDtor := isDtor;
+    Td.Meths[n].IsClassMeth := True;
+    Td.Meths[n].IsStatic := True;
+    Td.Meths[n].RetTyp := TyNone;
+    Td.Meths[n].Slot := -1;
+    Td.Meths[n].Vis := Vis;
+    RememberMethod(Td.Meths[n].Sym, AName + '.' + mname, mpos);
+    AddProcEnt(Td.Meths[n].Sym, Td.Meths[n].Sym, False, 0, TyNone);
+    if isCtor then AppendStr(FClassCtors, Td.Meths[n].Sym)
+    else AppendStr(FClassDtors, Td.Meths[n].Sym);
+    Exit;
+  end;
   if FTok.Kind = tkProperty then
   begin
-    if isClassM then
+    if isClassM and (Rec = 0) then
       Die(Who + '''s property is read from a value' + HerePos);
     FTok := FLex.Next;
     if FTok.Kind <> tkIdent then
@@ -7779,8 +7917,11 @@ begin
     td.Props[n].WriteName := wname;
     td.Props[n].NIndex := nindex;
     td.Props[n].Vis := vis;
+    td.Props[n].IsClass := isClassM;
+    if isClassM and (nindex <> 0) then
+      Die('a class property has no index' + HerePos);
     { a record's property may read and write a field of it (P165) }
-    if (Rec <> 0) and (nindex = 0) then
+    if (Rec <> 0) and (nindex = 0) and not isClassM then
     begin
       for i := 0 to High(Fields) do
       begin
@@ -8091,6 +8232,12 @@ begin
   Result := False;
   while H > 0 do
   begin
+    for i := 0 to High(FTypes[H].CVars) do
+      if SameId(FTypes[H].CVars[i].Name, AName) then
+      begin
+        Result := True;
+        Exit;
+      end;
     for i := 0 to High(FTypes[H].Meths) do
       if SameId(FTypes[H].Meths[i].Name, AName) then
       begin
@@ -8244,6 +8391,18 @@ var
   pr: TPropInfo;
   rname: string;
 begin
+  hh := H;
+  while hh > 0 do
+  begin
+    k := CVarIndex(hh, AName);
+    if k >= 0 then
+    begin
+      CheckVis(hh, 3, k, ALine, ACol);
+      Result := NewVar(FTypes[hh].CVars[k].Sym, FTypes[hh].CVars[k].Typ);
+      Exit;
+    end;
+    hh := FTypes[hh].Parent;
+  end;
   { a property of the helper or of one it descends from }
   mi := -1;
   hh := H;
@@ -8262,6 +8421,11 @@ begin
   if owner <> 0 then
   begin
     pr := FTypes[owner].Props[px];
+    if pr.IsClass then
+    begin
+      Result := ClassPropRead(owner, px, ALine, ACol);
+      Exit;
+    end;
     if (pr.Vis = VisStrictPrivate) and (FHelperTyp <> owner) then
       Die(pr.Name + ' is strict private to ' + FTypes[owner].Name + HerePos);
     if (pr.Vis = VisPrivate) and FTypes[owner].Imported then
@@ -9296,11 +9460,14 @@ begin
       FRecSelf := rid;
       off := 0;
       repeat
+        td.CVars := htd.CVars;
         FRecVis := recVis;
         off := ParseRecPart(td, off, tkEnd);
         if FTok.Kind = tkEnd then
           Break;
-        if (FTok.Kind = tkIdent) and SameId(FTok.Lexeme, 'strict') then
+        if FTok.Kind = tkVar then
+          FTok := FLex.Next
+        else if (FTok.Kind = tkIdent) and SameId(FTok.Lexeme, 'strict') then
         begin
           FTok := FLex.Next;
           if (FTok.Kind <> tkIdent) or not SameId(FTok.Lexeme, 'private') then
@@ -9327,7 +9494,7 @@ begin
           FRecVis := VisPublic;
           ParseHelperMember(htd, name, recVis, rid, td.Fields);
           { a field after a member needs a visibility section first }
-          while RecMemberAhead and not ((FTok.Kind = tkIdent) and (SameId(FTok.Lexeme, 'private') or
+          while RecMemberAhead and (FTok.Kind <> tkVar) and not ((FTok.Kind = tkIdent) and (SameId(FTok.Lexeme, 'private') or
             SameId(FTok.Lexeme, 'public') or SameId(FTok.Lexeme, 'protected') or
             SameId(FTok.Lexeme, 'published') or SameId(FTok.Lexeme, 'strict'))) do
             ParseHelperMember(htd, name, recVis, rid, td.Fields);
@@ -9346,7 +9513,7 @@ begin
         td.Size := 1;
       FTypes[rid].Fields := td.Fields;
       FTypes[rid].Size := td.Size;
-      if (Length(htd.Meths) > 0) or (Length(htd.Props) > 0) then
+      if (Length(htd.Meths) > 0) or (Length(htd.Props) > 0) or (Length(htd.CVars) > 0) then
         MakeRecordHelper(rid, name, htd);
     end
     else
@@ -18196,6 +18363,16 @@ begin
   for k := 0 to High(st.Meths) do
     if SameId(st.Meths[k].Name, acc) and st.Meths[k].IsClassMeth and CallableMeth(st.Meths[k]) then
     begin
+      { Pick the accessor's declared signature, not simply the first
+        overload of its name. A setter receives one value of the
+        property's type; a getter has no parameters (P168). }
+      if writing then
+      begin
+        if st.Meths[k].IsFunc or (st.Meths[k].NParams <> 1) then Continue;
+        if st.Meths[k].ByRef[0] or not SameTyp(st.Meths[k].ParamTyps[0], pr.Typ) then Continue;
+      end
+      else if not st.Meths[k].IsFunc or (st.Meths[k].NParams <> 0) or
+        not SameTyp(st.Meths[k].RetTyp, pr.Typ) then Continue;
       if not st.Meths[k].IsStatic then
         Die(acc + ', the accessor of class property ' + pr.Name +
           ', is a static class method or a class variable at ' + IntToStr(ALine) + ':' +
@@ -18712,6 +18889,12 @@ begin
     pr.Sym := ProcSym('', TypeStemOf(st) + '_' + pr.Name) + ClassLifeTag(pr.IsCtor);
     pr.IsCtor := False;
     pr.NoSelf := True;
+    if st.Kind = tykHelper then
+    begin
+      pr.HelperTyp := pr.ClassTyp;
+      pr.ClassTyp := 0;
+      pr.Name := st.Name + '.' + pr.Name;
+    end;
     Eat(tkSemi);
     Result := pr;
     Exit;

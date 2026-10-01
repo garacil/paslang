@@ -2952,6 +2952,19 @@ program or the unit's implementation section, even if never called.
 The compiler reports a missing body at its declaration, before linking.
 Abstract class methods do not need bodies.
 
+Records may also declare `class var` and `class property`. A class
+variable is shared storage, not an instance field, and does not add to
+`SizeOf` or alter the value's layout. A class property reads or writes
+such a variable or a static accessor method, with the record's normal
+visibility rules. Both are usable as `T.Name`, `v.Name` and plainly
+inside its methods. `class constructor` and `class destructor` take
+no parameters and have no `Self`: one of each per record, run once in
+declaration order at startup and in reverse order at teardown. In a
+unit the constructors precede `initialization` and the destructors
+follow `finalization`. These lifetimes do not construct or destroy
+individual record values (`testdata/recstatic.paslang` and
+`testdata/units/recsuse.paslang`).
+
 `Append(s, a, b)` is `s` with `a` and `b` after its elements, a slice of
 `s`'s type, as Go's `append` (1.0.132); `Append(s, u)` with `u` of `s`'s
 type adds `u`'s elements, `s`'s own too. `Cap(s)` is its capacity. A
@@ -10606,6 +10619,12 @@ the commands on standard input, under `--debug-mode` and under
   a constructor called from another receives the same `Self`.
   `testdata/recmeth.paslang` checks both forms and the type and record
   helper constructors too.
+- Record class destructors run at normal program or unit teardown,
+  in reverse declaration order, so a dependency initialized first
+  remains available until its dependants have finished. Free Pascal
+  3.2.2 runs these record destructors in declaration order instead.
+  `recstatic` tests paslang's explicit reverse-order contract;
+  `recsuse` also checks their position after unit finalization.
 - `Write` prints no set, as Free Pascal; it prints a `Boolean` as 1 or
   0, where Free Pascal writes TRUE and FALSE.
 - SysUtils writes a real with the digits of the value itself, rounded
