@@ -10,6 +10,55 @@ everything, memory included, not only equal.
 
 ## 1. Why a paslang program held more memory than Go's (1.0.52)
 
+A syscall P handoff counts the replacement M as spinning before publishing
+the old M's detached state. That pending capacity remains counted until the
+replacement starts scheduling. The deadlock detector must not mistake the
+interval before its wake for a program with no runnable capacity. This is
+the same race guarded by `incidlelocked(-1)` in current Go's `retake`.
+`inject_syscall_handoff.py` forces the last-sleeper check during a reused-M
+handoff, checks both pending capacity and genuine deadlock, restores all
+state and lets the ordinary concurrency/GC fixture complete.
+
+The arm64 G transitions in `ready`, ordinary park, park-unlock and IO park
+use acquire/release CAS, the `LDAXRW`/`STLXRW` base design in current Go's
+`internal/runtime/atomic/atomic_arm64.s`. A wake publishes transferred
+values; successful parking publishes the saved SP/PC/BP, and a losing park
+acquires an early wake. Relaxed exclusive instructions provide atomicity
+without those publication edges. The debugger gate verifies the five
+actual instruction pairs through the cross-disassembler: x86-hosted QEMU
+alone cannot demonstrate ARM weak-memory correctness.
+When `-cpu` includes LSE the same shared emitter kernel writes `CASAL`,
+chosen at compile time without a runtime feature branch.
+
+The central syscall entry also owns the signal lifecycle of real fork.
+M+24 saves the original Linux kernel signal mask; M+40 holds the complete
+mask and identifies a private child awaiting exec. The original M restores
+its mask before GC waits or a detached syscall continuation can migrate G;
+the parent clears M+40. The child retains a raw-only interval, restores its
+real stack guard rather than a copied GC/preemption request, and keeps
+signals blocked until the raw exec prelude resets caught handlers and
+restores the saved mask. Ignored handlers remain ignored. No copied runtime
+handler, allocator, stack mover or finalizer may run in that interval.
+The exec prelude returns explicit setup errors through the ordinary raw
+syscall result. This is shared by all units, not a SysUtils adapter.
+
+A selected arm starts after its temporary selection table has been removed.
+The selected index is dead before the arm body: retaining it on the arm64
+stack made `Break` and `Continue` skip a pop and invalidated the next call's
+stack map. `selectflow` covers boxed receives, default and nested arms,
+`finally`, stack growth and GC; the internal debugger also runs under GC
+verification and stress. Descriptor/frame mismatches remain fatal in
+verification mode rather than being hidden by a conservative fallback.
+
+The internal debugger keeps a frame and a `next` target as distances from
+the G's stack high, just as `copystack` preserves used stack distances in
+current Go. It never puts an absolute stack address in a heap state record:
+the precise stack mover does not relocate integer fields of heap objects.
+Before resolving a stopped frame it acquires the runtime's waiting state;
+the debugger guard prevents resume while variables or caller frames are
+read. A deterministic GDB test forces growth after a hook saves its frame
+and before it parks, and checks the relocated frame and decimal variables.
+
 ### The allocator before P95 (1.0.52)
 
 `rt_alloc` rounded a request up to 8 bytes. A block of up to 4 KB came
@@ -182,10 +231,18 @@ conservatively, word by word, and does not move what it finds that way.
    every running routine's guard poisoned as sysmon does; an M stops in
    `rt_gcstopm`, from `rt_mloop` (where a yield and a preemption at
    `.ms_preempt` land) or on losing the race to start the cycle; an idle
-   M counts as stopped, and so does one inside a system call (MState 2),
+   M counts as stopped, and so does one inside a system call (MState 2
+   with its P, 8 after that P was retaken),
    which waits on the way out for the cycle that counted it; a routine
    holding a runtime lock runs until it lets go. The cycle runs on the
-   g0 of the M that started it.
+   g0 of the M that started it. M creation/P handoff and the beginning
+   of the stop share a table lock: the collector freezes the allocated
+   M count, not the P count. It scans every blocked G's saved syscall
+   frame before its return can rejoin the scheduler. Retaken Ms may
+   outnumber Ps; they do not enlarge the parallel-mark budget. Worker
+   records are reserved by the M limit, but threads and system stacks
+   are allocated only on demand. A returning no-P M waits for reuse;
+   all of these transitions preserve GC roots and stack maps.
 6. **Mark.** A grey stack in memory outside the heap; mark bits per span;
    an interior pointer (`@r.f`, `PChar` arithmetic) finds its object
    through the span table; a word that is not inside an allocated object
@@ -403,7 +460,7 @@ the rules above.
   counter's type and is scanned by that type. `pas` of a nested routine
   or of any call keeps the environment at G+248 until `rt_execute` loads
   it; the routine's record is scanned whole and word by word
-  (`GRecSize`, 272 bytes), so the box stays alive, and `PasStackAdjust`
+  (`GRecSize`, 288 bytes), so the box stays alive, and `PasStackAdjust`
   moves G+248 when it points into a stack that moved.
 - *Trees, heaps and the store (1.0.141–1.0.145, P110).* A tree's header
   and every node of it (`pastree`) come from two-argument `GetMem`,

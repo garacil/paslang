@@ -54,6 +54,8 @@ const
   MsgCloseSender = 'paslang: close of a channel with a waiting sender';
   MsgMapRW = 'paslang: concurrent map read and map write';
   MsgClone = 'paslang: clone failed';
+  MsgSignalMask = 'paslang: cannot restore runtime signal mask';
+  MsgThreads = 'paslang: thread limit exceeded (10000 Ms)';
   MsgIndex = 'paslang: index ';
   MsgBit = 'paslang: bit ';
   MsgSet = 'paslang: set element ';
@@ -362,6 +364,7 @@ type
     procedure PshK(const Reg: string; K: Byte);
     procedure MapHint4(K0, K1, K2, K3: Byte);
     function HasFeat(Bit: LongInt): Boolean;
+    procedure ArmGStatusCas(const RetryLabel, MissLabel: string);
     function NoUnwind(MinDep: LongInt): Boolean;
     procedure GcMark(Id, W0: LongInt; var W: TGcBits; Depth: LongInt);
     function GcAny(const W: TGcBits): Boolean;
@@ -1064,6 +1067,30 @@ end;
 function TEmitter.HasFeat(Bit: LongInt): Boolean;
 begin
   Result := ((FCpuSet shr Bit) and 1) <> 0;
+end;
+
+{ One G-state CAS kernel: x9 address, w1 expected, w2 new; w3 observed,
+  w4 exclusive status. Current Go atomic_arm64.s Cas and ARM ARM CASAL/
+  LDAXR/STLXR. CPU choice is static; failed CAS also acquires an early
+  wake. Every ready/park/park-unlock/IO transition uses this body. }
+procedure TEmitter.ArmGStatusCas(const RetryLabel, MissLabel: string);
+begin
+  Line(RetryLabel + ':');
+  if HasFeat(CpuFeatBit('atomics', True)) then
+  begin
+    Line('  mov w3, w1');
+    Line('  casal w3, w2, [x9]');
+    Line('  cmp w3, w1');
+    Line('  b.ne ' + MissLabel);
+  end
+  else
+  begin
+    Line('  ldaxr w3, [x9]');
+    Line('  cmp w3, w1');
+    Line('  b.ne ' + MissLabel);
+    Line('  stlxr w4, w2, [x9]');
+    Line('  cbnz w4, ' + RetryLabel);
+  end;
 end;
 
 procedure TEmitter.MapHint4(K0, K1, K2, K3: Byte);
@@ -18386,6 +18413,8 @@ begin
     Code := 7
   else if k = tykReal then
     Code := 6
+  else if k = tykCurrency then
+    Code := 11
   else if (k = tykPointer) or (k = tykClass) or (k = tykProc) or (k = tykClassRef) then
     Code := 8
   else if (k = tykEnum) or (k = tykSubrange) then
@@ -18872,9 +18901,12 @@ begin
               StoreTo(NewVar(S^.Sels[i].Dest, FindSym(S^.Sels[i].Dest).Typ));
               Imm('x0', i);
             end;
-            PshK('x0', 0);
+            { The chosen arm never needs the selector again. Keeping it
+              on the stack made Break/Continue skip its pop (P192), so
+              subsequent safe points no longer matched their stack maps.
+              Like Go walk/select.go, enter the body with no temporary
+              selector storage that a control-flow exit must unwind. }
             EmitStmt(S^.Sels[i].Body);
-            Ppop('x0');
             Line('  b ' + b);
             Line(a + ':');
           end;
@@ -23784,7 +23816,8 @@ begin
   Result := False;
   if S.ByRef or S.Global or (S.Up <> 0) then
     Exit;
-  if not (IsIntId(S.Typ) or (S.Typ = TyReal) or (S.Typ = TySingle) or (S.Typ = TyQuad)) then
+  if not (IsIntId(S.Typ) or (S.Typ = TyReal) or (S.Typ = TySingle) or
+    (S.Typ = TyQuad) or (S.Typ = TyCurrency)) then
     Exit;
   nm := ToLower(S.Name);
   { A for loop's hidden limit (1.0.93) is not the program's. }
@@ -23897,6 +23930,23 @@ begin
   Line('  .uleb128 11');
   Line('  .byte 0');
   Line('  .byte 0');
+  { DWARF 5 sections 5.1.1.3/5.1.1.5: a signed scaled integer,
+    decimal_scale -4 and digit_count 19; also valid in DWARF 4. }
+  Line('  .uleb128 6');
+  Line('  .uleb128 36');
+  Line('  .byte 0');
+  Line('  .uleb128 3');
+  Line('  .uleb128 8');
+  Line('  .uleb128 62');
+  Line('  .uleb128 11');
+  Line('  .uleb128 11');
+  Line('  .uleb128 11');
+  Line('  .uleb128 92');
+  Line('  .uleb128 13');
+  Line('  .uleb128 95');
+  Line('  .uleb128 11');
+  Line('  .byte 0');
+  Line('  .byte 0');
   Line('  .byte 0');
   Line('.section .debug_info,"",@progbits');
   Line('.Ldi_hdr:');
@@ -23928,6 +23978,13 @@ begin
     _Float128 as IEEE quad on amd64 too, where its 16-byte long double is
     x87's (1.0.115). }
   DwarfBase(TyQuad, '_Float128', 4, 16);
+  Line('.Ldt' + IntToStr(TyCurrency) + ':');
+  Line('  .uleb128 6');
+  Line('  .asciz "Currency"');
+  Line('  .byte 13');
+  Line('  .byte 8');
+  Line('  .sleb128 -4');
+  Line('  .byte 19');
   for p := 0 to High(FOwnNames) do
   begin
     any := False;
@@ -24938,7 +24995,7 @@ begin
   Line('  ret');
   Line('.cm_g0:');
   Line('  leaq rt_allm(%rip), %rax');
-  Line('  movq rt_nproc(%rip), %rcx');
+  Line('  movq rt_mstarted(%rip), %rcx');
   Line('.cm_n:');
   Line('  testq %rcx, %rcx');
   Line('  jz .cm_r13');
@@ -25290,6 +25347,9 @@ begin
   Line('  incq %r12');
   Line('  jmp .is_loop');
   Line('.is_done:');
+  Line('  movq rt_nproc(%rip), %rax');
+  Line('  movq %rax, rt_heapstate+344(%rip)');
+  Line('  movq $10000, rt_heapstate+352(%rip)');
   Line('  popq %r15');
   Line('  popq %r13');
   Line('  popq %r12');
@@ -25326,6 +25386,144 @@ begin
   Line('  xorq %rbp, %rbp');
   Line('  xorq %r14, %r14');
   Line('  call rt_sigstack');
+  Line('  call rt_gcidle');
+  Line('  jmp rt_mloop');
+  Line('');
+  { P178: current Go proc.go retake/handoffp/exitsyscall0. A syscall
+    keeps its P on the fast path; sysmon atomically prevents return
+    while handing that P to another M. Idle scheduler Ms keep their
+    P here (unlike Go's general pidle list), but syscall-return Ms have
+    no P and form a reusable list. There is still one G scheduler.
+    P189: count the replacement as spinning before publishing state 8.
+    Like Go retake's incidlelocked(-1), a pending handoff is runnable
+    capacity, even before the replacement M leaves its sleep counter.
+    Otherwise the returning M can report deadlock during that window.
+    Table mutation and the beginning of STW share heap state +336.
+    Like Go's syscalltick, M+88 changes at every syscall entry and
+    M+104 is sysmon's previous observation. Retake only a call seen
+    in two scans; recheck after claiming state 7 to exclude a different
+    call entering between the observation and the CAS. A sole G with
+    no other work needs no replacement M (Go's handoffp). }
+  Line('rt_retake:');
+  Line('  pushq %rbx');
+  Line('  pushq %rbp');
+  Line('  pushq %r12');
+  Line('  pushq %r15');
+  Line('  movq %rdi, %rbx');
+  Line('  leaq rt_heapstate+336(%rip), %rdi');
+  Line('  call rt_lock');
+  Line('  cmpq $0, rt_heapstate+200(%rip)');
+  Line('  jne .rk_unlock');
+  Line('  movq rt_mstarted(%rip), %rax');
+  Line('  cmpq rt_nproc(%rip), %rax');
+  Line('  jb .rk_unlock');
+  Line('  cmpq $1, rt_nlive(%rip)');
+  Line('  jbe .rk_unlock');
+  Line('  movq $2, %rax');
+  Line('  movq $7, %rcx');
+  Line('  lock cmpxchgq %rcx, 120(%rbx)');
+  Line('  jne .rk_unlock');
+  Line('  movq 88(%rbx), %rax');
+  Line('  cmpq 104(%rbx), %rax');
+  Line('  je .rk_claimed');
+  Line('  movq $2, %rax');
+  Line('  xchgq %rax, 120(%rbx)');
+  Line('  jmp .rk_unlock');
+  Line('.rk_claimed:');
+  Line('  leaq rt_glock(%rip), %rdi');
+  Line('  call rt_lock');
+  Line('  movq rt_mnop(%rip), %r12');
+  Line('  testq %r12, %r12');
+  Line('  jz .rk_new');
+  Line('  movq 64(%r12), %rax');
+  Line('  movq %rax, rt_mnop(%rip)');
+  Line('  xorq %rbp, %rbp');
+  Line('  jmp .rk_attach');
+  Line('.rk_new:');
+  Line('  movq rt_mstarted(%rip), %r12');
+  Line('  cmpq $10000, %r12');
+  Line('  jae rt_diethreads');
+  Line('  movq %r12, %rax');
+  Line('  shlq $7, %r12');
+  Line('  leaq rt_allm(%rip), %rcx');
+  Line('  addq %rcx, %r12');
+  Line('  movq %rax, 0(%r12)');
+  Line('  movq $1, 120(%r12)');
+  Line('  movq $32768, %rdi');
+  Line('  call rt_mmap');
+  Line('  pushq %rax');
+  Line('  movq %rax, %rdi');
+  Line('  call rt_guard');
+  Line('  popq %rax');
+  Line('  addq $32768, %rax');
+  Line('  movq %rax, 32(%r12)');
+  Line('  incq rt_mstarted(%rip)');
+  Line('  movq rt_mstarted(%rip), %rax');
+  Line('  movq %rax, rt_heapstate+344(%rip)');
+  Line('  movq $1, %rbp');
+  Line('.rk_attach:');
+  Line('  movq 8(%rbx), %r15');
+  Line('  movq $0, 8(%rbx)');
+  Line('  movq %r15, 8(%r12)');
+  Line('  movq %r12, 8(%r15)');
+  Line('  lock incq rt_nspinning(%rip)');
+  Line('  movq $1, 56(%r12)');
+  Line('  movq $0, 72(%r12)');
+  Line('  movl $1, 48(%r12)');
+  Line('  movq $8, %rax');
+  Line('  xchgq %rax, 120(%rbx)');
+  Line('  leaq rt_glock(%rip), %rdi');
+  Line('  call rt_unlock');
+  Line('  leaq rt_heapstate+336(%rip), %rdi');
+  Line('  call rt_unlock');
+  Line('  testq %rbp, %rbp');
+  Line('  jz .rk_wake');
+  Line('  movq %r12, %rdi');
+  Line('  call rt_newm');
+  Line('  jmp .rk_done');
+  Line('.rk_wake:');
+  Line('  leaq 48(%r12), %rdi');
+  Line('  movq $129, %rsi');
+  Line('  movq $1, %rdx');
+  Line('  movq $202, %rax');
+  Line('  syscall');
+  Line('  jmp .rk_done');
+  Line('.rk_unlock:');
+  Line('  leaq rt_heapstate+336(%rip), %rdi');
+  Line('  call rt_unlock');
+  Line('.rk_done:');
+  Line('  popq %r15');
+  Line('  popq %r12');
+  Line('  popq %rbp');
+  Line('  popq %rbx');
+  Line('  ret');
+  { Only a retaken syscall returns here: the G is queued with a saved
+    syscall continuation; this M waits without a P until reused. }
+  Line('rt_mnopwait:');
+  Line('  movl $0, 48(%r13)');
+  Line('  movq $1, %rax');
+  Line('  xchgq %rax, 120(%r13)');
+  Line('  leaq rt_glock(%rip), %rdi');
+  Line('  call rt_lock');
+  Line('  movq rt_mnop(%rip), %rax');
+  Line('  movq %rax, 64(%r13)');
+  Line('  movq %r13, rt_mnop(%rip)');
+  Line('  leaq rt_glock(%rip), %rdi');
+  Line('  call rt_unlock');
+  Line('  call rt_msleepin');
+  Line('.mn_wait:');
+  Line('  call rt_gcwork');
+  Line('  cmpl $0, 48(%r13)');
+  Line('  jne .mn_awake');
+  Line('  leaq 48(%r13), %rdi');
+  Line('  movq $128, %rsi');
+  Line('  xorq %rdx, %rdx');
+  Line('  xorq %r10, %r10');
+  Line('  movq $202, %rax');
+  Line('  syscall');
+  Line('  jmp .mn_wait');
+  Line('.mn_awake:');
+  Line('  call rt_msleepout');
   Line('  call rt_gcidle');
   Line('  jmp rt_mloop');
   Line('');
@@ -25909,7 +26107,7 @@ begin
   Line('.sm_wake:');
   Line('  call rt_wakep');
   Line('.sm_scan0:');
-  Line('  movq rt_nproc(%rip), %r12');
+  Line('  movq rt_mstarted(%rip), %r12');
   Line('  xorq %r15, %r15');
   Line('.sm_scan:');
   Line('  cmpq %r12, %r15');
@@ -25918,6 +26116,17 @@ begin
   Line('  shlq $7, %rax');
   Line('  leaq rt_allm(%rip), %rbx');
   Line('  addq %rax, %rbx');
+  Line('  cmpq $2, 120(%rbx)');
+  Line('  jne .sm_preempt');
+  Line('  movq 88(%rbx), %rax');
+  Line('  cmpq 104(%rbx), %rax');
+  Line('  je .sm_retake');
+  Line('  movq %rax, 104(%rbx)');
+  Line('  jmp .sm_preempt');
+  Line('.sm_retake:');
+  Line('  movq %rbx, %rdi');
+  Line('  call rt_retake');
+  Line('.sm_preempt:');
   Line('  movq 16(%rbx), %rax');
   Line('  testq %rax, %rax');
   Line('  jz .sm_next');
@@ -25984,6 +26193,7 @@ begin
   Line('  pushq %r12');
   Line('  pushq %r13');
   Line('  pushq %r15');
+  Line('  subq $16, %rsp'); { result survives actual park/migration }
   Line('  movq %rdi, %rbx');
   Line('  movq %rsi, %r12');
   Line('  movq %rdx, %r13');
@@ -26022,13 +26232,27 @@ begin
   Line('  movq $233, %rax');
   Line('  syscall');
   Line('  testq %rax, %rax');
-  Line('  jns .wi_cas');
+  Line('  jns .wi_success');
   Line('  movq rt_epfd(%rip), %rdi');
   Line('  movq $1, %rsi');
   Line('  movq %rbx, %rdx');
   Line('  movq %rsp, %r10');
   Line('  movq $233, %rax');
   Line('  syscall');
+  { P180: current Go netpoll_epoll.go netpollopen reports EpollCtl
+    errors. Never park on a registration that failed. Self-wake through
+    the SAME token/status protocol as an event or deadline; a deadline
+    racing this failure can win the token without queuing a running G.
+    A slot on G's saved stack keeps the result across park, stack
+    movement and timer cleanup; no live register survives a park. }
+  Line('  testq %rax, %rax');
+  Line('  jns .wi_success');
+  Line('  movq %rax, 16(%rsp)');
+  Line('  movq %r15, %rdi');
+  Line('  call rt_pollwake');
+  Line('  jmp .wi_cas');
+  Line('.wi_success:');
+  Line('  movq $0, 16(%rsp)');
   Line('.wi_cas:');
   Line('  addq $16, %rsp');
   Line('  lock incq rt_npollwait(%rip)');
@@ -26063,6 +26287,8 @@ begin
   Line('  movq $0, 264(%r14)');
   Line('.wi_nt:');
   Line('  lock decq rt_npollwait(%rip)');
+  Line('  movq (%rsp), %rax');
+  Line('  addq $16, %rsp');
   Line('  popq %r15');
   Line('  popq %r13');
   Line('  popq %r12');
@@ -28362,6 +28588,11 @@ begin
   Line('  xorq %rdi, %rdi');
   Line('  leaq .Ldeadlock(%rip), %rsi');
   Line('  movq $' + IntToStr(Length(MsgDeadlock)) + ', %rdx');
+  Line('  jmp rt_diemsg');
+  Line('rt_diethreads:');
+  Line('  xorq %rdi, %rdi');
+  Line('  leaq .Lthreads(%rip), %rsi');
+  Line('  movq $' + IntToStr(Length(MsgThreads)) + ', %rdx');
   Line('  jmp rt_diemsg');
   Line('rt_divzero:');
   Line('  movq (%rsp), %rdi');
@@ -31175,8 +31406,6 @@ begin
   Line('  jz .sy_raw');
   Line('  cmpl $0, 184(%r14)');
   Line('  jne .sy_raw');
-  Line('  cmpq $0, rt_heapstate+192(%rip)');
-  Line('  je .sy_raw');
   Line('  pushq %rbx');
   Line('  pushq %rbp');
   Line('  pushq %r12');
@@ -31188,20 +31417,89 @@ begin
   Line('  pushq %r10');
   Line('  pushq %r8');
   Line('  pushq %r9');
+  Line('  pushq %rax');
   Line('  movq %rsp, 40(%r14)');
   Line('  movq %rbp, 56(%r14)');
   Line('  movq $0, 48(%r14)');
   Line('  movq 32(%r14), %r13');
+  Line('  incq 88(%r13)');
   Line('  movq $2, %rcx');
   Line('  xchgq %rcx, 120(%r13)');
+  { P185: current Go runtime_BeforeFork/AfterFork. Block on the original
+    M and restore on that M before GC/retake can migrate G. M+24 is the
+    saved kernel mask; M+40 is the all-signals mask and child marker.
+    A private child stays masked throughout raw setup; exec below resets
+    caught handlers before restoring this mask, with explicit failures. }
+  Line('  cmpq $57, %rax');
+  Line('  je .sy_forkmask');
+  Line('  cmpq $56, %rax');
+  Line('  jne .sy_invoke');
+  Line('  testq $256, 48(%rsp)');
+  Line('  jne .sy_invoke');
+  Line('.sy_forkmask:');
+  Line('  movq $-1, 40(%r13)');
+  Line('  movq $2, %rdi');
+  Line('  leaq 40(%r13), %rsi');
+  Line('  leaq 24(%r13), %rdx');
+  Line('  movq $8, %r10');
+  Line('  movq $14, %rax');
+  Line('  syscall');
+  Line('  testq %rax, %rax');
+  Line('  jns .sy_masked');
+  Line('  movq $0, 40(%r13)');
+  Line('  movq %rax, %rbx');
+  Line('  jmp .sy_x');
+  Line('.sy_masked:');
+  Line('  movq (%rsp), %rax');
+  Line('  movq 8(%rsp), %r9');
+  Line('  movq 16(%rsp), %r8');
+  Line('  movq 24(%rsp), %r10');
+  Line('  movq 32(%rsp), %rdx');
+  Line('  movq 40(%rsp), %rsi');
+  Line('  movq 48(%rsp), %rdi');
+  Line('.sy_invoke:');
   Line('  syscall');
   Line('  movq %rax, %rbx');
+  { A fork child has no scheduler threads and must not wait for a GC
+    generation copied from its parent. Only raw Sys* wrappers are
+    permitted before exec/exit (current Go syscall.runtime_AfterFork). }
+  Line('  testq %rax, %rax');
+  Line('  jne .sy_parent');
+  Line('  cmpq $0, 40(%r13)');
+  Line('  je .sy_parent');
+  Line('  movl $1, 184(%r14)');
+  { A GC move/preemption request can be copied by fork. The child has
+    no collector or scheduler threads to service it. Current Go
+    runtime_AfterForkInChild forbids stack growth in the same interval;
+    our raw Sys* wrappers/loops fit the caller's checked margin. Keep
+    only the real guard in the private child, never change the parent. }
+  Line('  movq 24(%r14), %rcx');
+  Line('  movq %rcx, 16(%r14)');
+  Line('  movq $0, 120(%r13)');
+  Line('  jmp .sy_ok');
+  Line('.sy_parent:');
+  Line('  cmpq $0, 40(%r13)');
+  Line('  je .sy_x');
+  Line('  movq $2, %rdi');
+  Line('  leaq 24(%r13), %rsi');
+  Line('  movq $0, %rdx');
+  Line('  movq $8, %r10');
+  Line('  movq $14, %rax');
+  Line('  syscall');
+  Line('  testq %rax, %rax');
+  Line('  js .sy_maskfatal');
+  Line('  movq $0, 40(%r13)');
   Line('.sy_x:');
   Line('  movl rt_heapstate+216(%rip), %r12d');
   Line('  movq $2, %rax');
   Line('  xorq %rcx, %rcx');
   Line('  lock cmpxchgq %rcx, 120(%r13)');
   Line('  je .sy_ok');
+  Line('  cmpq $7, %rax');
+  Line('  je .sy_retaking');
+  Line('  cmpq $8, %rax');
+  Line('  je .sy_detached');
+  Line('.sy_gcwait:');
   Line('  leaq rt_heapstate+216(%rip), %rdi');
   Line('  movq $128, %rsi');
   Line('  movl %r12d, %edx');
@@ -31209,8 +31507,31 @@ begin
   Line('  movq $202, %rax');
   Line('  syscall');
   Line('  jmp .sy_x');
+  Line('.sy_retaking:');
+  Line('  pause');
+  Line('  jmp .sy_x');
+  Line('.sy_detached:');
+  Line('  xorq %rcx, %rcx');
+  Line('  lock cmpxchgq %rcx, 120(%r13)');
+  Line('  jne .sy_x');
+  Line('  movq %rbx, (%rsp)');
+  Line('  movq %rsp, 40(%r14)');
+  Line('  leaq .sy_resume(%rip), %rax');
+  Line('  movq %rax, 48(%r14)');
+  Line('  movl $3, 152(%r14)');
+  Line('  movq %r14, %rbx');
+  Line('  movq 32(%r13), %rsp');
+  Line('  xorq %rbp, %rbp');
+  Line('  xorq %r14, %r14');
+  Line('  movq $0, 16(%r13)');
+  Line('  movq %rbx, %rdi');
+  Line('  call rt_globput');
+  Line('  call rt_wakep');
+  Line('  jmp rt_mnopwait');
   Line('.sy_ok:');
-  Line('  movq %rbx, %rax');
+  Line('  movq %rbx, (%rsp)');
+  Line('.sy_resume:');
+  Line('  popq %rax');
   Line('  popq %r9');
   Line('  popq %r8');
   Line('  popq %r10');
@@ -31224,7 +31545,107 @@ begin
   Line('  popq %rbx');
   Line('  ret');
   Line('.sy_raw:');
+  Line('  testq %r14, %r14');
+  Line('  jz .sy_raw_call');
+  Line('  cmpq $59, %rax');
+  Line('  jne .sy_raw_call');
+  Line('  movq 32(%r14), %rcx');
+  Line('  cmpq $0, 40(%rcx)');
+  Line('  je .sy_raw_call');
+  Line('  jmp .sy_childexec');
+  Line('.sy_raw_call:');
   Line('  syscall');
+  Line('  ret');
+  Line('.sy_maskfatal:');
+  Line('  movq $0, %rdi');
+  Line('  leaq .Lsignalmaskfail(%rip), %rsi');
+  Line('  movq $' + IntToStr(Length(MsgSignalMask)) + ', %rdx');
+  Line('  jmp rt_diemsg');
+  Line('.sy_childexec:');
+  Line('  pushq %rbx');
+  Line('  pushq %rbp');
+  Line('  pushq %r12');
+  Line('  pushq %r13');
+  Line('  pushq %r15');
+  Line('  pushq %rdi');
+  Line('  pushq %rsi');
+  Line('  pushq %rdx');
+  Line('  pushq %r10');
+  Line('  pushq %r8');
+  Line('  pushq %r9');
+  Line('  pushq %rax');
+  Line('  subq $64, %rsp');
+  Line('  movq $0, 32(%rsp)');
+  Line('  movq $0, 40(%rsp)');
+  Line('  movq $0, 48(%rsp)');
+  Line('  movq $0, 56(%rsp)');
+  Line('  movq 32(%r14), %r13');
+  Line('  movq $1, %r12');
+  Line('.sy_sigloop:');
+  Line('  cmpq $9, %r12');
+  Line('  je .sy_signext');
+  Line('  cmpq $19, %r12');
+  Line('  je .sy_signext');
+  Line('  movq %r12, %rdi');
+  Line('  movq $0, %rsi');
+  Line('  leaq (%rsp), %rdx');
+  Line('  movq $8, %r10');
+  Line('  movq $13, %rax');
+  Line('  syscall');
+  Line('  testq %rax, %rax');
+  Line('  js .sy_execsignalerror');
+  Line('  cmpq $1, (%rsp)');
+  Line('  jbe .sy_signext');
+  Line('  movq %r12, %rdi');
+  Line('  leaq 32(%rsp), %rsi');
+  Line('  movq $0, %rdx');
+  Line('  movq $8, %r10');
+  Line('  movq $13, %rax');
+  Line('  syscall');
+  Line('  testq %rax, %rax');
+  Line('  js .sy_execsignalerror');
+  Line('.sy_signext:');
+  Line('  addq $1, %r12');
+  Line('  cmpq $64, %r12');
+  Line('  jbe .sy_sigloop');
+  Line('  movq $2, %rdi');
+  Line('  leaq 24(%r13), %rsi');
+  Line('  movq $0, %rdx');
+  Line('  movq $8, %r10');
+  Line('  movq $14, %rax');
+  Line('  syscall');
+  Line('  testq %rax, %rax');
+  Line('  js .sy_execsignalerror');
+  Line('  movq $0, 40(%r13)');
+  Line('  addq $64, %rsp');
+  Line('  popq %rax');
+  Line('  popq %r9');
+  Line('  popq %r8');
+  Line('  popq %r10');
+  Line('  popq %rdx');
+  Line('  popq %rsi');
+  Line('  popq %rdi');
+  Line('  popq %r15');
+  Line('  popq %r13');
+  Line('  popq %r12');
+  Line('  popq %rbp');
+  Line('  popq %rbx');
+  Line('  jmp .sy_raw_call');
+  Line('.sy_execsignalerror:');
+  Line('  addq $64, %rsp');
+  Line('  movq %rax, (%rsp)');
+  Line('  popq %rax');
+  Line('  popq %r9');
+  Line('  popq %r8');
+  Line('  popq %r10');
+  Line('  popq %rdx');
+  Line('  popq %rsi');
+  Line('  popq %rdi');
+  Line('  popq %r15');
+  Line('  popq %r13');
+  Line('  popq %r12');
+  Line('  popq %rbp');
+  Line('  popq %rbx');
   Line('  ret');
   { rt_heapinit, before pas_main: the heap state's tables and cap, then
     pasheap keeps the ranges and gives the mcaches, one per P (P+2136). }
@@ -31272,7 +31693,7 @@ begin
   { This runtime moves a stack whose guard asks for it (1.0.61, bit 0),
     its waiting Ms mark with a cycle (1.0.66, bit 1), and rt_alloc takes
     runs from an entry's free slots in word 24 (1.0.68, bit 2). }
-  Line('  movq $7, 504(%rdi)');
+  Line('  movq $15, 504(%rdi)');
   { The word at +512 said whether XXH3's long path took AVX2 (1.0.63)
     and rt_haspopcnt whether PopCount had popcnt (1.0.126); since P111
     -cpu decides both when the program is compiled, and rt_cpufeat
@@ -32929,6 +33350,8 @@ begin
       instructions of the runtime and of inline asm (P110); a program
       runs them only where rt_cpufeat says the processor has them }
     Line('.arch armv8-a+crypto+sha3+crc');
+    if HasFeat(CpuFeatBit('atomics', True)) then
+      Line('.arch_extension lse');
   end
   else
     Line('/* generated by paslangc — linux amd64 */');
@@ -33275,6 +33698,10 @@ begin
     Line('  .ascii "' + MsgDeadlock + '"');
     Line('.Lclonefail:');
     Line('  .ascii "' + MsgClone + '"');
+    Line('.Lsignalmaskfail:');
+    Line('  .ascii "' + MsgSignalMask + '"');
+    Line('.Lthreads:');
+    Line('  .ascii "' + MsgThreads + '"');
     Line('.Lbidx:');
     Line('  .ascii "' + MsgIndex + '"');
     Line('.Lchancap:');
@@ -33847,6 +34274,8 @@ begin
       in the order of rt_allm (P91). }
     Line('rt_mstarted:');
     Line('  .quad 0');
+    Line('rt_mnop:');
+    Line('  .quad 0');
     Line('rt_idlenote:');
     Line('  .quad 0');
     { P90: the Ms looking for work, the stack of Ms asleep on their own
@@ -33910,7 +34339,7 @@ begin
       the object being raised and G+280 where (P122) }
     Line('  .space 288');
     Line('rt_allm:');
-    Line('  .space 4096');
+    Line('  .space 1280000');
     Line('rt_allp:');
     Line('  .space 69632');
     Line('.align 16');
@@ -36996,6 +37425,11 @@ begin
   LeaS('.Ldeadlock', 'x1');
   Line('  mov x2, #' + IntToStr(Length(MsgDeadlock)));
   Line('  b rt_diemsg');
+  Line('rt_diethreads:');
+  Line('  mov x0, xzr');
+  LeaS('.Lthreads', 'x1');
+  Line('  mov x2, #' + IntToStr(Length(MsgThreads)));
+  Line('  b rt_diemsg');
   Line('rt_divzero:');
   Line('  sub x0, x30, #1');
   LeaS('.Ldivzero', 'x1');
@@ -39254,7 +39688,7 @@ begin
   Line('  ret');
   Line('.cm_g0:');
   LeaS('rt_allm', 'x0');
-  LdS('rt_nproc', 'x1');
+  LdS('rt_mstarted', 'x1');
   Line('  mov x2, sp');
   Line('.cm_n:');
   Line('  cbz x1, .cm_x21');
@@ -39631,6 +40065,11 @@ begin
   Line('  add x20, x20, #1');
   Line('  b .is_loop');
   Line('.is_done:');
+  LeaS('rt_heapstate', 'x9');
+  LdS('rt_nproc', 'x10');
+  Line('  str x10, [x9, #344]');
+  Line('  mov x10, #10000');
+  Line('  str x10, [x9, #352]');
   Ppop('x22');
   Ppop('x21');
   Ppop('x20');
@@ -39672,6 +40111,154 @@ begin
   Line('  mov x8, #178');
   Line('  svc #0');
   Line('  str x0, [x21, #80]');
+  Line('  bl rt_gcidle');
+  Line('  b rt_mloop');
+  { P178: same M/P ownership protocol as amd64, current Go proc.go
+    retake/handoffp/exitsyscall0. Atomics use current Go's arm64
+    LDAXR/STLXR CAS and STLR publication, never a relaxed handoff. }
+  Line('rt_retake:');
+  Line('  stp x29, x30, [sp, #-16]!');
+  Line('  stp x19, x20, [sp, #-16]!');
+  Line('  stp x21, x22, [sp, #-16]!');
+  Line('  stp x23, x24, [sp, #-16]!');
+  Line('  mov x19, x0');
+  LeaS('rt_heapstate', 'x0');
+  Line('  add x0, x0, #336');
+  Line('  bl rt_lock');
+  LeaS('rt_heapstate', 'x9');
+  Line('  ldr x10, [x9, #200]');
+  Line('  cbnz x10, .rk_unlock');
+  LdS('rt_mstarted', 'x9');
+  LdS('rt_nproc', 'x10');
+  Line('  cmp x9, x10');
+  Line('  b.lo .rk_unlock');
+  LdS('rt_nlive', 'x9');
+  Line('  cmp x9, #1');
+  Line('  b.ls .rk_unlock');
+  Line('  add x9, x19, #120');
+  Line('.rk_cas:');
+  Line('  ldaxr x10, [x9]');
+  Line('  cmp x10, #2');
+  Line('  b.ne .rk_missed');
+  Line('  mov x11, #7');
+  Line('  stlxr w12, x11, [x9]');
+  Line('  cbnz w12, .rk_cas');
+  Line('  ldr x10, [x19, #88]');
+  Line('  ldr x11, [x19, #104]');
+  Line('  cmp x10, x11');
+  Line('  b.eq .rk_claimed');
+  Line('  mov x10, #2');
+  Line('  stlr x10, [x9]');
+  Line('  b .rk_unlock');
+  Line('.rk_claimed:');
+  LeaS('rt_glock', 'x0');
+  Line('  bl rt_lock');
+  LdS('rt_mnop', 'x23');
+  Line('  cbz x23, .rk_new');
+  Line('  ldr x9, [x23, #64]');
+  StS('x9', 'rt_mnop');
+  Line('  mov x24, xzr');
+  Line('  b .rk_attach');
+  Line('.rk_new:');
+  LdS('rt_mstarted', 'x23');
+  Line('  mov x9, #10000');
+  Line('  cmp x23, x9');
+  Line('  b.hs rt_diethreads');
+  Line('  mov x10, x23');
+  LeaS('rt_allm', 'x9');
+  Line('  add x23, x9, x23, lsl #7');
+  Line('  str x10, [x23]');
+  Line('  mov x9, #1');
+  Line('  str x9, [x23, #120]');
+  Imm('x0', 32768);
+  Line('  bl rt_mmap');
+  Line('  str x0, [sp, #-16]!');
+  Line('  bl rt_guard');
+  Line('  ldr x0, [sp], #16');
+  Imm('x9', 32768);
+  Line('  add x0, x0, x9');
+  Line('  str x0, [x23, #32]');
+  LdS('rt_mstarted', 'x9');
+  Line('  add x9, x9, #1');
+  StS('x9', 'rt_mstarted');
+  LeaS('rt_heapstate', 'x10');
+  Line('  str x9, [x10, #344]');
+  Line('  mov x24, #1');
+  Line('.rk_attach:');
+  Line('  ldr x20, [x19, #8]');
+  Line('  str xzr, [x19, #8]');
+  Line('  str x20, [x23, #8]');
+  Line('  str x23, [x20, #8]');
+  LeaS('rt_nspinning', 'x9');
+  Line('.rk_spin:');
+  Line('  ldaxr x10, [x9]');
+  Line('  add x10, x10, #1');
+  Line('  stlxr w11, x10, [x9]');
+  Line('  cbnz w11, .rk_spin');
+  Line('  mov x9, #1');
+  Line('  str x9, [x23, #56]');
+  Line('  str xzr, [x23, #72]');
+  Line('  add x9, x23, #48');
+  Line('  mov w10, #1');
+  Line('  stlr w10, [x9]');
+  Line('  add x9, x19, #120');
+  Line('  mov x10, #8');
+  Line('  stlr x10, [x9]');
+  LeaS('rt_glock', 'x0');
+  Line('  bl rt_unlock');
+  LeaS('rt_heapstate', 'x0');
+  Line('  add x0, x0, #336');
+  Line('  bl rt_unlock');
+  Line('  cbz x24, .rk_wake');
+  Line('  mov x0, x23');
+  Line('  bl rt_newm');
+  Line('  b .rk_done');
+  Line('.rk_wake:');
+  Line('  add x0, x23, #48');
+  Line('  mov x1, #129');
+  Line('  mov x2, #1');
+  Line('  mov x8, #98');
+  Line('  svc #0');
+  Line('  b .rk_done');
+  Line('.rk_missed:');
+  Line('  clrex');
+  Line('.rk_unlock:');
+  LeaS('rt_heapstate', 'x0');
+  Line('  add x0, x0, #336');
+  Line('  bl rt_unlock');
+  Line('.rk_done:');
+  Line('  ldp x23, x24, [sp], #16');
+  Line('  ldp x21, x22, [sp], #16');
+  Line('  ldp x19, x20, [sp], #16');
+  Line('  ldp x29, x30, [sp], #16');
+  Line('  ret');
+  Line('rt_mnopwait:');
+  Line('  str wzr, [x21, #48]');
+  Line('  mov x9, #1');
+  Line('  add x10, x21, #120');
+  Line('  stlr x9, [x10]');
+  LeaS('rt_glock', 'x0');
+  Line('  bl rt_lock');
+  LdS('rt_mnop', 'x9');
+  Line('  str x9, [x21, #64]');
+  StS('x21', 'rt_mnop');
+  LeaS('rt_glock', 'x0');
+  Line('  bl rt_unlock');
+  Line('  bl rt_msleepin');
+  Line('.mn_wait:');
+  Line('  bl rt_gcwork');
+  Line('  add x9, x21, #48');
+  Line('  ldar w10, [x9]');
+  Line('  cbnz w10, .mn_awake');
+  Line('  add x0, x21, #48');
+  Line('  mov x1, #128');
+  Line('  mov x2, xzr');
+  Line('  mov x3, xzr');
+  Line('  mov x8, #98');
+  Line('  svc #0');
+  Line('  b .mn_wait');
+  Line('.mn_awake:');
+  Line('  bl rt_msleepout');
   Line('  bl rt_gcidle');
   Line('  b rt_mloop');
   Line('rt_gcms:');
@@ -40192,25 +40779,20 @@ begin
   Line('  ret');
   Line('rt_ready:');
   Line('  str x30, [sp, #-16]!');
+  { P195: current Go atomic_arm64.s Cas uses LDAXRW/STLXRW in the
+    base path. Ready publishes transferred channel/sync data; the
+    parking CAS must acquire a wake that won its race and release
+    the saved stack context when it actually parks. Relaxed exclusive
+    pairs do not establish either edge on real arm64 hardware. }
   Line('  add x9, x0, #152');
   Line('  mov w1, #1');
   Line('  mov w2, #3');
-  Line('.rd_a:');
-  Line('  ldxr w3, [x9]');
-  Line('  cmp w3, w1');
-  Line('  b.ne .rd_b');
-  Line('  stxr w4, w2, [x9]');
-  Line('  cbnz w4, .rd_a');
+  ArmGStatusCas('.rd_a', '.rd_b');
   Line('  ldr x30, [sp], #16');
   Line('  ret');
   Line('.rd_b:');
   Line('  mov w1, #2');
-  Line('.rd_c:');
-  Line('  ldxr w3, [x9]');
-  Line('  cmp w3, w1');
-  Line('  b.ne .rd_clr');
-  Line('  stxr w4, w2, [x9]');
-  Line('  cbnz w4, .rd_c');
+  ArmGStatusCas('.rd_c', '.rd_clr');
   Psh('x0');
   Line('  bl rt_curm');
   Line('  ldr x1, [sp]');
@@ -40304,12 +40886,7 @@ begin
   Line('  add x9, x28, #152');
   Line('  mov w1, #1');
   Line('  mov w2, #2');
-  Line('.pk_cas:');
-  Line('  ldxr w3, [x9]');
-  Line('  cmp w3, w1');
-  Line('  b.ne .pk_run');
-  Line('  stxr w4, w2, [x9]');
-  Line('  cbnz w4, .pk_cas');
+  ArmGStatusCas('.pk_cas', '.pk_run');
   Line('  mov x21, x16');
   Line('  ldr x9, [x21, #32]');
   Line('  mov sp, x9');
@@ -40859,12 +41436,7 @@ begin
   Line('  add x9, x28, #152');
   Line('  mov w1, #1');
   Line('  mov w2, #2');
-  Line('.rpu_cas:');
-  Line('  ldxr w3, [x9]');
-  Line('  cmp w3, w1');
-  Line('  b.ne .rpu_run');
-  Line('  stxr w4, w2, [x9]');
-  Line('  cbnz w4, .rpu_cas');
+  ArmGStatusCas('.rpu_cas', '.rpu_run');
   Line('  mov x21, x16');
   Line('  ldr x9, [x21, #32]');
   Line('  mov sp, x9');
@@ -40978,7 +41550,7 @@ begin
   Line('.sm_wake:');
   Line('  bl rt_wakep');
   Line('.sm_scan0:');
-  LdS('rt_nproc', 'x20');
+  LdS('rt_mstarted', 'x20');
   Line('  mov x22, xzr');
   Line('.sm_scan:');
   Line('  cmp x22, x20');
@@ -40986,6 +41558,22 @@ begin
   Line('  lsl x0, x22, #7');
   LeaS('rt_allm', 'x1');
   Line('  add x1, x1, x0');
+  Line('  add x9, x1, #120');
+  Line('  ldar x10, [x9]');
+  Line('  cmp x10, #2');
+  Line('  b.ne .sm_preempt');
+  Line('  ldr x9, [x1, #88]');
+  Line('  ldr x10, [x1, #104]');
+  Line('  cmp x9, x10');
+  Line('  b.eq .sm_retake');
+  Line('  str x9, [x1, #104]');
+  Line('  b .sm_preempt');
+  Line('.sm_retake:');
+  Line('  mov x0, x1');
+  Line('  bl rt_retake');
+  LeaS('rt_allm', 'x1');
+  Line('  add x1, x1, x22, lsl #7');
+  Line('.sm_preempt:');
   Line('  ldr x0, [x1, #16]');
   Line('  cbz x0, .sm_next');
   Imm('x9', Int64($fffffffffffffade));
@@ -42331,9 +42919,6 @@ begin
   Line('  cbz x28, .asy_raw0');
   Line('  ldr w16, [x28, #184]');
   Line('  cbnz w16, .asy_raw0');
-  LeaS('rt_heapstate', 'x16');
-  Line('  ldr x16, [x16, #192]');
-  Line('  cbz x16, .asy_raw0');
   Line('  stp x29, x30, [sp, #-16]!');
   Line('  stp x19, x20, [sp, #-16]!');
   Line('  stp x21, x22, [sp, #-16]!');
@@ -42348,17 +42933,66 @@ begin
   Line('  stp x10, x11, [sp, #-16]!');
   Line('  stp x12, x13, [sp, #-16]!');
   Line('  stp x14, x15, [sp, #-16]!');
+  Line('  sub sp, sp, #16');
+  Line('  str x8, [sp, #8]');
   Line('  mov x16, sp');
   Line('  str x16, [x28, #40]');
   Line('  str x29, [x28, #56]');
   Line('  str xzr, [x28, #48]');
   Line('  ldr x21, [x28, #32]');
+  Line('  ldr x16, [x21, #88]');
+  Line('  add x16, x16, #1');
+  Line('  str x16, [x21, #88]');
   Line('  add x16, x21, #120');
   Line('  mov x17, #2');
   Line('  stlr x17, [x16]');
   Line('  dmb ish');
+  Line('  cmp x8, #220');
+  Line('  b.ne .asy_invoke');
+  Line('  tbnz x0, #8, .asy_invoke');
+  Line('  movn x16, #0');
+  Line('  str x16, [x21, #40]');
+  Line('  mov x0, #2');
+  Line('  add x1, x21, #40');
+  Line('  add x2, x21, #24');
+  Line('  mov x3, #8');
+  Line('  mov x8, #135');
+  Line('  svc #0');
+  Line('  tbz x0, #63, .asy_masked');
+  Line('  str xzr, [x21, #40]');
+  Line('  mov x19, x0');
+  Line('  b .asy_x');
+  Line('.asy_masked:');
+  Line('  ldp x0, x1, [sp, #128]');
+  Line('  ldp x2, x3, [sp, #112]');
+  Line('  ldp x4, x5, [sp, #96]');
+  Line('  ldr x8, [sp, #8]');
+  Line('.asy_invoke:');
   Line('  svc #0');
   Line('  mov x19, x0');
+  Line('  cbnz x0, .asy_parent');
+  Line('  ldr x16, [sp, #8]');
+  Line('  cmp x16, #220');
+  Line('  b.ne .asy_parent');
+  Line('  ldr x16, [sp, #128]');
+  Line('  tbnz x16, #8, .asy_parent');
+  Line('  mov w16, #1');
+  Line('  str w16, [x28, #184]');
+  Line('  ldr x16, [x28, #24]');
+  Line('  str x16, [x28, #16]');
+  Line('  str xzr, [x21, #120]');
+  Line('  b .asy_ok');
+  Line('.asy_parent:');
+  Line('  ldr x16, [x21, #40]');
+  Line('  cbz x16, .asy_x');
+  Line('  mov x0, #2');
+  Line('  add x1, x21, #24');
+  Line('  mov x2, xzr');
+  Line('  mov x3, #8');
+  Line('  mov x8, #135');
+  Line('  svc #0');
+  Line('  tbnz x0, #63, .asy_maskfatal');
+  Line('  str xzr, [x21, #40]');
   Line('.asy_x:');
   LeaS('rt_heapstate', 'x20');
   Line('  add x9, x20, #216');
@@ -42367,10 +43001,15 @@ begin
   Line('.asy_cas:');
   Line('  ldaxr x11, [x10]');
   Line('  cmp x11, #2');
-  Line('  b.ne .asy_wait');
+  Line('  b.ne .asy_other');
   Line('  stlxr w12, xzr, [x10]');
   Line('  cbnz w12, .asy_cas');
   Line('  b .asy_ok');
+  Line('.asy_other:');
+  Line('  cmp x11, #8');
+  Line('  b.eq .asy_detached');
+  Line('  cmp x11, #7');
+  Line('  b.eq .asy_retaking');
   Line('.asy_wait:');
   Line('  clrex');
   Line('  add x0, x20, #216');
@@ -42380,8 +43019,34 @@ begin
   Line('  mov x8, #98');
   Line('  svc #0');
   Line('  b .asy_x');
+  Line('.asy_retaking:');
+  Line('  clrex');
+  Line('  yield');
+  Line('  b .asy_x');
+  Line('.asy_detached:');
+  Line('  stlxr w12, xzr, [x10]');
+  Line('  cbnz w12, .asy_x');
+  Line('  str x19, [sp]');
+  Line('  mov x16, sp');
+  Line('  str x16, [x28, #40]');
+  LeaS('.asy_resume', 'x16');
+  Line('  str x16, [x28, #48]');
+  Line('  mov w16, #3');
+  Line('  str w16, [x28, #152]');
+  Line('  mov x19, x28');
+  Line('  ldr x16, [x21, #32]');
+  Line('  mov sp, x16');
+  Line('  mov x29, xzr');
+  Line('  mov x28, xzr');
+  Line('  str xzr, [x21, #16]');
+  Line('  mov x0, x19');
+  Line('  bl rt_globput');
+  Line('  bl rt_wakep');
+  Line('  b rt_mnopwait');
   Line('.asy_ok:');
-  Line('  mov x16, x19');
+  Line('  str x19, [sp]');
+  Line('.asy_resume:');
+  Line('  ldr x16, [sp], #16');
   Line('  ldp x14, x15, [sp], #16');
   Line('  ldp x12, x13, [sp], #16');
   Line('  ldp x10, x11, [sp], #16');
@@ -42400,8 +43065,87 @@ begin
   Line('  ldp x16, x17, [sp], #16');
   Line('  ret');
   Line('.asy_raw0:');
+  Line('  cbz x28, .asy_rawpop');
+  Line('  cmp x8, #221');
+  Line('  b.ne .asy_rawpop');
+  Line('  ldr x16, [x28, #32]');
+  Line('  ldr x17, [x16, #40]');
+  Line('  cbnz x17, .asy_childexec');
+  Line('.asy_rawpop:');
   Line('  ldp x16, x17, [sp], #16');
+  Line('.asy_raw_call:');
   Line('  svc #0');
+  Line('  ret');
+  Line('.asy_maskfatal:');
+  Line('  mov x0, xzr');
+  LeaS('.Lsignalmaskfail', 'x1');
+  Line('  mov x2, #' + IntToStr(Length(MsgSignalMask)));
+  Line('  b rt_diemsg');
+  Line('.asy_childexec:');
+  Line('  stp x19, x20, [sp, #-16]!');
+  Line('  stp x21, x22, [sp, #-16]!');
+  Line('  stp x0, x1, [sp, #-16]!');
+  Line('  stp x2, x3, [sp, #-16]!');
+  Line('  stp x4, x5, [sp, #-16]!');
+  Line('  stp x8, x9, [sp, #-16]!');
+  Line('  sub sp, sp, #64');
+  Line('  stp xzr, xzr, [sp, #32]');
+  Line('  stp xzr, xzr, [sp, #48]');
+  Line('  ldr x21, [x28, #32]');
+  Line('  mov x19, #1');
+  Line('.asy_sigloop:');
+  Line('  cmp x19, #9');
+  Line('  b.eq .asy_signext');
+  Line('  cmp x19, #19');
+  Line('  b.eq .asy_signext');
+  Line('  mov x0, x19');
+  Line('  mov x1, xzr');
+  Line('  mov x2, sp');
+  Line('  mov x3, #8');
+  Line('  mov x8, #134');
+  Line('  svc #0');
+  Line('  tbnz x0, #63, .asy_execsignalerror');
+  Line('  ldr x16, [sp]');
+  Line('  cmp x16, #1');
+  Line('  b.ls .asy_signext');
+  Line('  mov x0, x19');
+  Line('  add x1, sp, #32');
+  Line('  mov x2, xzr');
+  Line('  mov x3, #8');
+  Line('  mov x8, #134');
+  Line('  svc #0');
+  Line('  tbnz x0, #63, .asy_execsignalerror');
+  Line('.asy_signext:');
+  Line('  add x19, x19, #1');
+  Line('  cmp x19, #64');
+  Line('  b.ls .asy_sigloop');
+  Line('  mov x0, #2');
+  Line('  add x1, x21, #24');
+  Line('  mov x2, xzr');
+  Line('  mov x3, #8');
+  Line('  mov x8, #135');
+  Line('  svc #0');
+  Line('  tbnz x0, #63, .asy_execsignalerror');
+  Line('  str xzr, [x21, #40]');
+  Line('  add sp, sp, #64');
+  Line('  ldp x8, x9, [sp], #16');
+  Line('  ldp x4, x5, [sp], #16');
+  Line('  ldp x2, x3, [sp], #16');
+  Line('  ldp x0, x1, [sp], #16');
+  Line('  ldp x21, x22, [sp], #16');
+  Line('  ldp x19, x20, [sp], #16');
+  Line('  ldp x16, x17, [sp], #16');
+  Line('  b .asy_raw_call');
+  Line('.asy_execsignalerror:');
+  Line('  str x0, [sp, #112]');
+  Line('  add sp, sp, #64');
+  Line('  ldp x8, x9, [sp], #16');
+  Line('  ldp x4, x5, [sp], #16');
+  Line('  ldp x2, x3, [sp], #16');
+  Line('  ldp x0, x1, [sp], #16');
+  Line('  ldp x21, x22, [sp], #16');
+  Line('  ldp x19, x20, [sp], #16');
+  Line('  ldp x16, x17, [sp], #16');
   Line('  ret');
   Line('rt_heapinit:');
   Line('  str x30, [sp, #-16]!');
@@ -42441,7 +43185,7 @@ begin
   Line('  str x9, [x0, #464]');
   Line('  mov x9, #16');
   Line('  str x9, [x0, #472]');
-  Line('  mov x9, #7');
+  Line('  mov x9, #15');
   Line('  str x9, [x0, #504]');
   LeaS('rt_allm', 'x9');
   Line('  str x9, [x0, #184]');
@@ -43802,6 +44546,7 @@ begin
   Line('  stp x23, x24, [sp, #-16]!');
   Line('  stp x25, x26, [sp, #-16]!');
   Line('  stp x27, xzr, [sp, #-16]!');
+  Line('  sub sp, sp, #16'); { result survives actual park/migration }
   Line('  mov x19, x0');
   Line('  mov x20, x1');
   Line('  mov x23, x2');
@@ -43843,13 +44588,23 @@ begin
   Line('  mov x8, #21');
   Line('  svc #0');
   Line('  cmp x0, #0');
-  Line('  b.ge .awi_cas');
+  Line('  b.ge .awi_success');
   LdS('rt_epfd', 'x0');
   Line('  mov x1, #1');
   Line('  mov x2, x19');
   Line('  mov x3, sp');
   Line('  mov x8, #21');
   Line('  svc #0');
+  { P180: failed epoll registration takes its own token through the
+    normal wake protocol, including any racing deadline. }
+  Line('  cmp x0, #0');
+  Line('  b.ge .awi_success');
+  Line('  str x0, [sp, #16]');
+  Line('  mov x0, x24');
+  Line('  bl rt_pollwake');
+  Line('  b .awi_cas');
+  Line('.awi_success:');
+  Line('  str xzr, [sp, #16]');
   Line('.awi_cas:');
   Line('  add sp, sp, #16');
   Line('  bl rt_pollwaitinc');
@@ -43860,12 +44615,7 @@ begin
   Line('  add x9, x28, #152');
   Line('  mov w1, #1');
   Line('  mov w2, #2');
-  Line('.awi_spin:');
-  Line('  ldxr w3, [x9]');
-  Line('  cmp w3, w1');
-  Line('  b.ne .awi_run');
-  Line('  stxr w4, w2, [x9]');
-  Line('  cbnz w4, .awi_spin');
+  ArmGStatusCas('.awi_spin', '.awi_run');
   Line('  mov x21, x22');
   Line('  ldr x9, [x21, #32]');
   Line('  mov sp, x9');
@@ -43887,6 +44637,8 @@ begin
   Line('  str xzr, [x28, #264]');
   Line('.awi_nt:');
   Line('  bl rt_pollwaitdec');
+  Line('  ldr x0, [sp]');
+  Line('  add sp, sp, #16');
   Line('  ldp x27, x9, [sp], #16');
   Line('  ldp x25, x26, [sp], #16');
   Line('  ldp x23, x24, [sp], #16');

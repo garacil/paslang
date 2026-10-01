@@ -1,6 +1,11 @@
 # paslangc manual
 
 The manual is inside the compiler so a checkout is not required to read it.
+`--help types` includes checked four-place decimal Currency and its explicit
+binary/decimal conversions. `--help lib` lists the modern SysUtils families:
+bounded resources, explicit system errors, environments/processes, builders,
+strict encodings, bounded C-string buffers, helpers and secure identifiers.
+The full API contracts and executable examples remain in the main manual.
 
 ```bash
 paslangc

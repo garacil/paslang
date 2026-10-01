@@ -1,0 +1,72 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+  GPL version 3 or later; see COPYING. No warranty. }
+{ Own-process destructive FD tests deliberately print nothing. The C
+  child checks actual post-exec state, independently of SysUtils. }
+program sysprocessfds;
+uses sysutils, paslinux;
+var root, probe: string; paths: array[0..2] of string;
+  files: array[0..2] of THandle; i, mask, phase, foreignFd, answer,
+  dupNr, fcntlNr, actionNr: Integer; status: Int32;
+  options: TProcessOptions; outcome: TProcessResult; error: TSysError;
+  arguments: array of string; action: array[0..3] of Int64;
+begin
+  root := ParamStr(1); probe := ParamStr(2);
+  if Amd64 then begin dupNr := 292; fcntlNr := 72; actionNr := 13 end
+  else begin dupNr := 24; fcntlNr := 25; actionNr := 134 end;
+  for i := 0 to 2 do
+  begin
+    paths[i] := root + '/stdio-' + IntToStr(i);
+    files[i] := FileCreate(paths[i], 384);
+    if files[i] < 3 then Halt(2);
+  end;
+  { A deliberately foreign descriptor WITHOUT CLOEXEC must not leak. }
+  foreignFd := Syscall(fcntlNr, files[0], 0, 64);
+  if foreignFd < 64 then Halt(3);
+  if Syscall(fcntlNr, foreignFd, 1) <> 0 then Halt(4);
+  FillChar(action, SizeOf(action), 0); action[0] := 1;
+  if Syscall(actionNr, 12, Integer(@action[0]), 0, 8) <> 0 then Halt(5);
+  SetLength(arguments, 5);
+  arguments[1] := IntToStr(foreignFd);
+  for phase := 0 to 1 do
+    for mask := 0 to 7 do
+    begin
+      options := TProcessOptions.Defaults;
+      for i := 0 to 2 do
+      begin
+        if Syscall(dupNr, files[i], i, 0) <> i then Halt(6);
+        arguments[i + 2] := paths[i];
+        if (mask and (1 shl i)) <> 0 then
+          if phase = 0 then FileClose(i) else options.StandardHandles[i] := -1;
+      end;
+      arguments[0] := IntToStr(mask);
+      if not TryExecuteProcess(probe, arguments, options, outcome, error) then Halt(7);
+      if not outcome.Succeeded then Halt(100 + outcome.ExitCode);
+      if OsWait(outcome.ProcessId, Integer(@status), 1, 0) <> -10 then Halt(8);
+      for i := 0 to 2 do
+      begin
+        answer := Syscall(fcntlNr, i, 1);
+        if (phase = 0) and ((mask and (1 shl i)) <> 0) then
+        begin if answer <> -9 then Halt(9) end
+        else if answer <> 0 then Halt(10);
+      end;
+    end;
+  { Cyclic remapping must use pre-spawn captured handles, not overwritten
+    descriptors from an earlier dup3 in the child's standard loop. }
+  options := TProcessOptions.Defaults;
+  for i := 0 to 2 do
+  begin
+    if Syscall(dupNr, files[i], i, 0) <> i then Halt(11);
+    options.StandardHandles[i] := (i + 1) mod 3;
+    arguments[i + 2] := paths[(i + 1) mod 3];
+  end;
+  arguments[0] := '0';
+  if not TryExecuteProcess(probe, arguments, options, outcome, error) then Halt(12);
+  if not outcome.Succeeded then Halt(100 + outcome.ExitCode);
+  FileClose(0);
+  options.StandardHandles[1] := 0;
+  if TryExecuteProcess(probe, arguments, options, outcome, error) then Halt(13);
+  if (error.Code <> 9) or (outcome.ProcessId <> 0) then Halt(14);
+  for i := 0 to 2 do FileClose(files[i]);
+  FileClose(foreignFd);
+end.

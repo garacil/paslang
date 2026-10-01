@@ -47,6 +47,15 @@ Source files use the `.paslang` extension.
 - **Inline assembly** per machine, `Quad` (IEEE binary128), vectors, and
   a collector that reads compiled frames through the compiler's stack
   maps.
+- **SysUtils.** Pascal-style exceptions, string utilities, conversions,
+  correctly rounded real formatting, exact checked decimal `Currency`,
+  date/time routines, bounded files,
+  explicit-base directories, exact metadata and lexical paths, immutable
+  environments, owned child processes/deadlines, secure temporary resources
+  and XDG configuration paths, owned builders, strict UTF-8/UTF-16/ASCII
+  encoding, checked byte helpers and secure random/time-prefixed UUIDs.
+  Compatibility is a reference, not a requirement to reproduce unsafe or obsolete APIs;
+  the [manual](docs/MANUAL.md#17-sysutils) specifies supported contracts.
 - **A debugger inside the executable.** A program compiled with `-debug`
   carries its own debugger: `./prog --debug-mode` runs it into a console
   on its terminal, stopped before its first statement, with gdb's short
@@ -154,6 +163,12 @@ Arch).
 
 `make release-assets` builds all of them into `build/pkg/release`, with
 `SHA256SUMS`; it needs `dpkg-deb`, `rpmbuild` and `makepkg`.
+`make check-release` also validates every package format, the exact binaries
+and manual, and both relocated compilers running the SysUtils examples.
+It independently rebuilds both debuggers for the base CPU and compares every
+byte, then tests the packaged debugger protocol against an instrumented
+program. The arm64 tools also run on Cortex-A53, without LSE.
+It additionally needs `bsdtar` and `rpm2cpio`.
 
 ## Documentation
 

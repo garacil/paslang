@@ -359,6 +359,7 @@ The sizes are fixed and the same on both targets:
 | `Real`, `Double` | 8 | one IEEE binary64 |
 | `Single` | 4 | IEEE binary32, worked out in 32 bits; with a Double it widens, and a Double becomes a Single only through `Single(x)` |
 | `Quad` | 16 | IEEE binary128 in software, the same bits on both machines; everything widens to it, and it becomes a Double only through `Double(x)` (§14) |
+| `Currency` | 8 | signed integer ten-thousandths, −922337203685477.5808..922337203685477.5807; checked arithmetic and once-rounded decimal input; binary-float conversions are explicit (§17) |
 | `^T`, a class, a map, a chan | 8 | one machine word; `nil` is zero; two pointer types to one type are one type, whichever unit declares them, `PChar` too (1.1.34, P164) |
 | `array of T` | 24 | a slice: pointer, length, capacity |
 | `array[a..b] of T`, `array[I] of T` | (b-a+1) × SizeOf(T) | fixed, no header; the index a range or an ordinal type `I` (`Boolean`, `Char`, `Byte`, an enumeration, a subrange), and `array[1..3, 1..4] of T` is `array[1..3] of array[1..4] of T` |
@@ -598,9 +599,11 @@ Every binary operator has a compound assignment, `x op= e`, which is
 `x := x op e` with the same rules: `i += 5`, `s += 'lang'`, `d /= 4`,
 `q *= 3`, `m xor= k`, `x rol= 3`, `mask andnot= bit`, `i div= 2`. So
 `b += i` for a `Byte` `b` and an `Integer` `i` is refused as
-`b := b + i` is. The place must be a variable whose address calls no
-routine (`a[F] += 1` is refused: F would run twice or its place be
-guessed), and the whole is a statement, never an expression.
+`b := b + i` is. The destination is bound once, before evaluating the
+right-hand side: `a[F] += 1` calls `F` once, and `a[i] += ChangeIndex`
+still writes the original element if that call changes `i`. Logical map
+entries retain their original map and key across growth or rebinding.
+The whole is a statement, never an expression.
 
 The rotations are the tool for anything circular: a byte swap (`w rol
 8` on a `Word`, `u rol 16` swaps the halves of a `UInt32`), a pattern
@@ -2239,6 +2242,8 @@ decimals: `WriteLn(i:5, ' ', x:10:3, ' ', s:8)`; `w` and `d` are any
 integer expressions, `x:0:0` rounds to a whole number. `ReadLn(s)` reads a
 line into a string. `Inc(v)`, `Inc(v, n)`, `Dec(v)`, `Dec(v, n)` count;
 on a real they add or take away the step, `1.0` unless one is given.
+On `Currency` they use checked decimal arithmetic (§17). Their destination
+is bound once as for compound assignment, including a calling index.
 
 `Exit` leaves the current routine, running the `finally` parts on the
 way; in a function `Exit(v)` is `Result := v` and then `Exit`. `Halt(n)`
@@ -2589,6 +2594,7 @@ kind of each value and the field of that kind holds it.
 | `vtChar` | a `Char`, a one-character literal | `VChar` |
 | `vtExtended` | a `Double`, a `Single` (widened) | `VExtended: Double` |
 | `vtQuad` | a `Quad` | `VQuad` |
+| `vtCurrency` | a `Currency` | `VCurrency: Currency` |
 | `vtAnsiString` | a string | `VAnsiString: string` |
 | `vtPChar` | a `PChar` | `VPChar` |
 | `vtPointer` | a pointer, `nil`, a routine value (its code) | `VPointer` |
@@ -2964,6 +2970,42 @@ unit the constructors precede `initialization` and the destructors
 follow `finalization`. These lifetimes do not construct or destroy
 individual record values (`testdata/recstatic.paslang` and
 `testdata/units/recsuse.paslang`).
+
+Records, classes and helpers can contain ordinary `const` and `type`
+sections. The names belong to the enclosing type: `TInfo.Mark`,
+`TInfo.TNested` or `nestedu.TInfo.TNested`, not global `Mark` or
+`TNested`. Typed constants retain their own global storage; an alias
+retains the denoted type's identity. Fields resume after `var` or a
+visibility section. Constants, nested types, fields, methods,
+properties and class variables share one namespace: duplicate names
+are errors in either declaration order. The usual visibility rules
+apply to constants and types too, including across compiled units.
+
+A method sees its own type's names, inherited names for a class, then
+its enclosing types. Its local declarations take precedence. A nested
+record's method is implemented as `TInfo.TNested.Compute`; its header
+and body see that lexical scope. The compiler's lexical scope chain
+is separate from class inheritance. A helper adds its visible names
+to its target without leaking them into the global scope. Constants
+can also be read through a value, class reference or `with` binding;
+a type-owned constant does not evaluate a value qualifier, which may
+be nil. `TInfo.TMode.M1` is an explicit enumeration member, and
+`Str`/`Val` use its leaf name `M1`.
+
+Nested declarations may include forward classes and generic records.
+The parameter of a generic takes precedence over an enclosing alias
+of the same spelling. Qualified specialization is supported, for
+example `specialize nestedgu.TContainer.TSlot<string>`. These lexical
+scope rules and qualified forms are part of paslang's modern contract,
+not limited by what an older Free Pascal accepts. Tests are
+`nestednames`, `nestedmore`, `nestedgeneric`, their rejection cases,
+and the `nestedu`/`nestedwrap`/`nestedgu` unit clients.
+
+[`examples/scopedtypes.paslang`](../examples/scopedtypes.paslang)
+combines nested declarations, record construction, shared class storage
+and one generic identity through two aliases. It prints `packet 42 4 1`
+and `ready Ready`. The shared counter is deliberately used only by main;
+concurrent callers would need an atomic counter or a mutex.
 
 `Append(s, a, b)` is `s` with `a` and `b` after its elements, a slice of
 `s`'s type, as Go's `append` (1.0.132); `Append(s, u)` with `u` of `s`'s
@@ -3910,7 +3952,14 @@ ab
 ```
 
 `generic Name<T> = ...` declares a template and `specialize Name<Type>`
-makes a concrete type from it. Every specialization is its own type.
+makes a concrete type from it. Its identity is the template declaration
+and argument type, not a generated name. Repeating an instantiation,
+using an alias for its argument, or importing it through another unit
+still gives the same type. Different declarations remain different
+even when their names and layouts match. Synthetic instance spellings
+are not source declarations and cannot hide a user's names. Compiled
+interfaces preserve every exported type alias, not just the first
+spelling of a type (`genericlocal`, `units/genericuse`, `aliasuse`).
 
 A generic is a record with one type parameter (1.0.146): `generic
 TStack<T> = class` is refused, `generic record`, and `<K, V>` is a
@@ -9462,9 +9511,9 @@ program has without `uses`:
 | `NetRead(fd, max, s)` | a procedure: parks until bytes come and puts up to `max` of them (1 to 65536) in the string variable `s`, which is empty at the end of the stream or on an error |
 | `NetWrite(fd, s)` | writes all of `s`, parking while the socket is full: the count written, negative on an error |
 | `NetClose(fd)` | a procedure: takes the descriptor off the poller and closes it |
-| `WaitFd(fd)` | parks until `fd` can be read |
-| `WaitIo(fd, ev)` | parks until `fd` is ready for `ev`: 1 to read, 4 to write |
-| `WaitMs(fd, ev, ms)` | `WaitIo`, which also returns after `ms` milliseconds; 0 or less returns at once |
+| `WaitFd(fd)` | parks until `fd` can be read; 0 on wake, negative errno if registration fails |
+| `WaitIo(fd, ev)` | parks until `fd` is ready for `ev`: 1 to read, 4 to write; 0 on wake, negative errno if registration fails |
+| `WaitMs(fd, ev, ms)` | `WaitIo`, which also wakes after `ms` milliseconds; 0 or less does not wait. Failed registration returns negative errno and removes its deadline |
 
 The three `Wait` words park the routine on the runtime's epoll, one wake
 per wait, and the thread goes on with other routines. Their `Integer`
@@ -9765,12 +9814,51 @@ slept at least 30ms: 1
 
 ## 17. SysUtils
 
-`uses sysutils` gives Free Pascal's unit of the name, its routines and
-classes with Free Pascal's names, parameters and results, written for
-paslang: the text of each was read in Free Pascal's sources (3.3.1, the
-line after 3.2.2) and its output compared with Free Pascal 3.2.2's
-(`testdata/sysutils1`, `fmtfloat1`, `format1`). It is a
-library unit like `pastime`, installed with the compiler and built for
+### API design inventory
+
+The reference catalogue is not a portability promise or an instruction to
+copy obsolete APIs. This inventory covers its families: every compatibility
+name retained below has a supported contract; replacements are intentional.
+The declarations in `src/rtl/sysutils.paslang` are the precise public surface.
+
+| Reference family | Decision and modern contract | Executable examples / regression gates |
+|---|---|---|
+| Exception hierarchy, Abort, exception-object/address inspection | Retain Pascal object exceptions; errors/exceptions belong to G. Contextual system failures also have explicit `TSysError` values. Never thread-local errno or a global last-error slot. | `errors`, `excobjects`, `cleanup`, `systemerrors`; `syserrors`, `syscalls` gate |
+| Integer/Boolean conversion, Def/Try forms | Retain checked integer ranges; `Integer` is 64-bit. Boolean fallback tables are pure, custom tables/settings remain caller-owned process-wide compatibility state. | `convert`, `valuehelpers`; `sysutils1/2`, `syshelpers`, `valrange` |
+| Real conversion, Format/FmtStr, format patterns | Retain useful formats/settings, replace historical approximation by exact once-rounded digits. Preserve Single/Integer/Quad values rather than forcing all through Double. Modern concurrent sites pass explicit settings. | `report`, `valuehelpers`; `fmtfloat1/2`, `format1`, `realtext`, `quadtext` |
+| Currency | Retain the useful four-place decimal representation and familiar API names. Replace wrapping arithmetic, binary intermediates and implicit mixed arithmetic by checked exact kernels, once-rounded conversion and explicit binary/decimal boundaries. | `money`; `currency1`, `syscurrency`, unit interfaces, debug/reject gates and independent rational/IEEE oracle |
+| Date/time, timestamp/file-date conversion, local-zone operations | Retain Pascal spellings, checked civil dates and explicit settings; current Go-shaped TZif/POSIX zone handling is initialized with `once`. Exact filesystem seconds/nanoseconds use `TFileTime`, not a lossy floating-point date. | `dates`, `filemetadata`; `dates1/2/3`, `zone1`, `sysmetadata` |
+| String case/compare/search/replace/quote/trim/wrap/line-break words | Retain byte-string operations on shared CPU/base kernels. Case-insensitive byte APIs are ASCII-only, not locale-dependent Unicode collation. Do not duplicate language words inside the unit. | `convert`, `strings`, `valuehelpers`; `sysutils1/2`, `strwords`, `strkern`, `syshelpers` |
+| PChar scan/copy/compare/search/case/format functions | Replace sentinel-only addresses by sized `TBytes`, explicit capacity and checked whole writes. `%s` accepts owned strings/Char. Omit silent-truncating `StrLCopy`/`StrLCat`/`StrLFmt` variants and raw `StrAlloc`/`StrNew`/`StrDispose`; caller-sized buffers and GC-owned snapshots replace them. | `textbuffers`; `syscstring`, `textcasts`, `textcastbad` |
+| WideString/UnicodeString/ANSI code-page conversions | Replace duplicate historical string representations and mutable locale/code-page singletons by UTF-8 strings and immutable strict UTF-8/UTF-16LE/BE/ASCII `TEncoding`. ANSI means UTF-8. No silent replacement or implicit BOM handling; explicit error indexes. Obsolete arbitrary platform code pages are omitted, not guessed. | `textencoding`; `sysencoding`, independent strict-codecs oracle |
+| TStringBuilder | Retain the use case, replace copyable mutable record tricks by an owned class, checked byte edits and independent snapshots. No implicit synchronization; `AddRune` rejects invalid scalars. Reserved method names have clear Pascal alternatives. | `textbuilding`; `sysbuilder`, `sysencoding` |
+| Scalar/string/character helpers and memory overlays | Retain thin checked helpers of the same conversion/search kernels. Omit duplicate helper types for aliases and unsafe endian-dependent numeric overlays; the language's bit/memory words already provide explicit operations. A Char is a byte: classification says ASCII, not Unicode. Split takes a nonempty literal delimiter; quoting-aware parsing belongs in a real parser, not ambiguous Split overloads. | `valuehelpers`; `syshelpers`, existing `bits`, `views`, `strkern` |
+| GUID creation/parsing/bytes/helpers | Retain Pascal fields and canonical text, make wire byte order explicit. Replace deterministic seed/callback/MAC-based generation by kernel-backed UUIDv4 and RFC UUIDv7. No inherited COM memory serialization, shared counter or mutable generator callback. | `identifiers`; `sysguid`, independent `uuid` oracle |
+| Raw file handles, read/write/seek/flush/truncate | Retain useful handle operations with checked Linux descriptor widths and sized buffers. Explicit Try forms carry operation/path/error context. Pollable waits park G; necessarily blocking kernel calls release scheduler capacity centrally. Omit DOS sharing flags and unbounded untyped buffers. | `boundedfiles`, `blockedio`; `sysfiles`, `syspipes`, `syswidth`, syscall-progress gate |
+| File metadata, attributes/times, whole contents | Replace layout-dependent stat/legacy attributes by uniform statx and exact times/valid-field flags. Whole reads require a budget; typed-array reads validate element widths. Omit Windows attribute mutation and ambiguous file-age fallback values; permissions and explicit metadata errors describe Linux. | `filemetadata`, `boundedfiles`; independent stat oracle, `sysmetadata`, `syscontents` |
+| Directory cursors/search, mkdir/removal/cwd, paths/symlinks | Retain familiar lexical path/search names, provide owned cursors and explicit `*At` bases. Only `/` separates Linux components; actual component walking/resolution is not lexical cleaning. Cwd setters are process-wide, never G-local. Omit Windows drives/UNC/8.3 and inherited path/depth limits. | `directories`, `paths`; `sysdirectories`, `syscwd`, independent Pascal/Go path oracles |
+| Environment, arguments, process execution and inherited handles | Replace mutable global environment hooks and shell-like command strings by immutable startup/explicit environment values, separate argv and owned process results. Preserve ignored signals, reset caught ones centrally after fork, close foreign descriptors, distinguish spawn failure from exit 127, reap on deadlines/failure. No global setters or implicit PATH search. | `environments`, `processes`; `sysenvironment`, `sysprocesses`, independent descriptor/signal probe |
+| Temporary files/randomness | Replace name prediction and shared PRNG counters by kernel CSPRNG plus exclusive file/directory creation. GetTempFileName actually creates the file. Omit historical `/dev/urandom` fallback on the supported kernel floor. Owner closes/removes resources. | `temporaryresources`; `systemresources`, `sysprocessfds` |
+| User/config/cache/data/state paths and application name | Use explicit immutable environments and XDG absolute-root/fallback rules. No invented HOME or mutable vendor callback. Application config names are validated single components. | `systempaths`; `systemresources` |
+| OS version/architecture/platform | Retain useful read-only TOSVersion fields backed by uname and the compiled target. Omit Windows service-pack/release tables, distribution guesses and mutable platform hooks. | `systempaths`; independent uname oracle |
+| Legacy internationalization/resource-string/locale hooks | Fixed deterministic English error messages and explicit format settings replace process-global mutable locale machinery. Full Unicode normalization/collation and message-catalogue translation are not claimed by ASCII byte APIs. | `systemerrors`, `report`; error-catalogue and independent-settings tests |
+
+No family is considered complete solely because its names appear in the
+interface. The full two-target gate also exercises G/M/P progress, per-G
+errors/exceptions, GC, resource ownership and cleanup. Mutable objects and
+buffers require an exclusive owner or caller-provided synchronization;
+being callable from every pasroutine does not make a shared mutable object
+race-free.
+
+`uses sysutils` provides paslang's utility library. Familiar Pascal
+names retain useful, documented semantics; Free Pascal is a compatibility
+reference, not the design specification. Unsafe unbounded memory access,
+implicit lossy conversions and obsolete platform assumptions are not
+requirements. Deliberate differences have their contract and tests in §19;
+real formatting follows current Go's correctly rounded conversion, rather
+than reproducing historical FPC rounding defects. Existing string, number
+and date routines have compatibility tests (`testdata/sysutils1`,
+`fmtfloat1`, `format1`). It is a library unit like `pastime`, installed with the compiler and built for
 each processor level (§21), so its string words run on the kernels of
 the processor a program is compiled for.
 
@@ -9819,6 +9907,294 @@ and `EArgumentNilException`, `ENotImplemented`, `ENotSupportedException`,
 handles, `nil` outside one; `Abort` raises `EAbort`, `OutOfMemoryError`
 `EOutOfMemory`.
 
+**System errors.** `TSysError` is an owned value containing a positive
+Linux `Code` (zero means success), an `Operation` and a `Path`. Its
+`Failed` tests the code, `Message` includes the supplied context, and
+`RaiseError` raises `EOSError` with the same numeric `ErrorCode`, or
+does nothing for zero. Prefer carrying this explicit value to relying
+on a previous operation's implicit state. `SysErrorMessage(code)` gives
+deterministic English descriptions of Linux errors, including newer
+codes 133 and 134; an unassigned or unknown code includes its number.
+The messages do not depend on process-global locale settings.
+
+`GetLastOSError` and `SetLastOSError` are the Pascal compatibility API.
+The slot belongs to the pasroutine (G), survives yielding, collection
+and migration to another M, and starts at zero when a G is reused.
+It accepts a nonnegative Int32 code; an invalid assignment raises
+`EArgumentOutOfRangeException` and leaves the old value intact.
+Raw `Syscall`/`Sys*` calls return negative errno directly and do not
+set this compatibility slot. `RaiseLastOSError` raises `EOSError`
+using the slot; its explicit-code overload does not change the slot.
+Both overloads always raise, even for zero; to conditionally raise,
+use `TSysError.RaiseError`.
+
+[`examples/systemerrors.paslang`](../examples/systemerrors.paslang)
+demonstrates contextual explicit errors and two independent pasroutine
+error slots. `syserrors`, `syserrcatalog` and the syscall-migration
+tests check reuse, ownership, all Linux codes and GC on both targets.
+
+**Files and owned handles.** `THandle` is a descriptor, `-1` on failed
+open. `FileOpen(path, fmOpenRead/fmOpenWrite/fmOpenReadWrite)` and
+`FileCreate(path[, rights])` open with atomic close-on-exec; rights are
+Linux permission bits, subject to the process umask. `FileClose` closes
+once, including after EINTR: retrying Linux close can close a descriptor
+already reused by another G. No active operation may race closing its
+handle. `TryOpenFileAt(base, path, flags, rights, out handle, out error)`
+accepts `paslinux` flags and a base descriptor; `CurrentDirectoryHandle`
+means the process cwd. An absolute path ignores the base. A base keeps
+relative operations stable across chdir, but is not a confinement sandbox.
+Paths containing NUL are rejected rather than silently truncated.
+Handles must fit a nonnegative Linux signed 32-bit descriptor; only an
+explicit directory base may also be `CurrentDirectoryHandle`. Wide
+integers return EBADF instead of aliasing another file after truncation,
+including for close and zero-byte IO. Open flags must fit a nonnegative
+signed 32-bit value; seek origins are Linux 0..4. These validations do not
+change the absolute-path rule: an absolute path ignores any base value.
+
+`FileRead(handle, var bytes, count)` and `FileWrite(handle, bytes, count)`
+return a transferred count or `-1`. Their `TryFileRead`/`TryFileWrite`
+forms also take a buffer offset and return explicit count/error values.
+The range is checked without addition overflow; an empty valid range
+forms no pointer and does no IO. One call is one transfer: short reads,
+short writes and read EOF (zero) are successful. EINTR retries; EAGAIN
+parks G with the correct read/write interest. Failed poll registration
+returns its error. Unavoidably blocking foreign descriptors, regular
+disk IO and metadata use the same central M/P handoff as raw system
+calls. There is no SysUtils-specific scheduler.
+
+`TryFileReadAt`/`TryFileWriteAt` additionally take a nonnegative file
+offset and do not change the shared position. Distinct positional writes
+may share a handle; positional writes on append handles are rejected
+because Linux otherwise ignores the supplied offset. Ordinary reads,
+writes and `FileSeek(handle, offset, origin)` share the position:
+coordinate them explicitly. `FileFlush` and `FileTruncate` operate on the
+handle. `TryFileClose` reports close errors explicitly. The compatibility
+forms set G-local last error, including zero on success; the `Try` forms
+leave it unchanged.
+
+**Whole contents with a budget.** `TryReadFileAt(base, path, maxBytes,
+out bytes, out error)` owns/closes its opened handle.
+`TryReadFileContents(handle, maxBytes, ...)` borrows the handle and
+advances its position without closing it. Neither trusts stat size:
+proc files reporting zero can still contain data. EOF at the exact
+budget is accepted; one-byte probing detects excess and returns EFBIG
+with an empty result, not silently truncated data. A negative budget is
+invalid. `GetFileContents(path/handle, maxBytes)` and
+`GetFileAsString(path, maxBytes)` raise contextual `EOSError` on failure;
+the string form preserves the bytes. `TryWriteFileAt(base, path, bytes,
+rights, out error)` writes all bytes and closes, also for an empty file.
+It is not an atomic transaction: a write failure may leave a partial
+file. Every mutable buffer has one owner during an operation.
+
+**Metadata and exact timestamps.** `TryFileInfoAt(base, path, followLink,
+out info, out error)` and `TryHandleInfo(handle, ...)` return `TFileInfo`.
+`Has(fiType or fiSize ...)` checks `ValidFields`: do not invent missing
+creation times. `IsDirectory`, `IsRegular` and `IsSymbolicLink` describe
+the queried object, not an implicitly substituted target. Mode, owner,
+group, links, size, inode, device and mount identity are retained.
+`Accessed`, `Created`, `Changed` and `Modified` are `TFileTime` values:
+signed Unix `Seconds` and `Nanoseconds` in 0..999999999. This preserves
+filesystem precision without a floating-point date conversion. The
+implementation follows the [Linux statx ABI](https://man7.org/linux/man-pages/man2/statx.2.html),
+including the filesystem's returned availability mask.
+
+`FileExists`, `DirectoryExists`, `FileGetAttr`, `FileAge` and
+`FileGetDate` provide the familiar Pascal queries. Integer dates are
+Unix seconds; `FileAge(..., out dateTime[, followLink])` and `FileAgeUTC`
+convert to local/UTC `TDateTime`. `FileSetDate(path/handle, seconds)` and
+the path's local `TDateTime`/`FileSetDateUTC` forms return zero or positive
+errno. Their compatibility seconds discard subseconds deliberately.
+`TrySetFileTimesAt` retains exact times and explicit link-following;
+`TrySetFileModeAt` changes actual Linux permission bits, following links,
+instead of pretending Windows/DOS attributes are portable permissions.
+
+**Directory operations and searches.** `CreateDir`, `RemoveDir`,
+`ForceDirectories`, `DeleteFile` and `RenameFile` have Pascal meanings.
+Modern `TryCreateDirectoryAt`, `TryForceDirectoriesAt`,
+`TryDeleteFileAt` and `TryRenameFileAt` use owned explicit bases/errors.
+The rename takes old/new bases and `replaceExisting`; false uses atomic
+no-replace, not a racy existence check. Directory creation walks real
+components without lexical cleaning: symlink/`..` has filesystem
+meaning. It verifies that an existing component really is a directory
+and supports paths longer than one kernel pathname argument.
+
+`TryOpenDirectoryAt` creates an owned `TDirectoryReader`. `Next(out
+name, out error)` returns false with code zero at EOF, or a nonzero error
+on failure; names are copied out of a bounds-checked 8192-byte buffer.
+It never yields `.` or `..`, and reports malformed records explicitly.
+Different cursors are independent; calls on the same cursor require
+exclusive ownership. EOF closes the descriptor. `CloseDirectory` is
+idempotent; `Free` closes early-exit cursors as well. Keep it in `finally`.
+`FindFirst(path, attr, out search)`, `FindNext(var search)` and
+`FindClose(var search)` supply `TSearchRec` (`Name`, `Size`, `Time`,
+`Mode`, `Attr`, `IsDirectory`, `IsCurrentOrParentDir`). Zero is a match;
+2 is no match/end, other positive codes are errors. Always call
+`FindClose` before reusing a live search; close is idempotent.
+Readonly/archive are always allowed, other attributes are selected by
+the mask; `faAnyFile` does not include `faSymLink`, which selects lstat.
+`MatchesFileName` supports Pascal `*` and `?`; `?` consumes one UTF-8
+character (an invalid byte consumes one), while brackets and backslash
+are literal. Patterns match a complete basename, not a path.
+
+**Paths and the process cwd.** Only `/` is a separator on Linux;
+backslash, spaces and UTF-8 bytes are preserved. `ExtractFileName`,
+`ExtractFilePath`, `ExtractFileDir`, `ExtractFileExt`, `ChangeFileExt`,
+`ChangeFilePath` and the leading/trailing delimiter helpers are Pascal
+spelling operations. A basename's initial dot alone is not an extension.
+`ConcatPaths` retains Pascal joining, including its leading empty-base
+behaviour. `JoinPaths` skips leading empties, joins once and applies
+`CleanPath`, current Go's lexical clean. `CleanPath('')` is `'.'`, while
+`JoinPaths([])` is `''`. `IsAbsolutePath` checks a leading slash;
+`IsLocalPath` rejects empty, NUL, absolute and escaping cleaned paths.
+These checks and cleaning do not resolve symlinks or establish security
+boundaries. `IsPathDelimiter` uses the string's 1-based byte index.
+
+`GetCurrentDir`/`TryGetCurrentDir` read the process cwd;
+`SetCurrentDir` changes it for all Gs. Prefer explicit bases for parallel
+work. `TryGetDirectoryPath(handle, out path, out error)` walks owned
+descriptors without chdir, a global cache or a depth cap. It also supplies
+the long-path fallback for getcwd, and returns an error for deleted or
+unreachable directories. `ExpandFileName(path[, basePath])` performs
+lexical absolute expansion. An absolute base avoids process cwd access;
+a relative/empty base is resolved against the process cwd. NUL raises
+`EArgumentException`. Expansion is not filesystem canonicalization.
+
+`scripts/check_sysutils.py` checks both targets, inline 0/40, one/all
+available CPUs and GC stress/off. File tests include 128 positional
+writers, blocked/pollable pipes, write pressure, 64 competing no-replace
+renames, 16 directory cursors and explicit bases under chdir. The path
+tests include 2,017 independently modelled inputs, a 400-deep directory
+longer than 4096 bytes, and host stat/lstat comparisons including sparse
+files larger than 4 GiB, nanoseconds and links.
+
+Executable examples: [`boundedfiles`](../examples/boundedfiles.paslang)
+shows bounded and positional IO plus proc-file contents;
+[`filemetadata`](../examples/filemetadata.paslang) distinguishes a
+link from its target and checks timestamp availability;
+[`directories`](../examples/directories.paslang) shows cursor/search
+ownership and EOF; [`paths`](../examples/paths.paslang) compares lexical
+cleaning, modern/Pascal joins, expansion and UTF-8 patterns. All have
+checked output and run on both targets in `make check`.
+
+**Immutable environments.** `GetEnvironmentVariable`,
+`TryGetEnvironmentVariable` (distinguishes missing from an empty value),
+`GetEnvironmentVariableCount` and 1-based `GetEnvironmentString` read
+the initial Linux exec vector. It is copied before user code, shared
+read-only by all libraries, and has no `/proc` dependency. Lookup is
+case-sensitive, rejects empty/`=`/NUL names and selects the first
+duplicate. Raw enumeration retains malformed entries; invalid indexes
+return `''`. Returned strings are owned COW values.
+
+`TEnvironment.Current` provides a normalized immutable value;
+`TEnvironment.Create(entries)` validates `NAME=value` without NUL and
+selects the last explicit duplicate value. Its `Count`, 1-based
+`Entry`, `Lookup`, `ToArray`, `WithValue` and `WithoutValue` offer
+read-only access, an independent array, and new updated values. Copies
+can be shared by pasroutines; updates never change another copy or the
+process environment. Malformed explicit entries raise
+`EArgumentException`. Global environment setters are not offered.
+
+**Processes.** `TryExecuteProcess(path, args, options, out outcome,
+out error)` executes an exact path, without implicit shell parsing or
+PATH search. Arguments exclude argv[0], which is the supplied path;
+spaces, quotes and shell punctuation remain literal bytes. Start from
+`TProcessOptions.Defaults`: inherited environment and standard handles,
+an owned snapshot of cwd, no execution timeout. `DirectoryHandle` and
+`Directory` choose an explicit base/path without changing parent cwd;
+`InheritEnvironment=False` uses the immutable `Environment` (including
+an explicitly empty one). `StandardHandles[0..2]` select borrowed
+descriptors, `-2` inherits the corresponding standard descriptor (even
+when closed), and `-1` closes it. Captured descriptors are duplicated
+before spawn and stay owned until return. No other descriptor, even a
+foreign one lacking CLOEXEC, is inherited across exec.
+
+`TProcessResult` distinguishes `ProcessId`, `Exited`, `ExitCode`,
+`Signal` and `TimedOut`; `Succeeded` means a normal zero exit. A
+nonzero exit, including 127, or signal termination is a successfully
+executed process, not a spawn error. The CLOEXEC status pipe reports
+actual spawn errors separately. Waiting on its pidfd parks the G in
+the shared poller. Positive `TimeoutMs` starts after successful exec;
+zero is unlimited. Expiry returns errno 110, kills the direct child
+and reaps it before return. The timeout does not include spawn setup
+and is not a process-tree cancellation contract. Completion winning
+the final status check succeeds; expiry winning it is a timeout.
+Every failure also closes owned descriptors and reaps a created child.
+No other code may wait for this call's PID, nor close its borrowed
+handles concurrently. `ExecuteProcess(path, args)` uses defaults,
+raises `EOSError` on system failure and returns an exit code or
+`128 + Signal`. NUL in any path/argument is an explicit error. The
+implementation follows the [Linux execve contract](https://man7.org/linux/man-pages/man2/execve.2.html)
+and [pidfd lifetime/readiness](https://man7.org/linux/man-pages/man2/pidfd_open.2.html).
+The shared runtime blocks signals on the original M before real fork,
+restores that M's mask before the parent G can migrate, and keeps the
+private child masked throughout raw setup. Immediately before exec it
+resets caught handlers, preserves ignored ones and restores the original
+mask. Failures in that exec prelude remain explicit spawn errors. This
+also applies to low-level fork/exec callers in other units; a fork child
+may execute only raw syscalls until exec or exit, never user Pascal,
+allocation, stack growth or finalization. The
+[Linux signal-mask contract](https://man7.org/linux/man-pages/man2/sigprocmask.2.html)
+explains why masking only inside a library would be incorrect.
+Executable examples [`environments`](../examples/environments.paslang)
+and [`processes`](../examples/processes.paslang) show immutable updates,
+owned array copies, explicit child settings and a real exit 127.
+
+**Randomness and temporary resources.** `RandomBytes(count)` returns
+owned bytes from Linux's kernel CSPRNG; `TryRandomBytes(buffer, offset,
+count, out error)` fills a checked range, retrying short reads and EINTR.
+Invalid ranges leave the buffer unchanged; an IO failure erases the
+entire valid requested range, never exposing a partial random result.
+This is not `pasrand`'s reproducible simulation generator. Waiting for
+kernel entropy uses the same central syscall scheduler as every unit.
+
+`TryCreateTempFileAt(base, directory, pattern, out name, out handle,
+out error)` exclusively creates an owned read/write, CLOEXEC file with
+mode 0600 before umask. `TryCreateTempDirectoryAt` creates a directory
+with mode 0700 before umask and returns its owned pathname. The last
+`*` in the pattern is replaced by 128 bits of kernel randomness in
+32 hexadecimal digits; without `*`, the token is appended. Other `*`
+bytes remain literal. Slash/NUL are rejected, and collisions are retried
+up to 10,000 times. Creation uses an owned directory snapshot, never
+predict-and-check. Empty directory selects `GetTempDir`: initial
+`TMPDIR` or `/tmp`, with a trailing slash; Linux has no different
+`Global` temporary root. Returned relative paths remain relative to
+the supplied base, which is not necessarily cwd. The caller closes
+and removes resources; neither files nor directories auto-delete.
+`GetTempFileName([directory, prefix])` also actually creates an empty
+file, closes its handle and returns its name, not an unused-name guess.
+
+**User/application directories.** The `TryGetUserDirectory`,
+`TryGetUserConfigDirectory`, `TryGetUserCacheDirectory`,
+`TryGetUserDataDirectory` and `TryGetUserStateDirectory` functions
+accept an explicit immutable `TEnvironment` and return a cleaned,
+absolute lexical path plus `TSysError`. They perform no filesystem IO
+and create no directories. HOME must be absolute and nonempty; missing
+HOME is errno 2, relative HOME errno 22. Absolute nonempty XDG roots
+take priority; invalid relative roots are ignored, as the
+[XDG Base Directory specification](https://specifications.freedesktop.org/basedir-spec/latest/)
+requires. Fallbacks are HOME plus `.config`, `.cache`, `.local/share`
+and `.local/state`. `GetUserDir` uses the initial environment and adds
+a trailing slash, without silently substituting a temporary directory.
+`GetApplicationConfigDirectory(environment, appName, Global=False)`
+adds one validated application component and a trailing slash; global
+configuration uses `/etc`. `ApplicationName` is the executable basename
+without its extension. `GetAppConfigDir(Global)` uses that name;
+`GetAppConfigFile(Global[, SubDir])` adds `ApplicationName + '.cfg'`.
+No mutable vendor hooks, locale-dependent paths or implicit mkdir exist.
+
+**Kernel identity.** Read-only `TOSVersion` class properties `Name`,
+`Release`, `Version`, `Machine`, `Major`, `Minor`, `Build` and
+`Architecture` are initialized once from bounded Linux `uname` data
+before user code. Major/Minor/Build are the first three numeric kernel
+release components, not Windows service packs or distribution names.
+`Check(major[, minor[, patch]])` compares lexicographically;
+`ToString` returns `machine-name release`. `GetCompiledArchitecture`
+and `GetCompiledPlatform` describe this binary's target, not its host
+under emulation. Immutable values are shared by all pasroutines.
+Examples [`temporaryresources`](../examples/temporaryresources.paslang)
+and [`systempaths`](../examples/systempaths.paslang) cover owned cleanup,
+secure randomness, explicit XDG selection and read-only identity.
+
 **Strings.** `UpperCase`, `LowerCase`, `AnsiUpperCase`, `AnsiLowerCase`;
 `CompareStr` (the difference of the first bytes that differ, on the
 `CompareByte` kernel), `CompareText` (the same with ASCII letters as
@@ -9831,6 +10207,99 @@ parameter; `IsDelimiter`, `LastDelimiter`, `AdjustLineBreaks`, `WrapText`
 (both forms), `IsValidIdent`, `CharInSet`, `AppendStr`, `BytesOf`,
 `StringOf`, `TBytes`, `TSysCharSet`.
 
+**Owned string builders.** `TStringBuilder` is an exclusively owned mutable
+object, not a copyable record or an implicitly synchronized shared buffer.
+Use `Create(capacity=64)` or `Create(text)`, `EnsureCapacity`, `AddText`,
+`AddChar`, `AddRune`, `AddInteger`, `AddReal(value, settings)`, `AddBoolean`,
+`AddLine`, and `AddFormat(template, args, settings)`. `InsertText` and
+`Remove` use checked zero-based **byte** indexes/counts. `ByteLength` and
+`Capacity` are byte counts; `Reset` keeps capacity, not a secure erasure
+promise. `ToString` returns an independent snapshot, never a writable view
+of the builder. Always `Free` the builder in `finally`; strings already
+returned remain valid. A Unicode scalar in `AddRune` must be in 0..$10FFFF,
+excluding surrogates; invalid values raise `EEncodingError` without changing
+the builder. No implicit U+FFFD replacement. Executable example:
+[`textbuilding`](../examples/textbuilding.paslang).
+
+**Strict explicit encodings.** `TEncoding` is an immutable record, safe to
+copy/share between pasroutines. Its zero value and `UTF8` represent UTF-8;
+`ANSI` is an explicit alias for UTF-8, not the machine locale. `Unicode`
+is UTF-16LE, `BigEndianUnicode` UTF-16BE, and `ASCII` US-ASCII.
+`EncodingName` and `CodePage` identify them. `GetBytes(text)` and
+`GetString(bytes)` validate strictly; the decoding overload accepts a
+checked offset/count. `Convert(source, destination, bytes)` decodes then
+encodes under those same contracts. `GetPreamble` returns an owned BOM
+sequence; conversion never automatically adds or consumes it. A BOM in
+input is ordinary U+FEFF text.
+
+`TryGetBytes` and `TryGetString` return an empty output on failure and an
+explicit `TEncodingError` (`Kind`, absolute zero-based input `ByteIndex`,
+`Message`, `RaiseError`); success has `teNone` and index -1. Range errors
+raise `EArgumentOutOfRangeException`; malformed UTF-8/UTF-16 or non-ASCII
+values raise `EEncodingError`, whose `ByteIndex` identifies the input.
+Invalid UTF-8, overlong sequences, surrogates and scalars above $10FFFF
+are errors, not silently repaired text. Executable example:
+[`textencoding`](../examples/textencoding.paslang).
+
+**Bounded C-string buffers.** `CStringOf(text)` produces owned `TBytes`
+with an additional NUL. `StrLen` and `StrPas` accept a whole byte slice or
+an explicit offset/capacity; they require a NUL **within** that extent.
+`StrPCopy`, `StrCopy`, `StrCat`, `StrMove`, `StrUpper` and `StrLower`
+validate source/destination ranges and whole writes before mutation.
+Capacity includes the NUL, except `StrMove`'s raw byte count and
+`FormatBuf`'s raw formatted output. `StrCopy`, `StrMove` and `StrCat` work
+with overlapping sources/destinations. `StrComp`/`StrIComp` use the byte
+comparison kernels; the latter and the case conversions are ASCII-only.
+`StrPos`, `StrScan`, `StrRScan` return zero-based positions, or -1; an
+empty needle is at zero, and scanning for NUL returns the terminator.
+`FormatBuf(buffer, offset, capacity, template, args, settings)` writes
+complete bytes without adding NUL; `StrFmt` includes the terminator.
+Insufficient space is an exception, never implicit truncation.
+`PChar(text)` separately owns a writable NUL-terminated snapshot, including
+literals/empty strings; it does not alias or extend the source string.
+A raw pointer alone still proves no readable extent. Executable example:
+[`textbuffers`](../examples/textbuffers.paslang).
+
+**Checked helpers.** `TStringHelper` provides `IsEmpty`, `ByteLength`,
+checked read-only zero-based `Chars`, `HasText`, `StartsWith`, `EndsWith`,
+`IndexOf` (-1 absent; empty needle at the supplied start), `Substring`,
+`InsertText`, `Remove`, `Replace`, `ToLower`, `ToUpper`, `Trim`, and numeric
+conversions. `SplitText(separator, maxParts=-1)` retains empty fields,
+requires a nonempty literal separator, and accepts zero (no fields), a
+positive part limit or -1 (unlimited). `string.JoinText` is the checked
+inverse. These are byte operations, not Unicode grapheme editing.
+`TIntegerHelper`, `TDoubleHelper` and `TBooleanHelper` reuse `Parse`,
+`TryParse` and the existing text conversions; double parsing/printing
+requires explicit settings. Integers also offer `ToHexString`, `ToDouble`
+and `ToBoolean`; doubles `IsNotANumber`, `IsInfinity`, `IsFinite`;
+booleans `ToInteger`. `TCharHelper` classifies **bytes** with
+`IsAsciiDigit`, `IsAsciiLetter`, `IsAsciiWhiteSpace`, and provides ASCII
+`ToLower`/`ToUpper` and owned `ToString`. Language words (`Contains`,
+`Split`, `Join`, `IsNan`, `Insert`, `Length`, `Clear`) are not redeclared
+as library members. Executable example:
+[`valuehelpers`](../examples/valuehelpers.paslang).
+
+**GUID / UUID.** `TGUID` has Pascal's 16-byte `D1: UInt32`, `D2,D3: Word`
+and `D4: array[0..7] of Byte`. `GuidToBytes`/`GuidFromBytes` and the helper's
+`ToByteArray`/`Create(bytes)` use exactly sixteen bytes in **network order**,
+not a native-memory dump. `StringToGUID`, `TryStringToGUID` and
+`TGUID.Create(text)` accept canonical hex-and-dash text, optionally enclosed
+in braces. They reject whitespace, truncated fields and alternate compact
+forms; a failed Try clears the result. `GUIDToString` and `ToString`
+write uppercase with braces; `ToString(True)` omits braces.
+`IsEqualGUID`, `IsEmpty` and `Version` inspect values without global state.
+
+`TryCreateGUID`, `CreateGUID` (zero success, positive errno), `NewGUID` and
+`TGUID.NewGuid` generate UUIDv4 with kernel randomness. `NewTimeGUID` and
+`TGUID.NewTimeGuid` generate RFC UUIDv7: a 48-bit Unix wall-clock millisecond
+prefix and 74 fresh random bits. `UnixMilliseconds` requires an RFC UUIDv7.
+UUIDv7 supports timestamp grouping but does **not** promise monotonic
+order within a millisecond or across a backwards clock adjustment. There
+is no shared counter, deterministic random seed or exposed MAC address.
+Neither identifier is an authorization token. The bit layout and text
+follow [RFC 9562](https://www.rfc-editor.org/rfc/rfc9562.html); executable
+example: [`identifiers`](../examples/identifiers.paslang).
+
 **Integers and Booleans.** `IntToStr`, `UIntToStr`, `IntToHex` (and its
 one-argument form, sixteen digits); `StrToInt`, `StrToInt64`,
 `StrToQWord`, `StrToUInt64`, `StrToDWord`, `StrToUInt`, each with its
@@ -9838,6 +10307,9 @@ one-argument form, sixteen digits); `StrToInt`, `StrToInt64`,
 `&`) into its type's range: a `DWord` past 2^32 - 1 is an error, where
 its low 32 bits were kept (P149); `BoolToStr` (`-1` and `0`, or `TrueBoolStrs` and `FalseBoolStrs`,
 or two strings given), `StrToBool`, `StrToBoolDef`, `TryStrToBool`.
+Empty Boolean text tables use immutable `True`/`False` fallbacks; readers
+never lazily populate global arrays. Custom compatibility tables must be
+frozen before concurrent readers start or synchronized by their owner.
 
 **Reals and the settings.** `StrToFloat`, `StrToFloatDef` and
 `TryStrToFloat` (into a `Double` or a `Single`, rounded once), each with a
@@ -9863,24 +10335,31 @@ patterns: up to three sections, for a positive value, a negative one and
 zero; `0` a digit always written, `#` one written when there is one, `.`
 the point, `,` the thousands, `E+` and `E-` an exponent, text in quotes
 as it is. `FloatToDecimal` gives the digits and the place of the point
-in a `TFloatRec`. Each takes a `Double`, a `Single`, an `Int64` or a
+in a `TFloatRec`, a compatibility record holding at most 18 significant
+digits plus its NUL terminator; precision above 18 is capped for this
+record only. String-returning formatters have no such cap. Each takes a
+`Double`, a `Single`, an `Int64`, a `Currency` or a
 `Quad` as its own value (a `Single`'s fewest digits are its own, `0.1`;
 an `Int64`'s are exact; a `Quad`'s are worked out exactly, all 113 bits,
 by `pasfmt`'s `PasQuadDigits`), and each has a form with a
-`TFormatSettings`. The digits are rounded once from the exact value, a
+`TFormatSettings` for the string-returning forms; `FloatToDecimal` returns
+separator-independent digits. The digits are rounded once from the exact value, a
 tie to even: `2.5` with no decimals is `2`, and `1.005` with two is
 `1.00`, since the `Double` is 1.00499999999999989...
 
 **Format.** `Format(fmt, [args])` reads Free Pascal's directives,
 `%[index:][-][width][.precision]type`: `d`, `u` and `x` an integer (64
 bits), `e`, `f`, `g`, `n` and `m` a real in the formats above (`%e` and
-`%g` with no precision the fewest digits), `s` a string, a `Char` or a
-`PChar`, `p` a pointer, `b` a `Boolean`, `o` an object's `ToString` or a
+`%g` with no precision the fewest digits), `s` an owned string or a `Char`,
+`p` a pointer, `b` a `Boolean`, `o` an object's `ToString` or a
 class's name, `%%` a `%`, and `*` for a width or a precision taken from
 the list. A missing argument, one of another kind or a letter that is no
 directive raises `EConvertError` with Free Pascal's message (`Invalid
 argument index in format "%d %d"`). `FmtStr(res, fmt, args)` is the
 procedure form.
+Raw `PChar` arguments to `%s` raise `EConvertError`, even with precision
+zero: precision limits output, not the readable extent of an address.
+Use a string, or `StrPas` on a bounded byte buffer, before formatting.
 
 ```pascal
 { SysUtils: a small report with Format, FormatFloat, FloatToStr and
@@ -9916,6 +10395,68 @@ sum  |  1238.00|  1,238.00|
 2 6.02E+023
 1.234.567,89 -42.50$
 ```
+
+### Exact decimal Currency
+
+`Currency` is a distinct language type, not a `Double` alias: an eight-byte
+signed count of ten-thousandths on both machines. Its range is
+−922337203685477.5808..922337203685477.5807, including both endpoints.
+`Default(Currency)` is zero; `Low` and `High` return those typed endpoints.
+SysUtils also names them `MinCurrency` and `MaxCurrency`.
+Untyped decimal literals are read directly from their digits, rounded once
+to four places, nearest with ties to even. Typed constants and default
+parameters retain that decimal value through separately compiled units.
+
+`+`, `-`, `*`, `/`, unary minus, `Abs`, `Sqr`, comparisons, `Min`/`Max`,
+`Inc`/`Dec` and compound assignment take Currency. Integer operands become
+whole decimal values with range checking; an untyped decimal literal takes
+the decimal type of its other operand. Every multiply/divide uses its exact
+wide intermediate and rounds once. Overflow and division by zero raise the
+core `ECurrencyError`, with `Kind` `cfOverflow`, `cfDivideByZero` or
+`cfInvalidValue`. This class descends from `TObject`, not from the optional
+SysUtils `Exception`; catch it explicitly. Constant failures are compile
+errors. A failed arithmetic assignment leaves its destination unchanged.
+
+`Currency(d)` converts the actual binary `Single`/`Double`/`Quad` value,
+checked and once-rounded. `Double(c)`, `Single(c)` and `Quad(c)` are explicit
+numeric conversions; a binary float and Currency never mix implicitly,
+including `Min`/`Max`. `Trunc`, `Round`, `Floor` and `Ceil` return integers;
+`Int` and `Frac` return Currency. It is not an ordinal, array index or
+Boolean condition: there is no implicit scaled-integer cast. Raw storage
+is explicit via `CurrencyToScaled`/`CurrencyFromScaled` or an unsafe byte
+view, `c as Int64`. Ordinary binary-float expressions remain binary-float
+expressions; introducing a Currency operand establishes decimal arithmetic.
+
+| API | Contract |
+|---|---|
+| `StrToCurr`, `TryStrToCurr`, `StrToCurrDef` | Decimal input with optional exponent and surrounding blanks; explicit settings select the decimal separator. No thousands separators, NaN, infinity or embedded NUL. `Try` returns false and zero; raising forms use `EConvertError`. |
+| `FloatToCurr`, `TryFloatToCurr` | Checked conversion of a Double's actual binary value. `Try` returns false and zero for nonfinite/out-of-range values; the raising form uses `EConvertError`. |
+| `CurrToStr` | Minimal fixed decimal text, preserving the complete value and both endpoints; no intermediate Double and no unwanted exponent. |
+| `CurrToStrF(c, format, digits)` | The same exact format engine and explicit settings as `FloatToStrF`; `digits` selects fractional places or exponent width, depending on the format. |
+| `FloatToStr`, `FloatToStrF`, `FloatToDecimal`, `FormatFloat`, `FormatCurr` | Type-preserving Currency overloads; pattern and significant/fractional formatting round the exact decimal value once. |
+| `Write`, `WriteLn`, `Str`, `Val`, `Format`/`FmtStr`, bounded formatting and builders | Currency is supported throughout; `array of const` uses `vtCurrency` and an inline `VCurrency` field. |
+| `Currency.Parse`, `TryParse`, `FromScaled`; `c.ToString`, `ToScaled`, `ScaledValue` | Checked helper forms, including explicit format settings and an unambiguous scaled-integer interchange. |
+
+The routines work from every pasroutine. Numeric scratch data, exceptions
+and explicit settings are independent; mutable process-wide default settings
+still require the caller's synchronization, as for all other formatters.
+Calling destinations and mutable indexes are bound before a compound RHS:
+`prices[Next] += ComputePrice` evaluates `Next` once and retains that same
+destination if `ComputePrice` changes the index, grows a map or triggers GC.
+
+The built-in debugger prints exact decimal values, including both endpoints.
+DWARF describes an eight-byte signed fixed-point integer, decimal scale −4,
+19 digits. External debugger display precision is that debugger's choice;
+GDB's default decimal display shortens very large values, while the stored
+scaled integer and DWARF scale remain exact.
+
+[`money`](../examples/money.paslang) demonstrates invoices, nearest-even
+rounding, scaled interchange, concurrent quotes and checked overflow.
+`make check` compares both the kernels and the public language/SysUtils
+paths with 11,005 independent rational/decimal/IEEE cases, with base and
+selected CPU builds on amd64 and arm64. Interfaces, defaults, helpers,
+negative compilation, debug values, side effects and concurrent GC stress
+have separate regression gates.
 
 **Dates and times.** A `TDateTime` is a `Double`, the days since
 1899-12-30 and the time the fraction of a day (`TDate` and `TTime` are
@@ -10001,10 +10542,11 @@ the dates too.
 
 ## 18. The runtime model
 
-A running program is a set of routines, Gs, on a set of OS threads, Ms.
-At most one M runs Pascal code for each CPU the program may use (its
-affinity mask); only the first M starts with the program, and another
-starts when there is work for it and no M is idle (1.0.70). The current
+A running program is a set of routines, Gs, on OS threads, Ms. A P is
+the right to execute Pascal code, its run queue and allocation cache.
+The number of Ps follows the affinity mask, with a floor of two and
+a ceiling of 32; each P belongs to at most one M. Only the first M
+starts with the program; others start as work requires them. The current
 G is in a register (`r14` on amd64, `x28` on arm64) and every routine
 has its own stack that grows on demand: each routine entry checks the
 stack and calls the runtime when it needs more. A system monitor thread
@@ -10030,6 +10572,26 @@ happen: with no timer pending, no routine waiting on a descriptor, no
 thread in a system call or looking for work, and a routine still alive,
 it stops the program with `paslang: all routines are asleep: deadlock`
 (§10, 1.0.139).
+
+This model applies to every unit, including user-written units. A
+pollable wait parks its G. An unavoidable blocking system call keeps
+its P on the short-call path; sysmon retakes that P if the call is still
+blocked and hands it to another M. A returned G whose P was retaken
+rejoins the same scheduler and may resume on a different M. Its stack,
+GC roots, exception and per-G state move with it. Returned no-P Ms are
+reused, so the thread count follows simultaneous blocking demand, not
+the number of completed calls. The runtime limits allocated Ms to
+10,000 and stops with `paslang: thread limit exceeded (10000 Ms)` if
+that limit is reached; it does not create them in advance. The P budget
+does not increase when more Ms are needed. These transitions work with
+the collector disabled too. A mutable object still needs its documented
+ownership or synchronization; scheduling compatibility is not permission
+for concurrent unsynchronized writes.
+
+[`examples/blockedio.paslang`](../examples/blockedio.paslang) uses
+deliberately blocking pipe reads. Even with one-CPU affinity (two Ps),
+main must run to release four readers; the output is `completed 4`.
+Higher-level units use the same runtime, not a private pool.
 
 The program does not link libc. Every operation is a system call from
 the runtime or from a Pascal unit: `Syscall(nr, a, b, ...)` takes 1 to 7
@@ -10063,7 +10625,10 @@ bytes alive after the last one, 2 the next goal, 3 bytes mapped, 4 given
 back to the kernel, 5 in use, 6 free, 7 handed out, 8 and 9 the total
 and the last pause in nanoseconds, 14 the workers that marked the last
 cycle, 15 how many may mark one, and 16, 17 and 18 the last cycle's
-stop, mark and sweep in nanoseconds. The marking is shared: the threads
+stop, mark and sweep in nanoseconds. Scheduler observations 20, 21 and
+22 report allocated M slots (including initial not-yet-started slots),
+syscall Ms whose P was retaken, and Ps. They work with GC off and are
+live observations, not one atomic snapshot. The marking is shared: the threads
 the cycle stopped and the idle ones take the roots in turn and give
 each other what they still have to scan, at most 16 of them, since
 past that waking them costs more than they mark; `PASLANG_GCWORKERS=n`
@@ -10284,6 +10849,11 @@ loop that calls nothing is reached at its next routine entry or loop
 head, as the monitor reaches it (§18). A stopped routine holds whatever
 locks it holds. The serving routine is not one the program waits for
 when its main routine ends.
+
+Frame inspection and `next` remain valid when a pasroutine's stack grows
+or moves under GC verification. Saved frames are stack-relative, and the
+server waits for the routine to park before reading its variables. The
+same debugger guard excludes resume while inspecting caller frames.
 
 `testdata/debug1.paslang` debugs itself under `make check`, on both
 machines: its main routine connects to its own socket and drives the
@@ -10573,7 +11143,44 @@ the commands on standard input, under `--debug-mode` and under
   implementation: a `const` after a routine is seen by the routines
   below it.
 - No `Text`, no `file`, no `file of`. No C foreign function interface.
+- SysUtils file buffers are typed, bounded `TBytes`, not untyped memory
+  whose extent cannot be checked. Whole-file reads require a byte budget;
+  excess is an explicit error, never silent truncation. DOS file-sharing
+  flags and Windows attribute mutation are omitted; use owned handles,
+  explicit synchronization and Linux permissions. Positional writes on
+  append handles are rejected to avoid Linux's ignored offset.
+- Linux paths have only `/` as separator, unlike FPC's Unix backslash
+  convention. `followLink=False` queries the link itself: a dangling
+  symlink is not a directory, unlike FPC's fallback. Search cursors omit
+  dot/parent entries; explicit directory-path walking has no inherited
+  depth/string limit. Lexical expansion/cleaning is not symlink resolution.
+- SysUtils system errors are explicit values; compatibility last-error
+  storage belongs to a G, not Linux thread-local errno. Descriptions are
+  deterministic English, not a global C locale. Raw system calls return
+  negative errno without changing that slot. `RaiseLastOSError(0)` still
+  raises, with the explicit `success` description; conditional raising
+  uses `TSysError.RaiseError`, whose zero code does nothing.
+- SysUtils process arguments are arrays, not an ambiguously parsed
+  command-line string. Spawn errors are not confused with exit 127.
+  No implicit PATH search, arbitrary handle inheritance or mutable
+  global environment callbacks/setters are offered; use explicit
+  `TProcessOptions` and immutable `TEnvironment` values.
+- Temporary names use exclusive kernel-backed creation, not historical
+  predictable name counters. There is no obsolete `/dev/urandom`
+  fallback on the supported modern Linux floor. User paths use XDG's
+  relative-root fallback (unlike Go's error for a relative XDG root),
+  without FPC's silent temporary-HOME fallback or mutable vendor hooks.
+  OS identity is the Linux kernel/compiled target, not obsolete Windows
+  release/service-pack enumerations or a guessed distribution version.
 - No `Random`.
+- SysUtils never scans sentinel-only text pointers. Typed, bounded byte
+  slices replace the historical PChar functions; implicit truncation,
+  `StrAlloc`/`StrNew`/`StrDispose` and duplicate raw allocation APIs are
+  omitted. `PChar(string)` owns its complete NUL-terminated snapshot;
+  `%s` accepts strings/Char, not raw pointers. Encodings are immutable,
+  strict and explicit, not mutable process-locale singleton objects.
+  Boolean default text reads are pure; mutable compatibility tables and
+  default settings are process-wide, not local to a pasroutine.
 - A static array does not go into an `array of T` parameter, `var`,
   `const` or plain: pass `a[Low(a)..High(a)]`, a slice that shares its
   elements. `var a: array of T` passes a slice by reference, so a
@@ -10652,6 +11259,15 @@ the commands on standard input, under `--debug-mode` and under
   n whatever its range, so `set of 60..140` takes 32 bytes; a list in
   brackets may mix a constant and an integer variable (`[60, n]`),
   which Free Pascal refuses as a type conflict.
+- Currency preserves Pascal's useful signed ten-thousandths representation,
+  not historical unchecked overflow or binary intermediates. Decimal input
+  and wide multiplication/division round once, nearest with ties to even;
+  overflow and division by zero raise typed per-G core faults. Typed binary
+  floats require explicit conversion. `CurrToStr` preserves all four places
+  where needed, including both signed endpoints. Independent rational/IEEE
+  oracles specify these results, not FPC's floating-point approximation or
+  overflow behavior. The bounded `TFloatRec` retains its explicit 18-digit
+  compatibility capacity; exact Currency string formatters have no such cap.
 - SysUtils' dates and times (P131) follow Free Pascal 3.3.1's sources
   where they differ from its 3.2.2: 23:59:60, a leap second, is a time
   (the next midnight); an interval before 0 is written with its sign,
@@ -10834,7 +11450,7 @@ its place:
 - the predefined types and their pointers: `Byte UInt8 Int8 ShortInt
   Word UInt16 Int16 SmallInt UInt32 LongWord DWord Int32 Int64 LongInt
   SizeInt NativeInt PtrInt Cardinal QWord UInt64 Rune Char AnsiChar Real
-  Double Extended Single Quad Pointer PChar` and `PByte PUInt8 PInt8 PShortInt
+  Double Extended Single Quad Currency Pointer PChar` and `PByte PUInt8 PInt8 PShortInt
   PWord PUInt16 PInt16 PSmallInt PDWord PLongWord PUInt32 PInt32
   PInteger PInt64 PSingle PDouble PQuad PBoolean PPointer`;
 - what the core units export (§15), predefined in every program and
@@ -10854,8 +11470,10 @@ method, a property or an enumeration member of one of these names is a
 compile error that names it, at the name: `Length is a reserved word,
 not a name at 5:3`. A unit's `.pi` is not checked for these names when
 it loads. The compiler loads only a `.pi` of the format it writes,
-`PASLANGI15` since 1.1.4, and refuses an older one: `build/geometry.pi
-was compiled by a paslang older than 1.1.4; compile geometry again`.
+`PASLANGI25`, and refuses an older one with the minimum compiler needed to
+rebuild it. Currency adds builtin type id 17; scoped members, generic
+origin/argument identity and every exported alias remain recorded. All
+installed libraries must be rebuilt when this format changes.
 
 `safe` before `program`, `unit`, `procedure`, `function`,
 `constructor` or `destructor` (a method's declaration in its class

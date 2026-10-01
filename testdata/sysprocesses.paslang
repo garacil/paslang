@@ -1,0 +1,138 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+  GPL version 3 or later; see COPYING. No warranty. }
+program sysprocesses;
+uses sysutils, paslinux;
+const Workers = 64;
+var root, executable, cwd: string;
+  joined: waitgroup; ready, releasePipe: array[0..1] of Int32;
+  baseHandle, capture, i, count, beforeCount: Integer;
+  options: TProcessOptions; outcome: TProcessResult; error: TSysError;
+  bytes: TBytes;
+
+procedure Require(OK: Boolean; Code: Integer);
+begin
+  if not OK then begin WriteLn('process assertion ', Code, ', system ', error.Code); Halt(Code) end;
+end;
+
+function DescriptorCount: Integer;
+var reader: TDirectoryReader; name: string; localError: TSysError;
+begin
+  Result := 0;
+  Require(TryOpenDirectoryAt(CurrentDirectoryHandle, '/proc/self/fd', reader, localError), 60);
+  try
+    while reader.Next(name, localError) do Inc(Result);
+    Require(localError.Code = 0, 61);
+  finally reader.Free; end;
+end;
+
+procedure Reaped(const ResultValue: TProcessResult);
+var status: Int32;
+begin
+  Require(OsWait(ResultValue.ProcessId, Integer(@status), 1, 0) = -10, 62);
+end;
+
+procedure WaitChild(Index: Integer);
+var localOptions: TProcessOptions; localOutcome: TProcessResult; localError: TSysError;
+begin
+  localOptions := TProcessOptions.Defaults;
+  localOptions.StandardHandles[0] := releasePipe[0];
+  localOptions.StandardHandles[1] := ready[1];
+  SetLastOSError(Index + 1);
+  Require(TryExecuteProcess('/bin/sh', ['-c', 'printf .; exec /bin/dd bs=1 count=1 status=none > /dev/null'],
+    localOptions, localOutcome, localError), 20);
+  Require(localOutcome.Succeeded, 21);
+  Require(GetLastOSError = Index + 1, 22);
+  Reaped(localOutcome);
+  joined.Done;
+end;
+
+begin
+  root := ParamStr(1);
+  options := TProcessOptions.Defaults;
+  Require(TryExecuteProcess('/bin/sh', ['-c', 'exit 127'], options, outcome, error), 2);
+  Require(outcome.Exited and (outcome.ExitCode = 127) and not outcome.Succeeded, 3);
+  Reaped(outcome);
+  Require(ExecuteProcess('/bin/sh', ['-c', 'exit 17']) = 17, 4);
+  Require(not TryExecuteProcess(root + '/does-not-exist', [], options, outcome, error), 5);
+  Require((error.Code = 2) and (error.Operation = 'execute'), 6);
+  Reaped(outcome);
+  executable := root + '/not-executable';
+  bytes := BytesOf('ordinary file');
+  Require(TryWriteFileAt(CurrentDirectoryHandle, executable, bytes, 384, error), 7);
+  Require(not TryExecuteProcess(executable, [], options, outcome, error), 8);
+  Require(error.Code = 13, 9);
+  Reaped(outcome);
+  Require(not TryExecuteProcess('/bin/sh'#0, [], options, outcome, error) and (error.Code = 22), 10);
+  Require(not TryExecuteProcess('/bin/sh', ['a'#0'b'], options, outcome, error) and (error.Code = 22), 11);
+  options.TimeoutMs := -1;
+  Require(not TryExecuteProcess('/bin/sh', [], options, outcome, error) and (error.Code = 22), 12);
+  options := TProcessOptions.Defaults;
+  options.StandardHandles[1] := 9223372036854775807;
+  Require(not TryExecuteProcess('/bin/sh', [], options, outcome, error) and (error.Code = 9), 13);
+  options := TProcessOptions.Defaults;
+  Require(TryExecuteProcess('/bin/sh', ['-c', 'kill -TERM $$'], options, outcome, error), 14);
+  Require(not outcome.Exited and (outcome.Signal = 15) and not outcome.Succeeded, 15);
+  Reaped(outcome);
+  cwd := GetCurrentDir;
+  Require(TryOpenFileAt(CurrentDirectoryHandle, root, ODirectory, 0, baseHandle, error), 16);
+  capture := FileCreate(root + '/capture', 384);
+  Require(capture >= 0, 17);
+  options.DirectoryHandle := baseHandle;
+  options.InheritEnvironment := False;
+  options.Environment := TEnvironment.Create(['CHILD_ONLY=old', 'CHILD_ONLY=ñ value', 'EMPTY=']);
+  options.StandardHandles[1] := capture;
+  Require(TryExecuteProcess('/bin/sh', ['-c', 'printf "%s\n" "$1" "$2" "$CHILD_ONLY" "$PWD"; test "${EMPTY+x}" = x; test -z "${PASLANG_PARENT_ONLY+x}"',
+    'child', 'a b "quoted"', '$(do not execute)'], options, outcome, error), 18);
+  Require(outcome.Succeeded and (GetCurrentDir = cwd), 19);
+  bytes := GetFileContents(capture, 0);
+  Require(Length(bytes) = 0, 63);
+  Require(FileSeek(capture, 0, fsFromBeginning) = 0, 64);
+  bytes := GetFileContents(capture, 4096);
+  Require(StringOf(bytes) = 'a b "quoted"'#10'$(do not execute)'#10'ñ value'#10 + root + #10, 65);
+  FileClose(capture); FileClose(baseHandle);
+  { Each reader consumes exactly one byte, never competing for pieces
+    of a line. Descriptors stay owned until join and close on exec. }
+  if Amd64 then count := 293 else count := 59;
+  Require(Syscall(count, Integer(@releasePipe[0]), 524288) = 0, 23);
+  Require(Syscall(count, Integer(@ready[0]), 524288) = 0, 24);
+  joined.Add(Workers);
+  for i := 0 to Workers - 1 do pas WaitChild(i);
+  SetLength(bytes, Workers);
+  i := 0;
+  while i < Workers do
+  begin
+    Require(TryFileRead(ready[0], bytes, i, Workers - i, count, error), 25);
+    Require(count > 0, 26);
+    Inc(i, count);
+  end;
+  { Every child has exec'd and is blocked. This G must still run. }
+  GcCollect;
+  for i := 1 to Workers do
+  begin
+    bytes := BytesOf('r');
+    Require(TryFileWrite(releasePipe[1], bytes, 0, Length(bytes), count, error), 27);
+    Require(count = Length(bytes), 28);
+  end;
+  joined.Wait;
+  FileClose(ready[0]); FileClose(ready[1]);
+  FileClose(releasePipe[0]); FileClose(releasePipe[1]);
+  beforeCount := DescriptorCount;
+  for i := 1 to 32 do
+  begin
+    options := TProcessOptions.Defaults;
+    options.TimeoutMs := 1;
+    Require(not TryExecuteProcess('/bin/sleep', ['10'], options, outcome, error), 29);
+    Require((error.Code = 110) and outcome.TimedOut and (outcome.Signal = 9), 30);
+    Reaped(outcome);
+    options.TimeoutMs := 5;
+    if TryExecuteProcess('/bin/true', [], options, outcome, error) then Require(outcome.Succeeded, 31)
+    else Require((error.Code = 110) and outcome.TimedOut, 32);
+    Reaped(outcome);
+    Require(not TryExecuteProcess(executable, [], options, outcome, error) and (error.Code = 13), 33);
+    Reaped(outcome);
+  end;
+  Require(DescriptorCount = beforeCount, 34);
+  WriteLn('literal arguments, explicit environment/cwd, spawn vs exit 127');
+  WriteLn('parked child waits ', Workers, ', signals, deadlines and no leaked handles/zombies');
+end.

@@ -4,7 +4,7 @@ paslang is a **new Pascal** whose execution model is Go’s: thousands of
 lightweight threads (G) multiplexed on a few OS threads (M), with a
 logical processor (P) as the right to run user code.
 
-The goal is **everything Pascal allows**, running on **Go’s technology**:
+The goal is **the useful richness of Pascal**, running on **Go’s technology**:
 G/M/P, `morestack`, park instead of block, channels. We implement Go’s
 engine **under Pascal**, not a toy subset forever.
 
@@ -77,11 +77,16 @@ Take from that reference: spellings, units, nested procedures, records,
 classes, generics, sets, structured statements. Leave behind: modes
 soup (`tp`, `macpas`), 16/32-bit `Integer`, default ShortString(255)
 and `string[n]` (a syntax error in paslang), `file of` as the I/O model,
-overlays, far pointers, real-48, `absolute`, COM, `threadvar`, and
+platform-dependent memory tricks, far pointers, real-48, COM, `threadvar`, and
 anything that assumes a 4 MiB OS thread stack. `published` was taken
 when it was needed (P21): a class's properties outside a `private` or
 `protected` section whose accessor is a field get an RTTI table that
 `GetPropInt`, `SetPropStr`, `CallProp` and their kin read by name.
+Typed `absolute` aliases and explicit byte views retain useful low-level
+control with documented bounds; they do not revive unbounded foreign-string
+scans. SysUtils' API inventory records what is retained, replaced or omitted
+and why. Checked exact Currency is a decimal type, not an emulation of
+historical floating-point or overflow defects.
 
 Our defaults stay the modern ABI in [TYPES.md](TYPES.md): unbounded
 UTF-8 `string`, 64-bit `Integer`, slices. Compatible *as Pascal*, not
@@ -142,6 +147,22 @@ If a builtin cannot honour G/M/P, it does not ship.
   per `pas`.
 - Wait = event: channel, timer, epoll. Stdlib `read`/`connect` go
   through netpoll so an M in a real syscall **drops its P**.
+
+This is a universal library contract, not an opt-in SysUtils feature:
+every language construct and unit must work from a pasroutine. Pollable
+I/O parks G; a necessarily blocking kernel call must release scheduler
+capacity so another M can execute work for its P. Marking a syscall as
+safe for GC alone does not meet this contract, and `O_NONBLOCK` does not
+make disk or metadata calls asynchronous. The runtime owns this mechanism;
+units do not create competing schedulers.
+
+Errors and exceptions belong to G or explicit return values. Shared
+initialization and caches require synchronization; mutable buffers,
+builders and file positions require documented ownership. Linux's cwd
+and environment are process-wide, so modern APIs take explicit base
+paths, environments and options. Verification must saturate available
+workers and still demonstrate progress, GC safety and cleanup on both
+architectures, not merely pass a two-routine test on a many-core host.
 
 Panic / `try`/`except` state lives **on the G**, not in a pthread threadvar:
 the try records (G+224) and the object a raise carries (G+272, 1.1.3).

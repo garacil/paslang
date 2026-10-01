@@ -135,6 +135,30 @@ of an element reads the size of the type it has there
   width; maps and channels hold the value in a normalized 8-byte word.
   `examples/narrow.paslang` is the manual's walk through these rules.
 
+## Exact four-place decimal Currency
+
+`Currency` is builtin id 17, an eight-byte signed count of ten-thousandths,
+not a binary floating-point alias. Its range is
+−922337203685477.5808..922337203685477.5807; alignment is 8 and zero is the
+default. It is a scalar with no GC pointer words, including inside records,
+arrays, channels, maps and interfaces of separately compiled units.
+`PASLANGI25` distinguishes it from ordinary integers and records its type
+in constants, defaults, fields, parameters and results.
+
+The exact decimal input and wide multiplication/division kernels round once,
+nearest with ties to even. All arithmetic and whole-integer conversions
+check overflow; division by zero and nonfinite input are typed core faults,
+`ECurrencyError`, owned by the current G. Typed binary floats require explicit
+`Currency(x)`/`Double(x)`/`Quad(x)` conversions. It is not an ordinal:
+`Trunc`/`Round` choose a numeric integer conversion, while `as Int64` is an
+explicit raw-byte view. SysUtils' scaled-interchange functions avoid unsafe
+views in ordinary programs.
+
+The variadic kind is `vtCurrency` (12), with the scaled value inline at
+`TVarRec.VCurrency`, offset 8. Native debug tables use decimal code 11;
+DWARF uses `DW_ATE_signed_fixed`, eight bytes, decimal scale −4 and digit
+count 19. See the manual's Currency section and `examples/money.paslang`.
+
 ## Real numbers
 
 `Real`, `Double` and `Extended` are one type: IEEE binary64, 8 bytes (`Extended` since 1.1.20, P145, as Free Pascal has it on arm64 and Win64). `Single` is
@@ -404,6 +428,17 @@ are worked out. The callee cannot keep it (MANUAL §5).
   unit's compiled interface without changing the record's field
   offsets or GC descriptor (`testdata/recmeth.paslang`,
   `testdata/units/recu.paslang`).
+- A record's `class var` is shared storage, not an instance field;
+  `class property` accesses that storage or a static accessor. Class
+  constructors run once before unit initialization and class destructors
+  run in reverse declaration order at shutdown (`testdata/recstatic.paslang`).
+- `const` and `type` sections inside a record, class or helper introduce
+  scoped names, not fields. `TOuter.TInner` preserves lexical ownership
+  and visibility, including across compiled units. A type alias exports
+  another binding to the same type, not a new nominal identity. Generic
+  instances are identified by their originating declaration and actual
+  argument type, never by a generated spelling (`testdata/nestednames.paslang`,
+  `testdata/units/genericprobe.paslang`, `testdata/units/aliasuse.paslang`).
 - `operator` defines `+ - * / div mod = <> < <= > >=` as a function.
   Integer, string, and set operations stay builtin when no operator is
   declared. A record without one is an error. `testdata/opadd.paslang`,

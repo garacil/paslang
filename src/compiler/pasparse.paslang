@@ -114,6 +114,8 @@ type
     FRecMembers: Boolean;  { a record's fields stop where its members begin (P165) }
     FRecVis: Byte;         { the visibility of the record's fields being read (P165) }
     FRecSelf: LongInt;     { the record being declared, which no field of it may be (P165) }
+    FMemberScope: LongInt;  { named type whose declarations or method head are being read (P169) }
+    FMemberVis: Byte;
     FHelperTyp: LongInt;      { the helper whose method is being read (P127), 0 outside one }
     FConstScope, FTypeScope, FProcScope: SizeInt;  { where the routine being read begins its constants, type names and nested routines in the tables (P137) }
     FScopeTypes: TStrArray;   { the type names the routine being read declares (P137) }
@@ -231,6 +233,18 @@ type
     function FreeStmt(X: PExpr; ALine: LongInt): PStmt;
     procedure AddConst(const AName: string; V: Int64; Typ: LongInt);
     procedure AddConstEnt(const AName: string; V: Int64; Typ: LongInt; const S: string);
+    function MemberContext: LongInt;
+    function ScopedIndex(T: LongInt; const N: string; out Owner: LongInt): SizeInt;
+    function ContextIndex(const N: string; out Owner: LongInt): SizeInt;
+    procedure ScopedVis(Owner: LongInt; I: SizeInt);
+    function DeclMemberName(const N: string): string;
+    procedure AddScoped(const Full: string; T: LongInt; Kind: Byte; const Ref: string);
+    procedure ParseMemberSection(T: LongInt; Vis: Byte; const Members: TTypeDef);
+    procedure CheckScopeMembers(T: LongInt; const Members: TTypeDef);
+    function ScopedValue(T: LongInt; const N: string; out E: PExpr): Boolean;
+    function ConstRefIndex(const N: string): SizeInt;
+    function ConstExpr(I: SizeInt): PExpr;
+    function ReadTypePath: string;
     procedure ParseConstValue(out V: Int64; out T: LongInt; out S: string);
     procedure ParseTypedInit(T, Off: LongInt; var Img: string; var D: TVarDecl);
     procedure PutWord(var Img: string; Off, Size: LongInt; V: Int64);
@@ -531,6 +545,7 @@ type
     function MapPlaceRoot(E: PExpr): PExpr;
     function MapPutPlace(E: PExpr): PExpr;
     function MapOpAssign(Place: PExpr; const Op: string; R: PExpr): PStmt;
+    function PlaceOpAssign(Place: PExpr; const Op: string; R: PExpr): PStmt;
     function HoistMapIn(St: PStmt): PStmt;
     procedure CheckForInMap(MT: LongInt; const KName, VName: string);
     procedure CheckTryGetVar(M, V: PExpr);
@@ -559,6 +574,10 @@ type
     function FindOp(Op: TBinOp; L, R: LongInt; out Sym: string;
       out Ret: LongInt): Boolean;
     function ApplyOp(Op: TBinOp; L, R: PExpr): PExpr;
+    function CurrRaw(E: PExpr): PExpr;
+    function CurrOf(E: PExpr): PExpr;
+    function CurrCall(const Name: string; A, B: PExpr; Ret: LongInt): PExpr;
+    function CurrBin(Op: TBinOp; L, R: PExpr): PExpr;
     procedure ParseOperator;
     function ParseInherited: PExpr;
     function ParseExpr: PExpr;
@@ -693,6 +712,9 @@ begin
   FTypes[TyV256].Name := 'V256';
   FTypes[TyV256].Kind := tykRecord;
   FTypes[TyV256].Size := 32;
+  FTypes[TyCurrency].Name := 'Currency';
+  FTypes[TyCurrency].Kind := tykCurrency;
+  FTypes[TyCurrency].Size := 8;
 end;
 
 { A narrow integer (P99): its own id, its range and its width (1.0.91;
@@ -972,6 +994,13 @@ begin
   end;
   if ByRef then
     Exit;
+  if TypeOf(T).Kind = tykCurrency then
+  begin
+    if IntOperand(E) and not IsCharT(E^.Typ) then Result := 120
+    else if UntypedReal(E) then Result := 4;
+    Exit;
+  end;
+  if TypeOf(E^.Typ).Kind = tykCurrency then Exit;
   Result := ConvCost(E, T);
   if Result >= 0 then
     Exit;
@@ -1220,6 +1249,8 @@ begin
     Die('a real does not go into ' + Into + ': Trunc or Round says how' + HerePos);
   if k = tykQuad then
     Die('a Quad does not go into ' + Into + ': Trunc or Round says how' + HerePos);
+  if k = tykCurrency then
+    Die('a Currency does not go into ' + Into + ': Trunc or Round says how' + HerePos);
 end;
 
 { A real as a condition (1.0.136): if r and while r compared its bits
@@ -1231,7 +1262,7 @@ begin
   if E = nil then
     Exit;
   k := TypeOf(E^.Typ).Kind;
-  if (k = tykReal) or (k = tykQuad) then
+  if (k = tykReal) or (k = tykQuad) or (k = tykCurrency) then
     Die('a real does not go into Boolean: compare it' + HerePos);
 end;
 
@@ -1545,7 +1576,7 @@ begin
     Exit;
   { A real becomes an integer through Trunc or Round; its bits are seen
     by a view. UInt64(d) and Byte(d) relabelled the bits (1.0.119). }
-  if TypeOf(E^.Typ).Kind = tykReal then
+  if (TypeOf(E^.Typ).Kind = tykReal) or (TypeOf(E^.Typ).Kind = tykCurrency) then
     Die('a real becomes ' + TypName(T) + ' through Trunc or Round; x as ' + TypName(T) +
       ' sees its bits' + HerePos);
   if TypeOf(E^.Typ).Kind = tykBoolean then
@@ -1685,7 +1716,11 @@ var
 begin
   td := TypeOf(Id);
   t := Id;
-  if OrdBounds(Id, blo, bhi) then
+  if td.Kind = tykCurrency then
+  begin
+    if Hi then v := High(Int64) else v := Low(Int64);
+  end
+  else if OrdBounds(Id, blo, bhi) then
   begin
     if Hi then
       v := bhi
@@ -1711,6 +1746,7 @@ begin
   end;
   Result := NewInt(v);
   Result^.Typ := t;
+  if td.Kind = tykCurrency then Result^.Flags := 0;
 end;
 
 { The atomics work on a whole word (lock xadd, cmpxchg, ldaxr): through a
@@ -1970,12 +2006,264 @@ begin
     Result := TypeOf(Id).Size;
 end;
 
+{ Go's current go/types/scope.go keeps ownership separate from the
+  type denoted by an alias. Pascal's member namespaces do the same:
+  TOuter.TNumber belongs to TOuter even when it denotes Integer. }
+function TParser.MemberContext: LongInt;
+begin
+  Result := FMemberScope;
+  if Result <> 0 then Exit;
+  if FHelperTyp <> 0 then Result := FHelperTyp
+  else Result := FClassTyp;
+end;
+
+function TParser.ScopedIndex(T: LongInt; const N: string; out Owner: LongInt): SizeInt;
+var
+  h, cur: LongInt;
+  i: SizeInt;
+begin
+  Result := -1;
+  Owner := 0;
+  if T <= 0 then Exit;
+  { A helper's own names hide those of its target, as its methods do. }
+  if FTypes[T].Kind = tykHelper then h := T
+  else h := HelperFor(T);
+  while h > 0 do
+  begin
+    for i := 0 to High(FTypes[h].Nested) do
+      if SameId(FTypes[h].Nested[i].Name, N) then
+      begin Owner := h; Result := i; Exit end;
+    h := FTypes[h].Parent;
+  end;
+  cur := T;
+  if FTypes[cur].Kind = tykHelper then cur := FTypes[cur].Elem;
+  while cur > 0 do
+  begin
+    for i := 0 to High(FTypes[cur].Nested) do
+      if SameId(FTypes[cur].Nested[i].Name, N) then
+      begin Owner := cur; Result := i; Exit end;
+    if FTypes[cur].Kind <> tykClass then Break;
+    cur := FTypes[cur].Parent;
+  end;
+end;
+
+function TParser.ContextIndex(const N: string; out Owner: LongInt): SizeInt;
+var
+  cur: LongInt;
+begin
+  cur := MemberContext;
+  Result := -1;
+  Owner := 0;
+  while cur > 0 do
+  begin
+    Result := ScopedIndex(cur, N, Owner);
+    if Result >= 0 then Exit;
+    cur := FTypes[cur].ScopeOwner;
+  end;
+end;
+
+procedure TParser.ScopedVis(Owner: LongInt; I: SizeInt);
+var
+  cur: LongInt;
+  v: Byte;
+  ok: Boolean;
+  what: string;
+begin
+  v := FTypes[Owner].Nested[I].Vis;
+  if v = VisPublic then Exit;
+  ok := False;
+  cur := MemberContext;
+  while cur > 0 do
+  begin
+    if SameTyp(cur, Owner) then ok := True;
+    if (v = VisProtected) or (v = VisStrictProtected) then
+      if (FTypes[cur].Kind = tykClass) and ClassUnder(cur, Owner) then ok := True;
+    cur := FTypes[cur].ScopeOwner;
+  end;
+  if ((v = VisPrivate) or (v = VisProtected)) and not FTypes[Owner].Imported then ok := True;
+  if v = VisPrivate then what := 'private'
+  else if v = VisProtected then what := 'protected'
+  else if v = VisStrictProtected then what := 'strict protected'
+  else what := 'strict private';
+  if not ok then
+    Die(FTypes[Owner].Nested[I].Name + ' is ' + what + ' to ' +
+      FTypes[Owner].Name + HerePos);
+end;
+
+function TParser.DeclMemberName(const N: string): string;
+begin
+  Result := N;
+  if FMemberScope > 0 then Result := FTypes[FMemberScope].Name + '.' + N;
+end;
+
+procedure TParser.AddScoped(const Full: string; T: LongInt; Kind: Byte; const Ref: string);
+var
+  prefix, leaf: string;
+  i, n: SizeInt;
+begin
+  if FMemberScope = 0 then Exit;
+  prefix := FTypes[FMemberScope].Name + '.';
+  if not SameId(Copy(Full, 1, Length(prefix)), prefix) then Exit;
+  leaf := Copy(Full, Length(prefix) + 1, Length(Full) - Length(prefix));
+  if Pos('.', leaf) > 0 then Exit;
+  for i := 0 to High(FTypes[FMemberScope].Nested) do
+    if SameId(FTypes[FMemberScope].Nested[i].Name, leaf) then
+    begin
+      { A forward class/interface is completed with the same identity. }
+      if (Kind = 0) and (FTypes[FMemberScope].Nested[i].Kind = 0) and
+        (FTypes[FMemberScope].Nested[i].Typ = T) then Exit;
+      Die('duplicate member ' + leaf + ' of ' + FTypes[FMemberScope].Name + DupAt);
+    end;
+  n := Length(FTypes[FMemberScope].Nested);
+  SetLength(FTypes[FMemberScope].Nested, n + 1);
+  FTypes[FMemberScope].Nested[n].Name := leaf;
+  FTypes[FMemberScope].Nested[n].Typ := T;
+  FTypes[FMemberScope].Nested[n].Kind := Kind;
+  FTypes[FMemberScope].Nested[n].Vis := FMemberVis;
+  FTypes[FMemberScope].Nested[n].Ref := Ref;
+end;
+
+procedure TParser.ParseMemberSection(T: LongInt; Vis: Byte; const Members: TTypeDef);
+var
+  save: Byte;
+begin
+  save := FMemberVis;
+  FMemberVis := Vis;
+  if FTok.Kind = tkConst then ParseConstSection else ParseTypeSection;
+  CheckScopeMembers(T, Members);
+  FMemberVis := save;
+end;
+
+{ Check both declaration orders against the same namespace. A later
+  field or method must not silently hide an earlier type or constant. }
+procedure TParser.CheckScopeMembers(T: LongInt; const Members: TTypeDef);
+var
+  i, j: SizeInt;
+  nm: string;
+begin
+  for i := 0 to High(FTypes[T].Nested) do
+  begin
+    nm := FTypes[T].Nested[i].Name;
+    for j := 0 to High(Members.Fields) do
+      if SameId(Members.Fields[j].Name, nm) then Die(nm + ' is a field already' + HerePos);
+    for j := 0 to High(Members.CVars) do
+      if SameId(Members.CVars[j].Name, nm) then Die(nm + ' is a class variable already' + HerePos);
+    for j := 0 to High(Members.Meths) do
+      if SameId(Members.Meths[j].Name, nm) then Die(nm + ' is a method already' + HerePos);
+    for j := 0 to High(Members.Props) do
+      if SameId(Members.Props[j].Name, nm) then Die(nm + ' is a property already' + HerePos);
+  end;
+end;
+
+function TParser.ConstRefIndex(const N: string): SizeInt;
+var
+  own: string;
+begin
+  Result := High(FConsts);
+  own := N;
+  if FUnitName <> '' then
+    if SameId(Copy(N, 1, Length(FUnitName) + 1), FUnitName + '.') then
+      own := Copy(N, Length(FUnitName) + 2, Length(N) - Length(FUnitName) - 1);
+  while Result >= 0 do
+  begin
+    if SameId(FConsts[Result].Name, N) or SameId(FConsts[Result].Name, own) then Exit;
+    Dec(Result);
+  end;
+end;
+
+function TParser.ConstExpr(I: SizeInt): PExpr;
+begin
+  if IsWideSet(FConsts[I].Typ) then Result := SetFromImage(FConsts[I].Txt, FConsts[I].Typ)
+  else if FConsts[I].Typ = TyString then Result := NewStr(FConsts[I].Txt)
+  else if FConsts[I].Typ = TyReal then
+  begin
+    Result := NewReal(FConsts[I].Value);
+    Result^.Flags := 1;
+    Result^.Txt := FConsts[I].Txt;
+    if FConsts[I].HasQ then
+    begin
+      Result^.Flags := 3;
+      Result^.QLo := FConsts[I].QLo;
+      Result^.Hi := FConsts[I].QHi;
+    end;
+  end
+  else
+  begin
+    Result := NewInt(FConsts[I].Value);
+    Result^.Typ := FConsts[I].Typ;
+    Result^.Flags := 1;
+    if TypeOf(Result^.Typ).Kind = tykCurrency then Result^.Flags := 0;
+  end;
+end;
+
+function TParser.ScopedValue(T: LongInt; const N: string; out E: PExpr): Boolean;
+var
+  owner: LongInt;
+  i, ci: SizeInt;
+begin
+  Result := False;
+  E := nil;
+  i := ScopedIndex(T, N, owner);
+  if i < 0 then Exit;
+  if FTypes[owner].Nested[i].Kind = 0 then Exit;
+  ScopedVis(owner, i);
+  if FTypes[owner].Nested[i].Kind = 2 then
+    E := NewVar(FTypes[owner].Nested[i].Ref, FTypes[owner].Nested[i].Typ)
+  else
+  begin
+    ci := ConstRefIndex(FTypes[owner].Nested[i].Ref);
+    if ci < 0 then Die('missing member constant ' + FTypes[owner].Nested[i].Ref);
+    E := ConstExpr(ci);
+  end;
+  Result := True;
+end;
+
 function TParser.NamedType(const AName: string; out Id: LongInt): Boolean;
 var
   i: SizeInt;
+  owner: LongInt;
+  prefix, leaf: string;
 begin
   Result := False;
   Id := TyNone;
+  i := Length(AName);
+  while (i > 0) and (AName[i] <> '.') do Dec(i);
+  if i > 0 then
+  begin
+    prefix := Copy(AName, 1, i - 1);
+    leaf := Copy(AName, i + 1, Length(AName) - i);
+    if NamedType(prefix, owner) then
+    begin
+      i := ScopedIndex(owner, leaf, owner);
+      if (i >= 0) and (FTypes[owner].Nested[i].Kind = 0) then
+      begin
+        ScopedVis(owner, i);
+        Id := FTypes[owner].Nested[i].Typ;
+        Result := True;
+      end;
+      Exit;
+    end;
+  end
+  else if not HiddenAbove(AName, 0) then
+  begin
+    { A generic's temporary type parameter is its innermost binding,
+      even when an enclosing member type has the same spelling. }
+    for i := High(FTypeNames) downto 0 do
+      if SameId(FTypeNames[i].Name, AName) and
+        (FTypes[FTypeNames[i].Id].Kind = tykParam) then
+      begin Id := FTypeNames[i].Id; Result := True; Exit end;
+    i := ContextIndex(AName, owner);
+    if i >= 0 then
+    begin
+      if FTypes[owner].Nested[i].Kind = 0 then
+      begin
+        ScopedVis(owner, i);
+        Id := FTypes[owner].Nested[i].Typ;
+        Result := True;
+      end;
+      Exit;
+    end;
+  end;
   { the innermost first: a routine's type hides the program's (P137),
     and a deeper name of any kind the type (P158, P159) }
   for i := High(FTypeNames) downto 0 do
@@ -2048,6 +2336,11 @@ begin
   begin
     { IEEE binary32 (P101): it was binary64 under another name. }
     Id := TySingle;
+    Result := True;
+  end
+  else if SameId(AName, 'Currency') then
+  begin
+    Id := TyCurrency;
     Result := True;
   end
   else if SameId(AName, 'V128') then
@@ -2843,6 +3136,8 @@ begin
       kd := VrInteger
     else if k = tykQuad then
       kd := VrQuad
+    else if k = tykCurrency then
+      kd := VrCurrency
     else if k = tykReal then
     begin
       kd := VrExtended;
@@ -3064,7 +3359,10 @@ var
   count: Int64;
 begin
   for i := 0 to High(FTypes) do
-    if (FTypes[i].Kind = tykArray) and (FTypes[i].Elem = Elem) and
+    { An anonymous array must not acquire a named imported type merely
+      because its bounds match (P193). Go types/fmt.go likewise preserves
+      a named type's identity separately from an anonymous array shape. }
+    if (FTypes[i].Kind = tykArray) and (FTypes[i].Name = '') and (FTypes[i].Elem = Elem) and
       (FTypes[i].Lo = Lo) and (FTypes[i].Hi = Hi) and (FTypes[i].Elem2 = Idx) then
     begin
       Result := LongInt(i);
@@ -3712,7 +4010,8 @@ procedure TParser.ParseEnumType(const AName: string);
 var
   td: TTypeDef;
   id, n: LongInt;
-  ename: string;
+  ni: SizeInt;
+  ename, ref: string;
 begin
   Eat(tkLParen);
   td := Default(TTypeDef);
@@ -3731,6 +4030,17 @@ begin
     ename := FTok.Lexeme;
     FTok := FLex.Next;
     AddConst(ename, n, id);
+    { TEnum.Member is explicit even for an enumeration nested in a
+      record. Its textual name remains the leaf, not Outer.Member. }
+    ni := Length(FTypes[id].Nested);
+    SetLength(FTypes[id].Nested, ni + 1);
+    FTypes[id].Nested[ni].Name := ename;
+    FTypes[id].Nested[ni].Kind := 1;
+    FTypes[id].Nested[ni].Typ := id;
+    FTypes[id].Nested[ni].Vis := VisPublic;
+    ref := FConsts[High(FConsts)].Name;
+    if FUnitName <> '' then ref := FUnitName + '.' + ref;
+    FTypes[id].Nested[ni].Ref := ref;
     Inc(n);
     if FTok.Kind <> tkComma then
       Break;
@@ -3789,21 +4099,24 @@ end;
 function TParser.SpecType(GenId, Arg: LongInt): LongInt;
 var
   g, td: TTypeDef;
-  spec: string;
   i, n: SizeInt;
-  off, sz, t, found: LongInt;
+  off, sz, t: LongInt;
 begin
   g := TypeOf(GenId);
   if g.Kind <> tykGeneric then
     Die('not a generic type');
-  spec := g.Name + '_' + TypeOf(Arg).Name;
-  if NamedType(spec, found) then
-  begin
-    Result := found;
-    Exit;
-  end;
+  { Go's current go/types/instantiate.go keys instances by origin and
+    type arguments. A displayed name is neither a cache key nor a
+    declaration: units can declare different types of one spelling. }
+  for i := High(FTypes) downto 0 do
+    if (FTypes[i].SpecOrigin > 0) and SameTyp(FTypes[i].SpecOrigin, GenId) and
+      SameTyp(FTypes[i].SpecArg, Arg) then
+    begin Result := LongInt(i); Exit end;
   td := Default(TTypeDef);
   td.Kind := tykRecord;
+  td.Name := g.Name + '<' + TypeOf(Arg).Name + '>';
+  td.SpecOrigin := GenId;
+  td.SpecArg := Arg;
   td.Fields := nil;
   off := 0;
   for i := 0 to High(g.Fields) do
@@ -3821,7 +4134,12 @@ begin
   td.Size := RecEnd(td, off);
   if td.Size < 1 then
     td.Size := 1;
-  Result := AddNamedType(spec, td);
+  { Only a source alias names the instance. Never insert a synthetic
+    TCell_TItem into the enclosing namespace. }
+  n := Length(FTypes);
+  SetLength(FTypes, n + 1);
+  FTypes[n] := td;
+  Result := LongInt(n);
 end;
 
 function TParser.AddNamedType(const AName: string; const Td: TTypeDef): LongInt;
@@ -3848,6 +4166,13 @@ begin
   FTypeNames[m].Name := AName;
   FTypeNames[m].Id := LongInt(n);
   FTypeNames[m].Nest := FNest;
+  if FMemberScope > 0 then
+    if SameId(Copy(AName, 1, Length(FTypes[FMemberScope].Name) + 1),
+      FTypes[FMemberScope].Name + '.') then
+    begin
+      FTypes[n].ScopeOwner := FMemberScope;
+      AddScoped(AName, LongInt(n), 0, '');
+    end;
   ResolvePending(AName, LongInt(n));
   Result := LongInt(n);
 end;
@@ -3861,15 +4186,11 @@ begin
   { the innermost first: a routine's constant hides the program's (P137);
     a deeper name of any kind hides the constant (P158, P159), and the
     constants around it with it }
-  for i := High(FConsts) downto 0 do
-    if SameId(FConsts[i].Name, AName) then
-    begin
-      if HiddenAbove(AName, FConsts[i].Nest) then
-        Exit;
-      V := FConsts[i].Value;
-      Result := True;
-      Exit;
-    end;
+  i := ConstIdx(AName);
+  if i < 0 then Exit;
+  if HiddenAbove(AName, FConsts[i].Nest) then Exit;
+  V := FConsts[i].Value;
+  Result := True;
 end;
 
 function TParser.IsVarName(const AName: string): Boolean;
@@ -4165,6 +4486,16 @@ begin
   if E = nil then
     Exit;
   CheckTyped(E);
+  if TypeOf(Want).Kind = tykCurrency then
+  begin
+    if ((TypeOf(E^.Typ).Kind = tykReal) and not UntypedReal(E)) or IsQuadTyp(E^.Typ) then
+      Die('a real becomes Currency only through Currency(x)' + HerePos);
+    Result := CurrOf(E);
+    Exit;
+  end;
+  if (TypeOf(E^.Typ).Kind = tykCurrency) and (Want <> TyNone) and
+    (TypeOf(Want).Kind <> tykParam) and (TypeOf(Want).Kind <> tykGeneric) then
+    Die('a Currency needs an explicit conversion to ' + TypName(Want) + HerePos);
   if (Want > TyNone) and (TypeOf(Want).Kind = tykInterface) and
     (TypeOf(E^.Typ).Kind = tykClass) then
   begin
@@ -4481,6 +4812,12 @@ begin
   else if E^.Kind = ekInt then
   begin
     PasQFromInt(E^.Num, Lo, Hi);
+    if TypeOf(E^.Typ).Kind = tykCurrency then
+    begin
+      PasQFromInt(10000, bl, bh);
+      PasQDiv(Lo, Hi, bl, bh, al, ah);
+      Lo := al; Hi := ah;
+    end;
     Result := True;
   end
   else if (E^.Kind = ekUn) and (E^.Un = uoNeg) then
@@ -4547,6 +4884,12 @@ begin
   if (E = nil) or IsQuadTyp(E^.Typ) then
     Exit;
   k := TypeOf(E^.Typ).Kind;
+  if k = tykCurrency then
+  begin
+    Result := QCall('rtq_div', QCall('rtq_i2q', CurrRaw(E), nil, TyQuad),
+      QuadLit('10000'), TyQuad);
+    Exit;
+  end;
   { A constant, a literal or an expression of them alone, is folded now,
     in binary128 (1.0.115): 1.1 + 2.2 and a named 1/3 keep 113 bits. }
   if (UntypedReal(E) or (E^.Kind = ekInt)) and QFold(E, lo, hi) then
@@ -4673,6 +5016,10 @@ begin
   { the rotation words take a Quad's 128 bits (1.0.130) }
   if (E^.Name = 'rt_rotm') or (E^.Name = 'rt_funnelm') then
     Exit;
+  for i := 0 to High(E^.Args) do
+    if (E^.Args[i] <> nil) and (TypeOf(E^.Args[i]^.Typ).Kind = tykCurrency) then
+      Die(Copy(E^.Name, 4, Length(E^.Name) - 3) +
+        ' has no Currency form: write Double(x) for it' + HerePos);
   for i := 0 to High(E^.Args) do
     if (E^.Args[i] <> nil) and IsQuadTyp(E^.Args[i]^.Typ) then
       Die(Copy(E^.Name, 4, Length(E^.Name) - 3) + ' has no Quad form: write Double(x) for it' +
@@ -5033,6 +5380,8 @@ var
   cand: array of Boolean;
   ranks: array of LongInt;
 begin
+  cand := nil;
+  ranks := nil;
   Result := False;
   P := Default(TProcEnt);
   { the routines of the name a call sees, as in Free Pascal (P160): those
@@ -5207,7 +5556,24 @@ end;
 { The index of constant AName, the innermost, -1 when there is none
   (P137). }
 function TParser.ConstIdx(const AName: string): SizeInt;
+var
+  owner: LongInt;
+  i: SizeInt;
 begin
+  if (Pos('.', AName) = 0) and not HiddenAbove(AName, 0) then
+  begin
+    i := ContextIndex(AName, owner);
+    if i >= 0 then
+    begin
+      Result := -1;
+      if FTypes[owner].Nested[i].Kind = 1 then
+      begin
+        ScopedVis(owner, i);
+        Result := ConstRefIndex(FTypes[owner].Nested[i].Ref);
+      end;
+      Exit;
+    end;
+  end;
   Result := High(FConsts);
   while (Result >= 0) and not SameId(FConsts[Result].Name, AName) do
     Result := Result - 1;
@@ -5424,36 +5790,50 @@ function TParser.TypeAhead(out Id: LongInt): Boolean;
 var
   nm: string;
 begin
-  Result := False;
   Id := TyNone;
-  if (FTok.Kind = tkIdent) and IsUsedUnit(FTok.Lexeme) and (not IsVarName(FTok.Lexeme)) and
-    (FLex.NextSolid = '.') then
+  nm := ReadTypePath;
+  Result := NamedType(nm, Id);
+end;
+
+{ The longest token prefix that names a type, not its subsequent
+  method/property. Each component follows ownership, not a flat alias. }
+function TParser.ReadTypePath: string;
+var
+  dots, candidate: string;
+  i, start: SizeInt;
+  id: LongInt;
+begin
+  Result := FTok.Lexeme;
+  if IsVarName(Result) then Exit;
+  candidate := Result;
+  dots := FLex.PeekDots;
+  i := 1;
+  while i <= Length(dots) do
   begin
-    nm := FLex.PeekDotName;
-    Result := (nm <> '') and NamedType(ToLower(FTok.Lexeme) + '.' + nm, Id);
-    Exit;
+    start := i;
+    Inc(i);
+    while (i <= Length(dots)) and (dots[i] <> '.') do Inc(i);
+    candidate := candidate + Copy(dots, start, i - start);
+    if NamedType(candidate, id) then Result := candidate;
   end;
-  Result := NamedType(FTok.Lexeme, Id);
 end;
 
 { The type name from here as it is written, for a message: T or ua.T. }
 function TParser.AheadName: string;
 begin
-  Result := FTok.Lexeme;
-  if (FTok.Kind = tkIdent) and IsUsedUnit(FTok.Lexeme) and (not IsVarName(FTok.Lexeme)) and
-    (FLex.NextSolid = '.') then
-    Result := FTok.Lexeme + '.' + FLex.PeekDotName;
+  Result := ReadTypePath;
 end;
 
 { Past the type name TypeAhead saw: T, or ua.T. }
 procedure TParser.SkipTypeName;
+var
+  name: string;
+  i: SizeInt;
 begin
-  if (FTok.Kind = tkIdent) and IsUsedUnit(FTok.Lexeme) and (not IsVarName(FTok.Lexeme)) and
-    (FLex.NextSolid = '.') then
-  begin
-    FTok := FLex.Next;
-    FTok := FLex.Next;
-  end;
+  name := ReadTypePath;
+  for i := 1 to Length(name) do
+    if name[i] = '.' then
+    begin FTok := FLex.Next; Eat(tkDot) end;
   FTok := FLex.Next;
 end;
 
@@ -5693,7 +6073,8 @@ begin
       a[2] := ValArg(TyInteger, w);
     x := CoreProc('PasEnumName', a, TyString);
   end
-  else if (TypeOf(x^.Typ).Kind = tykReal) or IsQuadTyp(x^.Typ) then
+  else if (TypeOf(x^.Typ).Kind = tykReal) or IsQuadTyp(x^.Typ) or
+    (TypeOf(x^.Typ).Kind = tykCurrency) then
   begin
     if w = nil then
       w := NewInt(0);
@@ -5782,6 +6163,11 @@ begin
     asq^.E := CoreProc('PasValQuadLo', a, TyInteger);
     call := ViewOf(NewVar(hq^.Name, hqt), vt);
   end
+  else if k = tykCurrency then
+  begin
+    SetLength(a, 2); a[0] := src; a[1] := tc;
+    call := CoreProc('PasValCurrency', a, TyCurrency);
+  end
   else if k = tykReal then
   begin
     SetLength(a, 2);
@@ -5841,7 +6227,7 @@ end;
   Str writes and Val reads; T may be a subrange of one. }
 function TParser.EnumNames(T: LongInt): string;
 var
-  i: SizeInt;
+  i, leaf: SizeInt;
   v: Int64;
   found: Boolean;
 begin
@@ -5855,11 +6241,12 @@ begin
       if (not found) and (FConsts[i].Value = v) and ((FConsts[i].Typ = T) or
         SameTyp(FConsts[i].Typ, T)) then
       begin
-        { a unit's value a name of the program's hides is .Name (P158) }
-        if Copy(FConsts[i].Name, 1, 1) = '.' then
-          Result := Result + Copy(FConsts[i].Name, 2, Length(FConsts[i].Name) - 1) + #0
-        else
-          Result := Result + FConsts[i].Name + #0;
+        { Strip unit and member qualification, including a hidden
+          unit name's leading dot (P158). Str/Val use the leaf. }
+        leaf := Length(FConsts[i].Name);
+        while (leaf > 0) and (FConsts[i].Name[leaf] <> '.') do Dec(leaf);
+        Result := Result + Copy(FConsts[i].Name, leaf + 1,
+          Length(FConsts[i].Name) - leaf) + #0;
         found := True;
       end;
     if not found then
@@ -5890,6 +6277,7 @@ begin
   ml := FTok.Line;
   mc := FTok.Col;
   FTok := FLex.Next;
+  if ScopedValue(T, mname, Result) then Exit;
   if (HelperFor(T) = 0) or not HelperHas(HelperFor(T), mname) then
     Die('unknown member ' + mname + ' of ' + TypName(T) + ': no helper for it has one' +
       HerePos);
@@ -5933,12 +6321,16 @@ end;
 function TParser.WithIdx(const AName: string): SizeInt;
 var
   i: SizeInt;
-  t: LongInt;
+  t, owner: LongInt;
+  ni: SizeInt;
 begin
   for i := High(FWith) downto 0 do
   begin
     t := FWith[i]^.Typ;
-    if (RecFieldIdx(t, AName) >= 0) or ((HelperFor(t) <> 0) and HelperHas(HelperFor(t), AName)) then
+    ni := ScopedIndex(t, AName, owner);
+    if (RecFieldIdx(t, AName) >= 0) or
+      ((ni >= 0) and (FTypes[owner].Nested[ni].Kind <> 0)) or
+      ((HelperFor(t) <> 0) and HelperHas(HelperFor(t), AName)) then
     begin
       Result := i;
       Exit;
@@ -6123,7 +6515,7 @@ begin
     are the lexer's) }
   AddReserved('byte uint8 int8 shortint word uint16 int16 smallint uint32');
   AddReserved('longword dword int32 int64 longint sizeint nativeint ptrint');
-  AddReserved('cardinal qword uint64 rune char ansichar real double extended single quad');
+  AddReserved('cardinal qword uint64 rune char ansichar real double extended single quad currency');
   AddReserved('pointer pchar v128 v256 pbyte puint8 pint8 pshortint pword puint16');
   AddReserved('pint16 psmallint pdword plongword puint32 pint32 pinteger pint64');
   AddReserved('psingle pdouble pquad pboolean ppointer');
@@ -6274,7 +6666,7 @@ end;
 
 procedure TParser.AddConst(const AName: string; V: Int64; Typ: LongInt);
 begin
-  AddConstEnt(AName, V, Typ, '');
+  AddConstEnt(DeclMemberName(AName), V, Typ, '');
 end;
 
 procedure TParser.AddConstEnt(const AName: string; V: Int64; Typ: LongInt; const S: string);
@@ -6306,6 +6698,9 @@ begin
   FConsts[len].Typ := Typ;
   FConsts[len].Txt := S;
   FConsts[len].Nest := FNest;
+  if FUnitName <> '' then
+    AddScoped(AName, Typ, 1, FUnitName + '.' + AName)
+  else AddScoped(AName, Typ, 1, AName);
 end;
 
 { The value of an untyped constant: an integer, a real, a string (with
@@ -7019,7 +7414,7 @@ begin
       Die('integer constant at ' + at + ' near ' + near + ', which is not an integer');
     v := Ord(txt[1]);
   end
-  else if TypeOf(t).Kind = tykReal then
+  else if (TypeOf(t).Kind = tykReal) or (TypeOf(t).Kind = tykCurrency) or IsQuadTyp(t) then
     Die('integer constant at ' + at + ' near ' + near + ', which is not an integer');
   Result := v;
 end;
@@ -7049,7 +7444,7 @@ begin
     Result := Ord(txt[1]);
     T := TyChar;
   end
-  else if TypeOf(T).Kind = tykReal then
+  else if (TypeOf(T).Kind = tykReal) or (TypeOf(T).Kind = tykCurrency) or IsQuadTyp(T) then
     Die('integer constant at ' + at + ' near ' + near + ', which is not an integer');
 end;
 
@@ -7092,7 +7487,6 @@ end;
 
 function TParser.ParseType: LongInt;
 var
-  tname: string;
   id, elem, t: LongInt;
   lo, hi: Int64;
   k: TTokKind;
@@ -7278,13 +7672,13 @@ begin
   else if k = tkCaret then
   begin
     FTok := FLex.Next;
-    if (FTok.Kind = tkIdent) and (not NamedType(FTok.Lexeme, id)) and
+    if (FTok.Kind = tkIdent) and (not TypeAhead(id)) and
       not (IsUsedUnit(FTok.Lexeme) and (FLex.NextSolid = '.')) then
     begin
       if not FInTypes then
         Die('unknown type ' + FTok.Lexeme + ' at ' + IntToStr(FTok.Line) +
           ':' + IntToStr(FTok.Col));
-      t := ForwardPtr(FTok.Lexeme, IntToStr(FTok.Line) + ':' +
+      t := ForwardPtr(DeclMemberName(FTok.Lexeme), IntToStr(FTok.Line) + ':' +
         IntToStr(FTok.Col));
       FTok := FLex.Next;
     end
@@ -7383,9 +7777,9 @@ begin
     FTok := FLex.Next;
     if FTok.Kind <> tkIdent then
       Die('specialize name');
-    if not NamedType(FTok.Lexeme, id) then
-      Die('unknown type ' + FTok.Lexeme);
-    FTok := FLex.Next;
+    if not TypeAhead(id) then
+      Die('unknown type ' + AheadName);
+    SkipTypeName;
     Eat(tkLt);
     elem := Self.ParseType;
     Eat(tkGt);
@@ -7393,21 +7787,9 @@ begin
   end
   else if k = tkIdent then
   begin
-    { ua.TPoint, a type of a unit named by the unit (P138) }
-    if IsUsedUnit(FTok.Lexeme) and (FLex.NextSolid = '.') then
+    if TypeAhead(id) then
     begin
-      tname := ToLower(FTok.Lexeme);
-      FTok := FLex.Next;
-      Eat(tkDot);
-      if not NamedType(tname + '.' + FTok.Lexeme, id) then
-        Die('unknown type ' + FTok.Lexeme + ' of unit ' + tname + HerePos);
-      FTok := FLex.Next;
-      Result := id;
-      Exit;
-    end;
-    if NamedType(FTok.Lexeme, id) then
-    begin
-      FTok := FLex.Next;
+      SkipTypeName;
       if TypeOf(id).Kind = tykGeneric then
         Die('specialize required for ' + TypeOf(id).Name);
       t := id;
@@ -7634,6 +8016,7 @@ begin
   td.Meths := Members.Meths;
   td.Props := Members.Props;
   td.CVars := Members.CVars;
+  td.ScopeOwner := Rec;
   n := Length(FTypes);
   SetLength(FTypes, n + 1);
   FTypes[n] := td;
@@ -7714,7 +8097,8 @@ function TParser.RecMemberAhead: Boolean;
 begin
   Result := (FTok.Kind = tkProcedure) or (FTok.Kind = tkFunction) or
     (FTok.Kind = tkConstructor) or (FTok.Kind = tkDestructor) or (FTok.Kind = tkClass) or
-    (FTok.Kind = tkProperty) or (FTok.Kind = tkVar) or ((FTok.Kind = tkIdent) and (SameId(FTok.Lexeme, 'private') or
+    (FTok.Kind = tkProperty) or (FTok.Kind = tkVar) or (FTok.Kind = tkConst) or
+    (FTok.Kind = tkType) or ((FTok.Kind = tkIdent) and (SameId(FTok.Lexeme, 'private') or
     SameId(FTok.Lexeme, 'public') or SameId(FTok.Lexeme, 'protected') or
     SameId(FTok.Lexeme, 'published') or SameId(FTok.Lexeme, 'strict')));
 end;
@@ -7752,6 +8136,13 @@ var
   check: TTypeDef;
   nindex: LongInt;
 begin
+  if (FTok.Kind = tkConst) or (FTok.Kind = tkType) then
+  begin
+    check := Td;
+    check.Fields := Fields;
+    ParseMemberSection(FMemberScope, Vis, check);
+    Exit;
+  end;
   if Rec <> 0 then
     Who := 'a record'
   else
@@ -8102,7 +8493,7 @@ end;
 function TParser.ParseHelperType(const AName: string; HKind: LongInt): LongInt;
 var
   td: TTypeDef;
-  parent, target: LongInt;
+  parent, target, saveScope: LongInt;
   n: SizeInt;
   tk: TTypeKind;
   vis: Byte;
@@ -8145,6 +8536,8 @@ begin
   td.Lo := HKind;
   td.Size := 0;
   Result := AddNamedType(AName, td);
+  saveScope := FMemberScope;
+  FMemberScope := Result;
   td.Meths := nil;
   td.Props := nil;
   vis := VisPublic;
@@ -8179,6 +8572,7 @@ begin
   { a property's methods are the helper's or its parent's }
   FTypes[Result].Meths := td.Meths;
   FTypes[Result].Props := td.Props;
+  CheckScopeMembers(Result, td);
   for n := 0 to High(td.Props) do
   begin
     if (td.Props[n].ReadName <> '') and not HelperHas(Result, td.Props[n].ReadName) then
@@ -8191,6 +8585,7 @@ begin
   n := Length(FHelpers);
   SetLength(FHelpers, n + 1);
   FHelpers[n] := Result;
+  FMemberScope := saveScope;
 end;
 
 { The helper in scope for type T (P127): the last declared or loaded for
@@ -8228,8 +8623,12 @@ end;
 function TParser.HelperHas(H: LongInt; const AName: string): Boolean;
 var
   i: SizeInt;
+  owner: LongInt;
 begin
   Result := False;
+  i := ScopedIndex(H, AName, owner);
+  if (i >= 0) and (FTypes[owner].Nested[i].Kind <> 0) then
+  begin Result := True; Exit end;
   while H > 0 do
   begin
     for i := 0 to High(FTypes[H].CVars) do
@@ -8391,6 +8790,7 @@ var
   pr: TPropInfo;
   rname: string;
 begin
+  if ScopedValue(H, AName, Result) then Exit;
   hh := H;
   while hh > 0 do
   begin
@@ -8540,7 +8940,7 @@ var
   isClassM, isStat, cvarMode, isStatField, short: Boolean;
   npar: LongInt;
   pt: LongInt;
-  parent, ov: LongInt;
+  parent, ov, saveScope: LongInt;
   par: TTypeDef;
   vis: Byte;
 begin
@@ -8664,7 +9064,12 @@ begin
     slot := par.VmtN;
     td.Parent := parent;
   end;
+  { Member declarations already see the inherited namespace, not
+    only bodies parsed after the class is complete. }
+  FTypes[Result].Parent := parent;
   cvarMode := False;
+  saveScope := FMemberScope;
+  FMemberScope := Result;
   while (not short) and (FTok.Kind <> tkEnd) do
   begin
     { The sections set what code may use the members that follow
@@ -8694,6 +9099,12 @@ begin
       FTok := FLex.Next;
       if FTok.Kind = tkSemi then
         FTok := FLex.Next;
+      cvarMode := False;
+      Continue;
+    end;
+    if (FTok.Kind = tkConst) or (FTok.Kind = tkType) then
+    begin
+      ParseMemberSection(Result, vis, td);
       cvarMode := False;
       Continue;
     end;
@@ -9133,7 +9544,11 @@ begin
         Die('interface method ' + par.Meths[n].Name);
     end;
   end;
+  td.ScopeOwner := FTypes[Result].ScopeOwner;
+  td.Nested := FTypes[Result].Nested;
+  CheckScopeMembers(Result, td);
   FTypes[Result] := td;
+  FMemberScope := saveScope;
 end;
 
 procedure TParser.ParseGenericType;
@@ -9148,7 +9563,7 @@ begin
   if FTok.Kind <> tkIdent then
     Die('generic name');
   CheckName(FTok.Lexeme);
-  name := FTok.Lexeme;
+  name := DeclMemberName(FTok.Lexeme);
   FTok := FLex.Next;
   Eat(tkLt);
   if FTok.Kind <> tkIdent then
@@ -9334,14 +9749,15 @@ var
   td, htd: TTypeDef;
   n, fwd: SizeInt;
   off: LongInt;
-  id, rid, savedSelf: LongInt;
+  id, rid, savedSelf, saveScope: LongInt;
   outer, savedMembers: Boolean;
   recVis: Byte;
 begin
   Eat(tkType);
   outer := FInTypes;
   FInTypes := True;
-  while (FTok.Kind = tkIdent) or (FTok.Kind = tkGeneric) or ReservedHere('=') do
+  while ((FTok.Kind = tkIdent) and not ((FMemberScope > 0) and RecMemberAhead)) or
+    (FTok.Kind = tkGeneric) or ReservedHere('=') do
   begin
     if (FTok.Kind = tkIdent) and SameId(FTok.Lexeme, 'operator') then
       Break;
@@ -9352,7 +9768,7 @@ begin
     end;
     CheckName(FTok.Lexeme);
     FDeclAt := HerePos;
-    name := FTok.Lexeme;
+    name := DeclMemberName(FTok.Lexeme);
     at := IntToStr(FTok.Line) + ':' + IntToStr(FTok.Col);
     { a class or an interface declared forward, declared whole now (P139) }
     fwd := FwdIdx(name);
@@ -9417,6 +9833,7 @@ begin
         FTypeNames[n].Name := name;
         FTypeNames[n].Id := id;
         FTypeNames[n].Nest := FNest;
+        AddScoped(name, id, 0, '');
       end
       else
       begin
@@ -9452,6 +9869,8 @@ begin
       { the record is named first (P165): its methods take and give it,
         and no field of it may be it }
       rid := AddNamedType(name, td);
+      saveScope := FMemberScope;
+      FMemberScope := rid;
       htd := Default(TTypeDef);
       recVis := VisPublic;
       savedMembers := FRecMembers;
@@ -9513,8 +9932,11 @@ begin
         td.Size := 1;
       FTypes[rid].Fields := td.Fields;
       FTypes[rid].Size := td.Size;
+      htd.Fields := td.Fields;
+      CheckScopeMembers(rid, htd);
       if (Length(htd.Meths) > 0) or (Length(htd.Props) > 0) or (Length(htd.CVars) > 0) then
         MakeRecordHelper(rid, name, htd);
+      FMemberScope := saveScope;
     end
     else
     begin
@@ -9525,11 +9947,12 @@ begin
       FTypeNames[n].Name := name;
       FTypeNames[n].Id := id;
       FTypeNames[n].Nest := FNest;
+      AddScoped(name, id, 0, '');
       ResolvePending(name, id);
     end;
   end;
   FInTypes := outer;
-  CheckPending;
+  if not outer then CheckPending;
 end;
 
 { The arguments of Write and WriteLn. The list is optional, as in every
@@ -9548,6 +9971,15 @@ begin
   Result := E;
   CheckTyped(E);
   k := TypeOf(E^.Typ).Kind;
+  if k = tykCurrency then
+  begin
+    if W = nil then W := NewInt(0);
+    if D = nil then D := NewInt(-1);
+    extra := nil; SetLength(extra, 3);
+    extra[0] := CurrRaw(E); extra[1] := W; extra[2] := D;
+    Result := CoreProc('PasFmtCurrency', extra, TyString);
+    Exit;
+  end;
   { A Quad prints exactly, as a Double does (P103). }
   if k = tykQuad then
   begin
@@ -9904,6 +10336,8 @@ begin
       nline := FTok.Line;
       ncol := FTok.Col;
       FTok := FLex.Next;
+      if ScopedValue(E^.Typ, name, ix) then
+      begin E := ix; Continue end;
       { a member of the value's helper (P127), before the type's own: a
         helper's method hides a class's of the name, as in FPC }
       if (E^.Typ > 0) and (HelperFor(E^.Typ) <> 0) and HelperHas(HelperFor(E^.Typ), name) then
@@ -10319,6 +10753,9 @@ begin
           if st.Kind = tykReal then
             Die('a real becomes Integer through Trunc or Round; x as Integer sees its bits' +
               HerePos);
+          if st.Kind = tykCurrency then
+            Die('a Currency becomes Integer through Trunc or Round; x as Integer sees its bits' +
+              HerePos);
           Die('Integer() takes a pointer or an ordinal' + HerePos);
         end;
         if IsIntId(e^.Typ) then
@@ -10341,11 +10778,17 @@ begin
       end;
     tkStringKw:
       begin
-        { string.Join: a static method of string's helper (P127) }
+        { A bounded string/Char conversion shares StrArg's owned result;
+          a bare pointer is not a string with a known extent. }
         FTok := FLex.Next;
-        if FTok.Kind <> tkDot then
-          Die('string is a type here: string.Method names a helper''s static method' + HerePos);
-        Result := ParsePostfix(TypeDot(TyString));
+        if FTok.Kind = tkDot then
+          Result := ParsePostfix(TypeDot(TyString))
+        else
+        begin
+          args := ParseArgList;
+          if Length(args) <> 1 then Die('typecast takes 1 argument' + HerePos);
+          Result := ParsePostfix(AsStr(args[0]));
+        end;
       end;
     tkRecv:
       begin
@@ -10365,7 +10808,12 @@ begin
         name := FTok.Lexeme;
         nline := FTok.Line;
         ncol := FTok.Col;
-        FTok := FLex.Next;
+        if (not IsVarName(name)) and (FLex.PeekDots <> '') and TypeAhead(id) then
+        begin
+          name := ReadTypePath;
+          SkipTypeName;
+        end
+        else FTok := FLex.Next;
         { ua.Twice: a name of the unit ua, found through ua even when a
           later unit's name hides it (P138) }
         if (FTok.Kind = tkDot) and IsUsedUnit(name) and not IsVarName(name) then
@@ -10390,6 +10838,9 @@ begin
             CheckRecField(FWith[wi]^.Typ, i, nline, ncol);
             st := TypeOf(FWith[wi]^.Typ);
             Result := NewField(FWith[wi], st.Fields[i].Name, st.Fields[i].Typ, st.Fields[i].Off);
+          end
+          else if ScopedValue(FWith[wi]^.Typ, name, Result) then
+          begin
           end
           else
             Result := HelperMember(FWith[wi], HelperFor(FWith[wi]^.Typ), name, nline, ncol);
@@ -10418,7 +10869,7 @@ begin
         { Integer.Parse, TPoint.Make: a static method of the type's
           helper (P127) }
         else if (FTok.Kind = tkDot) and NamedType(name, id) and (TypeOf(id).Kind <> tykClass) and
-          (TypeOf(id).Kind <> tykHelper) and (HelperFor(id) <> 0) and (not IsVarName(name)) then
+          (not IsVarName(name)) then
           Result := TypeDot(id)
         else if SameId(name, 'SrcLine') then
         begin
@@ -10444,6 +10895,8 @@ begin
             Result := ConvertInt(args[0], TyInteger)
           else if TypeOf(args[0]^.Typ).Kind = tykReal then
             Die('Ord of a real: Trunc or Round says how' + HerePos)
+          else if TypeOf(args[0]^.Typ).Kind = tykCurrency then
+            Die('Ord of a Currency: Trunc or Round says how' + HerePos)
           else
             Result := AsInt(args[0], TyInteger);
           { Ord of a constant is a constant with no type, as a literal
@@ -10476,7 +10929,9 @@ begin
           args := ParseArgList;
           if Length(args) <> 1 then
             Die('Abs takes 1 argument');
-          if IsQuadTyp(args[0]^.Typ) then
+          if TypeOf(args[0]^.Typ).Kind = tykCurrency then
+            Result := CurrCall('PasCurrAbs', args[0], nil, TyCurrency)
+          else if IsQuadTyp(args[0]^.Typ) then
             Result := QCall('rtq_abs', args[0], nil, TyQuad)
           else if args[0]^.Typ = TySingle then
             Result := NewCall('rt_abssingle', args, TySingle)
@@ -10490,7 +10945,9 @@ begin
           args := ParseArgList;
           if Length(args) <> 1 then
             Die('Sqr takes 1 argument');
-          if IsQuadTyp(args[0]^.Typ) then
+          if TypeOf(args[0]^.Typ).Kind = tykCurrency then
+            Result := CurrCall('PasCurrSqr', args[0], nil, TyCurrency)
+          else if IsQuadTyp(args[0]^.Typ) then
             Result := QCall('rtq_sqr', args[0], nil, TyQuad)
           else if args[0]^.Typ = TySingle then
             Result := NewCall('rt_sqrsingle', args, TySingle)
@@ -10504,7 +10961,9 @@ begin
           args := ParseArgList;
           if Length(args) <> 1 then
             Die('Trunc takes 1 argument');
-          if IsQuadTyp(args[0]^.Typ) then
+          if TypeOf(args[0]^.Typ).Kind = tykCurrency then
+            Result := CurrCall('PasCurrTrunc', args[0], nil, TyInteger)
+          else if IsQuadTyp(args[0]^.Typ) then
             Result := QCall('rtq_toint', args[0], NewInt(0), TyInteger)
           else
             Result := NewCall('rt_trunc', args, TyInteger);
@@ -10514,7 +10973,9 @@ begin
           args := ParseArgList;
           if Length(args) <> 1 then
             Die('Round takes 1 argument');
-          if IsQuadTyp(args[0]^.Typ) then
+          if TypeOf(args[0]^.Typ).Kind = tykCurrency then
+            Result := CurrCall('PasCurrRound', args[0], nil, TyInteger)
+          else if IsQuadTyp(args[0]^.Typ) then
             Result := QCall('rtq_toint', args[0], NewInt(1), TyInteger)
           else
             Result := NewCall('rt_round', args, TyInteger);
@@ -10564,7 +11025,9 @@ begin
           args := ParseArgList;
           if Length(args) <> 1 then
             Die('Frac takes 1 argument');
-          if IsQuadTyp(args[0]^.Typ) then
+          if TypeOf(args[0]^.Typ).Kind = tykCurrency then
+            Result := CurrCall('PasCurrFrac', args[0], nil, TyCurrency)
+          else if IsQuadTyp(args[0]^.Typ) then
             Result := QCall('rtq_frac', args[0], nil, TyQuad)
           else
             Result := NewCall('rt_fracpart', args, TyReal);
@@ -10574,7 +11037,9 @@ begin
           args := ParseArgList;
           if Length(args) <> 1 then
             Die('Int takes 1 argument');
-          if IsQuadTyp(args[0]^.Typ) then
+          if TypeOf(args[0]^.Typ).Kind = tykCurrency then
+            Result := CurrCall('PasCurrInt', args[0], nil, TyCurrency)
+          else if IsQuadTyp(args[0]^.Typ) then
             Result := QCall('rtq_int', args[0], nil, TyQuad)
           else
             Result := NewCall('rt_intpart', args, TyReal);
@@ -10761,6 +11226,8 @@ begin
           end
           else if Length(args) <> 1 then
             Die('Floor takes 1 argument')
+          else if TypeOf(args[0]^.Typ).Kind = tykCurrency then
+            Result := CurrCall('PasCurrFloor', args[0], nil, TyInteger)
           else if IsQuadTyp(args[0]^.Typ) then
             Result := QCall('rtq_toint', args[0], NewInt(2), TyInteger)
           else
@@ -10778,6 +11245,8 @@ begin
           end
           else if Length(args) <> 1 then
             Die('Ceil takes 1 argument')
+          else if TypeOf(args[0]^.Typ).Kind = tykCurrency then
+            Result := CurrCall('PasCurrCeil', args[0], nil, TyInteger)
           else if IsQuadTyp(args[0]^.Typ) then
             Result := QCall('rtq_toint', args[0], NewInt(3), TyInteger)
           else
@@ -11084,8 +11553,7 @@ begin
           args := ParseArgList;
           if Length(args) <> 1 then
             Die('Odd takes 1 argument');
-          if TypeOf(args[0]^.Typ).Kind = tykReal then
-            Die('Odd takes an integer');
+          NoReal(args[0], 'Odd');
           Result := NewCall('rt_odd', args, TyBoolean);
         end
         else if SameId(name, 'IsNan') and (FTok.Kind = tkLParen) then
@@ -11109,7 +11577,17 @@ begin
           args := ParseArgList;
           if Length(args) <> 2 then
             Die(mname + ' takes 2 arguments');
-          if IsQuadTyp(args[0]^.Typ) or IsQuadTyp(args[1]^.Typ) then
+          if (TypeOf(args[0]^.Typ).Kind = tykCurrency) or
+            (TypeOf(args[1]^.Typ).Kind = tykCurrency) then
+          begin
+            if ((TypeOf(args[0]^.Typ).Kind = tykReal) and not UntypedReal(args[0])) or
+              ((TypeOf(args[1]^.Typ).Kind = tykReal) and not UntypedReal(args[1])) or
+              IsQuadTyp(args[0]^.Typ) or IsQuadTyp(args[1]^.Typ) then
+              Die('mixed Currency arithmetic needs an explicit Currency(x) or Double(x)' + HerePos);
+            if SameId(mname, 'Max') then name := 'PasCurrMax' else name := 'PasCurrMin';
+            Result := CurrCall(name, CurrOf(args[0]), CurrOf(args[1]), TyCurrency);
+          end
+          else if IsQuadTyp(args[0]^.Typ) or IsQuadTyp(args[1]^.Typ) then
           begin
             if SameId(mname, 'Max') then
               Result := QCall('rtq_max', QuadOf(args[0]), QuadOf(args[1]), TyQuad)
@@ -11841,7 +12319,7 @@ begin
                 Result := NewInt(1);
             end
             else if (k = tykInteger) or (k = tykSubrange) or (k = tykEnum) or
-              (k = tykBoolean) or (args[0]^.Typ = TyChar) then
+              (k = tykBoolean) or (k = tykCurrency) or (args[0]^.Typ = TyChar) then
               Result := TypeBound(args[0]^.Typ, SameId(name, 'High'))
             else if k = tykTree then
             begin
@@ -12267,7 +12745,22 @@ begin
             args := ParseArgList;
             if Length(args) <> 1 then
               Die('typecast takes 1 argument');
-            if (id = TyQuad) and (args[0]^.Typ <> TyPointer) and
+            if TypeOf(id).Kind = tykCurrency then
+              Result := CurrOf(args[0])
+            else if (TypeOf(args[0]^.Typ).Kind = tykCurrency) and (TypeOf(id).Kind = tykReal) then
+            begin
+              Result := CurrCall('PasCurrToReal', args[0], nil, TyReal);
+              if id = TySingle then Result := ConvertReal(Result, id);
+            end
+            else if (TypeOf(args[0]^.Typ).Kind = tykCurrency) and (id <> TyQuad) then
+              Die('a Currency becomes ' + TypName(id) + ' through Trunc or Round; x as ' +
+                TypName(id) + ' sees its bits' + HerePos)
+            else if IsStrTyp(id) then
+              Result := AsStr(args[0])
+            else if (TypeOf(id).Kind = tykPointer) and
+              (TypeOf(id).Elem = TyChar) and IsStrTyp(args[0]^.Typ) then
+              Result := CoreProc('PasCString', args, id)
+            else if (id = TyQuad) and (args[0]^.Typ <> TyPointer) and
               not ((args[0]^.Kind = ekDeref) and (args[0]^.Typ = TyNone)) then
               { Quad(x) (P103): x worked out in Quad, exactly widened. }
               Result := QuadOf(args[0])
@@ -12405,31 +12898,7 @@ begin
         end
         else if FindConst(name, cv) then
         begin
-          Result := NewInt(cv);
-          Result^.Typ := TyInteger;
-          Result^.Flags := 1;
-          for i := 0 to High(FConsts) do
-            if SameId(FConsts[i].Name, name) and not HiddenAbove(name, FConsts[i].Nest) then
-            begin
-              if IsWideSet(FConsts[i].Typ) then
-                Result := SetFromImage(FConsts[i].Txt, FConsts[i].Typ)
-              else if FConsts[i].Typ = TyString then
-                Result := NewStr(FConsts[i].Txt)
-              else if FConsts[i].Typ = TyReal then
-              begin
-                Result := NewReal(cv);
-                Result^.Flags := 1;
-                Result^.Txt := FConsts[i].Txt;
-                if FConsts[i].HasQ then
-                begin
-                  Result^.Flags := 3;
-                  Result^.QLo := FConsts[i].QLo;
-                  Result^.Hi := FConsts[i].QHi;
-                end;
-              end
-              else
-                Result^.Typ := FConsts[i].Typ;
-            end;
+          Result := ConstExpr(ConstIdx(name));
         end
         else if Length(FWith) > 0 then
         begin
@@ -12463,6 +12932,9 @@ begin
               Result := NewPi
             else
               Die('unknown identifier ' + name);
+        end
+        else if (not IsLocalName(name)) and ScopedValue(MemberContext, name, Result) then
+        begin
         end
         else if FClassTyp <> 0 then
         begin
@@ -12637,7 +13109,9 @@ begin
       e := Self.ParseUnary;
       CheckOperand('-', e);
       e := NewUn(uoNeg, e);
-      if (e^.L <> nil) and IsQuadTyp(e^.L^.Typ) then
+      if (e^.L <> nil) and (TypeOf(e^.L^.Typ).Kind = tykCurrency) then
+        e := CurrCall('PasCurrNeg', e^.L, nil, TyCurrency)
+      else if (e^.L <> nil) and IsQuadTyp(e^.L^.Typ) then
         e := QuadNeg(e^.L)
       else if (e^.L <> nil) and (TypeOf(e^.L^.Typ).Kind = tykReal) then
         e^.Typ := e^.L^.Typ
@@ -12718,6 +13192,124 @@ begin
   Result := e;
 end;
 
+{ Only the compiler unwraps the scaled representation for its kernels.
+  Public integer casts remain numeric conversions, not reinterpretation. }
+function TParser.CurrRaw(E: PExpr): PExpr;
+begin
+  Result := E;
+  if (E <> nil) and (TypeOf(E^.Typ).Kind = tykCurrency) then
+  begin
+    Result := NewUn(uoConv, E);
+    Result^.Typ := TyInteger;
+  end;
+end;
+
+function TParser.CurrCall(const Name: string; A, B: PExpr; Ret: LongInt): PExpr;
+var args: TExprArray; av, bv, value: Int64; at, bt: LongInt;
+  text: string; folded: Boolean;
+begin
+  args := nil; SetLength(args, 1); args[0] := CurrRaw(A);
+  if B <> nil then begin SetLength(args, 2); args[1] := CurrRaw(B) end;
+  folded := ConstFold(args[0], av, at, text);
+  bv := 0;
+  if (B <> nil) and folded then folded := ConstFold(args[1], bv, bt, text);
+  if folded then
+  begin
+    try
+      if Name = 'PasCurrFromInt' then value := PasCurrFromInt(av)
+      else if Name = 'PasCurrFromReal' then value := PasCurrFromReal(BitsReal(av))
+      else if Name = 'PasCurrAdd' then value := PasCurrAdd(av, bv)
+      else if Name = 'PasCurrSub' then value := PasCurrSub(av, bv)
+      else if Name = 'PasCurrMul' then value := PasCurrMul(av, bv)
+      else if Name = 'PasCurrSqr' then value := PasCurrSqr(av)
+      else if Name = 'PasCurrDiv' then value := PasCurrDiv(av, bv)
+      else if Name = 'PasCurrNeg' then value := PasCurrNeg(av)
+      else if Name = 'PasCurrAbs' then value := PasCurrAbs(av)
+      else if Name = 'PasCurrTrunc' then value := PasCurrTrunc(av)
+      else if Name = 'PasCurrRound' then value := PasCurrRound(av)
+      else if Name = 'PasCurrFloor' then value := PasCurrFloor(av)
+      else if Name = 'PasCurrCeil' then value := PasCurrCeil(av)
+      else if Name = 'PasCurrInt' then value := PasCurrInt(av)
+      else if Name = 'PasCurrFrac' then value := PasCurrFrac(av)
+      else if Name = 'PasCurrMin' then value := PasCurrMin(av, bv)
+      else if Name = 'PasCurrMax' then value := PasCurrMax(av, bv)
+      else if Name = 'PasCurrToReal' then
+      begin
+        Result := NewReal(RealBits(PasCurrToReal(av))); Exit;
+      end
+      else folded := False;
+    except
+      on error: ECurrencyError do Die(error.Message + ' in a constant' + HerePos);
+    end;
+    if folded then
+    begin
+      Result := NewInt(value); Result^.Typ := Ret; Result^.Flags := 0; Exit;
+    end;
+  end;
+  Result := CoreProc(Name, args, Ret);
+end;
+
+function TParser.CurrOf(E: PExpr): PExpr;
+var text: string; value, hi: Int64; args: TExprArray;
+begin
+  CheckTyped(E);
+  Result := E;
+  if TypeOf(E^.Typ).Kind = tykCurrency then Exit;
+  text := '';
+  if (E^.Kind = ekReal) and UntypedReal(E) then text := E^.Txt
+  else if (E^.Kind = ekUn) and (E^.Un = uoNeg) and
+    (E^.L <> nil) and (E^.L^.Kind = ekReal) and UntypedReal(E^.L) and
+    (E^.L^.Txt <> '') then text := '-' + E^.L^.Txt;
+  if text <> '' then
+  begin
+    if not PasTryParseCurrency(text, value) then Die('constant does not fit Currency' + HerePos);
+    Result := NewInt(value); Result^.Typ := TyCurrency; Result^.Flags := 0; Exit;
+  end;
+  if IntOperand(E) and not IsCharT(E^.Typ) then
+    Result := CurrCall('PasCurrFromInt', ValArg(TyInteger, E), nil, TyCurrency)
+  else if TypeOf(E^.Typ).Kind = tykReal then
+    Result := CurrCall('PasCurrFromReal', ValArg(TyReal, E), nil, TyCurrency)
+  else if IsQuadTyp(E^.Typ) then
+  begin
+    if QFold(E, value, hi) then
+    begin
+      try value := PasCurrFromQuad(value, hi)
+      except on error: ECurrencyError do Die(error.Message + ' in a constant' + HerePos) end;
+      Result := NewInt(value); Result^.Typ := TyCurrency; Result^.Flags := 0;
+    end
+    else
+    begin
+      { An ordinary Quad value parameter evaluates its source once and
+        preserves both words across calls, GC and stack growth. }
+      args := nil; SetLength(args, 1);
+      args[0] := E;
+      Result := CoreProc('PasCurrFromQuadValue', args, TyCurrency);
+    end;
+  end
+  else Die(TypName(E^.Typ) + ' does not become Currency' + HerePos);
+end;
+
+function TParser.CurrBin(Op: TBinOp; L, R: PExpr): PExpr;
+var name: string;
+begin
+  if ((TypeOf(L^.Typ).Kind = tykReal) and not UntypedReal(L)) or
+    ((TypeOf(R^.Typ).Kind = tykReal) and not UntypedReal(R)) or
+    IsQuadTyp(L^.Typ) or IsQuadTyp(R^.Typ) then
+    Die('mixed Currency arithmetic needs an explicit Currency(x) or Double(x)' + HerePos);
+  L := CurrOf(L); R := CurrOf(R);
+  if Op = boAdd then name := 'PasCurrAdd'
+  else if Op = boSub then name := 'PasCurrSub'
+  else if Op = boMul then name := 'PasCurrMul'
+  else if Op = boSlash then name := 'PasCurrDiv'
+  else if (Op = boEq) or (Op = boNe) or (Op = boLt) or (Op = boLe) or
+    (Op = boGt) or (Op = boGe) then
+  begin
+    Result := NewBin(Op, CurrRaw(L), CurrRaw(R)); Result^.Typ := TyBoolean; Exit;
+  end
+  else Die('Currency takes +, -, *, / and the comparisons' + HerePos);
+  Result := CurrCall(name, L, R, TyCurrency);
+end;
+
 function TParser.ApplyOp(Op: TBinOp; L, R: PExpr): PExpr;
 var
   sym: string;
@@ -12727,6 +13319,11 @@ begin
   args := nil;
   CheckTyped(L);
   CheckTyped(R);
+  if (TypeOf(L^.Typ).Kind = tykCurrency) or (TypeOf(R^.Typ).Kind = tykCurrency) then
+  begin
+    Result := CurrBin(Op, L, R);
+    Exit;
+  end;
   if ((Op = boAdd) or (Op = boSub)) and PtrArith(Op, L, R, Result) then
     Exit;
   if FindOp(Op, L^.Typ, R^.Typ, sym, ret) then
@@ -12921,6 +13518,8 @@ end;
 { not E: a Boolean's negation or an integer's bits flipped (1.0.74). }
 function TParser.MakeNot(E: PExpr): PExpr;
 begin
+  if (E <> nil) and (TypeOf(E^.Typ).Kind = tykCurrency) then
+    Die('not does not take Currency' + HerePos);
   if (E <> nil) and (IsBlockNode(E) or IsBlockTyp(E^.Typ) or (TypeOf(E^.Typ).Kind = tykString)) then
   begin
     Result := BlockNot(E);
@@ -12966,7 +13565,8 @@ begin
         '(x and 4) = 4, or Ord(b) for the number' + HerePos);
     if (L <> nil) and (R <> nil) and
       ((TypeOf(L^.Typ).Kind = tykReal) or (TypeOf(R^.Typ).Kind = tykReal) or
-      IsQuadTyp(L^.Typ) or IsQuadTyp(R^.Typ)) then
+      IsQuadTyp(L^.Typ) or IsQuadTyp(R^.Typ) or
+      (TypeOf(L^.Typ).Kind = tykCurrency) or (TypeOf(R^.Typ).Kind = tykCurrency)) then
       Die(K + ' does not take a real' + HerePos);
   end;
   if K = '*' then
@@ -12996,7 +13596,8 @@ begin
     Result := NewBin(boAnd, L, R);
     if (L <> nil) and (R <> nil) and
       ((TypeOf(L^.Typ).Kind = tykReal) or (TypeOf(R^.Typ).Kind = tykReal) or
-      IsQuadTyp(L^.Typ) or IsQuadTyp(R^.Typ)) then
+      IsQuadTyp(L^.Typ) or IsQuadTyp(R^.Typ) or
+      (TypeOf(L^.Typ).Kind = tykCurrency) or (TypeOf(R^.Typ).Kind = tykCurrency)) then
       Die(K + ' does not take a real' + HerePos);
     if (Result^.Typ <> TyBoolean) and IntOperand(L) and IntOperand(R) then
       TypeIntBin(Result);
@@ -13837,7 +14438,7 @@ begin
   sz := ValSize(X^.Typ);
   if IntOperand(X) then
     Result := 0
-  else if ((k = tykReal) or (k = tykBoolean) or (k = tykEnum) or (k = tykPointer) or
+  else if ((k = tykReal) or (k = tykCurrency) or (k = tykBoolean) or (k = tykEnum) or (k = tykPointer) or
     (k = tykSet) or (k = tykProc) or (k = tykMap) or (k = tykTree) or
     (k = tykHeap) or (k = tykStore) or (k = tykChan)) and
     ((sz = 1) or (sz = 2) or (sz = 4) or (sz = 8)) then
@@ -14153,7 +14754,7 @@ begin
   k := TypeOf(T).Kind;
   sz := ValSize(T);
   Result := ((sz = 1) or (sz = 2) or (sz = 4) or (sz = 8)) and
-    ((k = tykInteger) or (k = tykSubrange) or (k = tykReal) or (k = tykBoolean) or
+    ((k = tykInteger) or (k = tykSubrange) or (k = tykReal) or (k = tykCurrency) or (k = tykBoolean) or
     (k = tykEnum) or (k = tykPointer) or (k = tykSet) or (k = tykClass) or
     (k = tykProc) or (k = tykMap) or (k = tykTree) or (k = tykHeap) or
     (k = tykStore) or (k = tykChan));
@@ -14299,8 +14900,18 @@ begin
   tb := TypeOf(B);
   if ta.Kind <> tb.Kind then
     Exit;
+  if (ta.SpecOrigin > 0) or (tb.SpecOrigin > 0) then
+  begin
+    Result := (ta.SpecOrigin > 0) and (tb.SpecOrigin > 0) and
+      SameTyp(ta.SpecOrigin, tb.SpecOrigin) and SameTyp(ta.SpecArg, tb.SpecArg);
+    Exit;
+  end;
   if (ta.Sym <> '') or (tb.Sym <> '') then
     Result := ta.Sym = tb.Sym
+  else if ta.Kind = tykGeneric then
+    { Local templates have no exported stem; only their declaration
+      id identifies them, never a same-spelled template in a sibling. }
+    Result := False
   else if (ta.Name <> '') and SameId(ta.Name, tb.Name) and (ta.Size = tb.Size) then
     Result := True
   else if IsDynTyp(A) and IsDynTyp(B) then
@@ -15924,9 +16535,10 @@ begin
     begin
       FTok := FLex.Next;
       Eat(tkEq);
-      if ExprHasCall(e) then
-        Die(ck + '= of a place that calls: assign it' + HerePos);
-      stp := MakeBin(ck, e, ParseExpr);
+      st := PlaceOpAssign(e, ck, ParseExpr);
+      st^.Line := lno;
+      Result := st;
+      Exit;
     end
     else
     begin
@@ -16075,6 +16687,10 @@ begin
         name := FTok.Lexeme;
         if not IsVarName(name) then
           Die('unknown identifier ' + name);
+        { PasReadLn writes a two-word UTF-8 string. Passing an ordinal
+          or record silently overwrote storage beyond its actual type. }
+        if not IsStrTyp(VarTyp(name)) then
+          Die('ReadLn takes a string variable, not ' + TypName(VarTyp(name)) + HerePos);
         st := NewStmt(skReadLn);
         st^.Name := name;
         FTok := FLex.Next;
@@ -16456,7 +17072,8 @@ begin
           if not (IsIntId(e^.Typ) or (TypeOf(e^.Typ).Kind = tykInteger) or
             (TypeOf(e^.Typ).Kind = tykSubrange) or (TypeOf(e^.Typ).Kind = tykEnum) or
             (TypeOf(e^.Typ).Kind = tykBoolean) or (TypeOf(e^.Typ).Kind = tykReal) or
-            (TypeOf(e^.Typ).Kind = tykQuad) or (TypeOf(e^.Typ).Kind = tykPointer)) then
+            (TypeOf(e^.Typ).Kind = tykQuad) or (TypeOf(e^.Typ).Kind = tykCurrency) or
+            (TypeOf(e^.Typ).Kind = tykPointer)) then
             Die(name + ' takes a number, an ordinal or a pointer, not ' + TypName(e^.Typ) +
               HerePos);
           if SameId(name, 'Inc') then
@@ -16470,7 +17087,8 @@ begin
             st^.E := ParseExpr;
             { An ordinal steps by an ordinal (1.0.136); a real by a real
               (P101). }
-            if (TypeOf(e^.Typ).Kind <> tykReal) and (TypeOf(e^.Typ).Kind <> tykQuad) then
+            if (TypeOf(e^.Typ).Kind <> tykReal) and (TypeOf(e^.Typ).Kind <> tykQuad) and
+              (TypeOf(e^.Typ).Kind <> tykCurrency) then
               NoReal(st^.E, TypName(e^.Typ));
             { A step whose values the variable holds is worked out in its
               type; a wider one adds and the sum wraps (P99). }
@@ -16507,33 +17125,13 @@ begin
           end;
           { Inc and Dec of a real add or take away the step, 1.0 unless
             one is given (1.0.103): they stepped the real's bits. }
-          if TypeOf(e^.Typ).Kind = tykReal then
+          if (TypeOf(e^.Typ).Kind = tykReal) or IsQuadTyp(e^.Typ) or
+            (TypeOf(e^.Typ).Kind = tykCurrency) then
           begin
-            if ExprHasCall(e) then
-              Die(name + ' of a real place that calls: assign it' + HerePos);
-            stp := ValArg(e^.Typ, st^.E);
-            if TypeOf(stp^.Typ).Kind <> tykReal then
-              Die(name + ' of a real takes a number' + HerePos);
             if st^.Kind = skInc then
-              stp := NewBin(boAdd, e, stp)
+              st := PlaceOpAssign(e, '+', st^.E)
             else
-              stp := NewBin(boSub, e, stp);
-            stp^.Typ := e^.Typ;
-            st^.Kind := skAssign;
-            st^.E := stp;
-          end;
-          { Inc and Dec of a Quad add or take away the step, 1 unless one
-            is given (P103), worked out as a Quad. }
-          if IsQuadTyp(e^.Typ) then
-          begin
-            if ExprHasCall(e) then
-              Die(name + ' of a Quad place that calls: assign it' + HerePos);
-            if st^.Kind = skInc then
-              stp := QuadBin(boAdd, e, st^.E)
-            else
-              stp := QuadBin(boSub, e, st^.E);
-            st^.Kind := skAssign;
-            st^.E := stp;
+              st := PlaceOpAssign(e, '-', st^.E);
           end;
           { Inc and Dec of a view of a value write it back (1.0.119). }
           if IsValueView(st^.Dest) then
@@ -16705,10 +17303,8 @@ begin
         end
         else if ck <> '' then
         begin
-          { x op= e is x := x op e (P105, 1.0.116), for every operator:
-            x += 1, s += 'a', m xor= k, q *= 2, x rol= 3. The place is
-            read and written, so it may not call; m[k] op= e works the
-            map and the key out once (1.0.140). }
+          { x op= e binds its destination before the RHS. Calls on
+            either side may mutate an index, pointer or map variable. }
           FTok := FLex.Next;
           Eat(tkEq);
           CheckTyped(e);
@@ -16716,22 +17312,10 @@ begin
             (TypeOf(e^.Args[0]^.Typ).Elem2 < 0) then
             Die(ck + '= of a tree of K: t[k] is True or False, and Include(t, k) puts k in' +
               HerePos);
-          if MapPlaceRoot(e) <> nil then
-            st := MapOpAssign(e, ck, ParseExpr)
-          else if e^.Kind = ekCall then
+          if (MapPlaceRoot(e) = nil) and (e^.Kind = ekCall) then
             Die(ck + '= needs a variable' + HerePos)
-          else if ExprHasCall(e) then
-            Die(ck + '= of a place that calls: assign it' + HerePos)
-          else if IsValueView(e) then
-            st := ViewStore(e, MakeBin(ck, e, ParseExpr))
           else
-          begin
-            st := NewStmt(skAssign);
-            st^.Dest := e;
-            st^.E := ValArg(e^.Typ, MakeBin(ck, e, ParseExpr));
-            if IsBlockNode(st^.E) and (st^.E^.Name = 'rt_blk') then
-              st := BlockStmt(e, st^.E);
-          end;
+            st := PlaceOpAssign(e, ck, ParseExpr);
         end
         else if (e^.Kind = ekCall) and ((e^.Name = 'rt_sliceins') or (e^.Name = 'rt_slicedel')) then
           st := SliceEdit(e)
@@ -17009,6 +17593,14 @@ begin
   td := TypeOf(T);
   k := td.Kind;
   at := IntToStr(FTok.Line) + ':' + IntToStr(FTok.Col);
+  if k = tykCurrency then
+  begin
+    FConstAt := at;
+    se := CurrOf(ParseExpr);
+    if not ConstFold(se, v, vt, txt) then Die('a Currency constant at ' + at);
+    PutWord(Img, Off, 8, v);
+    Exit;
+  end;
   if k = tykSet then
   begin
     { a set's bytes, its elements in its range (P126) }
@@ -17211,10 +17803,10 @@ var
   sz, k: LongInt;
 begin
   Eat(tkConst);
-  while (FTok.Kind = tkIdent) or ReservedHere('=:') do
+  while ((FTok.Kind = tkIdent) and not ((FMemberScope > 0) and RecMemberAhead)) or ReservedHere('=:') do
   begin
     CheckName(FTok.Lexeme);
-    name := FTok.Lexeme;
+    name := DeclMemberName(FTok.Lexeme);
     at := HerePos;
     FDeclAt := at;
     FTok := FLex.Next;
@@ -17258,6 +17850,7 @@ begin
       FVars[High(FVars)].Init := s;
       FVars[High(FVars)].Rel := d.Rel;
       FVars[High(FVars)].RelStr := d.RelStr;
+      AddScoped(name, t, 2, VarSym(name));
       Eat(tkSemi);
     end
     else
@@ -17329,6 +17922,54 @@ begin
     FTypes[n].Imported := True;
     FImportMap[i] := LongInt(n);
   end;
+  for i := 0 to mx - 1 do
+  begin
+    if Iface.Types[i].Kind = tykNone then
+      Continue;
+    nw := FImportMap[i];
+    if (i <= TyLastBuiltin) and (nw = i) then
+      Continue;
+    if (Iface.Types[i].Elem >= 0) and (Iface.Types[i].Elem < mx) then
+      FTypes[nw].Elem := FImportMap[Iface.Types[i].Elem];
+    if (Iface.Types[i].Elem2 > 0) and (Iface.Types[i].Elem2 < mx) then
+      FTypes[nw].Elem2 := FImportMap[Iface.Types[i].Elem2];
+    for j := 0 to High(FTypes[nw].Fields) do
+      if (FTypes[nw].Fields[j].Typ >= 0) and (FTypes[nw].Fields[j].Typ < mx) then
+        FTypes[nw].Fields[j].Typ := FImportMap[FTypes[nw].Fields[j].Typ];
+    { a class's parent, interfaces and properties (PASLANGI13, 1.0.137) }
+    if (Iface.Types[i].Parent > 0) and (Iface.Types[i].Parent < mx) then
+      FTypes[nw].Parent := FImportMap[Iface.Types[i].Parent];
+    if (Iface.Types[i].ScopeOwner > 0) and (Iface.Types[i].ScopeOwner < mx) then
+      FTypes[nw].ScopeOwner := FImportMap[Iface.Types[i].ScopeOwner];
+    if Iface.Types[i].SpecOrigin > 0 then
+    begin
+      FTypes[nw].SpecOrigin := MapImport(Iface.Types[i].SpecOrigin);
+      FTypes[nw].SpecArg := MapImport(Iface.Types[i].SpecArg);
+    end;
+    for j := 0 to High(FTypes[nw].Nested) do
+      FTypes[nw].Nested[j].Typ := MapImport(FTypes[nw].Nested[j].Typ);
+    for j := 0 to High(FTypes[nw].Ifaces) do
+      if (FTypes[nw].Ifaces[j] >= 0) and (FTypes[nw].Ifaces[j] < mx) then
+        FTypes[nw].Ifaces[j] := FImportMap[FTypes[nw].Ifaces[j]];
+    for j := 0 to High(FTypes[nw].Props) do
+      if (FTypes[nw].Props[j].Typ >= 0) and (FTypes[nw].Props[j].Typ < mx) then
+        FTypes[nw].Props[j].Typ := FImportMap[FTypes[nw].Props[j].Typ];
+    for j := 0 to High(FTypes[nw].CVars) do
+      if (FTypes[nw].CVars[j].Typ >= 0) and (FTypes[nw].CVars[j].Typ < mx) then
+        FTypes[nw].CVars[j].Typ := FImportMap[FTypes[nw].CVars[j].Typ];
+    for j := 0 to High(FTypes[nw].Meths) do
+    begin
+      if (FTypes[nw].Meths[j].RetTyp >= 0) and (FTypes[nw].Meths[j].RetTyp < mx) then
+        FTypes[nw].Meths[j].RetTyp := FImportMap[FTypes[nw].Meths[j].RetTyp];
+      for k := 0 to High(FTypes[nw].Meths[j].ParamTyps) do
+        if (FTypes[nw].Meths[j].ParamTyps[k] >= 0) and
+          (FTypes[nw].Meths[j].ParamTyps[k] < mx) then
+          FTypes[nw].Meths[j].ParamTyps[k] :=
+            FImportMap[FTypes[nw].Meths[j].ParamTyps[k]];
+    end;
+  end;
+  { Remap all type edges before identity comparisons or scoped lookup
+    inspect them: foreign table indices are never local type ids. }
   for i := 0 to High(Iface.TypeNames) do
   begin
     old := Iface.TypeIds[i];
@@ -17367,43 +18008,6 @@ begin
       FTypeNames[nw].Name := ToLower(Iface.Name) + '.' + Iface.TypeNames[i];
       FTypeNames[nw].Id := FImportMap[old];
       FTypeNames[nw].Owner := ToLower(Iface.Name);
-    end;
-  end;
-  for i := 0 to mx - 1 do
-  begin
-    if Iface.Types[i].Kind = tykNone then
-      Continue;
-    nw := FImportMap[i];
-    if (i <= TyLastBuiltin) and (nw = i) then
-      Continue;
-    if (Iface.Types[i].Elem >= 0) and (Iface.Types[i].Elem < mx) then
-      FTypes[nw].Elem := FImportMap[Iface.Types[i].Elem];
-    if (Iface.Types[i].Elem2 > 0) and (Iface.Types[i].Elem2 < mx) then
-      FTypes[nw].Elem2 := FImportMap[Iface.Types[i].Elem2];
-    for j := 0 to High(FTypes[nw].Fields) do
-      if (FTypes[nw].Fields[j].Typ >= 0) and (FTypes[nw].Fields[j].Typ < mx) then
-        FTypes[nw].Fields[j].Typ := FImportMap[FTypes[nw].Fields[j].Typ];
-    { a class's parent, interfaces and properties (PASLANGI13, 1.0.137) }
-    if (Iface.Types[i].Parent > 0) and (Iface.Types[i].Parent < mx) then
-      FTypes[nw].Parent := FImportMap[Iface.Types[i].Parent];
-    for j := 0 to High(FTypes[nw].Ifaces) do
-      if (FTypes[nw].Ifaces[j] >= 0) and (FTypes[nw].Ifaces[j] < mx) then
-        FTypes[nw].Ifaces[j] := FImportMap[FTypes[nw].Ifaces[j]];
-    for j := 0 to High(FTypes[nw].Props) do
-      if (FTypes[nw].Props[j].Typ >= 0) and (FTypes[nw].Props[j].Typ < mx) then
-        FTypes[nw].Props[j].Typ := FImportMap[FTypes[nw].Props[j].Typ];
-    for j := 0 to High(FTypes[nw].CVars) do
-      if (FTypes[nw].CVars[j].Typ >= 0) and (FTypes[nw].CVars[j].Typ < mx) then
-        FTypes[nw].CVars[j].Typ := FImportMap[FTypes[nw].CVars[j].Typ];
-    for j := 0 to High(FTypes[nw].Meths) do
-    begin
-      if (FTypes[nw].Meths[j].RetTyp >= 0) and (FTypes[nw].Meths[j].RetTyp < mx) then
-        FTypes[nw].Meths[j].RetTyp := FImportMap[FTypes[nw].Meths[j].RetTyp];
-      for k := 0 to High(FTypes[nw].Meths[j].ParamTyps) do
-        if (FTypes[nw].Meths[j].ParamTyps[k] >= 0) and
-          (FTypes[nw].Meths[j].ParamTyps[k] < mx) then
-          FTypes[nw].Meths[j].ParamTyps[k] :=
-            FImportMap[FTypes[nw].Meths[j].ParamTyps[k]];
     end;
   end;
   { a unit's helpers are in scope where it is used (P127), after the
@@ -17606,7 +18210,18 @@ begin
   if Copy(data, 1, 11) = 'PASLANGI20' + #10 then
     Die(path + ' was compiled by a paslang older than 1.1.37; compile ' +
       AName + ' again');
-  if (Copy(data, 1, 8) = 'PASLANGI') and (Copy(data, 1, 11) <> 'PASLANGI21' + #10) then
+  if Copy(data, 1, 11) = 'PASLANGI21' + #10 then
+    Die(path + ' was compiled by a paslang older than 1.1.44; compile ' +
+      AName + ' again');
+  if Copy(data, 1, 11) = 'PASLANGI22' + #10 then
+    Die(path + ' was compiled by a paslang older than 1.1.47; compile ' +
+      AName + ' again');
+  if Copy(data, 1, 11) = 'PASLANGI23' + #10 then
+    Die(path + ' was compiled by a paslang older than 1.1.48; compile ' +
+      AName + ' again');
+  if Copy(data, 1, 11) = 'PASLANGI24' + #10 then
+    Die(path + ' was compiled by a paslang older than 1.1.79; compile ' + AName + ' again');
+  if (Copy(data, 1, 8) = 'PASLANGI') and (Copy(data, 1, 11) <> 'PASLANGI25' + #10) then
     Die(path + ' was compiled by a newer paslang (' + FirstLine(data) +
       '); compile ' + AName + ' again with this one');
   if not ParseIface(data, iface) then
@@ -17870,8 +18485,9 @@ begin
     SetLength(FTypeNames, n + 1);
     FTypeNames[n].Name := 'TClass';
     FTypeNames[n].Id := InternClassRef(t);
-    AddCoreName('TClass');
   end;
+  if NamedType('TClass', tc) then
+    AddCoreName('TClass');
   { TVarRec and its kinds (P124), what an array of const holds: the
     kind, and the value in the record itself, a string's two words and a
     Quad too, so nothing points at a copy }
@@ -17886,6 +18502,7 @@ begin
     AddRecField(rd, 'VBoolean', 8, TyBoolean);
     AddRecField(rd, 'VChar', 8, TyChar);
     AddRecField(rd, 'VExtended', 8, TyReal);
+    AddRecField(rd, 'VCurrency', 8, TyCurrency);
     AddRecField(rd, 'VPointer', 8, TyPointer);
     AddRecField(rd, 'VPChar', 8, InternPtr(TyChar));
     AddRecField(rd, 'VObject', 8, t);
@@ -17894,10 +18511,17 @@ begin
     AddRecField(rd, 'VInterface', 8, TyPointer);
     AddRecField(rd, 'VQuad', 16, TyQuad);
     vr := AddNamedType('TVarRec', rd);
+  end;
+  if NamedType('TVarRec', vr) then
+  begin
     AddCoreName('TVarRec');
+    { A used unit can import TVarRec before LoadCore runs, without
+      importing its kind constants. The type's existence does not
+      imply that any of the language's predefined names were loaded. }
     for n := 0 to High(VtNames) do
     begin
-      AddConstEnt(VtNames[n], VtValues[n], TyInteger, '');
+      if not CoreName(VtNames[n]) then
+        AddConstEnt(VtNames[n], VtValues[n], TyInteger, '');
       AddCoreName(VtNames[n]);
     end;
   end;
@@ -18412,6 +19036,7 @@ var
 begin
   Result := True;
   Res := nil;
+  if ScopedValue(Cls, AName, Res) then Exit;
   st := TypeOf(Cls);
   i := CVarIndex(Cls, AName);
   if i >= 0 then
@@ -18510,6 +19135,7 @@ begin
   nline := FTok.Line;
   ncol := FTok.Col;
   FTok := FLex.Next;
+  if ScopedValue(Id, mname, Result) then Exit;
   if not ClassMember(Id, nil, mname, nline, ncol, Result) then
     Die('unknown class member ' + TypeOf(Id).Name + '.' + mname + ' at ' +
       IntToStr(nline) + ':' + IntToStr(ncol));
@@ -18705,6 +19331,14 @@ var
 begin
   t := PT;
   dk := TypeOf(t).Kind;
+  if dk = tykCurrency then
+  begin
+    FConstAt := HerePos;
+    e := CurrOf(ParseExpr);
+    if not ConstFold(e, OutV, dt, OutS) then Die('a Currency default must be constant' + HerePos);
+    OutS := '';
+    Exit;
+  end;
   if FTok.Kind = tkNil then
   begin
     if not ((dk = tykPointer) or (dk = tykClass) or (dk = tykClassRef) or (dk = tykProc) or
@@ -18815,7 +19449,7 @@ var
   pr: TProc;
   names, pats: array of string;
   nn, i, n, oi: SizeInt;
-  t: LongInt;
+  t, saveScope: LongInt;
   byref, isconst, seenDef, eqm: Boolean;
   dv: Int64;
   ds: string;
@@ -18826,6 +19460,7 @@ var
   st: TTypeDef;
   hpos: string;
 begin
+  saveScope := FMemberScope;
   anon := FAnonHead;
   hpos := '';
   FAnonHead := False;
@@ -18848,7 +19483,9 @@ begin
     CheckName(FTok.Lexeme);
     FDeclAt := HerePos;
     pr.Name := FTok.Lexeme;
-    FTok := FLex.Next;
+    if (FLex.PeekDots <> '') and TypeAhead(t) then
+    begin pr.Name := ReadTypePath; SkipTypeName end
+    else FTok := FLex.Next;
   end;
   if (not anon) and (FTok.Kind = tkDot) then
   begin
@@ -18871,6 +19508,7 @@ begin
     FTok := FLex.Next;
     pr.Sym := ProcSym('', TypeStemOf(TypeOf(pr.ClassTyp)) + '_' + pr.Name);
   end;
+  if pr.ClassTyp <> 0 then FMemberScope := pr.ClassTyp;
   if isClassM and (pr.ClassTyp = 0) then
     Die('class goes before the body of a class method, TClass.Name' + HerePos);
   { a class constructor or destructor (P123): the one the class declares,
@@ -18896,6 +19534,7 @@ begin
       pr.Name := st.Name + '.' + pr.Name;
     end;
     Eat(tkSemi);
+    FMemberScope := saveScope;
     Result := pr;
     Exit;
   end;
@@ -18927,6 +19566,7 @@ begin
           FTok := FLex.Next;
         end;
         names := nil;
+        pats := nil;
         nn := 0;
         while True do
         begin
@@ -18997,6 +19637,7 @@ begin
   { an anonymous routine's head ends there: its sections or begin follow }
   if anon then
   begin
+    FMemberScope := saveScope;
     Result := pr;
     Exit;
   end;
@@ -19145,6 +19786,7 @@ begin
     end;
     pr.NoSelf := False;
   end;
+  FMemberScope := saveScope;
   Result := pr;
 end;
 
@@ -20734,29 +21376,31 @@ end;
   inside the value, m[k].X += 1 (1.0.140): m[k] := m[k] op e with the
   map and the key worked out once, in hidden variables unless they are
   a variable or a constant, so Maps()[F()] += 1 runs each call once. An
-  index on the way to the field is read twice and may not call. They
-  were refused (+= needs a variable). }
+  index on the way is bound too. Even plain variables need snapshots:
+  the RHS may change the map, the key or an index before the write. }
 function TParser.MapOpAssign(Place: PExpr; const Op: string; R: PExpr): PStmt;
 var
-  root, dest, w: PExpr;
+  root, dest: PExpr;
   pre: TStmtArray;
   st: PStmt;
   i: SizeInt;
+
+  procedure BindIndices(E: PExpr);
+  begin
+    if E = root then Exit;
+    BindIndices(E^.L);
+    if (E^.Kind = ekIndex) and not ((E^.R^.Kind = ekInt) or (E^.R^.Kind = ekNil)) then
+      E^.R := HiddenVar(E^.R^.Typ, pre, E^.R);
+  end;
+
 begin
   root := MapPlaceRoot(Place);
   pre := nil;
-  if root^.Args[0]^.Kind <> ekVar then
-    root^.Args[0] := HiddenVar(root^.Args[0]^.Typ, pre, root^.Args[0]);
-  if not ((root^.Args[1]^.Kind = ekVar) or (root^.Args[1]^.Kind = ekInt) or
+  root^.Args[0] := HiddenVar(root^.Args[0]^.Typ, pre, root^.Args[0]);
+  if not ((root^.Args[1]^.Kind = ekInt) or
     (root^.Args[1]^.Kind = ekStr) or (root^.Args[1]^.Kind = ekNil)) then
     root^.Args[1] := HiddenVar(root^.Args[1]^.Typ, pre, root^.Args[1]);
-  w := Place;
-  while w <> root do
-  begin
-    if (w^.Kind = ekIndex) and ExprHasCall(w^.R) then
-      Die(Op + '= of a place that calls: assign it' + HerePos);
-    w := w^.L;
-  end;
+  BindIndices(Place);
   if Place = root then
     dest := Place
   else
@@ -20774,6 +21418,39 @@ begin
   Result := NewStmt(skBlock);
   for i := 0 to High(pre) do
     AppendStmt(Result, pre[i]);
+  AppendStmt(Result, st);
+end;
+
+{ Current Go walk/assign.go makes a safe LHS before rewriting op=.
+  A calling place is bound by its typed address, once, before the RHS.
+  The normal stack maps keep that pointer valid across growth and GC.
+  Map/tree entries retain their existing logical binding instead. }
+function TParser.PlaceOpAssign(Place: PExpr; const Op: string; R: PExpr): PStmt;
+var pre: TStmtArray; dest, raw, pointerValue: PExpr; st: PStmt; i: SizeInt;
+begin
+  if MapPlaceRoot(Place) <> nil then
+  begin Result := MapOpAssign(Place, Op, R); Exit end;
+  pre := nil;
+  dest := Place;
+  if ExprHasCall(Place) or ((Place^.Kind <> ekVar) and ExprHasCall(R)) then
+  begin
+    raw := Place;
+    if IsValueView(raw) then raw := raw^.R;
+    pointerValue := HiddenVar(InternPtr(raw^.Typ), pre, NewAddr(raw));
+    dest := NewDeref(pointerValue, raw^.Typ);
+    if IsValueView(Place) then dest := ViewOf(dest, Place^.Typ);
+  end;
+  if IsValueView(dest) then st := ViewStore(dest, MakeBin(Op, dest, R))
+  else
+  begin
+    st := NewStmt(skAssign);
+    st^.Dest := dest;
+    st^.E := ValArg(dest^.Typ, MakeBin(Op, dest, R));
+    if IsBlockNode(st^.E) and (st^.E^.Name = 'rt_blk') then st := BlockStmt(dest, st^.E);
+  end;
+  if Length(pre) = 0 then begin Result := st; Exit end;
+  Result := NewStmt(skBlock);
+  for i := 0 to High(pre) do AppendStmt(Result, pre[i]);
   AppendStmt(Result, st);
 end;
 

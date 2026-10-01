@@ -52,6 +52,7 @@ const
   ORdwr   = 2;
   OAppend = 1024;
   OCreat  = 64;
+  OExcl   = 128;
   OTrunc  = 512;
   ONonblock = 2048;
   ODirectory = 65536;
@@ -66,6 +67,7 @@ function Sys4(Nr, A, B, C, D: Int64): Int64;
   numbers so existing call sites keep working there. arm64 has no
   open, mkdir, access, pipe, dup2, poll, or fork. }
 function OsOpen(Path, Flags, Mode: Int64): Int64;
+function OsOpenAt(DirFd, Path, Flags, Mode: Int64): Int64;
 function OsClose(Fd: Int64): Int64;
 function OsRead(Fd, Buf, N: Int64): Int64;
 function OsWrite(Fd, Buf, N: Int64): Int64;
@@ -82,6 +84,12 @@ function OsFstat(Fd, Buf: Int64): Int64;
 function OsPoll(Fds, Nfds, TimeoutMs: Int64): Int64;
 function OsReadlink(Path, Buf, N: Int64): Int64;
 
+{ Read-only initial process environment, copied before user code.
+  Entry indexes are 1-based; out-of-range entries are empty. }
+function ProcessEnvironmentCount: Integer;
+function ProcessEnvironmentEntry(Index: Integer): string;
+function LookupProcessEnvironment(const Name: string; out Value: string): Boolean;
+
 { System call numbers for the child of a fork, which may only run raw
   Sys1..Sys4 calls: no prologue and no stack check between fork and
   execve. Read them before the fork. NrDup2 is dup2 on amd64 and dup3 on
@@ -94,6 +102,112 @@ function NrDup2: Int64;
 implementation
 
 {$WARN 4055 OFF}
+
+type PInitialEnv = ^PChar;
+var
+  InitialEnvironment: array of string;
+{$ifndef FPC}
+  EnvironmentNames: map[string] of Integer;
+{$endif}
+
+{ Current Go runtime/runtime1.go goenvs_unix: envp follows argv's
+  terminating pointer, at argc+1. Linux's exec ABI owns/validates these
+  NUL-terminated objects, unlike arbitrary user PChar buffers. No raw
+  pointer escapes this unit. Debugger DropArgs preserves this location.
+  Intel SDM MOV/LEA and ARM ARM ADRP/LDR/ADD were read for these stubs. }
+function InitialEnvironmentStart: Pointer;
+begin
+{$ifdef FPC}
+  Result := Pointer(Envp);
+{$else}
+  asm amd64 (Result: out rax)
+    movq rt_argv(%rip), %rax
+    movq rt_argc(%rip), %rcx
+    leaq 8(%rax,%rcx,8), %rax
+  end;
+  asm arm64 (Result: out x0)
+    adrp x0, rt_argv
+    ldr x0, [x0, :lo12:rt_argv]
+    adrp x1, rt_argc
+    ldr x1, [x1, :lo12:rt_argc]
+    add x1, x1, #1
+    add x0, x0, x1, lsl #3
+  end;
+{$endif}
+end;
+
+procedure CopyInitialEnvironment;
+var entries: PInitialEnv; bytes: PChar; count, i, size: Integer;
+{$ifndef FPC}
+  separator: Integer;
+  key: string;
+{$endif}
+begin
+  entries := PInitialEnv(InitialEnvironmentStart);
+  count := 0;
+  if entries <> nil then while entries[count] <> nil do Inc(count);
+  SetLength(InitialEnvironment, count);
+{$ifndef FPC}
+  New(EnvironmentNames, count);
+{$endif}
+  for i := 0 to count - 1 do
+  begin
+    bytes := entries[i];
+    size := 0;
+    while bytes[size] <> #0 do Inc(size);
+    SetLength(InitialEnvironment[i], size);
+    if size > 0 then Move(bytes^, InitialEnvironment[i][1], size);
+{$ifndef FPC}
+    separator := Pos('=', InitialEnvironment[i]);
+    if separator > 1 then
+    begin
+      key := Copy(InitialEnvironment[i], 1, separator - 1);
+      if not (key in EnvironmentNames) then EnvironmentNames[key] := i + 1;
+    end;
+{$endif}
+  end;
+end;
+
+function ProcessEnvironmentCount: Integer;
+begin
+  Result := Length(InitialEnvironment);
+end;
+
+function ProcessEnvironmentEntry(Index: Integer): string;
+begin
+  Result := '';
+  if (Index > 0) and (Index <= Length(InitialEnvironment)) then
+    Result := InitialEnvironment[Index - 1];
+end;
+
+function LookupProcessEnvironment(const Name: string; out Value: string): Boolean;
+var index: Integer;
+{$ifndef FPC}
+  separator: Integer;
+{$endif}
+begin
+  Result := False;
+  Value := '';
+  if (Name = '') or (Pos('=', Name) > 0) or (Pos(#0, Name) > 0) then Exit;
+{$ifdef FPC}
+  for index := 0 to High(InitialEnvironment) do
+    if (Copy(InitialEnvironment[index], 1, Length(Name)) = Name) and
+      (Length(InitialEnvironment[index]) > Length(Name)) and
+      (InitialEnvironment[index][Length(Name) + 1] = '=') then
+    begin
+      Value := Copy(InitialEnvironment[index], Length(Name) + 2);
+      Result := True;
+      Exit;
+    end;
+{$else}
+  if TryGet(EnvironmentNames, Name, index) then
+  begin
+    separator := Length(Name) + 1;
+    Value := Copy(InitialEnvironment[index - 1], separator + 1);
+    Result := True;
+  end;
+{$endif}
+end;
 
 function Sys0(Nr: Int64): Int64;
 begin
@@ -184,6 +298,17 @@ begin
     Result := Sys4(56, -100, Path, ArmOpenFlags(Flags), Mode)
   else
     Result := Sys3(SysOpen, Path, Flags, Mode);
+end;
+
+{ DirFd stabilizes the base directory across process-wide chdir.
+  Use -100 for the process current directory. The flag vocabulary is
+  still amd64's; the existing translation is shared, not duplicated. }
+function OsOpenAt(DirFd, Path, Flags, Mode: Int64): Int64;
+begin
+  if Amd64 = 0 then
+    Result := Sys4(56, DirFd, Path, ArmOpenFlags(Flags), Mode)
+  else
+    Result := Sys4(257, DirFd, Path, Flags, Mode);
 end;
 
 function OsClose(Fd: Int64): Int64;
@@ -323,5 +448,8 @@ begin
   else
     Result := Sys3(SysPoll, Fds, Nfds, TimeoutMs);
 end;
+
+initialization
+  CopyInitialEnvironment;
 
 end.

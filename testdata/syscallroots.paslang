@@ -1,0 +1,243 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+  GPL version 3 or later; see COPYING. No warranty. }
+
+{ P178: more blocked Ms than Ps, growing stacks, live strings and an
+  exception across syscall return migration, per-G Carry, independent
+  SysUtils settings and repeated rounds reusing the no-P M list. }
+program syscallroots;
+
+uses paslinux, paslib, pastime, sysutils;
+
+const
+  Readers = 64;
+  Depth = 12;
+  Rounds = 3;
+
+var
+  pipes: array[0..Readers - 1, 0..1] of Int32;
+  started: chan of Integer;
+  joined: waitgroup;
+  completed, migrated, phase, i, token, firstThreads, deadline: Integer;
+  sent: Byte;
+
+function ThreadCount: Integer;
+var
+  entries: string;
+  k: Integer;
+begin
+  entries := ListDir('/proc/self/task');
+  Result := 0;
+  for k := 1 to Length(entries) do
+    if entries[k] = #10 then Result := Result + 1;
+end;
+
+{ Linux proc_pid_syscall(5): observe the kernel calls, not a guessed
+  delay after Send. Under qemu these are host read(0), on native arm64
+  read(63); match the actual pipe fd as well as the syscall number. }
+function BlockedReads: Integer;
+const
+  TaskPath = '/proc/self/task'#0;
+  Prefix = '/proc/self/task/';
+  Suffix = '/syscall'#0;
+var
+  directoryPath: array[0..31] of Char;
+  path: array[0..127] of Char;
+  entries: array[0..8191] of Byte;
+  state: array[0..255] of Char;
+  directoryFd, syscallFd, count, stateCount, offset, recordSize: Integer;
+  k, nameSize, cursor, number, fd, digit, reader: Integer;
+  seen: array[0..Readers - 1] of Boolean;
+begin
+  { Keep the observer allocation-free. With GCSTRESS=1, constructing
+    hundreds of paths/strings per scan stopped and interrupted the
+    QEMU syscall threads repeatedly; observation itself changed the
+    saturation being measured. No GC or syscall protocol is bypassed. }
+  Result := 0;
+  Move(TaskPath[1], directoryPath[0], Length(TaskPath));
+  directoryFd := OsOpen(Integer(@directoryPath[0]), ORdonly or ODirectory or 524288, 0);
+  if directoryFd < 0 then Halt(37);
+  repeat
+    repeat
+      count := OsGetdents(directoryFd, Integer(@entries[0]), SizeOf(entries));
+    until count <> -4;
+    if count < 0 then Halt(38);
+    offset := 0;
+    while offset < count do
+    begin
+      if count - offset < 20 then Halt(39);
+      recordSize := entries[offset + 16] + entries[offset + 17] * 256;
+      if (recordSize < 20) or (recordSize > count - offset) then Halt(40);
+      nameSize := 0;
+      while (nameSize < recordSize - 19) and (entries[offset + 19 + nameSize] <> 0) do
+        Inc(nameSize);
+      if nameSize = recordSize - 19 then Halt(41);
+      if (nameSize > 0) and (entries[offset + 19] >= 48) and (entries[offset + 19] <= 57) then
+      begin
+        if Length(Prefix) + nameSize + Length(Suffix) > SizeOf(path) then Halt(42);
+        Move(Prefix[1], path[0], Length(Prefix));
+        for k := 0 to nameSize - 1 do path[Length(Prefix) + k] := Chr(entries[offset + 19 + k]);
+        Move(Suffix[1], path[Length(Prefix) + nameSize], Length(Suffix));
+        repeat
+          syscallFd := OsOpen(Integer(@path[0]), ORdonly or 524288, 0);
+        until syscallFd <> -4;
+        if syscallFd >= 0 then
+        begin
+          repeat
+            stateCount := OsRead(syscallFd, Integer(@state[0]), SizeOf(state));
+          until stateCount <> -4;
+          if OsClose(syscallFd) <> 0 then Halt(43);
+          cursor := 0;
+          number := -1;
+          if (stateCount > 0) and (state[0] >= '0') and (state[0] <= '9') then
+          begin
+            number := 0;
+            while (cursor < stateCount) and (state[cursor] >= '0') and (state[cursor] <= '9') do
+            begin
+              number := number * 10 + Ord(state[cursor]) - 48;
+              Inc(cursor);
+            end;
+          end;
+          if ((number = 0) or (number = 63)) and (cursor + 3 < stateCount) then
+          begin
+            Inc(cursor); { space }
+            if (state[cursor] = '0') and (state[cursor + 1] = 'x') then
+            begin
+              cursor := cursor + 2;
+              fd := 0;
+              while (cursor < stateCount) and (state[cursor] <> ' ') do
+              begin
+                digit := Ord(state[cursor]) - 48;
+                if (state[cursor] >= 'a') and (state[cursor] <= 'f') then
+                  digit := Ord(state[cursor]) - 87;
+                if (digit < 0) or (digit > 15) then Halt(44);
+                fd := fd * 16 + digit;
+                Inc(cursor);
+              end;
+              for reader := 0 to Readers - 1 do
+                if (fd = pipes[reader, 0]) and not seen[reader] then
+                begin
+                  seen[reader] := True;
+                  Inc(Result);
+                end;
+            end;
+          end;
+        end;
+      end;
+      offset := offset + recordSize;
+    end;
+  until count = 0;
+  if OsClose(directoryFd) <> 0 then Halt(45);
+end;
+
+function Tid: Integer;
+begin
+  if Amd64 then Result := Syscall(186) else Result := Syscall(178);
+end;
+
+function DeepRead(Index, Level: Integer): Integer;
+var
+  pad: array[0..255] of Integer;
+  held, marker, expected: string;
+  settings: TFormatSettings;
+  beforeTid, count, ignored: Integer;
+  answer: Byte;
+begin
+  pad[0] := Index + Level;
+  pad[255] := Level;
+  held := 'id' + IntToStr(Index) + ':' + IntToStr(Level);
+  if Level > 0 then
+    Result := DeepRead(Index, Level - 1)
+  else
+  begin
+    settings := DefaultFormatSettings;
+    settings.DecimalSeparator := '.';
+    if Odd(Index) then settings.DecimalSeparator := ',';
+    expected := '1' + settings.DecimalSeparator + '25';
+    if FloatToStrF(1.25, ffFixed, 18, 2, settings) <> expected then Halt(20);
+    if FormatDateTime('yyyy-mm-dd', EncodeDate(2026, 10, 1), settings) <> '2026-10-01' then Halt(21);
+    marker := 'bad-' + IntToStr(Index);
+    try
+      ignored := StrToInt(marker);
+      Halt(22);
+    except
+      on E: EConvertError do
+      begin
+        Send(started, Index);
+        beforeTid := Tid;
+        repeat
+          count := OsRead(pipes[Index, 0], Integer(@answer), 1);
+        until count <> -4;
+        if (count <> 1) or (answer <> 42) then Halt(23);
+        if ExceptObject <> E then Halt(24);
+        if Pos(marker, E.Message) = 0 then Halt(25);
+        if beforeTid <> Tid then AtomicAdd(@migrated, 1);
+        Result := count + answer;
+      end;
+    end;
+    if ExceptObject <> nil then Halt(26);
+  end;
+  if held <> 'id' + IntToStr(Index) + ':' + IntToStr(Level) then Halt(27);
+  Result := Result + pad[0] + pad[255];
+end;
+
+procedure Reader(Index: Integer);
+var
+  identity, total: Integer;
+begin
+  identity := Goid;
+  Carry := Odd(Index);
+  SetLastOSError(Index + 1);
+  total := DeepRead(Index, Depth);
+  if total <> Index * (Depth + 1) + Depth * (Depth + 1) + 43 then Halt(28);
+  if (Carry <> Odd(Index)) or (Goid <> identity) then Halt(29);
+  if GetLastOSError <> Index + 1 then Halt(36);
+  AtomicAdd(@completed, 1);
+  joined.Done;
+end;
+
+begin
+  started := MakeChan();
+  sent := 42;
+  for phase := 1 to Rounds do
+  begin
+    for i := 0 to Readers - 1 do
+      if OsPipe(Integer(@pipes[i, 0])) <> 0 then Halt(30);
+    joined.Add(Readers);
+    for i := 0 to Readers - 1 do pas Reader(i);
+    for i := 0 to Readers - 1 do token := Recv(started);
+    deadline := Monotonic + 15000000000;
+    { Seeing the kernel read is not yet seeing sysmon's P handoff.
+      Observe both, so the first phase reaches the same complete
+      saturation as later ones before measuring M reuse. }
+    while (HeapStat(21) < Readers) or (BlockedReads < Readers) do
+    begin
+      if Monotonic > deadline then
+      begin
+        WriteLn('saturation incomplete: reads ', BlockedReads, ', retaken ', HeapStat(21),
+          ', Ms ', HeapStat(20), ', Ps ', HeapStat(22));
+        Halt(35);
+      end;
+      Sleep(10);
+    end;
+    GcCollect;
+    for i := 0 to Readers - 1 do
+      if OsWrite(pipes[i, 1], Integer(@sent), 1) <> 1 then Halt(31);
+    joined.Wait;
+    for i := 0 to Readers - 1 do
+    begin
+      if OsClose(pipes[i, 0]) <> 0 then Halt(32);
+      if OsClose(pipes[i, 1]) <> 0 then Halt(33);
+    end;
+    Sleep(50);
+    GcCollect;
+    if phase = 1 then firstThreads := ThreadCount
+    else if ThreadCount > firstThreads + 2 then
+    begin
+      WriteLn('worker count grew: phase ', phase, ', first ', firstThreads, ', now ', ThreadCount);
+      Halt(34);
+    end;
+  end;
+  WriteLn('blocked roots ', completed, ' moved ', migrated > 0);
+  WriteLn('workers reused');
+end.

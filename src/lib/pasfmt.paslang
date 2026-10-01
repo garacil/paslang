@@ -30,6 +30,54 @@ unit pasfmt;
 
 interface
 
+{ The foreign bootstrap has System.TObject; native code uses our root. }
+{$ifndef FPC}uses pasobject;{$endif}
+
+type
+  TCurrencyFault = (cfOverflow, cfDivideByZero, cfInvalidValue);
+  TCurrencyQuadWords = array[0..1] of Int64;
+  { Primitive arithmetic is independent of the optional SysUtils unit.
+    Like every raised object, this fault belongs to the current G. }
+  ECurrencyError = class(TObject)
+  private
+    FKind: TCurrencyFault;
+    FMessage: string;
+  public
+    constructor Create(AKind: TCurrencyFault);
+    function ToString: string; override;
+    property Kind: TCurrencyFault read FKind;
+    property Message: string read FMessage;
+  end;
+
+{ Currency kernels exchange the signed integer of ten-thousandths,
+  never a binary floating-point approximation of a decimal value. }
+function PasCurrFromInt(V: Int64): Int64;
+function PasCurrFromReal(X: Double): Int64;
+function PasCurrFromQuad(Lo, Hi: Int64): Int64;
+function PasCurrFromQuadWords(const Words: TCurrencyQuadWords): Int64;
+function PasCurrToReal(V: Int64): Double;
+function PasCurrAdd(A, B: Int64): Int64;
+function PasCurrSub(A, B: Int64): Int64;
+function PasCurrMul(A, B: Int64): Int64;
+function PasCurrSqr(V: Int64): Int64;
+{$ifndef FPC}
+function PasCurrFromQuadValue(Value: Quad): Int64;
+{$endif}
+function PasCurrDiv(A, B: Int64): Int64;
+function PasCurrNeg(V: Int64): Int64;
+function PasCurrAbs(V: Int64): Int64;
+function PasCurrTrunc(V: Int64): Int64;
+function PasCurrRound(V: Int64): Int64;
+function PasCurrFloor(V: Int64): Int64;
+function PasCurrCeil(V: Int64): Int64;
+function PasCurrInt(V: Int64): Int64;
+function PasCurrFrac(V: Int64): Int64;
+function PasCurrMin(A, B: Int64): Int64;
+function PasCurrMax(A, B: Int64): Int64;
+function PasTryParseCurrency(const S: string; out V: Int64): Boolean;
+function PasFmtCurrency(V: Int64; W, D: Integer): string;
+function PasCurrencyDigits(V, Mode, N: Int64; out Dp: Int64): string;
+
 function PasFmtReal(X: Double; W, D: Integer): string;
 function PasFmtInt(V: Int64; W: Integer): string;
 function PasFmtStr(const S: string; W: Integer): string;
@@ -1034,12 +1082,20 @@ end;
   of 18 and 21 bits are exact for a Double's. }
 function Log10Pow2Q(X: Int64): Int64;
 begin
+{$ifdef FPC}
+  Result := SarInt64(X * 1292913986, 32);
+{$else}
   Result := (X * 1292913986) sar 32;
+{$endif}
 end;
 
 function SkewedQ(X: Int64): Int64;
 begin
+{$ifdef FPC}
+  Result := SarInt64(X * 1292913986 - 536607788, 32);
+{$else}
   Result := (X * 1292913986 - 536607788) sar 32;
+{$endif}
 end;
 
 { The significand of a Quad with its hidden bit, M, and the power of 2
@@ -1270,6 +1326,341 @@ end;
 function PasFmtStr(const S: string; W: Integer): string;
 begin
   Result := Pad(S, W);
+end;
+
+constructor ECurrencyError.Create(AKind: TCurrencyFault);
+begin
+  FKind := AKind;
+  case AKind of
+    cfOverflow: FMessage := 'Currency overflow';
+    cfDivideByZero: FMessage := 'Currency divide by zero';
+    cfInvalidValue: FMessage := 'invalid Currency value';
+  end;
+end;
+
+function ECurrencyError.ToString: string;
+begin
+  Result := FMessage;
+end;
+
+function CurrMagnitude(V: Int64): Int64;
+begin
+  Result := V;
+  if V < 0 then Result := -V;
+end;
+
+{ Q is unsigned. The sole allowed high-bit magnitude is exactly 2^63
+  when negative: the asymmetric signed boundary is intentional. }
+function CurrSigned(Q: Int64; Negative: Boolean): Int64;
+begin
+  if (Q < 0) and not (Negative and (Q = Low(Int64))) then
+    raise ECurrencyError.Create(cfOverflow);
+  Result := Q;
+  if Negative then Result := -Q;
+end;
+
+function CurrBigSigned(const A: TBig; Negative: Boolean; out V: Int64): Boolean;
+var magnitude: Int64;
+begin
+  Result := False; V := 0;
+  if Length(A) > 2 then Exit;
+  magnitude := A[0];
+  if Length(A) = 2 then magnitude := magnitude or (A[1] shl 32);
+  if (magnitude < 0) and not (Negative and (magnitude = Low(Int64))) then Exit;
+  V := magnitude;
+  if Negative then V := -V;
+  Result := True;
+end;
+
+function CurrBig(V: Int64): TBig;
+begin
+  Result := nil; SetLength(Result, 2);
+  Result[0] := V and 4294967295;
+  Result[1] := V shr 32;
+  BigTrim(Result);
+end;
+
+function PasCurrFromInt(V: Int64): Int64;
+begin
+  if (V < -922337203685477) or (V > 922337203685477) then
+    raise ECurrencyError.Create(cfOverflow);
+  Result := V * 10000;
+end;
+
+function PasCurrAdd(A, B: Int64): Int64;
+begin
+  Result := A + B;
+  if ((A xor Result) and (B xor Result)) < 0 then
+    raise ECurrencyError.Create(cfOverflow);
+end;
+
+function PasCurrSub(A, B: Int64): Int64;
+begin
+  Result := A - B;
+  if ((A xor B) and (A xor Result)) < 0 then
+    raise ECurrencyError.Create(cfOverflow);
+end;
+
+function PasCurrNeg(V: Int64): Int64;
+begin
+  if V = Low(Int64) then raise ECurrencyError.Create(cfOverflow);
+  Result := -V;
+end;
+
+function PasCurrAbs(V: Int64): Int64;
+begin
+  Result := V;
+  if V < 0 then Result := PasCurrNeg(V);
+end;
+
+{ Go math/big/float.go round: the discarded half and sticky remainder
+  determine one nearest-even decision. The native product/division use
+  the existing machine-word kernels, not new assembler in this unit. }
+procedure CurrWideMul(A, B: Int64; out Hi, Lo: Int64);
+{$ifdef FPC}
+var a0, a1, b0, b1, t, middle, carry: Int64;
+{$endif}
+begin
+{$ifdef FPC}
+  a0 := A and 4294967295; a1 := A shr 32;
+  b0 := B and 4294967295; b1 := B shr 32;
+  t := a0 * b0; Lo := t and 4294967295;
+  t := a1 * b0 + (t shr 32); middle := t and 4294967295;
+  carry := t shr 32; t := a0 * b1 + middle;
+  Hi := a1 * b1 + carry + (t shr 32);
+  Lo := Lo or (t shl 32);
+{$else}
+  Mul128(A, B, Hi, Lo);
+{$endif}
+end;
+
+procedure CurrWideDiv(Hi, Lo, Denominator: Int64; out Q, R: Int64);
+{$ifdef FPC}
+var numerator, divisor, quotient, remainder: TBig;
+{$endif}
+begin
+{$ifdef FPC}
+  numerator := nil; SetLength(numerator, 4);
+  numerator[0] := Lo and 4294967295; numerator[1] := Lo shr 32;
+  numerator[2] := Hi and 4294967295; numerator[3] := Hi shr 32;
+  BigTrim(numerator); divisor := CurrBig(Denominator);
+  BigDivMod(numerator, divisor, quotient, remainder);
+  Q := quotient[0];
+  if Length(quotient) = 2 then Q := Q or (quotient[1] shl 32);
+  R := remainder[0];
+  if Length(remainder) = 2 then R := R or (remainder[1] shl 32);
+{$else}
+  DivMod128(Hi, Lo, Denominator, Q, R);
+{$endif}
+end;
+
+function CurrQuotient(Hi, Lo, Denominator: Int64; Negative: Boolean): Int64;
+var q, r, half: Int64;
+begin
+  { Native DivMod128 requires an unsigned quotient that fits one word.
+    Hi is nonnegative here; a negative denominator means exactly 2^63. }
+  if (Denominator >= 0) and (Hi >= Denominator) then
+    raise ECurrencyError.Create(cfOverflow);
+  CurrWideDiv(Hi, Lo, Denominator, q, r);
+  half := Denominator shr 1;
+  if (r > half) or ((r = half) and ((Denominator and 1) = 0) and Odd(q)) then
+  begin
+    if q = -1 then raise ECurrencyError.Create(cfOverflow);
+    q := q + 1;
+  end;
+  Result := CurrSigned(q, Negative);
+end;
+
+function PasCurrMul(A, B: Int64): Int64;
+var hi, lo: Int64;
+begin
+  CurrWideMul(CurrMagnitude(A), CurrMagnitude(B), hi, lo);
+  Result := CurrQuotient(hi, lo, 10000, (A < 0) <> (B < 0));
+end;
+
+function PasCurrDiv(A, B: Int64): Int64;
+var hi, lo: Int64;
+begin
+  if B = 0 then raise ECurrencyError.Create(cfDivideByZero);
+  CurrWideMul(CurrMagnitude(A), 10000, hi, lo);
+  Result := CurrQuotient(hi, lo, CurrMagnitude(B), (A < 0) <> (B < 0));
+end;
+
+function PasCurrSqr(V: Int64): Int64;
+begin Result := PasCurrMul(V, V) end;
+
+{$ifndef FPC}
+function PasCurrFromQuadValue(Value: Quad): Int64;
+var words: TCurrencyQuadWords;
+begin
+  Move(Value, words, SizeOf(words));
+  Result := PasCurrFromQuad(words[0], words[1]);
+end;
+{$endif}
+
+function PasCurrTrunc(V: Int64): Int64;
+begin
+  Result := V div 10000;
+end;
+
+function PasCurrRound(V: Int64): Int64;
+var remainder: Int64;
+begin
+  Result := V div 10000; remainder := V mod 10000;
+  if (Abs(remainder) > 5000) or ((Abs(remainder) = 5000) and Odd(Result)) then
+    if V < 0 then Result := Result - 1 else Result := Result + 1;
+end;
+
+function PasCurrFloor(V: Int64): Int64;
+begin
+  Result := V div 10000;
+  if (V < 0) and ((V mod 10000) <> 0) then Result := Result - 1;
+end;
+
+function PasCurrCeil(V: Int64): Int64;
+begin
+  Result := V div 10000;
+  if (V > 0) and ((V mod 10000) <> 0) then Result := Result + 1;
+end;
+
+function PasCurrInt(V: Int64): Int64;
+begin Result := (V div 10000) * 10000 end;
+
+function PasCurrFrac(V: Int64): Int64;
+begin Result := V mod 10000 end;
+
+function PasCurrMin(A, B: Int64): Int64;
+begin if A < B then Result := A else Result := B end;
+
+function PasCurrMax(A, B: Int64): Int64;
+begin if A > B then Result := A else Result := B end;
+
+function PasTryParseCurrency(const S: string; out V: Int64): Boolean;
+var magnitude: TBig; negative: Boolean; digits, exponent, cls: Integer;
+begin
+  V := 0; Result := False;
+  if not ScanReal(S, negative, magnitude, digits, exponent) then Exit;
+  if BigIsZero(magnitude) then begin Result := True; Exit end;
+  exponent := exponent + 4;
+  { At most 19 scaled digits fit. A magnitude strictly below a tenth
+    of one scaled unit rounds to zero without constructing 10^100000. }
+  if digits + exponent > 19 then Exit;
+  if digits + exponent < 0 then begin Result := True; Exit end;
+  if exponent >= 0 then BigMulPow10(magnitude, exponent)
+  else
+  begin
+    BigDivPow10(magnitude, -exponent, cls);
+    BigRoundCls(magnitude, cls);
+  end;
+  Result := CurrBigSigned(magnitude, negative, V);
+end;
+
+function PasCurrFromReal(X: Double): Int64;
+var bits, field, mantissa: Int64; exponent: Integer; magnitude: TBig;
+begin
+  bits := 0;
+  Move(X, bits, 8); field := (bits shr 52) and 2047;
+  if field = 2047 then raise ECurrencyError.Create(cfInvalidValue);
+  mantissa := bits and 4503599627370495;
+  if field = 0 then exponent := -1074
+  else
+  begin
+    mantissa := mantissa or 4503599627370496;
+    exponent := field - 1075;
+  end;
+  magnitude := CurrBig(mantissa); BigMulSmall(magnitude, 10000);
+  if exponent >= 0 then BigShl(magnitude, exponent)
+  else BigShrRound(magnitude, -exponent);
+  if not CurrBigSigned(magnitude, bits < 0, Result) then
+    raise ECurrencyError.Create(cfOverflow);
+end;
+
+function PasCurrFromQuad(Lo, Hi: Int64): Int64;
+var mantissa, magnitude: TBig; exponent, field: Int64; kind, cls: Integer;
+begin
+  QuadParts(Lo, Hi, mantissa, exponent, field, kind);
+  if kind = 2 then raise ECurrencyError.Create(cfInvalidValue);
+  QuadScale(mantissa, exponent, 4, magnitude, cls);
+  BigRoundCls(magnitude, cls);
+  if not CurrBigSigned(magnitude, Hi < 0, Result) then
+    raise ECurrencyError.Create(cfOverflow);
+end;
+
+function PasCurrFromQuadWords(const Words: TCurrencyQuadWords): Int64;
+begin Result := PasCurrFromQuad(Words[0], Words[1]) end;
+
+{ A decimal of four places is already exact. Precision requests alter
+  the integer scale, round once, and reuse the common formatting engine.
+  There is no intermediate Double/Quad or dependence on a CPU FP mode. }
+function PasCurrencyDigits(V, Mode, N: Int64; out Dp: Int64): string;
+var magnitude: TBig; shift: Int64; cls: Integer;
+begin
+  Dp := 0; Result := '';
+  if V = 0 then Exit;
+  magnitude := CurrBig(CurrMagnitude(V));
+  Result := BigToDec(BigCopy(magnitude));
+  Dp := Length(Result) - 4;
+  if Mode = 1 then
+  begin
+    if N < 1 then N := 1;
+    shift := N - Dp - 4;
+  end
+  else if Mode = 2 then shift := N - 4
+  else shift := 0;
+  if shift > 0 then BigMulPow10(magnitude, shift)
+  else if shift < 0 then
+  begin
+    BigDivPow10(magnitude, -shift, cls);
+    BigRoundCls(magnitude, cls);
+  end;
+  if BigIsZero(magnitude) then begin Result := ''; Dp := 0; Exit end;
+  Result := BigToDec(magnitude);
+  Dp := Length(Result) - 4 - shift;
+  while (Length(Result) > 1) and (Result[Length(Result)] = '0') do
+    SetLength(Result, Length(Result) - 1);
+end;
+
+function PasFmtCurrency(V: Int64; W, D: Integer): string;
+var digits, text: string; dp, places, count, index, offset, total: Int64;
+begin
+  if D < -1 then raise ECurrencyError.Create(cfInvalidValue);
+  if D = -1 then digits := PasCurrencyDigits(V, 0, 0, dp)
+  else digits := PasCurrencyDigits(V, 2, D, dp);
+  places := D;
+  if places < 0 then
+  begin
+    places := Length(digits) - dp;
+    if places < 0 then places := 0;
+  end;
+  count := dp; if count < 1 then count := 1;
+  offset := 0;
+  if (V < 0) and (digits <> '') then offset := 1;
+  if places > High(Int64) - count - offset - 1 then
+    raise ECurrencyError.Create(cfOverflow);
+  total := offset + count + places;
+  if places > 0 then total := total + 1;
+  text := ''; SetLength(text, total);
+  FillChar(text[1], total, 48);
+  if offset > 0 then text[1] := '-';
+  for index := 1 to dp do
+    if index <= Length(digits) then text[offset + index] := digits[index];
+  if places > 0 then
+  begin
+    text[offset + count + 1] := '.';
+    for index := 1 to places do
+      if (dp + index > 0) and (dp + index <= Length(digits)) then
+        text[offset + count + 1 + index] := digits[dp + index];
+  end;
+  Result := Pad(text, W);
+end;
+
+function PasCurrToReal(V: Int64): Double;
+var bits: Int64;
+begin
+  Result := 0;
+  if not PasParseReal(PasFmtCurrency(V, 0, -1), bits) then
+    raise ECurrencyError.Create(cfInvalidValue);
+  Move(bits, Result, 8);
 end;
 
 end.

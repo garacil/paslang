@@ -58,7 +58,7 @@ PASLANG_SRC := \
 	src/lib/paslinux.paslang \
 	cmd/paslangc/paslangc.paslang
 
-.PHONY: package distpkg release-assets bench-rounds all hello check check-arm64 clean hostsrc self self-arm64 stage compilers core core-arm64 libs libs-arm64 bench manual \
+.PHONY: package distpkg release-assets check-release bench-rounds all hello check check-arm64 clean hostsrc self self-arm64 stage compilers core core-arm64 libs libs-arm64 bench manual \
 	install install-strip uninstall installdirs installcheck \
 	mostlyclean distclean maintainer-clean
 
@@ -96,6 +96,24 @@ GOLDEN += treewide
 GOLDEN_A64 += treewide
 GOLDEN += recstatic
 GOLDEN_A64 += recstatic
+GOLDEN += nestednames nestedmore nestedgeneric genericlocal
+GOLDEN_A64 += nestednames nestedmore nestedgeneric genericlocal
+GOLDEN += forkguard forksignals
+GOLDEN_A64 += forkguard forksignals
+GOLDEN += textcasts
+GOLDEN_A64 += textcasts
+GOLDEN += syshelpers sysguid
+GOLDEN_A64 += syshelpers sysguid
+GOLDEN += sysfamilies
+GOLDEN_A64 += sysfamilies
+GOLDEN += currency1 syscurrency corekinds
+GOLDEN_A64 += currency1 syscurrency corekinds
+GOLDEN += placeonce dwarfcurrency selectflow realincplace quadincplace intcompplace
+GOLDEN_A64 += placeonce dwarfcurrency selectflow realincplace quadincplace intcompplace
+GOLDEN += arrayidentity
+GOLDEN_A64 += arrayidentity
+GOLDEN += debuggrow
+GOLDEN_A64 += debuggrow
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -354,7 +372,7 @@ bench: $(OUTDIR)/paslangc core
 # The debugger's terminal (P118): pasdbg <socket> speaks to a program
 # compiled with -debug and run with PASLANG_DEBUG=<socket>.
 $(OUTDIR)/pasdbg: $(OUTDIR)/paslangc libs cmd/pasdbg/pasdbg.paslang
-	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(OUTDIR)/pasdbg cmd/pasdbg/pasdbg.paslang
+	$(OUTDIR)/paslangc -cpu base -Fu $(BUILDDIR) -o $(OUTDIR)/pasdbg cmd/pasdbg/pasdbg.paslang
 
 # The three servers against their Go twins (P115): scripts/bench/servers.py.
 # The pairs again in alternating rounds (scripts/bench/rounds.py), the
@@ -367,6 +385,9 @@ bench-servers: $(OUTDIR)/paslangc core libs
 	PATH=$(OUTDIR):$$PATH python3 scripts/bench/servers.py -n 3 --json $(BUILDDIR)/bench/servers.json
 
 check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch64-static
+	@python3 scripts/check_recipes.py
+	@python3 scripts/check_debug_growth.py "$(OUTDIR)/paslangc" "$(BUILDDIR)" $(QEMU_A64)
+	@sh scripts/check_bootstrap.sh "$(BUILDDIR)"
 	@set -e; \
 	xrun=""; \
 	if command -v Xvfb > /dev/null 2>&1; then \
@@ -1066,8 +1087,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  'argument:a real does not go into Integer: Trunc or Round says how at 12:7' \
 	  'exitreal:a real does not go into Integer: Trunc or Round says how at 5:13' \
 	  'boolreal:a real does not go into Boolean at 7:9' \
-	  'ordreal:Ord of a real: Trunc or Round says how at 6:17' \
-	  'inccall:Inc of a real place that calls: assign it at 11:12'; do \
+	  'ordreal:Ord of a real: Trunc or Round says how at 6:17'; do \
 	  n=$${f%%:*}; w=$${f#*:}; \
 	  if $(OUTDIR)/paslangc -o $(BUILDDIR)/rb_$$n testdata/realbad/$$n.paslang >$(BUILDDIR)/rb_$$n.err 2>&1; then \
 	    echo "$$n should fail"; exit 1; \
@@ -1147,8 +1167,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  'fromstr:a string does not become a Quad at 19:11' \
 	  'toobig:constant 1e5000 does not fit Quad at 19:14' \
 	  'quaddiv:a Quad takes +, -, *, / and the comparisons at 19:15' \
-	  'quadnot:not does not take a real at 19:13' \
-	  'incall:Inc of a Quad place that calls: assign it at 19:12'; do \
+	  'quadnot:not does not take a real at 19:13'; do \
 	  n=$${f%%:*}; w=$${f#*:}; \
 	  if $(OUTDIR)/paslangc -o $(BUILDDIR)/qb_$$n testdata/quadbad/$$n.paslang >$(BUILDDIR)/qb_$$n.err 2>&1; then \
 	    echo "$$n should fail"; exit 1; \
@@ -1159,8 +1178,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	echo "==== 1.0.116 rejects: bits, operands, Booleans, declarations ===="; \
 	$(OUTDIR)/paslangc testdata/units/visu.paslang; \
 	$(OUTDIR)/paslangc testdata/units/visd.paslang; \
-	for f in 'callplace:+= of a place that calls: assign it at 22:11 in testdata/bitbad/callplace.paslang' \
-	  'notplace:+= needs a variable at 22:8' \
+	for f in 'notplace:+= needs a variable at 22:8' \
 	  'narrow:Integer needs a conversion to Byte at 22:9' \
 	  'realnand:nand does not take a real at 22:16' \
 	  'realrol:rol does not take a real at 22:15' \
@@ -1661,7 +1679,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(OUTDIR)/paslangc testdata/units/dbl.paslang; \
 	test -f $(BUILDDIR)/adder.pi; \
 	test -f $(BUILDDIR)/dbl.pi; \
-	grep -q PASLANGI21 $(BUILDDIR)/adder.pi; \
+	grep -q PASLANGI25 $(BUILDDIR)/adder.pi; \
 	$(OUTDIR)/paslangc testdata/units/quadimpl.paslang; \
 	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/quadimplmain testdata/quadimpl.paslang; \
 	$(BUILDDIR)/quadimplmain > $(BUILDDIR)/quadimpl.got; \
@@ -1691,8 +1709,8 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(OUTDIR)/paslangc -Fu $(BUILDDIR) testdata/units/visd.paslang; \
 	grep -q '^FLD FPriv 16 1 2$$' $(BUILDDIR)/visu.pi; \
 	grep -q '^PROP ProtProp 1 FProt FProt 32 32 0 0 1 0$$' $(BUILDDIR)/visu.pi; \
-	: TVisBase descends from TObject, type 17, the first after the builtins, and has its 6 slots and 2 of its own: its Destroy is slot 0 P121; \
-	grep -q '^CLASS 17 8 ' $(BUILDDIR)/visu.pi; \
+	: TVisBase descends from TObject, type 18 after Currency, and has its 6 slots and 2 of its own: its Destroy is slot 0 P121; \
+	grep -q '^CLASS 18 8 ' $(BUILDDIR)/visu.pi; \
 	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/visuse testdata/units/visuse.paslang; \
 	$(BUILDDIR)/visuse > $(BUILDDIR)/visuse.got; \
 	diff -u testdata/units/visuse.out $(BUILDDIR)/visuse.got; \
@@ -1847,6 +1865,24 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	timeout 60 $(QEMU_A64) $(BUILDDIR)/nestuse-arm > $(BUILDDIR)/nestuse-arm.got; \
 	diff -u testdata/units/nestuse.out $(BUILDDIR)/nestuse-arm.got; \
 	: records with methods and properties across a unit, and their private members, P165; \
+	sh scripts/check_scoped_types.sh "$(OUTDIR)/paslangc" "$(BUILDDIR)" $(QEMU_A64); \
+	python3 scripts/check_syscalls.py "$(OUTDIR)/paslangc" "$(BUILDDIR)" $(QEMU_A64); \
+	python3 scripts/check_sysutils.py "$(OUTDIR)/paslangc" "$(BUILDDIR)" $(QEMU_A64); \
+	python3 scripts/check_currency_language.py "$(OUTDIR)/paslangc" "$(BUILDDIR)" $(QEMU_A64); \
+	for level in 0 40; do \
+	  for cpu in native base; do \
+	    $(OUTDIR)/paslangc -inline $$level -cpu $$cpu -Fu $(BUILDDIR) -o $(BUILDDIR)/currencykernelmodel testdata/currencykernelmodel.paslang; \
+	    python3 scripts/check_currency.py $(BUILDDIR)/currencykernelmodel; \
+	    $(OUTDIR)/paslangc -inline $$level -cpu $$cpu -Fu $(BUILDDIR) -o $(BUILDDIR)/currencyfrontendmodel testdata/currencyfrontendmodel.paslang; \
+	    python3 scripts/check_currency.py --frontend $(BUILDDIR)/currencyfrontendmodel; \
+	  done; \
+	  for cpu in max base; do \
+	    $(OUTDIR)/paslangc -target arm64 -inline $$level -cpu $$cpu -Fu $(A64DIR) -o $(BUILDDIR)/currencykernelmodel-arm testdata/currencykernelmodel.paslang; \
+	    python3 scripts/check_currency.py $(QEMU_A64) $(BUILDDIR)/currencykernelmodel-arm; \
+	    $(OUTDIR)/paslangc -target arm64 -inline $$level -cpu $$cpu -Fu $(A64DIR) -o $(BUILDDIR)/currencyfrontendmodel-arm testdata/currencyfrontendmodel.paslang; \
+	    python3 scripts/check_currency.py --frontend $(QEMU_A64) $(BUILDDIR)/currencyfrontendmodel-arm; \
+	  done; \
+	done; \
 	$(OUTDIR)/paslangc testdata/units/recu.paslang; \
 	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/recuse testdata/units/recuse.paslang; \
 	$(BUILDDIR)/recuse > $(BUILDDIR)/recuse.got; \
@@ -2013,112 +2049,132 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(BUILDDIR)/twiceuse > $(BUILDDIR)/twiceuse.got; \
 	diff -u testdata/units/twiceuse.out $(BUILDDIR)/twiceuse.got; \
 	rm -rf $(BUILDDIR)/oldpi; mkdir -p $(BUILDDIR)/oldpi; \
-	sed '1s/PASLANGI21/PASLANGI1/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI25/PASLANGI1/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	cp $(BUILDDIR)/dbl.o $(BUILDDIR)/oldpi/; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.0.49 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.0.49; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI21/PASLANGI2/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI25/PASLANGI2/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.0.55 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.0.55; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI21/PASLANGI3/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI25/PASLANGI3/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.0.58 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.0.58; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI21/PASLANGI4/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI25/PASLANGI4/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.0.87 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.0.87; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI21/PASLANGI5/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI25/PASLANGI5/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.0.91 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.0.91; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI21/PASLANGI6/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI25/PASLANGI6/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.0.104 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.0.104; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI21/PASLANGI7/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI25/PASLANGI7/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.0.108 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.0.108; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI21/PASLANGI8/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI25/PASLANGI8/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.0.110 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.0.110; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI21/PASLANGI9/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI25/PASLANGI9/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.0.114 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.0.114; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI21/PASLANGI10/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI25/PASLANGI10/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.0.125 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.0.125; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI21/PASLANGI11/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI25/PASLANGI11/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.0.133 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.0.133; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI21/PASLANGI12/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI25/PASLANGI12/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.0.137 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.0.137; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI21/PASLANGI13/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI25/PASLANGI13/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.1.2 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.1.2; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI21/PASLANGI14/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI25/PASLANGI14/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.1.4 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.1.4; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI21/PASLANGI15/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI25/PASLANGI15/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.1.6 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.1.6; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI21/PASLANGI16/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI25/PASLANGI16/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.1.7 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.1.7; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI21/PASLANGI17/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI25/PASLANGI17/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.1.8 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.1.8; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI21/PASLANGI18/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI25/PASLANGI18/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.1.9 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.1.9; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI21/PASLANGI19/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI25/PASLANGI19/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.1.28 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.1.28; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI21/PASLANGI20/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI25/PASLANGI20/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.1.37 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.1.37; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI21/PASLANGI22/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI25/PASLANGI21/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
+	  echo 'an interface without nested namespaces should be refused'; exit 1; \
+	fi; \
+	grep -q 'compiled by a paslang older than 1.1.44; compile dbl again' $(BUILDDIR)/oldpi.err; \
+	sed '1s/PASLANGI25/PASLANGI22/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
+	  echo 'an interface without generic instance identity should be refused'; exit 1; \
+	fi; \
+	grep -q 'compiled by a paslang older than 1.1.47; compile dbl again' $(BUILDDIR)/oldpi.err; \
+	sed '1s/PASLANGI25/PASLANGI23/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
+	  echo 'an interface without all type aliases should be refused'; exit 1; \
+	fi; \
+	grep -q 'compiled by a paslang older than 1.1.48; compile dbl again' $(BUILDDIR)/oldpi.err; \
+	sed '1s/PASLANGI25/PASLANGI24/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
+	  echo 'an interface without Currency builtin identity should be refused'; exit 1; \
+	fi; \
+	grep -q 'compiled by a paslang older than 1.1.79; compile dbl again' $(BUILDDIR)/oldpi.err; \
+	sed '1s/PASLANGI25/PASLANGI26/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from a later paslang should be refused'; exit 1; \
 	fi; \
-	grep -q 'was compiled by a newer paslang (PASLANGI22); compile dbl again with this one' $(BUILDDIR)/oldpi.err; \
+	grep -q 'was compiled by a newer paslang (PASLANGI26); compile dbl again with this one' $(BUILDDIR)/oldpi.err; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/pisum testdata/units/pisum.paslang; \
 	sed 's/^TYPE Byte 6 1 1 /TYPE Byte 6 1 4 /' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	$(BUILDDIR)/pisum $(BUILDDIR)/oldpi/dbl.pi; \
@@ -2346,7 +2402,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	test "$$ticks" -lt 20; \
 	echo "ok idlecpu ($$ticks user ticks after one second)"; \
 	echo "==== examples ===="; \
-	for t in hello values control routines varargs records classes registry helpers convert report generics errors excobjects bank concurrent fanin maps sync wordcount strings maths narrow pointers single quad bits rotations carry bigrot bitfields wide atomics views vectors machine assembly hashes closures slices properties cleanup pipeline kvstore sorting timeout digest bitmap trees dates; do \
+	for t in hello values control routines varargs records scopedtypes classes registry helpers convert report money systemerrors boundedfiles filemetadata directories paths environments processes temporaryresources systempaths textbuilding textencoding textbuffers valuehelpers identifiers generics errors excobjects bank concurrent blockedio fanin maps sync wordcount strings maths narrow pointers single quad bits rotations carry bigrot bitfields wide atomics views vectors machine assembly hashes closures slices properties cleanup pipeline kvstore sorting timeout digest bitmap trees dates; do \
 	  $(OUTDIR)/paslangc -o $(BUILDDIR)/ex_$$t examples/$$t.paslang; \
 	  $(BUILDDIR)/ex_$$t > $(BUILDDIR)/ex_$$t.got; \
 	  diff -u examples/$$t.out $(BUILDDIR)/ex_$$t.got; \
@@ -2622,7 +2678,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	done; \
 	echo ok deadlock-arm; \
 	echo "==== examples arm64 ===="; \
-	for t in hello values control routines varargs records classes registry helpers convert report generics errors excobjects bank concurrent fanin maps sync wordcount strings maths narrow pointers single quad bits rotations carry bigrot bitfields wide atomics views vectors machine assembly hashes closures slices properties cleanup pipeline kvstore sorting timeout digest bitmap trees dates; do \
+	for t in hello values control routines varargs records scopedtypes classes registry helpers convert report money systemerrors boundedfiles filemetadata directories paths environments processes temporaryresources systempaths textbuilding textencoding textbuffers valuehelpers identifiers generics errors excobjects bank concurrent blockedio fanin maps sync wordcount strings maths narrow pointers single quad bits rotations carry bigrot bitfields wide atomics views vectors machine assembly hashes closures slices properties cleanup pipeline kvstore sorting timeout digest bitmap trees dates; do \
 	  $(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/ex_$$t-arm examples/$$t.paslang; \
 	  timeout 60 $(QEMU_A64) $(BUILDDIR)/ex_$$t-arm > $(BUILDDIR)/ex_$$t-arm.got; \
 	  diff -u examples/$$t.out $(BUILDDIR)/ex_$$t-arm.got; \
@@ -2655,10 +2711,16 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	grep -q 'hello world' $(BUILDDIR)/hello-lex-arm.got; \
 	echo ok compiler-lex-arm; \
 	echo "==== compiler emit arm64 ===="; \
-	timeout 60 $(QEMU_A64) $(OUTDIR)/paslangc-arm64 -o $(BUILDDIR)/hello-byarm testdata/hello.paslang > $(BUILDDIR)/hello-byarm.log 2>&1; \
-	test -s $(BUILDDIR)/hello-byarm.s; \
-	$(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/hello-bycross testdata/hello.paslang; \
-	diff -u $(BUILDDIR)/hello-byarm.s $(BUILDDIR)/hello-bycross.s; \
+	: native and cross defaults intentionally differ, so compare identical explicit CPU profiles; \
+	for cpu in base max; do \
+	  model=max; if [ $$cpu = base ]; then model=cortex-a53; fi; \
+	  timeout 60 $(QEMU_A64) -cpu $$model $(OUTDIR)/paslangc-arm64 -cpu $$cpu -o $(BUILDDIR)/hello-byarm-$$cpu testdata/hello.paslang > $(BUILDDIR)/hello-byarm-$$cpu.log 2>&1; \
+	  test -s $(BUILDDIR)/hello-byarm-$$cpu.s; \
+	  $(OUTDIR)/paslangc -target arm64 -cpu $$cpu -o $(BUILDDIR)/hello-bycross-$$cpu testdata/hello.paslang; \
+	  diff -u $(BUILDDIR)/hello-byarm-$$cpu.s $(BUILDDIR)/hello-bycross-$$cpu.s; \
+	  timeout 20 $(QEMU_A64) -cpu $$model $(BUILDDIR)/hello-byarm-$$cpu > $(BUILDDIR)/hello-byarm-$$cpu.got; \
+	  diff -u testdata/hello.out $(BUILDDIR)/hello-byarm-$$cpu.got; \
+	done; \
 	echo ok compiler-emit-arm; \
 	echo "==== sysid arm64 ===="; \
 	$(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/sysid-arm testdata/sysid.paslang; \
@@ -3036,7 +3098,7 @@ package: all compilers $(OUTDIR)/pasdbg
 	    done; \
 	  else \
 	    cp $(OUTDIR)/paslangc-arm64 $$d/bin/paslangc; \
-	    $(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $$d/bin/pasdbg cmd/pasdbg/pasdbg.paslang; \
+	    $(OUTDIR)/paslangc -target arm64 -cpu base -Fu $(A64DIR) -o $$d/bin/pasdbg cmd/pasdbg/pasdbg.paslang; \
 	    rm -f $$d/bin/pasdbg.o $$d/bin/pasdbg.s $$d/bin/pasdbg.ld; \
 	  fi; \
 	  for u in $(CORE_UNITS) $(LIB_UNITS); do \
@@ -3056,6 +3118,10 @@ package: all compilers $(OUTDIR)/pasdbg
 # .tgz, each installing under /usr, into build/pkg/dist.
 distpkg: package
 	python3 scripts/distpkg.py
+
+# Validate all archive formats and execute both relocated package compilers.
+check-release: release-assets
+	python3 scripts/check_release.py
 
 # Everything a release carries, in build/pkg/release: the two archives
 # of make package for this version (an older version's, left in

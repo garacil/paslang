@@ -98,11 +98,12 @@ type
     Id: Integer;
     Line: Integer;
     Fn: Integer;
-    Frame: Integer;
+    Frame: Integer;      { distance from GRec's stack high, never an absolute address }
+    GRec: Pointer;       { the runtime G record never moves }
     Stopped: Boolean;
     Freeze: Boolean;
     Step: Integer;       { 0 none, 1 a line, 2 a line in this frame or an outer one }
-    StepFrame: Integer;
+    StepFrame: Integer;  { the same stack-relative distance }
     Resume: chan of Integer;
   end;
 
@@ -405,12 +406,27 @@ begin
       end;
     9:
       Result := IntToStr(PInt(A)^);
+    11:
+      Result := PasFmtCurrency(PInt(A)^, 0, -1);
   else
     Result := '<' + IntToStr(Size) + ' bytes>';
   end;
 end;
 
 { ---- the states of the routines ---- }
+
+{ Current Go runtime/stubs.go getg: use the dedicated G register, not
+  a traversal of allgs (whose array can grow concurrently). Intel SDM
+  MOV and ARM ARM MOV(register)/ORR were read: only Result changes. }
+function CurrentRoutine: Pointer;
+begin
+  asm amd64 (Result: out rax)
+    movq %r14, %rax
+  end;
+  asm arm64 (Result: out x0)
+    mov x0, x28
+  end;
+end;
 
 function StateOf(G: Integer): PGState;
 var
@@ -423,6 +439,7 @@ begin
     st^.Line := 0;
     st^.Fn := 0;
     st^.Frame := 0;
+    st^.GRec := nil;
     st^.Stopped := False;
     st^.Freeze := False;
     st^.Step := 0;
@@ -468,11 +485,15 @@ begin
   st := StateOf(g);
   st^.Line := Line;
   st^.Fn := Integer(Fn);
-  st^.Frame := Integer(Frame);
+  st^.GRec := CurrentRoutine;
+  { Go stack.go copystack preserves each frame's distance from stack.hi.
+    Frame is a typed stack root and moves if any preceding call grows
+    this G. No call separates the high load from the subtraction. }
+  st^.Frame := PInt(Integer(st^.GRec) + 8)^ - Integer(Frame);
   stop := False;
   if st^.Step = 1 then
     stop := True
-  else if (st^.Step = 2) and (Integer(Frame) >= st^.StepFrame) then
+  else if (st^.Step = 2) and (st^.Frame <= st^.StepFrame) then
     stop := True
   else if PauseAll or st^.Freeze then
     stop := True
@@ -663,9 +684,17 @@ procedure Frames(C: Integer; St: PGState; Want: Integer; out OutBp, OutFn: Integ
 var
   bp, ret, f, depth: Integer;
 begin
-  OutBp := St^.Frame;
+  { Stopped is published before Unlock/Send/Recv finish. Wait for the
+    runtime's release-published waiting state before resolving an address.
+    The Guard held by the server prevents resume; after notification the
+    G executes only leaf channel runtime code until Recv parks, so even a
+    full Stops buffer cannot introduce another stack-growth safe point.
+    Like Go preempt.go suspendG, never inspect a running/moving stack. }
+  while AtomicLoad(PInt32(Integer(St^.GRec) + 152)^) <> 2 do
+    Sleep(1);
+  OutBp := PInt(Integer(St^.GRec) + 8)^ - St^.Frame;
   OutFn := FnByStart(St^.Fn);
-  bp := St^.Frame;
+  bp := OutBp;
   f := OutFn;
   depth := 0;
   if (Want < 0) and (f >= 0) then
@@ -737,7 +766,7 @@ begin
     g := PInt(arr + i * 8)^;
     if g = 0 then
       Continue;
-    st := PInt32(g + 152)^;
+    st := AtomicLoad(PInt32(g + 152)^);
     if st = 4 then
       Continue;
     id := PInt(g + 176)^;

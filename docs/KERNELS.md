@@ -47,6 +47,24 @@ for each machine (its license is in `LICENSE-GO`);
 | `PasCaseMapCpu` | `UpCase` and `LowerCase` of a string: its ASCII letters' case bit flipped | amd64 AVX2 (`avx2`): `vpsubb`, `vpminub` and `vpcmpeqb` mark the letters, `vpand` and `vpxor` flip bit 32, 32 bytes a step; arm64 NEON: `sub`, `cmhi`, `and`, `eor`, 16 a step | `PasCaseMapBase`: the same on SSE2, 16 bytes a step; `PasCaseMapPlain` | `testdata/strkern`, `strwords` | `passtr` |
 | `rt_streq`, `rt_strcmp` | string `=` and `<>`, and `<`, `<=`, `>`, `>=` (the first differing byte, then the length) | amd64 AVX2 (`avx2`): `vpcmpeqb` 64 bytes a step, `vpmovmskb` and `bsf` for the first difference; arm64 NEON, part of the base: 64 bytes compared as words (`v16` on, no callee-saved register), `ldp` 16 at a time, `rev` to order the first differing word | SSE2's `pcmpeqb` 16 or 64 bytes a step, 8 a step and one load for the last 8, under 8 one load of each that stays in its page (the emitter writes the one `-cpu` asks for into the runtime) | `testdata/strcmpk` (every length to 150, equal, prefixes, a byte above and below at each place, 0 and 255) native, `-cpu v2`, base, arm64 max and base | `src/compiler/pasemit.paslang`, `EmitRuntime` and `EmitRuntimeArm`, after Go 1.23's `equal_*.s` and `compare_*.s` |
 
+Currency's checked arithmetic reuses `pasfmt`'s existing `Mul128` and
+`DivMod128` pair: exact signed magnitudes, one scale adjustment and one
+nearest-even rounding. Decimal parse/format and binary64/binary128 conversion
+use its common exact big-integer/IEEE helpers, not another assembly
+implementation. The clean FPC bootstrap has a portable limb implementation;
+the product uses its native core. `scripts/check_currency.py` supplies an
+independent rational oracle for 11,005 cases, exercised for both raw kernels
+and typed language/SysUtils paths on both machines and CPU selections.
+
+The scheduler's G-state CAS has one arm64 emitter kernel, `ArmGStatusCas`
+in `pasemit`: address x9, expected w1, new w2, observed w3 and exclusive
+status w4. Ready, park, park-unlock and IO park reuse it. `-cpu` with
+`atomics`/`lse` chooses `CASAL`; the ARMv8.0 base uses `LDAXR`/`STLXR`.
+Both acquire an early wake and release transferred values/saved contexts,
+after current Go's `atomic_arm64.s`; there is no runtime feature branch.
+The debugger gate decodes all five sites, and concurrency/GC gates run
+both CPU paths. AMD64 already uses locked `CMPXCHG`.
+
 Words with no kernel yet (the Pascal body serves every processor):
 MD5 (no instruction exists), SHA-3 (arm64 FEAT_SHA3 could serve it),
 Adler-32, FNV-1a, MurmurHash3, SipHash, the B+ tree and the heap. `Pos` searches as Go's `strings.Index` does, `IndexByte` and `MemEq` above and Rabin-Karp when the first byte keeps matching in vain; Go's brute-force `IndexString` for needles under 64 bytes is not taken, the search stays linear without it.

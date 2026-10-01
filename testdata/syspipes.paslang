@@ -1,0 +1,92 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+  GPL version 3 or later; see COPYING. No warranty. }
+program syspipes;
+uses sysutils, paslinux;
+const Readers = 64;
+var
+  pipes: array[0..Readers - 1, 0..1] of Int32;
+  started: chan of Integer;
+  joined: waitgroup;
+  phase, i, token, completed, flagCall, count: Integer;
+  data: TBytes;
+
+procedure Reader(Index: Integer);
+var buffer: TBytes; transferred: Integer; error: TSysError;
+begin
+  SetLength(buffer, 8);
+  SetLastOSError(Index + 1);
+  Send(started, Index);
+  if not TryFileRead(pipes[Index, 0], buffer, 0, 8, transferred, error) then Halt(10);
+  if (transferred <> 1) or (buffer[0] <> 42) then Halt(11);
+  if not TryFileRead(pipes[Index, 0], buffer, 0, 8, transferred, error) then Halt(12);
+  if transferred <> 0 then Halt(13);
+  if GetLastOSError <> Index + 1 then Halt(14);
+  AtomicAdd(@completed, 1);
+  joined.Done;
+end;
+
+procedure PressuredWrite(Handle: Integer);
+var buffer: TBytes; transferred: Integer; error: TSysError;
+begin
+  buffer := BytesOf('x');
+  if not TryFileWrite(Handle, buffer, 0, 1, transferred, error) then Halt(15);
+  if transferred <> 1 then Halt(16);
+  joined.Done;
+end;
+
+var
+  pressure: array[0..1] of Int32;
+  fill: array[0..4095] of Byte;
+  capacity, drained: Integer;
+  error: TSysError;
+begin
+  if Amd64 then flagCall := 72 else flagCall := 25;
+  started := MakeChan();
+  data := BytesOf('*');
+  for phase := 1 to 2 do
+  begin
+    for i := 0 to Readers - 1 do
+    begin
+      if OsPipe(Integer(@pipes[i, 0])) <> 0 then Halt(2);
+      if phase = 1 then
+        if Syscall(flagCall, pipes[i, 0], 4, ONonblock) <> 0 then Halt(3);
+    end;
+    joined.Add(Readers);
+    for i := 0 to Readers - 1 do pas Reader(i);
+    for i := 0 to Readers - 1 do token := Recv(started);
+    Sleep(100);
+    GcCollect;
+    if (phase = 1) and (HeapStat(20) > HeapStat(22)) then Halt(4);
+    for i := 0 to Readers - 1 do
+    begin
+      if FileWrite(pipes[i, 1], data, 1) <> 1 then Halt(5);
+      FileClose(pipes[i, 1]);
+    end;
+    joined.Wait;
+    for i := 0 to Readers - 1 do FileClose(pipes[i, 0]);
+  end;
+  { A full nonblocking pipe forces the WRITE interest, not READ. }
+  if OsPipe(Integer(@pressure[0])) <> 0 then Halt(6);
+  if Syscall(flagCall, pressure[1], 4, ONonblock) <> 0 then Halt(7);
+  capacity := 0;
+  repeat
+    count := OsWrite(pressure[1], Integer(@fill[0]), SizeOf(fill));
+    if count > 0 then capacity := capacity + count;
+  until count = -11;
+  joined.Add(1);
+  pas PressuredWrite(pressure[1]);
+  Sleep(20);
+  drained := OsRead(pressure[0], Integer(@fill[0]), SizeOf(fill));
+  if drained <> SizeOf(fill) then Halt(8);
+  joined.Wait;
+  FileClose(pressure[1]);
+  SetLength(data, capacity + 1);
+  if not TryFileRead(pressure[0], data, 0, Length(data), count, error) then Halt(17);
+  if (count <> capacity - drained + 1) or (data[count - 1] <> Ord('x')) then Halt(18);
+  if TryFileReadAt(pressure[0], data, 0, 1, 0, count, error) then Halt(19);
+  if error.Code <> 29 then Halt(20); { ESPIPE, not an empty successful result }
+  FileClose(pressure[0]);
+  WriteLn('pollable and blocking readers ', completed);
+  WriteLn('write pressure, EOF and positional pipe error');
+end.

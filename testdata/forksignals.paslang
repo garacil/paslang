@@ -1,0 +1,94 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+  GPL version 3 or later; see COPYING. No warranty. }
+program forksignals;
+uses paslinux;
+var pipes, releasePipe: array[0..1] of Int32;
+  oldMask, mask, pending, fullMask, answer, pid, phase,
+    maskNr, actionNr, pendingNr, readNr, writeNr, killNr, waitNr,
+    exitNr, execNr, sentSignal, pendingBit: Int64;
+  status: Int32; action: array[0..3] of Int64;
+  missing: string; rawPath: Pointer;
+begin
+  if Amd64 then
+  begin maskNr := 14; actionNr := 13; pendingNr := 127; readNr := 0;
+    writeNr := 1; killNr := 62; waitNr := 61 end
+  else
+  begin maskNr := 135; actionNr := 134; pendingNr := 136; readNr := 63;
+    writeNr := 64; killNr := 129; waitNr := 260 end;
+  { QEMU delivers host SIGSEGV to its private guest queue, which its
+    rt_sigpending does not report. Test a kernel-pending SIGINT there;
+    the full SIGSEGV mask and caught-handler reset are still checked. }
+  if Amd64 then begin sentSignal := 11; pendingBit := 1024 end
+  else begin sentSignal := 2; pendingBit := 2 end;
+  exitNr := NrExit;
+  execNr := NrExecve;
+  missing := '/paslang-no-such-executable'#0;
+  rawPath := @missing[1];
+  fullMask := -1 and not (256 or 262144); { unmaskable SIGKILL/SIGSTOP }
+  answer := Sys4(maskNr, 2, 0, Integer(@oldMask), 8);
+  if answer <> 0 then Halt(2);
+  { Ask the actual kernel/emulator for its supported signal set: QEMU
+    reserves host realtime signals and cannot represent every guest bit.
+    Still require the complete supported mask and pending SIGSEGV below. }
+  answer := Sys4(maskNr, 2, Integer(@fullMask), 0, 8);
+  if answer <> 0 then Halt(14);
+  answer := Sys4(maskNr, 2, 0, Integer(@fullMask), 8);
+  if (answer <> 0) or ((fullMask and 1024) = 0) then Halt(15);
+  { Preserve a deliberately blocked signal, not just an empty mask. }
+  mask := oldMask or 512;
+  answer := Sys4(maskNr, 2, Integer(@mask), 0, 8);
+  if answer <> 0 then Halt(3);
+  action[0] := 1; action[1] := 0; action[2] := 0; action[3] := 0;
+  answer := Sys4(actionNr, 12, Integer(@action), 0, 8);
+  if answer <> 0 then Halt(4);
+  for phase := 0 to 1 do
+  begin
+    if OsPipe(Integer(@pipes)) <> 0 then Halt(5);
+    if OsPipe(Integer(@releasePipe)) <> 0 then Halt(6);
+    pid := OsFork;
+    if pid = 0 then
+    begin
+      { Only raw Sys* operations, including the runtime's exec prelude. }
+      if phase = 0 then
+      begin
+        answer := Sys4(maskNr, 2, 0, Integer(@pending), 8);
+        if (answer <> 0) or (pending <> fullMask) then answer := Sys1(exitNr, 41);
+        answer := Sys3(writeNr, pipes[1], Integer(@pending), 1);
+        repeat answer := Sys3(readNr, releasePipe[0], Integer(@pending), 1); until answer <> -4;
+        answer := Sys2(pendingNr, Integer(@pending), 8);
+        if (answer <> 0) or ((pending and pendingBit) = 0) then answer := Sys1(exitNr, 42);
+      end
+      else
+      begin
+        answer := Sys3(execNr, Integer(rawPath), 0, 0);
+        if answer <> -2 then answer := Sys1(exitNr, 43);
+        answer := Sys4(maskNr, 2, 0, Integer(@pending), 8);
+        if (answer <> 0) or (pending <> mask) then answer := Sys1(exitNr, 44);
+        answer := Sys4(actionNr, 11, 0, Integer(@action), 8);
+        if (answer <> 0) or (action[0] <> 0) then answer := Sys1(exitNr, 45);
+        answer := Sys4(actionNr, 12, 0, Integer(@action), 8);
+        if (answer <> 0) or (action[0] <> 1) then answer := Sys1(exitNr, 46);
+      end;
+      answer := Sys1(exitNr, 0);
+    end;
+    if pid < 0 then Halt(7);
+    OsClose(pipes[1]);
+    OsClose(releasePipe[0]);
+    answer := Sys4(maskNr, 2, 0, Integer(@pending), 8);
+    if (answer <> 0) or (pending <> mask) then Halt(8);
+    if phase = 0 then
+    begin
+      if OsRead(pipes[0], Integer(@pending), 1) <> 1 then Halt(9);
+      if Sys2(killNr, pid, sentSignal) <> 0 then Halt(10);
+      if OsWrite(releasePipe[1], Integer(@pending), 1) <> 1 then Halt(11);
+    end;
+    repeat answer := Sys4(waitNr, pid, Integer(@status), 0, 0); until answer <> -4;
+    if (answer <> pid) or (status <> 0) then Halt(12);
+    OsClose(pipes[0]);
+    OsClose(releasePipe[1]);
+  end;
+  answer := Sys4(maskNr, 2, Integer(@oldMask), 0, 8);
+  if answer <> 0 then Halt(13);
+  WriteLn('fork setup masks signals; exec resets caught handlers and preserves ignored ones');
+end.
