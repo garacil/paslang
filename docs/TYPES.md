@@ -567,8 +567,10 @@ and a delete leaves a tombstone only in a full group. `New(m, hint)`
 makes one table while the hint fits one (up to 896 entries), else 2^k
 tables of 1024 slots at half load. Keys hash with XXH3 (1.0.64): a
 string key as `XxHash3` of its bytes, an eight-byte key through XXH3's
-path for 4 to 8 bytes, in line; every map has its own seed, drawn from
-one `getrandom` per process, so the order differs between runs. A
+path for 4 to 8 bytes, in line; every map has its own seed: a bijective
+mix of one `getrandom` key per process (set once by `AtomicCas`) and a
+count `AtomicAdd` makes unique (1.1.92), so the order differs between
+runs and two maps made at once by two routines never share a seed. A
 `Writing` flag catches two routines writing at once (`paslang:
 concurrent map writes`). The compiler passes a descriptor
 (`.LdescMap_<type>`: key kind, key size, value size, whether a slot

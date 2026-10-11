@@ -136,6 +136,9 @@ GOLDEN += arrayidentity
 GOLDEN_A64 += arrayidentity
 GOLDEN += debuggrow
 GOLDEN_A64 += debuggrow
+# P197: maps made by 64 routines at once each take a seed of their own.
+GOLDEN += mapseed
+GOLDEN_A64 += mapseed
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -538,7 +541,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  PASLANG_GCSTRESS=3 PASLANG_GCPOISON=1 timeout 300 $(BUILDDIR)/gcbasic > $(BUILDDIR)/gcbasic.got; \
 	  diff -u testdata/gcbasic.out $(BUILDDIR)/gcbasic.got; \
 	done; \
-	for t in heapspan map2 sync2 strs mapsplit closurebox tree1 tree2 hash1 store1; do \
+	for t in heapspan map2 sync2 strs mapsplit closurebox tree1 tree2 hash1 store1 mapseed; do \
 	  PASLANG_GCSTRESS=5 PASLANG_GCPOISON=1 timeout 300 $(BUILDDIR)/$$t > $(BUILDDIR)/$$t.got; \
 	  diff -u testdata/$$t.out $(BUILDDIR)/$$t.got; \
 	done; \
@@ -594,6 +597,13 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -qw 'ptest' $(BUILDDIR)/set256-v2.s; \
 	if grep -qw 'vptest' $(BUILDDIR)/set256-v2.s; then echo "set256-v2.s carries AVX2"; exit 1; fi; \
 	echo ok cpu-base; \
+	echo "==== the benchmark programs compile (P197) ===="; \
+	mkdir -p $(BUILDDIR)/benchcheck; \
+	for f in scripts/bench/*.paslang; do \
+	  $(OUTDIR)/paslangc -o $(BUILDDIR)/benchcheck/$$(basename $$f .paslang) $$f; \
+	done; \
+	rm -rf $(BUILDDIR)/benchcheck; \
+	echo ok bench programs; \
 	echo "==== parallel mark ===="; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/parmark testdata/parmark.paslang; \
 	for w in "" "" "" PASLANG_GCWORKERS=1 PASLANG_GCWORKERS=2 PASLANG_GCWORKERS=0 "PASLANG_GCVERIFY=1 PASLANG_GCPOISON=1" "PASLANG_GCSTRESS=50 PASLANG_GCPOISON=1"; do \

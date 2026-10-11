@@ -148,8 +148,8 @@ type
   PIter = ^TIter;
 
 var
-  ProcSeed: Integer;
-  SeedReady: Integer;
+  ProcKey: Integer;    { the process's secret key: 0 until the first map }
+  MapCount: Integer;   { the maps seeded so far }
 
 procedure Fatal(const Msg: string);
 begin
@@ -157,12 +157,24 @@ begin
   Halt(1);
 end;
 
-{ One random seed per process from the kernel, then one value per map. }
+{ One secret key per process from the kernel, set once by whichever
+  routine gets there first, then one seed per map: the key mixed with a
+  count that AtomicAdd makes unique (P197, 1.1.92). The old code read and
+  wrote two globals with plain loads and stores, so two routines making
+  maps at once raced on both and could take the same seed. Go seeds each
+  map with rand() (golang src/internal/runtime/maps/map.go:288), the M's
+  own ChaCha8 state, with no lock on its fast path (src/runtime/rand.go
+  rand, mrandinit); paslang has no state per M, and a map's seed needs
+  only to be unique and unknown without the key: a bijective mix of the
+  key xor a unique count gives both, with no lock and no wait. Without
+  getrandom the key comes from the cycle counter, as Go's readTimeRandom
+  stretches nanotime. }
 function NextSeed: Integer;
 var
-  buf, r: Integer;
+  k, buf, r, x: Integer;
 begin
-  if SeedReady = 0 then
+  k := AtomicLoad(ProcKey);
+  if k = 0 then
   begin
     buf := 0;
     if Amd64 = 1 then
@@ -170,12 +182,18 @@ begin
     else
       r := Syscall(278, @buf, 8, 0);
     if r <> 8 then
-      buf := 88172645463325252;
-    ProcSeed := buf;
-    SeedReady := 1;
+      buf := (CycleCount xor 88172645463325252) * P1;
+    if buf = 0 then
+      buf := P2;
+    if AtomicCas(@ProcKey, 0, buf) then
+      k := buf
+    else
+      k := AtomicLoad(ProcKey);
   end;
-  ProcSeed := ProcSeed * P1 + P2;
-  Result := ProcSeed xor (ProcSeed shr 29);
+  x := AtomicAdd(@MapCount, 1) xor k;
+  x := (x xor (x shr 33)) * P1;
+  x := (x xor (x shr 29)) * P2;
+  Result := x xor (x shr 32);
 end;
 
 { A new seed for M, and the bitflip XXH3 derives from it for 4 to 8

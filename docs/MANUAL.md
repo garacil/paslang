@@ -5080,9 +5080,10 @@ until it has 1024 slots and then splits in two, so a growing map never
 holds an old and a new copy of all of itself at once. Keys hash with
 XXH3 (1.0.64): a string's bytes as `XxHash3` hashes them, an eight-byte
 key through XXH3's path for 4 to 8 bytes, in line. Every map has a seed
-of its own, drawn from one `getrandom` per process, so the order differs
-between runs and between two maps. A map is not safe for two routines
-writing at once; the runtime stops the program with
+of its own, mixed from one `getrandom` key per process and a count taken
+atomically, so the order differs between runs and between two maps, even
+two that two routines make at the same moment. A map is not safe for
+two routines writing at once; the runtime stops the program with
 `paslang: concurrent map writes` when it catches that. Use a mutex.
 
 ### Trees: the ordered map and set
