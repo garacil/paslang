@@ -1,0 +1,314 @@
+{ P198: strings that are views of bytes inside a block the program never
+  writes again (PasStrView, as Go's unsafe.String). Forty views lie in a
+  block with no pointers, each after a byte with the shared mark; they
+  are stored, passed, put in maps, records and arrays, captured by
+  closures, sent through a channel to 32 routines, cut, joined, searched
+  and written to (a write copies), and the block's sum is the same at
+  the end: nothing wrote it. Then the views of a second block outlive
+  every pointer to its start and read the same after the collector has
+  run. make check runs it on both machines, under PASLANG_GCSTRESS,
+  GCPOISON and GCVERIFY, and with -checkptr, which accepts a step from
+  a view's characters back to its mark and on to its last byte. }
+program strview;
+
+const
+  NViews = 40;
+  Routines = 32;
+  Rounds = 8;
+
+type
+  TStrWords = record
+    P: Pointer;
+    N: Integer;
+  end;
+  PStrWords = ^TStrWords;
+  TRec = record
+    Name: string;
+    Tag: Integer;
+  end;
+  TGet = function: string;
+  TViews = array of string;
+  TInts = array of Integer;
+
+var
+  blk: PByte;
+  size, sum0, sum1, bad, checked, i, k, n: Integer;
+  offs, lens: TInts;
+  views, want, kept: TViews;
+  work: chan of TRec;
+  wg: waitgroup;
+  rec: TRec;
+  gets: array of TGet;
+  byName: map[string] of Integer;
+
+{ The text of view K, L bytes long: letters, never 'Z', 'Q', 'R' or
+  'V', which the writes below put in }
+function Pattern(K, L: Integer): string;
+var
+  j: Integer;
+begin
+  Result := '';
+  for j := 0 to L - 1 do
+    Result := Result + Chr(Ord('a') + (K + j * 7) mod 26);
+end;
+
+function Len(K: Integer): Integer;
+begin
+  if (K >= 1) and (K <= 3) then
+    Result := 14 + K
+  else
+    Result := 1 + (K * 37) mod 300;
+end;
+
+{ FNV-1a over N bytes at P }
+function Sum(P: PByte; N: Integer): Integer;
+var
+  j: Integer;
+begin
+  Result := 1469598103934665603;
+  for j := 0 to N - 1 do
+    Result := (Result xor P[j]) * 1099511628211;
+end;
+
+{ The block: view K's mark at Offs[K] ($01, or $FF: only bit 0 counts),
+  its characters after it; the last view ends at the block's last byte. }
+function Build(out Offs, Lens: TInts; out Size: Integer): PByte;
+var
+  j, kk, at: Integer;
+  t: string;
+begin
+  SetLength(Offs, NViews);
+  SetLength(Lens, NViews);
+  Size := 0;
+  for kk := 0 to NViews - 1 do
+  begin
+    Lens[kk] := Len(kk);
+    Offs[kk] := Size;
+    Size := Size + 1 + Lens[kk];
+  end;
+  Result := PByte(GetMem(Size, 0));
+  for kk := 0 to NViews - 1 do
+  begin
+    at := Offs[kk];
+    if kk mod 2 = 0 then
+      Result[at] := 1
+    else
+      Result[at] := 255;
+    t := Pattern(kk, Lens[kk]);
+    for j := 1 to Lens[kk] do
+      Result[at + j] := Byte(Ord(t[j]));
+  end;
+end;
+
+function Getter(S: string): TGet;
+begin
+  Result := function: string
+  begin
+    Result := S;
+  end;
+end;
+
+procedure Poke(var S: string);
+begin
+  S[1] := 'V';
+end;
+
+{ Every way a string is shared or copied, on view K; True when each
+  answer is the one its pattern gives and the view still reads it. }
+function Exercise(const V: string; K: Integer): Boolean;
+var
+  w, a, b, c, d, e, f: string;
+  r: TRec;
+  arr: array of string;
+  pc: PChar;
+  m: map[Integer] of string;
+  L, runes: Integer;
+  ch: Rune;
+begin
+  w := want[K];
+  L := Length(w);
+  Result := (V = w) and (Length(V) = L) and not (V < w) and not (V > w);
+  a := V;
+  a[1] := 'Z';
+  Result := Result and (a = 'Z' + Copy(w, 2, L)) and (V = w);
+  b := V;
+  SetLength(b, L + 3);
+  Result := Result and (Copy(b, 1, L) = w) and (Length(b) = L + 3);
+  b := V;
+  SetLength(b, L div 2);
+  Result := Result and (b = Copy(w, 1, L div 2));
+  c := V + '!' + V;
+  Result := Result and (c = w + '!' + w);
+  Result := Result and (Copy(V, 2, 5) = Copy(w, 2, 5));
+  Result := Result and (Pos(Copy(w, L div 2 + 1, 3), V) = Pos(Copy(w, L div 2 + 1, 3), w));
+  Result := Result and (UpCase(V) = UpCase(w)) and (LowerCase(V) = w);
+  d := V;
+  Insert('xy', d, 2);
+  Delete(d, 1, 1);
+  e := w;
+  Insert('xy', e, 2);
+  Delete(e, 1, 1);
+  Result := Result and (d = e);
+  r.Name := V;
+  r.Tag := K;
+  r.Name[1] := 'Q';
+  Result := Result and (r.Name = 'Q' + Copy(w, 2, L));
+  SetLength(arr, 2);
+  arr[0] := V;
+  arr[1] := arr[0];
+  arr[1][1] := 'R';
+  Result := Result and (arr[0] = w) and (arr[1] = 'R' + Copy(w, 2, L));
+  New(m);
+  m[K] := V;
+  Result := Result and (m[K] = w);
+  pc := PChar(V);
+  pc^ := 'P';
+  e := V;
+  Poke(e);
+  Result := Result and (e = 'V' + Copy(w, 2, L));
+  f := V;
+  for runes := 1 to Length(f) do
+    f[runes] := 'w';
+  Result := Result and (f = StringOfChar('w', L));
+  runes := 0;
+  for ch in V do
+    runes := runes + 1;
+  Result := Result and (runes = L) and (V = w);
+end;
+
+{ A routine: each view it receives, exercised; the counts are atomic. }
+procedure Worker;
+var
+  r: TRec;
+  seen: map[string] of Integer;
+begin
+  New(seen);
+  r := Recv(work);
+  while r.Tag >= 0 do
+  begin
+    if Exercise(r.Name, r.Tag) then
+      AtomicAdd(@checked, 1)
+    else
+      AtomicAdd(@bad, 1);
+    seen[r.Name] := r.Tag;
+    if seen[want[r.Tag]] <> r.Tag then
+      AtomicAdd(@bad, 1);
+    r := Recv(work);
+  end;
+  wg.Done;
+end;
+
+{ The views of a block of their own, and nothing else of it: the block's
+  pointer dies with this routine. }
+function Orphans: TViews;
+var
+  b: PByte;
+  o, l: TInts;
+  sz, kk: Integer;
+begin
+  b := Build(o, l, sz);
+  SetLength(Result, NViews);
+  for kk := 0 to NViews - 1 do
+    Result[kk] := PasStrView(b + o[kk] + 1, l[kk]);
+end;
+
+{ Garbage, so the collector runs and reuses what nothing holds. }
+procedure Churn;
+var
+  j: Integer;
+  s: string;
+  g: array of Integer;
+begin
+  for j := 1 to 20000 do
+  begin
+    s := Pattern(j, 40) + Pattern(j + 1, 40);
+    SetLength(g, 64);
+    g[j mod 64] := Length(s);
+  end;
+end;
+
+begin
+  blk := Build(offs, lens, size);
+  sum0 := Sum(blk, size);
+  SetLength(want, NViews);
+  SetLength(views, NViews);
+  for k := 0 to NViews - 1 do
+  begin
+    want[k] := Pattern(k, lens[k]);
+    views[k] := PasStrView(blk + offs[k] + 1, lens[k]);
+  end;
+
+  { one routine: every way of sharing and copying }
+  New(byName);
+  SetLength(gets, NViews);
+  for k := 0 to NViews - 1 do
+  begin
+    if not Exercise(views[k], k) then
+      bad := bad + 1;
+    byName[views[k]] := k;
+    gets[k] := Getter(views[k]);
+  end;
+  for k := 0 to NViews - 1 do
+    if (byName[want[k]] <> k) or (gets[k]() <> want[k]) then
+      bad := bad + 1;
+  WriteLn(NViews, ' views, ', bad, ' bad');
+
+  { 32 routines at once, each view sent through a channel 8 times }
+  work := MakeChan(16);
+  wg.Add(Routines);
+  for i := 1 to Routines do
+    pas Worker;
+  for i := 1 to Rounds do
+    for k := 0 to NViews - 1 do
+    begin
+      rec.Name := views[k];
+      rec.Tag := k;
+      Send(work, rec);
+    end;
+  rec.Name := '';
+  rec.Tag := -1;
+  for i := 1 to Routines do
+    Send(work, rec);
+  wg.Wait;
+  WriteLn(Routines, ' routines, ', checked, ' checked, ', bad, ' bad');
+
+  { every view still reads its pattern and the block is as it was }
+  for k := 0 to NViews - 1 do
+    if views[k] <> want[k] then
+      bad := bad + 1;
+  sum1 := Sum(blk, size);
+  if sum1 = sum0 then
+    WriteLn('block unchanged, ', bad, ' bad')
+  else
+    WriteLn('block written, ', bad, ' bad');
+
+  { the empty string is never a view }
+  if PasStrView(blk + 1, 0) = '' then
+    WriteLn('empty: ', Length(PasStrView(blk + 1, 0)));
+
+  { a view's words are the block's own bytes, and its mark and last
+    byte are reached by steps from its characters (a view of the
+    string's words: s as T would see a copy of its characters) }
+  n := 0;
+  for k := 0 to NViews - 1 do
+  begin
+    if (PStrWords(@views[k])^.P = Pointer(blk + offs[k] + 1)) and
+      (((PByte(PStrWords(@views[k])^.P) - 1)^ and 1) = 1) and
+      ((PByte(PStrWords(@views[k])^.P) + lens[k] - 1)^ = Ord(want[k][lens[k]])) then
+      n := n + 1;
+  end;
+  WriteLn('marks and last bytes: ', n);
+
+  { views outlive the only pointer to their block's start }
+  kept := Orphans;
+  for i := 1 to 4 do
+  begin
+    Churn;
+    GcCollect;
+  end;
+  n := 0;
+  for k := 0 to NViews - 1 do
+    if kept[k] = want[k] then
+      n := n + 1;
+  WriteLn('orphan views: ', n, ' of ', NViews);
+end.

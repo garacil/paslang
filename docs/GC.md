@@ -497,6 +497,16 @@ the rules above.
   shared variable's field address are never the block's start. The
   value such a word is kept for must lie inside the block, not at its
   end.
+- A string view (`PasStrView`, P198) points at any byte inside a block
+  with no pointers, after a byte with the shared mark in the same
+  block. The runtime never takes `p - 1` of a string for the start of
+  its block (`PasStrBlock` asks the heap which object holds it, and in
+  a block of more than 16 bytes a string whose byte before is not the
+  block's first is never marked by it) and writes the byte before a
+  string's characters only when its bit 0 is clear; a view's is set, so a block of views is never
+  written after it is made. `testdata/strview` holds 40 views of a block
+  through 32 routines, the collector's stress, poison and verify modes
+  and `-checkptr`, and reads the block's sum unchanged.
 - Nothing parks while it holds a runtime lock (a rule since 1.0.51).
 
 ### 2.7 What it should give, and what it gave

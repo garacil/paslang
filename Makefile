@@ -139,6 +139,9 @@ GOLDEN_A64 += debuggrow
 # P197: maps made by 64 routines at once each take a seed of their own.
 GOLDEN += mapseed
 GOLDEN_A64 += mapseed
+# P198: strings that are views of a block nothing writes (PasStrView).
+GOLDEN += strview
+GOLDEN_A64 += strview
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -541,7 +544,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  PASLANG_GCSTRESS=3 PASLANG_GCPOISON=1 timeout 300 $(BUILDDIR)/gcbasic > $(BUILDDIR)/gcbasic.got; \
 	  diff -u testdata/gcbasic.out $(BUILDDIR)/gcbasic.got; \
 	done; \
-	for t in heapspan map2 sync2 strs mapsplit closurebox tree1 tree2 hash1 store1 mapseed; do \
+	for t in heapspan map2 sync2 strs mapsplit closurebox tree1 tree2 hash1 store1 mapseed strview; do \
 	  PASLANG_GCSTRESS=5 PASLANG_GCPOISON=1 timeout 300 $(BUILDDIR)/$$t > $(BUILDDIR)/$$t.got; \
 	  diff -u testdata/$$t.out $(BUILDDIR)/$$t.got; \
 	done; \
@@ -1465,7 +1468,17 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  test $$rc -eq 1; \
 	  grep -q 'paslang: pointer outside its object at line 17' $(BUILDDIR)/fatal_$$t-arm.err; \
 	done; \
-	for t in ptrarith ptrtyped memview ptrsafe gcbasic pchar narrowmem cpwalk ptrreach; do \
+	$(OUTDIR)/paslangc -checkptr -o $(BUILDDIR)/fatal_cpstrview testdata/fatal/cpstrview.paslang; \
+	set +e; $(BUILDDIR)/fatal_cpstrview > $(BUILDDIR)/fatal_cpstrview.got 2> $(BUILDDIR)/fatal_cpstrview.err; rc=$$?; set -e; \
+	test $$rc -eq 1; \
+	diff -u testdata/fatal/expected.out $(BUILDDIR)/fatal_cpstrview.got; \
+	grep -q 'paslang: pointer outside its object at line 21' $(BUILDDIR)/fatal_cpstrview.err; \
+	$(OUTDIR)/paslangc -checkptr -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/fatal_cpstrview-arm testdata/fatal/cpstrview.paslang; \
+	set +e; timeout 60 $(QEMU_A64) $(BUILDDIR)/fatal_cpstrview-arm > $(BUILDDIR)/fatal_cpstrview-arm.got 2> $(BUILDDIR)/fatal_cpstrview-arm.err; rc=$$?; set -e; \
+	test $$rc -eq 1; \
+	diff -u testdata/fatal/expected.out $(BUILDDIR)/fatal_cpstrview-arm.got; \
+	grep -q 'paslang: pointer outside its object at line 21' $(BUILDDIR)/fatal_cpstrview-arm.err; \
+	for t in ptrarith ptrtyped memview ptrsafe gcbasic pchar narrowmem cpwalk ptrreach strview; do \
 	  $(OUTDIR)/paslangc -checkptr -o $(BUILDDIR)/cpok_$$t testdata/$$t.paslang; \
 	  $(BUILDDIR)/cpok_$$t > $(BUILDDIR)/cpok_$$t.got; \
 	  diff -u testdata/$$t.out $(BUILDDIR)/cpok_$$t.got; \
@@ -1473,6 +1486,9 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(OUTDIR)/paslangc -checkptr -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/cpok_cpwalk-arm testdata/cpwalk.paslang; \
 	timeout 60 $(QEMU_A64) $(BUILDDIR)/cpok_cpwalk-arm > $(BUILDDIR)/cpok_cpwalk-arm.got; \
 	diff -u testdata/cpwalk.out $(BUILDDIR)/cpok_cpwalk-arm.got; \
+	$(OUTDIR)/paslangc -checkptr -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/cpok_strview-arm testdata/strview.paslang; \
+	timeout 300 $(QEMU_A64) $(BUILDDIR)/cpok_strview-arm > $(BUILDDIR)/cpok_strview-arm.got; \
+	diff -u testdata/strview.out $(BUILDDIR)/cpok_strview-arm.got; \
 	grep -q 'call rt_ptrfrom' $(BUILDDIR)/cp_chk.s; \
 	grep -q 'call rt_ptrarith' $(BUILDDIR)/cp_chk.s; \
 	grep -qE '^[[:space:]]+bl[[:space:]]+rt_ptrfrom' $(BUILDDIR)/cp_chk-arm.s; \
@@ -2376,7 +2392,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'paslang: unlock of an unlocked mutex' $(BUILDDIR)/unlockfree.err; \
 	echo ok unlockfree; \
 	echo "==== fatal ===="; \
-	for t in divzero nilptr deep oom oomlimit closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl; do \
+	for t in divzero nilptr deep oom oomlimit closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap; do \
 	  $(OUTDIR)/paslangc -o $(BUILDDIR)/fatal_$$t testdata/fatal/$$t.paslang; \
 	  set +e; \
 	  if [ $$t = oomlimit ]; then \
@@ -2433,6 +2449,10 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'paslang: index 5 out of range \[0..1\] at line 13' $(BUILDDIR)/fatal_bnested.err; \
 	grep -q 'paslang: index 7 out of range \[0..4\] at line 10' $(BUILDDIR)/fatal_bconst.err; \
 	grep -q 'paslang: index 4 out of range \[1..3\] at line 16' $(BUILDDIR)/fatal_bstrcall.err; \
+	grep -q '^paslang: string view length -2 out of range$$' $(BUILDDIR)/fatal_svneg.err; \
+	grep -q '^paslang: string view of nil with length 3$$' $(BUILDDIR)/fatal_svnil.err; \
+	grep -q '^paslang: string view over bytes not marked shared$$' $(BUILDDIR)/fatal_svmark.err; \
+	grep -q '^paslang: string view length 16 out of range$$' $(BUILDDIR)/fatal_svwrap.err; \
 	echo ok fatal; \
 	echo "==== deadlock ===="; \
 	for t in dlrecv dlsend dlcycle dlmutex dlmain dlselect; do \
@@ -2666,7 +2686,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	grep -q 'paslang: unlock of an unlocked mutex' $(BUILDDIR)/unlockfree-arm.err; \
 	echo ok unlockfree-arm; \
 	echo "==== fatal arm64 ===="; \
-	for t in divzero nilptr deep oom closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl; do \
+	for t in divzero nilptr deep oom closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap; do \
 	  $(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/fatal_$$t-arm testdata/fatal/$$t.paslang; \
 	  set +e; timeout 60 $(QEMU_A64) $(BUILDDIR)/fatal_$$t-arm > $(BUILDDIR)/fatal_$$t-arm.got 2> $(BUILDDIR)/fatal_$$t-arm.err; rc=$$?; set -e; \
 	  test $$rc -eq 1; \
@@ -2716,6 +2736,10 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	grep -q 'paslang: index 5 out of range \[0..1\] at line 13' $(BUILDDIR)/fatal_bnested-arm.err; \
 	grep -q 'paslang: index 7 out of range \[0..4\] at line 10' $(BUILDDIR)/fatal_bconst-arm.err; \
 	grep -q 'paslang: index 4 out of range \[1..3\] at line 16' $(BUILDDIR)/fatal_bstrcall-arm.err; \
+	grep -q '^paslang: string view length -2 out of range$$' $(BUILDDIR)/fatal_svneg-arm.err; \
+	grep -q '^paslang: string view of nil with length 3$$' $(BUILDDIR)/fatal_svnil-arm.err; \
+	grep -q '^paslang: string view over bytes not marked shared$$' $(BUILDDIR)/fatal_svmark-arm.err; \
+	grep -q '^paslang: string view length 16 out of range$$' $(BUILDDIR)/fatal_svwrap-arm.err; \
 	echo ok fatal-arm; \
 	echo "==== deadlock arm64 ===="; \
 	for t in dlrecv dlsend dlcycle dlmutex dlmain dlselect; do \

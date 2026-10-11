@@ -3221,6 +3221,28 @@ string is a copy, `Copy(s, i, j - i + 1)`. `MemBase(p)`, `MemSize(p)`
 and `MemEnd(p)` are the object an address is in (a heap block, the
 routine's stack, the globals; 0 when none), to check by hand.
 
+`PasStrView(p, n)` is the `n` bytes at `p` as a string, with no copy,
+Go's `unsafe.String`: a view, for text that lies in a block the program
+has filled and never writes again (a file read whole, a parsed
+document). The byte before `p` must be in the same block and have bit 0
+set, the mark of characters another string shares: no store writes it,
+any number of routines read the view at once, a write through the view
+copies the characters first, and the view keeps its whole block alive.
+`n = 0` gives `''`; a length below 0, a nil `p` with a length, and a
+byte before `p` without the mark stop the program
+(`paslang: string view over bytes not marked shared`). Nothing checks
+that the bytes are not changed later through a pointer; that is the
+program's promise, as in Go.
+
+```pascal
+b := PByte(GetMem(6, 0));
+b[0] := 1;                                   { the shared mark }
+b[1] := Byte('h'); b[2] := Byte('e'); b[3] := Byte('l'); b[4] := Byte('l'); b[5] := Byte('o');
+s := PasStrView(b + 1, 5);                   { 'hello', no copy }
+t := s;                                      { shared, the mark already set }
+s[1] := 'j';                                 { s is 'jello', t 'hello', b unchanged }
+```
+
 A pointer one past the end of a heap block is allowed (a walk may end
 there), but it points where the next block starts, so it does not keep
 its own block alive: while such a pointer is in use, keep a pointer to
@@ -6304,6 +6326,7 @@ routines are there for the compiler, and a program may call them too:
 | `pasfmt` | `PasParseSingle(s, out bits): Boolean` | the single nearest the text, its bits in the low 32 |
 | `pasfmt` | `PasF64ToF32(b)`, `PasF32ToF64(b)` | the bits of a double rounded to the nearest single, of a single widened to a double |
 | `pasfmt` | `PasParseQuad(s, out lo, hi): Boolean`, `PasFmtQuad(lo, hi, w, d): string` | a `Quad`'s two words from text, and to text as `PasFmtReal` |
+| `passtr` | `PasStrView(p, n): string` | the `n` bytes at `p` as a string with no copy, after a byte with the shared mark (§6) |
 | `pashash` | `PasHex(s)`, `PasMd5(s)`, `PasSha3(s, bits)`, `PasAdler32(s, adler)`, `PasFnv1a32(s)`, `PasFnv1a64(s)`, `PasMurmur3(s, seed)`, `PasSipHash(s, k0, k1)` | the bodies of `Hex`, `Md5`, `Sha3_*`, `Adler32`, `Fnv1a32`, `Fnv1a64`, `Murmur3` and `SipHash`, one each |
 | `pashash` | `PasSha1Cpu(s)`, `PasSha1Base(s)`, and the same pairs for `Sha224`, `Sha256`, `Sha384`, `Sha512`; `PasHmacCpu(alg, key, msg)`, `PasHmacBase` (alg 0 MD5, 1 SHA-1, 2 SHA-224, 3 SHA-256, 4 SHA-384, 5 SHA-512); `PasCrc32Cpu(s, crc)`, `PasCrc32Base`, `PasCrc32cCpu`, `PasCrc32cBase`; `PasMerkleRootCpu(leaves)`, `PasMerkleRootBase`, `PasMerkleProofCpu(leaves, i)`, `PasMerkleProofBase`, `PasMerkleCheckCpu(leaf, i, n, proof, root)`, `PasMerkleCheckBase` | the two bodies of each word, the `Cpu` one on the processor's instructions and the `Base` one in Pascal; the compiler calls one by `-cpu` (§21), a program that calls `Cpu` itself answers for the processor it runs on |
 | `pastree` | `PasTreeNew`, `PasTreeGet`, `PasTreePut`, `PasTreeDelete`, `PasTreeClear`, `PasTreeStep`, `PasTreeBound`, `PasTreeRank`, `PasTreeKeyAt`, `PasTreePop`, `PasTreeSplit`, `PasTreeJoin`, `PasHeapNew`, `PasHeapPush`, `PasHeapPop`, `PasHeapLow`, `PasHeapEmpty` | the tree and heap words, taking the compiler's descriptor of the type (key kind and sizes) and keys by address: written for the compiler, not for a program, which has `t[k]`, `Push` and the rest |

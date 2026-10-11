@@ -334,6 +334,22 @@ characters. That is **not** our default.
   so an assignment, a parameter or a field shares them for nothing, and
   the first write through any holder copies them for that holder alone
   (`rt_strunique`; a literal's characters are always shared).
+- A view (P198, 1.1.93): `PasStrView(p, n)` (core unit `passtr`) is a
+  string whose characters are the `n` bytes at `p`, with no copy, Go's
+  `unsafe.String`. The contract: the bytes from `p - 1` to `p + n - 1`
+  lie in one heap block that nothing writes while a view of it lives,
+  and the byte at `p - 1` has bit 0 set, the shared mark. No store ever
+  writes that byte (`ShareStr`, `rt_strshare` and `rt_setpropstr` write
+  the mark only when it is clear, and every other path that changes a
+  string makes a new one: `rt_strunique`, `SetLength`, `Insert`,
+  `Delete`, `Copy`, concatenation), so any number of routines read a
+  view at once with no lock, and a write through a view copies the
+  characters first. `p` lies inside the block, so the view keeps the
+  whole block alive. `n = 0` gives the empty string, never a view; a
+  length below 0 or past the end of the address space, a nil `p` with
+  `n` above 0 and a byte before `p` without the mark stop the program.
+  `s as T` is the other direction: a view of the characters of `s`,
+  which it first makes its own.
 - Length: `Length(s)` is the byte count; **no 255 cap**. Limited by
   address space / allocation.
 - Assignment and argument passing **copy the fat pointer**, not the
