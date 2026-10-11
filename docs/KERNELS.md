@@ -30,8 +30,8 @@ for each machine (its license is in `LICENSE-GO`);
 
 | Kernel | What | Extension (`-cpu` name) | Base path | Test and oracle | Where |
 |---|---|---|---|---|---|
-| `Sha256BlocksCpu` | SHA-256 and SHA-224 rounds, N blocks | amd64 SHA-NI (`sha`, `sha2`); arm64 FEAT_SHA256 (`sha2`) | `Sha256BlocksPlain`, the 64 rounds written out | `testdata/hash1` against `scripts/hashmodel.py` (Python hashlib), FIPS 180-4 vectors | `src/lib/pashash.paslang`, after Go's `sha256block_{amd64,arm64}.s` |
-| `Sha1BlocksCpu` | SHA-1 rounds | amd64 SHA-NI (`sha1`); arm64 FEAT_SHA1 (`sha1`) | `Sha1BlocksPlain`, 80 rounds written out | `hash1` | `pashash`, after `SHA1RNDS4`, `SHA1NEXTE`, `SHA1MSG1` and `SHA1MSG2` in the SDM vol. 2B (Go 1.23 has no SHA-NI body for SHA-1) and Go's `sha1block_arm64.s` |
+| `Sha256BlocksCpu` | SHA-256 and SHA-224 rounds, N blocks | amd64 SHA-NI with SSSE3 and SSE4.1 (`sha2 ssse3 sse41`: PSHUFB, PALIGNR, PINSRQ, PBLENDW, as Go's gate; no VEX moves, so no AVX); arm64 FEAT_SHA256 (`sha2`) | `Sha256BlocksPlain`, the 64 rounds written out | `testdata/hash1` against `scripts/hashmodel.py` (Python hashlib), FIPS 180-4 vectors | `src/lib/pashash.paslang`, after Go's `sha256block_{amd64,arm64}.s` |
+| `Sha1BlocksCpu` | SHA-1 rounds | amd64 SHA-NI with SSSE3 and SSE4.1 (`sha1 ssse3 sse41`: PSHUFB, PINSRQ, PINSRD); arm64 FEAT_SHA1 (`sha1`) | `Sha1BlocksPlain`, 80 rounds written out | `hash1` | `pashash`, after `SHA1RNDS4`, `SHA1NEXTE`, `SHA1MSG1` and `SHA1MSG2` in the SDM vol. 2B (Go 1.23 has no SHA-NI body for SHA-1) and Go's `sha1block_arm64.s` |
 | `Sha512BlocksCpu` | SHA-512 and SHA-384 rounds | arm64 FEAT_SHA512 (`sha512`); amd64 none (no processor here answers for its SHA512 extension) | `Sha512BlocksPlain`, 80 rounds written out | `hash1` | `pashash`, after Go's `sha512block_arm64.s` |
 | `Crc32cCpu`, `Crc32cTriple` | CRC-32C (Castagnoli) | amd64 SSE4.2 `crc32` (`sse42`), three chains at once over pieces of 1344 and 168 bytes joined by shift tables built at first use (Go's `castagnoliSSE42Triple`, 33 GB/s here; a PCLMULQDQ fold with Castagnoli's constants gave 18 and was dropped); arm64 FEAT_CRC32 (`crc32`) | the 256-entry table | `hash1` against RFC 3720's definition | `pashash`, after Go's `crc32_{amd64,arm64}.s` and `crc32_amd64.go` |
 | `Crc32Cpu` | CRC-32 (IEEE, zlib) | amd64 PCLMULQDQ folding (`pclmul`, `sse41`), 64 bytes and up; arm64 FEAT_CRC32 (`crc32`) | the table | `hash1` against zlib | `pashash`, after Go's `ieeeCLMUL` and Intel's paper on PCLMULQDQ CRC |
@@ -78,7 +78,10 @@ Adler-32, FNV-1a, MurmurHash3, SipHash, the B+ tree and the heap. `Pos` searches
    Pascal body beside it. `pashash` is written by `scripts/hashgen.py`:
    change the template there and run it.
 3. Export the word twice, `XxxCpu` and `XxxBase`; in the parser, choose by
-   `CpuSuffix('<feature>')`.
+   `CpuSuffix('<features>')`, naming every extension the body's
+   instructions belong to (P196: the SHA-NI bodies also need SSSE3 and
+   SSE4.1); `scripts/check_cpufeat.sh` proves the choice for a matrix
+   of `-cpu`.
 4. Add the oracle's vectors to the test and run it with `-cpu native`,
    `-cpu base` and, on arm64, `-cpu max` under qemu.
 5. Add the row above.
@@ -108,8 +111,11 @@ follows the same steps, in this order, and is not done until the last.
    word with one body), checking the arguments and dying with plain
    words on the wrong ones. The feature names are those of
    `CpuFeatBit` in `pasast` (`sha1`, `sha2`, `sha512`, `crc32`,
-   `sse42`, `pclmul`, `avx2`, …); two joined by a space are both
-   needed.
+   `sse42`, `pclmul`, `avx2`, …); every name in the space-separated
+   list is needed, and a name no machine knows stops the compile (P196).
+   A body for one machine names that machine's features: the SHA words
+   go through `ShaSuffix`, `sha2 ssse3 sse41` on amd64 and `sha2` on
+   arm64.
 4. The model: `scripts/hashmodel.py` computes the word over the same
    inputs with Python's `hashlib`, `hmac`, `zlib` or the reference
    definition, and writes `testdata/hash1.out`; `testdata/hash1.paslang`

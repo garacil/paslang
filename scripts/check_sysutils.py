@@ -38,7 +38,20 @@ off = dict(base_env, PASLANG_GC="off")
 cpu = str(min(os.sched_getaffinity(0)))
 
 
+# A timeout catches a hang, not a slow machine: as Go's dist scales every
+# test timeout by GO_TEST_TIMEOUT_SCALE (golang/src/cmd/dist/test.go:187,
+# scaledTimeout :362), PASLANG_TEST_TIMEOUT_SCALE scales these, and a run
+# under qemu gets five times as long. sysenvironment for arm64 with the GC's
+# stress, verify and poison on one CPU took 167 s under qemu on a Ryzen 7
+# 4800H (27 s natively): over the old fixed 120 s, never hung.
+timeout_scale = int(os.environ.get("PASLANG_TEST_TIMEOUT_SCALE", "1"))
+QEMU_FACTOR = 5
+
+
 def run(command, environment=base_env, timeout=120, input_data=None):
+    timeout *= timeout_scale
+    if qemu[0] in command:
+        timeout *= QEMU_FACTOR
     process = subprocess.Popen(command, env=environment, stdout=subprocess.PIPE,
                                stderr=subprocess.STDOUT, stdin=subprocess.PIPE,
                                start_new_session=True)

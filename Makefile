@@ -426,6 +426,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	@python3 scripts/check_recipes.py
 	@python3 scripts/check_debug_growth.py "$(OUTDIR)/paslangc" "$(BUILDDIR)" $(QEMU_A64)
 	@sh scripts/check_bootstrap.sh "$(BUILDDIR)"
+	@sh scripts/check_cpufeat.sh "$(OUTDIR)/paslangc" "$(BUILDDIR)" $(QEMU_A64)
 	@set -e; \
 	xrun=""; \
 	if command -v Xvfb > /dev/null 2>&1; then \

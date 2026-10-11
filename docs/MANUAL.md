@@ -5859,7 +5859,9 @@ as 64 characters, and `Hex('')` is `''`.
 Which body a word calls is fixed by `-cpu` through these features:
 `Sha1` and `HmacSha1` by `sha1`; `Sha224`, `Sha256`, `HmacSha224`,
 `HmacSha256` and the three Merkle words by `sha2` (on amd64 both are
-SHA-NI's `sha`); `Sha384`, `Sha512`, `HmacSha384` and `HmacSha512` by
+SHA-NI's `sha`, and the SHA-NI rounds also use SSSE3 and SSE4.1, so
+there they need `ssse3` and `sse41` too, as Go's gates say: `-cpu sha`
+alone keeps the Pascal rounds); `Sha384`, `Sha512`, `HmacSha384` and `HmacSha512` by
 `sha512`, which amd64 never has, so there the Pascal rounds serve;
 `Crc32c` by `sse42` on amd64 and `crc32` on arm64; `Crc32` by `pclmul`
 and `sse41` together on amd64 (the folding takes a message of 64 bytes
@@ -5910,8 +5912,8 @@ program takes their names.
 | Word | Algorithm | Gives | Takes | On the processor (`-cpu`) | Use it for |
 |---|---|---|---|---|---|
 | `Md5(s)` | MD5, RFC 1321: 64-byte blocks, 64 steps of 32-bit words | 16 bytes | a string | the Pascal rounds | fingerprints in old formats; never for security, collisions are cheap |
-| `Sha1(s)` | SHA-1, FIPS 180-4: 64-byte blocks, 80 rounds | 20 bytes | a string | SHA-NI (`sha1`); FEAT_SHA1 | identifiers in the style of git; not for signatures, collisions have been made |
-| `Sha224(s)`, `Sha256(s)` | SHA-2, FIPS 180-4: 64-byte blocks, 64 rounds | 28, 32 bytes | a string | SHA-NI (`sha2`); FEAT_SHA256 | the standard choice for integrity and signatures |
+| `Sha1(s)` | SHA-1, FIPS 180-4: 64-byte blocks, 80 rounds | 20 bytes | a string | SHA-NI with SSSE3 and SSE4.1 (`sha1 ssse3 sse41`); FEAT_SHA1 | identifiers in the style of git; not for signatures, collisions have been made |
+| `Sha224(s)`, `Sha256(s)` | SHA-2, FIPS 180-4: 64-byte blocks, 64 rounds | 28, 32 bytes | a string | SHA-NI with SSSE3 and SSE4.1 (`sha2 ssse3 sse41`); FEAT_SHA256 | the standard choice for integrity and signatures |
 | `Sha384(s)`, `Sha512(s)` | SHA-2, FIPS 180-4: 128-byte blocks, 80 rounds of 64-bit words | 48, 64 bytes | a string | FEAT_SHA512 (`sha512`, arm64); Pascal on amd64 | the same, faster on long messages in software |
 | `Sha3_224(s)` … `Sha3_512(s)` | SHA-3, FIPS 202: Keccak-f[1600], 24 rounds of a 200-byte sponge | 28 to 64 bytes | a string | the Pascal rounds | when a second family beside SHA-2 is wanted |
 | `HmacMd5(key, msg)`, `HmacSha1`, `HmacSha224`, `HmacSha256`, `HmacSha384`, `HmacSha512` | HMAC, RFC 2104, over that hash | as long as its hash | two strings | as its hash | authenticating a message with a shared secret |
