@@ -3110,7 +3110,7 @@ install: all installdirs
 	$(DESTDIR)$(bindir)/paslangc -o $(BUILDDIR)/paslang-install-hello $(srcdir)/testdata/hello.paslang
 	$(BUILDDIR)/paslang-install-hello
 	rm -f $(BUILDDIR)/paslang-install-hello
-	: an arm64 program from amd64, when the arm64 units were asked for; on arm64 hello was one; \
+	: an arm64 program from amd64 when the arm64 units were asked for, since on arm64 hello was one; \
 	if [ -n '$(AMD64)' ] && [ -n '$(ARM64)' ]; then \
 	  $(DESTDIR)$(bindir)/paslangc -target arm64 -o $(BUILDDIR)/paslang-install-a64 $(srcdir)/testdata/heapspan.paslang; \
 	  rm -f $(BUILDDIR)/paslang-install-a64; \

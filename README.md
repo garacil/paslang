@@ -118,11 +118,13 @@ adds the arm64 units, for `paslangc -target arm64`; they need
 Arch).
 
 The tests need more, and only the tests: `make check`, on amd64, needs
-`./configure --enable-arm64` and the arm64 binutils, Python 3, `gdb`, a C
-compiler (`cc`) and Go, which build helper programs and oracles of the
-tests, `qemu-aarch64-static` 11.1 in `/usr/bin` (the arm64 tests run
-under a copy that `scripts/patch-qemu-madv102.py` patches so
-`MADV_GUARD_INSTALL` succeeds), and `Xvfb` if present for the X11 tests.
+`./configure --enable-arm64` and the arm64 binutils, Python 3, `gdb`, the
+Free Pascal compiler (`fpc`), which builds the bootstrap again in a clean
+directory, a C compiler (`cc`) and Go, which build helper programs and
+oracles of the tests, `qemu-aarch64-static` 11.1 in `/usr/bin` (the
+arm64 tests run under a copy that `scripts/patch-qemu-madv102.py`
+patches so `MADV_GUARD_INSTALL` succeeds), and `Xvfb` if present for the
+X11 tests.
 The benchmarks need Go.
 
 ```
