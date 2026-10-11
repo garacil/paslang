@@ -75,6 +75,28 @@ SELF_UNITS := \
 
 A64DIR := $(BUILDDIR)/a64
 
+# The machine make runs on, which configure found (config.mk), else
+# uname: make builds and installs that machine's units. paslangc
+# assembles amd64 with /usr/bin/as, so the amd64 units are built on amd64
+# alone. The arm64 units are built on arm64, and on amd64 when asked for
+# (./configure --enable-arm64, or ARM64=yes), which needs the arm64
+# binutils by the paths paslangc runs them (Assemble and the link in
+# cmd/paslangc). make check, on amd64, needs both.
+ifeq ($(origin MACHINE),undefined)
+ifneq ($(filter aarch64 arm64,$(shell uname -m)),)
+MACHINE := arm64
+else
+MACHINE := amd64
+endif
+endif
+ARM64 ?=
+ifeq ($(MACHINE),arm64)
+AMD64 :=
+override ARM64 := yes
+else
+AMD64 := yes
+endif
+
 # Every unit is built again for one processor level of each machine
 # (P143), x86-64-v3 and ARMv8.2 with its crypto extension, in a
 # directory beside the base build: a program compiled for a -cpu with
@@ -144,7 +166,7 @@ LIB_UNITS := \
 	src/lib/pasx11.paslang \
 	src/rtl/sysutils.paslang
 
-all: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(OUTDIR)/pasdbg
+all: $(OUTDIR)/paslangc $(if $(AMD64),core libs) $(if $(ARM64),core-arm64 libs-arm64) $(OUTDIR)/pasdbg
 
 # The book in one page, docs/manual/index.html, from the canonical
 # Markdown (MANUAL.md, TYPES.md, QUAD.md, GC.md, KERNELS.md, VISION.md).
@@ -182,6 +204,10 @@ libs-arm64: $(OUTDIR)/paslangc core-arm64 $(LIB_UNITS) | $(BUILDDIR)
 	done
 
 core: $(OUTDIR)/paslangc $(CORE_UNITS) | $(BUILDDIR)
+	@if [ -z '$(AMD64)' ]; then \
+	  echo 'the amd64 units are built on an amd64 machine: paslangc assembles them with /usr/bin/as'; \
+	  exit 1; \
+	fi
 	@set -e; \
 	for u in $(CORE_UNITS); do \
 	  b=$$(basename $$u .paslang); \
@@ -196,6 +222,14 @@ core: $(OUTDIR)/paslangc $(CORE_UNITS) | $(BUILDDIR)
 	done
 
 core-arm64: $(OUTDIR)/paslangc $(CORE_UNITS) | $(BUILDDIR)
+	@if [ -z '$(ARM64)' ]; then \
+	  echo 'the arm64 units are not built on this amd64 machine: ./configure --enable-arm64 (or make ARM64=yes) builds them'; \
+	  exit 1; \
+	fi
+	@if [ -n '$(AMD64)' ] && { [ ! -x /usr/bin/aarch64-linux-gnu-as ] || [ ! -x /usr/bin/aarch64-linux-gnu-ld ]; }; then \
+	  echo 'the arm64 units need /usr/bin/aarch64-linux-gnu-as and /usr/bin/aarch64-linux-gnu-ld (binutils-aarch64-linux-gnu on Debian, aarch64-linux-gnu-binutils on Arch)'; \
+	  exit 1; \
+	fi
 	@set -e; mkdir -p $(A64DIR); \
 	for u in $(CORE_UNITS); do \
 	  b=$$(basename $$u .paslang); \
@@ -256,6 +290,10 @@ $(OUTDIR)/paslangc: $(PASLANG_SRC) $(CORE_UNITS) | $(OUTDIR) $(UNITDIR) $(HOSTDI
 	  $(MAKE) stage HOST="$(OUTDIR)/paslangc" STAGE="$(BUILDDIR)/paslangc.self"; \
 	  mv "$(BUILDDIR)/paslangc.self" "$(OUTDIR)/paslangc"; \
 	else \
+	  if [ '$(MACHINE)' != amd64 ]; then \
+	    echo 'the first build on arm64 needs a paslangc (the arm64 package) in $(bindir) or bin/: the bootstrap from Free Pascal is written for amd64 (scripts/host_syscall.py)'; \
+	    exit 1; \
+	  fi; \
 	  echo "bootstrap paslangc via fpc"; \
 	  $(MAKE) hostsrc; \
 	  $(HOSTC) $(FLAGS) $(HOSTDIR)/paslangc.pas; \
@@ -357,7 +395,7 @@ self-arm64: $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/qemu-aarch64-static | $(BUILDDI
 	timeout 20 taskset -c 0 $(QEMU_A64) $(BUILDDIR)/hello-a64s2; \
 	echo ok self-arm64
 
-hello: $(OUTDIR)/paslangc core testdata/hello.paslang | $(BUILDDIR)
+hello: $(OUTDIR)/paslangc $(if $(AMD64),core,core-arm64) testdata/hello.paslang | $(BUILDDIR)
 	$(OUTDIR)/paslangc -o $(OUTDIR)/hello testdata/hello.paslang
 	$(OUTDIR)/hello
 
@@ -371,8 +409,8 @@ bench: $(OUTDIR)/paslangc core
 
 # The debugger's terminal (P118): pasdbg <socket> speaks to a program
 # compiled with -debug and run with PASLANG_DEBUG=<socket>.
-$(OUTDIR)/pasdbg: $(OUTDIR)/paslangc libs cmd/pasdbg/pasdbg.paslang
-	$(OUTDIR)/paslangc -cpu base -Fu $(BUILDDIR) -o $(OUTDIR)/pasdbg cmd/pasdbg/pasdbg.paslang
+$(OUTDIR)/pasdbg: $(OUTDIR)/paslangc $(if $(AMD64),libs,libs-arm64) cmd/pasdbg/pasdbg.paslang
+	$(OUTDIR)/paslangc -cpu base -Fu $(if $(AMD64),$(BUILDDIR),$(A64DIR)) -o $(OUTDIR)/pasdbg cmd/pasdbg/pasdbg.paslang
 
 # The three servers against their Go twins (P115): scripts/bench/servers.py.
 # The pairs again in alternating rounds (scripts/bench/rounds.py), the
@@ -3041,18 +3079,23 @@ install: all installdirs
 	  $(INSTALL_PROGRAM) $(OUTDIR)/paslangc-arm64 $(DESTDIR)$(bindir)/paslangc-arm64; \
 	fi
 	$(PRE_INSTALL)
-	: every core unit, passtr too, P143: a list written out left it behind; \
-	for u in $(CORE_UNITS) $(LIB_UNITS); do \
-	  b=$$(basename $$u .paslang); \
-	  $(INSTALL_DATA) $(BUILDDIR)/$$b.pi $(BUILDDIR)/$$b.o $(DESTDIR)$(libdir)/paslang/; \
-	done
+	: the amd64 units, built on amd64, AMD64: every core unit, passtr too, P143: a list written out left it behind; \
+	if [ -n '$(AMD64)' ]; then \
+	  for u in $(CORE_UNITS) $(LIB_UNITS); do \
+	    b=$$(basename $$u .paslang); \
+	    $(INSTALL_DATA) $(BUILDDIR)/$$b.pi $(BUILDDIR)/$$b.o $(DESTDIR)$(libdir)/paslang/; \
+	  done; \
+	fi
 	: the level builds, P143; \
-	mkdir -p $(DESTDIR)$(libdir)/paslang/$(LVL_X64); \
-	for u in $(CORE_UNITS) $(LIB_UNITS); do \
-	  b=$$(basename $$u .paslang); \
-	  $(INSTALL_DATA) $(BUILDDIR)/$(LVL_X64)/$$b.o $(DESTDIR)$(libdir)/paslang/$(LVL_X64)/; \
-	done
-	if [ -f $(A64DIR)/pasmap.o ]; then \
+	if [ -n '$(AMD64)' ]; then \
+	  mkdir -p $(DESTDIR)$(libdir)/paslang/$(LVL_X64); \
+	  for u in $(CORE_UNITS) $(LIB_UNITS); do \
+	    b=$$(basename $$u .paslang); \
+	    $(INSTALL_DATA) $(BUILDDIR)/$(LVL_X64)/$$b.o $(DESTDIR)$(libdir)/paslang/$(LVL_X64)/; \
+	  done; \
+	fi
+	: the arm64 units when make built them, ARM64; \
+	if [ -n '$(ARM64)' ]; then \
 	  for u in $(CORE_UNITS) $(LIB_UNITS); do \
 	    b=$$(basename $$u .paslang); \
 	    $(INSTALL_DATA) $(A64DIR)/$$b.pi $(A64DIR)/$$b.o $(DESTDIR)$(libdir)/paslang/aarch64/; \
@@ -3067,8 +3110,11 @@ install: all installdirs
 	$(DESTDIR)$(bindir)/paslangc -o $(BUILDDIR)/paslang-install-hello $(srcdir)/testdata/hello.paslang
 	$(BUILDDIR)/paslang-install-hello
 	rm -f $(BUILDDIR)/paslang-install-hello
-	$(DESTDIR)$(bindir)/paslangc -target arm64 -o $(BUILDDIR)/paslang-install-a64 $(srcdir)/testdata/heapspan.paslang
-	rm -f $(BUILDDIR)/paslang-install-a64
+	: an arm64 program from amd64, when the arm64 units were asked for; on arm64 hello was one; \
+	if [ -n '$(AMD64)' ] && [ -n '$(ARM64)' ]; then \
+	  $(DESTDIR)$(bindir)/paslangc -target arm64 -o $(BUILDDIR)/paslang-install-a64 $(srcdir)/testdata/heapspan.paslang; \
+	  rm -f $(BUILDDIR)/paslang-install-a64; \
+	fi
 
 install-strip:
 	$(MAKE) INSTALL_PROGRAM='$(INSTALL_PROGRAM) -s' install
@@ -3140,8 +3186,13 @@ uninstall:
 	rm -rf $(DESTDIR)$(libdir)/paslang
 
 installdirs:
-	mkdir -p $(DESTDIR)$(bindir) $(DESTDIR)$(libdir)/paslang $(DESTDIR)$(libdir)/paslang/aarch64 \
-	  $(DESTDIR)$(libdir)/paslang/$(LVL_X64) '$(DESTDIR)$(libdir)/paslang/aarch64/$(LVL_A64)'
+	mkdir -p $(DESTDIR)$(bindir) $(DESTDIR)$(libdir)/paslang
+	if [ -n '$(AMD64)' ]; then \
+	  mkdir -p $(DESTDIR)$(libdir)/paslang/$(LVL_X64); \
+	fi
+	if [ -n '$(ARM64)' ]; then \
+	  mkdir -p $(DESTDIR)$(libdir)/paslang/aarch64 '$(DESTDIR)$(libdir)/paslang/aarch64/$(LVL_A64)'; \
+	fi
 
 installcheck:
 	$(DESTDIR)$(bindir)/paslangc -o $(BUILDDIR)/paslang-installcheck $(srcdir)/testdata/hello.paslang

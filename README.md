@@ -100,35 +100,55 @@ under Go's almost everywhere. The programs are in `scripts/bench/`:
 ## Building
 
 paslang runs on GNU/Linux, kernel 6.13 or newer, on amd64 or arm64.
-Building it from source needs:
+Building and installing it from source needs only:
 
-- the Free Pascal compiler (`fpc`), which builds the first compiler once;
-  paslang then compiles itself,
-- GNU binutils (`as`, `ld`) and, on an amd64 machine,
-  `aarch64-linux-gnu-as` and `aarch64-linux-gnu-ld`: `make` builds the
-  arm64 units too, and `make install` links an arm64 test program,
-- Python 3,
-- for `make check`, `gdb`, and `qemu-aarch64-static` 11.1 in `/usr/bin`
-  (the arm64 tests run under a copy that
-  `scripts/patch-qemu-madv102.py` patches so `MADV_GUARD_INSTALL`
-  succeeds), and `Xvfb` if present for the X11 tests; for the
-  benchmarks, Go.
+- GNU binutils (`as`, `ld`) in `/usr/bin`, where `paslangc` runs them,
+- for the first build alone, when no `paslangc` is installed yet, the
+  Free Pascal compiler (`fpc`), which builds the first compiler once
+  (paslang then compiles itself), and Python 3, which prepares its copy
+  of the sources. That bootstrap is written for amd64: on arm64 the
+  first build needs a `paslangc` already, the arm64 package's.
+
+Go and a C compiler are not needed to build or install. `./configure`
+finds the machine it runs on, and `make` builds and `make install`
+installs that machine's units. On amd64, `./configure --enable-arm64`
+adds the arm64 units, for `paslangc -target arm64`; they need
+`aarch64-linux-gnu-as` and `aarch64-linux-gnu-ld` in `/usr/bin`
+(`binutils-aarch64-linux-gnu` on Debian, `aarch64-linux-gnu-binutils` on
+Arch).
+
+The tests need more, and only the tests: `make check`, on amd64, needs
+`./configure --enable-arm64` and the arm64 binutils, Python 3, `gdb`, a C
+compiler (`cc`) and Go, which build helper programs and oracles of the
+tests, `qemu-aarch64-static` 11.1 in `/usr/bin` (the arm64 tests run
+under a copy that `scripts/patch-qemu-madv102.py` patches so
+`MADV_GUARD_INSTALL` succeeds), and `Xvfb` if present for the X11 tests.
+The benchmarks need Go.
 
 ```
 ./configure
 make
-make check
 make install
 ```
 
+and for the tests:
+
+```
+./configure --enable-arm64
+make
+make check
+```
+
 `make` builds `bin/paslangc`, `bin/pasdbg`, and the core and library
-units for both machines. `make check` runs every test program, every example of
+units of the machine (and the arm64 ones too with `--enable-arm64`).
+`make check` runs every test program, every example of
 the manual, the servers' self-tests and the arm64 build under qemu.
 `make install` puts `paslangc` and `pasdbg` in `$(prefix)/bin` and the
 units in `$(prefix)/lib/paslang` (the arm64 ones in
 `lib/paslang/aarch64`); `./configure --prefix=...` chooses the prefix.
 `make package` writes the two release archives under `build/pkg`, and
-`make distpkg` the packages of the distributions under `build/pkg/dist`.
+`make distpkg` the packages of the distributions under `build/pkg/dist`;
+both carry the two machines, so they need `./configure --enable-arm64`.
 
 ## Binary packages
 
