@@ -12,10 +12,10 @@ import os
 import random
 import re
 from pathlib import Path
+import shutil
 import signal
 import subprocess
 import sys
-import tempfile
 import uuid
 
 
@@ -24,7 +24,12 @@ build = Path(sys.argv[2]).resolve()
 qemu = sys.argv[3:]
 if not qemu:
     raise SystemExit("usage: check_sysutils.py compiler build qemu [options]")
-work = Path(tempfile.mkdtemp(prefix="sysutils-", dir=build))
+# One directory per check, emptied on each run and removed when the check
+# passes: a failure stays for inspection, nothing accumulates in build/.
+work = build / "check-sysutils"
+if work.exists():
+    shutil.rmtree(work)
+work.mkdir()
 base_env = {key: value for key, value in os.environ.items() if not key.startswith("PASLANG_GC")}
 base_env['PASLANG_PARENT_ONLY'] = 'parent-owned'
 base_env['TZ'] = 'UTC'
@@ -307,3 +312,4 @@ for target in ("amd64", "arm64"):
                         if output != expected_output:
                             raise RuntimeError(f"unexpected {binary} {arguments}:\n{output[:4096].decode(errors='replace')}")
     print(f"ok SysUtils {target} (inline 0/40, single/all CPUs, GC stress/off, errors/files/metadata/cwd/{len(paths)} paths)", flush=True)
+shutil.rmtree(work)

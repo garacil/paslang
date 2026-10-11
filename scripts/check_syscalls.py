@@ -4,13 +4,14 @@
 # GPL version 3 or later; see COPYING. No warranty.
 """P178: saturated blocking calls preserve G/M/P, GC and stack roots.
 
-Unique build directories, dynamically selected affinity and a private
+A build directory of its own, dynamically selected affinity and a private
 Unix GDB socket avoid shared output files, CPU assumptions and port races.
 The QEMU user-mode socket endpoint is documented at
 https://www.qemu.org/docs/master/user/main.html#linux-user-space-emulator
 """
 import os
 from pathlib import Path
+import shutil
 import signal
 import subprocess
 import sys
@@ -26,7 +27,12 @@ if inject_only:
     qemu.remove("--inject-only")
 if not qemu:
     raise SystemExit("usage: check_syscalls.py compiler build qemu [options]")
-work = Path(tempfile.mkdtemp(prefix="syscalls-", dir=build))
+# One directory per check, emptied on each run and removed when the check
+# passes: a failure stays for inspection, nothing accumulates in build/.
+work = build / "check-syscalls"
+if work.exists():
+    shutil.rmtree(work)
+work.mkdir()
 base_env = {key: value for key, value in os.environ.items() if not key.startswith("PASLANG_GC")}
 stress = dict(base_env, PASLANG_GCVERIFY="1", PASLANG_GCSTRESS="1", PASLANG_GCPOISON="1")
 off = dict(base_env, PASLANG_GC="off")
@@ -95,3 +101,4 @@ for target in ("amd64", "arm64"):
         if marker not in output:
             raise RuntimeError(f"{script} fault injection failed: {output.decode(errors='replace')}")
     print(f"ok syscalls {target} (inline 0/40, single/all CPUs, GC stress/off, EINTR/short/EOF/handoff)", flush=True)
+shutil.rmtree(work)

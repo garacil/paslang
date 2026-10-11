@@ -6,6 +6,7 @@
 import os
 import re
 from pathlib import Path
+import shutil
 import signal
 import subprocess
 import sys
@@ -15,7 +16,12 @@ import time
 compiler = str(Path(sys.argv[1]).resolve())
 build = Path(sys.argv[2]).resolve()
 qemu = sys.argv[3:]
-work = Path(tempfile.mkdtemp(prefix='debug-growth-', dir=build))
+# One directory per check, emptied on each run and removed when the check
+# passes: a failure stays for inspection, nothing accumulates in build/.
+work = build / 'check-debug-growth'
+if work.exists():
+    shutil.rmtree(work)
+work.mkdir()
 base = {key: value for key, value in os.environ.items() if not key.startswith('PASLANG_GC')}
 stress = dict(base, PASLANG_GCVERIFY='1', PASLANG_GCSTRESS='1', PASLANG_GCPOISON='1',
               DEBUGINFOD_URLS='')
@@ -112,3 +118,4 @@ for target, cpu_level in (('amd64', 'base'), ('arm64', 'base'), ('arm64', 'max')
         raise RuntimeError(gdb_output.decode(errors='replace'))
     print(f'ok debugger growth {target}/{cpu_level}: frames, next, GC stress/off, single/all CPUs and forced relocation',
           flush=True)
+shutil.rmtree(work)

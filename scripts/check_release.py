@@ -3,10 +3,12 @@
 # Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
 # GPL version 3 or later; see COPYING. No warranty.
 """Validate every release format and run both relocated packaged compilers."""
+import atexit
 import hashlib
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import tempfile
 import time
@@ -15,7 +17,10 @@ repo = Path(__file__).resolve().parents[1]
 assets = repo / 'build/pkg/release'
 base = {key: value for key, value in os.environ.items() if not key.startswith('PASLANG_GC')}
 stress = dict(base, PASLANG_GCVERIFY='1', PASLANG_GCSTRESS='1', PASLANG_GCPOISON='1')
+# The shared temporary directory cannot hold a fixed name for the last run,
+# as build/ does, so the extracted packages go away on exit, pass or fail.
 work = Path(tempfile.mkdtemp(prefix='paslang-release-check-'))
+atexit.register(shutil.rmtree, work)
 qemu = repo / 'build/qemu-aarch64-static'
 
 

@@ -5,14 +5,19 @@
 """Currency language/interface, place binding and debug contracts on both targets."""
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
-import tempfile
 
 compiler = str(Path(sys.argv[1]).resolve())
 build = Path(sys.argv[2]).resolve()
 qemu = sys.argv[3:]
-work = Path(tempfile.mkdtemp(prefix='currency-language-', dir=build))
+# One directory per check, emptied on each run and removed when the check
+# passes: a failure stays for inspection, nothing accumulates in build/.
+work = build / 'check-currency-language'
+if work.exists():
+    shutil.rmtree(work)
+work.mkdir()
 environment = dict(os.environ, PASLANG_GCVERIFY='1', PASLANG_GCSTRESS='1', PASLANG_GCPOISON='1')
 compile_environment = {key: value for key, value in os.environ.items()
                        if not key.startswith('PASLANG_GC')}
@@ -112,3 +117,4 @@ for target in ('amd64', 'arm64'):
         if b'= 2.675' not in gdb_output or b'small = 1/10000' not in gdb_output:
             raise RuntimeError(f'GDB Currency type/value: {gdb_output!r}')
     print(f'ok Currency language {target}: inline0/40, affinity, GC stress, interfaces, rejects and debug')
+shutil.rmtree(work)

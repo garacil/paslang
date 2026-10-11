@@ -5,7 +5,11 @@
 # P182: isolated FPC bootstrap, followed by two native stages.
 set -eu
 build_dir=$1
-work_dir=$(mktemp -d "$build_dir/bootstrap-XXXXXX")
+# One directory, emptied on each run and removed when the check passes:
+# a failure stays for inspection, nothing accumulates in the build tree.
+work_dir=$build_dir/check-bootstrap
+rm -rf "$work_dir"
+mkdir -p "$work_dir"
 work_dir=$(readlink -f "$work_dir")
 host_dir="$work_dir/host"
 mkdir -p "$host_dir" "$work_dir/units" "$work_dir/build"
@@ -50,4 +54,5 @@ for source in bootstrapcore quadconst valround valunsigned; do
     fi
     diff -u "testdata/$source.out" "$work_dir/$source.got"
 done
+rm -rf "$work_dir"
 echo 'ok clean FPC bootstrap, integer/environment fixture and two native stages'
