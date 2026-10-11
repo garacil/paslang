@@ -6320,6 +6320,8 @@ routines are there for the compiler, and a program may call them too:
 | `pasroutines` | `PasCondWait(c, m)`, `PasCondSignal(c)`, `PasCondBroadcast(c)` | those of a `cond` (`TPasCond`) |
 | `pasroutines` | `PasOnceBegin(o): Boolean`, `PasOnceEnd(o)`, `PasOnceDone(o): Boolean` | `once o do stmt` is `if PasOnceBegin(o) then` the statement, then `PasOnceEnd(o)`; `PasOnceDone` is `o.Done` (`TPasOnce`) |
 | `pasroutines` | `PasReadLn(Dest: Pointer)` | `ReadLn(s)`: one line of standard input into the string at `Dest` |
+| `pasroutines` | `PasIoRetry(answer, fd, ev, deadline): Boolean`, `PasIoDeadline(ms)`, `PasIoRead(fd, buf, n, deadline)`, `PasIoWrite(fd, buf, n, deadline)` | the one loop of I/O that parks: whether to make a system call again after its answer (EINTR at once, EAGAIN after parking until `fd` is ready or the deadline passes), a deadline `ms` from now, one read and one write through it |
+| `pasroutines` | `PasNetRead(fd, max, dest)`, `PasNetWrite(fd, p, n)` | `NetRead(fd, max, s)` and `NetWrite(fd, s)` |
 | `pasfmt` | `PasFmtReal(x, w, d): string` | `x:w:d` as text, `d` decimals padded to `w` columns; a `d` below 0 is `WriteLn`'s own form, up to six decimals |
 | `pasfmt` | `PasFmtInt(v, w): string`, `PasFmtStr(s, w): string` | an integer, a string, padded to `w` columns |
 | `pasfmt` | `PasParseReal(s, out bits): Boolean` | the double nearest the text `s`, its 64 bits into the `Int64` `bits`; `False` when `s` is not a number |
@@ -9542,20 +9544,31 @@ program has without `uses`:
 | `WaitMs(fd, ev, ms)` | `WaitIo`, which also wakes after `ms` milliseconds; 0 or less does not wait. Failed registration returns negative errno and removes its deadline |
 
 The three `Wait` words park the routine on the runtime's epoll, one wake
-per wait, and the thread goes on with other routines. Their `Integer`
-result says nothing: after one the caller tries its read or its write
-again, as `pasnet` does:
+per wait, and the thread goes on with other routines. After a wake the
+caller tries its read or its write again. That loop is written once,
+in `pasroutines` (1.1.94), as Go's `internal/poll` writes it:
+`PasIoRetry(answer, fd, ev, deadline)` takes the answer of a system
+call and says whether to make the call again: at once on EINTR (-4),
+and on EAGAIN (-11) after the routine has parked until `fd` is ready
+for `ev` or until `deadline` passes, a `Nanotime` (`PasIoDeadline(ms)`
+is the one `ms` milliseconds from now, 0 or less now; a deadline of 0
+is none). A wait that fails leaves its negative errno in `answer`, a
+deadline that passed -110 (ETIMEDOUT), and a descriptor epoll does not
+take, a file on disk or a directory, its -11, as Go's poller answers
+for a descriptor it never registered. `PasIoRead(fd, buf, n,
+deadline)` and `PasIoWrite` are one transfer each through it, at most
+1 GiB, giving the count or a negative errno; `NetRead`, `NetWrite`,
+`ReadLn`, SysUtils' file reads and writes and every word of `pasnet`
+use them:
 
 ```
 nr := 63;                                { read on arm64 }
 if Amd64 = 1 then
   nr := 0;                               { read on amd64 }
-n := Syscall(nr, fd, @buf, 512);         { -11: nothing yet (EAGAIN) }
-while n = -11 do
-begin
-  WaitIo(fd, 1);                         { park until fd can be read }
-  n := Syscall(nr, fd, @buf, 512);
-end;
+repeat
+  n := Syscall(nr, fd, @buf, 512);       { -4 EINTR, -11 EAGAIN }
+until not PasIoRetry(n, fd, 1, 0);       { parks until fd can be read }
+n := PasIoRead(fd, @buf, 512, PasIoDeadline(100));   { the same, or -110 after 100 ms }
 ```
 
 `uses paslib` gives files and processes: `ReadFile`, `WriteFile`,
@@ -11480,7 +11493,8 @@ its place:
   PWord PUInt16 PInt16 PSmallInt PDWord PLongWord PUInt32 PInt32
   PInteger PInt64 PSingle PDouble PQuad PBoolean PPointer`;
 - what the core units export (§15), predefined in every program and
-  unit: `Goid NumGoroutine Yield PasReadLn`, the sync types `TPasMutex
+  unit: `Goid NumGoroutine Yield PasReadLn PasIoRetry PasIoDeadline
+  PasIoRead PasIoWrite PasNetRead PasNetWrite`, the sync types `TPasMutex
   TPasRWMutex TPasWaitGroup TPasCond TPasOnce` with their `PasMutexLock`
   … `PasOnceDone` routines, pasfmt's `PasFmtReal` … `PasFmtQuad`,
   pashash's `PasHex PasMd5 PasSha1Cpu` … `PasMerkleCheckBase` and

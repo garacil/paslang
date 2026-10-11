@@ -4,6 +4,10 @@
 # GPL version 3 or later; see COPYING. No warranty.
 """P178: saturated blocking calls preserve G/M/P, GC and stack roots.
 
+P199: ioretry's first read of 8 bytes is a NetRead through pasroutines'
+PasIoRetry; the injected EINTR must be read again, not taken for the end
+of the stream (the fixture halts with 5 if NetRead comes back empty).
+
 A build directory of its own, dynamically selected affinity and a private
 Unix GDB socket avoid shared output files, CPU assumptions and port races.
 The QEMU user-mode socket endpoint is documented at
@@ -57,8 +61,9 @@ for target in ("amd64", "arm64"):
     core = build if target == "amd64" else build / "a64"
     runner = [] if target == "amd64" else qemu
     for level in ((40,) if inject_only else (0, 40)):
-        for name in (("syscallretry", "syscallroots") if inject_only else
-                     ("syscallprogress", "syscallroots", "syscallwait", "syscallretry", "forksignals")):
+        for name in (("syscallretry", "syscallroots", "ioretry") if inject_only else
+                     ("syscallprogress", "syscallroots", "syscallwait", "syscallretry", "forksignals",
+                      "ioretry")):
             binary = work / f"{name}-{target}-{level}"
             run([compiler, "-target", target, "-inline", str(level), "-Fu", str(core),
                  "-o", str(binary), f"testdata/{name}.paslang"])
@@ -70,6 +75,7 @@ for target in ("amd64", "arm64"):
                         raise RuntimeError(f"unexpected output from {binary}: {output!r}")
     for name, script, marker in (
             ("syscallretry", "eintr", b"EINTR retry, short read and EOF passed"),
+            ("ioretry", "eintr", b"EINTR retry, short read and EOF passed"),
             ("syscallroots", "handoff", b"pending syscall handoff and genuine deadlock passed")):
         binary = work / f"{name}-{target}-40"
         commands = ["gdb", "-batch", "-nx", "-q", "-ex", "set debuginfod enabled off",
@@ -100,5 +106,5 @@ for target in ("amd64", "arm64"):
                         process.communicate()
         if marker not in output:
             raise RuntimeError(f"{script} fault injection failed: {output.decode(errors='replace')}")
-    print(f"ok syscalls {target} (inline 0/40, single/all CPUs, GC stress/off, EINTR/short/EOF/handoff)", flush=True)
+    print(f"ok syscalls {target} (inline 0/40, single/all CPUs, GC stress/off, EINTR/short/EOF/handoff, PasIoRetry EINTR)", flush=True)
 shutil.rmtree(work)

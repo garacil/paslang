@@ -98,6 +98,22 @@ function NumGoroutine: Integer;
 procedure Yield;
 procedure PasReadLn(Dest: Pointer);
 
+{ The one loop of a transfer that parks (P199). After a system call on a
+  descriptor answers Answer, PasIoRetry says whether to make the call
+  again: on EINTR at once, on EAGAIN once the routine has parked until
+  the descriptor is ready (Ev 1 to read, 4 to write) or until Deadline,
+  a Nanotime, passes (0 is no deadline). A failed wait puts its -errno
+  in Answer, a deadline that passed -110 (ETIMEDOUT). PasIoDeadline is
+  the deadline Ms milliseconds from now. PasIoRead and PasIoWrite are
+  one transfer each through it; NetRead and NetWrite are PasNetRead and
+  PasNetWrite. }
+function PasIoRetry(var Answer: Integer; Fd, Ev, Deadline: Integer): Boolean;
+function PasIoDeadline(Ms: Integer): Integer;
+function PasIoRead(Fd: Integer; Buf: Pointer; N, Deadline: Integer): Integer;
+function PasIoWrite(Fd: Integer; Buf: Pointer; N, Deadline: Integer): Integer;
+procedure PasNetRead(Fd, MaxN: Integer; Dest: Pointer);
+function PasNetWrite(Fd: Integer; P: Pointer; N: Integer): Integer;
+
 implementation
 
 { Every runtime fatal error exits 1, like the map and the domain errors. }
@@ -487,10 +503,10 @@ end;
   the program, so the bytes after a line wait for the next ReadLn: each
   call had 256 bytes of its own, dropped whatever came after the first
   line and cut a longer line. A line ends at a line feed, which is not
-  kept, or at the end of the input. Standard input is non-blocking, so
-  a routine waiting for input parks on the poller (WaitFd) and its M
-  runs others; one routine reads at a time, the rest wait on InMu. The
-  runtime's rt_readln jumps here with Dest, the string to fill. }
+  kept, or at the end of the input or an error. A routine waiting for
+  input parks on the poller (PasIoRead, P199) and its M runs others;
+  one routine reads at a time, the rest wait on InMu. The runtime's
+  rt_readln jumps here with Dest, the string to fill. }
 type
   PStr = ^string;
 
@@ -502,28 +518,22 @@ var
 procedure PasReadLn(Dest: Pointer);
 var
   line: string;
-  n, k, old, nr: Integer;
+  n, k, old: Integer;
   done: Boolean;
 begin
   line := '';
-  if Amd64 = 1 then
-    nr := 0
-  else
-    nr := 63;
   PasMutexLock(InMu);
   done := False;
   while not done do
     if InPos >= InEnd then
     begin
-      n := Syscall(nr, 0, Int64(@InBuf[0]), 4096);
+      n := PasIoRead(0, @InBuf[0], 4096, 0);
       if n > 0 then
       begin
         InPos := 0;
         InEnd := n;
       end
-      else if n = -11 then
-        k := WaitFd(0)
-      else if n <> -4 then
+      else
         done := True;
     end
     else
@@ -547,6 +557,182 @@ begin
     end;
   PasMutexUnlock(InMu);
   PStr(Dest)^ := line;
+end;
+
+{ ---- I/O that parks (P199) ---- }
+
+{ Every unit's read and write loop was its own copy: sysutils', ten in
+  pasnet, ReadLn's here and NetRead's and NetWrite's in the runtime's
+  assembler, and most of them read EINTR as the end of the stream or
+  tried again after a wait that had failed, spinning. The policy is
+  Go's (golang src/internal/poll/fd_unix.go: Read, Write, ReadMsg,
+  WriteTo and WriteMsg, with ignoringEINTRIO): EINTR makes the call
+  again; EAGAIN waits for the descriptor and makes it again, unless
+  the wait fails. A descriptor epoll does not take (EPERM, a disk file)
+  is one Go's poller never registered (src/os/file_unix.go newFile), so
+  its EAGAIN is the answer; any other failed registration is returned,
+  as WaitIo reports it (P180). A deadline makes the wait WaitMs, to the
+  millisecond after it, and an EAGAIN past it the answer -110, Go's
+  ErrDeadlineExceeded; the call is tried before the deadline is looked
+  at. Waiting parks the routine: no M and no P is held, and a blocking
+  descriptor blocks in the call with the P handed over (P178). }
+
+type
+  { a string's two words, as passtr's TStrWords }
+  TStrWords = record
+    P: Pointer;
+    N: Integer;
+  end;
+  PStrWords = ^TStrWords;
+
+const
+  { Go's maxRW: at most 1 GiB a transfer, so a count never overflows a
+    system call's answer and long reads stay aligned }
+  MaxRW = 1073741824;
+
+function PasIoRetry(var Answer: Integer; Fd, Ev, Deadline: Integer): Boolean;
+var
+  left, w: Integer;
+begin
+  Result := Answer = -4;
+  if Answer <> -11 then
+    Exit;
+  if Deadline > 0 then
+  begin
+    left := Deadline - Nanotime;
+    if left <= 0 then
+    begin
+      Answer := -110;
+      Exit;
+    end;
+    w := WaitMs(Fd, Ev, left div 1000000 + 1);
+  end
+  else
+    w := WaitIo(Fd, Ev);
+  if w = -1 then
+    Exit;
+  if w < 0 then
+  begin
+    Answer := w;
+    Exit;
+  end;
+  Result := True;
+end;
+
+{ The Nanotime Ms milliseconds from now: 0 or less is now, so a wait
+  ends at once, and at most 2^40 ms, as WaitMs takes, so it neither
+  overflows nor comes out 0, which is no deadline. }
+function PasIoDeadline(Ms: Integer): Integer;
+begin
+  if Ms < 0 then
+    Ms := 0;
+  if Ms > 1099511627776 then
+    Ms := 1099511627776;
+  Result := Nanotime + Ms * 1000000;
+end;
+
+{ One read: the count, 0 at the end of the stream or for N of 0 or
+  less (Go's Read returns at once for an empty buffer), or -errno. }
+function PasIoRead(Fd: Integer; Buf: Pointer; N, Deadline: Integer): Integer;
+var
+  nr: Integer;
+begin
+  Result := 0;
+  if N <= 0 then
+    Exit;
+  if N > MaxRW then
+    N := MaxRW;
+  if Amd64 = 1 then
+    nr := 0
+  else
+    nr := 63;
+  repeat
+    Result := Syscall(nr, Fd, Buf, N);
+  until not PasIoRetry(Result, Fd, 1, Deadline);
+end;
+
+{ One write: the count, which may be short, 0 for N of 0 or less, or
+  -errno. The caller writes the rest. }
+function PasIoWrite(Fd: Integer; Buf: Pointer; N, Deadline: Integer): Integer;
+var
+  nr: Integer;
+begin
+  Result := 0;
+  if N <= 0 then
+    Exit;
+  if N > MaxRW then
+    N := MaxRW;
+  if Amd64 = 1 then
+    nr := 1
+  else
+    nr := 64;
+  repeat
+    Result := Syscall(nr, Fd, Buf, N);
+  until not PasIoRetry(Result, Fd, 4, Deadline);
+end;
+
+{ NetRead(fd, max, s): the runtime's rt_tcpread jumps here. Up to MaxN
+  bytes (1 to 65536) in the string at Dest, which keeps the block of
+  MaxN with a shorter length, as rt_tcpread's did: no copy; the empty
+  string at the end of the stream or on an error. }
+procedure PasNetRead(Fd, MaxN: Integer; Dest: Pointer);
+var
+  n: Integer;
+begin
+  if MaxN < 1 then
+    MaxN := 1;
+  if MaxN > 65536 then
+    MaxN := 65536;
+  PStr(Dest)^ := '';
+  SetLength(PStr(Dest)^, MaxN);
+  n := PasIoRead(Fd, Pointer(PStr(Dest)^), MaxN, 0);
+  if n > 0 then
+    PStrWords(Dest)^.N := n
+  else
+    PStr(Dest)^ := '';
+end;
+
+{ NetWrite(fd, s): the runtime's rt_tcpwrite jumps here with the
+  string's two words. All of it, parking while the socket is full: N,
+  or -errno. A socket is asked for no SIGPIPE (MSG_NOSIGNAL, 1.1.1),
+  so a peer that went away is EPIPE, as Go's net has it; a descriptor
+  that is not a socket says ENOTSOCK to sendto and gets a plain write.
+  A write that moves nothing ends with the count so far, where Go's
+  Write ends with io.ErrUnexpectedEOF. }
+function PasNetWrite(Fd: Integer; P: Pointer; N: Integer): Integer;
+var
+  r, want, nsend, nwrite: Integer;
+begin
+  if Amd64 = 1 then
+  begin
+    nsend := 44;
+    nwrite := 1;
+  end
+  else
+  begin
+    nsend := 206;
+    nwrite := 64;
+  end;
+  Result := 0;
+  while Result < N do
+  begin
+    want := N - Result;
+    if want > MaxRW then
+      want := MaxRW;
+    repeat
+      r := Syscall(nsend, Fd, Integer(P) + Result, want, 16384, 0, 0);
+      if r = -88 then
+        r := Syscall(nwrite, Fd, Integer(P) + Result, want);
+    until not PasIoRetry(r, Fd, 4, 0);
+    if r < 0 then
+    begin
+      Result := r;
+      Exit;
+    end;
+    if r = 0 then
+      Exit;
+    Result := Result + r;
+  end;
 end;
 
 end.

@@ -1,0 +1,214 @@
+{ P199 (1.1.94): the one loop of I/O that parks. pasroutines' PasIoRetry
+  is the policy under PasIoRead, PasIoWrite, NetRead, NetWrite, ReadLn,
+  sysutils' file reads and writes and pasnet's sockets: EINTR makes the
+  call again, EAGAIN parks the routine until the descriptor is ready or
+  a deadline passes, a failed wait is the answer, and a descriptor epoll
+  does not take keeps its EAGAIN, as Go's internal/poll. Here on pipes
+  and stream sockets that do not block, with 64 routines parked at once.
+  check_syscalls.py injects one EINTR into the first read of 8 bytes,
+  the NetRead at the start: before 1.1.94 rt_tcpread took EINTR for the
+  end of the stream and NetRead gave the empty string. make check runs
+  it on both machines and under the collector's stress. }
+program ioretry;
+
+uses
+  paslinux, pasnet;
+
+const
+  Readers = 64;
+  BigSize = 1048576;
+
+type
+  TFds = array[0..1] of Int32;
+
+var
+  p, q: TFds;
+  pipes: array[0..Readers - 1] of TFds;
+  s, big, got, root: string;
+  buf: array[0..4095] of Byte;
+  a, n, i, t0, fd, filled, drained, written, total, sa, sb, bad, woken: Integer;
+  same: Boolean;
+  wg: waitgroup;
+
+{ A pipe whose ends do not block (pipe2 with O_NONBLOCK and O_CLOEXEC,
+  the numbers sysutils uses) }
+function NbPipe(var F: TFds): Boolean;
+begin
+  F[0] := 0;
+  F[1] := 0;
+  if Amd64 = 1 then
+    Result := Syscall(293, @F[0], 524288 or ONonblock) = 0
+  else
+    Result := Syscall(59, @F[0], 524288 or ONonblock) = 0;
+end;
+
+procedure LateWrite(Fd, Ms: Integer; const S: string);
+var
+  k: Integer;
+begin
+  Sleep(Ms);
+  k := OsWrite(Fd, Int64(Pointer(S)), Length(S));
+  if k <> Length(S) then
+    AtomicAdd(@bad, 1);
+  wg.Done;
+end;
+
+{ Reads Want bytes after a pause, parking in PasIoRead while the pipe
+  is empty. }
+procedure Drain(Fd, Want: Integer);
+var
+  b: array[0..4095] of Byte;
+  k: Integer;
+begin
+  Sleep(20);
+  while drained < Want do
+  begin
+    k := PasIoRead(Fd, @b[0], 4096, 0);
+    if k <= 0 then
+      Break;
+    drained := drained + k;
+  end;
+  wg.Done;
+end;
+
+procedure BigWriter(Fd: Integer);
+begin
+  written := NetWrite(Fd, big);
+  wg.Done;
+end;
+
+{ One of 64 routines parked at once, each on its own pipe }
+procedure Reader(K: Integer);
+var
+  b: array[0..15] of Byte;
+  r: Integer;
+begin
+  r := PasIoRead(pipes[K][0], @b[0], 16, 0);
+  if (r <> 1) or (b[0] <> K) then
+    AtomicAdd(@bad, 1);
+  AtomicAdd(@woken, 1);
+  wg.Done;
+end;
+
+begin
+  { EINTR (injected by check_syscalls.py into this read of 8 bytes) }
+  if not NbPipe(p) then
+    Halt(1);
+  s := 'abcdefgh';
+  n := OsWrite(p[1], Int64(Pointer(s)), 8);
+  NetRead(p[0], 8, got);
+  WriteLn('netread: ', got);
+  if got <> s then
+    Halt(5);
+
+  { EAGAIN on a pipe: the read parks until a routine writes }
+  wg.Add(1);
+  pas LateWrite(p[1], 20, 'hello');
+  n := PasIoRead(p[0], @buf[0], 64, 0);
+  wg.Wait;
+  WriteLn('pipe read parked: ', n, ' ', Chr(buf[0]), Chr(buf[1]), Chr(buf[2]), Chr(buf[3]), Chr(buf[4]));
+
+  { EAGAIN on a full pipe: the write parks until a routine drains it }
+  if not NbPipe(q) then
+    Halt(2);
+  filled := 0;
+  repeat
+    n := OsWrite(q[1], Int64(@buf[0]), 4096);
+    if n > 0 then
+      filled := filled + n;
+  until n < 0;
+  WriteLn('pipe full: ', n, ', a multiple of 4096: ', (filled > 0) and (filled mod 4096 = 0));
+  drained := 0;
+  wg.Add(1);
+  pas Drain(q[0], filled + 4096);
+  n := PasIoWrite(q[1], @buf[0], 4096, 0);
+  wg.Wait;
+  WriteLn('pipe write parked: ', n, ', all drained: ', drained = filled + 4096);
+
+  { deadlines: none come, one passed, data before the deadline }
+  t0 := Nanotime;
+  n := PasIoRead(p[0], @buf[0], 64, PasIoDeadline(30));
+  WriteLn('deadline 30 ms: ', n, ', after 30 ms: ', Nanotime - t0 >= 30000000);
+  t0 := Nanotime;
+  n := PasIoRead(p[0], @buf[0], 64, PasIoDeadline(0));
+  a := PasIoRead(p[0], @buf[0], 64, PasIoDeadline(-5));
+  WriteLn('deadline 0 and -5 ms: ', n, ' ', a, ', at once: ', Nanotime - t0 < 1000000000);
+  wg.Add(1);
+  pas LateWrite(p[1], 10, 'late');
+  n := PasIoRead(p[0], @buf[0], 64, PasIoDeadline(5000));
+  wg.Wait;
+  WriteLn('data before the deadline: ', n);
+
+  { the policy itself }
+  a := -4;
+  WriteLn('EINTR: ', PasIoRetry(a, p[0], 1, 0), ' ', a);
+  a := 5;
+  WriteLn('a count: ', PasIoRetry(a, p[0], 1, 0), ' ', a);
+  a := -32;
+  WriteLn('EPIPE: ', PasIoRetry(a, p[0], 4, 0), ' ', a);
+  root := '/'#0;
+  fd := OsOpen(Int64(Pointer(root)), ORdonly or ODirectory, 0);
+  a := -11;
+  WriteLn('EAGAIN on a descriptor epoll does not take: ', PasIoRetry(a, fd, 1, 0), ' ', a);
+  n := OsClose(fd);
+  a := -11;
+  WriteLn('EAGAIN on a descriptor that is not open: ', PasIoRetry(a, 1000000, 1, 0), ' ', a);
+  a := -11;
+  WriteLn('EAGAIN past the deadline: ', PasIoRetry(a, p[0], 1, Nanotime - 1), ' ', a);
+  WriteLn('nothing to read: ', PasIoRead(p[0], @buf[0], 0, 0), ', a closed descriptor: ', PasIoRead(1000000, @buf[0], 8, 0));
+
+  { a stream socket: NetWrite parks while the other end reads a MiB }
+  if not UnixPair(sa, sb) then
+    Halt(3);
+  SetLength(big, BigSize);
+  for i := 1 to BigSize do
+    big[i] := Chr((i * 7) mod 251);
+  written := 0;
+  wg.Add(1);
+  pas BigWriter(sa);
+  total := 0;
+  same := True;
+  while total < BigSize do
+  begin
+    NetRead(sb, 65536, got);
+    if got = '' then
+      Break;
+    for i := 1 to Length(got) do
+      if got[i] <> big[total + i] then
+        same := False;
+    total := total + Length(got);
+  end;
+  wg.Wait;
+  WriteLn('socket: ', written, ' written, ', total, ' read, the same bytes: ', same);
+
+  { NetWrite to a pipe: sendto says ENOTSOCK and a plain write follows }
+  n := NetWrite(p[1], 'pipe text');
+  NetRead(p[0], 64, got);
+  WriteLn('pipe NetWrite: ', n, ' ', got);
+
+  { the end of the stream }
+  n := OsClose(p[1]);
+  NetRead(p[0], 16, got);
+  WriteLn('end of the stream: ', Length(got), ' ', PasIoRead(p[0], @buf[0], 16, 0));
+  n := OsClose(sa);
+  NetRead(sb, 16, got);
+  WriteLn('socket closed: ', Length(got));
+
+  { 64 routines parked in PasIoRead at once, each woken by its write }
+  bad := 0;
+  woken := 0;
+  for i := 0 to Readers - 1 do
+    if not NbPipe(pipes[i]) then
+      Halt(4);
+  wg.Add(Readers);
+  for i := 0 to Readers - 1 do
+    pas Reader(i);
+  Sleep(20);
+  for i := 0 to Readers - 1 do
+  begin
+    buf[0] := Byte(i);
+    n := OsWrite(pipes[i][1], Int64(@buf[0]), 1);
+  end;
+  wg.Wait;
+  WriteLn(Readers, ' readers parked, ', woken, ' woken, ', bad, ' bad');
+end.

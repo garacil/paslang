@@ -142,6 +142,10 @@ GOLDEN_A64 += mapseed
 # P198: strings that are views of a block nothing writes (PasStrView).
 GOLDEN += strview
 GOLDEN_A64 += strview
+# P199: the one loop of I/O that parks (PasIoRetry): EINTR, EAGAIN on
+# pipes and sockets, deadlines, failed waits, 64 routines parked.
+GOLDEN += ioretry
+GOLDEN_A64 += ioretry
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -544,7 +548,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  PASLANG_GCSTRESS=3 PASLANG_GCPOISON=1 timeout 300 $(BUILDDIR)/gcbasic > $(BUILDDIR)/gcbasic.got; \
 	  diff -u testdata/gcbasic.out $(BUILDDIR)/gcbasic.got; \
 	done; \
-	for t in heapspan map2 sync2 strs mapsplit closurebox tree1 tree2 hash1 store1 mapseed strview; do \
+	for t in heapspan map2 sync2 strs mapsplit closurebox tree1 tree2 hash1 store1 mapseed strview ioretry; do \
 	  PASLANG_GCSTRESS=5 PASLANG_GCPOISON=1 timeout 300 $(BUILDDIR)/$$t > $(BUILDDIR)/$$t.got; \
 	  diff -u testdata/$$t.out $(BUILDDIR)/$$t.got; \
 	done; \
@@ -3144,11 +3148,12 @@ install: all installdirs
 	$(POST_INSTALL)
 	$(DESTDIR)$(bindir)/paslangc -o $(BUILDDIR)/paslang-install-hello $(srcdir)/testdata/hello.paslang
 	$(BUILDDIR)/paslang-install-hello
-	rm -f $(BUILDDIR)/paslang-install-hello
+	: the program and what the compile wrote beside it, so a root install leaves nothing of root in build/
+	rm -f $(BUILDDIR)/paslang-install-hello $(BUILDDIR)/paslang-install-hello.s $(BUILDDIR)/paslang-install-hello.o $(BUILDDIR)/paslang-install-hello.ld
 	: an arm64 program from amd64 when the arm64 units were asked for, since on arm64 hello was one; \
 	if [ -n '$(AMD64)' ] && [ -n '$(ARM64)' ]; then \
 	  $(DESTDIR)$(bindir)/paslangc -target arm64 -o $(BUILDDIR)/paslang-install-a64 $(srcdir)/testdata/heapspan.paslang; \
-	  rm -f $(BUILDDIR)/paslang-install-a64; \
+	  rm -f $(BUILDDIR)/paslang-install-a64 $(BUILDDIR)/paslang-install-a64.s $(BUILDDIR)/paslang-install-a64.o $(BUILDDIR)/paslang-install-a64.ld; \
 	fi
 
 install-strip:
@@ -3232,10 +3237,10 @@ installdirs:
 installcheck:
 	$(DESTDIR)$(bindir)/paslangc -o $(BUILDDIR)/paslang-installcheck $(srcdir)/testdata/hello.paslang
 	$(BUILDDIR)/paslang-installcheck
-	rm -f $(BUILDDIR)/paslang-installcheck
+	rm -f $(BUILDDIR)/paslang-installcheck $(BUILDDIR)/paslang-installcheck.s $(BUILDDIR)/paslang-installcheck.o $(BUILDDIR)/paslang-installcheck.ld
 	$(DESTDIR)$(bindir)/paslangc -o $(BUILDDIR)/paslang-installcheck-who $(srcdir)/examples/pasroutines/who.paslang
 	$(BUILDDIR)/paslang-installcheck-who
-	rm -f $(BUILDDIR)/paslang-installcheck-who
+	rm -f $(BUILDDIR)/paslang-installcheck-who $(BUILDDIR)/paslang-installcheck-who.s $(BUILDDIR)/paslang-installcheck-who.o $(BUILDDIR)/paslang-installcheck-who.ld
 
 mostlyclean:
 
