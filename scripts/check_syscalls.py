@@ -12,6 +12,10 @@ P212: stdlocks leaves a WriteLn stuck on a standard output that blocks
 while standard error and the collector go on; on one CPU the stuck write
 must hand its P over.
 
+P213: waitms0 asks WaitMs for 0, negative and huge deadlines on a pipe
+and a socket; with no time left the answer is 0 at once, not what the
+registers held, under every collector setting and on one CPU.
+
 A build directory of its own, dynamically selected affinity and a private
 Unix GDB socket avoid shared output files, CPU assumptions and port races.
 The QEMU user-mode socket endpoint is documented at
@@ -67,7 +71,7 @@ for target in ("amd64", "arm64"):
     for level in ((40,) if inject_only else (0, 40)):
         for name in (("syscallretry", "syscallroots", "ioretry") if inject_only else
                      ("syscallprogress", "syscallroots", "syscallwait", "syscallretry", "forksignals",
-                      "ioretry", "stdlocks")):
+                      "ioretry", "stdlocks", "waitms0")):
             binary = work / f"{name}-{target}-{level}"
             run([compiler, "-target", target, "-inline", str(level), "-Fu", str(core),
                  "-o", str(binary), f"testdata/{name}.paslang"])
@@ -110,5 +114,5 @@ for target in ("amd64", "arm64"):
                         process.communicate()
         if marker not in output:
             raise RuntimeError(f"{script} fault injection failed: {output.decode(errors='replace')}")
-    print(f"ok syscalls {target} (inline 0/40, single/all CPUs, GC stress/off, EINTR/short/EOF/handoff, PasIoRetry EINTR, stuck standard output)", flush=True)
+    print(f"ok syscalls {target} (inline 0/40, single/all CPUs, GC stress/off, EINTR/short/EOF/handoff, PasIoRetry EINTR, stuck standard output, WaitMs with no time left)", flush=True)
 shutil.rmtree(work)

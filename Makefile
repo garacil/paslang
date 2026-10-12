@@ -151,6 +151,10 @@ GOLDEN_A64 += ioretry
 # lines whole.
 GOLDEN += stdlocks
 GOLDEN_A64 += stdlocks
+# P213: WaitMs with no time left answers 0 at once, on a pipe and a
+# socket, from main and from a routine while main goes on.
+GOLDEN += waitms0
+GOLDEN_A64 += waitms0
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a

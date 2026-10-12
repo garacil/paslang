@@ -9555,7 +9555,7 @@ program has without `uses`:
 | `NetClose(fd)` | a procedure: takes the descriptor off the poller and closes it |
 | `WaitFd(fd)` | parks until `fd` can be read; 0 on wake, negative errno if registration fails |
 | `WaitIo(fd, ev)` | parks until `fd` is ready for `ev`: 1 to read, 4 to write; 0 on wake, negative errno if registration fails |
-| `WaitMs(fd, ev, ms)` | `WaitIo`, which also wakes after `ms` milliseconds; 0 or less does not wait. Failed registration returns negative errno and removes its deadline |
+| `WaitMs(fd, ev, ms)` | `WaitIo`, which also wakes after `ms` milliseconds; 0 or less does not wait and answers 0, the answer of a deadline that came, as Go answers a deadline already past. Failed registration returns negative errno and removes its deadline |
 
 The three `Wait` words park the routine on the runtime's epoll, one wake
 per wait, and the thread goes on with other routines. After a wake the
