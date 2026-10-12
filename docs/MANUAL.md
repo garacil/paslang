@@ -6405,8 +6405,8 @@ read and write them.
 | `TcpReadN(fd, n, buf, data)` | exactly `n` bytes, from `buf` first; False at the end of the stream |
 | `UdpBindAt(host, port)` | a datagram socket at `host` of either family |
 | `UdpSendTo(fd, host, port, data)` | a datagram of up to 65507 bytes to a literal or a name |
-| `UdpRecvFrom(fd, max, host, port)` | a datagram and its sender, parking until one comes; `UdpSend` and `UdpRecv` take datagrams of up to 65536 bytes too |
-| `UdpRecvFromMs(fd, max, ms, host, port)` | the same within `ms` milliseconds, else `''` with `host` `''`: a client of a lossy protocol asks again |
+| `UdpRecvFrom(fd, max, host, port)` | a datagram and its sender, parking until one comes: `host` a dotted quad or an IPv6 address without brackets, an empty datagram `''` with its sender; `UdpSend` and `UdpRecv` take datagrams of up to 65536 bytes too |
+| `UdpRecvFromMs(fd, max, ms, host, port)` | the same within `ms` milliseconds, else `''` with `host` `''`: a client of a lossy protocol asks again (one body with `UdpRecvFrom` since 1.1.101) |
 | `RaiseFdLimit` | the descriptor limit raised to what the system allows (the hard limit): the new soft limit. A server of tens of thousands of connections calls it first |
 | `DnsQueryA(name, id)`, `DnsAnswerA(msg, id)` | a question for an A record and the first A of its answer as a dotted quad (`''` when none or the id differs) |
 | `DnsQuestionName(msg)`, `DnsReplyA(query, ip4, ttl)`, `DnsReplyNx(query)` | what a server needs: the name asked, an answer with one A record, no such name |

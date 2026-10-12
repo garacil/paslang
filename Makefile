@@ -155,10 +155,15 @@ GOLDEN_A64 += stdlocks
 # socket, from main and from a routine while main goes on.
 GOLDEN += waitms0
 GOLDEN_A64 += waitms0
-# P214: SetLength that shortens a string it owns keeps its block; a
-# shared string, a literal and a view are still copied.
+# P214, P222: SetLength that shortens a string it owns keeps its block
+# while the string fills more than half of it; a shared string, a
+# literal and a view are still copied.
 GOLDEN += strshrink
 GOLDEN_A64 += strshrink
+# P215: UdpRecvFrom and UdpRecvFromMs are one body: an IPv6 sender, an
+# IPv4 one and an empty datagram named alike by both, on both machines.
+GOLDEN += udpfrom
+GOLDEN_A64 += udpfrom
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
