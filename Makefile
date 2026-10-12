@@ -174,6 +174,10 @@ GOLDEN_A64 += connwait
 # tree does: a write to the copy left the map's value changed.
 GOLDEN += trygetshare
 GOLDEN_A64 += trygetshare
+# P228: an element of a tree given as a var or out argument is its
+# value's slot on both machines, as a map's is.
+GOLDEN += treevarg
+GOLDEN_A64 += treevarg
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -542,6 +546,9 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/trygetshare0 testdata/trygetshare.paslang; \
 	$(BUILDDIR)/trygetshare0 > $(BUILDDIR)/trygetshare0.got; \
 	diff -u testdata/trygetshare.out $(BUILDDIR)/trygetshare0.got; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/treevarg0 testdata/treevarg.paslang; \
+	$(BUILDDIR)/treevarg0 > $(BUILDDIR)/treevarg0.got; \
+	diff -u testdata/treevarg.out $(BUILDDIR)/treevarg0.got; \
 	echo ok inline; \
 	echo "==== dead code ===="; \
 	sz=$$(size $(BUILDDIR)/hello | awk 'NR==2 {print $$1}'); \
