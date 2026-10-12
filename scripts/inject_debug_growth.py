@@ -5,6 +5,15 @@
 
 No product test switch: request growth through the actual stack guard,
 then inspect the relocated frame before the ordinary debugger reads it.
+
+The guard word (G+16) is the runtime's too: sysmon writes the preemption
+marker into the running G's guard on each pass and a lock's last unlock
+re-arms it, so a marker may replace the request before the next
+prologue, and rt_morestack's preemption path only yields after putting
+back the G's real guard (G+24). The request goes into both words (P220):
+put back, it asks again, and the next prologue grows; rt_newstack writes
+both for the new stack. $debug_preempt = 1 writes the marker right after
+the request, so that path runs every time.
 """
 from pathlib import Path
 import struct
@@ -12,6 +21,8 @@ import gdb
 
 arm = gdb.selected_inferior().architecture().name() == 'aarch64'
 gdb.write('debug injection architecture: ' + gdb.selected_inferior().architecture().name() + '\n')
+PREEMPT = 0xfffffffffffffade
+G = '$x28' if arm else '$r14'
 
 
 def value(expression):
@@ -31,15 +42,19 @@ entry.condition = f'{"$x0" if arm else "$rdi"} == {value("$debug_line")}'
 gdb.execute('continue' if arm else 'run --debug-mode < ' + gdb.convenience_variable('debug_input').string())
 if entry.hit_count != 1:
     raise gdb.GdbError('debug hook did not reach the forced-growth stop')
-victim = value('$x28' if arm else '$r14')
+victim = value(G)
 entry.delete()
 saved = gdb.Breakpoint(f'src/lib/pasdebug.paslang:{unlock}', internal=True)
-saved.condition = f'{"$x28" if arm else "$r14"} == {victim}'
+saved.condition = f'{G} == {victim}'
 gdb.execute('continue')
 if saved.hit_count != 1:
     raise gdb.GdbError('debug hook did not publish its frame before growth')
 old_hi = word(victim + 8)
 gdb.selected_inferior().write_memory(victim + 16, struct.pack('<Q', old_hi))
+gdb.selected_inferior().write_memory(victim + 24, struct.pack('<Q', old_hi))
+preempt = gdb.convenience_variable('debug_preempt')
+if preempt is not None and int(preempt):
+    gdb.selected_inferior().write_memory(victim + 16, struct.pack('<Q', PREEMPT))
 saved.delete()
 inspection = gdb.Breakpoint('p_pasdebug_frames', internal=True)
 gdb.execute('continue')

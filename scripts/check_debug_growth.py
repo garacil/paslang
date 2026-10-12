@@ -81,41 +81,47 @@ for target, cpu_level in (('amd64', 'base'), ('arm64', 'base'), ('arm64', 'max')
                     '-ex', f'set $debug_line = {grow_line}',
                     '-ex', f'set $debug_input = "{input_path}"']
     source = 'source scripts/inject_debug_growth.py'
-    if target == 'amd64':
-        # Isolate the injected growth request from concurrent GC guard
-        # requests; ordinary console runs above retain full GC stress.
-        gdb_output = run([*gdb_commands, '-ex', source], dict(base, PASLANG_GC='off'))
-        check(gdb_output, target)
-    else:
-        with tempfile.TemporaryDirectory(prefix='pl-dbg-') as directory:
-            endpoint = Path(directory) / 'gdb.sock'
-            process = subprocess.Popen(['taskset', '-c', str(min(os.sched_getaffinity(0))),
-                                        *qemu, '-g', str(endpoint), str(binary), '--debug-mode'],
-                                       env=dict(base, PASLANG_GC='off'), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                       stderr=subprocess.STDOUT, start_new_session=True)
-            try:
-                process.stdin.write(commands)
-                process.stdin.flush()
-                deadline = time.monotonic() + 10
-                while not endpoint.exists():
-                    if process.poll() is not None or time.monotonic() >= deadline:
-                        raise RuntimeError('QEMU did not open its private GDB socket')
-                    time.sleep(.01)
+    # Twice: as it comes, and with the preemption marker written right
+    # after the growth request, the race with sysmon made certain: the
+    # stack grows only if the guard put back after the preemption asks
+    # again (P220).
+    for preempt in (0, 1):
+        probe = [*gdb_commands, '-ex', f'set $debug_preempt = {preempt}']
+        if target == 'amd64':
+            # Isolate the injected growth request from concurrent GC guard
+            # requests; ordinary console runs above retain full GC stress.
+            gdb_output = run([*probe, '-ex', source], dict(base, PASLANG_GC='off'))
+            check(gdb_output, target)
+        else:
+            with tempfile.TemporaryDirectory(prefix='pl-dbg-') as directory:
+                endpoint = Path(directory) / 'gdb.sock'
+                process = subprocess.Popen(['taskset', '-c', str(min(os.sched_getaffinity(0))),
+                                            *qemu, '-g', str(endpoint), str(binary), '--debug-mode'],
+                                           env=dict(base, PASLANG_GC='off'), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                           stderr=subprocess.STDOUT, start_new_session=True)
                 try:
-                    gdb_output = run([*gdb_commands, '-ex', f'target remote {endpoint}', '-ex', source], stress)
-                except RuntimeError as error:
-                    output, _ = process.communicate(timeout=10)
-                    raise RuntimeError(f'{error}\nguest exit {process.returncode}: {output!r}') from error
-                output, _ = process.communicate(timeout=120)
-                if process.returncode:
-                    raise RuntimeError(f'forced-growth guest failed: {output!r}')
-                check(output, target)
-            finally:
-                if process.poll() is None:
-                    os.killpg(process.pid, signal.SIGKILL)
-                    process.communicate()
-    if b'forced debugger stack growth and relocated Currency frame passed' not in gdb_output:
-        raise RuntimeError(gdb_output.decode(errors='replace'))
-    print(f'ok debugger growth {target}/{cpu_level}: frames, next, GC stress/off, single/all CPUs and forced relocation',
-          flush=True)
+                    process.stdin.write(commands)
+                    process.stdin.flush()
+                    deadline = time.monotonic() + 10
+                    while not endpoint.exists():
+                        if process.poll() is not None or time.monotonic() >= deadline:
+                            raise RuntimeError('QEMU did not open its private GDB socket')
+                        time.sleep(.01)
+                    try:
+                        gdb_output = run([*probe, '-ex', f'target remote {endpoint}', '-ex', source], stress)
+                    except RuntimeError as error:
+                        output, _ = process.communicate(timeout=10)
+                        raise RuntimeError(f'{error}\nguest exit {process.returncode}: {output!r}') from error
+                    output, _ = process.communicate(timeout=120)
+                    if process.returncode:
+                        raise RuntimeError(f'forced-growth guest failed: {output!r}')
+                    check(output, target)
+                finally:
+                    if process.poll() is None:
+                        os.killpg(process.pid, signal.SIGKILL)
+                        process.communicate()
+        if b'forced debugger stack growth and relocated Currency frame passed' not in gdb_output:
+            raise RuntimeError(gdb_output.decode(errors='replace'))
+    print(f'ok debugger growth {target}/{cpu_level}: frames, next, GC stress/off, single/all CPUs and forced relocation, '
+          'a preemption request in its way too', flush=True)
 shutil.rmtree(work)
