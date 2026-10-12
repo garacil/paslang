@@ -170,6 +170,10 @@ GOLDEN_A64 += udpfrom
 # EINTR, a spurious wake and a silent nameserver under gdb).
 GOLDEN += connwait
 GOLDEN_A64 += connwait
+# P227: TryGet of a map marks the strings it copies out, as TryGet of a
+# tree does: a write to the copy left the map's value changed.
+GOLDEN += trygetshare
+GOLDEN_A64 += trygetshare
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -535,6 +539,9 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  grep -q "call p_$$f$$" $(BUILDDIR)/inline1.s || { echo "inline1.s does not call $$f, which should stay a call"; exit 1; }; \
 	done; \
 	grep -q "call p_sq$$" $(BUILDDIR)/inline0.s || { echo "inline0.s (-inline 0) does not call Sq"; exit 1; }; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/trygetshare0 testdata/trygetshare.paslang; \
+	$(BUILDDIR)/trygetshare0 > $(BUILDDIR)/trygetshare0.got; \
+	diff -u testdata/trygetshare.out $(BUILDDIR)/trygetshare0.got; \
 	echo ok inline; \
 	echo "==== dead code ===="; \
 	sz=$$(size $(BUILDDIR)/hello | awk 'NR==2 {print $$1}'); \
