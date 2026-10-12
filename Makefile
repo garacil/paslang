@@ -415,7 +415,7 @@ stage: $(PASLANG_SRC) $(CORE_UNITS) | $(BUILDDIR)
 	$(BUILDDIR)/stage-hello; \
 	echo ok stage
 
-self-arm64: $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/qemu-aarch64-static | $(BUILDDIR)
+self-arm64: $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/qemu-aarch64 | $(BUILDDIR)
 	@set -e; ulimit -v 2097152; \
 	mkdir -p $(BUILDDIR)/a64self; \
 	for u in $(CORE_UNITS) $(SELF_UNITS); do \
@@ -456,7 +456,7 @@ bench-rounds:
 bench-servers: $(OUTDIR)/paslangc core libs
 	PATH=$(OUTDIR):$$PATH python3 scripts/bench/servers.py -n 3 --json $(BUILDDIR)/bench/servers.json
 
-check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch64-static
+check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch64
 	@python3 scripts/check_recipes.py
 	@python3 scripts/check_debug_growth.py "$(OUTDIR)/paslangc" "$(BUILDDIR)" $(QEMU_A64)
 	@sh scripts/check_bootstrap.sh "$(BUILDDIR)"
@@ -2564,13 +2564,17 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(MAKE) self; \
 	$(MAKE) check-arm64
 
-QEMU_A64 := $(BUILDDIR)/qemu-aarch64-static
+# The arm64 tests run under QEMU's user mode built here, from the signed
+# 11.1.1 release in docs/ref/qemu (fetched once, checked by its SHA-256)
+# with the patches of scripts/qemu: QEMU 11.1.1 deadlocks a program that
+# forks while another of its threads makes a system call (P226), and
+# fails MADV_GUARD_INSTALL. The tests alone need it.
+QEMU_A64 := $(BUILDDIR)/qemu-aarch64
 
-$(BUILDDIR)/qemu-aarch64-static: | $(BUILDDIR)
-	cp /usr/bin/qemu-aarch64-static $@
-	python3 scripts/patch-qemu-madv102.py $@
+$(BUILDDIR)/qemu-aarch64: scripts/build_qemu.py $(wildcard scripts/qemu/*.patch) | $(BUILDDIR)
+	python3 scripts/build_qemu.py $(BUILDDIR) docs/ref/qemu/qemu-11.1.1.tar.xz
 
-check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/qemu-aarch64-static
+check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/qemu-aarch64
 	@set -e; \
 	echo "==== lib units arm64 ===="; \
 	for u in $(LIB_UNITS); do \

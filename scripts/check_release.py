@@ -21,7 +21,7 @@ stress = dict(base, PASLANG_GCVERIFY='1', PASLANG_GCSTRESS='1', PASLANG_GCPOISON
 # as build/ does, so the extracted packages go away on exit, pass or fail.
 work = Path(tempfile.mkdtemp(prefix='paslang-release-check-'))
 atexit.register(shutil.rmtree, work)
-qemu = repo / 'build/qemu-aarch64-static'
+qemu = repo / 'build/qemu-aarch64'
 
 
 def run(command, cwd=work, env=base):

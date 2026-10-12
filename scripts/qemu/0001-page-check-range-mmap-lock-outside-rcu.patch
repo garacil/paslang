@@ -1,0 +1,72 @@
+QEMU 11.1.1 linux-user: never wait for mmap_lock inside an RCU read section.
+
+paslang's arm64 tests run under QEMU's user mode, built from the signed
+11.1.1 release with this patch (scripts/build_qemu.py). A guest that
+forks while another of its threads makes a system call with a pointer
+deadlocks (paslang P226, found on testdata/sysprocesses: 19 hangs in
+240 runs):
+
+- page_check_range() (accel/tcg/user-exec.c) looks a range up under
+  RCU_READ_LOCK_GUARD() and, on a miss of the lockless lookup or to
+  call page_unprotect(), takes mmap_lock() inside that read section;
+- fork_start() (linux-user/main.c) holds mmap_lock while fork() runs
+  util/rcu.c's atfork handler, rcu_init_lock(), which waits for
+  rcu_sync_lock;
+- synchronize_rcu() holds rcu_sync_lock while wait_for_readers() waits
+  for the reader of the first point.
+
+The reader leaves the read section before it waits for mmap_lock and
+looks again with the lock held, as the original does after a miss;
+pageflags_find() under mmap_lock needs no read section. With it,
+sysprocesses ran 400 times without a hang. QEMU's master branch has the
+same code.
+
+--- a/accel/tcg/user-exec.c
++++ b/accel/tcg/user-exec.c
+@@ -508,7 +508,12 @@
+         return false; /* wrap around */
+     }
+ 
+-    RCU_READ_LOCK_GUARD();
++    /*
++     * mmap_lock is never waited for inside the RCU read side: fork_start()
++     * holds it while fork()'s RCU atfork handler waits for rcu_sync_lock,
++     * which synchronize_rcu() holds while it waits for this reader.
++     */
++    rcu_read_lock();
+ 
+     locked = have_mmap_lock();
+     while (true) {
+@@ -521,7 +526,9 @@
+                  * Lockless lookups have false negatives.
+                  * Retry with the lock held.
+                  */
++                rcu_read_unlock();
+                 mmap_lock();
++                rcu_read_lock();
+                 locked = -1;
+                 p = pageflags_find(start, last);
+             }
+@@ -545,6 +552,14 @@
+                 ret = false; /* page not writable */
+                 break;
+             }
++            /* page_unprotect() takes mmap_lock: take it outside first. */
++            if (!locked) {
++                rcu_read_unlock();
++                mmap_lock();
++                rcu_read_lock();
++                locked = -1;
++                continue;
++            }
+             /* Asking about writable, but has been protected: undo. */
+             if (!page_unprotect(NULL, start, 0)) {
+                 ret = false;
+@@ -566,6 +581,7 @@
+         start = p->itree.last + 1;
+     }
+ 
++    rcu_read_unlock();
+     /* Release the lock if acquired locally. */
+     if (locked < 0) {
+         mmap_unlock();
