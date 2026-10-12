@@ -5765,7 +5765,12 @@ byte in front, no required trailing zero. Assignment copies the pointer
 and the length; concatenation allocates a new buffer. `'ab'#10'c'` is one
 string with a newline inside. `s[i]` is a byte, 1-based. `Length` counts
 bytes and `for r in s do` walks Unicode scalars. `Copy(s, from, count)`
-cuts, `SetLength(s, n)` sizes, `=` and `<>` compare bytes, 64 at a
+cuts, `SetLength(s, n)` sizes: a string no other variable holds keeps
+its block when it gets shorter or keeps its length, as Go's `s[:n]`
+does, and a longer one gets a new block whose new bytes are zero; a
+string another variable holds, a literal or a view is copied first, so
+the program may write the result through a pointer (1.1.99). `=` and
+`<>` compare bytes, 64 at a
 time on AVX2 or SSE2 (or NEON) as Go's `memequal` does. `<`, `<=`,
 `>` and `>=` compare them byte by byte as well: the first byte that
 differs decides, and when one string is a prefix of the other the
