@@ -5767,9 +5767,12 @@ string with a newline inside. `s[i]` is a byte, 1-based. `Length` counts
 bytes and `for r in s do` walks Unicode scalars. `Copy(s, from, count)`
 cuts, `SetLength(s, n)` sizes: a string no other variable holds keeps
 its block when it gets shorter or keeps its length, as Go's `s[:n]`
-does, and a longer one gets a new block whose new bytes are zero; a
-string another variable holds, a literal or a view is copied first, so
-the program may write the result through a pointer (1.1.99). `=` and
+does, while it fills more than half of the block, as FPC's
+`SetLength` does: shorter, it moves to a block of its own, so a string
+holds less than twice its size or 32 bytes (1.1.100). A longer one
+gets a new block whose new bytes are zero; a string another variable
+holds, a literal or a view is copied first, so the program may write
+the result through a pointer (1.1.99). `=` and
 `<>` compare bytes, 64 at a
 time on AVX2 or SSE2 (or NEON) as Go's `memequal` does. `<`, `<=`,
 `>` and `>=` compare them byte by byte as well: the first byte that

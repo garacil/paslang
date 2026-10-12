@@ -1,14 +1,23 @@
-{ P214 (1.1.99): SetLength that shortens a string no other string
-  shares, or keeps its length, keeps its block: only the length
-  changes, nothing is copied. A string another variable holds, a
-  literal and a view of a block nothing writes (PasStrView) still get a
-  block of their own, so a write through the shortened string never
-  reaches the others and the viewed block's sum stays the same. Nothing
-  past the new length shows again: a grow takes a new block whose new
-  characters are zero, and a join reads only the length. Each line says
-  whether a case held; main runs them, then 16 routines at once, with
-  the collector running between the steps. }
+{ P214 (1.1.99) and P222 (1.1.100): SetLength that shortens a string
+  no other string shares, or keeps its length, keeps its block while
+  the string fills more than half of it, FPC's rule: only the length
+  changes, nothing is copied. At most half of a block over 32 bytes,
+  the string moves to a block of its own, so it never holds much more
+  than it needs: shortened one at a time, or read with room for 64 KiB
+  from a pipe or a datagram socket, it ends in a small block. A string
+  another variable holds, a literal and a view of a block nothing
+  writes (PasStrView) still get a block of their own, so a write
+  through the shortened string never reaches the others and the viewed
+  block's sum stays the same. Nothing past the new length shows again:
+  a grow takes a new block whose new characters are zero, and a join
+  reads only the length. The block sizes come from MemSize, so each
+  boundary is the heap's own. Each line says whether a case held; main
+  runs them, then 16 routines at once, with the collector running
+  between the steps. }
 program strshrink;
+
+uses
+  paslinux;
 
 const
   Routines = 16;
@@ -23,6 +32,7 @@ type
     Name: string;
     Tag: Integer;
   end;
+  TFds = array[0..1] of Int32;
 
 var
   wg: waitgroup;
@@ -31,6 +41,20 @@ var
 function Words(var S: string): Pointer;
 begin
   Result := PStrWords(@S)^.P;
+end;
+
+{ The size of the block that holds S: its mark is the byte before its
+  characters }
+function Block(var S: string): Integer;
+begin
+  Result := MemSize(PByte(Words(S)) - 1);
+end;
+
+{ FPC's rule: a block of 32 bytes or less, or one the mark and the
+  characters fill more than half of }
+function Fits(var S: string): Boolean;
+begin
+  Result := (Block(S) <= 32) or (2 * (Length(S) + 1) > Block(S));
 end;
 
 { Letters K, K+1, ... L of them, in a block of their own }
@@ -43,15 +67,27 @@ begin
     Result := Result + Chr(Ord('a') + (K + j) mod 26);
 end;
 
-{ The same letters into S, in a block SetLength gives it: a string no
-  other variable holds, as a read buffer is }
+{ The same letters into S, in a new block SetLength gives it: a string
+  no other variable holds, as a read buffer is }
 procedure Fill(var S: string; K, L: Integer);
 var
   j: Integer;
 begin
+  S := '';
   SetLength(S, L);
   for j := 1 to L do
     S[j] := Chr(Ord('a') + (K + j - 1) mod 26);
+end;
+
+{ Whether S is the letters K, K+1, ... }
+function Letters(const S: string; K: Integer): Boolean;
+var
+  j: Integer;
+begin
+  Result := True;
+  for j := 1 to Length(S) do
+    if S[j] <> Chr(Ord('a') + (K + j - 1) mod 26) then
+      Result := False;
 end;
 
 function Sum(P: PByte; N: Integer): Integer;
@@ -88,33 +124,85 @@ begin
     Result := 1;
 end;
 
+{ What NetRead puts in a string from Fd after Data is written to Dst:
+  up to 64 KiB, in a block of 64 KiB that SetLength then cuts }
+function ReadBack(Dst, Fd: Integer; const Data: string; var Got: string): Boolean;
+begin
+  Result := OsWrite(Dst, Int64(Pointer(Data)), Length(Data)) = Length(Data);
+  NetRead(Fd, 65536, Got);
+end;
+
 function Cases(Show: Boolean): Integer;
 var
-  s, t, u, v, w, lit: string;
+  s, t, u, v, w, x, lit, got: string;
   p, q: Pointer;
   blk: PByte;
-  sum0: Integer;
+  sum0, n, b, k, moves, nr: Integer;
+  ok: Boolean;
   arr: array of string;
   rec: TRec;
+  fd: TFds;
 begin
   Result := 0;
 
   Fill(s, 0, 300);
   p := Words(s);
-  SetLength(s, 5);
+  b := Block(s);
+  n := b div 2;
+  SetLength(s, n);
   Churn;
-  Result := Result + Check('an owned string shortened keeps its block',
-    (Words(s) = p) and (s = 'abcde') and (Length(s) = 5), Show);
-  SetLength(s, 5);
+  Result := Result + Check('an owned string shortened to more than half of its block keeps it',
+    (b > 32) and (Words(s) = p) and (Length(s) = n) and Letters(s, 0), Show);
+  SetLength(s, n);
   Result := Result + Check('the same length keeps it too', Words(s) = p, Show);
   s[1] := 'Z';
-  Result := Result + Check('a write after it needs no copy', (Words(s) = p) and (s = 'Zbcde'), Show);
+  Result := Result + Check('a write after it needs no copy',
+    (Words(s) = p) and (s[1] = 'Z') and (Block(s) = b), Show);
   t := s + '!';
-  Result := Result + Check('a join reads only the length', t = 'Zbcde!', Show);
-  SetLength(s, 9);
+  Result := Result + Check('a join reads only the length',
+    (Length(t) = n + 1) and (Copy(t, 1, n) = s) and (t[n + 1] = '!'), Show);
+  SetLength(s, n - 1);
+  Churn;
+  Result := Result + Check('to half of it or less it moves to a block that fits',
+    (Words(s) <> p) and (Length(s) = n - 1) and (s[1] = 'Z') and Letters(Copy(s, 2, n - 2), 1) and
+    Fits(s) and (Block(s) < b), Show);
+  p := Words(s);
+  SetLength(s, n + 8);
   Churn;
   Result := Result + Check('a grow takes a new block and its new characters are zero',
-    (Words(s) <> p) and (Copy(s, 1, 5) = 'Zbcde') and (s[6] = #0) and (s[9] = #0) and (Length(s) = 9), Show);
+    (Words(s) <> p) and (s[1] = 'Z') and (s[n] = #0) and (s[n + 8] = #0) and (Length(s) = n + 8), Show);
+
+  Fill(s, 2, 30);
+  p := Words(s);
+  b := Block(s);
+  SetLength(s, 1);
+  Result := Result + Check('a block of 32 bytes or less is kept however short',
+    (b <= 32) and (Words(s) = p) and (s = 'c'), Show);
+
+  Fill(s, 3, 4096);
+  ok := True;
+  moves := 0;
+  for k := 4095 downto 1 do
+  begin
+    p := Words(s);
+    SetLength(s, k);
+    if Words(s) <> p then
+      moves := moves + 1;
+    if not Fits(s) then
+      ok := False;
+  end;
+  Result := Result + Check('shortened one at a time it always fits its block and ends in a small one',
+    ok and (moves >= 4) and (moves <= 16) and (Block(s) <= 32) and (s = 'd'), Show);
+
+  Fill(s, 4, 65536);
+  p := Words(s);
+  b := Block(s);
+  SetLength(s, b div 2);
+  ok := (Words(s) = p) and Letters(s, 4);
+  SetLength(s, 4);
+  Churn;
+  Result := Result + Check('a large block too: kept above half, left far below it',
+    (b > 65536) and ok and (Words(s) <> p) and (s = 'efgh') and (Block(s) <= 32), Show);
 
   Fill(s, 1, 50);
   t := s;
@@ -123,7 +211,7 @@ begin
   s[1] := 'Q';
   Churn;
   Result := Result + Check('a shared string shortened gets a block of its own',
-    (Words(s) <> p) and (s = 'Qcd') and (t = Fresh(1, 50)) and (Words(t) = p), Show);
+    (Words(s) <> p) and (s = 'Qcd') and (Length(t) = 50) and Letters(t, 1) and (Words(t) = p), Show);
   SetLength(t, 2);
   t[2] := 'R';
   Result := Result + Check('so does the other holder',
@@ -144,38 +232,74 @@ begin
   sum0 := Sum(blk, 65);
   v := PasStrView(blk + 1, 64);
   q := Words(v);
-  SetLength(v, 10);
+  SetLength(v, 60);
   v[1] := 'V';
   Churn;
   Result := Result + Check('a view shortened is copied and its block never written',
-    (Words(v) <> q) and (Length(v) = 10) and (v[1] = 'V') and (v[2] = Chr(Ord('a') + 2)) and
+    (Words(v) <> q) and (Length(v) = 60) and (v[1] = 'V') and (v[2] = Chr(Ord('a') + 2)) and
     (Sum(blk, 65) = sum0), Show);
 
   SetLength(arr, 3);
   Fill(arr[1], 2, 100);
   p := Words(arr[1]);
-  SetLength(arr[1], 7);
+  b := Block(arr[1]);
+  SetLength(arr[1], b div 2);
   Fill(rec.Name, 3, 100);
   q := Words(rec.Name);
-  Cut(rec.Name, 6);
+  n := Block(rec.Name) div 2;
+  Cut(rec.Name, n);
   Churn;
-  Result := Result + Check('an element, a field and a var parameter keep their blocks',
-    (Words(arr[1]) = p) and (arr[1] = Fresh(2, 7)) and (Words(rec.Name) = q) and
-    (rec.Name = Fresh(3, 6)), Show);
+  Result := Result + Check('an element, a field and a var parameter keep their blocks above half',
+    (Words(arr[1]) = p) and (Length(arr[1]) = b div 2) and Letters(arr[1], 2) and
+    (Words(rec.Name) = q) and (Length(rec.Name) = n) and Letters(rec.Name, 3), Show);
+  Cut(arr[1], 3);
+  Cut(rec.Name, 2);
+  Result := Result + Check('and leave them below it',
+    (Words(arr[1]) <> p) and (arr[1] = 'cde') and Fits(arr[1]) and
+    (Words(rec.Name) <> q) and (rec.Name = 'de') and Fits(rec.Name), Show);
 
-  u := Fresh(5, 10) + Fresh(6, 10);
+  u := Fresh(5, 40) + Fresh(6, 40);
   p := Words(u);
-  SetLength(u, 12);
-  w := Copy(lit, 1, 20);
+  b := Block(u);
+  SetLength(u, b div 2);
+  Fill(x, 7, 200);
+  w := Copy(x, 1, 100);
   q := Words(w);
-  SetLength(w, 9);
+  n := Block(w) div 2;
+  SetLength(w, n);
   Churn;
   Result := Result + Check('a join and a Copy are their own and keep theirs too',
-    (Words(u) = p) and (u = Fresh(5, 10) + Fresh(6, 2)) and (Words(w) = q) and (w = 'a literal'), Show);
+    (b > 32) and (Words(u) = p) and (u = Copy(Fresh(5, 40) + Fresh(6, 40), 1, b div 2)) and
+    (Words(w) = q) and (Length(w) = n) and Letters(w, 7), Show);
 
   s := Fresh(4, 20);
   SetLength(s, 0);
   Result := Result + Check('shortened to nothing it is the empty string', (s = '') and (Length(s) = 0), Show);
+
+  fd[0] := 0;
+  fd[1] := 0;
+  ok := OsPipe(Int64(@fd[0])) = 0;
+  Fill(x, 8, 60000);
+  ok := ok and ReadBack(fd[1], fd[0], x, got) and (got = x) and (Block(got) > 65536);
+  ok := ok and ReadBack(fd[1], fd[0], 'a pipe', got) and (got = 'a pipe') and (Block(got) <= 32);
+  OsClose(fd[0]);
+  OsClose(fd[1]);
+  Result := Result + Check('a read with room for 64 KiB keeps the block when it fills it, not when it is short',
+    ok, Show);
+
+  { socketpair(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0, fd): 53 on amd64,
+    199 on arm64 (Go's syscall/zsysnum_linux_*.go) }
+  if Amd64 = 1 then
+    nr := 53
+  else
+    nr := 199;
+  fd[0] := 0;
+  fd[1] := 0;
+  ok := Syscall(nr, 1, 2 or 524288, 0, @fd[0]) = 0;
+  ok := ok and ReadBack(fd[1], fd[0], 'ping', got) and (got = 'ping') and (Block(got) <= 32);
+  OsClose(fd[0]);
+  OsClose(fd[1]);
+  Result := Result + Check('a datagram of 4 bytes read with room for 64 KiB holds a small block', ok, Show);
 end;
 
 procedure Routine;
