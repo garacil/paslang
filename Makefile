@@ -146,6 +146,11 @@ GOLDEN_A64 += strview
 # pipes and sockets, deadlines, failed waits, 64 routines parked.
 GOLDEN += ioretry
 GOLDEN_A64 += ioretry
+# P212: standard output and standard error, a lock each; a WriteLn that
+# fits in 4096 bytes is one write, so two streams on one pipe keep their
+# lines whole.
+GOLDEN += stdlocks
+GOLDEN_A64 += stdlocks
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -496,7 +501,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	for t in $(GOLDEN); do \
 	  echo "==== $$t ===="; \
 	  $(OUTDIR)/paslangc -o $(BUILDDIR)/$$t testdata/$$t.paslang; \
-	  $(BUILDDIR)/$$t > $(BUILDDIR)/$$t.got; \
+	  timeout 300 $(BUILDDIR)/$$t > $(BUILDDIR)/$$t.got; \
 	  diff -u testdata/$$t.out $(BUILDDIR)/$$t.got; \
 	  echo ok $$t; \
 	done; \
@@ -548,7 +553,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  PASLANG_GCSTRESS=3 PASLANG_GCPOISON=1 timeout 300 $(BUILDDIR)/gcbasic > $(BUILDDIR)/gcbasic.got; \
 	  diff -u testdata/gcbasic.out $(BUILDDIR)/gcbasic.got; \
 	done; \
-	for t in heapspan map2 sync2 strs mapsplit closurebox tree1 tree2 hash1 store1 mapseed strview ioretry; do \
+	for t in heapspan map2 sync2 strs mapsplit closurebox tree1 tree2 hash1 store1 mapseed strview ioretry stdlocks; do \
 	  PASLANG_GCSTRESS=5 PASLANG_GCPOISON=1 timeout 300 $(BUILDDIR)/$$t > $(BUILDDIR)/$$t.got; \
 	  diff -u testdata/$$t.out $(BUILDDIR)/$$t.got; \
 	done; \

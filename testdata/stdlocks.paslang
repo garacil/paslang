@@ -1,0 +1,304 @@
+{ P212 (1.1.95): standard output and standard error are two streams,
+  each with its own lock, as Go's os.Stdout and os.Stderr are two Files
+  with their own poll.FD. Before 1.1.95 they shared one print lock, so a
+  WriteLn to standard error waited behind a WriteLn stuck on a full
+  standard output. Each WriteLn now goes out in one write while it fits
+  in 4096 bytes, as Go's Fprintln makes one Write of its line, so the
+  lines of the two streams on one pipe stay whole. The program points
+  its standard output and error at pipes and back; check_syscalls.py
+  also runs it on one CPU, where the writer stuck in its write must
+  hand its P over. }
+program stdlocks;
+
+uses
+  paslinux;
+
+const
+  Lines = 200;
+  Width = 1000;
+  Writers = 4;
+  Rounds = 50;
+  DrainAfter = 1000;
+  BigLen = 100000;
+
+type
+  TFds = array[0..1] of Int32;
+
+var
+  wg, dw: waitgroup;
+  drained: string;
+  written: Integer;
+
+{ pipe2 with O_CLOEXEC and the flags given }
+function MakePipe(var F: TFds; Flags: Integer): Boolean;
+begin
+  F[0] := 0;
+  F[1] := 0;
+  if Amd64 = 1 then
+    Result := Syscall(293, @F[0], 524288 or Flags) = 0
+  else
+    Result := Syscall(59, @F[0], 524288 or Flags) = 0;
+end;
+
+function Dup(Fd: Integer): Integer;
+begin
+  if Amd64 = 1 then
+    Result := Syscall(32, Fd)
+  else
+    Result := Syscall(23, Fd);
+end;
+
+{ Lines of Width bytes to standard output: the pipe holds 64 KiB, so
+  the writer is stuck in its write until the pipe is read. }
+procedure Writer;
+var
+  s: string;
+  j: Integer;
+begin
+  s := StringOfChar('x', Width);
+  for j := 1 to Lines do
+  begin
+    WriteLn(s);
+    AtomicAdd(@written, 1);
+  end;
+  wg.Done;
+end;
+
+{ Reads the pipe to its end after Ms milliseconds. }
+procedure Drain(Fd, Ms: Integer);
+var
+  chunk: string;
+begin
+  Sleep(Ms);
+  drained := '';
+  repeat
+    NetRead(Fd, 65536, chunk);
+    drained := drained + chunk;
+  until chunk = '';
+  dw.Done;
+end;
+
+function LinesWhole(const S: string): Boolean;
+var
+  p, j, k: Integer;
+begin
+  Result := Length(S) = Lines * (Width + 1);
+  p := 1;
+  for j := 1 to Lines do
+  begin
+    if not Result then
+      Exit;
+    for k := 0 to Width - 1 do
+      if S[p + k] <> 'x' then
+        Result := False;
+    if S[p + Width] <> #10 then
+      Result := False;
+    p := p + Width + 1;
+  end;
+end;
+
+{ A writer stuck on standard output does not hold standard error: on a
+  pipe that blocks (the write waits in the kernel and its P goes to
+  another M) and on one that does not (the write parks on the poller). }
+procedure Stuck(const Name: string; Flags: Integer);
+var
+  op, ep: TFds;
+  saved, savedErr, t0, t1, at, n: Integer;
+  got: string;
+begin
+  if not MakePipe(op, Flags) or not MakePipe(ep, 0) then
+    Halt(2);
+  saved := Dup(1);
+  savedErr := Dup(2);
+  n := OsDup2(op[1], 1);
+  n := OsDup2(ep[1], 2);
+  written := 0;
+  wg.Add(1);
+  pas Writer;
+  dw.Add(1);
+  pas Drain(op[0], DrainAfter);
+  Sleep(300);
+  GcCollect;
+  at := written;
+  t0 := Nanotime;
+  WriteLn(ErrOutput, 'diagnostic');
+  t1 := Nanotime;
+  n := OsDup2(savedErr, 2);
+  n := OsClose(savedErr);
+  n := OsClose(ep[1]);
+  NetRead(ep[0], 64, got);
+  n := OsClose(ep[0]);
+  wg.Wait;
+  n := OsDup2(saved, 1);
+  n := OsClose(saved);
+  n := OsClose(op[1]);
+  dw.Wait;
+  n := OsClose(op[0]);
+  WriteLn(Name, ': the writer stuck ', (at > 0) and (at < Lines), ', standard error at once ',
+    t1 - t0 < 500000000, ', ', Copy(got, 1, Length(got) - 1), ', ', Length(drained) div (Width + 1),
+    ' lines whole ', LinesWhole(drained));
+end;
+
+function PadLen(K, J: Integer): Integer;
+begin
+  Result := (K * 977 + J * 131) mod 3900;
+end;
+
+function PadChar(K, J: Integer): Char;
+begin
+  Result := Chr(97 + (K + J) mod 26);
+end;
+
+procedure OutWriter(K: Integer);
+var
+  j: Integer;
+begin
+  for j := 1 to Rounds do
+    WriteLn('o ', K, ' ', j, ' ', Chr(64 + K), ' ', StringOfChar(PadChar(K, J), PadLen(K, j)));
+  wg.Done;
+end;
+
+procedure ErrWriter(K: Integer);
+var
+  j: Integer;
+begin
+  for j := 1 to Rounds do
+    WriteLn(ErrOutput, 'e ', K, ' ', j, ' ', Chr(64 + K), ' ', StringOfChar(PadChar(K, J), PadLen(K, j)));
+  wg.Done;
+end;
+
+function Num(const S: string; var P: Integer): Integer;
+begin
+  Result := 0;
+  while (P <= Length(S)) and (S[P] >= '0') and (S[P] <= '9') do
+  begin
+    Result := Result * 10 + Ord(S[P]) - 48;
+    P := P + 1;
+  end;
+end;
+
+{ Every line whole and each writer's lines in its order: the stream,
+  the writer, the round, the writer's letter and its padding. }
+procedure CheckShared(const S: string; out Count, Bad: Integer);
+var
+  next: array[0..1, 1..Writers] of Integer;
+  p, q, r, st, k, j, i: Integer;
+  ok: Boolean;
+begin
+  for st := 0 to 1 do
+    for k := 1 to Writers do
+      next[st][k] := 1;
+  Count := 0;
+  Bad := 0;
+  p := 1;
+  while p <= Length(S) do
+  begin
+    q := p;
+    while (q <= Length(S)) and (S[q] <> #10) do
+      q := q + 1;
+    if q > Length(S) then
+    begin
+      Bad := Bad + 1;
+      Break;
+    end;
+    Count := Count + 1;
+    ok := (q - p > 8) and ((S[p] = 'o') or (S[p] = 'e')) and (S[p + 1] = ' ');
+    if ok then
+    begin
+      if S[p] = 'o' then
+        st := 0
+      else
+        st := 1;
+      r := p + 2;
+      k := Num(S, r);
+      ok := (k >= 1) and (k <= Writers) and (S[r] = ' ');
+      if ok then
+      begin
+        r := r + 1;
+        j := Num(S, r);
+        ok := (j = next[st][k]) and (S[r] = ' ') and (S[r + 1] = Chr(64 + k)) and (S[r + 2] = ' ') and
+          (q - (r + 3) = PadLen(k, j));
+        if ok then
+        begin
+          for i := r + 3 to q - 1 do
+            if S[i] <> PadChar(k, j) then
+              ok := False;
+          next[st][k] := j + 1;
+        end;
+      end;
+    end;
+    if not ok then
+      Bad := Bad + 1;
+    p := q + 1;
+  end;
+  for st := 0 to 1 do
+    for k := 1 to Writers do
+      if next[st][k] <> Rounds + 1 then
+        Bad := Bad + 1;
+end;
+
+{ Both streams on one pipe, eight writers at once: each WriteLn is one
+  write of up to 4096 bytes, which a pipe takes whole (PIPE_BUF). }
+procedure Shared;
+var
+  cp: TFds;
+  saved, savedErr, k, n, count, bad: Integer;
+begin
+  if not MakePipe(cp, 0) then
+    Halt(3);
+  saved := Dup(1);
+  savedErr := Dup(2);
+  n := OsDup2(cp[1], 1);
+  n := OsDup2(cp[1], 2);
+  dw.Add(1);
+  pas Drain(cp[0], 0);
+  wg.Add(2 * Writers);
+  for k := 1 to Writers do
+  begin
+    pas OutWriter(k);
+    pas ErrWriter(k);
+  end;
+  wg.Wait;
+  n := OsDup2(saved, 1);
+  n := OsDup2(savedErr, 2);
+  n := OsClose(saved);
+  n := OsClose(savedErr);
+  n := OsClose(cp[1]);
+  dw.Wait;
+  n := OsClose(cp[0]);
+  CheckShared(drained, count, bad);
+  WriteLn('one pipe for both: ', count, ' lines, ', bad, ' bad');
+end;
+
+{ A line longer than the buffer goes out in pieces, in order. }
+procedure Long;
+var
+  dp: TFds;
+  saved, n: Integer;
+  big: string;
+begin
+  if not MakePipe(dp, 0) then
+    Halt(4);
+  big := StringOfChar('b', BigLen);
+  saved := Dup(1);
+  n := OsDup2(dp[1], 1);
+  dw.Add(1);
+  pas Drain(dp[0], 0);
+  WriteLn('big ', big, ' end ', -7, ' ', 'c');
+  Write('no newline, ');
+  Write(12);
+  WriteLn;
+  n := OsDup2(saved, 1);
+  n := OsClose(saved);
+  n := OsClose(dp[1]);
+  dw.Wait;
+  n := OsClose(dp[0]);
+  WriteLn('a long line: ', drained = 'big ' + big + ' end -7 c'#10'no newline, 12'#10);
+end;
+
+begin
+  Stuck('blocking pipe', 0);
+  Stuck('nonblocking pipe', ONonblock);
+  Shared;
+  Long;
+end.

@@ -80,6 +80,21 @@ const
   MsgChanCap2 = ' out of range';
   MsgAddr = ' addr 0x';
   MsgSp = ' sp 0x';
+  { A standard stream's buffer (P212): a write of up to PIPE_BUF bytes
+    to a pipe is atomic, 4096 on Linux (linux/limits.h), so a line that
+    fits goes out whole even when both streams share one pipe. }
+  OutBufSize = 4096;
+  OutRecSize = 64 + OutBufSize;
+
+{ The record of the stream a Write statement names (P212): 'err' for
+  ErrOutput, standard output otherwise. }
+function OutStream(const Name: string): string;
+begin
+  if Name = 'err' then
+    Result := 'rt_stderr'
+  else
+    Result := 'rt_stdout';
+end;
 
 function GasEscape(const S: string): string;
 var
@@ -18509,9 +18524,8 @@ begin
     { the same on arm64 (1.0.136): it emitted nothing, and the statement
       then went out as a call of rt_dumplocs, which no runtime has, so
       the program did not link }
+    LeaS('rt_stdout', 'x0');
     Line('  bl rt_printlock');
-    Line('  mov x0, #1');
-    StS('x0', 'rt_ofd');
     for i := 0 to High(FSym) do
     begin
       if FSym[i].ByRef or (FSym[i].Up > 0) then
@@ -18524,20 +18538,25 @@ begin
         Continue;
       LeaS(InternStr(FSym[i].Name + '='), 'x1');
       Imm('x2', Length(FSym[i].Name) + 1);
+      LeaS('rt_stdout', 'x0');
       Line('  bl rt_write');
       if FSym[i].Global then
         LeaS(VarLabel(FSym[i].Name), 'x9')
       else
         AddFP('x9', FSym[i].Off);
-      LoadTo('[x9]', FSym[i].Typ, 'x0');
+      LoadTo('[x9]', FSym[i].Typ, 'x1');
+      LeaS('rt_stdout', 'x0');
       Line('  bl rt_writeint');
+      LeaS('rt_stdout', 'x0');
       Line('  bl rt_nl');
     end;
+    LeaS('rt_stdout', 'x0');
     Line('  bl rt_printunlock');
     Exit;
   end;
+  { every call takes the standard output's record in rdi (P212) }
+  Line('  leaq rt_stdout(%rip), %rdi');
   Line('  call rt_printlock');
-  Line('  movq $1, rt_ofd(%rip)');
   for i := 0 to High(FSym) do
   begin
     if FSym[i].ByRef or (FSym[i].Up > 0) then
@@ -18550,14 +18569,18 @@ begin
       Continue;
     Line('  leaq ' + InternStr(FSym[i].Name + '=') + '(%rip), %rsi');
     Line('  movq $' + IntToStr(Length(FSym[i].Name) + 1) + ', %rdx');
+    Line('  leaq rt_stdout(%rip), %rdi');
     Line('  call rt_write');
     if FSym[i].Global then
       LoadTo(VarLabel(FSym[i].Name) + '(%rip)', FSym[i].Typ, 'rax')
     else
       LoadTo(IntToStr(FSym[i].Off) + '(%rbp)', FSym[i].Typ, 'rax');
+    Line('  leaq rt_stdout(%rip), %rdi');
     Line('  call rt_writeint');
+    Line('  leaq rt_stdout(%rip), %rdi');
     Line('  call rt_nl');
   end;
+  Line('  leaq rt_stdout(%rip), %rdi');
   Line('  call rt_printunlock');
 end;
 
@@ -18979,12 +19002,10 @@ begin
             if (S^.Args[i]^.Kind = ekStr) or IsStr(S^.Args[i]^.Typ) then
               Line('  str x2, [x16, #8]');
           end;
+          { every call takes the stream's record in x0 (P212), the
+            integer of rt_writeint in x1 }
+          LeaS(OutStream(S^.Name), 'x0');
           Line('  bl rt_printlock');
-          if S^.Name = 'err' then
-            Line('  mov x0, #2')
-          else
-            Line('  mov x0, #1');
-          StS('x0', 'rt_ofd');
           for i := 0 to n - 1 do
           begin
             Imm('x16', i * 16);
@@ -18993,6 +19014,7 @@ begin
             begin
               Line('  ldr x1, [x16]');
               Line('  ldr x2, [x16, #8]');
+              LeaS(OutStream(S^.Name), 'x0');
               Line('  bl rt_write');
             end
             else if S^.Args[i]^.Typ = TyChar then
@@ -19000,18 +19022,24 @@ begin
               { A Char prints as its byte: the low byte of the slot. }
               Line('  mov x1, x16');
               Line('  mov x2, #1');
+              LeaS(OutStream(S^.Name), 'x0');
               Line('  bl rt_write');
             end
             else if TKind(S^.Args[i]^.Typ) = tykReal then
               Die('a real reached Write unformatted (pasfmt formats every real)')
             else
             begin
-              Line('  ldr x0, [x16]');
+              Line('  ldr x1, [x16]');
+              LeaS(OutStream(S^.Name), 'x0');
               Line('  bl rt_writeint');
             end;
           end;
           if S^.Kind = skWriteLn then
+          begin
+            LeaS(OutStream(S^.Name), 'x0');
             Line('  bl rt_nl');
+          end;
+          LeaS(OutStream(S^.Name), 'x0');
           Line('  bl rt_printunlock');
           if n > 0 then
           begin
@@ -19686,17 +19714,17 @@ begin
           if (S^.Args[i]^.Kind = ekStr) or IsStr(S^.Args[i]^.Typ) then
             Line('  movq %rdx, ' + IntToStr(i * 16 + 8) + '(%rsp)');
         end;
+        { every call takes the stream's record in rdi (P212): two
+          statements on two streams never share an output descriptor }
+        Line('  leaq ' + OutStream(S^.Name) + '(%rip), %rdi');
         Line('  call rt_printlock');
-        if S^.Name = 'err' then
-          Line('  movq $2, rt_ofd(%rip)')
-        else
-          Line('  movq $1, rt_ofd(%rip)');
         for i := 0 to n - 1 do
         begin
           if (S^.Args[i]^.Kind = ekStr) or IsStr(S^.Args[i]^.Typ) then
           begin
             Line('  movq ' + IntToStr(i * 16) + '(%rsp), %rsi');
             Line('  movq ' + IntToStr(i * 16 + 8) + '(%rsp), %rdx');
+            Line('  leaq ' + OutStream(S^.Name) + '(%rip), %rdi');
             Line('  call rt_write');
           end
           else if S^.Args[i]^.Typ = TyChar then
@@ -19705,6 +19733,7 @@ begin
               byte of the slot is that byte. Ord(c) prints the code. }
             Line('  leaq ' + IntToStr(i * 16) + '(%rsp), %rsi');
             Line('  movq $1, %rdx');
+            Line('  leaq ' + OutStream(S^.Name) + '(%rip), %rdi');
             Line('  call rt_write');
           end
           else if TKind(S^.Args[i]^.Typ) = tykReal then
@@ -19712,11 +19741,16 @@ begin
           else
           begin
             Line('  movq ' + IntToStr(i * 16) + '(%rsp), %rax');
+            Line('  leaq ' + OutStream(S^.Name) + '(%rip), %rdi');
             Line('  call rt_writeint');
           end;
         end;
         if S^.Kind = skWriteLn then
+        begin
+          Line('  leaq ' + OutStream(S^.Name) + '(%rip), %rdi');
           Line('  call rt_nl');
+        end;
+        Line('  leaq ' + OutStream(S^.Name) + '(%rip), %rdi');
         Line('  call rt_printunlock');
         if n > 0 then
           Line('  addq $' + IntToStr(n * 16) + ', %rsp');
@@ -25563,41 +25597,64 @@ end;
 
 procedure TEmitter.EmitIO;
 begin
-  { Hand-off like a mutex. A waiting G parks; the M runs other routines. }
+  { A standard stream (P212): rt_stdout and rt_stderr, one record each,
+    as Go's os.Stdout and os.Stderr are two Files, each with the
+    writeLock of its own poll.FD (internal/poll/fd_unix.go Write,
+    fd_mutex.go), so a WriteLn stuck on a full standard output no longer
+    holds a diagnostic to standard error. Record: +0 the runtime lock,
+    +8 held, +16 and +24 the queue of the routines waiting (first, last:
+    first come, first served, as the semaphore fdMutex sleeps on,
+    runtime/sema.go with lifo false), +32 the descriptor, +40 the bytes
+    in the buffer at +64 (OutBufSize). rt_printlock and rt_printunlock
+    take the record in rdi. Hand-off like a mutex: a waiting G parks,
+    the M runs other routines, and the unlock hands the stream to the
+    first waiter. }
   Line('rt_printlock:');
-  Line('  leaq rt_printlk(%rip), %rdi');
+  Line('  pushq %rbx');
+  Line('  movq %rdi, %rbx');
   Line('  call rt_lock');
-  Line('  cmpl $0, rt_printheld(%rip)');
+  Line('  cmpq $0, 8(%rbx)');
   Line('  jne .pl_wait');
-  Line('  movl $1, rt_printheld(%rip)');
-  Line('  leaq rt_printlk(%rip), %rdi');
+  Line('  movq $1, 8(%rbx)');
+  Line('  movq %rbx, %rdi');
   Line('  call rt_unlock');
+  Line('  popq %rbx');
   Line('  ret');
   Line('.pl_wait:');
-  Line('  leaq rt_printq(%rip), %rdi');
-  Line('  call rt_qwait');
-  Line('  leaq rt_printlk(%rip), %rdi');
+  Line('  leaq 16(%rbx), %rdi');
+  Line('  call rt_qwaitback');
+  Line('  movq %rbx, %rdi');
   Line('  call rt_parkunlock');
+  Line('  popq %rbx');
   Line('  ret');
+  { The statement's bytes go out first, in one write while they fit the
+    buffer, as Go's Fprintln makes one Write of its line
+    (fmt/print.go), so WriteLns to two streams on one pipe do not cut
+    each other's lines. }
   Line('rt_printunlock:');
   Line('  pushq %rbx');
-  Line('  leaq rt_printlk(%rip), %rdi');
+  Line('  pushq %r12');
+  Line('  movq %rdi, %rbx');
+  Line('  call rt_outflush');
+  Line('  movq %rbx, %rdi');
   Line('  call rt_lock');
-  Line('  leaq rt_printq(%rip), %rdi');
-  Line('  call rt_qwake1');
+  Line('  leaq 16(%rbx), %rdi');
+  Line('  call rt_qwakefirst');
   Line('  testq %rax, %rax');
   Line('  jz .pu_free');
-  Line('  movq %rax, %rbx');
-  Line('  leaq rt_printlk(%rip), %rdi');
-  Line('  call rt_unlock');
+  Line('  movq %rax, %r12');
   Line('  movq %rbx, %rdi');
+  Line('  call rt_unlock');
+  Line('  movq %r12, %rdi');
   Line('  call rt_ready');
+  Line('  popq %r12');
   Line('  popq %rbx');
   Line('  ret');
   Line('.pu_free:');
-  Line('  movl $0, rt_printheld(%rip)');
-  Line('  leaq rt_printlk(%rip), %rdi');
+  Line('  movq $0, 8(%rbx)');
+  Line('  movq %rbx, %rdi');
   Line('  call rt_unlock');
+  Line('  popq %r12');
   Line('  popq %rbx');
   Line('  ret');
   Line('');
@@ -30216,7 +30273,8 @@ begin
   Line('  movq %rax, rt_heapp(%rip)');
   Line('  addq $1048576, %rax');
   Line('  movq %rax, rt_heape(%rip)');
-  Line('  movq $1, rt_ofd(%rip)');
+  Line('  movq $1, rt_stdout+32(%rip)');
+  Line('  movq $2, rt_stderr+32(%rip)');
   Line('  movq $1, rt_nlive(%rip)');
   Line('  call rt_initsched');
   Line('  call rt_ioinit');
@@ -30492,41 +30550,105 @@ begin
   EmitScheduler;
   EmitChan;
   EmitIO;
-  Line('.globl rt_write');
+  { rt_write (P212): rdi a stream record (rt_stdout, rt_stderr) its
+    caller holds, rsi and rdx the bytes. They join the stream's buffer
+    while it has room; otherwise the buffer goes out, and then the bytes
+    join it, or go out themselves when they would fill it. The caller's
+    rt_printunlock writes what is left. Jcc: Intel SDM vol. 2A 3-499
+    (JA is CF=0 and ZF=0, JAE CF=0, JLE ZF=1 or SF<>OF). }
   Line('rt_write:');
+  Line('  testq %rdx, %rdx');
+  Line('  jle .ow_ret');
+  Line('  movq 40(%rdi), %rax');
+  Line('  leaq (%rax,%rdx), %rcx');
+  Line('  cmpq $' + IntToStr(OutBufSize) + ', %rcx');
+  Line('  ja .ow_full');
+  Line('  movq %rcx, 40(%rdi)');
+  Line('  leaq 64(%rdi,%rax), %rdi');
+  Line('  movq %rdx, %rcx');
+  Line('  jmp rt_memcpy');
+  Line('.ow_full:');
   Line('  pushq %rbx');
   Line('  pushq %r12');
   Line('  pushq %r13');
+  Line('  movq %rdi, %rbx');
+  Line('  movq %rsi, %r12');
+  Line('  movq %rdx, %r13');
+  Line('  call rt_outflush');
+  Line('  cmpq $' + IntToStr(OutBufSize) + ', %r13');
+  Line('  jae .ow_direct');
+  Line('  movq %r13, 40(%rbx)');
+  Line('  leaq 64(%rbx), %rdi');
+  Line('  movq %r12, %rsi');
+  Line('  movq %r13, %rcx');
+  Line('  call rt_memcpy');
+  Line('  jmp .ow_out');
+  Line('.ow_direct:');
+  Line('  movq 32(%rbx), %rdi');
+  Line('  movq %r12, %rsi');
+  Line('  movq %r13, %rdx');
+  Line('  call rt_writefd');
+  Line('.ow_out:');
+  Line('  popq %r13');
+  Line('  popq %r12');
+  Line('  popq %rbx');
+  Line('.ow_ret:');
+  Line('  ret');
+  { rt_outflush: rdi a stream record; its buffer goes out and empties. }
+  Line('rt_outflush:');
+  Line('  movq 40(%rdi), %rdx');
+  Line('  testq %rdx, %rdx');
+  Line('  jz .of_ret');
+  Line('  movq $0, 40(%rdi)');
+  Line('  leaq 64(%rdi), %rsi');
+  Line('  movq 32(%rdi), %rdi');
+  Line('  jmp rt_writefd');
+  Line('.of_ret:');
+  Line('  ret');
+  { rt_writefd: rdi a descriptor, rsi and rdx the bytes, all written as
+    Go's poll.FD.Write does (internal/poll/fd_unix.go): EINTR makes the
+    call again, EAGAIN waits for the descriptor and a failed wait gives
+    up, as any other error. The call goes through rt_syscall, so a
+    descriptor that blocks hands its P over (P178). rbx, r12 and r13
+    kept. }
+  Line('rt_writefd:');
+  Line('  pushq %rbx');
+  Line('  pushq %r12');
+  Line('  pushq %r13');
+  Line('  movq %rdi, %r13');
   Line('  movq %rsi, %rbx');
   Line('  movq %rdx, %r12');
-  Line('.pw:');
+  Line('.wf:');
   Line('  testq %r12, %r12');
-  Line('  jle .pw_done');
-  Line('  movq rt_ofd(%rip), %rdi');
+  Line('  jle .wf_done');
+  Line('  movq %r13, %rdi');
   Line('  movq %rbx, %rsi');
   Line('  movq %r12, %rdx');
   Line('  movq $1, %rax');
-  Line('  syscall');
+  Line('  call rt_syscall');
   Line('  testq %rax, %rax');
-  Line('  jg .pw_more');
+  Line('  jg .wf_more');
   Line('  cmpq $-4, %rax');
-  Line('  je .pw');
+  Line('  je .wf');
   Line('  cmpq $-11, %rax');
-  Line('  jne .pw_done');
-  Line('  movq rt_ofd(%rip), %rdi');
+  Line('  jne .wf_done');
+  Line('  movq %r13, %rdi');
   Line('  movq $4, %rsi');
   Line('  call rt_waitio');
-  Line('  jmp .pw');
-  Line('.pw_more:');
+  Line('  testq %rax, %rax');
+  Line('  jz .wf');
+  Line('  jmp .wf_done');
+  Line('.wf_more:');
   Line('  addq %rax, %rbx');
   Line('  subq %rax, %r12');
-  Line('  jmp .pw');
-  Line('.pw_done:');
+  Line('  jmp .wf');
+  Line('.wf_done:');
   Line('  popq %r13');
   Line('  popq %r12');
   Line('  popq %rbx');
   Line('  ret');
   Line('');
+  { rt_nl: rdi the stream }
   Line('rt_nl:');
   Line('  leaq .Lnl(%rip), %rsi');
   Line('  movq $1, %rdx');
@@ -30540,10 +30662,13 @@ begin
   Line('  movq $231, %rax');
   Line('  syscall');
   Line('');
+  { rt_writeint: rax the integer, rdi the stream (kept at -32(%rbp),
+    below the digits, which use -22 to -1) }
   Line('rt_writeint:');
   Line('  pushq %rbp');
   Line('  movq %rsp, %rbp');
   Line('  subq $32, %rsp');
+  Line('  movq %rdi, -32(%rbp)');
   Line('  movq %rax, %rdi');
   Line('  leaq -1(%rbp), %rsi');
   Line('  movb $0, (%rsi)');
@@ -30559,6 +30684,7 @@ begin
   Line('  movb $48, -2(%rbp)');
   Line('  leaq -2(%rbp), %rsi');
   Line('  movq $1, %rdx');
+  Line('  movq -32(%rbp), %rdi');
   Line('  call rt_write');
   Line('  leave');
   Line('  ret');
@@ -30580,6 +30706,7 @@ begin
   Line('.wi_out:');
   Line('  leaq -1(%rbp), %rdx');
   Line('  subq %rsi, %rdx');
+  Line('  movq -32(%rbp), %rdi');
   Line('  call rt_write');
   Line('  leave');
   Line('  ret');
@@ -34210,12 +34337,16 @@ begin
       for its exit, so two reports never interleave (P86). }
     Line('rt_siglock:');
     Line('  .quad 0');
-    Line('rt_printlk:');
-    Line('  .quad 0');
-    Line('rt_printheld:');
-    Line('  .quad 0');
-    Line('rt_printq:');
-    Line('  .quad 0');
+    { The two standard streams (P212): a record each, the layout at
+      EmitIO; a cache line apart, so the two locks share none. .balign
+      counts bytes on both machines; .align is a power of two on
+      AArch64 (aarch64-linux-gnu-as 2.47: .align 8 put the next label at
+      256), bytes on x86. }
+    Line('.balign 64');
+    Line('rt_stdout:');
+    Line('  .zero ' + IntToStr(OutRecSize));
+    Line('rt_stderr:');
+    Line('  .zero ' + IntToStr(OutRecSize));
     Line('rt_epfd:');
     Line('  .quad 0');
     Line('rt_evfd:');
@@ -34233,8 +34364,6 @@ begin
     Line('  .quad 0');
     Line('rt_iotab:');
     Line('  .zero 1024');
-    Line('rt_ofd:');
-    Line('  .quad 0');
     Line('rt_argc:');
     Line('  .quad 0');
     Line('rt_argv:');
@@ -40205,47 +40334,53 @@ begin
   Line('  ldp x19, x20, [sp], #16');
   Line('  ldp x29, x30, [sp], #16');
   Line('  ret');
+  { A standard stream as on amd64 (P212): x0 the record (rt_stdout,
+    rt_stderr; the layout at the amd64 EmitIO), its own lock, a first
+    come, first served queue and a buffer that rt_printunlock writes
+    out before it hands the stream on. }
   Line('rt_printlock:');
-  Line('  str x30, [sp, #-16]!');
-  LeaS('rt_printlk', 'x0');
+  Line('  stp x30, x19, [sp, #-16]!');
+  Line('  mov x19, x0');
   Line('  bl rt_lock');
-  LdS('rt_printheld', 'x9');
+  Line('  ldr x9, [x19, #8]');
   Line('  cbnz x9, .apl_wait');
   Line('  mov x9, #1');
-  StS('x9', 'rt_printheld');
-  LeaS('rt_printlk', 'x0');
+  Line('  str x9, [x19, #8]');
+  Line('  mov x0, x19');
   Line('  bl rt_unlock');
-  Line('  ldr x30, [sp], #16');
+  Line('  ldp x30, x19, [sp], #16');
   Line('  ret');
   Line('.apl_wait:');
-  LeaS('rt_printq', 'x0');
-  Line('  bl rt_qwait');
-  LeaS('rt_printlk', 'x0');
+  Line('  add x0, x19, #16');
+  Line('  bl rt_qwaitback');
+  Line('  mov x0, x19');
   Line('  bl rt_parkunlock');
-  Line('  ldr x30, [sp], #16');
+  Line('  ldp x30, x19, [sp], #16');
   Line('  ret');
   Line('rt_printunlock:');
-  Line('  str x30, [sp, #-16]!');
-  Line('  stp x19, x20, [sp, #-16]!');
-  LeaS('rt_printlk', 'x0');
-  Line('  bl rt_lock');
-  LeaS('rt_printq', 'x0');
-  Line('  bl rt_qwake1');
-  Line('  cbz x0, .apu_free');
+  Line('  stp x30, x19, [sp, #-16]!');
+  Line('  str x20, [sp, #-16]!');
   Line('  mov x19, x0');
-  LeaS('rt_printlk', 'x0');
-  Line('  bl rt_unlock');
+  Line('  bl rt_outflush');
   Line('  mov x0, x19');
+  Line('  bl rt_lock');
+  Line('  add x0, x19, #16');
+  Line('  bl rt_qwakefirst');
+  Line('  cbz x0, .apu_free');
+  Line('  mov x20, x0');
+  Line('  mov x0, x19');
+  Line('  bl rt_unlock');
+  Line('  mov x0, x20');
   Line('  bl rt_ready');
-  Line('  ldp x19, x20, [sp], #16');
-  Line('  ldr x30, [sp], #16');
+  Line('  ldr x20, [sp], #16');
+  Line('  ldp x30, x19, [sp], #16');
   Line('  ret');
   Line('.apu_free:');
-  StS('xzr', 'rt_printheld');
-  LeaS('rt_printlk', 'x0');
+  Line('  str xzr, [x19, #8]');
+  Line('  mov x0, x19');
   Line('  bl rt_unlock');
-  Line('  ldp x19, x20, [sp], #16');
-  Line('  ldr x30, [sp], #16');
+  Line('  ldr x20, [sp], #16');
+  Line('  ldp x30, x19, [sp], #16');
   Line('  ret');
   Line('rt_poke:');
   LdS('rt_evfd', 'x0');
@@ -41668,6 +41803,12 @@ begin
   StS('x0', 'rt_heape');
   Line('  mov x0, #1');
   StS('x0', 'rt_nlive');
+  { the standard streams' descriptors (P212) }
+  LeaS('rt_stdout', 'x9');
+  Line('  str x0, [x9, #32]');
+  Line('  mov x0, #2');
+  LeaS('rt_stderr', 'x9');
+  Line('  str x0, [x9, #32]');
   Line('  bl rt_initsched');
   Line('  bl rt_ioinit');
   { sysmon, on a thread of its own with an 8 KB stack, as on amd64. It was
@@ -42143,37 +42284,93 @@ begin
   Line('  orr w0, w3, w7');
   Line('  mov x1, #4');
   Line('  ret');
+  { rt_write as on amd64 (P212): x0 a stream record its caller holds,
+    x1 and x2 the bytes, into the buffer while they fit, or the buffer
+    out first. CMP (immediate) takes 0 to 4095 and LSL #12 (Arm ARM
+    C6.2.96), so 4096 is #1, lsl #12; HI is C==1 and Z==0, HS C==1
+    (Table C1-1). }
   Line('rt_write:');
-  Line('  str x30, [sp, #-16]!');
-  Line('  stp x19, x20, [sp, #-16]!');
+  Line('  cmp x2, #0');
+  Line('  b.le .aow_ret');
+  Line('  ldr x9, [x0, #40]');
+  Line('  add x10, x9, x2');
+  Line('  cmp x10, #' + IntToStr(OutBufSize shr 12) + ', lsl #12');
+  Line('  b.hi .aow_full');
+  Line('  str x10, [x0, #40]');
+  Line('  add x0, x0, #64');
+  Line('  add x0, x0, x9');
+  Line('  b rt_memcpy');
+  Line('.aow_full:');
+  Line('  stp x30, x19, [sp, #-16]!');
+  Line('  stp x20, x21, [sp, #-16]!');
+  Line('  mov x19, x0');
+  Line('  mov x20, x1');
+  Line('  mov x21, x2');
+  Line('  bl rt_outflush');
+  Line('  cmp x21, #' + IntToStr(OutBufSize shr 12) + ', lsl #12');
+  Line('  b.hs .aow_direct');
+  Line('  str x21, [x19, #40]');
+  Line('  add x0, x19, #64');
+  Line('  mov x1, x20');
+  Line('  mov x2, x21');
+  Line('  bl rt_memcpy');
+  Line('  b .aow_out');
+  Line('.aow_direct:');
+  Line('  ldr x0, [x19, #32]');
+  Line('  mov x1, x20');
+  Line('  mov x2, x21');
+  Line('  bl rt_writefd');
+  Line('.aow_out:');
+  Line('  ldp x20, x21, [sp], #16');
+  Line('  ldp x30, x19, [sp], #16');
+  Line('.aow_ret:');
+  Line('  ret');
+  Line('rt_outflush:');
+  Line('  ldr x2, [x0, #40]');
+  Line('  cbz x2, .aof_ret');
+  Line('  str xzr, [x0, #40]');
+  Line('  add x1, x0, #64');
+  Line('  ldr x0, [x0, #32]');
+  Line('  b rt_writefd');
+  Line('.aof_ret:');
+  Line('  ret');
+  { rt_writefd as on amd64: x0 the descriptor, x1 and x2 the bytes, all
+    written through rt_syscall; EINTR again, EAGAIN waits, a failed wait
+    or any other error gives up. x19 to x21 kept. }
+  Line('rt_writefd:');
+  Line('  stp x30, x19, [sp, #-16]!');
+  Line('  stp x20, x21, [sp, #-16]!');
+  Line('  mov x21, x0');
   Line('  mov x19, x1');
   Line('  mov x20, x2');
-  Line('.awr:');
+  Line('.awf:');
   Line('  cmp x20, #0');
-  Line('  b.le .awr_done');
-  LdS('rt_ofd', 'x0');
+  Line('  b.le .awf_done');
+  Line('  mov x0, x21');
   Line('  mov x1, x19');
   Line('  mov x2, x20');
   Line('  mov x8, #64');
-  Line('  svc #0');
+  Line('  bl rt_syscall');
   Line('  cmp x0, #0');
-  Line('  b.gt .awr_more');
+  Line('  b.gt .awf_more');
   Line('  cmn x0, #4');
-  Line('  b.eq .awr');
+  Line('  b.eq .awf');
   Line('  cmn x0, #11');
-  Line('  b.ne .awr_done');
-  LdS('rt_ofd', 'x0');
+  Line('  b.ne .awf_done');
+  Line('  mov x0, x21');
   Line('  mov x1, #4');
   Line('  bl rt_waitio');
-  Line('  b .awr');
-  Line('.awr_more:');
+  Line('  cbz x0, .awf');
+  Line('  b .awf_done');
+  Line('.awf_more:');
   Line('  add x19, x19, x0');
   Line('  sub x20, x20, x0');
-  Line('  b .awr');
-  Line('.awr_done:');
-  Line('  ldp x19, x20, [sp], #16');
-  Line('  ldr x30, [sp], #16');
+  Line('  b .awf');
+  Line('.awf_done:');
+  Line('  ldp x20, x21, [sp], #16');
+  Line('  ldp x30, x19, [sp], #16');
   Line('  ret');
+  { rt_nl: x0 the stream }
   Line('rt_nl:');
   LeaS('.Lnl', 'x1');
   Line('  mov x2, #1');
@@ -42184,11 +42381,13 @@ begin
   Line('rt_exit:');
   Line('  mov x8, #94');
   Line('  svc #0');
+  { rt_writeint: x0 the stream (kept at x29-32, below the digits, which
+    use x29-22 to x29-1), x1 the integer (P212) }
   Line('rt_writeint:');
   Line('  stp x29, x30, [sp, #-16]!');
   Line('  mov x29, sp');
   Line('  sub sp, sp, #32');
-  Line('  mov x1, x0');
+  Line('  str x0, [sp]');
   Line('  sub x2, x29, #1');
   Line('  strb wzr, [x2]');
   Line('  cmp x1, #0');
@@ -42203,6 +42402,7 @@ begin
   Line('  strb w9, [x29, #-2]');
   Line('  sub x1, x29, #2');
   Line('  mov x2, #1');
+  Line('  ldr x0, [sp]');
   Line('  bl rt_write');
   Line('  mov sp, x29');
   Line('  ldp x29, x30, [sp], #16');
@@ -42226,6 +42426,7 @@ begin
   Line('  sub x0, x0, x2');
   Line('  mov x1, x2');
   Line('  mov x2, x0');
+  Line('  ldr x0, [sp]');
   Line('  bl rt_write');
   Line('  mov sp, x29');
   Line('  ldp x29, x30, [sp], #16');

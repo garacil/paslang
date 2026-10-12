@@ -121,8 +121,8 @@ pas worker(1);
 ```
 
 - **`WriteLn` / `Write` / `ReadLn`** are builtins. They desugar to
-  runtime calls that take the current **G**, hold a print lock so
-  concurrent lines do not tear (like Go `fmt`), and **park** (or
+  runtime calls that take the current **G**, hold their stream's lock
+  so concurrent lines do not tear (like Go `fmt`), and **park** (or
   `entersyscall`) if the fd would block the M. They never assume a
   4 MiB pthread stack.
 - There is **no** `PasWriteLn`, no unit `Pasio`, no second API.

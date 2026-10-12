@@ -4617,8 +4617,13 @@ another still runs; a program whose routines are all at `Breakpoint`s
 is dead, since only a routine can call `ContinueBreak`. `Halt(n)` ends
 the program at once, whatever the other routines are doing (§4).
 
-Standard output is written line by line under a lock: a `WriteLn` from
-one routine never interleaves inside a `WriteLn` from another.
+Standard output and standard error each have a lock of their own: a
+`WriteLn` from one routine never interleaves inside a `WriteLn` from
+another to the same stream, and one stuck on a full standard output
+does not hold a `WriteLn(ErrOutput, ...)`. A `Write` or `WriteLn` whose
+text fits in 4096 bytes goes out in one write, so lines to both streams
+on one pipe (`2>&1`) stay whole too; a longer one goes out in order, in
+pieces.
 
 When an operation on a channel parks, in one line each: a `Send` on a
 channel made with `MakeChan()` parks until a receiver takes the value,
