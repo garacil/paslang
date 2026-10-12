@@ -178,6 +178,11 @@ GOLDEN_A64 += trygetshare
 # value's slot on both machines, as a map's is.
 GOLDEN += treevarg
 GOLDEN_A64 += treevarg
+# P221: a string a routine builds and returns is stored without the
+# shared mark; one another variable holds is marked whichever way it
+# reaches Result, and the holder never changes.
+GOLDEN += resultmark
+GOLDEN_A64 += resultmark
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -549,6 +554,9 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/treevarg0 testdata/treevarg.paslang; \
 	$(BUILDDIR)/treevarg0 > $(BUILDDIR)/treevarg0.got; \
 	diff -u testdata/treevarg.out $(BUILDDIR)/treevarg0.got; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/resultmark0 testdata/resultmark.paslang; \
+	$(BUILDDIR)/resultmark0 > $(BUILDDIR)/resultmark0.got; \
+	diff -u testdata/resultmark.out $(BUILDDIR)/resultmark0.got; \
 	echo ok inline; \
 	echo "==== dead code ===="; \
 	sz=$$(size $(BUILDDIR)/hello | awk 'NR==2 {print $$1}'); \
