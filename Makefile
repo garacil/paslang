@@ -539,8 +539,13 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/readlines.out $(BUILDDIR)/readlines.got; \
 	(sleep 0.05; head -c 3000 testdata/readlines.in; sleep 0.05; tail -c +3001 testdata/readlines.in) | $(BUILDDIR)/readlines > $(BUILDDIR)/readlines.got; \
 	diff -u testdata/readlines.out $(BUILDDIR)/readlines.got; \
+	: the same input nonblocking, as a shell may hand it over: ReadLn parks on the poller, P217; \
+	(sleep 0.05; head -c 3000 testdata/readlines.in; sleep 0.05; tail -c +3001 testdata/readlines.in) | python3 scripts/nonblocking.py $(BUILDDIR)/readlines > $(BUILDDIR)/readlines.got; \
+	diff -u testdata/readlines.out $(BUILDDIR)/readlines.got; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/spurwake testdata/spurwake.paslang; \
 	(sleep 0.2; printf 'x\n'; head -c 100000 /dev/zero | tr '\0' y) | timeout 20 $(BUILDDIR)/spurwake > $(BUILDDIR)/spurwake.got; \
+	diff -u testdata/spurwake.out $(BUILDDIR)/spurwake.got; \
+	(sleep 0.2; printf 'x\n'; head -c 100000 /dev/zero | tr '\0' y) | timeout 20 python3 scripts/nonblocking.py $(BUILDDIR)/spurwake > $(BUILDDIR)/spurwake.got; \
 	diff -u testdata/spurwake.out $(BUILDDIR)/spurwake.got; \
 	echo ok stdin; \
 	echo "==== collector ===="; \
@@ -697,6 +702,8 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	echo "==== blockrd ===="; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/blockrd testdata/blockrd.paslang; \
 	{ sleep 0.2; printf 'x\n'; } | $(BUILDDIR)/blockrd > $(BUILDDIR)/blockrd.got; \
+	diff -u testdata/blockrd.out $(BUILDDIR)/blockrd.got; \
+	{ sleep 0.2; printf 'x\n'; } | python3 scripts/nonblocking.py $(BUILDDIR)/blockrd > $(BUILDDIR)/blockrd.got; \
 	diff -u testdata/blockrd.out $(BUILDDIR)/blockrd.got; \
 	echo ok blockrd; \
 	echo "==== lines ===="; \
@@ -1941,6 +1948,8 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	: records with methods and properties across a unit, and their private members, P165; \
 	sh scripts/check_scoped_types.sh "$(OUTDIR)/paslangc" "$(BUILDDIR)" $(QEMU_A64); \
 	python3 scripts/check_syscalls.py "$(OUTDIR)/paslangc" "$(BUILDDIR)" $(QEMU_A64); \
+	: the standard streams keep the flags the program found, P217; \
+	python3 scripts/check_stdstreams.py "$(OUTDIR)/paslangc" "$(BUILDDIR)" $(QEMU_A64); \
 	python3 scripts/check_sysutils.py "$(OUTDIR)/paslangc" "$(BUILDDIR)" $(QEMU_A64); \
 	python3 scripts/check_currency_language.py "$(OUTDIR)/paslangc" "$(BUILDDIR)" $(QEMU_A64); \
 	for level in 0 40; do \
@@ -2573,8 +2582,12 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	$(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/readlines-arm testdata/readlines.paslang; \
 	timeout 60 $(QEMU_A64) $(BUILDDIR)/readlines-arm < testdata/readlines.in > $(BUILDDIR)/readlines-arm.got; \
 	diff -u testdata/readlines.out $(BUILDDIR)/readlines-arm.got; \
+	(sleep 0.05; head -c 3000 testdata/readlines.in; sleep 0.05; tail -c +3001 testdata/readlines.in) | timeout 60 python3 scripts/nonblocking.py $(QEMU_A64) $(BUILDDIR)/readlines-arm > $(BUILDDIR)/readlines-arm.got; \
+	diff -u testdata/readlines.out $(BUILDDIR)/readlines-arm.got; \
 	$(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/spurwake-arm testdata/spurwake.paslang; \
 	(sleep 0.5; printf 'x\n'; head -c 100000 /dev/zero | tr '\0' y) | timeout 60 $(QEMU_A64) $(BUILDDIR)/spurwake-arm > $(BUILDDIR)/spurwake-arm.got; \
+	diff -u testdata/spurwake.out $(BUILDDIR)/spurwake-arm.got; \
+	(sleep 0.5; printf 'x\n'; head -c 100000 /dev/zero | tr '\0' y) | timeout 60 python3 scripts/nonblocking.py $(QEMU_A64) $(BUILDDIR)/spurwake-arm > $(BUILDDIR)/spurwake-arm.got; \
 	diff -u testdata/spurwake.out $(BUILDDIR)/spurwake-arm.got; \
 	echo ok stdin-arm; \
 	echo "==== collector arm64 ===="; \
@@ -2589,8 +2602,9 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	diff -u testdata/mapsplit.out $(BUILDDIR)/mapsplit-arm.got; \
 	echo ok collector-arm; \
 	echo "==== stack maps arm64 ===="; \
+	: store1 takes 620 s here, 1.1.95 as 1.1.96, its mark workers spinning between small cycles, 460 s with one: 1200 until P219; \
 	for t in $(GOLDEN_A64); do \
-	  PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=3 PASLANG_GCPOISON=1 timeout 600 $(QEMU_A64) $(BUILDDIR)/$$t-arm > $(BUILDDIR)/$$t-arm.vgot; \
+	  PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=3 PASLANG_GCPOISON=1 timeout 1200 $(QEMU_A64) $(BUILDDIR)/$$t-arm > $(BUILDDIR)/$$t-arm.vgot; \
 	  diff -u testdata/$$t.out $(BUILDDIR)/$$t-arm.vgot; \
 	done; \
 	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 timeout 600 $(QEMU_A64) $(BUILDDIR)/stackmap-arm > $(BUILDDIR)/stackmap-arm.vgot; \

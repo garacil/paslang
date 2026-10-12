@@ -4625,6 +4625,15 @@ text fits in 4096 bytes goes out in one write, so lines to both streams
 on one pipe (`2>&1`) stay whole too; a longer one goes out in order, in
 pieces.
 
+The standard streams keep the flags the program was given. Their open
+file descriptions are shared with the shell and the programs before and
+after it, so the runtime never makes them nonblocking: a `ReadLn` or a
+`WriteLn` on a blocking one waits in its system call, and on one that
+came nonblocking it parks until the descriptor is ready; either way the
+other routines and the collector go on, on one CPU too. The message of
+a runtime error waits for room on a full standard error, as it would on
+a blocking one.
+
 When an operation on a channel parks, in one line each: a `Send` on a
 channel made with `MakeChan()` parks until a receiver takes the value,
 and on a channel made with `MakeChan(n)` only while its `n` places are
