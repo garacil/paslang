@@ -1,0 +1,228 @@
+{ P216 (1.1.102): connecting waits as Go's netFD.connect does. A
+  listener whose queue of connections not yet accepted is full drops
+  the next connection's SYN, so that connect stays on its way until a
+  routine accepts one and the SYN goes again, about a second later: a
+  slow connect on the loopback, every time. NetConnect, TcpConnect6
+  and TcpConnectTo wait through it and the connection carries bytes;
+  TcpConnectToMs gives up at its deadline (that is how the queue is
+  known full); a closed port fails once the wait says so, a multicast
+  address at once from connect(2); a name nobody answers for ends at
+  TcpConnectToMs's deadline; a ticker routine goes on while main waits.
+  Any case that does not hold makes the exit status 3. check_syscalls.py
+  also runs it under gdb (scripts/inject_syscall_connect.py): the first
+  connect's answer becomes EINTR, and the connection is still on its
+  way; the first slow connect's wait is woken by an always writable
+  socket put at descriptor 100, and that must not count as connected;
+  the name's query is never sent, so the resolver waits for its
+  deadline. }
+program connwait;
+
+uses
+  pasnet, paslib;
+
+var
+  held: array of Integer;
+  ticks, stop, bad, accepted: Integer;
+  wg: waitgroup;
+
+procedure Ticker;
+begin
+  while AtomicAdd(@stop, 0) = 0 do
+  begin
+    Sleep(1);
+    AtomicAdd(@ticks, 1);
+  end;
+end;
+
+procedure Expect(Ok: Boolean);
+begin
+  if not Ok then
+    bad := bad + 1;
+end;
+
+{ Connections to L that nobody accepts, until one within 300 ms gives
+  up: then the queue is full. True when the last one gave up between
+  250 ms and 10 s, at its deadline and not at the kernel's minutes. }
+function Fill(const Host: string; L: Integer): Boolean;
+var
+  c, k, t0, ms: Integer;
+begin
+  Result := False;
+  SetLength(held, 0);
+  for k := 1 to 8 do
+  begin
+    t0 := Nanotime;
+    c := TcpConnectToMs(Host, TcpPort(L), 300);
+    if c < 0 then
+    begin
+      ms := (Nanotime - t0) div 1000000;
+      Result := (ms >= 250) and (ms < 10000);
+      Exit;
+    end;
+    held := Append(held, c);
+  end;
+end;
+
+procedure LateAccept(L: Integer);
+begin
+  Sleep(100);
+  accepted := TcpAccept(L);
+  wg.Done;
+end;
+
+{ A connect while L's queue is full: Kind 0 TcpConnectTo, 1 NetConnect,
+  2 TcpConnect6. }
+procedure Slow(const What, Host: string; Kind: Integer);
+var
+  l, c, a, k, t0, ms, n: Integer;
+  full: Boolean;
+  got, peer: string;
+begin
+  l := TcpListenAt(Host, 0, 1);
+  full := Fill(Host, l);
+  wg.Add(1);
+  pas LateAccept(l);
+  t0 := Nanotime;
+  if Kind = 0 then
+    c := TcpConnectTo(Host, TcpPort(l))
+  else if Kind = 1 then
+    c := NetConnect($7F000001, TcpPort(l))
+  else
+    c := TcpConnect6(TcpPort(l));
+  ms := (Nanotime - t0) div 1000000;
+  { connected means it has a peer now, not once a write has waited }
+  peer := '';
+  if c >= 0 then
+    peer := TcpPeer(c);
+  wg.Wait;
+  TcpClose(accepted);
+  for k := 1 to Length(held) - 1 do
+    TcpClose(TcpAccept(l));
+  a := TcpAccept(l);
+  n := -1;
+  got := '';
+  if c >= 0 then
+  begin
+    n := TcpWrite(c, 'hello');
+    got := TcpRead(a, 64);
+  end;
+  WriteLn('  ', What, ': the queue full by a deadline ', full, ', waited ', ms >= 500,
+    ', connected ', c >= 0, ', bytes through ', (n = 5) and (got = 'hello'),
+    ', a peer at once and the same two ends ', (peer <> '') and (peer = TcpLocal(a)));
+  Expect(full and (ms >= 500) and (c >= 0) and (n = 5) and (got = 'hello') and (peer <> '') and
+    (peer = TcpLocal(a)));
+  for k := 0 to Length(held) - 1 do
+    TcpClose(held[k]);
+  TcpClose(a);
+  if c >= 0 then
+    TcpClose(c);
+  TcpClose(l);
+end;
+
+procedure Closed(const What, Host: string; Kind: Integer);
+var
+  l, p, c, t0, ms: Integer;
+begin
+  l := TcpListenAt(Host, 0, 1);
+  p := TcpPort(l);
+  TcpClose(l);
+  t0 := Nanotime;
+  if Kind = 0 then
+    c := TcpConnectTo(Host, p)
+  else
+    c := NetConnect($7F000001, p);
+  ms := (Nanotime - t0) div 1000000;
+  WriteLn('  ', What, ': -1 ', c = -1, ', at once ', ms < 2000);
+  Expect((c = -1) and (ms < 2000));
+end;
+
+{ An address no route reaches: a multicast one, which Linux refuses at
+  once with ENETUNREACH (its tcp_v4_connect and tcp_v6_connect), so the
+  answer is connect(2)'s own and no wait comes before it. }
+procedure Unreachable(const What, Host: string; Kind: Integer);
+var
+  c, t0, ms: Integer;
+begin
+  t0 := Nanotime;
+  if Kind = 0 then
+    c := TcpConnectTo(Host, 80)
+  else
+    c := NetConnect($E0000001, 80);
+  ms := (Nanotime - t0) div 1000000;
+  WriteLn('  ', What, ': -1 ', c = -1, ', at once ', ms < 2000);
+  Expect((c = -1) and (ms < 2000));
+end;
+
+{ A name in .invalid (RFC 6761, never a name): TcpConnectToMs ends at
+  its deadline with the resolution, before the resolver's own two
+  seconds. Alone, the deadline is 0 ms and the resolver sends nothing;
+  under gdb (CONNWAIT_DNS=1) it is 600 ms and the injector turns the
+  query's sendto into getpid, so nothing leaves the machine and no
+  answer comes. }
+procedure NameDeadline;
+var
+  ms0, c, t0, ms: Integer;
+begin
+  ms0 := 0;
+  if GetEnv('CONNWAIT_DNS') = '1' then
+    ms0 := 600;
+  t0 := Nanotime;
+  c := TcpConnectToMs('connwait.invalid', 80, ms0);
+  ms := (Nanotime - t0) div 1000000;
+  WriteLn('a name nobody answers for: -1 ', c = -1, ', at the deadline ',
+    (ms >= ms0 - 50) and (ms < ms0 + 1000));
+  Expect((c = -1) and (ms >= ms0 - 50) and (ms < ms0 + 1000));
+end;
+
+var
+  l, c, a, n, spare, nr: Integer;
+  got: string;
+
+begin
+  pas Ticker;
+  l := TcpListenAt('127.0.0.1', 0, 16);
+  c := TcpConnectTo('127.0.0.1', TcpPort(l));
+  a := TcpAccept(l);
+  n := TcpWrite(c, 'first');
+  got := TcpRead(a, 64);
+  WriteLn('a connection at once: connected ', c >= 0, ', bytes through ', (n = 5) and (got = 'first'));
+  Expect((c >= 0) and (n = 5) and (got = 'first'));
+  TcpClose(a);
+  TcpClose(c);
+  TcpClose(l);
+
+  { an always writable socket at descriptor 100, for the injected wake:
+    dup3 is 292 on amd64 and 24 on arm64 (Go's zsysnum_linux_*.go) }
+  spare := UdpBindAt('127.0.0.1', 0);
+  if Amd64 = 1 then
+    nr := 292
+  else
+    nr := 24;
+  Expect(Syscall(nr, spare, 100, 0) = 100);
+
+  WriteLn('slow connects');
+  Slow('TcpConnectTo, IPv4', '127.0.0.1', 0);
+  Slow('NetConnect', '127.0.0.1', 1);
+  Slow('TcpConnect6', '::1', 2);
+  Slow('TcpConnectTo, IPv6', '::1', 0);
+  WriteLn('closed ports');
+  Closed('TcpConnectTo, IPv4', '127.0.0.1', 0);
+  Closed('NetConnect', '127.0.0.1', 1);
+  Closed('TcpConnectTo, IPv6', '::1', 0);
+  WriteLn('unreachable addresses');
+  Unreachable('TcpConnectTo, IPv4', '224.0.0.1', 0);
+  Unreachable('NetConnect', '224.0.0.1', 1);
+  Unreachable('TcpConnectTo, IPv6', 'ff0e::1', 0);
+  NameDeadline;
+  AtomicAdd(@stop, 1);
+  WriteLn('the ticker went on while main waited ', ticks > 0);
+  Expect(ticks > 0);
+  if bad > 0 then
+    Halt(3);
+end.
+
+{ This file is part of paslang's tests.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+  paslang is free software under the GNU General Public License,
+  version 3 or (at your option) any later version; see the file
+  COPYING. It comes with ABSOLUTELY NO WARRANTY. }

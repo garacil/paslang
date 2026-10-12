@@ -6396,7 +6396,8 @@ read and write them.
 | Word | What it does |
 |---|---|
 | `TcpListenAt(host, port, backlog)` | a listener at `host` of either family (`''`, `0.0.0.0` or `::` for every address; on `::` IPv4 connections come too), `SO_REUSEADDR` and `TCP_NODELAY` set, the backlog 4096 when 0 or less; `NetAccept` and `TcpAccept` park on it |
-| `TcpConnectTo(host, port)` | a connection to a literal of either family or a name, parking while it is made; -1 when it fails |
+| `TcpConnectTo(host, port)` | a connection to a literal of either family or a name, parking while it is made as Go's `connect` waits: a spurious wake or an interrupted call waits on, a refused or unreachable one fails; -1 when it fails |
+| `TcpConnectToMs(host, port, ms)` | the same within `ms` milliseconds of the call, the name's resolution included, as Go's `Dialer.Timeout` bounds both, else -1; 0 or less is a deadline already past, as `WaitMs` takes it (Go's `Timeout` of 0 is no limit, which here is `TcpConnectTo`) (1.1.102) |
 | `TcpPeer(fd)`, `TcpLocal(fd)` | the two ends as `host:port`, `[host]:port` for IPv6; `''` on an error |
 | `TcpShutdown(fd, how)` | no more reading (0), no more writing (1: the peer reads the end of the stream), both (2) |
 | `TcpKeepAlive(fd, on)` | the kernel's keep-alive probes |
@@ -9557,7 +9558,7 @@ program has without `uses`:
 | `NetListen(port)` | a TCP socket bound to `port` on every IPv4 address and listening, non-blocking, with `SO_REUSEADDR` and `TCP_NODELAY`: its descriptor, or a negative number when that fails |
 | `NetPort(fd)` | the socket's local port; 0 when it cannot be read |
 | `NetAccept(fd)` | the descriptor of the next connection, parking until one comes; negative on an error |
-| `NetConnect(ip4, port)` | a connection to the IPv4 address given as one `Integer` (`127.0.0.1` is `$7F000001`), parking until it is made: its descriptor, or -1 |
+| `NetConnect(ip4, port)` | a connection to the IPv4 address given as one `Integer` (`127.0.0.1` is `$7F000001`), parking until it is made as Go's `connect` waits (a spurious wake or an interrupted call waits on, 1.1.102): its descriptor, or -1 |
 | `NetRead(fd, max, s)` | a procedure: parks until bytes come and puts up to `max` of them (1 to 65536) in the string variable `s`, which is empty at the end of the stream or on an error |
 | `NetWrite(fd, s)` | writes all of `s`, parking while the socket is full: the count written, negative on an error |
 | `NetClose(fd)` | a procedure: takes the descriptor off the poller and closes it |

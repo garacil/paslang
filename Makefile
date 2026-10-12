@@ -164,6 +164,12 @@ GOLDEN_A64 += strshrink
 # IPv4 one and an empty datagram named alike by both, on both machines.
 GOLDEN += udpfrom
 GOLDEN_A64 += udpfrom
+# P216: connecting waits as Go's netFD.connect does: slow connects while
+# the listener's queue is full, closed ports, unreachable addresses and
+# a deadline that bounds a name's resolution (check_syscalls.py adds
+# EINTR, a spurious wake and a silent nameserver under gdb).
+GOLDEN += connwait
+GOLDEN_A64 += connwait
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a

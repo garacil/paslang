@@ -106,13 +106,17 @@ procedure PasReadLn(Dest: Pointer);
   in Answer, a deadline that passed -110 (ETIMEDOUT). PasIoDeadline is
   the deadline Ms milliseconds from now. PasIoRead and PasIoWrite are
   one transfer each through it; NetRead and NetWrite are PasNetRead and
-  PasNetWrite. }
+  PasNetWrite. PasConnect makes a connection on a socket that does not
+  block, waiting as Go's netFD.connect does (P216); NetConnect is
+  PasNetConnect. }
 function PasIoRetry(var Answer: Integer; Fd, Ev, Deadline: Integer): Boolean;
 function PasIoDeadline(Ms: Integer): Integer;
 function PasIoRead(Fd: Integer; Buf: Pointer; N, Deadline: Integer): Integer;
 function PasIoWrite(Fd: Integer; Buf: Pointer; N, Deadline: Integer): Integer;
 procedure PasNetRead(Fd, MaxN: Integer; Dest: Pointer);
 function PasNetWrite(Fd: Integer; P: Pointer; N: Integer): Integer;
+function PasConnect(Fd: Integer; Sa: Pointer; Size, Deadline: Integer): Integer;
+function PasNetConnect(Ip, Port: Integer): Integer;
 
 implementation
 
@@ -728,6 +732,140 @@ begin
       Exit;
     Result := Result + r;
   end;
+end;
+
+{ ---- connecting (P216) ---- }
+
+{ A connection on Fd, a socket that does not block, to the sockaddr of
+  Size bytes at Sa: 0 once it is made, else -errno; Deadline a Nanotime
+  (0 none), past which the answer is -110, Go's ErrDeadlineExceeded.
+  Go's netFD.connect (net/fd_unix.go): EINPROGRESS, EALREADY and EINTR
+  from connect(2) say the connection is on its way, 0 and EISCONN that
+  it is made, anything else is the answer. On its way, the routine
+  parks until the socket can be written, and a failed wait is the
+  answer; then SO_ERROR says how it went, since another connect call
+  need not give an earlier error (Go issue 7474): EINPROGRESS, EALREADY
+  and EINTR wait again, EISCONN is made, 0 is made once getpeername
+  agrees, because the poller may wake a routine spuriously (Go issues
+  14548 and 19289), and anything else is the answer. Before, NetConnect,
+  TcpConnect6 and TcpConnectTo waited once, took SO_ERROR 0 for a
+  connection and EINTR from connect for a failure. Errno values and
+  call numbers from Go's syscall/zerrors_linux_*.go and
+  zsysnum_linux_*.go, the same on both machines but the calls. }
+function PasConnect(Fd: Integer; Sa: Pointer; Size, Deadline: Integer): Integer;
+var
+  nconnect, ngetsockopt, ngetpeername, err, olen, plen, left, w: Integer;
+  peer: array[0..127] of Byte;
+begin
+  if Amd64 = 1 then
+  begin
+    nconnect := 42;
+    ngetsockopt := 55;
+    ngetpeername := 52;
+  end
+  else
+  begin
+    nconnect := 203;
+    ngetsockopt := 209;
+    ngetpeername := 205;
+  end;
+  Result := Syscall(nconnect, Fd, Sa, Size);
+  if (Result = 0) or (Result = -106) then
+  begin
+    Result := 0;
+    Exit;
+  end;
+  if (Result <> -115) and (Result <> -114) and (Result <> -4) then
+    Exit;
+  while True do
+  begin
+    if Deadline > 0 then
+    begin
+      left := Deadline - Nanotime;
+      if left <= 0 then
+      begin
+        Result := -110;
+        Exit;
+      end;
+      w := WaitMs(Fd, 4, left div 1000000 + 1);
+    end
+    else
+      w := WaitIo(Fd, 4);
+    if w < 0 then
+    begin
+      Result := w;
+      Exit;
+    end;
+    err := 0;
+    olen := 4;
+    Result := Syscall(ngetsockopt, Fd, 1, 4, @err, @olen);
+    if Result < 0 then
+      Exit;
+    if err = 106 then
+    begin
+      Result := 0;
+      Exit;
+    end;
+    if err = 0 then
+    begin
+      plen := 128;
+      if Syscall(ngetpeername, Fd, @peer, @plen) = 0 then
+      begin
+        Result := 0;
+        Exit;
+      end;
+    end
+    else if (err <> 115) and (err <> 114) and (err <> 4) then
+    begin
+      Result := -err;
+      Exit;
+    end;
+  end;
+end;
+
+{ NetConnect(ip4, port): the runtime's rt_tcpconnect jumps here. A TCP
+  socket that does not block and closes on exec, TCP_NODELAY set as Go
+  sets it on every TCP connection, connected through PasConnect: its
+  descriptor, or -1 with the socket closed. }
+function PasNetConnect(Ip, Port: Integer): Integer;
+var
+  nsocket, nsetsockopt, nclose, fd, one, r: Integer;
+  sa: array[0..15] of Byte;
+  i: Integer;
+begin
+  if Amd64 = 1 then
+  begin
+    nsocket := 41;
+    nsetsockopt := 54;
+    nclose := 3;
+  end
+  else
+  begin
+    nsocket := 198;
+    nsetsockopt := 208;
+    nclose := 57;
+  end;
+  Result := -1;
+  fd := Syscall(nsocket, 2, 526337, 0);
+  if fd < 0 then
+    Exit;
+  one := 1;
+  r := Syscall(nsetsockopt, fd, 6, 1, @one, 4);
+  for i := 0 to 15 do
+    sa[i] := 0;
+  sa[0] := 2;
+  sa[2] := Byte((Port shr 8) and 255);
+  sa[3] := Byte(Port and 255);
+  sa[4] := Byte((Ip shr 24) and 255);
+  sa[5] := Byte((Ip shr 16) and 255);
+  sa[6] := Byte((Ip shr 8) and 255);
+  sa[7] := Byte(Ip and 255);
+  if PasConnect(fd, @sa, 16, 0) <> 0 then
+  begin
+    r := Syscall(nclose, fd);
+    Exit;
+  end;
+  Result := fd;
 end;
 
 end.

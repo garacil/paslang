@@ -66,9 +66,12 @@ function Resolve(const Host: string): string;
 
 { TCP for servers: an address of either family, the backlog, the peer,
   one direction shut, keep-alive, the buffers, lines and counted reads
-  over a per-connection buffer the caller keeps. }
+  over a per-connection buffer the caller keeps. TcpConnectToMs is
+  TcpConnectTo within Ms milliseconds of the call, the name's
+  resolution included (P216). }
 function TcpListenAt(const Host: string; Port, Backlog: Integer): Integer;
 function TcpConnectTo(const Host: string; Port: Integer): Integer;
+function TcpConnectToMs(const Host: string; Port, Ms: Integer): Integer;
 function TcpPeer(Fd: Integer): string;
 function TcpLocal(Fd: Integer): string;
 procedure TcpShutdown(Fd, How: Integer);
@@ -409,40 +412,33 @@ begin
   Result := fd;
 end;
 
-function TcpConnect6(Port: Integer): Integer;
+{ A TCP connection to the sockaddr of Size bytes at Sa, of the family
+  its first byte names, TCP_NODELAY set as NetConnect sets it, through
+  pasroutines' PasConnect, the wait Go's netFD.connect makes (P216): its
+  descriptor, or -1 with the socket closed. Deadline a Nanotime, 0 none. }
+function ConnectSa(Sa: Pointer; Size, Deadline: Integer): Integer;
 var
-  fd, n, err, olen: Integer;
-  sa: array[0..27] of Char;
+  fd, n: Integer;
 begin
-  fd := Syscall(SnSocket, 10, 526337, 0);
+  Result := -1;
+  fd := Syscall(SnSocket, Integer(PByte(Sa)^), 526337, 0);
   if fd < 0 then
+    Exit;
+  SetNoDelay(fd);
+  if PasConnect(fd, Sa, Size, Deadline) <> 0 then
   begin
-    Result := -1;
+    n := Syscall(SnClose, fd);
     Exit;
   end;
-  Fill6(sa, Port, True);
-  n := Syscall(SnConnect, fd, @sa, 28);
-  if n < 0 then
-  begin
-    if n <> -115 then
-    begin
-      n := Syscall(SnClose, fd);
-      Result := -1;
-      Exit;
-    end;
-    n := WaitIo(fd, 4);
-    err := 0;
-    olen := 4;
-    n := Syscall(SnGetsockopt, fd, 1, 4, @err, @olen);
-    if (n < 0) or (err <> 0) then
-    begin
-      n := Syscall(SnClose, fd);
-      Result := -1;
-      Exit;
-    end;
-  end;
-  SetNoDelay(fd);
   Result := fd;
+end;
+
+function TcpConnect6(Port: Integer): Integer;
+var
+  sa: array[0..27] of Char;
+begin
+  Fill6(sa, Port, True);
+  Result := ConnectSa(@sa, 28, 0);
 end;
 
 function TcpAccept6(Fd: Integer): Integer;
@@ -913,52 +909,40 @@ begin
   Result := fd;
 end;
 
+function ResolveWithin(const Host: string; Deadline: Integer): string; forward;
+
 { A connection to Host: a literal of either family or a name; parks
-  while the connection is made. }
-function TcpConnectTo(const Host: string; Port: Integer): Integer;
+  while the connection is made, until Deadline (a Nanotime, 0 none),
+  which bounds the name's resolution too, as Go's Dialer.Timeout does
+  (net/dial.go: dialCtx puts the deadline on the context that
+  resolveAddrList and the connect share). -1 when it fails. }
+function ConnectHost(const Host: string; Port, Deadline: Integer): Integer;
 var
   sa: array[0..27] of Byte;
-  fd, n, size, err, olen, ip4: Integer;
+  size, ip4: Integer;
   h: string;
 begin
   Result := -1;
   h := Host;
   if (not HostToV4(h, ip4)) and (not IsV6Text(h)) then
   begin
-    h := Resolve(h);
+    h := ResolveWithin(h, Deadline);
     if h = '' then
       Exit;
   end;
   if not FillSockaddr(h, Port, sa, size) then
     Exit;
-  if sa[0] = 2 then
-  begin
-    Result := NetConnect((Integer(sa[4]) shl 24) or (Integer(sa[5]) shl 16) or (Integer(sa[6]) shl 8) or Integer(sa[7]), Port);
-    Exit;
-  end;
-  fd := Syscall(SnSocket, 10, 526337, 0);
-  if fd < 0 then
-    Exit;
-  n := Syscall(SnConnect, fd, @sa, size);
-  if n < 0 then
-  begin
-    if n <> -115 then
-    begin
-      n := Syscall(SnClose, fd);
-      Exit;
-    end;
-    n := WaitIo(fd, 4);
-    err := 0;
-    olen := 4;
-    n := Syscall(SnGetsockopt, fd, 1, 4, @err, @olen);
-    if (n < 0) or (err <> 0) then
-    begin
-      n := Syscall(SnClose, fd);
-      Exit;
-    end;
-  end;
-  SetNoDelay(fd);
-  Result := fd;
+  Result := ConnectSa(@sa, size, Deadline);
+end;
+
+function TcpConnectTo(const Host: string; Port: Integer): Integer;
+begin
+  Result := ConnectHost(Host, Port, 0);
+end;
+
+function TcpConnectToMs(const Host: string; Port, Ms: Integer): Integer;
+begin
+  Result := ConnectHost(Host, Port, PasIoDeadline(Ms));
 end;
 
 function TcpPeer(Fd: Integer): string;
@@ -1417,10 +1401,12 @@ end;
 
 { Host as a dotted quad: a literal is itself, else /etc/hosts, else the
   first nameserver of /etc/resolv.conf asked over UDP, two seconds and
-  two tries; '' when nothing knows it. }
-function Resolve(const Host: string): string;
+  two tries, each wait ending at Deadline (a Nanotime, 0 none) when it
+  comes first, and no try begun past it (P216); '' when nothing knows
+  it. Resolve is the same with no deadline. }
+function ResolveWithin(const Host: string; Deadline: Integer): string;
 var
-  ip4, fd, id, n, tries, port: Integer;
+  ip4, fd, id, n, tries, port, wait: Integer;
   ns, q, m, from: string;
 begin
   Result := '';
@@ -1450,10 +1436,18 @@ begin
   q := DnsQueryA(Host, id);
   for tries := 1 to 2 do
   begin
+    wait := PasIoDeadline(2000);
+    if Deadline > 0 then
+    begin
+      if Deadline - Nanotime <= 0 then
+        Break;
+      if Deadline < wait then
+        wait := Deadline;
+    end;
     n := UdpSendTo(fd, ns, 53, q);
     if n < 0 then
       Break;
-    m := UdpRecvFromMs(fd, 4096, 2000, from, port);
+    m := UdpRecvWithin(fd, 4096, wait, from, port);
     if m <> '' then
     begin
       Result := DnsAnswerA(m, id);
@@ -1464,6 +1458,10 @@ begin
   UdpClose(fd);
 end;
 
+function Resolve(const Host: string): string;
+begin
+  Result := ResolveWithin(Host, 0);
+end;
 
 { The name the first question of Msg asks, dots between its labels. }
 function DnsQuestionName(const Msg: string): string;
