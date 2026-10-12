@@ -198,6 +198,23 @@ const
   WorkerSize = 512;
   ObletSize = 131072;
   DefWorkers = 16;
+  { P219: a cycle starts with one worker for every MarkPerWorker bytes
+    the cycle before scanned, Go's scanWorkExpected (lastHeapScan,
+    lastStackScan and globalsScan, runtime/mgcpacer.go): the bytes alive
+    counted the strings, which nobody scans, and a store of 9 MB woke 15
+    workers for a mark one did in 245 us. A worker that has scanned
+    EnlistWeight blocks' weight in one run while nobody waits asks for
+    one more, and so does one that ends a root job while JobsPerEnlist
+    jobs for every worker asked for are still waiting. Measured: see
+    GC.md. }
+  MarkPerWorker = 32768;
+  EnlistWeight = 128;
+  JobsPerEnlist = 64;
+  { A worker with nothing spins MarkSpin times on Pause (about 64 cycles
+    each on Family 19h, AMD 56665 2.9.7) before it sleeps, as Go's lock
+    spins before futexsleep (runtime/lock_spinbit.go): a give right
+    after it ran out finds it awake. }
+  MarkSpin = 256;
   { A worker record: the routine record its checks read (guard at 16,
     M at 32, lock count at 184), then its grey stack (base, top, end),
     the blocks it queued this cycle and a count for its donations. }
@@ -206,6 +223,8 @@ const
   WEnd = 272;
   WMarked = 280;
   WPops = 288;
+  { the bytes it scanned this cycle: words of blocks, frames, ranges }
+  WScan = 296;
 
   { The tables block: the spans with free slots of each span class
     (the central lists), the free page runs by length (bucket 0 for 128
@@ -266,6 +285,10 @@ const
   MRecSize = 128;
   MCurG = 16;
   MFutex = 48;
+  { the marking (HMarkEpoch) this M last looked at: rt_gcwork writes it
+    before PasGcWorker; a wake that picked the M for a marking writes
+    its negative first (WakeIdle) }
+  MEpoch = 112;
   MState = 120;
   MsRun = 0;
   MsIdle = 1;
@@ -305,17 +328,25 @@ var
     table; the worker records; the jobs of the roots, MNJobs of them;
     MParallel when more than one worker may mark, and a mark bit is then
     set by compare and swap. PASLANG_GCWORKERS=n: at most n workers mark
-    a cycle, 0 every M; DefWorkers when it says nothing: past about 16
-    on a machine of 32 threads waking them cost more than they marked. }
+    a cycle, and never more than the Ps (HGcWant), 0 one for each P;
+    DefWorkers when it says nothing: past about 16 on a machine of 32
+    threads waking them cost more than they marked. }
   MBase, MEnd, MTable: Integer;
   MWorkers, MNJobs, MParallel, MMaxWorkers, MLastWorkers: Integer;
+  { the heap state, the most workers this cycle may mark with, and the
+    bytes the cycle before scanned (WScan) }
+  MMarkH0, MMarkBudget, MLastScan: Integer;
   MPadB: array[0..7] of Integer;
   { The next root job, handed out by an atomic add (P95d). }
   MMarkJob: Integer;
   MPadC: array[0..7] of Integer;
-  { MMarkActive workers mark and MMarkWait of them have nothing; one
-    may join while MMarkOpen, MMarkJoined have. }
+  { MMarkActive workers mark and MMarkWait of them have nothing, of
+    whom MMarkSleep sleep on MMarkSeq (P219); one may join while
+    MMarkOpen and while fewer than MMarkWant have (MMarkJoined);
+    MMarkDone once every worker in it had nothing and nothing was
+    shared. }
   MMarkActive, MMarkWait, MMarkOpen, MMarkJoined: Integer;
+  MMarkWant, MMarkSleep, MMarkSeq, MMarkDone: Integer;
   MPadD: array[0..7] of Integer;
   { The shared grey stack, under MShLock, takes what a busy worker gives
     to an idle one; MShCount blocks on it are not claimed yet. }
@@ -438,6 +469,15 @@ var
   r: Integer;
 begin
   r := Syscall(NrFutex, A, 129, 2147483647);
+end;
+
+{ FUTEX_WAKE_PRIVATE, at most N of those waiting on A: how many woke,
+  0 on an error. }
+function FutexWakeN(A, N: Integer): Integer;
+begin
+  Result := Syscall(NrFutex, A, 129, N);
+  if Result < 0 then
+    Result := 0;
 end;
 
 { A fatal error inside a cycle: Msg and a line feed on standard error,
@@ -1676,6 +1716,8 @@ begin
   b := MBase;
   e := MEnd;
   a := (Lo + 7) and (-8);
+  if Hi > a then
+    PInt(W + WScan)^ := PInt(W + WScan)^ + (Hi - a);
   while a + 8 <= Hi do
   begin
     v := PInt(a)^;
@@ -1692,6 +1734,7 @@ var
 begin
   b := MBase;
   e := MEnd;
+  PInt(W + WScan)^ := PInt(W + WScan)^ + N * 8;
   j := 0;
   while j * 64 < N do
   begin
@@ -1965,6 +2008,7 @@ begin
   ew := PInt(Typ)^ div 8;
   if ew <= 0 then
     Exit;
+  PInt(W + WScan)^ := PInt(W + WScan)^ + NWords * 8;
   { J0 is the word of the element at A: an oblet starts inside one. }
   j := J0 mod ew;
   for i := 0 to NWords - 1 do
@@ -2033,6 +2077,84 @@ begin
   MShEnd := r + nb;
 end;
 
+{ A worker that sleeps for blocks wakes (P219). The sleeper counts
+  itself in MMarkSleep and then looks at MShCount; a giver adds to
+  MShCount and then looks at MMarkSleep. With each side's add before its
+  load, one of them sees the other: a locked instruction is not
+  reordered with loads (Intel SDM vol. 3A 11.2.2), and on arm64 the
+  store-release of AtomicAdd's stlxr is observed before a later ldar
+  (Arm ARM B2.6.10). The sleeper read MMarkSeq before it counted itself
+  and the futex sleeps only while the word still holds that, so a wake
+  that moves it first is never lost. }
+procedure WakeSleeper;
+begin
+  AtomicAdd(@MMarkSeq, 1);
+  FutexWakeN(Integer(@MMarkSeq), 1);
+end;
+
+{ The marking is done: every sleeper wakes to see MMarkDone. The store
+  of MMarkDone and the add before the load of MMarkSleep order as the
+  sleeper's add and loads do (WakeSleeper), so with nobody counted
+  asleep nobody sleeps and no futex call is made. }
+procedure WakeAll;
+begin
+  AtomicAdd(@MMarkSeq, 1);
+  if AtomicLoad(MMarkSleep) > 0 then
+    FutexWake(Integer(@MMarkSeq));
+end;
+
+{ An idle M that has not looked at marking Ep, and that no other wake
+  picked for it, is picked by writing -Ep in its epoch word and woken on
+  its own futex word; rt_gcwork writes Ep when the M runs it. Without
+  the mark, a worker that asked for one more right after the cycle
+  started woke an M the cycle had just woken. Says whether one was
+  found. }
+function WakeIdle(H0, Ep: Integer): Boolean;
+var
+  allm, n, i, m, e: Integer;
+begin
+  Result := True;
+  allm := RdW(H0 + HAllM);
+  n := MCount(H0);
+  for i := 0 to n - 1 do
+  begin
+    m := allm + i * MRecSize;
+    if (RdW(m + MState) = MsIdleTaken) and (RdW(m + 32) <> 0) then
+    begin
+      e := RdW(m + MEpoch);
+      if (e <> Ep) and (e <> -Ep) then
+        if AtomicCas(PInt(m + MEpoch), e, -Ep) then
+        begin
+          FutexWake(m + MFutex);
+          Exit;
+        end;
+    end;
+  end;
+  Result := False;
+end;
+
+{ One more worker for the marking, while fewer than MMarkBudget may
+  join, as Go's putfull and balance call enlistWorker when they put work
+  on the global list (runtime/mgcwork.go, mgcpacer.go): an idle M first,
+  each on its own word, then a stopped one on HGcGen, where the Ms whose
+  system call came back during the cycle wait too and cannot mark. A
+  wake that reached nobody who joins only leaves MMarkWant above
+  MMarkJoined. Says whether it asked. }
+function Enlist: Boolean;
+var
+  w: Integer;
+begin
+  Result := False;
+  repeat
+    w := AtomicLoad(MMarkWant);
+    if w >= MMarkBudget then
+      Exit;
+  until AtomicCas(@MMarkWant, w, w + 1);
+  Result := True;
+  if not WakeIdle(MMarkH0, AtomicLoad(PInt(MMarkH0 + HMarkEpoch)^)) then
+    FutexWakeN(MMarkH0 + HGcGen, 1);
+end;
+
 { Give only when the lock is free: a worker that would wait for it
   scans on instead (another is giving already). What goes is the bottom
   of W's stack, the blocks pushed first: in a tree they are the roots of
@@ -2040,11 +2162,12 @@ end;
   The top, the deepest and smallest, was given first: a taker was done
   with it at once and waited again, and the workers spent their time
   handing blocks over. }
-procedure ShGive(W, K: Integer);
+function ShGive(W, K: Integer): Boolean;
 var
   n, g: Integer;
   src, dst: Pointer;
 begin
+  Result := False;
   if MShLock <> 0 then
     Exit;
   if not AtomicCas(@MShLock, 0, 1) then
@@ -2062,6 +2185,9 @@ begin
   dst := Pointer(g);
   Move(src^, dst^, n);
   PInt(W + WTop)^ := g + n;
+  if AtomicLoad(MMarkSleep) > 0 then
+    WakeSleeper;
+  Result := True;
 end;
 
 { The K blocks on top of W's stack go to the shared one whatever it
@@ -2071,7 +2197,7 @@ end;
   with 8. }
 procedure ShPut(W, K: Integer);
 var
-  t: Integer;
+  t, i: Integer;
   src, dst: Pointer;
 begin
   ShLock;
@@ -2084,6 +2210,16 @@ begin
   MShTop := MShTop + K * 8;
   AtomicAdd(@MShCount, K);
   ShUnlock;
+  { a sleeping worker takes them, and wakes the next (ShTake); with
+    none, one more worker for each oblet while the cycle may have more }
+  if AtomicLoad(MMarkSleep) > 0 then
+    WakeSleeper
+  else
+  begin
+    i := 0;
+    while (i < K) and Enlist do
+      i := i + 1;
+  end;
 end;
 
 function ShTake(W: Integer): Boolean;
@@ -2120,6 +2256,9 @@ begin
   Move(src^, dst^, k * 8);
   ShUnlock;
   PInt(W + WTop)^ := t + k * 8;
+  { what is left goes to the next sleeper, one wake at a time }
+  if (AtomicLoad(MShCount) > 0) and (AtomicLoad(MMarkSleep) > 0) then
+    WakeSleeper;
   Result := True;
 end;
 
@@ -2177,6 +2316,7 @@ begin
   e := MEnd;
   bit0 := (Obj - PInt(sp + SBase)^) shr 3;
   words := esz shr 3;
+  PInt(W + WScan)^ := PInt(W + WScan)^ + esz;
   for i := 0 to words - 1 do
   begin
     k := bit0 + i;
@@ -2198,14 +2338,17 @@ end;
   block they made Drain eleven times as slow with 13 workers as with
   one. By weight: an oblet of 128 KB is one block, and a worker that
   held oblets gave only every 16 of them, 4 ms, while the others
-  waited. }
+  waited. With nobody waiting, every EnlistWeight more asks for one more
+  worker and gives it half (P219): a cycle starts with the workers the
+  heap alive before it needs, and a heap that grew finds the rest so. }
 procedure Drain(W: Integer);
 var
-  o, t, n, c, nxt, k: Integer;
+  o, t, n, c, nxt, k, enl: Integer;
 begin
   c := 0;
   nxt := 16;
   k := 0;
+  enl := EnlistWeight;
   while PInt(W + WTop)^ > PInt(W + WGrey)^ do
   begin
     t := PInt(W + WTop)^ - 8;
@@ -2217,11 +2360,20 @@ begin
     begin
       nxt := c + 16;
       if MParallel <> 0 then
-        if (MMarkWait > 0) and (MShCount = 0) then
+        if MShCount = 0 then
         begin
           n := (PInt(W + WTop)^ - PInt(W + WGrey)^) div 8;
           if n >= 4 then
-            ShGive(W, n div 2);
+          begin
+            if MMarkWait > 0 then
+              ShGive(W, n div 2)
+            else if (c >= enl) and (MMarkWant < MMarkBudget) then
+            begin
+              enl := c + EnlistWeight;
+              if ShGive(W, n div 2) then
+                Enlist;
+            end;
+          end;
         end;
     end;
   end;
@@ -2289,10 +2441,17 @@ end;
 { A worker's marking: root jobs while there are, what it queued, then
   what others gave; with nothing left it waits, and the marking ends
   when every worker in it waits and nothing is shared (Go's gcDrain and
-  its nwait). }
+  its nwait). The worker that finds it so says MMarkDone for all, as
+  Go's last worker calls gcMarkDone (gcEndWork, runtime/mgc.go); each
+  still looks at the shared stack first. A worker waits asleep on
+  MMarkSeq, which a give moves (P219): it spun on Pause, and the workers
+  that small cycles woke for nothing took the CPU, store1 under
+  PASLANG_GCSTRESS 858 s of it in 140 s. While JobsPerEnlist root jobs
+  for every worker asked for wait and nobody does, a worker that ends
+  one asks for one more. }
 procedure MarkWork(H0, W: Integer);
 var
-  j: Integer;
+  j, s, spin: Integer;
 begin
   while True do
   begin
@@ -2304,43 +2463,78 @@ begin
       MarkJob(H0, W, j);
       PInt(W + WMarked)^ := PInt(W + WMarked)^ + 1;
       Drain(W);
+      if (MParallel <> 0) and (MMarkWait = 0) and (MMarkWant < MMarkBudget) and
+         (MNJobs - MMarkJob >= JobsPerEnlist * MMarkWant) then
+        Enlist;
       Continue;
     end;
     Drain(W);
     if ShTake(W) then
       Continue;
     AtomicAdd(@MMarkWait, 1);
+    spin := 0;
     while True do
     begin
-      if MShCount > 0 then
+      if AtomicLoad(MShCount) > 0 then
       begin
         AtomicAdd(@MMarkWait, -1);
         if ShTake(W) then
           Break;
         AtomicAdd(@MMarkWait, 1);
-      end
-      else if MMarkWait >= MMarkActive then
+        Continue;
+      end;
+      if AtomicLoad(MMarkDone) <> 0 then
       begin
         AtomicAdd(@MMarkWait, -1);
         Exit;
       end;
-      Pause;
+      if AtomicLoad(MMarkWait) >= AtomicLoad(MMarkActive) then
+      begin
+        AtomicStore(MMarkDone, 1);
+        WakeAll;
+        AtomicAdd(@MMarkWait, -1);
+        Exit;
+      end;
+      if spin < MarkSpin then
+      begin
+        spin := spin + 1;
+        Pause;
+        Continue;
+      end;
+      s := AtomicLoad(MMarkSeq);
+      AtomicAdd(@MMarkSleep, 1);
+      if (AtomicLoad(MShCount) = 0) and (AtomicLoad(MMarkDone) = 0) and
+         (AtomicLoad(MMarkWait) < AtomicLoad(MMarkActive)) then
+        FutexWait(Integer(@MMarkSeq), s, 0);
+      AtomicAdd(@MMarkSleep, -1);
     end;
   end;
 end;
 
-{ W joins the marking while it is open, and while fewer than
-  PASLANG_GCWORKERS have (the cycle's own M has its place already). }
+{ W joins the marking while it is open, and while fewer than MMarkWant
+  have (the cycle's own M has its place already), MMarkBudget at most.
+  An M turned away for room forgets the marking, so that a worker that
+  asks for one more may wake it again (WakeIdle). The last to leave
+  wakes the cycle's M if it waits for it (P219). }
 procedure JoinMark(H0, W: Integer);
+var
+  j: Integer;
 begin
-  if MMarkOpen <> 0 then
-    if (MMaxWorkers <= 0) or (AtomicAdd(@MMarkJoined, 1) <= MMaxWorkers) then
+  if AtomicLoad(MMarkOpen) = 0 then
+    Exit;
+  repeat
+    j := AtomicLoad(MMarkJoined);
+    if j >= AtomicLoad(MMarkWant) then
     begin
-      AtomicAdd(@MMarkActive, 1);
-      if MMarkOpen <> 0 then
-        MarkWork(H0, W);
-      AtomicAdd(@MMarkActive, -1);
+      WrW(RdW(W + 32) + MEpoch, 0);
+      Exit;
     end;
+  until AtomicCas(@MMarkJoined, j, j + 1);
+  AtomicAdd(@MMarkActive, 1);
+  if AtomicLoad(MMarkOpen) <> 0 then
+    MarkWork(H0, W);
+  if AtomicAdd(@MMarkActive, -1) = 0 then
+    FutexWake(Integer(@MMarkActive));
 end;
 
 { An M that waits for a cycle to end marks with it (rt_gcwork, on its
@@ -2384,13 +2578,20 @@ begin
 end;
 
 { The marking of a cycle (P95d): the jobs, the counts, the shared stack
-  empty; open; a new phase that every M waiting for this cycle looks
-  for, a stopped one on HGcGen and an idle one on its own futex word;
-  this cycle's M marks too; closed, and done when no worker is left in
-  it. MLastWorkers counts the workers that scanned anything. }
+  empty; open; a new phase that the Ms waiting for this cycle look for,
+  an idle one on its own futex word and a stopped one on HGcGen; this
+  cycle's M marks too; closed, and done when no worker is left in it.
+  MLastWorkers counts the workers that scanned anything, MLastScan the
+  bytes they scanned. P219: only the workers the cycle before's scan
+  keeps busy are woken, one for every MarkPerWorker bytes it scanned
+  (the cycle's M is one of them), HGcWant at most, and a worker with
+  more asks for others (Enlist). Every stopped M
+  was woken, and every idle one up to HGcWant, and those with nothing
+  spun on Pause until the end. The cycle's M waits for the last worker
+  to leave as a worker waits for blocks: it spins, then sleeps. }
 procedure MarkAll(H0: Integer);
 var
-  me, allm, n, i, m, w: Integer;
+  me, allm, n, i, w, want, ep, a, spin: Integer;
 begin
   allm := RdW(H0 + HAllM);
   n := MCount(H0);
@@ -2399,44 +2600,66 @@ begin
   MMarkJob := 0;
   MMarkWait := 0;
   MMarkJoined := 1;
+  MMarkSleep := 0;
+  MMarkDone := 0;
+  MMarkH0 := H0;
   MShTop := MSh;
   MShCount := 0;
   for i := 0 to n - 1 do
   begin
     PInt(MWorkers + i * WorkerSize + WMarked)^ := 0;
     PInt(MWorkers + i * WorkerSize + WPops)^ := 0;
+    PInt(MWorkers + i * WorkerSize + WScan)^ := 0;
   end;
   MParallel := 0;
   if (RdW(H0 + HGcWant) > 1) and ((RdW(H0 + HRtCaps) and 2) <> 0) and (MMaxWorkers <> 1) then
     MParallel := 1;
+  want := 1;
+  MMarkBudget := 1;
+  if MParallel <> 0 then
+  begin
+    MMarkBudget := RdW(H0 + HGcWant);
+    want := MLastScan div MarkPerWorker + 1;
+    if want > MMarkBudget then
+      want := MMarkBudget;
+  end;
+  MMarkWant := want;
   AtomicAdd(@MMarkOpen, 1);
   if MParallel <> 0 then
   begin
-    AtomicAdd(PInt(H0 + HMarkEpoch), 1);
-    FutexWake(H0 + HGcGen);
-    { Idle Ms sleep on their own word: as many as may join. }
+    ep := AtomicAdd(PInt(H0 + HMarkEpoch), 1);
     w := 1;
-    for i := 0 to n - 1 do
-    begin
-      m := allm + i * MRecSize;
-      if (RdW(m + MState) = MsIdleTaken) and (RdW(m + 32) <> 0) and
-         (w < RdW(H0 + HGcWant)) then
-      begin
-        FutexWake(m + MFutex);
-        w := w + 1;
-      end;
-    end;
+    while (w < want) and WakeIdle(H0, ep) do
+      w := w + 1;
+    if w < want then
+      FutexWakeN(H0 + HGcGen, want - w);
   end;
   AtomicAdd(@MMarkActive, 1);
   MarkWork(H0, MWorkers + me * WorkerSize);
   AtomicAdd(@MMarkActive, -1);
   AtomicAdd(@MMarkOpen, -1);
-  while MMarkActive > 0 do
-    Pause;
+  spin := 0;
+  while True do
+  begin
+    a := AtomicLoad(MMarkActive);
+    if a = 0 then
+      Break;
+    if spin < MarkSpin then
+    begin
+      spin := spin + 1;
+      Pause;
+      Continue;
+    end;
+    FutexWait(Integer(@MMarkActive), a, 0);
+  end;
   w := 0;
+  MLastScan := 0;
   for i := 0 to n - 1 do
+  begin
     if PInt(MWorkers + i * WorkerSize + WMarked)^ > 0 then
       w := w + 1;
+    MLastScan := MLastScan + PInt(MWorkers + i * WorkerSize + WScan)^;
+  end;
   MLastWorkers := w;
 end;
 

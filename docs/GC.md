@@ -401,7 +401,57 @@ The sweep stays on the cycle's M: 0.2 ms after one worker, 0.6–0.9
 after many, since the mark bits it reads were written on other cores.
 While the heap grows, waking 31 threads for small cycles costs more
 than they mark, so a cycle takes at most 16 unless `PASLANG_GCWORKERS`
-says otherwise (0 every M).
+says otherwise, never more than the Ps (0 one for each P).
+
+Until P219 every cycle woke all of them, and a worker with nothing spun
+on `pause` until the end: 2000 cycles of a heap of 64 KB took 1.4–1.6 s
+of CPU in 130–150 ms, and `store1` under `PASLANG_GCSTRESS` 858 s in
+140 s. Now a cycle wakes one worker for every 32 KB the cycle before
+scanned (the cycle's M is one of them), as Go's pacer expects the scan
+work of the last cycle (`scanWorkExpected`, `runtime/mgcpacer.go`): an
+idle M first, each on its own futex word, then a stopped one. By the
+bytes alive, `store1` under stress, 9 MB of mostly strings, which
+nobody scans, woke 15 workers for a mark that one did in 245 µs; by the
+bytes scanned it wakes 4. A worker that has scanned 128
+blocks' weight while nobody waits gives half of its stack and asks for
+one more, as Go's `putfull` and `balance` call `enlistWorker`
+(`runtime/mgcwork.go`); one that puts oblets on the shared stack asks
+for one for each, and one that ends a root job while 64 jobs for every
+worker asked for still wait asks for one. A worker with nothing spins
+256 times on `pause` and then sleeps on a futex word that every give
+moves; the last to find nothing says that the marking is done, as Go's
+last worker calls `gcMarkDone`. The mark of a cycle (`HeapStat(17)`,
+averaged over 50 or 20 cycles) and the process's CPU against the wall
+clock, the median of seven interleaved runs (five for the routines,
+three for the large heaps), on the development machine as it is used:
+
+| heap | before | after |
+|---|---|---|
+| trees, 53 KB alive | 160 µs, 12.0× | 40 µs, 2.8× |
+| trees, 101 KB | 100 µs, 11.1× | 52 µs, 4.7× |
+| trees, 196 KB | 169 µs, 12.5× | 95 µs, 6.6× |
+| trees, 388 KB | 115 µs, 12.1× | 104 µs, 10.3× |
+| trees, 772 KB | 402 µs, 12.2× | 188 µs, 9.7× |
+| trees, 3 MB | 561 µs, 12.7× | 563 µs, 11.0× |
+| 100 routines, each with a small tree | 40 µs, 10.5× | 48 µs, 1.8× |
+| 1000 routines | 404 µs, 13.1× | 328 µs, 8.6× |
+| 20 000 routines | 5.7 ms | 5.4 ms |
+| a million strings in a map, 68 MB | 10.4 ms | 9.6 ms |
+| 16 trees and 500 000 strings, 39 MB | 5.1 ms | 5.1 ms |
+| 4 million strings in an array, 122 MB | 8.4 ms | 8.4 ms |
+
+The fastest run of each, which needs the machine idle, still favours
+the old way where little is scanned: 31, 39 and 56 µs against 36, 51
+and 76 µs for the trees of 53 to 196 KB, since every worker was awake
+from the start, and 468 against 533 µs for 3 MB, where a worker that
+slept has to be woken; it spent four to twelve times the CPU for that,
+and its medians spread from 40 to 670 µs. A worker that spins without
+end gets the 3 MB back (464 µs) and loses the median (660 µs); waking
+every worker as before but letting them sleep doubled the CPU of the
+small cycles; a spin of 1024 was no faster than one of 256, and a
+worker for every 16 KB or 64 KB no better than for every 32 KB. 2000
+cycles of a list of 64 KB, which one worker marks alone, take 106–114
+ms and 1.2 times as much CPU, against 139–142 ms and 11 times before.
 
 The first version shared badly and was measured before it was kept.
 16 workers marked the trees only 5 times as fast as one: a worker gave

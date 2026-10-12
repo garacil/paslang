@@ -10692,9 +10692,12 @@ stop, mark and sweep in nanoseconds. Scheduler observations 20, 21 and
 syscall Ms whose P was retaken, and Ps. They work with GC off and are
 live observations, not one atomic snapshot. The marking is shared: the threads
 the cycle stopped and the idle ones take the roots in turn and give
-each other what they still have to scan, at most 16 of them, since
-past that waking them costs more than they mark; `PASLANG_GCWORKERS=n`
-sets another limit, 0 every thread, 1 the cycle's thread alone.
+each other what they still have to scan. A cycle wakes one of them for
+every 32 KB the cycle before scanned, a thread that has more than it
+can scan soon asks for another, and one with nothing sleeps until there
+is some. At most 16 of them mark, since past that waking them costs
+more than they mark; `PASLANG_GCWORKERS=n` sets another limit, never
+above the number of Ps, 0 one for each P, 1 the cycle's thread alone.
 `FreeMem` does nothing: a block goes
 when nothing points to it any more. An `Integer` holding an address
 does not keep a block alive, as in Go; keep the pointer too.

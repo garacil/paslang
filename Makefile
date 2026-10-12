@@ -654,6 +654,15 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  diff -u testdata/lazym.out $(BUILDDIR)/lazym.got; \
 	done; \
 	echo ok lazym; \
+	echo "==== idle mark workers (P219) ===="; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/markidle testdata/markidle.paslang; \
+	for w in "" PASLANG_GC=off PASLANG_GCWORKERS=1 PASLANG_GCWORKERS=0; do \
+	  env $$w timeout 120 $(BUILDDIR)/markidle > $(BUILDDIR)/markidle.got; \
+	  diff -u testdata/markidle.out $(BUILDDIR)/markidle.got; \
+	done; \
+	taskset -c 0 timeout 120 $(BUILDDIR)/markidle > $(BUILDDIR)/markidle.got; \
+	diff -u testdata/markidle.out $(BUILDDIR)/markidle.got; \
+	echo ok markidle; \
 	echo "==== alloc bits ===="; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/allocbits testdata/allocbits.paslang; \
 	for w in "" PASLANG_GCPOISON=1 "PASLANG_GCSTRESS=50 PASLANG_GCPOISON=1" "PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=10 PASLANG_GCPOISON=1" PASLANG_GC=off; do \
@@ -2627,9 +2636,8 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	diff -u testdata/mapsplit.out $(BUILDDIR)/mapsplit-arm.got; \
 	echo ok collector-arm; \
 	echo "==== stack maps arm64 ===="; \
-	: store1 takes 620 s here, 1.1.95 as 1.1.96, its mark workers spinning between small cycles, 460 s with one: 1200 until P219; \
 	for t in $(GOLDEN_A64); do \
-	  PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=3 PASLANG_GCPOISON=1 timeout 1200 $(QEMU_A64) $(BUILDDIR)/$$t-arm > $(BUILDDIR)/$$t-arm.vgot; \
+	  PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=3 PASLANG_GCPOISON=1 timeout 600 $(QEMU_A64) $(BUILDDIR)/$$t-arm > $(BUILDDIR)/$$t-arm.vgot; \
 	  diff -u testdata/$$t.out $(BUILDDIR)/$$t-arm.vgot; \
 	done; \
 	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 timeout 600 $(QEMU_A64) $(BUILDDIR)/stackmap-arm > $(BUILDDIR)/stackmap-arm.vgot; \
@@ -2654,6 +2662,15 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	  diff -u testdata/lazym.out $(BUILDDIR)/lazym-arm.got; \
 	done; \
 	echo ok lazym-arm; \
+	echo "==== idle mark workers arm64 (P219) ===="; \
+	$(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/markidle-arm testdata/markidle.paslang; \
+	for w in "" PASLANG_GC=off PASLANG_GCWORKERS=1; do \
+	  env $$w timeout 600 $(QEMU_A64) $(BUILDDIR)/markidle-arm > $(BUILDDIR)/markidle-arm.got; \
+	  diff -u testdata/markidle.out $(BUILDDIR)/markidle-arm.got; \
+	done; \
+	taskset -c 0 timeout 600 $(QEMU_A64) $(BUILDDIR)/markidle-arm > $(BUILDDIR)/markidle-arm.got; \
+	diff -u testdata/markidle.out $(BUILDDIR)/markidle-arm.got; \
+	echo ok markidle-arm; \
 	echo "==== alloc bits arm64 ===="; \
 	$(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/allocbits-arm testdata/allocbits.paslang; \
 	for w in "" PASLANG_GCPOISON=1 "PASLANG_GCSTRESS=50 PASLANG_GCPOISON=1" "PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=50 PASLANG_GCPOISON=1" PASLANG_GC=off; do \
