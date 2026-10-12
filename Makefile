@@ -1950,6 +1950,8 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	python3 scripts/check_syscalls.py "$(OUTDIR)/paslangc" "$(BUILDDIR)" $(QEMU_A64); \
 	: the standard streams keep the flags the program found, P217; \
 	python3 scripts/check_stdstreams.py "$(OUTDIR)/paslangc" "$(BUILDDIR)" $(QEMU_A64); \
+	: an alignment the emitter writes means bytes on both machines, P218; \
+	python3 scripts/check_align.py "$(OUTDIR)/paslangc" "$(BUILDDIR)" $(QEMU_A64) $(CORE_UNITS); \
 	python3 scripts/check_sysutils.py "$(OUTDIR)/paslangc" "$(BUILDDIR)" $(QEMU_A64); \
 	python3 scripts/check_currency_language.py "$(OUTDIR)/paslangc" "$(BUILDDIR)" $(QEMU_A64); \
 	for level in 0 40; do \
