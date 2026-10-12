@@ -22,6 +22,8 @@
   scripts/bench/run.py -n 5       five runs per program (default 3), median reported
   scripts/bench/run.py --scale F  every budget times F (F < 1 shows a failing run)
   scripts/bench/run.py --json P   write every number and the machine's details to P
+  scripts/bench/run.py --cpu base build the paslang side for these processors only
+                                  (comma-separated; default native,base: Regla 12)
 
 After the table, the pairs in CHECKPTR run again built with paslangc -checkptr
 (P104): the line gives that build's time as a multiple of the plain one, held
@@ -30,9 +32,18 @@ to CHECKPTR_BUDGET, and its output must be the same.
 make bench runs it with this tree's bin/paslangc first on the PATH (P89).
 
 Each pair is one .paslang and one .go with the same work. The .paslang is compiled
-with the paslangc on the PATH, the .go with go (its cache under build/gocache).
-The table prints median wall time, resident memory (ru_maxrss of that process)
-and the ratio paslang / Go. Exit status is 1 when a time ratio passes its budget
+with the paslangc on the PATH, once with -cpu native and once with -cpu base
+(build/bench/NAME.pl and NAME.base.pl), the .go with go (its cache under
+build/gocache); each build is held to the same budgets. The native build
+runs against Go as it ships (GOAMD64=v1, its libraries choosing the
+processor's extensions when they run); the base build against the same Go
+binary run with GODEBUG=cpu.all=off, which turns every optional extension
+off (internal/cpu processOptions), so both run on the base processor.
+The two programs of a pair run in rounds, alternating which runs first. The
+table prints each side's median wall time, the median of the rounds' ratios
+paslang / Go (the time verdict), the median peak resident memory (VmHWM as
+the program exits, scripts/bench/peak.py, over MEM_RUNS runs apart from the
+timed ones) and its ratio. Exit status is 1 when a time ratio passes its budget
 in BUDGET, when paslang's peak resident memory passes MEM_BUDGET times Go's, or
 when the outputs differ. Budgets are today's numbers rounded up; they go down as
 milestones close. The numbers come from a run, never from memory.
@@ -43,40 +54,39 @@ import sys
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+from peak import peak_kib  # noqa: E402
 ROOT = os.path.dirname(os.path.dirname(HERE))
 OUT = os.path.join(ROOT, "build", "bench")
 PAIRS = ["b1loop", "b2str", "b3spawn", "b4chan", "b5map", "b6smap", "b7narrow", "b8ptr",
          "b9hash", "b10rot", "b11tree"]
 CHECKPTR = ["b8ptr"]
 PROBES = ["p1alloccap", "p2deeprec", "p3divzero", "p4nil", "p5bounds", "p6strbounds", "p7parked"]
-# paslang / Go wall-time ratio allowed, per pair: today's numbers rounded up,
-# lowered as milestones close (P90 took b4chan to 0.4; P93, P94, P96 and P98 took
-# b1loop to 1.0, b2str to 0.9, b5map and b3spawn to 0.8 and b4chan to 0.2 on
-# 2026-09-26, 1.0.52). The margin above 1.0 is the noise of a shared machine.
-# P89 (1.0.72): with P90 to P98 closed every pair is at parity or better, so the
-# budgets are 1.0 and the noise of a shared machine (runs vary by 10 to 30%
-# here): 1.1, medians of seven runs under make bench. b4chan stays at 0.5 to
-# keep what it won (0.3 today); b6smap, 0.8 to 1.0 today, is held at 1.1.
-BUDGET = {"b1loop": 1.1, "b2str": 1.1, "b3spawn": 1.1, "b4chan": 0.5, "b5map": 1.1, "b6smap": 1.1,
-          # P100 (1.0.96): narrow code, at 1.1 since P100 closed (1.0.105:
-          # 0.82 of Go's cycles, the instructions Go runs and its loops aligned).
-          "b7narrow": 1.1,
-          # P104 (1.0.111): pointer walks and a linked list, 0.93 of Go's
-          # cycles (Go walks the block as a slice).
-          "b8ptr": 1.1,
-          # 1.1.1 (2026-09-29, docs/BENCH-2026-09-29.md): the hash kernels
-          # at Go's time after the const parameters stopped being copied;
-          # the rotations of a xoshiro256** stream at 1.47 (the loop keeps
-          # six variables in registers and has eight) and the ordered
-          # tree at 1.31 of the same B+ tree in Go (the leaf's key layout,
-          # the calls P112 removes): today's numbers rounded up, to go
-          # down with P113.
-          "b9hash": 1.1, "b10rot": 1.5, "b11tree": 1.4}
+# paslang / Go time allowed, per pair: the median of the rounds' ratios (P223,
+# Regla 12: faster than Go in everything, so every budget is below 1.00 and a
+# pair Go wins or ties fails make bench). The history: 1.1 for most pairs from
+# P89 (1.0.72) to P223, the noise of medians of separate runs on a shared
+# machine; 1.5 for b10rot and 1.4 for b11tree from 1.1.1. A pair that wins
+# keeps what it won: today's ratio rounded up (2026-10-12, 1.1.106, forty
+# alternating rounds, native and base: b3spawn 0.67/0.65, b4chan 0.22/0.23,
+# b7narrow 0.85/0.86, b11tree 0.85/0.83). A pair at parity or behind is held
+# at 0.99, and its hito takes it under (b1loop 0.98/0.995, b2str 1.29/1.24,
+# b5map 1.00/0.95, b6smap 0.99/0.99, b8ptr 1.08/1.07, b9hash 1.01/2.44,
+# b10rot 1.43/1.43).
+BUDGET = {"b1loop": 0.99, "b2str": 0.99, "b3spawn": 0.90, "b4chan": 0.30, "b5map": 0.99,
+          "b6smap": 0.99, "b7narrow": 0.90, "b8ptr": 0.99, "b9hash": 0.99, "b10rot": 0.99,
+          "b11tree": 0.95}
 # paslangc -checkptr / the plain build, per pair in CHECKPTR (P104).
 CHECKPTR_BUDGET = {"b8ptr": 10.0}
-# Peak resident memory, paslang / Go: at most Go's and the same margin (every
-# pair is at or under Go's today: 12/12, 12/12, 12/26, 12/12, 48/52, 115/121 MB).
-MEM_BUDGET = 1.1
+# Peak resident memory, paslang / Go, the medians of MEM_RUNS traced runs:
+# below Go's in every pair (P223). Before P223 it read 1.1, and the small
+# pairs' numbers were Python's own size (peak.py says why).
+MEM_BUDGET = 0.99
+# Runs of each program for its memory, traced to read VmHWM as it exits:
+# a small program's peak moves by 2 MiB from one run to the next on a
+# system with transparent huge pages always on (0, 1 or 2 of them under
+# a 276 KiB paslang program, as its regions fall with ASLR; Go's alike).
+MEM_RUNS = 5
 
 
 def sh(cmd, env=None, cwd=ROOT):
@@ -85,10 +95,15 @@ def sh(cmd, env=None, cwd=ROOT):
         sys.exit(f"{' '.join(cmd)}\n{p.stderr}")
 
 
-def build(name, go=True):
+def pl_path(name, cpu, ext=".pl"):
+    """The paslang build of a pair for a processor: NAME.pl for native, NAME.base.pl for base."""
+    return os.path.join(OUT, name + ("" if cpu == "native" else "." + cpu) + ext)
+
+
+def build(name, go=True, cpu="native"):
     os.makedirs(OUT, exist_ok=True)
     # paslangc makes a build/ under its cwd, so it runs from the root, where one belongs.
-    sh(["paslangc", "-o", os.path.join(OUT, name + ".pl"), os.path.join(HERE, name + ".paslang")])
+    sh(["paslangc", "-cpu", cpu, "-o", pl_path(name, cpu), os.path.join(HERE, name + ".paslang")])
     if go:
         env = dict(os.environ)
         env.setdefault("HOME", OUT)
@@ -106,29 +121,79 @@ def build(name, go=True):
             sys.exit(p.stderr)
 
 
-def run(exe, n):
-    """Median wall seconds, peak resident MB, exit status, first output line."""
-    walls, rss, status, first = [], 0, 0, ""
-    for _ in range(n):
-        so = open(os.path.join(OUT, "stdout"), "w+")
-        se = open(os.path.join(OUT, "stderr"), "w+")
-        t = time.perf_counter()
-        p = subprocess.Popen([exe], stdout=so, stderr=se)
-        _, st, ru = os.wait4(p.pid, 0)
-        walls.append(time.perf_counter() - t)
-        rss = max(rss, ru.ru_maxrss / 1024)
-        status = st >> 8 if st & 0xff == 0 else -(st & 0x7f)
-        so.seek(0); se.seek(0)
-        out = so.read().strip().splitlines()
-        err = se.read().strip().splitlines()
-        first = (out[0] if out else "") + ((" | " + err[0]) if err else "")
-        so.close(); se.close()
-    walls.sort()
-    LAST_WALLS[exe] = list(walls)
-    return walls[len(walls) // 2], rss, status, first
+def go_env(cpu):
+    """The environment Go runs in for a paslang build of cpu: the base
+    processor turns off every extension Go would choose when it runs."""
+    if cpu == "base":
+        return dict(os.environ, GODEBUG="cpu.all=off")
+    return None
 
 
+def peak_mb(exe, env=None, runs=MEM_RUNS):
+    """Median peak resident MB of runs traced runs (peak.py), and all of them."""
+    peaks = []
+    with open(os.devnull, "w") as null:
+        for _ in range(runs):
+            kib, _ = peak_kib([exe], env=env, stdout=null.fileno(), stderr=null.fileno())
+            peaks.append(kib / 1024)
+    peaks.sort()
+    return peaks[len(peaks) // 2], peaks
+
+
+def once(exe, env=None):
+    """Wall seconds, exit status and first output line of one run."""
+    so = open(os.path.join(OUT, "stdout"), "w+")
+    se = open(os.path.join(OUT, "stderr"), "w+")
+    t = time.perf_counter()
+    p = subprocess.Popen([exe], stdout=so, stderr=se, env=env)
+    _, st = os.waitpid(p.pid, 0)
+    wall = time.perf_counter() - t
+    status = st >> 8 if st & 0xff == 0 else -(st & 0x7f)
+    so.seek(0); se.seek(0)
+    out = so.read().strip().splitlines()
+    err = se.read().strip().splitlines()
+    so.close(); se.close()
+    return wall, status, (out[0] if out else "") + ((" | " + err[0]) if err else "")
+
+
+def alternate(a, b, n, env_a=None, env_b=None):
+    """n rounds of the programs a and b, alternating which runs first.
+    Gives each side's median wall seconds, exit status and first line
+    (the first line that differs from the first run's, or a status that
+    is not 0, when one does), and the median of the rounds' ratios, b's
+    time over a's. On a machine that runs anything else a median of
+    separate runs moved by up to 30 % from one batch to the next; a
+    round's two programs share the machine's state of that moment."""
+    wa, wb, ratios = [], [], []
+    sa, oa, sb, ob = 0, None, 0, None
+    for r in range(n):
+        if r % 2 == 0:
+            ta, xa, ya = once(a, env_a)
+            tb, xb, yb = once(b, env_b)
+        else:
+            tb, xb, yb = once(b, env_b)
+            ta, xa, ya = once(a, env_a)
+        wa.append(ta)
+        wb.append(tb)
+        ratios.append(tb / ta if ta > 0 else float("inf"))
+        sa = sa or xa
+        sb = sb or xb
+        oa = ya if oa is None or ya != oa else oa
+        ob = yb if ob is None or yb != ob else ob
+    LAST_WALLS[a] = sorted(wa)
+    LAST_WALLS[b] = sorted(wb)
+    LAST_RATIOS[(a, b)] = list(ratios)
+    return (median(wa), sa, oa), (median(wb), sb, ob), median(ratios)
+
+
+def median(xs):
+    xs = sorted(xs)
+    return xs[len(xs) // 2] if len(xs) % 2 else (xs[len(xs) // 2 - 1] + xs[len(xs) // 2]) / 2
+
+
+LAST_RATIOS = {}
 LAST_WALLS = {}
+LAST_PEAKS = {}
 
 
 def machine():
@@ -174,19 +239,17 @@ def machine():
     return info
 
 
-def checkptr(n, scale):
+def checkptr(n, scale, cpu):
     """The pairs in CHECKPTR built with -checkptr: time over the plain build's."""
     bad = 0
     for b in CHECKPTR:
-        sh(["paslangc", "-checkptr", "-o", os.path.join(OUT, b + ".cp"), os.path.join(HERE, b + ".paslang")])
-        pw, _, ps, pl_out = run(os.path.join(OUT, b + ".pl"), n)
-        cw, _, cs, cp_out = run(os.path.join(OUT, b + ".cp"), n)
-        ratio = cw / pw if pw > 0 else float("inf")
+        sh(["paslangc", "-cpu", cpu, "-checkptr", "-o", pl_path(b, cpu, ".cp"), os.path.join(HERE, b + ".paslang")])
+        (pw, ps, pl_out), (cw, cs, cp_out), ratio = alternate(pl_path(b, cpu), pl_path(b, cpu, ".cp"), n)
         budget = CHECKPTR_BUDGET[b] * scale
         same = "yes" if (cp_out == pl_out and cs == 0 and ps == 0) else f"NO ({cp_out!r} vs {pl_out!r})"
         flag = "  OVER BUDGET" if ratio > budget else ""
         bad += bool(flag) or same != "yes"
-        print(f"{b:10s} -checkptr {cw:7.3f} s, {ratio:5.1f} times the plain build (budget {budget:.1f})  same output: {same}{flag}")
+        print(f"{b:10s} {cpu:6s} -checkptr {cw:7.3f} s, {ratio:5.1f} times the plain build (budget {budget:.1f})  same output: {same}{flag}")
     return bad
 
 
@@ -194,53 +257,65 @@ def probes():
     print(f"{'probe':12s} {'status':>7s}  message")
     for p in PROBES:
         build(p, go=False)
-        w, r, st, first = run(os.path.join(OUT, p + ".pl"), 1)
+        w, st, first = once(os.path.join(OUT, p + ".pl"))
         print(f"{p:12s} {st:7d}  {first}")
 
 
 def main():
+    # One line as each pair is measured, also into a file (make bench > log).
+    sys.stdout.reconfigure(line_buffering=True)
     n = 3
     scale = 1.0
     args = sys.argv[1:]
     json_path = ""
-    while args[:1] in (["-n"], ["--scale"], ["--json"]):
+    cpus = ["native", "base"]
+    while args[:1] in (["-n"], ["--scale"], ["--json"], ["--cpu"]):
         if args[0] == "-n":
             n = int(args[1])
         elif args[0] == "--json":
             json_path = args[1]
+        elif args[0] == "--cpu":
+            cpus = args[1].split(",")
         else:
             scale = float(args[1])
         args = args[2:]
-    record = {"machine": machine(), "runs_per_program": n, "scale": scale, "pairs": [], "checkptr": []}
+    record = {"machine": machine(), "runs_per_program": n, "scale": scale, "cpus": cpus, "pairs": [], "checkptr": []}
     if args == ["probes"]:
         probes()
         return
     bad = 0
-    print(f"{'pair':10s} {'go s':>7s} {'paslang s':>10s} {'ratio':>6s} {'budget':>7s} "
+    print(f"{'pair':10s} {'cpu':6s} {'go s':>7s} {'paslang s':>10s} {'ratio':>6s} {'budget':>7s} "
           f"{'go MB':>6s} {'pl MB':>6s} {'mem':>5s}  same output")
-    for b in PAIRS:
-        build(b)
-        gw, gr, gs, go_out = run(os.path.join(OUT, b + ".go.bin"), n)
-        pw, pr, ps, pl_out = run(os.path.join(OUT, b + ".pl"), n)
-        ratio = pw / gw if gw > 0 else float("inf")
-        mem = pr / gr if gr > 0 else float("inf")
-        budget = BUDGET[b] * scale
-        same = "yes" if (go_out == pl_out and gs == 0 and ps == 0) else f"NO ({pl_out!r} vs {go_out!r})"
-        flag = ""
-        if ratio > budget:
-            flag += "  OVER BUDGET"
-        if mem > MEM_BUDGET * scale:
-            flag += "  OVER MEMORY"
-        bad += bool(flag) or same != "yes"
-        print(f"{b:10s} {gw:7.3f} {pw:10.3f} {ratio:6.2f} {budget:7.2f} {gr:6.0f} {pr:6.0f} {mem:5.2f}  {same}{flag}")
-        record["pairs"].append({"pair": b, "go": {"median_s": gw, "walls_s": LAST_WALLS.get(os.path.join(OUT, b + ".go.bin"), []),
-                                                  "peak_rss_mb": gr, "status": gs, "output": go_out},
-                                "paslang": {"median_s": pw, "walls_s": LAST_WALLS.get(os.path.join(OUT, b + ".pl"), []),
-                                            "peak_rss_mb": pr, "status": ps, "output": pl_out},
-                                "ratio_time": ratio, "ratio_mem": mem, "budget": budget, "same_output": same == "yes",
-                                "over": flag.strip()})
+    for cpu in cpus:
+        for b in PAIRS:
+            build(b, go=(cpu == cpus[0]), cpu=cpu)
+            gexe, pexe = os.path.join(OUT, b + ".go.bin"), pl_path(b, cpu)
+            (gw, gs, go_out), (pw, ps, pl_out), ratio = alternate(gexe, pexe, n, go_env(cpu))
+            gr, LAST_PEAKS[gexe] = peak_mb(gexe, go_env(cpu))
+            pr, LAST_PEAKS[pexe] = peak_mb(pexe)
+            mem = pr / gr if gr > 0 else float("inf")
+            budget = BUDGET[b] * scale
+            same = "yes" if (go_out == pl_out and gs == 0 and ps == 0) else f"NO ({pl_out!r} vs {go_out!r})"
+            flag = ""
+            if ratio > budget:
+                flag += "  OVER BUDGET"
+            if mem > MEM_BUDGET * scale:
+                flag += "  OVER MEMORY"
+            bad += bool(flag) or same != "yes"
+            print(f"{b:10s} {cpu:6s} {gw:7.3f} {pw:10.3f} {ratio:6.2f} {budget:7.2f} {gr:6.1f} {pr:6.1f} {mem:5.2f}  {same}{flag}")
+            record["pairs"].append({"pair": b, "cpu": cpu, "go_godebug": (go_env(cpu) or {}).get("GODEBUG", ""),
+                                    "go": {"median_s": gw, "walls_s": LAST_WALLS.get(os.path.join(OUT, b + ".go.bin"), []),
+                                           "peak_rss_mb": gr, "peaks_mb": LAST_PEAKS.get(os.path.join(OUT, b + ".go.bin"), []),
+                                           "status": gs, "output": go_out},
+                                    "paslang": {"median_s": pw, "walls_s": LAST_WALLS.get(pl_path(b, cpu), []),
+                                                "peak_rss_mb": pr, "peaks_mb": LAST_PEAKS.get(pl_path(b, cpu), []),
+                                                "status": ps, "output": pl_out},
+                                    "round_ratios": LAST_RATIOS.get((gexe, pexe), []),
+                                    "ratio_time": ratio, "ratio_mem": mem, "budget": budget, "same_output": same == "yes",
+                                    "over": flag.strip()})
     print()
-    bad += checkptr(n, scale)
+    for cpu in cpus:
+        bad += checkptr(n, scale, cpu)
     print()
     probes()
     if json_path:
