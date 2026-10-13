@@ -333,16 +333,28 @@ characters. That is **not** our default.
   them in their block says whether another string shares them (bit 0),
   so an assignment, a parameter or a field shares them for nothing, and
   the first write through any holder copies them for that holder alone
-  (`rt_strunique`; a literal's characters are always shared).
+  (`rt_strunique`; a literal's characters are always shared). Bits 1
+  to 7 of that byte are the size class of a block the runtime made
+  for appends (P242, 1.1.107: `rt_class2size` up to 67, `rt_strbig`
+  past 32 KiB), 0 when it is not known: `s := s + x` and `s += x`
+  write `x` after `s`'s characters in their own block when the mark is
+  clear and the class has room, and store only the length; a full block
+  grows as Go's `append` does (`nextslicecap`), past 32 KiB where it is
+  when the pages after it are free (`PasHeapGrowLarge`). Every byte
+  written so lies past the string's length, so no holder of the block
+  sees one change. The byte belongs to the runtime: a string made from
+  raw memory (a view, a pointer cast) follows the rule of a view below,
+  its mark set, so nothing ever writes it.
 - A view (P198, 1.1.93): `PasStrView(p, n)` (core unit `passtr`) is a
   string whose characters are the `n` bytes at `p`, with no copy, Go's
   `unsafe.String`. The contract: the bytes from `p - 1` to `p + n - 1`
   lie in one heap block that nothing writes while a view of it lives,
   and the byte at `p - 1` has bit 0 set, the shared mark. No store ever
   writes that byte (`ShareStr`, `rt_strshare` and `rt_setpropstr` write
-  the mark only when it is clear, and every other path that changes a
-  string makes a new one: `rt_strunique`, `SetLength`, `Insert`,
-  `Delete`, `Copy`, concatenation), so any number of routines read a
+  the mark only when it is clear, `rt_strappend` writes in place and
+  `rt_strextend` the class only when it is clear, and every other path
+  that changes a string makes a new one: `rt_strunique`, `SetLength`,
+  `Insert`, `Delete`, `Copy`, concatenation), so any number of routines read a
   view at once with no lock, and a write through a view copies the
   characters first. `p` lies inside the block, so the view keeps the
   whole block alive. `n = 0` gives the empty string, never a view; a

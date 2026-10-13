@@ -482,6 +482,14 @@ the rules above.
   characters is the shared mark of copy on write, and
   the value is an interior pointer, which marks the block. The empty
   string is `rt_zerobase`, outside the heap. A literal is in `.rodata`.
+  A block made for appends (P242, 1.1.107) is rounded up to its size
+  class and the byte before the characters keeps the class in bits 1
+  to 7; one past 32 KiB grows where it is: `PasHeapGrowLarge` takes the
+  pages right after its span, from the front of the free run there or
+  from the fresh pages at the cursor, under the heap lock, moves the
+  span's size, limit and pages in the table with it, and counts the
+  bytes in use and free as `CheckGc` adds them up. The new pages keep
+  what they held; the string writes every byte it shows.
 - *Channels (1.0.83, 1.0.85).* A value wider than a word travels in a
   box allocated with its type's GC word, so a box is scanned as that
   type would be. A channel without a buffer is 64 bytes with GC word 0:

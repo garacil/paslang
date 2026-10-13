@@ -48,6 +48,7 @@ interface
 function PasHeapInit(H: Pointer; NProc: Integer): Integer;
 function PasHeapRefill(H, MC: Pointer; SC: Integer): Integer;
 function PasHeapLarge(H: Pointer; Size, Typ: Integer): Integer;
+function PasHeapGrowLarge(H: Pointer; Base, Bytes: Integer): Integer;
 function PasHeapCheck(H: Pointer): Integer;
 function PasHeapMask(H: Pointer; Addr: Integer): Integer;
 function PasMemBase(H: Pointer; Addr: Integer): Integer;
@@ -1433,6 +1434,86 @@ begin
   end
   else if RdW(sp + SNeedZero) <> 0 then
     ZeroMem(Result, npages * PageSize);
+end;
+
+{ The large block at Base grown where it is to Bytes, rounded up to its
+  pages (P242): the pages right after its span join it, from the front
+  of the free run that starts there or from the fresh pages at the
+  cursor, as C's realloc grows a block whose next pages are free. 1
+  when it grew, 0 when those pages are taken (the caller copies the
+  block). The new pages keep what they held, for a caller that writes
+  every byte it shows (a string's characters past its length). Under
+  the heap lock, as NewSpan; the span's size, limit and pages in the
+  table move with it, and the bytes in use and free add up as before
+  (CheckGc). Go never grows a block, growslice copies: a string built
+  by appends past 32 KiB copied itself at each step and faulted in the
+  pages of every copy. }
+function PasHeapGrowLarge(H: Pointer; Base, Bytes: Integer): Integer;
+var
+  h0, sp, np, k, add, e, q, m, t, i: Integer;
+  gc: Boolean;
+begin
+  Result := 0;
+  h0 := Integer(H);
+  gc := RdW(h0 + HGcOn) <> 0;
+  np := (Bytes + PageSize - 1) div PageSize;
+  add := 0;
+  SpinLock(PInt(h0 + HLock));
+  sp := 0;
+  if (Base >= RdW(h0 + HBase)) and (Base < RdW(h0 + HCursor)) then
+    sp := RdW(PageSlot(h0, Base));
+  if (sp <> 0) and (RdW(sp + SState) = StLarge) and (RdW(sp + SBase) = Base) and
+    (np > RdW(sp + SNPages)) then
+  begin
+    k := np - RdW(sp + SNPages);
+    add := k * PageSize;
+    e := Base + RdW(sp + SNPages) * PageSize;
+    if e = RdW(h0 + HCursor) then
+    begin
+      if AllocPages(h0, k) = e then
+        Result := 1;
+    end
+    else if gc then
+    begin
+      q := RdW(PageSlot(h0, e));
+      if (q <> 0) and (RdW(q + SState) = StRun) and (RdW(q + SBase) = e) and
+        (RdW(q + SNPages) >= k) then
+      begin
+        UnlinkRun(h0, q);
+        m := RdW(q + SNPages);
+        WrW(h0 + HFreeBytes, RdW(h0 + HFreeBytes) - add);
+        if RdW(q + SReleased) = 0 then
+          WrW(h0 + HFreeDirty, RdW(h0 + HFreeDirty) - add)
+        else
+          WrW(h0 + HReleased, RdW(h0 + HReleased) - add);
+        if m > k then
+        begin
+          WrW(q + SBase, e + add);
+          WrW(q + SNPages, m - k);
+          MarkRunEnds(h0, q);
+          LinkRun(h0, q);
+        end
+        else
+          FreeSpanRec(h0, q);
+        Result := 1;
+      end;
+    end;
+    if Result = 1 then
+    begin
+      t := PageSlot(h0, e);
+      for i := 0 to k - 1 do
+        WrW(t + i * 8, sp);
+      WrW(sp + SNPages, np);
+      WrW(sp + SElemSize, np * PageSize);
+      WrW(sp + SLimit, Base + np * PageSize);
+      WrW(sp + SDivMul, 4294967295 div (np * PageSize) + 1);
+      if gc then
+        WrW(h0 + HInUse, RdW(h0 + HInUse) + add);
+    end;
+  end;
+  SpinUnlock(PInt(h0 + HLock));
+  if (Result = 1) and gc then
+    AtomicAdd(PInt(h0 + HAllocated), add);
 end;
 
 { ---- stopping the world ---- }

@@ -132,6 +132,12 @@ BUDGET.update({"b13strw:upper": 0.10, "b13strw:lower": 0.10, "b13strw:equalfold"
                "b18sync:mutex": 0.80, "b18sync:cond": 0.65,
                "b24math:pow": 0.98, "b26slice:strings": 0.90, "b28stack:deep": 0.90,
                "b29exc:raise": 0.15, "b30gc:trees": 0.97})
+# P242 (1.1.107): s := s + c grows s in its own block and a block past 32
+# KiB grows where it is; twenty million appends did not end in ten
+# minutes and take 0.861 of Go's strings.Builder with -cpu native and
+# 0.767 with -cpu base (twenty alternating rounds), 19.7 MB at the peak
+# against Go's 51.4.
+BUDGET["b13strw:concat"] = 0.90
 # paslangc -checkptr / the plain build, per pair in CHECKPTR (P104).
 CHECKPTR_BUDGET = {"b8ptr": 10.0}
 # Peak resident memory, paslang / Go, the medians of MEM_RUNS traced runs:

@@ -5762,7 +5762,15 @@ abc 1
 
 A string is a pointer and a 64-bit byte length: no 255 limit, no length
 byte in front, no required trailing zero. Assignment copies the pointer
-and the length; concatenation allocates a new buffer. `'ab'#10'c'` is one
+and the length; concatenation allocates a new buffer, except that
+`s := s + x` and `s += x` grow `s` where it is when no other variable
+holds it: its block keeps room past its length, growing as Go's
+`append` grows a slice, and a block past 32 KiB takes the free pages
+right after it, so a string built a piece at a time copies itself now
+and then, not at every piece (1.1.107; Go's `s += x` copies both every
+time, and `strings.Builder` is its way to build one). The answer is
+always the concatenation's, also when the routines `x` calls change
+`s` first. `'ab'#10'c'` is one
 string with a newline inside. `s[i]` is a byte, 1-based. `Length` counts
 bytes and `for r in s do` walks Unicode scalars. `Copy(s, from, count)`
 cuts, `SetLength(s, n)` sizes: a string no other variable holds keeps

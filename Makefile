@@ -183,6 +183,12 @@ GOLDEN_A64 += treevarg
 # reaches Result, and the holder never changes.
 GOLDEN += resultmark
 GOLDEN_A64 += resultmark
+# P242: s := s + x and s += x grow s in its own block when it has room,
+# and a block past 32 KiB grows where it is: every answer is the
+# concatenation's, through every kind of place, shared strings, places
+# x's routines change, the collector and two large strings in turn.
+GOLDEN += strappend
+GOLDEN_A64 += strappend
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -563,6 +569,11 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/resultmark0 testdata/resultmark.paslang; \
 	$(BUILDDIR)/resultmark0 > $(BUILDDIR)/resultmark0.got; \
 	diff -u testdata/resultmark.out $(BUILDDIR)/resultmark0.got; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/strappend0 testdata/strappend.paslang; \
+	$(BUILDDIR)/strappend0 > $(BUILDDIR)/strappend0.got; \
+	diff -u testdata/strappend.out $(BUILDDIR)/strappend0.got; \
+	grep -q 'call rt_strappendc$$' $(BUILDDIR)/strappend.s || { echo "strappend.s does not append a character through rt_strappendc"; exit 1; }; \
+	grep -q 'call rt_strappend$$' $(BUILDDIR)/strappend.s || { echo "strappend.s does not append a string through rt_strappend"; exit 1; }; \
 	echo ok inline; \
 	echo "==== dead code ===="; \
 	sz=$$(size $(BUILDDIR)/hello | awk 'NR==2 {print $$1}'); \
@@ -2625,6 +2636,8 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	  diff -u testdata/$$t.out $(BUILDDIR)/$$t-arm.got; \
 	  echo ok $$t-arm; \
 	done; \
+	grep -q 'bl rt_strappendc$$' $(BUILDDIR)/strappend-arm.s || { echo "strappend-arm.s does not append a character through rt_strappendc"; exit 1; }; \
+	grep -q 'bl rt_strappend$$' $(BUILDDIR)/strappend-arm.s || { echo "strappend-arm.s does not append a string through rt_strappend"; exit 1; }; \
 	echo "==== the base processor arm64 ===="; \
 	for t in hash1 tree1 store1 vectors bitwords set256 strwords strkern strcmpk cmpwords sysutils1; do \
 	  $(OUTDIR)/paslangc -target arm64 -cpu base -o $(BUILDDIR)/$$t-arm-base testdata/$$t.paslang; \

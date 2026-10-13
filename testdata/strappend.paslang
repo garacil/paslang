@@ -1,0 +1,446 @@
+{ P242 (1.1.107): s := s + x and s += x for a string place s grow s in
+  its own block when it has room, and a block past 32 KiB grows where it
+  is when the pages after it are free, so a string built a piece at a
+  time copies itself now and then, not at every piece. The answers are
+  the concatenation's: every line here reads the same as with 1.1.106,
+  which copied the whole string at every piece, apart from the line that
+  counts the blocks a string of a million characters went through. The
+  ways in: a place that holds the string alone and one another string
+  shares (a copy, a value or const parameter, a map's value, a channel,
+  a closure), a variable of the frame, a global, a var parameter, a
+  field of a record and of an object, an element of a static and of a
+  dynamic array, a pointer's target and Result; a character, a literal,
+  a string and a sum of them; a place that the routines of x change
+  before the append (the string read first is appended to); strings
+  past 32 KiB with the collector running between pieces and two of them
+  growing in turn, so one finds the pages after it taken; SetLength,
+  writes and views. HeapCheck says the heap is sound after each part. }
+program strappend;
+
+uses
+  sysutils;
+
+type
+  TRec = record
+    Name: string;
+    Tag: Integer;
+  end;
+  TBox = class
+    FText: string;
+    procedure Add(const S: string);
+    procedure AddCh(C: Char);
+  end;
+  TAct = procedure;
+  PStr = ^string;
+  TStrWords = record
+    P: Pointer;
+    N: Integer;
+  end;
+  PStrWords = ^TStrWords;
+
+var
+  g, gs: string;
+  gi: Integer;
+  arr: array[1..4] of string;
+  dyn: array of string;
+  m: map[Integer] of string;
+  ch: chan of string;
+  done: waitgroup;
+  sums: array[0..7] of Integer;
+
+function Words(var S: string): Pointer;
+begin
+  Result := PStrWords(@S)^.P;
+end;
+
+function Hash(const S: string): Integer;
+var
+  i, h: Integer;
+begin
+  h := 0;
+  for i := 1 to Length(S) do
+    h := (h * 31 + Ord(S[i])) and $FFFFFFFF;
+  Result := h;
+end;
+
+procedure TBox.Add(const S: string);
+begin
+  FText := FText + S;
+end;
+
+procedure TBox.AddCh(C: Char);
+begin
+  FText += C;
+end;
+
+{ x's routines change the place before the append: g := 'changed', g
+  grown, g cut. }
+function Change: string;
+begin
+  g := 'changed';
+  Result := 'R';
+end;
+
+function Grow: string;
+begin
+  g := g + 'qqq';
+  Result := 'R';
+end;
+
+function Cut: string;
+begin
+  SetLength(g, 1);
+  Result := 'R';
+end;
+
+function Bump: string;
+begin
+  gi := gi + 1;
+  Result := '+';
+end;
+
+procedure AddTo(var A: string; const B: string);
+begin
+  A := A + B;
+end;
+
+procedure AddChTo(var A: string; C: Char);
+begin
+  A += C;
+end;
+
+procedure ByValue(A: string);
+begin
+  A := A + ' and more';
+  A += '!';
+  WriteLn('value parameter: ', Length(A), ' ', Copy(A, Length(A) - 19, 20));
+end;
+
+procedure ByConst(const A: string);
+begin
+  gs := gs + ' grown';
+  gs += '!';
+  WriteLn('const parameter: ', A, ' / ', gs);
+end;
+
+function Built(N: Integer): string;
+var
+  i: Integer;
+begin
+  Result := '';
+  for i := 1 to N do
+    Result := Result + Chr(48 + i mod 10);
+end;
+
+function Joined(N: Integer): string;
+var
+  i: Integer;
+begin
+  Result := '[';
+  for i := 1 to N do
+    Result += IntToStr(i) + ',';
+  Result := Result + ']';
+end;
+
+procedure Worker(K: Integer);
+var
+  s, sent: string;
+  i: Integer;
+begin
+  s := '';
+  for i := 1 to 50000 + K * 1000 do
+    s := s + Chr(97 + (i + K) mod 26);
+  sent := s;
+  Send(ch, sent);
+  for i := 1 to 1000 do
+    s := s + 'z';
+  sums[K] := Hash(s) xor Length(s);
+  done.Done;
+end;
+
+procedure Chars;
+var
+  s: string;
+  c: Char;
+  i, moved: Integer;
+  p: Pointer;
+begin
+  s := '';
+  moved := 0;
+  p := nil;
+  for i := 1 to 1000000 do
+  begin
+    c := Chr(97 + i mod 26);
+    s := s + c;
+    if Words(s) <> p then
+    begin
+      moved := moved + 1;
+      p := Words(s);
+    end;
+  end;
+  WriteLn('a million characters: ', Length(s), ' ', Hash(s), ' ', s[1], s[26], s[1000000]);
+  WriteLn('blocks it went through under 64: ', Ord(moved < 64));
+  s := '';
+  for i := 1 to 300 do
+    s := s + 'x';
+  for i := 1 to 300 do
+    s += Chr(65 + i mod 26);
+  WriteLn('literal and Chr: ', Length(s), ' ', Copy(s, 295, 12));
+end;
+
+procedure Pieces;
+var
+  s, e: string;
+  i: Integer;
+begin
+  s := '';
+  for i := 1 to 20000 do
+    s := s + IntToStr(i) + ',';
+  WriteLn('numbers: ', Length(s), ' ', Copy(s, Length(s) - 11, 12), ' ', Hash(s));
+  s := 'ab';
+  for i := 1 to 12 do
+    s := s + s;
+  WriteLn('s + s: ', Length(s), ' ', Copy(s, 1, 6), ' ', Copy(s, 8189, 8));
+  s := 'xy';
+  for i := 1 to 5 do
+    s := s + '-' + s;
+  WriteLn('s + - + s: ', Length(s), ' ', Copy(s, 1, 12), ' ', Hash(s));
+  e := '';
+  s := 'keep';
+  s := s + '';
+  s := s + e;
+  s += e;
+  WriteLn('empty pieces: ', s, ' ', Length(s));
+  s := Joined(3000);
+  WriteLn('Result += : ', Length(s), ' ', Copy(s, 1, 8), ' ', Copy(s, Length(s) - 6, 7));
+  WriteLn('two calls: ', Built(20), ' ', Built(25), ' ', Length(Built(70000)));
+end;
+
+procedure Shared;
+var
+  s, t, u: string;
+  i: Integer;
+begin
+  s := '';
+  for i := 1 to 100 do
+    s := s + Chr(97 + i mod 26);
+  t := s;
+  s := s + 'X';
+  s += 'Y';
+  WriteLn('a copy: ', Length(t), ' ', Length(s), ' ', t[100], ' ', Copy(s, 99, 4), ' ', Ord(Copy(s, 1, 100) = t));
+  t := t + 'Z';
+  WriteLn('and its copy grown: ', Copy(t, 99, 3), ' ', Copy(s, 99, 4));
+  u := s;
+  for i := 1 to 1000 do
+    u := u + '.';
+  WriteLn('the first after it: ', Length(s), ' ', Length(u), ' ', Copy(s, 99, 4));
+  s := 'literal';
+  s := s + 's';
+  s += ' grow';
+  WriteLn('from a literal: ', s);
+  s := 'abcdefghijklmnopqrstuvwxyz';
+  for i := 1 to 40 do
+    s := s + '0';
+  SetLength(s, 5);
+  s := s + 'Z';
+  s += 'W';
+  WriteLn('after SetLength: ', s, ' ', Length(s));
+  t := s;
+  s[1] := 'Q';
+  s := s + '!';
+  WriteLn('a write and a piece: ', s, ' ', t);
+  s := '';
+  for i := 1 to 40 do
+    s := s + Chr(97 + i mod 26);
+  t := s;
+  t[1] := 'T';
+  t := t + 'u';
+  WriteLn('a write on the copy: ', Copy(s, 1, 3), ' ', Copy(t, 1, 3), ' ', Length(s), ' ', Length(t));
+end;
+
+procedure Guarded;
+begin
+  g := 'start';
+  g := g + Change;
+  WriteLn('x changes the place: ', g);
+  g := 'start';
+  g := g + 'a';
+  g := g + Grow;
+  WriteLn('x grows the place: ', g);
+  g := 'start';
+  g := g + 'abcdefghijklmnopqrstuvwxyz';
+  g := g + Cut;
+  WriteLn('x cuts the place: ', g);
+  g := 'base';
+  g := g + 'x' + g;
+  WriteLn('the place in x: ', g);
+  gi := 1;
+  arr[1] := 'one';
+  arr[2] := 'two';
+  arr[gi] := arr[gi] + Bump;
+  WriteLn('x moves the index: ', arr[1], ' ', arr[2], ' ', gi);
+end;
+
+procedure Places;
+var
+  r: TRec;
+  b: TBox;
+  p: PStr;
+  s, v: string;
+  act: TAct;
+  i: Integer;
+begin
+  s := '';
+  for i := 1 to 1000 do
+    AddTo(s, 'xy');
+  for i := 1 to 10 do
+    AddChTo(s, 'c');
+  WriteLn('var parameter: ', Length(s), ' ', Copy(s, 1995, 16));
+  ByValue(s);
+  WriteLn('the caller: ', Length(s));
+  gs := 'held';
+  ByConst(gs);
+  r.Name := 'rec';
+  r.Tag := 7;
+  for i := 1 to 100 do
+    r.Name := r.Name + Chr(48 + i mod 10);
+  r.Name += '!';
+  WriteLn('a record field: ', Length(r.Name), ' ', Copy(r.Name, 1, 8), ' ', r.Tag);
+  b := TBox.Create;
+  b.FText := 'box';
+  for i := 1 to 500 do
+    b.Add(IntToStr(i mod 7));
+  for i := 1 to 26 do
+    b.AddCh(Chr(64 + i));
+  b.FText := b.FText + '.';
+  WriteLn('an object field: ', Length(b.FText), ' ', Copy(b.FText, 1, 8), ' ', Copy(b.FText, Length(b.FText) - 5, 6));
+  b.Free;
+  for i := 1 to 4 do
+    arr[i] := '';
+  for i := 1 to 400 do
+    arr[1 + i mod 4] := arr[1 + i mod 4] + Chr(65 + i mod 26);
+  WriteLn('a static array: ', Length(arr[1]), ' ', Copy(arr[2], 1, 6), ' ', Hash(arr[3]));
+  SetLength(dyn, 3);
+  for i := 1 to 300 do
+    dyn[i mod 3] += IntToStr(i);
+  WriteLn('a dynamic array: ', Length(dyn[0]), ' ', Length(dyn[1]), ' ', Copy(dyn[2], 1, 6));
+  New(p);
+  p^ := 'ptr';
+  for i := 1 to 200 do
+    p^ := p^ + '.';
+  WriteLn('a pointer''s target: ', Length(p^), ' ', Copy(p^, 1, 5));
+  New(m);
+  m[1] := 'map';
+  v := m[1];
+  for i := 1 to 50 do
+    v := v + 'v';
+  m[1] := m[1] + 'q';
+  WriteLn('a map''s value: ', m[1], ' ', Length(v));
+  s := 'cl';
+  act := procedure
+  begin
+    s := s + 'o';
+    s += 's';
+  end;
+  for i := 1 to 3 do
+    act;
+  WriteLn('a closure: ', s);
+end;
+
+procedure Large;
+var
+  s, t, a, b: string;
+  junk: array of string;
+  i, k: Integer;
+begin
+  s := '';
+  SetLength(junk, 64);
+  for i := 1 to 3000000 do
+  begin
+    s := s + Chr(97 + i mod 26);
+    if i mod 50000 = 0 then
+    begin
+      junk[(i div 50000) mod 64] := Built(5000);
+      GcCollect;
+    end;
+  end;
+  WriteLn('three million: ', Length(s), ' ', Hash(s), ' heap ', HeapCheck);
+  t := s;
+  s := s + 'X';
+  WriteLn('a copy of it: ', Length(t), ' ', Length(s), ' ', t[Length(t)], s[Length(s)]);
+  a := '';
+  b := '';
+  for i := 1 to 400000 do
+  begin
+    a := a + Chr(65 + i mod 26);
+    b += Chr(97 + i mod 26);
+    if i mod 100000 = 0 then
+      GcCollect;
+  end;
+  WriteLn('two in turn: ', Length(a), ' ', Hash(a), ' ', Length(b), ' ', Hash(b), ' heap ', HeapCheck);
+  s := '';
+  k := 0;
+  for i := 1 to 40000 do
+  begin
+    s := s + Chr(48 + i mod 10);
+    if (Length(s) <> i) or (s[i] <> Chr(48 + i mod 10)) then
+      k := k + 1;
+  end;
+  WriteLn('every length on the way: ', k, ' ', Copy(s, 32760, 12));
+end;
+
+procedure Views;
+var
+  bp: PByte;
+  s, v: string;
+  i, sum: Integer;
+begin
+  bp := PByte(GetMem(64, 0));
+  bp[0] := 1;
+  for i := 1 to 63 do
+    bp[i] := Byte(97 + i mod 26);
+  v := PasStrView(bp + 1, 20);
+  s := v;
+  for i := 1 to 30 do
+    s := s + 'v';
+  v += 'w';
+  sum := 0;
+  for i := 1 to 63 do
+    sum := sum + bp[i];
+  WriteLn('a view: ', Length(s), ' ', Copy(s, 18, 6), ' ', Length(v), ' ', Copy(v, 19, 3), ' block ', sum);
+end;
+
+procedure Routines;
+var
+  i, n, t: Integer;
+  r: string;
+begin
+  ch := MakeChan(8);
+  done.Add(8);
+  for i := 0 to 7 do
+    pas Worker(i);
+  n := 0;
+  for i := 0 to 7 do
+  begin
+    r := Recv(ch);
+    r := r + 'received';
+    n := n + Length(r);
+  end;
+  done.Wait;
+  t := 0;
+  for i := 0 to 7 do
+    t := t xor sums[i];
+  WriteLn('eight routines: ', n, ' ', t);
+end;
+
+begin
+  Chars;
+  Pieces;
+  Shared;
+  Guarded;
+  Places;
+  Large;
+  Views;
+  Routines;
+  WriteLn('heap ', HeapCheck);
+end.
