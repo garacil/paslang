@@ -190,6 +190,9 @@ GOLDEN_A64 += resultmark
 # x's routines change, the collector and two large strings in turn.
 GOLDEN += strappend
 GOLDEN_A64 += strappend
+# a condition as branches against the same condition as a value (P265)
+GOLDEN += condjump
+GOLDEN_A64 += condjump
 # P263: code chooses by the version of paslangc compiling it: {$if},
 # {$elseif}, PASLANG_FULLVERSION and its parts, defined(), skipped branches.
 GOLDEN += condver
@@ -1780,6 +1783,14 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -A3 'cmovbq' $(BUILDDIR)/bcerun_s.s | grep -q 'jae'; \
 	grep -q '^  .p2align 5$$' $(BUILDDIR)/bcerun_s.s; \
 	echo ok bcerun; \
+	: the and, or and not of a condition as branches, P265: the same answers with every routine a call, and Digit two compares and two jumps; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/condjump0 testdata/condjump.paslang; \
+	$(BUILDDIR)/condjump0 > $(BUILDDIR)/condjump0.got; \
+	diff -u testdata/condjump.out $(BUILDDIR)/condjump0.got; \
+	awk '/^p_digit:/,/ret$$/' $(BUILDDIR)/condjump.s > $(BUILDDIR)/condjump-digit.s; \
+	grep -q 'cmpq $$48, ' $(BUILDDIR)/condjump-digit.s && grep -q '^  jl ' $(BUILDDIR)/condjump-digit.s && grep -q '^  jg ' $(BUILDDIR)/condjump-digit.s || { echo "condjump.s: Digit's condition is not two compares and two jumps"; exit 1; }; \
+	if grep -q '^  set' $(BUILDDIR)/condjump-digit.s; then echo "condjump.s: Digit's condition makes a Boolean"; exit 1; fi; \
+	echo ok condjump; \
 	echo "==== narrow Go twin ===="; \
 	if command -v go > /dev/null 2>&1; then \
 	  rm -rf $(BUILDDIR)/gotwin; mkdir -p $(BUILDDIR)/gotwin; \
@@ -2679,6 +2690,12 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	done; \
 	grep -q 'bl rt_strappendc$$' $(BUILDDIR)/strappend-arm.s || { echo "strappend-arm.s does not append a character through rt_strappendc"; exit 1; }; \
 	grep -q 'bl rt_strappend$$' $(BUILDDIR)/strappend-arm.s || { echo "strappend-arm.s does not append a string through rt_strappend"; exit 1; }; \
+	$(OUTDIR)/paslangc -target arm64 -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/condjump0-arm testdata/condjump.paslang; \
+	timeout 300 $(QEMU_A64) $(BUILDDIR)/condjump0-arm > $(BUILDDIR)/condjump0-arm.got; \
+	diff -u testdata/condjump.out $(BUILDDIR)/condjump0-arm.got; \
+	awk '/^p_digit:/,/ret$$/' $(BUILDDIR)/condjump-arm.s > $(BUILDDIR)/condjump-digit-arm.s; \
+	grep -q 'cmp x0, #48' $(BUILDDIR)/condjump-digit-arm.s && grep -q 'b.lt ' $(BUILDDIR)/condjump-digit-arm.s && grep -q 'b.gt ' $(BUILDDIR)/condjump-digit-arm.s || { echo "condjump-arm.s: Digit's condition is not two compares and two branches"; exit 1; }; \
+	if grep -q 'cset' $(BUILDDIR)/condjump-digit-arm.s; then echo "condjump-arm.s: Digit's condition makes a Boolean"; exit 1; fi; \
 	echo "==== the base processor arm64 ===="; \
 	for t in hash1 tree1 store1 vectors bitwords set256 strwords strkern strcmpk cmpwords sysutils1; do \
 	  $(OUTDIR)/paslangc -target arm64 -cpu base -o $(BUILDDIR)/$$t-arm-base testdata/$$t.paslang; \
