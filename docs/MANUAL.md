@@ -2912,8 +2912,10 @@ on. `CompareByte(a, b, n)` is the difference of the first bytes of `a`
 and `b` that differ, 0 when their `n` bytes are equal, and `IndexByte(x,
 n, v)` the place from 0 of the byte `v` among the first `n` of `x`, -1
 when it is not there: Free Pascal's System words, on the processor's
-vectors (AVX2, SSE2, NEON; `docs/KERNELS.md`). A count not above 0
-reads nothing, where Free Pascal reads without an end (1.1.22, P147).
+vectors (AVX2, SSE2, NEON; `docs/KERNELS.md`), at most 64 KiB a call to
+the kernel, so a routine comparing or searching a long run can be
+stopped between two (1.1.120, P270). A count not above 0 reads nothing,
+where Free Pascal reads without an end (1.1.22, P147).
 `Low`, `High` and `Length` work on static arrays, slices and
 strings: a string's `Low` is 1, its first index, and its `High` its
 length (1.0.136; `Low` gave 0). `Length` also counts the entries of a
@@ -6456,12 +6458,13 @@ routines are there for the compiler, and a program may call them too:
 | `pasnum` | `PasNumI64(p, sc, out v): Boolean`, `PasNumU64` | an integer literal as an `Int64` or a `QWord` (in the `Int64`'s bits); `False` for `1.0`, `1e2` or a value that does not fit |
 | `pasnum` | `PasNumAppendF64(p, bits): Integer`, `PasNumAppendF32`, `PasNumAppendInt(p, v)`, `PasNumAppendUint` | writes at `p` (`PasNumTextMax`, 32 bytes, are enough) the fewest digits that read back as the double or single with those bits, as JSON and ECMAScript lay them out, or the integer; the bytes written |
 | `passtr` | `PasStrView(p, n): string` | the `n` bytes at `p` as a string with no copy, after a byte with the shared mark (§6) |
+| `passtr` | `PasFindByteCpu(p, n, c): Integer`, `PasFindByteBase`, `PasCompareByteCpu(a, b, n): Integer`, `PasCompareByteBase` | `IndexByte` and `CompareByte` on each processor's kernels (`PasIndexByteCpu`, `PasCmpByteCpu` and their base bodies, which take any length in one call), given at most 64 KiB a call, so the routine can be stopped between two; a shorter run goes to the kernel at once (1.1.120, P270) |
 | `passtr` | `PasUtf8Valid(p, n, ijson): Integer` | whether the `n` bytes at `p` are UTF-8 (RFC 3629): -1 when they are, else the place from 0 of the first byte of the first sequence that is not, as Python's strict decoder gives it; with `ijson` a noncharacter is refused too (U+FDD0 to U+FDEF and the last two of each plane, I-JSON, RFC 7493 2.1). AVX2 or NEON 64 bytes at a time by simdjson's lookup4, the base SSE2's ASCII skip with Go's automaton (1.1.117, P201); nothing past `p[n-1]` is read, and the kernel gets at most 64 KiB a call, so a routine validating a large text can be stopped between two (1.1.119, P269) |
 | `passtr` | `PasUtf8Start(st, ijson)`, `PasUtf8Feed(st, p, n): Integer`, `PasUtf8End(st): Integer` | the same in pieces, a sequence a piece cuts waiting for the next: `Feed` -1 while all is right, else the place in the whole; `End` the place of a sequence left open |
 | `passtr` | `PasUtf8Plain(p, n, ijson, out pend)`, `PasUtf8BlocksCpu`, `PasUtf8BlocksBase` | the reference byte by byte (a sequence the end cuts is `pend` bytes, not an error) and the two kernels over blocks of 64 bytes, which take any number of blocks in one call where `PasUtf8Valid` and `PasUtf8Feed` give them 1024 at most (64 KiB); the tests hold them to the reference |
 | `pasjson` | `PasJsonScanStart(st)`, `PasJsonIndex(p, n, st, idx, off): Integer` | the structural scan of the `n` bytes at `p`, whose first is at `off` in the text: the places from the start of the text, as `UInt32`, of every quote, of every comma, colon, bracket and brace and the first byte of every other scalar outside a string, and of every escaping backslash and control byte inside one, into `idx` (room for `n + 8`), and how many; the `TPasJsonScan` `st` carries whether the next byte is escaped, whether a string is open and whether a scalar goes on, and counts the values and member names (`Nodes`), the scalars that are not strings (`Scalars`) and the bytes of the strings from their opening quote and of the other scalars (`Bytes`). The text ends as if spaces followed it; nothing past `p[n-1]` is read (1.1.118, P202) |
 | `pasjson` | `PasJsonIndexBlocks(p, nblocks, st, idx, off)`, `PasJsonIndexCpu`, `PasJsonIndexBase`, `PasJsonIndexPlain(p, n, st, idx, off)` | the same over whole blocks of 64 bytes, for a text that goes on (room for `64 * nblocks + 8`); the two kernels, which take any number of blocks in one call where `PasJsonIndexBlocks` gives them 1024 at most (64 KiB), so the routine can be stopped between two; and the reference byte by byte, which the tests hold them to |
-| `pasjson` | `PasJsonEscIndex(p, n, html): Integer`, `PasJsonEscIndexCpu`, `PasJsonEscIndexBase`, `PasJsonEscIndexPlain` | the place from 0 of the first of the `n` bytes at `p` that JSON writes escaped (a quote, a backslash, a byte below 20h and, with `html`, `&`, `<` and `>`), -1 when there is none; the kernels read aligned blocks, which never cross a page |
+| `pasjson` | `PasJsonEscIndex(p, n, html): Integer`, `PasJsonEscIndexCpu`, `PasJsonEscIndexBase`, `PasJsonEscIndexPlain` | the place from 0 of the first of the `n` bytes at `p` that JSON writes escaped (a quote, a backslash, a byte below 20h and, with `html`, `&`, `<` and `>`), -1 when there is none; the kernels read aligned blocks, which never cross a page, and `PasJsonEscIndex` gives them at most 64 KiB a call (1.1.120, P270) |
 | `pashash` | `PasHex(s)`, `PasMd5(s)`, `PasSha3(s, bits)`, `PasAdler32(s, adler)`, `PasFnv1a32(s)`, `PasFnv1a64(s)`, `PasMurmur3(s, seed)`, `PasSipHash(s, k0, k1)` | the bodies of `Hex`, `Md5`, `Sha3_*`, `Adler32`, `Fnv1a32`, `Fnv1a64`, `Murmur3` and `SipHash`, one each |
 | `pashash` | `PasSha1Cpu(s)`, `PasSha1Base(s)`, and the same pairs for `Sha224`, `Sha256`, `Sha384`, `Sha512`; `PasHmacCpu(alg, key, msg)`, `PasHmacBase` (alg 0 MD5, 1 SHA-1, 2 SHA-224, 3 SHA-256, 4 SHA-384, 5 SHA-512); `PasCrc32Cpu(s, crc)`, `PasCrc32Base`, `PasCrc32cCpu`, `PasCrc32cBase`; `PasMerkleRootCpu(leaves)`, `PasMerkleRootBase`, `PasMerkleProofCpu(leaves, i)`, `PasMerkleProofBase`, `PasMerkleCheckCpu(leaf, i, n, proof, root)`, `PasMerkleCheckBase` | the two bodies of each word, the `Cpu` one on the processor's instructions and the `Base` one in Pascal; the compiler calls one by `-cpu` (§21), a program that calls `Cpu` itself answers for the processor it runs on |
 | `pastree` | `PasTreeNew`, `PasTreeGet`, `PasTreePut`, `PasTreeDelete`, `PasTreeClear`, `PasTreeStep`, `PasTreeBound`, `PasTreeRank`, `PasTreeKeyAt`, `PasTreePop`, `PasTreeSplit`, `PasTreeJoin`, `PasHeapNew`, `PasHeapPush`, `PasHeapPop`, `PasHeapLow`, `PasHeapEmpty` | the tree and heap words, taking the compiler's descriptor of the type (key kind and sizes) and keys by address: written for the compiler, not for a program, which has `t[k]`, `Push` and the rest |
@@ -10748,10 +10751,14 @@ stack and calls the runtime when it needs more. A system monitor thread
 marks a long-running routine every 10 ms, and the scheduler takes it
 off its M at its next routine entry or loop head; a `for` whose body
 calls nothing and holds no other loop asks once every 1024 passes. An
-`asm` block has neither and runs to its end, so the scans of the core
-units give their kernels at most 64 KiB a call (`PasJsonIndex`,
-`PasUtf8Valid`, `PasUtf8Feed`) and a routine scanning a large text is
-taken off between two (1.1.119, P269).
+`asm` block has neither and runs to its end, so every word of the core
+units gives its kernel at most 64 KiB a call, and a routine working on
+a large value is taken off between two: the scans of JSON and UTF-8
+(`PasJsonIndex`, `PasUtf8Valid`, `PasUtf8Feed`; 1.1.119, P269), the
+searches, comparisons and case maps of strings, the hashes and CRCs,
+JSON's escape finder and the rotation of a whole value (1.1.120, P270).
+The runtime's own copies and clears (`Move`, `FillChar`, a large block
+made ready) still run to their end.
 
 A routine that waits, on a channel, a mutex, a condition, `Sleep`, a
 socket or standard input, parks: its registers and stack pointer are

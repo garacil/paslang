@@ -46,7 +46,15 @@
   byte, MemEq checks the rest, and when the first byte keeps matching
   where the rest does not, Rabin-Karp takes over, so the search stays
   linear. On arm64 NEON is part of the base processor: its Cpu and Base
-  bodies are one. }
+  bodies are one.
+
+  A kernel takes any length in one call, and an asm block is not
+  preempted, so no word gives one more than 64 KiB a call (P269, P270):
+  Pos over a slice of the text at a time, PasFindByte and PasCompareByte
+  (IndexByte and CompareByte) and the case map in a loop of calls, the
+  UTF-8 validation 1024 blocks a call; the loop's head is where the
+  routine can be stopped. Nothing is added to the loops that call a
+  kernel most: Pos's own runs over each slice as it did over the text. }
 
 unit passtr;
 
@@ -67,6 +75,10 @@ function PasCaseCmpPlain(A, B: Pointer; N: Int64): Int64;
 procedure PasCaseMapCpu(Src, Dst: Pointer; N: Int64; Upper: Boolean);
 procedure PasCaseMapBase(Src, Dst: Pointer; N: Int64; Upper: Boolean);
 procedure PasCaseMapPlain(Src, Dst: Pointer; N: Int64; Upper: Boolean);
+function PasFindByteCpu(P: Pointer; N, C: Int64): Int64;
+function PasFindByteBase(P: Pointer; N, C: Int64): Int64;
+function PasCompareByteCpu(A, B: Pointer; N: Int64): Int64;
+function PasCompareByteBase(A, B: Pointer; N: Int64): Int64;
 
 type
   { a validation of UTF-8 in pieces (P201): PasUtf8Start, PasUtf8Feed
@@ -122,6 +134,11 @@ const
   { At most this many blocks of 64 bytes, 64 KiB, go to the UTF-8
     kernel in one call, as JsonMaxBlocks in pasjson (P269). }
   Utf8MaxBlocks = 1024;
+  { At most this many bytes, 64 KiB, go to a kernel of search, compare
+    or case in one call (P270): an asm block is not preempted, and the
+    code between two calls is where the routine can be stopped, for the
+    collector or for another routine (§18). }
+  StrMaxBytes = 65536;
 
 { ---- IndexByte ---- }
 
@@ -1782,6 +1799,185 @@ begin
   end;
 end;
 
+{ ---- Slices ---- }
+
+{ IndexByte and CompareByte (the compiler calls the body of the -cpu):
+  the kernel at most StrMaxBytes a call (P270). A short run goes to it
+  at once, a longer one to a loop of calls (a branch only: a loop's
+  test, its preemption check among them, costs every call), a search
+  going on in the next slice when one holds no match, a comparison the
+  first slice's answer that is not 0, as one call gives it, since the
+  answer is the difference of the first bytes that differ. }
+function FindByteLongCpu(P: Pointer; N, C: Int64): Int64;
+var
+  done, r: Int64;
+begin
+  done := 0;
+  while N - done > StrMaxBytes do
+  begin
+    r := PasIndexByteCpu(Pointer(Integer(P) + done), StrMaxBytes, C);
+    if r >= 0 then
+    begin
+      Result := done + r;
+      Exit;
+    end;
+    done := done + StrMaxBytes;
+  end;
+  r := PasIndexByteCpu(Pointer(Integer(P) + done), N - done, C);
+  if r >= 0 then
+    r := done + r;
+  Result := r;
+end;
+
+function PasFindByteCpu(P: Pointer; N, C: Int64): Int64;
+begin
+  if N <= StrMaxBytes then
+    Result := PasIndexByteCpu(P, N, C)
+  else
+    Result := FindByteLongCpu(P, N, C);
+end;
+
+function CompareByteLongCpu(A, B: Pointer; N: Int64): Int64;
+var
+  done: Int64;
+begin
+  done := 0;
+  while N - done > StrMaxBytes do
+  begin
+    Result := PasCmpByteCpu(Pointer(Integer(A) + done), Pointer(Integer(B) + done), StrMaxBytes);
+    if Result <> 0 then
+      Exit;
+    done := done + StrMaxBytes;
+  end;
+  Result := PasCmpByteCpu(Pointer(Integer(A) + done), Pointer(Integer(B) + done), N - done);
+end;
+
+function PasCompareByteCpu(A, B: Pointer; N: Int64): Int64;
+begin
+  if N <= StrMaxBytes then
+    Result := PasCmpByteCpu(A, B, N)
+  else
+    Result := CompareByteLongCpu(A, B, N);
+end;
+
+{ The case map of N bytes, at most StrMaxBytes a call (P270). }
+procedure CaseMapLongCpu(Src, Dst: PByte; N: Int64; Upper: Boolean);
+var
+  done: Int64;
+begin
+  done := 0;
+  while N - done > StrMaxBytes do
+  begin
+    PasCaseMapCpu(@Src[done], @Dst[done], StrMaxBytes, Upper);
+    done := done + StrMaxBytes;
+  end;
+  PasCaseMapCpu(@Src[done], @Dst[done], N - done, Upper);
+end;
+
+{ Whether A and B hold the same N bytes, MemEq at most StrMaxBytes a
+  call: the check of a needle longer than that (P270). }
+function MemEqLongCpu(A, B: PByte; N: Int64): Boolean;
+var
+  done: Int64;
+begin
+  done := 0;
+  while N - done > StrMaxBytes do
+  begin
+    if not PasMemEqCpu(@A[done], @B[done], StrMaxBytes) then
+    begin
+      Result := False;
+      Exit;
+    end;
+    done := done + StrMaxBytes;
+  end;
+  Result := PasMemEqCpu(@A[done], @B[done], N - done);
+end;
+
+function FindByteLongBase(P: Pointer; N, C: Int64): Int64;
+var
+  done, r: Int64;
+begin
+  done := 0;
+  while N - done > StrMaxBytes do
+  begin
+    r := PasIndexByteBase(Pointer(Integer(P) + done), StrMaxBytes, C);
+    if r >= 0 then
+    begin
+      Result := done + r;
+      Exit;
+    end;
+    done := done + StrMaxBytes;
+  end;
+  r := PasIndexByteBase(Pointer(Integer(P) + done), N - done, C);
+  if r >= 0 then
+    r := done + r;
+  Result := r;
+end;
+
+function PasFindByteBase(P: Pointer; N, C: Int64): Int64;
+begin
+  if N <= StrMaxBytes then
+    Result := PasIndexByteBase(P, N, C)
+  else
+    Result := FindByteLongBase(P, N, C);
+end;
+
+function CompareByteLongBase(A, B: Pointer; N: Int64): Int64;
+var
+  done: Int64;
+begin
+  done := 0;
+  while N - done > StrMaxBytes do
+  begin
+    Result := PasCmpByteBase(Pointer(Integer(A) + done), Pointer(Integer(B) + done), StrMaxBytes);
+    if Result <> 0 then
+      Exit;
+    done := done + StrMaxBytes;
+  end;
+  Result := PasCmpByteBase(Pointer(Integer(A) + done), Pointer(Integer(B) + done), N - done);
+end;
+
+function PasCompareByteBase(A, B: Pointer; N: Int64): Int64;
+begin
+  if N <= StrMaxBytes then
+    Result := PasCmpByteBase(A, B, N)
+  else
+    Result := CompareByteLongBase(A, B, N);
+end;
+
+{ The case map of N bytes, at most StrMaxBytes a call (P270). }
+procedure CaseMapLongBase(Src, Dst: PByte; N: Int64; Upper: Boolean);
+var
+  done: Int64;
+begin
+  done := 0;
+  while N - done > StrMaxBytes do
+  begin
+    PasCaseMapBase(@Src[done], @Dst[done], StrMaxBytes, Upper);
+    done := done + StrMaxBytes;
+  end;
+  PasCaseMapBase(@Src[done], @Dst[done], N - done, Upper);
+end;
+
+{ Whether A and B hold the same N bytes, MemEq at most StrMaxBytes a
+  call: the check of a needle longer than that (P270). }
+function MemEqLongBase(A, B: PByte; N: Int64): Boolean;
+var
+  done: Int64;
+begin
+  done := 0;
+  while N - done > StrMaxBytes do
+  begin
+    if not PasMemEqBase(@A[done], @B[done], StrMaxBytes) then
+    begin
+      Result := False;
+      Exit;
+    end;
+    done := done + StrMaxBytes;
+  end;
+  Result := PasMemEqBase(@A[done], @B[done], N - done);
+end;
+
 { ---- Pos ---- }
 
 { Rabin-Karp over S[From..N-1] for Sub (Go's IndexRabinKarp), its
@@ -1857,6 +2053,26 @@ begin
   until p < 0;
 end;
 
+{ A needle longer than StrMaxBytes (P270): Rabin-Karp all the way, linear
+  as Pos's own, each place the hashes agree checked a slice at a time. }
+function IndexOfLongCpu(Sp, Sb: PByte; N, NS, From: Int64): Int64;
+var
+  hs, pw, h: UInt32;
+  i, p: Int64;
+begin
+  Result := -1;
+  RkStart(Sp, Sb, NS, From, hs, pw, h);
+  i := From + NS;
+  repeat
+    p := RkNext(Sp, N, NS, hs, pw, i, h);
+    if (p >= 0) and MemEqLongCpu(@Sp[p], Sb, NS) then
+    begin
+      Result := p;
+      Exit;
+    end;
+  until p < 0;
+end;
+
 function RabinKarpBase(Sp, Sb: PByte; N, NS, From: Int64): Int64;
 var
   hs, pw, h: UInt32;
@@ -1877,6 +2093,50 @@ begin
   until p < 0;
 end;
 
+{ A needle longer than StrMaxBytes (P270): Rabin-Karp all the way, linear
+  as Pos's own, each place the hashes agree checked a slice at a time. }
+function IndexOfLongBase(Sp, Sb: PByte; N, NS, From: Int64): Int64;
+var
+  hs, pw, h: UInt32;
+  i, p: Int64;
+begin
+  Result := -1;
+  RkStart(Sp, Sb, NS, From, hs, pw, h);
+  i := From + NS;
+  repeat
+    p := RkNext(Sp, N, NS, hs, pw, i, h);
+    if (p >= 0) and MemEqLongBase(@Sp[p], Sb, NS) then
+    begin
+      Result := p;
+      Exit;
+    end;
+  until p < 0;
+end;
+
+function IndexOfCpu(Sp, Sb: PByte; N, NS, From: Int64): Int64; forward;
+
+{ A text with more than StrMaxBytes places for Sub after From (P270):
+  IndexOf over each StrMaxBytes of them in turn, the text it is given
+  ending where the last of them ends a match, so no call of a kernel
+  and no Rabin-Karp goes further; the loop head between two is where
+  the routine can be stopped. }
+function IndexOfSlicesCpu(Sp, Sb: PByte; N, NS, From: Int64): Int64;
+var
+  i, n2: Int64;
+begin
+  i := From;
+  repeat
+    n2 := i + StrMaxBytes + NS - 1;
+    if n2 > N then
+      n2 := N;
+    Result := IndexOfCpu(Sp, Sb, n2, NS, i);
+    if Result >= 0 then
+      Exit;
+    i := i + StrMaxBytes;
+  until i + NS > N;
+  Result := -1;
+end;
+
 { The place from 0 of Sub (NS bytes) in S (N bytes) from byte From on,
   -1 when it is not there: Go's stringslite.Index, IndexByte to the
   next first byte, MemEq for the rest, Rabin-Karp once the first byte
@@ -1892,10 +2152,15 @@ begin
   Result := -1;
   if NS > N - From then
     Exit;
+  if NS > StrMaxBytes then
+  begin
+    Result := IndexOfLongCpu(Sp, Sb, N, NS, From);
+    Exit;
+  end;
   c0 := Sb[0];
   if NS = 1 then
   begin
-    o := PasIndexByteCpu(@Sp[From], N - From, c0);
+    o := PasFindByteCpu(@Sp[From], N - From, c0);
     if o >= 0 then
       Result := From + o;
     Exit;
@@ -1903,6 +2168,12 @@ begin
   c1 := Sb[1];
   i := From;
   t := N - NS + 1;
+  { more than StrMaxBytes places: a slice of them at a time (P270) }
+  if t - i > StrMaxBytes then
+  begin
+    Result := IndexOfSlicesCpu(Sp, Sb, N, NS, From);
+    Exit;
+  end;
   fails := 0;
   while i < t do
   begin
@@ -1928,6 +2199,30 @@ begin
   end;
 end;
 
+function IndexOfBase(Sp, Sb: PByte; N, NS, From: Int64): Int64; forward;
+
+{ A text with more than StrMaxBytes places for Sub after From (P270):
+  IndexOf over each StrMaxBytes of them in turn, the text it is given
+  ending where the last of them ends a match, so no call of a kernel
+  and no Rabin-Karp goes further; the loop head between two is where
+  the routine can be stopped. }
+function IndexOfSlicesBase(Sp, Sb: PByte; N, NS, From: Int64): Int64;
+var
+  i, n2: Int64;
+begin
+  i := From;
+  repeat
+    n2 := i + StrMaxBytes + NS - 1;
+    if n2 > N then
+      n2 := N;
+    Result := IndexOfBase(Sp, Sb, n2, NS, i);
+    if Result >= 0 then
+      Exit;
+    i := i + StrMaxBytes;
+  until i + NS > N;
+  Result := -1;
+end;
+
 function IndexOfBase(Sp, Sb: PByte; N, NS, From: Int64): Int64;
 var
   c0, c1: Int64;
@@ -1936,10 +2231,15 @@ begin
   Result := -1;
   if NS > N - From then
     Exit;
+  if NS > StrMaxBytes then
+  begin
+    Result := IndexOfLongBase(Sp, Sb, N, NS, From);
+    Exit;
+  end;
   c0 := Sb[0];
   if NS = 1 then
   begin
-    o := PasIndexByteBase(@Sp[From], N - From, c0);
+    o := PasFindByteBase(@Sp[From], N - From, c0);
     if o >= 0 then
       Result := From + o;
     Exit;
@@ -1947,6 +2247,12 @@ begin
   c1 := Sb[1];
   i := From;
   t := N - NS + 1;
+  { more than StrMaxBytes places: a slice of them at a time (P270) }
+  if t - i > StrMaxBytes then
+  begin
+    Result := IndexOfSlicesBase(Sp, Sb, N, NS, From);
+    Exit;
+  end;
   fails := 0;
   while i < t do
   begin
@@ -2006,7 +2312,10 @@ begin
   Result := 0;
   if (Offset < 1) or (Offset > Length(S)) then
     Exit;
-  r := PasIndexByteCpu(@S[Offset], Length(S) - Offset + 1, Ord(C));
+  if Length(S) - Offset + 1 <= StrMaxBytes then
+    r := PasIndexByteCpu(@S[Offset], Length(S) - Offset + 1, Ord(C))
+  else
+    r := FindByteLongCpu(@S[Offset], Length(S) - Offset + 1, Ord(C));
   if r >= 0 then
     Result := Offset + r;
 end;
@@ -2018,7 +2327,10 @@ begin
   Result := 0;
   if (Offset < 1) or (Offset > Length(S)) then
     Exit;
-  r := PasIndexByteBase(@S[Offset], Length(S) - Offset + 1, Ord(C));
+  if Length(S) - Offset + 1 <= StrMaxBytes then
+    r := PasIndexByteBase(@S[Offset], Length(S) - Offset + 1, Ord(C))
+  else
+    r := FindByteLongBase(@S[Offset], Length(S) - Offset + 1, Ord(C));
   if r >= 0 then
     Result := Offset + r;
 end;
@@ -2033,7 +2345,11 @@ begin
   if Length(S) = 0 then
     Exit;
   SetLength(Result, Length(S));
-  PasCaseMapCpu(@S[1], @Result[1], Length(S), Upper);
+  { at most StrMaxBytes a call (P270) }
+  if Length(S) <= StrMaxBytes then
+    PasCaseMapCpu(@S[1], @Result[1], Length(S), Upper)
+  else
+    CaseMapLongCpu(@S[1], @Result[1], Length(S), Upper);
 end;
 
 function MapCaseBase(const S: string; Upper: Boolean): string;
@@ -2042,7 +2358,11 @@ begin
   if Length(S) = 0 then
     Exit;
   SetLength(Result, Length(S));
-  PasCaseMapBase(@S[1], @Result[1], Length(S), Upper);
+  { at most StrMaxBytes a call (P270) }
+  if Length(S) <= StrMaxBytes then
+    PasCaseMapBase(@S[1], @Result[1], Length(S), Upper)
+  else
+    CaseMapLongBase(@S[1], @Result[1], Length(S), Upper);
 end;
 
 function PasUpperCpu(const S: string): string;

@@ -1,0 +1,177 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+  GPL version 3 or later; see COPYING. No warranty. }
+
+{ P270: no kernel of a core unit holds its P longer than a slice. Run
+  on one processor (taskset -c 0), where the runtime keeps two Ps: for
+  each family, two routines start together and each makes one long call
+  (IndexByte, Pos, CompareByte, CompareText, the JSON escape finder,
+  UpperCase, a rotation, SHA-1, SHA-256, SHA-512, CRC-32, CRC-32C), so
+  both Ps are busy, while a third wakes every millisecond, makes a
+  little garbage for the collector and counts its wakes; the wakes that
+  fall while both calls run are counted (from the later start to the
+  earlier end). Every front gives its kernel at most 64 KiB a call, a
+  routine stops between two when sysmon asks (every 10 ms) or the
+  collector stops the world, and the third one runs: five wakes or more
+  fall while both run (some ten to twenty here). With the whole length
+  in one call, at most one at an edge did (1.1.119), save where the
+  front was already a loop of Pascal around a bounded kernel: SHA-512
+  and CRC-32C on amd64. On amd64 the kernels read 256 MiB in some 15 ms,
+  so six processes that spin (this program run again with the word hog
+  and its parent's number, each ending when that parent is gone) share
+  the processor with the two calls and make each last some ten times as
+  long; under qemu the kernels are slow enough on 32 MiB. The first
+  argument names the families: all, or str for the base processor,
+  whose hashes and CRCs are Pascal. }
+program kernslice;
+
+uses paslib, pashash, pasjson, sysutils;
+
+const
+  NHog = 6;
+  NFam = 12;
+  Names: array[0..11] of string = ('indexbyte', 'pos', 'comparebyte',
+    'comparetext', 'jsonesc', 'uppercase', 'rotate', 'sha1', 'sha256',
+    'sha512', 'crc32', 'crc32c');
+  { each family's length in MiB: on amd64 some 15 ms of one call alone
+    here (SHA-512 is Pascal there), under qemu some 100 ms }
+  MiBAmd: array[0..11] of Integer = (256, 256, 256, 256, 256, 32, 32, 32, 32, 8, 128, 128);
+  MiBArm: array[0..11] of Integer = (96, 96, 48, 48, 32, 32, 64, 8, 4, 4, 16, 32);
+
+var
+  txt, cur: string;
+  family, n: Integer;
+  ready, ticks, finished: Integer;
+  t0, t1, res: array[0..1] of Integer;
+  outs: array[0..1] of string;
+  mu: mutex;
+  wg: waitgroup;
+
+{ This program run with the word hog and its parent's number: spin
+  until that parent is gone (getppid gives another), or a minute has
+  passed. Only amd64 runs it. }
+procedure Hog(Parent: Integer);
+var
+  start, i, x: Integer;
+begin
+  start := Nanotime;
+  x := 0;
+  while (Syscall(110) = Parent) and (Nanotime - start < 60000000000) do
+    for i := 1 to 100000 do
+      x := x + i;
+  if x = 1 then
+    WriteLn('never');
+end;
+
+procedure RunHog;
+begin
+  ExecuteProcess('/proc/self/exe', ['hog', IntToStr(Syscall(39))]);
+end;
+
+procedure Call(Id: Integer);
+begin
+  case family of
+    0: res[Id] := IndexByte(cur[1], n, 35);
+    1: res[Id] := Pos('#!', cur);
+    2: res[Id] := CompareByte(cur[1], cur[1], n);
+    3: res[Id] := CompareText(cur, cur);
+    4: res[Id] := PasJsonEscIndex(@cur[1], n, True);
+    5: outs[Id] := UpperCase(cur);
+    6: outs[Id] := RotateLeft(cur, 3);
+    7: outs[Id] := Sha1(cur);
+    8: outs[Id] := Sha256(cur);
+    9: outs[Id] := Sha512(cur);
+    10: res[Id] := Crc32(cur);
+    11: res[Id] := Crc32c(cur);
+  end;
+end;
+
+procedure Work(Id: Integer);
+begin
+  lock mu do
+    ready := ready + 1;
+  while ready < 2 do
+    Yield;
+  t0[Id] := ticks;
+  Call(Id);
+  t1[Id] := ticks;
+  lock mu do
+    finished := finished + 1;
+  wg.Done;
+end;
+
+procedure Ticker;
+var
+  s: string;
+begin
+  while finished < 2 do
+  begin
+    ticks := ticks + 1;
+    s := IntToStr(ticks) + 'x';
+    if Length(s) = 0 then
+      WriteLn('never');
+    Sleep(1);
+  end;
+  wg.Done;
+end;
+
+var
+  f, h, both: Integer;
+  strOnly, same: Boolean;
+
+begin
+  if ParamStr(1) = 'hog' then
+  begin
+    Hog(StrToInt(ParamStr(2)));
+    Halt(0);
+  end;
+  strOnly := ParamStr(1) = 'str';
+  if Amd64 = 1 then
+  begin
+    for h := 1 to NHog do
+      pas RunHog;
+    Sleep(100);
+    SetLength(txt, 256 shl 20);
+  end
+  else
+    SetLength(txt, 96 shl 20);
+  FillChar(txt[1], Length(txt), 97);
+  for f := 0 to NFam - 1 do
+  begin
+    if strOnly and (f >= 7) then
+      Continue;
+    family := f;
+    if Amd64 = 1 then
+      n := MiBAmd[f] shl 20
+    else
+      n := MiBArm[f] shl 20;
+    if n = Length(txt) then
+      cur := txt
+    else
+      cur := Copy(txt, 1, n);
+    ready := 0;
+    ticks := 0;
+    finished := 0;
+    outs[0] := '';
+    outs[1] := '';
+    wg.Add(3);
+    pas Ticker;
+    pas Work(0);
+    pas Work(1);
+    wg.Wait;
+    same := (res[0] = res[1]) and (outs[0] = outs[1]);
+    { the wakes from the later start to the earlier end }
+    both := t1[0];
+    if t1[1] < both then
+      both := t1[1];
+    if t0[0] > t0[1] then
+      both := both - t0[0]
+    else
+      both := both - t0[1];
+    WriteLn(Names[f], ': the same answer ', same, ', the other routine ran while both calls ran: ',
+      both >= 5);
+  end;
+  { the routines waiting for the hogs are not waited for; each hog ends
+    when it finds its parent gone }
+  Halt(0);
+end.

@@ -84,6 +84,12 @@ function PasMerkleCheckBase(const Leaf: string; Index, Count: Integer; const Pro
 implementation
 
 const
+  { At most this many bytes go to a block routine in one call (P270):
+    an asm block is not preempted, and the code between two calls is
+    where the routine can be stopped, for the collector or for another
+    routine (§18). A multiple of 128, so of every block and of the 16
+    bytes of CRC32's folding. }
+  HashMaxBytes = 65536;
   { FIPS 180-4, 4.2.2: the first 32 bits of the fractional parts of
     the cube roots of the first 64 primes, for the SHA-256 kernels }
 
@@ -3305,7 +3311,7 @@ end;
 function PasCrc32Cpu(const S: string; Crc: Integer): Integer;
 var
   c: UInt32;
-  n, done: Integer;
+  n, done, k: Integer;
 begin
   c := UInt32(Crc);
   c := not c;
@@ -3314,15 +3320,21 @@ begin
   if n > 0 then
   begin
 {$ifdef CPUAARCH64}
-    c := Crc32Cpu(c, Pointer(S), n);
     done := n;
 {$else}
     if n >= 64 then
-    begin
       done := n - (n mod 16);
-      c := Crc32Cpu(c, Pointer(S), done);
-    end;
 {$endif}
+    { at most HashMaxBytes a call (P270); on amd64 the last piece keeps
+      the 64 bytes the folding needs }
+    k := 0;
+    while done - k > HashMaxBytes + 64 do
+    begin
+      c := Crc32Cpu(c, Pointer(Integer(Pointer(S)) + k), HashMaxBytes);
+      k := k + HashMaxBytes;
+    end;
+    if done > k then
+      c := Crc32Cpu(c, Pointer(Integer(Pointer(S)) + k), done - k);
     if done < n then
     begin
       BuildTabs;
@@ -3362,6 +3374,13 @@ begin
     done := n;
   end;
 {$endif}
+  { at most HashMaxBytes a call (P270); amd64's Crc32cFast goes in
+    pieces of three times CrcK2 already }
+  while n - done > HashMaxBytes do
+  begin
+    c := Crc32cCpu(c, Pointer(Integer(Pointer(S)) + done), HashMaxBytes);
+    done := done + HashMaxBytes;
+  end;
   if done < n then
     c := Crc32cCpu(c, Pointer(Integer(Pointer(S)) + done), n - done);
   c := not c;
@@ -3614,13 +3633,20 @@ function Sha256OfCpu(const S: string; Init: Pointer; OutWords: Integer): string;
 var
   st: array[0..7] of UInt32;
   buf: array[0..127] of Byte;
-  i, n, nb: Integer;
+  i, n, nb, done, take: Integer;
 begin
   for i := 0 to 7 do
     st[i] := LoadLE32(Pointer(Integer(Init) + i * 4));
   n := Length(S) div 64;
-  if n > 0 then
-    Sha256BlocksCpu(@st[0], Pointer(S), n);
+  done := 0;
+  while done < n do
+  begin
+    take := n - done;
+    if take > HashMaxBytes div 64 then
+      take := HashMaxBytes div 64;
+    Sha256BlocksCpu(@st[0], Pointer(Integer(Pointer(S)) + done * 64), take);
+    done := done + take;
+  end;
   Tail64(S, @buf[0], nb, False);
   Sha256BlocksCpu(@st[0], @buf[0], nb);
   SetLength(Result, OutWords * 4);
@@ -3642,7 +3668,7 @@ function PasSha1Cpu(const S: string): string;
 var
   st: array[0..4] of UInt32;
   buf: array[0..127] of Byte;
-  i, n, nb: Integer;
+  i, n, nb, done, take: Integer;
 begin
   st[0] := $67452301;
   st[1] := $efcdab89;
@@ -3650,8 +3676,15 @@ begin
   st[3] := $10325476;
   st[4] := $c3d2e1f0;
   n := Length(S) div 64;
-  if n > 0 then
-    Sha1BlocksCpu(@st[0], Pointer(S), n);
+  done := 0;
+  while done < n do
+  begin
+    take := n - done;
+    if take > HashMaxBytes div 64 then
+      take := HashMaxBytes div 64;
+    Sha1BlocksCpu(@st[0], Pointer(Integer(Pointer(S)) + done * 64), take);
+    done := done + take;
+  end;
   Tail64(S, @buf[0], nb, False);
   Sha1BlocksCpu(@st[0], @buf[0], nb);
   SetLength(Result, 20);
@@ -3663,13 +3696,20 @@ function Sha512OfCpu(const S: string; Init: Pointer; OutWords: Integer): string;
 var
   st: array[0..7] of Integer;
   buf: array[0..255] of Byte;
-  i, n, off, rest, nb: Integer;
+  i, n, off, rest, nb, done, take: Integer;
 begin
   for i := 0 to 7 do
     st[i] := LoadLE64(Pointer(Integer(Init) + i * 8));
   n := Length(S) div 128;
-  if n > 0 then
-    Sha512BlocksCpu(@st[0], Pointer(S), n);
+  done := 0;
+  while done < n do
+  begin
+    take := n - done;
+    if take > HashMaxBytes div 128 then
+      take := HashMaxBytes div 128;
+    Sha512BlocksCpu(@st[0], Pointer(Integer(Pointer(S)) + done * 128), take);
+    done := done + take;
+  end;
   { FIPS 180-4, 5.1.2: a 1 bit, zeros, the length in 128 bits }
   off := n * 128;
   rest := Length(S) - off;
@@ -3846,13 +3886,20 @@ function Sha256OfBase(const S: string; Init: Pointer; OutWords: Integer): string
 var
   st: array[0..7] of UInt32;
   buf: array[0..127] of Byte;
-  i, n, nb: Integer;
+  i, n, nb, done, take: Integer;
 begin
   for i := 0 to 7 do
     st[i] := LoadLE32(Pointer(Integer(Init) + i * 4));
   n := Length(S) div 64;
-  if n > 0 then
-    Sha256BlocksPlain(@st[0], Pointer(S), n);
+  done := 0;
+  while done < n do
+  begin
+    take := n - done;
+    if take > HashMaxBytes div 64 then
+      take := HashMaxBytes div 64;
+    Sha256BlocksPlain(@st[0], Pointer(Integer(Pointer(S)) + done * 64), take);
+    done := done + take;
+  end;
   Tail64(S, @buf[0], nb, False);
   Sha256BlocksPlain(@st[0], @buf[0], nb);
   SetLength(Result, OutWords * 4);
@@ -3874,7 +3921,7 @@ function PasSha1Base(const S: string): string;
 var
   st: array[0..4] of UInt32;
   buf: array[0..127] of Byte;
-  i, n, nb: Integer;
+  i, n, nb, done, take: Integer;
 begin
   st[0] := $67452301;
   st[1] := $efcdab89;
@@ -3882,8 +3929,15 @@ begin
   st[3] := $10325476;
   st[4] := $c3d2e1f0;
   n := Length(S) div 64;
-  if n > 0 then
-    Sha1BlocksPlain(@st[0], Pointer(S), n);
+  done := 0;
+  while done < n do
+  begin
+    take := n - done;
+    if take > HashMaxBytes div 64 then
+      take := HashMaxBytes div 64;
+    Sha1BlocksPlain(@st[0], Pointer(Integer(Pointer(S)) + done * 64), take);
+    done := done + take;
+  end;
   Tail64(S, @buf[0], nb, False);
   Sha1BlocksPlain(@st[0], @buf[0], nb);
   SetLength(Result, 20);
@@ -3895,13 +3949,20 @@ function Sha512OfBase(const S: string; Init: Pointer; OutWords: Integer): string
 var
   st: array[0..7] of Integer;
   buf: array[0..255] of Byte;
-  i, n, off, rest, nb: Integer;
+  i, n, off, rest, nb, done, take: Integer;
 begin
   for i := 0 to 7 do
     st[i] := LoadLE64(Pointer(Integer(Init) + i * 8));
   n := Length(S) div 128;
-  if n > 0 then
-    Sha512BlocksPlain(@st[0], Pointer(S), n);
+  done := 0;
+  while done < n do
+  begin
+    take := n - done;
+    if take > HashMaxBytes div 128 then
+      take := HashMaxBytes div 128;
+    Sha512BlocksPlain(@st[0], Pointer(Integer(Pointer(S)) + done * 128), take);
+    done := done + take;
+  end;
   { FIPS 180-4, 5.1.2: a 1 bit, zeros, the length in 128 bits }
   off := n * 128;
   rest := Length(S) - off;

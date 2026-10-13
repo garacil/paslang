@@ -26,6 +26,10 @@ read against the SDM. The unit's text is the source the compiler
 reads; run this after changing a kernel or a body:
 
     python3 scripts/hashgen.py
+
+make check runs it with --check, which writes nothing and fails when
+the unit is not what the template writes (P270: a line taken out of
+the unit by hand came back at the next run).
 """
 import os
 import sys
@@ -466,13 +470,20 @@ function Sha256Of{V}(const S: string; Init: Pointer; OutWords: Integer): string;
 var
   st: array[0..7] of UInt32;
   buf: array[0..127] of Byte;
-  i, n, nb: Integer;
+  i, n, nb, done, take: Integer;
 begin
   for i := 0 to 7 do
     st[i] := LoadLE32(Pointer(Integer(Init) + i * 4));
   n := Length(S) div 64;
-  if n > 0 then
-    {BLK256}(@st[0], Pointer(S), n);
+  done := 0;
+  while done < n do
+  begin
+    take := n - done;
+    if take > HashMaxBytes div 64 then
+      take := HashMaxBytes div 64;
+    {BLK256}(@st[0], Pointer(Integer(Pointer(S)) + done * 64), take);
+    done := done + take;
+  end;
   Tail64(S, @buf[0], nb, False);
   {BLK256}(@st[0], @buf[0], nb);
   SetLength(Result, OutWords * 4);
@@ -494,7 +505,7 @@ function PasSha1{V}(const S: string): string;
 var
   st: array[0..4] of UInt32;
   buf: array[0..127] of Byte;
-  i, n, nb: Integer;
+  i, n, nb, done, take: Integer;
 begin
   st[0] := $67452301;
   st[1] := $efcdab89;
@@ -502,8 +513,15 @@ begin
   st[3] := $10325476;
   st[4] := $c3d2e1f0;
   n := Length(S) div 64;
-  if n > 0 then
-    {BLK1}(@st[0], Pointer(S), n);
+  done := 0;
+  while done < n do
+  begin
+    take := n - done;
+    if take > HashMaxBytes div 64 then
+      take := HashMaxBytes div 64;
+    {BLK1}(@st[0], Pointer(Integer(Pointer(S)) + done * 64), take);
+    done := done + take;
+  end;
   Tail64(S, @buf[0], nb, False);
   {BLK1}(@st[0], @buf[0], nb);
   SetLength(Result, 20);
@@ -515,13 +533,20 @@ function Sha512Of{V}(const S: string; Init: Pointer; OutWords: Integer): string;
 var
   st: array[0..7] of Integer;
   buf: array[0..255] of Byte;
-  i, n, off, rest, nb: Integer;
+  i, n, off, rest, nb, done, take: Integer;
 begin
   for i := 0 to 7 do
     st[i] := LoadLE64(Pointer(Integer(Init) + i * 8));
   n := Length(S) div 128;
-  if n > 0 then
-    {BLK512}(@st[0], Pointer(S), n);
+  done := 0;
+  while done < n do
+  begin
+    take := n - done;
+    if take > HashMaxBytes div 128 then
+      take := HashMaxBytes div 128;
+    {BLK512}(@st[0], Pointer(Integer(Pointer(S)) + done * 128), take);
+    done := done + take;
+  end;
   { FIPS 180-4, 5.1.2: a 1 bit, zeros, the length in 128 bits }
   off := n * 128;
   rest := Length(S) - off;
@@ -724,7 +749,6 @@ HEAD = r'''{ This file is part of paslang.
   You should have received a copy of the GNU General Public License
   along with paslang.  If not, see <https://www.gnu.org/licenses/>. }
 
-{$mode objfpc}{$H+}
 
 { The hash words of the language (P111): Md5, Sha1, Sha224, Sha256,
   Sha384, Sha512, Sha3_224, Sha3_256, Sha3_384, Sha3_512, the HMAC of
@@ -791,6 +815,12 @@ function PasMerkleCheckBase(const Leaf: string; Index, Count: Integer; const Pro
 implementation
 
 const
+  { At most this many bytes go to a block routine in one call (P270):
+    an asm block is not preempted, and the code between two calls is
+    where the routine can be stopped, for the collector or for another
+    routine (§18). A multiple of 128, so of every block and of the 16
+    bytes of CRC32's folding. }
+  HashMaxBytes = 65536;
   { FIPS 180-4, 4.2.2: the first 32 bits of the fractional parts of
     the cube roots of the first 64 primes, for the SHA-256 kernels }
 '''
@@ -1313,7 +1343,7 @@ end;
 function PasCrc32Cpu(const S: string; Crc: Integer): Integer;
 var
   c: UInt32;
-  n, done: Integer;
+  n, done, k: Integer;
 begin
   c := UInt32(Crc);
   c := not c;
@@ -1322,15 +1352,21 @@ begin
   if n > 0 then
   begin
 {$ifdef CPUAARCH64}
-    c := Crc32Cpu(c, Pointer(S), n);
     done := n;
 {$else}
     if n >= 64 then
-    begin
       done := n - (n mod 16);
-      c := Crc32Cpu(c, Pointer(S), done);
-    end;
 {$endif}
+    { at most HashMaxBytes a call (P270); on amd64 the last piece keeps
+      the 64 bytes the folding needs }
+    k := 0;
+    while done - k > HashMaxBytes + 64 do
+    begin
+      c := Crc32Cpu(c, Pointer(Integer(Pointer(S)) + k), HashMaxBytes);
+      k := k + HashMaxBytes;
+    end;
+    if done > k then
+      c := Crc32Cpu(c, Pointer(Integer(Pointer(S)) + k), done - k);
     if done < n then
     begin
       BuildTabs;
@@ -1370,6 +1406,13 @@ begin
     done := n;
   end;
 {$endif}
+  { at most HashMaxBytes a call (P270); amd64's Crc32cFast goes in
+    pieces of three times CrcK2 already }
+  while n - done > HashMaxBytes do
+  begin
+    c := Crc32cCpu(c, Pointer(Integer(Pointer(S)) + done), HashMaxBytes);
+    done := done + HashMaxBytes;
+  end;
   if done < n then
     c := Crc32cCpu(c, Pointer(Integer(Pointer(S)) + done), n - done);
   c := not c;
@@ -1515,7 +1558,7 @@ end;
 '''
 
 
-def main():
+def main(check=False):
     sha256_x86 = asm_block(sha256())
     sha1_x86 = asm_block(sha1())
     sha1_arm = asm_block(asm_from_go.body(asm_from_go.GO / 'sha1' / 'sha1block_arm64.s'), True)
@@ -1612,9 +1655,19 @@ end;
     out.append(variant('Base'))
     out.append('\nend.\n')
     text = '\n'.join(out)
-    open(os.path.join(ROOT, 'src', 'lib', 'pashash.paslang'), 'w').write(text)
+    path = os.path.join(ROOT, 'src', 'lib', 'pashash.paslang')
+    if check:
+        # make check (P270): the unit is what this writes, so a change made
+        # in the unit and not here is not lost at the next run
+        if open(path).read() != text:
+            sys.exit('scripts/hashgen.py: src/lib/pashash.paslang is not what the template writes')
+        print('pashash.paslang is the template\'s')
+        return
+    open(path, 'w').write(text)
     print('written', text.count('\n'), 'lines')
 
 
 if __name__ == '__main__':
-    main()
+    if sys.argv[1:] not in ([], ['--check']):
+        sys.exit('usage: scripts/hashgen.py [--check]')
+    main('--check' in sys.argv[1:])

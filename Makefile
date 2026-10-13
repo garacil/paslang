@@ -210,6 +210,8 @@ GOLDEN_A64 += cputune
 # UTF-8 validation, one kernel per machine (P201)
 GOLDEN += utf8kern
 GOLDEN_A64 += utf8kern
+GOLDEN += longslice
+GOLDEN_A64 += longslice
 # JSON's scans, one kernel per machine (P202)
 GOLDEN += jsonkern
 GOLDEN_A64 += jsonkern
@@ -730,7 +732,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/stackmap.out $(BUILDDIR)/stackmap.vgot; \
 	echo ok stackmaps; \
 	echo "==== the base processor (-cpu base) ===="; \
-	for t in vectors vecmore vecpool bitwords xxh3 inlineasm hash1 tree1 store1 mapsplit set256 strwords strkern strcmpk cmpwords sysutils1 utf8kern jsonkern; do \
+	for t in vectors vecmore vecpool bitwords xxh3 inlineasm hash1 tree1 store1 mapsplit set256 strwords strkern strcmpk cmpwords sysutils1 utf8kern jsonkern longslice; do \
 	  $(OUTDIR)/paslangc -cpu base -o $(BUILDDIR)/$$t-base testdata/$$t.paslang; \
 	  $(BUILDDIR)/$$t-base > $(BUILDDIR)/$$t.bgot; \
 	  diff -u testdata/$$t.out $(BUILDDIR)/$$t.bgot; \
@@ -761,11 +763,19 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -qw 'ptest' $(BUILDDIR)/set256-v2.s; \
 	if grep -qw 'vptest' $(BUILDDIR)/set256-v2.s; then echo "set256-v2.s carries AVX2"; exit 1; fi; \
 	: a program for the base processor links no instruction past it, P268: inlineasm writes AVX2 itself and strkern calls the AVX2 kernels to test them; \
-	for t in vectors vecmore vecpool bitwords xxh3 hash1 tree1 store1 mapsplit set256 strwords strcmpk cmpwords sysutils1 utf8kern jsonkern; do \
+	for t in vectors vecmore vecpool bitwords xxh3 hash1 tree1 store1 mapsplit set256 strwords strcmpk cmpwords sysutils1 utf8kern jsonkern longslice; do \
 	  python3 -I scripts/check_cpubin.py base $(BUILDDIR)/$$t-base > /dev/null || { python3 -I scripts/check_cpubin.py base $(BUILDDIR)/$$t-base; exit 1; }; \
 	done; \
 	: the UTF-8 kernels against the strict decoder of Python, P201: the expected output is the model output; \
 	python3 -I scripts/utf8kern_model.py testdata/utf8kern.paslang | diff -u testdata/utf8kern.out -; \
+	: every front of a kernel against Python across the edges of its slices of 64 KiB, P270; \
+	python3 -I scripts/longslice_model.py testdata/longslice.paslang | diff -u testdata/longslice.out -; \
+	: pashash is what scripts/hashgen.py writes from its template, P270; \
+	python3 -I scripts/hashgen.py --check; \
+	grep -q 'call p_passtr_pasfindbytecpu$$' $(BUILDDIR)/longslice.s || { echo "longslice.s does not call the AVX2 front of IndexByte"; exit 1; }; \
+	grep -q 'call p_passtr_pascomparebytecpu$$' $(BUILDDIR)/longslice.s || { echo "longslice.s does not call the AVX2 front of CompareByte"; exit 1; }; \
+	grep -q 'call p_passtr_pasfindbytebase$$' $(BUILDDIR)/longslice-base.s || { echo "longslice-base.s does not call the base front of IndexByte"; exit 1; }; \
+	if grep -q 'call p_passtr_pas[a-z]*cpu$$' $(BUILDDIR)/longslice-base.s; then echo "longslice-base.s calls an AVX2 front"; exit 1; fi; \
 	grep -q 'call p_passtr_pasutf8blockscpu$$' $(BUILDDIR)/$(LVL_X64)/passtr.s || { echo "passtr's v3 build does not call the AVX2 UTF-8 kernel"; exit 1; }; \
 	if grep -q 'call p_passtr_pasutf8blockscpu$$' $(BUILDDIR)/passtr.s; then echo "passtr's base build calls the AVX2 UTF-8 kernel"; exit 1; fi; \
 	: the scans of JSON against their definitions, P202: the expected output is the model output, the v3 build calls the AVX2 kernels and the base build the SSE2 ones; \
@@ -811,6 +821,14 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	taskset -c 0 timeout 120 $(BUILDDIR)/utf8slice > $(BUILDDIR)/utf8slice.got; \
 	diff -u testdata/utf8slice.out $(BUILDDIR)/utf8slice.got; \
 	echo ok utf8slice; \
+	echo "==== the core units' kernels give way (P270) ===="; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/kernslice testdata/kernslice.paslang; \
+	taskset -c 0 timeout 300 $(BUILDDIR)/kernslice all > $(BUILDDIR)/kernslice.got; \
+	diff -u testdata/kernslice.out $(BUILDDIR)/kernslice.got; \
+	$(OUTDIR)/paslangc -cpu base -o $(BUILDDIR)/kernslice-base testdata/kernslice.paslang; \
+	taskset -c 0 timeout 300 $(BUILDDIR)/kernslice-base str > $(BUILDDIR)/kernslice.bgot; \
+	head -n 7 testdata/kernslice.out | diff -u - $(BUILDDIR)/kernslice.bgot; \
+	echo ok kernslice; \
 	echo "==== alloc bits ===="; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/allocbits testdata/allocbits.paslang; \
 	for w in "" PASLANG_GCPOISON=1 "PASLANG_GCSTRESS=50 PASLANG_GCPOISON=1" "PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=10 PASLANG_GCPOISON=1" PASLANG_GC=off; do \
@@ -2891,7 +2909,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/cputuse-arm > $(BUILDDIR)/cputuse-arm.got; \
 	diff -u testdata/cputuse.out $(BUILDDIR)/cputuse-arm.got; \
 	echo "==== the base processor arm64 ===="; \
-	for t in hash1 tree1 store1 vectors bitwords set256 strwords strkern strcmpk cmpwords sysutils1 utf8kern jsonkern; do \
+	for t in hash1 tree1 store1 vectors bitwords set256 strwords strkern strcmpk cmpwords sysutils1 utf8kern jsonkern longslice; do \
 	  $(OUTDIR)/paslangc -target arm64 -cpu base -o $(BUILDDIR)/$$t-arm-base testdata/$$t.paslang; \
 	  timeout 120 $(QEMU_A64) $(BUILDDIR)/$$t-arm-base > $(BUILDDIR)/$$t-arm.bgot; \
 	  diff -u testdata/$$t.out $(BUILDDIR)/$$t-arm.bgot; \
@@ -2969,6 +2987,14 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	taskset -c 0 timeout 600 $(QEMU_A64) $(BUILDDIR)/utf8slice-arm > $(BUILDDIR)/utf8slice-arm.got; \
 	diff -u testdata/utf8slice.out $(BUILDDIR)/utf8slice-arm.got; \
 	echo ok utf8slice-arm; \
+	echo "==== the core units' kernels give way arm64 (P270) ===="; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -o $(BUILDDIR)/kernslice-arm testdata/kernslice.paslang; \
+	taskset -c 0 timeout 600 $(QEMU_A64) $(BUILDDIR)/kernslice-arm all > $(BUILDDIR)/kernslice-arm.got; \
+	diff -u testdata/kernslice.out $(BUILDDIR)/kernslice-arm.got; \
+	$(OUTDIR)/paslangc -target arm64 -cpu base -o $(BUILDDIR)/kernslice-armb testdata/kernslice.paslang; \
+	taskset -c 0 timeout 600 $(QEMU_A64) $(BUILDDIR)/kernslice-armb str > $(BUILDDIR)/kernslice-armb.got; \
+	head -n 7 testdata/kernslice.out | diff -u - $(BUILDDIR)/kernslice-armb.got; \
+	echo ok kernslice-arm; \
 	echo "==== alloc bits arm64 ===="; \
 	$(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/allocbits-arm testdata/allocbits.paslang; \
 	for w in "" PASLANG_GCPOISON=1 "PASLANG_GCSTRESS=50 PASLANG_GCPOISON=1" "PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=50 PASLANG_GCPOISON=1" PASLANG_GC=off; do \
