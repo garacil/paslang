@@ -68,7 +68,9 @@ PAIRS = ["b1loop", "b2str", "b3spawn", "b4chan", "b5map", "b6smap", "b7narrow", 
          # P223: everything else paslang does that Go does too.
          "b12num", "b13strw", "b14sort", "b15io", "b16net", "b17conc", "b18sync", "b19heap",
          "b20hash", "b21text", "b22rand", "b23date", "b24math", "b25exec", "b26slice", "b27call",
-         "b28stack", "b29exc", "b30gc", "b31map", "b32fs"]
+         "b28stack", "b29exc", "b30gc", "b31map", "b32fs",
+         # P201: UTF-8 validation (PasUtf8Valid against unicode/utf8.Valid)
+         "b33utf8"]
 # The longest one run may take, in seconds: a run past it is killed, its
 # unit stops being measured and fails (Go's side of every pair takes
 # under 1 s; paslang's append of a character, quadratic until its hito,
@@ -98,6 +100,7 @@ SECTIONS = {
     "b30gc": ["trees"],
     "b31map": ["iter", "delete", "update"],
     "b32fs": ["stat", "list"],
+    "b33utf8": ["ascii", "mixed"],
 }
 CHECKPTR = ["b8ptr"]
 PROBES = ["p1alloccap", "p2deeprec", "p3divzero", "p4nil", "p5bounds", "p6strbounds", "p7parked"]

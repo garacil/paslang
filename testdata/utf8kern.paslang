@@ -1,0 +1,204 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+  GPL version 3 or later; see COPYING. No warranty. }
+
+{ P201: UTF-8 validation, one kernel per machine. Every class of
+  sequence below (right, wrong, cut by the end, and the noncharacters
+  I-JSON refuses with their neighbours) in a run of filler of one to
+  four bytes a character, at every place of every length to 70 and of
+  the lengths around two blocks, in both modes: PasUtf8Valid (the kernel
+  of the build: AVX2 for native on amd64, SSE2 and Go's automaton for
+  base, NEON on arm64), the Plain body, and the pieces' interface fed in
+  three parts cut inside sequences, which must agree; each class's
+  answers are summed into one line that scripts/utf8kern_model.py gives
+  from Python's strict decoder. Then every class ending exactly at the
+  end of a readable page, the next one unmapped: nothing reads past the
+  input. }
+program utf8kern;
+
+const
+  NClass = 45;
+  { the classes, as hex: scripts/utf8kern_model.py reads this table }
+  Classes: array[0..44] of string = (
+    '41', 'C280', 'DFBF', 'E0A080', 'E1BFBE', 'ED9FBF', 'EE8080', 'EFBFBD',
+    'F0908080', 'F0AFBFBE', 'F4808080', 'F48FBFBD',
+    '80', 'BF', 'C080', 'C1BF', 'C2', 'C241', 'C2C2', 'E080', 'E09FBF', 'E0A0', 'E0A041',
+    'EDA080', 'EDBFBF', 'F08080', 'F08FBFBF', 'F09080', 'F0908041', 'F4908080',
+    'F5808080', 'F8888080', 'FF', 'FE',
+    'EFB790', 'EFB7AF', 'EFB78F', 'EFB7B0', 'EFBFBE', 'EFBFBF', 'F09FBFBE',
+    'F48FBFBF', 'F3BFBFBF', 'F09FBFBD', 'E1BFBF');
+  { the filler of each run: one character of one to four bytes }
+  Fills: array[0..3] of string = ('61', 'C3A9', 'E282AC', 'F09F9880');
+  NLong = 6;
+  Longs: array[0..5] of Integer = (120, 127, 128, 129, 130, 200);
+
+var
+  buf: array[0..1023] of Byte;
+  cls, fil: array[0..7] of Byte;
+  ncls, nfil: Integer;
+  bad: Integer;
+
+function HexByte(const s: string; i: Integer): Byte;
+var
+  k, v, c: Integer;
+begin
+  v := 0;
+  for k := 0 to 1 do
+  begin
+    c := Ord(s[2 * i + 1 + k]);
+    if c <= Ord('9') then
+      v := v * 16 + c - Ord('0')
+    else
+      v := v * 16 + c - Ord('A') + 10;
+  end;
+  Result := Byte(v);
+end;
+
+procedure Unhex(const s: string; b: PByte; out n: Integer);
+var
+  i: Integer;
+begin
+  n := Length(s) div 2;
+  for i := 0 to n - 1 do
+    b[i] := HexByte(s, i);
+end;
+
+{ L bytes into P: filler to O, the class, filler after; a filler
+  character that does not fit is made of 'a's. }
+procedure Build(P: PByte; L, O: Integer);
+var
+  i, k: Integer;
+begin
+  i := 0;
+  while i + nfil <= O do
+  begin
+    for k := 0 to nfil - 1 do
+      P[i + k] := fil[k];
+    i := i + nfil;
+  end;
+  while i < O do
+  begin
+    P[i] := 97;
+    i := i + 1;
+  end;
+  for k := 0 to ncls - 1 do
+    P[O + k] := cls[k];
+  i := O + ncls;
+  while i + nfil <= L do
+  begin
+    for k := 0 to nfil - 1 do
+      P[i + k] := fil[k];
+    i := i + nfil;
+  end;
+  while i < L do
+  begin
+    P[i] := 97;
+    i := i + 1;
+  end;
+end;
+
+{ The answer of every way, which must agree: the kernel, the Plain body
+  (a sequence the end cuts is an error at its start), and the pieces. }
+function Check(P: PByte; L: Integer; IJ: Boolean): Integer;
+var
+  a, b, pend, c1, c2, f: Integer;
+  st: TPasUtf8;
+begin
+  a := PasUtf8Valid(P, L, IJ);
+  b := PasUtf8Plain(P, L, IJ, pend);
+  if (b < 0) and (pend > 0) then
+    b := L - pend;
+  c1 := L div 3 + 1;
+  if c1 > L then
+    c1 := L;
+  c2 := (2 * L) div 3 + 2;
+  if c2 > L then
+    c2 := L;
+  PasUtf8Start(st, IJ);
+  f := PasUtf8Feed(st, P, c1);
+  if f < 0 then
+    f := PasUtf8Feed(st, @P[c1], c2 - c1);
+  if f < 0 then
+    f := PasUtf8Feed(st, @P[c2], L - c2);
+  if f < 0 then
+    f := PasUtf8End(st);
+  if (a <> b) or (a <> f) then
+  begin
+    bad := bad + 1;
+    if bad < 10 then
+      WriteLn('disagree: length ', L, ' kernel ', a, ' plain ', b, ' pieces ', f);
+  end;
+  Result := a;
+end;
+
+var
+  c, fl, L, O, k, r, li, mode: Integer;
+  n: Int64;
+  sum: Int64;
+  ij: Boolean;
+  page, pg: Integer;
+  q: PByte;
+
+begin
+  bad := 0;
+  for c := 0 to NClass - 1 do
+  begin
+    Unhex(Classes[c], @cls[0], ncls);
+    n := 0;
+    sum := 0;
+    for mode := 0 to 1 do
+    begin
+      ij := mode = 1;
+      for fl := 0 to 3 do
+      begin
+        Unhex(Fills[fl], @fil[0], nfil);
+        for li := -70 to NLong - 1 do
+        begin
+          if li < 0 then
+            L := li + 71
+          else
+            L := Longs[li];
+          if L < ncls then
+            Continue;
+          for O := 0 to L - ncls do
+          begin
+            Build(@buf[0], L, O);
+            r := Check(@buf[0], L, ij);
+            n := n + 1;
+            sum := (sum * 31 + r + 2) mod 1000000007;
+          end;
+        end;
+      end;
+    end;
+    WriteLn(Classes[c], ' ', n, ' ', sum);
+  end;
+  { the guard page: every class at the end of the readable page }
+  if Amd64 = 1 then
+    page := Syscall(9, 0, 8192, 3, 34, -1, 0)
+  else
+    page := Syscall(222, 0, 8192, 3, 34, -1, 0);
+  if Amd64 = 1 then
+    pg := Syscall(10, page + 4096, 4096, 0)
+  else
+    pg := Syscall(226, page + 4096, 4096, 0);
+  n := 0;
+  sum := 0;
+  for c := 0 to NClass - 1 do
+  begin
+    Unhex(Classes[c], @cls[0], ncls);
+    Unhex(Fills[1], @fil[0], nfil);
+    for L := ncls to 140 do
+    begin
+      q := PByte(Pointer(page + 4096 - L));
+      Build(q, L, L - ncls);
+      for mode := 0 to 1 do
+      begin
+        r := Check(q, L, mode = 1);
+        n := n + 1;
+        sum := (sum * 31 + r + 2) mod 1000000007;
+      end;
+    end;
+  end;
+  WriteLn('guard ', pg, ' ', n, ' ', sum);
+  WriteLn('disagree ', bad);
+end.
