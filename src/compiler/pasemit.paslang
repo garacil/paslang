@@ -331,6 +331,8 @@ type
     FLocRanges: array of TLocRange;
     FStubs: string;         { the slow paths of a promoted loop's checks, placed after it }
     FLastIns: string;       { the last instruction emitted, when nothing that a jump reaches came after it (P96) }
+    FTextSec: Boolean;      { the section Line writes into holds code (P267) }
+    FTextPushed: Boolean;   { ... and the one a .pushsection left, for its .popsection }
     FProgProcs: TProcArray; { every routine of the compilation, to find a routine's nested ones }
     FTmpStmts: TStmtArray;
     FSawDump: Boolean;      { CollectNames met a DumpLocals, which reads every local }
@@ -359,6 +361,7 @@ type
     FDescHash: array of LongInt; { open addressing over FDescOut, -1 empty }
     FMapLab: LongInt;
     procedure Line(const S: string);
+    procedure NoteSection(const S: string);
     function ForwardLoad(const S: string; out Drop: Boolean): string;
     procedure NoteLine(const S: string);
     procedure MapNote(const S: string);
@@ -775,6 +778,30 @@ begin
   FLen := need;
 end;
 
+{ Which section a directive Line writes moves to: code for .text and
+  for a .section whose flags have x, data for every other (P267). }
+procedure TEmitter.NoteSection(const S: string);
+var
+  code: Boolean;
+begin
+  if S = '.popsection' then
+  begin
+    FTextSec := FTextPushed;
+    Exit;
+  end;
+  if (Copy(S, 1, 5) = '.text') or (Copy(S, 1, 18) = '.pushsection .text') then
+    code := True
+  else if (Copy(S, 1, 8) = '.section') or (Copy(S, 1, 12) = '.pushsection') then
+    code := (Pos('"ax"', S) > 0) or (Copy(S, 1, 14) = '.section .text')
+  else if (S = '.data') or (S = '.bss') then
+    code := False
+  else
+    Exit;
+  if Copy(S, 1, 12) = '.pushsection' then
+    FTextPushed := FTextSec;
+  FTextSec := code;
+end;
+
 procedure TEmitter.Line(const S: string);
 var
   n: SizeInt;
@@ -782,9 +809,27 @@ var
   drop: Boolean;
 begin
   n := Length(S);
+  if (n >= 5) and (S[1] = '.') then
+    NoteSection(S);
   if (n > 4) and (n < 128) and (S[1] = 'r') and (S[2] = 't') and (S[3] = '_') and
     (S[n] = ':') then
+  begin
+    { arm64: a routine of the runtime starts on 32 bytes, as every
+      routine does there (P267), where Arm's Neoverse N1 guide (4.9)
+      puts subroutine entries and branch targets (Go aligns arm64's to
+      16, cmd/internal/obj/arm64/asm7.go funcAlign). In code only: a
+      label of the runtime in a data section stays where its data is;
+      the padding of a code section is no-op instructions (as.info
+      7.75), so an entry the code before it falls into (rt_waitio2) runs
+      them first. Not amd64: aligned to 32 as Go aligns them
+      (cmd/link/internal/amd64/l.go funcAlign), entries moved the hot
+      loops across 64-byte lines on this Zen 2 and pairs pinned to one
+      CPU changed by -5.7 to +8.7 %, worse on the whole; measured, it
+      stays as it was. }
+    if FTextSec and FArm then
+      AppendLine('  .p2align 5');
     AppendLine('.globl ' + Copy(S, 1, n - 1));
+  end;
   t := S;
   drop := False;
   if (not FArm) and (FLastIns <> '') then
@@ -6168,14 +6213,16 @@ begin
   Line(ok + ':');
 end;
 
-{ amd64: the target of a loop's back edge starts on 32 bytes (P100): a
-  loop whose few instructions crossed a fetch block ran a fifth slower
+{ The target of a loop's back edge starts on 32 bytes (P100): a loop
+  whose few instructions crossed a fetch block ran a fifth slower
   (b7narrow's histogram, 280M cycles where Go's took 198M). The padding
-  lies after a jump, or runs once as the loop starts. }
+  lies after a jump, or runs once as the loop starts. arm64 too since
+  P267: Arm's Neoverse N1 guide (4.9) aligns branch targets to 32 bytes
+  and keeps a loop of 32 bytes or less within one aligned 32-byte
+  region. }
 procedure TEmitter.AlignLoop;
 begin
-  if not FArm then
-    Line('  .p2align 5');
+  Line('  .p2align 5');
 end;
 
 procedure TEmitter.JumpCC(const CC, L: string);
@@ -19503,6 +19550,7 @@ begin
           c := Lab;
           PushLoop(b, c);
           Line('  b ' + c);
+          AlignLoop;
           Line(a + ':');
           EmitStmt(S^.Body);
           Line(c + ':');
@@ -19521,6 +19569,7 @@ begin
           a := Lab;
           b := Lab;
           PushLoop(b, a);
+          AlignLoop;
           Line(a + ':');
           EmitStackCheck(a, '16');
           EmitStmt(S^.Body);
@@ -23997,6 +24046,10 @@ begin
     Line('.section .text.' + Pr.Sym + ',"ax",%progbits')
   else
     Line('.section .text.' + Pr.Sym + ',"ax",@progbits');
+  { arm64: every routine on 32 bytes (P267; the runtime's in Line, and
+    why not amd64 there) }
+  if FArm then
+    Line('  .p2align 5');
   FOwnSec := Pr.Sym;
   FDbgFn := Pr.Sym;
   FDbgLine := 0;

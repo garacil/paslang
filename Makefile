@@ -2987,6 +2987,9 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	$(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/hello-arm testdata/hello.paslang; \
 	$(QEMU_A64) $(BUILDDIR)/hello-arm > $(BUILDDIR)/hello-arm.got; \
 	diff -u testdata/hello.out $(BUILDDIR)/hello-arm.got; \
+	: every routine of an arm64 program starts on 32 bytes, P267; \
+	bad=$$(nm -n $(BUILDDIR)/hello-arm | grep -E ' [Tt] (p_|rt_)' | while read a t n; do if [ $$((0x$$a % 32)) -ne 0 ]; then echo $$n; fi; done | wc -l); \
+	test "$$bad" -eq 0 || { echo "hello-arm: $$bad routines do not start on 32 bytes"; exit 1; }; \
 	echo ok hello-arm; \
 	echo "==== slice arm64 ===="; \
 	$(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/slice-arm testdata/slice.paslang; \
