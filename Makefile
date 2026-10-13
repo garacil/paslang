@@ -196,6 +196,9 @@ GOLDEN_A64 += condjump
 # a function of one expression goes in as its expression (P266)
 GOLDEN += exprinline
 GOLDEN_A64 += exprinline
+# the processor in the code: $CPU and $TUNE, LZCNT and TZCNT (P261)
+GOLDEN += cputune
+GOLDEN_A64 += cputune
 # P263: code chooses by the version of paslangc compiling it: {$if},
 # {$elseif}, PASLANG_FULLVERSION and its parts, defined(), skipped branches.
 GOLDEN += condver
@@ -1547,6 +1550,75 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(BUILDDIR)/conduse > $(BUILDDIR)/conduse.got; \
 	diff -u testdata/conduse.out $(BUILDDIR)/conduse.got; \
 	echo ok condbad; \
+	echo "==== cpubad and cputune ===="; \
+	: the processor in the code, P261: the directives refused where they cannot be, the processors the flags do not know; \
+	for f in 'unknown:{$$CPU zen9}: zen9 is no processor or feature of amd64 at 3' \
+	  'empty:{$$CPU} wants a processor, a feature or DEFAULT at 3' \
+	  'featarm:{$$CPU base+atomics}: atomics is no processor or feature of amd64 at 3' \
+	  'tunearm:{$$TUNE neoverse-n1}: neoverse-n1 is no processor of the target' \
+	  'inbody:{$$CPU} or {$$TUNE} at line 6 is inside the body of P: they stand between routines' \
+	  'inmain:{$$CPU} or {$$TUNE} at line 5 is inside the main block' \
+	  'ininit:{$$CPU} or {$$TUNE} at line 12 is inside the initialization or the finalization'; do \
+	  n=$${f%%:*}; w=$${f#*:}; \
+	  if $(OUTDIR)/paslangc -o $(BUILDDIR)/cpb_$$n testdata/cpubad/$$n.paslang >$(BUILDDIR)/cpb_$$n.err 2>&1; then \
+	    echo "$$n should fail"; exit 1; \
+	  fi; \
+	  grep -qF -e "$$w" $(BUILDDIR)/cpb_$$n.err || { cat $(BUILDDIR)/cpb_$$n.err; exit 1; }; \
+	done; \
+	for f in '-cpu zen9:zen9 is no processor or feature of amd64' \
+	  '-tune foo:-tune foo: no processor of the target' \
+	  '-tune neoverse-n1:-tune neoverse-n1: no processor of the target' \
+	  '-target arm64 -cpu native:native is the machine compiling, which is not an arm64 one' \
+	  '-target arm64 -cpu zen2:zen2 is no processor or feature of arm64'; do \
+	  o=$${f%%:*}; w=$${f#*:}; \
+	  if $(OUTDIR)/paslangc $$o -o $(BUILDDIR)/cpb_flag testdata/hello.paslang >$(BUILDDIR)/cpb_flag.err 2>&1; then \
+	    echo "paslangc $$o should fail"; exit 1; \
+	  fi; \
+	  grep -qF -e "$$w" $(BUILDDIR)/cpb_flag.err || { cat $(BUILDDIR)/cpb_flag.err; exit 1; }; \
+	done; \
+	$(OUTDIR)/paslangc -v | grep -q '^processor: ' || { echo "paslangc -v names no processor"; exit 1; }; \
+	: the same counts compiled for the base, for a processor named, with the costs of another; \
+	for c in base 'native -tune zen5' 'native -tune zen2' 'native -inline 0'; do \
+	  $(OUTDIR)/paslangc -cpu $$c -o $(BUILDDIR)/cputune-c testdata/cputune.paslang; \
+	  $(BUILDDIR)/cputune-c > $(BUILDDIR)/cputune-c.got; \
+	  diff -u testdata/cputune.out $(BUILDDIR)/cputune-c.got; \
+	done; \
+	python3 -I scripts/cputune_out.py testdata/cputune.paslang | diff -u testdata/cputune.out - ; \
+	: under -cpu base, the routines after the CPU haswell directive take lzcnt and tzcnt and say so, the base ones bsr and bsf, and One stays a call from the main block; \
+	$(OUTDIR)/paslangc -cpu base -o $(BUILDDIR)/cputune-b testdata/cputune.paslang; \
+	awk '/^p_lzfast:/,/^\.section/' $(BUILDDIR)/cputune-b.s > $(BUILDDIR)/cputune-lzfast.s; \
+	awk '/^p_tzfast:/,/^\.section/' $(BUILDDIR)/cputune-b.s > $(BUILDDIR)/cputune-tzfast.s; \
+	awk '/^p_lzbase:/,/^\.section/' $(BUILDDIR)/cputune-b.s > $(BUILDDIR)/cputune-lzbase.s; \
+	awk '/^p_tzbase:/,/^\.section/' $(BUILDDIR)/cputune-b.s > $(BUILDDIR)/cputune-tzbase.s; \
+	awk '/^pas_main:/,/^\.section/' $(BUILDDIR)/cputune-b.s > $(BUILDDIR)/cputune-main.s; \
+	test $$(grep -c 'lzcnt[lq] ' $(BUILDDIR)/cputune-lzfast.s) = 7 || { echo "cputune.s: LzFast has not seven lzcnt"; exit 1; }; \
+	test $$(grep -c 'tzcnt[lq] ' $(BUILDDIR)/cputune-tzfast.s) = 7 || { echo "cputune.s: TzFast has not seven tzcnt"; exit 1; }; \
+	if grep -q 'bsr\|bsf' $(BUILDDIR)/cputune-lzfast.s $(BUILDDIR)/cputune-tzfast.s; then echo "cputune.s: a haswell routine has bsr or bsf"; exit 1; fi; \
+	test $$(grep -c 'bsrq ' $(BUILDDIR)/cputune-lzbase.s) = 7 && test $$(grep -c 'bsfq ' $(BUILDDIR)/cputune-tzbase.s) = 7 || { echo "cputune.s: the base routines are not bsr and bsf"; exit 1; }; \
+	if grep -q 'lzcnt\|tzcnt' $(BUILDDIR)/cputune-lzbase.s $(BUILDDIR)/cputune-tzbase.s $(BUILDDIR)/cputune-main.s; then echo "cputune.s: a base routine has lzcnt or tzcnt"; exit 1; fi; \
+	grep -qF '/* p_lzfast: cpu ' $(BUILDDIR)/cputune-b.s && grep -F '/* p_lzfast: cpu ' $(BUILDDIR)/cputune-b.s | grep -q 'bmi1.* lzcnt.*; tune haswell \*/' || { echo "cputune.s: LzFast does not say its processor"; exit 1; }; \
+	grep -qF '; tune zen1 */' $(BUILDDIR)/cputune-b.s || { echo "cputune.s: Tuned does not say its tune"; exit 1; }; \
+	if grep -qF '/* p_lzbase' $(BUILDDIR)/cputune-b.s; then echo "cputune.s: a routine of the command line's processor says one"; exit 1; fi; \
+	grep -q 'call p_one$$' $(BUILDDIR)/cputune-main.s || { echo "cputune.s: One, of another processor, went into the main block"; exit 1; }; \
+	if grep -q 'call p_two$$' $(BUILDDIR)/cputune-main.s; then echo "cputune.s: Two, of the main block's processor, stayed a call"; exit 1; fi; \
+	: the runtime by -tune: the highest bit of the last word that differs is 63 - lzcnt on zen2, bsr on zen5 and haswell; \
+	$(OUTDIR)/paslangc -cpu haswell -tune zen2 -o $(BUILDDIR)/cputune-hz2 testdata/cputune.paslang; \
+	$(OUTDIR)/paslangc -cpu haswell -tune zen5 -o $(BUILDDIR)/cputune-hz5 testdata/cputune.paslang; \
+	$(OUTDIR)/paslangc -cpu zen2 -tune generic -o $(BUILDDIR)/cputune-z2g testdata/cputune.paslang; \
+	grep -A1 'lzcntq %rcx, %rcx' $(BUILDDIR)/cputune-hz2.s | grep -q 'xorq $$63, %rcx' && grep -A1 'lzcntq %rdx, %rcx' $(BUILDDIR)/cputune-hz2.s | grep -q 'xorq $$63, %rcx' || { echo "cputune-hz2.s: the runtime does not take 63 - lzcnt"; exit 1; }; \
+	if grep -q 'bsrq %rcx, %rcx\|bsrq %rdx, %rcx' $(BUILDDIR)/cputune-hz2.s; then echo "cputune-hz2.s: the runtime keeps bsr on zen2's costs"; exit 1; fi; \
+	for f in hz5 z2g; do \
+	  grep -q 'bsrq %rcx, %rcx' $(BUILDDIR)/cputune-$$f.s && grep -q 'bsrq %rdx, %rcx' $(BUILDDIR)/cputune-$$f.s || { echo "cputune-$$f.s: the runtime does not keep bsr"; exit 1; }; \
+	  if grep -q 'lzcntq %rcx, %rcx' $(BUILDDIR)/cputune-$$f.s; then echo "cputune-$$f.s: the runtime takes lzcnt"; exit 1; fi; \
+	done; \
+	: a unit compiled for base whose routine and initialization are for haswell; \
+	$(OUTDIR)/paslangc -cpu base testdata/units/cpuu.paslang; \
+	grep -qF '/* p_cpuu_uhigh: cpu ' $(BUILDDIR)/cpuu.s && grep -qF '/* u_cpuu_init: cpu ' $(BUILDDIR)/cpuu.s || { echo "cpuu.s: the unit's routine or initialization does not say its processor"; exit 1; }; \
+	awk '/^p_cpuu_uhigh:/,/^\.section/' $(BUILDDIR)/cpuu.s | grep -q 'lzcnt' || { echo "cpuu.s: UHigh has no lzcnt"; exit 1; }; \
+	$(OUTDIR)/paslangc -cpu base -Fu $(BUILDDIR) -o $(BUILDDIR)/cputuse testdata/cputuse.paslang; \
+	$(BUILDDIR)/cputuse > $(BUILDDIR)/cputuse.got; \
+	diff -u testdata/cputuse.out $(BUILDDIR)/cputuse.got; \
+	echo ok cpubad; \
 	echo "==== treebad ===="; \
 	for f in 'tryset:TryGet needs a tree with values: k in t says whether k is there at 10:24 in testdata/treebad/tryset.paslang' \
 	  'setval:+= of a tree of K: t[k] is True or False, and Include(t, k) puts k in at 8:11' \
@@ -1652,16 +1724,22 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'ror x[0-9]*, x[0-9]*, #51$$' $(BUILDDIR)/bitops_apool.s; \
 	grep -q 'ror w[0-9]*, w[0-9]*, w16$$' $(BUILDDIR)/bitops_apool.s; \
 	test $$(grep -A1 'asr x[0-9]*, x[0-9]*, #2$$' $(BUILDDIR)/bitops_apool.s | grep -c sxtb) -eq 0; \
-	$(OUTDIR)/paslangc -o $(BUILDDIR)/bitwords_s testdata/bitwords.paslang; \
+	: the bit words on a pool register, P261: popcnt, lzcnt and tzcnt for x86-64-v3, and for the base the SWAR count, bsr and bsf; \
+	$(OUTDIR)/paslangc -cpu v3 -o $(BUILDDIR)/bitwords_s testdata/bitwords.paslang; \
 	sed -n '/^p_pool:/,/cfi_endproc/p' $(BUILDDIR)/bitwords_s.s > $(BUILDDIR)/bitwords_pool.s; \
-	for i in 'popcntq %r' 'bsfq %r' 'bsrq %r' 'bswapq %r' 'rolw $$8, %'; do \
+	for i in 'popcntq %r' 'lzcntq %r' 'tzcntq %r' 'lzcntl %e' 'tzcntl %e' 'bswapq %r' 'rolw $$8, %'; do \
 	  grep -qF -e "$$i" $(BUILDDIR)/bitwords_pool.s || { echo "bitwords pool lacks $$i"; exit 1; }; \
 	done; \
+	if grep -q 'bsf\|bsr' $(BUILDDIR)/bitwords_pool.s; then echo "bitwords pool for v3 has bsf or bsr"; exit 1; fi; \
 	test $$(grep -c rt_haspopcnt $(BUILDDIR)/bitwords_s.s) -eq 0; \
 	$(OUTDIR)/paslangc -cpu base -o $(BUILDDIR)/bitwords_b testdata/bitwords.paslang; \
 	sed -n '/^p_pool:/,/cfi_endproc/p' $(BUILDDIR)/bitwords_b.s > $(BUILDDIR)/bitwords_bpool.s; \
 	test $$(grep -c popcnt $(BUILDDIR)/bitwords_bpool.s) -eq 0; \
 	grep -qF -e 'movabsq $$6148914691236517205, %' $(BUILDDIR)/bitwords_bpool.s; \
+	for i in 'bsfq %r' 'bsrq %r'; do \
+	  grep -qF -e "$$i" $(BUILDDIR)/bitwords_bpool.s || { echo "bitwords base pool lacks $$i"; exit 1; }; \
+	done; \
+	if grep -q 'lzcnt\|tzcnt' $(BUILDDIR)/bitwords_bpool.s; then echo "bitwords pool for base has lzcnt or tzcnt"; exit 1; fi; \
 	$(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/bitwords_a testdata/bitwords.paslang; \
 	sed -n '/^p_pool:/,/cfi_endproc/p' $(BUILDDIR)/bitwords_a.s > $(BUILDDIR)/bitwords_apool.s; \
 	for i in 'cnt v16.8b, v16.8b' 'rbit x' 'clz x' 'rev x' 'rev16 w'; do \
@@ -2714,6 +2792,19 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	awk '/^p_branchy:/,/ret$$/' $(BUILDDIR)/exprinline-arm.s > $(BUILDDIR)/exprinline-branchy-arm.s; \
 	grep -q 'b.ge ' $(BUILDDIR)/exprinline-branchy-arm.s || { echo "exprinline-arm.s: Branchy does not branch on Less's compare"; exit 1; }; \
 	if grep -q 'bl p_less\|cset' $(BUILDDIR)/exprinline-branchy-arm.s; then echo "exprinline-arm.s: Branchy calls Less or makes a Boolean"; exit 1; fi; \
+	: the processor in the code on arm64, P261: the routines after the CPU neoverse-n1 directive say it, LSE is on for them, and the unit runs; \
+	$(OUTDIR)/paslangc -target arm64 -cpu base -Fu $(A64DIR) -o $(BUILDDIR)/cputune-ab testdata/cputune.paslang; \
+	grep -q '^.arch_extension lse$$' $(BUILDDIR)/cputune-ab.s || { echo "cputune-ab.s: no LSE for the neoverse-n1 routines"; exit 1; }; \
+	grep -F '/* p_lzfast: cpu ' $(BUILDDIR)/cputune-ab.s | grep -q 'atomics.*; tune neoverse-n1 \*/' || { echo "cputune-ab.s: LzFast does not say its processor"; exit 1; }; \
+	grep -qF '; tune neoverse-v1 */' $(BUILDDIR)/cputune-ab.s || { echo "cputune-ab.s: Tuned does not say its tune"; exit 1; }; \
+	awk '/^pas_main:/,/^\.section/' $(BUILDDIR)/cputune-ab.s | grep -q 'bl p_one$$' || { echo "cputune-ab.s: One, of another processor, went into the main block"; exit 1; }; \
+	timeout 300 $(QEMU_A64) $(BUILDDIR)/cputune-ab > $(BUILDDIR)/cputune-ab.got; \
+	diff -u testdata/cputune.out $(BUILDDIR)/cputune-ab.got; \
+	$(OUTDIR)/paslangc -target arm64 -cpu base testdata/units/cpuu.paslang; \
+	grep -qF '/* u_cpuu_init: cpu ' $(A64DIR)/cpuu.s || { echo "cpuu-arm.s: the initialization does not say its processor"; exit 1; }; \
+	$(OUTDIR)/paslangc -target arm64 -cpu base -Fu $(A64DIR) -o $(BUILDDIR)/cputuse-arm testdata/cputuse.paslang; \
+	timeout 300 $(QEMU_A64) $(BUILDDIR)/cputuse-arm > $(BUILDDIR)/cputuse-arm.got; \
+	diff -u testdata/cputuse.out $(BUILDDIR)/cputuse-arm.got; \
 	echo "==== the base processor arm64 ===="; \
 	for t in hash1 tree1 store1 vectors bitwords set256 strwords strkern strcmpk cmpwords sysutils1; do \
 	  $(OUTDIR)/paslangc -target arm64 -cpu base -o $(BUILDDIR)/$$t-arm-base testdata/$$t.paslang; \

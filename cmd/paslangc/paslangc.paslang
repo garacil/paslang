@@ -96,6 +96,8 @@ var
   { -checkptr (P104): every pointer step and access held to its object. }
   checkPtr: Boolean;
   cpuSpec: string;    { -cpu: the processor the code is compiled for (P111) }
+  tuneSpec: string;   { -tune: the processor whose costs choose between forms that do the same (P261) }
+  cpuTune: LongInt;
   inlineMax: LongInt; { -inline: the largest routine put in place where it is called (P112) }
   inlineArg: Int64;
   cpuSet: Int64;
@@ -151,6 +153,111 @@ begin
   Result := CpuFeatures;
 end;
 
+{ CPUID leaf Leaf, subleaf 0, on amd64 (SDM vol. 2A CPUID); nothing on
+  arm64. }
+procedure HostCpuid(Leaf: Int64; out A, B, C, D: Int64);
+var
+  ra, rb, rc, rd: Int64;
+begin
+  asm amd64 (Leaf: in rax; ra: out rax; rb: out rbx; rc: out rcx; rd: out rdx)
+    xorl %ecx, %ecx
+    cpuid
+  end;
+  asm arm64 (ra: out x0; rb: out x1; rc: out x2; rd: out x3)
+    mov x0, xzr
+    mov x1, xzr
+    mov x2, xzr
+    mov x3, xzr
+  end;
+  A := ra;
+  B := rb;
+  C := rc;
+  D := rd;
+end;
+
+{ MIDR_EL1 on arm64, which Linux gives a program by trapping the MRS
+  when HWCAP_CPUID (bit 11 of AT_HWCAP) says so, as Go reads it
+  (golang src/internal/cpu/cpu_arm64_hwcap.go, getMIDR in
+  cpu_arm64.s); nothing on amd64. }
+function HostMidr: Int64;
+var
+  m: Int64;
+begin
+  asm amd64 (m: out rax)
+    xorl %eax, %eax
+  end;
+  asm arm64 (m: out x0)
+    mrs x0, midr_el1
+  end;
+  Result := m;
+end;
+
+{ The four characters of a register of CPUID leaf 0, low byte first. }
+function RegChars(R: Int64): string;
+var
+  i: LongInt;
+begin
+  Result := '';
+  for i := 0 to 3 do
+    Result := Result + Chr((R shr (8 * i)) and 255);
+end;
+
+{ The machine compiling (P261, Regla 14), into pasast's CpuHostProc,
+  the name the table has for it ('' when it has none), and Desc, what
+  -v says. amd64: the vendor of CPUID leaf 0 (EBX, EDX, ECX) and the
+  family and model of leaf 1 EAX, the base fields and the extended
+  ones as the vendor's manual puts them together (SDM vol. 1 21.3:
+  DisplayFamily adds the extended family when the family is 0Fh,
+  DisplayModel prepends the extended model when it is 06h or 0Fh; AMD
+  APM vol. 3 E.3.2: both when the base family is Fh). arm64: MIDR_EL1
+  (Implementer 31:24, PartNum 15:4: ARM ARM D24.2.136). }
+procedure HostIdent(out Desc: string);
+var
+  a, b, c, d, fam, model: Int64;
+  vendor: string;
+  k: LongInt;
+begin
+  CpuHostProc := '';
+  if HostArm then
+  begin
+    if ((CpuFeatures shr 11) and 1) = 0 then
+    begin
+      Desc := 'MIDR_EL1 not given (no HWCAP_CPUID)';
+      Exit;
+    end;
+    a := HostMidr;
+    Desc := 'MIDR_EL1 ' + IntToHex2(Byte(a shr 24)) + IntToHex2(Byte(a shr 16)) + IntToHex2(Byte(a shr 8)) +
+      IntToHex2(Byte(a));
+    k := CpuIdentArm(a);
+  end
+  else
+  begin
+    HostCpuid(0, a, b, c, d);
+    vendor := RegChars(b) + RegChars(d) + RegChars(c);
+    HostCpuid(1, a, b, c, d);
+    fam := (a shr 8) and 15;
+    model := (a shr 4) and 15;
+    if vendor = 'AuthenticAMD' then
+    begin
+      if fam = 15 then
+      begin
+        fam := fam + ((a shr 20) and 255);
+        model := model + ((a shr 16) and 15) * 16;
+      end;
+    end
+    else
+    begin
+      if (fam = 6) or (fam = 15) then
+        model := model + ((a shr 16) and 15) * 16;
+      if fam = 15 then
+        fam := fam + ((a shr 20) and 255);
+    end;
+    Desc := vendor + ' family ' + IntToHex2(Byte(fam)) + 'h model ' + IntToHex2(Byte(model)) + 'h';
+    k := CpuIdentX86(vendor, LongInt(fam), LongInt(model));
+  end;
+  CpuHostProc := CpuProcName(k);
+end;
+
 procedure CompileUnit(const SrcPath, OutBase: string; const UPath: TStrArray; arm: Boolean);
 var
   src, asmText, sPath, oPath, piPath, piText, dir: string;
@@ -159,7 +266,7 @@ begin
   if not ReadFile(SrcPath, src) then
     Die('cannot read ' + SrcPath);
   DieWhere := SrcPath;
-  prog := ParseSource(src, UPath, arm, cpuSet);
+  prog := ParseSource(src, UPath, arm, cpuSet, cpuTune);
   prog.SrcName := SrcPath;
   prog.CheckPtr := checkPtr;
   prog.InlineMax := inlineMax;
@@ -190,7 +297,7 @@ begin
 end;
 
 var
-  srcPath, outPath, sPath, oPath, src, piPath, piText, topic: string;
+  srcPath, outPath, sPath, oPath, src, piPath, piText, topic, hostDesc: string;
   installDir, pkgDir, uSrc, uBase, stamp, uname: string;
   i: LongInt;
   prog: TProgram;
@@ -255,6 +362,13 @@ begin
         Die('missing argument for -cpu');
       cpuSpec := ParamStr(i);
     end
+    else if ParamStr(i) = '-tune' then
+    begin
+      Inc(i);
+      if i > ParamCount then
+        Die('missing argument for -tune');
+      tuneSpec := ParamStr(i);
+    end
     else if ParamStr(i) = '-Fu' then
     begin
       Inc(i);
@@ -272,6 +386,13 @@ begin
     else if (ParamStr(i) = '-v') or (ParamStr(i) = '--version') then
     begin
       PrintBanner;
+      { the machine compiling, what -cpu native and -tune native are
+        (P261) }
+      HostIdent(hostDesc);
+      if CpuHostProc <> '' then
+        WriteLn('processor: ' + CpuHostProc + ' (' + hostDesc + ')')
+      else
+        WriteLn('processor: none of the table (' + hostDesc + '): native takes its features, and no costs');
       PrintLicense;
       Halt(0);
     end
@@ -339,23 +460,61 @@ begin
   DieWhere := srcPath;
   { The processor the code is compiled for (-cpu, P111): what this
     machine has when the target is this machine, the base processor
-    when compiling across, unless -cpu says. }
+    when compiling across, unless -cpu says. The machine compiling is
+    known by its name too (P261): native is its features and its costs,
+    and -cpu NAME a processor's features and costs; -tune NAME the
+    costs alone; $CPU and $TUNE in the code over both. }
+  CpuHostTarget := arm = HostArm;
+  CpuHostSet := 0;
+  CpuHostProc := '';
+  if CpuHostTarget then
+  begin
+    CpuHostSet := NativeCpu;
+    HostIdent(hostDesc);
+  end;
   if cpuSpec = '' then
   begin
-    if arm = HostArm then
+    if CpuHostTarget then
       cpuSpec := 'native'
     else
       cpuSpec := 'base';
   end;
-  cpuSet := CpuSetOf(cpuSpec, arm, NativeCpu, cpuErr);
+  cpuSet := CpuSetOf(cpuSpec, arm, CpuHostSet, cpuErr);
+  if cpuErr = 'native' then
+  begin
+    if arm then
+      Die('-cpu ' + cpuSpec + ': native is the machine compiling, which is not an arm64 one')
+    else
+      Die('-cpu ' + cpuSpec + ': native is the machine compiling, which is not an amd64 one');
+  end;
   if cpuErr <> '' then
   begin
     if arm then
-      Die('-cpu ' + cpuSpec + ': ' + cpuErr + ' is no feature of arm64 (base, native, max, v8.1, v8.2, crypto, or a name of CpuHas)')
+      Die('-cpu ' + cpuSpec + ': ' + cpuErr + ' is no processor or feature of arm64 (base, native, max, v8.1, ' +
+        'v8.2, crypto, the processors ' + CpuProcNames(True) + ', or a name of CpuHas)')
     else
-      Die('-cpu ' + cpuSpec + ': ' + cpuErr + ' is no feature of amd64 (base, native, max, v2, v3, v4, or a name of CpuHas)');
+      Die('-cpu ' + cpuSpec + ': ' + cpuErr + ' is no processor or feature of amd64 (base, native, max, v2, v3, ' +
+        'v4, the processors ' + CpuProcNames(False) + ', or a name of CpuHas)');
   end;
-  prog := ParseSource(src, upath, arm, cpuSet);
+  cpuTune := CpuSpecTune(cpuSpec, arm);
+  if tuneSpec <> '' then
+  begin
+    if ToLower(tuneSpec) = 'generic' then
+      cpuTune := 0
+    else if ToLower(tuneSpec) = 'native' then
+    begin
+      if not CpuHostTarget then
+        Die('-tune native: native is the machine compiling, which is not the target');
+      cpuTune := CpuProcIndex(CpuHostProc, arm);
+    end
+    else
+    begin
+      cpuTune := CpuProcIndex(tuneSpec, arm);
+      if cpuTune = 0 then
+        Die('-tune ' + tuneSpec + ': no processor of the target (generic, native, or ' + CpuProcNames(arm) + ')');
+    end;
+  end;
+  prog := ParseSource(src, upath, arm, cpuSet, cpuTune);
   prog.SrcName := srcPath;
   prog.CheckPtr := checkPtr;
   prog.InlineMax := inlineMax;

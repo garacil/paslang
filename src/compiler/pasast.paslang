@@ -310,6 +310,12 @@ type
     IsAnon: Boolean;
     Shared: TStrArray;
     Pins: TStrArray;
+    { The processor its code is compiled for (P261): the $CPU and
+      $TUNE in force where its body stands, over -cpu and -tune; when
+      CpuOwn is False, the program's (a routine the compiler makes). }
+    CpuOwn: Boolean;
+    CpuSet: Int64;
+    CpuTune: LongInt;
   end;
   TProcArray = array of TProc;
 
@@ -342,6 +348,9 @@ type
     TypeNames: array of string;
     IfaceTypes: LongInt;   { how many types a unit's interface had declared: a named type past them is the implementation's, and its .pi does not name it (P110) }
     CpuSet: Int64;         { the processor the code is compiled for (-cpu, P111): the bits CpuFeatBit names }
+    CpuTune: LongInt;      { the processor whose costs choose between forms that do the same (-tune, P261): its place in the table of CpuProcName, 0 none }
+    MainCpu: Int64;        { the processor of the main block, and of a unit's initialization and finalization: the directives in force there (P261) }
+    MainTune: LongInt;
     TypeIds: array of LongInt;
     Vars: TVarDeclArray;
     Procs: TProcArray;
@@ -364,6 +373,22 @@ function FoldMulHi(A, B: Int64; Signed: Boolean): Int64;
 function CpuFeatBit(const Name: string; Arm: Boolean): LongInt;
 function CpuSetOf(const Spec: string; Arm: Boolean; Native: Int64; out Err: string): Int64;
 function CpuFeatNames(Arm: Boolean): string;
+function CpuProcIndex(const Name: string; Arm: Boolean): LongInt;
+function CpuProcName(Idx: LongInt): string;
+function CpuProcNames(Arm: Boolean): string;
+function CpuSpecTune(const Spec: string; Arm: Boolean): LongInt;
+function CpuIdentX86(const Vendor: string; Family, Model: LongInt): LongInt;
+function CpuIdentArm(Midr: Int64): LongInt;
+function CpuCostLzcntBsr(Tune: LongInt): Boolean;
+function CpuSetNames(ASet: Int64; Arm: Boolean): string;
+
+var
+  { The machine compiling (P261): whether the target is that machine,
+    its features and the table's name for it ('' when the table does not
+    have it), what native says. }
+  CpuHostTarget: Boolean;
+  CpuHostSet: Int64;
+  CpuHostProc: string;
 
 function WritesFirst(S: PStmt; const N, Alias: string): Boolean;
 function NewInt(V: Int64): PExpr;
@@ -904,13 +929,345 @@ begin
     Result := x;
 end;
 
+{ The processors the compiler knows by name (P261, Regla 14): -cpu
+  NAME takes its features, as GCC's -march does, and the costs of its
+  instructions choose between forms that do the same (-tune NAME, which
+  -cpu NAME implies). Entry 0 is no processor: the target's own choices.
+
+  Every feature is the manufacturer's (docs/ref/asm):
+  - AMD, chapter 2 of each Software Optimization Guide, "the following
+    ... subsets are supported", the later generations adding to the
+    earlier: zen1 (55723: SSE3 to SSE4.2, AVX, AVX2, AES, SHA, RDRAND,
+    F16C, CLMUL, MOVBE, LZCNT/POPCNT, BMI1, BMI2; RDSEED and ADCX new),
+    zen2 (56305: the same), zen3 (56665: AVX2 VAES/VPCLMULQDQ new), zen4
+    (57647: AVX-512 F, DQ, BW, VL, VBMI, VNNI, GFNI), zen5 (58455: the
+    same and AVX-VNNI, which paslang does not name). FMA and CMPXCHG16B
+    are rows of each latency table, with their CPUID flag.
+  - Intel, SDM vol. 1 table 5-2 (the generation that brought each
+    extension) with its note 3 (Alder Lake has no AVX-512), and the
+    optimization manual 248966-049 3.7.6 (enhanced REP MOVSB from Ivy
+    Bridge): haswell (AES-NI, PCLMULQDQ, AVX, F16C, RDRAND, then FMA,
+    AVX2, BMI1, BMI2, LZCNT, MOVBE), broadwell (ADX, RDSEED), skylake,
+    skylake-avx512 (Xeon Scalable: AVX512F, DQ, BW, VL), cascadelake
+    (AVX512_VNNI), cannonlake (SHA, AVX512_VBMI), icelake (VAES, GFNI,
+    VPCLMULQDQ and AVX512_VNNI), tigerlake, sapphirerapids, alderlake
+    (the extensions before it, without AVX-512).
+  - Arm, the ID registers of each core's Technical Reference Manual,
+    read through the field each HWCAP is (docs/ref/linux/elf_hwcaps.rst):
+    cortex-a72 (100095 4.3.18, 4.3.20: CRC32), cortex-a76 (100798
+    13.62-13.68: Armv8.2, Atomic 2, RDM, DP, LRCPC 1, DPB 1, FP and
+    AdvSIMD 1), neoverse-n1 (100616: the same and PFR1.SSBS 2),
+    neoverse-v1 (101427 3.2.73-3.2.79, 3.7.5: and TS 1, FHM, JSCVT,
+    FCMA, LRCPC 2, DPB 2, I8MM, BF16, DGH, APA, GPA, SVE, DIT,
+    MMFR2.AT), neoverse-n2 and neoverse-v2 (102099 B.5, 102375 A.5: and
+    TS 2, FRINTTS, SB, SVE2 with BitPerm, I8MM and BF16, BT), and
+    neoverse-n3 and neoverse-v3 (107997, 107734: those, RNDR 1, and
+    pointer authentication by QARMA3 in ISAR2.APA3 and GPA3, which
+    elf_hwcaps.rst does not give as PACA or PACG). The Cryptographic
+    Extension is a choice of the chip on every core: a name never has
+    it, and crypto after the name adds the core's (SHA2 2 gives sha512
+    too; SHA3, SM3, SM4 and SVE's AES on the cores that have them).
+  The machine compiling is named by CpuIdentX86 and CpuIdentArm.
+
+  The costs (bit 0 of ProcCost: the index of a word's highest bit
+  set is cheaper as 63 - LZCNT than as BSR) are the latency tables:
+  BSR is 6 ops of latency 4 and LZCNT 1 op of latency 1 on zen1
+  (amd-family17h-latencies-1.00), zen2 (-17h-30h-) and zen3
+  (-family19h-); BSR is 1 op of latency 1 on zen5 (amd-zen5-latencies)
+  and LZCNT and BSR take 3 cycles each on Skylake (Intel 336289-001),
+  where BSR stays. A processor without a table keeps BSR. }
+const
+  CpuProcs = 23;
+  { the features every amd64 processor of the table has: x86-64-v3 and
+    v2 (psABI 1.0 table 3.1), AES and CLMUL, RDRAND }
+  ProcX86 = 'sse3 ssse3 sse41 sse42 popcnt cx16 avx avx2 bmi1 bmi2 fma f16c movbe lzcnt aes pclmul rdrand';
+  ProcZen = ProcX86 + ' sha rdseed adx';
+  ProcZen4 = ProcZen + ' vaes vpclmulqdq avx512f avx512dq avx512bw avx512vl avx512vbmi avx512vnni gfni';
+  ProcBdw = ProcX86 + ' erms adx rdseed';
+  ProcSkx = ProcBdw + ' avx512f avx512dq avx512bw avx512vl';
+  ProcIcl = ProcSkx + ' sha avx512vbmi avx512vnni vaes vpclmulqdq gfni';
+  ProcA76 = 'crc32 atomics rdm fphp asimdhp dotprod lrcpc dcpop';
+  ProcV1 = ProcA76 + ' fhm flagm jscvt fcma ilrcpc dcpodp i8mm bf16 dgh sve svei8mm svebf16 dit uscat ssbs';
+  ProcN2 = ProcV1 + ' flagm2 frint sb sve2 svebitperm bti';
+  ProcCrypto = 'aes pmull sha1 sha2';
+  ProcCrypto3 = ProcCrypto + ' sha512 sha3 sm3 sm4';
+
+{ The table, entry by entry: the name, the features, the Cryptographic
+  Extension's (arm64), the costs. }
+function ProcName(I: LongInt): string;
+begin
+  case I of
+    1: Result := 'zen1';
+    2: Result := 'zen2';
+    3: Result := 'zen3';
+    4: Result := 'zen4';
+    5: Result := 'zen5';
+    6: Result := 'haswell';
+    7: Result := 'broadwell';
+    8: Result := 'skylake';
+    9: Result := 'skylake-avx512';
+    10: Result := 'cascadelake';
+    11: Result := 'cannonlake';
+    12: Result := 'icelake';
+    13: Result := 'tigerlake';
+    14: Result := 'sapphirerapids';
+    15: Result := 'alderlake';
+    16: Result := 'cortex-a72';
+    17: Result := 'cortex-a76';
+    18: Result := 'neoverse-n1';
+    19: Result := 'neoverse-v1';
+    20: Result := 'neoverse-n2';
+    21: Result := 'neoverse-v2';
+    22: Result := 'neoverse-n3';
+    23: Result := 'neoverse-v3';
+  else
+    Result := '';
+  end;
+end;
+
+function ProcArm(I: LongInt): Boolean;
+begin
+  Result := I >= 16;
+end;
+
+function ProcFeats(I: LongInt): string;
+begin
+  case I of
+    1, 2: Result := ProcZen;
+    3: Result := ProcZen + ' vaes vpclmulqdq';
+    4, 5: Result := ProcZen4;
+    6: Result := ProcX86 + ' erms';
+    7, 8: Result := ProcBdw;
+    9: Result := ProcSkx;
+    10: Result := ProcSkx + ' avx512vnni';
+    11: Result := ProcSkx + ' sha avx512vbmi';
+    12, 13, 14: Result := ProcIcl;
+    15: Result := ProcBdw + ' sha vaes vpclmulqdq gfni';
+    16: Result := 'crc32';
+    17: Result := ProcA76;
+    18: Result := ProcA76 + ' ssbs';
+    19: Result := ProcV1 + ' paca pacg';
+    20, 21: Result := ProcN2 + ' paca pacg';
+    22, 23: Result := ProcN2 + ' rng';
+  else
+    Result := '';
+  end;
+end;
+
+function ProcCryptoFeats(I: LongInt): string;
+begin
+  case I of
+    16, 17, 18: Result := ProcCrypto;
+    19: Result := ProcCrypto3;
+    20, 21, 22, 23: Result := ProcCrypto3 + ' sveaes svepmull svesha3 svesm4';
+  else
+    Result := '';
+  end;
+end;
+
+{ bit 0: 63 - LZCNT is cheaper than BSR }
+function ProcCost(I: LongInt): Int64;
+begin
+  case I of
+    1, 2, 3: Result := 1;
+  else
+    Result := 0;
+  end;
+end;
+
+{ The table's place of the processor Name of the target, 0 for none. }
+function CpuProcIndex(const Name: string; Arm: Boolean): LongInt;
+var
+  i: LongInt;
+  n: string;
+begin
+  Result := 0;
+  n := Name;
+  for i := 1 to Length(n) do
+    if (n[i] >= 'A') and (n[i] <= 'Z') then
+      n[i] := Chr(Ord(n[i]) + 32);
+  if n = '' then
+    Exit;
+  for i := 1 to CpuProcs do
+    if (ProcName(i) = n) and (ProcArm(i) = Arm) then
+    begin
+      Result := i;
+      Exit;
+    end;
+end;
+
+function CpuProcName(Idx: LongInt): string;
+begin
+  Result := ProcName(Idx);
+end;
+
+{ The target's processors, by name, for its messages. }
+function CpuProcNames(Arm: Boolean): string;
+var
+  i: LongInt;
+begin
+  Result := '';
+  for i := 1 to CpuProcs do
+    if ProcArm(i) = Arm then
+    begin
+      if Result <> '' then
+        Result := Result + ' ';
+      Result := Result + ProcName(i);
+    end;
+end;
+
+{ The processor whose costs a -cpu Spec implies (P261): the last one
+  it names, native the machine compiling's; 0 when it names none (a
+  level or a feature names no processor). }
+function CpuSpecTune(const Spec: string; Arm: Boolean): LongInt;
+var
+  i, start: SizeInt;
+  tok: string;
+  k: LongInt;
+begin
+  Result := 0;
+  start := 1;
+  for i := 1 to Length(Spec) + 1 do
+    if (i > Length(Spec)) or (Spec[i] = '+') or (Spec[i] = ',') then
+    begin
+      tok := Copy(Spec, start, i - start);
+      start := i + 1;
+      for k := 1 to Length(tok) do
+        if (tok[k] >= 'A') and (tok[k] <= 'Z') then
+          tok[k] := Chr(Ord(tok[k]) + 32);
+      if tok = 'native' then
+        Result := CpuProcIndex(CpuHostProc, Arm)
+      else
+      begin
+        k := CpuProcIndex(tok, Arm);
+        if k > 0 then
+          Result := k;
+      end;
+    end;
+end;
+
+{ The amd64 processor of a vendor (CPUID leaf 0: EBX, EDX, ECX) and its
+  DisplayFamily and DisplayModel (leaf 1 EAX: SDM vol. 1 21.1.1.1, AMD
+  APM vol. 3 E.3.2), 0 when the table does not have it. AMD: family 17h
+  models 00h-2Fh are Zen (55723) and 30h and later Zen 2 (56305);
+  family 19h models 10h-1Fh and 60h and later Zen 4 (57647, 1), the
+  others Zen 3 (56665); family 1Ah models 00h-4Fh and 60h-6Fh Zen 5
+  (58455, 1). Intel family 06h, SDM vol. 4 table 2-1: Haswell 3C, 45,
+  46, 3F; Broadwell 3D, 47, 4F, 56; Skylake 4E, 5E and its Kaby Lake,
+  Coffee Lake and Comet Lake 8E, 9E, A5, A6; Xeon Scalable 55; Cannon
+  Lake 66; Ice Lake 7E, 6A, 6C; Tiger Lake 8C, 8D; Sapphire Rapids 8F;
+  Alder Lake 97, 9A. }
+function CpuIdentX86(const Vendor: string; Family, Model: LongInt): LongInt;
+var
+  n: string;
+begin
+  n := '';
+  if Vendor = 'AuthenticAMD' then
+  begin
+    if Family = $17 then
+    begin
+      if Model < $30 then
+        n := 'zen1'
+      else
+        n := 'zen2';
+    end
+    else if Family = $19 then
+    begin
+      if ((Model >= $10) and (Model <= $1F)) or (Model >= $60) then
+        n := 'zen4'
+      else
+        n := 'zen3';
+    end
+    else if Family = $1A then
+    begin
+      if (Model <= $4F) or ((Model >= $60) and (Model <= $6F)) then
+        n := 'zen5';
+    end;
+  end
+  else if (Vendor = 'GenuineIntel') and (Family = 6) then
+    case Model of
+      $3C, $45, $46, $3F: n := 'haswell';
+      $3D, $47, $4F, $56: n := 'broadwell';
+      $4E, $5E, $8E, $9E, $A5, $A6: n := 'skylake';
+      $55: n := 'skylake-avx512';
+      $66: n := 'cannonlake';
+      $7E, $6A, $6C: n := 'icelake';
+      $8C, $8D: n := 'tigerlake';
+      $8F: n := 'sapphirerapids';
+      $97, $9A: n := 'alderlake';
+    end;
+  Result := CpuProcIndex(n, False);
+end;
+
+{ The arm64 core of a MIDR_EL1 (ARM ARM D24.2.136: Implementer 31:24,
+  PartNum 15:4), 0 when the table does not have it: Arm's (41h) parts
+  of each TRM, Cortex-A72 D08h, Cortex-A76 D0Bh, Neoverse N1 D0Ch, V1
+  D40h, N2 D49h, V2 D4Fh, N3 D8Eh, V3 D84h. }
+function CpuIdentArm(Midr: Int64): LongInt;
+var
+  n: string;
+begin
+  n := '';
+  if ((Midr shr 24) and $FF) = $41 then
+    case (Midr shr 4) and $FFF of
+      $D08: n := 'cortex-a72';
+      $D0B: n := 'cortex-a76';
+      $D0C: n := 'neoverse-n1';
+      $D40: n := 'neoverse-v1';
+      $D49: n := 'neoverse-n2';
+      $D4F: n := 'neoverse-v2';
+      $D8E: n := 'neoverse-n3';
+      $D84: n := 'neoverse-v3';
+    end;
+  Result := CpuProcIndex(n, True);
+end;
+
+{ The features of ASet by name, one name a bit (P261: the assembly
+  says the processor of a routine that is not the command line's). }
+function CpuSetNames(ASet: Int64; Arm: Boolean): string;
+var
+  names, nm: string;
+  i, st: SizeInt;
+  b: LongInt;
+  seen: Int64;
+begin
+  Result := '';
+  seen := 0;
+  names := CpuFeatNames(Arm) + ' ';
+  st := 1;
+  for i := 1 to Length(names) do
+    if names[i] = ' ' then
+    begin
+      nm := Copy(names, st, i - st);
+      st := i + 1;
+      b := CpuFeatBit(nm, Arm);
+      if (b >= 0) and (b < 64) and (((ASet shr b) and 1) <> 0) and (((seen shr b) and 1) = 0) then
+      begin
+        seen := seen or (Int64(1) shl b);
+        if Result <> '' then
+          Result := Result + ' ';
+        Result := Result + nm;
+      end;
+    end;
+  if Result = '' then
+    Result := 'base';
+end;
+
+{ The index of a nonzero word's highest bit set is cheaper as 63 -
+  LZCNT than as BSR on the processor Tune (the costs above). }
+function CpuCostLzcntBsr(Tune: LongInt): Boolean;
+begin
+  Result := (ProcCost(Tune) and 1) <> 0;
+end;
+
 { The processor a program is compiled for (-cpu, P111): the bits
   CpuFeatBit names, read from names joined by + (or ,): base (SSE2; fp
   and asimd on arm64), native (what the machine compiling has), max
   (every feature the target names), the x86-64 psABI levels v2, v3 and
-  v4 on amd64, v8.1, v8.2 and crypto on arm64, and any feature name of
-  CpuHas. Err names a word it does not know, or one the target never
-  has. }
+  v4 on amd64, v8.1, v8.2 and crypto on arm64, a processor of the table
+  (P261: its features; crypto after an arm64 core adds that core's
+  Cryptographic Extension), and any feature name of CpuHas. Err names a
+  word it does not know, or one the target never has. }
 function CpuNamesBits(const Names: string; Arm: Boolean): Int64;
 var
   i, start: SizeInt;
@@ -942,12 +1299,14 @@ const
   A82 = 'fphp asimdhp dcpop';
   ACrypto = 'aes pmull sha1 sha2';
   MaxA = 'fp asimd aes pmull sha1 sha2 crc32 atomics fphp asimdhp rdm jscvt fcma lrcpc dcpop sha3 sm3 sm4 ' +
-    'dotprod sha512 sve fhm dit uscat ilrcpc flagm ssbs sb paca pacg';
+    'dotprod sha512 sve fhm dit uscat ilrcpc flagm ssbs sb paca pacg dcpodp sve2 sveaes svepmull svebitperm ' +
+    'svesha3 svesm4 flagm2 frint svei8mm svef32mm svef64mm svebf16 i8mm bf16 dgh rng bti mte';
 var
   i, start: SizeInt;
   tok, l: string;
-  b: LongInt;
+  b, proc: LongInt;
 begin
+  proc := 0;
   Err := '';
   Result := 0;
   if Arm then
@@ -967,7 +1326,16 @@ begin
       if l = 'base' then
         Continue
       else if l = 'native' then
-        Result := Result or Native
+      begin
+        { the machine compiling, which a program for another names not
+          (P261) }
+        if not CpuHostTarget then
+        begin
+          Err := 'native';
+          Exit;
+        end;
+        Result := Result or Native;
+      end
       else if l = 'max' then
       begin
         if Arm then
@@ -986,7 +1354,17 @@ begin
       else if Arm and (l = 'v8.2') then
         Result := Result or CpuNamesBits(A81 + ' ' + A82, True)
       else if Arm and (l = 'crypto') then
-        Result := Result or CpuNamesBits(ACrypto, True)
+      begin
+        if ProcCryptoFeats(proc) <> '' then
+          Result := Result or CpuNamesBits(ProcCryptoFeats(proc), True)
+        else
+          Result := Result or CpuNamesBits(ACrypto, True);
+      end
+      else if CpuProcIndex(l, Arm) > 0 then
+      begin
+        proc := CpuProcIndex(l, Arm);
+        Result := Result or CpuNamesBits(ProcFeats(proc), Arm);
+      end
       else
       begin
         b := CpuFeatBit(l, Arm);
@@ -1004,12 +1382,16 @@ end;
 
 { Every feature name of the target's (P148), the base ones first: what
   the ifdef words CPU_<NAME> name, one each; a feature with two names
-  (sha, sha1 and sha2 for SHA-NI on amd64) has both. }
+  (sha, sha1 and sha2 for SHA-NI on amd64) has both. arm64's are
+  AT_HWCAP's and AT_HWCAP2's (P261: the processors of the table have
+  the second word's too). }
 function CpuFeatNames(Arm: Boolean): string;
 begin
   if Arm then
     Result := 'fp asimd aes pmull sha1 sha2 crc32 atomics fphp asimdhp rdm jscvt fcma lrcpc dcpop ' +
-      'sha3 sm3 sm4 dotprod sha512 sve fhm dit uscat ilrcpc flagm ssbs sb paca pacg'
+      'sha3 sm3 sm4 dotprod sha512 sve fhm dit uscat ilrcpc flagm ssbs sb paca pacg dcpodp sve2 sveaes ' +
+      'svepmull svebitperm svesha3 svesm4 flagm2 frint svei8mm svef32mm svef64mm svebf16 i8mm bf16 dgh rng ' +
+      'bti mte'
   else
     Result := 'sse2 sse3 ssse3 sse41 sse42 popcnt aes pclmul avx fma f16c movbe rdrand avx2 bmi1 ' +
       'bmi2 adx rdseed sha sha1 sha2 erms avx512f avx512bw avx512vl avx512dq vaes vpclmulqdq gfni ' +

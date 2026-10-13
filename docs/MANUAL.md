@@ -239,6 +239,29 @@ P148):
 {$endif}
 ```
 
+The code says its processor itself with `{$CPU spec}` and `{$TUNE
+name}` (1.1.114, P261), which take the place of `-cpu` and `-tune`
+(§21) from where they stand: `spec` is what `-cpu` takes (a processor
+by name, a level, features joined by `+`, `native`, `base`, `max`), and
+`name` a processor of the target, `native` or `generic`. A routine is
+compiled for the processor in force where its body begins, and the
+main block, and a unit's initialization and finalization, for the one
+in force where they begin; `CPU_<NAME>` follows `{$CPU}` at once.
+`{$CPU DEFAULT}` and `{$TUNE DEFAULT}` give the command line's back.
+The directives stand between routines: one inside a body is an error,
+since a body's code is one processor's. So the code says what the
+command line cannot, and it prevails over it (Regla 14):
+
+```
+{$CPU zen4}
+function Sum(p: PByte; n: Integer): Integer;   { AVX-512 allowed here }
+...
+{$CPU DEFAULT}
+```
+
+A routine compiled for one processor is not put in place in the code
+of another (§5): its instructions are its own.
+
 `{$if expr}` and `{$elseif expr}` keep the code after them when the
 expression is true, as Free Pascal's compile-time expressions do. It
 takes numbers, `defined(NAME)`, the comparisons `=`, `<>`, `<`, `<=`,
@@ -273,6 +296,8 @@ msg}` stop it there, so a source says which paslangc it needs:
 ```
 
 Any other directive (`{$mode objfpc}`, `{$H+}`) is read as a comment.
+A brace comment ends at the first `}`, so a comment that names a
+directive writes it without braces (`$CPU`).
 
 ## 3. Values and types
 
@@ -883,8 +908,11 @@ field. The counts are `Integer`s. The bit words' names are reserved
 
 The code is the machine's own: `SetBit(b, 3, 1)` is `orb $8` on `b`'s
 byte, or `orq $8` on the register a loop keeps it in; `IsBitSet` a
-shift and an `and`; `TrailingZeros` `bsf` over a sentinel bit and
-`LeadingZeros` `bsr` (`rbit` + `clz` and `clz` on arm64); `ByteSwap`
+shift and an `and`; `TrailingZeros` `tzcnt` and `LeadingZeros`
+`lzcnt` when the processor has BMI1 and LZCNT (`-cpu`, §21; 1.1.114),
+each giving the width for 0 by itself, and else `bsf` over a sentinel
+bit and `bsr` with a `cmov` for 0 (`rbit` + `clz` and `clz` on arm64);
+`ByteSwap`
 `bswap` or `rev`; `ReverseBits` `rbit` on arm64 and a `bswap` with three
 swaps on amd64, which has no bit reversal; `PopCount` `popcnt` when the
 processor the program is compiled for has it (`-cpu`, §21) and twelve
@@ -11647,11 +11675,12 @@ paslangc [options] file.paslang
 | `-Fu <dir>` | a directory of compiled units, repeatable |
 | `-install <dir>` | compile a package and install its units there |
 | `-target amd64`, `-target intel64`, `-target arm64` | the machine to emit for; on amd64 the arm64 output is cross-assembled with `aarch64-linux-gnu-as` and `-ld`, and an arm64 machine uses its own `as` and `ld` |
-| `-cpu <set>` | the processor the code is compiled for: `base` (SSE2; `fp` and `asimd` on arm64, runs anywhere), `native` (what the machine compiling has; the default when the target is this machine), `max` (every feature the target names), the x86-64 psABI levels `v2`, `v3`, `v4`, the arm64 steps `v8.1`, `v8.2`, `crypto`, or names of `CpuHas` joined by `+` (`-cpu v3+sha+pclmul`); `base` is the default when compiling across. The compiler chooses the instructions and the bodies of the words by it and the program tests nothing at run time; on a processor without them it dies with an illegal instruction. Every installed unit is built twice, for `base` and for a level (`v3` on amd64, `v8.2+crypto` on arm64, in a directory of that name beside the base build): a program whose `-cpu` has every feature of the level links the level's objects, so the words a unit uses take the program's processor too (1.1.18, P143; a unit took the base kernels whatever the program's `-cpu`). A level object older than its base object is not taken |
+| `-cpu <set>` | the processor the code is compiled for: `base` (SSE2; `fp` and `asimd` on arm64, runs anywhere), `native` (what the machine compiling has; the default when the target is this machine; an error when it is not the target), `max` (every feature the target names), the x86-64 psABI levels `v2`, `v3`, `v4`, the arm64 steps `v8.1`, `v8.2`, `crypto`, a processor by name (1.1.114, P261) with the features its manufacturer's tables give it, `zen1` to `zen5`, `haswell`, `broadwell`, `skylake`, `skylake-avx512`, `cascadelake`, `cannonlake`, `icelake`, `tigerlake`, `sapphirerapids`, `alderlake`, `cortex-a72`, `cortex-a76`, `neoverse-n1`, `neoverse-v1`, `neoverse-n2`, `neoverse-v2`, `neoverse-n3`, `neoverse-v3` (on Arm's cores the Cryptographic Extension is the chip's choice: `crypto` after the name adds that core's, `-cpu neoverse-v2+crypto`), or names of `CpuHas` joined by `+` (`-cpu v3+sha+pclmul`); `base` is the default when compiling across. The compiler chooses the instructions and the bodies of the words by it and the program tests nothing at run time; on a processor without them it dies with an illegal instruction. Every installed unit is built twice, for `base` and for a level (`v3` on amd64, `v8.2+crypto` on arm64, in a directory of that name beside the base build): a program whose `-cpu` has every feature of the level links the level's objects, so the words a unit uses take the program's processor too (1.1.18, P143; a unit took the base kernels whatever the program's `-cpu`). A level object older than its base object is not taken |
+| `-tune <name>` | the processor whose costs choose between forms that do the same (1.1.114, P261), read in its manufacturer's latency tables (`docs/ref/asm`): the highest bit set of a word is `63 - lzcnt` on Zen to Zen 3, where `bsr` is 6 operations of latency 4, and `bsr` where it costs no more; the instructions stay those `-cpu` allows. `-cpu <processor>` and `native` imply their own; `generic` is none; `{$TUNE}` in the code prevails (§2) |
 | `--lex` | print the first 41 tokens of the source (number, kind, text, line:column) and stop |
 | `-h` | the version banner and the index of the built-in help |
 | `--help`, `--help <topic>` | the banner and the built-in help: every section, or one of `flags`, `types`, `lang`, `runtime`, `lib`, `limits`, `examples`; `all` is every section, `index` (or `short`) the index, and an unknown topic says so and prints the index |
-| `-v`, `--version` | the version banner |
+| `-v`, `--version` | the version banner, and the processor of the machine compiling: its name in the table of `-cpu` and what it is (`processor: zen2 (AuthenticAMD family 17h model 60h)`; CPUID on amd64, `MIDR_EL1` on arm64) |
 
 The program is linked statically, with only the routines it reaches:
 every routine sits in a section of its own and the linker drops the

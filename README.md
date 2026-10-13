@@ -35,7 +35,11 @@ Source files use the `.paslang` extension.
 - **The processor chosen at compile time.** `-cpu` picks the
   instructions; a word with a kernel (SHA-1, SHA-256, SHA-512, the CRCs,
   XXH3, `PopCount`, the vectors) has a body for the processor's
-  extensions and a plain one, and nothing is tested at run time.
+  extensions and a plain one, and nothing is tested at run time. The
+  compiler knows the machine it runs on and processors by name (`zen2`,
+  `icelake`, `neoverse-v2`...), and `-tune` chooses between equal forms
+  by the manufacturer's latency tables; `{$CPU}` and `{$TUNE}` in the
+  code prevail over the command line.
 - **Classes and exceptions with objects.** Every class descends from
   `TObject`; `raise` carries an object of any class, and an `except`
   part picks it by class with `on E: T do` handlers. The object belongs

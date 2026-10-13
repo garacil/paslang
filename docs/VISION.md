@@ -192,7 +192,10 @@ call. The rules that follow from that (`docs/KERNELS.md`):
   processor's instructions or the Pascal body, and writes `popcnt`, the
   AVX2 vectors or the SSE2 ones, directly. The program tests nothing at
   run time; a jump is a jump, and the base processor is a separate
-  compile (`-cpu base`), not a branch.
+  compile (`-cpu base`), not a branch. The processor is known by name,
+  the machine compiling by default, and what each instruction costs on
+  it, read in its manufacturer's tables, chooses between forms that do
+  the same (`-tune`); the code may say its own (`{$CPU}`, `{$TUNE}`).
 - **Every kernel has its Pascal body beside it**, the reference, and the
   program always compiles and runs without the extension.
 - **Rounds are written out**, not looped: SHA-256's 64 rounds and SHA-1's

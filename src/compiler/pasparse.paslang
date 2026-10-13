@@ -26,7 +26,7 @@ var
   DebugMode: Boolean;   { -debug (P118): a program gets uses pasdebug, the debugger inside it }
 
 function ParseSource(const Src: string; const UPath: array of string;
-  Arm: Boolean; CpuSet: Int64): TProgram;
+  Arm: Boolean; CpuSet: Int64; CpuTune: LongInt): TProgram;
 
 implementation
 
@@ -623,6 +623,7 @@ type
     constructor Create(Lex: TLexer; const UPath: array of string; Arm: Boolean);
     function ParseProgram: TProgram;
     function HasCpu(const N: string): Boolean;
+    procedure CpuHeld(Gen: LongInt; const Where: string);
     function CpuSuffix(const Feat: string): string;
     function ShaSuffix(const Ext: string): string;
   end;
@@ -8772,6 +8773,9 @@ begin
   Result.Body := NewStmt(skBlock);
   SetLength(Result.Body^.Stmts, 1);
   Result.Body^.Stmts[0] := st;
+  Result.CpuOwn := Pr.CpuOwn;
+  Result.CpuSet := Pr.CpuSet;
+  Result.CpuTune := Pr.CpuTune;
 end;
 
 { Obj.AName through helper H (P127): a method with its arguments, or a
@@ -18616,9 +18620,10 @@ begin
   Result := NewCall(pe.Sym, args, pe.RetTyp);
 end;
 
-{ The processor the program is compiled for has the feature (-cpu,
-  P111): CpuFeatBit's bit of CpuSet; 64 is every processor of the
-  target, a negative bit none. }
+{ The processor the code is compiled for has the feature (-cpu, P111):
+  CpuFeatBit's bit of the set in force where the parser stands, -cpu's
+  or the $CPU over it (P261); 64 is every processor of the target, a
+  negative bit none. }
 function TParser.HasCpu(const N: string): Boolean;
 var
   b: LongInt;
@@ -18629,7 +18634,17 @@ begin
   else if b < 0 then
     Result := False
   else
-    Result := ((CpuSet shr b) and 1) <> 0;
+    Result := ((FLex.CpuSet shr b) and 1) <> 0;
+end;
+
+{ A $CPU or $TUNE read since Gen, inside a body that began under the
+  processor in force then (P261): a body's code is one processor's, so
+  the directives stand between routines. }
+procedure TParser.CpuHeld(Gen: LongInt; const Where: string);
+begin
+  if FLex.CpuGen <> Gen then
+    Die('{$CPU} or {$TUNE} at line ' + IntToStr(FLex.CpuLine) + ' is inside ' + Where +
+      ': they stand between routines, and a body is compiled for one processor');
 end;
 
 { Which of a core routine's two bodies a word calls: the one on the
@@ -21792,6 +21807,9 @@ begin
   body := NewStmt(skBlock);
   AppendStmt(body, Call);
   pr.Body := body;
+  pr.CpuOwn := True;
+  pr.CpuSet := FLex.CpuSet;
+  pr.CpuTune := FLex.CpuTune;
   n := Length(FProg.Procs);
   SetLength(FProg.Procs, n + 1);
   FProg.Procs[n] := pr;
@@ -21904,9 +21922,16 @@ var
   initb: PStmt;
   savedSTypes: TStrArray;
   keep: Boolean;
+  cpuGen: LongInt;
 begin
   anon := FAnonBody;
   FAnonBody := False;
+  { the processor of its code: the $CPU and $TUNE in force where the
+    body begins (P261) }
+  Pr.CpuOwn := True;
+  Pr.CpuSet := FLex.CpuSet;
+  Pr.CpuTune := FLex.CpuTune;
+  cpuGen := FLex.CpuGen;
   savedExc := FExcDepth;
   FExcDepth := 0;
   savedLocals := FLocals;
@@ -22061,6 +22086,7 @@ begin
   CheckFwdTypes;
   FInBody := True;
   Pr.Body := Self.ParseBlock;
+  CpuHeld(cpuGen, 'the body of ' + Pr.Name);
   { the variables with a value take it first (P144) }
   if Length(FVarInits) > 0 then
   begin
@@ -22530,6 +22556,7 @@ function TParser.ParseProgram: TProgram;
 var
   prog: TProgram;
   i: SizeInt;
+  cpuGen: LongInt;
 begin
   FNameCheck := True;
   prog := Default(TProgram);
@@ -22560,7 +22587,13 @@ begin
   FProg.UsesNames := FUsesNames;
   FProg.LinkObjs := FLinkObjs;
   FInBody := False;
+  { the main block's processor: the directives in force at its begin
+    (P261) }
+  FProg.MainCpu := FLex.CpuSet;
+  FProg.MainTune := FLex.CpuTune;
+  cpuGen := FLex.CpuGen;
   FProg.Body := ParseBlock;
+  CpuHeld(cpuGen, 'the main block');
   { the class constructors before the program, the destructors after
     it, last first (P123) }
   FProg.Body := JoinStmts(JoinStmts(LifeCalls(FClassCtors, False), FProg.Body),
@@ -22578,6 +22611,7 @@ end;
 function TParser.ParseUnit: TProgram;
 var
   i, n0: SizeInt;
+  cpuGen: LongInt;
 begin
   FNameCheck := True;
   Eat(tkUnit);
@@ -22629,6 +22663,11 @@ begin
     if FProg.Procs[i].IsFwd and (FProg.Procs[i].Body = nil) then
       Die('missing body of ' + FProg.Procs[i].Name);
   end;
+  { the processor of the initialization and the finalization: the
+    directives in force where the first begins (P261) }
+  FProg.MainCpu := FLex.CpuSet;
+  FProg.MainTune := FLex.CpuTune;
+  cpuGen := FLex.CpuGen;
   if FTok.Kind = tkInitialization then
   begin
     FTok := FLex.Next;
@@ -22639,6 +22678,7 @@ begin
     FTok := FLex.Next;
     FProg.FiniBody := ParseLifeBlock(tkEnd);
   end;
+  CpuHeld(cpuGen, 'the initialization or the finalization');
   { the class constructors before the unit's initialization, the
     destructors after its finalization, last first (P123) }
   FProg.InitBody := JoinStmts(LifeCalls(FClassCtors, False), FProg.InitBody);
@@ -22685,34 +22725,23 @@ begin
 end;
 
 function ParseSource(const Src: string; const UPath: array of string;
-  Arm: Boolean; CpuSet: Int64): TProgram;
+  Arm: Boolean; CpuSet: Int64; CpuTune: LongInt): TProgram;
 var
   lex: TLexer;
   p: TParser;
   m: TProgram;
-  names, nm: string;
-  i, st: SizeInt;
-  b: LongInt;
 begin
   lex := TLexer.Create(Src);
   lex.SetTarget(Arm);
   { PASLANG_VERSION ... PASLANG_FULLVERSION, the compiler compiling, for
     $if (P263) }
   lex.SetVersion(PaslangVersion);
-  { CPU_AVX2, CPU_CRC32 and every feature of the target by name (P148):
-    defined when the processor compiled for has it, so a unit or a
-    program chooses its bodies by -cpu when it is compiled, as the words
-    of the language do }
-  names := CpuFeatNames(Arm) + ' ';
-  st := 1;
-  for i := 1 to Length(names) do
-    if names[i] = ' ' then
-    begin
-      nm := Copy(names, st, i - st);
-      st := i + 1;
-      b := CpuFeatBit(nm, Arm);
-      lex.SetFeature(nm, (b = 64) or ((b >= 0) and (b < 64) and (((CpuSet shr b) and 1) <> 0)));
-    end;
+  { the processor of -cpu and -tune, and CPU_AVX2, CPU_CRC32 and every
+    feature of the target by name (P148): defined when the processor
+    compiled for has it, so a unit or a program chooses its bodies by
+    -cpu when it is compiled, as the words of the language do; $CPU and
+    $TUNE in the code take its place from where they stand (P261) }
+  lex.SetCpu(Arm, CpuSet, CpuTune);
   p := TParser.Create(lex, UPath, Arm);
   p.CpuSet := CpuSet;
   try
@@ -22732,6 +22761,7 @@ begin
     m.Types := p.FTypes;
     m.UsesNames := p.FUsesNames;
     m.CpuSet := CpuSet;
+    m.CpuTune := CpuTune;
     m.LinkObjs := p.FLinkObjs;
     m.DepNames := p.FLoaded;
     m.DepSums := p.FLoadedSum;

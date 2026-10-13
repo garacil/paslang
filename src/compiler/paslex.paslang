@@ -160,6 +160,16 @@ type
     FDirLine: LongInt;
     FMacNames: array of string;
     FMacVals: array of Int64;
+    { the processor (P261): the command line's, and what $CPU and
+      $TUNE put over it from where they stand }
+    FArm: Boolean;
+    FCmdSet: Int64;
+    FCmdTune: LongInt;
+    FCodeSetOn, FCodeTuneOn: Boolean;
+    FCodeSet: Int64;
+    FCodeSetTune, FCodeTune: LongInt;
+    FCpuGen: LongInt;
+    FCpuLine: LongInt;
     procedure Advance;
     procedure SkipSpace;
     function Defined(const N: string): Boolean;
@@ -169,6 +179,9 @@ type
     procedure SetMacro(const N: string; V: Int64);
     function EvalIf(const S: string): Boolean;
     procedure DirMessage(const Kind, Msg: string);
+    procedure ApplyCpu;
+    procedure CpuDirective(const S: string);
+    procedure TuneDirective(const S: string);
     function Peek: Char;
     function Ident: TToken;
     function Number: TToken;
@@ -181,6 +194,11 @@ type
     procedure SetTarget(Arm: Boolean);
     procedure SetFeature(const N: string; On: Boolean);
     procedure SetVersion(const V: string);
+    procedure SetCpu(Arm: Boolean; ASet: Int64; ATune: LongInt);
+    function CpuSet: Int64;
+    function CpuTune: LongInt;
+    function CpuGen: LongInt;
+    function CpuLine: LongInt;
     function Next: TToken;
     function BlankToLineEnd: Boolean;
     function RawBlock: string;
@@ -190,7 +208,7 @@ type
 implementation
 
 uses
-  paslib, pasfmt;
+  paslib, pasfmt, pasast;
 
 function IsAlpha(C: Char): Boolean;
 begin
@@ -246,6 +264,146 @@ end;
 procedure TLexer.SetFeature(const N: string; On: Boolean);
 begin
   Define('CPU_' + N, On);
+end;
+
+{ The processor the code is compiled for (P261, Regla 14): the command
+  line's set and tune (-cpu and -tune, or what the machine compiling
+  is), which $CPU and $TUNE in the code take the place of from
+  where they stand; CPU_<NAME> is defined for each feature of the set in
+  force (P148). }
+procedure TLexer.SetCpu(Arm: Boolean; ASet: Int64; ATune: LongInt);
+begin
+  FArm := Arm;
+  FCmdSet := ASet;
+  FCmdTune := ATune;
+  FCodeSetOn := False;
+  FCodeTuneOn := False;
+  FCpuGen := 0;
+  FCpuLine := 0;
+  ApplyCpu;
+end;
+
+{ The set in force: $CPU's, else the command line's. }
+function TLexer.CpuSet: Int64;
+begin
+  if FCodeSetOn then
+    Result := FCodeSet
+  else
+    Result := FCmdSet;
+end;
+
+{ The tune in force: $TUNE's; else the processor $CPU names; else
+  the command line's. }
+function TLexer.CpuTune: LongInt;
+begin
+  if FCodeTuneOn then
+    Result := FCodeTune
+  else if FCodeSetOn and (FCodeSetTune > 0) then
+    Result := FCodeSetTune
+  else
+    Result := FCmdTune;
+end;
+
+{ How many $CPU and $TUNE have been read, and the line of the last:
+  the parser holds a routine's body to the processor in force where it
+  begins. }
+function TLexer.CpuGen: LongInt;
+begin
+  Result := FCpuGen;
+end;
+
+function TLexer.CpuLine: LongInt;
+begin
+  Result := FCpuLine;
+end;
+
+procedure TLexer.ApplyCpu;
+var
+  names, nm: string;
+  i, st: SizeInt;
+  b: LongInt;
+  cur: Int64;
+begin
+  cur := CpuSet;
+  names := CpuFeatNames(FArm) + ' ';
+  st := 1;
+  for i := 1 to Length(names) do
+    if names[i] = ' ' then
+    begin
+      nm := Copy(names, st, i - st);
+      st := i + 1;
+      b := CpuFeatBit(nm, FArm);
+      SetFeature(nm, (b = 64) or ((b >= 0) and (b < 64) and (((cur shr b) and 1) <> 0)));
+    end;
+end;
+
+{ $CPU spec: the processor of the code from here on, the words of
+  -cpu (a processor, a level, features joined by +, native, base, max);
+  $CPU DEFAULT gives the command line's back. }
+procedure TLexer.CpuDirective(const S: string);
+var
+  err, mach: string;
+  bits: Int64;
+begin
+  if FArm then
+    mach := 'arm64'
+  else
+    mach := 'amd64';
+  if S = '' then
+    Die('{$CPU} wants a processor, a feature or DEFAULT at ' + IntToStr(FDirLine));
+  if ToLower(S) = 'default' then
+    FCodeSetOn := False
+  else
+  begin
+    bits := CpuSetOf(S, FArm, CpuHostSet, err);
+    if err = 'native' then
+      Die('{$CPU ' + S + '}: native is the machine compiling, which is not an ' + mach + ' one, at ' +
+        IntToStr(FDirLine))
+    else if err <> '' then
+      Die('{$CPU ' + S + '}: ' + err + ' is no processor or feature of ' + mach + ' at ' + IntToStr(FDirLine));
+    FCodeSet := bits;
+    FCodeSetOn := True;
+    FCodeSetTune := CpuSpecTune(S, FArm);
+  end;
+  Inc(FCpuGen);
+  FCpuLine := FDirLine;
+  ApplyCpu;
+end;
+
+{ $TUNE name: the processor whose costs choose between forms that do
+  the same, from here on: a processor of the target, native or generic
+  (none); $TUNE DEFAULT gives back the one $CPU or the command line
+  says. }
+procedure TLexer.TuneDirective(const S: string);
+var
+  l: string;
+  k: LongInt;
+begin
+  l := ToLower(S);
+  if l = 'default' then
+    FCodeTuneOn := False
+  else
+  begin
+    if l = 'generic' then
+      k := 0
+    else if l = 'native' then
+    begin
+      if not CpuHostTarget then
+        Die('{$TUNE native}: native is the machine compiling, which is not the target, at ' + IntToStr(FDirLine));
+      k := CpuProcIndex(CpuHostProc, FArm);
+    end
+    else
+    begin
+      k := CpuProcIndex(l, FArm);
+      if k = 0 then
+        Die('{$TUNE ' + S + '}: ' + S + ' is no processor of the target (generic, native, DEFAULT, or ' +
+          CpuProcNames(FArm) + ') at ' + IntToStr(FDirLine));
+    end;
+    FCodeTune := k;
+    FCodeTuneOn := True;
+  end;
+  Inc(FCpuGen);
+  FCpuLine := FDirLine;
 end;
 
 { A name $if reads as a number (P263), defined too, as Free Pascal's
@@ -826,6 +984,10 @@ begin
         Define(arg, True)
       else if d = 'undef' then
         Define(arg, False)
+      else if d = 'cpu' then
+        CpuDirective(FDirRest)
+      else if d = 'tune' then
+        TuneDirective(FDirRest)
       else if (d = 'info') or (d = 'note') or (d = 'hint') or (d = 'warning') or (d = 'message') then
         DirMessage(d, FDirRest)
       else if (d = 'error') or (d = 'fatal') then

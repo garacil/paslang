@@ -300,6 +300,9 @@ type
     FWmBase: string;        { arm64: EmitWordMem's operand is [FWmBase, FWmIdx, lsl #FWmSh] }
     FCheckPtr: Boolean;     { -checkptr: pointer steps and accesses held to their object (P104) }
     FCpuSet: Int64;         { -cpu: the processor the code is compiled for (P111): its bits choose the instructions, nothing is tested at run time }
+    FTune: LongInt;         { -tune: the processor whose costs choose between forms that do the same (P261), pasast's table, 0 none }
+    FProgCpu: Int64;        { the command line's, which the runtime and the routines the compiler makes take; a routine's own and the main block's come from $CPU and $TUNE (P261) }
+    FProgTune: LongInt;
     FProvOn: Boolean;       { EmitFor emits a run's body whose indexes FProv proved (P100) }
     FStrFill: string;       { StrFillLoop: the string whose characters the loop owns, '' for none (1.1.1) }
     FStrFillCtr: string;    { and the loop's counter }
@@ -381,6 +384,9 @@ type
     procedure PshK(const Reg: string; K: Byte);
     procedure MapHint4(K0, K1, K2, K3: Byte);
     function HasFeat(Bit: LongInt): Boolean;
+    function Bsf(const Sfx: string): string;
+    procedure CpuNote(const Sym: string; ASet: Int64; ATune: LongInt);
+    procedure BsrQ(const Src, Dst: string);
     procedure ArmGStatusCas(const RetryLabel, MissLabel: string);
     function NoUnwind(MinDep: LongInt): Boolean;
     procedure GcMark(Id, W0: LongInt; var W: TGcBits; Depth: LongInt);
@@ -1133,6 +1139,49 @@ begin
   Result := ((FCpuSet shr Bit) and 1) <> 0;
 end;
 
+{ The processor of a routine's code, when $CPU or $TUNE made it another
+  than the command line's, said in the assembly before it (P261). }
+procedure TEmitter.CpuNote(const Sym: string; ASet: Int64; ATune: LongInt);
+var
+  t: string;
+begin
+  if (ASet = FProgCpu) and (ATune = FProgTune) then
+    Exit;
+  t := CpuProcName(ATune);
+  if t = '' then
+    t := 'generic';
+  Line('/* ' + Sym + ': cpu ' + CpuSetNames(ASet, FArm) + '; tune ' + t + ' */');
+end;
+
+{ The lowest bit set of a word that is not 0, on amd64 (P261): TZCNT
+  on BMI1, which is never slower than BSF (2 ops of latency 2 against 6
+  of latency 3 on Zen to Zen 3, the same on Zen 5 and Skylake: the AMD
+  latency tables and Intel 336289-001), else BSF. Sfx is the width, q
+  or l; on a word that is not 0 the two give the same. }
+function TEmitter.Bsf(const Sfx: string): string;
+begin
+  if HasFeat(CpuFeatBit('bmi1', False)) then
+    Result := 'tzcnt' + Sfx
+  else
+    Result := 'bsf' + Sfx;
+end;
+
+{ The highest bit set of a word that is not 0 into Dst, on amd64
+  (P261): 63 - LZCNT (lzcnt and an xor, 2 ops of latency 2) where the
+  processor tuned for has LZCNT and its table says BSR costs more (6
+  ops of latency 4 on Zen to Zen 3: CpuCostLzcntBsr), else BSR (1 op
+  of latency 1 on Zen 5, 3 cycles as LZCNT on Skylake). }
+procedure TEmitter.BsrQ(const Src, Dst: string);
+begin
+  if HasFeat(CpuFeatBit('lzcnt', False)) and CpuCostLzcntBsr(FTune) then
+  begin
+    Line('  lzcntq %' + Src + ', %' + Dst);
+    Line('  xorq $63, %' + Dst);
+  end
+  else
+    Line('  bsrq %' + Src + ', %' + Dst);
+end;
+
 { One G-state CAS kernel: x9 address, w1 expected, w2 new; w3 observed,
   w4 exclusive status. Current Go atomic_arm64.s Cas and ARM ARM CASAL/
   LDAXR/STLXR. CPU choice is static; failed CAS also acquires an early
@@ -1664,11 +1713,15 @@ begin
   finiSym := 'u_' + uname + '_fini';
   ret := Lab;
   LoadGlobals(Prog);
+  { the processor of the initialization and the finalization (P261) }
+  FCpuSet := Prog.MainCpu;
+  FTune := Prog.MainTune;
   FNest := 0;
   FScratchOff := 0;
   FScratchCur := 0;
   FScratchMax := 0;
   FFrameSym := '.Lfr' + initSym;
+  CpuNote(initSym, Prog.MainCpu, Prog.MainTune);
   Line('.globl ' + initSym);
   Line(initSym + ':');
   EmitStackCheck(initSym, FFrameSym);
@@ -16327,9 +16380,11 @@ end;
   operand's type (1.0.117). A signed narrow value is zero-extended
   first. amd64 (R rax or a pool register; rax, rcx and rdx are free,
   the two not R the temporaries): popcnt when -cpu says the
-  processor has it, else the SWAR count; trailing zeros are bsf over a
-  sentinel bit at the width (bsf + cmovz for 64 bits); leading zeros
-  bsr of 2x + 1 taken from the width (bsr + cmovz + xor for 64 bits);
+  processor has it, else the SWAR count; trailing zeros are tzcnt on
+  BMI1 and leading zeros lzcnt on LZCNT (P261), which give the width
+  for 0 themselves, else bsf over a sentinel bit at the width (bsf +
+  cmovz for 64 bits) and bsr of 2x + 1 taken from the width (bsr +
+  cmovz + xor for 64 bits);
   bswap (rolw for 16 bits); a bit reversal is a bswap and three SWAR
   swaps, then a shift down to the width. arm64: cnt through v16, rbit +
   clz over the sentinel, clz, rev16/rev/rev, rbit and a shift. A result
@@ -16438,7 +16493,25 @@ begin
         Line('  shrq $56, %' + R);
       end;
     uoCtz:
-      if w < 64 then
+      if HasFeat(CpuFeatBit('bmi1', False)) then
+      begin
+        { TZCNT (SDM vol. 2B) is 2 ops of latency 2 where BSF is 6 of
+          latency 3 on Zen to Zen 3 (amd-family17h, -17h-30h- and
+          -family19h-latencies), 1 of latency 1 as BSF on Zen 5 and 3
+          cycles as BSF on Skylake (Intel 336289-001), and it counts the
+          width of a zero itself: never slower, and the sentinel or the
+          cmovz is not written. A narrow width takes its sentinel bit by
+          an or (1 op of latency 1). }
+        if w = 64 then
+          Line('  tzcntq %' + R + ', %' + R)
+        else
+        begin
+          if w < 32 then
+            Line('  orl $' + IntToStr(Int64(1) shl w) + ', %' + X86Sub(R, 4));
+          Line('  tzcntl %' + X86Sub(R, 4) + ', %' + X86Sub(R, 4));
+        end;
+      end
+      else if w < 64 then
       begin
         Line('  btsq $' + IntToStr(w) + ', %' + R);
         Line('  bsfq %' + R + ', %' + R);
@@ -16450,7 +16523,23 @@ begin
         Line('  cmovzq %' + t1 + ', %' + R);
       end;
     uoClz:
-      if w < 64 then
+      if HasFeat(CpuFeatBit('lzcnt', False)) then
+      begin
+        { LZCNT (SDM vol. 2A) is 1 op of latency 1 where BSR is 6 of
+          latency 4 on Zen to Zen 3, 1 of latency 1 as BSR on Zen 5 and
+          3 cycles as BSR on Skylake, and it counts the width of a zero
+          itself: one instruction for the four of bsr, cmovz and the
+          xor. A narrow width counts in 32 bits, less the bits above it. }
+        if w = 64 then
+          Line('  lzcntq %' + R + ', %' + R)
+        else
+        begin
+          Line('  lzcntl %' + X86Sub(R, 4) + ', %' + X86Sub(R, 4));
+          if w < 32 then
+            Line('  subl $' + IntToStr(32 - w) + ', %' + X86Sub(R, 4));
+        end;
+      end
+      else if w < 64 then
       begin
         Line('  leaq 1(%' + R + ',%' + R + '), %' + R);
         Line('  bsrq %' + R + ', %' + R);
@@ -23851,6 +23940,18 @@ begin
   FTryFin := nil;
   FTryDep := nil;
   FTryRec := nil;
+  { the processor of its code: its own (the $CPU and $TUNE where its body
+    stands), or the program's (P261) }
+  if Pr.CpuOwn then
+  begin
+    FCpuSet := Pr.CpuSet;
+    FTune := Pr.CpuTune;
+  end
+  else
+  begin
+    FCpuSet := FProgCpu;
+    FTune := FProgTune;
+  end;
 
   FNest := Pr.Nest;
   parentN := 0;
@@ -24046,6 +24147,7 @@ begin
     Line('.section .text.' + Pr.Sym + ',"ax",%progbits')
   else
     Line('.section .text.' + Pr.Sym + ',"ax",@progbits');
+  CpuNote(Pr.Sym, FCpuSet, FTune);
   { arm64: every routine on 32 bytes (P267; the runtime's in Line, and
     why not amd64 there) }
   if FArm then
@@ -27706,7 +27808,7 @@ begin
   Line('  incq %rcx');
   Line('  jmp .cz_l');
   Line('.cz_h:');
-  Line('  bsfl %eax, %eax');
+  Line('  ' + Bsf('l') + ' %eax, %eax');
   Line('  leaq (%rax,%rcx,8), %rax');
   Line('  ret');
   Line('.cz_n:');
@@ -27721,12 +27823,24 @@ begin
   Line('  movzbl (%rdi,%rcx), %eax');
   Line('  testl %eax, %eax');
   Line('  jz .lz_l');
-  Line('  bsrl %eax, %eax');
-  Line('  movq %rsi, %rdx');
-  Line('  subq %rcx, %rdx');
-  Line('  shlq $3, %rdx');
-  Line('  subq %rax, %rdx');
-  Line('  leaq -1(%rdx), %rax');
+  if HasFeat(CpuFeatBit('lzcnt', False)) and CpuCostLzcntBsr(FTune) then
+  begin
+    { the bit's index is 31 - lzcnt (BsrQ, P261): 8 n - (31 - z) - 1 }
+    Line('  lzcntl %eax, %eax');
+    Line('  movq %rsi, %rdx');
+    Line('  subq %rcx, %rdx');
+    Line('  shlq $3, %rdx');
+    Line('  leaq -32(%rdx,%rax), %rax');
+  end
+  else
+  begin
+    Line('  bsrl %eax, %eax');
+    Line('  movq %rsi, %rdx');
+    Line('  subq %rcx, %rdx');
+    Line('  shlq $3, %rdx');
+    Line('  subq %rax, %rdx');
+    Line('  leaq -1(%rdx), %rax');
+  end;
   Line('  ret');
   Line('.lz_n:');
   Line('  leaq (,%rsi,8), %rax');
@@ -31397,14 +31511,20 @@ begin
   Line('  jz .al_rfslow');
   Line('  subq %rax, %rcx');
   Line('  movq %rcx, %r8');
-  Line('  bsfq %rdx, %rcx');
+  Line('  ' + Bsf('q') + ' %rdx, %rcx');
   Line('  shrq %cl, %rdx');
   Line('  movq %rcx, %r10');
   Line('  movq %rdx, %rcx');
   Line('  notq %rcx');
-  Line('  bsfq %rcx, %rcx');
-  Line('  jnz .al_rcl');
-  Line('  movl $64, %ecx');
+  if HasFeat(CpuFeatBit('bmi1', False)) then
+    { TZCNT gives 64 for a word of no zero bit itself (P261) }
+    Line('  tzcntq %rcx, %rcx')
+  else
+  begin
+    Line('  bsfq %rcx, %rcx');
+    Line('  jnz .al_rcl');
+    Line('  movl $64, %ecx');
+  end;
   Line('.al_rcl:');
   Line('  cmpq $64, %rcx');
   Line('  jb .al_rcs');
@@ -33529,7 +33649,7 @@ begin
   Line('  addq $16, %rdi');
   Line('  addq $16, %rdx');
   Line('.sm_diff16:');
-  Line('  bsfq %rax, %r9');
+  Line('  ' + Bsf('q') + ' %rax, %r9');
   Line('  xorq %rax, %rax');
   Line('  movb (%rdi,%r9), %cl');
   Line('  cmpb (%rdx,%r9), %cl');
@@ -33552,7 +33672,7 @@ begin
   Line('  bswapq %rax');
   Line('  bswapq %rcx');
   Line('  xorq %rax, %rcx');
-  Line('  bsrq %rcx, %rcx');
+  BsrQ('rcx', 'rcx');
   Line('  shrq %cl, %rax');
   Line('  andq $1, %rax');
   Line('  leaq -1(%rax,%rax), %rax');
@@ -33583,7 +33703,7 @@ begin
   Line('  bswapq %rdx');
   Line('  xorq %rdi, %rdx');
   Line('  je .sm_same');
-  Line('  bsrq %rdx, %rcx');
+  BsrQ('rdx', 'rcx');
   Line('  shrq %cl, %rdi');
   Line('  andq $1, %rdi');
   Line('  leaq -1(%rdi,%rdi), %rax');
@@ -33972,6 +34092,9 @@ begin
   FLab := 0;
   FCheckPtr := Prog.CheckPtr;
   FCpuSet := Prog.CpuSet;
+  FTune := Prog.CpuTune;
+  FProgCpu := Prog.CpuSet;
+  FProgTune := Prog.CpuTune;
   FDebug := Prog.Debug;
   FDbgFn := '';
   FLastIns := '';
@@ -34058,7 +34181,14 @@ begin
       instructions of the runtime and of inline asm (P110); a program
       runs them only where rt_cpufeat says the processor has them }
     Line('.arch armv8-a+crypto+sha3+crc');
-    if HasFeat(CpuFeatBit('atomics', True)) then
+    { LSE when any code of the file is for a processor with it: the
+      command line's, the main block's or a routine's (P261) }
+    k := CpuFeatBit('atomics', True);
+    big := Prog.CpuSet or Prog.MainCpu;
+    for i := 0 to High(Prog.Procs) do
+      if Prog.Procs[i].CpuOwn then
+        big := big or Prog.Procs[i].CpuSet;
+    if ((big shr k) and 1) <> 0 then
       Line('.arch_extension lse');
   end
   else
@@ -34090,6 +34220,7 @@ begin
       Line('  call rt_boot');
     end;
     Line('');
+    CpuNote('pas_main', Prog.MainCpu, Prog.MainTune);
     Line('pas_main:');
     Line('  .cfi_startproc');
     EmitStackCheck('pas_main', FFrameSym);
@@ -34114,7 +34245,11 @@ begin
         FDbgFn := 'pas_main';
         FDbgLine := 0;
       end;
+      FCpuSet := Prog.MainCpu;
+      FTune := Prog.MainTune;
       EmitStmt(Prog.Body);
+      FCpuSet := FProgCpu;
+      FTune := FProgTune;
       FDbgFn := '';
       FMainLine := FDbgLine;
       { Exit in the program's body ends it here (1.1.1: the label was
@@ -34149,7 +34284,11 @@ begin
         FDbgFn := 'pas_main';
         FDbgLine := 0;
       end;
+      FCpuSet := Prog.MainCpu;
+      FTune := Prog.MainTune;
       EmitStmt(Prog.Body);
+      FCpuSet := FProgCpu;
+      FTune := FProgTune;
       FDbgFn := '';
       FMainLine := FDbgLine;
       Line(FEpi + ':');
@@ -34171,6 +34310,9 @@ begin
         EmitProc(Prog.Procs[i]);
   if Prog.IsUnit then
     EmitUnitLife(Prog);
+  { the runtime is the command line's processor's (P261) }
+  FCpuSet := FProgCpu;
+  FTune := FProgTune;
   if not Prog.IsUnit then
   begin
     { Every pc from here on is the runtime: the line table ends with this
@@ -35223,7 +35365,7 @@ begin
   Line('  andq %r11, %rsi');
   Line('  jz .mgs_miss');
   Line('.mgs_bit:');
-  Line('  bsfq %rsi, %rdi');
+  Line('  ' + Bsf('q') + ' %rsi, %rdi');
   Line('  shrq $3, %rdi');
   Line('  imulq 48(%rbx), %rdi');
   Line('  leaq 8(%rax,%rdi), %rdi');
