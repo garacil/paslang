@@ -66,7 +66,7 @@ Topics:
 | types | sizes: `Integer` 64, the narrow integers 8/16/32, `Char` 1 byte, `string` pointer+length, `Real` binary64, `Single` binary32, `Quad` binary128, slices, records, sets, channels, maps, the sync types, method and interface values, pointers and views |
 | lang | statements, units, classes, channels, a hello program |
 | runtime | G/M, preemption, the collector, the fatal errors, `Syscall`, and the builtins: the calculation set, hashing, `GetMem`, the debugging words, RTTI, the atomics and the scheduler's words |
-| lib | the ten core units (`pasnum`, `pasobject`, `pasroutines`, `pasmap`, `pashash`, `pastree`, `pasfmt`, `passtr`, `pasheap`, `pasquad`), the installed units `pastime`, `pasrand`, `passort`, `paslib`, `pasnet`, `pasdebug` (written by `-debug`) and `pasx11`, and the `Net` builtins under `pasnet` |
+| lib | the eleven core units (`pasnum`, `pasobject`, `pasroutines`, `pasmap`, `pashash`, `pastree`, `pasfmt`, `passtr`, `pasheap`, `pasquad`, `pasjson`), the installed units `pastime`, `pasrand`, `passort`, `paslib`, `pasnet`, `pasdebug` (written by `-debug`) and `pasx11`, and the `Net` builtins under `pasnet` |
 | limits | forms the compiler does not accept or treats otherwise than another Pascal, and the reserved words |
 | examples | commands that compile and run |
 | all | every section above, after the index |

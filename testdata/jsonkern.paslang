@@ -1,0 +1,365 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+  GPL version 3 or later; see COPYING. No warranty. }
+
+{ P202: JSON's scans, one kernel per machine. The structural scan of a
+  text of every length to 300, at every place from 0 to 63 of a buffer:
+  the scan of the build (PasJsonIndex: AVX2 for native on amd64, SSE2
+  for base, NEON on arm64), and the Cpu and Base kernels on the text
+  padded with spaces in two calls, the state carried from one to the
+  other, must give the Plain body's index, state and counts (Plain over
+  the text and then the spaces). Then patterns at the places around the
+  blocks' edges of a text of three blocks (runs of backslashes and
+  quotes across bit 63, strings and scalars across a block), in four
+  fillers, outside and inside a string; the escape finder on a string of
+  every length to 200 at every place from 0 to 63, both modes, and
+  every byte at every place of a short string; texts and strings that
+  end at the end of a readable page whose next page is unmapped, and
+  strings that begin at the start of a page whose page before is
+  unmapped; and last, eight routines at once, each scanning a text of
+  its own of some 200 000 bytes in the heap, several calls of 64 KiB,
+  against Plain (Regla 11). Plain's answers are summed into the lines
+  that scripts/jsonkern_model.py gives from the definitions. }
+program jsonkern;
+
+uses pasjson;
+
+const
+  { the bytes of the random texts, and a byte of any value one time in five }
+  Alpha: array[0..23] of Byte = (34, 92, 123, 125, 91, 93, 44, 58, 32, 10, 9, 13,
+    97, 49, 45, 1, 12, 26, 127, 128, 255, 101, 46, 34);
+  NPat = 26;
+  Pats: array[0..25] of string = ('\', '\\', '\\\', '\\\\', '\\\\\', '\"', '\\"', '\\\"',
+    '"', '""', '"a"', '"\"', '"\\"', '"ab\"c"', '[1,2]', '{"k":true}', '-1.5e+3', 'tru',
+    '"x', ' "y" ', 'a"b', '1"2"3', 'A', ',:', '[]{}', '"\\\\\"');
+  Fills: array[0..3] of Byte = (32, 120, 49, 44);
+  { the offset of the text in the document: low, and near the top of 32 bits }
+  OffLo = 5;
+  OffHi = 4294966000;
+
+var
+  seed: Int64;
+  H: Int64;
+  bad: Integer;
+  wg: waitgroup;
+  agree: array[0..7] of Integer;
+  txt: array[0..511] of Byte;
+  buf: array[0..1023] of Byte;
+  spaces: array[0..63] of Byte;
+  ia, ib: array[0..1100] of UInt32;
+
+function Rnd: Int64;
+begin
+  seed := seed xor (seed shl 13);
+  seed := seed xor (seed shr 7);
+  seed := seed xor (seed shl 17);
+  Result := seed and $7FFFFFFFFFFFFFFF;
+end;
+
+procedure Mix(V: Int64);
+begin
+  H := (H * 131 + (V and $FFFFFFFF) + 1) and $FFFFFFFFFFFF;
+end;
+
+{ N bytes of a random text into P }
+procedure GenText(P: PByte; N: Integer);
+var
+  i: Integer;
+begin
+  for i := 0 to N - 1 do
+    if Rnd mod 5 = 0 then
+      P[i] := Byte(Rnd and 255)
+    else
+      P[i] := Alpha[Rnd mod 24];
+end;
+
+{ N bytes of a string to write: letters, and a byte of any value one
+  time in nine }
+procedure GenStr(P: PByte; N: Integer);
+var
+  i: Integer;
+begin
+  for i := 0 to N - 1 do
+    if Rnd mod 9 = 0 then
+      P[i] := Byte(Rnd and 255)
+    else
+      P[i] := Byte(97 + Rnd mod 26);
+end;
+
+function Same(const A, B: TPasJsonScan): Boolean;
+begin
+  Result := (A.Escaped = B.Escaped) and (A.InStr = B.InStr) and (A.Scalar = B.Scalar) and
+    (A.Nodes = B.Nodes) and (A.Scalars = B.Scalars) and (A.Bytes = B.Bytes);
+end;
+
+procedure Disagree(const Way: string; N, Al: Integer);
+begin
+  bad := bad + 1;
+  if bad < 10 then
+    WriteLn('disagree: ', Way, ' length ', N, ' place ', Al);
+end;
+
+{ Plain's scan of P[0..N-1] followed by spaces to the end of its last
+  block, into ia and Ref: how many places }
+function Reference(P: PByte; N: Integer; Off: Int64; var Ref: TPasJsonScan): Int64;
+var
+  pad: Integer;
+begin
+  PasJsonScanStart(Ref);
+  Result := PasJsonIndexPlain(P, N, Ref, @ia[0], Off);
+  pad := ((N + 63) and not 63) - N;
+  Result := Result + PasJsonIndexPlain(@spaces[0], pad, Ref, @ia[Result], Off + N);
+end;
+
+{ the scan's answer into the sum }
+procedure MixScan(K: Int64; const S: TPasJsonScan);
+var
+  i: Integer;
+begin
+  Mix(K);
+  for i := 0 to K - 1 do
+    Mix(ia[i]);
+  Mix(S.Escaped);
+  Mix(S.InStr);
+  Mix(S.Scalar);
+  Mix(S.Nodes);
+  Mix(S.Scalars);
+  Mix(S.Bytes);
+end;
+
+function SameIndex(K: Int64): Boolean;
+var
+  i: Integer;
+begin
+  Result := True;
+  for i := 0 to K - 1 do
+    if ia[i] <> ib[i] then
+      Result := False;
+end;
+
+{ the scan of the build on P[0..N-1], and the kernels on it padded with
+  spaces in place (P has room), held to the reference }
+procedure Kernels(P: PByte; N, Al: Integer; Off, Want: Int64; const Ref: TPasJsonScan);
+var
+  s: TPasJsonScan;
+  k, nb, k1, i: Int64;
+begin
+  PasJsonScanStart(s);
+  k := PasJsonIndex(P, N, s, @ib[0], Off);
+  if (k <> Want) or not Same(s, Ref) or not SameIndex(Want) then
+    Disagree('scan', N, Al);
+  nb := (N + 63) shr 6;
+  for i := N to nb * 64 - 1 do
+    P[i] := 32;
+  k1 := Al mod (nb + 1);
+  PasJsonScanStart(s);
+  k := PasJsonIndexBase(P, k1, s, @ib[0], Off);
+  k := k + PasJsonIndexBase(@P[k1 * 64], nb - k1, s, @ib[k], Off + k1 * 64);
+  if (k <> Want) or not Same(s, Ref) or not SameIndex(Want) then
+    Disagree('base', N, Al);
+{$if defined(CPU_AVX2) or defined(CPUAARCH64)}
+  PasJsonScanStart(s);
+  k := PasJsonIndexCpu(P, k1, s, @ib[0], Off);
+  k := k + PasJsonIndexCpu(@P[k1 * 64], nb - k1, s, @ib[k], Off + k1 * 64);
+  if (k <> Want) or not Same(s, Ref) or not SameIndex(Want) then
+    Disagree('cpu', N, Al);
+{$endif}
+end;
+
+{ the escape finder's ways on P[0..N-1], held to Plain's }
+function Esc(P: PByte; N, Al: Integer; Html: Boolean): Int64;
+var
+  a: Int64;
+begin
+  a := PasJsonEscIndexPlain(P, N, Html);
+  if PasJsonEscIndex(P, N, Html) <> a then
+    Disagree('escape', N, Al);
+  if PasJsonEscIndexBase(P, N, Html) <> a then
+    Disagree('escape base', N, Al);
+{$if defined(CPU_AVX2) or defined(CPUAARCH64)}
+  if PasJsonEscIndexCpu(P, N, Html) <> a then
+    Disagree('escape cpu', N, Al);
+{$endif}
+  Result := a;
+end;
+
+{ A routine's own text of 200 000 bytes and more in the heap, from its
+  own xorshift: the scan of the build (several calls into the kernel)
+  against Plain over the text and the spaces after it. }
+procedure Scanner(Id: Integer);
+var
+  t: array of Byte;
+  ra, rb: array of UInt32;
+  sa, sb: TPasJsonScan;
+  x, n, i, ka, kb, pad: Int64;
+  ok: Boolean;
+begin
+  n := 200000 + Id * 37;
+  SetLength(t, n);
+  SetLength(ra, n + 72);
+  SetLength(rb, n + 72);
+  x := 1234567 + Id * 7919;
+  for i := 0 to n - 1 do
+  begin
+    x := x xor (x shl 13);
+    x := x xor (x shr 7);
+    x := x xor (x shl 17);
+    t[i] := Alpha[(x and $7FFFFFFFFFFFFFFF) mod 24];
+  end;
+  PasJsonScanStart(sa);
+  ka := PasJsonIndexPlain(@t[0], n, sa, @ra[0], 0);
+  pad := ((n + 63) and not 63) - n;
+  ka := ka + PasJsonIndexPlain(@spaces[0], pad, sa, @ra[ka], n);
+  PasJsonScanStart(sb);
+  kb := PasJsonIndex(@t[0], n, sb, @rb[0], 0);
+  ok := (ka = kb) and Same(sa, sb);
+  if ok then
+    for i := 0 to ka - 1 do
+      if ra[i] <> rb[i] then
+        ok := False;
+  agree[Id] := Ord(ok);
+  wg.Done;
+end;
+
+var
+  n, al, i, j, f, m, o, b, mode, cases: Integer;
+  k, off, page, pg: Int64;
+  ref: TPasJsonScan;
+  q: PByte;
+  s: string;
+
+begin
+  bad := 0;
+  for i := 0 to 63 do
+    spaces[i] := 32;
+  { texts of every length at every place }
+  seed := 88172645463325252;
+  H := 0;
+  cases := 0;
+  for n := 0 to 300 do
+  begin
+    GenText(@txt[0], n);
+    for off := 0 to 1 do
+    begin
+      if off = 0 then
+        k := Reference(@txt[0], n, OffLo, ref)
+      else
+        k := Reference(@txt[0], n, OffHi, ref);
+      MixScan(k, ref);
+      for al := 0 to 63 do
+      begin
+        for i := 0 to n - 1 do
+          buf[al + i] := txt[i];
+        if off = 0 then
+          Kernels(@buf[al], n, al, OffLo, k, ref)
+        else
+          Kernels(@buf[al], n, al, OffHi, k, ref);
+        cases := cases + 1;
+      end;
+    end;
+  end;
+  WriteLn('texts ', cases, ' ', H);
+  { patterns around the edges of the blocks }
+  H := 0;
+  cases := 0;
+  for j := 0 to NPat - 1 do
+  begin
+    s := Pats[j];
+    for f := 0 to 3 do
+      for mode := 0 to 1 do
+        for o := 0 to 191 - Length(s) do
+        begin
+          if not ((o < 8) or ((o >= 48) and (o <= 80)) or ((o >= 112) and (o <= 144)) or
+            (o >= 184 - Length(s))) then
+            Continue;
+          for i := 0 to 191 do
+            txt[i] := Fills[f];
+          if mode = 1 then
+            txt[0] := 34;
+          for i := 1 to Length(s) do
+            txt[o + i - 1] := Byte(Ord(s[i]));
+          k := Reference(@txt[0], 192, OffLo, ref);
+          MixScan(k, ref);
+          for i := 0 to 191 do
+            buf[i + (o and 7)] := txt[i];
+          Kernels(@buf[o and 7], 192, o and 7, OffLo, k, ref);
+          cases := cases + 1;
+        end;
+  end;
+  WriteLn('patterns ', cases, ' ', H);
+  { the escape finder: every length at every place, both modes }
+  H := 0;
+  cases := 0;
+  for n := 0 to 200 do
+  begin
+    GenStr(@txt[0], n);
+    for mode := 0 to 1 do
+    begin
+      Mix(PasJsonEscIndexPlain(@txt[0], n, mode = 1));
+      for al := 0 to 63 do
+      begin
+        for i := 0 to n - 1 do
+          buf[al + i] := txt[i];
+        Esc(@buf[al], n, al, mode = 1);
+        cases := cases + 1;
+      end;
+    end;
+  end;
+  WriteLn('escapes ', cases, ' ', H);
+  { every byte at every place of a string of 71 letters }
+  H := 0;
+  cases := 0;
+  for b := 0 to 255 do
+    for o := 0 to 70 do
+      for mode := 0 to 1 do
+      begin
+        for i := 0 to 70 do
+          buf[o + i] := 97;
+        buf[o + o] := Byte(b);
+        Mix(Esc(@buf[o], 71, o, mode = 1));
+        cases := cases + 1;
+      end;
+  WriteLn('escape bytes ', cases, ' ', H);
+  { the guard pages: a readable page between two unmapped ones }
+  if Amd64 = 1 then
+    page := Syscall(9, 0, 12288, 3, 34, -1, 0)
+  else
+    page := Syscall(222, 0, 12288, 3, 34, -1, 0);
+  if Amd64 = 1 then
+    pg := Syscall(10, page, 4096, 0) + Syscall(10, page + 8192, 4096, 0)
+  else
+    pg := Syscall(226, page, 4096, 0) + Syscall(226, page + 8192, 4096, 0);
+  H := 0;
+  cases := 0;
+  for n := 1 to 200 do
+  begin
+    { a text that ends at the end of the page: the scan reads nothing past it }
+    q := PByte(Pointer(page + 8192 - n));
+    GenText(q, n);
+    k := Reference(q, n, OffLo, ref);
+    MixScan(k, ref);
+    PasJsonScanStart(ref);
+    if (PasJsonIndex(q, n, ref, @ib[0], OffLo) <> k) or not SameIndex(k) then
+      Disagree('guard scan', n, 0);
+    { strings that end at the end and that begin at the start of the page }
+    GenStr(q, n);
+    for mode := 0 to 1 do
+      Mix(Esc(q, n, 0, mode = 1));
+    q := PByte(Pointer(page + 4096));
+    GenStr(q, n);
+    for mode := 0 to 1 do
+      Mix(Esc(q, n, 0, mode = 1));
+    cases := cases + 1;
+  end;
+  WriteLn('guard ', pg, ' ', cases, ' ', H);
+  { eight routines at once }
+  wg.Add(8);
+  for i := 0 to 7 do
+    pas Scanner(i);
+  wg.Wait;
+  cases := 0;
+  for i := 0 to 7 do
+    cases := cases + agree[i];
+  WriteLn('routines 8 agree ', cases);
+  WriteLn('disagree ', bad);
+end.

@@ -177,14 +177,15 @@ a unit's `.pi` in each `-Fu` directory in the order given, then in
 only), in `build`, in
 `.`, and beside the source file, and reads the first one it finds.
 
-Eight units are part of the language and need no `uses`; every program
+Eleven units are part of the language and need no `uses`; every program
 links them. `pasobject` (`TObject`, the root of every class),
 `pasroutines` (the sync types), `pasfmt` (what `Write`
-prints), `pashash` (the hash words) and `pastree` (the ordered tree,
-the heap and the store) also put their names in every program;
-`pasmap` (the hash map), `pasheap` (the heap and the collector) and
-`pasquad` (`Quad`) are only linked. Of each unit only the routines the
-program reaches stay in it (§21). Section 15 describes them.
+prints), `passtr` (the string words), `pashash` (the hash words) and
+`pastree` (the ordered tree, the heap and the store) also put their
+names in every program; `pasnum` (numbers as text), `pasmap` (the hash
+map), `pasheap` (the heap and the collector), `pasquad` (`Quad`) and
+`pasjson` (JSON's scans) are only linked. Of each unit only the routines
+the program reaches stay in it (§21). Section 15 describes them.
 
 ### Packages
 
@@ -6377,7 +6378,7 @@ prints
 
 ## 15. The core library and pasnet
 
-Ten units, the core, are compiled into `build/` (and `build/a64/`
+Eleven units, the core, are compiled into `build/` (and `build/a64/`
 for arm64) by `make`, for the base processor (`-cpu base`, so the
 installed units serve a program compiled for any processor) and again
 for a level (P143), and installed beside the compiler by `make
@@ -6417,11 +6418,21 @@ install`. Every program links them without `uses`:
   the `store` (§11); it names `pashash` for the log's CRC.
 - `pasheap` is the heap's slow paths and the collector (§18).
 - `pasquad` is the arithmetic of `Quad`, in software (§14).
+- `pasjson` is JSON's scans (P202), the first part of JSON in the
+  language: the structural scan of a text, 64 bytes a block after
+  simdjson's stage 1, which writes the index of the places a parser
+  reads (every quote, every comma, colon, bracket and brace and the
+  first byte of every other scalar outside a string, every escaping
+  backslash and control byte inside one) and counts what the document
+  holds; and the escape finder, the first byte of a string that JSON
+  writes escaped. Each has a kernel per machine (AVX2, SSE2, NEON) and
+  its Pascal body, chosen when the unit is built (docs/KERNELS.md).
 
 The names of `pasobject`, `pasroutines`, `pasfmt`, `passtr`, `pashash`
 and `pastree` are every program's, as those of a unit in `uses` are;
-`pasnum`, `pasmap`, `pasheap` and `pasquad` are only linked (`uses
-pasnum` or `uses pasquad` brings its names in). Their
+`pasnum`, `pasmap`, `pasheap`, `pasquad` and `pasjson` are only linked
+(`uses pasnum`, `uses pasquad` or `uses pasjson` brings its names in).
+Their
 routines are there for the compiler, and a program may call them too:
 
 | Unit | Routine | What it does |
@@ -6448,6 +6459,9 @@ routines are there for the compiler, and a program may call them too:
 | `passtr` | `PasUtf8Valid(p, n, ijson): Integer` | whether the `n` bytes at `p` are UTF-8 (RFC 3629): -1 when they are, else the place from 0 of the first byte of the first sequence that is not, as Python's strict decoder gives it; with `ijson` a noncharacter is refused too (U+FDD0 to U+FDEF and the last two of each plane, I-JSON, RFC 7493 2.1). AVX2 or NEON 64 bytes at a time by simdjson's lookup4, the base SSE2's ASCII skip with Go's automaton (1.1.117, P201); nothing past `p[n-1]` is read |
 | `passtr` | `PasUtf8Start(st, ijson)`, `PasUtf8Feed(st, p, n): Integer`, `PasUtf8End(st): Integer` | the same in pieces, a sequence a piece cuts waiting for the next: `Feed` -1 while all is right, else the place in the whole; `End` the place of a sequence left open |
 | `passtr` | `PasUtf8Plain(p, n, ijson, out pend)`, `PasUtf8BlocksCpu`, `PasUtf8BlocksBase` | the reference byte by byte (a sequence the end cuts is `pend` bytes, not an error) and the two kernels over blocks of 64 bytes, which the tests hold to it |
+| `pasjson` | `PasJsonScanStart(st)`, `PasJsonIndex(p, n, st, idx, off): Integer` | the structural scan of the `n` bytes at `p`, whose first is at `off` in the text: the places from the start of the text, as `UInt32`, of every quote, of every comma, colon, bracket and brace and the first byte of every other scalar outside a string, and of every escaping backslash and control byte inside one, into `idx` (room for `n + 8`), and how many; the `TPasJsonScan` `st` carries whether the next byte is escaped, whether a string is open and whether a scalar goes on, and counts the values and member names (`Nodes`), the scalars that are not strings (`Scalars`) and the bytes of the strings from their opening quote and of the other scalars (`Bytes`). The text ends as if spaces followed it; nothing past `p[n-1]` is read (1.1.118, P202) |
+| `pasjson` | `PasJsonIndexBlocks(p, nblocks, st, idx, off)`, `PasJsonIndexCpu`, `PasJsonIndexBase`, `PasJsonIndexPlain(p, n, st, idx, off)` | the same over whole blocks of 64 bytes, for a text that goes on (room for `64 * nblocks + 8`); the two kernels, which take any number of blocks in one call where `PasJsonIndexBlocks` gives them 1024 at most (64 KiB), so the routine can be stopped between two; and the reference byte by byte, which the tests hold them to |
+| `pasjson` | `PasJsonEscIndex(p, n, html): Integer`, `PasJsonEscIndexCpu`, `PasJsonEscIndexBase`, `PasJsonEscIndexPlain` | the place from 0 of the first of the `n` bytes at `p` that JSON writes escaped (a quote, a backslash, a byte below 20h and, with `html`, `&`, `<` and `>`), -1 when there is none; the kernels read aligned blocks, which never cross a page |
 | `pashash` | `PasHex(s)`, `PasMd5(s)`, `PasSha3(s, bits)`, `PasAdler32(s, adler)`, `PasFnv1a32(s)`, `PasFnv1a64(s)`, `PasMurmur3(s, seed)`, `PasSipHash(s, k0, k1)` | the bodies of `Hex`, `Md5`, `Sha3_*`, `Adler32`, `Fnv1a32`, `Fnv1a64`, `Murmur3` and `SipHash`, one each |
 | `pashash` | `PasSha1Cpu(s)`, `PasSha1Base(s)`, and the same pairs for `Sha224`, `Sha256`, `Sha384`, `Sha512`; `PasHmacCpu(alg, key, msg)`, `PasHmacBase` (alg 0 MD5, 1 SHA-1, 2 SHA-224, 3 SHA-256, 4 SHA-384, 5 SHA-512); `PasCrc32Cpu(s, crc)`, `PasCrc32Base`, `PasCrc32cCpu`, `PasCrc32cBase`; `PasMerkleRootCpu(leaves)`, `PasMerkleRootBase`, `PasMerkleProofCpu(leaves, i)`, `PasMerkleProofBase`, `PasMerkleCheckCpu(leaf, i, n, proof, root)`, `PasMerkleCheckBase` | the two bodies of each word, the `Cpu` one on the processor's instructions and the `Base` one in Pascal; the compiler calls one by `-cpu` (§21), a program that calls `Cpu` itself answers for the processor it runs on |
 | `pastree` | `PasTreeNew`, `PasTreeGet`, `PasTreePut`, `PasTreeDelete`, `PasTreeClear`, `PasTreeStep`, `PasTreeBound`, `PasTreeRank`, `PasTreeKeyAt`, `PasTreePop`, `PasTreeSplit`, `PasTreeJoin`, `PasHeapNew`, `PasHeapPush`, `PasHeapPop`, `PasHeapLow`, `PasHeapEmpty` | the tree and heap words, taking the compiler's descriptor of the type (key kind and sizes) and keys by address: written for the compiler, not for a program, which has `t[k]`, `Push` and the rest |
@@ -6466,6 +6480,18 @@ t := '[1.5e-7,42]';
 if PasNumScan(@t[2], Length(t) - 1, True, sc) then   { sc.Len = 6: the comma ends it }
   if PasNumF64(@t[2], sc, bits) then                  { bits = 1.5e-7's, in range }
     n := PasNumAppendF64(@buf[0], bits);               { buf = '1.5e-7', n = 6 }
+```
+
+With `uses pasjson`, a text is scanned for the places of its values:
+
+```
+t := '{"a":[1,"x\"y"]}';
+PasJsonScanStart(st);
+k := PasJsonIndex(@t[1], Length(t), st, @idx[0], 0);
+{ k = 12: 0 1 3 4 5 6 7 8 10 13 14 15, the brace, the quotes of "a",
+  the colon, the bracket, the 1, the comma, the quotes of the string and
+  its backslash, the closing bracket and brace; st.Nodes = 5 (the
+  object, "a", the array, 1 and the string), st.Bytes = 8 }
 ```
 
 A missing core unit stops the compile with a message that names it:

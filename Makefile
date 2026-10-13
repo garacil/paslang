@@ -210,6 +210,9 @@ GOLDEN_A64 += cputune
 # UTF-8 validation, one kernel per machine (P201)
 GOLDEN += utf8kern
 GOLDEN_A64 += utf8kern
+# JSON's scans, one kernel per machine (P202)
+GOLDEN += jsonkern
+GOLDEN_A64 += jsonkern
 # P263: code chooses by the version of paslangc compiling it: {$if},
 # {$elseif}, PASLANG_FULLVERSION and its parts, defined(), skipped branches.
 GOLDEN += condver
@@ -228,7 +231,8 @@ CORE_UNITS := \
 	src/lib/pasheap.paslang \
 	src/lib/pasfmt.paslang \
 	src/lib/passtr.paslang \
-	src/lib/pasquad.paslang
+	src/lib/pasquad.paslang \
+	src/lib/pasjson.paslang
 
 # The library units a program reaches with a uses clause. They are not
 # part of the language, but they are part of the installation, so a
@@ -726,7 +730,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/stackmap.out $(BUILDDIR)/stackmap.vgot; \
 	echo ok stackmaps; \
 	echo "==== the base processor (-cpu base) ===="; \
-	for t in vectors vecmore vecpool bitwords xxh3 inlineasm hash1 tree1 store1 mapsplit set256 strwords strkern strcmpk cmpwords sysutils1 utf8kern; do \
+	for t in vectors vecmore vecpool bitwords xxh3 inlineasm hash1 tree1 store1 mapsplit set256 strwords strkern strcmpk cmpwords sysutils1 utf8kern jsonkern; do \
 	  $(OUTDIR)/paslangc -cpu base -o $(BUILDDIR)/$$t-base testdata/$$t.paslang; \
 	  $(BUILDDIR)/$$t-base > $(BUILDDIR)/$$t.bgot; \
 	  diff -u testdata/$$t.out $(BUILDDIR)/$$t.bgot; \
@@ -757,13 +761,20 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -qw 'ptest' $(BUILDDIR)/set256-v2.s; \
 	if grep -qw 'vptest' $(BUILDDIR)/set256-v2.s; then echo "set256-v2.s carries AVX2"; exit 1; fi; \
 	: a program for the base processor links no instruction past it, P268: inlineasm writes AVX2 itself and strkern calls the AVX2 kernels to test them; \
-	for t in vectors vecmore vecpool bitwords xxh3 hash1 tree1 store1 mapsplit set256 strwords strcmpk cmpwords sysutils1 utf8kern; do \
+	for t in vectors vecmore vecpool bitwords xxh3 hash1 tree1 store1 mapsplit set256 strwords strcmpk cmpwords sysutils1 utf8kern jsonkern; do \
 	  python3 -I scripts/check_cpubin.py base $(BUILDDIR)/$$t-base > /dev/null || { python3 -I scripts/check_cpubin.py base $(BUILDDIR)/$$t-base; exit 1; }; \
 	done; \
-	: the UTF-8 kernels against Python's strict decoder, P201: the expected output is the model's; \
+	: the UTF-8 kernels against the strict decoder of Python, P201: the expected output is the model output; \
 	python3 -I scripts/utf8kern_model.py testdata/utf8kern.paslang | diff -u testdata/utf8kern.out -; \
 	grep -q 'call p_passtr_pasutf8blockscpu$$' $(BUILDDIR)/$(LVL_X64)/passtr.s || { echo "passtr's v3 build does not call the AVX2 UTF-8 kernel"; exit 1; }; \
 	if grep -q 'call p_passtr_pasutf8blockscpu$$' $(BUILDDIR)/passtr.s; then echo "passtr's base build calls the AVX2 UTF-8 kernel"; exit 1; fi; \
+	: the scans of JSON against their definitions, P202: the expected output is the model output, the v3 build calls the AVX2 kernels and the base build the SSE2 ones; \
+	python3 -I scripts/jsonkern_model.py testdata/jsonkern.paslang | diff -u testdata/jsonkern.out -; \
+	for k in pasjsonindex pasjsonescindex; do \
+	  grep -q "call p_pasjson_$${k}cpu$$" $(BUILDDIR)/$(LVL_X64)/pasjson.s || { echo "pasjson's v3 build does not call $${k}cpu"; exit 1; }; \
+	  grep -q "call p_pasjson_$${k}base$$" $(BUILDDIR)/pasjson.s || { echo "pasjson's base build does not call $${k}base"; exit 1; }; \
+	  if grep -q "call p_pasjson_$${k}cpu$$" $(BUILDDIR)/pasjson.s; then echo "pasjson's base build calls $${k}cpu"; exit 1; fi; \
+	done; \
 	echo ok cpu-base; \
 	echo "==== the benchmark programs compile (P197) ===="; \
 	mkdir -p $(BUILDDIR)/benchcheck; \
@@ -2875,7 +2886,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/cputuse-arm > $(BUILDDIR)/cputuse-arm.got; \
 	diff -u testdata/cputuse.out $(BUILDDIR)/cputuse-arm.got; \
 	echo "==== the base processor arm64 ===="; \
-	for t in hash1 tree1 store1 vectors bitwords set256 strwords strkern strcmpk cmpwords sysutils1 utf8kern; do \
+	for t in hash1 tree1 store1 vectors bitwords set256 strwords strkern strcmpk cmpwords sysutils1 utf8kern jsonkern; do \
 	  $(OUTDIR)/paslangc -target arm64 -cpu base -o $(BUILDDIR)/$$t-arm-base testdata/$$t.paslang; \
 	  timeout 120 $(QEMU_A64) $(BUILDDIR)/$$t-arm-base > $(BUILDDIR)/$$t-arm.bgot; \
 	  diff -u testdata/$$t.out $(BUILDDIR)/$$t-arm.bgot; \
