@@ -83,6 +83,11 @@ type
     function OwnContinue(S: PStmt; Loops: LongInt): Boolean;
     function LoopAt(S: PStmt): PStmt;
     function InlineS(S: PStmt): PStmt;
+    function NameUses(E: PExpr; const N: string): LongInt;
+    function SafeArg(E: PExpr): Boolean;
+    function ExprBody(Idx: LongInt; out B: PExpr): Boolean;
+    procedure ExprInlineE(var E: PExpr);
+    procedure ExprInlineS(S: PStmt);
     function FindProc(const Sym: string): LongInt;
     function FoldExpr(E: PExpr): PExpr;
     function FoldStmt(S: PStmt): PStmt;
@@ -1523,6 +1528,159 @@ begin
   Result := nw;
 end;
 
+{ ---- A function of one expression goes in as its expression (P266) ----
+
+  A function whose body is Result := E alone (or its name := E), with no
+  locals and no var or out parameter, where E makes no call and does
+  not read Result, is the expression itself wherever it is called: in a
+  condition, an operand, an argument, the right side of an and or an
+  or. The call becomes a copy of E with each parameter replaced by its
+  argument, typed as the call was, evaluated where the call was. It
+  went in as a block that set a hidden variable and the call's place
+  read that variable, so if ULt(a, b) then made a Boolean in a register
+  and tested it, where the comparison inside is the branch itself
+  (P265's CondJmp sees it now), and an integer helper's value went
+  through memory. An argument is a constant, or an expression of the
+  parameter's own type that makes no call and cannot fail (no index,
+  dereference, division or remainder: the call would have evaluated
+  it, and it must fail or not as it did); one that is not a leaf is
+  used once at most in E, so nothing is worked out twice. Go makes the
+  call an InlinedCallExpr, the body and its return variables
+  (cmd/compile/internal/inline/inl.go mkinlcall, ir/expr.go), and its
+  SSA makes those variables values; with no SSA here, the expression
+  stands where the call was. }
+
+{ How many times E reads the name N. }
+function TOpt.NameUses(E: PExpr; const N: string): LongInt;
+var
+  i: SizeInt;
+begin
+  Result := 0;
+  if E = nil then
+    Exit;
+  if (E^.Kind = ekVar) and SameId(E^.Name, N) then
+    Result := 1;
+  Result := Result + NameUses(E^.L, N) + NameUses(E^.R, N);
+  for i := 0 to High(E^.Args) do
+    Result := Result + NameUses(E^.Args[i], N);
+end;
+
+{ An argument that may stand in E as it is: constants, variables, and
+  arithmetic, logic, shifts and comparisons on those, none of which can
+  fail or make a call. }
+function TOpt.SafeArg(E: PExpr): Boolean;
+begin
+  Result := False;
+  if E = nil then
+    Exit;
+  case E^.Kind of
+    ekInt, ekNil, ekVar:
+      Result := True;
+    ekStr:
+      Result := Length(E^.Txt) = 1;
+    ekUn:
+      Result := SafeArg(E^.L);
+    ekBin:
+      if (E^.Bin <> boDiv) and (E^.Bin <> boMod) and (E^.Bin <> boSlash) and
+        (E^.Bin <> boIn) and (E^.Bin <> boConcat) and (E^.Bin <> boIs) and (E^.Bin <> boAs) then
+        Result := SafeArg(E^.L) and SafeArg(E^.R);
+  end;
+end;
+
+{ The expression a function's body is, when the function goes in as it. }
+function TOpt.ExprBody(Idx: LongInt; out B: PExpr): Boolean;
+var
+  pr: TProc;
+  st: PStmt;
+  i: SizeInt;
+begin
+  Result := False;
+  B := nil;
+  pr := FProcs[Idx];
+  if (not pr.IsFunc) or (Length(pr.Locals) > 0) then
+    Exit;
+  for i := 0 to High(pr.Params) do
+    if pr.Params[i].ByRef then
+      Exit;
+  st := pr.Body;
+  if (st <> nil) and (st^.Kind = skBlock) and (Length(st^.Stmts) = 1) then
+    st := st^.Stmts[0];
+  if (st = nil) or (st^.Kind <> skAssign) or (st^.Dest = nil) or (st^.Dest^.Kind <> ekVar) then
+    Exit;
+  if not (SameId(st^.Dest^.Name, 'Result') or SameId(st^.Dest^.Name, pr.Name)) then
+    Exit;
+  if (st^.E = nil) or (st^.E^.Typ <> pr.RetTyp) or (not Pure(st^.E)) then
+    Exit;
+  if (NameUses(st^.E, 'Result') > 0) or (NameUses(st^.E, pr.Name) > 0) then
+    Exit;
+  B := st^.E;
+  Result := True;
+end;
+
+{ Every call in E of a function that goes in as its expression, inner
+  calls first, so an argument that was a call is an expression by the
+  time its own call is looked at. }
+procedure TOpt.ExprInlineE(var E: PExpr);
+var
+  i: SizeInt;
+  idx: LongInt;
+  b, a, nw: PExpr;
+  pr: TProc;
+  saveFrom: TStrArray;
+  saveTo: TExprArray;
+begin
+  if E = nil then
+    Exit;
+  ExprInlineE(E^.L);
+  ExprInlineE(E^.R);
+  for i := 0 to High(E^.Args) do
+    ExprInlineE(E^.Args[i]);
+  if E^.Kind <> ekCall then
+    Exit;
+  idx := FindProc(E^.Name);
+  if (idx < 0) or (idx = FCur) or (not Inlinable(idx)) or (not ExprBody(idx, b)) then
+    Exit;
+  pr := FProcs[idx];
+  if Length(E^.Args) <> Length(pr.Params) then
+    Exit;
+  for i := 0 to High(pr.Params) do
+  begin
+    a := E^.Args[i];
+    if (a = nil) or (a^.Kind = ekAddr) or (not SafeArg(a)) then
+      Exit;
+    if (a^.Kind <> ekInt) and (a^.Kind <> ekNil) and (a^.Typ <> pr.Params[i].Typ) then
+      Exit;
+    if (a^.Kind <> ekInt) and (a^.Kind <> ekNil) and (a^.Kind <> ekVar) and
+      (NameUses(b, pr.Params[i].Name) > 1) then
+      Exit;
+  end;
+  saveFrom := FMapFrom;
+  saveTo := FMapTo;
+  FMapFrom := nil;
+  FMapTo := nil;
+  for i := 0 to High(pr.Params) do
+    MapName(pr.Params[i].Name, E^.Args[i]);
+  nw := CopyE(b);
+  FMapFrom := saveFrom;
+  FMapTo := saveTo;
+  nw^.Typ := E^.Typ;
+  E := nw;
+  Inc(FDone);
+end;
+
+procedure TOpt.ExprInlineS(S: PStmt);
+var
+  i: SizeInt;
+begin
+  if S = nil then
+    Exit;
+  ExprInlineE(S^.E);
+  ExprInlineE(S^.E2);
+  ExprInlineE(S^.Dest);
+  for i := 0 to High(S^.Args) do
+    ExprInlineE(S^.Args[i]);
+end;
+
 { The walk over a routine: what a step produces is walked on, so a
   call put in place has its own calls put in place in the same pass
   and a statement with several calls takes them one after another. }
@@ -1534,6 +1692,7 @@ begin
   Result := S;
   if S = nil then
     Exit;
+  ExprInlineS(S);
   r := InlineAt(S);
   if r = nil then
     r := HoistAt(S);

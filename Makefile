@@ -193,6 +193,9 @@ GOLDEN_A64 += strappend
 # a condition as branches against the same condition as a value (P265)
 GOLDEN += condjump
 GOLDEN_A64 += condjump
+# a function of one expression goes in as its expression (P266)
+GOLDEN += exprinline
+GOLDEN_A64 += exprinline
 # P263: code chooses by the version of paslangc compiling it: {$if},
 # {$elseif}, PASLANG_FULLVERSION and its parts, defined(), skipped branches.
 GOLDEN += condver
@@ -1791,6 +1794,14 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'cmpq $$48, ' $(BUILDDIR)/condjump-digit.s && grep -q '^  jl ' $(BUILDDIR)/condjump-digit.s && grep -q '^  jg ' $(BUILDDIR)/condjump-digit.s || { echo "condjump.s: Digit's condition is not two compares and two jumps"; exit 1; }; \
 	if grep -q '^  set' $(BUILDDIR)/condjump-digit.s; then echo "condjump.s: Digit's condition makes a Boolean"; exit 1; fi; \
 	echo ok condjump; \
+	: a function of one expression goes in as its expression, P266: the output of every routine a call, and Branchy one compare and one jump with no call of Less; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/exprinline0 testdata/exprinline.paslang; \
+	$(BUILDDIR)/exprinline0 > $(BUILDDIR)/exprinline0.got; \
+	diff -u testdata/exprinline.out $(BUILDDIR)/exprinline0.got; \
+	awk '/^p_branchy:/,/ret$$/' $(BUILDDIR)/exprinline.s > $(BUILDDIR)/exprinline-branchy.s; \
+	grep -q '^  jge ' $(BUILDDIR)/exprinline-branchy.s || { echo "exprinline.s: Branchy does not branch on Less's compare"; exit 1; }; \
+	if grep -q 'call p_less\|^  set' $(BUILDDIR)/exprinline-branchy.s; then echo "exprinline.s: Branchy calls Less or makes a Boolean"; exit 1; fi; \
+	echo ok exprinline; \
 	echo "==== narrow Go twin ===="; \
 	if command -v go > /dev/null 2>&1; then \
 	  rm -rf $(BUILDDIR)/gotwin; mkdir -p $(BUILDDIR)/gotwin; \
@@ -2529,7 +2540,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'paslang: unlock of an unlocked mutex' $(BUILDDIR)/unlockfree.err; \
 	echo ok unlockfree; \
 	echo "==== fatal ===="; \
-	for t in divzero nilptr deep oom oomlimit closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap; do \
+	for t in divzero nilptr deep oom oomlimit closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg; do \
 	  $(OUTDIR)/paslangc -o $(BUILDDIR)/fatal_$$t testdata/fatal/$$t.paslang; \
 	  set +e; \
 	  if [ $$t = oomlimit ]; then \
@@ -2553,6 +2564,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'paslang: set element 1 out of range \[2..7\] at line 16' $(BUILDDIR)/fatal_setincl.err; \
 	grep -q 'paslang: integer divide by zero at line 13' $(BUILDDIR)/fatal_divloop.err; \
 	grep -q 'paslang: index 10 out of range \[0..4\] at line 11' $(BUILDDIR)/fatal_bstatic.err; \
+	grep -q 'paslang: index 9 out of range \[0..4\] at line 17' $(BUILDDIR)/fatal_exprarg.err; \
 	grep -q 'paslang: index 3 out of range \[0..2\] at line 13' $(BUILDDIR)/fatal_bslice.err; \
 	grep -q 'paslang: index 3 out of range \[0..2\] at line 14' $(BUILDDIR)/fatal_bsame.err; \
 	grep -q 'paslang: index 5 out of range \[0..4\] at line 15' $(BUILDDIR)/fatal_bslicereg.err; \
@@ -2696,6 +2708,12 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	awk '/^p_digit:/,/ret$$/' $(BUILDDIR)/condjump-arm.s > $(BUILDDIR)/condjump-digit-arm.s; \
 	grep -q 'cmp x0, #48' $(BUILDDIR)/condjump-digit-arm.s && grep -q 'b.lt ' $(BUILDDIR)/condjump-digit-arm.s && grep -q 'b.gt ' $(BUILDDIR)/condjump-digit-arm.s || { echo "condjump-arm.s: Digit's condition is not two compares and two branches"; exit 1; }; \
 	if grep -q 'cset' $(BUILDDIR)/condjump-digit-arm.s; then echo "condjump-arm.s: Digit's condition makes a Boolean"; exit 1; fi; \
+	$(OUTDIR)/paslangc -target arm64 -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/exprinline0-arm testdata/exprinline.paslang; \
+	timeout 300 $(QEMU_A64) $(BUILDDIR)/exprinline0-arm > $(BUILDDIR)/exprinline0-arm.got; \
+	diff -u testdata/exprinline.out $(BUILDDIR)/exprinline0-arm.got; \
+	awk '/^p_branchy:/,/ret$$/' $(BUILDDIR)/exprinline-arm.s > $(BUILDDIR)/exprinline-branchy-arm.s; \
+	grep -q 'b.ge ' $(BUILDDIR)/exprinline-branchy-arm.s || { echo "exprinline-arm.s: Branchy does not branch on Less's compare"; exit 1; }; \
+	if grep -q 'bl p_less\|cset' $(BUILDDIR)/exprinline-branchy-arm.s; then echo "exprinline-arm.s: Branchy calls Less or makes a Boolean"; exit 1; fi; \
 	echo "==== the base processor arm64 ===="; \
 	for t in hash1 tree1 store1 vectors bitwords set256 strwords strkern strcmpk cmpwords sysutils1; do \
 	  $(OUTDIR)/paslangc -target arm64 -cpu base -o $(BUILDDIR)/$$t-arm-base testdata/$$t.paslang; \
@@ -2850,7 +2868,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	grep -q 'paslang: unlock of an unlocked mutex' $(BUILDDIR)/unlockfree-arm.err; \
 	echo ok unlockfree-arm; \
 	echo "==== fatal arm64 ===="; \
-	for t in divzero nilptr deep oom closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap; do \
+	for t in divzero nilptr deep oom closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg; do \
 	  $(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/fatal_$$t-arm testdata/fatal/$$t.paslang; \
 	  set +e; timeout 60 $(QEMU_A64) $(BUILDDIR)/fatal_$$t-arm > $(BUILDDIR)/fatal_$$t-arm.got 2> $(BUILDDIR)/fatal_$$t-arm.err; rc=$$?; set -e; \
 	  test $$rc -eq 1; \
@@ -2867,6 +2885,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	grep -q 'paslang: set element 1 out of range \[2..7\] at line 16' $(BUILDDIR)/fatal_setincl-arm.err; \
 	grep -q 'paslang: integer divide by zero at line 13' $(BUILDDIR)/fatal_divloop-arm.err; \
 	grep -q 'paslang: index 10 out of range \[0..4\] at line 11' $(BUILDDIR)/fatal_bstatic-arm.err; \
+	grep -q 'paslang: index 9 out of range \[0..4\] at line 17' $(BUILDDIR)/fatal_exprarg-arm.err; \
 	grep -q 'paslang: index 3 out of range \[0..2\] at line 13' $(BUILDDIR)/fatal_bslice-arm.err; \
 	grep -q 'paslang: index 3 out of range \[0..2\] at line 14' $(BUILDDIR)/fatal_bsame-arm.err; \
 	grep -q 'paslang: index 5 out of range \[0..4\] at line 15' $(BUILDDIR)/fatal_bslicereg-arm.err; \
