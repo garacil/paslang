@@ -240,6 +240,39 @@ P148):
 {$endif}
 ```
 
+`{$if expr}` and `{$elseif expr}` keep the code after them when the
+expression is true, as Free Pascal's compile-time expressions do. It
+takes numbers, `defined(NAME)`, the comparisons `=`, `<>`, `<`, `<=`,
+`>` and `>=`, `not`, `and`, `or` and `xor`, bound as paslang's
+operators bind (a comparison before `and`, §3), and parentheses; a
+value is true when it is not 0, and a name that is not a number is an
+error. `{$ifend}` ends one as `{$endif}` does, and a branch not taken
+is not read. The version of the paslangc compiling is four numbers:
+`PASLANG_VERSION`, `PASLANG_RELEASE`, `PASLANG_PATCH` and
+`PASLANG_FULLVERSION`, the three in one, major times a million plus
+release times a thousand plus patch (1.1.108 is 1001108). So a source
+uses what a version brought and keeps another body for an older
+compiler (1.1.108, P263):
+
+```
+{$if PASLANG_FULLVERSION >= 1001108}
+  r := NewWay(x);                { what 1.1.108 brought }
+{$else}
+  r := OldWay(x);
+{$endif}
+```
+
+`{$info msg}`, `{$note msg}`, `{$hint msg}`, `{$warning msg}` and
+`{$message msg}` print `msg` on the standard error with the line and
+the file, and the compilation goes on; `{$error msg}` and `{$fatal
+msg}` stop it there, so a source says which paslangc it needs:
+
+```
+{$if PASLANG_FULLVERSION < 1001108}
+  {$error this program needs paslangc 1.1.108 or later}
+{$endif}
+```
+
 Any other directive (`{$mode objfpc}`, `{$H+}`) is read as a comment.
 
 ## 3. Values and types
@@ -11210,6 +11243,12 @@ the commands on standard input, under `--debug-mode` and under
 - A comparison binds before `and`, `or` and `xor`, as in C and Go:
   `(j > 3) and (s <> '')` needs no parentheses, and `x and 4 = 4`, which
   would mix a Boolean with an integer, is a compile error (§3).
+- `{$if}` reads numbers, `defined(NAME)` and the numeric names
+  (`PASLANG_FULLVERSION` and its parts); a name that is not a number is
+  an error, where Free Pascal reads an expression it cannot take as
+  numbers as strings and goes on. `PASLANG_FULLVERSION` gives the
+  release and the patch three digits each (1.1.108 is 1001108), where
+  `FPC_FULLVERSION` gives them two: paslang's patch is past 100 (§2).
 - A routine's `var`, `const` and `type` sections and its nested routines
   come in any order, as in FPC; a nested routine sees what is declared
   before it. So do the sections and the routines of a unit's

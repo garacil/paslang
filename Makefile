@@ -189,6 +189,10 @@ GOLDEN_A64 += resultmark
 # x's routines change, the collector and two large strings in turn.
 GOLDEN += strappend
 GOLDEN_A64 += strappend
+# P263: code chooses by the version of paslangc compiling it: {$if},
+# {$elseif}, PASLANG_FULLVERSION and its parts, defined(), skipped branches.
+GOLDEN += condver
+GOLDEN_A64 += condver
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -1504,6 +1508,28 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  grep -qF -e "$$w" $(BUILDDIR)/bb_$$n.err || { cat $(BUILDDIR)/bb_$$n.err; exit 1; }; \
 	done; \
 	echo ok bitbad; \
+	echo "==== condbad ===="; \
+	for f in 'unknown:{$$if} NOTHING is not a number (defined(NOTHING) says whether it is defined) at 3: NOTHING > 1' \
+	  'paren:{$$if} wants ) at 3: (1 = 1' \
+	  'trailing:{$$if} cannot read 2 after the expression at 3: 1 2' \
+	  'empty:{$$if} wants an expression at 3' \
+	  'plus:{$$if} cannot read '"'+'"' at 3: 1 + 2' \
+	  'elseifbad:{$$if} NOWHERE is not a number (defined(NOWHERE) says whether it is defined) at 4: NOWHERE' \
+	  'needed:{$$error} needs paslangc 99 or later at 4' \
+	  'fatal:{$$fatal} stop here at 3'; do \
+	  n=$${f%%:*}; w=$${f#*:}; \
+	  if $(OUTDIR)/paslangc -o $(BUILDDIR)/cb_$$n testdata/condbad/$$n.paslang >$(BUILDDIR)/cb_$$n.err 2>&1; then \
+	    echo "$$n should fail"; exit 1; \
+	  fi; \
+	  grep -qF -e "$$w" $(BUILDDIR)/cb_$$n.err || { cat $(BUILDDIR)/cb_$$n.err; exit 1; }; \
+	done; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/condver-info testdata/condver.paslang >/dev/null 2>$(BUILDDIR)/condver-info.err; \
+	grep -qF 'paslangc: info: compiled by paslangc 1.1.108 or later at 66 in testdata/condver.paslang' $(BUILDDIR)/condver-info.err || { cat $(BUILDDIR)/condver-info.err; exit 1; }; \
+	$(OUTDIR)/paslangc testdata/units/condu.paslang; \
+	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/conduse testdata/conduse.paslang; \
+	$(BUILDDIR)/conduse > $(BUILDDIR)/conduse.got; \
+	diff -u testdata/conduse.out $(BUILDDIR)/conduse.got; \
+	echo ok condbad; \
 	echo "==== treebad ===="; \
 	for f in 'tryset:TryGet needs a tree with values: k in t says whether k is there at 10:24 in testdata/treebad/tryset.paslang' \
 	  'setval:+= of a tree of K: t[k] is True or False, and Include(t, k) puts k in at 8:11' \

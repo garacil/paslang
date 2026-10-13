@@ -158,12 +158,19 @@ type
     FLine, FCol: LongInt;
     FCh: Char;
     FDefs: array of string;
+    FDirRest: string;
+    FDirLine: LongInt;
+    FMacNames: array of string;
+    FMacVals: array of Int64;
     procedure Advance;
     procedure SkipSpace;
     function Defined(const N: string): Boolean;
     procedure Define(const N: string; On: Boolean);
     function Directive(out Arg: string): string;
     procedure SkipBranch(AtElse: Boolean);
+    procedure SetMacro(const N: string; V: Int64);
+    function EvalIf(const S: string): Boolean;
+    procedure DirMessage(const Kind, Msg: string);
     function Peek: Char;
     function Ident: TToken;
     function Number: TToken;
@@ -175,6 +182,7 @@ type
     constructor Create(const ASrc: string);
     procedure SetTarget(Arm: Boolean);
     procedure SetFeature(const N: string; On: Boolean);
+    procedure SetVersion(const V: string);
     function Next: TToken;
     function BlankToLineEnd: Boolean;
     function RawBlock: string;
@@ -242,6 +250,268 @@ begin
   Define('CPU_' + N, On);
 end;
 
+{ A name $if reads as a number (P263), defined too, as Free Pascal's
+  macros FPC_VERSION and FPC_FULLVERSION are. }
+procedure TLexer.SetMacro(const N: string; V: Int64);
+var
+  i, k: SizeInt;
+  u: string;
+begin
+  u := ToLower(N);
+  Define(u, True);
+  for i := 0 to High(FMacNames) do
+    if FMacNames[i] = u then
+    begin
+      FMacVals[i] := V;
+      Exit;
+    end;
+  k := Length(FMacNames);
+  SetLength(FMacNames, k + 1);
+  SetLength(FMacVals, k + 1);
+  FMacNames[k] := u;
+  FMacVals[k] := V;
+end;
+
+{ The version of the compiler compiling, V as PaslangVersion says it
+  (major.release.patch), as numbers for $if (P263): PASLANG_VERSION,
+  PASLANG_RELEASE, PASLANG_PATCH and PASLANG_FULLVERSION, the three in
+  one, major * 1000000 + release * 1000 + patch (1.1.108 is 1001108).
+  Free Pascal's FPC_FULLVERSION gives the release and the patch two
+  digits each (Programmer's Guide 3.2.2, 2.3); paslang's patch is past
+  100, so it takes three. }
+procedure TLexer.SetVersion(const V: string);
+var
+  part: array[0..2] of Int64;
+  i, k: SizeInt;
+begin
+  part[0] := 0;
+  part[1] := 0;
+  part[2] := 0;
+  k := 0;
+  for i := 1 to Length(V) do
+    if V[i] = '.' then
+    begin
+      if k < 2 then
+        k := k + 1;
+    end
+    else if (V[i] >= '0') and (V[i] <= '9') then
+      part[k] := part[k] * 10 + Ord(V[i]) - 48;
+  SetMacro('PASLANG_VERSION', part[0]);
+  SetMacro('PASLANG_RELEASE', part[1]);
+  SetMacro('PASLANG_PATCH', part[2]);
+  SetMacro('PASLANG_FULLVERSION', part[0] * 1000000 + part[1] * 1000 + part[2]);
+end;
+
+{ The expression of $if or $elseif (P263), as Free Pascal's
+  compile-time expressions (Programmer's Guide 3.2.2, 2.4): numbers,
+  the numeric names (the version's), defined(NAME), the comparisons
+  = <> < <= > >=, not, and, or and xor, and parentheses, bound as
+  paslang's operators bind (a comparison before and, and before or and
+  xor, manual 3); a value is true when it is not 0. A name that is not a
+  number, or anything else, is an error with its line: Free Pascal reads
+  an expression it cannot take as numbers as strings and goes on. }
+function TLexer.EvalIf(const S: string): Boolean;
+var
+  ip: SizeInt;
+  tok, traw: string;
+  tnum: Int64;
+  tkind: LongInt;
+
+  procedure Bad(const Why: string);
+  begin
+    if S = '' then
+      Die('{$if} ' + Why + ' at ' + IntToStr(FDirLine))
+    else
+      Die('{$if} ' + Why + ' at ' + IntToStr(FDirLine) + ': ' + S);
+  end;
+
+  { the next token of S: 0 the end, 1 a number in tnum, 2 a name in tok
+    (lower case), 3 an operator or a parenthesis in tok }
+  procedure NextTok;
+  var
+    st: SizeInt;
+  begin
+    while (ip <= Length(S)) and ((S[ip] = ' ') or (S[ip] = #9) or (S[ip] = #10) or (S[ip] = #13)) do
+      ip := ip + 1;
+    tok := '';
+    traw := '';
+    tnum := 0;
+    if ip > Length(S) then
+    begin
+      tkind := 0;
+      Exit;
+    end;
+    st := ip;
+    if IsDigit(S[ip]) then
+    begin
+      while (ip <= Length(S)) and IsDigit(S[ip]) do
+      begin
+        if tnum > (High(Int64) - (Ord(S[ip]) - 48)) div 10 then
+          Bad('number too big');
+        tnum := tnum * 10 + Ord(S[ip]) - 48;
+        ip := ip + 1;
+      end;
+      tkind := 1;
+    end
+    else if IsAlpha(S[ip]) then
+    begin
+      while (ip <= Length(S)) and (IsAlpha(S[ip]) or IsDigit(S[ip])) do
+        ip := ip + 1;
+      traw := Copy(S, st, ip - st);
+      tok := ToLower(traw);
+      tkind := 2;
+    end
+    else
+    begin
+      if (S[ip] = '<') and (ip < Length(S)) and ((S[ip + 1] = '=') or (S[ip + 1] = '>')) then
+        ip := ip + 2
+      else if (S[ip] = '>') and (ip < Length(S)) and (S[ip + 1] = '=') then
+        ip := ip + 2
+      else if (S[ip] = '(') or (S[ip] = ')') or (S[ip] = '=') or (S[ip] = '<') or
+        (S[ip] = '>') or (S[ip] = '-') then
+        ip := ip + 1
+      else
+        Bad('cannot read ''' + S[ip] + '''');
+      tok := Copy(S, st, ip - st);
+      traw := tok;
+      tkind := 3;
+    end;
+  end;
+
+  { The value of the operators of Level and the tighter ones: 3 or and
+    xor, 2 and, 1 a comparison, 0 not, a minus, a number, a name,
+    defined(NAME) and a parenthesis. }
+  function Climb(Level: LongInt): Int64;
+  var
+    b: Int64;
+    op, nm: string;
+    i: SizeInt;
+  begin
+    Result := 0;
+    if Level = 0 then
+    begin
+      if (tkind = 2) and (tok = 'not') then
+      begin
+        NextTok;
+        Result := Ord(Climb(0) = 0);
+      end
+      else if (tkind = 3) and (tok = '-') then
+      begin
+        NextTok;
+        Result := -Climb(0);
+      end
+      else if tkind = 1 then
+      begin
+        Result := tnum;
+        NextTok;
+      end
+      else if (tkind = 3) and (tok = '(') then
+      begin
+        NextTok;
+        Result := Climb(3);
+        if (tkind <> 3) or (tok <> ')') then
+          Bad('wants )');
+        NextTok;
+      end
+      else if (tkind = 2) and (tok = 'defined') then
+      begin
+        NextTok;
+        if (tkind <> 3) or (tok <> '(') then
+          Bad('wants ( after defined');
+        NextTok;
+        if tkind <> 2 then
+          Bad('wants a name in defined()');
+        nm := tok;
+        NextTok;
+        if (tkind <> 3) or (tok <> ')') then
+          Bad('wants ) after defined(' + nm);
+        NextTok;
+        Result := Ord(Defined(nm));
+      end
+      else if (tkind = 2) and (tok <> 'and') and (tok <> 'or') and (tok <> 'xor') then
+      begin
+        for i := 0 to High(FMacNames) do
+          if FMacNames[i] = tok then
+          begin
+            Result := FMacVals[i];
+            NextTok;
+            Exit;
+          end;
+        Bad(traw + ' is not a number (defined(' + traw + ') says whether it is defined)');
+      end
+      else
+        Bad('wants a value');
+      Exit;
+    end;
+    Result := Climb(Level - 1);
+    if Level = 1 then
+    begin
+      if (tkind = 3) and ((tok = '=') or (tok = '<>') or (tok = '<') or (tok = '<=') or
+        (tok = '>') or (tok = '>=')) then
+      begin
+        op := tok;
+        NextTok;
+        b := Climb(0);
+        if op = '=' then
+          Result := Ord(Result = b)
+        else if op = '<>' then
+          Result := Ord(Result <> b)
+        else if op = '<' then
+          Result := Ord(Result < b)
+        else if op = '<=' then
+          Result := Ord(Result <= b)
+        else if op = '>' then
+          Result := Ord(Result > b)
+        else
+          Result := Ord(Result >= b);
+      end;
+    end
+    else if Level = 2 then
+    begin
+      while (tkind = 2) and (tok = 'and') do
+      begin
+        NextTok;
+        b := Climb(1);
+        Result := Ord((Result <> 0) and (b <> 0));
+      end;
+    end
+    else
+    begin
+      while (tkind = 2) and ((tok = 'or') or (tok = 'xor')) do
+      begin
+        op := tok;
+        NextTok;
+        b := Climb(2);
+        if op = 'or' then
+          Result := Ord((Result <> 0) or (b <> 0))
+        else
+          Result := Ord((Result <> 0) xor (b <> 0));
+      end;
+    end;
+  end;
+
+begin
+  ip := 1;
+  NextTok;
+  if tkind = 0 then
+    Bad('wants an expression');
+  Result := Climb(3) <> 0;
+  if tkind = 1 then
+    Bad('cannot read ' + IntToStr(tnum) + ' after the expression')
+  else if tkind <> 0 then
+    Bad('cannot read ' + traw + ' after the expression');
+end;
+
+{ $info, $note, $hint, $warning and $message say Msg on the
+  standard error and the compilation goes on (P263, as Free Pascal's). }
+procedure TLexer.DirMessage(const Kind, Msg: string);
+begin
+  if DieWhere <> '' then
+    WriteLn(ErrOutput, 'paslangc: ', Kind, ': ', Msg, ' at ', FDirLine, ' in ', DieWhere)
+  else
+    WriteLn(ErrOutput, 'paslangc: ', Kind, ': ', Msg, ' at ', FDirLine);
+end;
+
 function TLexer.Defined(const N: string): Boolean;
 var
   i: SizeInt;
@@ -279,9 +549,12 @@ end;
 { A directive at FCh = '$' inside braces: its word in lower case and its
   first argument, the closing brace eaten. }
 function TLexer.Directive(out Arg: string): string;
+var
+  k: SizeInt;
 begin
   Result := '';
   Arg := '';
+  FDirLine := FLine;
   Advance;
   while (FCh <> #0) and (FCh <> '}') and IsAlpha(FCh) do
   begin
@@ -291,13 +564,21 @@ begin
   Result := ToLower(Result);
   while (FCh = ' ') or (FCh = #9) do
     Advance;
-  while (FCh <> #0) and (FCh <> '}') and (IsAlpha(FCh) or ((FCh >= '0') and (FCh <= '9'))) do
+  { the whole argument too, for $if and the messages (P263) }
+  FDirRest := '';
+  while (FCh <> #0) and (FCh <> '}') do
   begin
-    Arg := Arg + FCh;
+    FDirRest := FDirRest + FCh;
     Advance;
   end;
-  while (FCh <> #0) and (FCh <> '}') do
-    Advance;
+  while (Length(FDirRest) > 0) and ((FDirRest[Length(FDirRest)] = ' ') or
+    (FDirRest[Length(FDirRest)] = #9) or (FDirRest[Length(FDirRest)] = #10) or
+    (FDirRest[Length(FDirRest)] = #13)) do
+    SetLength(FDirRest, Length(FDirRest) - 1);
+  k := 1;
+  while (k <= Length(FDirRest)) and (IsAlpha(FDirRest[k]) or IsDigit(FDirRest[k])) do
+    k := k + 1;
+  Arg := Copy(FDirRest, 1, k - 1);
   if FCh = '}' then
     Advance;
 end;
@@ -318,14 +599,21 @@ begin
       d := Directive(arg);
       if (d = 'ifdef') or (d = 'ifndef') or (d = 'if') then
         Inc(depth)
-      else if d = 'endif' then
+      else if (d = 'endif') or (d = 'ifend') then
       begin
         if depth = 0 then
           Exit;
         Dec(depth);
       end
       else if (d = 'else') and (depth = 0) and AtElse then
-        Exit;
+        Exit
+      else if (d = 'elseif') and (depth = 0) and AtElse then
+      begin
+        { a branch not taken yet: this one is taken when its expression
+          is true (P263) }
+        if EvalIf(FDirRest) then
+          Exit;
+      end;
     end
     else
       Advance;
@@ -528,12 +816,22 @@ begin
         if Defined(arg) <> (d = 'ifdef') then
           SkipBranch(True);
       end
-      else if d = 'else' then
+      else if d = 'if' then
+      begin
+        if not EvalIf(FDirRest) then
+          SkipBranch(True);
+      end
+      else if (d = 'else') or (d = 'elseif') then
+        { the branch taken ends here: the rest goes to its endif }
         SkipBranch(False)
       else if d = 'define' then
         Define(arg, True)
       else if d = 'undef' then
-        Define(arg, False);
+        Define(arg, False)
+      else if (d = 'info') or (d = 'note') or (d = 'hint') or (d = 'warning') or (d = 'message') then
+        DirMessage(d, FDirRest)
+      else if (d = 'error') or (d = 'fatal') then
+        Die('{$' + d + '} ' + FDirRest + ' at ' + IntToStr(FDirLine));
       Continue;
     end;
     if FCh = '{' then
