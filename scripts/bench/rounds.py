@@ -40,22 +40,13 @@ exit status is 1 when a pair does not pass or does not print the same.
 import json
 import os
 import statistics
-import subprocess
 import sys
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from run import BUDGET  # noqa: E402
+from run import BUDGET, PAIRS, units, unit_name, once, go_env, pl_path  # noqa: E402
 OUT = os.path.join(ROOT, "build", "bench")
-PAIRS = ["b1loop", "b2str", "b3spawn", "b4chan", "b5map", "b6smap", "b7narrow", "b8ptr",
-         "b9hash", "b10rot", "b11tree"]
-
-
-def timed(path, env=None):
-    start = time.perf_counter()
-    p = subprocess.run([path], capture_output=True, env=env)
-    return time.perf_counter() - start, p.stdout
 
 
 def main():
@@ -80,29 +71,39 @@ def main():
         else:
             pairs.append(args[i])
             i += 1
-    if not pairs:
-        pairs = PAIRS
+    chosen = [(b, sec) for b, sec in units() if not pairs or b in pairs or unit_name(b, sec) in pairs]
     record = {"method": "%d rounds a pair, the two programs alternating which runs first; "
                         "the ratio of each round (paslang over Go), its median and quartiles" % rounds,
               "pairs": {}}
     bad = 0
-    print("pair      cpu     ratio  budget  middle half      paslang s   go s  same output")
-    for cpu, name in [(c, n) for c in cpus for n in pairs]:
-        pl = os.path.join(OUT, name + ("" if cpu == "native" else "." + cpu) + ".pl")
-        go = os.path.join(OUT, name + ".go.bin")
+    print("pair           cpu     ratio  budget  middle half      paslang s   go s  same output")
+    for cpu, (prog, sec) in [(c, u) for c in cpus for u in chosen]:
+        name, args = unit_name(prog, sec), (() if sec is None else (sec,))
+        pl = pl_path(prog, cpu)
+        go = os.path.join(OUT, prog + ".go.bin")
         if not (os.path.exists(pl) and os.path.exists(go)):
-            print("%-9s %-6s not built: run make bench first" % (name, cpu))
+            print("%-14s %-6s not built: run make bench first" % (name, cpu))
             continue
-        genv = dict(os.environ, GODEBUG="cpu.all=off") if cpu == "base" else None
+        genv = go_env(cpu)
         ratios, tp, tg, same = [], [], [], True
+        started = time.perf_counter()
         for r in range(rounds):
+            # A unit whose rounds are long (a pair Go wins by a hundred
+            # times) stops after 60 s once it has five.
+            if r >= 5 and time.perf_counter() - started > 60:
+                break
             if r % 2 == 0:
-                a, oa = timed(pl)
-                b, ob = timed(go, genv)
+                a, sa, oa = once(pl, None, args)
+                b, sb, ob = once(go, genv, args)
             else:
-                b, ob = timed(go, genv)
-                a, oa = timed(pl)
-            same = same and oa == ob
+                b, sb, ob = once(go, genv, args)
+                a, sa, oa = once(pl, None, args)
+            same = same and oa == ob and sa == 0 and sb == 0
+            if sa == "timeout" or sb == "timeout":
+                tp.append(a)
+                tg.append(b)
+                ratios = [a / b] * 4
+                break
             tp.append(a)
             tg.append(b)
             ratios.append(a / b)
@@ -119,7 +120,7 @@ def main():
         row["budget"] = BUDGET[name]
         row["over"] = flag.strip()
         record["pairs"][name if cpu == "native" else name + "." + cpu] = row
-        print("%-9s %-6s  %.3f  %6.2f  %.3f to %.3f   %.4f   %.4f  %s%s" % (
+        print("%-14s %-6s  %.3f  %6.2f  %.3f to %.3f   %.4f   %.4f  %s%s" % (
             name, cpu, row["ratio_median"], BUDGET[name], row["q1"], row["q3"], row["paslang_s"],
             row["go_s"], "yes" if same else "NO", flag))
     if out:

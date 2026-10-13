@@ -446,13 +446,19 @@ hello: $(OUTDIR)/paslangc $(if $(AMD64),core,core-arm64) testdata/hello.paslang 
 	$(OUTDIR)/paslangc -o $(OUTDIR)/hello testdata/hello.paslang
 	$(OUTDIR)/hello
 
-# P89: paslang against Go (scripts/bench/run.py): the six pairs built with
-# this tree's compiler and with go, medians of seven runs, time and memory
-# against the budgets in run.py (exit 1 when one passes it or an output
-# differs), then the seven robustness probes. Go is not a dependency of the
-# compiler: make check does not run this.
-bench: $(OUTDIR)/paslangc core
-	@mkdir -p $(BUILDDIR)/bench; PATH="$(abspath $(OUTDIR)):$$PATH" python3 scripts/bench/run.py -n 7 --json $(BUILDDIR)/bench/last.json
+# P89: paslang against Go (scripts/bench/run.py): every pair built with
+# this tree's compiler for -cpu native and -cpu base and with go, seven
+# alternating rounds, time and memory against the budgets in run.py (all
+# below 1.00 since P223; exit 1 when one passes it or an output differs),
+# then the robustness probes; then paslangc against go build on one
+# generated program (scripts/bench/build.py, P223). Both run, and the
+# target fails if either does. Go is not a dependency of the compiler:
+# make check does not run this.
+bench: $(OUTDIR)/paslangc core libs
+	@mkdir -p $(BUILDDIR)/bench; rc=0; \
+	PATH="$(abspath $(OUTDIR)):$$PATH" python3 scripts/bench/run.py -n 7 --json $(BUILDDIR)/bench/last.json || rc=1; \
+	PATH="$(abspath $(OUTDIR)):$$PATH" python3 scripts/bench/build.py -n 8 --json $(BUILDDIR)/bench/build.json || rc=1; \
+	exit $$rc
 
 # The debugger's terminal (P118): pasdbg <socket> speaks to a program
 # compiled with -debug and run with PASLANG_DEBUG=<socket>.

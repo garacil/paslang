@@ -49,6 +49,7 @@ when the outputs differ. Budgets are today's numbers rounded up; they go down as
 milestones close. The numbers come from a run, never from memory.
 """
 import os
+import select
 import subprocess
 import sys
 import time
@@ -59,7 +60,41 @@ from peak import peak_kib  # noqa: E402
 ROOT = os.path.dirname(os.path.dirname(HERE))
 OUT = os.path.join(ROOT, "build", "bench")
 PAIRS = ["b1loop", "b2str", "b3spawn", "b4chan", "b5map", "b6smap", "b7narrow", "b8ptr",
-         "b9hash", "b10rot", "b11tree"]
+         "b9hash", "b10rot", "b11tree",
+         # P223: everything else paslang does that Go does too.
+         "b12num", "b13strw", "b14sort", "b15io", "b16net", "b17conc", "b18sync", "b19heap",
+         "b20hash", "b21text", "b22rand", "b23date", "b24math", "b25exec", "b26slice", "b27call",
+         "b28stack", "b29exc", "b30gc", "b31map", "b32fs"]
+# The longest one run may take, in seconds: a run past it is killed, its
+# unit stops being measured and fails (Go's side of every pair takes
+# under 1 s; paslang's append of a character, quadratic until its hito,
+# took over ten minutes for twenty million).
+TIMEOUT = 60
+# A program that measures several things takes the name of one as its
+# argument; each NAME:SECTION is judged as a pair of its own.
+SECTIONS = {
+    "b12num": ["itoa", "ftoa", "fmt", "atoi", "atof"],
+    "b13strw": ["index", "upper", "lower", "replace", "trim", "compare", "equalfold", "concat"],
+    "b14sort": ["ints", "strings", "reals"],
+    "b15io": ["small", "smallread"],
+    "b16net": ["tcp", "unix"],
+    "b17conc": ["sleep", "timeout", "pipe", "fanin"],
+    "b18sync": ["mutex", "rwread", "once", "cond", "atomic"],
+    "b19heap": ["ints", "strings"],
+    "b20hash": ["md5", "sha1", "sha512", "sha3", "hmac", "crc32", "adler32", "fnv"],
+    "b21text": ["hex", "runes"],
+    "b22rand": ["own", "below", "real", "global", "globalpar"],
+    "b23date": ["stamp", "date"],
+    "b24math": ["sin", "exp", "ln", "sqrt", "pow", "atan"],
+    "b25exec": ["serial", "par"],
+    "b26slice": ["ints", "strings"],
+    "b27call": ["iface", "closure", "proc"],
+    "b28stack": ["deep", "many"],
+    "b29exc": ["raise"],
+    "b30gc": ["trees"],
+    "b31map": ["iter", "delete", "update"],
+    "b32fs": ["stat", "list"],
+}
 CHECKPTR = ["b8ptr"]
 PROBES = ["p1alloccap", "p2deeprec", "p3divzero", "p4nil", "p5bounds", "p6strbounds", "p7parked"]
 # paslang / Go time allowed, per pair: the median of the rounds' ratios (P223,
@@ -76,6 +111,23 @@ PROBES = ["p1alloccap", "p2deeprec", "p3divzero", "p4nil", "p5bounds", "p6strbou
 BUDGET = {"b1loop": 0.99, "b2str": 0.99, "b3spawn": 0.90, "b4chan": 0.30, "b5map": 0.99,
           "b6smap": 0.99, "b7narrow": 0.90, "b8ptr": 0.99, "b9hash": 0.99, "b10rot": 0.99,
           "b11tree": 0.95}
+# The pairs P223 added (2026-10-13, 1.1.106, forty alternating rounds,
+# native and base): every one that loses or ties on either processor is
+# held at 0.99 and has its hito; the ones that win on both keep what they
+# won, the larger of the two rounded up (upper 0.040/0.048, lower
+# 0.032/0.039, equalfold 0.058/0.114, small 0.935/0.939, smallread
+# 0.941/0.942, pipe 0.574/0.710, fanin 0.436/0.426, mutex 0.666/0.618,
+# cond 0.497/0.472, pow 0.946/0.897, b26slice:strings 0.787/0.858, deep
+# 0.862/0.857, raise 0.069/0.071, trees 0.919/0.906).
+for _b in PAIRS[11:]:
+    for _sec in SECTIONS[_b]:
+        BUDGET.setdefault(_b + ":" + _sec, 0.99)
+BUDGET.update({"b13strw:upper": 0.10, "b13strw:lower": 0.10, "b13strw:equalfold": 0.15,
+               "b15io:small": 0.97, "b15io:smallread": 0.98,
+               "b17conc:pipe": 0.80, "b17conc:fanin": 0.55,
+               "b18sync:mutex": 0.80, "b18sync:cond": 0.65,
+               "b24math:pow": 0.98, "b26slice:strings": 0.90, "b28stack:deep": 0.90,
+               "b29exc:raise": 0.15, "b30gc:trees": 0.97})
 # paslangc -checkptr / the plain build, per pair in CHECKPTR (P104).
 CHECKPTR_BUDGET = {"b8ptr": 10.0}
 # Peak resident memory, paslang / Go, the medians of MEM_RUNS traced runs:
@@ -129,26 +181,49 @@ def go_env(cpu):
     return None
 
 
-def peak_mb(exe, env=None, runs=MEM_RUNS):
+def peak_mb(exe, env=None, runs=MEM_RUNS, args=()):
     """Median peak resident MB of runs traced runs (peak.py), and all of them."""
     peaks = []
     with open(os.devnull, "w") as null:
         for _ in range(runs):
-            kib, _ = peak_kib([exe], env=env, stdout=null.fileno(), stderr=null.fileno())
+            kib, _ = peak_kib([exe, *args], env=env, stdout=null.fileno(), stderr=null.fileno())
             peaks.append(kib / 1024)
     peaks.sort()
     return peaks[len(peaks) // 2], peaks
 
 
-def once(exe, env=None):
+def units(names=None):
+    """The (program, section) pairs to measure, section None for a program
+    without sections."""
+    return [(b, sec) for b in (names or PAIRS) for sec in SECTIONS.get(b, [None])]
+
+
+def unit_name(b, sec):
+    return b if sec is None else b + ":" + sec
+
+
+def once(exe, env=None, args=()):
     """Wall seconds, exit status and first output line of one run."""
     so = open(os.path.join(OUT, "stdout"), "w+")
     se = open(os.path.join(OUT, "stderr"), "w+")
     t = time.perf_counter()
-    p = subprocess.Popen([exe], stdout=so, stderr=se, env=env)
+    p = subprocess.Popen([exe, *args], stdout=so, stderr=se, env=env)
+    # The end is waited for on a pidfd: poll wakes when the program ends.
+    # Popen.wait(timeout) sleeps in steps of up to 50 ms and rounded every
+    # time up to them.
+    fd = os.pidfd_open(p.pid)
+    poller = select.poll()
+    poller.register(fd, select.POLLIN)
+    ended = poller.poll(TIMEOUT * 1000)
+    os.close(fd)
+    if not ended:
+        p.kill()
+        p.wait()
+        so.close(); se.close()
+        return float("inf"), "timeout", "did not end in %d s" % TIMEOUT
     _, st = os.waitpid(p.pid, 0)
     wall = time.perf_counter() - t
-    status = st >> 8 if st & 0xff == 0 else -(st & 0x7f)
+    p.returncode = status = os.waitstatus_to_exitcode(st)
     so.seek(0); se.seek(0)
     out = so.read().strip().splitlines()
     err = se.read().strip().splitlines()
@@ -156,7 +231,7 @@ def once(exe, env=None):
     return wall, status, (out[0] if out else "") + ((" | " + err[0]) if err else "")
 
 
-def alternate(a, b, n, env_a=None, env_b=None):
+def alternate(a, b, n, env_a=None, env_b=None, args=()):
     """n rounds of the programs a and b, alternating which runs first.
     Gives each side's median wall seconds, exit status and first line
     (the first line that differs from the first run's, or a status that
@@ -168,21 +243,24 @@ def alternate(a, b, n, env_a=None, env_b=None):
     sa, oa, sb, ob = 0, None, 0, None
     for r in range(n):
         if r % 2 == 0:
-            ta, xa, ya = once(a, env_a)
-            tb, xb, yb = once(b, env_b)
+            ta, xa, ya = once(a, env_a, args)
+            tb, xb, yb = once(b, env_b, args)
         else:
-            tb, xb, yb = once(b, env_b)
-            ta, xa, ya = once(a, env_a)
+            tb, xb, yb = once(b, env_b, args)
+            ta, xa, ya = once(a, env_a, args)
         wa.append(ta)
         wb.append(tb)
         ratios.append(tb / ta if ta > 0 else float("inf"))
         sa = sa or xa
         sb = sb or xb
+        if xa == "timeout" or xb == "timeout":
+            oa, ob = ya, yb
+            break
         oa = ya if oa is None or ya != oa else oa
         ob = yb if ob is None or yb != ob else ob
-    LAST_WALLS[a] = sorted(wa)
-    LAST_WALLS[b] = sorted(wb)
-    LAST_RATIOS[(a, b)] = list(ratios)
+    LAST_WALLS[(a, tuple(args))] = sorted(wa)
+    LAST_WALLS[(b, tuple(args))] = sorted(wb)
+    LAST_RATIOS[(a, b, tuple(args))] = list(ratios)
     return (median(wa), sa, oa), (median(wb), sb, ob), median(ratios)
 
 
@@ -245,6 +323,7 @@ def checkptr(n, scale, cpu):
     for b in CHECKPTR:
         sh(["paslangc", "-cpu", cpu, "-checkptr", "-o", pl_path(b, cpu, ".cp"), os.path.join(HERE, b + ".paslang")])
         (pw, ps, pl_out), (cw, cs, cp_out), ratio = alternate(pl_path(b, cpu), pl_path(b, cpu, ".cp"), n)
+        LAST_RATIOS.pop((pl_path(b, cpu), pl_path(b, cpu, ".cp"), ()), None)
         budget = CHECKPTR_BUDGET[b] * scale
         same = "yes" if (cp_out == pl_out and cs == 0 and ps == 0) else f"NO ({cp_out!r} vs {pl_out!r})"
         flag = "  OVER BUDGET" if ratio > budget else ""
@@ -284,17 +363,24 @@ def main():
         probes()
         return
     bad = 0
-    print(f"{'pair':10s} {'cpu':6s} {'go s':>7s} {'paslang s':>10s} {'ratio':>6s} {'budget':>7s} "
+    print(f"{'pair':14s} {'cpu':6s} {'go s':>7s} {'paslang s':>10s} {'ratio':>6s} {'budget':>7s} "
           f"{'go MB':>6s} {'pl MB':>6s} {'mem':>5s}  same output")
     for cpu in cpus:
-        for b in PAIRS:
-            build(b, go=(cpu == cpus[0]), cpu=cpu)
+        built = set()
+        for b, sec in units():
+            if b not in built:
+                build(b, go=(cpu == cpus[0]), cpu=cpu)
+                built.add(b)
+            name, args = unit_name(b, sec), (() if sec is None else (sec,))
             gexe, pexe = os.path.join(OUT, b + ".go.bin"), pl_path(b, cpu)
-            (gw, gs, go_out), (pw, ps, pl_out), ratio = alternate(gexe, pexe, n, go_env(cpu))
-            gr, LAST_PEAKS[gexe] = peak_mb(gexe, go_env(cpu))
-            pr, LAST_PEAKS[pexe] = peak_mb(pexe)
+            (gw, gs, go_out), (pw, ps, pl_out), ratio = alternate(gexe, pexe, n, go_env(cpu), None, args)
+            if gs == "timeout" or ps == "timeout":
+                gr, gpeaks, pr, ppeaks = 1.0, [], float("inf"), []
+            else:
+                gr, gpeaks = peak_mb(gexe, go_env(cpu), args=args)
+                pr, ppeaks = peak_mb(pexe, args=args)
             mem = pr / gr if gr > 0 else float("inf")
-            budget = BUDGET[b] * scale
+            budget = BUDGET[name] * scale
             same = "yes" if (go_out == pl_out and gs == 0 and ps == 0) else f"NO ({pl_out!r} vs {go_out!r})"
             flag = ""
             if ratio > budget:
@@ -302,15 +388,13 @@ def main():
             if mem > MEM_BUDGET * scale:
                 flag += "  OVER MEMORY"
             bad += bool(flag) or same != "yes"
-            print(f"{b:10s} {cpu:6s} {gw:7.3f} {pw:10.3f} {ratio:6.2f} {budget:7.2f} {gr:6.1f} {pr:6.1f} {mem:5.2f}  {same}{flag}")
-            record["pairs"].append({"pair": b, "cpu": cpu, "go_godebug": (go_env(cpu) or {}).get("GODEBUG", ""),
-                                    "go": {"median_s": gw, "walls_s": LAST_WALLS.get(os.path.join(OUT, b + ".go.bin"), []),
-                                           "peak_rss_mb": gr, "peaks_mb": LAST_PEAKS.get(os.path.join(OUT, b + ".go.bin"), []),
-                                           "status": gs, "output": go_out},
-                                    "paslang": {"median_s": pw, "walls_s": LAST_WALLS.get(pl_path(b, cpu), []),
-                                                "peak_rss_mb": pr, "peaks_mb": LAST_PEAKS.get(pl_path(b, cpu), []),
-                                                "status": ps, "output": pl_out},
-                                    "round_ratios": LAST_RATIOS.get((gexe, pexe), []),
+            print(f"{name:14s} {cpu:6s} {gw:7.3f} {pw:10.3f} {ratio:6.2f} {budget:7.2f} {gr:6.1f} {pr:6.1f} {mem:5.2f}  {same}{flag}")
+            record["pairs"].append({"pair": name, "cpu": cpu, "go_godebug": (go_env(cpu) or {}).get("GODEBUG", ""),
+                                    "go": {"median_s": gw, "walls_s": LAST_WALLS.get((gexe, args), []),
+                                           "peak_rss_mb": gr, "peaks_mb": gpeaks, "status": gs, "output": go_out},
+                                    "paslang": {"median_s": pw, "walls_s": LAST_WALLS.get((pexe, args), []),
+                                                "peak_rss_mb": pr, "peaks_mb": ppeaks, "status": ps, "output": pl_out},
+                                    "round_ratios": LAST_RATIOS.get((gexe, pexe, args), []),
                                     "ratio_time": ratio, "ratio_mem": mem, "budget": budget, "same_output": same == "yes",
                                     "over": flag.strip()})
     print()
