@@ -44,6 +44,11 @@ make            # builds bin/paslangc, bin/pasdbg and the units for both machine
 make install    # optional: puts paslangc, pasdbg and lib/paslang under /usr/local
 ```
 
+`make` builds paslangc for the processor of the machine that builds it,
+as paslangc compiles every program (`-cpu`, §21; 1.1.115):
+`make SELF_CPU=base` builds one that runs on any machine of its kind,
+and the archives of a release carry compilers built for `base`.
+
 The smallest program is a name, a body and one line of output
 (`examples/hello.paslang`):
 
@@ -6374,8 +6379,9 @@ prints
 
 Ten units, the core, are compiled into `build/` (and `build/a64/`
 for arm64) by `make`, for the base processor (`-cpu base`, so the
-installed toolchain runs on any machine), and installed beside the
-compiler by `make install`. Every program links them without `uses`:
+installed units serve a program compiled for any processor) and again
+for a level (P143), and installed beside the compiler by `make
+install`. Every program links them without `uses`:
 
 - `pasobject` declares `TObject`, the root of every class, and the
   routines the class words call: the name, the parent and the size a

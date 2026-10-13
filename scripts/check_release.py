@@ -84,9 +84,13 @@ for record in records:
         raise RuntimeError(f'package has no unique compiler: {name}')
     compiler = packaged[0]
     target = 'arm64' if ('arm64' in name or 'aarch64' in name) else 'amd64'
-    reference = repo / ('bin/paslangc-arm64' if target == 'arm64' else 'bin/paslangc')
+    # The compilers a release carries are built for the base processor
+    # (P264): bin/paslangc is built for the machine that built it.
+    reference = repo / ('bin/paslangc-arm64' if target == 'arm64' else 'bin/paslangc-base')
     if digest(compiler) != digest(reference):
         raise RuntimeError(f'package compiler differs from verified binary: {name}')
+    if target == 'amd64':
+        run(['python3', '-I', repo / 'scripts/check_cpubin.py', 'base', compiler])
     debugger = compiler.with_name('pasdbg')
     if not debugger.is_file() or digest(debugger) != debugger_hashes[target]:
         raise RuntimeError(f'package debugger is not the baseline build: {name}')

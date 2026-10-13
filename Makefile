@@ -46,6 +46,14 @@ BUILDDIR := ./build
 # paslangc writes for itself, built with as and ld (scripts/bootstrap_seed.py).
 BOOT_MIN := 1.1.110
 SEED_DIR := bootstrap
+# The processor bin/paslangc is built for (P264, Reglas 14 and 15): the
+# machine building it, as every program is by default; make
+# SELF_CPU=<processor, level or features> another, base for any machine
+# of its kind. Its units and the core units it links are built for it
+# too, in the stage's own directory; the installed core units stay built
+# for base and their level (P143). What a release carries for other
+# machines, bin/paslangc-base and bin/paslangc-arm64, is built for base.
+SELF_CPU ?= native
 
 PASLANG_SRC := \
 	src/compiler/pasast.paslang \
@@ -311,7 +319,21 @@ core-arm64: $(OUTDIR)/paslangc $(CORE_UNITS) | $(BUILDDIR)
 	  $(OUTDIR)/paslangc -target arm64 -cpu $(LVL_A64) -c -Fu $(A64DIR) -o '$(A64DIR)/$(LVL_A64)'/$$b $$u; \
 	done
 
-compilers: $(OUTDIR)/paslangc core $(OUTDIR)/paslangc-arm64
+compilers: $(OUTDIR)/paslangc core $(OUTDIR)/paslangc-arm64 $(OUTDIR)/paslangc-base
+
+# The amd64 compiler a release carries (P264): built for the base
+# processor, so it runs on any amd64 machine, where bin/paslangc is
+# built for the one that built it (SELF_CPU). Its units go to their own
+# directory; it links the base core units of build/.
+$(OUTDIR)/paslangc-base: $(OUTDIR)/paslangc core $(SELF_UNITS) cmd/paslangc/paslangc.paslang | $(OUTDIR) $(BUILDDIR)
+	mkdir -p $(BUILDDIR)/ccbase
+	@set -e; ulimit -v 2097152; \
+	for u in $(SELF_UNITS); do \
+	  b=$$(basename $$u .paslang); \
+	  echo "base $$b"; \
+	  $(OUTDIR)/paslangc -cpu base -c -Fu $(BUILDDIR)/ccbase -o $(BUILDDIR)/ccbase/$$b $$u; \
+	done; \
+	$(OUTDIR)/paslangc -cpu base -Fu $(BUILDDIR)/ccbase -o $@ cmd/paslangc/paslangc.paslang
 
 $(OUTDIR)/paslangc-arm64: $(OUTDIR)/paslangc core-arm64 $(SELF_UNITS) cmd/paslangc/paslangc.paslang | $(OUTDIR) $(BUILDDIR)
 	mkdir -p $(A64DIR)
@@ -360,8 +382,8 @@ $(OUTDIR)/paslangc: $(PASLANG_SRC) $(CORE_UNITS) | $(OUTDIR) $(BUILDDIR)
 	  boot="$(BUILDDIR)/paslangc.prev"; \
 	fi; \
 	$(MAKE) stage HOST="$$boot" STAGE="$(OUTDIR)/paslangc"; \
-	echo "paslangc by itself"; \
-	$(MAKE) stage HOST="$(OUTDIR)/paslangc" STAGE="$(BUILDDIR)/paslangc.self"; \
+	echo "paslangc by itself, for $(SELF_CPU)"; \
+	$(MAKE) stage HOST="$(OUTDIR)/paslangc" STAGE="$(BUILDDIR)/paslangc.self" STAGECPU="$(SELF_CPU)"; \
 	mv "$(BUILDDIR)/paslangc.self" "$(OUTDIR)/paslangc"
 
 # The seeds of the bootstrap (P262): the assembly bin/paslangc writes for
@@ -381,7 +403,7 @@ bootstrap-seed: $(OUTDIR)/paslangc
 # miscompiles the compiler shows here, on the biggest program there is,
 # and not only on hello (1.0.40 passed every test and still miscompiled
 # SetLength in the parser, P94).
-self: $(OUTDIR)/paslangc core | $(BUILDDIR)
+self: $(OUTDIR)/paslangc $(OUTDIR)/paslangc-base core | $(BUILDDIR)
 	@set -e; ulimit -v 2097152; \
 	S2=$(BUILDDIR)/self2; S3=$(BUILDDIR)/self3; \
 	rm -rf $$S2 $$S3; mkdir -p $$S2 $$S3; \
@@ -401,6 +423,27 @@ self: $(OUTDIR)/paslangc core | $(BUILDDIR)
 	  b=$$(basename $$u .paslang); \
 	  cmp $$S2/$$b.s $$S3/$$b.s; \
 	done; \
+	: the same two stages for the processor bin/paslangc is built for, P264; \
+	N2=$(BUILDDIR)/self2n; N3=$(BUILDDIR)/self3n; \
+	rm -rf $$N2 $$N3; mkdir -p $$N2 $$N3; \
+	for u in $(SELF_UNITS); do \
+	  b=$$(basename $$u .paslang); \
+	  echo "self2 $(SELF_CPU) $$b"; \
+	  $(OUTDIR)/paslangc -cpu $(SELF_CPU) -c -Fu $$N2 -o $$N2/$$b $$u; \
+	done; \
+	$(OUTDIR)/paslangc -cpu $(SELF_CPU) -Fu $$N2 -o $$N2/paslangc cmd/paslangc/paslangc.paslang; \
+	for u in $(SELF_UNITS); do \
+	  b=$$(basename $$u .paslang); \
+	  echo "self3 $(SELF_CPU) $$b"; \
+	  $$N2/paslangc -cpu $(SELF_CPU) -c -Fu $$N3 -o $$N3/$$b $$u; \
+	done; \
+	$$N2/paslangc -cpu $(SELF_CPU) -Fu $$N3 -o $$N3/paslangc cmd/paslangc/paslangc.paslang; \
+	for u in $(SELF_UNITS) cmd/paslangc/paslangc.paslang; do \
+	  b=$$(basename $$u .paslang); \
+	  cmp $$N2/$$b.s $$N3/$$b.s; \
+	done; \
+	$$N3/paslangc -o $(BUILDDIR)/hello-n3 testdata/hello.paslang; \
+	$(BUILDDIR)/hello-n3; \
 	for t in $(GOLDEN); do \
 	  $(OUTDIR)/paslangc -o $$S2/g_$$t testdata/$$t.paslang; \
 	  $$S3/paslangc -o $$S3/g_$$t testdata/$$t.paslang; \
@@ -413,14 +456,29 @@ self: $(OUTDIR)/paslangc core | $(BUILDDIR)
 	done; \
 	$$S3/paslangc -o $(BUILDDIR)/hello-s3 testdata/hello.paslang; \
 	$(BUILDDIR)/hello-s3; \
+	: the compiler a release carries, P264: built for base it writes what S2 writes, and on amd64 it has no instruction past SSE2; \
+	B=$(BUILDDIR)/selfb; rm -rf $$B; mkdir -p $$B; \
+	for u in $(SELF_UNITS); do \
+	  b=$$(basename $$u .paslang); \
+	  $(OUTDIR)/paslangc-base -cpu base -c -Fu $$B -o $$B/$$b $$u; \
+	  cmp $$S2/$$b.s $$B/$$b.s; \
+	done; \
+	if [ -n "$(AMD64)" ]; then \
+	  python3 -I scripts/check_cpubin.py base $(OUTDIR)/paslangc-base; \
+	  if [ "$(SELF_CPU)" = native ]; then python3 -I scripts/check_cpubin.py native $(OUTDIR)/paslangc; fi; \
+	fi; \
 	echo ok self
 
 HOST ?= $(bindir)/paslangc
 STAGE ?= $(BUILDDIR)/paslangc-stage
-# The compiler and the units are built for the base processor:
-# the installed toolchain runs on any machine. A host older than 1.0.144
-# does not know -cpu, so the flag is passed only when its help names it.
+# The processor a stage builds the compiler, its units and the core
+# units it links for: STAGECPU when the caller gives it (the last stage,
+# SELF_CPU: P264), else the base processor, which every host takes. A
+# host older than 1.0.144 does not know -cpu, so the flag is passed only
+# when its help names it.
+STAGECPU ?=
 HOSTCPU = $$(if $(HOST) --help flags 2>/dev/null | grep -q '^-cpu'; then echo -cpu base; fi)
+STAGECPUFLAG = $(if $(STAGECPU),-cpu $(STAGECPU),$(HOSTCPU))
 STAGE_DIR := $(BUILDDIR)/stage
 
 # The compiler links the core units (its lexer reads reals with pasfmt), so
@@ -445,10 +503,10 @@ stage: $(PASLANG_SRC) $(CORE_UNITS) | $(BUILDDIR)
 	for u in $(CORE_UNITS) $(SELF_UNITS); do \
 	  b=$$(basename $$u .paslang); \
 	  echo "stage $$b"; \
-	  $(HOST) $(HOSTCPU) -c -Fu $(STAGE_DIR) -o $(STAGE_DIR)/$$b $$u; \
+	  $(HOST) $(STAGECPUFLAG) -c -Fu $(STAGE_DIR) -o $(STAGE_DIR)/$$b $$u; \
 	done; \
 	echo "stage paslangc"; \
-	$(HOST) $(HOSTCPU) -Fu $(STAGE_DIR) -o $(STAGE) cmd/paslangc/paslangc.paslang; \
+	$(HOST) $(STAGECPUFLAG) -Fu $(STAGE_DIR) -o $(STAGE) cmd/paslangc/paslangc.paslang; \
 	for u in $(CORE_UNITS); do \
 	  b=$$(basename $$u .paslang); \
 	  echo "stage core $$b"; \
@@ -3450,7 +3508,8 @@ package: all compilers $(OUTDIR)/pasdbg
 	  mkdir -p $$d/bin $$d/lib/paslang/aarch64 $$d/lib/paslang/$(LVL_X64) "$$d/lib/paslang/aarch64/$(LVL_A64)" \
 	    $$d/share/doc/paslang/manual $$d/share/paslang; \
 	  if [ $$m = amd64 ]; then \
-	    cp $(OUTDIR)/paslangc $(OUTDIR)/pasdbg $$d/bin/; \
+	    cp $(OUTDIR)/paslangc-base $$d/bin/paslangc; \
+	    cp $(OUTDIR)/pasdbg $$d/bin/; \
 	    for u in $(CORE_UNITS) $(LIB_UNITS); do \
 	      b=$$(basename $$u .paslang); cp $(BUILDDIR)/$$b.pi $(BUILDDIR)/$$b.o $$d/lib/paslang/; \
 	      cp $(BUILDDIR)/$(LVL_X64)/$$b.o $$d/lib/paslang/$(LVL_X64)/; \
