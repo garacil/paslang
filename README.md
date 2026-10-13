@@ -103,11 +103,13 @@ paslang runs on GNU/Linux, kernel 6.13 or newer, on amd64 or arm64.
 Building and installing it from source needs only:
 
 - GNU binutils (`as`, `ld`) in `/usr/bin`, where `paslangc` runs them,
-- for the first build alone, when no `paslangc` is installed yet, the
-  Free Pascal compiler (`fpc`), which builds the first compiler once
-  (paslang then compiles itself), and Python 3, which prepares its copy
-  of the sources. That bootstrap is written for amd64: on arm64 the
-  first build needs a `paslangc` already, the arm64 package's.
+- for the first build alone, when no `paslangc` 1.1.108 or later is
+  installed yet, Python 3, which unpacks the seed in `bootstrap/`: the
+  assembly paslangc writes for itself, for amd64 and for arm64, which
+  `as` and `ld` build into the first compiler; paslang then compiles
+  itself. No other compiler is needed or used, on either machine, as Go
+  builds itself with an earlier Go. A released `paslangc` (the archives
+  and packages of each release) works as the first compiler too.
 
 Go and a C compiler are not needed to build or install. `./configure`
 finds the machine it runs on, and `make` builds and `make install`
@@ -118,9 +120,8 @@ adds the arm64 units, for `paslangc -target arm64`; they need
 Arch).
 
 The tests need more, and only the tests: `make check`, on amd64, needs
-`./configure --enable-arm64` and the arm64 binutils, Python 3, `gdb`, the
-Free Pascal compiler (`fpc`), which builds the bootstrap again in a clean
-directory, a C compiler (`cc`) and Go, which build helper programs and
+`./configure --enable-arm64` and the arm64 binutils, Python 3, `gdb`, a
+C compiler (`cc`) and Go, which build helper programs and
 oracles of the tests, `meson`, `ninja` and glib's headers, with which
 `make` builds the `qemu-aarch64` the arm64 tests run under from QEMU
 11.1.1's signed release (fetched once into `docs/ref/qemu` and checked

@@ -51,8 +51,7 @@ Currency's checked arithmetic reuses `pasfmt`'s existing `Mul128` and
 `DivMod128` pair: exact signed magnitudes, one scale adjustment and one
 nearest-even rounding. Decimal parse/format and binary64/binary128 conversion
 use its common exact big-integer/IEEE helpers, not another assembly
-implementation. The clean FPC bootstrap has a portable limb implementation;
-the product uses its native core. `scripts/check_currency.py` supplies an
+implementation. `scripts/check_currency.py` supplies an
 independent rational oracle for 11,005 cases, exercised for both raw kernels
 and typed language/SysUtils paths on both machines and CPU selections.
 

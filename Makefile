@@ -38,13 +38,14 @@ NORMAL_INSTALL = :
 PRE_INSTALL = :
 POST_INSTALL = :
 
-HOSTC    ?= fpc
 OUTDIR   := ./bin
-UNITDIR  := ./units
 BUILDDIR := ./build
-HOSTDIR  := $(BUILDDIR)/host
-WARN     := -vwnh -Sewnh -vm11030,11031,6018
-FLAGS    := -Mobjfpc -Scgi -O2 -Fu$(HOSTDIR) -FE$(OUTDIR) -FU$(UNITDIR) -gl $(WARN)
+# paslang is built by paslangc alone (P262, Reglas 9 and 15). The oldest
+# paslangc that compiles these sources (cmd/paslangc says it with $if
+# too), and the seed a machine with none starts from: the assembly
+# paslangc writes for itself, built with as and ld (scripts/bootstrap_seed.py).
+BOOT_MIN := 1.1.108
+SEED_DIR := bootstrap
 
 PASLANG_SRC := \
 	src/compiler/pasast.paslang \
@@ -58,7 +59,7 @@ PASLANG_SRC := \
 	src/lib/paslinux.paslang \
 	cmd/paslangc/paslangc.paslang
 
-.PHONY: package distpkg release-assets check-release bench-rounds all hello check check-arm64 clean hostsrc self self-arm64 stage compilers core core-arm64 libs libs-arm64 bench manual \
+.PHONY: package distpkg release-assets check-release bench-rounds all hello check check-arm64 clean bootstrap-seed self self-arm64 stage compilers core core-arm64 libs libs-arm64 bench manual \
 	install install-strip uninstall installdirs installcheck \
 	mostlyclean distclean maintainer-clean
 
@@ -312,52 +313,56 @@ $(OUTDIR)/paslangc-arm64: $(OUTDIR)/paslangc core-arm64 $(SELF_UNITS) cmd/paslan
 	done; \
 	$(OUTDIR)/paslangc -target arm64 -cpu base -Fu $(A64DIR) -o $@ cmd/paslangc/paslangc.paslang
 
-$(OUTDIR) $(UNITDIR) $(BUILDDIR) $(HOSTDIR):
+$(OUTDIR) $(BUILDDIR):
 	mkdir -p $@
 
-hostsrc: $(PASLANG_SRC) | $(HOSTDIR)
-	cp src/compiler/*.paslang src/lib/*.paslang $(HOSTDIR)/
-	cp cmd/paslangc/paslangc.paslang $(HOSTDIR)/paslangc.pas
-	@cd $(HOSTDIR) && for f in *.paslang; do mv "$$f" "$${f%.paslang}.pas"; done
-	python3 scripts/host_syscall.py $(HOSTDIR)
-
-# The compiler the host builds runs the host's runtime; built again by
-# itself it runs its own, so a fix to the runtime (rt_setlength, 1.0.88)
-# is in bin/paslangc, and so in what make check tests and make install
-# installs, from its own version on. The installed compiler lagged one
-# version: 1.0.87's stale rt_setlength laid out a frame of the P99
-# compiler wrong and the stage compiler crashed.
-$(OUTDIR)/paslangc: $(PASLANG_SRC) $(CORE_UNITS) | $(OUTDIR) $(UNITDIR) $(HOSTDIR) $(BUILDDIR)
+# The compiler the boot compiler builds runs that compiler's runtime;
+# built again by itself it runs its own, so a fix to the runtime
+# (rt_setlength, 1.0.88) is in bin/paslangc, and so in what make check
+# tests and make install installs, from its own version on. The boot
+# compiler is the installed paslangc or bin/'s when it is BOOT_MIN or
+# later, else the one the seed of this machine gives with as and ld
+# (bootstrap/seed-<machine>.tar.xz, P262): no other compiler is ever
+# needed, on amd64 or on arm64 (Regla 15, as Go builds itself with an
+# earlier Go).
+$(OUTDIR)/paslangc: $(PASLANG_SRC) $(CORE_UNITS) | $(OUTDIR) $(BUILDDIR)
 	@set -e; \
 	boot=""; \
-	if [ -x "$(bindir)/paslangc" ]; then boot="$(bindir)/paslangc"; \
-	elif [ -x "$(OUTDIR)/paslangc" ]; then boot="$(OUTDIR)/paslangc"; \
+	for c in "$(bindir)/paslangc" "$(OUTDIR)/paslangc"; do \
+	  if [ -z "$$boot" ] && [ -x "$$c" ]; then \
+	    v=$$("$$c" -v 2>/dev/null | grep -o '[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*' | head -1); \
+	    if [ -n "$$v" ] && printf '%s\n%s\n' "$(BOOT_MIN)" "$$v" | sort -V -C; then boot="$$c"; \
+	    else echo "$$c is $$v, older than $(BOOT_MIN): the seed builds the boot compiler"; fi; \
+	  fi; \
+	done; \
+	if [ -z "$$boot" ]; then \
+	  echo "paslangc from the seed $(SEED_DIR)/seed-$(MACHINE).tar.xz with as and ld"; \
+	  rm -rf "$(BUILDDIR)/seed"; \
+	  python3 scripts/bootstrap_seed.py build --seed "$(SEED_DIR)/seed-$(MACHINE).tar.xz" --out "$(BUILDDIR)/seed"; \
+	  boot="$(BUILDDIR)/seed/paslangc"; \
 	fi; \
-	if [ -n "$$boot" ]; then \
-	  echo "stage paslangc via $$boot"; \
-	  absboot=$$(readlink -f "$$boot"); \
-	  abstarget=""; \
-	  if [ -x "$(OUTDIR)/paslangc" ]; then abstarget=$$(readlink -f "$(OUTDIR)/paslangc"); fi; \
-	  if [ -n "$$abstarget" ] && [ "$$absboot" = "$$abstarget" ]; then \
-	    cp "$(OUTDIR)/paslangc" "$(BUILDDIR)/paslangc.prev"; \
-	    boot="$(BUILDDIR)/paslangc.prev"; \
-	  fi; \
-	  $(MAKE) stage HOST="$$boot" STAGE="$(OUTDIR)/paslangc"; \
-	  echo "paslangc by itself"; \
-	  $(MAKE) stage HOST="$(OUTDIR)/paslangc" STAGE="$(BUILDDIR)/paslangc.self"; \
-	  mv "$(BUILDDIR)/paslangc.self" "$(OUTDIR)/paslangc"; \
-	else \
-	  if [ '$(MACHINE)' != amd64 ]; then \
-	    echo 'the first build on arm64 needs a paslangc (the arm64 package) in $(bindir) or bin/: the bootstrap from Free Pascal is written for amd64 (scripts/host_syscall.py)'; \
-	    exit 1; \
-	  fi; \
-	  echo "bootstrap paslangc via fpc"; \
-	  $(MAKE) hostsrc; \
-	  $(HOSTC) $(FLAGS) $(HOSTDIR)/paslangc.pas; \
-	  echo "paslangc by itself"; \
-	  $(MAKE) stage HOST="$(OUTDIR)/paslangc" STAGE="$(BUILDDIR)/paslangc.self"; \
-	  mv "$(BUILDDIR)/paslangc.self" "$(OUTDIR)/paslangc"; \
-	fi
+	echo "stage paslangc via $$boot"; \
+	absboot=$$(readlink -f "$$boot"); \
+	abstarget=""; \
+	if [ -x "$(OUTDIR)/paslangc" ]; then abstarget=$$(readlink -f "$(OUTDIR)/paslangc"); fi; \
+	if [ -n "$$abstarget" ] && [ "$$absboot" = "$$abstarget" ]; then \
+	  cp "$(OUTDIR)/paslangc" "$(BUILDDIR)/paslangc.prev"; \
+	  boot="$(BUILDDIR)/paslangc.prev"; \
+	fi; \
+	$(MAKE) stage HOST="$$boot" STAGE="$(OUTDIR)/paslangc"; \
+	echo "paslangc by itself"; \
+	$(MAKE) stage HOST="$(OUTDIR)/paslangc" STAGE="$(BUILDDIR)/paslangc.self"; \
+	mv "$(BUILDDIR)/paslangc.self" "$(OUTDIR)/paslangc"
+
+# The seeds of the bootstrap (P262): the assembly bin/paslangc writes for
+# itself, every unit and the program for -cpu base, for amd64 and for
+# arm64, with the link line, packed by scripts/bootstrap_seed.py into
+# bootstrap/. Written again when BOOT_MIN moves past the seeds' version.
+bootstrap-seed: $(OUTDIR)/paslangc
+	python3 scripts/bootstrap_seed.py make --compiler "$(OUTDIR)/paslangc" --arch amd64 \
+	  --out "$(SEED_DIR)/seed-amd64.tar.xz" -- $(CORE_UNITS) $(SELF_UNITS) cmd/paslangc/paslangc.paslang
+	python3 scripts/bootstrap_seed.py make --compiler "$(OUTDIR)/paslangc" --arch arm64 \
+	  --out "$(SEED_DIR)/seed-arm64.tar.xz" -- $(CORE_UNITS) $(SELF_UNITS) cmd/paslangc/paslangc.paslang
 
 # The compiler reproduces itself: bin/paslangc builds the compiler into
 # self2, that compiler builds it again into self3, and the assembly of
@@ -488,7 +493,7 @@ bench-servers: $(OUTDIR)/paslangc core libs
 check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch64
 	@python3 scripts/check_recipes.py
 	@python3 scripts/check_debug_growth.py "$(OUTDIR)/paslangc" "$(BUILDDIR)" $(QEMU_A64)
-	@sh scripts/check_bootstrap.sh "$(BUILDDIR)"
+	@sh scripts/check_bootstrap.sh "$(BUILDDIR)" $(QEMU_A64) $(CORE_UNITS)
 	@sh scripts/check_cpufeat.sh "$(OUTDIR)/paslangc" "$(BUILDDIR)" $(QEMU_A64)
 	@set -e; \
 	xrun=""; \
@@ -3277,11 +3282,11 @@ install: all installdirs
 	$(DESTDIR)$(bindir)/paslangc -o $(BUILDDIR)/paslang-install-hello $(srcdir)/testdata/hello.paslang
 	$(BUILDDIR)/paslang-install-hello
 	: the program and what the compile wrote beside it, so a root install leaves nothing of root in build/
-	rm -f $(BUILDDIR)/paslang-install-hello $(BUILDDIR)/paslang-install-hello.s $(BUILDDIR)/paslang-install-hello.o $(BUILDDIR)/paslang-install-hello.ld
+	rm -f $(BUILDDIR)/paslang-install-hello $(BUILDDIR)/paslang-install-hello.s $(BUILDDIR)/paslang-install-hello.o $(BUILDDIR)/paslang-install-hello.ld $(BUILDDIR)/paslang-install-hello.link
 	: an arm64 program from amd64 when the arm64 units were asked for, since on arm64 hello was one; \
 	if [ -n '$(AMD64)' ] && [ -n '$(ARM64)' ]; then \
 	  $(DESTDIR)$(bindir)/paslangc -target arm64 -o $(BUILDDIR)/paslang-install-a64 $(srcdir)/testdata/heapspan.paslang; \
-	  rm -f $(BUILDDIR)/paslang-install-a64 $(BUILDDIR)/paslang-install-a64.s $(BUILDDIR)/paslang-install-a64.o $(BUILDDIR)/paslang-install-a64.ld; \
+	  rm -f $(BUILDDIR)/paslang-install-a64 $(BUILDDIR)/paslang-install-a64.s $(BUILDDIR)/paslang-install-a64.o $(BUILDDIR)/paslang-install-a64.ld $(BUILDDIR)/paslang-install-a64.link; \
 	fi
 
 install-strip:
@@ -3313,7 +3318,7 @@ package: all compilers $(OUTDIR)/pasdbg
 	  else \
 	    cp $(OUTDIR)/paslangc-arm64 $$d/bin/paslangc; \
 	    $(OUTDIR)/paslangc -target arm64 -cpu base -Fu $(A64DIR) -o $$d/bin/pasdbg cmd/pasdbg/pasdbg.paslang; \
-	    rm -f $$d/bin/pasdbg.o $$d/bin/pasdbg.s $$d/bin/pasdbg.ld; \
+	    rm -f $$d/bin/pasdbg.o $$d/bin/pasdbg.s $$d/bin/pasdbg.ld $$d/bin/pasdbg.link; \
 	  fi; \
 	  for u in $(CORE_UNITS) $(LIB_UNITS); do \
 	    b=$$(basename $$u .paslang); cp $(A64DIR)/$$b.pi $(A64DIR)/$$b.o $$d/lib/paslang/aarch64/; \
@@ -3365,10 +3370,10 @@ installdirs:
 installcheck:
 	$(DESTDIR)$(bindir)/paslangc -o $(BUILDDIR)/paslang-installcheck $(srcdir)/testdata/hello.paslang
 	$(BUILDDIR)/paslang-installcheck
-	rm -f $(BUILDDIR)/paslang-installcheck $(BUILDDIR)/paslang-installcheck.s $(BUILDDIR)/paslang-installcheck.o $(BUILDDIR)/paslang-installcheck.ld
+	rm -f $(BUILDDIR)/paslang-installcheck $(BUILDDIR)/paslang-installcheck.s $(BUILDDIR)/paslang-installcheck.o $(BUILDDIR)/paslang-installcheck.ld $(BUILDDIR)/paslang-installcheck.link
 	$(DESTDIR)$(bindir)/paslangc -o $(BUILDDIR)/paslang-installcheck-who $(srcdir)/examples/pasroutines/who.paslang
 	$(BUILDDIR)/paslang-installcheck-who
-	rm -f $(BUILDDIR)/paslang-installcheck-who $(BUILDDIR)/paslang-installcheck-who.s $(BUILDDIR)/paslang-installcheck-who.o $(BUILDDIR)/paslang-installcheck-who.ld
+	rm -f $(BUILDDIR)/paslang-installcheck-who $(BUILDDIR)/paslang-installcheck-who.s $(BUILDDIR)/paslang-installcheck-who.o $(BUILDDIR)/paslang-installcheck-who.ld $(BUILDDIR)/paslang-installcheck-who.link
 
 mostlyclean:
 
@@ -3381,4 +3386,4 @@ maintainer-clean:
 	$(MAKE) distclean
 
 clean:
-	rm -rf $(OUTDIR) $(UNITDIR) $(BUILDDIR)
+	rm -rf $(OUTDIR) $(BUILDDIR)

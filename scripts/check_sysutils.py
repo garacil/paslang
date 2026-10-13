@@ -92,9 +92,10 @@ for _ in range(2000):
     paths.append("/".join(generator.choice(components) for _ in range(generator.randrange(1, 18))))
 paths.append("a/" * 5000 + "../b")
 path_input = (str(len(paths)) + "\n" + "\n".join(paths) + "\n").encode()
-pascal_oracle = work / "pathscompat-fpc"
-run(["fpc", "-FE" + str(work), "-FU" + str(work), "-o" + str(pascal_oracle),
-     "testdata/pathscompat.paslang"])
+# The exact model of Pascal's path words below is the reference. Until
+# P262 (2026-10-13) it was also checked against a Free Pascal 3.2.2 build
+# of testdata/pathscompat on every run; Free Pascal is a language
+# reference now and runs nowhere (Reglas 9 and 15).
 def pascal_path_model(path):
     end = path.rfind("/") + 1
     name = path[end:]
@@ -113,13 +114,8 @@ def pascal_path_model(path):
     return "\n".join(fields) + "\n"
 
 # FPC also treats backslash as a separator on Unix. paslang deliberately
-# follows Linux (and Go): backslash is an ordinary filename byte. Validate
-# that difference against the exact model, not against FPC's convention.
-reference_paths = [path for path in paths if "\\" not in path]
-reference_input = (str(len(reference_paths)) + "\n" + "\n".join(reference_paths) + "\n").encode()
-reference_model = "".join(pascal_path_model(path) for path in reference_paths).encode()
-if run([str(pascal_oracle)], input_data=reference_input) != reference_model:
-    raise RuntimeError("Pascal path model differs from intended FPC semantics")
+# follows Linux (and Go): backslash is an ordinary filename byte, as the
+# model says.
 expected_pascal_paths = "".join(pascal_path_model(path) for path in paths).encode()
 go_oracle = work / "pathsclean-go"
 run(["go", "build", "-o", str(go_oracle), "testdata/pathsclean_oracle.go"])

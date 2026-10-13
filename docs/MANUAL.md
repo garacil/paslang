@@ -212,14 +212,13 @@ the code between them, nested as deep as needed, and `{$define NAME}`
 and `{$undef NAME}` set a name for the rest of the file. paslang
 defines `PASLANG`, `LINUX`, `UNIX` and `CPU64`, and the processor under
 the names Free Pascal uses: `CPUX86_64` and `CPUAMD64` on amd64,
-`CPUAARCH64` on arm64. So one source builds with either compiler and on
-either machine:
+`CPUAARCH64` on arm64, so one source builds on either machine:
 
 ```
-{$ifdef PASLANG}
-  hi := MulHi(a, b);             { one instruction }
+{$ifdef CPUX86_64}
+  WriteLn('amd64');
 {$else}
-  hi := MulHiPortable(a, b);     { what FPC builds }
+  WriteLn('arm64');
 {$endif}
 ```
 
