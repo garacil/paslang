@@ -103,7 +103,7 @@ paslang runs on GNU/Linux, kernel 6.13 or newer, on amd64 or arm64.
 Building and installing it from source needs only:
 
 - GNU binutils (`as`, `ld`) in `/usr/bin`, where `paslangc` runs them,
-- for the first build alone, when no `paslangc` 1.1.108 or later is
+- for the first build alone, when no `paslangc` 1.1.110 or later is
   installed yet, Python 3, which unpacks the seed in `bootstrap/`: the
   assembly paslangc writes for itself, for amd64 and for arm64, which
   `as` and `ld` build into the first compiler; paslang then compiles

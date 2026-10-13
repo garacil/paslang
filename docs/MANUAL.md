@@ -92,7 +92,7 @@ A unit is how a program of your own is split into parts. What the
 language itself provides (strings, maps, trees, heaps, the store, the
 hash words, the rotations, the sync types, the calculation set, the
 collector, `TObject`) is in the language and needs no `uses`: it is
-written as eight core units that every program links without naming
+written as ten core units that every program links without naming
 them (§15).
 The unit below is a programmer's own:
 
@@ -6344,7 +6344,7 @@ prints
 
 ## 15. The core library and pasnet
 
-Eight units, the core, are compiled into `build/` (and `build/a64/`
+Ten units, the core, are compiled into `build/` (and `build/a64/`
 for arm64) by `make`, for the base processor (`-cpu base`, so the
 installed toolchain runs on any machine), and installed beside the
 compiler by `make install`. Every program links them without `uses`:
@@ -6357,8 +6357,23 @@ compiler by `make install`. Every program links them without `uses`:
   `once`, the `lock` and `once` statements, `Goid`, `NumGoroutine`,
   `Yield` and `ReadLn`. It is Pascal over the park and wake words of the
   scheduler (§18).
+- `pasnum` reads and writes numbers as text (P200). One scanner reads
+  a number with Pascal's grammar or JSON's (RFC 8259), eight digits at a
+  time where eight are there; its value is the nearest `Double` or
+  `Single`, rounded once, by Go's conversion (the unrounded scaling of
+  `internal/strconv`, and an exact decimal of 800 digits when more than
+  19 digits matter), or, for an integer literal, an `Int64` or a
+  `QWord`, exact or refused. It writes the fewest digits that read back
+  as a real, in JSON's and ECMAScript's form (`1e+21`, `1.5e-7`, `-0`),
+  and an integer, two digits at a time, into a buffer the caller gives.
+  It allocates nothing and reads nothing past the text it is given.
+  `Val`, `StrToFloat`, the compiler's real literals and `pasfmt` go
+  through it.
 - `pasfmt` writes and reads reals for `Write`, `WriteLn` and `x:w:d`
   (1.0.79): a real printed exactly, a literal read as the nearest double.
+- `passtr` is the string words (§13): `Pos`, `Insert`, `Delete`,
+  `UpCase`, `StringOfChar`, `Val`'s reading of a number, with their
+  kernels.
 - `pasmap` implements `map[K] of V`: a Swiss table in Pascal, a
   directory of tables of at most 1024 slots that split (§11).
 - `pashash` is the hash words (§13): every algorithm in Pascal with its
@@ -6369,9 +6384,10 @@ compiler by `make install`. Every program links them without `uses`:
 - `pasheap` is the heap's slow paths and the collector (§18).
 - `pasquad` is the arithmetic of `Quad`, in software (§14).
 
-The names of `pasobject`, `pasroutines`, `pasfmt`, `pashash` and
-`pastree` are every program's, as those of a unit in `uses` are; `pasmap`, `pasheap` and
-`pasquad` are only linked (`uses pasquad` brings its names in). Their
+The names of `pasobject`, `pasroutines`, `pasfmt`, `passtr`, `pashash`
+and `pastree` are every program's, as those of a unit in `uses` are;
+`pasnum`, `pasmap`, `pasheap` and `pasquad` are only linked (`uses
+pasnum` or `uses pasquad` brings its names in). Their
 routines are there for the compiler, and a program may call them too:
 
 | Unit | Routine | What it does |
@@ -6390,6 +6406,10 @@ routines are there for the compiler, and a program may call them too:
 | `pasfmt` | `PasParseSingle(s, out bits): Boolean` | the single nearest the text, its bits in the low 32 |
 | `pasfmt` | `PasF64ToF32(b)`, `PasF32ToF64(b)` | the bits of a double rounded to the nearest single, of a single widened to a double |
 | `pasfmt` | `PasParseQuad(s, out lo, hi): Boolean`, `PasFmtQuad(lo, hi, w, d): string` | a `Quad`'s two words from text, and to text as `PasFmtReal` |
+| `pasnum` | `PasNumScan(p, n, json, out sc): Boolean` | reads the number at the start of the `n` bytes at `p`, with Pascal's grammar or, with `json`, RFC 8259's, into a `TPasNumScan`: its first 19 significant digits (`Mant`), their power of ten (`Exp10`), how many significant digits it has, whether one past the 19th was dropped, its sign, whether it is an integer literal, and the bytes it takes (`Len`); `False` when the text does not start with a number, `Len` then the offset of the byte that stops it |
+| `pasnum` | `PasNumF64(p, sc, out bits): Boolean`, `PasNumF32` | the double or single nearest the number `sc` read from the text at `p`, rounded once; `False` past the largest, `bits` then the infinity of its sign |
+| `pasnum` | `PasNumI64(p, sc, out v): Boolean`, `PasNumU64` | an integer literal as an `Int64` or a `QWord` (in the `Int64`'s bits); `False` for `1.0`, `1e2` or a value that does not fit |
+| `pasnum` | `PasNumAppendF64(p, bits): Integer`, `PasNumAppendF32`, `PasNumAppendInt(p, v)`, `PasNumAppendUint` | writes at `p` (`PasNumTextMax`, 32 bytes, are enough) the fewest digits that read back as the double or single with those bits, as JSON and ECMAScript lay them out, or the integer; the bytes written |
 | `passtr` | `PasStrView(p, n): string` | the `n` bytes at `p` as a string with no copy, after a byte with the shared mark (§6) |
 | `pashash` | `PasHex(s)`, `PasMd5(s)`, `PasSha3(s, bits)`, `PasAdler32(s, adler)`, `PasFnv1a32(s)`, `PasFnv1a64(s)`, `PasMurmur3(s, seed)`, `PasSipHash(s, k0, k1)` | the bodies of `Hex`, `Md5`, `Sha3_*`, `Adler32`, `Fnv1a32`, `Fnv1a64`, `Murmur3` and `SipHash`, one each |
 | `pashash` | `PasSha1Cpu(s)`, `PasSha1Base(s)`, and the same pairs for `Sha224`, `Sha256`, `Sha384`, `Sha512`; `PasHmacCpu(alg, key, msg)`, `PasHmacBase` (alg 0 MD5, 1 SHA-1, 2 SHA-224, 3 SHA-256, 4 SHA-384, 5 SHA-512); `PasCrc32Cpu(s, crc)`, `PasCrc32Base`, `PasCrc32cCpu`, `PasCrc32cBase`; `PasMerkleRootCpu(leaves)`, `PasMerkleRootBase`, `PasMerkleProofCpu(leaves, i)`, `PasMerkleProofBase`, `PasMerkleCheckCpu(leaf, i, n, proof, root)`, `PasMerkleCheckBase` | the two bodies of each word, the `Cpu` one on the processor's instructions and the `Base` one in Pascal; the compiler calls one by `-cpu` (§21), a program that calls `Cpu` itself answers for the processor it runs on |
@@ -6399,6 +6419,16 @@ routines are there for the compiler, and a program may call them too:
 ```
 ok := PasParseReal('0.5', bits);       { True; bits = $3FE0000000000000 }
 s := PasFmtReal(3.14159, 8, 2);        { '    3.14' }
+```
+
+With `uses pasnum`, a number is read where it lies and written into a
+buffer, as a JSON reader and writer do:
+
+```
+t := '[1.5e-7,42]';
+if PasNumScan(@t[2], Length(t) - 1, True, sc) then   { sc.Len = 6: the comma ends it }
+  if PasNumF64(@t[2], sc, bits) then                  { bits = 1.5e-7's, in range }
+    n := PasNumAppendF64(@buf[0], bits);               { buf = '1.5e-7', n = 6 }
 ```
 
 A missing core unit stops the compile with a message that names it:

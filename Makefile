@@ -44,7 +44,7 @@ BUILDDIR := ./build
 # paslangc that compiles these sources (cmd/paslangc says it with $if
 # too), and the seed a machine with none starts from: the assembly
 # paslangc writes for itself, built with as and ld (scripts/bootstrap_seed.py).
-BOOT_MIN := 1.1.108
+BOOT_MIN := 1.1.110
 SEED_DIR := bootstrap
 
 PASLANG_SRC := \
@@ -199,6 +199,7 @@ GOLDEN_A64 += condver
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
 # uses clause. They are compiled by paslangc itself, once per target.
 CORE_UNITS := \
+	src/lib/pasnum.paslang \
 	src/lib/pasobject.paslang \
 	src/lib/pasroutines.paslang \
 	src/lib/pasmap.paslang \
@@ -423,6 +424,11 @@ STAGE_DIR := $(BUILDDIR)/stage
 stage: $(PASLANG_SRC) $(CORE_UNITS) | $(BUILDDIR)
 	@test -n "$(HOST)"
 	@test -x "$(HOST)"
+	@v=$$("$(HOST)" -v 2>/dev/null | grep -o '[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*' | head -1); \
+	if [ -z "$$v" ] || ! printf '%s\n%s\n' "$(BOOT_MIN)" "$$v" | sort -V -C; then \
+	  echo "stage: $(HOST) is $${v:-of no version}, older than BOOT_MIN $(BOOT_MIN): it cannot build these sources"; \
+	  exit 1; \
+	fi
 	@set -e; ulimit -v 2097152; \
 	: a clean directory each time, 1.1.2: a .pi another compiler wrote there, of another format, was read before this host rewrote it; \
 	rm -rf $(STAGE_DIR); \
@@ -2052,6 +2058,8 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	python3 scripts/check_align.py "$(OUTDIR)/paslangc" "$(BUILDDIR)" $(QEMU_A64) $(CORE_UNITS); \
 	python3 scripts/check_sysutils.py "$(OUTDIR)/paslangc" "$(BUILDDIR)" $(QEMU_A64); \
 	python3 scripts/check_currency_language.py "$(OUTDIR)/paslangc" "$(BUILDDIR)" $(QEMU_A64); \
+	: numbers as text, exact on both machines against the model and Go, P200; \
+	python3 scripts/check_pasnum.py "$(OUTDIR)/paslangc" "$(BUILDDIR)" $(QEMU_A64); \
 	for level in 0 40; do \
 	  for cpu in native base; do \
 	    $(OUTDIR)/paslangc -inline $$level -cpu $$cpu -Fu $(BUILDDIR) -o $(BUILDDIR)/currencykernelmodel testdata/currencykernelmodel.paslang; \
@@ -2636,8 +2644,10 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  rm -f $(BUILDDIR)/xvfb.pid; \
 	fi; \
 	echo "==== stage ===="; \
-	host="$(bindir)/paslangc"; \
-	if [ ! -x "$$host" ]; then host="$(OUTDIR)/paslangc"; fi; \
+	: the installed paslangc builds the sources when it is BOOT_MIN or later, as for bin/paslangc, else the one in bin/ does; \
+	host="$(bindir)/paslangc"; v=""; \
+	if [ -x "$$host" ]; then v=$$("$$host" -v 2>/dev/null | grep -o '[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*' | head -1); fi; \
+	if [ -z "$$v" ] || ! printf '%s\n%s\n' "$(BOOT_MIN)" "$$v" | sort -V -C; then host="$(OUTDIR)/paslangc"; fi; \
 	$(MAKE) stage HOST="$$host" STAGE="$(BUILDDIR)/paslangc-stage"; \
 	echo "==== self ===="; \
 	$(MAKE) self; \
