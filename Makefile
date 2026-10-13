@@ -806,6 +806,11 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	taskset -c 0 timeout 120 $(BUILDDIR)/markidle > $(BUILDDIR)/markidle.got; \
 	diff -u testdata/markidle.out $(BUILDDIR)/markidle.got; \
 	echo ok markidle; \
+	echo "==== a kernel's calls give way (P269) ===="; \
+	$(OUTDIR)/paslangc -cpu base -o $(BUILDDIR)/utf8slice testdata/utf8slice.paslang; \
+	taskset -c 0 timeout 120 $(BUILDDIR)/utf8slice > $(BUILDDIR)/utf8slice.got; \
+	diff -u testdata/utf8slice.out $(BUILDDIR)/utf8slice.got; \
+	echo ok utf8slice; \
 	echo "==== alloc bits ===="; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/allocbits testdata/allocbits.paslang; \
 	for w in "" PASLANG_GCPOISON=1 "PASLANG_GCSTRESS=50 PASLANG_GCPOISON=1" "PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=10 PASLANG_GCPOISON=1" PASLANG_GC=off; do \
@@ -2959,6 +2964,11 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	taskset -c 0 timeout 600 $(QEMU_A64) $(BUILDDIR)/markidle-arm > $(BUILDDIR)/markidle-arm.got; \
 	diff -u testdata/markidle.out $(BUILDDIR)/markidle-arm.got; \
 	echo ok markidle-arm; \
+	echo "==== a kernel's calls give way arm64 (P269) ===="; \
+	$(OUTDIR)/paslangc -target arm64 -cpu base -o $(BUILDDIR)/utf8slice-arm testdata/utf8slice.paslang; \
+	taskset -c 0 timeout 600 $(QEMU_A64) $(BUILDDIR)/utf8slice-arm > $(BUILDDIR)/utf8slice-arm.got; \
+	diff -u testdata/utf8slice.out $(BUILDDIR)/utf8slice-arm.got; \
+	echo ok utf8slice-arm; \
 	echo "==== alloc bits arm64 ===="; \
 	$(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/allocbits-arm testdata/allocbits.paslang; \
 	for w in "" PASLANG_GCPOISON=1 "PASLANG_GCSTRESS=50 PASLANG_GCPOISON=1" "PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=50 PASLANG_GCPOISON=1" PASLANG_GC=off; do \

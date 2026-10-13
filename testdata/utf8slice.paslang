@@ -1,0 +1,88 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+  GPL version 3 or later; see COPYING. No warranty. }
+
+{ P269: a call into a kernel never holds the scheduler longer than a
+  slice. Run on one processor (taskset -c 0), where the runtime keeps
+  two Ps (rt_ncpu takes at least two): two routines start together and
+  each validates a text of two-byte characters, 256 MiB on amd64 and 32
+  MiB under qemu, in one call of PasUtf8Valid, so both Ps are busy; a
+  third wakes every millisecond, makes a little garbage for the
+  collector and counts its wakes. Each validating routine counts the
+  wakes that fall inside its own call. Built for the base processor,
+  whose body takes some 450 ms a call here (SSE2 on amd64, NEON under
+  qemu). The kernel gets at most 1024 blocks (64 KiB) a call, a routine
+  stops between two calls when sysmon asks (every 10 ms) or the
+  collector stops the world, and the third one runs: five wakes or
+  more fall inside each call (some sixty on amd64, seventy under qemu).
+  With the whole text in one call of the kernel, only the one or two at
+  a call's edges did (1.1.117 and 1.1.118: 0 to 2 on both machines),
+  since neither P is given up before the call ends. }
+program utf8slice;
+
+uses paslib;
+
+var
+  buf: array of Byte;
+  ready, ticks, finished: Integer;
+  inside, res: array[0..1] of Integer;
+  mu: mutex;
+  wg: waitgroup;
+
+procedure Validate(Id: Integer);
+var
+  t0: Integer;
+begin
+  lock mu do
+    ready := ready + 1;
+  while ready < 2 do
+    Yield;
+  t0 := ticks;
+  res[Id] := PasUtf8Valid(@buf[0], Length(buf), False);
+  inside[Id] := ticks - t0;
+  lock mu do
+    finished := finished + 1;
+  wg.Done;
+end;
+
+procedure Ticker;
+var
+  s: string;
+begin
+  while finished < 2 do
+  begin
+    ticks := ticks + 1;
+    s := IntToStr(ticks) + 'x';
+    if Length(s) = 0 then
+      WriteLn('never');
+    Sleep(1);
+  end;
+  wg.Done;
+end;
+
+var
+  n, i: Integer;
+begin
+  if Amd64 = 1 then
+    n := 256 shl 20
+  else
+    n := 32 shl 20;
+  SetLength(buf, n);
+  i := 0;
+  while i < n do
+  begin
+    buf[i] := $C3;
+    buf[i + 1] := $A9;
+    i := i + 2;
+  end;
+  ready := 0;
+  ticks := 0;
+  finished := 0;
+  wg.Add(3);
+  pas Ticker;
+  pas Validate(0);
+  pas Validate(1);
+  wg.Wait;
+  WriteLn('valid: ', res[0] = -1, ' ', res[1] = -1);
+  WriteLn('the other routine ran inside both calls: ', (inside[0] >= 5) and (inside[1] >= 5));
+end.

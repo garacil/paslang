@@ -7,7 +7,8 @@ UTF-8 decoder: the place of the first byte of the first sequence that
 is wrong (UnicodeDecodeError's start), or -1; in I-JSON's mode a
 noncharacter (U+FDD0 to U+FDEF, U+xFFFE and U+xFFFF, RFC 7493 2.1) is
 wrong too, at its first byte. The classes, the fillers and the lengths
-are read from the test itself."""
+are read from the test itself; the long texts (P269) put a class around
+each edge of the slices of 64 KiB the kernel is given at a time."""
 import re
 import sys
 
@@ -42,17 +43,13 @@ def answer(b, ij):
 
 
 def build(cls, fil, L, O):
-    out = bytearray()
-    while len(out) + len(fil) <= O:
-        out += fil
-    while len(out) < O:
-        out.append(97)
-    out += cls
-    while len(out) + len(fil) <= L:
-        out += fil
-    while len(out) < L:
-        out.append(97)
-    return bytes(out)
+    """The test's Build: filler to O, 'a's to O, the class, filler and
+    'a's to L."""
+    q = O // len(fil)
+    out = fil * q + b'a' * (O - q * len(fil)) + cls
+    q = (L - len(out)) // len(fil)
+    out += fil * q
+    return out + b'a' * (L - len(out))
 
 
 lines = []
@@ -80,5 +77,17 @@ for cls in classes:
             n += 1
             s = (s * 31 + r + 2) % 1000000007
 lines.append('guard 0 %d %d' % (n, s))
+n = 0
+s = 0
+for i in [int(x) for x in table('LongClass')]:
+    for fil in (fills[1], fills[2]):
+        for k in (1, 2, 3):
+            for O in range(k * 65536 - 4, k * 65536 + 4):
+                b = build(classes[i], fil, 200000, O)
+                for mode in (0, 1):
+                    r = answer(b, mode == 1)
+                    n += 1
+                    s = (s * 31 + r + 2) % 1000000007
+lines.append('long %d %d' % (n, s))
 lines.append('disagree 0')
 print('\n'.join(lines))
