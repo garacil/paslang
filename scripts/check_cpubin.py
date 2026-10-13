@@ -8,13 +8,10 @@ disassembly (objdump -d): the instructions past the base processor
 CRC32, and every VEX or EVEX instruction (a ymm or zmm register, or a
 v mnemonic).
 
-  check_cpubin.py base   EXE   none outside the kernel bodies named *Cpu
-  check_cpubin.py native EXE   some outside those kernels, when
-                               /proc/cpuinfo has BMI1, POPCNT or AVX2
-
-The kernel bodies named *Cpu are left out for base until P268: passtr's
-PosOf takes its kernels by a parameter, so a base program links
-PasIndexByteCpu and PasMemEqCpu and never runs them."""
+  check_cpubin.py base   EXE   none: a program for the base processor
+                               links no kernel past it (P268)
+  check_cpubin.py native EXE   some, when /proc/cpuinfo has BMI1,
+                               POPCNT or AVX2"""
 import re
 import subprocess
 import sys
@@ -44,23 +41,19 @@ def main():
     mode, exe = sys.argv[1], sys.argv[2]
     hits = scan(exe)
     if mode == 'base':
-        bad = {k: v for k, v in hits.items() if not k.endswith('cpu')}
-        if bad:
-            for k, v in sorted(bad.items()):
+        if hits:
+            for k, v in sorted(hits.items()):
                 print('%s: %s has %d instructions past the base processor: %s' % (exe, k, len(v), ', '.join(v[:4])))
             sys.exit(1)
-        print('%s: no instruction past the base processor outside the *Cpu kernels (%d routines with them)'
-              % (exe, len(hits)))
+        print('%s: no instruction past the base processor' % exe)
     elif mode == 'native':
         flags = open('/proc/cpuinfo').read().split()
         if not any(f in flags for f in ('bmi1', 'popcnt', 'avx2')):
             print('%s: this processor has nothing past the base to look for' % exe)
             return
-        own = {k: v for k, v in hits.items() if not k.endswith('cpu')}
-        if not own:
-            sys.exit('%s: no instruction past the base processor outside the *Cpu kernels: not built for this one'
-                     % exe)
-        print('%s: %d routines on this processor\'s instructions' % (exe, len(own)))
+        if not hits:
+            sys.exit('%s: no instruction past the base processor: not built for this one' % exe)
+        print('%s: %d routines on this processor\'s instructions' % (exe, len(hits)))
     else:
         sys.exit('check_cpubin.py base|native EXE')
 

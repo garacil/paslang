@@ -1756,68 +1756,110 @@ end;
 
 { ---- Pos ---- }
 
-{ Rabin-Karp over S[From..N-1] for Sub (Go's IndexRabinKarp): the place
-  from 0 in S, -1 when there is none. }
-function RabinKarp(Sp, Sb: PByte; N, NS, From: Int64; Cpu: Boolean): Int64;
+{ Rabin-Karp over S[From..N-1] for Sub (Go's IndexRabinKarp), its
+  hashing apart from the check of a place, so each body of Pos checks
+  with its own kernel and nothing is chosen at run time (P268, Regla
+  8): RkStart gives Sub's hash Hs, the power Pw its first byte leaves
+  in the window and the hash H of the first window, S[From..From+NS-1];
+  RkNext the next place, from the window that ends before I on, whose
+  hash is Sub's (-1 when there is none), the window moved past it. }
+procedure RkStart(Sp, Sb: PByte; NS, From: Int64; out Hs, Pw, H: UInt32);
 var
-  hs, pw, sq, h: UInt32;
+  sq: UInt32;
   i, k: Int64;
 begin
-  Result := -1;
-  hs := 0;
+  Hs := 0;
   for i := 0 to NS - 1 do
-    hs := hs * PrimeRK + Sb[i];
-  pw := 1;
+    Hs := Hs * PrimeRK + Sb[i];
+  Pw := 1;
   sq := PrimeRK;
   k := NS;
   while k > 0 do
   begin
     if (k and 1) <> 0 then
-      pw := pw * sq;
+      Pw := Pw * sq;
     sq := sq * sq;
     k := k shr 1;
   end;
+  H := 0;
+  for i := From to From + NS - 1 do
+    H := H * PrimeRK + Sp[i];
+end;
+
+function RkNext(Sp: PByte; N, NS: Int64; Hs, Pw: UInt32; var I: Int64; var H: UInt32): Int64;
+var
+  hit: Boolean;
+begin
+  Result := -1;
+  while I <= N do
+  begin
+    hit := H = Hs;
+    if hit then
+      Result := I - NS;
+    if I < N then
+    begin
+      H := H * PrimeRK + Sp[I];
+      H := H - Pw * Sp[I - NS];
+    end;
+    I := I + 1;
+    if hit then
+      Exit;
+  end;
+end;
+
+{ The place from 0 in S of Sub by Rabin-Karp from byte From on, -1 when
+  there is none: each body's place checked with its own MemEq. }
+function RabinKarpCpu(Sp, Sb: PByte; N, NS, From: Int64): Int64;
+var
+  hs, pw, h: UInt32;
+  i, p: Int64;
+begin
+  Result := -1;
   if N - From < NS then
     Exit;
-  h := 0;
-  for i := From to From + NS - 1 do
-    h := h * PrimeRK + Sp[i];
+  RkStart(Sp, Sb, NS, From, hs, pw, h);
   i := From + NS;
-  while True do
-  begin
-    if h = hs then
+  repeat
+    p := RkNext(Sp, N, NS, hs, pw, i, h);
+    if (p >= 0) and PasMemEqCpu(@Sp[p], Sb, NS) then
     begin
-      if Cpu then
-      begin
-        if PasMemEqCpu(@Sp[i - NS], Sb, NS) then
-        begin
-          Result := i - NS;
-          Exit;
-        end;
-      end
-      else if PasMemEqBase(@Sp[i - NS], Sb, NS) then
-      begin
-        Result := i - NS;
-        Exit;
-      end;
-    end;
-    if i >= N then
+      Result := p;
       Exit;
-    h := h * PrimeRK + Sp[i];
-    h := h - pw * Sp[i - NS];
-    i := i + 1;
-  end;
+    end;
+  until p < 0;
+end;
+
+function RabinKarpBase(Sp, Sb: PByte; N, NS, From: Int64): Int64;
+var
+  hs, pw, h: UInt32;
+  i, p: Int64;
+begin
+  Result := -1;
+  if N - From < NS then
+    Exit;
+  RkStart(Sp, Sb, NS, From, hs, pw, h);
+  i := From + NS;
+  repeat
+    p := RkNext(Sp, N, NS, hs, pw, i, h);
+    if (p >= 0) and PasMemEqBase(@Sp[p], Sb, NS) then
+    begin
+      Result := p;
+      Exit;
+    end;
+  until p < 0;
 end;
 
 { The place from 0 of Sub (NS bytes) in S (N bytes) from byte From on,
   -1 when it is not there: Go's stringslite.Index, IndexByte to the
   next first byte, MemEq for the rest, Rabin-Karp once the first byte
-  has matched too often in vain. }
-function IndexOf(Sp, Sb: PByte; N, NS, From: Int64; Cpu: Boolean): Int64;
+  has matched too often in vain. One body for each processor, the same
+  steps, each calling its own kernels (P268): the choice is made when
+  the program is compiled, by which of PasPosCpu and PasPosBase the
+  compiler calls, and a program for the base links no AVX2 kernel. }
+function IndexOfCpu(Sp, Sb: PByte; N, NS, From: Int64): Int64;
 var
   c0, c1: Int64;
   i, t, o, fails: Int64;
-  eq: Boolean;
 begin
   Result := -1;
   if NS > N - From then
@@ -1825,10 +1867,7 @@ begin
   c0 := Sb[0];
   if NS = 1 then
   begin
-    if Cpu then
-      o := PasIndexByteCpu(@Sp[From], N - From, c0)
-    else
-      o := PasIndexByteBase(@Sp[From], N - From, c0);
+    o := PasIndexByteCpu(@Sp[From], N - From, c0);
     if o >= 0 then
       Result := From + o;
     Exit;
@@ -1841,31 +1880,65 @@ begin
   begin
     if Sp[i] <> c0 then
     begin
-      if Cpu then
-        o := PasIndexByteCpu(@Sp[i + 1], t - i - 1, c0)
-      else
-        o := PasIndexByteBase(@Sp[i + 1], t - i - 1, c0);
+      o := PasIndexByteCpu(@Sp[i + 1], t - i - 1, c0);
       if o < 0 then
         Exit;
       i := i + o + 1;
     end;
-    if Sp[i + 1] = c1 then
+    if (Sp[i + 1] = c1) and PasMemEqCpu(@Sp[i], Sb, NS) then
     begin
-      if Cpu then
-        eq := PasMemEqCpu(@Sp[i], Sb, NS)
-      else
-        eq := PasMemEqBase(@Sp[i], Sb, NS);
-      if eq then
-      begin
-        Result := i;
-        Exit;
-      end;
+      Result := i;
+      Exit;
     end;
     i := i + 1;
     fails := fails + 1;
     if (fails >= 4 + (i shr 4)) and (i < t) then
     begin
-      Result := RabinKarp(Sp, Sb, N, NS, i, Cpu);
+      Result := RabinKarpCpu(Sp, Sb, N, NS, i);
+      Exit;
+    end;
+  end;
+end;
+
+function IndexOfBase(Sp, Sb: PByte; N, NS, From: Int64): Int64;
+var
+  c0, c1: Int64;
+  i, t, o, fails: Int64;
+begin
+  Result := -1;
+  if NS > N - From then
+    Exit;
+  c0 := Sb[0];
+  if NS = 1 then
+  begin
+    o := PasIndexByteBase(@Sp[From], N - From, c0);
+    if o >= 0 then
+      Result := From + o;
+    Exit;
+  end;
+  c1 := Sb[1];
+  i := From;
+  t := N - NS + 1;
+  fails := 0;
+  while i < t do
+  begin
+    if Sp[i] <> c0 then
+    begin
+      o := PasIndexByteBase(@Sp[i + 1], t - i - 1, c0);
+      if o < 0 then
+        Exit;
+      i := i + o + 1;
+    end;
+    if (Sp[i + 1] = c1) and PasMemEqBase(@Sp[i], Sb, NS) then
+    begin
+      Result := i;
+      Exit;
+    end;
+    i := i + 1;
+    fails := fails + 1;
+    if (fails >= 4 + (i shr 4)) and (i < t) then
+    begin
+      Result := RabinKarpBase(Sp, Sb, N, NS, i);
       Exit;
     end;
   end;
@@ -1874,26 +1947,28 @@ end;
 { Pos(Sub, S, Offset), as Free Pascal: the place from 1 of the first
   Sub in S at Offset or after, 0 when there is none, when Sub is empty
   or when Offset is below 1 or past S. }
-function PosOf(const Sub, S: string; Offset: Int64; Cpu: Boolean): Int64;
+function PasPosCpu(const Sub, S: string; Offset: Int64): Int64;
 var
   r: Int64;
 begin
   Result := 0;
   if (Length(Sub) = 0) or (Offset < 1) or (Offset > Length(S)) then
     Exit;
-  r := IndexOf(PByte(@S[1]), PByte(@Sub[1]), Length(S), Length(Sub), Offset - 1, Cpu);
+  r := IndexOfCpu(PByte(@S[1]), PByte(@Sub[1]), Length(S), Length(Sub), Offset - 1);
   if r >= 0 then
     Result := r + 1;
 end;
 
-function PasPosCpu(const Sub, S: string; Offset: Int64): Int64;
-begin
-  Result := PosOf(Sub, S, Offset, True);
-end;
-
 function PasPosBase(const Sub, S: string; Offset: Int64): Int64;
+var
+  r: Int64;
 begin
-  Result := PosOf(Sub, S, Offset, False);
+  Result := 0;
+  if (Length(Sub) = 0) or (Offset < 1) or (Offset > Length(S)) then
+    Exit;
+  r := IndexOfBase(PByte(@S[1]), PByte(@Sub[1]), Length(S), Length(Sub), Offset - 1);
+  if r >= 0 then
+    Result := r + 1;
 end;
 
 function PasPosCharCpu(C: Char; const S: string; Offset: Int64): Int64;
@@ -1922,36 +1997,44 @@ end;
 
 { ---- Case ---- }
 
-function MapCase(const S: string; Upper, Cpu: Boolean): string;
+{ S with its ASCII letters made capitals (Upper) or small, by the
+  kernel of each body, chosen when the program is compiled (P268). }
+function MapCaseCpu(const S: string; Upper: Boolean): string;
 begin
   Result := '';
   if Length(S) = 0 then
     Exit;
   SetLength(Result, Length(S));
-  if Cpu then
-    PasCaseMapCpu(@S[1], @Result[1], Length(S), Upper)
-  else
-    PasCaseMapBase(@S[1], @Result[1], Length(S), Upper);
+  PasCaseMapCpu(@S[1], @Result[1], Length(S), Upper);
+end;
+
+function MapCaseBase(const S: string; Upper: Boolean): string;
+begin
+  Result := '';
+  if Length(S) = 0 then
+    Exit;
+  SetLength(Result, Length(S));
+  PasCaseMapBase(@S[1], @Result[1], Length(S), Upper);
 end;
 
 function PasUpperCpu(const S: string): string;
 begin
-  Result := MapCase(S, True, True);
+  Result := MapCaseCpu(S, True);
 end;
 
 function PasUpperBase(const S: string): string;
 begin
-  Result := MapCase(S, True, False);
+  Result := MapCaseBase(S, True);
 end;
 
 function PasLowerCpu(const S: string): string;
 begin
-  Result := MapCase(S, False, True);
+  Result := MapCaseCpu(S, False);
 end;
 
 function PasLowerBase(const S: string): string;
 begin
-  Result := MapCase(S, False, False);
+  Result := MapCaseBase(S, False);
 end;
 
 { ---- Insert, Delete, StringOfChar ---- }
@@ -2384,7 +2467,7 @@ begin
     if Names[i] = #0 then
     begin
       w := Copy(Names, st, i - st);
-      if (Length(w) = Length(S)) and (MapCase(w, True, False) = MapCase(S, True, False)) then
+      if (Length(w) = Length(S)) and (MapCaseBase(w, True) = MapCaseBase(S, True)) then
       begin
         Result := k;
         Code := 0;
