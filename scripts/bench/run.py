@@ -19,7 +19,7 @@
 
   scripts/bench/run.py            build and run the pairs, print the table, then the probes
   scripts/bench/run.py probes     run the robustness probes only, print status and message
-  scripts/bench/run.py -n 5       five runs per program (default 3), median reported
+  scripts/bench/run.py -n 5       five alternating rounds per pair (default 3)
   scripts/bench/run.py --scale F  every budget times F (F < 1 shows a failing run)
   scripts/bench/run.py --json P   write every number and the machine's details to P
   scripts/bench/run.py --cpu base build the paslang side for these processors only
@@ -43,10 +43,14 @@ The two programs of a pair run in rounds, alternating which runs first. The
 table prints each side's median wall time, the median of the rounds' ratios
 paslang / Go (the time verdict), the median peak resident memory (VmHWM as
 the program exits, scripts/bench/peak.py, over MEM_RUNS runs apart from the
-timed ones) and its ratio. Exit status is 1 when a time ratio passes its budget
-in BUDGET, when paslang's peak resident memory passes MEM_BUDGET times Go's, or
-when the outputs differ. Budgets are today's numbers rounded up; they go down as
-milestones close. The numbers come from a run, never from memory.
+timed ones) and its ratio. A program that measures several things (SECTIONS)
+takes the name of one as its argument, and each NAME:SECTION is judged as a
+pair of its own; a run past TIMEOUT seconds is killed and its unit fails.
+Exit status is 1 when a time ratio passes its budget in BUDGET, when
+paslang's peak resident memory passes MEM_BUDGET times Go's, or when the
+outputs differ. Every budget is below 1.00 (P223, Regla 12): a pair Go wins
+or ties fails, and has its hito; a pair that wins keeps what it won,
+rounded up. The numbers come from a run, never from memory.
 """
 import os
 import select
@@ -374,18 +378,21 @@ def main():
             name, args = unit_name(b, sec), (() if sec is None else (sec,))
             gexe, pexe = os.path.join(OUT, b + ".go.bin"), pl_path(b, cpu)
             (gw, gs, go_out), (pw, ps, pl_out), ratio = alternate(gexe, pexe, n, go_env(cpu), None, args)
-            if gs == "timeout" or ps == "timeout":
-                gr, gpeaks, pr, ppeaks = 1.0, [], float("inf"), []
-            else:
+            # A unit that did not end has no memory to compare: none is
+            # measured (0 in the record), and its time fails it.
+            ended = gs != "timeout" and ps != "timeout"
+            if ended:
                 gr, gpeaks = peak_mb(gexe, go_env(cpu), args=args)
                 pr, ppeaks = peak_mb(pexe, args=args)
-            mem = pr / gr if gr > 0 else float("inf")
+                mem = pr / gr if gr > 0 else float("inf")
+            else:
+                gr, gpeaks, pr, ppeaks, mem = 0.0, [], 0.0, [], 0.0
             budget = BUDGET[name] * scale
             same = "yes" if (go_out == pl_out and gs == 0 and ps == 0) else f"NO ({pl_out!r} vs {go_out!r})"
             flag = ""
             if ratio > budget:
                 flag += "  OVER BUDGET"
-            if mem > MEM_BUDGET * scale:
+            if ended and mem > MEM_BUDGET * scale:
                 flag += "  OVER MEMORY"
             bad += bool(flag) or same != "yes"
             print(f"{name:14s} {cpu:6s} {gw:7.3f} {pw:10.3f} {ratio:6.2f} {budget:7.2f} {gr:6.1f} {pr:6.1f} {mem:5.2f}  {same}{flag}")
