@@ -46,6 +46,7 @@ interface
 function PasHeapInit(H: Pointer; NProc: Integer): Integer;
 function PasHeapRefill(H, MC: Pointer; SC: Integer): Integer;
 function PasHeapLarge(H: Pointer; Size, Typ: Integer): Integer;
+procedure PasHeapLargeTyped(H: Pointer; Base, Typ: Integer);
 function PasHeapGrowLarge(H: Pointer; Base, Bytes: Integer): Integer;
 function PasHeapCheck(H: Pointer): Integer;
 function PasHeapMask(H: Pointer; Addr: Integer): Integer;
@@ -1393,16 +1394,26 @@ end;
   pointer, 1 every word, else a descriptor), kept in the span, with 2
   added when a cycle was asked for and could not run. The address, 0
   when the heap is full, 1 to collect first; with the collector 4 is
-  added when the pages held something and rt_alloc must clear them. }
+  added when the pages held something and rt_alloc must clear them.
+  An rt_alloc that clears them a piece at a time, its routine able to
+  stop between two (P271), adds 4 to Typ: 4 is then added with or
+  without the collector, and the collector, which could run meanwhile,
+  does not read such a block, its type 0 until PasHeapLargeTyped gives
+  it Typ, as Go's mallocgcLarge leaves largeType nil until the memory is
+  zero (malloc.go, issue 47302); the block's address in rt_alloc's
+  registers keeps it. Without 4 in Typ, the runtime of a compiler older
+  than these units (the stage compiler links them, P271 found it), the
+  block is typed at once and cleared here without the collector. }
 function PasHeapLarge(H: Pointer; Size, Typ: Integer): Integer;
 var
   h0, npages, sp, sc, ty: Integer;
-  gc: Boolean;
+  gc, pieces: Boolean;
 begin
   Result := 0;
   h0 := Integer(H);
   gc := RdW(h0 + HGcOn) <> 0;
-  ty := Typ and (-3);
+  ty := Typ and (-7);
+  pieces := (Typ and 4) <> 0;
   if gc and ((Typ and 2) = 0) then
     if GcDue(h0) then
     begin
@@ -1417,7 +1428,10 @@ begin
   sp := NewSpan(h0, npages, npages * PageSize, sc);
   if sp <> 0 then
   begin
-    WrW(sp + SLargeType, ty);
+    if pieces and (RdW(sp + SNeedZero) <> 0) then
+      WrW(sp + SLargeType, 0)
+    else
+      WrW(sp + SLargeType, ty);
     WrW(sp + SFreeIndex, 1);
   end;
   SpinUnlock(PInt(h0 + HLock));
@@ -1425,13 +1439,27 @@ begin
     Exit;
   Result := RdW(sp + SBase);
   if gc then
-  begin
     AtomicAdd(PInt(h0 + HAllocated), npages * PageSize);
-    if RdW(sp + SNeedZero) <> 0 then
-      Result := Result + 4;
-  end
-  else if RdW(sp + SNeedZero) <> 0 then
-    ZeroMem(Result, npages * PageSize);
+  if RdW(sp + SNeedZero) <> 0 then
+  begin
+    if gc or pieces then
+      Result := Result + 4
+    else
+      ZeroMem(Result, npages * PageSize);
+  end;
+end;
+
+{ The large block at Base, made zero by rt_alloc, gets its GC word Typ
+  (2 and 4 dropped): from now the collector reads it as it holds (P271). The
+  routine allocating it is running, so no cycle marks meanwhile, and the
+  stop of the world orders this store before the next one's reads. }
+procedure PasHeapLargeTyped(H: Pointer; Base, Typ: Integer);
+var
+  h0, sp: Integer;
+begin
+  h0 := Integer(H);
+  sp := RdW(PageSlot(h0, Base));
+  WrW(sp + SLargeType, Typ and (-7));
 end;
 
 { The large block at Base grown where it is to Bytes, rounded up to its

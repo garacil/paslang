@@ -212,6 +212,8 @@ GOLDEN += utf8kern
 GOLDEN_A64 += utf8kern
 GOLDEN += longslice
 GOLDEN_A64 += longslice
+GOLDEN += rtlong
+GOLDEN_A64 += rtlong
 # JSON's scans, one kernel per machine (P202)
 GOLDEN += jsonkern
 GOLDEN_A64 += jsonkern
@@ -732,7 +734,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/stackmap.out $(BUILDDIR)/stackmap.vgot; \
 	echo ok stackmaps; \
 	echo "==== the base processor (-cpu base) ===="; \
-	for t in vectors vecmore vecpool bitwords xxh3 inlineasm hash1 tree1 store1 mapsplit set256 strwords strkern strcmpk cmpwords sysutils1 utf8kern jsonkern longslice; do \
+	for t in vectors vecmore vecpool bitwords xxh3 inlineasm hash1 tree1 store1 mapsplit set256 strwords strkern strcmpk cmpwords sysutils1 utf8kern jsonkern longslice rtlong; do \
 	  $(OUTDIR)/paslangc -cpu base -o $(BUILDDIR)/$$t-base testdata/$$t.paslang; \
 	  $(BUILDDIR)/$$t-base > $(BUILDDIR)/$$t.bgot; \
 	  diff -u testdata/$$t.out $(BUILDDIR)/$$t.bgot; \
@@ -763,13 +765,15 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -qw 'ptest' $(BUILDDIR)/set256-v2.s; \
 	if grep -qw 'vptest' $(BUILDDIR)/set256-v2.s; then echo "set256-v2.s carries AVX2"; exit 1; fi; \
 	: a program for the base processor links no instruction past it, P268: inlineasm writes AVX2 itself and strkern calls the AVX2 kernels to test them; \
-	for t in vectors vecmore vecpool bitwords xxh3 hash1 tree1 store1 mapsplit set256 strwords strcmpk cmpwords sysutils1 utf8kern jsonkern longslice; do \
+	for t in vectors vecmore vecpool bitwords xxh3 hash1 tree1 store1 mapsplit set256 strwords strcmpk cmpwords sysutils1 utf8kern jsonkern longslice rtlong; do \
 	  python3 -I scripts/check_cpubin.py base $(BUILDDIR)/$$t-base > /dev/null || { python3 -I scripts/check_cpubin.py base $(BUILDDIR)/$$t-base; exit 1; }; \
 	done; \
 	: the UTF-8 kernels against the strict decoder of Python, P201: the expected output is the model output; \
 	python3 -I scripts/utf8kern_model.py testdata/utf8kern.paslang | diff -u testdata/utf8kern.out -; \
 	: every front of a kernel against Python across the edges of its slices of 64 KiB, P270; \
 	python3 -I scripts/longslice_model.py testdata/longslice.paslang | diff -u testdata/longslice.out -; \
+	: the copies, clears, comparisons and hashes of the runtime across the edges of their pieces, the hashes against xxhsum when it is there, P271; \
+	if command -v xxhsum > /dev/null; then python3 -I scripts/rtlong_model.py testdata/rtlong.paslang | diff -u testdata/rtlong.out -; fi; \
 	: pashash is what scripts/hashgen.py writes from its template, P270; \
 	python3 -I scripts/hashgen.py --check; \
 	grep -q 'call p_passtr_pasfindbytecpu$$' $(BUILDDIR)/longslice.s || { echo "longslice.s does not call the AVX2 front of IndexByte"; exit 1; }; \
@@ -829,6 +833,16 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	taskset -c 0 timeout 300 $(BUILDDIR)/kernslice-base str > $(BUILDDIR)/kernslice.bgot; \
 	head -n 7 testdata/kernslice.out | diff -u - $(BUILDDIR)/kernslice.bgot; \
 	echo ok kernslice; \
+	echo "==== the runtime's copies, clears, comparisons and hashes give way (P271) ===="; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/rtslice testdata/rtslice.paslang; \
+	PASLANG_GC=20000 taskset -c 0 timeout 300 $(BUILDDIR)/rtslice > $(BUILDDIR)/rtslice.got; \
+	diff -u testdata/rtslice.out $(BUILDDIR)/rtslice.got; \
+	PASLANG_GC=20000 PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=50 PASLANG_GCPOISON=1 taskset -c 0 timeout 600 $(BUILDDIR)/rtslice > $(BUILDDIR)/rtslice.vgot; \
+	diff -u testdata/rtslice.out $(BUILDDIR)/rtslice.vgot; \
+	$(OUTDIR)/paslangc -cpu base -o $(BUILDDIR)/rtslice-base testdata/rtslice.paslang; \
+	PASLANG_GC=20000 taskset -c 0 timeout 300 $(BUILDDIR)/rtslice-base > $(BUILDDIR)/rtslice.bgot; \
+	diff -u testdata/rtslice.out $(BUILDDIR)/rtslice.bgot; \
+	echo ok rtslice; \
 	echo "==== alloc bits ===="; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/allocbits testdata/allocbits.paslang; \
 	for w in "" PASLANG_GCPOISON=1 "PASLANG_GCSTRESS=50 PASLANG_GCPOISON=1" "PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=10 PASLANG_GCPOISON=1" PASLANG_GC=off; do \
@@ -2909,7 +2923,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/cputuse-arm > $(BUILDDIR)/cputuse-arm.got; \
 	diff -u testdata/cputuse.out $(BUILDDIR)/cputuse-arm.got; \
 	echo "==== the base processor arm64 ===="; \
-	for t in hash1 tree1 store1 vectors bitwords set256 strwords strkern strcmpk cmpwords sysutils1 utf8kern jsonkern longslice; do \
+	for t in hash1 tree1 store1 vectors bitwords set256 strwords strkern strcmpk cmpwords sysutils1 utf8kern jsonkern longslice rtlong; do \
 	  $(OUTDIR)/paslangc -target arm64 -cpu base -o $(BUILDDIR)/$$t-arm-base testdata/$$t.paslang; \
 	  timeout 120 $(QEMU_A64) $(BUILDDIR)/$$t-arm-base > $(BUILDDIR)/$$t-arm.bgot; \
 	  diff -u testdata/$$t.out $(BUILDDIR)/$$t-arm.bgot; \
@@ -2995,6 +3009,14 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	taskset -c 0 timeout 600 $(QEMU_A64) $(BUILDDIR)/kernslice-armb str > $(BUILDDIR)/kernslice-armb.got; \
 	head -n 7 testdata/kernslice.out | diff -u - $(BUILDDIR)/kernslice-armb.got; \
 	echo ok kernslice-arm; \
+	echo "==== the runtime's copies, clears, comparisons and hashes give way arm64 (P271) ===="; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -o $(BUILDDIR)/rtslice-arm testdata/rtslice.paslang; \
+	PASLANG_GC=20000 taskset -c 0 timeout 600 $(QEMU_A64) $(BUILDDIR)/rtslice-arm > $(BUILDDIR)/rtslice-arm.got; \
+	diff -u testdata/rtslice.out $(BUILDDIR)/rtslice-arm.got; \
+	$(OUTDIR)/paslangc -target arm64 -cpu base -o $(BUILDDIR)/rtslice-armb testdata/rtslice.paslang; \
+	PASLANG_GC=20000 taskset -c 0 timeout 600 $(QEMU_A64) $(BUILDDIR)/rtslice-armb > $(BUILDDIR)/rtslice-armb.got; \
+	diff -u testdata/rtslice.out $(BUILDDIR)/rtslice-armb.got; \
+	echo ok rtslice-arm; \
 	echo "==== alloc bits arm64 ===="; \
 	$(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/allocbits-arm testdata/allocbits.paslang; \
 	for w in "" PASLANG_GCPOISON=1 "PASLANG_GCSTRESS=50 PASLANG_GCPOISON=1" "PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=50 PASLANG_GCPOISON=1" PASLANG_GC=off; do \

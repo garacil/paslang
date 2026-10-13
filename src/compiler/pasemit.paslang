@@ -745,6 +745,10 @@ type
     procedure EmitRuntime;
     procedure EmitRuntimeArm;
     procedure EmitXxh3X86;
+    procedure EmitYieldPointX86;
+    procedure EmitYieldPointArm;
+    procedure YieldCheckX86(const Tag: string);
+    procedure YieldCheckArm(const Tag, Reg: string);
     procedure EmitMapGetStrX86;
     procedure EmitXxh3Arm;
     procedure EmitMapGetStrArm;
@@ -3630,6 +3634,13 @@ begin
     end;
     AddFP('x16', Off);
     Imm('x17', n);
+    { a frame past 256 KiB a piece at a time (P271), the arguments
+      still in x0 to x7 kept }
+    if Bytes > 262144 then
+    begin
+      Line('  bl rt_zerobig');
+      Exit;
+    end;
     a := Lab;
     b := Lab;
     Line(a + ':');
@@ -3647,6 +3658,14 @@ begin
     Exit;
   end;
   Line('  leaq ' + IntToStr(Off) + '(%rbp), %rdi');
+  if Bytes > 262144 then
+  begin
+    { a frame past 256 KiB a piece at a time (P271) }
+    Line('  movq $' + IntToStr(Bytes) + ', %rcx');
+    Line('  xorl %eax, %eax');
+    Line('  call rt_fillbig');
+    Exit;
+  end;
   Line('  movq $' + IntToStr(n) + ', %rcx');
   Line('  xorq %rax, %rax');
   Line('  rep stosq');
@@ -8458,6 +8477,14 @@ begin
       end;
       Line('  b .adone' + IntToStr(FLab));
       Line('.azero' + IntToStr(FLab) + ':');
+      { a value past 256 KiB a piece at a time (P271) }
+      if TSize(Dest^.Typ) > 262144 then
+      begin
+        Line('  mov x1, x2');
+        Line('  mov w2, wzr');
+        Line('  bl rt_fillbig');
+        Line('  b .adone' + IntToStr(FLab));
+      end;
       Line('  cmp x2, #8');
       Line('  b.lt .azb' + IntToStr(FLab));
       Line('  str xzr, [x0], #8');
@@ -8540,7 +8567,11 @@ begin
     Line('  testq %rsi, %rsi');
     Line('  jnz .stblob' + IntToStr(FLab));
     Line('  xorq %rax, %rax');
-    Line('  rep stosb');
+    { a value past 256 KiB a piece at a time (P271) }
+    if TSize(Dest^.Typ) > 262144 then
+      Line('  call rt_fillbig')
+    else
+      Line('  rep stosb');
     Line('  jmp .stdone' + IntToStr(FLab));
     Line('.stblob' + IntToStr(FLab) + ':');
     smap := StrMap(Dest^.Typ);
@@ -19307,6 +19338,12 @@ begin
           b := Lab;
           Line('  cmp x1, #0');
           Line('  b.le ' + b);
+          { past 256 KiB a piece at a time, the routine able to stop
+            between two (P271) }
+          Line('  cmp x1, #64, lsl #12');
+          Line('  b.ls ' + a);
+          Line('  bl rt_fillbig');
+          Line('  b ' + b);
           Line(a + ':');
           Line('  strb w2, [x0], #1');
           Line('  subs x1, x1, #1');
@@ -20038,8 +20075,16 @@ begin
         Line('  popq %rcx');
         Line('  popq %rdi');
         a := Lab;
+        b := Lab;
         Line('  testq %rcx, %rcx');
         Line('  jle ' + a);
+        { past 256 KiB a piece at a time, the routine able to stop
+          between two (P271) }
+        Line('  cmpq $262144, %rcx');
+        Line('  jbe ' + b);
+        Line('  call rt_fillbig');
+        Line('  jmp ' + a);
+        Line(b + ':');
         Line('  rep stosb');
         Line(a + ':');
       end
@@ -30178,6 +30223,17 @@ begin
   Line('  addq %rcx, %r11');
   Line('  movq %r9, %rax');
   Line('  addq %rcx, %rax');
+  { at most 256 KiB of whole stripes a chunk, rdx its end (the length
+    waits on the stack), rdi what is left after it; rt_yieldpoint
+    between two chunks when the routine was asked to stop (P271) }
+  Line('.x6o:');
+  Line('  movq %rdi, %rdx');
+  Line('  andq $-32, %rdx');
+  Line('  movl $262144, %ecx');
+  Line('  cmpq %rcx, %rdx');
+  Line('  cmovaq %rcx, %rdx');
+  Line('  subq %rdx, %rdi');
+  Line('  addq %rbx, %rdx');
   Line('.x6l:');
   Line('  movq (%rbx), %rcx');
   Line('  imulq .Lxxh64p2(%rip), %rcx');
@@ -30204,9 +30260,13 @@ begin
   Line('  imulq .Lxxh64p1(%rip), %rcx');
   Line('  movq %rcx, %r10');
   Line('  addq $32, %rbx');
-  Line('  subq $32, %rdi');
+  Line('  cmpq %rdx, %rbx');
+  Line('  jb .x6l');
   Line('  cmpq $32, %rdi');
-  Line('  jae .x6l');
+  Line('  jb .x6e');
+  YieldCheckX86('.x6y');
+  Line('  jmp .x6o');
+  Line('.x6e:');
   Line('  movq %r11, %rdx');
   Line('  rolq $1, %rdx');
   Line('  movq %rax, %rcx');
@@ -30321,6 +30381,18 @@ begin
   Line('  movl %r9d, %r10d');
   Line('  movl %r9d, %r11d');
   Line('  subl %eax, %r11d');
+  { at most 256 KiB of whole stripes a chunk, rcx its end, rdi what is
+    left after it: the loop compares its place with the end and takes
+    nothing more a stripe; rt_yieldpoint between two chunks when the
+    routine was asked to stop (P271) }
+  Line('.x3o:');
+  Line('  movq %rdi, %rcx');
+  Line('  andq $-16, %rcx');
+  Line('  movl $262144, %eax');
+  Line('  cmpq %rax, %rcx');
+  Line('  cmovaq %rax, %rcx');
+  Line('  subq %rcx, %rdi');
+  Line('  addq %rbx, %rcx');
   Line('.x3l:');
   Line('  movl (%rbx), %eax');
   Line('  imull .Lxxh32p2(%rip), %eax');
@@ -30347,9 +30419,13 @@ begin
   Line('  imull .Lxxh32p1(%rip), %eax');
   Line('  movl %eax, %r11d');
   Line('  addq $16, %rbx');
-  Line('  subq $16, %rdi');
+  Line('  cmpq %rcx, %rbx');
+  Line('  jb .x3l');
   Line('  cmpq $16, %rdi');
-  Line('  jae .x3l');
+  Line('  jb .x3e');
+  YieldCheckX86('.x3y');
+  Line('  jmp .x3o');
+  Line('.x3e:');
   Line('  roll $1, %edx');
   Line('  roll $7, %r8d');
   Line('  roll $12, %r10d');
@@ -30854,6 +30930,7 @@ begin
   Line('  movq 120(%r14), %rax');
   Line('  ret');
   Line('');
+  EmitYieldPointX86;
   Line('rt_newstack:');
   Line('  pushq %rbx');
   Line('  pushq %r12');
@@ -31178,7 +31255,11 @@ begin
     building). Longer: 16 bytes at a time with the last 16 (the first 16
     going backwards) loaded before any store and stored at the end, so an
     overlap either way reads each byte before it is written; 2048 bytes
-    and more without an overlap with rep movsb (ERMS). }
+    and more without an overlap with rep movsb (ERMS). Past 256 KiB, a
+    piece of 256 KiB at a time through the same paths, from the end when
+    the destination lies inside the source, with rt_yieldpoint between
+    two when the routine was asked to stop (P271; Go's chunk for its
+    large clears, malloc.go). }
   Line('rt_memcpy:');
   Line('  cmpq $16, %rcx');
   Line('  ja .mcp_17');
@@ -31221,6 +31302,8 @@ begin
   Line('  movdqu %xmm15, -16(%rdi,%rcx)');
   Line('  ret');
   Line('.mcp_33:');
+  Line('  cmpq $262144, %rcx');
+  Line('  ja .mcp_big');
   Line('  movq %rdi, %rax');
   Line('  subq %rsi, %rax');
   Line('  cmpq %rcx, %rax');
@@ -31257,6 +31340,76 @@ begin
   Line('  cmpq $16, %rcx');
   Line('  ja .mcp_bl');
   Line('  movdqu %xmm15, (%rdi)');
+  Line('  ret');
+  { Past 256 KiB: rdx what is left, r8 the source and r9 the destination
+    of the next piece (their ends going backwards), kept on the stack
+    for the caller; each piece is a call of rt_memcpy, which keeps them. }
+  Line('.mcp_big:');
+  Line('  pushq %rdx');
+  Line('  pushq %r8');
+  Line('  pushq %r9');
+  Line('  movq %rcx, %rdx');
+  Line('  movq %rsi, %r8');
+  Line('  movq %rdi, %r9');
+  Line('  movq %rdi, %rax');
+  Line('  subq %rsi, %rax');
+  Line('  cmpq %rcx, %rax');
+  Line('  jb .mcb_back');
+  Line('.mcb_f:');
+  Line('  movl $262144, %ecx');
+  Line('  cmpq %rcx, %rdx');
+  Line('  cmovbq %rdx, %rcx');
+  Line('  movq %r8, %rsi');
+  Line('  movq %r9, %rdi');
+  Line('  addq %rcx, %r8');
+  Line('  addq %rcx, %r9');
+  Line('  subq %rcx, %rdx');
+  Line('  call rt_memcpy');
+  Line('  testq %rdx, %rdx');
+  Line('  jz .mcb_done');
+  YieldCheckX86('.mcb_f');
+  Line('  jmp .mcb_f');
+  Line('.mcb_back:');
+  Line('  addq %rdx, %r8');
+  Line('  addq %rdx, %r9');
+  Line('.mcb_b:');
+  Line('  movl $262144, %ecx');
+  Line('  cmpq %rcx, %rdx');
+  Line('  cmovbq %rdx, %rcx');
+  Line('  subq %rcx, %r8');
+  Line('  subq %rcx, %r9');
+  Line('  subq %rcx, %rdx');
+  Line('  movq %r8, %rsi');
+  Line('  movq %r9, %rdi');
+  Line('  call rt_memcpy');
+  Line('  testq %rdx, %rdx');
+  Line('  jz .mcb_done');
+  YieldCheckX86('.mcb_b');
+  Line('  jmp .mcb_b');
+  Line('.mcb_done:');
+  Line('  popq %r9');
+  Line('  popq %r8');
+  Line('  popq %rdx');
+  Line('  ret');
+  Line('');
+  { rt_fillbig (P271): FillChar and a zero value past 256 KiB, rdi the
+    bytes, rcx how many, al the byte; rep stosb a piece of 256 KiB at a
+    time with rt_yieldpoint between two. rcx and rdi as rep stosb leaves
+    them, every other register kept. }
+  Line('rt_fillbig:');
+  Line('  pushq %rdx');
+  Line('.fb_l:');
+  Line('  movq %rcx, %rdx');
+  Line('  subq $262144, %rdx');
+  Line('  jbe .fb_last');
+  Line('  movl $262144, %ecx');
+  Line('  rep stosb');
+  Line('  movq %rdx, %rcx');
+  YieldCheckX86('.fb_l');
+  Line('  jmp .fb_l');
+  Line('.fb_last:');
+  Line('  rep stosb');
+  Line('  popq %rdx');
   Line('  ret');
   Line('');
   { rt_alloc (P95a, docs/GC.md): rdi size, rsi GC word (0 no pointer,
@@ -31613,6 +31766,10 @@ begin
   Line('  cmpq 8(%r14), %rsp');
   Line('  ja rt_persistentalloc');
   Line('  movq %rsi, %rdx');
+  { 4: this rt_alloc clears a reused block a piece at a time and types
+    it after (P271), which PasHeapLarge must know: with a runtime older
+    than the units it types the block at once }
+  Line('  orq $4, %rdx');
   Line('  movq %rdi, %rsi');
   Line('  leaq rt_heapstate(%rip), %rdi');
   { 1 from pasheap: a cycle first, then ask again; 2 added to the GC word
@@ -31630,17 +31787,30 @@ begin
   Line('.al_lgd:');
   Line('  testq %rax, %rax');
   Line('  jz rt_dieoom');
-  { 4 added: the pages held something; clear them (rsi the size). }
+  { 4 added: the pages held something; clear them (rsi the size) a piece
+    at a time through rt_fillbig, the routine able to stop between two,
+    then give the block its type, which pasheap left 0 meanwhile so that
+    no cycle reads what the pages held (P271). rdx is still the GC
+    word: rt_gocall keeps it. A block of no pointer has nothing to get. }
   Line('  testq $4, %rax');
   Line('  jz .al_lgr');
   Line('  andq $-8, %rax');
   Line('  pushq %rax');
+  Line('  pushq %rdx');
   Line('  movq %rax, %rdi');
   Line('  leaq 8191(%rsi), %rcx');
   Line('  andq $-8192, %rcx');
-  Line('  shrq $3, %rcx');
   Line('  xorl %eax, %eax');
-  Line('  rep stosq');
+  Line('  call rt_fillbig');
+  Line('  popq %rdx');
+  Line('  movq %rdx, %rcx');
+  Line('  andq $-7, %rcx');
+  Line('  jz .al_lgt');
+  Line('  movq (%rsp), %rsi');
+  Line('  leaq rt_heapstate(%rip), %rdi');
+  Line('  leaq p_pasheap_pasheaplargetyped(%rip), %rax');
+  Line('  call rt_gocall');
+  Line('.al_lgt:');
   Line('  popq %rax');
   Line('.al_lgr:');
   Line('  ret');
@@ -33501,7 +33671,9 @@ begin
     compare_amd64.s), a string in rdi and rsi, the other in rdx and rcx.
     64 bytes a step on AVX2 when -cpu has it, on SSE2 otherwise; 16 and 8
     after; under 8 one load of each that stays in its page. They were a
-    byte a step. }
+    byte a step. rt_streq's 64-byte loop goes a chunk of 256 KiB at a
+    time, rt_strcmp's looks at r9, the next place, every step; between
+    two rt_yieldpoint when the routine was asked to stop (P271). }
   Line('.globl rt_streq');
   Line('rt_streq:');
   Line('  cmpq %rsi, %rcx');
@@ -33512,11 +33684,21 @@ begin
   Line('  jb .se_small');
   Line('  cmpq $64, %rsi');
   Line('  jb .se_big');
+  { at most 256 KiB of 64-byte steps a chunk, rax its end, rsi what is
+    left after it: the loop compares its place with the end, a step
+    less than counting down; rt_yieldpoint between two chunks when the
+    routine was asked to stop (P271) }
+  Line('.se_hc:');
+  Line('  movq %rsi, %rax');
+  Line('  andq $-64, %rax');
+  Line('  movl $262144, %r8d');
+  Line('  cmpq %r8, %rax');
+  Line('  cmovaq %r8, %rax');
+  Line('  subq %rax, %rsi');
+  Line('  addq %rdi, %rax');
   if HasFeat(CpuFeatBit('avx2', False)) then
   begin
     Line('.se_huge:');
-    Line('  cmpq $64, %rsi');
-    Line('  jb .se_hugeend');
     Line('  vmovdqu (%rdi), %ymm0');
     Line('  vmovdqu (%rdx), %ymm1');
     Line('  vmovdqu 32(%rdi), %ymm2');
@@ -33527,9 +33709,15 @@ begin
     Line('  vpmovmskb %ymm6, %r8d');
     Line('  addq $64, %rdi');
     Line('  addq $64, %rdx');
-    Line('  subq $64, %rsi');
     Line('  cmpl $0xffffffff, %r8d');
-    Line('  je .se_huge');
+    Line('  jne .se_hne');
+    Line('  cmpq %rax, %rdi');
+    Line('  jb .se_huge');
+    Line('  cmpq $64, %rsi');
+    Line('  jb .se_hugeend');
+    YieldCheckX86('.se_hy');
+    Line('  jmp .se_hc');
+    Line('.se_hne:');
     Line('  vzeroupper');
     Line('  jmp .se_no');
     Line('.se_hugeend:');
@@ -33538,8 +33726,6 @@ begin
   else
   begin
     Line('.se_huge:');
-    Line('  cmpq $64, %rsi');
-    Line('  jb .se_big');
     Line('  movdqu (%rdi), %xmm0');
     Line('  movdqu (%rdx), %xmm1');
     Line('  movdqu 16(%rdi), %xmm2');
@@ -33558,10 +33744,14 @@ begin
     Line('  pmovmskb %xmm0, %r8d');
     Line('  addq $64, %rdi');
     Line('  addq $64, %rdx');
-    Line('  subq $64, %rsi');
     Line('  cmpl $0xffff, %r8d');
-    Line('  je .se_huge');
-    Line('  jmp .se_no');
+    Line('  jne .se_no');
+    Line('  cmpq %rax, %rdi');
+    Line('  jb .se_huge');
+    Line('  cmpq $64, %rsi');
+    Line('  jb .se_big');
+    YieldCheckX86('.se_hy');
+    Line('  jmp .se_hc');
   end;
   Line('.se_big:');
   Line('  cmpq $8, %rsi');
@@ -33623,6 +33813,7 @@ begin
   Line('  jb .sm_small');
   Line('  cmpq $63, %r8');
   Line('  jbe .sm_loop');
+  Line('  leaq 262144(%rdi), %r9');
   Line('  jmp .sm_bigloop');
   Line('.sm_loop:');
   Line('  cmpq $16, %r8');
@@ -33736,6 +33927,10 @@ begin
     Line('  subq $64, %r8');
     Line('  cmpq $64, %r8');
     Line('  jb .sm_bigexit');
+    Line('  cmpq %r9, %rdi');
+    Line('  jb .sm_bigloop');
+    Line('  addq $262144, %r9');
+    YieldCheckX86('.sm_by');
     Line('  jmp .sm_bigloop');
     Line('.sm_d32v:');
     Line('  vzeroupper');
@@ -33779,6 +33974,10 @@ begin
     Line('  subq $64, %r8');
     Line('  cmpq $64, %r8');
     Line('  jbe .sm_loop');
+    Line('  cmpq %r9, %rdi');
+    Line('  jb .sm_bigloop');
+    Line('  addq $262144, %r9');
+    YieldCheckX86('.sm_by');
     Line('  jmp .sm_bigloop');
   end;
   Line('');
@@ -35429,6 +35628,210 @@ begin
   Line('  ret');
 end;
 
+{ rt_yieldpoint (P271): a long copy, clear, comparison or hash of the
+  runtime calls it between two pieces when its routine has been asked
+  to stop (G+16 holds Poisoned, which sysmon writes every 10 ms and the
+  collector's stop of the world too). It keeps every register, as Go's
+  asyncPreempt does (preempt_amd64.s and preempt_arm64.s, written by
+  mkpreempt.go): the general ones and the vector ones (ymm0-ymm15 when
+  the processor compiled for has AVX, since a promoted V256 may live in
+  one; xmm0-xmm15 else; q0-q31 on arm64) go on the routine's stack, and
+  it parks as a preempted prologue does (.ms_preempt), on the global
+  queue, coming back through .pk_res. The collector reads that stack
+  word by word up to the caller's frame pointer, as it reads any
+  runtime frame (ScanStack). The flags are not kept: a call leaves them
+  undefined. With AVX the restore leaves the upper halves in use until
+  the next vzeroupper, which on Intel's cores costs the SSE code between
+  (only after a stop, some every 10 ms). It does nothing on another
+  stack than the routine's own (rt_newstack copies on the M's) or while
+  the routine holds a runtime lock (G+184, the collector's own records
+  among them): the request then waits for the next check. }
+procedure TEmitter.EmitYieldPointX86;
+const
+  Gpr: array[0..13] of string = ('rax', 'rcx', 'rdx', 'rbx', 'rsi', 'rdi', 'r8',
+    'r9', 'r10', 'r11', 'r12', 'r13', 'r15', 'rbp');
+var
+  i, vw, sz: LongInt;
+  avx: Boolean;
+begin
+  avx := HasFeat(CpuFeatBit('avx', False));
+  if avx then
+    vw := 32
+  else
+    vw := 16;
+  sz := 112 + 16 * vw;
+  Line('rt_yieldpoint:');
+  Line('  cmpl $0, 184(%r14)');
+  Line('  jne .yp_no');
+  Line('  cmpq 0(%r14), %rsp');
+  Line('  jb .yp_no');
+  Line('  cmpq 8(%r14), %rsp');
+  Line('  ja .yp_no');
+  Line('  subq $' + IntToStr(sz) + ', %rsp');
+  for i := 0 to 13 do
+    Line('  movq %' + Gpr[i] + ', ' + IntToStr(8 * i) + '(%rsp)');
+  for i := 0 to 15 do
+    if avx then
+      Line('  vmovdqu %ymm' + IntToStr(i) + ', ' + IntToStr(112 + vw * i) + '(%rsp)')
+    else
+      Line('  movdqu %xmm' + IntToStr(i) + ', ' + IntToStr(112 + vw * i) + '(%rsp)');
+  { the .pk_res layout: the callee-saved registers, then where to go on }
+  Line('  pushq %rbx');
+  Line('  pushq %r12');
+  Line('  pushq %r13');
+  Line('  pushq %r15');
+  Line('  leaq .yp_res(%rip), %rax');
+  Line('  pushq %rax');
+  Line('  movq 24(%r14), %rax');
+  Line('  movq %rax, 16(%r14)');
+  Line('  leaq .pk_res(%rip), %rax');
+  Line('  movq %rax, 48(%r14)');
+  Line('  movq %rsp, 40(%r14)');
+  Line('  movq %rbp, 56(%r14)');
+  Line('  movq 32(%r14), %r13');
+  Line('  movq 32(%r13), %rsp');
+  Line('  xorq %rbp, %rbp');
+  { r14 no longer names the queued routine, as in .ms_preempt }
+  Line('  movq %r14, %rdi');
+  Line('  xorq %r14, %r14');
+  Line('  call rt_globput');
+  Line('  jmp rt_yieldwake');
+  Line('.yp_res:');
+  for i := 0 to 15 do
+    if avx then
+      Line('  vmovdqu ' + IntToStr(112 + vw * i) + '(%rsp), %ymm' + IntToStr(i))
+    else
+      Line('  movdqu ' + IntToStr(112 + vw * i) + '(%rsp), %xmm' + IntToStr(i));
+  for i := 0 to 13 do
+    Line('  movq ' + IntToStr(8 * i) + '(%rsp), %' + Gpr[i]);
+  Line('  addq $' + IntToStr(sz) + ', %rsp');
+  Line('.yp_no:');
+  Line('  ret');
+  Line('');
+end;
+
+{ Between two pieces of a long copy, clear, comparison or hash of the
+  runtime (P271): rt_yieldpoint when the routine (r14, 0 on an M's own
+  stack) has been asked to stop, Poisoned (-1314) in its guard; the
+  compare takes no register. Tag names the place, so its label is
+  unique. }
+procedure TEmitter.YieldCheckX86(const Tag: string);
+begin
+  Line('  testq %r14, %r14');
+  Line('  jz ' + Tag + '_ny');
+  Line('  cmpq $-1314, 16(%r14)');
+  Line('  jne ' + Tag + '_ny');
+  Line('  call rt_yieldpoint');
+  Line(Tag + '_ny:');
+end;
+
+{ The same on arm64, x28 the routine; Reg is a register the place may
+  lose, and x30 is lost to the bl, so the place has saved it. }
+procedure TEmitter.YieldCheckArm(const Tag, Reg: string);
+begin
+  Line('  cbz x28, ' + Tag + '_ny');
+  Line('  ldr ' + Reg + ', [x28, #16]');
+  Line('  cmn ' + Reg + ', #1314');
+  Line('  b.ne ' + Tag + '_ny');
+  Line('  bl rt_yieldpoint');
+  Line(Tag + '_ny:');
+end;
+
+{ rt_yieldpoint on arm64, as above: x0-x17, x19-x27, x29, x30 and q0-q31
+  on the routine's stack, x28 the routine; .pk_res gives back x19-x27
+  and returns to .yp_res. x9 and x10 are the only registers it uses
+  before it saves them, so they are saved first. }
+procedure TEmitter.EmitYieldPointArm;
+var
+  i: LongInt;
+begin
+  Line('rt_yieldpoint:');
+  Line('  stp x9, x10, [sp, #-16]!');
+  Line('  ldr w9, [x28, #184]');
+  Line('  cbnz w9, .yp_no');
+  Line('  mov x9, sp');
+  Line('  ldr x10, [x28]');
+  Line('  cmp x9, x10');
+  Line('  b.lo .yp_no');
+  Line('  ldr x10, [x28, #8]');
+  Line('  cmp x9, x10');
+  Line('  b.hi .yp_no');
+  { 30 general registers (x9 and x10 already below) and 32 vector ones }
+  Line('  sub sp, sp, #752');
+  i := 0;
+  while i <= 8 do
+  begin
+    Line('  stp x' + IntToStr(i) + ', x' + IntToStr(i + 1) + ', [sp, #' + IntToStr(8 * i) + ']');
+    i := i + 2;
+  end;
+  Line('  stp x11, x12, [sp, #88]');
+  Line('  stp x13, x14, [sp, #104]');
+  Line('  stp x15, x16, [sp, #120]');
+  Line('  str x17, [sp, #136]');
+  Line('  stp x19, x20, [sp, #144]');
+  Line('  stp x21, x22, [sp, #160]');
+  Line('  stp x23, x24, [sp, #176]');
+  Line('  stp x25, x26, [sp, #192]');
+  Line('  stp x27, x29, [sp, #208]');
+  Line('  str x30, [sp, #224]');
+  i := 0;
+  while i <= 30 do
+  begin
+    Line('  stp q' + IntToStr(i) + ', q' + IntToStr(i + 1) + ', [sp, #' + IntToStr(240 + 16 * i) + ']');
+    i := i + 2;
+  end;
+  { the .pk_res layout, as .ms_preempt writes it }
+  Line('  stp x19, x20, [sp, #-16]!');
+  Line('  stp x21, x22, [sp, #-16]!');
+  Line('  stp x23, x24, [sp, #-16]!');
+  Line('  stp x25, x26, [sp, #-16]!');
+  Line('  stp x27, xzr, [sp, #-16]!');
+  Line('  adr x10, .yp_res');
+  Line('  str x10, [sp, #-16]!');
+  Line('  ldr x9, [x28, #24]');
+  Line('  str x9, [x28, #16]');
+  Line('  mov x9, sp');
+  Line('  str x9, [x28, #40]');
+  Line('  str x29, [x28, #56]');
+  Line('  adr x10, .pk_res');
+  Line('  str x10, [x28, #48]');
+  Line('  ldr x21, [x28, #32]');
+  Line('  ldr x9, [x21, #32]');
+  Line('  mov sp, x9');
+  Line('  mov x29, xzr');
+  Line('  mov x0, x28');
+  Line('  mov x28, xzr');
+  Line('  bl rt_globput');
+  Line('  b rt_yieldwake');
+  Line('.yp_res:');
+  i := 0;
+  while i <= 30 do
+  begin
+    Line('  ldp q' + IntToStr(i) + ', q' + IntToStr(i + 1) + ', [sp, #' + IntToStr(240 + 16 * i) + ']');
+    i := i + 2;
+  end;
+  i := 0;
+  while i <= 8 do
+  begin
+    Line('  ldp x' + IntToStr(i) + ', x' + IntToStr(i + 1) + ', [sp, #' + IntToStr(8 * i) + ']');
+    i := i + 2;
+  end;
+  Line('  ldp x11, x12, [sp, #88]');
+  Line('  ldp x13, x14, [sp, #104]');
+  Line('  ldp x15, x16, [sp, #120]');
+  Line('  ldr x17, [sp, #136]');
+  Line('  ldp x19, x20, [sp, #144]');
+  Line('  ldp x21, x22, [sp, #160]');
+  Line('  ldp x23, x24, [sp, #176]');
+  Line('  ldp x25, x26, [sp, #192]');
+  Line('  ldp x27, x29, [sp, #208]');
+  Line('  ldr x30, [sp, #224]');
+  Line('  add sp, sp, #752');
+  Line('.yp_no:');
+  Line('  ldp x9, x10, [sp], #16');
+  Line('  ret');
+end;
+
 procedure TEmitter.EmitXxh3X86;
 begin
 { rt_xxh3: XXH3, 64 bits, with a seed, as the reference's
@@ -36428,7 +36831,13 @@ begin
   Line('  paddq %xmm6, %xmm3');
   Line('  addq $1024, %r12');
   Line('  decq %r13');
+  Line('  jz .x3_srest');
+  { every 256 blocks (256 KiB) rt_yieldpoint when the routine was asked
+    to stop (P271): it keeps the accumulators }
+  Line('  testb $255, %r13b');
   Line('  jnz .x3_sblk');
+  YieldCheckX86('.x3_sy');
+  Line('  jmp .x3_sblk');
   Line('.x3_srest:');
   Line('  leaq -1(%r10), %rdi');
   Line('  movq %r12, %rax');
@@ -36765,7 +37174,13 @@ begin
   Line('  vpaddq %ymm6, %ymm1, %ymm1');
   Line('  addq $1024, %r12');
   Line('  decq %r13');
+  Line('  jz .x3_vrest');
+  { every 256 blocks rt_yieldpoint when asked, as above (P271): with AVX
+    it keeps the ymm accumulators whole }
+  Line('  testb $255, %r13b');
   Line('  jnz .x3_vblk');
+  YieldCheckX86('.x3_vy');
+  Line('  jmp .x3_vblk');
   Line('.x3_vrest:');
   Line('  leaq -1(%r10), %rdi');
   Line('  movq %r12, %rax');
@@ -37949,7 +38364,15 @@ begin
   Line('  mov v3.16b, v4.16b');
   Line('  add x3, x3, #1024');
   Line('  subs x4, x4, #1');
+  Line('  b.eq .x3_rest');
+  { every 256 blocks (256 KiB) rt_yieldpoint when the routine was asked
+    to stop (P271): it keeps the accumulators in v0 to v3 }
+  Line('  tst x4, #255');
   Line('  b.ne .x3_blk');
+  Line('  str x30, [sp, #-16]!');
+  YieldCheckArm('.x3_ay', 'x6');
+  Line('  ldr x30, [sp], #16');
+  Line('  b .x3_blk');
   Line('.x3_rest:');
   Line('  sub x6, x2, #1');
   Line('  sub x7, x3, x0');
@@ -39460,6 +39883,15 @@ begin
   Line('  mov x8, x1');
   Line('  mov x9, x1');
   Line('  sub x9, x9, x13');
+  { at most 256 KiB of whole stripes a chunk, x11 its end, x4 what is
+    left after it, as on amd64; rt_yieldpoint between two (P271) }
+  Line('.x6o:');
+  Line('  and x11, x4, #-32');
+  Line('  movz x14, #4, lsl #16');
+  Line('  cmp x11, x14');
+  Line('  csel x11, x11, x14, ls');
+  Line('  sub x4, x4, x11');
+  Line('  add x11, x5, x11');
   Line('.x6l:');
   Line('  ldr x10, [x5]');
   Line('  mul x10, x10, x12');
@@ -39482,9 +39914,14 @@ begin
   Line('  ror x10, x10, #33');
   Line('  mul x9, x10, x13');
   Line('  add x5, x5, #32');
-  Line('  sub x4, x4, #32');
+  Line('  cmp x5, x11');
+  Line('  b.lo .x6l');
   Line('  cmp x4, #32');
-  Line('  b.ge .x6l');
+  Line('  b.lt .x6e');
+  { x30 waits in the frame }
+  YieldCheckArm('.x6y', 'x10');
+  Line('  b .x6o');
+  Line('.x6e:');
   Line('  ror x14, x6, #63');
   Line('  ror x10, x7, #57');
   Line('  add x14, x14, x10');
@@ -39603,6 +40040,15 @@ begin
   Line('  mov w8, w1');
   Line('  mov w9, w1');
   Line('  sub w9, w9, w13');
+  { at most 256 KiB of whole stripes a chunk, x11 its end, x4 what is
+    left after it, as in rt_xxh64; rt_yieldpoint between two (P271) }
+  Line('.x3o:');
+  Line('  and x11, x4, #-16');
+  Line('  movz x14, #4, lsl #16');
+  Line('  cmp x11, x14');
+  Line('  csel x11, x11, x14, ls');
+  Line('  sub x4, x4, x11');
+  Line('  add x11, x5, x11');
   Line('.x3l:');
   Line('  ldr w10, [x5]');
   Line('  mul w10, w10, w12');
@@ -39625,9 +40071,13 @@ begin
   Line('  ror w10, w10, #19');
   Line('  mul w9, w10, w13');
   Line('  add x5, x5, #16');
-  Line('  sub x4, x4, #16');
+  Line('  cmp x5, x11');
+  Line('  b.lo .x3l');
   Line('  cmp x4, #16');
-  Line('  b.ge .x3l');
+  Line('  b.lt .x3e');
+  YieldCheckArm('.x3y', 'x10');
+  Line('  b .x3o');
+  Line('.x3e:');
   Line('  ror w6, w6, #31');
   Line('  ror w7, w7, #25');
   Line('  ror w8, w8, #20');
@@ -42764,6 +43214,7 @@ begin
   Line('  str w9, [x28, #188]');
   Line('  ldr x30, [x28, #240]');
   Line('  ret');
+  EmitYieldPointArm;
   Line('rt_newstack:');
   Line('  stp x29, x30, [sp, #-16]!');
   Line('  mov x29, sp');
@@ -42902,7 +43353,9 @@ begin
     bytes two loads that may overlap and then two stores; longer, 16
     bytes at a time with the last 16 (the first 16 going backwards)
     loaded before any store, a destination inside the source backwards
-    (P94). }
+    (P94). Past 256 KiB a piece of 256 KiB at a time, with
+    rt_yieldpoint between two when the routine was asked to stop, as on
+    amd64 (P271). }
   Line('rt_memcpy:');
   Line('  cmp x2, #16');
   Line('  b.hi .amcp_17');
@@ -42952,6 +43405,8 @@ begin
   Line('  stur q31, [x0, #-16]');
   Line('  ret');
   Line('.amcp_33:');
+  Line('  cmp x2, #64, lsl #12');
+  Line('  b.hi .amcp_big');
   Line('  sub x3, x0, x1');
   Line('  cmp x3, x2');
   Line('  b.lo .amcp_back');
@@ -42976,6 +43431,93 @@ begin
   Line('  cmp x2, #16');
   Line('  b.hi .amcp_bl');
   Line('  str q31, [x0]');
+  Line('  ret');
+  { Past 256 KiB: x4 what is left, x5 the source and x6 the destination
+    of the next piece (their ends going backwards), x7 the piece, kept
+    with x30 on the stack for the caller; each piece is a call of
+    rt_memcpy, which keeps them. }
+  Line('.amcp_big:');
+  Line('  stp x4, x5, [sp, #-48]!');
+  Line('  stp x6, x7, [sp, #16]');
+  Line('  str x30, [sp, #32]');
+  Line('  mov x4, x2');
+  Line('  mov x5, x1');
+  Line('  mov x6, x0');
+  Line('  movz x7, #4, lsl #16');
+  Line('  sub x3, x0, x1');
+  Line('  cmp x3, x2');
+  Line('  b.lo .amcb_back');
+  Line('.amcb_f:');
+  Line('  cmp x4, x7');
+  Line('  csel x2, x4, x7, lo');
+  Line('  mov x1, x5');
+  Line('  mov x0, x6');
+  Line('  add x5, x5, x2');
+  Line('  add x6, x6, x2');
+  Line('  sub x4, x4, x2');
+  Line('  bl rt_memcpy');
+  Line('  cbz x4, .amcb_done');
+  YieldCheckArm('.amcb_f', 'x3');
+  Line('  b .amcb_f');
+  Line('.amcb_back:');
+  Line('  add x5, x5, x4');
+  Line('  add x6, x6, x4');
+  Line('.amcb_b:');
+  Line('  cmp x4, x7');
+  Line('  csel x2, x4, x7, lo');
+  Line('  sub x5, x5, x2');
+  Line('  sub x6, x6, x2');
+  Line('  sub x4, x4, x2');
+  Line('  mov x1, x5');
+  Line('  mov x0, x6');
+  Line('  bl rt_memcpy');
+  Line('  cbz x4, .amcb_done');
+  YieldCheckArm('.amcb_b', 'x3');
+  Line('  b .amcb_b');
+  Line('.amcb_done:');
+  Line('  ldr x30, [sp, #32]');
+  Line('  ldp x6, x7, [sp, #16]');
+  Line('  ldp x4, x5, [sp], #48');
+  Line('  ret');
+  { rt_fillbig (P271): FillChar and a zero value past 256 KiB, x0 the
+    bytes, x1 how many, w2 the byte, a piece of 256 KiB at a time with
+    rt_yieldpoint between two; x0 and x1 used up, every other register
+    kept. }
+  Line('rt_fillbig:');
+  Line('  stp x3, x30, [sp, #-16]!');
+  Line('.afb_l:');
+  Line('  cmp x1, #64, lsl #12');
+  Line('  b.ls .afb_last');
+  Line('  movz x3, #4, lsl #16');
+  Line('  sub x1, x1, x3');
+  Line('.afb_p:');
+  Line('  strb w2, [x0], #1');
+  Line('  subs x3, x3, #1');
+  Line('  b.ne .afb_p');
+  YieldCheckArm('.afb_l', 'x3');
+  Line('  b .afb_l');
+  Line('.afb_last:');
+  Line('  cbz x1, .afb_done');
+  Line('.afb_q:');
+  Line('  strb w2, [x0], #1');
+  Line('  subs x1, x1, #1');
+  Line('  b.ne .afb_q');
+  Line('.afb_done:');
+  Line('  ldp x3, x30, [sp], #16');
+  Line('  ret');
+  { rt_zerobig (P271): a frame of compiled code past 256 KiB made zero
+    in its prologue, x16 the first word and x17 how many, as the loop it
+    takes the place of; every other register kept, the arguments in x0
+    to x7 among them. }
+  Line('rt_zerobig:');
+  Line('  stp x0, x1, [sp, #-32]!');
+  Line('  stp x2, x30, [sp, #16]');
+  Line('  mov x0, x16');
+  Line('  lsl x1, x17, #3');
+  Line('  mov w2, wzr');
+  Line('  bl rt_fillbig');
+  Line('  ldp x2, x30, [sp, #16]');
+  Line('  ldp x0, x1, [sp], #32');
   Line('  ret');
   Line('rt_decoderune:');
   Line('  cmp x2, x1');
@@ -43541,6 +44083,8 @@ begin
   Line('  b.hi rt_persistentalloc');
   Line('  str x30, [sp, #-16]!');
   Line('  mov x2, x1');
+  { 4: cleared a piece at a time and typed after, as on amd64 (P271) }
+  Line('  orr x2, x2, #4');
   Line('  mov x1, x0');
   { 1: a cycle first, as on amd64; 2 added when none could run. }
   Line('.al_lgcall:');
@@ -43556,18 +44100,27 @@ begin
   Line('.al_lgd:');
   Line('  ldr x30, [sp], #16');
   Line('  cbz x0, rt_dieoom');
-  { 4 added: clear the pages (x1 the size). }
+  { 4 added: clear the pages (x1 the size) a piece at a time through
+    rt_fillbig, then give the block its type, as on amd64 (P271); x2 is
+    still the GC word, which rt_gocall keeps. }
   Line('  tbz x0, #2, .al_lgr');
   Line('  bic x0, x0, #7');
-  Line('  mov x12, x0');
+  Line('  stp x0, x30, [sp, #-32]!');
+  Line('  str x2, [sp, #16]');
   Imm('x13', 8191);
-  Line('  add x13, x1, x13');
-  Line('  and x13, x13, #-8192');
-  Line('  add x13, x12, x13');
-  Line('.al_lgz:');
-  Line('  stp xzr, xzr, [x12], #16');
-  Line('  cmp x12, x13');
-  Line('  b.lo .al_lgz');
+  Line('  add x1, x1, x13');
+  Line('  and x1, x1, #-8192');
+  Line('  mov w2, wzr');
+  Line('  bl rt_fillbig');
+  Line('  ldr x2, [sp, #16]');
+  Line('  and x3, x2, #-7');
+  Line('  cbz x3, .al_lgt');
+  Line('  ldr x1, [sp]');
+  LeaS('rt_heapstate', 'x0');
+  LeaS('p_pasheap_pasheaplargetyped', 'x17');
+  Line('  bl rt_gocall');
+  Line('.al_lgt:');
+  Line('  ldp x0, x30, [sp], #32');
   Line('.al_lgr:');
   Line('  ret');
   { rt_gocall as on amd64: x17 the routine, x0 to x2 its arguments;
@@ -46407,7 +46960,9 @@ begin
     in x2 and x3: 64 bytes a step compared as words by NEON (v16 on, no
     callee-saved register), 16 by ldp, then 8, 4, 2 and 1; cmpbody's
     rev turns the first differing word into its order. Go's CMP a, b
-    sets the flags of b - a: here written cmp b, a. }
+    sets the flags of b - a: here written cmp b, a. Their loops go a
+    chunk of 256 KiB at a time, as on amd64, with rt_yieldpoint between
+    two when the routine was asked to stop (P271). }
   Line('rt_streq:');
   Line('  cmp x1, x3');
   Line('  b.ne .ase_no');
@@ -46420,7 +46975,16 @@ begin
   Line('  b.lo .ase_tail');
   Line('  bic x3, x1, #0x3f');
   Line('  cbz x3, .ase_c16');
-  Line('  add x6, x0, x3');
+  { at most 256 KiB of 64-byte steps a chunk, x6 its end and x7 the end
+    of them all: the loop is the one it was; rt_yieldpoint between two
+    chunks when the routine was asked to stop (P271) }
+  Line('  add x7, x0, x3');
+  Line('.ase_hc:');
+  Line('  sub x6, x7, x0');
+  Line('  movz x9, #4, lsl #16');
+  Line('  cmp x6, x9');
+  Line('  csel x6, x6, x9, ls');
+  Line('  add x6, x0, x6');
   Line('.ase_c64:');
   Line('  ld1 {v16.2d, v17.2d, v18.2d, v19.2d}, [x0], #64');
   Line('  ld1 {v20.2d, v21.2d, v22.2d, v23.2d}, [x2], #64');
@@ -46437,6 +47001,13 @@ begin
   Line('  cbz x4, .ase_no');
   Line('  cbz x5, .ase_no');
   Line('  b.ne .ase_c64');
+  Line('  cmp x0, x7');
+  Line('  b.eq .ase_c64d');
+  Line('  str x30, [sp, #-16]!');
+  YieldCheckArm('.ase_cy', 'x4');
+  Line('  ldr x30, [sp], #16');
+  Line('  b .ase_hc');
+  Line('.ase_c64d:');
   Line('  and x1, x1, #0x3f');
   Line('  cbz x1, .ase_yes');
   Line('.ase_c16:');
@@ -46498,13 +47069,25 @@ begin
   Line('  mov x0, xzr');
   Line('  ret');
   Line('rt_strcmp:');
-  Line('  cmp x0, x2');
-  Line('  b.eq .asm_same');
+  { x6 the shorter length; x3 then A's less B's, whose sign .asm_same
+    reads, so x1 is free for the end of the 16-byte steps (P271) }
   Line('  cmp x3, x1');
   Line('  csel x6, x3, x1, lt');
+  Line('  sub x3, x1, x3');
+  Line('  cmp x0, x2');
+  Line('  b.eq .asm_same');
   Line('  cbz x6, .asm_same');
   Line('  bic x10, x6, #0xf');
   Line('  cbz x10, .asm_small');
+  { at most 256 KiB of 16-byte steps a chunk, x10 its end and x1 the end
+    of them all: the loop is the one it was; rt_yieldpoint between two
+    chunks when the routine was asked to stop (P271) }
+  Line('  add x1, x0, x10');
+  Line('.asm_hc:');
+  Line('  sub x10, x1, x0');
+  Line('  movz x4, #4, lsl #16');
+  Line('  cmp x10, x4');
+  Line('  csel x10, x10, x4, ls');
   Line('  add x10, x0, x10');
   Line('.asm_l16:');
   Line('  ldp x4, x8, [x0], #16');
@@ -46515,6 +47098,13 @@ begin
   Line('  b.ne .asm_cmpnext');
   Line('  cmp x10, x0');
   Line('  b.ne .asm_l16');
+  Line('  cmp x1, x0');
+  Line('  b.eq .asm_l16d');
+  Line('  str x30, [sp, #-16]!');
+  YieldCheckArm('.asm_ly', 'x4');
+  Line('  ldr x30, [sp], #16');
+  Line('  b .asm_hc');
+  Line('.asm_l16d:');
   Line('  and x6, x6, #0xf');
   Line('  cbz x6, .asm_same');
   Line('  subs x6, x6, #8');
@@ -46537,6 +47127,7 @@ begin
   Line('  mov x0, #1');
   Line('  cneg x0, x0, hi');
   Line('  ret');
+
   Line('.asm_small:');
   Line('  tbz x6, #3, .asm_lt8');
   Line('  ldr x4, [x0]');
@@ -46575,9 +47166,9 @@ begin
   Line('  cmp w5, w4');
   Line('  b.ne .asm_ret');
   Line('.asm_same:');
-  Line('  cmp x1, x3');
+  Line('  cmp x3, #0');
   Line('  cset x0, ne');
-  Line('  cneg x0, x0, lo');
+  Line('  cneg x0, x0, lt');
   Line('  ret');
   Line('.asm_cmpnext:');
   Line('  rev x4, x8');

@@ -10757,8 +10757,15 @@ a large value is taken off between two: the scans of JSON and UTF-8
 (`PasJsonIndex`, `PasUtf8Valid`, `PasUtf8Feed`; 1.1.119, P269), the
 searches, comparisons and case maps of strings, the hashes and CRCs,
 JSON's escape finder and the rotation of a whole value (1.1.120, P270).
-The runtime's own copies and clears (`Move`, `FillChar`, a large block
-made ready) still run to their end.
+The runtime's own long work goes 256 KiB a piece too: copies (`Move`,
+the growth of a string or an array, `Copy`, concatenation), clears
+(`FillChar`, a zero value or a frame of more than 256 KiB, a large block
+whose pages held something before), the comparisons of strings (`=`,
+`<` and the others) and the hashes `XxHash3`, `XxHash64` and `XxHash32`.
+Between two pieces the routine stops when it has been asked to, keeping
+every register on its stack as Go's asynchronous preemption does; a
+large block is invisible to the collector until it is clear (1.1.121,
+P271).
 
 A routine that waits, on a channel, a mutex, a condition, `Sleep`, a
 socket or standard input, parks: its registers and stack pointer are

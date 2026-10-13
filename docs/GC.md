@@ -184,7 +184,14 @@ conservatively, word by word, and does not move what it finds that way.
   (sysmon), every park, every system call. A routine holding a runtime
   lock is not preempted (G+184, 1.0.51). Promoted variables live in
   registers only inside regions without calls, and the preemption stubs
-  spill them home.
+  spill them home. Since P271 (1.1.121) a long copy, clear, comparison
+  or hash of the runtime stops too, between two pieces of 256 KiB, in
+  rt_yieldpoint: every register goes on the routine's stack, as Go's
+  asyncPreempt saves them, and the collector reads that stack word by
+  word up to the caller's frame. A large block whose pages held
+  something is cleared there a piece at a time, with its type 0 until it
+  is clear (PasHeapLargeTyped), as Go's mallocgcLarge leaves largeType
+  nil: no cycle reads what the pages held.
 - The allocation sites are few and known: `GetMem`, `New`, constructors,
   `MakeChan`, a function returning a record (a heap copy per return,
   P80), and the string and dynamic-array routines (`rt_concat`,
