@@ -245,6 +245,10 @@ GOLDEN_A64 += inlinevar
 # GetFileAsString, /proc, a pipe a routine writes.
 GOLDEN += syswhole
 GOLDEN_A64 += syswhole
+# P277: every descriptor paslib opens closes on exec: the flag in
+# /proc/self/fdinfo, and a child another routine runs has none of them.
+GOLDEN += cloexec
+GOLDEN_A64 += cloexec
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a

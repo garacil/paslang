@@ -10052,7 +10052,11 @@ a directory that cannot be read). A whole file is read into its string
 where it stays, at the size the system gives for it and one byte more,
 so a regular file takes one read and a second that finds the end, as
 Go's `os.ReadFile` does; a pipe or a file of `/proc`, which give no
-size, start at 512 bytes and double. A piece at a time goes through a
+size, start at 512 bytes and double. Every descriptor `paslib` opens,
+and the pipe of `RunCapture`, closes on exec, as Go's do: a program
+`Run` starts from another routine at the same moment does not inherit
+it, and one meant for a child gets there by `dup2` to the number the
+child expects. A piece at a time goes through a
 descriptor, an `Int64` below zero when the open failed: `FileOpen`
 opens to read, `FileCreate` makes or empties and opens to write,
 `FileAppend` opens to add at the end, making the file when it is not
