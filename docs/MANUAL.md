@@ -2471,7 +2471,8 @@ caller's, so a write through that pointer is the caller's too.
 costs no call (1.1.1): the compiler copies its body where it is
 called. Plain means no nested routine, closure, method or
 constructor; parameters, locals and result of an integer, Boolean,
-enumeration, subrange or pointer type; a body of assignments, ifs,
+enumeration, subrange or pointer type, and `var` or `out` parameters
+of a record too (1.1.126); a body of assignments, ifs,
 cases, `while`, `repeat` and `for` loops (a `for x in` only over a
 static array), calls, `Write`, `Inc`, `Dec`, `Halt`, `Sleep`, `Send`,
 `Close`, and `Break` or `Continue` in loops of its own, and nothing
@@ -2488,11 +2489,21 @@ evaluated first in an `if`, a `case`, an assignment's value or place,
 the arguments of a call or of `Write`, and the condition of a `while`
 or a `repeat`. The routine's parameters become hidden variables of
 the caller assigned from the arguments in order (a `var` parameter is
-the place given; a value parameter the routine never changes, given a
-constant or a variable of the caller's own, is that itself), its
+the place given, its fields the fields of the caller's record; a value
+parameter the routine never changes, given a constant or a variable of
+the caller's own, is that itself), its
 locals hidden variables that start at zero as in the routine, `Result`
 the variable the assignment takes; a stop inside reports the routine's
-own line, and `DumpLocals` in a routine keeps it a routine. The
+own line, and `DumpLocals` in a routine keeps it a routine. A call
+stays a call where the place given for a `var` parameter is found
+through a variable another `var` parameter is given, such as
+`Bump(b[j], j)`: the routine may change `j` before it writes the place,
+and the call reached the place by the address it took first. A
+function with no locals whose body is `Result :=` one expression that
+makes no call goes in as that expression wherever it is used (1.1.112),
+in a condition or an operand as well, each argument standing for its
+parameter when it is a constant or cannot fail, and a `var` parameter
+given a variable being that variable (1.1.126). The
 output of a program is the same at every level: `testdata/inline1`
 runs under `make check` both ways. `-inline-trace` says on the error
 output why a routine called in one of those places stays a call; a

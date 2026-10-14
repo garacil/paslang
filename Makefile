@@ -236,6 +236,10 @@ GOLDEN_A64 += condver
 # directory, ReadPrefix and RunCapture, the bytes compared.
 GOLDEN += readwhole
 GOLDEN_A64 += readwhole
+# P275: a var or out parameter of a record goes in place; a place found
+# through a variable another var parameter is given stays a call.
+GOLDEN += inlinevar
+GOLDEN_A64 += inlinevar
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -668,6 +672,16 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  grep -q "call p_$$f$$" $(BUILDDIR)/inline1.s || { echo "inline1.s does not call $$f, which should stay a call"; exit 1; }; \
 	done; \
 	grep -q "call p_sq$$" $(BUILDDIR)/inline0.s || { echo "inline0.s (-inline 0) does not call Sq"; exit 1; }; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/inlinevar0 testdata/inlinevar.paslang; \
+	$(BUILDDIR)/inlinevar0 > $(BUILDDIR)/inlinevar0.got; \
+	diff -u testdata/inlinevar.out $(BUILDDIR)/inlinevar0.got; \
+	: a var or out parameter of a record goes in place P275, and a place found through a variable another var parameter is given stays a call; \
+	for f in step sum wipe tag shift inner; do \
+	  if grep -q "call p_$$f$$" $(BUILDDIR)/inlinevar.s; then echo "inlinevar.s still calls $$f, which should be in place"; exit 1; fi; \
+	done; \
+	for f in bump bumppos repoint; do \
+	  grep -q "call p_$$f$$" $(BUILDDIR)/inlinevar.s || { echo "inlinevar.s does not call $$f, which should stay a call"; exit 1; }; \
+	done; \
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/trygetshare0 testdata/trygetshare.paslang; \
 	$(BUILDDIR)/trygetshare0 > $(BUILDDIR)/trygetshare0.got; \
 	diff -u testdata/trygetshare.out $(BUILDDIR)/trygetshare0.got; \

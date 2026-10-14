@@ -49,6 +49,7 @@ type
     FMapTo: TExprArray;     { ... and what stands for each in the copy }
     function SameId(const A, B: string): Boolean;
     function Scalar(T: LongInt): Boolean;
+    function RecordTyp(T: LongInt): Boolean;
     procedure MapName(const N: string; E: PExpr);
     function Mapped(const N: string; out E: PExpr): Boolean;
     function CloneE(E: PExpr): PExpr;
@@ -75,6 +76,8 @@ type
     function ForCounter(S: PStmt; const N: string): Boolean;
     function Dumps(S: PStmt): Boolean;
     function RootName(E: PExpr): string;
+    procedure PlaceDeps(E: PExpr; var Deps: TStrArray);
+    function AddrOwn(E: PExpr; const Pr: TProc): Boolean;
     function AddrOf(E: PExpr; const N: string): Boolean;
     function WritesName(S: PStmt; const N: string): Boolean;
     function UnrollAt(S: PStmt): PStmt;
@@ -479,6 +482,11 @@ begin
     (k = tykSubrange) or (k = tykPointer);
 end;
 
+function TOpt.RecordTyp(T: LongInt): Boolean;
+begin
+  Result := (T >= 0) and (T <= High(FProg^.Types)) and (FProg^.Types[T].Kind = tykRecord);
+end;
+
 procedure TOpt.MapName(const N: string; E: PExpr);
 var
   k: SizeInt;
@@ -720,8 +728,13 @@ begin
       why := 'without a body'
     else if pr.IsFunc and (not Scalar(pr.RetTyp)) then
       why := 'its result is not a scalar';
+    { A var or out parameter of a record is the place the caller gives:
+      InlineAt makes that place stand for the name (PlaceOK), so its
+      fields read and write the caller's record, as through the address
+      the call passes (P275). By value it would need a copy of its own. }
     for i := 0 to High(pr.Params) do
-      if (why = '') and (not Scalar(pr.Params[i].Typ)) then
+      if (why = '') and (not Scalar(pr.Params[i].Typ)) and
+        not (pr.Params[i].ByRef and RecordTyp(pr.Params[i].Typ)) then
         why := 'parameter ' + pr.Params[i].Name + ' is not a scalar';
     for i := 0 to High(pr.Locals) do
       if (why = '') and (not Scalar(pr.Locals[i].Typ)) then
@@ -915,13 +928,40 @@ begin
   case E^.Kind of
     ekInt, ekNil, ekStr, ekReal, ekVar:
       Result := True;
-    ekField, ekDeref, ekUn:
+    ekField, ekDeref, ekUn, ekAddr:
       Result := Pure(E^.L);
     ekIndex, ekBin:
       Result := Pure(E^.L) and Pure(E^.R);
   else
     Result := False;
   end;
+end;
+
+{ Whether E takes the address of a value parameter of Pr, or of a part
+  of one: that address is the callee's own copy, which the expression
+  put in place would not have (P275). }
+function TOpt.AddrOwn(E: PExpr; const Pr: TProc): Boolean;
+var
+  i: SizeInt;
+  r: string;
+begin
+  Result := False;
+  if E = nil then
+    Exit;
+  if E^.Kind = ekAddr then
+  begin
+    r := RootName(E^.L);
+    for i := 0 to High(Pr.Params) do
+      if (not Pr.Params[i].ByRef) and SameId(Pr.Params[i].Name, r) then
+      begin
+        Result := True;
+        Exit;
+      end;
+  end;
+  Result := AddrOwn(E^.L, Pr) or AddrOwn(E^.R, Pr);
+  for i := 0 to High(E^.Args) do
+    if not Result then
+      Result := AddrOwn(E^.Args[i], Pr);
 end;
 
 { An expression evaluated ahead of a call put in place, whose value
@@ -1167,6 +1207,60 @@ begin
   end;
 end;
 
+{ The caller's variables the address of a place given for a var
+  parameter is read from (P275), the place PlaceOK took: an index, the
+  pointer of a dereference, the variable that holds a dynamic array or
+  an object. A record or a static array a variable is adds nothing:
+  its address never changes. }
+procedure TOpt.PlaceDeps(E: PExpr; var Deps: TStrArray);
+var
+  b: PExpr;
+  n: SizeInt;
+  dep: string;
+begin
+  if E = nil then
+    Exit;
+  dep := '';
+  case E^.Kind of
+    ekField:
+      begin
+        b := E^.L;
+        if b = nil then
+          Exit;
+        if FProg^.Types[b^.Typ].Kind = tykRecord then
+          PlaceDeps(b, Deps)
+        else if b^.Kind = ekVar then
+          dep := b^.Name;
+      end;
+    ekIndex:
+      begin
+        b := E^.L;
+        if (E^.R <> nil) and (E^.R^.Kind = ekVar) then
+        begin
+          n := Length(Deps);
+          SetLength(Deps, n + 1);
+          Deps[n] := ToLower(E^.R^.Name);
+        end;
+        if b = nil then
+          Exit;
+        if (FProg^.Types[b^.Typ].Kind = tykArray) and
+          (FProg^.Types[b^.Typ].Hi >= FProg^.Types[b^.Typ].Lo) then
+          PlaceDeps(b, Deps)
+        else if b^.Kind = ekVar then
+          dep := b^.Name;
+      end;
+    ekDeref:
+      if (E^.L <> nil) and (E^.L^.Kind = ekVar) then
+        dep := E^.L^.Name;
+  end;
+  if dep <> '' then
+  begin
+    n := Length(Deps);
+    SetLength(Deps, n + 1);
+    Deps[n] := ToLower(dep);
+  end;
+end;
+
 function TOpt.AddrOf(E: PExpr; const N: string): Boolean;
 var
   i: SizeInt;
@@ -1278,7 +1372,8 @@ var
   i, k: SizeInt;
   blk, st: PStmt;
   hv, arg, res: PExpr;
-  refs: TStrArray;
+  refs, deps: TStrArray;
+  d, m: SizeInt;
 begin
   Result := nil;
   if S = nil then
@@ -1319,11 +1414,6 @@ begin
       if (arg^.Kind <> ekVar) and ForCounter(pr.Body, pr.Params[i].Name) then
         Exit;
     end;
-  Inc(FN);
-  FMapFrom := nil;
-  FMapTo := nil;
-  blk := NewStmt(skBlock);
-  blk^.Line := S^.Line;
   { the roots of the places given for var parameters: a value
     parameter given the same variable keeps its own copy }
   refs := nil;
@@ -1337,6 +1427,38 @@ begin
       SetLength(refs, k + 1);
       refs[k] := ToLower(RootName(arg));
     end;
+  { A place whose address is read from a variable another var parameter
+    is given stays a call: the body may change that variable before it
+    writes the place, which the call reached by the address it took
+    first. Go assigns every argument to its parameter once, before the
+    body (noder/reader.go, inlvars by OAS2); a place stands here for the
+    name, its address worked out at each use, and Bump(b[j], j), whose
+    body raises J and then writes P, wrote b[j + 1] (P275). }
+  k := 0;
+  for i := 0 to High(pr.Params) do
+    if pr.Params[i].ByRef then
+    begin
+      arg := args[i];
+      if (arg <> nil) and (arg^.Kind = ekAddr) then
+        arg := arg^.L;
+      deps := nil;
+      PlaceDeps(arg, deps);
+      for d := 0 to High(deps) do
+        for m := 0 to High(refs) do
+          if (m <> k) and (refs[m] = deps[d]) then
+          begin
+            if InlineTrace then
+              WriteLn(ErrOutput, 'inline: ', pr.Name, ' stays a call here: the place given for ',
+                pr.Params[i].Name, ' is found through ', deps[d], ', which another var parameter is given');
+            Exit;
+          end;
+      Inc(k);
+    end;
+  Inc(FN);
+  FMapFrom := nil;
+  FMapTo := nil;
+  blk := NewStmt(skBlock);
+  blk^.Line := S^.Line;
   { the parameters, in order }
   for i := 0 to High(pr.Params) do
   begin
@@ -1571,8 +1693,9 @@ end;
 { ---- A function of one expression goes in as its expression (P266) ----
 
   A function whose body is Result := E alone (or its name := E), with no
-  locals and no var or out parameter, where E makes no call and does
-  not read Result, is the expression itself wherever it is called: in a
+  locals, where E makes no call, does not read Result and takes no
+  address of a value parameter, is the expression itself wherever it is
+  called (a var or out parameter given a variable, P275): in a
   condition, an operand, an argument, the right side of an and or an
   or. The call becomes a copy of E with each parameter replaced by its
   argument, typed as the call was, evaluated where the call was. It
@@ -1632,16 +1755,12 @@ function TOpt.ExprBody(Idx: LongInt; out B: PExpr): Boolean;
 var
   pr: TProc;
   st: PStmt;
-  i: SizeInt;
 begin
   Result := False;
   B := nil;
   pr := FProcs[Idx];
   if (not pr.IsFunc) or (Length(pr.Locals) > 0) then
     Exit;
-  for i := 0 to High(pr.Params) do
-    if pr.Params[i].ByRef then
-      Exit;
   st := pr.Body;
   if (st <> nil) and (st^.Kind = skBlock) and (Length(st^.Stmts) = 1) then
     st := st^.Stmts[0];
@@ -1652,6 +1771,8 @@ begin
   if (st^.E = nil) or (st^.E^.Typ <> pr.RetTyp) or (not Pure(st^.E)) then
     Exit;
   if (NameUses(st^.E, 'Result') > 0) or (NameUses(st^.E, pr.Name) > 0) then
+    Exit;
+  if AddrOwn(st^.E, pr) then
     Exit;
   B := st^.E;
   Result := True;
@@ -1686,6 +1807,19 @@ begin
   for i := 0 to High(pr.Params) do
   begin
     a := E^.Args[i];
+    { A var or out parameter given a variable: the variable stands in
+      (P275), and E, which writes nothing, reads it where the call
+      would have read through its address. A place made of an index or
+      a dereference stays a call: the call worked out its address,
+      which could fail, even where E does not read it. }
+    if pr.Params[i].ByRef then
+    begin
+      if (a <> nil) and (a^.Kind = ekAddr) then
+        a := a^.L;
+      if (a = nil) or (a^.Kind <> ekVar) or (a^.Typ <> pr.Params[i].Typ) then
+        Exit;
+      Continue;
+    end;
     if (a = nil) or (a^.Kind = ekAddr) or (not SafeArg(a)) then
       Exit;
     if (a^.Kind <> ekInt) and (a^.Kind <> ekNil) and (a^.Typ <> pr.Params[i].Typ) then
@@ -1699,7 +1833,12 @@ begin
   FMapFrom := nil;
   FMapTo := nil;
   for i := 0 to High(pr.Params) do
-    MapName(pr.Params[i].Name, E^.Args[i]);
+  begin
+    a := E^.Args[i];
+    if pr.Params[i].ByRef and (a^.Kind = ekAddr) then
+      a := a^.L;
+    MapName(pr.Params[i].Name, a);
+  end;
   nw := CopyE(b);
   FMapFrom := saveFrom;
   FMapTo := saveTo;
