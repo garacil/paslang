@@ -2673,6 +2673,7 @@ kind of each value and the field of that kind holds it.
 | `vtChar` | a `Char`, a one-character literal | `VChar` |
 | `vtExtended` | a `Double`, a `Single` (widened) | `VExtended: Double` |
 | `vtQuad` | a `Quad` | `VQuad` |
+| `vtJson` | a `json` (1.1.130) | `VJson: json` |
 | `vtCurrency` | a `Currency` | `VCurrency: Currency` |
 | `vtAnsiString` | a string | `VAnsiString: string` |
 | `vtPChar` | a `PChar` | `VPChar` |
@@ -5729,6 +5730,105 @@ the routine can be stopped between two and at its loop heads, so a long
 parse holds no processor from the others (§19). `testdata/jsonshare`
 reads one document from 64 routines, parses failing texts in 32 and
 large ones in 8 while a ninth answers every millisecond.
+
+### With the rest of the language
+
+A `json` is one word, the address of a value in a document that never
+changes, so whatever holds a value holds that word and nothing else: a
+channel and a `select`, a `map` or a `tree` value, a field of a record
+or a class, an element of an array, a generic's parameter, what a
+closure keeps, an argument of a routine `pas` starts and a unit's
+interface (its `.pi` names the type, kind 26). A `json` in a
+`map[json]`, a `tree[json]` or a `heap of json` is refused with a
+message: values have no order, and the text of the canonical form is
+the key. `case j.Kind of` takes the kinds; a helper of the program's
+own, `type helper(TJsonHelper) for json`, adds members and keeps the
+core's, and one a used unit declares is in scope where the unit is
+(1.1.130). An `array of const` takes a `json` as `vtJson` (20, its word
+in `VJson`, paslang's as `vtQuad` is) and `Format`'s `%s` writes it as
+`Write` does, with its width and precision; `Write(j:w)` pads it. A
+`safe` routine walks one: it is no pointer to the program. The
+debugger's `print` writes a `json` as `Write` does, the first 200 bytes
+of a long one and its length (§19). `testdata/jsonlang`,
+`testdata/units/jsonu` and `testdata/jsondbg` hold all of it on both
+machines.
+
+`examples/jsonlang.paslang`:
+
+```pascal
+{ JSON with the rest of the language: a json is one word, so a channel,
+  a map, a record, a closure and a routine pas starts carry it and
+  nothing else; a helper of the program's own adds to TJsonHelper, an
+  array of const takes it and Format's %s writes it. }
+program jsonlang;
+
+uses
+  sysutils;
+
+type
+  TOrder = record
+    Id: Integer;
+    Lines: json;
+  end;
+
+  TShop = type helper(TJsonHelper) for json
+    function Cents: Integer;
+  end;
+
+function TShop.Cents: Integer;
+var
+  line: json;
+begin
+  Result := 0;
+  for line in Self do
+    Result := Result + line['price'].AsInteger * line['qty'].AsInteger;
+end;
+
+procedure Total(Order: TOrder; Into: chan of string);
+begin
+  Send(Into, Format('order %d: %d lines, %d cents', [Order.Id, Length(Order.Lines),
+    Order.Lines.Cents]));
+end;
+
+var
+  doc: json;
+  orders: map[Integer] of TOrder;
+  o: TOrder;
+  done: chan of string;
+  named: function(const Key: string): json;
+  i: Integer;
+
+begin
+  doc := JsonParse('{"shop":"corner","orders":[' +
+    '{"id":7,"lines":[{"item":"tea","price":250,"qty":2}]},' +
+    '{"id":9,"lines":[{"item":"jam","price":420,"qty":1},{"item":"bread","price":180,"qty":3}]}]}');
+  New(orders);
+  for i := 0 to Length(doc['orders']) - 1 do
+  begin
+    o.Id := doc['orders'][i]['id'].AsInteger;
+    o.Lines := doc['orders'][i]['lines'];
+    orders[o.Id] := o;
+  end;
+  done := MakeChan();
+  pas Total(orders[7], done);
+  WriteLn(Recv(done));
+  pas Total(orders[9], done);
+  WriteLn(Recv(done));
+  named := function(const Key: string): json begin Result := doc[Key]; end;
+  WriteLn(Format('%s has %d orders; the first line: %s',
+    [named('shop'), Length(named('orders')), orders[9].Lines[0]]));
+  WriteLn('[', named('shop'):10, ']');
+end.
+```
+
+prints
+
+```
+order 7: 1 lines, 500 cents
+order 9: 2 lines, 960 cents
+"corner" has 2 orders; the first line: {"item":"jam","price":420,"qty":1}
+[  "corner"]
+```
 
 ### Speed
 
@@ -12023,7 +12123,7 @@ its place:
   `PasJsonIndex` … `PasJsonImage` routines, and pasobject's `TObject`
   with `PasClassName` … `PasUncaught`, and the compiler's `TClass`
   (`class of TObject`), `TVarRec` and its kinds `vtInteger` …
-  `vtQuad`. A core unit declares its
+  `vtJson`. A core unit declares its
   own exports; nothing else may, and a unit's implementation types are
   its own (an importer cannot name them, and they are not reserved).
 

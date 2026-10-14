@@ -249,6 +249,11 @@ GOLDEN_A64 += syswhole
 # /proc/self/fdinfo, and a child another routine runs has none of them.
 GOLDEN += cloexec
 GOLDEN_A64 += cloexec
+# P204: json with the rest of the language: channels, select, map, tree,
+# fields, arrays, generics, closures, pas, helpers, case, array of const,
+# Format, Write widths, safe.
+GOLDEN += jsonlang
+GOLDEN_A64 += jsonlang
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -681,6 +686,9 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  grep -q "call p_$$f$$" $(BUILDDIR)/inline1.s || { echo "inline1.s does not call $$f, which should stay a call"; exit 1; }; \
 	done; \
 	grep -q "call p_sq$$" $(BUILDDIR)/inline0.s || { echo "inline0.s (-inline 0) does not call Sq"; exit 1; }; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/jsonlang0 testdata/jsonlang.paslang; \
+	$(BUILDDIR)/jsonlang0 > $(BUILDDIR)/jsonlang0.got; \
+	diff -u testdata/jsonlang.out $(BUILDDIR)/jsonlang0.got; \
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/inlinevar0 testdata/inlinevar.paslang; \
 	$(BUILDDIR)/inlinevar0 > $(BUILDDIR)/inlinevar0.got; \
 	diff -u testdata/inlinevar.out $(BUILDDIR)/inlinevar0.got; \
@@ -859,6 +867,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  'tryreal:TryGet of a json takes a name, a string, or a place, an Integer at 10:25' \
 	  'mapkey:a json is no map key' \
 	  'treej:a json is no tree key' \
+	  'heapj:a json is no heap element: json values have no order, = and <> only; a heap of its text, JsonEncode(j, JsonCanonical), has one at 3:18' \
 	  'jsonvar:json is a reserved word, not a name at 3:3' \
 	  'corename:JsonParse is a reserved word, not a name at 3:3'; do \
 	  n=$${f%%:*}; w=$${f#*:}; \
@@ -1050,6 +1059,17 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  cat $(BUILDDIR)/$$t.prog >> $(BUILDDIR)/$$t.got; \
 	  diff -u testdata/$$t.out $(BUILDDIR)/$$t.got; \
 	done; \
+	: a json in the console, its text, from --debug-mode and attached P204; \
+	$(OUTDIR)/paslangc -debug -Fu $(BUILDDIR) -o $(BUILDDIR)/jsondbg testdata/jsondbg.paslang; \
+	timeout 60 $(BUILDDIR)/jsondbg --debug-mode < testdata/jsondbg.in > $(BUILDDIR)/jsondbg.got 2>&1; \
+	diff -u testdata/jsondbg.out $(BUILDDIR)/jsondbg.got; \
+	s=@paslang-jsondbg-$$$$; \
+	timeout 60 $(BUILDDIR)/jsondbg --debug-listen $$s > $(BUILDDIR)/jsondbgattach.prog 2>&1 & p=$$!; \
+	timeout 60 $(BUILDDIR)/jsondbg --debug-attach $$s < testdata/jsondbg.in > $(BUILDDIR)/jsondbgattach.got 2>&1; \
+	wait $$p; \
+	echo '--- the program' >> $(BUILDDIR)/jsondbgattach.got; \
+	cat $(BUILDDIR)/jsondbgattach.prog >> $(BUILDDIR)/jsondbgattach.got; \
+	diff -u testdata/jsondbgattach.out $(BUILDDIR)/jsondbgattach.got; \
 	echo ok debug-console; \
 	echo "==== tcppark ===="; \
 	$(OUTDIR)/paslangc -c src/lib/pasnet.paslang; \
@@ -1137,7 +1157,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'pas passes values, and an array of const lives for the call it is given to at 7:16' $(BUILDDIR)/aconstbad_paslist.err; \
 	grep -q 'an array of const is given to a routine, not a var or out parameter at 3:34' $(BUILDDIR)/aconstbad_varparam.err; \
 	grep -q 'array of const is the type of a parameter at 4:15' $(BUILDDIR)/aconstbad_vartype.err; \
-	grep -q 'an array of const takes ordinals, reals, strings, pointers, objects, classes and interfaces, not TR at 13:9' $(BUILDDIR)/aconstbad_recval.err; \
+	grep -q 'an array of const takes ordinals, reals, strings, pointers, objects, classes, interfaces and json, not TR at 13:9' $(BUILDDIR)/aconstbad_recval.err; \
 	grep -q 'an array of const takes values, not a range at 7:12' $(BUILDDIR)/aconstbad_range.err; \
 	echo ok aconstbad; \
 	echo "==== default parameter rejects (P125) ===="; \
@@ -1871,11 +1891,14 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	test $$rc -eq 1; \
 	diff -u testdata/fatal/expected.out $(BUILDDIR)/fatal_cpstrview-arm.got; \
 	grep -q 'paslang: pointer outside its object at line 21' $(BUILDDIR)/fatal_cpstrview-arm.err; \
-	for t in ptrarith ptrtyped memview ptrsafe gcbasic pchar narrowmem cpwalk ptrreach strview strshrink; do \
+	for t in ptrarith ptrtyped memview ptrsafe gcbasic pchar narrowmem cpwalk ptrreach strview strshrink jsonlang; do \
 	  $(OUTDIR)/paslangc -checkptr -o $(BUILDDIR)/cpok_$$t testdata/$$t.paslang; \
 	  $(BUILDDIR)/cpok_$$t > $(BUILDDIR)/cpok_$$t.got; \
 	  diff -u testdata/$$t.out $(BUILDDIR)/cpok_$$t.got; \
 	done; \
+	$(OUTDIR)/paslangc -checkptr -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/cpok_jsonlang-arm testdata/jsonlang.paslang; \
+	timeout 120 $(QEMU_A64) $(BUILDDIR)/cpok_jsonlang-arm > $(BUILDDIR)/cpok_jsonlang-arm.got; \
+	diff -u testdata/jsonlang.out $(BUILDDIR)/cpok_jsonlang-arm.got; \
 	$(OUTDIR)/paslangc -checkptr -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/cpok_cpwalk-arm testdata/cpwalk.paslang; \
 	timeout 60 $(QEMU_A64) $(BUILDDIR)/cpok_cpwalk-arm > $(BUILDDIR)/cpok_cpwalk-arm.got; \
 	diff -u testdata/cpwalk.out $(BUILDDIR)/cpok_cpwalk-arm.got; \
@@ -2177,6 +2200,18 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/quadmore-arm testdata/quadmore.paslang; \
 	timeout 60 $(QEMU_A64) $(BUILDDIR)/quadmore-arm > $(BUILDDIR)/quadmore-arm.got; \
 	diff -u testdata/quadmore.out $(BUILDDIR)/quadmore-arm.got; \
+	: json through a unit P204: a variable, routines, a record, a class, a generic instance and a helper of the unit that hides TJsonHelper; \
+	$(OUTDIR)/paslangc testdata/units/jsonu.paslang; \
+	grep -q '^TYPE json [0-9]* 26 8 ' $(BUILDDIR)/jsonu.pi; \
+	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/jsonuse testdata/units/jsonuse.paslang; \
+	$(BUILDDIR)/jsonuse > $(BUILDDIR)/jsonuse.got; \
+	diff -u testdata/units/jsonuse.out $(BUILDDIR)/jsonuse.got; \
+	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=3 PASLANG_GCPOISON=1 $(BUILDDIR)/jsonuse > $(BUILDDIR)/jsonuse.got; \
+	diff -u testdata/units/jsonuse.out $(BUILDDIR)/jsonuse.got; \
+	$(OUTDIR)/paslangc -target arm64 testdata/units/jsonu.paslang; \
+	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/jsonuse-arm testdata/units/jsonuse.paslang; \
+	timeout 60 $(QEMU_A64) $(BUILDDIR)/jsonuse-arm > $(BUILDDIR)/jsonuse-arm.got; \
+	diff -u testdata/units/jsonuse.out $(BUILDDIR)/jsonuse-arm.got; \
 	$(OUTDIR)/paslangc testdata/units/anonrec.paslang; \
 	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/anonrecmain testdata/anonrec.paslang; \
 	PASLANG_GCVERIFY=1 $(BUILDDIR)/anonrecmain > $(BUILDDIR)/anonrec.got; \
@@ -2903,7 +2938,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	test "$$ticks" -lt 20; \
 	echo "ok idlecpu ($$ticks user ticks after one second)"; \
 	echo "==== examples ===="; \
-	for t in hello values control routines varargs records scopedtypes classes registry helpers convert report money systemerrors boundedfiles filemetadata directories paths environments processes temporaryresources systempaths textbuilding textencoding textbuffers valuehelpers identifiers generics errors excobjects bank concurrent blockedio fanin maps sync wordcount strings maths narrow pointers single quad bits rotations carry bigrot bitfields wide atomics views vectors machine assembly hashes closures slices properties cleanup pipeline kvstore sorting timeout digest bitmap trees dates jsonread jsonwrite; do \
+	for t in hello values control routines varargs records scopedtypes classes registry helpers convert report money systemerrors boundedfiles filemetadata directories paths environments processes temporaryresources systempaths textbuilding textencoding textbuffers valuehelpers identifiers generics errors excobjects bank concurrent blockedio fanin maps sync wordcount strings maths narrow pointers single quad bits rotations carry bigrot bitfields wide atomics views vectors machine assembly hashes closures slices properties cleanup pipeline kvstore sorting timeout digest bitmap trees dates jsonread jsonwrite jsonlang; do \
 	  $(OUTDIR)/paslangc -o $(BUILDDIR)/ex_$$t examples/$$t.paslang; \
 	  $(BUILDDIR)/ex_$$t > $(BUILDDIR)/ex_$$t.got; \
 	  diff -u examples/$$t.out $(BUILDDIR)/ex_$$t.got; \
@@ -3266,7 +3301,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	done; \
 	echo ok deadlock-arm; \
 	echo "==== examples arm64 ===="; \
-	for t in hello values control routines varargs records scopedtypes classes registry helpers convert report money systemerrors boundedfiles filemetadata directories paths environments processes temporaryresources systempaths textbuilding textencoding textbuffers valuehelpers identifiers generics errors excobjects bank concurrent blockedio fanin maps sync wordcount strings maths narrow pointers single quad bits rotations carry bigrot bitfields wide atomics views vectors machine assembly hashes closures slices properties cleanup pipeline kvstore sorting timeout digest bitmap trees dates jsonread jsonwrite; do \
+	for t in hello values control routines varargs records scopedtypes classes registry helpers convert report money systemerrors boundedfiles filemetadata directories paths environments processes temporaryresources systempaths textbuilding textencoding textbuffers valuehelpers identifiers generics errors excobjects bank concurrent blockedio fanin maps sync wordcount strings maths narrow pointers single quad bits rotations carry bigrot bitfields wide atomics views vectors machine assembly hashes closures slices properties cleanup pipeline kvstore sorting timeout digest bitmap trees dates jsonread jsonwrite jsonlang; do \
 	  $(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/ex_$$t-arm examples/$$t.paslang; \
 	  timeout 60 $(QEMU_A64) $(BUILDDIR)/ex_$$t-arm > $(BUILDDIR)/ex_$$t-arm.got; \
 	  diff -u examples/$$t.out $(BUILDDIR)/ex_$$t-arm.got; \
@@ -3518,6 +3553,9 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	echo '--- the program' >> $(BUILDDIR)/debug2attach-arm.got; \
 	cat $(BUILDDIR)/debug2attach-arm.prog >> $(BUILDDIR)/debug2attach-arm.got; \
 	diff -u testdata/debug2attach.out $(BUILDDIR)/debug2attach-arm.got; \
+	$(OUTDIR)/paslangc -target arm64 -debug -Fu $(BUILDDIR)/a64 -o $(BUILDDIR)/jsondbg-arm testdata/jsondbg.paslang; \
+	timeout 120 $(QEMU_A64) $(BUILDDIR)/jsondbg-arm --debug-mode < testdata/jsondbg.in > $(BUILDDIR)/jsondbg-arm.got 2>&1; \
+	diff -u testdata/jsondbg.out $(BUILDDIR)/jsondbg-arm.got; \
 	echo ok debug-console-arm; \
 	echo "==== network servers arm64 ===="; \
 	$(OUTDIR)/paslangc -target arm64 -c src/lib/pasnet.paslang; \
