@@ -262,6 +262,10 @@ GOLDEN_A64 += jsonbind1 jsonbind2 jsonbind3
 # through a register that keeps its address, on a stack that grows.
 GOLDEN += varparts
 GOLDEN_A64 += varparts
+# P283: a while and a repeat that count run in runs of 1024 passes with
+# one preemption test a run, as a for does.
+GOLDEN += whilerun
+GOLDEN_A64 += whilerun
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -2145,7 +2149,15 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  grep -qE '[0-9]\(%r(bx|9|1[0-5])\)' $(BUILDDIR)/varparts-$$f.s || { echo "varparts.s: $$f reads no field from a kept register"; exit 1; }; \
 	  if grep -qE '[0-9]\(%r(si|di)\)' $(BUILDDIR)/varparts-$$f.s; then echo "varparts.s: $$f reads a field through a pool register"; exit 1; fi; \
 	done; \
-	echo ok varparts; \
+	echo ok varparts-asm; \
+	: a while or a repeat that counts runs in runs, P283: Spin and Spin2 work out a run end with a cmov, Spin3 and Others, which do not count, test at every pass; \
+	for f in spin spin2; do \
+	  awk "/^p_$$f:/,/ret\$$/" $(BUILDDIR)/whilerun.s | grep -q 'cmovgq' || { echo "whilerun.s: $$f does not run in runs"; exit 1; }; \
+	done; \
+	for f in spin3 others; do \
+	  if awk "/^p_$$f:/,/ret\$$/" $(BUILDDIR)/whilerun.s | grep -q 'cmov'; then echo "whilerun.s: $$f runs in runs"; exit 1; fi; \
+	done; \
+	echo ok whilerun-asm; \
 	: a function of one expression goes in as its expression, P266: the output of every routine a call, and Branchy one compare and one jump with no call of Less; \
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/exprinline0 testdata/exprinline.paslang; \
 	$(BUILDDIR)/exprinline0 > $(BUILDDIR)/exprinline0.got; \
@@ -3125,6 +3137,13 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	  if grep -qE '\[x(9|1[0-7])(, #[0-9]+)?\]' $(BUILDDIR)/varparts-$$f-arm.s; then echo "varparts-arm.s: $$f reads a field through a pool register"; exit 1; fi; \
 	done; \
 	echo ok varparts-arm-asm; \
+	for f in spin spin2; do \
+	  awk "/^p_$$f:/,/ret\$$/" $(BUILDDIR)/whilerun-arm.s | grep -q 'csel x26' || { echo "whilerun-arm.s: $$f does not run in runs"; exit 1; }; \
+	done; \
+	for f in spin3 others; do \
+	  if awk "/^p_$$f:/,/ret\$$/" $(BUILDDIR)/whilerun-arm.s | grep -q 'csel'; then echo "whilerun-arm.s: $$f runs in runs"; exit 1; fi; \
+	done; \
+	echo ok whilerun-arm-asm; \
 	$(OUTDIR)/paslangc -target arm64 -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/exprinline0-arm testdata/exprinline.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/exprinline0-arm > $(BUILDDIR)/exprinline0-arm.got; \
 	diff -u testdata/exprinline.out $(BUILDDIR)/exprinline0-arm.got; \

@@ -634,6 +634,14 @@ type
     function PureIntE(E: PExpr): Boolean;
     function PureIntS(S: PStmt): Boolean;
     function HasInnerFor(S: PStmt): Boolean;
+    function HasContinue(S: PStmt): Boolean;
+    function RunLimit(E: PExpr; Body: PStmt): Boolean;
+    function RunStep(St: PStmt; const N: string; out C: Int64): Boolean;
+    function CountedLoop(S: PStmt; out Leaf: PExpr; out Up: Boolean): Boolean;
+    procedure RunRest(E, Leaf: PExpr; var Rest: TExprArray);
+    function EmitLoopRun(S: PStmt): Boolean;
+    procedure RunBool(const Target: string; WhenTrue: Boolean);
+    procedure RunEnd(E: PExpr; const V: string; Up: Boolean);
     function WritesVar(S: PStmt; const N: string): Boolean;
     procedure ForRunTail(S: PStmt; const Vs: TSym; const Top, Brk: string);
     function NamesVar(E: PExpr; const N: string): Boolean;
@@ -6926,16 +6934,21 @@ begin
   Result := False;
 end;
 
-{ S holds a for without a loop inside, which EmitFor runs in runs. }
+{ S holds a for without a loop inside, which EmitFor runs in runs, or
+  a while or a repeat that counts, which EmitLoopRun runs so (P283). }
 function TEmitter.HasInnerFor(S: PStmt): Boolean;
 var
   i: SizeInt;
+  leaf: PExpr;
+  up: Boolean;
 begin
   Result := False;
   if S = nil then
     Exit;
   Result := True;
   if (S^.Kind = skFor) and (not HasLoop(S^.Body)) then
+    Exit;
+  if CountedLoop(S, leaf, up) then
     Exit;
   if HasInnerFor(S^.ThenSt) or HasInnerFor(S^.ElseSt) or HasInnerFor(S^.Body) then
     Exit;
@@ -6946,6 +6959,355 @@ begin
     if HasInnerFor(S^.Arms[i].Body) then
       Exit;
   Result := False;
+end;
+
+{ S holds a continue: in a loop without a loop inside, the loop's own. }
+function TEmitter.HasContinue(S: PStmt): Boolean;
+var
+  i: SizeInt;
+begin
+  Result := False;
+  if S = nil then
+    Exit;
+  Result := True;
+  if S^.Kind = skContinue then
+    Exit;
+  if HasContinue(S^.ThenSt) or HasContinue(S^.ElseSt) or HasContinue(S^.Body) then
+    Exit;
+  for i := 0 to High(S^.Stmts) do
+    if HasContinue(S^.Stmts[i]) then
+      Exit;
+  for i := 0 to High(S^.Arms) do
+    if HasContinue(S^.Arms[i].Body) then
+      Exit;
+  Result := False;
+end;
+
+{ E is a limit no pass of Body changes: constants, and variables a loop
+  could keep in a register that Body does not write, or the length of a
+  string or a slice of this frame that Body does not assign, joined by
+  integer arithmetic. It is read once a run (P283). }
+function TEmitter.RunLimit(E: PExpr; Body: PStmt): Boolean;
+var
+  s: TSym;
+  a: PExpr;
+begin
+  Result := False;
+  if E = nil then
+    Exit;
+  case E^.Kind of
+    ekInt:
+      Result := True;
+    ekVar:
+      Result := TryFindSym(E^.Name, s) and PromoCand(s) and
+        (TKind(s.Typ) <> tykBoolean) and not WritesVar(Body, E^.Name);
+    ekUn:
+      Result := (E^.Un = uoNeg) and RunLimit(E^.L, Body);
+    ekBin:
+      Result := ((E^.Bin = boAdd) or (E^.Bin = boSub) or (E^.Bin = boMul) or
+        (E^.Bin = boAnd) or (E^.Bin = boOr) or (E^.Bin = boXor) or
+        (E^.Bin = boShl) or (E^.Bin = boShr)) and (TKind(E^.Typ) = tykInteger) and
+        RunLimit(E^.L, Body) and RunLimit(E^.R, Body);
+    ekCall:
+      if (E^.Name = 'rt_length') and (Length(E^.Args) = 1) then
+      begin
+        a := E^.Args[0];
+        Result := (a <> nil) and (a^.Kind = ekVar) and TryFindSym(a^.Name, s) and
+          (IsStr(s.Typ) or IsDyn(s.Typ)) and (not s.ByRef) and (s.Up = 0) and
+          (not s.Global) and (not s.Boxed) and (not AddrTakenSym(s)) and
+          not WritesVar(Body, a^.Name);
+      end;
+  end;
+end;
+
+{ St steps the variable N by a constant: N := N + c, N := c + N,
+  N := N - c, Inc(N, c) or Dec(N, c); C is the signed step. }
+function TEmitter.RunStep(St: PStmt; const N: string; out C: Int64): Boolean;
+var
+  e: PExpr;
+begin
+  Result := False;
+  C := 0;
+  if St = nil then
+    Exit;
+  if (St^.Kind = skInc) or (St^.Kind = skDec) then
+  begin
+    if (St^.Dest = nil) or (St^.Dest^.Kind <> ekVar) or not SameSym(St^.Dest^.Name, N) then
+      Exit;
+    if (St^.E = nil) or (St^.E^.Kind <> ekInt) then
+      Exit;
+    C := St^.E^.Num;
+    if St^.Kind = skDec then
+      C := -C;
+    Result := True;
+    Exit;
+  end;
+  if St^.Kind <> skAssign then
+    Exit;
+  if St^.Dest = nil then
+  begin
+    if not SameSym(St^.Name, N) then
+      Exit;
+  end
+  else if (St^.Dest^.Kind <> ekVar) or not SameSym(St^.Dest^.Name, N) then
+    Exit;
+  e := St^.E;
+  if (e = nil) or (e^.Kind <> ekBin) or (e^.L = nil) or (e^.R = nil) then
+    Exit;
+  if (e^.Bin = boAdd) and (e^.L^.Kind = ekVar) and SameSym(e^.L^.Name, N) and
+    (e^.R^.Kind = ekInt) then
+    C := e^.R^.Num
+  else if (e^.Bin = boAdd) and (e^.R^.Kind = ekVar) and SameSym(e^.R^.Name, N) and
+    (e^.L^.Kind = ekInt) then
+    C := e^.L^.Num
+  else if (e^.Bin = boSub) and (e^.L^.Kind = ekVar) and SameSym(e^.L^.Name, N) and
+    (e^.R^.Kind = ekInt) then
+    C := -e^.R^.Num
+  else
+    Exit;
+  Result := True;
+end;
+
+{ A while or a repeat that counts (P283): the test of its condition, or
+  the first test of the and that is a while's condition or of the or
+  that is a repeat's until, compares a 64-bit variable with a limit no
+  pass changes (RunLimit), and the body, with no loop and no continue in
+  it, steps the variable towards the limit once a pass by a constant of
+  1 to 1023, at its top level, where nothing else writes it. Leaf is
+  that test and Up says the variable counts up. }
+function TEmitter.CountedLoop(S: PStmt; out Leaf: PExpr; out Up: Boolean): Boolean;
+var
+  e: PExpr;
+  vs: TSym;
+  i, steps: SizeInt;
+  c: Int64;
+  one: TStmtArray;
+begin
+  Result := False;
+  Leaf := nil;
+  Up := False;
+  if (S = nil) or (S^.E = nil) or (S^.Body = nil) or
+    ((S^.Kind <> skWhile) and (S^.Kind <> skRepeat)) then
+    Exit;
+  if HasLoop(S^.Body) or HasContinue(S^.Body) then
+    Exit;
+  e := S^.E;
+  if S^.Kind = skWhile then
+  begin
+    while (e^.Kind = ekBin) and (e^.Bin = boAnd) and (e^.Typ = TyBoolean) and (e^.L <> nil) do
+      e := e^.L;
+  end
+  else
+    while (e^.Kind = ekBin) and (e^.Bin = boOr) and (e^.Typ = TyBoolean) and (e^.L <> nil) do
+      e := e^.L;
+  if (e^.Kind <> ekBin) or (e^.L = nil) or (e^.R = nil) or (e^.L^.Kind <> ekVar) then
+    Exit;
+  case e^.Bin of
+    boLt, boLe:
+      Up := S^.Kind = skWhile;
+    boGt, boGe:
+      Up := S^.Kind = skRepeat;
+  else
+    Exit;
+  end;
+  if not PlainOrd(e^.L, vs) then
+    Exit;
+  if (vs.Global and (FIsUnit or ExtGlobal(vs.Name))) or AddrTakenSym(vs) then
+    Exit;
+  if NamesVar(e^.R, vs.Name) or not RunLimit(e^.R, S^.Body) then
+    Exit;
+  if S^.Body^.Kind = skBlock then
+    one := S^.Body^.Stmts
+  else
+  begin
+    one := nil;
+    SetLength(one, 1);
+    one[0] := S^.Body;
+  end;
+  steps := 0;
+  for i := 0 to High(one) do
+    if RunStep(one[i], vs.Name, c) then
+    begin
+      if Up and ((c < 1) or (c > 1023)) then
+        Exit;
+      if (not Up) and ((c > -1) or (c < -1023)) then
+        Exit;
+      Inc(steps);
+    end
+    else if WritesVar(one[i], vs.Name) then
+      Exit;
+  if steps <> 1 then
+    Exit;
+  Leaf := e;
+  Result := True;
+end;
+
+{ The tests of S's condition after Leaf, in order: the and's for a
+  while, the or's for a repeat. }
+procedure TEmitter.RunRest(E, Leaf: PExpr; var Rest: TExprArray);
+var
+  k: SizeInt;
+begin
+  if (E = nil) or (E = Leaf) then
+    Exit;
+  RunRest(E^.L, Leaf, Rest);
+  k := Length(Rest);
+  SetLength(Rest, k + 1);
+  Rest[k] := E^.R;
+end;
+
+{ A while or a repeat that counts runs in runs of 1024 passes with one
+  preemption test a run, as a for does (P283, P100): the test at the end
+  of a pass compares the variable with the run's end in FChunkReg, then
+  the rest of the condition; past the run's end the whole condition is
+  tested, then the guard word, and the next run's end is worked out
+  (RunEnd). The first run's end is worked out on the way in, with no
+  preemption test (the next run's head has it): a loop of a few passes
+  pays what it paid before, three instructions and a compare, and each
+  pass after the first saves the guard's compare and branch. }
+function TEmitter.EmitLoopRun(S: PStmt): Boolean;
+var
+  leaf: PExpr;
+  rest: TExprArray;
+  up, wt: Boolean;
+  vs: TSym;
+  a, b, c, head: string;
+  i: SizeInt;
+begin
+  Result := False;
+  if (not FPromoOn) or (FChunkReg = '') then
+    Exit;
+  if not CountedLoop(S, leaf, up) then
+    Exit;
+  vs := FindSym(leaf^.L^.Name);
+  if vs.Reg = '' then
+    Exit;
+  Result := True;
+  a := Lab;
+  b := Lab;
+  c := Lab;
+  head := Lab;
+  PushLoop(b, c);
+  RunEnd(leaf^.R, vs.Reg, up);
+  if S^.Kind = skWhile then
+    JumpCC('', c);
+  AlignLoop;
+  Line(a + ':');
+  EmitStmt(S^.Body);
+  Line(c + ':');
+  EmitLoc(S^.Line);
+  rest := nil;
+  RunRest(S^.E, leaf, rest);
+  if FArm then
+    Line('  cmp ' + vs.Reg + ', ' + FChunkReg)
+  else
+    Line('  cmpq %' + FChunkReg + ', %' + vs.Reg);
+  { the leaf over the run's end: a while goes on while it holds, a
+    repeat while it fails }
+  wt := S^.Kind = skWhile;
+  if Length(rest) = 0 then
+    JumpCC(CondCC(leaf^.Bin, wt), a)
+  else
+  begin
+    JumpCC(CondCC(leaf^.Bin, not wt), head);
+    for i := 0 to High(rest) - 1 do
+      if not CondJmp(rest[i], b, not wt) then
+      begin
+        EmitExpr(rest[i]);
+        RunBool(b, not wt);
+      end;
+    if not CondJmp(rest[High(rest)], a, wt) then
+    begin
+      EmitExpr(rest[High(rest)]);
+      RunBool(a, wt);
+    end;
+    JumpCC('', b);
+  end;
+  Line(head + ':');
+  if not CondJmp(S^.E, b, not wt) then
+  begin
+    EmitExpr(S^.E);
+    RunBool(b, not wt);
+  end;
+  EmitStackCheck(head, '16');
+  RunEnd(leaf^.R, vs.Reg, up);
+  JumpCC('', a);
+  Line(b + ':');
+  PopLoop;
+end;
+
+{ FChunkReg := the end of the run that starts at the variable in V,
+  towards the limit E: the lesser of V + 1023 and E counting up, the
+  greater of V - 1023 and E counting down (P283). Each end is on the
+  limit's side, so a pass the run lets go on is one the condition lets
+  go on, however the variable stands to the limit on the way in; near
+  High(Integer) (Low going down) the sum wraps to the other side, the
+  end falls behind V, and every pass goes back to the whole test, still
+  right. E is read from its register when the loop keeps it in one.
+  Three instructions where ForChunk's unsigned form takes six: a for
+  works out its run's end only past its limit's test, and its proofs
+  (ProofTests) want an end that is never behind the counter. }
+procedure TEmitter.RunEnd(E: PExpr; const V: string; Up: Boolean);
+var
+  s: TSym;
+  l, ch: string;
+begin
+  if (E^.Kind = ekVar) and PlainOrd(E, s) and (s.Reg <> '') then
+    l := s.Reg
+  else
+  begin
+    EmitExpr(E);
+    if FArm then
+      l := 'x0'
+    else
+      l := 'rax';
+  end;
+  ch := FChunkReg;
+  if FArm then
+  begin
+    if Up then
+      Line('  add ' + ch + ', ' + V + ', #1023')
+    else
+      Line('  sub ' + ch + ', ' + V + ', #1023');
+    Line('  cmp ' + ch + ', ' + l);
+    if Up then
+      Line('  csel ' + ch + ', ' + l + ', ' + ch + ', gt')
+    else
+      Line('  csel ' + ch + ', ' + l + ', ' + ch + ', lt');
+  end
+  else
+  begin
+    if Up then
+      Line('  leaq 1023(%' + V + '), %' + ch)
+    else
+      Line('  leaq -1023(%' + V + '), %' + ch);
+    Line('  cmpq %' + l + ', %' + ch);
+    if Up then
+      Line('  cmovgq %' + l + ', %' + ch)
+    else
+      Line('  cmovlq %' + l + ', %' + ch);
+  end;
+end;
+
+{ The Boolean in rax (x0): on to Target when it is True if WhenTrue,
+  when it is False otherwise. }
+procedure TEmitter.RunBool(const Target: string; WhenTrue: Boolean);
+begin
+  if FArm then
+  begin
+    if WhenTrue then
+      Line('  cbnz x0, ' + Target)
+    else
+      Line('  cbz x0, ' + Target);
+  end
+  else
+  begin
+    Line('  testq %rax, %rax');
+    if WhenTrue then
+      Line('  jnz ' + Target)
+    else
+      Line('  jz ' + Target);
+  end;
 end;
 
 function TEmitter.TreeKey(T: LongInt): LongInt;
@@ -20091,6 +20453,7 @@ begin
           Line(b + ':');
         end;
       skWhile:
+        if not EmitLoopRun(S) then
         begin
           { Rotated: the test is at the bottom and branches back while it
             holds, one branch a turn; it keeps the while's line (P93). }
@@ -20114,6 +20477,7 @@ begin
           PopLoop;
         end;
       skRepeat:
+        if not EmitLoopRun(S) then
         begin
           a := Lab;
           b := Lab;
@@ -20802,6 +21166,7 @@ begin
         Line(b + ':');
       end;
     skWhile:
+      if not EmitLoopRun(S) then
       begin
         { Rotated: the test is at the bottom and branches back while it
           holds, one branch a turn; it keeps the while's line (P93). }
@@ -20826,6 +21191,7 @@ begin
         PopLoop;
       end;
     skRepeat:
+      if not EmitLoopRun(S) then
       begin
         a := Lab;
         b := Lab;

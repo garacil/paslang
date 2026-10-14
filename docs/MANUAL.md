@@ -2293,6 +2293,11 @@ it was, as in FPC. The counter may be a `var` parameter or a variable
 a closure shares, and so may the variable of `for x in` (1.0.135; the
 loop wrote over the address it holds). A `for` whose body calls nothing and holds no other
 loop checks for preemption once every 1024 passes, not at each one.
+So does a `while` or a `repeat` that counts (1.1.137): its condition,
+or the first test of a `while`'s `and` or of a `repeat`'s `or`,
+compares an integer variable with a limit no pass changes, and the
+body, with no loop and no `continue` in it, steps that variable towards
+the limit by a constant of 1 to 1023 once a pass, at its top level.
 A `for` of a constant count of four passes or fewer with a small body
 that neither changes its counter nor takes its address is written out
 once per pass with the pass's value in the counter's place, then the
@@ -11496,7 +11501,8 @@ has its own stack that grows on demand: each routine entry checks the
 stack and calls the runtime when it needs more. A system monitor thread
 marks a long-running routine every 10 ms, and the scheduler takes it
 off its M at its next routine entry or loop head; a `for` whose body
-calls nothing and holds no other loop asks once every 1024 passes. An
+calls nothing and holds no other loop asks once every 1024 passes, and
+so does a `while` or a `repeat` that counts (§4). An
 `asm` block has neither and runs to its end, so every word of the core
 units gives its kernel at most 64 KiB a call, and a routine working on
 a large value is taken off between two: the scans of JSON and UTF-8
