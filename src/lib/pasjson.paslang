@@ -206,6 +206,39 @@ type
     function At(const Ptr: string): json;
     function Find(const Name: string): json;
   end;
+
+  { The writer of the encoders the compiler writes for a record, a class
+    or any type JsonEncode takes (P205): the text, and a level for each
+    open object or array, for its commas and for the JSON Pointer an
+    error names. One routine owns a writer while it writes. }
+  TJsonOutLevel = record
+    Count: Integer;     { the members or elements written }
+    Obj: Boolean;
+    NameP: Pointer;     { the last member's name as it was written, "name": }
+    NameN: Integer;
+  end;
+  TJsonOut = record
+    S: string;          { the text, longer than what is written }
+    N: Integer;         { the bytes written }
+    Depth: Integer;     { the open objects and arrays }
+    MaxDepth: Integer;
+    ValAt: Integer;     { where the value of the last member begins }
+    Indent: string;     { '' on one line }
+    Pad: string;        { a line feed and Indent as many times as the deepest level so far }
+    Html: Boolean;
+    Lv: array of TJsonOutLevel;
+  end;
+  { where a member began, for omitempty to take it back }
+  TJsonOutMark = record
+    N, Count: Integer;
+  end;
+  { a map's keys and the names they are written as, ordered by name
+    before its members are written }
+  TJsonOutPair = record
+    Name: string;
+    Key: Integer;
+  end;
+  TJsonOutPairs = array of TJsonOutPair;
 {$endif}
 
 
@@ -257,6 +290,46 @@ function PasJsonParsePlain(const S: string; const Opts: TJsonOptions; out Err: E
 { The bytes of the document J is the root of, its header to the end of
   its arena: two parses of a text give the same. }
 function PasJsonImage(J: json): string;
+
+{ The words of the encoders the compiler writes (P205). A member is
+  PasJsonOutName with its name as written, "name":, and its value; an
+  element PasJsonOutItem and its value; Quoted writes a number inside a
+  string (json quoted). Each raises EJsonError with the JSON Pointer of
+  the value it could not write: a string that is not UTF-8 or a
+  noncharacter (jeEncoding), NaN, an infinity, a Char past 127, a value
+  no member of its enumeration, a TDateTime past year 9999 (jeRange),
+  a level past MaxDepth (jeDepth). }
+procedure PasJsonOutInit(var W: TJsonOut; const Opts: TJsonOptions; Hint: Integer);
+function PasJsonOutText(var W: TJsonOut; const Opts: TJsonOptions): string;
+procedure PasJsonOutOpen(var W: TJsonOut; Obj: Boolean);
+procedure PasJsonOutClose(var W: TJsonOut);
+procedure PasJsonOutName(var W: TJsonOut; const Lit: string);
+procedure PasJsonOutItem(var W: TJsonOut);
+procedure PasJsonOutRaw(var W: TJsonOut; const Lit: string);
+procedure PasJsonOutNull(var W: TJsonOut);
+procedure PasJsonOutBool(var W: TJsonOut; B: Boolean);
+procedure PasJsonOutInt(var W: TJsonOut; V: Integer; Quoted: Boolean);
+procedure PasJsonOutF64(var W: TJsonOut; V: Double; Quoted: Boolean);
+procedure PasJsonOutF32(var W: TJsonOut; V: Single; Quoted: Boolean);
+procedure PasJsonOutQuad(var W: TJsonOut; V: Quad; Quoted: Boolean);
+procedure PasJsonOutCur(var W: TJsonOut; V: Currency; Quoted: Boolean);
+procedure PasJsonOutStr(var W: TJsonOut; const S: string);
+procedure PasJsonOutChar(var W: TJsonOut; C: Char);
+procedure PasJsonOutJson(var W: TJsonOut; J: json);
+procedure PasJsonOutBytes(var W: TJsonOut; P: Pointer; N: Integer);
+procedure PasJsonOutTime(var W: TJsonOut; V: Double);
+procedure PasJsonOutBadEnum(var W: TJsonOut; V: Integer);
+function PasJsonOutMark(var W: TJsonOut): TJsonOutMark;
+procedure PasJsonOutDrop(var W: TJsonOut; const M: TJsonOutMark);
+procedure PasJsonOutFail(var W: TJsonOut; Kind: TJsonErrorKind; const Reason: string);
+function PasJsonOutZeroF64(V: Double): Boolean;
+function PasJsonOutZeroF32(V: Single): Boolean;
+function PasJsonOutZeroQuad(V: Quad): Boolean;
+procedure PasJsonOutNameStr(var W: TJsonOut; const S: string);
+procedure PasJsonOutNameInt(var W: TJsonOut; V: Integer);
+procedure PasJsonOutMembers(var W: TJsonOut; J: json);
+procedure PasJsonOutSortPairs(var A: TJsonOutPairs);
+function PasJsonOutIntName(V: Integer): string;
 {$endif}
 
 implementation
@@ -5901,6 +5974,845 @@ end;
 function TJsonHelper.Find(const Name: string): json;
 begin
   Result := JsonOfN(JFind(NodeOfJ(Self), Name));
+end;
+
+{ ---- the writer of the encoders the compiler writes (P205) ---- }
+
+{ Room for K more bytes: the string grown to twice what it needs, as
+  the document writer grows its own. }
+procedure OutRoom(var W: TJsonOut; K: Integer);
+var
+  c: Integer;
+begin
+  if W.N + K <= Length(W.S) then
+    Exit;
+  c := Length(W.S) * 2;
+  if c < W.N + K + 64 then
+    c := W.N + K + 64;
+  SetLength(W.S, c);
+end;
+
+procedure OutPut(var W: TJsonOut; P: Pointer; K: Integer);
+begin
+  if K <= 0 then
+    Exit;
+  OutRoom(W, K);
+  Move(PByte(P)^, PByte(Pointer(W.S))[W.N], K);
+  W.N := W.N + K;
+end;
+
+procedure OutB(var W: TJsonOut; B: Integer);
+begin
+  if W.N >= Length(W.S) then
+    OutRoom(W, 1);
+  PByte(Pointer(W.S))[W.N] := Byte(B);
+  W.N := W.N + 1;
+end;
+
+{ A line feed and Depth indents, as the document writer's PutLine. }
+procedure OutLine(var W: TJsonOut; Depth: Integer);
+var
+  need, k: Integer;
+begin
+  need := 1 + Depth * Length(W.Indent);
+  if Length(W.Pad) < need then
+  begin
+    W.Pad := #10;
+    for k := 1 to Depth * 2 + 8 do
+      W.Pad := W.Pad + W.Indent;
+  end;
+  OutPut(W, Pointer(W.Pad), need);
+end;
+
+{ Hint is the length of the text written the last time for the type,
+  so the string is reserved once and not grown by copies, as Go's
+  encoder reuses a buffer of the size it last needed (v2's pooled
+  bytes). }
+procedure PasJsonOutInit(var W: TJsonOut; const Opts: TJsonOptions; Hint: Integer);
+begin
+  W := Default(TJsonOut);
+  if Hint < 192 then
+    Hint := 192;
+  SetLength(W.S, Hint + Hint div 8 + 64);
+  W.Html := Opts.EscapeHtml and not Opts.Canonical;
+  if not Opts.Canonical then
+    W.Indent := Opts.Indent;
+  W.MaxDepth := Opts.MaxDepth;
+  if W.MaxDepth <= 0 then
+    W.MaxDepth := JsonDepthMax;
+  SetLength(W.Lv, 16);
+end;
+
+{ The text written; in RFC 8785's form a second pass, a parse and the
+  canonical writer, which orders the members and writes the numbers as
+  ECMAScript does. }
+function PasJsonOutText(var W: TJsonOut; const Opts: TJsonOptions): string;
+var
+  o: TJsonOptions;
+begin
+  SetLength(W.S, W.N);
+  Result := W.S;
+  W.S := '';
+  if Opts.Canonical then
+  begin
+    o := Opts;
+    o.MaxBytes := 0;
+    if o.MaxDepth < W.MaxDepth then
+      o.MaxDepth := W.MaxDepth;
+    Result := JsonEncode(JsonParse(Result, o), Opts);
+  end;
+end;
+
+{ The four hex digits of S from I. }
+function HexVal4(const S: string; I: Integer): Integer;
+var
+  k, d: Integer;
+  c: Char;
+begin
+  Result := 0;
+  for k := I to I + 3 do
+  begin
+    d := 0;
+    if k <= Length(S) then
+    begin
+      c := S[k];
+      if (c >= '0') and (c <= '9') then
+        d := Ord(c) - Ord('0')
+      else if (c >= 'a') and (c <= 'f') then
+        d := Ord(c) - Ord('a') + 10
+      else if (c >= 'A') and (c <= 'F') then
+        d := Ord(c) - Ord('A') + 10;
+    end;
+    Result := Result * 16 + d;
+  end;
+end;
+
+{ The JSON Pointer of the value being written: the name of the member
+  or the place of the element at each open level. }
+function OutPath(var W: TJsonOut): string;
+var
+  d, i, n: Integer;
+  p: PByte;
+  lit, nm: string;
+  c: Char;
+begin
+  Result := '';
+  for d := 1 to W.Depth do
+  begin
+    if W.Lv[d].Count = 0 then
+      Break;
+    if not W.Lv[d].Obj then
+    begin
+      Result := Result + '/' + IntText(W.Lv[d].Count - 1);
+      Continue;
+    end;
+    p := PByte(W.Lv[d].NameP);
+    n := W.Lv[d].NameN;
+    lit := '';
+    SetLength(lit, n);
+    if n > 0 then
+      Move(p^, lit[1], n);
+    { "name": back to the name: the compiler escapes only the quote, the
+      backslash and the control bytes }
+    nm := '';
+    i := 2;
+    while (i <= Length(lit)) and (lit[i] <> '"') do
+    begin
+      c := lit[i];
+      if (c = '\') and (i < Length(lit)) then
+      begin
+        i := i + 1;
+        c := lit[i];
+        case c of
+          'b': c := #8;
+          'f': c := #12;
+          'n': c := #10;
+          'r': c := #13;
+          't': c := #9;
+          'u':
+            begin
+              c := Char(HexVal4(lit, i + 1) and 255);
+              i := i + 4;
+            end;
+        end;
+      end;
+      if c = '~' then
+        nm := nm + '~0'
+      else if c = '/' then
+        nm := nm + '~1'
+      else
+        nm := nm + c;
+      i := i + 1;
+    end;
+    Result := Result + '/' + nm;
+  end;
+end;
+
+procedure PasJsonOutFail(var W: TJsonOut; Kind: TJsonErrorKind; const Reason: string);
+var
+  p: string;
+begin
+  p := OutPath(W);
+  raise EJsonError.Create(Kind, -1, 0, 0, p, p, Reason);
+end;
+
+procedure PasJsonOutOpen(var W: TJsonOut; Obj: Boolean);
+begin
+  if W.Depth >= W.MaxDepth then
+    PasJsonOutFail(W, jeDepth, 'exceeded max depth');
+  if Obj then
+    OutB(W, 123)
+  else
+    OutB(W, 91);
+  W.Depth := W.Depth + 1;
+  if W.Depth >= Length(W.Lv) then
+    SetLength(W.Lv, Length(W.Lv) * 2);
+  W.Lv[W.Depth].Count := 0;
+  W.Lv[W.Depth].Obj := Obj;
+  W.Lv[W.Depth].NameP := nil;
+  W.Lv[W.Depth].NameN := 0;
+end;
+
+procedure PasJsonOutClose(var W: TJsonOut);
+var
+  obj: Boolean;
+  cnt: Integer;
+begin
+  obj := W.Lv[W.Depth].Obj;
+  cnt := W.Lv[W.Depth].Count;
+  W.Depth := W.Depth - 1;
+  if (cnt > 0) and (W.Indent <> '') then
+    OutLine(W, W.Depth);
+  if obj then
+    OutB(W, 125)
+  else
+    OutB(W, 93);
+end;
+
+{ A member's name as the compiler wrote it, "name":, after a comma and
+  a new line as the level needs; with EscapeHtml, its <, > and & as
+  \u003c, \u003e and \u0026. On one line with no EscapeHtml, a check
+  for room and two copies. }
+procedure PasJsonOutName(var W: TJsonOut; const Lit: string);
+var
+  i, k: Integer;
+  c: Char;
+  lv: ^TJsonOutLevel;
+  p: PByte;
+begin
+  lv := @W.Lv[W.Depth];
+  k := Length(Lit);
+  if (W.Indent = '') and not W.Html then
+  begin
+    if W.N + k + 1 > Length(W.S) then
+      OutRoom(W, k + 1);
+    p := @PByte(Pointer(W.S))[W.N];
+    if lv^.Count > 0 then
+    begin
+      p^ := 44;
+      p := @p[1];
+      W.N := W.N + 1;
+    end;
+    Move(PByte(Pointer(Lit))^, p^, k);
+    W.N := W.N + k;
+  end
+  else
+  begin
+    if lv^.Count > 0 then
+      OutB(W, 44);
+    if W.Indent <> '' then
+      OutLine(W, W.Depth);
+    if W.Html and ((Pos('<', Lit) > 0) or (Pos('>', Lit) > 0) or (Pos('&', Lit) > 0)) then
+    begin
+      for i := 1 to k do
+      begin
+        c := Lit[i];
+        if c = '<' then
+          PasJsonOutRaw(W, '\u003c')
+        else if c = '>' then
+          PasJsonOutRaw(W, '\u003e')
+        else if c = '&' then
+          PasJsonOutRaw(W, '\u0026')
+        else
+          OutB(W, Ord(c));
+      end;
+    end
+    else
+      OutPut(W, Pointer(Lit), k);
+    if W.Indent <> '' then
+      OutB(W, 32);
+  end;
+  lv^.Count := lv^.Count + 1;
+  lv^.NameP := Pointer(Lit);
+  lv^.NameN := k;
+  W.ValAt := W.N;
+end;
+
+procedure PasJsonOutItem(var W: TJsonOut);
+begin
+  if W.Lv[W.Depth].Count > 0 then
+    OutB(W, 44);
+  if W.Indent <> '' then
+    OutLine(W, W.Depth);
+  W.Lv[W.Depth].Count := W.Lv[W.Depth].Count + 1;
+end;
+
+procedure PasJsonOutRaw(var W: TJsonOut; const Lit: string);
+begin
+  OutPut(W, Pointer(Lit), Length(Lit));
+end;
+
+procedure PasJsonOutNull(var W: TJsonOut);
+begin
+  PasJsonOutRaw(W, 'null');
+end;
+
+procedure PasJsonOutBool(var W: TJsonOut; B: Boolean);
+begin
+  if B then
+    PasJsonOutRaw(W, 'true')
+  else
+    PasJsonOutRaw(W, 'false');
+end;
+
+procedure PasJsonOutInt(var W: TJsonOut; V: Integer; Quoted: Boolean);
+begin
+  OutRoom(W, 24);
+  if Quoted then
+    OutB(W, 34);
+  W.N := W.N + PasNumAppendInt(@PByte(Pointer(W.S))[W.N], V);
+  if Quoted then
+    OutB(W, 34);
+end;
+
+{ A Double as Go's v2 writes a float64 (jsonwire.AppendFloat): the
+  shortest text that reads back as it, -0 as -0; NaN and the infinities
+  have no JSON form. }
+procedure PasJsonOutF64(var W: TJsonOut; V: Double; Quoted: Boolean);
+var
+  bits: Int64;
+begin
+  bits := V as Int64;
+  if ((bits shr 52) and $7FF) = $7FF then
+    PasJsonOutFail(W, jeRange, 'a Double that is NaN or infinite has no JSON form');
+  OutRoom(W, PasNumTextMax + 2);
+  if Quoted then
+    OutB(W, 34);
+  W.N := W.N + PasNumAppendF64(@PByte(Pointer(W.S))[W.N], bits);
+  if Quoted then
+    OutB(W, 34);
+end;
+
+{ A Single as Go's v2 writes a float32: its own shortest text. }
+procedure PasJsonOutF32(var W: TJsonOut; V: Single; Quoted: Boolean);
+var
+  bits: Int64;
+begin
+  bits := 0;
+  Move(V, bits, 4);
+  if ((bits shr 23) and $FF) = $FF then
+    PasJsonOutFail(W, jeRange, 'a Single that is NaN or infinite has no JSON form');
+  OutRoom(W, PasNumTextMax + 2);
+  if Quoted then
+    OutB(W, 34);
+  W.N := W.N + PasNumAppendF32(@PByte(Pointer(W.S))[W.N], bits);
+  if Quoted then
+    OutB(W, 34);
+end;
+
+{ A Quad: its shortest digits (PasQuadDigits, P103), written as
+  ECMAScript writes a Number (7.1.12.1): plain from 10^-6 to 10^21,
+  with an exponent past them. }
+procedure PasJsonOutQuad(var W: TJsonOut; V: Quad; Quoted: Boolean);
+var
+  w2: array[0..1] of Int64;
+  digs, t: string;
+  dp, k, nd: Integer;
+begin
+  Move(V, w2, 16);
+  if ((w2[1] shr 48) and $7FFF) = $7FFF then
+    PasJsonOutFail(W, jeRange, 'a Quad that is NaN or infinite has no JSON form');
+  digs := PasQuadDigits(w2[0], w2[1], 0, 0, dp);
+  t := '';
+  if w2[1] < 0 then
+    t := '-';
+  nd := Length(digs);
+  if nd = 0 then
+    t := t + '0'
+  else if (dp >= nd) and (dp <= 21) then
+  begin
+    t := t + digs;
+    for k := 1 to dp - nd do
+      t := t + '0';
+  end
+  else if (dp > 0) and (dp <= 21) then
+    t := t + Copy(digs, 1, dp) + '.' + Copy(digs, dp + 1, nd - dp)
+  else if (dp <= 0) and (dp > -6) then
+  begin
+    t := t + '0.';
+    for k := 1 to -dp do
+      t := t + '0';
+    t := t + digs;
+  end
+  else
+  begin
+    t := t + digs[1];
+    if nd > 1 then
+      t := t + '.' + Copy(digs, 2, nd - 1);
+    if dp - 1 >= 0 then
+      t := t + 'e+' + IntText(dp - 1)
+    else
+      t := t + 'e' + IntText(dp - 1);
+  end;
+  if Quoted then
+    OutB(W, 34);
+  PasJsonOutRaw(W, t);
+  if Quoted then
+    OutB(W, 34);
+end;
+
+{ A Currency exactly: its integer and its four places, the trailing
+  zeros of the places left out. }
+procedure PasJsonOutCur(var W: TJsonOut; V: Currency; Quoted: Boolean);
+var
+  u, ip, fp: Int64;
+  t: string;
+  k: Integer;
+begin
+  u := V as Int64;
+  t := '';
+  if u < 0 then
+  begin
+    t := '-';
+    { the smallest Int64 has no positive: its places are 5808 }
+    if u = Low(Int64) then
+    begin
+      t := '-922337203685477.5808';
+      if Quoted then
+        OutB(W, 34);
+      PasJsonOutRaw(W, t);
+      if Quoted then
+        OutB(W, 34);
+      Exit;
+    end;
+    u := -u;
+  end;
+  ip := u div 10000;
+  fp := u mod 10000;
+  t := t + IntText(ip);
+  if fp <> 0 then
+  begin
+    t := t + '.' + Char(Ord('0') + fp div 1000) + Char(Ord('0') + (fp div 100) mod 10) +
+      Char(Ord('0') + (fp div 10) mod 10) + Char(Ord('0') + fp mod 10);
+    k := Length(t);
+    while t[k] = '0' do
+      k := k - 1;
+    SetLength(t, k);
+  end;
+  if Quoted then
+    OutB(W, 34);
+  PasJsonOutRaw(W, t);
+  if Quoted then
+    OutB(W, 34);
+end;
+
+{ A string with the fewest escapes, as the document writer's PutStr
+  (Go's jsonwire.AppendQuote); one that is not UTF-8, or holds a
+  noncharacter, has no I-JSON form, as Go's v2 refuses invalid UTF-8. A
+  short string of printable ASCII with no quote and no backslash, the
+  common name or word, is one pass and one copy, as Go's appendString
+  runs its ASCII loop first. }
+procedure OutStr(var W: TJsonOut; P: PByte; N: Integer);
+var
+  i, k: Integer;
+  b: Integer;
+  d: PByte;
+begin
+  if N <= 64 then
+  begin
+    i := 0;
+    while i < N do
+    begin
+      b := P[i];
+      if (b < 32) or (b >= 128) or (b = 34) or (b = 92) or (W.Html and ((b = 60) or (b = 62) or
+        (b = 38))) then
+        Break;
+      i := i + 1;
+    end;
+    if i = N then
+    begin
+      if W.N + N + 2 > Length(W.S) then
+        OutRoom(W, N + 2);
+      d := @PByte(Pointer(W.S))[W.N];
+      d^ := 34;
+      if N > 0 then
+        Move(P^, d[1], N);
+      d[N + 1] := 34;
+      W.N := W.N + N + 2;
+      Exit;
+    end;
+  end;
+  if (N > 0) and (PasUtf8Valid(P, N, True) >= 0) then
+    PasJsonOutFail(W, jeEncoding, 'a string that is not UTF-8 or holds a noncharacter has no ' +
+      'JSON form');
+  OutB(W, 34);
+  i := 0;
+  while i < N do
+  begin
+    k := PasJsonEscIndex(@P[i], N - i, W.Html);
+    if k < 0 then
+    begin
+      OutPut(W, @P[i], N - i);
+      Break;
+    end;
+    if k > 0 then
+      OutPut(W, @P[i], k);
+    i := i + k;
+    b := P[i];
+    OutB(W, 92);
+    case b of
+      34, 92: OutB(W, b);
+      8: OutB(W, 98);
+      12: OutB(W, 102);
+      10: OutB(W, 110);
+      13: OutB(W, 114);
+      9: OutB(W, 116);
+    else
+      OutB(W, 117);
+      OutB(W, 48);
+      OutB(W, 48);
+      OutB(W, Ord(HexDigit(b shr 4)));
+      OutB(W, Ord(HexDigit(b and 15)));
+    end;
+    i := i + 1;
+  end;
+  OutB(W, 34);
+end;
+
+procedure PasJsonOutStr(var W: TJsonOut; const S: string);
+begin
+  OutStr(W, PByte(Pointer(S)), Length(S));
+end;
+
+{ A Char as a string of one byte: past 127 a byte alone is no UTF-8. }
+procedure PasJsonOutChar(var W: TJsonOut; C: Char);
+var
+  b: Byte;
+begin
+  if Ord(C) > 127 then
+    PasJsonOutFail(W, jeEncoding, 'a Char past 127 is no UTF-8 alone and has no JSON form');
+  b := Byte(Ord(C));
+  OutStr(W, @b, 1);
+end;
+
+{ A json as it is: its text by the document writer, on one line or a
+  value a line at this level. }
+procedure PasJsonOutJson(var W: TJsonOut; J: json);
+var
+  t: string;
+  i, start: Integer;
+begin
+  if J = nil then
+  begin
+    PasJsonOutNull(W);
+    Exit;
+  end;
+  if W.Indent = '' then
+    t := JsonWrite(NodeOfJ(J), 0, '', W.Html)
+  else
+    t := JsonWrite(NodeOfJ(J), 1, W.Indent, W.Html);
+  if (W.Indent = '') or (W.Depth = 0) then
+  begin
+    PasJsonOutRaw(W, t);
+    Exit;
+  end;
+  start := 1;
+  for i := 1 to Length(t) do
+    if t[i] = #10 then
+    begin
+      OutPut(W, @t[start], i - start);
+      OutLine(W, W.Depth);
+      start := i + 1;
+    end;
+  OutPut(W, @t[start], Length(t) - start + 1);
+end;
+
+{ Bytes in base64, RFC 4648 section 4 with its padding, as Go writes a
+  []byte. }
+procedure PasJsonOutBytes(var W: TJsonOut; P: Pointer; N: Integer);
+const
+  Alpha = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+var
+  b: PByte;
+  i, v: Integer;
+begin
+  b := PByte(P);
+  OutRoom(W, (N + 2) div 3 * 4 + 2);
+  OutB(W, 34);
+  i := 0;
+  while i + 3 <= N do
+  begin
+    v := (b[i] shl 16) or (b[i + 1] shl 8) or b[i + 2];
+    OutB(W, Ord(Alpha[(v shr 18) + 1]));
+    OutB(W, Ord(Alpha[((v shr 12) and 63) + 1]));
+    OutB(W, Ord(Alpha[((v shr 6) and 63) + 1]));
+    OutB(W, Ord(Alpha[(v and 63) + 1]));
+    i := i + 3;
+  end;
+  if N - i = 1 then
+  begin
+    v := b[i] shl 16;
+    OutB(W, Ord(Alpha[(v shr 18) + 1]));
+    OutB(W, Ord(Alpha[((v shr 12) and 63) + 1]));
+    OutB(W, 61);
+    OutB(W, 61);
+  end
+  else if N - i = 2 then
+  begin
+    v := (b[i] shl 16) or (b[i + 1] shl 8);
+    OutB(W, Ord(Alpha[(v shr 18) + 1]));
+    OutB(W, Ord(Alpha[((v shr 12) and 63) + 1]));
+    OutB(W, Ord(Alpha[((v shr 6) and 63) + 1]));
+    OutB(W, 61);
+  end;
+  OutB(W, 34);
+end;
+
+function Two(V: Integer): string;
+begin
+  Result := Char(Ord('0') + V div 10) + Char(Ord('0') + V mod 10);
+end;
+
+{ A TDateTime (days from 1899-12-30, the fraction the time of day; a
+  day before it negative with its time still positive, as Free Pascal
+  keeps it) as RFC 3339 text in UTC, to the millisecond, the trailing
+  zeros of the fraction left out, as Go writes a time.Time
+  (RFC3339Nano); the day from its count by Howard Hinnant's
+  civil_from_days. Years 1 to 9999. }
+procedure PasJsonOutTime(var W: TJsonOut; V: Double);
+var
+  bits, d, ms, z, era, doe, yoe, y, doy, mp, dd, mm, hh, mi, ss, fr: Int64;
+  t: string;
+begin
+  bits := V as Int64;
+  if ((bits shr 52) and $7FF) = $7FF then
+    PasJsonOutFail(W, jeRange, 'a TDateTime that is NaN or infinite has no RFC 3339 form');
+  if (V > 2958466) or (V < -693594) then
+    PasJsonOutFail(W, jeRange, 'a TDateTime past the years 1 to 9999 has no RFC 3339 form');
+  d := Trunc(V);
+  ms := Round(Abs(V - d) * 86400000);
+  if ms >= 86400000 then
+  begin
+    ms := 0;
+    if V < 0 then
+      d := d - 1
+    else
+      d := d + 1;
+  end;
+  { days from 1970-01-01 }
+  z := d - 25569 + 719468;
+  if z >= 0 then
+    era := z div 146097
+  else
+    era := (z - 146096) div 146097;
+  doe := z - era * 146097;
+  yoe := (doe - doe div 1460 + doe div 36524 - doe div 146096) div 365;
+  y := yoe + era * 400;
+  doy := doe - (365 * yoe + yoe div 4 - yoe div 100);
+  mp := (5 * doy + 2) div 153;
+  dd := doy - (153 * mp + 2) div 5 + 1;
+  if mp < 10 then
+    mm := mp + 3
+  else
+    mm := mp - 9;
+  if mm <= 2 then
+    y := y + 1;
+  if (y < 1) or (y > 9999) then
+    PasJsonOutFail(W, jeRange, 'a TDateTime past the years 1 to 9999 has no RFC 3339 form');
+  hh := ms div 3600000;
+  mi := (ms div 60000) mod 60;
+  ss := (ms div 1000) mod 60;
+  fr := ms mod 1000;
+  t := '"' + Two(y div 100) + Two(y mod 100) + '-' + Two(mm) + '-' + Two(dd) + 'T' + Two(hh) +
+    ':' + Two(mi) + ':' + Two(ss);
+  if fr <> 0 then
+  begin
+    t := t + '.' + Char(Ord('0') + fr div 100);
+    if fr mod 100 <> 0 then
+    begin
+      t := t + Char(Ord('0') + (fr div 10) mod 10);
+      if fr mod 10 <> 0 then
+        t := t + Char(Ord('0') + fr mod 10);
+    end;
+  end;
+  PasJsonOutRaw(W, t + 'Z"');
+end;
+
+procedure PasJsonOutBadEnum(var W: TJsonOut; V: Integer);
+begin
+  PasJsonOutFail(W, jeRange, IntText(V) + ' is no value of its enumeration');
+end;
+
+function PasJsonOutMark(var W: TJsonOut): TJsonOutMark;
+begin
+  Result.N := W.N;
+  Result.Count := W.Lv[W.Depth].Count;
+end;
+
+{ omitempty (P205): the member just written goes when its value came out
+  as null, an empty string, an empty object or an empty array, as Go's v2
+  omits it (doc.go). }
+procedure PasJsonOutDrop(var W: TJsonOut; const M: TJsonOutMark);
+var
+  k: Integer;
+  b: PByte;
+begin
+  k := W.N - W.ValAt;
+  b := @PByte(Pointer(W.S))[W.ValAt];
+  if ((k = 4) and (b[0] = 110) and (b[1] = 117) and (b[2] = 108) and (b[3] = 108)) or
+    ((k = 2) and (((b[0] = 34) and (b[1] = 34)) or ((b[0] = 123) and (b[1] = 125)) or
+    ((b[0] = 91) and (b[1] = 93)))) then
+  begin
+    W.N := M.N;
+    W.Lv[W.Depth].Count := M.Count;
+  end;
+end;
+
+{ omitzero of a real: zero is +0 alone, its bits all clear, as Go's
+  reflect IsZero takes a float; -0 is written. }
+function PasJsonOutZeroF64(V: Double): Boolean;
+begin
+  Result := (V as Int64) = 0;
+end;
+
+function PasJsonOutZeroF32(V: Single): Boolean;
+var
+  bits: Int64;
+begin
+  bits := 0;
+  Move(V, bits, 4);
+  Result := bits = 0;
+end;
+
+function PasJsonOutZeroQuad(V: Quad): Boolean;
+var
+  w2: array[0..1] of Int64;
+begin
+  Move(V, w2, 16);
+  Result := (w2[0] = 0) and (w2[1] = 0);
+end;
+
+{ A member's name the program gives as it runs, a map's key: quoted
+  with its escapes, a name that is not UTF-8 refused as a string is. }
+procedure PasJsonOutNameStr(var W: TJsonOut; const S: string);
+begin
+  if W.Lv[W.Depth].Count > 0 then
+    OutB(W, 44);
+  if W.Indent <> '' then
+    OutLine(W, W.Depth);
+  OutStr(W, PByte(Pointer(S)), Length(S));
+  OutB(W, 58);
+  if W.Indent <> '' then
+    OutB(W, 32);
+  W.Lv[W.Depth].Count := W.Lv[W.Depth].Count + 1;
+  W.Lv[W.Depth].NameP := nil;
+  W.Lv[W.Depth].NameN := 0;
+  W.ValAt := W.N;
+end;
+
+{ A map's integer key, as Go writes one: its decimal digits as the name. }
+procedure PasJsonOutNameInt(var W: TJsonOut; V: Integer);
+begin
+  PasJsonOutNameStr(W, IntText(V));
+end;
+
+{ The members of J in place, after those of the record that keeps them
+  (json unknown, Go's embedded fallback): nil adds none, and what is no
+  object has no members to add. }
+procedure PasJsonOutMembers(var W: TJsonOut; J: json);
+var
+  it: TJsonIter;
+  k: string;
+  v: json;
+begin
+  if J = nil then
+    Exit;
+  if JKindOf(NodeOfJ(J)) <> jkObject then
+  begin
+    { the pointer of the record that keeps them, not its last member }
+    if W.Lv[W.Depth].Count > 0 then
+      W.Lv[W.Depth].Count := 0;
+    PasJsonOutFail(W, jeType, 'json unknown keeps an object of members, not ' +
+      KindName(NodeOfJ(J)));
+  end;
+  PasJsonIterInit(J, it, 2);
+  while PasJsonNextMember(it, k, v) do
+  begin
+    PasJsonOutNameStr(W, k);
+    PasJsonOutJson(W, v);
+  end;
+end;
+
+{ A map's keys by name, as Go's v2 writes a map with Deterministic
+  (arshal_default.go: strings.Compare of the names): a heap sort in
+  place, no allocation, n log n at worst. }
+procedure PasJsonOutSortPairs(var A: TJsonOutPairs);
+var
+  n, i, root, child, last: Integer;
+  t: TJsonOutPair;
+begin
+  n := Length(A);
+  i := n div 2 - 1;
+  while i >= 0 do
+  begin
+    root := i;
+    while root * 2 + 1 < n do
+    begin
+      child := root * 2 + 1;
+      if (child + 1 < n) and (A[child].Name < A[child + 1].Name) then
+        child := child + 1;
+      if A[root].Name < A[child].Name then
+      begin
+        t := A[root];
+        A[root] := A[child];
+        A[child] := t;
+        root := child;
+      end
+      else
+        Break;
+    end;
+    i := i - 1;
+  end;
+  last := n - 1;
+  while last > 0 do
+  begin
+    t := A[0];
+    A[0] := A[last];
+    A[last] := t;
+    root := 0;
+    while root * 2 + 1 < last do
+    begin
+      child := root * 2 + 1;
+      if (child + 1 < last) and (A[child].Name < A[child + 1].Name) then
+        child := child + 1;
+      if A[root].Name < A[child].Name then
+      begin
+        t := A[root];
+        A[root] := A[child];
+        A[child] := t;
+        root := child;
+      end
+      else
+        Break;
+    end;
+    last := last - 1;
+  end;
+end;
+
+{ An integer key's name: its decimal digits, as Go names one. }
+function PasJsonOutIntName(V: Integer): string;
+begin
+  Result := IntText(V);
 end;
 {$endif}
 

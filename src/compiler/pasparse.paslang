@@ -110,6 +110,12 @@ type
     FConstNames: TStrArray;   { the const parameters of the routines being read, outermost first (1.1.1) }
     FHelpers: array of LongInt;  { the helpers in scope, in the order declared or loaded (P127) }
     FCoreHelpers: LongInt;  { how many of them, at the front, a core unit brought (P204) }
+    FInVariant: Boolean;  { the fields of a variant part are parsed: json ignore alone (P205) }
+    FGenMode: Boolean;    { the text the compiler writes is parsed (P205) }
+    FJsonText: array of LongInt;  { the types JsonEncode and JsonOf take (P205) }
+    FJsonEnc: array of LongInt;   { the types with an encoder }
+    FJsonZero: array of LongInt;  { the types with a zero test for omitzero }
+    FJsonAt: string;              { where the first JsonEncode of a typed value is }
     FRecMembers: Boolean;  { a record's fields stop where its members begin (P165) }
     FRecVis: Byte;         { the visibility of the record's fields being read (P165) }
     FRecSelf: LongInt;     { the record being declared, which no field of it may be (P165) }
@@ -572,6 +578,26 @@ type
     function ParseType: LongInt;
     function ParseIntConst: Int64;
     function ParseRecPart(var Td: TTypeDef; Start: LongInt; Stop: TTokKind): LongInt;
+    function JsonNumberTyp(T: LongInt): Boolean;
+    procedure ParseJsonDirective(T: LongInt; NNames: SizeInt; out JName: string;
+      out JFlags: LongInt);
+    procedure JsonNamesOf(T: LongInt; var Names: TStrArray; Depth: LongInt);
+    procedure CheckJsonNames(T: LongInt);
+    procedure CheckJsonTyp(T: LongInt; JFlags: LongInt; const At: string);
+    function JsonTypRef(T: LongInt): string;
+    function JsonNeedEnc(T: LongInt): string;
+    function JsonNeedZero(T: LongInt): string;
+    function JsonBase(T: LongInt): LongInt;
+    function JsonForm(T: LongInt; out Why: string): Boolean;
+    function JsonValue(T: LongInt; const V: string; Flags: LongInt; const Who: string): string;
+    function JsonZero(T: LongInt; const V: string): string;
+    procedure JsonMembers(T: LongInt; const Base, Who: string; var Body: string;
+      var Unknown: string; Depth: LongInt);
+    function JsonEncText(T: LongInt): string;
+    function JsonKeyName(B: LongInt; const V: string): string;
+    function JsonZeroText(T: LongInt): string;
+    function JsonTypedCall(Want: LongInt; const Args: TExprArray): PExpr;
+    procedure GenJsonCode;
     function ParseVariant(var Td: TTypeDef; Start: LongInt; Stop: TTokKind): LongInt;
     procedure ParseTypeSection;
     function FindOp(Op: TBinOp; L, R: LongInt; out Sym: string;
@@ -2238,9 +2264,18 @@ var
   i: SizeInt;
   owner: LongInt;
   prefix, leaf: string;
+  v: Int64;
 begin
   Result := False;
   Id := TyNone;
+  { the type the compiler names by its number in the text it writes (P205) }
+  if FGenMode and (Copy(AName, 1, 6) = 'json.t') and
+    StrToInt64(Copy(AName, 7, Length(AName) - 6), v) then
+  begin
+    Id := LongInt(v);
+    Result := True;
+    Exit;
+  end;
   i := Length(AName);
   while (i > 0) and (AName[i] <> '.') do Dec(i);
   if i > 0 then
@@ -4182,6 +4217,11 @@ begin
     SetLength(td.Fields, n + 1);
     td.Fields[n].Name := g.Fields[i].Name;
     td.Fields[n].Typ := t;
+    td.Fields[n].JName := g.Fields[i].JName;
+    td.Fields[n].JFlags := g.Fields[i].JFlags;
+    { the json directive of a field of type T, checked with T known (P205) }
+    if g.Fields[i].JFlags <> 0 then
+      CheckJsonTyp(t, g.Fields[i].JFlags, HerePos);
     off := FieldAt(off, t);
     td.Fields[n].Off := off;
     off := off + sz;
@@ -4195,6 +4235,7 @@ begin
   SetLength(FTypes, n + 1);
   FTypes[n] := td;
   Result := LongInt(n);
+  CheckJsonNames(Result);
 end;
 
 function TParser.AddNamedType(const AName: string; const Td: TTypeDef): LongInt;
@@ -5897,9 +5938,11 @@ var
   i: SizeInt;
 begin
   name := ReadTypePath;
-  for i := 1 to Length(name) do
-    if name[i] = '.' then
-    begin FTok := FLex.Next; Eat(tkDot) end;
+  { json.t and a number, the compiler's own name of a type, is one token (P205) }
+  if not (FGenMode and (Copy(name, 1, 5) = 'json.')) then
+    for i := 1 to Length(name) do
+      if name[i] = '.' then
+      begin FTok := FLex.Next; Eat(tkDot) end;
   FTok := FLex.Next;
 end;
 
@@ -6039,6 +6082,9 @@ var
   ok: Boolean;
   nm, what: string;
 begin
+  { the encoders the compiler writes read every member (P205) }
+  if FGenMode then
+    Exit;
   if Kind = 0 then
   begin
     v := FTypes[Cls].Fields[Idx].Vis;
@@ -6372,6 +6418,8 @@ procedure TParser.CheckRecField(T: LongInt; I: SizeInt; ALine, ACol: LongInt);
 var
   f: TField;
 begin
+  if FGenMode then
+    Exit;
   f := FTypes[T].Fields[I];
   if (f.Vis = VisStrictPrivate) and ((FHelperTyp = 0) or (FHelperTyp <> RecordHelper(T))) then
     Die(f.Name + ' is strict private to ' + FTypes[T].Name + ' at ' + IntToStr(ALine) + ':' +
@@ -6558,7 +6606,7 @@ begin
   AddReserved('hex md5 sha1 sha224 sha384 sha512 sha3_224 sha3_256 sha3_384');
   AddReserved('sha3_512 hmacmd5 hmacsha1 hmacsha224 hmacsha256 hmacsha384');
   AddReserved('hmacsha512 crc32 crc32c adler32 fnv1a32 fnv1a64 murmur3 siphash');
-  AddReserved('tryget default assigned setlength inc dec getmem freemem move');
+  AddReserved('tryget default assigned setlength inc dec getmem freemem move jsonof');
   AddReserved('fillchar view membase memsize memend');
   { the calculation set }
   AddReserved('abs sqr sqrt trunc round int frac floor ceil min max pi exp ln');
@@ -7587,6 +7635,7 @@ begin
     FTypes[pn] := rtd;
     FTypes[pn].Name := '';
     Result := LongInt(pn);
+    CheckJsonNames(Result);
     Exit;
   end;
   if k = tkClass then
@@ -8206,6 +8255,8 @@ var
   isFunc, isClassM, isStat, byref, eq, isCtor, isDtor: Boolean;
   check: TTypeDef;
   nindex: LongInt;
+  jname: string;
+  jflags: LongInt;
 begin
   if (FTok.Kind = tkConst) or (FTok.Kind = tkType) then
   begin
@@ -8349,6 +8400,8 @@ begin
     t := Self.ParseType;
     rname := '';
     wname := '';
+    jname := '';
+    jflags := 0;
     while FTok.Kind <> tkSemi do
     begin
       if FTok.Kind = tkRead then
@@ -8363,6 +8416,9 @@ begin
         wname := FTok.Lexeme;
         FTok := FLex.Next;
       end
+      else if (FTok.Kind = tkJson) and (Rec <> 0) then
+        Die('a record is its fields in JSON, not its properties: json goes after a field' +
+          HerePos)
       else
         Die('property');
     end;
@@ -8373,6 +8429,8 @@ begin
     SetLength(td.Props, n + 1);
     td.Props[n].Name := mname;
     td.Props[n].Typ := t;
+    td.Props[n].JName := jname;
+    td.Props[n].JFlags := jflags;
     td.Props[n].ReadOff := -1;
     td.Props[n].WriteOff := -1;
     td.Props[n].ReadName := rname;
@@ -8900,9 +8958,9 @@ begin
       Result := ClassPropRead(owner, px, ALine, ACol);
       Exit;
     end;
-    if (pr.Vis = VisStrictPrivate) and (FHelperTyp <> owner) then
+    if (pr.Vis = VisStrictPrivate) and (FHelperTyp <> owner) and not FGenMode then
       Die(pr.Name + ' is strict private to ' + FTypes[owner].Name + HerePos);
-    if (pr.Vis = VisPrivate) and FTypes[owner].Imported then
+    if (pr.Vis = VisPrivate) and FTypes[owner].Imported and not FGenMode then
       Die(pr.Name + ' is private to ' + FTypes[owner].Name + '''s unit' + HerePos);
     { a record's property of a field (P165): the field itself, read or
       assigned }
@@ -8994,9 +9052,9 @@ begin
   if hh = 0 then
     Die('unknown member ' + AName + ' of ' + FTypes[H].Name + ' at ' + IntToStr(ALine) + ':' +
       IntToStr(ACol));
-  if (FTypes[hh].Meths[mi].Vis = VisStrictPrivate) and (FHelperTyp <> hh) then
+  if (FTypes[hh].Meths[mi].Vis = VisStrictPrivate) and (FHelperTyp <> hh) and not FGenMode then
     Die(AName + ' is strict private to ' + FTypes[hh].Name + HerePos);
-  if (FTypes[hh].Meths[mi].Vis = VisPrivate) and FTypes[hh].Imported then
+  if (FTypes[hh].Meths[mi].Vis = VisPrivate) and FTypes[hh].Imported and not FGenMode then
     Die(AName + ' is private to ' + FTypes[hh].Name + '''s unit' + HerePos);
   if (not have) and NeedsArgs(FTypes[hh].Meths[mi]) then
     Die(AName + ' takes arguments' + HerePos);
@@ -9017,6 +9075,8 @@ var
   parent, ov, saveScope: LongInt;
   par: TTypeDef;
   vis: Byte;
+  jname: string;
+  jflags: LongInt;
 begin
   td := Default(TTypeDef);
   td.Kind := tykClass;
@@ -9248,6 +9308,8 @@ begin
       t := Self.ParseType;
       rname := '';
       wname := '';
+      jname := '';
+      jflags := 0;
       while FTok.Kind <> tkSemi do
       begin
         if FTok.Kind = tkRead then
@@ -9262,14 +9324,21 @@ begin
           wname := FTok.Lexeme;
           FTok := FLex.Next;
         end
+        else if (FTok.Kind = tkJson) and (jflags = 0) then
+          { a property in JSON (P205): by its read accessor }
+          ParseJsonDirective(t, 1, jname, jflags)
         else
           Die('property');
       end;
       Eat(tkSemi);
+      if isClassM and (jflags <> 0) then
+        Die('a class property is no member of an object: json writes none' + HerePos);
       n := Length(td.Props);
       SetLength(td.Props, n + 1);
       td.Props[n].Name := mname;
       td.Props[n].Typ := t;
+      td.Props[n].JName := jname;
+      td.Props[n].JFlags := jflags;
       td.Props[n].ReadOff := -1;
       td.Props[n].WriteOff := -1;
       td.Props[n].ReadName := rname;
@@ -9534,6 +9603,10 @@ begin
     end;
     Eat(tkColon);
     t := Self.ParseType;
+    jname := '';
+    jflags := 0;
+    if FTok.Kind = tkJson then
+      ParseJsonDirective(t, nn, jname, jflags);
     Eat(tkSemi);
     { x: T; static; is a class variable as class var declares one (P123) }
     isStatField := False;
@@ -9543,6 +9616,8 @@ begin
       Eat(tkSemi);
       isStatField := True;
     end;
+    if (cvarMode or isStatField) and (jflags <> 0) then
+      Die('a class variable is no member of an object: json writes none' + HerePos);
     sz := ValSize(t);
     for i := 0 to nn - 1 do
     begin
@@ -9572,6 +9647,8 @@ begin
       td.Fields[n].Name := names[i];
       td.Fields[n].Typ := t;
       td.Fields[n].Vis := vis;
+      td.Fields[n].JName := jname;
+      td.Fields[n].JFlags := jflags;
       off := FieldAt(off, t);
       td.Fields[n].Off := off;
       off := off + sz;
@@ -9622,6 +9699,7 @@ begin
   td.Nested := FTypes[Result].Nested;
   CheckScopeMembers(Result, td);
   FTypes[Result] := td;
+  CheckJsonNames(Result);
   FMemberScope := saveScope;
 end;
 
@@ -9632,6 +9710,8 @@ var
   ntn, nn, i, n: SizeInt;
   td: TTypeDef;
   names: array of string;
+  jname: string;
+  jflags: LongInt;
 begin
   Eat(tkGeneric);
   if FTok.Kind <> tkIdent then
@@ -9676,6 +9756,10 @@ begin
     end;
     Eat(tkColon);
     t := Self.ParseType;
+    jname := '';
+    jflags := 0;
+    if FTok.Kind = tkJson then
+      ParseJsonDirective(t, nn, jname, jflags);
     Eat(tkSemi);
     sz := ValSize(t);
     for i := 0 to nn - 1 do
@@ -9685,6 +9769,8 @@ begin
       SetLength(td.Fields, n + 1);
       td.Fields[n].Name := names[i];
       td.Fields[n].Typ := t;
+      td.Fields[n].JName := jname;
+      td.Fields[n].JFlags := jflags;
       off := FieldAt(off, t);
       td.Fields[n].Off := off;
       off := off + sz;
@@ -9699,12 +9785,219 @@ begin
   AddNamedType(name, td);
 end;
 
+{ A type json writes as a number (P205): an integer of any width, a
+  subrange of one, a real, a Quad, a Currency; what quoted takes. }
+function TParser.JsonNumberTyp(T: LongInt): Boolean;
+var
+  k: TTypeKind;
+  b: LongInt;
+begin
+  k := TypeOf(T).Kind;
+  b := T;
+  if k = tykSubrange then
+  begin
+    b := TypeOf(T).Elem;
+    k := TypeOf(b).Kind;
+    if IsCharT(b) or (k = tykEnum) or (k = tykBoolean) then
+    begin
+      Result := False;
+      Exit;
+    end;
+  end;
+  Result := (IsIntId(b) or (k = tykInteger) or (k = tykReal) or (k = tykQuad) or
+    (k = tykCurrency)) and (b <> TyBoolean) and not IsCharT(b);
+end;
+
+{ The json directive after a member's type (P205): json, then the name
+  the member has in JSON, a string, and the options, each once, as the
+  options of Go's struct tag (encoding/json/v2 doc.go): omitzero,
+  omitempty, quoted (Go's string), required, ignore (Go's "-"), unknown
+  (Go's embedded fallback), embed, and rfc3339 for a TDateTime. T is
+  the member's type, NNames how many names its declaration gives. }
+procedure TParser.ParseJsonDirective(T: LongInt; NNames: SizeInt; out JName: string;
+  out JFlags: LongInt);
+var
+  f: LongInt;
+  w, at, wat: string;
+begin
+  JName := '';
+  JFlags := 0;
+  at := HerePos;
+  Eat(tkJson);
+  if (FTok.Kind = tkString) or (FTok.Kind = tkChar) then
+  begin
+    while (FTok.Kind = tkString) or (FTok.Kind = tkChar) do
+    begin
+      if FTok.Kind = tkString then
+        JName := JName + FTok.Lexeme
+      else
+      begin
+        if (FTok.IntVal < 0) or (FTok.IntVal > 255) then
+          Die('char code' + HerePos);
+        JName := JName + Char(FTok.IntVal);
+      end;
+      FTok := FLex.Next;
+    end;
+    if JName = '' then
+      Die('a json name is not empty: leave the name out for the member''s own' + at);
+    if PasUtf8Valid(@JName[1], Length(JName), True) >= 0 then
+      Die('a json name is UTF-8 with no noncharacter (RFC 7493 2.1)' + at);
+    if NNames > 1 then
+      Die('a json name names one member, and this declaration gives ' + IntToStr(NNames) + at);
+    JFlags := JfName;
+  end;
+  while FTok.Kind = tkIdent do
+  begin
+    w := ToLower(FTok.Lexeme);
+    wat := HerePos;
+    if w = 'omitzero' then
+      f := JfOmitZero
+    else if w = 'omitempty' then
+      f := JfOmitEmpty
+    else if w = 'quoted' then
+      f := JfQuoted
+    else if w = 'required' then
+      f := JfRequired
+    else if w = 'ignore' then
+      f := JfIgnore
+    else if w = 'unknown' then
+      f := JfUnknown
+    else if w = 'embed' then
+      f := JfEmbed
+    else if w = 'rfc3339' then
+      f := JfRfc3339
+    else
+    begin
+      Die(FTok.Lexeme + ' is no json option: omitzero, omitempty, quoted, required, ignore, ' +
+        'unknown, embed or rfc3339' + wat);
+      f := 0;
+    end;
+    if (JFlags and f) <> 0 then
+      Die('json ' + w + ' twice' + wat);
+    JFlags := JFlags or f;
+    FTok := FLex.Next;
+  end;
+  if JFlags = 0 then
+    Die('json after a member''s type takes its name, a string, or its options' + at);
+  if FInVariant and (JFlags <> JfIgnore) then
+    Die('a member of a variant part takes json ignore alone: json writes no variant' + at);
+  { a generic's T is checked in each instance, its type known there }
+  if TypeOf(T).Kind <> tykParam then
+    CheckJsonTyp(T, JFlags, at);
+end;
+
+{ The options of a json directive the member's type T takes (P205). }
+procedure TParser.CheckJsonTyp(T: LongInt; JFlags: LongInt; const At: string);
+var
+  k: TTypeKind;
+  pt: LongInt;
+begin
+  k := TypeOf(T).Kind;
+  if ((JFlags and JfIgnore) <> 0) and (JFlags <> JfIgnore) then
+    Die('json ignore leaves the member out and takes nothing else' + at);
+  if (JFlags and JfEmbed) <> 0 then
+  begin
+    if JFlags <> JfEmbed then
+      Die('json embed puts the record''s members in place of its own and takes nothing else' + at);
+    pt := T;
+    if k = tykPointer then
+      pt := TypeOf(T).Elem;
+    if (pt <= 0) or (TypeOf(pt).Kind <> tykRecord) then
+      Die('json embed takes a record or a pointer to one, not ' + TypName(T) + at);
+  end;
+  if (JFlags and JfUnknown) <> 0 then
+  begin
+    if JFlags <> JfUnknown then
+      Die('json unknown keeps the members no other takes and takes nothing else' + at);
+    if k <> tykJson then
+      Die('json unknown takes a json, which keeps the members no other takes, not ' +
+        TypName(T) + at);
+  end;
+  if ((JFlags and JfQuoted) <> 0) and not JsonNumberTyp(T) then
+    Die('json quoted writes a number inside a string, and ' + TypName(T) +
+      ' is no number' + at);
+  if ((JFlags and JfRfc3339) <> 0) and not ((k = tykReal) and (T <> TySingle)) then
+    Die('json rfc3339 takes a TDateTime, a Double, not ' + TypName(T) + at);
+  if ((JFlags and JfRfc3339) <> 0) and ((JFlags and JfQuoted) <> 0) then
+    Die('json rfc3339 writes a string, and quoted a number in one' + at);
+end;
+
+{ The JSON names the members of record or class T give (P205), its
+  embedded records' in their place, in Names. }
+procedure TParser.JsonNamesOf(T: LongInt; var Names: TStrArray; Depth: LongInt);
+var
+  i: SizeInt;
+  et: LongInt;
+  td: TTypeDef;
+begin
+  if Depth > 32 then
+    Die('json embed goes 32 records deep: ' + TypName(T) + ' embeds itself' + HerePos);
+  td := TypeOf(T);
+  for i := 0 to High(td.Fields) do
+  begin
+    if (td.Fields[i].JFlags and (JfIgnore or JfUnknown)) <> 0 then
+      Continue;
+    if (td.Fields[i].Vis <> VisPublic) and ((td.Fields[i].JFlags and not JfVariant) = 0) then
+      Continue;
+    if (td.Fields[i].JFlags and JfEmbed) <> 0 then
+    begin
+      et := td.Fields[i].Typ;
+      if TypeOf(et).Kind = tykPointer then
+        et := TypeOf(et).Elem;
+      JsonNamesOf(et, Names, Depth + 1);
+      Continue;
+    end;
+    if (td.Fields[i].JFlags and JfName) <> 0 then
+      AppendStr(Names, td.Fields[i].JName)
+    else
+      AppendStr(Names, td.Fields[i].Name);
+  end;
+  for i := 0 to High(td.Props) do
+  begin
+    if (td.Props[i].JFlags and (JfIgnore or JfUnknown)) <> 0 then
+      Continue;
+    if (not td.Props[i].IsPublished) and (td.Props[i].JFlags = 0) then
+      Continue;
+    if (td.Props[i].JFlags and JfName) <> 0 then
+      AppendStr(Names, td.Props[i].JName)
+    else
+      AppendStr(Names, td.Props[i].Name);
+  end;
+end;
+
+{ No two members of record or class T have one JSON name, and one at
+  most keeps the unknown members (P205). }
+procedure TParser.CheckJsonNames(T: LongInt);
+var
+  names: TStrArray;
+  i, j, nu: SizeInt;
+  td: TTypeDef;
+begin
+  td := TypeOf(T);
+  nu := 0;
+  for i := 0 to High(td.Fields) do
+    if (td.Fields[i].JFlags and JfUnknown) <> 0 then
+      Inc(nu);
+  if nu > 1 then
+    Die(TypName(T) + ' has ' + IntToStr(nu) + ' members json unknown, and one keeps them' +
+      HerePos);
+  names := nil;
+  JsonNamesOf(T, names, 0);
+  for i := 0 to High(names) do
+    for j := i + 1 to High(names) do
+      if names[i] = names[j] then
+        Die('two members of ' + TypName(T) + ' are ''' + names[i] + ''' in JSON: json ''name'' ' +
+          'gives one another, json ignore leaves one out' + HerePos);
+end;
+
 function TParser.ParseRecPart(var Td: TTypeDef; Start: LongInt;
   Stop: TTokKind): LongInt;
 var
   cur, maxEnd, vend, sz, t: LongInt;
   n, nn, i: SizeInt;
   names: array of string;
+  jname: string;
+  jflags: LongInt;
 begin
   cur := Start;
   maxEnd := Start;
@@ -9743,6 +10036,10 @@ begin
     if (FRecSelf <> 0) and (TypeOf(t).Kind <> tykPointer) and (t > TyLastBuiltin) and
       (TypeOf(t).Size = 0) and (TypeOf(t).Kind <> tykClass) then
       Die('a record holds no field of its own type: ' + TypName(t) + HerePos);
+    jname := '';
+    jflags := 0;
+    if FTok.Kind = tkJson then
+      ParseJsonDirective(t, nn, jname, jflags);
     sz := ValSize(t);
     for i := 0 to nn - 1 do
     begin
@@ -9752,6 +10049,10 @@ begin
       Td.Fields[n].Name := names[i];
       Td.Fields[n].Typ := t;
       Td.Fields[n].Vis := FRecVis;
+      Td.Fields[n].JName := jname;
+      Td.Fields[n].JFlags := jflags;
+      if FInVariant then
+        Td.Fields[n].JFlags := jflags or JfVariant;
       cur := FieldAt(cur, t);
       Td.Fields[n].Off := cur;
       cur := cur + sz;
@@ -9769,6 +10070,7 @@ function TParser.ParseVariant(var Td: TTypeDef; Start: LongInt;
 var
   base, maxEnd, vend, sz, t, n: LongInt;
   tag: string;
+  saveVariant: Boolean;
 begin
   Eat(tkCase);
   base := Start;
@@ -9805,7 +10107,11 @@ begin
       Die('variant label');
     FTok := FLex.Next;
     Eat(tkLParen);
+    { a variant has no JSON form: no json directive in it (P205) }
+    saveVariant := FInVariant;
+    FInVariant := True;
     vend := ParseRecPart(Td, base, tkRParen);
+    FInVariant := saveVariant;
     Eat(tkRParen);
     if vend > maxEnd then
       maxEnd := vend;
@@ -10006,6 +10312,7 @@ begin
         td.Size := 1;
       FTypes[rid].Fields := td.Fields;
       FTypes[rid].Size := td.Size;
+      CheckJsonNames(rid);
       htd.Fields := td.Fields;
       CheckScopeMembers(rid, htd);
       if (Length(htd.Meths) > 0) or (Length(htd.Props) > 0) or (Length(htd.CVars) > 0) then
@@ -10723,6 +11030,7 @@ var
   etyp: LongInt;
   have, ctorHere, lst, noeq: Boolean;
   k: TTypeKind;
+  t2: LongInt;
 begin
   Result := nil;
   case FTok.Kind of
@@ -12178,6 +12486,46 @@ begin
           else
             Die('Delete takes a map and a key, or a string variable, an index and a count' +
               HerePos);
+        end
+        else if (SameId(name, 'JsonEncode') or SameId(name, 'JsonOf')) and
+          (FTok.Kind = tkLParen) and FindProc('JsonParse', pe) then
+        begin
+          { JsonEncode(j) of a json is pasjson's; of any other value, and
+            JsonOf, the functions the compiler writes for its type (P205) }
+          args := ParseArgList;
+          if (Length(args) < 1) or (Length(args) > 2) or
+            (SameId(name, 'JsonOf') and (Length(args) <> 1)) then
+            Die(name + ' takes a value' + HerePos);
+          CheckTyped(args[0]);
+          if (args[0]^.Kind = ekNil) or (TypeOf(args[0]^.Typ).Kind = tykJson) then
+          begin
+            if SameId(name, 'JsonOf') then
+            begin
+              if args[0]^.Kind = ekNil then
+                args[0]^.Typ := InternJson;
+              Result := args[0];
+            end
+            else
+            begin
+              if not FindProc(name, pe) or not ResolveProc(name, args, pe) then
+                Die('wrong arguments for ' + name + HerePos);
+              FillDefaults(pe, args);
+              Result := NewCall(pe.Sym, args, pe.RetTyp);
+            end;
+          end
+          else
+          begin
+            if Length(args) = 2 then
+            begin
+              if not NamedType('TJsonOptions', t2) then
+                Die('JsonEncode needs pasjson' + HerePos);
+              args[1] := ValArg(t2, args[1]);
+            end;
+            if SameId(name, 'JsonOf') then
+              Result := JsonTypedCall(2, args)
+            else
+              Result := JsonTypedCall(1, args);
+          end;
         end
         else if SameId(name, 'TryGet') and (FTok.Kind = tkLParen) then
         begin
@@ -18434,7 +18782,10 @@ begin
   { From 1.1.124 a type may be json, kind 26 (P203). }
   if Copy(data, 1, 11) = 'PASLANGI25' + #10 then
     Die(path + ' was compiled by a paslang older than 1.1.124; compile ' + AName + ' again');
-  if (Copy(data, 1, 8) = 'PASLANGI') and (Copy(data, 1, 11) <> 'PASLANGI26' + #10) then
+  { From 1.1.131 a member carries its json directive (P205). }
+  if Copy(data, 1, 11) = 'PASLANGI26' + #10 then
+    Die(path + ' was compiled by a paslang older than 1.1.131; compile ' + AName + ' again');
+  if (Copy(data, 1, 8) = 'PASLANGI') and (Copy(data, 1, 11) <> 'PASLANGI27' + #10) then
     Die(path + ' was compiled by a newer paslang (' + FirstLine(data) +
       '); compile ' + AName + ' again with this one');
   if not ParseIface(data, iface) then
@@ -22808,6 +23159,636 @@ begin
   FOps[n].Sym := pr.Sym;
 end;
 
+{ ---- typed JSON: the encoders the compiler writes (P205) ----
+
+  JsonEncode(x) and JsonOf(x) of a value that is no json call a function
+  the compiler writes for x's type. Each type gets an encoder, a routine
+  of Pascal text that the parser reads at the end of the unit, in its
+  own mode (FGenMode): $j and a name is the identifier json. and the
+  name, which no source can write, json.t and a number the type of that
+  number, and a member of any visibility may be read. The encoders write
+  through pasjson's TJsonOut, as Go's v2 arshalers write through its
+  jsontext.Encoder (encoding/json/v2 arshal.go). }
+
+{ S as a Pascal literal. }
+function PasLit(const S: string): string;
+var
+  i: SizeInt;
+begin
+  Result := '''';
+  for i := 1 to Length(S) do
+    if S[i] = '''' then
+      Result := Result + ''''''
+    else
+      Result := Result + S[i];
+  Result := Result + '''';
+end;
+
+{ Name quoted as JSON with the fewest escapes (Go's jsonwire.AppendQuote),
+  and a colon after it: the literal a member's name is written as. }
+function JsonNameLit(const Name: string): string;
+const
+  Digits = '0123456789abcdef';
+var
+  i: SizeInt;
+  b: Integer;
+  t: string;
+begin
+  t := '"';
+  for i := 1 to Length(Name) do
+  begin
+    b := Ord(Name[i]);
+    if b = 34 then
+      t := t + '\"'
+    else if b = 92 then
+      t := t + '\\'
+    else if b = 8 then
+      t := t + '\b'
+    else if b = 12 then
+      t := t + '\f'
+    else if b = 10 then
+      t := t + '\n'
+    else if b = 13 then
+      t := t + '\r'
+    else if b = 9 then
+      t := t + '\t'
+    else if b < 32 then
+      t := t + '\u00' + Digits[b div 16 + 1] + Digits[b mod 16 + 1]
+    else
+      t := t + Name[i];
+  end;
+  Result := PasLit(t + '":');
+end;
+
+function TParser.JsonTypRef(T: LongInt): string;
+begin
+  Result := '$jt' + IntToStr(T);
+end;
+
+{ The encoder of type T, asked for: its name in the text. }
+function TParser.JsonNeedEnc(T: LongInt): string;
+var
+  i: SizeInt;
+begin
+  Result := '$jenc' + IntToStr(T);
+  for i := 0 to High(FJsonEnc) do
+    if FJsonEnc[i] = T then
+      Exit;
+  i := Length(FJsonEnc);
+  SetLength(FJsonEnc, i + 1);
+  FJsonEnc[i] := T;
+end;
+
+function TParser.JsonNeedZero(T: LongInt): string;
+var
+  i: SizeInt;
+begin
+  Result := '$jzero' + IntToStr(T);
+  for i := 0 to High(FJsonZero) do
+    if FJsonZero[i] = T then
+      Exit;
+  i := Length(FJsonZero);
+  SetLength(FJsonZero, i + 1);
+  FJsonZero[i] := T;
+end;
+
+{ T and the type it is a subrange of. }
+function TParser.JsonBase(T: LongInt): LongInt;
+begin
+  Result := T;
+  if (T > 0) and (TypeOf(T).Kind = tykSubrange) then
+    Result := TypeOf(T).Elem;
+end;
+
+{ Whether type T has a JSON form, and why not when it has none. }
+function TParser.JsonForm(T: LongInt; out Why: string): Boolean;
+var
+  b: LongInt;
+  k: TTypeKind;
+begin
+  Result := True;
+  Why := '';
+  b := JsonBase(T);
+  k := TypeOf(b).Kind;
+  if IsCharT(b) or (b = TyBoolean) or (k = tykBoolean) or (k = tykEnum) or IsIntId(b) or
+    (k = tykInteger) or (k = tykReal) or (k = tykQuad) or (k = tykCurrency) or IsStrTyp(b) or
+    (k = tykJson) or (k = tykRecord) or (k = tykClass) or (k = tykSet) then
+    Exit;
+  if k = tykArray then
+  begin
+    if IsConstArr(b) then
+    begin
+      Why := 'an array of const';
+      Result := False;
+    end;
+    Exit;
+  end;
+  if (k = tykPointer) and (TypeOf(b).Elem > 0) and (TypeOf(b).Elem <> TyNone) then
+    Exit;
+  if (k = tykMap) or (k = tykTree) then
+  begin
+    { a name is a string, an integer or a member of an enumeration }
+    b := JsonBase(TypeOf(b).Elem);
+    k := TypeOf(b).Kind;
+    if IsStrTyp(b) or IsIntId(b) or (k = tykInteger) or (k = tykEnum) or IsCharT(b) or
+      (b = TyBoolean) then
+      Exit;
+    Why := 'a map or a tree whose key is no string, integer or enumeration';
+    Result := False;
+    Exit;
+  end;
+  Why := TypName(T);
+  Result := False;
+end;
+
+{ The statements that write value V of type T, a member's value with
+  its directive's Flags (quoted and rfc3339 apply to the value itself).
+  Who names the member, for an error. }
+function TParser.JsonValue(T: LongInt; const V: string; Flags: LongInt;
+  const Who: string): string;
+var
+  b, e: LongInt;
+  k: TTypeKind;
+  q, why: string;
+  i: SizeInt;
+begin
+  if not JsonForm(T, why) then
+    Die(Who + ' has no JSON form (' + why + '): json ignore leaves it out' + FJsonAt);
+  b := JsonBase(T);
+  k := TypeOf(b).Kind;
+  q := 'False';
+  if (Flags and JfQuoted) <> 0 then
+    q := 'True';
+  if k = tykJson then
+    Result := 'PasJsonOutJson(W, ' + V + ');'
+  else if IsCharT(b) then
+    Result := 'PasJsonOutChar(W, ' + V + ');'
+  else if (b = TyBoolean) or (k = tykBoolean) then
+    Result := 'PasJsonOutBool(W, ' + V + ');'
+  else if k = tykEnum then
+  begin
+    Result := 'case Ord(' + V + ') of ';
+    for i := 0 to High(FTypes[b].Nested) do
+      if FTypes[b].Nested[i].Kind = 1 then
+        Result := Result + IntToStr(i) + ': PasJsonOutRaw(W, ' +
+          PasLit('"' + FTypes[b].Nested[i].Name + '"') + '); ';
+    Result := Result + 'else PasJsonOutBadEnum(W, Ord(' + V + ')); end;';
+  end
+  else if IsIntId(b) or (k = tykInteger) then
+    Result := 'PasJsonOutInt(W, ' + V + ', ' + q + ');'
+  else if k = tykReal then
+  begin
+    if b = TySingle then
+      Result := 'PasJsonOutF32(W, ' + V + ', ' + q + ');'
+    else if (Flags and JfRfc3339) <> 0 then
+      Result := 'PasJsonOutTime(W, ' + V + ');'
+    else
+      Result := 'PasJsonOutF64(W, ' + V + ', ' + q + ');';
+  end
+  else if k = tykQuad then
+    Result := 'PasJsonOutQuad(W, ' + V + ', ' + q + ');'
+  else if k = tykCurrency then
+    Result := 'PasJsonOutCur(W, ' + V + ', ' + q + ');'
+  else if IsStrTyp(b) then
+    Result := 'PasJsonOutStr(W, ' + V + ');'
+  else if (k = tykArray) and (TypeOf(b).Elem = TyByte) and IsDynTyp(b) then
+    { bytes in base64, as Go writes a []byte (doc.go) }
+    Result := 'if Length(' + V + ') > 0 then PasJsonOutBytes(W, @' + V + '[0], Length(' + V +
+      ')) else PasJsonOutRaw(W, ''""'');'
+  else if (k = tykArray) and (TypeOf(b).Elem = TyByte) then
+    Result := 'PasJsonOutBytes(W, @' + V + ', SizeOf(' + V + '));'
+  else
+  begin
+    e := b;
+    Result := JsonNeedEnc(e) + '(W, ' + V + ');';
+  end;
+end;
+
+{ A Boolean expression: value V of type T is its type's zero, as Go's
+  omitzero asks (reflect.Value.IsZero: a real is zero when its bits are). }
+function TParser.JsonZero(T: LongInt; const V: string): string;
+var
+  b: LongInt;
+  k: TTypeKind;
+begin
+  b := JsonBase(T);
+  k := TypeOf(b).Kind;
+  if (k = tykJson) or (k = tykPointer) or (k = tykClass) or (k = tykMap) or (k = tykTree) then
+    Result := '(' + V + ' = nil)'
+  else if (k = tykArray) and IsDynTyp(b) then
+    Result := '(Length(' + V + ') = 0)'
+  else if IsStrTyp(b) then
+    Result := '(' + V + ' = '''')'
+  else if (b = TyBoolean) or (k = tykBoolean) then
+    Result := '(not ' + V + ')'
+  else if IsCharT(b) or (k = tykEnum) then
+    Result := '(Ord(' + V + ') = 0)'
+  else if k = tykReal then
+  begin
+    if b = TySingle then
+      Result := 'PasJsonOutZeroF32(' + V + ')'
+    else
+      Result := 'PasJsonOutZeroF64(' + V + ')';
+  end
+  else if k = tykQuad then
+    Result := 'PasJsonOutZeroQuad(' + V + ')'
+  else if k = tykSet then
+    Result := '(' + V + ' = [])'
+  else if (k = tykRecord) or (k = tykArray) then
+    Result := JsonNeedZero(b) + '(' + V + ')'
+  else
+    Result := '(' + V + ' = 0)';
+end;
+
+{ The statements that write the members of record or class T at Base
+  (X, or X.F of a field it embeds), each by its directive; Unknown gets
+  the json that keeps the members no field takes. Who names T. }
+procedure TParser.JsonMembers(T: LongInt; const Base, Who: string; var Body: string;
+  var Unknown: string; Depth: LongInt);
+var
+  td: TTypeDef;
+  i: SizeInt;
+  f, et: LongInt;
+  nm, v, w, put: string;
+begin
+  if Depth > 32 then
+    Die('json embed goes 32 records deep in ' + Who + FJsonAt);
+  td := TypeOf(T);
+  for i := 0 to High(td.Fields) do
+  begin
+    f := td.Fields[i].JFlags and not JfVariant;
+    if (f and JfIgnore) <> 0 then
+      Continue;
+    if (td.Fields[i].Vis <> VisPublic) and (f = 0) then
+      Continue;
+    v := Base + '.' + td.Fields[i].Name;
+    w := Who + '.' + td.Fields[i].Name;
+    if (td.Fields[i].JFlags and JfVariant) <> 0 then
+      Die(w + ' is in a variant part and has no JSON form: json ignore on each of the part''s ' +
+        'fields leaves it out' + FJsonAt);
+    if (f and JfUnknown) <> 0 then
+    begin
+      Unknown := v;
+      Continue;
+    end;
+    if (f and JfEmbed) <> 0 then
+    begin
+      et := td.Fields[i].Typ;
+      if TypeOf(et).Kind = tykPointer then
+      begin
+        Body := Body + 'if ' + v + ' <> nil then begin ' + #10;
+        JsonMembers(TypeOf(et).Elem, v + '^', w, Body, Unknown, Depth + 1);
+        Body := Body + 'end;' + #10;
+      end
+      else
+        JsonMembers(et, v, w, Body, Unknown, Depth + 1);
+      Continue;
+    end;
+    if (f and JfName) <> 0 then
+      nm := td.Fields[i].JName
+    else
+      nm := td.Fields[i].Name;
+    put := 'PasJsonOutName(W, ' + JsonNameLit(nm) + '); ' + JsonValue(td.Fields[i].Typ, v, f, w);
+    if (f and JfOmitEmpty) <> 0 then
+      put := 'm := PasJsonOutMark(W); ' + put + ' PasJsonOutDrop(W, m);';
+    if (f and JfOmitZero) <> 0 then
+      put := 'if not ' + JsonZero(td.Fields[i].Typ, v) + ' then begin ' + put + ' end;';
+    Body := Body + put + #10;
+  end;
+  for i := 0 to High(td.Props) do
+  begin
+    f := td.Props[i].JFlags;
+    if (f and JfIgnore) <> 0 then
+      Continue;
+    if (not td.Props[i].IsPublished) and (f = 0) then
+      Continue;
+    w := Who + '.' + td.Props[i].Name;
+    if (td.Props[i].ReadName = '') or (td.Props[i].NIndex > 0) then
+    begin
+      if f <> 0 then
+        Die(w + ' is read by no accessor, or by an index: json writes no such property' + FJsonAt);
+      Continue;
+    end;
+    v := Base + '.' + td.Props[i].Name;
+    if (f and JfName) <> 0 then
+      nm := td.Props[i].JName
+    else
+      nm := td.Props[i].Name;
+    put := 'PasJsonOutName(W, ' + JsonNameLit(nm) + '); ' + JsonValue(td.Props[i].Typ, v, f, w);
+    if (f and JfOmitEmpty) <> 0 then
+      put := 'm := PasJsonOutMark(W); ' + put + ' PasJsonOutDrop(W, m);';
+    if (f and JfOmitZero) <> 0 then
+      put := 'if not ' + JsonZero(td.Props[i].Typ, v) + ' then begin ' + put + ' end;';
+    Body := Body + put + #10;
+  end;
+end;
+
+{ The text of the encoder of type T: a procedure that writes X. }
+function TParser.JsonEncText(T: LongInt): string;
+var
+  k: TTypeKind;
+  body, unk, head, ix, kt, ktext: string;
+  td: TTypeDef;
+  kb, e: LongInt;
+  lo, hi: Int64;
+begin
+  td := TypeOf(T);
+  k := td.Kind;
+  head := 'procedure $jenc' + IntToStr(T) + '(var W: TJsonOut; const X: ' + JsonTypRef(T) + ');';
+  body := '';
+  unk := '';
+  if (k = tykRecord) or (k = tykClass) then
+  begin
+    JsonMembers(T, 'X', TypName(T), body, unk, 0);
+    if unk <> '' then
+      body := body + 'PasJsonOutMembers(W, ' + unk + ');' + #10;
+    body := 'PasJsonOutOpen(W, True);' + #10 + body + 'PasJsonOutClose(W);' + #10;
+    if k = tykClass then
+      body := 'if X = nil then PasJsonOutNull(W) else begin' + #10 + body + 'end;' + #10;
+    Result := head + #10 + 'var m: TJsonOutMark;' + #10 + 'begin' + #10 + body + 'end;' + #10;
+  end
+  else if (k = tykArray) and IsDynTyp(T) then
+    Result := head + #10 + 'var i: Integer;' + #10 + 'begin' + #10 +
+      'PasJsonOutOpen(W, False);' + #10 + 'for i := 0 to High(X) do begin PasJsonOutItem(W); ' +
+      JsonValue(td.Elem, 'X[i]', 0, TypName(T) + '[i]') + ' end;' + #10 +
+      'PasJsonOutClose(W);' + #10 + 'end;' + #10
+  else if k = tykArray then
+  begin
+    if td.Elem2 > 0 then
+      ix := JsonTypRef(td.Elem2)
+    else
+      ix := 'Integer';
+    Result := head + #10 + 'var i: ' + ix + ';' + #10 + 'begin' + #10 +
+      'PasJsonOutOpen(W, False);' + #10 + 'for i := Low(X) to High(X) do begin PasJsonOutItem(W); ' +
+      JsonValue(td.Elem, 'X[i]', 0, TypName(T) + '[i]') + ' end;' + #10 +
+      'PasJsonOutClose(W);' + #10 + 'end;' + #10;
+  end
+  else if k = tykSet then
+  begin
+    { the members in their order: a set of a 256 values at most }
+    e := td.Elem;
+    kb := JsonBase(e);
+    if TypeOf(e).Kind = tykSubrange then
+    begin
+      lo := TypeOf(e).Lo;
+      hi := TypeOf(e).Hi;
+    end
+    else if TypeOf(kb).Kind = tykEnum then
+    begin
+      lo := 0;
+      hi := TypeOf(kb).Hi;
+    end
+    else if kb = TyBoolean then
+    begin
+      lo := 0;
+      hi := 1;
+    end
+    else
+    begin
+      lo := 0;
+      hi := 255;
+    end;
+    ix := JsonTypRef(e) + '(i)';
+    Result := head + #10 + 'var i: Integer;' + #10 + 'begin' + #10 +
+      'PasJsonOutOpen(W, False);' + #10 + 'for i := ' + IntToStr(lo) + ' to ' + IntToStr(hi) +
+      ' do if ' + ix + ' in X then begin PasJsonOutItem(W); ' +
+      JsonValue(e, ix, 0, TypName(T)) + ' end;' + #10 + 'PasJsonOutClose(W);' + #10 + 'end;' + #10;
+  end
+  else if k = tykPointer then
+    Result := head + #10 + 'begin' + #10 + 'if X = nil then PasJsonOutNull(W) else begin ' +
+      JsonValue(td.Elem, 'X^', 0, TypName(T) + '^') + ' end;' + #10 + 'end;' + #10
+  else if (k = tykMap) or (k = tykTree) then
+  begin
+    { a map's members in the order of their names, as Go's v2 writes a
+      map with Deterministic (strings.Compare); a tree's in its own; a nil
+      one is an empty object, as v2 writes a nil map (FormatNilMapAsNull
+      off) }
+    kb := JsonBase(td.Elem);
+    kt := JsonTypRef(td.Elem);
+    if IsStrTyp(kb) then
+      ktext := 'k'
+    else if IsCharT(kb) then
+      ktext := '('''' + k)'
+    else if (TypeOf(kb).Kind = tykEnum) or (kb = TyBoolean) then
+      ktext := ''
+    else
+      ktext := 'PasJsonOutIntName(k)';
+    if k = tykMap then
+    begin
+      Result := head + #10 + 'var ps: TJsonOutPairs; k: ' + kt + '; nm: string; i, n: Integer;' +
+        #10 + 'begin' + #10 + 'if X = nil then begin PasJsonOutRaw(W, ''{}''); Exit; end;' + #10 +
+        'SetLength(ps, Length(X)); n := 0;' + #10 + 'for k in X do begin ';
+      if ktext = '' then
+        Result := Result + JsonKeyName(kb, 'k') + ' ps[n].Name := nm;'
+      else
+        Result := Result + 'ps[n].Name := ' + ktext + ';';
+      if not IsStrTyp(kb) then
+        Result := Result + ' ps[n].Key := Ord(k);';
+      Result := Result + ' n := n + 1; end;' + #10 + 'PasJsonOutSortPairs(ps);' + #10;
+      if IsStrTyp(kb) then
+        ix := 'X[ps[i].Name]'
+      else
+        ix := 'X[' + kt + '(ps[i].Key)]';
+      Result := Result + 'PasJsonOutOpen(W, True);' + #10 +
+        'for i := 0 to n - 1 do begin PasJsonOutNameStr(W, ps[i].Name); ' +
+        JsonValue(td.Elem2, ix, 0, TypName(T) + '[k]') + ' end;' + #10 +
+        'PasJsonOutClose(W);' + #10 + 'end;' + #10;
+    end
+    else
+    begin
+      Result := head + #10 + 'var k: ' + kt + '; v: ' + JsonTypRef(td.Elem2) + '; nm: string;' +
+        #10 + 'begin' + #10 + 'if X = nil then begin PasJsonOutRaw(W, ''{}''); Exit; end;' + #10 +
+        'PasJsonOutOpen(W, True);' + #10 + 'for k, v in X do begin ';
+      if ktext = '' then
+        Result := Result + JsonKeyName(kb, 'k') + ' PasJsonOutNameStr(W, nm);'
+      else
+        Result := Result + 'PasJsonOutNameStr(W, ' + ktext + ');';
+      Result := Result + ' ' + JsonValue(td.Elem2, 'v', 0, TypName(T) + '[k]') + ' end;' + #10 +
+        'PasJsonOutClose(W);' + #10 + 'end;' + #10;
+    end;
+  end
+  else
+    Die(TypName(T) + ' has no JSON form' + FJsonAt);
+end;
+
+{ A member of an enumeration, or a Boolean, as a map's key: the
+  statement that puts its name in nm. }
+function TParser.JsonKeyName(B: LongInt; const V: string): string;
+var
+  i: SizeInt;
+begin
+  if B = TyBoolean then
+  begin
+    Result := 'if ' + V + ' then nm := ''true'' else nm := ''false'';';
+    Exit;
+  end;
+  Result := 'case Ord(' + V + ') of ';
+  for i := 0 to High(FTypes[B].Nested) do
+    if FTypes[B].Nested[i].Kind = 1 then
+      Result := Result + IntToStr(i) + ': nm := ' + PasLit(FTypes[B].Nested[i].Name) + '; ';
+  Result := Result + 'else nm := ''''; end;';
+end;
+
+{ The text of the zero test of record or static array T. }
+function TParser.JsonZeroText(T: LongInt): string;
+var
+  td: TTypeDef;
+  i: SizeInt;
+  allz, ix: string;
+begin
+  td := TypeOf(T);
+  Result := 'function $jzero' + IntToStr(T) + '(const X: ' + JsonTypRef(T) + '): Boolean;' + #10;
+  if td.Kind = tykRecord then
+  begin
+    allz := 'True';
+    for i := 0 to High(td.Fields) do
+      allz := allz + ' and ' + JsonZero(td.Fields[i].Typ, 'X.' + td.Fields[i].Name);
+    Result := Result + 'begin' + #10 + 'Result := ' + allz + ';' + #10 + 'end;' + #10;
+  end
+  else
+  begin
+    if td.Elem2 > 0 then
+      ix := JsonTypRef(td.Elem2)
+    else
+      ix := 'Integer';
+    Result := Result + 'var i: ' + ix + ';' + #10 + 'begin' + #10 + 'Result := True;' + #10 +
+      'for i := Low(X) to High(X) do if not ' + JsonZero(td.Elem, 'X[i]') +
+      ' then begin Result := False; Exit; end;' + #10 + 'end;' + #10;
+  end;
+end;
+
+{ JsonEncode(x[, opts]) or JsonOf(x) of a value of type T that is no
+  json: the call of the function written for T. }
+function TParser.JsonTypedCall(Want: LongInt; const Args: TExprArray): PExpr;
+var
+  t: LongInt;
+  i: SizeInt;
+  a: TExprArray;
+  pe: TProcEnt;
+  why: string;
+  found: Boolean;
+begin
+  t := Args[0]^.Typ;
+  if not JsonForm(t, why) then
+    Die('JsonEncode takes a value with a JSON form, and ' + TypName(t) + ' has none' + HerePos);
+  if FJsonAt = '' then
+    FJsonAt := HerePos;
+  found := False;
+  for i := 0 to High(FJsonText) do
+    if FJsonText[i] = t then
+      found := True;
+  if not found then
+  begin
+    i := Length(FJsonText);
+    SetLength(FJsonText, i + 1);
+    FJsonText[i] := t;
+  end;
+  a := nil;
+  if Want = 1 then
+  begin
+    SetLength(a, 2);
+    a[0] := Args[0];
+    if Length(Args) > 1 then
+      a[1] := Args[1]
+    else
+    begin
+      if not FindProc('JsonDefaults', pe) then
+        Die('JsonEncode needs pasjson' + HerePos);
+      a[1] := NewCall(pe.Sym, nil, pe.RetTyp);
+    end;
+    Result := NewCall(ProcSym(FUnitName, 'json.text' + IntToStr(t)), a, TyString);
+  end
+  else
+  begin
+    SetLength(a, 1);
+    a[0] := Args[0];
+    Result := NewCall(ProcSym(FUnitName, 'json.of' + IntToStr(t)), a, InternJson);
+  end;
+end;
+
+{ The functions JsonEncode and JsonOf call, and every encoder they need,
+  as Pascal text the parser reads in its own mode, at the end of the
+  unit: headers first, then bodies. }
+procedure TParser.GenJsonCode;
+var
+  src, heads, bodies, txt, h: string;
+  i, ne, nz: SizeInt;
+  t: LongInt;
+  saveLex: TLexer;
+  saveTok: TToken;
+  saveImpl, saveCheck: Boolean;
+  lex: TLexer;
+begin
+  if Length(FJsonText) = 0 then
+    Exit;
+  heads := '';
+  bodies := '';
+  for i := 0 to High(FJsonText) do
+  begin
+    t := FJsonText[i];
+    { the length of the last text, the room of the next }
+    heads := 'var $jhint' + IntToStr(t) + ': Integer;' + #10 + heads;
+    h := 'function $jtext' + IntToStr(t) + '(const X: ' + JsonTypRef(t) +
+      '; const Opts: TJsonOptions): string;';
+    heads := heads + h + ' forward;' + #10;
+    bodies := bodies + h + #10 + 'var W: TJsonOut;' + #10 + 'begin' + #10 +
+      'PasJsonOutInit(W, Opts, AtomicLoad($jhint' + IntToStr(t) + '));' + #10 +
+      JsonValue(t, 'X', 0, TypName(t)) + #10 + 'AtomicStore($jhint' + IntToStr(t) + ', W.N);' +
+      #10 + 'Result := PasJsonOutText(W, Opts);' + #10 + 'end;' + #10;
+    h := 'function $jof' + IntToStr(t) + '(const X: ' + JsonTypRef(t) + '): json;';
+    heads := heads + h + ' forward;' + #10;
+    bodies := bodies + h + #10 + 'begin' + #10 +
+      'Result := JsonParse($jtext' + IntToStr(t) + '(X, JsonDefaults));' + #10 + 'end;' + #10;
+  end;
+  { the encoders the ones before need, until none is new }
+  ne := 0;
+  nz := 0;
+  while (ne < Length(FJsonEnc)) or (nz < Length(FJsonZero)) do
+  begin
+    if ne < Length(FJsonEnc) then
+    begin
+      t := FJsonEnc[ne];
+      ne := ne + 1;
+      txt := JsonEncText(t);
+      heads := heads + Copy(txt, 1, Pos(#10, txt) - 1) + ' forward;' + #10;
+      bodies := bodies + txt;
+    end
+    else
+    begin
+      t := FJsonZero[nz];
+      nz := nz + 1;
+      txt := JsonZeroText(t);
+      heads := heads + Copy(txt, 1, Pos(#10, txt) - 1) + ' forward;' + #10;
+      bodies := bodies + txt;
+    end;
+  end;
+  src := heads + bodies;
+  if GetEnv('PASLANG_JSONGEN') <> '' then
+    WriteLn(ErrOutput, src);
+  saveLex := FLex;
+  saveTok := FTok;
+  saveImpl := FInImpl;
+  saveCheck := FNameCheck;
+  lex := TLexer.Create(src);
+  lex.SetTarget(FArm);
+  lex.SetVersion(PaslangVersion);
+  lex.SetCpu(FArm, saveLex.CpuSet, saveLex.CpuTune);
+  lex.Gen := True;
+  FLex := lex;
+  FTok := FLex.Next;
+  FGenMode := True;
+  FInImpl := True;
+  FNameCheck := False;
+  ParseDecls(True);
+  if FTok.Kind <> tkEof then
+    Die('the encoders the compiler writes do not read back: ' + FTok.Lexeme + HerePos);
+  FGenMode := False;
+  FInImpl := saveImpl;
+  FNameCheck := saveCheck;
+  FLex := saveLex;
+  FTok := saveTok;
+end;
+
 procedure TParser.ParseDecls(NeedBody: Boolean);
 var
   pr: TProc;
@@ -22963,6 +23944,8 @@ begin
     LifeCalls(FClassDtors, True));
   FProg.Vars := FVars;
   Eat(tkDot);
+  { the encoders the program's JsonEncode and JsonOf need (P205) }
+  GenJsonCode;
   CheckMethodBodies;
   for i := 0 to High(FProg.Procs) do
     if FProg.Procs[i].IsFwd and (FProg.Procs[i].Body = nil) then
@@ -23048,6 +24031,8 @@ begin
   FProg.FiniBody := JoinStmts(FProg.FiniBody, LifeCalls(FClassDtors, True));
   Eat(tkEnd);
   Eat(tkDot);
+  { the encoders the unit's JsonEncode and JsonOf need (P205) }
+  GenJsonCode;
   CheckMethodBodies;
   FProg.Vars := FVars;
   FProg.Types := FTypes;

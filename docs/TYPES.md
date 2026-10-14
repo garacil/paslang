@@ -719,6 +719,16 @@ descends from it. `TJsonIndex` reads an object's members in O(1) through
 a table seeded per index. A document is read by any number of routines
 at once; nothing in it is written after the parse.
 
+Any value with a JSON form is written by `JsonEncode(x)` and made a
+json by `JsonOf(x)` (P205): the compiler writes an encoder for its type,
+Pascal it parses at the end of the unit in a mode of its own (names
+`$j...` no source can write, types by number, every member visible),
+over pasjson's `TJsonOut`. A field or a property takes a `json`
+directive after its type, its name and options (`omitzero`, `omitempty`,
+`quoted`, `required`, `ignore`, `unknown`, `embed`, `rfc3339`), kept in
+`TField` and `TPropInfo` (`JName`, `JFlags`) and in the `.pi`
+(PASLANGI27: two more parts on `FLD` and `PROP`).
+
 ## Sync types
 
 `mutex` (32 bytes), `rwmutex` (48), `waitgroup` (24), `cond` (16), and

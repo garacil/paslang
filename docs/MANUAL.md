@@ -5830,6 +5830,167 @@ order 9: 2 lines, 960 cents
 [  "corner"]
 ```
 
+### Records, classes and any value: JsonEncode
+
+`JsonEncode(x)` and `JsonEncode(x, opts)` write a value of any type
+that has a JSON form, and `JsonOf(x)` makes it a `json` (1.1.131). The
+compiler writes an encoder for each type it is given, Pascal it reads at
+the end of the unit and links like any routine: no reflection, no table
+read at run time. A member says how it is written with a `json`
+directive after its type, the name first and the options after, as Go's
+struct tags do (`encoding/json/v2`):
+
+```pascal
+Name: string json 'full_name' omitempty;
+Count: Integer json quoted;
+Base: TBase json embed;
+Rest: json json unknown;
+Secret: string json ignore;
+property Title: string read FTitle write FTitle json 'title';
+```
+
+| Option | What it does | Go's tag |
+|---|---|---|
+| `'name'` | the member's name in JSON, any UTF-8 text | the name |
+| `omitzero` | left out when it is its type's zero: 0, `''`, `False`, `nil`, an empty array, a record of zeros (a real is zero when its bits are, so `-0` is written) | `omitzero` |
+| `omitempty` | left out when it is written as `null`, `""`, `{}` or `[]` | `omitempty` |
+| `quoted` | a number written inside a string, `"12"` | `string` |
+| `required` | read in P206 | |
+| `ignore` | never written | `-` |
+| `embed` | a record's members, or a pointer's to one, in place of its own | `embed` |
+| `unknown` | a `json` object whose members are written after the others | `embed` on a `jsontext.Value` |
+| `rfc3339` | a `TDateTime` written as RFC 3339 text in UTC, to the millisecond | |
+
+A record writes its fields; a class its public fields and properties,
+its ancestors' first, a property through what it reads; a member of any
+visibility with a directive is written, and `json ignore` leaves any
+out. The members go in the order they are declared, an embedded record's
+in its place, the members `unknown` keeps last. A class is written by
+its static type, `nil` as `null`. A type with no JSON form (a channel, a
+mutex, a heap, a store, an untyped `Pointer`, a routine, an interface,
+a field of a variant part) is a compile error that names the member and
+says that `json ignore` leaves it out; a directive that does not fit its
+member is one too.
+
+| Type | JSON |
+|---|---|
+| integers, integer subranges | a number |
+| `Boolean` | `true`, `false` |
+| `Char` | a string of one byte (past 127 an error: alone it is no UTF-8) |
+| `string` | a string, the fewest escapes; not UTF-8 or a noncharacter is an error |
+| `Double`, `Single`, `Quad` | the shortest number that reads back as it; NaN and the infinities are errors |
+| `Currency` | the number it is exactly, `12.34` |
+| an enumeration | the member's name, `"Admin"` |
+| a set | an array of its members in order |
+| a record | an object |
+| a static array | an array |
+| `array of Byte`, `array[...] of Byte` | a string in base64 (RFC 4648), as Go writes `[]byte` |
+| a dynamic array | an array, `[]` when empty |
+| `map[K] of V` (K a string, an integer, a `Char`, a `Boolean` or an enumeration) | an object, its names in order, as Go's with `Deterministic`; `{}` when `nil` |
+| `tree[K] of V` | an object in the tree's order |
+| a class | an object, or `null` |
+| `^T` | `T`, or `null` |
+| `json` | the value as it is |
+
+An error at run time raises `EJsonError` with the JSON Pointer of the
+value: a string that is not UTF-8, NaN, a `Char` past 127, a value no
+member of its enumeration, a `TDateTime` outside the years 1 to 9999,
+`unknown` that holds no object, a level past `MaxDepth` (a cycle of
+pointers ends there). `JsonPretty` writes a value a line, as a document
+is written; `JsonCanonical` writes RFC 8785's form; `EscapeHtml` escapes
+`<`, `>` and `&` in the names too. `scripts/jsonmodel.py` writes 150
+random record types and values in what paslang and Go share and holds
+every line, on one line and a value a line, to what Go's `v2` writes,
+on both machines; `testdata/jsonbind1` holds the rest.
+
+`examples/jsonbind.paslang`:
+
+```pascal
+{ JSON written from records and classes: a json directive after a
+  member's type gives its name and options, json ignore leaves it out;
+  JsonEncode writes a value of any type with a JSON form, JsonOf makes
+  it a json. }
+program jsonbind;
+
+uses
+  sysutils;
+
+type
+  TRole = (Reader, Writer, Admin);
+
+  TAddress = record
+    Street: string json 'street';
+    Zip: Integer json 'zip' quoted;
+  end;
+
+  TUser = class
+  private
+    FName: string;
+    FPassword: string;
+  public
+    Id: Integer json 'id';
+    Roles: set of TRole json 'roles';
+    Home: TAddress json embed;
+    Phones: array of string json 'phones' omitempty;
+    Joined: TDateTime json 'joined' rfc3339;
+    Balance: Currency json 'balance';
+    Note: string json 'note' omitzero;
+    property Name: string read FName write FName json 'name';
+    property Password: string read FPassword write FPassword json ignore;
+  end;
+
+var
+  u: TUser;
+  doc: json;
+
+begin
+  u := TUser.Create;
+  u.Id := 7;
+  u.Name := 'Ana';
+  u.Password := 'secret';
+  u.Roles := [Reader, Admin];
+  u.Home.Street := 'Calle Mayor 1';
+  u.Home.Zip := 3001;
+  u.Joined := EncodeDate(2026, 10, 14) + EncodeTime(9, 30, 0, 0);
+  u.Balance := 1234.5;
+  WriteLn(JsonEncode(u));
+  SetLength(u.Phones, 1);
+  u.Phones[0] := '+34 600 000 000';
+  WriteLn(JsonEncode(u, JsonPretty));
+  doc := JsonOf(u);
+  WriteLn(doc['roles'][1], ' ', doc['zip'].AsString, ' ', JsonEncode(u.Roles));
+  u.Free;
+end.
+```
+
+prints
+
+```
+{"id":7,"roles":["Reader","Admin"],"street":"Calle Mayor 1","zip":"3001","joined":"2026-10-14T09:30:00Z","balance":1234.5,"name":"Ana"}
+{
+  "id": 7,
+  "roles": [
+    "Reader",
+    "Admin"
+  ],
+  "street": "Calle Mayor 1",
+  "zip": "3001",
+  "phones": [
+    "+34 600 000 000"
+  ],
+  "joined": "2026-10-14T09:30:00Z",
+  "balance": 1234.5,
+  "name": "Ana"
+}
+"Admin" 3001 ["Reader","Admin"]
+```
+
+Writing typed values is as fast as the documents: 20000 records of an
+integer, a string, an array of strings, a real, a Boolean, an array of
+records and a map, written twenty times, take 0.79 of the time of Go's
+`v2` with `Deterministic` and 0.80 of `v1` on one line, 0.74 and 0.70 a
+value a line, with less memory (`scripts/bench/b35bind`).
+
 ### Speed
 
 The text is scanned 64 bytes at a time by the kernel of the processor
@@ -12061,7 +12222,9 @@ its place:
   High Odd SizeOf Length Copy Delete Clear TryGet Default Assigned
   SetLength Inc Dec GetMem FreeMem Move FillChar CompareByte IndexByte
   View MemBase MemSize MemEnd`, and Pascal's string words `Pos Insert Concat UpCase LowerCase
-  StringOfChar Str Val` (1.1.10);
+  StringOfChar Str Val` (1.1.10), and `JsonOf` (§12, 1.1.131); the options
+  of a `json` directive, `omitzero` … `rfc3339`, are words only after
+  `json` and stay names;
 - the tree, heap and store words (§11): `Rank KeyAt PopLow PopHigh Split
   Join Include Exclude Push Pop StoreOpen StorePut StoreGet StoreDelete
   StoreSync StoreClose StoreAbandon`, and the types `tree`, `heap` and
@@ -12119,8 +12282,10 @@ its place:
   (§12) `JsonParse TryJsonParse JsonEncode JsonIndex JsonDefaults
   JsonPretty JsonCanonical`, its types `TJsonKind` (`jkNull` …
   `jkObject`), `TJsonErrorKind` (`jeSyntax` … `jeRange`), `TJsonOptions`,
-  `EJsonError`, `TJsonIter`, `TJsonIndex` and `TJsonHelper` and its
-  `PasJsonIndex` … `PasJsonImage` routines, and pasobject's `TObject`
+  `EJsonError`, `TJsonIter`, `TJsonIndex`, `TJsonHelper` and the
+  writer's `TJsonOut`, `TJsonOutLevel`, `TJsonOutMark`, `TJsonOutPair` and
+  `TJsonOutPairs`, and its `PasJsonIndex` … `PasJsonImage` and
+  `PasJsonOutInit` … `PasJsonOutIntName` routines, and pasobject's `TObject`
   with `PasClassName` … `PasUncaught`, and the compiler's `TClass`
   (`class of TObject`), `TVarRec` and its kinds `vtInteger` …
   `vtJson`. A core unit declares its
@@ -12132,8 +12297,8 @@ method, a property or an enumeration member of one of these names is a
 compile error that names it, at the name: `Length is a reserved word,
 not a name at 5:3`. A unit's `.pi` is not checked for these names when
 it loads. The compiler loads only a `.pi` of the format it writes,
-`PASLANGI26`, and refuses an older one with the minimum compiler needed to
-rebuild it. A type may be `json`, kind 26 (1.1.124); Currency adds builtin type id 17; scoped members, generic
+`PASLANGI27`, and refuses an older one with the minimum compiler needed to
+rebuild it. A field or a property carries its `json` directive (1.1.131); a type may be `json`, kind 26 (1.1.124); Currency adds builtin type id 17; scoped members, generic
 origin/argument identity and every exported alias remain recorded. All
 installed libraries must be rebuilt when this format changes.
 
