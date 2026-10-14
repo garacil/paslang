@@ -10249,13 +10249,16 @@ Xlib: a `TX11` object with `Connect`, `CreateWin`, `CreateGc`,
 `MapWin`, `SetTitle`, `SetClass`, `SetProtocols` and `IsCloseEvent`
 (the window manager's close), `FillRect`, `DrawLine`, `DrawText` (with
 `LoadFont` and `TextWidth`), `SetFg`, `SetBg`, `SetClip`, `Sync`,
-`NextEvent`, `Queued` and `CanRead` (the routine that draws parks on
-the socket with `WaitFd` while nothing arrives), `Atom`, `TakeProp`,
+`NextEvent`, `Queued` and `CanRead` (what the server sent within 300
+ms), `Atom`, `TakeProp`,
 `AnswerSel` and `ClipRound` for the clipboard, `Keysym` and
 `KeysymShift` for the keyboard, `SendClick` and `SendKey` to drive a
-window from a test, and `PixelAt` to read one back. `make check` opens
-its windows on an `Xvfb` display when `Xvfb` is installed, and on the
-current display otherwise.
+window from a test, and `PixelAt` to read one back. Its socket is
+`pasnet`'s, not blocking and closed on exec, and the routine that draws
+parks while it reads, writes or waits for an event, on amd64 and on
+arm64 alike (1.1.129). `make check` opens its windows on an `Xvfb`
+display when `Xvfb` is installed, and on the current display
+otherwise, from both machines.
 
 `examples/clock.paslang`:
 

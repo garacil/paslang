@@ -2752,6 +2752,11 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$$xrun $(BUILDDIR)/xcanvas > $(BUILDDIR)/xcanvas.got; \
 	diff -u testdata/xcanvas.out $(BUILDDIR)/xcanvas.got; \
 	echo ok xcanvas; \
+	: the same client on arm64 under qemu against the same server, P278: it made amd64 system calls there; \
+	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/xcanvas-arm testdata/xcanvas.paslang; \
+	$$xrun timeout 120 $(QEMU_A64) $(BUILDDIR)/xcanvas-arm > $(BUILDDIR)/xcanvas-arm.got; \
+	diff -u testdata/xcanvas.out $(BUILDDIR)/xcanvas-arm.got; \
+	echo ok xcanvas-arm; \
 	echo "==== dirlist ===="; \
 	$(OUTDIR)/paslangc -c -Fu $(BUILDDIR) src/lib/paslinux.paslang; \
 	$(OUTDIR)/paslangc -c -Fu $(BUILDDIR) src/lib/paslib.paslang; \

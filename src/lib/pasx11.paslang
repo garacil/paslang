@@ -19,7 +19,11 @@
   along with paslang.  If not, see <https://www.gnu.org/licenses/>. }
 
 
-{ Raw X11 on a Unix socket. No Xlib. The UI G parks with WaitFd. }
+{ Raw X11 on a Unix socket. No Xlib. The socket is pasnet's, not
+  blocking and closed on exec, and every read, write and wait parks the
+  routine (PasIoRead, PasIoWrite, WaitMs), with the system call numbers
+  of the machine it is compiled for (P278: it made amd64's calls on
+  arm64 too, and waited for an event in poll, which arm64 has not). }
 unit pasx11;
 
 interface
@@ -58,6 +62,7 @@ type
     procedure SendPkt(const B: string);
     function Pull(N: Integer): string;
     function ReadReply: string;
+    function Take: Boolean;
     function CanRead: Boolean;
     function CreateWin(W, H: Integer): Int64;
     function CreateGc(Win: Int64): Int64;
@@ -94,7 +99,7 @@ type
 implementation
 
 uses
-  paslinux, paslib;
+  paslinux, paslib, pasnet;
 
 constructor TX11.Create;
 begin
@@ -171,19 +176,27 @@ begin
   Result := Ord(E[1]) and 127;
 end;
 
-procedure TX11.SendPkt(const B: string);
+{ All of B to Fd, parking while the socket is full: whether it went. }
+function SendAll(Fd: Int64; const B: string): Boolean;
 var
   off, n, k: Int64;
 begin
+  Result := False;
   off := 1;
   n := Length(B);
   while off <= n do
   begin
-    k := Sys3(SysWrite, Fd, Int64(@B[off]), n - off + 1);
+    k := PasIoWrite(Fd, @B[off], n - off + 1, 0);
     if k <= 0 then
       Exit;
     off := off + k;
   end;
+  Result := True;
+end;
+
+procedure TX11.SendPkt(const B: string);
+begin
+  SendAll(Fd, B);
 end;
 
 function TX11.Pull(N: Integer): string;
@@ -196,9 +209,8 @@ begin
     Exit;
   while Length(InBuf) < N do
   begin
-    WaitFd(Fd);
     tmp := Blank(4096);
-    k := Sys3(SysRead, Fd, Int64(@tmp[1]), 4096);
+    k := PasIoRead(Fd, @tmp[1], 4096, 0);
     if k <= 0 then
       Exit;
     SetLength(tmp, k);
@@ -221,9 +233,7 @@ end;
 function TX11.Connect: Boolean;
 var
   disp, path, auth, setup, rest, sock, num: string;
-  addr: array[0..111] of Char;
   i, n, extra: Integer;
-  p: Int64;
 begin
   Result := False;
   disp := GetEnv('DISPLAY');
@@ -244,20 +254,9 @@ begin
     if num <> '' then
       path := '/tmp/.X11-unix/X' + num;
   end;
-  for i := 0 to 111 do
-    addr[i] := #0;
-  addr[0] := Char(AfUnix);
-  addr[1] := #0;
-  n := Length(path);
-  for i := 1 to n do
-    addr[i + 1] := path[i];
-  Fd := Sys3(SysSocket, AfUnix, SockStream, 0);
+  Fd := UnixConnect(path);
   if Fd < 0 then
-    Exit;
-  p := Sys3(SysConnect, Fd, Int64(@addr[0]), 110);
-  if p < 0 then
   begin
-    Sys1(SysClose, Fd);
     Fd := -1;
     Exit;
   end;
@@ -312,16 +311,16 @@ begin
       i := i + extra;
     end;
   end;
-  if Sys3(SysWrite, Fd, Int64(@setup[1]), Length(setup)) <> Length(setup) then
+  if not SendAll(Fd, setup) then
   begin
-    Sys1(SysClose, Fd);
+    NetClose(Fd);
     Fd := -1;
     Exit;
   end;
   setup := Pull(8);
   if (Length(setup) < 8) or (setup[1] <> #1) then
   begin
-    Sys1(SysClose, Fd);
+    NetClose(Fd);
     Fd := -1;
     Exit;
   end;
@@ -329,7 +328,7 @@ begin
   rest := Pull(extra);
   if Length(rest) < extra then
   begin
-    Sys1(SysClose, Fd);
+    NetClose(Fd);
     Fd := -1;
     Exit;
   end;
@@ -799,18 +798,41 @@ begin
   end;
 end;
 
-function TX11.CanRead: Boolean;
+{ What the server has sent, without waiting: into InBuf; whether any
+  came. }
+function TX11.Take: Boolean;
 var
-  pfd, r: Int64;
+  tmp: string;
+  k: Int64;
+begin
+  tmp := Blank(4096);
+  repeat
+    k := OsRead(Fd, Int64(@tmp[1]), 4096);
+  until k <> -4;
+  Result := k > 0;
+  if Result then
+  begin
+    SetLength(tmp, k);
+    InBuf := InBuf + tmp;
+  end;
+end;
+
+{ Whether the server sends something within 300 ms: what is there, or
+  what comes while the routine parks in WaitMs, which answers 0 when
+  the descriptor is ready and when the time is up alike. }
+function TX11.CanRead: Boolean;
 begin
   if (Length(InBuf) > 0) or (Length(EvQ) > 0) then
   begin
     Result := True;
     Exit;
   end;
-  pfd := (Fd and $FFFFFFFF) or (Int64(1) shl 32);
-  r := Sys3(SysPoll, Int64(@pfd), 1, 300);
-  Result := r > 0;
+  Result := Take;
+  if not Result then
+  begin
+    WaitMs(Fd, 1, 300);
+    Result := Take;
+  end;
 end;
 
 function TX11.Sync: Boolean;
