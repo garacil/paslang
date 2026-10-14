@@ -2754,6 +2754,17 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	fi; \
 	grep -q 'a compiled unit has other builtin types (Byte): compile it again' $(BUILDDIR)/oldpi.err; \
 	echo ok units; \
+	echo "==== a core unit missing ===="; \
+	: a core unit whose interface is not found stops the compile with its name P279, and is never left out of the link; \
+	rm -rf $(BUILDDIR)/nocore; mkdir -p $(BUILDDIR)/nocore/core; \
+	cp $(BUILDDIR)/*.pi $(BUILDDIR)/*.o $(BUILDDIR)/nocore/core/; \
+	rm -f $(BUILDDIR)/nocore/core/pashash.pi; \
+	if (cd $(BUILDDIR)/nocore && $(CURDIR)/$(OUTDIR)/paslangc -Fu core -o hello $(CURDIR)/testdata/hello.paslang) > $(BUILDDIR)/nocore.err 2>&1; then \
+	  echo 'a program without the core unit pashash should be refused'; exit 1; \
+	fi; \
+	grep -q 'the core unit pashash is missing: no pashash.pi in core, ' $(BUILDDIR)/nocore.err; \
+	rm -rf $(BUILDDIR)/nocore; \
+	echo ok nocore; \
 	echo "==== unit init ===="; \
 	$(OUTDIR)/paslangc testdata/units/inita.paslang; \
 	$(OUTDIR)/paslangc -Fu $(BUILDDIR) testdata/units/initb.paslang; \
