@@ -231,6 +231,11 @@ GOLDEN_A64 += chunkidx
 # {$elseif}, PASLANG_FULLVERSION and its parts, defined(), skipped branches.
 GOLDEN += condver
 GOLDEN_A64 += condver
+# P274: paslib reads a whole file in place: every length about 512
+# and 4096, some MB, a pipe a child writes, a file of /proc, a
+# directory, ReadPrefix and RunCapture, the bytes compared.
+GOLDEN += readwhole
+GOLDEN_A64 += readwhole
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a

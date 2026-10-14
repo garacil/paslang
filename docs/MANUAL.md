@@ -10037,7 +10037,11 @@ whether they could, `ReadPrefix(path, n, out data)` the first `n`
 bytes, `FileExists(path)`, `FileSize(path)`, `EnsureDir(path)`,
 `CopyFile(src, dst)`, `ReadLink(path, out target)` and
 `ListDir(path)`, the names of the entries joined by a newline (`''` for
-a directory that cannot be read). A piece at a time goes through a
+a directory that cannot be read). A whole file is read into its string
+where it stays, at the size the system gives for it and one byte more,
+so a regular file takes one read and a second that finds the end, as
+Go's `os.ReadFile` does; a pipe or a file of `/proc`, which give no
+size, start at 512 bytes and double. A piece at a time goes through a
 descriptor, an `Int64` below zero when the open failed: `FileOpen`
 opens to read, `FileCreate` makes or empties and opens to write,
 `FileAppend` opens to add at the end, making the file when it is not
@@ -10049,7 +10053,8 @@ it is, 2 from the end) and gives the new place, `FileTell` where it
 is, `FileEnd` moves to the end, and `FileClose` closes. `Run(exe,
 args)` runs a program with an `array of string` of arguments and waits
 for it, giving the status it ended with; `RunCapture(exe, args, out
-output)` also collects what it wrote to standard output; `LookPath(exe)`
+output)` also collects what it wrote to standard output and standard
+error, read as a pipe is; `LookPath(exe)`
 finds a name with no slash in `PATH`, as a shell does. `GetEnv(name)`
 reads the environment, `LookupEnv(name, out value)` too and says
 whether the name is set at all (`TZ=` is set and empty), `IntToStr`, `StrToInt64(s, out v)`,

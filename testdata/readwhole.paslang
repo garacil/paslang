@@ -1,0 +1,206 @@
+{ P274: paslib reads a whole file in place. ReadFile takes the size
+  from fstat and reads into the string, with one byte more for the read
+  that meets the end; what says nothing of its size (a pipe, a file of
+  /proc) starts at 512 bytes and doubles. Every length about those
+  edges, some MB, a pipe a child writes, a file of /proc, a directory,
+  a file that is not there, ReadPrefix, FileRead and RunCapture: the
+  bytes are compared each time. }
+program readwhole;
+
+uses
+  paslinux, paslib;
+
+const
+  Count = 14;
+
+var
+  sizes: array[0..Count - 1] of Int64;
+  pipes: array[0..1] of Int32;
+  i: Integer;
+  want, got, path, big, head: string;
+  fd: Int64;
+  ok: Boolean;
+  pid, answer, addr, left, writeNr, waitNr, exitNr, closeNr: Int64;
+  status: Int32;
+  args: array of string;
+  rc: LongInt;
+
+{ Bytes that differ from their neighbours, so a piece read twice or out
+  of place shows. }
+function Pattern(N: Int64): string;
+var
+  i: Int64;
+begin
+  Result := '';
+  SetLength(Result, N);
+  for i := 1 to N do
+    Result[i] := Char((i * 7 + i shr 9) mod 251);
+end;
+
+function Same(const A, B: string): string;
+begin
+  if A = B then
+    Result := 'same'
+  else
+    Result := 'DIFFERENT';
+end;
+
+function YesNo(B: Boolean): string;
+begin
+  if B then
+    Result := 'yes'
+  else
+    Result := 'no';
+end;
+
+begin
+  sizes[0] := 0;
+  sizes[1] := 1;
+  sizes[2] := 2;
+  sizes[3] := 511;
+  sizes[4] := 512;
+  sizes[5] := 513;
+  sizes[6] := 1023;
+  sizes[7] := 4095;
+  sizes[8] := 4096;
+  sizes[9] := 4097;
+  sizes[10] := 65537;
+  sizes[11] := 1048576;
+  sizes[12] := 1900000;
+  sizes[13] := 3000007;
+
+  { A regular file of each size: written, read whole, compared. }
+  for i := 0 to Count - 1 do
+  begin
+    want := Pattern(sizes[i]);
+    path := 'build/readwhole-' + IntToStr(sizes[i]) + '.bin';
+    if not WriteFile(path, want) then
+      Halt(1);
+    got := 'stale';
+    ok := ReadFile(path, got);
+    WriteLn('file ', sizes[i], ' ', YesNo(ok), ' ', Length(got), ' ', Same(got, want));
+  end;
+
+  { ReadPrefix: at most MaxN bytes, fewer when the file is shorter. }
+  want := Pattern(4097);
+  got := 'stale';
+  ok := ReadPrefix('build/readwhole-4097.bin', 20, got);
+  WriteLn('prefix 20 ', YesNo(ok), ' ', Length(got), ' ', Same(got, Copy(want, 1, 20)));
+  got := 'stale';
+  ok := ReadPrefix('build/readwhole-4097.bin', 4097, got);
+  WriteLn('prefix 4097 ', YesNo(ok), ' ', Length(got), ' ', Same(got, want));
+  got := 'stale';
+  ok := ReadPrefix('build/readwhole-4097.bin', 100000, got);
+  WriteLn('prefix 100000 ', YesNo(ok), ' ', Length(got), ' ', Same(got, want));
+  got := 'stale';
+  ok := ReadPrefix('build/readwhole-1.bin', 20, got);
+  WriteLn('prefix of 1 ', YesNo(ok), ' ', Length(got), ' ', Same(got, Pattern(1)));
+  got := 'stale';
+  ok := ReadPrefix('build/readwhole-0.bin', 20, got);
+  WriteLn('prefix of 0 ', YesNo(ok), ' ', Length(got));
+
+  { FileRead from where the handle stands: a piece, the rest with room
+    to spare, nothing at the end. }
+  want := Pattern(3000007);
+  fd := FileOpen('build/readwhole-3000007.bin');
+  got := FileRead(fd, 1000);
+  WriteLn('fileread 1000 ', Length(got), ' ', Same(got, Copy(want, 1, 1000)));
+  got := FileRead(fd, 300);
+  WriteLn('fileread 300 ', Length(got), ' ', Same(got, Copy(want, 1001, 300)));
+  got := FileRead(fd, 5000000);
+  WriteLn('fileread rest ', Length(got), ' ', Same(got, Copy(want, 1301, 3000007)));
+  got := FileRead(fd, 5000000);
+  WriteLn('fileread at the end ', Length(got), ' ', FileTell(fd));
+  FileSeek(fd, 2999000, 0);
+  got := FileRead(fd, 5000000);
+  WriteLn('fileread from 2999000 ', Length(got), ' ', Same(got, Copy(want, 2999001, 1007)));
+  FileClose(fd);
+
+  { A file of /proc says it is 0 bytes long and is not. }
+  got := '';
+  ok := ReadFile('/proc/self/status', got);
+  WriteLn('proc ', YesNo(ok), ' ', Copy(got, 1, 5), ' ', YesNo(Length(got) > 512),
+    ' ', YesNo(Pos('Pid:', got) > 0));
+
+  { A directory opens and does not read; a file that is not there does
+    not open. Both leave Data empty. }
+  got := 'stale';
+  ok := ReadFile('build', got);
+  WriteLn('directory ', YesNo(ok), ' ', Length(got));
+  got := 'stale';
+  ok := ReadFile('build/readwhole-not-there.bin', got);
+  WriteLn('missing ', YesNo(ok), ' ', Length(got));
+  got := 'stale';
+  ok := ReadPrefix('build/readwhole-not-there.bin', 20, got);
+  WriteLn('prefix missing ', YesNo(ok), ' ', Length(got));
+
+  { A pipe: a child writes 300007 bytes and ends; the parent reads the
+    pipe through its name in /proc, which has no size, to the end. The
+    child runs raw system calls only (paslinux, NrExit). }
+  if Amd64 then
+  begin
+    writeNr := 1;
+    waitNr := 61;
+  end
+  else
+  begin
+    writeNr := 64;
+    waitNr := 260;
+  end;
+  exitNr := NrExit;
+  closeNr := NrClose;
+  big := Pattern(300007);
+  if OsPipe(Integer(@pipes)) <> 0 then
+    Halt(2);
+  addr := Integer(@big[1]);
+  left := Length(big);
+  pid := OsFork;
+  if pid = 0 then
+  begin
+    answer := Sys1(closeNr, pipes[0]);
+    while left > 0 do
+    begin
+      answer := Sys3(writeNr, pipes[1], addr, left);
+      if answer = -4 then
+        answer := 0
+      else if answer <= 0 then
+        answer := Sys1(exitNr, 41);
+      addr := addr + answer;
+      left := left - answer;
+    end;
+    answer := Sys1(exitNr, 0);
+  end;
+  if pid < 0 then
+    Halt(3);
+  OsClose(pipes[1]);
+  { the first 1000 bytes by FileRead, where the pipe cannot tell its
+    place; the rest by ReadFile through another open of the same pipe }
+  head := FileRead(pipes[0], 1000);
+  got := 'stale';
+  ok := ReadFile('/proc/self/fd/' + IntToStr(pipes[0]), got);
+  OsClose(pipes[0]);
+  repeat
+    answer := Sys4(waitNr, pid, Integer(@status), 0, 0);
+  until answer <> -4;
+  if (answer <> pid) or (status <> 0) then
+    Halt(4);
+  WriteLn('pipe ', Length(head), ' ', YesNo(ok), ' ', Length(got), ' ', Same(head + got, big));
+
+  { RunCapture reads a child's output through a pipe the same way. }
+  args := nil;
+  SetLength(args, 1);
+  args[0] := 'build/readwhole-3000007.bin';
+  got := 'stale';
+  rc := RunCapture('cat', args, got);
+  WriteLn('capture ', rc, ' ', Length(got), ' ', Same(got, Pattern(3000007)));
+  args[0] := 'build/readwhole-0.bin';
+  got := 'stale';
+  rc := RunCapture('cat', args, got);
+  WriteLn('capture empty ', rc, ' ', Length(got));
+end.
+
+{ This file is part of paslang's tests.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+  paslang is free software under the GNU General Public License,
+  version 3 or (at your option) any later version; see the file
+  COPYING. It comes with ABSOLUTELY NO WARRANTY. }

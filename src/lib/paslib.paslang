@@ -308,12 +308,82 @@ begin
   OsClose(fd);
 end;
 
+{ What is left to read from Fd, into Data in place (P274), as Go's
+  os.ReadFile reads a file (os/file.go, readFileContents): room for
+  Hint bytes and one more, so that the read that meets the end needs no
+  other block, and at least 512, since a file of /proc says it is 0
+  bytes long and reads badly in small pieces; when the room fills (a
+  pipe, a file that grew), it doubles, so a read costs its size. Before,
+  the string grew by the 4 KiB each read gave and was copied whole each
+  time: 473 M instructions and 475 reads for a file of 1.9 MB
+  (callgrind, strace). At most Limit bytes
+  when Limit is not negative. Each read is PasIoRead's (P199): one a
+  signal cut is made again, one that would wait on a descriptor that
+  does not block parks the routine. False on any other error, with the
+  bytes read before it in Data. SetLength keeps the block when it cuts
+  the string to what was read, since that fills more than half of it
+  (P214). }
+function ReadAll(Fd, Hint, Limit: Int64; out Data: string): Boolean;
+var
+  s: string;
+  used, room, n: Int64;
+begin
+  Result := True;
+  Data := '';
+  if Hint < 0 then
+    Hint := 0;
+  room := Hint + 1;
+  if room < 512 then
+    room := 512;
+  if (Limit >= 0) and (room > Limit) then
+    room := Limit;
+  s := '';
+  SetLength(s, room);
+  used := 0;
+  while (Limit < 0) or (used < Limit) do
+  begin
+    if used = room then
+    begin
+      room := room * 2;
+      if (Limit >= 0) and (room > Limit) then
+        room := Limit;
+      SetLength(s, room);
+    end;
+    n := PasIoRead(Fd, @s[used + 1], room - used, 0);
+    if n < 0 then
+    begin
+      Result := False;
+      Break;
+    end;
+    if n = 0 then
+      Break;
+    used := used + n;
+  end;
+  SetLength(s, used);
+  Data := s;
+end;
+
+{ The room to make for at most MaxN bytes of Fd (all when MaxN is
+  negative): the size fstat gives, st_size, the word at byte 48 of
+  struct stat on amd64 (asm/stat.h) and on arm64 (asm-generic/stat.h),
+  as FileSize reads it; 0 when it gives none (a pipe and a file of /proc
+  say 0), and without asking it when ReadAll's first room, 512 bytes,
+  holds MaxN. }
+function RoomHint(Fd, MaxN: Int64): Int64;
+var
+  st: array[0..17] of Int64;
+begin
+  Result := 0;
+  if (MaxN >= 0) and (MaxN <= 512) then
+    Exit;
+  if OsFstat(Fd, Int64(@st[0])) = 0 then
+    Result := st[6];
+end;
+
 function ReadFile(const Path: string; out Data: string): Boolean;
 var
   p: PChar;
-  fd, n: Int64;
-  buf: array[0..4095] of Char;
-  total: string;
+  fd: Int64;
 begin
   Result := False;
   Data := '';
@@ -322,29 +392,17 @@ begin
   FreeMem(p);
   if fd < 0 then
     Exit;
-  total := '';
-  repeat
-    n := OsRead(fd, Int64(@buf[0]), SizeOf(buf));
-    if n < 0 then
-    begin
-      OsClose(fd);
-      Exit;
-    end;
-    if n = 0 then
-      Break;
-    SetLength(total, Length(total) + n);
-    Move(buf[0], total[Length(total) - n + 1], n);
-  until False;
+  Result := ReadAll(fd, RoomHint(fd, -1), -1, Data);
   OsClose(fd);
-  Data := total;
-  Result := True;
+  if not Result then
+    Data := '';
 end;
 
+{ At most MaxN bytes from the start of Path. }
 function ReadPrefix(const Path: string; MaxN: Int64; out Data: string): Boolean;
 var
   p: PChar;
-  fd, n, want, got: Int64;
-  buf: array[0..4095] of Char;
+  fd: Int64;
 begin
   Result := False;
   Data := '';
@@ -355,26 +413,10 @@ begin
   FreeMem(p);
   if fd < 0 then
     Exit;
-  got := 0;
-  while got < MaxN do
-  begin
-    want := MaxN - got;
-    if want > 4096 then
-      want := 4096;
-    n := OsRead(fd, Int64(@buf[0]), want);
-    if n < 0 then
-    begin
-      OsClose(fd);
-      Exit;
-    end;
-    if n = 0 then
-      Break;
-    SetLength(Data, Length(Data) + n);
-    Move(buf[0], Data[Length(Data) - n + 1], n);
-    got := got + n;
-  end;
+  Result := ReadAll(fd, RoomHint(fd, MaxN), MaxN, Data);
   OsClose(fd);
-  Result := True;
+  if not Result then
+    Data := '';
 end;
 
 function WriteFile(const Path, Data: string): Boolean;
@@ -531,12 +573,11 @@ end;
 
 function RunCapture(const Exe: string; const Args: array of string; out Output: string): LongInt;
 var
-  pid, st, r, n, rd, wr, execNr, exitNr, closeNr, dupNr: Int64;
+  pid, st, r, rd, wr, execNr, exitNr, closeNr, dupNr: Int64;
   argv: array of PChar;
   i: SizeInt;
   path: PChar;
   pipev: Int64;
-  buf: array[0..4095] of Char;
   total: string;
 begin
   { See Run: the child runs raw system calls only. }
@@ -581,16 +622,9 @@ begin
   else
   begin
     OsClose(wr);
-    total := '';
-    repeat
-      n := OsRead(rd, Int64(@buf[0]), 4096);
-      if n < 0 then
-        Break;
-      if n = 0 then
-        Break;
-      SetLength(total, Length(total) + n);
-      Move(buf[0], total[Length(total) - n + 1], n);
-    until False;
+    { all the child writes, to the end or to an error, as ReadFile reads
+      a pipe (P274) }
+    ReadAll(rd, 0, -1, total);
     OsClose(rd);
     Output := total;
     st := 0;
@@ -755,30 +789,25 @@ end;
   the end of the file. }
 function FileRead(Fd: Int64; MaxN: Int64): string;
 var
-  buf: array[0..4095] of Char;
-  n, want, got: Int64;
+  hint, here: Int64;
 begin
   Result := '';
   if (Fd < 0) or (MaxN <= 0) then
     Exit;
-  got := 0;
-  while got < MaxN do
+  { Into place, as ReadFile (P274): it grew by 4 KiB a read, copying
+    what it held each time. The room is what is left after the handle's
+    place, not the whole file: a read at the end of a large one made no
+    room for it. A handle that does not seek (a pipe) has none. }
+  hint := RoomHint(Fd, MaxN);
+  if hint > 0 then
   begin
-    want := MaxN - got;
-    if want > 4096 then
-      want := 4096;
-    n := OsRead(Fd, Int64(@buf[0]), want);
-    if n = -11 then
-    begin
-      WaitFd(Fd);
-      Continue;
-    end;
-    if n <= 0 then
-      Break;
-    SetLength(Result, Length(Result) + n);
-    Move(buf[0], Result[Length(Result) - n + 1], n);
-    got := got + n;
+    here := FileTell(Fd);
+    if (here < 0) or (here >= hint) then
+      hint := 0
+    else
+      hint := hint - here;
   end;
+  ReadAll(Fd, hint, MaxN, Result);
 end;
 
 { Every byte of Data, however many writes that takes. The answer is
