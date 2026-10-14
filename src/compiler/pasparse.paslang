@@ -116,6 +116,11 @@ type
     FJsonEnc: array of LongInt;   { the types with an encoder }
     FJsonZero: array of LongInt;  { the types with a zero test for omitzero }
     FJsonAt: string;              { where the first JsonEncode of a typed value is }
+    FJsonDec: array of LongInt;   { the types with a decoder (P206) }
+    FJsonChk: array of LongInt;   { the types with a check, for Merge }
+    FJsonNames: array of LongInt; { the enumerations whose names a decoder reads }
+    FJsonDEnt: array of LongInt;  { the types JsonDecode, TryJsonDecode, a typed for and TryGet take }
+    FJsonDForm: array of LongInt; { the entries of each a unit calls, Jd* }
     FRecMembers: Boolean;  { a record's fields stop where its members begin (P165) }
     FRecVis: Byte;         { the visibility of the record's fields being read (P165) }
     FRecSelf: LongInt;     { the record being declared, which no field of it may be (P165) }
@@ -598,6 +603,20 @@ type
     function JsonKeyName(B: LongInt; const V: string): string;
     function JsonZeroText(T: LongInt): string;
     function JsonTypedCall(Want: LongInt; const Args: TExprArray): PExpr;
+    function JsonNeedDec(T: LongInt): string;
+    function JsonNeedChk(T: LongInt): string;
+    function JsonNeedNames(B: LongInt; out N: SizeInt): string;
+    function JsonEnumTab(B: LongInt): string;
+    procedure JsonCanMake(T: LongInt);
+    function JsonDecValue(T: LongInt; const V, Node: string; Flags: LongInt; const Who: string;
+      Chk: Boolean): string;
+    procedure JsonDecMembers(T: LongInt; const Base, Who, Pre: string; var Arms: string;
+      var Names: TStrArray; var Locals, Req, Unknown: string; Depth: LongInt; Chk: Boolean);
+    function JsonDecText(T: LongInt; Chk: Boolean; out Tab: string): string;
+    function JsonDecEntries(T: LongInt; Forms: LongInt; var Heads: string): string;
+    function JsonNeedEntry(T: LongInt; Form: LongInt): string;
+    function JsonDecodeCall(IsTry: Boolean; const Args: TExprArray): PExpr;
+    function JsonTypedGet(const Args: TExprArray): PExpr;
     procedure GenJsonCode;
     function ParseVariant(var Td: TTypeDef; Start: LongInt; Stop: TTokKind): LongInt;
     procedure ParseTypeSection;
@@ -6607,7 +6626,8 @@ begin
   AddReserved('hex md5 sha1 sha224 sha384 sha512 sha3_224 sha3_256 sha3_384');
   AddReserved('sha3_512 hmacmd5 hmacsha1 hmacsha224 hmacsha256 hmacsha384');
   AddReserved('hmacsha512 crc32 crc32c adler32 fnv1a32 fnv1a64 murmur3 siphash');
-  AddReserved('tryget default assigned setlength inc dec getmem freemem move jsonof');
+  AddReserved('tryget default assigned setlength inc dec getmem freemem move jsonof jsondecode');
+  AddReserved('tryjsondecode');
   AddReserved('fillchar view membase memsize memend');
   { the calculation set }
   AddReserved('abs sqr sqrt trunc round int frac floor ceil min max pi exp ln');
@@ -12488,6 +12508,14 @@ begin
             Die('Delete takes a map and a key, or a string variable, an index and a count' +
               HerePos);
         end
+        else if (SameId(name, 'JsonDecode') or SameId(name, 'TryJsonDecode')) and
+          (FTok.Kind = tkLParen) and FindProc('JsonParse', pe) then
+        begin
+          { JsonDecode(src, x[, opts]) and TryJsonDecode(src, x, err[,
+            opts]): the functions the compiler writes for x's type (P206) }
+          args := ParseArgList;
+          Result := JsonDecodeCall(SameId(name, 'TryJsonDecode'), args);
+        end
         else if (SameId(name, 'JsonEncode') or SameId(name, 'JsonOf')) and
           (FTok.Kind = tkLParen) and FindProc('JsonParse', pe) then
         begin
@@ -12539,20 +12567,27 @@ begin
             { TryGet(j, 'k', v) and TryGet(j, i, v) (P203): whether j has
               that member or element, into v; never an error }
             CheckTyped(args[1]);
-            CheckOutVar(args[2], InternJson, 'TryGet(j, k, v): v');
-            if IsStrTyp(args[1]^.Typ) or IsCharT(args[1]^.Typ) then
-            begin
-              args[1] := StrArg(TyString, args[1]);
-              Result := CoreProc('PasJsonTryGet', args, TyBoolean);
-            end
-            else if (TypeOf(args[1]^.Typ).Kind = tykInteger) or
-              (TypeOf(args[1]^.Typ).Kind = tykSubrange) then
-            begin
-              args[1] := ValArg(TyInteger, args[1]);
-              Result := CoreProc('PasJsonTryItem', args, TyBoolean);
-            end
+            CheckTyped(args[2]);
+            if TypeOf(args[2]^.Typ).Kind <> tykJson then
+              { a typed v (P206): the member or the element decoded into it }
+              Result := JsonTypedGet(args)
             else
-              Die('TryGet of a json takes a name, a string, or a place, an Integer' + HerePos);
+            begin
+              CheckOutVar(args[2], InternJson, 'TryGet(j, k, v): v');
+              if IsStrTyp(args[1]^.Typ) or IsCharT(args[1]^.Typ) then
+              begin
+                args[1] := StrArg(TyString, args[1]);
+                Result := CoreProc('PasJsonTryGet', args, TyBoolean);
+              end
+              else if (TypeOf(args[1]^.Typ).Kind = tykInteger) or
+                (TypeOf(args[1]^.Typ).Kind = tykSubrange) then
+              begin
+                args[1] := ValArg(TyInteger, args[1]);
+                Result := CoreProc('PasJsonTryItem', args, TyBoolean);
+              end
+              else
+                Die('TryGet of a json takes a name, a string, or a place, an Integer' + HerePos);
+            end;
           end
           else
           begin
@@ -21990,6 +22025,19 @@ begin
     Result := NewUn(uoNot, Result);
 end;
 
+const
+  { the forms of a type's JSON decoding entries a unit calls (P206) }
+  JdText = 1;
+  JdJson = 2;
+  JdTryText = 4;
+  JdTryJson = 8;
+  JdGet = 16;
+  JdItem = 32;
+  JdMerge = 64;
+  { the variables a check reads values into and drops }
+  JsonChkVars = 'cI: Integer; cB: Boolean; cC: Char; cF: Double; cS: Single; cQ: Quad; ' +
+    'cY: Currency; cT: string; nb: Integer;';
+
 { for v in j, for k in j, for k, v in j and for i, v in j (P203): a
   while over an iterator of pasjson, whose next word fills hidden
   variables that the pass copies into the loop's own, so a closure made
@@ -21999,10 +22047,13 @@ end;
   variable, VName that one. }
 function TParser.JsonForIn(St: PStmt; const KName, VName: string; K0: SizeInt): PStmt;
 var
-  itt, vt, kt, want: LongInt;
-  itv, tk, tv, nxt: string;
+  itt, vt, kt, want, jt: LongInt;
+  itv, tk, tv, nxt, why: string;
   blk, ini, loop, body, asg: PStmt;
-  a: TExprArray;
+  a, da: TExprArray;
+  typed: Boolean;
+  ce: PExpr;
+  pe: TProcEnt;
 begin
   if not NamedType('TJsonIter', itt) then
     Die('for in a json needs the core unit pasjson (build/pasjson.pi)');
@@ -22011,6 +22062,7 @@ begin
   if KName <> '' then
     kt := VarTyp(KName);
   tk := '';
+  typed := False;
   if KName = '' then
   begin
     if TypeOf(vt).Kind = tykJson then
@@ -22025,15 +22077,15 @@ begin
     end
     else
     begin
-      Die('for x in a json: x is a json, its values, or a string, an object''s names, not ' +
-        TypName(vt) + HerePos);
+      { a typed x (P206): each value decoded into it }
       want := 0;
+      nxt := 'PasJsonNextValue';
+      typed := True;
     end;
   end
   else
   begin
-    if TypeOf(vt).Kind <> tykJson then
-      Die('for k, v in a json: v is a json, not ' + TypName(vt) + HerePos);
+    typed := TypeOf(vt).Kind <> tykJson;
     if IsStrTyp(kt) then
     begin
       want := 2;
@@ -22051,6 +22103,10 @@ begin
       want := 0;
     end;
   end;
+  if typed and not JsonForm(vt, why) then
+    Die('for in a json decodes each value into a variable of a type with a JSON form, and ' +
+      TypName(vt) + ' has none' + HerePos);
+  jt := InternJson;
   blk := NewStmt(skBlock);
   itv := HiddenNamed('forin.jit', itt);
   a := nil;
@@ -22065,7 +22121,9 @@ begin
   AppendStmt(blk, ini);
   if KName <> '' then
     tk := HiddenNamed('forin.jk', kt);
-  if IsStrTyp(vt) then
+  if typed then
+    tv := HiddenNamed('forin.jv', jt)
+  else if IsStrTyp(vt) then
     tv := HiddenNamed('forin.jv', TyString)
   else
     tv := HiddenNamed('forin.jv', vt);
@@ -22075,13 +22133,18 @@ begin
     SetLength(a, 3);
     a[0] := NewVar(itv, itt);
     a[1] := NewVar(tk, kt);
-    a[2] := NewVar(tv, vt);
+    if typed then
+      a[2] := NewVar(tv, jt)
+    else
+      a[2] := NewVar(tv, vt);
   end
   else
   begin
     SetLength(a, 2);
     a[0] := NewVar(itv, itt);
-    if IsStrTyp(vt) then
+    if typed then
+      a[1] := NewVar(tv, jt)
+    else if IsStrTyp(vt) then
       a[1] := NewVar(tv, TyString)
     else
       a[1] := NewVar(tv, vt);
@@ -22094,12 +22157,30 @@ begin
     asg^.E := NewVar(tk, kt);
     AppendStmt(body, asg);
   end;
-  asg := NewStmt(skAssign);
-  asg^.Dest := NewVar(VarSym(VName), vt);
-  if IsStrTyp(vt) then
-    asg^.E := ValArg(vt, NewVar(tv, TyString))
+  if typed then
+  begin
+    { the value decoded into v, which changes only when it decodes }
+    if not FindProc('JsonDefaults', pe) then
+      Die('for in a json needs the core unit pasjson (build/pasjson.pi)');
+    da := nil;
+    SetLength(da, 3);
+    da[0] := NewVar(tv, jt);
+    da[1] := NewAddr(NewVar(VarSym(VName), vt));
+    da[2] := NewCall(pe.Sym, nil, pe.RetTyp);
+    ce := NewCall(JsonNeedEntry(vt, JdJson), da, TyNone);
+    asg := NewStmt(skCall);
+    asg^.Name := ce^.Name;
+    asg^.Args := ce^.Args;
+  end
   else
-    asg^.E := NewVar(tv, vt);
+  begin
+    asg := NewStmt(skAssign);
+    asg^.Dest := NewVar(VarSym(VName), vt);
+    if IsStrTyp(vt) then
+      asg^.E := ValArg(vt, NewVar(tv, TyString))
+    else
+      asg^.E := NewVar(tv, vt);
+  end;
   AppendStmt(body, asg);
   AppendStmt(body, St^.Body);
   loop := NewStmt(skWhile);
@@ -23729,20 +23810,842 @@ begin
   end;
 end;
 
-{ The functions JsonEncode and JsonOf call, and every encoder they need,
-  as Pascal text the parser reads in its own mode, at the end of the
-  unit: headers first, then bodies. }
+{ ---- typed JSON: the decoders the compiler writes (P206) ----
+
+  JsonDecode(S, X) and JsonDecode(J, X), TryJsonDecode, a typed for
+  over a json and a typed TryGet call functions the compiler writes for
+  X's type, as P205's encoders: Pascal text read at the end of the unit
+  in the generated mode. Each type gets a decoder, $jdec, which reads a
+  node of the document into a variable of the type through pasjson's
+  PasJsonIn words, and, when a call in the unit passes options, a
+  check, $jchk, which reads the same and writes nothing. The entry
+  decodes into a hidden variable it assigns once, so the target changes
+  only when the whole decode succeeds; with Merge it checks the whole
+  document first and then decodes into the target itself, as Go's v2
+  merges (encoding/json/v2 arshal_default.go). }
+
+{ V as an Int64 literal of the text. }
+function IntLitText(V: Int64): string;
+begin
+  if V < -9223372036854775807 then
+    Result := '(-9223372036854775807 - 1)'
+  else
+    Result := IntToStr(V);
+end;
+
+function TParser.JsonNeedDec(T: LongInt): string;
+var
+  i: SizeInt;
+begin
+  Result := '$jdec' + IntToStr(T);
+  for i := 0 to High(FJsonDec) do
+    if FJsonDec[i] = T then
+      Exit;
+  i := Length(FJsonDec);
+  SetLength(FJsonDec, i + 1);
+  FJsonDec[i] := T;
+end;
+
+function TParser.JsonNeedChk(T: LongInt): string;
+var
+  i: SizeInt;
+begin
+  Result := '$jchk' + IntToStr(T);
+  for i := 0 to High(FJsonChk) do
+    if FJsonChk[i] = T then
+      Exit;
+  i := Length(FJsonChk);
+  SetLength(FJsonChk, i + 1);
+  FJsonChk[i] := T;
+end;
+
+{ The table of the names of enumeration B's members, by their ordinal:
+  its name in the text and how many. }
+function TParser.JsonNeedNames(B: LongInt; out N: SizeInt): string;
+var
+  i: SizeInt;
+begin
+  Result := '$jn' + IntToStr(B);
+  N := Length(FTypes[B].Nested);
+  for i := 0 to High(FJsonNames) do
+    if FJsonNames[i] = B then
+      Exit;
+  i := Length(FJsonNames);
+  SetLength(FJsonNames, i + 1);
+  FJsonNames[i] := B;
+end;
+
+{ The constant that holds the names of enumeration B's members. }
+function TParser.JsonEnumTab(B: LongInt): string;
+var
+  i: SizeInt;
+begin
+  Result := 'const $jn' + IntToStr(B) + ': array[0..' + IntToStr(High(FTypes[B].Nested)) +
+    '] of string = (';
+  for i := 0 to High(FTypes[B].Nested) do
+  begin
+    if i > 0 then
+      Result := Result + ', ';
+    if FTypes[B].Nested[i].Kind = 1 then
+      Result := Result + PasLit(FTypes[B].Nested[i].Name)
+    else
+      Result := Result + '''''';
+  end;
+  Result := Result + ');';
+end;
+
+{ A class JsonDecode makes, with its Create: not abstract, and the
+  Create of the nearest class that declares one (TObject's at the
+  root) takes no argument, so a class that asks for its arguments is
+  never made without them. }
+procedure TParser.JsonCanMake(T: LongInt);
+var
+  c, pc: LongInt;
+  i, q: SizeInt;
+  own, ok, inherited0: Boolean;
+begin
+  if ClassAbstract(T) then
+    Die('JsonDecode makes a ' + TypName(T) + ' with its Create, and ' + TypName(T) +
+      ' is abstract' + FJsonAt);
+  c := T;
+  while c > 0 do
+  begin
+    pc := TypeOf(c).Parent;
+    own := False;
+    ok := False;
+    for i := 0 to High(FTypes[c].Meths) do
+      if SameId(FTypes[c].Meths[i].Name, 'Create') and FTypes[c].Meths[i].IsCtor then
+      begin
+        { declared here: no Create of the parent has its symbol }
+        inherited0 := False;
+        if pc > 0 then
+          for q := 0 to High(FTypes[pc].Meths) do
+            if FTypes[pc].Meths[q].Sym = FTypes[c].Meths[i].Sym then
+              inherited0 := True;
+        if not inherited0 then
+        begin
+          own := True;
+          if MinArgs(FTypes[c].Meths[i]) = 0 then
+            ok := True;
+        end;
+      end;
+    if own then
+    begin
+      if not ok then
+        Die('JsonDecode makes a ' + TypName(T) + ' with Create, and ' + TypName(c) +
+          '.Create takes arguments' + FJsonAt);
+      Exit;
+    end;
+    c := pc;
+  end;
+end;
+
+{ The statements that read node Node into V, of type T, a member's value
+  with its directive's Flags; with Chk they read it into a variable
+  that is dropped, the check of Merge. Who names it, for an error. }
+function TParser.JsonDecValue(T: LongInt; const V, Node: string; Flags: LongInt;
+  const Who: string; Chk: Boolean): string;
+var
+  b: LongInt;
+  k: TTypeKind;
+  q, why, tn, dst, rd: string;
+  lo, hi: Int64;
+  n: SizeInt;
+begin
+  if not JsonForm(T, why) then
+    Die(Who + ' has no JSON form (' + why + '): json ignore leaves it out' + FJsonAt);
+  b := JsonBase(T);
+  k := TypeOf(b).Kind;
+  q := 'False';
+  if (Flags and JfQuoted) <> 0 then
+    q := 'True';
+  tn := PasLit(TypName(T));
+  rd := '';
+  dst := V;
+  if k = tykJson then
+  begin
+    if Chk then
+      Result := ''
+    else
+      Result := V + ' := PasJsonInJson(R, ' + Node + ');';
+    Exit;
+  end;
+  if IsCharT(b) then
+  begin
+    OrdBounds(T, lo, hi);
+    rd := 'PasJsonInChar(R, ' + Node + ', ' + IntToStr(lo) + ', ' + IntToStr(hi) + ', ' + tn + ')';
+    if Chk then
+      dst := 'cC'
+    else if T <> TyChar then
+      rd := JsonTypRef(T) + '(' + rd + ')';
+  end
+  else if (b = TyBoolean) or (k = tykBoolean) then
+  begin
+    rd := 'PasJsonInBool(R, ' + Node + ')';
+    if Chk then
+      dst := 'cB';
+  end
+  else if k = tykEnum then
+  begin
+    OrdBounds(T, lo, hi);
+    rd := 'PasJsonInEnum(R, ' + Node + ', @' + JsonNeedNames(b, n) + ', ' + IntToStr(n) + ', ' +
+      IntToStr(lo) + ', ' + IntToStr(hi) + ', ' + tn + ')';
+    if Chk then
+      dst := 'cI'
+    else
+      rd := JsonTypRef(T) + '(' + rd + ')';
+  end
+  else if IsIntId(b) or (k = tykInteger) then
+  begin
+    OrdBounds(T, lo, hi);
+    if (Flags and JfQuoted) <> 0 then
+      rd := 'PasJsonInIntQ'
+    else
+      rd := 'PasJsonInInt';
+    rd := rd + '(R, ' + Node + ', ' + IntLitText(lo) + ', ' + IntLitText(hi) + ', ' + tn + ')';
+    if Chk then
+      dst := 'cI'
+    else if T <> TyInteger then
+      rd := JsonTypRef(T) + '(' + rd + ')';
+  end
+  else if k = tykReal then
+  begin
+    if b = TySingle then
+    begin
+      rd := 'PasJsonInF32(R, ' + Node + ', ' + q + ', ' + tn + ')';
+      if Chk then
+        dst := 'cS';
+    end
+    else
+    begin
+      { rfc3339 makes the real a TDateTime, which is a Double's alias }
+      if (Flags and JfRfc3339) <> 0 then
+        rd := 'PasJsonInTime(R, ' + Node + ', ''TDateTime'')'
+      else
+        rd := 'PasJsonInF64(R, ' + Node + ', ' + q + ', ' + tn + ')';
+      if Chk then
+        dst := 'cF';
+    end;
+  end
+  else if k = tykQuad then
+  begin
+    rd := 'PasJsonInQuad(R, ' + Node + ', ' + q + ', ' + tn + ')';
+    if Chk then
+      dst := 'cQ';
+  end
+  else if k = tykCurrency then
+  begin
+    rd := 'PasJsonInCur(R, ' + Node + ', ' + q + ', ' + tn + ')';
+    if Chk then
+      dst := 'cY';
+  end
+  else if IsStrTyp(b) then
+  begin
+    rd := 'PasJsonInStr(R, ' + Node + ', ' + tn + ')';
+    if Chk then
+      dst := 'cT';
+  end
+  else if (k = tykArray) and (TypeOf(b).Elem = TyByte) and IsDynTyp(b) then
+  begin
+    { bytes from base64, as Go reads a []byte (arshal_default.go) }
+    Result := 'nb := PasJsonInB64Len(R, ' + Node + ', ' + tn + ');';
+    if not Chk then
+      Result := Result + ' ' + V + ' := nil; if nb > 0 then begin SetLength(' + V +
+        ', nb); PasJsonInB64To(' + Node + ', @' + V + '[0]); end;';
+    Exit;
+  end
+  else if (k = tykArray) and (TypeOf(b).Elem = TyByte) then
+  begin
+    if Chk then
+      Result := 'PasJsonInB64Fixed(R, ' + Node + ', nil, SizeOf(' + JsonTypRef(b) + '), ' + tn + ');'
+    else
+      Result := 'PasJsonInB64Fixed(R, ' + Node + ', @' + V + ', SizeOf(' + V + '), ' + tn + ');';
+    Exit;
+  end
+  else
+  begin
+    if Chk then
+      Result := JsonNeedChk(b) + '(R, ' + Node + ');'
+    else
+      Result := JsonNeedDec(b) + '(R, ' + Node + ', ' + V + ');';
+    Exit;
+  end;
+  Result := dst + ' := ' + rd + ';';
+end;
+
+{ The case arms that read the members of record or class T at Base (X,
+  X.F of a record it embeds, or X.F^ of a pointer to one, made by Pre
+  when one of its members comes), each by its directive, their JSON
+  names in Names in the arms' order; Locals gets a property's variable
+  and a required member's flag, Req the checks of the required ones
+  after the members, Unknown the json that keeps the others. The
+  members are the ones the encoder writes (JsonMembers). }
+procedure TParser.JsonDecMembers(T: LongInt; const Base, Who, Pre: string; var Arms: string;
+  var Names: TStrArray; var Locals, Req, Unknown: string; Depth: LongInt; Chk: Boolean);
+var
+  td: TTypeDef;
+  i: SizeInt;
+  f, et: LongInt;
+  nm, v, w, arm, pv, idx: string;
+begin
+  if Depth > 32 then
+    Die('json embed goes 32 records deep in ' + Who + FJsonAt);
+  td := TypeOf(T);
+  for i := 0 to High(td.Fields) do
+  begin
+    f := td.Fields[i].JFlags and not JfVariant;
+    if (f and JfIgnore) <> 0 then
+      Continue;
+    if (td.Fields[i].Vis <> VisPublic) and (f = 0) then
+      Continue;
+    v := Base + '.' + td.Fields[i].Name;
+    w := Who + '.' + td.Fields[i].Name;
+    if (td.Fields[i].JFlags and JfVariant) <> 0 then
+      Die(w + ' is in a variant part and has no JSON form: json ignore on each of the part''s ' +
+        'fields leaves it out' + FJsonAt);
+    if (f and JfUnknown) <> 0 then
+    begin
+      Unknown := v;
+      Continue;
+    end;
+    if (f and JfEmbed) <> 0 then
+    begin
+      et := td.Fields[i].Typ;
+      if TypeOf(et).Kind = tykPointer then
+      begin
+        if Chk then
+          JsonDecMembers(TypeOf(et).Elem, v + '^', w, Pre, Arms, Names, Locals, Req, Unknown,
+            Depth + 1, Chk)
+        else
+          JsonDecMembers(TypeOf(et).Elem, v + '^', w, Pre + 'if ' + v + ' = nil then New(' + v +
+            '); ', Arms, Names, Locals, Req, Unknown, Depth + 1, Chk);
+      end
+      else
+        JsonDecMembers(et, v, w, Pre, Arms, Names, Locals, Req, Unknown, Depth + 1, Chk);
+      Continue;
+    end;
+    if (f and JfName) <> 0 then
+      nm := td.Fields[i].JName
+    else
+      nm := td.Fields[i].Name;
+    idx := IntToStr(Length(Names));
+    AppendStr(Names, nm);
+    arm := Pre + JsonDecValue(td.Fields[i].Typ, v, 'PasJsonInVal(c)', f, w, Chk);
+    if (f and JfRequired) <> 0 then
+    begin
+      Locals := Locals + 'rq' + idx + ': Boolean; ';
+      arm := 'rq' + idx + ' := True; ' + arm;
+      Req := Req + 'if not rq' + idx + ' then PasJsonInMissing(R, J, ' + PasLit(nm) + ');' + #10;
+    end;
+    Arms := Arms + idx + ': begin ' + arm + ' end;' + #10;
+  end;
+  for i := 0 to High(td.Props) do
+  begin
+    f := td.Props[i].JFlags;
+    if (f and JfIgnore) <> 0 then
+      Continue;
+    if (not td.Props[i].IsPublished) and (f = 0) then
+      Continue;
+    w := Who + '.' + td.Props[i].Name;
+    if (td.Props[i].ReadName = '') or (td.Props[i].NIndex > 0) then
+    begin
+      if f <> 0 then
+        Die(w + ' is read by no accessor, or by an index: json writes no such property' + FJsonAt);
+      Continue;
+    end;
+    v := Base + '.' + td.Props[i].Name;
+    if (f and JfName) <> 0 then
+      nm := td.Props[i].JName
+    else
+      nm := td.Props[i].Name;
+    idx := IntToStr(Length(Names));
+    AppendStr(Names, nm);
+    if Chk then
+      arm := JsonDecValue(td.Props[i].Typ, '', 'PasJsonInVal(c)', f, w, True)
+    else
+    begin
+      { a property is read through its variable, which its writer then
+        takes; one with no writer is read and dropped }
+      pv := 'p' + idx;
+      Locals := Locals + pv + ': ' + JsonTypRef(td.Props[i].Typ) + '; ';
+      arm := 'if R.Merge then ' + pv + ' := ' + v + ' else ' + pv + ' := Default(' +
+        JsonTypRef(td.Props[i].Typ) + '); ' +
+        JsonDecValue(td.Props[i].Typ, pv, 'PasJsonInVal(c)', f, w, False);
+      if td.Props[i].WriteName <> '' then
+        arm := arm + ' ' + v + ' := ' + pv + ';';
+      arm := Pre + arm;
+    end;
+    if (f and JfRequired) <> 0 then
+    begin
+      Locals := Locals + 'rq' + idx + ': Boolean; ';
+      arm := 'rq' + idx + ' := True; ' + arm;
+      Req := Req + 'if not rq' + idx + ' then PasJsonInMissing(R, J, ' + PasLit(nm) + ');' + #10;
+    end;
+    Arms := Arms + idx + ': begin ' + arm + ' end;' + #10;
+  end;
+end;
+
+{ The text of the decoder of type T, $jdec, or with Chk of its check,
+  $jchk: a procedure that reads node J into X. Tab gets the constant of
+  a record's or a class's names, which the decoder writes and the check
+  reads. }
+function TParser.JsonDecText(T: LongInt; Chk: Boolean; out Tab: string): string;
+var
+  k: TTypeKind;
+  td: TTypeDef;
+  head, tr, tn, body, arms, locals, req, unk, ix, elem, kt, vt, key, nmc: string;
+  names: TStrArray;
+  i, n: SizeInt;
+  e, kb: LongInt;
+  lo, hi: Int64;
+begin
+  td := TypeOf(T);
+  k := td.Kind;
+  tr := JsonTypRef(T);
+  tn := PasLit(TypName(T));
+  Tab := '';
+  if Chk then
+    head := 'procedure $jchk' + IntToStr(T) + '(var R: TJsonIn; J: Pointer);'
+  else
+    head := 'procedure $jdec' + IntToStr(T) + '(var R: TJsonIn; J: Pointer; var X: ' + tr + ');';
+  if (k = tykRecord) or (k = tykClass) then
+  begin
+    if (k = tykClass) and not Chk then
+      JsonCanMake(T);
+    arms := '';
+    names := nil;
+    locals := '';
+    req := '';
+    unk := '';
+    JsonDecMembers(T, 'X', TypName(T), '', arms, names, locals, req, unk, 0, Chk);
+    n := Length(names);
+    if n > 0 then
+    begin
+      Tab := 'const $jn' + IntToStr(T) + ': array[0..' + IntToStr(n - 1) + '] of string = (';
+      for i := 0 to n - 1 do
+      begin
+        if i > 0 then
+          Tab := Tab + ', ';
+        Tab := Tab + PasLit(names[i]);
+      end;
+      Tab := Tab + ');';
+      body := 'm := PasJsonInMatch(c, @$jn' + IntToStr(T) + ', ' + IntToStr(n) + ', k);' + #10 +
+        'case m of' + #10 + arms + 'else' + #10;
+    end
+    else
+      body := 'begin' + #10;
+    if unk = '' then
+      body := body + 'PasJsonInUnknown(R, c);' + #10
+    else if Chk then
+      body := body + 'cI := 0;' + #10
+    else
+      body := body + 'PasJsonInKeep(uk, c);' + #10;
+    body := body + 'end;' + #10;
+    body := 'c := PasJsonInFirst(J);' + #10 + 'k := 0;' + #10 + 'for i := 1 to n do' + #10 +
+      'begin' + #10 + body + 'c := PasJsonInNextMember(c);' + #10 + 'end;' + #10;
+    if (unk <> '') and not Chk then
+    begin
+      locals := locals + 'uk: TJsonKeep; ';
+      body := 'uk := Default(TJsonKeep);' + #10 + body + unk + ' := PasJsonInKept(R, J, uk, ' + unk +
+        ');' + #10;
+    end;
+    if req <> '' then
+    begin
+      ix := '';
+      for i := 0 to n - 1 do
+        if Pos('rq' + IntToStr(i) + ':', locals) > 0 then
+          ix := ix + 'rq' + IntToStr(i) + ' := False;' + #10;
+      body := ix + body + req;
+    end;
+    if Chk then
+      body := 'if PasJsonInNull(J) then Exit;' + #10 + 'n := PasJsonInObj(R, J, ' + tn + ');' + #10 +
+        body
+    else if k = tykClass then
+      body := 'if PasJsonInNull(J) then begin X := nil; Exit; end;' + #10 +
+        'n := PasJsonInObj(R, J, ' + tn + ');' + #10 +
+        'if not R.Merge or (X = nil) then X := ' + tr + '.Create;' + #10 + body
+    else
+      body := 'if PasJsonInNull(J) then begin X := Default(' + tr + '); Exit; end;' + #10 +
+        'n := PasJsonInObj(R, J, ' + tn + ');' + #10 +
+        'if not R.Merge then X := Default(' + tr + ');' + #10 + body;
+    locals := 'c: Pointer; n, i, k, m: Integer; ' + JsonChkVars + ' ' + locals;
+    Result := head + #10 + 'var ' + locals + #10 + 'begin' + #10 + body + 'end;' + #10;
+  end
+  else if (k = tykArray) and IsDynTyp(T) then
+  begin
+    if Chk then
+      Result := head + #10 + 'var c: Pointer; n, i: Integer; ' + JsonChkVars + #10 + 'begin' + #10 +
+        'if PasJsonInNull(J) then Exit;' + #10 + 'n := PasJsonInArr(R, J, ' + tn + ');' + #10 +
+        'c := PasJsonInFirst(J);' + #10 + 'for i := 0 to n - 1 do begin ' +
+        JsonDecValue(td.Elem, '', 'c', 0, TypName(T) + '[i]', True) +
+        ' c := PasJsonInNext(c); end;' + #10 + 'end;' + #10
+    else
+      Result := head + #10 + 'var c: Pointer; n, i, nb: Integer;' + #10 + 'begin' + #10 +
+        'if PasJsonInNull(J) then begin X := nil; Exit; end;' + #10 +
+        'n := PasJsonInArr(R, J, ' + tn + ');' + #10 + 'X := nil;' + #10 + 'SetLength(X, n);' + #10 +
+        'c := PasJsonInFirst(J);' + #10 + 'for i := 0 to n - 1 do begin ' +
+        JsonDecValue(td.Elem, 'X[i]', 'c', 0, TypName(T) + '[i]', False) +
+        ' c := PasJsonInNext(c); end;' + #10 + 'end;' + #10;
+  end
+  else if k = tykArray then
+  begin
+    { a static array: its length exactly, each element from its zero,
+      as Go's v2 reads a Go array }
+    if td.Elem2 > 0 then
+      ix := JsonTypRef(td.Elem2)
+    else
+      ix := 'Integer';
+    lo := td.Lo;
+    hi := td.Hi;
+    if Chk then
+      Result := head + #10 + 'var c: Pointer; n: Integer; i: ' + ix + '; ' + JsonChkVars + #10 +
+        'begin' + #10 + 'if PasJsonInNull(J) then Exit;' + #10 +
+        'n := PasJsonInArr(R, J, ' + tn + ');' + #10 +
+        'PasJsonInLen(R, J, ' + IntToStr(hi - lo + 1) + ', ' + tn + ');' + #10 +
+        'c := PasJsonInFirst(J);' + #10 + 'for n := 1 to ' + IntToStr(hi - lo + 1) + ' do begin ' +
+        JsonDecValue(td.Elem, '', 'c', 0, TypName(T) + '[i]', True) +
+        ' c := PasJsonInNext(c); end;' + #10 + 'end;' + #10
+    else
+      Result := head + #10 + 'var c: Pointer; n, nb: Integer; i: ' + ix + ';' + #10 + 'begin' + #10 +
+        'X := Default(' + tr + ');' + #10 + 'if PasJsonInNull(J) then Exit;' + #10 +
+        'n := PasJsonInArr(R, J, ' + tn + ');' + #10 +
+        'PasJsonInLen(R, J, ' + IntToStr(hi - lo + 1) + ', ' + tn + ');' + #10 +
+        'c := PasJsonInFirst(J);' + #10 + 'for i := Low(X) to High(X) do begin ' +
+        JsonDecValue(td.Elem, 'X[i]', 'c', 0, TypName(T) + '[i]', False) +
+        ' c := PasJsonInNext(c); end;' + #10 + 'end;' + #10;
+  end
+  else if k = tykSet then
+  begin
+    { a set from an array of its members, each once }
+    e := td.Elem;
+    elem := JsonTypRef(e);
+    Result := head + #10 + 'var c: Pointer; n, i: Integer; e: ' + elem + '; s: ' + tr + '; ' +
+      JsonChkVars + #10 + 'begin' + #10;
+    if Chk then
+      Result := Result + 'if PasJsonInNull(J) then Exit;' + #10
+    else
+      Result := Result + 'if PasJsonInNull(J) then begin X := []; Exit; end;' + #10;
+    Result := Result + 'n := PasJsonInArr(R, J, ' + tn + ');' + #10 + 's := [];' + #10 +
+      'c := PasJsonInFirst(J);' + #10 + 'for i := 1 to n do' + #10 + 'begin' + #10 +
+      'if PasJsonInNull(c) then PasJsonInBad(R, c, ' + tn + ');' + #10 +
+      JsonDecValue(e, 'e', 'c', 0, TypName(T), False) + #10 +
+      'if e in s then PasJsonInTwice(R, c, ' + tn + ');' + #10 + 's := s + [e];' + #10 +
+      'c := PasJsonInNext(c);' + #10 + 'end;' + #10;
+    if not Chk then
+      Result := Result + 'X := s;' + #10;
+    Result := Result + 'end;' + #10;
+  end
+  else if k = tykPointer then
+  begin
+    if Chk then
+      Result := head + #10 + 'var ' + JsonChkVars + #10 + 'begin' + #10 +
+        'if PasJsonInNull(J) then Exit;' + #10 +
+        JsonDecValue(td.Elem, '', 'J', 0, TypName(T) + '^', True) + #10 + 'end;' + #10
+    else
+      Result := head + #10 + 'var nb: Integer;' + #10 + 'begin' + #10 +
+        'if PasJsonInNull(J) then begin X := nil; Exit; end;' + #10 +
+        'if not R.Merge or (X = nil) then New(X);' + #10 +
+        JsonDecValue(td.Elem, 'X^', 'J', 0, TypName(T) + '^', False) + #10 + 'end;' + #10;
+  end
+  else if (k = tykMap) or (k = tykTree) then
+  begin
+    { a map or a tree from an object: each name its key, each value read
+      into the entry there with Merge, as Go's v2 reuses a map entry }
+    kb := JsonBase(td.Elem);
+    kt := JsonTypRef(td.Elem);
+    vt := JsonTypRef(td.Elem2);
+    nmc := PasLit(TypName(td.Elem));
+    if IsStrTyp(kb) then
+      key := 'key := PasJsonInName(c);'
+    else if IsCharT(kb) then
+    begin
+      OrdBounds(td.Elem, lo, hi);
+      key := 'key := ' + kt + '(PasJsonInNameChar(R, c, ' + IntToStr(lo) + ', ' + IntToStr(hi) +
+        ', ' + nmc + '));';
+    end
+    else if kb = TyBoolean then
+      key := 'key := PasJsonInNameBool(R, c, ' + nmc + ');'
+    else if TypeOf(kb).Kind = tykEnum then
+    begin
+      OrdBounds(td.Elem, lo, hi);
+      key := 'key := ' + kt + '(PasJsonInNameEnum(R, c, @' + JsonNeedNames(kb, n) + ', ' +
+        IntToStr(n) + ', ' + IntToStr(lo) + ', ' + IntToStr(hi) + ', ' + nmc + '));';
+    end
+    else
+    begin
+      OrdBounds(td.Elem, lo, hi);
+      key := 'key := ' + kt + '(PasJsonInNameInt(R, c, ' + IntLitText(lo) + ', ' + IntLitText(hi) +
+        ', ' + nmc + '));';
+    end;
+    if Chk then
+      Result := head + #10 + 'var c: Pointer; n, i: Integer; key: ' + kt + '; ' + JsonChkVars + #10 +
+        'begin' + #10 + 'if PasJsonInNull(J) then Exit;' + #10 +
+        'n := PasJsonInObj(R, J, ' + tn + ');' + #10 + 'c := PasJsonInFirst(J);' + #10 +
+        'for i := 1 to n do' + #10 + 'begin' + #10 + key + #10 +
+        JsonDecValue(td.Elem2, '', 'PasJsonInVal(c)', 0, TypName(T) + '[k]', True) + #10 +
+        'c := PasJsonInNextMember(c);' + #10 + 'end;' + #10 + 'end;' + #10
+    else
+      Result := head + #10 + 'var c: Pointer; n, i, nb: Integer; key: ' + kt + '; v: ' + vt + ';' +
+        #10 + 'begin' + #10 + 'if PasJsonInNull(J) then begin X := nil; Exit; end;' + #10 +
+        'n := PasJsonInObj(R, J, ' + tn + ');' + #10 +
+        'if not R.Merge or (X = nil) then New(X);' + #10 + 'c := PasJsonInFirst(J);' + #10 +
+        'for i := 1 to n do' + #10 + 'begin' + #10 + key + #10 +
+        'if R.Merge and (key in X) then v := X[key] else v := Default(' + vt + ');' + #10 +
+        JsonDecValue(td.Elem2, 'v', 'PasJsonInVal(c)', 0, TypName(T) + '[k]', False) + #10 +
+        'X[key] := v;' + #10 + 'c := PasJsonInNextMember(c);' + #10 + 'end;' + #10 + 'end;' + #10;
+  end
+  else
+    Die(TypName(T) + ' has no JSON form' + FJsonAt);
+end;
+
+{ The entries of type T a unit calls, by the forms in Forms (Jd*): the
+  decode from text and from a json, their Try twins and the typed
+  TryGet of a member or an element. }
+function TParser.JsonDecEntries(T: LongInt; Forms: LongInt; var Heads: string): string;
+var
+  tr, id, h, dc, chk, one: string;
+begin
+  tr := JsonTypRef(T);
+  id := IntToStr(T);
+  Result := '';
+  dc := JsonDecValue(T, 't', 'J', 0, TypName(T), False);
+  one := 'var R: TJsonIn; J: Pointer; t: ' + tr + '; ' + JsonChkVars + #10 + 'begin' + #10 +
+    'R := Default(TJsonIn);' + #10;
+  if (Forms and JdMerge) <> 0 then
+  begin
+    { Merge: the whole document checked first, then read into X itself }
+    chk := JsonDecValue(T, '', 'J', 0, TypName(T), True);
+    dc := 'if R.Merge then begin ' + chk + #10 + JsonDecValue(T, 'X', 'J', 0, TypName(T), False) +
+      ' Exit; end;' + #10 + 't := Default(' + tr + ');' + #10 + dc;
+  end
+  else
+    dc := 't := Default(' + tr + ');' + #10 + dc;
+  dc := dc + #10 + 'X := t;' + #10 + 'end;' + #10;
+  if (Forms and (JdText or JdTryText)) <> 0 then
+  begin
+    h := 'procedure $jdtext' + id + '(const S: string; var X: ' + tr + '; const Opts: TJsonOptions);';
+    Heads := Heads + h + ' forward;' + #10;
+    Result := Result + h + #10 + one + 'J := PasJsonInText(R, S, Opts);' + #10 + dc;
+  end;
+  if (Forms and (JdJson or JdTryJson or JdGet or JdItem)) <> 0 then
+  begin
+    h := 'procedure $jdjson' + id + '(D: json; var X: ' + tr + '; const Opts: TJsonOptions);';
+    Heads := Heads + h + ' forward;' + #10;
+    Result := Result + h + #10 + one + 'J := PasJsonInDoc(R, D, Opts);' + #10 + dc;
+  end;
+  if (Forms and JdTryText) <> 0 then
+  begin
+    h := 'function $jdtryt' + id + '(const S: string; var X: ' + tr +
+      '; out Err: EJsonError; const Opts: TJsonOptions): Boolean;';
+    Heads := Heads + h + ' forward;' + #10;
+    Result := Result + h + #10 + 'begin' + #10 + 'Err := nil;' + #10 + 'Result := True;' + #10 +
+      'try' + #10 + '$jdtext' + id + '(S, X, Opts);' + #10 + 'except' + #10 +
+      'on E: EJsonError do begin Err := E; Result := False; end;' + #10 + 'end;' + #10 + 'end;' + #10;
+  end;
+  if (Forms and (JdTryJson or JdGet or JdItem)) <> 0 then
+  begin
+    h := 'function $jdtryj' + id + '(D: json; var X: ' + tr +
+      '; out Err: EJsonError; const Opts: TJsonOptions): Boolean;';
+    Heads := Heads + h + ' forward;' + #10;
+    Result := Result + h + #10 + 'begin' + #10 + 'Err := nil;' + #10 + 'Result := True;' + #10 +
+      'try' + #10 + '$jdjson' + id + '(D, X, Opts);' + #10 + 'except' + #10 +
+      'on E: EJsonError do begin Err := E; Result := False; end;' + #10 + 'end;' + #10 + 'end;' + #10;
+  end;
+  if (Forms and JdGet) <> 0 then
+  begin
+    h := 'function $jdget' + id + '(D: json; const K: string; var X: ' + tr + '): Boolean;';
+    Heads := Heads + h + ' forward;' + #10;
+    Result := Result + h + #10 + 'var v: json; e: EJsonError;' + #10 + 'begin' + #10 +
+      'Result := False;' + #10 + 'if PasJsonTryGet(D, K, v) then' + #10 +
+      'Result := $jdtryj' + id + '(v, X, e, JsonDefaults);' + #10 + 'end;' + #10;
+  end;
+  if (Forms and JdItem) <> 0 then
+  begin
+    h := 'function $jditem' + id + '(D: json; I: Integer; var X: ' + tr + '): Boolean;';
+    Heads := Heads + h + ' forward;' + #10;
+    Result := Result + h + #10 + 'var v: json; e: EJsonError;' + #10 + 'begin' + #10 +
+      'Result := False;' + #10 + 'if PasJsonTryItem(D, I, v) then' + #10 +
+      'Result := $jdtryj' + id + '(v, X, e, JsonDefaults);' + #10 + 'end;' + #10;
+  end;
+end;
+
+{ Type T's entry in Forms is called: its symbol. }
+function TParser.JsonNeedEntry(T: LongInt; Form: LongInt): string;
+var
+  i: SizeInt;
+  found: Boolean;
+begin
+  if FJsonAt = '' then
+    FJsonAt := HerePos;
+  found := False;
+  for i := 0 to High(FJsonDEnt) do
+    if FJsonDEnt[i] = T then
+    begin
+      FJsonDForm[i] := FJsonDForm[i] or Form;
+      found := True;
+    end;
+  if not found then
+  begin
+    i := Length(FJsonDEnt);
+    SetLength(FJsonDEnt, i + 1);
+    SetLength(FJsonDForm, i + 1);
+    FJsonDEnt[i] := T;
+    FJsonDForm[i] := Form;
+  end;
+  case Form and not JdMerge of
+    JdText: Result := 'json.dtext';
+    JdJson: Result := 'json.djson';
+    JdTryText: Result := 'json.dtryt';
+    JdTryJson: Result := 'json.dtryj';
+    JdGet: Result := 'json.dget';
+  else
+    Result := 'json.ditem';
+  end;
+  Result := ProcSym(FUnitName, Result + IntToStr(T));
+end;
+
+{ JsonDecode(src, x[, opts]) and TryJsonDecode(src, x, err[, opts]):
+  src a string or a json, x a variable of a type with a JSON form. }
+function TParser.JsonDecodeCall(IsTry: Boolean; const Args: TExprArray): PExpr;
+var
+  t, ot, et: LongInt;
+  a: TExprArray;
+  pe: TProcEnt;
+  why, wn: string;
+  form, n, i: LongInt;
+  x: PExpr;
+begin
+  if IsTry then
+    wn := 'TryJsonDecode'
+  else
+    wn := 'JsonDecode';
+  n := 2;
+  if IsTry then
+    n := 3;
+  if (Length(Args) < n) or (Length(Args) > n + 1) then
+  begin
+    if IsTry then
+      Die('TryJsonDecode takes the text or a json, a variable, the error and the options if any' +
+        HerePos)
+    else
+      Die('JsonDecode takes the text or a json, a variable and the options if any' + HerePos);
+  end;
+  for i := 0 to High(Args) do
+    CheckTyped(Args[i]);
+  x := Args[1];
+  if not ((x^.Kind = ekVar) or (x^.Kind = ekField) or (x^.Kind = ekIndex) or
+    (x^.Kind = ekDeref)) then
+    Die(wn + '(s, x): x needs a variable' + HerePos);
+  t := x^.Typ;
+  if not JsonForm(t, why) then
+    Die(wn + ' takes a variable of a type with a JSON form, and ' + TypName(t) + ' has none' +
+      HerePos);
+  a := nil;
+  SetLength(a, n + 1);
+  if Args[0]^.Kind = ekNil then
+    Args[0]^.Typ := InternJson;
+  if TypeOf(Args[0]^.Typ).Kind = tykJson then
+  begin
+    form := JdJson;
+    if IsTry then
+      form := JdTryJson;
+    a[0] := ValArg(InternJson, Args[0]);
+  end
+  else if IsStrTyp(Args[0]^.Typ) or IsCharT(Args[0]^.Typ) then
+  begin
+    form := JdText;
+    if IsTry then
+      form := JdTryText;
+    a[0] := StrArg(TyString, Args[0]);
+  end
+  else
+  begin
+    Die(wn + ' reads JSON text, a string, or a json, not ' + TypName(Args[0]^.Typ) + HerePos);
+    form := 0;
+  end;
+  a[1] := NewAddr(x);
+  if IsTry then
+  begin
+    if not NamedType('EJsonError', et) then
+      Die(wn + ' needs pasjson' + HerePos);
+    CheckOutVar(Args[2], et, 'TryJsonDecode(s, x, err): err');
+    a[2] := NewAddr(Args[2]);
+  end;
+  if not NamedType('TJsonOptions', ot) then
+    Die(wn + ' needs pasjson' + HerePos);
+  if Length(Args) > n then
+  begin
+    { options: Merge may be asked, so the type's check is written too }
+    a[n] := ValArg(ot, Args[n]);
+    form := form or JdMerge;
+  end
+  else
+  begin
+    if not FindProc('JsonDefaults', pe) then
+      Die(wn + ' needs pasjson' + HerePos);
+    a[n] := NewCall(pe.Sym, nil, pe.RetTyp);
+  end;
+  if IsTry then
+    Result := NewCall(JsonNeedEntry(t, form), a, TyBoolean)
+  else
+    Result := NewCall(JsonNeedEntry(t, form), a, TyNone);
+end;
+
+{ TryGet(j, k, v) and TryGet(j, i, v) of a v that is no json (P206):
+  whether j has that member or element and it decodes into v, which
+  changes only then; never an error. }
+function TParser.JsonTypedGet(const Args: TExprArray): PExpr;
+var
+  v: PExpr;
+  a: TExprArray;
+  why: string;
+  form: LongInt;
+begin
+  v := Args[2];
+  if not ((v^.Kind = ekVar) or (v^.Kind = ekField) or (v^.Kind = ekIndex) or
+    (v^.Kind = ekDeref)) then
+    Die('TryGet(j, k, v): v needs a variable' + HerePos);
+  if not JsonForm(v^.Typ, why) then
+    Die('TryGet of a json takes a v of a type with a JSON form, and ' + TypName(v^.Typ) +
+      ' has none' + HerePos);
+  a := nil;
+  SetLength(a, 3);
+  a[0] := ValArg(InternJson, Args[0]);
+  CheckTyped(Args[1]);
+  if IsStrTyp(Args[1]^.Typ) or IsCharT(Args[1]^.Typ) then
+  begin
+    a[1] := StrArg(TyString, Args[1]);
+    form := JdGet;
+  end
+  else if (TypeOf(Args[1]^.Typ).Kind = tykInteger) or (TypeOf(Args[1]^.Typ).Kind = tykSubrange) then
+  begin
+    a[1] := ValArg(TyInteger, Args[1]);
+    form := JdItem;
+  end
+  else
+  begin
+    Die('TryGet of a json takes a name, a string, or a place, an Integer' + HerePos);
+    form := 0;
+  end;
+  a[2] := NewAddr(v);
+  Result := NewCall(JsonNeedEntry(v^.Typ, form), a, TyBoolean);
+end;
+
+{ The functions JsonEncode, JsonOf and JsonDecode call, and every
+  encoder, decoder and check they need, as Pascal text the parser reads
+  in its own mode, at the end of the unit: constants and headers first,
+  then bodies. }
 procedure TParser.GenJsonCode;
 var
-  src, heads, bodies, txt, h: string;
-  i, ne, nz: SizeInt;
+  src, heads, bodies, txt, h, tab: string;
+  i, ne, nz, nd, nc, nn: SizeInt;
   t: LongInt;
   saveLex: TLexer;
   saveTok: TToken;
   saveImpl, saveCheck: Boolean;
   lex: TLexer;
 begin
-  if Length(FJsonText) = 0 then
+  if (Length(FJsonText) = 0) and (Length(FJsonDEnt) = 0) then
     Exit;
   heads := '';
   bodies := '';
@@ -23763,27 +24666,58 @@ begin
     bodies := bodies + h + #10 + 'begin' + #10 +
       'Result := JsonParse($jtext' + IntToStr(t) + '(X, JsonDefaults));' + #10 + 'end;' + #10;
   end;
-  { the encoders the ones before need, until none is new }
+  { the decodes' entries (P206), and the checks Merge needs }
+  for i := 0 to High(FJsonDEnt) do
+  begin
+    bodies := bodies + JsonDecEntries(FJsonDEnt[i], FJsonDForm[i], heads);
+  end;
+  { the encoders, decoders, checks and tables the ones before need, until
+    none is new }
   ne := 0;
   nz := 0;
-  while (ne < Length(FJsonEnc)) or (nz < Length(FJsonZero)) do
+  nd := 0;
+  nc := 0;
+  nn := 0;
+  while (ne < Length(FJsonEnc)) or (nz < Length(FJsonZero)) or (nd < Length(FJsonDec)) or
+    (nc < Length(FJsonChk)) or (nn < Length(FJsonNames)) do
   begin
     if ne < Length(FJsonEnc) then
     begin
       t := FJsonEnc[ne];
       ne := ne + 1;
       txt := JsonEncText(t);
-      heads := heads + Copy(txt, 1, Pos(#10, txt) - 1) + ' forward;' + #10;
-      bodies := bodies + txt;
     end
-    else
+    else if nz < Length(FJsonZero) then
     begin
       t := FJsonZero[nz];
       nz := nz + 1;
       txt := JsonZeroText(t);
-      heads := heads + Copy(txt, 1, Pos(#10, txt) - 1) + ' forward;' + #10;
-      bodies := bodies + txt;
+    end
+    else if nd < Length(FJsonDec) then
+    begin
+      t := FJsonDec[nd];
+      nd := nd + 1;
+      txt := JsonDecText(t, False, tab);
+      if tab <> '' then
+        heads := tab + #10 + heads;
+    end
+    else if nc < Length(FJsonChk) then
+    begin
+      t := FJsonChk[nc];
+      nc := nc + 1;
+      txt := JsonDecText(t, True, tab);
+      { the decoder of the type writes its names: a check comes only with it }
+      JsonNeedDec(t);
+    end
+    else
+    begin
+      t := FJsonNames[nn];
+      nn := nn + 1;
+      heads := JsonEnumTab(t) + #10 + heads;
+      Continue;
     end;
+    heads := heads + Copy(txt, 1, Pos(#10, txt) - 1) + ' forward;' + #10;
+    bodies := bodies + txt;
   end;
   src := heads + bodies;
   if GetEnv('PASLANG_JSONGEN') <> '' then

@@ -256,8 +256,8 @@ GOLDEN += jsonlang
 GOLDEN_A64 += jsonlang
 # P205: JsonEncode and JsonOf of a value of any type with a JSON form,
 # through the encoder the compiler writes for it, every directive.
-GOLDEN += jsonbind1
-GOLDEN_A64 += jsonbind1
+GOLDEN += jsonbind1 jsonbind2 jsonbind3
+GOLDEN_A64 += jsonbind1 jsonbind2 jsonbind3
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -693,6 +693,9 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/jsonbind10 testdata/jsonbind1.paslang; \
 	$(BUILDDIR)/jsonbind10 > $(BUILDDIR)/jsonbind10.got; \
 	diff -u testdata/jsonbind1.out $(BUILDDIR)/jsonbind10.got; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/jsonbind20 testdata/jsonbind2.paslang; \
+	$(BUILDDIR)/jsonbind20 > $(BUILDDIR)/jsonbind20.got; \
+	diff -u testdata/jsonbind2.out $(BUILDDIR)/jsonbind20.got; \
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/jsonlang0 testdata/jsonlang.paslang; \
 	$(BUILDDIR)/jsonlang0 > $(BUILDDIR)/jsonlang0.got; \
 	diff -u testdata/jsonlang.out $(BUILDDIR)/jsonlang0.got; \
@@ -868,8 +871,8 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  'strarith:+ does not take a json' \
 	  'realidx:a json is indexed by a name, a string, or a place, an Integer, not Real at 10:14' \
 	  'downto:for x in a json walks it forward: downto does not at 10:21' \
-	  'forreal:for x in a json: x is a json, its values, or a string' \
-	  'kvbad:for k, v in a json: v is a json, not string at 10:20' \
+	  'forreal:for in a json decodes each value into a variable of a type with a JSON form, and Pointer has none at 10:17' \
+	  "kvbad:for k, v in a json: k is a string, an object's names, or an Integer, an array's places, not Boolean at 10:20" \
 	  'nottest:a json does not go into Boolean' \
 	  'inint:in a json looks for a member' \
 	  'ifjson:a json is no condition: j.AsBoolean reads one, j.IsNull says null at 10:8' \
@@ -898,7 +901,18 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  'bindutf8:a json name is UTF-8 with no noncharacter (RFC 7493 2.1) at 4:16' \
 	  'jsonofargs:JsonOf takes a value at 5:23' \
 	  'jsonvar:json is a reserved word, not a name at 3:3' \
-	  'corename:JsonParse is a reserved word, not a name at 3:3'; do \
+	  'corename:JsonParse is a reserved word, not a name at 3:3' \
+	  'decabstract:JsonDecode makes a TA with its Create, and TA is abstract at 9:22' \
+	  'decctor:JsonDecode makes a TA with Create, and TA.Create takes arguments at 14:22' \
+	  'decnotvar:JsonDecode(s, x): x needs a variable at 7:23' \
+	  'decform:JsonDecode takes a variable of a type with a JSON form, and Pointer has none at 5:21' \
+	  'decsrc:JsonDecode reads JSON text, a string, or a json, not Integer at 5:19' \
+	  'decargs:JsonDecode takes the text or a json, a variable and the options if any at 5:18' \
+	  'tryargs:TryJsonDecode takes the text or a json, a variable, the error and the options if any at 5:28' \
+	  'tryerr:TryJsonDecode(s, x, err): err is Integer, not EJsonError at 5:31' \
+	  'trygetform:TryGet of a json takes a v of a type with a JSON form, and Pointer has none at 6:24' \
+	  'decchan:TR.C has no JSON form (a channel): json ignore leaves it out at 10:22' \
+	  'decvar:JsonDecode is a reserved word, not a name at 3:3'; do \
 	  n=$${f%%:*}; w=$${f#*:}; \
 	  if $(OUTDIR)/paslangc -o $(BUILDDIR)/jb_$$n testdata/jsonbad/$$n.paslang >$(BUILDDIR)/jb_$$n.err 2>&1; then \
 	    echo "jsonbad/$$n should fail"; exit 1; \
@@ -1920,7 +1934,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	test $$rc -eq 1; \
 	diff -u testdata/fatal/expected.out $(BUILDDIR)/fatal_cpstrview-arm.got; \
 	grep -q 'paslang: pointer outside its object at line 21' $(BUILDDIR)/fatal_cpstrview-arm.err; \
-	for t in ptrarith ptrtyped memview ptrsafe gcbasic pchar narrowmem cpwalk ptrreach strview strshrink jsonlang jsonbind1; do \
+	for t in ptrarith ptrtyped memview ptrsafe gcbasic pchar narrowmem cpwalk ptrreach strview strshrink jsonlang jsonbind1 jsonbind2; do \
 	  $(OUTDIR)/paslangc -checkptr -o $(BUILDDIR)/cpok_$$t testdata/$$t.paslang; \
 	  $(BUILDDIR)/cpok_$$t > $(BUILDDIR)/cpok_$$t.got; \
 	  diff -u testdata/$$t.out $(BUILDDIR)/cpok_$$t.got; \
@@ -2251,6 +2265,17 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/bindmain-arm testdata/units/bindmain.paslang; \
 	timeout 60 $(QEMU_A64) $(BUILDDIR)/bindmain-arm > $(BUILDDIR)/bindmain-arm.got; \
 	diff -u testdata/units/bindmain.out $(BUILDDIR)/bindmain-arm.got; \
+	: a unit types read by the program that uses it, private fields too, and the unit reading in its own routines P206; \
+	$(OUTDIR)/paslangc testdata/units/jsondec.paslang; \
+	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/jsondecuse testdata/units/jsondecuse.paslang; \
+	$(BUILDDIR)/jsondecuse > $(BUILDDIR)/jsondecuse.got; \
+	diff -u testdata/units/jsondecuse.out $(BUILDDIR)/jsondecuse.got; \
+	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=3 PASLANG_GCPOISON=1 $(BUILDDIR)/jsondecuse > $(BUILDDIR)/jsondecuse.got; \
+	diff -u testdata/units/jsondecuse.out $(BUILDDIR)/jsondecuse.got; \
+	$(OUTDIR)/paslangc -target arm64 testdata/units/jsondec.paslang; \
+	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/jsondecuse-arm testdata/units/jsondecuse.paslang; \
+	timeout 60 $(QEMU_A64) $(BUILDDIR)/jsondecuse-arm > $(BUILDDIR)/jsondecuse-arm.got; \
+	diff -u testdata/units/jsondecuse.out $(BUILDDIR)/jsondecuse-arm.got; \
 	$(OUTDIR)/paslangc testdata/units/anonrec.paslang; \
 	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/anonrecmain testdata/anonrec.paslang; \
 	PASLANG_GCVERIFY=1 $(BUILDDIR)/anonrecmain > $(BUILDDIR)/anonrec.got; \
@@ -2993,7 +3018,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	test "$$ticks" -lt 20; \
 	echo "ok idlecpu ($$ticks user ticks after one second)"; \
 	echo "==== examples ===="; \
-	for t in hello values control routines varargs records scopedtypes classes registry helpers convert report money systemerrors boundedfiles filemetadata directories paths environments processes temporaryresources systempaths textbuilding textencoding textbuffers valuehelpers identifiers generics errors excobjects bank concurrent blockedio fanin maps sync wordcount strings maths narrow pointers single quad bits rotations carry bigrot bitfields wide atomics views vectors machine assembly hashes closures slices properties cleanup pipeline kvstore sorting timeout digest bitmap trees dates jsonread jsonwrite jsonlang jsonbind; do \
+	for t in hello values control routines varargs records scopedtypes classes registry helpers convert report money systemerrors boundedfiles filemetadata directories paths environments processes temporaryresources systempaths textbuilding textencoding textbuffers valuehelpers identifiers generics errors excobjects bank concurrent blockedio fanin maps sync wordcount strings maths narrow pointers single quad bits rotations carry bigrot bitfields wide atomics views vectors machine assembly hashes closures slices properties cleanup pipeline kvstore sorting timeout digest bitmap trees dates jsonread jsonwrite jsonlang jsonbind jsonunbind; do \
 	  $(OUTDIR)/paslangc -o $(BUILDDIR)/ex_$$t examples/$$t.paslang; \
 	  $(BUILDDIR)/ex_$$t > $(BUILDDIR)/ex_$$t.got; \
 	  diff -u examples/$$t.out $(BUILDDIR)/ex_$$t.got; \
@@ -3356,7 +3381,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	done; \
 	echo ok deadlock-arm; \
 	echo "==== examples arm64 ===="; \
-	for t in hello values control routines varargs records scopedtypes classes registry helpers convert report money systemerrors boundedfiles filemetadata directories paths environments processes temporaryresources systempaths textbuilding textencoding textbuffers valuehelpers identifiers generics errors excobjects bank concurrent blockedio fanin maps sync wordcount strings maths narrow pointers single quad bits rotations carry bigrot bitfields wide atomics views vectors machine assembly hashes closures slices properties cleanup pipeline kvstore sorting timeout digest bitmap trees dates jsonread jsonwrite jsonlang jsonbind; do \
+	for t in hello values control routines varargs records scopedtypes classes registry helpers convert report money systemerrors boundedfiles filemetadata directories paths environments processes temporaryresources systempaths textbuilding textencoding textbuffers valuehelpers identifiers generics errors excobjects bank concurrent blockedio fanin maps sync wordcount strings maths narrow pointers single quad bits rotations carry bigrot bitfields wide atomics views vectors machine assembly hashes closures slices properties cleanup pipeline kvstore sorting timeout digest bitmap trees dates jsonread jsonwrite jsonlang jsonbind jsonunbind; do \
 	  $(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/ex_$$t-arm examples/$$t.paslang; \
 	  timeout 60 $(QEMU_A64) $(BUILDDIR)/ex_$$t-arm > $(BUILDDIR)/ex_$$t-arm.got; \
 	  diff -u examples/$$t.out $(BUILDDIR)/ex_$$t-arm.got; \

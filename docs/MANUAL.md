@@ -5628,7 +5628,8 @@ that hold a noncharacter, as I-JSON says.
 
 `EJsonError` has the error's `Kind` (`TJsonErrorKind`: `jeSyntax`,
 `jeEncoding`, `jeDuplicate`, `jeDepth`, `jeTooLarge` for a parse,
-`jeMissing`, `jeType`, `jeRange` for a read), its `Offset` (the byte
+`jeMissing`, `jeType`, `jeRange` for a read, and `jeUnknown` for a
+decode's member no field takes, below), its `Offset` (the byte
 from 0), `Line` and `Column` (from 1, the column in bytes), the `Path` of
 the value it is about (a JSON Pointer; for a read, of what was asked),
 its `Reason` and a `Message`:
@@ -5657,8 +5658,9 @@ when there is an error.
 level (`JsonPretty` takes two spaces), as Go's `jsontext` with
 `WithIndent`; `Canonical` RFC 8785's form (`JsonCanonical`); and
 `EscapeHtml` writes `<`, `>` and `&` as `\u003c`, `\u003e` and `\u0026`.
-`JsonDefaults` gives the options of a parse and a write with none, and
-nothing about JSON is global.
+`RejectUnknown` and `Merge` say how `JsonDecode` reads (below).
+`JsonDefaults` gives the options of a parse, a write and a decode with
+none, and nothing about JSON is global.
 
 `examples/jsonwrite.paslang`:
 
@@ -5855,7 +5857,7 @@ property Title: string read FTitle write FTitle json 'title';
 | `omitzero` | left out when it is its type's zero: 0, `''`, `False`, `nil`, an empty array, a record of zeros (a real is zero when its bits are, so `-0` is written) | `omitzero` |
 | `omitempty` | left out when it is written as `null`, `""`, `{}` or `[]` | `omitempty` |
 | `quoted` | a number written inside a string, `"12"` | `string` |
-| `required` | read in P206 | |
+| `required` | when read, a member that must be in the text (`JsonDecode`) | |
 | `ignore` | never written | `-` |
 | `embed` | a record's members, or a pointer's to one, in place of its own | `embed` |
 | `unknown` | a `json` object whose members are written after the others | `embed` on a `jsontext.Value` |
@@ -5990,6 +5992,154 @@ integer, a string, an array of strings, a real, a Boolean, an array of
 records and a map, written twenty times, take 0.79 of the time of Go's
 `v2` with `Deterministic` and 0.80 of `v1` on one line, 0.74 and 0.70 a
 value a line, with less memory (`scripts/bench/b35bind`).
+
+### Reading records, classes and any value: JsonDecode
+
+`JsonDecode(src, x)` and `JsonDecode(src, x, opts)` read JSON into a
+variable of any type with a JSON form (1.1.133): `src` is the text, a
+string, or a `json`; the compiler writes a decoder for `x`'s type as it
+writes an encoder, so the directives above say how each member is read
+too. `TryJsonDecode(src, x, err[, opts])` is its twin that gives the
+error in `err` (`nil` when there is none) and returns whether it read.
+Whatever fails, `x` is left as it was: the decode reads into a variable
+of its own and puts it in `x` once, at the end, where Go's `v2` leaves
+what it wrote before the error.
+
+A member is matched by its name exactly, the next one in the order of
+the fields first. What is read follows Go's `v2` (`Unmarshal`):
+
+| Type | Reads |
+|---|---|
+| integers, integer subranges | a number with no point and no exponent (`1.0` and `1e2` are no integers), within the type's range; `-0` is 0 |
+| `quoted` | the number inside a string, the whole string a JSON number |
+| `Double`, `Single` | a number, rounded once to the type (`Single` from the text, never through a `Double`); past the largest finite one an error, below the smallest 0 |
+| `Quad` | a number, rounded once from its text |
+| `Currency` | a number that is exactly four places or fewer, within its range: never rounded |
+| `Boolean` | `true` or `false` |
+| `Char` | a string of one byte of seven bits |
+| `string` | a string, copied, so the value keeps nothing of the text |
+| an enumeration | the name of a member |
+| a set | an array of its members, each once |
+| a record | an object; a member it does not take is left out, or an error with `RejectUnknown`, or kept by its `unknown` member |
+| a static array | an array of exactly its length |
+| a dynamic array | an array, new |
+| `array of Byte`, `array[...] of Byte` | base64 (RFC 4648 4, padded, no line breaks), the static one exactly its size |
+| `map[K] of V`, `tree[K] of V` | an object; each name its key: a string as it is, a `Char` of one byte, an integer in its decimal digits (no `-0`, no `0` before a digit), an enumeration's member, `true` or `false` |
+| a class | an object, into an object made with its `Create`, or `null` for `nil` |
+| `^T` | `T` into a new one, or `null` for `nil` |
+| `json` | any value, its own document (the root of one is shared) |
+| `TDateTime` with `rfc3339` | RFC 3339 text (5.6, `T` and `Z` in capitals, seconds below 60, a fraction of any length, `Z` or `+hh:mm`), taken to UTC, years 1 to 9999 |
+
+`null` is the type's zero (`Default(T)`), for every type; a member that
+is not there stays zero, an object made by `Create` keeps what `Create`
+gave it, and `required` makes its absence an error. A class is made
+with the `Create` of the nearest class that declares one, `TObject`'s
+at the root: one that takes arguments, or an abstract class, is a
+compile error. A property is written through its `write`; one with none
+is read and dropped.
+
+With `opts.Merge`, the text is read into what `x` holds, as Go's `v2`
+always reads: an object's members merge into a record or an object that
+is there member by member, a map keeps its entries and reads a value
+into the one it has, a pointer or an object that is there is read into;
+strings, numbers, arrays and `json` are replaced. The whole text is
+checked against the type first, writing nothing, so even then nothing
+changes unless all of it reads. `opts.RejectUnknown` makes a member that
+no field takes an error (`jeUnknown`).
+
+Each error is an `EJsonError` with the JSON Pointer of the value and,
+when it came from text, its line, column and byte: `jeType` for a kind
+or a form the type does not take (`cannot decode "x" into Integer`),
+`jeRange` past a range (`cannot decode 300 into Byte: out of range at
+1:7 (byte 6) within "/B"`), `jeMissing`, `jeUnknown`, `jeDuplicate` for
+a set's member twice; the text's own errors are a parse's (§12, Errors).
+
+`for v in j` and `for k, v in j` decode each value into `v` when `v` is
+no `json` (a `string` alone is still an object's names; `for i, s in j`
+reads strings), and `TryGet(j, k, v)` and `TryGet(j, i, v)` say whether
+the member or the element is there and reads into `v`, which changes
+only then.
+
+`examples/jsonunbind.paslang`:
+
+```pascal
+{ JSON read into records and classes: JsonDecode reads text or a json
+  into a variable of any type with a JSON form, through what the json
+  directives say; the variable changes only when all of it reads, and
+  TryJsonDecode gives the error instead of raising it. }
+program jsonunbind;
+
+uses
+  sysutils;
+
+type
+  TRole = (Reader, Writer, Admin);
+
+  TAddress = record
+    Street: string json 'street';
+    Zip: Integer json 'zip' quoted;
+  end;
+
+  TUser = class
+  public
+    Id: Integer json 'id' required;
+    Name: string json 'name';
+    Roles: set of TRole json 'roles';
+    Home: TAddress json embed;
+    Joined: TDateTime json 'joined' rfc3339;
+    Balance: Currency json 'balance';
+    Extra: json json unknown;
+  end;
+
+const
+  Text = '{"id": 7, "name": "Ana", "roles": ["Reader", "Admin"], ' +
+    '"street": "Calle Mayor 1", "zip": "3001", "joined": "2026-10-14T11:30:00+02:00", ' +
+    '"balance": 1234.5, "team": "blue"}';
+
+var
+  u: TUser;
+  e: EJsonError;
+  ports: array of Integer;
+  opts: TJsonOptions;
+  port: Integer;
+
+begin
+  JsonDecode(Text, u);
+  WriteLn(u.Id, ' ', u.Name, ' ', Admin in u.Roles, ' ', u.Home.Zip, ' ',
+    FormatDateTime('yyyy-mm-dd hh:nn', u.Joined), ' ', u.Balance, ' ', u.Extra);
+  if not TryJsonDecode('{"id": 8, "roles": ["Owner"]}', u, e) then
+    WriteLn(e.Message);
+  WriteLn(u.Id);
+  opts := JsonDefaults;
+  opts.Merge := True;
+  JsonDecode('{"id": 8, "balance": 99.99}', u, opts);
+  WriteLn(u.Id, ' ', u.Name, ' ', u.Balance);
+  JsonDecode('[8080, 8443]', ports);
+  for port in JsonParse('{"http": 80, "https": 443}') do
+    Write(port, ' ');
+  WriteLn(Length(ports), ' ', ports[1]);
+end.
+```
+
+prints
+
+```
+7 Ana 1 3001 2026-10-14 09:30 1234.5 {"team":"blue"}
+json: cannot decode "Owner" into TRole: no such member at 1:21 (byte 20) within "/roles/0"
+7
+8 Ana 99.99
+80 443 2 8443
+```
+
+`scripts/jsonmodel.py` reads back each of its 150 types' text, reads a
+second text into each value with `Merge` and refuses a text with a
+member of another kind, as Go's `v2` does, line for line on both
+machines; `testdata/jsonbind2` and `jsonbind3` hold the rest, among it a
+list 5000 deep read in a new routine and one document read by 16 at
+once. Reading 20000 records twenty times takes 0.74 of the time of Go's
+`v2` and 0.66 of `v1` (`scripts/bench/b36unbind`); the document the text
+is parsed into first makes its memory 2.6 times Go's, which P280 takes
+away.
 
 ### Speed
 
@@ -11960,6 +12110,14 @@ the commands on standard input, under `--debug-mode` and under
   I-JSON message must not hold one. `AsInteger` takes an integer literal
   that fits and nothing else (`1.0` is no integer); `AsFloat` refuses
   a number past the largest `Double` instead of giving an infinity.
+  `JsonDecode` (1.1.133) changes its variable only when the whole text
+  reads, where Go's `v2` leaves what it wrote before the error; without
+  `Merge` it replaces the variable, a member that is not there zero,
+  where Go's `v2` always merges into what is there. An empty array or
+  `""` for bytes reads as `nil`, since an empty dynamic array is `nil`
+  in paslang, so `omitzero` then leaves it out where Go keeps a slice
+  that is not `nil`; an integer key of a map is read only from the
+  digits JsonEncode writes for it (no `-0`, which Go takes as 0).
 - SysUtils file buffers are typed, bounded `TBytes`, not untyped memory
   whose extent cannot be checked. Whole-file reads require a byte budget;
   excess is an explicit error, never silent truncation. DOS file-sharing
@@ -12222,7 +12380,8 @@ its place:
   High Odd SizeOf Length Copy Delete Clear TryGet Default Assigned
   SetLength Inc Dec GetMem FreeMem Move FillChar CompareByte IndexByte
   View MemBase MemSize MemEnd`, and Pascal's string words `Pos Insert Concat UpCase LowerCase
-  StringOfChar Str Val` (1.1.10), and `JsonOf` (§12, 1.1.131); the options
+  StringOfChar Str Val` (1.1.10), `JsonOf` (§12, 1.1.131), and
+  `JsonDecode` and `TryJsonDecode` (§12, 1.1.133); the options
   of a `json` directive, `omitzero` … `rfc3339`, are words only after
   `json` and stay names;
 - the tree, heap and store words (§11): `Rank KeyAt PopLow PopHigh Split
@@ -12281,11 +12440,12 @@ its place:
   pastree's `PasTreeNew` … `PasStoreAbandon`, pasjson's JSON words
   (§12) `JsonParse TryJsonParse JsonEncode JsonIndex JsonDefaults
   JsonPretty JsonCanonical`, its types `TJsonKind` (`jkNull` …
-  `jkObject`), `TJsonErrorKind` (`jeSyntax` … `jeRange`), `TJsonOptions`,
-  `EJsonError`, `TJsonIter`, `TJsonIndex`, `TJsonHelper` and the
+  `jkObject`), `TJsonErrorKind` (`jeSyntax` … `jeUnknown`), `TJsonOptions`,
+  `EJsonError`, `TJsonIter`, `TJsonIndex`, `TJsonHelper`, the
   writer's `TJsonOut`, `TJsonOutLevel`, `TJsonOutMark`, `TJsonOutPair` and
-  `TJsonOutPairs`, and its `PasJsonIndex` … `PasJsonImage` and
-  `PasJsonOutInit` … `PasJsonOutIntName` routines, and pasobject's `TObject`
+  `TJsonOutPairs` and the reader's `TJsonIn` and `TJsonKeep`, and its
+  `PasJsonIndex` … `PasJsonImage`, `PasJsonOutInit` … `PasJsonOutIntName`
+  and `PasJsonInText` … `PasJsonInNameBool` routines, and pasobject's `TObject`
   with `PasClassName` … `PasUncaught`, and the compiler's `TClass`
   (`class of TObject`), `TVarRec` and its kinds `vtInteger` …
   `vtJson`. A core unit declares its

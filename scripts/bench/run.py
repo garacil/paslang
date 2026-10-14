@@ -74,7 +74,9 @@ PAIRS = ["b1loop", "b2str", "b3spawn", "b4chan", "b5map", "b6smap", "b7narrow", 
          # P203: JSON (the json type against encoding/json v2 and v1) on Go's corpus
          "b34json",
          # P205: typed JSON written (JsonEncode of a record against Marshal)
-         "b35bind"]
+         "b35bind",
+         # P206: typed JSON read (JsonDecode into records against Unmarshal)
+         "b36unbind"]
 # The longest one run may take, in seconds: a run past it is killed, its
 # unit stops being measured and fails (Go's side of every pair takes
 # under 1 s; paslang's append of a character, quadratic until its hito,
@@ -107,6 +109,7 @@ SECTIONS = {
     "b33utf8": ["ascii", "mixed"],
     "b34json": ["parse", "parse1", "compact", "compact1", "pretty", "pretty1", "canonical"],
     "b35bind": ["marshal", "marshal1", "indent", "indent1"],
+    "b36unbind": ["unmarshal", "unmarshal1"],
 }
 CHECKPTR = ["b8ptr"]
 PROBES = ["p1alloccap", "p2deeprec", "p3divzero", "p4nil", "p5bounds", "p6strbounds", "p7parked"]
@@ -160,6 +163,10 @@ BUDGET.update({"b34json:parse": 0.70, "b34json:parse1": 0.40, "b34json:compact":
 # compact, 0.80 of v1, 0.74/0.72 of v2 a value a line, 0.70/0.68 of v1
 BUDGET.update({"b35bind:marshal": 0.88, "b35bind:marshal1": 0.88, "b35bind:indent": 0.82,
                "b35bind:indent1": 0.78})
+# P206: typed JSON read; measured 0.74/0.78 (native/base) of Go's v2, 0.66/0.69
+# of v1. Its peak memory is 2.6 times Go's (the document the text is parsed
+# into before it is read): P280 reads the text without one.
+BUDGET.update({"b36unbind:unmarshal": 0.86, "b36unbind:unmarshal1": 0.78})
 # paslangc -checkptr / the plain build, per pair in CHECKPTR (P104).
 CHECKPTR_BUDGET = {"b8ptr": 10.0}
 # Peak resident memory, paslang / Go, the medians of MEM_RUNS traced runs:

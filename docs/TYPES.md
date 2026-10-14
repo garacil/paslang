@@ -729,6 +729,20 @@ directive after its type, its name and options (`omitzero`, `omitempty`,
 `TField` and `TPropInfo` (`JName`, `JFlags`) and in the `.pi`
 (PASLANGI27: two more parts on `FLD` and `PROP`).
 
+`JsonDecode(src, x)` and `TryJsonDecode` (P206) read text or a json
+into a variable of any type with a JSON form through a decoder the
+compiler writes the same way (`$jdec`), over pasjson's `TJsonIn` and its
+`PasJsonIn` words, which read a node of the document into the type or
+raise `EJsonError` with its pointer and its place in the text. The
+entry reads into a hidden variable and assigns it once, so a decode
+that fails changes nothing; with `Merge` a check (`$jchk`) reads the
+whole document first, writing nothing and running no code of the
+program, and the decoder then merges into the variable itself. A
+member is found through a constant of the type's names (`$jn`), the
+one after the last found first. A `json` member takes a copy of its
+subtree, its own document; a string is copied. A typed `for` over a
+json and a typed `TryGet` call the same entries.
+
 ## Sync types
 
 `mutex` (32 bytes), `rwmutex` (48), `waitgroup` (24), `cond` (16), and

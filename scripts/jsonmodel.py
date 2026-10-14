@@ -2,7 +2,7 @@
 # This file is part of paslang.
 # Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
 # GPL version 3 or later; see COPYING. No warranty.
-"""Typed JSON held to Go's v2, schema by schema (P205).
+"""Typed JSON held to Go's v2, schema by schema (P205, P206).
 
 Random record types with fixed seeds, in what paslang and Go both write:
 integers, Booleans, strings, Doubles, arrays, records, maps of strings,
@@ -10,13 +10,18 @@ pointers, bytes and json, with the directives a name, omitempty,
 omitzero, quoted, ignore, embed and unknown; random values of them. One
 paslang program and one Go program are written with the same types and
 values; each prints every value with JsonEncode / json.Marshal
-(Deterministic), on one line and a value a line. The paslang lines must
-be Go's. Go's lines are kept in testdata/json/model.expect, so the check
+(Deterministic), on one line and a value a line; then reads that text
+back into a new value and writes it again (JsonDecode / json.Unmarshal),
+reads a second text of the type, written here, into the value with
+Merge (Go's own merge), and says whether a text with a member of
+another kind is refused. The paslang lines must be Go's. Go's lines are kept in testdata/json/model.expect, so the check
 runs where Go is not; with Go, the file is held to what Go prints now
 (--update rewrites it).
 
   scripts/jsonmodel.py compiler build [qemu] [--update]
 """
+import base64
+import json
 import os
 import random
 import shutil
@@ -171,6 +176,102 @@ def gen_rec(r, i, recs, depth):
 def zero_of(f):
     return {"int": 0, "bool": False, "str": "", "float": 0.0, "arr": [], "map": {}, "ptr": None,
             "bytes": b"", "json": "null"}[f.kind]
+
+
+# ---- the text of a value, for the decodes ----
+
+def val_json(f, x, quoted=False):
+    k = f.kind
+    if k == "int":
+        t = str(x)
+    elif k == "float":
+        t = repr(x)
+    elif k == "bool":
+        return "true" if x else "false"
+    elif k == "str":
+        return json.dumps(x, ensure_ascii=False)
+    elif k == "bytes":
+        return '"' + base64.b64encode(x).decode() + '"'
+    elif k == "json":
+        return x
+    elif k == "arr":
+        return "[" + ",".join(val_json(f.elem, e) for e in x) + "]"
+    elif k == "map":
+        return "{" + ",".join(json.dumps(a, ensure_ascii=False) + ":" + val_json(f.elem, b)
+                              for a, b in x.items()) + "}"
+    elif k in ("rec", "ptr"):
+        if x is None:
+            return "null"
+        return obj_json(f.rec, x, ALL_RECS[0])
+    else:
+        raise ValueError(k)
+    return '"' + t + '"' if quoted else t
+
+
+def members_json(i, v, recs, out, ignored):
+    for f in recs[i]:
+        if "unknown" in f.opts:
+            continue
+        if "embed" in f.opts:
+            members_json(f.rec, v[f.name], recs, out, ignored)
+        elif "ignore" in f.opts:
+            # the Go field's own name: a member no field takes
+            ignored.append(f.name)
+        elif "omitzero" in f.opts and (v[f.name] in (b"", []) or
+                                       (f.kind == "json" and v[f.name] == "null")):
+            # an empty array or bytes and a null json are nil in paslang,
+            # where Go's v2 reads a slice or a Value that is not nil and
+            # omitzero then writes it: such a member is left out
+            continue
+        else:
+            out.append((f.jname if f.jname is not None else f.name,
+                        val_json(f, v[f.name], "quoted" in f.opts)))
+
+
+def obj_json(i, v, recs, extra=()):
+    out, ignored = [], []
+    members_json(i, v, recs, out, ignored)
+    names = {a for a, b in out}
+    out += [(n, "1") for n in dict.fromkeys(ignored) if n not in names]
+    out += list(extra)
+    return "{" + ",".join(json.dumps(a, ensure_ascii=False) + ":" + b for a, b in out) + "}"
+
+
+ALL_RECS = [None]
+
+
+def second_text(r, recs):
+    """A second value of the top record, with no member a json unknown
+    keeps (Go's v2 appends to its text, so a name it already has would
+    be there twice) and members no field takes."""
+    ALL_RECS[0] = recs
+    v2 = gen_rec(r, 0, recs, 0)
+    def clear(i, v):
+        for f in recs[i]:
+            if "unknown" in f.opts:
+                v[f.name] = "{}"
+            elif "embed" in f.opts:
+                clear(f.rec, v[f.name])
+    clear(0, v2)
+    extra = [("zq_%d" % r.randrange(1000), str(r.randrange(100))) for _ in range(r.randrange(0, 3))]
+    extra = list(dict(extra).items())
+    return obj_json(0, v2, recs, extra)
+
+
+def bad_text(r, recs, v):
+    """The text of v with one member of another kind, or an array."""
+    ALL_RECS[0] = recs
+    fs = [f for f in recs[0] if f.kind in ("int", "bool", "str", "float") and not
+          ({"ignore", "embed", "unknown"} & set(f.opts))]
+    if not fs:
+        return "[]"
+    f = r.choice(fs)
+    wrong = {"int": '"x"', "bool": "1", "str": "1", "float": '"x"'}[f.kind]
+    out = []
+    members_json(0, v, recs, out, [])
+    name = f.jname if f.jname is not None else f.name
+    out = [(a, wrong if a == name else b) for a, b in out]
+    return "{" + ",".join(json.dumps(a, ensure_ascii=False) + ":" + b for a, b in out) + "}"
 
 
 # ---- Pascal ----
@@ -403,12 +504,32 @@ def build_sources():
         pas_body += stm
         pas_body.append("WriteLn(JsonEncode(%s));" % top)
         pas_body.append("WriteLn(JsonEncode(%s, JsonPretty));" % top)
+        # the decodes' texts from a generator of their own, so the schemas
+        # and values stay P205's
+        r2 = random.Random(SEED * 1000 + c)
+        text2 = second_text(r2, recs)
+        bad = bad_text(r2, recs, v)
+        pas_vars += ["  c%dw, c%dm: %s;" % (c, c, pg.tname(0))]
+        pas_body.append("JsonDecode(JsonEncode(%s), c%dw);" % (top, c))
+        pas_body.append("WriteLn(JsonEncode(c%dw));" % c)
+        pas_body.append("c%dm := %s;" % (c, top))
+        pas_body.append("JsonDecode(%s, c%dm, mopts);" % (pas_str(text2), c))
+        pas_body.append("WriteLn(JsonEncode(c%dm));" % c)
+        pas_body.append("if TryJsonDecode(%s, c%dw, err) then WriteLn('ok') else WriteLn('error');" %
+                        (pas_str(bad), c))
         gg = GoGen(c, recs)
         go_types += gg.types()
-        go_body.append("\tshow(%s)" % gg.rec(0, v))
-    pas = ["{ written by scripts/jsonmodel.py (P205) }", "program jsonmodel;", "type"]
-    pas += pas_types + ["var"] + pas_vars + ["begin"] + pas_body + ["end."]
-    go = ["// written by scripts/jsonmodel.py (P205)", "package main", "", "import (",
+        go_body.append("\t{")
+        go_body.append("\t\tv := %s" % gg.rec(0, v))
+        go_body.append("\t\tshow(v)")
+        go_body.append("\t\trt(v)")
+        go_body.append("\t\tmg(v, %s)" % go_str(text2))
+        go_body.append("\t\tbad[%s](%s)" % (gg.tname(0), go_str(bad)))
+        go_body.append("\t}")
+    pas = ["{ written by scripts/jsonmodel.py (P205, P206) }", "program jsonmodel;", "type"]
+    pas += pas_types + ["var", "  mopts: TJsonOptions;", "  err: EJsonError;"] + pas_vars
+    pas += ["begin", "mopts := JsonDefaults;", "mopts.Merge := True;"] + pas_body + ["end."]
+    go = ["// written by scripts/jsonmodel.py (P205, P206)", "package main", "", "import (",
           '\t"encoding/json/jsontext"', '\t"encoding/json/v2"', '\t"fmt"', '\t"math"', ")", "",
           "var _ = math.MinInt64", ""]
     go += go_types
@@ -417,6 +538,23 @@ def build_sources():
            "\tif err != nil {", "\t\tpanic(err)", "\t}", "\tfmt.Println(string(b))",
            '\tb, err = json.Marshal(v, json.Deterministic(true), jsontext.WithIndent("  "))',
            "\tif err != nil {", "\t\tpanic(err)", "\t}", "\tfmt.Println(string(b))", "}", "",
+           "func line(v any) {",
+           "\tb, err := json.Marshal(v, json.Deterministic(true))",
+           "\tif err != nil {", "\t\tpanic(err)", "\t}", "\tfmt.Println(string(b))", "}", "",
+           "func rt[T any](v T) {",
+           "\tb, err := json.Marshal(v, json.Deterministic(true))",
+           "\tif err != nil {", "\t\tpanic(err)", "\t}",
+           "\tvar w T",
+           "\tif err := json.Unmarshal(b, &w); err != nil {", "\t\tpanic(err)", "\t}",
+           "\tline(w)", "}", "",
+           "func mg[T any](v T, s string) {",
+           "\tw := v",
+           "\tif err := json.Unmarshal([]byte(s), &w); err != nil {", "\t\tpanic(err)", "\t}",
+           "\tline(w)", "}", "",
+           "func bad[T any](s string) {",
+           "\tvar w T",
+           "\tif err := json.Unmarshal([]byte(s), &w); err != nil {",
+           '\t\tfmt.Println("error")', "\t} else {", '\t\tfmt.Println("ok")', "\t}", "}", "",
            "func main() {"] + go_body + ["}"]
     return "\n".join(pas) + "\n", "\n".join(go) + "\n"
 
@@ -475,8 +613,8 @@ def main():
                 w = wl[i] if i < len(wl) else "<none>"
                 if g != w:
                     sys.exit("jsonmodel %s line %d:\n  paslang %s\n  Go      %s" % (name, i + 1, g, w))
-    print("ok jsonmodel (%d schemas held to Go's v2, compact and a value a line%s)" %
-          (SCHEMAS, ", amd64 and arm64" if qemu else ""))
+    print("ok jsonmodel (%d schemas held to Go's v2: written compact and a value a line, read "
+          "back, merged and refused%s)" % (SCHEMAS, ", amd64 and arm64" if qemu else ""))
 
 
 if __name__ == "__main__":
