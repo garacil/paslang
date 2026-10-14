@@ -3641,12 +3641,17 @@ begin
       Line('  bl rt_zerobig');
       Exit;
     end;
+    { 16 bytes a store (P272), the odd word first; x16 and x17 alone, the
+      arguments still in x0 to x7 }
     a := Lab;
     b := Lab;
-    Line(a + ':');
-    Line('  cbz x17, ' + b);
+    Line('  tbz x17, #0, ' + a);
     Line('  str xzr, [x16], #8');
     Line('  sub x17, x17, #1');
+    Line(a + ':');
+    Line('  cbz x17, ' + b);
+    Line('  stp xzr, xzr, [x16], #16');
+    Line('  sub x17, x17, #2');
     Line('  b ' + a);
     Line(b + ':');
     Exit;
@@ -8477,12 +8482,16 @@ begin
       end;
       Line('  b .adone' + IntToStr(FLab));
       Line('.azero' + IntToStr(FLab) + ':');
-      { a value past 256 KiB a piece at a time (P271) }
-      if TSize(Dest^.Typ) > 262144 then
+      { a value past 256 KiB a piece at a time (P271), from 64 bytes 32
+        a store by rt_fill (P272) }
+      if TSize(Dest^.Typ) >= 64 then
       begin
         Line('  mov x1, x2');
         Line('  mov w2, wzr');
-        Line('  bl rt_fillbig');
+        if TSize(Dest^.Typ) > 262144 then
+          Line('  bl rt_fillbig')
+        else
+          Line('  bl rt_fill');
         Line('  b .adone' + IntToStr(FLab));
       end;
       Line('  cmp x2, #8');
@@ -19338,16 +19347,14 @@ begin
           b := Lab;
           Line('  cmp x1, #0');
           Line('  b.le ' + b);
-          { past 256 KiB a piece at a time, the routine able to stop
-            between two (P271) }
+          { 32 bytes a store by rt_fill (P272); past 256 KiB a piece at a
+            time, the routine able to stop between two (P271) }
           Line('  cmp x1, #64, lsl #12');
           Line('  b.ls ' + a);
           Line('  bl rt_fillbig');
           Line('  b ' + b);
           Line(a + ':');
-          Line('  strb w2, [x0], #1');
-          Line('  subs x1, x1, #1');
-          Line('  b.ne ' + a);
+          Line('  bl rt_fill');
           Line(b + ':');
         end
         else
@@ -43479,31 +43486,96 @@ begin
   Line('  ldp x6, x7, [sp, #16]');
   Line('  ldp x4, x5, [sp], #48');
   Line('  ret');
+  { rt_fill (P272): FillChar and a zero value, x0 the bytes, x1 how many
+    (above 0), w2 the byte; x0, x1, x3 and v31 used up, every other
+    register kept. DUP puts the byte in every lane of v31 (Arm ARM
+    C7.2.41); up to 32 bytes two stores that may overlap, the first
+    bytes and the last ones (STUR, C7.2.391, from the end); longer, STP
+    of two Q registers 32 bytes a store (C7.2.386, offsets multiples of
+    16 up to 1008), four a loop over 128 bytes as the Neoverse V2 and N2
+    guides write memset, from the start rounded up to 16 after the first
+    64, and the last 128 by stores that end at the end, so nothing past
+    the request is written. It was one byte a step (strb). }
+  Line('rt_fill:');
+  Line('  dup v31.16b, w2');
+  Line('  add x3, x0, x1');
+  Line('  cmp x1, #32');
+  Line('  b.hi .afl_32');
+  Line('  cmp x1, #16');
+  Line('  b.lo .afl_lt16');
+  Line('  str q31, [x0]');
+  Line('  stur q31, [x3, #-16]');
+  Line('  ret');
+  Line('.afl_lt16:');
+  Line('  cmp x1, #8');
+  Line('  b.lo .afl_lt8');
+  Line('  str d31, [x0]');
+  Line('  stur d31, [x3, #-8]');
+  Line('  ret');
+  Line('.afl_lt8:');
+  Line('  cmp x1, #4');
+  Line('  b.lo .afl_lt4');
+  Line('  str s31, [x0]');
+  Line('  stur s31, [x3, #-4]');
+  Line('  ret');
+  Line('.afl_lt4:');
+  Line('  strb w2, [x0]');
+  Line('  cmp x1, #2');
+  Line('  b.lo .afl_ret');
+  Line('  stur h31, [x3, #-2]');
+  Line('.afl_ret:');
+  Line('  ret');
+  Line('.afl_32:');
+  Line('  stp q31, q31, [x0]');
+  Line('  stp q31, q31, [x3, #-32]');
+  Line('  cmp x1, #64');
+  Line('  b.ls .afl_ret');
+  Line('  stp q31, q31, [x0, #32]');
+  Line('  stp q31, q31, [x3, #-64]');
+  Line('  cmp x1, #128');
+  Line('  b.ls .afl_ret');
+  Line('  add x0, x0, #64');
+  Line('  bic x0, x0, #15');
+  Line('  sub x1, x3, #128');
+  Line('.afl_loop:');
+  Line('  cmp x0, x1');
+  Line('  b.hi .afl_tail');
+  Line('  stp q31, q31, [x0]');
+  Line('  stp q31, q31, [x0, #32]');
+  Line('  stp q31, q31, [x0, #64]');
+  Line('  stp q31, q31, [x0, #96]');
+  Line('  add x0, x0, #128');
+  Line('  b .afl_loop');
+  Line('.afl_tail:');
+  Line('  stp q31, q31, [x1]');
+  Line('  stp q31, q31, [x1, #32]');
+  Line('  stp q31, q31, [x1, #64]');
+  Line('  stp q31, q31, [x1, #96]');
+  Line('  ret');
   { rt_fillbig (P271): FillChar and a zero value past 256 KiB, x0 the
-    bytes, x1 how many, w2 the byte, a piece of 256 KiB at a time with
-    rt_yieldpoint between two; x0 and x1 used up, every other register
-    kept. }
+    bytes, x1 how many, w2 the byte, a piece of 256 KiB at a time through
+    rt_fill (P272) with rt_yieldpoint between two; x0, x1 and v31 used
+    up, every other register kept. }
   Line('rt_fillbig:');
-  Line('  stp x3, x30, [sp, #-16]!');
+  Line('  stp x3, x30, [sp, #-32]!');
+  Line('  stp x4, x5, [sp, #16]');
   Line('.afb_l:');
   Line('  cmp x1, #64, lsl #12');
   Line('  b.ls .afb_last');
-  Line('  movz x3, #4, lsl #16');
-  Line('  sub x1, x1, x3');
-  Line('.afb_p:');
-  Line('  strb w2, [x0], #1');
-  Line('  subs x3, x3, #1');
-  Line('  b.ne .afb_p');
+  Line('  mov x4, x0');
+  Line('  mov x5, x1');
+  Line('  movz x1, #4, lsl #16');
+  Line('  bl rt_fill');
+  Line('  add x0, x4, #64, lsl #12');
+  Line('  sub x1, x5, #64, lsl #12');
   YieldCheckArm('.afb_l', 'x3');
   Line('  b .afb_l');
   Line('.afb_last:');
   Line('  cbz x1, .afb_done');
-  Line('.afb_q:');
-  Line('  strb w2, [x0], #1');
-  Line('  subs x1, x1, #1');
-  Line('  b.ne .afb_q');
+  Line('  bl rt_fill');
   Line('.afb_done:');
-  Line('  ldp x3, x30, [sp], #16');
+  Line('  ldp x4, x5, [sp, #16]');
+  Line('  ldp x3, x30, [sp], #32');
   Line('  ret');
   { rt_zerobig (P271): a frame of compiled code past 256 KiB made zero
     in its prologue, x16 the first word and x17 how many, as the loop it

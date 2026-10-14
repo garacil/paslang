@@ -2908,7 +2908,8 @@ any view: `q := PByte(GetMem(64, 0))`. `FreeMem(p)` does nothing, the
 collector gives back what nothing reaches. `Move(a, b, n)` copies `n` bytes
 between two variables; to copy through pointers write `Move(p^, q^, n)`.
 `FillChar(x, n, v)` writes the byte (or `Char`) `v` `n` times from `x`
-on. `CompareByte(a, b, n)` is the difference of the first bytes of `a`
+on, by `rep stosb` on amd64 and 32 bytes a store on arm64 (1.1.122,
+P272). `CompareByte(a, b, n)` is the difference of the first bytes of `a`
 and `b` that differ, 0 when their `n` bytes are equal, and `IndexByte(x,
 n, v)` the place from 0 of the byte `v` among the first `n` of `x`, -1
 when it is not there: Free Pascal's System words, on the processor's
