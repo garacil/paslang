@@ -3019,6 +3019,17 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	PASLANG_GC=20000 taskset -c 0 timeout 600 $(QEMU_A64) $(BUILDDIR)/rtslice-armb > $(BUILDDIR)/rtslice-armb.got; \
 	diff -u testdata/rtslice.out $(BUILDDIR)/rtslice-armb.got; \
 	echo ok rtslice-arm; \
+	echo "==== DC ZVA on a processor -cpu names (P273) ===="; \
+	$(OUTDIR)/paslangc -target arm64 -cpu neoverse-n1 -o $(BUILDDIR)/fillkern-n1 testdata/fillkern.paslang; \
+	grep -q 'dc zva' $(BUILDDIR)/fillkern-n1.s || { echo "fillkern-n1.s has no dc zva"; exit 1; }; \
+	if grep -q 'dc zva' $(BUILDDIR)/fillkern-arm.s; then echo "fillkern-arm.s, compiled for max, has dc zva"; exit 1; fi; \
+	timeout 300 $(QEMU_A64) -cpu neoverse-n1 $(BUILDDIR)/fillkern-n1 > $(BUILDDIR)/fillkern-n1.got; \
+	diff -u testdata/fillkern.out $(BUILDDIR)/fillkern-n1.got; \
+	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=3 PASLANG_GCPOISON=1 timeout 600 $(QEMU_A64) -cpu neoverse-v1 $(BUILDDIR)/fillkern-n1 > $(BUILDDIR)/fillkern-n1.got; \
+	diff -u testdata/fillkern.out $(BUILDDIR)/fillkern-n1.got; \
+	if timeout 60 $(QEMU_A64) -cpu a64fx $(BUILDDIR)/fillkern-n1 > $(BUILDDIR)/fillkern-a64fx.got 2>&1; then echo "fillkern-n1 ran on a64fx"; exit 1; fi; \
+	grep -qx 'paslang: compiled for neoverse-n1, whose DC ZVA zeroes 64 bytes; this processor reads DCZID_EL0 6' $(BUILDDIR)/fillkern-a64fx.got || { cat $(BUILDDIR)/fillkern-a64fx.got; exit 1; }; \
+	echo ok zva-arm; \
 	echo "==== alloc bits arm64 ===="; \
 	$(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/allocbits-arm testdata/allocbits.paslang; \
 	for w in "" PASLANG_GCPOISON=1 "PASLANG_GCSTRESS=50 PASLANG_GCPOISON=1" "PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=50 PASLANG_GCPOISON=1" PASLANG_GC=off; do \
