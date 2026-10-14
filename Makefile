@@ -258,6 +258,10 @@ GOLDEN_A64 += jsonlang
 # through the encoder the compiler writes for it, every directive.
 GOLDEN += jsonbind1 jsonbind2 jsonbind3
 GOLDEN_A64 += jsonbind1 jsonbind2 jsonbind3
+# P282: a loop reads and writes the fields of a var or const parameter
+# through a register that keeps its address, on a stack that grows.
+GOLDEN += varparts
+GOLDEN_A64 += varparts
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -2133,6 +2137,15 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'cmpq $$48, ' $(BUILDDIR)/condjump-digit.s && grep -q '^  jl ' $(BUILDDIR)/condjump-digit.s && grep -q '^  jg ' $(BUILDDIR)/condjump-digit.s || { echo "condjump.s: Digit's condition is not two compares and two jumps"; exit 1; }; \
 	if grep -q '^  set' $(BUILDDIR)/condjump-digit.s; then echo "condjump.s: Digit's condition makes a Boolean"; exit 1; fi; \
 	echo ok condjump; \
+	: the address of a var or const parameter in a register a run, P282: the sums under the stress of the collector, and every field read and written from that register, none from a pool register loaded from the slot; \
+	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=3 PASLANG_GCPOISON=1 $(BUILDDIR)/varparts > $(BUILDDIR)/varparts-gc.got; \
+	diff -u testdata/varparts.out $(BUILDDIR)/varparts-gc.got; \
+	for f in sum sumwhile sumconst bump; do \
+	  awk "/^p_$$f:/,/ret\$$/" $(BUILDDIR)/varparts.s > $(BUILDDIR)/varparts-$$f.s; \
+	  grep -qE '[0-9]\(%r(bx|9|1[0-5])\)' $(BUILDDIR)/varparts-$$f.s || { echo "varparts.s: $$f reads no field from a kept register"; exit 1; }; \
+	  if grep -qE '[0-9]\(%r(si|di)\)' $(BUILDDIR)/varparts-$$f.s; then echo "varparts.s: $$f reads a field through a pool register"; exit 1; fi; \
+	done; \
+	echo ok varparts; \
 	: a function of one expression goes in as its expression, P266: the output of every routine a call, and Branchy one compare and one jump with no call of Less; \
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/exprinline0 testdata/exprinline.paslang; \
 	$(BUILDDIR)/exprinline0 > $(BUILDDIR)/exprinline0.got; \
@@ -3106,6 +3119,12 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	awk '/^p_digit:/,/ret$$/' $(BUILDDIR)/condjump-arm.s > $(BUILDDIR)/condjump-digit-arm.s; \
 	grep -q 'cmp x0, #48' $(BUILDDIR)/condjump-digit-arm.s && grep -q 'b.lt ' $(BUILDDIR)/condjump-digit-arm.s && grep -q 'b.gt ' $(BUILDDIR)/condjump-digit-arm.s || { echo "condjump-arm.s: Digit's condition is not two compares and two branches"; exit 1; }; \
 	if grep -q 'cset' $(BUILDDIR)/condjump-digit-arm.s; then echo "condjump-arm.s: Digit's condition makes a Boolean"; exit 1; fi; \
+	for f in sum sumwhile sumconst bump; do \
+	  awk "/^p_$$f:/,/ret\$$/" $(BUILDDIR)/varparts-arm.s > $(BUILDDIR)/varparts-$$f-arm.s; \
+	  grep -qE '\[x(19|2[0-8])(, #[0-9]+)?\]' $(BUILDDIR)/varparts-$$f-arm.s || { echo "varparts-arm.s: $$f reads no field from a kept register"; exit 1; }; \
+	  if grep -qE '\[x(9|1[0-7])(, #[0-9]+)?\]' $(BUILDDIR)/varparts-$$f-arm.s; then echo "varparts-arm.s: $$f reads a field through a pool register"; exit 1; fi; \
+	done; \
+	echo ok varparts-arm-asm; \
 	$(OUTDIR)/paslangc -target arm64 -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/exprinline0-arm testdata/exprinline.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/exprinline0-arm > $(BUILDDIR)/exprinline0-arm.got; \
 	diff -u testdata/exprinline.out $(BUILDDIR)/exprinline0-arm.got; \

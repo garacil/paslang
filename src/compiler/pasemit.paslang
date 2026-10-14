@@ -647,6 +647,7 @@ type
     function DirectStore(Dest: PExpr): Boolean;
     procedure EmitCall(const Name: string; const Args: TExprArray);
     function DirectArg(E: PExpr; const R: string; Put: Boolean): Boolean;
+    function ByRefReg(B: PExpr): string;
     function MethArgs(Obj: PExpr; SelfCls: Byte; const Args: TExprArray): LongInt;
     function WordInt(T: LongInt): Boolean;
     function CallFree(E: PExpr; Depth: LongInt): Boolean;
@@ -21534,7 +21535,15 @@ var
 begin
   if not TryFindSym(N, s) then
     Exit;
-  if s.ByRef or (s.Up <> 0) then
+  { a var parameter's address (Part 4, P282): its slot does not change
+    in a region, so a register keeps it, and a field of it is read
+    through that register, where every read loaded the slot first }
+  if Part = 4 then
+  begin
+    if (not s.ByRef) or (s.Up <> 0) or s.Global or s.Boxed then
+      Exit;
+  end
+  else if s.ByRef or (s.Up <> 0) then
     Exit;
   { arm64 forms a static array's address in two or three instructions
     (adrp and add, or the frame offset and an add); a loop keeps it. }
@@ -21543,6 +21552,7 @@ begin
     if (not FArm) or IsDyn(s.Typ) or IsStr(s.Typ) or (TKind(s.Typ) <> tykArray) then
       Exit;
   end
+  else if Part = 4 then
   else if (not IsDyn(s.Typ)) or AddrKept(s.Name) then
     Exit;
   if s.Global and (FIsUnit or ExtGlobal(s.Name)) then
@@ -21580,6 +21590,15 @@ begin
       Line('  ldrb w' + Copy(Reg, 2, 8) + ', [x28, #256]')
     else
       Line('  movzbl 256(%r14), %' + X86Sub(Reg, 4));
+    Exit;
+  end;
+  if Part = 4 then
+  begin
+    { a var parameter's address, from its slot }
+    if FArm then
+      LdFP(Reg, S.Off)
+    else
+      Line('  movq ' + IntToStr(S.Off) + '(%rbp), %' + Reg);
     Exit;
   end;
   if Part = 3 then
@@ -21653,6 +21672,11 @@ begin
     PromoAddPart(E^.L^.Name, 2, Weight);
     PromoAddPart(E^.L^.Name, 3, Weight);
   end;
+  { a class's field is read through the object, not the variable's
+    address }
+  if (E^.Kind = ekField) and (E^.L <> nil) and (E^.L^.Kind = ekVar) and
+    (TKind(E^.L^.Typ) <> tykClass) then
+    PromoAddPart(E^.L^.Name, 4, Weight);
   PromoScanE(E^.L, Weight);
   PromoScanE(E^.R, Weight);
   for i := 0 to High(E^.Args) do
@@ -22426,6 +22450,30 @@ begin
       end;
     ekBin:
       begin
+        { a - k of a register is one lea, a two-operand one, one cycle on
+          Zen 2 (AMD 56305 2.10.2), where mov and sub were two (P282);
+          on arm64 one sub or add with its immediate }
+        if (E^.Bin = boSub) and (TSize(E^.Typ) = 8) and (E^.R^.Kind = ekInt) and
+          (E^.L^.Kind = ekVar) and WordVar(E^.L, s) and (s.Reg <> '') and (TSize(s.Typ) = 8) then
+        begin
+          if (not FArm) and Fits32(-E^.R^.Num) then
+          begin
+            Line('  leaq ' + IntToStr(-E^.R^.Num) + '(%' + s.Reg + '), %' + r);
+            Exit;
+          end;
+          if FArm and (E^.R^.Num >= 0) and (E^.R^.Num <= 4095) then
+          begin
+            Line('  sub ' + r + ', ' + s.Reg + ', #' + IntToStr(E^.R^.Num));
+            Exit;
+          end;
+        end;
+        if FArm and (E^.Bin = boAdd) and (TSize(E^.Typ) = 8) and (E^.R^.Kind = ekInt) and
+          (E^.R^.Num >= 0) and (E^.R^.Num <= 4095) and (E^.L^.Kind = ekVar) and
+          WordVar(E^.L, s) and (s.Reg <> '') and (TSize(s.Typ) = 8) then
+        begin
+          Line('  add ' + r + ', ' + s.Reg + ', #' + IntToStr(E^.R^.Num));
+          Exit;
+        end;
         { a + b of two registers, or a + k, is one lea (1.1.1) }
         if (not FArm) and (E^.Bin = boAdd) and (TSize(E^.Typ) = 8) and
           (E^.L^.Kind = ekVar) and WordVar(E^.L, s) and (s.Reg <> '') and (TSize(s.Typ) = 8) then
@@ -23130,17 +23178,41 @@ begin
     StoreFrom(MemA(S), TSize(S.Typ), R);
 end;
 
+{ The register a region keeps var parameter B's address in (Part 4,
+  P282), or ''. }
+function TEmitter.ByRefReg(B: PExpr): string;
+var
+  s: TSym;
+begin
+  Result := '';
+  if (B = nil) or (B^.Kind <> ekVar) or not FPromoOn then
+    Exit;
+  if not TryFindSym(B^.Name, s) then
+    Exit;
+  if s.ByRef and (s.Up = 0) and not s.Global then
+    Result := PartReg(s, 4);
+end;
+
 { The address of the record or array B into pool register D. }
 procedure TEmitter.EmitWordBase(B: PExpr; D: LongInt);
 var
   s: TSym;
-  r, m: string;
+  r, m, kr: string;
 begin
   r := OrdPool(D);
   if B^.Kind = ekVar then
   begin
     if not TryFindSym(B^.Name, s) then
       Die('internal error: base ' + B^.Name);
+    kr := ByRefReg(B);
+    if kr <> '' then
+    begin
+      if FArm then
+        Line('  mov ' + r + ', ' + kr)
+      else
+        Line('  movq %' + kr + ', %' + r);
+      Exit;
+    end;
     if FArm then
     begin
       if s.ByRef then
@@ -23444,6 +23516,33 @@ begin
       EmitOrdTo(E^.L, D);
     ekField:
       begin
+        { a field of a var parameter whose address a register keeps:
+          that register is the base (P282) }
+        if (TKind(E^.L^.Typ) <> tykClass) and (ByRefReg(E^.L) <> '') then
+        begin
+          if not FArm then
+          begin
+            Result := IntToStr(E^.Off) + '(%' + ByRefReg(E^.L) + ')';
+            Exit;
+          end;
+          { arm64: the field at its natural place is the load's offset
+            from that register, scaled by the size (ARM DDI 0487 M.c
+            C6.2.216, LDR immediate, the unsigned offset) }
+          asz := TSize(LoadTyp(E));
+          if E^.Off = 0 then
+          begin
+            WmSet(ByRefReg(E^.L), '', 0, 0);
+            Result := '[' + ByRefReg(E^.L) + ']';
+            Exit;
+          end;
+          if (E^.Off > 0) and ((asz = 1) or (asz = 2) or (asz = 4) or (asz = 8)) and
+            (E^.Off mod asz = 0) and (E^.Off div asz <= 4095) then
+          begin
+            WmSet(ByRefReg(E^.L), '', 0, E^.Off);
+            Result := '[' + ByRefReg(E^.L) + ', #' + IntToStr(E^.Off) + ']';
+            Exit;
+          end;
+        end;
         if TKind(E^.L^.Typ) = tykClass then
           EmitOrdTo(E^.L, D)
         else
