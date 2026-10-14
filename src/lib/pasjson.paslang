@@ -242,19 +242,26 @@ type
     Key: Integer;
   end;
   TJsonOutPairs = array of TJsonOutPair;
-  { A typed decode's state (P206): what its options ask and where its
-    document came from, for an error's place. One routine owns it
-    while it decodes. }
+  { A typed decode's cursor (P206, P280): what its options ask, and the
+    text it reads a token at a time, with no document, or the nodes of
+    the json it reads. One routine owns it while it decodes. }
   TJsonIn = record
     Merge: Boolean;     { into what is there, as Go's v2 unmarshals }
     Reject: Boolean;    { a member no field takes is an error }
-    Text: string;       { the text the document was parsed from, '' for a json }
-    Root: Pointer;      { the root node of that text's document }
+    Text: string;       { the text read, '' for a json }
+    Opts: TJsonOptions; { what the text is read with }
+    S: Pointer;         { the text's reader, nil for a json }
+    Cur, Last, Name, Root: Pointer;  { a json: the next node, the last read, the last name, the first }
+    Ends: array of Pointer;          { a json: where each open container ends }
+    NE: Integer;
+    Count: Integer;     { the length of the array just opened, -1 when not known }
+    FakeW0, FakeW1: Int64;  { a container read whole, as a node of its kind }
   end;
-  { the members a record's json unknown keeps: the nodes of their names }
+  { the members a record's json unknown keeps: their names and the text
+    of their values }
   TJsonKeep = record
     N: Integer;
-    Names: array of Pointer;
+    Names, Vals: array of string;
   end;
 {$endif}
 
@@ -348,53 +355,52 @@ procedure PasJsonOutMembers(var W: TJsonOut; J: json);
 procedure PasJsonOutSortPairs(var A: TJsonOutPairs);
 function PasJsonOutIntName(V: Integer): string;
 
-{ The words of the decoders the compiler writes (P206). J is a node of
-  a document, nil for a json that is null; each word takes a JSON null
-  as its type's zero and raises EJsonError, with the JSON Pointer of J
-  and, when the document was parsed from text, the line, the column and
-  the byte J's text starts at, when J is no value of the type T names:
-  jeType for a kind or a form the type does not take, jeRange past its
-  range, jeMissing and jeUnknown for a member, jeDuplicate for a member
-  of a set given twice. }
-function PasJsonInText(var R: TJsonIn; const S: string; const Opts: TJsonOptions): Pointer;
-function PasJsonInDoc(var R: TJsonIn; J: json; const Opts: TJsonOptions): Pointer;
-function PasJsonInNull(J: Pointer): Boolean;
-function PasJsonInObj(var R: TJsonIn; J: Pointer; const T: string): Integer;
-function PasJsonInArr(var R: TJsonIn; J: Pointer; const T: string): Integer;
-procedure PasJsonInLen(var R: TJsonIn; J: Pointer; N: Integer; const T: string);
-function PasJsonInFirst(J: Pointer): Pointer;
-function PasJsonInNext(J: Pointer): Pointer;
-function PasJsonInVal(Name: Pointer): Pointer;
-function PasJsonInNextMember(Name: Pointer): Pointer;
-function PasJsonInMatch(Name: Pointer; Names: Pointer; N: Integer; var K: Integer): Integer;
-procedure PasJsonInUnknown(var R: TJsonIn; Name: Pointer);
-procedure PasJsonInMissing(var R: TJsonIn; J: Pointer; const Name: string);
-procedure PasJsonInKeep(var K: TJsonKeep; Name: Pointer);
-function PasJsonInKept(var R: TJsonIn; J: Pointer; const K: TJsonKeep; Old: json): json;
-procedure PasJsonInBad(var R: TJsonIn; J: Pointer; const T: string);
-procedure PasJsonInTwice(var R: TJsonIn; J: Pointer; const T: string);
-function PasJsonInInt(var R: TJsonIn; J: Pointer; Lo, Hi: Integer; const T: string): Integer;
-function PasJsonInIntQ(var R: TJsonIn; J: Pointer; Lo, Hi: Integer; const T: string): Integer;
-function PasJsonInBool(var R: TJsonIn; J: Pointer): Boolean;
-function PasJsonInChar(var R: TJsonIn; J: Pointer; Lo, Hi: Integer; const T: string): Char;
-function PasJsonInEnum(var R: TJsonIn; J: Pointer; Names: Pointer; N, Lo, Hi: Integer;
-  const T: string): Integer;
-function PasJsonInF64(var R: TJsonIn; J: Pointer; Quoted: Boolean; const T: string): Double;
-function PasJsonInF32(var R: TJsonIn; J: Pointer; Quoted: Boolean; const T: string): Single;
-function PasJsonInQuad(var R: TJsonIn; J: Pointer; Quoted: Boolean; const T: string): Quad;
-function PasJsonInCur(var R: TJsonIn; J: Pointer; Quoted: Boolean; const T: string): Currency;
-function PasJsonInTime(var R: TJsonIn; J: Pointer; const T: string): Double;
-function PasJsonInStr(var R: TJsonIn; J: Pointer; const T: string): string;
-function PasJsonInJson(var R: TJsonIn; J: Pointer): json;
-function PasJsonInB64Len(var R: TJsonIn; J: Pointer; const T: string): Integer;
-procedure PasJsonInB64To(J: Pointer; P: Pointer);
-procedure PasJsonInB64Fixed(var R: TJsonIn; J: Pointer; P: Pointer; N: Integer; const T: string);
-function PasJsonInName(Name: Pointer): string;
-function PasJsonInNameInt(var R: TJsonIn; Name: Pointer; Lo, Hi: Integer; const T: string): Integer;
-function PasJsonInNameChar(var R: TJsonIn; Name: Pointer; Lo, Hi: Integer; const T: string): Char;
-function PasJsonInNameEnum(var R: TJsonIn; Name: Pointer; Names: Pointer; N, Lo, Hi: Integer;
-  const T: string): Integer;
-function PasJsonInNameBool(var R: TJsonIn; Name: Pointer; const T: string): Boolean;
+{ The words of the decoders the compiler writes (P206, P280): each
+  reads the next value of the cursor, or the name just read, into the
+  type T names, a JSON null as its zero, or raises EJsonError with the
+  JSON Pointer of the value and, from text, the line, the column and the
+  byte it starts at: jeType for a kind or a form the type does not take,
+  jeRange past its range, jeMissing and jeUnknown for a member,
+  jeDuplicate for a member of a set given twice, and a parse's errors
+  for the text, the first in its order. }
+procedure PasJsonInText(var R: TJsonIn; const S: string; const Opts: TJsonOptions);
+procedure PasJsonInDoc(var R: TJsonIn; J: json; const Opts: TJsonOptions);
+procedure PasJsonInRewind(var R: TJsonIn);
+procedure PasJsonInEnd(var R: TJsonIn);
+function PasJsonInNull(var R: TJsonIn): Boolean;
+function PasJsonInObj(var R: TJsonIn; const T: string): Int64;
+function PasJsonInArr(var R: TJsonIn; const T: string): Int64;
+function PasJsonInName(var R: TJsonIn): Boolean;
+function PasJsonInItem(var R: TJsonIn): Boolean;
+procedure PasJsonInSkip(var R: TJsonIn);
+function PasJsonInMatch(var R: TJsonIn; Names, Keys: Pointer; N: Integer; var K: Integer): Integer;
+procedure PasJsonInUnknown(var R: TJsonIn);
+procedure PasJsonInMissing(var R: TJsonIn; Mark: Int64; const Name: string);
+procedure PasJsonInLenEnd(var R: TJsonIn; Mark: Int64; Got, Want: Integer; const T: string);
+procedure PasJsonInBad(var R: TJsonIn; const T: string);
+procedure PasJsonInTwice(var R: TJsonIn; const T: string);
+procedure PasJsonInKeep(var R: TJsonIn; var K: TJsonKeep);
+function PasJsonInKept(var R: TJsonIn; Mark: Int64; const K: TJsonKeep; Old: json): json;
+function PasJsonInJson(var R: TJsonIn): json;
+function PasJsonInInt(var R: TJsonIn; Lo, Hi: Integer; const T: string): Integer;
+function PasJsonInIntQ(var R: TJsonIn; Lo, Hi: Integer; const T: string): Integer;
+function PasJsonInBool(var R: TJsonIn): Boolean;
+function PasJsonInChar(var R: TJsonIn; Lo, Hi: Integer; const T: string): Char;
+function PasJsonInEnum(var R: TJsonIn; Names: Pointer; N, Lo, Hi: Integer; const T: string): Integer;
+function PasJsonInF64(var R: TJsonIn; Quoted: Boolean; const T: string): Double;
+function PasJsonInF32(var R: TJsonIn; Quoted: Boolean; const T: string): Single;
+function PasJsonInQuad(var R: TJsonIn; Quoted: Boolean; const T: string): Quad;
+function PasJsonInCur(var R: TJsonIn; Quoted: Boolean; const T: string): Currency;
+function PasJsonInTime(var R: TJsonIn; const T: string): Double;
+function PasJsonInStr(var R: TJsonIn; const T: string): string;
+function PasJsonInB64Len(var R: TJsonIn; const T: string): Integer;
+procedure PasJsonInB64To(var R: TJsonIn; P: Pointer);
+procedure PasJsonInB64Fixed(var R: TJsonIn; P: Pointer; N: Integer; const T: string);
+function PasJsonInKeyStr(var R: TJsonIn): string;
+function PasJsonInKeyInt(var R: TJsonIn; Lo, Hi: Integer; const T: string): Integer;
+function PasJsonInKeyChar(var R: TJsonIn; Lo, Hi: Integer; const T: string): Char;
+function PasJsonInKeyEnum(var R: TJsonIn; Names: Pointer; N, Lo, Hi: Integer; const T: string): Integer;
+function PasJsonInKeyBool(var R: TJsonIn; const T: string): Boolean;
 {$endif}
 
 implementation
@@ -1873,6 +1879,7 @@ type
     Flat: Boolean;
     NSet: Int64;      { past JsonLinear members: the names in Names }
     Names: array of Int64;
+    Mark: Int64;      { stream: where its names begin in the arena (P280) }
   end;
 
   TJErr = record
@@ -1904,7 +1911,16 @@ type
     Cur: Int64;        { its next byte }
     Failed: Boolean;
     Err: TJErr;
+    Stream: Boolean;   { read a token at a time for a decode, no document (P280) }
+    NTop: Int64;       { stream: the end of the open objects' names in the arena }
+    ValAt: Int64;      { stream: where the last value read starts }
+    NameAt: Int64;     { stream: where the last name read starts }
+    Top: PJFrame;      { stream: the innermost open container's frame }
+    IdxP: PUInt32;     { stream: the index's first entry }
+    Idx2: array of UInt32;  { stream: the window StCount reads ahead with }
+    Ahead: Int64;      { stream: the bytes StCount may still read ahead }
   end;
+  PJParse = ^TJParse;
 
 var
   JSeedKey: Integer;     { the process's secret key for the name sets: 0 until the first }
@@ -2524,8 +2540,13 @@ begin
         ((P.State = SValue) and (P.St[i].Name >= 0));
       if not named then
         Exit;
-      f := NodeAt(P, P.St[i].Name);
-      Result := Result + '/' + PtrToken(StrBytes(f), StrLen(f));
+      if P.Stream then
+        Result := Result + '/' + PtrToken(@P.D[P.St[i].Name + 9], PInt64(@P.D[P.St[i].Name])^)
+      else
+      begin
+        f := NodeAt(P, P.St[i].Name);
+        Result := Result + '/' + PtrToken(StrBytes(f), StrLen(f));
+      end;
     end
     else
     begin
@@ -2650,6 +2671,21 @@ begin
   if P.Depth > 0 then
     if (W0 and 7) >= JtArr then
       P.St[P.Depth - 1].Flat := False;
+end;
+
+{ Stream mode (P280): room in the scratch block up to K bytes, which a
+  parse's block always has, reserved at its size. }
+procedure SRoom(var P: TJParse; K: Int64);
+var
+  n: Int64;
+begin
+  if K + 16 <= Length(P.Doc) then
+    Exit;
+  n := Length(P.Doc) * 2;
+  if n < K + 4096 then
+    n := K + 4096;
+  SetLength(P.Doc, n);
+  P.D := @P.Doc[0];
 end;
 
 { ---- strings ---- }
@@ -2870,6 +2906,8 @@ begin
       SetErr(P, BadKind(P), P.Bad, WhereNext, BadReason(P));
       Exit;
     end;
+    if P.Stream then
+      SRoom(P, a + (e - src) + 16);
     if e > src then
     begin
       Move(P.T[src], P.D[a], e - src);
@@ -3127,6 +3165,8 @@ function NumNode(var P: TJParse; S: Int64; var Sc: TPasNumScan): Boolean;
 var
   v, sub, a, node: Int64;
 begin
+  if P.Stream then
+    SRoom(P, P.Arena + 9 + Sc.Len);
   if sc.IntLit and PasNumI64(@P.T[S], sc, v) then
     sub := JnInt or JnIntLit
   else if sc.IntLit and PasNumU64(@P.T[S], sc, v) then
@@ -5978,6 +6018,18 @@ begin
   Move(w, Result, 16);
 end;
 
+{ The N bytes at P as a string of its own: a decode reads a string with
+  no escape in place, in the text, where no view can be made (P280). }
+function BytesStr(P: PByte; N: Int64): string;
+begin
+  Result := '';
+  if N > 0 then
+  begin
+    SetLength(Result, N);
+    Move(P^, PByte(Pointer(Result))^, N);
+  end;
+end;
+
 { The Currency the number at P is exactly, four places: 0, or 1 when it
   has a fifth place that is not 0, 2 past Currency's range; never
   rounded. }
@@ -6010,7 +6062,7 @@ begin
     end;
   end;
   Result := 0;
-  if not PasTryParseCurrency(PasStrView(P, N), V) then
+  if not PasTryParseCurrency(BytesStr(P, N), V) then
     Result := 2;
 end;
 
@@ -6902,289 +6954,6 @@ begin
   Result := IntText(V);
 end;
 
-{ ---- typed decoding (P206) ----
-
-  JsonDecode(S, X) parses S and decodes its root into X, JsonDecode(J,
-  X) a json, through the decoder the compiler writes for X's type
-  (Pascal it reads at the end of the unit, as P205's encoders) over the
-  words below: each reads a node of the document and gives its value in
-  the type asked for, or raises EJsonError. Go's encoding/json/v2 is
-  the reference (arshal_default.go): null is the zero, an integer comes
-  only from an integer literal in its type's range (jsonwire.ParseUint),
-  a real is rounded once, a string is copied, bytes are base64 (RFC 4648
-  4, padding required), a name matches exactly. }
-
-{ The place in S of the K-th node of its document, from 0: the nodes
-  are the values and the member names in the order of the text, so a
-  walk of its tokens counts them; only for an error, the text already
-  valid. }
-function NodeTextOffset(const S: string; K: Int64): Int64;
-var
-  i, n, cnt: Int64;
-  b: Integer;
-begin
-  n := Length(S);
-  cnt := -1;
-  i := 0;
-  while i < n do
-  begin
-    b := Ord(S[i + 1]);
-    if (b = 32) or (b = 9) or (b = 10) or (b = 13) or (b = 44) or (b = 58) or (b = 93) or
-      (b = 125) then
-    begin
-      i := i + 1;
-      Continue;
-    end;
-    cnt := cnt + 1;
-    if cnt = K then
-    begin
-      Result := i;
-      Exit;
-    end;
-    if b = 34 then
-    begin
-      i := i + 1;
-      while (i < n) and (S[i + 1] <> '"') do
-      begin
-        if S[i + 1] = '\' then
-          i := i + 1;
-        i := i + 1;
-      end;
-      i := i + 1;
-    end
-    else if (b = 91) or (b = 123) then
-      i := i + 1
-    else
-      while (i < n) and not Delim(Ord(S[i + 1])) do
-        i := i + 1;
-  end;
-  Result := n;
-end;
-
-{ Raises the error of a decode: its place is At's text, when the
-  document came from text. }
-procedure InRaise(var R: TJsonIn; At: PJNode; Kind: TJsonErrorKind; const Path, Where,
-  Reason: string);
-var
-  off, line, col, i: Int64;
-begin
-  off := -1;
-  line := 0;
-  col := 0;
-  if (R.Text <> '') and (At <> nil) and (R.Root <> nil) then
-  begin
-    off := NodeTextOffset(R.Text, (Integer(At) - Integer(R.Root)) div 16);
-    line := 1;
-    col := 1;
-    for i := 1 to off do
-      if R.Text[i] = #10 then
-      begin
-        line := line + 1;
-        col := 1;
-      end
-      else
-        col := col + 1;
-  end;
-  raise EJsonError.Create(Kind, off, line, col, Path, Where, Reason);
-end;
-
-procedure InFail(var R: TJsonIn; J: PJNode; Kind: TJsonErrorKind; const Reason: string);
-var
-  p: string;
-begin
-  p := NodePath(J);
-  InRaise(R, J, Kind, p, p, Reason);
-end;
-
-{ J as a decode's error names it: a short number or string as it is,
-  else its kind. }
-function InWhat(J: PJNode): string;
-begin
-  if J = nil then
-    Result := 'null'
-  else
-    case J^.W0 and 7 of
-      JtNull: Result := 'null';
-      JtFalse: Result := 'false';
-      JtTrue: Result := 'true';
-      JtNum:
-        if PInt64(NumText(J))^ < 100 then
-          Result := NumView(J)
-        else
-          Result := 'a number';
-      JtStr:
-        if StrLen(J) < 100 then
-          Result := GoQuoteStr(PasStrView(StrBytes(J), StrLen(J)))
-        else
-          Result := 'a string';
-      JtArr: Result := 'an array';
-    else
-      Result := 'an object';
-    end;
-end;
-
-procedure InWhy(var R: TJsonIn; J: PJNode; Kind: TJsonErrorKind; const T, Why: string);
-begin
-  InFail(R, J, Kind, 'cannot decode ' + InWhat(J) + ' into ' + T + ': ' + Why);
-end;
-
-procedure PasJsonInBad(var R: TJsonIn; J: Pointer; const T: string);
-begin
-  InFail(R, PJNode(J), jeType, 'cannot decode ' + InWhat(PJNode(J)) + ' into ' + T);
-end;
-
-procedure PasJsonInTwice(var R: TJsonIn; J: Pointer; const T: string);
-begin
-  InWhy(R, PJNode(J), jeDuplicate, T, 'twice in the set');
-end;
-
-function PasJsonInText(var R: TJsonIn; const S: string; const Opts: TJsonOptions): Pointer;
-var
-  e: TJErr;
-  r0: PJNode;
-begin
-  r0 := ParseText(S, Opts, False, e);
-  if r0 = nil then
-    raise ParseError(S, e);
-  R.Merge := Opts.Merge;
-  R.Reject := Opts.RejectUnknown;
-  R.Text := S;
-  R.Root := r0;
-  Result := r0;
-end;
-
-function PasJsonInDoc(var R: TJsonIn; J: json; const Opts: TJsonOptions): Pointer;
-begin
-  R.Merge := Opts.Merge;
-  R.Reject := Opts.RejectUnknown;
-  R.Text := '';
-  R.Root := nil;
-  Result := NodeOfJ(J);
-end;
-
-function PasJsonInNull(J: Pointer): Boolean;
-begin
-  Result := (J = nil) or ((PJNode(J)^.W0 and 7) = JtNull);
-end;
-
-function PasJsonInObj(var R: TJsonIn; J: Pointer; const T: string): Integer;
-begin
-  if (J = nil) or ((PJNode(J)^.W0 and 7) <> JtObj) then
-    PasJsonInBad(R, J, T);
-  Result := PJNode(J)^.W0 shr 8;
-end;
-
-function PasJsonInArr(var R: TJsonIn; J: Pointer; const T: string): Integer;
-begin
-  if (J = nil) or ((PJNode(J)^.W0 and 7) <> JtArr) then
-    PasJsonInBad(R, J, T);
-  Result := PJNode(J)^.W0 shr 8;
-end;
-
-{ A static array's length: the JSON array's must be the same, as Go's
-  v2 asks of a Go array. }
-procedure PasJsonInLen(var R: TJsonIn; J: Pointer; N: Integer; const T: string);
-var
-  k: Integer;
-begin
-  k := PJNode(J)^.W0 shr 8;
-  if k <> N then
-    InFail(R, PJNode(J), jeType, 'cannot decode an array of ' + IntText(k) + ' into ' + T +
-      ', which has ' + IntText(N));
-end;
-
-function PasJsonInFirst(J: Pointer): Pointer;
-begin
-  Result := Pointer(Integer(J) + 16);
-end;
-
-function PasJsonInNext(J: Pointer): Pointer;
-begin
-  Result := NodeAdd(PJNode(J), NodeSpan(PJNode(J)));
-end;
-
-function PasJsonInVal(Name: Pointer): Pointer;
-begin
-  Result := Pointer(Integer(Name) + 16);
-end;
-
-function PasJsonInNextMember(Name: Pointer): Pointer;
-var
-  v: PJNode;
-begin
-  v := NodeAdd(PJNode(Name), 1);
-  Result := NodeAdd(v, NodeSpan(v));
-end;
-
-{ The member a name is, by the table of the type's names (N of them):
-  the one after the member before first, as the text usually keeps the
-  order of the fields, then each by its length and bytes; -1 for none.
-  K, the next expected, follows the one found. }
-function PasJsonInMatch(Name: Pointer; Names: Pointer; N: Integer; var K: Integer): Integer;
-var
-  nd: PJNode;
-  l, i: Int64;
-  p: PByte;
-  ps: ^string;
-begin
-  nd := PJNode(Name);
-  l := StrLen(nd);
-  p := StrBytes(nd);
-  ps := Names;
-  if (K < N) and (Length(ps[K]) = l) and
-    ((l = 0) or (CompareByte(PByte(Pointer(ps[K]))^, p^, l) = 0)) then
-  begin
-    Result := K;
-    K := K + 1;
-    Exit;
-  end;
-  for i := 0 to N - 1 do
-    if (Length(ps[i]) = l) and ((l = 0) or (CompareByte(PByte(Pointer(ps[i]))^, p^, l) = 0)) then
-    begin
-      Result := i;
-      K := i + 1;
-      Exit;
-    end;
-  Result := -1;
-end;
-
-{ A member no field takes: an error with RejectUnknown (Go's
-  RejectUnknownMembers), else left. Its pointer names it, within its
-  object. }
-procedure PasJsonInUnknown(var R: TJsonIn; Name: Pointer);
-var
-  p, w: string;
-  i: Int64;
-begin
-  if not R.Reject then
-    Exit;
-  p := NodePath(NodeAdd(PJNode(Name), 1));
-  i := Length(p);
-  while (i > 0) and (p[i] <> '/') do
-    i := i - 1;
-  w := Copy(p, 1, i - 1);
-  InRaise(R, PJNode(Name), jeUnknown, p, w, 'unknown member ' +
-    GoQuoteStr(PasStrView(StrBytes(PJNode(Name)), StrLen(PJNode(Name)))));
-end;
-
-{ A member json required asks for, not there. }
-procedure PasJsonInMissing(var R: TJsonIn; J: Pointer; const Name: string);
-var
-  w: string;
-begin
-  w := NodePath(PJNode(J));
-  InRaise(R, PJNode(J), jeMissing, w + '/' + KeyToken(Name), w, 'missing member ' +
-    GoQuoteStr(Name));
-end;
-
-procedure PasJsonInKeep(var K: TJsonKeep; Name: Pointer);
-begin
-  if K.N = Length(K.Names) then
-    SetLength(K.Names, K.N * 2 + 4);
-  K.Names[K.N] := Name;
-  K.N := K.N + 1;
-end;
-
 { The bytes node N takes in the arena: a string 01h and its
   characters, a number its length, 01h and its text. }
 function ArenaOf(N: PJNode): Int64;
@@ -7282,219 +7051,12 @@ begin
   Result := JsonOfN(PJNode(@d[JsonHead]));
 end;
 
-function PasJsonInJson(var R: TJsonIn; J: Pointer): json;
-begin
-  if PasJsonInNull(J) then
-    Result := nil
-  else
-    Result := JsonCopy(PJNode(J));
-end;
-
-function SameNode(A, B: PJNode): Boolean;
-begin
-  Result := (StrLen(A) = StrLen(B)) and ((StrLen(A) = 0) or
-    (CompareByte(StrBytes(A)^, StrBytes(B)^, StrLen(A)) = 0));
-end;
-
-{ The object of the members a record's json unknown keeps: the ones K
-  names, and with Merge first those of Old (an object, or null) that K
-  does not name again. Nil when there are none. }
-function PasJsonInKept(var R: TJsonIn; J: Pointer; const K: TJsonKeep; Old: json): json;
-var
-  o, c, nm, d0: PJNode;
-  olds: array of PJNode;
-  no, i, q, nodes, arena, cnt, at, a: Int64;
-  flat, again: Boolean;
-  d: PByte;
-begin
-  o := nil;
-  if R.Merge then
-    o := NodeOfJ(Old);
-  if (o <> nil) and ((o^.W0 and 7) = JtNull) then
-    o := nil;
-  if (o <> nil) and ((o^.W0 and 7) <> JtObj) then
-    InFail(R, PJNode(J), jeType, 'json unknown keeps an object of members, not ' + KindName(o));
-  no := 0;
-  olds := nil;
-  if o <> nil then
-  begin
-    SetLength(olds, o^.W0 shr 8);
-    c := NodeAdd(o, 1);
-    for i := 1 to o^.W0 shr 8 do
-    begin
-      again := False;
-      for q := 0 to K.N - 1 do
-        if SameNode(c, PJNode(K.Names[q])) then
-          again := True;
-      if not again then
-      begin
-        olds[no] := c;
-        no := no + 1;
-      end;
-      c := NodeAdd(NodeAdd(c, 1), NodeSpan(NodeAdd(c, 1)));
-    end;
-  end;
-  cnt := no + K.N;
-  if cnt = 0 then
-  begin
-    Result := nil;
-    Exit;
-  end;
-  nodes := 1;
-  arena := 0;
-  flat := True;
-  for i := 0 to cnt - 1 do
-  begin
-    if i < no then
-      nm := olds[i]
-    else
-      nm := PJNode(K.Names[i - no]);
-    c := NodeAdd(nm, 1);
-    if (c^.W0 and 7) >= JtArr then
-      flat := False;
-    nodes := nodes + 1 + NodeSpan(c);
-    for q := 0 to NodeSpan(c) do
-      arena := arena + ArenaOf(NodeAdd(nm, q));
-  end;
-  d := NewDoc(nodes, arena);
-  d0 := PJNode(@d[JsonHead]);
-  d0^.W0 := JtObj or (cnt shl 8);
-  if flat then
-    d0^.W0 := d0^.W0 or JfFlat;
-  d0^.W1 := nodes;
-  at := 1;
-  a := JsonHead + nodes * 16;
-  for i := 0 to cnt - 1 do
-  begin
-    if i < no then
-      nm := olds[i]
-    else
-      nm := PJNode(K.Names[i - no]);
-    a := CopyRun(d, at, nm, 1 + NodeSpan(NodeAdd(nm, 1)), a);
-    at := at + 1 + NodeSpan(NodeAdd(nm, 1));
-  end;
-  Result := JsonOfN(d0);
-end;
-
 { Whether the N bytes at P are, whole, one JSON number (RFC 8259, Go's
   jsonwire.ConsumeNumber over all of them): what json quoted asks of
   the string a number is written in. }
 function WholeNumber(P: PByte; N: Int64; out Sc: TPasNumScan): Boolean;
 begin
   Result := (N > 0) and PasNumScan(P, N, True, Sc) and (Sc.Len = N);
-end;
-
-{ The text of number node J, or of the number string J holds (json
-  quoted), at P and N; a node that is neither raises. }
-procedure NumIn(var R: TJsonIn; J: PJNode; Quoted: Boolean; const T: string; out P: PByte;
-  out N: Int64; out Sc: TPasNumScan);
-var
-  k: Int64;
-  tx: PByte;
-begin
-  k := J^.W0 and 7;
-  if Quoted then
-  begin
-    if k = JtNum then
-      InWhy(R, J, jeType, T, 'json quoted takes the number in a string');
-    if k <> JtStr then
-      PasJsonInBad(R, J, T);
-    P := StrBytes(J);
-    N := StrLen(J);
-    if not WholeNumber(P, N, Sc) then
-      InWhy(R, J, jeType, T, 'not a number');
-    Exit;
-  end;
-  if k <> JtNum then
-    PasJsonInBad(R, J, T);
-  tx := NumText(J);
-  P := @tx[9];
-  N := PInt64(tx)^;
-  if not PasNumScan(P, N, True, Sc) then
-    InWhy(R, J, jeType, T, 'not a number');
-end;
-
-function PasJsonInInt(var R: TJsonIn; J: Pointer; Lo, Hi: Integer; const T: string): Integer;
-var
-  nd: PJNode;
-begin
-  nd := PJNode(J);
-  Result := 0;
-  if nd = nil then
-    Exit;
-  if (nd^.W0 and 63) = (JtNum or JnInt or JnIntLit) then
-  begin
-    Result := nd^.W1;
-    if (Result >= Lo) and (Result <= Hi) then
-      Exit;
-    InWhy(R, nd, jeRange, T, 'out of range');
-  end;
-  case nd^.W0 and 7 of
-    JtNull:
-      Exit;
-    JtNum:
-      if (nd^.W0 and JnIntLit) = 0 then
-        InWhy(R, nd, jeType, T, 'not an integer')
-      else
-        InWhy(R, nd, jeRange, T, 'out of range');
-  end;
-  PasJsonInBad(R, nd, T);
-end;
-
-{ json quoted: a string holding just an integer literal, as Go's v2
-  reads a quoted integer (jsonwire.ParseUint after an optional minus). }
-function PasJsonInIntQ(var R: TJsonIn; J: Pointer; Lo, Hi: Integer; const T: string): Integer;
-var
-  nd: PJNode;
-  p: PByte;
-  n: Int64;
-  sc: TPasNumScan;
-begin
-  nd := PJNode(J);
-  Result := 0;
-  if PasJsonInNull(nd) then
-    Exit;
-  NumIn(R, nd, True, T, p, n, sc);
-  if not sc.IntLit then
-    InWhy(R, nd, jeType, T, 'not an integer');
-  if not PasNumI64(p, sc, Result) or (Result < Lo) or (Result > Hi) then
-    InWhy(R, nd, jeRange, T, 'out of range');
-end;
-
-function PasJsonInBool(var R: TJsonIn; J: Pointer): Boolean;
-begin
-  Result := False;
-  if J = nil then
-    Exit;
-  case PJNode(J)^.W0 and 7 of
-    JtNull, JtFalse:
-      Exit;
-    JtTrue:
-      Result := True;
-  else
-    PasJsonInBad(R, J, 'Boolean');
-  end;
-end;
-
-{ A Char: a string of one character of seven bits, as JsonEncode writes
-  one; Lo and Hi bound a subrange of Char. }
-function PasJsonInChar(var R: TJsonIn; J: Pointer; Lo, Hi: Integer; const T: string): Char;
-var
-  nd: PJNode;
-  b: Integer;
-begin
-  nd := PJNode(J);
-  Result := #0;
-  if PasJsonInNull(nd) then
-    Exit;
-  if (nd^.W0 and 7) <> JtStr then
-    PasJsonInBad(R, nd, T);
-  if (StrLen(nd) <> 1) or (StrBytes(nd)^ > 127) then
-    InWhy(R, nd, jeType, T, 'not one character of seven bits');
-  b := StrBytes(nd)^;
-  if (b < Lo) or (b > Hi) then
-    InWhy(R, nd, jeRange, T, 'out of range');
-  Result := Chr(b);
 end;
 
 { The member of an enumeration a string names (Names, the names of its
@@ -7512,24 +7074,6 @@ begin
       Exit;
     end;
   Result := -1;
-end;
-
-function PasJsonInEnum(var R: TJsonIn; J: Pointer; Names: Pointer; N, Lo, Hi: Integer;
-  const T: string): Integer;
-var
-  nd: PJNode;
-begin
-  nd := PJNode(J);
-  Result := 0;
-  if PasJsonInNull(nd) then
-    Exit;
-  if (nd^.W0 and 7) <> JtStr then
-    PasJsonInBad(R, nd, T);
-  Result := EnumOf(StrBytes(nd), StrLen(nd), Names, N);
-  if Result < 0 then
-    InWhy(R, nd, jeType, T, 'no such member');
-  if (Result < Lo) or (Result > Hi) then
-    InWhy(R, nd, jeRange, T, 'out of range');
 end;
 
 { The Double of number node J, rounded once: False past its range. }
@@ -7560,114 +7104,6 @@ begin
       end;
   else
     Result := False;
-  end;
-end;
-
-function PasJsonInF64(var R: TJsonIn; J: Pointer; Quoted: Boolean; const T: string): Double;
-var
-  nd: PJNode;
-  p: PByte;
-  n, bits: Int64;
-  sc: TPasNumScan;
-begin
-  nd := PJNode(J);
-  Result := 0;
-  if PasJsonInNull(nd) then
-    Exit;
-  if not Quoted and ((nd^.W0 and 7) = JtNum) then
-  begin
-    if not NodeF64(nd, bits) then
-      InWhy(R, nd, jeRange, T, 'out of range');
-    Result := bits as Double;
-    Exit;
-  end;
-  NumIn(R, nd, Quoted, T, p, n, sc);
-  if not PasNumF64(p, sc, bits) then
-    InWhy(R, nd, jeRange, T, 'out of range');
-  Result := bits as Double;
-end;
-
-{ A Single rounded once from the text, as Go's ParseFloat(s, 32). }
-function PasJsonInF32(var R: TJsonIn; J: Pointer; Quoted: Boolean; const T: string): Single;
-var
-  nd: PJNode;
-  p: PByte;
-  n, bits: Int64;
-  sc: TPasNumScan;
-begin
-  nd := PJNode(J);
-  Result := 0;
-  if PasJsonInNull(nd) then
-    Exit;
-  NumIn(R, nd, Quoted, T, p, n, sc);
-  bits := 0;
-  if not PasNumF32(p, sc, bits) then
-    InWhy(R, nd, jeRange, T, 'out of range');
-  Move(bits, Result, 4);
-end;
-
-{ A Quad, the binary128 nearest the text (pasfmt's PasParseQuad). }
-function PasJsonInQuad(var R: TJsonIn; J: Pointer; Quoted: Boolean; const T: string): Quad;
-var
-  nd: PJNode;
-  p: PByte;
-  n, lo, hi: Int64;
-  sc: TPasNumScan;
-  w: array[0..1] of Int64;
-begin
-  nd := PJNode(J);
-  w[0] := 0;
-  w[1] := 0;
-  if not PasJsonInNull(nd) then
-  begin
-    NumIn(R, nd, Quoted, T, p, n, sc);
-    lo := 0;
-    hi := 0;
-    PasParseQuad(PasStrView(p, n), lo, hi);
-    if ((hi shr 48) and $7FFF) = $7FFF then
-      InWhy(R, nd, jeRange, T, 'out of range');
-    w[0] := lo;
-    w[1] := hi;
-  end;
-  Move(w, Result, 16);
-end;
-
-function PasJsonInCur(var R: TJsonIn; J: Pointer; Quoted: Boolean; const T: string): Currency;
-var
-  nd: PJNode;
-  p: PByte;
-  n, v: Int64;
-  sc: TPasNumScan;
-begin
-  nd := PJNode(J);
-  v := 0;
-  if not PasJsonInNull(nd) then
-  begin
-    NumIn(R, nd, Quoted, T, p, n, sc);
-    case CurOf(p, n, v) of
-      1: InWhy(R, nd, jeRange, T, 'more than four places');
-      2: InWhy(R, nd, jeRange, T, 'out of range');
-    end;
-  end;
-  Result := v as Currency;
-end;
-
-function PasJsonInStr(var R: TJsonIn; J: Pointer; const T: string): string;
-var
-  nd: PJNode;
-  n: Int64;
-begin
-  nd := PJNode(J);
-  Result := '';
-  if PasJsonInNull(nd) then
-    Exit;
-  if (nd^.W0 and 7) <> JtStr then
-    PasJsonInBad(R, nd, T);
-  n := StrLen(nd);
-  if n > 0 then
-  begin
-    SetLength(Result, n);
-    Move(StrBytes(nd)^, PByte(Pointer(Result))^, n);
   end;
 end;
 
@@ -7806,22 +7242,6 @@ begin
   Result := 2;
 end;
 
-function PasJsonInTime(var R: TJsonIn; J: Pointer; const T: string): Double;
-var
-  nd: PJNode;
-begin
-  nd := PJNode(J);
-  Result := 0;
-  if PasJsonInNull(nd) then
-    Exit;
-  if (nd^.W0 and 7) <> JtStr then
-    PasJsonInBad(R, nd, T);
-  case TimeOf(StrBytes(nd), StrLen(nd), Result) of
-    0: InWhy(R, nd, jeType, T, 'not RFC 3339');
-    1: InWhy(R, nd, jeRange, T, 'out of range');
-  end;
-end;
-
 { A base64 digit's value, -1 for none (RFC 4648 4, the standard
   alphabet). }
 function B64Val(B: Integer): Integer;
@@ -7896,130 +7316,1885 @@ begin
   end;
 end;
 
-function PasJsonInB64Len(var R: TJsonIn; J: Pointer; const T: string): Integer;
-var
-  nd: PJNode;
-begin
-  nd := PJNode(J);
-  Result := 0;
-  if PasJsonInNull(nd) then
-    Exit;
-  if (nd^.W0 and 7) <> JtStr then
-    PasJsonInBad(R, nd, T);
-  Result := B64Count(StrBytes(nd), StrLen(nd));
-  if Result < 0 then
-    InWhy(R, nd, jeType, T, 'not base64 (RFC 4648)');
-end;
 
-procedure PasJsonInB64To(J: Pointer; P: Pointer);
-begin
-  B64Decode(StrBytes(PJNode(J)), StrLen(PJNode(J)), PByte(P));
-end;
+{ ---- the text read a token at a time (P280) ----
 
-{ A static array of bytes: base64 of exactly its N bytes, as Go's v2
-  asks of a [N]byte; null its zeros. }
-procedure PasJsonInB64Fixed(var R: TJsonIn; J: Pointer; P: Pointer; N: Integer; const T: string);
+  A typed decode reads the text itself, as Go's jsontext.Decoder reads
+  it (decode.go ReadToken, SkipValue), with no document: the parser's
+  record in its stream mode. The index comes a window at a time, as for
+  a parse; a scalar is read by the parse's own routines (ParseStr,
+  ParseNum, ParseLit) into one node and the arena after it, both
+  scratch, used by the decode before the next token; the names of the
+  open objects stay in the arena, each [length][01h][bytes], one object's
+  back to back from its frame's Mark, as Go's objectNamespace keeps
+  them, and are checked for twins as Dup checks a document's (one by one
+  up to JsonLinear, then through a set of their places); a frame's Name
+  is its last name's place, which the error's pointer reads. Every error
+  is the parse's, with its place and pointer: a text a decode reads
+  gives the errors a parse of it would, up to the first one, met in the
+  text's order. }
+
+{ The reader of S in stream mode, at its first token. False, with the
+  error in P, when the text is longer than Opts lets a parse take. }
+function StStart(var P: TJParse; const S: string; const Opts: TJsonOptions): Boolean;
 var
-  k: Integer;
+  lim: Int64;
 begin
-  if PasJsonInNull(J) then
+  Result := False;
+  P := Default(TJParse);
+  P.Stream := True;
+  lim := JsonMaxDoc;
+  if (Opts.MaxBytes > 0) and (Opts.MaxBytes < lim) then
+    lim := Opts.MaxBytes;
+  if Length(S) > lim then
   begin
-    FillChar(PByte(P)^, N, 0);
+    P.Failed := True;
+    P.Err.Kind := 4;
+    P.Err.Offset := lim;
+    P.Err.Path := '';
+    P.Err.Reason := 'the text has ' + IntText(Length(S)) + ' bytes, more than the ' + IntText(lim) +
+      ' a parse takes';
     Exit;
   end;
-  k := PasJsonInB64Len(R, J, T);
-  if k <> N then
-    InWhy(R, PJNode(J), jeType, T, IntText(k) + ' bytes for ' + IntText(N));
-  if N > 0 then
-    PasJsonInB64To(J, P);
+  P.T := PByte(Pointer(S));
+  P.N := Length(S);
+  P.MaxDepth := Opts.MaxDepth;
+  if P.MaxDepth <= 0 then
+    P.MaxDepth := JsonDepthMax;
+  P.Bad := PasUtf8Valid(P.T, P.N, True);
+  SetLength(P.Idx, JsonWin + 8);
+  P.IdxP := @P.Idx[0];
+  PasJsonScanStart(P.Scan);
+  SetLength(P.Doc, 4096);
+  P.D := @P.Doc[0];
+  P.NTop := JsonHead + 16;
+  P.Top := nil;
+  P.Ahead := 2 * P.N;
+  P.Seed := NextSeed;
+  P.State := SValue;
+  SetLength(P.St, 16);
+  Result := True;
 end;
 
-{ ---- a map's or a tree's keys, from the names of an object ---- }
+{ The names of the object F: the place of each, from its Mark, back to
+  back. }
+function StNameLen(var P: TJParse; At: Int64): Int64;
+begin
+  Result := PInt64(@P.D[At])^;
+end;
 
-function PasJsonInName(Name: Pointer): string;
+function StSameAt(var P: TJParse; A, B: Int64): Boolean;
 var
   n: Int64;
 begin
-  Result := '';
-  n := StrLen(PJNode(Name));
-  if n > 0 then
+  n := StNameLen(P, A);
+  Result := (n = StNameLen(P, B)) and ((n = 0) or (CompareByte(P.D[A + 9], P.D[B + 9], n) = 0));
+end;
+
+function StHash(var P: TJParse; At: Int64): Int64;
+begin
+  Result := XxHash3(PasStrView(@P.D[At + 9], StNameLen(P, At)), P.Seed);
+end;
+
+procedure StSetPut(var P: TJParse; var F: TJFrame; At: Int64);
+var
+  m, h: Int64;
+begin
+  m := Length(F.Names) - 1;
+  h := StHash(P, At) and m;
+  while F.Names[h] >= 0 do
+    h := (h + 1) and m;
+  F.Names[h] := At;
+  F.NSet := F.NSet + 1;
+end;
+
+procedure StSetGrow(var P: TJParse; var F: TJFrame; Slots: Int64);
+var
+  old: array of Int64;
+  i: Int64;
+begin
+  old := F.Names;
+  F.Names := nil;
+  SetLength(F.Names, Slots);
+  for i := 0 to Slots - 1 do
+    F.Names[i] := -1;
+  F.NSet := 0;
+  for i := 0 to High(old) do
+    if old[i] >= 0 then
+      StSetPut(P, F, old[i]);
+end;
+
+{ Whether the object F has a name As the one at At, which ends its
+  names: Dup over the names of the arena. }
+function StDup(var P: TJParse; var F: TJFrame; At: Int64): Boolean;
+var
+  k, m, h: Int64;
+begin
+  Result := False;
+  if F.Count < JsonLinear then
   begin
-    SetLength(Result, n);
-    Move(StrBytes(PJNode(Name))^, PByte(Pointer(Result))^, n);
+    k := F.Mark;
+    while k < At do
+    begin
+      if StSameAt(P, k, At) then
+      begin
+        Result := True;
+        Exit;
+      end;
+      k := k + 9 + StNameLen(P, k);
+    end;
+    Exit;
+  end;
+  if F.NSet = 0 then
+  begin
+    k := 64;
+    while k < 4 * (F.Count + 1) do
+      k := k * 2;
+    StSetGrow(P, F, k);
+    k := F.Mark;
+    while k < At do
+    begin
+      StSetPut(P, F, k);
+      k := k + 9 + StNameLen(P, k);
+    end;
+  end;
+  m := Length(F.Names) - 1;
+  h := StHash(P, At) and m;
+  while F.Names[h] >= 0 do
+  begin
+    if StSameAt(P, F.Names[h], At) then
+    begin
+      Result := True;
+      Exit;
+    end;
+    h := (h + 1) and m;
+  end;
+  if (F.NSet + 1) * 2 > Length(F.Names) then
+    StSetGrow(P, F, Length(F.Names) * 2);
+  StSetPut(P, F, At);
+end;
+
+{ The first byte of the next token and its place E, not taken; -1 at
+  the end of the text. }
+function StPeek(var P: TJParse; out E: Int64): Integer;
+begin
+  if P.I >= P.NIdx then
+    if not Refill(P) then
+    begin
+      E := P.N;
+      Result := -1;
+      Exit;
+    end;
+  E := P.IdxP[P.I];
+  Result := P.T[E];
+end;
+
+{ Its frame, Top, kept by the reader with the index's first entry, IdxP:
+  an element of a dynamic array is read with its bounds checked, and
+  the reader reads these at every token. }
+procedure StOpen(var P: TJParse; Obj: Boolean; E: Int64);
+var
+  f: PJFrame;
+begin
+  if P.Depth >= Length(P.St) then
+    SetLength(P.St, Length(P.St) * 2 + 8);
+  f := @P.St[P.Depth];
+  f^.Node := E;
+  f^.Count := 0;
+  f^.Name := -1;
+  f^.Obj := Obj;
+  f^.NSet := 0;
+  f^.Mark := P.NTop;
+  P.Depth := P.Depth + 1;
+  P.Top := f;
+  if Obj then
+    P.State := SObjFirst
+  else
+    P.State := SArrFirst;
+end;
+
+{ The open container closes: its names are let go, and it is a value
+  of the one around it. }
+procedure StClose(var P: TJParse);
+var
+  f: PJFrame;
+begin
+  f := P.Top;
+  P.Depth := P.Depth - 1;
+  P.NTop := f^.Mark;
+  if f^.Names <> nil then
+    f^.Names := nil;
+  if P.Depth > 0 then
+  begin
+    f := @P.St[P.Depth - 1];
+    P.Top := f;
+    f^.Count := f^.Count + 1;
+  end
+  else
+    P.Top := nil;
+  P.State := SAfter;
+end;
+
+{ The next value, where the parse would read one (P.State SValue or
+  SArrFirst): a scalar read into the scratch node, at JsonHead, Result
+  its kind (JtNull to JtStr); an opening bracket or brace opens its
+  container, JtArr or JtObj; -1 after an error, which P holds. ValAt is
+  where the value starts. As ParseFast, a string whose next entry closes
+  it and an integer of at most 18 digits are read on the spot: such a
+  string is not copied, its node points into the text. }
+function StValue(var P: TJParse): Integer;
+var
+  e, c, q, node, k, at, v, len, a, n, lim, b: Int64;
+  neg: Boolean;
+  nd: PJNode;
+  t, d: PByte;
+  ix: PUInt32;
+  sc: TPasNumScan;
+begin
+  Result := -1;
+  if P.I >= P.NIdx then
+    if not Refill(P) then
+    begin
+      SetEof(P, P.N, WhereAt);
+      Exit;
+    end;
+  ix := P.IdxP;
+  e := ix[P.I];
+  t := P.T;
+  c := t[e];
+  P.I := P.I + 1;
+  P.ValAt := e;
+  q := -1;
+  if c = 34 then
+  begin
+    { a string whose next entry closes it: in place }
+    if P.I < P.NIdx then
+    begin
+      q := ix[P.I];
+      if (t[q] = 34) and not ((P.Bad > e) and (P.Bad < q)) then
+      begin
+        P.I := P.I + 1;
+        nd := PJNode(@P.D[JsonHead]);
+        nd^.W0 := JtStr or JfNoEsc or ((q - e - 1) shl 8);
+        nd^.W1 := Int64(@t[e + 1]) - Int64(nd);
+        if P.Top <> nil then
+          P.Top^.Count := P.Top^.Count + 1;
+        P.State := SAfter;
+        Result := JtStr;
+        Exit;
+      end;
+    end;
+    P.Nodes := 0;
+    P.Arena := P.NTop;
+    SRoom(P, P.Arena + 64);
+    if not ParseStr(P, e, node) then
+      Exit;
+    if P.Top <> nil then
+      P.Top^.Count := P.Top^.Count + 1;
+    P.State := SAfter;
+    Result := JtStr;
+    Exit;
+  end;
+  if (c = 45) or ((c >= 48) and (c <= 57)) then
+  begin
+    { an integer of at most 18 digits, no 0 before another digit, no
+      point and no exponent after it: its value at once }
+    n := P.N;
+    k := e;
+    neg := c = 45;
+    if neg then
+      k := k + 1;
+    v := 0;
+    at := k;
+    lim := at + 19;
+    if lim > n then
+      lim := n;
+    while k < lim do
+    begin
+      b := t[k];
+      if (b < 48) or (b > 57) then
+        Break;
+      v := v * 10 + (b - 48);
+      k := k + 1;
+    end;
+    len := k - e;
+    b := 0;
+    if k < n then
+      b := t[k];
+    if (k > at) and (k - at <= 18) and not ((t[at] = 48) and (k - at > 1)) and
+      ((k >= n) or ((b <> 46) and (b <> 101) and (b <> 69) and ((b < 48) or (b > 57)))) then
+    begin
+      if neg then
+        v := -v;
+      a := P.NTop;
+      if a + 9 + len + 32 > Length(P.Doc) then
+        SRoom(P, a + 9 + len + 16);
+      d := P.D;
+      PInt64(@d[a])^ := len;
+      d[a + 8] := 1;
+      { the digits eight bytes at a time: the arena has the room, and
+        the text holds what is read past them }
+      if e + ((len + 7) and not 7) <= n then
+        CopyWords(@t[e], @d[a + 9], len)
+      else
+        Move(t[e], d[a + 9], len);
+      nd := PJNode(@d[JsonHead]);
+      nd^.W0 := JtNum or JnInt or JnIntLit or ((a - JsonHead) shl 8);
+      nd^.W1 := v;
+      if P.Top <> nil then
+        P.Top^.Count := P.Top^.Count + 1;
+      P.State := SAfter;
+      Result := JtNum;
+      if (k < n) and ((JsonClassHi[b shr 4] and JsonClassLo[b and 15] and $1F) = 0) and
+        (b <> 34) then
+      begin
+        SetAfter(P, k);
+        Result := -1;
+      end;
+      Exit;
+    end;
+    { a decimal of at most 18 digits with no exponent, d+.d+ (no 0
+      before another digit): its scan made here, its Double by
+      PasNumF64's exact way when it has one }
+    if (k < n) and (b = 46) and (k > at) and not ((t[at] = 48) and (k - at > 1)) then
+    begin
+      q := k + 1;
+      lim := at + 19;
+      if lim > n then
+        lim := n;
+      while q < lim do
+      begin
+        b := t[q];
+        if (b < 48) or (b > 57) then
+          Break;
+        v := v * 10 + (b - 48);
+        q := q + 1;
+      end;
+      b := 0;
+      if q < n then
+        b := t[q];
+      if (q > k + 1) and (q - at <= 19) and
+        ((q >= n) or ((b <> 101) and (b <> 69) and ((b < 48) or (b > 57)))) then
+      begin
+        sc.Mant := v;
+        sc.Exp10 := -(q - k - 1);
+        sc.Digits := q - at - 1;
+        sc.Len := q - e;
+        sc.Neg := neg;
+        sc.Dropped := False;
+        sc.IntLit := False;
+        len := q - e;
+        a := P.NTop;
+        if a + 9 + len + 32 > Length(P.Doc) then
+          SRoom(P, a + 9 + len + 16);
+        d := P.D;
+        PInt64(@d[a])^ := len;
+        d[a + 8] := 1;
+        if e + ((len + 7) and not 7) <= n then
+          CopyWords(@t[e], @d[a + 9], len)
+        else
+          Move(t[e], d[a + 9], len);
+        nd := PJNode(@d[JsonHead]);
+        if PasNumF64(@t[e], sc, v) then
+          nd^.W0 := JtNum or JnFloat or ((a - JsonHead) shl 8)
+        else
+          nd^.W0 := JtNum or JnHuge or ((a - JsonHead) shl 8);
+        nd^.W1 := v;
+        if P.Top <> nil then
+          P.Top^.Count := P.Top^.Count + 1;
+        P.State := SAfter;
+        Result := JtNum;
+        if (q < n) and ((JsonClassHi[b shr 4] and JsonClassLo[b and 15] and $1F) = 0) and
+          (b <> 34) then
+        begin
+          SetAfter(P, q);
+          Result := -1;
+        end;
+        Exit;
+      end;
+    end;
+    P.Nodes := 0;
+    P.Arena := P.NTop;
+    q := -1;
+    if not ParseNum(P, e, q) then
+      Exit;
+    Result := JtNum;
+  end
+  else
+  begin
+    P.Nodes := 0;
+    P.Arena := P.NTop;
+    case c of
+      123, 91:
+        begin
+          if P.Depth >= P.MaxDepth then
+          begin
+            SetErr(P, 3, e, WhereNext, 'exceeded max depth');
+            Exit;
+          end;
+          StOpen(P, c = 123, e);
+          if c = 123 then
+            Result := JtObj
+          else
+            Result := JtArr;
+          Exit;
+        end;
+      116:
+        begin
+          if not ParseLit(P, e, 'true', JtTrue) then
+            Exit;
+          q := e + 4;
+          Result := JtTrue;
+        end;
+      102:
+        begin
+          if not ParseLit(P, e, 'false', JtFalse) then
+            Exit;
+          q := e + 5;
+          Result := JtFalse;
+        end;
+      110:
+        begin
+          if not ParseLit(P, e, 'null', JtNull) then
+            Exit;
+          q := e + 4;
+          Result := JtNull;
+        end;
+    else
+      SetErr(P, 0, e, WhereNext, 'invalid character ' + QuoteAt(P, e) + ' at start of value');
+      Exit;
+    end;
+  end;
+  if P.Top <> nil then
+    P.Top^.Count := P.Top^.Count + 1;
+  P.State := SAfter;
+  { a scalar that is no string ends at a delimiter }
+  if q < P.N then
+  begin
+    b := t[q];
+    if ((JsonClassHi[b shr 4] and JsonClassLo[b and 15] and $1F) = 0) and (b <> 34) then
+    begin
+      SetAfter(P, q);
+      Result := -1;
+    end;
   end;
 end;
 
-procedure NameFail(var R: TJsonIn; Name: PJNode; Kind: TJsonErrorKind; const T, Why: string);
+{ The next member of the open object (P.State SObjFirst, or SAfter in
+  it): 1 when a name was read, its place the frame's Name, NameAt where
+  it starts, P.State SValue for its value; 0 when the object closed; -1
+  after an error. As ParseFast, a comma, a name with no escape and its
+  colon in the window are read on the spot, and checked against the
+  names before it one by one. }
+function StName(var P: TJParse): Integer;
 var
-  p, why2: string;
+  e, c, node, at, i, q, len, k, kl: Int64;
+  f: PJFrame;
+  t, d: PByte;
+  ix: PUInt32;
+  twin: Boolean;
 begin
-  p := NodePath(NodeAdd(Name, 1));
-  why2 := '';
-  if Why <> '' then
-    why2 := ': ' + Why;
-  InRaise(R, Name, Kind, p, p, 'cannot decode the name ' +
-    GoQuoteStr(PasStrView(StrBytes(Name), StrLen(Name))) + ' into ' + T + why2);
+  Result := -1;
+  f := P.Top;
+  i := P.I;
+  ix := P.IdxP;
+  t := P.T;
+  if P.State = SAfter then
+    k := 4
+  else
+    k := 3;
+  if (i + k <= P.NIdx) and (f^.Count < JsonLinear) then
+  begin
+    c := t[ix[i]];
+    if c = 125 then
+    begin
+      { the object closes }
+      P.I := i + 1;
+      StClose(P);
+      Result := 0;
+      Exit;
+    end;
+    if (k = 4) and (c = 44) then
+      i := i + 1;
+    e := ix[i];
+    q := ix[i + 1];
+    if ((k = 3) or (i > P.I)) and (t[e] = 34) and (t[q] = 34) and (t[ix[i + 2]] = 58) and
+      not ((P.Bad > e) and (P.Bad < q)) then
+    begin
+      len := q - e - 1;
+      at := P.NTop;
+      if at + 9 + len + 32 > Length(P.Doc) then
+        SRoom(P, at + 9 + len + 16);
+      d := P.D;
+      PInt64(@d[at])^ := len;
+      d[at + 8] := 1;
+      if e + 1 + ((len + 7) and not 7) <= P.N then
+        CopyWords(@t[e + 1], @d[at + 9], len)
+      else
+        Move(t[e + 1], d[at + 9], len);
+      { the names before it, one by one }
+      twin := False;
+      k := f^.Mark;
+      while k < at do
+      begin
+        kl := PInt64(@d[k])^;
+        if (kl = len) and ((len = 0) or ((d[k + 9] = d[at + 9]) and
+          (CompareByte(d[k + 9], d[at + 9], len) = 0))) then
+        begin
+          twin := True;
+          Break;
+        end;
+        k := k + 9 + kl;
+      end;
+      f^.Name := at;
+      P.NameAt := e;
+      if twin then
+      begin
+        P.I := i + 2;
+        P.State := SColon;
+        SetErr(P, 2, e, WhereNext, 'duplicate object member name');
+        Exit;
+      end;
+      P.NTop := at + 9 + len;
+      P.I := i + 3;
+      P.State := SValue;
+      Result := 1;
+      Exit;
+    end;
+  end;
+  c := StPeek(P, e);
+  if c < 0 then
+  begin
+    SetEof(P, P.N, WhereAt);
+    Exit;
+  end;
+  P.I := P.I + 1;
+  if P.State = SAfter then
+  begin
+    if c = 125 then
+    begin
+      StClose(P);
+      Result := 0;
+      Exit;
+    end;
+    if c <> 44 then
+    begin
+      SetAfter(P, e);
+      Exit;
+    end;
+    P.State := SObjName;
+    c := StPeek(P, e);
+    if c < 0 then
+    begin
+      SetEof(P, P.N, WhereAt);
+      Exit;
+    end;
+    P.I := P.I + 1;
+  end
+  else if c = 125 then
+  begin
+    StClose(P);
+    Result := 0;
+    Exit;
+  end;
+  if c <> 34 then
+  begin
+    SetErr(P, 0, e, WhereNext, 'invalid character ' + QuoteAt(P, e) +
+      ' at start of string (expecting ''"'')');
+    Exit;
+  end;
+  at := P.NTop;
+  P.Nodes := 0;
+  P.Arena := at + 8;
+  SRoom(P, P.Arena + 64);
+  if not ParseStr(P, e, node) then
+    Exit;
+  PInt64(@P.D[at])^ := StrLen(NodeAt(P, 0));
+  P.NameAt := e;
+  f := P.Top;
+  if StDup(P, f^, at) then
+  begin
+    f^.Name := at;
+    P.State := SColon;
+    SetErr(P, 2, e, WhereNext, 'duplicate object member name');
+    Exit;
+  end;
+  f^.Name := at;
+  P.NTop := P.Arena;
+  P.State := SColon;
+  c := StPeek(P, e);
+  if c < 0 then
+  begin
+    SetEof(P, P.N, WhereAt);
+    Exit;
+  end;
+  P.I := P.I + 1;
+  if c <> 58 then
+  begin
+    SetErr(P, 0, e, WhereNext, 'invalid character ' + QuoteAt(P, e) + ' after object name (expecting '':'')');
+    Exit;
+  end;
+  P.State := SValue;
+  Result := 1;
 end;
 
-{ An integer's name: its decimal digits as JsonEncode writes them, a
-  minus only before one that is not 0 and no 0 before another digit, so
-  each key has one name and two names are never one key. }
-function PasJsonInNameInt(var R: TJsonIn; Name: Pointer; Lo, Hi: Integer; const T: string): Integer;
+{ The next element of the open array (P.State SArrFirst, or SAfter in
+  it): 1 when one follows, P.State then where StValue reads it; 0 when the
+  array closed; -1 after an error. }
+function StItem(var P: TJParse): Integer;
+var
+  e, c: Int64;
+begin
+  Result := -1;
+  if P.I < P.NIdx then
+  begin
+    e := P.IdxP[P.I];
+    c := P.T[e];
+  end
+  else
+  begin
+    c := StPeek(P, e);
+    if c < 0 then
+    begin
+      SetEof(P, P.N, WhereAt);
+      Exit;
+    end;
+  end;
+  if P.State = SArrFirst then
+  begin
+    if c = 93 then
+    begin
+      P.I := P.I + 1;
+      StClose(P);
+      Result := 0;
+      Exit;
+    end;
+    Result := 1;
+    Exit;
+  end;
+  P.I := P.I + 1;
+  if c = 44 then
+  begin
+    P.State := SValue;
+    Result := 1;
+  end
+  else if c = 93 then
+  begin
+    StClose(P);
+    Result := 0;
+  end
+  else
+    SetAfter(P, e);
+end;
+
+{ The elements of the array just opened, counted on the index from
+  where the reader is to its closing bracket: a decode reserves the
+  array at its length, with no copy as it grows. Past the reader's
+  window the text after it is indexed again into a window of the
+  count's own, from the scan's state there; that reading ahead takes at
+  most twice the text over a decode (Ahead), so arrays in arrays past
+  their windows cost no more; then -1. A text that is no JSON may give a
+  wrong count, which the decode corrects as it reads. }
+function StCount(var P: TJParse): Int64;
+var
+  i, depth, n, ni, ofs, take: Int64;
+  c: Integer;
+  ix: PUInt32;
+  t: PByte;
+  sc: TPasJsonScan;
+begin
+  Result := -1;
+  i := P.I;
+  ni := P.NIdx;
+  ix := P.IdxP;
+  t := P.T;
+  ofs := P.Done0;
+  sc := P.Scan;
+  depth := 0;
+  n := 0;
+  while True do
+  begin
+    while i < ni do
+    begin
+      c := t[ix[i]];
+      i := i + 1;
+      if (c = 91) or (c = 123) then
+        depth := depth + 1
+      else if (c = 93) or (c = 125) then
+      begin
+        if depth = 0 then
+        begin
+          Result := n;
+          Exit;
+        end;
+        depth := depth - 1;
+      end
+      else if (c = 44) and (depth = 0) then
+        n := n + 1;
+      { an element starts: the first one counts }
+      if n = 0 then
+        n := 1;
+    end;
+    { the window ends: the text after it, indexed again }
+    if (ofs >= P.N) or (P.Ahead <= 0) then
+      Exit;
+    if Length(P.Idx2) = 0 then
+      SetLength(P.Idx2, JsonWin + 8);
+    take := P.N - ofs;
+    if take > JsonWin then
+    begin
+      take := JsonWin;
+      ni := PasJsonIndexBlocks(@t[ofs], take shr 6, sc, @P.Idx2[0], ofs);
+    end
+    else
+      ni := PasJsonIndex(@t[ofs], take, sc, @P.Idx2[0], ofs);
+    ofs := ofs + take;
+    P.Ahead := P.Ahead - take;
+    ix := @P.Idx2[0];
+    i := 0;
+  end;
+end;
+
+{ The rest of the container the last StValue opened, read and checked:
+  False after an error. }
+function StRest(var P: TJParse): Boolean;
+var
+  d, r: Int64;
+begin
+  Result := False;
+  d := P.Depth;
+  while P.Depth >= d do
+  begin
+    if P.Top^.Obj then
+      r := StName(P)
+    else
+      r := StItem(P);
+    if r < 0 then
+      Exit;
+    if r > 0 then
+      if StValue(P) < 0 then
+        Exit;
+  end;
+  Result := True;
+end;
+
+{ The next value, whatever it is, read and checked. }
+function StSkip(var P: TJParse): Boolean;
+var
+  k: Integer;
+begin
+  k := StValue(P);
+  Result := (k >= 0) and ((k < JtArr) or StRest(P));
+end;
+
+{ After the top-level value: nothing but white space, every byte UTF-8
+  (ParseDoc at the end of the text). False after an error. }
+function StEnd(var P: TJParse): Boolean;
+var
+  e: Int64;
+begin
+  Result := False;
+  if StPeek(P, e) >= 0 then
+  begin
+    SetAfter(P, e);
+    Exit;
+  end;
+  if P.Bad >= 0 then
+  begin
+    SetErr(P, BadKind(P), P.Bad, WhereNext, BadReason(P));
+    Exit;
+  end;
+  Result := True;
+end;
+
+{ The pointer of the value the last StValue read (Done) or opened: the
+  open containers by the member or the element each is in. }
+function StPath(var P: TJParse; Done: Boolean): string;
+var
+  i, n, at: Int64;
+begin
+  Result := '';
+  n := P.Depth;
+  { a container just opened: the pointer is the one around it's }
+  if not Done then
+    n := n - 1;
+  for i := 0 to n - 1 do
+    if P.St[i].Obj then
+    begin
+      at := P.St[i].Name;
+      if at >= 0 then
+        Result := Result + '/' + PtrToken(@P.D[at + 9], StNameLen(P, at));
+    end
+    else if (i = n - 1) and Done then
+      Result := Result + '/' + IntText(P.St[i].Count - 1)
+    else
+      Result := Result + '/' + IntText(P.St[i].Count);
+end;
+
+{ ---- typed decoding (P206, P280) ----
+
+  JsonDecode(S, X) reads the text S into X, JsonDecode(J, X) a json,
+  through the decoder the compiler writes for X's type (Pascal it reads
+  at the end of the unit, as P205's encoders) over the words below and
+  their cursor, TJsonIn: from text the stream reader above, no document
+  made (P280); from a json its nodes in their order. Each word reads the
+  next value in the type asked for, or raises EJsonError with the JSON
+  Pointer of the value and, from text, its place; the text's own errors
+  are a parse's, the first one in the text's order, as Go's v2 meets
+  them while it decodes. Go's encoding/json/v2 is the reference
+  (arshal_default.go): null is the zero, an integer comes only from an
+  integer literal in its type's range (jsonwire.ParseUint), a real is
+  rounded once, a string is copied, bytes are base64 (RFC 4648 4,
+  padding required), a name matches exactly. }
+
+function InP(var R: TJsonIn): PJParse;
+begin
+  Result := PJParse(R.S);
+end;
+
+{ Raises the error the stream reader holds. }
+procedure InParseFail(var R: TJsonIn);
+begin
+  raise ParseError(R.Text, InP(R)^.Err);
+end;
+
+{ Raises the error of a decode about the value just read, J its node:
+  from text its place and its pointer from the reader, from a json the
+  node's pointer. }
+procedure InFail(var R: TJsonIn; J: PJNode; Kind: TJsonErrorKind; const Reason: string);
+var
+  p: string;
+  off, line, col, i: Int64;
+begin
+  if R.S = nil then
+  begin
+    p := NodePath(J);
+    raise EJsonError.Create(Kind, -1, 0, 0, p, p, Reason);
+  end;
+  p := StPath(InP(R)^, True);
+  off := InP(R)^.ValAt;
+  line := 1;
+  col := 1;
+  for i := 1 to off do
+    if R.Text[i] = #10 then
+    begin
+      line := line + 1;
+      col := 1;
+    end
+    else
+      col := col + 1;
+  raise EJsonError.Create(Kind, off, line, col, p, p, Reason);
+end;
+
+{ J as a decode's error names it: a short number or string as it is,
+  else its kind. }
+function InWhat(J: PJNode): string;
+begin
+  if J = nil then
+    Result := 'null'
+  else
+    case J^.W0 and 7 of
+      JtNull: Result := 'null';
+      JtFalse: Result := 'false';
+      JtTrue: Result := 'true';
+      JtNum:
+        if PInt64(NumText(J))^ < 100 then
+          Result := NumView(J)
+        else
+          Result := 'a number';
+      JtStr:
+        if StrLen(J) < 100 then
+          Result := GoQuoteStr(BytesStr(StrBytes(J), StrLen(J)))
+        else
+          Result := 'a string';
+      JtArr: Result := 'an array';
+    else
+      Result := 'an object';
+    end;
+end;
+
+procedure InWhy(var R: TJsonIn; J: PJNode; Kind: TJsonErrorKind; const T, Why: string);
+begin
+  InFail(R, J, Kind, 'cannot decode ' + InWhat(J) + ' into ' + T + ': ' + Why);
+end;
+
+procedure InKind(var R: TJsonIn; J: PJNode; const T: string);
+begin
+  InFail(R, J, jeType, 'cannot decode ' + InWhat(J) + ' into ' + T);
+end;
+
+{ The next value, read: a scalar's node (from text the scratch one), or
+  a container read whole, given by a node of its kind alone; nil for a
+  json that is null. }
+function InNext(var R: TJsonIn): PJNode;
+var
+  k: Integer;
+  va: Int64;
+  P: PJParse;
+begin
+  if R.S = nil then
+  begin
+    Result := PJNode(R.Cur);
+    R.Last := R.Cur;
+    if Result <> nil then
+      R.Cur := NodeAdd(Result, NodeSpan(Result));
+    Exit;
+  end;
+  P := PJParse(R.S);
+  k := StValue(P^);
+  if k < 0 then
+    InParseFail(R);
+  if k >= JtArr then
+  begin
+    va := P^.ValAt;
+    if not StRest(P^) then
+      InParseFail(R);
+    P^.ValAt := va;
+    R.FakeW0 := k;
+    R.FakeW1 := 0;
+    Result := PJNode(@R.FakeW0);
+    Exit;
+  end;
+  Result := PJNode(@P^.D[JsonHead]);
+end;
+
+{ The value just read, again, for an error about it. }
+function InLast(var R: TJsonIn): PJNode;
+begin
+  if R.S = nil then
+    Result := PJNode(R.Last)
+  else
+    Result := NodeAt(InP(R)^, 0);
+end;
+
+procedure PasJsonInText(var R: TJsonIn; const S: string; const Opts: TJsonOptions);
+var
+  P: PJParse;
+begin
+  R.Merge := Opts.Merge;
+  R.Reject := Opts.RejectUnknown;
+  R.Text := S;
+  R.Opts := Opts;
+  New(P);
+  R.S := P;
+  if not StStart(P^, S, Opts) then
+    InParseFail(R);
+end;
+
+procedure PasJsonInDoc(var R: TJsonIn; J: json; const Opts: TJsonOptions);
+begin
+  R.Merge := Opts.Merge;
+  R.Reject := Opts.RejectUnknown;
+  R.Text := '';
+  R.S := nil;
+  R.Cur := NodeOfJ(J);
+  R.Root := R.Cur;
+  R.NE := 0;
+end;
+
+{ The document from its start again: Merge's decode after its check. }
+procedure PasJsonInRewind(var R: TJsonIn);
+begin
+  if R.S = nil then
+  begin
+    R.Cur := R.Root;
+    R.NE := 0;
+    Exit;
+  end;
+  if not StStart(InP(R)^, R.Text, R.Opts) then
+    InParseFail(R);
+end;
+
+{ After the value: the end of the text, nothing else in it. }
+procedure PasJsonInEnd(var R: TJsonIn);
+begin
+  if (R.S <> nil) and not StEnd(InP(R)^) then
+    InParseFail(R);
+end;
+
+{ Whether the next value is null, which is then read. }
+function PasJsonInNull(var R: TJsonIn): Boolean;
+var
+  e: Int64;
+  P: PJParse;
+begin
+  if R.S = nil then
+  begin
+    Result := (R.Cur = nil) or ((PJNode(R.Cur)^.W0 and 7) = JtNull);
+    if Result then
+    begin
+      R.Last := R.Cur;
+      if R.Cur <> nil then
+        R.Cur := NodeAdd(PJNode(R.Cur), 1);
+    end;
+    Exit;
+  end;
+  P := InP(R);
+  Result := False;
+  if P^.I < P^.NIdx then
+  begin
+    if P^.T[P^.Idx[P^.I]] <> 110 then
+      Exit;
+  end
+  else if StPeek(P^, e) <> 110 then
+    Exit;
+  begin
+    if StValue(P^) < 0 then
+      InParseFail(R);
+    Result := True;
+  end;
+end;
+
+{ The next value, an object, opened: its mark, the place an error about
+  it is told at. }
+function PasJsonInObj(var R: TJsonIn; const T: string): Int64;
+var
+  nd: PJNode;
+  k: Integer;
+  va: Int64;
+  P: PJParse;
+begin
+  if R.S = nil then
+  begin
+    nd := PJNode(R.Cur);
+    if (nd = nil) or ((nd^.W0 and 7) <> JtObj) then
+      InKind(R, InNext(R), T);
+    if R.NE = Length(R.Ends) then
+      SetLength(R.Ends, R.NE * 2 + 8);
+    R.Ends[R.NE] := NodeAdd(nd, NodeSpan(nd));
+    R.NE := R.NE + 1;
+    R.Last := nd;
+    R.Cur := NodeAdd(nd, 1);
+    Result := Int64(nd);
+    Exit;
+  end;
+  P := InP(R);
+  k := StValue(P^);
+  if k < 0 then
+    InParseFail(R);
+  if k <> JtObj then
+  begin
+    if k = JtArr then
+    begin
+      va := P^.ValAt;
+      if not StRest(P^) then
+        InParseFail(R);
+      P^.ValAt := va;
+      R.FakeW0 := k;
+      InKind(R, PJNode(@R.FakeW0), T);
+    end;
+    InKind(R, NodeAt(P^, 0), T);
+  end;
+  Result := P^.ValAt;
+end;
+
+{ The next value, an array, opened: its mark; Count is its length when
+  it is known (a json's), else -1. }
+function PasJsonInArr(var R: TJsonIn; const T: string): Int64;
+var
+  nd: PJNode;
+  k: Integer;
+  va: Int64;
+  P: PJParse;
+begin
+  if R.S = nil then
+  begin
+    nd := PJNode(R.Cur);
+    if (nd = nil) or ((nd^.W0 and 7) <> JtArr) then
+      InKind(R, InNext(R), T);
+    if R.NE = Length(R.Ends) then
+      SetLength(R.Ends, R.NE * 2 + 8);
+    R.Ends[R.NE] := NodeAdd(nd, NodeSpan(nd));
+    R.NE := R.NE + 1;
+    R.Count := nd^.W0 shr 8;
+    R.Last := nd;
+    R.Cur := NodeAdd(nd, 1);
+    Result := Int64(nd);
+    Exit;
+  end;
+  P := InP(R);
+  k := StValue(P^);
+  if k < 0 then
+    InParseFail(R);
+  if k <> JtArr then
+  begin
+    if k = JtObj then
+    begin
+      va := P^.ValAt;
+      if not StRest(P^) then
+        InParseFail(R);
+      P^.ValAt := va;
+      R.FakeW0 := k;
+      InKind(R, PJNode(@R.FakeW0), T);
+    end;
+    InKind(R, NodeAt(P^, 0), T);
+  end;
+  R.Count := StCount(P^);
+  Result := P^.ValAt;
+end;
+
+{ The next member of the open object: True with its name read, False
+  when the object closed. }
+function PasJsonInName(var R: TJsonIn): Boolean;
+var
+  r0: Integer;
+begin
+  if R.S = nil then
+  begin
+    if R.Cur = R.Ends[R.NE - 1] then
+    begin
+      R.NE := R.NE - 1;
+      Result := False;
+      Exit;
+    end;
+    R.Name := R.Cur;
+    R.Cur := NodeAdd(PJNode(R.Cur), 1);
+    Result := True;
+    Exit;
+  end;
+  r0 := StName(InP(R)^);
+  if r0 < 0 then
+    InParseFail(R);
+  Result := r0 > 0;
+end;
+
+{ Whether the open array has a next element, else it closed. }
+function PasJsonInItem(var R: TJsonIn): Boolean;
+var
+  r0: Integer;
+begin
+  if R.S = nil then
+  begin
+    if R.Cur = R.Ends[R.NE - 1] then
+    begin
+      R.NE := R.NE - 1;
+      Result := False;
+      Exit;
+    end;
+    Result := True;
+    Exit;
+  end;
+  r0 := StItem(InP(R)^);
+  if r0 < 0 then
+    InParseFail(R);
+  Result := r0 > 0;
+end;
+
+procedure PasJsonInSkip(var R: TJsonIn);
+begin
+  InNext(R);
+end;
+
+{ The name the last PasJsonInName read: its bytes and length. }
+procedure InName(var R: TJsonIn; out P: PByte; out N: Int64);
+var
+  S: PJParse;
+  at: Int64;
+begin
+  if R.S = nil then
+  begin
+    P := StrBytes(PJNode(R.Name));
+    N := StrLen(PJNode(R.Name));
+    Exit;
+  end;
+  S := InP(R);
+  at := S^.Top^.Name;
+  P := @S^.D[at + 9];
+  N := PInt64(@S^.D[at])^;
+end;
+
+{ The member a name is, by the tables of the type's names (N of them):
+  Names their strings, Keys the first eight bytes of each as an Int64
+  (the compiler writes both). The name just read is taken as its length
+  and its first eight bytes, which the arena and a document hold past
+  any name, so a name of eight bytes or fewer is matched by two
+  compares and a longer one by CompareByte after them; the one after
+  the member before first, as the text usually keeps the order of the
+  fields, then each in turn; -1 for none. K, the next expected, follows
+  the one found. }
+function PasJsonInMatch(var R: TJsonIn; Names, Keys: Pointer; N: Integer; var K: Integer): Integer;
+var
+  l, i, at, key: Int64;
+  p: PByte;
+  w, ks: PInt64;
+  S: PJParse;
+begin
+  if R.S = nil then
+  begin
+    p := StrBytes(PJNode(R.Name));
+    l := StrLen(PJNode(R.Name));
+  end
+  else
+  begin
+    S := PJParse(R.S);
+    at := S^.Top^.Name;
+    p := @S^.D[at + 9];
+    l := PInt64(@S^.D[at])^;
+  end;
+  key := PInt64(p)^;
+  if l < 8 then
+    key := key and ((Int64(1) shl (8 * l)) - 1);
+  ks := PInt64(Keys);
+  i := K;
+  if i < N then
+  begin
+    w := PInt64(Pointer(Integer(Names) + i * 16));
+    if (ks[i] = key) and (w[1] = l) and ((l <= 8) or
+      (CompareByte(PByte(Pointer(w[0]))[8], p[8], l - 8) = 0)) then
+    begin
+      Result := i;
+      K := i + 1;
+      Exit;
+    end;
+  end;
+  for i := 0 to N - 1 do
+  begin
+    w := PInt64(Pointer(Integer(Names) + i * 16));
+    if (ks[i] = key) and (w[1] = l) and ((l <= 8) or
+      (CompareByte(PByte(Pointer(w[0]))[8], p[8], l - 8) = 0)) then
+    begin
+      Result := i;
+      K := i + 1;
+      Exit;
+    end;
+  end;
+  Result := -1;
+end;
+
+{ The pointer of the member just named, and of its object. }
+procedure InMemberPath(var R: TJsonIn; out Path, Where: string);
+var
+  i: Int64;
+begin
+  if R.S = nil then
+    Path := NodePath(NodeAdd(PJNode(R.Name), 1))
+  else
+    Path := StPath(InP(R)^, True);
+  i := Length(Path);
+  while (i > 0) and (Path[i] <> '/') do
+    i := i - 1;
+  Where := Copy(Path, 1, i - 1);
+end;
+
+{ A member no field takes: an error with RejectUnknown (Go's
+  RejectUnknownMembers), else its value is read and left. }
+procedure PasJsonInUnknown(var R: TJsonIn);
+var
+  p, w, nm: string;
+  b: PByte;
+  n, off, line, col, i: Int64;
+begin
+  if not R.Reject then
+  begin
+    InNext(R);
+    Exit;
+  end;
+  InMemberPath(R, p, w);
+  InName(R, b, n);
+  nm := 'unknown member ' + GoQuoteStr(PasStrView(b, n));
+  if R.S = nil then
+    raise EJsonError.Create(jeUnknown, -1, 0, 0, p, w, nm);
+  off := InP(R)^.NameAt;
+  line := 1;
+  col := 1;
+  for i := 1 to off do
+    if R.Text[i] = #10 then
+    begin
+      line := line + 1;
+      col := 1;
+    end
+    else
+      col := col + 1;
+  raise EJsonError.Create(jeUnknown, off, line, col, p, w, nm);
+end;
+
+{ The error about the container whose mark is Mark, which was just
+  read: its place and its pointer. }
+procedure InMarkFail(var R: TJsonIn; Mark: Int64; Kind: TJsonErrorKind; const Path, Where,
+  Reason: string);
+var
+  off, line, col, i: Int64;
+begin
+  if R.S = nil then
+    raise EJsonError.Create(Kind, -1, 0, 0, Path, Where, Reason);
+  off := Mark;
+  line := 1;
+  col := 1;
+  for i := 1 to off do
+    if R.Text[i] = #10 then
+    begin
+      line := line + 1;
+      col := 1;
+    end
+    else
+      col := col + 1;
+  raise EJsonError.Create(Kind, off, line, col, Path, Where, Reason);
+end;
+
+function InMarkPath(var R: TJsonIn; Mark: Int64): string;
+begin
+  if R.S = nil then
+    Result := NodePath(PJNode(Mark))
+  else
+    Result := StPath(InP(R)^, True);
+end;
+
+{ A member json required asks for, not in the object just read. }
+procedure PasJsonInMissing(var R: TJsonIn; Mark: Int64; const Name: string);
+var
+  w: string;
+begin
+  w := InMarkPath(R, Mark);
+  InMarkFail(R, Mark, jeMissing, w + '/' + KeyToken(Name), w, 'missing member ' + GoQuoteStr(Name));
+end;
+
+{ A static array's length: the JSON array just read had Got elements,
+  and must have the Want it has, as Go's v2 asks of a Go array. }
+procedure PasJsonInLenEnd(var R: TJsonIn; Mark: Int64; Got, Want: Integer; const T: string);
+var
+  p: string;
+begin
+  if Got = Want then
+    Exit;
+  p := InMarkPath(R, Mark);
+  InMarkFail(R, Mark, jeType, p, p, 'cannot decode an array of ' + IntText(Got) + ' into ' + T +
+    ', which has ' + IntText(Want));
+end;
+
+{ The value just read, null, is no member of a set. }
+procedure PasJsonInBad(var R: TJsonIn; const T: string);
+begin
+  InKind(R, InLast(R), T);
+end;
+
+procedure PasJsonInTwice(var R: TJsonIn; const T: string);
+begin
+  InWhy(R, InLast(R), jeDuplicate, T, 'twice in the set');
+end;
+
+{ The member just named, for json unknown: its name and its value's
+  text, the value read. }
+procedure PasJsonInKeep(var R: TJsonIn; var K: TJsonKeep);
+var
+  b: PByte;
+  n, e, a: Int64;
+  v: string;
+  P: PJParse;
+begin
+  InName(R, b, n);
+  if K.N = Length(K.Names) then
+  begin
+    SetLength(K.Names, K.N * 2 + 4);
+    SetLength(K.Vals, K.N * 2 + 4);
+  end;
+  K.Names[K.N] := Copy(PasStrView(b, n), 1, n);
+  if R.S = nil then
+  begin
+    v := JsonWrite(PJNode(R.Cur), 0, '', False);
+    InNext(R);
+  end
+  else
+  begin
+    P := InP(R);
+    StPeek(P^, a);
+    if not StSkip(P^) then
+      InParseFail(R);
+    StPeek(P^, e);
+    v := Copy(R.Text, a + 1, e - a);
+  end;
+  K.Vals[K.N] := v;
+  K.N := K.N + 1;
+end;
+
+{ The object of the members a record's json unknown keeps: the ones K
+  holds, and with Merge first those of Old (an object, or null) that K
+  does not name again. Nil when there are none. Its text is written,
+  each value as it came, and parsed. }
+function PasJsonInKept(var R: TJsonIn; Mark: Int64; const K: TJsonKeep; Old: json): json;
+var
+  o, c: PJNode;
+  i, q: Int64;
+  again: Boolean;
+  p: string;
+  W: TJsonOut;
+begin
+  o := nil;
+  if R.Merge then
+    o := NodeOfJ(Old);
+  if (o <> nil) and ((o^.W0 and 7) = JtNull) then
+    o := nil;
+  if (o <> nil) and ((o^.W0 and 7) <> JtObj) then
+  begin
+    p := InMarkPath(R, Mark);
+    InMarkFail(R, Mark, jeType, p, p, 'json unknown keeps an object of members, not ' + KindName(o));
+  end;
+  if (K.N = 0) and ((o = nil) or ((o^.W0 shr 8) = 0)) then
+  begin
+    Result := nil;
+    Exit;
+  end;
+  PasJsonOutInit(W, JsonDefaults, 64);
+  PasJsonOutOpen(W, True);
+  if o <> nil then
+  begin
+    c := NodeAdd(o, 1);
+    for i := 1 to o^.W0 shr 8 do
+    begin
+      again := False;
+      for q := 0 to K.N - 1 do
+        if (Length(K.Names[q]) = StrLen(c)) and ((StrLen(c) = 0) or
+          (CompareByte(PByte(Pointer(K.Names[q]))^, StrBytes(c)^, StrLen(c)) = 0)) then
+          again := True;
+      if not again then
+      begin
+        PasJsonOutNameStr(W, Copy(PasStrView(StrBytes(c), StrLen(c)), 1, StrLen(c)));
+        PasJsonOutJson(W, JsonOfN(NodeAdd(c, 1)));
+      end;
+      c := NodeAdd(NodeAdd(c, 1), NodeSpan(NodeAdd(c, 1)));
+    end;
+  end;
+  for i := 0 to K.N - 1 do
+  begin
+    PasJsonOutNameStr(W, K.Names[i]);
+    PasJsonOutRaw(W, K.Vals[i]);
+  end;
+  PasJsonOutClose(W);
+  Result := JsonParse(PasJsonOutText(W, JsonDefaults), R.Opts);
+end;
+
+{ The next value as a json of its own: from text its text parsed, from
+  a json its subtree copied, the root of one shared. }
+function PasJsonInJson(var R: TJsonIn): json;
+var
+  a, e: Int64;
+  P: PJParse;
+begin
+  if R.S = nil then
+  begin
+    if PasJsonInNull(R) then
+      Result := nil
+    else
+    begin
+      Result := JsonCopy(PJNode(R.Cur));
+      InNext(R);
+    end;
+    Exit;
+  end;
+  P := InP(R);
+  StPeek(P^, a);
+  if not StSkip(P^) then
+    InParseFail(R);
+  if R.Text[a + 1] = 'n' then
+  begin
+    Result := nil;
+    Exit;
+  end;
+  StPeek(P^, e);
+  Result := JsonParse(Copy(R.Text, a + 1, e - a), R.Opts);
+end;
+
+{ The text of number node J, or of the number string J holds (json
+  quoted), at P and N; a node that is neither raises. }
+procedure NumIn(var R: TJsonIn; J: PJNode; Quoted: Boolean; const T: string; out P: PByte;
+  out N: Int64; out Sc: TPasNumScan);
+var
+  k: Int64;
+  tx: PByte;
+begin
+  k := J^.W0 and 7;
+  if Quoted then
+  begin
+    if k = JtNum then
+      InWhy(R, J, jeType, T, 'json quoted takes the number in a string');
+    if k <> JtStr then
+      InKind(R, J, T);
+    P := StrBytes(J);
+    N := StrLen(J);
+    if not WholeNumber(P, N, Sc) then
+      InWhy(R, J, jeType, T, 'not a number');
+    Exit;
+  end;
+  if k <> JtNum then
+    InKind(R, J, T);
+  tx := NumText(J);
+  P := @tx[9];
+  N := PInt64(tx)^;
+  if not PasNumScan(P, N, True, Sc) then
+    InWhy(R, J, jeType, T, 'not a number');
+end;
+
+function PasJsonInInt(var R: TJsonIn; Lo, Hi: Integer; const T: string): Integer;
+var
+  nd: PJNode;
+begin
+  nd := InNext(R);
+  Result := 0;
+  if nd = nil then
+    Exit;
+  if (nd^.W0 and 63) = (JtNum or JnInt or JnIntLit) then
+  begin
+    Result := nd^.W1;
+    if (Result >= Lo) and (Result <= Hi) then
+      Exit;
+    InWhy(R, nd, jeRange, T, 'out of range');
+  end;
+  case nd^.W0 and 7 of
+    JtNull:
+      Exit;
+    JtNum:
+      if (nd^.W0 and JnIntLit) = 0 then
+        InWhy(R, nd, jeType, T, 'not an integer')
+      else
+        InWhy(R, nd, jeRange, T, 'out of range');
+  end;
+  InKind(R, nd, T);
+end;
+
+{ json quoted: a string holding just an integer literal, as Go's v2
+  reads a quoted integer (jsonwire.ParseUint after an optional minus). }
+function PasJsonInIntQ(var R: TJsonIn; Lo, Hi: Integer; const T: string): Integer;
 var
   nd: PJNode;
   p: PByte;
   n: Int64;
   sc: TPasNumScan;
 begin
-  nd := PJNode(Name);
-  p := StrBytes(nd);
-  n := StrLen(nd);
+  nd := InNext(R);
   Result := 0;
-  if not WholeNumber(p, n, sc) or not sc.IntLit or ((n = 2) and (p[0] = 45) and (p[1] = 48)) then
-    NameFail(R, nd, jeType, T, 'not an integer');
+  if (nd = nil) or ((nd^.W0 and 7) = JtNull) then
+    Exit;
+  NumIn(R, nd, True, T, p, n, sc);
+  if not sc.IntLit then
+    InWhy(R, nd, jeType, T, 'not an integer');
   if not PasNumI64(p, sc, Result) or (Result < Lo) or (Result > Hi) then
-    NameFail(R, nd, jeRange, T, 'out of range');
+    InWhy(R, nd, jeRange, T, 'out of range');
 end;
 
-function PasJsonInNameChar(var R: TJsonIn; Name: Pointer; Lo, Hi: Integer; const T: string): Char;
+function PasJsonInBool(var R: TJsonIn): Boolean;
+var
+  nd: PJNode;
+begin
+  nd := InNext(R);
+  Result := False;
+  if nd = nil then
+    Exit;
+  case nd^.W0 and 7 of
+    JtNull, JtFalse:
+      Exit;
+    JtTrue:
+      Result := True;
+  else
+    InKind(R, nd, 'Boolean');
+  end;
+end;
+
+{ A Char: a string of one character of seven bits, as JsonEncode writes
+  one; Lo and Hi bound a subrange of Char. }
+function PasJsonInChar(var R: TJsonIn; Lo, Hi: Integer; const T: string): Char;
 var
   nd: PJNode;
   b: Integer;
 begin
-  nd := PJNode(Name);
+  nd := InNext(R);
+  Result := #0;
+  if (nd = nil) or ((nd^.W0 and 7) = JtNull) then
+    Exit;
+  if (nd^.W0 and 7) <> JtStr then
+    InKind(R, nd, T);
   if (StrLen(nd) <> 1) or (StrBytes(nd)^ > 127) then
-    NameFail(R, nd, jeType, T, 'not one character of seven bits');
+    InWhy(R, nd, jeType, T, 'not one character of seven bits');
   b := StrBytes(nd)^;
   if (b < Lo) or (b > Hi) then
-    NameFail(R, nd, jeRange, T, 'out of range');
+    InWhy(R, nd, jeRange, T, 'out of range');
   Result := Chr(b);
 end;
 
-function PasJsonInNameEnum(var R: TJsonIn; Name: Pointer; Names: Pointer; N, Lo, Hi: Integer;
-  const T: string): Integer;
+function PasJsonInEnum(var R: TJsonIn; Names: Pointer; N, Lo, Hi: Integer; const T: string): Integer;
 var
   nd: PJNode;
 begin
-  nd := PJNode(Name);
+  nd := InNext(R);
+  Result := 0;
+  if (nd = nil) or ((nd^.W0 and 7) = JtNull) then
+    Exit;
+  if (nd^.W0 and 7) <> JtStr then
+    InKind(R, nd, T);
   Result := EnumOf(StrBytes(nd), StrLen(nd), Names, N);
   if Result < 0 then
-    NameFail(R, nd, jeType, T, 'no such member');
+    InWhy(R, nd, jeType, T, 'no such member');
   if (Result < Lo) or (Result > Hi) then
-    NameFail(R, nd, jeRange, T, 'out of range');
+    InWhy(R, nd, jeRange, T, 'out of range');
 end;
 
-function PasJsonInNameBool(var R: TJsonIn; Name: Pointer; const T: string): Boolean;
+function PasJsonInF64(var R: TJsonIn; Quoted: Boolean; const T: string): Double;
 var
   nd: PJNode;
   p: PByte;
+  n, bits: Int64;
+  sc: TPasNumScan;
 begin
-  nd := PJNode(Name);
-  p := StrBytes(nd);
+  nd := InNext(R);
+  Result := 0;
+  if (nd = nil) or ((nd^.W0 and 7) = JtNull) then
+    Exit;
+  if not Quoted and ((nd^.W0 and 7) = JtNum) then
+  begin
+    if not NodeF64(nd, bits) then
+      InWhy(R, nd, jeRange, T, 'out of range');
+    Result := bits as Double;
+    Exit;
+  end;
+  NumIn(R, nd, Quoted, T, p, n, sc);
+  if not PasNumF64(p, sc, bits) then
+    InWhy(R, nd, jeRange, T, 'out of range');
+  Result := bits as Double;
+end;
+
+{ A Single rounded once from the text, as Go's ParseFloat(s, 32). }
+function PasJsonInF32(var R: TJsonIn; Quoted: Boolean; const T: string): Single;
+var
+  nd: PJNode;
+  p: PByte;
+  n, bits: Int64;
+  sc: TPasNumScan;
+begin
+  nd := InNext(R);
+  Result := 0;
+  if (nd = nil) or ((nd^.W0 and 7) = JtNull) then
+    Exit;
+  NumIn(R, nd, Quoted, T, p, n, sc);
+  bits := 0;
+  if not PasNumF32(p, sc, bits) then
+    InWhy(R, nd, jeRange, T, 'out of range');
+  Move(bits, Result, 4);
+end;
+
+{ A Quad, the binary128 nearest the text (pasfmt's PasParseQuad). }
+function PasJsonInQuad(var R: TJsonIn; Quoted: Boolean; const T: string): Quad;
+var
+  nd: PJNode;
+  p: PByte;
+  n, lo, hi: Int64;
+  sc: TPasNumScan;
+  w: array[0..1] of Int64;
+begin
+  nd := InNext(R);
+  w[0] := 0;
+  w[1] := 0;
+  if (nd <> nil) and ((nd^.W0 and 7) <> JtNull) then
+  begin
+    NumIn(R, nd, Quoted, T, p, n, sc);
+    lo := 0;
+    hi := 0;
+    PasParseQuad(BytesStr(p, n), lo, hi);
+    if ((hi shr 48) and $7FFF) = $7FFF then
+      InWhy(R, nd, jeRange, T, 'out of range');
+    w[0] := lo;
+    w[1] := hi;
+  end;
+  Move(w, Result, 16);
+end;
+
+function PasJsonInCur(var R: TJsonIn; Quoted: Boolean; const T: string): Currency;
+var
+  nd: PJNode;
+  p: PByte;
+  n, v: Int64;
+  sc: TPasNumScan;
+begin
+  nd := InNext(R);
+  v := 0;
+  if (nd <> nil) and ((nd^.W0 and 7) <> JtNull) then
+  begin
+    NumIn(R, nd, Quoted, T, p, n, sc);
+    case CurOf(p, n, v) of
+      1: InWhy(R, nd, jeRange, T, 'more than four places');
+      2: InWhy(R, nd, jeRange, T, 'out of range');
+    end;
+  end;
+  Result := v as Currency;
+end;
+
+function PasJsonInTime(var R: TJsonIn; const T: string): Double;
+var
+  nd: PJNode;
+begin
+  nd := InNext(R);
+  Result := 0;
+  if (nd = nil) or ((nd^.W0 and 7) = JtNull) then
+    Exit;
+  if (nd^.W0 and 7) <> JtStr then
+    InKind(R, nd, T);
+  case TimeOf(StrBytes(nd), StrLen(nd), Result) of
+    0: InWhy(R, nd, jeType, T, 'not RFC 3339');
+    1: InWhy(R, nd, jeRange, T, 'out of range');
+  end;
+end;
+
+function PasJsonInStr(var R: TJsonIn; const T: string): string;
+var
+  nd: PJNode;
+  n: Int64;
+begin
+  nd := InNext(R);
+  Result := '';
+  if (nd = nil) or ((nd^.W0 and 7) = JtNull) then
+    Exit;
+  if (nd^.W0 and 7) <> JtStr then
+    InKind(R, nd, T);
+  n := StrLen(nd);
+  if n > 0 then
+  begin
+    SetLength(Result, n);
+    Move(StrBytes(nd)^, PByte(Pointer(Result))^, n);
+  end;
+end;
+
+{ Bytes: the next value, base64, read; the count of its bytes, which
+  PasJsonInB64To then writes before the cursor moves again. }
+function PasJsonInB64Len(var R: TJsonIn; const T: string): Integer;
+var
+  nd: PJNode;
+begin
+  nd := InNext(R);
+  Result := 0;
+  if (nd = nil) or ((nd^.W0 and 7) = JtNull) then
+    Exit;
+  if (nd^.W0 and 7) <> JtStr then
+    InKind(R, nd, T);
+  Result := B64Count(StrBytes(nd), StrLen(nd));
+  if Result < 0 then
+    InWhy(R, nd, jeType, T, 'not base64 (RFC 4648)');
+end;
+
+procedure PasJsonInB64To(var R: TJsonIn; P: Pointer);
+var
+  nd: PJNode;
+begin
+  nd := InLast(R);
+  B64Decode(StrBytes(nd), StrLen(nd), PByte(P));
+end;
+
+{ A static array of bytes: base64 of exactly its N bytes, as Go's v2
+  asks of a [N]byte; null its zeros. P nil only checks. }
+procedure PasJsonInB64Fixed(var R: TJsonIn; P: Pointer; N: Integer; const T: string);
+var
+  k: Integer;
+  nd: PJNode;
+begin
+  k := PasJsonInB64Len(R, T);
+  nd := InLast(R);
+  if (nd = nil) or ((nd^.W0 and 7) = JtNull) then
+  begin
+    if P <> nil then
+      FillChar(PByte(P)^, N, 0);
+    Exit;
+  end;
+  if k <> N then
+    InWhy(R, nd, jeType, T, IntText(k) + ' bytes for ' + IntText(N));
+  if (N > 0) and (P <> nil) then
+    PasJsonInB64To(R, P);
+end;
+
+{ ---- a map's or a tree's keys, from the name just read ---- }
+
+function PasJsonInKeyStr(var R: TJsonIn): string;
+var
+  b: PByte;
+  n: Int64;
+begin
+  InName(R, b, n);
+  Result := '';
+  if n > 0 then
+  begin
+    SetLength(Result, n);
+    Move(b^, PByte(Pointer(Result))^, n);
+  end;
+end;
+
+procedure KeyFail(var R: TJsonIn; Kind: TJsonErrorKind; const T, Why: string);
+var
+  p, w, why2: string;
+  b: PByte;
+  n, off, line, col, i: Int64;
+begin
+  InMemberPath(R, p, w);
+  InName(R, b, n);
+  why2 := '';
+  if Why <> '' then
+    why2 := ': ' + Why;
+  w := 'cannot decode the name ' + GoQuoteStr(PasStrView(b, n)) + ' into ' + T + why2;
+  if R.S = nil then
+    raise EJsonError.Create(Kind, -1, 0, 0, p, p, w);
+  off := InP(R)^.NameAt;
+  line := 1;
+  col := 1;
+  for i := 1 to off do
+    if R.Text[i] = #10 then
+    begin
+      line := line + 1;
+      col := 1;
+    end
+    else
+      col := col + 1;
+  raise EJsonError.Create(Kind, off, line, col, p, p, w);
+end;
+
+{ An integer's name: its decimal digits as JsonEncode writes them, a
+  minus only before one that is not 0 and no 0 before another digit, so
+  each key has one name and two names are never one key. }
+function PasJsonInKeyInt(var R: TJsonIn; Lo, Hi: Integer; const T: string): Integer;
+var
+  p: PByte;
+  n: Int64;
+  sc: TPasNumScan;
+begin
+  InName(R, p, n);
+  Result := 0;
+  if not WholeNumber(p, n, sc) or not sc.IntLit or ((n = 2) and (p[0] = 45) and (p[1] = 48)) then
+    KeyFail(R, jeType, T, 'not an integer');
+  if not PasNumI64(p, sc, Result) or (Result < Lo) or (Result > Hi) then
+    KeyFail(R, jeRange, T, 'out of range');
+end;
+
+function PasJsonInKeyChar(var R: TJsonIn; Lo, Hi: Integer; const T: string): Char;
+var
+  p: PByte;
+  n: Int64;
+begin
+  InName(R, p, n);
+  if (n <> 1) or (p^ > 127) then
+    KeyFail(R, jeType, T, 'not one character of seven bits');
+  if (p^ < Lo) or (p^ > Hi) then
+    KeyFail(R, jeRange, T, 'out of range');
+  Result := Chr(p^);
+end;
+
+function PasJsonInKeyEnum(var R: TJsonIn; Names: Pointer; N, Lo, Hi: Integer;
+  const T: string): Integer;
+var
+  p: PByte;
+  l: Int64;
+begin
+  InName(R, p, l);
+  Result := EnumOf(p, l, Names, N);
+  if Result < 0 then
+    KeyFail(R, jeType, T, 'no such member');
+  if (Result < Lo) or (Result > Hi) then
+    KeyFail(R, jeRange, T, 'out of range');
+end;
+
+function PasJsonInKeyBool(var R: TJsonIn; const T: string): Boolean;
+var
+  p: PByte;
+  n: Int64;
+begin
+  InName(R, p, n);
   Result := False;
-  if PasStrView(p, StrLen(nd)) = 'true' then
+  if PasStrView(p, n) = 'true' then
     Result := True
-  else if PasStrView(p, StrLen(nd)) <> 'false' then
-    NameFail(R, nd, jeType, T, '');
+  else if PasStrView(p, n) <> 'false' then
+    KeyFail(R, jeType, T, '');
 end;
 {$endif}
 

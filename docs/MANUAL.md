@@ -6136,10 +6136,21 @@ second text into each value with `Merge` and refuses a text with a
 member of another kind, as Go's `v2` does, line for line on both
 machines; `testdata/jsonbind2` and `jsonbind3` hold the rest, among it a
 list 5000 deep read in a new routine and one document read by 16 at
-once. Reading 20000 records twenty times takes 0.74 of the time of Go's
-`v2` and 0.66 of `v1` (`scripts/bench/b36unbind`); the document the text
-is parsed into first makes its memory 2.6 times Go's, which P280 takes
-away.
+once.
+
+Text is read a token at a time, as Go's `jsontext.Decoder` reads it,
+with no document made (1.1.134): the same index as a parse, a window at
+a time, the names of the open objects kept to tell a name twice, a
+string with no escape taken where it lies in the text, an array
+reserved at its length, counted on the index before it is read. Its
+errors are a parse's, the first one in the text's order: `check_json`
+reads each of its 20421 documents both ways and wants the same error,
+place and pointer, or the same value. Reading 20000 records twenty times
+takes 0.77 of the time of Go's `v2` and 0.70 of `v1`, 0.80 and 0.73
+with `-cpu base` (`scripts/bench/b36unbind`); its peak is 55 MB against
+Go's 40, from the size of the data itself (a map of three entries 400
+bytes against 265, a short string a block of its own, a slice's
+frontier), which P285 to P287 take on.
 
 ### Speed
 

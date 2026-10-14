@@ -732,8 +732,13 @@ directive after its type, its name and options (`omitzero`, `omitempty`,
 `JsonDecode(src, x)` and `TryJsonDecode` (P206) read text or a json
 into a variable of any type with a JSON form through a decoder the
 compiler writes the same way (`$jdec`), over pasjson's `TJsonIn` and its
-`PasJsonIn` words, which read a node of the document into the type or
-raise `EJsonError` with its pointer and its place in the text. The
+`PasJsonIn` words, which read the next value of a cursor into the type
+or raise `EJsonError` with its pointer and its place in the text. The
+cursor reads a json's nodes, or the text itself a token at a time with
+no document (P280): the parser's record in a stream mode, a scratch
+node for the scalar just read, the names of the open objects back to
+back in its arena for the twin check, the parser's own routines and
+errors. The
 entry reads into a hidden variable and assigns it once, so a decode
 that fails changes nothing; with `Merge` a check (`$jchk`) reads the
 whole document first, writing nothing and running no code of the

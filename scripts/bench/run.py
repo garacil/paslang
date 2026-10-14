@@ -164,9 +164,11 @@ BUDGET.update({"b34json:parse": 0.70, "b34json:parse1": 0.40, "b34json:compact":
 BUDGET.update({"b35bind:marshal": 0.88, "b35bind:marshal1": 0.88, "b35bind:indent": 0.82,
                "b35bind:indent1": 0.78})
 # P206: typed JSON read; measured 0.74/0.78 (native/base) of Go's v2, 0.66/0.69
-# of v1. Its peak memory is 2.6 times Go's (the document the text is parsed
-# into before it is read): P280 reads the text without one.
-BUDGET.update({"b36unbind:unmarshal": 0.86, "b36unbind:unmarshal1": 0.78})
+# of v1, its peak 2.6 times Go's (the document the text was parsed into).
+# P280 reads the text a token at a time with no document: 0.77/0.80 of v2,
+# 0.70/0.73 of v1, the peak 55 MB against Go's 40, now the data's own size
+# (P285 to P287).
+BUDGET.update({"b36unbind:unmarshal": 0.88, "b36unbind:unmarshal1": 0.81})
 # paslangc -checkptr / the plain build, per pair in CHECKPTR (P104).
 CHECKPTR_BUDGET = {"b8ptr": 10.0}
 # Peak resident memory, paslang / Go, the medians of MEM_RUNS traced runs:

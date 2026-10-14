@@ -237,6 +237,14 @@ def main():
             bad += 1
             if bad < 10:
                 print('index and plain differ on %r: %s' % (d[:80], l))
+    # the reader of a typed decode, a token at a time (P280), gives the
+    # parse's errors and values
+    same = run(pas, 'D', docs)
+    for d, l in zip(docs, same):
+        if l != 'same':
+            bad += 1
+            if bad < 20:
+                print('the parse and the decode differ on %r: %s' % (d[:80], l))
     got = {}
     for mode in 'pic':
         got[mode] = run(pas, mode, docs)
