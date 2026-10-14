@@ -10484,13 +10484,19 @@ leave it unchanged.
 **Whole contents with a budget.** `TryReadFileAt(base, path, maxBytes,
 out bytes, out error)` owns/closes its opened handle.
 `TryReadFileContents(handle, maxBytes, ...)` borrows the handle and
-advances its position without closing it. Neither trusts stat size:
-proc files reporting zero can still contain data. EOF at the exact
-budget is accepted; one-byte probing detects excess and returns EFBIG
-with an empty result, not silently truncated data. A negative budget is
+advances its position without closing it. Both read into the result
+itself as Go's `os.ReadFile` does: room for the size the system gives
+(less the handle's place) and one byte more, so a regular file is one
+read and a second that finds the end; at least 512 bytes, doubling,
+since a file of `/proc` says it is 0 bytes long and has data. The size
+is only room: the read goes on to the end whatever it said. EOF at the
+exact budget is accepted; the room is at most one byte past the budget,
+and that byte detects excess and returns EFBIG with an empty result,
+not silently truncated data. A negative budget is
 invalid. `GetFileContents(path/handle, maxBytes)` and
 `GetFileAsString(path, maxBytes)` raise contextual `EOSError` on failure;
-the string form preserves the bytes. `TryWriteFileAt(base, path, bytes,
+the string form preserves the bytes and reads them into the string
+where they stay. `TryWriteFileAt(base, path, bytes,
 rights, out error)` writes all bytes and closes, also for an empty file.
 It is not an atomic transaction: a write failure may leave a partial
 file. Every mutable buffer has one owner during an operation.

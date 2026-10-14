@@ -6646,15 +6646,56 @@ begin
   else Result := CompatibilityResult(0);
 end;
 
-{ Current Go os/file.go readFileContents grows incrementally and does
-  not trust stat's size (proc files can report zero). Require a byte
-  budget and probe only one byte beyond it, returning EFBIG explicitly.
-  A separate fixed read buffer avoids tiny /proc reads except when the
-  caller's remaining budget itself is tiny. Errors discard the partial
-  result; borrowed Handle remains open and its position advances. }
-function TryReadFileContents(Handle: THandle; MaxBytes: Integer;
+{ A whole file into memory as current Go's os.ReadFile reads it
+  (os/file.go, readFileContents; P276): room for the size statx gives,
+  less the handle's place when it was not just opened, and one byte
+  more, so a regular file is one read and a second that finds the end;
+  at least 512 bytes, since a file of /proc says 0 and reads badly in
+  small pieces; the room doubles when it fills (a pipe, a file that
+  grew). The size is only room: the read goes on to the end whatever it
+  said. The bytes go straight into the result through PasIoRead (EINTR
+  again, EAGAIN parks). A budget: at most MaxBytes, the room at most
+  MaxBytes + 1, so one byte past it tells EFBIG. Errors discard the
+  partial result; a borrowed Handle stays open and its place advances.
+  Before, 8 KiB a read through a buffer of its own and a copy of each
+  piece: 238 reads for 1.9 MB where Go makes two. }
+function ContentsHint(Handle: THandle; Fresh: Boolean): Integer;
+var info: TFileInfo; error: TSysError; here: Integer;
+begin
+  Result := 0;
+  if not TryHandleInfo(Handle, info, error) or not info.Has(fiSize) or
+    (info.Size <= 0) then Exit;
+  Result := info.Size;
+  if Fresh then Exit;
+  { lseek, not FileSeek: the last OS error is the caller's to keep }
+  repeat
+    here := Syscall(SystemNumber(8, 62), Handle, 0, 1);
+  until here <> -4;
+  if (here < 0) or (here >= Result) then Result := 0
+  else Result := Result - here;
+end;
+
+{ The first room (Room 0), and the next when the read fills Room: twice
+  as much, at most MaxBytes + 1. No sum overflows: a size of the largest
+  Integer gives 512, as Go's size + 1 does when it wraps. }
+function ContentsRoom(Hint, Room, MaxBytes: Integer): Integer;
+var limit: Integer;
+begin
+  limit := MaxBytes;
+  if MaxBytes < High(Integer) then limit := MaxBytes + 1;
+  if Room = 0 then
+  begin
+    Result := 512;
+    if (Hint >= 512) and (Hint < High(Integer)) then Result := Hint + 1;
+  end
+  else if Room <= limit - Room then Result := Room * 2
+  else Result := limit;
+  if Result > limit then Result := limit;
+end;
+
+function ReadContents(Handle: THandle; MaxBytes: Integer; Fresh: Boolean;
   out Contents: TBytes; out Error: TSysError): Boolean;
-var chunk: TBytes; used, want, transferred, capacity, needed: Integer;
+var used, room, hint, transferred: Integer;
 begin
   Contents := nil;
   SystemError(Error, 0, 'read contents', '');
@@ -6664,40 +6705,91 @@ begin
     Error.Code := 22;
     Exit;
   end;
-  SetLength(chunk, 8192);
+  hint := ContentsHint(Handle, Fresh);
+  room := ContentsRoom(hint, 0, MaxBytes);
+  SetLength(Contents, room);
   used := 0;
-  capacity := 0;
   while True do
   begin
-    want := Length(chunk);
-    if MaxBytes - used < want then want := MaxBytes - used + 1;
-    if not TryFileRead(Handle, chunk, 0, want, transferred, Error) then Break;
+    if used = room then
+    begin
+      room := ContentsRoom(hint, room, MaxBytes);
+      SetLength(Contents, room);
+    end;
+    if not TryFileRead(Handle, Contents, used, room - used, transferred, Error) then Break;
     if transferred = 0 then
     begin
       SetLength(Contents, used);
       Result := True;
       Exit;
     end;
-    if transferred > MaxBytes - used then
+    used := used + transferred;
+    if used > MaxBytes then
     begin
       Error.Code := 27;
       Break;
     end;
-    needed := used + transferred;
-    if needed > capacity then
-    begin
-      if capacity = 0 then capacity := Length(chunk)
-      else if capacity > MaxBytes div 2 then capacity := MaxBytes
-      else capacity := capacity * 2;
-      if capacity > MaxBytes then capacity := MaxBytes;
-      if capacity < needed then capacity := needed;
-      SetLength(Contents, capacity);
-    end;
-    Move(chunk[0], Contents[used], transferred);
-    used := needed;
   end;
   Contents := nil;
   Error.Operation := 'read contents';
+end;
+
+{ The same into a string, for GetFileAsString: the bytes are read
+  where they stay, not copied once more out of a TBytes. }
+function ReadContentsText(Handle: THandle; MaxBytes: Integer;
+  out Text: string; out Error: TSysError): Boolean;
+var used, room, hint, transferred: Integer;
+begin
+  Text := '';
+  SystemError(Error, 0, 'read contents', '');
+  Result := False;
+  if MaxBytes < 0 then
+  begin
+    Error.Code := 22;
+    Exit;
+  end;
+  if not ValidFileHandle(Handle) then
+  begin
+    Error.Code := 9;
+    Exit;
+  end;
+  hint := ContentsHint(Handle, True);
+  room := ContentsRoom(hint, 0, MaxBytes);
+  SetLength(Text, room);
+  used := 0;
+  while True do
+  begin
+    if used = room then
+    begin
+      room := ContentsRoom(hint, room, MaxBytes);
+      SetLength(Text, room);
+    end;
+    transferred := PasIoRead(Handle, @Text[used + 1], room - used, 0);
+    if transferred < 0 then
+    begin
+      Error.Code := -transferred;
+      Break;
+    end;
+    if transferred = 0 then
+    begin
+      SetLength(Text, used);
+      Result := True;
+      Exit;
+    end;
+    used := used + transferred;
+    if used > MaxBytes then
+    begin
+      Error.Code := 27;
+      Break;
+    end;
+  end;
+  Text := '';
+end;
+
+function TryReadFileContents(Handle: THandle; MaxBytes: Integer;
+  out Contents: TBytes; out Error: TSysError): Boolean;
+begin
+  Result := ReadContents(Handle, MaxBytes, False, Contents, Error);
 end;
 
 function TryReadFileAt(DirectoryHandle: THandle; const Path: string; MaxBytes: Integer;
@@ -6713,7 +6805,7 @@ begin
   end;
   if not TryOpenFileAt(DirectoryHandle, Path, ORdonly, 0, handle, Error) then Exit;
   try
-    Result := TryReadFileContents(handle, MaxBytes, Contents, Error);
+    Result := ReadContents(handle, MaxBytes, True, Contents, Error);
   finally
     if not TryFileClose(handle, closeError) and Result then
     begin
@@ -6770,8 +6862,21 @@ begin
 end;
 
 function GetFileAsString(const FileName: string; MaxBytes: Integer): string;
+var handle: THandle; error, closeError: TSysError; ok: Boolean;
 begin
-  Result := StringOf(GetFileContents(FileName, MaxBytes));
+  Result := '';
+  if MaxBytes < 0 then SystemError(error, 22, 'read contents', FileName)
+  else if TryOpenFileAt(CurrentDirectoryHandle, FileName, ORdonly, 0, handle, error) then
+  begin
+    ok := ReadContentsText(handle, MaxBytes, Result, error);
+    if not TryFileClose(handle, closeError) and ok then
+    begin
+      Result := '';
+      error := closeError;
+    end;
+    error.Path := FileName;
+  end;
+  error.RaiseError;
 end;
 
 { ==== paths (P130) ==== }

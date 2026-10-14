@@ -240,6 +240,11 @@ GOLDEN_A64 += readwhole
 # through a variable another var parameter is given stays a call.
 GOLDEN += inlinevar
 GOLDEN_A64 += inlinevar
+# P276: SysUtils reads a whole file into the result itself: lengths about
+# 512 and 4096 and some MB, budgets either side, a handle in the middle,
+# GetFileAsString, /proc, a pipe a routine writes.
+GOLDEN += syswhole
+GOLDEN_A64 += syswhole
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a

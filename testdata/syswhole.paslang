@@ -1,0 +1,174 @@
+{ P276: SysUtils reads a whole file into the result itself, with room
+  for the size the system gives and one byte more, at most the budget
+  and one byte more. Every length about 512 and 4096 and some MB, each
+  with a budget of its size, one less (EFBIG), one more, none and the
+  largest; a handle that stands in the middle; GetFileAsString; a file
+  of /proc, which says it is 0 bytes long; a pipe a routine writes, with
+  and without enough budget; a directory and a missing file. }
+program syswhole;
+
+uses
+  sysutils, paslinux;
+
+const
+  Count = 11;
+
+var
+  sizes: array[0..Count - 1] of Integer;
+  pipeEnds: array[0..1] of Int32;
+  i: Integer;
+  want, got: TBytes;
+  text, path: string;
+  error: TSysError;
+  handle: THandle;
+  done: waitgroup;
+
+function Pattern(N: Integer): TBytes;
+var
+  i: Integer;
+begin
+  Result := nil;
+  SetLength(Result, N);
+  for i := 0 to N - 1 do
+    Result[i] := Byte((i * 7 + i shr 9) mod 251);
+end;
+
+function Same(const A, B: TBytes): string;
+var
+  i: Integer;
+begin
+  Result := 'same';
+  if Length(A) <> Length(B) then
+    Result := 'DIFFERENT'
+  else
+    for i := 0 to High(A) do
+      if A[i] <> B[i] then
+      begin
+        Result := 'DIFFERENT';
+        Exit;
+      end;
+end;
+
+{ What a read with budget Budget answers: ok and the length, or the error. }
+function Attempt(const Path: string; Budget: Integer): string;
+var
+  bytes: TBytes;
+  e: TSysError;
+begin
+  if TryReadFileAt(CurrentDirectoryHandle, Path, Budget, bytes, e) then
+    Result := 'ok ' + IntToStr(Length(bytes))
+  else
+    Result := 'error ' + IntToStr(e.Code) + ' ' + IntToStr(Length(bytes));
+end;
+
+procedure Writer;
+var
+  bytes: TBytes;
+  e: TSysError;
+  n, k: Integer;
+begin
+  bytes := Pattern(300007);
+  n := 0;
+  while n < Length(bytes) do
+  begin
+    if not TryFileWrite(pipeEnds[1], bytes, n, Length(bytes) - n, k, e) then
+      Halt(3);
+    n := n + k;
+  end;
+  FileClose(pipeEnds[1]);
+  done.Done;
+end;
+
+begin
+  sizes[0] := 0;
+  sizes[1] := 1;
+  sizes[2] := 511;
+  sizes[3] := 512;
+  sizes[4] := 513;
+  sizes[5] := 4095;
+  sizes[6] := 4096;
+  sizes[7] := 4097;
+  sizes[8] := 65537;
+  sizes[9] := 1048576;
+  sizes[10] := 3000007;
+  for i := 0 to Count - 1 do
+  begin
+    want := Pattern(sizes[i]);
+    path := 'build/syswhole-' + IntToStr(sizes[i]) + '.bin';
+    if not TryWriteFileAt(CurrentDirectoryHandle, path, want, 420, error) then
+      Halt(1);
+    got := nil;
+    if not TryReadFileAt(CurrentDirectoryHandle, path, sizes[i], got, error) then
+      Halt(2);
+    text := GetFileAsString(path, sizes[i]);
+    WriteLn(sizes[i], ': ', Same(got, want), ' ', Same(BytesOf(text), want),
+      ' | ', Attempt(path, sizes[i] - 1), ' | ', Attempt(path, sizes[i] + 1),
+      ' | ', Attempt(path, 0), ' | ', Attempt(path, High(Integer)));
+  end;
+
+  { a handle that stands in the middle reads the rest, and keeps its
+    place at the end }
+  want := Pattern(3000007);
+  if not TryOpenFileAt(CurrentDirectoryHandle, 'build/syswhole-3000007.bin', ORdonly, 0,
+    handle, error) then
+    Halt(4);
+  FileSeek(handle, 2999000, fsFromBeginning);
+  got := GetFileContents(handle, 1007);
+  WriteLn('from 2999000: ', Length(got), ' ', Same(got, Copy(want, 2999000, 1007)), ' ',
+    FileSeek(handle, 0, fsFromCurrent));
+  got := GetFileContents(handle, 0);
+  WriteLn('at the end: ', Length(got));
+  FileSeek(handle, 1000, fsFromBeginning);
+  WriteLn('from 1000 with a budget short by one: ',
+    not TryReadFileContents(handle, 3000007 - 1000 - 1, got, error), ' ', error.Code, ' ',
+    Length(got));
+  FileClose(handle);
+
+  { /proc says 0 and has more than 512 bytes }
+  text := GetFileAsString('/proc/self/status', 1048576);
+  WriteLn('proc: ', Copy(text, 1, 5), ' ', Length(text) > 512, ' ', Pos('Pid:', text) > 0);
+  WriteLn('proc short: ', Attempt('/proc/self/status', 10));
+
+  { a pipe a routine writes: all of it, then too little budget }
+  if OsPipe(Integer(@pipeEnds[0])) <> 0 then
+    Halt(5);
+  done.Add(1);
+  pas Writer;
+  if not TryReadFileContents(pipeEnds[0], 300007, got, error) then
+    Halt(6);
+  done.Wait;
+  FileClose(pipeEnds[0]);
+  WriteLn('pipe: ', Length(got), ' ', Same(got, Pattern(300007)));
+  if OsPipe(Integer(@pipeEnds[0])) <> 0 then
+    Halt(7);
+  done.Add(1);
+  pas Writer;
+  WriteLn('pipe short: ', not TryReadFileContents(pipeEnds[0], 300006, got, error), ' ',
+    error.Code, ' ', Length(got));
+  FileClose(pipeEnds[0]);
+  done.Wait;
+
+  { a directory and a missing file }
+  WriteLn('directory: ', Attempt('build', 100));
+  WriteLn('missing: ', Attempt('build/syswhole-not-there.bin', 100));
+  try
+    text := GetFileAsString('build/syswhole-not-there.bin', 100);
+    WriteLn('missing as string: read');
+  except
+    on e: EOSError do
+      WriteLn('missing as string: ', e.ErrorCode);
+  end;
+  try
+    text := GetFileAsString('build/syswhole-1.bin', 0);
+    WriteLn('too long as string: read');
+  except
+    on e: EOSError do
+      WriteLn('too long as string: ', e.ErrorCode);
+  end;
+end.
+
+{ This file is part of paslang's tests.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+  paslang is free software under the GNU General Public License,
+  version 3 or (at your option) any later version; see the file
+  COPYING. It comes with ABSOLUTELY NO WARRANTY. }
