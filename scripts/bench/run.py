@@ -70,7 +70,9 @@ PAIRS = ["b1loop", "b2str", "b3spawn", "b4chan", "b5map", "b6smap", "b7narrow", 
          "b20hash", "b21text", "b22rand", "b23date", "b24math", "b25exec", "b26slice", "b27call",
          "b28stack", "b29exc", "b30gc", "b31map", "b32fs",
          # P201: UTF-8 validation (PasUtf8Valid against unicode/utf8.Valid)
-         "b33utf8"]
+         "b33utf8",
+         # P203: JSON (the json type against encoding/json v2 and v1) on Go's corpus
+         "b34json"]
 # The longest one run may take, in seconds: a run past it is killed, its
 # unit stops being measured and fails (Go's side of every pair takes
 # under 1 s; paslang's append of a character, quadratic until its hito,
@@ -101,6 +103,7 @@ SECTIONS = {
     "b31map": ["iter", "delete", "update"],
     "b32fs": ["stat", "list"],
     "b33utf8": ["ascii", "mixed"],
+    "b34json": ["parse", "parse1", "compact", "compact1", "pretty", "pretty1", "canonical"],
 }
 CHECKPTR = ["b8ptr"]
 PROBES = ["p1alloccap", "p2deeprec", "p3divzero", "p4nil", "p5bounds", "p6strbounds", "p7parked"]
@@ -141,6 +144,15 @@ BUDGET.update({"b13strw:upper": 0.10, "b13strw:lower": 0.10, "b13strw:equalfold"
 # 0.767 with -cpu base (twenty alternating rounds), 19.7 MB at the peak
 # against Go's 51.4.
 BUDGET["b13strw:concat"] = 0.90
+# P203 (1.1.124): the json type on Go's corpus, seven alternating rounds,
+# native and base, against encoding/json v2 (and v1 for the sections that
+# end in 1): parse 0.560/0.613, parse1 0.279/0.306, compact 0.380/0.396,
+# compact1 0.304/0.316, pretty 0.372/0.374, pretty1 0.269/0.262,
+# canonical 0.946/0.957 (Go's jsontext.Value.Canonicalize); the peak
+# memory 0.93, 0.92, 0.63, 0.61, 0.58, 0.50 and 0.85 of Go's.
+BUDGET.update({"b34json:parse": 0.70, "b34json:parse1": 0.40, "b34json:compact": 0.50,
+               "b34json:compact1": 0.40, "b34json:pretty": 0.45, "b34json:pretty1": 0.35,
+               "b34json:canonical": 0.98})
 # paslangc -checkptr / the plain build, per pair in CHECKPTR (P104).
 CHECKPTR_BUDGET = {"b8ptr": 10.0}
 # Peak resident memory, paslang / Go, the medians of MEM_RUNS traced runs:
@@ -163,6 +175,21 @@ def sh(cmd, env=None, cwd=ROOT):
 def pl_path(name, cpu, ext=".pl"):
     """The paslang build of a pair for a processor: NAME.pl for native, NAME.base.pl for base."""
     return os.path.join(OUT, name + ("" if cpu == "native" else "." + cpu) + ext)
+
+
+def prepare():
+    """What a pair reads besides itself: b34json, Go's JSON corpus
+    (testdata/json/corpus, zstd) as plain files in build/bench/json, read
+    with Python's compression.zstd (a test tool)."""
+    import compression.zstd
+    d = os.path.join(OUT, "json")
+    os.makedirs(d, exist_ok=True)
+    for f in sorted(os.listdir(os.path.join(ROOT, "testdata", "json", "corpus"))):
+        if f.endswith(".json.zst"):
+            with open(os.path.join(ROOT, "testdata", "json", "corpus", f), "rb") as g:
+                data = compression.zstd.decompress(g.read())
+            with open(os.path.join(d, f[:-4]), "wb") as h:
+                h.write(data)
 
 
 def build(name, go=True, cpu="native"):
@@ -376,6 +403,7 @@ def main():
         probes()
         return
     bad = 0
+    prepare()
     print(f"{'pair':14s} {'cpu':6s} {'go s':>7s} {'paslang s':>10s} {'ratio':>6s} {'budget':>7s} "
           f"{'go MB':>6s} {'pl MB':>6s} {'mem':>5s}  same output")
     for cpu in cpus:

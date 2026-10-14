@@ -25,15 +25,17 @@ Contents
 9. Errors: raise, try, finally
 10. Routines that run concurrently: pas, channels, select
 11. Maps
-12. Sync: mutex, rwmutex, waitgroup, cond, once
-13. Strings and hashing
-14. Reals and the calculation set
-15. The core library and pasnet
-16. The clock, chance and order
-17. The runtime model
-18. Limits and differences from other Pascals
-19. Reserved words
-20. Command reference
+12. JSON
+13. Sync: mutex, rwmutex, waitgroup, cond, once
+14. Strings and hashing
+15. Reals and the calculation set
+16. The core library and pasnet
+17. The clock, chance and order
+18. SysUtils
+19. The runtime model
+20. Limits and differences from other Pascals
+21. Reserved words
+22. Command reference
 
 ## 1. Getting started
 
@@ -45,7 +47,7 @@ make install    # optional: puts paslangc, pasdbg and lib/paslang under /usr/loc
 ```
 
 `make` builds paslangc for the processor of the machine that builds it,
-as paslangc compiles every program (`-cpu`, §21; 1.1.115):
+as paslangc compiles every program (`-cpu`, §22; 1.1.115):
 `make SELF_CPU=base` builds one that runs on any machine of its kind,
 and the archives of a release carry compilers built for `base`.
 
@@ -91,14 +93,14 @@ in a unit's implementation is another variable. A name the program
 declares hides the one of that name a unit it uses declares, whatever
 the kind of either, and a variable or a parameter of a routine hides it
 inside the routine; the unit's name still reaches it (`geometry.Area`),
-and a later unit in `uses` hides an earlier one's the same way (§19).
+and a later unit in `uses` hides an earlier one's the same way (§20).
 
 A unit is how a program of your own is split into parts. What the
 language itself provides (strings, maps, trees, heaps, the store, the
 hash words, the rotations, the sync types, the calculation set, the
 collector, `TObject`) is in the language and needs no `uses`: it is
 written as ten core units that every program links without naming
-them (§15).
+them (§16).
 The unit below is a programmer's own:
 
 `examples/units/geometry.paslang`:
@@ -185,7 +187,7 @@ prints), `passtr` (the string words), `pashash` (the hash words) and
 names in every program; `pasnum` (numbers as text), `pasmap` (the hash
 map), `pasheap` (the heap and the collector), `pasquad` (`Quad`) and
 `pasjson` (JSON's scans) are only linked. Of each unit only the routines
-the program reaches stay in it (§21). Section 15 describes them.
+the program reaches stay in it (§22). Section 16 describes them.
 
 ### Packages
 
@@ -228,13 +230,13 @@ the names Free Pascal uses: `CPUX86_64` and `CPUAMD64` on amd64,
 {$endif}
 ```
 
-The processor the code is compiled for (`-cpu`, §21) names its
+The processor the code is compiled for (`-cpu`, §22) names its
 features too: `CPU_AVX2`, `CPU_SSE42`, `CPU_BMI1`, `CPU_SHA2` on amd64,
 `CPU_CRC32`, `CPU_AES`, `CPU_PMULL`, `CPU_SHA2` on arm64, one for every
 feature name `-cpu` takes, each defined when that processor has it. A
 unit or a program chooses its bodies with them when it is compiled, as
 the language's own words choose their kernels, and nothing is tested at
-run time; a unit's build for a level (§21) takes that level's (1.1.23,
+run time; a unit's build for a level (§22) takes that level's (1.1.23,
 P148):
 
 ```
@@ -247,7 +249,7 @@ P148):
 
 The code says its processor itself with `{$CPU spec}` and `{$TUNE
 name}` (1.1.114, P261), which take the place of `-cpu` and `-tune`
-(§21) from where they stand: `spec` is what `-cpu` takes (a processor
+(§22) from where they stand: `spec` is what `-cpu` takes (a processor
 by name, a level, features joined by `+`, `native`, `base`, `max`), and
 `name` a processor of the target, `native` or `generic`. A routine is
 compiled for the processor in force where its body begins, and the
@@ -414,15 +416,15 @@ The sizes are fixed and the same on both targets:
 | Type | Size | Notes |
 |------|------|-------|
 | `Integer`, `LongInt`, `Int64`, `SizeInt`, `NativeInt`, `PtrInt`, `Cardinal`, `QWord`, `UInt64`, `Rune` | 8 | one signed 64-bit integer under every name |
-| `Byte` `UInt8` · `Int8` `ShortInt` · `Word` `UInt16` · `Int16` `SmallInt` · `UInt32` `LongWord` `DWord` · `Int32` | 1, 1, 2, 2, 4, 4 | six types (the names between dots are one), whose values keep their width: `Byte` 0..255, `Int8` −128..127, `Word` 0..65535, `Int16` −32768..32767, `UInt32` 0..4294967295, `Int32` −2147483648..2147483647; 1, 2 or 4 bytes in memory (a local or a global keeps a word's slot); `High(T)` and `Low(T)` are constants of the type; the names are reserved words (§20) |
+| `Byte` `UInt8` · `Int8` `ShortInt` · `Word` `UInt16` · `Int16` `SmallInt` · `UInt32` `LongWord` `DWord` · `Int32` | 1, 1, 2, 2, 4, 4 | six types (the names between dots are one), whose values keep their width: `Byte` 0..255, `Int8` −128..127, `Word` 0..65535, `Int16` −32768..32767, `UInt32` 0..4294967295, `Int32` −2147483648..2147483647; 1, 2 or 4 bytes in memory (a local or a global keeps a word's slot); `High(T)` and `Low(T)` are constants of the type; the names are reserved words (§21) |
 | `Boolean` | 8 | `False` is 0, `True` is 1; only a Boolean goes into one, `Boolean(x)` turns a number or a pointer into one (§3) |
 | an enumeration, a subrange | 8 | an integer; a subrange's values are its host's: `1..10` integers, `'0'..'9'` characters, `Mon..Fri` the enumeration's members |
 | `Char`, `AnsiChar` | 1 | a byte, its own type: `Ord(c)` is its code |
 | `string` | 16 | pointer and byte length; no 255 cap, no trailing zero; the characters are copied on the first write after they are shared |
 | `Real`, `Double` | 8 | one IEEE binary64 |
 | `Single` | 4 | IEEE binary32, worked out in 32 bits; with a Double it widens, and a Double becomes a Single only through `Single(x)` |
-| `Quad` | 16 | IEEE binary128 in software, the same bits on both machines; everything widens to it, and it becomes a Double only through `Double(x)` (§14) |
-| `Currency` | 8 | signed integer ten-thousandths, −922337203685477.5808..922337203685477.5807; checked arithmetic and once-rounded decimal input; binary-float conversions are explicit (§17) |
+| `Quad` | 16 | IEEE binary128 in software, the same bits on both machines; everything widens to it, and it becomes a Double only through `Double(x)` (§15) |
+| `Currency` | 8 | signed integer ten-thousandths, −922337203685477.5808..922337203685477.5807; checked arithmetic and once-rounded decimal input; binary-float conversions are explicit (§18) |
 | `^T`, a class, a map, a chan | 8 | one machine word; `nil` is zero; two pointer types to one type are one type, whichever unit declares them, `PChar` too (1.1.34, P164) |
 | `array of T` | 24 | a slice: pointer, length, capacity |
 | `array[a..b] of T`, `array[I] of T` | (b-a+1) × SizeOf(T) | fixed, no header; the index a range or an ordinal type `I` (`Boolean`, `Char`, `Byte`, an enumeration, a subrange), and `array[1..3, 1..4] of T` is `array[1..3] of array[1..4] of T` |
@@ -537,7 +539,7 @@ too, as is a conversion like `Int64(d)` or `Byte(d)`; `d as UInt64` sees
 its bits (§3, views). `Trunc`, `Round`, `Floor` and `Ceil` of a NaN, an infinity or a
 real out of `Integer`'s range stop the program with
 `real out of integer range at line N`, the same on both machines
-(-2^63 itself converts). `Single` and `Quad` are in §14.
+(-2^63 itself converts). `Single` and `Quad` are in §15.
 
 An enumeration and a subrange are integers. A subrange is of a host
 type, the type of its bounds, and its values are the host's: `TDigit =
@@ -653,7 +655,7 @@ indicated type's, as for `+` (§3): `i := b rol 1` rotates in `Integer`
 (400), `Byte(b rol 1)` rotates the byte (145).
 
 These seven words are reserved (1.0.131): no variable, field or routine
-takes their names (§20).
+takes their names (§21).
 Each instruction is one machine instruction on a register (`rolb`,
 `rorw`, `sarq`; `ror`, `asr` on arm64); a byte or a halfword rotation
 on arm64 is two shifts and an `orr`.
@@ -771,7 +773,7 @@ Every line of that program gives the same on arm64: a rotation is the
 same instruction, or on a byte two shifts and an `orr`, and the count
 rules are the language's, not the machine's. The Murmur loop is the
 reference algorithm line for line, `k rol= 15` and `h rol= 13` being
-its two rotations; `Murmur3` (§13) is the same code in the core unit,
+its two rotations; `Murmur3` (§14) is the same code in the core unit,
 so the two numbers agree.
 
 A `Boolean` in integer arithmetic is its `Ord`, as a `Char` is its
@@ -910,18 +912,18 @@ record, an array, a string or a slice whole, the highest bit being bit
 7 of its last byte. `SetBits` takes the
 low `width` bits of a value that varies, and a constant must fit the
 field. The counts are `Integer`s. The bit words' names are reserved
-(1.0.131, §20).
+(1.0.131, §21).
 
 The code is the machine's own: `SetBit(b, 3, 1)` is `orb $8` on `b`'s
 byte, or `orq $8` on the register a loop keeps it in; `IsBitSet` a
 shift and an `and`; `TrailingZeros` `tzcnt` and `LeadingZeros`
-`lzcnt` when the processor has BMI1 and LZCNT (`-cpu`, §21; 1.1.114),
+`lzcnt` when the processor has BMI1 and LZCNT (`-cpu`, §22; 1.1.114),
 each giving the width for 0 by itself, and else `bsf` over a sentinel
 bit and `bsr` with a `cmov` for 0 (`rbit` + `clz` and `clz` on arm64);
 `ByteSwap`
 `bswap` or `rev`; `ReverseBits` `rbit` on arm64 and a `bswap` with three
 swaps on amd64, which has no bit reversal; `PopCount` `popcnt` when the
-processor the program is compiled for has it (`-cpu`, §21) and twelve
+processor the program is compiled for has it (`-cpu`, §22) and twelve
 instructions when it does not, `cnt` on arm64. On memory a constant bit is one instruction
 on its byte, and a count over a record or a string a loop in the
 runtime, eight bytes a step.
@@ -1072,7 +1074,7 @@ turns a `Byte`'s 8 bits and gives 3; alone, 64 bits).
   program stops: `a funnel of 3 and 4 bytes at line L`. An empty string
   or slice has no bits: it comes back empty, and a shift to Carry leaves
   0 there.
-- Their names are reserved (1.0.131, §20): no variable, routine, field
+- Their names are reserved (1.0.131, §21): no variable, routine, field
   or type takes one.
 
 ```
@@ -1657,7 +1659,7 @@ prints
 ```
 
 `AtomicAdd(@v, d)` and `AtomicCas(@v, old, new)` are the runtime's
-words (§18): unlike the words above they take the address of an
+words (§19): unlike the words above they take the address of an
 `Integer`, and a narrower one is refused (`AtomicAdd needs an 8-byte
 integer, not a Byte`), as is the variable itself where its address
 goes (`AtomicAdd takes the address of an Integer, as AtomicAdd(@v,
@@ -1774,14 +1776,14 @@ and the function's result stay in memory. amd64 gives up to eight
 registers (xmm15 down, fewer when a statement's tree is deep: the
 tree's registers come first), arm64 v8 to v15; a V256 takes two on
 arm64 and in SSE2. On amd64 such a run is compiled once, for the
-processor `-cpu` names (§21): for AVX2 when it has AVX2 (a V256 in one
+processor `-cpu` names (§22): for AVX2 when it has AVX2 (a V256 in one
 ymm register, every instruction VEX, `vpmulld` and the other SSE4.1
 instructions SSE2 lacks), for SSE2 otherwise; nothing is tested at run
 time. A constant `VSplat16(255)` is one load of 32 bytes the
 object file holds.
 
 On amd64 a V128 is SSE2 and a V256 is AVX2 when the program is
-compiled for a processor with it (`-cpu`, §21; the default is the
+compiled for a processor with it (`-cpu`, §22; the default is the
 machine compiling), or two SSE2 halves otherwise; nothing is decided at
 run time. `-cpu base` compiles the SSE2 paths, to test them on one
 machine. `VShuffle8` is SSSE3's `pshufb` when the set has it and a loop
@@ -1943,7 +1945,7 @@ else
 see the baseline processor, SSE2 on amd64 and NEON on arm64 and nothing
 more. The language's own words do not ask them: the vectors, `PopCount`,
 the maps' hash and the hash words are chosen when the program is
-compiled (`-cpu`, §21), and `-cpu base` compiles their base paths.
+compiled (`-cpu`, §22), and `-cpu base` compiles their base paths.
 
 `CpuFeatures` holds, on amd64, bit 0 `sse2`, 1 `sse3`, 2 `ssse3`, 3
 `sse41`, 4 `sse42`, 5 `popcnt`, 6 `aes`, 7 `pclmul`, 8 `avx`, 9 `fma`, 10
@@ -2003,7 +2005,7 @@ written by a system call
 `CpuHas` is decided when the program is compiled, so the string `neon`
 is nowhere in the amd64 program and `sse2` nowhere in the arm64 one:
 what a machine can never run is not in its program. The constant
-`Amd64` (§18) says which machine the program is compiled for, as
+`Amd64` (§19) says which machine the program is compiled for, as
 `CpuHas` says what that machine has; the first picks a system call
 number (`write` is 1 on amd64 and 64 on arm64), the second the code for
 a feature. Bit 0 of `CpuFeatures` is 1 on both machines because it is
@@ -2308,7 +2310,7 @@ decimals: `WriteLn(i:5, ' ', x:10:3, ' ', s:8)`; `w` and `d` are any
 integer expressions, `x:0:0` rounds to a whole number. `ReadLn(s)` reads a
 line into a string. `Inc(v)`, `Inc(v, n)`, `Dec(v)`, `Dec(v, n)` count;
 on a real they add or take away the step, `1.0` unless one is given.
-On `Currency` they use checked decimal arithmetic (§17). Their destination
+On `Currency` they use checked decimal arithmetic (§18). Their destination
 is bound once as for compound assignment, including a calling index.
 
 `Exit` leaves the current routine, running the `finally` parts on the
@@ -2446,7 +2448,7 @@ or a constant around it (1.1.36, P159; the global variable was read in
 silence, and the other kinds were refused). Inside one routine a
 variable, a parameter, a constant, a type and a nested routine may not
 share a name, and a variable or a parameter may not take the name of a
-routine around it (§19).
+routine around it (§20).
 
 A routine takes up to 32 parameters. `var` passes the caller's variable,
 `out` the same but for results only, `const` promises not to change it.
@@ -2496,7 +2498,7 @@ runs under `make check` both ways. `-inline-trace` says on the error
 output why a routine called in one of those places stays a call; a
 routine called only elsewhere stays a call without a line. To debug a routine that goes in
 place, compile with `-inline 0`: a debugger then finds the routine and
-its variables where the source has them (`-debug`, §18, does so by
+its variables where the source has them (`-debug`, §19, does so by
 itself).
 
 ```
@@ -2814,7 +2816,7 @@ same way (a `var` or `out` parameter cannot be: `X is a var parameter
 of Make, which has a closure inside: a closure may outlive the variable
 it points at; copy it to a local`). The variables live as long as a
 value that keeps them does: their block is on the heap, and the
-collector takes it back when the last closure over it is gone (§18).
+collector takes it back when the last closure over it is gone (§19).
 One call, one block: the two closures one call of `Tally` makes share
 `sum`, and two calls of `Adder` keep two `N`s. An anonymous routine
 written where no routine encloses it, as `Each`'s argument is, keeps
@@ -2980,7 +2982,7 @@ end;
 `v.LengthSquared` is 25. `v.Create(6, 8)` instead runs the constructor
 on `v` itself, keeping any field it does not assign. Calling another
 constructor from a constructor also uses that same `Self`, including
-its string fields (§19). A method on a function result works on that
+its string fields (§20). A method on a function result works on that
 value; on a variable it changes the variable. A `class` method in a
 record must be `static`, has no `Self`, and can be called as
 `TVector.Zero` or `v.Zero`. A property reads or writes a field, or goes
@@ -3350,7 +3352,7 @@ does. The option is chosen per unit (its `.pi` says `CHECKPTR`). The
 last object found is kept in the routine's record, so a loop that only
 walks a pointer takes about 11 times its time, a list walk about 5 and
 code without pointers the same (`make bench` measures it on `b8ptr`);
-without the option no check is emitted at all. `safe` code (§20) has no
+without the option no check is emitted at all. `safe` code (§21) has no
 raw pointer work to check.
 
 ## 7. Classes and interfaces
@@ -3542,13 +3544,13 @@ declares its own method named `Free` calls that. `pas obj.Free` runs the
 destructor as a routine. `inherited Destroy`, `inherited Create` or a
 bare `inherited` with no ancestor that has the method does nothing
 (1.0.137; it was an error). An object's memory goes back when nothing
-points to it any more (§18), destructor or not; there is no reference
+points to it any more (§19), destructor or not; there is no reference
 counting.
 
 ### TObject, the root of every class
 
 A class declared with no parent descends from `TObject`, which the
-core unit `pasobject` declares (§15): every object has what it has.
+core unit `pasobject` declares (§16): every object has what it has.
 
 | Member | What it does |
 |---|---|
@@ -4633,7 +4635,7 @@ done
 ```
 
 `pas` starts a routine: a G, scheduled by the runtime over OS threads,
-at most one running Pascal code for each CPU the program may use (§18). What follows `pas` is a call as a
+at most one running Pascal code for each CPU the program may use (§19). What follows `pas` is a call as a
 statement writes it (1.0.135): `pas Name(a, b, c)` with any number of
 arguments of any type, `pas f` or `pas f(a)` of a routine value or a
 closure, `pas obj.M(a)` of a method (a class's or an interface's),
@@ -4715,7 +4717,7 @@ never reorders what went through it. `Close(c)` wakes every receiver
 parked on `c`, each with the zero value; a `Send` on a closed channel,
 plain or as an arm of a `select`, stops the program with `paslang:
 send on closed channel`, and a second `Close` with `paslang: close of
-closed channel` (§18). The zero value is the only sign of a closed
+closed channel` (§19). The zero value is the only sign of a closed
 channel a receiver gets, so a stream that ends by a `Close` must not
 carry the zero value as data: `pipeline` below sends job numbers from 1.
 
@@ -4960,7 +4962,7 @@ channel with a buffer, `MakeChan(1)`, and ends whatever happened.
 
 `examples/pipeline.paslang` is the shape of most concurrent work: a
 channel of jobs, a fixed number of routines taking from it, a channel
-of results and a waitgroup (§12) that says when the workers are done.
+of results and a waitgroup (§13) that says when the workers are done.
 
 ```pascal
 { A worker pool: three routines take jobs from one channel and put their
@@ -5323,7 +5325,7 @@ and says whether there was one, `Pop(h)` gives it and `Low(h)` shows it
 `Single` (a `Quad` is refused).
 
 The order of the heap is the `<` of `T`: an ordinal as a signed number,
-a `string` byte by byte as §13 has it, so `''` comes first and `'B'`
+a `string` byte by byte as §14 has it, so `''` comes first and `'B'`
 before `'a'`, and a real by value, `-0.0` and `0.0` being equal. A
 push or a pop moves one element up or down the tree of the array,
 about `Log2(n)` compares; the array starts with room for 16 elements
@@ -5332,7 +5334,7 @@ and doubles when it is full. `Length(h)` of a `nil` heap is 0 and
 program with `paslang: nil heap`: `New(h)` first. A heap kept at `k`
 elements, one `Pop` after every `Push` past `k`, holds the `k` largest
 seen so far, the least of them at `Low(h)`; `examples/sorting.paslang`
-(§16) uses one as a priority queue of strings and one as a top three.
+(§17) uses one as a priority queue of strings and one as a top three.
 
 ### The store
 
@@ -5448,7 +5450,7 @@ is a `tree[string] of string` and holds copies of the strings given.
 An empty value is a value: `'empty' in db` is `True` while `StoreGet`
 gives `''` for it and for a missing key alike. The store takes no lock
 of its own; two routines that use one at once must hold a mutex
-(§12). `StorePut` and `StoreDelete` on a `store` that was never
+(§13). `StorePut` and `StoreDelete` on a `store` that was never
 opened stop the program with `paslang: nil store` (a `StoreGet` gives
 `''` and `k in db` `False`); a path that cannot be made stops it with
 `paslang: store open <path>`, and a file that is not a table with
@@ -5457,7 +5459,299 @@ a new store). `StoreAbandon` is for tests of the
 recovery, as in the example; a program that is done with a store
 closes it.
 
-## 12. Sync: mutex, rwmutex, waitgroup, cond, once
+## 12. JSON
+
+`json` is a word of the language (1.1.124): a value of a JSON document,
+one word, the address of the value inside a document that never changes
+once parsed, `nil` for `null`. The core unit `pasjson` is its runtime
+and every program has it, with no `uses`. A document is read as Go's
+`encoding/json/v2` reads one, strictly, and written in three forms; the
+errors carry Go's reasons, offsets and JSON Pointers (RFC 6901).
+
+### Reading
+
+`JsonParse(s)` parses the text `s` and gives its value, or raises
+`EJsonError`; `TryJsonParse(s, j, err)` gives `False` and the error in
+`err` instead. Both take a `TJsonOptions` last.
+
+`examples/jsonread.paslang`:
+
+```pascal
+{ JSON read: a document parsed once, then read by name, by place, by
+  JSON Pointer and by walking it; what is missing raises EJsonError
+  with the pointer of what was asked, and TryGet asks without raising. }
+program jsonread;
+
+const
+  Text = '{"store":"Corner","open":true,"rating":4.5,' +
+    '"items":[{"name":"tea","price":3,"tags":["hot","green"]},' +
+    '{"name":"cake","price":4.25,"tags":[]}],"owner":null}';
+
+var
+  doc, item, v: json;
+  name: string;
+  i: Integer;
+
+begin
+  doc := JsonParse(Text);
+  Write(doc['store'].AsString, ' is ');
+  if doc['open'].AsBoolean then
+    Write('open')
+  else
+    Write('closed');
+  WriteLn(', rated ', doc['rating'].AsFloat:0:1);
+  WriteLn(doc['items'][0]['name'].AsString, ' costs ', doc.At('/items/0/price').AsInteger);
+  Write(Length(doc['items']), ' items, ');
+  if doc['owner'].IsNull then
+    WriteLn('no owner');
+  for item in doc['items'] do
+  begin
+    Write(item['name'].AsString, ':');
+    for v in item['tags'] do
+      Write(' ', v.AsString);
+    WriteLn;
+  end;
+  for name, v in doc do
+    if v.Kind = jkNumber then
+      WriteLn(name, ' = ', v.AsNumber);
+  for i, v in doc['items'] do
+    WriteLn(i, ' ', v['price']);
+  if TryGet(doc, 'phone', v) then
+    WriteLn('phone ', v)
+  else
+    WriteLn('no phone');
+  try
+    WriteLn(doc['items'][1]['stock'].AsInteger);
+  except
+    on e: EJsonError do
+      WriteLn(e.Message, ' | ', e.Path);
+  end;
+  WriteLn(doc['items'][0]);
+end.
+```
+
+prints
+
+```
+Corner is open, rated 4.5
+tea costs 3
+2 items, no owner
+tea: hot green
+cake:
+rating = 4.5
+0 3
+1 4.25
+no phone
+json: no member "stock" within "/items/1" | /items/1/stock
+{"name":"tea","price":3,"tags":["hot","green"]}
+```
+
+| Word | What it gives |
+|---|---|
+| `j['k']`, `j[i]`, `j['a', 0]` | the member `k` of an object, the element `i` of an array (from 0), one after the other; a missing member, a value of another kind and a place past the end raise `EJsonError` |
+| `j.At('/a/0')` | the value the JSON Pointer names (RFC 6901: `~0` is `~`, `~1` is `/`; an element's token is its place, with no 0 before it) |
+| `j.Find('k')` | the member `k`, or `nil` when `j` is no object or has none |
+| `'k' in j` | whether `j` is an object with a member `k`; never raises |
+| `TryGet(j, 'k', v)`, `TryGet(j, i, v)` | whether the member or the element is there, into `v`; never raises |
+| `Length(j)` | the elements of an array or the members of an object |
+| `j.Kind` | `jkNull`, `jkBoolean`, `jkNumber`, `jkString`, `jkArray` or `jkObject` (`TJsonKind`) |
+| `j.IsNull` | whether `j` is `null` (or `nil`) |
+| `j.AsBoolean`, `j.AsString` | the value of a Boolean, of a string |
+| `j.AsInteger` | an integer literal that fits an `Integer`: `1.0` and `1e2` are no integers, as in Go's `v2` |
+| `j.AsFloat` | the `Double` nearest the number, rounded once; one past the largest `Double` (`1e400`) is an error |
+| `j.AsQuad` | the `Quad` nearest the number's text, rounded once |
+| `j.AsCurrency` | the number when it has at most four places and fits a `Currency`; never rounded |
+| `j.AsNumber` | the number's text as the document has it |
+| `j1 = j2`, `j1 <> j2` | equal as JSON values: the same kind, numbers of the same decimal value (`1 = 1.0 = 10e-1`, `-0 = 0`), strings of the same characters, arrays of equal elements in order, objects with the same names and equal values in any order |
+| `Write(j)`, `Write(j:w)` | the value's compact text, padded as a string |
+
+`for` walks a json in four forms: `for v in j` gives an array's elements
+or an object's values (`v` a json), `for k in j` an object's names (`k`
+a string), `for k, v in j` an object's members and `for i, v in j` an
+array's elements with their places (`i` an `Integer`). A walk of another
+kind of value raises; `downto` is refused. A json goes into a variable,
+a field, an element of a slice, a value of a map, a channel; nothing
+else goes into a json (`JsonParse` reads text) and a json goes into
+nothing else (its members read it), and `j as T` sees its bytes.
+
+A document is one block: its values in sixteen bytes each, in the
+order of the text, then the characters of its strings and the text of
+its numbers. `AsString` gives a string that is a view of those bytes,
+with no copy (§6), and any value of a document keeps the whole document
+alive: a value kept long after its document is better copied out
+(`Copy(j['name'].AsString, 1)`). An object of many members is read in
+O(1) through `JsonIndex(j)`, a `TJsonIndex` with `Get`, `Find`, `Has`,
+`Item`, `Count` and `Doc`, made once and never changed.
+
+### What a parse takes
+
+The text must be I-JSON (RFC 7493), as Go's `v2` requires it by
+default, and is refused at the first byte that is not, in the order of
+the text:
+
+- bytes that are not UTF-8 (RFC 3629), and a noncharacter (U+FDD0 to
+  U+FDEF and the last two of every plane, RFC 7493 2.1), in the text or
+  escaped (`\uFFFE`); Go takes the noncharacters, paslang does not;
+- a surrogate escape that is not a high one followed by a low one;
+- an object that names a member twice, the names compared unescaped
+  (RFC 7493 2.3);
+- what RFC 8259 does not take: comments, a comma before a closing
+  bracket, `NaN` and `Infinity`, a `+` before a number, a 0 before
+  another digit, a point with no digit after it, a control character
+  in a string, a byte order mark, a second value after the first;
+- a nesting deeper than `MaxDepth` (10000 by default, Go's) and a text
+  longer than `MaxBytes` (any up to 4 GiB less a byte when 0).
+
+Of JSONTestSuite's 35 `i_` files, whose verdict each parser chooses,
+paslang takes the ten that hold numbers beyond a `Double` or an `Integer`
+(they keep their text; `AsFloat` and `AsInteger` refuse them) and
+`i_structure_500_nested_arrays`, and refuses the other 24: the surrogates
+alone or in a wrong order, the bytes that are not UTF-8 (Latin-1,
+overlong forms, past U+10FFFF, cut), UTF-16 with or without a byte
+order mark, and the UTF-8 byte order mark before an object. Of its
+`y_` files it refuses the two that name a member twice and the eight
+that hold a noncharacter, as I-JSON says.
+
+### Errors
+
+`EJsonError` has the error's `Kind` (`TJsonErrorKind`: `jeSyntax`,
+`jeEncoding`, `jeDuplicate`, `jeDepth`, `jeTooLarge` for a parse,
+`jeMissing`, `jeType`, `jeRange` for a read), its `Offset` (the byte
+from 0), `Line` and `Column` (from 1, the column in bytes), the `Path` of
+the value it is about (a JSON Pointer; for a read, of what was asked),
+its `Reason` and a `Message`:
+
+```
+json: invalid character ']' at start of value at 1:4 (byte 3) within "/1"
+json: duplicate object member name "a" at 1:8 (byte 7)
+json: no member "stock" within "/items/1"
+json: 1.5 is not an integer within "/n"
+```
+
+A parse gives Go's `jsontext.SyntacticError` for the same text: the same
+offset, the same pointer (the value an error is in, or the container
+an error after a value is in) and the same reason, the characters in it
+quoted as Go's `strconv.QuoteRune` quotes them; a pointer longer than
+100 bytes is cut in the message as Go cuts it, and kept whole in
+`Path`. `make check` holds paslang to Go's `v2` on every file of
+JSONTestSuite, on Go's own corpus and on 20000 texts made from them
+(`scripts/check_json.py`). The line and the column are counted only
+when there is an error.
+
+### Writing
+
+`JsonEncode(j)` writes `j` on one line; `JsonEncode(j, opts)` as
+`TJsonOptions` says: `Indent` a value a line, `Indent` once for each
+level (`JsonPretty` takes two spaces), as Go's `jsontext` with
+`WithIndent`; `Canonical` RFC 8785's form (`JsonCanonical`); and
+`EscapeHtml` writes `<`, `>` and `&` as `\u003c`, `\u003e` and `\u0026`.
+`JsonDefaults` gives the options of a parse and a write with none, and
+nothing about JSON is global.
+
+`examples/jsonwrite.paslang`:
+
+```pascal
+{ JSON written: compact, a value a line, and in RFC 8785's canonical
+  form, where names go in order and numbers in their shortest form, so
+  two equal documents give the same bytes; = compares documents as JSON
+  values, numbers by their value and objects as sets of members. }
+program jsonwrite;
+
+var
+  a, b: json;
+  o: TJsonOptions;
+
+begin
+  a := JsonParse('{"b": [1.50, 2e1, "x<y"], "a": {"z": null, "k": true}}');
+  b := JsonParse('{"a":{"k":true,"z":null},"b":[1.5,20,"x<y"]}');
+  WriteLn(JsonEncode(a));
+  WriteLn(JsonEncode(a, JsonPretty));
+  WriteLn(JsonEncode(a, JsonCanonical));
+  WriteLn(JsonEncode(b, JsonCanonical));
+  if a = b then
+    WriteLn('equal as JSON values');
+  o := JsonDefaults;
+  o.EscapeHtml := True;
+  WriteLn(JsonEncode(a['b'], o));
+  WriteLn(a['a']:30, '|');
+end.
+```
+
+prints
+
+```
+{"b":[1.50,2e1,"x<y"],"a":{"z":null,"k":true}}
+{
+  "b": [
+    1.50,
+    2e1,
+    "x<y"
+  ],
+  "a": {
+    "z": null,
+    "k": true
+  }
+}
+{"a":{"k":true,"z":null},"b":[1.5,20,"x<y"]}
+{"a":{"k":true,"z":null},"b":[1.5,20,"x<y"]}
+equal as JSON values
+[1.50,2e1,"x\u003cy"]
+           {"z":null,"k":true}|
+```
+
+A string is written with the fewest escapes (RFC 8785 3.2.2.2): `"`, `\`
+and the control characters, `\b`, `\f`, `\n`, `\r`, `\t` where they have one and
+`\u00xx` the others. A number is written as its text, but in the
+canonical form as ECMAScript writes its `Double` (RFC 8785 3.2.2.3), as
+Go's `jsonwire` does: an integer of fewer than 16 digits as it is, `-0`
+as `0`, one past the largest `Double` as the largest; the names of an
+object in the order of their UTF-16 code units (3.2.3). The examples of
+RFC 8785, its sample, its names and Appendix B's numbers, are
+`testdata/jsoncanon`.
+
+### Sharing
+
+A document never changes, so any number of routines read one at once
+with no lock, and its `TJsonIndex` too; an error belongs to the routine
+that raised it (§9). A parse works the text in windows of 64 KiB, and
+the routine can be stopped between two and at its loop heads, so a long
+parse holds no processor from the others (§19). `testdata/jsonshare`
+reads one document from 64 routines, parses failing texts in 32 and
+large ones in 8 while a ninth answers every millisecond.
+
+### Speed
+
+The text is scanned 64 bytes at a time by the kernel of the processor
+(`PasJsonIndex`, P202: AVX2, SSE2 or NEON, §14 and `docs/KERNELS.md`), the
+document reserved once at the size the scan counts, and filled a token
+at a time, the common strings, integers and literals with no call. On
+an AMD Ryzen 7 4800H (Zen 2), the median of three rounds of the best of
+30 parses of each file of Go's corpus, against Go 1.27's
+`encoding/json/v2` unmarshalling it into `any`:
+
+| File | Bytes | paslang | Go v2 | Ratio |
+|---|---|---|---|---|
+| canada_geometry | 270403 | 1.918 ms | 3.566 ms | 0.54 |
+| citm_catalog | 1727204 | 2.238 ms | 9.968 ms | 0.22 |
+| golang_source | 1940472 | 8.186 ms | 23.792 ms | 0.34 |
+| string_escaped | 42062 | 0.209 ms | 0.243 ms | 0.86 |
+| string_unicode | 18124 | 0.015 ms | 0.048 ms | 0.31 |
+| synthea_fhir | 2008494 | 3.249 ms | 14.013 ms | 0.23 |
+| twitter_status | 631514 | 1.467 ms | 4.498 ms | 0.33 |
+
+A document is written in one pass into a string that grows, and on one
+line or a value a line takes from 0.05 to 0.44 of the time Go's `v2`
+takes to marshal its `any` on every file (`scripts/bench/b34json`,
+whose sections hold each of these against Go's `v2` and `v1` in `make
+bench`). RFC 8785's form sorts an object's names only when they are not
+in order already and remembers the order of the last eight shapes of
+object it sorted. From text to RFC 8785's text, a parse and a write,
+the whole corpus takes 0.95 of the time of Go's `Value.Canonicalize`;
+canada_geometry, 111000 reals read and written in their shortest form,
+takes 1.37, as the numbers of the core unit pasnum are slower than Go's
+`strconv` (hito P240).
+
+## 13. Sync: mutex, rwmutex, waitgroup, cond, once
 
 `examples/sync.paslang`:
 
@@ -5777,9 +6071,9 @@ seven eighths of it hold the hint; a larger one makes as many tables of
 1024 slots as hold it at half load. There is no way to fix a size in
 the declaration, as in Go; `New` is the only place, and the map never
 shrinks. `Less` in this example compares the bytes by hand; since
-strings take `<` (§13), `A < B` gives the same order.
+strings take `<` (§14), `A < B` gives the same order.
 
-## 13. Strings and hashing
+## 14. Strings and hashing
 
 `examples/strings.paslang`:
 
@@ -5855,7 +6149,7 @@ time on AVX2 or SSE2 (or NEON) as Go's `memequal` does. `<`, `<=`,
 `>` and `>=` compare them byte by byte as well: the first byte that
 differs decides, and when one string is a prefix of the other the
 shorter one comes first, so a list of names sorts the way you expect.
-`IntToStr` and `StrToInt64` of `uses paslib` convert (§15).
+`IntToStr` and `StrToInt64` of `uses paslib` convert (§16).
 
 Pascal's string words are there, as Free Pascal has them (1.1.10):
 `Pos(sub, s)` and `Pos(sub, s, from)` give the place from 1 of `sub`
@@ -5909,7 +6203,7 @@ the core unit `pashash`, and SHA-1, SHA-256, SHA-512 and the CRCs also
 have a body on the processor's own instructions (SHA-NI, SSE4.2's
 `crc32`, PCLMULQDQ on amd64; FEAT_SHA1, FEAT_SHA256, FEAT_SHA512,
 FEAT_CRC32 on arm64) that the program calls when it is compiled for a
-processor that has them (`-cpu`, §21, and `docs/KERNELS.md`).
+processor that has them (`-cpu`, §22, and `docs/KERNELS.md`).
 
 `examples/hashes.paslang`:
 
@@ -6028,7 +6322,7 @@ in an `Integer`, so a hash with the top bit set prints negative.
 Every word here takes the bytes of a string and is written as its
 standard writes it. A digest
 comes back as a string of raw bytes, a checksum or a fast hash as an
-`Integer`. The words are reserved (§20): no routine or variable of a
+`Integer`. The words are reserved (§21): no routine or variable of a
 program takes their names.
 
 | Word | Algorithm | Gives | Takes | On the processor (`-cpu`) | Use it for |
@@ -6058,7 +6352,7 @@ chosen value is easy to make. SipHash sits between: fast, and safe as a
 table's hash while its key is secret. A word with a body on the
 processor's instructions and one in Pascal gives the same bytes from
 both (`make check` runs `testdata/hash1` both ways on both machines);
-the choice is made when the program is compiled (`-cpu`, §21).
+the choice is made when the program is compiled (`-cpu`, §22).
 
 ### Hashing anything
 
@@ -6167,7 +6461,7 @@ HMAC-SHA256 under `key` of RFC 2104's examples.
 
 The algorithms live in the core unit `pashash` (the xxHash words are
 the runtime's own, in assembly, since the map hashes with XXH3), which
-every program links without `uses` (§15). `scripts/hashgen.py` writes that unit from
+every program links without `uses` (§16). `scripts/hashgen.py` writes that unit from
 one template: each algorithm in Pascal with its rounds written out (the
 only loop is over the blocks), and for SHA-1, SHA-256, SHA-512 and the
 CRCs a second body in `asm amd64` and `asm arm64` after Go's assembly
@@ -6182,7 +6476,7 @@ Python's `hashlib`, `hmac` and `zlib` and the reference definitions
 `testdata/xxh32`, `xxh64` and `xxh3` the xxHash ones.
 Adding an algorithm is the recipe in `docs/KERNELS.md`.
 
-## 14. Reals and the calculation set
+## 15. Reals and the calculation set
 
 `examples/maths.paslang`:
 
@@ -6231,7 +6525,7 @@ A value outside a routine's domain stops the program with a message and
 its line, `paslang: sqrt domain at line 4`, rather than returning NaN;
 the last column names the message. A result too big for a `Double` is
 an infinity (`Exp(1000)` is `+Inf`), not a stop. There is no `Random`;
-`pasrand` has random numbers (§16).
+`pasrand` has random numbers (§17).
 
 | Routine | Gives | Stops on (message) |
 |---|---|---|
@@ -6379,7 +6673,7 @@ prints
 16
 ```
 
-## 15. The core library and pasnet
+## 16. The core library and pasnet
 
 Eleven units, the core, are compiled into `build/` (and `build/a64/`
 for arm64) by `make`, for the base processor (`-cpu base`, so the
@@ -6394,7 +6688,7 @@ install`. Every program links them without `uses`:
 - `pasroutines` implements `mutex`, `rwmutex`, `waitgroup`, `cond` and
   `once`, the `lock` and `once` statements, `Goid`, `NumGoroutine`,
   `Yield` and `ReadLn`. It is Pascal over the park and wake words of the
-  scheduler (§18).
+  scheduler (§19).
 - `pasnum` reads and writes numbers as text (P200). One scanner reads
   a number with Pascal's grammar or JSON's (RFC 8259), eight digits at a
   time where eight are there; its value is the nearest `Double` or
@@ -6409,18 +6703,18 @@ install`. Every program links them without `uses`:
   through it.
 - `pasfmt` writes and reads reals for `Write`, `WriteLn` and `x:w:d`
   (1.0.79): a real printed exactly, a literal read as the nearest double.
-- `passtr` is the string words (§13): `Pos`, `Insert`, `Delete`,
+- `passtr` is the string words (§14): `Pos`, `Insert`, `Delete`,
   `UpCase`, `StringOfChar`, `Val`'s reading of a number, with their
   kernels.
 - `pasmap` implements `map[K] of V`: a Swiss table in Pascal, a
   directory of tables of at most 1024 slots that split (§11).
-- `pashash` is the hash words (§13): every algorithm in Pascal with its
+- `pashash` is the hash words (§14): every algorithm in Pascal with its
   rounds written out and, for SHA-1, SHA-256, SHA-512 and the CRCs, a
   second body on the processor's instructions; `Hex`; the Merkle words.
 - `pastree` implements `tree[K] of V`, `tree of K`, `heap of T` and
   the `store` (§11); it names `pashash` for the log's CRC.
-- `pasheap` is the heap's slow paths and the collector (§18).
-- `pasquad` is the arithmetic of `Quad`, in software (§14).
+- `pasheap` is the heap's slow paths and the collector (§19).
+- `pasquad` is the arithmetic of `Quad`, in software (§15).
 - `pasjson` is JSON's scans (P202), the first part of JSON in the
   language: the structural scan of a text, 64 bytes a block after
   simdjson's stage 1, which writes the index of the places a parser
@@ -6467,7 +6761,7 @@ routines are there for the compiler, and a program may call them too:
 | `pasjson` | `PasJsonIndexBlocks(p, nblocks, st, idx, off)`, `PasJsonIndexCpu`, `PasJsonIndexBase`, `PasJsonIndexPlain(p, n, st, idx, off)` | the same over whole blocks of 64 bytes, for a text that goes on (room for `64 * nblocks + 8`); the two kernels, which take any number of blocks in one call where `PasJsonIndexBlocks` gives them 1024 at most (64 KiB), so the routine can be stopped between two; and the reference byte by byte, which the tests hold them to |
 | `pasjson` | `PasJsonEscIndex(p, n, html): Integer`, `PasJsonEscIndexCpu`, `PasJsonEscIndexBase`, `PasJsonEscIndexPlain` | the place from 0 of the first of the `n` bytes at `p` that JSON writes escaped (a quote, a backslash, a byte below 20h and, with `html`, `&`, `<` and `>`), -1 when there is none; the kernels read aligned blocks, which never cross a page, and `PasJsonEscIndex` gives them at most 64 KiB a call (1.1.120, P270) |
 | `pashash` | `PasHex(s)`, `PasMd5(s)`, `PasSha3(s, bits)`, `PasAdler32(s, adler)`, `PasFnv1a32(s)`, `PasFnv1a64(s)`, `PasMurmur3(s, seed)`, `PasSipHash(s, k0, k1)` | the bodies of `Hex`, `Md5`, `Sha3_*`, `Adler32`, `Fnv1a32`, `Fnv1a64`, `Murmur3` and `SipHash`, one each |
-| `pashash` | `PasSha1Cpu(s)`, `PasSha1Base(s)`, and the same pairs for `Sha224`, `Sha256`, `Sha384`, `Sha512`; `PasHmacCpu(alg, key, msg)`, `PasHmacBase` (alg 0 MD5, 1 SHA-1, 2 SHA-224, 3 SHA-256, 4 SHA-384, 5 SHA-512); `PasCrc32Cpu(s, crc)`, `PasCrc32Base`, `PasCrc32cCpu`, `PasCrc32cBase`; `PasMerkleRootCpu(leaves)`, `PasMerkleRootBase`, `PasMerkleProofCpu(leaves, i)`, `PasMerkleProofBase`, `PasMerkleCheckCpu(leaf, i, n, proof, root)`, `PasMerkleCheckBase` | the two bodies of each word, the `Cpu` one on the processor's instructions and the `Base` one in Pascal; the compiler calls one by `-cpu` (§21), a program that calls `Cpu` itself answers for the processor it runs on |
+| `pashash` | `PasSha1Cpu(s)`, `PasSha1Base(s)`, and the same pairs for `Sha224`, `Sha256`, `Sha384`, `Sha512`; `PasHmacCpu(alg, key, msg)`, `PasHmacBase` (alg 0 MD5, 1 SHA-1, 2 SHA-224, 3 SHA-256, 4 SHA-384, 5 SHA-512); `PasCrc32Cpu(s, crc)`, `PasCrc32Base`, `PasCrc32cCpu`, `PasCrc32cBase`; `PasMerkleRootCpu(leaves)`, `PasMerkleRootBase`, `PasMerkleProofCpu(leaves, i)`, `PasMerkleProofBase`, `PasMerkleCheckCpu(leaf, i, n, proof, root)`, `PasMerkleCheckBase` | the two bodies of each word, the `Cpu` one on the processor's instructions and the `Base` one in Pascal; the compiler calls one by `-cpu` (§22), a program that calls `Cpu` itself answers for the processor it runs on |
 | `pastree` | `PasTreeNew`, `PasTreeGet`, `PasTreePut`, `PasTreeDelete`, `PasTreeClear`, `PasTreeStep`, `PasTreeBound`, `PasTreeRank`, `PasTreeKeyAt`, `PasTreePop`, `PasTreeSplit`, `PasTreeJoin`, `PasHeapNew`, `PasHeapPush`, `PasHeapPop`, `PasHeapLow`, `PasHeapEmpty` | the tree and heap words, taking the compiler's descriptor of the type (key kind and sizes) and keys by address: written for the compiler, not for a program, which has `t[k]`, `Push` and the rest |
 | `pastree` | `PasStoreOpen(path): Pointer`, `PasStorePut(db, k, v)`, `PasStoreGet(db, k): string`, `PasStoreHas(db, k): Boolean`, `PasStoreDelete(db, k)`, `PasStoreSync(db)`, `PasStoreClose(db)`, `PasStoreAbandon(db)` | the store words; `k in db` is `PasStoreHas` |
 
@@ -9762,7 +10056,7 @@ whether the name is set at all (`TZ=` is set and empty), `IntToStr`, `StrToInt64
 `IntToHex2(b)`, `ToLower`, `HasSuffix`, `ChangeExt`, `BaseName`,
 `DirName` and `JoinPath` shape strings and paths.
 
-## 16. The clock, chance and order
+## 17. The clock, chance and order
 
 Four more units are installed beside the compiler. They are ordinary
 paslang over `Syscall`, not part of the language: name them in `uses`.
@@ -10011,7 +10305,7 @@ slept at least 30ms: 1
 50 would go at 2
 ```
 
-## 17. SysUtils
+## 18. SysUtils
 
 ### API design inventory
 
@@ -10053,12 +10347,12 @@ race-free.
 names retain useful, documented semantics; Free Pascal is a compatibility
 reference, not the design specification. Unsafe unbounded memory access,
 implicit lossy conversions and obsolete platform assumptions are not
-requirements. Deliberate differences have their contract and tests in §19;
+requirements. Deliberate differences have their contract and tests in §20;
 real formatting follows current Go's correctly rounded conversion, rather
 than reproducing historical FPC rounding defects. Existing string, number
 and date routines have compatibility tests (`testdata/sysutils1`,
 `fmtfloat1`, `format1`). It is a library unit like `pastime`, installed with the compiler and built for
-each processor level (§21), so its string words run on the kernels of
+each processor level (§22), so its string words run on the kernels of
 the processor a program is compiled for.
 
 ```pascal
@@ -10723,7 +11017,7 @@ begin
 end.
 ```
 
-What differs from Free Pascal's, as paslang differs (§19): `Integer` is
+What differs from Free Pascal's, as paslang differs (§20): `Integer` is
 64 bits, so `StrToInt` takes what `StrToInt64` takes; the `Ansi` words
 change the ASCII letters of UTF-8 text and leave the other bytes;
 `GetBaseException` is the object it is called on, since paslang keeps no
@@ -10734,12 +11028,12 @@ prints `paslang: uncaught raise in the main routine: EConvertError: ...`
 and the program stops with status 1. A real is written with its own
 digits rounded once, every digit asked for, a precision of 1 as one
 digit, NaN as `NaN`; FormatFloat's empty section and a value that rounds
-to 0, and Format's letters it does not know, as §19 says. The local
+to 0, and Format's letters it does not know, as §20 says. The local
 clock is Go's, a date's own offset and daylight saving time at any date,
-and a year Free Pascal takes as a `Word` is an `Integer`, as §19 says of
+and a year Free Pascal takes as a `Word` is an `Integer`, as §20 says of
 the dates too.
 
-## 18. The runtime model
+## 19. The runtime model
 
 A running program is a set of routines, Gs, on OS threads, Ms. A P is
 the right to execute Pascal code, its run queue and allocation cache.
@@ -11063,7 +11357,7 @@ A routine that stops parks on a channel of its own and the others run
 on; the socket is served by a routine of the program, so the program
 must be scheduling for the debugger to answer: a program spinning in a
 loop that calls nothing is reached at its next routine entry or loop
-head, as the monitor reaches it (§18). A stopped routine holds whatever
+head, as the monitor reaches it (§19). A stopped routine holds whatever
 locks it holds. The serving routine is not one the program waits for
 when its main routine ends.
 
@@ -11344,7 +11638,7 @@ to the new one. `testdata/debug2.paslang` runs under `make check` with
 the commands on standard input, under `--debug-mode` and under
 `--debug-listen` with `--debug-attach`, on both machines.
 
-## 19. Limits and differences from other Pascals
+## 20. Limits and differences from other Pascals
 
 - `Byte`, `Word`, `Int32` and the rest keep their width in their values
   and in memory, and a record's fields lie at their natural alignment:
@@ -11366,6 +11660,16 @@ the commands on standard input, under `--debug-mode` and under
   implementation: a `const` after a routine is seen by the routines
   below it.
 - No `Text`, no `file`, no `file of`. No C foreign function interface.
+- JSON (§12) is a word of the language, not a library of objects to
+  build and free (Free Pascal's fcl-json, `TJSONData`): a `json` is one
+  word of a document that never changes, and the parse is strict I-JSON
+  (RFC 7493) as Go's `encoding/json/v2`, where fcl-json takes comments,
+  a comma before a closing bracket and a name twice. paslang refuses a
+  noncharacter (U+FDD0 to U+FDEF and the last two of every plane), in
+  the text or escaped (`\uFFFE`), which Go takes: RFC 7493 2.1 says an
+  I-JSON message must not hold one. `AsInteger` takes an integer literal
+  that fits and nothing else (`1.0` is no integer); `AsFloat` refuses
+  a number past the largest `Double` instead of giving an infinity.
 - SysUtils file buffers are typed, bounded `TBytes`, not untyped memory
   whose extent cannot be checked. Whole-file reads require a byte budget;
   excess is an explicit error, never silent truncation. DOS file-sharing
@@ -11592,7 +11896,7 @@ the commands on standard input, under `--debug-mode` and under
   stops with `paslang: all routines are asleep: deadlock` (§10).
 - The target is GNU/Linux only, kernel 6.13 or newer, amd64 and arm64.
 
-## 20. Reserved words
+## 21. Reserved words
 
 The lexer reserves these words, in any case of letters; none can name
 a variable, a type or a routine, and one where a name goes says so:
@@ -11610,8 +11914,8 @@ Names that other Pascals predeclare and paslang reserves: `integer
 boolean new write writeln readln`.
 
 The paslang additions: `pas chan makechan send recv close select map
-lock once mutex rwmutex waitgroup cond sleep safe tree heap store`, and
-`package contains` (Delphi's, §2).
+lock once mutex rwmutex waitgroup cond sleep safe tree heap store json`,
+and `package contains` (Delphi's, §2).
 
 Every predefined name is reserved as well (1.0.138; from 1.0.131 to
 1.0.137 only the words added since 1.0.131 were, and the older ones could
@@ -11622,7 +11926,7 @@ its place:
 - the bit operators `nand nor xnor andnot sar rol ror`;
 - the declaration words `forward overload override abstract public
   private published protected strict operator inline cdecl nostackframe`,
-  and `packed`, which has no place at all: it is refused everywhere (§19);
+  and `packed`, which has no place at all: it is refused everywhere (§20);
 - the slice words `Append` and `Cap`;
 - the ordinal, string, slice, map and memory words `Ord Chr Succ Pred Low
   High Odd SizeOf Length Copy Delete Clear TryGet Default Assigned
@@ -11633,12 +11937,12 @@ its place:
   Join Include Exclude Push Pop StoreOpen StorePut StoreGet StoreDelete
   StoreSync StoreClose StoreAbandon`, and the types `tree`, `heap` and
   `store` are keywords;
-- the hash words (§13): `Hex Md5 Sha1 Sha224 Sha256 Sha384 Sha512
+- the hash words (§14): `Hex Md5 Sha1 Sha224 Sha256 Sha384 Sha512
   Sha3_224 Sha3_256 Sha3_384 Sha3_512 HmacMd5 HmacSha1 HmacSha224
   HmacSha256 HmacSha384 HmacSha512 Crc32 Crc32c Adler32 Fnv1a32 Fnv1a64
-  Murmur3 SipHash MerkleRoot MerkleProof MerkleCheck` (the table in §13,
+  Murmur3 SipHash MerkleRoot MerkleProof MerkleCheck` (the table in §14,
   The algorithms, says what each computes and what it is for);
-- the calculation set (§14): `Abs Sqr Sqrt Trunc Round Int Frac Floor
+- the calculation set (§15): `Abs Sqr Sqrt Trunc Round Int Frac Floor
   Ceil Min Max Pi Exp Ln LnXP1 Log10 Log2 LogN Power Hypot Ldexp Poly
   Sin Cos Tan Cot Sec Csc ArcSin ArcCos ArcTan ArcTan2 ArcCot ArcSec
   ArcCsc Sinh Cosh Tanh ArcSinh ArcCosh ArcTanh IsNan IsInfinite`;
@@ -11676,13 +11980,18 @@ its place:
   Double Extended Single Quad Currency Pointer PChar` and `PByte PUInt8 PInt8 PShortInt
   PWord PUInt16 PInt16 PSmallInt PDWord PLongWord PUInt32 PInt32
   PInteger PInt64 PSingle PDouble PQuad PBoolean PPointer`;
-- what the core units export (§15), predefined in every program and
+- what the core units export (§16), predefined in every program and
   unit: `Goid NumGoroutine Yield PasReadLn PasIoRetry PasIoDeadline
   PasIoRead PasIoWrite PasNetRead PasNetWrite`, the sync types `TPasMutex
   TPasRWMutex TPasWaitGroup TPasCond TPasOnce` with their `PasMutexLock`
   … `PasOnceDone` routines, pasfmt's `PasFmtReal` … `PasFmtQuad`,
   pashash's `PasHex PasMd5 PasSha1Cpu` … `PasMerkleCheckBase` and
-  pastree's `PasTreeNew` … `PasStoreAbandon`, and pasobject's `TObject`
+  pastree's `PasTreeNew` … `PasStoreAbandon`, pasjson's JSON words
+  (§12) `JsonParse TryJsonParse JsonEncode JsonIndex JsonDefaults
+  JsonPretty JsonCanonical`, its types `TJsonKind` (`jkNull` …
+  `jkObject`), `TJsonErrorKind` (`jeSyntax` … `jeRange`), `TJsonOptions`,
+  `EJsonError`, `TJsonIter`, `TJsonIndex` and `TJsonHelper` and its
+  `PasJsonIndex` … `PasJsonImage` routines, and pasobject's `TObject`
   with `PasClassName` … `PasUncaught`, and the compiler's `TClass`
   (`class of TObject`), `TVarRec` and its kinds `vtInteger` …
   `vtQuad`. A core unit declares its
@@ -11694,8 +12003,8 @@ method, a property or an enumeration member of one of these names is a
 compile error that names it, at the name: `Length is a reserved word,
 not a name at 5:3`. A unit's `.pi` is not checked for these names when
 it loads. The compiler loads only a `.pi` of the format it writes,
-`PASLANGI25`, and refuses an older one with the minimum compiler needed to
-rebuild it. Currency adds builtin type id 17; scoped members, generic
+`PASLANGI26`, and refuses an older one with the minimum compiler needed to
+rebuild it. A type may be `json`, kind 26 (1.1.124); Currency adds builtin type id 17; scoped members, generic
 origin/argument identity and every exported alias remain recorded. All
 installed libraries must be rebuilt when this format changes.
 
@@ -11712,7 +12021,7 @@ run time.
 `WriteLn`, `Write`, `ReadLn`, `New`, `Sleep`, `MakeChan`, `Send`,
 `Recv` and `Close` are keywords (above) and are never names.
 
-## 21. Command reference
+## 22. Command reference
 
 ```
 paslangc [options] file.paslang
@@ -11725,7 +12034,7 @@ paslangc [options] file.paslang
 | `-checkptr` | check every pointer step and access against its object while the program runs (§6) |
 | `-inline <n>` | inline by measure (§5): a plain routine of the unit whose body counts `n` statements and expression nodes or fewer goes in place where it is called; a routine declared `inline` goes in whatever its size; `-inline 0` keeps one copy of every routine and every loop; 40 by default |
 | `-inline-trace` | say on the error output why each routine of the unit stays a call |
-| `-debug` | the debugger inside the executable (§18): `uses pasdebug`, a call of the debugger at every statement, the tables of the routines, variables and lines; `-inline 0` and no variable in a register; run with `PASLANG_DEBUG=<socket>` and speak to it with `pasdbg <socket>` |
+| `-debug` | the debugger inside the executable (§19): `uses pasdebug`, a call of the debugger at every statement, the tables of the routines, variables and lines; `-inline 0` and no variable in a register; run with `PASLANG_DEBUG=<socket>` and speak to it with `pasdbg <socket>` |
 | `-Fu <dir>` | a directory of compiled units, repeatable |
 | `-install <dir>` | compile a package and install its units there |
 | `-target amd64`, `-target intel64`, `-target arm64` | the machine to emit for; on amd64 the arm64 output is cross-assembled with `aarch64-linux-gnu-as` and `-ld`, and an arm64 machine uses its own `as` and `ld` |

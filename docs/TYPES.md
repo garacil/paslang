@@ -670,6 +670,55 @@ The compiler passes `.LdescTree_<type>` and `.LdescHeap_<type>` (key
 kind, key size, value size, whether a slot holds a pointer) to the
 unit's routines, and calls them by the map's convention.
 
+## json (P203)
+
+`json` is a keyword: **one word, the address of a value inside a
+document that never changes**, `nil` for `null` (the zero value prints
+`null`). `JsonParse` and `TryJsonParse` make the document, strict I-JSON
+as Go's `encoding/json/v2` (MANUAL §12); the core unit `pasjson` is the
+runtime, linked into every program with its words visible.
+
+A document is **one block that holds no pointer**: a header of 32
+bytes (a mark, the nodes, the end of the arena), then a node of 16
+bytes for every value and every member's name, in the order of the
+text, then the arena. A node's first word is its kind in bits 0 to 2
+(null, false, true, number, string, array, object), flags in bits 3 to
+7 and in the rest a length, a count or an offset; its second a value,
+an offset or a size:
+
+- a string: the length of its characters, unescaped, and the offset
+  from the node to them; the byte before them is `01h`, the mark of a
+  string another shares, so `AsString` is a view with no copy (P198),
+  and a flag says whether the text had no escape (written back as it
+  is);
+- a number: the offset to its text in the arena (its length, `01h`,
+  the text as written) and its value: an `Int64` for an integer literal
+  that fits, else its bits as a `QWord` or its `Double`, rounded once,
+  with flags for which and whether the text was an integer literal;
+- an array or an object: the count of its elements or members (an
+  object's children are name, value, name, value) and the number of
+  nodes it spans, itself included, so the value after it is that many
+  nodes on; a flag says no child is a container, and then `j[i]` is one
+  step.
+
+The block is reserved once, at the size the structural scan counts
+(P202: the nodes, the bytes of the strings and the other scalars), so
+nothing grows while the parse runs; a text holds at most 4 GiB less a
+byte, the scan's places being 32 bits, as simdjson's. A `json` in a
+variable keeps the whole document alive through its interior pointer
+(the collector finds the block from any address in it, GC.md 2.3). A
+json goes only where a json goes: no conversion either way, `=` and
+`<>` compare JSON values, and `j as T` sees its bytes. It is no key of a
+map or a tree and no element of a heap.
+
+Reading is `j['k']` (a walk of the object's names, the length first),
+`j[i]`, `j.At(pointer)`, `for`, `TryGet`, `in` and `Length`, and the
+members of `TJsonHelper` (`Kind`, `AsString`, ...), a type helper for
+`json` in `pasjson`: a program's own helper for json hides it unless it
+descends from it. `TJsonIndex` reads an object's members in O(1) through
+a table seeded per index. A document is read by any number of routines
+at once; nothing in it is written after the parse.
+
 ## Sync types
 
 `mutex` (32 bytes), `rwmutex` (48), `waitgroup` (24), `cond` (16), and

@@ -1,0 +1,185 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+  GPL version 3 or later; see COPYING. No warranty. }
+
+{ P203, Regla 11: a json from any pasroutine. A document never
+  changes, so 64 routines read one at once with no lock (by name, by
+  place, by pointer, through one TJsonIndex, walking it, comparing it
+  and writing it), each
+  summing what it reads, and every sum is the one alone; 32 routines
+  parse texts that fail, each its own, and each error, raised or given
+  by TryJsonParse, is its routine's own, with its own place and reason;
+  8 routines parse a document of some 6 MB each while a ninth answers a
+  ping every millisecond, which goes on answering (stage 1 gives way a
+  window at a time, stage 2 at its loop heads); all of it under the
+  collector, whose cycles move nothing and keep every document alive
+  while a value of it is held. }
+program jsonshare;
+
+uses sysutils;
+
+const
+  NRead = 64;
+  NFail = 32;
+  NBig = 8;
+
+var
+  doc: json;
+  sums: array[0..NRead - 1] of Integer;
+  fails: array[0..NFail - 1] of string;
+  bigs: array[0..NBig - 1] of Integer;
+  gix: TJsonIndex;
+  wg, wp: waitgroup;
+  pings, stop: Integer;
+
+function SumDoc(D: json): Integer;
+var
+  v, w: json;
+  k: string;
+  i: Integer;
+begin
+  Result := 0;
+  for i, v in D['items'] do
+  begin
+    Result := Result + v['n'].AsInteger * (i + 1);
+    for w in v['tags'] do
+      Result := Result + Length(w.AsString);
+    Result := Result + Length(v.At('/name').AsString);
+  end;
+  for k, v in D['index'] do
+    if v = D['items'][v.AsInteger]['n'] then
+      Result := Result + Length(k);
+  i := 0;
+  while i < 1000 do
+  begin
+    Result := Result + gix.Get('k' + IntToStr(i)).AsInteger;
+    i := i + 7;
+  end;
+  Result := Result + Length(JsonEncode(D, JsonCanonical)) mod 1000;
+end;
+
+procedure Reader(Id: Integer);
+var
+  r: Integer;
+begin
+  sums[Id] := 0;
+  for r := 1 to 20 do
+    sums[Id] := sums[Id] + SumDoc(doc);
+  wg.Done;
+end;
+
+procedure Failer(Id: Integer);
+var
+  j: json;
+  e: EJsonError;
+  t: string;
+begin
+  t := '{"routine":' + IntToStr(Id) + ',"list":[' + StringOfChar('1', Id + 1) + ',]}';
+  if TryJsonParse(t, j, e) then
+    fails[Id] := 'accepted'
+  else
+    fails[Id] := IntToStr(e.Offset) + ' ' + e.Path + ' ' + e.Reason;
+  try
+    j := JsonParse(t);
+  except
+    on x: EJsonError do
+      if x.Offset <> e.Offset then
+        fails[Id] := 'raised another error: ' + x.Message;
+  end;
+  wg.Done;
+end;
+
+procedure Big(Id: Integer);
+var
+  s: string;
+  i: Integer;
+  d: json;
+begin
+  s := '[';
+  for i := 0 to 199999 do
+  begin
+    if i > 0 then
+      s := s + ',';
+    s := s + '{"i":' + IntToStr(i + Id) + ',"s":"value ' + IntToStr(i) + '"}';
+  end;
+  s := s + ']';
+  d := JsonParse(s);
+  bigs[Id] := Length(d) + d[199999]['i'].AsInteger;
+  wg.Done;
+end;
+
+procedure Pinger;
+begin
+  while AtomicLoad(stop) = 0 do
+  begin
+    Sleep(1);
+    AtomicAdd(@pings, 1);
+  end;
+  wp.Done;
+end;
+
+var
+  t: string;
+  i, alone, before: Integer;
+  ok: Boolean;
+
+begin
+  t := '{"items":[';
+  for i := 0 to 999 do
+  begin
+    if i > 0 then
+      t := t + ',';
+    t := t + '{"n":' + IntToStr(i * 7 mod 1000) + ',"name":"item ' + IntToStr(i) +
+      '","tags":["a","bb","' + IntToStr(i) + '"]}';
+  end;
+  t := t + '],"index":{';
+  for i := 0 to 999 do
+  begin
+    if i > 0 then
+      t := t + ',';
+    t := t + '"k' + IntToStr(i) + '":' + IntToStr(i);
+  end;
+  t := t + '}}';
+  doc := JsonParse(t);
+  gix := JsonIndex(doc['index']);
+  t := '';
+  alone := 20 * SumDoc(doc);
+
+  wg.Add(NRead + NFail);
+  for i := 0 to NRead - 1 do
+    pas Reader(i);
+  for i := 0 to NFail - 1 do
+    pas Failer(i);
+  wg.Wait;
+  ok := True;
+  for i := 0 to NRead - 1 do
+    if sums[i] <> alone then
+      ok := False;
+  WriteLn('readers agree: ', ok);
+  for i := 0 to NFail - 1 do
+    if i mod 8 = 0 then
+      WriteLn('failer ', i, ': ', fails[i]);
+  ok := True;
+  for i := 0 to NFail - 1 do
+    if fails[i] <> IntToStr(22 + i + Length(IntToStr(i))) + ' /list/1' +
+      ' invalid character '']'' at start of value' then
+      ok := False;
+  WriteLn('failers each their own: ', ok);
+
+  stop := 0;
+  pings := 0;
+  wp.Add(1);
+  pas Pinger;
+  before := AtomicLoad(pings);
+  wg.Add(NBig);
+  for i := 0 to NBig - 1 do
+    pas Big(i);
+  wg.Wait;
+  AtomicStore(stop, 1);
+  wp.Wait;
+  ok := True;
+  for i := 0 to NBig - 1 do
+    if bigs[i] <> 200000 + 199999 + i then
+      ok := False;
+  WriteLn('big documents: ', ok, ', pings while they parsed: ', AtomicLoad(pings) - before > 5);
+end.

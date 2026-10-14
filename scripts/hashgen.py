@@ -818,7 +818,7 @@ const
   { At most this many bytes go to a block routine in one call (P270):
     an asm block is not preempted, and the code between two calls is
     where the routine can be stopped, for the collector or for another
-    routine (§18). A multiple of 128, so of every block and of the 16
+    routine (§19). A multiple of 128, so of every block and of the 16
     bytes of CRC32's folding. }
   HashMaxBytes = 65536;
   { FIPS 180-4, 4.2.2: the first 32 bits of the fractional parts of

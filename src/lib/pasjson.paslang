@@ -18,10 +18,32 @@
   You should have received a copy of the GNU General Public License
   along with paslang.  If not, see <https://www.gnu.org/licenses/>. }
 
-{ JSON's scans, one kernel per machine (P202): the structural scan of
-  a text, which the parser reads (P203), and the escape finder of the
-  writer. Go reads JSON a byte at a time (encoding/json/jsontext), so
-  where it has no SIMD the scan follows simdjson 5.0.3's stage 1
+{ JSON in paslang (P202, P203): the json type's runtime, its words
+  (JsonParse, JsonEncode, EJsonError, the members of TJsonHelper) and
+  JSON's scans, one kernel per machine.
+
+  A document is one block that holds no pointer: a header, a node of 16
+  bytes for every value and every member's name in the order of the
+  text, and an arena for the characters of the strings and the text of
+  the numbers (docs/TYPES.md, json). A json is the address of a node, nil
+  for null; nothing writes a document once parsed, so any number of
+  routines read one at once. A parse checks the text is UTF-8 (passtr's
+  kernel), runs the structural scan below over it to count what the
+  document needs, reserves it once at that size and fills it as the
+  scan runs again, a window of 64 KiB at a time, under a state machine
+  with an explicit stack of the open containers (no recursion, so the
+  10000 levels Go takes need no stack): Go's encoding/json/v2 strictness
+  (jsontext/state.go, decode.go, jsonwire/decode.go) and its errors,
+  their offsets, pointers and reasons as Go's SyntacticError gives them.
+  The writer is Go's jsonwire (AppendQuote, AppendFloat, CompareUTF16)
+  in two passes, the size and then the bytes. Plain, a parser that reads
+  a byte at a time, is the one the tests hold the other to, block for
+  block.
+
+  The scans: the structural scan of a text, which the parser reads, and
+  the escape finder of the writer. Go reads JSON a byte at a time
+  (encoding/json/jsontext), so where it has no SIMD the scan follows
+  simdjson 5.0.3's stage 1
   (docs/ref/json/simdjson-5.0.3, src/generic/stage1:
   json_escape_scanner.h, json_string_scanner.h, json_scanner.h,
   json_structural_indexer.h; the classification of src/haswell.cpp and
@@ -71,6 +93,14 @@ unit pasjson;
 
 interface
 
+{ The json type's runtime (P203) is compiled by a paslangc that knows
+  json, 1.1.124 and after; an older one, the host that builds the stage
+  compiler (Regla 15), compiles the scans alone, which that compiler
+  links. }
+{$if PASLANG_FULLVERSION >= 1001124}
+uses pasobject, pasnum, passtr, pasfmt;
+{$endif}
+
 type
   { The scan's state from one call to the next, and its counts (P202);
     PasJsonScanStart sets it for a new text. }
@@ -82,6 +112,102 @@ type
     Scalars: Int64;   { scalars that are not strings }
     Bytes: Int64;     { bytes of the strings from their opening quote, and of the other scalars }
   end;
+
+{$if PASLANG_FULLVERSION >= 1001124}
+  { What a json value is (P203): null (nil is null too), true or
+    false, a number, a string, an array, an object. }
+  TJsonKind = (jkNull, jkBoolean, jkNumber, jkString, jkArray, jkObject);
+  { Why a parse or a read failed: the text is no JSON (jeSyntax), not
+    UTF-8 or holds a noncharacter (jeEncoding, RFC 7493 2.1), an object
+    names a member twice (jeDuplicate), nests past MaxDepth (jeDepth) or
+    is longer than MaxBytes (jeTooLarge); a read asked for a member
+    that is not there (jeMissing), of a value of another kind (jeType)
+    or for an element or a number past its range (jeRange). }
+  TJsonErrorKind = (jeSyntax, jeEncoding, jeDuplicate, jeDepth, jeTooLarge, jeMissing, jeType,
+    jeRange);
+
+  { How a parse reads and how JsonEncode writes, one call at a time:
+    nothing about JSON is global. JsonDefaults, JsonPretty and
+    JsonCanonical give the usual ones. }
+  TJsonOptions = record
+    MaxDepth: Integer;     { the deepest nesting a parse takes: 10000 by default, as Go's }
+    MaxBytes: Integer;     { the longest text a parse takes, 0 for any (at most 4 GiB - 1) }
+    Indent: string;        { JsonEncode: '' on one line, else a value a line, Indent a level }
+    Canonical: Boolean;    { JsonEncode: RFC 8785's form, which Indent does not change }
+    EscapeHtml: Boolean;   { JsonEncode: <, > and & as \u003c, \u003e and \u0026 }
+  end;
+
+  { The error of a parse or a read: where it is (Offset, the byte from
+    0; Line and Column, from 1, the column in bytes; 0 for a read), the
+    JSON Pointer of the value it is about (RFC 6901) and why. Like every
+    raised object, it belongs to the routine that raised it. }
+  EJsonError = class(TObject)
+  private
+    FKind: TJsonErrorKind;
+    FOffset, FLine, FColumn: Integer;
+    FPath, FReason, FMessage: string;
+  public
+    constructor Create(AKind: TJsonErrorKind; AOffset, ALine, AColumn: Integer;
+      const APath, AWhere, AReason: string);
+    function ToString: string; override;
+    property Kind: TJsonErrorKind read FKind;
+    property Offset: Integer read FOffset;
+    property Line: Integer read FLine;
+    property Column: Integer read FColumn;
+    property Path: string read FPath;
+    property Reason: string read FReason;
+    property Message: string read FMessage;
+  end;
+
+  { for ... in a json: the next child and how many are left. }
+  TJsonIter = record
+    Cur: Pointer;      { the next element, or the next member's name }
+    Left: Integer;
+    Index: Integer;    { the next element's place }
+    Obj: Boolean;
+  end;
+
+  { An object's members or an array's elements read in O(1) (P203): a
+    table of the names, seeded per index (XxHash3 with a seed from the
+    process's key, as an object's names are checked for twins), or the
+    places of the elements. It never changes once made, so any number
+    of routines read one at once, as the document. }
+  TJsonIndex = class(TObject)
+  private
+    FDoc: json;
+    FNames: array of Pointer;   { the name nodes, nil for a free slot }
+    FMask: Integer;
+    FSeed: Integer;
+    FItems: array of Pointer;   { an array's elements }
+  public
+    constructor Create(J: json);
+    function Get(const Name: string): json;
+    function Find(const Name: string): json;
+    function Has(const Name: string): Boolean;
+    function Item(I: Integer): json;
+    function Count: Integer;
+    property Doc: json read FDoc;
+  end;
+
+  { A json's members and their reads. A document never changes, so any
+    number of routines read one at once. A helper of a program's own
+    for json hides this one unless it descends from it:
+    type helper(TJsonHelper) for json. }
+  TJsonHelper = type helper for json
+    function Kind: TJsonKind;
+    function IsNull: Boolean;
+    function AsBoolean: Boolean;
+    function AsInteger: Integer;
+    function AsFloat: Double;
+    function AsQuad: Quad;
+    function AsCurrency: Currency;
+    function AsString: string;
+    function AsNumber: string;
+    function At(const Ptr: string): json;
+    function Find(const Name: string): json;
+  end;
+{$endif}
+
 
 procedure PasJsonScanStart(var S: TPasJsonScan);
 function PasJsonIndexPlain(P: Pointer; N: Int64; var S: TPasJsonScan; Idx: Pointer; Off: Int64): Int64;
@@ -95,12 +221,50 @@ function PasJsonEscIndexCpu(P: Pointer; N: Int64; Html: Boolean): Int64;
 function PasJsonEscIndexBase(P: Pointer; N: Int64; Html: Boolean): Int64;
 function PasJsonEscIndex(P: Pointer; N: Int64; Html: Boolean): Int64;
 
+{$if PASLANG_FULLVERSION >= 1001124}
+function JsonIndex(J: json): TJsonIndex;
+function JsonDefaults: TJsonOptions;
+function JsonPretty: TJsonOptions;
+function JsonCanonical: TJsonOptions;
+function JsonParse(const S: string): json; overload;
+function JsonParse(const S: string; const Opts: TJsonOptions): json; overload;
+function TryJsonParse(const S: string; out J: json; out Err: EJsonError): Boolean; overload;
+function TryJsonParse(const S: string; out J: json; out Err: EJsonError;
+  const Opts: TJsonOptions): Boolean; overload;
+function JsonEncode(J: json): string; overload;
+function JsonEncode(J: json; const Opts: TJsonOptions): string; overload;
+
+{ The words the compiler writes for j['k'], j[i], 'k' in j, TryGet,
+  Length, =, Write and for ... in (P203). }
+function PasJsonGet(J: json; const K: string): json;
+function PasJsonItem(J: json; I: Integer): json;
+function PasJsonHas(J: json; const K: string): Boolean;
+function PasJsonTryGet(J: json; const K: string; out V: json): Boolean;
+function PasJsonTryItem(J: json; I: Integer; out V: json): Boolean;
+function PasJsonLength(J: json): Integer;
+function PasJsonEqual(A, B: json): Boolean;
+function PasJsonText(J: json): string;
+procedure PasJsonIterInit(J: json; var It: TJsonIter; Want: Integer);
+function PasJsonNextValue(var It: TJsonIter; out V: json): Boolean;
+function PasJsonNextName(var It: TJsonIter; out K: string): Boolean;
+function PasJsonNextMember(var It: TJsonIter; out K: string; out V: json): Boolean;
+function PasJsonNextItem(var It: TJsonIter; out I: Integer; out V: json): Boolean;
+
+{ The parser that reads a byte at a time, without the index (Plain):
+  the tests hold the other to it, document for document (P203). Nil
+  and Err on an error, as TryJsonParse. }
+function PasJsonParsePlain(const S: string; const Opts: TJsonOptions; out Err: EJsonError): json;
+{ The bytes of the document J is the root of, its header to the end of
+  its arena: two parses of a text give the same. }
+function PasJsonImage(J: json): string;
+{$endif}
+
 implementation
 
 const
   { At most this many blocks of 64 bytes, 64 KiB, go to a kernel in one
     call: the code between two calls is where the routine can be
-    stopped, for the collector or for another routine (§18). }
+    stopped, for the collector or for another routine (§19). }
   JsonMaxBlocks = 1024;
 
   { The class of a byte b, JsonClassHi[b shr 4] and JsonClassLo[b and
@@ -1513,5 +1677,4231 @@ begin
     Result := PasJsonEscIndexBase(P, N, Html);
 {$endif}
 end;
+
+
+{$if PASLANG_FULLVERSION >= 1001124}
+{ ---- The document (P203) ---- }
+
+const
+  JsonHead = 32;      { the document's header: its mark, its nodes, the end of its arena, its text's length }
+  JsonMagic = $4E4F534A53415001;
+  JtNull = 0;
+  JtFalse = 1;
+  JtTrue = 2;
+  JtNum = 3;
+  JtStr = 4;
+  JtArr = 5;
+  JtObj = 6;
+  JfNoEsc = 8;
+  JfFlat = 8;
+  JnInt = 0;
+  JnUint = 8;
+  JnFloat = 16;
+  JnHuge = 24;
+  JnIntLit = 32;
+  JsonWin = 65536;
+  { an object's names are checked for twins one by one up to this many,
+    then through a set: Go's objectNamespace switches to its map past 64 }
+  JsonLinear = 64;
+  JsonMaxDoc = 4294967295;
+  JsonDepthMax = 10000;
+  { U+2026, the horizontal ellipsis of a pointer cut short }
+  Ellipsis = #226#128#166;
+
+  { the parser's states }
+  SValue = 0;     { a value: the top level, after a colon, after a comma in an array }
+  SArrFirst = 1;  { after an opening bracket: a value or the closing one }
+  SObjFirst = 2;  { after an opening brace: a name or the closing one }
+  SObjName = 3;   { after a comma in an object: a name }
+  SColon = 4;     { after a name: a colon }
+  SAfter = 5;     { after a value }
+
+  { where an error is, for its pointer (Go's appendStackPointer) }
+  WhereNext = 1;      { in the value that comes, or in the name: the member or the element }
+  WhereAt = 0;      { between two tokens: the container, or the member after its name }
+
+type
+  PJNode = ^TJNode;
+  TJNode = record
+    W0, W1: Int64;
+  end;
+
+  PJFrame = ^TJFrame;
+  TJFrame = record
+    Node: Int64;      { the container's node, from the first node }
+    Count: Int64;     { its elements or members done }
+    Name: Int64;      { an object: the node of its last name }
+    Obj: Boolean;
+    Flat: Boolean;
+    NSet: Int64;      { past JsonLinear members: the names in Names }
+    Names: array of Int64;
+  end;
+
+  TJErr = record
+    Kind: Integer;    { 0 syntax, 1 encoding, 2 duplicate, 3 depth, 4 too large }
+    Offset: Int64;
+    Path: string;
+    Reason: string;
+  end;
+
+  TJParse = record
+    T: PByte;
+    N: Int64;
+    Doc: array of Byte;
+    D: PByte;          { @Doc[0] }
+    Nodes: Int64;      { nodes written }
+    NodeCap: Int64;
+    Arena: Int64;      { the arena's next byte, from D }
+    ArenaEnd: Int64;
+    Idx: array of UInt32;
+    NIdx, I, Done0: Int64;
+    Scan: TPasJsonScan;
+    St: array of TJFrame;
+    Depth: Int64;
+    MaxDepth: Int64;
+    State: Integer;
+    Bad: Int64;        { the first byte that is not UTF-8, -1 none }
+    Seed: Int64;
+    Plain: Boolean;    { the Plain parser: a byte at a time, no index }
+    Cur: Int64;        { its next byte }
+    Failed: Boolean;
+    Err: TJErr;
+  end;
+
+var
+  JSeedKey: Integer;     { the process's secret key for the name sets: 0 until the first }
+  JSeedCount: Integer;   { the sets seeded so far }
+
+{ ---- errors ---- }
+
+function HexDigit(V: Integer): Char;
+begin
+  if V < 10 then
+    Result := Chr(48 + V)
+  else
+    Result := Chr(87 + V);
+end;
+
+{ The character at T[Off] (RFC 3629 3), its bytes in N: -1 when they
+  are not UTF-8 (an overlong form, a surrogate, past U+10FFFF, cut). }
+function DecodeAt(var P: TJParse; Off: Int64; out N: Int64): Integer;
+var
+  b, k, c, lo: Integer;
+begin
+  Result := -1;
+  N := 1;
+  b := P.T[Off];
+  if b < $80 then
+  begin
+    Result := b;
+    Exit;
+  end;
+  if (b >= $C2) and (b <= $DF) then
+  begin
+    N := 2;
+    c := b and $1F;
+    lo := $80;
+  end
+  else if (b >= $E0) and (b <= $EF) then
+  begin
+    N := 3;
+    c := b and $0F;
+    lo := $800;
+  end
+  else if (b >= $F0) and (b <= $F4) then
+  begin
+    N := 4;
+    c := b and $07;
+    lo := $10000;
+  end
+  else
+    Exit;
+  if Off + N > P.N then
+  begin
+    N := 1;
+    Exit;
+  end;
+  for k := 1 to N - 1 do
+  begin
+    if (P.T[Off + k] and $C0) <> $80 then
+    begin
+      N := 1;
+      Exit;
+    end;
+    c := (c shl 6) or (P.T[Off + k] and $3F);
+  end;
+  if (c < lo) or (c > $10FFFF) or ((c >= $D800) and (c <= $DFFF)) then
+  begin
+    N := 1;
+    Exit;
+  end;
+  Result := c;
+end;
+
+function Hex4Text(V: Integer; Digits: Integer): string;
+var
+  k: Integer;
+begin
+  Result := '';
+  for k := Digits - 1 downto 0 do
+    Result := Result + HexDigit((V shr (4 * k)) and 15);
+end;
+
+function TextAt(var P: TJParse; Off, N: Int64): string;
+var
+  k: Int64;
+begin
+  if Off + N > P.N then
+    N := P.N - Off;
+  SetLength(Result, N);
+  for k := 1 to N do
+    Result[k] := Chr(P.T[Off + k - 1]);
+end;
+
+const
+  { Go's strconv.IsPrint tables (src/strconv/isprint.go, from Go's
+    unicode tables by its makeisprint.go): ranges of printable
+    characters in pairs, and the ones inside them that are not }
+  JsonPrint16: array[0..411] of Word = (
+    $0020, $007E, $00A1, $0377, $037A, $037F, $0384, $0556,
+    $0559, $058A, $058D, $05C7, $05D0, $05EA, $05EF, $05F4,
+    $0606, $070D, $0710, $074A, $074D, $07B1, $07C0, $07FA,
+    $07FD, $082D, $0830, $085B, $085E, $086A, $0870, $088F,
+    $0897, $098C, $098F, $0990, $0993, $09B2, $09B6, $09B9,
+    $09BC, $09C4, $09C7, $09C8, $09CB, $09CE, $09D7, $09D7,
+    $09DC, $09E3, $09E6, $09FE, $0A01, $0A0A, $0A0F, $0A10,
+    $0A13, $0A39, $0A3C, $0A42, $0A47, $0A48, $0A4B, $0A4D,
+    $0A51, $0A51, $0A59, $0A5E, $0A66, $0A76, $0A81, $0AB9,
+    $0ABC, $0ACD, $0AD0, $0AD0, $0AE0, $0AE3, $0AE6, $0AF1,
+    $0AF9, $0B0C, $0B0F, $0B10, $0B13, $0B39, $0B3C, $0B44,
+    $0B47, $0B48, $0B4B, $0B4D, $0B55, $0B57, $0B5C, $0B63,
+    $0B66, $0B77, $0B82, $0B8A, $0B8E, $0B95, $0B99, $0B9F,
+    $0BA3, $0BA4, $0BA8, $0BAA, $0BAE, $0BB9, $0BBE, $0BC2,
+    $0BC6, $0BCD, $0BD0, $0BD0, $0BD7, $0BD7, $0BE6, $0BFA,
+    $0C00, $0C39, $0C3C, $0C4D, $0C55, $0C5D, $0C60, $0C63,
+    $0C66, $0C6F, $0C77, $0CB9, $0CBC, $0CCD, $0CD5, $0CD6,
+    $0CDC, $0CE3, $0CE6, $0CF3, $0D00, $0D4F, $0D54, $0D63,
+    $0D66, $0D96, $0D9A, $0DBD, $0DC0, $0DC6, $0DCA, $0DCA,
+    $0DCF, $0DDF, $0DE6, $0DEF, $0DF2, $0DF4, $0E01, $0E3A,
+    $0E3F, $0E5B, $0E81, $0EBD, $0EC0, $0ED9, $0EDC, $0EDF,
+    $0F00, $0F6C, $0F71, $0FDA, $1000, $10C7, $10CD, $10CD,
+    $10D0, $124D, $1250, $125D, $1260, $128D, $1290, $12B5,
+    $12B8, $12C5, $12C8, $1315, $1318, $135A, $135D, $137C,
+    $1380, $1399, $13A0, $13F5, $13F8, $13FD, $1400, $169C,
+    $16A0, $16F8, $1700, $1715, $171F, $1736, $1740, $1753,
+    $1760, $1773, $1780, $17DD, $17E0, $17E9, $17F0, $17F9,
+    $1800, $1819, $1820, $1878, $1880, $18AA, $18B0, $18F5,
+    $1900, $192B, $1930, $193B, $1940, $1940, $1944, $196D,
+    $1970, $1974, $1980, $19AB, $19B0, $19C9, $19D0, $19DA,
+    $19DE, $1A1B, $1A1E, $1A7C, $1A7F, $1A89, $1A90, $1A99,
+    $1AA0, $1AAD, $1AB0, $1ADD, $1AE0, $1AEB, $1B00, $1BF3,
+    $1BFC, $1C37, $1C3B, $1C49, $1C4D, $1C8A, $1C90, $1CBA,
+    $1CBD, $1CC7, $1CD0, $1CFA, $1D00, $1F15, $1F18, $1F1D,
+    $1F20, $1F45, $1F48, $1F4D, $1F50, $1F7D, $1F80, $1FD3,
+    $1FD6, $1FEF, $1FF2, $1FFE, $2010, $2027, $2030, $205E,
+    $2070, $2071, $2074, $209C, $20A0, $20C1, $20D0, $20F0,
+    $2100, $218B, $2190, $2429, $2440, $244A, $2460, $2B73,
+    $2B76, $2CF3, $2CF9, $2D27, $2D2D, $2D2D, $2D30, $2D67,
+    $2D6F, $2D70, $2D7F, $2D96, $2DA0, $2E5D, $2E80, $2EF3,
+    $2F00, $2FD5, $2FF0, $3096, $3099, $30FF, $3105, $31E5,
+    $31EF, $A48C, $A490, $A4C6, $A4D0, $A62B, $A640, $A6F7,
+    $A700, $A7DC, $A7F1, $A82C, $A830, $A839, $A840, $A877,
+    $A880, $A8C5, $A8CE, $A8D9, $A8E0, $A953, $A95F, $A97C,
+    $A980, $A9D9, $A9DE, $AA36, $AA40, $AA4D, $AA50, $AA59,
+    $AA5C, $AAC2, $AADB, $AAF6, $AB01, $AB06, $AB09, $AB0E,
+    $AB11, $AB16, $AB20, $AB6B, $AB70, $ABED, $ABF0, $ABF9,
+    $AC00, $D7A3, $D7B0, $D7C6, $D7CB, $D7FB, $F900, $FA6D,
+    $FA70, $FAD9, $FB00, $FB06, $FB13, $FB17, $FB1D, $FDCF,
+    $FDF0, $FE19, $FE20, $FE6B, $FE70, $FEFC, $FF01, $FFBE,
+    $FFC2, $FFC7, $FFCA, $FFCF, $FFD2, $FFD7, $FFDA, $FFDC,
+    $FFE0, $FFEE, $FFFC, $FFFD);
+  JsonNotPrint16: array[0..131] of Word = (
+    $00AD, $038B, $038D, $03A2, $0530, $0590, $061C, $06DD,
+    $083F, $085F, $08E2, $0984, $09A9, $09B1, $09DE, $0A04,
+    $0A29, $0A31, $0A34, $0A37, $0A3D, $0A5D, $0A84, $0A8E,
+    $0A92, $0AA9, $0AB1, $0AB4, $0AC6, $0ACA, $0B00, $0B04,
+    $0B29, $0B31, $0B34, $0B5E, $0B84, $0B91, $0B9B, $0B9D,
+    $0BC9, $0C0D, $0C11, $0C29, $0C45, $0C49, $0C57, $0C5B,
+    $0C8D, $0C91, $0CA9, $0CB4, $0CC5, $0CC9, $0CDF, $0CF0,
+    $0D0D, $0D11, $0D45, $0D49, $0D80, $0D84, $0DB2, $0DBC,
+    $0DD5, $0DD7, $0E83, $0E85, $0E8B, $0EA4, $0EA6, $0EC5,
+    $0EC7, $0ECF, $0F48, $0F98, $0FBD, $0FCD, $10C6, $1249,
+    $1257, $1259, $1289, $12B1, $12BF, $12C1, $12D7, $1311,
+    $1680, $176D, $1771, $180E, $191F, $1A5F, $1B4D, $1F58,
+    $1F5A, $1F5C, $1F5E, $1FB5, $1FC5, $1FDC, $1FF5, $208F,
+    $2D26, $2DA7, $2DAF, $2DB7, $2DBF, $2DC7, $2DCF, $2DD7,
+    $2DDF, $2E9A, $3000, $3040, $3130, $318F, $321F, $A9CE,
+    $A9FF, $AB27, $AB2F, $FB37, $FB3D, $FB3F, $FB42, $FB45,
+    $FE53, $FE67, $FE75, $FFE7);
+  JsonPrint32: array[0..565] of UInt32 = (
+    $00010000, $0001004D, $00010050, $0001005D, $00010080, $000100FA,
+    $00010100, $00010102, $00010107, $00010133, $00010137, $0001019C,
+    $000101A0, $000101A0, $000101D0, $000101FD, $00010280, $0001029C,
+    $000102A0, $000102D0, $000102E0, $000102FB, $00010300, $00010323,
+    $0001032D, $0001034A, $00010350, $0001037A, $00010380, $000103C3,
+    $000103C8, $000103D5, $00010400, $0001049D, $000104A0, $000104A9,
+    $000104B0, $000104D3, $000104D8, $000104FB, $00010500, $00010527,
+    $00010530, $00010563, $0001056F, $000105BC, $000105C0, $000105F3,
+    $00010600, $00010736, $00010740, $00010755, $00010760, $00010767,
+    $00010780, $000107BA, $00010800, $00010805, $00010808, $00010838,
+    $0001083C, $0001083C, $0001083F, $0001089E, $000108A7, $000108AF,
+    $000108E0, $000108F5, $000108FB, $0001091B, $0001091F, $00010939,
+    $0001093F, $00010959, $00010980, $000109B7, $000109BC, $000109CF,
+    $000109D2, $00010A06, $00010A0C, $00010A35, $00010A38, $00010A3A,
+    $00010A3F, $00010A48, $00010A50, $00010A58, $00010A60, $00010A9F,
+    $00010AC0, $00010AE6, $00010AEB, $00010AF6, $00010B00, $00010B35,
+    $00010B39, $00010B55, $00010B58, $00010B72, $00010B78, $00010B91,
+    $00010B99, $00010B9C, $00010BA9, $00010BAF, $00010C00, $00010C48,
+    $00010C80, $00010CB2, $00010CC0, $00010CF2, $00010CFA, $00010D27,
+    $00010D30, $00010D39, $00010D40, $00010D65, $00010D69, $00010D85,
+    $00010D8E, $00010D8F, $00010E60, $00010EAD, $00010EB0, $00010EB1,
+    $00010EC2, $00010EC7, $00010ED0, $00010ED8, $00010EFA, $00010F27,
+    $00010F30, $00010F59, $00010F70, $00010F89, $00010FB0, $00010FCB,
+    $00010FE0, $00010FF6, $00011000, $0001104D, $00011052, $00011075,
+    $0001107F, $000110C2, $000110D0, $000110E8, $000110F0, $000110F9,
+    $00011100, $00011147, $00011150, $00011176, $00011180, $000111F4,
+    $00011200, $00011241, $00011280, $000112A9, $000112B0, $000112EA,
+    $000112F0, $000112F9, $00011300, $0001130C, $0001130F, $00011310,
+    $00011313, $00011344, $00011347, $00011348, $0001134B, $0001134D,
+    $00011350, $00011350, $00011357, $00011357, $0001135D, $00011363,
+    $00011366, $0001136C, $00011370, $00011374, $00011380, $0001138B,
+    $0001138E, $000113C2, $000113C5, $000113D8, $000113E1, $000113E2,
+    $00011400, $00011461, $00011480, $000114C7, $000114D0, $000114D9,
+    $00011580, $000115B5, $000115B8, $000115DD, $00011600, $00011644,
+    $00011650, $00011659, $00011660, $0001166C, $00011680, $000116B9,
+    $000116C0, $000116C9, $000116D0, $000116E3, $00011700, $0001171A,
+    $0001171D, $0001172B, $00011730, $00011746, $00011800, $0001183B,
+    $000118A0, $000118F2, $000118FF, $00011906, $00011909, $00011909,
+    $0001190C, $00011938, $0001193B, $00011946, $00011950, $00011959,
+    $000119A0, $000119A7, $000119AA, $000119D7, $000119DA, $000119E4,
+    $00011A00, $00011A47, $00011A50, $00011AA2, $00011AB0, $00011AF8,
+    $00011B00, $00011B09, $00011B60, $00011B67, $00011BC0, $00011BE1,
+    $00011BF0, $00011BF9, $00011C00, $00011C45, $00011C50, $00011C6C,
+    $00011C70, $00011C8F, $00011C92, $00011CB6, $00011D00, $00011D36,
+    $00011D3A, $00011D47, $00011D50, $00011D59, $00011D60, $00011D98,
+    $00011DA0, $00011DA9, $00011DB0, $00011DDB, $00011DE0, $00011DE9,
+    $00011EE0, $00011EF8, $00011F00, $00011F3A, $00011F3E, $00011F5A,
+    $00011FB0, $00011FB0, $00011FC0, $00011FF1, $00011FFF, $00012399,
+    $00012400, $00012474, $00012480, $00012543, $00012F90, $00012FF2,
+    $00013000, $0001342F, $00013440, $00013455, $00013460, $000143FA,
+    $00014400, $00014646, $00016100, $00016139, $00016800, $00016A38,
+    $00016A40, $00016A69, $00016A6E, $00016AC9, $00016AD0, $00016AED,
+    $00016AF0, $00016AF5, $00016B00, $00016B45, $00016B50, $00016B77,
+    $00016B7D, $00016B8F, $00016D40, $00016D79, $00016E40, $00016E9A,
+    $00016EA0, $00016EB8, $00016EBB, $00016ED3, $00016F00, $00016F4A,
+    $00016F4F, $00016F87, $00016F8F, $00016F9F, $00016FE0, $00016FE4,
+    $00016FF0, $00016FF6, $00017000, $00018CD5, $00018CFF, $00018D1E,
+    $00018D80, $00018DF2, $0001AFF0, $0001B122, $0001B132, $0001B132,
+    $0001B150, $0001B152, $0001B155, $0001B155, $0001B164, $0001B167,
+    $0001B170, $0001B2FB, $0001BC00, $0001BC6A, $0001BC70, $0001BC7C,
+    $0001BC80, $0001BC88, $0001BC90, $0001BC99, $0001BC9C, $0001BC9F,
+    $0001CC00, $0001CCFC, $0001CD00, $0001CEB3, $0001CEBA, $0001CED0,
+    $0001CEE0, $0001CEF0, $0001CF00, $0001CF2D, $0001CF30, $0001CF46,
+    $0001CF50, $0001CFC3, $0001D000, $0001D0F5, $0001D100, $0001D126,
+    $0001D129, $0001D172, $0001D17B, $0001D1EA, $0001D200, $0001D245,
+    $0001D2C0, $0001D2D3, $0001D2E0, $0001D2F3, $0001D300, $0001D356,
+    $0001D360, $0001D378, $0001D400, $0001D49F, $0001D4A2, $0001D4A2,
+    $0001D4A5, $0001D4A6, $0001D4A9, $0001D50A, $0001D50D, $0001D546,
+    $0001D54A, $0001D6A5, $0001D6A8, $0001D7CB, $0001D7CE, $0001DA8B,
+    $0001DA9B, $0001DAAF, $0001DF00, $0001DF1E, $0001DF25, $0001DF2A,
+    $0001E000, $0001E018, $0001E01B, $0001E02A, $0001E030, $0001E06D,
+    $0001E08F, $0001E08F, $0001E100, $0001E12C, $0001E130, $0001E13D,
+    $0001E140, $0001E149, $0001E14E, $0001E14F, $0001E290, $0001E2AE,
+    $0001E2C0, $0001E2F9, $0001E2FF, $0001E2FF, $0001E4D0, $0001E4F9,
+    $0001E5D0, $0001E5FA, $0001E5FF, $0001E5FF, $0001E6C0, $0001E6F5,
+    $0001E6FE, $0001E6FF, $0001E7E0, $0001E8C4, $0001E8C7, $0001E8D6,
+    $0001E900, $0001E94B, $0001E950, $0001E959, $0001E95E, $0001E95F,
+    $0001EC71, $0001ECB4, $0001ED01, $0001ED3D, $0001EE00, $0001EE24,
+    $0001EE27, $0001EE3B, $0001EE42, $0001EE42, $0001EE47, $0001EE54,
+    $0001EE57, $0001EE64, $0001EE67, $0001EE9B, $0001EEA1, $0001EEBB,
+    $0001EEF0, $0001EEF1, $0001F000, $0001F02B, $0001F030, $0001F093,
+    $0001F0A0, $0001F0AE, $0001F0B1, $0001F0F5, $0001F100, $0001F1AD,
+    $0001F1E6, $0001F202, $0001F210, $0001F23B, $0001F240, $0001F248,
+    $0001F250, $0001F251, $0001F260, $0001F265, $0001F300, $0001F6D8,
+    $0001F6DC, $0001F6EC, $0001F6F0, $0001F6FC, $0001F700, $0001F7D9,
+    $0001F7E0, $0001F7EB, $0001F7F0, $0001F7F0, $0001F800, $0001F80B,
+    $0001F810, $0001F847, $0001F850, $0001F859, $0001F860, $0001F887,
+    $0001F890, $0001F8AD, $0001F8B0, $0001F8BB, $0001F8C0, $0001F8C1,
+    $0001F8D0, $0001F8D8, $0001F900, $0001FA57, $0001FA60, $0001FA6D,
+    $0001FA70, $0001FA7C, $0001FA80, $0001FA8A, $0001FA8E, $0001FAC8,
+    $0001FACD, $0001FADC, $0001FADF, $0001FAEA, $0001FAEF, $0001FAF8,
+    $0001FB00, $0001FBFA, $00020000, $0002A6DF, $0002A700, $0002B81D,
+    $0002B820, $0002CEAD, $0002CEB0, $0002EBE0, $0002EBF0, $0002EE5D,
+    $0002F800, $0002FA1D, $00030000, $0003134A, $00031350, $00033479,
+    $000E0100, $000E01EF);
+  JsonNotPrint32: array[0..119] of Word = (
+    $000C, $0027, $003B, $003E, $018F, $039E, $057B, $058B,
+    $0593, $0596, $05A2, $05B2, $05BA, $0786, $07B1, $0809,
+    $0836, $0856, $08F3, $0A04, $0A14, $0A18, $0E7F, $0EAA,
+    $10BD, $1135, $11E0, $1212, $1287, $1289, $128E, $129E,
+    $1304, $1329, $1331, $1334, $133A, $138A, $138F, $13B6,
+    $13C1, $13C6, $13CB, $13D6, $145C, $1914, $1917, $1936,
+    $1C09, $1C37, $1CA8, $1D07, $1D0A, $1D3B, $1D3E, $1D66,
+    $1D69, $1D8F, $1D92, $1F11, $246F, $6A5F, $6ABF, $6B5A,
+    $6B62, $AFF4, $AFFC, $AFFF, $D455, $D49D, $D4AD, $D4BA,
+    $D4BC, $D4C4, $D506, $D515, $D51D, $D53A, $D53F, $D545,
+    $D551, $DAA0, $E007, $E022, $E025, $E6DF, $E7E7, $E7EC,
+    $E7EF, $E7FF, $EE04, $EE20, $EE23, $EE28, $EE33, $EE38,
+    $EE3A, $EE48, $EE4A, $EE4C, $EE50, $EE53, $EE58, $EE5A,
+    $EE5C, $EE5E, $EE60, $EE63, $EE6B, $EE73, $EE78, $EE7D,
+    $EE7F, $EE8A, $EEA4, $EEAA, $F0C0, $F0D0, $FAC7, $FB93);
+  { 412 + 132 + 566 + 120 entries }
+
+
+{ Go's strconv.IsPrint (quote.go): a letter, a mark, a number, a
+  punctuation mark, a symbol or the ASCII space. }
+function GoIsPrint(R: Integer): Boolean;
+var
+  lo, hi, m, n: Integer;
+begin
+  if R <= $FF then
+  begin
+    Result := ((R >= $20) and (R <= $7E)) or ((R >= $A1) and (R <= $FF) and (R <> $AD));
+    Exit;
+  end;
+  Result := False;
+  if R < $10000 then
+  begin
+    n := Length(JsonPrint16);
+    lo := 0;
+    hi := n;
+    while lo < hi do
+    begin
+      m := lo + (hi - lo) shr 1;
+      if JsonPrint16[m] < R then
+        lo := m + 1
+      else
+        hi := m;
+    end;
+    if (lo >= n) or (R < JsonPrint16[lo and not 1]) or (JsonPrint16[lo or 1] < R) then
+      Exit;
+    n := Length(JsonNotPrint16);
+    lo := 0;
+    hi := n;
+    while lo < hi do
+    begin
+      m := lo + (hi - lo) shr 1;
+      if JsonNotPrint16[m] < R then
+        lo := m + 1
+      else
+        hi := m;
+    end;
+    Result := not ((lo < n) and (JsonNotPrint16[lo] = R));
+    Exit;
+  end;
+  n := Length(JsonPrint32);
+  lo := 0;
+  hi := n;
+  while lo < hi do
+  begin
+    m := lo + (hi - lo) shr 1;
+    if JsonPrint32[m] < R then
+      lo := m + 1
+    else
+      hi := m;
+  end;
+  if (lo >= n) or (R < JsonPrint32[lo and not 1]) or (JsonPrint32[lo or 1] < R) then
+    Exit;
+  if R >= $20000 then
+  begin
+    Result := True;
+    Exit;
+  end;
+  R := R - $10000;
+  n := Length(JsonNotPrint32);
+  lo := 0;
+  hi := n;
+  while lo < hi do
+  begin
+    m := lo + (hi - lo) shr 1;
+    if JsonNotPrint32[m] < R then
+      lo := m + 1
+    else
+      hi := m;
+  end;
+  Result := not ((lo < n) and (JsonNotPrint32[lo] = R));
+end;
+
+{ Go's unicode.IsSpace: the ASCII white space, U+0085, U+00A0 and the
+  separators of Unicode's Z category. }
+function GoIsSpace(R: Integer): Boolean;
+begin
+  case R of
+    9, 10, 11, 12, 13, 32, $85, $A0, $1680, $2000..$200A, $2028, $2029, $202F, $205F, $3000:
+      Result := True;
+  else
+    Result := False;
+  end;
+end;
+
+{ The character R escaped as Go's strconv.appendEscapedRune writes it
+  between quotes Q: itself when printable, a short escape, \xHH below
+  space and for DEL, \uHHHH, \UHHHHHHHH. }
+function GoEscRune(R, Q: Integer; const Raw: string): string;
+begin
+  if (R = Q) or (R = 92) then
+  begin
+    Result := '\' + Chr(R);
+    Exit;
+  end;
+  if GoIsPrint(R) then
+  begin
+    Result := Raw;
+    Exit;
+  end;
+  case R of
+    7: Result := '\a';
+    8: Result := '\b';
+    12: Result := '\f';
+    10: Result := '\n';
+    13: Result := '\r';
+    9: Result := '\t';
+    11: Result := '\v';
+  else
+    if (R < 32) or (R = 127) then
+      Result := '\x' + Hex4Text(R, 2)
+    else if R < $10000 then
+      Result := '\u' + Hex4Text(R, 4)
+    else
+      Result := '\U' + Hex4Text(R, 8);
+  end;
+end;
+
+{ The character at T[Off] quoted as Go's jsonwire.QuoteRune does: '\xHH'
+  for a byte that is not UTF-8, else strconv.QuoteRune. }
+function QuoteAt(var P: TJParse; Off: Int64): string;
+var
+  c: Integer;
+  n: Int64;
+begin
+  c := DecodeAt(P, Off, n);
+  if c < 0 then
+    Result := '''\x' + Hex4Text(P.T[Off], 2) + ''''
+  else
+    Result := '''' + GoEscRune(c, 39, TextAt(P, Off, n)) + '''';
+end;
+
+{ S quoted as Go's strconv.Quote does: between double quotes, each
+  character by GoEscRune, a byte that is not UTF-8 as \xHH. }
+function GoQuoteStr(const S: string): string;
+var
+  q: TJParse;
+  i, k: Int64;
+  c: Integer;
+begin
+  q := Default(TJParse);
+  q.T := PByte(Pointer(S));
+  q.N := Length(S);
+  Result := '"';
+  i := 0;
+  while i < q.N do
+  begin
+    c := DecodeAt(q, i, k);
+    if c < 0 then
+    begin
+      Result := Result + '\x' + Hex4Text(q.T[i], 2);
+      i := i + 1;
+    end
+    else
+    begin
+      Result := Result + GoEscRune(c, 34, Copy(S, i + 1, k));
+      i := i + k;
+    end;
+  end;
+  Result := Result + '"';
+end;
+
+{ The text T[Off..Off+N-1] of an error, as Go's InvalidTextError writes
+  it: one character quoted as QuoteAt; in backquotes when it holds no
+  backquote, no space, nothing that is not UTF-8 or not printable; else
+  as Go's strconv.Quote. N is cut to the text's end. }
+function WhatText(var P: TJParse; Off, N: Int64): string;
+var
+  i, k, runes: Int64;
+  c: Integer;
+  esc: Boolean;
+begin
+  if Off + N > P.N then
+    N := P.N - Off;
+  runes := 0;
+  esc := False;
+  i := Off;
+  while i < Off + N do
+  begin
+    c := DecodeAt(P, i, k);
+    { a character the end of the text cut is no character: a byte }
+    if (c >= 0) and (i + k > Off + N) then
+    begin
+      c := -1;
+      k := 1;
+    end;
+    if (c < 0) or (c = $FFFD) or (c = 96) or GoIsSpace(c) or not GoIsPrint(c) then
+      esc := True;
+    i := i + k;
+    runes := runes + 1;
+  end;
+  if runes = 1 then
+  begin
+    Result := QuoteAt(P, Off);
+    Exit;
+  end;
+  if not esc then
+  begin
+    Result := '`' + TextAt(P, Off, N) + '`';
+    Exit;
+  end;
+  Result := '"';
+  i := Off;
+  while i < Off + N do
+  begin
+    c := DecodeAt(P, i, k);
+    if (c < 0) or (i + k > Off + N) then
+    begin
+      Result := Result + '\x' + Hex4Text(P.T[i], 2);
+      i := i + 1;
+    end
+    else
+    begin
+      Result := Result + GoEscRune(c, 34, TextAt(P, i, k));
+      i := i + k;
+    end;
+  end;
+  Result := Result + '"';
+end;
+
+{ Why the text is not I-JSON at Bad, the first byte PasUtf8Valid
+  refused: a noncharacter (RFC 7493 2.1), or no UTF-8. }
+{ Whether T[Off..] is the start of a character the end of the text
+  cuts: Go's utf8.FullRune is false there, and jsonwire says
+  unexpected EOF, not invalid UTF-8. }
+function CutRune(var P: TJParse; Off: Int64): Boolean;
+var
+  b, need, lo, hi: Integer;
+  n: Int64;
+begin
+  Result := False;
+  n := P.N - Off;
+  b := P.T[Off];
+  if (b >= $C2) and (b <= $DF) then
+    need := 2
+  else if (b >= $E0) and (b <= $EF) then
+    need := 3
+  else if (b >= $F0) and (b <= $F4) then
+    need := 4
+  else
+    Exit;
+  if n >= need then
+    Exit;
+  { the second byte's range by the first (RFC 3629 4) }
+  lo := $80;
+  hi := $BF;
+  if b = $E0 then
+    lo := $A0
+  else if b = $ED then
+    hi := $9F
+  else if b = $F0 then
+    lo := $90
+  else if b = $F4 then
+    hi := $8F;
+  if (n > 1) and ((P.T[Off + 1] < lo) or (P.T[Off + 1] > hi)) then
+    Exit;
+  if (n > 2) and ((P.T[Off + 2] < $80) or (P.T[Off + 2] > $BF)) then
+    Exit;
+  Result := True;
+end;
+
+function BadReason(var P: TJParse): string;
+var
+  c: Integer;
+  n: Int64;
+begin
+  c := DecodeAt(P, P.Bad, n);
+  if CutRune(P, P.Bad) then
+    Result := 'unexpected EOF'
+  else if c >= 0 then
+    Result := 'invalid character ' + QuoteAt(P, P.Bad) + ' in string: a noncharacter (RFC 7493 2.1)'
+  else
+    Result := 'invalid UTF-8';
+end;
+
+function BadKind(var P: TJParse): Integer;
+begin
+  if CutRune(P, P.Bad) then
+    Result := 0
+  else
+    Result := 1;
+end;
+
+function IntText(V: Int64): string;
+begin
+  Str(V, Result);
+end;
+
+{ A name as a JSON Pointer token (RFC 6901 3): ~ as ~0, / as ~1. }
+function PtrToken(P: PByte; N: Int64): string;
+var
+  i: Int64;
+begin
+  Result := '';
+  for i := 0 to N - 1 do
+    if P[i] = 126 then
+      Result := Result + '~0'
+    else if P[i] = 47 then
+      Result := Result + '~1'
+    else
+      Result := Result + Chr(P[i]);
+end;
+
+function NodeAt(var P: TJParse; K: Int64): PJNode;
+begin
+  Result := PJNode(@P.D[JsonHead + K * 16]);
+end;
+
+function StrBytes(N: PJNode): PByte;
+begin
+  Result := PByte(Pointer(Integer(N) + N^.W1));
+end;
+
+function StrLen(N: PJNode): Int64;
+begin
+  Result := N^.W0 shr 8;
+end;
+
+{ The pointer of the error (Go's appendStackPointer): every open
+  container but the last by the member or the element it is in, the
+  last by Where and the state. }
+function ErrPath(var P: TJParse; Where: Integer): string;
+var
+  i: Int64;
+  f: PJNode;
+  last, named: Boolean;
+begin
+  Result := '';
+  for i := 0 to P.Depth - 1 do
+  begin
+    last := i = P.Depth - 1;
+    if P.St[i].Obj then
+    begin
+      named := (not last) or (P.State = SColon) or
+        ((P.State = SValue) and (P.St[i].Name >= 0));
+      if not named then
+        Exit;
+      f := NodeAt(P, P.St[i].Name);
+      Result := Result + '/' + PtrToken(StrBytes(f), StrLen(f));
+    end
+    else
+    begin
+      if last and ((Where = WhereAt) or (P.State = SAfter)) then
+        Exit;
+      Result := Result + '/' + IntText(P.St[i].Count);
+    end;
+  end;
+end;
+
+procedure SetErr(var P: TJParse; Kind: Integer; Off: Int64; Where: Integer; const Reason: string);
+begin
+  if P.Failed then
+    Exit;
+  { the first error in the text's order: a byte that is not UTF-8
+    before this one is the error }
+  if (P.Bad >= 0) and (P.Bad < Off) then
+  begin
+    P.Failed := True;
+    P.Err.Kind := 1;
+    if CutRune(P, P.Bad) then
+      P.Err.Kind := 0;
+    P.Err.Offset := P.Bad;
+    P.Err.Path := ErrPath(P, WhereNext);
+    P.Err.Reason := BadReason(P);
+    Exit;
+  end;
+  P.Failed := True;
+  P.Err.Kind := Kind;
+  P.Err.Offset := Off;
+  P.Err.Path := ErrPath(P, Where);
+  P.Err.Reason := Reason;
+end;
+
+procedure SetEof(var P: TJParse; Off: Int64; Where: Integer);
+begin
+  SetErr(P, 0, Off, Where, 'unexpected EOF');
+end;
+
+{ ---- the index, a window at a time ---- }
+
+function Refill(var P: TJParse): Boolean;
+var
+  take, k: Int64;
+begin
+  Result := False;
+  while P.Done0 < P.N do
+  begin
+    take := P.N - P.Done0;
+    if take > JsonWin then
+    begin
+      take := JsonWin;
+      k := PasJsonIndexBlocks(@P.T[P.Done0], take shr 6, P.Scan, @P.Idx[0], P.Done0);
+    end
+    else
+      k := PasJsonIndex(@P.T[P.Done0], take, P.Scan, @P.Idx[0], P.Done0);
+    P.Done0 := P.Done0 + take;
+    P.NIdx := k;
+    P.I := 0;
+    if k > 0 then
+    begin
+      Result := True;
+      Exit;
+    end;
+  end;
+end;
+
+function NextEnt(var P: TJParse; out E: Int64): Boolean;
+begin
+  if P.I >= P.NIdx then
+    if not Refill(P) then
+    begin
+      E := P.N;
+      Result := False;
+      Exit;
+    end;
+  E := P.Idx[P.I];
+  P.I := P.I + 1;
+  Result := True;
+end;
+
+{ The Plain parser's next token: the first byte after white space. }
+function NextTokPlain(var P: TJParse; out E: Int64): Boolean;
+var
+  b: Integer;
+begin
+  while P.Cur < P.N do
+  begin
+    b := P.T[P.Cur];
+    if (b <> 32) and (b <> 9) and (b <> 10) and (b <> 13) then
+    begin
+      E := P.Cur;
+      P.Cur := P.Cur + 1;
+      Result := True;
+      Exit;
+    end;
+    P.Cur := P.Cur + 1;
+  end;
+  E := P.N;
+  Result := False;
+end;
+
+function NextTok(var P: TJParse; out E: Int64): Boolean;
+begin
+  if P.Plain then
+    Result := NextTokPlain(P, E)
+  else
+    Result := NextEnt(P, E);
+end;
+
+{ ---- nodes ---- }
+
+function NewNode(var P: TJParse; W0, W1: Int64): Int64;
+var
+  nd: PJNode;
+begin
+  Result := P.Nodes;
+  nd := NodeAt(P, Result);
+  nd^.W0 := W0;
+  nd^.W1 := W1;
+  P.Nodes := P.Nodes + 1;
+  if P.Depth > 0 then
+    if (W0 and 7) >= JtArr then
+      P.St[P.Depth - 1].Flat := False;
+end;
+
+{ ---- strings ---- }
+
+function HexVal(B: Integer): Integer;
+begin
+  if (B >= 48) and (B <= 57) then
+    Result := B - 48
+  else if (B >= 65) and (B <= 70) then
+    Result := B - 55
+  else if (B >= 97) and (B <= 102) then
+    Result := B - 87
+  else
+    Result := -1;
+end;
+
+{ The 4 hex digits at T[Off..Off+3], -1 when one is not. }
+function Hex4(var P: TJParse; Off: Int64): Integer;
+var
+  k, h: Integer;
+begin
+  Result := 0;
+  for k := 0 to 3 do
+  begin
+    h := HexVal(P.T[Off + k]);
+    if h < 0 then
+    begin
+      Result := -1;
+      Exit;
+    end;
+    Result := Result * 16 + h;
+  end;
+end;
+
+
+
+{ Whether T[Off..N-1], the end of the text, can start an escape \uXXXX
+  (with LowHalf, one of a low surrogate): Go's hasEscapedUTF16Prefix; the
+  text then ends in the escape, unexpected EOF, not a wrong one. }
+function EscPrefix(var P: TJParse; Off: Int64; LowHalf: Boolean): Boolean;
+var
+  i, c: Int64;
+begin
+  Result := False;
+  for i := 0 to P.N - Off - 1 do
+  begin
+    c := P.T[Off + i];
+    if (i = 0) and (c <> 92) then
+      Exit;
+    if (i = 1) and (c <> 117) then
+      Exit;
+    if (i = 2) and LowHalf and (c <> 100) and (c <> 68) then
+      Exit;
+    if (i = 3) and LowHalf and not (((c >= 99) and (c <= 102)) or ((c >= 67) and (c <= 70))) then
+      Exit;
+    if (i >= 2) and (i < 6) and (HexVal(c) < 0) then
+      Exit;
+  end;
+  Result := True;
+end;
+
+{ A noncharacter (Unicode 3.4 D14, refused by I-JSON, RFC 7493 2.1):
+  U+FDD0 to U+FDEF and the last two of every plane. }
+function NonChar(C: Integer): Boolean;
+begin
+  Result := ((C >= $FDD0) and (C <= $FDEF)) or ((C and $FFFE) = $FFFE);
+end;
+
+{ The character C written in UTF-8 at D[A], A moved past it. }
+procedure PutRune(var P: TJParse; var A: Int64; C: Int64);
+begin
+  if C < $80 then
+  begin
+    P.D[A] := Byte(C);
+    A := A + 1;
+  end
+  else if C < $800 then
+  begin
+    P.D[A] := Byte($C0 or (C shr 6));
+    P.D[A + 1] := Byte($80 or (C and $3F));
+    A := A + 2;
+  end
+  else if C < $10000 then
+  begin
+    P.D[A] := Byte($E0 or (C shr 12));
+    P.D[A + 1] := Byte($80 or ((C shr 6) and $3F));
+    P.D[A + 2] := Byte($80 or (C and $3F));
+    A := A + 3;
+  end
+  else
+  begin
+    P.D[A] := Byte($F0 or (C shr 18));
+    P.D[A + 1] := Byte($80 or ((C shr 12) and $3F));
+    P.D[A + 2] := Byte($80 or ((C shr 6) and $3F));
+    P.D[A + 3] := Byte($80 or (C and $3F));
+    A := A + 4;
+  end;
+end;
+
+{ The escape whose backslash is at E (RFC 8259 7, Go's jsonwire
+  ConsumeStringResumable): its character written at D[A], Src the byte
+  after it, Pair when it was a surrogate pair (two escapes). A high
+  surrogate needs a low one after it; a noncharacter is refused (RFC
+  7493 2.1). False on an error. }
+function Escape(var P: TJParse; E: Int64; var A: Int64; out Src: Int64; out Pair: Boolean): Boolean;
+var
+  c, r, r2: Int64;
+begin
+  Result := False;
+  Pair := False;
+  Src := E + 2;
+  if E + 1 >= P.N then
+  begin
+    SetEof(P, E, WhereNext);
+    Exit;
+  end;
+  c := P.T[E + 1];
+  case c of
+    34, 92, 47: r := c;
+    98: r := 8;
+    102: r := 12;
+    110: r := 10;
+    114: r := 13;
+    116: r := 9;
+    117:
+      begin
+        if E + 6 > P.N then
+        begin
+          if EscPrefix(P, E, False) then
+            SetEof(P, E, WhereNext)
+          else
+            SetErr(P, 0, E, WhereNext, 'invalid escape sequence ' + WhatText(P, E, 6) + ' in string');
+          Exit;
+        end;
+        r := Hex4(P, E + 2);
+        if r < 0 then
+        begin
+          SetErr(P, 0, E, WhereNext, 'invalid escape sequence ' + WhatText(P, E, 6) + ' in string');
+          Exit;
+        end;
+        Src := E + 6;
+        if (r >= $D800) and (r <= $DFFF) then
+        begin
+          if E + 12 > P.N then
+          begin
+            if EscPrefix(P, E + 6, True) then
+              SetEof(P, E, WhereNext)
+            else
+              SetErr(P, 0, E, WhereNext, 'invalid surrogate pair ' + WhatText(P, E, 12) + ' in string');
+            Exit;
+          end;
+          r2 := -1;
+          if (P.T[E + 6] = 92) and (P.T[E + 7] = 117) then
+            r2 := Hex4(P, E + 8);
+          if (r > $DBFF) or (r2 < $DC00) or (r2 > $DFFF) then
+          begin
+            SetErr(P, 0, E, WhereNext, 'invalid surrogate pair ' + WhatText(P, E, 12) + ' in string');
+            Exit;
+          end;
+          r := $10000 + ((r - $D800) shl 10) + (r2 - $DC00);
+          Src := E + 12;
+          Pair := True;
+        end;
+        if NonChar(r) then
+        begin
+          SetErr(P, 1, E, WhereNext, 'invalid escape sequence ' + WhatText(P, E, Src - E) +
+            ' in string: a noncharacter (RFC 7493 2.1)');
+          Exit;
+        end;
+      end;
+  else
+    SetErr(P, 0, E, WhereNext, 'invalid escape sequence ' + WhatText(P, E, 2) + ' in string');
+    Exit;
+  end;
+  PutRune(P, A, r);
+  Result := True;
+end;
+
+{ The string node of the characters written from Start + 1 to A, the
+  01h of a view at Start. }
+procedure StrNode(var P: TJParse; Start, A: Int64; NoEsc: Boolean; out Node: Int64);
+var
+  w: Int64;
+begin
+  Node := P.Nodes;
+  w := JtStr or ((A - Start - 1) shl 8);
+  if NoEsc then
+    w := w or JfNoEsc;
+  NewNode(P, w, (Start + 1) - (JsonHead + Node * 16));
+  P.Arena := A;
+end;
+
+{ The string whose opening quote is at Q into the arena: 01h, then its
+  characters unescaped, and its node, a name's or a value's. The index
+  gives its escapes, control bytes and closing quote: the runs between
+  are copied whole. False on an error. }
+function ParseStr(var P: TJParse; Q: Int64; out Node: Int64): Boolean;
+var
+  a, src, e, c, start: Int64;
+  noesc, pair: Boolean;
+begin
+  Result := False;
+  Node := -1;
+  start := P.Arena;
+  P.D[start] := 1;
+  a := start + 1;
+  src := Q + 1;
+  noesc := True;
+  while True do
+  begin
+    if not NextEnt(P, e) then
+    begin
+      SetEof(P, P.N, WhereNext);
+      Exit;
+    end;
+    if (P.Bad >= src) and (P.Bad < e) then
+    begin
+      SetErr(P, BadKind(P), P.Bad, WhereNext, BadReason(P));
+      Exit;
+    end;
+    if e > src then
+    begin
+      Move(P.T[src], P.D[a], e - src);
+      a := a + (e - src);
+    end;
+    c := P.T[e];
+    if c = 34 then
+      Break;
+    if c <> 92 then
+    begin
+      SetErr(P, 0, e, WhereNext, 'invalid character ' + QuoteAt(P, e) +
+        ' in string (expecting non-control character)');
+      Exit;
+    end;
+    noesc := False;
+    if not Escape(P, e, a, src, pair) then
+      Exit;
+    { the second backslash of a pair is in the index: take it }
+    if pair and not (NextEnt(P, c) and (c = e + 6)) then
+    begin
+      SetErr(P, 0, e, WhereNext, 'invalid surrogate pair ' + WhatText(P, e, 12) + ' in string');
+      Exit;
+    end;
+  end;
+  StrNode(P, start, a, noesc, Node);
+  Result := True;
+end;
+
+{ The same string read a byte at a time, without the index, each
+  character past ASCII decoded and checked here (RFC 3629, RFC 7493
+  2.1): the Plain parser's, which must give the same bytes. }
+function ParseStrPlain(var P: TJParse; Q: Int64; out Node: Int64): Boolean;
+var
+  a, i, n, c, start, src: Int64;
+  noesc, pair: Boolean;
+begin
+  Result := False;
+  Node := -1;
+  start := P.Arena;
+  P.D[start] := 1;
+  a := start + 1;
+  i := Q + 1;
+  noesc := True;
+  while True do
+  begin
+    if i >= P.N then
+    begin
+      SetEof(P, P.N, WhereNext);
+      Exit;
+    end;
+    c := P.T[i];
+    if c = 34 then
+      Break;
+    if c = 92 then
+    begin
+      noesc := False;
+      if not Escape(P, i, a, src, pair) then
+        Exit;
+      i := src;
+    end
+    else if c < 32 then
+    begin
+      SetErr(P, 0, i, WhereNext, 'invalid character ' + QuoteAt(P, i) +
+        ' in string (expecting non-control character)');
+      Exit;
+    end
+    else if c < 128 then
+    begin
+      P.D[a] := Byte(c);
+      a := a + 1;
+      i := i + 1;
+    end
+    else
+    begin
+      c := DecodeAt(P, i, n);
+      if c < 0 then
+      begin
+        if CutRune(P, i) then
+          SetEof(P, i, WhereNext)
+        else
+          SetErr(P, 1, i, WhereNext, 'invalid UTF-8');
+        Exit;
+      end;
+      if NonChar(c) then
+      begin
+        SetErr(P, 1, i, WhereNext, 'invalid character ' + QuoteAt(P, i) +
+          ' in string: a noncharacter (RFC 7493 2.1)');
+        Exit;
+      end;
+      Move(P.T[i], P.D[a], n);
+      a := a + n;
+      i := i + n;
+    end;
+  end;
+  P.Cur := i + 1;
+  StrNode(P, start, a, noesc, Node);
+  Result := True;
+end;
+
+function StrAt(var P: TJParse; Q: Int64; out Node: Int64): Boolean;
+begin
+  if P.Plain then
+    Result := ParseStrPlain(P, Q, Node)
+  else
+    Result := ParseStr(P, Q, Node);
+end;
+
+{ ---- names ---- }
+
+function SameName(A, B: PJNode): Boolean;
+var
+  n: Int64;
+begin
+  n := StrLen(A);
+  Result := (n = StrLen(B)) and (CompareByte(StrBytes(A)^, StrBytes(B)^, n) = 0);
+end;
+
+function NameHash(var P: TJParse; A: PJNode): Int64;
+begin
+  Result := XxHash3(PasStrView(StrBytes(A), StrLen(A)), P.Seed);
+end;
+
+procedure SetPut(var P: TJParse; var F: TJFrame; Node: Int64);
+var
+  m, h: Int64;
+begin
+  m := Length(F.Names) - 1;
+  h := NameHash(P, NodeAt(P, Node)) and m;
+  while F.Names[h] >= 0 do
+    h := (h + 1) and m;
+  F.Names[h] := Node;
+  F.NSet := F.NSet + 1;
+end;
+
+procedure SetGrow(var P: TJParse; var F: TJFrame; Slots: Int64);
+var
+  old: array of Int64;
+  i: Int64;
+begin
+  old := F.Names;
+  F.Names := nil;
+  SetLength(F.Names, Slots);
+  for i := 0 to Slots - 1 do
+    F.Names[i] := -1;
+  F.NSet := 0;
+  for i := 0 to High(old) do
+    if old[i] >= 0 then
+      SetPut(P, F, old[i]);
+end;
+
+{ Whether the object F already has the name of node Node, its members
+  before compared unescaped (Go's objectNamespace, jsontext/state.go):
+  one by one while it has at most JsonLinear, then through a set. }
+function Dup(var P: TJParse; var F: TJFrame; Node: Int64): Boolean;
+var
+  nd, o: PJNode;
+  k, m, h: Int64;
+begin
+  Result := False;
+  nd := NodeAt(P, Node);
+  if F.Count < JsonLinear then
+  begin
+    { the names lie before Node, each after its member's value: walk them }
+    k := F.Node + 1;
+    while k < Node do
+    begin
+      o := NodeAt(P, k);
+      if SameName(o, nd) then
+      begin
+        Result := True;
+        Exit;
+      end;
+      o := NodeAt(P, k + 1);
+      if (o^.W0 and 7) >= JtArr then
+        k := k + 1 + o^.W1
+      else
+        k := k + 2;
+    end;
+    Exit;
+  end;
+  if F.NSet = 0 then
+  begin
+    { at least four slots a name, so the probes stay short and the
+      table never fills }
+    k := 64;
+    while k < 4 * (F.Count + 1) do
+      k := k * 2;
+    SetGrow(P, F, k);
+    k := F.Node + 1;
+    while k < Node do
+    begin
+      SetPut(P, F, k);
+      o := NodeAt(P, k + 1);
+      if (o^.W0 and 7) >= JtArr then
+        k := k + 1 + o^.W1
+      else
+        k := k + 2;
+    end;
+  end;
+  m := Length(F.Names) - 1;
+  h := NameHash(P, nd) and m;
+  while F.Names[h] >= 0 do
+  begin
+    if SameName(NodeAt(P, F.Names[h]), nd) then
+    begin
+      Result := True;
+      Exit;
+    end;
+    h := (h + 1) and m;
+  end;
+  if (F.NSet + 1) * 2 > Length(F.Names) then
+    SetGrow(P, F, Length(F.Names) * 2);
+  SetPut(P, F, Node);
+end;
+
+{ ---- scalars ---- }
+
+function Delim(B: Integer): Boolean;
+begin
+  Result := (B = 32) or (B = 9) or (B = 10) or (B = 13) or (B = 44) or (B = 58) or
+    (B = 93) or (B = 125) or (B = 91) or (B = 123) or (B = 34);
+end;
+
+{ After a scalar that ends at E: nothing, or a byte that ends it. }
+function ScalarEnd(var P: TJParse; E: Int64): Boolean;
+begin
+  Result := (E >= P.N) or Delim(P.T[E]);
+end;
+
+function ParseLit(var P: TJParse; S: Int64; const Lit: string; Kind: Integer): Boolean;
+var
+  k: Int64;
+begin
+  Result := False;
+  for k := 1 to Length(Lit) - 1 do
+  begin
+    if S + k >= P.N then
+    begin
+      SetEof(P, P.N, WhereNext);
+      Exit;
+    end;
+    if P.T[S + k] <> Ord(Lit[k + 1]) then
+    begin
+      SetErr(P, 0, S + k, WhereNext, 'invalid character ' + QuoteAt(P, S + k) + ' in literal ' + Lit +
+        ' (expecting ''' + Lit[k + 1] + ''')');
+      Exit;
+    end;
+  end;
+  NewNode(P, Kind, 0);
+  Result := True;
+end;
+
+{ The node of the number Sc read at S, its text in the arena. }
+function NumNode(var P: TJParse; S: Int64; var Sc: TPasNumScan): Boolean;
+var
+  v, sub, a, node: Int64;
+begin
+  if sc.IntLit and PasNumI64(@P.T[S], sc, v) then
+    sub := JnInt or JnIntLit
+  else if sc.IntLit and PasNumU64(@P.T[S], sc, v) then
+    sub := JnUint or JnIntLit
+  else
+  begin
+    if PasNumF64(@P.T[S], sc, v) then
+      sub := JnFloat
+    else
+      sub := JnHuge;
+    if sc.IntLit then
+      sub := sub or JnIntLit;
+  end;
+  { the text, after its length and the 01h of a view }
+  a := P.Arena;
+  PInt64(@P.D[a])^ := sc.Len;
+  P.D[a + 8] := 1;
+  Move(P.T[S], P.D[a + 9], sc.Len);
+  P.Arena := a + 9 + sc.Len;
+  node := P.Nodes;
+  NewNode(P, JtNum or sub or ((a - (JsonHead + node * 16)) shl 8), v);
+  Result := True;
+end;
+
+function ParseNum(var P: TJParse; S: Int64; out E: Int64): Boolean;
+var
+  sc: TPasNumScan;
+  v, sub, a: Int64;
+  node: Int64;
+begin
+  Result := False;
+  E := S;
+  if not PasNumScan(@P.T[S], P.N - S, True, sc) then
+  begin
+    { 0 then a digit: the number is 0 and the digit the next token, as
+      Go's ConsumeNumber reads it }
+    if (S + sc.Len < P.N) and (P.T[S + sc.Len] >= 48) and (P.T[S + sc.Len] <= 57) and
+      (P.T[S + sc.Len - 1] = 48) and PasNumScan(@P.T[S], sc.Len, True, sc) then
+    begin
+      E := S + sc.Len;
+      Result := NumNode(P, S, sc);
+      Exit;
+    end;
+    { a number the text cuts: Go gives its start }
+    if S + sc.Len >= P.N then
+      SetEof(P, S, WhereNext)
+    else
+      SetErr(P, 0, S + sc.Len, WhereNext, 'invalid character ' + QuoteAt(P, S + sc.Len) +
+        ' in number (expecting digit)');
+    Exit;
+  end;
+  E := S + sc.Len;
+  Result := NumNode(P, S, sc);
+end;
+
+
+
+{ ---- containers ---- }
+
+procedure OpenBox(var P: TJParse; Obj: Boolean);
+var
+  f: Int64;
+begin
+  if P.Depth >= Length(P.St) then
+    SetLength(P.St, Length(P.St) * 2 + 8);
+  f := P.Nodes;
+  if Obj then
+    NewNode(P, JtObj, 0)
+  else
+    NewNode(P, JtArr, 0);
+  P.St[P.Depth].Node := f;
+  P.St[P.Depth].Count := 0;
+  P.St[P.Depth].Name := -1;
+  P.St[P.Depth].Obj := Obj;
+  P.St[P.Depth].Flat := True;
+  P.St[P.Depth].NSet := 0;
+  P.St[P.Depth].Names := nil;
+  P.Depth := P.Depth + 1;
+end;
+
+procedure CloseBox(var P: TJParse);
+var
+  nd: PJNode;
+  f: Int64;
+begin
+  P.Depth := P.Depth - 1;
+  f := P.St[P.Depth].Node;
+  nd := NodeAt(P, f);
+  nd^.W0 := nd^.W0 or (P.St[P.Depth].Count shl 8);
+  if P.St[P.Depth].Flat then
+    nd^.W0 := nd^.W0 or JfFlat;
+  nd^.W1 := P.Nodes - f;
+  P.St[P.Depth].Names := nil;
+end;
+
+{ A value done: its container counts it. }
+procedure ValueDone(var P: TJParse);
+begin
+  if P.Depth > 0 then
+    P.St[P.Depth - 1].Count := P.St[P.Depth - 1].Count + 1;
+  P.State := SAfter;
+end;
+
+{ The value that starts at E, whose first byte is C; Q the end of a
+  scalar that is no string, -1 for the others. }
+procedure ParseValue(var P: TJParse; E, C: Int64; out Q: Int64);
+var
+  node: Int64;
+begin
+  Q := -1;
+  case C of
+    123, 91:
+      begin
+        if P.Depth >= P.MaxDepth then
+        begin
+          SetErr(P, 3, E, WhereNext, 'exceeded max depth');
+          Exit;
+        end;
+        OpenBox(P, C = 123);
+        if C = 123 then
+          P.State := SObjFirst
+        else
+          P.State := SArrFirst;
+      end;
+    34:
+      if StrAt(P, E, node) then
+        ValueDone(P);
+    116:
+      if ParseLit(P, E, 'true', JtTrue) then
+      begin
+        Q := E + 4;
+        ValueDone(P);
+      end;
+    102:
+      if ParseLit(P, E, 'false', JtFalse) then
+      begin
+        Q := E + 5;
+        ValueDone(P);
+      end;
+    110:
+      if ParseLit(P, E, 'null', JtNull) then
+      begin
+        Q := E + 4;
+        ValueDone(P);
+      end;
+    45, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57:
+      if ParseNum(P, E, Q) then
+        ValueDone(P);
+  else
+    SetErr(P, 0, E, WhereNext, 'invalid character ' + QuoteAt(P, E) + ' at start of value');
+  end;
+end;
+
+{ The error of a byte at E after a value, as Go writes it. }
+procedure SetAfter(var P: TJParse; E: Int64);
+var
+  w: string;
+begin
+  if P.Depth = 0 then
+    w := 'after top-level value'
+  else if P.St[P.Depth - 1].Obj then
+    w := 'after object value (expecting '','' or ''}'')'
+  else
+    w := 'after array element (expecting '','' or '']'')';
+  SetErr(P, 0, E, WhereAt, 'invalid character ' + QuoteAt(P, E) + ' ' + w);
+end;
+
+procedure ParseDoc(var P: TJParse);
+var
+  e, c, q, node: Int64;
+begin
+  P.State := SValue;
+  while not P.Failed do
+  begin
+    if not NextTok(P, e) then
+    begin
+      if (P.State = SAfter) and (P.Depth = 0) then
+      begin
+        if (P.Bad >= 0) then
+          SetErr(P, BadKind(P), P.Bad, WhereNext, BadReason(P));
+        Exit;
+      end;
+      SetEof(P, P.N, WhereAt);
+      Exit;
+    end;
+    c := P.T[e];
+    case P.State of
+      SValue, SArrFirst:
+        begin
+          if (P.State = SArrFirst) and (c = 93) then
+          begin
+            CloseBox(P);
+            ValueDone(P);
+            Continue;
+          end;
+          ParseValue(P, e, c, q);
+          if P.Plain and (q >= 0) then
+            P.Cur := q;
+          { a scalar that is no string ends at a delimiter: a byte that
+            is none is the next token, an error after a value }
+          if (q >= 0) and not P.Failed and not ScalarEnd(P, q) then
+            SetAfter(P, q);
+        end;
+      SObjFirst, SObjName:
+        begin
+          if (P.State = SObjFirst) and (c = 125) then
+          begin
+            CloseBox(P);
+            ValueDone(P);
+            Continue;
+          end;
+          if c <> 34 then
+          begin
+            SetErr(P, 0, e, WhereNext, 'invalid character ' + QuoteAt(P, e) +
+              ' at start of string (expecting ''"'')');
+            Continue;
+          end;
+          if not StrAt(P, e, node) then
+            Continue;
+          if Dup(P, P.St[P.Depth - 1], node) then
+          begin
+            P.St[P.Depth - 1].Name := node;
+            P.State := SColon;
+            SetErr(P, 2, e, WhereNext, 'duplicate object member name');
+            Continue;
+          end;
+          P.St[P.Depth - 1].Name := node;
+          P.State := SColon;
+        end;
+      SColon:
+        if c = 58 then
+          P.State := SValue
+        else
+          SetErr(P, 0, e, WhereNext, 'invalid character ' + QuoteAt(P, e) +
+            ' after object name (expecting '':'')');
+      SAfter:
+        begin
+          if P.Depth = 0 then
+            SetAfter(P, e)
+          else if c = 44 then
+          begin
+            if P.St[P.Depth - 1].Obj then
+              P.State := SObjName
+            else
+              P.State := SValue;
+          end
+          else if (c = 93) and not P.St[P.Depth - 1].Obj then
+          begin
+            CloseBox(P);
+            ValueDone(P);
+          end
+          else if (c = 125) and P.St[P.Depth - 1].Obj then
+          begin
+            CloseBox(P);
+            ValueDone(P);
+          end
+          else
+            SetAfter(P, e);
+        end;
+    end;
+  end;
+end;
+
+{ A string with escapes, its opening quote at Q, read a byte at a time
+  from it to its closing quote, as Go's jsonwire.AppendUnquote reads
+  one, with no entry of the index taken for each escape: the entries
+  up to the closing quote are passed over after. False, with nothing
+  taken, for whatever is not a plain string of valid escapes (an
+  error, a noncharacter, a byte that is not UTF-8, the end of the text
+  or of the index's window): ParseStr then reads it again and says
+  why. The node as ParseStr makes it. }
+function ParseStrEsc(var P: TJParse; Q: Int64; out Node: Int64): Boolean;
+var
+  t, d: PByte;
+  ix: PUInt32;
+  i, n, a, start, b, r, r2, h, k: Int64;
+begin
+  Result := False;
+  Node := -1;
+  t := P.T;
+  d := P.D;
+  n := P.N;
+  start := P.Arena;
+  a := start + 1;
+  i := Q + 1;
+  while True do
+  begin
+    if i >= n then
+      Exit;
+    b := t[i];
+    if b = 34 then
+      Break;
+    if b = 92 then
+    begin
+      if i + 1 >= n then
+        Exit;
+      b := t[i + 1];
+      if b = 117 then
+      begin
+        if i + 6 > n then
+          Exit;
+        r := 0;
+        for k := 2 to 5 do
+        begin
+          h := HexVal(t[i + k]);
+          if h < 0 then
+            Exit;
+          r := r * 16 + h;
+        end;
+        i := i + 6;
+        if (r >= $D800) and (r <= $DFFF) then
+        begin
+          if (r > $DBFF) or (i + 6 > n) or (t[i] <> 92) or (t[i + 1] <> 117) then
+            Exit;
+          r2 := 0;
+          for k := 2 to 5 do
+          begin
+            h := HexVal(t[i + k]);
+            if h < 0 then
+              Exit;
+            r2 := r2 * 16 + h;
+          end;
+          if (r2 < $DC00) or (r2 > $DFFF) then
+            Exit;
+          r := $10000 + ((r - $D800) shl 10) + (r2 - $DC00);
+          i := i + 6;
+        end;
+        if ((r >= $FDD0) and (r <= $FDEF)) or ((r and $FFFE) = $FFFE) then
+          Exit;
+        if r < $80 then
+        begin
+          d[a] := Byte(r);
+          a := a + 1;
+        end
+        else if r < $800 then
+        begin
+          d[a] := Byte($C0 or (r shr 6));
+          d[a + 1] := Byte($80 or (r and $3F));
+          a := a + 2;
+        end
+        else if r < $10000 then
+        begin
+          d[a] := Byte($E0 or (r shr 12));
+          d[a + 1] := Byte($80 or ((r shr 6) and $3F));
+          d[a + 2] := Byte($80 or (r and $3F));
+          a := a + 3;
+        end
+        else
+        begin
+          d[a] := Byte($F0 or (r shr 18));
+          d[a + 1] := Byte($80 or ((r shr 12) and $3F));
+          d[a + 2] := Byte($80 or ((r shr 6) and $3F));
+          d[a + 3] := Byte($80 or (r and $3F));
+          a := a + 4;
+        end;
+      end
+      else
+      begin
+        case b of
+          34, 92, 47: d[a] := Byte(b);
+          98: d[a] := 8;
+          102: d[a] := 12;
+          110: d[a] := 10;
+          114: d[a] := 13;
+          116: d[a] := 9;
+        else
+          Exit;
+        end;
+        a := a + 1;
+        i := i + 2;
+      end;
+    end
+    else if b < 32 then
+      Exit
+    else
+    begin
+      d[a] := Byte(b);
+      a := a + 1;
+      i := i + 1;
+    end;
+  end;
+  { i is the closing quote: a byte that is not UTF-8 before it is
+    ParseStr's to say; the entries of the index up to it, all in this
+    window, are passed over }
+  if (P.Bad > Q) and (P.Bad < i) then
+    Exit;
+  ix := @P.Idx[0];
+  k := P.I;
+  while (k < P.NIdx) and (ix[k] < i) do
+    k := k + 1;
+  if (k >= P.NIdx) or (ix[k] <> i) then
+    Exit;
+  P.I := k + 1;
+  d[start] := 1;
+  Node := P.Nodes;
+  StrNode(P, start, a, False, Node);
+  Result := True;
+end;
+
+{ N bytes from Src to Dst eight at a time, a short run of the text into
+  the arena: the caller has made sure the text holds the bytes up to the
+  next multiple of eight, and the arena takes them (what is written past
+  the run is written over by what comes next, or falls in the eight
+  bytes the document keeps after its arena). }
+procedure CopyWords(Src, Dst: PByte; N: Int64);
+var
+  k: Int64;
+begin
+  k := 0;
+  while k < N do
+  begin
+    PInt64(@Dst[k])^ := PInt64(@Src[k])^;
+    k := k + 8;
+  end;
+end;
+
+{ Stage 2 over the index, the parse of every text (P203): ParseDoc's
+  loop with its common cases written out where they happen, a string
+  whose next entry is its closing quote, an integer of at most 18
+  digits, a literal, an opening and a closing bracket or brace, a name
+  in an object of at most JsonLinear members, with no routine called on
+  their way (a routine whose parameter is the parser's record is never
+  put in place, MANUAL "Routines put in place"); the others, and every
+  error, go to ParseDoc's routines, which give the same nodes and the
+  same errors. The tests hold it to Plain, a byte at a time, document
+  for document (PasJsonParsePlain). }
+procedure ParseFast(var P: TJParse);
+var
+  e, c, q, node, k, len, a, v, at, w0, nd, kk: Int64;
+  sc: TPasNumScan;
+  i, ni, nodes, arena, depth, state, n, bad, fsz: Int64;
+  t, d, x, y: PByte;
+  ix: PUInt32;
+  fb, fr: PJFrame;
+  np, op: PJNode;
+  neg, twice: Boolean;
+begin
+  t := P.T;
+  d := P.D;
+  ix := @P.Idx[0];
+  n := P.N;
+  bad := P.Bad;
+  if Length(P.St) = 0 then
+    SetLength(P.St, 16);
+  fb := @P.St[0];
+  fsz := SizeOf(TJFrame);
+  { the parser's state in locals, written back to P before every call
+    of one of its routines and read again after }
+  i := P.I;
+  ni := P.NIdx;
+  nodes := P.Nodes;
+  arena := P.Arena;
+  depth := 0;
+  state := SValue;
+  fr := nil;
+  while True do
+  begin
+    { the next entry of the index }
+    if i >= ni then
+    begin
+      P.I := i;
+      if not Refill(P) then
+      begin
+        P.Nodes := nodes;
+        P.Arena := arena;
+        P.Depth := depth;
+        P.State := state;
+        if (state = SAfter) and (depth = 0) then
+        begin
+          if bad >= 0 then
+            SetErr(P, BadKind(P), bad, WhereNext, BadReason(P));
+          Exit;
+        end;
+        SetEof(P, n, WhereAt);
+        Exit;
+      end;
+      i := P.I;
+      ni := P.NIdx;
+    end;
+    e := ix[i];
+    i := i + 1;
+    c := t[e];
+    case state of
+      SValue, SArrFirst:
+        begin
+          q := -1;
+          if c = 34 then
+          begin
+            { a string whose next entry closes it: its bytes at once }
+            if (i < ni) and (t[ix[i]] = 34) and not ((bad > e) and (bad < ix[i])) then
+            begin
+              q := ix[i];
+              i := i + 1;
+              len := q - e - 1;
+              a := arena;
+              d[a] := 1;
+              if (len <= 32) and (e + 1 + ((len + 7) and not 7) <= n) then
+                CopyWords(@t[e + 1], @d[a + 1], len)
+              else if len > 0 then
+                Move(t[e + 1], d[a + 1], len);
+              np := PJNode(@d[JsonHead + nodes * 16]);
+              np^.W0 := JtStr or JfNoEsc or (len shl 8);
+              np^.W1 := (a + 1) - (JsonHead + nodes * 16);
+              nodes := nodes + 1;
+              arena := a + 1 + len;
+            end
+            else
+            begin
+              P.I := i;
+              P.Nodes := nodes;
+              P.Arena := arena;
+              P.Depth := depth;
+              P.State := state;
+              if not ParseStrEsc(P, e, node) and not ParseStr(P, e, node) then
+                Exit;
+              i := P.I;
+              ni := P.NIdx;
+              nodes := P.Nodes;
+              arena := P.Arena;
+            end;
+            if depth > 0 then
+              fr^.Count := fr^.Count + 1;
+            state := SAfter;
+            Continue;
+          end;
+          if (c = 45) or ((c >= 48) and (c <= 57)) then
+          begin
+            { an integer of at most 18 digits, no 0 before another digit,
+              no point and no exponent after it: its value at once }
+            k := e;
+            neg := c = 45;
+            if neg then
+              k := k + 1;
+            v := 0;
+            at := k;
+            while (k < n) and (k - at < 19) and (t[k] >= 48) and (t[k] <= 57) do
+            begin
+              v := v * 10 + (t[k] - 48);
+              k := k + 1;
+            end;
+            len := k - e;
+            if (k > at) and (k - at <= 18) and not ((t[at] = 48) and (k - at > 1)) and
+              ((k >= n) or ((t[k] <> 46) and (t[k] <> 101) and (t[k] <> 69) and
+              ((t[k] < 48) or (t[k] > 57)))) then
+            begin
+              if neg then
+                v := -v;
+              a := arena;
+              PInt64(@d[a])^ := len;
+              d[a + 8] := 1;
+              if e + ((len + 7) and not 7) <= n then
+                CopyWords(@t[e], @d[a + 9], len)
+              else
+                for kk := 0 to len - 1 do
+                  d[a + 9 + kk] := t[e + kk];
+              arena := a + 9 + len;
+              np := PJNode(@d[JsonHead + nodes * 16]);
+              np^.W0 := JtNum or JnInt or JnIntLit or ((a - (JsonHead + nodes * 16)) shl 8);
+              np^.W1 := v;
+              nodes := nodes + 1;
+              q := k;
+            end
+            else if PasNumScan(@t[e], n - e, True, sc) then
+            begin
+              { any other number: its value as NumNode gives it }
+              len := sc.Len;
+              q := e + len;
+              if sc.IntLit and PasNumI64(@t[e], sc, v) then
+                w0 := JnInt or JnIntLit
+              else if sc.IntLit and PasNumU64(@t[e], sc, v) then
+                w0 := JnUint or JnIntLit
+              else
+              begin
+                if PasNumF64(@t[e], sc, v) then
+                  w0 := JnFloat
+                else
+                  w0 := JnHuge;
+                if sc.IntLit then
+                  w0 := w0 or JnIntLit;
+              end;
+              a := arena;
+              PInt64(@d[a])^ := len;
+              d[a + 8] := 1;
+              if (len <= 32) and (e + ((len + 7) and not 7) <= n) then
+                CopyWords(@t[e], @d[a + 9], len)
+              else
+                Move(t[e], d[a + 9], len);
+              arena := a + 9 + len;
+              np := PJNode(@d[JsonHead + nodes * 16]);
+              np^.W0 := JtNum or w0 or ((a - (JsonHead + nodes * 16)) shl 8);
+              np^.W1 := v;
+              nodes := nodes + 1;
+            end
+            else
+            begin
+              { no number, or 0 and a digit: ParseNum says which }
+              P.I := i;
+              P.Nodes := nodes;
+              P.Arena := arena;
+              P.Depth := depth;
+              P.State := state;
+              if not ParseNum(P, e, q) then
+                Exit;
+              nodes := P.Nodes;
+              arena := P.Arena;
+            end;
+            if depth > 0 then
+              fr^.Count := fr^.Count + 1;
+            state := SAfter;
+          end
+          else if (c = 123) or (c = 91) then
+          begin
+            if depth >= P.MaxDepth then
+            begin
+              P.I := i;
+              P.Nodes := nodes;
+              P.Arena := arena;
+              P.Depth := depth;
+              P.State := state;
+              SetErr(P, 3, e, WhereNext, 'exceeded max depth');
+              Exit;
+            end;
+            if depth >= Length(P.St) then
+            begin
+              SetLength(P.St, Length(P.St) * 2 + 8);
+              fb := @P.St[0];
+            end;
+            np := PJNode(@d[JsonHead + nodes * 16]);
+            if c = 123 then
+              np^.W0 := JtObj
+            else
+              np^.W0 := JtArr;
+            np^.W1 := 0;
+            if depth > 0 then
+              PJFrame(Pointer(Integer(fb) + (depth - 1) * fsz))^.Flat := False;
+            fr := PJFrame(Pointer(Integer(fb) + depth * fsz));
+            fr^.Node := nodes;
+            fr^.Count := 0;
+            fr^.Name := -1;
+            fr^.Obj := c = 123;
+            fr^.Flat := True;
+            fr^.NSet := 0;
+            nodes := nodes + 1;
+            depth := depth + 1;
+            if c = 123 then
+              state := SObjFirst
+            else
+              state := SArrFirst;
+            Continue;
+          end
+          else if (c = 93) and (state = SArrFirst) then
+          begin
+            { an empty array }
+            depth := depth - 1;
+            np := PJNode(@d[JsonHead + fr^.Node * 16]);
+            np^.W0 := np^.W0 or JfFlat;
+            np^.W1 := nodes - fr^.Node;
+            if depth > 0 then
+            begin
+              fr := PJFrame(Pointer(Integer(fb) + (depth - 1) * fsz));
+              fr^.Count := fr^.Count + 1;
+            end
+            else
+              fr := nil;
+            state := SAfter;
+            Continue;
+          end
+          else if (c = 116) and (e + 4 <= n) and (t[e + 1] = 114) and (t[e + 2] = 117) and
+            (t[e + 3] = 101) then
+          begin
+            np := PJNode(@d[JsonHead + nodes * 16]);
+            np^.W0 := JtTrue;
+            np^.W1 := 0;
+            nodes := nodes + 1;
+            if depth > 0 then
+              fr^.Count := fr^.Count + 1;
+            state := SAfter;
+            q := e + 4;
+          end
+          else if (c = 102) and (e + 5 <= n) and (t[e + 1] = 97) and (t[e + 2] = 108) and
+            (t[e + 3] = 115) and (t[e + 4] = 101) then
+          begin
+            np := PJNode(@d[JsonHead + nodes * 16]);
+            np^.W0 := JtFalse;
+            np^.W1 := 0;
+            nodes := nodes + 1;
+            if depth > 0 then
+              fr^.Count := fr^.Count + 1;
+            state := SAfter;
+            q := e + 5;
+          end
+          else if (c = 110) and (e + 4 <= n) and (t[e + 1] = 117) and (t[e + 2] = 108) and
+            (t[e + 3] = 108) then
+          begin
+            np := PJNode(@d[JsonHead + nodes * 16]);
+            np^.W0 := JtNull;
+            np^.W1 := 0;
+            nodes := nodes + 1;
+            if depth > 0 then
+              fr^.Count := fr^.Count + 1;
+            state := SAfter;
+            q := e + 4;
+          end
+          else
+          begin
+            { a literal cut or wrong, or no value: ParseValue says why }
+            P.I := i;
+            P.Nodes := nodes;
+            P.Arena := arena;
+            P.Depth := depth;
+            P.State := state;
+            ParseValue(P, e, c, q);
+            if P.Failed then
+              Exit;
+            nodes := P.Nodes;
+            arena := P.Arena;
+            state := P.State;
+          end;
+          { a scalar that is no string ends at a delimiter: a byte that
+            is none is the next token, an error after a value }
+          if (q >= 0) and (q < n) then
+          begin
+            c := t[q];
+            if not ((c = 32) or (c = 9) or (c = 10) or (c = 13) or (c = 44) or (c = 58) or
+              (c = 93) or (c = 125) or (c = 91) or (c = 123) or (c = 34)) then
+            begin
+              P.I := i;
+              P.Nodes := nodes;
+              P.Arena := arena;
+              P.Depth := depth;
+              P.State := state;
+              SetAfter(P, q);
+              Exit;
+            end;
+          end;
+        end;
+      SObjFirst, SObjName:
+        begin
+          if (state = SObjFirst) and (c = 125) then
+          begin
+            { an empty object }
+            depth := depth - 1;
+            np := PJNode(@d[JsonHead + fr^.Node * 16]);
+            np^.W0 := np^.W0 or JfFlat;
+            np^.W1 := nodes - fr^.Node;
+            if depth > 0 then
+            begin
+              fr := PJFrame(Pointer(Integer(fb) + (depth - 1) * fsz));
+              fr^.Count := fr^.Count + 1;
+            end
+            else
+              fr := nil;
+            state := SAfter;
+            Continue;
+          end;
+          if c <> 34 then
+          begin
+            P.I := i;
+            P.Nodes := nodes;
+            P.Arena := arena;
+            P.Depth := depth;
+            P.State := state;
+            SetErr(P, 0, e, WhereNext, 'invalid character ' + QuoteAt(P, e) +
+              ' at start of string (expecting ''"'')');
+            Exit;
+          end;
+          if (i < ni) and (t[ix[i]] = 34) and not ((bad > e) and (bad < ix[i])) then
+          begin
+            q := ix[i];
+            i := i + 1;
+            len := q - e - 1;
+            a := arena;
+            d[a] := 1;
+            if (len <= 32) and (e + 1 + ((len + 7) and not 7) <= n) then
+              CopyWords(@t[e + 1], @d[a + 1], len)
+            else if len > 0 then
+              Move(t[e + 1], d[a + 1], len);
+            node := nodes;
+            np := PJNode(@d[JsonHead + node * 16]);
+            np^.W0 := JtStr or JfNoEsc or (len shl 8);
+            np^.W1 := (a + 1) - (JsonHead + node * 16);
+            nodes := node + 1;
+            arena := a + 1 + len;
+          end
+          else
+          begin
+            P.I := i;
+            P.Nodes := nodes;
+            P.Arena := arena;
+            P.Depth := depth;
+            P.State := state;
+            if not ParseStrEsc(P, e, node) and not ParseStr(P, e, node) then
+              Exit;
+            i := P.I;
+            ni := P.NIdx;
+            nodes := P.Nodes;
+            arena := P.Arena;
+          end;
+          if fr^.Count < JsonLinear then
+          begin
+            { the names before, one by one: the length, the first byte,
+              then the rest }
+            np := PJNode(@d[JsonHead + node * 16]);
+            len := np^.W0 shr 8;
+            x := PByte(Pointer(Integer(np) + np^.W1));
+            twice := False;
+            nd := fr^.Node + 1;
+            while nd < node do
+            begin
+              op := PJNode(@d[JsonHead + nd * 16]);
+              if (op^.W0 shr 8) = len then
+              begin
+                y := PByte(Pointer(Integer(op) + op^.W1));
+                if (len = 0) or ((x[0] = y[0]) and (CompareByte(x^, y^, len) = 0)) then
+                begin
+                  twice := True;
+                  Break;
+                end;
+              end;
+              op := PJNode(@d[JsonHead + (nd + 1) * 16]);
+              if (op^.W0 and 7) >= JtArr then
+                nd := nd + 1 + op^.W1
+              else
+                nd := nd + 2;
+            end;
+          end
+          else
+          begin
+            P.Nodes := nodes;
+            P.Arena := arena;
+            twice := Dup(P, fr^, node);
+          end;
+          fr^.Name := node;
+          state := SColon;
+          if twice then
+          begin
+            P.I := i;
+            P.Nodes := nodes;
+            P.Arena := arena;
+            P.Depth := depth;
+            P.State := state;
+            SetErr(P, 2, e, WhereNext, 'duplicate object member name');
+            Exit;
+          end;
+        end;
+      SColon:
+        if c = 58 then
+          state := SValue
+        else
+        begin
+          P.I := i;
+          P.Nodes := nodes;
+          P.Arena := arena;
+          P.Depth := depth;
+          P.State := state;
+          SetErr(P, 0, e, WhereNext, 'invalid character ' + QuoteAt(P, e) +
+            ' after object name (expecting '':'')');
+          Exit;
+        end;
+      SAfter:
+        begin
+          if (depth > 0) and (c = 44) then
+          begin
+            if fr^.Obj then
+              state := SObjName
+            else
+              state := SValue;
+          end
+          else if (depth > 0) and (((c = 93) and not fr^.Obj) or ((c = 125) and fr^.Obj)) then
+          begin
+            { the container ends: its count, FLAT and its size }
+            depth := depth - 1;
+            np := PJNode(@d[JsonHead + fr^.Node * 16]);
+            w0 := np^.W0 or (fr^.Count shl 8);
+            if fr^.Flat then
+              w0 := w0 or JfFlat;
+            np^.W0 := w0;
+            np^.W1 := nodes - fr^.Node;
+            if fr^.NSet > 0 then
+              fr^.Names := nil;
+            if depth > 0 then
+            begin
+              fr := PJFrame(Pointer(Integer(fb) + (depth - 1) * fsz));
+              fr^.Count := fr^.Count + 1;
+            end
+            else
+              fr := nil;
+            state := SAfter;
+          end
+          else
+          begin
+            P.I := i;
+            P.Nodes := nodes;
+            P.Arena := arena;
+            P.Depth := depth;
+            P.State := state;
+            SetAfter(P, e);
+            Exit;
+          end;
+        end;
+    end;
+  end;
+end;
+
+{ The seed of an object's set of names (Go's objectNamespace has none:
+  it is a Go map, seeded by the runtime): a secret key of the process
+  from the kernel, set once by the routine that gets there first, mixed
+  with a count AtomicAdd makes unique, as pasmap seeds its maps (P197),
+  so no text can be made that collides in every process. }
+function NextSeed: Integer;
+var
+  k, buf, r, x: Integer;
+begin
+  k := AtomicLoad(JSeedKey);
+  if k = 0 then
+  begin
+    buf := 0;
+    if Amd64 = 1 then
+      r := Syscall(318, @buf, 8, 0)
+    else
+      r := Syscall(278, @buf, 8, 0);
+    if r <> 8 then
+      buf := CycleCount * $9E3779B97F4A7C15;
+    if buf = 0 then
+      buf := 1;
+    if AtomicCas(@JSeedKey, 0, buf) then
+      k := buf
+    else
+      k := AtomicLoad(JSeedKey);
+  end;
+  x := AtomicAdd(@JSeedCount, 1) xor k;
+  x := (x xor (x shr 33)) * $FF51AFD7ED558CCD;
+  x := (x xor (x shr 29)) * $C4CEB9FE1A85EC53;
+  Result := x xor (x shr 32);
+end;
+
+{ The whole parse: stage 1 counts, the document reserved once, stage 1
+  again a window at a time under stage 2. }
+{ ---- the writer ---- }
+
+type
+  { where the writer puts its bytes: B nil counts them only }
+  { an object's shape for RFC 8785: its members, their names in the
+    object's order and the place in that order of each name in RFC
+    8785's }
+  TJShape = record
+    N: Int64;
+    Names: array of PJNode;
+    Perm: array of Int64;
+  end;
+
+  PJOut = ^TJOut;
+  TJOut = record
+    S: string;            { the text, longer than what is written }
+    B: PByte;             { its bytes }
+    N: Int64;             { the bytes written }
+    Indent: string;
+    Pad: string;          { a line feed and Indent as many times as the deepest level so far }
+    Names: array of PJNode;  { RFC 8785: the names of the open objects, in order, a region each }
+    Keys: array of Int64;    { each name's first eight bytes, big-endian, a prefix of its order }
+    Slow: array of Boolean;  { a name whose first eight bytes do not order it as UTF-16 does }
+    Orig: array of Int64;    { each name's place in its object, while a region is sorted }
+    Shapes: array[0..7] of TJShape;  { the last objects sorted, one shape each }
+    NextShape: Int64;        { the next to replace }
+    NTop: Int64;          { the end of the regions in use }
+    Pretty, Canon, Html: Boolean;
+  end;
+
+
+  TJWFrame = record
+    Box: PJNode;       { the container }
+    Left: Int64;       { its children still to write }
+    Next: PJNode;      { the next child: an element, or a member's name }
+    First: Boolean;
+    Obj: Boolean;
+    Sorted: Boolean;   { RFC 8785: its names are the region of O^.Names from SBase, in order }
+    SBase, SI: Int64;
+  end;
+
+{ Room for N more bytes in the text being written: its string grown to
+  twice what it needs, as Go's append grows a slice, so the writer goes
+  over the value once. }
+procedure Grow(O: PJOut; N: Int64);
+var
+  c: Int64;
+begin
+  c := Length(O^.S) * 2;
+  if c < O^.N + N + 64 then
+    c := O^.N + N + 64;
+  SetLength(O^.S, c);
+  O^.B := PByte(Pointer(O^.S));
+end;
+
+procedure Put(O: PJOut; P: Pointer; N: Int64);
+begin
+  if O^.N + N > Length(O^.S) then
+    Grow(O, N);
+  Move(P^, O^.B[O^.N], N);
+  O^.N := O^.N + N;
+end;
+
+procedure PutB(O: PJOut; B: Integer);
+begin
+  if O^.N >= Length(O^.S) then
+    Grow(O, 1);
+  O^.B[O^.N] := Byte(B);
+  O^.N := O^.N + 1;
+end;
+
+procedure PutText(O: PJOut; const S: string);
+begin
+  if S <> '' then
+    Put(O, Pointer(S), Length(S));
+end;
+
+{ A string quoted with the fewest escapes (Go's jsonwire.AppendQuote,
+  RFC 8785 3.2.2.2): the quote, the backslash and the control bytes
+  that have a short form by it, the other control bytes as \u00xx;
+  with Html, <, > and & as \u003c, \u003e and \u0026. The escape
+  finder (P202) skips the runs that need nothing. }
+procedure PutStr(O: PJOut; P: PByte; N: Int64; NoEsc: Boolean);
+var
+  i, k: Int64;
+  b: Integer;
+begin
+  PutB(O, 34);
+  if NoEsc and not O^.Html then
+    Put(O, P, N)
+  else
+  begin
+    i := 0;
+    while i < N do
+    begin
+      k := PasJsonEscIndex(@P[i], N - i, O^.Html);
+      if k < 0 then
+      begin
+        Put(O, @P[i], N - i);
+        Break;
+      end;
+      if k > 0 then
+        Put(O, @P[i], k);
+      i := i + k;
+      b := P[i];
+      PutB(O, 92);
+      case b of
+        34, 92: PutB(O, b);
+        8: PutB(O, 98);
+        12: PutB(O, 102);
+        10: PutB(O, 110);
+        13: PutB(O, 114);
+        9: PutB(O, 116);
+      else
+        PutB(O, 117);
+        PutB(O, 48);
+        PutB(O, 48);
+        PutB(O, Ord(HexDigit(b shr 4)));
+        PutB(O, Ord(HexDigit(b and 15)));
+      end;
+      i := i + 1;
+    end;
+  end;
+  PutB(O, 34);
+end;
+
+function NumText(Nd: PJNode): PByte;
+begin
+  Result := PByte(Pointer(Integer(Nd) + (Nd^.W0 shr 8)));
+end;
+
+{ A number: its text; in RFC 8785's form the shortest text of its
+  Double as ECMAScript writes it (3.2.2.3), as Go's
+  jsonwire.ReformatNumber does: an integer of fewer than 16 digits as it
+  is, -0 as 0, one past the largest Double as it. }
+procedure PutNum(O: PJOut; Nd: PJNode);
+var
+  t: PByte;
+  n, bits: Int64;
+  d: Double;
+  sc: TPasNumScan;
+begin
+  t := NumText(Nd);
+  n := PInt64(t)^;
+  if not O^.Canon then
+  begin
+    Put(O, @t[9], n);
+    Exit;
+  end;
+  case Nd^.W0 and 24 of
+    JnInt:
+      if (n < 16) and not ((n = 2) and (t[9] = 45)) then
+      begin
+        Put(O, @t[9], n);
+        Exit;
+      end
+      else
+      begin
+        d := Nd^.W1;
+        bits := d as Int64;
+      end;
+    JnUint:
+      { above Int64: its Double from its text, rounded once }
+      if not PasNumScan(@t[9], n, True, sc) or not PasNumF64(@t[9], sc, bits) then
+        bits := 0;
+    JnFloat:
+      bits := Nd^.W1;
+    JnHuge:
+      if Nd^.W1 < 0 then
+        bits := Int64($FFEFFFFFFFFFFFFF)
+      else
+        bits := $7FEFFFFFFFFFFFFF;
+  end;
+  if (bits and $7FFFFFFFFFFFFFFF) = 0 then
+    bits := 0;
+  if O^.N + PasNumTextMax > Length(O^.S) then
+    Grow(O, PasNumTextMax);
+  O^.N := O^.N + PasNumAppendF64(@O^.B[O^.N], bits);
+end;
+
+{ A line feed and Depth indents, from O^.Pad, made longer when a level
+  is deeper than any before: one copy a line. }
+procedure PutLine(O: PJOut; Depth: Int64);
+var
+  need, k: Int64;
+begin
+  need := 1 + Depth * Length(O^.Indent);
+  if Length(O^.Pad) < need then
+  begin
+    O^.Pad := #10;
+    for k := 1 to Depth * 2 + 8 do
+      O^.Pad := O^.Pad + O^.Indent;
+  end;
+  Put(O, Pointer(O^.Pad), need);
+end;
+
+{ The size in nodes of the value at Nd: 1 for a scalar. }
+function NodeSpan(Nd: PJNode): Int64;
+begin
+  if (Nd^.W0 and 7) >= JtArr then
+    Result := Nd^.W1
+  else
+    Result := 1;
+end;
+
+function NodeAdd(Nd: PJNode; K: Int64): PJNode;
+begin
+  Result := PJNode(Pointer(Integer(Nd) + K * 16));
+end;
+
+{ The character at A[I] of a valid UTF-8 text, its bytes in L. }
+function Utf8Rune(A: PByte; NA, I: Int64; out L: Int64): Integer;
+var
+  b: Integer;
+begin
+  b := A[I];
+  if b < $E0 then
+  begin
+    L := 2;
+    Result := ((b and $1F) shl 6) or (A[I + 1] and $3F);
+  end
+  else if b < $F0 then
+  begin
+    L := 3;
+    Result := ((b and $0F) shl 12) or ((A[I + 1] and $3F) shl 6) or (A[I + 2] and $3F);
+  end
+  else
+  begin
+    L := 4;
+    Result := ((b and $07) shl 18) or ((A[I + 1] and $3F) shl 12) or ((A[I + 2] and $3F) shl 6) or
+      (A[I + 3] and $3F);
+  end;
+end;
+
+{ RFC 8785 3.2.3: names in the order of their UTF-16 code units (Go's
+  jsonwire.CompareUTF16): as bytes, but a character past U+FFFF goes as
+  its high surrogate against one from U+E000 to U+FFFF. }
+function CmpUtf16(A: PByte; NA: Int64; B: PByte; NB: Int64): Integer;
+var
+  i, j, la, lb: Int64;
+  ra, rb: Integer;
+begin
+  i := 0;
+  j := 0;
+  while True do
+  begin
+    if (i >= NA) or (j >= NB) then
+    begin
+      if NA - i < NB - j then
+        Result := -1
+      else if NA - i > NB - j then
+        Result := 1
+      else
+        Result := 0;
+      Exit;
+    end;
+    if (A[i] < 128) or (B[j] < 128) then
+    begin
+      if A[i] <> B[j] then
+      begin
+        if A[i] < B[j] then
+          Result := -1
+        else
+          Result := 1;
+        Exit;
+      end;
+      i := i + 1;
+      j := j + 1;
+      Continue;
+    end;
+    ra := Utf8Rune(A, NA, i, la);
+    rb := Utf8Rune(B, NB, j, lb);
+    if (ra <= $FFFF) and (rb > $FFFF) then
+      rb := $D800 + ((rb - $10000) shr 10)
+    else if (rb <= $FFFF) and (ra > $FFFF) then
+      ra := $D800 + ((ra - $10000) shr 10);
+    if ra <> rb then
+    begin
+      if ra < rb then
+        Result := -1
+      else
+        Result := 1;
+      Exit;
+    end;
+    i := i + la;
+    j := j + lb;
+  end;
+end;
+
+function NameLess(X, Y: PJNode): Boolean;
+begin
+  Result := CmpUtf16(StrBytes(X), StrLen(X), StrBytes(Y), StrLen(Y)) < 0;
+end;
+
+{ Whether the name in slot I of O^.Names goes before the one in slot J
+  (RFC 8785 3.2.3): by their first eight bytes as one unsigned number
+  when they differ there and neither holds a byte from EEh up (below
+  U+E000 the order of UTF-8's bytes is UTF-16's), else by CmpUtf16. }
+function KeyLess(O: PJOut; I, J: Int64): Boolean;
+begin
+  if (O^.Keys[I] <> O^.Keys[J]) and not O^.Slow[I] and not O^.Slow[J] then
+    Result := (O^.Keys[I] xor Low(Int64)) < (O^.Keys[J] xor Low(Int64))
+  else
+    Result := NameLess(O^.Names[I], O^.Names[J]);
+end;
+
+{ Slots I and J of O^.Names, with their keys, swapped. }
+procedure SwapSlot(O: PJOut; I, J: Int64);
+var
+  t: PJNode;
+  k: Int64;
+  f: Boolean;
+begin
+  t := O^.Names[I];
+  O^.Names[I] := O^.Names[J];
+  O^.Names[J] := t;
+  k := O^.Keys[I];
+  O^.Keys[I] := O^.Keys[J];
+  O^.Keys[J] := k;
+  f := O^.Slow[I];
+  O^.Slow[I] := O^.Slow[J];
+  O^.Slow[J] := f;
+  k := O^.Orig[I];
+  O^.Orig[I] := O^.Orig[J];
+  O^.Orig[J] := k;
+end;
+
+{ Sorts the slots B to B+N-1 of O^.Names by KeyLess, past 16 of them: a
+  heap sort, with no recursion. }
+procedure SortHeap(O: PJOut; B, N: Int64);
+var
+  i, root, child, last: Int64;
+begin
+  i := N div 2 - 1;
+  while i >= 0 do
+  begin
+    root := i;
+    while True do
+    begin
+      child := 2 * root + 1;
+      if child >= N then
+        Break;
+      if (child + 1 < N) and KeyLess(O, B + child, B + child + 1) then
+        child := child + 1;
+      if not KeyLess(O, B + root, B + child) then
+        Break;
+      SwapSlot(O, B + root, B + child);
+      root := child;
+    end;
+    i := i - 1;
+  end;
+  last := N - 1;
+  while last > 0 do
+  begin
+    SwapSlot(O, B, B + last);
+    root := 0;
+    while True do
+    begin
+      child := 2 * root + 1;
+      if child >= last then
+        Break;
+      if (child + 1 < last) and KeyLess(O, B + child, B + child + 1) then
+        child := child + 1;
+      if not KeyLess(O, B + root, B + child) then
+        Break;
+      SwapSlot(O, B + root, B + child);
+      root := child;
+    end;
+    last := last - 1;
+  end;
+end;
+
+{ Sorts the slots B to B+N-1 of O^.Names: by insertion up to 16, as
+  most objects have, else the heap sort. }
+procedure SortNames(O: PJOut; B, N: Int64);
+var
+  i, j: Int64;
+begin
+  if N > 16 then
+  begin
+    SortHeap(O, B, N);
+    Exit;
+  end;
+  for i := B + 1 to B + N - 1 do
+  begin
+    j := i;
+    while (j > B) and KeyLess(O, j, j - 1) do
+    begin
+      SwapSlot(O, j, j - 1);
+      j := j - 1;
+    end;
+  end;
+end;
+
+{ The key of a name: its first eight bytes big-endian, zeros after a
+  shorter one; Slow when one of them is EEh or more. }
+function NameKey(Nm: PJNode; out Slow: Boolean): Int64;
+var
+  p: PByte;
+  n, k, b: Int64;
+begin
+  p := StrBytes(Nm);
+  n := StrLen(Nm);
+  if n > 8 then
+    n := 8;
+  Result := 0;
+  Slow := False;
+  for k := 0 to 7 do
+  begin
+    Result := Result shl 8;
+    if k < n then
+    begin
+      b := p[k];
+      if b >= $EE then
+        Slow := True;
+      Result := Result or b;
+    end;
+  end;
+end;
+
+{ The value at Root written into O, with no recursion: a stack of the
+  open containers, each with its next child. }
+procedure PutValue(O: PJOut; Root: PJNode);
+var
+  st: array of TJWFrame;
+  depth, c, k: Int64;
+  nd, v, nm: PJNode;
+  inorder, slow, hit: Boolean;
+  sh, si: Int64;
+begin
+  depth := 0;
+  nd := Root;
+  while True do
+  begin
+    if depth > 0 then
+    begin
+      if not st[depth - 1].First then
+        PutB(O, 44);
+      st[depth - 1].First := False;
+      if O^.Pretty then
+        PutLine(O, depth);
+      nd := st[depth - 1].Next;
+      if st[depth - 1].Obj then
+      begin
+        PutStr(O, StrBytes(nd), StrLen(nd), (nd^.W0 and JfNoEsc) <> 0);
+        PutB(O, 58);
+        if O^.Pretty then
+          PutB(O, 32);
+        nd := NodeAdd(nd, 1);
+      end;
+    end;
+    v := nd;
+    case v^.W0 and 7 of
+      JtNull: PutText(O, 'null');
+      JtFalse: PutText(O, 'false');
+      JtTrue: PutText(O, 'true');
+      JtNum: PutNum(O, v);
+      JtStr: PutStr(O, StrBytes(v), StrLen(v), (v^.W0 and JfNoEsc) <> 0);
+    else
+      begin
+        c := v^.W0 shr 8;
+        if (v^.W0 and 7) = JtArr then
+          PutB(O, 91)
+        else
+          PutB(O, 123);
+        if c > 0 then
+        begin
+          if depth >= Length(st) then
+            SetLength(st, Length(st) * 2 + 8);
+          st[depth].Box := v;
+          st[depth].Left := c;
+          st[depth].First := True;
+          st[depth].Obj := (v^.W0 and 7) = JtObj;
+          st[depth].Next := NodeAdd(v, 1);
+          st[depth].Sorted := False;
+          st[depth].SI := 0;
+          { RFC 8785's order: the names into a region of O^.Names, used
+            only when they are not in order already }
+          if O^.Canon and st[depth].Obj and (c > 1) then
+          begin
+            if O^.NTop + 2 * c > Length(O^.Names) then
+            begin
+              SetLength(O^.Names, (O^.NTop + 2 * c) * 2);
+              SetLength(O^.Keys, (O^.NTop + 2 * c) * 2);
+              SetLength(O^.Slow, (O^.NTop + 2 * c) * 2);
+              SetLength(O^.Orig, (O^.NTop + 2 * c) * 2);
+            end;
+            nm := NodeAdd(v, 1);
+            inorder := True;
+            for k := 0 to c - 1 do
+            begin
+              O^.Names[O^.NTop + k] := nm;
+              O^.Keys[O^.NTop + k] := NameKey(nm, slow);
+              O^.Slow[O^.NTop + k] := slow;
+              if (k > 0) and inorder and not KeyLess(O, O^.NTop + k - 1, O^.NTop + k) then
+                inorder := False;
+              nm := NodeAdd(nm, 1 + NodeSpan(NodeAdd(nm, 1)));
+            end;
+            if not inorder then
+            begin
+              { an object with the names of one sorted before, in the same
+                order (arrays of objects of a few shapes): its order }
+              sh := -1;
+              for si := 0 to 7 do
+                if (sh < 0) and (O^.Shapes[si].N = c) then
+                begin
+                  hit := True;
+                  k := 0;
+                  while hit and (k < c) do
+                  begin
+                    if not SameName(O^.Names[O^.NTop + k], O^.Shapes[si].Names[k]) then
+                      hit := False;
+                    k := k + 1;
+                  end;
+                  if hit then
+                    sh := si;
+                end;
+              if sh >= 0 then
+              begin
+                for k := 0 to c - 1 do
+                  O^.Names[O^.NTop + c + k] := O^.Names[O^.NTop + O^.Shapes[sh].Perm[k]];
+                for k := 0 to c - 1 do
+                  O^.Names[O^.NTop + k] := O^.Names[O^.NTop + c + k];
+              end
+              else
+              begin
+                sh := O^.NextShape;
+                O^.NextShape := (sh + 1) and 7;
+                SetLength(O^.Shapes[sh].Names, c);
+                SetLength(O^.Shapes[sh].Perm, c);
+                for k := 0 to c - 1 do
+                begin
+                  O^.Shapes[sh].Names[k] := O^.Names[O^.NTop + k];
+                  O^.Orig[O^.NTop + k] := k;
+                end;
+                SortNames(O, O^.NTop, c);
+                for k := 0 to c - 1 do
+                  O^.Shapes[sh].Perm[k] := O^.Orig[O^.NTop + k];
+                O^.Shapes[sh].N := c;
+              end;
+              st[depth].Sorted := True;
+              st[depth].SBase := O^.NTop;
+              st[depth].Next := O^.Names[O^.NTop];
+              O^.NTop := O^.NTop + c;
+            end;
+          end;
+          depth := depth + 1;
+          Continue;
+        end;
+        if (v^.W0 and 7) = JtArr then
+          PutB(O, 93)
+        else
+          PutB(O, 125);
+      end;
+    end;
+    { the value is written: close the containers it ends }
+    while depth > 0 do
+    begin
+      st[depth - 1].Left := st[depth - 1].Left - 1;
+      if st[depth - 1].Left > 0 then
+      begin
+        if st[depth - 1].Sorted then
+        begin
+          st[depth - 1].SI := st[depth - 1].SI + 1;
+          st[depth - 1].Next := O^.Names[st[depth - 1].SBase + st[depth - 1].SI];
+        end
+        else
+          st[depth - 1].Next := NodeAdd(v, NodeSpan(v));
+        Break;
+      end;
+      depth := depth - 1;
+      if O^.Pretty then
+        PutLine(O, depth);
+      v := st[depth].Box;
+      if st[depth].Sorted then
+        O^.NTop := st[depth].SBase;
+      if (v^.W0 and 7) = JtArr then
+        PutB(O, 93)
+      else
+        PutB(O, 125);
+    end;
+    if depth = 0 then
+      Break;
+  end;
+end;
+
+{ The text of the value at Root, written once into a string that grows
+  (Grow), first as long as the document's text when Root is a root.
+  Mode 0 compact, 1 pretty, 2 canonical. }
+function JsonWrite(Root: PJNode; Mode: Integer; const Indent: string; Html: Boolean): string;
+var
+  o: TJOut;
+  base: PByte;
+  n: Int64;
+begin
+  o := Default(TJOut);
+  o.Indent := Indent;
+  o.Pretty := Mode = 1;
+  o.Canon := Mode = 2;
+  o.Html := Html and (Mode <> 2);
+  n := 256;
+  base := PByte(MemBase(Root));
+  if (base <> nil) and (PInt64(base)^ = JsonMagic) and (PJNode(@base[JsonHead]) = Root) then
+  begin
+    n := PInt64(@base[24])^ + 64;
+    if o.Pretty then
+      n := n * 2;
+  end;
+  SetLength(o.S, n);
+  o.B := PByte(Pointer(o.S));
+  PutValue(@o, Root);
+  SetLength(o.S, o.N);
+  Result := o.S;
+end;
+
+{ ---- reading a document ---- }
+
+{ The pointer S cut to about N bytes for a message, as Go's
+  jsonwire.TruncatePointer cuts it: its first and its last N / 2 bytes
+  around an ellipsis, moved out to the whole names next to the cut and
+  to whole characters, with as many slashes kept as the middle had, up
+  to two (the Path of the error keeps it whole). }
+function TruncPointer(const S: string; N: Int64): string;
+var
+  i, j, k, slashes: Int64;
+  mid: string;
+begin
+  if Length(S) <= N then
+  begin
+    Result := S;
+    Exit;
+  end;
+  { i and j count bytes from 0, as Go's indexes }
+  i := N div 2;
+  j := Length(S) - N div 2;
+  k := i - 1;
+  while (k >= 0) and (S[k + 1] <> '/') do
+    k := k - 1;
+  if k > 0 then
+    i := k;
+  k := j;
+  while (k < Length(S)) and (S[k + 1] <> '/') do
+    k := k + 1;
+  if k < Length(S) then
+    j := k + 1;
+  { a valid text: a cut inside a character has a continuation byte after it }
+  while (i > 0) and (i < Length(S)) and ((Ord(S[i + 1]) and $C0) = $80) do
+    i := i - 1;
+  while (j < Length(S)) and ((Ord(S[j + 1]) and $C0) = $80) do
+    j := j + 1;
+  slashes := 0;
+  for k := i + 1 to j do
+    if S[k] = '/' then
+      slashes := slashes + 1;
+  if slashes = 0 then
+    mid := Ellipsis
+  else if slashes = 1 then
+    mid := Ellipsis + '/' + Ellipsis
+  else
+    mid := Ellipsis + '/' + Ellipsis + '/' + Ellipsis;
+  if (j > i) and (S[i + 1] = '/') and (mid <> Ellipsis) then
+    mid := Copy(mid, Length(Ellipsis) + 1, Length(mid));
+  if (j > i) and (S[j] = '/') and (mid <> Ellipsis) then
+    mid := Copy(mid, 1, Length(mid) - Length(Ellipsis));
+  Result := Copy(S, 1, i) + mid + Copy(S, j + 1, Length(S));
+end;
+
+{ The error's message: its reason, where in the text (a parse) and the
+  pointer of the value it is about, as Go's jsontext.SyntacticError
+  writes them (errors.go). }
+constructor EJsonError.Create(AKind: TJsonErrorKind; AOffset, ALine, AColumn: Integer;
+  const APath, AWhere, AReason: string);
+begin
+  FKind := AKind;
+  FOffset := AOffset;
+  FLine := ALine;
+  FColumn := AColumn;
+  FPath := APath;
+  FReason := AReason;
+  FMessage := 'json: ' + AReason;
+  if ALine > 0 then
+    FMessage := FMessage + ' at ' + IntText(ALine) + ':' + IntText(AColumn) + ' (byte ' +
+      IntText(AOffset) + ')';
+  if AWhere <> '' then
+    FMessage := FMessage + ' within ' + GoQuoteStr(TruncPointer(AWhere, 100));
+end;
+
+function EJsonError.ToString: string;
+begin
+  Result := FMessage;
+end;
+
+{ S with every Old (two bytes) as Repl, for a pointer's tokens. }
+function StringReplaceAll(const S, Old, Repl: string): string;
+var
+  i: Int64;
+begin
+  Result := '';
+  i := 1;
+  while i <= Length(S) do
+    if (i < Length(S)) and (S[i] = Old[1]) and (S[i + 1] = Old[2]) then
+    begin
+      Result := Result + Repl;
+      i := i + 2;
+    end
+    else
+    begin
+      Result := Result + S[i];
+      i := i + 1;
+    end;
+end;
+
+{ The error of a parse that failed, its line and column counted now. }
+function ParseError(const S: string; const E: TJErr): EJsonError;
+var
+  i, line, col: Int64;
+  k: TJsonErrorKind;
+  nm: string;
+begin
+  line := 1;
+  col := 1;
+  for i := 1 to E.Offset do
+    if S[i] = #10 then
+    begin
+      line := line + 1;
+      col := 1;
+    end
+    else
+      col := col + 1;
+  case E.Kind of
+    1: k := jeEncoding;
+    2: k := jeDuplicate;
+    3: k := jeDepth;
+    4: k := jeTooLarge;
+  else
+    k := jeSyntax;
+  end;
+  if k <> jeDuplicate then
+  begin
+    Result := EJsonError.Create(k, E.Offset, line, col, E.Path, E.Path, E.Reason);
+    Exit;
+  end;
+  { a name twice: the message names it, within its object }
+  i := Length(E.Path);
+  while (i > 0) and (E.Path[i] <> '/') do
+    i := i - 1;
+  nm := Copy(E.Path, i + 1, Length(E.Path));
+  nm := StringReplaceAll(StringReplaceAll(nm, '~1', '/'), '~0', '~');
+  Result := EJsonError.Create(k, E.Offset, line, col, E.Path, Copy(E.Path, 1, i - 1), E.Reason);
+  Result.FMessage := 'json: ' + E.Reason + ' ' + GoQuoteStr(nm) + ' at ' + IntText(line) + ':' +
+    IntText(col) + ' (byte ' + IntText(E.Offset) + ')';
+  if i > 1 then
+    Result.FMessage := Result.FMessage + ' within ' +
+      GoQuoteStr(TruncPointer(Copy(E.Path, 1, i - 1), 100));
+end;
+
+function JKindOf(J: PJNode): TJsonKind;
+begin
+  if J = nil then
+    Result := jkNull
+  else
+    case J^.W0 and 7 of
+      JtFalse, JtTrue: Result := jkBoolean;
+      JtNum: Result := jkNumber;
+      JtStr: Result := jkString;
+      JtArr: Result := jkArray;
+      JtObj: Result := jkObject;
+    else
+      Result := jkNull;
+    end;
+end;
+
+function KindName(J: PJNode): string;
+begin
+  case JKindOf(J) of
+    jkNull: Result := 'null';
+    jkBoolean: Result := 'a Boolean';
+    jkNumber: Result := 'a number';
+    jkString: Result := 'a string';
+    jkArray: Result := 'an array';
+  else
+    Result := 'an object';
+  end;
+end;
+
+{ The pointer of the value at J from its document's root (RFC 6901),
+  worked out only for an error: the document is the block J lies in
+  (MemBase), its root after the header; the path down to J, child by
+  child. A value that is not in a document (nil) has the empty one. }
+function NodePath(J: PJNode): string;
+var
+  base: PByte;
+  nd, c, nm: PJNode;
+  k, n: Int64;
+begin
+  Result := '';
+  if J = nil then
+    Exit;
+  base := PByte(MemBase(J));
+  if (base = nil) or (PInt64(base)^ <> JsonMagic) then
+    Exit;
+  nd := PJNode(@base[JsonHead]);
+  while nd <> J do
+  begin
+    if (nd^.W0 and 7) < JtArr then
+      Exit;
+    n := nd^.W0 shr 8;
+    c := NodeAdd(nd, 1);
+    for k := 0 to n - 1 do
+    begin
+      if (nd^.W0 and 7) = JtObj then
+      begin
+        nm := c;
+        c := NodeAdd(c, 1);
+      end
+      else
+        nm := nil;
+      if (Integer(J) >= Integer(c)) and (Integer(J) < Integer(NodeAdd(c, NodeSpan(c)))) then
+      begin
+        if nm <> nil then
+          Result := Result + '/' + PtrToken(StrBytes(nm), StrLen(nm))
+        else
+          Result := Result + '/' + IntText(k);
+        Break;
+      end;
+      c := NodeAdd(c, NodeSpan(c));
+    end;
+    nd := c;
+  end;
+end;
+
+procedure RaiseKind(J: PJNode; const Want: string);
+var
+  p: string;
+begin
+  p := NodePath(J);
+  raise EJsonError.Create(jeType, -1, 0, 0, p, p, KindName(J) + ' is not ' + Want);
+end;
+
+function JKind(J: PJNode): Integer;
+begin
+  Result := Ord(JKindOf(J));
+end;
+
+function JIsNull(J: PJNode): Boolean;
+begin
+  Result := (J = nil) or ((J^.W0 and 7) = JtNull);
+end;
+
+function JAsBoolean(J: PJNode): Boolean;
+var
+  k: Int64;
+begin
+  if J = nil then
+    RaiseKind(nil, 'a Boolean');
+  k := J^.W0 and 7;
+  if k = JtTrue then
+    Result := True
+  else if k = JtFalse then
+    Result := False
+  else
+    RaiseKind(J, 'a Boolean');
+end;
+
+function NumView(J: PJNode): string;
+var
+  t: PByte;
+begin
+  t := NumText(J);
+  Result := PasStrView(@t[9], PInt64(t)^);
+end;
+
+procedure NeedNum(J: PJNode);
+begin
+  if (J = nil) or ((J^.W0 and 7) <> JtNum) then
+    RaiseKind(J, 'a number');
+end;
+
+{ An integer from an integer literal only, exact (Go's v2: 1.0 and 1e2
+  are no integers). }
+function JAsInteger(J: PJNode): Int64;
+var
+  p: string;
+begin
+  NeedNum(J);
+  if (J^.W0 and (24 or JnIntLit)) = (JnInt or JnIntLit) then
+  begin
+    Result := J^.W1;
+    Exit;
+  end;
+  p := NodePath(J);
+  if (J^.W0 and JnIntLit) = 0 then
+    raise EJsonError.Create(jeType, -1, 0, 0, p, p, NumView(J) + ' is not an integer')
+  else
+    raise EJsonError.Create(jeRange, -1, 0, 0, p, p, NumView(J) +
+      ' is out of Integer''s range');
+end;
+
+{ The Double nearest the number, rounded once; one past the largest
+  Double is an error, as Go's v2 says of 1e1000. }
+function JAsFloat(J: PJNode): Double;
+var
+  nd: PJNode;
+  t: PByte;
+  sc: TPasNumScan;
+  bits: Int64;
+  p: string;
+begin
+  NeedNum(J);
+  nd := J;
+  case nd^.W0 and 24 of
+    JnInt:
+      begin
+        Result := nd^.W1;
+        { -0 is an integer 0 with its sign }
+        if (nd^.W1 = 0) and (NumText(nd)[9] = 45) then
+          Result := -0.0;
+      end;
+    JnFloat:
+      Result := nd^.W1 as Double;
+    JnUint:
+      begin
+        t := NumText(nd);
+        bits := 0;
+        if PasNumScan(@t[9], PInt64(t)^, True, sc) then
+          PasNumF64(@t[9], sc, bits);
+        Result := bits as Double;
+      end;
+  else
+    p := NodePath(nd);
+    raise EJsonError.Create(jeRange, -1, 0, 0, p, p, NumView(nd) + ' is out of Double''s range');
+  end;
+end;
+
+function JAsString(J: PJNode): string;
+begin
+  if (J = nil) or ((J^.W0 and 7) <> JtStr) then
+    RaiseKind(J, 'a string');
+  Result := PasStrView(StrBytes(J), StrLen(J));
+end;
+
+function JAsNumber(J: PJNode): string;
+begin
+  NeedNum(J);
+  Result := NumView(J);
+end;
+
+{ The member K of the object J, nil when it has none: its names one
+  by one, the length first. }
+function FindMember(J: PJNode; const K: string): PJNode;
+var
+  n, i, kl: Int64;
+  c: PJNode;
+begin
+  Result := nil;
+  n := J^.W0 shr 8;
+  kl := Length(K);
+  c := NodeAdd(J, 1);
+  for i := 1 to n do
+  begin
+    if (StrLen(c) = kl) and ((kl = 0) or (CompareByte(StrBytes(c)^, PByte(Pointer(K))^, kl) = 0)) then
+    begin
+      Result := NodeAdd(c, 1);
+      Exit;
+    end;
+    c := NodeAdd(c, 1 + NodeSpan(NodeAdd(c, 1)));
+  end;
+end;
+
+function KeyToken(const K: string): string;
+begin
+  if K = '' then
+    Result := ''
+  else
+    Result := PtrToken(PByte(Pointer(K)), Length(K));
+end;
+
+function JGet(J: PJNode; const K: string): PJNode;
+var
+  p: string;
+begin
+  if (J = nil) or ((J^.W0 and 7) <> JtObj) then
+    RaiseKind(J, 'an object');
+  Result := FindMember(J, K);
+  if Result = nil then
+  begin
+    p := NodePath(J);
+    raise EJsonError.Create(jeMissing, -1, 0, 0, p + '/' + KeyToken(K), p, 'no member "' + K + '"');
+  end;
+end;
+
+{ The element I of the array J: at once when no element is a container
+  (FLAT), else past the ones before it. }
+function ItemOf(J: PJNode; I: Int64): PJNode;
+var
+  k: Int64;
+begin
+  if (J^.W0 and JfFlat) <> 0 then
+  begin
+    Result := NodeAdd(J, 1 + I);
+    Exit;
+  end;
+  Result := NodeAdd(J, 1);
+  for k := 1 to I do
+    Result := NodeAdd(Result, NodeSpan(Result));
+end;
+
+function JItem(J: PJNode; I: Int64): PJNode;
+var
+  p: string;
+  n: Int64;
+begin
+  if (J = nil) or ((J^.W0 and 7) <> JtArr) then
+    RaiseKind(J, 'an array');
+  n := J^.W0 shr 8;
+  if (I < 0) or (I >= n) then
+  begin
+    p := NodePath(J);
+    raise EJsonError.Create(jeRange, -1, 0, 0, p + '/' + IntText(I), p, 'index ' + IntText(I) +
+      ' out of range (length ' + IntText(n) + ')');
+  end;
+  Result := ItemOf(J, I);
+end;
+
+function JHas(J: PJNode; const K: string): Boolean;
+begin
+  Result := (J <> nil) and ((J^.W0 and 7) = JtObj) and (FindMember(J, K) <> nil);
+end;
+
+function JFind(J: PJNode; const K: string): PJNode;
+begin
+  Result := nil;
+  if (J <> nil) and ((J^.W0 and 7) = JtObj) then
+    Result := FindMember(J, K);
+end;
+
+function JTryGet(J: PJNode; const K: string; out V: PJNode): Boolean;
+begin
+  V := JFind(J, K);
+  Result := V <> nil;
+end;
+
+function JTryItem(J: PJNode; I: Int64; out V: PJNode): Boolean;
+begin
+  V := nil;
+  Result := (J <> nil) and ((J^.W0 and 7) = JtArr) and (I >= 0) and
+    (I < J^.W0 shr 8);
+  if Result then
+    V := ItemOf(J, I);
+end;
+
+function JLength(J: PJNode): Int64;
+begin
+  if (J = nil) or ((J^.W0 and 7) < JtArr) then
+    RaiseKind(J, 'an array or an object');
+  Result := J^.W0 shr 8;
+end;
+
+{ RFC 6901: the value the pointer P names from J, nil when there is
+  none or P is no pointer; Bad says which (0 found, 1 no pointer, 2
+  no value there). A token of an array is 0 or a digit string without
+  a leading 0 (RFC 6901 4), "-" names nothing. }
+function PtrFind(J: PJNode; const P: string; out Bad: Integer): PJNode;
+var
+  i, s, n, k, idx: Int64;
+  tok: string;
+  ok: Boolean;
+begin
+  Result := J;
+  Bad := 0;
+  n := Length(P);
+  if n = 0 then
+    Exit;
+  if P[1] <> '/' then
+  begin
+    Bad := 1;
+    Result := nil;
+    Exit;
+  end;
+  i := 2;
+  while True do
+  begin
+    s := i;
+    tok := '';
+    while (i <= n) and (P[i] <> '/') do
+    begin
+      if P[i] = '~' then
+      begin
+        if (i < n) and (P[i + 1] = '0') then
+          tok := tok + '~'
+        else if (i < n) and (P[i + 1] = '1') then
+          tok := tok + '/'
+        else
+        begin
+          Bad := 1;
+          Result := nil;
+          Exit;
+        end;
+        i := i + 2;
+      end
+      else
+      begin
+        tok := tok + P[i];
+        i := i + 1;
+      end;
+    end;
+    if (Result = nil) or ((Result^.W0 and 7) < JtArr) then
+    begin
+      Bad := 2;
+      Result := nil;
+      Exit;
+    end;
+    if (Result^.W0 and 7) = JtObj then
+      Result := FindMember(Result, tok)
+    else
+    begin
+      ok := (Length(tok) > 0) and (Length(tok) <= 18) and not ((Length(tok) > 1) and (tok[1] = '0'));
+      idx := 0;
+      for k := 1 to Length(tok) do
+        if (tok[k] >= '0') and (tok[k] <= '9') then
+          idx := idx * 10 + (Ord(tok[k]) - 48)
+        else
+          ok := False;
+      if ok and (idx < Result^.W0 shr 8) then
+        Result := ItemOf(Result, idx)
+      else
+        Result := nil;
+    end;
+    if Result = nil then
+    begin
+      Bad := 2;
+      Exit;
+    end;
+    if i > n then
+      Exit;
+    i := i + 1;
+  end;
+end;
+
+function JAt(J: PJNode; const P: string): PJNode;
+var
+  bad: Integer;
+  w: string;
+begin
+  Result := PtrFind(J, P, bad);
+  if bad <> 0 then
+  begin
+    w := NodePath(J);
+    if bad = 1 then
+      raise EJsonError.Create(jeSyntax, -1, 0, 0, w + P, w, 'invalid JSON Pointer "' + P + '"')
+    else
+      raise EJsonError.Create(jeMissing, -1, 0, 0, w + P, w, 'no value at "' + P + '"');
+  end;
+end;
+
+{ ---- equality ---- }
+
+{ The decimal string of (Neg ? -X : X) + K, X a string of digits of any
+  length, K a small integer; '-' before it when it is below 0. }
+function DecAdd(const X: string; Neg: Boolean; K: Int64): string;
+var
+  v, i, n: Int64;
+  c: Integer;
+begin
+  if Length(X) <= 17 then
+  begin
+    v := 0;
+    for i := 1 to Length(X) do
+      v := v * 10 + (Ord(X[i]) - 48);
+    if Neg then
+      v := -v;
+    Str(v + K, Result);
+    Exit;
+  end;
+  { past 10^17 a shift below 2^40 cannot change the sign: add it to the
+    magnitude's digits, carried as in hand }
+  Result := X;
+  if Neg then
+    K := -K;
+  if K >= 0 then
+  begin
+    i := Length(Result);
+    c := 0;
+    while (K > 0) or (c > 0) do
+    begin
+      if i = 0 then
+      begin
+        Result := '0' + Result;
+        i := 1;
+      end;
+      n := (Ord(Result[i]) - 48) + (K mod 10) + c;
+      K := K div 10;
+      c := n div 10;
+      Result[i] := Chr(48 + n mod 10);
+      i := i - 1;
+    end;
+  end
+  else
+  begin
+    K := -K;
+    i := Length(Result);
+    c := 0;
+    while (K > 0) or (c > 0) do
+    begin
+      n := (Ord(Result[i]) - 48) - (K mod 10) - c;
+      K := K div 10;
+      if n < 0 then
+      begin
+        n := n + 10;
+        c := 1;
+      end
+      else
+        c := 0;
+      Result[i] := Chr(48 + n);
+      i := i - 1;
+    end;
+    while (Length(Result) > 1) and (Result[1] = '0') do
+      Result := Copy(Result, 2, Length(Result) - 1);
+  end;
+  if Neg then
+    Result := '-' + Result;
+end;
+
+{ A number's exact value as text that two equal numbers share (RFC
+  8259 6 names no precision; JSON values are equal when their decimal
+  values are, 1.0 = 1 = 1e0 = 10e-1, -0 = 0): its significant digits
+  without the zeros before and after them, and the power of ten of the
+  first, as d.ddd x 10^E; '0' for zero. The exponent of the text may be
+  as long as the text: added to the shift of the point as decimal
+  strings, never cut. }
+function NumKey(P: PByte; N: Int64): string;
+var
+  i, first, dot, shift, en, k: Int64;
+  neg, eneg: Boolean;
+  dig, ex: string;
+  c: Integer;
+begin
+  i := 0;
+  neg := False;
+  if P[0] = 45 then
+  begin
+    neg := True;
+    i := 1;
+  end;
+  dig := '';
+  dot := -1;
+  first := -1;
+  { the digits before the exponent; place counts them from the first }
+  k := 0;
+  while (i < N) and (P[i] <> 101) and (P[i] <> 69) do
+  begin
+    if P[i] = 46 then
+      dot := k
+    else
+    begin
+      if (first < 0) and (P[i] <> 48) then
+        first := k;
+      if first >= 0 then
+        dig := dig + Chr(P[i]);
+      k := k + 1;
+    end;
+    i := i + 1;
+  end;
+  if dot < 0 then
+    dot := k;
+  if first < 0 then
+  begin
+    Result := '0';
+    Exit;
+  end;
+  while (Length(dig) > 1) and (dig[Length(dig)] = '0') do
+    SetLength(dig, Length(dig) - 1);
+  { 0.ddd x 10^(dot - first) is d.dd x 10^(dot - first - 1) }
+  shift := dot - first - 1;
+  eneg := False;
+  ex := '0';
+  if i < N then
+  begin
+    i := i + 1;
+    if (P[i] = 43) or (P[i] = 45) then
+    begin
+      eneg := P[i] = 45;
+      i := i + 1;
+    end;
+    while (i < N - 1) and (P[i] = 48) do
+      i := i + 1;
+    ex := '';
+    while i < N do
+    begin
+      ex := ex + Chr(P[i]);
+      i := i + 1;
+    end;
+  end;
+  ex := DecAdd(ex, eneg, shift);
+  if neg then
+    Result := '-' + dig + 'e' + ex
+  else
+    Result := dig + 'e' + ex;
+end;
+
+function NumEqual(A, B: PJNode): Boolean;
+var
+  ta, tb: PByte;
+  na, nb: Int64;
+begin
+  ta := NumText(A);
+  tb := NumText(B);
+  na := PInt64(ta)^;
+  nb := PInt64(tb)^;
+  { the same text, or two integers that fit: at once }
+  if (na = nb) and (CompareByte(ta[9], tb[9], na) = 0) then
+  begin
+    Result := True;
+    Exit;
+  end;
+  if ((A^.W0 and (24 or JnIntLit)) = (JnInt or JnIntLit)) and
+    ((B^.W0 and (24 or JnIntLit)) = (JnInt or JnIntLit)) then
+  begin
+    Result := A^.W1 = B^.W1;
+    Exit;
+  end;
+  Result := NumKey(@ta[9], na) = NumKey(@tb[9], nb);
+end;
+
+type
+  TJPair = record
+    A, B: PJNode;
+  end;
+
+{ Whether two values are equal as JSON (RFC 8259): the same kind; two
+  numbers of the same decimal value; two strings of the same
+  characters; two arrays of equal elements in order; two objects with
+  the same names, each with equal values, in any order (a set, RFC
+  7493 2.3: no name twice). nil is null. No recursion: a stack of the
+  pairs still to compare. }
+function JEqual(A, B: PJNode): Boolean;
+var
+  st: array of TJPair;
+  n, k, c: Int64;
+  na, nb, x, y, m: PJNode;
+  ka, kb: Int64;
+begin
+  Result := False;
+  SetLength(st, 16);
+  st[0].A := A;
+  st[0].B := B;
+  n := 1;
+  while n > 0 do
+  begin
+    n := n - 1;
+    na := st[n].A;
+    nb := st[n].B;
+    if na = nb then
+      Continue;
+    if na = nil then
+      ka := JtNull
+    else
+      ka := na^.W0 and 7;
+    if nb = nil then
+      kb := JtNull
+    else
+      kb := nb^.W0 and 7;
+    if ka <> kb then
+      Exit;
+    case ka of
+      JtNum:
+        if not NumEqual(na, nb) then
+          Exit;
+      JtStr:
+        if (StrLen(na) <> StrLen(nb)) or
+          ((StrLen(na) > 0) and (CompareByte(StrBytes(na)^, StrBytes(nb)^, StrLen(na)) <> 0)) then
+          Exit;
+      JtArr, JtObj:
+        begin
+          c := na^.W0 shr 8;
+          if c <> nb^.W0 shr 8 then
+            Exit;
+          if n + c > Length(st) then
+            SetLength(st, (n + c) * 2);
+          x := NodeAdd(na, 1);
+          y := NodeAdd(nb, 1);
+          for k := 1 to c do
+          begin
+            if ka = JtObj then
+            begin
+              m := FindMember(nb, PasStrView(StrBytes(x), StrLen(x)));
+              if m = nil then
+                Exit;
+              x := NodeAdd(x, 1);
+              st[n].A := x;
+              st[n].B := m;
+            end
+            else
+            begin
+              st[n].A := x;
+              st[n].B := y;
+              y := NodeAdd(y, NodeSpan(y));
+            end;
+            n := n + 1;
+            x := NodeAdd(x, NodeSpan(x));
+          end;
+        end;
+    end;
+  end;
+  Result := True;
+end;
+
+{ ---- the parse ---- }
+
+{ The document of the text S, nil and E on an error: the UTF-8 check
+  (the first byte that is not I-JSON's, which an error after it gives
+  way to), stage 1 over the whole text to count what the document
+  needs, the document reserved once at that size, then stage 1 again a
+  window at a time under stage 2; Plain reads a byte at a time instead.
+  A text past MaxBytes, or past 4 GiB - 1 (the index holds 32-bit
+  places, as simdjson's), is refused before it is read. }
+function ParseText(const S: string; const O: TJsonOptions; Plain: Boolean; out E: TJErr): PJNode;
+var
+  p: TJParse;
+  scan: TPasJsonScan;
+  at, take, size, lim: Int64;
+begin
+  Result := nil;
+  E := Default(TJErr);
+  lim := JsonMaxDoc;
+  if (O.MaxBytes > 0) and (O.MaxBytes < lim) then
+    lim := O.MaxBytes;
+  if Length(S) > lim then
+  begin
+    E.Kind := 4;
+    E.Offset := lim;
+    E.Path := '';
+    E.Reason := 'the text has ' + IntText(Length(S)) + ' bytes, more than the ' + IntText(lim) +
+      ' a parse takes';
+    Exit;
+  end;
+  p := Default(TJParse);
+  p.T := PByte(Pointer(S));
+  p.N := Length(S);
+  p.MaxDepth := O.MaxDepth;
+  if p.MaxDepth <= 0 then
+    p.MaxDepth := JsonDepthMax;
+  p.Plain := Plain;
+  if Plain then
+    p.Bad := -1
+  else
+    p.Bad := PasUtf8Valid(p.T, p.N, True);
+  SetLength(p.Idx, JsonWin + 8);
+  PasJsonScanStart(scan);
+  at := 0;
+  while at < p.N do
+  begin
+    take := p.N - at;
+    if Plain then
+    begin
+      if take > JsonWin then
+        take := JsonWin;
+      PasJsonIndexPlain(@p.T[at], take, scan, @p.Idx[0], at);
+    end
+    else if take > JsonWin then
+    begin
+      take := JsonWin;
+      PasJsonIndexBlocks(@p.T[at], take shr 6, scan, @p.Idx[0], at);
+    end
+    else
+      PasJsonIndex(@p.T[at], take, scan, @p.Idx[0], at);
+    at := at + take;
+  end;
+  size := JsonHead + scan.Nodes * 16 + scan.Bytes + 9 * scan.Scalars + 8;
+  SetLength(p.Doc, size);
+  p.D := @p.Doc[0];
+  PInt64(@p.D[0])^ := JsonMagic;
+  p.Arena := JsonHead + scan.Nodes * 16;
+  p.NodeCap := scan.Nodes;
+  p.Seed := NextSeed;
+  PasJsonScanStart(p.Scan);
+  if Plain then
+    ParseDoc(p)
+  else
+    ParseFast(p);
+  if p.Failed then
+  begin
+    E := p.Err;
+    Exit;
+  end;
+  PInt64(@p.D[8])^ := p.Nodes;
+  PInt64(@p.D[16])^ := p.Arena;
+  PInt64(@p.D[24])^ := p.N;
+  Result := PJNode(@p.D[JsonHead]);
+end;
+
+function NodeOfJ(J: json): PJNode;
+begin
+  Result := J as PJNode;
+end;
+
+function JsonOfN(N: PJNode): json;
+begin
+  Result := N as json;
+end;
+
+function JsonDefaults: TJsonOptions;
+begin
+  Result := Default(TJsonOptions);
+  Result.MaxDepth := JsonDepthMax;
+end;
+
+function JsonPretty: TJsonOptions;
+begin
+  Result := JsonDefaults;
+  Result.Indent := '  ';
+end;
+
+function JsonCanonical: TJsonOptions;
+begin
+  Result := JsonDefaults;
+  Result.Canonical := True;
+end;
+
+function JsonParse(const S: string; const Opts: TJsonOptions): json;
+var
+  e: TJErr;
+  r: PJNode;
+begin
+  r := ParseText(S, Opts, False, e);
+  if r = nil then
+    raise ParseError(S, e);
+  Result := JsonOfN(r);
+end;
+
+function JsonParse(const S: string): json;
+begin
+  Result := JsonParse(S, JsonDefaults);
+end;
+
+function TryJsonParse(const S: string; out J: json; out Err: EJsonError;
+  const Opts: TJsonOptions): Boolean;
+var
+  e: TJErr;
+  r: PJNode;
+begin
+  r := ParseText(S, Opts, False, e);
+  Result := r <> nil;
+  J := JsonOfN(r);
+  if Result then
+    Err := nil
+  else
+    Err := ParseError(S, e);
+end;
+
+function TryJsonParse(const S: string; out J: json; out Err: EJsonError): Boolean;
+begin
+  Result := TryJsonParse(S, J, Err, JsonDefaults);
+end;
+
+function PasJsonParsePlain(const S: string; const Opts: TJsonOptions; out Err: EJsonError): json;
+var
+  e: TJErr;
+  r: PJNode;
+begin
+  r := ParseText(S, Opts, True, e);
+  Result := JsonOfN(r);
+  if r = nil then
+    Err := ParseError(S, e)
+  else
+    Err := nil;
+end;
+
+function PasJsonImage(J: json): string;
+var
+  base: PByte;
+  n: Int64;
+begin
+  Result := '';
+  if J = nil then
+    Exit;
+  base := PByte(MemBase(NodeOfJ(J)));
+  if (base = nil) or (PInt64(base)^ <> JsonMagic) or (PJNode(@base[JsonHead]) <> NodeOfJ(J)) then
+    Exit;
+  n := PInt64(@base[16])^;
+  SetLength(Result, n);
+  Move(base^, PByte(Pointer(Result))^, n);
+end;
+
+{ ---- writing ---- }
+
+function JsonEncode(J: json; const Opts: TJsonOptions): string;
+var
+  mode: Integer;
+begin
+  mode := 0;
+  if Opts.Canonical then
+    mode := 2
+  else if Opts.Indent <> '' then
+    mode := 1;
+  if J = nil then
+    Result := 'null'
+  else
+    Result := JsonWrite(NodeOfJ(J), mode, Opts.Indent, Opts.EscapeHtml);
+end;
+
+function JsonEncode(J: json): string;
+begin
+  if J = nil then
+    Result := 'null'
+  else
+    Result := JsonWrite(NodeOfJ(J), 0, '', False);
+end;
+
+function PasJsonText(J: json): string;
+begin
+  Result := JsonEncode(J);
+end;
+
+{ ---- reading ---- }
+
+function PasJsonGet(J: json; const K: string): json;
+begin
+  Result := JsonOfN(JGet(NodeOfJ(J), K));
+end;
+
+function PasJsonItem(J: json; I: Integer): json;
+begin
+  Result := JsonOfN(JItem(NodeOfJ(J), I));
+end;
+
+function PasJsonHas(J: json; const K: string): Boolean;
+begin
+  Result := JHas(NodeOfJ(J), K);
+end;
+
+function PasJsonTryGet(J: json; const K: string; out V: json): Boolean;
+var
+  n: PJNode;
+begin
+  Result := JTryGet(NodeOfJ(J), K, n);
+  V := JsonOfN(n);
+end;
+
+function PasJsonTryItem(J: json; I: Integer; out V: json): Boolean;
+var
+  n: PJNode;
+begin
+  Result := JTryItem(NodeOfJ(J), I, n);
+  V := JsonOfN(n);
+end;
+
+function PasJsonLength(J: json): Integer;
+begin
+  Result := JLength(NodeOfJ(J));
+end;
+
+function PasJsonEqual(A, B: json): Boolean;
+begin
+  Result := JEqual(NodeOfJ(A), NodeOfJ(B));
+end;
+
+{ for x in j: Want 0 a value at a time, of an array or an object; 1 an
+  object's names; 2 an object's members; 3 an array's elements with
+  their places. Another kind of value raises. }
+procedure PasJsonIterInit(J: json; var It: TJsonIter; Want: Integer);
+var
+  n: PJNode;
+  k: Int64;
+begin
+  n := NodeOfJ(J);
+  if n = nil then
+    k := JtNull
+  else
+    k := n^.W0 and 7;
+  if (Want = 0) and (k < JtArr) then
+    RaiseKind(n, 'an array or an object');
+  if ((Want = 1) or (Want = 2)) and (k <> JtObj) then
+    RaiseKind(n, 'an object');
+  if (Want = 3) and (k <> JtArr) then
+    RaiseKind(n, 'an array');
+  It.Cur := NodeAdd(n, 1);
+  It.Left := n^.W0 shr 8;
+  It.Index := 0;
+  It.Obj := k = JtObj;
+end;
+
+{ The next child: an element, or a member, Nm its name (nil in an
+  array) and the value; False when none is left. }
+function IterStep(var It: TJsonIter; out Nm, V: PJNode): Boolean;
+var
+  c: PJNode;
+begin
+  Result := It.Left > 0;
+  Nm := nil;
+  V := nil;
+  if not Result then
+    Exit;
+  c := PJNode(It.Cur);
+  if It.Obj then
+  begin
+    Nm := c;
+    c := NodeAdd(c, 1);
+  end;
+  V := c;
+  It.Cur := NodeAdd(c, NodeSpan(c));
+  It.Left := It.Left - 1;
+  It.Index := It.Index + 1;
+end;
+
+function PasJsonNextValue(var It: TJsonIter; out V: json): Boolean;
+var
+  nm, n: PJNode;
+begin
+  Result := IterStep(It, nm, n);
+  V := JsonOfN(n);
+end;
+
+function PasJsonNextName(var It: TJsonIter; out K: string): Boolean;
+var
+  nm, n: PJNode;
+begin
+  Result := IterStep(It, nm, n);
+  if Result then
+    K := PasStrView(StrBytes(nm), StrLen(nm))
+  else
+    K := '';
+end;
+
+function PasJsonNextMember(var It: TJsonIter; out K: string; out V: json): Boolean;
+var
+  nm, n: PJNode;
+begin
+  Result := IterStep(It, nm, n);
+  V := JsonOfN(n);
+  if Result then
+    K := PasStrView(StrBytes(nm), StrLen(nm))
+  else
+    K := '';
+end;
+
+function PasJsonNextItem(var It: TJsonIter; out I: Integer; out V: json): Boolean;
+var
+  nm, n: PJNode;
+begin
+  I := It.Index;
+  Result := IterStep(It, nm, n);
+  V := JsonOfN(n);
+end;
+
+{ ---- the index ---- }
+
+function IndexHash(const S: string; Seed: Integer): Integer;
+begin
+  Result := XxHash3(S, Seed);
+end;
+
+constructor TJsonIndex.Create(J: json);
+var
+  n: PJNode;
+  c, k, slots, h: Int64;
+  nm: PJNode;
+begin
+  FDoc := J;
+  n := NodeOfJ(J);
+  if (n = nil) or ((n^.W0 and 7) < JtArr) then
+    RaiseKind(n, 'an array or an object');
+  c := n^.W0 shr 8;
+  if (n^.W0 and 7) = JtArr then
+  begin
+    SetLength(FItems, c);
+    nm := NodeAdd(n, 1);
+    for k := 0 to c - 1 do
+    begin
+      FItems[k] := nm;
+      nm := NodeAdd(nm, NodeSpan(nm));
+    end;
+    Exit;
+  end;
+  slots := 8;
+  while slots < 2 * c do
+    slots := slots * 2;
+  SetLength(FNames, slots);
+  FMask := slots - 1;
+  FSeed := NextSeed;
+  nm := NodeAdd(n, 1);
+  for k := 0 to c - 1 do
+  begin
+    h := IndexHash(PasStrView(StrBytes(nm), StrLen(nm)), FSeed) and FMask;
+    while FNames[h] <> nil do
+      h := (h + 1) and FMask;
+    FNames[h] := nm;
+    nm := NodeAdd(nm, 1);
+    nm := NodeAdd(nm, NodeSpan(nm));
+  end;
+end;
+
+{ The value of the member Name, nil when there is none. }
+function TJsonIndex.Find(const Name: string): json;
+var
+  h, kl: Int64;
+  nm: PJNode;
+begin
+  Result := nil;
+  if FNames = nil then
+    Exit;
+  kl := Length(Name);
+  h := IndexHash(Name, FSeed) and FMask;
+  while FNames[h] <> nil do
+  begin
+    nm := PJNode(FNames[h]);
+    if (StrLen(nm) = kl) and ((kl = 0) or (CompareByte(StrBytes(nm)^, PByte(Pointer(Name))^, kl) = 0)) then
+    begin
+      Result := JsonOfN(NodeAdd(nm, 1));
+      Exit;
+    end;
+    h := (h + 1) and FMask;
+  end;
+end;
+
+function TJsonIndex.Has(const Name: string): Boolean;
+begin
+  Result := Find(Name) <> nil;
+end;
+
+{ The value of the member Name; a missing one raises as j['k'] does. }
+function TJsonIndex.Get(const Name: string): json;
+var
+  p: string;
+begin
+  Result := Find(Name);
+  if Result = nil then
+  begin
+    if FNames = nil then
+      RaiseKind(NodeOfJ(FDoc), 'an object');
+    p := NodePath(NodeOfJ(FDoc));
+    raise EJsonError.Create(jeMissing, -1, 0, 0, p + '/' + KeyToken(Name), p,
+      'no member "' + Name + '"');
+  end;
+end;
+
+{ The element I of the array; out of range raises as j[i] does. }
+function TJsonIndex.Item(I: Integer): json;
+var
+  p: string;
+begin
+  if FNames <> nil then
+    RaiseKind(NodeOfJ(FDoc), 'an array');
+  if (I < 0) or (I >= Length(FItems)) then
+  begin
+    p := NodePath(NodeOfJ(FDoc));
+    raise EJsonError.Create(jeRange, -1, 0, 0, p + '/' + IntText(I), p, 'index ' + IntText(I) +
+      ' out of range (length ' + IntText(Length(FItems)) + ')');
+  end;
+  Result := JsonOfN(PJNode(FItems[I]));
+end;
+
+function TJsonIndex.Count: Integer;
+begin
+  Result := NodeOfJ(FDoc)^.W0 shr 8;
+end;
+
+function JsonIndex(J: json): TJsonIndex;
+begin
+  Result := TJsonIndex.Create(J);
+end;
+
+{ ---- the helper ---- }
+
+function TJsonHelper.Kind: TJsonKind;
+begin
+  Result := JKindOf(NodeOfJ(Self));
+end;
+
+function TJsonHelper.IsNull: Boolean;
+begin
+  Result := JIsNull(NodeOfJ(Self));
+end;
+
+function TJsonHelper.AsBoolean: Boolean;
+begin
+  Result := JAsBoolean(NodeOfJ(Self));
+end;
+
+function TJsonHelper.AsInteger: Integer;
+begin
+  Result := JAsInteger(NodeOfJ(Self));
+end;
+
+function TJsonHelper.AsFloat: Double;
+begin
+  Result := JAsFloat(NodeOfJ(Self));
+end;
+
+{ The binary128 nearest the number, rounded once from its text
+  (pasfmt's PasParseQuad); past the largest Quad an error. }
+function TJsonHelper.AsQuad: Quad;
+var
+  n: PJNode;
+  lo, hi: Int64;
+  w: array[0..1] of Int64;
+  p: string;
+begin
+  n := NodeOfJ(Self);
+  NeedNum(n);
+  lo := 0;
+  hi := 0;
+  PasParseQuad(NumView(n), lo, hi);
+  if ((hi shr 48) and $7FFF) = $7FFF then
+  begin
+    p := NodePath(n);
+    raise EJsonError.Create(jeRange, -1, 0, 0, p, p, NumView(n) + ' is out of Quad''s range');
+  end;
+  w[0] := lo;
+  w[1] := hi;
+  Move(w, Result, 16);
+end;
+
+{ The Currency the number is exactly (four places): one with a fifth
+  place that is not 0, or past Currency's range, is an error, never
+  rounded. }
+function TJsonHelper.AsCurrency: Currency;
+var
+  n: PJNode;
+  t: PByte;
+  key, p: string;
+  dig, ex: string;
+  i, e, last: Int64;
+  v: Int64;
+  ok: Boolean;
+begin
+  n := NodeOfJ(Self);
+  NeedNum(n);
+  t := NumText(n);
+  key := NumKey(@t[9], PInt64(t)^);
+  ok := True;
+  if key <> '0' then
+  begin
+    { d.ddd x 10^E: its last digit is worth 10^(E - digits + 1) }
+    i := Pos('e', key);
+    dig := Copy(key, 1, i - 1);
+    ex := Copy(key, i + 1, Length(key));
+    if (dig <> '') and (dig[1] = '-') then
+      dig := Copy(dig, 2, Length(dig));
+    ok := Length(ex) <= 18;
+    if ok then
+    begin
+      Val(ex, e, i);
+      last := e - Length(dig) + 1;
+      ok := last >= -4;
+    end;
+  end;
+  p := NodePath(n);
+  if not ok then
+    raise EJsonError.Create(jeRange, -1, 0, 0, p, p, NumView(n) + ' is no Currency: it has more ' +
+      'than four places');
+  if not PasTryParseCurrency(NumView(n), v) then
+    raise EJsonError.Create(jeRange, -1, 0, 0, p, p, NumView(n) + ' is out of Currency''s range');
+  Result := v as Currency;
+end;
+
+function TJsonHelper.AsString: string;
+begin
+  Result := JAsString(NodeOfJ(Self));
+end;
+
+function TJsonHelper.AsNumber: string;
+begin
+  Result := JAsNumber(NodeOfJ(Self));
+end;
+
+function TJsonHelper.At(const Ptr: string): json;
+begin
+  Result := JsonOfN(JAt(NodeOfJ(Self), Ptr));
+end;
+
+function TJsonHelper.Find(const Name: string): json;
+begin
+  Result := JsonOfN(JFind(NodeOfJ(Self), Name));
+end;
+{$endif}
 
 end.

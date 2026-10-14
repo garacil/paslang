@@ -103,7 +103,7 @@ Adler-32, FNV-1a, MurmurHash3, SipHash, the B+ tree and the heap. `Pos` searches
 
 ## Adding a hash word (a new algorithm)
 
-Every algorithm of §13 of the manual went in this way; a new one
+Every algorithm of §14 of the manual went in this way; a new one
 follows the same steps, in this order, and is not done until the last.
 
 1. The algorithm is written from its standard's text, never from
@@ -138,8 +138,8 @@ follows the same steps, in this order, and is not done until the last.
    300 bytes, and a long message. `make check` runs it on both
    machines, native and `-cpu base`, and requires the base build to
    call the `Base` body.
-5. The words of the manual: the table in §13 (algorithm, what it
-   gives, what it takes, the feature, what it is for), §20's list, the
+5. The words of the manual: the table in §14 (algorithm, what it
+   gives, what it takes, the feature, what it is for), §21's list, the
    `lib` section of `paslangc --help` (`src/compiler/pashelp.paslang`,
    with the version raised), and a row in the table above
    when there is a kernel.
