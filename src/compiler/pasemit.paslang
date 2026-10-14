@@ -646,6 +646,13 @@ type
     procedure ProofTests(const R, CH, Fail: string);
     function DirectStore(Dest: PExpr): Boolean;
     procedure EmitCall(const Name: string; const Args: TExprArray);
+    function DirectArg(E: PExpr; const R: string; Put: Boolean): Boolean;
+    function MethArgs(Obj: PExpr; SelfCls: Byte; const Args: TExprArray): LongInt;
+    function WordInt(T: LongInt): Boolean;
+    function CallFree(E: PExpr; Depth: LongInt): Boolean;
+    procedure PlanArgs(const Args: TExprArray; MaxReg: LongInt; out Kd, Comp: LongInt);
+    procedure PutArgs(const Args: TExprArray; Kd, Comp, Reg0: LongInt);
+    procedure ArmArgX0(A: PExpr);
     procedure EmitArgVal(E: PExpr);
     procedure EmitCallVal(Target: PExpr; const Args: TExprArray);
     procedure EmitArmMeth(Obj: PExpr; const Args: TExprArray; Slot: LongInt;
@@ -8891,9 +8898,258 @@ begin
   Line('  ' + Setcc + ' %al');
 end;
 
+{ Argument E straight into register R, in one or two instructions that
+  touch no other register but x16, when it calls nothing and moves
+  nothing (P281): a constant, a string literal by its address, a
+  word-sized integer, enumeration or pointer variable of this frame or
+  a global, the address of a variable of this frame or a global (a
+  string's or a record's, passed by it) and a var parameter's. Go's
+  register ABI puts such an argument in place
+  (cmd/compile/abi-internal.md); the push, the load and the add of the
+  others are three more instructions. With Put False it only says
+  whether it can. }
+function TEmitter.DirectArg(E: PExpr; const R: string; Put: Boolean): Boolean;
+var
+  s: TSym;
+  k: TTypeKind;
+  v: PExpr;
+begin
+  Result := False;
+  if E = nil then
+    Exit;
+  case E^.Kind of
+    ekInt:
+      begin
+        k := TKind(E^.Typ);
+        if (k = tykReal) or (k = tykQuad) or (k = tykCurrency) or (k = tykSet) or IsFat(E^.Typ) or
+          IsBlob(E^.Typ) then
+          Exit;
+        if Put then
+        begin
+          if FArm then
+            Imm(R, E^.Num)
+          else
+            Line('  movq $' + IntToStr(E^.Num) + ', %' + R);
+        end;
+        Result := True;
+      end;
+    ekStr:
+      begin
+        if not IsFat(E^.Typ) then
+          Exit;
+        if Put then
+        begin
+          if FArm then
+            LeaS(InternStrFat(E^.Txt), R)
+          else
+            Line('  leaq ' + InternStrFat(E^.Txt) + '(%rip), %' + R);
+        end;
+        Result := True;
+      end;
+    ekVar, ekAddr:
+      begin
+        v := E;
+        if E^.Kind = ekAddr then
+          v := E^.L;
+        if (v = nil) or (v^.Kind <> ekVar) then
+          Exit;
+        s := FindSym(v^.Name);
+        if (s.Up > 0) or s.Boxed or (s.Name = '') then
+          Exit;
+        if (E^.Kind = ekAddr) or IsFat(v^.Typ) or IsBlob(v^.Typ) then
+        begin
+          { its address: a var parameter's slot holds it }
+          if s.Reg <> '' then
+            Exit;
+          if Put then
+          begin
+            if s.ByRef then
+            begin
+              if FArm then
+              begin
+                if s.Global then
+                  LdS(VarLabel(s.Name), R)
+                else
+                  LdFP(R, s.Off);
+              end
+              else
+                Line('  movq ' + MemA(s) + ', %' + R);
+            end
+            else if FArm then
+            begin
+              if s.Global then
+                LeaS(VarLabel(s.Name), R)
+              else
+                AddFP(R, s.Off);
+            end
+            else if s.Global then
+              Line('  leaq ' + VarLabel(s.Name) + '(%rip), %' + R)
+            else
+              Line('  leaq ' + IntToStr(s.Off) + '(%rbp), %' + R);
+          end;
+          Result := True;
+          Exit;
+        end;
+        { its value: a word, read where it lies }
+        k := TKind(v^.Typ);
+        if (TSize(v^.Typ) <> 8) or (TSize(s.Typ) <> 8) or (k = tykReal) or (k = tykQuad) or
+          (k = tykSet) or s.ByRef then
+          Exit;
+        if Put then
+          LoadPlain(s, R);
+        Result := True;
+      end;
+  end;
+end;
+
+{ T is an integer, a Boolean, a Char, an enumeration or a pointer of at
+  most a word, whose value an expression leaves in rax or x0. }
+function TEmitter.WordInt(T: LongInt): Boolean;
+var
+  k: TTypeKind;
+begin
+  k := TKind(T);
+  Result := (TSize(T) <= 8) and not IsFat(T) and not IsBlob(T) and (k <> tykReal) and
+    (k <> tykQuad) and (k <> tykCurrency) and (k <> tykSet);
+end;
+
+{ E is worked out with no call and changes nothing (P281): integer
+  arithmetic, logic, shifts and comparisons, conversions between
+  integers, variables, constants, elements and fields, a word in rax or
+  x0. It may use the register pool, which holds arguments, so a call
+  works out one such argument first, before any is in its register. }
+function TEmitter.CallFree(E: PExpr; Depth: LongInt): Boolean;
+begin
+  Result := False;
+  if (E = nil) or (Depth > 12) or not WordInt(E^.Typ) then
+    Exit;
+  case E^.Kind of
+    ekInt:
+      Result := True;
+    ekVar:
+      Result := True;
+    ekBin:
+      Result := (E^.Bin in [boAdd, boSub, boMul, boDiv, boMod, boEq, boNe, boLt, boLe, boGt, boGe,
+        boAnd, boOr, boXor, boShl, boShr, boSar]) and WordInt(E^.L^.Typ) and
+        WordInt(E^.R^.Typ) and CallFree(E^.L, Depth + 1) and CallFree(E^.R, Depth + 1);
+    ekUn:
+      Result := (E^.Un in [uoNeg, uoNot, uoConv]) and WordInt(E^.L^.Typ) and
+        CallFree(E^.L, Depth + 1);
+    ekIndex:
+      Result := (E^.L <> nil) and (E^.L^.Kind = ekVar) and (TKind(E^.L^.Typ) = tykArray) and
+        (E^.R <> nil) and WordInt(E^.R^.Typ) and CallFree(E^.R, Depth + 1);
+    ekField:
+      Result := (E^.L <> nil) and (E^.L^.Kind = ekVar) and
+        ((TKind(E^.L^.Typ) = tykRecord) or (TKind(E^.L^.Typ) = tykClass));
+  end;
+end;
+
+{ The arguments of a call: the first Kd worked out and pushed as before;
+  each of the others calls nothing, and goes straight to its register,
+  one of them, Comp (-1 for none), worked out first (P281). The whole
+  plan only when the arguments fit in MaxReg registers. }
+procedure TEmitter.PlanArgs(const Args: TExprArray; MaxReg: LongInt; out Kd, Comp: LongInt);
+var
+  i: LongInt;
+begin
+  Kd := Length(Args);
+  Comp := -1;
+  if Length(Args) > MaxReg then
+    Exit;
+  i := High(Args);
+  while i >= 0 do
+  begin
+    if DirectArg(Args[i], 'rax', False) then
+      Kd := i
+    else if (Comp < 0) and CallFree(Args[i], 0) then
+    begin
+      Comp := i;
+      Kd := i;
+    end
+    else
+      Break;
+    i := i - 1;
+  end;
+end;
+
+{ The arguments from Kd on into their registers, the one worked out
+  first, Reg0 the register of argument 0 (1 for a method's, Self in the
+  first). }
+procedure TEmitter.PutArgs(const Args: TExprArray; Kd, Comp, Reg0: LongInt);
+var
+  i: LongInt;
+begin
+  if Comp >= 0 then
+  begin
+    EmitExpr(Args[Comp]);
+    if FArm then
+      Line('  mov ' + ArgR(Reg0 + Comp) + ', x0')
+    else
+      Line('  movq %rax, %' + ArgReg(Reg0 + Comp));
+  end;
+  for i := Kd to High(Args) do
+    if i <> Comp then
+    begin
+      if FArm then
+        DirectArg(Args[i], ArgR(Reg0 + i), True)
+      else
+        DirectArg(Args[i], ArgReg(Reg0 + i), True);
+    end;
+end;
+
+{ Self, Obj, in rdi and the arguments in rsi and on, for a method's call
+  on amd64: the arguments after the last one that calls or moves
+  anything straight to their registers, and Self too when it is a class
+  variable and nothing else is pushed (P281); the others pushed and
+  shifted as before, Self pushed with SelfCls. The words the call
+  leaves on the stack past the registers, which the caller takes off
+  with Self's after the call. }
+function TEmitter.MethArgs(Obj: PExpr; SelfCls: Byte; const Args: TExprArray): LongInt;
+var
+  n, kd, nreg, i, comp: LongInt;
+begin
+  Result := 0;
+  n := Length(Args);
+  PlanArgs(Args, 5, kd, comp);
+  if (kd = 0) and (Obj^.Kind = ekVar) and (TKind(Obj^.Typ) = tykClass) and
+    DirectArg(Obj, 'rax', False) then
+  begin
+    PutArgs(Args, 0, comp, 1);
+    DirectArg(Obj, 'rdi', True);
+    Exit;
+  end;
+  EmitExpr(Obj);
+  PushK('rax', SelfCls);
+  for i := 0 to kd - 1 do
+  begin
+    { the rules of every call, P80 included: a record value is already
+      an address }
+    EmitArgVal(Args[i]);
+    PushK('rax', ACls(Args[i]));
+  end;
+  if kd < n then
+  begin
+    PutArgs(Args, kd, comp, 1);
+    ShiftArgs(kd, kd, 1);
+    Line('  popq %rdi');
+    Exit;
+  end;
+  if n > 5 then
+    nreg := 5
+  else
+    nreg := n;
+  ShiftArgs(n, nreg, 1);
+  if n > nreg then
+    Line('  movq ' + IntToStr((n - nreg) * 8) + '(%rsp), %rdi')
+  else
+    Line('  popq %rdi');
+  Result := n - nreg;
+end;
+
 procedure TEmitter.EmitCall(const Name: string; const Args: TExprArray);
 var
-  i, n, nreg: SizeInt;
+  i, n, nreg, kd: SizeInt;
+  kd0, comp: LongInt;
   off: LongInt;
   te: PExpr;
   kinds: array of Byte;
@@ -8992,6 +9248,74 @@ begin
   n := Length(Args);
   if n > 32 then
     Die('at most 32 arguments');
+  { the arguments after the last one that calls or moves anything go
+    straight to their registers, after the others are worked out (P281) }
+  if FArm then
+    PlanArgs(Args, 8, kd0, comp)
+  else
+    PlanArgs(Args, 6, kd0, comp);
+  kd := kd0;
+  if FArm and (kd < n) then
+  begin
+    for i := 0 to kd - 1 do
+    begin
+      if Args[i]^.Kind = ekMethPtr then
+      begin
+        EmitExpr(Args[i]);
+        off := ScratchT(16, Args[i]^.Typ);
+        StFP('x0', off);
+        StFP('x2', off + 8);
+        Imm('x0', off);
+        Line('  add x0, x29, x0');
+      end
+      else if Args[i]^.Kind = ekAddr then
+        EmitExpr(Args[i])
+      else if IsFat(Args[i]^.Typ) then
+      begin
+        if Args[i]^.Kind = ekStr then
+          LeaS(InternStrFat(Args[i]^.Txt), 'x0')
+        else if (Args[i]^.Kind = ekVar) or (Args[i]^.Kind = ekField) or
+          (Args[i]^.Kind = ekIndex) or (Args[i]^.Kind = ekDeref) then
+          EmitAddr(Args[i])
+        else
+        begin
+          EmitExpr(Args[i]);
+          if IsDyn(Args[i]^.Typ) then
+            off := ScratchT(24, Args[i]^.Typ)
+          else
+            off := ScratchT(16, Args[i]^.Typ);
+          StFP('x0', off);
+          StFP('x2', off + 8);
+          if IsDyn(Args[i]^.Typ) then
+            StFP('x3', off + 16);
+          Imm('x0', off);
+          Line('  add x0, x29, x0');
+        end;
+      end
+      else if IsBlob(Args[i]^.Typ) then
+      begin
+        if (Args[i]^.Kind = ekVar) or (Args[i]^.Kind = ekField) or
+          (Args[i]^.Kind = ekIndex) or (Args[i]^.Kind = ekDeref) then
+          EmitAddr(Args[i])
+        else
+          EmitExpr(Args[i]);
+      end
+      else
+        EmitExpr(Args[i]);
+      PshK('x0', ACls(Args[i]));
+    end;
+    PutArgs(Args, kd, comp, 0);
+    for i := 0 to kd - 1 do
+      Line('  ldr ' + ArgR(LongInt(i)) + ', [sp, #' + IntToStr((kd - 1 - i) * 16) + ']');
+    if kd > 0 then
+    begin
+      Imm('x16', kd * 16);
+      Line('  add sp, sp, x16');
+    end;
+    EmitLink(ProcNest(Name));
+    Line('  bl ' + Name);
+    Exit;
+  end;
   if FArm then
   begin
     for i := 0 to n - 1 do
@@ -9101,7 +9425,7 @@ begin
     end;
     Exit;
   end;
-  for i := 0 to n - 1 do
+  for i := 0 to kd - 1 do
   begin
     if Args[i]^.Kind = ekMethPtr then
     begin
@@ -9153,6 +9477,16 @@ begin
       EmitExpr(Args[i]);
     PushK('rax', ACls(Args[i]));
   end;
+  if kd < n then
+  begin
+    { the direct ones first, then the worked-out ones from the stack
+      into the registers before them }
+    PutArgs(Args, kd, comp, 0);
+    ShiftArgs(kd, kd, 0);
+    EmitLink(ProcNest(Name));
+    Line('  call ' + Name);
+    Exit;
+  end;
   if n > 6 then
     nreg := 6
   else
@@ -9172,7 +9506,7 @@ end;
   refused rather than passed wrongly. }
 procedure TEmitter.EmitCallVal(Target: PExpr; const Args: TExprArray);
 var
-  i, n: LongInt;
+  i, n, kd, comp: LongInt;
 begin
   n := Length(Args);
   if FArm then
@@ -9184,16 +9518,19 @@ begin
     EmitExpr(Target);
     PshK('x2', 1);
     PshK('x0', 0);
-    for i := 0 to n - 1 do
+    { the arguments that call nothing straight to their registers (P281) }
+    PlanArgs(Args, 8, kd, comp);
+    for i := 0 to kd - 1 do
     begin
       EmitArgVal(Args[i]);
       PshK('x0', ACls(Args[i]));
     end;
-    Line('  ldr x9, [sp, #' + IntToStr(n * 16) + ']');
-    Line('  ldr x27, [sp, #' + IntToStr((n + 1) * 16) + ']');
-    for i := 0 to n - 1 do
-      Line('  ldr ' + ArgR(i) + ', [sp, #' + IntToStr((n - 1 - i) * 16) + ']');
-    Imm('x16', (n + 2) * 16);
+    PutArgs(Args, kd, comp, 0);
+    Line('  ldr x9, [sp, #' + IntToStr(kd * 16) + ']');
+    Line('  ldr x27, [sp, #' + IntToStr((kd + 1) * 16) + ']');
+    for i := 0 to kd - 1 do
+      Line('  ldr ' + ArgR(i) + ', [sp, #' + IntToStr((kd - 1 - i) * 16) + ']');
+    Imm('x16', (kd + 2) * 16);
     Line('  add sp, sp, x16');
     Line('  blr x9');
   end
@@ -9204,16 +9541,19 @@ begin
     EmitExpr(Target);
     PushK('rdx', 1);
     PushK('rax', 0);
-    for i := 0 to n - 1 do
+    { the arguments that call nothing straight to their registers (P281) }
+    PlanArgs(Args, 6, kd, comp);
+    for i := 0 to kd - 1 do
     begin
       EmitArgVal(Args[i]);
       PushK('rax', ACls(Args[i]));
     end;
-    for i := 0 to n - 1 do
-      Line('  movq ' + IntToStr((n - 1 - i) * 8) + '(%rsp), %' + ArgReg(i));
-    Line('  movq ' + IntToStr(n * 8) + '(%rsp), %r11');
-    Line('  movq ' + IntToStr((n + 1) * 8) + '(%rsp), %r10');
-    Line('  addq $' + IntToStr((n + 2) * 8) + ', %rsp');
+    PutArgs(Args, kd, comp, 0);
+    for i := 0 to kd - 1 do
+      Line('  movq ' + IntToStr((kd - 1 - i) * 8) + '(%rsp), %' + ArgReg(i));
+    Line('  movq ' + IntToStr(kd * 8) + '(%rsp), %r11');
+    Line('  movq ' + IntToStr((kd + 1) * 8) + '(%rsp), %r10');
+    Line('  addq $' + IntToStr((kd + 2) * 8) + ', %rsp');
     Line('  call *%r11');
   end;
 end;
@@ -9282,10 +9622,64 @@ begin
     EmitExpr(E);
 end;
 
+{ A method's argument A into x0 on arm64, as every call passes one: a
+  string or a record by its address, a method value through a scratch
+  pair (P80, 1.0.133). }
+procedure TEmitter.ArmArgX0(A: PExpr);
+var
+  off: LongInt;
+begin
+  if A^.Kind = ekMethPtr then
+  begin
+    EmitExpr(A);
+    off := ScratchT(16, A^.Typ);
+    StFP('x0', off);
+    StFP('x2', off + 8);
+    Imm('x0', off);
+    Line('  add x0, x29, x0');
+  end
+  else if A^.Kind = ekAddr then
+    EmitExpr(A)
+  else if IsFat(A^.Typ) then
+  begin
+    if A^.Kind = ekStr then
+      LeaS(InternStrFat(A^.Txt), 'x0')
+    else if (A^.Kind = ekVar) or (A^.Kind = ekField) or (A^.Kind = ekIndex) or
+      (A^.Kind = ekDeref) then
+      EmitAddr(A)
+    else
+    begin
+      EmitExpr(A);
+      if IsDyn(A^.Typ) then
+        off := ScratchT(24, A^.Typ)
+      else
+        off := ScratchT(16, A^.Typ);
+      StFP('x0', off);
+      StFP('x2', off + 8);
+      if IsDyn(A^.Typ) then
+        StFP('x3', off + 16);
+      Imm('x0', off);
+      Line('  add x0, x29, x0');
+    end;
+  end
+  else if IsBlob(A^.Typ) then
+  begin
+    { A record value is already an address (P80). }
+    if (A^.Kind = ekVar) or (A^.Kind = ekField) or (A^.Kind = ekIndex) or
+      (A^.Kind = ekDeref) then
+      EmitAddr(A)
+    else
+      EmitExpr(A);
+  end
+  else
+    EmitExpr(A);
+end;
+
 procedure TEmitter.EmitArmMeth(Obj: PExpr; const Args: TExprArray;
   Slot: LongInt; const Name: string);
 var
-  i, nuser, ntot, npush, nreg, ns, off, src: LongInt;
+  i, nuser, ntot, npush, nreg, ns, off, src, kd, comp: LongInt;
+  direct: Boolean;
 begin
   if (Slot < 0) and (Slot <> -3) and (Name = '') then
   begin
@@ -9295,6 +9689,61 @@ begin
   nuser := Length(Args);
   if nuser > 32 then
     Die('at most 32 arguments');
+  { the arguments after the last one that calls or moves anything
+    straight to their registers, Self too when it is a class variable
+    and nothing else is pushed (P281) }
+  direct := False;
+  kd := nuser;
+  comp := -1;
+  if (Slot <> -3) and (nuser < 8) then
+  begin
+    PlanArgs(Args, 7, kd, comp);
+    if (kd = 0) and (Obj^.Kind = ekVar) and (TKind(Obj^.Typ) = tykClass) and
+      DirectArg(Obj, 'x0', False) then
+    begin
+      PutArgs(Args, 0, comp, 1);
+      DirectArg(Obj, 'x0', True);
+      direct := True;
+    end
+    else if kd < nuser then
+    begin
+      EmitExpr(Obj);
+      PshK('x0', VCls(Obj^.Typ, 0));
+      for i := 0 to kd - 1 do
+      begin
+        ArmArgX0(Args[i]);
+        PshK('x0', VCls(Args[i]^.Typ, 0));
+      end;
+      PutArgs(Args, kd, comp, 1);
+      for i := 0 to kd - 1 do
+        Line('  ldr ' + ArgR(1 + i) + ', [sp, #' + IntToStr((kd - 1 - i) * 16) + ']');
+      Line('  ldr x0, [sp, #' + IntToStr(kd * 16) + ']');
+      Imm('x16', (kd + 1) * 16);
+      Line('  add sp, sp, x16');
+      direct := True;
+    end;
+  end;
+  if direct then
+  begin
+    if Slot >= 0 then
+    begin
+      Line('  ldr x16, [x0]');
+      Imm('x17', Slot * 8);
+      Line('  add x16, x16, x17');
+      Line('  ldr x16, [x16]');
+      Line('  blr x16');
+    end
+    else if Slot <= ClsSlotBase then
+    begin
+      Imm('x17', (ClsSlotBase - Slot) * 8);
+      Line('  add x16, x0, x17');
+      Line('  ldr x16, [x16]');
+      Line('  blr x16');
+    end
+    else
+      Line('  bl ' + Name);
+    Exit;
+  end;
   if Slot = -3 then
   begin
     { an interface's call has its code in x0 and Self in x2 already }
@@ -9320,50 +9769,7 @@ begin
   end;
   for i := 0 to nuser - 1 do
   begin
-    if Args[i]^.Kind = ekMethPtr then
-    begin
-      EmitExpr(Args[i]);
-      off := ScratchT(16, Args[i]^.Typ);
-      StFP('x0', off);
-      StFP('x2', off + 8);
-      Imm('x0', off);
-      Line('  add x0, x29, x0');
-    end
-    else if Args[i]^.Kind = ekAddr then
-      EmitExpr(Args[i])
-    else if IsFat(Args[i]^.Typ) then
-    begin
-      if Args[i]^.Kind = ekStr then
-        LeaS(InternStrFat(Args[i]^.Txt), 'x0')
-      else if (Args[i]^.Kind = ekVar) or (Args[i]^.Kind = ekField) or
-        (Args[i]^.Kind = ekIndex) or (Args[i]^.Kind = ekDeref) then
-        EmitAddr(Args[i])
-      else
-      begin
-        EmitExpr(Args[i]);
-        if IsDyn(Args[i]^.Typ) then
-          off := ScratchT(24, Args[i]^.Typ)
-        else
-          off := ScratchT(16, Args[i]^.Typ);
-        StFP('x0', off);
-        StFP('x2', off + 8);
-        if IsDyn(Args[i]^.Typ) then
-          StFP('x3', off + 16);
-        Imm('x0', off);
-        Line('  add x0, x29, x0');
-      end;
-    end
-    else if IsBlob(Args[i]^.Typ) then
-    begin
-      { A record value is already an address (P80). }
-      if (Args[i]^.Kind = ekVar) or (Args[i]^.Kind = ekField) or
-        (Args[i]^.Kind = ekIndex) or (Args[i]^.Kind = ekDeref) then
-        EmitAddr(Args[i])
-      else
-        EmitExpr(Args[i]);
-    end
-    else
-      EmitExpr(Args[i]);
+    ArmArgX0(Args[i]);
     PshK('x0', VCls(Args[i]^.Typ, 0));
   end;
   ntot := nuser + 1;
@@ -9425,19 +9831,30 @@ end;
   object did not exist). }
 procedure TEmitter.EmitMethVal(Target: PExpr; const Args: TExprArray);
 var
-  i, n, nreg: LongInt;
+  i, n, nreg, kd, comp: LongInt;
 begin
   EmitExpr(Target);
   PushK('rax', 0);
   PushK('rdx', 1);
   n := Length(Args);
-  for i := 0 to n - 1 do
+  { the arguments that call nothing straight to their registers (P281) }
+  PlanArgs(Args, 5, kd, comp);
+  for i := 0 to kd - 1 do
   begin
     { a string or a record goes by address, as in every other call
       (1.0.133): its first word went, and the callee read its length
       from what came next }
     EmitArgVal(Args[i]);
     PushK('rax', ACls(Args[i]));
+  end;
+  if kd < n then
+  begin
+    PutArgs(Args, kd, comp, 1);
+    ShiftArgs(kd, kd, 1);
+    Line('  popq %rdi');
+    Line('  popq %rax');
+    Line('  call *%rax');
+    Exit;
   end;
   if n > 5 then
     nreg := 5
@@ -9462,7 +9879,7 @@ end;
 procedure TEmitter.EmitIfaceCall(Obj: PExpr; const Args: TExprArray;
   Slot: LongInt);
 var
-  i, n, nreg: LongInt;
+  i, n, nreg, kd, comp: LongInt;
 begin
   { The code from the interface's table and the object as Self, then a
     call as through a method value (1.0.135): every argument by the rules
@@ -9485,10 +9902,21 @@ begin
   PushK('rcx', 0);
   PushK('rax', 1);
   n := Length(Args);
-  for i := 0 to n - 1 do
+  { the arguments that call nothing straight to their registers (P281) }
+  PlanArgs(Args, 5, kd, comp);
+  for i := 0 to kd - 1 do
   begin
     EmitArgVal(Args[i]);
     PushK('rax', ACls(Args[i]));
+  end;
+  if kd < n then
+  begin
+    PutArgs(Args, kd, comp, 1);
+    ShiftArgs(kd, kd, 1);
+    Line('  popq %rdi');
+    Line('  popq %rax');
+    Line('  call *%rax');
+    Exit;
   end;
   if n > 5 then
     nreg := 5
@@ -18083,25 +18511,7 @@ else if E^.Name = 'rt_high' then
         end
         else
         begin
-          EmitExpr(E^.L);
-          PushK('rax', VCls(E^.L^.Typ, 0));
-          for i := 0 to High(E^.Args) do
-          begin
-            { One argument of a method call, the same rules the plain
-              call path follows, including P80: a record value is
-              already an address. }
-            EmitArgVal(E^.Args[i]);
-            PushK('rax', ACls(E^.Args[i]));
-          end;
-          if Length(E^.Args) > 5 then
-            nreg := 5
-          else
-            nreg := Length(E^.Args);
-          ShiftArgs(Length(E^.Args), nreg, 1);
-          if Length(E^.Args) > nreg then
-            Line('  movq ' + IntToStr((Length(E^.Args) - nreg) * 8) + '(%rsp), %rdi')
-          else
-            Line('  popq %rdi');
+          nreg := MethArgs(E^.L, VCls(E^.L^.Typ, 0), E^.Args);
           if E^.Off >= 0 then
           begin
             Line('  movq (%rdi), %rax');
@@ -18112,8 +18522,8 @@ else if E^.Name = 'rt_high' then
             Line('  call *' + IntToStr((ClsSlotBase - E^.Off) * 8) + '(%rdi)')
           else
             Line('  call ' + E^.Name);
-          if Length(E^.Args) > nreg then
-            Line('  addq $' + IntToStr((Length(E^.Args) - nreg + 1) * 8) + ', %rsp');
+          if nreg > 0 then
+            Line('  addq $' + IntToStr((nreg + 1) * 8) + ', %rsp');
         end;
       end;
     ekMethPtr:
@@ -19968,32 +20378,16 @@ begin
           EmitCallVal(S^.E, S^.Args)
         else if (S^.E2 <> nil) and (S^.E2^.Num = -3) then
           EmitMethVal(S^.E, S^.Args)
-        else
+        else if (S^.E2 <> nil) and (S^.E2^.Num = -2) then
         begin
-        EmitExpr(S^.E);
-        if (S^.E2 <> nil) and (S^.E2^.Num = -2) then
-        begin
+          EmitExpr(S^.E);
           Line('  movq %rdx, %rdi');
           Line('  call *%rax');
         end
         else
         begin
-          PushK('rax', 0);
-          for i := 0 to High(S^.Args) do
-          begin
-            { The same rules everywhere, P80 included. }
-            EmitArgVal(S^.Args[i]);
-            PushK('rax', ACls(S^.Args[i]));
-          end;
-          if Length(S^.Args) > 5 then
-            nreg := 5
-          else
-            nreg := Length(S^.Args);
-          ShiftArgs(Length(S^.Args), nreg, 1);
-          if Length(S^.Args) > nreg then
-            Line('  movq ' + IntToStr((Length(S^.Args) - nreg) * 8) + '(%rsp), %rdi')
-          else
-            Line('  popq %rdi');
+        begin
+          nreg := MethArgs(S^.E, 0, S^.Args);
           if (S^.E2 <> nil) and (S^.E2^.Num >= 0) then
           begin
             Line('  movq (%rdi), %rax');
@@ -20003,8 +20397,8 @@ begin
             Line('  call *' + IntToStr((ClsSlotBase - S^.E2^.Num) * 8) + '(%rdi)')
           else
             Line('  call ' + S^.Name);
-          if Length(S^.Args) > nreg then
-            Line('  addq $' + IntToStr((Length(S^.Args) - nreg + 1) * 8) + ', %rsp');
+          if nreg > 0 then
+            Line('  addq $' + IntToStr((nreg + 1) * 8) + ', %rsp');
         end;
         end;
       end
