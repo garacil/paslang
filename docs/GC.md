@@ -373,6 +373,21 @@ raise after the stack grew twice in a try read an unmapped stack
 first return past it went back to the old stack and every allocation
 after that went to the persistent heap, never collected (`growgc`).
 
+A frame's locals are read by the map only where they hold something
+(P284, 1.1.138). The prologue used to clear every local with a pointer
+word, since each call's map counted it from the routine's start, the
+calls before its first write too. A local, or Result, that every path
+writes before reading it (`WritesFirst`) is now left as it is, and the
+map of each call counts its pointer words only where it is written,
+by the walk `WalkW` makes for `WritesFirst` (`DaWalk`: an assignment
+writes, an if and a case keep what all branches write, a loop what
+came before it, an exit or a break ends its path). Where such a local
+is not written, no path reads it before writing it again, so its old
+value is dead there: its slot holds whatever a frame before left, and
+the collector does not read it. `lazyzero` keeps pointers and strings
+across allocation on every shape of path under `PASLANG_GCVERIFY`,
+`PASLANG_GCSTRESS=1` and `PASLANG_GCPOISON` on both machines.
+
 P95d's parallel mark is built (1.0.66). The roots are jobs (the
 globals, the Ms, the persistent heap, then one per routine) that any
 worker takes by an atomic counter; each worker has a grey stack of its

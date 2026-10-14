@@ -604,7 +604,9 @@ bitmask), and `Write` does not print one. On a processor with AVX2 an
 operation on two sets of 32 bytes is one instruction (TYPES.md, Sets).
 
 Every local variable starts as zero: an `Integer` is 0, a `string` is
-empty, a slice and a map are `nil`, a record has zero fields.
+empty, a slice and a map are `nil`, a record has zero fields. A local,
+or a `Result`, that every path of the routine writes before reading it
+is not cleared at all, since nothing could tell (1.1.138).
 
 ### Operators, bits and compound assignment
 

@@ -232,6 +232,7 @@ type
     ScrK: array of Byte;
     Pinned: LongInt;
     PinTop: LongInt;
+    Da: Int64;           { the P284 candidates written at the call (DaWalk) }
   end;
 
   TEmitter = class
@@ -348,6 +349,14 @@ type
     FMapPro: Boolean;         { a prologue's stack check: a call is a site of kind 1 }
     FMapSpOk: Boolean;        { the next write of the stack pointer is accounted for by the caller }
     FMapSites: array of TMapSite;
+    FDaOn: Boolean;        { the routine has P284 candidates: locals the prologue leaves as they are }
+    FDaResKeep: Boolean;   { Result is written on every path before it is read: not cleared }
+    FDaName: TStrArray;    { the candidates' names, a bit each }
+    FDaOff: array of LongInt;   { each one's lowest frame offset }
+    FDaWords: array of LongInt; { and its words }
+    FDaAlias: string;      { the routine's name, which names Result too }
+    FDaGen: LongInt;       { the walk that set the statements' Da }
+    FCurDa: Int64;         { the candidates written where the code being emitted runs }
     FPushK: array of Byte;    { the words below the frame, the first pushed first }
     FPushHint: array of Byte; { classes of the words of the next push, lowest address first }
     FScrOff: array of LongInt; { the scratch words the statement took, from the frame pointer }
@@ -581,6 +590,10 @@ type
     procedure LoadVar(const N: string);
     procedure StoreVar(const N: string);
     procedure EmitStmt(S: PStmt);
+    procedure EmitStmtNow(S: PStmt);
+    function DaBit(const N: string): Int64;
+    procedure DaWalk(S: PStmt; var M: Int64);
+    procedure DaSetup(const Pr: TProc; Loc0: LongInt);
     procedure EmitForRunes(S: PStmt);
     procedure EmitCmp(const Setcc: string);
     function RealBin(E: PExpr): Boolean;
@@ -1298,6 +1311,7 @@ begin
   end;
   FMapSites[n].Pinned := FPinned;
   FMapSites[n].PinTop := FScratchOff;
+  FMapSites[n].Da := FCurDa;
   AppendLine(gl + ':');
   NoteLine(gl + ':');
 end;
@@ -1447,6 +1461,17 @@ begin
         if (idx >= 0) and (idx < n) then
           cls[idx] := FLocK[i];
       end;
+      { a P284 candidate not written at the call: dead there, its slot
+        not cleared, so not read }
+      if FDaOn then
+        for i := 0 to High(FDaName) do
+          if (FMapSites[s].Da and (Int64(1) shl i)) = 0 then
+            for j := 0 to FDaWords[i] - 1 do
+            begin
+              idx := SizeInt((-(FDaOff[i] + 8 * LongInt(j))) div 8) - 1;
+              if (idx >= 0) and (idx < n) then
+                cls[idx] := 0;
+            end;
       for j := 1 to FMapSites[s].Pinned div 8 do
       begin
         idx := SizeInt((-(FMapSites[s].PinTop - 8 * LongInt(j))) div 8) - 1;
@@ -4103,6 +4128,9 @@ begin
   begin
     sz := Align8(SlotSize(Pr.Locals[i].Typ));
     slot := slot + sz;
+    { a P284 candidate starts as it is (DaSetup) }
+    if FDaOn and (DaBit(Pr.Locals[i].Name) <> 0) then
+      Continue;
     k := TKind(Pr.Locals[i].Typ);
     skip := (sz = 8) and (not IsFat(Pr.Locals[i].Typ)) and
       (not IsBlob(Pr.Locals[i].Typ)) and (k <> tykReal) and (k <> tykSet) and
@@ -7194,6 +7222,8 @@ begin
   AlignLoop;
   Line(a + ':');
   EmitStmt(S^.Body);
+  if (S^.Kind = skRepeat) and FDaOn and (S^.DaGen = FDaGen) then
+    FCurDa := S^.Da2;
   Line(c + ':');
   EmitLoc(S^.Line);
   rest := nil;
@@ -7308,6 +7338,216 @@ begin
     else
       Line('  jz ' + Target);
   end;
+end;
+
+{ P284: the bit of the local N among the routine's candidates (the
+  locals and Result whose pointer words the prologue leaves as they
+  are), 0 when N is not one. Result answers to its own name too. }
+function TEmitter.DaBit(const N: string): Int64;
+var
+  i: SizeInt;
+begin
+  Result := 0;
+  for i := 0 to High(FDaName) do
+    if SameSym(FDaName[i], N) or ((FDaName[i] = 'result') and (FDaAlias <> '') and
+      SameSym(N, FDaAlias)) then
+    begin
+      Result := Int64(1) shl i;
+      Exit;
+    end;
+end;
+
+{ The candidates S starts with written, as WalkW (pasast) counts them
+  (P284): an assignment of a whole variable writes it, an if and a case
+  keep what every branch writes, a loop keeps what was written before
+  it, and an exit, a halt, a break or a continue ends its path, so
+  anything after it on that path counts as written. Any other statement
+  is reached by a candidate only written (WalkW asks so), and its parts
+  start with what it starts with. S^.Da is what S starts with; a
+  repeat's Da2 is what its until is tested with. }
+procedure TEmitter.DaWalk(S: PStmt; var M: Int64);
+var
+  i: SizeInt;
+  m1, m2, all: Int64;
+begin
+  if S = nil then
+    Exit;
+  S^.Da := M;
+  S^.DaGen := FDaGen;
+  case S^.Kind of
+    skAssign:
+      if (S^.Dest <> nil) and (S^.Dest^.Kind = ekVar) then
+        M := M or DaBit(S^.Dest^.Name)
+      else if S^.Dest = nil then
+        M := M or DaBit(S^.Name);
+    skIf:
+      begin
+        m1 := M;
+        DaWalk(S^.ThenSt, m1);
+        m2 := M;
+        DaWalk(S^.ElseSt, m2);
+        M := m1 and m2;
+      end;
+    skWhile:
+      begin
+        m1 := M;
+        DaWalk(S^.Body, m1);
+      end;
+    skRepeat:
+      begin
+        m1 := M;
+        DaWalk(S^.Body, m1);
+        S^.Da2 := m1;
+      end;
+    skFor:
+      begin
+        m1 := M or DaBit(S^.Name);
+        DaWalk(S^.Body, m1);
+      end;
+    skBlock:
+      for i := 0 to High(S^.Stmts) do
+        DaWalk(S^.Stmts[i], M);
+    skCase:
+      begin
+        all := -1;
+        for i := 0 to High(S^.Arms) do
+        begin
+          m1 := M;
+          DaWalk(S^.Arms[i].Body, m1);
+          all := all and m1;
+        end;
+        m2 := M;
+        DaWalk(S^.ElseSt, m2);
+        M := all and m2;
+      end;
+    skExit, skHalt, skBreak, skContinue:
+      M := -1;
+  else
+    begin
+      m1 := M;
+      DaWalk(S^.ThenSt, m1);
+      m1 := M;
+      DaWalk(S^.ElseSt, m1);
+      m1 := M;
+      DaWalk(S^.Body, m1);
+      for i := 0 to High(S^.Stmts) do
+      begin
+        m1 := M;
+        DaWalk(S^.Stmts[i], m1);
+      end;
+      for i := 0 to High(S^.Arms) do
+      begin
+        m1 := M;
+        DaWalk(S^.Arms[i].Body, m1);
+      end;
+      for i := 0 to High(S^.Sels) do
+      begin
+        m1 := M;
+        DaWalk(S^.Sels[i].Body, m1);
+      end;
+    end;
+  end;
+end;
+
+{ The locals and Result that start unwritten (P284): those with a
+  pointer word, whose address nobody takes, that every path writes
+  before it reads them (WritesFirst), at most 64. The prologue leaves
+  them as they are, and a call's map counts their pointer words only
+  where they are written (DaWalk, MapEnd): where WalkW says one is not
+  written, no path reads it before writing it again, so its value
+  there is dead and its slot is not read. Result is left as it is
+  whenever every path writes it before reading it and before the
+  routine returns. A routine with nested routines, closures' boxes or
+  -debug keeps them all zero, as P112 did. }
+procedure TEmitter.DaSetup(const Pr: TProc; Loc0: LongInt);
+var
+  i, j, n: SizeInt;
+  slot, sz: LongInt;
+  bits: TGcBits;
+  children, twice: Boolean;
+  nm: string;
+  m: Int64;
+begin
+  Inc(FDaGen);
+  FDaOn := False;
+  FDaResKeep := False;
+  FDaName := nil;
+  FDaOff := nil;
+  FDaWords := nil;
+  FDaAlias := '';
+  FCurDa := 0;
+  if FDebug or (Pr.Body = nil) or Pr.Boxing or (Length(Pr.Shared) > 0) then
+    Exit;
+  children := False;
+  for i := 0 to High(FProgProcs) do
+    if FProgProcs[i].ParentSym = Pr.Sym then
+      children := True;
+  if children then
+    Exit;
+  slot := Loc0;
+  for i := 0 to High(Pr.Locals) do
+  begin
+    sz := Align8(SlotSize(Pr.Locals[i].Typ));
+    slot := slot + sz;
+    if Length(FDaName) >= 63 then
+      Continue;
+    nm := ToLower(Pr.Locals[i].Name);
+    twice := False;
+    for j := 0 to High(Pr.Locals) do
+      if (j <> i) and SameSym(Pr.Locals[j].Name, Pr.Locals[i].Name) then
+        twice := True;
+    if twice or LocAddrTaken(nm) then
+      Continue;
+    bits := nil;
+    GcMark(Pr.Locals[i].Typ, 0, bits, 0);
+    if not GcAny(bits) then
+      Continue;
+    if not WritesFirst(Pr.Body, Pr.Locals[i].Name, '') then
+      Continue;
+    n := Length(FDaName);
+    SetLength(FDaName, n + 1);
+    SetLength(FDaOff, n + 1);
+    SetLength(FDaWords, n + 1);
+    FDaName[n] := nm;
+    FDaOff[n] := -slot;
+    FDaWords[n] := sz div 8;
+  end;
+  if Pr.IsFunc and FHasRes and WritesFirst(Pr.Body, 'result', Pr.Name) and
+    (not LocAddrTaken('result')) and (not LocAddrTaken(FResName)) then
+  begin
+    FDaResKeep := True;
+    bits := nil;
+    GcMark(Pr.RetTyp, 0, bits, 0);
+    if GcAny(bits) then
+    begin
+      n := Length(FDaName);
+      SetLength(FDaName, n + 1);
+      SetLength(FDaOff, n + 1);
+      SetLength(FDaWords, n + 1);
+      FDaName[n] := 'result';
+      FDaOff[n] := FResOff;
+      FDaWords[n] := Align8(TSize(Pr.RetTyp)) div 8;
+      FDaAlias := Pr.Name;
+    end;
+  end;
+  if Length(FDaName) = 0 then
+    Exit;
+  FDaOn := True;
+  m := 0;
+  DaWalk(Pr.Body, m);
+end;
+
+{ S emitted with what DaWalk found written at its start (P284); a
+  statement of no walk of this routine leaves it as it was. }
+procedure TEmitter.EmitStmt(S: PStmt);
+var
+  old: Int64;
+begin
+  old := FCurDa;
+  if FDaOn and (S <> nil) and (S^.DaGen = FDaGen) then
+    FCurDa := S^.Da;
+  EmitStmtNow(S);
+  FCurDa := old;
 end;
 
 function TEmitter.TreeKey(T: LongInt): LongInt;
@@ -19954,7 +20194,7 @@ begin
   PopLoop;
 end;
 
-procedure TEmitter.EmitStmt(S: PStmt);
+procedure TEmitter.EmitStmtNow(S: PStmt);
 var
   i, j, n, nreg: SizeInt;
   ist: PStmt;
@@ -20486,6 +20726,8 @@ begin
           Line(a + ':');
           EmitStackCheck(a, '16');
           EmitStmt(S^.Body);
+          if FDaOn and (S^.DaGen = FDaGen) then
+            FCurDa := S^.Da2;
           if not FastJcc(S^.E, a) then
           begin
             EmitExpr(S^.E);
@@ -21200,6 +21442,8 @@ begin
         Line(a + ':');
         EmitStackCheck(a, '16');
         EmitStmt(S^.Body);
+        if FDaOn and (S^.DaGen = FDaGen) then
+          FCurDa := S^.Da2;
         if not FastJcc(S^.E, a) then
         begin
           EmitExpr(S^.E);
@@ -25114,23 +25358,27 @@ begin
       if i + Ord(HasSelf(Pr)) < 8 then
         StFP(ArgR(LongInt(i + Ord(HasSelf(Pr)))),
           -8 * LongInt(i + 1 + Ord(Pr.Nest > 0) + Ord(HasSelf(Pr))));
+    DaSetup(Pr, LongInt(loc0));
     if loc1 > loc0 then
       ZeroLocals(Pr, LongInt(loc0));
     { The slot is whole words, so a value of 3 bytes clears one: counted
       down by 8 from its size it never reached 0 and ran on (1.0.56). }
-    if Pr.IsFunc and IsBlob(Pr.RetTyp) then
+    { Result written first on every path starts as it is (P284) }
+    if Pr.IsFunc and (not FDaResKeep) and IsBlob(Pr.RetTyp) then
       ZeroFrame(FResOff, Align8(TSize(Pr.RetTyp)))
-    else if Pr.IsFunc and IsFat(Pr.RetTyp) then
+    else if Pr.IsFunc and (not FDaResKeep) and IsFat(Pr.RetTyp) then
     begin
       StFP('xzr', FResOff);
       StFP('xzr', FResOff + 8);
       if IsDyn(Pr.RetTyp) then
         StFP('xzr', FResOff + 16);
     end
-    else if Pr.IsFunc then
+    else if Pr.IsFunc and not FDaResKeep then
       StFP('xzr', FResOff);
     BoxSetup(Pr);
     EmitStmt(Pr.Body);
+    if FDaOn then
+      FCurDa := DaBit('result');
     Line(FEpi + ':');
     if Pr.IsCtor then
       LdFP('x0', -8 * LongInt(1 + Ord(Pr.Nest > 0)))
@@ -25192,12 +25440,15 @@ begin
       string, a slice or a record the routine never assigns comes back
       empty, not with the length a previous frame left in the second
       word (only the first word was cleared on amd64, P94). }
+    DaSetup(Pr, LongInt(loc0));
     if loc1 > loc0 then
       ZeroLocals(Pr, LongInt(loc0));
-    if Pr.IsFunc then
+    if Pr.IsFunc and not FDaResKeep then
       ZeroFrame(FResOff, Align8(TSize(Pr.RetTyp)));
     BoxSetup(Pr);
     EmitStmt(Pr.Body);
+    if FDaOn then
+      FCurDa := DaBit('result');
     Line(FEpi + ':');
     if Pr.IsCtor then
       Line('  movq -8(%rbp), %rax')
@@ -25272,6 +25523,9 @@ begin
   FTryDep := savedTD;
   FTryRec := savedTR;
   FLocAddr := nil;
+  FDaOn := False;
+  FDaResKeep := False;
+  FCurDa := 0;
 end;
 
 function TEmitter.IsDwarfInt(const S: TSym): Boolean;

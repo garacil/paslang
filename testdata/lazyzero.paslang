@@ -1,0 +1,262 @@
+program lazyzero;
+
+{ A local or a Result that every path writes before reading it starts
+  as it is, not as zero, and a call's stack map counts its pointer words
+  only where it is written (P284). Every routine here writes its
+  pointers and strings first, then keeps them across calls that
+  allocate, on every shape of path: both arms of an if, the arms of a
+  case, a loop's body, a repeat whose until calls, a for, a try, an
+  exit; frames before them leave garbage in the slots. Run under the
+  collector's stress and verify, nothing may be lost or poisoned. }
+
+uses sysutils;
+
+type
+  PNode = ^TNode;
+  TNode = record
+    V: Integer;
+    S: string;
+    Next: PNode;
+  end;
+  TBox = class
+    N: Integer;
+    T: string;
+  end;
+
+var
+  sink: Integer;
+
+{ Leaves pointer-looking garbage in the stack below the caller. }
+procedure Dirty(K: Integer);
+var
+  a, b, c, d, e, f, g, h: Integer;
+  p: PNode;
+begin
+  New(p);
+  p^.V := K;
+  a := Integer(p) + 8;
+  b := a + 16;
+  c := K * 7;
+  d := Integer(p);
+  e := d xor 1;
+  f := -1;
+  g := d + 4096;
+  h := 1;
+  sink := sink + ((a + b + c + d + e + f + g + h) and 1);
+end;
+
+function Churn(N: Integer): Integer;
+var
+  i: Integer;
+  s: string;
+begin
+  Result := 0;
+  for i := 1 to N do
+  begin
+    s := IntToStr(i) + '-' + IntToStr(i * 3);
+    Result := Result + Length(s);
+  end;
+end;
+
+function MakeNode(V: Integer): PNode;
+begin
+  New(Result);
+  Result^.V := V;
+  Result^.S := 'node' + IntToStr(V);
+  Result^.Next := nil;
+end;
+
+{ Written in both arms of an if, then kept across allocation. }
+function BothArms(K: Integer): string;
+var
+  p: PNode;
+  s: string;
+begin
+  sink := sink + Churn(50);
+  if K mod 2 = 0 then
+  begin
+    p := MakeNode(K);
+    s := 'even';
+  end
+  else
+  begin
+    p := MakeNode(K + 1);
+    s := 'odd';
+  end;
+  sink := sink + Churn(200);
+  Result := s + ':' + p^.S + ':' + IntToStr(p^.V);
+end;
+
+{ Written in every arm of a case and its else. }
+function CaseArms(K: Integer): string;
+var
+  b: TBox;
+begin
+  case K mod 3 of
+    0: b := TBox.Create;
+    1:
+      begin
+        sink := sink + Churn(30);
+        b := TBox.Create;
+      end;
+  else
+    b := TBox.Create;
+  end;
+  b.N := K;
+  b.T := 'box' + IntToStr(K);
+  sink := sink + Churn(200);
+  Result := b.T + '/' + IntToStr(b.N);
+  b.Free;
+end;
+
+{ A loop's body writes first and reads after allocation, pass by pass. }
+function LoopBody(N: Integer): Integer;
+var
+  i: Integer;
+  p: PNode;
+  s: string;
+begin
+  Result := 0;
+  i := 0;
+  while i < N do
+  begin
+    sink := sink + Churn(5);
+    p := MakeNode(i);
+    s := p^.S + '!';
+    sink := sink + Churn(20);
+    Result := Result + Length(s) + p^.V;
+    i := i + 1;
+  end;
+end;
+
+function Valid(p: PNode): Boolean;
+begin
+  sink := sink + Churn(40);
+  Result := (p <> nil) and (p^.S = 'node' + IntToStr(p^.V));
+end;
+
+{ A repeat's until calls with the pointer its body wrote. }
+function RepeatUntil(N: Integer): Integer;
+var
+  p: PNode;
+  k: Integer;
+begin
+  k := 0;
+  repeat
+    p := MakeNode(k);
+    k := k + 1;
+  until (not Valid(p)) or (k >= N);
+  Result := k + p^.V;
+end;
+
+{ A for's body. }
+function ForBody(N: Integer): string;
+var
+  i: Integer;
+  t: string;
+begin
+  Result := '';
+  for i := 1 to N do
+  begin
+    t := IntToStr(i);
+    sink := sink + Churn(10);
+    Result := Result + t;
+  end;
+end;
+
+{ Written before a try, read in its handler after allocation. }
+function TryKeep(K: Integer): string;
+var
+  p: PNode;
+begin
+  p := MakeNode(K);
+  try
+    sink := sink + Churn(100);
+    if K > 2 then
+      raise Exception.Create('big');
+    Result := 'small ' + p^.S;
+  except
+    on E: Exception do
+    begin
+      sink := sink + Churn(100);
+      Result := E.Message + ' ' + p^.S;
+    end;
+  end;
+end;
+
+{ Result is written first, then the routine leaves early or late. }
+function EarlyExit(K: Integer): string;
+var
+  s: string;
+begin
+  s := 'k' + IntToStr(K);
+  if K < 3 then
+  begin
+    Result := s + ' early';
+    sink := sink + Churn(100);
+    Exit;
+  end;
+  sink := sink + Churn(100);
+  Result := s + ' late';
+end;
+
+{ A chain built in a loop and walked after allocation. }
+function Chain(N: Integer): Integer;
+var
+  head, p: PNode;
+  i: Integer;
+begin
+  head := nil;
+  for i := 1 to N do
+  begin
+    p := MakeNode(i);
+    p^.Next := head;
+    head := p;
+  end;
+  sink := sink + Churn(300);
+  Result := 0;
+  p := head;
+  while p <> nil do
+  begin
+    if p^.S <> 'node' + IntToStr(p^.V) then
+      Result := Result - 1000000;
+    Result := Result + p^.V;
+    p := p^.Next;
+  end;
+end;
+
+var
+  k, total: Integer;
+  line: string;
+begin
+  total := 0;
+  line := '';
+  for k := 0 to 5 do
+  begin
+    Dirty(k);
+    line := line + BothArms(k) + ' ';
+    Dirty(k);
+    line := line + CaseArms(k) + ' ';
+    Dirty(k);
+    total := total + LoopBody(20 + k);
+    Dirty(k);
+    total := total + RepeatUntil(10 + k);
+    Dirty(k);
+    line := line + ForBody(k + 3) + ' ';
+    Dirty(k);
+    line := line + TryKeep(k) + ' ';
+    Dirty(k);
+    line := line + EarlyExit(k) + ' ';
+    Dirty(k);
+    total := total + Chain(100 + k);
+    WriteLn(line);
+    line := '';
+  end;
+  WriteLn(total, ' ', sink >= 0);
+end.
+
+{ This file is part of paslang's tests.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+  paslang is free software under the GNU General Public License,
+  version 3 or (at your option) any later version; see the file
+  COPYING. It comes with ABSOLUTELY NO WARRANTY. }
