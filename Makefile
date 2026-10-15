@@ -305,6 +305,9 @@ GOLDEN_A64 += asyncspin asyncgc
 # P294: arithmetic in one instruction where it took several.
 GOLDEN += leaform
 GOLDEN_A64 += leaform
+# P299: a check's failure out of line, the checked path without a branch.
+GOLDEN += coldfail
+GOLDEN_A64 += coldfail
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -2270,6 +2273,9 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	test $$(grep -cE 'movq -(8|16)\(%r(si|di|[0-9]+)\), ' $(BUILDDIR)/leaform-back.s) -eq 2 || { echo "leaform.s: Back does not load at p - 8 and p - 16"; exit 1; }; \
 	if grep -qE 'subq \$$(8|16), ' $(BUILDDIR)/leaform-back.s; then echo "leaform.s: Back subtracts before it loads"; exit 1; fi; \
 	echo ok leaform-asm; \
+	: every failure of a check is after the ret of its routine, so the checked path takes no branch, P299; \
+	python3 -I scripts/check_cold.py $(BUILDDIR)/coldfail.s 20; \
+	echo ok coldfail-asm; \
 	: a function of one expression goes in as its expression, P266: the output of every routine a call, and Branchy one compare and one jump with no call of Less; \
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/exprinline0 testdata/exprinline.paslang; \
 	$(BUILDDIR)/exprinline0 > $(BUILDDIR)/exprinline0.got; \
@@ -3331,6 +3337,8 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	grep -qE 'sub x(9|1[0-5]), x(9|1[0-5]), #264$$' $(BUILDDIR)/leaform-far-arm.s || { echo "leaform-arm.s: Far folds p - 264, past LDUR"; exit 1; }; \
 	awk '/^p_idx:/,/cfi_endproc/' $(BUILDDIR)/leaform-arm.s | grep -qE 'ldr x[0-9]+, \[x[0-9]+, x[0-9]+, lsl #3\]' || { echo "leaform-arm.s: Idx does not index the load"; exit 1; }; \
 	echo ok leaform-arm-asm; \
+	python3 -I scripts/check_cold.py $(BUILDDIR)/coldfail-arm.s 20; \
+	echo ok coldfail-arm-asm; \
 	$(OUTDIR)/paslangc -target arm64 -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/exprinline0-arm testdata/exprinline.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/exprinline0-arm > $(BUILDDIR)/exprinline0-arm.got; \
 	diff -u testdata/exprinline.out $(BUILDDIR)/exprinline0-arm.got; \
