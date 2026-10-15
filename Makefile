@@ -270,6 +270,10 @@ GOLDEN_A64 += whilerun
 # is, and a call's stack map counts it only where it is written.
 GOLDEN += lazyzero
 GOLDEN_A64 += lazyzero
+# P285: a map of up to eight keys is one group, as Go's small map, and
+# takes less memory than Go's at every count of keys.
+GOLDEN += mapsmall
+GOLDEN_A64 += mapsmall
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -2169,6 +2173,10 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  if awk "/^p_$$f:/,/^\.set/" $(BUILDDIR)/lazyzero.s | grep -q 'movq \$$0, -'; then echo "lazyzero.s: $$f clears a slot"; exit 1; fi; \
 	done; \
 	echo ok lazyzero-gc; \
+	: a small map under the stress and verify of the collector, P285, its counts of memory left out; \
+	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 $(BUILDDIR)/mapsmall nomem > $(BUILDDIR)/mapsmall-gc.got; \
+	grep -v ' keys: ' testdata/mapsmall.out | diff -u - $(BUILDDIR)/mapsmall-gc.got; \
+	echo ok mapsmall-gc; \
 	: a function of one expression goes in as its expression, P266: the output of every routine a call, and Branchy one compare and one jump with no call of Less; \
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/exprinline0 testdata/exprinline.paslang; \
 	$(BUILDDIR)/exprinline0 > $(BUILDDIR)/exprinline0.got; \
@@ -3161,6 +3169,9 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	  if awk "/^p_$$f:/,/^\.Lfrp_$$f:/" $(BUILDDIR)/lazyzero-arm.s | grep -q 'xzr, \[x29'; then echo "lazyzero-arm.s: $$f clears a slot"; exit 1; fi; \
 	done; \
 	echo ok lazyzero-arm-gc; \
+	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 timeout 300 $(QEMU_A64) $(BUILDDIR)/mapsmall-arm nomem > $(BUILDDIR)/mapsmall-arm-gc.got; \
+	grep -v ' keys: ' testdata/mapsmall.out | diff -u - $(BUILDDIR)/mapsmall-arm-gc.got; \
+	echo ok mapsmall-arm-gc; \
 	$(OUTDIR)/paslangc -target arm64 -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/exprinline0-arm testdata/exprinline.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/exprinline0-arm > $(BUILDDIR)/exprinline0-arm.got; \
 	diff -u testdata/exprinline.out $(BUILDDIR)/exprinline0-arm.got; \

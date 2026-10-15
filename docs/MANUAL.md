@@ -5158,7 +5158,7 @@ bo is here
 ```
 
 `map[K] of V` is one pointer, `nil` until `New(m)` or `New(m, hint)`
-creates the table; the hint is the number of entries to make room for.
+creates the map; the hint is the number of entries to make room for.
 The key is an ordinal, a string, a pointer or a class, and the value is
 any type, records included. A read of a missing key, or of a `nil` map,
 gives the zero value; a write to a `nil` map stops the program with
@@ -5201,7 +5201,12 @@ in another unit too; a `nil` goes into any map.
 
 The map is the Swiss table of Go's runtime: groups of eight slots with
 a control byte per slot, quadratic probing and a load of 7/8, in a
-directory of tables of at most 1024 slots each (1.0.59). A table doubles
+directory of tables of at most 1024 slots each (1.0.59). A map of up to
+eight keys is one group and nothing else, as Go's small map (1.1.139):
+its group comes with its first key, its eight control bytes are read at
+once with no probe, and its ninth key moves it into a table of sixteen
+slots; a `map[string] of Integer` takes 32 bytes empty and 240 with one
+to eight keys, where Go takes 48 and 256. A table doubles
 until it has 1024 slots and then splits in two, so a growing map never
 holds an old and a new copy of all of itself at once. Keys hash with
 XXH3 (1.0.64): a string's bytes as `XxHash3` hashes them, an eight-byte

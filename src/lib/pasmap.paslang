@@ -28,7 +28,12 @@
   control word: one byte per slot, 128 for empty, 254 for deleted, else
   the low seven bits of the hash. A lookup probes the groups
   quadratically and stops at the first group with an empty slot, so a
-  delete leaves a tombstone only when its group is full. The compiler
+  delete leaves a tombstone only when its group is full. A map of up to
+  eight keys is one group and nothing else, as Go's small map: no
+  directory, no table, the group read whole with no probe, so it holds
+  eight keys and never a tombstone, and it comes with the first key
+  (P285: an empty map is its 32-byte header, one of up to eight keys 240
+  bytes, Go's 48 and 256). The compiler
   calls these routines; user code writes m[k], m[k] := v, k in m,
   Delete, TryGet, Clear, Length and for k, v in m. }
 unit pasmap;
@@ -69,7 +74,29 @@ const
   { Go's maxTableCapacity. }
   MaxTableCap = 1024;
   { A table is one block: this header (TTable), then its groups. }
-  TableHdr = 64;
+  TableHdr = 16;
+  { A directory is one block: Gen and DirMask, then its entries. }
+  DirHdr = 16;
+  { The keys of a small map, its one group's slots (Go's
+    abi.MapGroupSlots), and the slots of the table it grows into (Go's
+    growToTable, 2 * abi.MapGroupSlots), the fewest any table has. }
+  SmallMax = 8;
+  TableMin = 16;
+{$if PASLANG_FULLVERSION >= 1001139}
+  SmallOn = True;
+  { Dir is the directory block's start: Gen at 0, DirMask at 8, the
+    entries from DirHdr }
+  DirEnt = DirHdr;
+  DirGenOff = 0;
+  DirMaskOff = 8;
+{$else}
+  SmallOn = False;
+  { for an older host's rt_mapgetstr (TMap below) Dir is the entries,
+    Gen and DirMask the two words before them }
+  DirEnt = 0;
+  DirGenOff = -16;
+  DirMaskOff = -8;
+{$endif}
 
 type
   PInt = ^Integer;
@@ -88,49 +115,72 @@ type
   PMapDesc = ^TMapDesc;
 
   { A table's header, at the start of the block that holds its groups
-    (Groups points TableHdr bytes further), and its local depth: the
-    lowest LocalDepth bits of the upper half of the hash (h shr 32) are
-    the same for every key in it. }
+    (they start TableHdr bytes further; Mask + 1 of them, 8 slots each),
+    and its local depth: the lowest LocalDepth bits of the upper half of
+    the hash (h shr 32) are the same for every key in it. Its slots are
+    the map's SlotSize (P285: the header was 64 bytes with the groups'
+    address, the capacity and both sizes, which are all known). }
   TTable = record
-    Groups: Pointer;
-    Mask: Integer;
-    Capacity: Integer;
-    GrowthLeft: Integer;
-    Used: Integer;
-    SlotSize: Integer;
-    GroupSize: Integer;
-    LocalDepth: Integer;
+    Used: Int32;
+    GrowthLeft: Int32;
+    Mask: Int32;
+    LocalDepth: Int32;
   end;
   PTable = ^TTable;
 
-  { Used comes first: Length(m) reads that word. Dir holds 2^Depth
-    entries, each the groups of a table (its header is TableHdr bytes
-    before), the one for a hash at (h shr 32) and DirMask (DirMask =
-    2^Depth - 1, so the only one when Depth is 0). A lookup reads the
-    entry and the group and never the table's header, and finds the
-    entry with a fixed shift and an and, not with a shift by Depth,
-    which cost a third of b5map. A table of local depth d with those d
-    bits p is at entries p, p + 2^d, p + 2*2^d and so on. Gen counts the
-    tables replaced (Grow). SlotSize, GroupSize and TabMask are every
-    table's: when Depth is 0 there is one table, and above it every
-    table has MaxTableCap slots. The fast paths keep M in a register and
-    read these words through it, as they read a table before. }
-  { rt_mapgetstr (pasemit, 1.0.69) reads these words by their offsets:
+  { Used comes first: Length(m) reads that word. A small map (TabMask
+    0) has its one group at Dir, EmptyGroup before its first key. Else Dir
+    holds 2^Depth entries, each the groups of a table (its header is
+    TableHdr bytes before), the one for a hash at (h shr 32) and DirMask
+    (2^Depth - 1, so the only one when Depth is 0); Dir is the start of
+    the directory's block, which keeps Gen, the tables replaced (Grow),
+    and DirMask in its first two words, then the entries. A lookup reads the entry and the group
+    and never the table's header, and finds the entry with a fixed
+    shift and an and, not with a shift by Depth, which cost a third of
+    b5map. A table of local depth d with those d bits p is at entries p,
+    p + 2^d, p + 2*2^d and so on. TabMask is every table's groups less
+    one: when Depth is 0 there is one table, and above it every table
+    has MaxTableCap slots; a table has TableMin slots or more, so 0 is
+    the small map's. Seed is XXH3's seed for string keys, and for the
+    others the bitflip XXH3 makes of it for eight bytes (Reseed). The
+    map is 32 bytes, Go's 48 (P285: it was 88, with the groups' size,
+    the masks, Gen and the bitflip as words of their own). }
+  { rt_mapgetstr (pasemit, 1.0.69) reads these by their offsets: Used
+    0, Seed 8, Dir 16, Writing 24 (a byte), TabMask 26 (two bytes),
+    SlotSize 28 (four bytes), and in the directory DirMask at 8 and the
+    entries from 16.
+    Move one and change it there. }
+{$if PASLANG_FULLVERSION >= 1001139}
+  TMap = record
+    Used: Integer;
+    Seed: Integer;
+    Dir: Pointer;
+    Writing: Byte;
+    Depth: Byte;
+    TabMask: Word;
+    SlotSize: Int32;
+  end;
+{$else}
+  { An older paslangc, the host that builds the stage compiler (Regla
+    15), writes its own rt_mapgetstr, which reads the map 1.1.138 had:
     Used 0, Seed 8, Dir 16, Writing 24, SlotSize 48, GroupSize 56,
-    DirMask 64, TabMask 72. Move one and change it there. }
+    DirMask 64 and TabMask 72, whole words. The stage compiler's maps
+    keep those words too, and none is small (SmallOn), since that
+    rt_mapgetstr would probe a full group for ever; the stage compiler
+    writes the new rt_mapgetstr and compiles this unit again. }
   TMap = record
     Used: Integer;
     Seed: Integer;
     Dir: Pointer;
     Writing: Integer;
     Depth: Integer;
-    Gen: Integer;
+    Spare: Integer;
     SlotSize: Integer;
     GroupSize: Integer;
     DirMask: Integer;
     TabMask: Integer;
-    Flip: Integer;      { XXH3's bitflip for Seed, the 8-byte keys' (Reseed) }
   end;
+{$endif}
   PMap = ^TMap;
 
   { The 32 bytes a for loop keeps on its own stack: a copy of the
@@ -144,6 +194,14 @@ type
     Live: Integer;
   end;
   PIter = ^TIter;
+
+const
+  { The group of a small map with no key yet: every slot empty, shared
+    and never written. A lookup leaves at the map's count before it reads
+    a group; an insertion that would fill a slot of it makes the map its
+    own group first (SmallGroup), so the probe has a group to read and
+    no check of its own on the way in. }
+  EmptyGroup: Integer = WordEmpty;
 
 var
   ProcKey: Integer;    { the process's secret key: 0 until the first map }
@@ -194,19 +252,24 @@ begin
   Result := x xor (x shr 32);
 end;
 
-{ A new seed for M, and the bitflip XXH3 derives from it for 4 to 8
-  bytes: (secret word 1 xor word 2) - (seed xor its low half's bytes
-  reversed, shifted up 32). }
-procedure Reseed(M: PMap);
+{ A new seed for M: for string keys the seed itself, for the others
+  the bitflip XXH3 derives from it for 4 to 8 bytes, (secret word 1 xor
+  word 2) - (seed xor its low half's bytes reversed, shifted up 32),
+  which is all their hash reads. }
+procedure Reseed(M: PMap; D: PMapDesc);
 var
   s, w: Integer;
 begin
   s := NextSeed;
-  M^.Seed := s;
-  w := s and 4294967295;
-  w := ((w and 255) shl 24) or (((w shr 8) and 255) shl 16) or
-    (((w shr 16) and 255) shl 8) or ((w shr 24) and 255);
-  M^.Flip := X3Flip - (s xor (w shl 32));
+  if D^.KeyKind = 1 then
+    M^.Seed := s
+  else
+  begin
+    w := s and 4294967295;
+    w := ((w and 255) shl 24) or (((w shr 8) and 255) shl 16) or
+      (((w shr 16) and 255) shl 8) or ((w shr 24) and 255);
+    M^.Seed := X3Flip - (s xor (w shl 32));
+  end;
 end;
 
 { The hash of a key: XXH3 with the map's seed (1.0.64). A string's bytes
@@ -222,8 +285,8 @@ begin
   else
   begin
     h := PInt(Key)^;
-    h := ((h shl 32) or (h shr 32)) xor M^.Flip;
-    h := h xor ((h shl 49) or (h shr 15)) xor ((h shl 24) or (h shr 40));
+    h := (h rol 32) xor M^.Seed;
+    h := h xor (h rol 49) xor (h rol 24);
     h := h * X3Mul;
     h := h xor ((h shr 35) + 8);
     h := h * X3Mul;
@@ -266,14 +329,34 @@ begin
   Result := (((Bits and (-Bits)) shr 7) * SlotIndex) shr 56;
 end;
 
-function GroupAt(T: PTable; G: Integer): Pointer;
+{ Group G of T, whose groups are GS bytes. }
+function GroupAt(T: PTable; G, GS: Integer): Pointer;
 begin
-  Result := Pointer(Integer(T^.Groups) + G * T^.GroupSize);
+  Result := Pointer(Integer(T) + TableHdr + G * GS);
 end;
 
-function SlotAt(T: PTable; G: Pointer; I: Integer): Pointer;
+{ Slot I of group G, whose slots are SS bytes. }
+function SlotAt(G: Pointer; I, SS: Integer): Pointer;
 begin
-  Result := Pointer(Integer(G) + 8 + I * T^.SlotSize);
+  Result := Pointer(Integer(G) + 8 + I * SS);
+end;
+
+function Capacity(T: PTable): Integer;
+begin
+  Result := (T^.Mask + 1) * 8;
+end;
+
+{ The directory's Gen and DirMask, the two words before its entries
+  (DirHdr): Dir is the block's start, so both are read at a positive
+  offset, one load each. }
+function GenAt(M: PMap): PInt;
+begin
+  Result := PInt(Integer(M^.Dir) + DirGenOff);
+end;
+
+function DirMaskOf(M: PMap): Integer;
+begin
+  Result := PInt(Integer(M^.Dir) + DirMaskOff)^;
 end;
 
 function MaxGrowth(Slots: Integer): Integer;
@@ -284,26 +367,27 @@ begin
     Result := (Slots * 7) div 8;
 end;
 
+{ The bytes of a slot: the key, then the value in whole words. }
+function SlotBytes(D: PMapDesc): Integer;
+begin
+  Result := D^.KeySize + ((D^.ValSize + 7) and (-8));
+end;
+
 function NewTable(Slots: Integer; D: PMapDesc): PTable;
 var
   t: PTable;
-  n, i, gs, ss, a: Integer;
+  n, i, gs, a: Integer;
   p: Pointer;
 begin
-  ss := D^.KeySize + ((D^.ValSize + 7) and (-8));
-  gs := 8 + 8 * ss;
+  gs := (SlotBytes(D) + 1) shl 3;
   n := Slots div 8;
   GetMem(p, TableHdr + n * gs, D^.SlotPtr);
   t := PTable(p);
-  t^.SlotSize := ss;
-  t^.GroupSize := gs;
-  t^.Mask := n - 1;
-  t^.Capacity := Slots;
-  t^.Used := 0;
-  t^.GrowthLeft := MaxGrowth(Slots);
-  t^.LocalDepth := 0;
+  t^.Mask := Int32(n - 1);
+  t^.Used := Int32(0);
+  t^.GrowthLeft := Int32(MaxGrowth(Slots));
+  t^.LocalDepth := Int32(0);
   a := Integer(p) + TableHdr;
-  t^.Groups := Pointer(a);
   for i := 0 to n - 1 do
     PInt(a + i * gs)^ := WordEmpty;
   Result := t;
@@ -314,9 +398,9 @@ end;
   the hash is computed without a call, and the probe loops call nothing,
   so they run in registers (P96). Addresses are Integers there. }
 
-{ Insert a slot copied from another table; the key is known to be new
-  and the table has room. }
-procedure PutFresh(T: PTable; Src: Pointer; H: Integer);
+{ Insert a slot of SS bytes copied from elsewhere; the key is known to
+  be new and the table has room. }
+procedure PutFresh(T: PTable; Src: Pointer; H, SS: Integer);
 var
   probe, step, bits, i: Integer;
   g, k: Pointer;
@@ -326,13 +410,13 @@ begin
   step := 0;
   while True do
   begin
-    g := GroupAt(T, probe);
+    g := GroupAt(T, probe, (SS + 1) shl 3);
     bits := MatchFree(PInt(g)^);
     if bits <> 0 then
     begin
       i := FirstSlot(bits);
-      k := SlotAt(T, g, i);
-      Move(Src^, k^, T^.SlotSize);
+      k := SlotAt(g, i, SS);
+      Move(Src^, k^, SS);
       pb := PChar(Integer(g) + i);
       pb^ := Char(H and 127);
       Exit;
@@ -345,26 +429,30 @@ end;
 { The table for hash H. }
 function TableFor(M: PMap; H: Integer): PTable;
 begin
-  Result := PTable(PInt(Integer(M^.Dir) + ((H shr 32) and M^.DirMask) * 8)^ - TableHdr);
+  Result := PTable(PInt(Integer(M^.Dir) + DirEnt + ((H shr 32) and DirMaskOf(M)) * 8)^ - TableHdr);
 end;
 
 { Directory entry I names table T, by its groups. }
 procedure SetEntry(M: PMap; I: Integer; T: PTable);
 begin
-  PInt(Integer(M^.Dir) + I * 8)^ := Integer(T) + TableHdr;
-  M^.TabMask := T^.Mask;
+  PInt(Integer(M^.Dir) + DirEnt + I * 8)^ := Integer(T) + TableHdr;
+  M^.TabMask := Word(T^.Mask);
 end;
 
-{ A directory of 2^Depth entries, every one T. }
-procedure NewDir(M: PMap; Depth: Integer; T: PTable);
+{ A directory of 2^Depth entries, every one T, its Gen at Gen. }
+procedure NewDir(M: PMap; Depth: Integer; T: PTable; Gen: Integer);
 var
   p: Pointer;
   i: Integer;
 begin
-  GetMem(p, (1 shl Depth) * 8);
-  M^.Dir := p;
-  M^.Depth := Depth;
+  GetMem(p, DirHdr + (1 shl Depth) * 8);
+  PInt(p)^ := Gen;
+  PInt(Integer(p) + 8)^ := (1 shl Depth) - 1;
+  M^.Dir := Pointer(Integer(p) + DirHdr - DirEnt);
+  M^.Depth := Byte(Depth);
+{$if PASLANG_FULLVERSION < 1001139}
   M^.DirMask := (1 shl Depth) - 1;
+{$endif}
   if T <> nil then
     for i := 0 to (1 shl Depth) - 1 do
       SetEntry(M, i, T);
@@ -379,12 +467,16 @@ var
   n: Integer;
 begin
   n := 1 shl M^.Depth;
-  GetMem(p, n * 16);
-  Move(M^.Dir^, p^, n * 8);
-  Move(M^.Dir^, Pointer(Integer(p) + n * 8)^, n * 8);
-  M^.Dir := p;
-  M^.Depth := M^.Depth + 1;
+  GetMem(p, DirHdr + n * 16);
+  PInt(p)^ := GenAt(M)^;
+  PInt(Integer(p) + 8)^ := n * 2 - 1;
+  Move(Pointer(Integer(M^.Dir) + DirEnt)^, Pointer(Integer(p) + DirHdr)^, n * 8);
+  Move(Pointer(Integer(M^.Dir) + DirEnt)^, Pointer(Integer(p) + DirHdr + n * 8)^, n * 8);
+  M^.Dir := Pointer(Integer(p) + DirHdr - DirEnt);
+  M^.Depth := Byte(M^.Depth + 1);
+{$if PASLANG_FULLVERSION < 1001139}
   M^.DirMask := n * 2 - 1;
+{$endif}
 end;
 
 { Every live entry of Old into A, or, when B is not nil, into A or B by
@@ -398,10 +490,10 @@ var
   flip, ssz, gsz, src, og, bits, ok, h, probe, step, ng, fb, slot, nk, j, diff, mask, na, gb, seed: Integer;
   t: PTable;
 begin
-  flip := M^.Flip;
-  ssz := Old^.SlotSize;
-  gsz := Old^.GroupSize;
-  src := Integer(Old^.Groups);
+  flip := M^.Seed;
+  ssz := M^.SlotSize;
+  gsz := (ssz + 1) shl 3;
+  src := Integer(Old) + TableHdr;
   if D^.KeyKind = 0 then
   begin
     { A and B have the same size; the half is chosen without a branch,
@@ -420,8 +512,8 @@ begin
       begin
         ok := og + 8 + ((((bits and (-bits)) shr 7) * SlotIndex) shr 56) * ssz;
         h := PInt(ok)^;
-        h := ((h shl 32) or (h shr 32)) xor flip;
-        h := h xor ((h shl 49) or (h shr 15)) xor ((h shl 24) or (h shr 40));
+        h := (h rol 32) xor flip;
+        h := h xor (h rol 49) xor (h rol 24);
         h := h * X3Mul;
         h := h xor ((h shr 35) + 8);
         h := h * X3Mul;
@@ -453,9 +545,9 @@ begin
         bits := bits and (bits - 1);
       end;
     end;
-    A^.Used := A^.Used + na;
+    A^.Used := Int32(A^.Used + na);
     if B <> nil then
-      B^.Used := B^.Used + Old^.Used - na;
+      B^.Used := Int32(B^.Used + Old^.Used - na);
   end
   else if D^.KeyKind = 1 then
   begin
@@ -504,31 +596,31 @@ begin
         bits := bits and (bits - 1);
       end;
     end;
-    A^.Used := A^.Used + na;
+    A^.Used := Int32(A^.Used + na);
     if B <> nil then
-      B^.Used := B^.Used + Old^.Used - na;
+      B^.Used := Int32(B^.Used + Old^.Used - na);
   end
   else
     for gi := 0 to Old^.Mask do
     begin
-      g := GroupAt(Old, gi);
+      g := GroupAt(Old, gi, gsz);
       ctrl := PInt(g)^;
       for i := 0 to 7 do
         if ((ctrl shr (8 * i)) and 128) = 0 then
         begin
-          k := SlotAt(Old, g, i);
+          k := SlotAt(g, i, ssz);
           h := HashOf(M, k, D);
           t := A;
           if B <> nil then
             if ((h shr Bit) and 1) = 1 then
               t := B;
-          PutFresh(t, k, h);
-          t^.Used := t^.Used + 1;
+          PutFresh(t, k, h, ssz);
+          t^.Used := Int32(t^.Used + 1);
         end;
     end;
-  A^.GrowthLeft := A^.GrowthLeft - A^.Used;
+  A^.GrowthLeft := Int32(A^.GrowthLeft - A^.Used);
   if B <> nil then
-    B^.GrowthLeft := B^.GrowthLeft - B^.Used;
+    B^.GrowthLeft := Int32(B^.GrowthLeft - B^.Used);
 end;
 
 { Table T, found for hash H, is full: a fresh table of the same size
@@ -542,15 +634,15 @@ var
   nt, left, right: PTable;
   slots, n, start, i, ld: Integer;
 begin
-  M^.Gen := M^.Gen + 1;
-  if (T^.Used * 2 < T^.Capacity) or (T^.Capacity < MaxTableCap) then
+  GenAt(M)^ := GenAt(M)^ + 1;
+  if (T^.Used * 2 < Capacity(T)) or (Capacity(T) < MaxTableCap) then
   begin
-    if T^.Used * 2 < T^.Capacity then
-      slots := T^.Capacity
+    if T^.Used * 2 < Capacity(T) then
+      slots := Capacity(T)
     else
-      slots := T^.Capacity * 2;
+      slots := Capacity(T) * 2;
     nt := NewTable(slots, D);
-    nt^.LocalDepth := T^.LocalDepth;
+    nt^.LocalDepth := Int32(T^.LocalDepth);
     MoveEntries(M, T, nt, nil, 0, D);
     left := nt;
     right := nt;
@@ -561,8 +653,8 @@ begin
       DoubleDir(M);
     left := NewTable(MaxTableCap, D);
     right := NewTable(MaxTableCap, D);
-    left^.LocalDepth := T^.LocalDepth + 1;
-    right^.LocalDepth := T^.LocalDepth + 1;
+    left^.LocalDepth := Int32(T^.LocalDepth + 1);
+    right^.LocalDepth := Int32(T^.LocalDepth + 1);
     MoveEntries(M, T, left, right, 32 + T^.LocalDepth, D);
   end;
   { T's entries: start + i * 2^LocalDepth for its LocalDepth bits start;
@@ -577,8 +669,8 @@ begin
       SetEntry(M, start + (i shl ld), right);
 end;
 
-{ The key slot, or nil. }
-function FindSlot(T: PTable; Key: Pointer; D: PMapDesc; H: Integer): Pointer;
+{ The key slot in T, whose slots are SS bytes, or nil. }
+function FindSlot(T: PTable; Key: Pointer; D: PMapDesc; H, SS: Integer): Pointer;
 var
   h2, probe, step, bits, i, ctrl: Integer;
   g, k: Pointer;
@@ -589,13 +681,13 @@ begin
   step := 0;
   while True do
   begin
-    g := GroupAt(T, probe);
+    g := GroupAt(T, probe, (SS + 1) shl 3);
     ctrl := PInt(g)^;
     bits := MatchH2(ctrl, h2);
     while bits <> 0 do
     begin
       i := FirstSlot(bits);
-      k := SlotAt(T, g, i);
+      k := SlotAt(g, i, SS);
       if KeyEq(k, Key, D) then
       begin
         Result := k;
@@ -610,8 +702,101 @@ begin
   end;
 end;
 
-{ A map for about Hint entries: one table while they fit in one, else
-  2^k tables of MaxTableCap, each half full. }
+{ A small map's slot of Key, or nil: every slot of its one group whose
+  control byte is H2 is compared, and there is no probe (Go's
+  getWithKeySmall): eight keys fit and none was ever deleted to a
+  tombstone. }
+function SmallFind(M: PMap; Key: Pointer; D: PMapDesc; H: Integer): Pointer;
+var
+  g, bits: Integer;
+  k: Pointer;
+begin
+  Result := nil;
+  g := Integer(M^.Dir);
+  if g = 0 then
+    Exit;
+  bits := MatchH2(PInt(g)^, H and 127);
+  while bits <> 0 do
+  begin
+    k := SlotAt(Pointer(g), FirstSlot(bits), M^.SlotSize);
+    if KeyEq(k, Key, D) then
+    begin
+      Result := k;
+      Exit;
+    end;
+    bits := bits and (bits - 1);
+  end;
+end;
+
+{ The key slot of Key wherever the map keeps it, or nil. }
+function FindAny(M: PMap; Key: Pointer; D: PMapDesc): Pointer;
+var
+  h: Integer;
+begin
+  h := HashOf(M, Key, D);
+  if M^.TabMask = 0 then
+    Result := SmallFind(M, Key, D, h)
+  else
+    Result := FindSlot(TableFor(M, h), Key, D, h, M^.SlotSize);
+end;
+
+{ A small map's group, made at its first key in place of EmptyGroup:
+  every slot empty. }
+procedure SmallGroup(M: PMap; D: PMapDesc);
+var
+  p: Pointer;
+begin
+  GetMem(p, (M^.SlotSize + 1) shl 3, D^.SlotPtr);
+  PInt(p)^ := WordEmpty;
+  M^.Dir := p;
+end;
+
+{ A free slot of a small map's group for a key of hash H, its control
+  byte set and the map's count up: the key's slot, the caller fills
+  it; nil when the eight are taken. }
+function SmallSlot(M: PMap; H: Integer): Pointer;
+var
+  g, bits, i: Integer;
+begin
+  Result := nil;
+  g := Integer(M^.Dir);
+  bits := MatchFree(PInt(g)^);
+  if bits = 0 then
+    Exit;
+  i := FirstSlot(bits);
+  PChar(g + i)^ := Char(H and 127);
+  M^.Used := M^.Used + 1;
+  Result := SlotAt(Pointer(g), i, M^.SlotSize);
+end;
+
+{ A small map's eight keys go into a table of TableMin slots under a
+  directory of one entry, as Go's growToTable. The group stays as it
+  is for a loop that started on it. }
+procedure GrowToTable(M: PMap; D: PMapDesc);
+var
+  t: PTable;
+  g, ss, ctrl, i: Integer;
+  k: Pointer;
+begin
+  ss := M^.SlotSize;
+  t := NewTable(TableMin, D);
+  g := Integer(M^.Dir);
+  ctrl := PInt(g)^;
+  for i := 0 to 7 do
+    if ((ctrl shr (8 * i)) and 128) = 0 then
+    begin
+      k := SlotAt(Pointer(g), i, ss);
+      PutFresh(t, k, HashOf(M, k, D), ss);
+      t^.Used := Int32(t^.Used + 1);
+    end;
+  t^.GrowthLeft := Int32(t^.GrowthLeft - t^.Used);
+  NewDir(M, 0, t, 1);
+end;
+
+{ A map for about Hint entries: a small map up to eight, with no group
+  until its first key, as Go's (NewMap allocates nothing for those);
+  one table while they fit in one, else 2^k tables of MaxTableCap, each
+  half full. }
 function PasMapNew(Desc: Pointer; Hint: Integer): Pointer;
 var
   mp: PMap;
@@ -621,26 +806,37 @@ begin
   New(mp);
   mp^.Used := 0;
   mp^.Writing := 0;
-  Reseed(mp);
-  mp^.SlotSize := PMapDesc(Desc)^.KeySize + ((PMapDesc(Desc)^.ValSize + 7) and (-8));
-  mp^.GroupSize := 8 + 8 * mp^.SlotSize;
+  Reseed(mp, PMapDesc(Desc));
+  mp^.SlotSize := Int32(SlotBytes(PMapDesc(Desc)));
+  mp^.Dir := nil;
+  mp^.Depth := 0;
+  mp^.TabMask := 0;
+{$if PASLANG_FULLVERSION < 1001139}
+  mp^.GroupSize := (mp^.SlotSize + 1) shl 3;
+{$endif}
+  if SmallOn and (Hint <= SmallMax) then
+  begin
+    mp^.Dir := @EmptyGroup;
+    Result := mp;
+    Exit;
+  end;
   if Hint <= MaxGrowth(MaxTableCap) then
   begin
-    slots := 8;
+    slots := TableMin;
     while MaxGrowth(slots) < Hint do
       slots := slots * 2;
-    NewDir(mp, 0, NewTable(slots, PMapDesc(Desc)));
+    NewDir(mp, 0, NewTable(slots, PMapDesc(Desc)), 0);
   end
   else
   begin
     k := 1;
     while (1 shl k) * (MaxGrowth(MaxTableCap) div 2) < Hint do
       k := k + 1;
-    NewDir(mp, k, nil);
+    NewDir(mp, k, nil, 0);
     for i := 0 to (1 shl k) - 1 do
     begin
       t := NewTable(MaxTableCap, PMapDesc(Desc));
-      t^.LocalDepth := k;
+      t^.LocalDepth := Int32(k);
       SetEntry(mp, i, t);
     end;
   end;
@@ -662,20 +858,26 @@ begin
     Exit;
   if PMap(M)^.Writing <> 0 then
     Fatal('paslang: concurrent map read and map write');
-  h := ((Key shl 32) or (Key shr 32)) xor PMap(M)^.Flip;
-  h := h xor ((h shl 49) or (h shr 15)) xor ((h shl 24) or (h shr 40));
+  h := (Key rol 32) xor PMap(M)^.Seed;
+  h := h xor (h rol 49) xor (h rol 24);
   h := h * X3Mul;
   h := h xor ((h shr 35) + 8);
   h := h * X3Mul;
   h := h xor (h shr 28);
-  base := PInt(Integer(PMap(M)^.Dir) + ((h shr 32) and PMap(M)^.DirMask) * 8)^;
+  { a small map's one group is the base, and its probe stays there
+    (TabMask 0); a table's is its directory entry }
+  if PMap(M)^.TabMask = 0 then
+    base := Integer(PMap(M)^.Dir)
+  else
+    base := PInt(Integer(PMap(M)^.Dir) + DirEnt +
+      ((h shr 32) and PInt(Integer(PMap(M)^.Dir) + DirMaskOff)^) * 8)^;
   probe := (h shr 7) and PMap(M)^.TabMask;
   h := (h and 127) * LSB;
   step := 0;
   k := 0;
   while True do
   begin
-    g := base + probe * PMap(M)^.GroupSize;
+    g := base + probe * ((PMap(M)^.SlotSize + 1) shl 3);
     bits := PInt(g)^ xor h;
     bits := (bits - LSB) and (bits xor (-1)) and MSB;
     while bits <> 0 do
@@ -691,7 +893,9 @@ begin
     end;
     if k <> 0 then
       Break;
-    if (PInt(g)^ and ((PInt(g)^ shl 6) xor (-1)) and MSB) <> 0 then
+    { a small map's group is all of it; a table's probe ends at a group
+      with an empty slot }
+    if (PMap(M)^.TabMask = 0) or ((PInt(g)^ and ((PInt(g)^ shl 6) xor (-1)) and MSB) <> 0) then
       Break;
     step := step + 1;
     probe := (probe + step) and PMap(M)^.TabMask;
@@ -713,8 +917,8 @@ begin
     Fatal('paslang: nil map');
   if PMap(M)^.Writing <> 0 then
     Fatal('paslang: concurrent map writes');
-  h := ((Key shl 32) or (Key shr 32)) xor PMap(M)^.Flip;
-  h := h xor ((h shl 49) or (h shr 15)) xor ((h shl 24) or (h shr 40));
+  h := (Key rol 32) xor PMap(M)^.Seed;
+  h := h xor (h rol 49) xor (h rol 24);
   h := h * X3Mul;
   h := h xor ((h shr 35) + 8);
   h := h * X3Mul;
@@ -723,14 +927,20 @@ begin
   Result := nil;
   while Result = nil do
   begin
-    base := PInt(Integer(PMap(M)^.Dir) + ((h shr 32) and PMap(M)^.DirMask) * 8)^;
+    { a small map's one group is the base, and its probe stays there
+      (TabMask 0); a table's is its directory entry }
+    if PMap(M)^.TabMask <> 0 then
+      base := PInt(Integer(PMap(M)^.Dir) + DirEnt +
+        ((h shr 32) and PInt(Integer(PMap(M)^.Dir) + DirMaskOff)^) * 8)^
+    else
+      base := Integer(PMap(M)^.Dir);
     probe := (h shr 7) and PMap(M)^.TabMask;
     step := 0;
     k := 0;
     dg := 0;
     while True do
     begin
-      g := base + probe * PMap(M)^.GroupSize;
+      g := base + probe * ((PMap(M)^.SlotSize + 1) shl 3);
       bits := PInt(g)^ xor ((h and 127) * LSB);
       bits := (bits - LSB) and (bits xor (-1)) and MSB;
       while bits <> 0 do
@@ -748,32 +958,40 @@ begin
         Break;
       { The first free slot on the way, empty or deleted, as the address
         of its control byte (a group is 8-aligned, so the low three bits
-        are the slot); an empty slot ends the probe. }
+        are the slot); an empty slot ends the probe, and so does a small
+        map's one group. }
       if dg = 0 then
       begin
         bits := PInt(g)^ and MSB;
         if bits <> 0 then
           dg := g + ((((bits and (-bits)) shr 7) * SlotIndex) shr 56);
       end;
-      if (PInt(g)^ and ((PInt(g)^ shl 6) xor (-1)) and MSB) <> 0 then
+      if (PMap(M)^.TabMask = 0) or ((PInt(g)^ and ((PInt(g)^ shl 6) xor (-1)) and MSB) <> 0) then
         Break;
       step := step + 1;
       probe := (probe + step) and PMap(M)^.TabMask;
     end;
     if k <> 0 then
       Result := Pointer(k + 8)
+    else if (PMap(M)^.TabMask = 0) and (PMap(M)^.Dir = @EmptyGroup) then
+      { a small map's first key: a group of its own, and the probe again }
+      SmallGroup(PMap(M), PMapDesc(Desc))
+    else if (PMap(M)^.TabMask = 0) and (dg = 0) then
+      { a small map's eight slots are taken: a table, and the probe again }
+      GrowToTable(PMap(M), PMapDesc(Desc))
     else
     begin
       { A deleted slot is reused without spending growth; an empty one
-        needs growth left, or the table grows and the probe runs again. }
+        needs growth left, or the table grows and the probe runs again.
+        A small map has neither: a free slot is taken. }
       t := PTable(base - TableHdr);
       j := (PInt(dg and (-8))^ shr ((dg and 7) * 8)) and 255;
-      if (j <> CtrlDeleted) and (t^.GrowthLeft = 0) then
+      if (PMap(M)^.TabMask <> 0) and (j <> CtrlDeleted) and (t^.GrowthLeft = 0) then
         Grow(PMap(M), t, h, PMapDesc(Desc))
       else
       begin
-        if j <> CtrlDeleted then
-          t^.GrowthLeft := t^.GrowthLeft - 1;
+        if (PMap(M)^.TabMask <> 0) and (j <> CtrlDeleted) then
+          t^.GrowthLeft := Int32(t^.GrowthLeft - 1);
         k := (dg and (-8)) + 8 + (dg and 7) * PMap(M)^.SlotSize;
         PInt(k)^ := Key;
         j := 8;
@@ -783,7 +1001,8 @@ begin
           j := j + 8;
         end;
         PChar(dg)^ := Char(h and 127);
-        t^.Used := t^.Used + 1;
+        if PMap(M)^.TabMask <> 0 then
+          t^.Used := Int32(t^.Used + 1);
         PMap(M)^.Used := PMap(M)^.Used + 1;
         Result := Pointer(k + 8);
       end;
@@ -810,13 +1029,19 @@ begin
   h := XxHash3(PStr(Key)^, PMap(M)^.Seed);
   kp := PInt(Key)^;
   kn := PInt(Integer(Key) + 8)^;
-  base := PInt(Integer(PMap(M)^.Dir) + ((h shr 32) and PMap(M)^.DirMask) * 8)^;
+  { a small map's one group is the base, and its probe stays there
+    (TabMask 0); a table's is its directory entry }
+  if PMap(M)^.TabMask = 0 then
+    base := Integer(PMap(M)^.Dir)
+  else
+    base := PInt(Integer(PMap(M)^.Dir) + DirEnt +
+      ((h shr 32) and PInt(Integer(PMap(M)^.Dir) + DirMaskOff)^) * 8)^;
   probe := (h shr 7) and PMap(M)^.TabMask;
   h2 := (h and 127) * LSB;
   step := 0;
   while True do
   begin
-    g := base + probe * PMap(M)^.GroupSize;
+    g := base + probe * ((PMap(M)^.SlotSize + 1) shl 3);
     bits := PInt(g)^ xor h2;
     bits := (bits - LSB) and (bits xor (-1)) and MSB;
     while bits <> 0 do
@@ -830,7 +1055,7 @@ begin
         end;
       bits := bits and (bits - 1);
     end;
-    if (PInt(g)^ and ((PInt(g)^ shl 6) xor (-1)) and MSB) <> 0 then
+    if (PMap(M)^.TabMask = 0) or ((PInt(g)^ and ((PInt(g)^ shl 6) xor (-1)) and MSB) <> 0) then
       Exit;
     step := step + 1;
     probe := (probe + step) and PMap(M)^.TabMask;
@@ -857,14 +1082,20 @@ begin
   Result := nil;
   while Result = nil do
   begin
-    base := PInt(Integer(PMap(M)^.Dir) + ((h shr 32) and PMap(M)^.DirMask) * 8)^;
+    { a small map's one group is the base, and its probe stays there
+      (TabMask 0); a table's is its directory entry }
+    if PMap(M)^.TabMask <> 0 then
+      base := PInt(Integer(PMap(M)^.Dir) + DirEnt +
+        ((h shr 32) and PInt(Integer(PMap(M)^.Dir) + DirMaskOff)^) * 8)^
+    else
+      base := Integer(PMap(M)^.Dir);
     probe := (h shr 7) and PMap(M)^.TabMask;
     step := 0;
     k := 0;
     dg := 0;
     while True do
     begin
-      g := base + probe * PMap(M)^.GroupSize;
+      g := base + probe * ((PMap(M)^.SlotSize + 1) shl 3);
       bits := PInt(g)^ xor ((h and 127) * LSB);
       bits := (bits - LSB) and (bits xor (-1)) and MSB;
       while bits <> 0 do
@@ -887,23 +1118,29 @@ begin
         if bits <> 0 then
           dg := g + ((((bits and (-bits)) shr 7) * SlotIndex) shr 56);
       end;
-      if (PInt(g)^ and ((PInt(g)^ shl 6) xor (-1)) and MSB) <> 0 then
+      if (PMap(M)^.TabMask = 0) or ((PInt(g)^ and ((PInt(g)^ shl 6) xor (-1)) and MSB) <> 0) then
         Break;
       step := step + 1;
       probe := (probe + step) and PMap(M)^.TabMask;
     end;
     if k <> 0 then
       Result := Pointer(k + 16)
+    else if (PMap(M)^.TabMask = 0) and (PMap(M)^.Dir = @EmptyGroup) then
+      { a small map's first key: a group of its own, and the probe again }
+      SmallGroup(PMap(M), PMapDesc(Desc))
+    else if (PMap(M)^.TabMask = 0) and (dg = 0) then
+      { a small map's eight slots are taken: a table, and the probe again }
+      GrowToTable(PMap(M), PMapDesc(Desc))
     else
     begin
       t := PTable(base - TableHdr);
       j := (PInt(dg and (-8))^ shr ((dg and 7) * 8)) and 255;
-      if (j <> CtrlDeleted) and (t^.GrowthLeft = 0) then
+      if (PMap(M)^.TabMask <> 0) and (j <> CtrlDeleted) and (t^.GrowthLeft = 0) then
         Grow(PMap(M), t, h, PMapDesc(Desc))
       else
       begin
-        if j <> CtrlDeleted then
-          t^.GrowthLeft := t^.GrowthLeft - 1;
+        if (PMap(M)^.TabMask <> 0) and (j <> CtrlDeleted) then
+          t^.GrowthLeft := Int32(t^.GrowthLeft - 1);
         k := (dg and (-8)) + 8 + (dg and 7) * PMap(M)^.SlotSize;
         PInt(k)^ := kp;
         PInt(k + 8)^ := kn;
@@ -914,7 +1151,8 @@ begin
           j := j + 8;
         end;
         PChar(dg)^ := Char(h and 127);
-        t^.Used := t^.Used + 1;
+        if PMap(M)^.TabMask <> 0 then
+          t^.Used := Int32(t^.Used + 1);
         PMap(M)^.Used := PMap(M)^.Used + 1;
         Result := Pointer(k + 16);
       end;
@@ -946,9 +1184,26 @@ begin
     Exit;
   end;
   h := HashOf(mp, Key, d);
-  k := FindSlot(TableFor(mp, h), Key, d, h);
+  if mp^.TabMask = 0 then
+    k := SmallFind(mp, Key, d, h)
+  else
+    k := FindSlot(TableFor(mp, h), Key, d, h, mp^.SlotSize);
   if k <> nil then
     Result := Pointer(Integer(k) + d^.KeySize);
+end;
+
+{ The key's new slot: the key copied in, the value zero. }
+procedure FillSlot(K, Key: Pointer; D: PMapDesc; SS: Integer);
+var
+  j: Integer;
+begin
+  Move(Key^, K^, D^.KeySize);
+  j := D^.KeySize;
+  while j < SS do
+  begin
+    PInt(Integer(K) + j)^ := 0;
+    j := j + 8;
+  end;
 end;
 
 { The value slot of Key, inserted if it was missing. The caller stores
@@ -958,10 +1213,9 @@ var
   mp: PMap;
   d: PMapDesc;
   t: PTable;
-  h, h2, probe, step, bits, i, ctrl, di, j: Integer;
+  h, h2, probe, step, bits, i, ctrl, di, ss, gs: Integer;
   g, k, dg: Pointer;
   pb: PChar;
-  w: PInt;
 begin
   if M = nil then
     Fatal('paslang: nil map');
@@ -976,8 +1230,31 @@ begin
   end;
   h := HashOf(mp, Key, d);
   h2 := h and 127;
+  ss := mp^.SlotSize;
+  gs := (ss + 1) shl 3;
   mp^.Writing := mp^.Writing xor 1;
   Result := nil;
+  if mp^.TabMask = 0 then
+  begin
+    { a small map: the key's slot in its group, else a free one, else
+      the eight go into a table and the probe below runs }
+    if mp^.Dir = @EmptyGroup then
+      SmallGroup(mp, d);
+    k := SmallFind(mp, Key, d, h);
+    if k <> nil then
+      Result := Pointer(Integer(k) + d^.KeySize)
+    else
+    begin
+      k := SmallSlot(mp, h);
+      if k <> nil then
+      begin
+        FillSlot(k, Key, d, ss);
+        Result := Pointer(Integer(k) + d^.KeySize);
+      end
+      else
+        GrowToTable(mp, d);
+    end;
+  end;
   while Result = nil do
   begin
     t := TableFor(mp, h);
@@ -987,13 +1264,13 @@ begin
     di := 0;
     while Result = nil do
     begin
-      g := GroupAt(t, probe);
+      g := GroupAt(t, probe, gs);
       ctrl := PInt(g)^;
       bits := MatchH2(ctrl, h2);
       while (bits <> 0) and (Result = nil) do
       begin
         i := FirstSlot(bits);
-        k := SlotAt(t, g, i);
+        k := SlotAt(g, i, ss);
         if KeyEq(k, Key, d) then
           Result := Pointer(Integer(k) + d^.KeySize);
         bits := bits and (bits - 1);
@@ -1018,20 +1295,13 @@ begin
         else
         begin
           i := FirstSlot(bits);
-          t^.GrowthLeft := t^.GrowthLeft - 1;
+          t^.GrowthLeft := Int32(t^.GrowthLeft - 1);
         end;
-        k := SlotAt(t, g, i);
-        Move(Key^, k^, d^.KeySize);
-        j := d^.KeySize;
-        while j < t^.SlotSize do
-        begin
-          w := PInt(Integer(k) + j);
-          w^ := 0;
-          j := j + 8;
-        end;
+        k := SlotAt(g, i, ss);
+        FillSlot(k, Key, d, ss);
         pb := PChar(Integer(g) + i);
         pb^ := Char(h2);
-        t^.Used := t^.Used + 1;
+        t^.Used := Int32(t^.Used + 1);
         mp^.Used := mp^.Used + 1;
         Result := Pointer(Integer(k) + d^.KeySize);
         Break;
@@ -1052,13 +1322,29 @@ begin
   mp^.Writing := mp^.Writing xor 1;
 end;
 
-{ True when the key was there. }
+{ Every word of a slot of SS bytes zero: a deleted key or value that
+  held a pointer kept its block alive, in a table the collector scans,
+  until the slot was used again (1.0.140). }
+procedure ZeroSlot(K: Pointer; SS: Integer);
+var
+  j: Integer;
+begin
+  j := 0;
+  while j < SS do
+  begin
+    PInt(Integer(K) + j)^ := 0;
+    j := j + 8;
+  end;
+end;
+
+{ True when the key was there. A small map's slot is empty again, as
+  Go's deleteSmall: no probe passes through its one group. }
 function PasMapDelete(M, Key, Desc: Pointer): Boolean;
 var
   mp: PMap;
   d: PMapDesc;
   t: PTable;
-  h, h2, probe, step, bits, i, ctrl, j: Integer;
+  h, h2, probe, step, bits, i, ctrl, ss, gs: Integer;
   g, k: Pointer;
   pb: PChar;
 begin
@@ -1073,22 +1359,40 @@ begin
   d := PMapDesc(Desc);
   h := HashOf(mp, Key, d);
   h2 := h and 127;
+  ss := mp^.SlotSize;
+  gs := (ss + 1) shl 3;
   mp^.Writing := mp^.Writing xor 1;
+  if mp^.TabMask = 0 then
+  begin
+    k := SmallFind(mp, Key, d, h);
+    if k <> nil then
+    begin
+      i := (Integer(k) - Integer(mp^.Dir) - 8) div ss;
+      PChar(Integer(mp^.Dir) + i)^ := Char(CtrlEmpty);
+      ZeroSlot(k, ss);
+      mp^.Used := mp^.Used - 1;
+      if mp^.Used = 0 then
+        Reseed(mp, d);
+      Result := True;
+    end;
+    mp^.Writing := mp^.Writing xor 1;
+    Exit;
+  end;
   t := TableFor(mp, h);
   probe := (h shr 7) and t^.Mask;
   step := 0;
   while not Result do
   begin
-    g := GroupAt(t, probe);
+    g := GroupAt(t, probe, gs);
     ctrl := PInt(g)^;
     bits := MatchH2(ctrl, h2);
     while (bits <> 0) and (not Result) do
     begin
       i := FirstSlot(bits);
-      k := SlotAt(t, g, i);
+      k := SlotAt(g, i, ss);
       if KeyEq(k, Key, d) then
       begin
-        t^.Used := t^.Used - 1;
+        t^.Used := Int32(t^.Used - 1);
         mp^.Used := mp^.Used - 1;
         pb := PChar(Integer(g) + i);
         if MatchEmpty(ctrl) <> 0 then
@@ -1096,21 +1400,13 @@ begin
           { A group with an empty slot ends every probe that reaches
             it, so this slot can be empty again. }
           pb^ := Char(CtrlEmpty);
-          t^.GrowthLeft := t^.GrowthLeft + 1;
+          t^.GrowthLeft := Int32(t^.GrowthLeft + 1);
         end
         else
           pb^ := Char(CtrlDeleted);
-        { The slot is zeroed (1.0.140): a deleted key or value that held
-          a pointer kept its block alive, in a table the collector scans,
-          until the slot was used again. }
-        j := 0;
-        while j < t^.SlotSize do
-        begin
-          PInt(Integer(k) + j)^ := 0;
-          j := j + 8;
-        end;
+        ZeroSlot(k, ss);
         if mp^.Used = 0 then
-          Reseed(mp);
+          Reseed(mp, d);
         Result := True;
       end;
       bits := bits and (bits - 1);
@@ -1131,14 +1427,17 @@ end;
   (the one below 2^LocalDepth), from a random entry and a random slot.
   When a table has been replaced since (Gen moved), a key is looked up
   again in the map, so an entry deleted during the loop is not returned,
-  an updated value is the current one, and no key comes twice. }
+  an updated value is the current one, and no key comes twice. A loop
+  over a small map walks its group (Live 255) from a random slot; when
+  the map is no longer that group (it grew into a table), a key is
+  looked up again in the same way. }
 function PasMapNext(M, It, Desc: Pointer): Pointer;
 var
   mp: PMap;
   d: PMapDesc;
   ip: PIter;
   t, ct: PTable;
-  depth, nd, dir, e, i, ctrl, de, dd, s, h, n: Integer;
+  depth, dir, e, i, de, dd, s, h, n, ss, gs, mk, lim, pr: Integer;
   g, k, p: Pointer;
 begin
   Result := nil;
@@ -1147,80 +1446,118 @@ begin
   mp := PMap(M);
   d := PMapDesc(Desc);
   ip := PIter(It);
+  ss := mp^.SlotSize;
   if ip^.Live = 0 then
   begin
     if mp^.Used = 0 then
       Exit;
-    if mp^.Depth = 0 then
-      ip^.Dir := Pointer(PInt(mp^.Dir)^ - TableHdr)
+    if mp^.TabMask = 0 then
+    begin
+      ip^.Dir := mp^.Dir;
+      ip^.Live := 255;
+    end
     else
     begin
-      n := 1 shl mp^.Depth;
-      GetMem(p, n * 8);
-      Move(mp^.Dir^, p^, n * 8);
-      ip^.Dir := p;
+      if mp^.Depth = 0 then
+        ip^.Dir := Pointer(PInt(Integer(mp^.Dir) + DirEnt)^ - TableHdr)
+      else
+      begin
+        n := 1 shl mp^.Depth;
+        GetMem(p, n * 8);
+        Move(Pointer(Integer(mp^.Dir) + DirEnt)^, p^, n * 8);
+        ip^.Dir := p;
+      end;
+      ip^.Live := GenAt(mp)^ * 256 + mp^.Depth + 1;
     end;
-    ip^.Live := mp^.Gen * 256 + mp^.Depth + 1;
     ip^.Probe := 0;
     ip^.Start := (mp^.Seed shr 13) and 1073741823;
   end;
   if mp^.Writing <> 0 then
     Fatal('paslang: concurrent map iteration and map write');
-  depth := (ip^.Live and 255) - 1;
-  nd := 1 shl depth;
-  dir := Integer(ip^.Dir);
-  while ip^.Probe < nd * MaxTableCap do
+  if ip^.Live = 255 then
   begin
-    de := ip^.Probe div MaxTableCap;
-    s := ip^.Probe mod MaxTableCap;
+    while ip^.Probe < SmallMax do
+    begin
+      i := (ip^.Probe + ip^.Start) and 7;
+      ip^.Probe := ip^.Probe + 1;
+      g := ip^.Dir;
+      if ((PInt(g)^ shr (8 * i)) and 128) = 0 then
+      begin
+        k := SlotAt(g, i, ss);
+        if mp^.Dir <> ip^.Dir then
+          k := FindAny(mp, k, d);
+        if k <> nil then
+        begin
+          Result := k;
+          Exit;
+        end;
+      end;
+    end;
+    Exit;
+  end;
+  { the probe in a register, written back as the call leaves; Probe and
+    Start are never negative, so a division by MaxTableCap is a shift }
+  depth := (ip^.Live and 255) - 1;
+  lim := MaxTableCap shl depth;
+  dir := Integer(ip^.Dir);
+  gs := (ss + 1) shl 3;
+  pr := ip^.Probe;
+  while pr < lim do
+  begin
+    de := pr shr 10;
+    s := pr and (MaxTableCap - 1);
     if depth = 0 then
     begin
       dd := 0;
-      t := PTable(ip^.Dir);
+      t := PTable(dir);
     end
     else
     begin
-      dd := (de + ip^.Start div MaxTableCap) and (nd - 1);
+      dd := (de + (ip^.Start shr 10)) and ((1 shl depth) - 1);
       t := PTable(PInt(dir + dd * 8)^ - TableHdr);
     end;
-    if ((dd shr t^.LocalDepth) <> 0) or (s >= t^.Capacity) then
+    mk := t^.Mask;
+    if ((dd shr t^.LocalDepth) <> 0) or ((s shr 3) > mk) then
     begin
-      ip^.Probe := (de + 1) * MaxTableCap;
+      pr := (de + 1) shl 10;
       Continue;
     end;
-    ip^.Probe := ip^.Probe + 1;
-    e := (s + ip^.Start) and (t^.Capacity - 1);
-    g := GroupAt(t, e shr 3);
+    pr := pr + 1;
+    { the slot of the run's offset in this table: its capacity is
+      (mk + 1) * 8, a power of two }
+    e := (s + ip^.Start) and ((mk shl 3) + 7);
+    g := Pointer(Integer(t) + TableHdr + (e shr 3) * gs);
     i := e and 7;
-    ctrl := PInt(g)^;
-    if ((ctrl shr (8 * i)) and 128) = 0 then
+    if ((PInt(g)^ shr (8 * i)) and 128) = 0 then
     begin
-      k := SlotAt(t, g, i);
-      if mp^.Gen <> (ip^.Live shr 8) then
+      k := SlotAt(g, i, ss);
+      if GenAt(mp)^ <> (ip^.Live shr 8) then
       begin
         h := HashOf(mp, k, d);
         ct := TableFor(mp, h);
         if ct <> t then
-          k := FindSlot(ct, k, d, h);
+          k := FindSlot(ct, k, d, h, ss);
       end;
       if k <> nil then
       begin
+        ip^.Probe := pr;
         Result := k;
         Exit;
       end;
     end;
   end;
+  ip^.Probe := pr;
 end;
 
 { Empty the map in place, every table kept at its size (as Go's clear
-  keeps them), and draw a new seed. The slots are zeroed too (1.0.140):
-  only the control words were, and every pointer the cleared entries
-  held stayed alive for the collector. }
+  keeps them), a small map's group too, and draw a new seed. The slots
+  are zeroed too (1.0.140): only the control words were, and every
+  pointer the cleared entries held stayed alive for the collector. }
 procedure PasMapClear(M, Desc: Pointer);
 var
   mp: PMap;
   t: PTable;
-  i, j, n, b: Integer;
+  i, j, n, b, gs: Integer;
   w: PInt;
 begin
   if M = nil then
@@ -1229,29 +1566,42 @@ begin
   if mp^.Writing <> 0 then
     Fatal('paslang: concurrent map writes');
   mp^.Writing := mp^.Writing xor 1;
-  n := 1 shl mp^.Depth;
-  for j := 0 to n - 1 do
+  gs := (mp^.SlotSize + 1) shl 3;
+  if mp^.TabMask = 0 then
   begin
-    t := PTable(PInt(Integer(mp^.Dir) + j * 8)^ - TableHdr);
-    if (j shr t^.LocalDepth) = 0 then
+    if mp^.Dir <> @EmptyGroup then
     begin
-      for i := 0 to t^.Mask do
+      w := PInt(mp^.Dir);
+      ZeroSlot(Pointer(Integer(w) + 8), gs - 8);
+      w^ := WordEmpty;
+    end;
+  end
+  else
+  begin
+    n := 1 shl mp^.Depth;
+    for j := 0 to n - 1 do
+    begin
+      t := PTable(PInt(Integer(mp^.Dir) + DirEnt + j * 8)^ - TableHdr);
+      if (j shr t^.LocalDepth) = 0 then
       begin
-        w := PInt(GroupAt(t, i));
-        b := 8;
-        while b < t^.GroupSize do
+        for i := 0 to t^.Mask do
         begin
-          PInt(Integer(w) + b)^ := 0;
-          b := b + 8;
+          w := PInt(GroupAt(t, i, gs));
+          b := 8;
+          while b < gs do
+          begin
+            PInt(Integer(w) + b)^ := 0;
+            b := b + 8;
+          end;
+          w^ := WordEmpty;
         end;
-        w^ := WordEmpty;
+        t^.Used := Int32(0);
+        t^.GrowthLeft := Int32(MaxGrowth(Capacity(t)));
       end;
-      t^.Used := 0;
-      t^.GrowthLeft := MaxGrowth(t^.Capacity);
     end;
   end;
   mp^.Used := 0;
-  Reseed(mp);
+  Reseed(mp, PMapDesc(Desc));
   mp^.Writing := mp^.Writing xor 1;
 end;
 
