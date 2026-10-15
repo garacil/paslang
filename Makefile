@@ -289,6 +289,9 @@ GOLDEN_A64 += leafcall
 # P289: a bounds check the index's range proves is left out.
 GOLDEN += bceprove
 GOLDEN_A64 += bceprove
+# P290: arm64 works on a register variable where it lives.
+GOLDEN += armregs
+GOLDEN_A64 += armregs
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -3200,7 +3203,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/condjump0-arm > $(BUILDDIR)/condjump0-arm.got; \
 	diff -u testdata/condjump.out $(BUILDDIR)/condjump0-arm.got; \
 	awk '/^p_digit:/,/ret$$/' $(BUILDDIR)/condjump-arm.s > $(BUILDDIR)/condjump-digit-arm.s; \
-	grep -q 'cmp x0, #48' $(BUILDDIR)/condjump-digit-arm.s && grep -q 'b.lt ' $(BUILDDIR)/condjump-digit-arm.s && grep -q 'b.gt ' $(BUILDDIR)/condjump-digit-arm.s || { echo "condjump-arm.s: Digit's condition is not two compares and two branches"; exit 1; }; \
+	grep -qE 'cmp x[0-9]+, #48' $(BUILDDIR)/condjump-digit-arm.s && grep -q 'b.lt ' $(BUILDDIR)/condjump-digit-arm.s && grep -q 'b.gt ' $(BUILDDIR)/condjump-digit-arm.s || { echo "condjump-arm.s: Digit's condition is not two compares and two branches"; exit 1; }; \
 	if grep -q 'cset' $(BUILDDIR)/condjump-digit-arm.s; then echo "condjump-arm.s: Digit's condition makes a Boolean"; exit 1; fi; \
 	for f in sum sumwhile sumconst bump; do \
 	  awk "/^p_$$f:/,/ret\$$/" $(BUILDDIR)/varparts-arm.s > $(BUILDDIR)/varparts-$$f-arm.s; \
@@ -3241,6 +3244,17 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	  if awk "/^p_$$f:/,/cfi_endproc/" $(BUILDDIR)/bceprove-arm.s | grep -q rt_boundsfail; then echo "bceprove-arm.s: $$f checks an index it proved"; exit 1; fi; \
 	done; \
 	echo ok bceprove-arm-asm; \
+	: a variable a register keeps is loaded, compared, stepped and masked where it lives, with the immediates arm64 takes, P290; \
+	awk '/^p_digits:/,/cfi_endproc/' $(BUILDDIR)/armregs-arm.s > $(BUILDDIR)/armregs-digits-arm.s; \
+	grep -qE 'ldrb w(19|2[0-8]), \[x(19|2[0-8]), x(19|2[0-8])' $(BUILDDIR)/armregs-digits-arm.s || { echo "armregs-arm.s: Digits does not load into its variable"; exit 1; }; \
+	grep -qE 'cmp x(19|2[0-8]), #48' $(BUILDDIR)/armregs-digits-arm.s || { echo "armregs-arm.s: Digits copies before it compares"; exit 1; }; \
+	grep -qE 'add (x(19|2[0-8])), \1, #1$$' $(BUILDDIR)/armregs-digits-arm.s || { echo "armregs-arm.s: Digits does not step k in place"; exit 1; }; \
+	if awk '/p2align 5/{l=1} l{print} l&&/cmp sp, x10/{exit}' $(BUILDDIR)/armregs-digits-arm.s | grep -qE 'mov x[01], x(19|2[0-8])$$'; then echo "armregs-arm.s: the loop of Digits copies a kept register into x0 or x1"; exit 1; fi; \
+	grep -q 'cmp sp, x10' $(BUILDDIR)/armregs-digits-arm.s || { echo "armregs-arm.s: the loop moves sp to compare it"; exit 1; }; \
+	awk '/^p_imms:/,/cfi_endproc/' $(BUILDDIR)/armregs-arm.s | grep -qE 'sub x(19|2[0-8]), x(19|2[0-8]), #1, lsl #12' || { echo "armregs-arm.s: Imms does not take 4096 as an immediate"; exit 1; }; \
+	awk '/^p_cmps:/,/cfi_endproc/' $(BUILDDIR)/armregs-arm.s | grep -qE 'cmn x(19|2[0-8]), #4095' || { echo "armregs-arm.s: Cmps does not compare -4095 with cmn"; exit 1; }; \
+	awk '/^p_loads:/,/cfi_endproc/' $(BUILDDIR)/armregs-arm.s | grep -qE 'and x[0-9]+, x(19|2[0-8]), #0x0*3f' || { echo "armregs-arm.s: Loads does not mask i where it lives"; exit 1; }; \
+	echo ok armregs-arm-asm; \
 	$(OUTDIR)/paslangc -target arm64 -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/exprinline0-arm testdata/exprinline.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/exprinline0-arm > $(BUILDDIR)/exprinline0-arm.got; \
 	diff -u testdata/exprinline.out $(BUILDDIR)/exprinline0-arm.got; \

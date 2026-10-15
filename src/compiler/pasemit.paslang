@@ -2100,6 +2100,58 @@ begin
   Result := '0x' + Result;
 end;
 
+{ V is a logical immediate of arm64's and, orr, eor and tst (P290): as
+  DecodeBitMasks decodes it (ARM DDI 0487 M.c J1.2.3.19), an element of
+  2, 4, 8, 16, 32 or 64 bits repeated across the word, the element a run
+  of ones, rotated, that neither is empty nor fills it. }
+function ArmLogImm(V: Int64): Boolean;
+var
+  size, i: LongInt;
+  mask, e, x: Int64;
+begin
+  Result := False;
+  if (V = 0) or (V = -1) then
+    Exit;
+  size := 64;
+  while size > 2 do
+  begin
+    i := size div 2;
+    mask := (Int64(1) shl i) - 1;
+    if (V and mask) <> ((V shr i) and mask) then
+      Break;
+    size := i;
+  end;
+  if size = 64 then
+    mask := -1
+  else
+    mask := (Int64(1) shl size) - 1;
+  e := V and mask;
+  for i := 0 to size - 1 do
+  begin
+    if i = 0 then
+      x := e
+    else
+      x := ((e shr i) or (e shl (size - i))) and mask;
+    if (x <> 0) and (x <> mask) and ((x and (x + 1)) = 0) then
+    begin
+      Result := True;
+      Exit;
+    end;
+  end;
+end;
+
+{ The immediate of arm64's add, sub, cmp and cmn for K, 0 or more: 0 to
+  4095, or such a value shifted left by 12 (ARM DDI 0487 M.c C6.2.5,
+  imm12 and sh); '' when K is neither (P290). }
+function ArmAddImm(K: Int64): string;
+begin
+  Result := '';
+  if (K >= 0) and (K <= 4095) then
+    Result := '#' + IntToStr(K)
+  else if (K > 4095) and ((K and 4095) = 0) and ((K shr 12) <= 4095) then
+    Result := '#' + IntToStr(K shr 12) + ', lsl #12';
+end;
+
 { ---- Sets (P126) ----
 
   A set of up to 64 elements is one word, bit n the element whose ordinal
@@ -5197,7 +5249,55 @@ var
 begin
   Result := False;
   if FArm then
+  begin
+    { arm64 (P290): a variable a register keeps takes the operation
+      there, the constant as the instruction's immediate: add and sub
+      take 0 to 4095 or that shifted by 12 (ArmAddImm), a shift 0 to
+      63, and, orr and eor a logical immediate (ArmLogImm). One
+      instruction where k := k + 1 took four through x0 and x1. }
+    if D.Reg = '' then
+      Exit;
+    m := D.Reg;
+    if ((Op = boShl) or (Op = boShr)) and (K >= 0) and (K <= 63) then
+    begin
+      if Op = boShl then
+        Line('  lsl ' + m + ', ' + m + ', #' + IntToStr(K))
+      else
+        Line('  lsr ' + m + ', ' + m + ', #' + IntToStr(K));
+      Result := True;
+    end
+    else if (Op = boAdd) or (Op = boSub) then
+    begin
+      if ArmAddImm(K) <> '' then
+      begin
+        if Op = boAdd then
+          Line('  add ' + m + ', ' + m + ', ' + ArmAddImm(K))
+        else
+          Line('  sub ' + m + ', ' + m + ', ' + ArmAddImm(K));
+        Result := True;
+      end
+      else if (K < 0) and (K > Low(Int64)) and (ArmAddImm(-K) <> '') then
+      begin
+        if Op = boAdd then
+          Line('  sub ' + m + ', ' + m + ', ' + ArmAddImm(-K))
+        else
+          Line('  add ' + m + ', ' + m + ', ' + ArmAddImm(-K));
+        Result := True;
+      end;
+    end
+    else if ((Op = boAnd) or (Op = boOr) or (Op = boXor)) and ArmLogImm(K) then
+    begin
+      if Op = boAnd then
+        ins := 'and'
+      else if Op = boOr then
+        ins := 'orr'
+      else
+        ins := 'eor';
+      Line('  ' + ins + ' ' + m + ', ' + m + ', #' + HexWord(K));
+      Result := True;
+    end;
     Exit;
+  end;
   if (Op = boShl) or (Op = boShr) then
   begin
     if (K < 0) or (K > 63) then
@@ -5232,11 +5332,39 @@ end;
 
 function TEmitter.InPlaceReg(const D: TSym; Op: TBinOp; const R: TSym): Boolean;
 var
-  m, ins: string;
+  m, ins, o: string;
 begin
   Result := False;
   if FArm then
+  begin
+    { arm64 (P290): the operation on the register the variable lives in,
+      the operand's own register when it has one }
+    if D.Reg = '' then
+      Exit;
+    ins := '';
+    case Op of
+      boAdd: ins := 'add';
+      boSub: ins := 'sub';
+      boAnd: ins := 'and';
+      boOr: ins := 'orr';
+      boXor: ins := 'eor';
+      boMul: ins := 'mul';
+      boShl: ins := 'lsl';
+      boShr: ins := 'lsr';
+    end;
+    if ins = '' then
+      Exit;
+    if (R.Reg <> '') and (R.Up = 0) and (not R.ByRef) then
+      o := R.Reg
+    else
+    begin
+      LoadPlain(R, 'x17');
+      o := 'x17';
+    end;
+    Line('  ' + ins + ' ' + D.Reg + ', ' + D.Reg + ', ' + o);
+    Result := True;
     Exit;
+  end;
   m := MemA(D);
   if (Op = boShl) or (Op = boShr) then
   begin
@@ -5279,7 +5407,96 @@ var
   ains, dreg, lreg, rreg, ins: string;
   k: Int64;
   lvar, rvar: Boolean;
+  a, b: PExpr;
 begin
+  if FArm then
+  begin
+    { arm64 (P290): three operands, so d := l op r is one instruction on
+      the registers the variables live in, the result straight into d's
+      (x0 and a store when d is in memory), a constant on the right the
+      immediate where the instruction takes one; a constant on the left
+      of an operation that commutes goes to the right. }
+    ins := '';
+    case Op of
+      boAdd: ins := 'add';
+      boSub: ins := 'sub';
+      boAnd: ins := 'and';
+      boOr: ins := 'orr';
+      boXor: ins := 'eor';
+      boMul: ins := 'mul';
+      boShl: ins := 'lsl';
+      boShr: ins := 'lsr';
+    end;
+    if ins <> '' then
+    begin
+      a := L;
+      b := R;
+      if (a^.Kind = ekInt) and (b^.Kind <> ekInt) and ((Op = boAdd) or (Op = boAnd) or
+        (Op = boOr) or (Op = boXor) or (Op = boMul)) then
+      begin
+        a := R;
+        b := L;
+      end;
+      if a^.Kind = ekInt then
+      begin
+        LoadImmR('x0', a^.Num);
+        lreg := 'x0';
+      end
+      else
+      begin
+        ls := FindSym(a^.Name);
+        if ls.Reg <> '' then
+          lreg := ls.Reg
+        else
+        begin
+          LoadPlain(ls, 'x0');
+          lreg := 'x0';
+        end;
+      end;
+      if b^.Kind = ekInt then
+      begin
+        k := b^.Num;
+        if ((Op = boShl) or (Op = boShr)) and (k >= 0) and (k <= 63) then
+          rreg := '#' + IntToStr(k)
+        else if ((Op = boAdd) or (Op = boSub)) and (ArmAddImm(k) <> '') then
+          rreg := ArmAddImm(k)
+        else if ((Op = boAdd) or (Op = boSub)) and (k < 0) and (k > Low(Int64)) and
+          (ArmAddImm(-k) <> '') then
+        begin
+          if Op = boAdd then
+            ins := 'sub'
+          else
+            ins := 'add';
+          rreg := ArmAddImm(-k);
+        end
+        else if ((Op = boAnd) or (Op = boOr) or (Op = boXor)) and ArmLogImm(k) then
+          rreg := '#' + HexWord(k)
+        else
+        begin
+          LoadImmR('x1', k);
+          rreg := 'x1';
+        end;
+      end
+      else
+      begin
+        rs := FindSym(b^.Name);
+        if rs.Reg <> '' then
+          rreg := rs.Reg
+        else
+        begin
+          LoadPlain(rs, 'x1');
+          rreg := 'x1';
+        end;
+      end;
+      dreg := D.Reg;
+      if dreg = '' then
+        dreg := 'x0';
+      Line('  ' + ins + ' ' + dreg + ', ' + lreg + ', ' + rreg);
+      if D.Reg = '' then
+        StorePlain(D);
+      Exit;
+    end;
+  end;
   if not FArm then
   begin
     { The forms a register variable takes without rax (1.1.1): d := l
@@ -5591,7 +5808,10 @@ begin
     Exit;
   if e^.Kind = ekInt then
   begin
-    if FArm then
+    if FArm and (dst.Reg <> '') then
+      { arm64: straight into the variable's register (P290) }
+      LoadImmR(dst.Reg, e^.Num)
+    else if FArm then
     begin
       LoadImmR('x0', e^.Num);
       StorePlain(dst);
@@ -5612,8 +5832,17 @@ begin
     begin
       if FArm then
       begin
-        LoadPlain(rs, 'x0');
-        StorePlain(dst);
+        { one move or one load or store where either has a register
+          (P290) }
+        if dst.Reg <> '' then
+          LoadPlain(rs, dst.Reg)
+        else if rs.Reg <> '' then
+          StorePlainFrom(dst, rs.Reg)
+        else
+        begin
+          LoadPlain(rs, 'x0');
+          StorePlain(dst);
+        end;
       end
       else if (dst.Reg <> '') or (rs.Reg <> '') then
         { one of them in a register: one move (1.1.1) }
@@ -5628,8 +5857,9 @@ begin
     Exit;
   end;
   { d := what p points to, a field or an element, d in a register
-    (1.1.1): the load goes into d's register, not through the pool }
-  if (not FArm) and (dst.Reg <> '') and
+    (1.1.1; arm64 too since P290): the load goes into d's register, not
+    through the pool }
+  if (dst.Reg <> '') and
     ((e^.Kind = ekDeref) or (e^.Kind = ekField) or (e^.Kind = ekIndex)) and
     (not IsFat(e^.Typ)) and (not IsBlob(e^.Typ)) and (TSize(e^.Typ) <= 8) and
     WordMemOK(e, 0) then
@@ -5642,24 +5872,37 @@ begin
   end;
   { d := (a + b) shr k, the middle of a binary search (1.1.1): lea and
     a shift into d's register }
-  if (not FArm) and (dst.Reg <> '') and (e^.Kind = ekBin) and
+  if (dst.Reg <> '') and (e^.Kind = ekBin) and
     ((e^.Bin = boShr) or (e^.Bin = boShl)) and (TSize(e^.Typ) = 8) and
     (e^.R <> nil) and (e^.R^.Kind = ekInt) and (e^.R^.Num >= 0) and (e^.R^.Num <= 63) and
     (e^.L <> nil) and (e^.L^.Kind = ekBin) and (e^.L^.Bin = boAdd) and (TSize(e^.L^.Typ) = 8) and
     PlainOrd(e^.L^.L, ls) and PlainOrd(e^.L^.R, rs) and (ls.Reg <> '') and (rs.Reg <> '') then
   begin
-    Line('  leaq (%' + ls.Reg + ',%' + rs.Reg + '), %' + dst.Reg);
-    if e^.Bin = boShr then
-      Line('  shrq $' + IntToStr(e^.R^.Num) + ', %' + dst.Reg)
+    if FArm then
+    begin
+      Line('  add ' + dst.Reg + ', ' + ls.Reg + ', ' + rs.Reg);
+      if e^.Bin = boShr then
+        Line('  lsr ' + dst.Reg + ', ' + dst.Reg + ', #' + IntToStr(e^.R^.Num))
+      else
+        Line('  lsl ' + dst.Reg + ', ' + dst.Reg + ', #' + IntToStr(e^.R^.Num));
+    end
     else
-      Line('  shlq $' + IntToStr(e^.R^.Num) + ', %' + dst.Reg);
+    begin
+      Line('  leaq (%' + ls.Reg + ',%' + rs.Reg + '), %' + dst.Reg);
+      if e^.Bin = boShr then
+        Line('  shrq $' + IntToStr(e^.R^.Num) + ', %' + dst.Reg)
+      else
+        Line('  shlq $' + IntToStr(e^.R^.Num) + ', %' + dst.Reg);
+    end;
     Result := True;
     Exit;
   end;
   if (e^.Kind = ekUn) and (e^.Un = uoNeg) and (e^.L <> nil) and
     PlainOrd(e^.L, rs) and SamePlace(dst, rs) then
   begin
-    if FArm then
+    if FArm and (dst.Reg <> '') then
+      Line('  neg ' + dst.Reg + ', ' + dst.Reg)
+    else if FArm then
     begin
       LoadPlain(dst, 'x0');
       Line('  neg x0, x0');
@@ -5783,7 +6026,9 @@ end;
 function TEmitter.CondJmp(E: PExpr; const Target: string; WhenTrue: Boolean): Boolean;
 var
   ls, rs: TSym;
-  cc, past: string;
+  cc, past, lr: string;
+  a, b: PExpr;
+  op: TBinOp;
 begin
   Result := False;
   if (E <> nil) and (E^.Kind = ekInt) then
@@ -5857,19 +6102,58 @@ begin
   cc := CondCC(E^.Bin, WhenTrue);
   if FArm then
   begin
-    if E^.L^.Kind = ekInt then
-      LoadImmR('x0', E^.L^.Num)
-    else
-      LoadPlain(ls, 'x0');
-    if (E^.R^.Kind = ekInt) and (E^.R^.Num >= 0) and (E^.R^.Num <= 4095) then
-      Line('  cmp x0, #' + IntToStr(E^.R^.Num))
+    { arm64 (P290): a variable a register keeps is compared there; a
+      constant on the left goes to the right with the comparison turned
+      round, and a negative one is cmn's (ARM DDI 0487 M.c C6.2.93):
+      the copies into x0 and x1 doubled a loop's test }
+    a := E^.L;
+    b := E^.R;
+    op := E^.Bin;
+    if (a^.Kind = ekInt) and (b^.Kind <> ekInt) then
+    begin
+      a := E^.R;
+      b := E^.L;
+      ls := rs;
+      case op of
+        boLt: op := boGt;
+        boLe: op := boGe;
+        boGt: op := boLt;
+        boGe: op := boLe;
+      end;
+      cc := CondCC(op, WhenTrue);
+    end;
+    if a^.Kind = ekInt then
+    begin
+      LoadImmR('x0', a^.Num);
+      lr := 'x0';
+    end
+    else if ls.Reg <> '' then
+      lr := ls.Reg
     else
     begin
-      if E^.R^.Kind = ekInt then
-        LoadImmR('x1', E^.R^.Num)
+      LoadPlain(ls, 'x0');
+      lr := 'x0';
+    end;
+    if (b^.Kind = ekInt) and (ArmAddImm(b^.Num) <> '') then
+      Line('  cmp ' + lr + ', ' + ArmAddImm(b^.Num))
+    else if (b^.Kind = ekInt) and (b^.Num < 0) and (b^.Num > Low(Int64)) and
+      (ArmAddImm(-b^.Num) <> '') then
+      Line('  cmn ' + lr + ', ' + ArmAddImm(-b^.Num))
+    else if b^.Kind = ekInt then
+    begin
+      LoadImmR('x1', b^.Num);
+      Line('  cmp ' + lr + ', x1');
+    end
+    else
+    begin
+      rs := FindSym(b^.Name);
+      if rs.Reg <> '' then
+        Line('  cmp ' + lr + ', ' + rs.Reg)
       else
+      begin
         LoadPlain(rs, 'x1');
-      Line('  cmp x0, x1');
+        Line('  cmp ' + lr + ', x1');
+      end;
     end;
     Line('  b.' + cc + ' ' + Target);
   end
@@ -23294,8 +23578,7 @@ begin
     ekBin:
       begin
         { a - k of a register is one lea, a two-operand one, one cycle on
-          Zen 2 (AMD 56305 2.10.2), where mov and sub were two (P282);
-          on arm64 one sub or add with its immediate }
+          Zen 2 (AMD 56305 2.10.2), where mov and sub were two (P282) }
         if (E^.Bin = boSub) and (TSize(E^.Typ) = 8) and (E^.R^.Kind = ekInt) and
           (E^.L^.Kind = ekVar) and WordVar(E^.L, s) and (s.Reg <> '') and (TSize(s.Typ) = 8) then
         begin
@@ -23304,17 +23587,50 @@ begin
             Line('  leaq ' + IntToStr(-E^.R^.Num) + '(%' + s.Reg + '), %' + r);
             Exit;
           end;
-          if FArm and (E^.R^.Num >= 0) and (E^.R^.Num <= 4095) then
-          begin
-            Line('  sub ' + r + ', ' + s.Reg + ', #' + IntToStr(E^.R^.Num));
-            Exit;
-          end;
         end;
-        if FArm and (E^.Bin = boAdd) and (TSize(E^.Typ) = 8) and (E^.R^.Kind = ekInt) and
-          (E^.R^.Num >= 0) and (E^.R^.Num <= 4095) and (E^.L^.Kind = ekVar) and
-          WordVar(E^.L, s) and (s.Reg <> '') and (TSize(s.Typ) = 8) then
+        { arm64 (P282, P290): an operation on a variable a register keeps
+          takes that register as its first operand, the result straight
+          into the pool's, the constant as the immediate where the
+          instruction takes one; a mov first doubled each such step }
+        if FArm and (TSize(E^.Typ) = 8) and (E^.L^.Kind = ekVar) and WordVar(E^.L, s) and
+          (s.Reg <> '') and (TSize(s.Typ) = 8) and ((E^.Bin = boAdd) or (E^.Bin = boSub) or
+          (E^.Bin = boAnd) or (E^.Bin = boOr) or (E^.Bin = boXor) or (E^.Bin = boMul) or
+          (E^.Bin = boShl) or (E^.Bin = boShr)) then
         begin
-          Line('  add ' + r + ', ' + s.Reg + ', #' + IntToStr(E^.R^.Num));
+          case E^.Bin of
+            boAdd: m := 'add';
+            boSub: m := 'sub';
+            boAnd: m := 'and';
+            boOr: m := 'orr';
+            boXor: m := 'eor';
+            boMul: m := 'mul';
+            boShl: m := 'lsl';
+          else
+            m := 'lsr';
+          end;
+          k := 0;
+          if E^.R^.Kind = ekInt then
+            k := E^.R^.Num;
+          if (E^.R^.Kind = ekInt) and ((E^.Bin = boShl) or (E^.Bin = boShr)) and
+            (k >= 0) and (k <= 63) then
+            Line('  ' + m + ' ' + r + ', ' + s.Reg + ', #' + IntToStr(k))
+          else if (E^.R^.Kind = ekInt) and ((E^.Bin = boAdd) or (E^.Bin = boSub)) and
+            (ArmAddImm(k) <> '') then
+            Line('  ' + m + ' ' + r + ', ' + s.Reg + ', ' + ArmAddImm(k))
+          else if (E^.R^.Kind = ekInt) and ((E^.Bin = boAdd) or (E^.Bin = boSub)) and
+            (k < 0) and (k > Low(Int64)) and (ArmAddImm(-k) <> '') then
+          begin
+            if E^.Bin = boAdd then
+              m := 'sub'
+            else
+              m := 'add';
+            Line('  ' + m + ' ' + r + ', ' + s.Reg + ', ' + ArmAddImm(-k));
+          end
+          else if (E^.R^.Kind = ekInt) and ((E^.Bin = boAnd) or (E^.Bin = boOr) or
+            (E^.Bin = boXor)) and ArmLogImm(k) then
+            Line('  ' + m + ' ' + r + ', ' + s.Reg + ', #' + HexWord(k))
+          else
+            Line('  ' + m + ' ' + r + ', ' + s.Reg + ', ' + OrdOperand(E^.R, D));
           Exit;
         end;
         { a + b of two registers, or a + k, is one lea (1.1.1) }
@@ -23484,7 +23800,7 @@ end;
 procedure TEmitter.EmitOrdBinArm(E: PExpr; D: LongInt);
 var
   r, op, cc: string;
-  small: Boolean;
+  small, addop: Boolean;
 begin
   r := OrdPool(D);
   small := (E^.R^.Kind = ekInt) and (E^.R^.Num >= 0) and (E^.R^.Num <= 4095);
@@ -23501,11 +23817,20 @@ begin
       end;
     boAdd, boSub:
       begin
-        if small then
-          op := '#' + IntToStr(E^.R^.Num)
+        { the immediate of 0 to 4095, or that shifted by 12, or of the
+          opposite operation for a negative one (P290) }
+        addop := E^.Bin = boAdd;
+        if (E^.R^.Kind = ekInt) and (ArmAddImm(E^.R^.Num) <> '') then
+          op := ArmAddImm(E^.R^.Num)
+        else if (E^.R^.Kind = ekInt) and (E^.R^.Num < 0) and (E^.R^.Num > Low(Int64)) and
+          (ArmAddImm(-E^.R^.Num) <> '') then
+        begin
+          op := ArmAddImm(-E^.R^.Num);
+          addop := not addop;
+        end
         else
           op := OrdOperand(E^.R, D);
-        if E^.Bin = boAdd then
+        if addop then
           Line('  add ' + r + ', ' + r + ', ' + op)
         else
           Line('  sub ' + r + ', ' + r + ', ' + op);
@@ -23560,7 +23885,11 @@ begin
       end
       else
       begin
-        op := OrdOperand(E^.R, D);
+        { a logical immediate where and, orr and eor take one (P290) }
+        if (E^.Bin <> boMul) and (E^.R^.Kind = ekInt) and ArmLogImm(E^.R^.Num) then
+          op := '#' + HexWord(E^.R^.Num)
+        else
+          op := OrdOperand(E^.R, D);
         case E^.Bin of
           boMul: Line('  mul ' + r + ', ' + r + ', ' + op);
           boAnd: Line('  and ' + r + ', ' + r + ', ' + op);
@@ -24512,10 +24841,9 @@ begin
         begin
           esz := TSize(td.Elem);
           disp := 0;
-          if FArm then
-            EmitOrdTo(E^.L, D)
-          else
-            r := PtrReg(E^.L, D);
+          { a pointer a register keeps is the base where it is, on arm64
+            too (P290): nothing below writes the base }
+          r := PtrReg(E^.L, D);
         end;
         isc := (E^.R^.Kind = ekInt) and Fits32(disp + E^.R^.Num * esz);
         k := 0;
@@ -25137,9 +25465,10 @@ begin
     slow := Lab;
     if FArm then
     begin
+      { sp itself: CMP (extended register) takes it as its first
+        operand (ARM DDI 0487 M.c C6.2.95), P290 }
       Line('  ldr x10, [x28, #16]');
-      Line('  mov x9, sp');
-      Line('  cmp x9, x10');
+      Line('  cmp sp, x10');
       Line('  b.ls ' + slow);
     end
     else
