@@ -274,6 +274,10 @@ GOLDEN_A64 += lazyzero
 # takes less memory than Go's at every count of keys.
 GOLDEN += mapsmall
 GOLDEN_A64 += mapsmall
+# P286: a string of one character takes no memory, as Go's: the
+# runtime's table of the 256, shared.
+GOLDEN += strone
+GOLDEN_A64 += strone
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -2177,6 +2181,10 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 $(BUILDDIR)/mapsmall nomem > $(BUILDDIR)/mapsmall-gc.got; \
 	grep -v ' keys: ' testdata/mapsmall.out | diff -u - $(BUILDDIR)/mapsmall-gc.got; \
 	echo ok mapsmall-gc; \
+	: strings of one character under the stress and verify of the collector, P286, the count of memory left out; \
+	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 $(BUILDDIR)/strone nomem > $(BUILDDIR)/strone-gc.got; \
+	grep -v 'strings of one character' testdata/strone.out | diff -u - $(BUILDDIR)/strone-gc.got; \
+	echo ok strone-gc; \
 	: a function of one expression goes in as its expression, P266: the output of every routine a call, and Branchy one compare and one jump with no call of Less; \
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/exprinline0 testdata/exprinline.paslang; \
 	$(BUILDDIR)/exprinline0 > $(BUILDDIR)/exprinline0.got; \
@@ -3172,6 +3180,9 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 timeout 300 $(QEMU_A64) $(BUILDDIR)/mapsmall-arm nomem > $(BUILDDIR)/mapsmall-arm-gc.got; \
 	grep -v ' keys: ' testdata/mapsmall.out | diff -u - $(BUILDDIR)/mapsmall-arm-gc.got; \
 	echo ok mapsmall-arm-gc; \
+	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 timeout 300 $(QEMU_A64) $(BUILDDIR)/strone-arm nomem > $(BUILDDIR)/strone-arm-gc.got; \
+	grep -v 'strings of one character' testdata/strone.out | diff -u - $(BUILDDIR)/strone-arm-gc.got; \
+	echo ok strone-arm-gc; \
 	$(OUTDIR)/paslangc -target arm64 -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/exprinline0-arm testdata/exprinline.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/exprinline0-arm > $(BUILDDIR)/exprinline0-arm.got; \
 	diff -u testdata/exprinline.out $(BUILDDIR)/exprinline0-arm.got; \

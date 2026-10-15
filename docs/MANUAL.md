@@ -6588,7 +6588,12 @@ does, while it fills more than half of the block, as FPC's
 holds less than twice its size or 32 bytes (1.1.100). A longer one
 gets a new block whose new bytes are zero; a string another variable
 holds, a literal or a view is copied first, so the program may write
-the result through a pointer (1.1.99). `=` and
+the result through a pointer (1.1.99). A string of one character made
+from a character, by `Copy`, by `+`, by `IntToStr` of a digit or from
+JSON takes no memory: it is the runtime's own string of that
+character, shared as a literal is, so a write through it copies it first
+(1.1.140, as Go's). Strings of fewer than 15 characters share blocks of
+16 bytes, as Go's small objects do. `=` and
 `<>` compare bytes, 64 at a
 time on AVX2 or SSE2 (or NEON) as Go's `memequal` does. `<`, `<=`,
 `>` and `>=` compare them byte by byte as well: the first byte that
