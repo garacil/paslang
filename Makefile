@@ -278,6 +278,10 @@ GOLDEN_A64 += mapsmall
 # runtime's table of the 256, shared.
 GOLDEN += strone
 GOLDEN_A64 += strone
+# P287: a slice's frontier costs no size class, the guarantees of 1.0.88
+# kept.
+GOLDEN += slicefront
+GOLDEN_A64 += slicefront
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -2185,6 +2189,10 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 $(BUILDDIR)/strone nomem > $(BUILDDIR)/strone-gc.got; \
 	grep -v 'strings of one character' testdata/strone.out | diff -u - $(BUILDDIR)/strone-gc.got; \
 	echo ok strone-gc; \
+	: slices grown, cut and copied under the stress and verify of the collector, P287, the count of memory left out; \
+	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 $(BUILDDIR)/slicefront nomem > $(BUILDDIR)/slicefront-gc.got; \
+	grep -v '20000 slices' testdata/slicefront.out | diff -u - $(BUILDDIR)/slicefront-gc.got; \
+	echo ok slicefront-gc; \
 	: a function of one expression goes in as its expression, P266: the output of every routine a call, and Branchy one compare and one jump with no call of Less; \
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/exprinline0 testdata/exprinline.paslang; \
 	$(BUILDDIR)/exprinline0 > $(BUILDDIR)/exprinline0.got; \
@@ -3183,6 +3191,9 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 timeout 300 $(QEMU_A64) $(BUILDDIR)/strone-arm nomem > $(BUILDDIR)/strone-arm-gc.got; \
 	grep -v 'strings of one character' testdata/strone.out | diff -u - $(BUILDDIR)/strone-arm-gc.got; \
 	echo ok strone-arm-gc; \
+	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 timeout 300 $(QEMU_A64) $(BUILDDIR)/slicefront-arm nomem > $(BUILDDIR)/slicefront-arm-gc.got; \
+	grep -v '20000 slices' testdata/slicefront.out | diff -u - $(BUILDDIR)/slicefront-arm-gc.got; \
+	echo ok slicefront-arm-gc; \
 	$(OUTDIR)/paslangc -target arm64 -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/exprinline0-arm testdata/exprinline.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/exprinline0-arm > $(BUILDDIR)/exprinline0-arm.got; \
 	diff -u testdata/exprinline.out $(BUILDDIR)/exprinline0-arm.got; \

@@ -3099,7 +3099,10 @@ concurrent callers would need an atomic counter or a mutex.
 
 `Append(s, a, b)` is `s` with `a` and `b` after its elements, a slice of
 `s`'s type, as Go's `append` (1.0.132); `Append(s, u)` with `u` of `s`'s
-type adds `u`'s elements, `s`'s own too. `Cap(s)` is its capacity. A
+type adds `u`'s elements, `s`'s own too. `Cap(s)` is its capacity: a
+`SetLength` to a new length takes exactly that many, a grow with room to
+spare as many as the block it takes holds, as Go's, and a shrink leaves
+the capacity at the new length (1.1.141). A
 list in brackets where a slice goes is a new slice of it: `u := [10,
 20, 30]`, `Total([1, 2, 3])`, `g := Append(g, [1, 2])`; `[]` is empty.
 So `Append(s, [a, b])` adds `a` and `b` (1.0.136; the list went in as

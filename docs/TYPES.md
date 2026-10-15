@@ -416,7 +416,12 @@ breaks C-shaped layout.
   buffer never changes under it, as with FPC's `SetLength`, while a
   slice grown one element at a time stays in place (1.0.88; before, a
   grow within the capacity showed what a shrink or another slice had
-  left there).
+  left there). The frontier costs no size class (1.1.141): a grow to
+  exactly its capacity has none, since nothing grows in place from it;
+  a grow with room to spare puts it in the block its elements take,
+  the capacity as many as fit before it; and a shrink leaves the
+  capacity at the new length, so a block without a frontier is never
+  read past its capacity.
 - Indexing is **0-based** (`a[0]` is the first element). Strings stay
   1-based. Every index is checked against the length (P87):
   `paslang: index I out of range [0..N-1]`, before a write writes.
