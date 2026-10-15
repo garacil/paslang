@@ -25,6 +25,9 @@ compile_environment = {key: value for key, value in os.environ.items()
 
 def run(command, input_data=None):
     selected_environment = compile_environment if command[0] == compiler else environment
+    if command[0] == 'gdb':
+        # no signal stops a routine under gdb (P293), as check_syscalls
+        selected_environment = dict(environment, PASLANG_ASYNCPREEMPTOFF='1')
     result = subprocess.run(command, input=input_data, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, env=selected_environment, timeout=120)
     if result.returncode:

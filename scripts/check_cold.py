@@ -7,8 +7,10 @@
 assembly paslangc wrote, no call of rt_boundsfail or rt_divzero in a
 routine paslangc compiled (p_... or pas_main) comes before that
 routine's first ret, so the path where a check holds takes no branch,
-and at least the given number come after one. Reads amd64's call and
-arm64's bl alike.
+and at least the given number come after one. A third argument names
+other routines of the runtime, joined by commas, whose calls must sit
+there too: the other failures and the slow paths that come back
+(P300). Reads amd64's call and arm64's bl alike.
 """
 
 import re
@@ -16,9 +18,12 @@ import sys
 
 
 def main():
-    if len(sys.argv) != 3:
-        raise SystemExit("usage: check_cold.py file.s least")
+    if len(sys.argv) not in (3, 4):
+        raise SystemExit("usage: check_cold.py file.s least [names]")
     path, least = sys.argv[1], int(sys.argv[2])
+    names = "boundsfail|divzero"
+    if len(sys.argv) == 4:
+        names = "|".join(n for n in sys.argv[3].split(",") if n)
     fn, after, bad = "", False, []
     count = 0
     for line in open(path):
@@ -29,7 +34,7 @@ def main():
             fn = ""
         elif fn and line == "  ret":
             after = True
-        elif fn and re.match(r"^  (call|bl) rt_(boundsfail|divzero)$", line):
+        elif fn and re.match(r"^  (call|bl) rt_(" + names + r")$", line):
             if after:
                 count += 1
             else:

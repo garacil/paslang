@@ -85,19 +85,24 @@ for target, cpu_level in (('amd64', 'base'), ('arm64', 'base'), ('arm64', 'max')
     # after the growth request, the race with sysmon made certain: the
     # stack grows only if the guard put back after the preemption asks
     # again (P220).
+    # Under gdb no signal stops a routine (PASLANG_ASYNCPREEMPTOFF, P293,
+    # as check_syscalls): SIGURG came to gdb through QEMU's stub as an
+    # event of its own and left gdb out of step with the target (1 run in
+    # 50 here, none in 100 with it set).
+    traced = dict(base, PASLANG_GC='off', PASLANG_ASYNCPREEMPTOFF='1')
     for preempt in (0, 1):
         probe = [*gdb_commands, '-ex', f'set $debug_preempt = {preempt}']
         if target == 'amd64':
             # Isolate the injected growth request from concurrent GC guard
             # requests; ordinary console runs above retain full GC stress.
-            gdb_output = run([*probe, '-ex', source], dict(base, PASLANG_GC='off'))
+            gdb_output = run([*probe, '-ex', source], traced)
             check(gdb_output, target)
         else:
             with tempfile.TemporaryDirectory(prefix='pl-dbg-') as directory:
                 endpoint = Path(directory) / 'gdb.sock'
                 process = subprocess.Popen(['taskset', '-c', str(min(os.sched_getaffinity(0))),
                                             *qemu, '-g', str(endpoint), str(binary), '--debug-mode'],
-                                           env=dict(base, PASLANG_GC='off'), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                           env=traced, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                            stderr=subprocess.STDOUT, start_new_session=True)
                 try:
                     process.stdin.write(commands)
