@@ -858,7 +858,15 @@ the `morestack` prologue and the 2 KiB scratch frame, so `fork` and
 nothing and holds no loop skips the `morestack` test too (1.1.142): its
 frame, 1 KiB at most, fits the 2 KiB its caller's test left; a leaf of
 one `Result :=` expression has no frame at all, its parameters in the
-argument registers (rdi, rsi, rdx; x0 to x7), its value in rax or x0. `Amd64` is 1 on GNU/Linux amd64
+argument registers (rdi, rsi, rdx; x0 to x7), its value in rax or x0.
+A loop tests nothing at its passes (1.1.147): `SIGURG`, sent by sysmon
+and by a cycle of the collector to an M's thread (its id at M+80),
+stops a routine at any instruction of compiled code without `asm`
+past its prologue's `morestack` test (a stop between its load of the
+guard and its call would double the stack for a request already
+cleared, Go's issue 35470), as Go's asynchronous preemption does; on
+arm64 the routine comes back by
+`x18`, which compiled code never holds a value in. `Amd64` is 1 on GNU/Linux amd64
 and 0 on arm64, so one source can pick the syscall number.
 The numeric constants in `paslinux` are the amd64 numbers. There is
 no assembler in that unit.

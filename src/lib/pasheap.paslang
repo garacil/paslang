@@ -195,6 +195,9 @@ const
   { The Ms a cycle may mark with (P91): rt_gcms gives threads to that
     many before it runs, the Ps at most. }
   HGcWant = 536;
+  { PASLANG_ASYNCPREEMPTOFF=1 (P293): no routine is stopped by a signal,
+    as Go's GODEBUG=asyncpreemptoff=1; sysmon and rt_sigurg read it. }
+  HAsyncOff = 544;
   WorkerSize = 512;
   ObletSize = 131072;
   DefWorkers = 16;
@@ -284,6 +287,8 @@ const
     call when a cycle counted it as stopped. }
   MRecSize = 128;
   MCurG = 16;
+  { the M's thread, where a preemption signal goes (P293) }
+  MTid = 80;
   MFutex = 48;
   { the marking (HMarkEpoch) this M last looked at: rt_gcwork writes it
     before PasGcWorker; a wake that picked the M for a marking writes
@@ -599,6 +604,9 @@ begin
     v := EnvIs(e, 'PASLANG_GCWORKERS=');
     if v <> 0 then
       MMaxWorkers := EnvNum(v);
+    v := EnvIs(e, 'PASLANG_ASYNCPREEMPTOFF=');
+    if v <> 0 then
+      WrW(H0 + HAsyncOff, EnvNum(v));
     p := p + 8;
   end;
 end;
@@ -1544,6 +1552,28 @@ end;
 
 { ---- stopping the world ---- }
 
+{ SIGURG to M's thread (P293): rt_sigurg stops its routine where it
+  runs when that routine still says Poisoned, as Go's preemptM does;
+  tgkill, the thread group being this process. }
+procedure PreemptM(M: Integer);
+var
+  tid, pid: Integer;
+begin
+  tid := RdW(M + MTid);
+  if tid <= 0 then
+    Exit;
+  if Amd64 = 1 then
+  begin
+    pid := Syscall(39);
+    Syscall(234, pid, tid, 23);
+  end
+  else
+  begin
+    pid := Syscall(172);
+    Syscall(131, pid, tid, 23);
+  end;
+end;
+
 { Every M but this cycle's own stops: an idle M or one in a system call
   is counted here and stops by itself when it comes back (rt_gcidle,
   rt_syscall); a running one is asked to, through the guard of its
@@ -1551,7 +1581,7 @@ end;
   Waits until none is left. }
 procedure StopTheWorld(H0: Integer);
 var
-  me, allm, n, i, m, s, g, left: Integer;
+  me, allm, n, i, m, s, g, left, turn: Integer;
 begin
   me := RdW(RdW(H0 + HGcG) + GM);
   allm := RdW(H0 + HAllM);
@@ -1570,6 +1600,7 @@ begin
     AtomicExchange(PInt32(H0 + HMTableLock)^, 0);
     FutexWake(H0 + HMTableLock);
   end;
+  turn := 0;
   while True do
   begin
     for i := 0 to n - 1 do
@@ -1597,7 +1628,15 @@ begin
         begin
           g := RdW(m + MCurG);
           if g <> 0 then
+          begin
+            { a routine that reached no check since the last turn, a
+              loop that tests nothing among them, gets the signal, once
+              a millisecond while it runs (P293) }
+            if (turn mod 20 = 1) and (RdW(g + GGuard) = Poisoned) and
+              (RdW(H0 + HAsyncOff) = 0) then
+              PreemptM(m);
             WrW(g + GGuard, Poisoned);
+          end;
         end;
       end;
     end;
@@ -1605,6 +1644,7 @@ begin
     if left = 0 then
       Break;
     FutexWait(H0 + HStopWait, left, 50000);
+    turn := turn + 1;
   end;
 end;
 

@@ -180,11 +180,28 @@ conservatively, word by word, and does not move what it finds that way.
 - The runtime is hand-written assembly on both machines and keeps
   pointers in callee-saved registers across calls (`rt_concat` holds
   both source strings across `rt_alloc`). It has no maps.
-- Safe points exist: the prologue and loop-head preemption checks
-  (sysmon), every park, every system call. A routine holding a runtime
-  lock is not preempted (G+184, 1.0.51). Promoted variables live in
-  registers only inside regions without calls, and the preemption stubs
-  spill them home. Since P271 (1.1.121) a long copy, clear, comparison
+- Safe points exist: the prologue's preemption check (sysmon), every
+  park, every system call, and since P293 (1.1.147) any instruction of
+  code paslangc compiled without `asm`, outside the runtime's units and
+  past a prologue's stack check, where `SIGURG` stops a routine that
+  runs and holds no runtime lock (G+184) or parking mark (G+152 not
+  0): `rt_asyncpreempt` keeps every register, the flags and the vector
+  registers on the routine's stack and parks it, and the collector
+  reads that stack word by word up to the frame pointer at G+56, the
+  interrupted frame included, which has no map at such a pc; the
+  frames above go by their maps. The
+  `pasasync` table, one entry a routine from the end of its prologue's
+  stack check to its end, says where a signal may stop one: stopped
+  between its load of the guard word and its call of `rt_morestack`, a
+  routine would come back with the request cleared and still call it,
+  and `rt_morestack` would double the stack for nothing (Go marks the
+  same instructions an unsafe point, issue 35470).
+  `scripts/check_pasasync.py` checks no entry spans the runtime or
+  holds a call of `rt_morestack`. `PASLANG_ASYNCPREEMPTOFF=1` turns the
+  signal off, as Go's `GODEBUG=asyncpreemptoff=1` (sysmon, the stop of
+  the world and `rt_sigurg` read pasheap's HAsyncOff, H0+544).
+  Loops test nothing. Promoted variables live in registers only inside
+  regions without calls; a stopped region's registers are on the stack. Since P271 (1.1.121) a long copy, clear, comparison
   or hash of the runtime stops too, between two pieces of 256 KiB, in
   rt_yieldpoint: every register goes on the routine's stack, as Go's
   asyncPreempt saves them, and the collector reads that stack word by

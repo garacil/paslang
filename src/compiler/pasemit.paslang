@@ -342,6 +342,15 @@ type
     FOwnLine: array of LongInt;
     FLocRanges: array of TLocRange;
     FCtrFacts: array of TCtrFact;
+    FAsyncOK: Boolean;      { the routine being emitted is in the pasasync table: a signal may stop it anywhere (P293) }
+    FAsyncFrom: string;     { the label after the prologue's stack check, where the routine's pasasync entry starts (P293) }
+    FInMain: Boolean;       { the main block's body is being emitted (P293) }
+    FRtUnit: Boolean;       { the unit compiled is one of the runtime's: none of its code goes in the pasasync table (P293) }
+    FNestNames: TStrArray;  { the names the routines nested in the one emitted use (P293) }
+    FRoutTab: TStrArray;    { a hash set of the names every routine of the program uses (P293) }
+    FRoutTabN: SizeInt;
+    FRoutTabOn: Boolean;
+    FNameSink: LongInt;
     FStubs: string;         { the slow paths of a promoted loop's checks, placed after it }
     FLastIns: string;       { the last instruction emitted, when nothing that a jump reaches came after it (P96) }
     FTextSec: Boolean;      { the section Line writes into holds code (P267) }
@@ -786,6 +795,12 @@ type
     procedure LeafReg(const N, R: string; Dw: LongInt; const Proc, EndLab: string);
     procedure EmitLeaf(const Pr: TProc; St: PStmt);
     function HasAsm(S: PStmt): Boolean;
+    procedure MainAsync;
+    procedure NoteName(const N: string);
+    function RoutNamed(const N: string): Boolean;
+    procedure NameScanE(E: PExpr);
+    procedure NameScanS(S: PStmt);
+    function GlobalOwnedByMain(const N: string): Boolean;
     function CmpConst(C: PExpr; out X: PExpr; out Op: TBinOp; out K: Int64): Boolean;
     function RangeTest(E: PExpr; out X: PExpr; out Lo, Hi: Int64; out Inside: Boolean): Boolean;
     procedure RangeCmp(X: PExpr; Lo, Hi: Int64);
@@ -795,8 +810,10 @@ type
     procedure EmitRuntimeArm;
     procedure EmitXxh3X86;
     procedure EmitYieldPointX86;
+    procedure EmitAsyncPreemptX86;
     function ZvaMsg: string;
     procedure EmitYieldPointArm;
+    procedure EmitAsyncPreemptArm;
     procedure YieldCheckX86(const Tag: string);
     procedure YieldCheckArm(const Tag, Reg: string);
     procedure EmitMapGetStrX86;
@@ -22602,6 +22619,147 @@ begin
   end;
 end;
 
+{ A name a body uses (P293): to FNestNames, or to the hash set FRoutTab
+  when FNameSink is 1 (FNV-1a over the name in lower case, open
+  addressing, doubled at half full). }
+procedure TEmitter.NoteName(const N: string);
+var
+  l: string;
+  h, i, m: SizeInt;
+  hv: Int64;
+  old: TStrArray;
+begin
+  if N = '' then
+    Exit;
+  l := ToLower(N);
+  if FNameSink = 0 then
+  begin
+    if not InNames(FNestNames, l) then
+      AddName(FNestNames, l);
+    Exit;
+  end;
+  if FRoutTabN * 2 >= Length(FRoutTab) then
+  begin
+    old := FRoutTab;
+    m := Length(old) * 2;
+    if m < 1024 then
+      m := 1024;
+    FRoutTab := nil;
+    SetLength(FRoutTab, m);
+    FRoutTabN := 0;
+    for i := 0 to High(old) do
+      if old[i] <> '' then
+        NoteName(old[i]);
+  end;
+  m := Length(FRoutTab);
+  hv := 2166136261;
+  for i := 1 to Length(l) do
+    hv := ((hv xor Int64(Ord(l[i]))) * 16777619) and 4294967295;
+  h := SizeInt(hv and Int64(m - 1));
+  while FRoutTab[h] <> '' do
+  begin
+    if FRoutTab[h] = l then
+      Exit;
+    h := (h + 1) and (m - 1);
+  end;
+  FRoutTab[h] := l;
+  Inc(FRoutTabN);
+end;
+
+{ N is in FRoutTab: some routine of the program uses the name. }
+function TEmitter.RoutNamed(const N: string): Boolean;
+var
+  l: string;
+  h, i, m: SizeInt;
+  hv: Int64;
+begin
+  Result := False;
+  m := Length(FRoutTab);
+  if m = 0 then
+    Exit;
+  l := ToLower(N);
+  hv := 2166136261;
+  for i := 1 to Length(l) do
+    hv := ((hv xor Int64(Ord(l[i]))) * 16777619) and 4294967295;
+  h := SizeInt(hv and Int64(m - 1));
+  while FRoutTab[h] <> '' do
+  begin
+    if FRoutTab[h] = l then
+    begin
+      Result := True;
+      Exit;
+    end;
+    h := (h + 1) and (m - 1);
+  end;
+end;
+
+procedure TEmitter.NameScanE(E: PExpr);
+var
+  i: SizeInt;
+begin
+  if E = nil then
+    Exit;
+  if (E^.Kind = ekVar) or (E^.Kind = ekCall) then
+    NoteName(E^.Name);
+  NameScanE(E^.L);
+  NameScanE(E^.R);
+  for i := 0 to High(E^.Args) do
+    NameScanE(E^.Args[i]);
+end;
+
+procedure TEmitter.NameScanS(S: PStmt);
+var
+  i: SizeInt;
+begin
+  if S = nil then
+    Exit;
+  NoteName(S^.Name);
+  NameScanE(S^.E);
+  NameScanE(S^.E2);
+  NameScanE(S^.Dest);
+  for i := 0 to High(S^.Args) do
+    NameScanE(S^.Args[i]);
+  NameScanS(S^.ThenSt);
+  NameScanS(S^.ElseSt);
+  NameScanS(S^.Body);
+  for i := 0 to High(S^.Stmts) do
+    NameScanS(S^.Stmts[i]);
+  for i := 0 to High(S^.Arms) do
+    NameScanS(S^.Arms[i].Body);
+  for i := 0 to High(S^.Sels) do
+  begin
+    NameScanE(S^.Sels[i].Chan);
+    NameScanE(S^.Sels[i].ValX);
+    NoteName(S^.Sels[i].Dest);
+    NameScanS(S^.Sels[i].Body);
+  end;
+end;
+
+{ A program's global no routine names, once: the routines' names in
+  FRoutTab. A routine with asm may name anything in its text, so then
+  every name counts as used. }
+function TEmitter.GlobalOwnedByMain(const N: string): Boolean;
+var
+  i: SizeInt;
+begin
+  if not FRoutTabOn then
+  begin
+    FRoutTabOn := True;
+    FRoutTab := nil;
+    FRoutTabN := 0;
+    FNameSink := 1;
+    NoteName('$');
+    for i := 0 to High(FProgProcs) do
+    begin
+      if HasAsm(FProgProcs[i].Body) then
+        NoteName('$asm');
+      NameScanS(FProgProcs[i].Body);
+    end;
+    FNameSink := 0;
+  end;
+  Result := (not RoutNamed('$asm')) and not RoutNamed(N);
+end;
+
 { A variable a loop may keep in a register: an 8-byte integer, enum or
   subrange of this frame or a program global, passed by value, whose
   address nobody takes. A unit's globals stay home: an importer may
@@ -22627,6 +22785,17 @@ begin
     unit's global in a program too (1.0.136): that unit may have taken
     its address, which this compilation cannot see }
   if S.Global and (FIsUnit or ExtGlobal(S.Name)) then
+    Exit;
+  { a register no other routine's write reaches (P293): a signal that
+    stops a loop keeps its registers, where the loop's test reloaded
+    them from home; so a program global is kept in the main block only
+    and only when no routine names it, a local not when a routine
+    nested in this one names it, and nothing in a closure's box }
+  if S.Global and ((not FInMain) or not GlobalOwnedByMain(S.Name)) then
+    Exit;
+  if (not S.Global) and InNames(FNestNames, ToLower(S.Name)) then
+    Exit;
+  if S.Boxed then
     Exit;
   if AddrTakenSym(S) then
     Exit;
@@ -25754,6 +25923,12 @@ var
   ok, slow: string;
   st: SizeInt;
 begin
+  { A loop of a routine in the pasasync table tests nothing at its
+    passes (P293): rt_sigurg stops the routine wherever it runs, as Go's
+    loops test nothing and its signals preempt them. A routine with asm,
+    or a unit's life block, keeps its loops' tests. }
+  if FAsyncOK and (Frame = '16') then
+    Exit;
   { A loop head inside a promoted loop: nothing in the loop calls, so the
     frame's 2 KB margin from the prologue still holds and the only thing
     to ask is whether sysmon wants the routine off the M. That is Go's
@@ -25808,6 +25983,12 @@ begin
   { Before the frame, the call is a prologue's (kind 1): the routine has
     pushed nothing and its caller's return address is just above (P95c). }
   FMapPro := not FMapOn;
+  { The routine's pasasync entry starts at ok (FAsyncFrom, P293): stopped
+    by a signal between its load of the guard word and rt_morestack, it
+    would come back with the request cleared and still call it, and
+    rt_morestack, finding a guard that asks for nothing, would double the
+    stack for nothing. Go marks the same instructions an unsafe point
+    (cmd/internal/obj/x86/obj6.go and arm64/obj7.go, issue 35470). }
   if FArm then
   begin
     { A symbol is a pair of words after the body (SetFrame): the arm64
@@ -25828,6 +26009,7 @@ begin
     PromoReload;
     Line('  b ' + Entry);
     Line(ok + ':');
+    FAsyncFrom := ok;
     FMapPro := False;
     Exit;
   end;
@@ -25839,6 +26021,7 @@ begin
   PromoReload;
   Line('  jmp ' + Entry);
   Line(ok + ':');
+  FAsyncFrom := ok;
   FMapPro := False;
 end;
 
@@ -25939,6 +26122,29 @@ begin
     Line('  mov x0, ' + ix);
   Imm('x1', Lo);
   Line('  bl rt_boundsfail');
+end;
+
+{ The main block's code for rt_sigurg (P293), as EmitProc gives each
+  routine's: in the section every object adds to, since the main block
+  sits in .text with the runtime and is always linked. }
+procedure TEmitter.MainAsync;
+var
+  e: string;
+begin
+  if FAsyncOK then
+  begin
+    e := Lab;
+    Line(e + ':');
+    MapOutLine('.section pasasync,"aw"');
+    MapOutLine('.balign 8');
+    { from after the prologue's stack check, as a routine's }
+    if FAsyncFrom = '' then
+      FAsyncFrom := 'pas_main';
+    MapOutLine('  .quad ' + FAsyncFrom + ', ' + e);
+    { the main block's call sites follow, in the maps' own section }
+    MapOutLine('.section pasgcmaps,"aw"');
+  end;
+  FAsyncOK := False;
 end;
 
 { A word value a register holds whole (P288): an 8-byte integer,
@@ -26389,10 +26595,13 @@ begin
   FCurProc := Pr.Sym;
   lst := nil;
   leaf := (not sysw) and LeafProc(Pr, lst);
+  FAsyncOK := (not sysw) and (not HasAsm(Pr.Body)) and not FRtUnit;
   { the names whose address this routine or one nested in it takes }
   savedAddr := FAddrNames;
   FAddrNames := nil;
   ScanAddrS(Pr.Body);
+  FNestNames := nil;
+  FNameSink := 0;
   for i := 0 to High(FProgProcs) do
   begin
     ps := FProgProcs[i].ParentSym;
@@ -26407,7 +26616,10 @@ begin
       Inc(k);
     end;
     if (ps = Pr.Sym) and (FProgProcs[i].Body <> nil) then
+    begin
       ScanAddrS(FProgProcs[i].Body);
+      NameScanS(FProgProcs[i].Body);
+    end;
   end;
   FLocAddr := FAddrNames;
   FAddrNames := savedAddr;
@@ -26444,6 +26656,7 @@ begin
   Line(Pr.Sym + ':');
   ck0 := FLen;
   ms0 := Length(FMapSites);
+  FAsyncFrom := '';
   if (not sysw) and not leaf then
     EmitStackCheck(Pr.Sym, FFrameSym);
   ck1 := FLen;
@@ -26607,6 +26820,7 @@ begin
     Move(FOut[ck1 + 1], FOut[ck0 + 1], FLen - ck1);
     FLen := FLen - (ck1 - ck0);
     SetLength(FMapSites, ms0);
+    FAsyncFrom := '';
   end;
 
   if not sysw then
@@ -26615,6 +26829,25 @@ begin
     MapEnd(FFrame);
   dend := Lab;
   Line(dend + ':');
+  { the routine's code for rt_sigurg (P293): a signal may stop it at any
+    instruction after its stack check (FAsyncFrom), the collector reading
+    the frame it stopped in word by word; not a body with asm, whose text
+    the collector cannot know }
+  if FAsyncOK then
+  begin
+    if FAsyncFrom = '' then
+      FAsyncFrom := Pr.Sym;
+    if FArm then
+      MapOutLine('.section pasasync.' + Pr.Sym + ',"awo",%progbits,' + Pr.Sym)
+    else
+      MapOutLine('.section pasasync.' + Pr.Sym + ',"awo",@progbits,' + Pr.Sym);
+    MapOutLine('.balign 8');
+    MapOutLine('  .quad ' + FAsyncFrom + ', ' + dend);
+    { back to the maps' own section: the main block's and a unit's life
+      blocks write their call sites without naming one }
+    MapOutLine('.section pasgcmaps,"aw"');
+  end;
+  FAsyncOK := False;
   Line('.text');
   FOwnSec := '';
   FDbgFn := '';
@@ -28233,6 +28466,10 @@ begin
   Line('  xorq %rbp, %rbp');
   Line('  xorq %r14, %r14');
   Line('  call rt_sigstack');
+  { the thread id, where sysmon's preemption signal goes (P293) }
+  Line('  movq $186, %rax');
+  Line('  syscall');
+  Line('  movq %rax, 80(%r13)');
   Line('  call rt_gcidle');
   Line('  jmp rt_mloop');
   Line('');
@@ -28974,11 +29211,33 @@ begin
   Line('.sm_retake:');
   Line('  movq %rbx, %rdi');
   Line('  call rt_retake');
+  { A routine that still says Poisoned a tick after it was poisoned has
+    reached no check in 10 ms: its M, while it runs, gets SIGURG, and
+    rt_sigurg stops the routine where it is (P293, Go's preemptone and
+    sysmon). }
   Line('.sm_preempt:');
   Line('  movq 16(%rbx), %rax');
   Line('  testq %rax, %rax');
   Line('  jz .sm_next');
   Line('  movabs $0xfffffffffffffade, %rcx');
+  Line('  cmpq %rcx, 16(%rax)');
+  Line('  jne .sm_poison');
+  { PASLANG_ASYNCPREEMPTOFF: no signal (pasheap's HAsyncOff) }
+  Line('  cmpq $0, rt_heapstate+544(%rip)');
+  Line('  jne .sm_next');
+  Line('  cmpq $0, 120(%rbx)');
+  Line('  jne .sm_next');
+  Line('  cmpq $0, 80(%rbx)');
+  Line('  je .sm_next');
+  Line('  movq $39, %rax');
+  Line('  syscall');
+  Line('  movq %rax, %rdi');
+  Line('  movq 80(%rbx), %rsi');
+  Line('  movq $23, %rdx');
+  Line('  movq $234, %rax');
+  Line('  syscall');
+  Line('  jmp .sm_next');
+  Line('.sm_poison:');
   Line('  movq %rcx, 16(%rax)');
   Line('.sm_next:');
   Line('  incq %r15');
@@ -31540,6 +31799,13 @@ begin
   Line('  call rt_sigone');
   Line('  movq $8, %rbx');
   Line('  call rt_sigone');
+  { SIGURG, the preemption request (P293) }
+  Line('  movq $23, %rdi');
+  Line('  leaq rt_sigactu(%rip), %rsi');
+  Line('  xorq %rdx, %rdx');
+  Line('  movq $8, %r10');
+  Line('  movq $13, %rax');
+  Line('  syscall');
   Line('  popq %rbx');
   Line('  ret');
   Line('rt_sigone:');
@@ -33071,6 +33337,12 @@ begin
   Line('  call rt_cpuinit');
   Line('  call rt_siginit');
   Line('  call rt_sigstack');
+  { M0's thread, the one a preemption signal goes to (P293), and the
+    table of code where it may stop a routine }
+  Line('  movq $186, %rax');
+  Line('  syscall');
+  Line('  movq %rax, rt_allm+80(%rip)');
+  Line('  call rt_asyncinit');
   Line('  call rt_ncpu');
   Line('  movq %rax, rt_nproc(%rip)');
   Line('  leaq rt_heap(%rip), %rax');
@@ -33201,6 +33473,7 @@ begin
   Line('  ret');
   Line('');
   EmitYieldPointX86;
+  EmitAsyncPreemptX86;
   Line('rt_newstack:');
   Line('  pushq %rbx');
   Line('  pushq %r12');
@@ -36745,6 +37018,12 @@ begin
   FResReg := '';
   FCurProc := 'pas_main';
   FIsUnit := Prog.IsUnit;
+  { the units that are the runtime's (P293): the collector, the
+    scheduler's primitives and the debugger keep their state across
+    instructions no signal may stop between, as Go never stops its
+    runtime package asynchronously }
+  FRtUnit := Prog.IsUnit and ((ToLower(Prog.Name) = 'pasheap') or
+    (ToLower(Prog.Name) = 'pasroutines') or (ToLower(Prog.Name) = 'pasdebug'));
   FExtVars := nil;
   for i := 0 to High(Prog.Vars) do
     if Prog.Vars[i].Ext then
@@ -36754,6 +37033,14 @@ begin
     end;
   FLocRanges := nil;
   FCtrFacts := nil;
+  FAsyncOK := False;
+  FInMain := False;
+  FRtUnit := False;
+  FNestNames := nil;
+  FRoutTab := nil;
+  FRoutTabN := 0;
+  FRoutTabOn := False;
+  FNameSink := 0;
   FAddrNames := nil;
   FAddrKept := nil;
   FLocAddr := nil;
@@ -36844,7 +37131,11 @@ begin
       end;
       FCpuSet := Prog.MainCpu;
       FTune := Prog.MainTune;
+      FAsyncOK := not HasAsm(Prog.Body);
+      FInMain := True;
+      FNestNames := nil;
       EmitStmt(Prog.Body);
+      FInMain := False;
       FCpuSet := FProgCpu;
       FTune := FProgTune;
       FDbgFn := '';
@@ -36860,6 +37151,7 @@ begin
       Line('  ret');
       if FDebug then
         Line('.Lmainend:');
+      MainAsync;
       SetFrame(FFrameSym, 0);
     end
     else
@@ -36883,7 +37175,11 @@ begin
       end;
       FCpuSet := Prog.MainCpu;
       FTune := Prog.MainTune;
+      FAsyncOK := not HasAsm(Prog.Body);
+      FInMain := True;
+      FNestNames := nil;
       EmitStmt(Prog.Body);
+      FInMain := False;
       FCpuSet := FProgCpu;
       FTune := FProgTune;
       FDbgFn := '';
@@ -36897,6 +37193,7 @@ begin
       Line('  .cfi_endproc');
       if FDebug then
         Line('.Lmainend:');
+      MainAsync;
       SetFrame(FFrameSym, 0);
     end;
   end;
@@ -36937,6 +37234,8 @@ begin
     Line('.weak __stop_pasdbg');
     Line('.weak __start_pasgcmaps');
     Line('.weak __stop_pasgcmaps');
+    Line('.weak __start_pasasync');
+    Line('.weak __stop_pasasync');
     Line('.weak __stop_pasgcroots');
     { Go's size classes (internal/runtime/gc/sizeclasses.go), P95a. }
     Line('.balign 8');
@@ -37272,6 +37571,20 @@ begin
       Line('  .quad 134217732')
     else
       Line('  .quad 201326596');
+    if FArm then
+      Line('  .quad 0')
+    else
+      Line('  .quad rt_sigreturn');
+    Line('  .quad 0');
+    { SIGURG, the preemption request (P293, as Go's sigPreempt): the
+      same flags and SA_RESTART (0x10000000), so a system call it lands
+      in goes on }
+    Line('rt_sigactu:');
+    Line('  .quad rt_sigurg');
+    if FArm then
+      Line('  .quad 402653188')
+    else
+      Line('  .quad 469762052');
     if FArm then
       Line('  .quad 0')
     else
@@ -37706,8 +38019,9 @@ begin
     Line('  .quad 0');
     Line('rt_maptot:');
     Line('  .quad 0');
-    { From +192 the collector's fields (pasheap: HGcOn to HPersistStatic). }
-    Line('  .space 512');
+    { From +192 the collector's fields (pasheap: HGcOn to HAsyncOff, the
+      last at +544, P293). }
+    Line('  .space 520');
     Line('rt_zerobase:');
     Line('  .quad 0');
     Line('rt_syssp:');
@@ -37807,6 +38121,12 @@ begin
     { The first thread to take a fatal signal reports; the others wait
       for its exit, so two reports never interleave (P86). }
     Line('rt_siglock:');
+    Line('  .quad 0');
+    { the table of code a signal may stop a routine at (P293): its
+      bounds once rt_asyncinit has sorted it, 0 while there is none }
+    Line('rt_asynclo:');
+    Line('  .quad 0');
+    Line('rt_asynchi:');
     Line('  .quad 0');
     { The two standard streams (P212): a record each, the layout at
       EmitIO; a cache line apart, so the two locks share none. }
@@ -38176,6 +38496,188 @@ begin
   Line('');
 end;
 
+{ rt_asyncpreempt (P293): rt_sigurg makes the routine it stopped call
+  this from the instruction it was at, as Go's pushCall does
+  (runtime/signal_amd64.go), the interrupted pc pushed as the return
+  address. It keeps every register as rt_yieldpoint does and the flags
+  too, since the instruction after may read them (Go's asyncPreempt
+  pushes them first, preempt_amd64.s), parks the routine on the global
+  queue with the layout .pk_res pops, and comes back with everything as
+  it was. The collector reads this stack word by word up to the frame
+  pointer kept at G+56 (ScanStack): the save area, the interrupted pc
+  and the interrupted frame, which has no map at such a pc. }
+procedure TEmitter.EmitAsyncPreemptX86;
+const
+  Gpr: array[0..13] of string = ('rax', 'rcx', 'rdx', 'rbx', 'rsi', 'rdi', 'r8',
+    'r9', 'r10', 'r11', 'r12', 'r13', 'r15', 'rbp');
+var
+  i, vw, sz: LongInt;
+  avx: Boolean;
+begin
+  avx := HasFeat(CpuFeatBit('avx', False));
+  if avx then
+    vw := 32
+  else
+    vw := 16;
+  sz := 112 + 16 * vw;
+  Line('rt_asyncpreempt:');
+  Line('  pushfq');
+  Line('  subq $' + IntToStr(sz) + ', %rsp');
+  for i := 0 to 13 do
+    Line('  movq %' + Gpr[i] + ', ' + IntToStr(8 * i) + '(%rsp)');
+  for i := 0 to 15 do
+    if avx then
+      Line('  vmovdqu %ymm' + IntToStr(i) + ', ' + IntToStr(112 + vw * i) + '(%rsp)')
+    else
+      Line('  movdqu %xmm' + IntToStr(i) + ', ' + IntToStr(112 + vw * i) + '(%rsp)');
+  Line('  pushq %rbx');
+  Line('  pushq %r12');
+  Line('  pushq %r13');
+  Line('  pushq %r15');
+  Line('  leaq .apx_res(%rip), %rax');
+  Line('  pushq %rax');
+  Line('  movq 24(%r14), %rax');
+  Line('  movq %rax, 16(%r14)');
+  Line('  leaq .pk_res(%rip), %rax');
+  Line('  movq %rax, 48(%r14)');
+  Line('  movq %rsp, 40(%r14)');
+  Line('  movq %rbp, 56(%r14)');
+  Line('  movq 32(%r14), %r13');
+  Line('  movq 32(%r13), %rsp');
+  Line('  xorq %rbp, %rbp');
+  Line('  movq %r14, %rdi');
+  Line('  xorq %r14, %r14');
+  Line('  call rt_globput');
+  Line('  jmp rt_yieldwake');
+  Line('.apx_res:');
+  for i := 0 to 15 do
+    if avx then
+      Line('  vmovdqu ' + IntToStr(112 + vw * i) + '(%rsp), %ymm' + IntToStr(i))
+    else
+      Line('  movdqu ' + IntToStr(112 + vw * i) + '(%rsp), %xmm' + IntToStr(i));
+  for i := 0 to 13 do
+    Line('  movq ' + IntToStr(8 * i) + '(%rsp), %' + Gpr[i]);
+  Line('  addq $' + IntToStr(sz) + ', %rsp');
+  Line('  popfq');
+  Line('  ret');
+  Line('');
+  { rt_sigurg: SIGURG, on the M's alternate stack (rdi the signal, rsi
+    the siginfo, rdx the ucontext: gregs from 40, r14 at 88, rsp at 160,
+    rip at 168). It stops the routine only where Go's isAsyncSafePoint
+    would (runtime/preempt.go), and looks at the pc first, since only in
+    code paslangc compiled is r14 the routine (an asm kernel or the
+    runtime may hold anything there; reading through it first faulted
+    under jsonshare's stress): r14 a routine that runs (G+152 0, Go's
+    _Grunning: one that marked itself parking, 1, goes on to its CAS of
+    1 to 2, and stopped there it would come back as 0 and lose the wake
+    its waker gives by that CAS), whose guard says Poisoned (it was
+    asked to stop and has not), that holds no runtime lock
+    (G+184), whose stack pointer is inside its stack and 1 KB above its
+    real guard (G+24) for rt_asyncpreempt's save area of some 700 bytes
+    (a prologue's check left 2 KB there), and whose pc is in code paslangc
+    compiled with no asm in it (the pasasync table, the last entry that
+    starts at or before the pc, by halves). Anywhere else the request
+    waits for the next check or the next signal. }
+  Line('rt_sigurg:');
+  { PASLANG_ASYNCPREEMPTOFF stops nothing (pasheap's HAsyncOff) }
+  Line('  cmpq $0, rt_heapstate+544(%rip)');
+  Line('  jne .sgu_ret');
+  { the pc first: only in code paslangc compiled is r14 the routine (an
+    asm kernel or the runtime may hold anything there) }
+  Line('  movq 168(%rdx), %r9');
+  Line('  movq rt_asynclo(%rip), %rsi');
+  Line('  testq %rsi, %rsi');
+  Line('  jz .sgu_ret');
+  Line('  movq rt_asynchi(%rip), %r11');
+  Line('  subq %rsi, %r11');
+  Line('  shrq $4, %r11');
+  Line('  xorq %r10, %r10');
+  Line('.sgu_bs:');
+  Line('  cmpq %r11, %r10');
+  Line('  jae .sgu_bd');
+  Line('  leaq (%r10,%r11), %rdi');
+  Line('  shrq $1, %rdi');
+  Line('  movq %rdi, %r8');
+  Line('  shlq $4, %r8');
+  Line('  cmpq (%rsi,%r8), %r9');
+  Line('  jb .sgu_lo');
+  Line('  leaq 1(%rdi), %r10');
+  Line('  jmp .sgu_bs');
+  Line('.sgu_lo:');
+  Line('  movq %rdi, %r11');
+  Line('  jmp .sgu_bs');
+  Line('.sgu_bd:');
+  Line('  testq %r10, %r10');
+  Line('  jz .sgu_ret');
+  Line('  decq %r10');
+  Line('  shlq $4, %r10');
+  Line('  cmpq 8(%rsi,%r10), %r9');
+  Line('  jae .sgu_ret');
+  Line('  movq 88(%rdx), %rax');
+  Line('  testq %rax, %rax');
+  Line('  jz .sgu_ret');
+  Line('  cmpl $0, 152(%rax)');
+  Line('  jne .sgu_ret');
+  Line('  cmpq $-1314, 16(%rax)');
+  Line('  jne .sgu_ret');
+  Line('  cmpl $0, 184(%rax)');
+  Line('  jne .sgu_ret');
+  Line('  movq 160(%rdx), %rcx');
+  Line('  cmpq 8(%rax), %rcx');
+  Line('  ja .sgu_ret');
+  Line('  movq 24(%rax), %r8');
+  Line('  addq $1024, %r8');
+  Line('  cmpq %r8, %rcx');
+  Line('  jb .sgu_ret');
+  Line('  subq $8, %rcx');
+  Line('  movq %r9, (%rcx)');
+  Line('  movq %rcx, 160(%rdx)');
+  Line('  leaq rt_asyncpreempt(%rip), %r9');
+  Line('  movq %r9, 168(%rdx)');
+  Line('.sgu_ret:');
+  Line('  ret');
+  Line('');
+  { rt_asyncinit, at the start: the pasasync table by its starts. The
+    linker lays the pieces in the order of their code, so it is sorted
+    already and the walk is all it costs; else an insertion sort. }
+  Line('rt_asyncinit:');
+  Line('  movabsq $__start_pasasync, %rsi');
+  Line('  movabsq $__stop_pasasync, %rdi');
+  Line('  testq %rsi, %rsi');
+  Line('  jz .aix_none');
+  Line('  cmpq %rsi, %rdi');
+  Line('  jbe .aix_none');
+  Line('  leaq 16(%rsi), %rcx');
+  Line('.aix_out:');
+  Line('  cmpq %rdi, %rcx');
+  Line('  jae .aix_done');
+  Line('  movq (%rcx), %r8');
+  Line('  movq 8(%rcx), %r9');
+  Line('  movq %rcx, %rdx');
+  Line('.aix_in:');
+  Line('  cmpq %rsi, %rdx');
+  Line('  jbe .aix_put');
+  Line('  movq -16(%rdx), %rax');
+  Line('  cmpq %r8, %rax');
+  Line('  jbe .aix_put');
+  Line('  movq %rax, (%rdx)');
+  Line('  movq -8(%rdx), %rax');
+  Line('  movq %rax, 8(%rdx)');
+  Line('  subq $16, %rdx');
+  Line('  jmp .aix_in');
+  Line('.aix_put:');
+  Line('  movq %r8, (%rdx)');
+  Line('  movq %r9, 8(%rdx)');
+  Line('  addq $16, %rcx');
+  Line('  jmp .aix_out');
+  Line('.aix_done:');
+  Line('  movq %rsi, rt_asynclo(%rip)');
+  Line('  movq %rdi, rt_asynchi(%rip)');
+  Line('.aix_none:');
+  Line('  ret');
+  Line('');
+end;
+
 { Between two pieces of a long copy, clear, comparison or hash of the
   runtime (P271): rt_yieldpoint when the routine (r14, 0 on an M's own
   stack) has been asked to stop, Poisoned (-1314) in its guard; the
@@ -38296,6 +38798,196 @@ begin
   Line('.yp_no:');
   Line('  ldp x9, x10, [sp], #16');
   Line('  ret');
+end;
+
+{ rt_asyncpreempt on arm64 (P293): rt_sigurg left the interrupted
+  link register on the stack in 16 bytes of its own and made the link
+  register the interrupted pc, as Go's pushCall does (signal_arm64.go).
+  Every general register but x18, the flags (NZCV) and FPSR, and q0 to
+  q31 go on the routine's stack (Go's preempt_arm64.s keeps the same),
+  the routine parks as rt_yieldpoint parks, and it comes back by x18,
+  which paslang's code never holds a value in: Go comes back by R27,
+  which is paslang's static link. }
+procedure TEmitter.EmitAsyncPreemptArm;
+var
+  i: LongInt;
+begin
+  Line('rt_asyncpreempt:');
+  Line('  sub sp, sp, #768');
+  i := 0;
+  while i <= 16 do
+  begin
+    Line('  stp x' + IntToStr(i) + ', x' + IntToStr(i + 1) + ', [sp, #' + IntToStr(8 * i) + ']');
+    i := i + 2;
+  end;
+  Line('  stp x19, x20, [sp, #144]');
+  Line('  stp x21, x22, [sp, #160]');
+  Line('  stp x23, x24, [sp, #176]');
+  Line('  stp x25, x26, [sp, #192]');
+  Line('  stp x27, x29, [sp, #208]');
+  Line('  str x30, [sp, #224]');
+  Line('  mrs x9, nzcv');
+  Line('  str x9, [sp, #232]');
+  Line('  mrs x9, fpsr');
+  Line('  str x9, [sp, #240]');
+  i := 0;
+  while i <= 30 do
+  begin
+    Line('  stp q' + IntToStr(i) + ', q' + IntToStr(i + 1) + ', [sp, #' + IntToStr(256 + 16 * i) + ']');
+    i := i + 2;
+  end;
+  { the .pk_res layout, as rt_yieldpoint writes it }
+  Line('  stp x19, x20, [sp, #-16]!');
+  Line('  stp x21, x22, [sp, #-16]!');
+  Line('  stp x23, x24, [sp, #-16]!');
+  Line('  stp x25, x26, [sp, #-16]!');
+  Line('  stp x27, xzr, [sp, #-16]!');
+  Line('  adr x10, .apx_ares');
+  Line('  str x10, [sp, #-16]!');
+  Line('  ldr x9, [x28, #24]');
+  Line('  str x9, [x28, #16]');
+  Line('  mov x9, sp');
+  Line('  str x9, [x28, #40]');
+  Line('  str x29, [x28, #56]');
+  Line('  adr x10, .pk_res');
+  Line('  str x10, [x28, #48]');
+  Line('  ldr x21, [x28, #32]');
+  Line('  ldr x9, [x21, #32]');
+  Line('  mov sp, x9');
+  Line('  mov x29, xzr');
+  Line('  mov x0, x28');
+  Line('  mov x28, xzr');
+  Line('  bl rt_globput');
+  Line('  b rt_yieldwake');
+  Line('.apx_ares:');
+  i := 0;
+  while i <= 30 do
+  begin
+    Line('  ldp q' + IntToStr(i) + ', q' + IntToStr(i + 1) + ', [sp, #' + IntToStr(256 + 16 * i) + ']');
+    i := i + 2;
+  end;
+  Line('  ldr x9, [sp, #240]');
+  Line('  msr fpsr, x9');
+  Line('  ldr x9, [sp, #232]');
+  Line('  msr nzcv, x9');
+  i := 0;
+  while i <= 16 do
+  begin
+    Line('  ldp x' + IntToStr(i) + ', x' + IntToStr(i + 1) + ', [sp, #' + IntToStr(8 * i) + ']');
+    i := i + 2;
+  end;
+  Line('  ldp x19, x20, [sp, #144]');
+  Line('  ldp x21, x22, [sp, #160]');
+  Line('  ldp x23, x24, [sp, #176]');
+  Line('  ldp x25, x26, [sp, #192]');
+  Line('  ldp x27, x29, [sp, #208]');
+  Line('  ldr x18, [sp, #224]');
+  Line('  add sp, sp, #768');
+  Line('  ldr x30, [sp], #16');
+  Line('  br x18');
+  { rt_sigurg: SIGURG on the M's alternate stack (x0 the signal, x1 the
+    siginfo, x2 the ucontext: the registers from 184, x28 at 408, x30 at
+    424, sp at 432, pc at 440), with the conditions of the amd64 one }
+  Line('rt_sigurg:');
+  { PASLANG_ASYNCPREEMPTOFF stops nothing (pasheap's HAsyncOff) }
+  LeaS('rt_heapstate', 'x14');
+  Line('  ldr x14, [x14, #544]');
+  Line('  cbnz x14, .asgu_ret');
+  { the pc first, as on amd64: only in compiled code is x28 the routine }
+  Line('  ldr x13, [x2, #440]');
+  LeaS('rt_asynclo', 'x14');
+  Line('  ldr x14, [x14]');
+  Line('  cbz x14, .asgu_ret');
+  LeaS('rt_asynchi', 'x15');
+  Line('  ldr x15, [x15]');
+  Line('  sub x15, x15, x14');
+  Line('  lsr x15, x15, #4');
+  Line('  mov x16, xzr');
+  Line('.asgu_bs:');
+  Line('  cmp x16, x15');
+  Line('  b.hs .asgu_bd');
+  Line('  add x17, x16, x15');
+  Line('  lsr x17, x17, #1');
+  Line('  lsl x10, x17, #4');
+  Line('  ldr x10, [x14, x10]');
+  Line('  cmp x13, x10');
+  Line('  b.lo .asgu_lo');
+  Line('  add x16, x17, #1');
+  Line('  b .asgu_bs');
+  Line('.asgu_lo:');
+  Line('  mov x15, x17');
+  Line('  b .asgu_bs');
+  Line('.asgu_bd:');
+  Line('  cbz x16, .asgu_ret');
+  Line('  sub x16, x16, #1');
+  Line('  lsl x16, x16, #4');
+  Line('  add x16, x16, #8');
+  Line('  ldr x10, [x14, x16]');
+  Line('  cmp x13, x10');
+  Line('  b.hs .asgu_ret');
+  Line('  ldr x9, [x2, #408]');
+  Line('  cbz x9, .asgu_ret');
+  Line('  ldr w10, [x9, #152]');
+  Line('  cbnz w10, .asgu_ret');
+  Line('  ldr x10, [x9, #16]');
+  Imm('x11', -1314);
+  Line('  cmp x10, x11');
+  Line('  b.ne .asgu_ret');
+  Line('  ldr w10, [x9, #184]');
+  Line('  cbnz w10, .asgu_ret');
+  Line('  ldr x12, [x2, #432]');
+  Line('  ldr x10, [x9, #8]');
+  Line('  cmp x12, x10');
+  Line('  b.hi .asgu_ret');
+  Line('  ldr x10, [x9, #24]');
+  Line('  add x10, x10, #1024');
+  Line('  cmp x12, x10');
+  Line('  b.lo .asgu_ret');
+  Line('  ldr x10, [x2, #424]');
+  Line('  sub x12, x12, #16');
+  Line('  str x10, [x12]');
+  Line('  str xzr, [x12, #8]');
+  Line('  str x12, [x2, #432]');
+  Line('  str x13, [x2, #424]');
+  LeaS('rt_asyncpreempt', 'x10');
+  Line('  str x10, [x2, #440]');
+  Line('.asgu_ret:');
+  Line('  ret');
+  { rt_asyncinit, at the start: the pasasync table by its starts, as on
+    amd64 }
+  Line('rt_asyncinit:');
+  Line('  ldr x9, =__start_pasasync');
+  Line('  ldr x10, =__stop_pasasync');
+  Line('  cbz x9, .aaix_none');
+  Line('  cmp x10, x9');
+  Line('  b.ls .aaix_none');
+  Line('  add x11, x9, #16');
+  Line('.aaix_out:');
+  Line('  cmp x11, x10');
+  Line('  b.hs .aaix_done');
+  Line('  ldp x12, x13, [x11]');
+  Line('  mov x14, x11');
+  Line('.aaix_in:');
+  Line('  cmp x14, x9');
+  Line('  b.ls .aaix_put');
+  Line('  ldp x15, x16, [x14, #-16]');
+  Line('  cmp x15, x12');
+  Line('  b.ls .aaix_put');
+  Line('  stp x15, x16, [x14]');
+  Line('  sub x14, x14, #16');
+  Line('  b .aaix_in');
+  Line('.aaix_put:');
+  Line('  stp x12, x13, [x14]');
+  Line('  add x11, x11, #16');
+  Line('  b .aaix_out');
+  Line('.aaix_done:');
+  LeaS('rt_asynclo', 'x11');
+  Line('  str x9, [x11]');
+  LeaS('rt_asynchi', 'x11');
+  Line('  str x10, [x11]');
+  Line('.aaix_none:');
+  Line('  ret');
+  Line('  .ltorg');
 end;
 
 procedure TEmitter.EmitXxh3X86;
@@ -41444,6 +42136,13 @@ begin
   Line('  bl rt_sigone');
   Line('  mov x0, #8');
   Line('  bl rt_sigone');
+  { SIGURG, the preemption request (P293) }
+  Line('  mov x0, #23');
+  LeaS('rt_sigactu', 'x1');
+  Line('  mov x2, xzr');
+  Line('  mov x3, #8');
+  Line('  mov x8, #134');
+  Line('  svc #0');
   Line('  ldr x30, [sp], #16');
   Line('  ret');
   Line('rt_sigone:');
@@ -45388,10 +46087,31 @@ begin
   Line('  bl rt_retake');
   LeaS('rt_allm', 'x1');
   Line('  add x1, x1, x22, lsl #7');
+  { a routine still poisoned since the last tick: SIGURG to its M,
+    while it runs (P293) }
   Line('.sm_preempt:');
   Line('  ldr x0, [x1, #16]');
   Line('  cbz x0, .sm_next');
   Imm('x9', Int64($fffffffffffffade));
+  Line('  ldr x10, [x0, #16]');
+  Line('  cmp x10, x9');
+  Line('  b.ne .sm_poison');
+  { PASLANG_ASYNCPREEMPTOFF: no signal (pasheap's HAsyncOff) }
+  LdS('rt_heapstate+544', 'x10');
+  Line('  cbnz x10, .sm_next');
+  Line('  add x10, x1, #120');
+  Line('  ldar x10, [x10]');
+  Line('  cbnz x10, .sm_next');
+  Line('  ldr x11, [x1, #80]');
+  Line('  cbz x11, .sm_next');
+  Line('  mov x8, #172');
+  Line('  svc #0');
+  Line('  mov x1, x11');
+  Line('  mov x2, #23');
+  Line('  mov x8, #131');
+  Line('  svc #0');
+  Line('  b .sm_next');
+  Line('.sm_poison:');
   Line('  str x9, [x0, #16]');
   Line('.sm_next:');
   Line('  add x22, x22, #1');
@@ -45572,6 +46292,8 @@ begin
   Line('  svc #0');
   LeaS('rt_allm', 'x9');
   Line('  str x0, [x9, #80]');
+  { the table of code where a signal may stop a routine (P293) }
+  Line('  bl rt_asyncinit');
   Line('  bl rt_ncpu');
   StS('x0', 'rt_nproc');
   LeaS('rt_heap', 'x0');
@@ -45715,6 +46437,7 @@ begin
   Line('  ldr x30, [x28, #240]');
   Line('  ret');
   EmitYieldPointArm;
+  EmitAsyncPreemptArm;
   Line('rt_newstack:');
   Line('  stp x29, x30, [sp, #-16]!');
   Line('  mov x29, sp');

@@ -93,7 +93,13 @@ for target in ("amd64", "arm64"):
             ("syscallroots", "handoff", b"pending syscall handoff and genuine deadlock passed", {}),
             ("connwait", "connect", b"connect EINTR, spurious wake and name deadline passed",
              {"CONNWAIT_DNS": "1"})):
-        injected = dict(stress, **extra)
+        # No signal stops a routine under gdb (PASLANG_ASYNCPREEMPTOFF, P293),
+        # as Go's own tests set GODEBUG=asyncpreemptoff=1 where a signal
+        # would disturb what they look at (runtime/crash_unix_test.go):
+        # SIGURG, which gdb passes on without stopping, reached gdb through
+        # QEMU's stub as an event of its own, gdb resumed the target under
+        # the script, and the script found it running (7 runs of 40).
+        injected = dict(stress, PASLANG_ASYNCPREEMPTOFF="1", **extra)
         binary = work / f"{name}-{target}-40"
         commands = ["gdb", "-batch", "-nx", "-q", "-ex", "set debuginfod enabled off",
                     "-ex", "set pagination off", "-ex", "set language c", str(binary)]

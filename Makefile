@@ -299,6 +299,9 @@ GOLDEN_A64 += framefield
 # P292: a range test is one unsigned compare.
 GOLDEN += rangetest
 GOLDEN_A64 += rangetest
+# P293: a loop that does not count is preempted by a signal, as Go's.
+GOLDEN += asyncspin asyncgc
+GOLDEN_A64 += asyncspin asyncgc
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -2239,6 +2242,20 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	test $$(awk '/^p_bits:/,/cfi_endproc/' $(BUILDDIR)/rangetest.s | grep -cE '^  (ja|jbe|seta|setbe) ') -eq 13 || { echo "rangetest.s: Bits has not 13 ranges in one compare"; exit 1; }; \
 	test $$(awk '/^p_narrow:/,/cfi_endproc/' $(BUILDDIR)/rangetest.s | grep -cE '^  (ja|jbe) ') -eq 8 || { echo "rangetest.s: Narrow has not 8 ranges in one compare"; exit 1; }; \
 	echo ok rangetest-asm; \
+	: a loop tests nothing at its passes, one CPU still runs the other routines, the collector stops a loop by a signal and reads its registers, and the pasasync table holds routines only, each past its stack check, P293; \
+	test $$(awk '/^p_spin:/,/cfi_endproc/' $(BUILDDIR)/asyncspin.s | grep -c 'cmpq 16(%r14)') -le 1 || { echo "asyncspin.s: Spin tests the guard in its loop"; exit 1; }; \
+	taskset -c 0 timeout 60 $(BUILDDIR)/asyncspin > $(BUILDDIR)/asyncspin-1.got; \
+	diff -u testdata/asyncspin.out $(BUILDDIR)/asyncspin-1.got; \
+	for w in "" "taskset -c 0"; do \
+	  PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 $$w timeout 300 $(BUILDDIR)/asyncgc > $(BUILDDIR)/asyncgc-gc.got; \
+	  diff -u testdata/asyncgc.out $(BUILDDIR)/asyncgc-gc.got; \
+	done; \
+	python3 -I scripts/check_pasasync.py $(BUILDDIR)/asyncgc; \
+	python3 -I scripts/check_pasasync.py $(BUILDDIR)/sysguid; \
+	: PASLANG_ASYNCPREEMPTOFF=1 stops nothing by a signal, so the wait of Walker never ends and the cycle waits for it, as under the asyncpreemptoff of Go; \
+	rc=0; PASLANG_ASYNCPREEMPTOFF=1 PASLANG_GCSTRESS=1 timeout 5 $(BUILDDIR)/asyncgc > /dev/null 2>&1 || rc=$$?; \
+	test $$rc -eq 124 || { echo "asyncgc: PASLANG_ASYNCPREEMPTOFF=1 still stops Walker (exit $$rc)"; exit 1; }; \
+	echo ok async-asm; \
 	: a function of one expression goes in as its expression, P266: the output of every routine a call, and Branchy one compare and one jump with no call of Less; \
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/exprinline0 testdata/exprinline.paslang; \
 	$(BUILDDIR)/exprinline0 > $(BUILDDIR)/exprinline0.got; \
@@ -3263,8 +3280,8 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	grep -qE 'ldrb w(19|2[0-8]), \[x(19|2[0-8]), x(19|2[0-8])' $(BUILDDIR)/armregs-digits-arm.s || { echo "armregs-arm.s: Digits does not load into its variable"; exit 1; }; \
 	grep -qE 'sub x[0-9]+, x(19|2[0-8]), #48$$' $(BUILDDIR)/armregs-digits-arm.s || { echo "armregs-arm.s: Digits copies b before its range test (P290, P292)"; exit 1; }; \
 	grep -qE 'add (x(19|2[0-8])), \1, #1$$' $(BUILDDIR)/armregs-digits-arm.s || { echo "armregs-arm.s: Digits does not step k in place"; exit 1; }; \
-	if awk '/p2align 5/{l=1} l{print} l&&/cmp sp, x10/{exit}' $(BUILDDIR)/armregs-digits-arm.s | grep -qE 'mov x[01], x(19|2[0-8])$$'; then echo "armregs-arm.s: the loop of Digits copies a kept register into x0 or x1"; exit 1; fi; \
-	grep -q 'cmp sp, x10' $(BUILDDIR)/armregs-digits-arm.s || { echo "armregs-arm.s: the loop moves sp to compare it"; exit 1; }; \
+	if awk '/p2align 5/{l=1} l{print} l&&/csel x26/{exit}' $(BUILDDIR)/armregs-digits-arm.s | grep -qE 'mov x[01], x(19|2[0-8])$$'; then echo "armregs-arm.s: the loop of Digits copies a kept register into x0 or x1"; exit 1; fi; \
+	if awk '/p2align 5/{l=1} l{print} l&&/csel x26/{exit}' $(BUILDDIR)/armregs-digits-arm.s | grep -q 'x28, #16'; then echo "armregs-arm.s: the loop of Digits tests the guard (P293)"; exit 1; fi; \
 	awk '/^p_imms:/,/cfi_endproc/' $(BUILDDIR)/armregs-arm.s | grep -qE 'sub x(19|2[0-8]), x(19|2[0-8]), #1, lsl #12' || { echo "armregs-arm.s: Imms does not take 4096 as an immediate"; exit 1; }; \
 	awk '/^p_cmps:/,/cfi_endproc/' $(BUILDDIR)/armregs-arm.s | grep -qE 'cmn x(19|2[0-8]), #4095' || { echo "armregs-arm.s: Cmps does not compare -4095 with cmn"; exit 1; }; \
 	awk '/^p_loads:/,/cfi_endproc/' $(BUILDDIR)/armregs-arm.s | grep -qE 'and x[0-9]+, x(19|2[0-8]), #0x0*3f' || { echo "armregs-arm.s: Loads does not mask i where it lives"; exit 1; }; \
@@ -3274,6 +3291,17 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	test $$(awk '/^p_bits:/,/cfi_endproc/' $(BUILDDIR)/rangetest-arm.s | grep -cE 'b[.](hi|ls) |cset x0, (hi|ls)') -eq 13 || { echo "rangetest-arm.s: Bits has not 13 ranges in one compare"; exit 1; }; \
 	test $$(awk '/^p_narrow:/,/cfi_endproc/' $(BUILDDIR)/rangetest-arm.s | grep -cE 'b[.](hi|ls) ') -eq 8 || { echo "rangetest-arm.s: Narrow has not 8 ranges in one compare"; exit 1; }; \
 	echo ok rangetest-arm-asm; \
+	test $$(awk '/^p_spin:/,/cfi_endproc/' $(BUILDDIR)/asyncspin-arm.s | grep -c 'x28, #16') -le 1 || { echo "asyncspin-arm.s: Spin tests the guard in its loop"; exit 1; }; \
+	taskset -c 0 timeout 120 $(QEMU_A64) $(BUILDDIR)/asyncspin-arm > $(BUILDDIR)/asyncspin-arm-1.got; \
+	diff -u testdata/asyncspin.out $(BUILDDIR)/asyncspin-arm-1.got; \
+	for w in "" "taskset -c 0"; do \
+	  PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 $$w timeout 600 $(QEMU_A64) $(BUILDDIR)/asyncgc-arm > $(BUILDDIR)/asyncgc-arm-gc.got; \
+	  diff -u testdata/asyncgc.out $(BUILDDIR)/asyncgc-arm-gc.got; \
+	done; \
+	python3 -I scripts/check_pasasync.py $(BUILDDIR)/asyncgc-arm; \
+	rc=0; PASLANG_ASYNCPREEMPTOFF=1 PASLANG_GCSTRESS=1 timeout 15 $(QEMU_A64) $(BUILDDIR)/asyncgc-arm > /dev/null 2>&1 || rc=$$?; \
+	test $$rc -eq 124 || { echo "asyncgc-arm: PASLANG_ASYNCPREEMPTOFF=1 still stops Walker (exit $$rc)"; exit 1; }; \
+	echo ok async-arm-asm; \
 	$(OUTDIR)/paslangc -target arm64 -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/exprinline0-arm testdata/exprinline.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/exprinline0-arm > $(BUILDDIR)/exprinline0-arm.got; \
 	diff -u testdata/exprinline.out $(BUILDDIR)/exprinline0-arm.got; \

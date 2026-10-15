@@ -2298,13 +2298,20 @@ the loop. The counter stops on the limit and never passes it, so
 the counter holds the limit, and a loop that does not run leaves it as
 it was, as in FPC. The counter may be a `var` parameter or a variable
 a closure shares, and so may the variable of `for x in` (1.0.135; the
-loop wrote over the address it holds). A `for` whose body calls nothing and holds no other
-loop checks for preemption once every 1024 passes, not at each one.
-So does a `while` or a `repeat` that counts (1.1.137): its condition,
+loop wrote over the address it holds). No loop tests for preemption at
+its passes (1.1.147): a signal stops a routine that runs too long
+wherever it is (§19). A `for` whose body calls nothing and holds no
+other loop still runs in runs of 1024 passes, where the indexes it
+proves need no check, and so does a `while` or a `repeat` that counts
+(1.1.137): its condition,
 or the first test of a `while`'s `and` or of a `repeat`'s `or`,
 compares an integer variable with a limit no pass changes, and the
 body, with no loop and no `continue` in it, steps that variable towards
 the limit by a constant of 1 to 1023 once a pass, at its top level.
+A loop keeps a variable of its routine in a register; a global only in
+the main block, and only one no routine names: another routine may
+write it while the loop runs, and the loop reads it from memory at every
+pass (1.1.147).
 A `for` of a constant count of four passes or fewer with a small body
 that neither changes its counter nor takes its address is written out
 once per pass with the pass's value in the counter's place, then the
@@ -2531,8 +2538,9 @@ inline: Big stays a call: measures 88 against -inline 40
 ```
 
 **Routines that call nothing.** A routine whose body makes no call and
-holds no loop (a loop's preemption test is a call) and no `asm`, with a
-frame of 1 KiB or less, starts with no stack check (1.1.142): its
+no `asm`, with a frame of 1 KiB or less, starts with no stack check
+(1.1.142; one with a loop too since 1.1.147, its loops tested since
+then by nothing): its
 caller's check left 2 KiB below the caller's frame, as Go makes such a
 function NOSPLIT. A function of that kind with no locals whose body is
 `Result :=` one expression is a leaf when the expression is made of
@@ -11539,10 +11547,21 @@ G is in a register (`r14` on amd64, `x28` on arm64) and every routine
 has its own stack that grows on demand: each routine entry checks the
 stack and calls the runtime when it needs more. A system monitor thread
 marks a long-running routine every 10 ms, and the scheduler takes it
-off its M at its next routine entry or loop head; a `for` whose body
-calls nothing and holds no other loop asks once every 1024 passes, and
-so does a `while` or a `repeat` that counts (§4). An
-`asm` block has neither and runs to its end, so every word of the core
+off its M at its next routine entry; one still marked 10 ms later, a
+loop that calls nothing, gets the signal `SIGURG` on its thread, which
+stops it at the instruction it is at, keeps every register, the flags
+and the vector registers on its stack, and parks it (1.1.147, as Go's
+asynchronous preemption does), and a cycle of the collector stops its
+routines the same way. So no loop tests anything at its passes. A
+routine is stopped so only in code paslangc compiled with no `asm` in
+it, outside the runtime's own units (`pasheap`, `pasroutines`,
+`pasdebug`), past the test of the stack at a routine's entry, while it
+runs and holds no runtime lock (`PASLANG_ASYNCPREEMPTOFF=1`, below,
+turns it off): a program that
+installs its own `SIGURG` handler takes this away, and on arm64 `x18`
+is the runtime's as the routine comes back, so inline assembly must not
+keep a value there. An
+`asm` block is never stopped and runs to its end, so every word of the core
 units gives its kernel at most 64 KiB a call, and a routine working on
 a large value is taken off between two: the scans of JSON and UTF-8
 (`PasJsonIndex`, `PasUtf8Valid`, `PasUtf8Feed`; 1.1.119, P269), the
@@ -11654,6 +11673,13 @@ pointer a map left out shows the same way; it also moves every stack
 after each cycle and fills the old one with $de. `HeapStat(11)` counts
 those blocks, `HeapStat(12)` the frames whose map did not fit and
 `HeapStat(13)` the stacks moved, grown or asked to.
+`PASLANG_ASYNCPREEMPTOFF=1` stops no routine by a signal, as Go's
+`GODEBUG=asyncpreemptoff=1`: a loop that calls nothing then holds its
+thread until it ends, and a cycle of the collector and the routines
+waiting for that thread wait for it, for ever when the loop waits for
+another routine to write (testdata/asyncgc's Walker does); a debugger
+that relays every signal, as gdb does through QEMU's stub, has no
+`SIGURG` to relay.
 
 Some words look at the program from inside, for tests and debuggers,
 and DWARF line numbers are always emitted:
