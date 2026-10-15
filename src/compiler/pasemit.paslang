@@ -573,6 +573,7 @@ type
     function FieldTypAt(T, Off: LongInt; const N: string): LongInt;
     function LoadTyp(E: PExpr): LongInt;
     function IntRange(E: PExpr; out Lo, Hi: Int64): Boolean;
+    function FrameField(E: PExpr; out Off: Int64; out Global: Boolean; out GLab: string): Boolean;
     function IndexInRange(E: PExpr; Lo, Hi: Int64): Boolean;
     function SameExpr(A, B: PExpr): Boolean;
     function InPlaceMem(Dest, E: PExpr): Boolean;
@@ -24618,6 +24619,43 @@ begin
   Result := '(%' + PtrReg(P, D) + ')';
 end;
 
+{ E is a field of a record in the frame, at any depth of fields (P291):
+  Off is its offset from the frame pointer, the record's own slot plus
+  the fields' offsets. A local (Result too) not by reference, not in a
+  closure's box, not in a register; Global says it is a global record
+  instead, Off then from its label (GLab). }
+function TEmitter.FrameField(E: PExpr; out Off: Int64; out Global: Boolean;
+  out GLab: string): Boolean;
+var
+  s: TSym;
+  p: PExpr;
+begin
+  Result := False;
+  Off := 0;
+  Global := False;
+  GLab := '';
+  p := E;
+  while (p <> nil) and (p^.Kind = ekField) do
+  begin
+    if (p^.L = nil) or (TKind(p^.L^.Typ) <> tykRecord) then
+      Exit;
+    Off := Off + p^.Off;
+    p := p^.L;
+  end;
+  if (p = nil) or (p^.Kind <> ekVar) or (not TryFindSym(p^.Name, s)) then
+    Exit;
+  if s.ByRef or (s.Up <> 0) or (s.Reg <> '') or s.Boxed then
+    Exit;
+  if s.Global then
+  begin
+    Global := True;
+    GLab := VarLabel(s.Name);
+  end
+  else
+    Off := Off + s.Off;
+  Result := Fits32(Off);
+end;
+
 { The place E addressed from pool register D (and D+1 for an index). On
   amd64 the result is a memory operand, its base the register of a
   pointer a region keeps when there is one; on arm64 the address is left
@@ -24635,7 +24673,8 @@ end;
 
 function TEmitter.EmitWordMem(E: PExpr; D: LongInt): string;
 var
-  r, idx, lenop, lenlab, ok, ok2, preg, lreg, lenR, glab, bs: string;
+  r, idx, lenop, lenlab, ok, ok2, preg, lreg, lenR, glab, bs, reclab: string;
+  recglob: Boolean;
   td: TTypeDef;
   esz, sh, lk, asz: LongInt;
   disp, k, lenk, lenoff: Int64;
@@ -24699,6 +24738,29 @@ begin
           begin
             WmSet(ByRefReg(E^.L), '', 0, E^.Off);
             Result := '[' + ByRefReg(E^.L) + ', #' + IntToStr(E^.Off) + ']';
+            Exit;
+          end;
+        end;
+        { a field of a record in the frame, at any depth of fields, is
+          the load's or the store's own operand: an offset from rbp, or
+          from x29 within LDUR's and STUR's -256 to 255 (ARM DDI 0487 M.c
+          C6.2.259, C6.2.446); a global record's field is its label plus
+          the offset on amd64. The record's address was formed again for
+          every field (P291). }
+        if FrameField(E, foff, recglob, reclab) then
+        begin
+          if not FArm then
+          begin
+            if recglob then
+              Result := GlobOff(reclab, foff) + '(%rip)'
+            else
+              Result := IntToStr(foff) + '(%rbp)';
+            Exit;
+          end;
+          if (not recglob) and (foff >= -256) and (foff <= 255) then
+          begin
+            WmSet('x29', '', 0, foff);
+            Result := '[x29, #' + IntToStr(foff) + ']';
             Exit;
           end;
         end;

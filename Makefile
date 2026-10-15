@@ -292,6 +292,10 @@ GOLDEN_A64 += bceprove
 # P290: arm64 works on a register variable where it lives.
 GOLDEN += armregs
 GOLDEN_A64 += armregs
+# P291: a field of a local record is read and written from the frame
+# pointer.
+GOLDEN += framefield
+GOLDEN_A64 += framefield
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -2225,6 +2229,9 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  if awk "/^p_$$f:/,/cfi_endproc/" $(BUILDDIR)/bceprove.s | grep -q rt_boundsfail; then echo "bceprove.s: $$f checks an index it proved"; exit 1; fi; \
 	done; \
 	echo ok bceprove-asm; \
+	: a field of a record in the frame is its load or store operand from rbp, the record not formed again, P291; \
+	test $$(awk '/^p_near:/,/cfi_endproc/' $(BUILDDIR)/framefield.s | grep -c 'leaq -[0-9]*(%rbp)') -le 1 || { echo "framefield.s: Near forms its record's address for its fields"; exit 1; }; \
+	echo ok framefield-asm; \
 	: a function of one expression goes in as its expression, P266: the output of every routine a call, and Branchy one compare and one jump with no call of Less; \
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/exprinline0 testdata/exprinline.paslang; \
 	$(BUILDDIR)/exprinline0 > $(BUILDDIR)/exprinline0.got; \
@@ -3255,6 +3262,8 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	awk '/^p_cmps:/,/cfi_endproc/' $(BUILDDIR)/armregs-arm.s | grep -qE 'cmn x(19|2[0-8]), #4095' || { echo "armregs-arm.s: Cmps does not compare -4095 with cmn"; exit 1; }; \
 	awk '/^p_loads:/,/cfi_endproc/' $(BUILDDIR)/armregs-arm.s | grep -qE 'and x[0-9]+, x(19|2[0-8]), #0x0*3f' || { echo "armregs-arm.s: Loads does not mask i where it lives"; exit 1; }; \
 	echo ok armregs-arm-asm; \
+	if awk '/^p_near:/,/cfi_endproc/' $(BUILDDIR)/framefield-arm.s | grep -qE 'sub x(9|1[0-7]), x29'; then echo "framefield-arm.s: Near forms its record's address for its fields"; exit 1; fi; \
+	echo ok framefield-arm-asm; \
 	$(OUTDIR)/paslangc -target arm64 -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/exprinline0-arm testdata/exprinline.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/exprinline0-arm > $(BUILDDIR)/exprinline0-arm.got; \
 	diff -u testdata/exprinline.out $(BUILDDIR)/exprinline0-arm.got; \
