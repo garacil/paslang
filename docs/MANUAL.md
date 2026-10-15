@@ -628,7 +628,12 @@ Boolean with an integer, so it is a compile error that says to write
 `(x and 4) = 4`.
 
 `and`, `or`, `xor` and `not` work on two Booleans (a Boolean `and` and
-`or` short-circuit) or on the bits of two integers. The logic family
+`or` short-circuit) or on the bits of two integers. A test of one value
+against both ends of a constant range, `(c >= '0') and (c <= '9')` or
+`(b < 48) or (b > 57)`, constants on either side and `<` or `<=` alike,
+is worked out as one subtraction and one compare without sign
+(1.1.146), as Go's compiler does; the value is read once, which is all
+the two tests would read, since neither side may call. The logic family
 adds four words, on Booleans and integers alike:
 
 | Operator | Is | `12 op 10` |

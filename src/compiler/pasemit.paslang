@@ -786,6 +786,9 @@ type
     procedure LeafReg(const N, R: string; Dw: LongInt; const Proc, EndLab: string);
     procedure EmitLeaf(const Pr: TProc; St: PStmt);
     function HasAsm(S: PStmt): Boolean;
+    function CmpConst(C: PExpr; out X: PExpr; out Op: TBinOp; out K: Int64): Boolean;
+    function RangeTest(E: PExpr; out X: PExpr; out Lo, Hi: Int64; out Inside: Boolean): Boolean;
+    procedure RangeCmp(X: PExpr; Lo, Hi: Int64);
     procedure EmitProc(const Pr: TProc);
     procedure LoadGlobals(const Prog: TProgram);
     procedure EmitRuntime;
@@ -6016,6 +6019,199 @@ begin
   Result := CondJmp(E, Target, True);
 end;
 
+{ C compares an ordinal expression with a constant (P292): X op K, a
+  constant on the left turned round. }
+function TEmitter.CmpConst(C: PExpr; out X: PExpr; out Op: TBinOp; out K: Int64): Boolean;
+var
+  a, b: PExpr;
+  t: LongInt;
+begin
+  Result := False;
+  X := nil;
+  Op := boEq;
+  K := 0;
+  if (C = nil) or (C^.Kind <> ekBin) or (C^.L = nil) or (C^.R = nil) then
+    Exit;
+  if (C^.Bin <> boLt) and (C^.Bin <> boLe) and (C^.Bin <> boGt) and (C^.Bin <> boGe) then
+    Exit;
+  a := C^.L;
+  b := C^.R;
+  Op := C^.Bin;
+  if (a^.Kind = ekInt) or ((a^.Kind = ekStr) and (Length(a^.Txt) = 1)) then
+  begin
+    a := C^.R;
+    b := C^.L;
+    case Op of
+      boLt: Op := boGt;
+      boLe: Op := boGe;
+      boGt: Op := boLt;
+    else
+      Op := boLe;
+    end;
+  end;
+  if b^.Kind = ekInt then
+    K := b^.Num
+  else if (b^.Kind = ekStr) and (Length(b^.Txt) = 1) then
+    K := Ord(b^.Txt[1])
+  else
+    Exit;
+  if (a^.Kind = ekInt) or (a^.Kind = ekStr) then
+    Exit;
+  t := a^.Typ;
+  if not (IsIntId(t) or (t = TyChar) or (TKind(t) = tykEnum) or (TKind(t) = tykSubrange)) then
+    Exit;
+  X := a;
+  Result := True;
+end;
+
+{ E is a test of one value against both ends of a constant range (P292),
+  as Go's generic.rules see it (src/cmd/compile/internal/ssa/_gen,
+  "signed integer range"): c <= x and x <= d is x in Lo..Hi (Inside),
+  x < c or x > d is x out of Lo..Hi; < and > take the next value in.
+  The same X on both sides (SameExpr: no call in it), Lo <= Hi, and
+  Hi - Lo within an Int64, so that x - Lo compared without sign with
+  Hi - Lo is the whole test. }
+function TEmitter.RangeTest(E: PExpr; out X: PExpr; out Lo, Hi: Int64;
+  out Inside: Boolean): Boolean;
+var
+  xa, xb: PExpr;
+  oa, ob: TBinOp;
+  ka, kb: Int64;
+  hasLo, hasHi: Boolean;
+
+  { the side x op k as a bound: lower or upper end of the range inside
+    (and), or the first value outside below or above (or) }
+  function Bound(Op: TBinOp; K: Int64): Boolean;
+  begin
+    Result := False;
+    if E^.Bin = boAnd then
+      case Op of
+        boGe: begin if hasLo then Exit; Lo := K; hasLo := True; end;
+        boGt: begin if hasLo or (K = High(Int64)) then Exit; Lo := K + 1; hasLo := True; end;
+        boLe: begin if hasHi then Exit; Hi := K; hasHi := True; end;
+      else
+        begin if hasHi or (K = Low(Int64)) then Exit; Hi := K - 1; hasHi := True; end;
+      end
+    else
+      case Op of
+        boLt: begin if hasLo then Exit; Lo := K; hasLo := True; end;
+        boLe: begin if hasLo or (K = High(Int64)) then Exit; Lo := K + 1; hasLo := True; end;
+        boGt: begin if hasHi then Exit; Hi := K; hasHi := True; end;
+      else
+        begin if hasHi or (K = Low(Int64)) then Exit; Hi := K - 1; hasHi := True; end;
+      end;
+    Result := True;
+  end;
+
+begin
+  Result := False;
+  X := nil;
+  Lo := 0;
+  Hi := 0;
+  Inside := False;
+  if (E = nil) or (E^.Kind <> ekBin) or (E^.Typ <> TyBoolean) or
+    ((E^.Bin <> boAnd) and (E^.Bin <> boOr)) then
+    Exit;
+  if not (CmpConst(E^.L, xa, oa, ka) and CmpConst(E^.R, xb, ob, kb)) then
+    Exit;
+  if not SameExpr(xa, xb) then
+    Exit;
+  hasLo := False;
+  hasHi := False;
+  if not (Bound(oa, ka) and Bound(ob, kb)) then
+    Exit;
+  if (not hasLo) or (not hasHi) or (Lo > Hi) then
+    Exit;
+  if (Lo < 0) and (Hi > High(Int64) + Lo) then
+    Exit;
+  X := xa;
+  Inside := E^.Bin = boAnd;
+  Result := True;
+end;
+
+{ x - Lo, then one compare without sign with Hi - Lo (P292): the flags
+  say below or same for x in Lo..Hi, above for x out of it (jbe, ja;
+  b.ls, b.hi). x's register is read where it is: lea or sub from it. }
+procedure TEmitter.RangeCmp(X: PExpr; Lo, Hi: Int64);
+var
+  s: TSym;
+  op, src: string;
+begin
+  if FArm then
+  begin
+    if (X^.Kind = ekVar) and PlainOrd(X, s) and (s.Reg <> '') then
+      src := s.Reg
+    else if (X^.Kind = ekVar) and PlainOrd(X, s) then
+    begin
+      LoadPlain(s, 'x0');
+      src := 'x0';
+    end
+    else
+    begin
+      EmitExpr(X);
+      src := 'x0';
+    end;
+    if Lo <> 0 then
+    begin
+      if ArmAddImm(Lo) <> '' then
+        Line('  sub x0, ' + src + ', ' + ArmAddImm(Lo))
+      else if (Lo < 0) and (Lo > Low(Int64)) and (ArmAddImm(-Lo) <> '') then
+        Line('  add x0, ' + src + ', ' + ArmAddImm(-Lo))
+      else
+      begin
+        LoadImmR('x1', Lo);
+        Line('  sub x0, ' + src + ', x1');
+      end;
+      src := 'x0';
+    end;
+    if ArmAddImm(Hi - Lo) <> '' then
+      Line('  cmp ' + src + ', ' + ArmAddImm(Hi - Lo))
+    else
+    begin
+      LoadImmR('x1', Hi - Lo);
+      Line('  cmp ' + src + ', x1');
+    end;
+    Exit;
+  end;
+  if (X^.Kind = ekVar) and PlainOrd(X, s) then
+  begin
+    if Lo = 0 then
+      op := MemA(s)
+    else if (s.Reg <> '') and Fits32(-Lo) then
+    begin
+      Line('  leaq ' + IntToStr(-Lo) + '(%' + s.Reg + '), %rax');
+      op := '%rax';
+    end
+    else
+    begin
+      LoadPlain(s, 'rax');
+      op := '%rax';
+    end;
+  end
+  else
+  begin
+    EmitExpr(X);
+    op := '%rax';
+  end;
+  if (Lo <> 0) and not ((X^.Kind = ekVar) and PlainOrd(X, s) and (s.Reg <> '') and Fits32(-Lo)) then
+  begin
+    if Fits32(Lo) then
+      Line('  subq $' + IntToStr(Lo) + ', %rax')
+    else
+    begin
+      LoadImmR('rcx', Lo);
+      Line('  subq %rcx, %rax');
+    end;
+  end;
+  if Fits32(Hi - Lo) then
+    Line('  cmpq $' + IntToStr(Hi - Lo) + ', ' + op)
+  else
+  begin
+    LoadImmR('rcx', Hi - Lo);
+    Line('  cmpq %rcx, ' + op);
+  end;
+end;
+
 { A condition as branches to Target, taken when it holds (WhenTrue) or
   when it fails: an integer comparison is one compare and one branch; a
   Boolean and, or and not are their sides' branches with short circuit
@@ -6028,8 +6224,10 @@ function TEmitter.CondJmp(E: PExpr; const Target: string; WhenTrue: Boolean): Bo
 var
   ls, rs: TSym;
   cc, past, lr: string;
-  a, b: PExpr;
+  a, b, rx: PExpr;
   op: TBinOp;
+  rlo, rhi: Int64;
+  rin: Boolean;
 begin
   Result := False;
   if (E <> nil) and (E^.Kind = ekInt) then
@@ -6055,6 +6253,25 @@ begin
   if (E <> nil) and (E^.Kind = ekBin) and ((E^.Bin = boAnd) or (E^.Bin = boOr)) and
     (E^.Typ = TyBoolean) and (E^.L <> nil) and (E^.R <> nil) then
   begin
+    { a range's two ends: one compare without sign and one branch
+      (P292) }
+    if RangeTest(E, rx, rlo, rhi, rin) then
+    begin
+      RangeCmp(rx, rlo, rhi);
+      if rin = WhenTrue then
+      begin
+        if FArm then
+          Line('  b.ls ' + Target)
+        else
+          Line('  jbe ' + Target);
+      end
+      else if FArm then
+        Line('  b.hi ' + Target)
+      else
+        Line('  ja ' + Target);
+      Result := True;
+      Exit;
+    end;
     if (E^.Bin = boAnd) <> WhenTrue then
     begin
       CondBranch(E^.L, Target, WhenTrue);
@@ -18540,6 +18757,9 @@ var
   i, nreg, nuser, ntot, ns: SizeInt;
   a, b: string;
   off, soff: LongInt;
+  rx: PExpr;
+  rlo, rhi: Int64;
+  rin: Boolean;
 begin
   if E = nil then
   begin
@@ -19219,6 +19439,15 @@ else if E^.Name = 'rt_high' then
           if FCheckPtr and (TKind(E^.Typ) = tykPointer) and
             ((E^.Bin = boAdd) or (E^.Bin = boSub)) then
             EmitPtrArith(E)
+          else if RangeTest(E, rx, rlo, rhi, rin) then
+          begin
+            { a range's two ends as a value: one compare and a cset (P292) }
+            RangeCmp(rx, rlo, rhi);
+            if rin then
+              Line('  cset x0, ls')
+            else
+              Line('  cset x0, hi');
+          end
           else if ((E^.Bin = boAnd) or (E^.Bin = boOr)) and (E^.Typ = TyBoolean) then
           begin
             a := Lab;
@@ -20195,6 +20424,16 @@ else if E^.Name = 'rt_high' then
           Line('  popq %rsi');
           Line('  movq %r8, %rdx');
           Line('  call rt_concat');
+        end
+        else if RangeTest(E, rx, rlo, rhi, rin) then
+        begin
+          { a range's two ends as a value: one compare and a set (P292) }
+          RangeCmp(rx, rlo, rhi);
+          if rin then
+            Line('  setbe %al')
+          else
+            Line('  seta %al');
+          Line('  movzbq %al, %rax');
         end
         else if ((E^.Bin = boAnd) or (E^.Bin = boOr)) and (E^.Typ = TyBoolean) then
         begin

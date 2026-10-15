@@ -296,6 +296,9 @@ GOLDEN_A64 += armregs
 # pointer.
 GOLDEN += framefield
 GOLDEN_A64 += framefield
+# P292: a range test is one unsigned compare.
+GOLDEN += rangetest
+GOLDEN_A64 += rangetest
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -2177,7 +2180,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(BUILDDIR)/condjump0 > $(BUILDDIR)/condjump0.got; \
 	diff -u testdata/condjump.out $(BUILDDIR)/condjump0.got; \
 	awk '/^p_digit:/,/ret$$/' $(BUILDDIR)/condjump.s > $(BUILDDIR)/condjump-digit.s; \
-	grep -q 'cmpq $$48, ' $(BUILDDIR)/condjump-digit.s && grep -q '^  jl ' $(BUILDDIR)/condjump-digit.s && grep -q '^  jg ' $(BUILDDIR)/condjump-digit.s || { echo "condjump.s: Digit's condition is not two compares and two jumps"; exit 1; }; \
+	grep -qE 'subq [$$]48, |leaq -48[(]' $(BUILDDIR)/condjump-digit.s && grep -q 'cmpq $$9, ' $(BUILDDIR)/condjump-digit.s && test $$(grep -cE '^  j(l|g|le|ge|a|be) ' $(BUILDDIR)/condjump-digit.s) -eq 1 || { echo "condjump.s: Digit's range is not one subtraction, one compare without sign and one jump (P292)"; exit 1; }; \
 	if grep -q '^  set' $(BUILDDIR)/condjump-digit.s; then echo "condjump.s: Digit's condition makes a Boolean"; exit 1; fi; \
 	echo ok condjump; \
 	: the address of a var or const parameter in a register a run, P282: the sums under the stress of the collector, and every field read and written from that register, none from a pool register loaded from the slot; \
@@ -2232,6 +2235,10 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	: a field of a record in the frame is its load or store operand from rbp, the record not formed again, P291; \
 	test $$(awk '/^p_near:/,/cfi_endproc/' $(BUILDDIR)/framefield.s | grep -c 'leaq -[0-9]*(%rbp)') -le 1 || { echo "framefield.s: Near forms its record's address for its fields"; exit 1; }; \
 	echo ok framefield-asm; \
+	: a test of both ends of a range is one compare without sign, two ranges whose span overflows keep their compares, P292; \
+	test $$(awk '/^p_bits:/,/cfi_endproc/' $(BUILDDIR)/rangetest.s | grep -cE '^  (ja|jbe|seta|setbe) ') -eq 13 || { echo "rangetest.s: Bits has not 13 ranges in one compare"; exit 1; }; \
+	test $$(awk '/^p_narrow:/,/cfi_endproc/' $(BUILDDIR)/rangetest.s | grep -cE '^  (ja|jbe) ') -eq 8 || { echo "rangetest.s: Narrow has not 8 ranges in one compare"; exit 1; }; \
+	echo ok rangetest-asm; \
 	: a function of one expression goes in as its expression, P266: the output of every routine a call, and Branchy one compare and one jump with no call of Less; \
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/exprinline0 testdata/exprinline.paslang; \
 	$(BUILDDIR)/exprinline0 > $(BUILDDIR)/exprinline0.got; \
@@ -3210,7 +3217,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/condjump0-arm > $(BUILDDIR)/condjump0-arm.got; \
 	diff -u testdata/condjump.out $(BUILDDIR)/condjump0-arm.got; \
 	awk '/^p_digit:/,/ret$$/' $(BUILDDIR)/condjump-arm.s > $(BUILDDIR)/condjump-digit-arm.s; \
-	grep -qE 'cmp x[0-9]+, #48' $(BUILDDIR)/condjump-digit-arm.s && grep -q 'b.lt ' $(BUILDDIR)/condjump-digit-arm.s && grep -q 'b.gt ' $(BUILDDIR)/condjump-digit-arm.s || { echo "condjump-arm.s: Digit's condition is not two compares and two branches"; exit 1; }; \
+	grep -qE 'sub x[0-9]+, x[0-9]+, #48' $(BUILDDIR)/condjump-digit-arm.s && grep -qE 'cmp x[0-9]+, #9$$' $(BUILDDIR)/condjump-digit-arm.s && test $$(grep -cE 'b[.](lt|gt|le|ge|hi|ls) ' $(BUILDDIR)/condjump-digit-arm.s) -eq 1 || { echo "condjump-arm.s: Digit's range is not one subtraction, one compare without sign and one branch (P292)"; exit 1; }; \
 	if grep -q 'cset' $(BUILDDIR)/condjump-digit-arm.s; then echo "condjump-arm.s: Digit's condition makes a Boolean"; exit 1; fi; \
 	for f in sum sumwhile sumconst bump; do \
 	  awk "/^p_$$f:/,/ret\$$/" $(BUILDDIR)/varparts-arm.s > $(BUILDDIR)/varparts-$$f-arm.s; \
@@ -3254,7 +3261,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	: a variable a register keeps is loaded, compared, stepped and masked where it lives, with the immediates arm64 takes, P290; \
 	awk '/^p_digits:/,/cfi_endproc/' $(BUILDDIR)/armregs-arm.s > $(BUILDDIR)/armregs-digits-arm.s; \
 	grep -qE 'ldrb w(19|2[0-8]), \[x(19|2[0-8]), x(19|2[0-8])' $(BUILDDIR)/armregs-digits-arm.s || { echo "armregs-arm.s: Digits does not load into its variable"; exit 1; }; \
-	grep -qE 'cmp x(19|2[0-8]), #48' $(BUILDDIR)/armregs-digits-arm.s || { echo "armregs-arm.s: Digits copies before it compares"; exit 1; }; \
+	grep -qE 'sub x[0-9]+, x(19|2[0-8]), #48$$' $(BUILDDIR)/armregs-digits-arm.s || { echo "armregs-arm.s: Digits copies b before its range test (P290, P292)"; exit 1; }; \
 	grep -qE 'add (x(19|2[0-8])), \1, #1$$' $(BUILDDIR)/armregs-digits-arm.s || { echo "armregs-arm.s: Digits does not step k in place"; exit 1; }; \
 	if awk '/p2align 5/{l=1} l{print} l&&/cmp sp, x10/{exit}' $(BUILDDIR)/armregs-digits-arm.s | grep -qE 'mov x[01], x(19|2[0-8])$$'; then echo "armregs-arm.s: the loop of Digits copies a kept register into x0 or x1"; exit 1; fi; \
 	grep -q 'cmp sp, x10' $(BUILDDIR)/armregs-digits-arm.s || { echo "armregs-arm.s: the loop moves sp to compare it"; exit 1; }; \
@@ -3264,6 +3271,9 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	echo ok armregs-arm-asm; \
 	if awk '/^p_near:/,/cfi_endproc/' $(BUILDDIR)/framefield-arm.s | grep -qE 'sub x(9|1[0-7]), x29'; then echo "framefield-arm.s: Near forms its record's address for its fields"; exit 1; fi; \
 	echo ok framefield-arm-asm; \
+	test $$(awk '/^p_bits:/,/cfi_endproc/' $(BUILDDIR)/rangetest-arm.s | grep -cE 'b[.](hi|ls) |cset x0, (hi|ls)') -eq 13 || { echo "rangetest-arm.s: Bits has not 13 ranges in one compare"; exit 1; }; \
+	test $$(awk '/^p_narrow:/,/cfi_endproc/' $(BUILDDIR)/rangetest-arm.s | grep -cE 'b[.](hi|ls) ') -eq 8 || { echo "rangetest-arm.s: Narrow has not 8 ranges in one compare"; exit 1; }; \
+	echo ok rangetest-arm-asm; \
 	$(OUTDIR)/paslangc -target arm64 -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/exprinline0-arm testdata/exprinline.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/exprinline0-arm > $(BUILDDIR)/exprinline0-arm.got; \
 	diff -u testdata/exprinline.out $(BUILDDIR)/exprinline0-arm.got; \
