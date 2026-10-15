@@ -205,6 +205,13 @@ type
   { One flag per word of a type: the word holds a heap pointer (P95a). }
   TGcBits = array of Boolean;
 
+  { A for's counter that only its loop writes, and the range its
+    constant limits give it in the body (P289). }
+  TCtrFact = record
+    Name: string;
+    Lo, Hi: Int64;
+  end;
+
   { Where a local lives in a register, for its DWARF location list. }
   TLocRange = record
     Proc: string;
@@ -334,6 +341,7 @@ type
     FMainLine: LongInt;
     FOwnLine: array of LongInt;
     FLocRanges: array of TLocRange;
+    FCtrFacts: array of TCtrFact;
     FStubs: string;         { the slow paths of a promoted loop's checks, placed after it }
     FLastIns: string;       { the last instruction emitted, when nothing that a jump reaches came after it (P96) }
     FTextSec: Boolean;      { the section Line writes into holds code (P267) }
@@ -564,6 +572,7 @@ type
     procedure DwarfBase(T: LongInt; const N: string; Enc, Size: LongInt);
     function FieldTypAt(T, Off: LongInt; const N: string): LongInt;
     function LoadTyp(E: PExpr): LongInt;
+    function IntRange(E: PExpr; out Lo, Hi: Int64): Boolean;
     function IndexInRange(E: PExpr; Lo, Hi: Int64): Boolean;
     function SameExpr(A, B: PExpr): Boolean;
     function InPlaceMem(Dest, E: PExpr): Boolean;
@@ -1970,6 +1979,20 @@ begin
     Line('  movq $' + IntToStr(n) + ', %rdx');
     Line('  movq $' + IntToStr(n) + ', %r8');
   end;
+end;
+
+{ K for C = 2^K, -1 when C is not a power of two. }
+function Pow2Log(C: Int64): LongInt;
+var
+  k: LongInt;
+begin
+  Result := -1;
+  if (C <= 0) or ((C and (C - 1)) <> 0) then
+    Exit;
+  k := 0;
+  while (C shr k) <> 1 do
+    Inc(k);
+  Result := k;
 end;
 
 { The routine has Self, the first argument: a method, but a static class
@@ -4473,9 +4496,9 @@ var
   s: TSym;
   td: TTypeDef;
   esz: LongInt;
-  i: LongInt;
+  i, sh: LongInt;
   off: LongInt;
-  ok: string;
+  ok, ix: string;
   wr: Boolean;
 begin
   wr := FAddrWrite;
@@ -4672,27 +4695,45 @@ begin
             EmitAddr(E^.L);
             PshK('x0', 1);
             EmitExpr(E^.R);
-            Imm('x16', td.Lo);
-            Line('  sub x1, x0, x16');
+            { the index from the low bound: x0 itself when that is 0 (P289) }
+            ix := 'x0';
+            if td.Lo <> 0 then
+            begin
+              Imm('x16', td.Lo);
+              Line('  sub x1, x0, x16');
+              ix := 'x1';
+            end;
             ok := Lab;
             if not IndexInRange(E^.R, td.Lo, td.Hi) then
             begin
               if (td.Hi - td.Lo >= 0) and (td.Hi - td.Lo <= 4095) then
-                Line('  cmp x1, #' + IntToStr(td.Hi - td.Lo))
+                Line('  cmp ' + ix + ', #' + IntToStr(td.Hi - td.Lo))
               else
               begin
                 Imm('x17', td.Hi - td.Lo);
-                Line('  cmp x1, x17');
+                Line('  cmp ' + ix + ', x17');
               end;
               Line('  b.ls ' + ok);
               BoundsFailArm('x0', 0, td.Lo, '', td.Hi, 0);
             end;
             Line(ok + ':');
-            Line('  mov x0, x1');
-            Imm('x16', esz);
-            Line('  mul x0, x0, x16');
+            { an element of a power of two is the add's shift, one cycle
+              for a shift of 4 or less on Neoverse N1 where a mul of 64
+              bits takes four (arm-neoverse-n1-sog 3.4, 3.6) }
+            sh := Pow2Log(esz);
+            { the base comes back into x1, where the index lowered by a
+              low bound other than 0 is: that one goes to x0 first }
+            if ix <> 'x0' then
+              Line('  mov x0, ' + ix);
             Ppop('x1');
-            Line('  add x0, x1, x0');
+            if (sh >= 0) and (sh <= 63) then
+              Line('  add x0, x1, x0, lsl #' + IntToStr(sh))
+            else
+            begin
+              Imm('x16', esz);
+              Line('  mul x0, x0, x16');
+              Line('  add x0, x1, x0');
+            end;
           end;
         end;
       ekCall, ekMethod, ekCtor:
@@ -4909,24 +4950,37 @@ begin
           PushK('rax', 1);
           EmitExpr(E^.R);
           ok := Lab;
-          LoadImmR('rcx', td.Lo);
-          Line('  movq %rax, %rdx');
-          Line('  subq %rcx, %rdx');
+          { the index from the low bound: rax itself when that is 0 (P289) }
+          ix := '%rax';
+          if td.Lo <> 0 then
+          begin
+            LoadImmR('rcx', td.Lo);
+            Line('  movq %rax, %rdx');
+            Line('  subq %rcx, %rdx');
+            ix := '%rdx';
+          end;
           if not IndexInRange(E^.R, td.Lo, td.Hi) then
           begin
             if (td.Hi - td.Lo >= 0) and (td.Hi - td.Lo <= 2147483647) then
-              Line('  cmpq $' + IntToStr(td.Hi - td.Lo) + ', %rdx')
+              Line('  cmpq $' + IntToStr(td.Hi - td.Lo) + ', ' + ix)
             else
             begin
               LoadImmR('rcx', td.Hi - td.Lo);
-              Line('  cmpq %rcx, %rdx');
+              Line('  cmpq %rcx, ' + ix);
             end;
             Line('  jbe ' + ok);
             BoundsFailX86('%rax', td.Lo, '', td.Hi, 0);
           end;
           Line(ok + ':');
-          Line('  movq %rdx, %rax');
-          if esz <> 1 then
+          if ix <> '%rax' then
+            Line('  movq %rdx, %rax');
+          { an element of a power of two is a shift, one cycle where imul
+            takes three on Zen 2 (AMD 17h 30h latencies: SHL 1, IMUL
+            reg64 3) }
+          sh := Pow2Log(esz);
+          if sh > 0 then
+            Line('  shlq $' + IntToStr(sh) + ', %rax')
+          else if esz <> 1 then
             Line('  imulq $' + IntToStr(esz) + ', %rax');
           Line('  popq %rcx');
           Line('  addq %rcx, %rax');
@@ -6472,9 +6526,10 @@ procedure TEmitter.EmitFor(S: PStmt);
 var
   vs: TSym;
   top, head, body, test, brk, ftop, fbody, ftest, fillx, oldfill, oldctr: string;
-  strip: Boolean;
+  strip, fact: Boolean;
   proofs: array of TProof;
   fille: PExpr;
+  nf, k: SizeInt;
 begin
   oldfill := FStrFill;
   oldctr := FStrFillCtr;
@@ -6498,6 +6553,34 @@ begin
   EmitExpr(S^.E);
   ForEnter(S, brk);
   vs := FindSym(S^.Name);
+  { P289: limits that are constants bound the counter in the body, when
+    nothing but the loop can write it: a local of this routine whose
+    address nothing takes (a var argument takes it), which the body
+    does not assign and no nested routine can reach }
+  fact := (S^.E <> nil) and (S^.E2 <> nil) and (S^.E^.Kind = ekInt) and
+    (S^.E2^.Kind = ekInt) and (not vs.Global) and (not vs.ByRef) and
+    (vs.Up = 0) and (not vs.Boxed) and (not LocAddrTaken(S^.Name)) and
+    (not WritesVar(S^.Body, S^.Name));
+  if fact then
+    for k := 0 to High(FProgProcs) do
+      if FProgProcs[k].ParentSym = FCurProc then
+        fact := False;
+  nf := Length(FCtrFacts);
+  if fact then
+  begin
+    SetLength(FCtrFacts, nf + 1);
+    FCtrFacts[nf].Name := S^.Name;
+    if S^.E^.Num <= S^.E2^.Num then
+    begin
+      FCtrFacts[nf].Lo := S^.E^.Num;
+      FCtrFacts[nf].Hi := S^.E2^.Num;
+    end
+    else
+    begin
+      FCtrFacts[nf].Lo := S^.E2^.Num;
+      FCtrFacts[nf].Hi := S^.E^.Num;
+    end;
+  end;
   strip := FPromoOn and (FChunkReg <> '') and (vs.Reg <> '') and
     (not HasLoop(S^.Body)) and (not WritesVar(S^.Body, S^.Name));
   JumpCC('', head);
@@ -6572,6 +6655,7 @@ begin
   end;
   Line(brk + ':');
   PopLoop;
+  SetLength(FCtrFacts, nf);
   FStrFill := oldfill;
   FStrFillCtr := oldctr;
 end;
@@ -6699,7 +6783,9 @@ begin
     else if (TKind(E^.L^.Typ) = tykArray) and not IsStr(E^.L^.Typ) then
     begin
       td := FTypes[E^.L^.Typ];
-      if (td.Hi >= td.Lo) and Fits32(td.Hi - td.Lo) and Fits32(c - td.Lo) then
+      { an index proved already (P289) needs no test at the run's head }
+      if (td.Hi >= td.Lo) and Fits32(td.Hi - td.Lo) and Fits32(c - td.Lo) and
+        not IndexInRange(E^.R, td.Lo, td.Hi) then
       begin
         arr := '';
         p.Lo := td.Lo;
@@ -17777,14 +17863,157 @@ begin
   end;
 end;
 
-{ Every value E can take lies in Lo..Hi, so a static array's index check
-  cannot fail (P100): E of a narrow integer type, whose values are always
-  clean, or a Char. A subrange or an enumeration may hold any value, so
-  they keep the check. }
-function TEmitter.IndexInRange(E: PExpr; Lo, Hi: Int64): Boolean;
+{ P289: every value E can take lies in Lo..Hi, as Go's prove pass bounds
+  a value by its operation (cmd/compile/internal/ssacompile/prove.go:
+  flowLimit, modLimit, the facts of And). Only what holds however
+  anything else runs: a value worked out into a register (x and K with K
+  not negative, x mod K, x shr K), the width of a narrow type, a
+  constant, and a for's counter that nothing but its loop can write
+  (FCtrFacts). A subrange or an enumeration may hold any value, so its
+  type gives no range. }
+function TEmitter.IntRange(E: PExpr; out Lo, Hi: Int64): Boolean;
 var
   t: LongInt;
-  c: Int64;
+  a, b, c, d, k, tl, th: Int64;
+  i: SizeInt;
+  ok, ty: Boolean;
+begin
+  Result := False;
+  Lo := 0;
+  Hi := 0;
+  if E = nil then
+    Exit;
+  if E^.Kind = ekInt then
+  begin
+    Lo := E^.Num;
+    Hi := E^.Num;
+    Result := True;
+    Exit;
+  end;
+  if E^.Kind = ekVar then
+    for i := High(FCtrFacts) downto 0 do
+      if SameSym(FCtrFacts[i].Name, E^.Name) then
+      begin
+        Lo := FCtrFacts[i].Lo;
+        Hi := FCtrFacts[i].Hi;
+        Result := True;
+        Exit;
+      end;
+  { the type's width: a narrow value is always clean (P100) }
+  ty := False;
+  tl := 0;
+  th := 0;
+  t := LoadTyp(E);
+  if IsNarrowId(t) then
+  begin
+    ty := True;
+    tl := FTypes[t].Lo;
+    th := FTypes[t].Hi;
+  end
+  else if t = TyChar then
+  begin
+    ty := True;
+    tl := 0;
+    th := 255;
+  end;
+  { the operation's, in 64 bits: a narrow one wraps in its width, which
+    the type's range already bounds }
+  ok := False;
+  if (TSize(E^.Typ) = 8) and (TKind(E^.Typ) = tykInteger) and (E^.Kind = ekBin) and
+    (E^.L <> nil) and (E^.R <> nil) then
+    case E^.Bin of
+      boAnd:
+        begin
+          { x and y lies in 0..y for a y not negative, whatever x is }
+          if IntRange(E^.L, a, b) and (a >= 0) then
+          begin
+            ok := True;
+            Lo := 0;
+            Hi := b;
+          end;
+          if IntRange(E^.R, c, d) and (c >= 0) then
+          begin
+            if (not ok) or (d < Hi) then
+              Hi := d;
+            ok := True;
+            Lo := 0;
+          end;
+        end;
+      boMod:
+        if (E^.R^.Kind = ekInt) and (E^.R^.Num <> 0) and (E^.R^.Num <> Low(Int64)) then
+        begin
+          k := Abs(E^.R^.Num);
+          { the sign of the dividend, as Go's %: modLimit }
+          ok := True;
+          if IntRange(E^.L, a, b) and (a >= 0) then
+          begin
+            Lo := 0;
+            Hi := k - 1;
+            if b < Hi then
+              Hi := b;
+          end
+          else
+          begin
+            Lo := -(k - 1);
+            Hi := k - 1;
+          end;
+        end;
+      boShr:
+        { a logical shift of 64 bits (shrq, lsr): EmitOrdBinAmd and Arm }
+        if (E^.R^.Kind = ekInt) and (E^.R^.Num >= 1) and (E^.R^.Num <= 63) then
+        begin
+          ok := True;
+          if IntRange(E^.L, a, b) and (a >= 0) then
+          begin
+            Lo := a shr E^.R^.Num;
+            Hi := b shr E^.R^.Num;
+          end
+          else
+          begin
+            Lo := 0;
+            Hi := High(Int64) shr (E^.R^.Num - 1);
+          end;
+        end;
+      boAdd, boSub:
+        if IntRange(E^.L, a, b) and IntRange(E^.R, c, d) and
+          (a >= -(Int64(1) shl 61)) and (b <= Int64(1) shl 61) and
+          (c >= -(Int64(1) shl 61)) and (d <= Int64(1) shl 61) then
+        begin
+          ok := True;
+          if E^.Bin = boAdd then
+          begin
+            Lo := a + c;
+            Hi := b + d;
+          end
+          else
+          begin
+            Lo := a - d;
+            Hi := b - c;
+          end;
+        end;
+    end;
+  if ok and ty then
+  begin
+    if tl > Lo then
+      Lo := tl;
+    if th < Hi then
+      Hi := th;
+  end
+  else if ty then
+  begin
+    Lo := tl;
+    Hi := th;
+  end;
+  Result := ok or ty;
+end;
+
+{ Every value E can take lies in Lo..Hi, so a static array's index check
+  cannot fail (P100): E of a narrow integer type, whose values are always
+  clean, or a Char, and since P289 any range IntRange proves. A subrange
+  or an enumeration may hold any value, so they keep the check. }
+function TEmitter.IndexInRange(E: PExpr; Lo, Hi: Int64): Boolean;
+var
+  c, a, b: Int64;
   i: SizeInt;
 begin
   Result := False;
@@ -17799,12 +18028,10 @@ begin
         Result := True;
         Exit;
       end;
-  { The stored type: Ord(c) of a Char still loads a byte. }
-  t := LoadTyp(E);
-  if IsNarrowId(t) then
-    Result := (FTypes[t].Lo >= Lo) and (FTypes[t].Hi <= Hi)
-  else if t = TyChar then
-    Result := (Lo <= 0) and (Hi >= 255);
+  { The stored type (Ord(c) of a Char still loads a byte), an operation
+    that bounds its value, a constant, a counter (P289). }
+  if IntRange(E, a, b) then
+    Result := (a >= Lo) and (b <= Hi);
 end;
 
 { A and B name the same place or value, with no call in them, so working
@@ -23402,19 +23629,6 @@ begin
   end;
   M := q;
   Sh := s;
-end;
-
-function Pow2Log(C: Int64): LongInt;
-var
-  k: LongInt;
-begin
-  Result := -1;
-  if (C <= 0) or ((C and (C - 1)) <> 0) then
-    Exit;
-  k := 0;
-  while (C shr k) <> 1 do
-    Inc(k);
-  Result := k;
 end;
 
 function TEmitter.DivConstOK(E: PExpr): Boolean;
@@ -35909,6 +36123,7 @@ begin
       FExtVars[High(FExtVars)] := ToLower(GlobName(Prog.Vars[i]));
     end;
   FLocRanges := nil;
+  FCtrFacts := nil;
   FAddrNames := nil;
   FAddrKept := nil;
   FLocAddr := nil;

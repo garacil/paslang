@@ -11708,6 +11708,19 @@ of at least 1 to `Length(s)` of a string variable whose body only
 stores `s[i]` from values that call nothing checks `s` once before the
 loop, making its characters its own, and its stores check nothing: the
 loop can neither change the length nor share the string (1.1.1).
+An index of a static array whose every value lies in its bounds is not
+checked (1.1.143), as Go's compiler proves it: `x and K` with `K` not
+negative lies in `0..K`, `x mod K` in `0..K - 1` when `x` cannot be
+negative (and in `-(K - 1)..K - 1` otherwise), `x shr K` of an
+`Integer` in `0..2^(64 - K) - 1`, a `Byte`, `Word`, `Char` or other
+narrow value in its type's range, a sum or difference of those in the
+sum of their ranges, and the counter of a `for` from a constant to a
+constant in those two, when only the loop can write it (a local of the
+routine whose address nothing takes, not given to a `var` parameter,
+not assigned in the body, in a routine with no nested routine). So
+`fns[i and 63]` of an `array[0..63]` and `h[(i and 15) + 1]` of an
+`array[1..16]` cost no check, while `a[i and 127]` of the first, or
+`a[(i and 63) + 1]`, still stops the program at its line.
 
 The domain errors of the calculation set (`ln`, `log`, `power`,
 `arcsin`, `arccos`, `arcsec`, `arccsc`, `arccosh`, `arctanh`, `lnxp1`)
