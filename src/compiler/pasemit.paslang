@@ -770,6 +770,12 @@ type
     procedure EmitUnitLife(const Prog: TProgram);
     function IsDwarfInt(const S: TSym): Boolean;
     procedure EmitDwarfLocals;
+    function LeafWord(T: LongInt): Boolean;
+    function LeafE(E: PExpr; const Par: TStrArray): Boolean;
+    function LeafProc(const Pr: TProc; out St: PStmt): Boolean;
+    procedure LeafReg(const N, R: string; Dw: LongInt; const Proc, EndLab: string);
+    procedure EmitLeaf(const Pr: TProc; St: PStmt);
+    function HasAsm(S: PStmt): Boolean;
     procedure EmitProc(const Pr: TProc);
     procedure LoadGlobals(const Prog: TProgram);
     procedure EmitRuntime;
@@ -24086,7 +24092,7 @@ end;
 
 function TEmitter.EmitWordMem(E: PExpr; D: LongInt): string;
 var
-  r, idx, lenop, lenlab, ok, ok2, preg, lreg, lenR, glab: string;
+  r, idx, lenop, lenlab, ok, ok2, preg, lreg, lenR, glab, bs: string;
   td: TTypeDef;
   esz, sh, lk, asz: LongInt;
   disp, k, lenk, lenoff: Int64;
@@ -24153,8 +24159,11 @@ begin
             Exit;
           end;
         end;
+        { an object a register keeps (a leaf's Self, a loop's variable)
+          is the base where it is, as amd64's PtrReg (P288) }
+        bs := r;
         if TKind(E^.L^.Typ) = tykClass then
-          EmitOrdTo(E^.L, D)
+          bs := PtrReg(E^.L, D)
         else
           EmitWordBase(E^.L, D);
         if not FArm then
@@ -24167,17 +24176,19 @@ begin
         if (E^.Off > 0) and ((asz = 1) or (asz = 2) or (asz = 4) or (asz = 8)) and
           (E^.Off mod asz = 0) and (E^.Off div asz <= 4095) then
         begin
-          WmSet(r, '', 0, E^.Off);
-          Result := '[' + r + ', #' + IntToStr(E^.Off) + ']';
+          WmSet(bs, '', 0, E^.Off);
+          Result := '[' + bs + ', #' + IntToStr(E^.Off) + ']';
           Exit;
         end;
         if (E^.Off > 0) and (E^.Off <= 4095) then
-          Line('  add ' + r + ', ' + r + ', #' + IntToStr(E^.Off))
+          Line('  add ' + r + ', ' + bs + ', #' + IntToStr(E^.Off))
         else if E^.Off <> 0 then
         begin
           Imm('x17', E^.Off);
-          Line('  add ' + r + ', ' + r + ', x17');
-        end;
+          Line('  add ' + r + ', ' + bs + ', x17');
+        end
+        else if bs <> r then
+          Line('  mov ' + r + ', ' + bs);
       end;
     ekIndex:
       begin
@@ -25086,6 +25097,255 @@ begin
   Line('  bl rt_boundsfail');
 end;
 
+{ A word value a register holds whole (P288): an 8-byte integer,
+  enumeration, subrange, pointer or class. }
+function TEmitter.LeafWord(T: LongInt): Boolean;
+var
+  k: TTypeKind;
+begin
+  k := TKind(T);
+  Result := (TSize(T) = 8) and ((k = tykInteger) or (k = tykEnum) or
+    (k = tykSubrange) or (k = tykPointer) or (k = tykClass));
+end;
+
+{ P288: E is what a leaf works out in registers: constants, the
+  routine's own word parameters (Par), a word field of a class
+  parameter, joined by the operators that call nothing and check
+  nothing (+, -, *, and, or, xor, shl, shr, unary - and not). No index
+  (its check calls rt_boundsfail), no division (its check), no call. }
+function TEmitter.LeafE(E: PExpr; const Par: TStrArray): Boolean;
+var
+  i: SizeInt;
+begin
+  Result := False;
+  if E = nil then
+    Exit;
+  case E^.Kind of
+    ekInt:
+      Result := True;
+    ekVar:
+      for i := 0 to High(Par) do
+        if SameSym(Par[i], E^.Name) then
+          Result := True;
+    ekField:
+      Result := (E^.L <> nil) and (E^.L^.Kind = ekVar) and
+        (TKind(E^.L^.Typ) = tykClass) and LeafWord(E^.Typ) and LeafE(E^.L, Par);
+    ekUn:
+      Result := ((E^.Un = uoNeg) or (E^.Un = uoNot)) and (TSize(E^.Typ) = 8) and
+        (TKind(E^.Typ) = tykInteger) and LeafE(E^.L, Par);
+    ekBin:
+      Result := ((E^.Bin = boAdd) or (E^.Bin = boSub) or (E^.Bin = boMul) or
+        (E^.Bin = boAnd) or (E^.Bin = boOr) or (E^.Bin = boXor) or
+        (E^.Bin = boShl) or (E^.Bin = boShr)) and (TSize(E^.Typ) = 8) and
+        (TKind(E^.Typ) = tykInteger) and LeafE(E^.L, Par) and LeafE(E^.R, Par);
+  end;
+end;
+
+{ P288: Pr is a leaf of one statement, St, Result := E: a function of
+  word parameters passed by value (Self too), at most three on amd64
+  (rdi, rsi and rdx: the expression pool from r8 on does not reach
+  them, and the operators of LeafE take only rax for a wide constant
+  and rcx for a shift's count) and eight on arm64 (x0 to x7; the pool
+  is x9 and up), with E of LeafE, no local, no nested routine, no
+  closure's cell, and no -debug (whose hook is a call at every
+  statement) or -checkptr. It calls nothing and keeps nothing in
+  memory, so it needs no stack check (its caller's left 2 KB below its
+  frame), no frame and no stack map, as Go makes a function that calls
+  nothing and whose frame is under StackSmall NOSPLIT, and gives one
+  without locals no base pointer (cmd/internal/obj/x86/obj6.go,
+  preprocess). Called once the routine's symbols are in FSym, which
+  OrdSimple reads. }
+function TEmitter.LeafProc(const Pr: TProc; out St: PStmt): Boolean;
+var
+  i, n: SizeInt;
+  s: PStmt;
+  par: TStrArray;
+begin
+  Result := False;
+  St := nil;
+  if FDebug or FCheckPtr or (Pr.Nest > 0) or Pr.IsCtor or Pr.RecCtor or
+    (not Pr.IsFunc) or Pr.Boxing or (Length(Pr.Shared) > 0) or
+    (Length(Pr.Pins) > 0) or (Length(Pr.Locals) > 0) or (Pr.Body = nil) then
+    Exit;
+  for i := 0 to High(FProgProcs) do
+    if FProgProcs[i].ParentSym = Pr.Sym then
+      Exit;
+  if not LeafWord(Pr.RetTyp) then
+    Exit;
+  n := Length(Pr.Params) + Ord(HasSelf(Pr));
+  if (FArm and (n > 8)) or ((not FArm) and (n > 3)) then
+    Exit;
+  par := nil;
+  if HasSelf(Pr) then
+  begin
+    SetLength(par, 1);
+    par[0] := 'self';
+  end;
+  for i := 0 to High(Pr.Params) do
+  begin
+    if Pr.Params[i].ByRef or not LeafWord(Pr.Params[i].Typ) then
+      Exit;
+    SetLength(par, Length(par) + 1);
+    par[High(par)] := Pr.Params[i].Name;
+  end;
+  s := Pr.Body;
+  if s^.Kind = skBlock then
+  begin
+    if Length(s^.Stmts) <> 1 then
+      Exit;
+    s := s^.Stmts[0];
+  end;
+  if (s = nil) or (s^.Kind <> skAssign) or (s^.E = nil) then
+    Exit;
+  if s^.Dest = nil then
+  begin
+    if not (SameSym(s^.Name, 'result') or SameSym(s^.Name, Pr.Name)) then
+      Exit;
+  end
+  else if (s^.Dest^.Kind <> ekVar) or not (SameSym(s^.Dest^.Name, 'result') or
+    SameSym(s^.Dest^.Name, Pr.Name)) then
+    Exit;
+  if not LeafE(s^.E, par) then
+    Exit;
+  if FArm then
+  begin
+    if not OrdSimple(s^.E, 0) then
+      Exit;
+  end
+  else if not OrdSimple(s^.E, 2) then
+    Exit;
+  St := s;
+  Result := True;
+end;
+
+{ The parameter N of the routine being emitted lives in register R, DWARF
+  register Dw, from the routine's label to EndLab: the whole of a leaf
+  (P288). }
+procedure TEmitter.LeafReg(const N, R: string; Dw: LongInt; const Proc, EndLab: string);
+var
+  i, j: SizeInt;
+begin
+  for i := High(FSym) downto 0 do
+    if (not FSym[i].Global) and (FSym[i].Up = 0) and SameSym(FSym[i].Name, N) then
+    begin
+      FSym[i].Reg := R;
+      j := Length(FLocRanges);
+      SetLength(FLocRanges, j + 1);
+      FLocRanges[j].Proc := Proc;
+      FLocRanges[j].Off := FSym[i].Off;
+      FLocRanges[j].Dw := Dw;
+      FLocRanges[j].B := Proc;
+      FLocRanges[j].E := EndLab;
+      Exit;
+    end;
+end;
+
+{ A leaf's body (P288): its parameters stay in the registers they came
+  in (DWARF 5, 4 and 1 for rdi, rsi and rdx; 0 to 7 for x0 to x7), where
+  the debugger reads them; the expression is worked out in the pool past
+  them, a constant, a parameter or a field straight into rax or x0. The
+  CFA stays the stack pointer at the call, as .cfi_startproc says. }
+procedure TEmitter.EmitLeaf(const Pr: TProc; St: PStmt);
+var
+  i, k: SizeInt;
+  e1, m: string;
+  s: TSym;
+  E: PExpr;
+begin
+  e1 := Lab;
+  Line('  .cfi_startproc');
+  k := 0;
+  if HasSelf(Pr) then
+  begin
+    if FArm then
+      LeafReg('self', 'x0', 0, Pr.Sym, e1)
+    else
+      LeafReg('self', 'rdi', 5, Pr.Sym, e1);
+    k := 1;
+  end;
+  for i := 0 to High(Pr.Params) do
+  begin
+    if FArm then
+      LeafReg(Pr.Params[i].Name, 'x' + IntToStr(k), LongInt(k), Pr.Sym, e1)
+    else if k = 0 then
+      LeafReg(Pr.Params[i].Name, 'rdi', 5, Pr.Sym, e1)
+    else if k = 1 then
+      LeafReg(Pr.Params[i].Name, 'rsi', 4, Pr.Sym, e1)
+    else
+      LeafReg(Pr.Params[i].Name, 'rdx', 1, Pr.Sym, e1);
+    Inc(k);
+  end;
+  EmitLoc(St^.Line);
+  E := St^.E;
+  if E^.Kind = ekInt then
+  begin
+    if FArm then
+      Imm('x0', E^.Num)
+    else
+      LoadImmR('rax', E^.Num);
+  end
+  else if E^.Kind = ekVar then
+  begin
+    if not WordVar(E, s) then
+      Die('internal error: leaf operand ' + E^.Name);
+    if FArm then
+    begin
+      if s.Reg <> 'x0' then
+        Line('  mov x0, ' + s.Reg);
+    end
+    else
+      Line('  movq %' + s.Reg + ', %rax');
+  end
+  else if E^.Kind = ekField then
+  begin
+    if FArm then
+    begin
+      m := EmitWordMem(E, 0);
+      WordLoad(m, LoadTyp(E), 'x0');
+    end
+    else
+    begin
+      m := EmitWordMem(E, 2);
+      WordLoad(m, LoadTyp(E), 'rax');
+    end;
+  end
+  else if FArm then
+  begin
+    EmitOrdTo(E, 0);
+    Line('  mov x0, ' + OrdPool(0));
+  end
+  else
+  begin
+    EmitOrdTo(E, 2);
+    Line('  movq %' + OrdPool(2) + ', %rax');
+  end;
+  Line('  ret');
+  Line(e1 + ':');
+  Line('  .cfi_endproc');
+end;
+
+{ S has an asm statement somewhere: its text may call (P288). }
+function TEmitter.HasAsm(S: PStmt): Boolean;
+var
+  i: SizeInt;
+begin
+  Result := False;
+  if S = nil then
+    Exit;
+  Result := True;
+  if S^.Kind = skAsm then
+    Exit;
+  if HasAsm(S^.ThenSt) or HasAsm(S^.ElseSt) or HasAsm(S^.Body) then
+    Exit;
+  for i := 0 to High(S^.Stmts) do
+    if HasAsm(S^.Stmts[i]) then
+      Exit;
+  for i := 0 to High(S^.Arms) do
+    if HasAsm(S^.Arms[i].Body) then
+      Exit;
+  Result := False;
+end;
+
 procedure TEmitter.EmitProc(const Pr: TProc);
 var
   i, j, n, nargs, slot, parentN, own, nlim, k: SizeInt;
@@ -25103,6 +25363,9 @@ var
   savedTD: array of LongInt;
   savedTR: array of Boolean;
   loc0, loc1: SizeInt;
+  leaf: Boolean;
+  lst: PStmt;
+  ck0, ck1, ms0: SizeInt;
 begin
   saved := FSym;
   savedResName := FResName;
@@ -25280,6 +25543,8 @@ begin
   FStubs := '';
   FResReg := '';
   FCurProc := Pr.Sym;
+  lst := nil;
+  leaf := (not sysw) and LeafProc(Pr, lst);
   { the names whose address this routine or one nested in it takes }
   savedAddr := FAddrNames;
   FAddrNames := nil;
@@ -25333,9 +25598,14 @@ begin
   if (Pr.Nest = 0) and (not Pr.IsExt) then
     Line('.globl ' + Pr.Sym);
   Line(Pr.Sym + ':');
-  if not sysw then
+  ck0 := FLen;
+  ms0 := Length(FMapSites);
+  if (not sysw) and not leaf then
     EmitStackCheck(Pr.Sym, FFrameSym);
-  if FArm then
+  ck1 := FLen;
+  if leaf then
+    EmitLeaf(Pr, lst)
+  else if FArm then
   begin
     Line('  .cfi_startproc');
     Line('  stp x29, x30, [sp, #-16]!');
@@ -25477,6 +25747,22 @@ begin
     Line('  .cfi_def_cfa %rsp, 8');
     Line('  ret');
     Line('  .cfi_endproc');
+  end;
+  { A body that calls nothing, its one call site the check's, has no
+    loop either (every loop's test calls rt_morestack): it runs to its
+    end in a few instructions and keeps no more than its frame below its
+    caller's, whose check left 2 KB there; a frame of up to 1 KB needs
+    no check of its own, as Go makes a leaf under StackSmall NOSPLIT
+    (cmd/internal/obj/x86/obj6.go, preprocess). The check's text goes,
+    and its site. Not an asm statement's body, whose text may call. }
+  if (not sysw) and (not leaf) and (Length(FMapSites) = ms0 + 1) and
+    (FMapSites[ms0].Kind = 1) and
+    (((LongInt(slot) + FScratchMax + 15) and (-16)) <= 1024) and
+    not HasAsm(Pr.Body) then
+  begin
+    Move(FOut[ck1 + 1], FOut[ck0 + 1], FLen - ck1);
+    FLen := FLen - (ck1 - ck0);
+    SetLength(FMapSites, ms0);
   end;
 
   if not sysw then

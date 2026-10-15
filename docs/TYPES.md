@@ -854,7 +854,11 @@ slot compares uninitialized high bits (`SameId` on `WriteLn` failed).
 on amd64 and on arm64. `paslinux` `Sys0`…`Sys4` are Pascal wrappers
 around it. A wrapper whose body is only `Result := Syscall(...)` skips
 the `morestack` prologue and the 2 KiB scratch frame, so `fork` and
-`wait4` do not grow or preempt mid-call. `Amd64` is 1 on GNU/Linux amd64
+`wait4` do not grow or preempt mid-call. A routine whose body calls
+nothing and holds no loop skips the `morestack` test too (1.1.142): its
+frame, 1 KiB at most, fits the 2 KiB its caller's test left; a leaf of
+one `Result :=` expression has no frame at all, its parameters in the
+argument registers (rdi, rsi, rdx; x0 to x7), its value in rax or x0. `Amd64` is 1 on GNU/Linux amd64
 and 0 on arm64, so one source can pick the syscall number.
 The numeric constants in `paslinux` are the amd64 numbers. There is
 no assembler in that unit.

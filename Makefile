@@ -282,6 +282,10 @@ GOLDEN_A64 += strone
 # kept.
 GOLDEN += slicefront
 GOLDEN_A64 += slicefront
+# P288: a small leaf routine has no stack check and no frame, and a
+# routine that calls nothing no stack check.
+GOLDEN += leafcall
+GOLDEN_A64 += leafcall
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -1041,6 +1045,14 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  $(BUILDDIR)/dwarfquad > $(BUILDDIR)/dwarfquad.gdb 2>&1; \
 	grep -q '^.1 = 0.333333333333333333333333333333333317$$' $(BUILDDIR)/dwarfquad.gdb; \
 	grep -q '^type = _Float128$$' $(BUILDDIR)/dwarfquad.gdb; \
+	: a leaf keeps its parameters in the registers they came in, and the debugger reads them there, P288; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/leafgdb testdata/leafcall.paslang; \
+	gdb -batch -nx -ex 'set debuginfod enabled off' -ex 'break leafcall.paslang:66' \
+	  -ex 'run > /dev/null' -ex 'print A' -ex 'print B' -ex 'print C' -ex kill \
+	  $(BUILDDIR)/leafgdb > $(BUILDDIR)/leafgdb.gdb 2>&1; \
+	grep -q '^.1 = 2$$' $(BUILDDIR)/leafgdb.gdb; \
+	grep -q '^.2 = 3$$' $(BUILDDIR)/leafgdb.gdb; \
+	grep -q '^.3 = 4$$' $(BUILDDIR)/leafgdb.gdb; \
 	echo ok dwarf; \
 	grep -q 'cmpq 16(%r14)' $(BUILDDIR)/opt.s; \
 	grep -A30 '^pas_main:' $(BUILDDIR)/opt.s | grep -q 'call rt_morestack'; \
@@ -1983,7 +1995,8 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q '^CHECKPTR$$' $(BUILDDIR)/safeu.pi; \
 	$(OUTDIR)/paslangc testdata/units/safeu.paslang; \
 	if grep -q '^CHECKPTR$$' $(BUILDDIR)/safeu.pi; then echo "safeu.pi says CHECKPTR without -checkptr"; exit 1; fi; \
-	echo ok checkptr; \
+	echo ok checkptr
+	@set -e; \
 	echo "==== index checks ===="; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/bce_s testdata/bce.paslang; \
 	if sed -n '/^p_table:/,/cfi_endproc/p' $(BUILDDIR)/bce_s.s | grep -q 'call rt_boundsfail'; then echo "bce: p_table kept a bounds check the loop does not need"; exit 1; fi; \
@@ -2193,6 +2206,14 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 $(BUILDDIR)/slicefront nomem > $(BUILDDIR)/slicefront-gc.got; \
 	grep -v '20000 slices' testdata/slicefront.out | diff -u - $(BUILDDIR)/slicefront-gc.got; \
 	echo ok slicefront-gc; \
+	: a leaf has no stack check and no frame, a routine that calls nothing keeps its frame with no check, one that calls keeps both, P288; \
+	for f in twice thrice mix rot big three same konst tshape_area tshape_areak tshape_link; do \
+	  if awk "/^p_$$f:/,/cfi_endproc/" $(BUILDDIR)/leafcall.s | grep -q 'cmpq 16(%r14)\|pushq %rbp'; then echo "leafcall.s: $$f has a stack check or a frame"; exit 1; fi; \
+	done; \
+	awk '/^p_clamp:/,/cfi_endproc/' $(BUILDDIR)/leafcall.s | grep -q 'pushq %rbp' || { echo "leafcall.s: Clamp has no frame"; exit 1; }; \
+	if awk '/^p_clamp:/,/cfi_endproc/' $(BUILDDIR)/leafcall.s | grep -q 'cmpq 16(%r14)'; then echo "leafcall.s: Clamp has a stack check"; exit 1; fi; \
+	awk '/^p_worker:/,/cfi_endproc/' $(BUILDDIR)/leafcall.s | grep -q 'cmpq 16(%r14)' || { echo "leafcall.s: Worker has no stack check"; exit 1; }; \
+	echo ok leafcall-asm; \
 	: a function of one expression goes in as its expression, P266: the output of every routine a call, and Branchy one compare and one jump with no call of Less; \
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/exprinline0 testdata/exprinline.paslang; \
 	$(BUILDDIR)/exprinline0 > $(BUILDDIR)/exprinline0.got; \
@@ -2998,7 +3019,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'paslang: unlock of an unlocked mutex' $(BUILDDIR)/unlockfree.err; \
 	echo ok unlockfree; \
 	echo "==== fatal ===="; \
-	for t in divzero nilptr deep oom oomlimit closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg; do \
+	for t in divzero nilptr deep oom oomlimit closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg leafnil; do \
 	  $(OUTDIR)/paslangc -o $(BUILDDIR)/fatal_$$t testdata/fatal/$$t.paslang; \
 	  set +e; \
 	  if [ $$t = oomlimit ]; then \
@@ -3012,6 +3033,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	done; \
 	grep -q 'paslang: integer divide by zero at line 11' $(BUILDDIR)/fatal_divzero.err; \
 	grep -q 'paslang: nil pointer dereference at line 16' $(BUILDDIR)/fatal_nilptr.err; \
+	grep -q 'paslang: nil pointer dereference at line 14' $(BUILDDIR)/fatal_leafnil.err; \
 	grep -q 'paslang: stack overflow at line 12' $(BUILDDIR)/fatal_deep.err; \
 	grep -q 'paslang: out of memory: [0-9][0-9]* MiB mapped' $(BUILDDIR)/fatal_oom.err; \
 	grep -q 'paslang: out of memory: [0-9][0-9]* MiB mapped' $(BUILDDIR)/fatal_oomlimit.err; \
@@ -3194,6 +3216,13 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 timeout 300 $(QEMU_A64) $(BUILDDIR)/slicefront-arm nomem > $(BUILDDIR)/slicefront-arm-gc.got; \
 	grep -v '20000 slices' testdata/slicefront.out | diff -u - $(BUILDDIR)/slicefront-arm-gc.got; \
 	echo ok slicefront-arm-gc; \
+	for f in twice thrice mix rot big three same konst tshape_area tshape_areak tshape_link; do \
+	  if awk "/^p_$$f:/,/cfi_endproc/" $(BUILDDIR)/leafcall-arm.s | grep -q 'x28, #16\|stp x29, x30'; then echo "leafcall-arm.s: $$f has a stack check or a frame"; exit 1; fi; \
+	done; \
+	awk '/^p_clamp:/,/cfi_endproc/' $(BUILDDIR)/leafcall-arm.s | grep -q 'stp x29, x30' || { echo "leafcall-arm.s: Clamp has no frame"; exit 1; }; \
+	if awk '/^p_clamp:/,/cfi_endproc/' $(BUILDDIR)/leafcall-arm.s | grep -q 'x28, #16'; then echo "leafcall-arm.s: Clamp has a stack check"; exit 1; fi; \
+	awk '/^p_worker:/,/cfi_endproc/' $(BUILDDIR)/leafcall-arm.s | grep -q 'x28, #16' || { echo "leafcall-arm.s: Worker has no stack check"; exit 1; }; \
+	echo ok leafcall-arm-asm; \
 	$(OUTDIR)/paslangc -target arm64 -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/exprinline0-arm testdata/exprinline.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/exprinline0-arm > $(BUILDDIR)/exprinline0-arm.got; \
 	diff -u testdata/exprinline.out $(BUILDDIR)/exprinline0-arm.got; \
@@ -3403,7 +3432,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	grep -q 'paslang: unlock of an unlocked mutex' $(BUILDDIR)/unlockfree-arm.err; \
 	echo ok unlockfree-arm; \
 	echo "==== fatal arm64 ===="; \
-	for t in divzero nilptr deep oom closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg; do \
+	for t in divzero nilptr deep oom closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg leafnil; do \
 	  $(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/fatal_$$t-arm testdata/fatal/$$t.paslang; \
 	  set +e; timeout 60 $(QEMU_A64) $(BUILDDIR)/fatal_$$t-arm > $(BUILDDIR)/fatal_$$t-arm.got 2> $(BUILDDIR)/fatal_$$t-arm.err; rc=$$?; set -e; \
 	  test $$rc -eq 1; \
@@ -3411,6 +3440,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	done; \
 	grep -q 'paslang: integer divide by zero at line 11' $(BUILDDIR)/fatal_divzero-arm.err; \
 	grep -q 'paslang: nil pointer dereference at line 16' $(BUILDDIR)/fatal_nilptr-arm.err; \
+	grep -q 'paslang: nil pointer dereference at line 14' $(BUILDDIR)/fatal_leafnil-arm.err; \
 	grep -q 'paslang: stack overflow at line 12' $(BUILDDIR)/fatal_deep-arm.err; \
 	grep -q 'paslang: out of memory: [0-9][0-9]* MiB mapped' $(BUILDDIR)/fatal_oom-arm.err; \
 	grep -q 'paslang: send on closed channel at line 11' $(BUILDDIR)/fatal_closed-arm.err; \

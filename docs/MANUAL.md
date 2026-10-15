@@ -2524,6 +2524,25 @@ $ paslangc -inline-trace prog.paslang
 inline: Count stays a call: its body has a statement that stays in its own frame (Exit, try, raise, with, pas, select, ReadLn, New, asm), or names a routine as a value, or calls itself
 inline: Big stays a call: measures 88 against -inline 40
 ```
+
+**Routines that call nothing.** A routine whose body makes no call and
+holds no loop (a loop's preemption test is a call) and no `asm`, with a
+frame of 1 KiB or less, starts with no stack check (1.1.142): its
+caller's check left 2 KiB below the caller's frame, as Go makes such a
+function NOSPLIT. A function of that kind with no locals whose body is
+`Result :=` one expression is a leaf when the expression is made of
+constants, its parameters, and fields of an object parameter (`Self`
+too), joined by `+`, `-`, `*`, `and`, `or`, `xor`, `shl`, `shr`, `not`
+and unary `-`, its parameters and result are integers, enumerations,
+subranges, pointers or objects of a word passed by value, and they are
+at most three with `Self` on amd64 and eight on arm64: it has no frame
+either, its parameters stay in the registers they arrive in, and its
+value is worked out in registers and returned. `Twice`, `Result := K *
+2`, runs four instructions where it ran thirteen. A debugger finds a
+leaf's parameters in those registers; a nil object read in a leaf stops
+the program with the leaf's line, as anywhere; under `-debug` every
+routine keeps its frame and its check.
+
 A default value is a constant expression of the parameter's type (an
 integer one converts for a real parameter), `nil` for a pointer, an
 object, a class, a routine value, an interface or a slice, and a
