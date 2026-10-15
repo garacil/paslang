@@ -302,6 +302,9 @@ GOLDEN_A64 += rangetest
 # P293: a loop that does not count is preempted by a signal, as Go's.
 GOLDEN += asyncspin asyncgc
 GOLDEN_A64 += asyncspin asyncgc
+# P294: arithmetic in one instruction where it took several.
+GOLDEN += leaform
+GOLDEN_A64 += leaform
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -2256,6 +2259,17 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	rc=0; PASLANG_ASYNCPREEMPTOFF=1 PASLANG_GCSTRESS=1 timeout 5 $(BUILDDIR)/asyncgc > /dev/null 2>&1 || rc=$$?; \
 	test $$rc -eq 124 || { echo "asyncgc: PASLANG_ASYNCPREEMPTOFF=1 still stops Walker (exit $$rc)"; exit 1; }; \
 	echo ok async-asm; \
+	: c + k * x and y + k * x are one lea, x := x + k * y one lea on the register of x, r13 and rbp are never the base of a lea with an index, and a load at p - k takes the offset, P294; \
+	awk '/^p_off8:/,/cfi_endproc/' $(BUILDDIR)/leaform.s > $(BUILDDIR)/leaform-off8.s; \
+	grep -q 'leaq 8(,%r[a-z0-9]*,8), ' $(BUILDDIR)/leaform-off8.s || { echo "leaform.s: Off8 is not one lea"; exit 1; }; \
+	if grep -qE 'imulq|shlq|addq' $(BUILDDIR)/leaform-off8.s; then echo "leaform.s: Off8 multiplies, shifts or adds"; exit 1; fi; \
+	awk '/^p_base:/,/cfi_endproc/' $(BUILDDIR)/leaform.s | grep -qE 'leaq \(%[a-z0-9]+,%[a-z0-9]+,4\)' || { echo "leaform.s: Base is not one lea"; exit 1; }; \
+	test $$(awk '/^p_loop:/,/cfi_endproc/' $(BUILDDIR)/leaform.s | grep -cE 'leaq \(%[a-z0-9]+,%[a-z0-9]+,[248]\), ') -eq 4 || { echo "leaform.s: the loop of Loop has not four leas"; exit 1; }; \
+	if grep -qE 'leaq [-0-9]*\(%(r13|rbp),%' $(BUILDDIR)/leaform.s; then echo "leaform.s: r13 or rbp is the base of a lea with an index"; exit 1; fi; \
+	awk '/^p_back:/,/cfi_endproc/' $(BUILDDIR)/leaform.s > $(BUILDDIR)/leaform-back.s; \
+	test $$(grep -cE 'movq -(8|16)\(%r(si|di|[0-9]+)\), ' $(BUILDDIR)/leaform-back.s) -eq 2 || { echo "leaform.s: Back does not load at p - 8 and p - 16"; exit 1; }; \
+	if grep -qE 'subq \$$(8|16), ' $(BUILDDIR)/leaform-back.s; then echo "leaform.s: Back subtracts before it loads"; exit 1; fi; \
+	echo ok leaform-asm; \
 	: a function of one expression goes in as its expression, P266: the output of every routine a call, and Branchy one compare and one jump with no call of Less; \
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/exprinline0 testdata/exprinline.paslang; \
 	$(BUILDDIR)/exprinline0 > $(BUILDDIR)/exprinline0.got; \
@@ -3302,6 +3316,21 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	rc=0; PASLANG_ASYNCPREEMPTOFF=1 PASLANG_GCSTRESS=1 timeout 15 $(QEMU_A64) $(BUILDDIR)/asyncgc-arm > /dev/null 2>&1 || rc=$$?; \
 	test $$rc -eq 124 || { echo "asyncgc-arm: PASLANG_ASYNCPREEMPTOFF=1 still stops Walker (exit $$rc)"; exit 1; }; \
 	echo ok async-arm-asm; \
+	: P294 on arm64: c + k * x a move and one add with the shift, y + k * x and x := x + k * y one add, and loads at p - k, p + k and p + i shl s in the load, within the offsets of LDUR and LDR; \
+	awk '/^p_off8:/,/cfi_endproc/' $(BUILDDIR)/leaform-arm.s > $(BUILDDIR)/leaform-off8-arm.s; \
+	grep -qE 'add x[0-9]+, x17, x[0-9]+, lsl #3' $(BUILDDIR)/leaform-off8-arm.s || { echo "leaform-arm.s: Off8 is not a move and one add"; exit 1; }; \
+	if grep -q 'mul ' $(BUILDDIR)/leaform-off8-arm.s; then echo "leaform-arm.s: Off8 multiplies"; exit 1; fi; \
+	awk '/^p_base:/,/cfi_endproc/' $(BUILDDIR)/leaform-arm.s | grep -qE 'add x[0-9]+, x[0-9]+, x[0-9]+, lsl #2' || { echo "leaform-arm.s: Base is not one add"; exit 1; }; \
+	test $$(awk '/^p_loop:/,/cfi_endproc/' $(BUILDDIR)/leaform-arm.s | grep -cE 'add x(19|2[0-6]), x(19|2[0-6]), x(19|2[0-6]), lsl #[123]') -eq 4 || { echo "leaform-arm.s: the loop of Loop has not four adds with a shift"; exit 1; }; \
+	if awk '/^p_loop:/,/cfi_endproc/' $(BUILDDIR)/leaform-arm.s | grep -q 'mul '; then echo "leaform-arm.s: Loop multiplies"; exit 1; fi; \
+	awk '/^p_back:/,/cfi_endproc/' $(BUILDDIR)/leaform-arm.s > $(BUILDDIR)/leaform-back-arm.s; \
+	test $$(grep -cE 'ldr x[0-9]+, \[x(9|1[0-5]), #-(8|16)\]' $(BUILDDIR)/leaform-back-arm.s) -eq 2 || { echo "leaform-arm.s: Back does not load at p - 8 and p - 16"; exit 1; }; \
+	if grep -qE 'sub x[0-9]+, x[0-9]+, #(8|16)$$' $(BUILDDIR)/leaform-back-arm.s; then echo "leaform-arm.s: Back subtracts before it loads"; exit 1; fi; \
+	awk '/^p_far:/,/cfi_endproc/' $(BUILDDIR)/leaform-arm.s > $(BUILDDIR)/leaform-far-arm.s; \
+	grep -qE '\[x(9|1[0-5]), #-256\]' $(BUILDDIR)/leaform-far-arm.s || { echo "leaform-arm.s: Far does not load at p - 256"; exit 1; }; \
+	grep -qE 'sub x(9|1[0-5]), x(9|1[0-5]), #264$$' $(BUILDDIR)/leaform-far-arm.s || { echo "leaform-arm.s: Far folds p - 264, past LDUR"; exit 1; }; \
+	awk '/^p_idx:/,/cfi_endproc/' $(BUILDDIR)/leaform-arm.s | grep -qE 'ldr x[0-9]+, \[x[0-9]+, x[0-9]+, lsl #3\]' || { echo "leaform-arm.s: Idx does not index the load"; exit 1; }; \
+	echo ok leaform-arm-asm; \
 	$(OUTDIR)/paslangc -target arm64 -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/exprinline0-arm testdata/exprinline.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/exprinline0-arm > $(BUILDDIR)/exprinline0-arm.got; \
 	diff -u testdata/exprinline.out $(BUILDDIR)/exprinline0-arm.got; \

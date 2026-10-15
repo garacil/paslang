@@ -771,6 +771,11 @@ type
     function EmitWordMem(E: PExpr; D: LongInt): string;
     function PtrReg(E: PExpr; D: LongInt): string;
     function ScaleOf(T: PExpr; out Idx: PExpr): Int64;
+    function WordReg(E: PExpr): string;
+    function ConstAddend(P: PExpr; out B: PExpr; out K: Int64): Boolean;
+    function ScaledAdd(E: PExpr; D: LongInt): Boolean;
+    function InPlaceScaled(const R: string; Op: TBinOp; E: PExpr): Boolean;
+    function ArmDerefAt(E: PExpr; D: LongInt; out M: string): Boolean;
     function DerefOperand(P: PExpr; D: LongInt): string;
     procedure WordLoad(const M: string; T: LongInt; const R: string);
     procedure WordStore(const M: string; Sz: LongInt; const R: string);
@@ -23903,6 +23908,7 @@ var
   s: TSym;
   ok, skip: Boolean;
   k: Int64;
+  t: PExpr;
 begin
   r := OrdPool(D);
   skip := FSkipCanon;
@@ -23986,6 +23992,20 @@ begin
       end;
     ekBin:
       begin
+        { a constant on the left of +, *, and, or and xor goes to the
+          right, where the forms below and both machines' immediates
+          take it: 8 * x was a move of 8 and an imul, x * 8 is a shift
+          (P294) }
+        if (E^.L^.Kind = ekInt) and (E^.R^.Kind <> ekInt) and (E^.Typ <> TyBoolean) and
+          ((E^.Bin = boAdd) or (E^.Bin = boMul) or (E^.Bin = boAnd) or
+          (E^.Bin = boOr) or (E^.Bin = boXor)) then
+        begin
+          t := E^.L;
+          E^.L := E^.R;
+          E^.R := t;
+        end;
+        if ScaledAdd(E, D) then
+          Exit;
         { a - k of a register is one lea, a two-operand one, one cycle on
           Zen 2 (AMD 56305 2.10.2), where mov and sub were two (P282) }
         if (E^.Bin = boSub) and (TSize(E^.Typ) = 8) and (E^.R^.Kind = ekInt) and
@@ -24054,7 +24074,12 @@ begin
           m := s.Reg;
           if (E^.R^.Kind = ekVar) and WordVar(E^.R, s) and (s.Reg <> '') and (TSize(s.Typ) = 8) then
           begin
-            Line('  leaq (%' + m + ',%' + s.Reg + '), %' + r);
+            { r13 as the base beside an index is Intel's slow LEA
+              (248966 3.5.1.2), as the index it is not (P294) }
+            if m = 'r13' then
+              Line('  leaq (%' + s.Reg + ',%' + m + '), %' + r)
+            else
+              Line('  leaq (%' + m + ',%' + s.Reg + '), %' + r);
             Exit;
           end;
         end;
@@ -24955,48 +24980,343 @@ begin
   end;
 end;
 
+{ The register of a word variable a region keeps there, or '': PtrReg
+  without working anything out (P294). }
+function TEmitter.WordReg(E: PExpr): string;
+var
+  s: TSym;
+begin
+  Result := '';
+  if (E <> nil) and (E^.Kind = ekVar) and WordVar(E, s) and (s.Reg <> '') and
+    (TSize(s.Typ) = 8) then
+    Result := s.Reg;
+end;
+
+{ P is B + k, k + B or B - k, a word and k a constant: K is the offset,
+  within 32 bits (P294). }
+function TEmitter.ConstAddend(P: PExpr; out B: PExpr; out K: Int64): Boolean;
+begin
+  Result := False;
+  B := nil;
+  K := 0;
+  if (P = nil) or (P^.Kind <> ekBin) or (TSize(P^.Typ) <> 8) or (P^.L = nil) or
+    (P^.R = nil) then
+    Exit;
+  if (P^.Bin = boAdd) and (P^.R^.Kind = ekInt) then
+  begin
+    B := P^.L;
+    K := P^.R^.Num;
+  end
+  else if (P^.Bin = boAdd) and (P^.L^.Kind = ekInt) then
+  begin
+    B := P^.R;
+    K := P^.L^.Num;
+  end
+  else if (P^.Bin = boSub) and (P^.R^.Kind = ekInt) and (P^.R^.Num > Low(Int64)) then
+  begin
+    B := P^.L;
+    K := -P^.R^.Num;
+  end
+  else
+    Exit;
+  Result := Fits32(K);
+end;
+
+{ E = y + k * x or k * x + y, k 2, 4 or 8 as a product or a shift
+  (ScaleOf), y a constant or not, in one instruction (P294). amd64: a
+  lea of a base and a scaled index, or of a scaled index and a
+  displacement, two sources: one cycle on Intel's cores since Sandy
+  Bridge (248966 3.5.1.2) and AMD's two-operand LEA on every Zen (56305
+  2.10.2; 55723, 56665, 57647 and 58455 the same), where the shift and
+  the add were two instructions and two cycles, and a constant on the
+  left a move and an imul. Intel's slow LEA is a base, an index and a
+  displacement together, or a base of rbp or r13 with an index (three
+  cycles; two on Zen 2): so a base in r13 goes to a pool register first,
+  and y + k * x + c stays a lea and an add, as Go splits the slow form
+  (cmd/compile/internal/amd64/ssa.go, LEAQ1 to LEAQ8). arm64: one add
+  with the index shifted, one cycle with an LSL of 4 or less on every
+  Neoverse (N1 SOG 3.4, N2, V2, N3 and V3 the same) where lsl and add
+  were two in a chain, as Go's ADD R0<<2, R1; for c + k * x the
+  constant goes to x17 first, independent of x, when one mov takes it.
+  The side evaluated second takes pool D+1, as OrdSimple counted it. }
+function TEmitter.ScaledAdd(E: PExpr; D: LongInt): Boolean;
+var
+  r, br, xr: string;
+  ix, y: PExpr;
+  sc, k: Int64;
+  sh: LongInt;
+  yfirst: Boolean;
+begin
+  Result := False;
+  if (E^.Bin <> boAdd) or (TSize(E^.Typ) <> 8) then
+    Exit;
+  y := E^.L;
+  yfirst := True;
+  sc := ScaleOf(E^.R, ix);
+  if sc = 0 then
+  begin
+    y := E^.R;
+    yfirst := False;
+    sc := ScaleOf(E^.L, ix);
+  end;
+  if (sc < 2) or (ix = nil) or (y = nil) then
+    Exit;
+  r := OrdPool(D);
+  if sc = 2 then
+    sh := 1
+  else if sc = 4 then
+    sh := 2
+  else
+    sh := 3;
+  if y^.Kind = ekInt then
+  begin
+    k := y^.Num;
+    if (not FArm) and not Fits32(k) then
+      Exit;
+    xr := WordReg(ix);
+    if xr = '' then
+    begin
+      EmitOrdTo(ix, D);
+      xr := r;
+    end;
+    if not FArm then
+      Line('  leaq ' + IntToStr(k) + '(,%' + xr + ',' + IntToStr(sc) + '), %' + r)
+    else if ((k < -65536) or (k > 65535)) and (ArmAddImm(k) <> '') then
+    begin
+      Line('  lsl ' + r + ', ' + xr + ', #' + IntToStr(sh));
+      Line('  add ' + r + ', ' + r + ', ' + ArmAddImm(k));
+    end
+    else if ((k < -65536) or (k > 65535)) and (k > Low(Int64)) and (ArmAddImm(-k) <> '') then
+    begin
+      Line('  lsl ' + r + ', ' + xr + ', #' + IntToStr(sh));
+      Line('  sub ' + r + ', ' + r + ', ' + ArmAddImm(-k));
+    end
+    else
+    begin
+      Imm('x17', k);
+      Line('  add ' + r + ', x17, ' + xr + ', lsl #' + IntToStr(sh));
+    end;
+    Result := True;
+    Exit;
+  end;
+  br := WordReg(y);
+  if (not FArm) and (br = 'r13') then
+    br := '';
+  xr := WordReg(ix);
+  if (br = '') and (xr = '') then
+  begin
+    if yfirst then
+    begin
+      if not OrdSimple(ix, D + 1) then
+        Exit;
+      EmitOrdTo(y, D);
+      EmitOrdTo(ix, D + 1);
+      br := r;
+      xr := OrdPool(D + 1);
+    end
+    else
+    begin
+      if not OrdSimple(y, D + 1) then
+        Exit;
+      EmitOrdTo(ix, D);
+      EmitOrdTo(y, D + 1);
+      xr := r;
+      br := OrdPool(D + 1);
+    end;
+  end
+  else if br = '' then
+  begin
+    EmitOrdTo(y, D);
+    br := r;
+  end
+  else if xr = '' then
+  begin
+    EmitOrdTo(ix, D);
+    xr := r;
+  end;
+  if FArm then
+    Line('  add ' + r + ', ' + br + ', ' + xr + ', lsl #' + IntToStr(sh))
+  else
+    Line('  leaq (%' + br + ',%' + xr + ',' + IntToStr(sc) + '), %' + r);
+  Result := True;
+end;
+
+{ R := R + E, E k * y with k 2, 4 or 8 (ScaleOf), R a register a
+  variable lives in (P294): ScaledAdd's lea of R and y on amd64, unless
+  R is r13, Intel's slow base; one add with y shifted on arm64, and R -
+  k * y one sub so. The shift and the add were two instructions in a
+  chain, on arm64 a move of k, a mul and an add. y is used where a
+  region keeps it, else worked out into pool 0, which the caller's
+  OrdOperand would have taken. }
+function TEmitter.InPlaceScaled(const R: string; Op: TBinOp; E: PExpr): Boolean;
+var
+  ix: PExpr;
+  sc: Int64;
+  sh: LongInt;
+  xr: string;
+begin
+  Result := False;
+  if (R = '') or (E = nil) then
+    Exit;
+  if not ((Op = boAdd) or (FArm and (Op = boSub))) then
+    Exit;
+  if (not FArm) and (R = 'r13') then
+    Exit;
+  sc := ScaleOf(E, ix);
+  if (sc < 2) or (ix = nil) then
+    Exit;
+  if sc = 2 then
+    sh := 1
+  else if sc = 4 then
+    sh := 2
+  else
+    sh := 3;
+  xr := WordReg(ix);
+  if xr = '' then
+  begin
+    EmitOrdTo(ix, 0);
+    xr := OrdPool(0);
+  end;
+  if not FArm then
+    Line('  leaq (%' + R + ',%' + xr + ',' + IntToStr(sc) + '), %' + R)
+  else if Op = boAdd then
+    Line('  add ' + R + ', ' + R + ', ' + xr + ', lsl #' + IntToStr(sh))
+  else
+    Line('  sub ' + R + ', ' + R + ', ' + xr + ', lsl #' + IntToStr(sh));
+  Result := True;
+end;
+
+{ arm64: the operand of a load or a store of E, a pointer's target,
+  without its address formed (P294): p + k, k + p and p - k are the
+  offset from p's register, LDUR's and STUR's -256 to 255 or the
+  unsigned offset of LDR and STR scaled by the size (ARM DDI 0487 M.c
+  C6.2.259, C6.2.216; GNU as takes either written as ldr), and p +
+  (i shl s) or p + i * m with the size's shift the register offset
+  (C6.2.218), as DerefOperand folds them on amd64. False when E is
+  none of them, with nothing written. }
+function TEmitter.ArmDerefAt(E: PExpr; D: LongInt; out M: string): Boolean;
+var
+  b, ix, q: PExpr;
+  k, sc: Int64;
+  sz, sh: LongInt;
+  bs, xs: string;
+  yfirst: Boolean;
+begin
+  Result := False;
+  M := '';
+  q := E^.L;
+  if q = nil then
+    Exit;
+  sz := TSize(LoadTyp(E));
+  if (sz <> 1) and (sz <> 2) and (sz <> 4) and (sz <> 8) then
+    Exit;
+  if ConstAddend(q, b, k) then
+  begin
+    if not (((k >= -256) and (k <= 255)) or
+      ((k >= 0) and (k mod sz = 0) and (k div sz <= 4095))) then
+      Exit;
+    bs := PtrReg(b, D);
+    WmSet(bs, '', 0, k);
+    M := '[' + bs + ', #' + IntToStr(k) + ']';
+    Result := True;
+    Exit;
+  end;
+  if (q^.Kind <> ekBin) or (q^.Bin <> boAdd) or (TSize(q^.Typ) <> 8) or
+    (q^.L = nil) or (q^.R = nil) then
+    Exit;
+  b := q^.L;
+  yfirst := True;
+  sc := ScaleOf(q^.R, ix);
+  if sc = 0 then
+  begin
+    b := q^.R;
+    yfirst := False;
+    sc := ScaleOf(q^.L, ix);
+  end;
+  if (sc <> sz) or (ix = nil) or (b = nil) then
+    Exit;
+  sh := 0;
+  if sz = 2 then
+    sh := 1
+  else if sz = 4 then
+    sh := 2
+  else if sz = 8 then
+    sh := 3;
+  bs := WordReg(b);
+  xs := WordReg(ix);
+  if (bs = '') and (xs = '') then
+  begin
+    if yfirst then
+    begin
+      if not OrdSimple(ix, D + 1) then
+        Exit;
+      EmitOrdTo(b, D);
+      EmitOrdTo(ix, D + 1);
+      bs := OrdPool(D);
+      xs := OrdPool(D + 1);
+    end
+    else
+    begin
+      if not OrdSimple(b, D + 1) then
+        Exit;
+      EmitOrdTo(ix, D);
+      EmitOrdTo(b, D + 1);
+      xs := OrdPool(D);
+      bs := OrdPool(D + 1);
+    end;
+  end
+  else if bs = '' then
+  begin
+    EmitOrdTo(b, D);
+    bs := OrdPool(D);
+  end
+  else if xs = '' then
+  begin
+    EmitOrdTo(ix, D);
+    xs := OrdPool(D);
+  end;
+  WmSet(bs, xs, sh, 0);
+  M := '[' + bs + ', ' + xs + ', lsl #' + IntToStr(sh) + ']';
+  Result := True;
+end;
+
 { The operand for what P points to (amd64, 1.1.1): p + k is k(%p), p +
   (i shl s) and p + i * m are (%p,%i,scale), and p + k + (i shl s) is
   k(%p,%i,scale); the base and the index are the registers of variables
   a region keeps, else pool D and D+1; anything else is (%p). A tree's
-  search read PInt(base + (mid shl 3))^ in five instructions. }
+  search read PInt(base + (mid shl 3))^ in five instructions. p - k
+  folds as p + k does since P294 (ConstAddend), a sub and a load where
+  -k(%p) is one. }
 function TEmitter.DerefOperand(P: PExpr; D: LongInt): string;
 var
-  x, y, ix: PExpr;
+  x, y, ix, b: PExpr;
   base, idx: string;
   sc, k: Int64;
 begin
+  if ConstAddend(P, x, k) then
+  begin
+    { (p + (i shl s)) + k or - k }
+    if (x^.Kind = ekBin) and (x^.Bin = boAdd) and (TSize(x^.Typ) = 8) and
+      (x^.L <> nil) and (x^.R <> nil) then
+    begin
+      sc := ScaleOf(x^.R, ix);
+      if sc <> 0 then
+      begin
+        base := PtrReg(x^.L, D);
+        idx := PtrReg(ix, D + 1);
+        Result := IntToStr(k) + '(%' + base + ',%' + idx + ',' + IntToStr(sc) + ')';
+        Exit;
+      end;
+    end;
+    base := PtrReg(x, D);
+    Result := IntToStr(k) + '(%' + base + ')';
+    Exit;
+  end;
   if (P <> nil) and (P^.Kind = ekBin) and (P^.Bin = boAdd) and (TSize(P^.Typ) = 8) and
     (P^.L <> nil) and (P^.R <> nil) then
   begin
     x := P^.L;
     y := P^.R;
-    if (y^.Kind = ekInt) and Fits32(y^.Num) then
-    begin
-      k := y^.Num;
-      { (p + (i shl s)) + k }
-      if (x^.Kind = ekBin) and (x^.Bin = boAdd) and (TSize(x^.Typ) = 8) and
-        (x^.L <> nil) and (x^.R <> nil) then
-      begin
-        sc := ScaleOf(x^.R, ix);
-        if sc <> 0 then
-        begin
-          base := PtrReg(x^.L, D);
-          idx := PtrReg(ix, D + 1);
-          Result := IntToStr(k) + '(%' + base + ',%' + idx + ',' + IntToStr(sc) + ')';
-          Exit;
-        end;
-      end;
-      base := PtrReg(x, D);
-      Result := IntToStr(k) + '(%' + base + ')';
-      Exit;
-    end;
-    if (x^.Kind = ekInt) and Fits32(x^.Num) then
-    begin
-      base := PtrReg(y, D);
-      Result := IntToStr(x^.Num) + '(%' + base + ')';
-      Exit;
-    end;
     sc := ScaleOf(y, ix);
     if sc = 0 then
     begin
@@ -25009,13 +25329,12 @@ begin
     end;
     if sc <> 0 then
     begin
-      { (p + k) + (i shl s) }
-      if (x^.Kind = ekBin) and (x^.Bin = boAdd) and (TSize(x^.Typ) = 8) and
-        (x^.L <> nil) and (x^.R <> nil) and (x^.R^.Kind = ekInt) and Fits32(x^.R^.Num) then
+      { (p + k) + (i shl s), (p - k) + (i shl s) }
+      if ConstAddend(x, b, k) then
       begin
-        base := PtrReg(x^.L, D);
+        base := PtrReg(b, D);
         idx := PtrReg(ix, D + 1);
-        Result := IntToStr(x^.R^.Num) + '(%' + base + ',%' + idx + ',' + IntToStr(sc) + ')';
+        Result := IntToStr(k) + '(%' + base + ',%' + idx + ',' + IntToStr(sc) + ')';
         Exit;
       end;
       base := PtrReg(x, D);
@@ -25119,7 +25438,13 @@ begin
   end;
   case E^.Kind of
     ekDeref:
-      EmitOrdTo(E^.L, D);
+      begin
+        { arm64: p + k, p - k and p + (i shl s) in the load's own
+          operand (P294) }
+        if FArm and ArmDerefAt(E, D, Result) then
+          Exit;
+        EmitOrdTo(E^.L, D);
+      end;
     ekField:
       begin
         { a field of a var parameter whose address a register keeps:
@@ -25739,6 +26064,9 @@ begin
   end;
   if inplace then
   begin
+    { x := x + k * y in one lea or one add with the shift (P294) }
+    if (dst.Reg <> '') and InPlaceScaled(dst.Reg, e^.Bin, e^.R) then
+      Exit;
     if FArm then
     begin
       if ((e^.Bin = boAdd) or (e^.Bin = boSub)) and (e^.R^.Kind = ekInt) and
@@ -25839,6 +26167,8 @@ var
 begin
   if E^.L^.Kind <> ekVar then
     SpineEmit(E^.L, R);
+  if InPlaceScaled(R, E^.Bin, E^.R) then
+    Exit;
   if FArm then
   begin
     if ((E^.Bin = boAdd) or (E^.Bin = boSub)) and (E^.R^.Kind = ekInt) and
@@ -35722,7 +36052,8 @@ begin
   Line('  pushq %rax');
   Line('  call rt_memcpy');
   Line('  popq %rax');
-  Line('  leaq (%r13,%r15), %rdx');
+  { r15 the base: r13 beside an index is Intel's slow LEA (P294) }
+  Line('  leaq (%r15,%r13), %rdx');
   Line('  popq %r15');
   Line('  popq %rbx');
   Line('  popq %r13');
