@@ -340,6 +340,9 @@ GOLDEN_A64 += leasplit
 # P310: an element's index is scaled by shifts and leas.
 GOLDEN += idxscale
 GOLDEN_A64 += idxscale
+# P311: a field of an element is read and written through one address.
+GOLDEN += fieldaddr
+GOLDEN_A64 += fieldaddr
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -2360,8 +2363,9 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	done; \
 	python3 -I scripts/check_lea.py $(BUILDDIR)/leasplit-skylake.s slow; \
 	python3 -I scripts/check_lea.py $(BUILDDIR)/leasplit-haswell.s slow; \
-	python3 -I scripts/check_lea.py $(BUILDDIR)/leasplit-icelake.s whole 20; \
-	python3 -I scripts/check_lea.py $(BUILDDIR)/leasplit-zen3.s whole 20; \
+	: the counts kept whole are those after P311, whose field of an element takes no lea of its address any more, 8 fewer in Locals; \
+	python3 -I scripts/check_lea.py $(BUILDDIR)/leasplit-icelake.s whole 15; \
+	python3 -I scripts/check_lea.py $(BUILDDIR)/leasplit-zen3.s whole 16; \
 	python3 -I scripts/check_lea.py $(BUILDDIR)/heapspan.s whole 1; \
 	echo ok leasplit-asm; \
 	: an element index is scaled by shifts and leas, never by a multiply by a power of two, P310: idxscale under the stress of the collector and without inlining, its routines Loc, Glob, Dyn, Ptr and Cut multiplying nothing; \
@@ -2373,6 +2377,15 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/idxscale.out $(BUILDDIR)/idxscale0.got; \
 	python3 -I scripts/check_scale.py $(BUILDDIR)/idxscale0.s loc,glob,dyn,ptr,cut; \
 	echo ok idxscale-asm; \
+	: a field of an element is read and written through one address, P311: fieldaddr under the stress of the collector and without inlining, its routines Loc, Glob, Heap2, Ptr and Nest forming no element address before a field; \
+	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 $(BUILDDIR)/fieldaddr > $(BUILDDIR)/fieldaddr-gc.got; \
+	diff -u testdata/fieldaddr.out $(BUILDDIR)/fieldaddr-gc.got; \
+	python3 -I scripts/check_fieldaddr.py $(BUILDDIR)/fieldaddr.s loc,glob,heap2,ptr,nest; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/fieldaddr0 testdata/fieldaddr.paslang; \
+	$(BUILDDIR)/fieldaddr0 > $(BUILDDIR)/fieldaddr0.got; \
+	diff -u testdata/fieldaddr.out $(BUILDDIR)/fieldaddr0.got; \
+	python3 -I scripts/check_fieldaddr.py $(BUILDDIR)/fieldaddr0.s loc,glob,heap2,ptr,nest; \
+	echo ok fieldaddr-asm; \
 	: every loop of an asm kernel of the units starts aligned, as the loops paslangc compiles, P302; \
 	python3 -I scripts/check_kernel_align.py src/lib/*.paslang src/rtl/*.paslang; \
 	echo ok kernel-align; \
@@ -3498,6 +3511,15 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	  python3 -I scripts/check_scale.py $(BUILDDIR)/idxscale-$$c-arm.s loc,glob,dyn,ptr,cut --arm; \
 	done; \
 	echo ok idxscale-arm-asm; \
+	: P311 on arm64: fieldaddr under the stress of the collector and without inlining, a field offset in its load or store with no add of it first; \
+	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 timeout 300 $(QEMU_A64) $(BUILDDIR)/fieldaddr-arm > $(BUILDDIR)/fieldaddr-arm-gc.got; \
+	diff -u testdata/fieldaddr.out $(BUILDDIR)/fieldaddr-arm-gc.got; \
+	python3 -I scripts/check_fieldaddr.py $(BUILDDIR)/fieldaddr-arm.s loc,glob,heap2,ptr,nest --arm; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/fieldaddr0-arm testdata/fieldaddr.paslang; \
+	timeout 300 $(QEMU_A64) $(BUILDDIR)/fieldaddr0-arm > $(BUILDDIR)/fieldaddr0-arm.got; \
+	diff -u testdata/fieldaddr.out $(BUILDDIR)/fieldaddr0-arm.got; \
+	python3 -I scripts/check_fieldaddr.py $(BUILDDIR)/fieldaddr0-arm.s loc,glob,heap2,ptr,nest --arm; \
+	echo ok fieldaddr-arm-asm; \
 	$(OUTDIR)/paslangc -target arm64 -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/exprinline0-arm testdata/exprinline.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/exprinline0-arm > $(BUILDDIR)/exprinline0-arm.got; \
 	diff -u testdata/exprinline.out $(BUILDDIR)/exprinline0-arm.got; \

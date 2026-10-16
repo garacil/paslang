@@ -821,6 +821,7 @@ type
     procedure EmitWordBase(B: PExpr; D: LongInt);
     procedure EmitFatWord(B: PExpr; D: LongInt; Len: Boolean);
     function EmitWordMem(E: PExpr; D: LongInt): string;
+    function AddDispOp(const M: string; Off: Int64; out R: string): Boolean;
     function PtrReg(E: PExpr; D: LongInt): string;
     function ScaleOf(T: PExpr; out Idx: PExpr): Int64;
     function WordReg(E: PExpr): string;
@@ -26589,7 +26590,7 @@ begin
   begin
     if FArm then
       Line('  lsl ' + D + ', ' + S + ', #' + IntToStr(sh))
-    else if (D <> S) and (sh = 1) then
+    else if (D <> S) and (sh = 1) and (S <> '%r13') and (S <> '%rbp') then
       Line('  leaq (' + S + ',' + S + '), ' + D)
     else if (D <> S) and (sh <= 3) then
       { one lea of the index alone where a move and a shift were two }
@@ -27608,13 +27609,76 @@ begin
     Result := L + IntToStr(D);
 end;
 
+{ amd64: the memory operand M with Off added to its displacement, a
+  number, a label plus a number or none (P311). False when the sum
+  leaves 32 bits or M is not an operand of that form. }
+function TEmitter.AddDispOp(const M: string; Off: Int64; out R: string): Boolean;
+var
+  p, i: SizeInt;
+  d, rest: string;
+  v: Int64;
+  neg, num: Boolean;
+begin
+  Result := False;
+  R := M;
+  p := Pos('(', M);
+  if (p = 0) or (M[Length(M)] <> ')') then
+    Exit;
+  if Off = 0 then
+  begin
+    Result := True;
+    Exit;
+  end;
+  d := Copy(M, 1, p - 1);
+  rest := Copy(M, p, Length(M) - p + 1);
+  if d = '' then
+  begin
+    if not Fits32(Off) then
+      Exit;
+    R := IntToStr(Off) + rest;
+    Result := True;
+    Exit;
+  end;
+  neg := d[1] = '-';
+  i := 1;
+  if neg then
+    i := 2;
+  num := i <= Length(d);
+  v := 0;
+  while num and (i <= Length(d)) do
+  begin
+    if (d[i] < '0') or (d[i] > '9') or (v > 100000000000) then
+      num := False
+    else
+      v := v * 10 + (Ord(d[i]) - Ord('0'));
+    Inc(i);
+  end;
+  if num then
+  begin
+    if neg then
+      v := -v;
+    v := v + Off;
+    if not Fits32(v) then
+      Exit;
+    R := IntToStr(v) + rest;
+    Result := True;
+    Exit;
+  end;
+  { a label: the assembler adds the offsets (as.info, 5.2 expressions) }
+  if Off > 0 then
+    R := d + '+' + IntToStr(Off) + rest
+  else
+    R := d + IntToStr(Off) + rest;
+  Result := True;
+end;
+
 function TEmitter.EmitWordMem(E: PExpr; D: LongInt): string;
 var
-  r, idx, lenop, lenlab, ok, ok2, preg, lreg, lenR, glab, bs, reclab: string;
+  r, idx, lenop, lenlab, ok, ok2, preg, lreg, lenR, glab, bs, reclab, m: string;
   recglob: Boolean;
   td: TTypeDef;
   esz, sh, lk, asz: LongInt;
-  disp, k, lenk, lenoff: Int64;
+  disp, k, lenk, lenoff, fo: Int64;
   s: TSym;
   fat, desc, isc, nochk, near, frm: Boolean;
   foff: Int64;
@@ -27715,14 +27779,48 @@ begin
             Exit;
           end;
         end;
+        { amd64: a field of an element, or of a field of one, is the
+          element's own operand with the field's offset added to its
+          displacement, one load or store of the base, the index and the
+          displacement where a lea first formed the element's address
+          for each field (P311): an address generation unit adds the
+          three at no cost to the load (the slow LEA of P298 is an ALU's;
+          Go folds the offset the same way, addressingmodes.go) }
+        if (not FArm) and (E^.L^.Kind <> ekVar) and (TKind(E^.L^.Typ) <> tykClass) then
+        begin
+          m := EmitWordMem(E^.L, D);
+          if AddDispOp(m, E^.Off, Result) then
+            Exit;
+          if m <> '(%' + r + ')' then
+            Line('  leaq ' + m + ', %' + r);
+          Result := IntToStr(E^.Off) + '(%' + r + ')';
+          Exit;
+        end;
         { an object a register keeps (a leaf's Self, a loop's variable)
           is the base where it is, as amd64's PtrReg (P288) }
         bs := r;
+        fo := E^.Off;
         if TKind(E^.L^.Typ) = tykClass then
           bs := PtrReg(E^.L, D)
         else if FArm and (E^.L^.Kind = ekDeref) and (WordReg(E^.L^.L) <> '') then
           { p^.f with p in a register: p's register is the base (P303) }
           bs := WordReg(E^.L^.L)
+        else if FArm and (E^.L^.Kind = ekField) then
+        begin
+          { arm64: a field of a field takes both offsets in the load's or
+            the store's own, where the inner one was an ADD first (P311) }
+          m := EmitWordMem(E^.L, D);
+          if FWmIdx <> '' then
+          begin
+            Line('  add ' + r + ', ' + FWmBase + ', ' + FWmIdx + ', lsl #' + IntToStr(FWmSh));
+            bs := r;
+          end
+          else
+          begin
+            bs := FWmBase;
+            fo := fo + FWmOff;
+          end;
+        end
         else
           EmitWordBase(E^.L, D);
         if not FArm then
@@ -27731,26 +27829,29 @@ begin
           Exit;
         end;
         { the first field is the base itself (P303) }
-        if E^.Off = 0 then
+        if fo = 0 then
         begin
           WmSet(bs, '', 0, 0);
           Result := '[' + bs + ']';
           Exit;
         end;
-        { A field at its natural place is an offset of the load itself. }
+        { A field at its natural place is an offset of the load itself;
+          a record's or an array's field is no load, its offset the one a
+          field of it adds to its own, or EmitWordBase's ADD (P311). }
         asz := TSize(LoadTyp(E));
-        if (E^.Off > 0) and ((asz = 1) or (asz = 2) or (asz = 4) or (asz = 8)) and
-          (E^.Off mod asz = 0) and (E^.Off div asz <= 4095) then
+        if (fo > 0) and ((((asz = 1) or (asz = 2) or (asz = 4) or (asz = 8)) and
+          (fo mod asz = 0) and (fo div asz <= 4095)) or
+          (((TKind(E^.Typ) = tykRecord) or (TKind(E^.Typ) = tykArray)) and (fo <= 4095))) then
         begin
-          WmSet(bs, '', 0, E^.Off);
-          Result := '[' + bs + ', #' + IntToStr(E^.Off) + ']';
+          WmSet(bs, '', 0, fo);
+          Result := '[' + bs + ', #' + IntToStr(fo) + ']';
           Exit;
         end;
-        if (E^.Off > 0) and (E^.Off <= 4095) then
-          Line('  add ' + r + ', ' + bs + ', #' + IntToStr(E^.Off))
-        else if E^.Off <> 0 then
+        if (fo > 0) and (fo <= 4095) then
+          Line('  add ' + r + ', ' + bs + ', #' + IntToStr(fo))
+        else if fo <> 0 then
         begin
-          Imm('x17', E^.Off);
+          Imm('x17', fo);
           Line('  add ' + r + ', ' + bs + ', x17');
         end
         else if bs <> r then
@@ -28117,8 +28218,10 @@ begin
           begin
             if sh < 0 then
             begin
-              if idx <> OrdPool(D + 1) then
-                Line('  movq %' + idx + ', %' + OrdPool(D + 1));
+              { the scale reads the index where it is and writes pool
+                register D + 1: one lea where a move and a shift were
+                two (P311) }
+              m := idx;
               idx := OrdPool(D + 1);
               { the scale of the address takes a factor of 2, 4 or 8:
                 24 is a lea by 3 and the address's scale 8 (P310); not
@@ -28131,7 +28234,7 @@ begin
                 esz := esz shr 1;
                 Inc(sh);
               end;
-              ScaleTo('%' + idx, '%' + idx, esz, '');
+              ScaleTo('%' + idx, '%' + m, esz, '');
               esz := Int64(1) shl sh;
             end;
             if glab <> '' then
