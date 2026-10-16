@@ -131,6 +131,23 @@ begin
   Result := 'p_' + ToLower(N);
 end;
 
+function Fits32(K: Int64): Boolean;
+begin
+  Result := (K >= -2147483648) and (K <= 2147483647);
+end;
+
+{ The immediate of arm64's add, sub, cmp and cmn for K, 0 or more: 0 to
+  4095, or such a value shifted left by 12 (ARM DDI 0487 M.c C6.2.5,
+  imm12 and sh); '' when K is neither (P290). }
+function ArmAddImm(K: Int64): string;
+begin
+  Result := '';
+  if (K >= 0) and (K <= 4095) then
+    Result := '#' + IntToStr(K)
+  else if (K > 4095) and ((K and 4095) = 0) and ((K shr 12) <= 4095) then
+    Result := '#' + IntToStr(K shr 12) + ', lsl #12';
+end;
+
 function VarLabel(const N: string): string;
 begin
   Result := 'v_' + ToLower(N);
@@ -780,6 +797,11 @@ type
     function NoStmt(S: PStmt): Boolean;
     procedure DropJumpTo(const L: string);
     function FixedAddr(E: PExpr; out Sy: TSym; out K: Int64): Boolean;
+    procedure CmpImmArm(const R: string; K: Int64; const Tmp: string);
+    procedure SpAdjArm(const Op: string; K: Int64);
+    procedure AddImmArmT(const Dst, Src: string; D: Int64; const Tmp: string);
+    function ConstOf(E: PExpr; out K: Int64): Boolean;
+    procedure AddKX86(const R: string; K: Int64);
     function FixedOp(const Sy: TSym; K: Int64): string;
     procedure FixedTo(const Sy: TSym; K: Int64; const Reg: string);
     procedure SmallChunks(N: Int64; var Off, Sz: TInt64Arr);
@@ -1659,13 +1681,14 @@ begin
     Line('  ldr ' + Reg + ', =' + IntToStr(V));
 end;
 
-{ Reg := x29 + Off, in one add or sub when Off fits twelve bits. }
+{ Reg := x29 + Off, in one add or sub when Off fits twelve bits, or
+  twelve bits shifted by 12 (ArmAddImm, P306). }
 procedure TEmitter.AddFP(const Reg: string; Off: Int64);
 begin
-  if (Off >= 0) and (Off <= 4095) then
-    Line('  add ' + Reg + ', x29, #' + IntToStr(Off))
-  else if (Off < 0) and (Off >= -4095) then
-    Line('  sub ' + Reg + ', x29, #' + IntToStr(-Off))
+  if (Off >= 0) and (ArmAddImm(Off) <> '') then
+    Line('  add ' + Reg + ', x29, ' + ArmAddImm(Off))
+  else if (Off < 0) and (Off > Low(Int64)) and (ArmAddImm(-Off) <> '') then
+    Line('  sub ' + Reg + ', x29, ' + ArmAddImm(-Off))
   else
   begin
     Imm('x16', Off);
@@ -2218,18 +2241,6 @@ begin
       Exit;
     end;
   end;
-end;
-
-{ The immediate of arm64's add, sub, cmp and cmn for K, 0 or more: 0 to
-  4095, or such a value shifted left by 12 (ARM DDI 0487 M.c C6.2.5,
-  imm12 and sh); '' when K is neither (P290). }
-function ArmAddImm(K: Int64): string;
-begin
-  Result := '';
-  if (K >= 0) and (K <= 4095) then
-    Result := '#' + IntToStr(K)
-  else if (K > 4095) and ((K and 4095) = 0) and ((K shr 12) <= 4095) then
-    Result := '#' + IntToStr(K shr 12) + ', lsl #12';
 end;
 
 { ---- Sets (P126) ----
@@ -4758,8 +4769,7 @@ begin
               LdFP('x9', -8);
               for i := 2 to s.Up do
                 Line('  ldr x9, [x9, #-8]');
-              Imm('x16', s.Off);
-              Line('  add x9, x9, x16');
+              AddImmArm('x9', 'x9', s.Off);
               Line('  ldr x0, [x9]');
             end;
           end
@@ -4774,8 +4784,7 @@ begin
             LdFP('x9', -8);
             for i := 2 to s.Up do
               Line('  ldr x9, [x9, #-8]');
-            Imm('x16', s.Off);
-            Line('  add x0, x9, x16');
+            AddImmArm('x0', 'x9', s.Off);
           end;
         end;
       ekField:
@@ -4786,8 +4795,7 @@ begin
             EmitAddr(E^.L);
           if E^.Off <> 0 then
           begin
-            Imm('x16', E^.Off);
-            Line('  add x0, x0, x16');
+            AddImmArm('x0', 'x0', E^.Off);
           end;
         end;
       ekDeref:
@@ -4813,8 +4821,7 @@ begin
             EmitExpr(E^.L);
             if (E^.R^.Num < 1) or (E^.R^.Num > Length(E^.L^.Txt)) then
               BoundsFailArm('', E^.R^.Num, 1, '', Length(E^.L^.Txt), 0);
-            Imm('x16', E^.R^.Num - 1);
-            Line('  add x0, x0, x16');
+            AddImmArm('x0', 'x0', E^.R^.Num - 1);
           end
           else if IsStr(E^.L^.Typ) and StrFilled(E) then
           begin
@@ -4921,8 +4928,7 @@ begin
             EmitAddr(E^.L);
             if (E^.R^.Num < td.Lo) or (E^.R^.Num > td.Hi) then
               BoundsFailArm('', E^.R^.Num, td.Lo, '', td.Hi, 0);
-            Imm('x16', (E^.R^.Num - td.Lo) * esz);
-            Line('  add x0, x0, x16');
+            AddImmArm('x0', 'x0', (E^.R^.Num - td.Lo) * esz);
           end
           else
           begin
@@ -4935,20 +4941,13 @@ begin
             ix := 'x0';
             if td.Lo <> 0 then
             begin
-              Imm('x16', td.Lo);
-              Line('  sub x1, x0, x16');
+              AddImmArm('x1', 'x0', -td.Lo);
               ix := 'x1';
             end;
             ok := Lab;
             if not IndexInRange(E^.R, td.Lo, td.Hi) then
             begin
-              if (td.Hi - td.Lo >= 0) and (td.Hi - td.Lo <= 4095) then
-                Line('  cmp ' + ix + ', #' + IntToStr(td.Hi - td.Lo))
-              else
-              begin
-                Imm('x17', td.Hi - td.Lo);
-                Line('  cmp ' + ix + ', x17');
-              end;
+              CmpImmArm(ix, td.Hi - td.Lo, 'x17');
               ColdBegin('  b.hi');
               BoundsFailArm('x0', 0, td.Lo, '', td.Hi, 0);
               ColdEnd;
@@ -5050,8 +5049,7 @@ begin
           EmitExpr(E^.L);
           if (E^.R^.Num < 1) or (E^.R^.Num > Length(E^.L^.Txt)) then
             BoundsFailX86('$' + IntToStr(E^.R^.Num), 1, '', Length(E^.L^.Txt), 0);
-          LoadImmR('rcx', E^.R^.Num - 1);
-          Line('  addq %rcx, %rax');
+          AddKX86('rax', E^.R^.Num - 1);
         end
         else if IsStr(E^.L^.Typ) and StrFilled(E) then
         begin
@@ -5182,8 +5180,7 @@ begin
           EmitAddr(E^.L);
           if (E^.R^.Num < td.Lo) or (E^.R^.Num > td.Hi) then
             BoundsFailX86('$' + IntToStr(E^.R^.Num), td.Lo, '', td.Hi, 0);
-          LoadImmR('rcx', (E^.R^.Num - td.Lo) * esz);
-          Line('  addq %rcx, %rax');
+          AddKX86('rax', (E^.R^.Num - td.Lo) * esz);
         end
         else
         begin
@@ -5197,9 +5194,15 @@ begin
           ix := '%rax';
           if td.Lo <> 0 then
           begin
-            LoadImmR('rcx', td.Lo);
-            Line('  movq %rax, %rdx');
-            Line('  subq %rcx, %rdx');
+            { the low bound in LEA's displacement (P306) }
+            if Fits32(-td.Lo) then
+              Line('  leaq ' + IntToStr(-td.Lo) + '(%rax), %rdx')
+            else
+            begin
+              LoadImmR('rcx', td.Lo);
+              Line('  movq %rax, %rdx');
+              Line('  subq %rcx, %rdx');
+            end;
             ix := '%rdx';
           end;
           if not IndexInRange(E^.R, td.Lo, td.Hi) then
@@ -5259,11 +5262,6 @@ begin
     Die('not an address kind=' + IntToStr(Ord(E^.Kind)) + ' name=' + E^.Name +
       ' bin=' + IntToStr(Ord(E^.Bin)));
   end;
-end;
-
-function Fits32(K: Int64): Boolean;
-begin
-  Result := (K >= -2147483648) and (K <= 2147483647);
 end;
 
 { ---- Move and FillChar in line (P304) ----
@@ -9300,8 +9298,7 @@ begin
       begin
         KeyScratch(E^.Args[1], off);
         Ppop('x0');
-        Imm('x1', off);
-        Line('  add x1, x29, x1');
+        AddFP('x1', off);
       end;
       LeaS(desc, 'x2');
       if E^.Name = 'rt_treedel' then
@@ -9405,8 +9402,7 @@ begin
       PshK('x0', 0);
       KeyScratch(E^.Args[1], off);
       Ppop('x0');
-      Imm('x1', off);
-      Line('  add x1, x29, x1');
+      AddFP('x1', off);
       LeaS(desc, 'x2');
       Line('  bl p_pastree_pasheappush');
     end
@@ -9946,8 +9942,7 @@ begin
         Imm('x3', vstride);
         Line('  mul x4, x2, x3');
         Line('  add x4, x1, x4');
-        Imm('x3', 48 + 32 * ksz);
-        Line('  add x4, x4, x3');
+        AddImmArmT('x4', 'x4', 48 + 32 * ksz, 'x3');
         Line('  str x4, [sp, #24]');
       end;
       Imm('x3', ksz);
@@ -10171,8 +10166,7 @@ begin
       StFP('x0', off);
       StFP('x2', off + 8);
       Ppop('x0');
-      Imm('x1', off);
-      Line('  add x1, x29, x1');
+      AddFP('x1', off);
       LeaS('.LdescMap_' + IntToStr(Dest^.Args[0]^.Typ), 'x2');
       Line('  bl p_pasmap_pasmapputstr');
     end
@@ -10366,8 +10360,7 @@ begin
           if slot >= 0 then
           begin
             Line('  ldr x16, [x0]');
-            Imm('x17', slot * 8);
-            Line('  add x16, x16, x17');
+            AddImmArm('x16', 'x16', slot * 8);
             Line('  ldr x16, [x16]');
             Line('  blr x16');
           end
@@ -10417,13 +10410,11 @@ begin
           Psh('x0');
           for i := 0 to nu do
             Line('  ldr ' + ArgR(i) + ', [sp, #' + IntToStr((nu - i) * 16) + ']');
-          Imm('x16', (nu + 1) * 16);
-          Line('  add sp, sp, x16');
+          SpAdjArm('add', (nu + 1) * 16);
           if slot >= 0 then
           begin
             Line('  ldr x16, [x0]');
-            Imm('x17', slot * 8);
-            Line('  add x16, x16, x17');
+            AddImmArm('x16', 'x16', slot * 8);
             Line('  ldr x16, [x16]');
             Line('  blr x16');
           end
@@ -10464,8 +10455,7 @@ begin
         if slot >= 0 then
         begin
           Line('  ldr x16, [x0]');
-          Imm('x17', slot * 8);
-          Line('  add x16, x16, x17');
+          AddImmArm('x16', 'x16', slot * 8);
           Line('  ldr x16, [x16]');
           Line('  blr x16');
         end
@@ -10499,8 +10489,7 @@ begin
       EmitExpr(Dest^.L);
       if foff <> 0 then
       begin
-        Imm('x16', foff);
-        Line('  add x0, x0, x16');
+        AddImmArm('x0', 'x0', foff);
       end;
       Ppop('x1');
       { At the field's width (P99). }
@@ -10705,8 +10694,7 @@ begin
         LdFP('x9', -8);
         for i := 2 to s.Up do
           Line('  ldr x9, [x9, #-8]');
-        Imm('x16', s.Off);
-        Line('  add x16, x9, x16');
+        AddImmArm('x16', 'x9', s.Off);
         Line('  ldr x9, [x16]');
       end;
       Line('  cbz x9, .lvnil' + IntToStr(FLab));
@@ -10764,8 +10752,7 @@ begin
       LdFP('x9', -8);
       for i := 2 to s.Up do
         Line('  ldr x9, [x9, #-8]');
-      Imm('x16', s.Off);
-      Line('  add x16, x9, x16');
+      AddImmArm('x16', 'x9', s.Off);
       LoadTo('[x16]', s.Typ, 'x0');
       if IsFat(s.Typ) then
         Line('  ldr x2, [x16, #8]');
@@ -10867,8 +10854,7 @@ begin
         LdFP('x9', -8);
         for i := 2 to s.Up do
           Line('  ldr x9, [x9, #-8]');
-        Imm('x16', s.Off);
-        Line('  add x16, x9, x16');
+        AddImmArm('x16', 'x9', s.Off);
         Line('  ldr x9, [x16]');
       end;
       StoreWidth('x0', 'x9', sz);
@@ -10903,8 +10889,7 @@ begin
       for i := 2 to s.Up do
         Line('  ldr x9, [x9, #-8]');
       Ppop('x0');
-      Imm('x16', s.Off);
-      Line('  add x16, x9, x16');
+      AddImmArm('x16', 'x9', s.Off);
       Line('  str x0, [x16]');
     end;
     Exit;
@@ -11249,8 +11234,7 @@ begin
         StFP('x0', off);
       end;
       Ppop('x0');
-      Imm('x1', off);
-      Line('  add x1, x29, x1');
+      AddFP('x1', off);
       LeaS('.LdescMap_' + IntToStr(Args[0]^.Typ), 'x2');
       Line('  bl p_pasmap_pasmapdelete');
     end
@@ -11319,8 +11303,7 @@ begin
         off := ScratchT(16, Args[i]^.Typ);
         StFP('x0', off);
         StFP('x2', off + 8);
-        Imm('x0', off);
-        Line('  add x0, x29, x0');
+        AddImmArmT('x0', 'x29', off, 'x0');
       end
       else if Args[i]^.Kind = ekAddr then
         EmitExpr(Args[i])
@@ -11342,8 +11325,7 @@ begin
           StFP('x2', off + 8);
           if IsDyn(Args[i]^.Typ) then
             StFP('x3', off + 16);
-          Imm('x0', off);
-          Line('  add x0, x29, x0');
+          AddImmArmT('x0', 'x29', off, 'x0');
         end;
       end
       else if IsBlob(Args[i]^.Typ) then
@@ -11363,8 +11345,7 @@ begin
       Line('  ldr ' + ArgR(LongInt(i)) + ', [sp, #' + IntToStr((kd - 1 - i) * 16) + ']');
     if kd > 0 then
     begin
-      Imm('x16', kd * 16);
-      Line('  add sp, sp, x16');
+      SpAdjArm('add', kd * 16);
     end;
     EmitLink(ProcNest(Name));
     Line('  bl ' + Name);
@@ -11380,8 +11361,7 @@ begin
         off := ScratchT(16, Args[i]^.Typ);
         StFP('x0', off);
         StFP('x2', off + 8);
-        Imm('x0', off);
-        Line('  add x0, x29, x0');
+        AddImmArmT('x0', 'x29', off, 'x0');
       end
       else if Args[i]^.Kind = ekAddr then
         EmitExpr(Args[i])
@@ -11403,8 +11383,7 @@ begin
           StFP('x2', off + 8);
           if IsDyn(Args[i]^.Typ) then
             StFP('x3', off + 16);
-          Imm('x0', off);
-          Line('  add x0, x29, x0');
+          AddImmArmT('x0', 'x29', off, 'x0');
         end;
       end
       else if IsBlob(Args[i]^.Typ) then
@@ -11449,8 +11428,7 @@ begin
         Line('  ldr x16, [sp, #' + IntToStr((n - nreg - 1 - i) * 16) + ']');
         Line('  str x16, [sp, #' + IntToStr(n * 16 - off + i * 8) + ']');
       end;
-      Imm('x16', n * 16 - off);
-      Line('  add sp, sp, x16');
+      SpAdjArm('add', n * 16 - off);
       { the off div 8 words left: argument nreg first, a pad word last }
       if FMapOn or FMapPro then
       begin
@@ -11466,16 +11444,14 @@ begin
     end
     else if n > 0 then
     begin
-      Imm('x16', n * 16);
-      Line('  add sp, sp, x16');
+      SpAdjArm('add', n * 16);
     end;
     EmitLink(ProcNest(Name));
     Line('  bl ' + Name);
     if n > nreg then
     begin
       off := ((n - nreg) * 8 + 15) and (-16);
-      Imm('x16', off);
-      Line('  add sp, sp, x16');
+      SpAdjArm('add', off);
     end;
     Exit;
   end;
@@ -11584,8 +11560,7 @@ begin
     Line('  ldr x27, [sp, #' + IntToStr((kd + 1) * 16) + ']');
     for i := 0 to kd - 1 do
       Line('  ldr ' + ArgR(i) + ', [sp, #' + IntToStr((kd - 1 - i) * 16) + ']');
-    Imm('x16', (kd + 2) * 16);
-    Line('  add sp, sp, x16');
+    SpAdjArm('add', (kd + 2) * 16);
     Line('  blr x9');
   end
   else
@@ -11649,8 +11624,7 @@ begin
         StFP('x2', off + 8);
         if IsDyn(E^.Typ) then
           StFP('x3', off + 16);
-        Imm('x0', off);
-        Line('  add x0, x29, x0');
+        AddImmArmT('x0', 'x29', off, 'x0');
       end
       else
       begin
@@ -11689,8 +11663,7 @@ begin
     off := ScratchT(16, A^.Typ);
     StFP('x0', off);
     StFP('x2', off + 8);
-    Imm('x0', off);
-    Line('  add x0, x29, x0');
+    AddImmArmT('x0', 'x29', off, 'x0');
   end
   else if A^.Kind = ekAddr then
     EmitExpr(A)
@@ -11712,8 +11685,7 @@ begin
       StFP('x2', off + 8);
       if IsDyn(A^.Typ) then
         StFP('x3', off + 16);
-      Imm('x0', off);
-      Line('  add x0, x29, x0');
+      AddImmArmT('x0', 'x29', off, 'x0');
     end;
   end
   else if IsBlob(A^.Typ) then
@@ -11772,8 +11744,7 @@ begin
       for i := 0 to kd - 1 do
         Line('  ldr ' + ArgR(1 + i) + ', [sp, #' + IntToStr((kd - 1 - i) * 16) + ']');
       Line('  ldr x0, [sp, #' + IntToStr(kd * 16) + ']');
-      Imm('x16', (kd + 1) * 16);
-      Line('  add sp, sp, x16');
+      SpAdjArm('add', (kd + 1) * 16);
       direct := True;
     end;
   end;
@@ -11782,15 +11753,13 @@ begin
     if Slot >= 0 then
     begin
       Line('  ldr x16, [x0]');
-      Imm('x17', Slot * 8);
-      Line('  add x16, x16, x17');
+      AddImmArm('x16', 'x16', Slot * 8);
       Line('  ldr x16, [x16]');
       Line('  blr x16');
     end
     else if Slot <= ClsSlotBase then
     begin
-      Imm('x17', (ClsSlotBase - Slot) * 8);
-      Line('  add x16, x0, x17');
+      AddImmArm('x16', 'x0', (ClsSlotBase - Slot) * 8);
       Line('  ldr x16, [x16]');
       Line('  blr x16');
     end
@@ -11845,29 +11814,25 @@ begin
       Line('  ldr x16, [sp, #' + IntToStr(src) + ']');
       Line('  str x16, [sp, #' + IntToStr(npush * 16 - off + i * 8) + ']');
     end;
-    Imm('x16', npush * 16 - off);
-    Line('  add sp, sp, x16');
+    SpAdjArm('add', npush * 16 - off);
   end
   else
   begin
-    Imm('x16', npush * 16);
-    Line('  add sp, sp, x16');
+    SpAdjArm('add', npush * 16);
   end;
   if Slot = -3 then
     Line('  blr x9')
   else if Slot >= 0 then
   begin
     Line('  ldr x16, [x0]');
-    Imm('x17', Slot * 8);
-    Line('  add x16, x16, x17');
+    AddImmArm('x16', 'x16', Slot * 8);
     Line('  ldr x16, [x16]');
     Line('  blr x16');
   end
   else if Slot <= ClsSlotBase then
   begin
     { a class method's virtual call (P123): x0, Self, is the table }
-    Imm('x17', (ClsSlotBase - Slot) * 8);
-    Line('  add x16, x0, x17');
+    AddImmArm('x16', 'x0', (ClsSlotBase - Slot) * 8);
     Line('  ldr x16, [x16]');
     Line('  blr x16');
   end
@@ -11875,8 +11840,7 @@ begin
     Line('  bl ' + Name);
   if ntot > 8 then
   begin
-    Imm('x16', off);
-    Line('  add sp, sp, x16');
+    SpAdjArm('add', off);
   end;
 end;
 
@@ -11943,8 +11907,7 @@ begin
   EmitExpr(Obj);
   if FArm then
   begin
-    Imm('x16', Slot * 8);
-    Line('  add x16, x2, x16');
+    AddImmArm('x16', 'x2', Slot * 8);
     Line('  ldr x16, [x16]');
     Line('  mov x2, x0');
     Line('  mov x0, x16');
@@ -15199,8 +15162,7 @@ begin
     LoadWordVar(sp, 'x9');
     if E^.R^.Num <> 0 then
     begin
-      Imm('x10', E^.R^.Num * sz);
-      Line('  add x9, x9, x10');
+      AddImmArmT('x9', 'x9', E^.R^.Num * sz, 'x10');
     end;
     Result := True;
     Exit;
@@ -18271,8 +18233,7 @@ begin
         Imm('x10', offs[i]);
         Line('  str x9, [x0, x10]');
       end;
-      Imm('x10', offs[i]);
-      Line('  add x9, x0, x10');
+      AddImmArmT('x9', 'x0', offs[i], 'x10');
       StFP('x9', FSym[j].Off);
     end
     else
@@ -19795,20 +19756,17 @@ begin
               Line('  ldr x16, [sp, #' + IntToStr((ns - 1 - i) * 16) + ']');
               Line('  str x16, [sp, #' + IntToStr(ntot * 16 - soff + i * 8) + ']');
             end;
-            Imm('x16', ntot * 16 - soff);
-            Line('  add sp, sp, x16');
+            SpAdjArm('add', ntot * 16 - soff);
           end
           else
           begin
-            Imm('x16', ntot * 16);
-            Line('  add sp, sp, x16');
+            SpAdjArm('add', ntot * 16);
           end;
           if (E^.L <> nil) and (E^.Num >= 0) then
           begin
             { a virtual constructor, the held class's own (P123) }
             Line('  ldr x16, [x0]');
-            Imm('x17', E^.Num * 8);
-            Line('  add x16, x16, x17');
+            AddImmArm('x16', 'x16', E^.Num * 8);
             Line('  ldr x16, [x16]');
             Line('  blr x16');
           end
@@ -19816,8 +19774,7 @@ begin
             Line('  bl ' + E^.Name);
           if soff > 0 then
           begin
-            Imm('x16', soff);
-            Line('  add sp, sp, x16');
+            SpAdjArm('add', soff);
           end;
           { the class's AfterConstruction on the new object (P121); through
             its slot when the class is the one a reference held (P123) }
@@ -19825,8 +19782,7 @@ begin
           begin
             Line('  ldr x0, [sp]');
             Line('  ldr x16, [x0]');
-            Imm('x17', E^.R^.Num * 8);
-            Line('  add x16, x16, x17');
+            AddImmArm('x16', 'x16', E^.R^.Num * 8);
             Line('  ldr x16, [x16]');
             Line('  blr x16');
           end
@@ -19849,8 +19805,7 @@ begin
             EmitExpr(E^.L);
             if E^.Off <> 0 then
             begin
-              Imm('x16', E^.Off);
-              Line('  add x0, x0, x16');
+              AddImmArm('x0', 'x0', E^.Off);
             end;
             if not IsBlob(E^.Typ) then
             begin
@@ -19958,8 +19913,7 @@ begin
             StFP('x0', off);
             StFP('x2', off + 8);
             Ppop('x0');
-            Imm('x1', off);
-            Line('  add x1, x29, x1');
+            AddFP('x1', off);
             LeaS('.LdescMap_' + IntToStr(E^.Args[0]^.Typ), 'x2');
             Line('  bl p_pasmap_pasmapputstr');
           end
@@ -20000,8 +19954,7 @@ begin
               StFP('x0', off);
             end;
             Ppop('x0');
-            Imm('x1', off);
-            Line('  add x1, x29, x1');
+            AddFP('x1', off);
             LeaS('.LdescMap_' + IntToStr(E^.Args[0]^.Typ), 'x2');
             if IsStr(E^.Args[1]^.Typ) and ((E^.Name = 'rt_mapget') or (E^.Name = 'rt_mapin')) then
               a := 'rt_mapgetstr'
@@ -20042,8 +19995,7 @@ begin
             StFP('x0', off);
           end;
           Ppop('x0');
-          Imm('x1', off);
-          Line('  add x1, x29, x1');
+          AddFP('x1', off);
           LeaS('.LdescMap_' + IntToStr(E^.Args[0]^.Typ), 'x2');
           Line('  bl p_pasmap_pasmapget');
           a := Lab;
@@ -20215,8 +20167,8 @@ else if E^.Name = 'rt_high' then
           EmitAddr(E^.Args[0]);
           Ppop('x4');
           Ppop('x5');
-          Imm('x7', FTypes[E^.Args[0]^.Typ].Lo);
-          Line('  sub x6, x4, x7');
+          AddImmArmT('x6', 'x4', -(FTypes[E^.Args[0]^.Typ].Lo), 'x7');
+          { x7 keeps the view's length for the check of the count below }
           Imm('x7', FTypes[E^.Args[0]^.Typ].Hi - FTypes[E^.Args[0]^.Typ].Lo + 1);
           a := Lab;
           Line('  cmp x6, x7');
@@ -21146,8 +21098,14 @@ else if E^.Name = 'rt_high' then
           Line('  movq %rsi, %rcx');
           if FTypes[E^.Args[0]^.Typ].Lo <> 0 then
           begin
-            LoadImmR('rdx', FTypes[E^.Args[0]^.Typ].Lo);
-            Line('  subq %rdx, %rcx');
+            { the low bound as SUB's immediate (P306) }
+            if Fits32(FTypes[E^.Args[0]^.Typ].Lo) then
+              Line('  subq $' + IntToStr(FTypes[E^.Args[0]^.Typ].Lo) + ', %rcx')
+            else
+            begin
+              LoadImmR('rdx', FTypes[E^.Args[0]^.Typ].Lo);
+              Line('  subq %rdx, %rcx');
+            end;
           end;
           LoadImmR('rdx', FTypes[E^.Args[0]^.Typ].Hi - FTypes[E^.Args[0]^.Typ].Lo + 1);
           a := Lab;
@@ -21786,8 +21744,7 @@ begin
   EmitExpr(S^.E);
   if FArm then
   begin
-    Imm('x16', 48);
-    Line('  sub sp, sp, x16');
+    SpAdjArm('sub', 48);
     Line('  str x0, [sp]');
     Line('  str x2, [sp, #8]');
     Line('  str xzr, [sp, #16]');
@@ -21811,8 +21768,7 @@ begin
     Line('  str x3, [sp, #16]');
     Line('  b ' + head);
     Line(done + ':');
-    Imm('x16', 48);
-    Line('  add sp, sp, x16');
+    SpAdjArm('add', 48);
   end
   else
   begin
@@ -22061,13 +22017,11 @@ begin
           SetLength(boxoff, n);
           if n > 16 then
             Die('select has more than 16 arms');
-          Imm('x16', n * 32);
-          Line('  sub sp, sp, x16');
+          SpAdjArm('sub', n * 32);
           for i := 0 to n - 1 do
           begin
             Imm('x9', Ord(S^.Sels[i].Kind));
-            Imm('x16', i * 32);
-            Line('  add x16, sp, x16');
+            AddImmArm('x16', 'sp', i * 32);
             Line('  str x9, [x16]');
             if S^.Sels[i].Kind = selDefault then
             begin
@@ -22094,8 +22048,7 @@ begin
               begin
                 { The box arrives in a word of the frame (1.0.83). }
                 boxoff[i] := ScratchT(8, S^.Sels[i].Chan^.Typ);
-                Imm('x9', boxoff[i]);
-                Line('  add x9, x29, x9');
+                AddImmArmT('x9', 'x29', boxoff[i], 'x9');
                 Line('  str x9, [x16, #16]');
               end
               else
@@ -22110,14 +22063,12 @@ begin
           Line('  mov x0, sp');
           Imm('x1', n);
           Line('  bl rt_select');
-          Imm('x16', n * 32);
-          Line('  add sp, sp, x16');
+          SpAdjArm('add', n * 32);
           b := Lab;
           for i := 0 to n - 1 do
           begin
             a := Lab;
-            Imm('x9', i);
-            Line('  cmp x0, x9');
+            CmpImmArm('x0', i, 'x9');
             Line('  b.ne ' + a);
             if (S^.Sels[i].Kind = selRecv) and ChanBoxed(S^.Sels[i].Chan^.Typ) then
             begin
@@ -22194,14 +22145,12 @@ begin
           n := Length(S^.Args);
           if n > 0 then
           begin
-            Imm('x16', n * 16);
-            Line('  sub sp, sp, x16');
+            SpAdjArm('sub', n * 16);
           end;
           for i := 0 to n - 1 do
           begin
             EmitExpr(S^.Args[i]);
-            Imm('x16', i * 16);
-            Line('  add x16, sp, x16');
+            AddImmArm('x16', 'sp', i * 16);
             Line('  str x0, [x16]');
             if (S^.Args[i]^.Kind = ekStr) or IsStr(S^.Args[i]^.Typ) then
               Line('  str x2, [x16, #8]');
@@ -22212,8 +22161,7 @@ begin
           Line('  bl rt_printlock');
           for i := 0 to n - 1 do
           begin
-            Imm('x16', i * 16);
-            Line('  add x16, sp, x16');
+            AddImmArm('x16', 'sp', i * 16);
             if (S^.Args[i]^.Kind = ekStr) or IsStr(S^.Args[i]^.Typ) then
             begin
               Line('  ldr x1, [x16]');
@@ -22247,8 +22195,7 @@ begin
           Line('  bl rt_printunlock');
           if n > 0 then
           begin
-            Imm('x16', n * 16);
-            Line('  add sp, sp, x16');
+            SpAdjArm('add', n * 16);
           end;
         end;
       skReadLn:
@@ -22537,11 +22484,9 @@ begin
                 d := Lab;
                 if j = nv - 1 then
                   d := c;
-                Imm('x9', S^.Arms[i].Vals[j]);
-                Line('  cmp x0, x9');
+                CmpImmArm('x0', S^.Arms[i].Vals[j], 'x9');
                 Line('  b.lt ' + d);
-                Imm('x9', S^.Arms[i].His[j]);
-                Line('  cmp x0, x9');
+                CmpImmArm('x0', S^.Arms[i].His[j], 'x9');
                 if j = nv - 1 then
                   Line('  b.gt ' + c)
                 else
@@ -22552,8 +22497,7 @@ begin
               end
               else
               begin
-                Imm('x9', S^.Arms[i].Vals[j]);
-                Line('  cmp x0, x9');
+                CmpImmArm('x0', S^.Arms[i].Vals[j], 'x9');
                 if j = nv - 1 then
                   Line('  b.ne ' + c)
                 else
@@ -22595,11 +22539,23 @@ begin
           (FindSym(S^.Dest^.Name).Reg <> '') then
         begin
           vs := FindSym(S^.Dest^.Name);
-          EmitExpr(S^.E);
-          if S^.Kind = skInc then
-            Line('  add ' + vs.Reg + ', ' + vs.Reg + ', x0')
+          { a constant step is the add's or sub's immediate, as amd64's
+            addq $k (P306) }
+          if (S^.E <> nil) and (S^.E^.Kind = ekInt) and (S^.E^.Num > Low(Int64)) then
+          begin
+            if S^.Kind = skInc then
+              AddImmArmT(vs.Reg, vs.Reg, S^.E^.Num, 'x0')
+            else
+              AddImmArmT(vs.Reg, vs.Reg, -S^.E^.Num, 'x0');
+          end
           else
-            Line('  sub ' + vs.Reg + ', ' + vs.Reg + ', x0');
+          begin
+            EmitExpr(S^.E);
+            if S^.Kind = skInc then
+              Line('  add ' + vs.Reg + ', ' + vs.Reg + ', x0')
+            else
+              Line('  sub ' + vs.Reg + ', ' + vs.Reg + ', x0');
+          end;
           CanonReg(vs.Reg, vs.Typ);
         end
         else
@@ -25196,6 +25152,7 @@ procedure TEmitter.EmitOrdBinArm(E: PExpr; D: LongInt);
 var
   r, op, cc: string;
   small, addop: Boolean;
+  k: Int64;
 begin
   r := OrdPool(D);
   small := (E^.R^.Kind = ekInt) and (E^.R^.Num >= 0) and (E^.R^.Num <= 4095);
@@ -25295,11 +25252,12 @@ begin
       end;
   else
     begin
-      if small then
-        op := '#' + IntToStr(E^.R^.Num)
+      { a constant CMP or CMN takes, a character's too (P306) }
+      if ConstOf(E^.R, k) and ((ArmAddImm(k) <> '') or
+        ((k < 0) and (k > Low(Int64)) and (ArmAddImm(-k) <> ''))) then
+        CmpImmArm(r, k, 'x17')
       else
-        op := OrdOperand(E^.R, D);
-      Line('  cmp ' + r + ', ' + op);
+        Line('  cmp ' + r + ', ' + OrdOperand(E^.R, D));
       case E^.Bin of
         boEq: cc := 'eq';
         boNe: cc := 'ne';
@@ -26777,17 +26735,8 @@ begin
               if td.Lo = 0 then
                 Line('  mov x1, ' + idx)
               else
-              begin
-                Imm('x1', td.Lo);
-                Line('  sub x1, ' + idx + ', x1');
-              end;
-              if (td.Hi - td.Lo >= 0) and (td.Hi - td.Lo <= 4095) then
-                Line('  cmp x1, #' + IntToStr(td.Hi - td.Lo))
-              else
-              begin
-                Imm('x0', td.Hi - td.Lo);
-                Line('  cmp x1, x0');
-              end;
+                AddImmArm('x1', idx, -td.Lo);
+              CmpImmArm('x1', td.Hi - td.Lo, 'x0');
               ColdBegin('  b.hi');
               BoundsFailArm(idx, 0, td.Lo, '', td.Hi, 0);
               ColdEnd;
@@ -26806,9 +26755,14 @@ begin
               end
               else
               begin
-                Line('  movq %' + idx + ', %rcx');
-                LoadImmR('rax', td.Lo);
-                Line('  subq %rax, %rcx');
+                if Fits32(-td.Lo) then
+                  Line('  leaq ' + IntToStr(-td.Lo) + '(%' + idx + '), %rcx')
+                else
+                begin
+                  Line('  movq %' + idx + ', %rcx');
+                  LoadImmR('rax', td.Lo);
+                  Line('  subq %rax, %rcx');
+                end;
                 if Fits32(td.Hi - td.Lo) then
                   Line('  cmpq $' + IntToStr(td.Hi - td.Lo) + ', %rcx')
                 else
@@ -26939,13 +26893,92 @@ begin
   FWmOff := Off;
 end;
 
-{ arm64: Dst := Src + D. }
+{ E is a constant word: an integer, a character, nil (P306). }
+function TEmitter.ConstOf(E: PExpr; out K: Int64): Boolean;
+begin
+  Result := True;
+  K := 0;
+  if E^.Kind = ekInt then
+    K := E^.Num
+  else if (E^.Kind = ekStr) and (Length(E^.Txt) = 1) then
+    K := Ord(E^.Txt[1])
+  else if E^.Kind <> ekNil then
+    Result := False;
+end;
+
+{ arm64: R compared with K: CMP's immediate, CMN's for a negative K
+  (ARM DDI 0487 M.c C6.2.96 and C6.2.93: aliases of SUBS and ADDS with
+  imm12 and its shift by 12), else K in Tmp (P306). }
+procedure TEmitter.CmpImmArm(const R: string; K: Int64; const Tmp: string);
+begin
+  if ArmAddImm(K) <> '' then
+    Line('  cmp ' + R + ', ' + ArmAddImm(K))
+  else if (K < 0) and (K > Low(Int64)) and (ArmAddImm(-K) <> '') then
+    Line('  cmn ' + R + ', ' + ArmAddImm(-K))
+  else
+  begin
+    Imm(Tmp, K);
+    Line('  cmp ' + R + ', ' + Tmp);
+  end;
+end;
+
+{ arm64: sp := sp - K or sp + K (Op 'sub' or 'add'), the immediate for
+  1 to 4095, the form MapNote counts as it counts sub sp, sp, x16 with
+  x16 known; nothing for 0 (P306). }
+procedure TEmitter.SpAdjArm(const Op: string; K: Int64);
+begin
+  if K = 0 then
+    Exit;
+  if (K > 0) and (K <= 4095) then
+    Line('  ' + Op + ' sp, sp, #' + IntToStr(K))
+  else
+  begin
+    Imm('x16', K);
+    Line('  ' + Op + ' sp, sp, x16');
+  end;
+end;
+
+{ amd64: R := R + K, ADD's sign-extended imm32 when K fits (SDM vol. 2A
+  3-14 ADD, REX.W 81 /0 id and 83 /0 ib), nothing for 0, else through rcx;
+  R is not rcx (P306). }
+procedure TEmitter.AddKX86(const R: string; K: Int64);
+begin
+  if K = 0 then
+    Exit;
+  if Fits32(K) then
+    Line('  addq $' + IntToStr(K) + ', %' + R)
+  else
+  begin
+    Line('  movabsq $' + IntToStr(K) + ', %rcx');
+    Line('  addq %rcx, %' + R);
+  end;
+end;
+
+{ arm64: Dst := Src + D as AddImmArm, a constant no immediate takes in
+  Tmp (P306). }
+procedure TEmitter.AddImmArmT(const Dst, Src: string; D: Int64; const Tmp: string);
+begin
+  if (D > 0) and (ArmAddImm(D) <> '') then
+    Line('  add ' + Dst + ', ' + Src + ', ' + ArmAddImm(D))
+  else if (D < 0) and (D > Low(Int64)) and (ArmAddImm(-D) <> '') then
+    Line('  sub ' + Dst + ', ' + Src + ', ' + ArmAddImm(-D))
+  else if D <> 0 then
+  begin
+    Imm(Tmp, D);
+    Line('  add ' + Dst + ', ' + Src + ', ' + Tmp);
+  end
+  else if Dst <> Src then
+    Line('  mov ' + Dst + ', ' + Src);
+end;
+
+{ arm64: Dst := Src + D, the constant ADD's or SUB's immediate when it
+  is 0 to 4095 or such a value shifted by 12 (ArmAddImm, P306). }
 procedure TEmitter.AddImmArm(const Dst, Src: string; D: Int64);
 begin
-  if (D > 0) and (D <= 4095) then
-    Line('  add ' + Dst + ', ' + Src + ', #' + IntToStr(D))
-  else if (D < 0) and (D >= -4095) then
-    Line('  sub ' + Dst + ', ' + Src + ', #' + IntToStr(-D))
+  if (D > 0) and (ArmAddImm(D) <> '') then
+    Line('  add ' + Dst + ', ' + Src + ', ' + ArmAddImm(D))
+  else if (D < 0) and (D > Low(Int64)) and (ArmAddImm(-D) <> '') then
+    Line('  sub ' + Dst + ', ' + Src + ', ' + ArmAddImm(-D))
   else if D <> 0 then
   begin
     Imm('x17', D);
@@ -27092,9 +27125,19 @@ begin
       Exit;
     if FArm then
     begin
+      { a constant add, sub, and, orr or eor takes (P306) }
       if ((e^.Bin = boAdd) or (e^.Bin = boSub)) and (e^.R^.Kind = ekInt) and
-        (e^.R^.Num >= 0) and (e^.R^.Num <= 4095) then
-        op := '#' + IntToStr(e^.R^.Num)
+        (e^.R^.Num > Low(Int64)) then
+      begin
+        if e^.Bin = boAdd then
+          AddImmArm(dst.Reg, dst.Reg, e^.R^.Num)
+        else
+          AddImmArm(dst.Reg, dst.Reg, -e^.R^.Num);
+        Exit;
+      end;
+      if ((e^.Bin = boAnd) or (e^.Bin = boOr) or (e^.Bin = boXor)) and
+        (e^.R^.Kind = ekInt) and ArmLogImm(e^.R^.Num) then
+        op := '#' + HexWord(e^.R^.Num)
       else
         op := OrdOperand(e^.R, -1);
       case e^.Bin of
@@ -27200,9 +27243,23 @@ begin
     Exit;
   if FArm then
   begin
-    if ((E^.Bin = boAdd) or (E^.Bin = boSub)) and (E^.R^.Kind = ekInt) and
-      (E^.R^.Num >= 0) and (E^.R^.Num <= 4095) then
-      op := '#' + IntToStr(E^.R^.Num)
+    { a constant add, sub, and, orr or eor takes (P306) }
+    if ((E^.Bin = boAdd) or (E^.Bin = boSub)) and (E^.R^.Kind = ekInt) then
+    begin
+      if E^.Bin = boAdd then
+        AddImmArm(R, R, E^.R^.Num)
+      else if E^.R^.Num > Low(Int64) then
+        AddImmArm(R, R, -E^.R^.Num)
+      else
+      begin
+        Imm('x17', E^.R^.Num);
+        Line('  sub ' + R + ', ' + R + ', x17');
+      end;
+      Exit;
+    end;
+    if ((E^.Bin = boAnd) or (E^.Bin = boOr) or (E^.Bin = boXor)) and
+      (E^.R^.Kind = ekInt) and ArmLogImm(E^.R^.Num) then
+      op := '#' + HexWord(E^.R^.Num)
     else
       op := OrdOperand(E^.R, -1);
     case E^.Bin of
@@ -27241,6 +27298,7 @@ end;
 function TEmitter.OrdJcc(E: PExpr; const Target: string; WhenTrue: Boolean): Boolean;
 var
   op, cc: string;
+  k: Int64;
 begin
   Result := False;
   if (E = nil) or (E^.Kind <> ekBin) then
@@ -27262,11 +27320,12 @@ begin
   cc := CondCC(E^.Bin, WhenTrue);
   if FArm then
   begin
-    if (E^.R^.Kind = ekInt) and (E^.R^.Num >= 0) and (E^.R^.Num <= 4095) then
-      op := '#' + IntToStr(E^.R^.Num)
+    { a constant CMP or CMN takes, a character's and nil's too (P306) }
+    if ConstOf(E^.R, k) and ((ArmAddImm(k) <> '') or
+      ((k < 0) and (k > Low(Int64)) and (ArmAddImm(-k) <> ''))) then
+      CmpImmArm(OrdPool(0), k, 'x17')
     else
-      op := OrdOperand(E^.R, 0);
-    Line('  cmp ' + OrdPool(0) + ', ' + op);
+      Line('  cmp ' + OrdPool(0) + ', ' + OrdOperand(E^.R, 0));
     Line('  b.' + cc + ' ' + Target);
   end
   else
@@ -27543,8 +27602,7 @@ begin
     Line('  sub x2, x2, #1')
   else if HiAdj <> 0 then
   begin
-    Imm('x16', HiAdj);
-    Line('  add x2, x2, x16');
+    AddImmArm('x2', 'x2', HiAdj);
   end;
   if ix = '' then
     Imm('x0', IdxK)
@@ -28101,11 +28159,17 @@ begin
     Line('  .cfi_offset 30, -8');
     Line('  mov x29, sp');
     Line('  .cfi_def_cfa_register 29');
-    if sysw then
-      Imm('x16', FFrame)
+    { a frame known now and up to 4095 bytes as SUB's immediate (P306) }
+    if sysw and (FFrame > 0) and (FFrame <= 4095) then
+      Line('  sub sp, sp, #' + IntToStr(FFrame))
     else
-      Line('  ldr x16, ' + FFrameSym);
-    Line('  sub sp, sp, x16');
+    begin
+      if sysw then
+        Imm('x16', FFrame)
+      else
+        Line('  ldr x16, ' + FFrameSym);
+      Line('  sub sp, sp, x16');
+    end;
     MapBegin;
     if Pr.Nest > 0 then
       StFP('x27', -8);
@@ -43512,12 +43576,10 @@ begin
   Imm('x9', 4096);
   Line('  cmp x20, x9');
   Line('  b.lo .sh_nil');
-  Imm('x9', 65536);
-  Line('  sub x9, x22, x9');
+  AddImmArmT('x9', 'x22', -(65536), 'x9');
   Line('  cmp x20, x9');
   Line('  b.lo .sh_bad');
-  Imm('x9', 4096);
-  Line('  add x9, x22, x9');
+  AddImmArmT('x9', 'x22', 4096, 'x9');
   Line('  cmp x20, x9');
   Line('  b.hs .sh_bad');
   Line('.sh_stk:');
@@ -45673,8 +45735,7 @@ begin
   Line('  ldr x3, [x0, #32]');
   Line('  cmp x2, x3');
   Line('  b.hi .cm_nx');
-  Imm('x9', 32768);
-  Line('  sub x3, x3, x9');
+  AddImmArmT('x3', 'x3', -(32768), 'x9');
   Line('  cmp x2, x3');
   Line('  b.lo .cm_nx');
   Line('  ret');
@@ -45825,32 +45886,26 @@ begin
   Line('  ldr x0, [x19, #2104]');
   Line('  ldr x1, [x19, #2112]');
   Line('  cbz x0, .ng_pmap');
-  Imm('x2', 32768);
-  Line('  add x2, x0, x2');
+  AddImmArmT('x2', 'x0', 32768, 'x2');
   Line('  cmp x2, x1');
   Line('  b.ls .ng_ptake');
   Line('.ng_pmap:');
   Imm('x0', 524288);
   Line('  bl rt_mmap');
   Line('  str x0, [x19, #2104]');
-  Imm('x1', 524288);
-  Line('  add x1, x0, x1');
+  AddImmArmT('x1', 'x0', 524288, 'x1');
   Line('  str x1, [x19, #2112]');
   Line('.ng_ptake:');
   Line('  ldr x0, [x19, #2104]');
-  Imm('x2', 32768);
-  Line('  add x2, x0, x2');
+  AddImmArmT('x2', 'x0', 32768, 'x2');
   Line('  str x2, [x19, #2104]');
   Line('  mov x20, x0');
   Line('  bl rt_guard');
-  Imm('x9', 4096);
-  Line('  add x0, x20, x9');
+  AddImmArmT('x0', 'x20', 4096, 'x9');
   Line('  str x20, [x0]');
-  Imm('x9', 32768);
-  Line('  add x9, x20, x9');
+  AddImmArmT('x9', 'x20', 32768, 'x9');
   Line('  str x9, [x0, #8]');
-  Imm('x9', 4384);
-  Line('  add x9, x20, x9');
+  AddImmArmT('x9', 'x20', 4384, 'x9');
   Line('  str x9, [x0, #16]');
   Line('  str x9, [x0, #24]');
   Line('  bl rt_allgadd');
@@ -45877,8 +45932,7 @@ begin
   LdS('rt_slabnext', 'x0');
   LdS('rt_slabend', 'x1');
   Line('  cbz x0, .ng_slab');
-  Imm('x2', 32768);
-  Line('  add x2, x0, x2');
+  AddImmArmT('x2', 'x0', 32768, 'x2');
   Line('  cmp x2, x1');
   Line('  b.ls .ng_take');
   Line('.ng_slab:');
@@ -45892,33 +45946,27 @@ begin
   LdS('rt_slabnext', 'x0');
   LdS('rt_slabend', 'x1');
   Line('  cbz x0, .ng_inst');
-  Imm('x2', 32768);
-  Line('  add x2, x0, x2');
+  AddImmArmT('x2', 'x0', 32768, 'x2');
   Line('  cmp x2, x1');
   Line('  b.ls .ng_take');
   Line('.ng_inst:');
   StS('x20', 'rt_slabnext');
-  Imm('x1', 524288);
-  Line('  add x1, x20, x1');
+  AddImmArmT('x1', 'x20', 524288, 'x1');
   StS('x1', 'rt_slabend');
   Line('  mov x0, x20');
   Line('.ng_take:');
-  Imm('x2', 32768);
-  Line('  add x2, x0, x2');
+  AddImmArmT('x2', 'x0', 32768, 'x2');
   StS('x2', 'rt_slabnext');
   Line('  mov x19, x0');
-  Imm('x20', 4096);
-  Line('  add x20, x0, x20');
+  AddImmArmT('x20', 'x0', 4096, 'x20');
   LeaS('rt_gflock', 'x0');
   Line('  bl rt_unlock');
   Line('  mov x0, x19');
   Line('  bl rt_guard');
   Line('  str x19, [x20]');
-  Imm('x9', 32768);
-  Line('  add x9, x19, x9');
+  AddImmArmT('x9', 'x19', 32768, 'x9');
   Line('  str x9, [x20, #8]');
-  Imm('x9', 4384);
-  Line('  add x9, x19, x9');
+  AddImmArmT('x9', 'x19', 4384, 'x9');
   Line('  str x9, [x20, #16]');
   Line('  str x9, [x20, #24]');
   Line('  mov x0, x20');
@@ -46024,8 +46072,7 @@ begin
   Line('  bl rt_guard');
   Ppop('x0');
   Ppop('x21');
-  Imm('x9', 32768);
-  Line('  add x0, x0, x9');
+  AddImmArmT('x0', 'x0', 32768, 'x9');
   LeaS('rt_allm', 'x21');
   Line('  lsl x9, x20, #7');
   Line('  add x21, x21, x9');
@@ -46153,8 +46200,7 @@ begin
   Line('  str x0, [sp, #-16]!');
   Line('  bl rt_guard');
   Line('  ldr x0, [sp], #16');
-  Imm('x9', 32768);
-  Line('  add x0, x0, x9');
+  AddImmArmT('x0', 'x0', 32768, 'x9');
   Line('  str x0, [x23, #32]');
   LdS('rt_mstarted', 'x9');
   Line('  add x9, x9, #1');
@@ -47741,8 +47787,7 @@ begin
   StS('x0', 'rt_nproc');
   LeaS('rt_heap', 'x0');
   StS('x0', 'rt_heapp');
-  Imm('x9', 1048576);
-  Line('  add x0, x0, x9');
+  AddImmArmT('x0', 'x0', 1048576, 'x9');
   StS('x0', 'rt_heape');
   Line('  mov x0, #1');
   StS('x0', 'rt_nlive');
@@ -47759,8 +47804,7 @@ begin
     calls to leave its M (found by P93). }
   Imm('x0', 8192);
   Line('  bl rt_mmap');
-  Imm('x9', 8192);
-  Line('  add x1, x0, x9');
+  AddImmArmT('x1', 'x0', 8192, 'x9');
   Imm('x0', $50F00);
   Line('  mov x2, xzr');
   Line('  mov x3, xzr');
@@ -47781,11 +47825,9 @@ begin
   Line('  str x9, [x28, #176]');
   StS('x9', 'rt_goidseq');
   Line('  str x19, [x28]');
-  Imm('x9', 1048576);
-  Line('  add x9, x19, x9');
+  AddImmArmT('x9', 'x19', 1048576, 'x9');
   Line('  str x9, [x28, #8]');
-  Imm('x9', 4224);
-  Line('  add x9, x19, x9');
+  AddImmArmT('x9', 'x19', 4224, 'x9');
   Line('  str x9, [x28, #16]');
   Line('  str x9, [x28, #24]');
   LeaS('rt_allm', 'x21');
@@ -47931,8 +47973,7 @@ begin
   Line('  mov x2, x7');
   Line('  str x19, [x28]');
   Line('  str x2, [x28, #8]');
-  Imm('x9', 4224);
-  Line('  add x9, x19, x9');
+  AddImmArmT('x9', 'x19', 4224, 'x9');
   Line('  str x9, [x28, #16]');
   Line('  str x9, [x28, #24]');
   Line('  sub x9, x2, x22');
@@ -48869,8 +48910,7 @@ begin
   Line('  bic x0, x0, #7');
   Line('  stp x0, x30, [sp, #-32]!');
   Line('  str x2, [sp, #16]');
-  Imm('x13', 8191);
-  Line('  add x1, x1, x13');
+  AddImmArmT('x1', 'x1', 8191, 'x13');
   Line('  and x1, x1, #-8192');
   Line('  mov w2, wzr');
   Line('  bl rt_fillbig');
@@ -49873,15 +49913,13 @@ begin
   Line('  b.ls .pa_unlock');
   Psh('x0');
   Line('  mov x1, x0');
-  Imm('x9', 2097152);
-  Line('  add x1, x1, x9');
+  AddImmArmT('x1', 'x1', 2097152, 'x9');
   Imm('x9', 16777216);
   Line('  cmp x1, x9');
   Line('  b.hs .pa_msz');
   Line('  mov x1, x9');
   Line('.pa_msz:');
-  Imm('x9', 2097151);
-  Line('  add x1, x1, x9');
+  AddImmArmT('x1', 'x1', 2097151, 'x9');
   Imm('x9', -2097152);
   Line('  and x1, x1, x9');
   Line('  cmp x1, #0');

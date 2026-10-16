@@ -322,6 +322,9 @@ GOLDEN_A64 += ifcase
 # P304: Move and FillChar of a constant count up to 128 bytes in line.
 GOLDEN += movefill
 GOLDEN_A64 += movefill
+# P306: a constant an instruction can take is its immediate.
+GOLDEN += immconst
+GOLDEN_A64 += immconst
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -2318,6 +2321,9 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	done; \
 	awk '/^p_c129:/,/cfi_endproc/' $(BUILDDIR)/movefill.s | grep -q 'call rt_memcpy' || { echo "movefill.s: c129 does not call rt_memcpy"; exit 1; }; \
 	echo ok movefill-asm; \
+	: a constant an instruction can take is its immediate, P306: the routines of immconst load no such constant into a register first; \
+	python3 -I scripts/check_immediates.py $(BUILDDIR)/immconst.s adds,logic,steps,cmps,chars,kind,arrays; \
+	echo ok immconst-asm; \
 	: every loop of an asm kernel of the units starts aligned, as the loops paslangc compiles, P302; \
 	python3 -I scripts/check_kernel_align.py src/lib/*.paslang src/rtl/*.paslang; \
 	echo ok kernel-align; \
@@ -3406,6 +3412,8 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	done; \
 	awk '/^p_c129:/,/cfi_endproc/' $(BUILDDIR)/movefill-arm.s | grep -q 'bl rt_memcpy' || { echo "movefill-arm.s: c129 does not call rt_memcpy"; exit 1; }; \
 	echo ok movefill-arm-asm; \
+	python3 -I scripts/check_immediates.py $(BUILDDIR)/immconst-arm.s adds,logic,steps,cmps,chars,kind,arrays; \
+	echo ok immconst-arm-asm; \
 	$(OUTDIR)/paslangc -target arm64 -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/exprinline0-arm testdata/exprinline.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/exprinline0-arm > $(BUILDDIR)/exprinline0-arm.got; \
 	diff -u testdata/exprinline.out $(BUILDDIR)/exprinline0-arm.got; \
