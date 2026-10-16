@@ -361,6 +361,10 @@ type
     FResReg: string;        { the register Result lives in while a loop keeps it there }
     FAddrNames: array of string; { lower-case names whose address is taken in this compilation }
     FLocAddr: array of string; { those taken in the routine being emitted and the routines nested in it (1.0.128) }
+    FSelBody: PStmt;        { the body being emitted, whose load addresses a select looks at (P307) }
+    FLoadDone: Boolean;     { FLoadAddr is FSelBody's }
+    FLoadGrew: Boolean;
+    FLoadAddr: TStrArray;   { the variables whose value goes into a load's address in FSelBody (P307) }
     FAddrKept: TStrArray;   { of those, the addresses that may be kept: not only passed to SetLength, Move or FillChar (P100) }
     FIsUnit: Boolean;
     FExtVars: TStrArray;    { the globals of other units, lowered (1.0.136) }
@@ -816,6 +820,22 @@ type
     function LoadKind(E: PExpr): Boolean;
     function NoStmt(S: PStmt): Boolean;
     procedure DropJumpTo(const L: string);
+    function SpecLeaf(E: PExpr): Boolean;
+    function SpecOps(E: PExpr): LongInt;
+    function SelTarget(S: PStmt; out X: TSym; out V: PExpr): Boolean;
+    function OwnLocal(const S: TSym): Boolean;
+    procedure CondSides(E, Pref: PExpr; out A, B: PExpr; out Op: TBinOp);
+    function CondFlagsOK(E: PExpr; D: LongInt; Pref: PExpr): Boolean;
+    function CondFlags(E: PExpr; D: LongInt; Pref: PExpr; out Side: string): TBinOp;
+    procedure SelLoad(F: PExpr; const R: string);
+    function SelReg(F: PExpr; const Spare: string): string;
+    function IncOne(E: PExpr; out A: PExpr): Boolean;
+    procedure SelBodyIs(B: PStmt);
+    procedure LoadAddrE(E: PExpr; InAddr: Boolean);
+    procedure LoadAddrPlace(D: PExpr);
+    procedure LoadAddrS(S: PStmt);
+    function LoadAddrSym(const S: TSym): Boolean;
+    function EmitSelectIf(S: PStmt): Boolean;
     function FindLineBack(const L: string): SizeInt;
     procedure ReplaceLine(P, OldLen: SizeInt; const NewText: string);
     function SubImmText(const D, S: string; V: Int64): string;
@@ -2043,7 +2063,10 @@ begin
     for i := 0 to High(Prog.UsesNames) do
       Line('  bl u_' + ToLower(Prog.UsesNames[i]) + '_init');
     if Prog.InitBody <> nil then
+    begin
+      SelBodyIs(Prog.InitBody);
       EmitStmt(Prog.InitBody);
+    end;
     LeaS(finiSym, 'x0');
     Line('  bl rt_regfini');
     Line(ret + ':');
@@ -2064,6 +2087,7 @@ begin
       Line('  mov x29, sp');
       FrameMarkArm;
       MapBegin;
+      SelBodyIs(Prog.FiniBody);
       EmitStmt(Prog.FiniBody);
       Line('  mov x0, xzr');
       Line('  mov sp, x29');
@@ -2088,7 +2112,10 @@ begin
     for i := 0 to High(Prog.UsesNames) do
       Line('  call u_' + ToLower(Prog.UsesNames[i]) + '_init');
     if Prog.InitBody <> nil then
+    begin
+      SelBodyIs(Prog.InitBody);
       EmitStmt(Prog.InitBody);
+    end;
     Line('  leaq ' + finiSym + '(%rip), %rdi');
     Line('  call rt_regfini');
     Line(ret + ':');
@@ -2108,6 +2135,7 @@ begin
       Line('  movq %rsp, %rbp');
       Line('  subq $' + FFrameSym + ', %rsp');
       MapBegin;
+      SelBodyIs(Prog.FiniBody);
       EmitStmt(Prog.FiniBody);
       Line('  xorq %rax, %rax');
       Line('  leave');
@@ -6914,6 +6942,529 @@ begin
     Result := 'jg'
   else
     Result := 'jge';
+end;
+
+{ ---- An if of a word assignment as a select (P307) ----
+
+  if c then x := e, and if c then x := e else x := f, are a compare and
+  a conditional select where Go's branchelim makes them one
+  (cmd/compile/internal/ssacompile/branchelim.go): the arm of an if
+  without an else at most two instructions that read no memory, divide
+  nothing and call nothing (elimIf's maxfuseinsts 2 and
+  canSpeculativelyExecute), each arm of an if with one at most one
+  (elimIfElse), x a word of 64 bits (amd64's CMOV takes no byte,
+  canCondSelect), one variable a side (shouldElimIfElse's one phi on
+  amd64), and x a register or a local nothing else reaches (OwnLocal):
+  Go's phis are SSA values, never memory. An e that is the compare's
+  side, as if a[i] > m then m := a[i] or if p^.next <> nil then
+  p := p^.next, is one value for Go's CSE: worked out once for the
+  compare, its load done whether or not the condition holds, so any e.
+  Else e and an f that is an instruction are worked out first into the
+  pool, then the compare sets
+  the flags, then nothing that writes them comes before the select: a
+  leaf f and x go to their registers by MOV, LDR or MOVZ, never by a
+  zeroing xor. On amd64 CMOVcc (SDM vol. 2A 3-157: the move happens when
+  the condition holds, the flags untouched), on arm64 CSEL (ARM DDI 0487
+  M.c C6.2.138), CSINC when an arm adds one to a variable and CINC when
+  the other arm is that variable (C6.2.141, C6.2.86; Go's ARM64.rules
+  turn a CSEL of an ADDconst [1] into them), XZR for a zero (Go's
+  CSEL0); so a branch the data makes unpredictable costs nothing. Go's
+  count of a list's values equal to k is CMP and CINC EQ on arm64, SETE
+  and CMOVNE on amd64 (go tool objdump). }
+
+{ A leaf a select reads with no instruction of its own or with one move:
+  a constant, a character, nil, a word variable. }
+function TEmitter.SpecLeaf(E: PExpr): Boolean;
+var
+  s: TSym;
+begin
+  Result := (E <> nil) and ((E^.Kind = ekInt) or (E^.Kind = ekNil) or
+    ((E^.Kind = ekStr) and (Length(E^.Txt) = 1)) or
+    ((E^.Kind = ekVar) and WordVar(E, s)));
+end;
+
+{ The instructions E takes when it can be worked out before its
+  condition holds, as Go's canSpeculativelyExecute, -1 when it cannot:
+  leaves and adds, subs, ands, ors and xors of words, no load, no
+  division, no pointer arithmetic, no narrow operation that a cleanup
+  follows. }
+function TEmitter.SpecOps(E: PExpr): LongInt;
+var
+  l, r: LongInt;
+begin
+  Result := -1;
+  if E = nil then
+    Exit;
+  if SpecLeaf(E) then
+  begin
+    Result := 0;
+    Exit;
+  end;
+  if not ((E^.Kind = ekBin) and (E^.L <> nil) and (E^.R <> nil) and
+    (TKind(E^.Typ) <> tykPointer) and ((E^.Bin = boAdd) or (E^.Bin = boSub) or
+    (E^.Bin = boAnd) or (E^.Bin = boOr) or (E^.Bin = boXor)) and
+    (not NarrowOp(E)) and (TSize(E^.Typ) = 8)) then
+    Exit;
+  l := SpecOps(E^.L);
+  r := SpecOps(E^.R);
+  if (l >= 0) and (r >= 0) then
+    Result := l + r + 1;
+end;
+
+{ S is one assignment of a word variable X of 64 bits, X := V, or an Inc
+  or a Dec of one (V then X + k or X - k). }
+function TEmitter.SelTarget(S: PStmt; out X: TSym; out V: PExpr): Boolean;
+var
+  d: PExpr;
+  k: TTypeKind;
+begin
+  Result := False;
+  V := nil;
+  if (S <> nil) and (S^.Kind = skBlock) and (Length(S^.Stmts) = 1) then
+    S := S^.Stmts[0];
+  if S = nil then
+    Exit;
+  d := S^.Dest;
+  if (S^.Kind <> skAssign) and (S^.Kind <> skInc) and (S^.Kind <> skDec) then
+    Exit;
+  if (d = nil) or (d^.Kind <> ekVar) or (not WordVar(d, X)) or (TSize(X.Typ) <> 8) then
+    Exit;
+  k := TKind(X.Typ);
+  if not ((k = tykInteger) or (k = tykEnum) or (k = tykSubrange) or (k = tykPointer) or
+    (k = tykClass)) then
+    Exit;
+  if S^.Kind = skAssign then
+    V := S^.E
+  else
+  begin
+    if S^.E = nil then
+      V := NewInt(1)
+    else
+      V := S^.E;
+    if S^.Kind = skInc then
+      V := NewBin(boAdd, d, V)
+    else
+      V := NewBin(boSub, d, V);
+    V^.Typ := X.Typ;
+  end;
+  Result := V <> nil;
+end;
+
+{ S is a local of this routine nothing else reaches while it runs, as a
+  value of Go's SSA is: not a global, not reached by reference or from a
+  nested routine (which pas can start on another thread), its address
+  not taken; P289's rule. A select in memory writes it back whether its
+  condition held or not, which only such a variable cannot tell. }
+function TEmitter.OwnLocal(const S: TSym): Boolean;
+var
+  k: SizeInt;
+begin
+  Result := (not S.Global) and (not S.ByRef) and (S.Up = 0) and (not S.Boxed) and
+    (not LocAddrTaken(S.Name));
+  if Result then
+    for k := 0 to High(FProgProcs) do
+      if FProgProcs[k].ParentSym = FCurProc then
+        Result := False;
+end;
+
+{ The sides of the comparison E as CondFlags compares them, A with B by
+  Op: a constant on the left goes to the right with the comparison
+  turned round, as CondJmp's (P290), so it is CMP's immediate; so does
+  the side Pref is when Pref is the right one, so its value is the
+  register CondFlags gives back. }
+procedure TEmitter.CondSides(E, Pref: PExpr; out A, B: PExpr; out Op: TBinOp);
+var
+  k: Int64;
+begin
+  A := E^.L;
+  B := E^.R;
+  Op := E^.Bin;
+  if (ConstOf(A, k) and not ConstOf(B, k)) or
+    ((Pref <> nil) and SameExpr(Pref, B) and not SameExpr(Pref, A)) then
+  begin
+    A := E^.R;
+    B := E^.L;
+    case Op of
+      boLt: Op := boGt;
+      boLe: Op := boGe;
+      boGt: Op := boLt;
+      boGe: Op := boLe;
+    end;
+  end;
+end;
+
+{ E is a comparison of two words CondFlags sets the flags for: its left
+  side in pool register D, its right side a leaf or pool register D+1;
+  with Pref, the left side is Pref. }
+function TEmitter.CondFlagsOK(E: PExpr; D: LongInt; Pref: PExpr): Boolean;
+var
+  k: TTypeKind;
+  a, b: PExpr;
+  op: TBinOp;
+begin
+  Result := False;
+  if (E = nil) or (E^.Kind <> ekBin) or (E^.L = nil) or (E^.R = nil) then
+    Exit;
+  if (E^.Bin <> boEq) and (E^.Bin <> boNe) and (E^.Bin <> boLt) and
+    (E^.Bin <> boLe) and (E^.Bin <> boGt) and (E^.Bin <> boGe) then
+    Exit;
+  CondSides(E, Pref, a, b, op);
+  if (Pref <> nil) and not SameExpr(Pref, a) then
+    Exit;
+  k := TKind(a^.Typ);
+  if not ((k = tykInteger) or (k = tykEnum) or (k = tykSubrange) or (k = tykPointer) or
+    (k = tykClass)) then
+    Exit;
+  if IsFat(a^.Typ) or IsFat(b^.Typ) or (TKind(b^.Typ) = tykSet) or
+    (TKind(b^.Typ) = tykReal) then
+    Exit;
+  Result := OrdSimple(a, D) and (OrdLeaf(b) or OrdSimple(b, D + 1));
+end;
+
+{ The flags of the comparison E, and the comparison they answer: its
+  left side into pool register D, or the register a region keeps it in,
+  which Side gives back, and one CMP, the right side its immediate where
+  the instruction takes one (P306). }
+function TEmitter.CondFlags(E: PExpr; D: LongInt; Pref: PExpr; out Side: string): TBinOp;
+var
+  a, b: PExpr;
+  k: Int64;
+  l: string;
+begin
+  CondSides(E, Pref, a, b, Result);
+  { a variable a region keeps is compared in its register (P303) }
+  l := WordReg(a);
+  if l = '' then
+  begin
+    EmitOrdTo(a, D);
+    l := OrdPool(D);
+  end;
+  if FArm then
+  begin
+    if ConstOf(b, k) and ((ArmAddImm(k) <> '') or
+      ((k < 0) and (k > Low(Int64)) and (ArmAddImm(-k) <> ''))) then
+      CmpImmArm(l, k, 'x17')
+    else
+      Line('  cmp ' + l + ', ' + OrdOperand(b, D));
+  end
+  else if ConstOf(b, k) and (k = 0) then
+    Line('  testq %' + l + ', %' + l)
+  else
+    Line('  cmpq ' + OrdOperand(b, D) + ', %' + l);
+  Side := l;
+end;
+
+{ The leaf F into register R with no write of the flags: MOV, MOVZ and
+  MOVK, LDR, never xor's zero. }
+procedure TEmitter.SelLoad(F: PExpr; const R: string);
+var
+  s: TSym;
+  k: Int64;
+begin
+  if (F^.Kind = ekVar) and WordVar(F, s) then
+  begin
+    if s.Reg <> R then
+      LoadWordVar(s, R);
+    Exit;
+  end;
+  if not ConstOf(F, k) then
+    Die('internal error: a select''s leaf');
+  if FArm then
+    Imm(R, k)
+  else if Fits32(k) then
+    Line('  movq $' + IntToStr(k) + ', %' + R)
+  else
+    Line('  movabsq $' + IntToStr(k) + ', %' + R);
+end;
+
+{ The register a select reads the leaf F from: the one a region keeps
+  the variable in, xzr for a zero on arm64 (Go's CSEL0), else Spare
+  after SelLoad. }
+function TEmitter.SelReg(F: PExpr; const Spare: string): string;
+var
+  k: Int64;
+begin
+  Result := WordReg(F);
+  if Result <> '' then
+    Exit;
+  if FArm and ConstOf(F, k) and (k = 0) then
+  begin
+    Result := 'xzr';
+    Exit;
+  end;
+  SelLoad(F, Spare);
+  Result := Spare;
+end;
+
+{ E is A + 1 or 1 + A, A a word variable: on arm64 CSINC adds the one
+  itself, as Go's ARM64.rules turn a CSEL of an ADDconst [1] into one
+  (ARM DDI 0487 M.c C6.2.141; CINC, C6.2.86, when both sources are A). }
+function TEmitter.IncOne(E: PExpr; out A: PExpr): Boolean;
+var
+  k: Int64;
+begin
+  Result := False;
+  A := nil;
+  if (E = nil) or (E^.Kind <> ekBin) or (E^.Bin <> boAdd) or (E^.L = nil) or
+    (E^.R = nil) then
+    Exit;
+  if (E^.L^.Kind = ekVar) and ConstOf(E^.R, k) and (k = 1) then
+    A := E^.L
+  else if (E^.R^.Kind = ekVar) and ConstOf(E^.L, k) and (k = 1) then
+    A := E^.R;
+  Result := (A <> nil) and SpecLeaf(A);
+end;
+
+{ The variables whose value goes into the address of a load in the body
+  being emitted, as the loadAddr of Go's branchelim: a pointer that is
+  dereferenced, a class reference whose field is read, an index, and
+  what an assignment to one of them reads, to a fixed point; a store's
+  address is none. A select would make such a load wait for its compare
+  where a predicted branch lets it start at once (canCondSelect, Go's
+  issue 26306): if p^.next <> nil then p := p^.next stays a branch. }
+procedure TEmitter.SelBodyIs(B: PStmt);
+begin
+  FSelBody := B;
+  FLoadDone := False;
+  FLoadAddr := nil;
+end;
+
+procedure TEmitter.LoadAddrE(E: PExpr; InAddr: Boolean);
+var
+  i: SizeInt;
+begin
+  if E = nil then
+    Exit;
+  case E^.Kind of
+    ekVar:
+      if InAddr and not InNames(FLoadAddr, ToLower(E^.Name)) then
+      begin
+        AddName(FLoadAddr, ToLower(E^.Name));
+        FLoadGrew := True;
+      end;
+    ekDeref, ekField:
+      LoadAddrE(E^.L, True);
+    ekIndex:
+      begin
+        LoadAddrE(E^.L, True);
+        LoadAddrE(E^.R, True);
+      end;
+    ekAddr:
+      LoadAddrPlace(E^.L);
+  else
+    begin
+      LoadAddrE(E^.L, InAddr);
+      LoadAddrE(E^.R, InAddr);
+      for i := 0 to High(E^.Args) do
+        LoadAddrE(E^.Args[i], False);
+    end;
+  end;
+end;
+
+{ The place D is written or its address taken: what it reads is read,
+  its own address is no load's. }
+procedure TEmitter.LoadAddrPlace(D: PExpr);
+begin
+  if D = nil then
+    Exit;
+  case D^.Kind of
+    ekIndex:
+      begin
+        LoadAddrPlace(D^.L);
+        LoadAddrE(D^.R, False);
+      end;
+    ekField:
+      LoadAddrPlace(D^.L);
+    ekDeref:
+      LoadAddrE(D^.L, False);
+  else
+    LoadAddrE(D, False);
+  end;
+end;
+
+procedure TEmitter.LoadAddrS(S: PStmt);
+var
+  i: SizeInt;
+  flows: Boolean;
+begin
+  if S = nil then
+    Exit;
+  { what is assigned to a variable a load's address comes from is one
+    too: Go follows a value's integer and pointer arguments }
+  flows := False;
+  if ((S^.Kind = skAssign) or (S^.Kind = skInc) or (S^.Kind = skDec)) and
+    (S^.Dest <> nil) and (S^.Dest^.Kind = ekVar) then
+    flows := InNames(FLoadAddr, ToLower(S^.Dest^.Name))
+  else if (S^.Kind = skFor) or (S^.Kind = skForIn) then
+    flows := InNames(FLoadAddr, ToLower(S^.Name));
+  LoadAddrPlace(S^.Dest);
+  LoadAddrE(S^.E, flows);
+  LoadAddrE(S^.E2, flows);
+  for i := 0 to High(S^.Args) do
+    LoadAddrE(S^.Args[i], False);
+  LoadAddrS(S^.ThenSt);
+  LoadAddrS(S^.ElseSt);
+  LoadAddrS(S^.Body);
+  for i := 0 to High(S^.Stmts) do
+    LoadAddrS(S^.Stmts[i]);
+  for i := 0 to High(S^.Arms) do
+    LoadAddrS(S^.Arms[i].Body);
+  for i := 0 to High(S^.Sels) do
+  begin
+    LoadAddrE(S^.Sels[i].Chan, False);
+    LoadAddrE(S^.Sels[i].ValX, False);
+    LoadAddrS(S^.Sels[i].Body);
+  end;
+end;
+
+{ S is one of FLoadAddr, worked out for the body the first time a select
+  asks. }
+function TEmitter.LoadAddrSym(const S: TSym): Boolean;
+begin
+  if not FLoadDone then
+  begin
+    FLoadAddr := nil;
+    repeat
+      FLoadGrew := False;
+      LoadAddrS(FSelBody);
+    until not FLoadGrew;
+    FLoadDone := True;
+  end;
+  Result := InNames(FLoadAddr, ToLower(S.Name));
+  if (not Result) and FHasRes and (not S.Global) and (S.Off = FResOff) then
+    Result := InNames(FLoadAddr, 'result') or InNames(FLoadAddr, ToLower(FResName));
+end;
+
+{ if c then x := e [else x := f] as a select, when Go's branchelim would
+  make one (above); False with nothing written when not. }
+function TEmitter.EmitSelectIf(S: PStmt): Boolean;
+var
+  x, x2, s2: TSym;
+  e, f, a, fa, pref: PExpr;
+  xc, src, ev, dst, l: string;
+  two, one, onef, fop, same: Boolean;
+  op: TBinOp;
+  k: Int64;
+  d, n: LongInt;
+begin
+  Result := False;
+  if (S = nil) or (S^.E = nil) or FDebug then
+    Exit;
+  if not SelTarget(S^.ThenSt, x, e) then
+    Exit;
+  { in memory x is written back whether the condition held or not }
+  if (x.Reg = '') and not OwnLocal(x) then
+    Exit;
+  if LoadAddrSym(x) then
+    Exit;
+  two := not NoStmt(S^.ElseSt);
+  n := 2;
+  if two then
+    n := 1;
+  if (S^.E^.Kind <> ekBin) or (S^.E^.L = nil) or (S^.E^.R = nil) then
+    Exit;
+  { e the compare's side: its register once the compare is done }
+  same := (WordReg(e) = '') and (not ConstOf(e, k)) and
+    (SameExpr(e, S^.E^.L) or SameExpr(e, S^.E^.R));
+  pref := nil;
+  if same then
+    pref := e
+  else if (SpecOps(e) < 0) or (SpecOps(e) > n) or not OrdSimple(e, 0) then
+    Exit;
+  f := nil;
+  if two then
+  begin
+    if not SelTarget(S^.ElseSt, x2, f) then
+      Exit;
+    if (x.Global <> x2.Global) or (not SamePlace(x, x2)) or (SpecOps(f) < 0) or
+      (SpecOps(f) > 1) then
+      Exit;
+  end;
+  one := FArm and (not same) and IncOne(e, a);
+  onef := FArm and two and (not one) and IncOne(f, fa);
+  { an f that is an instruction is worked out into pool register 1 before
+    the compare, which then starts at 2 }
+  fop := two and (not SpecLeaf(f)) and (not onef);
+  d := 1;
+  if fop then
+  begin
+    d := 2;
+    if not OrdSimple(f, 1) then
+      Exit;
+  end;
+  if not CondFlagsOK(S^.E, d, pref) then
+    Exit;
+  Result := True;
+  if one then
+    e := a;
+  src := '';
+  { the then value: a leaf in the register a region keeps it in or arm64's
+    zero register as it is, else worked out into pool register 0; on
+    amd64 the else value goes into x's register before CMOV reads it }
+  if not same then
+  begin
+    src := WordReg(e);
+    if FArm and (src = '') and ConstOf(e, k) and (k = 0) then
+      src := 'xzr';
+    if (not FArm) and two and (src = x.Reg) then
+      src := '';
+    if src = '' then
+    begin
+      EmitOrdTo(e, 0);
+      src := OrdPool(0);
+    end;
+  end;
+  if fop then
+    EmitOrdTo(f, 1);
+  op := CondFlags(S^.E, d, pref, l);
+  if same then
+    src := l;
+  if FArm then
+  begin
+    dst := x.Reg;
+    if dst = '' then
+      dst := 'x17';
+    if fop then
+      ev := OrdPool(1)
+    else if onef then
+      ev := SelReg(fa, 'x17')
+    else if two then
+      ev := SelReg(f, 'x17')
+    else if x.Reg <> '' then
+      ev := x.Reg
+    else if one and (e^.Kind = ekVar) and WordVar(e, s2) and SamePlace(s2, x) and
+      (not s2.Global) then
+      ev := src
+    else
+    begin
+      LoadWordVar(x, 'x17');
+      ev := 'x17';
+    end;
+    if onef then
+      Line('  csinc ' + dst + ', ' + src + ', ' + ev + ', ' + CondCC(op, True))
+    else if not one then
+      Line('  csel ' + dst + ', ' + src + ', ' + ev + ', ' + CondCC(op, True))
+    else if ev = src then
+      Line('  cinc ' + dst + ', ' + src + ', ' + CondCC(op, True))
+    else
+      Line('  csinc ' + dst + ', ' + ev + ', ' + src + ', ' + CondCC(op, False));
+    if x.Reg = '' then
+      StoreWordVar(x, 'x17');
+    Exit;
+  end;
+  xc := Copy(X86Jcc(CondCC(op, True)), 2, 3);
+  dst := x.Reg;
+  if dst = '' then
+    dst := 'rax';
+  if fop then
+    Line('  movq %' + OrdPool(1) + ', %' + dst)
+  else if two then
+    SelLoad(f, dst)
+  else if x.Reg = '' then
+    LoadWordVar(x, 'rax');
+  Line('  cmov' + xc + 'q %' + src + ', %' + dst);
+  if x.Reg = '' then
+    StoreWordVar(x, 'rax');
 end;
 
 function TEmitter.FastJcc(E: PExpr; const IfFalse: string): Boolean;
@@ -22417,7 +22968,9 @@ begin
           Line(b + ':');
         end;
       skIf:
-        if (S^.ElseSt = nil) and DirectJump(S^.ThenSt, c) then
+        { a word's assignment as a select (P307) }
+        if EmitSelectIf(S) then
+        else if (S^.ElseSt = nil) and DirectJump(S^.ThenSt, c) then
         begin
           if not JccTrue(S^.E, c) then
           begin
@@ -23179,7 +23732,9 @@ begin
         Line(b + ':');
       end;
     skIf:
-      if (S^.ElseSt = nil) and DirectJump(S^.ThenSt, c) then
+      { a word's assignment as a select (P307) }
+      if EmitSelectIf(S) then
+      else if (S^.ElseSt = nil) and DirectJump(S^.ThenSt, c) then
       begin
         if not JccTrue(S^.E, c) then
         begin
@@ -28362,8 +28917,15 @@ var
   leaf: Boolean;
   lst: PStmt;
   ck0, ck1, ms0: SizeInt;
+  savedSel: PStmt;
+  savedLoadDone: Boolean;
+  savedLoadAddr: TStrArray;
 begin
   saved := FSym;
+  savedSel := FSelBody;
+  savedLoadDone := FLoadDone;
+  savedLoadAddr := FLoadAddr;
+  SelBodyIs(Pr.Body);
   savedResName := FResName;
   savedResOff := FResOff;
   savedHas := FHasRes;
@@ -28844,6 +29406,9 @@ begin
   FTryDep := savedTD;
   FTryRec := savedTR;
   FLocAddr := nil;
+  FSelBody := savedSel;
+  FLoadDone := savedLoadDone;
+  FLoadAddr := savedLoadAddr;
   FDaOn := False;
   FDaResKeep := False;
   FCurDa := 0;
@@ -39094,6 +39659,7 @@ begin
       FAsyncOK := not HasAsm(Prog.Body);
       FInMain := True;
       FNestNames := nil;
+      SelBodyIs(Prog.Body);
       EmitStmt(Prog.Body);
       FInMain := False;
       FCpuSet := FProgCpu;
@@ -39140,6 +39706,7 @@ begin
       FAsyncOK := not HasAsm(Prog.Body);
       FInMain := True;
       FNestNames := nil;
+      SelBodyIs(Prog.Body);
       EmitStmt(Prog.Body);
       FInMain := False;
       FCpuSet := FProgCpu;

@@ -331,6 +331,9 @@ GOLDEN_A64 += mulconst
 # P308: an arm64 prologue takes its frame size as immediates.
 GOLDEN += framesize
 GOLDEN_A64 += framesize
+# P307: an if whose arms only assign a word is a conditional select.
+GOLDEN += selectif
+GOLDEN_A64 += selectif
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -2227,12 +2230,12 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  if grep -qE '[0-9]\(%r(si|di)\)' $(BUILDDIR)/varparts-$$f.s; then echo "varparts.s: $$f reads a field through a pool register"; exit 1; fi; \
 	done; \
 	echo ok varparts-asm; \
-	: a while or a repeat that counts runs in runs, P283: Spin and Spin2 work out a run end with a cmov, Spin3 and Others, which do not count, test at every pass; \
+	: a while or a repeat that counts runs in runs, P283: Spin and Spin2 work out a run end of 1023 passes with a cmov, Spin3 and Others, which do not count, work out none and test at every pass, a cmov of theirs being an if made a select by P307; \
 	for f in spin spin2; do \
-	  awk "/^p_$$f:/,/ret\$$/" $(BUILDDIR)/whilerun.s | grep -q 'cmovgq' || { echo "whilerun.s: $$f does not run in runs"; exit 1; }; \
+	  awk "/^p_$$f:/,/ret\$$/" $(BUILDDIR)/whilerun.s | grep -A3 'leaq 1023(' | grep -q 'cmovgq' || { echo "whilerun.s: $$f does not run in runs"; exit 1; }; \
 	done; \
 	for f in spin3 others; do \
-	  if awk "/^p_$$f:/,/ret\$$/" $(BUILDDIR)/whilerun.s | grep -q 'cmov'; then echo "whilerun.s: $$f runs in runs"; exit 1; fi; \
+	  if awk "/^p_$$f:/,/ret\$$/" $(BUILDDIR)/whilerun.s | grep -q 'leaq 1023('; then echo "whilerun.s: $$f runs in runs"; exit 1; fi; \
 	done; \
 	echo ok whilerun-asm; \
 	: a local or a Result written first starts as it is, P284: lazyzero under the stress and verify of the collector, and BothArms, CaseArms, ForBody and EarlyExit clear no slot of their frames; \
@@ -2334,15 +2337,24 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	if awk '/^p_ten:/,/cfi_endproc/' $(BUILDDIR)/mulconst.s | grep -q 'imulq'; then echo "mulconst.s: Ten multiplies"; exit 1; fi; \
 	awk '/^p_large:/,/cfi_endproc/' $(BUILDDIR)/mulconst.s | grep -q 'imulq' || { echo "mulconst.s: Large does not multiply"; exit 1; }; \
 	echo ok mulconst-asm; \
+	: an if whose arms only assign a word is a compare and a CMOVcc as the branchelim of Go makes it, P307: selectif under the stress of the collector and without inlining, every if it marks select a CMOVcc and no jump, every one it marks branch a jump; \
+	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 $(BUILDDIR)/selectif > $(BUILDDIR)/selectif-gc.got; \
+	diff -u testdata/selectif.out $(BUILDDIR)/selectif-gc.got; \
+	python3 -I scripts/check_select.py $(BUILDDIR)/selectif.s testdata/selectif.paslang; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/selectif0 testdata/selectif.paslang; \
+	$(BUILDDIR)/selectif0 > $(BUILDDIR)/selectif0.got; \
+	diff -u testdata/selectif.out $(BUILDDIR)/selectif0.got; \
+	python3 -I scripts/check_select.py $(BUILDDIR)/selectif0.s testdata/selectif.paslang; \
+	echo ok selectif-asm; \
 	: every loop of an asm kernel of the units starts aligned, as the loops paslangc compiles, P302; \
 	python3 -I scripts/check_kernel_align.py src/lib/*.paslang src/rtl/*.paslang; \
 	echo ok kernel-align; \
-	: a function of one expression goes in as its expression, P266: the output of every routine a call, and Branchy one compare and one jump with no call of Less; \
+	: a function of one expression goes in as its expression, P266: the output of every routine a call, and Branchy one compare and a select, P307, with no call of Less; \
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/exprinline0 testdata/exprinline.paslang; \
 	$(BUILDDIR)/exprinline0 > $(BUILDDIR)/exprinline0.got; \
 	diff -u testdata/exprinline.out $(BUILDDIR)/exprinline0.got; \
 	awk '/^p_branchy:/,/ret$$/' $(BUILDDIR)/exprinline.s > $(BUILDDIR)/exprinline-branchy.s; \
-	grep -q '^  jge ' $(BUILDDIR)/exprinline-branchy.s || { echo "exprinline.s: Branchy does not branch on Less's compare"; exit 1; }; \
+	grep -q '^  cmovlq ' $(BUILDDIR)/exprinline-branchy.s || { echo "exprinline.s: Branchy is not a select on Less's compare"; exit 1; }; \
 	if grep -q 'call p_less\|^  set' $(BUILDDIR)/exprinline-branchy.s; then echo "exprinline.s: Branchy calls Less or makes a Boolean"; exit 1; fi; \
 	echo ok exprinline; \
 	echo "==== narrow Go twin ===="; \
@@ -3327,7 +3339,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	  awk "/^p_$$f:/,/ret\$$/" $(BUILDDIR)/whilerun-arm.s | grep -q 'csel x26' || { echo "whilerun-arm.s: $$f does not run in runs"; exit 1; }; \
 	done; \
 	for f in spin3 others; do \
-	  if awk "/^p_$$f:/,/ret\$$/" $(BUILDDIR)/whilerun-arm.s | grep -q 'csel'; then echo "whilerun-arm.s: $$f runs in runs"; exit 1; fi; \
+	  if awk "/^p_$$f:/,/ret\$$/" $(BUILDDIR)/whilerun-arm.s | grep -qE '^  add x26, x[0-9]+, #1023$$'; then echo "whilerun-arm.s: $$f runs in runs"; exit 1; fi; \
 	done; \
 	echo ok whilerun-arm-asm; \
 	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 timeout 300 $(QEMU_A64) $(BUILDDIR)/lazyzero-arm > $(BUILDDIR)/lazyzero-arm-gc.got; \
@@ -3440,11 +3452,20 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	awk '/^p_big:/,/cfi_endproc/' $(BUILDDIR)/framesize-arm.s | grep -qE '^  sub sp, sp, #[0-9]+, lsl #12$$' || { echo "framesize-arm.s: Big's frame is not two SUBs"; exit 1; }; \
 	awk '/^p_huge:/,/cfi_endproc/' $(BUILDDIR)/framesize-arm.s | grep -q '^  sub sp, sp, x16$$' || { echo "framesize-arm.s: Huge's frame past 16 MiB is not through x16"; exit 1; }; \
 	echo ok framesize-arm-asm; \
+	: P307 on arm64: selectif under the stress of the collector and without inlining, every if it marks select a CSEL, CSINC or CINC and no branch, every one it marks branch a branch; \
+	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 timeout 300 $(QEMU_A64) $(BUILDDIR)/selectif-arm > $(BUILDDIR)/selectif-arm-gc.got; \
+	diff -u testdata/selectif.out $(BUILDDIR)/selectif-arm-gc.got; \
+	python3 -I scripts/check_select.py $(BUILDDIR)/selectif-arm.s testdata/selectif.paslang; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/selectif0-arm testdata/selectif.paslang; \
+	timeout 300 $(QEMU_A64) $(BUILDDIR)/selectif0-arm > $(BUILDDIR)/selectif0-arm.got; \
+	diff -u testdata/selectif.out $(BUILDDIR)/selectif0-arm.got; \
+	python3 -I scripts/check_select.py $(BUILDDIR)/selectif0-arm.s testdata/selectif.paslang; \
+	echo ok selectif-arm-asm; \
 	$(OUTDIR)/paslangc -target arm64 -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/exprinline0-arm testdata/exprinline.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/exprinline0-arm > $(BUILDDIR)/exprinline0-arm.got; \
 	diff -u testdata/exprinline.out $(BUILDDIR)/exprinline0-arm.got; \
 	awk '/^p_branchy:/,/ret$$/' $(BUILDDIR)/exprinline-arm.s > $(BUILDDIR)/exprinline-branchy-arm.s; \
-	grep -q 'b.ge ' $(BUILDDIR)/exprinline-branchy-arm.s || { echo "exprinline-arm.s: Branchy does not branch on Less's compare"; exit 1; }; \
+	grep -qE '^  csel x[0-9]+, x[0-9]+, x[0-9]+, lt$$' $(BUILDDIR)/exprinline-branchy-arm.s || { echo "exprinline-arm.s: Branchy is not a select on Less's compare"; exit 1; }; \
 	if grep -q 'bl p_less\|cset' $(BUILDDIR)/exprinline-branchy-arm.s; then echo "exprinline-arm.s: Branchy calls Less or makes a Boolean"; exit 1; fi; \
 	: the processor in the code on arm64, P261: the routines after the CPU neoverse-n1 directive say it, LSE is on for them, and the unit runs; \
 	$(OUTDIR)/paslangc -target arm64 -cpu base -Fu $(A64DIR) -o $(BUILDDIR)/cputune-ab testdata/cputune.paslang; \

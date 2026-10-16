@@ -2321,6 +2321,18 @@ that neither changes its counter nor takes its address is written out
 once per pass with the pass's value in the counter's place, then the
 counter is set to the limit as the loop would leave it (1.1.1, §5 on
 `-inline`; `-inline 0` keeps the loop).
+An `if` whose arms only assign an integer, a pointer or a class
+reference of 64 bits is a compare and a conditional select, `cmov` on
+amd64 and `csel`, `csinc` or `cinc` on arm64, with no branch for the
+data to mispredict, as Go's branchelim makes it (1.1.159, P307): the
+arm of an `if` without `else` at most two adds, subs, ands, ors or
+xors of variables and constants, each arm of one with `else` one, or
+the value the condition compares, so `if x < lo then lo := x`, `if x
+= k then Inc(n)` and `if a[i] > m then m := a[i]` take no branch. The
+branch stays for a variable kept in memory that another routine or
+thread could see (a global, one whose address is taken, one a nested
+routine reads) and for a pointer or an index that a load then uses,
+whose load a branch lets start before the compare.
 
 A `case` label is a constant, a range `'a'..'z'` or a list of them
 (`1, 3, 10..19:`); on a string the labels are strings and the whole
