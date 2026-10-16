@@ -12,8 +12,10 @@ every pass; the length s := s + c stores (movq %rdx on amd64, through
 x0 on arm64) is a string's word, not a variable's. A call of the
 runtime keeps or reloads the registers after the routine's ret. On
 arm64 FillChar's own call, rt_fill, keeps every register a region
-holds (it uses x0, x1, x3 and v31) and stays. Reads amd64's and
-arm64's assembly alike.
+holds (it uses x0, x1, x3 and v31) and stays. A 16-byte store from an
+xmm register is an array's bytes, FillChar of a local array in line
+since P304, not a variable's word. Reads amd64's and arm64's assembly
+alike.
 """
 
 import re
@@ -63,7 +65,8 @@ def main():
             if re.match(r"^  (call|bl) ", line) and line != "  bl rt_fill":
                 bad.append(f"p_{name} calls in its loop: {line.strip()}")
             elif (line.endswith("(%rbp)") and not re.match(r"^  (cmp|test)", line) and
-                  not re.match(r"^  movq %rdx, -[0-9]+\(%rbp\)$", line)):
+                  not re.match(r"^  movq %rdx, -[0-9]+\(%rbp\)$", line) and
+                  not re.match(r"^  v?movdqu %xmm[0-9]+, -[0-9]+\(%rbp\)$", line)):
                 bad.append(f"p_{name} writes its frame in its loop: {line.strip()}")
             elif re.match(r"^  (str|stp|stur)[a-z]* .*\[x29", line):
                 bad.append(f"p_{name} writes its frame in its loop: {line.strip()}")

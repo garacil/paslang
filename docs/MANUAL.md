@@ -2966,7 +2966,10 @@ collector gives back what nothing reaches. `Move(a, b, n)` copies `n` bytes
 between two variables; to copy through pointers write `Move(p^, q^, n)`.
 `FillChar(x, n, v)` writes the byte (or `Char`) `v` `n` times from `x`
 on, by `rep stosb` on amd64 and 32 bytes a store on arm64 (1.1.122,
-P272), zeros by DC ZVA when `-cpu` names an Arm core (1.1.123, P273). `CompareByte(a, b, n)` is the difference of the first bytes of `a`
+P272), zeros by DC ZVA when `-cpu` names an Arm core (1.1.123, P273).
+A constant `n` up to 128 is stores in line, and so is `Move` of a
+constant count up to 128, which reads every byte before it writes one,
+so an overlap still copies right (1.1.155, P304). `CompareByte(a, b, n)` is the difference of the first bytes of `a`
 and `b` that differ, 0 when their `n` bytes are equal, and `IndexByte(x,
 n, v)` the place from 0 of the byte `v` among the first `n` of `x`, -1
 when it is not there: Free Pascal's System words, on the processor's

@@ -779,6 +779,14 @@ type
     function LoadKind(E: PExpr): Boolean;
     function NoStmt(S: PStmt): Boolean;
     procedure DropJumpTo(const L: string);
+    function FixedAddr(E: PExpr; out Sy: TSym; out K: Int64): Boolean;
+    function FixedOp(const Sy: TSym; K: Int64): string;
+    procedure FixedTo(const Sy: TSym; K: Int64; const Reg: string);
+    procedure SmallChunks(N: Int64; var Off, Sz: TInt64Arr);
+    function EmitSmallMove(S: PStmt): Boolean;
+    function EmitSmallFill(S: PStmt): Boolean;
+    function EmitMoveArgs(S: PStmt): Boolean;
+    function EmitFillArgs(S: PStmt): Boolean;
     function ZeroCmp(E: PExpr; const Target: string; WhenTrue: Boolean): Boolean;
     function ConstAddend(P: PExpr; out B: PExpr; out K: Int64): Boolean;
     function ScaledAdd(E: PExpr; D: LongInt): Boolean;
@@ -5256,6 +5264,588 @@ end;
 function Fits32(K: Int64): Boolean;
 begin
   Result := (K >= -2147483648) and (K <= 2147483647);
+end;
+
+{ ---- Move and FillChar in line (P304) ----
+
+  A constant count up to 128 bytes is loads and stores in line, where
+  every Move and FillChar pushed its address and count and called
+  rt_memcpy, or rt_fill on arm64. Go zeroes and copies a constant size
+  so: one to four stores up to 16 bytes, straight-line 16-byte stores
+  under 192, a loop of 64 up to 1408 and REP STOSQ or MOVSQ past it on
+  amd64 (AMD64.rules Zero and Move, ssa.RepZeroThreshold and
+  RepMoveThreshold 1408), stores and STP up to 16 bytes and LoweredZero
+  under 192 on arm64. Zen 2 stores one 256-bit word a cycle and REP MOVS
+  is microcode (AMD 56305 2.12, Table 1). The chunks: 1, 2, 4, 8 and 16
+  bytes one access, 3 two (2 and 1), 5 to 7 two words of 4 and 9 to 15
+  two of 8 that overlap, 17 to 128 16-byte words with the last one
+  ending at the end. Move reads every chunk before it writes one, so an
+  overlap either way reads each byte before it is written, as Pascal's
+  Move does; 16-byte words go through xmm0 to xmm7 (VEX forms with AVX,
+  so no SSE-AVX transition) and q0 to q7 on arm64, which no region
+  holds (they keep xmm8 and up, v8 to v15). A variable of the frame or a
+  global is its own operand on amd64, with no address formed. }
+
+{ E is @v, @a[k] or @r.f for a variable of this frame or a global at a
+  fixed place (not a var parameter, not boxed, not an outer routine's),
+  a static array's constant index within its bounds, or a record's field:
+  K is the offset of the place from the variable's start. }
+function TEmitter.FixedAddr(E: PExpr; out Sy: TSym; out K: Int64): Boolean;
+var
+  v: PExpr;
+  td: TTypeDef;
+begin
+  Result := False;
+  K := 0;
+  if (E = nil) or (E^.Kind <> ekAddr) or (E^.L = nil) then
+    Exit;
+  v := E^.L;
+  if (v^.Kind = ekIndex) and (v^.L <> nil) and (v^.L^.Kind = ekVar) and (v^.R <> nil) and
+    (v^.R^.Kind = ekInt) and (TKind(v^.L^.Typ) = tykArray) and (not IsDyn(v^.L^.Typ)) and
+    (not IsStr(v^.L^.Typ)) then
+  begin
+    td := FTypes[v^.L^.Typ];
+    if (v^.R^.Num < td.Lo) or (v^.R^.Num > td.Hi) then
+      Exit;
+    K := (v^.R^.Num - td.Lo) * TSize(td.Elem);
+    v := v^.L;
+  end
+  else if (v^.Kind = ekField) and (v^.L <> nil) and (v^.L^.Kind = ekVar) and
+    (TKind(v^.L^.Typ) = tykRecord) then
+  begin
+    K := v^.Off;
+    v := v^.L;
+  end;
+  if v^.Kind <> ekVar then
+    Exit;
+  if not TryFindSym(v^.Name, Sy) then
+    Exit;
+  Result := (not Sy.ByRef) and (Sy.Up = 0) and (not Sy.Boxed) and (Sy.Reg = '');
+end;
+
+{ amd64: the operand K bytes into a fixed variable. }
+function TEmitter.FixedOp(const Sy: TSym; K: Int64): string;
+begin
+  if Sy.Global and (K = 0) then
+    Result := VarLabel(Sy.Name) + '(%rip)'
+  else if Sy.Global then
+    Result := VarLabel(Sy.Name) + '+' + IntToStr(K) + '(%rip)'
+  else
+    Result := IntToStr(Sy.Off + K) + '(%rbp)';
+end;
+
+{ The address K bytes into a fixed variable into Reg. }
+procedure TEmitter.FixedTo(const Sy: TSym; K: Int64; const Reg: string);
+begin
+  if FArm then
+  begin
+    if Sy.Global then
+    begin
+      LeaS(VarLabel(Sy.Name), Reg);
+      if K <> 0 then
+        AddImmArm(Reg, Reg, K);
+    end
+    else
+      AddFP(Reg, Sy.Off + K);
+  end
+  else
+    Line('  leaq ' + FixedOp(Sy, K) + ', %' + Reg);
+end;
+
+{ The accesses that cover N bytes, 1 to 128 (P304). }
+procedure TEmitter.SmallChunks(N: Int64; var Off, Sz: TInt64Arr);
+var
+  m, i: Int64;
+begin
+  Off := nil;
+  Sz := nil;
+  if (N = 1) or (N = 2) or (N = 4) or (N = 8) or (N = 16) then
+  begin
+    SetLength(Off, 1);
+    SetLength(Sz, 1);
+    Off[0] := 0;
+    Sz[0] := N;
+    Exit;
+  end;
+  if N < 16 then
+  begin
+    SetLength(Off, 2);
+    SetLength(Sz, 2);
+    Off[0] := 0;
+    if N = 3 then
+    begin
+      Sz[0] := 2;
+      Off[1] := 2;
+      Sz[1] := 1;
+    end
+    else if N < 8 then
+    begin
+      Sz[0] := 4;
+      Off[1] := N - 4;
+      Sz[1] := 4;
+    end
+    else
+    begin
+      Sz[0] := 8;
+      Off[1] := N - 8;
+      Sz[1] := 8;
+    end;
+    Exit;
+  end;
+  m := (N + 15) div 16;
+  SetLength(Off, m);
+  SetLength(Sz, m);
+  for i := 0 to m - 1 do
+  begin
+    Off[i] := 16 * i;
+    Sz[i] := 16;
+  end;
+  Off[m - 1] := N - 16;
+end;
+
+{ Move(a, b, n) with n a constant up to 128 in line (P304). }
+function TEmitter.EmitSmallMove(S: PStmt): Boolean;
+var
+  n: Int64;
+  i: SizeInt;
+  off, sz: TInt64Arr;
+  ssy, dsy: TSym;
+  fs, fd, avx: Boolean;
+  r, so, dop: string;
+  sk, dk: Int64;
+begin
+  Result := False;
+  if (Length(S^.Args) <> 3) or (S^.Args[2] = nil) or (S^.Args[2]^.Kind <> ekInt) then
+    Exit;
+  n := S^.Args[2]^.Num;
+  if (n < 1) or (n > 128) then
+    Exit;
+  Result := True;
+  fs := FixedAddr(S^.Args[0], ssy, sk);
+  fd := FixedAddr(S^.Args[1], dsy, dk);
+  SmallChunks(n, off, sz);
+  if FArm then
+  begin
+    { x10 the source, x11 the destination }
+    if not fs then
+    begin
+      EmitExpr(S^.Args[0]);
+      if not fd then
+      begin
+        PshK('x0', VCls(S^.Args[0]^.Typ, 0));
+        EmitExpr(S^.Args[1]);
+        Line('  mov x11, x0');
+        Ppop('x10');
+      end
+      else
+      begin
+        Line('  mov x10, x0');
+        FixedTo(dsy, dk, 'x11');
+      end;
+    end
+    else
+    begin
+      if not fd then
+      begin
+        EmitExpr(S^.Args[1]);
+        Line('  mov x11, x0');
+      end
+      else
+        FixedTo(dsy, dk, 'x11');
+      FixedTo(ssy, sk, 'x10');
+    end;
+    for i := 0 to High(off) do
+    begin
+      if sz[i] = 16 then
+        r := 'q' + IntToStr(i)
+      else if sz[i] = 8 then
+        r := 'x' + IntToStr(12 + i)
+      else
+        r := 'w' + IntToStr(12 + i);
+      if sz[i] = 1 then
+        Line('  ldrb ' + r + ', [x10, #' + IntToStr(off[i]) + ']')
+      else if sz[i] = 2 then
+        Line('  ldrh ' + r + ', [x10, #' + IntToStr(off[i]) + ']')
+      else
+        Line('  ldr ' + r + ', [x10, #' + IntToStr(off[i]) + ']');
+    end;
+    for i := 0 to High(off) do
+    begin
+      if sz[i] = 16 then
+        r := 'q' + IntToStr(i)
+      else if sz[i] = 8 then
+        r := 'x' + IntToStr(12 + i)
+      else
+        r := 'w' + IntToStr(12 + i);
+      if sz[i] = 1 then
+        Line('  strb ' + r + ', [x11, #' + IntToStr(off[i]) + ']')
+      else if sz[i] = 2 then
+        Line('  strh ' + r + ', [x11, #' + IntToStr(off[i]) + ']')
+      else
+        Line('  str ' + r + ', [x11, #' + IntToStr(off[i]) + ']');
+    end;
+    Exit;
+  end;
+  avx := HasFeat(CpuFeatBit('avx', False));
+  { rsi the source and rdi the destination when they are not fixed }
+  if (not fs) and (not fd) then
+  begin
+    EmitExpr(S^.Args[0]);
+    PushK('rax', VCls(S^.Args[0]^.Typ, 0));
+    EmitExpr(S^.Args[1]);
+    Line('  movq %rax, %rdi');
+    Line('  popq %rsi');
+  end
+  else if not fs then
+  begin
+    EmitExpr(S^.Args[0]);
+    Line('  movq %rax, %rsi');
+  end
+  else if not fd then
+  begin
+    EmitExpr(S^.Args[1]);
+    Line('  movq %rax, %rdi');
+  end;
+  for i := 0 to High(off) do
+  begin
+    if fs then
+      so := FixedOp(ssy, sk + off[i])
+    else
+      so := IntToStr(off[i]) + '(%rsi)';
+    if sz[i] = 16 then
+    begin
+      if avx then
+        Line('  vmovdqu ' + so + ', %xmm' + IntToStr(i))
+      else
+        Line('  movdqu ' + so + ', %xmm' + IntToStr(i));
+    end
+    else
+    begin
+      if i = 0 then
+        r := 'ax'
+      else
+        r := 'cx';
+      if sz[i] = 1 then
+        Line('  movzbl ' + so + ', %e' + r)
+      else if sz[i] = 2 then
+        Line('  movzwl ' + so + ', %e' + r)
+      else if sz[i] = 4 then
+        Line('  movl ' + so + ', %e' + r)
+      else
+        Line('  movq ' + so + ', %r' + r);
+    end;
+  end;
+  for i := 0 to High(off) do
+  begin
+    if fd then
+      dop := FixedOp(dsy, dk + off[i])
+    else
+      dop := IntToStr(off[i]) + '(%rdi)';
+    if sz[i] = 16 then
+    begin
+      if avx then
+        Line('  vmovdqu %xmm' + IntToStr(i) + ', ' + dop)
+      else
+        Line('  movdqu %xmm' + IntToStr(i) + ', ' + dop);
+    end
+    else
+    begin
+      if i = 0 then
+        r := 'a'
+      else
+        r := 'c';
+      if sz[i] = 1 then
+        Line('  movb %' + r + 'l, ' + dop)
+      else if sz[i] = 2 then
+        Line('  movw %' + r + 'x, ' + dop)
+      else if sz[i] = 4 then
+        Line('  movl %e' + r + 'x, ' + dop)
+      else
+        Line('  movq %r' + r + 'x, ' + dop);
+    end;
+  end;
+end;
+
+{ FillChar(x, n, v) with n a constant up to 128 in line (P304): the byte
+  v in every byte of a word, rax or x12 (v times $0101010101010101, or
+  three ORs of shifted copies on arm64), and in every lane of xmm0
+  (MOVQ and PUNPCKLQDQ, SDM vol. 2B 4-54 and 4-512; PXOR for 0) or v0
+  (DUP (general) and MOVI, ARM DDI 0487 M.c C7.2.41 and C7.2.247). }
+function TEmitter.EmitSmallFill(S: PStmt): Boolean;
+var
+  n, v, pat: Int64;
+  i: SizeInt;
+  off, sz: TInt64Arr;
+  dsy: TSym;
+  fd, vk, avx, wide, narrow: Boolean;
+  dop, r: string;
+  x: PExpr;
+  dk: Int64;
+begin
+  Result := False;
+  if (Length(S^.Args) <> 3) or (S^.Args[1] = nil) or (S^.Args[1]^.Kind <> ekInt) then
+    Exit;
+  n := S^.Args[1]^.Num;
+  if (n < 1) or (n > 128) then
+    Exit;
+  x := S^.Args[2];
+  vk := (x^.Kind = ekInt) or ((x^.Kind = ekStr) and (Length(x^.Txt) = 1));
+  v := 0;
+  if x^.Kind = ekInt then
+    v := x^.Num and 255
+  else if vk then
+    v := Ord(x^.Txt[1]);
+  pat := v or (v shl 8);
+  pat := pat or (pat shl 16);
+  pat := pat or (pat shl 32);
+  Result := True;
+  fd := FixedAddr(S^.Args[0], dsy, dk);
+  SmallChunks(n, off, sz);
+  wide := False;
+  narrow := False;
+  for i := 0 to High(sz) do
+    if sz[i] = 16 then
+      wide := True
+    else if sz[i] > 1 then
+      narrow := True;
+  if FArm then
+  begin
+    { x11 the destination, the byte in w12 }
+    if not fd then
+    begin
+      EmitExpr(S^.Args[0]);
+      if not vk then
+      begin
+        PshK('x0', VCls(S^.Args[0]^.Typ, 0));
+        EmitExpr(x);
+        Line('  and w12, w0, #255');
+        Ppop('x11');
+      end
+      else
+        Line('  mov x11, x0');
+    end
+    else
+    begin
+      if not vk then
+      begin
+        EmitExpr(x);
+        Line('  and w12, w0, #255');
+      end;
+      FixedTo(dsy, dk, 'x11');
+    end;
+    if vk then
+    begin
+      if (v <> 0) and ((not wide) or narrow or (sz[0] = 1)) then
+        Imm('x12', pat);
+      if wide then
+      begin
+        if v = 0 then
+          Line('  movi v0.2d, #0')
+        else
+          Line('  movi v0.16b, #' + IntToStr(v));
+      end;
+    end
+    else
+    begin
+      if wide then
+        Line('  dup v0.16b, w12');
+      if narrow then
+      begin
+        Line('  orr x12, x12, x12, lsl #8');
+        Line('  orr x12, x12, x12, lsl #16');
+        Line('  orr x12, x12, x12, lsl #32');
+      end;
+    end;
+    for i := 0 to High(off) do
+    begin
+      if sz[i] = 16 then
+        Line('  str q0, [x11, #' + IntToStr(off[i]) + ']')
+      else
+      begin
+        if vk and (v = 0) then
+        begin
+          if sz[i] = 8 then
+            r := 'xzr'
+          else
+            r := 'wzr';
+        end
+        else if sz[i] = 8 then
+          r := 'x12'
+        else
+          r := 'w12';
+        if sz[i] = 1 then
+          Line('  strb ' + r + ', [x11, #' + IntToStr(off[i]) + ']')
+        else if sz[i] = 2 then
+          Line('  strh ' + r + ', [x11, #' + IntToStr(off[i]) + ']')
+        else
+          Line('  str ' + r + ', [x11, #' + IntToStr(off[i]) + ']');
+      end;
+    end;
+    Exit;
+  end;
+  avx := HasFeat(CpuFeatBit('avx', False));
+  { rdi the destination when it is not fixed, the pattern in rax }
+  if not fd then
+  begin
+    EmitExpr(S^.Args[0]);
+    if not vk then
+    begin
+      PushK('rax', VCls(S^.Args[0]^.Typ, 0));
+      EmitExpr(x);
+      Line('  popq %rdi');
+    end
+    else
+      Line('  movq %rax, %rdi');
+  end
+  else if not vk then
+    EmitExpr(x);
+  if not vk then
+  begin
+    Line('  movzbl %al, %eax');
+    Line('  movabsq $72340172838076673, %rcx');
+    Line('  imulq %rcx, %rax');
+  end
+  else if (not Fits32(pat)) and (wide or (sz[High(sz)] = 8)) and (v <> 0) then
+    Line('  movabsq $' + IntToStr(pat) + ', %rax');
+  if wide then
+  begin
+    if vk and (v = 0) then
+    begin
+      if avx then
+        Line('  vpxor %xmm0, %xmm0, %xmm0')
+      else
+        Line('  pxor %xmm0, %xmm0');
+    end
+    else
+    begin
+      if vk and Fits32(pat) then
+        Line('  movq $' + IntToStr(pat) + ', %rax');
+      if avx then
+      begin
+        Line('  vmovq %rax, %xmm0');
+        Line('  vpunpcklqdq %xmm0, %xmm0, %xmm0');
+      end
+      else
+      begin
+        Line('  movq %rax, %xmm0');
+        Line('  punpcklqdq %xmm0, %xmm0');
+      end;
+    end;
+  end;
+  for i := 0 to High(off) do
+  begin
+    if fd then
+      dop := FixedOp(dsy, dk + off[i])
+    else
+      dop := IntToStr(off[i]) + '(%rdi)';
+    if sz[i] = 16 then
+    begin
+      if avx then
+        Line('  vmovdqu %xmm0, ' + dop)
+      else
+        Line('  movdqu %xmm0, ' + dop);
+    end
+    else if vk then
+    begin
+      { a constant's bytes as the store's own immediate (MOV r/m,
+        imm), the 8-byte one when it fits 32 bits sign extended }
+      if sz[i] = 1 then
+        Line('  movb $' + IntToStr(v) + ', ' + dop)
+      else if sz[i] = 2 then
+        Line('  movw $' + IntToStr(pat and 65535) + ', ' + dop)
+      else if sz[i] = 4 then
+        Line('  movl $' + IntToStr(pat and 4294967295) + ', ' + dop)
+      else if Fits32(pat) then
+        Line('  movq $' + IntToStr(pat) + ', ' + dop)
+      else
+        Line('  movq %rax, ' + dop);
+    end
+    else if sz[i] = 1 then
+      Line('  movb %al, ' + dop)
+    else if sz[i] = 2 then
+      Line('  movw %ax, ' + dop)
+    else if sz[i] = 4 then
+      Line('  movl %eax, ' + dop)
+    else
+      Line('  movq %rax, ' + dop);
+  end;
+end;
+
+{ Move(a, b, n) of any count with a and b fixed variables and n without
+  a call: the addresses go straight to their registers, n through rax or
+  x0 first, with no push (P304). }
+function TEmitter.EmitMoveArgs(S: PStmt): Boolean;
+var
+  ssy, dsy: TSym;
+  sk, dk: Int64;
+begin
+  Result := False;
+  if (Length(S^.Args) <> 3) or EHasCall(S^.Args[2]) then
+    Exit;
+  if not (FixedAddr(S^.Args[0], ssy, sk) and FixedAddr(S^.Args[1], dsy, dk)) then
+    Exit;
+  Result := True;
+  EmitExpr(S^.Args[2]);
+  if FArm then
+  begin
+    Line('  mov x2, x0');
+    FixedTo(ssy, sk, 'x1');
+    FixedTo(dsy, dk, 'x0');
+    Line('  bl rt_memcpy');
+  end
+  else
+  begin
+    Line('  movq %rax, %rcx');
+    FixedTo(ssy, sk, 'rsi');
+    FixedTo(dsy, dk, 'rdi');
+    Line('  call rt_memcpy');
+  end;
+end;
+
+{ FillChar(x, n, v) of any count with x a fixed variable, n without a
+  call and v a constant or a word variable: n, v and the address straight
+  to their registers, with no push (P304). False when it is not. }
+function TEmitter.EmitFillArgs(S: PStmt): Boolean;
+var
+  dsy, vs: TSym;
+  x: PExpr;
+  v, dk: Int64;
+  vk: Boolean;
+begin
+  Result := False;
+  if (Length(S^.Args) <> 3) or EHasCall(S^.Args[1]) then
+    Exit;
+  if not FixedAddr(S^.Args[0], dsy, dk) then
+    Exit;
+  x := S^.Args[2];
+  vk := (x^.Kind = ekInt) or ((x^.Kind = ekStr) and (Length(x^.Txt) = 1));
+  if (not vk) and not ((x^.Kind = ekVar) and WordVar(x, vs)) then
+    Exit;
+  v := 0;
+  if x^.Kind = ekInt then
+    v := x^.Num and 255
+  else if vk then
+    v := Ord(x^.Txt[1]);
+  Result := True;
+  EmitExpr(S^.Args[1]);
+  if FArm then
+  begin
+    Line('  mov x1, x0');
+    if vk then
+      Imm('x2', v)
+    else
+      LoadWordVar(vs, 'x2');
+    FixedTo(dsy, dk, 'x0');
+  end
+  else
+  begin
+    Line('  movq %rax, %rcx');
+    if vk then
+      Line('  movl $' + IntToStr(v) + ', %eax')
+    else
+      LoadWordVar(vs, 'rax');
+    FixedTo(dsy, dk, 'rdi');
+  end;
 end;
 
 function X86Sub(const R: string; W: LongInt): string; forward;
@@ -21399,6 +21989,10 @@ begin
         end
         else if S^.Name = 'rt_move' then
         begin
+          { a constant count up to 128 in line, fixed places with no
+            push (P304) }
+          if (not EmitSmallMove(S)) and (not EmitMoveArgs(S)) then
+          begin
           EmitExpr(S^.Args[0]);
           PshK('x0', VCls(S^.Args[0]^.Typ, 0));
           EmitExpr(S^.Args[1]);
@@ -21408,9 +22002,14 @@ begin
           Ppop('x0');
           Ppop('x1');
           Line('  bl rt_memcpy');
+          end;
         end
         else if S^.Name = 'rt_fillchar' then
         begin
+          if not EmitSmallFill(S) then
+          begin
+          if not EmitFillArgs(S) then
+          begin
           EmitExpr(S^.Args[0]);
           PshK('x0', VCls(S^.Args[0]^.Typ, 0));
           EmitExpr(S^.Args[1]);
@@ -21419,6 +22018,7 @@ begin
           Line('  mov x2, x0');
           Ppop('x1');
           Ppop('x0');
+          end;
           a := Lab;
           b := Lab;
           Line('  cmp x1, #0');
@@ -21433,6 +22033,7 @@ begin
           Line(a + ':');
           Line('  bl rt_fill');
           Line(b + ':');
+          end;
         end
         else
           EmitCall(S^.Name, S^.Args);
@@ -22155,6 +22756,10 @@ begin
       end
       else if S^.Name = 'rt_move' then
       begin
+        { a constant count up to 128 in line, fixed places with no push
+          (P304) }
+        if (not EmitSmallMove(S)) and (not EmitMoveArgs(S)) then
+        begin
         EmitExpr(S^.Args[0]);
         PushK('rax', VCls(S^.Args[0]^.Typ, 0));
         EmitExpr(S^.Args[1]);
@@ -22164,9 +22769,14 @@ begin
         Line('  popq %rdi');
         Line('  popq %rsi');
         Line('  call rt_memcpy');
+        end;
       end
       else if S^.Name = 'rt_fillchar' then
       begin
+        if not EmitSmallFill(S) then
+        begin
+        if not EmitFillArgs(S) then
+        begin
         EmitExpr(S^.Args[0]);
         PushK('rax', VCls(S^.Args[0]^.Typ, 0));
         EmitExpr(S^.Args[1]);
@@ -22174,6 +22784,7 @@ begin
         EmitExpr(S^.Args[2]);
         Line('  popq %rcx');
         Line('  popq %rdi');
+        end;
         a := Lab;
         b := Lab;
         Line('  testq %rcx, %rcx');
@@ -22188,6 +22799,7 @@ begin
         Line(b + ':');
         Line('  rep stosb');
         Line(a + ':');
+        end;
       end
       else if S^.Name = 'rt_dumplocs' then
         EmitDumpLocals

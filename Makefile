@@ -319,6 +319,9 @@ GOLDEN_A64 += ptrwalk
 # P305: an if without an else jumps over nothing.
 GOLDEN += ifcase
 GOLDEN_A64 += ifcase
+# P304: Move and FillChar of a constant count up to 128 bytes in line.
+GOLDEN += movefill
+GOLDEN_A64 += movefill
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -2307,6 +2310,14 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	: no jump goes to the next instruction in any golden program, P305: an if without an else, the last arm of a case and an Exit that ends a routine fall through; \
 	python3 -I scripts/check_nextjump.py $(foreach t,$(GOLDEN),$(BUILDDIR)/$(t).s); \
 	echo ok nextjump; \
+	: Move and FillChar of a constant count up to 128 bytes are loads and stores in line, P304: movefill under the stress of the collector, no call and no rep stosb for 1 to 128 bytes, rt_memcpy from 129; \
+	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 $(BUILDDIR)/movefill > $(BUILDDIR)/movefill-gc.got; \
+	diff -u testdata/movefill.out $(BUILDDIR)/movefill-gc.got; \
+	for f in c1 c3 c8 c16 c17 c100 c128 whole; do \
+	  if awk "/^p_$$f:/,/cfi_endproc/" $(BUILDDIR)/movefill.s | grep -qE 'call rt_memcpy|rep stosb'; then echo "movefill.s: $$f calls rt_memcpy or fills with rep stosb"; exit 1; fi; \
+	done; \
+	awk '/^p_c129:/,/cfi_endproc/' $(BUILDDIR)/movefill.s | grep -q 'call rt_memcpy' || { echo "movefill.s: c129 does not call rt_memcpy"; exit 1; }; \
+	echo ok movefill-asm; \
 	: every loop of an asm kernel of the units starts aligned, as the loops paslangc compiles, P302; \
 	python3 -I scripts/check_kernel_align.py src/lib/*.paslang src/rtl/*.paslang; \
 	echo ok kernel-align; \
@@ -3388,6 +3399,13 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	echo ok ptrwalk-arm-asm; \
 	python3 -I scripts/check_nextjump.py $(foreach t,$(GOLDEN_A64),$(BUILDDIR)/$(t)-arm.s); \
 	echo ok nextjump-arm; \
+	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 timeout 300 $(QEMU_A64) $(BUILDDIR)/movefill-arm > $(BUILDDIR)/movefill-arm-gc.got; \
+	diff -u testdata/movefill.out $(BUILDDIR)/movefill-arm-gc.got; \
+	for f in c1 c3 c8 c16 c17 c100 c128 whole; do \
+	  if awk "/^p_$$f:/,/cfi_endproc/" $(BUILDDIR)/movefill-arm.s | grep -qE 'bl rt_memcpy|bl rt_fill$$'; then echo "movefill-arm.s: $$f calls rt_memcpy or rt_fill"; exit 1; fi; \
+	done; \
+	awk '/^p_c129:/,/cfi_endproc/' $(BUILDDIR)/movefill-arm.s | grep -q 'bl rt_memcpy' || { echo "movefill-arm.s: c129 does not call rt_memcpy"; exit 1; }; \
+	echo ok movefill-arm-asm; \
 	$(OUTDIR)/paslangc -target arm64 -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/exprinline0-arm testdata/exprinline.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/exprinline0-arm > $(BUILDDIR)/exprinline0-arm.got; \
 	diff -u testdata/exprinline.out $(BUILDDIR)/exprinline0-arm.got; \
