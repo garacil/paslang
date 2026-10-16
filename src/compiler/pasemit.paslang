@@ -776,6 +776,8 @@ type
     function PtrReg(E: PExpr; D: LongInt): string;
     function ScaleOf(T: PExpr; out Idx: PExpr): Int64;
     function WordReg(E: PExpr): string;
+    function LoadKind(E: PExpr): Boolean;
+    function ZeroCmp(E: PExpr; const Target: string; WhenTrue: Boolean): Boolean;
     function ConstAddend(P: PExpr; out B: PExpr; out K: Int64): Boolean;
     function ScaledAdd(E: PExpr; D: LongInt): Boolean;
     function InPlaceScaled(const R: string; Op: TBinOp; E: PExpr): Boolean;
@@ -6441,6 +6443,12 @@ begin
   { a set's comparison is EmitSetBin's (P126): <= is a subset }
   if (TKind(E^.L^.Typ) = tykSet) or (TKind(E^.R^.Typ) = tykSet) then
     Exit;
+  { x = 0, x <> 0, p = nil and p <> nil (P303) }
+  if ZeroCmp(E, Target, WhenTrue) then
+  begin
+    Result := True;
+    Exit;
+  end;
   if not (((E^.L^.Kind = ekInt) or PlainOrd(E^.L, ls)) and
     ((E^.R^.Kind = ekInt) or PlainOrd(E^.R, rs))) then
   begin
@@ -6551,6 +6559,82 @@ begin
       Line('  cmpq %rcx, %rax');
     end;
     Line('  ' + X86Jcc(cc) + ' ' + Target);
+  end;
+  Result := True;
+end;
+
+{ E is x = 0, x <> 0, p = nil or p <> nil, either way round, x a word
+  the pool works out (an integer, an enumeration, a character, a
+  pointer, an object): on arm64 one CBZ or CBNZ on x's register (ARM
+  DDI 0487 M.c C6.2.78 and C6.2.77: the label within +-1 MB as
+  B.cond's, the flags untouched), on amd64 TEST of the register with
+  itself and one jump, or CMP of the variable in memory with 0 (SDM
+  vol. 2B 4-721 TEST: ZF is 1 when the AND is 0); Go's loop over a list
+  is CBNZ R0 and TESTQ AX, AX (go tool objdump). The constant went into
+  x17 or a compare took it, and a variable a region keeps was copied
+  into the pool first. }
+function TEmitter.ZeroCmp(E: PExpr; const Target: string; WhenTrue: Boolean): Boolean;
+var
+  x, z: PExpr;
+  s: TSym;
+  r: string;
+  k: TTypeKind;
+  jz: Boolean;
+begin
+  Result := False;
+  if (E^.Bin <> boEq) and (E^.Bin <> boNe) then
+    Exit;
+  x := E^.L;
+  z := E^.R;
+  if not ((z^.Kind = ekNil) or ((z^.Kind = ekInt) and (z^.Num = 0))) then
+  begin
+    x := E^.R;
+    z := E^.L;
+  end;
+  if not ((z^.Kind = ekNil) or ((z^.Kind = ekInt) and (z^.Num = 0))) then
+    Exit;
+  if (x = nil) or (x^.Kind = ekNil) or (x^.Kind = ekInt) or IsFat(x^.Typ) or
+    IsBlob(x^.Typ) then
+    Exit;
+  k := TKind(x^.Typ);
+  if not ((k = tykInteger) or (k = tykEnum) or (k = tykSubrange) or
+    (k = tykBoolean) or (k = tykPointer) or (k = tykClass)) then
+    Exit;
+  { the jump is taken when x is 0: = that holds, or <> that fails }
+  jz := (E^.Bin = boEq) = WhenTrue;
+  if FArm then
+  begin
+    r := WordReg(x);
+    if r = '' then
+    begin
+      if not OrdSimple(x, 0) then
+        Exit;
+      EmitOrdTo(x, 0);
+      r := OrdPool(0);
+    end;
+    if jz then
+      Line('  cbz ' + r + ', ' + Target)
+    else
+      Line('  cbnz ' + r + ', ' + Target);
+  end
+  else
+  begin
+    r := WordReg(x);
+    if r <> '' then
+      Line('  testq %' + r + ', %' + r)
+    else if (x^.Kind = ekVar) and WordVar(x, s) and (TSize(s.Typ) = 8) then
+      Line('  cmpq $0, ' + MemA(s))
+    else
+    begin
+      if not OrdSimple(x, 0) then
+        Exit;
+      EmitOrdTo(x, 0);
+      Line('  testq %' + OrdPool(0) + ', %' + OrdPool(0));
+    end;
+    if jz then
+      Line('  je ' + Target)
+    else
+      Line('  jne ' + Target);
   end;
   Result := True;
 end;
@@ -18954,6 +19038,17 @@ begin
   if ((E^.Kind = ekBin) or (E^.Kind = ekUn) or (E^.Kind = ekIndex) or
     (E^.Kind = ekField) or (E^.Kind = ekDeref)) and OrdSimple(E, 0) then
   begin
+    { a load straight into rax or x0, where it went to the pool and was
+      copied (P303) }
+    if LoadKind(E) then
+    begin
+      FSkipCanon := False;
+      if FArm then
+        WordLoad(EmitWordMem(E, 0), LoadTyp(E), 'x0')
+      else
+        WordLoad(EmitWordMem(E, 0), LoadTyp(E), 'rax');
+      Exit;
+    end;
     EmitOrdTo(E, 0);
     if FArm then
       Line('  mov x0, ' + OrdPool(0))
@@ -25145,6 +25240,14 @@ begin
   end;
 end;
 
+{ E is a load the pool works out as one: a word through a pointer, a
+  field or an index (EmitOrdTo's ekDeref, ekField and ekIndex, P303). }
+function TEmitter.LoadKind(E: PExpr): Boolean;
+begin
+  Result := (E <> nil) and ((E^.Kind = ekDeref) or (E^.Kind = ekField) or
+    (E^.Kind = ekIndex));
+end;
+
 { The register of a word variable a region keeps there, or '': PtrReg
   without working anything out (P294). }
 function TEmitter.WordReg(E: PExpr): string;
@@ -25608,6 +25711,14 @@ begin
           operand (P294) }
         if FArm and ArmDerefAt(E, D, Result) then
           Exit;
+        { arm64: p^ with p in a register is [p], as amd64's PtrReg
+          (P303): it was copied into the pool first }
+        if FArm and (WordReg(E^.L) <> '') then
+        begin
+          WmSet(WordReg(E^.L), '', 0, 0);
+          Result := '[' + WordReg(E^.L) + ']';
+          Exit;
+        end;
         EmitOrdTo(E^.L, D);
       end;
     ekField:
@@ -25667,11 +25778,21 @@ begin
         bs := r;
         if TKind(E^.L^.Typ) = tykClass then
           bs := PtrReg(E^.L, D)
+        else if FArm and (E^.L^.Kind = ekDeref) and (WordReg(E^.L^.L) <> '') then
+          { p^.f with p in a register: p's register is the base (P303) }
+          bs := WordReg(E^.L^.L)
         else
           EmitWordBase(E^.L, D);
         if not FArm then
         begin
           Result := IntToStr(E^.Off) + '(%' + r + ')';
+          Exit;
+        end;
+        { the first field is the base itself (P303) }
+        if E^.Off = 0 then
+        begin
+          WmSet(bs, '', 0, 0);
+          Result := '[' + bs + ']';
           Exit;
         end;
         { A field at its natural place is an offset of the load itself. }
@@ -26143,7 +26264,7 @@ end;
   register 0, the address from pool register 1, one store (P94). }
 function TEmitter.WordAssign(Dest, E: PExpr): Boolean;
 var
-  s: TSym;
+  s, src: TSym;
   m: string;
   sz: LongInt;
   k: TTypeKind;
@@ -26166,6 +26287,29 @@ begin
     if not WordVar(Dest, s) then
       Exit;
     Result := True;
+    { a copy between two variables of one size, one of them in a
+      register, is one move, load or store, where it went through the
+      pool (P303) }
+    if (E^.Kind = ekVar) and WordVar(E, src) and (TSize(src.Typ) = TSize(s.Typ)) and
+      ((s.Reg <> '') or (src.Reg <> '')) then
+    begin
+      FSkipCanon := False;
+      if s.Reg = '' then
+        StoreWordVar(s, src.Reg)
+      else if s.Reg <> src.Reg then
+        LoadWordVar(src, s.Reg);
+      Exit;
+    end;
+    { a load into a variable a region keeps in a register goes there,
+      where it went to the pool and was copied (P303): EmitOrdTo loads
+      the clean value as LoadTo does, and StoreWordVar copies it whole }
+    if (s.Reg <> '') and LoadKind(E) then
+    begin
+      FSkipCanon := False;
+      m := EmitWordMem(E, 0);
+      WordLoad(m, LoadTyp(E), s.Reg);
+      Exit;
+    end;
     FSkipCanon := (TSize(E^.Typ) = TSize(s.Typ)) and (s.Reg = '');
     EmitOrdTo(E, 0);
     StoreWordVar(s, OrdPool(0));
@@ -26285,6 +26429,12 @@ begin
     (e^.L^.Kind = ekBin) and InPlaceSpine(e, dst.Name) then
   begin
     SpineEmit(e, dst.Reg);
+    Exit;
+  end;
+  { a load into a register variable goes there (P303) }
+  if (dst.Reg <> '') and LoadKind(e) then
+  begin
+    WordLoad(EmitWordMem(e, 0), LoadTyp(e), dst.Reg);
     Exit;
   end;
   EmitOrdTo(e, 0);

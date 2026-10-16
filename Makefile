@@ -312,6 +312,10 @@ GOLDEN_A64 += coldfail
 # registers.
 GOLDEN += coldloop
 GOLDEN_A64 += coldloop
+# P303: a pointer a region keeps in a register is read and tested where
+# it lives.
+GOLDEN += ptrwalk
+GOLDEN_A64 += ptrwalk
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -2288,6 +2292,15 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/coldloop.out $(BUILDDIR)/coldloop-gc.got; \
 	python3 -I scripts/check_coldloop.py $(BUILDDIR)/coldloop.s counted,twocounters,shared,global,walk,deep,wash,wipe,own; \
 	echo ok coldloop-asm; \
+	: a pointer a region keeps in a register is tested where it lives, P303: ptrwalk under the stress of the collector, and its walks test their pointer with a test of the register, never a compare with 0; \
+	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 $(BUILDDIR)/ptrwalk > $(BUILDDIR)/ptrwalk-gc.got; \
+	diff -u testdata/ptrwalk.out $(BUILDDIR)/ptrwalk-gc.got; \
+	for f in widths last zeros spell; do \
+	  awk "/^p_$$f:/,/cfi_endproc/" $(BUILDDIR)/ptrwalk.s > $(BUILDDIR)/ptrwalk-$$f.s; \
+	  grep -qE '^  testq %(r9, %r9|r10, %r10|r11, %r11|rbx, %rbx|r12, %r12|r13, %r13|r15, %r15)$$' $(BUILDDIR)/ptrwalk-$$f.s || { echo "ptrwalk.s: $$f does not test its pointer in its register"; exit 1; }; \
+	  if grep -qE 'cmpq \$$0, %' $(BUILDDIR)/ptrwalk-$$f.s; then echo "ptrwalk.s: $$f compares a register with 0"; exit 1; fi; \
+	done; \
+	echo ok ptrwalk-asm; \
 	: every loop of an asm kernel of the units starts aligned, as the loops paslangc compiles, P302; \
 	python3 -I scripts/check_kernel_align.py src/lib/*.paslang src/rtl/*.paslang; \
 	echo ok kernel-align; \
@@ -3358,6 +3371,15 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	diff -u testdata/coldloop.out $(BUILDDIR)/coldloop-arm-gc.got; \
 	python3 -I scripts/check_coldloop.py $(BUILDDIR)/coldloop-arm.s counted,twocounters,shared,global,walk,deep,wash,wipe,own; \
 	echo ok coldloop-arm-asm; \
+	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 timeout 300 $(QEMU_A64) $(BUILDDIR)/ptrwalk-arm > $(BUILDDIR)/ptrwalk-arm-gc.got; \
+	diff -u testdata/ptrwalk.out $(BUILDDIR)/ptrwalk-arm-gc.got; \
+	for f in widths last zeros spell; do \
+	  awk "/^p_$$f:/,/cfi_endproc/" $(BUILDDIR)/ptrwalk-arm.s > $(BUILDDIR)/ptrwalk-$$f-arm.s; \
+	  grep -qE '^  cbnz x(19|2[0-6]), ' $(BUILDDIR)/ptrwalk-$$f-arm.s || { echo "ptrwalk-arm.s: $$f does not test its pointer with cbnz"; exit 1; }; \
+	  if grep -qE '^  mov x(9|1[0-5]), x(19|2[0-6])$$' $(BUILDDIR)/ptrwalk-$$f-arm.s; then echo "ptrwalk-arm.s: $$f copies a register variable into the pool"; exit 1; fi; \
+	  if grep -q 'mov x17, #0$$' $(BUILDDIR)/ptrwalk-$$f-arm.s; then echo "ptrwalk-arm.s: $$f compares with a register of zero"; exit 1; fi; \
+	done; \
+	echo ok ptrwalk-arm-asm; \
 	$(OUTDIR)/paslangc -target arm64 -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/exprinline0-arm testdata/exprinline.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/exprinline0-arm > $(BUILDDIR)/exprinline0-arm.got; \
 	diff -u testdata/exprinline.out $(BUILDDIR)/exprinline0-arm.got; \
