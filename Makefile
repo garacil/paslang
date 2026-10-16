@@ -316,6 +316,9 @@ GOLDEN_A64 += coldloop
 # it lives.
 GOLDEN += ptrwalk
 GOLDEN_A64 += ptrwalk
+# P305: an if without an else jumps over nothing.
+GOLDEN += ifcase
+GOLDEN_A64 += ifcase
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -2301,6 +2304,9 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  if grep -qE 'cmpq \$$0, %' $(BUILDDIR)/ptrwalk-$$f.s; then echo "ptrwalk.s: $$f compares a register with 0"; exit 1; fi; \
 	done; \
 	echo ok ptrwalk-asm; \
+	: no jump goes to the next instruction in any golden program, P305: an if without an else, the last arm of a case and an Exit that ends a routine fall through; \
+	python3 -I scripts/check_nextjump.py $(foreach t,$(GOLDEN),$(BUILDDIR)/$(t).s); \
+	echo ok nextjump; \
 	: every loop of an asm kernel of the units starts aligned, as the loops paslangc compiles, P302; \
 	python3 -I scripts/check_kernel_align.py src/lib/*.paslang src/rtl/*.paslang; \
 	echo ok kernel-align; \
@@ -3380,6 +3386,8 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	  if grep -q 'mov x17, #0$$' $(BUILDDIR)/ptrwalk-$$f-arm.s; then echo "ptrwalk-arm.s: $$f compares with a register of zero"; exit 1; fi; \
 	done; \
 	echo ok ptrwalk-arm-asm; \
+	python3 -I scripts/check_nextjump.py $(foreach t,$(GOLDEN_A64),$(BUILDDIR)/$(t)-arm.s); \
+	echo ok nextjump-arm; \
 	$(OUTDIR)/paslangc -target arm64 -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/exprinline0-arm testdata/exprinline.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/exprinline0-arm > $(BUILDDIR)/exprinline0-arm.got; \
 	diff -u testdata/exprinline.out $(BUILDDIR)/exprinline0-arm.got; \

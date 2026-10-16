@@ -777,6 +777,8 @@ type
     function ScaleOf(T: PExpr; out Idx: PExpr): Int64;
     function WordReg(E: PExpr): string;
     function LoadKind(E: PExpr): Boolean;
+    function NoStmt(S: PStmt): Boolean;
+    procedure DropJumpTo(const L: string);
     function ZeroCmp(E: PExpr; const Target: string; WhenTrue: Boolean): Boolean;
     function ConstAddend(P: PExpr; out B: PExpr; out K: Int64): Boolean;
     function ScaledAdd(E: PExpr; D: LongInt): Boolean;
@@ -868,6 +870,36 @@ begin
     Move(S[1], FOut[FLen + 1], m);
   FOut[FLen + m + 1] := Char(10);
   FLen := need;
+end;
+
+{ The jump to L that ends the code written so far goes, when only
+  labels, .loc and .cfi lines follow it: L is about to be written next,
+  and an Exit that ends a routine jumped to its epilogue right after it
+  (P305). The labels stay; the code reaching them falls into L. }
+procedure TEmitter.DropJumpTo(const L: string);
+var
+  e, b: SizeInt;
+  t: string;
+begin
+  e := FLen;
+  while e > 0 do
+  begin
+    b := e - 1;
+    while (b > 0) and (FOut[b] <> Char(10)) do
+      Dec(b);
+    t := Copy(FOut, b + 1, e - b - 1);
+    if (t = '  jmp ' + L) or (t = '  b ' + L) then
+    begin
+      if FLen > e then
+        Move(FOut[e + 1], FOut[b + 1], FLen - e);
+      FLen := FLen - (e - b);
+      Exit;
+    end;
+    if not (((Length(t) > 1) and (t[1] = '.') and (t[Length(t)] = ':')) or
+      (Copy(t, 1, 7) = '  .loc ') or (Copy(t, 1, 6) = '  .cfi')) then
+      Exit;
+    e := b;
+  end;
 end;
 
 { Which section a directive Line writes moves to: code for .text and
@@ -21222,7 +21254,7 @@ end;
 
 procedure TEmitter.EmitStmtNow(S: PStmt);
 var
-  i, j, n, nreg: SizeInt;
+  i, j, n, nreg, nv, ns: SizeInt;
   ist: PStmt;
   a, b, c, d, smap: string;
   boxoff: array of LongInt;
@@ -21499,7 +21531,9 @@ begin
               Like Go walk/select.go, enter the body with no temporary
               selector storage that a control-flow exit must unwind. }
             EmitStmt(S^.Sels[i].Body);
-            Line('  b ' + b);
+            { the last arm falls to the end (P305) }
+            if i < n - 1 then
+              Line('  b ' + b);
             Line(a + ':');
           end;
           Line(b + ':');
@@ -21714,10 +21748,16 @@ begin
             Line('  cbz x0, ' + a);
           end;
           EmitStmt(S^.ThenSt);
-          Line('  b ' + b);
-          Line(a + ':');
-          EmitStmt(S^.ElseSt);
-          Line(b + ':');
+          { no else: nothing to jump over (P305) }
+          if NoStmt(S^.ElseSt) then
+            Line(a + ':')
+          else
+          begin
+            Line('  b ' + b);
+            Line(a + ':');
+            EmitStmt(S^.ElseSt);
+            Line(b + ':');
+          end;
         end;
       skWhile:
         if not EmitLoopRun(S) then
@@ -21874,37 +21914,57 @@ begin
             c := Lab;
             { A string label compares the whole string; a range is two
               compares (1.0.78). }
-            for j := 0 to High(S^.Arms[i].Strs) do
+            { the arm's last test goes past it when it fails, so a match
+              falls into the arm (P305) }
+            ns := Length(S^.Arms[i].Strs);
+            nv := Length(S^.Arms[i].Vals);
+            for j := 0 to ns - 1 do
             begin
               LdFP('x0', so);
               LdFP('x1', so + 8);
               LeaS(InternStr(S^.Arms[i].Strs[j]), 'x2');
               Imm('x3', Length(S^.Arms[i].Strs[j]));
               Line('  bl rt_streq');
-              Line('  cbnz x0, ' + a);
+              if (j = ns - 1) and (nv = 0) then
+                Line('  cbz x0, ' + c)
+              else
+                Line('  cbnz x0, ' + a);
             end;
-            for j := 0 to High(S^.Arms[i].Vals) do
+            for j := 0 to nv - 1 do
               if (j <= High(S^.Arms[i].His)) and (S^.Arms[i].His[j] <> S^.Arms[i].Vals[j]) then
               begin
                 d := Lab;
+                if j = nv - 1 then
+                  d := c;
                 Imm('x9', S^.Arms[i].Vals[j]);
                 Line('  cmp x0, x9');
                 Line('  b.lt ' + d);
                 Imm('x9', S^.Arms[i].His[j]);
                 Line('  cmp x0, x9');
-                Line('  b.le ' + a);
-                Line(d + ':');
+                if j = nv - 1 then
+                  Line('  b.gt ' + c)
+                else
+                begin
+                  Line('  b.le ' + a);
+                  Line(d + ':');
+                end;
               end
               else
               begin
                 Imm('x9', S^.Arms[i].Vals[j]);
                 Line('  cmp x0, x9');
-                Line('  b.eq ' + a);
+                if j = nv - 1 then
+                  Line('  b.ne ' + c)
+                else
+                  Line('  b.eq ' + a);
               end;
-            Line('  b ' + c);
+            if ns + nv = 0 then
+              Line('  b ' + c);
             Line(a + ':');
             EmitStmt(S^.Arms[i].Body);
-            Line('  b ' + b);
+            { the last arm without an else falls to the end (P305) }
+            if (i < High(S^.Arms)) or not NoStmt(S^.ElseSt) then
+              Line('  b ' + b);
             Line(c + ':');
           end;
           EmitStmt(S^.ElseSt);
@@ -22212,7 +22272,9 @@ begin
             StoreTo(NewVar(S^.Sels[i].Dest, FindSym(S^.Sels[i].Dest).Typ));
           end;
           EmitStmt(S^.Sels[i].Body);
-          Line('  jmp ' + b);
+          { the last arm falls to the end (P305) }
+          if i < n - 1 then
+            Line('  jmp ' + b);
           Line(a + ':');
         end;
         Line(b + ':');
@@ -22430,10 +22492,17 @@ begin
           Line('  jz ' + a);
         end;
         EmitStmt(S^.ThenSt);
-        Line('  jmp ' + b);
-        Line(a + ':');
-        EmitStmt(S^.ElseSt);
-        Line(b + ':');
+        { no else: nothing to jump over, where every pass through the
+          then took a jump to the next instruction (P305) }
+        if NoStmt(S^.ElseSt) then
+          Line(a + ':')
+        else
+        begin
+          Line('  jmp ' + b);
+          Line(a + ':');
+          EmitStmt(S^.ElseSt);
+          Line(b + ':');
+        end;
       end;
     skWhile:
       if not EmitLoopRun(S) then
@@ -22582,7 +22651,11 @@ begin
           { A string label compares the whole string; a range is two
             compares; a label beyond 32 bits goes through rcx: cmpq takes
             a 32-bit immediate (1.0.78). }
-          for j := 0 to High(S^.Arms[i].Strs) do
+          { the arm's last test goes past it when it fails, so a match
+            falls into the arm, where it jumped over a jump (P305) }
+          ns := Length(S^.Arms[i].Strs);
+          nv := Length(S^.Arms[i].Vals);
+          for j := 0 to ns - 1 do
           begin
             Line('  movq ' + IntToStr(so) + '(%rbp), %rdi');
             Line('  movq ' + IntToStr(so + 8) + '(%rbp), %rsi');
@@ -22590,27 +22663,43 @@ begin
             Line('  movq $' + IntToStr(Length(S^.Arms[i].Strs[j])) + ', %rcx');
             Line('  call rt_streq');
             Line('  testq %rax, %rax');
-            Line('  jnz ' + a);
+            if (j = ns - 1) and (nv = 0) then
+              Line('  jz ' + c)
+            else
+              Line('  jnz ' + a);
           end;
-          for j := 0 to High(S^.Arms[i].Vals) do
+          for j := 0 to nv - 1 do
             if (j <= High(S^.Arms[i].His)) and (S^.Arms[i].His[j] <> S^.Arms[i].Vals[j]) then
             begin
               d := Lab;
+              if j = nv - 1 then
+                d := c;
               CaseCmp(S^.Arms[i].Vals[j]);
               Line('  jl ' + d);
               CaseCmp(S^.Arms[i].His[j]);
-              Line('  jle ' + a);
-              Line(d + ':');
+              if j = nv - 1 then
+                Line('  jg ' + c)
+              else
+              begin
+                Line('  jle ' + a);
+                Line(d + ':');
+              end;
             end
             else
             begin
               CaseCmp(S^.Arms[i].Vals[j]);
-              Line('  je ' + a);
+              if j = nv - 1 then
+                Line('  jne ' + c)
+              else
+                Line('  je ' + a);
             end;
-          Line('  jmp ' + c);
+          if ns + nv = 0 then
+            Line('  jmp ' + c);
           Line(a + ':');
           EmitStmt(S^.Arms[i].Body);
-          Line('  jmp ' + b);
+          { the last arm without an else falls to the end (P305) }
+          if (i < High(S^.Arms)) or not NoStmt(S^.ElseSt) then
+            Line('  jmp ' + b);
           Line(c + ':');
         end;
         EmitStmt(S^.ElseSt);
@@ -25240,6 +25329,13 @@ begin
   end;
 end;
 
+{ S writes no code: no statement, or a block of none (an else of
+  nothing, P305). }
+function TEmitter.NoStmt(S: PStmt): Boolean;
+begin
+  Result := (S = nil) or ((S^.Kind = skBlock) and (Length(S^.Stmts) = 0));
+end;
+
 { E is a load the pool works out as one: a word through a pointer, a
   field or an index (EmitOrdTo's ekDeref, ekField and ekIndex, P303). }
 function TEmitter.LoadKind(E: PExpr): Boolean;
@@ -27428,6 +27524,7 @@ begin
     EmitStmt(Pr.Body);
     if FDaOn then
       FCurDa := DaBit('result');
+    DropJumpTo(FEpi);
     Line(FEpi + ':');
     if Pr.IsCtor then
       LdFP('x0', -8 * LongInt(1 + Ord(Pr.Nest > 0)))
@@ -27499,6 +27596,7 @@ begin
     EmitStmt(Pr.Body);
     if FDaOn then
       FCurDa := DaBit('result');
+    DropJumpTo(FEpi);
     Line(FEpi + ':');
     if Pr.IsCtor then
       Line('  movq -8(%rbp), %rax')
@@ -37871,6 +37969,7 @@ begin
       FMainLine := FDbgLine;
       { Exit in the program's body ends it here (1.1.1: the label was
         named and never written, and the link failed) }
+      DropJumpTo(FEpi);
       Line(FEpi + ':');
       Line('  bl rt_runfini');
       Line('  mov x0, xzr');
@@ -37914,6 +38013,7 @@ begin
       FTune := FProgTune;
       FDbgFn := '';
       FMainLine := FDbgLine;
+      DropJumpTo(FEpi);
       Line(FEpi + ':');
       Line('  call rt_runfini');
       Line('  xorq %rax, %rax');
