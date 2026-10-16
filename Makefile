@@ -44,7 +44,7 @@ BUILDDIR := ./build
 # paslangc that compiles these sources (cmd/paslangc says it with $if
 # too), and the seed a machine with none starts from: the assembly
 # paslangc writes for itself, built with as and ld (scripts/bootstrap_seed.py).
-BOOT_MIN := 1.1.110
+BOOT_MIN := 1.1.156
 SEED_DIR := bootstrap
 # The processor bin/paslangc is built for (P264, Reglas 14 and 15): the
 # machine building it, as every program is by default; make
@@ -325,6 +325,9 @@ GOLDEN_A64 += movefill
 # P306: a constant an instruction can take is its immediate.
 GOLDEN += immconst
 GOLDEN_A64 += immconst
+# P295: a product by a constant is shifts and adds where that is faster.
+GOLDEN += mulconst
+GOLDEN_A64 += mulconst
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -2324,6 +2327,10 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	: a constant an instruction can take is its immediate, P306: the routines of immconst load no such constant into a register first; \
 	python3 -I scripts/check_immediates.py $(BUILDDIR)/immconst.s adds,logic,steps,cmps,chars,kind,arrays; \
 	echo ok immconst-asm; \
+	: a product by a constant is one or two shifts, adds or leas where that costs less than a multiply, P295: Ten multiplies nothing and Large still does; \
+	if awk '/^p_ten:/,/cfi_endproc/' $(BUILDDIR)/mulconst.s | grep -q 'imulq'; then echo "mulconst.s: Ten multiplies"; exit 1; fi; \
+	awk '/^p_large:/,/cfi_endproc/' $(BUILDDIR)/mulconst.s | grep -q 'imulq' || { echo "mulconst.s: Large does not multiply"; exit 1; }; \
+	echo ok mulconst-asm; \
 	: every loop of an asm kernel of the units starts aligned, as the loops paslangc compiles, P302; \
 	python3 -I scripts/check_kernel_align.py src/lib/*.paslang src/rtl/*.paslang; \
 	echo ok kernel-align; \
@@ -3414,6 +3421,14 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	echo ok movefill-arm-asm; \
 	python3 -I scripts/check_immediates.py $(BUILDDIR)/immconst-arm.s adds,logic,steps,cmps,chars,kind,arrays; \
 	echo ok immconst-arm-asm; \
+	: P295 on arm64: Ten multiplies nothing, SixFortyOne multiplies only where the multiply is fast and not tuned for Neoverse N1, whose takes 4 cycles; \
+	if awk '/^p_ten:/,/cfi_endproc/' $(BUILDDIR)/mulconst-arm.s | grep -q '^  mul '; then echo "mulconst-arm.s: Ten multiplies"; exit 1; fi; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -tune neoverse-n1 -Fu $(A64DIR) -o $(BUILDDIR)/mulconst-n1-arm testdata/mulconst.paslang; \
+	timeout 300 $(QEMU_A64) $(BUILDDIR)/mulconst-n1-arm > $(BUILDDIR)/mulconst-n1-arm.got; \
+	diff -u testdata/mulconst.out $(BUILDDIR)/mulconst-n1-arm.got; \
+	if awk '/^p_sixfortyone:/,/cfi_endproc/' $(BUILDDIR)/mulconst-n1-arm.s | grep -q '^  mul '; then echo "mulconst-n1-arm.s: SixFortyOne multiplies on Neoverse N1"; exit 1; fi; \
+	awk '/^p_large:/,/cfi_endproc/' $(BUILDDIR)/mulconst-n1-arm.s | grep -q '^  mul ' || { echo "mulconst-n1-arm.s: Large does not multiply"; exit 1; }; \
+	echo ok mulconst-arm-asm; \
 	$(OUTDIR)/paslangc -target arm64 -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/exprinline0-arm testdata/exprinline.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/exprinline0-arm > $(BUILDDIR)/exprinline0-arm.got; \
 	diff -u testdata/exprinline.out $(BUILDDIR)/exprinline0-arm.got; \

@@ -247,6 +247,14 @@ type
     collector reads as a candidate. Kind 1 is a prologue's stack check,
     before the routine has a frame. }
   TInt64Arr = array of Int64;
+  { a*x + b*y in one instruction, its cost in tenths of a cycle (P295):
+    Kind 1 add, 2 neg, 3 sub, 4 add with y shifted, 5 neg shifted,
+    6 sub with y shifted, 7 shift, 8 lea (amd64, y scaled by 1 shl Sh) }
+  TMulCombo = record
+    A, B: Int64;
+    Cost, Kind, Sh: LongInt;
+  end;
+  TMulComboArr = array of TMulCombo;
 
   TMapSite = record
     Lab: string;
@@ -319,6 +327,11 @@ type
     FNoCheck: Boolean;      { EmitWordMem's element was just checked by the same statement (P100) }
     FChunkReg: string;
     FR8Lent: Boolean;   { a region of integer arithmetic keeps a variable in r8 (1.1.1) }
+    FMulC: TMulComboArr;   { the one-instruction combinations of P295's recipes }
+    FMulCTune: LongInt;    { the processor FMulC was made for, -1 for none yet }
+    FMulCost: LongInt;     { a multiply's cost there }
+    FMulKs: TInt64Arr;     { the constants a recipe was looked for, and what was found }
+    FMulForm, FMulIn, FMulOut: TInt64Arr;
     FCarrySym: TSym;    { the place Carry's register is loaded from and stored to (1.0.130) }      { the end of an innermost for's run of 1024, in a promoted region (P100) }
     FChunkSave: LongInt;    { its caller value's frame slot when the register is a kept one, else 0 }
     FChunkDw: LongInt;      { its DWARF number, for the CFI of that slot }
@@ -781,6 +794,12 @@ type
     function WordScalar(E: PExpr): Boolean;
     function PoolSize: LongInt;
     procedure MulImm(const Op, R: string);
+    procedure MulCombos;
+    function MulRecipe(K: Int64; out Form, Inner, Outer: LongInt): Boolean;
+    procedure MulComboArm(const C: TMulCombo; const D, X, Y: string);
+    procedure MulComboX86(const C: TMulCombo; const D, X, Y: string);
+    function MulByK(const R: string; K: Int64): Boolean;
+    function MulByKTo(const D, S: string; K: Int64): Boolean;
     function IndexOK(I: PExpr; D: LongInt): Boolean;
     function WordBaseOK(B: PExpr; D: LongInt): Boolean;
     function FatPtrOK(B: PExpr; D: LongInt): Boolean;
@@ -24975,6 +24994,9 @@ begin
           else if (E^.R^.Kind = ekInt) and ((E^.Bin = boAnd) or (E^.Bin = boOr) or
             (E^.Bin = boXor)) and ArmLogImm(k) then
             Line('  ' + m + ' ' + r + ', ' + s.Reg + ', #' + HexWord(k))
+          { a product by a constant's recipe from the variable's register
+            (P295) }
+          else if (E^.Bin = boMul) and (E^.R^.Kind = ekInt) and MulByKTo(r, s.Reg, k) then
           else
             Line('  ' + m + ' ' + r + ', ' + s.Reg + ', ' + OrdOperand(E^.R, D));
           Exit;
@@ -25237,6 +25259,10 @@ begin
       end
       else
       begin
+        { a constant's product by a recipe, before the constant is
+          loaded (P295) }
+        if (E^.Bin = boMul) and ConstOf(E^.R, k) and MulByK(r, k) then
+          Exit;
         { a logical immediate where and, orr and eor take one (P290) }
         if (E^.Bin <> boMul) and (E^.R^.Kind = ekInt) and ArmLogImm(E^.R^.Num) then
           op := '#' + HexWord(E^.R^.Num)
@@ -25489,12 +25515,312 @@ begin
   Result := (sz = 8) or (sz = 1) or (sz = 2) or (sz = 4);
 end;
 
+{ ---- A product by a constant (P295) ----
+
+  x * K as one or two of the instructions that compute a*x + b*y, as Go
+  writes it when that costs less than a multiply (cmd/compile/internal/
+  ssa/config.go BuildRecipes; rewrite.go MulStrengthReduce; ARM64.rules
+  and AMD64.rules, MUL and MULQconst by a constant). The one-instruction
+  combinations: on arm64 add, neg and sub (10), add, neg and sub with the
+  second operand shifted left by 1 to 63 and a shift by 1 to 63, their
+  costs and a multiply's those of the processor -cpu or $TUNE names
+  (CpuShiftAddCostArm, CpuMulCostArm: Neoverse N1's MUL takes 4 cycles,
+  N2's and V2's 2); on amd64 Go's (add and lea by 2, 4 and 8 10, neg,
+  sub and a shift 11, a multiply 30: IMUL takes 3 cycles on Zen 2, AMD
+  17h 30h latencies, and an add, a shift and a lea of two parts 1). A
+  recipe is one of them on x and x, or two: the second on the first's
+  result twice (A), on x and the first's result (B), or on the first's
+  result and x (C), the cheapest under a multiply. }
+
+procedure TEmitter.MulCombos;
+var
+  i: LongInt;
+
+  procedure R(A, B: Int64; Cost, Kind, Sh: LongInt);
+  var
+    n: SizeInt;
+  begin
+    n := Length(FMulC);
+    SetLength(FMulC, n + 1);
+    FMulC[n].A := A;
+    FMulC[n].B := B;
+    FMulC[n].Cost := Cost;
+    FMulC[n].Kind := Kind;
+    FMulC[n].Sh := Sh;
+  end;
+
+begin
+  if FArm then
+  begin
+    if FMulCTune = FTune then
+      Exit;
+    FMulCTune := FTune;
+  end
+  else
+  begin
+    if FMulCTune = 0 then
+      Exit;
+    FMulCTune := 0;
+  end;
+  FMulC := nil;
+  FMulKs := nil;
+  FMulForm := nil;
+  FMulIn := nil;
+  FMulOut := nil;
+  if FArm then
+  begin
+    FMulCost := CpuMulCostArm(FTune);
+    R(1, 1, 10, 1, 0);
+    R(-1, 0, 10, 2, 0);
+    R(1, -1, 10, 3, 0);
+    for i := 1 to 63 do
+    begin
+      R(1, Int64(1) shl i, CpuShiftAddCostArm(FTune, i), 4, i);
+      R(-(Int64(1) shl i), 0, CpuShiftAddCostArm(FTune, i), 5, i);
+      R(1, -(Int64(1) shl i), CpuShiftAddCostArm(FTune, i), 6, i);
+      if i = 1 then
+        R(Int64(1) shl i, 0, 9, 7, i)
+      else
+        R(Int64(1) shl i, 0, 10, 7, i);
+    end;
+  end
+  else
+  begin
+    FMulCost := 30;
+    R(1, 1, 10, 1, 0);
+    R(-1, 0, 11, 2, 0);
+    R(1, -1, 11, 3, 0);
+    R(1, 2, 10, 8, 1);
+    R(1, 4, 10, 8, 2);
+    R(1, 8, 10, 8, 3);
+    for i := 2 to 63 do
+      R(Int64(1) shl i, 0, 11, 7, i);
+  end;
+end;
+
+{ The recipe for x * K: Form 1 one combination (Inner), 2 to 4 two (A, B,
+  C above), the cheapest under a multiply, as Go builds its table; False
+  when a multiply costs no more. Found once a constant. }
+function TEmitter.MulRecipe(K: Int64; out Form, Inner, Outer: LongInt): Boolean;
+var
+  i, o, n: SizeInt;
+  best, c: LongInt;
+  vi: Int64;
+begin
+  MulCombos;
+  for i := 0 to High(FMulKs) do
+    if FMulKs[i] = K then
+    begin
+      Form := LongInt(FMulForm[i]);
+      Inner := LongInt(FMulIn[i]);
+      Outer := LongInt(FMulOut[i]);
+      Result := Form <> 0;
+      Exit;
+    end;
+  Form := 0;
+  Inner := 0;
+  Outer := 0;
+  best := FMulCost;
+  for i := 0 to High(FMulC) do
+    if (FMulC[i].A + FMulC[i].B = K) and (FMulC[i].Cost < best) then
+    begin
+      best := FMulC[i].Cost;
+      Form := 1;
+      Inner := LongInt(i);
+    end;
+  for i := 0 to High(FMulC) do
+  begin
+    vi := FMulC[i].A + FMulC[i].B;
+    for o := 0 to High(FMulC) do
+    begin
+      c := FMulC[i].Cost + FMulC[o].Cost;
+      if c >= best then
+        Continue;
+      if vi * (FMulC[o].A + FMulC[o].B) = K then
+      begin
+        best := c;
+        Form := 2;
+        Inner := LongInt(i);
+        Outer := LongInt(o);
+      end
+      else if (FMulC[o].B <> 0) and (FMulC[o].A + FMulC[o].B * vi = K) then
+      begin
+        best := c;
+        Form := 3;
+        Inner := LongInt(i);
+        Outer := LongInt(o);
+      end
+      else if (FMulC[o].B <> 0) and (FMulC[o].A * vi + FMulC[o].B = K) then
+      begin
+        best := c;
+        Form := 4;
+        Inner := LongInt(i);
+        Outer := LongInt(o);
+      end;
+    end;
+  end;
+  n := Length(FMulKs);
+  SetLength(FMulKs, n + 1);
+  SetLength(FMulForm, n + 1);
+  SetLength(FMulIn, n + 1);
+  SetLength(FMulOut, n + 1);
+  FMulKs[n] := K;
+  FMulForm[n] := Form;
+  FMulIn[n] := Inner;
+  FMulOut[n] := Outer;
+  Result := Form <> 0;
+end;
+
+{ arm64: D := a*X + b*Y of the combination C (ARM DDI 0487 M.c: ADD,
+  SUB and NEG of a shifted register, C6.2.6, C6.2.458, C6.2.295; LSL
+  immediate, C6.2.270). }
+procedure TEmitter.MulComboArm(const C: TMulCombo; const D, X, Y: string);
+var
+  sh: string;
+begin
+  sh := IntToStr(C.Sh);
+  case C.Kind of
+    1: Line('  add ' + D + ', ' + X + ', ' + Y);
+    2: Line('  neg ' + D + ', ' + X);
+    3: Line('  sub ' + D + ', ' + X + ', ' + Y);
+    4: Line('  add ' + D + ', ' + X + ', ' + Y + ', lsl #' + sh);
+    5: Line('  neg ' + D + ', ' + X + ', lsl #' + sh);
+    6: Line('  sub ' + D + ', ' + X + ', ' + Y + ', lsl #' + sh);
+  else
+    Line('  lsl ' + D + ', ' + X + ', #' + sh);
+  end;
+end;
+
+{ amd64: D := a*X + b*Y of the combination C, registers written with %:
+  an add, sub, neg or shift works on D in place, a move first when D is
+  not X; a lea of two parts with no displacement (SDM vol. 2A 3-547
+  LEA). }
+procedure TEmitter.MulComboX86(const C: TMulCombo; const D, X, Y: string);
+begin
+  case C.Kind of
+    1:
+      if D = X then
+        Line('  addq ' + Y + ', ' + D)
+      else if D = Y then
+        Line('  addq ' + X + ', ' + D)
+      else
+        Line('  leaq (' + X + ',' + Y + '), ' + D);
+    2:
+      begin
+        if D <> X then
+          Line('  movq ' + X + ', ' + D);
+        Line('  negq ' + D);
+      end;
+    3:
+      if D = X then
+        Line('  subq ' + Y + ', ' + D)
+      else if D = Y then
+      begin
+        Line('  negq ' + D);
+        Line('  addq ' + X + ', ' + D);
+      end
+      else
+      begin
+        Line('  movq ' + X + ', ' + D);
+        Line('  subq ' + Y + ', ' + D);
+      end;
+    8: Line('  leaq (' + X + ',' + Y + ',' + IntToStr(Int64(1) shl C.Sh) + '), ' + D);
+  else
+    begin
+      if D <> X then
+        Line('  movq ' + X + ', ' + D);
+      Line('  shlq $' + IntToStr(C.Sh) + ', ' + D);
+    end;
+  end;
+end;
+
+{ R := R * K by a recipe, R's register named as its machine writes it
+  (with % on amd64), when one costs less than a multiply; the second
+  value of a form B or C goes through x17 on arm64 and rax (rcx when R
+  is rax) on amd64. False with nothing written when none does, and on
+  amd64 for r13 and rbp, which are never a lea's base beside an index
+  (P294). }
+function TEmitter.MulByK(const R: string; K: Int64): Boolean;
+begin
+  Result := MulByKTo(R, R, K);
+end;
+
+{ D := S * K by a recipe, as MulByK: the first instruction reads S, and
+  D takes the result; S stays when it is not D (P295). }
+function TEmitter.MulByKTo(const D, S: string; K: Int64): Boolean;
+var
+  f, i, o: LongInt;
+  t: string;
+begin
+  Result := False;
+  if (K = 0) or (K = 1) then
+    Exit;
+  if (not FArm) and ((S = '%r13') or (S = '%rbp') or (D = '%r13') or (D = '%rbp')) then
+    Exit;
+  if not MulRecipe(K, f, i, o) then
+    Exit;
+  Result := True;
+  if FArm then
+  begin
+    t := 'x17';
+    case f of
+      1: MulComboArm(FMulC[i], D, S, S);
+      2:
+        begin
+          MulComboArm(FMulC[i], D, S, S);
+          MulComboArm(FMulC[o], D, D, D);
+        end;
+      3:
+        begin
+          MulComboArm(FMulC[i], t, S, S);
+          MulComboArm(FMulC[o], D, S, t);
+        end;
+    else
+      begin
+        MulComboArm(FMulC[i], t, S, S);
+        MulComboArm(FMulC[o], D, t, S);
+      end;
+    end;
+    Exit;
+  end;
+  if (D <> '%rax') and (S <> '%rax') then
+    t := '%rax'
+  else if (D <> '%rcx') and (S <> '%rcx') then
+    t := '%rcx'
+  else
+    t := '%rdx';
+  case f of
+    1: MulComboX86(FMulC[i], D, S, S);
+    2:
+      begin
+        MulComboX86(FMulC[i], D, S, S);
+        MulComboX86(FMulC[o], D, D, D);
+      end;
+    3:
+      begin
+        MulComboX86(FMulC[i], t, S, S);
+        MulComboX86(FMulC[o], D, S, t);
+      end;
+  else
+    begin
+      MulComboX86(FMulC[i], t, S, S);
+      MulComboX86(FMulC[o], D, t, S);
+    end;
+  end;
+end;
+
 { R := R * Op with Op an immediate (or a register/memory operand),
   R written with its % (1.1.1): a multiply by 2, 4, 8 is a shift and by
   3, 5, 9 one lea, as Go writes them, one cycle where imul takes three
   in the chain of every hash mixer. }
 procedure TEmitter.MulImm(const Op, R: string);
+var
+  k: Int64;
 begin
+  { a product by a constant as Go's recipes make it (P295) }
+  if (Length(Op) > 1) and (Op[1] = '$') and StrToInt64(Copy(Op, 2, Length(Op) - 1), k) and
+    MulByK(R, k) then
+    Exit;
   if Op = '$2' then
     Line('  shlq $1, ' + R)
   else if Op = '$4' then
@@ -27089,6 +27415,7 @@ var
   e: PExpr;
   op, r: string;
   inplace: Boolean;
+  k: Int64;
 begin
   Result := False;
   if (S = nil) or (S^.Dest = nil) or (S^.E = nil) then
@@ -27135,6 +27462,9 @@ begin
           AddImmArm(dst.Reg, dst.Reg, -e^.R^.Num);
         Exit;
       end;
+      { a product by a constant's recipe (P295) }
+      if (e^.Bin = boMul) and ConstOf(e^.R, k) and MulByK(dst.Reg, k) then
+        Exit;
       if ((e^.Bin = boAnd) or (e^.Bin = boOr) or (e^.Bin = boXor)) and
         (e^.R^.Kind = ekInt) and ArmLogImm(e^.R^.Num) then
         op := '#' + HexWord(e^.R^.Num)
@@ -27236,6 +27566,7 @@ end;
 procedure TEmitter.SpineEmit(E: PExpr; const R: string);
 var
   op: string;
+  k: Int64;
 begin
   if E^.L^.Kind <> ekVar then
     SpineEmit(E^.L, R);
@@ -27257,6 +27588,9 @@ begin
       end;
       Exit;
     end;
+    { a product by a constant's recipe (P295) }
+    if (E^.Bin = boMul) and ConstOf(E^.R, k) and MulByK(R, k) then
+      Exit;
     if ((E^.Bin = boAnd) or (E^.Bin = boOr) or (E^.Bin = boXor)) and
       (E^.R^.Kind = ekInt) and ArmLogImm(E^.R^.Num) then
       op := '#' + HexWord(E^.R^.Num)
@@ -52350,6 +52684,7 @@ begin
   em := TEmitter.Create;
   try
     em.FArm := False;
+    em.FMulCTune := -1;
     Result := em.Emit(Prog);
   finally
     em.Free;
@@ -52363,6 +52698,7 @@ begin
   em := TEmitter.Create;
   try
     em.FArm := True;
+    em.FMulCTune := -1;
     Result := em.Emit(Prog);
   finally
     em.Free;
