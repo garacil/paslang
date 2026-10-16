@@ -2276,6 +2276,9 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	: every failure of a check and every slow path that comes back is after the ret of its routine, so the fast path takes no branch, P299 and P300; \
 	python3 -I scripts/check_cold.py $(BUILDDIR)/coldfail.s 40 boundsfail,divzero,sqrtneg,realrange,bitfail,setfail,funnelfail,asfail,strappendc,strunique,fillbig; \
 	echo ok coldfail-asm; \
+	: every loop of an asm kernel of the units starts aligned, as the loops paslangc compiles, P302; \
+	python3 -I scripts/check_kernel_align.py src/lib/*.paslang src/rtl/*.paslang; \
+	echo ok kernel-align; \
 	: a function of one expression goes in as its expression, P266: the output of every routine a call, and Branchy one compare and one jump with no call of Less; \
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/exprinline0 testdata/exprinline.paslang; \
 	$(BUILDDIR)/exprinline0 > $(BUILDDIR)/exprinline0.got; \

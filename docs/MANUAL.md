@@ -2155,7 +2155,11 @@ may serve two bindings, `in` under one name and `out` under another
 (`ahi: in rdx; sumhi: out rdx`), and a result comes out of whatever
 register the instruction leaves it in. A local label is a number on a
 line of its own, `1:`, and a jump names it with a direction, `1b` back
-or `2f` forward. The lines between the bindings and `end` go to the
+or `2f` forward. A directive goes through too: `.p2align 5` on the line
+before the label a loop jumps back to starts the loop on 32 bytes, as
+paslangc starts the loops it compiles, so a change of the code before it
+does not move it (every kernel of the core units does, 1.1.151). The
+lines between the bindings and `end` go to the
 assembler untouched, so an amd64 block is AT&T (`%rax`, `$10`, source
 first) and an arm64 block is the Arm syntax (`#0`, destination first).
 

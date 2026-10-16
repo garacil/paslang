@@ -36,6 +36,35 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, 'scripts'))
 import asm_from_go
+import re
+
+
+def align_loops(text):
+    """P302: .p2align 5 before every label an asm block's loop branches
+    back to, as paslangc starts the loops it compiles
+    (scripts/check_kernel_align.py checks it)."""
+    lines = text.split('\n')
+    out = []
+    i = 0
+    while i < len(lines):
+        m = re.match(r'^(\s*)asm (amd64|arm64)\b', lines[i])
+        if not m:
+            out.append(lines[i])
+            i += 1
+            continue
+        j = i + 1
+        while j < len(lines) and not re.match(r'^' + m.group(1) + r'end\b', lines[j]):
+            j += 1
+        block = lines[i:j]
+        back = set(re.findall(r'\b(\d+)b\b', '\n'.join(block)))
+        out.append(block[0])
+        for k in range(1, len(block)):
+            lm = re.match(r'^(\s*)(\d+):\s*$', block[k])
+            if lm and lm.group(2) in back and not out[-1].strip().startswith('.p2align'):
+                out.append(lm.group(1) + '.p2align 5')
+            out.append(block[k])
+        i = j
+    return '\n'.join(out)
 
 def sha256():
     L = []
@@ -1654,7 +1683,7 @@ end;
     out.append(variant('Cpu'))
     out.append(variant('Base'))
     out.append('\nend.\n')
-    text = '\n'.join(out)
+    text = align_loops('\n'.join(out))
     path = os.path.join(ROOT, 'src', 'lib', 'pashash.paslang')
     if check:
         # make check (P270): the unit is what this writes, so a change made

@@ -1,0 +1,56 @@
+QEMU 11.1.1 linux-user: a new thread's host signal mask is its guest mask.
+
+paslang's arm64 tests run under QEMU's user mode, built from the signed
+11.1.1 release with this patch (scripts/build_qemu.py). A thread that
+spins in guest code never took a signal again, and paslang's collector,
+which stops such a thread with SIGURG (P293, as Go's asynchronous
+preemption), waited for it for ever (paslang P302, found on
+testdata/whilerun under the collector's stress: 6 hangs in 600 runs,
+at once under load):
+
+- host_signal_handler() (linux-user/signal.c) leaves the interrupted
+  context with every host signal blocked but SIGSEGV and SIGBUS, until
+  process_pending_signals() sets the host mask back to the guest's;
+- a guest clone() that runs in that window (a signal came just before
+  the thread's svc, and do_syscall() runs before the signal is
+  processed) saves that all-blocked mask in do_fork() and clone_func()
+  gives it to the new thread;
+- the new thread's TaskState has no signal pending, so its
+  process_pending_signals() never sets its mask, and every signal sent
+  to it stays pending in the host (/proc's SigBlk fffffffe7ffbfabf,
+  SigPnd SIGURG, signal_pending 0 and an empty guest mask, the thread in
+  translated code).
+
+The new thread now takes the guest mask it inherited (ts->signal_mask,
+copied from the parent's) without SIGSEGV and SIGBUS, as
+process_pending_signals() sets it. With it, whilerun ran 1000 times
+beside 16 busy loops without a hang, where it hung within its first
+three runs before. QEMU's master branch has the same code.
+
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -6948,8 +6948,22 @@
+     if (info->parent_tidptr)
+         put_user_u32(info->tid, info->parent_tidptr);
+     qemu_guest_random_seed_thread_part2(cpu->random_seed);
+-    /* Enable signals.  */
+-    sigprocmask(SIG_SETMASK, &info->sigmask, NULL);
++    /*
++     * Enable signals: the host mask mirrors the guest's (ts->signal_mask,
++     * copied from the parent's), as process_pending_signals() leaves it,
++     * not the parent's host mask of the moment, which is all-blocked from
++     * host_signal_handler() until the parent's process_pending_signals().
++     * A thread created in that window kept every host signal but SIGSEGV
++     * and SIGBUS blocked, with no signal pending to make it set its mask,
++     * and never took a signal again.
++     */
++    {
++        sigset_t set = ts->signal_mask;
++
++        sigdelset(&set, SIGSEGV);
++        sigdelset(&set, SIGBUS);
++        sigprocmask(SIG_SETMASK, &set, NULL);
++    }
+     /* Signal to the parent that we're ready.  */
+     pthread_mutex_lock(&info->mutex);
+     pthread_cond_broadcast(&info->cond);
