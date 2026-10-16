@@ -337,6 +337,9 @@ GOLDEN_A64 += selectif
 # P298: a lea of three components is two where the processor makes it slow.
 GOLDEN += leasplit
 GOLDEN_A64 += leasplit
+# P310: an element's index is scaled by shifts and leas.
+GOLDEN += idxscale
+GOLDEN_A64 += idxscale
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -2361,6 +2364,15 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	python3 -I scripts/check_lea.py $(BUILDDIR)/leasplit-zen3.s whole 20; \
 	python3 -I scripts/check_lea.py $(BUILDDIR)/heapspan.s whole 1; \
 	echo ok leasplit-asm; \
+	: an element index is scaled by shifts and leas, never by a multiply by a power of two, P310: idxscale under the stress of the collector and without inlining, its routines Loc, Glob, Dyn, Ptr and Cut multiplying nothing; \
+	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 $(BUILDDIR)/idxscale > $(BUILDDIR)/idxscale-gc.got; \
+	diff -u testdata/idxscale.out $(BUILDDIR)/idxscale-gc.got; \
+	python3 -I scripts/check_scale.py $(BUILDDIR)/idxscale.s loc,glob,dyn,ptr,cut; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/idxscale0 testdata/idxscale.paslang; \
+	$(BUILDDIR)/idxscale0 > $(BUILDDIR)/idxscale0.got; \
+	diff -u testdata/idxscale.out $(BUILDDIR)/idxscale0.got; \
+	python3 -I scripts/check_scale.py $(BUILDDIR)/idxscale0.s loc,glob,dyn,ptr,cut; \
+	echo ok idxscale-asm; \
 	: every loop of an asm kernel of the units starts aligned, as the loops paslangc compiles, P302; \
 	python3 -I scripts/check_kernel_align.py src/lib/*.paslang src/rtl/*.paslang; \
 	echo ok kernel-align; \
@@ -3476,6 +3488,16 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	diff -u testdata/selectif.out $(BUILDDIR)/selectif0-arm.got; \
 	python3 -I scripts/check_select.py $(BUILDDIR)/selectif0-arm.s testdata/selectif.paslang; \
 	echo ok selectif-arm-asm; \
+	: P310 on arm64: idxscale under the stress of the collector, and tuned for Neoverse N1 and N2, whose shifted adds cost less than a MADD, Loc, Glob, Dyn, Ptr and Cut multiply nothing; \
+	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 timeout 300 $(QEMU_A64) $(BUILDDIR)/idxscale-arm > $(BUILDDIR)/idxscale-arm-gc.got; \
+	diff -u testdata/idxscale.out $(BUILDDIR)/idxscale-arm-gc.got; \
+	for c in neoverse-n1 neoverse-n2; do \
+	  $(OUTDIR)/paslangc -target arm64 -cpu max -tune $$c -Fu $(A64DIR) -o $(BUILDDIR)/idxscale-$$c-arm testdata/idxscale.paslang; \
+	  timeout 300 $(QEMU_A64) $(BUILDDIR)/idxscale-$$c-arm > $(BUILDDIR)/idxscale-$$c-arm.got; \
+	  diff -u testdata/idxscale.out $(BUILDDIR)/idxscale-$$c-arm.got; \
+	  python3 -I scripts/check_scale.py $(BUILDDIR)/idxscale-$$c-arm.s loc,glob,dyn,ptr,cut --arm; \
+	done; \
+	echo ok idxscale-arm-asm; \
 	$(OUTDIR)/paslangc -target arm64 -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/exprinline0-arm testdata/exprinline.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/exprinline0-arm > $(BUILDDIR)/exprinline0-arm.got; \
 	diff -u testdata/exprinline.out $(BUILDDIR)/exprinline0-arm.got; \

@@ -803,6 +803,11 @@ type
     procedure MulImm(const Op, R: string);
     procedure MulCombos;
     function MulRecipe(K: Int64; out Form, Inner, Outer: LongInt): Boolean;
+    procedure MulRecipeVia(const D, S: string; F, I, O: LongInt; const T: string);
+    procedure ScaleTo(const D, S: string; K: Int64; const Tmp: string);
+    procedure ScaleAddArm(const D, B, X: string; K: Int64; const T1, T2: string);
+    procedure ScaleAddX86(const D, B, X: string; K: Int64; const Tmp: string);
+    procedure ScaleAddDispX86(const D, B, X: string; K, Disp: Int64; const Tmp: string);
     procedure MulComboArm(const C: TMulCombo; const D, X, Y: string);
     procedure MulComboX86(const C: TMulCombo; const D, X, Y: string);
     function MulByK(const R: string; K: Int64): Boolean;
@@ -5170,14 +5175,10 @@ begin
                 Line(ok + ':');
               end;
             end;
-            if esz <> 1 then
-            begin
-              Imm('x16', esz);
-              Line('  mul x0, x0, x16');
-            end;
             if FCheckPtr and (TKind(E^.L^.Typ) = tykPointer) then
             begin
               { p[i] held to p's object (1.0.111). }
+              ScaleTo('x0', 'x0', esz, 'x16');
               Line('  ldr x1, [sp]');
               Line('  add x0, x1, x0');
               Imm('x1', esz);
@@ -5187,7 +5188,7 @@ begin
             else
             begin
               Ppop('x1');
-              Line('  add x0, x1, x0');
+              ScaleAddArm('x0', 'x1', 'x0', esz, 'x16', 'x17');
             end;
           end
           else if E^.R^.Kind = ekInt then
@@ -5233,14 +5234,7 @@ begin
             if ix <> 'x0' then
               Line('  mov x0, ' + ix);
             Ppop('x1');
-            if (sh >= 0) and (sh <= 63) then
-              Line('  add x0, x1, x0, lsl #' + IntToStr(sh))
-            else
-            begin
-              Imm('x16', esz);
-              Line('  mul x0, x0, x16');
-              Line('  add x0, x1, x0');
-            end;
+            ScaleAddArm('x0', 'x1', 'x0', esz, 'x16', 'x17');
           end;
         end;
       ekCall, ekMethod, ekCtor:
@@ -5415,10 +5409,8 @@ begin
           end;
           if ok <> '' then
             Line(ok + ':');
-          if esz <> 1 then
-            Line('  imulq $' + IntToStr(esz) + ', %rax');
           Line('  popq %rcx');
-          Line('  addq %rcx, %rax');
+          ScaleAddX86('%rax', '%rcx', '%rax', esz, '%rdx');
         end
         else if TKind(E^.L^.Typ) = tykPointer then
         begin
@@ -5426,11 +5418,10 @@ begin
           EmitExpr(E^.L);
           PushK('rax', VCls(E^.L^.Typ, 0));
           EmitExpr(E^.R);
-          if esz <> 1 then
-            Line('  imulq $' + IntToStr(esz) + ', %rax');
           if FCheckPtr then
           begin
             { p[i] held to p's object (1.0.111). }
+            ScaleTo('%rax', '%rax', esz, '%rcx');
             Line('  addq (%rsp), %rax');
             LoadImmR('rcx', esz);
             Line('  call rt_ptrfrom');
@@ -5439,7 +5430,7 @@ begin
           else
           begin
             Line('  popq %rcx');
-            Line('  addq %rcx, %rax');
+            ScaleAddX86('%rax', '%rcx', '%rax', esz, '%rdx');
           end;
         end
         else if E^.R^.Kind = ekInt then
@@ -5494,14 +5485,9 @@ begin
             Line('  movq %rdx, %rax');
           { an element of a power of two is a shift, one cycle where imul
             takes three on Zen 2 (AMD 17h 30h latencies: SHL 1, IMUL
-            reg64 3) }
-          sh := Pow2Log(esz);
-          if sh > 0 then
-            Line('  shlq $' + IntToStr(sh) + ', %rax')
-          else if esz <> 1 then
-            Line('  imulq $' + IntToStr(esz) + ', %rax');
+            reg64 3), any other size a recipe where one is cheaper (P310) }
           Line('  popq %rcx');
-          Line('  addq %rcx, %rax');
+          ScaleAddX86('%rax', '%rcx', '%rax', esz, '%rdx');
         end;
       end;
     ekAddr:
@@ -10733,15 +10719,11 @@ begin
       Line('  str x2, [sp, #8]');
       if vsz > 0 then
       begin
-        Imm('x3', vstride);
-        Line('  mul x4, x2, x3');
-        Line('  add x4, x1, x4');
+        ScaleAddArm('x4', 'x1', 'x2', vstride, 'x3', '');
         AddImmArmT('x4', 'x4', 48 + 32 * ksz, 'x3');
         Line('  str x4, [sp, #24]');
       end;
-      Imm('x3', ksz);
-      Line('  mul x0, x2, x3');
-      Line('  add x0, x1, x0');
+      ScaleAddArm('x0', 'x1', 'x2', ksz, 'x3', '');
       Line('  add x0, x0, #48');
       Line('  b ' + got);
       Line(slow + ':');
@@ -10830,12 +10812,10 @@ begin
       Line('  movq %rsi, 8(%rsp)');
       if vsz > 0 then
       begin
-        Line('  imulq $' + IntToStr(vstride) + ', %rsi, %rcx');
-        Line('  leaq ' + IntToStr(48 + 32 * ksz) + '(%rdi,%rcx), %rcx');
+        ScaleAddDispX86('%rcx', '%rdi', '%rsi', vstride, 48 + 32 * ksz, '%rax');
         Line('  movq %rcx, 24(%rsp)');
       end;
-      Line('  imulq $' + IntToStr(ksz) + ', %rsi, %rax');
-      Line('  leaq 48(%rdi,%rax), %rax');
+      ScaleAddDispX86('%rax', '%rdi', '%rsi', ksz, 48, '%rcx');
       Line('  jmp ' + got);
       Line(slow + ':');
     end;
@@ -18536,12 +18516,8 @@ begin
       LdFP('x1', s1 + 8);
       Line('  cmp x0, x1');
       ColdBegin('  b.ne');
-      if esz > 1 then
-      begin
-        Imm('x9', esz);
-        Line('  mul x0, x0, x9');
-        Line('  mul x1, x1, x9');
-      end;
+      ScaleTo('x0', 'x0', esz, 'x9');
+      ScaleTo('x1', 'x1', esz, 'x9');
       Line('  bl rt_funnelfail');
       ColdEnd;
     end
@@ -18551,11 +18527,8 @@ begin
       Line('  movq ' + IntToStr(s1 + 8) + '(%rbp), %rsi');
       Line('  cmpq %rsi, %rdi');
       ColdBegin('  jne');
-      if esz > 1 then
-      begin
-        Line('  imulq $' + IntToStr(esz) + ', %rdi');
-        Line('  imulq $' + IntToStr(esz) + ', %rsi');
-      end;
+      ScaleTo('%rdi', '%rdi', esz, '');
+      ScaleTo('%rsi', '%rsi', esz, '');
       Line('  call rt_funnelfail');
       ColdEnd;
     end;
@@ -18575,11 +18548,7 @@ begin
         Line('  bl rt_stralloc')
       else
       begin
-        if esz > 1 then
-        begin
-          Imm('x9', esz);
-          Line('  mul x0, x0, x9');
-        end;
+        ScaleTo('x0', 'x0', esz, 'x9');
         Line('  mov x1, xzr');
         Line('  bl rt_alloc');
       end;
@@ -18591,8 +18560,7 @@ begin
         Line('  call rt_stralloc')
       else
       begin
-        if esz > 1 then
-          Line('  imulq $' + IntToStr(esz) + ', %rdi');
+        ScaleTo('%rdi', '%rdi', esz, '%rsi');
         Line('  xorl %esi, %esi');
         Line('  call rt_alloc');
       end;
@@ -18645,11 +18613,7 @@ begin
     else
     begin
       LdFP('x3', s0 + 8);
-      if esz > 1 then
-      begin
-        Imm('x9', esz);
-        Line('  mul x3, x3, x9');
-      end;
+      ScaleTo('x3', 'x3', esz, 'x9');
     end;
     CarryLd('w4');
     Imm('x9', kind);
@@ -18693,8 +18657,7 @@ begin
   else
   begin
     Line('  movq ' + IntToStr(s0 + 8) + '(%rbp), %rcx');
-    if esz > 1 then
-      Line('  imulq $' + IntToStr(esz) + ', %rcx');
+    ScaleTo('%rcx', '%rcx', esz, '%r8');
   end;
   Line('  movzbl ' + CarryM(1) + ', %r8d');
   Line('  shll $8, %r8d');
@@ -20924,8 +20887,7 @@ else if E^.Name = 'rt_high' then
           ColdEnd;
           Line(a + ':');
           Line('  sub x2, x6, x4');
-          Imm('x7', TSize(FTypes[E^.Typ].Elem));
-          Line('  madd x0, x4, x7, x0');
+          ScaleAddArm('x0', 'x0', 'x4', TSize(FTypes[E^.Typ].Elem), 'x7', '');
           Line('  mov x3, #0');
         end
         else if E^.Name = 'rt_slicecut' then
@@ -20952,8 +20914,7 @@ else if E^.Name = 'rt_high' then
           Line('  csel x5, x5, xzr, gt');
           Line('  cmp x5, x6');
           Line('  csel x2, x5, x6, lt');
-          Imm('x7', TSize(FTypes[E^.Typ].Elem));
-          Line('  madd x0, x4, x7, x0');
+          ScaleAddArm('x0', 'x0', 'x4', TSize(FTypes[E^.Typ].Elem), 'x7', '');
           Line('  mov x3, #0');
         end
         else if E^.Name = 'rt_aslice' then
@@ -20986,8 +20947,7 @@ else if E^.Name = 'rt_high' then
           BoundsFailArm('x5', 0, FTypes[E^.Args[0]^.Typ].Lo, '', FTypes[E^.Args[0]^.Typ].Hi, 0);
           ColdEnd;
           Line(a + ':');
-          Imm('x7', TSize(FTypes[E^.Typ].Elem));
-          Line('  madd x0, x6, x7, x0');
+          ScaleAddArm('x0', 'x0', 'x6', TSize(FTypes[E^.Typ].Elem), 'x7', '');
           Line('  mov x3, #0');
         end
         else if E^.Name = 'rt_paramcount' then
@@ -21841,8 +21801,7 @@ else if E^.Name = 'rt_high' then
           ColdEnd;
           Line(a + ':');
           Line('  subq %rsi, %rcx');
-          if TSize(FTypes[E^.Typ].Elem) <> 1 then
-            Line('  imulq $' + IntToStr(TSize(FTypes[E^.Typ].Elem)) + ', %rsi');
+          ScaleTo('%rsi', '%rsi', TSize(FTypes[E^.Typ].Elem), '%r8');
           Line('  addq %rsi, %rax');
           Line('  movq %rcx, %rdx');
           Line('  xorl %r8d, %r8d');
@@ -21876,8 +21835,7 @@ else if E^.Name = 'rt_high' then
           Line('  cmovsq %rdx, %rdi');
           Line('  cmpq %rcx, %rdi');
           Line('  cmovgq %rcx, %rdi');
-          if TSize(FTypes[E^.Typ].Elem) <> 1 then
-            Line('  imulq $' + IntToStr(TSize(FTypes[E^.Typ].Elem)) + ', %rsi');
+          ScaleTo('%rsi', '%rsi', TSize(FTypes[E^.Typ].Elem), '%r8');
           Line('  addq %rsi, %rax');
           Line('  movq %rdi, %rdx');
           Line('  xorl %r8d, %r8d');
@@ -21925,8 +21883,7 @@ else if E^.Name = 'rt_high' then
           BoundsFailX86('%rdi', FTypes[E^.Args[0]^.Typ].Lo, '', FTypes[E^.Args[0]^.Typ].Hi, 0);
           ColdEnd;
           Line(a + ':');
-          if TSize(FTypes[E^.Typ].Elem) <> 1 then
-            Line('  imulq $' + IntToStr(TSize(FTypes[E^.Typ].Elem)) + ', %rcx');
+          ScaleTo('%rcx', '%rcx', TSize(FTypes[E^.Typ].Elem), '%r8');
           Line('  addq %rcx, %rax');
           Line('  xorl %r8d, %r8d');
         end
@@ -26544,52 +26501,262 @@ begin
     Exit;
   Result := True;
   if FArm then
-  begin
-    t := 'x17';
-    case f of
-      1: MulComboArm(FMulC[i], D, S, S);
-      2:
-        begin
-          MulComboArm(FMulC[i], D, S, S);
-          MulComboArm(FMulC[o], D, D, D);
-        end;
-      3:
-        begin
-          MulComboArm(FMulC[i], t, S, S);
-          MulComboArm(FMulC[o], D, S, t);
-        end;
-    else
-      begin
-        MulComboArm(FMulC[i], t, S, S);
-        MulComboArm(FMulC[o], D, t, S);
-      end;
-    end;
-    Exit;
-  end;
-  if (D <> '%rax') and (S <> '%rax') then
+    t := 'x17'
+  else if (D <> '%rax') and (S <> '%rax') then
     t := '%rax'
   else if (D <> '%rcx') and (S <> '%rcx') then
     t := '%rcx'
   else
     t := '%rdx';
-  case f of
-    1: MulComboX86(FMulC[i], D, S, S);
+  MulRecipeVia(D, S, f, i, o, t);
+end;
+
+{ D := S * K by the recipe F, I, O of MulRecipe, the second value of a
+  form 3 or 4 through T (P295, P310). }
+procedure TEmitter.MulRecipeVia(const D, S: string; F, I, O: LongInt; const T: string);
+begin
+  if FArm then
+  begin
+    case F of
+      1: MulComboArm(FMulC[I], D, S, S);
+      2:
+        begin
+          MulComboArm(FMulC[I], D, S, S);
+          MulComboArm(FMulC[O], D, D, D);
+        end;
+      3:
+        begin
+          MulComboArm(FMulC[I], T, S, S);
+          MulComboArm(FMulC[O], D, S, T);
+        end;
+    else
+      begin
+        MulComboArm(FMulC[I], T, S, S);
+        MulComboArm(FMulC[O], D, T, S);
+      end;
+    end;
+    Exit;
+  end;
+  case F of
+    1: MulComboX86(FMulC[I], D, S, S);
     2:
       begin
-        MulComboX86(FMulC[i], D, S, S);
-        MulComboX86(FMulC[o], D, D, D);
+        MulComboX86(FMulC[I], D, S, S);
+        MulComboX86(FMulC[O], D, D, D);
       end;
     3:
       begin
-        MulComboX86(FMulC[i], t, S, S);
-        MulComboX86(FMulC[o], D, S, t);
+        MulComboX86(FMulC[I], T, S, S);
+        MulComboX86(FMulC[O], D, S, T);
       end;
   else
     begin
-      MulComboX86(FMulC[i], t, S, S);
-      MulComboX86(FMulC[o], D, t, S);
+      MulComboX86(FMulC[I], T, S, S);
+      MulComboX86(FMulC[O], D, T, S);
     end;
   end;
+end;
+
+{ D := S * K, K the size of an element or the scale of a count (P310):
+  a move for 1, a shift for a power of two, else the recipe of MulRecipe
+  where it costs less than a multiply on this tune, as Go multiplies by
+  a constant (cmd/compile/internal/ssa/_gen/AMD64.rules and ARM64.rules,
+  MULQconst and MULconst), its second value through Tmp for a recipe of
+  two (none with Tmp ''), else the multiply: IMUL of an immediate on
+  amd64, the constant in Tmp (x16 with Tmp '') and MUL on arm64. A shift
+  takes 1 cycle where IMUL r64 takes 3 on Zen 2 and Skylake (AMD 17h 30h
+  latencies; Intel 336289-001) and MUL of X form 4 on Neoverse N1
+  (arm-neoverse-n1-sog 3.6). Registers as the machine writes them, % on
+  amd64; r13 and rbp take no lea of a recipe beside an index (P294). }
+procedure TEmitter.ScaleTo(const D, S: string; K: Int64; const Tmp: string);
+var
+  f, i, o, sh: LongInt;
+  t: string;
+begin
+  if K = 1 then
+  begin
+    if D <> S then
+    begin
+      if FArm then
+        Line('  mov ' + D + ', ' + S)
+      else
+        Line('  movq ' + S + ', ' + D);
+    end;
+    Exit;
+  end;
+  sh := Pow2Log(K);
+  if sh > 0 then
+  begin
+    if FArm then
+      Line('  lsl ' + D + ', ' + S + ', #' + IntToStr(sh))
+    else if (D <> S) and (sh = 1) then
+      Line('  leaq (' + S + ',' + S + '), ' + D)
+    else if (D <> S) and (sh <= 3) then
+      { one lea of the index alone where a move and a shift were two }
+      Line('  leaq 0(,' + S + ',' + IntToStr(K) + '), ' + D)
+    else
+    begin
+      if D <> S then
+        Line('  movq ' + S + ', ' + D);
+      Line('  shlq $' + IntToStr(sh) + ', ' + D);
+    end;
+    Exit;
+  end;
+  if MulRecipe(K, f, i, o) and ((f <= 2) or (Tmp <> '')) and
+    (FArm or not ((S = '%r13') or (S = '%rbp') or (D = '%r13') or (D = '%rbp'))) then
+  begin
+    MulRecipeVia(D, S, f, i, o, Tmp);
+    Exit;
+  end;
+  if FArm then
+  begin
+    t := Tmp;
+    if t = '' then
+      t := 'x16';
+    if t = S then
+      t := 'x17';
+    Imm(t, K);
+    Line('  mul ' + D + ', ' + S + ', ' + t);
+  end
+  else if D = S then
+    Line('  imulq $' + IntToStr(K) + ', ' + D)
+  else
+    Line('  imulq $' + IntToStr(K) + ', ' + S + ', ' + D);
+end;
+
+{ arm64: D := B + X * K, K an element's size (P310): one ADD with X
+  shifted for a power of two (ARM DDI 0487 M.c C6.2.6, 1 cycle for a
+  shift of 4 or less on Neoverse N1, 2 past it, CpuShiftAddCostArm);
+  else the cheapest on this tune of K's recipe into T1 and an ADD, of
+  the recipe of m into T1 and an ADD of T1 shifted by s for K = m * 2^s
+  (Go's rules make 24 * x ADDshiftLL x x [1] and the shift a part of the
+  add that follows), and of K in T1 and one MADD (C6.2.275); a recipe's
+  second value through T2 (none with T2 ''). T1 is neither B nor X. }
+procedure TEmitter.ScaleAddArm(const D, B, X: string; K: Int64; const T1, T2: string);
+var
+  f, i, o, sh, c, best, way, fm, im, om, s: LongInt;
+  m: Int64;
+begin
+  if K = 1 then
+  begin
+    Line('  add ' + D + ', ' + B + ', ' + X);
+    Exit;
+  end;
+  sh := Pow2Log(K);
+  if (sh > 0) and (sh <= 63) then
+  begin
+    Line('  add ' + D + ', ' + B + ', ' + X + ', lsl #' + IntToStr(sh));
+    Exit;
+  end;
+  MulCombos;
+  best := FMulCost;
+  way := 0;
+  f := 0;
+  i := 0;
+  o := 0;
+  fm := 0;
+  im := 0;
+  om := 0;
+  if MulRecipe(K, f, i, o) and ((f <= 2) or (T2 <> '')) then
+  begin
+    c := FMulC[i].Cost + 10;
+    if f > 1 then
+      c := c + FMulC[o].Cost;
+    if c < best then
+    begin
+      best := c;
+      way := 1;
+    end;
+  end;
+  s := 0;
+  m := K;
+  while (m and 1) = 0 do
+  begin
+    m := m shr 1;
+    Inc(s);
+  end;
+  if (s > 0) and (m > 1) and MulRecipe(m, fm, im, om) and ((fm <= 2) or (T2 <> '')) then
+  begin
+    c := FMulC[im].Cost + CpuShiftAddCostArm(FTune, s);
+    if fm > 1 then
+      c := c + FMulC[om].Cost;
+    if c < best then
+    begin
+      best := c;
+      way := 2;
+    end;
+  end;
+  case way of
+    1:
+      begin
+        MulRecipeVia(T1, X, f, i, o, T2);
+        Line('  add ' + D + ', ' + B + ', ' + T1);
+      end;
+    2:
+      begin
+        MulRecipeVia(T1, X, fm, im, om, T2);
+        Line('  add ' + D + ', ' + B + ', ' + T1 + ', lsl #' + IntToStr(s));
+      end;
+  else
+    begin
+      Imm(T1, K);
+      Line('  madd ' + D + ', ' + X + ', ' + T1 + ', ' + B);
+    end;
+  end;
+end;
+
+{ amd64: D := B + X * K, X a register the scale may change (P310): X * m
+  by ScaleTo for K = m * 2^s, s up to 3, then one LEA of B and X scaled
+  by 2^s (SDM vol. 2A table 2-3: the SIB byte scales by 1, 2, 4 or 8),
+  so 24 is a lea of X by 3 and the base's lea by 8; for s of 0 an ADD
+  when D is B or X. B is neither r13 nor rbp. }
+procedure TEmitter.ScaleAddX86(const D, B, X: string; K: Int64; const Tmp: string);
+var
+  s: LongInt;
+  m: Int64;
+begin
+  s := 0;
+  m := K;
+  while (s < 3) and (m > 1) and ((m and 1) = 0) do
+  begin
+    m := m shr 1;
+    Inc(s);
+  end;
+  ScaleTo(X, X, m, Tmp);
+  if s > 0 then
+    Line('  leaq (' + B + ',' + X + ',' + IntToStr(Int64(1) shl s) + '), ' + D)
+  else if D = X then
+    Line('  addq ' + B + ', ' + D)
+  else if D = B then
+    Line('  addq ' + X + ', ' + D)
+  else
+    Line('  leaq (' + B + ',' + X + '), ' + D);
+end;
+
+{ amd64: D := B + X * K + Disp, X kept, D not B (P310): for K = m * 2^s,
+  s up to 3, X * m into D by ScaleTo and one LEA of B, D scaled by 2^s
+  and Disp; for m of 1 the LEA reads X itself, one instruction where a
+  multiply and a lea were two. }
+procedure TEmitter.ScaleAddDispX86(const D, B, X: string; K, Disp: Int64; const Tmp: string);
+var
+  s: LongInt;
+  m: Int64;
+  xr: string;
+begin
+  s := 0;
+  m := K;
+  while (s < 3) and (m > 1) and ((m and 1) = 0) do
+  begin
+    m := m shr 1;
+    Inc(s);
+  end;
+  xr := X;
+  if m <> 1 then
+  begin
+    ScaleTo(D, X, m, Tmp);
+    xr := D;
+  end;
+  Line('  leaq ' + IntToStr(Disp) + '(' + B + ',' + xr + ',' + IntToStr(Int64(1) shl s) + '), ' + D);
 end;
 
 { R := R * Op with Op an immediate (or a register/memory operand),
@@ -27940,8 +28107,7 @@ begin
               Line('  add ' + OrdPool(D) + ', ' + r + ', ' + idx + ', lsl #' + IntToStr(sh))
             else
             begin
-              Imm('x17', esz);
-              Line('  madd ' + OrdPool(D) + ', ' + idx + ', x17, ' + r);
+              ScaleAddArm(OrdPool(D), r, idx, esz, 'x17', '');
             end;
             r := OrdPool(D);
             if disp <> 0 then
@@ -27954,8 +28120,19 @@ begin
               if idx <> OrdPool(D + 1) then
                 Line('  movq %' + idx + ', %' + OrdPool(D + 1));
               idx := OrdPool(D + 1);
-              Line('  imulq $' + IntToStr(esz) + ', %' + idx + ', %' + idx);
-              esz := 1;
+              { the scale of the address takes a factor of 2, 4 or 8:
+                24 is a lea by 3 and the address's scale 8 (P310); not
+                beside a base of r13 or rbp with no displacement, whose
+                index unscaled takes the base's place below (P298) }
+              sh := 0;
+              while (sh < 3) and ((esz and 1) = 0) and (frm or (glab <> '') or (disp <> 0) or
+                ((r <> 'r13') and (r <> 'rbp'))) do
+              begin
+                esz := esz shr 1;
+                Inc(sh);
+              end;
+              ScaleTo('%' + idx, '%' + idx, esz, '');
+              esz := Int64(1) shl sh;
             end;
             if glab <> '' then
             begin
