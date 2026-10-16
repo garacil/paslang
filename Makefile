@@ -334,6 +334,9 @@ GOLDEN_A64 += framesize
 # P307: an if whose arms only assign a word is a conditional select.
 GOLDEN += selectif
 GOLDEN_A64 += selectif
+# P298: a lea of three components is two where the processor makes it slow.
+GOLDEN += leasplit
+GOLDEN_A64 += leasplit
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -2346,6 +2349,18 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/selectif.out $(BUILDDIR)/selectif0.got; \
 	python3 -I scripts/check_select.py $(BUILDDIR)/selectif0.s testdata/selectif.paslang; \
 	echo ok selectif-asm; \
+	: a lea of three components is two where the processor makes it slow, P298: leasplit tuned for skylake and haswell keeps no such lea in its code or its runtime, for icelake and zen3 they stay, the same output for each, and heapspan has no base of r13 beside an unscaled index with no displacement; \
+	for c in skylake haswell icelake zen3; do \
+	  $(OUTDIR)/paslangc -tune $$c -o $(BUILDDIR)/leasplit-$$c testdata/leasplit.paslang; \
+	  $(BUILDDIR)/leasplit-$$c > $(BUILDDIR)/leasplit-$$c.got; \
+	  diff -u testdata/leasplit.out $(BUILDDIR)/leasplit-$$c.got; \
+	done; \
+	python3 -I scripts/check_lea.py $(BUILDDIR)/leasplit-skylake.s slow; \
+	python3 -I scripts/check_lea.py $(BUILDDIR)/leasplit-haswell.s slow; \
+	python3 -I scripts/check_lea.py $(BUILDDIR)/leasplit-icelake.s whole 20; \
+	python3 -I scripts/check_lea.py $(BUILDDIR)/leasplit-zen3.s whole 20; \
+	python3 -I scripts/check_lea.py $(BUILDDIR)/heapspan.s whole 1; \
+	echo ok leasplit-asm; \
 	: every loop of an asm kernel of the units starts aligned, as the loops paslangc compiles, P302; \
 	python3 -I scripts/check_kernel_align.py src/lib/*.paslang src/rtl/*.paslang; \
 	echo ok kernel-align; \

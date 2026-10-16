@@ -390,6 +390,7 @@ type
     FCold: string;          { the failures of this routine's checks, placed after its ret (P299) }
     FColdAt: SizeInt;       { where the failure being captured starts in FOut, -1 for none }
     FLastIns: string;       { the last instruction emitted, when nothing that a jump reaches came after it (P96) }
+    FAsmText: Boolean;      { the lines of an asm block are being written, as they are (P298) }
     FTextSec: Boolean;      { the section Line writes into holds code (P267) }
     FTextPushed: Boolean;   { ... and the one a .pushsection left, for its .popsection }
     FProgProcs: TProcArray; { every routine of the compilation, to find a routine's nested ones }
@@ -430,6 +431,7 @@ type
     procedure Line(const S: string);
     procedure NoteSection(const S: string);
     function ForwardLoad(const S: string; out Drop: Boolean): string;
+    function SplitLea(const S: string): Boolean;
     procedure NoteLine(const S: string);
     procedure MapNote(const S: string);
     procedure MapSite;
@@ -1148,6 +1150,8 @@ begin
       AppendLine('  .p2align 5');
     AppendLine('.globl ' + Copy(S, 1, n - 1));
   end;
+  if (not FArm) and (not FAsmText) and CpuSlowLea(FTune) and SplitLea(S) then
+    Exit;
   t := S;
   drop := False;
   if (not FArm) and (FLastIns <> '') then
@@ -1158,6 +1162,106 @@ begin
   NoteLine(t);
   if FMapOn or FMapPro then
     MapNote(t);
+end;
+
+{ A lea of a base, an index and a displacement, or of a base of rbp or
+  r13 beside an index, on a processor where that lea is slow
+  (CpuSlowLea, P298): two leas of two components each, as Go wrote it up
+  to 1.27 (amd64/ssa.go: the base and index first, then the displacement
+  on the result). With a base of rbp or r13 the halves are chosen so
+  neither has one beside an index: the index becomes the base when it
+  is not scaled, else the displacement goes first when the result is
+  not the index; a lea no split makes faster stays. True when it wrote
+  the lines for S. An asm block's lines are never split. }
+function TEmitter.SplitLea(const S: string): Boolean;
+var
+  n, i, o, c: SizeInt;
+  op, d, inner, b, x, sc, r: string;
+  disp, bslow, xslow, rslow: Boolean;
+  parts: TStrArray;
+
+  function SlowBase(const Reg: string): Boolean;
+  begin
+    Result := (Reg = '%rbp') or (Reg = '%ebp') or (Reg = '%bp') or (Reg = '%r13') or
+      (Reg = '%r13d') or (Reg = '%r13w');
+  end;
+
+begin
+  Result := False;
+  n := Length(S);
+  if (n < 16) or (Copy(S, 1, 5) <> '  lea') or (S[7] <> ' ') then
+    Exit;
+  op := Copy(S, 3, 4);
+  if (op <> 'leaq') and (op <> 'leal') and (op <> 'leaw') then
+    Exit;
+  o := 0;
+  c := 0;
+  for i := 8 to n do
+    if S[i] = '(' then
+    begin
+      o := i;
+      Break;
+    end;
+  if o = 0 then
+    Exit;
+  for i := o + 1 to n do
+    if S[i] = ')' then
+    begin
+      c := i;
+      Break;
+    end;
+  if (c = 0) or (c + 3 > n) or (Copy(S, c + 1, 3) <> ', %') then
+    Exit;
+  d := Copy(S, 8, o - 8);
+  inner := Copy(S, o + 1, c - o - 1);
+  r := Copy(S, c + 3, n - c - 2);
+  if (Pos(',', r) > 0) or (Pos(' ', r) > 0) then
+    Exit;
+  parts := nil;
+  i := 1;
+  while i <= Length(inner) + 1 do
+  begin
+    o := i;
+    while (i <= Length(inner)) and (inner[i] <> ',') do
+      Inc(i);
+    SetLength(parts, Length(parts) + 1);
+    parts[High(parts)] := Copy(inner, o, i - o);
+    Inc(i);
+  end;
+  if (Length(parts) < 2) or (Length(parts) > 3) then
+    Exit;
+  b := parts[0];
+  x := parts[1];
+  sc := '1';
+  if Length(parts) = 3 then
+    sc := parts[2];
+  if (b = '') or (x = '') or (b[1] <> '%') or (x[1] <> '%') then
+    Exit;
+  disp := (d <> '') and (d <> '0');
+  bslow := SlowBase(b);
+  xslow := SlowBase(x);
+  rslow := SlowBase(r);
+  if not (disp or bslow) then
+    Exit;
+  if not bslow then
+  begin
+    Line('  ' + op + ' (' + b + ',' + x + ',' + sc + '), ' + r);
+    Line('  ' + op + ' ' + d + '(' + r + '), ' + r);
+    Result := True;
+  end
+  else if (sc = '1') and not xslow then
+  begin
+    Line('  ' + op + ' (' + x + ',' + b + '), ' + r);
+    if disp then
+      Line('  ' + op + ' ' + d + '(' + r + '), ' + r);
+    Result := True;
+  end
+  else if disp and (r <> x) and not rslow then
+  begin
+    Line('  ' + op + ' ' + d + '(' + b + '), ' + r);
+    Line('  ' + op + ' (' + r + ',' + x + ',' + sc + '), ' + r);
+    Result := True;
+  end;
 end;
 
 { A store followed by a load of the same place, with nothing a jump can
@@ -14792,7 +14896,11 @@ begin
     begin
       l := AsmLine(Copy(S^.Name, a, i - a));
       if l <> '' then
+      begin
+        FAsmText := True;
         Line(l);
+        FAsmText := False;
+      end;
       a := i + 1;
     end;
 end;
@@ -27857,6 +27965,21 @@ begin
             if frm then
             begin
               Result := IntToStr(foff + disp) + '(%rbp,%' + idx + ',' + IntToStr(esz) + ')';
+              Exit;
+            end;
+            { no displacement of 0: a base of r13 or rbp needs one
+              byte for it, so an unscaled index takes the base's place
+              (P298; SDM vol. 2A table 2-3, mod 00 with base 101 is
+              disp32 with no base) }
+            if (disp = 0) and (esz = 1) and ((r = 'r13') or (r = 'rbp')) and
+              (idx <> 'r13') and (idx <> 'rbp') then
+            begin
+              Result := '(%' + idx + ',%' + r + ')';
+              Exit;
+            end;
+            if disp = 0 then
+            begin
+              Result := '(%' + r + ',%' + idx + ',' + IntToStr(esz) + ')';
               Exit;
             end;
             if Fits32(disp) then
