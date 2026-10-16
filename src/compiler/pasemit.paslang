@@ -323,6 +323,7 @@ type
     FVecCVal: array of Int64;
     FScratchMax: LongInt;   { the high-water mark of the scratch area of this routine }
     FFrameSym: string;      { the .set symbol that carries the frame size, defined after the body }
+    FFrameMarked: Boolean;  { arm64: the prologue wrote the mark SetFrame fills (P308) }
     FSkipCanon: Boolean;    { EmitOrdTo's top node feeds a store of its own width: no cleanup (P100) }
     FNoCheck: Boolean;      { EmitWordMem's element was just checked by the same statement (P100) }
     FChunkReg: string;
@@ -815,6 +816,11 @@ type
     function LoadKind(E: PExpr): Boolean;
     function NoStmt(S: PStmt): Boolean;
     procedure DropJumpTo(const L: string);
+    function FindLineBack(const L: string): SizeInt;
+    procedure ReplaceLine(P, OldLen: SizeInt; const NewText: string);
+    function SubImmText(const D, S: string; V: Int64): string;
+    procedure FixFrameArm(const Sym: string; F: LongInt);
+    procedure FrameMarkArm;
     function FixedAddr(E: PExpr; out Sy: TSym; out K: Int64): Boolean;
     procedure CmpImmArm(const R: string; K: Int64; const Tmp: string);
     procedure SpAdjArm(const Op: string; K: Int64);
@@ -919,6 +925,125 @@ begin
     Move(S[1], FOut[FLen + 1], m);
   FOut[FLen + m + 1] := Char(10);
   FLen := need;
+end;
+
+{ ---- arm64's frame size as immediates (P308) ----
+
+  A routine's frame is known only after its body, so arm64 loaded it
+  from a word placed after the body, ldr x16, .Lfr and sub sp, sp, x16,
+  and the stack check loaded the frame and its margin the same way: a
+  load on the path of every call, four cycles on Neoverse N1 and a miss
+  on a routine's first call. The prologue and the check now write a
+  comment that marks their place, and SetFrame, which knows the size,
+  puts there the SUBs that take it as immediates (ARM DDI 0487 M.c
+  C6.2.457, imm12 and its shift by 12): one for up to 4095 bytes, two
+  up to 16 MiB, a literal past that. Between the two SUBs of a large
+  frame the frame is half made; nothing is stored in it yet, and a stop
+  by a signal there saves its registers below that sp as anywhere. Go
+  makes a frame up to 0xf0 with one STP and a larger one with SUB of
+  its size (cmd/internal/obj/arm64/obj7.go). }
+
+{ The place, from 1, of the last line L of the text written so far; 0
+  when there is none (P308). }
+function TEmitter.FindLineBack(const L: string): SizeInt;
+var
+  p, n, k: SizeInt;
+  ok: Boolean;
+begin
+  Result := 0;
+  n := Length(L);
+  p := FLen - n;
+  while p >= 1 do
+  begin
+    if (FOut[p + n] = Char(10)) and ((p = 1) or (FOut[p - 1] = Char(10))) and
+      (FOut[p] = L[1]) then
+    begin
+      ok := True;
+      for k := 2 to n do
+        if FOut[p + k - 1] <> L[k] then
+        begin
+          ok := False;
+          Break;
+        end;
+      if ok then
+      begin
+        Result := p;
+        Exit;
+      end;
+    end;
+    Dec(p);
+  end;
+end;
+
+{ The OldLen characters from P are NewText now, the text after moved to
+  follow it (P308). }
+procedure TEmitter.ReplaceLine(P, OldLen: SizeInt; const NewText: string);
+var
+  d, m, room: SizeInt;
+begin
+  m := Length(NewText);
+  d := m - OldLen;
+  if FLen + d + 1 > Length(FOut) then
+  begin
+    room := Length(FOut);
+    while room < FLen + d + 1 do
+      room := room * 2;
+    SetLength(FOut, room);
+  end;
+  if FLen - (P + OldLen) + 1 > 0 then
+    Move(FOut[P + OldLen], FOut[P + m], FLen - (P + OldLen) + 1);
+  if m > 0 then
+    Move(NewText[1], FOut[P], m);
+  FLen := FLen + d;
+end;
+
+{ D := S - V as text, lines joined by line ends (P308). }
+function TEmitter.SubImmText(const D, S: string; V: Int64): string;
+var
+  lo, hi: Int64;
+begin
+  if (V >= 0) and (V <= 4095) then
+    Result := '  sub ' + D + ', ' + S + ', #' + IntToStr(V)
+  else if (V > 0) and (V <= 16777215) then
+  begin
+    lo := V and 4095;
+    hi := V shr 12;
+    if lo = 0 then
+      Result := '  sub ' + D + ', ' + S + ', #' + IntToStr(hi) + ', lsl #12'
+    else
+      Result := '  sub ' + D + ', ' + S + ', #' + IntToStr(lo) + Char(10) +
+        '  sub ' + D + ', ' + D + ', #' + IntToStr(hi) + ', lsl #12';
+  end
+  else
+    Result := '  ldr x16, =' + IntToStr(V) + Char(10) + '  sub ' + D + ', ' + S + ', x16';
+end;
+
+{ The prologue's mark for its frame's SUBs (P308). }
+procedure TEmitter.FrameMarkArm;
+begin
+  Line('  /* frame ' + FFrameSym + ' */');
+  FFrameMarked := True;
+end;
+
+{ The routine Sym's frame F into its prologue's mark and its check's,
+  when the check stayed (P308); a leaf without a frame wrote neither. }
+procedure TEmitter.FixFrameArm(const Sym: string; F: LongInt);
+var
+  p: SizeInt;
+  m: string;
+begin
+  if not FFrameMarked then
+    Exit;
+  FFrameMarked := False;
+  m := '  /* check ' + Sym + ' */';
+  p := FindLineBack(m);
+  if p > 0 then
+    ReplaceLine(p, Length(m), SubImmText('x9', 'sp', Int64(F) + 2048));
+  m := '  /* frame ' + Sym + ' */';
+  p := FindLineBack(m);
+  if p = 0 then
+    Die('internal error: no frame mark for ' + Sym);
+  ReplaceLine(p, Length(m), SubImmText('sp', 'sp', F));
 end;
 
 { The jump to L that ends the code written so far goes, when only
@@ -1909,8 +2034,7 @@ begin
   begin
     Line('  stp x29, x30, [sp, #-16]!');
     Line('  mov x29, sp');
-    Line('  ldr x16, ' + FFrameSym);
-    Line('  sub sp, sp, x16');
+    FrameMarkArm;
     MapBegin;
     LdS(onceSym, 'x0');
     Line('  cbnz x0, ' + ret);
@@ -1938,8 +2062,7 @@ begin
       EmitStackCheck(finiSym, FFrameSym);
       Line('  stp x29, x30, [sp, #-16]!');
       Line('  mov x29, sp');
-      Line('  ldr x16, ' + FFrameSym);
-      Line('  sub sp, sp, x16');
+      FrameMarkArm;
       MapBegin;
       EmitStmt(Prog.FiniBody);
       Line('  mov x0, xzr');
@@ -3928,15 +4051,12 @@ begin
     n made RandRange's word collide with the routine RandRangeN. }
   if FArm then
   begin
+    { the size into the prologue's and the check's SUBs (P308) }
+    FixFrameArm(Sym, f);
     { The literals of this routine's ldr =imm go right after it: one
       pool at the end of the text was more than the 1 MB an ldr reaches
       once the compiler's own emitter grew past it (1.0.51). }
     Line('  .ltorg');
-    Line('.balign 8');
-    Line(Sym + ':');
-    Line('  .quad ' + IntToStr(f));
-    Line('.Lfn' + Copy(Sym, 5, Length(Sym) - 4) + ':');
-    Line('  .quad ' + IntToStr(-(f + 2048)));
   end
   else
     Line('.set ' + Sym + ', ' + IntToStr(f));
@@ -27674,6 +27794,7 @@ procedure TEmitter.EmitStackCheck(const Entry: string; const Frame: string);
 var
   ok, slow: string;
   st: SizeInt;
+  fk: Int64;
 begin
   { A loop of a routine in the pasasync table tests nothing at its
     passes (P293): rt_sigurg stops the routine wherever it runs, as Go's
@@ -27743,14 +27864,17 @@ begin
     (cmd/internal/obj/x86/obj6.go and arm64/obj7.go, issue 35470). }
   if FArm then
   begin
-    { A symbol is a pair of words after the body (SetFrame): the arm64
-      assembler wants a constant in =imm, so the frame is loaded from
-      a literal the routine ends with, the same one load =imm costs. }
+    { sp less the frame and its margin: a symbol's frame is known after
+      the body, so a mark SetFrame fills with the SUBs (P308); a number
+      takes them now }
     if Frame[1] = '.' then
-      Line('  ldr x9, .Lfn' + Copy(Frame, 5, Length(Frame) - 4))
+      Line('  /* check ' + Frame + ' */')
     else
-      Line('  ldr x9, =-(' + Frame + '+2048)');
-    Line('  add x9, sp, x9');
+    begin
+      if not StrToInt64(Frame, fk) then
+        Die('internal error: frame ' + Frame);
+      Line(SubImmText('x9', 'sp', fk + 2048));
+    end;
     Line('  ldr x10, [x28, #16]');
     Line('  cmp x9, x10');
     Line('  b.hs ' + ok);
@@ -28493,17 +28617,17 @@ begin
     Line('  .cfi_offset 30, -8');
     Line('  mov x29, sp');
     Line('  .cfi_def_cfa_register 29');
-    { a frame known now and up to 4095 bytes as SUB's immediate (P306) }
+    { a frame known now and up to 4095 bytes as SUB's immediate (P306);
+      one known after the body by SetFrame's (P308) }
     if sysw and (FFrame > 0) and (FFrame <= 4095) then
       Line('  sub sp, sp, #' + IntToStr(FFrame))
-    else
+    else if sysw then
     begin
-      if sysw then
-        Imm('x16', FFrame)
-      else
-        Line('  ldr x16, ' + FFrameSym);
+      Imm('x16', FFrame);
       Line('  sub sp, sp, x16');
-    end;
+    end
+    else
+      FrameMarkArm;
     MapBegin;
     if Pr.Nest > 0 then
       StFP('x27', -8);
@@ -38953,8 +39077,7 @@ begin
       Line('  .cfi_offset 30, -8');
       Line('  mov x29, sp');
       Line('  .cfi_def_cfa_register 29');
-      Line('  ldr x16, ' + FFrameSym);
-      Line('  sub sp, sp, x16');
+      FrameMarkArm;
       MapBegin;
       EmitInitCalls(Prog);
       if FDebug then

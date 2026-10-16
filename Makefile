@@ -328,6 +328,9 @@ GOLDEN_A64 += immconst
 # P295: a product by a constant is shifts and adds where that is faster.
 GOLDEN += mulconst
 GOLDEN_A64 += mulconst
+# P308: an arm64 prologue takes its frame size as immediates.
+GOLDEN += framesize
+GOLDEN_A64 += framesize
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -3330,7 +3333,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 timeout 300 $(QEMU_A64) $(BUILDDIR)/lazyzero-arm > $(BUILDDIR)/lazyzero-arm-gc.got; \
 	diff -u testdata/lazyzero.out $(BUILDDIR)/lazyzero-arm-gc.got; \
 	for f in botharms casearms forbody earlyexit; do \
-	  if awk "/^p_$$f:/,/^\.Lfrp_$$f:/" $(BUILDDIR)/lazyzero-arm.s | grep -q 'xzr, \[x29'; then echo "lazyzero-arm.s: $$f clears a slot"; exit 1; fi; \
+	  if awk "/^p_$$f:/,/cfi_endproc/" $(BUILDDIR)/lazyzero-arm.s | grep -q 'xzr, \[x29'; then echo "lazyzero-arm.s: $$f clears a slot"; exit 1; fi; \
 	done; \
 	echo ok lazyzero-arm-gc; \
 	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 timeout 300 $(QEMU_A64) $(BUILDDIR)/mapsmall-arm nomem > $(BUILDDIR)/mapsmall-arm-gc.got; \
@@ -3429,6 +3432,14 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	if awk '/^p_sixfortyone:/,/cfi_endproc/' $(BUILDDIR)/mulconst-n1-arm.s | grep -q '^  mul '; then echo "mulconst-n1-arm.s: SixFortyOne multiplies on Neoverse N1"; exit 1; fi; \
 	awk '/^p_large:/,/cfi_endproc/' $(BUILDDIR)/mulconst-n1-arm.s | grep -q '^  mul ' || { echo "mulconst-n1-arm.s: Large does not multiply"; exit 1; }; \
 	echo ok mulconst-arm-asm; \
+	: an arm64 prologue and stack check take the frame size as SUB immediates with no load of a word after the body, P308: one SUB for Small, two for Big, the literal past 16 MiB for Huge, no mark left; \
+	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 timeout 300 $(QEMU_A64) $(BUILDDIR)/framesize-arm > $(BUILDDIR)/framesize-arm-gc.got; \
+	diff -u testdata/framesize.out $(BUILDDIR)/framesize-arm-gc.got; \
+	if grep -qE 'ldr x(9|16), \.Lf|/\* (frame|check) ' $(BUILDDIR)/framesize-arm.s; then echo "framesize-arm.s: a frame size loaded from a word, or a mark left"; exit 1; fi; \
+	awk '/^p_small:/,/cfi_endproc/' $(BUILDDIR)/framesize-arm.s | grep -qE '^  sub sp, sp, #[0-9]+$$' || { echo "framesize-arm.s: Small's frame is not one SUB"; exit 1; }; \
+	awk '/^p_big:/,/cfi_endproc/' $(BUILDDIR)/framesize-arm.s | grep -qE '^  sub sp, sp, #[0-9]+, lsl #12$$' || { echo "framesize-arm.s: Big's frame is not two SUBs"; exit 1; }; \
+	awk '/^p_huge:/,/cfi_endproc/' $(BUILDDIR)/framesize-arm.s | grep -q '^  sub sp, sp, x16$$' || { echo "framesize-arm.s: Huge's frame past 16 MiB is not through x16"; exit 1; }; \
+	echo ok framesize-arm-asm; \
 	$(OUTDIR)/paslangc -target arm64 -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/exprinline0-arm testdata/exprinline.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/exprinline0-arm > $(BUILDDIR)/exprinline0-arm.got; \
 	diff -u testdata/exprinline.out $(BUILDDIR)/exprinline0-arm.got; \
