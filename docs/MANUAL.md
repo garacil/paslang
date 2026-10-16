@@ -6615,7 +6615,12 @@ holds it: its block keeps room past its length, growing as Go's
 `append` grows a slice, and a block past 32 KiB takes the free pages
 right after it, so a string built a piece at a time copies itself now
 and then, not at every piece (1.1.107; Go's `s += x` copies both every
-time, and `strings.Builder` is its way to build one). The answer is
+time, and `strings.Builder` is its way to build one). A loop that adds
+a character at a time keeps its counters and its other variables in
+registers: the call that grows the block sits after the routine's
+body, with the variables stored before it and loaded after it, and a
+loop that clears with `FillChar` keeps them there too (1.1.152,
+P301). The answer is
 always the concatenation's, also when the routines `x` calls change
 `s` first. `'ab'#10'c'` is one
 string with a newline inside. `s[i]` is a byte, 1-based. `Length` counts

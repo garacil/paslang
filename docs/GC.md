@@ -201,7 +201,12 @@ conservatively, word by word, and does not move what it finds that way.
   signal off, as Go's `GODEBUG=asyncpreemptoff=1` (sysmon, the stop of
   the world and `rt_sigurg` read pasheap's HAsyncOff, H0+544).
   Loops test nothing. Promoted variables live in registers only inside
-  regions without calls; a stopped region's registers are on the stack. Since P271 (1.1.121) a long copy, clear, comparison
+  regions whose calls sit on slow paths (P301): `s := s + c`'s call of
+  `rt_strappendc` has them stored home before it and loaded after it;
+  `rt_strunique`, `rt_fillbig` and arm64's `rt_fill` keep every
+  register a region holds, and the collector reads the runtime's frames
+  and the frame that called them word by word; a stopped region's
+  registers are on the stack. Since P271 (1.1.121) a long copy, clear, comparison
   or hash of the runtime stops too, between two pieces of 256 KiB, in
   rt_yieldpoint: every register goes on the routine's stack, as Go's
   asyncPreempt saves them, and the collector reads that stack word by

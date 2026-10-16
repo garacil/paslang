@@ -308,6 +308,10 @@ GOLDEN_A64 += leaform
 # P299: a check's failure out of line, the checked path without a branch.
 GOLDEN += coldfail
 GOLDEN_A64 += coldfail
+# P301: a loop whose only calls sit on slow paths keeps its variables in
+# registers.
+GOLDEN += coldloop
+GOLDEN_A64 += coldloop
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -1097,9 +1101,12 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	echo ok busy; \
 	echo "==== blockrd ===="; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/blockrd testdata/blockrd.paslang; \
-	{ sleep 0.2; printf 'x\n'; } | $(BUILDDIR)/blockrd > $(BUILDDIR)/blockrd.got; \
+	: blockrd, the line comes once main has written 1 or after 20 s, so R waits in ReadLn while main runs whatever the load, where a line 0.2 s late came after main under the chain once; \
+	rm -f $(BUILDDIR)/blockrd.got; \
+	{ timeout 20 sh -c 'until grep -qx 1 $(BUILDDIR)/blockrd.got 2>/dev/null; do sleep 0.02; done'; printf 'x\n'; } | $(BUILDDIR)/blockrd > $(BUILDDIR)/blockrd.got; \
 	diff -u testdata/blockrd.out $(BUILDDIR)/blockrd.got; \
-	{ sleep 0.2; printf 'x\n'; } | python3 scripts/nonblocking.py $(BUILDDIR)/blockrd > $(BUILDDIR)/blockrd.got; \
+	rm -f $(BUILDDIR)/blockrd.got; \
+	{ timeout 20 sh -c 'until grep -qx 1 $(BUILDDIR)/blockrd.got 2>/dev/null; do sleep 0.02; done'; printf 'x\n'; } | python3 scripts/nonblocking.py $(BUILDDIR)/blockrd > $(BUILDDIR)/blockrd.got; \
 	diff -u testdata/blockrd.out $(BUILDDIR)/blockrd.got; \
 	echo ok blockrd; \
 	echo "==== lines ===="; \
@@ -2276,6 +2283,11 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	: every failure of a check and every slow path that comes back is after the ret of its routine, so the fast path takes no branch, P299 and P300; \
 	python3 -I scripts/check_cold.py $(BUILDDIR)/coldfail.s 40 boundsfail,divzero,sqrtneg,realrange,bitfail,setfail,funnelfail,asfail,strappendc,strunique,fillbig; \
 	echo ok coldfail-asm; \
+	: a loop whose only calls sit on slow paths keeps its variables in registers, P301: coldloop under the stress of the collector, and no loop of it calls or writes its frame; \
+	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 $(BUILDDIR)/coldloop > $(BUILDDIR)/coldloop-gc.got; \
+	diff -u testdata/coldloop.out $(BUILDDIR)/coldloop-gc.got; \
+	python3 -I scripts/check_coldloop.py $(BUILDDIR)/coldloop.s counted,twocounters,shared,global,walk,deep,wash,wipe,own; \
+	echo ok coldloop-asm; \
 	: every loop of an asm kernel of the units starts aligned, as the loops paslangc compiles, P302; \
 	python3 -I scripts/check_kernel_align.py src/lib/*.paslang src/rtl/*.paslang; \
 	echo ok kernel-align; \
@@ -3342,6 +3354,10 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	echo ok leaform-arm-asm; \
 	python3 -I scripts/check_cold.py $(BUILDDIR)/coldfail-arm.s 40 boundsfail,divzero,sqrtneg,realrange,bitfail,setfail,funnelfail,asfail,strappendc,strunique,fillbig; \
 	echo ok coldfail-arm-asm; \
+	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 timeout 300 $(QEMU_A64) $(BUILDDIR)/coldloop-arm > $(BUILDDIR)/coldloop-arm-gc.got; \
+	diff -u testdata/coldloop.out $(BUILDDIR)/coldloop-arm-gc.got; \
+	python3 -I scripts/check_coldloop.py $(BUILDDIR)/coldloop-arm.s counted,twocounters,shared,global,walk,deep,wash,wipe,own; \
+	echo ok coldloop-arm-asm; \
 	$(OUTDIR)/paslangc -target arm64 -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/exprinline0-arm testdata/exprinline.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/exprinline0-arm > $(BUILDDIR)/exprinline0-arm.got; \
 	diff -u testdata/exprinline.out $(BUILDDIR)/exprinline0-arm.got; \

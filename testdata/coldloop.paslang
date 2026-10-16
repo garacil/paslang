@@ -1,0 +1,209 @@
+{ P301: a loop whose only calls sit on slow paths keeps its variables in
+  registers. s := s + c calls rt_strappendc only when s's block is full
+  or shared, after the routine's ret, with the registers stored before
+  the call and loaded after it; FillChar calls rt_fillbig only past 256
+  KiB (rt_fill on arm64), and s[i] := c rt_strunique only when s is
+  shared, and those keep every register a region holds. Every loop here
+  runs under make check's stress of the collector, which runs inside
+  those calls, and scripts/check_coldloop.py checks that none of them
+  calls in its loop or writes a variable to its frame there. }
+program coldloop;
+
+type
+  PNode = ^TNode;
+  TNode = record
+    ch: Char;
+    v: Integer;
+    next: PNode;
+  end;
+
+var
+  text: string;
+  tab: array[0..15] of Char;
+  g: string;
+  a: array[0..63] of Integer;
+  small: array[0..99] of Integer;
+  wide: array[0..99999] of Integer;
+
+{ a counted for, its counter and the run's end in registers }
+function Counted(n: Integer): Integer;
+var
+  i: Integer;
+  s: string;
+begin
+  s := '';
+  for i := 1 to n do
+    s := s + text[1 + i mod 43];
+  Result := Length(s) * 1000 + Ord(s[1]) + Ord(s[n]);
+end;
+
+{ a while with two counters and a character of an array }
+function TwoCounters(n: Integer): Integer;
+var
+  i, k: Integer;
+  s: string;
+begin
+  s := '';
+  i := 0;
+  k := 7;
+  while i < n do
+  begin
+    s := s + tab[k and 15];
+    k := k + 3;
+    i := i + 1;
+  end;
+  Result := Length(s) + Ord(s[n div 2 + 1]) * 7 + k;
+end;
+
+{ a literal character, and a string shared before the loop: its first
+  append copies it }
+function Shared(n: Integer): Integer;
+var
+  i: Integer;
+  s, t: string;
+begin
+  s := 'start';
+  t := s;
+  for i := 1 to n do
+    s := s + '.';
+  Result := Length(s) + Length(t) * 100000;
+end;
+
+{ a global string, its words at labels }
+function Global(n: Integer): Integer;
+var
+  i: Integer;
+begin
+  g := '';
+  for i := 0 to n - 1 do
+    g := g + Chr(65 + i mod 26);
+  Result := Length(g) + Ord(g[n]);
+end;
+
+function Build(n: Integer): PNode;
+var
+  i: Integer;
+  p: PNode;
+begin
+  Result := nil;
+  for i := n - 1 downto 0 do
+  begin
+    New(p);
+    p^.ch := Chr(97 + i mod 26);
+    p^.v := i;
+    p^.next := Result;
+    Result := p;
+  end;
+end;
+
+{ a list whose only pointer is p, in a register in the loop: the
+  collector, which runs in the append's call, finds it stored home }
+function Walk(n: Integer): Integer;
+var
+  p: PNode;
+  s: string;
+  c: Integer;
+begin
+  p := Build(n);
+  s := '';
+  c := 0;
+  while p <> nil do
+  begin
+    s := s + p^.ch;
+    c := c + 1;
+    p := p^.next;
+  end;
+  Result := Length(s) + c + Ord(s[n]);
+end;
+
+{ a character that needs more registers than amd64's pool keeps in a
+  region: EmitExpr pushes the rest and reads the variables in their
+  registers }
+function Deep(n: Integer): Integer;
+var
+  i, k, j: Integer;
+  s: string;
+begin
+  s := '';
+  k := 1;
+  j := 2;
+  for i := 1 to n do
+  begin
+    s := s + Chr(97 + (a[i and 63] * (a[k and 63] * (a[j and 63] * (a[(i + 1) and 63] + 1)))) mod 26);
+    k := k + 1;
+    j := j + 2;
+  end;
+  Result := Length(s) + Ord(s[n]) + k + j;
+end;
+
+{ FillChar of 800 bytes at every pass }
+function Wash(n: Integer): Integer;
+var
+  i, t: Integer;
+begin
+  t := 0;
+  for i := 1 to n do
+  begin
+    FillChar(small, SizeOf(small), i and 7);
+    t := t + (small[i mod 100] and 255);
+  end;
+  Result := t;
+end;
+
+{ FillChar of 800000 bytes, past 256 KiB: rt_fillbig, which stops
+  between two pieces, while a list's only pointer is p; and a local
+  array of the frame }
+function Wipe(n: Integer): Integer;
+var
+  t: Integer;
+  p: PNode;
+  loc: array[0..15] of Integer;
+begin
+  p := Build(n);
+  t := 0;
+  while p <> nil do
+  begin
+    FillChar(wide, SizeOf(wide), p^.v and 3);
+    FillChar(loc, SizeOf(loc), 1);
+    t := t + (wide[p^.v * 997 mod 100000] and 7) + (loc[p^.v and 15] and 1);
+    p := p^.next;
+  end;
+  Result := t;
+end;
+
+{ s[i] := c on a string shared before the loop: its first write copies
+  it (rt_strunique) }
+function Own(n: Integer): Integer;
+var
+  i, k: Integer;
+  s, t: string;
+begin
+  s := StringOfChar('a', n);
+  t := s;
+  k := 3;
+  for i := 1 to n do
+  begin
+    s[i] := Chr(97 + k and 15);
+    k := k + 5;
+  end;
+  Result := Ord(s[n]) + Ord(t[n]) * 1000 + k;
+end;
+
+var
+  i: Integer;
+begin
+  text := 'the quick brown fox jumps over the lazy dog';
+  for i := 0 to 15 do
+    tab[i] := Chr(97 + i);
+  for i := 0 to 63 do
+    a[i] := i * 7 + 3;
+  WriteLn(Counted(1), ' ', Counted(100), ' ', Counted(300000));
+  WriteLn(TwoCounters(1), ' ', TwoCounters(5000), ' ', TwoCounters(200001));
+  WriteLn(Shared(0), ' ', Shared(1), ' ', Shared(70000));
+  WriteLn(Global(1), ' ', Global(26), ' ', Global(100000));
+  WriteLn(Walk(1), ' ', Walk(27), ' ', Walk(150000));
+  WriteLn(Deep(1), ' ', Deep(10), ' ', Deep(5000));
+  WriteLn(Wash(1), ' ', Wash(1000));
+  WriteLn(Wipe(1), ' ', Wipe(200));
+  WriteLn(Own(1), ' ', Own(1000));
+end.
