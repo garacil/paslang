@@ -382,6 +382,9 @@ GOLDEN_A64 += unrollctr
 # P325: a var parameter through a routine value or a method value.
 GOLDEN += varvalue
 GOLDEN_A64 += varvalue
+# P338: a routine value, a method value and an interface take their kind.
+GOLDEN += valkinds
+GOLDEN_A64 += valkinds
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -1433,6 +1436,21 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'TR declares no method Thrice of these parameters at 12:13' $(BUILDDIR)/recbad_nodecl.err; \
 	grep -q 'TR is a record with no methods at 6:13' $(BUILDDIR)/recbad_plainrec.err; \
 	echo ok recbad; \
+	echo "==== value kind rejects (P338) ===="; \
+	for target in amd64 arm64; do \
+	  for n in intproc intmeth intiface callmeth argproc resproc; do \
+	    if $(OUTDIR)/paslangc -target $$target -o $(BUILDDIR)/valkindbad_$$n-$$target testdata/valkindbad/$$n.paslang >$(BUILDDIR)/valkindbad_$$n-$$target.err 2>&1; then \
+	      echo "$$n should fail"; exit 1; \
+	    fi; \
+	  done; \
+	  grep -qF 'Integer does not go into routine at 11:9' $(BUILDDIR)/valkindbad_intproc-$$target.err; \
+	  grep -qF 'Integer does not go into method at 11:9' $(BUILDDIR)/valkindbad_intmeth-$$target.err; \
+	  grep -qF 'Integer does not go into IVal at 13:9' $(BUILDDIR)/valkindbad_intiface-$$target.err; \
+	  grep -qF 'this calls the method; @ before it gives the method value at 23:13' $(BUILDDIR)/valkindbad_callmeth-$$target.err; \
+	  grep -qF 'string does not go into routine at 12:11' $(BUILDDIR)/valkindbad_argproc-$$target.err; \
+	  grep -qF 'Integer does not go into routine at 9:14' $(BUILDDIR)/valkindbad_resproc-$$target.err; \
+	done; \
+	echo ok valkindbad; \
 	echo "==== var argument rejects (P325) ===="; \
 	for target in amd64 arm64; do \
 	  for n in constarg exprarg fewargs manyargs; do \
