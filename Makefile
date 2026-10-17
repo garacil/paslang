@@ -349,6 +349,9 @@ GOLDEN_A64 += modconst
 # P313: an index that is a sum takes its constant into the displacement.
 GOLDEN += idxsum
 GOLDEN_A64 += idxsum
+# P314: an element's index is scaled once for its fields.
+GOLDEN += fieldcse
+GOLDEN_A64 += fieldcse
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -2406,6 +2409,15 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/idxsum.out $(BUILDDIR)/idxsum0.got; \
 	python3 -I scripts/check_idxsum.py $(BUILDDIR)/idxsum0.s run12,run20,run24,run28,run40,run48,run56; \
 	echo ok idxsum-asm; \
+	: the scaled index of an element once for its fields, P314: fieldcse under the stress of the collector and without inlining, Same and InHeap scaling once a loop body; \
+	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 $(BUILDDIR)/fieldcse > $(BUILDDIR)/fieldcse-gc.got; \
+	diff -u testdata/fieldcse.out $(BUILDDIR)/fieldcse-gc.got; \
+	python3 -I scripts/check_fieldcse.py $(BUILDDIR)/fieldcse.s same:2,inheap:4; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/fieldcse0 testdata/fieldcse.paslang; \
+	$(BUILDDIR)/fieldcse0 > $(BUILDDIR)/fieldcse0.got; \
+	diff -u testdata/fieldcse.out $(BUILDDIR)/fieldcse0.got; \
+	python3 -I scripts/check_fieldcse.py $(BUILDDIR)/fieldcse0.s same:2,inheap:4; \
+	echo ok fieldcse-asm; \
 	: every loop of an asm kernel of the units starts aligned, as the loops paslangc compiles, P302; \
 	python3 -I scripts/check_kernel_align.py src/lib/*.paslang src/rtl/*.paslang; \
 	echo ok kernel-align; \
@@ -3562,6 +3574,15 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	diff -u testdata/idxsum.out $(BUILDDIR)/idxsum0-arm.got; \
 	python3 -I scripts/check_idxsum.py $(BUILDDIR)/idxsum0-arm.s run12,run20,run24,run28,run40,run48,run56 --arm; \
 	echo ok idxsum-arm-asm; \
+	: P314 on arm64: fieldcse under the stress of the collector and without inlining, one element address a loop body; \
+	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 timeout 300 $(QEMU_A64) $(BUILDDIR)/fieldcse-arm > $(BUILDDIR)/fieldcse-arm-gc.got; \
+	diff -u testdata/fieldcse.out $(BUILDDIR)/fieldcse-arm-gc.got; \
+	python3 -I scripts/check_fieldcse.py $(BUILDDIR)/fieldcse-arm.s same:4,inheap:4 --arm; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/fieldcse0-arm testdata/fieldcse.paslang; \
+	timeout 300 $(QEMU_A64) $(BUILDDIR)/fieldcse0-arm > $(BUILDDIR)/fieldcse0-arm.got; \
+	diff -u testdata/fieldcse.out $(BUILDDIR)/fieldcse0-arm.got; \
+	python3 -I scripts/check_fieldcse.py $(BUILDDIR)/fieldcse0-arm.s same:4,inheap:4 --arm; \
+	echo ok fieldcse-arm-asm; \
 	$(OUTDIR)/paslangc -target arm64 -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/exprinline0-arm testdata/exprinline.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/exprinline0-arm > $(BUILDDIR)/exprinline0-arm.got; \
 	diff -u testdata/exprinline.out $(BUILDDIR)/exprinline0-arm.got; \

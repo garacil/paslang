@@ -333,6 +333,9 @@ type
     FMulCost: LongInt;     { a multiply's cost there }
     FMulKs: TInt64Arr;     { the constants a recipe was looked for, and what was found }
     FMulForm, FMulIn, FMulOut: TInt64Arr;
+    FIxOn: Boolean;        { FIxReg holds FIxSrc scaled by FIxK, plus FIxBase on arm64 (P314) }
+    FIxReg, FIxSrc, FIxBase: string;
+    FIxK: Int64;
     FCarrySym: TSym;    { the place Carry's register is loaded from and stored to (1.0.130) }      { the end of an innermost for's run of 1024, in a promoted region (P100) }
     FChunkSave: LongInt;    { its caller value's frame slot when the register is a kept one, else 0 }
     FChunkDw: LongInt;      { its DWARF number, for the CFI of that slot }
@@ -433,6 +436,7 @@ type
     function ForwardLoad(const S: string; out Drop: Boolean): string;
     function SplitLea(const S: string): Boolean;
     procedure NoteLine(const S: string);
+    procedure IxNote(const S: string);
     procedure MapNote(const S: string);
     procedure MapSite;
     procedure MapPush(Words: LongInt; Pad: Boolean);
@@ -1331,10 +1335,207 @@ begin
     Exit;
   if (n > 4) and (Copy(S, 1, 3) = '.LL') and (S[n] = ':') then
     Exit;
+  if FIxOn and (FColdAt < 0) then
+    IxNote(S);
   if (n > 3) and (S[1] = ' ') and (S[2] = ' ') and (S[3] <> '.') then
     FLastIns := S
   else
     FLastIns := '';
+end;
+
+{ P314: whether the line S, of the routine's straight path, leaves the
+  scaled index FIxReg holds (on arm64 the element's address) as it was;
+  FIxOn goes off when it may not. A label goes through a jump, so it
+  forgets, but a line's (.LL, never a jump's target, NoteLine skips it),
+  and so does any instruction that is not one of the plain ones below,
+  and one that writes FIxReg, FIxSrc or FIxBase: on amd64 its last
+  operand, a register of the same name at any width; on arm64 its first,
+  ldp's first two, and the base a writeback form changes. A compare, a
+  test or a branch writes none. The lines of a failure out of line
+  (FColdAt) are not on the path: it never comes back, or comes back to
+  a label. }
+procedure TEmitter.IxNote(const S: string);
+var
+  n, p, q: SizeInt;
+  op, rest, d: string;
+
+  function Fam(const R: string): string;
+  var
+    t: string;
+    k: SizeInt;
+  begin
+    Result := '';
+    t := R;
+    k := Length(t);
+    while (k > 0) and ((t[k] = ' ') or (t[k] = ']') or (t[k] = '!')) do
+      Dec(k);
+    t := Copy(t, 1, k);
+    if (t <> '') and (t[1] = '%') then
+      t := Copy(t, 2, Length(t) - 1);
+    if t = '' then
+      Exit;
+    if FArm then
+    begin
+      if ((t[1] = 'x') or (t[1] = 'w')) and (Length(t) >= 2) and (t[2] >= '0') and (t[2] <= '9') then
+        Result := 'x' + Copy(t, 2, Length(t) - 1);
+      Exit;
+    end;
+    if (t[1] = 'r') and (Length(t) >= 2) and (t[2] >= '0') and (t[2] <= '9') then
+    begin
+      k := 2;
+      while (k <= Length(t)) and (t[k] >= '0') and (t[k] <= '9') do
+        Inc(k);
+      Result := Copy(t, 1, k - 1);
+      Exit;
+    end;
+    if (t = 'rax') or (t = 'eax') or (t = 'ax') or (t = 'al') or (t = 'ah') then
+      Result := 'rax'
+    else if (t = 'rbx') or (t = 'ebx') or (t = 'bx') or (t = 'bl') or (t = 'bh') then
+      Result := 'rbx'
+    else if (t = 'rcx') or (t = 'ecx') or (t = 'cx') or (t = 'cl') or (t = 'ch') then
+      Result := 'rcx'
+    else if (t = 'rdx') or (t = 'edx') or (t = 'dx') or (t = 'dl') or (t = 'dh') then
+      Result := 'rdx'
+    else if (t = 'rsi') or (t = 'esi') or (t = 'si') or (t = 'sil') then
+      Result := 'rsi'
+    else if (t = 'rdi') or (t = 'edi') or (t = 'di') or (t = 'dil') then
+      Result := 'rdi'
+    else if (t = 'rbp') or (t = 'ebp') or (t = 'bp') or (t = 'bpl') then
+      Result := 'rbp'
+    else if (t = 'rsp') or (t = 'esp') or (t = 'sp') or (t = 'spl') then
+      Result := 'rsp';
+  end;
+
+  function Hit(const R: string): Boolean;
+  var
+    f: string;
+  begin
+    f := Fam(R);
+    Result := (f <> '') and ((f = FIxReg) or (f = FIxSrc) or (f = FIxBase));
+  end;
+
+  function Starts(const P: string): Boolean;
+  begin
+    Result := Copy(op, 1, Length(P)) = P;
+  end;
+
+begin
+  n := Length(S);
+  if (n < 3) or (S[1] <> ' ') or (S[2] <> ' ') then
+  begin
+    FIxOn := False;
+    Exit;
+  end;
+  if S[3] = '.' then
+  begin
+    if Copy(S, 1, 10) <> '  .p2align' then
+      FIxOn := False;
+    Exit;
+  end;
+  p := 3;
+  while (p <= n) and (S[p] <> ' ') do
+    Inc(p);
+  op := Copy(S, 3, p - 3);
+  rest := Copy(S, p + 1, n - p);
+  if not FArm then
+  begin
+    if op = '' then
+    begin
+      FIxOn := False;
+      Exit;
+    end;
+    if (((Starts('cmp') and not Starts('cmpxchg')) or Starts('test')) and (rest <> '')) or
+      (op = 'bt') or (op = 'btq') or (op = 'btl') or ((op[1] = 'j') and (op <> 'jmpq')) then
+      Exit;
+    if not ((Starts('mov') and (rest <> '')) or (Starts('lea') and (rest <> '')) or Starts('add') or Starts('sub') or
+      Starts('and') or Starts('or') or Starts('xor') or Starts('inc') or Starts('dec') or
+      Starts('neg') or Starts('not') or Starts('sh') or Starts('sa') or Starts('ro') or
+      Starts('set') or Starts('cmov') or Starts('adc') or Starts('sbb') or Starts('bswap') or
+      Starts('popcnt') or Starts('lzcnt') or Starts('tzcnt') or Starts('bsf') or Starts('bsr') or
+      (Starts('imul') and (Pos(',', rest) > 0))) then
+    begin
+      FIxOn := False;
+      Exit;
+    end;
+    q := 0;
+    for p := Length(rest) - 1 downto 1 do
+      if (rest[p] = ',') and (rest[p + 1] = ' ') then
+      begin
+        q := p;
+        Break;
+      end;
+    if q > 0 then
+      d := Copy(rest, q + 2, Length(rest) - q - 1)
+    else
+      d := rest;
+    if (d <> '') and (d[1] = '%') and Hit(d) then
+      FIxOn := False;
+    Exit;
+  end;
+  if (op = 'cmp') or (op = 'cmn') or (op = 'tst') or (op = 'b') or Starts('b.') or (op = 'cbz') or
+    (op = 'cbnz') or (op = 'tbz') or (op = 'tbnz') or (op = 'nop') then
+    Exit;
+  q := Pos(',', rest);
+  if q > 0 then
+    d := Copy(rest, 1, q - 1)
+  else
+    d := rest;
+  if (op = 'str') or (op = 'strb') or (op = 'strh') or (op = 'stur') or (op = 'sturb') or
+    (op = 'sturh') or (op = 'stp') then
+  begin
+    { a store writes no register but the base of its writeback form }
+    if (Pos('!', rest) > 0) or (Pos('], #', rest) > 0) then
+    begin
+      p := Pos('[', rest);
+      q := p + 1;
+      while (q <= Length(rest)) and (rest[q] <> ',') and (rest[q] <> ']') do
+        Inc(q);
+      if Hit(Copy(rest, p + 1, q - p - 1)) then
+        FIxOn := False;
+    end;
+    Exit;
+  end;
+  if not ((op = 'mov') or (op = 'movz') or (op = 'movn') or (op = 'movk') or (op = 'add') or
+    (op = 'adds') or (op = 'sub') or (op = 'subs') or (op = 'and') or (op = 'ands') or
+    (op = 'orr') or (op = 'eor') or (op = 'eon') or (op = 'orn') or (op = 'bic') or
+    (op = 'lsl') or (op = 'lsr') or (op = 'asr') or (op = 'ror') or (op = 'mul') or
+    (op = 'madd') or (op = 'msub') or (op = 'smulh') or (op = 'umulh') or (op = 'neg') or
+    (op = 'mvn') or (op = 'sxtw') or (op = 'sxth') or (op = 'sxtb') or (op = 'uxth') or
+    (op = 'uxtb') or (op = 'csel') or (op = 'csinc') or (op = 'csinv') or (op = 'csneg') or
+    (op = 'cinc') or (op = 'cset') or (op = 'csetm') or (op = 'cneg') or (op = 'ldr') or
+    (op = 'ldrb') or (op = 'ldrh') or (op = 'ldrsb') or (op = 'ldrsh') or (op = 'ldrsw') or
+    (op = 'ldur') or (op = 'ldurb') or (op = 'ldurh') or (op = 'ldursb') or (op = 'ldursh') or
+    (op = 'ldursw') or (op = 'ldp') or (op = 'adr') or (op = 'adrp') or (op = 'clz') or
+    (op = 'rbit') or (op = 'rev') or (op = 'ubfx') or (op = 'sbfx') or (op = 'ubfiz') or
+    (op = 'sbfiz') or (op = 'bfi') or (op = 'bfxil') or (op = 'extr') or (op = 'fmov') or
+    (op = 'scvtf') or (op = 'ucvtf') or (op = 'fcvtzs') or (op = 'fcvtzu')) then
+  begin
+    FIxOn := False;
+    Exit;
+  end;
+  if Hit(d) then
+    FIxOn := False;
+  if op = 'ldp' then
+  begin
+    p := Pos(',', rest);
+    q := p + 1;
+    while (q <= Length(rest)) and (rest[q] <> ',') do
+      Inc(q);
+    d := Copy(rest, p + 1, q - p - 1);
+    while (d <> '') and (d[1] = ' ') do
+      d := Copy(d, 2, Length(d) - 1);
+    if Hit(d) then
+      FIxOn := False;
+  end;
+  if ((Copy(op, 1, 2) = 'ld')) and ((Pos('!', rest) > 0) or (Pos('], #', rest) > 0)) then
+  begin
+    p := Pos('[', rest);
+    q := p + 1;
+    while (q <= Length(rest)) and (rest[q] <> ',') and (rest[q] <> ']') do
+      Inc(q);
+    if Hit(Copy(rest, p + 1, q - p - 1)) then
+      FIxOn := False;
+  end;
 end;
 
 { ---- stack maps (P95c) ----
@@ -27968,6 +28169,8 @@ var
   fat, desc, isc, nochk, near, frm: Boolean;
   foff: Int64;
   ib: PExpr;
+  ixvar: Boolean;
+  ad: string;
 begin
   r := OrdPool(D);
   Result := '';
@@ -28263,10 +28466,14 @@ begin
         k := 0;
         idx := '';
         ixk := 0;
+        ixvar := False;
         if isc then
           k := E^.R^.Num
         else if (E^.R^.Kind = ekVar) and WordVar(E^.R, s) and (s.Reg <> '') then
-          idx := s.Reg
+        begin
+          idx := s.Reg;
+          ixvar := True;
+        end
         else if ConstAddend(E^.R, ib, ixk) and (ib^.Kind = ekVar) and WordVar(ib, s) and
           (s.Reg <> '') and (disp + ixk * esz >= -(Int64(1) shl 30)) and
           (disp + ixk * esz <= Int64(1) shl 30) then
@@ -28277,7 +28484,10 @@ begin
             (AMD64.rules; ARM64.rules 699 takes an ADDconst into the
             load's offset): no add of the index first, and a constant c
             of a low bound's size cancels it (P313) }
-          idx := s.Reg
+        begin
+          idx := s.Reg;
+          ixvar := True;
+        end
         else
         begin
           ixk := 0;
@@ -28356,8 +28566,9 @@ begin
                 BoundsFailArm(idx, 0, -disp, lenR, 0, -1 - disp);
               ColdEnd;
             end;
-            if ok <> '' then
-              Line(ok + ':');
+            { no label after the check: nothing jumps to it since the
+              failure went out of line (P299), and a label would end the
+              index a field before kept scaled (P314) }
           end
           else
           begin
@@ -28403,8 +28614,6 @@ begin
                 BoundsFailX86('%' + idx, -disp, lenop, 0, -1 - disp);
               ColdEnd;
             end;
-            if ok <> '' then
-              Line(ok + ':');
           end;
         end
         else if TKind(E^.L^.Typ) = tykArray then
@@ -28475,7 +28684,6 @@ begin
                 BoundsFailX86('%' + idx, td.Lo, '', td.Hi, 0);
               ColdEnd;
             end;
-            Line(ok + ':');
           end;
         end;
         disp := disp + ixk * esz;
@@ -28528,15 +28736,33 @@ begin
               Result := '[' + r + ', ' + idx + ', lsl #' + IntToStr(sh) + ']';
               Exit;
             end;
-            if sh >= 0 then
-              Line('  add ' + OrdPool(D) + ', ' + r + ', ' + idx + ', lsl #' + IntToStr(sh))
+            { a variable's index: the element's address goes to pool
+              register D + 1, free in the word place as a computed index
+              is, so that a load into D leaves it for the next field;
+              from the same base and index into this very register,
+              which nothing has written since, it is no add (P314) }
+            if ixvar and (r <> OrdPool(D + 1)) then
+              ad := OrdPool(D + 1)
             else
+              ad := OrdPool(D);
+            if not (FIxOn and (FIxReg = ad) and (FIxSrc = idx) and (FIxBase = r) and
+              (FIxK = esz)) then
             begin
-              { x16, scratch here as the checks' x1 and x17 are, takes a
-                recipe's second value (P313) }
-              ScaleAddArm(OrdPool(D), r, idx, esz, 'x17', 'x16');
+              if sh >= 0 then
+                Line('  add ' + ad + ', ' + r + ', ' + idx + ', lsl #' + IntToStr(sh))
+              else
+              begin
+                { x16, scratch here as the checks' x1 and x17 are, takes a
+                  recipe's second value (P313) }
+                ScaleAddArm(ad, r, idx, esz, 'x17', 'x16');
+              end;
+              FIxOn := ixvar and (r <> ad) and (idx <> ad);
+              FIxReg := ad;
+              FIxSrc := idx;
+              FIxBase := r;
+              FIxK := esz;
             end;
-            r := OrdPool(D);
+            r := ad;
             { the displacement, a low bound's or a constant of the index,
               in the load's or store's own offset where an ADD or SUB
               came first (P313): LDUR's and STUR's -256 to 255 (ARM DDI
@@ -28578,7 +28804,21 @@ begin
               { rcx, which the checks above take as their scratch, holds
                 a recipe's second value when the index is scaled in its
                 own register (P313) }
-              ScaleTo('%' + idx, '%' + m, esz, '%rcx');
+              { the variable's index scaled by the same factor into this
+                very register, which nothing has written since, as the
+                field before took it: no instruction, as Go's CSE keeps
+                one value for both (cmd/compile/internal/ssacompile/
+                cse.go; P314) }
+              if not (FIxOn and (FIxReg = idx) and (FIxSrc = m) and (FIxBase = '') and
+                (FIxK = esz)) then
+              begin
+                ScaleTo('%' + idx, '%' + m, esz, '%rcx');
+                FIxOn := ixvar and (m <> idx);
+                FIxReg := idx;
+                FIxSrc := m;
+                FIxBase := '';
+                FIxK := esz;
+              end;
               esz := Int64(1) shl sh;
             end;
             if glab <> '' then
@@ -29277,6 +29517,7 @@ begin
   AppendLine(Copy(FCold, 1, Length(FCold) - 1));
   FCold := '';
   FLastIns := '';
+  FIxOn := False;
 end;
 
 { The divisor is zero: rt_divzero, out of line (P299). }
