@@ -627,6 +627,16 @@ parentheses, and `x and 4 = 4` reads `x and (4 = 4)`. That mixes a
 Boolean with an integer, so it is a compile error that says to write
 `(x and 4) = 4`.
 
+The operands of an expression are worked out left to right, and so are
+the arguments of a call and the calls among them: in `v + Bump(v)`,
+where `Bump` changes its `var` parameter, `v` is read before the call,
+and `F(1) + G(2) * H(3)` calls `F`, `G` and `H` in that order. An operand
+no call can change, a constant or a variable of the routine whose
+address nobody takes, that no nested routine or closure names and that
+is no `var` parameter, may be read after a call to its right, which
+gives the same value (P326); every `-inline` gives
+the same answer.
+
 `and`, `or`, `xor` and `not` work on two Booleans (a Boolean `and` and
 `or` short-circuit) or on the bits of two integers. A test of one value
 against both ends of a constant range, `(c >= '0') and (c <= '9')` or

@@ -45,6 +45,9 @@ type
     FDone: LongInt;         { how many a pass put in place }
     FOk: array of LongInt;  { per routine: 0 not yet measured, 1 goes in, 2 stays a call }
     FQuiet: array of LongInt; { per routine: 0 not yet looked at, 1 writes and calls nothing, 2 does }
+    FReach: TStrArray;      { the names of FCur something besides its own reading may change (P326) }
+    FReachFor, FReachN: LongInt;  { the routine and the count of bodies put in place FReach was taken at }
+    FHiddenAddr: TStrArray; { the hidden variables whose address a body put in place takes (P326) }
     FMapFrom: TStrArray;    { the callee's names ... }
     FMapTo: TExprArray;     { ... and what stands for each in the copy }
     function SameId(const A, B: string): Boolean;
@@ -65,6 +68,11 @@ type
     function Hidden(const Base: string; T: LongInt): PExpr;
     function ZeroOf(T: LongInt): PExpr;
     function CallerLocal(const N: string): Boolean;
+    procedure ReachE(E: PExpr; Names: Boolean);
+    function StorageRoot(E: PExpr): string;
+    procedure ReachS(S: PStmt; Names: Boolean);
+    procedure Reach;
+    function Reached(const N: string): Boolean;
     function PlaceOK(E: PExpr): Boolean;
     function Pure(E: PExpr): Boolean;
     function Ahead(E: PExpr): Boolean;
@@ -847,8 +855,14 @@ begin
   end;
 end;
 
-{ A parameter or local of the routine being rewritten: nothing the
-  callee does reaches it. }
+{ A value parameter or local of the routine being rewritten that
+  nothing the callee does reaches: its address taken nowhere in the
+  routine (a var argument is one), named by no routine nested in it or
+  closure made in it, which reach its frame through their link or box.
+  A var parameter may be any place, a global a call writes among them.
+  Taken as it was, a local given to a var parameter was read after the
+  call put ahead of it: v + BumpVar(v, 1) * 10 gave 115 inlined and 15
+  with -inline 0 (P326). }
 function TOpt.CallerLocal(const N: string): Boolean;
 var
   i: SizeInt;
@@ -859,15 +873,173 @@ begin
   for i := 0 to High(FProcs[FCur].Params) do
     if SameId(FProcs[FCur].Params[i].Name, N) then
     begin
+      if FProcs[FCur].Params[i].ByRef then
+        Exit;
       Result := True;
-      Exit;
+      Break;
     end;
-  for i := 0 to High(FProcs[FCur].Locals) do
-    if SameId(FProcs[FCur].Locals[i].Name, N) then
+  if not Result then
+    for i := 0 to High(FProcs[FCur].Locals) do
+      if SameId(FProcs[FCur].Locals[i].Name, N) then
+      begin
+        Result := True;
+        Break;
+      end;
+  if not Result then
+    Exit;
+  Result := not Reached(N);
+end;
+
+{ N is in FReach as the body being rewritten stands now: a call may
+  change it (P326). }
+function TOpt.Reached(const N: string): Boolean;
+begin
+  if (FReachFor <> FCur) or (FReachN <> FN) then
+    Reach;
+  Result := InList(FReach, ToLower(N));
+end;
+
+{ The variable whose own storage E lies in: a variable, a field of a
+  record in one, an element of a static array in one; '' for what lies
+  elsewhere, a dynamic array's element, a pointer's target, an object's
+  field, whose address leaves the variable itself out of reach. }
+function TOpt.StorageRoot(E: PExpr): string;
+var
+  t: LongInt;
+begin
+  Result := '';
+  if E = nil then
+    Exit;
+  if E^.Kind = ekVar then
+  begin
+    Result := E^.Name;
+    Exit;
+  end;
+  if ((E^.Kind <> ekField) and (E^.Kind <> ekIndex)) or (E^.L = nil) then
+    Exit;
+  t := E^.L^.Typ;
+  if (t < 0) or (t > High(FProg^.Types)) then
+    Exit;
+  if (E^.Kind = ekField) and (FProg^.Types[t].Kind = tykRecord) then
+    Result := StorageRoot(E^.L)
+  else if (E^.Kind = ekIndex) and (FProg^.Types[t].Kind = tykArray) and
+    (FProg^.Types[t].Hi >= FProg^.Types[t].Lo) then
+    Result := StorageRoot(E^.L);
+end;
+
+{ The names in E whose address is taken (their storage, StorageRoot);
+  with Names, every name. }
+procedure TOpt.ReachE(E: PExpr; Names: Boolean);
+var
+  i: SizeInt;
+  r: string;
+begin
+  if E = nil then
+    Exit;
+  if E^.Kind = ekAddr then
+  begin
+    r := ToLower(StorageRoot(E^.L));
+    if (r <> '') and not InList(FReach, r) then
     begin
-      Result := True;
-      Exit;
+      SetLength(FReach, Length(FReach) + 1);
+      FReach[High(FReach)] := r;
     end;
+  end;
+  if Names and (E^.Kind = ekVar) and not InList(FReach, ToLower(E^.Name)) then
+  begin
+    SetLength(FReach, Length(FReach) + 1);
+    FReach[High(FReach)] := ToLower(E^.Name);
+  end;
+  ReachE(E^.L, Names);
+  ReachE(E^.R, Names);
+  for i := 0 to High(E^.Args) do
+    ReachE(E^.Args[i], Names);
+end;
+
+procedure TOpt.ReachS(S: PStmt; Names: Boolean);
+var
+  i: SizeInt;
+  r: string;
+begin
+  if S = nil then
+    Exit;
+  if Names then
+  begin
+    r := ToLower(S^.Name);
+    if (r <> '') and not InList(FReach, r) then
+    begin
+      SetLength(FReach, Length(FReach) + 1);
+      FReach[High(FReach)] := r;
+    end;
+  end;
+  ReachE(S^.E, Names);
+  ReachE(S^.E2, Names);
+  ReachE(S^.Dest, Names);
+  for i := 0 to High(S^.Args) do
+    { SetLength, Move and FillChar use the address and keep none (P100,
+      the emitter's AddrKept): no later call reaches the variable by it }
+    if (S^.Kind = skCall) and ((S^.Name = 'rt_setlength') or (S^.Name = 'rt_move') or
+      (S^.Name = 'rt_fillchar')) and (S^.Args[i] <> nil) and (S^.Args[i]^.Kind = ekAddr) then
+      ReachE(S^.Args[i]^.L, Names)
+    else
+      ReachE(S^.Args[i], Names);
+  ReachS(S^.ThenSt, Names);
+  ReachS(S^.ElseSt, Names);
+  ReachS(S^.Body, Names);
+  for i := 0 to High(S^.Stmts) do
+    ReachS(S^.Stmts[i], Names);
+  for i := 0 to High(S^.Arms) do
+    ReachS(S^.Arms[i].Body, Names);
+  for i := 0 to High(S^.Sels) do
+  begin
+    ReachE(S^.Sels[i].Chan, Names);
+    ReachE(S^.Sels[i].ValX, Names);
+    if Names then
+    begin
+      r := ToLower(S^.Sels[i].Dest);
+      if (r <> '') and not InList(FReach, r) then
+      begin
+        SetLength(FReach, Length(FReach) + 1);
+        FReach[High(FReach)] := r;
+      end;
+    end;
+    ReachS(S^.Sels[i].Body, Names);
+  end;
+end;
+
+{ FReach for FCur as its body stands: the names whose address it takes,
+  and every name of the routines nested in it, at any depth, and of the
+  closures made in it. }
+procedure TOpt.Reach;
+var
+  j, k: SizeInt;
+  ps, q: string;
+begin
+  FReach := nil;
+  FReachFor := FCur;
+  FReachN := FN;
+  if FCur < 0 then
+  begin
+    { the program's body: its hidden variables' addresses }
+    ReachS(FProg^.Body, False);
+    Exit;
+  end;
+  ReachS(FProcs[FCur].Body, False);
+  for j := 0 to High(FProcs) do
+  begin
+    ps := FProcs[j].ParentSym;
+    k := 0;
+    while (ps <> '') and (ps <> FProcs[FCur].Sym) and (k < 16) do
+    begin
+      q := ps;
+      ps := '';
+      if FindProc(q) >= 0 then
+        ps := FProcs[FindProc(q)].ParentSym;
+      Inc(k);
+    end;
+    if (ps <> '') and (ps = FProcs[FCur].Sym) then
+      ReachS(FProcs[j].Body, True);
+  end;
 end;
 
 { A place given for a var or out parameter that may stand in the body
@@ -976,7 +1148,8 @@ begin
     ekInt, ekNil, ekStr, ekReal:
       Result := True;
     ekVar:
-      Result := CallerLocal(E^.Name) or (Copy(E^.Name, 1, 4) = 'inl.');
+      Result := CallerLocal(E^.Name) or ((Copy(E^.Name, 1, 4) = 'inl.') and
+        (not InList(FHiddenAddr, ToLower(E^.Name))) and not Reached(E^.Name));
     ekUn:
       Result := Ahead(E^.L);
     ekBin:
@@ -1372,7 +1545,7 @@ var
   i, k: SizeInt;
   blk, st: PStmt;
   hv, arg, res: PExpr;
-  refs, deps: TStrArray;
+  refs, deps, keep: TStrArray;
   d, m: SizeInt;
 begin
   Result := nil;
@@ -1527,6 +1700,19 @@ begin
   end;
   FMapFrom := nil;
   FMapTo := nil;
+  { P326: the hidden variables whose address the copy takes, which a
+    call put ahead could change: the body Reach reads is not this
+    pass's rewriting yet }
+  keep := FReach;
+  FReach := nil;
+  ReachS(blk, False);
+  for d := 0 to High(FReach) do
+    if (Copy(FReach[d], 1, 4) = 'inl.') and not InList(FHiddenAddr, FReach[d]) then
+    begin
+      SetLength(FHiddenAddr, Length(FHiddenAddr) + 1);
+      FHiddenAddr[High(FHiddenAddr)] := FReach[d];
+    end;
+  FReach := keep;
   Inc(FDone);
   Result := blk;
 end;
@@ -1903,6 +2089,7 @@ begin
   FMax := Prog.InlineMax;
   FN := 0;
   FCur := -1;
+  FReachFor := -2;
   for i := 0 to High(Prog.Procs) do
     if (not Prog.Procs[i].IsExt) and (Prog.Procs[i].Body <> nil) then
       Prog.Procs[i].Body := FoldStmt(Prog.Procs[i].Body);

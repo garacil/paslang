@@ -373,6 +373,9 @@ GOLDEN_A64 += andmask
 # P333: an exec and a new thread do not race (amd64: qemu-user does not
 # execve an arm64 program, so arm64 reads the runtime's forms).
 GOLDEN += execrace
+# P326: an inlined call is put ahead only of what it cannot change.
+GOLDEN += inlineorder
+GOLDEN_A64 += inlineorder
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -2479,6 +2482,13 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	: the exec lock around a new thread and an execve, clone again on EAGAIN, P333: the runtime in execrace; \
 	python3 -I scripts/check_execlock.py $(BUILDDIR)/execrace.s; \
 	echo ok execlock-asm; \
+	: the same answers at every -inline, operands left to right, P326: inlineorder with -inline 0 and 200; \
+	for n in 0 200; do \
+	  $(OUTDIR)/paslangc -inline $$n -o $(BUILDDIR)/inlineorder$$n testdata/inlineorder.paslang; \
+	  $(BUILDDIR)/inlineorder$$n > $(BUILDDIR)/inlineorder$$n.got; \
+	  diff -u testdata/inlineorder.out $(BUILDDIR)/inlineorder$$n.got; \
+	done; \
+	echo ok inlineorder-inline; \
 	: every loop of an asm kernel of the units starts aligned, as the loops paslangc compiles, P302; \
 	python3 -I scripts/check_kernel_align.py src/lib/*.paslang src/rtl/*.paslang; \
 	echo ok kernel-align; \
@@ -3704,6 +3714,13 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	$(OUTDIR)/paslangc -target arm64 -cpu max -Fu $(A64DIR) -o $(BUILDDIR)/execrace-arm testdata/execrace.paslang; \
 	python3 -I scripts/check_execlock.py $(BUILDDIR)/execrace-arm.s --arm; \
 	echo ok execlock-arm-asm; \
+	: P326 on arm64: inlineorder with -inline 0 and 200; \
+	for n in 0 200; do \
+	  $(OUTDIR)/paslangc -target arm64 -cpu max -inline $$n -Fu $(A64DIR) -o $(BUILDDIR)/inlineorder$$n-arm testdata/inlineorder.paslang; \
+	  timeout 300 $(QEMU_A64) $(BUILDDIR)/inlineorder$$n-arm > $(BUILDDIR)/inlineorder$$n-arm.got; \
+	  diff -u testdata/inlineorder.out $(BUILDDIR)/inlineorder$$n-arm.got; \
+	done; \
+	echo ok inlineorder-arm-inline; \
 	$(OUTDIR)/paslangc -target arm64 -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/exprinline0-arm testdata/exprinline.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/exprinline0-arm > $(BUILDDIR)/exprinline0-arm.got; \
 	diff -u testdata/exprinline.out $(BUILDDIR)/exprinline0-arm.got; \
