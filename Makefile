@@ -379,6 +379,9 @@ GOLDEN_A64 += andtest
 # P296: a routine that calls nothing keeps its variables in registers, no frame.
 GOLDEN += flatproc
 GOLDEN_A64 += flatproc
+# P323: a product by a constant with no recipe is one imulq from its variable.
+GOLDEN += imulconst
+GOLDEN_A64 += imulconst
 # P333: an exec and a new thread do not race (amd64: qemu-user does not
 # execve an arm64 program, so arm64 reads the runtime's forms).
 GOLDEN += execrace
@@ -2555,6 +2558,13 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/flatproc.out $(BUILDDIR)/flatproc0.got; \
 	python3 -I scripts/check_flatproc.py $(BUILDDIR)/flatproc0.s --clamp=7; \
 	echo ok flatproc-asm; \
+	: a product by a constant no recipe takes as one imulq from the register or the home of its variable, P323: imulconst with and without inlining; \
+	python3 -I scripts/check_imulconst.py $(BUILDDIR)/imulconst.s --three=30; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/imulconst0 testdata/imulconst.paslang; \
+	$(BUILDDIR)/imulconst0 > $(BUILDDIR)/imulconst0.got; \
+	diff -u testdata/imulconst.out $(BUILDDIR)/imulconst0.got; \
+	python3 -I scripts/check_imulconst.py $(BUILDDIR)/imulconst0.s --three=30; \
+	echo ok imulconst-asm; \
 	: the exec lock around a new thread and an execve, clone again on EAGAIN, P333: the runtime in execrace; \
 	python3 -I scripts/check_execlock.py $(BUILDDIR)/execrace.s; \
 	echo ok execlock-asm; \
