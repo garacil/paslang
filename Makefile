@@ -379,6 +379,9 @@ GOLDEN_A64 += inlineorder
 # P336: an unrolled loop keeps its counter where what it calls reads it.
 GOLDEN += unrollctr
 GOLDEN_A64 += unrollctr
+# P325: a var parameter through a routine value or a method value.
+GOLDEN += varvalue
+GOLDEN_A64 += varvalue
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -1430,6 +1433,19 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'TR declares no method Thrice of these parameters at 12:13' $(BUILDDIR)/recbad_nodecl.err; \
 	grep -q 'TR is a record with no methods at 6:13' $(BUILDDIR)/recbad_plainrec.err; \
 	echo ok recbad; \
+	echo "==== var argument rejects (P325) ===="; \
+	for target in amd64 arm64; do \
+	  for n in constarg exprarg fewargs manyargs; do \
+	    if $(OUTDIR)/paslangc -target $$target -o $(BUILDDIR)/varbad_$$n-$$target testdata/varbad/$$n.paslang >$(BUILDDIR)/varbad_$$n-$$target.err 2>&1; then \
+	      echo "$$n should fail"; exit 1; \
+	    fi; \
+	  done; \
+	  grep -qF 'a var or out parameter needs a variable, not a value at 10:10' $(BUILDDIR)/varbad_constarg-$$target.err; \
+	  grep -qF 'a var or out parameter needs a variable, not a value at 20:11' $(BUILDDIR)/varbad_exprarg-$$target.err; \
+	  grep -qF 'wrong number of arguments for the routine value at 18:15' $(BUILDDIR)/varbad_fewargs-$$target.err; \
+	  grep -qF 'wrong number of arguments for the routine value at 18:21' $(BUILDDIR)/varbad_manyargs-$$target.err; \
+	done; \
+	echo ok varbad; \
 	echo "==== with rejects (P166) ===="; \
 	for target in amd64 arm64; do \
 	  if $(OUTDIR)/paslangc -target $$target -o $(BUILDDIR)/withbad_$$target testdata/withbad/constwrite.paslang >$(BUILDDIR)/withbad_$$target.err 2>&1; then \
