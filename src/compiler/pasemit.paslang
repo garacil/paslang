@@ -327,6 +327,7 @@ type
     FFrameSym: string;      { the .set symbol that carries the frame size, defined after the body }
     FFrameMarked: Boolean;  { arm64: the prologue wrote the mark SetFrame fills (P308) }
     FSkipCanon: Boolean;    { EmitOrdTo's top node feeds a store of its own width: no cleanup (P100) }
+    FCondCarry: Boolean;    { CondFlags's flags answer by the carry, a BT's: ae for =, b for <> (P322) }
     FPool0: string;         { pool register 0's name while a value is worked out in a variable's register (P318) }
     FNoCheck: Boolean;      { EmitWordMem's element was just checked by the same statement (P100) }
     FChunkReg: string;
@@ -854,6 +855,9 @@ type
     procedure CondSides(E, Pref: PExpr; out A, B: PExpr; out Op: TBinOp);
     function CondFlagsOK(E: PExpr; D: LongInt; Pref: PExpr): Boolean;
     function CondFlags(E: PExpr; D: LongInt; Pref: PExpr; out Side: string): TBinOp;
+    function AndZero(E: PExpr; out A: PExpr): Boolean;
+    function AndTest(A: PExpr; D: LongInt; AllowBit: Boolean): LongInt;
+    procedure TbzPass(From: SizeInt);
     procedure SelLoad(F: PExpr; const R: string);
     function SelReg(F: PExpr; const Spare: string): string;
     function IncOne(E: PExpr; out A: PExpr): Boolean;
@@ -7749,17 +7753,386 @@ begin
   Result := OrdSimple(a, D) and (OrdLeaf(b) or OrdSimple(b, D + 1));
 end;
 
+{ arm64, the routine's text from From (P322): a TST of one bit and the
+  B.EQ or B.NE after it are one TBZ or TBNZ (ARM DDI 0487 C6.2.479 and
+  C6.2.478, the bit's number and a label within 32 KiB, the flags not
+  written), as Go writes a test of one bit (ARM64.rules, TBZ and TBNZ),
+  where the label is the routine's and within reach by a count of its
+  instructions (a .p2align its most padding), which GNU as does not
+  relax, and the flags the TST wrote are read neither after the branch
+  nor at its label: on each path the first instruction that touches
+  them writes them all, or is a call or a return. }
+procedure TEmitter.TbzPass(From: SizeInt);
+var
+  ls: TStrArray;
+  at: array of Int64;
+  drop: array of Boolean;
+  i, j, n, b, e, k, bit, q, st: SizeInt;
+  t, op, tgt, reg, hx, out1: string;
+  v, w: Int64;
+  d: LongInt;
+  changed: Boolean;
+
+  function FindLab(const L: string): SizeInt;
+  var
+    x: SizeInt;
+  begin
+    Result := -1;
+    for x := 0 to n - 1 do
+      if ls[x] = L + ':' then
+      begin
+        Result := x;
+        Exit;
+      end;
+  end;
+
+  { the flags are dead from line x on, on this path: before any reader,
+    a write of all of them, a call or a return; a B followed to its
+    label, four deep }
+  function Dead(x: SizeInt; Depth: LongInt): Boolean;
+  var
+    o: string;
+    p, y: SizeInt;
+  begin
+    Result := False;
+    while x < n do
+    begin
+      { a label joins other paths to this one, whose flags it does not
+        read: passed, as a directive is }
+      if (ls[x] = '') or (Copy(ls[x], 1, 3) = '  .') or
+        ((ls[x][1] <> ' ') and (ls[x][Length(ls[x])] = ':')) then
+      begin
+        Inc(x);
+        Continue;
+      end;
+      if (Length(ls[x]) < 3) or (ls[x][1] <> ' ') then
+        Exit;
+      p := 3;
+      while (p <= Length(ls[x])) and (ls[x][p] <> ' ') do
+        Inc(p);
+      o := Copy(ls[x], 3, p - 3);
+      if (o = 'cmp') or (o = 'cmn') or (o = 'tst') or (o = 'adds') or (o = 'subs') or
+        (o = 'ands') or (o = 'bics') or (o = 'fcmp') or (o = 'fcmpe') or (o = 'bl') or
+        (o = 'blr') or (o = 'ret') then
+      begin
+        Result := True;
+        Exit;
+      end;
+      if (o = 'b') and (Depth < 4) and (p < Length(ls[x])) then
+      begin
+        y := FindLab(Copy(ls[x], p + 1, Length(ls[x]) - p));
+        if y >= 0 then
+          Result := Dead(y + 1, Depth + 1);
+        Exit;
+      end;
+      if (o = 'b') or (Copy(o, 1, 2) = 'b.') or (o = 'cbz') or (o = 'cbnz') or (o = 'tbz') or
+        (o = 'tbnz') or (o = 'br') or (Copy(o, 1, 2) = 'cs') or (Copy(o, 1, 2) = 'ci') or
+        (Copy(o, 1, 2) = 'cn') or (Copy(o, 1, 3) = 'adc') or (Copy(o, 1, 3) = 'sbc') or
+        (Copy(o, 1, 2) = 'cc') or (o = 'fcsel') or (o = 'mrs') then
+        Exit;
+      Inc(x);
+    end;
+  end;
+
+begin
+  if FLen <= From then
+    Exit;
+  { the routine's lines }
+  ls := nil;
+  n := 0;
+  st := From + 1;
+  for q := From + 1 to FLen do
+    if FOut[q] = Char(10) then
+    begin
+      SetLength(ls, n + 1);
+      ls[n] := Copy(FOut, st, q - st);
+      Inc(n);
+      st := q + 1;
+    end;
+  if n < 3 then
+    Exit;
+  { where each line starts, in bytes at most: an instruction 4, a
+    .p2align its most padding }
+  SetLength(at, n + 1);
+  SetLength(drop, n);
+  at[0] := 0;
+  for i := 0 to n - 1 do
+  begin
+    t := ls[i];
+    k := 0;
+    if Copy(t, 1, 11) = '  .p2align ' then
+    begin
+      d := 0;
+      j := 12;
+      while (j <= Length(t)) and (t[j] >= '0') and (t[j] <= '9') do
+      begin
+        d := d * 10 + (Ord(t[j]) - Ord('0'));
+        Inc(j);
+      end;
+      if d > 12 then
+        d := 12;
+      k := SizeInt(1) shl d;
+    end
+    else if (Length(t) > 3) and (t[1] = ' ') and (t[2] = ' ') and (t[3] <> '.') then
+      k := 4;
+    at[i + 1] := at[i] + k;
+    drop[i] := False;
+  end;
+  changed := False;
+  for i := 0 to n - 2 do
+  begin
+    t := ls[i];
+    if Copy(t, 1, 6) <> '  tst ' then
+      Continue;
+    j := Pos(', #0x', t);
+    if j = 0 then
+      Continue;
+    reg := Copy(t, 7, j - 7);
+    hx := Copy(t, j + 5, Length(t) - j - 4);
+    if (Length(reg) < 2) or (reg[1] <> 'x') or (Length(hx) <> 16) then
+      Continue;
+    { the immediate, one bit's }
+    v := 0;
+    for q := 1 to 16 do
+    begin
+      if (hx[q] >= '0') and (hx[q] <= '9') then
+        d := Ord(hx[q]) - Ord('0')
+      else if (hx[q] >= 'a') and (hx[q] <= 'f') then
+        d := Ord(hx[q]) - Ord('a') + 10
+      else
+        d := -1;
+      if d < 0 then
+      begin
+        v := 0;
+        Break;
+      end;
+      v := (v shl 4) or d;
+    end;
+    bit := -1;
+    w := 1;
+    for q := 0 to 63 do
+    begin
+      if v = w then
+        bit := q;
+      w := w shl 1;
+    end;
+    if bit < 0 then
+      Continue;
+    op := ls[i + 1];
+    if Copy(op, 1, 7) = '  b.eq ' then
+      b := 0
+    else if Copy(op, 1, 7) = '  b.ne ' then
+      b := 1
+    else
+      Continue;
+    tgt := Copy(op, 8, Length(op) - 7);
+    e := FindLab(tgt);
+    if e < 0 then
+      Continue;
+    if Abs(at[e] - at[i]) > 32000 then
+      Continue;
+    if not (Dead(i + 2, 0) and Dead(e + 1, 0)) then
+      Continue;
+    if b = 0 then
+      ls[i] := '  tbz ' + reg + ', #' + IntToStr(bit) + ', ' + tgt
+    else
+      ls[i] := '  tbnz ' + reg + ', #' + IntToStr(bit) + ', ' + tgt;
+    drop[i + 1] := True;
+    changed := True;
+  end;
+  if not changed then
+    Exit;
+  out1 := '';
+  for i := 0 to n - 1 do
+    if not drop[i] then
+      out1 := out1 + ls[i] + Char(10);
+  { the text after the last line end, if any, stays after the new lines }
+  out1 := out1 + Copy(FOut, st, FLen - st + 1);
+  if From + Length(out1) + 1 > Length(FOut) then
+    SetLength(FOut, From + Length(out1) + 4096);
+  if Length(out1) > 0 then
+    Move(out1[1], FOut[From + 1], Length(out1));
+  FLen := From + Length(out1);
+end;
+
+{ E is (x and c) = 0 or <> 0, either way round: A the and (P322). }
+function TEmitter.AndZero(E: PExpr; out A: PExpr): Boolean;
+var
+  z: PExpr;
+begin
+  Result := False;
+  A := nil;
+  if (E = nil) or (E^.Kind <> ekBin) or ((E^.Bin <> boEq) and (E^.Bin <> boNe)) or
+    (E^.L = nil) or (E^.R = nil) then
+    Exit;
+  A := E^.L;
+  z := E^.R;
+  if not ((z^.Kind = ekInt) and (z^.Num = 0)) then
+  begin
+    A := E^.R;
+    z := E^.L;
+  end;
+  if not ((z^.Kind = ekInt) and (z^.Num = 0)) then
+    Exit;
+  Result := (A^.Kind = ekBin) and (A^.Bin = boAnd) and (A^.Typ <> TyBoolean) and
+    (A^.L <> nil) and (A^.R <> nil) and (TKind(A^.Typ) = tykInteger);
+end;
+
+{ The flags of A, x and c, against 0 with no AND written (P322): Go's
+  (CMPQconst (ANDQconst [c] x) [0]) => (TESTQconst [c] x) (AMD64.rules
+  1398-1403), TST on arm64. 1 when ZF answers it (zero when the and is),
+  2 when CF does, a BT of the one bit of c past bit 31 that TEST's imm32
+  cannot name (AMD64.rules 625-636), only with AllowBit; 0 with nothing
+  written when neither fits. c a constant: TEST of the narrowest that
+  holds it, a byte up to 255 (testb, of the low byte), 32 bits up to
+  2^32 - 1 (testl: TEST of 64 bits sign-extends its imm32), 64 for a
+  negative one an imm32 holds; of x's register, of x at its home (that
+  much of it, little-endian) or of the pool after x. A narrow x is clean
+  in its register, extended as its type is, and c a constant of its type
+  extended alike, so the test of the words answers the narrow and. A
+  constant neither TEST nor BT takes goes into rax for a TEST of two
+  registers. c a variable a register keeps beside one: TEST of the two
+  registers.
+  TEST and a jump fuse (AMD 56665 2.9.3 Branch Fusion, Intel 248966
+  3.4.2.2 Table 3-2); BT is in neither list, so it is only for the bits
+  TEST cannot reach. }
+function TEmitter.AndTest(A: PExpr; D: LongInt; AllowBit: Boolean): LongInt;
+var
+  x, y, t: PExpr;
+  c: Int64;
+  s: TSym;
+  reg, op, ry: string;
+  tw, sz, k: LongInt;
+begin
+  Result := 0;
+  x := A^.L;
+  y := A^.R;
+  if ConstOf(x, c) and not ConstOf(y, c) then
+  begin
+    t := x;
+    x := y;
+    y := t;
+  end;
+  if ConstOf(y, c) then
+  begin
+    if FArm then
+    begin
+      reg := WordReg(x);
+      if reg = '' then
+      begin
+        if not OrdSimple(x, D) then
+          Exit;
+        EmitOrdTo(x, D);
+        reg := OrdPool(D);
+      end;
+      if ArmLogImm(c) then
+        Line('  tst ' + reg + ', #' + HexWord(c))
+      else
+      begin
+        Imm('x17', c);
+        Line('  tst ' + reg + ', x17');
+      end;
+      Result := 1;
+      Exit;
+    end;
+    k := -1;
+    if (c >= 0) and (c <= 255) then
+      tw := 1
+    else if (c >= 0) and (c <= 4294967295) then
+      tw := 4
+    else if Fits32(c) then
+      tw := 8
+    else if AllowBit and (c > 0) and ((c and (c - 1)) = 0) then
+    begin
+      tw := 0;
+      k := 0;
+      while (Int64(1) shl k) <> c do
+        Inc(k);
+    end
+    else
+      tw := 9;
+    case tw of
+      1: op := 'testb $' + IntToStr(c) + ', ';
+      4: op := 'testl $' + IntToStr(c) + ', ';
+      8: op := 'testq $' + IntToStr(c) + ', ';
+      9: op := 'testq %rax, ';
+    else
+      op := 'btq $' + IntToStr(k) + ', ';
+    end;
+    { a constant no TEST takes and no BT names goes into rax, after x is
+      worked out, which may take rax itself: TEST of the two registers,
+      as Go's (TESTQ (MOVQconst [c]) x) when c is no imm32 }
+    sz := tw;
+    if (sz = 0) or (sz = 9) then
+      sz := 8;
+    reg := WordReg(x);
+    if reg <> '' then
+    begin
+      if tw = 9 then
+        Line('  movabsq $' + IntToStr(c) + ', %rax');
+      Line('  ' + op + '%' + X86Sub(reg, sz));
+    end
+    else if (x^.Kind = ekVar) and WordVar(x, s) and (s.Reg = '') and (TSize(s.Typ) >= sz) and
+      ((tw = 1) or (tw = 4) or (TSize(s.Typ) = 8)) then
+    begin
+      { the variable at its home: TEST of a memory operand reads it
+        (SDM vol. 2B TEST), BT of a memory operand with an immediate the
+        bit within it }
+      if tw = 9 then
+        Line('  movabsq $' + IntToStr(c) + ', %rax');
+      Line('  ' + op + MemA(s));
+    end
+    else
+    begin
+      if not OrdSimple(x, D) then
+        Exit;
+      EmitOrdTo(x, D);
+      if tw = 9 then
+        Line('  movabsq $' + IntToStr(c) + ', %rax');
+      Line('  ' + op + '%' + X86Sub(OrdPool(D), sz));
+    end;
+    if tw = 0 then
+      Result := 2
+    else
+      Result := 1;
+    Exit;
+  end;
+  reg := WordReg(x);
+  ry := WordReg(y);
+  if (reg = '') or (ry = '') then
+    Exit;
+  if FArm then
+    Line('  tst ' + reg + ', ' + ry)
+  else
+    Line('  testq %' + ry + ', %' + reg);
+  Result := 1;
+end;
+
 { The flags of the comparison E, and the comparison they answer: its
   left side into pool register D, or the register a region keeps it in,
   which Side gives back, and one CMP, the right side its immediate where
   the instruction takes one (P306). }
 function TEmitter.CondFlags(E: PExpr; D: LongInt; Pref: PExpr; out Side: string): TBinOp;
 var
-  a, b: PExpr;
+  a, b, z: PExpr;
   k: Int64;
   l: string;
+  f: LongInt;
 begin
   CondSides(E, Pref, a, b, Result);
+  { (x and c) = 0 is one TEST or TST when the select reads no side (Pref,
+    P322), or a BT whose answer is the carry (FCondCarry) }
+  FCondCarry := False;
+  if (Pref = nil) and AndZero(E, z) then
+  begin
+    f := AndTest(z, D, not FArm);
+    if f > 0 then
+    begin
+      FCondCarry := f = 2;
+      Side := '';
+      Exit;
+    end;
+  end;
   { a variable a region keeps is compared in its register (P303) }
   l := WordReg(a);
   if l = '' then
@@ -8081,6 +8454,14 @@ begin
     Exit;
   end;
   xc := Copy(X86Jcc(CondCC(op, True)), 2, 3);
+  { a BT's carry is the bit: the and is 0 when it is clear (P322) }
+  if FCondCarry then
+  begin
+    if op = boEq then
+      xc := 'ae'
+    else
+      xc := 'b';
+  end;
   dst := x.Reg;
   if dst = '' then
     dst := 'rax';
@@ -8518,10 +8899,45 @@ var
   r: string;
   k: TTypeKind;
   jz: Boolean;
+  f: LongInt;
 begin
   Result := False;
   if (E^.Bin <> boEq) and (E^.Bin <> boNe) then
     Exit;
+  { (x and c) = 0: one TEST or TST and the jump, a BT of a high bit
+    and a jump on the carry (P322); TbzPass makes TST of one bit and
+    its b.eq or b.ne a TBZ or TBNZ where the label is within reach }
+  if AndZero(E, z) then
+  begin
+    jz := (E^.Bin = boEq) = WhenTrue;
+    f := AndTest(z, 0, True);
+    if f = 1 then
+    begin
+      if FArm then
+      begin
+        if jz then
+          Line('  b.eq ' + Target)
+        else
+          Line('  b.ne ' + Target);
+      end
+      else if jz then
+        Line('  je ' + Target)
+      else
+        Line('  jne ' + Target);
+      Result := True;
+      Exit;
+    end
+    else if f = 2 then
+    begin
+      { CF the bit: the and is 0 when it is clear }
+      if jz then
+        Line('  jae ' + Target)
+      else
+        Line('  jb ' + Target);
+      Result := True;
+      Exit;
+    end;
+  end;
   x := E^.L;
   z := E^.R;
   if not ((z^.Kind = ekNil) or ((z^.Kind = ekInt) and (z^.Num = 0))) then
@@ -26319,6 +26735,39 @@ begin
           E^.L := E^.R;
           E^.R := t;
         end;
+        { the value of (x and c) = 0 or <> 0: one TEST or TST, or a BT,
+          and the set (P322) }
+        if (E^.Typ = TyBoolean) and AndZero(E, t) then
+        begin
+          ok := E^.Bin = boEq;
+          zt := AndTest(t, D, True);
+          if zt > 0 then
+          begin
+            if FArm then
+            begin
+              if ok then
+                Line('  cset ' + r + ', eq')
+              else
+                Line('  cset ' + r + ', ne');
+            end
+            else
+            begin
+              if zt = 2 then
+              begin
+                if ok then
+                  Line('  setae %al')
+                else
+                  Line('  setb %al');
+              end
+              else if ok then
+                Line('  sete %al')
+              else
+                Line('  setne %al');
+              Line('  movzbq %al, %' + r);
+            end;
+            Exit;
+          end;
+        end;
         { x and $FF, $FFFF or $FFFFFFFF is a zero extension of x's low
           byte, halfword or word: from x's register, or a load of that
           much of x at its home, else of the pool's register after x,
@@ -30833,6 +31282,8 @@ begin
     SetFrame(FFrameSym, LongInt(slot))
   else
     MapEnd(FFrame);
+  if FArm and not HasAsm(Pr.Body) then
+    TbzPass(ck0);
   dend := Lab;
   Line(dend + ':');
   { the routine's code for rt_sigurg (P293): a signal may stop it at any

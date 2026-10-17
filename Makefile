@@ -373,6 +373,9 @@ GOLDEN_A64 += andmask
 # P321: a constant from 0 to 2^32 - 1 by a movl, 0 by an xorl where the flags die.
 GOLDEN += movconst
 GOLDEN_A64 += movconst
+# P322: an and compared with 0 is one test of its source.
+GOLDEN += andtest
+GOLDEN_A64 += andtest
 # P333: an exec and a new thread do not race (amd64: qemu-user does not
 # execve an arm64 program, so arm64 reads the runtime's forms).
 GOLDEN += execrace
@@ -2526,6 +2529,13 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/movconst.out $(BUILDDIR)/movconst0.got; \
 	python3 -I scripts/check_movconst.py $(BUILDDIR)/movconst0.s; \
 	echo ok movconst-asm; \
+	: an and compared with 0 as one TEST or BT of its source, P322: andtest with and without inlining, no AND before a test of it with zero; \
+	python3 -I scripts/check_andtest.py $(BUILDDIR)/andtest.s; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/andtest0 testdata/andtest.paslang; \
+	$(BUILDDIR)/andtest0 > $(BUILDDIR)/andtest0.got; \
+	diff -u testdata/andtest.out $(BUILDDIR)/andtest0.got; \
+	python3 -I scripts/check_andtest.py $(BUILDDIR)/andtest0.s; \
+	echo ok andtest-asm; \
 	: the exec lock around a new thread and an execve, clone again on EAGAIN, P333: the runtime in execrace; \
 	python3 -I scripts/check_execlock.py $(BUILDDIR)/execrace.s; \
 	echo ok execlock-asm; \
@@ -3764,6 +3774,13 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	diff -u testdata/andmask.out $(BUILDDIR)/andmask0-arm.got; \
 	python3 -I scripts/check_andmask.py $(BUILDDIR)/andmask0-arm.s --arm; \
 	echo ok andmask-arm-asm; \
+	: P322 on arm64: andtest with and without inlining, one TST and the tests of one bit TBZ or TBNZ; \
+	python3 -I scripts/check_andtest.py $(BUILDDIR)/andtest-arm.s --arm --tbz=38; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/andtest0-arm testdata/andtest.paslang; \
+	timeout 300 $(QEMU_A64) $(BUILDDIR)/andtest0-arm > $(BUILDDIR)/andtest0-arm.got; \
+	diff -u testdata/andtest.out $(BUILDDIR)/andtest0-arm.got; \
+	python3 -I scripts/check_andtest.py $(BUILDDIR)/andtest0-arm.s --arm --tbz=38; \
+	echo ok andtest-arm-asm; \
 	: P333 on arm64: the runtime of execrace, the exec lock around a new thread and an execve; \
 	$(OUTDIR)/paslangc -target arm64 -cpu max -Fu $(A64DIR) -o $(BUILDDIR)/execrace-arm testdata/execrace.paslang; \
 	python3 -I scripts/check_execlock.py $(BUILDDIR)/execrace-arm.s --arm; \
