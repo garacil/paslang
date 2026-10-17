@@ -52,7 +52,7 @@ const
   MsgCloseClosed = 'paslang: close of closed channel';
   MsgCloseSender = 'paslang: close of a channel with a waiting sender';
   MsgMapRW = 'paslang: concurrent map read and map write';
-  MsgClone = 'paslang: clone failed';
+  MsgClone = 'paslang: clone failed, errno ';
   MsgSignalMask = 'paslang: cannot restore runtime signal mask';
   MsgThreads = 'paslang: thread limit exceeded (10000 Ms)';
   MsgIndex = 'paslang: index ';
@@ -32323,9 +32323,21 @@ begin
     marks with that cycle when its marking is open) and schedules
     (rt_mloop). The caller set M+56 when it hands over a spinning count.
     rbx kept; rax, rcx, rdx, rsi, rdi, r8, r10, r11 clobbered (P91). }
+  { P333: the thread is made under the exec lock taken for reading, as
+    Go's newm1 holds execLock around newosproc (runtime/proc.go, issue
+    19546): an execve of the process waits for it, and a clone does not
+    run while the kernel replaces the process (it gave EAGAIN there, and
+    the program ended); clone again on EAGAIN, 20 times in all with 1,
+    2, ... 19 ms between, Go's retryOnEAGAIN (runtime/retry.go); a clone
+    that still fails says its errno, as Go's newosproc does. r12 kept
+    too. }
   Line('rt_newm:');
   Line('  pushq %rbx');
+  Line('  pushq %r12');
   Line('  movq %rdi, %rbx');
+  Line('  call rt_execrl');
+  Line('  xorl %r12d, %r12d');
+  Line('.nm_try:');
   Line('  movq $0x50f00, %rdi');
   Line('  movq 32(%rbx), %rsi');
   Line('  xorq %rdx, %rdx');
@@ -32335,13 +32347,82 @@ begin
   Line('  syscall');
   Line('  testq %rax, %rax');
   Line('  jz .nm_child');
-  Line('  js .nm_fail');
+  Line('  jns .nm_made');
+  Line('  cmpq $-11, %rax');
+  Line('  jne .nm_fail');
+  Line('  incl %r12d');
+  Line('  cmpl $20, %r12d');
+  Line('  jae .nm_fail');
+  Line('  imulq $1000000, %r12, %rcx');
+  Line('  subq $16, %rsp');
+  Line('  movq $0, (%rsp)');
+  Line('  movq %rcx, 8(%rsp)');
+  Line('  movq %rsp, %rdi');
+  Line('  xorq %rsi, %rsi');
+  Line('  movq $35, %rax');
+  Line('  syscall');
+  Line('  addq $16, %rsp');
+  Line('  jmp .nm_try');
+  Line('.nm_made:');
+  Line('  lock decq rt_execlk(%rip)');
+  Line('  popq %r12');
   Line('  popq %rbx');
   Line('  ret');
   Line('.nm_fail:');
+  Line('  negq %rax');
+  Line('  movq %rax, %rbx');
   Line('  leaq .Lclonefail(%rip), %rsi');
   Line('  movq $' + IntToStr(Length(MsgClone)) + ', %rdx');
-  Line('  jmp rt_diemsg');
+  Line('  call rt_rawwrite');
+  Line('  movq %rbx, %rdi');
+  Line('  movq $10, %rsi');
+  Line('  call rt_fatalnum');
+  Line('  jmp rt_dieend');
+  { P333: the exec lock for reading: waits while an execve of the
+    process holds it, then counts one more thread being made; rax, rcx
+    and r11 changed }
+  Line('rt_execrl:');
+  Line('  movq rt_execlk(%rip), %rax');
+  Line('.xr_cas:');
+  Line('  btq $32, %rax');
+  Line('  jc .xr_wait');
+  Line('  leaq 1(%rax), %rcx');
+  Line('  lock cmpxchgq %rcx, rt_execlk(%rip)');
+  Line('  jne .xr_cas');
+  Line('  ret');
+  Line('.xr_wait:');
+  Line('  movq $24, %rax');
+  Line('  syscall');
+  Line('  jmp rt_execrl');
+  { P333: the exec lock for writing, Go's syscall_runtime_BeforeExec: the
+    bit taken (another execve waits for it), then the threads being made
+    let finish; every register kept }
+  Line('rt_execwl:');
+  Line('  pushq %rax');
+  Line('  pushq %rcx');
+  Line('  pushq %r11');
+  Line('.xw_bit:');
+  Line('  lock btsq $32, rt_execlk(%rip)');
+  Line('  jnc .xw_drain');
+  Line('  movq $24, %rax');
+  Line('  syscall');
+  Line('  jmp .xw_bit');
+  Line('.xw_drain:');
+  Line('  cmpl $0, rt_execlk(%rip)');
+  Line('  je .xw_done');
+  Line('  movq $24, %rax');
+  Line('  syscall');
+  Line('  jmp .xw_drain');
+  Line('.xw_done:');
+  Line('  popq %r11');
+  Line('  popq %rcx');
+  Line('  popq %rax');
+  Line('  ret');
+  { P333: given back when the execve failed, Go's AfterExec; every
+    register kept }
+  Line('rt_execwu:');
+  Line('  lock btrq $32, rt_execlk(%rip)');
+  Line('  ret');
   Line('.nm_child:');
   Line('  movq %rbx, %r13');
   Line('  movq 32(%r13), %rsp');
@@ -38530,6 +38611,11 @@ begin
     saved kernel mask; M+40 is the all-signals mask and child marker.
     A private child stays masked throughout raw setup; exec below resets
     caught handlers before restoring this mask, with explicit failures. }
+  { P333: an execve of the process itself waits for the threads being
+    made and keeps others from being made (rt_execwl), and gives the
+    lock back when it fails }
+  Line('  cmpq $59, %rax');
+  Line('  je .sy_exec');
   Line('  cmpq $57, %rax');
   Line('  je .sy_forkmask');
   Line('  cmpq $56, %rax');
@@ -38644,15 +38730,30 @@ begin
   Line('  popq %rbp');
   Line('  popq %rbx');
   Line('  ret');
+  { P333: the execve of a routine's own process, out of the way of the
+    paths that fall into .sy_invoke }
+  Line('.sy_exec:');
+  Line('  call rt_execwl');
+  Line('  syscall');
+  Line('  call rt_execwu');
+  Line('  movq %rax, %rbx');
+  Line('  jmp .sy_parent');
+  { a fork's child execs as it is (.sy_childexec): its copy of the lock
+    is the parent's at the fork, and it has one thread; the process's
+    own execve on this path takes the lock as above (P333) }
   Line('.sy_raw:');
-  Line('  testq %r14, %r14');
-  Line('  jz .sy_raw_call');
   Line('  cmpq $59, %rax');
   Line('  jne .sy_raw_call');
+  Line('  testq %r14, %r14');
+  Line('  jz .sy_raw_exec');
   Line('  movq 32(%r14), %rcx');
   Line('  cmpq $0, 40(%rcx)');
-  Line('  je .sy_raw_call');
-  Line('  jmp .sy_childexec');
+  Line('  jne .sy_childexec');
+  Line('.sy_raw_exec:');
+  Line('  call rt_execwl');
+  Line('  syscall');
+  Line('  call rt_execwu');
+  Line('  ret');
   Line('.sy_raw_call:');
   Line('  syscall');
   Line('  ret');
@@ -41946,6 +42047,10 @@ begin
     Line('rt_glock:');
     Line('  .quad 0');
     Line('rt_gflock:');
+    Line('  .quad 0');
+    { P333: the exec lock, Go's execLock: bit 32 an execve of the process
+      in progress, the low word the threads being made }
+    Line('rt_execlk:');
     Line('  .quad 0');
     Line('rt_heaplock:');
     Line('  .quad 0');
@@ -48489,10 +48594,16 @@ begin
   { rt_newm and rt_gcms as on amd64 (P91): x0 the M; the child finds it
     on its own stack, as rt_initsched's clones did, and records its
     thread id at M+80. x21 kept. }
+  { P333: as on amd64, under the exec lock for reading, clone again on
+    EAGAIN as Go's retryOnEAGAIN, the errno said; x22 kept too. The
+    lock's atomics are Go's arm64 LDAXR/STLXR loops }
   Line('rt_newm:');
   Line('  stp x29, x30, [sp, #-16]!');
-  Psh('x21');
+  Line('  stp x21, x22, [sp, #-16]!');
   Line('  mov x21, x0');
+  Line('  bl rt_execrl');
+  Line('  mov x22, xzr');
+  Line('.anm_try:');
   Line('  ldr x1, [x21, #32]');
   Line('  sub x1, x1, #16');
   Line('  str x21, [x1]');
@@ -48503,14 +48614,97 @@ begin
   Line('  mov x8, #220');
   Line('  svc #0');
   Line('  cbz x0, .anm_child');
-  Line('  tbnz x0, #63, .anm_fail');
-  Ppop('x21');
+  Line('  tbz x0, #63, .anm_made');
+  Line('  cmn x0, #11');
+  Line('  b.ne .anm_fail');
+  Line('  add x22, x22, #1');
+  Line('  cmp x22, #20');
+  Line('  b.hs .anm_fail');
+  Imm('x9', 1000000);
+  Line('  mul x9, x22, x9');
+  Line('  stp xzr, x9, [sp, #-16]!');
+  Line('  mov x0, sp');
+  Line('  mov x1, xzr');
+  Line('  mov x8, #101');
+  Line('  svc #0');
+  Line('  add sp, sp, #16');
+  Line('  b .anm_try');
+  Line('.anm_made:');
+  LeaS('rt_execlk', 'x16');
+  Line('.anm_ru:');
+  Line('  ldaxr x17, [x16]');
+  Line('  sub x17, x17, #1');
+  Line('  stlxr w9, x17, [x16]');
+  Line('  cbnz w9, .anm_ru');
+  Line('  ldp x21, x22, [sp], #16');
   Line('  ldp x29, x30, [sp], #16');
   Line('  ret');
   Line('.anm_fail:');
+  Line('  neg x21, x0');
   LeaS('.Lclonefail', 'x1');
   Line('  mov x2, #' + IntToStr(Length(MsgClone)));
-  Line('  b rt_diemsg');
+  Line('  bl rt_rawwrite');
+  Line('  mov x0, x21');
+  Line('  mov x1, #10');
+  Line('  bl rt_fatalnum');
+  Line('  b rt_dieend');
+  { P333: the exec lock for reading, as on amd64; x0, x8, x9, x16, x17
+    changed }
+  Line('rt_execrl:');
+  LeaS('rt_execlk', 'x16');
+  Line('.axr_try:');
+  Line('  ldaxr x17, [x16]');
+  Line('  tbnz x17, #32, .axr_wait');
+  Line('  add x17, x17, #1');
+  Line('  stxr w9, x17, [x16]');
+  Line('  cbnz w9, .axr_try');
+  Line('  ret');
+  Line('.axr_wait:');
+  Line('  clrex');
+  Line('  mov x8, #124');
+  Line('  svc #0');
+  Line('  b .axr_try');
+  { P333: the exec lock for writing and given back, as on amd64; every
+    register kept }
+  Line('rt_execwl:');
+  Line('  stp x16, x17, [sp, #-16]!');
+  Line('  stp x0, x8, [sp, #-16]!');
+  Line('  str x9, [sp, #-16]!');
+  LeaS('rt_execlk', 'x16');
+  Line('.axw_bit:');
+  Line('  ldaxr x17, [x16]');
+  Line('  tbnz x17, #32, .axw_busy');
+  Line('  orr x17, x17, #0x100000000');
+  Line('  stxr w9, x17, [x16]');
+  Line('  cbnz w9, .axw_bit');
+  Line('.axw_drain:');
+  Line('  ldar w17, [x16]');
+  Line('  cbz w17, .axw_done');
+  Line('  mov x8, #124');
+  Line('  svc #0');
+  Line('  b .axw_drain');
+  Line('.axw_busy:');
+  Line('  clrex');
+  Line('  mov x8, #124');
+  Line('  svc #0');
+  Line('  b .axw_bit');
+  Line('.axw_done:');
+  Line('  ldr x9, [sp], #16');
+  Line('  ldp x0, x8, [sp], #16');
+  Line('  ldp x16, x17, [sp], #16');
+  Line('  ret');
+  Line('rt_execwu:');
+  Line('  stp x16, x17, [sp, #-16]!');
+  Line('  str x9, [sp, #-16]!');
+  LeaS('rt_execlk', 'x16');
+  Line('.axu_bit:');
+  Line('  ldaxr x17, [x16]');
+  Line('  and x17, x17, #0xffffffff');
+  Line('  stlxr w9, x17, [x16]');
+  Line('  cbnz w9, .axu_bit');
+  Line('  ldr x9, [sp], #16');
+  Line('  ldp x16, x17, [sp], #16');
+  Line('  ret');
   Line('.anm_child:');
   Line('  ldr x21, [sp]');
   Line('  ldr x9, [x21, #32]');
@@ -51633,6 +51827,10 @@ begin
   Line('  mov x17, #2');
   Line('  stlr x17, [x16]');
   Line('  dmb ish');
+  { P333: an execve of the process itself under the exec lock, as on
+    amd64 }
+  Line('  cmp x8, #221');
+  Line('  b.eq .asy_exec');
   Line('  cmp x8, #220');
   Line('  b.ne .asy_invoke');
   Line('  tbnz x0, #8, .asy_invoke');
@@ -51750,13 +51948,30 @@ begin
   Line('  mov x0, x16');
   Line('  ldp x16, x17, [sp], #16');
   Line('  ret');
+  { P333: the execve of a routine's own process, out of the way of the
+    paths that fall into .asy_invoke }
+  Line('.asy_exec:');
+  Line('  bl rt_execwl');
+  Line('  svc #0');
+  Line('  bl rt_execwu');
+  Line('  mov x19, x0');
+  Line('  b .asy_parent');
+  { a fork's child execs as it is (P333, as on amd64) }
   Line('.asy_raw0:');
-  Line('  cbz x28, .asy_rawpop');
   Line('  cmp x8, #221');
   Line('  b.ne .asy_rawpop');
+  Line('  cbz x28, .asy_rawexec');
   Line('  ldr x16, [x28, #32]');
   Line('  ldr x17, [x16, #40]');
   Line('  cbnz x17, .asy_childexec');
+  Line('.asy_rawexec:');
+  Line('  ldp x16, x17, [sp], #16');
+  Line('  stp x29, x30, [sp, #-16]!');
+  Line('  bl rt_execwl');
+  Line('  svc #0');
+  Line('  bl rt_execwu');
+  Line('  ldp x29, x30, [sp], #16');
+  Line('  ret');
   Line('.asy_rawpop:');
   Line('  ldp x16, x17, [sp], #16');
   Line('.asy_raw_call:');

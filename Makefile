@@ -370,6 +370,9 @@ GOLDEN_A64 += runlen
 # P320: an and with $FF, $FFFF or $FFFFFFFF is a zero extension.
 GOLDEN += andmask
 GOLDEN_A64 += andmask
+# P333: an exec and a new thread do not race (amd64: qemu-user does not
+# execve an arm64 program, so arm64 reads the runtime's forms).
+GOLDEN += execrace
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -2473,6 +2476,9 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/andmask.out $(BUILDDIR)/andmask0.got; \
 	python3 -I scripts/check_andmask.py $(BUILDDIR)/andmask0.s; \
 	echo ok andmask-asm; \
+	: the exec lock around a new thread and an execve, clone again on EAGAIN, P333: the runtime in execrace; \
+	python3 -I scripts/check_execlock.py $(BUILDDIR)/execrace.s; \
+	echo ok execlock-asm; \
 	: every loop of an asm kernel of the units starts aligned, as the loops paslangc compiles, P302; \
 	python3 -I scripts/check_kernel_align.py src/lib/*.paslang src/rtl/*.paslang; \
 	echo ok kernel-align; \
@@ -3694,6 +3700,10 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	diff -u testdata/andmask.out $(BUILDDIR)/andmask0-arm.got; \
 	python3 -I scripts/check_andmask.py $(BUILDDIR)/andmask0-arm.s --arm; \
 	echo ok andmask-arm-asm; \
+	: P333 on arm64: the runtime of execrace, the exec lock around a new thread and an execve; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -Fu $(A64DIR) -o $(BUILDDIR)/execrace-arm testdata/execrace.paslang; \
+	python3 -I scripts/check_execlock.py $(BUILDDIR)/execrace-arm.s --arm; \
+	echo ok execlock-arm-asm; \
 	$(OUTDIR)/paslangc -target arm64 -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/exprinline0-arm testdata/exprinline.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/exprinline0-arm > $(BUILDDIR)/exprinline0-arm.got; \
 	diff -u testdata/exprinline.out $(BUILDDIR)/exprinline0-arm.got; \
