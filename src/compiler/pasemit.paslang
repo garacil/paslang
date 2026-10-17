@@ -327,6 +327,15 @@ type
     FFrameSym: string;      { the .set symbol that carries the frame size, defined after the body }
     FFrameMarked: Boolean;  { arm64: the prologue wrote the mark SetFrame fills (P308) }
     FSkipCanon: Boolean;    { EmitOrdTo's top node feeds a store of its own width: no cleanup (P100) }
+    FFlat: Boolean;         { the routine has no frame, its variables in registers (P296) }
+    FFlatCfa: LongInt;      { its CFA's offset from rsp: 8 and 8 a register it pushed }
+    FFlatPad: Boolean;      { a failure out of line moves rsp by 8 first, for its call }
+    FFlatForce: TStrArray;  { a second emission's register for each own variable, '' as the first chose }
+    FFlatTry: LongInt;      { 0 the first emission, 1 the second, 2 the first again }
+    FFlatCheck: Boolean;    { PromoStmtOK takes Exit: FlatProc asks (P296) }
+    FFlatParts: TStrArray;  { the parts' registers the first emission chose, for the second }
+    FFlatBody: string;      { the last emission's body and failures, and its registers }
+    FFlatRegs: TStrArray;
     FCondCarry: Boolean;    { CondFlags's flags answer by the carry, a BT's: ae for =, b for <> (P322) }
     FPool0: string;         { pool register 0's name while a value is worked out in a variable's register (P318) }
     FNoCheck: Boolean;      { EmitWordMem's element was just checked by the same statement (P100) }
@@ -917,6 +926,16 @@ type
     function LeafProc(const Pr: TProc; out St: PStmt): Boolean;
     procedure LeafReg(const N, R: string; Dw: LongInt; const Proc, EndLab: string);
     procedure EmitLeaf(const Pr: TProc; St: PStmt);
+    function FlatProc(const Pr: TProc): Boolean;
+    function NamesReg(const T, R: string): Boolean;
+    function RegNamed(const T, R: string): Boolean;
+    function RegTaken(const L: TStrArray; const R: string): Boolean;
+    function ArrivesIn(const L: TStrArray; const R: string): Boolean;
+    function SavedReg(const R: string): Boolean;
+    function RenameReg(const T, R, M: string): string;
+    function RenameRegTo(const T, M, R: string): string;
+    function NormLabels(const T: string): string;
+    function EmitFlat(const Pr: TProc): Boolean;
     function HasAsm(S: PStmt): Boolean;
     procedure MainAsync;
     procedure NoteName(const N: string);
@@ -24293,7 +24312,12 @@ begin
           if S^.E <> nil then
           begin
             EmitExpr(S^.E);
-            if FHasRes then
+            if FHasRes and (FResReg <> '') then
+            begin
+              if FResReg <> 'x0' then
+                Line('  mov ' + FResReg + ', x0');
+            end
+            else if FHasRes then
               StFP('x0', FResOff);
           end;
           UnwindTry(0);
@@ -25053,7 +25077,12 @@ begin
         if S^.E <> nil then
         begin
           EmitExpr(S^.E);
-          if FHasRes then
+          if FHasRes and (FResReg <> '') then
+          begin
+            if FResReg <> 'rax' then
+              Line('  movq %rax, %' + FResReg);
+          end
+          else if FHasRes then
             Line('  movq %rax, ' + IntToStr(FResOff) + '(%rbp)');
         end;
         UnwindTry(0);
@@ -25655,6 +25684,11 @@ begin
         PromoStmtOK(S^.ElseSt, InLoop);
     skWhile, skRepeat:
       Result := PromoExprOK(S^.E) and PromoStmtOK(S^.Body, True);
+    skExit:
+      { a routine with no frame leaves by its epilogue, its variables in
+        registers and nowhere else (P296): Exit and Exit(value); a region
+        stores its variables home first, so it takes none }
+      Result := FFlatCheck and ((S^.E = nil) or PromoExprOK(S^.E));
     skFor:
       begin
         if (S^.Name = '') or (S^.E = nil) or (S^.E2 = nil) then
@@ -30429,6 +30463,18 @@ begin
     FLineLabs[n] := locn;
     FLineNums[n] := FCurLine;
   end;
+  { no frame (P296): the CFA is rsp's offset as the body left it, and an
+    even count of pushes leaves rsp 8 off 16, which the failure's call
+    (it never comes back) needs on 16 (System V psABI 3.2.2) }
+  if FFlat and not FArm then
+  begin
+    Line('  .cfi_def_cfa_offset ' + IntToStr(FFlatCfa));
+    if FFlatPad then
+    begin
+      Line('  subq $8, %rsp');
+      Line('  .cfi_def_cfa_offset ' + IntToStr(FFlatCfa + 8));
+    end;
+  end;
 end;
 
 procedure TEmitter.ColdBegin(const Jmp: string);
@@ -30810,6 +30856,918 @@ begin
   Line('  .cfi_endproc');
 end;
 
+{ P296: Pr calls nothing and every one of its own variables can be kept
+  in a register: no -debug or -checkptr, not nested, no nested routine,
+  closure's box or pinned cell, not a constructor, no asm, a body of
+  statements a region takes (PromoStmtOK: no call), word parameters by
+  value in registers (six on amd64, eight on arm64, Self counted), and
+  Self, the parameters, Result and the locals all PromoCand's (a word or
+  a narrow integer, a Boolean, a pointer or a class, its address not
+  taken). Not in the runtime's units, which take no async preemption, so
+  their loops test the guard with a slow path that needs homes. Read
+  once the routine's symbols are in FSym and FLocAddr is known. }
+function TEmitter.FlatProc(const Pr: TProc): Boolean;
+var
+  i: SizeInt;
+  n: LongInt;
+  ok: Boolean;
+begin
+  Result := False;
+  if FDebug or FCheckPtr or FRtUnit or (Pr.Nest > 0) or Pr.IsCtor or Pr.RecCtor or
+    Pr.Boxing or (Length(Pr.Shared) > 0) or (Length(Pr.Pins) > 0) or (Pr.Body = nil) or
+    HasAsm(Pr.Body) then
+    Exit;
+  for i := 0 to High(FProgProcs) do
+    if FProgProcs[i].ParentSym = Pr.Sym then
+      Exit;
+  n := Length(Pr.Params) + Ord(HasSelf(Pr));
+  if (FArm and (n > 8)) or ((not FArm) and (n > 6)) then
+    Exit;
+  for i := 0 to High(Pr.Params) do
+    if Pr.Params[i].ByRef or IsFat(Pr.Params[i].Typ) or IsBlob(Pr.Params[i].Typ) then
+      Exit;
+  FFlatCheck := True;
+  ok := True;
+  if Pr.Body^.Kind = skBlock then
+  begin
+    for i := 0 to High(Pr.Body^.Stmts) do
+      if not PromoStmtOK(Pr.Body^.Stmts[i], False) then
+        ok := False;
+  end
+  else
+    ok := PromoStmtOK(Pr.Body, False);
+  FFlatCheck := False;
+  if not ok then
+    Exit;
+  { FSym has room past the routine's own symbols, entries with no name }
+  for i := 0 to High(FSym) do
+    if (FSym[i].Name <> '') and (not FSym[i].Global) and (FSym[i].Up = 0) and
+      not PromoCand(FSym[i]) then
+      Exit;
+  Result := True;
+end;
+
+{ P296: Pr's body with every variable of its own in a register and no
+  frame, as Go keeps a leaf's values in registers and gives a function
+  with no locals left in memory no frame (cmd/compile/internal/ssa/
+  regalloc.go; cmd/internal/obj/x86/obj6.go: no BP saved for a frameless
+  leaf; arm64 obj7.go: a leaf with no frame saves no LR). The registers:
+  amd64 r9, r10 and r11 (r11 the run's end with an inner for, r8 too in a
+  body of integer arithmetic alone), which nothing saves, then rbx, r12,
+  r13 and r15, pushed and popped; arm64 x19 to x26 (x26 the run's end
+  with an inner for), saved in pairs, as a region takes them: the pool
+  is rsi, rdi and r8 inside a region (PoolSize) and x9 up, rax, rcx and
+  rdx or x0 to x8, x16 and x17 its scratch. A parameter keeps the register it came in where that is one
+  of them, else moves there; a local and Result start as zero. Every
+  variable's DWARF location is its register over the routine (LeafReg).
+  False with nothing written, everything as it was, when more variables
+  than registers, or when the body took a frame word after all (a
+  scratch slot, a reference to the frame): the routine is emitted with
+  its frame then. }
+function TEmitter.EmitFlat(const Pr: TProc): Boolean;
+var
+  avail, dregs, pushed: TStrArray;
+  own: array of SizeInt;
+  i, j, k, n, ai, nll, nlr, st0, sm: SizeInt;
+  cl0, dl0: LongInt;
+  wt: array of LongInt;
+  parts: array of TPromo;
+  inner, pure, used8, moved, ok, coldback: Boolean;
+  r, nm, e1, txt, body, body1, body2: string;
+  arrive0, force, cand, reg1: TStrArray;
+  b0: SizeInt;
+  changed: Boolean;
+  arrive: TStrArray;
+
+  function StrToIntSafe(const T: string): LongInt;
+  var
+    q: SizeInt;
+  begin
+    Result := 0;
+    for q := 1 to Length(T) do
+      if (T[q] >= '0') and (T[q] <= '9') then
+        Result := Result * 10 + (Ord(T[q]) - Ord('0'));
+  end;
+
+  function DwOf(const R: string): LongInt;
+  begin
+    if FArm then
+      Result := StrToIntSafe(Copy(R, 2, 3))
+    else if R = 'rax' then
+      Result := 0
+    else if R = 'rdx' then
+      Result := 1
+    else if R = 'rcx' then
+      Result := 2
+    else if R = 'rbx' then
+      Result := 3
+    else if R = 'rsi' then
+      Result := 4
+    else if R = 'rdi' then
+      Result := 5
+    else
+      Result := StrToIntSafe(Copy(R, 2, 3));
+  end;
+
+  function InFree(const R: string): SizeInt;
+  var
+    q: SizeInt;
+  begin
+    Result := -1;
+    for q := 0 to High(avail) do
+      if avail[q] = R then
+      begin
+        Result := q;
+        Exit;
+      end;
+  end;
+
+begin
+  Result := False;
+  st0 := FLen;
+  { the line the last .loc named: a second emission names it again }
+  cl0 := FCurLine;
+  dl0 := FDbgLine;
+  nll := Length(FLineLabs);
+  nlr := Length(FLocRanges);
+  sm := FScratchMax;
+  inner := False;
+  pure := not FArm;
+  if Pr.Body^.Kind = skBlock then
+  begin
+    for i := 0 to High(Pr.Body^.Stmts) do
+    begin
+      if HasInnerFor(Pr.Body^.Stmts[i]) then
+        inner := True;
+      if pure and not PureIntS(Pr.Body^.Stmts[i]) then
+        pure := False;
+    end;
+  end
+  else
+  begin
+    inner := HasInnerFor(Pr.Body);
+    pure := pure and PureIntS(Pr.Body);
+  end;
+  { the registers in the order they are handed out }
+  avail := nil;
+  if FArm then
+  begin
+    { x19 to x26, saved as a region saves them (x2 to x8 are the
+      emitter's scratch, x27 the static link, x28 the routine's G); x26
+      the run's end with an inner for }
+    for i := 19 to 26 do
+      if not (inner and (i = 26)) then
+      begin
+        SetLength(avail, Length(avail) + 1);
+        avail[High(avail)] := 'x' + IntToStr(i);
+      end;
+  end
+  else
+  begin
+    SetLength(avail, 2);
+    avail[0] := 'r9';
+    avail[1] := 'r10';
+    if not inner then
+    begin
+      SetLength(avail, 3);
+      avail[2] := 'r11';
+    end;
+    if pure then
+    begin
+      SetLength(avail, Length(avail) + 1);
+      avail[High(avail)] := 'r8';
+    end;
+    SetLength(avail, Length(avail) + 4);
+    avail[High(avail) - 3] := 'rbx';
+    avail[High(avail) - 2] := 'r12';
+    avail[High(avail) - 1] := 'r13';
+    avail[High(avail)] := 'r15';
+  end;
+  { the routine's own variables: Self, the parameters, Result, the locals }
+  own := nil;
+  for i := 0 to High(FSym) do
+    if (FSym[i].Name <> '') and (not FSym[i].Global) and (FSym[i].Up = 0) then
+    begin
+      SetLength(own, Length(own) + 1);
+      own[High(own)] := i;
+    end;
+  if Length(own) > Length(avail) then
+    Exit;
+  { where each came in: '' for a local or Result }
+  arrive := nil;
+  SetLength(arrive, Length(own));
+  SetLength(dregs, Length(own));
+  for j := 0 to High(own) do
+  begin
+    arrive[j] := '';
+    dregs[j] := '';
+    nm := FSym[own[j]].Name;
+    ai := -1;
+    if HasSelf(Pr) and SameSym(nm, 'self') then
+      ai := 0
+    else
+      for i := 0 to High(Pr.Params) do
+        if SameSym(nm, Pr.Params[i].Name) then
+          ai := i + Ord(HasSelf(Pr));
+    if ai >= 0 then
+    begin
+      if FArm then
+        arrive[j] := 'x' + IntToStr(ai)
+      else
+        arrive[j] := ArgReg(LongInt(ai));
+    end;
+  end;
+  SetLength(arrive0, Length(own));
+  for j := 0 to High(own) do
+    arrive0[j] := arrive[j];
+  { a parameter that came in one of the registers keeps it, and one that
+    the second emission sets elsewhere (FFlatForce) }
+  for j := 0 to High(own) do
+    if (arrive[j] <> '') and (InFree(arrive[j]) >= 0) then
+    begin
+      dregs[j] := arrive[j];
+      avail[InFree(arrive[j])] := '';
+    end
+    else if (FFlatTry = 1) and (FFlatForce[j] <> '') then
+      dregs[j] := FFlatForce[j];
+  { the second emission's choices for the others (FFlatForce) }
+  if FFlatTry = 1 then
+    for j := 0 to High(own) do
+      if (dregs[j] = '') and (FFlatForce[j] <> '') then
+        dregs[j] := FFlatForce[j];
+  { a register taken so is no more to hand out }
+  for j := 0 to High(own) do
+    if (dregs[j] <> '') and (InFree(dregs[j]) >= 0) then
+      avail[InFree(dregs[j])] := '';
+  { the others by their weight, as a region counts it (PromoScanS: a use
+    eight times a loop level), the heaviest into the registers nothing
+    saves }
+  SetLength(wt, Length(own));
+  FPromo := nil;
+  FFatWritten := nil;
+  if Pr.Body^.Kind = skBlock then
+  begin
+    for i := 0 to High(Pr.Body^.Stmts) do
+      PromoScanS(Pr.Body^.Stmts[i], 1);
+  end
+  else
+    PromoScanS(Pr.Body, 1);
+  for j := 0 to High(own) do
+  begin
+    wt[j] := 0;
+    for i := 0 to High(FPromo) do
+      if (FPromo[i].Part = 0) and (not FPromo[i].Place.Global) and
+        SamePlace(FPromo[i].Place, FSym[own[j]]) then
+        wt[j] := FPromo[i].Refs;
+  end;
+  { a global's part a region would keep, read twice or more: a slice's
+    pointer and length the body does not assign, an arm64 static array's
+    address, Carry's byte (PromoAddPart), in a register too, loaded at the
+    entry as LoadHomePart loads a region's, found by PartReg in FPromo }
+  parts := nil;
+  for i := 0 to High(FPromo) do
+    if (FPromo[i].Part > 0) and (FPromo[i].Part <> 4) and (FPromo[i].Refs >= 2) and
+      (FPromo[i].Place.Global or (FPromo[i].Part = 9)) and
+      ((FPromo[i].Part >= 3) or not InNames(FFatWritten, NormName(FPromo[i].Place.Name))) then
+    begin
+      SetLength(parts, Length(parts) + 1);
+      parts[High(parts)] := FPromo[i];
+      parts[High(parts)].Reg := '';
+    end;
+  FPromo := nil;
+  FFatWritten := nil;
+  k := 0;
+  repeat
+    n := -1;
+    for j := 0 to High(own) do
+      if (dregs[j] = '') and ((n < 0) or (wt[j] > wt[n])) then
+        n := j;
+    if n >= 0 then
+    begin
+      while (k <= High(avail)) and (avail[k] = '') do
+        Inc(k);
+      if k > High(avail) then
+        Exit;
+      dregs[n] := avail[k];
+      avail[k] := '';
+    end;
+  until n < 0;
+  for i := 0 to High(parts) do
+  begin
+    if (FFlatTry = 1) and (i <= High(FFlatParts)) then
+      parts[i].Reg := FFlatParts[i]
+    else
+    begin
+      while (k <= High(avail)) and (avail[k] = '') do
+        Inc(k);
+      if k <= High(avail) then
+      begin
+        parts[i].Reg := avail[k];
+        avail[k] := '';
+      end;
+    end;
+  end;
+  used8 := False;
+  for j := 0 to High(own) do
+    if dregs[j] = 'r8' then
+      used8 := True;
+  for i := 0 to High(parts) do
+    if parts[i].Reg = 'r8' then
+      used8 := True;
+  { the kept registers it takes are pushed: amd64 rbx, r12, r13 and r15;
+    arm64 every x19 to x26, two at a time, sp on 16 (AAPCS64 5.2.2) }
+  pushed := nil;
+  for j := 0 to High(own) do
+    if SavedReg(dregs[j]) then
+    begin
+      SetLength(pushed, Length(pushed) + 1);
+      pushed[High(pushed)] := dregs[j];
+    end;
+  for i := 0 to High(parts) do
+    if SavedReg(parts[i].Reg) then
+    begin
+      SetLength(pushed, Length(pushed) + 1);
+      pushed[High(pushed)] := parts[i].Reg;
+    end;
+  if FArm and inner then
+  begin
+    SetLength(pushed, Length(pushed) + 1);
+    pushed[High(pushed)] := 'x26';
+  end;
+  if FArm and (Length(pushed) mod 2 = 1) then
+  begin
+    SetLength(pushed, Length(pushed) + 1);
+    pushed[High(pushed)] := 'xzr';
+  end;
+  e1 := Lab;
+  Line('  .cfi_startproc');
+  FFlatCfa := 8;
+  if FArm then
+  begin
+    FFlatCfa := 0;
+    i := 0;
+    while i < Length(pushed) do
+    begin
+      Line('  stp ' + pushed[i] + ', ' + pushed[i + 1] + ', [sp, #-16]!');
+      FFlatCfa := FFlatCfa + 16;
+      Line('  .cfi_def_cfa_offset ' + IntToStr(FFlatCfa));
+      Line('  .cfi_offset ' + IntToStr(DwOf(pushed[i])) + ', -' + IntToStr(FFlatCfa));
+      if pushed[i + 1] <> 'xzr' then
+        Line('  .cfi_offset ' + IntToStr(DwOf(pushed[i + 1])) + ', -' + IntToStr(FFlatCfa - 8));
+      i := i + 2;
+    end;
+  end
+  else
+    for i := 0 to High(pushed) do
+    begin
+      Line('  pushq %' + pushed[i]);
+      FFlatCfa := FFlatCfa + 8;
+      Line('  .cfi_def_cfa_offset ' + IntToStr(FFlatCfa));
+      Line('  .cfi_offset %' + pushed[i] + ', -' + IntToStr(FFlatCfa));
+    end;
+  FFlatPad := (not FArm) and (Length(pushed) mod 2 = 0);
+  { the parameters into theirs, none moved before its own register is
+    read: a destination is never a register another parameter came in
+    but its own (r8 and r9 keep theirs) }
+  repeat
+    moved := False;
+    for j := 0 to High(own) do
+      if (arrive[j] <> '') and (arrive[j] <> dregs[j]) then
+      begin
+        ok := True;
+        for i := 0 to High(own) do
+          if (i <> j) and (arrive[i] = dregs[j]) then
+            ok := False;
+        if ok then
+        begin
+          if FArm then
+            Line('  mov ' + dregs[j] + ', ' + arrive[j])
+          else
+            Line('  movq %' + arrive[j] + ', %' + dregs[j]);
+          arrive[j] := dregs[j];
+          moved := True;
+        end;
+      end;
+  until not moved;
+  for j := 0 to High(own) do
+    if (arrive[j] <> '') and (arrive[j] <> dregs[j]) then
+      Die('internal error: a parameter of ' + Pr.Sym + ' with no register');
+  { a local and Result start as zero, but where every path writes them
+    before it reads them (WritesFirst, DaSetup's FDaResKeep: P284) }
+  DaSetup(Pr, 0);
+  for j := 0 to High(own) do
+  begin
+    if arrive[j] <> '' then
+      Continue;
+    if FHasRes and (FSym[own[j]].Off = FResOff) then
+    begin
+      if FDaResKeep then
+        Continue;
+    end
+    else if WritesFirst(Pr.Body, FSym[own[j]].Name, '') then
+      Continue;
+    if FArm then
+      Line('  mov ' + dregs[j] + ', xzr')
+    else
+      Line('  xorl %' + X86Sub(dregs[j], 4) + ', %' + X86Sub(dregs[j], 4));
+  end;
+  { the symbols at their registers, with their DWARF ranges }
+  for j := 0 to High(own) do
+  begin
+    FSym[own[j]].Reg := dregs[j];
+    n := Length(FLocRanges);
+    SetLength(FLocRanges, n + 1);
+    FLocRanges[n].Proc := Pr.Sym;
+    FLocRanges[n].Off := FSym[own[j]].Off;
+    FLocRanges[n].Dw := DwOf(dregs[j]);
+    FLocRanges[n].B := Pr.Sym;
+    FLocRanges[n].E := e1;
+    if FHasRes and (FSym[own[j]].Off = FResOff) then
+      FResReg := dregs[j];
+  end;
+  n := 0;
+  for i := 0 to High(parts) do
+    if parts[i].Reg <> '' then
+      LoadHomePart(parts[i].Place, parts[i].Part, parts[i].Reg);
+  FPromo := nil;
+  for i := 0 to High(parts) do
+    if parts[i].Reg <> '' then
+    begin
+      SetLength(FPromo, Length(FPromo) + 1);
+      FPromo[High(FPromo)] := parts[i];
+    end;
+  FFlat := True;
+  FPromoOn := True;
+  FR8Lent := used8;
+  FChunkSave := 0;
+  if inner then
+  begin
+    if FArm then
+    begin
+      FChunkReg := 'x26';
+      FChunkDw := 26;
+    end
+    else
+    begin
+      FChunkReg := 'r11';
+      FChunkDw := 11;
+    end;
+  end
+  else
+    FChunkReg := '';
+  BoxSetup(Pr);
+  b0 := FLen;
+  EmitStmt(Pr.Body);
+  body := Copy(FOut, b0 + 1, FLen - b0) + FCold;
+  DropJumpTo(FEpi);
+  Line(FEpi + ':');
+  if Pr.IsFunc then
+  begin
+    r := FResReg;
+    if FArm then
+    begin
+      if r <> 'x0' then
+        Line('  mov x0, ' + r);
+    end
+    else if r <> 'rax' then
+      Line('  movq %' + r + ', %rax');
+  end;
+  if Length(pushed) > 0 then
+    Line('  .cfi_remember_state');
+  if FArm then
+  begin
+    i := Length(pushed) - 2;
+    while i >= 0 do
+    begin
+      if pushed[i + 1] = 'xzr' then
+        Line('  ldr ' + pushed[i] + ', [sp], #16')
+      else
+        Line('  ldp ' + pushed[i] + ', ' + pushed[i + 1] + ', [sp], #16');
+      Line('  .cfi_def_cfa_offset ' + IntToStr(8 * i));
+      i := i - 2;
+    end;
+  end
+  else
+    for i := High(pushed) downto 0 do
+    begin
+      Line('  popq %' + pushed[i]);
+      Line('  .cfi_def_cfa_offset ' + IntToStr(8 + 8 * i));
+    end;
+  Line('  ret');
+  if Length(pushed) > 0 then
+    Line('  .cfi_restore_state');
+  coldback := (Pos('  jmp ', FCold) > 0) or (Pos('  b .', FCold) > 0) or (Pos('  b ' , FCold) > 0);
+  ColdFlush(False);
+  Line(e1 + ':');
+  Line('  .cfi_endproc');
+  FFlat := False;
+  FFlatPad := False;
+  FPromo := nil;
+  FPromoOn := False;
+  FR8Lent := False;
+  FChunkReg := '';
+  FResReg := '';
+  for j := 0 to High(own) do
+    FSym[own[j]].Reg := '';
+  { a frame word after all: emitted again with its frame }
+  txt := Copy(FOut, st0 + 1, FLen - st0);
+  { a block out of line that jumps back (a string's append, its call's
+    slow path) would come back with rsp moved and, on arm64, the return
+    address in x30 overwritten: such a routine keeps its frame }
+  if (FScratchMax > sm) or (FCold <> '') or coldback or
+    ((not FArm) and ((Pos('(%rbp)', body) > 0) or (Pos('(%rsp)', body) > 0))) or
+    (FArm and ((Pos('x29', body) > 0) or (Pos('[sp', body) > 0))) or (Pos(FFrameSym, txt) > 0) then
+  begin
+    FLen := st0;
+    FCurLine := cl0;
+    FDbgLine := dl0;
+    SetLength(FLineLabs, nll);
+    SetLength(FLineNums, nll);
+    SetLength(FLocRanges, nlr);
+    FScratchMax := sm;
+    FCold := '';
+    FLastIns := '';
+    FIxOn := False;
+    FChkOn := False;
+    FZeroN := 0;
+    Exit;
+  end;
+  Result := True;
+  { second emission (P296): a variable moves into a register the body
+    and its failures name nowhere and nothing there writes behind the
+    text, one nothing saves: a parameter into its own arrival register,
+    any into rax or x0 (Result then needs no move), rdi, rsi, rdx, rcx
+    and r8, or x0 to x15, but none into another parameter's arrival
+    register (the moves at the entry then have no cycle). The pool and
+    the scratch do not depend on where the variables live; the second
+    body, its new registers renamed to the first's, must be the first
+    body, or the first is emitted again. }
+  if FFlatTry = 0 then
+  begin
+    SetLength(force, Length(own));
+    SetLength(cand, 0);
+    if FArm then
+    begin
+      for i := 0 to 15 do
+        if i <> 9 then
+        begin
+          SetLength(cand, Length(cand) + 1);
+          cand[High(cand)] := 'x' + IntToStr(i);
+        end;
+    end
+    else
+    begin
+      SetLength(cand, 6);
+      cand[0] := 'rax';
+      cand[1] := 'rdi';
+      cand[2] := 'rsi';
+      cand[3] := 'rdx';
+      cand[4] := 'rcx';
+      cand[5] := 'r8';
+    end;
+    changed := False;
+    for j := 0 to High(own) do
+      force[j] := '';
+    { a parameter into its own arrival register }
+    for j := 0 to High(own) do
+      if (arrive0[j] <> '') and (arrive0[j] <> dregs[j]) and not RegNamed(body, arrive0[j]) and
+        not RegTaken(dregs, arrive0[j]) then
+      begin
+        force[j] := arrive0[j];
+        changed := True;
+      end;
+    { Result into rax or x0 }
+    for j := 0 to High(own) do
+      if FHasRes and (FSym[own[j]].Off = FResOff) and (force[j] = '') then
+      begin
+        if FArm then
+          r := 'x0'
+        else
+          r := 'rax';
+        if (not RegNamed(body, r)) and (not RegTaken(dregs, r)) and (not RegTaken(force, r)) and
+          not ArrivesIn(arrive0, r) then
+        begin
+          force[j] := r;
+          changed := True;
+        end;
+      end;
+    { the rest, heaviest first, from a register that needs a save }
+    repeat
+      n := -1;
+      for j := 0 to High(own) do
+        if (force[j] = '') and SavedReg(dregs[j]) and ((n < 0) or (wt[j] > wt[n])) then
+          n := j;
+      if n >= 0 then
+      begin
+        r := '';
+        for i := 0 to High(cand) do
+          if (r = '') and (not RegNamed(body, cand[i])) and (not RegTaken(dregs, cand[i])) and
+            (not RegTaken(force, cand[i])) and not ArrivesIn(arrive0, cand[i]) then
+            r := cand[i];
+        if r = '' then
+          force[n] := '-'
+        else
+        begin
+          force[n] := r;
+          changed := True;
+        end;
+      end;
+    until n < 0;
+    for j := 0 to High(own) do
+      if force[j] = '-' then
+        force[j] := '';
+    if changed then
+    begin
+      body1 := body;
+      SetLength(reg1, Length(own));
+      for j := 0 to High(own) do
+        reg1[j] := dregs[j];
+      FLen := st0;
+      FCurLine := cl0;
+      FDbgLine := dl0;
+      SetLength(FLineLabs, nll);
+      SetLength(FLineNums, nll);
+      SetLength(FLocRanges, nlr);
+      FScratchMax := sm;
+      FLastIns := '';
+      FIxOn := False;
+      FChkOn := False;
+      FZeroN := 0;
+      FFlatForce := force;
+      SetLength(FFlatParts, Length(parts));
+      for i := 0 to High(parts) do
+        FFlatParts[i] := parts[i].Reg;
+      FFlatTry := 1;
+      ok := EmitFlat(Pr);
+      if ok then
+      begin
+        { the second body with its registers named as the first's }
+        body2 := FFlatBody;
+        for j := 0 to High(own) do
+          if FFlatRegs[j] <> reg1[j] then
+            body2 := RenameReg(body2, FFlatRegs[j], '@' + IntToStr(j) + '@');
+        for j := 0 to High(own) do
+          if FFlatRegs[j] <> reg1[j] then
+            body2 := RenameRegTo(body2, '@' + IntToStr(j) + '@', reg1[j]);
+        { the labels of the second count on from the first's }
+        ok := NormLabels(body2) = NormLabels(body1);
+      end;
+      if not ok then
+      begin
+        FLen := st0;
+        FCurLine := cl0;
+        FDbgLine := dl0;
+        SetLength(FLineLabs, nll);
+        SetLength(FLineNums, nll);
+        SetLength(FLocRanges, nlr);
+        FScratchMax := sm;
+        FLastIns := '';
+        FIxOn := False;
+        FChkOn := False;
+        FZeroN := 0;
+        FFlatTry := 2;
+        Result := EmitFlat(Pr);
+      end;
+      FFlatTry := 0;
+      FFlatForce := nil;
+      FFlatParts := nil;
+    end;
+  end;
+  FFlatBody := body;
+  FFlatRegs := dregs;
+end;
+
+{ T with its labels .Ln and .LLn renumbered in the order they first
+  appear, so two emissions of one body compare (P296). }
+function TEmitter.NormLabels(const T: string): string;
+var
+  i, k, n, q: SizeInt;
+  names: TStrArray;
+  id: string;
+begin
+  Result := '';
+  names := nil;
+  n := Length(T);
+  i := 1;
+  while i <= n do
+  begin
+    if (T[i] = '.') and (i < n) and (T[i + 1] = 'L') and ((i = 1) or not (T[i - 1] in ['a'..'z', 'A'..'Z', '0'..'9', '_'])) then
+    begin
+      k := i + 2;
+      while (k <= n) and (T[k] in ['A'..'Z', 'a'..'z', '0'..'9', '_']) do
+        Inc(k);
+      id := Copy(T, i, k - i);
+      q := 0;
+      while (q <= High(names)) and (names[q] <> id) do
+        Inc(q);
+      if q > High(names) then
+      begin
+        SetLength(names, q + 1);
+        names[q] := id;
+      end;
+      Result := Result + '.L#' + IntToStr(q);
+      i := k;
+      Continue;
+    end;
+    Result := Result + T[i];
+    Inc(i);
+  end;
+end;
+
+{ The registers of L include R (P296). }
+function TEmitter.RegTaken(const L: TStrArray; const R: string): Boolean;
+var
+  i: SizeInt;
+begin
+  Result := False;
+  for i := 0 to High(L) do
+    if L[i] = R then
+      Result := True;
+end;
+
+{ R is one a parameter came in (P296). }
+function TEmitter.ArrivesIn(const L: TStrArray; const R: string): Boolean;
+begin
+  Result := RegTaken(L, R);
+end;
+
+{ R needs a save: amd64 rbx, r12, r13, r15; arm64 x19 and up (P296). }
+function TEmitter.SavedReg(const R: string): Boolean;
+begin
+  if FArm then
+    Result := (Length(R) = 3) and (R[1] = 'x') and ((R[2] = '1') or (R[2] = '2')) and
+      (((R[2] = '1') and (R[3] = '9')) or (R[2] = '2'))
+  else
+    Result := (R = 'rbx') or (R = 'r12') or (R = 'r13') or (R = 'r15');
+end;
+
+{ The text T names R on either machine (P296): NamesReg on amd64; on
+  arm64 xN or wN as a word, or a string instruction or a call that
+  returns does not count (none is left). }
+function TEmitter.RegNamed(const T, R: string): Boolean;
+var
+  i, n, k: SizeInt;
+  num: string;
+begin
+  if not FArm then
+  begin
+    Result := NamesReg(T, R);
+    Exit;
+  end;
+  Result := True;
+  num := Copy(R, 2, Length(R) - 1);
+  n := Length(T);
+  i := 1;
+  while i <= n do
+  begin
+    if ((T[i] = 'x') or (T[i] = 'w')) and ((i = 1) or not (T[i - 1] in ['a'..'z', 'A'..'Z', '0'..'9', '_', '.'])) then
+    begin
+      k := i + 1;
+      while (k <= n) and (T[k] >= '0') and (T[k] <= '9') do
+        Inc(k);
+      if (k > i + 1) and (Copy(T, i + 1, k - i - 1) = num) and
+        ((k > n) or not (T[k] in ['a'..'z', 'A'..'Z', '0'..'9', '_'])) then
+        Exit;
+      i := k;
+    end
+    else
+      Inc(i);
+  end;
+  Result := False;
+end;
+
+{ T with register R renamed to the marker M at every width (P296). }
+function TEmitter.RenameReg(const T, R, M: string): string;
+var
+  i, n, k, w: SizeInt;
+  num, id: string;
+begin
+  Result := '';
+  n := Length(T);
+  i := 1;
+  if FArm then
+  begin
+    num := Copy(R, 2, Length(R) - 1);
+    while i <= n do
+    begin
+      if ((T[i] = 'x') or (T[i] = 'w')) and ((i = 1) or not (T[i - 1] in ['a'..'z', 'A'..'Z', '0'..'9', '_', '.'])) then
+      begin
+        k := i + 1;
+        while (k <= n) and (T[k] >= '0') and (T[k] <= '9') do
+          Inc(k);
+        if (k > i + 1) and (Copy(T, i + 1, k - i - 1) = num) and
+          ((k > n) or not (T[k] in ['a'..'z', 'A'..'Z', '0'..'9', '_'])) then
+        begin
+          Result := Result + T[i] + M;
+          i := k;
+          Continue;
+        end;
+      end;
+      Result := Result + T[i];
+      Inc(i);
+    end;
+    Exit;
+  end;
+  while i <= n do
+  begin
+    if T[i] = '%' then
+    begin
+      k := i + 1;
+      while (k <= n) and (T[k] in ['a'..'z', '0'..'9']) do
+        Inc(k);
+      id := Copy(T, i + 1, k - i - 1);
+      w := 0;
+      if id = R then
+        w := 8
+      else if id = X86Sub(R, 4) then
+        w := 4
+      else if id = X86Sub(R, 2) then
+        w := 2
+      else if id = X86Sub(R, 1) then
+        w := 1;
+      if w > 0 then
+      begin
+        Result := Result + '%' + M + IntToStr(w);
+        i := k;
+        Continue;
+      end;
+    end;
+    Result := Result + T[i];
+    Inc(i);
+  end;
+end;
+
+{ T with the marker M back as register R at the width it marks (P296). }
+function TEmitter.RenameRegTo(const T, M, R: string): string;
+var
+  i, n, w: SizeInt;
+begin
+  Result := '';
+  n := Length(T);
+  i := 1;
+  while i <= n do
+  begin
+    if Copy(T, i, Length(M)) = M then
+    begin
+      if FArm then
+      begin
+        Result := Result + Copy(R, 2, Length(R) - 1);
+        i := i + Length(M);
+      end
+      else
+      begin
+        w := Ord(T[i + Length(M)]) - Ord('0');
+        Result := Result + X86Sub(R, w);
+        i := i + Length(M) + 1;
+      end;
+      Continue;
+    end;
+    Result := Result + T[i];
+    Inc(i);
+  end;
+end;
+
+{ The text T names register R (amd64) at any width, or writes it behind
+  its text: cqto, cltq, a division or a one-operand multiply rdx (and
+  rax), a string instruction rcx, rsi and rdi, a syscall rcx (P296). }
+function TEmitter.NamesReg(const T, R: string): Boolean;
+var
+  i: SizeInt;
+  w: TStrArray;
+  sfx: string;
+begin
+  Result := True;
+  w := nil;
+  SetLength(w, 4);
+  w[0] := '%' + R;
+  w[1] := '%' + X86Sub(R, 4);
+  w[2] := '%' + X86Sub(R, 2);
+  w[3] := '%' + X86Sub(R, 1);
+  for i := 0 to 3 do
+    if Pos(w[i], T) > 0 then
+      Exit;
+  if ((R = 'rdx') or (R = 'rax')) and ((Pos('cqto', T) > 0) or (Pos('cltd', T) > 0) or (Pos('div', T) > 0) or
+    (Pos('mulq %', T) > 0) or (Pos('imulq %', T) > 0) or (Pos('rdtsc', T) > 0) or (Pos('cpuid', T) > 0)) then
+    Exit;
+  if ((R = 'rcx') or (R = 'rsi') or (R = 'rdi') or (R = 'rax')) and ((Pos('rep', T) > 0) or
+    (Pos('syscall', T) > 0)) then
+    Exit;
+  if (R = 'rax') and ((Pos('cltq', T) > 0) or (Pos('cwtl', T) > 0) or (Pos('cbtw', T) > 0) or
+    (Pos('cmpxchg', T) > 0)) then
+    Exit;
+  { a string instruction stands alone on its line }
+  sfx := 'bwlq';
+  for i := 1 to 4 do
+    if (Pos('  movs' + sfx[i] + Char(10), T) > 0) or
+      (Pos('  stos' + sfx[i] + Char(10), T) > 0) or
+      (Pos('  lods' + sfx[i] + Char(10), T) > 0) or
+      (Pos('  cmps' + sfx[i] + Char(10), T) > 0) or
+      (Pos('  scas' + sfx[i] + Char(10), T) > 0) then
+      if (R = 'rcx') or (R = 'rsi') or (R = 'rdi') or (R = 'rax') then
+        Exit;
+  Result := False;
+end;
+
 { S has an asm statement somewhere: its text may call (P288). }
 function TEmitter.HasAsm(S: PStmt): Boolean;
 var
@@ -30849,7 +31807,7 @@ var
   savedTD: array of LongInt;
   savedTR: array of Boolean;
   loc0, loc1: SizeInt;
-  leaf: Boolean;
+  leaf, flat: Boolean;
   lst: PStmt;
   ck0, ck1, ms0: SizeInt;
   savedSel: PStmt;
@@ -31100,11 +32058,15 @@ begin
   ck0 := FLen;
   ms0 := Length(FMapSites);
   FAsyncFrom := '';
-  if (not sysw) and not leaf then
+  { a routine that calls nothing, every variable in a register and no
+    frame (P296) }
+  flat := (not sysw) and (not leaf) and FlatProc(Pr) and EmitFlat(Pr);
+  if (not sysw) and (not leaf) and (not flat) then
     EmitStackCheck(Pr.Sym, FFrameSym);
   ck1 := FLen;
   if leaf then
     EmitLeaf(Pr, lst)
+  else if flat then
   else if FArm then
   begin
     Line('  .cfi_startproc');
@@ -31267,7 +32229,7 @@ begin
     no check of its own, as Go makes a leaf under StackSmall NOSPLIT
     (cmd/internal/obj/x86/obj6.go, preprocess). The check's text goes,
     and its site. Not an asm statement's body, whose text may call. }
-  if (not sysw) and (not leaf) and (Length(FMapSites) = ms0 + 1) and
+  if (not sysw) and (not leaf) and (not flat) and (Length(FMapSites) = ms0 + 1) and
     (FMapSites[ms0].Kind = 1) and
     (((LongInt(slot) + FScratchMax + 15) and (-16)) <= 1024) and
     not HasAsm(Pr.Body) then

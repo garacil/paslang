@@ -376,6 +376,9 @@ GOLDEN_A64 += movconst
 # P322: an and compared with 0 is one test of its source.
 GOLDEN += andtest
 GOLDEN_A64 += andtest
+# P296: a routine that calls nothing keeps its variables in registers, no frame.
+GOLDEN += flatproc
+GOLDEN_A64 += flatproc
 # P333: an exec and a new thread do not race (amd64: qemu-user does not
 # execve an arm64 program, so arm64 reads the runtime's forms).
 GOLDEN += execrace
@@ -1158,6 +1161,15 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q '^.1 = 2$$' $(BUILDDIR)/leafgdb.gdb; \
 	grep -q '^.2 = 3$$' $(BUILDDIR)/leafgdb.gdb; \
 	grep -q '^.3 = 4$$' $(BUILDDIR)/leafgdb.gdb; \
+	: a routine with no frame keeps its parameters and locals in registers, and the debugger reads them there, P296; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/flatgdb testdata/flatproc.paslang; \
+	gdb -batch -nx -ex 'set debuginfod enabled off' -ex 'break flatproc.paslang:32' \
+	  -ex 'run > /dev/null' -ex 'print X' -ex 'print Lo' -ex 'print Hi' -ex 'print r' -ex kill \
+	  $(BUILDDIR)/flatgdb > $(BUILDDIR)/flatgdb.gdb 2>&1; \
+	grep -q '^.1 = 5$$' $(BUILDDIR)/flatgdb.gdb; \
+	grep -q '^.2 = 1$$' $(BUILDDIR)/flatgdb.gdb; \
+	grep -q '^.3 = 9$$' $(BUILDDIR)/flatgdb.gdb; \
+	grep -q '^.4 = 5$$' $(BUILDDIR)/flatgdb.gdb; \
 	echo ok dwarf; \
 	grep -q 'cmpq 16(%r14)' $(BUILDDIR)/opt.s; \
 	grep -A30 '^pas_main:' $(BUILDDIR)/opt.s | grep -q 'call rt_morestack'; \
@@ -2342,11 +2354,11 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 $(BUILDDIR)/slicefront nomem > $(BUILDDIR)/slicefront-gc.got; \
 	grep -v '20000 slices' testdata/slicefront.out | diff -u - $(BUILDDIR)/slicefront-gc.got; \
 	echo ok slicefront-gc; \
-	: a leaf has no stack check and no frame, a routine that calls nothing keeps its frame with no check, one that calls keeps both, P288; \
+	: a leaf has no stack check and no frame, P288, nor a routine that calls nothing, P296, one that calls keeps both; \
 	for f in twice thrice mix rot big three same konst tshape_area tshape_areak tshape_link; do \
 	  if awk "/^p_$$f:/,/cfi_endproc/" $(BUILDDIR)/leafcall.s | grep -q 'cmpq 16(%r14)\|pushq %rbp'; then echo "leafcall.s: $$f has a stack check or a frame"; exit 1; fi; \
 	done; \
-	awk '/^p_clamp:/,/cfi_endproc/' $(BUILDDIR)/leafcall.s | grep -q 'pushq %rbp' || { echo "leafcall.s: Clamp has no frame"; exit 1; }; \
+	if awk '/^p_clamp:/,/cfi_endproc/' $(BUILDDIR)/leafcall.s | grep -q 'pushq %rbp'; then echo "leafcall.s: Clamp has a frame"; exit 1; fi; \
 	if awk '/^p_clamp:/,/cfi_endproc/' $(BUILDDIR)/leafcall.s | grep -q 'cmpq 16(%r14)'; then echo "leafcall.s: Clamp has a stack check"; exit 1; fi; \
 	awk '/^p_worker:/,/cfi_endproc/' $(BUILDDIR)/leafcall.s | grep -q 'cmpq 16(%r14)' || { echo "leafcall.s: Worker has no stack check"; exit 1; }; \
 	echo ok leafcall-asm; \
@@ -2400,7 +2412,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/ptrwalk.out $(BUILDDIR)/ptrwalk-gc.got; \
 	for f in widths last zeros spell; do \
 	  awk "/^p_$$f:/,/cfi_endproc/" $(BUILDDIR)/ptrwalk.s > $(BUILDDIR)/ptrwalk-$$f.s; \
-	  grep -qE '^  testq %(r9, %r9|r10, %r10|r11, %r11|rbx, %rbx|r12, %r12|r13, %r13|r15, %r15)$$' $(BUILDDIR)/ptrwalk-$$f.s || { echo "ptrwalk.s: $$f does not test its pointer in its register"; exit 1; }; \
+	  grep -qE '^  testq %([a-z0-9]+), %\1$$' $(BUILDDIR)/ptrwalk-$$f.s || { echo "ptrwalk.s: $$f does not test its pointer in its register"; exit 1; }; \
 	  if grep -qE 'cmpq \$$0, %' $(BUILDDIR)/ptrwalk-$$f.s; then echo "ptrwalk.s: $$f compares a register with 0"; exit 1; fi; \
 	done; \
 	echo ok ptrwalk-asm; \
@@ -2509,11 +2521,11 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	python3 -I scripts/check_regassign.py $(BUILDDIR)/regassign0.s; \
 	echo ok regassign-asm; \
 	: a run head proving a slice by its length in a register or at its home, P319: runlen with and without inlining, the free bodies checking none; \
-	python3 -I scripts/check_chkcse.py $(BUILDDIR)/runlen.s sum5:5,mix5:5,back:4,local5:10; \
+	python3 -I scripts/check_chkcse.py $(BUILDDIR)/runlen.s sum5:5,mix5:6,back:4,local5:10; \
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/runlen0 testdata/runlen.paslang; \
 	$(BUILDDIR)/runlen0 > $(BUILDDIR)/runlen0.got; \
 	diff -u testdata/runlen.out $(BUILDDIR)/runlen0.got; \
-	python3 -I scripts/check_chkcse.py $(BUILDDIR)/runlen0.s sum5:5,mix5:5,back:4,local5:10; \
+	python3 -I scripts/check_chkcse.py $(BUILDDIR)/runlen0.s sum5:5,mix5:6,back:4,local5:10; \
 	echo ok runlen-asm; \
 	: an and with a mask of 8, 16 or 32 bits as a zero extension from its source, P320: andmask with and without inlining, no AND of a mask in its routines; \
 	python3 -I scripts/check_andmask.py $(BUILDDIR)/andmask.s; \
@@ -2536,6 +2548,13 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/andtest.out $(BUILDDIR)/andtest0.got; \
 	python3 -I scripts/check_andtest.py $(BUILDDIR)/andtest0.s; \
 	echo ok andtest-asm; \
+	: a routine that calls nothing with its variables in registers and no frame, P296: flatproc with and without inlining; \
+	python3 -I scripts/check_flatproc.py $(BUILDDIR)/flatproc.s --clamp=7; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/flatproc0 testdata/flatproc.paslang; \
+	$(BUILDDIR)/flatproc0 > $(BUILDDIR)/flatproc0.got; \
+	diff -u testdata/flatproc.out $(BUILDDIR)/flatproc0.got; \
+	python3 -I scripts/check_flatproc.py $(BUILDDIR)/flatproc0.s --clamp=7; \
+	echo ok flatproc-asm; \
 	: the exec lock around a new thread and an execve, clone again on EAGAIN, P333: the runtime in execrace; \
 	python3 -I scripts/check_execlock.py $(BUILDDIR)/execrace.s; \
 	echo ok execlock-asm; \
@@ -3361,7 +3380,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'paslang: unlock of an unlocked mutex' $(BUILDDIR)/unlockfree.err; \
 	echo ok unlockfree; \
 	echo "==== fatal ===="; \
-	for t in divzero nilptr deep oom oomlimit closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg leafnil bmaskwide bmodneg bmaskone bforpast bvarctr bnestctr bsumstat bsumdyn bsumneg bkeepfirst bkeepmoved bkeepstat bkeepshrunk brunlen brunloc; do \
+	for t in divzero nilptr deep oom oomlimit closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg leafnil bmaskwide bmodneg bmaskone bforpast bvarctr bnestctr bsumstat bsumdyn bsumneg bkeepfirst bkeepmoved bkeepstat bkeepshrunk brunlen brunloc bflatidx bflatpush; do \
 	  $(OUTDIR)/paslangc -o $(BUILDDIR)/fatal_$$t testdata/fatal/$$t.paslang; \
 	  set +e; \
 	  if [ $$t = oomlimit ]; then \
@@ -3394,6 +3413,9 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	: P319: a run that does not fit a slice proved by its length at home runs the checked body, which reports the index; \
 	grep -q 'paslang: index 30 out of range \[0..29\] at line 15' $(BUILDDIR)/fatal_brunlen.err; \
 	grep -q 'paslang: index 1500 out of range \[0..1499\] at line 17' $(BUILDDIR)/fatal_brunloc.err; \
+	: P296: an index past its array in a routine with no frame, nothing pushed or a register pushed, reports it; \
+	grep -q 'paslang: index 10 out of range \[0..9\] at line 11' $(BUILDDIR)/fatal_bflatidx.err; \
+	grep -q 'paslang: index -1 out of range \[0..9\] at line 14' $(BUILDDIR)/fatal_bflatpush.err; \
 	grep -q 'paslang: stack overflow at line 12' $(BUILDDIR)/fatal_deep.err; \
 	grep -q 'paslang: out of memory: [0-9][0-9]* MiB mapped' $(BUILDDIR)/fatal_oom.err; \
 	grep -q 'paslang: out of memory: [0-9][0-9]* MiB mapped' $(BUILDDIR)/fatal_oomlimit.err; \
@@ -3579,7 +3601,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	for f in twice thrice mix rot big three same konst tshape_area tshape_areak tshape_link; do \
 	  if awk "/^p_$$f:/,/cfi_endproc/" $(BUILDDIR)/leafcall-arm.s | grep -q 'x28, #16\|stp x29, x30'; then echo "leafcall-arm.s: $$f has a stack check or a frame"; exit 1; fi; \
 	done; \
-	awk '/^p_clamp:/,/cfi_endproc/' $(BUILDDIR)/leafcall-arm.s | grep -q 'stp x29, x30' || { echo "leafcall-arm.s: Clamp has no frame"; exit 1; }; \
+	if awk '/^p_clamp:/,/cfi_endproc/' $(BUILDDIR)/leafcall-arm.s | grep -q 'stp x29, x30'; then echo "leafcall-arm.s: Clamp has a frame"; exit 1; fi; \
 	if awk '/^p_clamp:/,/cfi_endproc/' $(BUILDDIR)/leafcall-arm.s | grep -q 'x28, #16'; then echo "leafcall-arm.s: Clamp has a stack check"; exit 1; fi; \
 	awk '/^p_worker:/,/cfi_endproc/' $(BUILDDIR)/leafcall-arm.s | grep -q 'x28, #16' || { echo "leafcall-arm.s: Worker has no stack check"; exit 1; }; \
 	echo ok leafcall-arm-asm; \
@@ -3591,12 +3613,12 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	awk '/^p_digits:/,/cfi_endproc/' $(BUILDDIR)/armregs-arm.s > $(BUILDDIR)/armregs-digits-arm.s; \
 	grep -qE 'ldrb w(19|2[0-8]), \[x(19|2[0-8]), x(19|2[0-8])' $(BUILDDIR)/armregs-digits-arm.s || { echo "armregs-arm.s: Digits does not load into its variable"; exit 1; }; \
 	grep -qE 'sub x[0-9]+, x(19|2[0-8]), #48$$' $(BUILDDIR)/armregs-digits-arm.s || { echo "armregs-arm.s: Digits copies b before its range test (P290, P292)"; exit 1; }; \
-	grep -qE 'add (x(19|2[0-8])), \1, #1$$' $(BUILDDIR)/armregs-digits-arm.s || { echo "armregs-arm.s: Digits does not step k in place"; exit 1; }; \
+	grep -qE 'add (x[0-9]+), \1, #1$$' $(BUILDDIR)/armregs-digits-arm.s || { echo "armregs-arm.s: Digits does not step k in place"; exit 1; }; \
 	if awk '/p2align 5/{l=1} l{print} l&&/csel x26/{exit}' $(BUILDDIR)/armregs-digits-arm.s | grep -qE 'mov x[01], x(19|2[0-8])$$'; then echo "armregs-arm.s: the loop of Digits copies a kept register into x0 or x1"; exit 1; fi; \
 	if awk '/p2align 5/{l=1} l{print} l&&/csel x26/{exit}' $(BUILDDIR)/armregs-digits-arm.s | grep -q 'x28, #16'; then echo "armregs-arm.s: the loop of Digits tests the guard (P293)"; exit 1; fi; \
-	awk '/^p_imms:/,/cfi_endproc/' $(BUILDDIR)/armregs-arm.s | grep -qE 'sub x(19|2[0-8]), x(19|2[0-8]), #1, lsl #12' || { echo "armregs-arm.s: Imms does not take 4096 as an immediate"; exit 1; }; \
-	awk '/^p_cmps:/,/cfi_endproc/' $(BUILDDIR)/armregs-arm.s | grep -qE 'cmn x(19|2[0-8]), #4095' || { echo "armregs-arm.s: Cmps does not compare -4095 with cmn"; exit 1; }; \
-	awk '/^p_loads:/,/cfi_endproc/' $(BUILDDIR)/armregs-arm.s | grep -qE 'and x[0-9]+, x(19|2[0-8]), #0x0*3f' || { echo "armregs-arm.s: Loads does not mask i where it lives"; exit 1; }; \
+	awk '/^p_imms:/,/cfi_endproc/' $(BUILDDIR)/armregs-arm.s | grep -qE 'sub x[0-9]+, x[0-9]+, #1, lsl #12' || { echo "armregs-arm.s: Imms does not take 4096 as an immediate"; exit 1; }; \
+	awk '/^p_cmps:/,/cfi_endproc/' $(BUILDDIR)/armregs-arm.s | grep -qE 'cmn x[0-9]+, #4095' || { echo "armregs-arm.s: Cmps does not compare -4095 with cmn"; exit 1; }; \
+	awk '/^p_loads:/,/cfi_endproc/' $(BUILDDIR)/armregs-arm.s | grep -qE 'and x[0-9]+, x[0-9]+, #0x0*3f' || { echo "armregs-arm.s: Loads does not mask i where it lives"; exit 1; }; \
 	echo ok armregs-arm-asm; \
 	if awk '/^p_near:/,/cfi_endproc/' $(BUILDDIR)/framefield-arm.s | grep -qE 'sub x(9|1[0-7]), x29'; then echo "framefield-arm.s: Near forms its record's address for its fields"; exit 1; fi; \
 	echo ok framefield-arm-asm; \
@@ -3622,11 +3644,11 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	test $$(awk '/^p_loop:/,/cfi_endproc/' $(BUILDDIR)/leaform-arm.s | grep -cE 'add x(19|2[0-6]), x(19|2[0-6]), x(19|2[0-6]), lsl #[123]') -eq 4 || { echo "leaform-arm.s: the loop of Loop has not four adds with a shift"; exit 1; }; \
 	if awk '/^p_loop:/,/cfi_endproc/' $(BUILDDIR)/leaform-arm.s | grep -q 'mul '; then echo "leaform-arm.s: Loop multiplies"; exit 1; fi; \
 	awk '/^p_back:/,/cfi_endproc/' $(BUILDDIR)/leaform-arm.s > $(BUILDDIR)/leaform-back-arm.s; \
-	test $$(grep -cE 'ldr x[0-9]+, \[x(9|1[0-5]), #-(8|16)\]' $(BUILDDIR)/leaform-back-arm.s) -eq 2 || { echo "leaform-arm.s: Back does not load at p - 8 and p - 16"; exit 1; }; \
+	test $$(grep -cE 'ldr x[0-9]+, \[x[0-9]+, #-(8|16)\]' $(BUILDDIR)/leaform-back-arm.s) -eq 2 || { echo "leaform-arm.s: Back does not load at p - 8 and p - 16"; exit 1; }; \
 	if grep -qE 'sub x[0-9]+, x[0-9]+, #(8|16)$$' $(BUILDDIR)/leaform-back-arm.s; then echo "leaform-arm.s: Back subtracts before it loads"; exit 1; fi; \
 	awk '/^p_far:/,/cfi_endproc/' $(BUILDDIR)/leaform-arm.s > $(BUILDDIR)/leaform-far-arm.s; \
-	grep -qE '\[x(9|1[0-5]), #-256\]' $(BUILDDIR)/leaform-far-arm.s || { echo "leaform-arm.s: Far does not load at p - 256"; exit 1; }; \
-	grep -qE 'sub x(9|1[0-5]), x(9|1[0-5]), #264$$' $(BUILDDIR)/leaform-far-arm.s || { echo "leaform-arm.s: Far folds p - 264, past LDUR"; exit 1; }; \
+	grep -qE '\[x[0-9]+, #-256\]' $(BUILDDIR)/leaform-far-arm.s || { echo "leaform-arm.s: Far does not load at p - 256"; exit 1; }; \
+	grep -qE 'sub x[0-9]+, x[0-9]+, #264$$' $(BUILDDIR)/leaform-far-arm.s || { echo "leaform-arm.s: Far folds p - 264, past LDUR"; exit 1; }; \
 	awk '/^p_idx:/,/cfi_endproc/' $(BUILDDIR)/leaform-arm.s | grep -qE 'ldr x[0-9]+, \[x[0-9]+, x[0-9]+, lsl #3\]' || { echo "leaform-arm.s: Idx does not index the load"; exit 1; }; \
 	echo ok leaform-arm-asm; \
 	python3 -I scripts/check_cold.py $(BUILDDIR)/coldfail-arm.s 40 boundsfail,divzero,sqrtneg,realrange,bitfail,setfail,funnelfail,asfail,strappendc,strunique,fillbig; \
@@ -3639,7 +3661,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	diff -u testdata/ptrwalk.out $(BUILDDIR)/ptrwalk-arm-gc.got; \
 	for f in widths last zeros spell; do \
 	  awk "/^p_$$f:/,/cfi_endproc/" $(BUILDDIR)/ptrwalk-arm.s > $(BUILDDIR)/ptrwalk-$$f-arm.s; \
-	  grep -qE '^  cbnz x(19|2[0-6]), ' $(BUILDDIR)/ptrwalk-$$f-arm.s || { echo "ptrwalk-arm.s: $$f does not test its pointer with cbnz"; exit 1; }; \
+	  grep -qE '^  cbnz x[0-9]+, ' $(BUILDDIR)/ptrwalk-$$f-arm.s || { echo "ptrwalk-arm.s: $$f does not test its pointer with cbnz"; exit 1; }; \
 	  if grep -qE '^  mov x(9|1[0-5]), x(19|2[0-6])$$' $(BUILDDIR)/ptrwalk-$$f-arm.s; then echo "ptrwalk-arm.s: $$f copies a register variable into the pool"; exit 1; fi; \
 	  if grep -q 'mov x17, #0$$' $(BUILDDIR)/ptrwalk-$$f-arm.s; then echo "ptrwalk-arm.s: $$f compares with a register of zero"; exit 1; fi; \
 	done; \
@@ -3761,11 +3783,11 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	python3 -I scripts/check_regassign.py $(BUILDDIR)/regassign0-arm.s --arm; \
 	echo ok regassign-arm-asm; \
 	: P319 on arm64: runlen with and without inlining, the free bodies checking none; \
-	python3 -I scripts/check_chkcse.py $(BUILDDIR)/runlen-arm.s sum5:5,mix5:5,back:4,local5:10; \
+	python3 -I scripts/check_chkcse.py $(BUILDDIR)/runlen-arm.s sum5:5,mix5:6,back:4,local5:10; \
 	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/runlen0-arm testdata/runlen.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/runlen0-arm > $(BUILDDIR)/runlen0-arm.got; \
 	diff -u testdata/runlen.out $(BUILDDIR)/runlen0-arm.got; \
-	python3 -I scripts/check_chkcse.py $(BUILDDIR)/runlen0-arm.s sum5:5,mix5:5,back:4,local5:10; \
+	python3 -I scripts/check_chkcse.py $(BUILDDIR)/runlen0-arm.s sum5:5,mix5:6,back:4,local5:10; \
 	echo ok runlen-arm-asm; \
 	: P320 on arm64: andmask with and without inlining, no AND of a mask in its routines; \
 	python3 -I scripts/check_andmask.py $(BUILDDIR)/andmask-arm.s --arm; \
@@ -3781,6 +3803,13 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	diff -u testdata/andtest.out $(BUILDDIR)/andtest0-arm.got; \
 	python3 -I scripts/check_andtest.py $(BUILDDIR)/andtest0-arm.s --arm --tbz=38; \
 	echo ok andtest-arm-asm; \
+	: P296 on arm64: flatproc with and without inlining, no frame and no saved link register; \
+	python3 -I scripts/check_flatproc.py $(BUILDDIR)/flatproc-arm.s --arm --clamp=8; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/flatproc0-arm testdata/flatproc.paslang; \
+	timeout 300 $(QEMU_A64) $(BUILDDIR)/flatproc0-arm > $(BUILDDIR)/flatproc0-arm.got; \
+	diff -u testdata/flatproc.out $(BUILDDIR)/flatproc0-arm.got; \
+	python3 -I scripts/check_flatproc.py $(BUILDDIR)/flatproc0-arm.s --arm --clamp=8; \
+	echo ok flatproc-arm-asm; \
 	: P333 on arm64: the runtime of execrace, the exec lock around a new thread and an execve; \
 	$(OUTDIR)/paslangc -target arm64 -cpu max -Fu $(A64DIR) -o $(BUILDDIR)/execrace-arm testdata/execrace.paslang; \
 	python3 -I scripts/check_execlock.py $(BUILDDIR)/execrace-arm.s --arm; \
@@ -4010,7 +4039,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	grep -q 'paslang: unlock of an unlocked mutex' $(BUILDDIR)/unlockfree-arm.err; \
 	echo ok unlockfree-arm; \
 	echo "==== fatal arm64 ===="; \
-	for t in divzero nilptr deep oom closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg leafnil bmaskwide bmodneg bmaskone bforpast bvarctr bnestctr bsumstat bsumdyn bsumneg bkeepfirst bkeepmoved bkeepstat bkeepshrunk brunlen brunloc; do \
+	for t in divzero nilptr deep oom closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg leafnil bmaskwide bmodneg bmaskone bforpast bvarctr bnestctr bsumstat bsumdyn bsumneg bkeepfirst bkeepmoved bkeepstat bkeepshrunk brunlen brunloc bflatidx bflatpush; do \
 	  $(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/fatal_$$t-arm testdata/fatal/$$t.paslang; \
 	  set +e; timeout 60 $(QEMU_A64) $(BUILDDIR)/fatal_$$t-arm > $(BUILDDIR)/fatal_$$t-arm.got 2> $(BUILDDIR)/fatal_$$t-arm.err; rc=$$?; set -e; \
 	  test $$rc -eq 1; \
@@ -4034,6 +4063,8 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	grep -q 'paslang: index 3 out of range \[0..2\] at line 15' $(BUILDDIR)/fatal_bkeepshrunk-arm.err; \
 	grep -q 'paslang: index 30 out of range \[0..29\] at line 15' $(BUILDDIR)/fatal_brunlen-arm.err; \
 	grep -q 'paslang: index 1500 out of range \[0..1499\] at line 17' $(BUILDDIR)/fatal_brunloc-arm.err; \
+	grep -q 'paslang: index 10 out of range \[0..9\] at line 11' $(BUILDDIR)/fatal_bflatidx-arm.err; \
+	grep -q 'paslang: index -1 out of range \[0..9\] at line 14' $(BUILDDIR)/fatal_bflatpush-arm.err; \
 	grep -q 'paslang: stack overflow at line 12' $(BUILDDIR)/fatal_deep-arm.err; \
 	grep -q 'paslang: out of memory: [0-9][0-9]* MiB mapped' $(BUILDDIR)/fatal_oom-arm.err; \
 	grep -q 'paslang: send on closed channel at line 11' $(BUILDDIR)/fatal_closed-arm.err; \
