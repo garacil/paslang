@@ -3817,8 +3817,9 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	diff -u testdata/mapsplit.out $(BUILDDIR)/mapsplit-arm.got; \
 	echo ok collector-arm; \
 	echo "==== stack maps arm64 ===="; \
+	: store1 under the stress of the collector takes 400 s of qemu on a machine half loaded and 1800 lets a loaded one finish it, P335; \
 	for t in $(GOLDEN_A64); do \
-	  PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=3 PASLANG_GCPOISON=1 timeout 600 $(QEMU_A64) $(BUILDDIR)/$$t-arm > $(BUILDDIR)/$$t-arm.vgot; \
+	  PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=3 PASLANG_GCPOISON=1 timeout 1800 $(QEMU_A64) $(BUILDDIR)/$$t-arm > $(BUILDDIR)/$$t-arm.vgot; \
 	  diff -u testdata/$$t.out $(BUILDDIR)/$$t-arm.vgot; \
 	done; \
 	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 timeout 600 $(QEMU_A64) $(BUILDDIR)/stackmap-arm > $(BUILDDIR)/stackmap-arm.vgot; \
