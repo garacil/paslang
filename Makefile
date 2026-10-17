@@ -361,6 +361,9 @@ GOLDEN_A64 += chkcse
 # P317: a product inside a conversion reads its variable in its register.
 GOLDEN += convmul
 GOLDEN_A64 += convmul
+# P318: a variable a register keeps is assigned there, a narrow one read there.
+GOLDEN += regassign
+GOLDEN_A64 += regassign
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -2443,6 +2446,13 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/convmul.out $(BUILDDIR)/convmul0.got; \
 	python3 -I scripts/check_convmul.py $(BUILDDIR)/convmul0.s; \
 	echo ok convmul-asm; \
+	: a variable a register keeps assigned in its register and a narrow one read in place, P318: regassign with and without inlining, no value moved into a variable and none through rax in its loops; \
+	python3 -I scripts/check_regassign.py $(BUILDDIR)/regassign.s; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/regassign0 testdata/regassign.paslang; \
+	$(BUILDDIR)/regassign0 > $(BUILDDIR)/regassign0.got; \
+	diff -u testdata/regassign.out $(BUILDDIR)/regassign0.got; \
+	python3 -I scripts/check_regassign.py $(BUILDDIR)/regassign0.s; \
+	echo ok regassign-asm; \
 	: every loop of an asm kernel of the units starts aligned, as the loops paslangc compiles, P302; \
 	python3 -I scripts/check_kernel_align.py src/lib/*.paslang src/rtl/*.paslang; \
 	echo ok kernel-align; \
@@ -3640,6 +3650,13 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	diff -u testdata/convmul.out $(BUILDDIR)/convmul0-arm.got; \
 	python3 -I scripts/check_convmul.py $(BUILDDIR)/convmul0-arm.s --arm; \
 	echo ok convmul-arm-asm; \
+	: P318 on arm64: regassign with and without inlining, no value moved into a variable and none through x17 in its loops; \
+	python3 -I scripts/check_regassign.py $(BUILDDIR)/regassign-arm.s --arm; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/regassign0-arm testdata/regassign.paslang; \
+	timeout 300 $(QEMU_A64) $(BUILDDIR)/regassign0-arm > $(BUILDDIR)/regassign0-arm.got; \
+	diff -u testdata/regassign.out $(BUILDDIR)/regassign0-arm.got; \
+	python3 -I scripts/check_regassign.py $(BUILDDIR)/regassign0-arm.s --arm; \
+	echo ok regassign-arm-asm; \
 	$(OUTDIR)/paslangc -target arm64 -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/exprinline0-arm testdata/exprinline.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/exprinline0-arm > $(BUILDDIR)/exprinline0-arm.got; \
 	diff -u testdata/exprinline.out $(BUILDDIR)/exprinline0-arm.got; \

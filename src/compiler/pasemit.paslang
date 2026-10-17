@@ -325,6 +325,7 @@ type
     FFrameSym: string;      { the .set symbol that carries the frame size, defined after the body }
     FFrameMarked: Boolean;  { arm64: the prologue wrote the mark SetFrame fills (P308) }
     FSkipCanon: Boolean;    { EmitOrdTo's top node feeds a store of its own width: no cleanup (P100) }
+    FPool0: string;         { pool register 0's name while a value is worked out in a variable's register (P318) }
     FNoCheck: Boolean;      { EmitWordMem's element was just checked by the same statement (P100) }
     FChunkReg: string;
     FR8Lent: Boolean;   { a region of integer arithmetic keeps a variable in r8 (1.1.1) }
@@ -627,6 +628,8 @@ type
     procedure RotArm(Op: TBinOp; T: LongInt);
     procedure EmitOrdRotArm(E: PExpr; D: LongInt);
     procedure CanonReg(const R: string; T: LongInt);
+    procedure CanonTo(const D, R: string; T: LongInt);
+    function PoolPlain(E: PExpr): Boolean;
     procedure DwarfBase(T: LongInt; const N: string; Enc, Size: LongInt);
     function FieldTypAt(T, Off: LongInt; const N: string): LongInt;
     function LoadTyp(E: PExpr): LongInt;
@@ -20268,36 +20271,57 @@ end;
   a register or a word of memory is always clean, so a load of a word
   needs nothing and a comparison works on the whole register. }
 procedure TEmitter.CanonReg(const R: string; T: LongInt);
+begin
+  CanonTo(R, R, T);
+end;
+
+{ The low bits of R, of type T, extended into D, as CanonReg in place:
+  one MOVZX, MOVSX or MOV of 32 bits on amd64, one UXT, SXT or MOV of a
+  W register on arm64, which write the whole of D (SDM vol. 2B MOVZX and
+  MOVSX; ARM DDI 0487 UXTB C6.2.500, SXTB C6.2.472, MOV register C6.2.282
+  of a W register zeroing the top) (P318). }
+procedure TEmitter.CanonTo(const D, R: string; T: LongInt);
 var
-  w, b8, b16, b32: string;
+  w, wd, b8, b16, b32, d32: string;
 begin
   if not IsNarrowId(T) then
+  begin
+    if D <> R then
+    begin
+      if FArm then
+        Line('  mov ' + D + ', ' + R)
+      else
+        Line('  movq %' + R + ', %' + D);
+    end;
     Exit;
+  end;
   if FArm then
   begin
     w := 'w' + Copy(R, 2, 8);
+    wd := 'w' + Copy(D, 2, 8);
     case T of
-      TyByte: Line('  uxtb ' + w + ', ' + w);
-      TyInt8: Line('  sxtb ' + R + ', ' + w);
-      TyWord: Line('  uxth ' + w + ', ' + w);
-      TyInt16: Line('  sxth ' + R + ', ' + w);
-      TyUInt32: Line('  mov ' + w + ', ' + w);
+      TyByte: Line('  uxtb ' + wd + ', ' + w);
+      TyInt8: Line('  sxtb ' + D + ', ' + w);
+      TyWord: Line('  uxth ' + wd + ', ' + w);
+      TyInt16: Line('  sxth ' + D + ', ' + w);
+      TyUInt32: Line('  mov ' + wd + ', ' + w);
     else
-      Line('  sxtw ' + R + ', ' + w);
+      Line('  sxtw ' + D + ', ' + w);
     end;
     Exit;
   end;
   b8 := X86Sub(R, 1);
   b16 := X86Sub(R, 2);
   b32 := X86Sub(R, 4);
+  d32 := X86Sub(D, 4);
   case T of
-    TyByte: Line('  movzbl %' + b8 + ', %' + b32);
-    TyInt8: Line('  movsbq %' + b8 + ', %' + R);
-    TyWord: Line('  movzwl %' + b16 + ', %' + b32);
-    TyInt16: Line('  movswq %' + b16 + ', %' + R);
-    TyUInt32: Line('  movl %' + b32 + ', %' + b32);
+    TyByte: Line('  movzbl %' + b8 + ', %' + d32);
+    TyInt8: Line('  movsbq %' + b8 + ', %' + D);
+    TyWord: Line('  movzwl %' + b16 + ', %' + d32);
+    TyInt16: Line('  movswq %' + b16 + ', %' + D);
+    TyUInt32: Line('  movl %' + b32 + ', %' + d32);
   else
-    Line('  movslq %' + b32 + ', %' + R);
+    Line('  movslq %' + b32 + ', %' + D);
   end;
 end;
 
@@ -25828,6 +25852,11 @@ end;
   counts, flags and large constants, and x0, x1 and x17 on arm64. }
 function TEmitter.OrdPool(D: LongInt): string;
 begin
+  if (D = 0) and (FPool0 <> '') then
+  begin
+    Result := FPool0;
+    Exit;
+  end;
   if FArm then
     Result := 'x' + IntToStr(9 + D)
   else
@@ -25840,6 +25869,29 @@ begin
     else
       Result := 'r10';
     end;
+end;
+
+{ E is worked out in the pool by plain steps alone: constants, word
+  variables, + - * and or xor shl shr of them, a negation, a not and a
+  conversion to a narrow integer; no index, field or call, no division,
+  no compare, nothing that writes a failure out of line (P318). }
+function TEmitter.PoolPlain(E: PExpr): Boolean;
+var
+  s: TSym;
+begin
+  Result := False;
+  if (E = nil) or (E^.Typ = TyBoolean) then
+    Exit;
+  case E^.Kind of
+    ekInt: Result := True;
+    ekVar: Result := WordVar(E, s);
+    ekUn:
+      Result := ((E^.Un = uoNeg) or (E^.Un = uoNot) or (E^.Un = uoConv)) and PoolPlain(E^.L);
+    ekBin:
+      Result := ((E^.Bin = boAdd) or (E^.Bin = boSub) or (E^.Bin = boMul) or
+        (E^.Bin = boAnd) or (E^.Bin = boOr) or (E^.Bin = boXor) or (E^.Bin = boShl) or
+        (E^.Bin = boShr)) and PoolPlain(E^.L) and PoolPlain(E^.R);
+  end;
 end;
 
 function TEmitter.OrdLeaf(E: PExpr): Boolean;
@@ -25948,6 +26000,16 @@ begin
       Line('  movabsq $' + IntToStr(k) + ', %rax');
       Result := '%rax';
     end;
+  end
+  else if (E^.Kind = ekVar) and WordVar(E, s) and (TSize(s.Typ) < 8) and (s.Reg <> '') then
+  begin
+    { a narrow variable a region keeps is clean in its register, the whole
+      word extended (P100: StoreWordVar and LoadHome keep it so), so the
+      register is the operand, where it went through rax or x17 (P318) }
+    if FArm then
+      Result := s.Reg
+    else
+      Result := '%' + s.Reg;
   end
   else if (E^.Kind = ekVar) and WordVar(E, s) and (TSize(s.Typ) < 8) then
   begin
@@ -26094,7 +26156,7 @@ begin
         { a - k of a register is one lea, a two-operand one, one cycle on
           Zen 2 (AMD 56305 2.10.2), where mov and sub were two (P282) }
         if (E^.Bin = boSub) and (TSize(E^.Typ) = 8) and (E^.R^.Kind = ekInt) and
-          (E^.L^.Kind = ekVar) and WordVar(E^.L, s) and (s.Reg <> '') and (TSize(s.Typ) = 8) then
+          (E^.L^.Kind = ekVar) and WordVar(E^.L, s) and (s.Reg <> '') then
         begin
           if (not FArm) and Fits32(-E^.R^.Num) then
           begin
@@ -26107,7 +26169,7 @@ begin
           into the pool's, the constant as the immediate where the
           instruction takes one; a mov first doubled each such step }
         if FArm and (TSize(E^.Typ) = 8) and (E^.L^.Kind = ekVar) and WordVar(E^.L, s) and
-          (s.Reg <> '') and (TSize(s.Typ) = 8) and ((E^.Bin = boAdd) or (E^.Bin = boSub) or
+          (s.Reg <> '') and ((E^.Bin = boAdd) or (E^.Bin = boSub) or
           (E^.Bin = boAnd) or (E^.Bin = boOr) or (E^.Bin = boXor) or (E^.Bin = boMul) or
           (E^.Bin = boShl) or (E^.Bin = boShr)) then
         begin
@@ -26152,7 +26214,7 @@ begin
         end;
         { a + b of two registers, or a + k, is one lea (1.1.1) }
         if (not FArm) and (E^.Bin = boAdd) and (TSize(E^.Typ) = 8) and
-          (E^.L^.Kind = ekVar) and WordVar(E^.L, s) and (s.Reg <> '') and (TSize(s.Typ) = 8) then
+          (E^.L^.Kind = ekVar) and WordVar(E^.L, s) and (s.Reg <> '') then
         begin
           if (E^.R^.Kind = ekInt) and Fits32(E^.R^.Num) then
           begin
@@ -26160,7 +26222,7 @@ begin
             Exit;
           end;
           m := s.Reg;
-          if (E^.R^.Kind = ekVar) and WordVar(E^.R, s) and (s.Reg <> '') and (TSize(s.Typ) = 8) then
+          if (E^.R^.Kind = ekVar) and WordVar(E^.R, s) and (s.Reg <> '') then
           begin
             { r13 as the base beside an index is Intel's slow LEA
               (248966 3.5.1.2), as the index it is not (P294) }
@@ -27871,14 +27933,14 @@ begin
 end;
 
 { The register of a word variable a region keeps there, or '': PtrReg
-  without working anything out (P294). }
+  without working anything out (P294); a narrow one's too, clean there,
+  the whole word extended (P100), as a load of it would leave it (P318). }
 function TEmitter.WordReg(E: PExpr): string;
 var
   s: TSym;
 begin
   Result := '';
-  if (E <> nil) and (E^.Kind = ekVar) and WordVar(E, s) and (s.Reg <> '') and
-    (TSize(s.Typ) = 8) then
+  if (E <> nil) and (E^.Kind = ekVar) and WordVar(E, s) and (s.Reg <> '') then
     Result := s.Reg;
 end;
 
@@ -29238,6 +29300,16 @@ begin
       WordLoad(m, LoadTyp(E), s.Reg);
       Exit;
     end;
+    { a narrow value for a variable a region keeps: the cleanup EmitOrdTo
+      writes in its pool register goes into the variable's, movzwl %si,
+      %ebx or uxth w21, w9 where it was that in place and a move (P318) }
+    if (s.Reg <> '') and NarrowOp(E) and IsNarrowId(E^.Typ) and not KeepsClean(E) then
+    begin
+      FSkipCanon := True;
+      EmitOrdTo(E, 0);
+      CanonTo(s.Reg, OrdPool(0), E^.Typ);
+      Exit;
+    end;
     FSkipCanon := (TSize(E^.Typ) = TSize(s.Typ)) and (s.Reg = '');
     EmitOrdTo(E, 0);
     StoreWordVar(s, OrdPool(0));
@@ -29377,6 +29449,17 @@ begin
   if (dst.Reg <> '') and LoadKind(e) then
   begin
     WordLoad(EmitWordMem(e, 0), LoadTyp(e), dst.Reg);
+    Exit;
+  end;
+  { a value of plain steps that does not read the variable is worked out
+    in the variable's register, pool register 0 named so for it, where it
+    was worked out in the pool and moved, as Go's allocator gives the value
+    the variable's register (P318) }
+  if (dst.Reg <> '') and PoolPlain(e) and not NamesVar(e, dst.Name) then
+  begin
+    FPool0 := dst.Reg;
+    EmitOrdTo(e, 0);
+    FPool0 := '';
     Exit;
   end;
   EmitOrdTo(e, 0);
