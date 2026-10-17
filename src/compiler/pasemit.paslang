@@ -327,6 +327,11 @@ type
     FFrameSym: string;      { the .set symbol that carries the frame size, defined after the body }
     FFrameMarked: Boolean;  { arm64: the prologue wrote the mark SetFrame fills (P308) }
     FSkipCanon: Boolean;    { EmitOrdTo's top node feeds a store of its own width: no cleanup (P100) }
+    FLeftIn: Boolean;       { a binary operation's left side is in rcx or x1, not pushed (P297) }
+    FLeftOp: string;        { with FLeftIn on amd64: the left side as an operand, its home or a constant, '' for rcx (P297) }
+    FRightK: Int64;         { with FRightOn: the left side in rax or x0 and the right this constant (P297) }
+    FRightOn: Boolean;
+    FPoolCap: LongInt;      { the pool at most this many registers, 0 for all: r10 and r11 keep a call's code and second word (P297) }
     FFlat: Boolean;         { the routine has no frame, its variables in registers (P296) }
     FFlatCfa: LongInt;      { its CFA's offset from rsp: 8 and 8 a register it pushed }
     FFlatPad: Boolean;      { a failure out of line moves rsp by 8 first, for its call }
@@ -459,6 +464,7 @@ type
     function MovConst32(const S: string): string;
     function ChkKept(const I, L, K: string): Boolean;
     function MemLenOK(const N: string): Boolean;
+    function LateBase(B: PExpr; out S: TSym): Boolean;
     procedure ChkDrop(const F: string; Mem: Boolean);
     procedure ChkKeep(const I, L, K: string; Ok: Boolean);
     procedure MapNote(const S: string);
@@ -686,6 +692,12 @@ type
     procedure DaSetup(const Pr: TProc; Loc0: LongInt);
     procedure EmitForRunes(S: PStmt);
     procedure EmitCmp(const Setcc: string);
+    procedure PopLeft;
+    function CallProof(E: PExpr): Boolean;
+    function LeftFirst(E: PExpr): Boolean;
+    function LeftSrc: string;
+    procedure ValPair(E: PExpr; const R0, R1: string);
+    procedure PutArgsKept(const Args: TExprArray; Comp, Reg0: LongInt);
     function RealBin(E: PExpr): Boolean;
     procedure EmitRealBin(E: PExpr);
     procedure RealIntCheck;
@@ -1812,6 +1824,21 @@ end;
   by nobody (AddrKept), no unit's global another unit may write, and no
   parameter of this routine a fat value reached by reference, which may
   be the same slice under another name. }
+{ P297: the static array B is a variable of this frame or a global in
+  place, whose address one instruction gives into rcx or x1 after its
+  index is worked out, with nothing pushed: not a var parameter, an outer
+  routine's, one in a heap box or a register's. }
+function TEmitter.LateBase(B: PExpr; out S: TSym): Boolean;
+begin
+  Result := False;
+  if (B = nil) or (B^.Kind <> ekVar) then
+    Exit;
+  S := FindSym(B^.Name);
+  Result := (S.Name <> '') and (not S.ByRef) and (S.Up = 0) and (not S.Boxed) and (S.Reg = '');
+  if Result and FArm and FPromoOn and (PartReg(S, 3) <> '') then
+    Result := False;
+end;
+
 function TEmitter.MemLenOK(const N: string): Boolean;
 var
   i: SizeInt;
@@ -5633,7 +5660,7 @@ var
   i, sh: LongInt;
   off: LongInt;
   ok, ix: string;
-  wr: Boolean;
+  wr, late: Boolean;
 begin
   wr := FAddrWrite;
   FAddrWrite := False;
@@ -5825,8 +5852,12 @@ begin
           begin
             td := FTypes[E^.L^.Typ];
             esz := TSize(td.Elem);
-            EmitAddr(E^.L);
-            PshK('x0', 1);
+            late := LateBase(E^.L, s);
+            if not late then
+            begin
+              EmitAddr(E^.L);
+              PshK('x0', 1);
+            end;
             EmitExpr(E^.R);
             { the index from the low bound: x0 itself when that is 0 (P289) }
             ix := 'x0';
@@ -5852,7 +5883,13 @@ begin
               low bound other than 0 is: that one goes to x0 first }
             if ix <> 'x0' then
               Line('  mov x0, ' + ix);
-            Ppop('x1');
+            { the base after the index when it is a label or the frame's (P297) }
+            if not late then
+              Ppop('x1')
+            else if s.Global then
+              LeaS(VarLabel(s.Name), 'x1')
+            else
+              AddFP('x1', s.Off);
             ScaleAddArm('x0', 'x1', 'x0', esz, 'x16', 'x17');
           end;
         end;
@@ -6067,8 +6104,12 @@ begin
         begin
           td := FTypes[E^.L^.Typ];
           esz := TSize(td.Elem);
-          EmitAddr(E^.L);
-          PushK('rax', 1);
+          late := LateBase(E^.L, s);
+          if not late then
+          begin
+            EmitAddr(E^.L);
+            PushK('rax', 1);
+          end;
           EmitExpr(E^.R);
           ok := Lab;
           { the index from the low bound: rax itself when that is 0 (P289) }
@@ -6104,8 +6145,14 @@ begin
             Line('  movq %rdx, %rax');
           { an element of a power of two is a shift, one cycle where imul
             takes three on Zen 2 (AMD 17h 30h latencies: SHL 1, IMUL
-            reg64 3), any other size a recipe where one is cheaper (P310) }
-          Line('  popq %rcx');
+            reg64 3), any other size a recipe where one is cheaper (P310);
+            the base after the index when one instruction gives it (P297) }
+          if not late then
+            Line('  popq %rcx')
+          else if s.Global then
+            Line('  leaq ' + VarLabel(s.Name) + '(%rip), %rcx')
+          else
+            Line('  leaq ' + IntToStr(s.Off) + '(%rbp), %rcx');
           ScaleAddX86('%rax', '%rcx', '%rax', esz, '%rdx');
         end;
       end;
@@ -12787,14 +12834,202 @@ begin
   end;
 end;
 
+{ The left side of a binary operation into rcx or x1: popped, or there
+  already (FLeftIn, P297). }
+procedure TEmitter.PopLeft;
+begin
+  if FLeftIn then
+  begin
+    FLeftIn := False;
+    Exit;
+  end;
+  if FArm then
+    Ppop('x1')
+  else
+    Line('  popq %rcx');
+end;
+
+{ E's value is one no call can change (P297): a constant, or a word
+  variable of this routine's own that no call reaches: not a global, not
+  by reference, not in a closure's box, its address not taken and named
+  by no routine nested in this one (a call of which reaches it by the
+  static link). }
+function TEmitter.CallProof(E: PExpr): Boolean;
+var
+  sy: TSym;
+begin
+  Result := False;
+  if E = nil then
+    Exit;
+  if (E^.Kind = ekInt) or (E^.Kind = ekNil) or ((E^.Kind = ekStr) and (Length(E^.Txt) = 1)) then
+  begin
+    Result := True;
+    Exit;
+  end;
+  if (E^.Kind = ekVar) and WordVar(E, sy) and (not sy.Global) and (sy.Up = 0) and
+    (not sy.ByRef) and (not sy.Boxed) and (not AddrTakenSym(sy)) and
+    not InNames(FNestNames, ToLower(sy.Name)) then
+    Result := True;
+  { a program's global in its main block that no routine names and whose
+    address nobody takes (P293's GlobalOwnedByMain), as a local of the
+    main block: a unit's global another unit may write, and a unit cannot
+    name a program's }
+  if (E^.Kind = ekVar) and WordVar(E, sy) and sy.Global and FInMain and (not FIsUnit) and
+    (not ExtGlobal(sy.Name)) and (not sy.Boxed) and (not AddrTakenSym(sy)) and
+    GlobalOwnedByMain(sy.Name) then
+    Result := True;
+end;
+
+{ The left side of + * and or xor as amd64 reads it after PopLeft: the
+  operand LeftFirst kept, a home or a constant, or rcx (P297). }
+function TEmitter.LeftSrc: string;
+begin
+  Result := '%rcx';
+  if FLeftOp <> '' then
+  begin
+    Result := FLeftOp;
+    FLeftOp := '';
+  end;
+end;
+
+{ P297: L op R with the left side kept in rcx or x1, nothing pushed, for
+  the operations that take it there (+ - * and or xor and the compares):
+  R a constant, into the instruction (FRightOn); R a word variable, read
+  after L as before, L moved first; R with a call and L one no call
+  changes (CallProof), or R with no call and L a constant or a word
+  variable, which nothing R does reaches: R first and L read after it,
+  the same value, so the order the program sees, left to right, holds,
+  and a call stays left to right with any other. Go copies a call in an
+  expression to a temporary before the rest (walk/order.go) and reads a
+  variable after it. False with nothing written when none; then L is
+  pushed as before. }
+function TEmitter.LeftFirst(E: PExpr): Boolean;
+var
+  sy: TSym;
+  k: Int64;
+  comm: Boolean;
+begin
+  Result := False;
+  if not ((E^.Bin = boAdd) or (E^.Bin = boSub) or (E^.Bin = boMul) or (E^.Bin = boAnd) or
+    (E^.Bin = boOr) or (E^.Bin = boXor) or (E^.Bin = boEq) or (E^.Bin = boNe) or
+    (E^.Bin = boLt) or (E^.Bin = boLe) or (E^.Bin = boGt) or (E^.Bin = boGe)) then
+    Exit;
+  { a constant right side goes into the instruction: L into rax or x0,
+    then addq $3, %rax or cmp x0, #9, where moving L aside and loading the
+    constant were two more; on arm64 + - * and the compares, whose
+    immediates AddImmArm and CmpImmArm take whatever their size; a
+    product by Go's recipes (MulByK, P295) where one is cheaper }
+  if (E^.R^.Kind = ekInt) and (TKind(E^.Typ) <> tykSet) and (TKind(E^.L^.Typ) <> tykSet) and
+    (TKind(E^.L^.Typ) <> tykReal) and ((FArm and ((E^.Bin = boAdd) or (E^.Bin = boSub) or
+    (E^.Bin = boMul) or (E^.Bin = boEq) or (E^.Bin = boNe) or (E^.Bin = boLt) or (E^.Bin = boLe) or
+    (E^.Bin = boGt) or (E^.Bin = boGe))) or ((not FArm) and Fits32(E^.R^.Num))) then
+  begin
+    if (E^.L^.Kind = ekStr) and (Length(E^.L^.Txt) = 1) then
+    begin
+      if FArm then
+        Imm('x0', Ord(E^.L^.Txt[1]))
+      else
+        Line('  movq $' + IntToStr(Ord(E^.L^.Txt[1])) + ', %rax');
+    end
+    else
+      EmitExpr(E^.L);
+    FRightK := E^.R^.Num;
+    FRightOn := True;
+    FLeftIn := True;
+    Result := True;
+    Exit;
+  end;
+  if (E^.R^.Kind = ekInt) or (E^.R^.Kind = ekNil) or
+    ((E^.R^.Kind = ekStr) and (Length(E^.R^.Txt) = 1)) or
+    ((E^.R^.Kind = ekVar) and WordVar(E^.R, sy)) then
+  begin
+    { L, then R: R's load touches nothing but rax or x0 }
+    if (E^.L^.Kind = ekStr) and (Length(E^.L^.Txt) = 1) then
+    begin
+      if FArm then
+        Imm('x1', Ord(E^.L^.Txt[1]))
+      else
+        Line('  movq $' + IntToStr(Ord(E^.L^.Txt[1])) + ', %rcx');
+    end
+    else
+    begin
+      EmitExpr(E^.L);
+      if FArm then
+        Line('  mov x1, x0')
+      else
+        Line('  movq %rax, %rcx');
+    end;
+    if (E^.R^.Kind = ekStr) and (Length(E^.R^.Txt) = 1) then
+    begin
+      if FArm then
+        Imm('x0', Ord(E^.R^.Txt[1]))
+      else
+        Line('  movq $' + IntToStr(Ord(E^.R^.Txt[1])) + ', %rax');
+    end
+    else
+      EmitExpr(E^.R);
+    FLeftIn := True;
+    Result := True;
+    Exit;
+  end;
+  if (EHasCall(E^.R) and CallProof(E^.L)) or ((not EHasCall(E^.R)) and
+    ((E^.L^.Kind = ekInt) or (E^.L^.Kind = ekNil) or
+    ((E^.L^.Kind = ekStr) and (Length(E^.L^.Txt) = 1)) or WordVar(E^.L, sy))) then
+  begin
+    EmitExpr(E^.R);
+    { + * and or xor on amd64 take the left side where it is: addq
+      v_t(%rip), %rax, one instruction where a load into rcx and the add
+      are two }
+    comm := (not FArm) and ((E^.Bin = boAdd) or (E^.Bin = boMul) or (E^.Bin = boAnd) or
+      (E^.Bin = boOr) or (E^.Bin = boXor)) and (TKind(E^.Typ) <> tykSet);
+    if ConstOf(E^.L, k) or (E^.L^.Kind = ekNil) or (E^.L^.Kind = ekStr) then
+    begin
+      if E^.L^.Kind = ekStr then
+        k := Ord(E^.L^.Txt[1])
+      else if E^.L^.Kind = ekNil then
+        k := 0;
+      { a constant left side of + or * (and, or, xor on amd64) goes into the
+        instruction as a right one does: the same value either way }
+      if (comm and Fits32(k)) or (FArm and ((E^.Bin = boAdd) or (E^.Bin = boMul)) and
+        (TKind(E^.Typ) <> tykSet)) then
+      begin
+        FRightK := k;
+        FRightOn := True;
+      end
+      else if FArm then
+        Imm('x1', k)
+      else
+        LoadImmR('rcx', k);
+    end
+    else
+    begin
+      WordVar(E^.L, sy);
+      if FArm then
+        LoadWordVar(sy, 'x1')
+      else if comm and ((sy.Reg <> '') or (TSize(sy.Typ) = 8)) then
+        FLeftOp := MemA(sy)
+      else
+        LoadWordVar(sy, 'rcx');
+    end;
+    FLeftIn := True;
+    Result := True;
+  end;
+end;
+
 procedure TEmitter.EmitCmp(const Setcc: string);
 var
   cc: string;
 begin
   if FArm then
   begin
-    Ppop('x1');
-    Line('  cmp x1, x0');
+    PopLeft;
+    if FRightOn then
+    begin
+      FRightOn := False;
+      CmpImmArm('x0', FRightK, 'x17');
+    end
+    else
+      Line('  cmp x1, x0');
     cc := 'eq';
     if Setcc = 'sete' then
       cc := 'eq'
@@ -12811,8 +13046,14 @@ begin
     Line('  cset x0, ' + cc);
     Exit;
   end;
-  Line('  popq %rcx');
-  Line('  cmpq %rax, %rcx');
+  PopLeft;
+  if FRightOn then
+  begin
+    FRightOn := False;
+    Line('  cmpq $' + IntToStr(FRightK) + ', %rax');
+  end
+  else
+    Line('  cmpq %rax, %rcx');
   Line('  movq $0, %rax');
   Line('  ' + Setcc + ' %al');
 end;
@@ -13002,7 +13243,10 @@ begin
   begin
     EmitExpr(Args[Comp]);
     if FArm then
-      Line('  mov ' + ArgR(Reg0 + Comp) + ', x0')
+    begin
+      if Reg0 + Comp <> 0 then
+        Line('  mov ' + ArgR(Reg0 + Comp) + ', x0');
+    end
     else
       Line('  movq %rax, %' + ArgReg(Reg0 + Comp));
   end;
@@ -13035,6 +13279,24 @@ begin
   begin
     PutArgs(Args, 0, comp, 1);
     DirectArg(Obj, 'rdi', True);
+    Exit;
+  end;
+  if kd = 0 then
+  begin
+    { P297: Self worked out first, into rdi, or into r10 while an
+      argument is worked out in the pool's first three registers }
+    EmitExpr(Obj);
+    if comp >= 0 then
+    begin
+      Line('  movq %rax, %r10');
+      PutArgsKept(Args, comp, 1);
+      Line('  movq %r10, %rdi');
+    end
+    else
+    begin
+      Line('  movq %rax, %rdi');
+      PutArgs(Args, 0, -1, 1);
+    end;
     Exit;
   end;
   EmitExpr(Obj);
@@ -13408,6 +13670,100 @@ begin
     Line('  addq $' + IntToStr((n - nreg) * 8) + ', %rsp');
 end;
 
+{ P297: the two words of a routine value, a method value or an
+  interface (code and environment, code and Self, object and table)
+  from where E lies into R0 and R1, as Go loads a closure's code from
+  the closure where it is (cmd/compile/internal/ssagen/ssa.go: rawLoad of
+  codeptr, then OpClosureLECall): a variable's from its home, an
+  element's, a field's or a pointer's target's from its address, on
+  arm64 in one ldp (ARM DDI 0487 M.c C6.2.214, signed offset: no
+  writeback, so the base may be one of the two, K1.2.17.7; Neoverse N1
+  SOG 3.9 table 14: an X-form pair 4 cycles, as one ldr, one
+  instruction for two); anything else worked out into rax and rdx, or
+  x0 and x2, and moved. }
+procedure TEmitter.ValPair(E: PExpr; const R0, R1: string);
+var
+  sy: TSym;
+  home: Boolean;
+begin
+  home := False;
+  if E^.Kind = ekVar then
+  begin
+    sy := FindSym(E^.Name);
+    home := (sy.Name <> '') and (sy.Reg = '') and (not sy.ByRef) and (sy.Up = 0) and
+      (not sy.Boxed) and (TSize(sy.Typ) = 16);
+  end;
+  if FArm then
+  begin
+    if home and sy.Global then
+    begin
+      LeaS(VarLabel(sy.Name), 'x16');
+      Line('  ldp ' + R0 + ', ' + R1 + ', [x16]');
+    end
+    else if home and (sy.Off >= -512) and (sy.Off <= 496) and (sy.Off mod 8 = 0) then
+      Line('  ldp ' + R0 + ', ' + R1 + ', [x29, #' + IntToStr(sy.Off) + ']')
+    else if home then
+    begin
+      AddFP('x16', sy.Off);
+      Line('  ldp ' + R0 + ', ' + R1 + ', [x16]');
+    end
+    else if (E^.Kind = ekIndex) or (E^.Kind = ekField) or (E^.Kind = ekDeref) then
+    begin
+      EmitAddr(E);
+      Line('  ldp ' + R0 + ', ' + R1 + ', [x0]');
+    end
+    else
+    begin
+      EmitExpr(E);
+      if R1 = 'x0' then
+      begin
+        Line('  mov ' + R0 + ', x0');
+        Line('  mov x0, x2');
+      end
+      else
+      begin
+        Line('  mov ' + R1 + ', x2');
+        if R0 <> 'x0' then
+          Line('  mov ' + R0 + ', x0');
+      end;
+    end;
+    Exit;
+  end;
+  if home then
+  begin
+    Line('  movq ' + StrWordA(sy, 0) + ', %' + R0);
+    Line('  movq ' + StrWordA(sy, 8) + ', %' + R1);
+  end
+  else if (E^.Kind = ekIndex) or (E^.Kind = ekField) or (E^.Kind = ekDeref) then
+  begin
+    EmitAddr(E);
+    Line('  movq (%rax), %' + R0);
+    Line('  movq 8(%rax), %' + R1);
+  end
+  else
+  begin
+    EmitExpr(E);
+    Line('  movq %rdx, %' + R1);
+    Line('  movq %rax, %' + R0);
+  end;
+end;
+
+{ P297: the arguments of a call PlanArgs sends straight to their
+  registers (Kd 0), the one worked out first in the pool's first three,
+  rsi, rdi and r8, as inside a region (PoolSize), while r11 and r10 keep
+  the call's code and its second word; x8 and x27 on arm64 are no
+  pool's. }
+procedure TEmitter.PutArgsKept(const Args: TExprArray; Comp, Reg0: LongInt);
+var
+  was: LongInt;
+begin
+  was := FPoolCap;
+  if not FArm then
+    FPoolCap := 3;
+  PutArgs(Args, 0, Comp, Reg0);
+  FPoolCap := was;
+end;
+
 { A call through a routine value (P81): the address is worked out
   first and kept under the arguments, and the call is indirect. Every
   argument goes the way EmitArgVal passes it, so a string or a record
@@ -13423,13 +13779,24 @@ begin
   begin
     if n > 8 then
       Die('at most 8 arguments through a routine value');
+    { the arguments that call nothing straight to their registers (P281) }
+    PlanArgs(Args, 8, kd, comp);
+    if kd = 0 then
+    begin
+      { P297: the code and the environment from their place into x8 and
+        x27, which no argument's code touches, then the arguments: Go's
+        closure call (ssagen/ssa.go OpClosureLECall, the context in R26,
+        cmd/compile/abi-internal.md) }
+      ValPair(Target, 'x8', 'x27');
+      PutArgsKept(Args, comp, 0);
+      Line('  blr x8');
+      Exit;
+    end;
     { the code and the environment, which goes in the static link's
       register: a closure reads it as its link (1.0.133) }
     EmitExpr(Target);
     PshK('x2', 1);
     PshK('x0', 0);
-    { the arguments that call nothing straight to their registers (P281) }
-    PlanArgs(Args, 8, kd, comp);
     for i := 0 to kd - 1 do
     begin
       EmitArgVal(Args[i]);
@@ -13447,11 +13814,21 @@ begin
   begin
     if n > 6 then
       Die('at most 6 arguments through a routine value');
+    { the arguments that call nothing straight to their registers (P281) }
+    PlanArgs(Args, 6, kd, comp);
+    if kd = 0 then
+    begin
+      { P297: the code and the environment from their place into r11 and
+        r10, the arguments after them in the other registers; Go's DX is
+        paslang's r10, the static link (cmd/compile/abi-internal.md) }
+      ValPair(Target, 'r11', 'r10');
+      PutArgsKept(Args, comp, 0);
+      Line('  call *%r11');
+      Exit;
+    end;
     EmitExpr(Target);
     PushK('rdx', 1);
     PushK('rax', 0);
-    { the arguments that call nothing straight to their registers (P281) }
-    PlanArgs(Args, 6, kd, comp);
     for i := 0 to kd - 1 do
     begin
       EmitArgVal(Args[i]);
@@ -13611,6 +13988,21 @@ begin
       DirectArg(Obj, 'x0', True);
       direct := True;
     end
+    else if kd = 0 then
+    begin
+      { P297: Self worked out first stays in x0, or in x27 while an
+        argument is worked out, nothing pushed }
+      EmitExpr(Obj);
+      if comp >= 0 then
+      begin
+        Line('  mov x27, x0');
+        PutArgs(Args, 0, comp, 1);
+        Line('  mov x0, x27');
+      end
+      else
+        PutArgs(Args, 0, -1, 1);
+      direct := True;
+    end
     else if kd < nuser then
     begin
       EmitExpr(Obj);
@@ -13646,6 +14038,24 @@ begin
     else
       Line('  bl ' + Name);
     Exit;
+  end;
+  if (Slot = -3) and (not FObjReady) and (nuser < 8) then
+  begin
+    { P297: a method value's code into x8 and Self into x0 from their
+      place, Self through x27 while an argument is worked out first }
+    PlanArgs(Args, 7, kd, comp);
+    if kd = 0 then
+    begin
+      if comp < 0 then
+        ValPair(Obj, 'x8', 'x0')
+      else
+        ValPair(Obj, 'x8', 'x27');
+      PutArgs(Args, 0, comp, 1);
+      if comp >= 0 then
+        Line('  mov x0, x27');
+      Line('  blr x8');
+      Exit;
+    end;
   end;
   if Slot = -3 then
   begin
@@ -13731,12 +14141,30 @@ procedure TEmitter.EmitMethVal(Target: PExpr; const Args: TExprArray);
 var
   i, n, nreg, kd, comp: LongInt;
 begin
-  EmitExpr(Target);
-  PushK('rax', 0);
-  PushK('rdx', 1);
   n := Length(Args);
   { the arguments that call nothing straight to their registers (P281) }
   PlanArgs(Args, 5, kd, comp);
+  if kd = 0 then
+  begin
+    { P297: the code into r11 and Self into rdi from their place, Self
+      through r10 when an argument is worked out in the pool first }
+    if comp < 0 then
+      ValPair(Target, 'r11', 'rdi')
+    else
+    begin
+      ValPair(Target, 'r11', 'r10');
+      PutArgsKept(Args, comp, 1);
+      Line('  movq %r10, %rdi');
+      Line('  call *%r11');
+      Exit;
+    end;
+    PutArgs(Args, 0, -1, 1);
+    Line('  call *%r11');
+    Exit;
+  end;
+  EmitExpr(Target);
+  PushK('rax', 0);
+  PushK('rdx', 1);
   for i := 0 to kd - 1 do
   begin
     { a string or a record goes by address, as in every other call
@@ -13784,6 +14212,50 @@ begin
     of every other call, a string or a record by address, more than five
     on the stack. It took one word an argument, so a string lost its
     length and what followed moved, and at most five. }
+  n := Length(Args);
+  if n < 8 then
+  begin
+    if FArm then
+      PlanArgs(Args, 7, kd, comp)
+    else
+      PlanArgs(Args, 5, kd, comp);
+    if (kd = 0) and ((not FArm) or (Slot * 8 <= 32760)) then
+    begin
+      { P297: the object and the table from their place, the code from
+        the table into r11 or x8, Self into the first register, through
+        r10 or x27 when an argument is worked out first; Go loads the
+        itab's word and calls it (ssagen/ssa.go, OCALLINTER: codeptr from
+        the closure getClosureAndRcvr gives) }
+      if FArm then
+      begin
+        if comp < 0 then
+          ValPair(Obj, 'x0', 'x8')
+        else
+          ValPair(Obj, 'x27', 'x8');
+        Line('  ldr x8, [x8, #' + IntToStr(Slot * 8) + ']');
+        PutArgs(Args, 0, comp, 1);
+        if comp >= 0 then
+          Line('  mov x0, x27');
+        Line('  blr x8');
+        Exit;
+      end;
+      if comp < 0 then
+      begin
+        ValPair(Obj, 'rdi', 'r11');
+        Line('  movq ' + IntToStr(Slot * 8) + '(%r11), %r11');
+        PutArgs(Args, 0, -1, 1);
+      end
+      else
+      begin
+        ValPair(Obj, 'r10', 'r11');
+        Line('  movq ' + IntToStr(Slot * 8) + '(%r11), %r11');
+        PutArgsKept(Args, comp, 1);
+        Line('  movq %r10, %rdi');
+      end;
+      Line('  call *%r11');
+      Exit;
+    end;
+  end;
   EmitExpr(Obj);
   if FArm then
   begin
@@ -13798,7 +14270,6 @@ begin
   Line('  movq ' + IntToStr(Slot * 8) + '(%rdx), %rcx');
   PushK('rcx', 0);
   PushK('rax', 1);
-  n := Length(Args);
   { the arguments that call nothing straight to their registers (P281) }
   PlanArgs(Args, 5, kd, comp);
   for i := 0 to kd - 1 do
@@ -22275,28 +22746,41 @@ else if E^.Name = 'rt_high' then
           end
           else
           begin
-            if (E^.L^.Kind = ekStr) and (Length(E^.L^.Txt) = 1) then
-              Imm('x0', Ord(E^.L^.Txt[1]))
-            else
-              EmitExpr(E^.L);
-            PshK('x0', VCls(E^.L^.Typ, 0));
-            if (E^.R^.Kind = ekStr) and (Length(E^.R^.Txt) = 1) then
-              Imm('x0', Ord(E^.R^.Txt[1]))
-            else
-              EmitExpr(E^.R);
+            if not LeftFirst(E) then
+            begin
+              if (E^.L^.Kind = ekStr) and (Length(E^.L^.Txt) = 1) then
+                Imm('x0', Ord(E^.L^.Txt[1]))
+              else
+                EmitExpr(E^.L);
+              PshK('x0', VCls(E^.L^.Typ, 0));
+              if (E^.R^.Kind = ekStr) and (Length(E^.R^.Txt) = 1) then
+                Imm('x0', Ord(E^.R^.Txt[1]))
+              else
+                EmitExpr(E^.R);
+            end;
             case E^.Bin of
               boAdd:
                 begin
-                  Ppop('x1');
-                  if TKind(E^.Typ) = tykSet then
+                  PopLeft;
+                  if FRightOn then
+                  begin
+                    FRightOn := False;
+                    AddImmArm('x0', 'x0', FRightK);
+                  end
+                  else if TKind(E^.Typ) = tykSet then
                     Line('  orr x0, x1, x0')
                   else
                     Line('  add x0, x1, x0');
                 end;
               boSub:
                 begin
-                  Ppop('x1');
-                  if TKind(E^.Typ) = tykSet then
+                  PopLeft;
+                  if FRightOn then
+                  begin
+                    FRightOn := False;
+                    AddImmArm('x0', 'x0', -FRightK);
+                  end
+                  else if TKind(E^.Typ) = tykSet then
                   begin
                     Line('  mvn x0, x0');
                     Line('  and x0, x1, x0');
@@ -22306,8 +22790,17 @@ else if E^.Name = 'rt_high' then
                 end;
               boMul:
                 begin
-                  Ppop('x1');
-                  if TKind(E^.Typ) = tykSet then
+                  PopLeft;
+                  if FRightOn then
+                  begin
+                    FRightOn := False;
+                    if not MulByK('x0', FRightK) then
+                    begin
+                      Imm('x1', FRightK);
+                      Line('  mul x0, x0, x1');
+                    end;
+                  end
+                  else if TKind(E^.Typ) = tykSet then
                     Line('  and x0, x1, x0')
                   else
                     Line('  mul x0, x1, x0');
@@ -22342,17 +22835,17 @@ else if E^.Name = 'rt_high' then
               boGe: EmitCmp('setge');
               boAnd:
                 begin
-                  Ppop('x1');
+                  PopLeft;
                   Line('  and x0, x1, x0');
                 end;
               boOr:
                 begin
-                  Ppop('x1');
+                  PopLeft;
                   Line('  orr x0, x1, x0');
                 end;
               boXor:
                 begin
-                  Ppop('x1');
+                  PopLeft;
                   Line('  eor x0, x1, x0');
                 end;
               boShl:
@@ -23243,28 +23736,41 @@ else if E^.Name = 'rt_high' then
         end
         else
         begin
-          if (E^.L^.Kind = ekStr) and (Length(E^.L^.Txt) = 1) then
-            Line('  movq $' + IntToStr(Ord(E^.L^.Txt[1])) + ', %rax')
-          else
-            EmitExpr(E^.L);
-          PushK('rax', VCls(E^.L^.Typ, 0));
-          if (E^.R^.Kind = ekStr) and (Length(E^.R^.Txt) = 1) then
-            Line('  movq $' + IntToStr(Ord(E^.R^.Txt[1])) + ', %rax')
-          else
-            EmitExpr(E^.R);
+          if not LeftFirst(E) then
+          begin
+            if (E^.L^.Kind = ekStr) and (Length(E^.L^.Txt) = 1) then
+              Line('  movq $' + IntToStr(Ord(E^.L^.Txt[1])) + ', %rax')
+            else
+              EmitExpr(E^.L);
+            PushK('rax', VCls(E^.L^.Typ, 0));
+            if (E^.R^.Kind = ekStr) and (Length(E^.R^.Txt) = 1) then
+              Line('  movq $' + IntToStr(Ord(E^.R^.Txt[1])) + ', %rax')
+            else
+              EmitExpr(E^.R);
+          end;
           case E^.Bin of
             boAdd:
               begin
-                Line('  popq %rcx');
-                if TKind(E^.Typ) = tykSet then
+                PopLeft;
+                if FRightOn then
+                begin
+                  FRightOn := False;
+                  Line('  addq $' + IntToStr(FRightK) + ', %rax');
+                end
+                else if TKind(E^.Typ) = tykSet then
                   Line('  orq %rcx, %rax')
                 else
-                  Line('  addq %rcx, %rax');
+                  Line('  addq ' + LeftSrc + ', %rax');
               end;
             boSub:
               begin
-                Line('  popq %rcx');
-                if TKind(E^.Typ) = tykSet then
+                PopLeft;
+                if FRightOn then
+                begin
+                  FRightOn := False;
+                  Line('  subq $' + IntToStr(FRightK) + ', %rax');
+                end
+                else if TKind(E^.Typ) = tykSet then
                 begin
                   Line('  notq %rax');
                   Line('  andq %rcx, %rax');
@@ -23277,11 +23783,17 @@ else if E^.Name = 'rt_high' then
               end;
             boMul:
               begin
-                Line('  popq %rcx');
-                if TKind(E^.Typ) = tykSet then
+                PopLeft;
+                if FRightOn then
+                begin
+                  FRightOn := False;
+                  if not MulByK('%rax', FRightK) then
+                    Line('  imulq $' + IntToStr(FRightK) + ', %rax, %rax');
+                end
+                else if TKind(E^.Typ) = tykSet then
                   Line('  andq %rcx, %rax')
                 else
-                  Line('  imulq %rcx, %rax');
+                  Line('  imulq ' + LeftSrc + ', %rax');
               end;
             boIn:
               begin
@@ -23316,18 +23828,36 @@ else if E^.Name = 'rt_high' then
             boGe: EmitCmp('setge');
             boAnd:
               begin
-                Line('  popq %rcx');
-                Line('  andq %rcx, %rax');
+                PopLeft;
+                if FRightOn then
+                begin
+                  FRightOn := False;
+                  Line('  andq $' + IntToStr(FRightK) + ', %rax');
+                end
+                else
+                  Line('  andq ' + LeftSrc + ', %rax');
               end;
             boOr:
               begin
-                Line('  popq %rcx');
-                Line('  orq %rcx, %rax');
+                PopLeft;
+                if FRightOn then
+                begin
+                  FRightOn := False;
+                  Line('  orq $' + IntToStr(FRightK) + ', %rax');
+                end
+                else
+                  Line('  orq ' + LeftSrc + ', %rax');
               end;
             boXor:
               begin
-                Line('  popq %rcx');
-                Line('  xorq %rcx, %rax');
+                PopLeft;
+                if FRightOn then
+                begin
+                  FRightOn := False;
+                  Line('  xorq $' + IntToStr(FRightK) + ', %rax');
+                end
+                else
+                  Line('  xorq ' + LeftSrc + ', %rax');
               end;
             boShl:
               begin
@@ -28343,6 +28873,10 @@ begin
   end
   else
     Result := 6;
+  { r11 and r10 keep a call's code and second word while an argument is
+    worked out (P297): rsi, rdi and r8, as inside a region }
+  if (FPoolCap > 0) and (Result > FPoolCap) then
+    Result := FPoolCap;
 end;
 
 function TEmitter.IndexOK(I: PExpr; D: LongInt): Boolean;

@@ -385,6 +385,9 @@ GOLDEN_A64 += imulconst
 # P324: a check against a slice's length at its home is kept, eight at a time.
 GOLDEN += memlen
 GOLDEN_A64 += memlen
+# P297: a call inside an expression pushes nothing, its operands in their order.
+GOLDEN += callexpr
+GOLDEN_A64 += callexpr
 # P333: an exec and a new thread do not race (amd64: qemu-user does not
 # execve an arm64 program, so arm64 reads the runtime's forms).
 GOLDEN += execrace
@@ -2575,6 +2578,13 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/memlen.out $(BUILDDIR)/memlen0.got; \
 	python3 -I scripts/check_chkcse.py $(BUILDDIR)/memlen0.s rotate:6,pair:2; \
 	echo ok memlen-asm; \
+	: calls through values push nothing and operands are read in their order, P297: callexpr with and without inlining; \
+	python3 -I scripts/check_callexpr.py $(BUILDDIR)/callexpr.s; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/callexpr0 testdata/callexpr.paslang; \
+	$(BUILDDIR)/callexpr0 > $(BUILDDIR)/callexpr0.got; \
+	diff -u testdata/callexpr.out $(BUILDDIR)/callexpr0.got; \
+	python3 -I scripts/check_callexpr.py $(BUILDDIR)/callexpr0.s; \
+	echo ok callexpr-asm; \
 	: the exec lock around a new thread and an execve, clone again on EAGAIN, P333: the runtime in execrace; \
 	python3 -I scripts/check_execlock.py $(BUILDDIR)/execrace.s; \
 	echo ok execlock-asm; \
@@ -3837,6 +3847,13 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	diff -u testdata/memlen.out $(BUILDDIR)/memlen0-arm.got; \
 	python3 -I scripts/check_chkcse.py $(BUILDDIR)/memlen0-arm.s rotate:6,pair:2; \
 	echo ok memlen-arm-asm; \
+	: P297 on arm64: callexpr with and without inlining, the code and second word of a call in x8 and x27; \
+	python3 -I scripts/check_callexpr.py $(BUILDDIR)/callexpr-arm.s --arm; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/callexpr0-arm testdata/callexpr.paslang; \
+	timeout 300 $(QEMU_A64) $(BUILDDIR)/callexpr0-arm > $(BUILDDIR)/callexpr0-arm.got; \
+	diff -u testdata/callexpr.out $(BUILDDIR)/callexpr0-arm.got; \
+	python3 -I scripts/check_callexpr.py $(BUILDDIR)/callexpr0-arm.s --arm; \
+	echo ok callexpr-arm-asm; \
 	: P333 on arm64: the runtime of execrace, the exec lock around a new thread and an execve; \
 	$(OUTDIR)/paslangc -target arm64 -cpu max -Fu $(A64DIR) -o $(BUILDDIR)/execrace-arm testdata/execrace.paslang; \
 	python3 -I scripts/check_execlock.py $(BUILDDIR)/execrace-arm.s --arm; \
