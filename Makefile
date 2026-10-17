@@ -364,6 +364,9 @@ GOLDEN_A64 += convmul
 # P318: a variable a register keeps is assigned there, a narrow one read there.
 GOLDEN += regassign
 GOLDEN_A64 += regassign
+# P319: a run's head proves a slice by its length, in a register or at home.
+GOLDEN += runlen
+GOLDEN_A64 += runlen
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -2433,11 +2436,11 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	: a bounds check an earlier one of the same index and length proves left out, P316: chkcse under the stress of the collector and without inlining, Fields checking once an element; \
 	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 $(BUILDDIR)/chkcse > $(BUILDDIR)/chkcse-gc.got; \
 	diff -u testdata/chkcse.out $(BUILDDIR)/chkcse-gc.got; \
-	python3 -I scripts/check_chkcse.py $(BUILDDIR)/chkcse.s fields:8,called:1,joined:3; \
+	python3 -I scripts/check_chkcse.py $(BUILDDIR)/chkcse.s fields:6,called:1,joined:3; \
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/chkcse0 testdata/chkcse.paslang; \
 	$(BUILDDIR)/chkcse0 > $(BUILDDIR)/chkcse0.got; \
 	diff -u testdata/chkcse.out $(BUILDDIR)/chkcse0.got; \
-	python3 -I scripts/check_chkcse.py $(BUILDDIR)/chkcse0.s fields:8,joined:3; \
+	python3 -I scripts/check_chkcse.py $(BUILDDIR)/chkcse0.s fields:6,joined:3; \
 	echo ok chkcse-asm; \
 	: a product by a constant under a narrowing conversion read from the register of the variable, P317: convmul with and without inlining; \
 	python3 -I scripts/check_convmul.py $(BUILDDIR)/convmul.s; \
@@ -2453,6 +2456,13 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/regassign.out $(BUILDDIR)/regassign0.got; \
 	python3 -I scripts/check_regassign.py $(BUILDDIR)/regassign0.s; \
 	echo ok regassign-asm; \
+	: a run head proving a slice by its length in a register or at its home, P319: runlen with and without inlining, the free bodies checking none; \
+	python3 -I scripts/check_chkcse.py $(BUILDDIR)/runlen.s sum5:5,mix5:5,back:4,local5:10; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/runlen0 testdata/runlen.paslang; \
+	$(BUILDDIR)/runlen0 > $(BUILDDIR)/runlen0.got; \
+	diff -u testdata/runlen.out $(BUILDDIR)/runlen0.got; \
+	python3 -I scripts/check_chkcse.py $(BUILDDIR)/runlen0.s sum5:5,mix5:5,back:4,local5:10; \
+	echo ok runlen-asm; \
 	: every loop of an asm kernel of the units starts aligned, as the loops paslangc compiles, P302; \
 	python3 -I scripts/check_kernel_align.py src/lib/*.paslang src/rtl/*.paslang; \
 	echo ok kernel-align; \
@@ -3261,7 +3271,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'paslang: unlock of an unlocked mutex' $(BUILDDIR)/unlockfree.err; \
 	echo ok unlockfree; \
 	echo "==== fatal ===="; \
-	for t in divzero nilptr deep oom oomlimit closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg leafnil bmaskwide bmodneg bmaskone bforpast bvarctr bnestctr bsumstat bsumdyn bsumneg bkeepfirst bkeepmoved bkeepstat bkeepshrunk; do \
+	for t in divzero nilptr deep oom oomlimit closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg leafnil bmaskwide bmodneg bmaskone bforpast bvarctr bnestctr bsumstat bsumdyn bsumneg bkeepfirst bkeepmoved bkeepstat bkeepshrunk brunlen brunloc; do \
 	  $(OUTDIR)/paslangc -o $(BUILDDIR)/fatal_$$t testdata/fatal/$$t.paslang; \
 	  set +e; \
 	  if [ $$t = oomlimit ]; then \
@@ -3291,6 +3301,9 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'paslang: index 10 out of range \[0..9\] at line 20' $(BUILDDIR)/fatal_bkeepmoved.err; \
 	grep -q 'paslang: index 9 out of range \[1..8\] at line 20' $(BUILDDIR)/fatal_bkeepstat.err; \
 	grep -q 'paslang: index 3 out of range \[0..2\] at line 15' $(BUILDDIR)/fatal_bkeepshrunk.err; \
+	: P319: a run that does not fit a slice proved by its length at home runs the checked body, which reports the index; \
+	grep -q 'paslang: index 30 out of range \[0..29\] at line 15' $(BUILDDIR)/fatal_brunlen.err; \
+	grep -q 'paslang: index 1500 out of range \[0..1499\] at line 17' $(BUILDDIR)/fatal_brunloc.err; \
 	grep -q 'paslang: stack overflow at line 12' $(BUILDDIR)/fatal_deep.err; \
 	grep -q 'paslang: out of memory: [0-9][0-9]* MiB mapped' $(BUILDDIR)/fatal_oom.err; \
 	grep -q 'paslang: out of memory: [0-9][0-9]* MiB mapped' $(BUILDDIR)/fatal_oomlimit.err; \
@@ -3637,11 +3650,11 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	: P316 on arm64: chkcse under the stress of the collector and without inlining, Fields checking once an element; \
 	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 timeout 300 $(QEMU_A64) $(BUILDDIR)/chkcse-arm > $(BUILDDIR)/chkcse-arm-gc.got; \
 	diff -u testdata/chkcse.out $(BUILDDIR)/chkcse-arm-gc.got; \
-	python3 -I scripts/check_chkcse.py $(BUILDDIR)/chkcse-arm.s fields:8,called:1,joined:3; \
+	python3 -I scripts/check_chkcse.py $(BUILDDIR)/chkcse-arm.s fields:6,called:1,joined:3; \
 	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/chkcse0-arm testdata/chkcse.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/chkcse0-arm > $(BUILDDIR)/chkcse0-arm.got; \
 	diff -u testdata/chkcse.out $(BUILDDIR)/chkcse0-arm.got; \
-	python3 -I scripts/check_chkcse.py $(BUILDDIR)/chkcse0-arm.s fields:8,joined:3; \
+	python3 -I scripts/check_chkcse.py $(BUILDDIR)/chkcse0-arm.s fields:6,joined:3; \
 	echo ok chkcse-arm-asm; \
 	: P317 on arm64: convmul with and without inlining, the recipe from the register of the variable; \
 	python3 -I scripts/check_convmul.py $(BUILDDIR)/convmul-arm.s --arm; \
@@ -3657,6 +3670,13 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	diff -u testdata/regassign.out $(BUILDDIR)/regassign0-arm.got; \
 	python3 -I scripts/check_regassign.py $(BUILDDIR)/regassign0-arm.s --arm; \
 	echo ok regassign-arm-asm; \
+	: P319 on arm64: runlen with and without inlining, the free bodies checking none; \
+	python3 -I scripts/check_chkcse.py $(BUILDDIR)/runlen-arm.s sum5:5,mix5:5,back:4,local5:10; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/runlen0-arm testdata/runlen.paslang; \
+	timeout 300 $(QEMU_A64) $(BUILDDIR)/runlen0-arm > $(BUILDDIR)/runlen0-arm.got; \
+	diff -u testdata/runlen.out $(BUILDDIR)/runlen0-arm.got; \
+	python3 -I scripts/check_chkcse.py $(BUILDDIR)/runlen0-arm.s sum5:5,mix5:5,back:4,local5:10; \
+	echo ok runlen-arm-asm; \
 	$(OUTDIR)/paslangc -target arm64 -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/exprinline0-arm testdata/exprinline.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/exprinline0-arm > $(BUILDDIR)/exprinline0-arm.got; \
 	diff -u testdata/exprinline.out $(BUILDDIR)/exprinline0-arm.got; \
@@ -3867,7 +3887,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	grep -q 'paslang: unlock of an unlocked mutex' $(BUILDDIR)/unlockfree-arm.err; \
 	echo ok unlockfree-arm; \
 	echo "==== fatal arm64 ===="; \
-	for t in divzero nilptr deep oom closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg leafnil bmaskwide bmodneg bmaskone bforpast bvarctr bnestctr bsumstat bsumdyn bsumneg bkeepfirst bkeepmoved bkeepstat bkeepshrunk; do \
+	for t in divzero nilptr deep oom closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg leafnil bmaskwide bmodneg bmaskone bforpast bvarctr bnestctr bsumstat bsumdyn bsumneg bkeepfirst bkeepmoved bkeepstat bkeepshrunk brunlen brunloc; do \
 	  $(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/fatal_$$t-arm testdata/fatal/$$t.paslang; \
 	  set +e; timeout 60 $(QEMU_A64) $(BUILDDIR)/fatal_$$t-arm > $(BUILDDIR)/fatal_$$t-arm.got 2> $(BUILDDIR)/fatal_$$t-arm.err; rc=$$?; set -e; \
 	  test $$rc -eq 1; \
@@ -3889,6 +3909,8 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	grep -q 'paslang: index 10 out of range \[0..9\] at line 20' $(BUILDDIR)/fatal_bkeepmoved-arm.err; \
 	grep -q 'paslang: index 9 out of range \[1..8\] at line 20' $(BUILDDIR)/fatal_bkeepstat-arm.err; \
 	grep -q 'paslang: index 3 out of range \[0..2\] at line 15' $(BUILDDIR)/fatal_bkeepshrunk-arm.err; \
+	grep -q 'paslang: index 30 out of range \[0..29\] at line 15' $(BUILDDIR)/fatal_brunlen-arm.err; \
+	grep -q 'paslang: index 1500 out of range \[0..1499\] at line 17' $(BUILDDIR)/fatal_brunloc-arm.err; \
 	grep -q 'paslang: stack overflow at line 12' $(BUILDDIR)/fatal_deep-arm.err; \
 	grep -q 'paslang: out of memory: [0-9][0-9]* MiB mapped' $(BUILDDIR)/fatal_oom-arm.err; \
 	grep -q 'paslang: send on closed channel at line 11' $(BUILDDIR)/fatal_closed-arm.err; \
