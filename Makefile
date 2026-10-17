@@ -358,6 +358,9 @@ GOLDEN_A64 += armconst
 # P316: a bounds check an earlier one proves is left out.
 GOLDEN += chkcse
 GOLDEN_A64 += chkcse
+# P317: a product inside a conversion reads its variable in its register.
+GOLDEN += convmul
+GOLDEN_A64 += convmul
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -2433,6 +2436,13 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/chkcse.out $(BUILDDIR)/chkcse0.got; \
 	python3 -I scripts/check_chkcse.py $(BUILDDIR)/chkcse0.s fields:8,joined:3; \
 	echo ok chkcse-asm; \
+	: a product by a constant under a narrowing conversion read from the register of the variable, P317: convmul with and without inlining; \
+	python3 -I scripts/check_convmul.py $(BUILDDIR)/convmul.s; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/convmul0 testdata/convmul.paslang; \
+	$(BUILDDIR)/convmul0 > $(BUILDDIR)/convmul0.got; \
+	diff -u testdata/convmul.out $(BUILDDIR)/convmul0.got; \
+	python3 -I scripts/check_convmul.py $(BUILDDIR)/convmul0.s; \
+	echo ok convmul-asm; \
 	: every loop of an asm kernel of the units starts aligned, as the loops paslangc compiles, P302; \
 	python3 -I scripts/check_kernel_align.py src/lib/*.paslang src/rtl/*.paslang; \
 	echo ok kernel-align; \
@@ -3623,6 +3633,13 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	diff -u testdata/chkcse.out $(BUILDDIR)/chkcse0-arm.got; \
 	python3 -I scripts/check_chkcse.py $(BUILDDIR)/chkcse0-arm.s fields:8,joined:3; \
 	echo ok chkcse-arm-asm; \
+	: P317 on arm64: convmul with and without inlining, the recipe from the register of the variable; \
+	python3 -I scripts/check_convmul.py $(BUILDDIR)/convmul-arm.s --arm; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/convmul0-arm testdata/convmul.paslang; \
+	timeout 300 $(QEMU_A64) $(BUILDDIR)/convmul0-arm > $(BUILDDIR)/convmul0-arm.got; \
+	diff -u testdata/convmul.out $(BUILDDIR)/convmul0-arm.got; \
+	python3 -I scripts/check_convmul.py $(BUILDDIR)/convmul0-arm.s --arm; \
+	echo ok convmul-arm-asm; \
 	$(OUTDIR)/paslangc -target arm64 -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/exprinline0-arm testdata/exprinline.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/exprinline0-arm > $(BUILDDIR)/exprinline0-arm.got; \
 	diff -u testdata/exprinline.out $(BUILDDIR)/exprinline0-arm.got; \
