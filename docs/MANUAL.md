@@ -5339,7 +5339,7 @@ begin
   WriteLn(Hex(Md5('abc')), ' ', Crc32('abc'), ' ', Crc32c('abc'));
   WriteLn(Hex(HmacSha256('key', 'The quick brown fox jumps over the lazy dog')));
 
-  db := StoreOpen('/tmp/paslang-trees-example');
+  db := StoreOpen(ParamStr(0) + '.store');   { beside the program }
   StorePut(db, 'greeting', 'hello');
   StorePut(db, 'count', '3');
   StoreDelete(db, 'count');
@@ -5440,10 +5440,8 @@ first.
   as a crash would leave them, and the next open replays the log. }
 program kvstore;
 
-const
-  Path = '/tmp/paslang-kvstore-example';
-
 var
+  Path: string;
   db: store;
   i: Integer;
 
@@ -5460,6 +5458,7 @@ begin
 end;
 
 begin
+  Path := ParamStr(0) + '.kv';           { beside the program: two runs apart }
   Remove(Path);                          { start clean }
   Remove(Path + '.wal');
   db := StoreOpen(Path);                 { makes the table and the log }
@@ -6932,8 +6931,8 @@ begin
   for i := 1 to SizeOf(h) do
     s[i] := Char(p[i - 1]);          { a record's bytes, padding included }
   WriteLn(SizeOf(h), ' ', Hex(s), ' ', Hex(Sha256(s)));
-  WriteFile('/tmp/paslang-digest.txt', 'The quick brown fox jumps over the lazy dog');
-  if ReadFile('/tmp/paslang-digest.txt', data) then
+  WriteFile(ParamStr(0) + '.txt', 'The quick brown fox jumps over the lazy dog');
+  if ReadFile(ParamStr(0) + '.txt', data) then
     WriteLn(Length(data), ' ', Hex(Sha1(data)));   { the classic SHA-1 vector }
   crc := 0;                          { a stream in pieces: the value so far goes on }
   for i := 1 to 4 do

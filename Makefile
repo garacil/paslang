@@ -709,13 +709,13 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	@sh scripts/check_cpufeat.sh "$(OUTDIR)/paslangc" "$(BUILDDIR)" $(QEMU_A64)
 	@set -e; \
 	xrun=""; \
+	: each run its own X server on a display it picks and writes, -displayfd, so two runs keep apart, P156; \
 	if command -v Xvfb > /dev/null 2>&1; then \
-	  if [ ! -e /tmp/.X11-unix/X99 ]; then \
-	    Xvfb :99 -screen 0 1024x768x24 -ac > /dev/null 2>&1 & \
-	    echo $$! > $(BUILDDIR)/xvfb.pid; \
-	    sleep 1; \
-	  fi; \
-	  xrun="env DISPLAY=:99"; \
+	  rm -f $(BUILDDIR)/xvfb.display; \
+	  Xvfb -displayfd 3 -screen 0 1024x768x24 -ac 3> $(BUILDDIR)/xvfb.display > /dev/null 2>&1 & \
+	  echo $$! > $(BUILDDIR)/xvfb.pid; \
+	  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s $(BUILDDIR)/xvfb.display ] && break; sleep 1; done; \
+	  xrun="env DISPLAY=:$$(cat $(BUILDDIR)/xvfb.display)"; \
 	fi; \
 	rm -f $(BUILDDIR)/fh.txt; \
 	echo "==== spawnrace ===="; \
@@ -2495,7 +2495,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	echo ok forward-rejects; \
 	:
 	@set -e; \
-	xrun=""; if command -v Xvfb >/dev/null 2>&1; then xrun="env DISPLAY=:99"; fi; \
+	xrun=""; if [ -s $(BUILDDIR)/xvfb.display ]; then xrun="env DISPLAY=:$$(cat $(BUILDDIR)/xvfb.display)"; fi; \
 	echo "==== units ===="; \
 	$(OUTDIR)/paslangc testdata/units/adder.paslang; \
 	$(OUTDIR)/paslangc testdata/units/dbl.paslang; \
@@ -3349,7 +3349,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	echo ok helpbox; \
 	if [ -f $(BUILDDIR)/xvfb.pid ]; then \
 	  kill $$(cat $(BUILDDIR)/xvfb.pid) 2> /dev/null || true; \
-	  rm -f $(BUILDDIR)/xvfb.pid; \
+	  rm -f $(BUILDDIR)/xvfb.pid $(BUILDDIR)/xvfb.display; \
 	fi; \
 	echo "==== stage ===="; \
 	: the installed paslangc builds the sources when it is BOOT_MIN or later, as for bin/paslangc, else the one in bin/ does; \
