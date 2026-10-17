@@ -346,6 +346,9 @@ GOLDEN_A64 += fieldaddr
 # P312: every product by a constant takes its recipe, the remainder's too.
 GOLDEN += modconst
 GOLDEN_A64 += modconst
+# P313: an index that is a sum takes its constant into the displacement.
+GOLDEN += idxsum
+GOLDEN_A64 += idxsum
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -2396,6 +2399,13 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/modconst.out $(BUILDDIR)/modconst0.got; \
 	python3 -I scripts/check_modconst.py $(BUILDDIR)/modconst0.s; \
 	echo ok modconst-asm; \
+	: an index that is a sum takes its constant into the displacement, P313: the routines Run of idxsum add nothing to an index before its scale and multiply no index, with and without inlining; \
+	python3 -I scripts/check_idxsum.py $(BUILDDIR)/idxsum.s run12,run20,run24,run28,run40,run48,run56; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/idxsum0 testdata/idxsum.paslang; \
+	$(BUILDDIR)/idxsum0 > $(BUILDDIR)/idxsum0.got; \
+	diff -u testdata/idxsum.out $(BUILDDIR)/idxsum0.got; \
+	python3 -I scripts/check_idxsum.py $(BUILDDIR)/idxsum0.s run12,run20,run24,run28,run40,run48,run56; \
+	echo ok idxsum-asm; \
 	: every loop of an asm kernel of the units starts aligned, as the loops paslangc compiles, P302; \
 	python3 -I scripts/check_kernel_align.py src/lib/*.paslang src/rtl/*.paslang; \
 	echo ok kernel-align; \
@@ -3204,7 +3214,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'paslang: unlock of an unlocked mutex' $(BUILDDIR)/unlockfree.err; \
 	echo ok unlockfree; \
 	echo "==== fatal ===="; \
-	for t in divzero nilptr deep oom oomlimit closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg leafnil bmaskwide bmodneg bmaskone bforpast bvarctr bnestctr; do \
+	for t in divzero nilptr deep oom oomlimit closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg leafnil bmaskwide bmodneg bmaskone bforpast bvarctr bnestctr bsumstat bsumdyn bsumneg; do \
 	  $(OUTDIR)/paslangc -o $(BUILDDIR)/fatal_$$t testdata/fatal/$$t.paslang; \
 	  set +e; \
 	  if [ $$t = oomlimit ]; then \
@@ -3225,6 +3235,10 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'paslang: index 64 out of range \[0..63\] at line 11' $(BUILDDIR)/fatal_bforpast.err; \
 	grep -q 'paslang: index 50 out of range \[0..9\] at line 20' $(BUILDDIR)/fatal_bvarctr.err; \
 	grep -q 'paslang: index 50 out of range \[0..9\] at line 21' $(BUILDDIR)/fatal_bnestctr.err; \
+	: P313: an index v + c with v in a register reports v + c; \
+	grep -q 'paslang: index 65 out of range \[1..64\] at line 15' $(BUILDDIR)/fatal_bsumstat.err; \
+	grep -q 'paslang: index 10 out of range \[0..9\] at line 14' $(BUILDDIR)/fatal_bsumdyn.err; \
+	grep -q 'paslang: index -4 out of range \[-3..20\] at line 17' $(BUILDDIR)/fatal_bsumneg.err; \
 	grep -q 'paslang: stack overflow at line 12' $(BUILDDIR)/fatal_deep.err; \
 	grep -q 'paslang: out of memory: [0-9][0-9]* MiB mapped' $(BUILDDIR)/fatal_oom.err; \
 	grep -q 'paslang: out of memory: [0-9][0-9]* MiB mapped' $(BUILDDIR)/fatal_oomlimit.err; \
@@ -3541,6 +3555,13 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	diff -u testdata/modconst.out $(BUILDDIR)/modconst0-arm.got; \
 	python3 -I scripts/check_modconst.py $(BUILDDIR)/modconst0-arm.s --arm; \
 	echo ok modconst-arm-asm; \
+	: P313 on arm64: the routines Run of idxsum add no constant to an index before its scale and none to the address of an element where the offset of the load or store takes it, with and without inlining; \
+	python3 -I scripts/check_idxsum.py $(BUILDDIR)/idxsum-arm.s run12,run20,run24,run28,run40,run48,run56 --arm; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/idxsum0-arm testdata/idxsum.paslang; \
+	timeout 300 $(QEMU_A64) $(BUILDDIR)/idxsum0-arm > $(BUILDDIR)/idxsum0-arm.got; \
+	diff -u testdata/idxsum.out $(BUILDDIR)/idxsum0-arm.got; \
+	python3 -I scripts/check_idxsum.py $(BUILDDIR)/idxsum0-arm.s run12,run20,run24,run28,run40,run48,run56 --arm; \
+	echo ok idxsum-arm-asm; \
 	$(OUTDIR)/paslangc -target arm64 -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/exprinline0-arm testdata/exprinline.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/exprinline0-arm > $(BUILDDIR)/exprinline0-arm.got; \
 	diff -u testdata/exprinline.out $(BUILDDIR)/exprinline0-arm.got; \
@@ -3750,7 +3771,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	grep -q 'paslang: unlock of an unlocked mutex' $(BUILDDIR)/unlockfree-arm.err; \
 	echo ok unlockfree-arm; \
 	echo "==== fatal arm64 ===="; \
-	for t in divzero nilptr deep oom closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg leafnil bmaskwide bmodneg bmaskone bforpast bvarctr bnestctr; do \
+	for t in divzero nilptr deep oom closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg leafnil bmaskwide bmodneg bmaskone bforpast bvarctr bnestctr bsumstat bsumdyn bsumneg; do \
 	  $(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/fatal_$$t-arm testdata/fatal/$$t.paslang; \
 	  set +e; timeout 60 $(QEMU_A64) $(BUILDDIR)/fatal_$$t-arm > $(BUILDDIR)/fatal_$$t-arm.got 2> $(BUILDDIR)/fatal_$$t-arm.err; rc=$$?; set -e; \
 	  test $$rc -eq 1; \
@@ -3765,6 +3786,9 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	grep -q 'paslang: index 64 out of range \[0..63\] at line 11' $(BUILDDIR)/fatal_bforpast-arm.err; \
 	grep -q 'paslang: index 50 out of range \[0..9\] at line 20' $(BUILDDIR)/fatal_bvarctr-arm.err; \
 	grep -q 'paslang: index 50 out of range \[0..9\] at line 21' $(BUILDDIR)/fatal_bnestctr-arm.err; \
+	grep -q 'paslang: index 65 out of range \[1..64\] at line 15' $(BUILDDIR)/fatal_bsumstat-arm.err; \
+	grep -q 'paslang: index 10 out of range \[0..9\] at line 14' $(BUILDDIR)/fatal_bsumdyn-arm.err; \
+	grep -q 'paslang: index -4 out of range \[-3..20\] at line 17' $(BUILDDIR)/fatal_bsumneg-arm.err; \
 	grep -q 'paslang: stack overflow at line 12' $(BUILDDIR)/fatal_deep-arm.err; \
 	grep -q 'paslang: out of memory: [0-9][0-9]* MiB mapped' $(BUILDDIR)/fatal_oom-arm.err; \
 	grep -q 'paslang: send on closed channel at line 11' $(BUILDDIR)/fatal_closed-arm.err; \

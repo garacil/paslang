@@ -26776,10 +26776,16 @@ begin
     end;
     Exit;
   end;
-  if MulRecipe(K, f, i, o) and ((f <= 2) or (Tmp <> '')) and
+  if MulRecipe(K, f, i, o) and ((f <= 2) or (Tmp <> '') or (D <> S)) and
     (FArm or not ((S = '%r13') or (S = '%rbp') or (D = '%r13') or (D = '%rbp'))) then
   begin
-    MulRecipeVia(D, S, f, i, o, Tmp);
+    { a recipe of two values with no Tmp takes D for the first when D is
+      not S: forms 3 and 4 write D last from S and it, so x * 7 into
+      another register is two leas where it was IMUL (P313) }
+    t := Tmp;
+    if (t = '') and (f > 2) then
+      t := D;
+    MulRecipeVia(D, S, f, i, o, t);
     Exit;
   end;
   if FArm then
@@ -27953,14 +27959,15 @@ end;
 
 function TEmitter.EmitWordMem(E: PExpr; D: LongInt): string;
 var
-  r, idx, lenop, lenlab, ok, ok2, preg, lreg, lenR, glab, bs, reclab, m: string;
+  r, idx, lenop, lenlab, ok, ok2, preg, lreg, lenR, glab, bs, reclab, m, ixop: string;
   recglob: Boolean;
   td: TTypeDef;
   esz, sh, lk, asz: LongInt;
-  disp, k, lenk, lenoff, fo: Int64;
+  disp, k, lenk, lenoff, fo, ixk: Int64;
   s: TSym;
   fat, desc, isc, nochk, near, frm: Boolean;
   foff: Int64;
+  ib: PExpr;
 begin
   r := OrdPool(D);
   Result := '';
@@ -28084,10 +28091,13 @@ begin
         else if FArm and (E^.L^.Kind = ekDeref) and (WordReg(E^.L^.L) <> '') then
           { p^.f with p in a register: p's register is the base (P303) }
           bs := WordReg(E^.L^.L)
-        else if FArm and (E^.L^.Kind = ekField) then
+        else if FArm and ((E^.L^.Kind = ekField) or (E^.L^.Kind = ekIndex)) then
         begin
           { arm64: a field of a field takes both offsets in the load's or
-            the store's own, where the inner one was an ADD first (P311) }
+            the store's own, where the inner one was an ADD first (P311);
+            a field of an element the element's operand, its displacement
+            (a low bound's, a constant of the index) joining the field's
+            offset where a SUB came first (P313) }
           m := EmitWordMem(E^.L, D);
           if FWmIdx <> '' then
           begin
@@ -28118,9 +28128,10 @@ begin
           a record's or an array's field is no load, its offset the one a
           field of it adds to its own, or EmitWordBase's ADD (P311). }
         asz := TSize(LoadTyp(E));
-        if (fo > 0) and ((((asz = 1) or (asz = 2) or (asz = 4) or (asz = 8)) and
+        if ((fo > 0) and ((((asz = 1) or (asz = 2) or (asz = 4) or (asz = 8)) and
           (fo mod asz = 0) and (fo div asz <= 4095)) or
-          (((TKind(E^.Typ) = tykRecord) or (TKind(E^.Typ) = tykArray)) and (fo <= 4095))) then
+          (((TKind(E^.Typ) = tykRecord) or (TKind(E^.Typ) = tykArray)) and (fo <= 4095)))) or
+          ((fo >= -256) and (fo <= 255)) then
         begin
           WmSet(bs, '', 0, fo);
           Result := '[' + bs + ', #' + IntToStr(fo) + ']';
@@ -28251,15 +28262,33 @@ begin
         isc := (E^.R^.Kind = ekInt) and Fits32(disp + E^.R^.Num * esz);
         k := 0;
         idx := '';
+        ixk := 0;
         if isc then
           k := E^.R^.Num
         else if (E^.R^.Kind = ekVar) and WordVar(E^.R, s) and (s.Reg <> '') then
           idx := s.Reg
+        else if ConstAddend(E^.R, ib, ixk) and (ib^.Kind = ekVar) and WordVar(ib, s) and
+          (s.Reg <> '') and (disp + ixk * esz >= -(Int64(1) shl 30)) and
+          (disp + ixk * esz <= Int64(1) shl 30) then
+          { v + c and v - c with v in a register: the index is v, and c
+            times the element's size joins the displacement after the
+            check, as Go folds an ADDQconst of the index into the
+            offset, LEAQ8 [c] x (ADDQconst [d] y) being LEAQ8 [c+8*d] x y
+            (AMD64.rules; ARM64.rules 699 takes an ADDconst into the
+            load's offset): no add of the index first, and a constant c
+            of a low bound's size cancels it (P313) }
+          idx := s.Reg
         else
         begin
+          ixk := 0;
           EmitOrdTo(E^.R, D + 1);
           idx := OrdPool(D + 1);
         end;
+        { the index's value for a failure's report: v + c }
+        if FArm or (ixk = 0) then
+          ixop := idx
+        else
+          ixop := IntToStr(ixk) + '(%' + idx + ')';
         { The check, before any address is formed (P87). The index is a
           constant k (isc) or in register idx, which may be a promoted
           variable's and is only read. }
@@ -28310,15 +28339,21 @@ begin
             end
             else if (not nochk) and (not SliceProven(E)) then
             begin
-              if disp = -1 then
+              if (disp = -1) or (ixk <> 0) then
               begin
-                Line('  sub x1, ' + idx + ', #1');
+                AddImmArm('x1', idx, ixk + disp);
                 Line('  cmp x1, ' + lenR);
               end
               else
                 Line('  cmp ' + idx + ', ' + lenR);
               ColdBegin('  b.hs');
-              BoundsFailArm(idx, 0, -disp, lenR, 0, -1 - disp);
+              if ixk <> 0 then
+              begin
+                AddImmArm('x17', idx, ixk);
+                BoundsFailArm('x17', 0, -disp, lenR, 0, -1 - disp);
+              end
+              else
+                BoundsFailArm(idx, 0, -disp, lenR, 0, -1 - disp);
               ColdEnd;
             end;
             if ok <> '' then
@@ -28354,15 +28389,18 @@ begin
             end
             else if (not nochk) and (not SliceProven(E)) then
             begin
-              if disp = -1 then
+              if (disp = -1) or (ixk <> 0) then
               begin
-                Line('  leaq -1(%' + idx + '), %rcx');
+                Line('  leaq ' + IntToStr(ixk + disp) + '(%' + idx + '), %rcx');
                 Line('  cmpq ' + lenop + ', %rcx');
               end
               else
                 Line('  cmpq ' + lenop + ', %' + idx);
               ColdBegin('  jae');
-              BoundsFailX86('%' + idx, -disp, lenop, 0, -1 - disp);
+              if ixk <> 0 then
+                BoundsFailX86(ixop, -disp, lenop, 0, -1 - disp)
+              else
+                BoundsFailX86('%' + idx, -disp, lenop, 0, -1 - disp);
               ColdEnd;
             end;
             if ok <> '' then
@@ -28388,18 +28426,21 @@ begin
             ok := Lab;
             if FArm then
             begin
-              if td.Lo = 0 then
-                Line('  mov x1, ' + idx)
-              else
-                AddImmArm('x1', idx, -td.Lo);
+              AddImmArm('x1', idx, ixk - td.Lo);
               CmpImmArm('x1', td.Hi - td.Lo, 'x0');
               ColdBegin('  b.hi');
-              BoundsFailArm(idx, 0, td.Lo, '', td.Hi, 0);
+              if ixk <> 0 then
+              begin
+                AddImmArm('x17', idx, ixk);
+                BoundsFailArm('x17', 0, td.Lo, '', td.Hi, 0);
+              end
+              else
+                BoundsFailArm(idx, 0, td.Lo, '', td.Hi, 0);
               ColdEnd;
             end
             else
             begin
-              if td.Lo = 0 then
+              if (td.Lo = 0) and (ixk = 0) then
               begin
                 if Fits32(td.Hi) then
                   Line('  cmpq $' + IntToStr(td.Hi) + ', %' + idx)
@@ -28411,12 +28452,12 @@ begin
               end
               else
               begin
-                if Fits32(-td.Lo) then
-                  Line('  leaq ' + IntToStr(-td.Lo) + '(%' + idx + '), %rcx')
+                if Fits32(ixk - td.Lo) then
+                  Line('  leaq ' + IntToStr(ixk - td.Lo) + '(%' + idx + '), %rcx')
                 else
                 begin
                   Line('  movq %' + idx + ', %rcx');
-                  LoadImmR('rax', td.Lo);
+                  LoadImmR('rax', td.Lo - ixk);
                   Line('  subq %rax, %rcx');
                 end;
                 if Fits32(td.Hi - td.Lo) then
@@ -28428,12 +28469,16 @@ begin
                 end;
               end;
               ColdBegin('  ja');
-              BoundsFailX86('%' + idx, td.Lo, '', td.Hi, 0);
+              if ixk <> 0 then
+                BoundsFailX86(ixop, td.Lo, '', td.Hi, 0)
+              else
+                BoundsFailX86('%' + idx, td.Lo, '', td.Hi, 0);
               ColdEnd;
             end;
             Line(ok + ':');
           end;
         end;
+        disp := disp + ixk * esz;
         if isc then
         begin
           disp := disp + k * esz;
@@ -28487,9 +28532,26 @@ begin
               Line('  add ' + OrdPool(D) + ', ' + r + ', ' + idx + ', lsl #' + IntToStr(sh))
             else
             begin
-              ScaleAddArm(OrdPool(D), r, idx, esz, 'x17', '');
+              { x16, scratch here as the checks' x1 and x17 are, takes a
+                recipe's second value (P313) }
+              ScaleAddArm(OrdPool(D), r, idx, esz, 'x17', 'x16');
             end;
             r := OrdPool(D);
+            { the displacement, a low bound's or a constant of the index,
+              in the load's or store's own offset where an ADD or SUB
+              came first (P313): LDUR's and STUR's -256 to 255 (ARM DDI
+              0487 M.c C6.2.259 and C6.2.446), LDR's and STR's multiple
+              of the element up to 4095 of them (C6.2.216, C6.2.415), and
+              any for a record's or an array's element, whose field adds
+              its offset and checks the sum (P311) }
+            if (disp <> 0) and (((disp >= -256) and (disp <= 255)) or
+              ((sh >= 0) and (disp > 0) and (disp mod esz = 0) and (disp div esz <= 4095)) or
+              (sh < 0)) then
+            begin
+              WmSet(r, '', 0, disp);
+              Result := '[' + r + ', #' + IntToStr(disp) + ']';
+              Exit;
+            end;
             if disp <> 0 then
               AddImmArm(r, r, disp);
           end
@@ -28513,7 +28575,10 @@ begin
                 esz := esz shr 1;
                 Inc(sh);
               end;
-              ScaleTo('%' + idx, '%' + m, esz, '');
+              { rcx, which the checks above take as their scratch, holds
+                a recipe's second value when the index is scaled in its
+                own register (P313) }
+              ScaleTo('%' + idx, '%' + m, esz, '%rcx');
               esz := Int64(1) shl sh;
             end;
             if glab <> '' then
@@ -29245,7 +29310,11 @@ begin
   { A limit in rdi, where the index goes, moves out of it first. }
   if (Hi = '%rdi') and (Idx <> '%rdi') then
     Line('  movq %rdi, %rdx');
-  Line('  movq ' + Idx + ', %rdi');
+  { an index that is a register plus a constant, c(%r), is its sum (P313) }
+  if Pos('(', Idx) > 0 then
+    Line('  leaq ' + Idx + ', %rdi')
+  else
+    Line('  movq ' + Idx + ', %rdi');
   if Hi = '' then
     LoadImmR('rdx', HiK)
   else if (Hi <> '%rdx') and not ((Hi = '%rdi') and (Idx <> '%rdi')) then
