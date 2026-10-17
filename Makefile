@@ -355,6 +355,9 @@ GOLDEN_A64 += fieldcse
 # P315: an arm64 constant goes into its register with no literal load.
 GOLDEN += armconst
 GOLDEN_A64 += armconst
+# P316: a bounds check an earlier one proves is left out.
+GOLDEN += chkcse
+GOLDEN_A64 += chkcse
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -2421,6 +2424,15 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/fieldcse.out $(BUILDDIR)/fieldcse0.got; \
 	python3 -I scripts/check_fieldcse.py $(BUILDDIR)/fieldcse0.s same:2,inheap:4; \
 	echo ok fieldcse-asm; \
+	: a bounds check an earlier one of the same index and length proves left out, P316: chkcse under the stress of the collector and without inlining, Fields checking once an element; \
+	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 $(BUILDDIR)/chkcse > $(BUILDDIR)/chkcse-gc.got; \
+	diff -u testdata/chkcse.out $(BUILDDIR)/chkcse-gc.got; \
+	python3 -I scripts/check_chkcse.py $(BUILDDIR)/chkcse.s fields:8,called:1,joined:3; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/chkcse0 testdata/chkcse.paslang; \
+	$(BUILDDIR)/chkcse0 > $(BUILDDIR)/chkcse0.got; \
+	diff -u testdata/chkcse.out $(BUILDDIR)/chkcse0.got; \
+	python3 -I scripts/check_chkcse.py $(BUILDDIR)/chkcse0.s fields:8,joined:3; \
+	echo ok chkcse-asm; \
 	: every loop of an asm kernel of the units starts aligned, as the loops paslangc compiles, P302; \
 	python3 -I scripts/check_kernel_align.py src/lib/*.paslang src/rtl/*.paslang; \
 	echo ok kernel-align; \
@@ -3229,7 +3241,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'paslang: unlock of an unlocked mutex' $(BUILDDIR)/unlockfree.err; \
 	echo ok unlockfree; \
 	echo "==== fatal ===="; \
-	for t in divzero nilptr deep oom oomlimit closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg leafnil bmaskwide bmodneg bmaskone bforpast bvarctr bnestctr bsumstat bsumdyn bsumneg; do \
+	for t in divzero nilptr deep oom oomlimit closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg leafnil bmaskwide bmodneg bmaskone bforpast bvarctr bnestctr bsumstat bsumdyn bsumneg bkeepfirst bkeepmoved bkeepstat bkeepshrunk; do \
 	  $(OUTDIR)/paslangc -o $(BUILDDIR)/fatal_$$t testdata/fatal/$$t.paslang; \
 	  set +e; \
 	  if [ $$t = oomlimit ]; then \
@@ -3254,6 +3266,11 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'paslang: index 65 out of range \[1..64\] at line 15' $(BUILDDIR)/fatal_bsumstat.err; \
 	grep -q 'paslang: index 10 out of range \[0..9\] at line 14' $(BUILDDIR)/fatal_bsumdyn.err; \
 	grep -q 'paslang: index -4 out of range \[-3..20\] at line 17' $(BUILDDIR)/fatal_bsumneg.err; \
+	: P316: the first of the checks of an element reports its index, and one is made again where the index or the length changed; \
+	grep -q 'paslang: index 10 out of range \[0..9\] at line 17' $(BUILDDIR)/fatal_bkeepfirst.err; \
+	grep -q 'paslang: index 10 out of range \[0..9\] at line 20' $(BUILDDIR)/fatal_bkeepmoved.err; \
+	grep -q 'paslang: index 9 out of range \[1..8\] at line 20' $(BUILDDIR)/fatal_bkeepstat.err; \
+	grep -q 'paslang: index 3 out of range \[0..2\] at line 15' $(BUILDDIR)/fatal_bkeepshrunk.err; \
 	grep -q 'paslang: stack overflow at line 12' $(BUILDDIR)/fatal_deep.err; \
 	grep -q 'paslang: out of memory: [0-9][0-9]* MiB mapped' $(BUILDDIR)/fatal_oom.err; \
 	grep -q 'paslang: out of memory: [0-9][0-9]* MiB mapped' $(BUILDDIR)/fatal_oomlimit.err; \
@@ -3597,6 +3614,15 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	diff -u testdata/armconst.out $(BUILDDIR)/armconst0-arm.got; \
 	python3 -I scripts/check_armconst.py $(BUILDDIR)/armconst0-arm.s --source=testdata/armconst.paslang; \
 	echo ok armconst-arm-asm; \
+	: P316 on arm64: chkcse under the stress of the collector and without inlining, Fields checking once an element; \
+	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 timeout 300 $(QEMU_A64) $(BUILDDIR)/chkcse-arm > $(BUILDDIR)/chkcse-arm-gc.got; \
+	diff -u testdata/chkcse.out $(BUILDDIR)/chkcse-arm-gc.got; \
+	python3 -I scripts/check_chkcse.py $(BUILDDIR)/chkcse-arm.s fields:8,called:1,joined:3; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/chkcse0-arm testdata/chkcse.paslang; \
+	timeout 300 $(QEMU_A64) $(BUILDDIR)/chkcse0-arm > $(BUILDDIR)/chkcse0-arm.got; \
+	diff -u testdata/chkcse.out $(BUILDDIR)/chkcse0-arm.got; \
+	python3 -I scripts/check_chkcse.py $(BUILDDIR)/chkcse0-arm.s fields:8,joined:3; \
+	echo ok chkcse-arm-asm; \
 	$(OUTDIR)/paslangc -target arm64 -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/exprinline0-arm testdata/exprinline.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/exprinline0-arm > $(BUILDDIR)/exprinline0-arm.got; \
 	diff -u testdata/exprinline.out $(BUILDDIR)/exprinline0-arm.got; \
@@ -3807,7 +3833,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	grep -q 'paslang: unlock of an unlocked mutex' $(BUILDDIR)/unlockfree-arm.err; \
 	echo ok unlockfree-arm; \
 	echo "==== fatal arm64 ===="; \
-	for t in divzero nilptr deep oom closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg leafnil bmaskwide bmodneg bmaskone bforpast bvarctr bnestctr bsumstat bsumdyn bsumneg; do \
+	for t in divzero nilptr deep oom closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg leafnil bmaskwide bmodneg bmaskone bforpast bvarctr bnestctr bsumstat bsumdyn bsumneg bkeepfirst bkeepmoved bkeepstat bkeepshrunk; do \
 	  $(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/fatal_$$t-arm testdata/fatal/$$t.paslang; \
 	  set +e; timeout 60 $(QEMU_A64) $(BUILDDIR)/fatal_$$t-arm > $(BUILDDIR)/fatal_$$t-arm.got 2> $(BUILDDIR)/fatal_$$t-arm.err; rc=$$?; set -e; \
 	  test $$rc -eq 1; \
@@ -3825,6 +3851,10 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	grep -q 'paslang: index 65 out of range \[1..64\] at line 15' $(BUILDDIR)/fatal_bsumstat-arm.err; \
 	grep -q 'paslang: index 10 out of range \[0..9\] at line 14' $(BUILDDIR)/fatal_bsumdyn-arm.err; \
 	grep -q 'paslang: index -4 out of range \[-3..20\] at line 17' $(BUILDDIR)/fatal_bsumneg-arm.err; \
+	grep -q 'paslang: index 10 out of range \[0..9\] at line 17' $(BUILDDIR)/fatal_bkeepfirst-arm.err; \
+	grep -q 'paslang: index 10 out of range \[0..9\] at line 20' $(BUILDDIR)/fatal_bkeepmoved-arm.err; \
+	grep -q 'paslang: index 9 out of range \[1..8\] at line 20' $(BUILDDIR)/fatal_bkeepstat-arm.err; \
+	grep -q 'paslang: index 3 out of range \[0..2\] at line 15' $(BUILDDIR)/fatal_bkeepshrunk-arm.err; \
 	grep -q 'paslang: stack overflow at line 12' $(BUILDDIR)/fatal_deep-arm.err; \
 	grep -q 'paslang: out of memory: [0-9][0-9]* MiB mapped' $(BUILDDIR)/fatal_oom-arm.err; \
 	grep -q 'paslang: send on closed channel at line 11' $(BUILDDIR)/fatal_closed-arm.err; \

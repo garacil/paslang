@@ -336,6 +336,8 @@ type
     FIxOn: Boolean;        { FIxReg holds FIxSrc scaled by FIxK, plus FIxBase on arm64 (P314) }
     FIxReg, FIxSrc, FIxBase: string;
     FIxK: Int64;
+    FChkOn: Boolean;       { the word place's last check holds: FChkIdx against FChkLen, FChkKey (P316) }
+    FChkIdx, FChkLen, FChkKey: string;
     FCarrySym: TSym;    { the place Carry's register is loaded from and stored to (1.0.130) }      { the end of an innermost for's run of 1024, in a promoted region (P100) }
     FChunkSave: LongInt;    { its caller value's frame slot when the register is a kept one, else 0 }
     FChunkDw: LongInt;      { its DWARF number, for the CFI of that slot }
@@ -437,6 +439,8 @@ type
     function SplitLea(const S: string): Boolean;
     procedure NoteLine(const S: string);
     procedure IxNote(const S: string);
+    function ChkKept(const I, L, K: string): Boolean;
+    procedure ChkKeep(const I, L, K: string; Ok: Boolean);
     procedure MapNote(const S: string);
     procedure MapSite;
     procedure MapPush(Words: LongInt; Pad: Boolean);
@@ -1337,7 +1341,7 @@ begin
     Exit;
   if (n > 4) and (Copy(S, 1, 3) = '.LL') and (S[n] = ':') then
     Exit;
-  if FIxOn and (FColdAt < 0) then
+  if (FIxOn or FChkOn) and (FColdAt < 0) then
     IxNote(S);
   if (n > 3) and (S[1] = ' ') and (S[2] = ' ') and (S[3] <> '.') then
     FLastIns := S
@@ -1413,6 +1417,8 @@ var
     f: string;
   begin
     f := Fam(R);
+    if (f <> '') and ((f = FChkIdx) or (f = FChkLen)) then
+      FChkOn := False;
     Result := (f <> '') and ((f = FIxReg) or (f = FIxSrc) or (f = FIxBase));
   end;
 
@@ -1426,12 +1432,16 @@ begin
   if (n < 3) or (S[1] <> ' ') or (S[2] <> ' ') then
   begin
     FIxOn := False;
+    FChkOn := False;
     Exit;
   end;
   if S[3] = '.' then
   begin
     if Copy(S, 1, 10) <> '  .p2align' then
+    begin
       FIxOn := False;
+      FChkOn := False;
+    end;
     Exit;
   end;
   p := 3;
@@ -1444,6 +1454,7 @@ begin
     if op = '' then
     begin
       FIxOn := False;
+      FChkOn := False;
       Exit;
     end;
     if (((Starts('cmp') and not Starts('cmpxchg')) or Starts('test')) and (rest <> '')) or
@@ -1457,6 +1468,7 @@ begin
       (Starts('imul') and (Pos(',', rest) > 0))) then
     begin
       FIxOn := False;
+      FChkOn := False;
       Exit;
     end;
     q := 0;
@@ -1513,6 +1525,7 @@ begin
     (op = 'scvtf') or (op = 'ucvtf') or (op = 'fcvtzs') or (op = 'fcvtzu')) then
   begin
     FIxOn := False;
+    FChkOn := False;
     Exit;
   end;
   if Hit(d) then
@@ -1538,6 +1551,37 @@ begin
     if Hit(Copy(rest, p + 1, q - p - 1)) then
       FIxOn := False;
   end;
+end;
+
+{ P316: the word place's last check, of the index register I against
+  the length's register L ('' for a static array's bounds) with K the
+  rest of its form, holds still: the same check is no work. }
+function TEmitter.ChkKept(const I, L, K: string): Boolean;
+var
+  l2: string;
+begin
+  l2 := L;
+  if (l2 <> '') and (l2[1] = '%') then
+    l2 := Copy(l2, 2, Length(l2) - 1);
+  Result := FChkOn and (FChkIdx = I) and (FChkLen = l2) and (FChkKey = K);
+end;
+
+{ P316: the check just written holds while nothing writes I or L: kept
+  when I is a variable's register (Ok) and L a register or none, as Go
+  keeps one IsInBounds for both and prove knows it true in the blocks it
+  dominates (cmd/compile/internal/ssacompile/cse.go and prove.go). }
+procedure TEmitter.ChkKeep(const I, L, K: string; Ok: Boolean);
+var
+  l2: string;
+begin
+  l2 := L;
+  if (l2 <> '') and (l2[1] = '%') then
+    l2 := Copy(l2, 2, Length(l2) - 1);
+  FChkOn := Ok and ((L = '') or ((not FArm) and (L[1] = '%')) or
+    (FArm and ((L[1] = 'x') or (L[1] = 'w'))));
+  FChkIdx := I;
+  FChkLen := l2;
+  FChkKey := K;
 end;
 
 { ---- stack maps (P95c) ----
@@ -28674,7 +28718,8 @@ begin
                 ColdEnd;
               end;
             end
-            else if (not nochk) and (not SliceProven(E)) then
+            else if (not nochk) and (not SliceProven(E)) and
+              not ChkKept(idx, lenR, 'f' + IntToStr(ixk + disp)) then
             begin
               if (disp = -1) or (ixk <> 0) then
               begin
@@ -28692,6 +28737,7 @@ begin
               else
                 BoundsFailArm(idx, 0, -disp, lenR, 0, -1 - disp);
               ColdEnd;
+              ChkKeep(idx, lenR, 'f' + IntToStr(ixk + disp), ixvar);
             end;
             { no label after the check: nothing jumps to it since the
               failure went out of line (P299), and a label would end the
@@ -28725,7 +28771,8 @@ begin
                 ColdEnd;
               end;
             end
-            else if (not nochk) and (not SliceProven(E)) then
+            else if (not nochk) and (not SliceProven(E)) and
+              not ChkKept(idx, lenop, 'f' + IntToStr(ixk + disp)) then
             begin
               if (disp = -1) or (ixk <> 0) then
               begin
@@ -28740,6 +28787,7 @@ begin
               else
                 BoundsFailX86('%' + idx, -disp, lenop, 0, -1 - disp);
               ColdEnd;
+              ChkKeep(idx, lenop, 'f' + IntToStr(ixk + disp), ixvar);
             end;
           end;
         end
@@ -28757,7 +28805,8 @@ begin
                 BoundsFailX86('$' + IntToStr(k), td.Lo, '', td.Hi, 0);
             end;
           end
-          else if (not nochk) and not IndexInRange(E^.R, td.Lo, td.Hi) then
+          else if (not nochk) and not IndexInRange(E^.R, td.Lo, td.Hi) and
+            not ChkKept(idx, '', 's' + IntToStr(ixk - td.Lo) + ':' + IntToStr(td.Hi - td.Lo)) then
           begin
             ok := Lab;
             if FArm then
@@ -28811,6 +28860,7 @@ begin
                 BoundsFailX86('%' + idx, td.Lo, '', td.Hi, 0);
               ColdEnd;
             end;
+            ChkKeep(idx, '', 's' + IntToStr(ixk - td.Lo) + ':' + IntToStr(td.Hi - td.Lo), ixvar);
           end;
         end;
         disp := disp + ixk * esz;
@@ -29645,6 +29695,7 @@ begin
   FCold := '';
   FLastIns := '';
   FIxOn := False;
+  FChkOn := False;
 end;
 
 { The divisor is zero: rt_divzero, out of line (P299). }
