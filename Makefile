@@ -367,6 +367,9 @@ GOLDEN_A64 += regassign
 # P319: a run's head proves a slice by its length, in a register or at home.
 GOLDEN += runlen
 GOLDEN_A64 += runlen
+# P320: an and with $FF, $FFFF or $FFFFFFFF is a zero extension.
+GOLDEN += andmask
+GOLDEN_A64 += andmask
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -2463,6 +2466,13 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/runlen.out $(BUILDDIR)/runlen0.got; \
 	python3 -I scripts/check_chkcse.py $(BUILDDIR)/runlen0.s sum5:5,mix5:5,back:4,local5:10; \
 	echo ok runlen-asm; \
+	: an and with a mask of 8, 16 or 32 bits as a zero extension from its source, P320: andmask with and without inlining, no AND of a mask in its routines; \
+	python3 -I scripts/check_andmask.py $(BUILDDIR)/andmask.s; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/andmask0 testdata/andmask.paslang; \
+	$(BUILDDIR)/andmask0 > $(BUILDDIR)/andmask0.got; \
+	diff -u testdata/andmask.out $(BUILDDIR)/andmask0.got; \
+	python3 -I scripts/check_andmask.py $(BUILDDIR)/andmask0.s; \
+	echo ok andmask-asm; \
 	: every loop of an asm kernel of the units starts aligned, as the loops paslangc compiles, P302; \
 	python3 -I scripts/check_kernel_align.py src/lib/*.paslang src/rtl/*.paslang; \
 	echo ok kernel-align; \
@@ -3677,6 +3687,13 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	diff -u testdata/runlen.out $(BUILDDIR)/runlen0-arm.got; \
 	python3 -I scripts/check_chkcse.py $(BUILDDIR)/runlen0-arm.s sum5:5,mix5:5,back:4,local5:10; \
 	echo ok runlen-arm-asm; \
+	: P320 on arm64: andmask with and without inlining, no AND of a mask in its routines; \
+	python3 -I scripts/check_andmask.py $(BUILDDIR)/andmask-arm.s --arm; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/andmask0-arm testdata/andmask.paslang; \
+	timeout 300 $(QEMU_A64) $(BUILDDIR)/andmask0-arm > $(BUILDDIR)/andmask0-arm.got; \
+	diff -u testdata/andmask.out $(BUILDDIR)/andmask0-arm.got; \
+	python3 -I scripts/check_andmask.py $(BUILDDIR)/andmask0-arm.s --arm; \
+	echo ok andmask-arm-asm; \
 	$(OUTDIR)/paslangc -target arm64 -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/exprinline0-arm testdata/exprinline.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/exprinline0-arm > $(BUILDDIR)/exprinline0-arm.got; \
 	diff -u testdata/exprinline.out $(BUILDDIR)/exprinline0-arm.got; \
