@@ -806,12 +806,14 @@ type
     procedure MulRecipeVia(const D, S: string; F, I, O: LongInt; const T: string);
     procedure ScaleTo(const D, S: string; K: Int64; const Tmp: string);
     procedure ScaleAddArm(const D, B, X: string; K: Int64; const T1, T2: string);
+    procedure ScaleSubArm(const D, B, X: string; K: Int64; const T: string);
     procedure ScaleAddX86(const D, B, X: string; K: Int64; const Tmp: string);
     procedure ScaleAddDispX86(const D, B, X: string; K, Disp: Int64; const Tmp: string);
     procedure MulComboArm(const C: TMulCombo; const D, X, Y: string);
     procedure MulComboX86(const C: TMulCombo; const D, X, Y: string);
     function MulByK(const R: string; K: Int64): Boolean;
     function MulByKTo(const D, S: string; K: Int64): Boolean;
+    function MulByKVia(const D, S: string; K: Int64; const T1, T2: string): Boolean;
     function IndexOK(I: PExpr; D: LongInt): Boolean;
     function WordBaseOK(B: PExpr; D: LongInt): Boolean;
     function FatPtrOK(B: PExpr; D: LongInt): Boolean;
@@ -6483,6 +6485,20 @@ begin
           lreg := 'x0';
         end;
       end;
+      if (b^.Kind = ekInt) and (Op = boMul) then
+      begin
+        { x * K by its recipe where that costs less than MUL on the
+          tune, x17 its second value (P312) }
+        dreg := D.Reg;
+        if dreg = '' then
+          dreg := 'x0';
+        if MulByKVia(dreg, lreg, b^.Num, 'x17', '') then
+        begin
+          if D.Reg = '' then
+            StorePlain(D);
+          Exit;
+        end;
+      end;
       if b^.Kind = ekInt then
       begin
         k := b^.Num;
@@ -6568,7 +6584,12 @@ begin
       else if (Op = boSub) and (dreg <> lreg) and Fits32(-k) then
         Line('  leaq ' + IntToStr(-k) + '(%' + lreg + '), %' + dreg)
       else if Op = boMul then
-        Line('  imulq $' + IntToStr(k) + ', %' + lreg + ', %' + dreg)
+      begin
+        { the recipe where it costs less than IMUL, rax and rcx free
+          here as the path through rax below takes them (P312) }
+        if not MulByKVia('%' + dreg, '%' + lreg, k, '%rax', '%rcx') then
+          Line('  imulq $' + IntToStr(k) + ', %' + lreg + ', %' + dreg);
+      end
       else
       begin
         if dreg <> lreg then
@@ -6584,7 +6605,10 @@ begin
       if (Op = boAdd) and (dreg <> rreg) then
         Line('  leaq ' + IntToStr(k) + '(%' + rreg + '), %' + dreg)
       else if Op = boMul then
-        Line('  imulq $' + IntToStr(k) + ', %' + rreg + ', %' + dreg)
+      begin
+        if not MulByKVia('%' + dreg, '%' + rreg, k, '%rax', '%rcx') then
+          Line('  imulq $' + IntToStr(k) + ', %' + rreg + ', %' + dreg);
+      end
       else
       begin
         if dreg <> rreg then
@@ -6617,7 +6641,16 @@ begin
       Exit;
     end;
     { through rax, the right operand in place: a constant as the
-      immediate, a variable as the memory or register operand }
+      immediate, a variable as the memory or register operand; a
+      product by a constant on the left takes it on the right, so its
+      recipe follows (P312) }
+    if (Op = boMul) and (L^.Kind = ekInt) and (R^.Kind = ekVar) and rvar and Fits32(L^.Num) then
+    begin
+      a := L;
+      L := R;
+      R := a;
+      ls := rs;
+    end;
     if L^.Kind = ekInt then
       LoadImmR('rax', L^.Num)
     else
@@ -6627,7 +6660,10 @@ begin
     else if (R^.Kind = ekInt) and Fits32(R^.Num) and (ins <> '') and (Op <> boShl) and (Op <> boShr) then
     begin
       if Op = boMul then
-        Line('  imulq $' + IntToStr(R^.Num) + ', %rax, %rax')
+      begin
+        if not MulByKVia('%rax', '%rax', R^.Num, '%rcx', '') then
+          Line('  imulq $' + IntToStr(R^.Num) + ', %rax, %rax');
+      end
       else
         Line('  ' + ins + ' $' + IntToStr(R^.Num) + ', %rax');
     end
@@ -26092,7 +26128,7 @@ end;
   X mod C, for C >= 1. amd64 uses rax, rcx and rdx; arm64 x16 and x17. }
 procedure TEmitter.EmitDivConst(const X: string; C: Int64; IsMod: Boolean);
 var
-  k, sh: LongInt;
+  k, sh, f, i, o: LongInt;
   m: Int64;
 begin
   k := Pow2Log(C);
@@ -26137,10 +26173,7 @@ begin
     end;
     Line('  sub x16, x16, ' + X + ', asr #63');
     if IsMod then
-    begin
-      Imm('x17', C);
-      Line('  msub ' + X + ', x16, x17, ' + X);
-    end
+      ScaleSubArm(X, X, 'x16', C, 'x17')
     else
       Line('  mov ' + X + ', x16');
     Exit;
@@ -26191,8 +26224,13 @@ begin
   Line('  subq %rax, %rdx');
   if IsMod then
   begin
-    if Fits32(C) then
-      Line('  imulq $' + IntToStr(C) + ', %rdx, %rdx')
+    { x - q * C with q * C the recipe ScaleTo gives it where that costs
+      less than IMUL on the tune, its second value in rax, free past the
+      quotient: Go rewrites x % c as x - (x / c) * c and reduces the
+      product as any other (generic.rules Mod64; AMD64.rules MULQconst),
+      so go1.27.2 writes x mod 7 as two leas and a sub (P312) }
+    if Fits32(C) or MulRecipe(C, f, i, o) then
+      ScaleTo('%rdx', '%rdx', C, '%rax')
     else
     begin
       Line('  movabsq $' + IntToStr(C) + ', %rax');
@@ -26494,8 +26532,29 @@ var
   t: string;
 begin
   Result := False;
-  if (K = 0) or (K = 1) then
+  { x * 1 is x and x * 0 is 0, as Go's rules fold them (generic.rules;
+    P312); the 0 a move, which leaves the flags as they are }
+  if K = 1 then
+  begin
+    if D <> S then
+    begin
+      if FArm then
+        Line('  mov ' + D + ', ' + S)
+      else
+        Line('  movq ' + S + ', ' + D);
+    end;
+    Result := True;
     Exit;
+  end;
+  if K = 0 then
+  begin
+    if FArm then
+      Line('  mov ' + D + ', xzr')
+    else
+      Line('  movl $0, %' + X86Sub(Copy(D, 2, Length(D) - 1), 4));
+    Result := True;
+    Exit;
+  end;
   if (not FArm) and ((S = '%r13') or (S = '%rbp') or (D = '%r13') or (D = '%rbp')) then
     Exit;
   if not MulRecipe(K, f, i, o) then
@@ -26512,6 +26571,108 @@ begin
   MulRecipeVia(D, S, f, i, o, t);
 end;
 
+{ D := S * K by a recipe where it costs less than a multiply, the free
+  registers T1 and T2 (neither D nor S, '' for none) the caller names
+  (P312): a recipe's second value goes through one of them; on amd64 a
+  source of r13 or rbp, no lea's base beside an index (P294), is moved
+  to T1 first, and a destination of either takes a recipe whose second
+  step adds it to itself in a lea through a free one and a move, each
+  move counted as an add (Zen 2's MOV of a register takes 1 cycle, AMD
+  17h 30h latencies), so x * 3 from r13 is a move and a lea, 2 cycles
+  where IMUL takes 3. A recipe of two steps on the first's value twice
+  (form 2) is the product of their values, so either step goes first:
+  the lea goes where its base, the value it reads, is not r13 or rbp, so
+  -3 * k into r13 is a lea of k and a neg of r13. x * 1 is x and x * 0
+  is 0, as Go's rules fold them (generic.rules, Mul64 by Const64 [1] and
+  [0]). False with nothing written otherwise. }
+function TEmitter.MulByKVia(const D, S: string; K: Int64; const T1, T2: string): Boolean;
+var
+  f, i, o, c, w: LongInt;
+  src, dst, ta, tb: string;
+  slows, slowd, swap: Boolean;
+begin
+  Result := False;
+  if K = 1 then
+  begin
+    if D <> S then
+    begin
+      if FArm then
+        Line('  mov ' + D + ', ' + S)
+      else
+        Line('  movq ' + S + ', ' + D);
+    end;
+    Result := True;
+    Exit;
+  end;
+  if K = 0 then
+  begin
+    if FArm then
+      Line('  mov ' + D + ', xzr')
+    else
+      Line('  xorl %' + X86Sub(Copy(D, 2, Length(D) - 1), 4) + ', %' +
+        X86Sub(Copy(D, 2, Length(D) - 1), 4));
+    Result := True;
+    Exit;
+  end;
+  if not MulRecipe(K, f, i, o) then
+    Exit;
+  if FArm then
+  begin
+    if (f > 2) and (T1 = '') then
+      Exit;
+    MulRecipeVia(D, S, f, i, o, T1);
+    Result := True;
+    Exit;
+  end;
+  slows := (S = '%r13') or (S = '%rbp');
+  slowd := (D = '%r13') or (D = '%rbp');
+  swap := slows and ((FMulC[i].Kind = 1) or (FMulC[i].Kind = 8)) and
+    (FMulC[o].Kind <> 8) and not slowd;
+  if slowd and (FMulC[o].Kind = 8) and (FMulC[i].Kind <> 8) and
+    not (slows and (FMulC[i].Kind = 1)) then
+    swap := True;
+  if (f = 2) and swap then
+  begin
+    w := i;
+    i := o;
+    o := w;
+  end;
+  c := FMulC[i].Cost;
+  if f > 1 then
+    c := c + FMulC[o].Cost;
+  src := S;
+  ta := T1;
+  tb := T2;
+  if slows and ((f > 2) or (FMulC[i].Kind = 1) or (FMulC[i].Kind = 8)) then
+  begin
+    if T1 = '' then
+      Exit;
+    src := T1;
+    ta := T2;
+    tb := '';
+    c := c + 10;
+  end;
+  dst := D;
+  if ((D = '%r13') or (D = '%rbp')) and (f = 2) and (FMulC[o].Kind = 8) then
+  begin
+    if ta = '' then
+      Exit;
+    dst := ta;
+    ta := tb;
+    c := c + 10;
+  end;
+  if ((f = 3) or (f = 4)) and (ta = '') then
+    Exit;
+  if c >= FMulCost then
+    Exit;
+  if src <> S then
+    Line('  movq ' + S + ', ' + src);
+  MulRecipeVia(dst, src, f, i, o, ta);
+  if dst <> D then
+    Line('  movq ' + dst + ', ' + D);
+  Result := True;
+end;
+
 { D := S * K by the recipe F, I, O of MulRecipe, the second value of a
   form 3 or 4 through T (P295, P310). }
 procedure TEmitter.MulRecipeVia(const D, S: string; F, I, O: LongInt; const T: string);
@@ -26526,11 +26687,23 @@ begin
           MulComboArm(FMulC[O], D, D, D);
         end;
       3:
+        { S + (S << n) and S - (S << n) are one ADD or SUB of a shifted
+          register, as Go folds an SLLconst operand into ADDshiftLL and
+          SUBshiftLL after the recipe (ARM64.rules; go1.27.2 writes x * 3
+          as ADD R0<<1, R0, R0): one instruction where two were (P312) }
+        if (FMulC[I].Kind = 7) and (FMulC[O].Kind = 1) then
+          Line('  add ' + D + ', ' + S + ', ' + S + ', lsl #' + IntToStr(FMulC[I].Sh))
+        else if (FMulC[I].Kind = 7) and (FMulC[O].Kind = 3) then
+          Line('  sub ' + D + ', ' + S + ', ' + S + ', lsl #' + IntToStr(FMulC[I].Sh))
+        else
         begin
           MulComboArm(FMulC[I], T, S, S);
           MulComboArm(FMulC[O], D, S, T);
         end;
     else
+      if (FMulC[I].Kind = 7) and (FMulC[O].Kind = 1) then
+        Line('  add ' + D + ', ' + S + ', ' + S + ', lsl #' + IntToStr(FMulC[I].Sh))
+      else
       begin
         MulComboArm(FMulC[I], T, S, S);
         MulComboArm(FMulC[O], D, T, S);
@@ -26702,6 +26875,112 @@ begin
     begin
       Imm(T1, K);
       Line('  madd ' + D + ', ' + X + ', ' + T1 + ', ' + B);
+    end;
+  end;
+end;
+
+{ arm64: D := B - X * K for K past 1 and no power of two, the
+  remainder's multiply back (P312); X and T may change, T is neither B
+  nor X. The cheapest on this tune of: for K = 2^s - 1 an ADD of B and X
+  into T and a SUB of X shifted by s from it, for K = 2^s + 1 a SUB and
+  the same SUB shifted (B - X * K is B + X - (X << s), or B - X - (X <<
+  s): go1.27.2 writes x mod 7 as ADD and SUB shifted by 3); K's recipe in
+  X, its second value through T, and a SUB; the recipe of m in X and a
+  SUB of X shifted by s for K = m * 2^s; and K in T and one MSUB (ARM DDI
+  0487 M.c C6.2.291; SUB of a shifted register C6.2.458). On Neoverse N1
+  MSUB of X form takes 4 cycles and keeps the multiplier 2 more, an ADD
+  or SUB shifted by 4 or less 1 (arm-neoverse-n1-sog 3.6 and 3.4). }
+procedure TEmitter.ScaleSubArm(const D, B, X: string; K: Int64; const T: string);
+var
+  f, i, o, fm, im, om, s, sp, sm, c, best, way: LongInt;
+  m: Int64;
+begin
+  MulCombos;
+  best := FMulCost;
+  way := 0;
+  f := 0;
+  i := 0;
+  o := 0;
+  fm := 0;
+  im := 0;
+  om := 0;
+  sp := -1;
+  sm := -1;
+  if K < High(Int64) then
+    sp := Pow2Log(K + 1);
+  if sp > 0 then
+  begin
+    c := 10 + CpuShiftAddCostArm(FTune, sp);
+    if c < best then
+    begin
+      best := c;
+      way := 1;
+    end;
+  end;
+  sm := Pow2Log(K - 1);
+  if sm > 0 then
+  begin
+    c := 10 + CpuShiftAddCostArm(FTune, sm);
+    if c < best then
+    begin
+      best := c;
+      way := 2;
+    end;
+  end;
+  if MulRecipe(K, f, i, o) then
+  begin
+    c := FMulC[i].Cost + 10;
+    if f > 1 then
+      c := c + FMulC[o].Cost;
+    if c < best then
+    begin
+      best := c;
+      way := 3;
+    end;
+  end;
+  s := 0;
+  m := K;
+  while (m > 1) and ((m and 1) = 0) do
+  begin
+    m := m shr 1;
+    Inc(s);
+  end;
+  if (s > 0) and (m > 1) and MulRecipe(m, fm, im, om) then
+  begin
+    c := FMulC[im].Cost + CpuShiftAddCostArm(FTune, s);
+    if fm > 1 then
+      c := c + FMulC[om].Cost;
+    if c < best then
+    begin
+      best := c;
+      way := 4;
+    end;
+  end;
+  case way of
+    1:
+      begin
+        Line('  add ' + T + ', ' + B + ', ' + X);
+        Line('  sub ' + D + ', ' + T + ', ' + X + ', lsl #' + IntToStr(sp));
+      end;
+    2:
+      begin
+        Line('  sub ' + T + ', ' + B + ', ' + X);
+        Line('  sub ' + D + ', ' + T + ', ' + X + ', lsl #' + IntToStr(sm));
+      end;
+    3:
+      begin
+        MulRecipeVia(X, X, f, i, o, T);
+        Line('  sub ' + D + ', ' + B + ', ' + X);
+      end;
+    4:
+      begin
+        MulRecipeVia(X, X, fm, im, om, T);
+        Line('  sub ' + D + ', ' + B + ', ' + X + ', lsl #' + IntToStr(s));
+      end;
+  else
+    begin
+      Imm(T, K);
+      Line('  msub ' + D + ', ' + X + ', ' + T + ', ' + B);
     end;
   end;
 end;
@@ -34160,7 +34439,8 @@ begin
   Line('.sx_e1:');
   Line('  cmpq %r15, %r12');
   Line('  jae .sx_park');
-  Line('  imulq $48, %r12, %rax');
+  Line('  leaq (%r12,%r12,2), %rax');
+  Line('  shlq $4, %rax');
   Line('  leaq 144(%r13, %rax), %rsi');
   Line('  movq %r14, 8(%rsi)');
   Line('  movq %r13, 24(%rsi)');
@@ -34189,7 +34469,8 @@ begin
   Line('.sx_r1:');
   Line('  cmpq %r15, %r12');
   Line('  jae .sx_rd');
-  Line('  imulq $48, %r12, %rax');
+  Line('  leaq (%r12,%r12,2), %rax');
+  Line('  shlq $4, %rax');
   Line('  leaq 144(%r13, %rax), %rsi');
   Line('  movq 32(%rsi), %rcx');
   Line('  shlq $5, %rcx');

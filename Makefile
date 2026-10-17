@@ -343,6 +343,9 @@ GOLDEN_A64 += idxscale
 # P311: a field of an element is read and written through one address.
 GOLDEN += fieldaddr
 GOLDEN_A64 += fieldaddr
+# P312: every product by a constant takes its recipe, the remainder's too.
+GOLDEN += modconst
+GOLDEN_A64 += modconst
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -2386,6 +2389,13 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/fieldaddr.out $(BUILDDIR)/fieldaddr0.got; \
 	python3 -I scripts/check_fieldaddr.py $(BUILDDIR)/fieldaddr0.s loc,glob,heap2,ptr,nest; \
 	echo ok fieldaddr-asm; \
+	: every product by a constant takes its recipe, P312: the routines of modconst multiply by a constant only where no recipe of Go costs less, the remainder and a source in r13 included, with and without inlining; \
+	python3 -I scripts/check_modconst.py $(BUILDDIR)/modconst.s; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/modconst0 testdata/modconst.paslang; \
+	$(BUILDDIR)/modconst0 > $(BUILDDIR)/modconst0.got; \
+	diff -u testdata/modconst.out $(BUILDDIR)/modconst0.got; \
+	python3 -I scripts/check_modconst.py $(BUILDDIR)/modconst0.s; \
+	echo ok modconst-asm; \
 	: every loop of an asm kernel of the units starts aligned, as the loops paslangc compiles, P302; \
 	python3 -I scripts/check_kernel_align.py src/lib/*.paslang src/rtl/*.paslang; \
 	echo ok kernel-align; \
@@ -3520,6 +3530,17 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	diff -u testdata/fieldaddr.out $(BUILDDIR)/fieldaddr0-arm.got; \
 	python3 -I scripts/check_fieldaddr.py $(BUILDDIR)/fieldaddr0-arm.s loc,glob,heap2,ptr,nest --arm; \
 	echo ok fieldaddr-arm-asm; \
+	: P312 on arm64: modconst multiplies and multiplies back only where no recipe or form of ScaleSubArm costs less, with no tune and tuned for Neoverse N1, and without inlining, every shift read by the next add or sub folded into it; \
+	python3 -I scripts/check_modconst.py $(BUILDDIR)/modconst-arm.s --arm; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -tune neoverse-n1 -Fu $(A64DIR) -o $(BUILDDIR)/modconst-n1-arm testdata/modconst.paslang; \
+	timeout 300 $(QEMU_A64) $(BUILDDIR)/modconst-n1-arm > $(BUILDDIR)/modconst-n1-arm.got; \
+	diff -u testdata/modconst.out $(BUILDDIR)/modconst-n1-arm.got; \
+	python3 -I scripts/check_modconst.py $(BUILDDIR)/modconst-n1-arm.s --arm --tune=n1; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/modconst0-arm testdata/modconst.paslang; \
+	timeout 300 $(QEMU_A64) $(BUILDDIR)/modconst0-arm > $(BUILDDIR)/modconst0-arm.got; \
+	diff -u testdata/modconst.out $(BUILDDIR)/modconst0-arm.got; \
+	python3 -I scripts/check_modconst.py $(BUILDDIR)/modconst0-arm.s --arm; \
+	echo ok modconst-arm-asm; \
 	$(OUTDIR)/paslangc -target arm64 -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/exprinline0-arm testdata/exprinline.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/exprinline0-arm > $(BUILDDIR)/exprinline0-arm.got; \
 	diff -u testdata/exprinline.out $(BUILDDIR)/exprinline0-arm.got; \
