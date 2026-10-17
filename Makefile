@@ -382,6 +382,9 @@ GOLDEN_A64 += flatproc
 # P323: a product by a constant with no recipe is one imulq from its variable.
 GOLDEN += imulconst
 GOLDEN_A64 += imulconst
+# P324: a check against a slice's length at its home is kept, eight at a time.
+GOLDEN += memlen
+GOLDEN_A64 += memlen
 # P333: an exec and a new thread do not race (amd64: qemu-user does not
 # execve an arm64 program, so arm64 reads the runtime's forms).
 GOLDEN += execrace
@@ -2503,11 +2506,11 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	: a bounds check an earlier one of the same index and length proves left out, P316: chkcse under the stress of the collector and without inlining, Fields checking once an element; \
 	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 $(BUILDDIR)/chkcse > $(BUILDDIR)/chkcse-gc.got; \
 	diff -u testdata/chkcse.out $(BUILDDIR)/chkcse-gc.got; \
-	python3 -I scripts/check_chkcse.py $(BUILDDIR)/chkcse.s fields:6,called:1,joined:3; \
+	python3 -I scripts/check_chkcse.py $(BUILDDIR)/chkcse.s fields:6,called:1,joined:3,moved:3,grown:3; \
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/chkcse0 testdata/chkcse.paslang; \
 	$(BUILDDIR)/chkcse0 > $(BUILDDIR)/chkcse0.got; \
 	diff -u testdata/chkcse.out $(BUILDDIR)/chkcse0.got; \
-	python3 -I scripts/check_chkcse.py $(BUILDDIR)/chkcse0.s fields:6,joined:3; \
+	python3 -I scripts/check_chkcse.py $(BUILDDIR)/chkcse0.s fields:6,joined:3,moved:3,grown:3; \
 	echo ok chkcse-asm; \
 	: a product by a constant under a narrowing conversion read from the register of the variable, P317: convmul with and without inlining; \
 	python3 -I scripts/check_convmul.py $(BUILDDIR)/convmul.s; \
@@ -2524,11 +2527,11 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	python3 -I scripts/check_regassign.py $(BUILDDIR)/regassign0.s; \
 	echo ok regassign-asm; \
 	: a run head proving a slice by its length in a register or at its home, P319: runlen with and without inlining, the free bodies checking none; \
-	python3 -I scripts/check_chkcse.py $(BUILDDIR)/runlen.s sum5:5,mix5:6,back:4,local5:10; \
+	python3 -I scripts/check_chkcse.py $(BUILDDIR)/runlen.s sum5:5,mix5:5,back:4,local5:10; \
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/runlen0 testdata/runlen.paslang; \
 	$(BUILDDIR)/runlen0 > $(BUILDDIR)/runlen0.got; \
 	diff -u testdata/runlen.out $(BUILDDIR)/runlen0.got; \
-	python3 -I scripts/check_chkcse.py $(BUILDDIR)/runlen0.s sum5:5,mix5:6,back:4,local5:10; \
+	python3 -I scripts/check_chkcse.py $(BUILDDIR)/runlen0.s sum5:5,mix5:5,back:4,local5:10; \
 	echo ok runlen-asm; \
 	: an and with a mask of 8, 16 or 32 bits as a zero extension from its source, P320: andmask with and without inlining, no AND of a mask in its routines; \
 	python3 -I scripts/check_andmask.py $(BUILDDIR)/andmask.s; \
@@ -2565,6 +2568,13 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/imulconst.out $(BUILDDIR)/imulconst0.got; \
 	python3 -I scripts/check_imulconst.py $(BUILDDIR)/imulconst0.s --three=30; \
 	echo ok imulconst-asm; \
+	: a check against a slice length at its home kept as one against a register, eight kept at a time, P324: memlen with and without inlining; \
+	python3 -I scripts/check_chkcse.py $(BUILDDIR)/memlen.s rotate:6,pair:2; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/memlen0 testdata/memlen.paslang; \
+	$(BUILDDIR)/memlen0 > $(BUILDDIR)/memlen0.got; \
+	diff -u testdata/memlen.out $(BUILDDIR)/memlen0.got; \
+	python3 -I scripts/check_chkcse.py $(BUILDDIR)/memlen0.s rotate:6,pair:2; \
+	echo ok memlen-asm; \
 	: the exec lock around a new thread and an execve, clone again on EAGAIN, P333: the runtime in execrace; \
 	python3 -I scripts/check_execlock.py $(BUILDDIR)/execrace.s; \
 	echo ok execlock-asm; \
@@ -3772,11 +3782,11 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	: P316 on arm64: chkcse under the stress of the collector and without inlining, Fields checking once an element; \
 	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 timeout 300 $(QEMU_A64) $(BUILDDIR)/chkcse-arm > $(BUILDDIR)/chkcse-arm-gc.got; \
 	diff -u testdata/chkcse.out $(BUILDDIR)/chkcse-arm-gc.got; \
-	python3 -I scripts/check_chkcse.py $(BUILDDIR)/chkcse-arm.s fields:6,called:1,joined:3; \
+	python3 -I scripts/check_chkcse.py $(BUILDDIR)/chkcse-arm.s fields:6,called:1,joined:3,moved:3,grown:3; \
 	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/chkcse0-arm testdata/chkcse.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/chkcse0-arm > $(BUILDDIR)/chkcse0-arm.got; \
 	diff -u testdata/chkcse.out $(BUILDDIR)/chkcse0-arm.got; \
-	python3 -I scripts/check_chkcse.py $(BUILDDIR)/chkcse0-arm.s fields:6,joined:3; \
+	python3 -I scripts/check_chkcse.py $(BUILDDIR)/chkcse0-arm.s fields:6,joined:3,moved:3,grown:3; \
 	echo ok chkcse-arm-asm; \
 	: P317 on arm64: convmul with and without inlining, the recipe from the register of the variable; \
 	python3 -I scripts/check_convmul.py $(BUILDDIR)/convmul-arm.s --arm; \
@@ -3793,11 +3803,11 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	python3 -I scripts/check_regassign.py $(BUILDDIR)/regassign0-arm.s --arm; \
 	echo ok regassign-arm-asm; \
 	: P319 on arm64: runlen with and without inlining, the free bodies checking none; \
-	python3 -I scripts/check_chkcse.py $(BUILDDIR)/runlen-arm.s sum5:5,mix5:6,back:4,local5:10; \
+	python3 -I scripts/check_chkcse.py $(BUILDDIR)/runlen-arm.s sum5:5,mix5:5,back:4,local5:10; \
 	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/runlen0-arm testdata/runlen.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/runlen0-arm > $(BUILDDIR)/runlen0-arm.got; \
 	diff -u testdata/runlen.out $(BUILDDIR)/runlen0-arm.got; \
-	python3 -I scripts/check_chkcse.py $(BUILDDIR)/runlen0-arm.s sum5:5,mix5:6,back:4,local5:10; \
+	python3 -I scripts/check_chkcse.py $(BUILDDIR)/runlen0-arm.s sum5:5,mix5:5,back:4,local5:10; \
 	echo ok runlen-arm-asm; \
 	: P320 on arm64: andmask with and without inlining, no AND of a mask in its routines; \
 	python3 -I scripts/check_andmask.py $(BUILDDIR)/andmask-arm.s --arm; \
@@ -3820,6 +3830,13 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	diff -u testdata/flatproc.out $(BUILDDIR)/flatproc0-arm.got; \
 	python3 -I scripts/check_flatproc.py $(BUILDDIR)/flatproc0-arm.s --arm --clamp=8; \
 	echo ok flatproc-arm-asm; \
+	: P324 on arm64: memlen with and without inlining, the length loaded only where a compare reads it; \
+	python3 -I scripts/check_chkcse.py $(BUILDDIR)/memlen-arm.s rotate:6,pair:2; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/memlen0-arm testdata/memlen.paslang; \
+	timeout 300 $(QEMU_A64) $(BUILDDIR)/memlen0-arm > $(BUILDDIR)/memlen0-arm.got; \
+	diff -u testdata/memlen.out $(BUILDDIR)/memlen0-arm.got; \
+	python3 -I scripts/check_chkcse.py $(BUILDDIR)/memlen0-arm.s rotate:6,pair:2; \
+	echo ok memlen-arm-asm; \
 	: P333 on arm64: the runtime of execrace, the exec lock around a new thread and an execve; \
 	$(OUTDIR)/paslangc -target arm64 -cpu max -Fu $(A64DIR) -o $(BUILDDIR)/execrace-arm testdata/execrace.paslang; \
 	python3 -I scripts/check_execlock.py $(BUILDDIR)/execrace-arm.s --arm; \

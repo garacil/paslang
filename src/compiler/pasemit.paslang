@@ -351,8 +351,9 @@ type
     FZeroAt, FZeroLen: array[0..7] of SizeInt;
     FIxReg, FIxSrc, FIxBase: string;
     FIxK: Int64;
-    FChkOn: Boolean;       { the word place's last check holds: FChkIdx against FChkLen, FChkKey (P316) }
-    FChkIdx, FChkLen, FChkKey: string;
+    FChkOn: Boolean;       { the word place's kept checks hold: FChkIdx against FChkLen, FChkKey (P316), FChkN of them (P324) }
+    FChkN: LongInt;
+    FChkIdx, FChkLen, FChkKey, FChkMem: array[0..7] of string;  { FChkMem: the global whose length word it names, '' for a register }
     FCarrySym: TSym;    { the place Carry's register is loaded from and stored to (1.0.130) }      { the end of an innermost for's run of 1024, in a promoted region (P100) }
     FChunkSave: LongInt;    { its caller value's frame slot when the register is a kept one, else 0 }
     FChunkDw: LongInt;      { its DWARF number, for the CFI of that slot }
@@ -457,6 +458,8 @@ type
     procedure ZeroNote(const S: string);
     function MovConst32(const S: string): string;
     function ChkKept(const I, L, K: string): Boolean;
+    function MemLenOK(const N: string): Boolean;
+    procedure ChkDrop(const F: string; Mem: Boolean);
     procedure ChkKeep(const I, L, K: string; Ok: Boolean);
     procedure MapNote(const S: string);
     procedure MapSite;
@@ -1569,8 +1572,8 @@ var
     f: string;
   begin
     f := Fam(R);
-    if (f <> '') and ((f = FChkIdx) or (f = FChkLen)) then
-      FChkOn := False;
+    if (f <> '') and FChkOn then
+      ChkDrop(f, False);
     Result := (f <> '') and ((f = FIxReg) or (f = FIxSrc) or (f = FIxBase));
   end;
 
@@ -1634,6 +1637,9 @@ begin
       d := Copy(rest, q + 2, Length(rest) - q - 1)
     else
       d := rest;
+    { a store to the global's words ends a check against its length (P324) }
+    if FChkOn and (Pos('(%rip)', d) > 0) then
+      ChkDrop(d, True);
     if (d <> '') and (d[1] = '%') and Hit(d) then
       FIxOn := False;
     Exit;
@@ -1646,6 +1652,12 @@ begin
     d := Copy(rest, 1, q - 1)
   else
     d := rest;
+  { arm64 reaches a global by x16 or x17: a store through them may write
+    its length (P324) }
+  if FChkOn and ((op = 'str') or (op = 'strb') or (op = 'strh') or
+    (op = 'stur') or (op = 'sturb') or (op = 'sturh') or (op = 'stp')) and
+    ((Pos('[x16', rest) > 0) or (Pos('[x17', rest) > 0)) then
+    ChkDrop('', True);
   if (op = 'str') or (op = 'strb') or (op = 'strh') or (op = 'stur') or (op = 'sturb') or
     (op = 'sturh') or (op = 'stp') then
   begin
@@ -1711,11 +1723,47 @@ end;
 function TEmitter.ChkKept(const I, L, K: string): Boolean;
 var
   l2: string;
+  q: LongInt;
 begin
   l2 := L;
   if (l2 <> '') and (l2[1] = '%') then
     l2 := Copy(l2, 2, Length(l2) - 1);
-  Result := FChkOn and (FChkIdx = I) and (FChkLen = l2) and (FChkKey = K);
+  Result := False;
+  if not FChkOn then
+    Exit;
+  for q := 0 to FChkN - 1 do
+    if (FChkIdx[q] = I) and (FChkLen[q] = l2) and (FChkKey[q] = K) then
+      Result := True;
+end;
+
+{ P324: the kept checks a write of register family F names, as index or
+  length, are no more; with Mem, those against a global's length at its
+  home that the store's text F names (on arm64 every one, F empty: its
+  stores reach a global through x16 or x17). }
+procedure TEmitter.ChkDrop(const F: string; Mem: Boolean);
+var
+  q, w: LongInt;
+  drop: Boolean;
+begin
+  w := 0;
+  for q := 0 to FChkN - 1 do
+  begin
+    if Mem then
+      drop := (FChkMem[q] <> '') and ((F = '') or (Pos(FChkMem[q] + '+', F) > 0) or
+        (Pos(FChkMem[q] + '(', F) > 0))
+    else
+      drop := (FChkIdx[q] = F) or (FChkLen[q] = F);
+    if not drop then
+    begin
+      FChkIdx[w] := FChkIdx[q];
+      FChkLen[w] := FChkLen[q];
+      FChkKey[w] := FChkKey[q];
+      FChkMem[w] := FChkMem[q];
+      Inc(w);
+    end;
+  end;
+  FChkN := w;
+  FChkOn := w > 0;
 end;
 
 { P316: the check just written holds while nothing writes I or L: kept
@@ -1725,15 +1773,59 @@ end;
 procedure TEmitter.ChkKeep(const I, L, K: string; Ok: Boolean);
 var
   l2: string;
+  q: LongInt;
 begin
   l2 := L;
   if (l2 <> '') and (l2[1] = '%') then
     l2 := Copy(l2, 2, Length(l2) - 1);
-  FChkOn := Ok and ((L = '') or ((not FArm) and (L[1] = '%')) or
-    (FArm and ((L[1] = 'x') or (L[1] = 'w'))));
-  FChkIdx := I;
-  FChkLen := l2;
-  FChkKey := K;
+  if not FChkOn then
+    FChkN := 0;
+  if not (Ok and ((L = '') or ((not FArm) and (L[1] = '%')) or
+    (FArm and ((L[1] = 'x') or (L[1] = 'w'))) or (Copy(L, 1, 2) = 'v_'))) then
+    Exit;
+  { the oldest goes when eight are kept }
+  if FChkN = 8 then
+  begin
+    for q := 0 to 6 do
+    begin
+      FChkIdx[q] := FChkIdx[q + 1];
+      FChkLen[q] := FChkLen[q + 1];
+      FChkKey[q] := FChkKey[q + 1];
+      FChkMem[q] := FChkMem[q + 1];
+    end;
+    FChkN := 7;
+  end;
+  FChkIdx[FChkN] := I;
+  FChkLen[FChkN] := l2;
+  FChkKey[FChkN] := K;
+  { a global's length at its home (P324): its label, whose stores end the
+    check as a register's writes do }
+  FChkMem[FChkN] := '';
+  if Copy(L, 1, 2) = 'v_' then
+    FChkMem[FChkN] := Copy(L, 1, Pos('+', L) - 1);
+  Inc(FChkN);
+  FChkOn := True;
+end;
+
+{ P324: the length of the global slice N at its home holds while no line
+  writes its label and no call or label lies between: its address taken
+  by nobody (AddrKept), no unit's global another unit may write, and no
+  parameter of this routine a fat value reached by reference, which may
+  be the same slice under another name. }
+function TEmitter.MemLenOK(const N: string): Boolean;
+var
+  i: SizeInt;
+  sy: TSym;
+begin
+  Result := False;
+  if (not TryFindSym(N, sy)) or (not sy.Global) or AddrKept(sy.Name) or
+    FIsUnit or ExtGlobal(sy.Name) then
+    Exit;
+  for i := 0 to High(FSym) do
+    if (FSym[i].Name <> '') and (not FSym[i].Global) and (FSym[i].Up = 0) and FSym[i].ByRef and
+      (IsFat(FSym[i].Typ) or IsDyn(FSym[i].Typ)) then
+      Exit;
+  Result := True;
 end;
 
 { ---- stack maps (P95c) ----
@@ -29120,7 +29212,7 @@ end;
 
 function TEmitter.EmitWordMem(E: PExpr; D: LongInt): string;
 var
-  r, idx, lenop, lenlab, ok, ok2, preg, lreg, lenR, glab, bs, reclab, m, ixop: string;
+  r, idx, lenop, lenlab, ok, ok2, preg, lreg, lenR, glab, bs, reclab, m, ixop, lenkey: string;
   recglob: Boolean;
   td: TTypeDef;
   esz, sh, lk, asz: LongInt;
@@ -29480,13 +29572,23 @@ begin
               Imm('x0', lenk)
             else if lk = 2 then
             begin
-              LeaS(lenlab, 'x16');
-              Line('  ldr x0, [x16, #8]');
+              { the length loaded only where a compare reads it: not for
+                an index proved, unchecked or checked already against it
+                (P324) }
+              if isc or ((not nochk) and (not SliceProven(E)) and
+                not ChkKept(idx, lenlab + '+8', 'f' + IntToStr(ixk + disp))) then
+              begin
+                LeaS(lenlab, 'x16');
+                Line('  ldr x0, [x16, #8]');
+              end;
             end
             else if lk = 4 then
               lenR := lreg
             else
               LdFP('x0', lenoff);
+            lenkey := lenR;
+            if lk = 2 then
+              lenkey := lenlab + '+8';
             if isc then
             begin
               if (lk = 1) and (k + disp >= 0) and (k + disp < lenk) then
@@ -29508,7 +29610,7 @@ begin
               end;
             end
             else if (not nochk) and (not SliceProven(E)) and
-              not ChkKept(idx, lenR, 'f' + IntToStr(ixk + disp)) then
+              not ChkKept(idx, lenkey, 'f' + IntToStr(ixk + disp)) then
             begin
               if (disp = -1) or (ixk <> 0) then
               begin
@@ -29526,7 +29628,8 @@ begin
               else
                 BoundsFailArm(idx, 0, -disp, lenR, 0, -1 - disp);
               ColdEnd;
-              ChkKeep(idx, lenR, 'f' + IntToStr(ixk + disp), ixvar);
+              ChkKeep(idx, lenkey, 'f' + IntToStr(ixk + disp),
+                ixvar and ((lk <> 2) or MemLenOK(E^.L^.Name)));
             end;
             { no label after the check: nothing jumps to it since the
               failure went out of line (P299), and a label would end the
@@ -29576,7 +29679,8 @@ begin
               else
                 BoundsFailX86('%' + idx, -disp, lenop, 0, -1 - disp);
               ColdEnd;
-              ChkKeep(idx, lenop, 'f' + IntToStr(ixk + disp), ixvar);
+              ChkKeep(idx, lenop, 'f' + IntToStr(ixk + disp),
+                ixvar and ((lk <> 2) or MemLenOK(E^.L^.Name)));
             end;
           end;
         end
