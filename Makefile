@@ -370,6 +370,9 @@ GOLDEN_A64 += runlen
 # P320: an and with $FF, $FFFF or $FFFFFFFF is a zero extension.
 GOLDEN += andmask
 GOLDEN_A64 += andmask
+# P321: a constant from 0 to 2^32 - 1 by a movl, 0 by an xorl where the flags die.
+GOLDEN += movconst
+GOLDEN_A64 += movconst
 # P333: an exec and a new thread do not race (amd64: qemu-user does not
 # execve an arm64 program, so arm64 reads the runtime's forms).
 GOLDEN += execrace
@@ -2516,6 +2519,13 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/andmask.out $(BUILDDIR)/andmask0.got; \
 	python3 -I scripts/check_andmask.py $(BUILDDIR)/andmask0.s; \
 	echo ok andmask-asm; \
+	: a constant from 0 to 2^32 - 1 into a register by a movl of 32 bits and 0 by an xorl where the flags die, P321: movconst with and without inlining, the runtime included; \
+	python3 -I scripts/check_movconst.py $(BUILDDIR)/movconst.s; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/movconst0 testdata/movconst.paslang; \
+	$(BUILDDIR)/movconst0 > $(BUILDDIR)/movconst0.got; \
+	diff -u testdata/movconst.out $(BUILDDIR)/movconst0.got; \
+	python3 -I scripts/check_movconst.py $(BUILDDIR)/movconst0.s; \
+	echo ok movconst-asm; \
 	: the exec lock around a new thread and an execve, clone again on EAGAIN, P333: the runtime in execrace; \
 	python3 -I scripts/check_execlock.py $(BUILDDIR)/execrace.s; \
 	echo ok execlock-asm; \

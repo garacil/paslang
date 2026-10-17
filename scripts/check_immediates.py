@@ -39,6 +39,10 @@ def addimm(k):
     return 0 <= k <= 4095 or ((k & 0xFFF) == 0 and (k >> 12) <= 4095)
 
 
+R64 = {"eax": "rax", "ebx": "rbx", "ecx": "rcx", "edx": "rdx", "esi": "rsi", "edi": "rdi",
+       "ebp": "rbp", **{f"r{i}d": f"r{i}" for i in range(8, 16)}}
+
+
 def read_again(lines, i, reg):
     """reg is read after line i before it is written or control leaves."""
     word = re.compile(r"(?<![a-z0-9])%?" + re.escape(reg) + r"(?![a-z0-9])")
@@ -90,9 +94,11 @@ def main():
                 if ok and not read_again(lines, i + 1, reg):
                     bad.append(f"{fn}: {l.strip()} | {nx.strip()}")
             continue
-        m = re.match(r"^  movq \$(-?\d+), %(r[a-z0-9]+)$", l)
+        # a movl of 32 bits zeroes the upper half: a constant from 0 to
+        # 2^32 - 1 goes into a register so (P321)
+        m = re.match(r"^  mov[lq] \$(-?\d+), %(r[a-z0-9]+|e[a-z]{2})$", l)
         if m:
-            k, reg = int(m.group(1)), m.group(2)
+            k, reg = int(m.group(1)), R64.get(m.group(2), m.group(2))
             m2 = re.match(r"^  (addq|subq|andq|orq|xorq|cmpq) %" + reg + ", ", nx)
             if m2 and -2 ** 31 <= k < 2 ** 31 and not read_again(lines, i + 1, reg):
                 bad.append(f"{fn}: {l.strip()} | {nx.strip()}")

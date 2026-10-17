@@ -337,6 +337,8 @@ type
     FMulKs: TInt64Arr;     { the constants a recipe was looked for, and what was found }
     FMulForm, FMulIn, FMulOut: TInt64Arr;
     FIxOn: Boolean;        { FIxReg holds FIxSrc scaled by FIxK, plus FIxBase on arm64 (P314) }
+    FZeroN: LongInt;       { the movl $0 of a register waiting for xorl till the flags die: first characters in FOut and lengths (P321) }
+    FZeroAt, FZeroLen: array[0..7] of SizeInt;
     FIxReg, FIxSrc, FIxBase: string;
     FIxK: Int64;
     FChkOn: Boolean;       { the word place's last check holds: FChkIdx against FChkLen, FChkKey (P316) }
@@ -442,6 +444,8 @@ type
     function SplitLea(const S: string): Boolean;
     procedure NoteLine(const S: string);
     procedure IxNote(const S: string);
+    procedure ZeroNote(const S: string);
+    function MovConst32(const S: string): string;
     function ChkKept(const I, L, K: string): Boolean;
     procedure ChkKeep(const I, L, K: string; Ok: Boolean);
     procedure MapNote(const S: string);
@@ -1181,10 +1185,118 @@ begin
     t := ForwardLoad(S, drop);
   if drop then
     Exit;
+  if (not FArm) and (not FAsmText) then
+    t := MovConst32(t);
   AppendLine(t);
   NoteLine(t);
   if FMapOn or FMapPro then
     MapNote(t);
+end;
+
+{ S, or its MOV of 32 bits when S moves a constant from 0 to 2^32 - 1
+  into a register of 64 (movq $N, or movabsq): MOV r32, imm32 zeroes the
+  upper half (SDM vol. 1 3.4.1.1) in five bytes, six past r7, where movq
+  takes seven and movabsq ten, as Go writes MOVL for such a constant
+  (cmd/compile/internal/amd64/ssa.go: 'Use MOVL to move a small
+  constant into a register when the constant is positive and fits into
+  32 bits'); a store to memory keeps its width, an asm block its text
+  (P321). }
+function TEmitter.MovConst32(const S: string): string;
+var
+  n, p, q: SizeInt;
+  v: Int64;
+  reg: string;
+begin
+  Result := S;
+  n := Length(S);
+  if (n < 14) or (S[1] <> ' ') or (S[2] <> ' ') or (S[3] <> 'm') then
+    Exit;
+  if Copy(S, 1, 8) = '  movq $' then
+    p := 9
+  else if Copy(S, 1, 11) = '  movabsq $' then
+    p := 12
+  else
+    Exit;
+  q := p;
+  v := 0;
+  while (q <= n) and (S[q] >= '0') and (S[q] <= '9') do
+  begin
+    v := v * 10 + (Ord(S[q]) - Ord('0'));
+    if v > 4294967295 then
+      Exit;
+    Inc(q);
+  end;
+  if (q = p) or (q + 2 > n) or (S[q] <> ',') or (S[q + 1] <> ' ') or (S[q + 2] <> '%') then
+    Exit;
+  reg := Copy(S, q + 3, n - q - 2);
+  if not ((reg = 'rax') or (reg = 'rbx') or (reg = 'rcx') or (reg = 'rdx') or
+    (reg = 'rsi') or (reg = 'rdi') or (reg = 'rbp') or (reg = 'r8') or (reg = 'r9') or
+    (reg = 'r10') or (reg = 'r11') or (reg = 'r12') or (reg = 'r13') or (reg = 'r14') or
+    (reg = 'r15')) then
+    Exit;
+  { the register's 32 bits: eax for rax, esi for rsi, r8d for r8 }
+  if reg[2] in ['0'..'9'] then
+    reg := reg + 'd'
+  else
+    reg := 'e' + Copy(reg, 2, 2);
+  Result := '  movl $' + Copy(S, p, q - p) + ', %' + reg;
+end;
+
+{ The line S after the movl $0 waiting at FZeroAt (P321): each zero is
+  xorl, three bytes fewer and a zero idiom the renamer does without an
+  execution unit (AMD 56665 2.9.2, Zen 3: XOR reg, reg a 0-cycle
+  operation; 57647 and 58455 the same), when an instruction that writes
+  every flag and reads none comes before any that reads one and before
+  a label, a jump, a call, a return or an instruction this does not
+  know, as Go writes MOV $0 as XOR where the flags are not live
+  (amd64/ssa.go). A directive and a line's .LL label (never a jump's
+  target) are passed by; a move, a load, a lea, a push or a pop touches
+  no flag. }
+procedure TEmitter.ZeroNote(const S: string);
+var
+  n, p: SizeInt;
+  i: LongInt;
+  op, z: string;
+begin
+  n := Length(S);
+  if (n >= 3) and (S[1] = ' ') and (S[2] = ' ') and (S[3] = '.') then
+    Exit;
+  if (n > 4) and (Copy(S, 1, 3) = '.LL') and (S[n] = ':') then
+    Exit;
+  if (n < 3) or (S[1] <> ' ') or (S[2] <> ' ') then
+  begin
+    FZeroN := 0;
+    Exit;
+  end;
+  p := 3;
+  while (p <= n) and (S[p] <> ' ') do
+    Inc(p);
+  op := Copy(S, 3, p - 3);
+  if (op = 'cmpq') or (op = 'cmpl') or (op = 'cmpw') or (op = 'cmpb') or
+    (op = 'testq') or (op = 'testl') or (op = 'testw') or (op = 'testb') or
+    (op = 'addq') or (op = 'addl') or (op = 'subq') or (op = 'subl') or
+    (op = 'andq') or (op = 'andl') or (op = 'orq') or (op = 'orl') or
+    (op = 'xorq') or (op = 'xorl') or (op = 'negq') or (op = 'negl') or
+    (op = 'ucomisd') or (op = 'ucomiss') or (op = 'comisd') or (op = 'comiss') then
+  begin
+    { the last first: a longer line moves only the text after it }
+    for i := FZeroN - 1 downto 0 do
+    begin
+      z := Copy(FOut, FZeroAt[i], FZeroLen[i]);
+      z := Copy(z, 12, Length(z) - 11);
+      ReplaceLine(FZeroAt[i], FZeroLen[i], '  xorl ' + z + ', ' + z);
+    end;
+    FZeroN := 0;
+    Exit;
+  end;
+  if (p > n) or not ((op = 'movq') or (op = 'movl') or (op = 'movw') or (op = 'movb') or
+    (op = 'movabsq') or (op = 'movzbl') or (op = 'movzwl') or (op = 'movzbq') or
+    (op = 'movzwq') or (op = 'movsbq') or (op = 'movswq') or (op = 'movslq') or
+    (op = 'movsbl') or (op = 'movswl') or (op = 'leaq') or (op = 'leal') or
+    (op = 'pushq') or (op = 'popq') or (op = 'movsd') or (op = 'movss') or
+    (op = 'movd') or (op = 'movaps') or (op = 'movups') or (op = 'movdqa') or
+    (op = 'movdqu')) then
+    FZeroN := 0;
 end;
 
 { A lea of a base, an index and a displacement, or of a base of rbp or
@@ -1348,6 +1460,18 @@ begin
     Exit;
   if (FIxOn or FChkOn) and (FColdAt < 0) then
     IxNote(S);
+  if not FArm then
+  begin
+    if FZeroN > 0 then
+      ZeroNote(S);
+    if (not FAsmText) and (FColdAt < 0) and (FZeroN < 8) and (n > 12) and
+      (Copy(S, 1, 12) = '  movl $0, %') then
+    begin
+      FZeroAt[FZeroN] := FLen - n;
+      FZeroLen[FZeroN] := n;
+      Inc(FZeroN);
+    end;
+  end;
   if (n > 3) and (S[1] = ' ') and (S[2] = ' ') and (S[3] <> '.') then
     FLastIns := S
   else
@@ -29835,6 +29959,8 @@ var
 begin
   if FColdAt >= 0 then
     Die('internal error: a check''s failure inside another');
+  { the failure's text leaves FOut at ColdEnd: no rewrite before it }
+  FZeroN := 0;
   { arm64's TBZ and TBNZ reach 32 KiB (C6.2.478), not a routine's end }
   if FArm and ((Copy(Jmp, 1, 6) = '  tbz ') or (Copy(Jmp, 1, 7) = '  tbnz ')) then
     Die('internal error: a test bit and branch to a block after the ret');
@@ -29885,6 +30011,7 @@ begin
   FLastIns := '';
   FIxOn := False;
   FChkOn := False;
+  FZeroN := 0;
 end;
 
 { The divisor is zero: rt_divzero, out of line (P299). }

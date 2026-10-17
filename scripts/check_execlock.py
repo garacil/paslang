@@ -42,7 +42,8 @@ def main():
         want_sy = [r"cmp x8, #221\n  b\.eq \.asy_exec", r"\.asy_exec:\n  bl rt_execwl\n  svc #0\n  bl rt_execwu",
                    r"\.asy_rawexec:\n(.*\n)*?  bl rt_execwl\n  svc #0\n  bl rt_execwu"]
     else:
-        want_nm = [r"call rt_execrl\n(.*\n)*?  movq \$56, %rax", r"cmpq \$-11, %rax", r"movq \$35, %rax", r"lock decq rt_execlk\(%rip\)"]
+        # the clone's and the nanosleep's numbers by a movl of 32 bits (P321)
+        want_nm = [r"call rt_execrl\n(.*\n)*?  movl \$56, %eax", r"cmpq \$-11, %rax", r"movl \$35, %eax", r"lock decq rt_execlk\(%rip\)"]
         want_sy = [r"cmpq \$59, %rax\n  je \.sy_exec", r"\.sy_exec:\n  call rt_execwl\n  syscall\n  call rt_execwu",
                    r"\.sy_raw_exec:\n  call rt_execwl\n  syscall\n  call rt_execwu"]
     for w in want_nm:
