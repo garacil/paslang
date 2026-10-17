@@ -352,6 +352,9 @@ GOLDEN_A64 += idxsum
 # P314: an element's index is scaled once for its fields.
 GOLDEN += fieldcse
 GOLDEN_A64 += fieldcse
+# P315: an arm64 constant goes into its register with no literal load.
+GOLDEN += armconst
+GOLDEN_A64 += armconst
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -3583,6 +3586,17 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	diff -u testdata/fieldcse.out $(BUILDDIR)/fieldcse0-arm.got; \
 	python3 -I scripts/check_fieldcse.py $(BUILDDIR)/fieldcse0-arm.s same:4,inheap:4 --arm; \
 	echo ok fieldcse-arm-asm; \
+	: P315 on arm64: no literal load in armconst, the runtime included, each constant in as many instructions as Go writes it, with no tune, tuned for Neoverse N1 and without inlining; \
+	python3 -I scripts/check_armconst.py $(BUILDDIR)/armconst-arm.s --source=testdata/armconst.paslang; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -tune neoverse-n1 -Fu $(A64DIR) -o $(BUILDDIR)/armconst-n1-arm testdata/armconst.paslang; \
+	timeout 300 $(QEMU_A64) $(BUILDDIR)/armconst-n1-arm > $(BUILDDIR)/armconst-n1-arm.got; \
+	diff -u testdata/armconst.out $(BUILDDIR)/armconst-n1-arm.got; \
+	python3 -I scripts/check_armconst.py $(BUILDDIR)/armconst-n1-arm.s --source=testdata/armconst.paslang; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/armconst0-arm testdata/armconst.paslang; \
+	timeout 300 $(QEMU_A64) $(BUILDDIR)/armconst0-arm > $(BUILDDIR)/armconst0-arm.got; \
+	diff -u testdata/armconst.out $(BUILDDIR)/armconst0-arm.got; \
+	python3 -I scripts/check_armconst.py $(BUILDDIR)/armconst0-arm.s --source=testdata/armconst.paslang; \
+	echo ok armconst-arm-asm; \
 	$(OUTDIR)/paslangc -target arm64 -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/exprinline0-arm testdata/exprinline.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/exprinline0-arm > $(BUILDDIR)/exprinline0-arm.got; \
 	diff -u testdata/exprinline.out $(BUILDDIR)/exprinline0-arm.got; \
@@ -3601,7 +3615,8 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	grep -qF '/* u_cpuu_init: cpu ' $(A64DIR)/cpuu.s || { echo "cpuu-arm.s: the initialization does not say its processor"; exit 1; }; \
 	$(OUTDIR)/paslangc -target arm64 -cpu base -Fu $(A64DIR) -o $(BUILDDIR)/cputuse-arm testdata/cputuse.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/cputuse-arm > $(BUILDDIR)/cputuse-arm.got; \
-	diff -u testdata/cputuse.out $(BUILDDIR)/cputuse-arm.got; \
+	diff -u testdata/cputuse.out $(BUILDDIR)/cputuse-arm.got
+	@set -e; \
 	echo "==== the base processor arm64 ===="; \
 	for t in hash1 tree1 store1 vectors bitwords set256 strwords strkern strcmpk cmpwords sysutils1 utf8kern jsonkern longslice rtlong fillkern json1 jsoncanon; do \
 	  $(OUTDIR)/paslangc -target arm64 -cpu base -o $(BUILDDIR)/$$t-arm-base testdata/$$t.paslang; \

@@ -1031,6 +1031,8 @@ begin
   FLen := FLen + d;
 end;
 
+function ArmImmText(const Reg: string; V: Int64): string; forward;
+
 { D := S - V as text, lines joined by line ends (P308). }
 function TEmitter.SubImmText(const D, S: string; V: Int64): string;
 var
@@ -1049,7 +1051,7 @@ begin
         '  sub ' + D + ', ' + D + ', #' + IntToStr(hi) + ', lsl #12';
   end
   else
-    Result := '  ldr x16, =' + IntToStr(V) + Char(10) + '  sub ' + D + ', ' + S + ', x16';
+    Result := ArmImmText('x16', V) + Char(10) + '  sub ' + D + ', ' + S + ', x16';
 end;
 
 { The prologue's mark for its frame's SUBs (P308). }
@@ -2151,11 +2153,25 @@ end;
   literal the assembler places (P100, 1.0.102: every constant was a load
   from the literal pool). MapNote reads either for x16. }
 procedure TEmitter.Imm(const Reg: string; V: Int64);
+var
+  t: string;
+  p: SizeInt;
 begin
   if (V >= -65536) and (V <= 65535) then
-    Line('  mov ' + Reg + ', #' + IntToStr(V))
-  else
-    Line('  ldr ' + Reg + ', =' + IntToStr(V));
+  begin
+    Line('  mov ' + Reg + ', #' + IntToStr(V));
+    Exit;
+  end;
+  { the instructions Go's assembler writes, no literal load (P315) }
+  t := ArmImmText(Reg, V);
+  p := Pos(Char(10), t);
+  while p > 0 do
+  begin
+    Line(Copy(t, 1, p - 1));
+    t := Copy(t, p + 1, Length(t) - p);
+    p := Pos(Char(10), t);
+  end;
+  Line(t);
 end;
 
 { Reg := x29 + Off, in one add or sub when Off fits twelve bits, or
@@ -2724,6 +2740,117 @@ begin
       Exit;
     end;
   end;
+end;
+
+{ arm64: the lines that put V in Reg as Go's assembler does
+  (cmd/internal/obj/arm64/asm7.go: con64class and omovlconst, MOVD of a
+  constant 4 to 16 bytes, never a literal), joined by line feeds (P315):
+  one MOV when MOVZ, MOVN or ORR of a bitmask takes V (the assembler's
+  MOV aliases, ARM DDI 0487 M.c C6.2.280, C6.2.279 and C6.2.281; ORR
+  (immediate) C6.2.301); MOVZ of the first halfword that is not 0 and a
+  MOVK of the other such one when two are 0, MOVN of the first that is
+  not 0xffff and a MOVK when two are 0xffff (C6.2.285, C6.2.284,
+  C6.2.283); ORR of a bitmask that differs from V in one halfword, the
+  rest of V rotated by 16 or 32 into it, and a MOVK of that halfword;
+  else MOVZ or MOVN and two MOVKs when one halfword is 0 or 0xffff, and
+  MOVZ and three MOVKs. On Neoverse N1 a MOVZ, MOVN or MOVK takes 1
+  cycle, 3 a cycle, and a load of a literal 4 (arm-neoverse-n1-sog 3.8
+  and 3.9), and the literal waits in the pool behind the code. }
+function ArmImmText(const Reg: string; V: Int64): string;
+var
+  h: array[0..3] of Int64;
+  i, j, zc, nc, r: LongInt;
+  x, mask, rv: Int64;
+
+  function MovK(k: LongInt): string;
+  begin
+    Result := Char(10) + '  movk ' + Reg + ', #' + IntToStr(h[k]) + ', lsl #' + IntToStr(16 * k);
+  end;
+
+begin
+  zc := 0;
+  nc := 0;
+  for i := 0 to 3 do
+  begin
+    h[i] := (V shr (16 * i)) and 65535;
+    if h[i] = 0 then
+      Inc(zc)
+    else if h[i] = 65535 then
+      Inc(nc);
+  end;
+  if (zc >= 3) or (nc >= 3) or ArmLogImm(V) then
+  begin
+    Result := '  mov ' + Reg + ', #' + IntToStr(V);
+    Exit;
+  end;
+  if zc = 2 then
+  begin
+    Result := '';
+    for i := 0 to 3 do
+      if h[i] <> 0 then
+      begin
+        if Result = '' then
+          Result := '  movz ' + Reg + ', #' + IntToStr(h[i]) + ', lsl #' + IntToStr(16 * i)
+        else
+          Result := Result + MovK(i);
+      end;
+    Exit;
+  end;
+  if nc = 2 then
+  begin
+    Result := '';
+    for i := 0 to 3 do
+      if h[i] <> 65535 then
+      begin
+        if Result = '' then
+          Result := '  movn ' + Reg + ', #' + IntToStr(65535 - h[i]) + ', lsl #' + IntToStr(16 * i)
+        else
+          Result := Result + MovK(i);
+      end;
+    Exit;
+  end;
+  for i := 0 to 3 do
+  begin
+    mask := Int64(65535) shl (16 * i);
+    for j := 0 to 1 do
+    begin
+      r := 16 * (j + 1);
+      rv := (V shl r) or (V shr (64 - r));
+      x := (V and not mask) or (rv and mask);
+      if ArmLogImm(x) then
+      begin
+        Result := '  orr ' + Reg + ', xzr, #' + IntToStr(x) + MovK(i);
+        Exit;
+      end;
+    end;
+  end;
+  if zc = 1 then
+  begin
+    Result := '';
+    for i := 0 to 3 do
+      if h[i] <> 0 then
+      begin
+        if Result = '' then
+          Result := '  movz ' + Reg + ', #' + IntToStr(h[i]) + ', lsl #' + IntToStr(16 * i)
+        else
+          Result := Result + MovK(i);
+      end;
+    Exit;
+  end;
+  if nc = 1 then
+  begin
+    Result := '';
+    for i := 0 to 3 do
+      if h[i] <> 65535 then
+      begin
+        if Result = '' then
+          Result := '  movn ' + Reg + ', #' + IntToStr(65535 - h[i]) + ', lsl #' + IntToStr(16 * i)
+        else
+          Result := Result + MovK(i);
+      end;
+    Exit;
+  end;
+  Result := '  movz ' + Reg + ', #' + IntToStr(h[0]) + MovK(1) + MovK(2) + MovK(3);
 end;
 
 { ---- Sets (P126) ----
@@ -42481,8 +42608,8 @@ begin
   { rt_asyncinit, at the start: the pasasync table by its starts, as on
     amd64 }
   Line('rt_asyncinit:');
-  Line('  ldr x9, =__start_pasasync');
-  Line('  ldr x10, =__stop_pasasync');
+  LeaS('__start_pasasync', 'x9');
+  LeaS('__stop_pasasync', 'x10');
   Line('  cbz x9, .aaix_none');
   Line('  cmp x10, x9');
   Line('  b.ls .aaix_none');
@@ -48872,7 +48999,7 @@ begin
     address from the literal pool, 0 when the weak symbol is absent }
   Line('  ldr x0, [x28, #272]');
   Line('  cbz x0, .uc_plain');
-  Line('  ldr x9, =p_pasobject_pasuncaught');
+  LeaS('p_pasobject_pasuncaught', 'x9');
   Line('  cbz x9, .uc_plain');
   Line('  blr x9');
   Line('  b .uc_exit');
@@ -51488,15 +51615,15 @@ begin
   Line('  str x9, [x0, #424]');
   LeaS('rt_heap', 'x9');
   Line('  str x9, [x0, #432]');
-  Line('  ldr x9, =__start_pasgcroots');
+  LeaS('__start_pasgcroots', 'x9');
   Line('  str x9, [x0, #168]');
-  Line('  ldr x9, =__stop_pasgcroots');
+  LeaS('__stop_pasgcroots', 'x9');
   Line('  str x9, [x0, #176]');
   { As on amd64 (P95c): .pk_res keeps x19 to x27 and the return address
     in 96 bytes, and a prologue's check pushes x30 in 16. }
-  Line('  ldr x9, =__start_pasgcmaps');
+  LeaS('__start_pasgcmaps', 'x9');
   Line('  str x9, [x0, #440]');
-  Line('  ldr x9, =__stop_pasgcmaps');
+  LeaS('__stop_pasgcmaps', 'x9');
   Line('  str x9, [x0, #448]');
   LeaS('.pk_res', 'x9');
   Line('  str x9, [x0, #456]');
