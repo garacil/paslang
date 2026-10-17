@@ -376,6 +376,9 @@ GOLDEN += execrace
 # P326: an inlined call is put ahead only of what it cannot change.
 GOLDEN += inlineorder
 GOLDEN_A64 += inlineorder
+# P336: an unrolled loop keeps its counter where what it calls reads it.
+GOLDEN += unrollctr
+GOLDEN_A64 += unrollctr
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -2489,6 +2492,13 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  diff -u testdata/inlineorder.out $(BUILDDIR)/inlineorder$$n.got; \
 	done; \
 	echo ok inlineorder-inline; \
+	: an unrolled loop stores its counter before each copy, P336: unrollctr with -inline 0 and 200; \
+	for n in 0 200; do \
+	  $(OUTDIR)/paslangc -inline $$n -o $(BUILDDIR)/unrollctr$$n testdata/unrollctr.paslang; \
+	  $(BUILDDIR)/unrollctr$$n > $(BUILDDIR)/unrollctr$$n.got; \
+	  diff -u testdata/unrollctr.out $(BUILDDIR)/unrollctr$$n.got; \
+	done; \
+	echo ok unrollctr-inline; \
 	: every loop of an asm kernel of the units starts aligned, as the loops paslangc compiles, P302; \
 	python3 -I scripts/check_kernel_align.py src/lib/*.paslang src/rtl/*.paslang; \
 	echo ok kernel-align; \
@@ -3721,6 +3731,13 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	  diff -u testdata/inlineorder.out $(BUILDDIR)/inlineorder$$n-arm.got; \
 	done; \
 	echo ok inlineorder-arm-inline; \
+	: P336 on arm64: unrollctr with -inline 0 and 200; \
+	for n in 0 200; do \
+	  $(OUTDIR)/paslangc -target arm64 -cpu max -inline $$n -Fu $(A64DIR) -o $(BUILDDIR)/unrollctr$$n-arm testdata/unrollctr.paslang; \
+	  timeout 300 $(QEMU_A64) $(BUILDDIR)/unrollctr$$n-arm > $(BUILDDIR)/unrollctr$$n-arm.got; \
+	  diff -u testdata/unrollctr.out $(BUILDDIR)/unrollctr$$n-arm.got; \
+	done; \
+	echo ok unrollctr-arm-inline; \
 	$(OUTDIR)/paslangc -target arm64 -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/exprinline0-arm testdata/exprinline.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/exprinline0-arm > $(BUILDDIR)/exprinline0-arm.got; \
 	diff -u testdata/exprinline.out $(BUILDDIR)/exprinline0-arm.got; \
