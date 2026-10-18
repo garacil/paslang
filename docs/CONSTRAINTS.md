@@ -25,6 +25,13 @@ Code that violates this file is wrong. Do not add “just one exception”.
 
 6.3 is too old for this model. No fallback.
 
+A routine's first stack has no guard page since P342 (1.1.194), as a
+goroutine's has none: its record and first stack are one chunk of 1360
+bytes on amd64 (2048 on arm64), and every check asks for the frame, the
+words pushed under it and a red zone that `scripts/check_stack.py`
+proves enough for every program, as Go's linker proves its nosplit
+chains. A stack that grew keeps its guard pages.
+
 ## Language vs delivery
 
 **Language goal:** living Object Pascal (units, nested procedures,

@@ -306,8 +306,8 @@ GOLDEN_A64 += framefield
 GOLDEN += rangetest
 GOLDEN_A64 += rangetest
 # P293: a loop that does not count is preempted by a signal, as Go's.
-GOLDEN += asyncspin asyncgc
-GOLDEN_A64 += asyncspin asyncgc
+GOLDEN += asyncspin asyncgc asyncleaf
+GOLDEN_A64 += asyncspin asyncgc asyncleaf
 # P294: arithmetic in one instruction where it took several.
 GOLDEN += leaform
 GOLDEN_A64 += leaform
@@ -2439,6 +2439,13 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	: PASLANG_ASYNCPREEMPTOFF=1 stops nothing by a signal, so the wait of Walker never ends and the cycle waits for it, as under the asyncpreemptoff of Go; \
 	rc=0; PASLANG_ASYNCPREEMPTOFF=1 PASLANG_GCSTRESS=1 timeout 5 $(BUILDDIR)/asyncgc > /dev/null 2>&1 || rc=$$?; \
 	test $$rc -eq 124 || { echo "asyncgc: PASLANG_ASYNCPREEMPTOFF=1 still stops Walker (exit $$rc)"; exit 1; }; \
+	: a leaf without a check of its own, a frame of 192 bytes or more, is stopped by a signal at every depth with its vector registers in a block of their own, P342; \
+	test $$(awk '/^p_spin:/,/cfi_endproc/' $(BUILDDIR)/asyncleaf.s | grep -c 'cmpq 16(%r14)') -eq 0 || { echo "asyncleaf.s: Spin checks its stack"; exit 1; }; \
+	test $$(sed -n 's/^\.set \.Lfrp_spin, //p' $(BUILDDIR)/asyncleaf.s) -ge 192 || { echo "asyncleaf.s: Spin's frame is under 192 bytes"; exit 1; }; \
+	for w in "" "taskset -c 0"; do \
+	  PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 $$w timeout 120 $(BUILDDIR)/asyncleaf > $(BUILDDIR)/asyncleaf-gc.got; \
+	  diff -u testdata/asyncleaf.out $(BUILDDIR)/asyncleaf-gc.got; \
+	done; \
 	echo ok async-asm; \
 	: c + k * x and y + k * x are one lea, x := x + k * y one lea on the register of x, r13 and rbp are never the base of a lea with an index, and a load at p - k takes the offset, P294; \
 	awk '/^p_off8:/,/cfi_endproc/' $(BUILDDIR)/leaform.s > $(BUILDDIR)/leaform-off8.s; \
@@ -2669,6 +2676,13 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	: every loop of an asm kernel of the units starts aligned, as the loops paslangc compiles, P302; \
 	python3 -I scripts/check_kernel_align.py src/lib/*.paslang src/rtl/*.paslang; \
 	echo ok kernel-align; \
+	: every routine within the room its check gives, as the Go linker proves its nosplit chains, and the 144 bytes of a stop wherever a routine of the pasasync table runs, P342: the golden programs and the units; \
+	python3 -I scripts/check_stack.py $(foreach t,$(GOLDEN),$(BUILDDIR)/$(t).s) $(foreach u,$(CORE_UNITS) $(LIB_UNITS),$(BUILDDIR)/$(basename $(notdir $(u))).s) --room=rt_yieldpoint,rt_asyncpreempt --async=144 --margin=64; \
+	echo ok stack-room; \
+	: a sleeping routine takes its record and first stack, P342; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/sleepers testdata/sleepers.paslang; \
+	python3 -I scripts/check_routinemem.py $(BUILDDIR)/sleepers --limit=1440; \
+	echo ok routinemem; \
 	: a function of one expression goes in as its expression, P266: the output of every routine a call, and Branchy one compare and a select, P307, with no call of Less; \
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/exprinline0 testdata/exprinline.paslang; \
 	$(BUILDDIR)/exprinline0 > $(BUILDDIR)/exprinline0.got; \
@@ -3734,6 +3748,12 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	python3 -I scripts/check_pasasync.py $(BUILDDIR)/asyncgc-arm; \
 	rc=0; PASLANG_ASYNCPREEMPTOFF=1 PASLANG_GCSTRESS=1 timeout 15 $(QEMU_A64) $(BUILDDIR)/asyncgc-arm > /dev/null 2>&1 || rc=$$?; \
 	test $$rc -eq 124 || { echo "asyncgc-arm: PASLANG_ASYNCPREEMPTOFF=1 still stops Walker (exit $$rc)"; exit 1; }; \
+	test $$(awk '/^p_spin:/,/cfi_endproc/' $(BUILDDIR)/asyncleaf-arm.s | grep -c 'x28, #16') -eq 0 || { echo "asyncleaf-arm.s: Spin checks its stack"; exit 1; }; \
+	test $$(awk '/^p_spin:/,/cfi_endproc/' $(BUILDDIR)/asyncleaf-arm.s | sed -n 's/^  sub sp, sp, #//p' | head -1) -ge 192 || { echo "asyncleaf-arm.s: Spin's frame is under 192 bytes"; exit 1; }; \
+	for w in "" "taskset -c 0"; do \
+	  PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 $$w timeout 300 $(QEMU_A64) $(BUILDDIR)/asyncleaf-arm > $(BUILDDIR)/asyncleaf-arm-gc.got; \
+	  diff -u testdata/asyncleaf.out $(BUILDDIR)/asyncleaf-arm-gc.got; \
+	done; \
 	echo ok async-arm-asm; \
 	: P294 on arm64: c + k * x a move and one add with the shift, y + k * x and x := x + k * y one add, and loads at p - k, p + k and p + i shl s in the load, within the offsets of LDUR and LDR; \
 	awk '/^p_off8:/,/cfi_endproc/' $(BUILDDIR)/leaform-arm.s > $(BUILDDIR)/leaform-off8-arm.s; \
@@ -3958,6 +3978,13 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	diff -u testdata/exc.out $(BUILDDIR)/exc0-arm.got; \
 	python3 -I scripts/check_adrpfold.py $(BUILDDIR)/exc0-arm.s --folds=1; \
 	echo ok linefold-arm-asm; \
+	: P342 on arm64: every routine within the room its check gives, and the 368 bytes of a stop, the golden programs and the units; \
+	python3 -I scripts/check_stack.py $(foreach t,$(GOLDEN_A64),$(BUILDDIR)/$(t)-arm.s) $(foreach u,$(CORE_UNITS) $(LIB_UNITS),$(A64DIR)/$(basename $(notdir $(u))).s) --arm --room=rt_yieldpoint:16,rt_asyncpreempt --async=368 --margin=64; \
+	echo ok stack-room-arm; \
+	: P342 on arm64: a sleeping routine takes its record and first stack; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -Fu $(A64DIR) -o $(BUILDDIR)/sleepers-arm testdata/sleepers.paslang; \
+	python3 -I scripts/check_routinemem.py $(BUILDDIR)/sleepers-arm --limit=2560 --qemu=$(QEMU_A64); \
+	echo ok routinemem-arm; \
 	: P333 on arm64: the runtime of execrace, the exec lock around a new thread and an execve; \
 	$(OUTDIR)/paslangc -target arm64 -cpu max -Fu $(A64DIR) -o $(BUILDDIR)/execrace-arm testdata/execrace.paslang; \
 	python3 -I scripts/check_execlock.py $(BUILDDIR)/execrace-arm.s --arm; \

@@ -440,6 +440,7 @@ type
     FDaGen: LongInt;       { the walk that set the statements' Da }
     FCurDa: Int64;         { the candidates written where the code being emitted runs }
     FPushK: array of Byte;    { the words below the frame, the first pushed first }
+    FPushMax: LongInt;        { the most of them in the routine being emitted: its check asks for them too (P342) }
     FPushHint: array of Byte; { classes of the words of the next push, lowest address first }
     FScrOff: array of LongInt; { the scratch words the statement took, from the frame pointer }
     FScrK: array of Byte;
@@ -473,6 +474,13 @@ type
     procedure MapPush(Words: LongInt; Pad: Boolean);
     procedure MapPop(Words: LongInt);
     procedure MapBegin;
+    function RedZone: LongInt;
+    function AsyncRoom: LongInt;
+    function XBlock: LongInt;
+    procedure XStopX86;
+    procedure XBackX86(const L: string);
+    procedure XStopArm;
+    procedure XBackArm(const L: string);
     procedure MapLoc(Off: LongInt; K: Byte);
     procedure MapEnd(F: LongInt);
     procedure MapOutLine(const S: string);
@@ -1145,7 +1153,7 @@ begin
   m := '  /* check ' + Sym + ' */';
   p := FindLineBack(m);
   if p > 0 then
-    ReplaceLine(p, Length(m), SubImmText('x9', 'sp', Int64(F) + 2048));
+    ReplaceLine(p, Length(m), SubImmText('x9', 'sp', Int64(F) + 8 * FPushMax + RedZone));
   m := '  /* frame ' + Sym + ' */';
   p := FindLineBack(m);
   if p = 0 then
@@ -2188,6 +2196,8 @@ var
 begin
   n := Length(FPushK);
   SetLength(FPushK, n + Words);
+  if n + Words > FPushMax then
+    FPushMax := n + Words;
   for j := Words - 1 downto 0 do
   begin
     if Pad and (j = 1) then
@@ -2270,6 +2280,7 @@ begin
   FMapPro := False;
   FMapSpOk := False;
   SetLength(FPushK, 0);
+  FPushMax := 0;
   SetLength(FPushHint, 0);
   SetLength(FScrOff, 0);
   SetLength(FScrK, 0);
@@ -4870,8 +4881,50 @@ begin
   Result := Scratch(Sz);
 end;
 
+{ The bytes a routine's check asks for below its frame and the words it
+  pushes under the frame (P342): what the runtime code it calls adds
+  without a check of its own, its deepest chain proved within them for
+  every program by scripts/check_stack.py, as Go's linker proves its
+  nosplit chains within stackGuard (cmd/link/internal/ld/stackcheck.go). }
+function TEmitter.RedZone: LongInt;
+begin
+  if FArm then
+    Result := 832
+  else
+    Result := 512;
+end;
+
+{ The bytes a stop writes below the stack pointer of the code it stops
+  (P342): on amd64 the return address, the flags (rt_asyncpreempt's),
+  10 general registers and the vector block's word, and .pk_res's five
+  words, whose rbx, r12, r13 and r15 come back from there; on arm64 the 16 the signal handler (or rt_yieldpoint) stores,
+  30 registers, the flags, FPSR and the block's word in 256, and .pk_res's
+  96. rt_sigurg stops a routine and rt_yieldpoint stops only with these
+  bytes above the real guard, as Go's isAsyncSafePoint asks
+  asyncPreemptStack (runtime/preempt.go); scripts/check_stack.py --async
+  proves that every routine of the pasasync table has them wherever it
+  runs and that the two write no more. }
+function TEmitter.AsyncRoom: LongInt;
+begin
+  if FArm then
+    Result := 16 + 256 + 96
+  else
+    Result := 8 + 8 + 88 + 40;
+end;
+
+{ The bytes of a stop's vector block: ymm0-ymm15 with AVX, xmm0-xmm15
+  else, q0-q31 on arm64. }
+function TEmitter.XBlock: LongInt;
+begin
+  if FArm or HasFeat(CpuFeatBit('avx', False)) then
+    Result := 512
+  else
+    Result := 256;
+end;
+
 { The frame of the routine just emitted: locals plus the scratch high-water
-  mark, rounded to 16, at least 16. }
+  mark, rounded to 16, at least 16; its check's bytes take the words it
+  pushed below it too (P342). }
 procedure TEmitter.SetFrame(const Sym: string; Locals: LongInt);
 var
   f: LongInt;
@@ -4891,7 +4944,10 @@ begin
     Line('  .ltorg');
   end
   else
+  begin
     Line('.set ' + Sym + ', ' + IntToStr(f));
+    Line('.set .Lpu' + Copy(Sym, 5, Length(Sym) - 4) + ', ' + IntToStr(8 * FPushMax));
+  end;
   MapEnd(f);
 end;
 
@@ -24972,7 +25028,8 @@ begin
           SetLength(boxoff, n);
           if n > 16 then
             Die('select has more than 16 arms');
-          SpAdjArm('sub', n * 32);
+          { the arms and rt_select's frame under them, as on amd64 (P342) }
+          SpAdjArm('sub', n * 32 + 144 + n * 48);
           for i := 0 to n - 1 do
           begin
             Imm('x9', Ord(S^.Sels[i].Kind));
@@ -25017,8 +25074,9 @@ begin
           end;
           Line('  mov x0, sp');
           Imm('x1', n);
+          AddImmArm('x2', 'sp', n * 32);
           Line('  bl rt_select');
-          SpAdjArm('add', n * 32);
+          SpAdjArm('add', n * 32 + 144 + n * 48);
           b := Lab;
           for i := 0 to n - 1 do
           begin
@@ -25748,7 +25806,9 @@ begin
         SetLength(boxoff, n);
         if n > 16 then
           Die('select has more than 16 arms');
-        Line('  subq $' + IntToStr(n * 32) + ', %rsp');
+        { the arms, and under them rt_select's frame for n arms: its
+          control block, 16 indexes and a waiter an arm (P342) }
+        Line('  subq $' + IntToStr(n * 32 + 144 + n * 48) + ', %rsp');
         for i := 0 to n - 1 do
         begin
           Line('  movq $' + IntToStr(Ord(S^.Sels[i].Kind)) + ', ' +
@@ -25787,8 +25847,9 @@ begin
         end;
         Line('  movq %rsp, %rdi');
         Line('  movq $' + IntToStr(n) + ', %rsi');
+        Line('  leaq ' + IntToStr(n * 32) + '(%rsp), %rdx');
         Line('  call rt_select');
-        Line('  addq $' + IntToStr(n * 32) + ', %rsp');
+        Line('  addq $' + IntToStr(n * 32 + 144 + n * 48) + ', %rsp');
         b := Lab;
         for i := 0 to n - 1 do
         begin
@@ -31573,7 +31634,7 @@ begin
   if FAsyncOK and (Frame = '16') then
     Exit;
   { A loop head inside a promoted loop: nothing in the loop calls, so the
-    frame's 2 KB margin from the prologue still holds and the only thing
+    red zone the prologue's check left still holds and the only thing
     to ask is whether sysmon wants the routine off the M. That is Go's
     prologue test, one compare with the guard word. The slow path spills,
     calls rt_morestack, reloads and comes back to the test; it is kept
@@ -31618,10 +31679,10 @@ begin
     Exit;
   end;
   { g in r14 / x28. stackguard0 at 16(g). Stack grows down. Frame is a
-    number or the .set symbol of the routine. Both machines ask for 2 KB
-    beyond the frame: the runtime routines a body calls push below the
-    frame without a check of their own (rt_select keeps 912 bytes), and
-    on the first stack the G record sits right under the guard word. }
+    number or the .set symbol of the routine. A routine asks for its
+    frame, the words it pushes under it and the red zone (RedZone, P342):
+    the runtime routines a body calls push below without a check of their
+    own, and on the first stack the record sits right under the guard. }
   ok := Lab;
   { Before the frame, the call is a prologue's (kind 1): the routine has
     pushed nothing and its caller's return address is just above (P95c). }
@@ -31643,7 +31704,7 @@ begin
     begin
       if not StrToInt64(Frame, fk) then
         Die('internal error: frame ' + Frame);
-      Line(SubImmText('x9', 'sp', fk + 2048));
+      Line(SubImmText('x9', 'sp', fk + RedZone));
     end;
     Line('  ldr x10, [x28, #16]');
     Line('  cmp x9, x10');
@@ -31659,7 +31720,13 @@ begin
     FMapPro := False;
     Exit;
   end;
-  Line('  leaq -(' + Frame + '+2064)(%rsp), %r11');
+  { a routine's frame, the words it pushes under it, and the red zone; a
+    loop head's 16 and the red zone (P342) }
+  if Frame[1] = '.' then
+    Line('  leaq -(' + Frame + '+.Lpu' + Copy(Frame, 5, Length(Frame) - 4) + '+' + IntToStr(RedZone) +
+      ')(%rsp), %r11')
+  else
+    Line('  leaq -(' + Frame + '+' + IntToStr(RedZone) + ')(%rsp), %r11');
   Line('  cmpq 16(%r14), %r11');
   Line('  jae ' + ok);
   PromoSpill;
@@ -31942,9 +32009,10 @@ end;
   is x9 and up), with E of LeafE, no local, no nested routine, no
   closure's cell, and no -debug (whose hook is a call at every
   statement) or -checkptr. It calls nothing and keeps nothing in
-  memory, so it needs no stack check (its caller's left 2 KB below its
-  frame), no frame and no stack map, as Go makes a function that calls
-  nothing and whose frame is under StackSmall NOSPLIT, and gives one
+  memory, so it needs no stack check (its caller's left the red zone
+  below its frame, P342), no frame and no stack map, as Go makes a
+  function that calls nothing and whose frame is under StackSmall
+  NOSPLIT, and gives one
   without locals no base pointer (cmd/internal/obj/x86/obj6.go,
   preprocess). Called once the routine's symbols are in FSym, which
   OrdSimple reads. }
@@ -33486,13 +33554,14 @@ begin
   { A body that calls nothing, its one call site the check's, has no
     loop either (every loop's test calls rt_morestack): it runs to its
     end in a few instructions and keeps no more than its frame below its
-    caller's, whose check left 2 KB there; a frame of up to 1 KB needs
-    no check of its own, as Go makes a leaf under StackSmall NOSPLIT
+    caller's, whose check left the red zone there; a frame of up to 256
+    bytes needs no check of its own (P342: 1 KB while the red zone was
+    2 KB), as Go makes a leaf under StackSmall NOSPLIT
     (cmd/internal/obj/x86/obj6.go, preprocess). The check's text goes,
     and its site. Not an asm statement's body, whose text may call. }
   if (not sysw) and (not leaf) and (not flat) and (Length(FMapSites) = ms0 + 1) and
     (FMapSites[ms0].Kind = 1) and
-    (((LongInt(slot) + FScratchMax + 15) and (-16)) <= 1024) and
+    (((LongInt(slot) + FScratchMax + 15) and (-16)) <= 256) and
     not HasAsm(Pr.Body) then
   begin
     Move(FOut[ck1 + 1], FOut[ck0 + 1], FLen - ck1);
@@ -34917,7 +34986,7 @@ begin
   Line('  movq 2112(%rbx), %rcx');
   Line('  testq %rax, %rax');
   Line('  jz .ng_pmap');
-  Line('  leaq 8192(%rax), %rdx');
+  Line('  leaq 1360(%rax), %rdx');
   Line('  cmpq %rcx, %rdx');
   Line('  jbe .ng_ptake');
   Line('.ng_pmap:');
@@ -34928,16 +34997,14 @@ begin
   Line('  movq %rcx, 2112(%rbx)');
   Line('.ng_ptake:');
   Line('  movq 2104(%rbx), %rax');
-  Line('  leaq 8192(%rax), %rdx');
+  Line('  leaq 1360(%rax), %rdx');
   Line('  movq %rdx, 2104(%rbx)');
-  Line('  movq %rax, %r12');
-  Line('  movq %rax, %rdi');
-  Line('  call rt_guard');
-  Line('  leaq 4096(%r12), %rax');
-  Line('  movq %r12, 0(%rax)');
-  Line('  leaq 8192(%r12), %rcx');
-  Line('  movq %rcx, 8(%rax)');
-  Line('  leaq 4384(%r12), %rcx');
+  { the record at the chunk's start, its first stack above it to the
+    chunk's end, bottom and guard at the record's end: 1360 bytes, three
+    routines a page, no guard page, the red zone proved (P342) }
+  Line('  leaq 288(%rax), %rcx');
+  Line('  movq %rcx, 0(%rax)');
+  Line('  movq %rdx, 8(%rax)');
   Line('  movq %rcx, 16(%rax)');
   Line('  movq %rcx, 24(%rax)');
   Line('  movq %rax, %rdi');
@@ -34965,7 +35032,7 @@ begin
   Line('  movq rt_slabend(%rip), %rcx');
   Line('  testq %rax, %rax');
   Line('  jz .ng_slab');
-  Line('  leaq 8192(%rax), %rdx');
+  Line('  leaq 1360(%rax), %rdx');
   Line('  cmpq %rcx, %rdx');
   Line('  jbe .ng_take');
   Line('.ng_slab:');
@@ -34980,7 +35047,7 @@ begin
   Line('  movq rt_slabend(%rip), %rcx');
   Line('  testq %rax, %rax');
   Line('  jz .ng_inst');
-  Line('  leaq 8192(%rax), %rdx');
+  Line('  leaq 1360(%rax), %rdx');
   Line('  cmpq %rcx, %rdx');
   Line('  jbe .ng_take');
   Line('.ng_inst:');
@@ -34989,18 +35056,15 @@ begin
   Line('  movq %rcx, rt_slabend(%rip)');
   Line('  movq %r12, %rax');
   Line('.ng_take:');
-  Line('  leaq 8192(%rax), %rdx');
+  Line('  leaq 1360(%rax), %rdx');
   Line('  movq %rdx, rt_slabnext(%rip)');
-  Line('  movq %rax, %rbx');
-  Line('  leaq 4096(%rax), %r12');
+  Line('  movq %rdx, %rbx');
+  Line('  movq %rax, %r12');
   Line('  leaq rt_gflock(%rip), %rdi');
   Line('  call rt_unlock');
-  Line('  movq %rbx, %rdi');
-  Line('  call rt_guard');
-  Line('  movq %rbx, 0(%r12)');
-  Line('  leaq 8192(%rbx), %rcx');
-  Line('  movq %rcx, 8(%r12)');
-  Line('  leaq 4384(%rbx), %rcx');
+  Line('  leaq 288(%r12), %rcx');
+  Line('  movq %rcx, 0(%r12)');
+  Line('  movq %rbx, 8(%r12)');
   Line('  movq %rcx, 16(%r12)');
   Line('  movq %rcx, 24(%r12)');
   Line('  movq %r12, %rax');
@@ -35538,6 +35602,24 @@ begin
   Line('  pushq %r10');
   Line('  pushq %rbp');
   Line('  movq %rsp, %rbp');
+  { on a routine's own stack (r14 its record, sp within its bounds) the
+    call goes on its M's stack, free while the routine runs, as Go's
+    nanotime1 goes to g0: how much stack the vDSO's C code takes is not
+    known, and a routine's stack keeps the red zone only (P342). r14 is 0
+    on an M's own stack and in sysmon, or an M's own record (status 5,
+    rt_gocallm's), and the records whose bounds are not set (rt_nsg)
+    hold no sp; rbp, which the vDSO keeps, brings sp back. }
+  Line('  testq %r14, %r14');
+  Line('  jz .now_here');
+  Line('  cmpl $5, 152(%r14)');
+  Line('  je .now_here');
+  Line('  cmpq 0(%r14), %rsp');
+  Line('  jb .now_here');
+  Line('  cmpq 8(%r14), %rsp');
+  Line('  ja .now_here');
+  Line('  movq 32(%r14), %r8');
+  Line('  movq 32(%r8), %rsp');
+  Line('.now_here:');
   Line('  subq $16, %rsp');
   Line('  andq $-16, %rsp');
   Line('  movq $1, %rdi');
@@ -35919,6 +36001,8 @@ begin
   Line('  ret');
   Line('');
   Line('rt_sysmon:');
+  { no routine's record: rt_now stays on this stack (P342) }
+  Line('  xorq %r14, %r14');
   Line('  subq $16, %rsp');
   Line('.sm_sleep:');
   Line('  movq $0, (%rsp)');
@@ -37812,8 +37896,10 @@ begin
     that arrived after phase 1 is seen here, not lost), and if none is
     ready one waiter per arm is queued before the locks drop and the G
     parks. On wake the locks are taken again, every waiter is removed,
-    and the control block names the winner. Frame: 0 control block (16),
-    16 the ordered arm indexes (16 x 8), 144 the waiters (16 x 48). }
+    and the control block names the winner. rdx: its frame, in the
+    caller's (P342), as Go's selectgo takes its arrays from its caller's
+    (cmd/compile/internal/walk/select.go): 0 control block (16), 16 the
+    ordered arm indexes (16 x 8), 144 the waiters (48 an arm). }
   Line('rt_select:');
   Line('  pushq %rbx');
   Line('  pushq %r12');
@@ -37821,8 +37907,7 @@ begin
   Line('  pushq %r15');
   Line('  movq %rdi, %rbx');
   Line('  movq %rsi, %r12');
-  Line('  subq $912, %rsp');
-  Line('  movq %rsp, %r13');
+  Line('  movq %rdx, %r13');
   Line('  xorq %r15, %r15');
   Line('.sx_try:');
   Line('  cmpq %r12, %r15');
@@ -37862,7 +37947,6 @@ begin
   Line('.sx_hit:');
   Line('  movq %r15, %rax');
   Line('.sx_ret:');
-  Line('  addq $912, %rsp');
   Line('  popq %r15');
   Line('  popq %r13');
   Line('  popq %r12');
@@ -38152,6 +38236,12 @@ begin
   Line('rt_guardfail:');
   Line('  leaq .Lguarderr(%rip), %rsi');
   Line('  movq $35, %rdx');
+  Line('  call rt_rawwrite');
+  Line('  movq $2, %rdi');
+  Line('  jmp rt_exit');
+  Line('rt_gconstack:');
+  Line('  leaq .Lgconstack(%rip), %rsi');
+  Line('  movq $51, %rdx');
   Line('  call rt_rawwrite');
   Line('  movq $2, %rdi');
   Line('  jmp rt_exit');
@@ -40323,14 +40413,14 @@ begin
   Line('  movq %r15, 40(%r14)');
   Line('  call rt_nsadjust');
   Line('  movq %r15, %rax');
-  { The first stack slab holds the G just above the guard page; it stays
-    mapped, as on arm64, so a routine record never moves and the list of
-    every record the collector walks stays true (P95b). It used to be
-    copied to the heap and the slab unmapped. Any other old stack goes. }
-  Line('  cmpq %r12, %r14');
-  Line('  jb .ns_unmap');
-  Line('  cmpq %r13, %r14');
-  Line('  jb .ns_kept');
+  { The first stack is its chunk's, right above the record (P342): it
+    stays, as the record does, so a routine record never moves and the
+    list of every record the collector walks stays true (P95b); its
+    neighbours' records and stacks share its pages. Any other old stack
+    goes. }
+  Line('  leaq 288(%r14), %rcx');
+  Line('  cmpq %rcx, %r12');
+  Line('  je .ns_kept');
   Line('.ns_unmap:');
   Line('  movq %r12, %rdi');
   Line('  movq %r13, %rsi');
@@ -41037,7 +41127,7 @@ begin
     held), the refill is asked again with 256, which takes no cycle. }
   Line('.al_rfcall:');
   Line('  leaq p_pasheap_pasheaprefill(%rip), %rax');
-  Line('  call rt_gocall');
+  Line('  call rt_gocallm');
   Line('  cmpq $3, %rax');
   Line('  je .al_rfzero');
   Line('  cmpq $2, %rax');
@@ -41084,7 +41174,7 @@ begin
     when none could run. }
   Line('.al_lgcall:');
   Line('  leaq p_pasheap_pasheaplarge(%rip), %rax');
-  Line('  call rt_gocall');
+  Line('  call rt_gocallm');
   Line('  cmpq $1, %rax');
   Line('  jne .al_lgd');
   Line('  call rt_gccollect');
@@ -41117,10 +41207,70 @@ begin
   Line('  movq (%rsp), %rsi');
   Line('  leaq rt_heapstate(%rip), %rdi');
   Line('  leaq p_pasheap_pasheaplargetyped(%rip), %rax');
-  Line('  call rt_gocall');
+  Line('  call rt_gocallm');
   Line('.al_lgt:');
   Line('  popq %rax');
   Line('.al_lgr:');
+  Line('  ret');
+  { rt_gocallm (P342): rt_gocall for the heap's slow paths, which take
+    more stack than a routine's first one keeps (PasHeapRefill's check
+    asks 704 bytes, NewSpan's under it 912): from a routine's own stack
+    they run on its M's system stack, r14 at the M's own record of it
+    (rt_allg0, as Go's g0: its guard 24 KB below the stack's top, nothing
+    preempted, never on the list of every record, never a collector
+    worker's), as Go runs span allocation on the system stack
+    (runtime/mheap.go alloc: systemstack, "Don't do any operations that
+    lock the heap on the G stack"); elsewhere it is rt_gocall. None of these paths waits, so the M
+    runs nothing else on its stack meanwhile, and the routine's own words
+    stay where they are. Every register but rax kept. }
+  Line('rt_gocallm:');
+  Line('  testq %r14, %r14');
+  Line('  jz rt_gocall');
+  Line('  cmpl $5, 152(%r14)');
+  Line('  je rt_gocall');
+  Line('  cmpq 0(%r14), %rsp');
+  Line('  jb rt_gocall');
+  Line('  cmpq 8(%r14), %rsp');
+  Line('  ja rt_gocall');
+  Line('  pushq %r11');
+  Line('  pushq %r12');
+  Line('  pushq %r13');
+  Line('  movq %rsp, %r12');
+  Line('  movq %r14, %r13');
+  Line('  movq 32(%r14), %r11');
+  Line('  movq 32(%r11), %rsp');
+  { the M's own record of its stack, rt_allg0 + 288 an M by its place in
+    rt_allm (128 bytes an M); rax, the routine to call, kept }
+  Line('  pushq %rax');
+  Line('  movq %r11, %r14');
+  Line('  leaq rt_allm(%rip), %rax');
+  Line('  subq %rax, %r14');
+  Line('  shrq $7, %r14');
+  Line('  imulq $288, %r14, %r14');
+  Line('  leaq rt_allg0(%rip), %rax');
+  Line('  addq %rax, %r14');
+  Line('  popq %rax');
+  { its fields: the M, the M's stack as its bounds (the 32 KB under the
+    top less the guard page) so that rt_alloc's slow path takes it for a
+    routine's and hands out heap blocks, not persistent ones, a guard 24
+    KB under the top, nothing preempted, and status 5, the mark of an
+    M's own record, so that rt_now and rt_gocallm do not move off it }
+  Line('  movq %r11, 32(%r14)');
+  Line('  leaq -28672(%rsp), %r11');
+  Line('  movq %r11, 0(%r14)');
+  Line('  movq %rsp, 8(%r14)');
+  Line('  leaq -24576(%rsp), %r11');
+  Line('  movq %r11, 16(%r14)');
+  Line('  movq %r11, 24(%r14)');
+  Line('  movl $5, 152(%r14)');
+  Line('  movl $0, 184(%r14)');
+  Line('  movl $0, 188(%r14)');
+  Line('  call rt_gocall');
+  Line('  movq %r13, %r14');
+  Line('  movq %r12, %rsp');
+  Line('  popq %r13');
+  Line('  popq %r12');
+  Line('  popq %r11');
   Line('  ret');
   { rt_gocall: calls the Pascal routine at rax with rdi, rsi and rdx on
     the routine's own stack and keeps every register but rax. They wait
@@ -41241,7 +41391,13 @@ begin
   Line('  pause');
   Line('  jmp .gcc_lw');
   Line('.gcc_stop:');
+  { on the M's own stack (P342): the routine's registers wait on its
+    stack, G+40, which may be a first stack of 1072 bytes, and
+    rt_gcstopm marks with the cycle (rt_gcwork), which takes 24 KB of
+    the stack it is on; back to them after }
+  Line('  movq 32(%r13), %rsp');
   Line('  call rt_gcstopm');
+  Line('  movq 40(%r14), %rsp');
   Line('.gcc_out:');
   Line('  decl 184(%r14)');
   Line('  jnz .gcc_on');
@@ -41347,6 +41503,18 @@ begin
     guard is 24 KB below. rbx, rbp, r12 to r15 kept; rax, rcx, rdx, rsi,
     rdi, r10, r11 clobbered (P95d). }
   Line('rt_gcwork:');
+  { never on a routine's own stack (P342): a fatal error rather than a
+    marking that runs into the records next to a first stack; an M's own
+    record (status 5) has the M's stack as its bounds }
+  Line('  testq %r14, %r14');
+  Line('  jz .gw_ok');
+  Line('  cmpl $5, 152(%r14)');
+  Line('  je .gw_ok');
+  Line('  cmpq 0(%r14), %rsp');
+  Line('  jb .gw_ok');
+  Line('  cmpq 8(%r14), %rsp');
+  Line('  jbe rt_gconstack');
+  Line('.gw_ok:');
   Line('  movq rt_heapstate+520(%rip), %rax');
   Line('  cmpq %rax, 112(%r13)');
   Line('  je .gw_ret');
@@ -41691,10 +41859,21 @@ begin
   Line('  movq %rax, 456(%rdi)');
   Line('  movq $40, 464(%rdi)');
   Line('  movq $8, 472(%rdi)');
+  { A stop's vector registers in a block of their own (P342): where a
+    routine a signal stopped and one stopped at a yield point resume,
+    the word of the save area above .pk_res's layout that holds the
+    block, and its bytes. }
+  Line('  leaq .apx_res(%rip), %rax');
+  Line('  movq %rax, 552(%rdi)');
+  Line('  leaq .yp_res(%rip), %rax');
+  Line('  movq %rax, 560(%rdi)');
+  Line('  movq $80, 568(%rdi)');
+  Line('  movq $' + IntToStr(XBlock) + ', 576(%rdi)');
   { This runtime moves a stack whose guard asks for it (1.0.61, bit 0),
-    its waiting Ms mark with a cycle (1.0.66, bit 1), and rt_alloc takes
-    runs from an entry's free slots in word 24 (1.0.68, bit 2). }
-  Line('  movq $15, 504(%rdi)');
+    its waiting Ms mark with a cycle (1.0.66, bit 1), rt_alloc takes
+    runs from an entry's free slots in word 24 (1.0.68, bit 2), and the
+    words at 552 to 576 name a stop's vector block (P342, bit 4). }
+  Line('  movq $31, 504(%rdi)');
   { The word at +512 said whether XXH3's long path took AVX2 (1.0.63)
     and rt_haspopcnt whether PopCount had popcnt (1.0.126); since P111
     -cpu decides both when the program is compiled, and rt_cpufeat
@@ -42420,7 +42599,7 @@ begin
   Line('  decq %rsi');
   Line('  leaq rt_heapstate(%rip), %rdi');
   Line('  leaq p_pasheap_pasheapgrowlarge(%rip), %rax');
-  Line('  call rt_gocall');
+  Line('  call rt_gocallm');
   Line('  popq %rcx');
   Line('  testq %rax, %rax');
   Line('  jz .sgx_ret');
@@ -42609,7 +42788,7 @@ begin
   Line('  movq 8(%rax), %rdx');
   Line('  leaq rt_heapstate(%rip), %rdi');
   Line('  leaq p_pasheap_passtrblock(%rip), %rax');
-  Line('  call rt_gocall');
+  Line('  call rt_gocallm');
   Line('  popq %rdx');
   Line('  popq %rsi');
   Line('  popq %rdi');
@@ -44271,6 +44450,8 @@ begin
     Line('  .asciz "__kernel_clock_gettime"');
     Line('.Lbadstack:');
     Line('  .ascii "paslang: the stack of a routine is not its own\n"');
+    Line('.Lgconstack:');
+    Line('  .ascii "paslang: the collector marked on a routine''s stack\n"');
     Line('.Lfatal:');
     Line('  .ascii "' + MsgFatal + '"');
     if FArm and (CpuZvaBlock(FProgProc) = 64) then
@@ -44816,9 +44997,9 @@ begin
     Line('  .quad 0');
     Line('rt_maptot:');
     Line('  .quad 0');
-    { From +192 the collector's fields (pasheap: HGcOn to HAsyncOff, the
-      last at +544, P293). }
-    Line('  .space 520');
+    { From +192 the collector's fields (pasheap: HGcOn to HXSize, the
+      last at +576, P342). }
+    Line('  .space 552');
     Line('rt_zerobase:');
     Line('  .quad 0');
     Line('rt_syssp:');
@@ -44929,6 +45110,12 @@ begin
     Line('  .quad 0');
     Line('rt_asynchi:');
     Line('  .quad 0');
+    { the free vector blocks of stops and the lock rt_xget takes them
+      under (P342) }
+    Line('rt_xfree:');
+    Line('  .quad 0');
+    Line('rt_xlock:');
+    Line('  .quad 0');
     { The two standard streams (P212): a record each, the layout at
       EmitIO; a cache line apart, so the two locks share none. }
     Line('.balign 64');
@@ -44970,6 +45157,10 @@ begin
     Line('  .space 288');
     Line('rt_allm:');
     Line('  .space 1280000');
+    { a record for each M's own stack (P342), as Go's g0: rt_gocallm runs
+      the heap's slow paths on it }
+    Line('rt_allg0:');
+    Line('  .space 2880000');
     Line('rt_allp:');
     Line('  .space 69632');
     Line('.balign 16');
@@ -45220,48 +45411,51 @@ end;
   to stop (G+16 holds Poisoned, which sysmon writes every 10 ms and the
   collector's stop of the world too). It keeps every register, as Go's
   asyncPreempt does (preempt_amd64.s and preempt_arm64.s, written by
-  mkpreempt.go): the general ones and the vector ones (ymm0-ymm15 when
-  the processor compiled for has AVX, since a promoted V256 may live in
-  one; xmm0-xmm15 else; q0-q31 on arm64) go on the routine's stack, and
-  it parks as a preempted prologue does (.ms_preempt), on the global
-  queue, coming back through .pk_res. The collector reads that stack
-  word by word up to the caller's frame pointer, as it reads any
-  runtime frame (ScanStack). The flags are not kept: a call leaves them
-  undefined. With AVX the restore leaves the upper halves in use until
-  the next vzeroupper, which on Intel's cores costs the SSE code between
-  (only after a stop, some every 10 ms). It does nothing on another
-  stack than the routine's own (rt_newstack copies on the M's) or while
-  the routine holds a runtime lock (G+184, the collector's own records
-  among them): the request then waits for the next check. }
+  mkpreempt.go): the general ones on the routine's stack, the vector
+  ones (ymm0-ymm15 when the processor compiled for has AVX, since a
+  promoted V256 may live in one; xmm0-xmm15 else; q0-q31 on arm64) in a
+  block of their own (rt_xget, P342), as Go keeps them in p.xRegs
+  and gp.xRegs and not on the goroutine's stack (runtime/
+  preempt_xreg.go), and it parks as a preempted prologue does
+  (.ms_preempt), on the global queue, coming back through .pk_res. The
+  collector reads that stack word by word up to the caller's frame
+  pointer, as it reads any runtime frame, and the block word by word too,
+  as Go's xRegScan (ScanStack). The flags are not kept: a call leaves
+  them undefined. With AVX the restore leaves the upper halves in use
+  until the next vzeroupper, which on Intel's cores costs the SSE code
+  between (only after a stop, some every 10 ms). It does nothing on
+  another stack than the routine's own (rt_newstack copies on the M's)
+  or while the routine holds a runtime lock (G+184, the collector's own
+  records among them), nor where AsyncRoom bytes below its caller's
+  stack pointer would not fit above the routine's real guard (G+24,
+  P342): the request then waits for the next check. It counts its own
+  room, as Go's asyncPreempt is entered only with asyncPreemptStack
+  bytes (runtime/preempt.go isAsyncSafePoint), and adds nothing to a
+  chain of unchecked runtime code (scripts/check_stack.py --room). }
 procedure TEmitter.EmitYieldPointX86;
 const
-  Gpr: array[0..13] of string = ('rax', 'rcx', 'rdx', 'rbx', 'rsi', 'rdi', 'r8',
-    'r9', 'r10', 'r11', 'r12', 'r13', 'r15', 'rbp');
+  Gpr: array[0..9] of string = ('rax', 'rcx', 'rdx', 'rsi', 'rdi', 'r8', 'r9',
+    'r10', 'r11', 'rbp');
 var
-  i, vw, sz: LongInt;
-  avx: Boolean;
+  i: LongInt;
 begin
-  avx := HasFeat(CpuFeatBit('avx', False));
-  if avx then
-    vw := 32
-  else
-    vw := 16;
-  sz := 112 + 16 * vw;
   Line('rt_yieldpoint:');
   Line('  cmpl $0, 184(%r14)');
   Line('  jne .yp_no');
-  Line('  cmpq 0(%r14), %rsp');
+  { the room: sp less what it writes below its return address against
+    the real guard, sp given back by a lea, which keeps the flags (SDM
+    vol. 2A, LEA: no flags affected) }
+  Line('  subq $' + IntToStr(AsyncRoom - 8) + ', %rsp');
+  Line('  cmpq 24(%r14), %rsp');
+  Line('  leaq ' + IntToStr(AsyncRoom - 8) + '(%rsp), %rsp');
   Line('  jb .yp_no');
   Line('  cmpq 8(%r14), %rsp');
   Line('  ja .yp_no');
-  Line('  subq $' + IntToStr(sz) + ', %rsp');
-  for i := 0 to 13 do
+  { 10 general registers, then the vector block's word at 80: .pk_res's
+    layout below keeps rbx, r12, r13 and r15 and gives them back }
+  Line('  subq $88, %rsp');
+  for i := 0 to 9 do
     Line('  movq %' + Gpr[i] + ', ' + IntToStr(8 * i) + '(%rsp)');
-  for i := 0 to 15 do
-    if avx then
-      Line('  vmovdqu %ymm' + IntToStr(i) + ', ' + IntToStr(112 + vw * i) + '(%rsp)')
-    else
-      Line('  movdqu %xmm' + IntToStr(i) + ', ' + IntToStr(112 + vw * i) + '(%rsp)');
   { the .pk_res layout: the callee-saved registers, then where to go on }
   Line('  pushq %rbx');
   Line('  pushq %r12');
@@ -45269,6 +45463,82 @@ begin
   Line('  pushq %r15');
   Line('  leaq .yp_res(%rip), %rax');
   Line('  pushq %rax');
+  XStopX86;
+  Line('.yp_res:');
+  XBackX86('.yp_put');
+  for i := 0 to 9 do
+    Line('  movq ' + IntToStr(8 * i) + '(%rsp), %' + Gpr[i]);
+  Line('  addq $88, %rsp');
+  Line('.yp_no:');
+  Line('  ret');
+  Line('');
+  { rt_xget (P342): a block of XBlock bytes for the vector registers of a
+    stop, in rdx: the first of the free list rt_xfree, taken under
+    rt_xlock as Go takes one from xRegAlloc under its lock, or a fresh
+    one of 16 KB from the kernel (Go's fixalloc chunk, _FixAllocChunk),
+    the others onto the list. A resumed routine gives its block back
+    with a CAS and no lock: only the holder of rt_xlock takes from the
+    list, so the head it read is still the head unless a block was
+    given meanwhile (no ABA). On the M's stack with r14 0, so the lock
+    counts in no routine; rax, rcx, rsi, rdi and r8 to r11 change. }
+  Line('rt_xget:');
+  Line('  leaq rt_xlock(%rip), %rdi');
+  Line('  call rt_lock');
+  Line('.xg_pop:');
+  Line('  movq rt_xfree(%rip), %rax');
+  Line('  testq %rax, %rax');
+  Line('  jz .xg_map');
+  Line('  movq (%rax), %rcx');
+  Line('  movq %rax, %rdx');
+  Line('  lock cmpxchgq %rcx, rt_xfree(%rip)');
+  Line('  jne .xg_pop');
+  Line('  jmp rt_unlock');
+  Line('.xg_map:');
+  Line('  movl $9, %eax');
+  Line('  xorl %edi, %edi');
+  Line('  movl $16384, %esi');
+  Line('  movl $3, %edx');
+  Line('  movl $34, %r10d');
+  Line('  movq $-1, %r8');
+  Line('  xorl %r9d, %r9d');
+  Line('  syscall');
+  Line('  cmpq $-4095, %rax');
+  Line('  jae rt_diemmap');
+  { the first block is the stop's; the others in a chain, the last of
+    them at rsi linked to the list as it is now }
+  Line('  movq %rax, %rdx');
+  Line('  leaq ' + IntToStr(XBlock) + '(%rax), %rcx');
+  Line('  leaq ' + IntToStr(16384 - XBlock) + '(%rax), %rsi');
+  Line('  movq %rcx, %rdi');
+  Line('.xg_link:');
+  Line('  cmpq %rsi, %rdi');
+  Line('  jae .xg_end');
+  Line('  leaq ' + IntToStr(XBlock) + '(%rdi), %r8');
+  Line('  movq %r8, (%rdi)');
+  Line('  movq %r8, %rdi');
+  Line('  jmp .xg_link');
+  Line('.xg_end:');
+  Line('  movq rt_xfree(%rip), %rax');
+  Line('.xg_cas:');
+  Line('  movq %rax, (%rsi)');
+  Line('  lock cmpxchgq %rcx, rt_xfree(%rip)');
+  Line('  jne .xg_cas');
+  Line('  leaq rt_xlock(%rip), %rdi');
+  Line('  jmp rt_unlock');
+  Line('');
+end;
+
+{ The end of a stop on amd64, once the registers are on the routine's
+  stack and .pk_res's layout under them (P342): the guard back to the
+  real one, where the routine resumes (G+40 its stack pointer, G+48
+  .pk_res, G+56 its frame pointer), then on the M's stack the vector
+  registers into a block of rt_xget and its address into the save
+  area's word at 80, before the routine is queued and a cycle may read
+  it. r14 no longer names the queued routine, as in .ms_preempt. }
+procedure TEmitter.XStopX86;
+var
+  i: LongInt;
+begin
   Line('  movq 24(%r14), %rax');
   Line('  movq %rax, 16(%r14)');
   Line('  leaq .pk_res(%rip), %rax');
@@ -45278,23 +45548,39 @@ begin
   Line('  movq 32(%r14), %r13');
   Line('  movq 32(%r13), %rsp');
   Line('  xorq %rbp, %rbp');
-  { r14 no longer names the queued routine, as in .ms_preempt }
-  Line('  movq %r14, %rdi');
+  Line('  movq %r14, %r12');
   Line('  xorq %r14, %r14');
+  Line('  call rt_xget');
+  Line('  movq 40(%r12), %rax');
+  Line('  movq %rdx, 120(%rax)');
+  for i := 0 to 15 do
+    if XBlock = 512 then
+      Line('  vmovdqu %ymm' + IntToStr(i) + ', ' + IntToStr(32 * i) + '(%rdx)')
+    else
+      Line('  movdqu %xmm' + IntToStr(i) + ', ' + IntToStr(16 * i) + '(%rdx)');
+  Line('  movq %r12, %rdi');
   Line('  call rt_globput');
   Line('  jmp rt_yieldwake');
-  Line('.yp_res:');
+end;
+
+{ Its return, at the resume label L names, the stack pointer at the
+  save area: the vector registers from the block, and the block back on
+  rt_xfree with a CAS (rt_xget says why no lock), rax and rdx changed. }
+procedure TEmitter.XBackX86(const L: string);
+var
+  i: LongInt;
+begin
+  Line('  movq 80(%rsp), %rdx');
   for i := 0 to 15 do
-    if avx then
-      Line('  vmovdqu ' + IntToStr(112 + vw * i) + '(%rsp), %ymm' + IntToStr(i))
+    if XBlock = 512 then
+      Line('  vmovdqu ' + IntToStr(32 * i) + '(%rdx), %ymm' + IntToStr(i))
     else
-      Line('  movdqu ' + IntToStr(112 + vw * i) + '(%rsp), %xmm' + IntToStr(i));
-  for i := 0 to 13 do
-    Line('  movq ' + IntToStr(8 * i) + '(%rsp), %' + Gpr[i]);
-  Line('  addq $' + IntToStr(sz) + ', %rsp');
-  Line('.yp_no:');
-  Line('  ret');
-  Line('');
+      Line('  movdqu ' + IntToStr(16 * i) + '(%rdx), %xmm' + IntToStr(i));
+  Line('  movq rt_xfree(%rip), %rax');
+  Line(L + ':');
+  Line('  movq %rax, (%rdx)');
+  Line('  lock cmpxchgq %rdx, rt_xfree(%rip)');
+  Line('  jne ' + L);
 end;
 
 { rt_asyncpreempt (P293): rt_sigurg makes the routine it stopped call
@@ -45306,59 +45592,32 @@ end;
   queue with the layout .pk_res pops, and comes back with everything as
   it was. The collector reads this stack word by word up to the frame
   pointer kept at G+56 (ScanStack): the save area, the interrupted pc
-  and the interrupted frame, which has no map at such a pc. }
+  and the interrupted frame, which has no map at such a pc; and the
+  vector block the save area's word at 80 names (P342). }
 procedure TEmitter.EmitAsyncPreemptX86;
 const
-  Gpr: array[0..13] of string = ('rax', 'rcx', 'rdx', 'rbx', 'rsi', 'rdi', 'r8',
-    'r9', 'r10', 'r11', 'r12', 'r13', 'r15', 'rbp');
+  Gpr: array[0..9] of string = ('rax', 'rcx', 'rdx', 'rsi', 'rdi', 'r8', 'r9',
+    'r10', 'r11', 'rbp');
 var
-  i, vw, sz: LongInt;
-  avx: Boolean;
+  i: LongInt;
 begin
-  avx := HasFeat(CpuFeatBit('avx', False));
-  if avx then
-    vw := 32
-  else
-    vw := 16;
-  sz := 112 + 16 * vw;
   Line('rt_asyncpreempt:');
   Line('  pushfq');
-  Line('  subq $' + IntToStr(sz) + ', %rsp');
-  for i := 0 to 13 do
+  Line('  subq $88, %rsp');
+  for i := 0 to 9 do
     Line('  movq %' + Gpr[i] + ', ' + IntToStr(8 * i) + '(%rsp)');
-  for i := 0 to 15 do
-    if avx then
-      Line('  vmovdqu %ymm' + IntToStr(i) + ', ' + IntToStr(112 + vw * i) + '(%rsp)')
-    else
-      Line('  movdqu %xmm' + IntToStr(i) + ', ' + IntToStr(112 + vw * i) + '(%rsp)');
   Line('  pushq %rbx');
   Line('  pushq %r12');
   Line('  pushq %r13');
   Line('  pushq %r15');
   Line('  leaq .apx_res(%rip), %rax');
   Line('  pushq %rax');
-  Line('  movq 24(%r14), %rax');
-  Line('  movq %rax, 16(%r14)');
-  Line('  leaq .pk_res(%rip), %rax');
-  Line('  movq %rax, 48(%r14)');
-  Line('  movq %rsp, 40(%r14)');
-  Line('  movq %rbp, 56(%r14)');
-  Line('  movq 32(%r14), %r13');
-  Line('  movq 32(%r13), %rsp');
-  Line('  xorq %rbp, %rbp');
-  Line('  movq %r14, %rdi');
-  Line('  xorq %r14, %r14');
-  Line('  call rt_globput');
-  Line('  jmp rt_yieldwake');
+  XStopX86;
   Line('.apx_res:');
-  for i := 0 to 15 do
-    if avx then
-      Line('  vmovdqu ' + IntToStr(112 + vw * i) + '(%rsp), %ymm' + IntToStr(i))
-    else
-      Line('  movdqu ' + IntToStr(112 + vw * i) + '(%rsp), %xmm' + IntToStr(i));
-  for i := 0 to 13 do
+  XBackX86('.apx_put');
+  for i := 0 to 9 do
     Line('  movq ' + IntToStr(8 * i) + '(%rsp), %' + Gpr[i]);
-  Line('  addq $' + IntToStr(sz) + ', %rsp');
+  Line('  addq $88, %rsp');
   Line('  popfq');
   Line('  ret');
   Line('');
@@ -45373,12 +45632,14 @@ begin
     1 to 2, and stopped there it would come back as 0 and lose the wake
     its waker gives by that CAS), whose guard says Poisoned (it was
     asked to stop and has not), that holds no runtime lock
-    (G+184), whose stack pointer is inside its stack and 1 KB above its
-    real guard (G+24) for rt_asyncpreempt's save area of some 700 bytes
-    (a prologue's check left 2 KB there), and whose pc is in code paslangc
-    compiled with no asm in it (the pasasync table, the last entry that
-    starts at or before the pc, by halves). Anywhere else the request
-    waits for the next check or the next signal. }
+    (G+184), whose stack pointer is inside its stack and AsyncRoom above
+    its real guard (G+24) for what rt_asyncpreempt writes, 144 bytes (as
+    Go's asyncPreemptStack, P342: its vector registers go to a block of
+    their own, and the red zone holds the rest in every routine of the
+    table), and whose pc is in code paslangc compiled with no asm in it
+    (the pasasync table,
+    the last entry that starts at or before the pc, by halves). Anywhere
+    else the request waits for the next check or the next signal. }
   Line('rt_sigurg:');
   { PASLANG_ASYNCPREEMPTOFF stops nothing (pasheap's HAsyncOff) }
   Line('  cmpq $0, rt_heapstate+544(%rip)');
@@ -45427,7 +45688,7 @@ begin
   Line('  cmpq 8(%rax), %rcx');
   Line('  ja .sgu_ret');
   Line('  movq 24(%rax), %r8');
-  Line('  addq $1024, %r8');
+  Line('  addq $' + IntToStr(AsyncRoom) + ', %r8');
   Line('  cmpq %r8, %rcx');
   Line('  jb .sgu_ret');
   Line('  subq $8, %rcx');
@@ -45506,10 +45767,11 @@ begin
   Line(Tag + '_ny:');
 end;
 
-{ rt_yieldpoint on arm64, as above: x0-x17, x19-x27, x29, x30 and q0-q31
-  on the routine's stack, x28 the routine; .pk_res gives back x19-x27
-  and returns to .yp_res. x9 and x10 are the only registers it uses
-  before it saves them, so they are saved first. }
+{ rt_yieldpoint on arm64, as above: x0-x17, x19-x27, x29 and x30 on
+  the routine's stack and q0-q31 in a block of rt_xget (P342), x28 the
+  routine; .pk_res gives back x19-x27 and returns to .yp_res. x9 and x10
+  are the only registers it uses before it saves them, so they are
+  saved first, the 16 bytes of AsyncRoom that its check counts. }
 procedure TEmitter.EmitYieldPointArm;
 var
   i: LongInt;
@@ -45518,15 +45780,19 @@ begin
   Line('  stp x9, x10, [sp, #-16]!');
   Line('  ldr w9, [x28, #184]');
   Line('  cbnz w9, .yp_no');
-  Line('  mov x9, sp');
-  Line('  ldr x10, [x28]');
+  { the room, as on amd64 (P342): what it writes below its caller's
+    stack pointer above the real guard }
+  Line('  sub x9, sp, #' + IntToStr(AsyncRoom - 16));
+  Line('  ldr x10, [x28, #24]');
   Line('  cmp x9, x10');
   Line('  b.lo .yp_no');
+  Line('  mov x9, sp');
   Line('  ldr x10, [x28, #8]');
   Line('  cmp x9, x10');
   Line('  b.hi .yp_no');
-  { 30 general registers (x9 and x10 already below) and 32 vector ones }
-  Line('  sub sp, sp, #752');
+  { 30 general registers (x9 and x10 already above), the vector block's
+    word at 248 }
+  Line('  sub sp, sp, #256');
   i := 0;
   while i <= 8 do
   begin
@@ -45543,12 +45809,6 @@ begin
   Line('  stp x25, x26, [sp, #192]');
   Line('  stp x27, x29, [sp, #208]');
   Line('  str x30, [sp, #224]');
-  i := 0;
-  while i <= 30 do
-  begin
-    Line('  stp q' + IntToStr(i) + ', q' + IntToStr(i + 1) + ', [sp, #' + IntToStr(240 + 16 * i) + ']');
-    i := i + 2;
-  end;
   { the .pk_res layout, as .ms_preempt writes it }
   Line('  stp x19, x20, [sp, #-16]!');
   Line('  stp x21, x22, [sp, #-16]!');
@@ -45557,28 +45817,9 @@ begin
   Line('  stp x27, xzr, [sp, #-16]!');
   Line('  adr x10, .yp_res');
   Line('  str x10, [sp, #-16]!');
-  Line('  ldr x9, [x28, #24]');
-  Line('  str x9, [x28, #16]');
-  Line('  mov x9, sp');
-  Line('  str x9, [x28, #40]');
-  Line('  str x29, [x28, #56]');
-  Line('  adr x10, .pk_res');
-  Line('  str x10, [x28, #48]');
-  Line('  ldr x21, [x28, #32]');
-  Line('  ldr x9, [x21, #32]');
-  Line('  mov sp, x9');
-  Line('  mov x29, xzr');
-  Line('  mov x0, x28');
-  Line('  mov x28, xzr');
-  Line('  bl rt_globput');
-  Line('  b rt_yieldwake');
+  XStopArm;
   Line('.yp_res:');
-  i := 0;
-  while i <= 30 do
-  begin
-    Line('  ldp q' + IntToStr(i) + ', q' + IntToStr(i + 1) + ', [sp, #' + IntToStr(240 + 16 * i) + ']');
-    i := i + 2;
-  end;
+  XBackArm('.yp_put');
   i := 0;
   while i <= 8 do
   begin
@@ -45595,26 +45836,158 @@ begin
   Line('  ldp x25, x26, [sp, #192]');
   Line('  ldp x27, x29, [sp, #208]');
   Line('  ldr x30, [sp, #224]');
-  Line('  add sp, sp, #752');
+  Line('  add sp, sp, #256');
   Line('.yp_no:');
   Line('  ldp x9, x10, [sp], #16');
   Line('  ret');
+  { rt_xget on arm64, as on amd64 (P342): the block in x3, on the M's
+    stack with x28 0; x0, x4 to x12 and x30 change. The take compares
+    the head it read with a load-exclusive pair and no access between. }
+  Line('rt_xget:');
+  Line('  str x30, [sp, #-16]!');
+  LeaS('rt_xlock', 'x0');
+  Line('  bl rt_lock');
+  LeaS('rt_xfree', 'x4');
+  Line('.xg_pop:');
+  Line('  ldr x3, [x4]');
+  Line('  cbz x3, .xg_map');
+  Line('  ldr x5, [x3]');
+  Line('.xg_try:');
+  Line('  ldaxr x6, [x4]');
+  Line('  cmp x6, x3');
+  Line('  b.ne .xg_again');
+  Line('  stxr w7, x5, [x4]');
+  Line('  cbnz w7, .xg_try');
+  Line('  b .xg_got');
+  Line('.xg_again:');
+  Line('  clrex');
+  Line('  b .xg_pop');
+  Line('.xg_map:');
+  Line('  mov x0, xzr');
+  Line('  mov x1, #16384');
+  Line('  mov x2, #3');
+  Line('  mov x3, #34');
+  Line('  mov x4, #-1');
+  Line('  mov x5, xzr');
+  Line('  mov x8, #222');
+  Line('  svc #0');
+  Line('  cmn x0, #4095');
+  Line('  b.hs rt_diemmap');
+  Line('  mov x3, x0');
+  Line('  add x5, x0, #' + IntToStr(XBlock));
+  Line('  mov x7, #' + IntToStr(16384 - XBlock));
+  Line('  add x6, x0, x7');
+  Line('  mov x7, x5');
+  Line('.xg_link:');
+  Line('  cmp x7, x6');
+  Line('  b.hs .xg_end');
+  Line('  add x8, x7, #' + IntToStr(XBlock));
+  Line('  str x8, [x7]');
+  Line('  mov x7, x8');
+  Line('  b .xg_link');
+  Line('.xg_end:');
+  LeaS('rt_xfree', 'x4');
+  Line('.xg_put:');
+  Line('  ldr x9, [x4]');
+  Line('  str x9, [x6]');
+  Line('.xg_putx:');
+  Line('  ldxr x10, [x4]');
+  Line('  cmp x10, x9');
+  Line('  b.ne .xg_putc');
+  Line('  stlxr w11, x5, [x4]');
+  Line('  cbnz w11, .xg_putx');
+  Line('  b .xg_got');
+  Line('.xg_putc:');
+  Line('  clrex');
+  Line('  b .xg_put');
+  Line('.xg_got:');
+  LeaS('rt_xlock', 'x0');
+  Line('  bl rt_unlock');
+  Line('  ldr x30, [sp], #16');
+  Line('  ret');
+end;
+
+{ The end of a stop on arm64, as XStopX86 (P342): the guard back, where
+  the routine resumes, then on the M's stack q0-q31 into a block of
+  rt_xget and its address into the save area's word at 248, before the
+  routine is queued. }
+procedure TEmitter.XStopArm;
+var
+  i: LongInt;
+begin
+  Line('  ldr x9, [x28, #24]');
+  Line('  str x9, [x28, #16]');
+  Line('  mov x9, sp');
+  Line('  str x9, [x28, #40]');
+  Line('  str x29, [x28, #56]');
+  Line('  adr x10, .pk_res');
+  Line('  str x10, [x28, #48]');
+  Line('  ldr x21, [x28, #32]');
+  Line('  ldr x9, [x21, #32]');
+  Line('  mov sp, x9');
+  Line('  mov x29, xzr');
+  Line('  mov x19, x28');
+  Line('  mov x28, xzr');
+  Line('  bl rt_xget');
+  Line('  ldr x9, [x19, #40]');
+  Line('  str x3, [x9, #344]');
+  i := 0;
+  while i <= 30 do
+  begin
+    Line('  stp q' + IntToStr(i) + ', q' + IntToStr(i + 1) + ', [x3, #' + IntToStr(16 * i) + ']');
+    i := i + 2;
+  end;
+  Line('  mov x0, x19');
+  Line('  bl rt_globput');
+  Line('  b rt_yieldwake');
+end;
+
+{ Its return at L, sp at the save area: q0-q31 from the block and the
+  block back on rt_xfree by a load-exclusive pair with no access between
+  (rt_xget says why no lock); x9 to x13 and the flags change. }
+procedure TEmitter.XBackArm(const L: string);
+var
+  i: LongInt;
+begin
+  Line('  ldr x9, [sp, #248]');
+  i := 0;
+  while i <= 30 do
+  begin
+    Line('  ldp q' + IntToStr(i) + ', q' + IntToStr(i + 1) + ', [x9, #' + IntToStr(16 * i) + ']');
+    i := i + 2;
+  end;
+  LeaS('rt_xfree', 'x10');
+  Line(L + ':');
+  Line('  ldr x11, [x10]');
+  Line('  str x11, [x9]');
+  Line(L + 'x:');
+  Line('  ldxr x12, [x10]');
+  Line('  cmp x12, x11');
+  Line('  b.ne ' + L + 'c');
+  Line('  stlxr w13, x9, [x10]');
+  Line('  cbnz w13, ' + L + 'x');
+  Line('  b ' + L + 'd');
+  Line(L + 'c:');
+  Line('  clrex');
+  Line('  b ' + L);
+  Line(L + 'd:');
 end;
 
 { rt_asyncpreempt on arm64 (P293): rt_sigurg left the interrupted
   link register on the stack in 16 bytes of its own and made the link
   register the interrupted pc, as Go's pushCall does (signal_arm64.go).
-  Every general register but x18, the flags (NZCV) and FPSR, and q0 to
-  q31 go on the routine's stack (Go's preempt_arm64.s keeps the same),
-  the routine parks as rt_yieldpoint parks, and it comes back by x18,
-  which paslang's code never holds a value in: Go comes back by R27,
-  which is paslang's static link. }
+  Every general register but x18, the flags (NZCV) and FPSR go on the
+  routine's stack and q0 to q31 in a block of rt_xget (P342; Go's
+  preempt_arm64.s keeps the same, the vector ones in p.xRegs), the
+  routine parks as rt_yieldpoint parks, and it comes back by x18, which
+  paslang's code never holds a value in: Go comes back by R27, which is
+  paslang's static link. }
 procedure TEmitter.EmitAsyncPreemptArm;
 var
   i: LongInt;
 begin
   Line('rt_asyncpreempt:');
-  Line('  sub sp, sp, #768');
+  Line('  sub sp, sp, #256');
   i := 0;
   while i <= 16 do
   begin
@@ -45631,12 +46004,6 @@ begin
   Line('  str x9, [sp, #232]');
   Line('  mrs x9, fpsr');
   Line('  str x9, [sp, #240]');
-  i := 0;
-  while i <= 30 do
-  begin
-    Line('  stp q' + IntToStr(i) + ', q' + IntToStr(i + 1) + ', [sp, #' + IntToStr(256 + 16 * i) + ']');
-    i := i + 2;
-  end;
   { the .pk_res layout, as rt_yieldpoint writes it }
   Line('  stp x19, x20, [sp, #-16]!');
   Line('  stp x21, x22, [sp, #-16]!');
@@ -45645,28 +46012,9 @@ begin
   Line('  stp x27, xzr, [sp, #-16]!');
   Line('  adr x10, .apx_ares');
   Line('  str x10, [sp, #-16]!');
-  Line('  ldr x9, [x28, #24]');
-  Line('  str x9, [x28, #16]');
-  Line('  mov x9, sp');
-  Line('  str x9, [x28, #40]');
-  Line('  str x29, [x28, #56]');
-  Line('  adr x10, .pk_res');
-  Line('  str x10, [x28, #48]');
-  Line('  ldr x21, [x28, #32]');
-  Line('  ldr x9, [x21, #32]');
-  Line('  mov sp, x9');
-  Line('  mov x29, xzr');
-  Line('  mov x0, x28');
-  Line('  mov x28, xzr');
-  Line('  bl rt_globput');
-  Line('  b rt_yieldwake');
+  XStopArm;
   Line('.apx_ares:');
-  i := 0;
-  while i <= 30 do
-  begin
-    Line('  ldp q' + IntToStr(i) + ', q' + IntToStr(i + 1) + ', [sp, #' + IntToStr(256 + 16 * i) + ']');
-    i := i + 2;
-  end;
+  XBackArm('.apx_put');
   Line('  ldr x9, [sp, #240]');
   Line('  msr fpsr, x9');
   Line('  ldr x9, [sp, #232]');
@@ -45683,7 +46031,7 @@ begin
   Line('  ldp x25, x26, [sp, #192]');
   Line('  ldp x27, x29, [sp, #208]');
   Line('  ldr x18, [sp, #224]');
-  Line('  add sp, sp, #768');
+  Line('  add sp, sp, #256');
   Line('  ldr x30, [sp], #16');
   Line('  br x18');
   { rt_sigurg: SIGURG on the M's alternate stack (x0 the signal, x1 the
@@ -45741,7 +46089,7 @@ begin
   Line('  cmp x12, x10');
   Line('  b.hi .asgu_ret');
   Line('  ldr x10, [x9, #24]');
-  Line('  add x10, x10, #1024');
+  Line('  add x10, x10, #' + IntToStr(AsyncRoom));
   Line('  cmp x12, x10');
   Line('  b.lo .asgu_ret');
   Line('  ldr x10, [x2, #424]');
@@ -48522,6 +48870,12 @@ begin
   Line('  bl rt_rawwrite');
   Line('  mov x0, #2');
   Line('  b rt_exit');
+  Line('rt_gconstack:');
+  LeaS('.Lgconstack', 'x1');
+  Line('  mov x2, #51');
+  Line('  bl rt_rawwrite');
+  Line('  mov x0, #2');
+  Line('  b rt_exit');
   { P86 on arm64, the same shape as amd64: raw writes to standard error,
     rt_diemsg with the text in x1 and x2 and a pc in x0, " at line N"
     when the pc is inside the program, exit 1. rt_rawwrite as on amd64
@@ -51135,7 +51489,8 @@ begin
   Line('  ldr x30, [sp], #16');
   Line('  ret');
   { As on amd64: the spawner's P first, the global path without a P. A
-    slab is 32 KB per routine here (P98). }
+    routine is 2048 bytes of a slab here, its record and first stack, two
+    a page (P342; 32 KB with a guard page from P98). }
   Line('rt_newg:');
   Line('  str x30, [sp, #-16]!');
   Psh('x19');
@@ -51180,7 +51535,7 @@ begin
   Line('  ldr x0, [x19, #2104]');
   Line('  ldr x1, [x19, #2112]');
   Line('  cbz x0, .ng_pmap');
-  AddImmArmT('x2', 'x0', 32768, 'x2');
+  AddImmArmT('x2', 'x0', 2048, 'x2');
   Line('  cmp x2, x1');
   Line('  b.ls .ng_ptake');
   Line('.ng_pmap:');
@@ -51191,15 +51546,13 @@ begin
   Line('  str x1, [x19, #2112]');
   Line('.ng_ptake:');
   Line('  ldr x0, [x19, #2104]');
-  AddImmArmT('x2', 'x0', 32768, 'x2');
+  AddImmArmT('x2', 'x0', 2048, 'x2');
   Line('  str x2, [x19, #2104]');
-  Line('  mov x20, x0');
-  Line('  bl rt_guard');
-  AddImmArmT('x0', 'x20', 4096, 'x9');
-  Line('  str x20, [x0]');
-  AddImmArmT('x9', 'x20', 32768, 'x9');
-  Line('  str x9, [x0, #8]');
-  AddImmArmT('x9', 'x20', 4384, 'x9');
+  { as on amd64 (P342): the record at the chunk's start, its first stack
+    above it, no guard page }
+  Line('  add x9, x0, #288');
+  Line('  str x9, [x0]');
+  Line('  str x2, [x0, #8]');
   Line('  str x9, [x0, #16]');
   Line('  str x9, [x0, #24]');
   Line('  bl rt_allgadd');
@@ -51226,7 +51579,7 @@ begin
   LdS('rt_slabnext', 'x0');
   LdS('rt_slabend', 'x1');
   Line('  cbz x0, .ng_slab');
-  AddImmArmT('x2', 'x0', 32768, 'x2');
+  AddImmArmT('x2', 'x0', 2048, 'x2');
   Line('  cmp x2, x1');
   Line('  b.ls .ng_take');
   Line('.ng_slab:');
@@ -51240,7 +51593,7 @@ begin
   LdS('rt_slabnext', 'x0');
   LdS('rt_slabend', 'x1');
   Line('  cbz x0, .ng_inst');
-  AddImmArmT('x2', 'x0', 32768, 'x2');
+  AddImmArmT('x2', 'x0', 2048, 'x2');
   Line('  cmp x2, x1');
   Line('  b.ls .ng_take');
   Line('.ng_inst:');
@@ -51249,18 +51602,15 @@ begin
   StS('x1', 'rt_slabend');
   Line('  mov x0, x20');
   Line('.ng_take:');
-  AddImmArmT('x2', 'x0', 32768, 'x2');
+  AddImmArmT('x2', 'x0', 2048, 'x2');
   StS('x2', 'rt_slabnext');
-  Line('  mov x19, x0');
-  AddImmArmT('x20', 'x0', 4096, 'x20');
+  Line('  mov x19, x2');
+  Line('  mov x20, x0');
   LeaS('rt_gflock', 'x0');
   Line('  bl rt_unlock');
-  Line('  mov x0, x19');
-  Line('  bl rt_guard');
-  Line('  str x19, [x20]');
-  AddImmArmT('x9', 'x19', 32768, 'x9');
-  Line('  str x9, [x20, #8]');
-  AddImmArmT('x9', 'x19', 4384, 'x9');
+  Line('  add x9, x20, #288');
+  Line('  str x9, [x20]');
+  Line('  str x19, [x20, #8]');
   Line('  str x9, [x20, #16]');
   Line('  str x9, [x20, #24]');
   Line('  mov x0, x20');
@@ -51806,6 +52156,24 @@ begin
   Line('  stp x12, x13, [sp, #-16]!');
   Line('  stp x14, x15, [sp, #-16]!');
   Line('  stp x17, x18, [sp, #-16]!');
+  { on the M's stack as on amd64 (P342); x19, which the vDSO keeps
+    (AAPCS64 6.1.1: x19-x28 callee-saved), brings sp back }
+  Line('  str x19, [sp, #-16]!');
+  Line('  mov x19, sp');
+  Line('  cbz x28, .now_here');
+  Line('  ldr w10, [x28, #152]');
+  Line('  cmp w10, #5');
+  Line('  b.eq .now_here');
+  Line('  ldr x10, [x28]');
+  Line('  cmp x19, x10');
+  Line('  b.lo .now_here');
+  Line('  ldr x10, [x28, #8]');
+  Line('  cmp x19, x10');
+  Line('  b.hi .now_here');
+  Line('  ldr x10, [x28, #32]');
+  Line('  ldr x10, [x10, #32]');
+  Line('  mov sp, x10');
+  Line('.now_here:');
   Line('  sub sp, sp, #16');
   Line('  mov x0, #1');
   Line('  mov x1, sp');
@@ -51815,7 +52183,8 @@ begin
   Imm('x9', 1000000000);
   Line('  mul x0, x0, x9');
   Line('  add x0, x0, x1');
-  Line('  add sp, sp, #16');
+  Line('  mov sp, x19');
+  Line('  ldr x19, [sp], #16');
   Line('  ldp x17, x18, [sp], #16');
   Line('  ldp x14, x15, [sp], #16');
   Line('  ldp x12, x13, [sp], #16');
@@ -52895,6 +53264,8 @@ begin
   Line('  bl rt_globput');
   Line('  b rt_mloop');
   Line('rt_sysmon:');
+  { no routine's record: rt_now stays on this stack (P342) }
+  Line('  mov x28, xzr');
   Line('  sub sp, sp, #16');
   Line('.sm_sleep:');
   Line('  str xzr, [sp]');
@@ -53367,12 +53738,12 @@ begin
     stack maps (P95c). Before, nothing moved: the first return past the
     copy went back to the old stack, the record said the new one, and
     every allocation after it went to the persistent heap. Then the old
-    stack goes, but the first one, which holds the record. }
+    stack goes, but the first one, its record's chunk (P342). }
   Line('  bl rt_nsadjust');
-  Line('  cmp x28, x20');
-  Line('  b.lo .ns_unmap');
-  Line('  cmp x28, x22');
-  Line('  b.lo .ns_kept');
+  { the first stack, right above the record, stays (P342) }
+  Line('  add x9, x28, #288');
+  Line('  cmp x9, x20');
+  Line('  b.eq .ns_kept');
   Line('.ns_unmap:');
   Line('  mov x0, x20');
   Line('  sub x1, x22, x20');
@@ -54223,7 +54594,7 @@ begin
   Line('.al_rfcall:');
   LeaS('rt_heapstate', 'x0');
   LeaS('p_pasheap_pasheaprefill', 'x17');
-  Line('  bl rt_gocall');
+  Line('  bl rt_gocallm');
   Line('  cmp x0, #3');
   Line('  b.eq .al_rfzero');
   Line('  cmp x0, #2');
@@ -54273,7 +54644,7 @@ begin
   Line('.al_lgcall:');
   LeaS('rt_heapstate', 'x0');
   LeaS('p_pasheap_pasheaplarge', 'x17');
-  Line('  bl rt_gocall');
+  Line('  bl rt_gocallm');
   Line('  cmp x0, #1');
   Line('  b.ne .al_lgd');
   Line('  bl rt_gccollect');
@@ -54300,11 +54671,67 @@ begin
   Line('  ldr x1, [sp]');
   LeaS('rt_heapstate', 'x0');
   LeaS('p_pasheap_pasheaplargetyped', 'x17');
-  Line('  bl rt_gocall');
+  Line('  bl rt_gocallm');
   Line('.al_lgt:');
   Line('  ldp x0, x30, [sp], #32');
   Line('.al_lgr:');
   Line('  ret');
+  { rt_gocallm as on amd64 (P342): x17 the routine, x0 to x2 its
+    arguments, on the M's system stack from a routine's own, x28 at the
+    M's own record; every register but x0 kept. }
+  Line('rt_gocallm:');
+  Line('  cbz x28, rt_gocall');
+  Line('  stp x9, x10, [sp, #-16]!');
+  Line('  ldr w9, [x28, #152]');
+  Line('  cmp w9, #5');
+  Line('  b.eq .gcm_no');
+  Line('  mov x9, sp');
+  Line('  ldr x10, [x28]');
+  Line('  cmp x9, x10');
+  Line('  b.lo .gcm_no');
+  Line('  ldr x10, [x28, #8]');
+  Line('  cmp x9, x10');
+  Line('  b.hi .gcm_no');
+  Line('  stp x11, x12, [sp, #-16]!');
+  Line('  stp x19, x20, [sp, #-16]!');
+  Line('  mov x19, sp');
+  Line('  mov x20, x28');
+  Line('  ldr x11, [x28, #32]');
+  { the M's own record, as on amd64 }
+  LeaS('rt_allm', 'x12');
+  Line('  sub x12, x11, x12');
+  Line('  lsr x12, x12, #7');
+  Line('  mov x10, #288');
+  Line('  mul x12, x12, x10');
+  LeaS('rt_allg0', 'x10');
+  Line('  add x10, x10, x12');
+  Line('  ldr x12, [x11, #32]');
+  Line('  mov sp, x12');
+  { its fields as on amd64: the M's stack as its bounds, status 5 }
+  Line('  str x12, [x10, #8]');
+  Line('  sub x9, x12, #28672');
+  Line('  str x9, [x10]');
+  Line('  sub x12, x12, #24576');
+  Line('  str x12, [x10, #16]');
+  Line('  str x12, [x10, #24]');
+  Line('  mov w9, #5');
+  Line('  str w9, [x10, #152]');
+  Line('  str wzr, [x10, #184]');
+  Line('  str wzr, [x10, #188]');
+  Line('  str x11, [x10, #32]');
+  Line('  mov x28, x10');
+  Line('  str x30, [sp, #-16]!');
+  Line('  bl rt_gocall');
+  Line('  ldr x30, [sp], #16');
+  Line('  mov x28, x20');
+  Line('  mov sp, x19');
+  Line('  ldp x19, x20, [sp], #16');
+  Line('  ldp x11, x12, [sp], #16');
+  Line('  ldp x9, x10, [sp], #16');
+  Line('  ret');
+  Line('.gcm_no:');
+  Line('  ldp x9, x10, [sp], #16');
+  Line('  b rt_gocall');
   { rt_gocall as on amd64: x17 the routine, x0 to x2 its arguments;
     every register but x0 kept, on the stack. }
   Line('rt_gocall:');
@@ -54427,7 +54854,12 @@ begin
   Line('  yield');
   Line('  b .agc_lw');
   Line('.agc_stop:');
+  { on the M's own stack, as on amd64 (P342) }
+  Line('  ldr x9, [x21, #32]');
+  Line('  mov sp, x9');
   Line('  bl rt_gcstopm');
+  Line('  ldr x9, [x28, #40]');
+  Line('  mov sp, x9');
   Line('.agc_out:');
   Line('  ldr w16, [x28, #184]');
   Line('  sub w16, w16, #1');
@@ -54560,6 +54992,19 @@ begin
     new epoch sees the marking open; with a plain load the later ldar
     of MMarkOpen could be satisfied first and find it closed (P219). }
   Line('rt_gcwork:');
+  { never on a routine's own stack, as on amd64 (P342) }
+  Line('  cbz x28, .agw_ok');
+  Line('  ldr w9, [x28, #152]');
+  Line('  cmp w9, #5');
+  Line('  b.eq .agw_ok');
+  Line('  mov x9, sp');
+  Line('  ldr x10, [x28]');
+  Line('  cmp x9, x10');
+  Line('  b.lo .agw_ok');
+  Line('  ldr x10, [x28, #8]');
+  Line('  cmp x9, x10');
+  Line('  b.ls rt_gconstack');
+  Line('.agw_ok:');
   Line('  stp x29, x30, [sp, #-16]!');
   Line('  mov x29, sp');
   LeaS('rt_heapstate', 'x9');
@@ -54887,7 +55332,15 @@ begin
   Line('  str x9, [x0, #464]');
   Line('  mov x9, #16');
   Line('  str x9, [x0, #472]');
-  Line('  mov x9, #15');
+  LeaS('.apx_ares', 'x9');
+  Line('  str x9, [x0, #552]');
+  LeaS('.yp_res', 'x9');
+  Line('  str x9, [x0, #560]');
+  Line('  mov x9, #248');
+  Line('  str x9, [x0, #568]');
+  Line('  mov x9, #' + IntToStr(XBlock));
+  Line('  str x9, [x0, #576]');
+  Line('  mov x9, #31');
   Line('  str x9, [x0, #504]');
   LeaS('rt_allm', 'x9');
   Line('  str x9, [x0, #184]');
@@ -55432,7 +55885,7 @@ begin
   Line('  ldr x2, [x10, #8]');
   LeaS('rt_heapstate', 'x0');
   LeaS('p_pasheap_passtrblock', 'x17');
-  Line('  bl rt_gocall');
+  Line('  bl rt_gocallm');
   Line('  mov x15, x0');
   Line('  ldp x2, x30, [sp], #16');
   Line('  ldp x0, x1, [sp], #16');
@@ -55673,7 +56126,7 @@ begin
   Line('  sub x1, x1, #1');
   LeaS('rt_heapstate', 'x0');
   LeaS('p_pasheap_pasheapgrowlarge', 'x17');
-  Line('  bl rt_gocall');
+  Line('  bl rt_gocallm');
   Line('  cbz x0, .asgx_ret');
   Line('  ldr x9, [sp, #24]');
   Line('  lsl w11, w11, #1');
@@ -56185,8 +56638,8 @@ begin
   Line('  stp x24, x25, [sp, #-16]!');
   Line('  mov x19, x0');
   Line('  mov x20, x1');
-  Line('  sub sp, sp, #912');
-  Line('  mov x22, sp');
+  { its frame in the caller's, x2 (P342) }
+  Line('  mov x22, x2');
   Line('  mov x23, xzr');
   Line('.asx_try:');
   Line('  cmp x23, x20');
@@ -56223,7 +56676,6 @@ begin
   Line('.asx_hit:');
   Line('  mov x0, x23');
   Line('.asx_ret:');
-  Line('  add sp, sp, #912');
   Line('  ldp x24, x25, [sp], #16');
   Line('  ldp x22, x23, [sp], #16');
   Line('  ldp x19, x20, [sp], #16');

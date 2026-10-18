@@ -185,11 +185,16 @@ conservatively, word by word, and does not move what it finds that way.
   code paslangc compiled without `asm`, outside the runtime's units and
   past a prologue's stack check, where `SIGURG` stops a routine that
   runs and holds no runtime lock (G+184) or parking mark (G+152 not
-  0): `rt_asyncpreempt` keeps every register, the flags and the vector
-  registers on the routine's stack and parks it, and the collector
-  reads that stack word by word up to the frame pointer at G+56, the
-  interrupted frame included, which has no map at such a pc; the
-  frames above go by their maps. The
+  0): `rt_asyncpreempt` keeps every general register and the flags on
+  the routine's stack and the vector registers in a block of their own
+  (since P342, 1.1.194, as Go keeps them in `p.xRegs` and
+  `gp.xRegs`, runtime/preempt_xreg.go: a stop writes 144 bytes under
+  the stack pointer it stops, 368 on arm64, which
+  `scripts/check_stack.py` proves every routine of the table has above
+  its guard wherever it runs), and parks it; the collector reads that
+  stack word by word up to the frame pointer at G+56, the interrupted
+  frame included, which has no map at such a pc, and the block too, as
+  Go's `xRegScan`; the frames above go by their maps. The
   `pasasync` table, one entry a routine from the end of its prologue's
   stack check to its end, says where a signal may stop one: stopped
   between its load of the guard word and its call of `rt_morestack`, a
@@ -206,11 +211,12 @@ conservatively, word by word, and does not move what it finds that way.
   `rt_strunique`, `rt_fillbig` and arm64's `rt_fill` keep every
   register a region holds, and the collector reads the runtime's frames
   and the frame that called them word by word; a stopped region's
-  registers are on the stack. Since P271 (1.1.121) a long copy, clear, comparison
+  registers are on the stack, its vector ones in the stop's block. Since P271 (1.1.121) a long copy, clear, comparison
   or hash of the runtime stops too, between two pieces of 256 KiB, in
-  rt_yieldpoint: every register goes on the routine's stack, as Go's
-  asyncPreempt saves them, and the collector reads that stack word by
-  word up to the caller's frame. A large block whose pages held
+  rt_yieldpoint: every general register goes on the routine's stack, as
+  Go's asyncPreempt saves them, and the vector ones in a block of their
+  own (P342), and the collector reads that stack word by word up to the
+  caller's frame, and the block. A large block whose pages held
   something is cleared there a piece at a time, with its type 0 until it
   is clear (PasHeapLargeTyped), as Go's mallocgcLarge leaves largeType
   nil: no cycle reads what the pages held.
