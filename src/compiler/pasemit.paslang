@@ -798,6 +798,10 @@ type
     function ByRefReg(B: PExpr): string;
     function MethArgs(Obj: PExpr; SelfCls: Byte; const Args: TExprArray): LongInt;
     function WordInt(T: LongInt): Boolean;
+    function ChainPlain(E: PExpr): Boolean;
+    function ReadsReg(E: PExpr; const R: string): Boolean;
+    function PoolWord(E: PExpr): string;
+    procedure ArgInto(E: PExpr; const R: string);
     function CallFree(E: PExpr; Depth: LongInt): Boolean;
     procedure PlanArgs(const Args: TExprArray; MaxReg: LongInt; out Kd, Comp: LongInt);
     procedure PutArgs(const Args: TExprArray; Kd, Comp, Reg0: LongInt);
@@ -9437,20 +9441,32 @@ end;
 { A condition's branch to Target always: CondJmp's when it has one, else
   the condition worked out as a value and tested, as before P265. }
 procedure TEmitter.CondBranch(E: PExpr; const Target: string; WhenTrue: Boolean);
+var
+  r: string;
 begin
   if CondJmp(E, Target, WhenTrue) then
     Exit;
-  EmitExpr(E);
+  { a word the pool works out is tested where it is (P328): p xor q was
+    worked out in rsi, moved to rax and tested there }
+  r := PoolWord(E);
+  if r = '' then
+  begin
+    EmitExpr(E);
+    if FArm then
+      r := 'x0'
+    else
+      r := 'rax';
+  end;
   if FArm then
   begin
     if WhenTrue then
-      Line('  cbnz x0, ' + Target)
+      Line('  cbnz ' + r + ', ' + Target)
     else
-      Line('  cbz x0, ' + Target);
+      Line('  cbz ' + r + ', ' + Target);
   end
   else
   begin
-    Line('  testq %rax, %rax');
+    Line('  testq %' + r + ', %' + r);
     if WhenTrue then
       Line('  jnz ' + Target)
     else
@@ -13601,6 +13617,121 @@ begin
   end;
 end;
 
+{ E is a chain of plain steps on one register (P328): a word variable
+  or a constant, or a negation, a not or a conversion of a chain, or
+  + - * and or xor of a chain and a constant or a word variable, or a
+  shift of a chain by a constant. EmitOrdTo works it out in the pool's
+  first register alone, with rax (x17 on arm64) for a constant too wide
+  for an operand or a narrow variable, and no other pool register. }
+function TEmitter.ChainPlain(E: PExpr): Boolean;
+var
+  s: TSym;
+begin
+  Result := False;
+  if (E = nil) or (E^.Typ = TyBoolean) or not WordInt(E^.Typ) then
+    Exit;
+  case E^.Kind of
+    ekInt: Result := True;
+    ekVar: Result := WordVar(E, s);
+    ekUn:
+      Result := ((E^.Un = uoNeg) or (E^.Un = uoNot) or (E^.Un = uoConv)) and ChainPlain(E^.L);
+    ekBin:
+      if (E^.Bin = boShl) or (E^.Bin = boShr) then
+        Result := (E^.R^.Kind = ekInt) and ChainPlain(E^.L)
+      else
+        Result := ((E^.Bin = boAdd) or (E^.Bin = boSub) or (E^.Bin = boMul) or
+          (E^.Bin = boAnd) or (E^.Bin = boOr) or (E^.Bin = boXor)) and
+          ((E^.R^.Kind = ekInt) or ((E^.R^.Kind = ekVar) and WordVar(E^.R, s))) and
+          ChainPlain(E^.L);
+  end;
+end;
+
+{ E, a word that calls nothing, worked out in the pool, and the
+  register that holds it named, where EmitExpr moved it to rax or x0
+  first and the reader took it from there (P328); '' and nothing
+  emitted for any other E, a load among them (EmitExpr puts it where
+  it goes at once). }
+function TEmitter.PoolWord(E: PExpr): string;
+begin
+  Result := '';
+  if (E = nil) or not (((E^.Kind = ekBin) or (E^.Kind = ekUn) or (E^.Kind = ekIndex) or
+    (E^.Kind = ekField) or (E^.Kind = ekDeref)) and OrdSimple(E, 0)) or LoadKind(E) then
+    Exit;
+  EmitOrdTo(E, 0);
+  Result := OrdPool(0);
+end;
+
+{ E reads a variable that lives in register R (P328). }
+function TEmitter.ReadsReg(E: PExpr; const R: string): Boolean;
+var
+  s: TSym;
+  i: SizeInt;
+begin
+  Result := False;
+  if E = nil then
+    Exit;
+  if E^.Kind = ekVar then
+  begin
+    s := FindSym(E^.Name);
+    Result := (s.Name <> '') and (s.Reg = R);
+    Exit;
+  end;
+  Result := ReadsReg(E^.L, R) or ReadsReg(E^.R, R);
+  for i := 0 to High(E^.Args) do
+    if not Result then
+      Result := ReadsReg(E^.Args[i], R);
+end;
+
+{ An argument that calls nothing worked out where its register R takes
+  it (P328): a load straight into R; a chain of plain steps in R, the
+  pool's first register named so (P318's way); anything else the pool
+  works out in its first register and one move puts there, where it went
+  to rax or x0 first and a second move followed: the argument i and 15
+  was movq v_i(%rip), %rsi; andq $15, %rsi; movq %rsi, %rax; movq %rax,
+  %rdi, where Go's register allocator gives the value the register that
+  takes it (cmd/compile/internal/ssa/regalloc.go, a value's register
+  hint: MOVQ AX, BX; ANDL $15, BX). }
+procedure TEmitter.ArgInto(E: PExpr; const R: string);
+var
+  was: string;
+begin
+  if ((E^.Kind = ekBin) or (E^.Kind = ekUn) or (E^.Kind = ekIndex) or
+    (E^.Kind = ekField) or (E^.Kind = ekDeref)) and OrdSimple(E, 0) then
+  begin
+    if LoadKind(E) then
+    begin
+      FSkipCanon := False;
+      WordLoad(EmitWordMem(E, 0), LoadTyp(E), R);
+      Exit;
+    end;
+    if PoolPlain(E) and ChainPlain(E) and not ReadsReg(E, R) then
+    begin
+      was := FPool0;
+      FPool0 := R;
+      EmitOrdTo(E, 0);
+      FPool0 := was;
+      Exit;
+    end;
+    EmitOrdTo(E, 0);
+    if OrdPool(0) <> R then
+    begin
+      if FArm then
+        Line('  mov ' + R + ', ' + OrdPool(0))
+      else
+        Line('  movq %' + OrdPool(0) + ', %' + R);
+    end;
+    Exit;
+  end;
+  EmitExpr(E);
+  if FArm then
+  begin
+    if R <> 'x0' then
+      Line('  mov ' + R + ', x0');
+  end
+  else
+    Line('  movq %rax, %' + R);
+end;
+
 { The arguments from Kd on into their registers, the one worked out
   first, Reg0 the register of argument 0 (1 for a method's, Self in the
   first). }
@@ -13610,14 +13741,10 @@ var
 begin
   if Comp >= 0 then
   begin
-    EmitExpr(Args[Comp]);
     if FArm then
-    begin
-      if Reg0 + Comp <> 0 then
-        Line('  mov ' + ArgR(Reg0 + Comp) + ', x0');
-    end
+      ArgInto(Args[Comp], ArgR(Reg0 + Comp))
     else
-      Line('  movq %rax, %' + ArgReg(Reg0 + Comp));
+      ArgInto(Args[Comp], ArgReg(Reg0 + Comp));
   end;
   for i := Kd to High(Args) do
     if i <> Comp then
@@ -24813,7 +24940,7 @@ procedure TEmitter.EmitStmtNow(S: PStmt);
 var
   i, j, n, nreg, nv, ns: SizeInt;
   ist: PStmt;
-  a, b, c, d, smap, op: string;
+  a, b, c, d, smap, op, pw: string;
   boxoff: array of LongInt;
   td: TTypeDef;
   off, so: LongInt;
@@ -25162,11 +25289,32 @@ begin
           end;
           for i := 0 to n - 1 do
           begin
-            EmitExpr(S^.Args[i]);
-            AddImmArm('x16', 'sp', i * 16);
-            Line('  str x0, [x16]');
+            { from where the value is (P328): a word the pool works out
+              from its register, and at sp's offset, one str or stp,
+              where an add made the address in x16 first }
+            pw := PoolWord(S^.Args[i]);
+            if pw = '' then
+            begin
+              EmitExpr(S^.Args[i]);
+              pw := 'x0';
+            end;
             if (S^.Args[i]^.Kind = ekStr) or IsStr(S^.Args[i]^.Typ) then
-              Line('  str x2, [x16, #8]');
+            begin
+              if i * 16 <= 504 then
+                Line('  stp x0, x2, [sp, #' + IntToStr(i * 16) + ']')
+              else
+              begin
+                AddImmArm('x16', 'sp', i * 16);
+                Line('  stp x0, x2, [x16]');
+              end;
+            end
+            else if i * 16 <= 32760 then
+              Line('  str ' + pw + ', [sp, #' + IntToStr(i * 16) + ']')
+            else
+            begin
+              AddImmArm('x16', 'sp', i * 16);
+              Line('  str ' + pw + ', [x16]');
+            end;
           end;
           { every call takes the stream's record in x0 (P212), the
             integer of rt_writeint in x1 }
@@ -25297,8 +25445,14 @@ begin
         begin
           if not JccTrue(S^.E, c) then
           begin
-            EmitExpr(S^.E);
-            Line('  cbnz x0, ' + c);
+            { a word the pool works out is tested where it is (P328) }
+            pw := PoolWord(S^.E);
+            if pw = '' then
+            begin
+              EmitExpr(S^.E);
+              pw := 'x0';
+            end;
+            Line('  cbnz ' + pw + ', ' + c);
           end;
         end
         else
@@ -25307,8 +25461,14 @@ begin
           b := Lab;
           if not FastJcc(S^.E, a) then
           begin
-            EmitExpr(S^.E);
-            Line('  cbz x0, ' + a);
+            { a word the pool works out is tested where it is (P328) }
+            pw := PoolWord(S^.E);
+            if pw = '' then
+            begin
+              EmitExpr(S^.E);
+              pw := 'x0';
+            end;
+            Line('  cbz ' + pw + ', ' + a);
           end;
           EmitStmt(S^.ThenSt);
           { no else: nothing to jump over (P305) }
@@ -25340,8 +25500,14 @@ begin
           EmitStackCheck(c, '16');
           if not JccTrue(S^.E, a) then
           begin
-            EmitExpr(S^.E);
-            Line('  cbnz x0, ' + a);
+            { a word the pool works out is tested where it is (P328) }
+            pw := PoolWord(S^.E);
+            if pw = '' then
+            begin
+              EmitExpr(S^.E);
+              pw := 'x0';
+            end;
+            Line('  cbnz ' + pw + ', ' + a);
           end;
           Line(b + ':');
           PopLoop;
@@ -25360,8 +25526,14 @@ begin
             FCurDa := S^.Da2;
           if not FastJcc(S^.E, a) then
           begin
-            EmitExpr(S^.E);
-            Line('  cbz x0, ' + a);
+            { a word the pool works out is tested where it is (P328) }
+            pw := PoolWord(S^.E);
+            if pw = '' then
+            begin
+              EmitExpr(S^.E);
+              pw := 'x0';
+            end;
+            Line('  cbz ' + pw + ', ' + a);
           end;
           Line(b + ':');
           PopLoop;
@@ -25931,8 +26103,14 @@ begin
           Line('  subq $' + IntToStr(n * 16) + ', %rsp');
         for i := 0 to n - 1 do
         begin
-          EmitExpr(S^.Args[i]);
-          Line('  movq %rax, ' + IntToStr(i * 16) + '(%rsp)');
+          { a word the pool works out is stored from where it is (P328) }
+          pw := PoolWord(S^.Args[i]);
+          if pw = '' then
+          begin
+            EmitExpr(S^.Args[i]);
+            pw := 'rax';
+          end;
+          Line('  movq %' + pw + ', ' + IntToStr(i * 16) + '(%rsp)');
           if (S^.Args[i]^.Kind = ekStr) or IsStr(S^.Args[i]^.Typ) then
             Line('  movq %rdx, ' + IntToStr(i * 16 + 8) + '(%rsp)');
         end;
@@ -26069,8 +26247,14 @@ begin
       begin
         if not JccTrue(S^.E, c) then
         begin
-          EmitExpr(S^.E);
-          Line('  testq %rax, %rax');
+          { a word the pool works out is tested where it is (P328) }
+          pw := PoolWord(S^.E);
+          if pw = '' then
+          begin
+            EmitExpr(S^.E);
+            pw := 'rax';
+          end;
+          Line('  testq %' + pw + ', %' + pw);
           Line('  jnz ' + c);
         end;
       end
@@ -26080,8 +26264,14 @@ begin
         b := Lab;
         if not FastJcc(S^.E, a) then
         begin
-          EmitExpr(S^.E);
-          Line('  testq %rax, %rax');
+          { a word the pool works out is tested where it is (P328) }
+          pw := PoolWord(S^.E);
+          if pw = '' then
+          begin
+            EmitExpr(S^.E);
+            pw := 'rax';
+          end;
+          Line('  testq %' + pw + ', %' + pw);
           Line('  jz ' + a);
         end;
         EmitStmt(S^.ThenSt);
@@ -26115,8 +26305,14 @@ begin
         EmitStackCheck(c, '16');
         if not JccTrue(S^.E, a) then
         begin
-          EmitExpr(S^.E);
-          Line('  testq %rax, %rax');
+          { a word the pool works out is tested where it is (P328) }
+          pw := PoolWord(S^.E);
+          if pw = '' then
+          begin
+            EmitExpr(S^.E);
+            pw := 'rax';
+          end;
+          Line('  testq %' + pw + ', %' + pw);
           Line('  jnz ' + a);
         end;
         Line(b + ':');
@@ -26136,8 +26332,14 @@ begin
           FCurDa := S^.Da2;
         if not FastJcc(S^.E, a) then
         begin
-          EmitExpr(S^.E);
-          Line('  testq %rax, %rax');
+          { a word the pool works out is tested where it is (P328) }
+          pw := PoolWord(S^.E);
+          if pw = '' then
+          begin
+            EmitExpr(S^.E);
+            pw := 'rax';
+          end;
+          Line('  testq %' + pw + ', %' + pw);
           Line('  jz ' + a);
         end;
         Line(b + ':');

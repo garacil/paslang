@@ -319,6 +319,9 @@ GOLDEN_A64 += ptimers
 # P345: a global only the main block names lets its value go after its last use.
 GOLDEN += mainlive
 GOLDEN_A64 += mainlive
+# P328: a word worked out in the pool lands in the register that reads it.
+GOLDEN += argreg
+GOLDEN_A64 += argreg
 # P354: a routine's record keeps no saved register once it is loaded back.
 GOLDEN += gstale
 GOLDEN_A64 += gstale
@@ -2468,6 +2471,12 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 timeout 300 $(BUILDDIR)/asyncgc-base > $(BUILDDIR)/asyncgc-base.got; \
 	diff -u testdata/asyncgc.out $(BUILDDIR)/asyncgc-base.got; \
 	echo ok async-asm; \
+	: a word worked out in the pool lands in the register that reads it, an argument, a condition, a WriteLn operand, P328; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/argreg0 testdata/argreg.paslang; \
+	$(BUILDDIR)/argreg0 > $(BUILDDIR)/argreg0.got; \
+	diff -u testdata/argreg.out $(BUILDDIR)/argreg0.got; \
+	python3 -I scripts/check_argreg.py $(BUILDDIR)/argreg0.s; \
+	echo ok argreg-asm; \
 	: c + k * x and y + k * x are one lea, x := x + k * y one lea on the register of x, r13 and rbp are never the base of a lea with an index, and a load at p - k takes the offset, P294; \
 	awk '/^p_off8:/,/cfi_endproc/' $(BUILDDIR)/leaform.s > $(BUILDDIR)/leaform-off8.s; \
 	grep -q 'leaq 8(,%r[a-z0-9]*,8), ' $(BUILDDIR)/leaform-off8.s || { echo "leaform.s: Off8 is not one lea"; exit 1; }; \
@@ -3776,6 +3785,12 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	  diff -u testdata/asyncleaf.out $(BUILDDIR)/asyncleaf-arm-gc.got; \
 	done; \
 	echo ok async-arm-asm; \
+	: P328 on arm64: a word worked out in the pool lands in the register that reads it, WriteLn operands at the offset of sp; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/argreg0-arm testdata/argreg.paslang; \
+	timeout 300 $(QEMU_A64) $(BUILDDIR)/argreg0-arm > $(BUILDDIR)/argreg0-arm.got; \
+	diff -u testdata/argreg.out $(BUILDDIR)/argreg0-arm.got; \
+	python3 -I scripts/check_argreg.py $(BUILDDIR)/argreg0-arm.s --arm; \
+	echo ok argreg-arm-asm; \
 	: P294 on arm64: c + k * x a move and one add with the shift, y + k * x and x := x + k * y one add, and loads at p - k, p + k and p + i shl s in the load, within the offsets of LDUR and LDR; \
 	awk '/^p_off8:/,/cfi_endproc/' $(BUILDDIR)/leaform-arm.s > $(BUILDDIR)/leaform-off8-arm.s; \
 	grep -qE 'add x[0-9]+, x17, x[0-9]+, lsl #3' $(BUILDDIR)/leaform-off8-arm.s || { echo "leaform-arm.s: Off8 is not a move and one add"; exit 1; }; \

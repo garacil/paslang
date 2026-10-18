@@ -140,7 +140,9 @@ def main():
         loops("p_six", [r"^  blr x8$"])
         has("p_run", r"^  blr x8\n(\.Lgm\d+:\n)?  ldr x1, \[x29, #-\d+\]\n  add x0, x1, x0$", "t read after the call")
         has("p_gets", r"^  ldp x8, x0, \[x29, #-\d+\]\n  mov x1, #5\n  blr x8$", "method value's code and Self in one ldp")
-        has("pas_main", r"^  blr x8\n(\.Lgm\d+:\n)?  adrp x16, v_mt\n  add x16, x16, :lo12:v_mt\n  ldr x1, \[x16\]$",
+        # folded since P328: WriteLn's operands are stored at sp's offset
+        # and no longer take x16, so P331's fold takes the read
+        has("pas_main", r"^  blr x8\n(\.Lgm\d+:\n)?  adrp x16, v_mt\n  ldr x1, \[x16, :lo12:v_mt\]$",
             "mt read after the call")
         has("p_locarr", r"^  bl p_deep\n(\.Lgm\d+:\n)?  add x0, x0, #3\n  cmp x0, #9$", "Deep(N) + 3 as add #3")
         before("pas_main", r"^  bl p_bumpg$")
