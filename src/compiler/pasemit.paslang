@@ -884,6 +884,7 @@ type
     function AndZero(E: PExpr; out A: PExpr): Boolean;
     function AndTest(A: PExpr; D: LongInt; AllowBit: Boolean): LongInt;
     procedure TbzPass(From: SizeInt);
+    procedure AdrpPass(From: SizeInt);
     procedure SelLoad(F: PExpr; const R: string);
     function SelReg(F: PExpr; const Spare: string): string;
     function IncOne(E: PExpr; out A: PExpr): Boolean;
@@ -8107,6 +8108,158 @@ begin
     if not drop[i] then
       out1 := out1 + ls[i] + Char(10);
   { the text after the last line end, if any, stays after the new lines }
+  out1 := out1 + Copy(FOut, st, FLen - st + 1);
+  if From + Length(out1) + 1 > Length(FOut) then
+    SetLength(FOut, From + Length(out1) + 4096);
+  if Length(out1) > 0 then
+    Move(out1[1], FOut[From + 1], Length(out1));
+  FLen := From + Length(out1);
+end;
+
+{ arm64, the routine's text from From (P331): adrp x16, v; add x16, x16,
+  :lo12:v and a load or a store through x16 at an offset are adrp and the
+  access with the low twelve bits, adrp x16, v+8 and ldr x1, [x16,
+  :lo12:v+8] (the page of the word itself, which may be the next), as Go's
+  assembler writes MOVD v(SB), R1 (cmd/internal/obj/arm64, a symbol's
+  load: ADRP and LDR with R_AARCH64_LDST64_ABS_LO12_NC), one instruction
+  fewer, where x16 is dead after the access: before any other read of
+  it, a write of it, a call or a return on that line's path, no label or
+  branch between. Only a program's or a unit's global, v_ whose start
+  lies on 8 or more (GlobAlign), at an offset of the access's size, so
+  the scaled offset the relocation needs (ARM DDI 0487 M.c C6.2.216 LDR
+  immediate, unsigned offset; the ELF for the Arm 64-bit Architecture:
+  LDST8, 16, 32 and 64 ABS_LO12_NC) holds. }
+procedure TEmitter.AdrpPass(From: SizeInt);
+var
+  ls: TStrArray;
+  drop: array of Boolean;
+  i, j, n, q, st, p: SizeInt;
+  t, sym, op, rt, mem, offs, out1: string;
+  sz: LongInt;
+  off: Int64;
+  changed, dead, ok: Boolean;
+begin
+  if FLen <= From then
+    Exit;
+  ls := nil;
+  n := 0;
+  st := From + 1;
+  for q := From + 1 to FLen do
+    if FOut[q] = Char(10) then
+    begin
+      SetLength(ls, n + 1);
+      ls[n] := Copy(FOut, st, q - st);
+      Inc(n);
+      st := q + 1;
+    end;
+  if n < 3 then
+    Exit;
+  SetLength(drop, n);
+  for i := 0 to n - 1 do
+    drop[i] := False;
+  changed := False;
+  for i := 0 to n - 3 do
+  begin
+    t := ls[i];
+    if Copy(t, 1, 14) <> '  adrp x16, v_' then
+      Continue;
+    sym := Copy(t, 13, Length(t) - 12);
+    if ls[i + 1] <> '  add x16, x16, :lo12:' + sym then
+      Continue;
+    { the access: op Rt, [x16] or [x16, #imm] }
+    t := ls[i + 2];
+    p := Pos(' ', Copy(t, 3, Length(t)));
+    if p = 0 then
+      Continue;
+    op := Copy(t, 3, p - 1);
+    sz := 0;
+    if (op = 'ldr') or (op = 'str') then
+    begin
+      if Copy(t, p + 3, 1) = 'x' then
+        sz := 8
+      else if Copy(t, p + 3, 1) = 'w' then
+        sz := 4;
+    end
+    else if (op = 'ldrb') or (op = 'strb') or (op = 'ldrsb') then
+      sz := 1
+    else if (op = 'ldrh') or (op = 'strh') or (op = 'ldrsh') then
+      sz := 2
+    else if op = 'ldrsw' then
+      sz := 4;
+    if sz = 0 then
+      Continue;
+    j := Pos(', [x16', t);
+    if j = 0 then
+      Continue;
+    rt := Copy(t, p + 3, j - p - 3);
+    if (rt = 'x16') or (rt = 'w16') or (Pos(' ', rt) > 0) then
+      Continue;
+    mem := Copy(t, j + 2, Length(t) - j - 1);
+    off := 0;
+    ok := True;
+    if mem = '[x16]' then
+      off := 0
+    else if (Copy(mem, 1, 7) = '[x16, #') and (mem[Length(mem)] = ']') then
+    begin
+      offs := Copy(mem, 8, Length(mem) - 8);
+      if not StrToInt64(offs, off) then
+        ok := False;
+    end
+    else
+      ok := False;
+    if (not ok) or (off < 0) or (off >= 4096) or (off mod sz <> 0) then
+      Continue;
+    { x16 dead after the access }
+    dead := False;
+    q := i + 3;
+    while q < n do
+    begin
+      t := ls[q];
+      if (t = '') or (Copy(t, 1, 3) = '  .') then
+      begin
+        Inc(q);
+        Continue;
+      end;
+      if (t[1] <> ' ') or (Copy(t, 1, 4) = '  b ') or (Copy(t, 1, 4) = '  b.') or
+        (Copy(t, 1, 5) = '  cbz') or (Copy(t, 1, 6) = '  cbnz') or (Copy(t, 1, 5) = '  tbz') or
+        (Copy(t, 1, 6) = '  tbnz') or (Copy(t, 1, 5) = '  br ') then
+        Break;
+      if (Copy(t, 1, 5) = '  bl ') or (Copy(t, 1, 6) = '  blr ') or (t = '  ret') then
+      begin
+        dead := Pos('x16', t) = 0;
+        Break;
+      end;
+      if Pos('x16', t) = 0 then
+      begin
+        Inc(q);
+        Continue;
+      end;
+      { the first that names x16: a write of it alone, and no read }
+      dead := ((Copy(t, 1, 12) = '  adrp x16, ') or (Copy(t, 1, 11) = '  mov x16, ') or
+        (Copy(t, 1, 12) = '  movz x16, ') or (Copy(t, 1, 11) = '  ldr x16, ')) and
+        (Pos('x16', Copy(t, 12, Length(t))) = 0);
+      Break;
+    end;
+    if not dead then
+      Continue;
+    if off = 0 then
+      ls[i + 2] := '  ' + op + ' ' + rt + ', [x16, :lo12:' + sym + ']'
+    else
+    begin
+      { the page of the word itself: v_s+8 may lie on the next page
+        (v_s at 0x43fff8 in chr), which adrp of v_s does not reach }
+      ls[i] := '  adrp x16, ' + sym + '+' + IntToStr(off);
+      ls[i + 2] := '  ' + op + ' ' + rt + ', [x16, :lo12:' + sym + '+' + IntToStr(off) + ']';
+    end;
+    drop[i + 1] := True;
+    changed := True;
+  end;
+  if not changed then
+    Exit;
+  out1 := '';
+  for i := 0 to n - 1 do
+    if not drop[i] then
+      out1 := out1 + ls[i] + Char(10);
   out1 := out1 + Copy(FOut, st, FLen - st + 1);
   if From + Length(out1) + 1 > Length(FOut) then
     SetLength(FOut, From + Length(out1) + 4096);
@@ -32977,7 +33130,10 @@ begin
   else
     MapEnd(FFrame);
   if FArm and not HasAsm(Pr.Body) then
+  begin
     TbzPass(ck0);
+    AdrpPass(ck0);
+  end;
   dend := Lab;
   Line(dend + ':');
   { the routine's code for rt_sigurg (P293): a signal may stop it at any
@@ -43206,7 +43362,7 @@ end;
 
 function TEmitter.Emit(const Prog: TProgram): string;
 var
-  i, j, k, mi: SizeInt;
+  i, j, k, mi, mb0: SizeInt;
   sz, rp, slot: LongInt;
   big: Int64;
   sruns: TInt64Arr;
@@ -43394,6 +43550,7 @@ begin
       FInMain := True;
       FNestNames := nil;
       SelBodyIs(Prog.Body);
+      mb0 := FLen;
       EmitStmt(Prog.Body);
       FInMain := False;
       FCpuSet := FProgCpu;
@@ -43410,6 +43567,9 @@ begin
       Line('  ldp x29, x30, [sp], #16');
       Line('  ret');
       ColdFlush(False);
+      { the main block's globals as a routine's, its cold blocks too (P331) }
+      if not HasAsm(Prog.Body) then
+        AdrpPass(mb0);
       Line('  .cfi_endproc');
       if FDebug then
         Line('.Lmainend:');

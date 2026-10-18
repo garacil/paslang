@@ -394,6 +394,9 @@ GOLDEN_A64 += forstep
 # P330: a value goes to its place without the stack.
 GOLDEN += twostore
 GOLDEN_A64 += twostore
+# P331: an arm64 global is loaded and stored by adrp and its low twelve bits.
+GOLDEN += globfold
+GOLDEN_A64 += globfold
 # P333: an exec and a new thread do not race (amd64: qemu-user does not
 # execve an arm64 program, so arm64 reads the runtime's forms).
 GOLDEN += execrace
@@ -3888,6 +3891,13 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	diff -u testdata/twostore.out $(BUILDDIR)/twostore0-arm.got; \
 	python3 -I scripts/check_twostore.py $(BUILDDIR)/twostore0-arm.s --arm; \
 	echo ok twostore-arm-asm; \
+	: P331 on arm64: globfold with and without inlining, a global by adrp and the low twelve bits; \
+	python3 -I scripts/check_adrpfold.py $(BUILDDIR)/globfold-arm.s --folds=12; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/globfold0-arm testdata/globfold.paslang; \
+	timeout 300 $(QEMU_A64) $(BUILDDIR)/globfold0-arm > $(BUILDDIR)/globfold0-arm.got; \
+	diff -u testdata/globfold.out $(BUILDDIR)/globfold0-arm.got; \
+	python3 -I scripts/check_adrpfold.py $(BUILDDIR)/globfold0-arm.s --folds=10; \
+	echo ok globfold-arm-asm; \
 	: P333 on arm64: the runtime of execrace, the exec lock around a new thread and an execve; \
 	$(OUTDIR)/paslangc -target arm64 -cpu max -Fu $(A64DIR) -o $(BUILDDIR)/execrace-arm testdata/execrace.paslang; \
 	python3 -I scripts/check_execlock.py $(BUILDDIR)/execrace-arm.s --arm; \
