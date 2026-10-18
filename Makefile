@@ -325,6 +325,9 @@ GOLDEN_A64 += argreg
 # P332: several arguments worked out in the pool push nothing.
 GOLDEN += manyargs
 GOLDEN_A64 += manyargs
+# P355: every argument that calls nothing pushes nothing.
+GOLDEN += heldargs
+GOLDEN_A64 += heldargs
 # P354: a routine's record keeps no saved register once it is loaded back.
 GOLDEN += gstale
 GOLDEN_A64 += gstale
@@ -2486,6 +2489,12 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/manyargs.out $(BUILDDIR)/manyargs0.got; \
 	python3 -I scripts/check_argpush.py $(BUILDDIR)/manyargs0.s; \
 	echo ok manyargs-asm; \
+	: every argument that calls nothing pushes nothing, elements, fields and divisions among them, P355; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/heldargs0 testdata/heldargs.paslang; \
+	$(BUILDDIR)/heldargs0 > $(BUILDDIR)/heldargs0.got; \
+	diff -u testdata/heldargs.out $(BUILDDIR)/heldargs0.got; \
+	python3 -I scripts/check_argpush.py $(BUILDDIR)/heldargs0.s --routines=p_bydirect,p_bydirect5,p_bymethod,p_bymethode,p_byvalue,p_byvalue5,p_bymethval,p_byiface,p_bynested; \
+	echo ok heldargs-asm; \
 	: c + k * x and y + k * x are one lea, x := x + k * y one lea on the register of x, r13 and rbp are never the base of a lea with an index, and a load at p - k takes the offset, P294; \
 	awk '/^p_off8:/,/cfi_endproc/' $(BUILDDIR)/leaform.s > $(BUILDDIR)/leaform-off8.s; \
 	grep -q 'leaq 8(,%r[a-z0-9]*,8), ' $(BUILDDIR)/leaform-off8.s || { echo "leaform.s: Off8 is not one lea"; exit 1; }; \
@@ -3806,6 +3815,12 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	diff -u testdata/manyargs.out $(BUILDDIR)/manyargs0-arm.got; \
 	python3 -I scripts/check_argpush.py $(BUILDDIR)/manyargs0-arm.s --arm; \
 	echo ok manyargs-arm-asm; \
+	: P355 on arm64: every argument that calls nothing pushes nothing; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/heldargs0-arm testdata/heldargs.paslang; \
+	timeout 300 $(QEMU_A64) $(BUILDDIR)/heldargs0-arm > $(BUILDDIR)/heldargs0-arm.got; \
+	diff -u testdata/heldargs.out $(BUILDDIR)/heldargs0-arm.got; \
+	python3 -I scripts/check_argpush.py $(BUILDDIR)/heldargs0-arm.s --arm --routines=p_bydirect,p_bydirect5,p_bymethod,p_bymethode,p_byvalue,p_byvalue5,p_bymethval,p_byiface,p_bynested; \
+	echo ok heldargs-arm-asm; \
 	: P294 on arm64: c + k * x a move and one add with the shift, y + k * x and x := x + k * y one add, and loads at p - k, p + k and p + i shl s in the load, within the offsets of LDUR and LDR; \
 	awk '/^p_off8:/,/cfi_endproc/' $(BUILDDIR)/leaform-arm.s > $(BUILDDIR)/leaform-off8-arm.s; \
 	grep -qE 'add x[0-9]+, x17, x[0-9]+, lsl #3' $(BUILDDIR)/leaform-off8-arm.s || { echo "leaform-arm.s: Off8 is not a move and one add"; exit 1; }; \

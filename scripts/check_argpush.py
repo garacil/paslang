@@ -3,13 +3,14 @@
 # Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
 # paslang is free software under the GNU General Public License,
 # version 3 or (at your option) any later version; see the file COPYING.
-"""Several arguments worked out in the pool push nothing (P332), read in
-the assembly of testdata/manyargs built with -inline 0: ByDirect,
-ByMethod and ByValue, each a call with several chains of plain steps
-among its arguments, push no word (pushq on amd64, str ... [sp, #-16]!
-on arm64 with --arm) and pop none, the frame's own aside.
+"""Arguments worked out in the pool push nothing (P332, P355), read in
+the assembly of a test built with -inline 0: each routine named, a call
+with several arguments worked out in the pool among its own, pushes no
+word (pushq on amd64, str ... [sp, #-16]! on arm64 with --arm) and pops
+none, the frame's own aside. The routines are testdata/manyargs's
+ByDirect, ByMethod and ByValue unless --routines names others.
 
-usage: check_argpush.py file.s [--arm]
+usage: check_argpush.py file.s [--arm] [--routines=p_a,p_b,...]
 """
 
 import re
@@ -19,6 +20,10 @@ import sys
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     arm = "--arm" in sys.argv[1:]
+    routines = ["p_bydirect", "p_bymethod", "p_byvalue"]
+    for a in sys.argv[1:]:
+        if a.startswith("--routines="):
+            routines = a.split("=", 1)[1].split(",")
     if len(args) != 1:
         raise SystemExit(__doc__)
     body, name = {}, None
@@ -31,7 +36,7 @@ def main():
         if name is not None:
             body[name].append(l.strip())
     bad = []
-    for r in ("p_bydirect", "p_bymethod", "p_byvalue"):
+    for r in routines:
         if r not in body:
             bad.append(f"{r}: not found")
             continue
@@ -46,7 +51,7 @@ def main():
     if bad:
         print("\n".join(bad[:20]))
         raise SystemExit(f"check_argpush: {len(bad)} pushes or pops around the calls in {args[0]}")
-    print(f"check_argpush: ByDirect, ByMethod and ByValue push nothing, in {args[0]}")
+    print(f"check_argpush: {len(routines)} routines push nothing, in {args[0]}")
 
 
 if __name__ == "__main__":
