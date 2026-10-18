@@ -111,9 +111,11 @@ def main():
     if not arm:
         loops("p_run", [r"^  movq v_fns\(,%rax,8\), %r11$", r"^  movq v_fns\+8\(,%rax,8\), %r10$",
                         r"^  call \*%r11$"])
-        loops("p_areas", [r"^  movq v_shapes\(,%rax,8\), %r10$", r"^  movq v_shapes\+8\(,%rax,8\), %r11$",
-                          r"^  movq 0\(%r11\), %r11$", r"^  movq %r10, %rdi$"])
-        loops("p_gets", [r"^  movq %rax, %r10$", r"^  movq %r10, %rdi$", r"^  call \*\d+\(%rax\)$"])
+        # Self straight into rdi since P332: the argument, a chain, is
+        # worked out in its own register and leaves rdi alone
+        loops("p_areas", [r"^  movq v_shapes\(,%rax,8\), %rdi$", r"^  movq v_shapes\+8\(,%rax,8\), %r11$",
+                          r"^  movq 0\(%r11\), %r11$"])
+        loops("p_gets", [r"^  movq %rax, %rdi$", r"^  call \*\d+\(%rax\)$"])
         loops("p_six", [r"^  call \*%r11$"])
         has("p_run", r"^  call \*%r11\n(\.Lgm\d+:\n)?  addq -\d+\(%rbp\), %rax$", "t added from its home after the call")
         has("p_gets", r"^  movq (-\d+)\(%rbp\), %r11\n  movq -\d+\(%rbp\), %rdi\n  movl \$5, %esi\n  call \*%r11$",
@@ -135,8 +137,8 @@ def main():
         before("p_outer", r"^  call p_outer_inner$")
     else:
         loops("p_run", [r"^  ldp x8, x27, \[x0\]$", r"^  blr x8$"])
-        loops("p_areas", [r"^  ldp x27, x8, \[x0\]$", r"^  ldr x8, \[x8, #0\]$", r"^  mov x0, x27$"])
-        loops("p_gets", [r"^  mov x27, x0$", r"^  mov x0, x27$", r"^  ldr x16, \[x0\]\n  ldr x16, \[x16, #\d+\]\n  blr x16$"])
+        loops("p_areas", [r"^  ldp x0, x8, \[x0\]$", r"^  ldr x8, \[x8, #0\]$"])
+        loops("p_gets", [r"^  ldr x0, \[x9, x10, lsl #3\]$", r"^  ldr x16, \[x0\]\n  ldr x16, \[x16, #\d+\]\n  blr x16$"])
         loops("p_six", [r"^  blr x8$"])
         has("p_run", r"^  blr x8\n(\.Lgm\d+:\n)?  ldr x1, \[x29, #-\d+\]\n  add x0, x1, x0$", "t read after the call")
         has("p_gets", r"^  ldp x8, x0, \[x29, #-\d+\]\n  mov x1, #5\n  blr x8$", "method value's code and Self in one ldp")
