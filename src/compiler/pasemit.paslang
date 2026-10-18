@@ -334,6 +334,9 @@ type
     FRightOn: Boolean;
     FPoolCap: LongInt;      { the pool at most this many registers, 0 for all: r10 and r11 keep a call's code and second word (P297) }
     FArgGuard: TStrArray;   { the registers a call's arguments wait in, which no line names (P355) }
+    FDivTop: PExpr;         { the expression whose value a reader takes in FDivDest (P356) }
+    FDivDest: string;       { that register, where a division at its top leaves its value }
+    FDivLanded: Boolean;    { the division left it there }
     FFlat: Boolean;         { the routine has no frame, its variables in registers (P296) }
     FFlatCfa: LongInt;      { its CFA's offset from rsp: 8 and 8 a register it pushed }
     FFlatPad: Boolean;      { a failure out of line moves rsp by 8 first, for its call }
@@ -959,12 +962,15 @@ type
     procedure WordLoad(const M: string; T: LongInt; const R: string);
     procedure WordStore(const M: string; Sz: LongInt; const R: string);
     function DivConstOK(E: PExpr): Boolean;
-    procedure EmitDivConst(const X: string; C: Int64; IsMod: Boolean);
+    procedure EmitDivConst(const X, Dst: string; C: Int64; IsMod: Boolean);
+    function DivOut(E: PExpr; D: LongInt): string;
+    function DivInRax(E: PExpr): Boolean;
+    function QuietOp(E: PExpr): Boolean;
     function OrdJcc(E: PExpr; const Target: string; WhenTrue: Boolean): Boolean;
     procedure StorePlainFrom(const S: TSym; const Src: string);
     procedure SetFrame(const Sym: string; Locals: LongInt);
     procedure ZeroFrame(Off, Bytes: LongInt);
-    procedure EmitDivCheck;
+    procedure EmitDivCheck(const R: string);
     function DivFix(E: PExpr): Boolean;
     procedure SignedDiv(E: PExpr; IsMod: Boolean);
     procedure ColdBeginAt(const Jmp, C: string);
@@ -13894,8 +13900,13 @@ begin
       FPool0 := was;
       Exit;
     end;
+    { a division at the top leaves its value in R (P356) }
+    FDivTop := E;
+    FDivDest := R;
+    FDivLanded := False;
     EmitOrdTo(E, 0);
-    if OrdPool(0) <> R then
+    FDivTop := nil;
+    if (not FDivLanded) and (OrdPool(0) <> R) then
     begin
       if FArm then
         Line('  mov ' + R + ', ' + OrdPool(0))
@@ -22917,7 +22928,17 @@ begin
         WordLoad(EmitWordMem(E, 0), LoadTyp(E), 'rax');
       Exit;
     end;
+    { a division at the top leaves its value in rax or x0 (P356) }
+    FDivTop := E;
+    if FArm then
+      FDivDest := 'x0'
+    else
+      FDivDest := 'rax';
+    FDivLanded := False;
     EmitOrdTo(E, 0);
+    FDivTop := nil;
+    if FDivLanded then
+      Exit;
     if FArm then
       Line('  mov x0, ' + OrdPool(0))
     else
@@ -23677,7 +23698,7 @@ else if E^.Name = 'rt_high' then
           else if DivConstOK(E) then
           begin
             EmitExpr(E^.L);
-            EmitDivConst('x0', E^.R^.Num, E^.Bin = boMod);
+            EmitDivConst('x0', 'x0', E^.R^.Num, E^.Bin = boMod);
           end
           else
           begin
@@ -23749,18 +23770,18 @@ else if E^.Name = 'rt_high' then
                 end;
               boDiv:
                 begin
-                  Line('  mov x1, x0');
-                  Ppop('x0');
-                  EmitDivCheck;
-                  Line('  sdiv x0, x0, x1');
+                  { the dividend popped into x1, the divisor where it
+                    is, where a move put it in x1 first (P356) }
+                  Ppop('x1');
+                  EmitDivCheck('x0');
+                  Line('  sdiv x0, x1, x0');
                 end;
               boMod:
                 begin
-                  Line('  mov x1, x0');
-                  Ppop('x0');
-                  EmitDivCheck;
-                  Line('  sdiv x9, x0, x1');
-                  Line('  msub x0, x9, x1, x0');
+                  Ppop('x1');
+                  EmitDivCheck('x0');
+                  Line('  sdiv x9, x1, x0');
+                  Line('  msub x0, x9, x0, x1');
                 end;
               boEq: EmitCmp('sete');
               boNe: EmitCmp('setne');
@@ -24671,7 +24692,7 @@ else if E^.Name = 'rt_high' then
         else if DivConstOK(E) then
         begin
           EmitExpr(E^.L);
-          EmitDivConst('%rax', E^.R^.Num, E^.Bin = boMod);
+          EmitDivConst('%rax', '%rax', E^.R^.Num, E^.Bin = boMod);
         end
         else
         begin
@@ -24746,14 +24767,14 @@ else if E^.Name = 'rt_high' then
               begin
                 Line('  movq %rax, %rcx');
                 Line('  popq %rax');
-                EmitDivCheck;
+                EmitDivCheck('rcx');
                 SignedDiv(E, False);
               end;
             boMod:
               begin
                 Line('  movq %rax, %rcx');
                 Line('  popq %rax');
-                EmitDivCheck;
+                EmitDivCheck('rcx');
                 SignedDiv(E, True);
                 Line('  movq %rdx, %rax');
               end;
@@ -28323,7 +28344,7 @@ var
   ok, skip: Boolean;
   k: Int64;
   t: PExpr;
-  zt, fz, oz: LongInt;
+  zt, fz, oz, was: LongInt;
 begin
   r := OrdPool(D);
   skip := FSkipCanon;
@@ -28596,7 +28617,21 @@ begin
         end
         else
         begin
-          EmitOrdTo(E^.L, D);
+          { a division's dividend straight into rax (DivInRax, P356) }
+          if DivInRax(E) then
+          begin
+            OpLineIn(E^.L, was);
+            if E^.L^.Kind = ekVar then
+            begin
+              ok := WordVar(E^.L, s);
+              LoadWordVar(s, 'rax');
+            end
+            else
+              WordLoad(EmitWordMem(E^.L, D), LoadTyp(E^.L), 'rax');
+            FOpLine := was;
+          end
+          else
+            EmitOrdTo(E^.L, D);
           if FArm then
             EmitOrdBinArm(E, D)
           else
@@ -28607,14 +28642,20 @@ begin
     Die('internal error: not an integer expression');
   end;
   { A narrow operation in the pool (P100): cleaned in its register,
-    unless a store of its own width takes it, which truncates anyway. }
+    unless a store of its own width takes it, which truncates anyway;
+    in its reader's where a division left it there (P356). }
   if NarrowOp(E) and not KeepsClean(E) and not skip then
-    CanonReg(r, E^.Typ);
+  begin
+    if (E = FDivTop) and FDivLanded then
+      CanonReg(FDivDest, E^.Typ)
+    else
+      CanonReg(r, E^.Typ);
+  end;
 end;
 
 procedure TEmitter.EmitOrdBinAmd(E: PExpr; D: LongInt);
 var
-  r, op, cc: string;
+  r, op, cc, dst: string;
   w: LongInt;
 begin
   r := '%' + OrdPool(D);
@@ -28692,18 +28733,21 @@ begin
       end;
     boDiv, boMod:
       if DivConstOK(E) then
-        EmitDivConst(r, E^.R^.Num, E^.Bin = boMod)
+        EmitDivConst(r, '%' + DivOut(E, D), E^.R^.Num, E^.Bin = boMod)
       else
       begin
         op := OrdOperand(E^.R, D);
         Line('  movq ' + op + ', %rcx');
-        Line('  movq ' + r + ', %rax');
-        EmitDivCheck;
+        { the dividend is in rax already when EmitOrdTo put it there (P356) }
+        if not DivInRax(E) then
+          Line('  movq ' + r + ', %rax');
+        EmitDivCheck('rcx');
         SignedDiv(E, E^.Bin = boMod);
-        if E^.Bin = boDiv then
-          Line('  movq %rax, ' + r)
-        else
-          Line('  movq %rdx, ' + r);
+        dst := DivOut(E, D);
+        if E^.Bin = boMod then
+          Line('  movq %rdx, %' + dst)
+        else if dst <> 'rax' then
+          Line('  movq %rax, %' + dst);
       end;
     boMul:
       begin
@@ -28798,19 +28842,22 @@ begin
       end;
     boDiv, boMod:
       if DivConstOK(E) then
-        EmitDivConst(r, E^.R^.Num, E^.Bin = boMod)
+        EmitDivConst(r, DivOut(E, D), E^.R^.Num, E^.Bin = boMod)
       else
       begin
+        { the check, sdiv and msub on the operands' own registers, as
+          go1.27.2 writes CBZ R3; SDIV R3, R4, R27; MSUB R3, R4, R27, R0,
+          where the dividend and the divisor went to x0 and x1 first;
+          x16 for the quotient of a remainder, which OrdOperand never
+          gives (P356) }
         op := OrdOperand(E^.R, D);
-        Line('  mov x1, ' + op);
-        Line('  mov x0, ' + r);
-        EmitDivCheck;
+        EmitDivCheck(op);
         if E^.Bin = boDiv then
-          Line('  sdiv ' + r + ', x0, x1')
+          Line('  sdiv ' + DivOut(E, D) + ', ' + r + ', ' + op)
         else
         begin
-          Line('  sdiv x17, x0, x1');
-          Line('  msub ' + r + ', x17, x1, x0');
+          Line('  sdiv x16, ' + r + ', ' + op);
+          Line('  msub ' + DivOut(E, D) + ', x16, ' + op + ', ' + r);
         end;
       end;
     boMul, boAnd, boOr, boXor:
@@ -28923,10 +28970,11 @@ end;
 
 { X (a register, '%rsi' or 'x9' style, rax or x0 allowed) := X div C or
   X mod C, for C >= 1. amd64 uses rax, rcx and rdx; arm64 x16 and x17. }
-procedure TEmitter.EmitDivConst(const X: string; C: Int64; IsMod: Boolean);
+procedure TEmitter.EmitDivConst(const X, Dst: string; C: Int64; IsMod: Boolean);
 var
   k, sh, f, i, o: LongInt;
   m: Int64;
+  src: string;
 begin
   k := Pow2Log(C);
   if FArm then
@@ -28934,22 +28982,33 @@ begin
     if C = 1 then
     begin
       if IsMod then
-        Line('  mov ' + X + ', xzr');
+        Line('  mov ' + Dst + ', xzr')
+      else if Dst <> X then
+        Line('  mov ' + Dst + ', ' + X);
       Exit;
     end;
+    { the last step writes Dst, where a mov from x16 followed (P356) }
     if k > 0 then
     begin
       Line('  asr x16, ' + X + ', #63');
       Line('  lsr x16, x16, #' + IntToStr(64 - k));
       Line('  add x16, ' + X + ', x16');
-      Line('  asr x16, x16, #' + IntToStr(k));
       if IsMod then
       begin
-        Line('  lsl x16, x16, #' + IntToStr(k));
-        Line('  sub ' + X + ', ' + X + ', x16');
+        { the sum with its low k bits cleared, one AND of a logical
+          immediate (ARM DDI 0487 M.c C6.2.12), where an ASR and an LSL
+          were two }
+        if ArmLogImm(-(Int64(1) shl k)) then
+          Line('  and x16, x16, #' + HexWord(-(Int64(1) shl k)))
+        else
+        begin
+          Line('  asr x16, x16, #' + IntToStr(k));
+          Line('  lsl x16, x16, #' + IntToStr(k));
+        end;
+        Line('  sub ' + Dst + ', ' + X + ', x16');
       end
       else
-        Line('  mov ' + X + ', x16');
+        Line('  asr ' + Dst + ', x16, #' + IntToStr(k));
       Exit;
     end;
     SMagic64(C, m, sh);
@@ -28968,55 +29027,76 @@ begin
       if sh > 0 then
         Line('  asr x16, x16, #' + IntToStr(sh));
     end;
-    Line('  sub x16, x16, ' + X + ', asr #63');
     if IsMod then
-      ScaleSubArm(X, X, 'x16', C, 'x17')
+    begin
+      Line('  sub x16, x16, ' + X + ', asr #63');
+      ScaleSubArm(Dst, X, 'x16', C, 'x17');
+    end
     else
-      Line('  mov ' + X + ', x16');
+      Line('  sub ' + Dst + ', x16, ' + X + ', asr #63');
     Exit;
   end;
   if C = 1 then
   begin
     if IsMod then
-      Line('  movq $0, ' + X);
+      Line('  movq $0, ' + Dst)
+    else if Dst <> X then
+      Line('  movq ' + X + ', ' + Dst);
     Exit;
   end;
-  if X <> '%rcx' then
-    Line('  movq ' + X + ', %rcx');
+  { the dividend read where it is, rcx for rax alone, which imulq takes
+    (P356) }
+  src := X;
+  if X = '%rax' then
+  begin
+    Line('  movq %rax, %rcx');
+    src := '%rcx';
+  end;
   if k > 0 then
   begin
-    Line('  movq %rcx, %rdx');
+    Line('  movq ' + src + ', %rdx');
     Line('  sarq $63, %rdx');
     Line('  shrq $' + IntToStr(64 - k) + ', %rdx');
-    Line('  addq %rcx, %rdx');
-    Line('  sarq $' + IntToStr(k) + ', %rdx');
+    Line('  addq ' + src + ', %rdx');
     if IsMod then
     begin
-      Line('  shlq $' + IntToStr(k) + ', %rdx');
-      Line('  subq %rdx, %rcx');
-      Line('  movq %rcx, ' + X);
+      { the quotient times 2^k is the sum with its low k bits cleared,
+        one AND, as go1.27.2 writes ANDQ $-8 for x % 8 (P356) }
+      if k <= 31 then
+        Line('  andq $' + IntToStr(-(Int64(1) shl k)) + ', %rdx')
+      else
+      begin
+        Line('  sarq $' + IntToStr(k) + ', %rdx');
+        Line('  shlq $' + IntToStr(k) + ', %rdx');
+      end;
+      Line('  subq %rdx, ' + src);
+      if src <> Dst then
+        Line('  movq ' + src + ', ' + Dst);
     end
     else
-      Line('  movq %rdx, ' + X);
+    begin
+      Line('  sarq $' + IntToStr(k) + ', %rdx');
+      Line('  movq %rdx, ' + Dst);
+    end;
     Exit;
   end;
   SMagic64(C, m, sh);
   if (m and 1) = 0 then
   begin
     Line('  movabsq $' + IntToStr(m shr 1) + ', %rax');
-    Line('  imulq %rcx');
+    Line('  imulq ' + src);
     if sh > 1 then
       Line('  sarq $' + IntToStr(sh - 1) + ', %rdx');
   end
   else
   begin
     Line('  movabsq $' + IntToStr(m) + ', %rax');
-    Line('  imulq %rcx');
-    Line('  addq %rcx, %rdx');
+    Line('  imulq ' + src);
+    Line('  addq ' + src + ', %rdx');
     if sh > 0 then
       Line('  sarq $' + IntToStr(sh) + ', %rdx');
   end;
-  Line('  movq %rcx, %rax');
+  Line('  movq ' + src + ', %rax');
   Line('  sarq $63, %rax');
   Line('  subq %rax, %rdx');
   if IsMod then
@@ -29033,11 +29113,12 @@ begin
       Line('  movabsq $' + IntToStr(C) + ', %rax');
       Line('  imulq %rax, %rdx');
     end;
-    Line('  subq %rdx, %rcx');
-    Line('  movq %rcx, ' + X);
+    Line('  subq %rdx, ' + src);
+    if src <> Dst then
+      Line('  movq ' + src + ', ' + Dst);
   end
   else
-    Line('  movq %rdx, ' + X);
+    Line('  movq %rdx, ' + Dst);
 end;
 
 { Word loads and stores (P94). A value of one word or one byte (an
@@ -31730,7 +31811,17 @@ begin
       Exit;
     end;
     FSkipCanon := (TSize(E^.Typ) = TSize(s.Typ)) and (s.Reg = '');
+    { a division at the top into a word variable a register keeps (P356) }
+    if (s.Reg <> '') and (TSize(s.Typ) = 8) then
+    begin
+      FDivTop := E;
+      FDivDest := s.Reg;
+      FDivLanded := False;
+    end;
     EmitOrdTo(E, 0);
+    FDivTop := nil;
+    if (s.Reg <> '') and (TSize(s.Typ) = 8) and FDivLanded then
+      Exit;
     StoreWordVar(s, OrdPool(0));
     Exit;
   end;
@@ -31881,7 +31972,17 @@ begin
     FPool0 := '';
     Exit;
   end;
+  { a division at the top into the variable's register (P356) }
+  if (dst.Reg <> '') and (TSize(dst.Typ) = 8) then
+  begin
+    FDivTop := e;
+    FDivDest := dst.Reg;
+    FDivLanded := False;
+  end;
   EmitOrdTo(e, 0);
+  FDivTop := nil;
+  if (dst.Reg <> '') and (TSize(dst.Typ) = 8) and FDivLanded then
+    Exit;
   StorePlainFrom(dst, OrdPool(0));
 end;
 
@@ -32323,22 +32424,69 @@ begin
   Line(done + ':');
 end;
 
-{ The divisor is zero: rt_divzero, out of line (P299). }
-procedure TEmitter.EmitDivCheck;
+{ The divisor, in register R (rcx on amd64, any on arm64, P356), is
+  zero: rt_divzero, out of line (P299). }
+procedure TEmitter.EmitDivCheck(const R: string);
 begin
   if FArm then
   begin
-    ColdBegin('  cbz x1,');
+    ColdBegin('  cbz ' + R + ',');
     Line('  bl rt_divzero');
     ColdEnd;
   end
   else
   begin
-    Line('  testq %rcx, %rcx');
+    Line('  testq %' + R + ', %' + R);
     ColdBegin('  jz');
     Line('  call rt_divzero');
     ColdEnd;
   end;
+end;
+
+{ The register a division E worked out in pool register D leaves its
+  value in (P356): its reader's, FDivDest, when E is the expression that
+  reader takes (an argument's register, a register variable's), else
+  the pool's; Go's allocator gives a division's value the register its
+  use wants and no move follows (go1.27.2's arm64 MSUB R3, R4, R27, R0
+  into an argument's register). }
+function TEmitter.DivOut(E: PExpr; D: LongInt): string;
+begin
+  Result := OrdPool(D);
+  if (E = FDivTop) and (D = 0) and (FDivDest <> '') then
+  begin
+    Result := FDivDest;
+    FDivLanded := True;
+  end;
+end;
+
+{ amd64: OrdOperand gives E with no code and leaves rax alone: a
+  constant of 32 bits, a word variable of 8 bytes at its home, one a
+  register keeps (P356). }
+function TEmitter.QuietOp(E: PExpr): Boolean;
+var
+  s: TSym;
+begin
+  Result := False;
+  if E = nil then
+    Exit;
+  if E^.Kind = ekInt then
+    Result := Fits32(E^.Num)
+  else if E^.Kind = ekVar then
+    Result := WordVar(E, s) and ((TSize(s.Typ) = 8) or (s.Reg <> ''));
+end;
+
+{ amd64: the division or remainder E by no constant, worked out in the
+  pool, takes its dividend straight into rax, where idivq reads it: a
+  variable or a load, with a divisor OrdOperand gives with no code
+  (QuietOp), as go1.27.2 writes MOVQ main.k(SB), AX before IDIVQ (P356);
+  the dividend went to the pool's register and a move to rax. }
+function TEmitter.DivInRax(E: PExpr): Boolean;
+var
+  s: TSym;
+begin
+  Result := (not FArm) and (E <> nil) and (E^.Kind = ekBin) and
+    ((E^.Bin = boDiv) or (E^.Bin = boMod)) and not DivConstOK(E) and (E^.L <> nil) and
+    (((E^.L^.Kind = ekVar) and WordVar(E^.L, s)) or LoadKind(E^.L)) and QuietOp(E^.R);
 end;
 
 { P87: an index out of range stops the program, inline where the check
