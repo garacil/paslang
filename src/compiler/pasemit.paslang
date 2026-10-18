@@ -698,6 +698,7 @@ type
     function LeftSrc: string;
     procedure ValPair(E: PExpr; const R0, R1: string);
     procedure PutArgsKept(const Args: TExprArray; Comp, Reg0: LongInt);
+    function KeptStore(Dest: PExpr): Boolean;
     function RealBin(E: PExpr): Boolean;
     procedure EmitRealBin(E: PExpr);
     procedure RealIntCheck;
@@ -12264,6 +12265,18 @@ begin
   end;
 end;
 
+{ P330: Dest is a place whose address calls nothing (a variable, a
+  field, an element, a pointer's target), stored outside a region and a
+  routine with no frame, whose r9 to r11 and x19 up hold variables, and
+  on arm64 no slice, whose third word has no free register: the value's
+  words may wait in registers while the address is worked out. }
+function TEmitter.KeptStore(Dest: PExpr): Boolean;
+begin
+  Result := (Dest <> nil) and ((Dest^.Kind = ekVar) or (Dest^.Kind = ekField) or
+    (Dest^.Kind = ekIndex) or (Dest^.Kind = ekDeref)) and (not EHasCall(Dest)) and
+    (not FPromoOn) and (not FFlat) and not (FArm and IsDyn(Dest^.Typ));
+end;
+
 procedure TEmitter.StoreTo(Dest: PExpr);
 var
   sym, smap: string;
@@ -12523,6 +12536,16 @@ begin
     begin
       if IsStr(Dest^.Typ) then
         ShareStr;
+      if KeptStore(Dest) then
+      begin
+        { P330: the two words in x8 and x27, which no address's code
+          touches, then one stp: nothing pushed }
+        Line('  mov x8, x0');
+        Line('  mov x27, x2');
+        EmitAddr(Dest);
+        Line('  stp x8, x27, [x0]');
+        Exit;
+      end;
       PshK('x2', VCls(Dest^.Typ, 1));
       PshK('x0', VCls(Dest^.Typ, 0));
       EmitAddr(Dest);
@@ -12530,6 +12553,14 @@ begin
       Line('  str x1, [x0]');
       Ppop('x1');
       Line('  str x1, [x0, #8]');
+    end
+    else if KeptStore(Dest) and not ((Dest^.Kind = ekIndex) and (Dest^.L <> nil) and
+      IsStr(Dest^.L^.Typ)) then
+    begin
+      { P330: a word or less in x8 while the address is worked out }
+      Line('  mov x8, x0');
+      EmitAddr(Dest);
+      StoreFrom('[x0]', TSize(LoadTyp(Dest)), 'x8');
     end
     else
     begin
@@ -12548,6 +12579,26 @@ begin
   begin
     if IsStr(Dest^.Typ) then
       ShareStr;
+    if KeptStore(Dest) then
+    begin
+      { P330: the words in r11, r10 and r9 while the place's address is
+        worked out with the pool's first three registers (PoolSize's cap,
+        P297), then stored: two or three stores where the pushes, the
+        pops and their moves were six or nine }
+      Line('  movq %rax, %r11');
+      Line('  movq %rdx, %r10');
+      if IsDyn(Dest^.Typ) then
+        Line('  movq %r8, %r9');
+      k := FPoolCap;
+      FPoolCap := 3;
+      EmitAddr(Dest);
+      FPoolCap := k;
+      Line('  movq %r11, (%rax)');
+      Line('  movq %r10, 8(%rax)');
+      if IsDyn(Dest^.Typ) then
+        Line('  movq %r9, 16(%rax)');
+      Exit;
+    end;
     if IsDyn(Dest^.Typ) then
       PushK('r8', VCls(Dest^.Typ, 2));
     PushK('rdx', VCls(Dest^.Typ, 1));
@@ -12593,6 +12644,17 @@ begin
     end;
     Line('.stdone' + IntToStr(FLab) + ':');
     Inc(FLab);
+  end
+  else if KeptStore(Dest) and not ((Dest^.Kind = ekIndex) and (Dest^.L <> nil) and
+    IsStr(Dest^.L^.Typ)) then
+  begin
+    { P330: a word or less in r11 while the address is worked out }
+    Line('  movq %rax, %r11');
+    k := FPoolCap;
+    FPoolCap := 3;
+    EmitAddr(Dest);
+    FPoolCap := k;
+    StoreFrom('(%rax)', TSize(LoadTyp(Dest)), 'r11');
   end
   else if TSize(LoadTyp(Dest)) < 8 then
   begin

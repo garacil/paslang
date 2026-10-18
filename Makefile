@@ -391,6 +391,9 @@ GOLDEN_A64 += callexpr
 # P327: a for loop whose body calls reads its counter once a pass.
 GOLDEN += forstep
 GOLDEN_A64 += forstep
+# P330: a value goes to its place without the stack.
+GOLDEN += twostore
+GOLDEN_A64 += twostore
 # P333: an exec and a new thread do not race (amd64: qemu-user does not
 # execve an arm64 program, so arm64 reads the runtime's forms).
 GOLDEN += execrace
@@ -2595,6 +2598,13 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/forstep.out $(BUILDDIR)/forstep0.got; \
 	python3 -I scripts/check_forstep.py $(BUILDDIR)/forstep0.s --loops=4; \
 	echo ok forstep-asm; \
+	: a value stored from registers while its place is worked out, P330: twostore with and without inlining; \
+	python3 -I scripts/check_twostore.py $(BUILDDIR)/twostore.s; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/twostore0 testdata/twostore.paslang; \
+	$(BUILDDIR)/twostore0 > $(BUILDDIR)/twostore0.got; \
+	diff -u testdata/twostore.out $(BUILDDIR)/twostore0.got; \
+	python3 -I scripts/check_twostore.py $(BUILDDIR)/twostore0.s; \
+	echo ok twostore-asm; \
 	: the exec lock around a new thread and an execve, clone again on EAGAIN, P333: the runtime in execrace; \
 	python3 -I scripts/check_execlock.py $(BUILDDIR)/execrace.s; \
 	echo ok execlock-asm; \
@@ -3871,6 +3881,13 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	diff -u testdata/forstep.out $(BUILDDIR)/forstep0-arm.got; \
 	python3 -I scripts/check_forstep.py $(BUILDDIR)/forstep0-arm.s --arm --loops=3; \
 	echo ok forstep-arm-asm; \
+	: P330 on arm64: twostore with and without inlining, one stp of x8 and x27; \
+	python3 -I scripts/check_twostore.py $(BUILDDIR)/twostore-arm.s --arm; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/twostore0-arm testdata/twostore.paslang; \
+	timeout 300 $(QEMU_A64) $(BUILDDIR)/twostore0-arm > $(BUILDDIR)/twostore0-arm.got; \
+	diff -u testdata/twostore.out $(BUILDDIR)/twostore0-arm.got; \
+	python3 -I scripts/check_twostore.py $(BUILDDIR)/twostore0-arm.s --arm; \
+	echo ok twostore-arm-asm; \
 	: P333 on arm64: the runtime of execrace, the exec lock around a new thread and an execve; \
 	$(OUTDIR)/paslangc -target arm64 -cpu max -Fu $(A64DIR) -o $(BUILDDIR)/execrace-arm testdata/execrace.paslang; \
 	python3 -I scripts/check_execlock.py $(BUILDDIR)/execrace-arm.s --arm; \
