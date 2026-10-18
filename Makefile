@@ -2460,6 +2460,13 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 $$w timeout 120 $(BUILDDIR)/asyncleaf > $(BUILDDIR)/asyncleaf-gc.got; \
 	  diff -u testdata/asyncleaf.out $(BUILDDIR)/asyncleaf-gc.got; \
 	done; \
+	: a stop loads each vector register no wider than its saved bits ask, a movq for one with nothing from bit 64 on, so Zen still knows its upper bits clear, AMD 56305 2.11.5, P344; \
+	test $$(awk '/^rt_asyncpreempt:/,/^rt_sigurg:/' $(BUILDDIR)/asyncgc.s | grep -cE '^  v?movq [0-9]+\(%rdx\), %xmm') -eq 16 || { echo "asyncgc.s: rt_asyncpreempt does not load its registers by movq"; exit 1; }; \
+	test $$(awk '/^rt_yieldpoint:/,/^rt_xget:/' $(BUILDDIR)/asyncgc.s | grep -cE '^  v?movq [0-9]+\(%rdx\), %xmm') -eq 16 || { echo "asyncgc.s: rt_yieldpoint does not load its registers by movq"; exit 1; }; \
+	$(OUTDIR)/paslangc -cpu base -o $(BUILDDIR)/asyncgc-base testdata/asyncgc.paslang; \
+	test $$(awk '/^rt_asyncpreempt:/,/^rt_sigurg:/' $(BUILDDIR)/asyncgc-base.s | grep -cE '^  movq [0-9]+\(%rdx\), %xmm') -eq 16 || { echo "asyncgc-base.s: rt_asyncpreempt does not load its registers by movq"; exit 1; }; \
+	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 timeout 300 $(BUILDDIR)/asyncgc-base > $(BUILDDIR)/asyncgc-base.got; \
+	diff -u testdata/asyncgc.out $(BUILDDIR)/asyncgc-base.got; \
 	echo ok async-asm; \
 	: c + k * x and y + k * x are one lea, x := x + k * y one lea on the register of x, r13 and rbp are never the base of a lea with an index, and a load at p - k takes the offset, P294; \
 	awk '/^p_off8:/,/cfi_endproc/' $(BUILDDIR)/leaform.s > $(BUILDDIR)/leaform-off8.s; \
