@@ -316,6 +316,9 @@ GOLDEN_A64 += pokewait
 # Ps, one poller, a deadline's timer off the P that holds it.
 GOLDEN += ptimers
 GOLDEN_A64 += ptimers
+# P345: a global only the main block names lets its value go after its last use.
+GOLDEN += mainlive
+GOLDEN_A64 += mainlive
 # P354: a routine's record keeps no saved register once it is loaded back.
 GOLDEN += gstale
 GOLDEN_A64 += gstale
@@ -3975,12 +3978,12 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	diff -u testdata/elemop.out $(BUILDDIR)/elemop0-arm.got; \
 	python3 -I scripts/check_elemop.py $(BUILDDIR)/elemop0-arm.s --arm --pairs=12; \
 	echo ok elemop-arm-asm; \
-	: P331 on arm64: globfold with and without inlining, a global by adrp and the low twelve bits; \
-	python3 -I scripts/check_adrpfold.py $(BUILDDIR)/globfold-arm.s --folds=32; \
+	: P331 on arm64: globfold with and without inlining, a global by adrp and the low twelve bits, two reads fewer since gp goes to nil after its last use and they come from a register, P345; \
+	python3 -I scripts/check_adrpfold.py $(BUILDDIR)/globfold-arm.s --folds=30; \
 	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/globfold0-arm testdata/globfold.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/globfold0-arm > $(BUILDDIR)/globfold0-arm.got; \
 	diff -u testdata/globfold.out $(BUILDDIR)/globfold0-arm.got; \
-	python3 -I scripts/check_adrpfold.py $(BUILDDIR)/globfold0-arm.s --folds=23; \
+	python3 -I scripts/check_adrpfold.py $(BUILDDIR)/globfold0-arm.s --folds=21; \
 	echo ok globfold-arm-asm; \
 	: P346 on arm64: exc with and without inlining, a line label in no global fold of P331; \
 	python3 -I scripts/check_adrpfold.py $(BUILDDIR)/exc-arm.s --folds=1; \

@@ -254,7 +254,13 @@ conservatively, word by word, and does not move what it finds that way.
 4. **Roots.** Globals: the compiler writes, for the program and each
    unit, a table of (address, size, pointer bitmap) of its variables in
    a section `pasgcroots`, which the linker gathers
-   (`__start_pasgcroots`, `__stop_pasgcroots`). Every routine record: its
+   (`__start_pasgcroots`, `__stop_pasgcroots`). A global of the program
+   that only the main block names and whose address nobody takes, a
+   string, a dynamic array, a map, an object or a pointer, is set to nil
+   after the last statement of the main block that names it (P345), as
+   Go's liveness gives a local of main dead after its last use
+   (cmd/compile/internal/liveness/plive.go): its root keeps nothing from
+   then on. Every routine record: its
    argument and saved-register words, through a list of all records
    (Go's `allgs`). Every stack: see D1. The runtime's one heap pointer
    of its own is in the routine record, which is read whole: the object

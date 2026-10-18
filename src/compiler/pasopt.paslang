@@ -95,6 +95,9 @@ type
     function ReachesOutE(E: PExpr): Boolean;
     function ReachesOut(S: PStmt): Boolean;
     function MainOwned(const N: string): Boolean;
+    function NamesS(S: PStmt; const N: string): Boolean;
+    function HoldsRef(T: LongInt): Boolean;
+    procedure DropDead(Blk: PStmt);
     function HasAsmS(S: PStmt): Boolean;
     function InList(const L: TStrArray; const N: string): Boolean;
     function AddStmt(Blk: PStmt; St: PStmt): PStmt;
@@ -1585,6 +1588,99 @@ begin
   Result := g;
 end;
 
+{ P345: S names N, as ReachS with every name reads it (the routines'
+  names for MainOwned came from it). }
+function TOpt.NamesS(S: PStmt; const N: string): Boolean;
+var
+  keep: TStrArray;
+begin
+  keep := FReach;
+  FReach := nil;
+  ReachS(S, True);
+  Result := InList(FReach, ToLower(N));
+  FReach := keep;
+end;
+
+{ A value of type T is a reference the collector follows and nil can
+  take its place: a string, a dynamic array, a map, an object, a
+  pointer. }
+function TOpt.HoldsRef(T: LongInt): Boolean;
+var
+  k: TTypeKind;
+begin
+  Result := False;
+  if (T < 0) or (T > High(FProg^.Types)) then
+    Exit;
+  k := FProg^.Types[T].Kind;
+  Result := (k = tykString) or (k = tykMap) or (k = tykClass) or (k = tykPointer) or
+    ((k = tykArray) and (FProg^.Types[T].Hi < FProg^.Types[T].Lo));
+end;
+
+{ P345: the main block's globals that no routine names (MainOwned) and
+  whose value is a reference let it go after the last statement of the
+  block that names them: an assignment of nil, or of '' for a string,
+  right after it, so the collector, which reads the globals as roots,
+  no longer keeps what it pointed to. Go's liveness gives a local of
+  main dead after its last use and its stack maps stop keeping it
+  (cmd/compile/internal/liveness/plive.go); a program's variables here
+  are globals, so b36unbind's items, ten megabytes JsonEncode had read
+  once, stayed a root through the twenty decodes after. Only the block's
+  own statements count: one that names it inside a loop or a branch is
+  that whole statement, and paslang has no goto to come back. Not under
+  -debug, whose debugger shows the variables. }
+procedure TOpt.DropDead(Blk: PStmt);
+var
+  i, j, last: SizeInt;
+  v: string;
+  t: LongInt;
+  st: PStmt;
+  outs: TStmtArray;
+  adds: array of TStmtArray;
+begin
+  if (Blk = nil) or (Blk^.Kind <> skBlock) or (Length(Blk^.Stmts) < 2) then
+    Exit;
+  adds := nil;
+  SetLength(adds, Length(Blk^.Stmts));
+  for i := 0 to High(FProg^.Vars) do
+  begin
+    v := FProg^.Vars[i].Name;
+    t := FProg^.Vars[i].Typ;
+    if FProg^.Vars[i].Ext or FProg^.Vars[i].Alias or (FProg^.Vars[i].Init <> '') or
+      (not HoldsRef(t)) or (not MainOwned(v)) then
+      Continue;
+    last := -1;
+    for j := 0 to High(Blk^.Stmts) do
+      if NamesS(Blk^.Stmts[j], v) then
+        last := j;
+    if (last < 0) or (last >= High(Blk^.Stmts)) then
+      Continue;
+    st := NewStmt(skAssign);
+    st^.Line := Blk^.Stmts[last]^.Line;
+    st^.Dest := NewVar(v, t);
+    if FProg^.Types[t].Kind = tykString then
+      st^.E := NewStr('')
+    else
+    begin
+      st^.E := NewNil;
+      st^.E^.Typ := t;
+    end;
+    SetLength(adds[last], Length(adds[last]) + 1);
+    adds[last][High(adds[last])] := st;
+  end;
+  outs := nil;
+  for i := 0 to High(Blk^.Stmts) do
+  begin
+    SetLength(outs, Length(outs) + 1);
+    outs[High(outs)] := Blk^.Stmts[i];
+    for j := 0 to High(adds[i]) do
+    begin
+      SetLength(outs, Length(outs) + 1);
+      outs[High(outs)] := adds[i][j];
+    end;
+  end;
+  Blk^.Stmts := outs;
+end;
+
 function TOpt.UnrollAt(S: PStmt): PStmt;
 var
   a, b, cnt, k, sz: Int64;
@@ -2267,6 +2363,10 @@ begin
     Prog.InitBody := FoldStmt(Prog.InitBody);
     Prog.FiniBody := FoldStmt(Prog.FiniBody);
   end;
+  { P345: the main block's own globals let their values go after their
+    last use }
+  if (not Prog.IsUnit) and (not Prog.Debug) and (not FAnyAsm) then
+    DropDead(Prog.Body);
 end;
 
 procedure Optimize(var Prog: TProgram);
