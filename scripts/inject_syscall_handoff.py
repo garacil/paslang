@@ -99,11 +99,24 @@ if saved_stack is not None:
     gdb.selected_inferior().write_memory(registers[sp] - 8, saved_stack)
 if not arm:
     gdb.execute("set scheduler-locking off")
-exiting = gdb.Breakpoint("rt_exit", internal=True)
-gdb.execute("continue")
-code = value("$x0" if arm else "$rdi")
-if exiting.hit_count != 1 or code != 0:
-    raise gdb.GdbError(f"handoff fixture did not finish successfully: {code}")
-exiting.delete()
-gdb.execute("detach")
+# Under QEMU the program's exit ends the run, not a breakpoint at rt_exit
+# (P348): QEMU's user-mode stub stops only the thread that stops
+# (gdbstub/user.c, gdb_handlesig), the others run on, and a last stop in
+# rt_exit, in whichever thread reached it, made gdb 18.1 crash or lose
+# QEMU as the process ended under it, 3 runs of 1800 with four busy loops
+# on one processor; gdb keeps the exit's status in $_exitcode. A native
+# gdb stops every thread at a breakpoint (all-stop), so amd64 stops there.
+if arm:
+    gdb.execute("continue")
+    code = gdb.parse_and_eval("$_exitcode")
+    if code.type.code == gdb.TYPE_CODE_VOID or int(code) != 0:
+        raise gdb.GdbError(f"handoff fixture did not finish successfully: {code}")
+else:
+    exiting = gdb.Breakpoint("rt_exit", internal=True)
+    gdb.execute("continue")
+    code = value("$rdi")
+    if exiting.hit_count != 1 or code != 0:
+        raise gdb.GdbError(f"handoff fixture did not finish successfully: {code}")
+    exiting.delete()
+    gdb.execute("detach")
 gdb.write("pending syscall handoff and genuine deadlock passed\n")

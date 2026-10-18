@@ -131,17 +131,32 @@ gdb.write("the name's query became getpid\n")
 
 # A second query would mean the resolver asked again past the deadline.
 again = gdb.Breakpoint(send_line, internal=True)
-exiting = gdb.Breakpoint("rt_exit", internal=True)
-gdb.execute("continue")
-if gdb.selected_inferior().pid == 0:
-    # Halt leaves without rt_exit; gdb keeps the status in $_exitcode.
-    raise gdb.GdbError(f"fixture exited with {int(gdb.parse_and_eval('$_exitcode'))}")
-code = int(gdb.parse_and_eval("$x0" if arm else "$rdi"))
-if again.hit_count != 0:
-    raise gdb.GdbError("the resolver asked again after its deadline")
-if exiting.hit_count != 1 or code != 0:
-    raise gdb.GdbError(f"fixture did not reach successful exit: {code}")
-exiting.delete()
-again.delete()
-gdb.execute("detach")
+# Under QEMU the program's exit ends the run, not a breakpoint at rt_exit
+# (P348): QEMU's user-mode stub stops only the thread that stops
+# (gdbstub/user.c, gdb_handlesig), the others run on, and a last stop in
+# rt_exit, in whichever thread reached it, made gdb 18.1 crash or lose
+# QEMU as the process ended under it, 3 runs of 1800 with four busy loops
+# on one processor; gdb keeps the exit's status in $_exitcode. A native
+# gdb stops every thread at a breakpoint (all-stop), so amd64 stops there.
+if arm:
+    gdb.execute("continue")
+    if gdb.selected_inferior().pid != 0 or again.hit_count != 0:
+        raise gdb.GdbError("the resolver asked again after its deadline")
+    code = gdb.parse_and_eval("$_exitcode")
+    if code.type.code == gdb.TYPE_CODE_VOID or int(code) != 0:
+        raise gdb.GdbError(f"fixture did not reach successful exit: {code}")
+else:
+    exiting = gdb.Breakpoint("rt_exit", internal=True)
+    gdb.execute("continue")
+    if gdb.selected_inferior().pid == 0:
+        # Halt leaves without rt_exit; gdb keeps the status in $_exitcode.
+        raise gdb.GdbError(f"fixture exited with {int(gdb.parse_and_eval('$_exitcode'))}")
+    code = int(gdb.parse_and_eval("$rdi"))
+    if again.hit_count != 0:
+        raise gdb.GdbError("the resolver asked again after its deadline")
+    if exiting.hit_count != 1 or code != 0:
+        raise gdb.GdbError(f"fixture did not reach successful exit: {code}")
+    exiting.delete()
+    again.delete()
+    gdb.execute("detach")
 gdb.write("connect EINTR, spurious wake and name deadline passed\n")
