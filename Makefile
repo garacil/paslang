@@ -412,6 +412,9 @@ GOLDEN_A64 += unrollctr
 # P325: a var parameter through a routine value or a method value.
 GOLDEN += varvalue
 GOLDEN_A64 += varvalue
+# P339: a token at the end of its line has that line, SrcLine its own.
+GOLDEN += lineend
+GOLDEN_A64 += lineend
 # P338: a routine value, a method value and an interface take their kind.
 GOLDEN += valkinds
 GOLDEN_A64 += valkinds
@@ -1046,7 +1049,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  'bindrfc:json rfc3339 takes a TDateTime, a Double, not Integer at 4:16' \
 	  'bindtwice:json omitzero twice at 4:30' \
 	  "bindempty:a json name is not empty: leave the name out for the member's own at 4:16" \
-	  "binddup:two members of TR are 'x' in JSON: json 'name' gives one another, json ignore leaves one out at 8:1" \
+	  "binddup:two members of TR are 'x' in JSON: json 'name' gives one another, json ignore leaves one out at 7:1" \
 	  "bindbare:json after a member's type takes its name, a string, or its options at 4:16" \
 	  'bindvariant:a member of a variant part takes json ignore alone: json writes no variant at 5:22' \
 	  "bindvarenc:TR.A is in a variant part and has no JSON form: json ignore on each of the part's fields leaves it out at 10:24" \
@@ -1409,7 +1412,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q '/ does not take a set: +, -, \*, =, <>, <= and >= do at 6:13' $(BUILDDIR)/setbad_divide.err; \
 	grep -q 'S is a const parameter: the routine may not change it' $(BUILDDIR)/setbad_inclconst.err; \
 	grep -q 'a list in brackets holds elements of one kind, not an integer and a Char at 5:16' $(BUILDDIR)/setbad_charint.err; \
-	grep -q 'Integer is no element of set of Char at 8:13' $(BUILDDIR)/setbad_inkind.err; \
+	grep -q 'Integer is no element of set of Char at 7:13' $(BUILDDIR)/setbad_inkind.err; \
 	echo ok setbad; \
 	echo "==== subrange rejects (P135) ===="; \
 	for n in mixed reversed twoenums notfit otherenum intenum charin; do \
@@ -1423,7 +1426,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'constant #120 does not fit TDigit at 7:11' $(BUILDDIR)/subbad_notfit.err; \
 	grep -q 'a list in brackets holds elements of one kind, not TDay and TColor at 9:19' $(BUILDDIR)/subbad_otherenum.err; \
 	grep -q 'Integer is no element of a set of TDay at 7:12' $(BUILDDIR)/subbad_intenum.err; \
-	grep -q 'Char is no element of set of TDay at 11:14' $(BUILDDIR)/subbad_charin.err; \
+	grep -q 'Char is no element of set of TDay at 10:14' $(BUILDDIR)/subbad_charin.err; \
 	echo ok subbad; \
 	echo "==== array index rejects (P161) ===="; \
 	for n in idxreal idxbig idxwide idxrev; do \
@@ -1464,7 +1467,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'FN is strict private to TR at 17:5' $(BUILDDIR)/recbad_strictf.err; \
 	grep -q 'Hidden is strict private to TR at 17:11' $(BUILDDIR)/recbad_strictm.err; \
 	grep -q 'a record.s method is not virtual: a record has no method table at 6:21' $(BUILDDIR)/recbad_virt.err; \
-	grep -q 'a record has no descendants: private, strict private or public at 7:3' $(BUILDDIR)/recbad_prot.err; \
+	grep -q 'a record has no descendants: private, strict private or public at 6:3' $(BUILDDIR)/recbad_prot.err; \
 	grep -q 'a record has no destructor at 6:5' $(BUILDDIR)/recbad_dtor.err; \
 	grep -qF 'missing body of TR.Init at 6:23' $(BUILDDIR)/recbad_clsctor.err; \
 	grep -q 'a record.s class method is static: class function F: T; static; at 6:20' $(BUILDDIR)/recbad_nostat.err; \
@@ -1490,6 +1493,21 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  grep -qF 'Integer does not go into routine at 9:14' $(BUILDDIR)/valkindbad_resproc-$$target.err; \
 	done; \
 	echo ok valkindbad; \
+	echo "==== line end rejects (P339) ===="; \
+	for target in amd64 arm64; do \
+	  for n in bignum strend wordend readvar forvar methname; do \
+	    if $(OUTDIR)/paslangc -target $$target -o $(BUILDDIR)/linebad_$$n-$$target testdata/linebad/$$n.paslang >$(BUILDDIR)/linebad_$$n-$$target.err 2>&1; then \
+	      echo "$$n should fail"; exit 1; \
+	    fi; \
+	  done; \
+	  grep -qF 'constant 99999999999999999999 does not fit Integer at 10:8' $(BUILDDIR)/linebad_bignum-$$target.err; \
+	  grep -qF 'syntax error at 9:5 [abc]' $(BUILDDIR)/linebad_strend-$$target.err; \
+	  grep -qF 'syntax error at 9:5 [abc]' $(BUILDDIR)/linebad_wordend-$$target.err; \
+	  grep -qF 'unknown identifier Nope at 8:10' $(BUILDDIR)/linebad_readvar-$$target.err; \
+	  grep -qF 'unknown identifier Nope at 8:7' $(BUILDDIR)/linebad_forvar-$$target.err; \
+	  grep -qF 'unknown identifier Nope at 14:8' $(BUILDDIR)/linebad_methname-$$target.err; \
+	done; \
+	echo ok linebad; \
 	echo "==== var argument rejects (P325) ===="; \
 	for target in amd64 arm64; do \
 	  for n in constarg exprarg fewargs manyargs; do \
@@ -1590,7 +1608,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'duplicate identifier K (the routine has a constant of the name)' $(BUILDDIR)/scopebad_constvar.err; \
 	grep -q 'duplicate identifier TPoint (the routine has a constant of the name)' $(BUILDDIR)/scopebad_typeconst.err; \
 	grep -q 'duplicate identifier X (the routine has a variable or a parameter of the name)' $(BUILDDIR)/scopebad_procparam.err; \
-	grep -q 'duplicate identifier K at 7:1' $(BUILDDIR)/scopebad_twoconst.err; \
+	grep -q 'duplicate identifier K at 6:1' $(BUILDDIR)/scopebad_twoconst.err; \
 	grep -q 'unknown identifier Q at 13:4' $(BUILDDIR)/scopebad_outside.err; \
 	grep -q 'unknown identifier K at 10:12' $(BUILDDIR)/scopebad_constout.err; \
 	echo ok scopebad; \
@@ -1600,8 +1618,8 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  'selfparent:TA is not declared whole yet: a parent class is declared before the classes that descend from it at 3:14' \
 	  'ifparent:IX is not declared whole yet: a parent interface is declared before the interfaces that descend from it at 4:18' \
 	  'implements:IX is not declared whole yet: an interface is declared before the classes that implement it at 4:23' \
-	  'mismatch:TA was declared forward as a class at 5:8' 'mismatch2:TA was declared forward as a class at 5:8' \
-	  'ifclass:IX was declared forward as an interface at 5:8' 'helper:TA was declared forward as a class at 4:8' \
+	  'mismatch:TA was declared forward as a class at 4:8' 'mismatch2:TA was declared forward as a class at 4:8' \
+	  'ifclass:IX was declared forward as an interface at 4:8' 'helper:TA was declared forward as a class at 4:8' \
 	  'twice:duplicate type TA at 4:3' 'done:duplicate type TA at 5:3' 'inner:forward type TA not resolved at 4:3'; do \
 	  n=$${f%%:*}; w=$${f#*:}; \
 	  if $(OUTDIR)/paslangc -o $(BUILDDIR)/classfwdbad_$$n testdata/classfwdbad/$$n.paslang >$(BUILDDIR)/classfwdbad_$$n.err 2>&1; then \
@@ -1699,8 +1717,8 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	echo "==== narrow rejects ===="; \
 	for f in 'const300:constant 300 does not fit Byte at 5:11 in testdata/narrowbad/const300.paslang' 'conv300:constant 300 does not fit Byte at 5:17' \
 	  'negbyte:constant -1 does not fit Byte at 5:16' 'narrowing:Integer needs a conversion to Byte at 7:9' \
-	  'mixed:Integer needs a conversion to Byte at 7:13' 'compare:constant 300 does not fit Byte at 7:14' \
-	  'caselabel:case label does not fit Byte at 8:5' 'forlimit:constant 300 does not fit Byte at 6:21' \
+	  'mixed:Integer needs a conversion to Byte at 7:13' 'compare:constant 300 does not fit Byte at 6:14' \
+	  'caselabel:case label does not fit Byte at 8:5' 'forlimit:constant 300 does not fit Byte at 5:21' \
 	  'argument:constant 300 does not fit Byte at 9:9' 'default:default value 300 does not fit Byte at 3:26' \
 	  'typedconst:constant 300 does not fit Byte at 3:13' 'nocontext:constant 300 does not fit Byte at line 6' \
 	  'signtoword:Int8 needs a conversion to Word at 7:9' 'vararg:var parameter of type Integer given a Byte at 11:7' \
@@ -1779,7 +1797,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  'nested:safe code does not step a pointer at 12:14' \
 	  'method:safe code does not see memory as another type at 11:22' \
 	  'wholeprog:safe code does not do pointer arithmetic at 7:13' \
-	  'notroutine:safe goes before a routine, a unit or a program at 3:6' \
+	  'notroutine:safe goes before a routine, a unit or a program at 2:6' \
 	  'viewsafe:safe code does not see memory as an array at 9:32'; do \
 	  n=$${f%%:*}; w=$${f#*:}; \
 	  if $(OUTDIR)/paslangc -o $(BUILDDIR)/sf_$$n testdata/safebad/$$n.paslang >$(BUILDDIR)/sf_$$n.err 2>&1; then \
@@ -1954,7 +1972,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  'realif:a real does not go into Boolean: compare it at 6:8' \
 	  'realwhile:a real does not go into Boolean: compare it at 6:11' \
 	  'realsetlen:a real does not go into Integer: Trunc or Round says how at 6:17' \
-	  'realcase:a real does not go into a case: Trunc or Round says how at 7:10' \
+	  'realcase:a real does not go into a case: Trunc or Round says how at 6:10' \
 	  'caseacross:empty case range 9223372036854775807..-9223372036854775808: Integer is signed, so a hex constant from $$8000000000000000 up is negative at 9:6' \
 	  'succlast:Succ past the last value of TColor at 4:21' \
 	  'predfirst:Pred before the first value of TColor at 4:20' \
@@ -1975,20 +1993,20 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  'visstrictdesc:FSecret is strict private to TA at 17:18' \
 	  'visctor:MakeHidden is private to TVisBase at 10:17' \
 	  'visinh:Hid is strict private to TA at 21:3' \
-	  'visstrictword:strict goes before private or protected at 7:10' \
+	  'visstrictword:strict goes before private or protected at 6:10' \
 	  'vismethval:Bump is strict private to TA at 21:10' \
 	  'mapkeyreal:Real does not go into Integer, the key of map[Integer] of Integer at 9:10' \
 	  'mapkeykind:Integer does not go into string, the key of map[string] of Integer at 10:12' \
 	  'mapkeyfit:constant 300 does not fit Byte at 9:10' \
-	  'mapforval:for k, v in map[Integer] of Integer: v is Byte, the values are Integer at 12:17' \
-	  'mapforkey:for k in map[string] of Integer: k is Integer, the keys are string at 11:14' \
-	  'maptryget:TryGet(m, k, v): v is string, the values of map[string] of Integer are Integer at 11:24' \
+	  'mapforval:for k, v in map[Integer] of Integer: v is Byte, the values are Integer at 11:17' \
+	  'mapforkey:for k in map[string] of Integer: k is Integer, the keys are string at 10:14' \
+	  'maptryget:TryGet(m, k, v): v is string, the values of map[string] of Integer are Integer at 10:24' \
 	  'mapaddr:the address of a map element is not taken: the table moves when the map grows at 10:15' \
 	  'mapinto:map[string] of Integer does not go into map[Integer] of string at 10:9' \
 	  'incstr:Inc takes a number, an ordinal or a pointer, not string at 9:8' \
 	  'vararr:array[0..3] of Byte does not go into a var array of Byte parameter: a slice does at 13:10' \
 	  'atomicval:AtomicAdd takes the address of an Integer, as AtomicAdd(@v, ...), not the Integer itself at 5:18' \
-	  'atomiccasval:AtomicCas takes the address of an Integer, as AtomicCas(@v, ...), not the Integer itself at 6:25' \
+	  'atomiccasval:AtomicCas takes the address of an Integer, as AtomicCas(@v, ...), not the Integer itself at 5:25' \
 	  'merklestatic:MerkleRoot takes the leaves as a slice, array of string, not the static array[0..2] of string: SetLength one and fill it at 8:36' \
 	  'constwrite:S is a const parameter: the routine may not change it or pass it as var; copy it into a variable first at 5:4' \
 	  'constvar:S is a const parameter: the routine may not change it or pass it as var; copy it into a variable first at 9:4'; do \
@@ -2091,22 +2109,22 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/cputuse.out $(BUILDDIR)/cputuse.got; \
 	echo ok cpubad; \
 	echo "==== treebad ===="; \
-	for f in 'tryset:TryGet needs a tree with values: k in t says whether k is there at 10:24 in testdata/treebad/tryset.paslang' \
+	for f in 'tryset:TryGet needs a tree with values: k in t says whether k is there at 9:24 in testdata/treebad/tryset.paslang' \
 	  'setval:+= of a tree of K: t[k] is True or False, and Include(t, k) puts k in at 8:11' \
 	  'jointypes:Join takes two trees of one type at 9:13' \
 	  'pushtype:string does not go into Integer, the elements of heap of Integer at 9:13' \
-	  'popvar:Pop(h, v): v needs a variable at 9:16' \
-	  'poptype:Pop(h, v): v is string, not Integer at 10:16' \
+	  'popvar:Pop(h, v): v needs a variable at 8:16' \
+	  'poptype:Pop(h, v): v is string, not Integer at 9:16' \
 	  'keyatreal:a real does not go into Integer: Trunc or Round says how at 8:24' \
 	  'succtree:Succ takes an ordinal, or a tree and a key, not tree[Integer] of Integer at 8:18' \
 	  'merkleleaves:MerkleRoot takes the leaves as a slice of strings, not Integer at 4:31' \
 	  'storearg:StorePut takes a store, a key and a value, both strings at 4:24' \
-	  'forkv:for k, v needs a tree with values; for k in t walks a tree of K at 10:17' \
+	  'forkv:for k, v needs a tree with values; for k in t walks a tree of K at 9:17' \
 	  'lowmap:Low takes an array, a slice, a string, an ordinal or a tree, not map[Integer] of Integer at 8:17' \
 	  'includeint:Include takes a tree and a key, or a set and an element at 7:16' \
-	  'poplowset:PopLow of a tree of K takes the key alone at 10:22' \
-	  'rangeval:for k, v in tree[Integer] of Integer: v is string, the values are Integer at 11:23' \
-	  'forinheap:for x in does not walk a heap: take its elements with Pop at 11:14' \
+	  'poplowset:PopLow of a tree of K takes the key alone at 9:22' \
+	  'rangeval:for k, v in tree[Integer] of Integer: v is string, the values are Integer at 10:23' \
+	  'forinheap:for x in does not walk a heap: take its elements with Pop at 10:14' \
 	  'heapname:heap is a reserved word, not a name at 4:3'; do \
 	  n=$${f%%:*}; w=$${f#*:}; \
 	  if $(OUTDIR)/paslangc -o $(BUILDDIR)/tb_$$n testdata/treebad/$$n.paslang >$(BUILDDIR)/tb_$$n.err 2>&1; then \
@@ -3444,7 +3462,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'paslang: unlock of an unlocked mutex' $(BUILDDIR)/unlockfree.err; \
 	echo ok unlockfree; \
 	echo "==== fatal ===="; \
-	for t in divzero nilptr deep oom oomlimit closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg leafnil bmaskwide bmodneg bmaskone bforpast bvarctr bnestctr bsumstat bsumdyn bsumneg bkeepfirst bkeepmoved bkeepstat bkeepshrunk brunlen brunloc bflatidx bflatpush; do \
+	for t in divzero nilptr deep oom oomlimit closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg leafnil bmaskwide bmodneg bmaskone bforpast bvarctr bnestctr bsumstat bsumdyn bsumneg bkeepfirst bkeepmoved bkeepstat bkeepshrunk brunlen brunloc divfirst bflatidx bflatpush; do \
 	  $(OUTDIR)/paslangc -o $(BUILDDIR)/fatal_$$t testdata/fatal/$$t.paslang; \
 	  set +e; \
 	  if [ $$t = oomlimit ]; then \
@@ -3457,6 +3475,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  diff -u testdata/fatal/expected.out $(BUILDDIR)/fatal_$$t.got; \
 	done; \
 	grep -q 'paslang: integer divide by zero at line 11' $(BUILDDIR)/fatal_divzero.err; \
+	grep -q 'paslang: integer divide by zero at line 14' $(BUILDDIR)/fatal_divfirst.err; \
 	grep -q 'paslang: nil pointer dereference at line 16' $(BUILDDIR)/fatal_nilptr.err; \
 	grep -q 'paslang: nil pointer dereference at line 14' $(BUILDDIR)/fatal_leafnil.err; \
 	grep -q 'paslang: index 100 out of range \[0..63\] at line 11' $(BUILDDIR)/fatal_bmaskwide.err; \
@@ -4138,13 +4157,14 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	grep -q 'paslang: unlock of an unlocked mutex' $(BUILDDIR)/unlockfree-arm.err; \
 	echo ok unlockfree-arm; \
 	echo "==== fatal arm64 ===="; \
-	for t in divzero nilptr deep oom closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg leafnil bmaskwide bmodneg bmaskone bforpast bvarctr bnestctr bsumstat bsumdyn bsumneg bkeepfirst bkeepmoved bkeepstat bkeepshrunk brunlen brunloc bflatidx bflatpush; do \
+	for t in divzero nilptr deep oom closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg leafnil bmaskwide bmodneg bmaskone bforpast bvarctr bnestctr bsumstat bsumdyn bsumneg bkeepfirst bkeepmoved bkeepstat bkeepshrunk brunlen brunloc divfirst bflatidx bflatpush; do \
 	  $(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/fatal_$$t-arm testdata/fatal/$$t.paslang; \
 	  set +e; timeout 60 $(QEMU_A64) $(BUILDDIR)/fatal_$$t-arm > $(BUILDDIR)/fatal_$$t-arm.got 2> $(BUILDDIR)/fatal_$$t-arm.err; rc=$$?; set -e; \
 	  test $$rc -eq 1; \
 	  diff -u testdata/fatal/expected.out $(BUILDDIR)/fatal_$$t-arm.got; \
 	done; \
 	grep -q 'paslang: integer divide by zero at line 11' $(BUILDDIR)/fatal_divzero-arm.err; \
+	grep -q 'paslang: integer divide by zero at line 14' $(BUILDDIR)/fatal_divfirst-arm.err; \
 	grep -q 'paslang: nil pointer dereference at line 16' $(BUILDDIR)/fatal_nilptr-arm.err; \
 	grep -q 'paslang: nil pointer dereference at line 14' $(BUILDDIR)/fatal_leafnil-arm.err; \
 	grep -q 'paslang: index 100 out of range \[0..63\] at line 11' $(BUILDDIR)/fatal_bmaskwide-arm.err; \
