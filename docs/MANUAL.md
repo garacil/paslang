@@ -3104,6 +3104,19 @@ entry reads as a zero record without inserting it; writing a member
 inserts it. A closure keeps the saved container, key and indexes
 (`testdata/withmap.paslang`).
 
+`with o do`, `o` an object, reaches what `o.Name` reaches: its fields,
+properties and methods, its class's and its ancestors', its class
+variables and class methods, `ClassName` and `Free`. A method with
+parameters named without `(` is its method value, and `@Get` is a
+function's. The reference is worked out once, into a hidden variable:
+changing `o` inside does not change the object reached, and `with
+TBox.Create do try ... finally Free end` frees the object it made. The
+object's names hide a local's, a global's and, in a method, `Self`'s; a
+member the code there may not use (strict private, or private to
+another unit) is refused, not passed over. `with` takes a record or an
+object, and on another type it is refused where the reference starts
+(`testdata/withobj.paslang`).
+
 Every concrete method declared here needs an implementation in the
 program or the unit's implementation section, even if never called.
 The compiler reports a missing body at its declaration, before linking.

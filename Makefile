@@ -123,6 +123,9 @@ GOLDEN_A64 := map1 map2 sync1 sync2 finexit zerolocal pchar pingpong sel chclose
 # P166: record operands bind once, including a with inside recursion.
 GOLDEN += withonce withcapture withmap
 GOLDEN_A64 += withonce withcapture withmap
+# P172: with on an object.
+GOLDEN += withobj
+GOLDEN_A64 += withobj
 GOLDEN += treewide
 GOLDEN_A64 += treewide
 GOLDEN += recstatic
@@ -1500,7 +1503,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  grep -qF 'wrong number of arguments for the routine value at 18:21' $(BUILDDIR)/varbad_manyargs-$$target.err; \
 	done; \
 	echo ok varbad; \
-	echo "==== with rejects (P166) ===="; \
+	echo "==== with rejects (P166, P172) ===="; \
 	for target in amd64 arm64; do \
 	  if $(OUTDIR)/paslangc -target $$target -o $(BUILDDIR)/withbad_$$target testdata/withbad/constwrite.paslang >$(BUILDDIR)/withbad_$$target.err 2>&1; then \
 	    echo "a with must not change a const record"; exit 1; \
@@ -1513,6 +1516,14 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  done; \
 	  grep -qF 'R is a const parameter: a closure in a with may not change it at line 12' $(BUILDDIR)/withbad_constcapture-$$target.err; \
 	  grep -qF 'R is a var parameter of Capture, which has a closure inside' $(BUILDDIR)/withbad_varcapture-$$target.err; \
+	  for n in intwith strictwith unknownwith; do \
+	    if $(OUTDIR)/paslangc -target $$target -o $(BUILDDIR)/withbad_$$n-$$target testdata/withbad/$$n.paslang >$(BUILDDIR)/withbad_$$n-$$target.err 2>&1; then \
+	      echo "$$n should fail"; exit 1; \
+	    fi; \
+	  done; \
+	  grep -qF 'Integer has no members: with takes a record or an object at 11:8' $(BUILDDIR)/withbad_intwith-$$target.err; \
+	  grep -qF 'Hidden is strict private to TSecret at 21:5' $(BUILDDIR)/withbad_strictwith-$$target.err; \
+	  grep -qF 'unknown identifier M at 16:5' $(BUILDDIR)/withbad_unknownwith-$$target.err; \
 	done; \
 	echo ok withbad; \
 	echo "==== unresolved method bodies (P167) ===="; \

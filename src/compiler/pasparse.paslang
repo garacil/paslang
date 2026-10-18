@@ -536,6 +536,7 @@ type
     function RecFieldIdx(T: LongInt; const AName: string): SizeInt;
     procedure CheckRecField(T: LongInt; I: SizeInt; ALine, ACol: LongInt);
     function WithIdx(const AName: string): SizeInt;
+    function ClassHas(T: LongInt; const AName: string): Boolean;
     function TypeDot(T: LongInt): PExpr;
     function IsUsedUnit(const AName: string): Boolean;
     function SameProcIdx(const AName: string; const Params: TParamArray): SizeInt;
@@ -658,6 +659,7 @@ type
     function ParsePas: PStmt;
     function PasThunk(Call: PStmt; const Typs: array of LongInt): PStmt;
     function ParsePostfix(E: PExpr): PExpr;
+    function DotMember(E: PExpr; const AName: string; ALine, ACol: LongInt): PExpr;
     function PropAccess(E: PExpr; I: SizeInt; ALine, ACol: LongInt): PExpr;
     function SelfMember(const AName: string; ALine, ACol: LongInt): PExpr;
     function ParseArgList: TExprArray;
@@ -6497,9 +6499,31 @@ begin
       IntToStr(ACol));
 end;
 
-{ The innermost with whose record has member AName (P165): a field, or
-  a method or a property of the record or of a helper for it; -1 when
-  none has. }
+{ Class T's object has member AName, as obj.AName reaches it (P172): a
+  property, a field or a method of the class or of an ancestor, a class
+  variable or property, ClassName and its kin, or Free. Its visibility
+  is checked where it is used, as after a dot. }
+function TParser.ClassHas(T: LongInt; const AName: string): Boolean;
+var
+  i: SizeInt;
+begin
+  Result := True;
+  for i := 0 to High(FTypes[T].Props) do
+    if SameId(FTypes[T].Props[i].Name, AName) then
+      Exit;
+  for i := 0 to High(FTypes[T].Fields) do
+    if SameId(FTypes[T].Fields[i].Name, AName) then
+      Exit;
+  for i := 0 to High(FTypes[T].Meths) do
+    if SameId(FTypes[T].Meths[i].Name, AName) then
+      Exit;
+  Result := (CVarIndex(T, AName) >= 0) or ClassPropNamed(T, AName) or IsClassWord(AName) or
+    SameId(AName, 'Free');
+end;
+
+{ The innermost with whose record or object has member AName (P165): a
+  field, or a method or a property of the record or of a helper for it;
+  an object's member (P172); -1 when none has. }
 function TParser.WithIdx(const AName: string): SizeInt;
 var
   i: SizeInt;
@@ -6510,7 +6534,7 @@ begin
   begin
     t := FWith[i]^.Typ;
     ni := ScopedIndex(t, AName, owner);
-    if (RecFieldIdx(t, AName) >= 0) or
+    if (RecFieldIdx(t, AName) >= 0) or ((TypeOf(t).Kind = tykClass) and ClassHas(t, AName)) or
       ((ni >= 0) and (FTypes[owner].Nested[ni].Kind <> 0)) or
       ((HelperFor(t) <> 0) and HelperHas(HelperFor(t), AName)) then
     begin
@@ -10772,6 +10796,181 @@ begin
   end;
 end;
 
+{ The member AName of E, read after E's dot at ALine:ACol, with what
+  follows it (a method's arguments): a scoped constant or variable of E's
+  type, a member of its helper (P127), a class's property, field, method,
+  class variable or property, an interface's method, a record's field or
+  a sync type's method. Out of ParsePostfix for a with on an object
+  (P172), whose names are its members as obj.name reaches them. }
+function TParser.DotMember(E: PExpr; const AName: string; ALine, ACol: LongInt): PExpr;
+var
+  st: TTypeDef;
+  i, k, mi: SizeInt;
+  ftyp, foff, cls: LongInt;
+  fname: string;
+  found, have: Boolean;
+  args: TExprArray;
+begin
+  if ScopedValue(E^.Typ, AName, Result) then
+    Exit;
+  { a member of the value's helper (P127), before the type's own: a
+    helper's method hides a class's of the name, as in FPC }
+  if (E^.Typ > 0) and (HelperFor(E^.Typ) <> 0) and HelperHas(HelperFor(E^.Typ), AName) then
+  begin
+    Result := HelperMember(E, HelperFor(E^.Typ), AName, ALine, ACol);
+    Exit;
+  end;
+  cls := E^.Typ;
+  st := TypeOf(E^.Typ);
+  found := False;
+  if st.Kind = tykClass then
+  begin
+    { each member's visibility is checked where it is used (1.0.137) }
+    for i := 0 to High(st.Props) do
+      if SameId(st.Props[i].Name, AName) then
+      begin
+        E := PropAccess(E, i, ALine, ACol);
+        found := True;
+        Break;
+      end;
+    if not found then
+      for i := 0 to High(st.Fields) do
+        if SameId(st.Fields[i].Name, AName) then
+        begin
+          CheckVis(cls, 0, i, ALine, ACol);
+          fname := st.Fields[i].Name;
+          ftyp := st.Fields[i].Typ;
+          foff := st.Fields[i].Off;
+          E := NewField(E, fname, ftyp, foff);
+          found := True;
+          Break;
+        end;
+    if not found then
+    begin
+      args := nil;
+      have := False;
+      if FTok.Kind = tkLParen then
+      begin
+        args := ParseArgList;
+        have := True;
+      end;
+      if PickMeth(st.Meths, AName, args, have, mi) and st.Meths[mi].IsClassMeth then
+      begin
+        { a class method on an object: Self is the object's class
+          (P123) }
+        CheckVis(cls, 1, mi, ALine, ACol);
+        if Length(args) <> st.Meths[mi].NParams then
+          Die('wrong number of arguments for ' + st.Name + '.' + AName + HerePos);
+        E := ClassMethCall(cls, VmtOf(E), mi, args);
+        found := True;
+      end
+      else if (mi >= 0) and (mi <= High(st.Meths)) and SameId(st.Meths[mi].Name, AName) then
+      begin
+        CheckVis(cls, 1, mi, ALine, ACol);
+        if have then
+          for k := 0 to High(args) do
+            if (k <= High(st.Meths[mi].ByRef)) and st.Meths[mi].ByRef[k] then
+              args[k] := VarArgOf(args[k]);
+        { a function with parameters and no ( is not a call: its
+          method value, as a procedure's (1.0.135) }
+        if have or (st.Meths[mi].IsFunc and not NeedsArgs(st.Meths[mi])) then
+          E := NewMethod(E, st.Meths[mi].Sym, args, st.Meths[mi].RetTyp,
+            st.Meths[mi].Slot)
+        else
+        begin
+          E := NewMethPtr(E, st.Meths[mi].Sym, st.Meths[mi].Slot);
+          E^.Typ := InternMethodSig(st.Meths[mi].IsFunc, st.Meths[mi].RetTyp,
+            st.Meths[mi].ParamTyps, st.Meths[mi].ByRef);
+        end;
+        found := True;
+      end;
+    end;
+    { an object's class variable or class property (P123) }
+    if (not found) and ((CVarIndex(cls, AName) >= 0) or ClassPropNamed(cls, AName)) then
+      found := ClassMember(cls, VmtOf(E), AName, ALine, ACol, E);
+    if not found then
+    begin
+      if IsClassWord(AName) then
+      begin
+        { ClassName, InstanceSize, ClassNameIs of the object's class
+          (P121), read from its method table }
+        E := ClassWord(E, AName, args);
+        found := True;
+      end
+      else if SameId(AName, 'Free') then
+      begin
+        { Flags 16: x.Free, which calls x's Destroy when x is not nil
+          (1.0.137); the statement makes it (FreeStmt) }
+        E := NewMethod(E, '', nil, TyNone, -1);
+        E^.Flags := 16;
+        found := True;
+      end
+      else
+        Die('unknown member ' + AName);
+    end;
+  end
+  else if st.Kind = tykClassRef then
+  begin
+    { a member of the class a reference holds (P123) }
+    if not ClassMember(st.Elem, E, AName, ALine, ACol, E) then
+      Die('unknown class member ' + TypeOf(st.Elem).Name + '.' + AName + ' at ' +
+        IntToStr(ALine) + ':' + IntToStr(ACol));
+  end
+  else if st.Kind = tykInterface then
+  begin
+    for i := 0 to High(st.Meths) do
+      if SameId(st.Meths[i].Name, AName) then
+      begin
+        args := nil;
+        if FTok.Kind = tkLParen then
+          args := ParseArgList;
+        FillMethDefs(st.Meths[i], args);
+        if Length(args) <> st.Meths[i].NParams then
+          Die('wrong number of arguments');
+        { converted and by address as a class's method takes them
+          (1.0.136): a var or out argument went as its value, and the
+          method wrote through it to address 0 }
+        CoerceArgs(st.Meths[i].ParamTyps, st.Meths[i].ByRef, args);
+        for k := 0 to High(args) do
+          if (k <= High(st.Meths[i].ByRef)) and st.Meths[i].ByRef[k] then
+            args[k] := VarArgOf(args[k]);
+        E := NewMethod(E, st.Meths[i].Name, args, st.Meths[i].RetTyp,
+          st.Meths[i].Slot);
+        found := True;
+        Break;
+      end;
+    if not found then
+      Die('unknown member ' + AName);
+  end
+  else if st.Kind = tykRecord then
+  begin
+    for i := 0 to High(st.Fields) do
+      if SameId(st.Fields[i].Name, AName) then
+      begin
+        CheckRecField(E^.Typ, i, ALine, ACol);
+        fname := st.Fields[i].Name;
+        ftyp := st.Fields[i].Typ;
+        foff := st.Fields[i].Off;
+        E := NewField(E, fname, ftyp, foff);
+        found := True;
+        Break;
+      end;
+    if not found then
+      E := CoreMethod(E, AName);
+  end
+  else
+  begin
+    { a value with no members of its own: its helper's (P127) }
+    if (E^.Typ > 0) and (HelperFor(E^.Typ) <> 0) then
+      Die(AName + ' is no member of ' + TypName(E^.Typ) + ': the helper in scope, ' +
+        FTypes[HelperFor(E^.Typ)].Name + ', has none' + ' at ' + IntToStr(ALine) + ':' +
+        IntToStr(ACol));
+    Die(TypName(E^.Typ) + ' has no members: ' + AName + ' needs a record, an object or a ' +
+      'helper for ' + TypName(E^.Typ) + ' at ' + IntToStr(ALine) + ':' + IntToStr(ACol));
+  end;
+  Result := E;
+end;
+
 function TParser.ParsePostfix(E: PExpr): PExpr;
 var
   st: TTypeDef;
@@ -10793,163 +10992,7 @@ begin
       nline := FTok.Line;
       ncol := FTok.Col;
       FTok := FLex.Next;
-      if ScopedValue(E^.Typ, name, ix) then
-      begin E := ix; Continue end;
-      { a member of the value's helper (P127), before the type's own: a
-        helper's method hides a class's of the name, as in FPC }
-      if (E^.Typ > 0) and (HelperFor(E^.Typ) <> 0) and HelperHas(HelperFor(E^.Typ), name) then
-      begin
-        E := HelperMember(E, HelperFor(E^.Typ), name, nline, ncol);
-        Continue;
-      end;
-      cls := E^.Typ;
-      st := TypeOf(E^.Typ);
-      found := False;
-      if st.Kind = tykClass then
-      begin
-        { each member's visibility is checked where it is used (1.0.137) }
-        for i := 0 to High(st.Props) do
-          if SameId(st.Props[i].Name, name) then
-          begin
-            E := PropAccess(E, i, nline, ncol);
-            found := True;
-            Break;
-          end;
-        if not found then
-          for i := 0 to High(st.Fields) do
-            if SameId(st.Fields[i].Name, name) then
-            begin
-              CheckVis(cls, 0, i, nline, ncol);
-              fname := st.Fields[i].Name;
-              ftyp := st.Fields[i].Typ;
-              foff := st.Fields[i].Off;
-              E := NewField(E, fname, ftyp, foff);
-              found := True;
-              Break;
-            end;
-        if not found then
-        begin
-          args := nil;
-          have := False;
-          if FTok.Kind = tkLParen then
-          begin
-            args := ParseArgList;
-            have := True;
-          end;
-          if PickMeth(st.Meths, name, args, have, mi) and st.Meths[mi].IsClassMeth then
-          begin
-            { a class method on an object: Self is the object's class
-              (P123) }
-            CheckVis(cls, 1, mi, nline, ncol);
-            if Length(args) <> st.Meths[mi].NParams then
-              Die('wrong number of arguments for ' + st.Name + '.' + name + HerePos);
-            E := ClassMethCall(cls, VmtOf(E), mi, args);
-            found := True;
-          end
-          else if (mi >= 0) and (mi <= High(st.Meths)) and SameId(st.Meths[mi].Name, name) then
-          begin
-            CheckVis(cls, 1, mi, nline, ncol);
-            if have then
-              for k := 0 to High(args) do
-                if (k <= High(st.Meths[mi].ByRef)) and st.Meths[mi].ByRef[k] then
-                  args[k] := VarArgOf(args[k]);
-            { a function with parameters and no ( is not a call: its
-              method value, as a procedure's (1.0.135) }
-            if have or (st.Meths[mi].IsFunc and not NeedsArgs(st.Meths[mi])) then
-              E := NewMethod(E, st.Meths[mi].Sym, args, st.Meths[mi].RetTyp,
-                st.Meths[mi].Slot)
-            else
-            begin
-              E := NewMethPtr(E, st.Meths[mi].Sym, st.Meths[mi].Slot);
-              E^.Typ := InternMethodSig(st.Meths[mi].IsFunc, st.Meths[mi].RetTyp,
-                st.Meths[mi].ParamTyps, st.Meths[mi].ByRef);
-            end;
-            found := True;
-          end;
-        end;
-        { an object's class variable or class property (P123) }
-        if (not found) and ((CVarIndex(cls, name) >= 0) or ClassPropNamed(cls, name)) then
-          found := ClassMember(cls, VmtOf(E), name, nline, ncol, E);
-        if not found then
-        begin
-          if IsClassWord(name) then
-          begin
-            { ClassName, InstanceSize, ClassNameIs of the object's class
-              (P121), read from its method table }
-            E := ClassWord(E, name, args);
-            found := True;
-          end
-          else if SameId(name, 'Free') then
-          begin
-            { Flags 16: x.Free, which calls x's Destroy when x is not nil
-              (1.0.137); the statement makes it (FreeStmt) }
-            E := NewMethod(E, '', nil, TyNone, -1);
-            E^.Flags := 16;
-            found := True;
-          end
-          else
-            Die('unknown member ' + name);
-        end;
-      end
-      else if st.Kind = tykClassRef then
-      begin
-        { a member of the class a reference holds (P123) }
-        if not ClassMember(st.Elem, E, name, nline, ncol, E) then
-          Die('unknown class member ' + TypeOf(st.Elem).Name + '.' + name + ' at ' +
-            IntToStr(nline) + ':' + IntToStr(ncol));
-      end
-      else if st.Kind = tykInterface then
-      begin
-        for i := 0 to High(st.Meths) do
-          if SameId(st.Meths[i].Name, name) then
-          begin
-            args := nil;
-            if FTok.Kind = tkLParen then
-              args := ParseArgList;
-            FillMethDefs(st.Meths[i], args);
-            if Length(args) <> st.Meths[i].NParams then
-              Die('wrong number of arguments');
-            { converted and by address as a class's method takes them
-              (1.0.136): a var or out argument went as its value, and the
-              method wrote through it to address 0 }
-            CoerceArgs(st.Meths[i].ParamTyps, st.Meths[i].ByRef, args);
-            for k := 0 to High(args) do
-              if (k <= High(st.Meths[i].ByRef)) and st.Meths[i].ByRef[k] then
-                args[k] := VarArgOf(args[k]);
-            E := NewMethod(E, st.Meths[i].Name, args, st.Meths[i].RetTyp,
-              st.Meths[i].Slot);
-            found := True;
-            Break;
-          end;
-        if not found then
-          Die('unknown member ' + name);
-      end
-      else if st.Kind = tykRecord then
-      begin
-        for i := 0 to High(st.Fields) do
-          if SameId(st.Fields[i].Name, name) then
-          begin
-            CheckRecField(E^.Typ, i, nline, ncol);
-            fname := st.Fields[i].Name;
-            ftyp := st.Fields[i].Typ;
-            foff := st.Fields[i].Off;
-            E := NewField(E, fname, ftyp, foff);
-            found := True;
-            Break;
-          end;
-        if not found then
-          E := CoreMethod(E, name);
-      end
-      else
-      begin
-        { a value with no members of its own: its helper's (P127) }
-        if (E^.Typ > 0) and (HelperFor(E^.Typ) <> 0) then
-          Die(name + ' is no member of ' + TypName(E^.Typ) + ': the helper in scope, ' +
-            FTypes[HelperFor(E^.Typ)].Name + ', has none' + ' at ' + IntToStr(nline) + ':' +
-            IntToStr(ncol));
-        Die(TypName(E^.Typ) + ' has no members: ' + name + ' needs a record, an object or a ' +
-          'helper for ' + TypName(E^.Typ) + ' at ' + IntToStr(nline) + ':' + IntToStr(ncol));
-      end;
+      E := DotMember(E, name, nline, ncol);
     end
     else if (FTok.Kind = tkLParen) and (TypeOf(E^.Typ).Kind = tykProc) then
     begin
@@ -11308,12 +11351,17 @@ begin
           FTok := FLex.Next;
         end;
         { a member of a with's record, the innermost's: a field, a method
-          or a property of the record or of a helper for it (P165); it
-          hides any other name, a local's too, as in Pascal }
+          or a property of the record or of a helper for it (P165), or
+          an object's member (P172); it hides any other name, a local's
+          too, as in Pascal }
         wi := -1;
         if Length(FWith) > 0 then
           wi := WithIdx(name);
-        if wi >= 0 then
+        if (wi >= 0) and (TypeOf(FWith[wi]^.Typ).Kind = tykClass) then
+          { an object's member as obj.name is (P172), through the hidden
+            variable that holds the reference }
+          Result := DotMember(NewVar(FWith[wi]^.Name, FWith[wi]^.Typ), name, nline, ncol)
+        else if wi >= 0 then
         begin
           i := RecFieldIdx(FWith[wi]^.Typ, name);
           if i >= 0 then
@@ -13501,7 +13549,7 @@ begin
             else if SameId(name, 'Pi') then
               Result := NewPi
             else
-              Die('unknown identifier ' + name);
+              Die('unknown identifier ' + name + ' at ' + IntToStr(nline) + ':' + IntToStr(ncol));
         end
         else if (not IsLocalName(name)) and ScopedValue(MemberContext, name, Result) then
         begin
@@ -13702,7 +13750,7 @@ begin
     { @Routine is the routine itself, as a value of its own shape. A
       variable, a field or obj.Method go the old way, below. }
     if IsName and (not IsVarName(FTok.Lexeme)) and
-      FindProc(FTok.Lexeme, atpe) then
+      ((Length(FWith) = 0) or (WithIdx(FTok.Lexeme) < 0)) and FindProc(FTok.Lexeme, atpe) then
     begin
       Result := NewProcPtr(atpe.Sym, InternProc(atpe.IsFunc, atpe.RetTyp,
         atpe.ParamTyp, atpe.ByRef));
@@ -21842,7 +21890,7 @@ end;
 function TParser.ParseWith(ALine: LongInt): PStmt;
 var
   base, cbase, i, n, k, k0, p0, j: SizeInt;
-  t, pt: LongInt;
+  t, pt, el, ec: LongInt;
   e, a, v, maproot, part: PExpr;
   indexes: TExprArray;
   body, block, alloc: PStmt;
@@ -21863,14 +21911,32 @@ begin
   Result^.Line := ALine;
   FTok := FLex.Next;
   repeat
+    el := FTok.Line;
+    ec := FTok.Col;
     e := ParseExpr;
     t := e^.Typ;
-    if TypeOf(t).Kind <> tykRecord then
-      Die('with record' + HerePos);
+    { a record or an object (P172), as FPC's reference has it (13.2.8:
+      the variable reference must be of a record, object or class type),
+      refused where the reference starts }
+    if (TypeOf(t).Kind <> tykRecord) and (TypeOf(t).Kind <> tykClass) then
+      Die(TypName(t) + ' has no members: with takes a record or an object at ' + IntToStr(el) +
+        ':' + IntToStr(ec));
     root := RootName(e);
     temp := '';
-    maproot := MapPlaceRoot(e);
-    if maproot <> nil then
+    maproot := nil;
+    if TypeOf(t).Kind = tykRecord then
+      maproot := MapPlaceRoot(e);
+    if TypeOf(t).Kind = tykClass then
+    begin
+      { an object: its reference worked out once into a hidden variable,
+        as FPC keeps it in a register (13.2.8: changing the variable in
+        the with does not change the object it reaches); a closure in
+        the body that reads it gets a cell, as a const record's copy }
+      v := HiddenVar(t, Result^.Stmts, e);
+      temp := v^.Name;
+      AppendStr(bindings, v^.Name);
+    end
+    else if maproot <> nil then
     begin
       { An entry is a logical place, not a stable table-slot address.
         Save the container, key and any indexes once; member accesses
