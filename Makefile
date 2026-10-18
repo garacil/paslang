@@ -3638,8 +3638,10 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 # The arm64 tests run under QEMU's user mode built here, from the signed
 # 11.1.1 release in docs/ref/qemu (fetched once, checked by its SHA-256)
 # with the patches of scripts/qemu: QEMU 11.1.1 deadlocks a program that
-# forks while another of its threads makes a system call (P226), and
-# fails MADV_GUARD_INSTALL. The tests alone need it.
+# forks while another of its threads makes a system call (P226), fails
+# MADV_GUARD_INSTALL, starts a thread with every host signal blocked
+# (P302), and changes gdb's breakpoints while the other threads walk
+# them (P349). The tests alone need it.
 QEMU_A64 := $(BUILDDIR)/qemu-aarch64
 
 $(BUILDDIR)/qemu-aarch64: scripts/build_qemu.py $(wildcard scripts/qemu/*.patch) | $(BUILDDIR)

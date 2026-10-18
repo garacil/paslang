@@ -1,0 +1,103 @@
+QEMU 11.1.1 gdbstub, user mode: gdb's breakpoints change with the other CPUs out of cpu_exec.
+
+paslang's arm64 tests run under QEMU's user mode, built from the signed
+11.1.1 release with this patch (scripts/build_qemu.py). Its system call
+injections run the program under QEMU's gdb stub (scripts/check_syscalls.py),
+and QEMU died of its own SIGSEGV there (paslang P349): 4 runs of 600 of
+the handoff injection beside four busy loops on one processor, and a
+chain of make check once (QEMU internal SIGSEGV {code=128, addr=(nil)},
+or SEGV_MAPERR in systemd-coredump). Under a host gdb with a breakpoint at
+die_from_signal, three faults of three were the same:
+
+- a CPU's thread in check_for_breakpoints_slow() (accel/tcg/cpu-exec.c),
+  at QTAILQ_FOREACH over cpu->breakpoints, from helper_lookup_tb_ptr()
+  in translated code;
+- gdb_breakpoint_insert(), gdb_breakpoint_remove() and
+  gdb_breakpoint_remove_all() (gdbstub/user.c) change every CPU's list
+  (CPU_FOREACH, cpu_breakpoint_insert() and cpu_breakpoint_remove_by_ref(),
+  which frees the entry) from the thread of the CPU that stopped, while
+  in user mode the other CPUs' threads run on (gdb_handlesig() waits in
+  the stopping thread alone) and walk their lists with no lock.
+
+The three now make their changes in an exclusive section
+(start_exclusive() and end_exclusive(), cpu-common.c, as gdbserver_fork's
+already does), every other CPU out of cpu_exec meanwhile; they run on a
+CPU's thread outside cpu_exec, as start_exclusive() asks, and the fork
+path, already exclusive, counts the section again; the first changes,
+from gdbserver_start() in main() before any CPU runs, have current_cpu
+NULL and no other thread, and take no section. With it the handoff
+injection ran its loop beside four busy loops without a fault.
+
+--- a/gdbstub/user.c
++++ b/gdbstub/user.c
+@@ -788,8 +788,30 @@
+ 
+ /*
+  * Break/Watch point helpers
++ *
++ * Every CPU's breakpoint list changes here, from the thread of the CPU
++ * that stopped, while the other threads run on and walk their own lists
++ * in check_for_breakpoints_slow(): each change is made with them out of
++ * cpu_exec, in an exclusive section, so none reads an entry that
++ * cpu_breakpoint_remove_by_ref() frees. The first changes come from
++ * gdbserver_start() in main(), before any CPU runs and with current_cpu
++ * NULL, where start_exclusive() would fault and no list is walked.
+  */
+ 
++static void gdb_breakpoints_begin(void)
++{
++    if (current_cpu) {
++        start_exclusive();
++    }
++}
++
++static void gdb_breakpoints_end(void)
++{
++    if (current_cpu) {
++        end_exclusive();
++    }
++}
++
+ int gdb_breakpoint_insert(CPUState *cs, GdbBreakpointType type,
+                           vaddr addr, vaddr len)
+ {
+@@ -799,12 +821,14 @@
+     switch (type) {
+     case GDB_BREAKPOINT_SW:
+     case GDB_BREAKPOINT_HW:
++        gdb_breakpoints_begin();
+         CPU_FOREACH(cpu) {
+             err = cpu_breakpoint_insert(cpu, addr, BP_GDB, NULL);
+             if (err) {
+                 break;
+             }
+         }
++        gdb_breakpoints_end();
+         return err;
+     default:
+         /* user-mode doesn't support watchpoints */
+@@ -821,12 +845,14 @@
+     switch (type) {
+     case GDB_BREAKPOINT_SW:
+     case GDB_BREAKPOINT_HW:
++        gdb_breakpoints_begin();
+         CPU_FOREACH(cpu) {
+             err = cpu_breakpoint_remove(cpu, addr, BP_GDB);
+             if (err) {
+                 break;
+             }
+         }
++        gdb_breakpoints_end();
+         return err;
+     default:
+         /* user-mode doesn't support watchpoints */
+@@ -836,7 +862,9 @@
+ 
+ void gdb_breakpoint_remove_all(CPUState *cs)
+ {
++    gdb_breakpoints_begin();
+     cpu_breakpoint_remove_all(cs, BP_GDB);
++    gdb_breakpoints_end();
+ }
+ 
+ /*

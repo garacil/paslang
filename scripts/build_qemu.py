@@ -9,9 +9,12 @@ download.qemu.org the first time and checked against its SHA-256 every
 time; the signature was checked with the release key, Michael Roth's,
 CEAC C9E1 5534 EBAB B82D 3FA0 3353 C9CE F108 B584), with the patches of
 scripts/qemu applied in order: QEMU 11.1.1 deadlocks a guest that forks
-while another of its threads makes a system call with a pointer, and
-answers EINVAL to MADV_GUARD_INSTALL. Only the tests need it; it needs
-a C compiler, Python, meson, ninja and glib's headers, as QEMU does.
+while another of its threads makes a system call with a pointer,
+answers EINVAL to MADV_GUARD_INSTALL, starts a thread with every host
+signal blocked (P302), and changes gdb's breakpoints while the other
+threads walk them, dying of its own SIGSEGV (P349). Only the tests need
+it; it needs a C compiler, Python, meson, ninja and glib's headers, as
+QEMU does.
 usage: build_qemu.py BUILDDIR TARBALL
 """
 import hashlib
