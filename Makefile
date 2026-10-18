@@ -308,6 +308,9 @@ GOLDEN_A64 += rangetest
 # P293: a loop that does not count is preempted by a signal, as Go's.
 GOLDEN += asyncspin asyncgc asyncleaf
 GOLDEN_A64 += asyncspin asyncgc asyncleaf
+# P354: a routine's record keeps no saved register once it is loaded back.
+GOLDEN += gstale
+GOLDEN_A64 += gstale
 # P294: arithmetic in one instruction where it took several.
 GOLDEN += leaform
 GOLDEN_A64 += leaform
