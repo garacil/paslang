@@ -495,14 +495,22 @@ def variant(v):
     blk1 = 'Sha1BlocksCpu' if v == 'Cpu' else 'Sha1BlocksPlain'
     blk512 = 'Sha512BlocksCpu' if v == 'Cpu' else 'Sha512BlocksPlain'
     t = r'''
-function Sha256Of{V}(const S: string; Init: Pointer; OutWords: Integer): string;
+function Sha256Of{V}P(Pre: Pointer; const S: string; Init: Pointer; OutWords: Integer): string;
 var
+  ext: Integer;
   st: array[0..7] of UInt32;
   buf: array[0..127] of Byte;
   i, n, nb, done, take: Integer;
 begin
   for i := 0 to 7 do
     st[i] := LoadLE32(Pointer(Integer(Init) + i * 4));
+  { the pad block HMAC puts before the message (P343) }
+  ext := 0;
+  if Pre <> nil then
+  begin
+    {BLK256}(@st[0], Pre, 1);
+    ext := 64;
+  end;
   n := Length(S) div 64;
   done := 0;
   while done < n do
@@ -513,11 +521,16 @@ begin
     {BLK256}(@st[0], Pointer(Integer(Pointer(S)) + done * 64), take);
     done := done + take;
   end;
-  Tail64(S, @buf[0], nb, False);
+  Tail64X(S, ext, @buf[0], nb, False);
   {BLK256}(@st[0], @buf[0], nb);
   SetLength(Result, OutWords * 4);
   for i := 0 to OutWords - 1 do
     StoreBE32(@Result[i * 4 + 1], st[i]);
+end;
+
+function Sha256Of{V}(const S: string; Init: Pointer; OutWords: Integer): string;
+begin
+  Result := Sha256Of{V}P(nil, S, Init, OutWords);
 end;
 
 function PasSha256{V}(const S: string): string;
@@ -530,8 +543,9 @@ begin
   Result := Sha256Of{V}(S, @H224[0], 7);
 end;
 
-function PasSha1{V}(const S: string): string;
+function Sha1Of{V}P(Pre: Pointer; const S: string): string;
 var
+  ext: Integer;
   st: array[0..4] of UInt32;
   buf: array[0..127] of Byte;
   i, n, nb, done, take: Integer;
@@ -541,6 +555,13 @@ begin
   st[2] := $98badcfe;
   st[3] := $10325476;
   st[4] := $c3d2e1f0;
+  { the pad block HMAC puts before the message (P343) }
+  ext := 0;
+  if Pre <> nil then
+  begin
+    {BLK1}(@st[0], Pre, 1);
+    ext := 64;
+  end;
   n := Length(S) div 64;
   done := 0;
   while done < n do
@@ -551,21 +572,34 @@ begin
     {BLK1}(@st[0], Pointer(Integer(Pointer(S)) + done * 64), take);
     done := done + take;
   end;
-  Tail64(S, @buf[0], nb, False);
+  Tail64X(S, ext, @buf[0], nb, False);
   {BLK1}(@st[0], @buf[0], nb);
   SetLength(Result, 20);
   for i := 0 to 4 do
     StoreBE32(@Result[i * 4 + 1], st[i]);
 end;
 
-function Sha512Of{V}(const S: string; Init: Pointer; OutWords: Integer): string;
+function PasSha1{V}(const S: string): string;
+begin
+  Result := Sha1Of{V}P(nil, S);
+end;
+
+function Sha512Of{V}P(Pre: Pointer; const S: string; Init: Pointer; OutWords: Integer): string;
 var
+  ext: Integer;
   st: array[0..7] of Integer;
   buf: array[0..255] of Byte;
   i, n, off, rest, nb, done, take: Integer;
 begin
   for i := 0 to 7 do
     st[i] := LoadLE64(Pointer(Integer(Init) + i * 8));
+  { the pad block HMAC puts before the message (P343) }
+  ext := 0;
+  if Pre <> nil then
+  begin
+    {BLK512}(@st[0], Pre, 1);
+    ext := 128;
+  end;
   n := Length(S) div 128;
   done := 0;
   while done < n do
@@ -588,11 +622,16 @@ begin
     nb := 1
   else
     nb := 2;
-  StoreBE64(@buf[nb * 128 - 8], Length(S) * 8);
+  StoreBE64(@buf[nb * 128 - 8], (Length(S) + ext) * 8);
   {BLK512}(@st[0], @buf[0], nb);
   SetLength(Result, OutWords * 8);
   for i := 0 to OutWords - 1 do
     StoreBE64(@Result[i * 8 + 1], st[i]);
+end;
+
+function Sha512Of{V}(const S: string; Init: Pointer; OutWords: Integer): string;
+begin
+  Result := Sha512Of{V}P(nil, S, Init, OutWords);
 end;
 
 function PasSha512{V}(const S: string): string;
@@ -603,6 +642,21 @@ end;
 function PasSha384{V}(const S: string): string;
 begin
   Result := Sha512Of{V}(S, @H384[0], 6);
+end;
+
+{ The hash Alg of the block Pre and then S (P343): HMAC's inner and outer
+  hashes, the pad block and the message absorbed from their own memory. }
+function HashBy{V}P(Alg: Integer; Pre: Pointer; const S: string): string;
+begin
+  case Alg of
+    0: Result := Md5OfP(Pre, S);
+    1: Result := Sha1Of{V}P(Pre, S);
+    2: Result := Sha256Of{V}P(Pre, S, @H224[0], 7);
+    3: Result := Sha256Of{V}P(Pre, S, @H256[0], 8);
+    4: Result := Sha512Of{V}P(Pre, S, @H384[0], 6);
+  else
+    Result := Sha512Of{V}P(Pre, S, @H512[0], 8);
+  end;
 end;
 
 function HashBy{V}(Alg: Integer; const S: string): string;
@@ -647,7 +701,9 @@ begin
       opad[i] := Char($5c);
     end;
   end;
-  Result := HashBy{V}(Alg, opad + HashBy{V}(Alg, ipad + Msg));
+  { the pads go into the state before the message, as Go's crypto/hmac
+    writes them (P343): ipad + Msg made a string of the message's size }
+  Result := HashBy{V}P(Alg, @opad[1], HashBy{V}P(Alg, @ipad[1], Msg));
 end;
 
 { The Merkle tree of RFC 9162: a leaf is SHA-256 of 0x00 and the entry,
@@ -893,8 +949,10 @@ end;
 
 { The tail of a message for a 64-byte block hash (FIPS 180-4, 5.1.1;
   RFC 1321, 3.1-3.2): a 1 bit, zeros, and the length in bits, big-endian
-  for SHA and little-endian for MD5, in one block or two, at Buf. }
-procedure Tail64(const S: string; Buf: Pointer; out NBlocks: Integer; LittleLen: Boolean);
+  for SHA and little-endian for MD5, in one block or two, at Buf; Extra
+  bytes came before S, HMAC's pad (P343), and the length counts them. }
+procedure Tail64X(const S: string; Extra: Integer; Buf: Pointer; out NBlocks: Integer;
+  LittleLen: Boolean);
 var
   n, off, rest, i, bits: Integer;
 begin
@@ -910,11 +968,16 @@ begin
     NBlocks := 1
   else
     NBlocks := 2;
-  bits := n * 8;
+  bits := (n + Extra) * 8;
   if LittleLen then
     StoreLE64(Pointer(Integer(Buf) + NBlocks * 64 - 8), bits)
   else
     StoreBE64(Pointer(Integer(Buf) + NBlocks * 64 - 8), bits);
+end;
+
+procedure Tail64(const S: string; Buf: Pointer; out NBlocks: Integer; LittleLen: Boolean);
+begin
+  Tail64X(S, 0, Buf, NBlocks, LittleLen);
 end;
 '''
 
@@ -1068,8 +1131,9 @@ REST = r'''
 
 {MD5}
 
-function PasMd5(const S: string): string;
+function Md5OfP(Pre: Pointer; const S: string): string;
 var
+  ext: Integer;
   st: array[0..3] of UInt32;
   buf: array[0..127] of Byte;
   i, n, nb: Integer;
@@ -1078,14 +1142,26 @@ begin
   st[1] := $efcdab89;
   st[2] := $98badcfe;
   st[3] := $10325476;
+  { the pad block HMAC puts before the message (P343) }
+  ext := 0;
+  if Pre <> nil then
+  begin
+    Md5Blocks(@st[0], Pre, 1);
+    ext := 64;
+  end;
   n := Length(S) div 64;
   if n > 0 then
     Md5Blocks(@st[0], Pointer(S), n);
-  Tail64(S, @buf[0], nb, True);
+  Tail64X(S, ext, @buf[0], nb, True);
   Md5Blocks(@st[0], @buf[0], nb);
   SetLength(Result, 16);
   for i := 0 to 3 do
     StoreLE32(@Result[i * 4 + 1], st[i]);
+end;
+
+function PasMd5(const S: string): string;
+begin
+  Result := Md5OfP(nil, S);
 end;
 
 { ---- SHA-3 (FIPS 202): the sponge with rate 1600 - 2 d bits and the
