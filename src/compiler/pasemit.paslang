@@ -965,6 +965,8 @@ type
     procedure SetFrame(const Sym: string; Locals: LongInt);
     procedure ZeroFrame(Off, Bytes: LongInt);
     procedure EmitDivCheck;
+    function DivFix(E: PExpr): Boolean;
+    procedure SignedDiv(E: PExpr; IsMod: Boolean);
     procedure ColdBeginAt(const Jmp, C: string);
     procedure ColdBegin(const Jmp: string);
     procedure ColdEnd;
@@ -24745,16 +24747,14 @@ else if E^.Name = 'rt_high' then
                 Line('  movq %rax, %rcx');
                 Line('  popq %rax');
                 EmitDivCheck;
-                Line('  cqto');
-                Line('  idivq %rcx');
+                SignedDiv(E, False);
               end;
             boMod:
               begin
                 Line('  movq %rax, %rcx');
                 Line('  popq %rax');
                 EmitDivCheck;
-                Line('  cqto');
-                Line('  idivq %rcx');
+                SignedDiv(E, True);
                 Line('  movq %rdx, %rax');
               end;
             boEq: EmitCmp('sete');
@@ -28699,8 +28699,7 @@ begin
         Line('  movq ' + op + ', %rcx');
         Line('  movq ' + r + ', %rax');
         EmitDivCheck;
-        Line('  cqto');
-        Line('  idivq %rcx');
+        SignedDiv(E, E^.Bin = boMod);
         if E^.Bin = boDiv then
           Line('  movq %rax, ' + r)
         else
@@ -32248,6 +32247,80 @@ begin
   FIxOn := False;
   FChkOn := False;
   FZeroN := 0;
+end;
+
+{ The signed division E needs its divisor compared with -1 (P359): not
+  when the divisor is a constant other than -1 or a load of an unsigned
+  type narrower than a word (a Byte, a Word, a UInt32, a Char, a
+  Boolean), which cannot be -1, nor when the dividend is a constant
+  other than the lowest or a load narrower than a word, which cannot be
+  the lowest; Go leaves the compare out where prove shows the same
+  (cmd/compile/internal/ssa/prove.go: the divisor not -1 or the dividend
+  above the lowest). }
+function TEmitter.DivFix(E: PExpr): Boolean;
+var
+  t: LongInt;
+begin
+  Result := False;
+  if (E^.R <> nil) and (E^.R^.Kind = ekInt) and (E^.R^.Num <> -1) then
+    Exit;
+  if (E^.R <> nil) and ((E^.R^.Kind = ekVar) or (E^.R^.Kind = ekIndex) or
+    (E^.R^.Kind = ekField) or (E^.R^.Kind = ekDeref)) then
+  begin
+    t := E^.R^.Typ;
+    if (t = TyByte) or (t = TyWord) or (t = TyUInt32) or (t = TyChar) or (t = TyBoolean) then
+      Exit;
+  end;
+  if (E^.L <> nil) and (E^.L^.Kind = ekInt) and (E^.L^.Num <> Low(Int64)) then
+    Exit;
+  if (E^.L <> nil) and ((E^.L^.Kind = ekVar) or (E^.L^.Kind = ekIndex) or
+    (E^.L^.Kind = ekField) or (E^.L^.Kind = ekDeref)) and (TSize(E^.L^.Typ) < 8) then
+    Exit;
+  Result := True;
+end;
+
+{ amd64: rax div rcx into rax, or rax mod rcx into rdx, for the signed
+  division E (P359). idivq faults on the quotient 2^63 of the lowest
+  Int64 by -1 (SDM vol. 2A 3-448, IDIV: #DE when a 64-bit quotient
+  passes 7FFFFFFFFFFFFFFFH), where arm64's sdiv writes the quotient's low
+  64 bits (ARM DDI 0487 M.c C6.2.357), the lowest again, and msub the
+  remainder 0, as Go gives them and div and mod wrap like the rest: a
+  divisor of -1 negates rax or zeroes rdx instead, Go's fix-up
+  (cmd/compile/internal/amd64/ssa.go, DivisionNeedsFixUp: CMPQ $-1,
+  JNE, NEGQ AX, XORL DX, DX, JMP), the one result used alone; a
+  constant -1 is that and no division, and DivFix leaves the compare
+  out where it cannot be. }
+procedure TEmitter.SignedDiv(E: PExpr; IsMod: Boolean);
+var
+  normal, done: string;
+begin
+  if (E^.R <> nil) and (E^.R^.Kind = ekInt) and (E^.R^.Num = -1) then
+  begin
+    if IsMod then
+      Line('  xorl %edx, %edx')
+    else
+      Line('  negq %rax');
+    Exit;
+  end;
+  if not DivFix(E) then
+  begin
+    Line('  cqto');
+    Line('  idivq %rcx');
+    Exit;
+  end;
+  normal := Lab;
+  done := Lab;
+  Line('  cmpq $-1, %rcx');
+  Line('  jne ' + normal);
+  if IsMod then
+    Line('  xorl %edx, %edx')
+  else
+    Line('  negq %rax');
+  Line('  jmp ' + done);
+  Line(normal + ':');
+  Line('  cqto');
+  Line('  idivq %rcx');
+  Line(done + ':');
 end;
 
 { The divisor is zero: rt_divzero, out of line (P299). }

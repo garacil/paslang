@@ -328,6 +328,9 @@ GOLDEN_A64 += manyargs
 # P355: every argument that calls nothing pushes nothing.
 GOLDEN += heldargs
 GOLDEN_A64 += heldargs
+# P359: the lowest Int64 divided by -1 wraps on amd64 as on arm64.
+GOLDEN += divwrap
+GOLDEN_A64 += divwrap
 # P354: a routine's record keeps no saved register once it is loaded back.
 GOLDEN += gstale
 GOLDEN_A64 += gstale
