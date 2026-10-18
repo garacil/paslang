@@ -11631,12 +11631,16 @@ readied it, so a send and the receive it wakes cost no thread switch.
 When nothing is runnable a thread looks for work for a short while and
 then sleeps: one thread waits in `epoll_wait` for events and timers,
 the others on a futex until they are needed; an idle program uses no
-CPU. The timers are one heap of routines by wake time, as Go's: `Sleep`
-and a wait with a deadline (`WaitMs`, `TcpReadDeadline`,
-`UdpRecvFromMs`) go in and out of it in O(log n) and cost no system
-call, whichever of the descriptor and the deadline comes first; ten
-thousand routines asleep at once are ten thousand entries and nothing
-else (1.1.1). The last thread to go to sleep checks whether anything can still
+CPU. The timers are heaps of routines by wake time, one in each P (the
+right to run code a thread holds) under that P's own lock, as Go's:
+`Sleep` and a wait with a deadline (`WaitMs`, `TcpReadDeadline`,
+`UdpRecvFromMs`) go into the heap of the P they run on and out of it in
+O(log n) and cost no system call, whichever of the descriptor and the
+deadline comes first; ten thousand routines asleep at once are ten
+thousand entries and nothing else (1.1.1). A thread runs its own P's due
+timers whenever it looks for work and another P's before it takes work
+from it, and the thread in `epoll_wait` sleeps to the earliest timer of
+all, woken only by a new one earlier than that (1.1.197). The last thread to go to sleep checks whether anything can still
 happen: with no timer pending, no routine waiting on a descriptor, no
 thread in a system call or looking for work, and a routine still alive,
 it stops the program with `paslang: all routines are asleep: deadlock`

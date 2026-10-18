@@ -58,8 +58,12 @@ mark = value(f"*(long*)(${replacement} + 56)")
 if pending < 1 or mark != 1:
     raise gdb.GdbError(f"published replacement is not counted: count={pending}, mark={mark}")
 
-names = ("rt_msleep", "rt_nspinning", "rt_sleeph", "rt_npollwait", "rt_maindone", "rt_nlive")
+names = ("rt_msleep", "rt_nspinning", "rt_npollwait", "rt_maindone", "rt_nlive")
 snapshot = {name: word(name) for name in names}
+# the timers are each P's (P352): how many each holds, at P+2152
+timer_counts = [value("(unsigned long)&rt_allp") + index * 2176 + 2152
+                for index in range(word("rt_nproc"))]
+timer_snapshot = {address: value(f"*(unsigned long long*){address}") for address in timer_counts}
 register_names = ([f"x{index}" for index in range(31)] + ["sp", "pc", "cpsr"] if arm else
                   ["rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
                    *[f"r{index}" for index in range(8, 16)], "rip", "eflags"])
@@ -72,8 +76,10 @@ if not arm:
 for has_capacity in (True, False):
     setword("rt_msleep", (snapshot["rt_msleep"] & ~0xffffffff) | (word("rt_mstarted") - 1))
     setword("rt_nspinning", pending if has_capacity else 0)
-    for name in ("rt_sleeph", "rt_npollwait", "rt_maindone"):
+    for name in ("rt_npollwait", "rt_maindone"):
         setword(name, 0)
+    for address in timer_counts:
+        gdb.execute(f"set *(unsigned long long*){address} = 0")
     setword("rt_nlive", 2)
     if arm:
         setregister("x30", resume)
@@ -95,6 +101,8 @@ for has_capacity in (True, False):
 
 for name, number in snapshot.items():
     setword(name, number)
+for address, number in timer_snapshot.items():
+    gdb.execute(f"set *(unsigned long long*){address} = {number}")
 if saved_stack is not None:
     gdb.selected_inferior().write_memory(registers[sp] - 8, saved_stack)
 if not arm:

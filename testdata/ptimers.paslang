@@ -1,0 +1,114 @@
+{ P352: each P keeps its own timers under its own lock. 64 routines,
+  spread over the Ps, sleep from 1 to 64 ms while one routine waits in
+  the poller: each wakes, none before its time. 32 routines wait for a
+  byte with a deadline of 300 ms: the 16 that get it first take their
+  timer off the P that holds it, wherever they run then, and wake long
+  before it; the other 16 wake at it, none before. Then the same once
+  more, so the heaps are used again after they emptied. }
+program ptimers;
+
+uses
+  pasnet, paslib;
+
+const
+  NSleep = 64;
+  NWait = 32;
+
+var
+  early, late, short, wrong: Integer;
+  wg: waitgroup;
+  l: Integer;
+  cs, ss: array[0..NWait - 1] of Integer;
+
+procedure Sleeper(Ms: Integer);
+var
+  t0, took: Integer;
+begin
+  t0 := Nanotime;
+  Sleep(Ms);
+  took := (Nanotime - t0) div 1000000;
+  if took < Ms then
+    AtomicAdd(@early, 1);
+  wg.Done;
+end;
+
+procedure Reader(K: Integer);
+var
+  t0, took: Integer;
+  got: string;
+begin
+  t0 := Nanotime;
+  got := TcpReadDeadline(ss[K], 1, 300);
+  took := (Nanotime - t0) div 1000000;
+  if K mod 2 = 0 then
+  begin
+    if got <> 'x' then
+      AtomicAdd(@wrong, 1);
+    if took >= 250 then
+      AtomicAdd(@late, 1);
+  end
+  else
+  begin
+    if got <> '' then
+      AtomicAdd(@wrong, 1);
+    if took < 300 then
+      AtomicAdd(@short, 1);
+  end;
+  wg.Done;
+end;
+
+procedure Writer(K: Integer);
+begin
+  Sleep(5);
+  if TcpWrite(cs[K], 'x') <> 1 then
+    AtomicAdd(@wrong, 1);
+  wg.Done;
+end;
+
+procedure OneRound;
+var
+  i: Integer;
+begin
+  for i := 1 to NSleep do
+  begin
+    wg.Add(1);
+    pas Sleeper(i);
+  end;
+  for i := 0 to NWait - 1 do
+  begin
+    wg.Add(1);
+    pas Reader(i);
+    if i mod 2 = 0 then
+    begin
+      wg.Add(1);
+      pas Writer(i);
+    end;
+  end;
+  wg.Wait;
+end;
+
+var
+  i, r: Integer;
+
+begin
+  l := TcpListen(0);
+  for i := 0 to NWait - 1 do
+  begin
+    cs[i] := TcpConnect('127.0.0.1', TcpPort(l));
+    ss[i] := TcpAccept(l);
+  end;
+  for r := 1 to 2 do
+  begin
+    OneRound;
+    { the odd ones never got a byte; the even ones' bytes were read }
+  end;
+  WriteLn('sleeps woke early: ', early);
+  WriteLn('reads past their byte by 250 ms: ', late);
+  WriteLn('deadlines that came short: ', short);
+  WriteLn('wrong results: ', wrong);
+  for i := 0 to NWait - 1 do
+  begin
+    TcpClose(cs[i]);
+    TcpClose(ss[i]);
+  end;
+end.

@@ -33950,7 +33950,9 @@ begin
   { M: 128 bytes. 0 id, 8 p, 16 curg, 32 syssp.
     P: 2176 bytes. 0 id, 8 m, 16 head u32, 20 tail u32, 24 runnext, 40 runq[256],
     2088 gfree head, 2096 gfree count, 2104 slab next, 2112 slab end (P98),
-    2120 alloc next, 2128 alloc end (P94).
+    2120 alloc next, 2128 alloc end (P94), 2136 mcache, and its timers
+    (P352): 2144 their heap, 2152 how many, 2160 their lock, 2168 the
+    earliest wake time, all ones with none.
     G: 0 lo, 8 hi, 16/24 guard, 32 m, 40 sp, 48 pc, 56 bp, 64 link, 128 fn, 136/144 args. }
   Line('.globl rt_pas');
   Line('rt_ncpu:');
@@ -34474,14 +34476,20 @@ begin
     Go's findRunnable checks the P's timers: they were checked only by
     the idle M that polls, and with every M running (P91: or no other M
     started) a routine asleep never woke. Preemption brings a busy M
-    here every 10 ms; rt_ready puts the routine in this P's runnext. }
+    here every 10 ms; rt_ready puts the routine in this P's runnext.
+    Each P has its own timers (P352): this M runs its own P's here and
+    another P's due ones before it steals from that P, as Go's stealWork
+    does. }
   Line('rt_findrunnable:');
-  Line('  cmpq $0, rt_sleeph(%rip)');
+  Line('  movq 8(%r13), %rdi');
+  Line('  cmpq $0, 2152(%rdi)');
   Line('  je .fr_q');
   Line('  call rt_now');
-  Line('  cmpq rt_timer0(%rip), %rax');
+  Line('  movq 8(%r13), %rdi');
+  Line('  cmpq 2168(%rdi), %rax');
   Line('  jb .fr_q');
-  Line('  call rt_checktimers');
+  Line('  movq %rax, %rsi');
+  Line('  call rt_runtimers');
   { One round in 61 looks at the global queue before the local one, as
     Go's schedule does (M+96 counts down): an M whose local queue never
     empties would leave the global one to wait for ever (1.0.71). }
@@ -34516,27 +34524,47 @@ begin
   Line('  testq %rax, %rax');
   Line('  jnz .fr_done');
   Line('.fr_steal0:');
+  Line('  call rt_now');
+  Line('  pushq %rax');
   Line('  movq rt_nproc(%rip), %r12');
   Line('  xorq %r15, %r15');
   Line('.fr_st:');
   Line('  cmpq %r12, %r15');
   Line('  jae .fr_none');
-  Line('  movq %r15, %rax');
-  Line('  movq $2176, %rcx');
-  Line('  mulq %rcx');
-  Line('  leaq rt_allp(%rip), %rsi');
+  Line('  imulq $2176, %r15, %rsi');
+  Line('  leaq rt_allp(%rip), %rax');
   Line('  addq %rax, %rsi');
   Line('  movq 8(%r13), %rdi');
   Line('  cmpq %rdi, %rsi');
   Line('  je .fr_next');
+  { that P's due timers, the routines they wake readied on this one }
+  Line('  cmpq $0, 2152(%rsi)');
+  Line('  je .fr_sq');
+  Line('  movq (%rsp), %rax');
+  Line('  cmpq %rax, 2168(%rsi)');
+  Line('  ja .fr_sq');
+  Line('  movq %rsi, %rdi');
+  Line('  movq %rax, %rsi');
+  Line('  call rt_runtimers');
+  Line('  movq 8(%r13), %rdi');
+  Line('  call rt_runqget');
+  Line('  testq %rax, %rax');
+  Line('  jnz .fr_sdone');
+  Line('  imulq $2176, %r15, %rsi');
+  Line('  leaq rt_allp(%rip), %rax');
+  Line('  addq %rax, %rsi');
+  Line('  movq 8(%r13), %rdi');
+  Line('.fr_sq:');
   Line('  call rt_runqsteal');
   Line('  testq %rax, %rax');
-  Line('  jnz .fr_done');
+  Line('  jnz .fr_sdone');
   Line('.fr_next:');
   Line('  incq %r15');
   Line('  jmp .fr_st');
   Line('.fr_none:');
   Line('  xorq %rax, %rax');
+  Line('.fr_sdone:');
+  Line('  popq %rcx');
   Line('.fr_done:');
   Line('  ret');
   Line('');
@@ -34796,7 +34824,7 @@ begin
     (the low half equals rt_mstarted) nothing runs any more, and the
     program is dead if nothing can wake anything: no M spinning or being
     woken (rt_nspinning; rt_wakep claims it before it pops an M), no
-    routine asleep on a timer (rt_sleeph), none parked on the poller
+    routine asleep on a timer (rt_anytimer, P352), none parked on the poller
     (rt_npollwait, kept by rt_waitio and rt_acwait), and a routine still
     alive (main while it has not returned, or another one after). The
     reads are consistent because the word is read again at the end:
@@ -34818,8 +34846,11 @@ begin
   Line('  jne .msi_ret');
   Line('  cmpq $0, rt_nspinning(%rip)');
   Line('  jne .msi_ret');
-  Line('  cmpq $0, rt_sleeph(%rip)');
-  Line('  jne .msi_ret');
+  Line('  pushq %rax');
+  Line('  call rt_anytimer');
+  Line('  testq %rax, %rax');
+  Line('  popq %rax');
+  Line('  jnz .msi_ret');
   Line('  cmpq $0, rt_npollwait(%rip)');
   Line('  jne .msi_ret');
   Line('  cmpq $0, rt_maindone(%rip)');
@@ -35683,53 +35714,40 @@ begin
   Line('  movq %rbx, 208(%r14)');
   Line('  movq $0, 264(%r14)');
   Line('  movl $1, 152(%r14)');
-  Line('  pushq %rbx');
-  Line('  leaq rt_glock(%rip), %rdi');
-  Line('  call rt_lock');
-  { the earliest wake time before this one: all ones with no timer, as
-    rt_timer0 says once the heap empties (it is 0 before the first one,
-    and the first Sleep beside a routine waiting in the poller slept
-    for ever) }
-  Line('  movq rt_timer0(%rip), %rax');
-  Line('  cmpq $0, rt_sleeph(%rip)');
-  Line('  jne .sl_t0');
-  Line('  movq $-1, %rax');
-  Line('.sl_t0:');
-  Line('  pushq %rax');
-  Line('  movq %r14, %rdi');
-  Line('  call rt_tins');
-  Line('  leaq rt_glock(%rip), %rdi');
-  Line('  call rt_unlock');
-  { A new timer earlier than the earliest one before it may come before
-    the deadline an M sleeps to in epoll_wait, which that one gave it:
-    poke the poller out so it recomputes; a later one it meets on time.
-    Go's wakeNetPoller (runtime/proc.go) pokes a poller only when it
-    sleeps past the new timer (P350): one Sleep of 20,000 at once wrote
-    the eventfd every time. }
-  Line('  popq %rax');
-  Line('  popq %rcx');
-  Line('  cmpq %rax, %rcx');
-  Line('  jae .sl_np');
-  Line('  call rt_poke');
-  Line('.sl_np:');
+  { on this M's P's timers, under that P's lock (P352), as Go's
+    maybeAdd takes the current P's: the routine runs runtime code, so
+    neither its M nor that M's P changes meanwhile }
+  Line('  movq 32(%r14), %rax');
+  Line('  movq 8(%rax), %rsi');
+  Line('  call rt_tadd');
   Line('  popq %rbx');
   Line('  call rt_parkmarked');
   Line('  ret');
   Line('');
-  { The timers (P115, 1.1.1): a binary min-heap of routines by wake time,
-    at rt_theap (64 MB of address space mapped the first time, pages
-    touched as it grows), its count in rt_sleeph, a routine's index + 1
-    at G+216 (0 when it is in no heap), its wake time at G+208 and, for
-    a wait on a descriptor with a deadline, the wait's token at G+264
-    (0 for Sleep). Insert, delete and a look at the earliest are
-    O(log n) and O(1), as Go's timer heaps; the list it replaces was
-    walked whole at every look. rt_timer0 is the earliest wake time, all
-    ones when there is none. rt_glock is held for all of them.
-    rt_tsift: rdi an index; the routine there goes up while its parent
-    wakes later, then down while a child wakes earlier, and every
-    routine moved gets its new index. Caller-saved registers only. }
+  { The timers (P115, 1.1.1; P352): a binary min-heap of routines by
+    wake time in each P, as Go keeps a heap of timers in each P
+    (runtime/time.go timers): at P+2144 (64 MB of address space mapped
+    the first time, pages touched as it grows), their count at P+2152,
+    their lock at P+2160, the earliest wake time at P+2168, all ones
+    with none. One heap under the global lock made every Sleep wait for
+    every other: b17conc's sleepers spent most of their time in rt_lock
+    on rt_glock. A routine's place is at G+216: the P's id in its high
+    half and the index + 1 in its low one (0 when it is in no heap);
+    its wake time at G+208 and, for a wait on a descriptor with a
+    deadline, the wait's token at G+264 (0 for Sleep). Insert, delete
+    and a look at the earliest are O(log n) and O(1). The P's lock is
+    held for all of them.
+    rt_tsift: rdi an index, rsi the P; the routine there goes up while
+    its parent wakes later, then down while a child wakes earlier, and
+    every routine moved gets its new place. Caller-saved registers, rsi
+    among them; rbx and r12 kept. }
   Line('rt_tsift:');
-  Line('  movq rt_theap(%rip), %r8');
+  Line('  pushq %rbx');
+  Line('  pushq %r12');
+  Line('  movq 2152(%rsi), %rbx');
+  Line('  movq (%rsi), %r12');
+  Line('  shlq $32, %r12');
+  Line('  movq 2144(%rsi), %r8');
   Line('  movq (%r8,%rdi,8), %r9');
   Line('  movq 208(%r9), %r10');
   Line('.ts_up:');
@@ -35741,17 +35759,17 @@ begin
   Line('  cmpq 208(%r11), %r10');
   Line('  jae .ts_dn');
   Line('  movq %r11, (%r8,%rdi,8)');
-  Line('  leaq 1(%rdi), %rax');
+  Line('  leaq 1(%r12,%rdi), %rax');
   Line('  movq %rax, 216(%r11)');
   Line('  movq %rsi, %rdi');
   Line('  jmp .ts_up');
   Line('.ts_dn:');
   Line('  leaq 1(%rdi,%rdi), %rsi');
-  Line('  cmpq rt_sleeph(%rip), %rsi');
+  Line('  cmpq %rbx, %rsi');
   Line('  jae .ts_put');
   Line('  movq (%r8,%rsi,8), %r11');
   Line('  leaq 1(%rsi), %rdx');
-  Line('  cmpq rt_sleeph(%rip), %rdx');
+  Line('  cmpq %rbx, %rdx');
   Line('  jae .ts_cmp');
   Line('  movq (%r8,%rdx,8), %rax');
   Line('  movq 208(%rax), %rcx');
@@ -35763,22 +35781,26 @@ begin
   Line('  cmpq 208(%r11), %r10');
   Line('  jbe .ts_put');
   Line('  movq %r11, (%r8,%rdi,8)');
-  Line('  leaq 1(%rdi), %rax');
+  Line('  leaq 1(%r12,%rdi), %rax');
   Line('  movq %rax, 216(%r11)');
   Line('  movq %rsi, %rdi');
   Line('  jmp .ts_dn');
   Line('.ts_put:');
   Line('  movq %r9, (%r8,%rdi,8)');
-  Line('  leaq 1(%rdi), %rax');
+  Line('  leaq 1(%r12,%rdi), %rax');
   Line('  movq %rax, 216(%r9)');
+  Line('  popq %r12');
+  Line('  popq %rbx');
   Line('  ret');
   Line('');
   { rt_tins: rdi a routine with its wake time at G+208 and token at
-    G+264 goes into the heap, or moves where it is if it is there. }
+    G+264 goes into the heap of the P at rsi, or moves where it is if it
+    is there (in that P's). rsi kept. }
   Line('rt_tins:');
-  Line('  cmpq $0, rt_theap(%rip)');
+  Line('  cmpq $0, 2144(%rsi)');
   Line('  jne .ti_have');
   Line('  pushq %rdi');
+  Line('  pushq %rsi');
   Line('  xorq %rdi, %rdi');
   Line('  movq $67108864, %rsi');
   Line('  movq $3, %rdx');
@@ -35787,101 +35809,190 @@ begin
   Line('  xorq %r9, %r9');
   Line('  movq $9, %rax');
   Line('  syscall');
+  Line('  popq %rsi');
   Line('  popq %rdi');
   Line('  testq %rax, %rax');
   Line('  jns .ti_mapped');
   Line('  jmp rt_diemmap');
   Line('.ti_mapped:');
-  Line('  movq %rax, rt_theap(%rip)');
+  Line('  movq %rax, 2144(%rsi)');
   Line('.ti_have:');
+  Line('  pushq %rsi');
   Line('  movq 216(%rdi), %rax');
   Line('  testq %rax, %rax');
   Line('  jnz .ti_again');
-  Line('  movq rt_sleeph(%rip), %rax');
+  Line('  movq 2152(%rsi), %rax');
   Line('  cmpq $8388608, %rax');
   Line('  jb .ti_room');
   Line('  jmp rt_dietoobig');
   Line('.ti_room:');
-  Line('  movq rt_theap(%rip), %r8');
+  Line('  movq 2144(%rsi), %r8');
   Line('  movq %rdi, (%r8,%rax,8)');
   Line('  leaq 1(%rax), %rcx');
+  Line('  movq %rcx, 2152(%rsi)');
+  Line('  movq (%rsi), %rdx');
+  Line('  shlq $32, %rdx');
+  Line('  addq %rdx, %rcx');
   Line('  movq %rcx, 216(%rdi)');
-  Line('  movq %rcx, rt_sleeph(%rip)');
   Line('  movq %rax, %rdi');
   Line('  call rt_tsift');
   Line('  jmp .ti_t0');
   Line('.ti_again:');
-  Line('  leaq -1(%rax), %rdi');
+  Line('  movl %eax, %edi');
+  Line('  decq %rdi');
   Line('  call rt_tsift');
   Line('.ti_t0:');
-  Line('  movq rt_theap(%rip), %r8');
+  Line('  popq %rsi');
+  Line('  movq 2144(%rsi), %r8');
   Line('  movq (%r8), %rax');
   Line('  movq 208(%rax), %rax');
-  Line('  movq %rax, rt_timer0(%rip)');
+  Line('  movq %rax, 2168(%rsi)');
   Line('  ret');
   Line('');
-  { rt_tdel: rdi a routine; out of the heap if it is in it. }
+  { rt_tdel: rdi a routine, rsi the P whose heap holds it, that P's lock
+    held; out of the heap if it is in it. rsi kept. }
   Line('rt_tdel:');
   Line('  movq 216(%rdi), %rax');
   Line('  testq %rax, %rax');
   Line('  jz .td_ret');
   Line('  movq $0, 216(%rdi)');
+  Line('  movl %eax, %eax');
   Line('  decq %rax');
-  Line('  movq rt_sleeph(%rip), %rcx');
+  Line('  movq 2152(%rsi), %rcx');
   Line('  decq %rcx');
-  Line('  movq %rcx, rt_sleeph(%rip)');
+  Line('  movq %rcx, 2152(%rsi)');
   Line('  cmpq %rcx, %rax');
   Line('  je .td_t0');
-  Line('  movq rt_theap(%rip), %r8');
+  Line('  pushq %rsi');
+  Line('  movq 2144(%rsi), %r8');
   Line('  movq (%r8,%rcx,8), %r9');
   Line('  movq %r9, (%r8,%rax,8)');
-  Line('  leaq 1(%rax), %rdx');
-  Line('  movq %rdx, 216(%r9)');
   Line('  movq %rax, %rdi');
   Line('  call rt_tsift');
+  Line('  popq %rsi');
   Line('.td_t0:');
   Line('  movq $-1, %rax');
-  Line('  cmpq $0, rt_sleeph(%rip)');
+  Line('  cmpq $0, 2152(%rsi)');
   Line('  je .td_set');
-  Line('  movq rt_theap(%rip), %r8');
+  Line('  movq 2144(%rsi), %r8');
   Line('  movq (%r8), %rax');
   Line('  movq 208(%rax), %rax');
   Line('.td_set:');
-  Line('  movq %rax, rt_timer0(%rip)');
+  Line('  movq %rax, 2168(%rsi)');
   Line('.td_ret:');
   Line('  ret');
   Line('');
-  { rt_checktimers: the routines whose time has come are taken off the
-    heap with the lock held, into a batch of 32 on this stack with the
-    token each needs (read while the lock keeps the routine from moving
-    on), and woken once it is dropped: a Sleep readied, a deadline wait
-    through its token, which does nothing when the descriptor woke it
-    first. A full batch is woken and the heap looked at again. rax: the
-    milliseconds until the next one, or -1 when there is none. }
-  Line('rt_checktimers:');
+  { rt_tadd: the routine r14, its wake time at G+208 and token at G+264,
+    onto the timers of the P at rsi under that P's lock. Then, as Go's
+    maybeAdd and wakeNetPoller (runtime/time.go, proc.go): only a timer
+    earlier than the P's earliest before it can come before what any M
+    waits for; then with an M in the poller (rt_pollerm) it is poked
+    out when the deadline it sleeps to (rt_polluntil, 0 while it is not
+    known yet) is later, and with none rt_wakep sends one there.
+    Callee-saved registers kept. }
+  Line('rt_tadd:');
+  Line('  pushq %rbx');
+  Line('  movq %rsi, %rbx');
+  Line('  leaq 2160(%rbx), %rdi');
+  Line('  call rt_lock');
+  Line('  movq 2168(%rbx), %rax');
+  Line('  cmpq $0, 2152(%rbx)');
+  Line('  jne .ta_t0');
+  Line('  movq $-1, %rax');
+  Line('.ta_t0:');
+  Line('  pushq %rax');
+  Line('  movq %r14, %rdi');
+  Line('  movq %rbx, %rsi');
+  Line('  call rt_tins');
+  Line('  leaq 2160(%rbx), %rdi');
+  Line('  call rt_unlock');
+  Line('  popq %rax');
+  Line('  movq 208(%r14), %rdi');
+  Line('  popq %rbx');
+  Line('  cmpq %rax, %rdi');
+  Line('  jae .ta_ret');
+  Line('  cmpq $0, rt_pollerm(%rip)');
+  Line('  je rt_wakep');
+  Line('  movq rt_polluntil(%rip), %rax');
+  Line('  testq %rax, %rax');
+  Line('  jz rt_poke');
+  Line('  cmpq %rdi, %rax');
+  Line('  ja rt_poke');
+  Line('.ta_ret:');
+  Line('  ret');
+  Line('');
+  { rt_tgone: the routine r14 off the timers it is on, through the P
+    whose id G+216 holds and under its lock: a routine a descriptor
+    woke before its deadline. The place is read before the lock, then
+    again under it: only rt_runtimers takes it off meanwhile, and the
+    routine, which runs, puts itself on no heap. }
+  Line('rt_tgone:');
+  Line('  movq 216(%r14), %rax');
+  Line('  testq %rax, %rax');
+  Line('  jz .tg_ret');
+  Line('  pushq %rbx');
+  Line('  shrq $32, %rax');
+  Line('  imulq $2176, %rax, %rbx');
+  Line('  leaq rt_allp(%rip), %rax');
+  Line('  addq %rax, %rbx');
+  Line('  leaq 2160(%rbx), %rdi');
+  Line('  call rt_lock');
+  Line('  movq %r14, %rdi');
+  Line('  movq %rbx, %rsi');
+  Line('  call rt_tdel');
+  Line('  leaq 2160(%rbx), %rdi');
+  Line('  call rt_unlock');
+  Line('  popq %rbx');
+  Line('.tg_ret:');
+  Line('  ret');
+  Line('');
+  { rt_anytimer: rax not 0 when a routine is on any P's timers. }
+  Line('rt_anytimer:');
+  Line('  xorq %rax, %rax');
+  Line('  movq rt_nproc(%rip), %rcx');
+  Line('  leaq rt_allp(%rip), %rdx');
+  Line('.at_n:');
+  Line('  testq %rcx, %rcx');
+  Line('  jz .at_ret');
+  Line('  orq 2152(%rdx), %rax');
+  Line('  addq $2176, %rdx');
+  Line('  decq %rcx');
+  Line('  jmp .at_n');
+  Line('.at_ret:');
+  Line('  ret');
+  Line('');
+  { rt_runtimers: rdi a P, rsi the time now. The routines on its timers
+    whose time has come are taken off the heap with its lock held, into
+    a batch of 32 on this stack with the token each needs (read while
+    the lock keeps the routine from moving on), and woken once it is
+    dropped: a Sleep readied, a deadline wait through its token, which
+    does nothing when the descriptor woke it first. A full batch is
+    woken and the heap looked at again. Go's timers.run. rbx, r12, r13
+    and r15 kept. }
+  Line('rt_runtimers:');
   Line('  pushq %rbx');
   Line('  pushq %r12');
   Line('  pushq %r13');
   Line('  pushq %r15');
   Line('  subq $520, %rsp');
-  Line('  call rt_now');
-  Line('  movq %rax, %r12');
-  Line('.ct_batch:');
-  Line('  leaq rt_glock(%rip), %rdi');
+  Line('  movq %rdi, %r13');
+  Line('  movq %rsi, %r12');
+  Line('.rt_batch:');
+  Line('  leaq 2160(%r13), %rdi');
   Line('  call rt_lock');
   Line('  xorq %rbx, %rbx');
-  Line('  movq $-1, %r13');
-  Line('.ct_n:');
-  Line('  cmpq $0, rt_sleeph(%rip)');
-  Line('  je .ct_unl');
-  Line('  movq rt_theap(%rip), %rax');
+  Line('  movq $0, 512(%rsp)');
+  Line('.rt_n:');
+  Line('  cmpq $0, 2152(%r13)');
+  Line('  je .rt_unl');
+  Line('  movq 2144(%r13), %rax');
   Line('  movq (%rax), %r15');
-  Line('  movq 208(%r15), %rcx');
-  Line('  cmpq %r12, %rcx');
-  Line('  ja .ct_later');
+  Line('  cmpq %r12, 208(%r15)');
+  Line('  ja .rt_unl');
   Line('  cmpq $32, %rbx');
-  Line('  jae .ct_more');
+  Line('  jae .rt_more');
   Line('  movq %r15, %rdi');
+  Line('  movq %r13, %rsi');
   Line('  call rt_tdel');
   Line('  movq %rbx, %rcx');
   Line('  shlq $4, %rcx');
@@ -35889,44 +36000,102 @@ begin
   Line('  movq 264(%r15), %rax');
   Line('  movq %rax, 8(%rsp,%rcx)');
   Line('  incq %rbx');
-  Line('  jmp .ct_n');
-  Line('.ct_more:');
-  Line('  movq $-2, %r13');
-  Line('  jmp .ct_unl');
-  Line('.ct_later:');
-  Line('  movq %rcx, %rax');
-  Line('  subq %r12, %rax');
-  Line('  xorq %rdx, %rdx');
-  Line('  movq $1000000, %rcx');
-  Line('  divq %rcx');
-  Line('  incq %rax');
-  Line('  movq %rax, %r13');
-  Line('.ct_unl:');
-  Line('  leaq rt_glock(%rip), %rdi');
+  Line('  jmp .rt_n');
+  Line('.rt_more:');
+  Line('  movq $1, 512(%rsp)');
+  Line('.rt_unl:');
+  Line('  leaq 2160(%r13), %rdi');
   Line('  call rt_unlock');
   Line('  xorq %r15, %r15');
-  Line('.ct_rd:');
+  Line('.rt_rd:');
   Line('  cmpq %rbx, %r15');
-  Line('  jae .ct_bd');
+  Line('  jae .rt_bd');
   Line('  movq %r15, %rcx');
   Line('  shlq $4, %rcx');
   Line('  movq 8(%rsp,%rcx), %rax');
   Line('  testq %rax, %rax');
-  Line('  jnz .ct_tok');
+  Line('  jnz .rt_tok');
   Line('  movq (%rsp,%rcx), %rdi');
   Line('  call rt_ready');
-  Line('  jmp .ct_nx');
-  Line('.ct_tok:');
+  Line('  jmp .rt_nx');
+  Line('.rt_tok:');
   Line('  movq %rax, %rdi');
   Line('  call rt_pollwake');
-  Line('.ct_nx:');
+  Line('.rt_nx:');
   Line('  incq %r15');
-  Line('  jmp .ct_rd');
-  Line('.ct_bd:');
-  Line('  cmpq $-2, %r13');
-  Line('  je .ct_batch');
-  Line('  movq %r13, %rax');
+  Line('  jmp .rt_rd');
+  Line('.rt_bd:');
+  Line('  cmpq $0, 512(%rsp)');
+  Line('  jne .rt_batch');
   Line('  addq $520, %rsp');
+  Line('  popq %r15');
+  Line('  popq %r13');
+  Line('  popq %r12');
+  Line('  popq %rbx');
+  Line('  ret');
+  Line('');
+  { rt_checktimers: every P's due timers run (rt_runtimers), then rax
+    the milliseconds until the earliest left on any P, or -1 when there
+    is none, and rdx that earliest wake time (all ones with none), as
+    Go's poller sleeps to checkTimersNoP's pollUntil. }
+  Line('rt_checktimers:');
+  Line('  pushq %rbx');
+  Line('  pushq %r12');
+  Line('  pushq %r13');
+  Line('  pushq %r15');
+  Line('  call rt_now');
+  Line('  movq %rax, %r12');
+  Line('  xorq %r15, %r15');
+  Line('.ct_p:');
+  Line('  cmpq rt_nproc(%rip), %r15');
+  Line('  jae .ct_min');
+  Line('  imulq $2176, %r15, %rbx');
+  Line('  leaq rt_allp(%rip), %rax');
+  Line('  addq %rax, %rbx');
+  Line('  cmpq $0, 2152(%rbx)');
+  Line('  je .ct_np');
+  Line('  cmpq %r12, 2168(%rbx)');
+  Line('  ja .ct_np');
+  Line('  movq %rbx, %rdi');
+  Line('  movq %r12, %rsi');
+  Line('  call rt_runtimers');
+  Line('.ct_np:');
+  Line('  incq %r15');
+  Line('  jmp .ct_p');
+  Line('.ct_min:');
+  Line('  movq $-1, %r13');
+  Line('  xorq %r15, %r15');
+  Line('  leaq rt_allp(%rip), %rbx');
+  Line('.ct_m:');
+  Line('  cmpq rt_nproc(%rip), %r15');
+  Line('  jae .ct_ms');
+  Line('  cmpq $0, 2152(%rbx)');
+  Line('  je .ct_mn');
+  Line('  movq 2168(%rbx), %rax');
+  Line('  cmpq %r13, %rax');
+  Line('  jae .ct_mn');
+  Line('  movq %rax, %r13');
+  Line('.ct_mn:');
+  Line('  addq $2176, %rbx');
+  Line('  incq %r15');
+  Line('  jmp .ct_m');
+  Line('.ct_ms:');
+  Line('  movq %r13, %rdx');
+  Line('  movq $-1, %rax');
+  Line('  cmpq $-1, %r13');
+  Line('  je .ct_ret');
+  Line('  xorq %rax, %rax');
+  Line('  movq %r13, %rcx');
+  Line('  subq %r12, %rcx');
+  Line('  jbe .ct_ret');
+  Line('  movq %rcx, %rax');
+  Line('  pushq %rdx');
+  Line('  xorq %rdx, %rdx');
+  Line('  movq $1000000, %rcx');
+  Line('  divq %rcx');
+  Line('  incq %rax');
+  Line('  popq %rdx');
+  Line('.ct_ret:');
   Line('  popq %r15');
   Line('  popq %r13');
   Line('  popq %r12');
@@ -35938,6 +36107,8 @@ begin
   Line('  pushq %r12');
   Line('  call rt_checktimers');
   Line('  movq %rax, %rbx');
+  { the earliest wake time on the stack: rt_findrunnable takes r12 }
+  Line('  pushq %rdx');
   Line('  call rt_findrunnable');
   Line('  testq %rax, %rax');
   Line('  jnz .ip_g');
@@ -35951,12 +36122,17 @@ begin
     system call travels in r10, never rcx (SYSCALL clobbers rcx). With
     rcx the timeout was whatever r10 held, usually 0, and every idle M
     spun at full speed. -1 from rt_checktimers blocks until an event. }
+  { the deadline it sleeps to, as Go's sched.pollUntil: a new timer
+    earlier than it pokes this M out (rt_tadd); 0 again once awake }
+  Line('  movq (%rsp), %rax');
+  Line('  movq %rax, rt_polluntil(%rip)');
   Line('  subq $192, %rsp');
   Line('  movq %rsp, %rsi');
   Line('  movq $16, %rdx');
   Line('  movq %rbx, %r10');
   Line('  movq $232, %rax');
   Line('  syscall');
+  Line('  movq $0, rt_polluntil(%rip)');
   Line('  movq %rax, %rbx');
   Line('  call rt_msleepout');
   Line('  call rt_now');
@@ -35991,10 +36167,12 @@ begin
   Line('  addq $192, %rsp');
   Line('.ip_none:');
   Line('  xorq %rax, %rax');
+  Line('  addq $8, %rsp');
   Line('  popq %r12');
   Line('  popq %rbx');
   Line('  ret');
   Line('.ip_g:');
+  Line('  addq $8, %rsp');
   Line('  popq %r12');
   Line('  popq %rbx');
   Line('  ret');
@@ -36085,8 +36263,9 @@ begin
   Line('  jae .sm_scan0');
   Line('  cmpq $1, rt_nlive(%rip)');
   Line('  ja .sm_wake');
-  Line('  cmpq $0, rt_sleeph(%rip)');
-  Line('  je .sm_scan0');
+  Line('  call rt_anytimer');
+  Line('  testq %rax, %rax');
+  Line('  jz .sm_scan0');
   Line('.sm_wake:');
   Line('  call rt_wakep');
   Line('.sm_scan0:');
@@ -36215,26 +36394,10 @@ begin
   Line('  js .wi_one');
   Line('  movq %r13, 208(%r14)');
   Line('  movq %r15, 264(%r14)');
-  Line('  pushq %r13');
-  Line('  leaq rt_glock(%rip), %rdi');
-  Line('  call rt_lock');
-  Line('  movq rt_timer0(%rip), %rax');
-  Line('  cmpq $0, rt_sleeph(%rip)');
-  Line('  jne .wi_t0');
-  Line('  movq $-1, %rax');
-  Line('.wi_t0:');
-  Line('  pushq %rax');
-  Line('  movq %r14, %rdi');
-  Line('  call rt_tins');
-  Line('  leaq rt_glock(%rip), %rdi');
-  Line('  call rt_unlock');
-  { as in rt_sleep (P350) }
-  Line('  popq %rax');
-  Line('  popq %rcx');
-  Line('  cmpq %rax, %rcx');
-  Line('  jae .wi_np');
-  Line('  call rt_poke');
-  Line('.wi_np:');
+  { on this M's P's timers, as a Sleep (P352) }
+  Line('  movq 32(%r14), %rax');
+  Line('  movq 8(%rax), %rsi');
+  Line('  call rt_tadd');
   Line('.wi_one:');
   { MOD first (P115, 1.1.1): after its first wait a descriptor stays
     in the set, one-shot and disarmed, so ADD failed with EEXIST on
@@ -36296,12 +36459,7 @@ begin
   { a deadline that did not come is taken off the timers }
   Line('  cmpq $0, 264(%r14)');
   Line('  je .wi_nt');
-  Line('  leaq rt_glock(%rip), %rdi');
-  Line('  call rt_lock');
-  Line('  movq %r14, %rdi');
-  Line('  call rt_tdel');
-  Line('  leaq rt_glock(%rip), %rdi');
-  Line('  call rt_unlock');
+  Line('  call rt_tgone');
   Line('  movq $0, 264(%r14)');
   Line('.wi_nt:');
   Line('  lock decq rt_npollwait(%rip)');
@@ -41962,6 +42120,7 @@ begin
   Line('  leaq rt_allp(%rip), %rdx');
   Line('.hi_p:');
   Line('  movq %rax, 2136(%rdx)');
+  Line('  movq $-1, 2168(%rdx)');
   Line('  addq $4608, %rax');
   Line('  addq $2176, %rdx');
   Line('  decq %rcx');
@@ -45201,16 +45360,10 @@ begin
       until an M drains it (P350) }
     Line('rt_wakesig:');
     Line('  .quad 0');
-    { The number of timers in the heap at rt_theap (P115: a count now,
-      the head of a list before; every test of it for 0 still holds). }
-    Line('rt_sleeph:');
-    Line('  .quad 0');
-    { The earliest wake time in the heap, or all ones (Go's timer0When,
-      P91): rt_tins and rt_tdel set it. It starts at 0 (.bss), and every
-      reader tests rt_sleeph first. }
-    Line('rt_timer0:');
-    Line('  .quad 0');
-    Line('rt_theap:');
+    { The deadline the M in the poller sleeps to, all ones for none, 0
+      while it is not known (P352, Go's sched.pollUntil); the timers are
+      each P's. }
+    Line('rt_polluntil:');
     Line('  .quad 0');
     Line('rt_iotab:');
     Line('  .zero 1024');
@@ -51054,16 +51207,22 @@ begin
   Line('  ldp x19, x20, [sp], #16');
   Line('  ldr x30, [sp], #16');
   Line('  ret');
-  { As on amd64 (P91): a due timer fires on any M that schedules. }
+  { As on amd64 (P91, P352): a due timer of this M's P fires on any M
+    that schedules, another P's before this M steals from it. }
   Line('rt_findrunnable:');
   Line('  str x30, [sp, #-16]!');
-  LdS('rt_sleeph', 'x9');
+  Line('  ldr x9, [x21, #8]');
   Line('  cbz x9, .fr_q');
+  Line('  ldr x10, [x9, #2152]');
+  Line('  cbz x10, .fr_q');
   Line('  bl rt_now');
-  LdS('rt_timer0', 'x9');
-  Line('  cmp x0, x9');
+  Line('  ldr x9, [x21, #8]');
+  Line('  ldr x10, [x9, #2168]');
+  Line('  cmp x0, x10');
   Line('  b.lo .fr_q');
-  Line('  bl rt_checktimers');
+  Line('  mov x1, x0');
+  Line('  mov x0, x9');
+  Line('  bl rt_runtimers');
   { One round in 61 takes from the global queue first, as on amd64. }
   Line('.fr_q:');
   Line('  ldr x9, [x21, #96]');
@@ -51095,6 +51254,8 @@ begin
   Line('  bl rt_runqget');
   Line('  cbnz x0, .fr_done');
   Line('.fr_steal0:');
+  Line('  bl rt_now');
+  Line('  str x0, [sp, #-16]!');
   LdS('rt_nproc', 'x20');
   Line('  mov x22, xzr');
   Line('.fr_st:');
@@ -51107,13 +51268,33 @@ begin
   Line('  ldr x0, [x21, #8]');
   Line('  cmp x0, x1');
   Line('  b.eq .fr_next');
+  Line('  ldr x9, [x1, #2152]');
+  Line('  cbz x9, .fr_sq');
+  Line('  ldr x9, [x1, #2168]');
+  Line('  ldr x10, [sp]');
+  Line('  cmp x9, x10');
+  Line('  b.hi .fr_sq');
+  Line('  mov x0, x1');
+  Line('  mov x1, x10');
+  Line('  bl rt_runtimers');
+  Line('  ldr x0, [x21, #8]');
+  Line('  bl rt_runqget');
+  Line('  cbnz x0, .fr_sdone');
+  Imm('x9', 2176);
+  Line('  mul x0, x22, x9');
+  LeaS('rt_allp', 'x1');
+  Line('  add x1, x1, x0');
+  Line('  ldr x0, [x21, #8]');
+  Line('.fr_sq:');
   Line('  bl rt_runqsteal');
-  Line('  cbnz x0, .fr_done');
+  Line('  cbnz x0, .fr_sdone');
   Line('.fr_next:');
   Line('  add x22, x22, #1');
   Line('  b .fr_st');
   Line('.fr_none:');
   Line('  mov x0, xzr');
+  Line('.fr_sdone:');
+  Line('  add sp, sp, #16');
   Line('.fr_done:');
   Line('  ldr x30, [sp], #16');
   Line('  ret');
@@ -51386,8 +51567,17 @@ begin
   Line('  b.ne .msi_ret');
   LdS('rt_nspinning', 'x12');
   Line('  cbnz x12, .msi_ret');
-  LdS('rt_sleeph', 'x12');
-  Line('  cbnz x12, .msi_ret');
+  { a routine on any P's timers (P352); x9 to x11 hold the count }
+  LdS('rt_nproc', 'x13');
+  LeaS('rt_allp', 'x14');
+  Line('.msi_tp:');
+  Line('  cbz x13, .msi_tn');
+  Line('  ldr x15, [x14, #2152]');
+  Line('  cbnz x15, .msi_ret');
+  Line('  add x14, x14, #2176');
+  Line('  sub x13, x13, #1');
+  Line('  b .msi_tp');
+  Line('.msi_tn:');
   LdS('rt_npollwait', 'x12');
   Line('  cbnz x12, .msi_ret');
   LdS('rt_maindone', 'x12');
@@ -52318,49 +52508,37 @@ begin
   Line('  str xzr, [x28, #264]');
   Line('  mov w9, #1');
   Line('  str w9, [x28, #152]');
-  LeaS('rt_glock', 'x0');
-  Line('  bl rt_lock');
-  { the earliest wake time before this one, all ones with no timer (as
-    on amd64), and this one (P350) }
-  LdS('rt_timer0', 'x9');
-  LdS('rt_sleeph', 'x10');
-  Line('  cmp x10, #0');
-  Line('  csinv x9, x9, xzr, ne');
-  Line('  stp x9, x19, [sp, #-16]!');
-  Line('  mov x0, x28');
-  Line('  bl rt_tins');
-  LeaS('rt_glock', 'x0');
-  Line('  bl rt_unlock');
-  { as on amd64: a poke only for a timer before the earliest one }
-  Line('  ldp x9, x10, [sp], #16');
-  Line('  cmp x10, x9');
-  Line('  b.hs .asl_np');
-  Line('  bl rt_poke');
-  Line('.asl_np:');
+  { on this M's P's timers, as on amd64 (P352) }
+  Line('  ldr x9, [x28, #32]');
+  Line('  ldr x1, [x9, #8]');
+  Line('  bl rt_tadd');
   Line('  ldp x19, x20, [sp], #16');
   Line('  ldr x30, [sp], #16');
   Line('  b rt_parkmarked');
-  { The timers on arm64, as on amd64 (P115, 1.1.1). rt_tsift: x0 an
-    index; x1-x3 and x9-x15 used. }
+  { The timers on arm64, as on amd64 (P115, 1.1.1; P352: a heap in each
+    P). rt_tsift: x0 an index, x1 the P (kept); x2 to x5 and x9 to x15
+    change. }
   Line('rt_tsift:');
-  LdS('rt_theap', 'x9');
+  Line('  ldr x9, [x1, #2144]');
+  Line('  ldr x15, [x1, #2152]');
+  Line('  ldr x4, [x1]');
+  Line('  lsl x4, x4, #32');
   Line('  ldr x10, [x9, x0, lsl #3]');
   Line('  ldr x11, [x10, #208]');
   Line('.ats_up:');
-  Line('  cbz x0, .ats_dl');
+  Line('  cbz x0, .ats_dn');
   Line('  sub x12, x0, #1');
   Line('  lsr x12, x12, #1');
   Line('  ldr x13, [x9, x12, lsl #3]');
   Line('  ldr x14, [x13, #208]');
   Line('  cmp x11, x14');
-  Line('  b.hs .ats_dl');
+  Line('  b.hs .ats_dn');
   Line('  str x13, [x9, x0, lsl #3]');
-  Line('  add x15, x0, #1');
-  Line('  str x15, [x13, #216]');
+  Line('  add x14, x0, #1');
+  Line('  orr x14, x14, x4');
+  Line('  str x14, [x13, #216]');
   Line('  mov x0, x12');
   Line('  b .ats_up');
-  Line('.ats_dl:');
-  LdS('rt_sleeph', 'x15');
   Line('.ats_dn:');
   Line('  lsl x12, x0, #1');
   Line('  add x12, x12, #1');
@@ -52370,33 +52548,36 @@ begin
   Line('  add x14, x12, #1');
   Line('  cmp x14, x15');
   Line('  b.hs .ats_cmp');
-  Line('  ldr x1, [x9, x14, lsl #3]');
-  Line('  ldr x2, [x1, #208]');
+  Line('  ldr x5, [x9, x14, lsl #3]');
+  Line('  ldr x2, [x5, #208]');
   Line('  ldr x3, [x13, #208]');
   Line('  cmp x2, x3');
   Line('  b.hs .ats_cmp');
   Line('  mov x12, x14');
-  Line('  mov x13, x1');
+  Line('  mov x13, x5');
   Line('.ats_cmp:');
   Line('  ldr x3, [x13, #208]');
   Line('  cmp x11, x3');
   Line('  b.ls .ats_put');
   Line('  str x13, [x9, x0, lsl #3]');
   Line('  add x14, x0, #1');
+  Line('  orr x14, x14, x4');
   Line('  str x14, [x13, #216]');
   Line('  mov x0, x12');
   Line('  b .ats_dn');
   Line('.ats_put:');
   Line('  str x10, [x9, x0, lsl #3]');
   Line('  add x14, x0, #1');
+  Line('  orr x14, x14, x4');
   Line('  str x14, [x10, #216]');
   Line('  ret');
-  { rt_tins: x0 a routine with G+208 and G+264 set. }
+  { rt_tins: x0 a routine with G+208 and G+264 set, x1 the P (kept). }
   Line('rt_tins:');
   Line('  str x30, [sp, #-16]!');
   Line('  stp x19, x20, [sp, #-16]!');
   Line('  mov x19, x0');
-  LdS('rt_theap', 'x9');
+  Line('  mov x20, x1');
+  Line('  ldr x9, [x20, #2144]');
   Line('  cbnz x9, .atin_have');
   Line('  mov x0, xzr');
   Imm('x1', 67108864);
@@ -52410,92 +52591,172 @@ begin
   Line('  b.ge .atin_mapped');
   Line('  b rt_diemmap');
   Line('.atin_mapped:');
-  StS('x0', 'rt_theap');
+  Line('  str x0, [x20, #2144]');
   Line('.atin_have:');
   Line('  ldr x9, [x19, #216]');
   Line('  cbnz x9, .atin_again');
-  LdS('rt_sleeph', 'x10');
+  Line('  ldr x10, [x20, #2152]');
   Imm('x11', 8388608);
   Line('  cmp x10, x11');
   Line('  b.lo .atin_room');
   Line('  b rt_dietoobig');
   Line('.atin_room:');
-  LdS('rt_theap', 'x9');
+  Line('  ldr x9, [x20, #2144]');
   Line('  str x19, [x9, x10, lsl #3]');
   Line('  add x11, x10, #1');
+  Line('  str x11, [x20, #2152]');
+  Line('  ldr x12, [x20]');
+  Line('  orr x11, x11, x12, lsl #32');
   Line('  str x11, [x19, #216]');
-  StS('x11', 'rt_sleeph');
   Line('  mov x0, x10');
+  Line('  mov x1, x20');
   Line('  bl rt_tsift');
   Line('  b .atin_t0');
   Line('.atin_again:');
-  Line('  sub x0, x9, #1');
+  Line('  mov w0, w9');
+  Line('  sub x0, x0, #1');
+  Line('  mov x1, x20');
   Line('  bl rt_tsift');
   Line('.atin_t0:');
-  LdS('rt_theap', 'x9');
+  Line('  ldr x9, [x20, #2144]');
   Line('  ldr x10, [x9]');
   Line('  ldr x10, [x10, #208]');
-  StS('x10', 'rt_timer0');
+  Line('  str x10, [x20, #2168]');
+  Line('  mov x1, x20');
   Line('  ldp x19, x20, [sp], #16');
   Line('  ldr x30, [sp], #16');
   Line('  ret');
-  { rt_tdel: x0 a routine; out of the heap if it is in it. }
+  { rt_tdel: x0 a routine, x1 the P whose heap holds it (kept), its lock
+    held; out of the heap if it is in it. }
   Line('rt_tdel:');
   Line('  str x30, [sp, #-16]!');
   Line('  ldr x9, [x0, #216]');
   Line('  cbz x9, .atd_ret');
   Line('  str xzr, [x0, #216]');
+  Line('  mov w9, w9');
   Line('  sub x9, x9, #1');
-  LdS('rt_sleeph', 'x10');
+  Line('  ldr x10, [x1, #2152]');
   Line('  sub x10, x10, #1');
-  StS('x10', 'rt_sleeph');
+  Line('  str x10, [x1, #2152]');
   Line('  cmp x9, x10');
   Line('  b.eq .atd_t0');
-  LdS('rt_theap', 'x11');
+  Line('  ldr x11, [x1, #2144]');
   Line('  ldr x12, [x11, x10, lsl #3]');
   Line('  str x12, [x11, x9, lsl #3]');
-  Line('  add x13, x9, #1');
-  Line('  str x13, [x12, #216]');
   Line('  mov x0, x9');
   Line('  bl rt_tsift');
   Line('.atd_t0:');
   Line('  mov x10, #-1');
-  LdS('rt_sleeph', 'x9');
+  Line('  ldr x9, [x1, #2152]');
   Line('  cbz x9, .atd_set');
-  LdS('rt_theap', 'x11');
+  Line('  ldr x11, [x1, #2144]');
   Line('  ldr x10, [x11]');
   Line('  ldr x10, [x10, #208]');
   Line('.atd_set:');
-  StS('x10', 'rt_timer0');
+  Line('  str x10, [x1, #2168]');
   Line('.atd_ret:');
   Line('  ldr x30, [sp], #16');
   Line('  ret');
-  { rt_checktimers on arm64: the batch of 32 (routine, token) on this
-    stack, as on amd64. x0: milliseconds to the next, or -1. }
-  Line('rt_checktimers:');
+  { rt_tadd: the routine x28 onto the timers of the P at x1 under that
+    P's lock, and the poller woken as on amd64 (Go's maybeAdd and
+    wakeNetPoller). x19 to x29 kept. }
+  Line('rt_tadd:');
+  Line('  str x30, [sp, #-16]!');
+  Line('  stp x19, x20, [sp, #-16]!');
+  Line('  mov x19, x1');
+  Line('  add x0, x19, #2160');
+  Line('  bl rt_lock');
+  Line('  ldr x20, [x19, #2168]');
+  Line('  ldr x9, [x19, #2152]');
+  Line('  cmp x9, #0');
+  Line('  csinv x20, x20, xzr, ne');
+  Line('  mov x0, x28');
+  Line('  mov x1, x19');
+  Line('  bl rt_tins');
+  Line('  add x0, x19, #2160');
+  Line('  bl rt_unlock');
+  Line('  ldr x0, [x28, #208]');
+  Line('  cmp x0, x20');
+  Line('  ldp x19, x20, [sp], #16');
+  Line('  ldr x30, [sp], #16');
+  Line('  b.hs .ata_ret');
+  LdS('rt_pollerm', 'x9');
+  Line('  cbz x9, .ata_wp');
+  LdS('rt_polluntil', 'x9');
+  Line('  cbz x9, .ata_poke');
+  Line('  cmp x9, x0');
+  Line('  b.ls .ata_ret');
+  Line('.ata_poke:');
+  Line('  b rt_poke');
+  Line('.ata_wp:');
+  Line('  b rt_wakep');
+  Line('.ata_ret:');
+  Line('  ret');
+  { rt_tgone: the routine x28 off the timers of the P whose id G+216
+    holds, under its lock, as on amd64. }
+  Line('rt_tgone:');
+  Line('  ldr x9, [x28, #216]');
+  Line('  cbz x9, .atg_ret');
+  Line('  str x30, [sp, #-16]!');
+  Line('  stp x19, x20, [sp, #-16]!');
+  Line('  lsr x9, x9, #32');
+  Imm('x10', 2176);
+  Line('  mul x9, x9, x10');
+  LeaS('rt_allp', 'x19');
+  Line('  add x19, x19, x9');
+  Line('  add x0, x19, #2160');
+  Line('  bl rt_lock');
+  Line('  mov x0, x28');
+  Line('  mov x1, x19');
+  Line('  bl rt_tdel');
+  Line('  add x0, x19, #2160');
+  Line('  bl rt_unlock');
+  Line('  ldp x19, x20, [sp], #16');
+  Line('  ldr x30, [sp], #16');
+  Line('.atg_ret:');
+  Line('  ret');
+  { rt_anytimer: x0 not 0 when a routine is on any P's timers; x9 to x11
+    change. }
+  Line('rt_anytimer:');
+  Line('  mov x0, xzr');
+  LdS('rt_nproc', 'x9');
+  LeaS('rt_allp', 'x10');
+  Line('.aat_n:');
+  Line('  cbz x9, .aat_ret');
+  Line('  ldr x11, [x10, #2152]');
+  Line('  orr x0, x0, x11');
+  Line('  add x10, x10, #2176');
+  Line('  sub x9, x9, #1');
+  Line('  b .aat_n');
+  Line('.aat_ret:');
+  Line('  ret');
+  { rt_runtimers: x0 a P, x1 the time now: its due timers in batches of
+    32, woken once its lock is dropped, as on amd64. x19 to x29 kept. }
+  Line('rt_runtimers:');
   Line('  str x30, [sp, #-16]!');
   Line('  stp x19, x20, [sp, #-16]!');
   Line('  stp x22, x23, [sp, #-16]!');
   Line('  stp x24, x25, [sp, #-16]!');
   Line('  sub sp, sp, #512');
-  Line('  bl rt_now');
-  Line('  mov x20, x0');
-  Line('.act_batch:');
-  LeaS('rt_glock', 'x0');
+  Line('  mov x23, x0');
+  Line('  mov x20, x1');
+  Line('.art_batch:');
+  Line('  add x0, x23, #2160');
   Line('  bl rt_lock');
   Line('  mov x19, xzr');
-  Line('  mov x22, #-1');
-  Line('.act_n:');
-  LdS('rt_sleeph', 'x9');
-  Line('  cbz x9, .act_unl');
-  LdS('rt_theap', 'x9');
+  Line('  mov x22, xzr');
+  Line('.art_n:');
+  Line('  ldr x9, [x23, #2152]');
+  Line('  cbz x9, .art_unl');
+  Line('  ldr x9, [x23, #2144]');
   Line('  ldr x24, [x9]');
-  Line('  ldr x23, [x24, #208]');
-  Line('  cmp x23, x20');
-  Line('  b.hi .act_later');
+  Line('  ldr x10, [x24, #208]');
+  Line('  cmp x10, x20');
+  Line('  b.hi .art_unl');
   Line('  cmp x19, #32');
-  Line('  b.hs .act_more');
+  Line('  b.hs .art_more');
   Line('  mov x0, x24');
+  Line('  mov x1, x23');
   Line('  bl rt_tdel');
   Line('  mov x9, sp');
   Line('  add x9, x9, x19, lsl #4');
@@ -52503,41 +52764,95 @@ begin
   Line('  ldr x10, [x24, #264]');
   Line('  str x10, [x9, #8]');
   Line('  add x19, x19, #1');
-  Line('  b .act_n');
-  Line('.act_more:');
-  Line('  mov x22, #-2');
-  Line('  b .act_unl');
-  Line('.act_later:');
-  Line('  sub x9, x23, x20');
-  Imm('x10', 1000000);
-  Line('  udiv x9, x9, x10');
-  Line('  add x22, x9, #1');
-  Line('.act_unl:');
-  LeaS('rt_glock', 'x0');
+  Line('  b .art_n');
+  Line('.art_more:');
+  Line('  mov x22, #1');
+  Line('.art_unl:');
+  Line('  add x0, x23, #2160');
   Line('  bl rt_unlock');
   Line('  mov x25, xzr');
-  Line('.act_rd:');
+  Line('.art_rd:');
   Line('  cmp x25, x19');
-  Line('  b.hs .act_bd');
+  Line('  b.hs .art_bd');
   Line('  mov x9, sp');
   Line('  add x9, x9, x25, lsl #4');
   Line('  ldr x10, [x9, #8]');
-  Line('  cbnz x10, .act_tok');
+  Line('  cbnz x10, .art_tok');
   Line('  ldr x0, [x9]');
   Line('  bl rt_ready');
-  Line('  b .act_nx');
-  Line('.act_tok:');
+  Line('  b .art_nx');
+  Line('.art_tok:');
   Line('  mov x0, x10');
   Line('  bl rt_pollwake');
-  Line('.act_nx:');
+  Line('.art_nx:');
   Line('  add x25, x25, #1');
-  Line('  b .act_rd');
-  Line('.act_bd:');
-  Line('  cmn x22, #2');
-  Line('  b.eq .act_batch');
-  Line('  mov x0, x22');
+  Line('  b .art_rd');
+  Line('.art_bd:');
+  Line('  cbnz x22, .art_batch');
   Line('  add sp, sp, #512');
   Line('  ldp x24, x25, [sp], #16');
+  Line('  ldp x22, x23, [sp], #16');
+  Line('  ldp x19, x20, [sp], #16');
+  Line('  ldr x30, [sp], #16');
+  Line('  ret');
+  { rt_checktimers on arm64: every P's due timers, then x0 the
+    milliseconds to the earliest left (-1 with none) and x1 that
+    earliest wake time (all ones), as on amd64. }
+  Line('rt_checktimers:');
+  Line('  str x30, [sp, #-16]!');
+  Line('  stp x19, x20, [sp, #-16]!');
+  Line('  stp x22, x23, [sp, #-16]!');
+  Line('  bl rt_now');
+  Line('  mov x20, x0');
+  Line('  mov x22, xzr');
+  Line('.act_p:');
+  LdS('rt_nproc', 'x9');
+  Line('  cmp x22, x9');
+  Line('  b.hs .act_min');
+  Imm('x10', 2176);
+  Line('  mul x9, x22, x10');
+  LeaS('rt_allp', 'x19');
+  Line('  add x19, x19, x9');
+  Line('  ldr x9, [x19, #2152]');
+  Line('  cbz x9, .act_np');
+  Line('  ldr x9, [x19, #2168]');
+  Line('  cmp x9, x20');
+  Line('  b.hi .act_np');
+  Line('  mov x0, x19');
+  Line('  mov x1, x20');
+  Line('  bl rt_runtimers');
+  Line('.act_np:');
+  Line('  add x22, x22, #1');
+  Line('  b .act_p');
+  Line('.act_min:');
+  Line('  mov x23, #-1');
+  Line('  mov x22, xzr');
+  LeaS('rt_allp', 'x19');
+  Line('.act_m:');
+  LdS('rt_nproc', 'x9');
+  Line('  cmp x22, x9');
+  Line('  b.hs .act_ms');
+  Line('  ldr x9, [x19, #2152]');
+  Line('  cbz x9, .act_mn');
+  Line('  ldr x9, [x19, #2168]');
+  Line('  cmp x9, x23');
+  Line('  csel x23, x9, x23, lo');
+  Line('.act_mn:');
+  Line('  add x19, x19, #2176');
+  Line('  add x22, x22, #1');
+  Line('  b .act_m');
+  Line('.act_ms:');
+  Line('  mov x1, x23');
+  Line('  mov x0, #-1');
+  Line('  cmn x23, #1');
+  Line('  b.eq .act_ret');
+  Line('  mov x0, xzr');
+  Line('  subs x9, x23, x20');
+  Line('  b.ls .act_ret');
+  Imm('x10', 1000000);
+  Line('  udiv x0, x9, x10');
+  Line('  add x0, x0, #1');
+  Line('.act_ret:');
   Line('  ldp x22, x23, [sp], #16');
   Line('  ldp x19, x20, [sp], #16');
   Line('  ldr x30, [sp], #16');
@@ -52553,6 +52868,8 @@ begin
   Line('  stp x23, x24, [sp, #-16]!');
   Line('  bl rt_checktimers');
   Line('  mov x23, x0');
+  { the earliest wake time, for rt_polluntil (P352) }
+  Line('  mov x24, x1');
   { A timer that fired readied a routine onto this P's queue: look once
     more before sleeping, as amd64 does (1.0.139; the poller slept on it
     until a poke came). rt_findrunnable uses x20 and x22, so the timeout
@@ -52563,6 +52880,8 @@ begin
   LdS('rt_epfd', 'x0');
   Line('  cbz x0, .aip_none');
   Line('  bl rt_msleepin');
+  { the deadline it sleeps to, as on amd64 (P352) }
+  StS('x24', 'rt_polluntil');
   LdS('rt_epfd', 'x0');
   Line('  sub sp, sp, #256');
   Line('  mov x1, sp');
@@ -52572,6 +52891,7 @@ begin
   Line('  mov x5, xzr');
   Line('  mov x8, #22');
   Line('  svc #0');
+  StS('xzr', 'rt_polluntil');
   Line('  mov x19, x0');
   Line('  bl rt_msleepout');
   Line('  bl rt_now');
@@ -53416,8 +53736,8 @@ begin
   LdS('rt_nlive', 'x9');
   Line('  cmp x9, #1');
   Line('  b.hi .sm_wake');
-  LdS('rt_sleeph', 'x9');
-  Line('  cbz x9, .sm_scan0');
+  Line('  bl rt_anytimer');
+  Line('  cbz x0, .sm_scan0');
   Line('.sm_wake:');
   Line('  bl rt_wakep');
   Line('.sm_scan0:');
@@ -55476,8 +55796,10 @@ begin
   LeaS('rt_allp', 'x2');
   Imm('x3', 4608);
   Imm('x4', 2176);
+  Line('  mov x5, #-1');
   Line('.hi_p:');
   Line('  str x0, [x2, #2136]');
+  Line('  str x5, [x2, #2168]');
   Line('  add x0, x0, x3');
   Line('  add x2, x2, x4');
   Line('  subs x1, x1, #1');
@@ -57095,23 +57417,10 @@ begin
   Line('  b.lt .awi_one');
   Line('  str x23, [x28, #208]');
   Line('  str x24, [x28, #264]');
-  LeaS('rt_glock', 'x0');
-  Line('  bl rt_lock');
-  LdS('rt_timer0', 'x9');
-  LdS('rt_sleeph', 'x10');
-  Line('  cmp x10, #0');
-  Line('  csinv x9, x9, xzr, ne');
-  Line('  stp x9, x23, [sp, #-16]!');
-  Line('  mov x0, x28');
-  Line('  bl rt_tins');
-  LeaS('rt_glock', 'x0');
-  Line('  bl rt_unlock');
-  { as in rt_sleep (P350) }
-  Line('  ldp x9, x10, [sp], #16');
-  Line('  cmp x10, x9');
-  Line('  b.hs .awi_np');
-  Line('  bl rt_poke');
-  Line('.awi_np:');
+  { on this M's P's timers, as a Sleep (P352) }
+  Line('  ldr x9, [x28, #32]');
+  Line('  ldr x1, [x9, #8]');
+  Line('  bl rt_tadd');
   Line('.awi_one:');
   { MOD first (P115, 1.1.1): after its first wait a descriptor stays
     in the set, one-shot and disarmed, so ADD failed with EEXIST on
@@ -57167,12 +57476,7 @@ begin
   Line('  str xzr, [x28, #192]');
   Line('  ldr x9, [x28, #264]');
   Line('  cbz x9, .awi_nt');
-  LeaS('rt_glock', 'x0');
-  Line('  bl rt_lock');
-  Line('  mov x0, x28');
-  Line('  bl rt_tdel');
-  LeaS('rt_glock', 'x0');
-  Line('  bl rt_unlock');
+  Line('  bl rt_tgone');
   Line('  str xzr, [x28, #264]');
   Line('.awi_nt:');
   Line('  bl rt_pollwaitdec');

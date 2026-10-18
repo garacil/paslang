@@ -312,6 +312,10 @@ GOLDEN_A64 += asyncspin asyncgc asyncleaf
 # the first one and one after the heap emptied beside a poller's wait.
 GOLDEN += pokewait
 GOLDEN_A64 += pokewait
+# P352: each P keeps its own timers: sleeps and deadlines spread over the
+# Ps, one poller, a deadline's timer off the P that holds it.
+GOLDEN += ptimers
+GOLDEN_A64 += ptimers
 # P354: a routine's record keeps no saved register once it is loaded back.
 GOLDEN += gstale
 GOLDEN_A64 += gstale
