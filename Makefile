@@ -3943,12 +3943,19 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	python3 -I scripts/check_elemop.py $(BUILDDIR)/elemop0-arm.s --arm --pairs=12; \
 	echo ok elemop-arm-asm; \
 	: P331 on arm64: globfold with and without inlining, a global by adrp and the low twelve bits; \
-	python3 -I scripts/check_adrpfold.py $(BUILDDIR)/globfold-arm.s --folds=12; \
+	python3 -I scripts/check_adrpfold.py $(BUILDDIR)/globfold-arm.s --folds=32; \
 	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/globfold0-arm testdata/globfold.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/globfold0-arm > $(BUILDDIR)/globfold0-arm.got; \
 	diff -u testdata/globfold.out $(BUILDDIR)/globfold0-arm.got; \
-	python3 -I scripts/check_adrpfold.py $(BUILDDIR)/globfold0-arm.s --folds=10; \
+	python3 -I scripts/check_adrpfold.py $(BUILDDIR)/globfold0-arm.s --folds=23; \
 	echo ok globfold-arm-asm; \
+	: P346 on arm64: exc with and without inlining, a line label in no global fold of P331; \
+	python3 -I scripts/check_adrpfold.py $(BUILDDIR)/exc-arm.s --folds=1; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/exc0-arm testdata/exc.paslang; \
+	timeout 300 $(QEMU_A64) $(BUILDDIR)/exc0-arm > $(BUILDDIR)/exc0-arm.got; \
+	diff -u testdata/exc.out $(BUILDDIR)/exc0-arm.got; \
+	python3 -I scripts/check_adrpfold.py $(BUILDDIR)/exc0-arm.s --folds=1; \
+	echo ok linefold-arm-asm; \
 	: P333 on arm64: the runtime of execrace, the exec lock around a new thread and an execve; \
 	$(OUTDIR)/paslangc -target arm64 -cpu max -Fu $(A64DIR) -o $(BUILDDIR)/execrace-arm testdata/execrace.paslang; \
 	python3 -I scripts/check_execlock.py $(BUILDDIR)/execrace-arm.s --arm; \
