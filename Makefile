@@ -388,6 +388,9 @@ GOLDEN_A64 += memlen
 # P297: a call inside an expression pushes nothing, its operands in their order.
 GOLDEN += callexpr
 GOLDEN_A64 += callexpr
+# P327: a for loop whose body calls reads its counter once a pass.
+GOLDEN += forstep
+GOLDEN_A64 += forstep
 # P333: an exec and a new thread do not race (amd64: qemu-user does not
 # execve an arm64 program, so arm64 reads the runtime's forms).
 GOLDEN += execrace
@@ -2585,6 +2588,13 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/callexpr.out $(BUILDDIR)/callexpr0.got; \
 	python3 -I scripts/check_callexpr.py $(BUILDDIR)/callexpr0.s; \
 	echo ok callexpr-asm; \
+	: a counter at its home read once a pass, P327: forstep with and without inlining; \
+	python3 -I scripts/check_forstep.py $(BUILDDIR)/forstep.s --loops=0; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/forstep0 testdata/forstep.paslang; \
+	$(BUILDDIR)/forstep0 > $(BUILDDIR)/forstep0.got; \
+	diff -u testdata/forstep.out $(BUILDDIR)/forstep0.got; \
+	python3 -I scripts/check_forstep.py $(BUILDDIR)/forstep0.s --loops=4; \
+	echo ok forstep-asm; \
 	: the exec lock around a new thread and an execve, clone again on EAGAIN, P333: the runtime in execrace; \
 	python3 -I scripts/check_execlock.py $(BUILDDIR)/execrace.s; \
 	echo ok execlock-asm; \
@@ -3854,6 +3864,13 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	diff -u testdata/callexpr.out $(BUILDDIR)/callexpr0-arm.got; \
 	python3 -I scripts/check_callexpr.py $(BUILDDIR)/callexpr0-arm.s --arm; \
 	echo ok callexpr-arm-asm; \
+	: P327 on arm64: forstep with and without inlining; \
+	python3 -I scripts/check_forstep.py $(BUILDDIR)/forstep-arm.s --arm --loops=0; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/forstep0-arm testdata/forstep.paslang; \
+	timeout 300 $(QEMU_A64) $(BUILDDIR)/forstep0-arm > $(BUILDDIR)/forstep0-arm.got; \
+	diff -u testdata/forstep.out $(BUILDDIR)/forstep0-arm.got; \
+	python3 -I scripts/check_forstep.py $(BUILDDIR)/forstep0-arm.s --arm --loops=3; \
+	echo ok forstep-arm-asm; \
 	: P333 on arm64: the runtime of execrace, the exec lock around a new thread and an execve; \
 	$(OUTDIR)/paslangc -target arm64 -cpu max -Fu $(A64DIR) -o $(BUILDDIR)/execrace-arm testdata/execrace.paslang; \
 	python3 -I scripts/check_execlock.py $(BUILDDIR)/execrace-arm.s --arm; \
