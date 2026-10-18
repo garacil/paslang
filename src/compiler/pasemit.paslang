@@ -299,6 +299,7 @@ type
     FArm: Boolean;
     FSrc: string;
     FCurLine: LongInt;
+    FOpLine: LongInt;       { the line of the innermost operation being emitted that may stop the program (P341) }
     FLineLabs: array of string;
     FLineNums: array of LongInt;
     FBrk: array of string;
@@ -551,7 +552,11 @@ type
     procedure EmitSyscall(const Args: TExprArray);
     function FindSym(const N: string): TSym;
     procedure EmitAddr(E: PExpr);
+    procedure EmitAddr0(E: PExpr);
     procedure EmitExpr(E: PExpr);
+    function MayStop(E: PExpr): Boolean;
+    procedure OpLineIn(E: PExpr; out Saved: LongInt);
+    procedure EmitExpr0(E: PExpr);
     procedure EmitExprRaw(E: PExpr);
     function NarrowOp(E: PExpr): Boolean;
     function KeepsClean(E: PExpr): Boolean;
@@ -837,6 +842,7 @@ type
     function OrdSimple(E: PExpr; D: LongInt): Boolean;
     function OrdOperand(E: PExpr; D: LongInt): string;
     procedure EmitOrdTo(E: PExpr; D: LongInt);
+    procedure EmitOrdTo0(E: PExpr; D: LongInt);
     procedure EmitOrdBinAmd(E: PExpr; D: LongInt);
     procedure EmitOrdBinArm(E: PExpr; D: LongInt);
     function OrdAssign(S: PStmt): Boolean;
@@ -867,6 +873,7 @@ type
     procedure EmitWordBase(B: PExpr; D: LongInt);
     procedure EmitFatWord(B: PExpr; D: LongInt; Len: Boolean);
     function EmitWordMem(E: PExpr; D: LongInt): string;
+    function EmitWordMem0(E: PExpr; D: LongInt): string;
     function AddDispOp(const M: string; Off: Int64; out R: string): Boolean;
     function PtrReg(E: PExpr; D: LongInt): string;
     function ScaleOf(T: PExpr; out Idx: PExpr): Int64;
@@ -2442,6 +2449,35 @@ begin
     SetLength(FMapOut, 2 * FMapOutN + 256);
   FMapOut[FMapOutN] := S;
   Inc(FMapOutN);
+end;
+
+{ E may stop the program where it is written (P341): an element, whose
+  index is checked, a dereference, a field or a method through a pointer
+  or an object, which a nil stops, a division, a conversion that checks
+  its range. }
+function TEmitter.MayStop(E: PExpr): Boolean;
+begin
+  Result := (E <> nil) and (E^.PosLine > 0) and ((E^.Kind = ekIndex) or (E^.Kind = ekDeref) or
+    (E^.Kind = ekMethod) or (E^.Kind = ekUn) or
+    ((E^.Kind = ekField) and (E^.L <> nil) and ((E^.L^.Kind = ekDeref) or (TKind(E^.L^.Typ) = tykClass))) or
+    ((E^.Kind = ekBin) and ((E^.Bin = boDiv) or (E^.Bin = boMod))));
+end;
+
+{ Entering E's code (P341): its line is the failure's, out of line (a
+  check's block takes FOpLine), until E's code ends and Saved comes
+  back; a dereference, which the signal of a nil stops in line, takes a
+  line of its own in the table when its statement runs on to its line.
+  An inlined body's expressions have no place (CopyE): a callee's line
+  is not the caller's. }
+procedure TEmitter.OpLineIn(E: PExpr; out Saved: LongInt);
+begin
+  Saved := FOpLine;
+  if not MayStop(E) then
+    Exit;
+  FOpLine := E^.PosLine;
+  if (FCurLine > 0) and (E^.PosLine <> FCurLine) and ((E^.Kind = ekDeref) or (E^.Kind = ekField) or
+    (E^.Kind = ekMethod)) then
+    EmitLoc(E^.PosLine);
 end;
 
 procedure TEmitter.EmitLoc(LineNo: LongInt);
@@ -5656,6 +5692,15 @@ begin
 end;
 
 procedure TEmitter.EmitAddr(E: PExpr);
+var
+  was: LongInt;
+begin
+  OpLineIn(E, was);
+  EmitAddr0(E);
+  FOpLine := was;
+end;
+
+procedure TEmitter.EmitAddr0(E: PExpr);
 var
   s: TSym;
   td: TTypeDef;
@@ -22167,6 +22212,15 @@ end;
 { Every expression goes through here: a narrow operation's result is
   cleaned once it is worked out (P99; P100 leaves it to the consumer). }
 procedure TEmitter.EmitExpr(E: PExpr);
+var
+  was: LongInt;
+begin
+  OpLineIn(E, was);
+  EmitExpr0(E);
+  FOpLine := was;
+end;
+
+procedure TEmitter.EmitExpr0(E: PExpr);
 begin
   EmitExprRaw(E);
   { The pool cleaned it already when EmitExprRaw worked it out there. }
@@ -27523,6 +27577,15 @@ end;
 
 procedure TEmitter.EmitOrdTo(E: PExpr; D: LongInt);
 var
+  was: LongInt;
+begin
+  OpLineIn(E, was);
+  EmitOrdTo0(E, D);
+  FOpLine := was;
+end;
+
+procedure TEmitter.EmitOrdTo0(E: PExpr; D: LongInt);
+var
   r, m: string;
   s: TSym;
   ok, skip: Boolean;
@@ -29979,6 +30042,15 @@ end;
 
 function TEmitter.EmitWordMem(E: PExpr; D: LongInt): string;
 var
+  was: LongInt;
+begin
+  OpLineIn(E, was);
+  Result := EmitWordMem0(E, D);
+  FOpLine := was;
+end;
+
+function TEmitter.EmitWordMem0(E: PExpr; D: LongInt): string;
+var
   r, idx, lenop, lenlab, ok, ok2, preg, lreg, lenR, glab, bs, reclab, m, ixop, lenkey: string;
   recglob: Boolean;
   td: TTypeDef;
@@ -31324,6 +31396,7 @@ procedure TEmitter.ColdBeginAt(const Jmp, C: string);
 var
   locn: string;
   n: SizeInt;
+  cl: LongInt;
 begin
   if FColdAt >= 0 then
     Die('internal error: a check''s failure inside another');
@@ -31336,9 +31409,14 @@ begin
     Line(Jmp + ' ' + C);
   FColdAt := FLen;
   Line(C + ':');
-  if FCurLine > 0 then
+  { the operation's line, which may be another line of the statement's
+    (P341) }
+  cl := FCurLine;
+  if FOpLine > 0 then
+    cl := FOpLine;
+  if cl > 0 then
   begin
-    Line('  .loc 1 ' + IntToStr(FCurLine));
+    Line('  .loc 1 ' + IntToStr(cl));
     Inc(FLab);
     locn := '.LL' + IntToStr(FLab);
     Line(locn + ':');
@@ -31346,7 +31424,7 @@ begin
     SetLength(FLineLabs, n + 1);
     SetLength(FLineNums, n + 1);
     FLineLabs[n] := locn;
-    FLineNums[n] := FCurLine;
+    FLineNums[n] := cl;
   end;
   { no frame (P296): the CFA is rsp's offset as the body left it, and an
     even count of pushes leaves rsp 8 off 16, which the failure's call
