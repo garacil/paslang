@@ -52,8 +52,8 @@ for target in amd64 arm64; do
         done
     done
     for spec in \
-        'genericbadarg:TCell<TItem> does not go into TCell<TItem>; x as T sees its bytes at 9:14' \
-        'genericbadorigin:TOther<Integer> does not go into TOther<Integer>; x as T sees its bytes at 9:14' \
+        'genericbadarg:TCell<TItem> does not go into TCell<TItem>; x as T sees its bytes at 9:12' \
+        'genericbadorigin:TOther<Integer> does not go into TOther<Integer>; x as T sees its bytes at 9:12' \
         'genericbadname:unknown type TCell_string at 7:8' \
         'nestpriv1:UnitOnly is private to TInfo at 3:29' \
         'nestpriv2:TUnitOnly is private to TInfo at 3:8' \
@@ -67,14 +67,14 @@ for target in amd64 arm64; do
         'constfield:N is a field already at 8:1' \
         'fieldconst:N is a field already at 6:1' \
         'helperconst:N is a method already at 7:6' \
-        'leak:unknown identifier N at 6:16' \
+        'leak:unknown identifier N at 6:15' \
         'methodtype:N is a method already at 6:1' \
         'privateconst:N is strict private to TOuter at 7:23' \
         'privatetype:TNum is strict private to TOuter at 7:8' \
         'protectedtype:TNum is strict protected to TOuter at 7:8' \
         'shadowtype:unknown type TNum at 9:8' \
         'typemethod:N is a method already at 7:4' \
-        'typeproperty:N is a property already at 9:1'; do
+        'typeproperty:N is a property already at 7:12'; do
         name=${spec%%:*}
         assert_rejected "testdata/nestedbad/$name.paslang" "${spec#*:}"
     done

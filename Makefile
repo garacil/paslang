@@ -1020,26 +1020,26 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	: typed JSON held to the Go v2 of the model, schema by schema P205; \
 	python3 -I scripts/jsonmodel.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64); \
 	: what the compiler refuses of a json, each with its message; \
-	for f in 'fromstr:string does not go into json: JsonParse reads JSON text at 10:11' \
-	  'toint:a json does not go into Integer: j.AsString, j.AsInteger and the other members read its value at 10:9' \
+	for f in 'fromstr:string does not go into json: JsonParse reads JSON text at 10:8' \
+	  'toint:a json does not go into Integer: j.AsString, j.AsInteger and the other members read its value at 10:8' \
 	  'tostr:a json does not go into string' \
-	  'intcast:a json is no number: j.AsInteger reads one at 10:18' \
-	  'boolcast:a json is no Boolean: j.AsBoolean reads one, j.IsNull says null at 10:18' \
+	  'intcast:a json is no number: j.AsInteger reads one at 10:8' \
+	  'boolcast:a json is no Boolean: j.AsBoolean reads one, j.IsNull says null at 10:16' \
 	  'ptrcast:a json becomes Pointer through its members' \
-	  'lessthan:json values compare with = and <> only at 10:13' \
-	  'plus:+ does not take a json: its members read its value at 10:13' \
+	  'lessthan:json values compare with = and <> only at 10:8' \
+	  'plus:+ does not take a json: its members read its value at 10:8' \
 	  'strarith:+ does not take a json' \
-	  'realidx:a json is indexed by a name, a string, or a place, an Integer, not Real at 10:14' \
-	  'downto:for x in a json walks it forward: downto does not at 10:21' \
-	  'forreal:for in a json decodes each value into a variable of a type with a JSON form, and Pointer has none at 10:17' \
-	  "kvbad:for k, v in a json: k is a string, an object's names, or an Integer, an array's places, not Boolean at 10:20" \
+	  'realidx:a json is indexed by a name, a string, or a place, an Integer, not Real at 10:10' \
+	  'downto:for x in a json walks it forward: downto does not at 10:3' \
+	  'forreal:for in a json decodes each value into a variable of a type with a JSON form, and Pointer has none at 10:3' \
+	  "kvbad:for k, v in a json: k is a string, an object's names, or an Integer, an array's places, not Boolean at 10:3" \
 	  'nottest:a json does not go into Boolean' \
 	  'inint:in a json looks for a member' \
-	  'ifjson:a json is no condition: j.AsBoolean reads one, j.IsNull says null at 10:8' \
-	  'tryreal:TryGet of a json takes a name, a string, or a place, an Integer at 10:25' \
+	  'ifjson:a json is no condition: j.AsBoolean reads one, j.IsNull says null at 10:6' \
+	  'tryreal:TryGet of a json takes a name, a string, or a place, an Integer at 10:8' \
 	  'mapkey:a json is no map key' \
 	  'treej:a json is no tree key' \
-	  'heapj:a json is no heap element: json values have no order, = and <> only; a heap of its text, JsonEncode(j, JsonCanonical), has one at 3:18' \
+	  'heapj:a json is no heap element: json values have no order, = and <> only; a heap of its text, JsonEncode(j, JsonCanonical), has one at 3:14' \
 	  'bindname2:a json name names one member, and this declaration gives 2 at 4:19' \
 	  'bindopt:bogus is no json option: omitzero, omitempty, quoted, required, ignore, unknown, embed or rfc3339 at 4:21' \
 	  'bindquoted:json quoted writes a number inside a string, and string is no number at 4:15' \
@@ -1049,29 +1049,29 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  'bindrfc:json rfc3339 takes a TDateTime, a Double, not Integer at 4:16' \
 	  'bindtwice:json omitzero twice at 4:30' \
 	  "bindempty:a json name is not empty: leave the name out for the member's own at 4:16" \
-	  "binddup:two members of TR are 'x' in JSON: json 'name' gives one another, json ignore leaves one out at 7:1" \
+	  "binddup:two members of TR are 'x' in JSON: json 'name' gives one another, json ignore leaves one out at 5:5" \
 	  "bindbare:json after a member's type takes its name, a string, or its options at 4:16" \
 	  'bindvariant:a member of a variant part takes json ignore alone: json writes no variant at 5:22' \
-	  "bindvarenc:TR.A is in a variant part and has no JSON form: json ignore on each of the part's fields leaves it out at 10:24" \
-	  'bindchan:TR.C has no JSON form (a channel): json ignore leaves it out at 9:24' \
-	  'bindptr:JsonEncode takes a value with a JSON form, and Pointer has none at 5:24' \
-	  'bindclassvar:a class variable is no member of an object: json writes none at 6:3' \
+	  "bindvarenc:TR.A is in a variant part and has no JSON form: json ignore on each of the part's fields leaves it out at 10:11" \
+	  'bindchan:TR.C has no JSON form (a channel): json ignore leaves it out at 9:11' \
+	  'bindptr:JsonEncode takes a value with a JSON form, and Pointer has none at 5:11' \
+	  'bindclassvar:a class variable is no member of an object: json writes none at 5:15' \
 	  'bindrecprop:a record is its fields in JSON, not its properties: json goes after a field at 7:33' \
-	  'bindwprop:TC.A is read by no accessor, or by an index: json writes no such property at 12:24' \
+	  'bindwprop:TC.A is read by no accessor, or by an index: json writes no such property at 12:11' \
 	  'bindutf8:a json name is UTF-8 with no noncharacter (RFC 7493 2.1) at 4:16' \
-	  'jsonofargs:JsonOf takes a value at 5:23' \
+	  'jsonofargs:JsonOf takes a value at 5:11' \
 	  'jsonvar:json is a reserved word, not a name at 3:3' \
 	  'corename:JsonParse is a reserved word, not a name at 3:3' \
-	  'decabstract:JsonDecode makes a TA with its Create, and TA is abstract at 9:22' \
-	  'decctor:JsonDecode makes a TA with Create, and TA.Create takes arguments at 14:22' \
-	  'decnotvar:JsonDecode(s, x): x needs a variable at 7:23' \
-	  'decform:JsonDecode takes a variable of a type with a JSON form, and Pointer has none at 5:21' \
-	  'decsrc:JsonDecode reads JSON text, a string, or a json, not Integer at 5:19' \
-	  'decargs:JsonDecode takes the text or a json, a variable and the options if any at 5:18' \
-	  'tryargs:TryJsonDecode takes the text or a json, a variable, the error and the options if any at 5:28' \
-	  'tryerr:TryJsonDecode(s, x, err): err is Integer, not EJsonError at 5:31' \
-	  'trygetform:TryGet of a json takes a v of a type with a JSON form, and Pointer has none at 6:24' \
-	  'decchan:TR.C has no JSON form (a channel): json ignore leaves it out at 10:22' \
+	  'decabstract:JsonDecode makes a TA with its Create, and TA is abstract at 9:3' \
+	  'decctor:JsonDecode makes a TA with Create, and TA.Create takes arguments at 14:3' \
+	  'decnotvar:JsonDecode(s, x): x needs a variable at 7:3' \
+	  'decform:JsonDecode takes a variable of a type with a JSON form, and Pointer has none at 5:3' \
+	  'decsrc:JsonDecode reads JSON text, a string, or a json, not Integer at 5:14' \
+	  'decargs:JsonDecode takes the text or a json, a variable and the options if any at 5:3' \
+	  'tryargs:TryJsonDecode takes the text or a json, a variable, the error and the options if any at 5:6' \
+	  'tryerr:TryJsonDecode(s, x, err): err is Integer, not EJsonError at 5:28' \
+	  'trygetform:TryGet of a json takes a v of a type with a JSON form, and Pointer has none at 6:21' \
+	  'decchan:TR.C has no JSON form (a channel): json ignore leaves it out at 10:3' \
 	  'decvar:JsonDecode is a reserved word, not a name at 3:3'; do \
 	  n=$${f%%:*}; w=$${f#*:}; \
 	  if $(OUTDIR)/paslangc -o $(BUILDDIR)/jb_$$n testdata/jsonbad/$$n.paslang >$(BUILDDIR)/jb_$$n.err 2>&1; then \
@@ -1350,7 +1350,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'raise ... at takes a pointer, not Integer at 5:27' $(BUILDDIR)/excbad_raiseat.err; \
 	grep -q 'on takes a class, not Integer at 8:11' $(BUILDDIR)/excbad_onint.err; \
 	grep -q 'unknown type ENowhere at 8:11' $(BUILDDIR)/excbad_onunknown.err; \
-	grep -q 'unknown identifier Err at 12:14' $(BUILDDIR)/excbad_onscope.err; \
+	grep -q 'unknown identifier Err at 12:11' $(BUILDDIR)/excbad_onscope.err; \
 	echo ok excbad; \
 	echo "==== class method and class reference rejects (P123) ===="; \
 	for n in cmfield cmobjmeth staticvirt refdesc classofint cctorargs cmnoprefix objbyclass cpropnotstatic; do \
@@ -1374,14 +1374,14 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	    echo "$$n should fail"; exit 1; \
 	  fi; \
 	done; \
-	grep -q 'an array of const is read, indexed, measured, walked or passed on to another, not kept in array of TVarRec at 7:13' $(BUILDDIR)/aconstbad_keep.err; \
-	grep -q 'an array of const lives for the call: its address is not taken at 7:10' $(BUILDDIR)/aconstbad_addr.err; \
+	grep -q 'an array of const is read, indexed, measured, walked or passed on to another, not kept in array of TVarRec at 7:12' $(BUILDDIR)/aconstbad_keep.err; \
+	grep -q 'an array of const lives for the call: its address is not taken at 7:9' $(BUILDDIR)/aconstbad_addr.err; \
 	grep -q 'A, an array of const, lives for the call: a closure in P may not keep it' $(BUILDDIR)/aconstbad_closure.err; \
-	grep -q 'pas passes values, and an array of const lives for the call it is given to at 7:16' $(BUILDDIR)/aconstbad_paslist.err; \
-	grep -q 'an array of const is given to a routine, not a var or out parameter at 3:34' $(BUILDDIR)/aconstbad_varparam.err; \
+	grep -q 'pas passes values, and an array of const lives for the call it is given to at 7:9' $(BUILDDIR)/aconstbad_paslist.err; \
+	grep -q 'an array of const is given to a routine, not a var or out parameter at 3:20' $(BUILDDIR)/aconstbad_varparam.err; \
 	grep -q 'array of const is the type of a parameter at 4:15' $(BUILDDIR)/aconstbad_vartype.err; \
-	grep -q 'an array of const takes ordinals, reals, strings, pointers, objects, classes, interfaces and json, not TR at 13:9' $(BUILDDIR)/aconstbad_recval.err; \
-	grep -q 'an array of const takes values, not a range at 7:12' $(BUILDDIR)/aconstbad_range.err; \
+	grep -q 'an array of const takes ordinals, reals, strings, pointers, objects, classes, interfaces and json, not TR at 13:6' $(BUILDDIR)/aconstbad_recval.err; \
+	grep -q 'an array of const takes values, not a range at 7:6' $(BUILDDIR)/aconstbad_range.err; \
 	echo ok aconstbad; \
 	echo "==== default parameter rejects (P125) ===="; \
 	for n in mvar mlast mimpl nilint mcount mfew; do \
@@ -1390,11 +1390,11 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  fi; \
 	done; \
 	grep -q 'default on var parameter at 5:30' $(BUILDDIR)/defbad_mvar.err; \
-	grep -q 'default parameters must be last at 5:40' $(BUILDDIR)/defbad_mlast.err; \
+	grep -q 'default parameters must be last at 5:31' $(BUILDDIR)/defbad_mlast.err; \
 	grep -q 'the default of X is the declaration.s at 7:14' $(BUILDDIR)/defbad_mimpl.err; \
 	grep -q 'nil is the default of a pointer, an object, a class, a routine, an interface or a slice, not of Integer at 3:24' $(BUILDDIR)/defbad_nilint.err; \
-	grep -q 'wrong number of arguments for P at 14:8' $(BUILDDIR)/defbad_mcount.err; \
-	grep -q 'wrong number of arguments for P at 16:9' $(BUILDDIR)/defbad_mfew.err; \
+	grep -q 'wrong number of arguments for P at 14:5' $(BUILDDIR)/defbad_mcount.err; \
+	grep -q 'wrong number of arguments for P at 16:5' $(BUILDDIR)/defbad_mfew.err; \
 	echo ok defbad; \
 	echo "==== set rejects (P126) ===="; \
 	for n in range ofint strelem kinds outside forvar writeset divide inclconst charint inkind; do \
@@ -1402,17 +1402,17 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	    echo "$$n should fail"; exit 1; \
 	  fi; \
 	done; \
-	grep -q 'a set holds elements 0 to 255, not 0..300 at 3:23' $(BUILDDIR)/setbad_range.err; \
-	grep -q 'a set is of Char, Byte, Boolean, an enumeration or a subrange, not Integer at 3:25' $(BUILDDIR)/setbad_ofint.err; \
-	grep -q 'a set holds ordinals, not string at 5:19' $(BUILDDIR)/setbad_strelem.err; \
-	grep -q 'TBytes and TChars are sets of other elements at 10:13' $(BUILDDIR)/setbad_kinds.err; \
-	grep -q 'set element out of 0..7 at 7:14' $(BUILDDIR)/setbad_outside.err; \
-	grep -q 'for x in TBytes: x is a Char, not an element of it at 10:15' $(BUILDDIR)/setbad_forvar.err; \
-	grep -q 'Write does not print a set: x in s tests an element at 6:12' $(BUILDDIR)/setbad_writeset.err; \
-	grep -q '/ does not take a set: +, -, \*, =, <>, <= and >= do at 6:13' $(BUILDDIR)/setbad_divide.err; \
+	grep -q 'a set holds elements 0 to 255, not 0..300 at 3:17' $(BUILDDIR)/setbad_range.err; \
+	grep -q 'a set is of Char, Byte, Boolean, an enumeration or a subrange, not Integer at 3:18' $(BUILDDIR)/setbad_ofint.err; \
+	grep -q 'a set holds ordinals, not string at 5:14' $(BUILDDIR)/setbad_strelem.err; \
+	grep -q 'TBytes and TChars are sets of other elements at 10:8' $(BUILDDIR)/setbad_kinds.err; \
+	grep -q 'set element out of 0..7 at 7:12' $(BUILDDIR)/setbad_outside.err; \
+	grep -q 'for x in TBytes: x is a Char, not an element of it at 9:12' $(BUILDDIR)/setbad_forvar.err; \
+	grep -q 'Write does not print a set: x in s tests an element at 6:11' $(BUILDDIR)/setbad_writeset.err; \
+	grep -q '/ does not take a set: +, -, \*, =, <>, <= and >= do at 6:8' $(BUILDDIR)/setbad_divide.err; \
 	grep -q 'S is a const parameter: the routine may not change it' $(BUILDDIR)/setbad_inclconst.err; \
-	grep -q 'a list in brackets holds elements of one kind, not an integer and a Char at 5:16' $(BUILDDIR)/setbad_charint.err; \
-	grep -q 'Integer is no element of set of Char at 7:13' $(BUILDDIR)/setbad_inkind.err; \
+	grep -q 'a list in brackets holds elements of one kind, not an integer and a Char at 5:12' $(BUILDDIR)/setbad_charint.err; \
+	grep -q 'Integer is no element of set of Char at 7:6' $(BUILDDIR)/setbad_inkind.err; \
 	echo ok setbad; \
 	echo "==== subrange rejects (P135) ===="; \
 	for n in mixed reversed twoenums notfit otherenum intenum charin; do \
@@ -1420,13 +1420,13 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	    echo "$$n should fail"; exit 1; \
 	  fi; \
 	done; \
-	grep -q 'a subrange.s bounds are of one type, not Char and Integer at 3:16' $(BUILDDIR)/subbad_mixed.err; \
-	grep -q 'bad subrange: 57 is above 48 at 3:19' $(BUILDDIR)/subbad_reversed.err; \
-	grep -q 'a subrange.s bounds are of one type, not TColor and TDay at 5:18' $(BUILDDIR)/subbad_twoenums.err; \
-	grep -q 'constant #120 does not fit TDigit at 7:11' $(BUILDDIR)/subbad_notfit.err; \
-	grep -q 'a list in brackets holds elements of one kind, not TDay and TColor at 9:19' $(BUILDDIR)/subbad_otherenum.err; \
-	grep -q 'Integer is no element of a set of TDay at 7:12' $(BUILDDIR)/subbad_intenum.err; \
-	grep -q 'Char is no element of set of TDay at 10:14' $(BUILDDIR)/subbad_charin.err; \
+	grep -q 'a subrange.s bounds are of one type, not Char and Integer at 3:10' $(BUILDDIR)/subbad_mixed.err; \
+	grep -q 'bad subrange: 57 is above 48 at 3:11' $(BUILDDIR)/subbad_reversed.err; \
+	grep -q 'a subrange.s bounds are of one type, not TColor and TDay at 5:10' $(BUILDDIR)/subbad_twoenums.err; \
+	grep -q 'constant #120 does not fit TDigit at 7:8' $(BUILDDIR)/subbad_notfit.err; \
+	grep -q 'a list in brackets holds elements of one kind, not TDay and TColor at 9:15' $(BUILDDIR)/subbad_otherenum.err; \
+	grep -q 'Integer is no element of a set of TDay at 7:10' $(BUILDDIR)/subbad_intenum.err; \
+	grep -q 'Char is no element of set of TDay at 10:6' $(BUILDDIR)/subbad_charin.err; \
 	echo ok subbad; \
 	echo "==== array index rejects (P161) ===="; \
 	for n in idxreal idxbig idxwide idxrev; do \
@@ -1434,10 +1434,10 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	    echo "$$n should fail"; exit 1; \
 	  fi; \
 	done; \
-	grep -q 'an array.s index is an ordinal type or a range, not Real at 5:16' $(BUILDDIR)/arrbad_idxreal.err; \
+	grep -q 'an array.s index is an ordinal type or a range, not Real at 5:12' $(BUILDDIR)/arrbad_idxreal.err; \
 	grep -q 'an array from -9223372036854775808 to 9223372036854775807 of Byte does not fit in 2147483647 bytes at 5:12' $(BUILDDIR)/arrbad_idxbig.err; \
 	grep -q 'an array from 0 to 300000000 of Integer does not fit in 2147483647 bytes at 6:12' $(BUILDDIR)/arrbad_idxwide.err; \
-	grep -q 'bad subrange: 3 is above 1 at 6:16' $(BUILDDIR)/arrbad_idxrev.err; \
+	grep -q 'bad subrange: 3 is above 1 at 6:12' $(BUILDDIR)/arrbad_idxrev.err; \
 	echo ok arrbad; \
 	echo "==== helper rejects (P127) ===="; \
 	for n in typerec recint field virt clsstat lastone strict typecall nodecl ctor otherkind nomember; do \
@@ -1451,8 +1451,8 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'a helper.s method is not virtual: a helper has no method table at 4:30' $(BUILDDIR)/helpbad_virt.err; \
 	grep -q 'a helper.s class method is static: class function F: T; static; at 4:20' $(BUILDDIR)/helpbad_clsstat.err; \
 	grep -q 'Twice is no member of Integer: the helper in scope, TB, has none at 24:13' $(BUILDDIR)/helpbad_lastone.err; \
-	grep -q 'Hidden is strict private to TH at 24:19' $(BUILDDIR)/helpbad_strict.err; \
-	grep -q 'TH.Twice is a method of a value, not of the type at 13:24' $(BUILDDIR)/helpbad_typecall.err; \
+	grep -q 'Hidden is strict private to TH at 24:13' $(BUILDDIR)/helpbad_strict.err; \
+	grep -q 'TH.Twice is a method of a value, not of the type at 13:19' $(BUILDDIR)/helpbad_typecall.err; \
 	grep -q 'TH declares no method Thrice of these parameters at 12:13' $(BUILDDIR)/helpbad_nodecl.err; \
 	grep -q 'a class helper has no constructor: a static class function makes an object at 7:5' $(BUILDDIR)/helpbad_ctor.err; \
 	grep -q 'a helper descends from a helper of its kind at 9:22' $(BUILDDIR)/helpbad_otherkind.err; \
@@ -1465,16 +1465,16 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  fi; \
 	done; \
 	grep -q 'FN is strict private to TR at 17:5' $(BUILDDIR)/recbad_strictf.err; \
-	grep -q 'Hidden is strict private to TR at 17:11' $(BUILDDIR)/recbad_strictm.err; \
+	grep -q 'Hidden is strict private to TR at 17:5' $(BUILDDIR)/recbad_strictm.err; \
 	grep -q 'a record.s method is not virtual: a record has no method table at 6:21' $(BUILDDIR)/recbad_virt.err; \
 	grep -q 'a record has no descendants: private, strict private or public at 6:3' $(BUILDDIR)/recbad_prot.err; \
 	grep -q 'a record has no destructor at 6:5' $(BUILDDIR)/recbad_dtor.err; \
 	grep -qF 'missing body of TR.Init at 6:23' $(BUILDDIR)/recbad_clsctor.err; \
 	grep -q 'a record.s class method is static: class function F: T; static; at 6:20' $(BUILDDIR)/recbad_nostat.err; \
 	grep -q 'a record.s fields come before its methods and properties, or after private or public at 7:5' $(BUILDDIR)/recbad_fieldafter.err; \
-	grep -q 'TR.Twice is a method of a value, not of the type at 13:19' $(BUILDDIR)/recbad_typecall.err; \
-	grep -q 'unknown identifier Result at 10:9' $(BUILDDIR)/recbad_ctorres.err; \
-	grep -q 'a record holds no field of its own type: TR at 6:14' $(BUILDDIR)/recbad_selfrec.err; \
+	grep -q 'TR.Twice is a method of a value, not of the type at 13:14' $(BUILDDIR)/recbad_typecall.err; \
+	grep -q 'unknown identifier Result at 10:3' $(BUILDDIR)/recbad_ctorres.err; \
+	grep -q 'a record holds no field of its own type: TR at 6:12' $(BUILDDIR)/recbad_selfrec.err; \
 	grep -q 'TR declares no method Thrice of these parameters at 12:13' $(BUILDDIR)/recbad_nodecl.err; \
 	grep -q 'TR is a record with no methods at 6:13' $(BUILDDIR)/recbad_plainrec.err; \
 	echo ok recbad; \
@@ -1485,12 +1485,12 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	      echo "$$n should fail"; exit 1; \
 	    fi; \
 	  done; \
-	  grep -qF 'Integer does not go into routine at 11:9' $(BUILDDIR)/valkindbad_intproc-$$target.err; \
-	  grep -qF 'Integer does not go into method at 11:9' $(BUILDDIR)/valkindbad_intmeth-$$target.err; \
-	  grep -qF 'Integer does not go into IVal at 13:9' $(BUILDDIR)/valkindbad_intiface-$$target.err; \
-	  grep -qF 'this calls the method; @ before it gives the method value at 23:13' $(BUILDDIR)/valkindbad_callmeth-$$target.err; \
-	  grep -qF 'string does not go into routine at 12:11' $(BUILDDIR)/valkindbad_argproc-$$target.err; \
-	  grep -qF 'Integer does not go into routine at 9:14' $(BUILDDIR)/valkindbad_resproc-$$target.err; \
+	  grep -qF 'Integer does not go into routine at 11:8' $(BUILDDIR)/valkindbad_intproc-$$target.err; \
+	  grep -qF 'Integer does not go into method at 11:8' $(BUILDDIR)/valkindbad_intmeth-$$target.err; \
+	  grep -qF 'Integer does not go into IVal at 13:8' $(BUILDDIR)/valkindbad_intiface-$$target.err; \
+	  grep -qF 'this calls the method; @ before it gives the method value at 23:8' $(BUILDDIR)/valkindbad_callmeth-$$target.err; \
+	  grep -qF 'string does not go into routine at 12:7' $(BUILDDIR)/valkindbad_argproc-$$target.err; \
+	  grep -qF 'Integer does not go into routine at 9:13' $(BUILDDIR)/valkindbad_resproc-$$target.err; \
 	done; \
 	echo ok valkindbad; \
 	echo "==== line end rejects (P339) ===="; \
@@ -1515,10 +1515,10 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	      echo "$$n should fail"; exit 1; \
 	    fi; \
 	  done; \
-	  grep -qF 'a var or out parameter needs a variable, not a value at 10:10' $(BUILDDIR)/varbad_constarg-$$target.err; \
-	  grep -qF 'a var or out parameter needs a variable, not a value at 20:11' $(BUILDDIR)/varbad_exprarg-$$target.err; \
-	  grep -qF 'wrong number of arguments for the routine value at 18:15' $(BUILDDIR)/varbad_fewargs-$$target.err; \
-	  grep -qF 'wrong number of arguments for the routine value at 18:21' $(BUILDDIR)/varbad_manyargs-$$target.err; \
+	  grep -qF 'a var or out parameter needs a variable, not a value at 10:8' $(BUILDDIR)/varbad_constarg-$$target.err; \
+	  grep -qF 'a var or out parameter needs a variable, not a value at 20:5' $(BUILDDIR)/varbad_exprarg-$$target.err; \
+	  grep -qF 'wrong number of arguments for the routine value at 18:11' $(BUILDDIR)/varbad_fewargs-$$target.err; \
+	  grep -qF 'wrong number of arguments for the routine value at 18:11' $(BUILDDIR)/varbad_manyargs-$$target.err; \
 	done; \
 	echo ok varbad; \
 	echo "==== with rejects (P166, P172) ===="; \
@@ -1560,7 +1560,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	echo ok methbodybad; \
 	echo "==== record static rejects (P168) ===="; \
 	for target in amd64 arm64; do \
-	  for f in 'strictvar:X is strict private to TR at 6:18' 'strictprop:P is strict private to TR at 7:18' 'twoctor:a record has one class constructor at 4:21' 'lifeparams:a class constructor takes no parameters at 3:21' 'fielddup:X is a class variable already at 5:13' 'missing:missing body of TR.Start at 3:21'; do \
+	  for f in 'strictvar:X is strict private to TR at 6:18' 'strictprop:P is strict private to TR at 7:18' 'twoctor:a record has one class constructor at 4:21' 'lifeparams:a class constructor takes no parameters at 3:21' 'fielddup:X is a class variable already at 5:3' 'missing:missing body of TR.Start at 3:21'; do \
 	    n=$${f%%:*}; msg=$${f#*:}; \
 	    if $(OUTDIR)/paslangc -target $$target -o $(BUILDDIR)/recstaticbad_$$n-$$target testdata/recstaticbad/$$n.paslang >$(BUILDDIR)/recstaticbad_$$n-$$target.err 2>&1; then \
 	      echo "$$n must fail"; exit 1; \
@@ -1585,16 +1585,16 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	    echo "$$n should fail"; exit 1; \
 	  fi; \
 	done; \
-	grep -q 'Copy takes a string or a slice, not Integer at 6:21' $(BUILDDIR)/strbad_copyslice.err; \
-	grep -q 'Insert(src, s, i): s needs a variable at 3:24' $(BUILDDIR)/strbad_insertconst.err; \
-	grep -q 'string does not go into Integer; x as T sees its bytes at 5:20' $(BUILDDIR)/strbad_insertslice.err; \
-	grep -q 'a slice that a call reaches is edited in a variable: put it in one first at 13:27' $(BUILDDIR)/strbad_editcall.err; \
-	grep -q 'Str takes a number or an enumeration.s member, not string at 5:16' $(BUILDDIR)/strbad_strstring.err; \
-	grep -q 'decimals are for a real at 5:16' $(BUILDDIR)/strbad_strdec.err; \
-	grep -q 'Val reads a number, a real or an enumeration.s member, not Char at 6:20' $(BUILDDIR)/strbad_valchar.err; \
-	grep -q 'Val(s, v, code): code is an integer variable, not string at 6:20' $(BUILDDIR)/strbad_valcode.err; \
-	grep -q 'StringOfChar takes a Char, not string at 3:32' $(BUILDDIR)/strbad_soc.err; \
-	grep -q 'a string or a Char goes here, not Integer at 3:20' $(BUILDDIR)/strbad_upint.err; \
+	grep -q 'Copy takes a string or a slice, not Integer at 6:16' $(BUILDDIR)/strbad_copyslice.err; \
+	grep -q 'Insert(src, s, i): s needs a variable at 3:15' $(BUILDDIR)/strbad_insertconst.err; \
+	grep -q 'string does not go into Integer; x as T sees its bytes at 5:10' $(BUILDDIR)/strbad_insertslice.err; \
+	grep -q 'a slice that a call reaches is edited in a variable: put it in one first at 13:10' $(BUILDDIR)/strbad_editcall.err; \
+	grep -q 'Str takes a number or an enumeration.s member, not string at 5:7' $(BUILDDIR)/strbad_strstring.err; \
+	grep -q 'decimals are for a real at 5:11' $(BUILDDIR)/strbad_strdec.err; \
+	grep -q 'Val reads a number, a real or an enumeration.s member, not Char at 6:12' $(BUILDDIR)/strbad_valchar.err; \
+	grep -q 'Val(s, v, code): code is an integer variable, not string at 6:15' $(BUILDDIR)/strbad_valcode.err; \
+	grep -q 'StringOfChar takes a Char, not string at 3:24' $(BUILDDIR)/strbad_soc.err; \
+	grep -q 'a string or a Char goes here, not Integer at 3:18' $(BUILDDIR)/strbad_upint.err; \
 	grep -q 'Pos is a reserved word, not a name at 3:3' $(BUILDDIR)/strbad_posname.err; \
 	grep -q 'Val is a reserved word, not a name at 2:10' $(BUILDDIR)/strbad_valname.err; \
 	echo ok strbad; \
@@ -1608,9 +1608,9 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'duplicate identifier K (the routine has a constant of the name)' $(BUILDDIR)/scopebad_constvar.err; \
 	grep -q 'duplicate identifier TPoint (the routine has a constant of the name)' $(BUILDDIR)/scopebad_typeconst.err; \
 	grep -q 'duplicate identifier X (the routine has a variable or a parameter of the name)' $(BUILDDIR)/scopebad_procparam.err; \
-	grep -q 'duplicate identifier K at 6:1' $(BUILDDIR)/scopebad_twoconst.err; \
-	grep -q 'unknown identifier Q at 13:4' $(BUILDDIR)/scopebad_outside.err; \
-	grep -q 'unknown identifier K at 10:12' $(BUILDDIR)/scopebad_constout.err; \
+	grep -q 'duplicate identifier K at 5:3' $(BUILDDIR)/scopebad_twoconst.err; \
+	grep -q 'unknown identifier Q at 13:3' $(BUILDDIR)/scopebad_outside.err; \
+	grep -q 'unknown identifier K at 10:11' $(BUILDDIR)/scopebad_constout.err; \
 	echo ok scopebad; \
 	echo "==== short class forms rejects (P139) ===="; \
 	for f in 'unresolved:forward type TA not resolved at 3:3' \
@@ -1629,7 +1629,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	done; \
 	echo ok classfwdbad; \
 	echo "==== object into interface rejects (P140) ===="; \
-	for f in 'noiface:TPlain does not implement IShape at 18:22' 'parentiface:TA does not implement IBase at 24:17'; do \
+	for f in 'noiface:TPlain does not implement IShape at 18:8' 'parentiface:TA does not implement IBase at 24:8'; do \
 	  n=$${f%%:*}; w=$${f#*:}; \
 	  if $(OUTDIR)/paslangc -o $(BUILDDIR)/ifacebad_$$n testdata/ifacebad/$$n.paslang >$(BUILDDIR)/ifacebad_$$n.err 2>&1; then \
 	    echo "$$n should fail"; exit 1; \
@@ -1638,7 +1638,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	done; \
 	echo ok ifacebad; \
 	echo "==== overload ambiguities (P141) ===="; \
-	for f in 'ambigset:ambiguous call G at 13:24' 'ambigref:ambiguous call H at 20:20' 'ambigptr:ambiguous call F at 22:27'; do \
+	for f in 'ambigset:ambiguous call G at 13:11' 'ambigref:ambiguous call H at 20:11' 'ambigptr:ambiguous call F at 22:11'; do \
 	  n=$${f%%:*}; w=$${f#*:}; \
 	  if $(OUTDIR)/paslangc -o $(BUILDDIR)/overbad_$$n testdata/overbad/$$n.paslang >$(BUILDDIR)/overbad_$$n.err 2>&1; then \
 	    echo "$$n should fail"; exit 1; \
@@ -1705,8 +1705,8 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	done; \
 	echo ok casebad; \
 	echo "==== overload rejects ===="; \
-	for f in 'ambig:ambiguous call Two at 15:12' 'nofit:no matching overload for Put at 12:13' \
-	  'signed:no matching overload for Put at 15:10' 'varexact:no matching overload for Get at 15:9'; do \
+	for f in 'ambig:ambiguous call Two at 15:3' 'nofit:no matching overload for Put at 12:3' \
+	  'signed:no matching overload for Put at 15:3' 'varexact:no matching overload for Get at 15:3'; do \
 	  n=$${f%%:*}; w=$${f#*:}; \
 	  if $(OUTDIR)/paslangc -o $(BUILDDIR)/$$n testdata/overbad/$$n.paslang >$(BUILDDIR)/$$n.err 2>&1; then \
 	    echo "$$n should fail"; exit 1; \
@@ -1715,14 +1715,14 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	done; \
 	echo ok overbad; \
 	echo "==== narrow rejects ===="; \
-	for f in 'const300:constant 300 does not fit Byte at 5:11 in testdata/narrowbad/const300.paslang' 'conv300:constant 300 does not fit Byte at 5:17' \
-	  'negbyte:constant -1 does not fit Byte at 5:16' 'narrowing:Integer needs a conversion to Byte at 7:9' \
-	  'mixed:Integer needs a conversion to Byte at 7:13' 'compare:constant 300 does not fit Byte at 6:14' \
-	  'caselabel:case label does not fit Byte at 8:5' 'forlimit:constant 300 does not fit Byte at 5:21' \
-	  'argument:constant 300 does not fit Byte at 9:9' 'default:default value 300 does not fit Byte at 3:26' \
-	  'typedconst:constant 300 does not fit Byte at 3:13' 'nocontext:constant 300 does not fit Byte at line 6' \
-	  'signtoword:Int8 needs a conversion to Word at 7:9' 'vararg:var parameter of type Integer given a Byte at 11:7' \
-	  'atomic:AtomicAdd needs an 8-byte integer, not a Byte at 7:26'; do \
+	for f in 'const300:constant 300 does not fit Byte at 5:8 in testdata/narrowbad/const300.paslang' 'conv300:constant 300 does not fit Byte at 5:13' \
+	  'negbyte:constant -1 does not fit Byte at 5:13' 'narrowing:Integer needs a conversion to Byte at 7:8' \
+	  'mixed:Integer needs a conversion to Byte at 7:8' 'compare:constant 300 does not fit Byte at 6:10' \
+	  'caselabel:case label does not fit Byte at 8:5' 'forlimit:constant 300 does not fit Byte at 5:17' \
+	  'argument:constant 300 does not fit Byte at 9:5' 'default:default value 300 does not fit Byte at 3:23' \
+	  'typedconst:constant 300 does not fit Byte at 3:13' 'nocontext:constant 300 does not fit Byte at 6:15' \
+	  'signtoword:Int8 needs a conversion to Word at 7:8' 'vararg:var parameter of type Integer given a Byte at 11:5' \
+	  'atomic:AtomicAdd needs an 8-byte integer, not a Byte at 7:21'; do \
 	  n=$${f%%:*}; w=$${f#*:}; \
 	  if $(OUTDIR)/paslangc -o $(BUILDDIR)/nb_$$n testdata/narrowbad/$$n.paslang >$(BUILDDIR)/nb_$$n.err 2>&1; then \
 	    echo "$$n should fail"; exit 1; \
@@ -1731,11 +1731,11 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	done; \
 	echo ok narrowbad; \
 	echo "==== real rejects ===="; \
-	for f in 'assign:a real does not go into Integer: Trunc or Round says how at 7:9 in testdata/realbad/assign.paslang' \
-	  'argument:a real does not go into Integer: Trunc or Round says how at 12:7' \
-	  'exitreal:a real does not go into Integer: Trunc or Round says how at 5:13' \
-	  'boolreal:a real does not go into Boolean at 7:9' \
-	  'ordreal:Ord of a real: Trunc or Round says how at 6:17'; do \
+	for f in 'assign:a real does not go into Integer: Trunc or Round says how at 7:8 in testdata/realbad/assign.paslang' \
+	  'argument:a real does not go into Integer: Trunc or Round says how at 12:5' \
+	  'exitreal:a real does not go into Integer: Trunc or Round says how at 5:8' \
+	  'boolreal:a real does not go into Boolean at 7:8' \
+	  'ordreal:Ord of a real: Trunc or Round says how at 6:15'; do \
 	  n=$${f%%:*}; w=$${f#*:}; \
 	  if $(OUTDIR)/paslangc -o $(BUILDDIR)/rb_$$n testdata/realbad/$$n.paslang >$(BUILDDIR)/rb_$$n.err 2>&1; then \
 	    echo "$$n should fail"; exit 1; \
@@ -1744,15 +1744,15 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	done; \
 	echo ok realbad; \
 	echo "==== single rejects ===="; \
-	for f in 'assign:Double needs Single(x) to become a Single at 7:9 in testdata/singlebad/assign.paslang' \
-	  'mixed:Double needs Single(x) to become a Single at 8:13' \
-	  'argument:Double needs Single(x) to become a Single at 12:7' \
-	  'exitdbl:Double needs Single(x) to become a Single at 5:13' \
-	  'bigconst:constant 1e39 does not fit Single at 5:12' \
-	  'convbig:constant 4e38 does not fit Single at 5:21' \
-	  'default:default value does not fit Single at 3:29' \
+	for f in 'assign:Double needs Single(x) to become a Single at 7:8 in testdata/singlebad/assign.paslang' \
+	  'mixed:Double needs Single(x) to become a Single at 8:8' \
+	  'argument:Double needs Single(x) to become a Single at 12:5' \
+	  'exitdbl:Double needs Single(x) to become a Single at 5:8' \
+	  'bigconst:constant 1e39 does not fit Single at 5:8' \
+	  'convbig:constant 4e38 does not fit Single at 5:16' \
+	  'default:default value does not fit Single at 3:25' \
 	  'typedconst:a constant that does not fit Single at 3:15' \
-	  'polysingle:Poly takes an array of Real at 6:23'; do \
+	  'polysingle:Poly takes an array of Real at 6:11'; do \
 	  n=$${f%%:*}; w=$${f#*:}; \
 	  if $(OUTDIR)/paslangc -o $(BUILDDIR)/sb_$$n testdata/singlebad/$$n.paslang >$(BUILDDIR)/sb_$$n.err 2>&1; then \
 	    echo "$$n should fail"; exit 1; \
@@ -1761,24 +1761,24 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	done; \
 	echo ok singlebad; \
 	echo "==== pointer rejects ===="; \
-	for f in 'readderef:the target of an untyped Pointer needs a type: T(p^) or PT(p)^ at 7:10 in testdata/ptrbad/readderef.paslang' \
-	  'storederef:the target of an untyped Pointer needs a type: T(p^) or PT(p)^ at 7:9' \
-	  'writederef:the target of an untyped Pointer needs a type: T(p^) or PT(p)^ at 7:13' \
-	  'arithderef:the target of an untyped Pointer needs a type: T(p^) or PT(p)^ at 7:14' \
-	  'indexptr:an untyped Pointer is indexed through a view: PByte(p)[i] at 7:12' \
-	  'twotypes:pointers of two types: see both through one view, PT(p) - PT(q) at 8:28' \
-	  'addptrs:two pointers do not add at 7:13' \
-	  'intminusptr:an integer minus a pointer at 7:13' \
-	  'caretbad:^T(q) sees a pointer, a class or an address at 7:19' \
-	  'reachvar:pointer outside its object: x has 8 bytes and this reaches bytes 8 to 8 at 6:27' \
-	  'reachneg:pointer outside its object: x has 8 bytes and this reaches bytes -1 to -1 at 7:27' \
-	  'reachwide:pointer outside its object: b has 1 byte and this reaches bytes 0 to 7 at 6:24' \
-	  'reachfield:pointer outside its object: r has 12 bytes and this reaches bytes 8 to 15 at 13:26' \
-	  'reachindex:pointer outside its object: a has 8 bytes and this reaches bytes 8 to 9 at 6:26' \
-	  'reachview:pointer outside its object: x has 8 bytes and this reaches bytes 0 to 11 at 13:21' \
-	  'reachuntyped:pointer outside its object: x has 8 bytes and this reaches bytes 0 to 11 at 13:28' \
-	  'reachfill:pointer outside its object: r has 12 bytes and this reaches bytes 0 to 99 at 12:21' \
-	  'reachmove:pointer outside its object: x has 8 bytes and this reaches bytes 0 to 15 at 7:16'; do \
+	for f in 'readderef:the target of an untyped Pointer needs a type: T(p^) or PT(p)^ at 7:8 in testdata/ptrbad/readderef.paslang' \
+	  'storederef:the target of an untyped Pointer needs a type: T(p^) or PT(p)^ at 7:3' \
+	  'writederef:the target of an untyped Pointer needs a type: T(p^) or PT(p)^ at 7:11' \
+	  'arithderef:the target of an untyped Pointer needs a type: T(p^) or PT(p)^ at 7:8' \
+	  'indexptr:an untyped Pointer is indexed through a view: PByte(p)[i] at 7:8' \
+	  'twotypes:pointers of two types: see both through one view, PT(p) - PT(q) at 8:14' \
+	  'addptrs:two pointers do not add at 7:8' \
+	  'intminusptr:an integer minus a pointer at 7:8' \
+	  'caretbad:^T(q) sees a pointer, a class or an address at 7:8' \
+	  'reachvar:pointer outside its object: x has 8 bytes and this reaches bytes 8 to 8 at 6:18' \
+	  'reachneg:pointer outside its object: x has 8 bytes and this reaches bytes -1 to -1 at 7:18' \
+	  'reachwide:pointer outside its object: b has 1 byte and this reaches bytes 0 to 7 at 6:20' \
+	  'reachfield:pointer outside its object: r has 12 bytes and this reaches bytes 8 to 15 at 13:20' \
+	  'reachindex:pointer outside its object: a has 8 bytes and this reaches bytes 8 to 9 at 6:17' \
+	  'reachview:pointer outside its object: x has 8 bytes and this reaches bytes 0 to 11 at 13:17' \
+	  'reachuntyped:pointer outside its object: x has 8 bytes and this reaches bytes 0 to 11 at 13:24' \
+	  'reachfill:pointer outside its object: r has 12 bytes and this reaches bytes 0 to 99 at 12:12' \
+	  'reachmove:pointer outside its object: x has 8 bytes and this reaches bytes 0 to 15 at 7:8'; do \
 	  n=$${f%%:*}; w=$${f#*:}; \
 	  if $(OUTDIR)/paslangc -o $(BUILDDIR)/pb_$$n testdata/ptrbad/$$n.paslang >$(BUILDDIR)/pb_$$n.err 2>&1; then \
 	    echo "$$n should fail"; exit 1; \
@@ -1787,18 +1787,18 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	done; \
 	echo ok ptrbad; \
 	echo "==== safe rejects ===="; \
-	for f in 'arith:safe code does not do pointer arithmetic at 10:13 in testdata/safebad/arith.paslang' \
-	  'incptr:safe code does not step a pointer at 10:9' \
-	  'indexptr:safe code does not index a pointer; an array or a slice checks its index at 10:17' \
-	  'view:safe code does not see memory as another type at 10:21' \
-	  'caret:safe code does not see memory as another type at 7:22' \
-	  'untyped:safe code does not reach through an untyped Pointer at 11:10' \
-	  'fromint:safe code does not see memory as another type at 5:24' \
-	  'nested:safe code does not step a pointer at 12:14' \
-	  'method:safe code does not see memory as another type at 11:22' \
-	  'wholeprog:safe code does not do pointer arithmetic at 7:13' \
+	for f in 'arith:safe code does not do pointer arithmetic at 10:8 in testdata/safebad/arith.paslang' \
+	  'incptr:safe code does not step a pointer at 10:7' \
+	  'indexptr:safe code does not index a pointer; an array or a slice checks its index at 10:13' \
+	  'view:safe code does not see memory as another type at 10:13' \
+	  'caret:safe code does not see memory as another type at 7:13' \
+	  'untyped:safe code does not reach through an untyped Pointer at 11:8' \
+	  'fromint:safe code does not see memory as another type at 5:13' \
+	  'nested:safe code does not step a pointer at 12:9' \
+	  'method:safe code does not see memory as another type at 11:13' \
+	  'wholeprog:safe code does not do pointer arithmetic at 7:8' \
 	  'notroutine:safe goes before a routine, a unit or a program at 2:6' \
-	  'viewsafe:safe code does not see memory as an array at 9:32'; do \
+	  'viewsafe:safe code does not see memory as an array at 9:8'; do \
 	  n=$${f%%:*}; w=$${f#*:}; \
 	  if $(OUTDIR)/paslangc -o $(BUILDDIR)/sf_$$n testdata/safebad/$$n.paslang >$(BUILDDIR)/sf_$$n.err 2>&1; then \
 	    echo "$$n should fail"; exit 1; \
@@ -1807,15 +1807,15 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	done; \
 	echo ok safebad; \
 	echo "==== quad rejects ===="; \
-	for f in 'todouble:a Quad becomes a Double only through Double(x) at 19:9 in testdata/quadbad/todouble.paslang' \
-	  'tosingle:a Quad becomes a Single only through Single(x) at 19:9' \
-	  'toint:a Quad does not go into Integer: Trunc or Round says how at 19:9' \
-	  'tobool:a Quad does not go into Boolean at 19:9' \
-	  'nosin:sin has no Quad form: write Double(x) for it at 19:14' \
-	  'fromstr:a string does not become a Quad at 19:11' \
-	  'toobig:constant 1e5000 does not fit Quad at 19:14' \
-	  'quaddiv:a Quad takes +, -, *, / and the comparisons at 19:15' \
-	  'quadnot:not does not take a real at 19:13'; do \
+	for f in 'todouble:a Quad becomes a Double only through Double(x) at 19:8 in testdata/quadbad/todouble.paslang' \
+	  'tosingle:a Quad becomes a Single only through Single(x) at 19:8' \
+	  'toint:a Quad does not go into Integer: Trunc or Round says how at 19:8' \
+	  'tobool:a Quad does not go into Boolean at 19:8' \
+	  'nosin:sin has no Quad form: write Double(x) for it at 19:8' \
+	  'fromstr:a string does not become a Quad at 19:8' \
+	  'toobig:constant 1e5000 does not fit Quad at 19:3' \
+	  'quaddiv:a Quad takes +, -, *, / and the comparisons at 19:8' \
+	  'quadnot:not does not take a real at 19:12'; do \
 	  n=$${f%%:*}; w=$${f#*:}; \
 	  if $(OUTDIR)/paslangc -o $(BUILDDIR)/qb_$$n testdata/quadbad/$$n.paslang >$(BUILDDIR)/qb_$$n.err 2>&1; then \
 	    echo "$$n should fail"; exit 1; \
@@ -1827,79 +1827,79 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(OUTDIR)/paslangc testdata/units/visu.paslang; \
 	$(OUTDIR)/paslangc testdata/units/visd.paslang; \
 	for f in 'notplace:+= needs a variable at 22:8' \
-	  'narrow:Integer needs a conversion to Byte at 22:9' \
-	  'realnand:nand does not take a real at 22:16' \
-	  'realrol:rol does not take a real at 22:15' \
-	  'realdiv:div does not take a real at 22:11' \
-	  'boolrol:rol takes two integers at 22:15' \
-	  'strxnor:xnor does not take a string at 22:16' \
-	  'strsub:- does not take a string at 22:11' \
-	  'strint:+ joins a string with a string or a Char at 22:13' \
-	  'strneg:- does not take a string at 22:10' \
-	  'strnot:string does not go into Boolean; x as T sees its bytes at 22:13' \
-	  'arradd:+ does not take an array at 22:16' \
-	  'recand:a record does not go into Integer; x as T sees its bytes at 22:15' \
-	  'mixnor:nor of a Boolean and an integer: a comparison binds first, so write (x and 4) = 4, or Ord(b) for the number at 22:15' \
-	  'mixand:and of a Boolean and an integer: a comparison binds first, so write (x and 4) = 4, or Ord(b) for the number at 22:18' \
-	  'inttobool:Integer does not go into Boolean: Boolean(x) is x <> 0 at 22:9' \
-	  'booladd:Integer does not go into Boolean: Boolean(x) is x <> 0 at 22:13' \
-	  'boolreal:a real does not go into Boolean: compare it at 22:18' \
-	  'boolstr:Boolean() takes an ordinal or a pointer at 22:18' \
-	  'quadrol:a Quad takes +, -, *, / and the comparisons at 22:11' \
+	  'narrow:Integer needs a conversion to Byte at 22:3' \
+	  'realnand:nand does not take a real at 22:8' \
+	  'realrol:rol does not take a real at 22:8' \
+	  'realdiv:div does not take a real at 22:3' \
+	  'boolrol:rol takes two integers at 22:8' \
+	  'strxnor:xnor does not take a string at 22:8' \
+	  'strsub:- does not take a string at 22:3' \
+	  'strint:+ joins a string with a string or a Char at 22:8' \
+	  'strneg:- does not take a string at 22:9' \
+	  'strnot:string does not go into Boolean; x as T sees its bytes at 22:8' \
+	  'arradd:+ does not take an array at 22:9' \
+	  'recand:a record does not go into Integer; x as T sees its bytes at 22:8' \
+	  'mixnor:nor of a Boolean and an integer: a comparison binds first, so write (x and 4) = 4, or Ord(b) for the number at 22:8' \
+	  'mixand:and of a Boolean and an integer: a comparison binds first, so write (x and 4) = 4, or Ord(b) for the number at 22:6' \
+	  'inttobool:Integer does not go into Boolean: Boolean(x) is x <> 0 at 22:8' \
+	  'booladd:Integer does not go into Boolean: Boolean(x) is x <> 0 at 22:8' \
+	  'boolreal:a real does not go into Boolean: compare it at 22:16' \
+	  'boolstr:Boolean() takes an ordinal or a pointer at 22:16' \
+	  'quadrol:a Quad takes +, -, *, / and the comparisons at 22:3' \
 	  'inexpr:an expression is expected, not = at 22:9' \
-	  'laterlocal:unknown identifier n at 8:7' \
-	  'bitconst:bit 8 out of range [0..7] at 22:22' \
-	  'fieldconst:bits 6..9 out of range [0..7] at 22:24' \
-	  'fieldwidth:GetBits takes a constant width at 22:24' \
-	  'widthzero:GetBits takes a width of 1 to 8 at 22:24' \
-	  'setbitconst:SetBit needs a variable at 22:18' \
-	  'recbit:bit 64 out of range [0..63] at 23:23' \
-	  'recfield:bits 60..67 out of range [0..63] at 23:25' \
-	  'recrev:ReverseBits takes a value of up to 8 bytes at 23:22' \
-	  'rawpop:PopCount of raw memory: it has no end; see it through View(p, n) at 23:20' \
-	  'stratomic:AtomicSetBit of a string: its characters may be shared; use a slice or an integer at 23:26' \
-	  'strcall:IsBitSet of a string or a slice that calls a routine: put it in a variable first at 23:34' \
-	  'saferaw:safe code does not reach through an untyped Pointer at 23:12' \
-	  'viewbig:a view of 2 bytes on Byte of 1 at 23:17' \
-	  'viewrec:a view of 16 bytes on a record of 8 at 23:34' \
-	  'viewval:a view of this value as array[0..7] of Byte needs a variable at 23:39' \
-	  'viewwrite:a view that is written needs a variable whose place calls no routine at 23:25' \
-	  'incexpr:Inc needs a variable at 23:12' \
+	  'laterlocal:unknown identifier n at 8:5' \
+	  'bitconst:bit 8 out of range [0..7] at 22:8' \
+	  'fieldconst:bits 6..9 out of range [0..7] at 22:8' \
+	  'fieldwidth:GetBits takes a constant width at 22:8' \
+	  'widthzero:GetBits takes a width of 1 to 8 at 22:8' \
+	  'setbitconst:SetBit needs a variable at 22:3' \
+	  'recbit:bit 64 out of range [0..63] at 23:8' \
+	  'recfield:bits 60..67 out of range [0..63] at 23:8' \
+	  'recrev:ReverseBits takes a value of up to 8 bytes at 23:8' \
+	  'rawpop:PopCount of raw memory: it has no end; see it through View(p, n) at 23:8' \
+	  'stratomic:AtomicSetBit of a string: its characters may be shared; use a slice or an integer at 23:8' \
+	  'strcall:IsBitSet of a string or a slice that calls a routine: put it in a variable first at 23:8' \
+	  'saferaw:safe code does not reach through an untyped Pointer at 23:10' \
+	  'viewbig:a view of 2 bytes on Byte of 1 at 23:8' \
+	  'viewrec:a view of 16 bytes on a record of 8 at 23:9' \
+	  'viewval:a view of this value as array[0..7] of Byte needs a variable at 23:10' \
+	  'viewwrite:a view that is written needs a variable whose place calls no routine at 23:3' \
+	  'incexpr:Inc needs a variable at 23:7' \
 	  'parenplace:a variable is expected before := at 23:11' \
-	  'saferawview:safe code does not reach through an untyped Pointer at 23:11' \
-	  'realconv:a real becomes Integer through Trunc or Round; x as Integer sees its bits at 22:17' \
-	  'realbyte:a real becomes Byte through Trunc or Round; x as Byte sees its bits at 22:15' \
-	  'blkptr:xor of a record, which holds strings, pointers or objects, would make addresses up at 24:15' \
-	  'blksize:xor of blocks of 8 and 16 bytes at 24:16' \
-	  'blkexpr:logic on a record or an array goes into a variable: r := a xor b at 24:23' \
-	  'blkreal:and of array[0..1] of Integer takes a block of its size, or an integer for an array of integers at 24:15' \
-	  'recint:TR does not go into Integer; x as T sees its bytes at 16:9' \
-	  'strtoint:string does not go into Integer; x as T sees its bytes at 16:9' \
-	  'dynelem:array of Byte does not go into array of Integer; x as T sees its bytes at 16:10' \
-	  'mulhireal:MulHi takes integers at 22:19' \
-	  'carryconst:AddCarry takes a variable whose place calls no routine at 22:28' \
-	  'mul128byte:Mul128 takes an Integer variable at 22:21' \
-	  'divmodargs:DivMod128 takes 5 arguments at 22:24' \
-	  'prefint:Prefetch takes a pointer at 23:14' \
-	  'aloadconst:AtomicLoad takes a variable whose place calls no routine at 23:21' \
-	  "cpuname:CpuHas does not know 'avx3' at 24:21" \
-	  "cpuvar:CpuHas takes the name of a feature in quotes, as CpuHas('avx2') at 25:16" \
-	  'cycleargs:CycleCount takes no argument at 24:21' \
-	  'vecwidth:VAdd8 takes vectors of one width, not a V128 and a V256 at 16:19' \
-	  'vecint:VAdd8 takes a V128 or a V256, not Integer at 16:19' \
-	  'vecsplat:VSplat8 takes an integer at 16:20' \
-	  'veccount:VShl16 takes a shift count, an integer at 16:22' \
-	  'vecargs:VAdd8 takes 2 arguments at 16:16' \
-	  'vecdeep:a vector expression this deep needs more than the 14 vector registers: split it into two statements at 16:109' \
-	  'vecnarrow:V256 does not go into V128; x as T sees its bytes at 16:9' \
-	  'writevec:Write does not print a V128: view its lanes, as (v as array[0..15] of Byte)[i] at 16:12' \
-	  'writerec:Write does not print a record: write its fields at 16:12' \
-	  'writearr:Write does not print an array: write its elements at 16:15' \
-	  'writechars:Write does not print an array: write its elements at 16:10' \
-	  'vecsplatf:VSplatF32 takes a number at 10:22' \
-	  'vecred:VSumU8 takes a V128 or a V256, not Integer at 10:17' \
-	  'vecredint:Integer does not go into V128; x as T sees its bytes at 10:21' \
-	  'asmalone:asm arm64 alone: this is compiled for amd64, so write an asm amd64 block beside it at 11:6' \
+	  'saferawview:safe code does not reach through an untyped Pointer at 23:8' \
+	  'realconv:a real becomes Integer through Trunc or Round; x as Integer sees its bits at 22:15' \
+	  'realbyte:a real becomes Byte through Trunc or Round; x as Byte sees its bits at 22:13' \
+	  'blkptr:xor of a record, which holds strings, pointers or objects, would make addresses up at 24:8' \
+	  'blksize:xor of blocks of 8 and 16 bytes at 24:8' \
+	  'blkexpr:logic on a record or an array goes into a variable: r := a xor b at 24:3' \
+	  'blkreal:and of array[0..1] of Integer takes a block of its size, or an integer for an array of integers at 24:8' \
+	  'recint:TR does not go into Integer; x as T sees its bytes at 16:8' \
+	  'strtoint:string does not go into Integer; x as T sees its bytes at 16:8' \
+	  'dynelem:array of Byte does not go into array of Integer; x as T sees its bytes at 16:8' \
+	  'mulhireal:MulHi takes integers at 22:8' \
+	  'carryconst:AddCarry takes a variable whose place calls no routine at 22:8' \
+	  'mul128byte:Mul128 takes an Integer variable at 22:3' \
+	  'divmodargs:DivMod128 takes 5 arguments at 22:3' \
+	  'prefint:Prefetch takes a pointer at 23:12' \
+	  'aloadconst:AtomicLoad takes a variable whose place calls no routine at 23:8' \
+	  "cpuname:CpuHas does not know 'avx3' at 24:6" \
+	  "cpuvar:CpuHas takes the name of a feature in quotes, as CpuHas('avx2') at 25:6" \
+	  'cycleargs:CycleCount takes no argument at 24:8' \
+	  'vecwidth:VAdd8 takes vectors of one width, not a V128 and a V256 at 16:8' \
+	  'vecint:VAdd8 takes a V128 or a V256, not Integer at 16:17' \
+	  'vecsplat:VSplat8 takes an integer at 16:8' \
+	  'veccount:VShl16 takes a shift count, an integer at 16:8' \
+	  'vecargs:VAdd8 takes 2 arguments at 16:8' \
+	  'vecdeep:a vector expression this deep needs more than the 14 vector registers: split it into two statements at 16:8' \
+	  'vecnarrow:V256 does not go into V128; x as T sees its bytes at 16:8' \
+	  'writevec:Write does not print a V128: view its lanes, as (v as array[0..15] of Byte)[i] at 16:11' \
+	  'writerec:Write does not print a record: write its fields at 16:11' \
+	  'writearr:Write does not print an array: write its elements at 16:14' \
+	  'writechars:Write does not print an array: write its elements at 16:9' \
+	  'vecsplatf:VSplatF32 takes a number at 10:8' \
+	  'vecred:VSumU8 takes a V128 or a V256, not Integer at 10:15' \
+	  'vecredint:Integer does not go into V128; x as T sees its bytes at 10:8' \
+	  'asmalone:asm arm64 alone: this is compiled for amd64, so write an asm amd64 block beside it at 9:3' \
 	  'asmreg:asm does not bind rsp: rsp and rbp hold the frame, r14 the running routine at 9:20' \
 	  'asmtype:asm binds V128 to no integer register at 9:20' \
 	  'asmxmm:asm amd64 does not bind Integer to xmm0: rax to r15 take integers, xmm a Single, a Double or a V128, ymm a V256 at 9:20' \
@@ -1908,17 +1908,17 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  'asmsafe:safe code does not take asm at 10:3' \
 	  'asmtwo:two asm blocks for amd64 side by side at 11:7' \
 	  'asmmode:an asm binding is in, out or inout at 9:17' \
-	  'dupfield:x is a field already at 7:12' \
-	  'dupinherit:A is a field already at 10:3' \
-	  'storebig:constant 70000 does not fit Word at 23:22' \
-	  'safeload:safe code does not see memory as another type at 23:19' \
-	  'setbitsbig:constant 20 does not fit 4 bits at 22:23' \
-	  'setbitcall:SetBit of a place that calls: assign it at 22:21' \
-	  'rotptr:RotateLeftToCarry of TNamed, which holds strings, pointers or objects, would make addresses up at 15:31' \
-	  'rotslptr:ShiftLeft of array of string, which holds strings, pointers or objects, would make addresses up at 8:23' \
-	  'rotobj:RotateRight takes a value, not an object: turn its fields at 14:25' \
-	  'rotraw:the target of an untyped Pointer needs a type: T(p^) or PT(p)^ at 10:32' \
-	  'funnelmix:FunnelLeft takes two values of one type, not TPair and Integer at 14:27' \
+	  'dupfield:x is a field already at 7:5' \
+	  'dupinherit:A is a field already at 9:5' \
+	  'storebig:constant 70000 does not fit Word at 23:16' \
+	  'safeload:safe code does not see memory as another type at 23:17' \
+	  'setbitsbig:constant 20 does not fit 4 bits at 22:3' \
+	  'setbitcall:SetBit of a place that calls: assign it at 22:3' \
+	  'rotptr:RotateLeftToCarry of TNamed, which holds strings, pointers or objects, would make addresses up at 15:26' \
+	  'rotslptr:ShiftLeft of array of string, which holds strings, pointers or objects, would make addresses up at 8:18' \
+	  'rotobj:RotateRight takes a value, not an object: turn its fields at 14:8' \
+	  'rotraw:the target of an untyped Pointer needs a type: T(p^) or PT(p)^ at 10:26' \
+	  'funnelmix:FunnelLeft takes two values of one type, not TPair and Integer at 14:19' \
 	  'resop:rol is a reserved word, not a name at 5:3' \
 	  'resdecl:override is a reserved word, not a name at 5:6' \
 	  'respre:Carry is a reserved word, not a name at 6:3' \
@@ -1938,50 +1938,50 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  'reslow:Low is a reserved word, not a name at 9:14' \
 	  'resgoid:Goid is a reserved word, not a name at 8:3' \
 	  'sleepvar:sleep is a reserved word, not a name at 5:3' \
-	  'appendnot:Append takes a slice first, not Integer at 8:20' \
-	  'capnot:Cap takes a slice, not string at 9:14' \
-	  'appendelem:string does not go into Integer; x as T sees its bytes at 8:22' \
-	  'slicerange:a slice takes values, not a range at 8:14' \
+	  'appendnot:Append takes a slice first, not Integer at 8:15' \
+	  'capnot:Cap takes a slice, not string at 9:12' \
+	  'appendelem:string does not go into Integer; x as T sees its bytes at 8:18' \
+	  'slicerange:a slice takes values, not a range at 8:9' \
 	  'resappend:Append is a reserved word, not a name at 4:11' \
-	  'capvar:X is a var parameter of P, which has a closure inside: a closure may outlive the variable it points at; copy it to a local at 15:4' \
-	  'capresult:Result of F, which has a closure inside, is not shared with the routines in it: use a local at 19:4' \
-	  'capcounter:i is the counter a closure in this loop keeps: no loop inside may count with it at 20:6' \
-	  'runechar:for c in a string walks its code points: c is a Rune or an Integer, not Char at 11:15' \
-	  'assignednot:Assigned takes a pointer, an object, a routine value or a slice, not Integer at 9:22' \
-	  'rotcount:ShiftLeft takes a count, an integer at 22:25' \
-	  'carryarg:CarryOn takes no argument at 22:13' \
-	  'carryint:Integer does not go into Boolean: Boolean(x) is x <> 0 at 22:13' \
-	  'rotargs:RotateLeftToCarry takes 1 or 2 arguments at 22:34' \
-	  'rotfit:constant 300 does not fit Byte at 22:30' \
-	  'pasvar:pas passes values: parameter 1 of Bump is a var parameter at 13:17' \
-	  'pasanonargs:pas runs a routine with no parameters: pas procedure begin ... end at 8:6' \
-	  'pasnotcall:pas takes a call: pas F(a, b), pas f, pas obj.M(a) or pas procedure begin ... end at 8:8' \
-	  'pasbuiltin:pas takes a routine of the program, not Length at 8:16' \
-	  'pasmethvar:pas passes values: parameter 1 is a var parameter at 24:11' \
-	  'methvalcount:wrong number of arguments for the method value at 22:7' \
-	  'pasnoargs:this routine takes 2 arguments and none are written at 18:12' \
-	  'methnoargs:this routine takes 2 arguments and none are written at 20:8' \
-	  'setint:a set does not go into Integer at 8:14' \
-	  'lengthint:Length takes a string, an array, a slice or a map, not Integer at 8:17' \
-	  'makechanneg:MakeChan takes a capacity of 0 or more at 6:19' \
-	  'makechanbig:MakeChan takes a capacity of up to 67108864 at 5:25' \
-	  'v128int:Integer does not go into V128: VSplat8..64 or a view makes one at 5:15' \
-	  'realinc:a real does not go into Integer: Trunc or Round says how at 6:11' \
-	  'realidx:a real does not go into Integer: Trunc or Round says how at 6:8' \
-	  'realfor:a real does not go into Integer: Trunc or Round says how at 6:19' \
-	  'realif:a real does not go into Boolean: compare it at 6:8' \
-	  'realwhile:a real does not go into Boolean: compare it at 6:11' \
-	  'realsetlen:a real does not go into Integer: Trunc or Round says how at 6:17' \
-	  'realcase:a real does not go into a case: Trunc or Round says how at 6:10' \
+	  'capvar:X is a var parameter of P, which has a closure inside: a closure may outlive the variable it points at; copy it to a local at 13:5' \
+	  'capresult:Result of F, which has a closure inside, is not shared with the routines in it: use a local at 12:5' \
+	  'capcounter:i is the counter a closure in this loop keeps: no loop inside may count with it at 18:5' \
+	  'runechar:for c in a string walks its code points: c is a Rune or an Integer, not Char at 10:3' \
+	  'assignednot:Assigned takes a pointer, an object, a routine value or a slice, not Integer at 9:20' \
+	  'rotcount:ShiftLeft takes a count, an integer at 22:8' \
+	  'carryarg:CarryOn takes no argument at 22:3' \
+	  'carryint:Integer does not go into Boolean: Boolean(x) is x <> 0 at 22:12' \
+	  'rotargs:RotateLeftToCarry takes 1 or 2 arguments at 22:8' \
+	  'rotfit:constant 300 does not fit Byte at 22:26' \
+	  'pasvar:pas passes values: parameter 1 of Bump is a var parameter at 13:3' \
+	  'pasanonargs:pas runs a routine with no parameters: pas procedure begin ... end at 5:3' \
+	  'pasnotcall:pas takes a call: pas F(a, b), pas f, pas obj.M(a) or pas procedure begin ... end at 8:3' \
+	  'pasbuiltin:pas takes a routine of the program, not Length at 8:3' \
+	  'pasmethvar:pas passes values: parameter 1 is a var parameter at 24:3' \
+	  'methvalcount:wrong number of arguments for the method value at 22:3' \
+	  'pasnoargs:this routine takes 2 arguments and none are written at 18:7' \
+	  'methnoargs:this routine takes 2 arguments and none are written at 20:3' \
+	  'setint:a set does not go into Integer at 8:8' \
+	  'lengthint:Length takes a string, an array, a slice or a map, not Integer at 8:15' \
+	  'makechanneg:MakeChan takes a capacity of 0 or more at 6:8' \
+	  'makechanbig:MakeChan takes a capacity of up to 67108864 at 5:8' \
+	  'v128int:Integer does not go into V128: VSplat8..64 or a view makes one at 5:13' \
+	  'realinc:a real does not go into Integer: Trunc or Round says how at 6:10' \
+	  'realidx:a real does not go into Integer: Trunc or Round says how at 6:5' \
+	  'realfor:a real does not go into Integer: Trunc or Round says how at 6:17' \
+	  'realif:a real does not go into Boolean: compare it at 6:6' \
+	  'realwhile:a real does not go into Boolean: compare it at 6:9' \
+	  'realsetlen:a real does not go into Integer: Trunc or Round says how at 6:16' \
+	  'realcase:a real does not go into a case: Trunc or Round says how at 6:8' \
 	  'caseacross:empty case range 9223372036854775807..-9223372036854775808: Integer is signed, so a hex constant from $$8000000000000000 up is negative at 9:6' \
-	  'succlast:Succ past the last value of TColor at 4:21' \
-	  'predfirst:Pred before the first value of TColor at 4:20' \
-	  'subrreal:a real does not go into TSmall: Trunc or Round says how at 7:10' \
+	  'succlast:Succ past the last value of TColor at 4:16' \
+	  'predfirst:Pred before the first value of TColor at 4:16' \
+	  'subrreal:a real does not go into TSmall: Trunc or Round says how at 7:9' \
 	  'dupglobal:duplicate identifier a at 4:5' \
 	  'dechuge:constant 9223372036854775809 does not fit Integer at 6:8' \
 	  'dec63:constant 9223372036854775808 does not fit Integer: -9223372036854775808 is the lowest at 6:8' \
 	  'hexhuge:constant $$10000000000000001 does not fit Integer at 6:9' \
-	  'highmap:High takes an array, a slice, a string, an ordinal or a tree, not map[Integer] of Integer at 9:15' \
+	  'highmap:High takes an array, a slice, a string, an ordinal or a tree, not map[Integer] of Integer at 9:13' \
 	  'visprivfield:FPriv is private to TVisBase at 11:5' \
 	  'visstrictpriv:FSecret is strict private to TA at 23:13' \
 	  'visprot:FProt is protected to TVisBase at 12:13' \
@@ -1995,21 +1995,21 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  'visinh:Hid is strict private to TA at 21:3' \
 	  'visstrictword:strict goes before private or protected at 6:10' \
 	  'vismethval:Bump is strict private to TA at 21:10' \
-	  'mapkeyreal:Real does not go into Integer, the key of map[Integer] of Integer at 9:10' \
-	  'mapkeykind:Integer does not go into string, the key of map[string] of Integer at 10:12' \
-	  'mapkeyfit:constant 300 does not fit Byte at 9:10' \
-	  'mapforval:for k, v in map[Integer] of Integer: v is Byte, the values are Integer at 11:17' \
-	  'mapforkey:for k in map[string] of Integer: k is Integer, the keys are string at 10:14' \
-	  'maptryget:TryGet(m, k, v): v is string, the values of map[string] of Integer are Integer at 10:24' \
-	  'mapaddr:the address of a map element is not taken: the table moves when the map grows at 10:15' \
-	  'mapinto:map[string] of Integer does not go into map[Integer] of string at 10:9' \
-	  'incstr:Inc takes a number, an ordinal or a pointer, not string at 9:8' \
-	  'vararr:array[0..3] of Byte does not go into a var array of Byte parameter: a slice does at 13:10' \
-	  'atomicval:AtomicAdd takes the address of an Integer, as AtomicAdd(@v, ...), not the Integer itself at 5:18' \
-	  'atomiccasval:AtomicCas takes the address of an Integer, as AtomicCas(@v, ...), not the Integer itself at 5:25' \
-	  'merklestatic:MerkleRoot takes the leaves as a slice, array of string, not the static array[0..2] of string: SetLength one and fill it at 8:36' \
-	  'constwrite:S is a const parameter: the routine may not change it or pass it as var; copy it into a variable first at 5:4' \
-	  'constvar:S is a const parameter: the routine may not change it or pass it as var; copy it into a variable first at 9:4'; do \
+	  'mapkeyreal:Real does not go into Integer, the key of map[Integer] of Integer at 9:5' \
+	  'mapkeykind:Integer does not go into string, the key of map[string] of Integer at 10:10' \
+	  'mapkeyfit:constant 300 does not fit Byte at 9:5' \
+	  'mapforval:for k, v in map[Integer] of Integer: v is Byte, the values are Integer at 11:3' \
+	  'mapforkey:for k in map[string] of Integer: k is Integer, the keys are string at 10:3' \
+	  'maptryget:TryGet(m, k, v): v is string, the values of map[string] of Integer are Integer at 10:21' \
+	  'mapaddr:the address of a map element is not taken: the table moves when the map grows at 10:9' \
+	  'mapinto:map[string] of Integer does not go into map[Integer] of string at 10:8' \
+	  'incstr:Inc takes a number, an ordinal or a pointer, not string at 9:7' \
+	  'vararr:array[0..3] of Byte does not go into a var array of Byte parameter: a slice does at 13:8' \
+	  'atomicval:AtomicAdd takes the address of an Integer, as AtomicAdd(@v, ...), not the Integer itself at 5:13' \
+	  'atomiccasval:AtomicCas takes the address of an Integer, as AtomicCas(@v, ...), not the Integer itself at 5:16' \
+	  'merklestatic:MerkleRoot takes the leaves as a slice, array of string, not the static array[0..2] of string: SetLength one and fill it at 8:29' \
+	  'constwrite:S is a const parameter: the routine may not change it or pass it as var; copy it into a variable first at 4:3' \
+	  'constvar:S is a const parameter: the routine may not change it or pass it as var; copy it into a variable first at 8:5'; do \
 	  n=$${f%%:*}; w=$${f#*:}; \
 	  if $(OUTDIR)/paslangc -o $(BUILDDIR)/bb_$$n testdata/bitbad/$$n.paslang >$(BUILDDIR)/bb_$$n.err 2>&1; then \
 	    echo "$$n should fail"; exit 1; \
@@ -2109,22 +2109,22 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/cputuse.out $(BUILDDIR)/cputuse.got; \
 	echo ok cpubad; \
 	echo "==== treebad ===="; \
-	for f in 'tryset:TryGet needs a tree with values: k in t says whether k is there at 9:24 in testdata/treebad/tryset.paslang' \
+	for f in 'tryset:TryGet needs a tree with values: k in t says whether k is there at 9:6 in testdata/treebad/tryset.paslang' \
 	  'setval:+= of a tree of K: t[k] is True or False, and Include(t, k) puts k in at 8:11' \
-	  'jointypes:Join takes two trees of one type at 9:13' \
-	  'pushtype:string does not go into Integer, the elements of heap of Integer at 9:13' \
-	  'popvar:Pop(h, v): v needs a variable at 8:16' \
-	  'poptype:Pop(h, v): v is string, not Integer at 9:16' \
-	  'keyatreal:a real does not go into Integer: Trunc or Round says how at 8:24' \
-	  'succtree:Succ takes an ordinal, or a tree and a key, not tree[Integer] of Integer at 8:18' \
-	  'merkleleaves:MerkleRoot takes the leaves as a slice of strings, not Integer at 4:31' \
-	  'storearg:StorePut takes a store, a key and a value, both strings at 4:24' \
-	  'forkv:for k, v needs a tree with values; for k in t walks a tree of K at 9:17' \
-	  'lowmap:Low takes an array, a slice, a string, an ordinal or a tree, not map[Integer] of Integer at 8:17' \
-	  'includeint:Include takes a tree and a key, or a set and an element at 7:16' \
-	  'poplowset:PopLow of a tree of K takes the key alone at 9:22' \
-	  'rangeval:for k, v in tree[Integer] of Integer: v is string, the values are Integer at 10:23' \
-	  'forinheap:for x in does not walk a heap: take its elements with Pop at 10:14' \
+	  'jointypes:Join takes two trees of one type at 9:3' \
+	  'pushtype:string does not go into Integer, the elements of heap of Integer at 9:11' \
+	  'popvar:Pop(h, v): v needs a variable at 8:13' \
+	  'poptype:Pop(h, v): v is string, not Integer at 9:13' \
+	  'keyatreal:a real does not go into Integer: Trunc or Round says how at 8:20' \
+	  'succtree:Succ takes an ordinal, or a tree and a key, not tree[Integer] of Integer at 8:16' \
+	  'merkleleaves:MerkleRoot takes the leaves as a slice of strings, not Integer at 4:29' \
+	  'storearg:StorePut takes a store, a key and a value, both strings at 4:3' \
+	  'forkv:for k, v needs a tree with values; for k in t walks a tree of K at 9:3' \
+	  'lowmap:Low takes an array, a slice, a string, an ordinal or a tree, not map[Integer] of Integer at 8:15' \
+	  'includeint:Include takes a tree and a key, or a set and an element at 7:3' \
+	  'poplowset:PopLow of a tree of K takes the key alone at 9:6' \
+	  'rangeval:for k, v in tree[Integer] of Integer: v is string, the values are Integer at 10:3' \
+	  'forinheap:for x in does not walk a heap: take its elements with Pop at 10:3' \
 	  'heapname:heap is a reserved word, not a name at 4:3'; do \
 	  n=$${f%%:*}; w=$${f#*:}; \
 	  if $(OUTDIR)/paslangc -o $(BUILDDIR)/tb_$$n testdata/treebad/$$n.paslang >$(BUILDDIR)/tb_$$n.err 2>&1; then \
@@ -2872,7 +2872,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/helppriv testdata/units/helppriv.paslang > $(BUILDDIR)/helppriv.err 2>&1; then \
 	  echo 'a helper.s private method called from another unit should be refused'; exit 1; \
 	fi; \
-	grep -q 'Pad is private to TStrTools.s unit at 9:19' $(BUILDDIR)/helppriv.err; \
+	grep -q 'Pad is private to TStrTools.s unit at 9:13' $(BUILDDIR)/helppriv.err; \
 	$(OUTDIR)/paslangc -target arm64 testdata/units/helpu.paslang; \
 	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/helpuse-arm testdata/units/helpuse.paslang; \
 	timeout 60 $(QEMU_A64) $(BUILDDIR)/helpuse-arm > $(BUILDDIR)/helpuse-arm.got; \
@@ -2886,7 +2886,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/shadbad testdata/units/shadbad.paslang > $(BUILDDIR)/shadbad.err 2>&1; then \
 	  echo 'a name its unit does not have should be refused'; exit 1; \
 	fi; \
-	grep -q 'unknown identifier shada.Nope at 4:21' $(BUILDDIR)/shadbad.err; \
+	grep -q 'unknown identifier shada.Nope at 4:11' $(BUILDDIR)/shadbad.err; \
 	$(OUTDIR)/paslangc -target arm64 testdata/units/shada.paslang; \
 	$(OUTDIR)/paslangc -target arm64 testdata/units/shadb.paslang; \
 	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/shaduse-arm testdata/units/shaduse.paslang; \
@@ -2957,7 +2957,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/ovbad testdata/units/ovbad.paslang > $(BUILDDIR)/ovbad.err 2>&1; then \
 	  echo 'ovbad should fail'; exit 1; \
 	fi; \
-	grep -q 'a real does not go into Integer: Trunc or Round says how at 11:20' $(BUILDDIR)/ovbad.err; \
+	grep -q 'a real does not go into Integer: Trunc or Round says how at 11:16' $(BUILDDIR)/ovbad.err; \
 	: a nested routine hides the names around it, of a unit too, P159; \
 	$(OUTDIR)/paslangc testdata/units/nestu.paslang; \
 	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/nestuse testdata/units/nestuse.paslang; \
@@ -3006,7 +3006,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  fi; \
 	done; \
 	grep -q 'FPeak is private to TStack.s unit at 8:13' $(BUILDDIR)/recpriv1.err; \
-	grep -q 'GetCount is private to TStack.s unit at 8:21' $(BUILDDIR)/recpriv2.err; \
+	grep -q 'GetCount is private to TStack.s unit at 8:13' $(BUILDDIR)/recpriv2.err; \
 	grep -q 'FCents is strict private to TMoney at 9:13' $(BUILDDIR)/recpriv3.err; \
 	: the local clock under five zones, a TZif file each, against Go, P131; \
 	: record class state and lifetime across a unit, P168 and P174; \
