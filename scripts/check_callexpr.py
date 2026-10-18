@@ -11,10 +11,13 @@ assembly paslangc wrote for testdata/callexpr.paslang, amd64 or with
   routine value, an interface or a virtual method with nothing pushed
   from the loop's head to the call;
 - the code and second word go from their place to the call's registers:
-  r11 and r10 (x8 and x27), Self through r10 (x27) when an argument is
+  r11 and r10 (x8 and x27), on amd64 from the element's own operand
+  (v_fns(,%rax,8), P329), Self through r10 (x27) when an argument is
   worked out first, an interface's code from its table in r11 (x8), a
   method value's from its home straight into r11 and rdi (one ldp into x8
   and x0);
+- LocArr's element read from the frame at its scaled index after the
+  index's check, no address formed (amd64, P329);
 - an operand no call can change is read after the call: Run's t as the
   add's memory operand (a load after the call on arm64), the main
   block's mt the same, 7 * a call the product's recipe with no 7 in a
@@ -105,8 +108,9 @@ def main():
             bad.append(f"{name}: no {what}")
 
     if not arm:
-        loops("p_run", [r"^  movq \(%rax\), %r11$", r"^  movq 8\(%rax\), %r10$", r"^  call \*%r11$"])
-        loops("p_areas", [r"^  movq \(%rax\), %r10$", r"^  movq 8\(%rax\), %r11$",
+        loops("p_run", [r"^  movq v_fns\(,%rax,8\), %r11$", r"^  movq v_fns\+8\(,%rax,8\), %r10$",
+                        r"^  call \*%r11$"])
+        loops("p_areas", [r"^  movq v_shapes\(,%rax,8\), %r10$", r"^  movq v_shapes\+8\(,%rax,8\), %r11$",
                           r"^  movq 0\(%r11\), %r11$", r"^  movq %r10, %rdi$"])
         loops("p_gets", [r"^  movq %rax, %r10$", r"^  movq %r10, %rdi$", r"^  call \*\d+\(%rax\)$"])
         loops("p_six", [r"^  call \*%r11$"])
@@ -121,8 +125,8 @@ def main():
         has("pas_main", r"^  orq v_mt\(%rip\), %rax$", "mt or a call from its home")
         has("p_locarr", r"^  call p_deep\n(\.Lgm\d+:\n)?  addq \$3, %rax$", "Deep(N) + 3 as addq $3")
         has("p_locarr", r"^  imulq \$1000, %rax, %rax$", "a product by 1000 in the instruction")
-        has("p_locarr", r"^  addq \$3, %rax\n  cmpq \$9, %rax\n  ja \.L\d+\n\.L\d+:\n  leaq -\d+\(%rbp\), %rcx$",
-            "the array's address after its index")
+        has("p_locarr", r"^  addq \$3, %rax\n  cmpq \$9, %rax\n  ja \.L\d+\n\.L\d+:\n  leaq \(%rax,%rax,2\), %rax\n"
+            r"  movq -\d+\(%rbp,%rax,8\), %rax$", "the element read at its index after the check")
         before("pas_main", r"^  call p_bumpg$")
         before("pas_main", r"^  call p_bumpvar$")
         before("p_locvar", r"^  call \*%r11$")

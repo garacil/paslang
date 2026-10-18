@@ -400,6 +400,8 @@ GOLDEN_A64 += forstep
 # P330: a value goes to its place without the stack.
 GOLDEN += twostore
 GOLDEN_A64 += twostore
+GOLDEN += elemop
+GOLDEN_A64 += elemop
 # P331: an arm64 global is loaded and stored by adrp and its low twelve bits.
 GOLDEN += globfold
 GOLDEN_A64 += globfold
@@ -2640,6 +2642,13 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/twostore.out $(BUILDDIR)/twostore0.got; \
 	python3 -I scripts/check_twostore.py $(BUILDDIR)/twostore0.s; \
 	echo ok twostore-asm; \
+	: a value of two words loaded and stored at the element itself, P329: elemop with and without inlining; \
+	python3 -I scripts/check_elemop.py $(BUILDDIR)/elemop.s --pairs=21; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/elemop0 testdata/elemop.paslang; \
+	$(BUILDDIR)/elemop0 > $(BUILDDIR)/elemop0.got; \
+	diff -u testdata/elemop.out $(BUILDDIR)/elemop0.got; \
+	python3 -I scripts/check_elemop.py $(BUILDDIR)/elemop0.s --pairs=21; \
+	echo ok elemop-asm; \
 	: the exec lock around a new thread and an execve, clone again on EAGAIN, P333: the runtime in execrace; \
 	python3 -I scripts/check_execlock.py $(BUILDDIR)/execrace.s; \
 	echo ok execlock-asm; \
@@ -3926,6 +3935,13 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	diff -u testdata/twostore.out $(BUILDDIR)/twostore0-arm.got; \
 	python3 -I scripts/check_twostore.py $(BUILDDIR)/twostore0-arm.s --arm; \
 	echo ok twostore-arm-asm; \
+	: P329 on arm64: elemop with and without inlining, one ldp or stp a pair, the add before it in its offset; \
+	python3 -I scripts/check_elemop.py $(BUILDDIR)/elemop-arm.s --arm --pairs=12; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/elemop0-arm testdata/elemop.paslang; \
+	timeout 300 $(QEMU_A64) $(BUILDDIR)/elemop0-arm > $(BUILDDIR)/elemop0-arm.got; \
+	diff -u testdata/elemop.out $(BUILDDIR)/elemop0-arm.got; \
+	python3 -I scripts/check_elemop.py $(BUILDDIR)/elemop0-arm.s --arm --pairs=12; \
+	echo ok elemop-arm-asm; \
 	: P331 on arm64: globfold with and without inlining, a global by adrp and the low twelve bits; \
 	python3 -I scripts/check_adrpfold.py $(BUILDDIR)/globfold-arm.s --folds=12; \
 	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/globfold0-arm testdata/globfold.paslang; \

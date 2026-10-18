@@ -6,10 +6,11 @@
 """A value goes to its place without the stack (P330), read in the
 assembly paslangc wrote for testdata/twostore.paslang, amd64 or with
 --arm arm64: FillFns stores routine values and strings into elements
-with nothing pushed for them (amd64: the words from r11 and r10; arm64:
-one stp of x8 and x27), and FillRecs stores interfaces, routine values,
-strings and method values so too (amd64 its slices from r11, r10 and
-r9; arm64 keeps a slice's three words on the stack).
+with nothing pushed for them (amd64: the words from r11 and r10, into
+the element's own operand since P329; arm64: one stp of x8 and x27, its
+offset the field's or the frame's), and FillRecs stores interfaces,
+routine values, strings and method values so too (amd64 its slices from
+r11, r10 and r9; arm64 keeps a slice's three words on the stack).
 """
 
 import re
@@ -29,6 +30,19 @@ def body(lines, name):
     return out
 
 
+def next8(a, b):
+    """movq %r11, X then movq %r10, X + 8: a displacement, a label plus
+    one or none before X's registers (P329)"""
+    m = re.match(r"^  movq %r11, (.*?)(\((?:%|,%).*)$", a)
+    n = re.match(r"^  movq %r10, (.*?)(\((?:%|,%).*)$", b)
+    if not m or not n or m.group(2) != n.group(2):
+        return False
+    da, db = m.group(1), n.group(1)
+    if re.match(r"^-?\d*$", da) and re.match(r"^-?\d+$", db):
+        return int(db) == int(da or "0") + 8
+    return db == da + "+8"
+
+
 def main():
     arm = "--arm" in sys.argv[1:]
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
@@ -39,10 +53,10 @@ def main():
     for name, want in (("p_fillfns", 2), ("p_fillrecs", 7)):
         b = body(lines, name)
         if arm:
-            kept = sum(1 for l in b if l == "  stp x8, x27, [x0]")
+            kept = sum(1 for l in b if re.match(r"^  stp x8, x27, \[(x\d+|sp)(, #-?\d+)?\]$", l))
         else:
-            kept = sum(1 for i, l in enumerate(b) if l == "  movq %r11, (%rax)" and
-                       i + 1 < len(b) and b[i + 1] == "  movq %r10, 8(%rax)")
+            kept = sum(1 for i, l in enumerate(b) if i + 1 < len(b) and
+                       next8(l, b[i + 1]))
         if kept < want:
             bad.append(f"{name}: {kept} two-word stores from registers, {want} at least")
         # a push of rdx then rax right before an address, the old store
