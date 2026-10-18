@@ -26,7 +26,8 @@ assembly paslangc wrote for testdata/callexpr.paslang, amd64 or with
 - one a call can change is read before it, pushed: g before BumpG, m
   before BumpVar, LocVar's v, Boxed's c and Outer's v before their
   calls;
-- no mov x0, x0 on arm64.
+- no mov x0, x0 on arm64, and a method table's slot read by one ldr at
+  its offset, no add of the offset to x16 before it (P347).
 """
 
 import re
@@ -135,7 +136,7 @@ def main():
     else:
         loops("p_run", [r"^  ldp x8, x27, \[x0\]$", r"^  blr x8$"])
         loops("p_areas", [r"^  ldp x27, x8, \[x0\]$", r"^  ldr x8, \[x8, #0\]$", r"^  mov x0, x27$"])
-        loops("p_gets", [r"^  mov x27, x0$", r"^  mov x0, x27$", r"^  blr x16$"])
+        loops("p_gets", [r"^  mov x27, x0$", r"^  mov x0, x27$", r"^  ldr x16, \[x0\]\n  ldr x16, \[x16, #\d+\]\n  blr x16$"])
         loops("p_six", [r"^  blr x8$"])
         has("p_run", r"^  blr x8\n(\.Lgm\d+:\n)?  ldr x1, \[x29, #-\d+\]\n  add x0, x1, x0$", "t read after the call")
         has("p_gets", r"^  ldp x8, x0, \[x29, #-\d+\]\n  mov x1, #5\n  blr x8$", "method value's code and Self in one ldp")
@@ -150,9 +151,11 @@ def main():
         for k, body in rs.items():
             if k.startswith("rt_"):
                 continue
-            for l in body:
+            for i, l in enumerate(body):
                 if l == "  mov x0, x0":
                     bad.append(f"{k}: mov x0, x0")
+                if l == "  ldr x16, [x16]" and i > 0 and re.match(r"^  add x16, x\d+, #\d+$", body[i - 1]):
+                    bad.append(f"{k}: {body[i - 1].strip()} before a slot's ldr")
     if bad:
         print("\n".join(bad[:20]))
         raise SystemExit(f"check_callexpr: {len(bad)} forms missing in {args[0]}")
