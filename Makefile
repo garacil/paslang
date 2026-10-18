@@ -308,6 +308,10 @@ GOLDEN_A64 += rangetest
 # P293: a loop that does not count is preempted by a signal, as Go's.
 GOLDEN += asyncspin asyncgc asyncleaf
 GOLDEN_A64 += asyncspin asyncgc asyncleaf
+# P350: a Sleep pokes the poller only for a timer before the earliest,
+# the first one and one after the heap emptied beside a poller's wait.
+GOLDEN += pokewait
+GOLDEN_A64 += pokewait
 # P354: a routine's record keeps no saved register once it is loaded back.
 GOLDEN += gstale
 GOLDEN_A64 += gstale

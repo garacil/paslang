@@ -35558,10 +35558,16 @@ begin
   Line('  popq %rbx');
   Line('  ret');
   Line('');
+  { One write while a wake is pending (rt_wakesig), as Go's netpollBreak:
+    the M that drains the eventfd lets the next one through (P350). }
   Line('rt_poke:');
   Line('  movq rt_evfd(%rip), %rdi');
   Line('  testq %rdi, %rdi');
   Line('  jz .pk2_done');
+  Line('  movl $1, %eax');
+  Line('  xchgl %eax, rt_wakesig(%rip)');
+  Line('  testl %eax, %eax');
+  Line('  jnz .pk2_done');
   Line('  subq $8, %rsp');
   Line('  movq $1, (%rsp)');
   Line('  movq %rsp, %rsi');
@@ -35677,15 +35683,35 @@ begin
   Line('  movq %rbx, 208(%r14)');
   Line('  movq $0, 264(%r14)');
   Line('  movl $1, 152(%r14)');
+  Line('  pushq %rbx');
   Line('  leaq rt_glock(%rip), %rdi');
   Line('  call rt_lock');
+  { the earliest wake time before this one: all ones with no timer, as
+    rt_timer0 says once the heap empties (it is 0 before the first one,
+    and the first Sleep beside a routine waiting in the poller slept
+    for ever) }
+  Line('  movq rt_timer0(%rip), %rax');
+  Line('  cmpq $0, rt_sleeph(%rip)');
+  Line('  jne .sl_t0');
+  Line('  movq $-1, %rax');
+  Line('.sl_t0:');
+  Line('  pushq %rax');
   Line('  movq %r14, %rdi');
   Line('  call rt_tins');
   Line('  leaq rt_glock(%rip), %rdi');
   Line('  call rt_unlock');
-  { A new timer may be earlier than the deadline the poller sleeps on:
-    poke it out of epoll_wait so it recomputes (Go's wakeNetPoller). }
+  { A new timer earlier than the earliest one before it may come before
+    the deadline an M sleeps to in epoll_wait, which that one gave it:
+    poke the poller out so it recomputes; a later one it meets on time.
+    Go's wakeNetPoller (runtime/proc.go) pokes a poller only when it
+    sleeps past the new timer (P350): one Sleep of 20,000 at once wrote
+    the eventfd every time. }
+  Line('  popq %rax');
+  Line('  popq %rcx');
+  Line('  cmpq %rax, %rcx');
+  Line('  jae .sl_np');
   Line('  call rt_poke');
+  Line('.sl_np:');
   Line('  popq %rbx');
   Line('  call rt_parkmarked');
   Line('  ret');
@@ -35956,6 +35982,8 @@ begin
   Line('  xorq %rax, %rax');
   Line('  syscall');
   Line('  addq $8, %rsp');
+  { read: the next wake may be written (P350) }
+  Line('  movl $0, rt_wakesig(%rip)');
   Line('.ip_nx:');
   Line('  incq %r12');
   Line('  jmp .ip_ev');
@@ -36187,13 +36215,26 @@ begin
   Line('  js .wi_one');
   Line('  movq %r13, 208(%r14)');
   Line('  movq %r15, 264(%r14)');
+  Line('  pushq %r13');
   Line('  leaq rt_glock(%rip), %rdi');
   Line('  call rt_lock');
+  Line('  movq rt_timer0(%rip), %rax');
+  Line('  cmpq $0, rt_sleeph(%rip)');
+  Line('  jne .wi_t0');
+  Line('  movq $-1, %rax');
+  Line('.wi_t0:');
+  Line('  pushq %rax');
   Line('  movq %r14, %rdi');
   Line('  call rt_tins');
   Line('  leaq rt_glock(%rip), %rdi');
   Line('  call rt_unlock');
+  { as in rt_sleep (P350) }
+  Line('  popq %rax');
+  Line('  popq %rcx');
+  Line('  cmpq %rax, %rcx');
+  Line('  jae .wi_np');
   Line('  call rt_poke');
+  Line('.wi_np:');
   Line('.wi_one:');
   { MOD first (P115, 1.1.1): after its first wait a descriptor stays
     in the set, one-shot and disarmed, so ADD failed with EEXIST on
@@ -45155,6 +45196,11 @@ begin
     Line('  .quad 0');
     Line('rt_evfd:');
     Line('  .quad 0');
+    { 1 while a wake written to rt_evfd waits to be read, as Go's
+      netpollWakeSig (runtime/netpoll_epoll.go): rt_poke writes once
+      until an M drains it (P350) }
+    Line('rt_wakesig:');
+    Line('  .quad 0');
     { The number of timers in the heap at rt_theap (P115: a count now,
       the head of a list before; every test of it for 0 still holds). }
     Line('rt_sleeph:');
@@ -52136,6 +52182,23 @@ begin
   Line('rt_poke:');
   LdS('rt_evfd', 'x0');
   Line('  cbz x0, .pk2_done');
+  { one write while a wake is pending, as on amd64 (P350): an exchange,
+    SWPAL with the atomics (ARM DDI 0487 M.c C6.2.467, FEAT_LSE: the old
+    word loaded with acquire, the new stored with release), else an
+    LDAXR and STLXR loop, as Go's Xchg (internal/runtime/atomic/
+    atomic_arm64.s) }
+  LeaS('rt_wakesig', 'x16');
+  Line('  mov w9, #1');
+  if HasFeat(CpuFeatBit('atomics', True)) then
+    Line('  swpal w9, w10, [x16]')
+  else
+  begin
+    Line('.pk2_x:');
+    Line('  ldaxr w10, [x16]');
+    Line('  stlxr w11, w9, [x16]');
+    Line('  cbnz w11, .pk2_x');
+  end;
+  Line('  cbnz w10, .pk2_done');
   Line('  sub sp, sp, #16');
   Line('  mov x9, #1');
   Line('  str x9, [sp]');
@@ -52257,11 +52320,23 @@ begin
   Line('  str w9, [x28, #152]');
   LeaS('rt_glock', 'x0');
   Line('  bl rt_lock');
+  { the earliest wake time before this one, all ones with no timer (as
+    on amd64), and this one (P350) }
+  LdS('rt_timer0', 'x9');
+  LdS('rt_sleeph', 'x10');
+  Line('  cmp x10, #0');
+  Line('  csinv x9, x9, xzr, ne');
+  Line('  stp x9, x19, [sp, #-16]!');
   Line('  mov x0, x28');
   Line('  bl rt_tins');
   LeaS('rt_glock', 'x0');
   Line('  bl rt_unlock');
+  { as on amd64: a poke only for a timer before the earliest one }
+  Line('  ldp x9, x10, [sp], #16');
+  Line('  cmp x10, x9');
+  Line('  b.hs .asl_np');
   Line('  bl rt_poke');
+  Line('.asl_np:');
   Line('  ldp x19, x20, [sp], #16');
   Line('  ldr x30, [sp], #16');
   Line('  b rt_parkmarked');
@@ -52520,6 +52595,10 @@ begin
   Line('  mov x8, #63');
   Line('  svc #0');
   Line('  add sp, sp, #16');
+  { read: the next wake may be written (P350); a store-release, as Go's
+    netpollWakeSig.Store }
+  LeaS('rt_wakesig', 'x16');
+  Line('  stlr wzr, [x16]');
   Line('.aip_nx:');
   Line('  add x20, x20, #1');
   Line('  b .aip_ev');
@@ -57018,11 +57097,21 @@ begin
   Line('  str x24, [x28, #264]');
   LeaS('rt_glock', 'x0');
   Line('  bl rt_lock');
+  LdS('rt_timer0', 'x9');
+  LdS('rt_sleeph', 'x10');
+  Line('  cmp x10, #0');
+  Line('  csinv x9, x9, xzr, ne');
+  Line('  stp x9, x23, [sp, #-16]!');
   Line('  mov x0, x28');
   Line('  bl rt_tins');
   LeaS('rt_glock', 'x0');
   Line('  bl rt_unlock');
+  { as in rt_sleep (P350) }
+  Line('  ldp x9, x10, [sp], #16');
+  Line('  cmp x10, x9');
+  Line('  b.hs .awi_np');
   Line('  bl rt_poke');
+  Line('.awi_np:');
   Line('.awi_one:');
   { MOD first (P115, 1.1.1): after its first wait a descriptor stays
     in the set, one-shot and disarmed, so ADD failed with EEXIST on
