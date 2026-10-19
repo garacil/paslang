@@ -334,6 +334,9 @@ GOLDEN_A64 += divwrap
 # P356: a division's value lands in the register that reads it.
 GOLDEN += divreg
 GOLDEN_A64 += divreg
+# P357: a nested routine reads its outer routine's variables in the pool.
+GOLDEN += uplevel
+GOLDEN_A64 += uplevel
 # P354: a routine's record keeps no saved register once it is loaded back.
 GOLDEN += gstale
 GOLDEN_A64 += gstale
@@ -2507,6 +2510,12 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/divreg.out $(BUILDDIR)/divreg0.got; \
 	python3 -I scripts/check_divmove.py $(BUILDDIR)/divreg0.s --min=10; \
 	echo ok divreg-asm; \
+	: a nested routine reads and writes the variables of its outer routines in the pool, P357; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/uplevel0 testdata/uplevel.paslang; \
+	$(BUILDDIR)/uplevel0 > $(BUILDDIR)/uplevel0.got; \
+	diff -u testdata/uplevel.out $(BUILDDIR)/uplevel0.got; \
+	python3 -I scripts/check_argpush.py $(BUILDDIR)/uplevel0.s --routines=p_outer_mid_deep; \
+	echo ok uplevel-asm; \
 	: c + k * x and y + k * x are one lea, x := x + k * y one lea on the register of x, r13 and rbp are never the base of a lea with an index, and a load at p - k takes the offset, P294; \
 	awk '/^p_off8:/,/cfi_endproc/' $(BUILDDIR)/leaform.s > $(BUILDDIR)/leaform-off8.s; \
 	grep -q 'leaq 8(,%r[a-z0-9]*,8), ' $(BUILDDIR)/leaform-off8.s || { echo "leaform.s: Off8 is not one lea"; exit 1; }; \
@@ -3839,6 +3848,12 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	diff -u testdata/divreg.out $(BUILDDIR)/divreg0-arm.got; \
 	python3 -I scripts/check_divmove.py $(BUILDDIR)/divreg0-arm.s --arm --min=10; \
 	echo ok divreg-arm-asm; \
+	: P357 on arm64: the variables of outer routines in the pool; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/uplevel0-arm testdata/uplevel.paslang; \
+	timeout 300 $(QEMU_A64) $(BUILDDIR)/uplevel0-arm > $(BUILDDIR)/uplevel0-arm.got; \
+	diff -u testdata/uplevel.out $(BUILDDIR)/uplevel0-arm.got; \
+	python3 -I scripts/check_argpush.py $(BUILDDIR)/uplevel0-arm.s --arm --routines=p_outer_mid_deep; \
+	echo ok uplevel-arm-asm; \
 	: P294 on arm64: c + k * x a move and one add with the shift, y + k * x and x := x + k * y one add, and loads at p - k, p + k and p + i shl s in the load, within the offsets of LDUR and LDR; \
 	awk '/^p_off8:/,/cfi_endproc/' $(BUILDDIR)/leaform-arm.s > $(BUILDDIR)/leaform-off8-arm.s; \
 	grep -qE 'add x[0-9]+, x17, x[0-9]+, lsl #3' $(BUILDDIR)/leaform-off8-arm.s || { echo "leaform-arm.s: Off8 is not a move and one add"; exit 1; }; \

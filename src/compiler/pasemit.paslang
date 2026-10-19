@@ -882,6 +882,9 @@ type
     function OrdAssign(S: PStmt): Boolean;
     function WordAssign(Dest, E: PExpr): Boolean;
     function WordVar(E: PExpr; out S: TSym): Boolean;
+    function UpWordVar(E: PExpr; out S: TSym): Boolean;
+    procedure UpChain(const S: TSym; const R: string);
+    procedure LoadUpWord(const S: TSym; const R: string);
     function WordScalar(E: PExpr): Boolean;
     function PoolSize: LongInt;
     procedure MulImm(const Op, R: string);
@@ -28224,7 +28227,7 @@ begin
     ekStr:
       Result := Length(E^.Txt) = 1;
     ekVar:
-      Result := WordVar(E, s);
+      Result := WordVar(E, s) or UpWordVar(E, s);
     ekDeref, ekField, ekIndex:
       Result := WordScalar(E) and WordMemOK(E, D);
     ekCall:
@@ -28303,7 +28306,7 @@ begin
       Result := '%rax';
     end;
   end
-  else if E^.Kind = ekVar then
+  else if (E^.Kind = ekVar) and not UpWordVar(E, s) then
   begin
     ok := WordVar(E, s);
     if not ok then
@@ -28366,9 +28369,12 @@ begin
     ekVar:
       begin
         ok := WordVar(E, s);
-        if not ok then
+        if ok then
+          LoadWordVar(s, r)
+        else if UpWordVar(E, s) then
+          LoadUpWord(s, r)
+        else
           Die('internal error: operand ' + E^.Name);
-        LoadWordVar(s, r);
       end;
     ekDeref, ekField, ekIndex:
       begin
@@ -29151,6 +29157,78 @@ begin
     (k = tykArray) or (k = tykRecord) then
     Exit;
   Result := True;
+end;
+
+{ E is a word variable of a routine around this one, reached through
+  the static link (P357): what WordVar takes but for S.Up, and not a var
+  parameter, whose slot holds an address. The pool loads it with
+  LoadUpWord and WordAssign stores it; MemA and every other reader of
+  WordVar's variables name the frame's own slots, so WordVar stays as it
+  is. }
+function TEmitter.UpWordVar(E: PExpr; out S: TSym): Boolean;
+var
+  k: TTypeKind;
+  sz: LongInt;
+begin
+  Result := False;
+  if (E = nil) or (E^.Kind <> ekVar) then
+    Exit;
+  if not TryFindSym(E^.Name, S) then
+    Exit;
+  if S.ByRef or (S.Up <= 0) or S.Global or (S.Reg <> '') then
+    Exit;
+  if IsFat(S.Typ) or IsBlob(S.Typ) then
+    Exit;
+  sz := TSize(S.Typ);
+  if (sz <> 8) and (sz <> 1) and (sz <> 2) and (sz <> 4) then
+    Exit;
+  k := TKind(S.Typ);
+  if (k = tykReal) or (k = tykSet) or (k = tykInterface) or (k = tykMethod) or
+    (k = tykArray) or (k = tykRecord) then
+    Exit;
+  Result := True;
+end;
+
+{ R := the frame of the routine S.Up levels out, by the static link in
+  this frame's slot at -8 and in each frame's after it, as LoadVar
+  follows it (P357). }
+procedure TEmitter.UpChain(const S: TSym; const R: string);
+var
+  i: LongInt;
+begin
+  if FArm then
+  begin
+    LdFP(R, -8);
+    for i := 2 to S.Up do
+      Line('  ldr ' + R + ', [' + R + ', #-8]');
+  end
+  else
+  begin
+    Line('  movq -8(%rbp), %' + R);
+    for i := 2 to S.Up do
+      Line('  movq -8(%' + R + '), %' + R);
+  end;
+end;
+
+{ The outer routine's word variable S into pool register R, the chain
+  followed in R itself (P357): movq -8(%rbp), %rsi; movq -16(%rsi),
+  %rsi where LoadVar's chain in rcx and the value in rax went on the
+  stack; on arm64 at the offset of the frame's register, which GNU as
+  writes as LDUR, LDURSW or LDURB for a negative one (ARM DDI 0487 M.c
+  C6.2.259-C6.2.264, STUR C6.2.446-C6.2.448: a signed offset of 9 bits),
+  x16 for the address only past them. }
+procedure TEmitter.LoadUpWord(const S: TSym; const R: string);
+begin
+  UpChain(S, R);
+  if not FArm then
+    LoadTo(IntToStr(S.Off) + '(%' + R + ')', S.Typ, R)
+  else if (S.Off >= -256) and (S.Off <= 255) then
+    LoadTo('[' + R + ', #' + IntToStr(S.Off) + ']', S.Typ, R)
+  else
+  begin
+    AddImmArm('x16', R, S.Off);
+    LoadTo('[x16]', S.Typ, R);
+  end;
 end;
 
 { A load of E gives one scalar word or byte. }
@@ -31770,6 +31848,32 @@ begin
   if InPlaceMem(Dest, E) then
   begin
     Result := True;
+    Exit;
+  end;
+  { an outer routine's word variable from the pool, through the chain
+    in rax or x16, where the value went to rax or x0 and StoreVar's
+    chain in rcx or x9 followed (P357) }
+  if (Dest^.Kind = ekVar) and UpWordVar(Dest, s) then
+  begin
+    Result := True;
+    FSkipCanon := TSize(E^.Typ) = TSize(s.Typ);
+    EmitOrdTo(E, 0);
+    if FArm then
+    begin
+      UpChain(s, 'x16');
+      if (s.Off >= -256) and (s.Off <= 255) then
+        StoreFrom('[x16, #' + IntToStr(s.Off) + ']', TSize(s.Typ), OrdPool(0))
+      else
+      begin
+        AddImmArm('x16', 'x16', s.Off);
+        StoreFrom('[x16]', TSize(s.Typ), OrdPool(0));
+      end;
+    end
+    else
+    begin
+      UpChain(s, 'rax');
+      StoreFrom(IntToStr(s.Off) + '(%rax)', TSize(s.Typ), OrdPool(0));
+    end;
     Exit;
   end;
   if Dest^.Kind = ekVar then
