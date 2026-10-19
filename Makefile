@@ -367,6 +367,9 @@ GOLDEN_A64 += propblob
 # P366: a record of up to three words comes back in registers.
 GOLDEN += regres
 GOLDEN_A64 += regres
+# P367: a record Result written field by field before it is read starts as it is.
+GOLDEN += fieldfirst
+GOLDEN_A64 += fieldfirst
 # P354: a routine's record keeps no saved register once it is loaded back.
 GOLDEN += gstale
 GOLDEN_A64 += gstale
@@ -2607,6 +2610,12 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/regres.out $(BUILDDIR)/regres0.got; \
 	python3 -I scripts/check_resbuf.py $(BUILDDIR)/regres0.s --regs=p_mkone,p_mkpair,p_rot,p_rot3,p_bump,p_pick,p_sum,p_twice,p_mknamed,p_mkpacked,p_mkreal,p_mkarr3,p_tcounter_pair,p_tcounter_tri --short=p_mkpair:2,p_rot:3,p_mkone:1; \
 	echo ok regres-asm; \
+	: a record written field by field before it is read starts with no zero, P367; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/fieldfirst0 testdata/fieldfirst.paslang; \
+	$(BUILDDIR)/fieldfirst0 > $(BUILDDIR)/fieldfirst0.got; \
+	diff -u testdata/fieldfirst.out $(BUILDDIR)/fieldfirst0.got; \
+	python3 -I scripts/check_fieldfirst.py $(BUILDDIR)/fieldfirst0.s --zeros=p_full:0,p_both:0,p_part:2,p_readfirst:5,p_branch:5,p_early:5,p_gap:2,p_localsum:5; \
+	echo ok fieldfirst-asm; \
 	: c + k * x and y + k * x are one lea, x := x + k * y one lea on the register of x, r13 and rbp are never the base of a lea with an index, and a load at p - k takes the offset, P294; \
 	awk '/^p_off8:/,/cfi_endproc/' $(BUILDDIR)/leaform.s > $(BUILDDIR)/leaform-off8.s; \
 	grep -q 'leaq 8(,%r[a-z0-9]*,8), ' $(BUILDDIR)/leaform-off8.s || { echo "leaform.s: Off8 is not one lea"; exit 1; }; \
@@ -4006,6 +4015,12 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	diff -u testdata/regres.out $(BUILDDIR)/regres0-arm.got; \
 	python3 -I scripts/check_resbuf.py $(BUILDDIR)/regres0-arm.s --arm --regs=p_mkone,p_mkpair,p_rot,p_rot3,p_bump,p_pick,p_sum,p_twice,p_mknamed,p_mkpacked,p_mkreal,p_mkarr3,p_tcounter_pair,p_tcounter_tri --short=p_mkpair:1,p_rot:4; \
 	echo ok regres-arm-asm; \
+	: P367 on arm64; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/fieldfirst0-arm testdata/fieldfirst.paslang; \
+	timeout 300 $(QEMU_A64) $(BUILDDIR)/fieldfirst0-arm > $(BUILDDIR)/fieldfirst0-arm.got; \
+	diff -u testdata/fieldfirst.out $(BUILDDIR)/fieldfirst0-arm.got; \
+	python3 -I scripts/check_fieldfirst.py $(BUILDDIR)/fieldfirst0-arm.s --arm --zeros=p_full:0,p_both:0,p_part:2,p_readfirst:5,p_branch:5,p_early:5,p_gap:2,p_localsum:5; \
+	echo ok fieldfirst-arm-asm; \
 	: every call of a routine that takes a buffer gives one, in every program and unit of both machines, P153; \
 	python3 -I scripts/check_resbuf.py --all $(BUILDDIR) $(BUILDDIR)/$(LVL_X64) $(A64DIR) '$(A64DIR)/$(LVL_A64)'; \
 	echo ok resbuf-all; \
