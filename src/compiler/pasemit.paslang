@@ -329,6 +329,7 @@ type
     FFrameMarked: Boolean;  { arm64: the prologue wrote the mark SetFrame fills (P308) }
     FSkipCanon: Boolean;    { EmitOrdTo's top node feeds a store of its own width: no cleanup (P100) }
     FLeftIn: Boolean;       { a binary operation's left side is in rcx or x1, not pushed (P297) }
+    FLeftReg: string;       { a division's left side waits in this register, not pushed (P360) }
     FLeftOp: string;        { with FLeftIn on amd64: the left side as an operand, its home or a constant, '' for rcx (P297) }
     FRightK: Int64;         { with FRightOn: the left side in rax or x0 and the right this constant (P297) }
     FRightOn: Boolean;
@@ -715,6 +716,7 @@ type
     procedure PopLeft;
     function CallProof(E: PExpr): Boolean;
     function LeftFirst(E: PExpr): Boolean;
+    function KeepLeft(E: PExpr): Boolean;
     function LeftSrc: string;
     procedure ValPair(E: PExpr; const R0, R1: string);
     function LastLeaRax(out B: SizeInt; out Op: string): Boolean;
@@ -13368,6 +13370,11 @@ var
   comm: Boolean;
 begin
   Result := False;
+  if (E^.Bin = boDiv) or (E^.Bin = boMod) then
+  begin
+    Result := KeepLeft(E);
+    Exit;
+  end;
   if not ((E^.Bin = boAdd) or (E^.Bin = boSub) or (E^.Bin = boMul) or (E^.Bin = boAnd) or
     (E^.Bin = boOr) or (E^.Bin = boXor) or (E^.Bin = boEq) or (E^.Bin = boNe) or
     (E^.Bin = boLt) or (E^.Bin = boLe) or (E^.Bin = boGt) or (E^.Bin = boGe)) then
@@ -13471,7 +13478,79 @@ begin
     end;
     FLeftIn := True;
     Result := True;
+    Exit;
   end;
+  Result := KeepLeft(E);
+end;
+
+{ P360: L op R with L a word that calls and R one the pool works out
+  alone: L into rax or x0, from there into r11 (amd64, outside a region
+  and a routine with no frame, whose r9 to r11 hold variables, the pool
+  within its first three registers, rsi, rdi and r8) or x8 (arm64, no
+  pool's), R worked out, and L into rcx or x1 for the operation, an
+  operand of + * and or xor as it is, or kept for a division
+  (FLeftReg): where L was pushed and popped. Nothing else holds r11 or
+  x8 there, as L's call leaves neither: what keeps a value in r10, r11,
+  x8 or x27 while another is worked out (P297, P330, P355) has only work
+  that calls nothing between. While R is worked out no line names the
+  register (FArgGuard, P355). False with nothing written when E is not
+  such. }
+function TEmitter.KeepLeft(E: PExpr): Boolean;
+var
+  was: LongInt;
+  park: string;
+  ok, comm: Boolean;
+begin
+  Result := False;
+  if (E^.L = nil) or (E^.R = nil) or (Length(FArgGuard) > 0) or (FLeftReg <> '') or
+    ((not FArm) and (FPromoOn or FFlat)) then
+    Exit;
+  if (not WordInt(E^.Typ)) or (not WordInt(E^.L^.Typ)) or (not WordInt(E^.R^.Typ)) or
+    (TKind(E^.Typ) = tykSet) or (TKind(E^.L^.Typ) = tykSet) or RealBin(E) then
+    Exit;
+  if (not EHasCall(E^.L)) or EHasCall(E^.R) or not ((E^.R^.Kind = ekBin) or
+    (E^.R^.Kind = ekUn) or (E^.R^.Kind = ekIndex) or (E^.R^.Kind = ekField) or
+    (E^.R^.Kind = ekDeref) or (E^.R^.Kind = ekVar)) then
+    Exit;
+  was := FPoolCap;
+  if not FArm then
+    FPoolCap := 3;
+  ok := OrdSimple(E^.R, 0);
+  FPoolCap := was;
+  if not ok then
+    Exit;
+  EmitExpr(E^.L);
+  if FArm then
+  begin
+    park := 'x8';
+    Line('  mov x8, x0');
+  end
+  else
+  begin
+    park := 'r11';
+    Line('  movq %rax, %r11');
+    FPoolCap := 3;
+  end;
+  SetLength(FArgGuard, 1);
+  FArgGuard[0] := park;
+  EmitExpr(E^.R);
+  FArgGuard := nil;
+  FPoolCap := was;
+  Result := True;
+  if (E^.Bin = boDiv) or (E^.Bin = boMod) then
+  begin
+    FLeftReg := park;
+    Exit;
+  end;
+  comm := (E^.Bin = boAdd) or (E^.Bin = boMul) or (E^.Bin = boAnd) or (E^.Bin = boOr) or
+    (E^.Bin = boXor);
+  if FArm then
+    Line('  mov x1, x8')
+  else if comm then
+    FLeftOp := '%r11'
+  else
+    Line('  movq %r11, %rcx');
+  FLeftIn := True;
 end;
 
 procedure TEmitter.EmitCmp(const Setcc: string);
@@ -22938,7 +23017,7 @@ end;
 procedure TEmitter.EmitExprRaw(E: PExpr);
 var
   i, nreg, nuser, ntot, ns: SizeInt;
-  a, b, op, ab: string;
+  a, b, op, ab, dv: string;
   av: Int64;
   off, soff: LongInt;
   rx: PExpr;
@@ -23824,17 +23903,32 @@ else if E^.Name = 'rt_high' then
               boDiv:
                 begin
                   { the dividend popped into x1, the divisor where it
-                    is, where a move put it in x1 first (P356) }
-                  Ppop('x1');
+                    is, where a move put it in x1 first (P356); in x8
+                    when KeepLeft kept it there (P360) }
+                  dv := 'x1';
+                  if FLeftReg <> '' then
+                  begin
+                    dv := FLeftReg;
+                    FLeftReg := '';
+                  end
+                  else
+                    Ppop('x1');
                   EmitDivCheck('x0');
-                  Line('  sdiv x0, x1, x0');
+                  Line('  sdiv x0, ' + dv + ', x0');
                 end;
               boMod:
                 begin
-                  Ppop('x1');
+                  dv := 'x1';
+                  if FLeftReg <> '' then
+                  begin
+                    dv := FLeftReg;
+                    FLeftReg := '';
+                  end
+                  else
+                    Ppop('x1');
                   EmitDivCheck('x0');
-                  Line('  sdiv x9, x1, x0');
-                  Line('  msub x0, x9, x0, x1');
+                  Line('  sdiv x9, ' + dv + ', x0');
+                  Line('  msub x0, x9, x0, ' + dv);
                 end;
               boEq: EmitCmp('sete');
               boNe: EmitCmp('setne');
@@ -24819,14 +24913,27 @@ else if E^.Name = 'rt_high' then
             boDiv:
               begin
                 Line('  movq %rax, %rcx');
-                Line('  popq %rax');
+                { the dividend from r11 when KeepLeft kept it there (P360) }
+                if FLeftReg <> '' then
+                begin
+                  Line('  movq %' + FLeftReg + ', %rax');
+                  FLeftReg := '';
+                end
+                else
+                  Line('  popq %rax');
                 EmitDivCheck('rcx');
                 SignedDiv(E, False);
               end;
             boMod:
               begin
                 Line('  movq %rax, %rcx');
-                Line('  popq %rax');
+                if FLeftReg <> '' then
+                begin
+                  Line('  movq %' + FLeftReg + ', %rax');
+                  FLeftReg := '';
+                end
+                else
+                  Line('  popq %rax');
                 EmitDivCheck('rcx');
                 SignedDiv(E, True);
                 Line('  movq %rdx, %rax');
