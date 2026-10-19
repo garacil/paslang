@@ -634,7 +634,10 @@ and `F(1) + G(2) * H(3)` calls `F`, `G` and `H` in that order. An operand
 no call can change, a constant or a variable of the routine whose
 address nobody takes, that no nested routine or closure names and that
 is no `var` parameter, may be read after a call to its right, which
-gives the same value (P326); every `-inline` gives
+gives the same value (P326); so may `Result`, when no nested routine
+names it and its address is not taken, and a global of the program
+that no routine names and whose address nobody takes, read in the main
+block (1.1.223); every `-inline` gives
 the same answer.
 
 `and`, `or`, `xor` and `not` work on two Booleans (a Boolean `and` and

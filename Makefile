@@ -379,6 +379,9 @@ GOLDEN_A64 += blockinl
 # P369: a method no override can change is put in place.
 GOLDEN += methinl
 GOLDEN_A64 += methinl
+# P371: Result and the main block's own globals are operands no call put in place changes.
+GOLDEN += aheadres
+GOLDEN_A64 += aheadres
 # P354: a routine's record keeps no saved register once it is loaded back.
 GOLDEN += gstale
 GOLDEN_A64 += gstale
@@ -2636,8 +2639,8 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/blockinl1 testdata/blockinl.paslang; \
 	grep -q 'movq v_g+120+16(%rip), %r' $(BUILDDIR)/blockinl1.s || { echo "blockinl.s: Get(4).C is not one load of G[4].C"; exit 1; }; \
 	if awk '/^p_fresh:/,/cfi_endproc/' $(BUILDDIR)/blockinl1.s | grep -q 'call'; then echo "blockinl.s: Fresh calls"; exit 1; fi; \
-	test $$(awk '/^pas_main:/,/cfi_endproc/' $(BUILDDIR)/blockinl1.s | grep -c 'call p_get$$') -eq 5 || { echo "blockinl.s: the main block does not call Get five times"; exit 1; }; \
-	test $$(awk '/^pas_main:/,/cfi_endproc/' $(BUILDDIR)/blockinl1.s | grep -c 'call p_mkpair$$') -eq 2 || { echo "blockinl.s: the main block does not call MkPair twice"; exit 1; }; \
+	test $$(awk '/^pas_main:/,/cfi_endproc/' $(BUILDDIR)/blockinl1.s | grep -c 'call p_get$$') -eq 1 || { echo "blockinl.s: the main block does not call Get once"; exit 1; }; \
+	if awk '/^pas_main:/,/cfi_endproc/' $(BUILDDIR)/blockinl1.s | grep -q 'call p_mkpair$$'; then echo "blockinl.s: the main block calls MkPair"; exit 1; fi; \
 	echo ok blockinl-asm; \
 	: a method called with the dispatch the compiler fixes goes in where it is called, its Self the object, a virtual one keeping its dispatch, P369; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/methinl1 testdata/methinl.paslang; \
@@ -2646,6 +2649,15 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	: the compiler, TypeOf put in place: IsStrTyp reads the Kind of the element of FTypes with no call; \
 	if awk '/^p_pasparse_tparser_isstrtyp:/,/cfi_endproc/' $(BUILDDIR)/stage/pasparse.s | grep -q 'call p_pasparse_tparser_typeof'; then echo "pasparse.s: IsStrTyp calls TypeOf"; exit 1; fi; \
 	echo ok methinl-asm; \
+	: Result and the main block globals no routine names are operands a call put in place cannot change, so the call to their right goes in, and a global a routine writes or whose address is taken keeps its place, P371; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/aheadres1 testdata/aheadres.paslang; \
+	if awk '/^pas_main:/,/cfi_endproc/' $(BUILDDIR)/aheadres1.s | grep -q 'call p_tri$$'; then echo "aheadres.s: the main block calls Tri"; exit 1; fi; \
+	if awk '/^p_sumtri:/,/cfi_endproc/' $(BUILDDIR)/aheadres1.s | grep -q 'call p_'; then echo "aheadres.s: SumTri calls"; exit 1; fi; \
+	if awk '/^p_acc:/,/cfi_endproc/' $(BUILDDIR)/aheadres1.s | grep -q 'call p_'; then echo "aheadres.s: Acc calls"; exit 1; fi; \
+	awk '/^p_nested:/,/cfi_endproc/' $(BUILDDIR)/aheadres1.s | grep -q 'call p_tri$$' || { echo "aheadres.s: Nested, whose Result a nested routine names, put Tri ahead"; exit 1; }; \
+	awk '/^pas_main:/,/cfi_endproc/' $(BUILDDIR)/aheadres1.s | grep -q 'call p_bump$$' || { echo "aheadres.s: g + Bump put Bump ahead"; exit 1; }; \
+	awk '/^pas_main:/,/cfi_endproc/' $(BUILDDIR)/aheadres1.s | grep -q 'call p_incvia$$' || { echo "aheadres.s: w + IncVia put IncVia ahead"; exit 1; }; \
+	echo ok aheadres-asm; \
 	: c + k * x and y + k * x are one lea, x := x + k * y one lea on the register of x, r13 and rbp are never the base of a lea with an index, and a load at p - k takes the offset, P294; \
 	awk '/^p_off8:/,/cfi_endproc/' $(BUILDDIR)/leaform.s > $(BUILDDIR)/leaform-off8.s; \
 	grep -q 'leaq 8(,%r[a-z0-9]*,8), ' $(BUILDDIR)/leaform-off8.s || { echo "leaform.s: Off8 is not one lea"; exit 1; }; \
@@ -4068,14 +4080,21 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	: P368 on arm64; \
 	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/blockinl1-arm testdata/blockinl.paslang; \
 	if awk '/^p_fresh:/,/cfi_endproc/' $(BUILDDIR)/blockinl1-arm.s | grep -q 'bl '; then echo "blockinl-arm.s: Fresh calls"; exit 1; fi; \
-	test $$(awk '/^pas_main:/,/cfi_endproc/' $(BUILDDIR)/blockinl1-arm.s | grep -c 'bl p_get$$') -eq 5 || { echo "blockinl-arm.s: the main block does not call Get five times"; exit 1; }; \
-	test $$(awk '/^pas_main:/,/cfi_endproc/' $(BUILDDIR)/blockinl1-arm.s | grep -c 'bl p_mkpair$$') -eq 2 || { echo "blockinl-arm.s: the main block does not call MkPair twice"; exit 1; }; \
+	test $$(awk '/^pas_main:/,/cfi_endproc/' $(BUILDDIR)/blockinl1-arm.s | grep -c 'bl p_get$$') -eq 1 || { echo "blockinl-arm.s: the main block does not call Get once"; exit 1; }; \
+	if awk '/^pas_main:/,/cfi_endproc/' $(BUILDDIR)/blockinl1-arm.s | grep -q 'bl p_mkpair$$'; then echo "blockinl-arm.s: the main block calls MkPair"; exit 1; fi; \
 	echo ok blockinl-arm-asm; \
 	: P369 on arm64; \
 	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/methinl1-arm testdata/methinl.paslang; \
 	if awk '/^pas_main:/,/cfi_endproc/' $(BUILDDIR)/methinl1-arm.s | grep -qE 'bl p_tbox_(bump|add|twice)$$'; then echo "methinl-arm.s: the main block calls Bump, Add or Twice"; exit 1; fi; \
 	test $$(awk '/^pas_main:/,/cfi_endproc/' $(BUILDDIR)/methinl1-arm.s | grep -c 'blr ') -eq 4 || { echo "methinl-arm.s: the main block does not make its four virtual calls"; exit 1; }; \
 	echo ok methinl-arm-asm; \
+	: P371 on arm64; \
+	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/aheadres1-arm testdata/aheadres.paslang; \
+	if awk '/^pas_main:/,/cfi_endproc/' $(BUILDDIR)/aheadres1-arm.s | grep -q 'bl p_tri$$'; then echo "aheadres-arm.s: the main block calls Tri"; exit 1; fi; \
+	if awk '/^p_sumtri:/,/cfi_endproc/' $(BUILDDIR)/aheadres1-arm.s | grep -q 'bl p_'; then echo "aheadres-arm.s: SumTri calls"; exit 1; fi; \
+	awk '/^p_nested:/,/cfi_endproc/' $(BUILDDIR)/aheadres1-arm.s | grep -q 'bl p_tri$$' || { echo "aheadres-arm.s: Nested put Tri ahead"; exit 1; }; \
+	awk '/^pas_main:/,/cfi_endproc/' $(BUILDDIR)/aheadres1-arm.s | grep -q 'bl p_bump$$' || { echo "aheadres-arm.s: g + Bump put Bump ahead"; exit 1; }; \
+	echo ok aheadres-arm-asm; \
 	: every call of a routine that takes a buffer gives one, in every program and unit of both machines, P153; \
 	python3 -I scripts/check_resbuf.py --all $(BUILDDIR) $(BUILDDIR)/$(LVL_X64) $(A64DIR) '$(A64DIR)/$(LVL_A64)'; \
 	echo ok resbuf-all; \
