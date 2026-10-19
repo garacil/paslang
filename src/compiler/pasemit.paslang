@@ -1001,6 +1001,12 @@ type
     function LeafProc(const Pr: TProc; out St: PStmt): Boolean;
     procedure LeafReg(const N, R: string; Dw: LongInt; const Proc, EndLab: string);
     procedure EmitLeaf(const Pr: TProc; St: PStmt);
+    function ChainQuiet(E: PExpr): Boolean;
+    function RightReads(E: PExpr; const R: string): Boolean;
+    function PureWrite(const L, R: string): Boolean;
+    function UpOperand(E: PExpr): Boolean;
+    function PureWriteAny(const L, R: string): Boolean;
+    function TailToRet(B0: SizeInt; const Res, Tgt: string; out Cut: string): Boolean;
     function FlatProc(const Pr: TProc): Boolean;
     function NamesReg(const T, R: string): Boolean;
     function RegNamed(const T, R: string): Boolean;
@@ -13955,7 +13961,7 @@ begin
     Exit;
   case E^.Kind of
     ekInt: Result := True;
-    ekVar: Result := WordVar(E, s);
+    ekVar: Result := WordVar(E, s) or UpOperand(E);
     ekUn:
       Result := ((E^.Un = uoNeg) or (E^.Un = uoNot) or (E^.Un = uoConv)) and ChainPlain(E^.L);
     ekBin:
@@ -13964,7 +13970,7 @@ begin
       else
         Result := ((E^.Bin = boAdd) or (E^.Bin = boSub) or (E^.Bin = boMul) or
           (E^.Bin = boAnd) or (E^.Bin = boOr) or (E^.Bin = boXor)) and
-          ((E^.R^.Kind = ekInt) or ((E^.R^.Kind = ekVar) and WordVar(E^.R, s))) and
+          ((E^.R^.Kind = ekInt) or ((E^.R^.Kind = ekVar) and (WordVar(E^.R, s) or UpOperand(E^.R)))) and
           ChainPlain(E^.L);
   end;
 end;
@@ -28326,7 +28332,7 @@ begin
     Exit;
   case E^.Kind of
     ekInt: Result := True;
-    ekVar: Result := WordVar(E, s);
+    ekVar: Result := WordVar(E, s) or UpOperand(E);
     ekUn:
       Result := ((E^.Un = uoNeg) or (E^.Un = uoNot) or (E^.Un = uoConv)) and PoolPlain(E^.L);
     ekBin:
@@ -30398,6 +30404,9 @@ procedure TEmitter.LoadWordVar(const S: TSym; const R: string);
 begin
   if S.Reg <> '' then
   begin
+    { already there: no move of a register to itself (P361) }
+    if S.Reg = R then
+      Exit;
     if FArm then
       Line('  mov ' + R + ', ' + S.Reg)
     else
@@ -32765,7 +32774,8 @@ end;
 function TEmitter.DivOut(E: PExpr; D: LongInt): string;
 begin
   Result := OrdPool(D);
-  if (E = FDivTop) and (D = 0) and (FDivDest <> '') then
+  { a leaf works its expression out from pool register 2 on amd64 (P361) }
+  if (E = FDivTop) and (FDivDest <> '') then
   begin
     Result := FDivDest;
     FDivLanded := True;
@@ -32785,7 +32795,18 @@ begin
   if E^.Kind = ekInt then
     Result := Fits32(E^.Num)
   else if E^.Kind = ekVar then
-    Result := WordVar(E, s) and ((TSize(s.Typ) = 8) or (s.Reg <> ''));
+    Result := (WordVar(E, s) and ((TSize(s.Typ) = 8) or (s.Reg <> ''))) or UpOperand(E);
+end;
+
+{ amd64, a routine with no frame (P334): E is a word of 8 bytes one level
+  out, which OrdOperand gives as its offset from the link's register with
+  no code, a plain step's operand as a variable at its home is (P361). }
+function TEmitter.UpOperand(E: PExpr): Boolean;
+var
+  s: TSym;
+begin
+  Result := (not FArm) and (FLinkReg <> '') and UpWordVar(E, s) and (s.Up = 1) and
+    (TSize(s.Typ) = 8);
 end;
 
 { amd64: the division or remainder E by no constant, worked out in the
@@ -33117,19 +33138,272 @@ begin
       WordLoad(m, LoadTyp(E), 'rax');
     end;
   end
-  else if FArm then
+  else if PoolPlain(E) and ChainPlain(E) and
+    ((FArm and not RightReads(E, 'x0')) or ((not FArm) and ChainQuiet(E))) then
   begin
+    { a chain of plain steps in rax or x0 itself, where it was worked out
+      in the pool and moved: go1.27.2 writes LEAQ (AX)(BX*1), AX (P361);
+      the parameters are no pool's, rcx no leaf's (three at most) }
+    m := FPool0;
+    if FArm then
+      FPool0 := 'x0'
+    else
+      FPool0 := 'rax';
     EmitOrdTo(E, 0);
-    Line('  mov x0, ' + OrdPool(0));
+    FPool0 := m;
   end
   else
   begin
-    EmitOrdTo(E, 2);
-    Line('  movq %' + OrdPool(2) + ', %rax');
+    { a division at the top leaves its value in rax or x0 (P356, P361) }
+    FDivTop := E;
+    if FArm then
+      FDivDest := 'x0'
+    else
+      FDivDest := 'rax';
+    FDivLanded := False;
+    if FArm then
+      EmitOrdTo(E, 0)
+    else
+      EmitOrdTo(E, 2);
+    FDivTop := nil;
+    if FDivLanded then
+    else if FArm then
+      Line('  mov x0, ' + OrdPool(0))
+    else
+      Line('  movq %' + OrdPool(2) + ', %rax');
   end;
   Line('  ret');
   Line(e1 + ':');
   Line('  .cfi_endproc');
+end;
+
+{ amd64: every right operand of the chain E is one OrdOperand gives with
+  no code and no rax (QuietOp, P356), so the chain can be worked out in
+  rax (P361). }
+function TEmitter.ChainQuiet(E: PExpr): Boolean;
+begin
+  Result := True;
+  if E = nil then
+    Exit;
+  case E^.Kind of
+    ekUn:
+      Result := ChainQuiet(E^.L);
+    ekBin:
+      Result := ChainQuiet(E^.L) and QuietOp(E^.R);
+  end;
+end;
+
+{ A right operand of the chain E reads register R: R may be the chain's
+  first value, read before the first step writes it, and no other
+  (P361). }
+function TEmitter.RightReads(E: PExpr; const R: string): Boolean;
+begin
+  Result := False;
+  if E = nil then
+    Exit;
+  case E^.Kind of
+    ekUn:
+      Result := RightReads(E^.L, R);
+    ekBin:
+      Result := RightReads(E^.L, R) or ReadsReg(E^.R, R);
+  end;
+end;
+
+{ The line L writes register R whole and reads nothing of it (P361):
+  amd64 a move, a lea or a load of R or its 32-bit half, which clears the
+  upper one (SDM vol. 1 3.4.1.1); arm64 an operation whose destination
+  is R or its 32-bit half, which clears the rest (ARM DDI 0487 M.c
+  C1.2.5). }
+function TEmitter.PureWrite(const L, R: string): Boolean;
+var
+  p, q: SizeInt;
+  m, dst, src: string;
+begin
+  Result := False;
+  if (Length(L) < 4) or (L[1] <> ' ') or (L[2] <> ' ') then
+    Exit;
+  p := 3;
+  while (p <= Length(L)) and (L[p] <> ' ') do
+    Inc(p);
+  m := Copy(L, 3, p - 3);
+  if FArm then
+  begin
+    if not ((m = 'mov') or (m = 'movz') or (m = 'mvn') or (m = 'add') or (m = 'sub') or
+      (m = 'mul') or (m = 'madd') or (m = 'msub') or (m = 'smulh') or (m = 'umulh') or
+      (m = 'sdiv') or (m = 'udiv') or (m = 'and') or (m = 'orr') or (m = 'eor') or
+      (m = 'bic') or (m = 'orn') or (m = 'eon') or (m = 'lsl') or (m = 'lsr') or
+      (m = 'asr') or (m = 'ror') or (m = 'neg') or (m = 'ldr') or (m = 'ldrb') or
+      (m = 'ldrh') or (m = 'ldrsb') or (m = 'ldrsh') or (m = 'ldrsw') or (m = 'cset') or
+      (m = 'csel') or (m = 'csinc') or (m = 'csinv') or (m = 'sxtb') or (m = 'sxth') or
+      (m = 'sxtw') or (m = 'uxtb') or (m = 'uxth') or (m = 'ubfx') or (m = 'sbfx')) then
+      Exit;
+    q := Pos(',', L);
+    if q = 0 then
+      Exit;
+    dst := Copy(L, p + 1, q - p - 1);
+    src := Copy(L, q + 1, Length(L) - q);
+    Result := ((dst = R) or (dst = 'w' + Copy(R, 2, Length(R) - 1))) and not RegNamed(src, R);
+    Exit;
+  end;
+  if not ((m = 'movq') or (m = 'movl') or (m = 'leaq') or (m = 'leal') or (m = 'movabsq') or
+    (m = 'movzbq') or (m = 'movzwq') or (m = 'movsbq') or (m = 'movswq') or (m = 'movslq') or
+    (m = 'movzbl') or (m = 'movzwl') or (m = 'movsbl') or (m = 'movswl')) then
+    Exit;
+  q := 0;
+  for p := Length(L) - 1 downto 1 do
+    if (q = 0) and (L[p] = ',') and (L[p + 1] = ' ') then
+      q := p;
+  if q = 0 then
+    Exit;
+  dst := Copy(L, q + 2, Length(L) - q - 1);
+  src := Copy(L, 1, q - 1);
+  Result := ((dst = '%' + R) or (dst = '%' + X86Sub(R, 4))) and not RegNamed(src, R);
+end;
+
+{ arm64: L is an operation PureWrite takes whose 64-bit destination is
+  R, its sources reading R or not: one instruction reads before it
+  writes (P361). }
+function TEmitter.PureWriteAny(const L, R: string): Boolean;
+var
+  p, q: SizeInt;
+begin
+  Result := False;
+  p := 3;
+  while (p <= Length(L)) and (L[p] <> ' ') do
+    Inc(p);
+  q := Pos(',', L);
+  if (q = 0) or (Copy(L, p + 1, q - p - 1) <> R) then
+    Exit;
+  Result := PureWrite(Copy(L, 1, q) + ' xzr', R);
+end;
+
+{ P361: a frameless routine's body ends with straight steps; from the
+  first of them that names Res, Result's register, the value is worked
+  out in Tgt, rax or x0, where the routine returns it, and the epilogue
+  moves nothing: Add1's movq %rax, %r9 and movq %r9, %rax go, b27call's
+  closure adds in rax (go1.27.2: ADDQ 0x8(DX), AX; RET). Only when no
+  jump reaches the epilogue (the caller checks), that step writes Res
+  whole and reads nothing of it (PureWrite) and no step from it on names
+  Tgt but that write, which reads before it writes, so Res's old value
+  is read nowhere after and Tgt holds nothing they need; a last movq %rax, %Res alone just goes; on arm64 a last mov
+  x0, xP after a step that writes xP, a register of the pool or a
+  scratch the return leaves dead, writes x0 itself. The lines are
+  renamed in FOut, the same instructions, so nothing counted about them
+  changes; the notes on FOut's offsets start again. Cut is a line label
+  put before them, where Result's DWARF range ends: past it the debugger
+  says the value is gone rather than read the register it left. True
+  when done. }
+function TEmitter.TailToRet(B0: SizeInt; const Res, Tgt: string; out Cut: string): Boolean;
+var
+  lines: TStrArray;
+  starts: array of SizeInt;
+  i, t0, i1, n, p, q, k: SizeInt;
+  l, txt, m: string;
+begin
+  Result := False;
+  Cut := '';
+  lines := nil;
+  starts := nil;
+  p := B0 + 1;
+  while p <= FLen do
+  begin
+    q := p;
+    while (q <= FLen) and (FOut[q] <> Char(10)) do
+      Inc(q);
+    SetLength(lines, Length(lines) + 1);
+    SetLength(starts, Length(starts) + 1);
+    lines[High(lines)] := Copy(FOut, p, q - p);
+    starts[High(starts)] := p - 1;
+    p := q + 1;
+  end;
+  n := Length(lines);
+  { the straight steps: after the last label but a line's, the last jump }
+  t0 := 0;
+  for i := 0 to n - 1 do
+  begin
+    l := lines[i];
+    if (Length(l) > 1) and (l[1] <> ' ') and (l[Length(l)] = ':') and (Copy(l, 1, 3) <> '.LL') then
+      t0 := i + 1
+    else if FArm and ((Copy(l, 1, 4) = '  b ') or (Copy(l, 1, 4) = '  b.') or
+      (Copy(l, 1, 5) = '  cbz') or (Copy(l, 1, 6) = '  cbnz') or (Copy(l, 1, 5) = '  tbz') or
+      (Copy(l, 1, 6) = '  tbnz') or (Copy(l, 1, 4) = '  bl') or (Copy(l, 1, 4) = '  br') or
+      (Copy(l, 1, 5) = '  ret')) then
+      t0 := i + 1
+    else if (not FArm) and ((Copy(l, 1, 3) = '  j') or (Copy(l, 1, 6) = '  call') or
+      (Copy(l, 1, 5) = '  ret')) then
+      t0 := i + 1;
+  end;
+  i1 := -1;
+  for i := t0 to n - 1 do
+    if (i1 < 0) and (Copy(lines[i], 1, 3) <> '  .') and RegNamed(lines[i], Res) then
+      i1 := i;
+  if i1 < 0 then
+    Exit;
+  k := i1;
+  if (not FArm) and (lines[i1] = '  movq %' + Tgt + ', %' + Res) then
+  begin
+    { the value is in rax already: the move alone goes }
+    for i := i1 + 1 to n - 1 do
+      if (Copy(lines[i], 1, 3) <> '  .') and RegNamed(lines[i], Res) then
+        Exit;
+    lines[i1] := '';
+  end
+  else
+  begin
+    if not PureWrite(lines[i1], Res) then
+      Exit;
+    { the write may read Tgt: one instruction reads before it writes }
+    for i := i1 + 1 to n - 1 do
+      if RegNamed(lines[i], Tgt) then
+        Exit;
+    for i := i1 to n - 1 do
+    begin
+      lines[i] := RenameRegTo(RenameReg(lines[i], Res, '@p361@'), '@p361@', Tgt);
+      { Result := a parameter that came in Tgt: no move of it to itself }
+      if (lines[i] = '  mov ' + Tgt + ', ' + Tgt) or (lines[i] = '  movq %' + Tgt + ', %' + Tgt) then
+        lines[i] := '';
+    end;
+    { arm64: mov x0, xP after the step that writes xP }
+    if FArm then
+    begin
+      q := n - 1;
+      while (q > i1) and (Copy(lines[q], 1, 3) = '  .') do
+        Dec(q);
+      p := q - 1;
+      while (p >= t0) and ((Copy(lines[p], 1, 3) = '  .') or
+        ((Copy(lines[p], 1, 3) = '.LL') and (lines[p][Length(lines[p])] = ':'))) do
+        Dec(p);
+      if (p >= t0) and (q > p) and (Copy(lines[q], 1, 9) = '  mov x0,') then
+      begin
+        m := Copy(lines[q], 11, Length(lines[q]) - 10);
+        if ((m = 'x9') or (m = 'x10') or (m = 'x11') or (m = 'x12') or (m = 'x13') or
+          (m = 'x14') or (m = 'x15') or (m = 'x16') or (m = 'x17')) and PureWriteAny(lines[p], m) then
+        begin
+          l := lines[p];
+          i := 3;
+          while (i <= Length(l)) and (l[i] <> ' ') do
+            Inc(i);
+          lines[p] := Copy(l, 1, i) + 'x0' + Copy(l, i + 1 + Length(m), Length(l) - i - Length(m));
+          lines[q] := '';
+          if p < k then
+            k := p;
+        end;
+      end;
+    end;
+  end;
+  txt := '';
+  FLen := starts[k];
+  Inc(FLab);
+  Cut := '.LL' + IntToStr(FLab);
+  AppendLine(Cut + ':');
+  for i := k to n - 1 do
+    if lines[i] <> '' then
+      AppendLine(lines[i]);
+  FLastIns := '';
+  FIxOn := False;
+  FChkOn := False;
+  FZeroN := 0;
+  Result := True;
 end;
 
 { P296: Pr calls nothing and every one of its own variables can be kept
@@ -33209,7 +33483,7 @@ var
   cl0, dl0: LongInt;
   wt: array of LongInt;
   parts: array of TPromo;
-  inner, pure, used8, moved, ok, coldback: Boolean;
+  inner, pure, used8, moved, ok, coldback, tailin: Boolean;
   r, nm, e1, txt, body, body1, body2: string;
   arrive0, force, cand, reg1: TStrArray;
   b0: SizeInt;
@@ -33610,8 +33884,21 @@ begin
   EmitStmt(Pr.Body);
   body := Copy(FOut, b0 + 1, FLen - b0) + FCold;
   DropJumpTo(FEpi);
+  { the last straight steps in rax or x0 when nothing else jumps to the
+    epilogue (P361) }
+  if FArm then
+    r := 'x0'
+  else
+    r := 'rax';
+  tailin := Pr.IsFunc and (FResReg <> '') and (FResReg <> r) and
+    (Pos(FEpi, Copy(FOut, b0 + 1, FLen - b0)) = 0) and (Pos(FEpi, FCold) = 0) and
+    TailToRet(b0, FResReg, r, txt);
+  if tailin then
+    for i := nlr to High(FLocRanges) do
+      if (FLocRanges[i].Proc = Pr.Sym) and (FLocRanges[i].Off = FResOff) then
+        FLocRanges[i].E := txt;
   Line(FEpi + ':');
-  if Pr.IsFunc then
+  if Pr.IsFunc and not tailin then
   begin
     r := FResReg;
     if FArm then
