@@ -349,6 +349,9 @@ GOLDEN_A64 += nestflat
 # P361: a routine with no frame works its value out in the register it returns it in.
 GOLDEN += retreg
 GOLDEN_A64 += retreg
+# P362: a label no jump reaches stands in no fold's way.
+GOLDEN += adrplast
+GOLDEN_A64 += adrplast
 # P354: a routine's record keeps no saved register once it is loaded back.
 GOLDEN += gstale
 GOLDEN_A64 += gstale
@@ -3922,6 +3925,12 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	diff -u testdata/retreg.out $(BUILDDIR)/retreg0-arm.got; \
 	python3 -I scripts/check_retreg.py $(BUILDDIR)/retreg0-arm.s --arm --routines=p_sum2,p_scale,p_half,p_addg,p_early,p_makeadd_anon.1 --short=p_makeadd_anon.1:2,p_sum2:1,p_addg:4; \
 	echo ok retreg-arm-asm; \
+	: P362 on arm64: the add of a global read last before a return goes into the load, past a label no jump reaches; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/adrplast0-arm testdata/adrplast.paslang; \
+	timeout 300 $(QEMU_A64) $(BUILDDIR)/adrplast0-arm > $(BUILDDIR)/adrplast0-arm.got; \
+	diff -u testdata/adrplast.out $(BUILDDIR)/adrplast0-arm.got; \
+	python3 -I scripts/check_adrpfold.py $(BUILDDIR)/adrplast0-arm.s --folds=6; \
+	echo ok adrplast-arm-asm; \
 	: P294 on arm64: c + k * x a move and one add with the shift, y + k * x and x := x + k * y one add, and loads at p - k, p + k and p + i shl s in the load, within the offsets of LDUR and LDR; \
 	awk '/^p_off8:/,/cfi_endproc/' $(BUILDDIR)/leaform-arm.s > $(BUILDDIR)/leaform-off8-arm.s; \
 	grep -qE 'add x[0-9]+, x17, x[0-9]+, lsl #3' $(BUILDDIR)/leaform-off8-arm.s || { echo "leaform-arm.s: Off8 is not a move and one add"; exit 1; }; \

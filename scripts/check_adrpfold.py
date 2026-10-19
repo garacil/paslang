@@ -9,7 +9,8 @@ routines and the main block no adrp x16, v_X and add x16, x16,
 :lo12:v_X are followed by a load or a store through [x16] that the next
 write of x16, a call or a return makes the last reader of x16, on a
 path with no branch or label a jump reaches (a line label is none:
-P346); and at least --folds=N accesses take :lo12:v_X themselves, each
+P346; nor is a label no other line names, as a frameless routine's
+epilogue label no Exit reaches: P362); and at least --folds=N accesses take :lo12:v_X themselves, each
 right after the adrp of its own word (v_X+8 may lie on the next page).
 A routine with an asm block keeps its code as written (HasAsm): the
 files read have none.
@@ -19,14 +20,15 @@ import re
 import sys
 
 
-def dead(lines, q):
+def dead(lines, q, named):
     """x16 is not read again on the path from line q: a write of it alone,
     a call or a return before any read, as AdrpPass reads it; a branch or
-    a label a jump reaches ends the path (no answer), a line label and a
-    directive do not (P346)"""
+    a label a jump reaches ends the path (no answer), a line label, a
+    label no other line names and a directive do not (P346, P362)"""
     while q < len(lines):
         t = lines[q]
-        if t == "" or t.startswith("  .") or re.match(r"^\.LL\d+:$", t):
+        if t == "" or t.startswith("  .") or re.match(r"^\.LL\d+:$", t) or \
+                (re.match(r"^\.L[\w.]*:$", t) and t[:-1] not in named):
             q += 1
             continue
         if not t.startswith(" ") or re.match(r"^  (b |b\.|cbz|cbnz|tbz|tbnz|br )", t):
@@ -48,6 +50,10 @@ def main():
     if len(args) != 1:
         raise SystemExit("usage: check_adrpfold.py file.s [--folds=N]")
     lines = [l for l in open(args[0]).read().splitlines() if not re.match(r"^\s*\.(loc|cfi)", l)]
+    named = set()
+    for l in lines:
+        if not l.endswith(":"):
+            named.update(re.findall(r"(?<![\w.])(\.L[\w.]*)", l))
     compiled, bad, folds = False, [], 0
     acc = re.compile(r"^  (ldr|str|ldrb|strb|ldrh|strh|ldrsb|ldrsh|ldrsw) ([xw])(\d+), \[x16(?:, #(\d+))?\]$")
     for i, l in enumerate(lines):
@@ -74,7 +80,7 @@ def main():
                 "ldrsw": 4}.get(op, 8 if w == "x" else 4)
         if off >= 4096 or off % size:
             continue
-        if dead(lines, i + 3):
+        if dead(lines, i + 3, named):
             bad.append(f"{i + 1}: {a.group(1)} {lines[i + 2].strip()} left with its add")
     if bad or folds < want:
         print("\n".join(bad[:10]))
