@@ -388,6 +388,9 @@ GOLDEN_A64 += elemaddr
 # P377: High of a slice reads its length alone, and a test of an index against both its ends is one compare.
 GOLDEN += boundsidiom
 GOLDEN_A64 += boundsidiom
+# P374: on arm64 a global's field or element at a constant offset is one adrp and one access.
+GOLDEN += globoff
+GOLDEN_A64 += globoff
 # P354: a routine's record keeps no saved register once it is loaded back.
 GOLDEN += gstale
 GOLDEN_A64 += gstale
@@ -4141,6 +4144,11 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	  test $$(awk "/^p_$$f:/,/cfi_endproc/" $(BUILDDIR)/boundsidiom1-arm.s | grep -cE '^  b\.(lo|hs) ') -eq 1 || { echo "boundsidiom-arm.s: $$f is not one branch without sign"; exit 1; }; \
 	done; \
 	echo ok boundsidiom-arm-asm; \
+	: a global field or element at a constant offset is one adrp and one access with the offset in its lo12, a field of a record in an element of an array as well, P374; \
+	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/globoff1-arm testdata/globoff.paslang; \
+	grep -qE '^  ldrb w[0-9]+, \[x[0-9]+, :lo12:v_o\+8\]' $(BUILDDIR)/globoff1-arm.s || { echo "globoff-arm.s: o.Inner.B is not one adrp and one ldrb"; exit 1; }; \
+	grep -qE '^  ldr x[0-9]+, \[x[0-9]+, :lo12:v_g\+240\]' $(BUILDDIR)/globoff1-arm.s || { echo "globoff-arm.s: g[3].Arr[2].Q is not one adrp and one ldr"; exit 1; }; \
+	echo ok globoff-arm-asm; \
 	: every call of a routine that takes a buffer gives one, in every program and unit of both machines, P153; \
 	python3 -I scripts/check_resbuf.py --all $(BUILDDIR) $(BUILDDIR)/$(LVL_X64) $(A64DIR) '$(A64DIR)/$(LVL_A64)'; \
 	echo ok resbuf-all; \

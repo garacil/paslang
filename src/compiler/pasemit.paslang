@@ -9437,16 +9437,53 @@ end;
   lies on 8 or more (GlobAlign), at an offset of the access's size, so
   the scaled offset the relocation needs (ARM DDI 0487 M.c C6.2.216 LDR
   immediate, unsigned offset; the ELF for the Arm 64-bit Architecture:
-  LDST8, 16, 32 and 64 ABS_LO12_NC) holds. }
+  LDST8, 16, 32 and 64 ABS_LO12_NC) holds. P374: the base any register
+  from x0 to x16, as an address worked out in the pool's x9 is, and the
+  adds of constant offsets between the address's add and the access, a
+  field's and an element's, summed into the access's: x := g[4].C was
+  adrp x9, v_g; add x9, x9, :lo12:v_g; add x9, x9, #72; ldr x9, [x9,
+  #16], now adrp x9, v_g+88; ldr x9, [x9, :lo12:v_g+88], as amd64's
+  movq v_g+72+16(%rip) is one; a load into its own base needs no proof
+  that the base is dead after it. A register is named by its x and its
+  w spelling, a word apart (x9 is not in x19). }
 procedure TEmitter.AdrpPass(From: SizeInt);
 var
   ls: TStrArray;
   drop: array of Boolean;
-  i, j, n, q, st, p: SizeInt;
-  t, sym, op, rt, mem, offs, out1, named: string;
+  i, j, n, q, st, p, k, a: SizeInt;
+  t, sym, op, rt, mem, offs, out1, named, br, bw, pre: string;
   sz: LongInt;
-  off: Int64;
-  changed, dead, ok: Boolean;
+  off, tot, kk: Int64;
+  changed, dead, ok, own: Boolean;
+
+  { line T names register R (x or w spelling W), not as a part of a
+    longer name }
+  function Names(const T, R, W: string): Boolean;
+  var
+    q2, e: SizeInt;
+    u: string;
+  begin
+    Result := False;
+    q2 := 1;
+    while q2 <= Length(T) do
+    begin
+      if (T[q2] = 'x') or (T[q2] = 'w') then
+      begin
+        e := q2 + 1;
+        while (e <= Length(T)) and (T[e] in ['0'..'9']) do
+          Inc(e);
+        u := Copy(T, q2, e - q2);
+        if ((u = R) or (u = W)) and ((q2 = 1) or not (T[q2 - 1] in ['a'..'z', 'A'..'Z', '0'..'9', '_', '.'])) then
+        begin
+          Result := True;
+          Exit;
+        end;
+        q2 := e;
+      end
+      else
+        Inc(q2);
+    end;
+  end;
 
   { the label of line T, a definition, is named by no other line }
   function Unreached(const T: string): Boolean;
@@ -9502,13 +9539,41 @@ begin
   for i := 0 to n - 3 do
   begin
     t := ls[i];
-    if Copy(t, 1, 14) <> '  adrp x16, v_' then
+    { adrp R, v_...: R from x0 to x16 }
+    if Copy(t, 1, 8) <> '  adrp x' then
       Continue;
-    sym := Copy(t, 13, Length(t) - 12);
-    if ls[i + 1] <> '  add x16, x16, :lo12:' + sym then
+    p := Pos(', v_', t);
+    if p = 0 then
       Continue;
-    { the access: op Rt, [x16] or [x16, #imm] }
-    t := ls[i + 2];
+    br := Copy(t, 8, p - 8);
+    if (Length(br) < 2) or (Length(br) > 3) or not StrToInt64(Copy(br, 2, Length(br) - 1), kk) or
+      (kk < 0) or (kk > 16) then
+      Continue;
+    bw := 'w' + Copy(br, 2, Length(br) - 1);
+    pre := '  adrp ' + br + ', ';
+    sym := Copy(t, Length(pre) + 1, Length(t) - Length(pre));
+    if ls[i + 1] <> '  add ' + br + ', ' + br + ', :lo12:' + sym then
+      Continue;
+    { the adds of constant offsets after it }
+    tot := 0;
+    k := i + 2;
+    ok := True;
+    while (k < n) and (Copy(ls[k], 1, Length('  add ' + br + ', ' + br + ', #')) =
+      '  add ' + br + ', ' + br + ', #') do
+    begin
+      offs := Copy(ls[k], Length('  add ' + br + ', ' + br + ', #') + 1, Length(ls[k]));
+      if not StrToInt64(offs, kk) then
+      begin
+        ok := False;
+        Break;
+      end;
+      tot := tot + kk;
+      Inc(k);
+    end;
+    if (not ok) or (k >= n) then
+      Continue;
+    { the access: op Rt, [R] or [R, #imm] }
+    t := ls[k];
     p := Pos(' ', Copy(t, 3, Length(t)));
     if p = 0 then
       Continue;
@@ -9529,71 +9594,85 @@ begin
       sz := 4;
     if sz = 0 then
       Continue;
-    j := Pos(', [x16', t);
+    j := Pos(', [' + br, t);
     if j = 0 then
       Continue;
     rt := Copy(t, p + 3, j - p - 3);
-    if (rt = 'x16') or (rt = 'w16') or (Pos(' ', rt) > 0) then
+    if Pos(' ', rt) > 0 then
       Continue;
     mem := Copy(t, j + 2, Length(t) - j - 1);
     off := 0;
     ok := True;
-    if mem = '[x16]' then
+    if mem = '[' + br + ']' then
       off := 0
-    else if (Copy(mem, 1, 7) = '[x16, #') and (mem[Length(mem)] = ']') then
+    else if (Copy(mem, 1, Length(br) + 4) = '[' + br + ', #') and (mem[Length(mem)] = ']') then
     begin
-      offs := Copy(mem, 8, Length(mem) - 8);
+      offs := Copy(mem, Length(br) + 5, Length(mem) - Length(br) - 5);
       if not StrToInt64(offs, off) then
         ok := False;
     end
     else
       ok := False;
-    if (not ok) or (off < 0) or (off >= 4096) or (off mod sz <> 0) then
+    tot := tot + off;
+    if (not ok) or (tot < 0) or (tot mod sz <> 0) then
       Continue;
-    { x16 dead after the access }
-    dead := False;
-    q := i + 3;
-    while q < n do
+    { a load into its own base leaves nothing of the address; a store,
+      or a load into another register, needs the base dead after it }
+    own := (Copy(op, 1, 2) = 'ld') and ((rt = br) or (rt = bw));
+    if (not own) and ((rt = br) or (rt = bw)) then
+      Continue;
+    dead := own;
+    if not dead then
     begin
-      t := ls[q];
-      if (t = '') or (Copy(t, 1, 3) = '  .') or ((Length(t) > 4) and (Copy(t, 1, 3) = '.LL') and
-        (t[Length(t)] = ':')) or Unreached(t) then
+      q := k + 1;
+      while q < n do
       begin
-        Inc(q);
-        Continue;
-      end;
-      if (t[1] <> ' ') or (Copy(t, 1, 4) = '  b ') or (Copy(t, 1, 4) = '  b.') or
-        (Copy(t, 1, 5) = '  cbz') or (Copy(t, 1, 6) = '  cbnz') or (Copy(t, 1, 5) = '  tbz') or
-        (Copy(t, 1, 6) = '  tbnz') or (Copy(t, 1, 5) = '  br ') then
+        t := ls[q];
+        if (t = '') or (Copy(t, 1, 3) = '  .') or ((Length(t) > 4) and (Copy(t, 1, 3) = '.LL') and
+          (t[Length(t)] = ':')) or Unreached(t) then
+        begin
+          Inc(q);
+          Continue;
+        end;
+        if (t[1] <> ' ') or (Copy(t, 1, 4) = '  b ') or (Copy(t, 1, 4) = '  b.') or
+          (Copy(t, 1, 5) = '  cbz') or (Copy(t, 1, 6) = '  cbnz') or (Copy(t, 1, 5) = '  tbz') or
+          (Copy(t, 1, 6) = '  tbnz') or (Copy(t, 1, 5) = '  br ') then
+          Break;
+        if (Copy(t, 1, 5) = '  bl ') or (Copy(t, 1, 6) = '  blr ') or (t = '  ret') then
+        begin
+          { past a call or a return only x16, which no routine takes or
+            gives back, is dead: the runtime's take arguments in other
+            registers, and a block comes back in x0, x2 and x3 (P366) }
+          dead := (br = 'x16') and not Names(t, br, bw);
+          Break;
+        end;
+        if not Names(t, br, bw) then
+        begin
+          Inc(q);
+          Continue;
+        end;
+        { the first that names R: a write of it alone, and no read }
+        dead := ((Copy(t, 1, Length('  adrp ' + br + ', ')) = '  adrp ' + br + ', ') or
+          (Copy(t, 1, Length('  mov ' + br + ', ')) = '  mov ' + br + ', ') or
+          (Copy(t, 1, Length('  movz ' + br + ', ')) = '  movz ' + br + ', ') or
+          (Copy(t, 1, Length('  ldr ' + br + ', ')) = '  ldr ' + br + ', ')) and
+          not Names(Copy(t, Length('  ldr ' + br + ', ') + 1, Length(t)), br, bw);
         Break;
-      if (Copy(t, 1, 5) = '  bl ') or (Copy(t, 1, 6) = '  blr ') or (t = '  ret') then
-      begin
-        dead := Pos('x16', t) = 0;
-        Break;
       end;
-      if Pos('x16', t) = 0 then
-      begin
-        Inc(q);
-        Continue;
-      end;
-      { the first that names x16: a write of it alone, and no read }
-      dead := ((Copy(t, 1, 12) = '  adrp x16, ') or (Copy(t, 1, 11) = '  mov x16, ') or
-        (Copy(t, 1, 12) = '  movz x16, ') or (Copy(t, 1, 11) = '  ldr x16, ')) and
-        (Pos('x16', Copy(t, 12, Length(t))) = 0);
-      Break;
     end;
     if not dead then
       Continue;
-    if off = 0 then
-      ls[i + 2] := '  ' + op + ' ' + rt + ', [x16, :lo12:' + sym + ']'
+    if tot = 0 then
+      ls[k] := '  ' + op + ' ' + rt + ', [' + br + ', :lo12:' + sym + ']'
     else
     begin
       { the page of the word itself: v_s+8 may lie on the next page
         (v_s at 0x43fff8 in chr), which adrp of v_s does not reach }
-      ls[i] := '  adrp x16, ' + sym + '+' + IntToStr(off);
-      ls[i + 2] := '  ' + op + ' ' + rt + ', [x16, :lo12:' + sym + '+' + IntToStr(off) + ']';
+      ls[i] := '  adrp ' + br + ', ' + sym + '+' + IntToStr(tot);
+      ls[k] := '  ' + op + ' ' + rt + ', [' + br + ', :lo12:' + sym + '+' + IntToStr(tot) + ']';
     end;
-    drop[i + 1] := True;
+    for a := i + 1 to k - 1 do
+      drop[a] := True;
     changed := True;
   end;
   if not changed then
