@@ -67,6 +67,8 @@ type
     function PartIn(S: PStmt; C: PExpr): LongInt;
     function NamedIn(const A: TExprArray; const N: string): Boolean;
     function HasTry(S: PStmt): Boolean;
+    function MethIdx(E: PExpr): LongInt;
+    function StmtMeth(S: PStmt): LongInt;
     procedure MapName(const N: string; E: PExpr);
     function Mapped(const N: string; out E: PExpr): Boolean;
     function CloneE(E: PExpr): PExpr;
@@ -680,6 +682,54 @@ begin
     end;
 end;
 
+{ ---- A method put in place (P369) ----
+
+  A method of a class called on an object with the slot -1, the dispatch
+  the compiler fixes (a method no override can change, or inherited's),
+  is the routine its symbol names: its body goes in as a plain routine's
+  does, its Self one more value parameter, the object the call gives.
+  That object stands for Self itself when the body never writes Self and
+  it is a variable of the caller's own, or the caller's own Self, which
+  only its body can write; else a hidden variable takes it first, before
+  the arguments, as the call evaluates it. Go inlines a method called on
+  a concrete type as a function, its receiver its first parameter
+  (typecheck turns OCALLMETH into OCALLFUNC; inline/inl.go). A method
+  of a record (Self by its address), a class method, a static one and a
+  constructor stay calls. E, an ekMethod: the routine, -1 when it is
+  none of these. }
+function TOpt.MethIdx(E: PExpr): LongInt;
+var
+  t: LongInt;
+begin
+  Result := -1;
+  if (E = nil) or (E^.Kind <> ekMethod) or (E^.Off <> -1) or (E^.Name = '') or (E^.L = nil) then
+    Exit;
+  t := E^.L^.Typ;
+  if (t < 0) or (t > High(FProg^.Types)) or (FProg^.Types[t].Kind <> tykClass) then
+    Exit;
+  Result := FindProc(E^.Name);
+  if (Result >= 0) and (FProcs[Result].ClassTyp = 0) then
+    Result := -1;
+end;
+
+{ The same for a call statement of a method: its object in E, its slot
+  in E2. }
+function TOpt.StmtMeth(S: PStmt): LongInt;
+var
+  t: LongInt;
+begin
+  Result := -1;
+  if (S = nil) or (S^.Kind <> skCall) or (S^.E = nil) or (S^.E2 = nil) or
+    (S^.E2^.Kind <> ekInt) or (S^.E2^.Num <> -1) or (S^.Name = '') then
+    Exit;
+  t := S^.E^.Typ;
+  if (t < 0) or (t > High(FProg^.Types)) or (FProg^.Types[t].Kind <> tykClass) then
+    Exit;
+  Result := FindProc(S^.Name);
+  if (Result >= 0) and (FProcs[Result].ClassTyp = 0) then
+    Result := -1;
+end;
+
 function TOpt.HasTry(S: PStmt): Boolean;
 var
   i: SizeInt;
@@ -940,8 +990,11 @@ begin
     why := '';
     if pr.IsExt then
       why := 'another unit''s'
-    else if pr.IsCtor or (pr.ClassTyp <> 0) then
-      why := 'a method'
+    else if pr.IsCtor then
+      why := 'a constructor'
+    else if (pr.ClassTyp <> 0) and ((pr.SelfTyp <> 0) or pr.NoSelf or pr.RecCtor or
+      (FProg^.Types[pr.ClassTyp].Kind <> tykClass)) then
+      why := 'a class method, or a method of a record'
     else if pr.IsAnon or pr.Boxing or (Length(pr.Shared) > 0) or (Length(pr.Pins) > 0) then
       why := 'a closure or one that keeps variables for closures'
     else if pr.Nest > 0 then
@@ -1478,6 +1531,29 @@ begin
             Exit;
         end;
       end;
+    ekMethod:
+      begin
+        idx := MethIdx(E);
+        if (idx >= 0) and FProcs[idx].IsFunc and (FCur <> idx) and Inlinable(idx) and SameCpu(idx) then
+        begin
+          Result := E;
+          Exit;
+        end;
+        if E^.L = nil then
+          Exit;
+        Result := FirstCall(E^.L);
+        if (Result <> nil) or (not Ahead(E^.L)) then
+          Exit;
+        for i := 0 to High(E^.Args) do
+        begin
+          if (E^.Args[i] <> nil) and (E^.Args[i]^.Kind <> ekAddr) then
+            Result := FirstCall(E^.Args[i]);
+          if Result <> nil then
+            Exit;
+          if not Ahead(E^.Args[i]) then
+            Exit;
+        end;
+      end;
     ekUn, ekDeref, ekField:
       Result := FirstCall(E^.L);
     ekIndex:
@@ -1972,7 +2048,7 @@ var
   args: TExprArray;
   i, k: SizeInt;
   blk, st: PStmt;
-  hv, arg, res, place, pc: PExpr;
+  hv, arg, res, place, pc, obj: PExpr;
   refs, deps, keep: TStrArray;
   d, m: SizeInt;
   direct: Boolean;
@@ -1981,16 +2057,31 @@ begin
   Result := nil;
   if S = nil then
     Exit;
+  obj := nil;
   if (S^.Kind = skCall) and (S^.E = nil) then
   begin
     idx := FindProc(S^.Name);
     args := S^.Args;
+  end
+  else if (S^.Kind = skCall) and (StmtMeth(S) >= 0) then
+  begin
+    { a method's call statement (P369): its object, then its arguments }
+    idx := StmtMeth(S);
+    args := S^.Args;
+    obj := S^.E;
   end
   else if (S^.Kind = skAssign) and (S^.E <> nil) and (S^.E^.Kind = ekCall) and
     ((S^.Dest <> nil) or FWantPlace) then
   begin
     idx := FindProc(S^.E^.Name);
     args := S^.E^.Args;
+  end
+  else if (S^.Kind = skAssign) and (S^.E <> nil) and (MethIdx(S^.E) >= 0) and
+    ((S^.Dest <> nil) or FWantPlace) then
+  begin
+    idx := MethIdx(S^.E);
+    args := S^.E^.Args;
+    obj := S^.E^.L;
   end
   else
     Exit;
@@ -2001,6 +2092,9 @@ begin
   if (not Inlinable(idx)) or (not SameCpu(idx)) then
     Exit;
   pr := FProcs[idx];
+  { a method needs its object, a plain routine none }
+  if (pr.ClassTyp <> 0) <> (obj <> nil) then
+    Exit;
   if (S^.Kind = skAssign) and (not pr.IsFunc) then
     Exit;
   if Length(args) <> Length(pr.Params) then
@@ -2080,6 +2174,25 @@ begin
   FMapTo := nil;
   blk := NewStmt(skBlock);
   blk^.Line := S^.Line;
+  { Self, the object the call gives, first (P369): the caller's own Self
+    or a variable of its own when the body never writes Self, else a
+    hidden variable }
+  if obj <> nil then
+  begin
+    if (obj^.Kind = ekVar) and (not WritesName(pr.Body, 'self')) and
+      ((SameId(obj^.Name, 'self') and (FCur >= 0) and (not Reached('self'))) or
+      (CallerLocal(obj^.Name) and (not InList(refs, ToLower(obj^.Name))))) then
+      MapName('self', obj)
+    else
+    begin
+      hv := Hidden('self', obj^.Typ);
+      st := AddStmt(blk, NewStmt(skAssign));
+      st^.Line := S^.Line;
+      st^.Dest := hv;
+      st^.E := obj;
+      MapName('self', hv);
+    end;
+  end;
   { the parameters, in order }
   for i := 0 to High(pr.Params) do
   begin
@@ -2228,7 +2341,10 @@ begin
             c := FirstCall(S^.Args[i]);
           if c <> nil then
           begin
-            if (i > 0) and (S^.Kind <> skCall) and (not Quiet(FindProc(c^.Name))) then
+            if (i > 0) and (S^.Kind <> skCall) and (c^.Kind = ekMethod) and (not Quiet(MethIdx(c))) then
+              c := nil
+            else if (i > 0) and (S^.Kind <> skCall) and (c^.Kind <> ekMethod) and
+              (not Quiet(FindProc(c^.Name))) then
               c := nil;
             Break;
           end;
@@ -2240,7 +2356,10 @@ begin
   end;
   if c = nil then
     Exit;
-  idx := FindProc(c^.Name);
+  if c^.Kind = ekMethod then
+    idx := MethIdx(c)
+  else
+    idx := FindProc(c^.Name);
   if idx < 0 then
     Exit;
   Inc(FN);
@@ -2476,13 +2595,22 @@ begin
   ExprInlineE(E^.R);
   for i := 0 to High(E^.Args) do
     ExprInlineE(E^.Args[i]);
-  if E^.Kind <> ekCall then
+  if E^.Kind = ekCall then
+    idx := FindProc(E^.Name)
+  else if E^.Kind = ekMethod then
+    idx := MethIdx(E)
+  else
     Exit;
-  idx := FindProc(E^.Name);
   if (idx < 0) or (idx = FCur) or (not Inlinable(idx)) or (not SameCpu(idx)) or (not ExprBody(idx, b)) then
     Exit;
   pr := FProcs[idx];
   if Length(E^.Args) <> Length(pr.Params) then
+    Exit;
+  if (pr.ClassTyp <> 0) <> (E^.Kind = ekMethod) then
+    Exit;
+  { a method's object (P369): a variable stands for Self, which E reads
+    where the call would have; anything else stays a call }
+  if (E^.Kind = ekMethod) and ((E^.L = nil) or (E^.L^.Kind <> ekVar)) then
     Exit;
   for i := 0 to High(pr.Params) do
   begin
@@ -2519,6 +2647,8 @@ begin
       a := a^.L;
     MapName(pr.Params[i].Name, a);
   end;
+  if E^.Kind = ekMethod then
+    MapName('self', E^.L);
   FInlining := True;
   nw := CopyE(b);
   FInlining := False;
