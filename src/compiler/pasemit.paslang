@@ -276,6 +276,8 @@ type
     FLab: LongInt;
     FAddrWrite: Boolean;  { the next EmitAddr is for a write: a string's characters become its own (1.0.82) }
     FStoreSrc: PExpr;     { the value StoreTo stores, when the statement knows it (1.0.82) }
+    FAddrInto: string;    { P373: the register an element's address goes to, '' rax or x0 ... }
+    FAddrDone: Boolean;   { ... and whether its last instruction wrote it there }
     FStrMaps: array of LongInt;  { the types whose string maps .rodata carries (1.0.82) }
     FZeroMax: LongInt;    { the biggest record a closed channel gives as zero (.Lzeroblk, 1.0.83) }
     FSetImgs: TStrArray;  { the constant sets of 32 bytes (P126), .Lsetc<n> in .rodata, 64 hex digits each }
@@ -1001,6 +1003,8 @@ type
     procedure FixedTo(const Sy: TSym; K: Int64; const Reg: string);
     procedure SmallChunks(N: Int64; var Off, Sz: TInt64Arr);
     function SmallMax: LongInt;
+    procedure AddrInto(E: PExpr; const R: string);
+    procedure ScaleAtIntoX86(const Disp, B, X: string; K: Int64; const D: string);
     procedure WideChunks(N: Int64; var Off, Sz: TInt64Arr);
     function EmitSmallMove(S: PStmt): Boolean;
     function EmitSmallFill(S: PStmt): Boolean;
@@ -6417,9 +6421,14 @@ var
   esz: LongInt;
   i, sh: LongInt;
   off: LongInt;
+  into, pw, xr, dr: string;
   ok, ix: string;
   wr, late: Boolean;
 begin
+  { the register an AddrInto asked for, for this element alone: what it
+    works out first (a base, an index) goes where it always went }
+  into := FAddrInto;
+  FAddrInto := '';
   wr := FAddrWrite;
   FAddrWrite := False;
   if E = nil then
@@ -6591,7 +6600,14 @@ begin
             else
             begin
               Ppop('x1');
-              ScaleAddArm('x0', 'x1', 'x0', esz, 'x16', 'x17');
+              { into the register asked for (P373) }
+              dr := 'x0';
+              if into <> '' then
+              begin
+                dr := into;
+                FAddrDone := True;
+              end;
+              ScaleAddArm(dr, 'x1', 'x0', esz, 'x16', 'x17');
             end;
           end
           else if E^.R^.Kind = ekInt then
@@ -6616,9 +6632,20 @@ begin
               EmitAddr(E^.L);
               PshK('x0', 1);
             end;
-            EmitExpr(E^.R);
+            { the index where the pool works it out, for a base that comes
+              after it (P373) }
+            pw := '';
+            if late and (td.Lo = 0) then
+              pw := PoolWord(E^.R);
+            if pw = '' then
+            begin
+              EmitExpr(E^.R);
+              xr := 'x0';
+            end
+            else
+              xr := pw;
             { the index from the low bound: x0 itself when that is 0 (P289) }
-            ix := 'x0';
+            ix := xr;
             if td.Lo <> 0 then
             begin
               AddImmArm('x1', 'x0', -td.Lo);
@@ -6629,7 +6656,7 @@ begin
             begin
               CmpImmArm(ix, td.Hi - td.Lo, 'x17');
               ColdBegin('  b.hi');
-              BoundsFailArm('x0', 0, td.Lo, '', td.Hi, 0);
+              BoundsFailArm(xr, 0, td.Lo, '', td.Hi, 0);
               ColdEnd;
             end;
             Line(ok + ':');
@@ -6639,25 +6666,34 @@ begin
             sh := Pow2Log(esz);
             { the base comes back into x1, where the index lowered by a
               low bound other than 0 is: that one goes to x0 first }
-            if ix <> 'x0' then
+            if td.Lo <> 0 then
+            begin
               Line('  mov x0, ' + ix);
+              xr := 'x0';
+            end;
+            dr := 'x0';
+            if into <> '' then
+            begin
+              dr := into;
+              FAddrDone := True;
+            end;
             { the base after the index when it is a label or the frame's
               (P297); the frame's offset after the element's add, where a
               field's offset and a pair's ldp or stp take it (P329) }
             if not late then
             begin
               Ppop('x1');
-              ScaleAddArm('x0', 'x1', 'x0', esz, 'x16', 'x17');
+              ScaleAddArm(dr, 'x1', xr, esz, 'x16', 'x17');
             end
             else if s.Global then
             begin
               LeaS(VarLabel(s.Name), 'x1');
-              ScaleAddArm('x0', 'x1', 'x0', esz, 'x16', 'x17');
+              ScaleAddArm(dr, 'x1', xr, esz, 'x16', 'x17');
             end
             else
             begin
-              ScaleAddArm('x0', 'x29', 'x0', esz, 'x16', 'x17');
-              AddImmArm('x0', 'x0', s.Off);
+              ScaleAddArm(dr, 'x29', xr, esz, 'x16', 'x17');
+              AddImmArm(dr, dr, s.Off);
             end;
           end;
         end;
@@ -6837,7 +6873,14 @@ begin
           if ok <> '' then
             Line(ok + ':');
           Line('  popq %rcx');
-          ScaleAddX86('%rax', '%rcx', '%rax', esz, '%rdx');
+          { into the register asked for (P373) }
+          dr := '%rax';
+          if into <> '' then
+          begin
+            dr := '%' + into;
+            FAddrDone := True;
+          end;
+          ScaleAddX86(dr, '%rcx', '%rax', esz, '%rdx');
         end
         else if TKind(E^.L^.Typ) = tykPointer then
         begin
@@ -6882,10 +6925,21 @@ begin
             EmitAddr(E^.L);
             PushK('rax', 1);
           end;
-          EmitExpr(E^.R);
+          { the index where the pool works it out, for a base that comes
+            after it (P373) }
+          pw := '';
+          if late and (td.Lo = 0) then
+            pw := PoolWord(E^.R);
+          if pw = '' then
+          begin
+            EmitExpr(E^.R);
+            xr := '%rax';
+          end
+          else
+            xr := '%' + pw;
           ok := Lab;
           { the index from the low bound: rax itself when that is 0 (P289) }
-          ix := '%rax';
+          ix := xr;
           if td.Lo <> 0 then
           begin
             { the low bound in LEA's displacement (P306) }
@@ -6909,26 +6963,32 @@ begin
               Line('  cmpq %rcx, ' + ix);
             end;
             ColdBegin('  ja');
-            BoundsFailX86('%rax', td.Lo, '', td.Hi, 0);
+            BoundsFailX86(xr, td.Lo, '', td.Hi, 0);
             ColdEnd;
           end;
           Line(ok + ':');
-          if ix <> '%rax' then
+          if td.Lo <> 0 then
             Line('  movq %rdx, %rax');
           { an element of a power of two is a shift, one cycle where imul
             takes three on Zen 2 (AMD 17h 30h latencies: SHL 1, IMUL
             reg64 3), any other size a recipe where one is cheaper (P310);
             the base after the index when one instruction gives it (P297),
             in the element's lea itself (P329) }
+          dr := '%rax';
+          if into <> '' then
+          begin
+            dr := '%' + into;
+            FAddrDone := True;
+          end;
           if not late then
           begin
             Line('  popq %rcx');
-            ScaleAddX86('%rax', '%rcx', '%rax', esz, '%rdx');
+            ScaleAddX86(dr, '%rcx', '%rax', esz, '%rdx');
           end
           else if s.Global then
-            ScaleAtX86(VarLabel(s.Name), '', esz)
+            ScaleAtIntoX86(VarLabel(s.Name), '', xr, esz, dr)
           else
-            ScaleAtX86(IntToStr(s.Off), '%rbp', esz);
+            ScaleAtIntoX86(IntToStr(s.Off), '%rbp', xr, esz, dr);
         end;
       end;
     ekAddr:
@@ -7047,6 +7107,49 @@ begin
   end
   else
     Line('  leaq ' + FixedOp(Sy, K) + ', %' + Reg);
+end;
+
+{ P373: E's value, an address, into R: an element's last lea or add
+  writes R itself (FAddrInto), and its index stays in the pool's register
+  that worked it out, where EmitExpr put the address in rax or x0 and a
+  move took it to R, as the index went to rax first: t := src[i and 7]
+  was movq %r9, %rsi; andq $7, %rsi; movq %rsi, %rax; two leas;
+  movq %rax, %rsi, where Go's register allocator gives each value the
+  register its user reads (cmd/compile/internal/ssa/regalloc.go, a
+  value's register hint). Anything else, a field after the element
+  among them, ends in rax or x0 and is moved. }
+procedure TEmitter.AddrInto(E: PExpr; const R: string);
+begin
+  FAddrInto := R;
+  FAddrDone := False;
+  EmitExpr(E);
+  FAddrInto := '';
+  if not FAddrDone then
+  begin
+    if FArm then
+      Line('  mov ' + R + ', x0')
+    else
+      Line('  movq %rax, %' + R);
+  end;
+  FAddrDone := False;
+end;
+
+{ amd64: D := Disp(B) + X * K, ScaleAtX86's address with the index in X,
+  which the scale may change (P373). }
+procedure TEmitter.ScaleAtIntoX86(const Disp, B, X: string; K: Int64; const D: string);
+var
+  s: LongInt;
+  m: Int64;
+begin
+  s := 0;
+  m := K;
+  while (s < 3) and (m > 1) and ((m and 1) = 0) do
+  begin
+    m := m shr 1;
+    Inc(s);
+  end;
+  ScaleTo(X, X, m, '%rdx');
+  Line('  leaq ' + Disp + '(' + B + ',' + X + ',' + IntToStr(Int64(1) shl s) + '), ' + D);
 end;
 
 { P372: the largest count moved in line: 256 bytes with AVX, eight
@@ -7168,27 +7271,23 @@ begin
     { x10 the source, x11 the destination }
     if not fs then
     begin
-      EmitExpr(S^.Args[0]);
       if not fd then
       begin
+        EmitExpr(S^.Args[0]);
         PshK('x0', VCls(S^.Args[0]^.Typ, 0));
-        EmitExpr(S^.Args[1]);
-        Line('  mov x11, x0');
+        AddrInto(S^.Args[1], 'x11');
         Ppop('x10');
       end
       else
       begin
-        Line('  mov x10, x0');
+        AddrInto(S^.Args[0], 'x10');
         FixedTo(dsy, dk, 'x11');
       end;
     end
     else
     begin
       if not fd then
-      begin
-        EmitExpr(S^.Args[1]);
-        Line('  mov x11, x0');
-      end
+        AddrInto(S^.Args[1], 'x11')
       else
         FixedTo(dsy, dk, 'x11');
       FixedTo(ssy, sk, 'x10');
@@ -7253,20 +7352,13 @@ begin
   begin
     EmitExpr(S^.Args[0]);
     PushK('rax', VCls(S^.Args[0]^.Typ, 0));
-    EmitExpr(S^.Args[1]);
-    Line('  movq %rax, %rdi');
+    AddrInto(S^.Args[1], 'rdi');
     Line('  popq %rsi');
   end
   else if not fs then
-  begin
-    EmitExpr(S^.Args[0]);
-    Line('  movq %rax, %rsi');
-  end
+    AddrInto(S^.Args[0], 'rsi')
   else if not fd then
-  begin
-    EmitExpr(S^.Args[1]);
-    Line('  movq %rax, %rdi');
-  end;
+    AddrInto(S^.Args[1], 'rdi');
   for i := 0 to High(off) do
   begin
     if fs then
@@ -7389,16 +7481,16 @@ begin
     { x11 the destination, the byte in w12 }
     if not fd then
     begin
-      EmitExpr(S^.Args[0]);
       if not vk then
       begin
+        EmitExpr(S^.Args[0]);
         PshK('x0', VCls(S^.Args[0]^.Typ, 0));
         EmitExpr(x);
         Line('  and w12, w0, #255');
         Ppop('x11');
       end
       else
-        Line('  mov x11, x0');
+        AddrInto(S^.Args[0], 'x11');
     end
     else
     begin
@@ -7473,15 +7565,15 @@ begin
   { rdi the destination when it is not fixed, the pattern in rax }
   if not fd then
   begin
-    EmitExpr(S^.Args[0]);
     if not vk then
     begin
+      EmitExpr(S^.Args[0]);
       PushK('rax', VCls(S^.Args[0]^.Typ, 0));
       EmitExpr(x);
       Line('  popq %rdi');
     end
     else
-      Line('  movq %rax, %rdi');
+      AddrInto(S^.Args[0], 'rdi');
   end
   else if not vk then
     EmitExpr(x);

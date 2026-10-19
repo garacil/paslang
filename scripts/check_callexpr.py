@@ -12,7 +12,8 @@ assembly paslangc wrote for testdata/callexpr.paslang, amd64 or with
   from the loop's head to the call;
 - the code and second word go from their place to the call's registers:
   r11 and r10 (x8 and x27), on amd64 from the element's own operand
-  (v_fns(,%rax,8), P329), Self through r10 (x27) when an argument is
+  (v_fns(,%rsi,8), P329, the index in the register that worked it out,
+  P373), Self through r10 (x27) when an argument is
   worked out first, an interface's code from its table in r11 (x8), a
   method value's from its home straight into r11 and rdi (one ldp into x8
   and x0);
@@ -109,11 +110,11 @@ def main():
             bad.append(f"{name}: no {what}")
 
     if not arm:
-        loops("p_run", [r"^  movq v_fns\(,%rax,8\), %r11$", r"^  movq v_fns\+8\(,%rax,8\), %r10$",
+        loops("p_run", [r"^  movq v_fns\(,%r\w+,8\), %r11$", r"^  movq v_fns\+8\(,%r\w+,8\), %r10$",
                         r"^  call \*%r11$"])
         # Self straight into rdi since P332: the argument, a chain, is
         # worked out in its own register and leaves rdi alone
-        loops("p_areas", [r"^  movq v_shapes\(,%rax,8\), %rdi$", r"^  movq v_shapes\+8\(,%rax,8\), %r11$",
+        loops("p_areas", [r"^  movq v_shapes\(,%r\w+,8\), %rdi$", r"^  movq v_shapes\+8\(,%r\w+,8\), %r11$",
                           r"^  movq 0\(%r11\), %r11$"])
         loops("p_gets", [r"^  movq %rax, %rdi$", r"^  call \*\d+\(%rax\)$"])
         loops("p_six", [r"^  call \*%r11$"])

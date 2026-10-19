@@ -382,6 +382,9 @@ GOLDEN_A64 += methinl
 # P371: Result and the main block's own globals are operands no call put in place changes.
 GOLDEN += aheadres
 GOLDEN_A64 += aheadres
+# P373: the address of an element goes straight into the register that reads it.
+GOLDEN += elemaddr
+GOLDEN_A64 += elemaddr
 # P354: a routine's record keeps no saved register once it is loaded back.
 GOLDEN += gstale
 GOLDEN_A64 += gstale
@@ -2658,6 +2661,11 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	awk '/^pas_main:/,/cfi_endproc/' $(BUILDDIR)/aheadres1.s | grep -q 'call p_bump$$' || { echo "aheadres.s: g + Bump put Bump ahead"; exit 1; }; \
 	awk '/^pas_main:/,/cfi_endproc/' $(BUILDDIR)/aheadres1.s | grep -q 'call p_incvia$$' || { echo "aheadres.s: w + IncVia put IncVia ahead"; exit 1; }; \
 	echo ok aheadres-asm; \
+	: the address of an element goes straight into the register that reads it, its index in the pool register that worked it out, P373; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/elemaddr1 testdata/elemaddr.paslang; \
+	grep -q 'leaq v_g0(,%rsi,8), %rsi' $(BUILDDIR)/elemaddr1.s || { echo "elemaddr.s: an element of g0 is not worked out in rsi"; exit 1; }; \
+	awk '/^p_runlocal:/,/cfi_endproc/' $(BUILDDIR)/elemaddr1.s | grep -qE 'leaq -[0-9]+\(%rbp,%rsi,8\), %rsi' || { echo "elemaddr.s: RunLocal works out no element in rsi"; exit 1; }; \
+	echo ok elemaddr-asm; \
 	: c + k * x and y + k * x are one lea, x := x + k * y one lea on the register of x, r13 and rbp are never the base of a lea with an index, and a load at p - k takes the offset, P294; \
 	awk '/^p_off8:/,/cfi_endproc/' $(BUILDDIR)/leaform.s > $(BUILDDIR)/leaform-off8.s; \
 	grep -q 'leaq 8(,%r[a-z0-9]*,8), ' $(BUILDDIR)/leaform-off8.s || { echo "leaform.s: Off8 is not one lea"; exit 1; }; \
@@ -3730,7 +3738,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'paslang: unlock of an unlocked mutex' $(BUILDDIR)/unlockfree.err; \
 	echo ok unlockfree; \
 	echo "==== fatal ===="; \
-	for t in divzero nilptr deep oom oomlimit closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg leafnil bmaskwide bmodneg bmaskone bforpast bvarctr bnestctr bsumstat bsumdyn bsumneg bkeepfirst bkeepmoved bkeepstat bkeepshrunk brunlen brunloc divfirst idxline nilline bflatidx bflatpush nilblk nilbig nilzero nildest nilmeth; do \
+	for t in divzero nilptr deep oom oomlimit closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg leafnil bmaskwide bmodneg bmaskone bforpast bvarctr bnestctr bsumstat bsumdyn bsumneg bkeepfirst bkeepmoved bkeepstat bkeepshrunk brunlen brunloc divfirst idxline nilline bflatidx bflatpush nilblk nilbig nilzero nildest nilmeth elemidx; do \
 	  $(OUTDIR)/paslangc -o $(BUILDDIR)/fatal_$$t testdata/fatal/$$t.paslang; \
 	  set +e; \
 	  if [ $$t = oomlimit ]; then \
@@ -3753,6 +3761,8 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'paslang: nil pointer dereference at line 19' $(BUILDDIR)/fatal_nildest.err; \
 	: P369: a method put in place on a nil object stops at the line of its call; \
 	grep -q 'paslang: nil pointer dereference at line 24' $(BUILDDIR)/fatal_nilmeth.err; \
+	: P373: an index kept in the pool register that worked it out reports its value; \
+	grep -q 'paslang: index 9 out of range \[0..7\] at line 20' $(BUILDDIR)/fatal_elemidx.err; \
 	grep -q 'paslang: nil pointer dereference at line 16' $(BUILDDIR)/fatal_nilptr.err; \
 	grep -q 'paslang: nil pointer dereference at line 14' $(BUILDDIR)/fatal_leafnil.err; \
 	grep -q 'paslang: index 100 out of range \[0..63\] at line 11' $(BUILDDIR)/fatal_bmaskwide.err; \
@@ -4108,6 +4118,10 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	awk '/^p_nested:/,/cfi_endproc/' $(BUILDDIR)/aheadres1-arm.s | grep -q 'bl p_tri$$' || { echo "aheadres-arm.s: Nested put Tri ahead"; exit 1; }; \
 	awk '/^pas_main:/,/cfi_endproc/' $(BUILDDIR)/aheadres1-arm.s | grep -q 'bl p_bump$$' || { echo "aheadres-arm.s: g + Bump put Bump ahead"; exit 1; }; \
 	echo ok aheadres-arm-asm; \
+	: P373 on arm64; \
+	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/elemaddr1-arm testdata/elemaddr.paslang; \
+	awk '/^p_runlocal:/,/cfi_endproc/' $(BUILDDIR)/elemaddr1-arm.s | grep -qE '^  (madd|add) x10, .*x29' || { echo "elemaddr-arm.s: RunLocal works out no element in x10"; exit 1; }; \
+	echo ok elemaddr-arm-asm; \
 	: every call of a routine that takes a buffer gives one, in every program and unit of both machines, P153; \
 	python3 -I scripts/check_resbuf.py --all $(BUILDDIR) $(BUILDDIR)/$(LVL_X64) $(A64DIR) '$(A64DIR)/$(LVL_A64)'; \
 	echo ok resbuf-all; \
@@ -4580,7 +4594,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	grep -q 'paslang: unlock of an unlocked mutex' $(BUILDDIR)/unlockfree-arm.err; \
 	echo ok unlockfree-arm; \
 	echo "==== fatal arm64 ===="; \
-	for t in divzero nilptr deep oom closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg leafnil bmaskwide bmodneg bmaskone bforpast bvarctr bnestctr bsumstat bsumdyn bsumneg bkeepfirst bkeepmoved bkeepstat bkeepshrunk brunlen brunloc divfirst idxline nilline bflatidx bflatpush nilblk nilbig nilzero nildest nilmeth; do \
+	for t in divzero nilptr deep oom closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg leafnil bmaskwide bmodneg bmaskone bforpast bvarctr bnestctr bsumstat bsumdyn bsumneg bkeepfirst bkeepmoved bkeepstat bkeepshrunk brunlen brunloc divfirst idxline nilline bflatidx bflatpush nilblk nilbig nilzero nildest nilmeth elemidx; do \
 	  $(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/fatal_$$t-arm testdata/fatal/$$t.paslang; \
 	  set +e; timeout 60 $(QEMU_A64) $(BUILDDIR)/fatal_$$t-arm > $(BUILDDIR)/fatal_$$t-arm.got 2> $(BUILDDIR)/fatal_$$t-arm.err; rc=$$?; set -e; \
 	  test $$rc -eq 1; \
@@ -4595,6 +4609,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	grep -q 'paslang: nil pointer dereference at line 17' $(BUILDDIR)/fatal_nilzero-arm.err; \
 	grep -q 'paslang: nil pointer dereference at line 19' $(BUILDDIR)/fatal_nildest-arm.err; \
 	grep -q 'paslang: nil pointer dereference at line 24' $(BUILDDIR)/fatal_nilmeth-arm.err; \
+	grep -q 'paslang: index 9 out of range \[0..7\] at line 20' $(BUILDDIR)/fatal_elemidx-arm.err; \
 	grep -q 'paslang: nil pointer dereference at line 16' $(BUILDDIR)/fatal_nilptr-arm.err; \
 	grep -q 'paslang: nil pointer dereference at line 14' $(BUILDDIR)/fatal_leafnil-arm.err; \
 	grep -q 'paslang: index 100 out of range \[0..63\] at line 11' $(BUILDDIR)/fatal_bmaskwide-arm.err; \
