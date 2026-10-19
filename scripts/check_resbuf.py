@@ -18,10 +18,10 @@ With --all, over every .s file in the directories named, a program's and
 the units' alike: every routine marked .set .Lrb.<routine> takes a
 buffer, and every call of one sets rax or x8 right before it, a unit's
 from any file, a program's (a file with pas_main) from its own (an
-arm64 file is one that names x29); the stage compiler's assembly, which
-the boot compiler writes, is left out. A unit's routine a
-program calls with no buffer, as the maker of a record's constructor
-was, shows here.
+arm64 file is one that names the register x29, a word of its own); the
+stage compiler's assembly, which the boot compiler writes, is left out.
+A unit's routine a program calls with no buffer, as the maker of a
+record's constructor was, shows here.
 
 With --regs, in one file: each routine it names gives its block back in
 registers (P366): it takes no buffer (no .Lrb mark, no test of one),
@@ -82,7 +82,9 @@ def check_all(dirs):
     bad, calls = [], 0
     for f, L in texts.items():
         marked = own[f] | units
-        arm = any("x29" in l for l in L)
+        # the register as a word of its own: an amd64 program's global
+        # gx29 is v_gx29 (P370's blockcopy)
+        arm = any(re.search(r"\bx29\b", l) for l in L)
         for i, l in enumerate(L):
             m = CALL.match(l)
             if not m or m.group(1) not in marked:

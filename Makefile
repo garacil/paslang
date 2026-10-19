@@ -370,6 +370,9 @@ GOLDEN_A64 += regres
 # P367: a record Result written field by field before it is read starts as it is.
 GOLDEN += fieldfirst
 GOLDEN_A64 += fieldfirst
+# P370: a block assigned is copied or zeroed in line, and a copy through nil stops.
+GOLDEN += blockcopy
+GOLDEN_A64 += blockcopy
 # P354: a routine's record keeps no saved register once it is loaded back.
 GOLDEN += gstale
 GOLDEN_A64 += gstale
@@ -2616,6 +2619,13 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/fieldfirst.out $(BUILDDIR)/fieldfirst0.got; \
 	python3 -I scripts/check_fieldfirst.py $(BUILDDIR)/fieldfirst0.s --zeros=p_full:0,p_both:0,p_part:2,p_readfirst:5,p_branch:5,p_early:5,p_gap:2,p_localsum:5; \
 	echo ok fieldfirst-asm; \
+	: a block assigned is copied as Move copies and zeroed as FillChar zeroes, with no test of a zero address, in line up to 128 bytes, P370; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/blockcopy1 testdata/blockcopy.paslang; \
+	if grep -q 'stblob' $(BUILDDIR)/blockcopy1.s; then echo "blockcopy.s: a block store tests a zero address"; exit 1; fi; \
+	if awk '/^p_t40:/,/cfi_endproc/' $(BUILDDIR)/blockcopy1.s | grep -qE 'call rt_memcpy|rep stosb'; then echo "blockcopy.s: T40 copies or zeroes out of line"; exit 1; fi; \
+	if awk '/^p_t200:/,/cfi_endproc/' $(BUILDDIR)/blockcopy1.s | grep -q 'rep stosb'; then echo "blockcopy.s: T200 zeroes a variable with rep stosb"; exit 1; fi; \
+	awk '/^p_t300:/,/cfi_endproc/' $(BUILDDIR)/blockcopy1.s | grep -q 'call rt_memcpy' || { echo "blockcopy.s: T300 copies no block with rt_memcpy"; exit 1; }; \
+	echo ok blockcopy-asm; \
 	: c + k * x and y + k * x are one lea, x := x + k * y one lea on the register of x, r13 and rbp are never the base of a lea with an index, and a load at p - k takes the offset, P294; \
 	awk '/^p_off8:/,/cfi_endproc/' $(BUILDDIR)/leaform.s > $(BUILDDIR)/leaform-off8.s; \
 	grep -q 'leaq 8(,%r[a-z0-9]*,8), ' $(BUILDDIR)/leaform-off8.s || { echo "leaform.s: Off8 is not one lea"; exit 1; }; \
@@ -3675,7 +3685,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'paslang: unlock of an unlocked mutex' $(BUILDDIR)/unlockfree.err; \
 	echo ok unlockfree; \
 	echo "==== fatal ===="; \
-	for t in divzero nilptr deep oom oomlimit closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg leafnil bmaskwide bmodneg bmaskone bforpast bvarctr bnestctr bsumstat bsumdyn bsumneg bkeepfirst bkeepmoved bkeepstat bkeepshrunk brunlen brunloc divfirst idxline nilline bflatidx bflatpush; do \
+	for t in divzero nilptr deep oom oomlimit closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg leafnil bmaskwide bmodneg bmaskone bforpast bvarctr bnestctr bsumstat bsumdyn bsumneg bkeepfirst bkeepmoved bkeepstat bkeepshrunk brunlen brunloc divfirst idxline nilline bflatidx bflatpush nilblk nilbig nilzero nildest; do \
 	  $(OUTDIR)/paslangc -o $(BUILDDIR)/fatal_$$t testdata/fatal/$$t.paslang; \
 	  set +e; \
 	  if [ $$t = oomlimit ]; then \
@@ -3691,6 +3701,11 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'paslang: integer divide by zero at line 15' $(BUILDDIR)/fatal_divfirst.err; \
 	grep -q 'paslang: index 12 out of range \[0..9\] at line 15' $(BUILDDIR)/fatal_idxline.err; \
 	grep -q 'paslang: nil pointer dereference at line 20' $(BUILDDIR)/fatal_nilline.err; \
+	: P370: a block read or written through nil stops at its line, in line and past rt_memcpy and rt_fill; \
+	grep -q 'paslang: nil pointer dereference at line 19' $(BUILDDIR)/fatal_nilblk.err; \
+	grep -q 'paslang: nil pointer dereference at line 19' $(BUILDDIR)/fatal_nilbig.err; \
+	grep -q 'paslang: nil pointer dereference at line 17' $(BUILDDIR)/fatal_nilzero.err; \
+	grep -q 'paslang: nil pointer dereference at line 19' $(BUILDDIR)/fatal_nildest.err; \
 	grep -q 'paslang: nil pointer dereference at line 16' $(BUILDDIR)/fatal_nilptr.err; \
 	grep -q 'paslang: nil pointer dereference at line 14' $(BUILDDIR)/fatal_leafnil.err; \
 	grep -q 'paslang: index 100 out of range \[0..63\] at line 11' $(BUILDDIR)/fatal_bmaskwide.err; \
@@ -4021,6 +4036,13 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	diff -u testdata/fieldfirst.out $(BUILDDIR)/fieldfirst0-arm.got; \
 	python3 -I scripts/check_fieldfirst.py $(BUILDDIR)/fieldfirst0-arm.s --arm --zeros=p_full:0,p_both:0,p_part:2,p_readfirst:5,p_branch:5,p_early:5,p_gap:2,p_localsum:5; \
 	echo ok fieldfirst-arm-asm; \
+	: P370 on arm64; \
+	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/blockcopy1-arm testdata/blockcopy.paslang; \
+	if grep -q 'azero' $(BUILDDIR)/blockcopy1-arm.s; then echo "blockcopy-arm.s: a block store tests a zero address"; exit 1; fi; \
+	if awk '/^p_t40:/,/cfi_endproc/' $(BUILDDIR)/blockcopy1-arm.s | grep -qE 'bl rt_memcpy|bl rt_fill'; then echo "blockcopy-arm.s: T40 copies or zeroes out of line"; exit 1; fi; \
+	if awk '/^p_t200:/,/cfi_endproc/' $(BUILDDIR)/blockcopy1-arm.s | grep -q 'bl rt_fill'; then echo "blockcopy-arm.s: T200 zeroes a variable with rt_fill"; exit 1; fi; \
+	awk '/^p_t300:/,/cfi_endproc/' $(BUILDDIR)/blockcopy1-arm.s | grep -q 'bl rt_memcpy' || { echo "blockcopy-arm.s: T300 copies no block with rt_memcpy"; exit 1; }; \
+	echo ok blockcopy-arm-asm; \
 	: every call of a routine that takes a buffer gives one, in every program and unit of both machines, P153; \
 	python3 -I scripts/check_resbuf.py --all $(BUILDDIR) $(BUILDDIR)/$(LVL_X64) $(A64DIR) '$(A64DIR)/$(LVL_A64)'; \
 	echo ok resbuf-all; \
@@ -4490,7 +4512,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	grep -q 'paslang: unlock of an unlocked mutex' $(BUILDDIR)/unlockfree-arm.err; \
 	echo ok unlockfree-arm; \
 	echo "==== fatal arm64 ===="; \
-	for t in divzero nilptr deep oom closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg leafnil bmaskwide bmodneg bmaskone bforpast bvarctr bnestctr bsumstat bsumdyn bsumneg bkeepfirst bkeepmoved bkeepstat bkeepshrunk brunlen brunloc divfirst idxline nilline bflatidx bflatpush; do \
+	for t in divzero nilptr deep oom closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg leafnil bmaskwide bmodneg bmaskone bforpast bvarctr bnestctr bsumstat bsumdyn bsumneg bkeepfirst bkeepmoved bkeepstat bkeepshrunk brunlen brunloc divfirst idxline nilline bflatidx bflatpush nilblk nilbig nilzero nildest; do \
 	  $(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/fatal_$$t-arm testdata/fatal/$$t.paslang; \
 	  set +e; timeout 60 $(QEMU_A64) $(BUILDDIR)/fatal_$$t-arm > $(BUILDDIR)/fatal_$$t-arm.got 2> $(BUILDDIR)/fatal_$$t-arm.err; rc=$$?; set -e; \
 	  test $$rc -eq 1; \
@@ -4500,6 +4522,10 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	grep -q 'paslang: integer divide by zero at line 15' $(BUILDDIR)/fatal_divfirst-arm.err; \
 	grep -q 'paslang: index 12 out of range \[0..9\] at line 15' $(BUILDDIR)/fatal_idxline-arm.err; \
 	grep -q 'paslang: nil pointer dereference at line 20' $(BUILDDIR)/fatal_nilline-arm.err; \
+	grep -q 'paslang: nil pointer dereference at line 19' $(BUILDDIR)/fatal_nilblk-arm.err; \
+	grep -q 'paslang: nil pointer dereference at line 19' $(BUILDDIR)/fatal_nilbig-arm.err; \
+	grep -q 'paslang: nil pointer dereference at line 17' $(BUILDDIR)/fatal_nilzero-arm.err; \
+	grep -q 'paslang: nil pointer dereference at line 19' $(BUILDDIR)/fatal_nildest-arm.err; \
 	grep -q 'paslang: nil pointer dereference at line 16' $(BUILDDIR)/fatal_nilptr-arm.err; \
 	grep -q 'paslang: nil pointer dereference at line 14' $(BUILDDIR)/fatal_leafnil-arm.err; \
 	grep -q 'paslang: index 100 out of range \[0..63\] at line 11' $(BUILDDIR)/fatal_bmaskwide-arm.err; \

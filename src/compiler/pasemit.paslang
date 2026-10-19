@@ -1005,6 +1005,12 @@ type
     procedure SmallChunks(N: Int64; var Off, Sz: TInt64Arr);
     function EmitSmallMove(S: PStmt): Boolean;
     function EmitSmallFill(S: PStmt): Boolean;
+    procedure EmitMoveStmt(S: PStmt);
+    procedure EmitFillStmt(S: PStmt);
+    function BlockPlace(E: PExpr): Boolean;
+    function PromoBlockOK(S: PStmt): Boolean;
+    procedure FixedZero(const Dsy: TSym; Dk: Int64; N: LongInt);
+    function BlockAssign(S: PStmt): Boolean;
     function EmitMoveArgs(S: PStmt): Boolean;
     function EmitFillArgs(S: PStmt): Boolean;
     function ZeroCmp(E: PExpr; const Target: string; WhenTrue: Boolean): Boolean;
@@ -7460,6 +7466,341 @@ begin
       Line('  movl %eax, ' + dop)
     else
       Line('  movq %rax, ' + dop);
+  end;
+end;
+
+{ Move(a, b, n): a constant count up to 128 in line, fixed places with no
+  push (P304), else rt_memcpy. }
+procedure TEmitter.EmitMoveStmt(S: PStmt);
+begin
+  if EmitSmallMove(S) or EmitMoveArgs(S) then
+    Exit;
+  if FArm then
+  begin
+    EmitExpr(S^.Args[0]);
+    PshK('x0', VCls(S^.Args[0]^.Typ, 0));
+    EmitExpr(S^.Args[1]);
+    PshK('x0', VCls(S^.Args[1]^.Typ, 0));
+    EmitExpr(S^.Args[2]);
+    Line('  mov x2, x0');
+    Ppop('x0');
+    Ppop('x1');
+    Line('  bl rt_memcpy');
+  end
+  else
+  begin
+    EmitExpr(S^.Args[0]);
+    PushK('rax', VCls(S^.Args[0]^.Typ, 0));
+    EmitExpr(S^.Args[1]);
+    PushK('rax', VCls(S^.Args[1]^.Typ, 0));
+    EmitExpr(S^.Args[2]);
+    Line('  movq %rax, %rcx');
+    Line('  popq %rdi');
+    Line('  popq %rsi');
+    Line('  call rt_memcpy');
+  end;
+end;
+
+{ FillChar(x, n, v): a constant count up to 128 in line (P304), else 32
+  bytes a store by rt_fill on arm64 (P272) and rep stosb on amd64, past
+  256 KiB a piece at a time, the routine able to stop between two
+  (P271). }
+procedure TEmitter.EmitFillStmt(S: PStmt);
+var
+  a, b: string;
+begin
+  if EmitSmallFill(S) then
+    Exit;
+  if FArm then
+  begin
+    if not EmitFillArgs(S) then
+    begin
+      EmitExpr(S^.Args[0]);
+      PshK('x0', VCls(S^.Args[0]^.Typ, 0));
+      EmitExpr(S^.Args[1]);
+      PshK('x0', 0);
+      EmitExpr(S^.Args[2]);
+      Line('  mov x2, x0');
+      Ppop('x1');
+      Ppop('x0');
+    end;
+    a := Lab;
+    b := Lab;
+    Line('  cmp x1, #0');
+    Line('  b.le ' + b);
+    Line('  cmp x1, #64, lsl #12');
+    ColdBegin('  b.hi');
+    Line('  bl rt_fillbig');
+    Line('  b ' + b);
+    ColdEnd;
+    Line(a + ':');
+    Line('  bl rt_fill');
+    Line(b + ':');
+    Exit;
+  end;
+  if not EmitFillArgs(S) then
+  begin
+    EmitExpr(S^.Args[0]);
+    PushK('rax', VCls(S^.Args[0]^.Typ, 0));
+    EmitExpr(S^.Args[1]);
+    PushK('rax', 0);
+    EmitExpr(S^.Args[2]);
+    Line('  popq %rcx');
+    Line('  popq %rdi');
+  end;
+  a := Lab;
+  b := Lab;
+  Line('  testq %rcx, %rcx');
+  Line('  jle ' + a);
+  Line('  cmpq $262144, %rcx');
+  ColdBegin('  ja');
+  Line('  call rt_fillbig');
+  Line('  jmp ' + a);
+  ColdEnd;
+  Line(b + ':');
+  Line('  rep stosb');
+  Line(a + ':');
+end;
+
+{ ---- A block assigned (P370) ----
+
+  A block's value is its address, 0 for a zero one (P80, Default and a
+  closed channel's receive), so StoreTo tested the address and called
+  rt_memcpy or ran rep stosb, for every size: b := a of 40 bytes was a
+  push, a pop, a test, a branch and a call, and a block read through a
+  nil pointer, whose address is 0, was taken for a zero one and gave
+  zeros where a word's read stops. A block assigned from a place, or
+  from a routine's block result (a buffer, P153, P366), is Move's copy
+  of its size now, P304's loads and stores in line up to 128 bytes, the
+  places' own operands when they are fixed, and rt_memcpy past them;
+  Default(T) is FillChar's zero; a read through nil stops at its load, in
+  line, with the line's number. Go copies and zeroes a known size so
+  (ssa/_gen/AMD64.rules Move and Zero, ARM64.rules). A block that holds
+  strings marks them shared after the copy, as before (1.0.82). }
+
+{ E is a place a block lies in: a variable, a field of a record in such
+  a place or of an object, an element of a static array in such a place
+  or of a dynamic one, what a pointer points to. Its address is never
+  taken for a zero value. }
+function TEmitter.BlockPlace(E: PExpr): Boolean;
+begin
+  Result := False;
+  if E = nil then
+    Exit;
+  case E^.Kind of
+    ekVar, ekDeref:
+      Result := True;
+    ekField:
+      Result := (E^.L <> nil) and ((TKind(E^.L^.Typ) = tykClass) or
+        ((TKind(E^.L^.Typ) = tykRecord) and BlockPlace(E^.L)));
+    ekIndex:
+      Result := (E^.L <> nil) and (TKind(E^.L^.Typ) = tykArray) and
+        (IsDyn(E^.L^.Typ) or BlockPlace(E^.L));
+  end;
+end;
+
+{ N zero bytes, 129 to 256, into a fixed place (FixedAddr): 16-byte
+  stores of one zeroed register in line, as Go zeroes under 192 bytes
+  (AMD64.rules and ARM64.rules, LoweredZero), where FillChar's path ran
+  rep stosb or called rt_fill. A copy past 128 bytes stays rt_memcpy's:
+  two fields of one type in two variants of a record may lie in part
+  over each other, and P304's moves load every word before they store
+  one only up to 128. }
+procedure TEmitter.FixedZero(const Dsy: TSym; Dk: Int64; N: LongInt);
+var
+  off, sz: TInt64Arr;
+  i: SizeInt;
+begin
+  SmallChunks(N, off, sz);
+  if FArm then
+  begin
+    FixedTo(Dsy, Dk, 'x11');
+    Line('  movi v0.2d, #0');
+    for i := 0 to High(off) do
+      Line('  str q0, [x11, #' + IntToStr(off[i]) + ']');
+    Exit;
+  end;
+  if HasFeat(CpuFeatBit('avx', False)) then
+  begin
+    Line('  vpxor %xmm0, %xmm0, %xmm0');
+    for i := 0 to High(off) do
+      Line('  vmovdqu %xmm0, ' + FixedOp(Dsy, Dk + off[i]));
+  end
+  else
+  begin
+    Line('  pxor %xmm0, %xmm0');
+    for i := 0 to High(off) do
+      Line('  movdqu %xmm0, ' + FixedOp(Dsy, Dk + off[i]));
+  end;
+end;
+
+{ S is a block assignment BlockAssign writes in line with no call: up to
+  128 bytes, from a place or Default, no string to mark, the places'
+  addresses worked out without one (PromoExprOK). P304's moves take rax,
+  rcx, rsi, rdi and xmm0 to xmm7, x10 to x13 and q0 to q7 on arm64, none
+  of which a region gives a variable (r8 to r11, rbx, r12, r13 and r15;
+  x19 on), so a loop that copies a record keeps its variables in
+  registers, as Go's keeps them across a Move. }
+function TEmitter.PromoBlockOK(S: PStmt): Boolean;
+begin
+  Result := False;
+  if (S^.Dest = nil) or (S^.E = nil) or (not IsBlob(S^.Dest^.Typ)) or
+    (S^.E^.Typ <> S^.Dest^.Typ) or (TSize(S^.Dest^.Typ) > 128) or
+    (StrMap(S^.Dest^.Typ) <> '') or (not BlockPlace(S^.Dest)) or (not PromoExprOK(S^.Dest)) then
+    Exit;
+  if (S^.E^.Kind = ekCall) and (S^.E^.Name = 'rt_default') then
+    Result := True
+  else
+    Result := BlockPlace(S^.E) and PromoExprOK(S^.E);
+end;
+
+function TEmitter.BlockAssign(S: PStmt): Boolean;
+var
+  mv: PStmt;
+  n: LongInt;
+  smap: string;
+  dsy, ssy: TSym;
+  dk, sk: Int64;
+  src: Boolean;
+begin
+  Result := False;
+  if (S^.Dest = nil) or (S^.E = nil) or (not IsBlob(S^.Dest^.Typ)) or
+    (S^.E^.Typ <> S^.Dest^.Typ) or (not BlockPlace(S^.Dest)) then
+    Exit;
+  n := TSize(S^.Dest^.Typ);
+  New(mv);
+  mv^ := Default(TStmt);
+  mv^.Kind := skCall;
+  mv^.Line := S^.Line;
+  SetLength(mv^.Args, 3);
+  if (S^.E^.Kind = ekCall) and (S^.E^.Name = 'rt_default') then
+  begin
+    mv^.Name := 'rt_fillchar';
+    mv^.Args[0] := NewAddr(S^.Dest);
+    mv^.Args[1] := NewInt(n);
+    mv^.Args[2] := NewInt(0);
+    Result := True;
+    if (n > 128) and (n <= 256) and FixedAddr(mv^.Args[0], dsy, dk) then
+    begin
+      FixedZero(dsy, dk, n);
+      Exit;
+    end;
+    if (n <= 128) or FixedAddr(mv^.Args[0], dsy, dk) then
+    begin
+      EmitFillStmt(mv);
+      Exit;
+    end;
+    { a place reached through nil stops at its first byte, here, with the
+      statement's line, not in rt_fill }
+    EmitExpr(mv^.Args[0]);
+    if FArm then
+    begin
+      Line('  ldrb w9, [x0]');
+      Imm('x1', n);
+      Line('  mov w2, wzr');
+      if n > 262144 then
+        Line('  bl rt_fillbig')
+      else
+        Line('  bl rt_fill');
+    end
+    else
+    begin
+      Line('  movq %rax, %rdi');
+      Line('  movzbl (%rdi), %eax');
+      Line('  xorl %eax, %eax');
+      Line('  movl $' + IntToStr(n) + ', %ecx');
+      if n > 262144 then
+        Line('  call rt_fillbig')
+      else
+        Line('  rep stosb');
+    end;
+    Exit;
+  end;
+  { a routine's block result: its buffer's address, never 0 }
+  src := BlockPlace(S^.E) or
+    ((S^.E^.Kind = ekCall) and (BlobRet(S^.E^.Name) = S^.E^.Typ)) or
+    ((S^.E^.Kind = ekMethod) and (S^.E^.Name <> '') and (S^.E^.Off <> -3) and
+    (S^.E^.Off <> -4) and (S^.E^.L <> nil) and (TKind(S^.E^.L^.Typ) <> tykInterface) and
+    (BlobRet(S^.E^.Name) = S^.E^.Typ));
+  if not src then
+    Exit;
+  Result := True;
+  mv^.Name := 'rt_move';
+  mv^.Args[0] := NewAddr(S^.E);
+  mv^.Args[0]^.Num := 1;
+  mv^.Args[1] := NewAddr(S^.Dest);
+  mv^.Args[2] := NewInt(n);
+  smap := StrMap(S^.Dest^.Typ);
+  if n <= 128 then
+  begin
+    EmitSmallMove(mv);
+    if smap = '' then
+      Exit;
+    { the copy's strings are the source's too (1.0.82): the destination's
+      address is where P304's moves left it, x11 or rdi, or a fixed
+      place's }
+    if FArm then
+    begin
+      if FixedAddr(mv^.Args[1], dsy, dk) then
+        FixedTo(dsy, dk, 'x0')
+      else
+        Line('  mov x0, x11');
+      LeaS(smap, 'x1');
+      Line('  bl rt_strshare');
+    end
+    else
+    begin
+      if FixedAddr(mv^.Args[1], dsy, dk) then
+        FixedTo(dsy, dk, 'rdi');
+      Line('  leaq ' + smap + '(%rip), %rsi');
+      Line('  call rt_strshare');
+    end;
+    Exit;
+  end;
+  if (smap = '') and FixedAddr(mv^.Args[0], ssy, sk) and FixedAddr(mv^.Args[1], dsy, dk) then
+  begin
+    EmitMoveArgs(mv);
+    Exit;
+  end;
+  { rt_memcpy, the places reached through nil stopping at their first
+    bytes, here, with the statement's line }
+  EmitExpr(mv^.Args[0]);
+  if FArm then
+  begin
+    PshK('x0', VCls(mv^.Args[0]^.Typ, 0));
+    EmitExpr(mv^.Args[1]);
+    Ppop('x1');
+    Line('  ldrb w9, [x1]');
+    Line('  ldrb w9, [x0]');
+    Imm('x2', n);
+    if smap <> '' then
+      PshK('x0', 0);
+    Line('  bl rt_memcpy');
+    if smap <> '' then
+    begin
+      Ppop('x0');
+      LeaS(smap, 'x1');
+      Line('  bl rt_strshare');
+    end;
+  end
+  else
+  begin
+    PushK('rax', VCls(mv^.Args[0]^.Typ, 0));
+    EmitExpr(mv^.Args[1]);
+    Line('  movq %rax, %rdi');
+    Line('  popq %rsi');
+    Line('  movzbl (%rsi), %eax');
+    Line('  movzbl (%rdi), %eax');
+    Line('  movl $' + IntToStr(n) + ', %ecx');
+    if smap <> '' then
+      PushK('rdi', 0);
+    Line('  call rt_memcpy');
+    if smap <> '' then
+    begin
+      Line('  popq %rdi');
+      Line('  leaq ' + smap + '(%rip), %rsi');
+      Line('  call rt_strshare');
+    end;
   end;
 end;
 
@@ -26161,6 +26502,7 @@ begin
           if not OrdAssign(S) then
           if not EmitStrAppend(S) then
           if not ResDestAssign(S) then
+          if not BlockAssign(S) then
           if (S^.Dest <> nil) and (S^.E <> nil) and
             (TKind(S^.Dest^.Typ) = tykInterface) and
             (TKind(S^.E^.Typ) = tykClass) then
@@ -26231,53 +26573,9 @@ begin
           Line('  bl rt_setlength');
         end
         else if S^.Name = 'rt_move' then
-        begin
-          { a constant count up to 128 in line, fixed places with no
-            push (P304) }
-          if (not EmitSmallMove(S)) and (not EmitMoveArgs(S)) then
-          begin
-          EmitExpr(S^.Args[0]);
-          PshK('x0', VCls(S^.Args[0]^.Typ, 0));
-          EmitExpr(S^.Args[1]);
-          PshK('x0', VCls(S^.Args[1]^.Typ, 0));
-          EmitExpr(S^.Args[2]);
-          Line('  mov x2, x0');
-          Ppop('x0');
-          Ppop('x1');
-          Line('  bl rt_memcpy');
-          end;
-        end
+          EmitMoveStmt(S)
         else if S^.Name = 'rt_fillchar' then
-        begin
-          if not EmitSmallFill(S) then
-          begin
-          if not EmitFillArgs(S) then
-          begin
-          EmitExpr(S^.Args[0]);
-          PshK('x0', VCls(S^.Args[0]^.Typ, 0));
-          EmitExpr(S^.Args[1]);
-          PshK('x0', 0);
-          EmitExpr(S^.Args[2]);
-          Line('  mov x2, x0');
-          Ppop('x1');
-          Ppop('x0');
-          end;
-          a := Lab;
-          b := Lab;
-          Line('  cmp x1, #0');
-          Line('  b.le ' + b);
-          { 32 bytes a store by rt_fill (P272); past 256 KiB a piece at a
-            time, the routine able to stop between two (P271) }
-          Line('  cmp x1, #64, lsl #12');
-          ColdBegin('  b.hi');
-          Line('  bl rt_fillbig');
-          Line('  b ' + b);
-          ColdEnd;
-          Line(a + ':');
-          Line('  bl rt_fill');
-          Line(b + ':');
-          end;
-        end
+          EmitFillStmt(S)
         else
           EmitCall(S^.Name, S^.Args);
       skSend:
@@ -26929,6 +27227,7 @@ begin
         if not OrdAssign(S) then
         if not EmitStrAppend(S) then
         if not ResDestAssign(S) then
+        if not BlockAssign(S) then
         if (S^.Dest <> nil) and (S^.E <> nil) and
           (TKind(S^.Dest^.Typ) = tykInterface) and
           (TKind(S^.E^.Typ) = tykClass) then
@@ -27072,52 +27371,9 @@ begin
         Line('  call rt_setlength');
       end
       else if S^.Name = 'rt_move' then
-      begin
-        { a constant count up to 128 in line, fixed places with no push
-          (P304) }
-        if (not EmitSmallMove(S)) and (not EmitMoveArgs(S)) then
-        begin
-        EmitExpr(S^.Args[0]);
-        PushK('rax', VCls(S^.Args[0]^.Typ, 0));
-        EmitExpr(S^.Args[1]);
-        PushK('rax', VCls(S^.Args[1]^.Typ, 0));
-        EmitExpr(S^.Args[2]);
-        Line('  movq %rax, %rcx');
-        Line('  popq %rdi');
-        Line('  popq %rsi');
-        Line('  call rt_memcpy');
-        end;
-      end
+        EmitMoveStmt(S)
       else if S^.Name = 'rt_fillchar' then
-      begin
-        if not EmitSmallFill(S) then
-        begin
-        if not EmitFillArgs(S) then
-        begin
-        EmitExpr(S^.Args[0]);
-        PushK('rax', VCls(S^.Args[0]^.Typ, 0));
-        EmitExpr(S^.Args[1]);
-        PushK('rax', 0);
-        EmitExpr(S^.Args[2]);
-        Line('  popq %rcx');
-        Line('  popq %rdi');
-        end;
-        a := Lab;
-        b := Lab;
-        Line('  testq %rcx, %rcx');
-        Line('  jle ' + a);
-        { past 256 KiB a piece at a time, the routine able to stop
-          between two (P271) }
-        Line('  cmpq $262144, %rcx');
-        ColdBegin('  ja');
-        Line('  call rt_fillbig');
-        Line('  jmp ' + a);
-        ColdEnd;
-        Line(b + ':');
-        Line('  rep stosb');
-        Line(a + ':');
-        end;
-      end
+        EmitFillStmt(S)
       else if S^.Name = 'rt_dumplocs' then
         EmitDumpLocals
       else
@@ -28267,6 +28523,12 @@ begin
           Exit;
         end;
         if VecCopy(S) then
+        begin
+          Result := True;
+          Exit;
+        end;
+        { a block copied or zeroed in line (P370) }
+        if PromoBlockOK(S) then
         begin
           Result := True;
           Exit;
