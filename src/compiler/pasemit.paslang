@@ -287,6 +287,20 @@ type
     FResOff: LongInt;
     FHasRes: Boolean;
     FResTyp: LongInt;
+    FResBuf: LongInt;      { P153: the frame slot of the buffer the caller gave a routine whose result is a block, 0 none }
+    FBlobSyms: TStrArray;  { P153: the routines and methods whose result is a block, sorted, and the block's type }
+    FBlobTyps: array of LongInt;
+    FCallE: PExpr;         { P153: the call expression EmitCall or EmitArmMeth works out, nil for a statement's }
+    FIfaceRes: LongInt;    { P153: the block an interface's call through EmitArmMeth returns, -1 none }
+    FResDest: PExpr;       { P153: the call whose buffer is the assignment's destination, FResDestSym }
+    FResDestSym: TSym;
+    FResDestUsed: Boolean;
+    FBufOff: LongInt;      { P153: the scratch buffer the call being written fills, of type FBufTyp, -1 none }
+    FBufTyp: LongInt;
+    FTopBufE: PExpr;       { P153: the call whose scratch buffer is the statement's last, FTopBufSz bytes, FScratchCur and FScrOff's length after it }
+    FTopBufSz: LongInt;
+    FTopBufCur: LongInt;
+    FTopBufN: SizeInt;
     FNest: LongInt;
     FBoxSlot: LongInt;
     FObjReady: Boolean;  { EmitArmMeth: an interface's code and Self in x0, x2 (1.0.135) }  { the frame slot of the routine's box, 0 when it has none (1.0.134) }
@@ -543,6 +557,15 @@ type
     function IsFat(Id: LongInt): Boolean;
     function GlobAlign(Id: LongInt): LongInt;
     function IsBlob(Id: LongInt): Boolean;
+    procedure BlobTable(const Prog: TProgram);
+    function BlobRet(const Sym: string): LongInt;
+    function SigRes(T: LongInt): LongInt;
+    function IfaceRes(T, Slot: LongInt): LongInt;
+    procedure ResBuf(T: LongInt; E: PExpr);
+    function ResDestAssign(S: PStmt): Boolean;
+    procedure ResCopy;
+    procedure BufTyped;
+    procedure BufFree(E: PExpr);
     function Scratch(Sz: LongInt): LongInt;
     function ScratchT(Sz, Typ: LongInt): LongInt;
     procedure ShareStr;
@@ -2292,6 +2315,8 @@ begin
   FMapSites[n].Da := FCurDa;
   AppendLine(gl + ':');
   NoteLine(gl + ':');
+  if FBufTyp >= 0 then
+    BufTyped;
 end;
 
 procedure TEmitter.MapLoc(Off: LongInt; K: Byte);
@@ -2357,6 +2382,9 @@ begin
           MapLoc(FSym[i].Off + 8 * LongInt(j), k);
       end;
     end;
+  { the caller's buffer, an address (P153) }
+  if FResBuf <> 0 then
+    MapLoc(FResBuf, 1);
 end;
 
 { A descriptor's label, one per distinct descriptor of the object file. }
@@ -4218,6 +4246,414 @@ function TEmitter.IsWSet(Id: LongInt): Boolean;
 begin
   Result := (TKind(Id) = tykSet) and (Id >= 0) and (Id <= High(FTypes)) and
     (FTypes[Id].Size = 32);
+end;
+
+{ P153: a routine whose result is a block (IsBlob: a record, a static
+  array, a set of 32 bytes) writes it where its caller says. The caller
+  gives the address of a place of its own, as Go gives a result that
+  does not fit in registers a slot in the caller's frame, left
+  uninitialized at the call (cmd/compile/abi-internal.md, Function call
+  argument and result passing), in rax on amd64, which no argument
+  takes (the psABI passes it in rdi, as a first argument, and returns
+  it in rax: x86-64-psABI-1.0 3.2.3, Returning of Values), and in x8 on
+  arm64, as AAPCS64 does (aapcs64-2025Q4 6.1.1, the indirect result
+  location register, and 6.9: the caller reserves the block). Every
+  call of such a routine gives one, so the emitter knows them all by
+  symbol: Prog.Procs (a unit's routine imported among them) and every
+  type's methods; a routine value's, a method value's and an
+  interface's by their type (SigRes, IfaceRes). Before, every call's
+  epilogue took a block from rt_alloc and copied Result into it, and
+  the caller copied it again. }
+procedure TEmitter.BlobTable(const Prog: TProgram);
+var
+  i, j, n: SizeInt;
+  sy: string;
+  t: LongInt;
+begin
+  FBlobSyms := nil;
+  FBlobTyps := nil;
+  n := 0;
+  for i := 0 to High(Prog.Procs) do
+    if Prog.Procs[i].IsFunc and (not Prog.Procs[i].IsCtor) and
+      (Prog.Procs[i].Sym <> '') and IsBlob(Prog.Procs[i].RetTyp) then
+    begin
+      SetLength(FBlobSyms, n + 1);
+      SetLength(FBlobTyps, n + 1);
+      FBlobSyms[n] := Prog.Procs[i].Sym;
+      FBlobTyps[n] := Prog.Procs[i].RetTyp;
+      Inc(n);
+    end;
+  for i := 0 to High(FTypes) do
+    for j := 0 to High(FTypes[i].Meths) do
+      if FTypes[i].Meths[j].IsFunc and (not FTypes[i].Meths[j].IsCtor) and
+        (FTypes[i].Meths[j].Sym <> '') and IsBlob(FTypes[i].Meths[j].RetTyp) then
+      begin
+        SetLength(FBlobSyms, n + 1);
+        SetLength(FBlobTyps, n + 1);
+        FBlobSyms[n] := FTypes[i].Meths[j].Sym;
+        FBlobTyps[n] := FTypes[i].Meths[j].RetTyp;
+        Inc(n);
+      end
+      { a record's constructor through the type calls its maker (P165),
+        a routine of the record's unit, which an importer's Procs lack;
+        the record's methods are its helper's (kind 24, Elem the record) }
+      else if FTypes[i].Meths[j].IsCtor and (FTypes[i].Meths[j].Sym <> '') and
+        ((TKind(i) = tykRecord) or ((TKind(i) = tykHelper) and
+        (TKind(FTypes[i].Elem) = tykRecord))) then
+      begin
+        SetLength(FBlobSyms, n + 1);
+        SetLength(FBlobTyps, n + 1);
+        FBlobSyms[n] := FTypes[i].Meths[j].Sym + '.new';
+        if TKind(i) = tykHelper then
+          FBlobTyps[n] := FTypes[i].Elem
+        else
+          FBlobTyps[n] := i;
+        Inc(n);
+      end;
+  { in order, for BlobRet's halving }
+  for i := 1 to n - 1 do
+  begin
+    sy := FBlobSyms[i];
+    t := FBlobTyps[i];
+    j := i - 1;
+    while (j >= 0) and (FBlobSyms[j] > sy) do
+    begin
+      FBlobSyms[j + 1] := FBlobSyms[j];
+      FBlobTyps[j + 1] := FBlobTyps[j];
+      Dec(j);
+    end;
+    FBlobSyms[j + 1] := sy;
+    FBlobTyps[j + 1] := t;
+  end;
+end;
+
+{ The block routine Sym returns (P153), -1 when it returns none. }
+function TEmitter.BlobRet(const Sym: string): LongInt;
+var
+  lo, hi, m: SizeInt;
+begin
+  Result := -1;
+  lo := 0;
+  hi := High(FBlobSyms);
+  while lo <= hi do
+  begin
+    m := (lo + hi) div 2;
+    if FBlobSyms[m] = Sym then
+    begin
+      Result := FBlobTyps[m];
+      Exit;
+    end;
+    if FBlobSyms[m] < Sym then
+      lo := m + 1
+    else
+      hi := m - 1;
+  end;
+end;
+
+{ The block a value of routine or method type T returns (P153), -1 when
+  it returns none. }
+function TEmitter.SigRes(T: LongInt): LongInt;
+begin
+  Result := -1;
+  if ((TKind(T) = tykProc) or (TKind(T) = tykMethod)) and
+    (Length(FTypes[T].Meths) > 0) and FTypes[T].Meths[0].IsFunc and
+    IsBlob(FTypes[T].Meths[0].RetTyp) then
+    Result := FTypes[T].Meths[0].RetTyp;
+end;
+
+{ The block the method in slot Slot of interface T returns (P153), -1
+  when it returns none; a parent's method is found in the parent. }
+function TEmitter.IfaceRes(T, Slot: LongInt): LongInt;
+var
+  j: SizeInt;
+  k: LongInt;
+begin
+  Result := -1;
+  k := 0;
+  while (TKind(T) = tykInterface) and (k < 64) do
+  begin
+    for j := 0 to High(FTypes[T].Meths) do
+      if FTypes[T].Meths[j].Slot = Slot then
+      begin
+        if FTypes[T].Meths[j].IsFunc and IsBlob(FTypes[T].Meths[j].RetTyp) then
+          Result := FTypes[T].Meths[j].RetTyp;
+        Exit;
+      end;
+    T := FTypes[T].Parent;
+    Inc(k);
+  end;
+end;
+
+{ The buffer of a call whose result is a block of type T (P153), its
+  address into rax or x8 right before the call instruction: the
+  assignment's destination when E is the call ResDestAssign named, else
+  a scratch slot of the statement. Its words are not read at that call
+  (class 0): the callee keeps the value in its Result, typed, until it
+  copies it at its end with no call after, and what the slot held before
+  is nobody's; from the call's return on they hold the value, of its
+  type's classes (BufTyped, at the call's map site). Only rax or x8 is
+  written, so a call through r11, x9 or x16 keeps its code. Nothing for
+  a T of -1. }
+procedure TEmitter.ResBuf(T: LongInt; E: PExpr);
+var
+  off: LongInt;
+begin
+  if T < 0 then
+    Exit;
+  if (E <> nil) and (E = FResDest) then
+  begin
+    FResDestUsed := True;
+    if FArm and FResDestSym.Global then
+      LeaS(VarLabel(FResDestSym.Name), 'x8')
+    else if FArm then
+      AddImmArmT('x8', 'x29', FResDestSym.Off, 'x8')
+    else
+      Line('  leaq ' + FixedOp(FResDestSym, 0) + ', %rax');
+    Exit;
+  end;
+  if FMapOn then
+    FScrHint := 0;
+  off := Scratch(TSize(T));
+  if FMapOn then
+  begin
+    FBufOff := off;
+    FBufTyp := T;
+  end;
+  FTopBufE := E;
+  FTopBufSz := Align8(TSize(T));
+  if FTopBufSz < 8 then
+    FTopBufSz := 8;
+  FTopBufCur := FScratchCur;
+  FTopBufN := Length(FScrOff);
+  if FArm then
+    AddImmArmT('x8', 'x29', off, 'x8')
+  else
+    Line('  leaq ' + IntToStr(off) + '(%rbp), %rax');
+end;
+
+{ E, a word or a fat value read from a field (a field's field...) of the
+  block the call FTopBufE returned, is loaded (P153): that call's buffer,
+  the statement's last scratch slot still, is nobody's now, and the next
+  call's takes its place. TypeOf(a).Kind = TypeOf(b).Kind took two
+  buffers of 272 bytes, and ParseStmtIn0's frame grew by 2 KB. }
+procedure TEmitter.BufFree(E: PExpr);
+var
+  r: PExpr;
+begin
+  r := E;
+  while (r <> nil) and (r^.Kind = ekField) do
+    r := r^.L;
+  if (r = nil) or (r <> FTopBufE) or (FScratchCur <> FTopBufCur) or
+    (Length(FScrOff) <> FTopBufN) then
+    Exit;
+  FScratchCur := FScratchCur - FTopBufSz;
+  SetLength(FScrOff, FTopBufN - FTopBufSz div 8);
+  SetLength(FScrK, FTopBufN - FTopBufSz div 8);
+  FTopBufE := nil;
+end;
+
+{ The call that fills the scratch buffer at FBufOff has its map site: the
+  buffer's words take the classes of its type FBufTyp for the sites after
+  it, a pointer's word 1, as a typed scratch slot's (P153). }
+procedure TEmitter.BufTyped;
+var
+  bits: TGcBits;
+  i: SizeInt;
+  j: LongInt;
+begin
+  bits := nil;
+  GcMark(FBufTyp, 0, bits, 0);
+  for i := 0 to High(FScrOff) do
+    if (FScrOff[i] >= FBufOff) and (FScrOff[i] < FBufOff + Align8(TSize(FBufTyp))) then
+    begin
+      j := (FScrOff[i] - FBufOff) div 8;
+      if (j < Length(bits)) and bits[j] then
+        FScrK[i] := 1
+      else
+        FScrK[i] := 0;
+    end;
+  FBufTyp := -1;
+end;
+
+{ r := F(...), r a variable of this frame that is no parameter, Result
+  or a global, F a routine or a method whose result is r's type (P153):
+  r's address is F's buffer, so F's epilogue writes r and nothing
+  copies it after. F writes there only at its end, after everything it
+  reads, r too, is read, and r's address stays where it is while F runs
+  (a frame's moves with its stack, and the slot that keeps it in F's
+  frame moves with it, class 1); an element or a field of something F
+  may reallocate keeps the copy. The psABI forbids the buffer to overlap
+  what the callee sees by another name (3.2.3), as its callee writes the
+  result as it goes; paslang's writes it once, at its end. False,
+  nothing written, for any other assignment. }
+function TEmitter.ResDestAssign(S: PStmt): Boolean;
+var
+  sy, svs: TSym;
+  t: LongInt;
+  sv: PExpr;
+  svu, used: Boolean;
+begin
+  Result := False;
+  if (S^.Dest = nil) or (S^.E = nil) or (S^.Dest^.Kind <> ekVar) or
+    not IsBlob(S^.Dest^.Typ) then
+    Exit;
+  t := -1;
+  if S^.E^.Kind = ekCall then
+    t := BlobRet(S^.E^.Name)
+  else if (S^.E^.Kind = ekMethod) and (S^.E^.Name <> '') and (S^.E^.Off <> -3) and
+    (S^.E^.Off <> -4) and (S^.E^.L <> nil) and (TKind(S^.E^.L^.Typ) <> tykInterface) then
+    t := BlobRet(S^.E^.Name);
+  if (t < 0) or (t <> S^.Dest^.Typ) then
+    Exit;
+  if (not TryFindSym(S^.Dest^.Name, sy)) or sy.ByRef or (sy.Up <> 0) or sy.Boxed or
+    (sy.Reg <> '') then
+    Exit;
+  sv := FResDest;
+  svs := FResDestSym;
+  svu := FResDestUsed;
+  FResDest := S^.E;
+  FResDestSym := sy;
+  FResDestUsed := False;
+  EmitExpr(S^.E);
+  used := FResDestUsed;
+  FResDest := sv;
+  FResDestSym := svs;
+  FResDestUsed := svu;
+  { a call worked out another way (put in place) took no buffer of r }
+  if not used then
+  begin
+    FStoreSrc := S^.E;
+    StoreTo(S^.Dest);
+    FStoreSrc := nil;
+  end;
+  Result := True;
+end;
+
+{ The epilogue of a routine whose result is a block (P153): Result into
+  the caller's buffer, whose address the frame keeps at FResBuf, and
+  that address back in rax or x0; up to 128 bytes by P304's moves
+  (SmallChunks), from 16 bytes a vector register at a time, more by
+  rt_memcpy. A buffer of 0 is a spawned routine's (rt_gstart), whose
+  result nobody reads: nothing is copied. }
+procedure TEmitter.ResCopy;
+var
+  n, bo: LongInt;
+  i: SizeInt;
+  off, sz: TInt64Arr;
+  done, so, dop, r, b: string;
+  avx: Boolean;
+begin
+  n := TSize(FResTyp);
+  done := Lab;
+  if FArm then
+  begin
+    LdFP('x0', FResBuf);
+    Line('  cbz x0, ' + done);
+    if n > 128 then
+    begin
+      AddFP('x1', FResOff);
+      Imm('x2', n);
+      Line('  bl rt_memcpy');
+      LdFP('x0', FResBuf);
+    end
+    else
+    begin
+      SmallChunks(n, off, sz);
+      { from x29 when every byte is within LDUR's reach (ARM DDI 0487
+        M.c C6.2.259, -256 to 255), else from x16 }
+      if (FResOff >= -256) and (FResOff + n <= 256) then
+      begin
+        b := 'x29';
+        bo := FResOff;
+      end
+      else
+      begin
+        AddFP('x16', FResOff);
+        b := 'x16';
+        bo := 0;
+      end;
+      for i := 0 to High(off) do
+      begin
+        if sz[i] = 16 then
+          r := 'q0'
+        else if sz[i] = 8 then
+          r := 'x9'
+        else
+          r := 'w9';
+        so := '[' + b + ', #' + IntToStr(bo + off[i]) + ']';
+        dop := '[x0, #' + IntToStr(off[i]) + ']';
+        if sz[i] = 1 then
+        begin
+          Line('  ldrb ' + r + ', ' + so);
+          Line('  strb ' + r + ', ' + dop);
+        end
+        else if sz[i] = 2 then
+        begin
+          Line('  ldrh ' + r + ', ' + so);
+          Line('  strh ' + r + ', ' + dop);
+        end
+        else
+        begin
+          Line('  ldr ' + r + ', ' + so);
+          Line('  str ' + r + ', ' + dop);
+        end;
+      end;
+    end;
+    Line(done + ':');
+    Exit;
+  end;
+  Line('  movq ' + IntToStr(FResBuf) + '(%rbp), %rax');
+  Line('  testq %rax, %rax');
+  Line('  jz ' + done);
+  if n > 128 then
+  begin
+    Line('  movq %rax, %rdi');
+    Line('  leaq ' + IntToStr(FResOff) + '(%rbp), %rsi');
+    Line('  movq $' + IntToStr(n) + ', %rcx');
+    Line('  call rt_memcpy');
+    Line('  movq ' + IntToStr(FResBuf) + '(%rbp), %rax');
+  end
+  else
+  begin
+    SmallChunks(n, off, sz);
+    avx := HasFeat(CpuFeatBit('avx', False));
+    for i := 0 to High(off) do
+    begin
+      so := IntToStr(FResOff + off[i]) + '(%rbp)';
+      dop := IntToStr(off[i]) + '(%rax)';
+      if (sz[i] = 16) and avx then
+      begin
+        Line('  vmovdqu ' + so + ', %xmm0');
+        Line('  vmovdqu %xmm0, ' + dop);
+      end
+      else if sz[i] = 16 then
+      begin
+        Line('  movdqu ' + so + ', %xmm0');
+        Line('  movdqu %xmm0, ' + dop);
+      end
+      else if sz[i] = 1 then
+      begin
+        Line('  movzbl ' + so + ', %ecx');
+        Line('  movb %cl, ' + dop);
+      end
+      else if sz[i] = 2 then
+      begin
+        Line('  movzwl ' + so + ', %ecx');
+        Line('  movw %cx, ' + dop);
+      end
+      else if sz[i] = 4 then
+      begin
+        Line('  movl ' + so + ', %ecx');
+        Line('  movl %ecx, ' + dop);
+      end
+      else
+      begin
+        Line('  movq ' + so + ', %rcx');
+        Line('  movq %rcx, ' + dop);
+      end;
+    end;
+  end;
+  Line(done + ':');
 end;
 
 { Scratch slots for temporaries live below the locals and grow down;
@@ -14225,7 +14661,14 @@ var
   kinds: array of Byte;
   top: SizeInt;
   held: TStrArray;
+  ce: PExpr;
+  rt: LongInt;
 begin
+  { the expression's call, when it is one, and the block it returns
+    (P153) }
+  ce := FCallE;
+  FCallE := nil;
+  rt := BlobRet(Name);
   te := NewCall(Name, Args, TyNone);
   if EmitTreeCall(te) then
     Exit;
@@ -14380,6 +14823,7 @@ begin
       SpAdjArm('add', kd * 16);
     end;
     EmitLink(ProcNest(Name));
+    ResBuf(rt, ce);
     Line('  bl ' + Name);
     Exit;
   end;
@@ -14479,6 +14923,7 @@ begin
       SpAdjArm('add', n * 16);
     end;
     EmitLink(ProcNest(Name));
+    ResBuf(rt, ce);
     Line('  bl ' + Name);
     if n > nreg then
     begin
@@ -14504,8 +14949,8 @@ begin
       { A record travels by address. A variable, a field, an element or
         what a pointer points at has one; anything else is a value, and
         a record value is already an address (a function that returns a
-        record returns a pointer to a copy of it), so it is passed as
-        it stands. Spilling it like a fat value passed the address of
+        record returns its buffer's, P153), so it is passed as it
+        stands. Spilling it like a fat value passed the address of
         the pointer and the callee read the pointer as its first field
         (P80). }
       if (Args[i]^.Kind = ekVar) or (Args[i]^.Kind = ekField) or
@@ -14546,6 +14991,7 @@ begin
     PutArgs(Args, kd, comp, 0, held);
     ShiftArgs(kd, kd, 0);
     EmitLink(ProcNest(Name));
+    ResBuf(rt, ce);
     Line('  call ' + Name);
     Exit;
   end;
@@ -14555,6 +15001,7 @@ begin
     nreg := n;
   ShiftArgs(n, nreg, 0);
   EmitLink(ProcNest(Name));
+  ResBuf(rt, ce);
   Line('  call ' + Name);
   if n > nreg then
     Line('  addq $' + IntToStr((n - nreg) * 8) + ', %rsp');
@@ -14874,10 +15321,11 @@ end;
   refused rather than passed wrongly. }
 procedure TEmitter.EmitCallVal(Target: PExpr; const Args: TExprArray);
 var
-  i, n, kd, comp: LongInt;
+  i, n, kd, comp, rt: LongInt;
   held: TStrArray;
 begin
   n := Length(Args);
+  rt := SigRes(Target^.Typ);
   if FArm then
   begin
     if n > 8 then
@@ -14892,7 +15340,15 @@ begin
         cmd/compile/abi-internal.md) }
       ValPair(Target, 'x8', 'x27');
       PutArgsKept(Args, comp, 0, held);
-      Line('  blr x8');
+      if rt >= 0 then
+      begin
+        { the code to x16, x8 the buffer (P153) }
+        Line('  mov x16, x8');
+        ResBuf(rt, nil);
+        Line('  blr x16');
+      end
+      else
+        Line('  blr x8');
       Exit;
     end;
     { the code and the environment, which goes in the static link's
@@ -14911,6 +15367,7 @@ begin
     for i := 0 to kd - 1 do
       Line('  ldr ' + ArgR(i) + ', [sp, #' + IntToStr((kd - 1 - i) * 16) + ']');
     SpAdjArm('add', (kd + 2) * 16);
+    ResBuf(rt, nil);
     Line('  blr x9');
   end
   else
@@ -14926,6 +15383,7 @@ begin
         paslang's r10, the static link (cmd/compile/abi-internal.md) }
       ValPair(Target, 'r11', 'r10');
       PutArgsKept(Args, comp, 0, held);
+      ResBuf(rt, nil);
       Line('  call *%r11');
       Exit;
     end;
@@ -14943,6 +15401,7 @@ begin
     Line('  movq ' + IntToStr(kd * 8) + '(%rsp), %r11');
     Line('  movq ' + IntToStr((kd + 1) * 8) + '(%rsp), %r10');
     Line('  addq $' + IntToStr((kd + 2) * 8) + ', %rsp');
+    ResBuf(rt, nil);
     Line('  call *%r11');
   end;
 end;
@@ -15064,10 +15523,21 @@ end;
 procedure TEmitter.EmitArmMeth(Obj: PExpr; const Args: TExprArray;
   Slot: LongInt; const Name: string);
 var
-  i, nuser, ntot, npush, nreg, ns, off, src, kd, comp: LongInt;
+  i, nuser, ntot, npush, nreg, ns, off, src, kd, comp, rt: LongInt;
   direct: Boolean;
   held: TStrArray;
+  ce: PExpr;
 begin
+  { the block the call returns (P153): a method's by its symbol, a
+    method value's by its type, an interface's as EmitIfaceCall says }
+  ce := FCallE;
+  FCallE := nil;
+  rt := FIfaceRes;
+  FIfaceRes := -1;
+  if Name <> '' then
+    rt := BlobRet(Name)
+  else if (Slot = -3) and not FObjReady then
+    rt := SigRes(Obj^.Typ);
   if (Slot < 0) and (Slot <> -3) and (Name = '') then
   begin
     Line('  mov x0, xzr');
@@ -15126,6 +15596,7 @@ begin
   end;
   if direct then
   begin
+    ResBuf(rt, ce);
     if Slot >= 0 then
     begin
       Line('  ldr x16, [x0]');
@@ -15155,7 +15626,14 @@ begin
       PutArgs(Args, 0, comp, 1, held);
       if Works(comp, held) then
         Line('  mov x0, x27');
-      Line('  blr x8');
+      if rt >= 0 then
+      begin
+        Line('  mov x16, x8');
+        ResBuf(rt, ce);
+        Line('  blr x16');
+      end
+      else
+        Line('  blr x8');
       Exit;
     end;
   end;
@@ -15212,6 +15690,7 @@ begin
   begin
     SpAdjArm('add', npush * 16);
   end;
+  ResBuf(rt, ce);
   if Slot = -3 then
     Line('  blr x9')
   else if Slot >= 0 then
@@ -15239,10 +15718,11 @@ end;
   object did not exist). }
 procedure TEmitter.EmitMethVal(Target: PExpr; const Args: TExprArray);
 var
-  i, n, nreg, kd, comp: LongInt;
+  i, n, nreg, kd, comp, rt: LongInt;
   held: TStrArray;
 begin
   n := Length(Args);
+  rt := SigRes(Target^.Typ);
   { the arguments that call nothing straight to their registers (P281) }
   PlanArgs(Args, 5, 1, '', kd, comp, held);
   if kd = 0 then
@@ -15256,10 +15736,12 @@ begin
       ValPair(Target, 'r11', 'r10');
       PutArgsKept(Args, comp, 1, held);
       Line('  movq %r10, %rdi');
+      ResBuf(rt, nil);
       Line('  call *%r11');
       Exit;
     end;
     PutArgs(Args, 0, -1, 1, held);
+    ResBuf(rt, nil);
     Line('  call *%r11');
     Exit;
   end;
@@ -15279,8 +15761,18 @@ begin
     PutArgs(Args, kd, comp, 1, held);
     ShiftArgs(kd, kd, 1);
     Line('  popq %rdi');
-    Line('  popq %rax');
-    Line('  call *%rax');
+    if rt >= 0 then
+    begin
+      { the code through r11, rax the buffer (P153) }
+      Line('  popq %r11');
+      ResBuf(rt, nil);
+      Line('  call *%r11');
+    end
+    else
+    begin
+      Line('  popq %rax');
+      Line('  call *%rax');
+    end;
     Exit;
   end;
   if n > 5 then
@@ -15291,24 +15783,43 @@ begin
   if n > nreg then
   begin
     Line('  movq ' + IntToStr((n - nreg) * 8) + '(%rsp), %rdi');
-    Line('  movq ' + IntToStr((n - nreg + 1) * 8) + '(%rsp), %rax');
-    Line('  call *%rax');
+    if rt >= 0 then
+    begin
+      Line('  movq ' + IntToStr((n - nreg + 1) * 8) + '(%rsp), %r11');
+      ResBuf(rt, nil);
+      Line('  call *%r11');
+    end
+    else
+    begin
+      Line('  movq ' + IntToStr((n - nreg + 1) * 8) + '(%rsp), %rax');
+      Line('  call *%rax');
+    end;
     Line('  addq $' + IntToStr((n - nreg + 2) * 8) + ', %rsp');
   end
   else
   begin
     Line('  popq %rdi');
-    Line('  popq %rax');
-    Line('  call *%rax');
+    if rt >= 0 then
+    begin
+      Line('  popq %r11');
+      ResBuf(rt, nil);
+      Line('  call *%r11');
+    end
+    else
+    begin
+      Line('  popq %rax');
+      Line('  call *%rax');
+    end;
   end;
 end;
 
 procedure TEmitter.EmitIfaceCall(Obj: PExpr; const Args: TExprArray;
   Slot: LongInt);
 var
-  i, n, nreg, kd, comp: LongInt;
+  i, n, nreg, kd, comp, rt: LongInt;
   held: TStrArray;
 begin
+  rt := IfaceRes(Obj^.Typ, Slot);
   { The code from the interface's table and the object as Self, then a
     call as through a method value (1.0.135): every argument by the rules
     of every other call, a string or a record by address, more than five
@@ -15338,7 +15849,14 @@ begin
         PutArgs(Args, 0, comp, 1, held);
         if Works(comp, held) then
           Line('  mov x0, x27');
-        Line('  blr x8');
+        if rt >= 0 then
+        begin
+          Line('  mov x16, x8');
+          ResBuf(rt, nil);
+          Line('  blr x16');
+        end
+        else
+          Line('  blr x8');
         Exit;
       end;
       if not Works(comp, held) then
@@ -15354,6 +15872,7 @@ begin
         PutArgsKept(Args, comp, 1, held);
         Line('  movq %r10, %rdi');
       end;
+      ResBuf(rt, nil);
       Line('  call *%r11');
       Exit;
     end;
@@ -15365,6 +15884,7 @@ begin
     Line('  mov x2, x0');
     Line('  mov x0, x16');
     FObjReady := True;
+    FIfaceRes := rt;
     EmitArmMeth(Obj, Args, -3, '');
     Exit;
   end;
@@ -15384,8 +15904,18 @@ begin
     PutArgs(Args, kd, comp, 1, held);
     ShiftArgs(kd, kd, 1);
     Line('  popq %rdi');
-    Line('  popq %rax');
-    Line('  call *%rax');
+    if rt >= 0 then
+    begin
+      { the code through r11, rax the buffer (P153) }
+      Line('  popq %r11');
+      ResBuf(rt, nil);
+      Line('  call *%r11');
+    end
+    else
+    begin
+      Line('  popq %rax');
+      Line('  call *%rax');
+    end;
     Exit;
   end;
   if n > 5 then
@@ -15396,15 +15926,33 @@ begin
   if n > nreg then
   begin
     Line('  movq ' + IntToStr((n - nreg) * 8) + '(%rsp), %rdi');
-    Line('  movq ' + IntToStr((n - nreg + 1) * 8) + '(%rsp), %rax');
-    Line('  call *%rax');
+    if rt >= 0 then
+    begin
+      Line('  movq ' + IntToStr((n - nreg + 1) * 8) + '(%rsp), %r11');
+      ResBuf(rt, nil);
+      Line('  call *%r11');
+    end
+    else
+    begin
+      Line('  movq ' + IntToStr((n - nreg + 1) * 8) + '(%rsp), %rax');
+      Line('  call *%rax');
+    end;
     Line('  addq $' + IntToStr((n - nreg + 2) * 8) + ', %rsp');
   end
   else
   begin
     Line('  popq %rdi');
-    Line('  popq %rax');
-    Line('  call *%rax');
+    if rt >= 0 then
+    begin
+      Line('  popq %r11');
+      ResBuf(rt, nil);
+      Line('  call *%r11');
+    end
+    else
+    begin
+      Line('  popq %rax');
+      Line('  call *%rax');
+    end;
   end;
 end;
 
@@ -23174,6 +23722,7 @@ begin
             end
             else
               LoadTo('[x0]', LoadTyp(E), 'x0');
+            BufFree(E);
           end;
         end;
       ekMakeChan:
@@ -23317,7 +23866,10 @@ begin
         else if (E^.L <> nil) and (TKind(E^.L^.Typ) = tykInterface) then
           EmitIfaceCall(E^.L, E^.Args, E^.Off)
         else
+        begin
+          FCallE := E;
           EmitArmMeth(E^.L, E^.Args, E^.Off, E^.Name);
+        end;
       ekMethPtr:
         begin
           EmitExpr(E^.L);
@@ -23687,7 +24239,10 @@ else if E^.Name = 'rt_high' then
           Line('  bl rt_paramstr');
         end
         else
+        begin
+          FCallE := E;
           EmitCall(E^.Name, E^.Args);
+        end;
       ekSet:
         begin
           Psh('x19');
@@ -24074,6 +24629,7 @@ else if E^.Name = 'rt_high' then
           end
           else
             LoadTo(AddrOp(''), LoadTyp(E), 'rax');
+          BufFree(E);
         end;
       end;
     ekMakeChan:
@@ -24167,13 +24723,23 @@ else if E^.Name = 'rt_high' then
           begin
             EmitExpr(E^.L);
             Line('  movq %rax, %rdi');
-            if off >= 0 then
+            if (off >= 0) and (BlobRet(a) >= 0) then
+            begin
+              { the table through r11, rax the buffer (P153) }
+              Line('  movq (%rdi), %r11');
+              ResBuf(BlobRet(a), nil);
+              Line('  call *' + IntToStr(off * 8) + '(%r11)');
+            end
+            else if off >= 0 then
             begin
               Line('  movq (%rdi), %rax');
               Line('  call *' + IntToStr(off * 8) + '(%rax)');
             end
             else
+            begin
+              ResBuf(BlobRet(a), nil);
               Line('  call ' + a);
+            end;
           end
           else
           begin
@@ -24188,13 +24754,23 @@ else if E^.Name = 'rt_high' then
               Die('property index');
             ShiftArgs(Length(E^.Args), Length(E^.Args), 1);
             Line('  popq %rdi');
-            if off >= 0 then
+            if (off >= 0) and (BlobRet(a) >= 0) then
+            begin
+              { the table through r11, rax the buffer (P153) }
+              Line('  movq (%rdi), %r11');
+              ResBuf(BlobRet(a), nil);
+              Line('  call *' + IntToStr(off * 8) + '(%r11)');
+            end
+            else if off >= 0 then
             begin
               Line('  movq (%rdi), %rax');
               Line('  call *' + IntToStr(off * 8) + '(%rax)');
             end
             else
+            begin
+              ResBuf(BlobRet(a), nil);
               Line('  call ' + a);
+            end;
           end;
         end
         else
@@ -24230,16 +24806,27 @@ else if E^.Name = 'rt_high' then
         else
         begin
           nreg := MethArgs(E^.L, VCls(E^.L^.Typ, 0), E^.Args);
-          if E^.Off >= 0 then
+          if (E^.Off >= 0) and (BlobRet(E^.Name) >= 0) then
+          begin
+            { the table through r11, rax the buffer (P153) }
+            Line('  movq (%rdi), %r11');
+            ResBuf(BlobRet(E^.Name), E);
+            Line('  call *' + IntToStr(E^.Off * 8) + '(%r11)');
+          end
+          else if E^.Off >= 0 then
           begin
             Line('  movq (%rdi), %rax');
             Line('  call *' + IntToStr(E^.Off * 8) + '(%rax)');
           end
-          else if E^.Off <= ClsSlotBase then
-            { a class method's virtual call (P123): Self is the table }
-            Line('  call *' + IntToStr((ClsSlotBase - E^.Off) * 8) + '(%rdi)')
           else
-            Line('  call ' + E^.Name);
+          begin
+            ResBuf(BlobRet(E^.Name), E);
+            if E^.Off <= ClsSlotBase then
+              { a class method's virtual call (P123): Self is the table }
+              Line('  call *' + IntToStr((ClsSlotBase - E^.Off) * 8) + '(%rdi)')
+            else
+              Line('  call ' + E^.Name);
+          end;
           if nreg > 0 then
             Line('  addq $' + IntToStr((nreg + 1) * 8) + ', %rsp');
         end;
@@ -24692,7 +25279,10 @@ else if E^.Name = 'rt_high' then
           Line('  call ' + E^.Name);
         end
         else
+        begin
+          FCallE := E;
           EmitCall(E^.Name, E^.Args);
+        end;
       end;
     ekAddr:
       begin
@@ -25447,6 +26037,7 @@ begin
           if not FastAssign(S) then
           if not OrdAssign(S) then
           if not EmitStrAppend(S) then
+          if not ResDestAssign(S) then
           if (S^.Dest <> nil) and (S^.E <> nil) and
             (TKind(S^.Dest^.Typ) = tykInterface) and
             (TKind(S^.E^.Typ) = tykClass) then
@@ -26214,6 +26805,7 @@ begin
         if not FastAssign(S) then
         if not OrdAssign(S) then
         if not EmitStrAppend(S) then
+        if not ResDestAssign(S) then
         if (S^.Dest <> nil) and (S^.E <> nil) and
           (TKind(S^.Dest^.Typ) = tykInterface) and
           (TKind(S^.E^.Typ) = tykClass) then
@@ -26260,21 +26852,40 @@ begin
         begin
           EmitExpr(S^.E);
           Line('  movq %rdx, %rdi');
-          Line('  call *%rax');
+          if SigRes(S^.E^.Typ) >= 0 then
+          begin
+            { the code through r11, rax the buffer (P153) }
+            Line('  movq %rax, %r11');
+            ResBuf(SigRes(S^.E^.Typ), nil);
+            Line('  call *%r11');
+          end
+          else
+            Line('  call *%rax');
         end
         else
         begin
         begin
           nreg := MethArgs(S^.E, 0, S^.Args);
-          if (S^.E2 <> nil) and (S^.E2^.Num >= 0) then
+          if (S^.E2 <> nil) and (S^.E2^.Num >= 0) and (BlobRet(S^.Name) >= 0) then
+          begin
+            { the table through r11, rax the buffer (P153) }
+            Line('  movq (%rdi), %r11');
+            ResBuf(BlobRet(S^.Name), nil);
+            Line('  call *' + IntToStr(S^.E2^.Num * 8) + '(%r11)');
+          end
+          else if (S^.E2 <> nil) and (S^.E2^.Num >= 0) then
           begin
             Line('  movq (%rdi), %rax');
             Line('  call *' + IntToStr(S^.E2^.Num * 8) + '(%rax)');
           end
-          else if (S^.E2 <> nil) and (S^.E2^.Num <= ClsSlotBase) then
-            Line('  call *' + IntToStr((ClsSlotBase - S^.E2^.Num) * 8) + '(%rdi)')
           else
-            Line('  call ' + S^.Name);
+          begin
+            ResBuf(BlobRet(S^.Name), nil);
+            if (S^.E2 <> nil) and (S^.E2^.Num <= ClsSlotBase) then
+              Line('  call *' + IntToStr((ClsSlotBase - S^.E2^.Num) * 8) + '(%rdi)')
+            else
+              Line('  call ' + S^.Name);
+          end;
           if nreg > 0 then
             Line('  addq $' + IntToStr((nreg + 1) * 8) + ', %rsp');
         end;
@@ -34413,6 +35024,7 @@ var
   savedResOff: LongInt;
   savedHas: Boolean;
   savedResTyp: LongInt;
+  savedResBuf: LongInt;
   sz: LongInt;
   sysw: Boolean;
   savedTF: array of PStmt;
@@ -34435,6 +35047,7 @@ begin
   savedResOff := FResOff;
   savedHas := FHasRes;
   savedResTyp := FResTyp;
+  savedResBuf := FResBuf;
   savedTF := FTryFin;
   savedTD := FTryDep;
   savedTR := FTryRec;
@@ -34577,6 +35190,13 @@ begin
     FResOff := 0;
     FResTyp := TyNone;
   end;
+  { the address of the caller's buffer for a block (P153), after Result }
+  FResBuf := 0;
+  if Pr.IsFunc and (not Pr.IsCtor) and IsBlob(Pr.RetTyp) then
+  begin
+    slot := slot + 8;
+    FResBuf := -LongInt(slot);
+  end;
   loc0 := slot;
   for i := 0 to High(Pr.Locals) do
   begin
@@ -34664,6 +35284,11 @@ begin
   FOwnSec := Pr.Sym;
   FDbgFn := Pr.Sym;
   FDbgLine := 0;
+  { a routine that takes a buffer says so to scripts/check_resbuf.py
+    --all, which reads every call of it (P153); a local symbol, no
+    object file keeps it }
+  if FResBuf <> 0 then
+    Line('.set .Lrb.' + Pr.Sym + ', 1');
   if (Pr.Nest = 0) and (not Pr.IsExt) then
     Line('.globl ' + Pr.Sym);
   Line(Pr.Sym + ':');
@@ -34708,6 +35333,8 @@ begin
       if i + Ord(HasSelf(Pr)) < 8 then
         StFP(ArgR(LongInt(i + Ord(HasSelf(Pr)))),
           -8 * LongInt(i + 1 + Ord(Pr.Nest > 0) + Ord(HasSelf(Pr))));
+    if FResBuf <> 0 then
+      StFP('x8', FResBuf);
     DaSetup(Pr, LongInt(loc0));
     if loc1 > loc0 then
       ZeroLocals(Pr, LongInt(loc0));
@@ -34734,17 +35361,7 @@ begin
     if Pr.IsCtor then
       LdFP('x0', -8 * LongInt(1 + Ord(Pr.Nest > 0)))
     else if Pr.IsFunc and IsBlob(Pr.RetTyp) then
-    begin
-      Imm('x0', TSize(Pr.RetTyp));
-      GcArg(GcWord(Pr.RetTyp), 'x1');
-      Line('  bl rt_alloc');
-      Line('  mov x4, x0');
-      AddFP('x1', FResOff);
-      Line('  mov x0, x4');
-      Imm('x2', TSize(Pr.RetTyp));
-      Line('  bl rt_memcpy');
-      Line('  mov x0, x4');
-    end
+      ResCopy
     else if Pr.IsFunc and IsFat(Pr.RetTyp) then
     begin
       LdFP('x0', FResOff);
@@ -34787,6 +35404,8 @@ begin
       if i + Ord(HasSelf(Pr)) < 6 then
         Line('  movq %' + ArgReg(LongInt(i + Ord(HasSelf(Pr)))) + ', ' +
           IntToStr(-8 * LongInt(i + 1 + Ord(Pr.Nest > 0) + Ord(HasSelf(Pr)))) + '(%rbp)');
+    if FResBuf <> 0 then
+      Line('  movq %rax, ' + IntToStr(FResBuf) + '(%rbp)');
     { Locals start as zero, so a string, a slice, a map or a sync
       record is ready to use, as in Go. So does the whole of Result: a
       string, a slice or a record the routine never assigns comes back
@@ -34806,17 +35425,7 @@ begin
     if Pr.IsCtor then
       Line('  movq -8(%rbp), %rax')
     else if Pr.IsFunc and IsBlob(Pr.RetTyp) then
-    begin
-      Line('  movq $' + IntToStr(TSize(Pr.RetTyp)) + ', %rdi');
-      GcArg(GcWord(Pr.RetTyp), 'rsi');
-      Line('  call rt_alloc');
-      Line('  movq %rax, %rdi');
-      Line('  leaq ' + IntToStr(FResOff) + '(%rbp), %rsi');
-      Line('  movq $' + IntToStr(TSize(Pr.RetTyp)) + ', %rcx');
-      PushK('rax', 1);
-      Line('  call rt_memcpy');
-      Line('  popq %rax');
-    end
+      ResCopy
     else if Pr.IsFunc and IsFat(Pr.RetTyp) then
     begin
       Line('  movq ' + IntToStr(FResOff) + '(%rbp), %rax');
@@ -34917,6 +35526,7 @@ begin
   FResOff := savedResOff;
   FHasRes := savedHas;
   FResTyp := savedResTyp;
+  FResBuf := savedResBuf;
   FTryFin := savedTF;
   FTryDep := savedTD;
   FTryRec := savedTR;
@@ -35895,6 +36505,8 @@ begin
   { the spawn's arguments too, once taken (P354) }
   Line('  movq $0, 136(%r14)');
   Line('  movq $0, 144(%r14)');
+  { no buffer: a spawned routine's block result is nobody's (P153) }
+  Line('  xorl %eax, %eax');
   Line('  callq *128(%r14)');
   Line('  jmp rt_goexit');
   Line('');
@@ -38474,13 +39086,17 @@ begin
   Line('  jmp rt_mloop');
   Line('.pk_run:');
   Line('  movl $0, 152(%r14)');
+  { the return address through r11, so rax keeps what rt_execute loaded
+    from G+120: a routine stopped at its prologue's check gets its
+    caller's buffer back (P153); a stop's save area gives r11 back
+    (.apx_res, .yp_res), and nothing that parks reads rax after }
   Line('.pk_res:');
-  Line('  popq %rax');
+  Line('  popq %r11');
   Line('  popq %r15');
   Line('  popq %r13');
   Line('  popq %r12');
   Line('  popq %rbx');
-  Line('  jmpq *%rax');
+  Line('  jmpq *%r11');
   Line('');
   { G+176 is the id. G+232 is the sync-queue link. ParkUnlock marks the
     G waiting before it drops the lock, so a waker cannot lose the wake. }
@@ -45501,6 +46117,14 @@ begin
     FProcSyms[i] := Prog.Procs[i].Sym;
     FProcNests[i] := Prog.Procs[i].Nest;
   end;
+  BlobTable(Prog);
+  FResBuf := 0;
+  FCallE := nil;
+  FIfaceRes := -1;
+  FResDest := nil;
+  FResDestUsed := False;
+  FBufTyp := -1;
+  FTopBufE := nil;
   FScratchOff := 0;
   FScratchCur := 0;
   FScratchMax := 0;
@@ -52653,12 +53277,16 @@ begin
   Line('  ldr x6, [x28, #160]');
   Line('  ldr x7, [x28, #168]');
   Line('  ldr x27, [x28, #248]');
+  { x8, the buffer of a routine stopped at its prologue's check, or a
+    new routine's entry, which rt_gstart takes from x8 (P153) }
+  Line('  ldr x8, [x28, #128]');
   { loaded, the words go, as on amd64 (P354) }
   Line('  stp xzr, xzr, [x28, #72]');
   Line('  stp xzr, xzr, [x28, #88]');
   Line('  stp xzr, xzr, [x28, #104]');
   Line('  stp xzr, xzr, [x28, #160]');
   Line('  str xzr, [x28, #248]');
+  Line('  str xzr, [x28, #128]');
   Line('  ldr x9, [x28, #48]');
   Imm('x10', 4096);
   Line('  cmp x9, x10');
@@ -52668,7 +53296,10 @@ begin
   Line('  ldr x0, [x28, #136]');
   Line('  ldr x1, [x28, #144]');
   Line('  stp xzr, xzr, [x28, #136]');
-  Line('  ldr x9, [x28, #128]');
+  { the entry, which rt_execute moved from G+128 to x8; x8 0, no buffer:
+    a spawned routine's block result is nobody's (P153) }
+  Line('  mov x9, x8');
+  Line('  mov x8, xzr');
   Line('  blr x9');
   Line('  b rt_goexit');
   Line('rt_goexit:');
@@ -55387,6 +56018,9 @@ begin
   Line('  str x5, [x28, #112]');
   Line('  str x6, [x28, #160]');
   Line('  str x7, [x28, #168]');
+  { x8, a block's buffer (P153), in G+128, which rt_gstart read when the
+    routine started }
+  Line('  str x8, [x28, #128]');
   Line('  str x27, [x28, #248]');
   Line('  str x30, [x28, #240]');
   Line('  mov x9, sp');
@@ -55421,12 +56055,14 @@ begin
   Line('  ldr x6, [x28, #160]');
   Line('  ldr x7, [x28, #168]');
   Line('  ldr x27, [x28, #248]');
+  Line('  ldr x8, [x28, #128]');
   { loaded, the words go, as on amd64 (P354) }
   Line('  stp xzr, xzr, [x28, #72]');
   Line('  stp xzr, xzr, [x28, #88]');
   Line('  stp xzr, xzr, [x28, #104]');
   Line('  stp xzr, xzr, [x28, #160]');
   Line('  str xzr, [x28, #248]');
+  Line('  str xzr, [x28, #128]');
   Line('  ldr x30, [x28, #240]');
   Line('  ret');
   { Preempted at a prologue: x19-x27 and the return address (x30 as
@@ -55460,6 +56096,8 @@ begin
   Line('.ms_nopre:');
   Line('  mov w9, #1');
   Line('  str w9, [x28, #188]');
+  { x8 is still in its register (P153) }
+  Line('  str xzr, [x28, #128]');
   Line('  ldr x30, [x28, #240]');
   Line('  ret');
   EmitYieldPointArm;

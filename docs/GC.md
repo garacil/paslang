@@ -247,7 +247,7 @@ conservatively, word by word, and does not move what it finds that way.
    allocation site: *noscan* (strings, arrays of scalars, sets);
    *typed*, with a pointer bitmap the compiler writes in `.rodata`
    (records, classes, dynamic arrays and channel buffers of pointerful
-   elements, record results, map groups from the map descriptor); and
+   elements, map groups from the map descriptor); and
    *conservative*, every word checked (`GetMem`, whose type nobody
    knows). Typed blocks up to 512 bytes keep their bits in the span,
    bigger ones a type word, as Go.
@@ -634,6 +634,16 @@ the rules above.
   through 32 routines, the collector's stress, poison and verify modes
   and `-checkptr`, and reads the block's sum unchanged.
 - Nothing parks while it holds a runtime lock (a rule since 1.0.51).
+- A routine whose result is a record, a static array or a set of 32
+  bytes writes it into its caller's buffer at its end (P153, 1.1.213):
+  the buffer's address comes in rax or x8, waits in the callee's frame
+  as a pointer (class 1), which a stack's move adjusts, and in G+120
+  (rax, amd64) or G+128 (x8, arm64) while `rt_morestack` grows or stops
+  the routine, cleared once loaded. A scratch buffer of the caller is
+  not read at its own call, where the callee's Result holds the value,
+  typed, until it copies it with no call after, and what the slot held
+  before is nobody's; from the call's return it is read by the value's
+  type. Before, every such call took a typed block from the heap.
 
 ### 2.7 What it should give, and what it gave
 

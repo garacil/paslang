@@ -1,0 +1,355 @@
+{ P153: a routine whose result is a block (a record, a static array, a
+  set of 32 bytes) writes it into its caller's buffer, a place of the
+  caller's frame whose address comes in rax or x8, or into the
+  variable an assignment names. Every kind of call: a routine, a nested
+  one, a unit's, a method static, virtual and of the class, a property's
+  getter, an interface's method, a routine value, a closure, a method
+  value, an operator, a call as a statement and a spawned one; results
+  of one word to 320 bytes, with strings in them; a buffer that is the
+  destination (a local, Result, a global, r := F(r)) and one that is
+  not (an element, a field, a map's value); a recursion that grows the
+  stack while the buffers' addresses wait in frames and in rax or x8;
+  an exception before the end; and routines stopped at their
+  prologues while they make records. }
+program recres;
+
+uses sysutils, pastime;
+
+type
+  TPair = record
+    A, B: Integer;
+  end;
+  TMid = record
+    N: Integer;
+    S: string;
+    P: TPair;
+    W: array[0..1] of Integer;
+  end;
+  TBig = array[0..39] of Integer;
+  TOdd = record
+    B1: Byte;
+    W2: Word;
+    B3: Byte;
+  end;
+  TSet = set of 0..255;
+
+  TShape = class
+    K: Integer;
+    function Box: TPair; virtual;
+    function Twice(X: Integer): TMid;
+    class function Unit1: TPair;
+    function GetCorner: TPair;
+    property Corner: TPair read GetCorner;
+  end;
+
+  TSquare = class(TShape)
+    function Box: TPair; override;
+  end;
+
+  IBoxed = interface
+    function Boxed(X: Integer): TMid;
+  end;
+
+  TBoxer = class(IBoxed)
+    Tag: string;
+    function Boxed(X: Integer): TMid;
+  end;
+
+  TMaker = function(X: Integer): TMid;
+  TMakerM = function(X: Integer): TMid of object;
+
+var
+  gp: TPair;
+  da: array of TPair;
+  res: chan of Integer;
+  done: waitgroup;
+
+function MkPair(A, B: Integer): TPair;
+begin
+  Result.A := A;
+  Result.B := B;
+end;
+
+function MkMid(N: Integer; const S: string): TMid;
+begin
+  Result.N := N;
+  Result.S := S + '!';
+  Result.P := MkPair(N, N * 2);
+  Result.W[0] := N + 1;
+  Result.W[1] := N + 2;
+end;
+
+function MkBig(K: Integer): TBig;
+var
+  i: Integer;
+begin
+  for i := 0 to 39 do
+    Result[i] := K * 100 + i;
+end;
+
+function MkSet(K: Integer): TSet;
+begin
+  Result := [K, K + 100, 255];
+end;
+
+function MkOdd(K: Integer): TOdd;
+begin
+  Result.B1 := Byte(K);
+  Result.W2 := Word(K * 300);
+  Result.B3 := Byte(K + 7);
+end;
+
+function SumPair(const P: TPair): Integer;
+begin
+  Result := P.A + P.B;
+end;
+
+function SumBig(const B: TBig): Integer;
+var
+  i: Integer;
+begin
+  Result := 0;
+  for i := 0 to 39 do
+    Result := Result + B[i];
+end;
+
+function Swap(const P: TPair): TPair;
+begin
+  Result.A := P.B;
+  Result.B := P.A;
+end;
+
+operator + (A, B: TPair): TPair;
+begin
+  Result.A := A.A + B.A;
+  Result.B := A.B + B.B;
+end;
+
+function TShape.Box: TPair;
+begin
+  Result := MkPair(K, 1);
+end;
+
+function TShape.Twice(X: Integer): TMid;
+begin
+  Result := MkMid(X * 2 + K, 'tw');
+end;
+
+class function TShape.Unit1: TPair;
+begin
+  Result := MkPair(1, 1);
+end;
+
+function TShape.GetCorner: TPair;
+begin
+  Result := MkPair(K + 1, K + 2);
+end;
+
+function TSquare.Box: TPair;
+begin
+  Result := MkPair(K, K);
+end;
+
+function TBoxer.Boxed(X: Integer): TMid;
+begin
+  Result := MkMid(X, Tag);
+end;
+
+{ the stack grows under Result, the destination of each level's call }
+function Climb(N: Integer): TMid;
+var
+  pad: array[0..31] of Integer;
+begin
+  pad[N mod 32] := N;
+  if N = 0 then
+    Result := MkMid(0, 'base')
+  else
+  begin
+    Result := Climb(N - 1);
+    Result.N := Result.N + pad[N mod 32] - N + 1;
+  end;
+end;
+
+{ and under a scratch buffer, the result read in the expression }
+function Climb2(N: Integer): TPair;
+var
+  pad: array[0..31] of Integer;
+begin
+  pad[N mod 32] := N;
+  if N = 0 then
+    Result := MkPair(0, 0)
+  else
+    Result := MkPair(Climb2(N - 1).A + pad[N mod 32] - N + 1, N);
+end;
+
+function Outer(K: Integer): TPair;
+var
+  acc: TPair;
+
+  function Inner(D: Integer): TPair;
+  begin
+    acc.A := acc.A + D;
+    Result := MkPair(acc.A, D);
+  end;
+
+begin
+  acc := MkPair(K, 0);
+  acc := Inner(5);
+  Result := Inner(1);
+end;
+
+function Risky(K: Integer): TPair;
+begin
+  Result := MkPair(K, K);
+  if K > 5 then
+    raise Exception.Create('too big');
+end;
+
+function Grow(N: Integer): TPair;
+begin
+  SetLength(da, N);
+  Result := MkPair(N, N + 1);
+end;
+
+function Wrap(K: Integer): TBig;
+begin
+  Result := MkBig(K);
+  Result[0] := -1;
+end;
+
+procedure Worker(K: Integer);
+var
+  i, s: Integer;
+  p: TPair;
+  mid: TMid;
+begin
+  s := 0;
+  for i := 1 to 100000 do
+  begin
+    p := MkPair(i, K);
+    mid := MkMid(i mod 7, 'x');
+    s := s + SumPair(p) + mid.W[1] + Length(mid.S);
+  end;
+  Send(res, s);
+  done.Done;
+end;
+
+var
+  p, q: TPair;
+  mid: TMid;
+  big: TBig;
+  st: TSet;
+  od: TOdd;
+  sh: TShape;
+  sq: TShape;
+  bx: TBoxer;
+  ib: IBoxed;
+  mk: TMaker;
+  mm: TMakerM;
+  base, i, total: Integer;
+  m: map[Integer] of TMid;
+  arr: array[0..3] of TPair;
+  dt: pastime.TDate;
+  g: TGUID;
+
+begin
+  p := MkPair(3, 4);
+  WriteLn(p.A, ' ', p.B, ' ', SumPair(MkPair(5, 6)));
+  mid := MkMid(7, 'seven');
+  WriteLn(mid.N, ' ', mid.S, ' ', mid.P.A, ' ', mid.P.B, ' ', mid.W[0], ' ', mid.W[1]);
+  big := MkBig(3);
+  WriteLn(big[0], ' ', big[39], ' ', SumBig(MkBig(2)));
+  big := Wrap(4);
+  WriteLn(big[0], ' ', big[1], ' ', big[39]);
+  st := MkSet(5);
+  WriteLn(5 in st, ' ', 105 in st, ' ', 255 in st, ' ', 6 in st);
+  od := MkOdd(3);
+  WriteLn(od.B1, ' ', od.W2, ' ', od.B3);
+  { a destination: a global, r := F(r), an element, a field }
+  gp := MkPair(4, 5);
+  gp := Swap(gp);
+  WriteLn(gp.A, ' ', gp.B);
+  arr[2] := MkPair(6, 7);
+  mid.P := MkPair(8, 9);
+  WriteLn(arr[2].A, ' ', arr[2].B, ' ', mid.P.A, ' ', mid.P.B);
+  { a call that reallocates the array whose element it gives }
+  SetLength(da, 1);
+  da[0] := Grow(500);
+  WriteLn(Length(da), ' ', da[0].A, ' ', da[0].B);
+  { operators, nested calls and a call as a statement }
+  p := MkPair(1, 2) + MkPair(10, 20) + MkPair(100, 200);
+  WriteLn(p.A, ' ', p.B, ' ', SumPair(Swap(Swap(MkPair(30, 40)))));
+  MkBig(5);
+  MkMid(1, 'gone');
+  { methods, a property, an interface }
+  sh := TShape.Create;
+  sh.K := 2;
+  sq := TSquare.Create;
+  sq.K := 6;
+  p := sh.Box;
+  q := sq.Box;
+  WriteLn(p.A, ' ', p.B, ' ', q.A, ' ', q.B, ' ', SumPair(sq.Box));
+  mid := sh.Twice(10);
+  q := sh.Corner;
+  WriteLn(mid.N, ' ', mid.S, ' ', TShape.Unit1.A, ' ', q.A, ' ', q.B);
+  bx := TBoxer.Create;
+  bx.Tag := 'box';
+  ib := bx;
+  mid := ib.Boxed(3);
+  WriteLn(mid.N, ' ', mid.S, ' ', mid.P.B, ' ', ib.Boxed(4).W[1]);
+  { a closure, a routine value, a method value }
+  base := 5;
+  mk := function(X: Integer): TMid
+  begin
+    Result := MkMid(X * 10 + base, 'clo');
+  end;
+  mid := mk(2);
+  WriteLn(mid.N, ' ', mid.S, ' ', mk(3).P.B);
+  mm := sh.Twice;
+  mid := mm(4);
+  WriteLn(mid.N, ' ', mid.S, ' ', mm(5).W[0]);
+  { with, a map's value }
+  with MkMid(7, 'w') do
+    WriteLn(N, ' ', S, ' ', P.A, ' ', P.B, ' ', W[0], ' ', W[1]);
+  New(m);
+  m[1] := MkMid(11, 'map');
+  m[2] := sh.Twice(1);
+  WriteLn(m[1].N, ' ', m[1].S, ' ', m[2].N, ' ', m[2].S);
+  { nested routines, recursion, an exception }
+  p := Outer(10);
+  WriteLn(p.A, ' ', p.B);
+  mid := Climb(3000);
+  WriteLn(mid.N, ' ', mid.S, ' ', Climb2(3000).A);
+  p := MkPair(1, 2);
+  try
+    p := Risky(9);
+  except
+    on E: Exception do
+      WriteLn('caught ', E.Message);
+  end;
+  WriteLn(p.A, ' ', p.B);
+  { the units' }
+  dt := UnixToDate(31539661);
+  WriteLn(dt.Year, '-', dt.Month, '-', dt.Day, ' ', dt.Hour, ':', dt.Minute, ':', dt.Second);
+  g := StringToGUID('{01234567-89AB-CDEF-0123-456789ABCDEF}');
+  WriteLn(GUIDToString(g));
+  { spawned: one whose result nobody reads, and workers stopped at their
+    prologues }
+  pas MkBig(9);
+  pas MkMid(2, 'spawned');
+  res := MakeChan();
+  done.Add(8);
+  for i := 1 to 8 do
+    pas Worker(i);
+  total := 0;
+  for i := 1 to 8 do
+    total := total + Recv(res);
+  done.Wait;
+  WriteLn(total);
+end.
+
+{ This file is part of paslang's tests.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+  paslang is free software under the GNU General Public License,
+  version 3 or (at your option) any later version; see the file
+  COPYING. It comes with ABSOLUTELY NO WARRANTY. }

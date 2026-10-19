@@ -12605,8 +12605,11 @@ method, a property or an enumeration member of one of these names is a
 compile error that names it, at the name: `Length is a reserved word,
 not a name at 5:3`. A unit's `.pi` is not checked for these names when
 it loads. The compiler loads only a `.pi` of the format it writes,
-`PASLANGI27`, and refuses an older one with the minimum compiler needed to
-rebuild it. A field or a property carries its `json` directive (1.1.131); a type may be `json`, kind 26 (1.1.124); Currency adds builtin type id 17; scoped members, generic
+`PASLANGI28`, and refuses an older one with the minimum compiler needed to
+rebuild it. A routine whose result is a record, a static array or a set
+of 32 bytes writes it where its caller says (1.1.213), which a unit
+compiled before did not; a field or a property carries its `json`
+directive (1.1.131); a type may be `json`, kind 26 (1.1.124); Currency adds builtin type id 17; scoped members, generic
 origin/argument identity and every exported alias remain recorded. All
 installed libraries must be rebuilt when this format changes.
 
