@@ -528,7 +528,19 @@ so a cycle's winner first starts as many as it may mark with (heap
 state +536, `rt_gcms`); `parmark` checks on both machines that a graph marked so
 survives with one worker, two, the default and all, under poison,
 verify and stress, and a runtime that drops what one worker gives the
-other, or the oblets it puts on the shared stack, breaks it.
+other, or the oblets it puts on the shared stack, breaks it. Two Ms a
+wake picked reached nobody until P337, and with `PASLANG_GCWORKERS=2`
+one worker marked every cycle, with 4 three: the M that polls waits in
+`epoll_wait`, not on its own futex word, and an M with no thread yet
+(the start counts every M but M0 idle) waits nowhere. A pick of the
+polling M now breaks its wait through the poller's eventfd, as
+`rt_poke` does (Go's `netpollBreak`), and `rt_gcidle` takes it to the
+marking when it comes back; an M the cycle took before it went to poll
+does not wait there (`rt_idlepoll`); an M with no thread id is no
+pick (heap state +584 and +592 hold the addresses of `rt_pollerm` and
+`rt_evfd`, runtime bit 5). `gcwake` runs cycles over eight live trees
+until twenty have marked with every worker the cap allows, with the cap
+at 2 and at 4, on both machines: none did before.
 
 **What later versions give the collector.** Each of these is read by
 the rules above.

@@ -207,6 +207,10 @@ const
   HYRes = 560;
   HXOff = 568;
   HXSize = 576;
+  { P337: the address of the runtime's rt_pollerm, the M that polls, and
+    of rt_evfd, the poller's eventfd, when HRtCaps has bit 5 }
+  HPollerAt = 584;
+  HEvFdAt = 592;
   WorkerSize = 512;
   ObletSize = 131072;
   DefWorkers = 16;
@@ -2285,11 +2289,20 @@ end;
   picked for it, is picked by writing -Ep in its epoch word and woken on
   its own futex word; rt_gcwork writes Ep when the M runs it. Without
   the mark, a worker that asked for one more right after the cycle
-  started woke an M the cycle had just woken. Says whether one was
-  found. }
+  started woke an M the cycle had just woken. The M that polls waits in
+  epoll_wait, not on that word: its wait is broken through the poller's
+  eventfd, as rt_poke breaks it (Go's netpollBreak, runtime/
+  netpoll_epoll.go), and rt_gcidle takes it to the marking when it
+  comes back; one the cycle took before it went to poll does not wait
+  there (rt_idlepoll), so a pick that saw another M polling misses
+  nothing. An M with no thread yet (rt_initsched counts every M but M0
+  idle until rt_wakep or rt_gcms gives it one) is no pick: it waits
+  nowhere. Both were the first idle Ms a pick found, and the wake
+  reached nobody: with PASLANG_GCWORKERS=2 one worker marked every
+  cycle, with 4 three (P337). Says whether one was found. }
 function WakeIdle(H0, Ep: Integer): Boolean;
 var
-  allm, n, i, m, e: Integer;
+  allm, n, i, m, e, fd, one, r, pm: Integer;
 begin
   Result := True;
   allm := RdW(H0 + HAllM);
@@ -2297,12 +2310,31 @@ begin
   for i := 0 to n - 1 do
   begin
     m := allm + i * MRecSize;
-    if (RdW(m + MState) = MsIdleTaken) and (RdW(m + 32) <> 0) then
+    { an M with a thread: one rt_initsched counts idle before any
+      gave it one (P91) waits nowhere, and only M0's thread id, the
+      main thread's, stays 0 (P337) }
+    if (RdW(m + MState) = MsIdleTaken) and (RdW(m + 32) <> 0) and
+      ((i = 0) or (RdW(m + MTid) <> 0)) then
     begin
       e := RdW(m + MEpoch);
       if (e <> Ep) and (e <> -Ep) then
         if AtomicCas(PInt(m + MEpoch), e, -Ep) then
         begin
+          pm := 0;
+          if (RdW(H0 + HRtCaps) and 32) <> 0 then
+            pm := RdW(H0 + HPollerAt);
+          if (pm <> 0) and (AtomicLoad(PInt(pm)^) = m) then
+          begin
+            fd := PInt(RdW(H0 + HEvFdAt))^;
+            if fd <> 0 then
+            begin
+              one := 1;
+              if Amd64 = 1 then
+                r := Syscall(1, fd, Int64(@one), 8)
+              else
+                r := Syscall(64, fd, Int64(@one), 8);
+            end;
+          end;
           FutexWake(m + MFutex);
           Exit;
         end;

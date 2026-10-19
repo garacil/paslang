@@ -1146,6 +1146,13 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  diff -u testdata/parmark.out $(BUILDDIR)/parmark.got; \
 	done; \
 	echo ok parmark; \
+	: with a cap on the workers every M a cycle may mark with marks, the poller and Ms with no thread no pick, P337; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/gcwake testdata/gcwake.paslang; \
+	for w in PASLANG_GCWORKERS=2 PASLANG_GCWORKERS=4; do \
+	  env $$w timeout 300 $(BUILDDIR)/gcwake > $(BUILDDIR)/gcwake.got; \
+	  diff -u testdata/gcwake.out $(BUILDDIR)/gcwake.got; \
+	done; \
+	echo ok gcwake; \
 	echo "==== lazy Ms ===="; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/lazym testdata/lazym.paslang; \
 	for w in "" "" PASLANG_GCWORKERS=1 PASLANG_GCWORKERS=0; do \
@@ -4257,6 +4264,13 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	  diff -u testdata/parmark.out $(BUILDDIR)/parmark-arm.got; \
 	done; \
 	echo ok parmark-arm; \
+	: P337 on arm64: every M a capped cycle may mark with marks; \
+	$(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/gcwake-arm testdata/gcwake.paslang; \
+	for w in PASLANG_GCWORKERS=2 PASLANG_GCWORKERS=4; do \
+	  env $$w timeout 600 $(QEMU_A64) $(BUILDDIR)/gcwake-arm > $(BUILDDIR)/gcwake-arm.got; \
+	  diff -u testdata/gcwake.out $(BUILDDIR)/gcwake-arm.got; \
+	done; \
+	echo ok gcwake-arm; \
 	echo "==== dirlist arm64 ===="; \
 	$(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/dirlist-arm testdata/dirlist.paslang; \
 	timeout 120 $(QEMU_A64) $(BUILDDIR)/dirlist-arm > $(BUILDDIR)/dirlist-arm.got; \
