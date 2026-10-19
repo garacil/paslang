@@ -3033,7 +3033,10 @@ the kernel, so a routine comparing or searching a long run can be
 stopped between two (1.1.120, P270). A count not above 0 reads nothing,
 where Free Pascal reads without an end (1.1.22, P147).
 `Low`, `High` and `Length` work on static arrays, slices and
-strings: a string's `Low` is 1, its first index, and its `High` its
+strings (of a variable, a field or an element, the length's word is
+read alone, and `(i < 0) or (i > High(a))`, its kin with `>=
+Length(a)` and their negations, for a slice `a` and an `Integer` `i`,
+are one compare without sign and one branch, 1.1.226): a string's `Low` is 1, its first index, and its `High` its
 length (1.0.136; `Low` gave 0). `Length` also counts the entries of a
 map, a tree or a heap and is 1 for a `Char`, and `Low(h)` of a heap is
 its least element (§11). `High(x)` and `Low(x)` of an ordinal value are its

@@ -385,6 +385,9 @@ GOLDEN_A64 += aheadres
 # P373: the address of an element goes straight into the register that reads it.
 GOLDEN += elemaddr
 GOLDEN_A64 += elemaddr
+# P377: High of a slice reads its length alone, and a test of an index against both its ends is one compare.
+GOLDEN += boundsidiom
+GOLDEN_A64 += boundsidiom
 # P354: a routine's record keeps no saved register once it is loaded back.
 GOLDEN += gstale
 GOLDEN_A64 += gstale
@@ -2666,6 +2669,16 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'leaq v_g0(,%rsi,8), %rsi' $(BUILDDIR)/elemaddr1.s || { echo "elemaddr.s: an element of g0 is not worked out in rsi"; exit 1; }; \
 	awk '/^p_runlocal:/,/cfi_endproc/' $(BUILDDIR)/elemaddr1.s | grep -qE 'leaq -[0-9]+\(%rbp,%rsi,8\), %rsi' || { echo "elemaddr.s: RunLocal works out no element in rsi"; exit 1; }; \
 	echo ok elemaddr-asm; \
+	: an index tested against both ends of a slice is one compare without sign and one branch, its length the word at 8 alone, P377; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/boundsidiom1 testdata/boundsidiom.paslang; \
+	for f in ina outa inr inp zero; do \
+	  awk "/^p_$$f:/,/cfi_endproc/" $(BUILDDIR)/boundsidiom1.s > $(BUILDDIR)/boundsidiom-$$f.s; \
+	  test $$(grep -cE '^  (jb|jae) ' $(BUILDDIR)/boundsidiom-$$f.s) -eq 1 || { echo "boundsidiom.s: $$f is not one branch without sign"; exit 1; }; \
+	  if grep -q 'set' $(BUILDDIR)/boundsidiom-$$f.s; then echo "boundsidiom.s: $$f makes a Boolean"; exit 1; fi; \
+	done; \
+	: the compiler, TypeOf put in place: its check in IsStrTyp makes no Boolean of its index against High, its own result the one setcc; \
+	if awk '/^p_pasparse_tparser_isstrtyp:/,/cfi_endproc/' $(BUILDDIR)/stage/pasparse.s | grep -q 'setg %al'; then echo "pasparse.s: the check in IsStrTyp makes a Boolean"; exit 1; fi; \
+	echo ok boundsidiom-asm; \
 	: c + k * x and y + k * x are one lea, x := x + k * y one lea on the register of x, r13 and rbp are never the base of a lea with an index, and a load at p - k takes the offset, P294; \
 	awk '/^p_off8:/,/cfi_endproc/' $(BUILDDIR)/leaform.s > $(BUILDDIR)/leaform-off8.s; \
 	grep -q 'leaq 8(,%r[a-z0-9]*,8), ' $(BUILDDIR)/leaform-off8.s || { echo "leaform.s: Off8 is not one lea"; exit 1; }; \
@@ -4122,6 +4135,12 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/elemaddr1-arm testdata/elemaddr.paslang; \
 	awk '/^p_runlocal:/,/cfi_endproc/' $(BUILDDIR)/elemaddr1-arm.s | grep -qE '^  (madd|add) x10, .*x29' || { echo "elemaddr-arm.s: RunLocal works out no element in x10"; exit 1; }; \
 	echo ok elemaddr-arm-asm; \
+	: P377 on arm64; \
+	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/boundsidiom1-arm testdata/boundsidiom.paslang; \
+	for f in ina outa inr inp zero; do \
+	  test $$(awk "/^p_$$f:/,/cfi_endproc/" $(BUILDDIR)/boundsidiom1-arm.s | grep -cE '^  b\.(lo|hs) ') -eq 1 || { echo "boundsidiom-arm.s: $$f is not one branch without sign"; exit 1; }; \
+	done; \
+	echo ok boundsidiom-arm-asm; \
 	: every call of a routine that takes a buffer gives one, in every program and unit of both machines, P153; \
 	python3 -I scripts/check_resbuf.py --all $(BUILDDIR) $(BUILDDIR)/$(LVL_X64) $(A64DIR) '$(A64DIR)/$(LVL_A64)'; \
 	echo ok resbuf-all; \

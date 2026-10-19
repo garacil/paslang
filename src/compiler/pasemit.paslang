@@ -791,6 +791,9 @@ type
     function FastAssign(S: PStmt): Boolean;
     function FastJcc(E: PExpr; const IfFalse: string): Boolean;
     function JccTrue(E: PExpr; const Target: string): Boolean;
+    function LenPlace(A: PExpr): Boolean;
+    procedure EmitLenWord(A: PExpr);
+    function BoundsIdiom(E: PExpr; out X, A: PExpr; out S: TSym; out InRange: Boolean): Boolean;
     function CondJmp(E: PExpr; const Target: string; WhenTrue: Boolean): Boolean;
     procedure CondBranch(E: PExpr; const Target: string; WhenTrue: Boolean);
     function CmpCounter(Lim: PExpr): Boolean;
@@ -10331,6 +10334,142 @@ begin
   end;
 end;
 
+{ ---- A length's word and a test of an index against it (P377) ----
+
+  A string's and a slice's value is two and three words, the length the
+  second, so Length and High of one loaded them all and kept one: High
+  of self.FTypes was movq 16(%rax), %r8; movq 8(%rax), %rdx; movq
+  (%rax), %rax; movq %rdx, %rax; decq %rax, in each of TypeOf's 372 sites
+  put in place (P369). A place's length is its word at 8 now. A is such
+  a place: a variable not in a register, a field, an element, what a
+  pointer points to, of a string or a slice. }
+function TEmitter.LenPlace(A: PExpr): Boolean;
+var
+  sy: TSym;
+begin
+  Result := False;
+  if (A = nil) or not (IsStr(A^.Typ) or IsDyn(A^.Typ)) then
+    Exit;
+  case A^.Kind of
+    ekVar:
+      Result := TryFindSym(A^.Name, sy) and (sy.Reg = '');
+    ekField, ekIndex, ekDeref:
+      Result := True;
+  end;
+end;
+
+{ A's length into rax or x0: its address and the word at 8, the
+  address's last lea the load's own operand (AddrOp, P329). A string or
+  slice passed by reference arrives as the address of its descriptor,
+  which may be nil, and then it is empty (EmitFatWord, LoadVar): that
+  0 is the length. }
+procedure TEmitter.EmitLenWord(A: PExpr);
+var
+  op, ok: string;
+  sy: TSym;
+begin
+  EmitAddr(A);
+  if (A^.Kind = ekVar) and TryFindSym(A^.Name, sy) and sy.ByRef then
+  begin
+    ok := Lab;
+    if FArm then
+    begin
+      Line('  cbz x0, ' + ok);
+      Line('  ldr x0, [x0, #8]');
+    end
+    else
+    begin
+      Line('  testq %rax, %rax');
+      Line('  jz ' + ok);
+      Line('  movq 8(%rax), %rax');
+    end;
+    Line(ok + ':');
+    Exit;
+  end;
+  if FArm then
+    Line('  ldr x0, [x0, #8]')
+  else
+  begin
+    op := AddrOp('');
+    Line('  movq ' + OpPlus(op, 8) + ', %rax');
+  end;
+end;
+
+{ E tests the index X against both ends of the slice A: (X < 0) or (X >
+  High(A)), (X < 0) or (X >= Length(A)), 0 > X for X < 0, and InRange
+  for their negations (X >= 0) and (X <= High(A)), (X >= 0) and (X <
+  Length(A)). X a word Integer variable, in a register or at a fixed
+  place (S), A a place LenPlace takes. One compare without sign of X
+  with A's length and one branch is the test, a negative X being past
+  every length, as Go's IsInBounds is (cmd/compile/internal/ssa,
+  AMD64.rules: (IsInBounds idx len) => (SETB (CMPQ idx len))). }
+function TEmitter.BoundsIdiom(E: PExpr; out X, A: PExpr; out S: TSym; out InRange: Boolean): Boolean;
+var
+  l, r, x2, c: PExpr;
+  lop, rop: TBinOp;
+begin
+  Result := False;
+  X := nil;
+  A := nil;
+  InRange := False;
+  if (E = nil) or (E^.Kind <> ekBin) or (E^.L = nil) or (E^.R = nil) then
+    Exit;
+  l := E^.L;
+  r := E^.R;
+  if (l^.Kind <> ekBin) or (r^.Kind <> ekBin) or (l^.L = nil) or (l^.R = nil) or
+    (r^.L = nil) or (r^.R = nil) then
+    Exit;
+  { the left side against 0, X on its left }
+  lop := l^.Bin;
+  if (l^.L^.Kind = ekInt) and (l^.L^.Num = 0) then
+  begin
+    x2 := l^.R;
+    if lop = boGt then
+      lop := boLt
+    else if lop = boLe then
+      lop := boGe
+    else
+      Exit;
+  end
+  else if (l^.R^.Kind = ekInt) and (l^.R^.Num = 0) then
+    x2 := l^.L
+  else
+    Exit;
+  { the right side: X against High or Length of A }
+  rop := r^.Bin;
+  c := r^.R;
+  if (c = nil) or (c^.Kind <> ekCall) or (Length(c^.Args) <> 1) or
+    not SameExpr(r^.L, x2) then
+    Exit;
+  if E^.Bin = boOr then
+  begin
+    if lop <> boLt then
+      Exit;
+    if not (((rop = boGt) and (c^.Name = 'rt_high')) or ((rop = boGe) and (c^.Name = 'rt_length'))) then
+      Exit;
+    InRange := False;
+  end
+  else if E^.Bin = boAnd then
+  begin
+    if lop <> boGe then
+      Exit;
+    if not (((rop = boLe) and (c^.Name = 'rt_high')) or ((rop = boLt) and (c^.Name = 'rt_length'))) then
+      Exit;
+    InRange := True;
+  end
+  else
+    Exit;
+  if (x2^.Kind <> ekVar) or (x2^.Typ <> TyInteger) or not PlainOrd(x2, S) then
+    Exit;
+  if (S.Reg = '') and (S.ByRef or (S.Up <> 0) or S.Boxed) then
+    Exit;
+  if (not IsDyn(c^.Args[0]^.Typ)) or not LenPlace(c^.Args[0]) then
+    Exit;
+  X := x2;
+  A := c^.Args[0];
+  Result := True;
+end;
+
 { A condition as branches to Target, taken when it holds (WhenTrue) or
   when it fails: an integer comparison is one compare and one branch; a
   Boolean and, or and not are their sides' branches with short circuit
@@ -10341,9 +10480,9 @@ end;
   for a branch, which took six to nine instructions a term. }
 function TEmitter.CondJmp(E: PExpr; const Target: string; WhenTrue: Boolean): Boolean;
 var
-  ls, rs: TSym;
+  ls, rs, xs: TSym;
   cc, past, lr: string;
-  a, b, rx: PExpr;
+  a, b, rx, bx, ba: PExpr;
   op: TBinOp;
   rlo, rhi: Int64;
   rin: Boolean;
@@ -10372,6 +10511,39 @@ begin
   if (E <> nil) and (E^.Kind = ekBin) and ((E^.Bin = boAnd) or (E^.Bin = boOr)) and
     (E^.Typ = TyBoolean) and (E^.L <> nil) and (E^.R <> nil) then
   begin
+    { an index against both ends of a slice: one compare without sign
+      of the index with the length and one branch (P377) }
+    if BoundsIdiom(E, bx, ba, xs, rin) then
+    begin
+      EmitLenWord(ba);
+      if FArm then
+      begin
+        if xs.Reg <> '' then
+          Line('  cmp ' + xs.Reg + ', x0')
+        else
+        begin
+          LoadWordVar(xs, 'x1');
+          Line('  cmp x1, x0');
+        end;
+        if rin = WhenTrue then
+          Line('  b.lo ' + Target)
+        else
+          Line('  b.hs ' + Target);
+      end
+      else
+      begin
+        if xs.Reg <> '' then
+          Line('  cmpq %rax, %' + xs.Reg)
+        else
+          Line('  cmpq %rax, ' + FixedOp(xs, 0));
+        if rin = WhenTrue then
+          Line('  jb ' + Target)
+        else
+          Line('  jae ' + Target);
+      end;
+      Result := True;
+      Exit;
+    end;
     { a range's two ends: one compare without sign and one branch
       (P292) }
     if RangeTest(E, rx, rlo, rhi, rin) then
@@ -24561,6 +24733,9 @@ begin
           EmitExpr(E^.Args[0]);
           Line('  bl rt_chstr');
         end
+        else if (E^.Name = 'rt_length') and LenPlace(E^.Args[0]) then
+          { a place's length word alone (P377) }
+          EmitLenWord(E^.Args[0])
         else if E^.Name = 'rt_length' then
         begin
           EmitExpr(E^.Args[0]);
@@ -24728,7 +24903,14 @@ begin
           Line('  mov x0, xzr');
           Line(b + ':');
         end
-else if E^.Name = 'rt_high' then
+else if (E^.Name = 'rt_high') and LenPlace(E^.Args[0]) then
+        begin
+          { a place's length word alone (P377) }
+          EmitLenWord(E^.Args[0]);
+          if IsDyn(E^.Args[0]^.Typ) then
+            Line('  sub x0, x0, #1');
+        end
+        else if E^.Name = 'rt_high' then
         begin
           EmitExpr(E^.Args[0]);
           if IsDyn(E^.Args[0]^.Typ) then
@@ -25524,6 +25706,9 @@ else if E^.Name = 'rt_high' then
           Line('  movq %rax, %rdi');
           Line('  call rt_chstr');
         end
+        else if (E^.Name = 'rt_length') and LenPlace(E^.Args[0]) then
+          { a place's length word alone (P377) }
+          EmitLenWord(E^.Args[0])
         else if E^.Name = 'rt_length' then
         begin
           EmitExpr(E^.Args[0]);
@@ -25706,7 +25891,14 @@ else if E^.Name = 'rt_high' then
           Line('  xorl %eax, %eax');
           Line(b + ':');
         end
-else if E^.Name = 'rt_high' then
+else if (E^.Name = 'rt_high') and LenPlace(E^.Args[0]) then
+        begin
+          { a place's length word alone (P377) }
+          EmitLenWord(E^.Args[0]);
+          if IsDyn(E^.Args[0]^.Typ) then
+            Line('  decq %rax');
+        end
+        else if E^.Name = 'rt_high' then
         begin
           EmitExpr(E^.Args[0]);
           if IsDyn(E^.Args[0]^.Typ) then
