@@ -514,6 +514,9 @@ type
     procedure CollectNames(S: PStmt; var L: TStrArray);
     function FirstWrites(const L: TStmtArray; A, Z: SizeInt): TStrArray;
     procedure ZeroLocals(const Pr: TProc; Loc0: LongInt);
+    function HasChildren(const Pr: TProc): Boolean;
+    function FirstNested(const Pr: TProc; const N, Alias: string): Boolean;
+    function ResNested(const Pr: TProc): Boolean;
     function DirectJump(S: PStmt; out Target: string): Boolean;
     procedure AppendLine(const S: string);
     procedure EmitLoc(LineNo: LongInt);
@@ -5413,11 +5416,60 @@ begin
   Result := w;
 end;
 
+{ Pr has nested routines. }
+function TEmitter.HasChildren(const Pr: TProc): Boolean;
+var
+  i: SizeInt;
+begin
+  Result := False;
+  for i := 0 to High(FProgProcs) do
+    if FProgProcs[i].ParentSym = Pr.Sym then
+      Result := True;
+end;
+
+{ Pr, a routine with nested ones, writes N on every path before anything
+  reads it and before any call, which may run a nested routine that
+  reads it (P358): WritesFirst with a call counted as a read (WfCalls). }
+function TEmitter.FirstNested(const Pr: TProc; const N, Alias: string): Boolean;
+begin
+  WfCalls := True;
+  Result := WritesFirst(Pr.Body, N, Alias);
+  WfCalls := False;
+end;
+
+{ The Result of Pr, a routine with nested ones, starts as it is (P358):
+  a word with no pointer whose address nobody takes, written first on
+  every path before any call (FirstNested), as DaSetup keeps it in a
+  routine with none (P284). }
+function TEmitter.ResNested(const Pr: TProc): Boolean;
+var
+  bits: TGcBits;
+  k: TTypeKind;
+begin
+  Result := False;
+  if (not Pr.IsFunc) or (not FHasRes) or FDebug or (Pr.Body = nil) or Pr.Boxing or
+    (Length(Pr.Shared) > 0) or (not HasChildren(Pr)) then
+    Exit;
+  k := TKind(Pr.RetTyp);
+  if IsFat(Pr.RetTyp) or IsBlob(Pr.RetTyp) or (TSize(Pr.RetTyp) > 8) or (k = tykReal) or
+    (k = tykSet) then
+    Exit;
+  bits := nil;
+  GcMark(Pr.RetTyp, 0, bits, 0);
+  if GcAny(bits) then
+    Exit;
+  if LocAddrTaken('result') or LocAddrTaken(FResName) then
+    Exit;
+  Result := FirstNested(Pr, 'result', Pr.Name);
+end;
+
 { The locals of Pr start as zero, except one-word scalars the body
   writes before anything reads them (P96: the leading assignments;
-  P112: WritesFirst, every path). A routine with nested
-  routines zeroes them all: a nested one may read its parent's local
-  before the parent writes it. Adjacent ranges go out as one. }
+  P112: WritesFirst, every path). A routine with nested routines zeroes
+  the others only (P358): a nested one may read its parent's local
+  before the parent writes it, through a call, so there a call before
+  the write counts as a read (FirstNested), where every local was
+  zeroed. Adjacent ranges go out as one. }
 procedure TEmitter.ZeroLocals(const Pr: TProc; Loc0: LongInt);
 var
   i: SizeInt;
@@ -5428,10 +5480,7 @@ var
   bits: TGcBits;
 begin
   w := nil;
-  children := False;
-  for i := 0 to High(FProgProcs) do
-    if FProgProcs[i].ParentSym = Pr.Sym then
-      children := True;
+  children := HasChildren(Pr);
   if (not children) and (Pr.Body <> nil) then
   begin
     if Pr.Body^.Kind = skBlock then
@@ -5457,8 +5506,9 @@ begin
     skip := (sz = 8) and (not IsFat(Pr.Locals[i].Typ)) and
       (not IsBlob(Pr.Locals[i].Typ)) and (k <> tykReal) and (k <> tykSet) and
       (InNames(w, ToLower(Pr.Locals[i].Name)) or
-       ((not children) and (not Pr.Boxing) and (Length(Pr.Shared) = 0) and
-        (Pr.Body <> nil) and WritesFirst(Pr.Body, Pr.Locals[i].Name, '')));
+       ((not Pr.Boxing) and (Length(Pr.Shared) = 0) and (Pr.Body <> nil) and
+        (((not children) and WritesFirst(Pr.Body, Pr.Locals[i].Name, '')) or
+        (children and FirstNested(Pr, Pr.Locals[i].Name, '')))));
     { A pointer starts as nil all the same: a stack map reads it at every
       call, the ones before its first write too (P95c). }
     if skip then
@@ -34178,7 +34228,7 @@ begin
       if IsDyn(Pr.RetTyp) then
         StFP('xzr', FResOff + 16);
     end
-    else if Pr.IsFunc and not FDaResKeep then
+    else if Pr.IsFunc and (not FDaResKeep) and not ResNested(Pr) then
       StFP('xzr', FResOff);
     BoxSetup(Pr);
     EmitStmt(Pr.Body);
@@ -34250,7 +34300,7 @@ begin
     DaSetup(Pr, LongInt(loc0));
     if loc1 > loc0 then
       ZeroLocals(Pr, LongInt(loc0));
-    if Pr.IsFunc and not FDaResKeep then
+    if Pr.IsFunc and (not FDaResKeep) and not ResNested(Pr) then
       ZeroFrame(FResOff, Align8(TSize(Pr.RetTyp)));
     BoxSetup(Pr);
     EmitStmt(Pr.Body);

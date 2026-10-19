@@ -337,6 +337,9 @@ GOLDEN_A64 += divreg
 # P357: a nested routine reads its outer routine's variables in the pool.
 GOLDEN += uplevel
 GOLDEN_A64 += uplevel
+# P358: a routine with nested ones zeroes only the locals a read may reach first.
+GOLDEN += nestzero
+GOLDEN_A64 += nestzero
 # P354: a routine's record keeps no saved register once it is loaded back.
 GOLDEN += gstale
 GOLDEN_A64 += gstale
@@ -2516,6 +2519,12 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/uplevel.out $(BUILDDIR)/uplevel0.got; \
 	python3 -I scripts/check_argpush.py $(BUILDDIR)/uplevel0.s --routines=p_outer_mid_deep; \
 	echo ok uplevel-asm; \
+	: a routine with nested ones zeroes only the locals a read may reach first, P358; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/nestzero0 testdata/nestzero.paslang; \
+	$(BUILDDIR)/nestzero0 > $(BUILDDIR)/nestzero0.got; \
+	diff -u testdata/nestzero.out $(BUILDDIR)/nestzero0.got; \
+	python3 -I scripts/check_nestzero.py $(BUILDDIR)/nestzero0.s --expect=p_early:2,p_late:0,p_branch:2,p_writeback:1; \
+	echo ok nestzero-asm; \
 	: c + k * x and y + k * x are one lea, x := x + k * y one lea on the register of x, r13 and rbp are never the base of a lea with an index, and a load at p - k takes the offset, P294; \
 	awk '/^p_off8:/,/cfi_endproc/' $(BUILDDIR)/leaform.s > $(BUILDDIR)/leaform-off8.s; \
 	grep -q 'leaq 8(,%r[a-z0-9]*,8), ' $(BUILDDIR)/leaform-off8.s || { echo "leaform.s: Off8 is not one lea"; exit 1; }; \
@@ -3854,6 +3863,12 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	diff -u testdata/uplevel.out $(BUILDDIR)/uplevel0-arm.got; \
 	python3 -I scripts/check_argpush.py $(BUILDDIR)/uplevel0-arm.s --arm --routines=p_outer_mid_deep; \
 	echo ok uplevel-arm-asm; \
+	: P358 on arm64: the locals a read may reach first, zeroed alone; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/nestzero0-arm testdata/nestzero.paslang; \
+	timeout 300 $(QEMU_A64) $(BUILDDIR)/nestzero0-arm > $(BUILDDIR)/nestzero0-arm.got; \
+	diff -u testdata/nestzero.out $(BUILDDIR)/nestzero0-arm.got; \
+	python3 -I scripts/check_nestzero.py $(BUILDDIR)/nestzero0-arm.s --arm --expect=p_early:2,p_late:0,p_branch:2,p_writeback:1; \
+	echo ok nestzero-arm-asm; \
 	: P294 on arm64: c + k * x a move and one add with the shift, y + k * x and x := x + k * y one add, and loads at p - k, p + k and p + i shl s in the load, within the offsets of LDUR and LDR; \
 	awk '/^p_off8:/,/cfi_endproc/' $(BUILDDIR)/leaform-arm.s > $(BUILDDIR)/leaform-off8-arm.s; \
 	grep -qE 'add x[0-9]+, x17, x[0-9]+, lsl #3' $(BUILDDIR)/leaform-off8-arm.s || { echo "leaform-arm.s: Off8 is not a move and one add"; exit 1; }; \
