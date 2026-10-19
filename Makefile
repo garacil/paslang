@@ -358,6 +358,9 @@ GOLDEN_A64 += adrplast
 # P153: a record result without the heap.
 GOLDEN += recres
 GOLDEN_A64 += recres
+# P364: for x in a static array a call gives takes the array once.
+GOLDEN += forinonce
+GOLDEN_A64 += forinonce
 # P354: a routine's record keeps no saved register once it is loaded back.
 GOLDEN += gstale
 GOLDEN_A64 += gstale
