@@ -3131,6 +3131,8 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	: records with methods and properties across a unit, and their private members, P165; \
 	sh scripts/check_scoped_types.sh "$(OUTDIR)/paslangc" "$(BUILDDIR)" $(QEMU_A64); \
 	python3 scripts/check_syscalls.py "$(OUTDIR)/paslangc" "$(BUILDDIR)" $(QEMU_A64); \
+	: a stop asked for while a runtime lock is held leaves no saved register in the routine record, P363; \
+	python3 scripts/check_nopre.py "$(OUTDIR)/paslangc" "$(BUILDDIR)" $(QEMU_A64); \
 	: the standard streams keep the flags the program found, P217; \
 	python3 scripts/check_stdstreams.py "$(OUTDIR)/paslangc" "$(BUILDDIR)" $(QEMU_A64); \
 	: an alignment the emitter writes means bytes on both machines, P218; \
