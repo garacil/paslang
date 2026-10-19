@@ -51,6 +51,8 @@ type
     FHiddenAddr: TStrArray; { the hidden variables whose address a body put in place takes (P326) }
     FProcNamed: TStrArray;  { every name a routine's body uses, and every address taken, before inlining (P336) }
     FAnyAsm: Boolean;       { a routine has asm, which may name anything }
+    FProcHash: array of LongInt;  { P375: FProcs by symbol, open addressing, -1 empty }
+    FNested: array of array of LongInt;  { P375: per routine, the routines nested in it at any depth }
     FMapFrom: TStrArray;    { the callee's names ... }
     FMapTo: TExprArray;     { ... and what stands for each in the copy }
     FHoistTo: PExpr;        { P368: the hidden variable HoistAt takes a block result into, which Result is }
@@ -125,6 +127,7 @@ type
     procedure ExprInlineE(var E: PExpr);
     procedure ExprInlineS(S: PStmt);
     function FindProc(const Sym: string): LongInt;
+    procedure IndexProcs;
     function FoldExpr(E: PExpr): PExpr;
     function FoldStmt(S: PStmt): PStmt;
     function InlineCall(E: PExpr): PExpr;
@@ -139,17 +142,87 @@ begin
   Result := ToLower(A) = ToLower(B);
 end;
 
-function TOpt.FindProc(const Sym: string): LongInt;
+{ The routine whose symbol is Sym, the first of them, -1 none (P375):
+  one probe of FProcHash, where FindProc walked every routine comparing
+  symbols, a quarter of a unit's compile as Reach asked it at every step
+  of every routine's chain of parents. Go's inliner keeps the callee on
+  the call (ir.CallExpr.Fun's Func) and never searches. }
+function SymHash(const S: string): Int64;
 var
   i: SizeInt;
 begin
+  Result := 2166136261;
+  for i := 1 to Length(S) do
+    Result := ((Result xor Int64(Ord(S[i]))) * 16777619) and 4294967295;
+end;
+
+function TOpt.FindProc(const Sym: string): LongInt;
+var
+  m, h: SizeInt;
+begin
   Result := -1;
-  for i := 0 to High(FProcs) do
-    if FProcs[i].Sym = Sym then
+  m := Length(FProcHash);
+  if (m = 0) or (Sym = '') then
+    Exit;
+  h := SizeInt(SymHash(Sym) and Int64(m - 1));
+  while FProcHash[h] >= 0 do
+  begin
+    if FProcs[FProcHash[h]].Sym = Sym then
     begin
-      Result := LongInt(i);
+      Result := FProcHash[h];
       Exit;
     end;
+    h := (h + 1) and (m - 1);
+  end;
+end;
+
+{ FProcHash, a table twice the routines' count at least, and FNested:
+  each routine's chain of parents walked once, as Reach walked it at
+  every call, sixteen steps at most, the routine put in the list of
+  every routine it reaches. The routines do not change while the
+  optimizer runs: it adds locals, never a routine. }
+procedure TOpt.IndexProcs;
+var
+  i, m, h, k, n: SizeInt;
+  ps: string;
+  a: LongInt;
+begin
+  m := 16;
+  while m < 2 * Length(FProcs) do
+    m := m * 2;
+  FProcHash := nil;
+  SetLength(FProcHash, m);
+  for i := 0 to m - 1 do
+    FProcHash[i] := -1;
+  for i := 0 to High(FProcs) do
+  begin
+    if FProcs[i].Sym = '' then
+      Continue;
+    if FindProc(FProcs[i].Sym) >= 0 then
+      Continue;
+    h := SizeInt(SymHash(FProcs[i].Sym) and Int64(m - 1));
+    while FProcHash[h] >= 0 do
+      h := (h + 1) and (m - 1);
+    FProcHash[h] := LongInt(i);
+  end;
+  FNested := nil;
+  SetLength(FNested, Length(FProcs));
+  for i := 0 to High(FProcs) do
+  begin
+    ps := FProcs[i].ParentSym;
+    k := 0;
+    while (ps <> '') and (k <= 16) do
+    begin
+      a := FindProc(ps);
+      if a < 0 then
+        Break;
+      n := Length(FNested[a]);
+      SetLength(FNested[a], n + 1);
+      FNested[a][n] := LongInt(i);
+      ps := FProcs[a].ParentSym;
+      Inc(k);
+    end;
+  end;
 end;
 
 function TOpt.IsEmptyProc(const Pr: TProc): Boolean;
@@ -1282,8 +1355,7 @@ end;
   closures made in it. }
 procedure TOpt.Reach;
 var
-  j, k: SizeInt;
-  ps, q: string;
+  j: SizeInt;
 begin
   FReach := nil;
   FReachFor := FCur;
@@ -1295,21 +1367,9 @@ begin
     Exit;
   end;
   ReachS(FProcs[FCur].Body, False);
-  for j := 0 to High(FProcs) do
-  begin
-    ps := FProcs[j].ParentSym;
-    k := 0;
-    while (ps <> '') and (ps <> FProcs[FCur].Sym) and (k < 16) do
-    begin
-      q := ps;
-      ps := '';
-      if FindProc(q) >= 0 then
-        ps := FProcs[FindProc(q)].ParentSym;
-      Inc(k);
-    end;
-    if (ps <> '') and (ps = FProcs[FCur].Sym) then
-      ReachS(FProcs[j].Body, True);
-  end;
+  { the routines nested in FCur, worked out once (P375) }
+  for j := 0 to High(FNested[FCur]) do
+    ReachS(FProcs[FNested[FCur][j]].Body, True);
 end;
 
 { A place given for a var or out parameter that may stand in the body
@@ -2712,6 +2772,7 @@ var
 begin
   FProg := @Prog;
   FProcs := Prog.Procs;
+  IndexProcs;
   FMax := Prog.InlineMax;
   FN := 0;
   FCur := -1;
