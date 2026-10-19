@@ -2695,7 +2695,20 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	for f in c1 c3 c8 c16 c17 c100 c128 whole; do \
 	  if awk "/^p_$$f:/,/cfi_endproc/" $(BUILDDIR)/movefill.s | grep -qE 'call rt_memcpy|rep stosb'; then echo "movefill.s: $$f calls rt_memcpy or fills with rep stosb"; exit 1; fi; \
 	done; \
-	awk '/^p_c129:/,/cfi_endproc/' $(BUILDDIR)/movefill.s | grep -q 'call rt_memcpy' || { echo "movefill.s: c129 does not call rt_memcpy"; exit 1; }; \
+	: the processor decides past 128 bytes, P372, for the base one Move of 129 bytes calls rt_memcpy and no ymm register is named, with AVX, v3, up to 256 bytes are 32-byte words in line and vzeroupper, from 257 rt_memcpy; \
+	$(OUTDIR)/paslangc -cpu base -o $(BUILDDIR)/movefill-base testdata/movefill.paslang; \
+	$(BUILDDIR)/movefill-base > $(BUILDDIR)/movefill-base.got; \
+	diff -u testdata/movefill.out $(BUILDDIR)/movefill-base.got; \
+	awk '/^p_c129:/,/cfi_endproc/' $(BUILDDIR)/movefill-base.s | grep -q 'call rt_memcpy' || { echo "movefill-base.s: c129 does not call rt_memcpy"; exit 1; }; \
+	if grep -q 'ymm' $(BUILDDIR)/movefill-base.s; then echo "movefill-base.s: a ymm register on the base processor"; exit 1; fi; \
+	$(OUTDIR)/paslangc -cpu v3 -o $(BUILDDIR)/movefill-v3 testdata/movefill.paslang; \
+	$(BUILDDIR)/movefill-v3 > $(BUILDDIR)/movefill-v3.got; \
+	diff -u testdata/movefill.out $(BUILDDIR)/movefill-v3.got; \
+	for f in c129 c200 c256; do \
+	  if awk "/^p_$$f:/,/cfi_endproc/" $(BUILDDIR)/movefill-v3.s | grep -q 'call rt_memcpy'; then echo "movefill-v3.s: $$f calls rt_memcpy"; exit 1; fi; \
+	  awk "/^p_$$f:/,/cfi_endproc/" $(BUILDDIR)/movefill-v3.s | grep -q 'vzeroupper' || { echo "movefill-v3.s: $$f leaves the upper halves dirty"; exit 1; }; \
+	done; \
+	awk '/^p_c257:/,/cfi_endproc/' $(BUILDDIR)/movefill-v3.s | grep -q 'call rt_memcpy' || { echo "movefill-v3.s: c257 does not call rt_memcpy"; exit 1; }; \
 	echo ok movefill-asm; \
 	: a constant an instruction can take is its immediate, P306: the routines of immconst load no such constant into a register first; \
 	python3 -I scripts/check_immediates.py $(BUILDDIR)/immconst.s adds,logic,steps,cmps,chars,kind,arrays; \
@@ -4136,6 +4149,9 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	  if awk "/^p_$$f:/,/cfi_endproc/" $(BUILDDIR)/movefill-arm.s | grep -qE 'bl rt_memcpy|bl rt_fill$$'; then echo "movefill-arm.s: $$f calls rt_memcpy or rt_fill"; exit 1; fi; \
 	done; \
 	awk '/^p_c129:/,/cfi_endproc/' $(BUILDDIR)/movefill-arm.s | grep -q 'bl rt_memcpy' || { echo "movefill-arm.s: c129 does not call rt_memcpy"; exit 1; }; \
+	: two 16-byte words side by side are one LDP or STP of Q registers, P372; \
+	awk '/^p_c128:/,/cfi_endproc/' $(BUILDDIR)/movefill-arm.s | grep -q 'ldp q' || { echo "movefill-arm.s: c128 loads no pair of Q registers"; exit 1; }; \
+	awk '/^p_c128:/,/cfi_endproc/' $(BUILDDIR)/movefill-arm.s | grep -q 'stp q' || { echo "movefill-arm.s: c128 stores no pair of Q registers"; exit 1; }; \
 	echo ok movefill-arm-asm; \
 	python3 -I scripts/check_immediates.py $(BUILDDIR)/immconst-arm.s adds,logic,steps,cmps,chars,kind,arrays; \
 	echo ok immconst-arm-asm; \

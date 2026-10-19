@@ -3013,11 +3013,15 @@ on, by `rep stosb` on amd64 and 32 bytes a store on arm64 (1.1.122,
 P272), zeros by DC ZVA when `-cpu` names an Arm core (1.1.123, P273).
 A constant `n` up to 128 is stores in line, and so is `Move` of a
 constant count up to 128, which reads every byte before it writes one,
-so an overlap still copies right (1.1.155, P304). A record, a static
+so an overlap still copies right (1.1.155, P304); with AVX (`-cpu v3`,
+or a processor that has it) up to 256, in 32-byte words and a
+`vzeroupper` after a copy, and on arm64 two 16-byte words side by side
+are one `ldp` or `stp` of Q registers (1.1.224). A record, a static
 array or a set of 32 bytes assigned, `a := b`, is that `Move` of its
 size, the strings it holds marked shared after it, and `x :=
 Default(T)` is that `FillChar` of zeros, in line up to 256 bytes into a
-variable (1.1.219, P370): `b := a` of 40 bytes is six moves, where it
+variable, into any place with AVX (1.1.219, P370; 1.1.224): `b := a` of 40 bytes is six moves
+(four and a `vzeroupper` with AVX), where it
 tested the source's address for a zero value and called `rt_memcpy`. A
 block read or written through `nil` stops with `nil pointer
 dereference` and its line, as a word does (it gave zeros). `CompareByte(a, b, n)` is the difference of the first bytes of `a`

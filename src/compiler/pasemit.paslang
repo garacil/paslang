@@ -1000,6 +1000,8 @@ type
     function FixedOp(const Sy: TSym; K: Int64): string;
     procedure FixedTo(const Sy: TSym; K: Int64; const Reg: string);
     procedure SmallChunks(N: Int64; var Off, Sz: TInt64Arr);
+    function SmallMax: LongInt;
+    procedure WideChunks(N: Int64; var Off, Sz: TInt64Arr);
     function EmitSmallMove(S: PStmt): Boolean;
     function EmitSmallFill(S: PStmt): Boolean;
     procedure EmitMoveStmt(S: PStmt);
@@ -7047,6 +7049,38 @@ begin
     Line('  leaq ' + FixedOp(Sy, K) + ', %' + Reg);
 end;
 
+{ P372: the largest count moved in line: 256 bytes with AVX, eight
+  32-byte ymm words all loaded before one is stored (Zen 2 loads two
+  256-bit words and stores one a cycle, AMD 56305 2.12), else 128, eight
+  16-byte words. Go copies under 192 bytes in line (AMD64.rules
+  LoweredMove). }
+function TEmitter.SmallMax: LongInt;
+begin
+  if (not FArm) and HasFeat(CpuFeatBit('avx', False)) then
+    Result := 256
+  else
+    Result := 128;
+end;
+
+{ The 32-byte words that cover N bytes, 33 to 256, the last ending at
+  the end. }
+procedure TEmitter.WideChunks(N: Int64; var Off, Sz: TInt64Arr);
+var
+  m, i: Int64;
+begin
+  m := (N + 31) div 32;
+  Off := nil;
+  Sz := nil;
+  SetLength(Off, m);
+  SetLength(Sz, m);
+  for i := 0 to m - 1 do
+  begin
+    Off[i] := 32 * i;
+    Sz[i] := 32;
+  end;
+  Off[m - 1] := N - 32;
+end;
+
 { The accesses that cover N bytes, 1 to 128 (P304). }
 procedure TEmitter.SmallChunks(N: Int64; var Off, Sz: TInt64Arr);
 var
@@ -7105,7 +7139,7 @@ var
   i: SizeInt;
   off, sz: TInt64Arr;
   ssy, dsy: TSym;
-  fs, fd, avx: Boolean;
+  fs, fd, avx, ymm: Boolean;
   r, so, dop: string;
   sk, dk: Int64;
 begin
@@ -7113,12 +7147,22 @@ begin
   if (Length(S^.Args) <> 3) or (S^.Args[2] = nil) or (S^.Args[2]^.Kind <> ekInt) then
     Exit;
   n := S^.Args[2]^.Num;
-  if (n < 1) or (n > 128) then
+  if (n < 1) or (n > SmallMax) then
     Exit;
   Result := True;
   fs := FixedAddr(S^.Args[0], ssy, sk);
   fd := FixedAddr(S^.Args[1], dsy, dk);
   SmallChunks(n, off, sz);
+  { 32-byte words with AVX (P372), unless a region keeps a vector in a
+    ymm register, whose upper half vzeroupper would clear }
+  ymm := (not FArm) and (n > 32) and (FVecTop = 0) and HasFeat(CpuFeatBit('avx', False));
+  if ymm then
+    WideChunks(n, off, sz)
+  else if n > 128 then
+  begin
+    Result := False;
+    Exit;
+  end;
   if FArm then
   begin
     { x10 the source, x11 the destination }
@@ -7149,8 +7193,20 @@ begin
         FixedTo(dsy, dk, 'x11');
       FixedTo(ssy, sk, 'x10');
     end;
-    for i := 0 to High(off) do
+    { two 16-byte words side by side, the first at a multiple of 16, are
+      one LDP or STP of Q registers (P372; ARM DDI 0487 C7.2.214 and
+      C7.2.330, LDP and STP (SIMD&FP), a signed offset that is a multiple
+      of 16), as Go's LoweredMove takes FLDPQ and FSTPQ }
+    i := 0;
+    while i <= High(off) do
     begin
+      if (sz[i] = 16) and (i < High(off)) and (sz[i + 1] = 16) and (off[i] mod 16 = 0) and
+        (off[i + 1] = off[i] + 16) then
+      begin
+        Line('  ldp q' + IntToStr(i) + ', q' + IntToStr(i + 1) + ', [x10, #' + IntToStr(off[i]) + ']');
+        i := i + 2;
+        Continue;
+      end;
       if sz[i] = 16 then
         r := 'q' + IntToStr(i)
       else if sz[i] = 8 then
@@ -7163,9 +7219,18 @@ begin
         Line('  ldrh ' + r + ', [x10, #' + IntToStr(off[i]) + ']')
       else
         Line('  ldr ' + r + ', [x10, #' + IntToStr(off[i]) + ']');
+      Inc(i);
     end;
-    for i := 0 to High(off) do
+    i := 0;
+    while i <= High(off) do
     begin
+      if (sz[i] = 16) and (i < High(off)) and (sz[i + 1] = 16) and (off[i] mod 16 = 0) and
+        (off[i + 1] = off[i] + 16) then
+      begin
+        Line('  stp q' + IntToStr(i) + ', q' + IntToStr(i + 1) + ', [x11, #' + IntToStr(off[i]) + ']');
+        i := i + 2;
+        Continue;
+      end;
       if sz[i] = 16 then
         r := 'q' + IntToStr(i)
       else if sz[i] = 8 then
@@ -7178,6 +7243,7 @@ begin
         Line('  strh ' + r + ', [x11, #' + IntToStr(off[i]) + ']')
       else
         Line('  str ' + r + ', [x11, #' + IntToStr(off[i]) + ']');
+      Inc(i);
     end;
     Exit;
   end;
@@ -7207,7 +7273,9 @@ begin
       so := FixedOp(ssy, sk + off[i])
     else
       so := IntToStr(off[i]) + '(%rsi)';
-    if sz[i] = 16 then
+    if sz[i] = 32 then
+      Line('  vmovdqu ' + so + ', %ymm' + IntToStr(i))
+    else if sz[i] = 16 then
     begin
       if avx then
         Line('  vmovdqu ' + so + ', %xmm' + IntToStr(i))
@@ -7236,7 +7304,9 @@ begin
       dop := FixedOp(dsy, dk + off[i])
     else
       dop := IntToStr(off[i]) + '(%rdi)';
-    if sz[i] = 16 then
+    if sz[i] = 32 then
+      Line('  vmovdqu %ymm' + IntToStr(i) + ', ' + dop)
+    else if sz[i] = 16 then
     begin
       if avx then
         Line('  vmovdqu %xmm' + IntToStr(i) + ', ' + dop)
@@ -7259,6 +7329,11 @@ begin
         Line('  movq %r' + r + 'x, ' + dop);
     end;
   end;
+  { the upper halves the ymm loads wrote go before any SSE instruction
+    meets them, 100 cycles of a micro-fault on Zen 2 (AMD 56305 2.11.6);
+    VZEROUPPER is one op and no latency there }
+  if ymm then
+    Line('  vzeroupper');
 end;
 
 { FillChar(x, n, v) with n a constant up to 128 in line (P304): the byte
@@ -7272,7 +7347,7 @@ var
   i: SizeInt;
   off, sz: TInt64Arr;
   dsy: TSym;
-  fd, vk, avx, wide, narrow: Boolean;
+  fd, vk, avx, wide, narrow, ymm: Boolean;
   dop, r: string;
   x: PExpr;
   dk: Int64;
@@ -7281,7 +7356,7 @@ begin
   if (Length(S^.Args) <> 3) or (S^.Args[1] = nil) or (S^.Args[1]^.Kind <> ekInt) then
     Exit;
   n := S^.Args[1]^.Num;
-  if (n < 1) or (n > 128) then
+  if (n < 1) or (n > SmallMax) then
     Exit;
   x := S^.Args[2];
   vk := (x^.Kind = ekInt) or ((x^.Kind = ekStr) and (Length(x^.Txt) = 1));
@@ -7293,13 +7368,19 @@ begin
   pat := v or (v shl 8);
   pat := pat or (pat shl 16);
   pat := pat or (pat shl 32);
+  { past 128 bytes only zeros, in 32-byte stores with AVX (P372) }
+  ymm := (not FArm) and (n > 32) and vk and (v = 0) and HasFeat(CpuFeatBit('avx', False));
+  if (n > 128) and not ymm then
+    Exit;
   Result := True;
   fd := FixedAddr(S^.Args[0], dsy, dk);
   SmallChunks(n, off, sz);
+  if ymm then
+    WideChunks(n, off, sz);
   wide := False;
   narrow := False;
   for i := 0 to High(sz) do
-    if sz[i] = 16 then
+    if sz[i] >= 16 then
       wide := True
     else if sz[i] > 1 then
       narrow := True;
@@ -7351,8 +7432,17 @@ begin
         Line('  orr x12, x12, x12, lsl #32');
       end;
     end;
-    for i := 0 to High(off) do
+    i := 0;
+    while i <= High(off) do
     begin
+      if (sz[i] = 16) and (i < High(off)) and (sz[i + 1] = 16) and (off[i] mod 16 = 0) and
+        (off[i + 1] = off[i] + 16) then
+      begin
+        { STP of Q registers, 32 bytes a store (P372) }
+        Line('  stp q0, q0, [x11, #' + IntToStr(off[i]) + ']');
+        i := i + 2;
+        Continue;
+      end;
       if sz[i] = 16 then
         Line('  str q0, [x11, #' + IntToStr(off[i]) + ']')
       else
@@ -7375,6 +7465,7 @@ begin
         else
           Line('  str ' + r + ', [x11, #' + IntToStr(off[i]) + ']');
       end;
+      Inc(i);
     end;
     Exit;
   end;
@@ -7433,7 +7524,9 @@ begin
       dop := FixedOp(dsy, dk + off[i])
     else
       dop := IntToStr(off[i]) + '(%rdi)';
-    if sz[i] = 16 then
+    if sz[i] = 32 then
+      Line('  vmovdqu %ymm0, ' + dop)
+    else if sz[i] = 16 then
     begin
       if avx then
         Line('  vmovdqu %xmm0, ' + dop)
@@ -7613,8 +7706,20 @@ begin
   begin
     FixedTo(Dsy, Dk, 'x11');
     Line('  movi v0.2d, #0');
-    for i := 0 to High(off) do
-      Line('  str q0, [x11, #' + IntToStr(off[i]) + ']');
+    i := 0;
+    while i <= High(off) do
+    begin
+      if (i < High(off)) and (off[i] mod 16 = 0) and (off[i + 1] = off[i] + 16) then
+      begin
+        Line('  stp q0, q0, [x11, #' + IntToStr(off[i]) + ']');
+        i := i + 2;
+      end
+      else
+      begin
+        Line('  str q0, [x11, #' + IntToStr(off[i]) + ']');
+        Inc(i);
+      end;
+    end;
     Exit;
   end;
   if HasFeat(CpuFeatBit('avx', False)) then
@@ -7677,12 +7782,12 @@ begin
     mv^.Args[1] := NewInt(n);
     mv^.Args[2] := NewInt(0);
     Result := True;
-    if (n > 128) and (n <= 256) and FixedAddr(mv^.Args[0], dsy, dk) then
+    if (n > SmallMax) and (n <= 256) and FixedAddr(mv^.Args[0], dsy, dk) then
     begin
       FixedZero(dsy, dk, n);
       Exit;
     end;
-    if (n <= 128) or FixedAddr(mv^.Args[0], dsy, dk) then
+    if (n <= SmallMax) or FixedAddr(mv^.Args[0], dsy, dk) then
     begin
       EmitFillStmt(mv);
       Exit;
@@ -7728,7 +7833,7 @@ begin
   mv^.Args[1] := NewAddr(S^.Dest);
   mv^.Args[2] := NewInt(n);
   smap := StrMap(S^.Dest^.Typ);
-  if n <= 128 then
+  if (n <= 128) or ((n <= SmallMax) and (FVecTop = 0)) then
   begin
     EmitSmallMove(mv);
     if smap = '' then
