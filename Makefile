@@ -343,6 +343,9 @@ GOLDEN_A64 += nestzero
 # P360: a binary operation keeps its left side in a register while a right side that calls nothing is worked out.
 GOLDEN += keepleft
 GOLDEN_A64 += keepleft
+# P334: a closure or nested routine that calls nothing has no frame.
+GOLDEN += nestflat
+GOLDEN_A64 += nestflat
 # P354: a routine's record keeps no saved register once it is loaded back.
 GOLDEN += gstale
 GOLDEN_A64 += gstale
@@ -1237,6 +1240,14 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q '^.2 = 1$$' $(BUILDDIR)/flatgdb.gdb; \
 	grep -q '^.3 = 9$$' $(BUILDDIR)/flatgdb.gdb; \
 	grep -q '^.4 = 5$$' $(BUILDDIR)/flatgdb.gdb; \
+	: a nested routine with no frame keeps its own variables in registers, and the debugger reads them there, P334; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/nestflatgdb testdata/nestflat.paslang; \
+	gdb -batch -nx -ex 'set debuginfod enabled off' -ex 'break nestflat.paslang:50' \
+	  -ex 'run > /dev/null' -ex 'print A' -ex 'print B' -ex 'print m' -ex kill \
+	  $(BUILDDIR)/nestflatgdb > $(BUILDDIR)/nestflatgdb.gdb 2>&1; \
+	grep -q '^.1 = 4$$' $(BUILDDIR)/nestflatgdb.gdb; \
+	grep -q '^.2 = 5$$' $(BUILDDIR)/nestflatgdb.gdb; \
+	grep -q '^.3 = 4$$' $(BUILDDIR)/nestflatgdb.gdb; \
 	echo ok dwarf; \
 	grep -q 'cmpq 16(%r14)' $(BUILDDIR)/opt.s; \
 	grep -A30 '^pas_main:' $(BUILDDIR)/opt.s | grep -q 'call rt_morestack'; \
@@ -2534,6 +2545,12 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/keepleft.out $(BUILDDIR)/keepleft0.got; \
 	python3 -I scripts/check_argpush.py $(BUILDDIR)/keepleft0.s --routines=p_bysum,p_bysub,p_bymul,p_byless,p_byatleast,p_bydiv,p_bymod,p_byouter_in1; \
 	echo ok keepleft-asm; \
+	: a closure or nested routine that calls nothing has no frame, its link kept in r10, P334; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/nestflat0 testdata/nestflat.paslang; \
+	$(BUILDDIR)/nestflat0 > $(BUILDDIR)/nestflat0.got; \
+	diff -u testdata/nestflat.out $(BUILDDIR)/nestflat0.got; \
+	python3 -I scripts/check_nestflat.py $(BUILDDIR)/nestflat0.s --flat=p_outer_flatadd,p_outer_flatlocal,p_outer_flatbump,p_outer_mid_flatdeep,p_adder_anon.1 --framed=p_outer_mid,p_outer; \
+	echo ok nestflat-asm; \
 	: c + k * x and y + k * x are one lea, x := x + k * y one lea on the register of x, r13 and rbp are never the base of a lea with an index, and a load at p - k takes the offset, P294; \
 	awk '/^p_off8:/,/cfi_endproc/' $(BUILDDIR)/leaform.s > $(BUILDDIR)/leaform-off8.s; \
 	grep -q 'leaq 8(,%r[a-z0-9]*,8), ' $(BUILDDIR)/leaform-off8.s || { echo "leaform.s: Off8 is not one lea"; exit 1; }; \
@@ -3884,6 +3901,12 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	diff -u testdata/keepleft.out $(BUILDDIR)/keepleft0-arm.got; \
 	python3 -I scripts/check_argpush.py $(BUILDDIR)/keepleft0-arm.s --arm --routines=p_bysum,p_bysub,p_bymul,p_byless,p_byatleast,p_bydiv,p_bymod,p_byouter_in1; \
 	echo ok keepleft-arm-asm; \
+	: P334 on arm64: no frame, the link kept in x27; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/nestflat0-arm testdata/nestflat.paslang; \
+	timeout 300 $(QEMU_A64) $(BUILDDIR)/nestflat0-arm > $(BUILDDIR)/nestflat0-arm.got; \
+	diff -u testdata/nestflat.out $(BUILDDIR)/nestflat0-arm.got; \
+	python3 -I scripts/check_nestflat.py $(BUILDDIR)/nestflat0-arm.s --arm --flat=p_outer_flatadd,p_outer_flatlocal,p_outer_flatbump,p_outer_mid_flatdeep,p_adder_anon.1 --framed=p_outer_mid,p_outer; \
+	echo ok nestflat-arm-asm; \
 	: P294 on arm64: c + k * x a move and one add with the shift, y + k * x and x := x + k * y one add, and loads at p - k, p + k and p + i shl s in the load, within the offsets of LDUR and LDR; \
 	awk '/^p_off8:/,/cfi_endproc/' $(BUILDDIR)/leaform-arm.s > $(BUILDDIR)/leaform-off8-arm.s; \
 	grep -qE 'add x[0-9]+, x17, x[0-9]+, lsl #3' $(BUILDDIR)/leaform-off8-arm.s || { echo "leaform-arm.s: Off8 is not a move and one add"; exit 1; }; \
