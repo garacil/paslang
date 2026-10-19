@@ -296,6 +296,13 @@ type
     FResDestSym: TSym;
     FResDestUsed: Boolean;
     FBufOff: LongInt;      { P153: the scratch buffer the call being written fills, of type FBufTyp, -1 none }
+    FTakeTyp: LongInt;     { P366: the call being written gives a block of type FTakeTyp in registers, -1 none: its stores follow the call }
+    FResSplit: TStrArray;  { P366: the words of the Result ResSplit split, for the EmitProc it calls }
+    FSplitNow: TStrArray;  { the words of the routine being written, result.w0 on, empty when its Result is whole }
+    FSplitDone: array of Boolean;  { the words EmitFlat worked out in their return registers already }
+    FTakeOff: LongInt;     { the scratch buffer they go to, when FTakeDest is False }
+    FTakeDest: Boolean;    { they go to FTakeSym, the assignment's destination }
+    FTakeSym: TSym;
     FBufTyp: LongInt;
     FTopBufE: PExpr;       { P153: the call whose scratch buffer is the statement's last, FTopBufSz bytes, FScratchCur and FScrOff's length after it }
     FTopBufSz: LongInt;
@@ -564,6 +571,15 @@ type
     procedure ResBuf(T: LongInt; E: PExpr);
     function ResDestAssign(S: PStmt): Boolean;
     procedure ResCopy;
+    function RegRes(T: LongInt): Boolean;
+    function SplitE(E: PExpr; const Alias: string): Boolean;
+    function SplitS(S: PStmt; const Alias: string): Boolean;
+    procedure SplitDoE(E: PExpr; const Alias: string);
+    procedure SplitDoS(S: PStmt; const Alias: string);
+    function ResSplit(const Pr: TProc; out Q: TProc): Boolean;
+    procedure SplitBack;
+    function SplitAlias(const N: string): string;
+    procedure ResTake;
     procedure BufTyped;
     procedure BufFree(E: PExpr);
     function Scratch(Sz: LongInt): LongInt;
@@ -1051,6 +1067,7 @@ type
     function RangeTest(E: PExpr; out X: PExpr; out Lo, Hi: Int64; out Inside: Boolean): Boolean;
     procedure RangeCmp(X: PExpr; Lo, Hi: Int64);
     procedure EmitProc(const Pr: TProc);
+    procedure EmitProcAt(const Pr: TProc);
     procedure LoadGlobals(const Prog: TProgram);
     procedure EmitRuntime;
     procedure EmitRuntimeArm;
@@ -1321,6 +1338,10 @@ begin
   NoteLine(t);
   if FMapOn or FMapPro then
     MapNote(t);
+  { a block in registers to store, after the call it came from (P366) }
+  if (FTakeTyp >= 0) and ((Copy(t, 1, 7) = '  call ') or (Copy(t, 1, 5) = '  bl ') or
+    (Copy(t, 1, 6) = '  blr ')) then
+    ResTake;
 end;
 
 { S, or its MOV of 32 bits when S moves a constant from 0 to 2^32 - 1
@@ -4400,6 +4421,16 @@ var
 begin
   if T < 0 then
     Exit;
+  { a block in registers (P366): nothing before the call, its stores
+    after (ResTake) }
+  if RegRes(T) and (E <> nil) and (E = FResDest) then
+  begin
+    FResDestUsed := True;
+    FTakeTyp := T;
+    FTakeDest := True;
+    FTakeSym := FResDestSym;
+    Exit;
+  end;
   if (E <> nil) and (E = FResDest) then
   begin
     FResDestUsed := True;
@@ -4425,7 +4456,13 @@ begin
     FTopBufSz := 8;
   FTopBufCur := FScratchCur;
   FTopBufN := Length(FScrOff);
-  if FArm then
+  if RegRes(T) then
+  begin
+    FTakeTyp := T;
+    FTakeDest := False;
+    FTakeOff := off;
+  end
+  else if FArm then
     AddImmArmT('x8', 'x29', off, 'x8')
   else
     Line('  leaq ' + IntToStr(off) + '(%rbp), %rax');
@@ -4527,6 +4564,75 @@ begin
     FStoreSrc := nil;
   end;
   Result := True;
+end;
+
+{ P366: a block of one to three whole words (a record or a static array
+  of 8, 16 or 24 bytes) comes back in registers, rax, rdx and r8 on
+  amd64, x0, x2 and x3 on arm64, the registers a string or a slice comes
+  back in, word by word as it lies in memory, a narrow field with its
+  neighbours: Go gives a struct back in registers field by field
+  (cmd/compile/abi-internal.md, register assignment of a struct), and
+  AAPCS64 gives back a composite of up to 16 bytes in x0 and x1
+  (aapcs64-2025Q4 6.9, as an argument of its type is passed). A size
+  that is no whole number of words keeps the buffer (P153), so no store
+  of a word writes past a destination of 6 bytes. }
+function TEmitter.RegRes(T: LongInt): Boolean;
+begin
+  Result := IsBlob(T) and (not IsWSet(T)) and
+    ((TSize(T) = 8) or (TSize(T) = 16) or (TSize(T) = 24));
+end;
+
+{ The call that gives a block in registers is written (P366): its words
+  go to the assignment's destination, or to the statement's scratch
+  buffer, whose address is the value then, as a block's value is its
+  address (P80). Line runs it right after the call instruction, before
+  anything else is written, so no register of the result is lost: the
+  map site that follows the call (MapSite) writes only its label. }
+procedure TEmitter.ResTake;
+var
+  n, i: LongInt;
+  r: array[0..2] of string;
+  op: string;
+begin
+  n := TSize(FTakeTyp) div 8;
+  FTakeTyp := -1;
+  if FArm then
+  begin
+    r[0] := 'x0';
+    r[1] := 'x2';
+    r[2] := 'x3';
+    if FTakeDest and FTakeSym.Global then
+    begin
+      LeaS(VarLabel(FTakeSym.Name), 'x16');
+      for i := 0 to n - 1 do
+        Line('  str ' + r[i] + ', [x16, #' + IntToStr(8 * i) + ']');
+    end
+    else if FTakeDest then
+    begin
+      for i := 0 to n - 1 do
+        StFP(r[i], FTakeSym.Off + 8 * i);
+    end
+    else
+    begin
+      for i := 0 to n - 1 do
+        StFP(r[i], FTakeOff + 8 * i);
+      AddImmArmT('x0', 'x29', FTakeOff, 'x0');
+    end;
+    Exit;
+  end;
+  r[0] := 'rax';
+  r[1] := 'rdx';
+  r[2] := 'r8';
+  for i := 0 to n - 1 do
+  begin
+    if FTakeDest then
+      op := FixedOp(FTakeSym, 8 * i)
+    else
+      op := IntToStr(FTakeOff + 8 * i) + '(%rbp)';
+    Line('  movq %' + r[i] + ', ' + op);
+  end;
+  if not FTakeDest then
+    Line('  leaq ' + IntToStr(FTakeOff) + '(%rbp), %rax');
 end;
 
 { The epilogue of a routine whose result is a block (P153): Result into
@@ -5954,7 +6060,7 @@ begin
       (not IsBlob(Pr.Locals[i].Typ)) and (k <> tykReal) and (k <> tykSet) and
       (InNames(w, ToLower(Pr.Locals[i].Name)) or
        ((not Pr.Boxing) and (Length(Pr.Shared) = 0) and (Pr.Body <> nil) and
-        (((not children) and WritesFirst(Pr.Body, Pr.Locals[i].Name, '')) or
+        (((not children) and WritesFirst(Pr.Body, Pr.Locals[i].Name, SplitAlias(Pr.Locals[i].Name))) or
         (children and FirstNested(Pr, Pr.Locals[i].Name, '')))));
     { A pointer starts as nil all the same: a stack map reads it at every
       call, the ones before its first write too (P95c). }
@@ -11757,7 +11863,7 @@ begin
     GcMark(Pr.Locals[i].Typ, 0, bits, 0);
     if not GcAny(bits) then
       Continue;
-    if not WritesFirst(Pr.Body, Pr.Locals[i].Name, '') then
+    if not WritesFirst(Pr.Body, Pr.Locals[i].Name, SplitAlias(Pr.Locals[i].Name)) then
       Continue;
     n := Length(FDaName);
     SetLength(FDaName, n + 1);
@@ -34468,7 +34574,7 @@ begin
       if FDaResKeep then
         Continue;
     end
-    else if WritesFirst(Pr.Body, FSym[own[j]].Name, '') then
+    else if WritesFirst(Pr.Body, FSym[own[j]].Name, SplitAlias(FSym[own[j]].Name)) then
       Continue;
     if FArm then
       Line('  mov ' + dregs[j] + ', xzr')
@@ -34545,8 +34651,38 @@ begin
     for i := nlr to High(FLocRanges) do
       if (FLocRanges[i].Proc = Pr.Sym) and (FLocRanges[i].Off = FResOff) then
         FLocRanges[i].E := txt;
+  { a split Result's words worked out in their return registers, each as
+    P361 works Result out in rax, when no jump reaches the epilogue
+    (P366) }
+  FSplitDone := nil;
+  SetLength(FSplitDone, Length(FSplitNow));
+  if (Length(FSplitNow) > 0) and (Pos(FEpi, Copy(FOut, b0 + 1, FLen - b0)) = 0) and
+    (Pos(FEpi, FCold) = 0) then
+    for j := 0 to High(FSplitNow) do
+    begin
+      if FArm and (j = 0) then
+        r := 'x0'
+      else if FArm then
+        r := 'x' + IntToStr(j + 1)
+      else if j = 0 then
+        r := 'rax'
+      else if j = 1 then
+        r := 'rdx'
+      else
+        r := 'r8';
+      nm := FindSym(FSplitNow[j]).Reg;
+      { not into the register of another word the epilogue still reads }
+      ok := (nm <> '') and (nm <> r);
+      for k := 0 to High(FSplitNow) do
+        if (k <> j) and (not FSplitDone[k]) and (FindSym(FSplitNow[k]).Reg = r) then
+          ok := False;
+      if ok then
+        FSplitDone[j] := TailToRet(b0, nm, r, txt);
+    end;
   Line(FEpi + ':');
-  if Pr.IsFunc and not tailin then
+  if Length(FSplitNow) > 0 then
+    SplitBack
+  else if Pr.IsFunc and not tailin then
   begin
     r := FResReg;
     if FArm then
@@ -35016,7 +35152,305 @@ begin
   Result := False;
 end;
 
+{ P366: a Result that comes back in registers and that the body reads
+  and writes field by field only, each field a whole word at a word's
+  offset (an Integer, a pointer, an object, a Double), is no record in
+  the frame: each word is a hidden local, result.w0 to result.w2
+  (ResSplit), which EmitFlat may keep in a register (P296) and which a
+  write first leaves as it is (P284), and the epilogue gives them back
+  (SplitBack). So MkPair, Result.A := A; Result.B := B, is two moves and
+  a return, where its frame stored both arguments, zeroed Result, copied
+  them there and loaded them back; Go's is one RET, its results coming
+  back in the registers its arguments came in (cmd/compile/abi-
+  internal.md), where paslang's come back in rax and rdx as a string's
+  do. A bare Result, its address, Exit with a value, asm, try, a nested
+  routine and -debug keep the record. SplitE and SplitS say whether the
+  body reads Result only so; SplitDoE and SplitDoS make each field read
+  or write its word's local. }
+function TEmitter.SplitE(E: PExpr; const Alias: string): Boolean;
+var
+  i: SizeInt;
+begin
+  Result := True;
+  if E = nil then
+    Exit;
+  if (E^.Kind = ekVar) and (SameSym(E^.Name, 'result') or ((Alias <> '') and SameSym(E^.Name, Alias))) then
+  begin
+    Result := False;
+    Exit;
+  end;
+  if (E^.Kind = ekField) and (E^.L <> nil) and (E^.L^.Kind = ekVar) and
+    (SameSym(E^.L^.Name, 'result') or ((Alias <> '') and SameSym(E^.L^.Name, Alias))) then
+  begin
+    Result := (E^.Off mod 8 = 0) and (TSize(E^.Typ) = 8) and (not IsFat(E^.Typ)) and
+      not IsBlob(E^.Typ);
+    Exit;
+  end;
+  if not (SplitE(E^.L, Alias) and SplitE(E^.R, Alias)) then
+  begin
+    Result := False;
+    Exit;
+  end;
+  for i := 0 to High(E^.Args) do
+    if not SplitE(E^.Args[i], Alias) then
+    begin
+      Result := False;
+      Exit;
+    end;
+end;
+
+function TEmitter.SplitS(S: PStmt; const Alias: string): Boolean;
+var
+  i: SizeInt;
+begin
+  Result := True;
+  if S = nil then
+    Exit;
+  Result := False;
+  if (S^.Kind = skAsm) or (S^.Kind = skTry) or ((S^.Kind = skExit) and (S^.E <> nil)) then
+    Exit;
+  if (S^.Kind <> skCall) and (SameSym(S^.Name, 'result') or ((Alias <> '') and SameSym(S^.Name, Alias))) then
+    Exit;
+  if not (SplitE(S^.E, Alias) and SplitE(S^.E2, Alias) and SplitE(S^.Dest, Alias) and
+    SplitS(S^.ThenSt, Alias) and SplitS(S^.ElseSt, Alias) and SplitS(S^.Body, Alias)) then
+    Exit;
+  for i := 0 to High(S^.Args) do
+    if not SplitE(S^.Args[i], Alias) then
+      Exit;
+  for i := 0 to High(S^.Stmts) do
+    if not SplitS(S^.Stmts[i], Alias) then
+      Exit;
+  for i := 0 to High(S^.Arms) do
+    if not SplitS(S^.Arms[i].Body, Alias) then
+      Exit;
+  for i := 0 to High(S^.Sels) do
+    if SameSym(S^.Sels[i].Dest, 'result') or ((Alias <> '') and SameSym(S^.Sels[i].Dest, Alias)) or
+      (not SplitE(S^.Sels[i].Chan, Alias)) or (not SplitE(S^.Sels[i].ValX, Alias)) or
+      (not SplitS(S^.Sels[i].Body, Alias)) then
+      Exit;
+  Result := True;
+end;
+
+procedure TEmitter.SplitDoE(E: PExpr; const Alias: string);
+var
+  i: SizeInt;
+begin
+  if E = nil then
+    Exit;
+  if (E^.Kind = ekField) and (E^.L <> nil) and (E^.L^.Kind = ekVar) and
+    (SameSym(E^.L^.Name, 'result') or ((Alias <> '') and SameSym(E^.L^.Name, Alias))) then
+  begin
+    E^.Kind := ekVar;
+    E^.Name := 'result.w' + IntToStr(E^.Off div 8);
+    E^.L := nil;
+    Exit;
+  end;
+  SplitDoE(E^.L, Alias);
+  SplitDoE(E^.R, Alias);
+  for i := 0 to High(E^.Args) do
+    SplitDoE(E^.Args[i], Alias);
+end;
+
+procedure TEmitter.SplitDoS(S: PStmt; const Alias: string);
+var
+  i: SizeInt;
+begin
+  if S = nil then
+    Exit;
+  SplitDoE(S^.E, Alias);
+  SplitDoE(S^.E2, Alias);
+  SplitDoE(S^.Dest, Alias);
+  for i := 0 to High(S^.Args) do
+    SplitDoE(S^.Args[i], Alias);
+  SplitDoS(S^.ThenSt, Alias);
+  SplitDoS(S^.ElseSt, Alias);
+  SplitDoS(S^.Body, Alias);
+  for i := 0 to High(S^.Stmts) do
+    SplitDoS(S^.Stmts[i], Alias);
+  for i := 0 to High(S^.Arms) do
+    SplitDoS(S^.Arms[i].Body, Alias);
+  for i := 0 to High(S^.Sels) do
+  begin
+    SplitDoE(S^.Sels[i].Chan, Alias);
+    SplitDoE(S^.Sels[i].ValX, Alias);
+    SplitDoS(S^.Sels[i].Body, Alias);
+  end;
+end;
+
+{ Pr with its Result split (P366): Q is Pr with the words as locals and
+  its body changed in place, FResSplit their names. False, nothing
+  changed, when Result is no record of whole-word fields that the body
+  reads field by field only. }
+function TEmitter.ResSplit(const Pr: TProc; out Q: TProc): Boolean;
+var
+  typs: array of LongInt;
+  locs: TVarDeclArray;
+  i, nw, n: SizeInt;
+  td: TTypeDef;
+begin
+  Result := False;
+  Q := Pr;
+  if FDebug or (not Pr.IsFunc) or Pr.IsCtor or (Pr.Body = nil) or (not RegRes(Pr.RetTyp)) or
+    (TKind(Pr.RetTyp) <> tykRecord) or Pr.Boxing or (Length(Pr.Shared) > 0) or
+    (Length(Pr.Pins) > 0) or HasChildren(Pr) or HasAsm(Pr.Body) then
+    Exit;
+  td := FTypes[Pr.RetTyp];
+  nw := TSize(Pr.RetTyp) div 8;
+  typs := nil;
+  SetLength(typs, nw);
+  for i := 0 to nw - 1 do
+    typs[i] := -1;
+  for i := 0 to High(td.Fields) do
+  begin
+    if (td.Fields[i].Off mod 8 <> 0) or (TSize(td.Fields[i].Typ) <> 8) or
+      IsFat(td.Fields[i].Typ) or IsBlob(td.Fields[i].Typ) or
+      (td.Fields[i].Off div 8 >= nw) then
+      Exit;
+    typs[td.Fields[i].Off div 8] := td.Fields[i].Typ;
+  end;
+  for i := 0 to nw - 1 do
+    if typs[i] < 0 then
+      Exit;
+  if not SplitS(Pr.Body, Pr.Name) then
+    Exit;
+  SplitDoS(Pr.Body, Pr.Name);
+  n := Length(Pr.Locals);
+  locs := nil;
+  SetLength(locs, n + nw);
+  for i := 0 to n - 1 do
+    locs[i] := Pr.Locals[i];
+  FResSplit := nil;
+  SetLength(FResSplit, nw);
+  for i := 0 to nw - 1 do
+  begin
+    locs[n + i] := Default(TVarDecl);
+    locs[n + i].Name := 'result.w' + IntToStr(i);
+    locs[n + i].Typ := typs[i];
+    FResSplit[i] := locs[n + i].Name;
+  end;
+  Q.Locals := locs;
+  Result := True;
+end;
+
+{ N when it is a word of the split Result (P366), else '': as WritesFirst's
+  Alias it asks for a write on every path by the end, as Result's does
+  (P284), the epilogue reading the word there; a local only needs no
+  read before its first write. }
+function TEmitter.SplitAlias(const N: string): string;
+var
+  i: SizeInt;
+begin
+  Result := '';
+  for i := 0 to High(FSplitNow) do
+    if SameSym(FSplitNow[i], N) then
+      Result := N;
+end;
+
+{ The words of a split Result back in rax, rdx and r8 (x0, x2, x3), from
+  their registers or their homes (P366), a word EmitFlat worked out in
+  its own already (FSplitDone) left: the moves between registers as one
+  parallel move, a move whose target no other still reads first, a
+  cycle broken through rcx or x16, which no variable holds; the loads
+  from the homes after them. }
+procedure TEmitter.SplitBack;
+var
+  i, j, n: SizeInt;
+  sy: TSym;
+  t, src, dst: array[0..2] of string;
+  done: array[0..2] of Boolean;
+  moved, busy: Boolean;
+  tmp: string;
+begin
+  if FArm then
+  begin
+    t[0] := 'x0';
+    t[1] := 'x2';
+    t[2] := 'x3';
+    tmp := 'x16';
+  end
+  else
+  begin
+    t[0] := 'rax';
+    t[1] := 'rdx';
+    t[2] := 'r8';
+    tmp := 'rcx';
+  end;
+  n := 0;
+  for i := 0 to High(FSplitNow) do
+  begin
+    sy := FindSym(FSplitNow[i]);
+    if (i <= High(FSplitDone)) and FSplitDone[i] then
+      Continue;
+    if (sy.Reg <> '') and (sy.Reg <> t[i]) then
+    begin
+      src[n] := sy.Reg;
+      dst[n] := t[i];
+      done[n] := False;
+      Inc(n);
+    end;
+  end;
+  repeat
+    moved := False;
+    for i := 0 to n - 1 do
+      if not done[i] then
+      begin
+        busy := False;
+        for j := 0 to n - 1 do
+          if (j <> i) and (not done[j]) and (src[j] = dst[i]) then
+            busy := True;
+        if not busy then
+        begin
+          if FArm then
+            Line('  mov ' + dst[i] + ', ' + src[i])
+          else
+            Line('  movq %' + src[i] + ', %' + dst[i]);
+          done[i] := True;
+          moved := True;
+        end;
+      end;
+    if not moved then
+      for i := 0 to n - 1 do
+        if (not done[i]) and not moved then
+        begin
+          { a cycle: its first source to the scratch register }
+          if FArm then
+            Line('  mov ' + tmp + ', ' + src[i])
+          else
+            Line('  movq %' + src[i] + ', %' + tmp);
+          src[i] := tmp;
+          moved := True;
+        end;
+    busy := False;
+    for i := 0 to n - 1 do
+      if not done[i] then
+        busy := True;
+  until not busy;
+  for i := 0 to High(FSplitNow) do
+  begin
+    sy := FindSym(FSplitNow[i]);
+    if ((i <= High(FSplitDone)) and FSplitDone[i]) or (sy.Reg <> '') then
+      Continue;
+    if FArm then
+      LdFP(t[i], sy.Off)
+    else
+      Line('  movq ' + IntToStr(sy.Off) + '(%rbp), %' + t[i]);
+  end;
+end;
+
 procedure TEmitter.EmitProc(const Pr: TProc);
+var
+  sq: TProc;
+begin
+  { a Result split into words (P366): the routine with them as locals }
+  if (Length(FResSplit) = 0) and ResSplit(Pr, sq) then
+  begin
+    EmitProcAt(sq);
+    Exit;
+  end;
+  EmitProcAt(Pr);
+end;
+
+procedure TEmitter.EmitProcAt(const Pr: TProc);
 var
   i, j, n, nargs, slot, parentN, own, nlim, k: SizeInt;
   pinUp: LongInt;
@@ -35028,6 +35462,7 @@ var
   savedHas: Boolean;
   savedResTyp: LongInt;
   savedResBuf: LongInt;
+  savedSplit: TStrArray;
   sz: LongInt;
   sysw: Boolean;
   savedTF: array of PStmt;
@@ -35051,6 +35486,9 @@ begin
   savedHas := FHasRes;
   savedResTyp := FResTyp;
   savedResBuf := FResBuf;
+  savedSplit := FSplitNow;
+  FSplitNow := FResSplit;
+  FResSplit := nil;
   savedTF := FTryFin;
   savedTD := FTryDep;
   savedTR := FTryRec;
@@ -35170,8 +35608,8 @@ begin
       FSym[n].Off := 16 + (i + Ord(HasSelf(Pr)) - nlim) * 8;
     Inc(n);
   end;
-  FHasRes := Pr.IsFunc;
-  if Pr.IsFunc then
+  FHasRes := Pr.IsFunc and (Length(FSplitNow) = 0);
+  if FHasRes then
   begin
     sz := Align8(TSize(Pr.RetTyp));
     slot := slot + sz;
@@ -35195,7 +35633,7 @@ begin
   end;
   { the address of the caller's buffer for a block (P153), after Result }
   FResBuf := 0;
-  if Pr.IsFunc and (not Pr.IsCtor) and IsBlob(Pr.RetTyp) then
+  if Pr.IsFunc and (not Pr.IsCtor) and IsBlob(Pr.RetTyp) and not RegRes(Pr.RetTyp) then
   begin
     slot := slot + 8;
     FResBuf := -LongInt(slot);
@@ -35344,16 +35782,16 @@ begin
     { The slot is whole words, so a value of 3 bytes clears one: counted
       down by 8 from its size it never reached 0 and ran on (1.0.56). }
     { Result written first on every path starts as it is (P284) }
-    if Pr.IsFunc and (not FDaResKeep) and IsBlob(Pr.RetTyp) then
+    if FHasRes and (not FDaResKeep) and IsBlob(Pr.RetTyp) then
       ZeroFrame(FResOff, Align8(TSize(Pr.RetTyp)))
-    else if Pr.IsFunc and (not FDaResKeep) and IsFat(Pr.RetTyp) then
+    else if FHasRes and (not FDaResKeep) and IsFat(Pr.RetTyp) then
     begin
       StFP('xzr', FResOff);
       StFP('xzr', FResOff + 8);
       if IsDyn(Pr.RetTyp) then
         StFP('xzr', FResOff + 16);
     end
-    else if Pr.IsFunc and (not FDaResKeep) and not ResNested(Pr) then
+    else if FHasRes and (not FDaResKeep) and not ResNested(Pr) then
       StFP('xzr', FResOff);
     BoxSetup(Pr);
     EmitStmt(Pr.Body);
@@ -35363,6 +35801,21 @@ begin
     Line(FEpi + ':');
     if Pr.IsCtor then
       LdFP('x0', -8 * LongInt(1 + Ord(Pr.Nest > 0)))
+    else if Length(FSplitNow) > 0 then
+    begin
+      { nothing of a flat attempt given up holds here }
+      FSplitDone := nil;
+      SplitBack;
+    end
+    else if Pr.IsFunc and RegRes(Pr.RetTyp) then
+    begin
+      { its words back in x0, x2 and x3 (P366) }
+      LdFP('x0', FResOff);
+      if TSize(Pr.RetTyp) > 8 then
+        LdFP('x2', FResOff + 8);
+      if TSize(Pr.RetTyp) > 16 then
+        LdFP('x3', FResOff + 16);
+    end
     else if Pr.IsFunc and IsBlob(Pr.RetTyp) then
       ResCopy
     else if Pr.IsFunc and IsFat(Pr.RetTyp) then
@@ -35417,7 +35870,7 @@ begin
     DaSetup(Pr, LongInt(loc0));
     if loc1 > loc0 then
       ZeroLocals(Pr, LongInt(loc0));
-    if Pr.IsFunc and (not FDaResKeep) and not ResNested(Pr) then
+    if FHasRes and (not FDaResKeep) and not ResNested(Pr) then
       ZeroFrame(FResOff, Align8(TSize(Pr.RetTyp)));
     BoxSetup(Pr);
     EmitStmt(Pr.Body);
@@ -35427,6 +35880,21 @@ begin
     Line(FEpi + ':');
     if Pr.IsCtor then
       Line('  movq -8(%rbp), %rax')
+    else if Length(FSplitNow) > 0 then
+    begin
+      { nothing of a flat attempt given up holds here }
+      FSplitDone := nil;
+      SplitBack;
+    end
+    else if Pr.IsFunc and RegRes(Pr.RetTyp) then
+    begin
+      { its words back in rax, rdx and r8 (P366) }
+      Line('  movq ' + IntToStr(FResOff) + '(%rbp), %rax');
+      if TSize(Pr.RetTyp) > 8 then
+        Line('  movq ' + IntToStr(FResOff + 8) + '(%rbp), %rdx');
+      if TSize(Pr.RetTyp) > 16 then
+        Line('  movq ' + IntToStr(FResOff + 16) + '(%rbp), %r8');
+    end
     else if Pr.IsFunc and IsBlob(Pr.RetTyp) then
       ResCopy
     else if Pr.IsFunc and IsFat(Pr.RetTyp) then
@@ -35530,6 +35998,7 @@ begin
   FHasRes := savedHas;
   FResTyp := savedResTyp;
   FResBuf := savedResBuf;
+  FSplitNow := savedSplit;
   FTryFin := savedTF;
   FTryDep := savedTD;
   FTryRec := savedTR;
@@ -46133,6 +46602,7 @@ begin
     FProcNests[i] := Prog.Procs[i].Nest;
   end;
   BlobTable(Prog);
+  FTakeTyp := -1;
   FResBuf := 0;
   FCallE := nil;
   FIfaceRes := -1;

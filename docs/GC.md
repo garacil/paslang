@@ -643,7 +643,11 @@ the rules above.
   not read at its own call, where the callee's Result holds the value,
   typed, until it copies it with no call after, and what the slot held
   before is nobody's; from the call's return it is read by the value's
-  type. Before, every such call took a typed block from the heap.
+  type. Before, every such call took a typed block from the heap. A
+  block of one to three words comes back in rax, rdx and r8 (x0, x2,
+  x3) instead (P366, 1.1.217), with no call between the return and the
+  caller's stores, so its pointers are never only in registers at a
+  safe point; a stop by a signal there reads the registers as words.
 
 ### 2.7 What it should give, and what it gave
 

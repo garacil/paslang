@@ -23,7 +23,15 @@ the boot compiler writes, is left out. A unit's routine a
 program calls with no buffer, as the maker of a record's constructor
 was, shows here.
 
+With --regs, in one file: each routine it names gives its block back in
+registers (P366): it takes no buffer (no .Lrb mark, no test of one),
+every call of one is followed, past its map label, by a store of rax (x0
+on arm64, or the adrp of a global destination, or the add of a far
+frame word's address into x16), and each one --short
+names is at most N instructions, ret and labels not counted.
+
 usage: check_resbuf.py file.s [--arm] --routines=p_a,p_b --dest=N
+       check_resbuf.py file.s [--arm] --regs=p_a,p_b [--short=p_a:2]
        check_resbuf.py --all dir...
 """
 
@@ -89,9 +97,61 @@ def check_all(dirs):
     print(f"check_resbuf: {n} routines take a buffer, all {calls} calls of them give one, in {len(files)} files")
 
 
+def check_regs(path, arm, regs, short):
+    L = lines_of(path)
+    raw = open(path, errors="replace").read().splitlines()
+    bodies, fn = {}, None
+    for l in raw:
+        m = re.match(r"^([A-Za-z_][\w.]*):$", l)
+        if m and not l.startswith(".L"):
+            fn = m.group(1)
+            bodies[fn] = []
+            continue
+        st = l.strip()
+        if fn is not None and st and not st.startswith(".") and not re.match(r"^\.?L\w*:$", st):
+            bodies[fn].append(st)
+    bad, calls = [], 0
+    for r in regs + list(short):
+        if r not in bodies:
+            bad.append(f"{r}: not found")
+    for r in regs:
+        if f".set .Lrb.{r}, 1" in L:
+            bad.append(f"{r}: takes a buffer")
+    for r, n in short.items():
+        b = [l for l in bodies.get(r, []) if l != "ret"]
+        if len(b) > n:
+            bad.append(f"{r}: {len(b)} instructions, {n} at most: {'; '.join(b)}")
+    # arm64: a frame word past STUR's reach is reached through x16 first
+    store = re.compile(r"^(str x0, |stp x0, |adrp x16, |(sub|add) x16, x29, )" if arm else r"^movq %rax, ")
+    for i, l in enumerate(L):
+        m = CALL.match(l)
+        if not m or m.group(1) not in regs:
+            continue
+        calls += 1
+        nxt = L[i + 1] if i + 1 < len(L) else ""
+        if not store.match(nxt):
+            bad.append(f"{l}: then {nxt}")
+    if bad:
+        print("\n".join(bad))
+        raise SystemExit(f"check_resbuf: {len(bad)} routines or calls out of the registers' rule, in {path}")
+    print(f"check_resbuf: {len(regs)} routines give their block back in registers, {calls} calls store it, in {path}")
+
+
 def main():
     if "--all" in sys.argv[1:]:
         check_all([a for a in sys.argv[1:] if not a.startswith("--")])
+        return
+    regs, short = [], {}
+    for a in sys.argv[1:]:
+        if a.startswith("--regs="):
+            regs = a.split("=", 1)[1].split(",")
+        if a.startswith("--short="):
+            for kv in a.split("=", 1)[1].split(","):
+                k, v = kv.split(":")
+                short[k] = int(v)
+    if regs:
+        args = [a for a in sys.argv[1:] if not a.startswith("--")]
+        check_regs(args[0], "--arm" in sys.argv[1:], regs, short)
         return
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     arm = "--arm" in sys.argv[1:]
