@@ -391,6 +391,9 @@ GOLDEN_A64 += boundsidiom
 # P374: on arm64 a global's field or element at a constant offset is one adrp and one access.
 GOLDEN += globoff
 GOLDEN_A64 += globoff
+# P378: the hidden variables of routines put in place share the frame's slots.
+GOLDEN += hidshare
+GOLDEN_A64 += hidshare
 # P354: a routine's record keeps no saved register once it is loaded back.
 GOLDEN += gstale
 GOLDEN_A64 += gstale
@@ -2682,6 +2685,13 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	: the compiler, TypeOf put in place: its check in IsStrTyp makes no Boolean of its index against High, its own result the one setcc; \
 	if awk '/^p_pasparse_tparser_isstrtyp:/,/cfi_endproc/' $(BUILDDIR)/stage/pasparse.s | grep -q 'setg %al'; then echo "pasparse.s: the check in IsStrTyp makes a Boolean"; exit 1; fi; \
 	echo ok boundsidiom-asm; \
+	: the hidden variables of bodies put in place share the frame slots their lives do not meet, a pointer slot with pointers only, P378; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/hidshare1 testdata/hidshare.paslang; \
+	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 $(BUILDDIR)/hidshare1 > $(BUILDDIR)/hidshare1.got; \
+	diff -u testdata/hidshare.out $(BUILDDIR)/hidshare1.got; \
+	f=$$(grep -o '\.set \.Lfrp_many, [0-9]*' $(BUILDDIR)/hidshare1.s | grep -o '[0-9]*$$'); \
+	test "$$f" -le 128 || { echo "hidshare.s: Many takes $$f bytes of frame"; exit 1; }; \
+	echo ok hidshare-asm; \
 	: c + k * x and y + k * x are one lea, x := x + k * y one lea on the register of x, r13 and rbp are never the base of a lea with an index, and a load at p - k takes the offset, P294; \
 	awk '/^p_off8:/,/cfi_endproc/' $(BUILDDIR)/leaform.s > $(BUILDDIR)/leaform-off8.s; \
 	grep -q 'leaq 8(,%r[a-z0-9]*,8), ' $(BUILDDIR)/leaform-off8.s || { echo "leaform.s: Off8 is not one lea"; exit 1; }; \
@@ -4149,6 +4159,11 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	grep -qE '^  ldrb w[0-9]+, \[x[0-9]+, :lo12:v_o\+8\]' $(BUILDDIR)/globoff1-arm.s || { echo "globoff-arm.s: o.Inner.B is not one adrp and one ldrb"; exit 1; }; \
 	grep -qE '^  ldr x[0-9]+, \[x[0-9]+, :lo12:v_g\+240\]' $(BUILDDIR)/globoff1-arm.s || { echo "globoff-arm.s: g[3].Arr[2].Q is not one adrp and one ldr"; exit 1; }; \
 	echo ok globoff-arm-asm; \
+	: P378 on arm64, under the collector verify mode; \
+	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/hidshare1-arm testdata/hidshare.paslang; \
+	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 timeout 300 $(QEMU_A64) $(BUILDDIR)/hidshare1-arm > $(BUILDDIR)/hidshare1-arm.got; \
+	diff -u testdata/hidshare.out $(BUILDDIR)/hidshare1-arm.got; \
+	echo ok hidshare-arm-asm; \
 	: every call of a routine that takes a buffer gives one, in every program and unit of both machines, P153; \
 	python3 -I scripts/check_resbuf.py --all $(BUILDDIR) $(BUILDDIR)/$(LVL_X64) $(A64DIR) '$(A64DIR)/$(LVL_A64)'; \
 	echo ok resbuf-all; \

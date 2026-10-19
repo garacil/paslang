@@ -277,6 +277,10 @@ type
     FAddrWrite: Boolean;  { the next EmitAddr is for a write: a string's characters become its own (1.0.82) }
     FStoreSrc: PExpr;     { the value StoreTo stores, when the statement knows it (1.0.82) }
     FAddrInto: string;    { P373: the register an element's address goes to, '' rax or x0 ... }
+    FLayOff: array of LongInt;   { P378: each local's offset in the frame, as the layout gave it }
+    FHidKeys: TStrArray;         { P378: the hidden variables that may share, by name ... }
+    FHidIdx: array of LongInt;   { ... their index among the routine's locals, -1 an empty slot }
+    FHidFirst, FHidLast, FHidLoop: array of LongInt;  { ... and each one's life }
     FAddrDone: Boolean;   { ... and whether its last instruction wrote it there }
     FStrMaps: array of LongInt;  { the types whose string maps .rodata carries (1.0.82) }
     FZeroMax: LongInt;    { the biggest record a closed channel gives as zero (.Lzeroblk, 1.0.83) }
@@ -1006,6 +1010,13 @@ type
     procedure FixedTo(const Sy: TSym; K: Int64; const Reg: string);
     procedure SmallChunks(N: Int64; var Off, Sz: TInt64Arr);
     function SmallMax: LongInt;
+    function HidFind(const N: string): LongInt;
+    procedure HidUse(const N: string; Ix, LoopA: LongInt);
+    procedure HidScanE(E: PExpr; Ix, LoopA: LongInt);
+    procedure HidScanS(S: PStmt; var Ix: LongInt; LoopA: LongInt);
+    function HidAddrE(E: PExpr; const N: string): Boolean;
+    function HidAddrS(S: PStmt; const N: string): Boolean;
+    function LayoutLocals(const Pr: TProc; Loc0: SizeInt): SizeInt;
     procedure AddrInto(E: PExpr; const R: string);
     procedure ScaleAtIntoX86(const Disp, B, X: string; K: Int64; const D: string);
     procedure WideChunks(N: Int64; var Off, Sz: TInt64Arr);
@@ -6067,7 +6078,9 @@ begin
   for i := 0 to High(Pr.Locals) do
   begin
     sz := Align8(SlotSize(Pr.Locals[i].Typ));
-    slot := slot + sz;
+    { the offset the layout gave it, a slot a hidden variable may share
+      (P378) }
+    slot := -FLayOff[i];
     { a P284 candidate starts as it is (DaSetup) }
     if FDaOn and (DaBit(Pr.Locals[i].Name) <> 0) then
       Continue;
@@ -7110,6 +7123,352 @@ begin
   end
   else
     Line('  leaq ' + FixedOp(Sy, K) + ', %' + Reg);
+end;
+
+{ ---- The hidden variables of bodies put in place share slots (P378) ----
+
+  P369 found pasemit's 655 frames grown from 59,824 bytes in all to
+  79,856: every site of a routine put in place adds its hidden variables
+  (inl.N.x: its parameters, its locals, its Result, HoistAt's value) to
+  its caller's locals, a slot each for the whole routine, though each
+  lives from its block to the statement it serves, and every slot is
+  zeroed or mapped (the frame-map descriptors grew by 85 KB). Go 1.23
+  merges the stack slots of locals whose lives do not overlap
+  (cmd/compile/internal/liveness/mergelocals.go). A hidden variable
+  shares here when it is written before anything reads it (WritesFirst,
+  or field by field: FieldsWritten, P367), its address is taken nowhere,
+  and the routine has no nested routine or closure and no -debug: its
+  life is its first statement to its last in the body's order, and all
+  of the outermost loop around any of its uses, as its value might pass
+  from one pass to the next. One whose life meets no other's of the
+  same type takes that one's slot, so a pointer slot is a pointer slot
+  still and the frame maps (P95c, P284) read the same kind there. The
+  names are found by a table (FNV-1a, open addressing). }
+function TEmitter.HidFind(const N: string): LongInt;
+var
+  m, h, i: SizeInt;
+  v: Int64;
+  c: Char;
+begin
+  Result := -1;
+  m := Length(FHidKeys);
+  if m = 0 then
+    Exit;
+  v := 2166136261;
+  for i := 1 to Length(N) do
+  begin
+    c := N[i];
+    if (c >= 'A') and (c <= 'Z') then
+      c := Char(Ord(c) + 32);
+    v := ((v xor Int64(Ord(c))) * 16777619) and 4294967295;
+  end;
+  h := SizeInt(v and Int64(m - 1));
+  while FHidIdx[h] <> -1 do
+  begin
+    if SameSym(FHidKeys[h], N) then
+    begin
+      Result := LongInt(h);
+      Exit;
+    end;
+    h := (h + 1) and (m - 1);
+  end;
+end;
+
+{ N used at statement Ix, inside the outermost loop that starts at LoopA
+  (-1 none). }
+procedure TEmitter.HidUse(const N: string; Ix, LoopA: LongInt);
+var
+  h: LongInt;
+  t: LongInt;
+begin
+  if (Length(N) < 5) or (Copy(N, 1, 4) <> 'inl.') then
+    Exit;
+  h := HidFind(N);
+  if h < 0 then
+    Exit;
+  t := Ix;
+  if LoopA >= 0 then
+  begin
+    t := LoopA;
+    FHidLoop[h] := LoopA;
+  end;
+  if (FHidFirst[h] < 0) or (t < FHidFirst[h]) then
+    FHidFirst[h] := t;
+  if Ix > FHidLast[h] then
+    FHidLast[h] := Ix;
+end;
+
+procedure TEmitter.HidScanE(E: PExpr; Ix, LoopA: LongInt);
+var
+  i: SizeInt;
+begin
+  if E = nil then
+    Exit;
+  if E^.Kind = ekVar then
+    HidUse(E^.Name, Ix, LoopA);
+  HidScanE(E^.L, Ix, LoopA);
+  HidScanE(E^.R, Ix, LoopA);
+  for i := 0 to High(E^.Args) do
+    HidScanE(E^.Args[i], Ix, LoopA);
+end;
+
+procedure TEmitter.HidScanS(S: PStmt; var Ix: LongInt; LoopA: LongInt);
+var
+  i: SizeInt;
+  cur, la: LongInt;
+  isLoop: Boolean;
+begin
+  if S = nil then
+    Exit;
+  Inc(Ix);
+  cur := Ix;
+  isLoop := (S^.Kind = skWhile) or (S^.Kind = skRepeat) or (S^.Kind = skFor) or (S^.Kind = skForIn);
+  la := LoopA;
+  if isLoop and (LoopA < 0) then
+    la := cur;
+  HidUse(S^.Name, cur, la);
+  HidScanE(S^.E, cur, la);
+  HidScanE(S^.E2, cur, la);
+  HidScanE(S^.Dest, cur, la);
+  for i := 0 to High(S^.Args) do
+    HidScanE(S^.Args[i], cur, la);
+  HidScanS(S^.ThenSt, Ix, la);
+  HidScanS(S^.ElseSt, Ix, la);
+  HidScanS(S^.Body, Ix, la);
+  for i := 0 to High(S^.Stmts) do
+    HidScanS(S^.Stmts[i], Ix, la);
+  for i := 0 to High(S^.Arms) do
+    HidScanS(S^.Arms[i].Body, Ix, la);
+  for i := 0 to High(S^.Sels) do
+  begin
+    HidScanE(S^.Sels[i].Chan, cur, la);
+    HidScanE(S^.Sels[i].ValX, cur, la);
+    HidUse(S^.Sels[i].Dest, cur, la);
+    HidScanS(S^.Sels[i].Body, Ix, la);
+  end;
+  { an outermost loop over: its uses live to its end }
+  if isLoop and (LoopA < 0) then
+    for i := 0 to High(FHidIdx) do
+      if (FHidIdx[i] >= 0) and (FHidLoop[i] = cur) and (FHidLast[i] < Ix) then
+        FHidLast[i] := Ix;
+end;
+
+{ E or S takes N's address. }
+function TEmitter.HidAddrE(E: PExpr; const N: string): Boolean;
+var
+  i: SizeInt;
+  r: PExpr;
+begin
+  Result := False;
+  if E = nil then
+    Exit;
+  if E^.Kind = ekAddr then
+  begin
+    r := E^.L;
+    while (r <> nil) and ((r^.Kind = ekField) or (r^.Kind = ekIndex)) do
+      r := r^.L;
+    if (r <> nil) and (r^.Kind = ekVar) and SameSym(r^.Name, N) then
+    begin
+      Result := True;
+      Exit;
+    end;
+  end;
+  Result := HidAddrE(E^.L, N) or HidAddrE(E^.R, N);
+  for i := 0 to High(E^.Args) do
+    if not Result then
+      Result := HidAddrE(E^.Args[i], N);
+end;
+
+function TEmitter.HidAddrS(S: PStmt; const N: string): Boolean;
+var
+  i: SizeInt;
+begin
+  Result := False;
+  if S = nil then
+    Exit;
+  Result := HidAddrE(S^.E, N) or HidAddrE(S^.E2, N) or HidAddrE(S^.Dest, N) or
+    HidAddrS(S^.ThenSt, N) or HidAddrS(S^.ElseSt, N) or HidAddrS(S^.Body, N);
+  for i := 0 to High(S^.Args) do
+    if not Result then
+      Result := HidAddrE(S^.Args[i], N);
+  for i := 0 to High(S^.Stmts) do
+    if not Result then
+      Result := HidAddrS(S^.Stmts[i], N);
+  for i := 0 to High(S^.Arms) do
+    if not Result then
+      Result := HidAddrS(S^.Arms[i].Body, N);
+  for i := 0 to High(S^.Sels) do
+    if not Result then
+      Result := HidAddrE(S^.Sels[i].Chan, N) or HidAddrE(S^.Sels[i].ValX, N) or
+        HidAddrS(S^.Sels[i].Body, N);
+end;
+
+{ The locals' offsets into FLayOff from Loc0 on, a slot each but for
+  the hidden ones that share; the frame's end. }
+function TEmitter.LayoutLocals(const Pr: TProc; Loc0: SizeInt): SizeInt;
+var
+  i, j, m, h, nc, ncol, k: SizeInt;
+  v: Int64;
+  c: Char;
+  share: Boolean;
+  root, order, tmp: array of LongInt;
+  colTyp, colRoot, colEnd: array of LongInt;
+  slot: SizeInt;
+  nm: string;
+  w, a, b, p, q, e: SizeInt;
+  ix: LongInt;
+begin
+  FLayOff := nil;
+  SetLength(FLayOff, Length(Pr.Locals));
+  root := nil;
+  SetLength(root, Length(Pr.Locals));
+  for i := 0 to High(root) do
+    root[i] := LongInt(i);
+  share := (not FDebug) and (Pr.Body <> nil) and (not Pr.Boxing) and (Length(Pr.Shared) = 0) and
+    (not HasChildren(Pr));
+  if share then
+  begin
+    { the candidates' table }
+    nc := 0;
+    for i := 0 to High(Pr.Locals) do
+      if Copy(Pr.Locals[i].Name, 1, 4) = 'inl.' then
+        Inc(nc);
+    share := nc > 1;
+  end;
+  if share then
+  begin
+    m := 16;
+    while m < 2 * nc do
+      m := m * 2;
+    FHidKeys := nil;
+    FHidIdx := nil;
+    FHidFirst := nil;
+    FHidLast := nil;
+    FHidLoop := nil;
+    SetLength(FHidKeys, m);
+    SetLength(FHidIdx, m);
+    SetLength(FHidFirst, m);
+    SetLength(FHidLast, m);
+    SetLength(FHidLoop, m);
+    for i := 0 to m - 1 do
+    begin
+      FHidIdx[i] := -1;
+      FHidFirst[i] := -1;
+      FHidLast[i] := -1;
+      FHidLoop[i] := -1;
+    end;
+    for i := 0 to High(Pr.Locals) do
+    begin
+      nm := Pr.Locals[i].Name;
+      if Copy(nm, 1, 4) <> 'inl.' then
+        Continue;
+      if HidAddrS(Pr.Body, nm) then
+        Continue;
+      if not (WritesFirst(Pr.Body, nm, '') or
+        ((TKind(Pr.Locals[i].Typ) = tykRecord) and FieldsWritten(Pr.Body, nm, '', FTypes, Pr.Locals[i].Typ))) then
+        Continue;
+      if HidFind(nm) >= 0 then
+        Continue;
+      v := 2166136261;
+      for j := 1 to Length(nm) do
+      begin
+        c := nm[j];
+        if (c >= 'A') and (c <= 'Z') then
+          c := Char(Ord(c) + 32);
+        v := ((v xor Int64(Ord(c))) * 16777619) and 4294967295;
+      end;
+      h := SizeInt(v and Int64(m - 1));
+      while FHidIdx[h] <> -1 do
+        h := (h + 1) and (m - 1);
+      FHidKeys[h] := nm;
+      FHidIdx[h] := LongInt(i);
+    end;
+    ix := 0;
+    HidScanS(Pr.Body, ix, -1);
+    { the used ones in the order their lives start: a merge sort }
+    order := nil;
+    for h := 0 to m - 1 do
+      if (FHidIdx[h] >= 0) and (FHidFirst[h] >= 0) then
+      begin
+        SetLength(order, Length(order) + 1);
+        order[High(order)] := LongInt(h);
+      end;
+    SetLength(tmp, Length(order));
+    w := 1;
+    while w < Length(order) do
+    begin
+      a := 0;
+      while a < Length(order) do
+      begin
+        b := a + w;
+        if b > Length(order) then
+          b := Length(order);
+        e := a + 2 * w;
+        if e > Length(order) then
+          e := Length(order);
+        p := a;
+        q := b;
+        for j := a to e - 1 do
+          if (p < b) and ((q >= e) or (FHidFirst[order[p]] <= FHidFirst[order[q]])) then
+          begin
+            tmp[j] := order[p];
+            Inc(p);
+          end
+          else
+          begin
+            tmp[j] := order[q];
+            Inc(q);
+          end;
+        a := e;
+      end;
+      for j := 0 to High(order) do
+        order[j] := tmp[j];
+      w := 2 * w;
+    end;
+    { a slot each type, taken again once its life is over }
+    ncol := 0;
+    colTyp := nil;
+    colRoot := nil;
+    colEnd := nil;
+    for j := 0 to High(order) do
+    begin
+      h := order[j];
+      i := FHidIdx[h];
+      k := -1;
+      for p := 0 to ncol - 1 do
+        if (colTyp[p] = Pr.Locals[i].Typ) and (colEnd[p] < FHidFirst[h]) then
+        begin
+          k := p;
+          Break;
+        end;
+      if k < 0 then
+      begin
+        SetLength(colTyp, ncol + 1);
+        SetLength(colRoot, ncol + 1);
+        SetLength(colEnd, ncol + 1);
+        colTyp[ncol] := Pr.Locals[i].Typ;
+        colRoot[ncol] := LongInt(i);
+        colEnd[ncol] := FHidLast[h];
+        Inc(ncol);
+      end
+      else
+      begin
+        root[i] := colRoot[k];
+        colEnd[k] := FHidLast[h];
+      end;
+    end;
+  end;
+  slot := Loc0;
+  for i := 0 to High(Pr.Locals) do
+    if root[i] = i then
+    begin
+      slot := slot + Align8(SlotSize(Pr.Locals[i].Typ));
+      FLayOff[i] := -LongInt(slot);
+    end;
+  for i := 0 to High(Pr.Locals) do
+    if root[i] <> i then
+      FLayOff[i] := FLayOff[root[i]];
+  Result := slot;
 end;
 
 { P373: E's value, an address, into R: an element's last lea or add
@@ -12644,7 +13003,7 @@ begin
   for i := 0 to High(Pr.Locals) do
   begin
     sz := Align8(SlotSize(Pr.Locals[i].Typ));
-    slot := slot + sz;
+    slot := -FLayOff[i];
     if Length(FDaName) >= 63 then
       Continue;
     nm := ToLower(Pr.Locals[i].Name);
@@ -36397,12 +36756,12 @@ begin
     FResBuf := -LongInt(slot);
   end;
   loc0 := slot;
+  { the hidden variables of bodies put in place share slots (P378) }
+  slot := LayoutLocals(Pr, loc0);
   for i := 0 to High(Pr.Locals) do
   begin
-    sz := Align8(SlotSize(Pr.Locals[i].Typ));
-    slot := slot + sz;
     FSym[n].Name := Pr.Locals[i].Name;
-    FSym[n].Off := -LongInt(slot);
+    FSym[n].Off := FLayOff[i];
     FSym[n].Global := False;
     FSym[n].Typ := Pr.Locals[i].Typ;
     FSym[n].Up := 0;
