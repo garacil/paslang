@@ -361,6 +361,9 @@ GOLDEN_A64 += recres
 # P364: for x in a static array a call gives takes the array once.
 GOLDEN += forinonce
 GOLDEN_A64 += forinonce
+# P365: a field of the record a property's getter gives.
+GOLDEN += propblob
+GOLDEN_A64 += propblob
 # P354: a routine's record keeps no saved register once it is loaded back.
 GOLDEN += gstale
 GOLDEN_A64 += gstale
@@ -1722,6 +1725,15 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  grep -qF "$$w" $(BUILDDIR)/overbad_$$n.err || { cat $(BUILDDIR)/overbad_$$n.err; exit 1; }; \
 	done; \
 	echo ok overbad; \
+	echo "==== the value of a call is no place to write (P365) ===="; \
+	for f in 'callfield:a field or an element of the value a call gives is no place to write at 12:3' 'getterfield:a field or an element of the value a call gives is no place to write at 19:3' 'callelem:a field or an element of the value a call gives is no place to write at 12:3'; do \
+	  n=$${f%%:*}; w=$${f#*:}; \
+	  if $(OUTDIR)/paslangc -o $(BUILDDIR)/valplace_$$n testdata/valplace/$$n.paslang >$(BUILDDIR)/valplace_$$n.err 2>&1; then \
+	    echo "$$n should fail"; exit 1; \
+	  fi; \
+	  grep -qF "$$w" $(BUILDDIR)/valplace_$$n.err || { cat $(BUILDDIR)/valplace_$$n.err; exit 1; }; \
+	done; \
+	echo ok valplace; \
 	echo "==== variables with a value and absolute rejects (P144) ===="; \
 	for f in 'absnone:unknown variable nothing at 3:21' 'abstwo:absolute names one variable at a time at 4:15' \
 	  'abstype:b: Byte absolute x: Integer; absolute is another name for a variable of its own type' \
