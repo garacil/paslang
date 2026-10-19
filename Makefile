@@ -343,6 +343,9 @@ GOLDEN_A64 += nestzero
 # P360: a binary operation keeps its left side in a register while a right side that calls nothing is worked out.
 GOLDEN += keepleft
 GOLDEN_A64 += keepleft
+# P150: among overloads the nearest conversion wins.
+GOLDEN += overnear
+GOLDEN_A64 += overnear
 # P334: a closure or nested routine that calls nothing has no frame.
 GOLDEN += nestflat
 GOLDEN_A64 += nestflat
@@ -1705,7 +1708,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	done; \
 	echo ok ifacebad; \
 	echo "==== overload ambiguities (P141) ===="; \
-	for f in 'ambigset:ambiguous call G at 13:11' 'ambigref:ambiguous call H at 20:11' 'ambigptr:ambiguous call F at 22:11'; do \
+	for f in 'ambigset:ambiguous call G at 18:11' 'ambigref:ambiguous call H at 24:11' 'ambigptr:ambiguous call F at 30:11'; do \
 	  n=$${f%%:*}; w=$${f#*:}; \
 	  if $(OUTDIR)/paslangc -o $(BUILDDIR)/overbad_$$n testdata/overbad/$$n.paslang >$(BUILDDIR)/overbad_$$n.err 2>&1; then \
 	    echo "$$n should fail"; exit 1; \

@@ -2600,23 +2600,26 @@ unit's `Half(X: Integer)` makes `Half(3)` the program's, and declared
 same types first, then an integer that widens without losing a value
 (the nearer width first, the same sign before the other: a `Byte` goes
 to `Word` before `Int16`, an `Int8` never to `Word`), then an integer
-for a real. A constant with no type of its own is an `Integer`, so
+for a real, a `Double` before a `Single`. A constant with no type of its own is an `Integer`, so
 `Put(5)` takes `Put(x: Word)` before `Put(x: Byte)`, and `Int8` before
 `Byte`; `Put(300)` takes `Word`. A `var` parameter takes its own type
 alone. Two routines that fit equally well are an ambiguous call.
-Beyond those, an argument fits every parameter a call converts it into,
-priced as Free Pascal ranks it: a subrange for its host, a list in
-brackets for an `array of const` or for a set of its kind (the two
-tie), then for a slice, `nil` for a reference, a pointer for `Pointer`,
-an object for an ancestor (the nearest first), a class reference for
-another (they tie), a `Char` for a string, an object for an interface
-it implements or for `Pointer` (they tie). `F('x')` takes `F(C: Char)`
-before `F(const S: string)`; `F(k)` with a `TGrand` takes `F(X: TKid)`
-before `F(X: TBase)`; `F([1, 2])` takes `array of const` before `array of
-Int64`. A list of elements of more than one kind, `[n, 'x']`, is a list:
-an `array of const` takes it, a set does not (1.1.16, P141; only the
-exact types, the integers and the reals matched, so `F(c)` with a Char
-for `F(const S: string)` found no overload). `forward` declares a routine before its
+Beyond those, an argument fits every parameter a call converts it into:
+a subrange for its host, a list in brackets for a set of its kind, then
+for a slice, then for an `array of const`, `nil` for a reference, a
+pointer for `Pointer`, an object for an ancestor and a class reference
+for another (the nearest first), a `Char` for a string, an object for
+an interface it implements, then for `Pointer`. `F('x')` takes `F(C:
+Char)` before `F(const S: string)`; `F(k)` with a `TGrand` takes `F(X:
+TKid)` before `F(X: TBase)`, and `H(TGrand)` `H(K: TKidClass)` before
+`H(K: TBaseClass)`; `F([1, 2])` takes `array of Int64` before `array of
+const`, `F(5)` `F(X: Double)` before `F(X: Single)`. Where Free Pascal
+3.2.2 ties those pairs, paslang takes the more specific one (1.1.212,
+P150); a true tie, two routines that fit at the same price, stays an
+ambiguous call. A list of elements of more than one kind, `[n, 'x']`,
+is a list: an `array of const` takes it, a set does not (1.1.16, P141;
+only the exact types, the integers and the reals matched, so `F(c)`
+with a Char for `F(const S: string)` found no overload). `forward` declares a routine before its
 body; the later header must repeat the same signature.
 
 A routine is also a value. The type is written the way the header is:
