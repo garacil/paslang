@@ -373,6 +373,9 @@ GOLDEN_A64 += fieldfirst
 # P370: a block assigned is copied or zeroed in line, and a copy through nil stops.
 GOLDEN += blockcopy
 GOLDEN_A64 += blockcopy
+# P368: a routine whose result is a block is put in place.
+GOLDEN += blockinl
+GOLDEN_A64 += blockinl
 # P354: a routine's record keeps no saved register once it is loaded back.
 GOLDEN += gstale
 GOLDEN_A64 += gstale
@@ -2626,6 +2629,13 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	if awk '/^p_t200:/,/cfi_endproc/' $(BUILDDIR)/blockcopy1.s | grep -q 'rep stosb'; then echo "blockcopy.s: T200 zeroes a variable with rep stosb"; exit 1; fi; \
 	awk '/^p_t300:/,/cfi_endproc/' $(BUILDDIR)/blockcopy1.s | grep -q 'call rt_memcpy' || { echo "blockcopy.s: T300 copies no block with rt_memcpy"; exit 1; }; \
 	echo ok blockcopy-asm; \
+	: a routine whose result is a block goes in where it is called, a field of it read where Result came from, P368; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/blockinl1 testdata/blockinl.paslang; \
+	grep -q 'movq v_g+120+16(%rip), %r' $(BUILDDIR)/blockinl1.s || { echo "blockinl.s: Get(4).C is not one load of G[4].C"; exit 1; }; \
+	if awk '/^p_fresh:/,/cfi_endproc/' $(BUILDDIR)/blockinl1.s | grep -q 'call'; then echo "blockinl.s: Fresh calls"; exit 1; fi; \
+	test $$(awk '/^pas_main:/,/cfi_endproc/' $(BUILDDIR)/blockinl1.s | grep -c 'call p_get$$') -eq 5 || { echo "blockinl.s: the main block does not call Get five times"; exit 1; }; \
+	test $$(awk '/^pas_main:/,/cfi_endproc/' $(BUILDDIR)/blockinl1.s | grep -c 'call p_mkpair$$') -eq 2 || { echo "blockinl.s: the main block does not call MkPair twice"; exit 1; }; \
+	echo ok blockinl-asm; \
 	: c + k * x and y + k * x are one lea, x := x + k * y one lea on the register of x, r13 and rbp are never the base of a lea with an index, and a load at p - k takes the offset, P294; \
 	awk '/^p_off8:/,/cfi_endproc/' $(BUILDDIR)/leaform.s > $(BUILDDIR)/leaform-off8.s; \
 	grep -q 'leaq 8(,%r[a-z0-9]*,8), ' $(BUILDDIR)/leaform-off8.s || { echo "leaform.s: Off8 is not one lea"; exit 1; }; \
@@ -4043,6 +4053,12 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	if awk '/^p_t200:/,/cfi_endproc/' $(BUILDDIR)/blockcopy1-arm.s | grep -q 'bl rt_fill'; then echo "blockcopy-arm.s: T200 zeroes a variable with rt_fill"; exit 1; fi; \
 	awk '/^p_t300:/,/cfi_endproc/' $(BUILDDIR)/blockcopy1-arm.s | grep -q 'bl rt_memcpy' || { echo "blockcopy-arm.s: T300 copies no block with rt_memcpy"; exit 1; }; \
 	echo ok blockcopy-arm-asm; \
+	: P368 on arm64; \
+	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/blockinl1-arm testdata/blockinl.paslang; \
+	if awk '/^p_fresh:/,/cfi_endproc/' $(BUILDDIR)/blockinl1-arm.s | grep -q 'bl '; then echo "blockinl-arm.s: Fresh calls"; exit 1; fi; \
+	test $$(awk '/^pas_main:/,/cfi_endproc/' $(BUILDDIR)/blockinl1-arm.s | grep -c 'bl p_get$$') -eq 5 || { echo "blockinl-arm.s: the main block does not call Get five times"; exit 1; }; \
+	test $$(awk '/^pas_main:/,/cfi_endproc/' $(BUILDDIR)/blockinl1-arm.s | grep -c 'bl p_mkpair$$') -eq 2 || { echo "blockinl-arm.s: the main block does not call MkPair twice"; exit 1; }; \
+	echo ok blockinl-arm-asm; \
 	: every call of a routine that takes a buffer gives one, in every program and unit of both machines, P153; \
 	python3 -I scripts/check_resbuf.py --all $(BUILDDIR) $(BUILDDIR)/$(LVL_X64) $(A64DIR) '$(A64DIR)/$(LVL_A64)'; \
 	echo ok resbuf-all; \

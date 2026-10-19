@@ -429,6 +429,7 @@ var
   WfCalls: Boolean;
 
 function WritesFirst(S: PStmt; const N, Alias: string): Boolean;
+function FieldsWritten(S: PStmt; const N, Alias: string; const Types: TTypeDefArray; T: LongInt): Boolean;
 function NewInt(V: Int64): PExpr;
 function NewReal(V: Int64): PExpr;
 function NewStr(const S: string): PExpr;
@@ -1872,6 +1873,243 @@ begin
   Result := WalkW(S, N, Alias, asg);
   if Result and (Alias <> '') and (not asg) then
     Result := False;
+end;
+
+{ P367: a record whose fields are written one by one starts as it is
+  when every path writes each field before anything reads it, and, for
+  Result, writes them all by the end: P284 asked for a write of the
+  whole. Only for a record of at most 63 fields that tile it with no
+  padding between or after (a comparison of two records may read every
+  byte), and only its top-level fields count: M has bit i when field i
+  is written. Go's SSA writes no zero into a struct whose fields are all
+  set (cmd/compile/internal/ssa, deadstore). The emitter asks it of a
+  record with no pointer word, which no stack map reads (P367), the
+  inliner of a block Result put in place (P368). FieldIdxOf is the field
+  at offset Off of T, -1 none. }
+function FieldIdxOf(const Types: TTypeDefArray; T, Off: LongInt): LongInt;
+var
+  i: SizeInt;
+begin
+  Result := -1;
+  for i := 0 to High(Types[T].Fields) do
+    if Types[T].Fields[i].Off = Off then
+    begin
+      Result := LongInt(i);
+      Exit;
+    end;
+end;
+
+{ The bytes a value of type T takes, as the emitter's TSize: an object
+  is its reference. }
+function TypeBytes(const Types: TTypeDefArray; T: LongInt): LongInt;
+begin
+  Result := 8;
+  if (T < 0) or (T > High(Types)) or (Types[T].Kind = tykClass) then
+    Exit;
+  Result := Types[T].Size;
+  if Result <= 0 then
+    Result := 8;
+end;
+
+{ E reads nothing of N that M says is not written yet. }
+function FieldsReadOK(E: PExpr; const N, Alias: string; const Types: TTypeDefArray; T: LongInt;
+  M: Int64): Boolean;
+var
+  i: SizeInt;
+  f: LongInt;
+  r: PExpr;
+begin
+  Result := True;
+  if E = nil then
+    Exit;
+  Result := False;
+  if (E^.Kind = ekVar) and IsN(E^.Name, N, Alias) then
+  begin
+    Result := M = (Int64(1) shl Length(Types[T].Fields)) - 1;
+    Exit;
+  end;
+  if E^.Kind = ekField then
+  begin
+    { a field of N, or a field of a field of N: the top-level one }
+    r := E;
+    while (r^.L <> nil) and (r^.L^.Kind = ekField) do
+      r := r^.L;
+    if (r^.L <> nil) and (r^.L^.Kind = ekVar) and IsN(r^.L^.Name, N, Alias) then
+    begin
+      f := FieldIdxOf(Types, T, r^.Off);
+      Result := (f >= 0) and ((M and (Int64(1) shl f)) <> 0);
+      Exit;
+    end;
+  end;
+  if not (FieldsReadOK(E^.L, N, Alias, Types, T, M) and FieldsReadOK(E^.R, N, Alias, Types, T, M)) then
+    Exit;
+  for i := 0 to High(E^.Args) do
+    if not FieldsReadOK(E^.Args[i], N, Alias, Types, T, M) then
+      Exit;
+  Result := True;
+end;
+
+{ WalkW's walk with fields: True when no path reads a field of N before
+  it writes it; M the fields every path wrote. }
+function FieldsWalk(S: PStmt; const N, Alias: string; const Types: TTypeDefArray; T: LongInt;
+  var M: Int64): Boolean;
+var
+  i: SizeInt;
+  f: LongInt;
+  m1, m2, all: Int64;
+  full: Int64;
+begin
+  Result := True;
+  if S = nil then
+    Exit;
+  Result := False;
+  full := (Int64(1) shl Length(Types[T].Fields)) - 1;
+  { a write of the whole by name; a loop's or ReadLn's variable; an
+    assignment with a place has its root's name too, which says nothing }
+  if IsN(S^.Name, N, Alias) and not ((S^.Kind = skAssign) and (S^.Dest <> nil)) then
+  begin
+    if (S^.Kind = skAssign) and (S^.Dest = nil) then
+    begin
+      if not FieldsReadOK(S^.E, N, Alias, Types, T, M) then
+        Exit;
+      M := full;
+      Result := True;
+    end;
+    Exit;
+  end;
+  case S^.Kind of
+    skAssign:
+      begin
+        if not FieldsReadOK(S^.E, N, Alias, Types, T, M) then
+          Exit;
+        if (S^.Dest <> nil) and (S^.Dest^.Kind = ekVar) and IsN(S^.Dest^.Name, N, Alias) then
+          M := full
+        else if (S^.Dest <> nil) and (S^.Dest^.Kind = ekField) and (S^.Dest^.L <> nil) and
+          (S^.Dest^.L^.Kind = ekVar) and IsN(S^.Dest^.L^.Name, N, Alias) then
+        begin
+          f := FieldIdxOf(Types, T, S^.Dest^.Off);
+          if f < 0 then
+            Exit;
+          M := M or (Int64(1) shl f);
+        end
+        else if not FieldsReadOK(S^.Dest, N, Alias, Types, T, M) then
+          Exit;
+      end;
+    skIf:
+      begin
+        if not FieldsReadOK(S^.E, N, Alias, Types, T, M) then
+          Exit;
+        m1 := M;
+        if not FieldsWalk(S^.ThenSt, N, Alias, Types, T, m1) then
+          Exit;
+        m2 := M;
+        if not FieldsWalk(S^.ElseSt, N, Alias, Types, T, m2) then
+          Exit;
+        M := m1 and m2;
+      end;
+    skWhile:
+      begin
+        if not FieldsReadOK(S^.E, N, Alias, Types, T, M) then
+          Exit;
+        m1 := M;
+        if not FieldsWalk(S^.Body, N, Alias, Types, T, m1) then
+          Exit;
+      end;
+    skRepeat:
+      begin
+        m1 := M;
+        if not FieldsWalk(S^.Body, N, Alias, Types, T, m1) then
+          Exit;
+        if not FieldsReadOK(S^.E, N, Alias, Types, T, m1) then
+          Exit;
+        M := m1;
+      end;
+    skFor:
+      begin
+        if not (FieldsReadOK(S^.E, N, Alias, Types, T, M) and FieldsReadOK(S^.E2, N, Alias, Types, T, M)) then
+          Exit;
+        m1 := M;
+        if not FieldsWalk(S^.Body, N, Alias, Types, T, m1) then
+          Exit;
+      end;
+    skBlock:
+      for i := 0 to High(S^.Stmts) do
+        if not FieldsWalk(S^.Stmts[i], N, Alias, Types, T, M) then
+          Exit;
+    skCase:
+      begin
+        if not FieldsReadOK(S^.E, N, Alias, Types, T, M) then
+          Exit;
+        all := full;
+        for i := 0 to High(S^.Arms) do
+        begin
+          m1 := M;
+          if not FieldsWalk(S^.Arms[i].Body, N, Alias, Types, T, m1) then
+            Exit;
+          all := all and m1;
+        end;
+        m2 := M;
+        if not FieldsWalk(S^.ElseSt, N, Alias, Types, T, m2) then
+          Exit;
+        M := all and m2;
+      end;
+    skCall, skWrite, skWriteLn, skSend, skClose, skSleep, skInc, skDec:
+      begin
+        if (S^.Kind = skCall) and (S^.Name = 'rt_dumplocs') then
+          Exit;
+        if not (FieldsReadOK(S^.E, N, Alias, Types, T, M) and FieldsReadOK(S^.Dest, N, Alias, Types, T, M)) then
+          Exit;
+        for i := 0 to High(S^.Args) do
+          if not FieldsReadOK(S^.Args[i], N, Alias, Types, T, M) then
+            Exit;
+      end;
+    skExit:
+      begin
+        if S^.E <> nil then
+          Exit;
+        { the epilogue reads Result there }
+        if (Alias <> '') and (M <> full) then
+          Exit;
+        M := full;
+      end;
+    skHalt:
+      begin
+        if not FieldsReadOK(S^.E, N, Alias, Types, T, M) then
+          Exit;
+        M := full;
+      end;
+    skBreak, skContinue:
+      M := full;
+  else
+    Exit;
+  end;
+  Result := True;
+end;
+
+{ N, a record of type T, has every field written on every path before
+  anything reads it (FieldsWalk), and, for Result (Alias the routine's
+  name), every one by the end. }
+function FieldsWritten(S: PStmt; const N, Alias: string; const Types: TTypeDefArray; T: LongInt): Boolean;
+var
+  i: SizeInt;
+  m: Int64;
+  sz: LongInt;
+begin
+  Result := False;
+  if (S = nil) or (T < 0) or (T > High(Types)) or (Types[T].Kind <> tykRecord) or
+    (Length(Types[T].Fields) = 0) or (Length(Types[T].Fields) > 63) then
+    Exit;
+  sz := 0;
+  for i := 0 to High(Types[T].Fields) do
+    sz := sz + TypeBytes(Types, Types[T].Fields[i].Typ);
+  if sz <> TypeBytes(Types, T) then
+    Exit;
+  m := 0;
+  if not FieldsWalk(S, N, Alias, Types, T, m) then
+    Exit;
+  if (Alias <> '') and (m <> (Int64(1) shl Length(Types[T].Fields)) - 1) then
+    Exit;
+  Result := True;
 end;
 
 function NewInt(V: Int64): PExpr;

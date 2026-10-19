@@ -2516,8 +2516,9 @@ caller's, so a write through that pointer is the caller's too.
 costs no call (1.1.1): the compiler copies its body where it is
 called. Plain means no nested routine, closure, method or
 constructor; parameters, locals and result of an integer, Boolean,
-enumeration, subrange or pointer type, and `var` or `out` parameters
-of a record too (1.1.126); a body of assignments, ifs,
+enumeration, subrange or pointer type, `var` or `out` parameters
+of a record too (1.1.126), and a result that is a record, a static
+array or a set of 32 bytes (1.1.220); a body of assignments, ifs,
 cases, `while`, `repeat` and `for` loops (a `for x in` only over a
 static array), calls, `Write`, `Inc`, `Dec`, `Halt`, `Sleep`, `Send`,
 `Close`, and `Break` or `Continue` in loops of its own, and nothing
@@ -2544,6 +2545,13 @@ stays a call where the place given for a `var` parameter is found
 through a variable another `var` parameter is given, such as
 `Bump(b[j], j)`: the routine may change `j` before it writes the place,
 and the call reached the place by the address it took first. A
+function whose result is a block takes the variable its value goes to
+as `Result`, or a hidden one copied there, which starts at zero unless
+every path writes it, whole or field by field, before reading it; one
+whose body ends with `Result :=` a place, `Result` named nowhere else,
+gives that place: `F(x).Field` where the call was reads the field from
+where `Result` came, `G[k].Field`, one load, and `r := F(x)` copies it
+once (1.1.220). A
 function with no locals whose body is `Result :=` one expression that
 makes no call goes in as that expression wherever it is used (1.1.112),
 in a condition or an operand as well, each argument standing for its

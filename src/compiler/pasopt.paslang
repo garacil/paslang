@@ -53,9 +53,20 @@ type
     FAnyAsm: Boolean;       { a routine has asm, which may name anything }
     FMapFrom: TStrArray;    { the callee's names ... }
     FMapTo: TExprArray;     { ... and what stands for each in the copy }
+    FHoistTo: PExpr;        { P368: the hidden variable HoistAt takes a block result into, which Result is }
+    FWantPlace: Boolean;    { P368: HoistAt reads a word of the result where the call was ... }
+    FPlace: PExpr;          { ... from the place InlineAt gives here }
     function SameId(const A, B: string): Boolean;
     function Scalar(T: LongInt): Boolean;
     function RecordTyp(T: LongInt): Boolean;
+    function BlockTyp(T: LongInt): Boolean;
+    function WordTyp(T: LongInt): Boolean;
+    function NeedZero(Body: PStmt; const N, Alias: string; T: LongInt): Boolean;
+    function PlaceBody(Idx: LongInt; out P: PExpr): Boolean;
+    function PartOf(E, C: PExpr; Top: LongInt): LongInt;
+    function PartIn(S: PStmt; C: PExpr): LongInt;
+    function NamedIn(const A: TExprArray; const N: string): Boolean;
+    function HasTry(S: PStmt): Boolean;
     procedure MapName(const N: string; E: PExpr);
     function Mapped(const N: string; out E: PExpr): Boolean;
     function CloneE(E: PExpr): PExpr;
@@ -505,6 +516,194 @@ begin
   Result := (T >= 0) and (T <= High(FProg^.Types)) and (FProg^.Types[T].Kind = tykRecord);
 end;
 
+{ ---- A block result put in place (P368) ----
+
+  A function whose result is a block, as the emitter's IsBlob (P153): a
+  record, a static array, a set of 32 bytes. Its Result is the variable
+  the call's value goes to: the hidden one HoistAt takes it into, or the
+  caller's own local that no argument names, in a routine with no try,
+  where no half-written value can be seen after a failure; else a hidden
+  one copied there. It starts at zero unless every path writes it whole
+  (WritesFirst, P284) or field by field (FieldsWritten, P367) before
+  anything reads it. Go declares an inlined result variable and zeroes
+  it before the body, or only at the one return when there is one
+  (noder/reader.go inlReturn, inline/inl.go canDelayResults). A body
+  whose last statement is Result := a place, Result named nowhere else,
+  gives that place: the value is the place read where it goes, Dest :=
+  the place after the rest of the body, and a part of the result read
+  where the call was (TypeOf(x).Kind) is that part of the place, no copy
+  made, as Go's SSA reads a load from the source of a Move just made
+  with no store between (ssa/_gen/generic.rules, Load of Move): nothing
+  between the body and the read can change the place, the operands
+  before the call being ones no call changes (FirstCall's Ahead) and the
+  rest worked out left to right after it (§ operands). Only a part whose
+  value is a word or two read whole (WordTyp): one a const parameter
+  takes by its address, a string a write may change in place, a block,
+  would see the place where the call gave a copy. }
+function TOpt.BlockTyp(T: LongInt): Boolean;
+var
+  k: TTypeKind;
+begin
+  Result := False;
+  if (T < 0) or (T > High(FProg^.Types)) then
+    Exit;
+  k := FProg^.Types[T].Kind;
+  Result := (k = tykRecord) or ((k = tykArray) and (FProg^.Types[T].Hi >= FProg^.Types[T].Lo)) or
+    ((k = tykSet) and (FProg^.Types[T].Size = 32));
+end;
+
+{ A value read whole into registers, never kept by its address: an
+  integer, a Char, a Boolean, an enumeration, a subrange, a pointer, an
+  object, a class, a real, a Currency, a set of 8 bytes or fewer. }
+function TOpt.WordTyp(T: LongInt): Boolean;
+var
+  k: TTypeKind;
+begin
+  Result := False;
+  if (T < 0) or (T > High(FProg^.Types)) then
+    Exit;
+  k := FProg^.Types[T].Kind;
+  Result := (k = tykInteger) or (k = tykBoolean) or (k = tykEnum) or (k = tykSubrange) or
+    (k = tykPointer) or (k = tykClass) or (k = tykClassRef) or (k = tykReal) or
+    (k = tykCurrency) or ((k = tykSet) and (FProg^.Types[T].Size <= 8));
+end;
+
+{ N of type T, in Body, needs its zero first: a path may read it, or a
+  part of it, before writing it. }
+function TOpt.NeedZero(Body: PStmt; const N, Alias: string; T: LongInt): Boolean;
+begin
+  Result := not WritesFirst(Body, N, Alias);
+  if Result and RecordTyp(T) and FieldsWritten(Body, N, Alias, FProg^.Types, T) then
+    Result := False;
+end;
+
+{ The routine's body ends with Result := P (or its name := P), P a place
+  of the result's type that makes no call and takes no address of its
+  own value parameter, and names Result nowhere else. }
+function TOpt.PlaceBody(Idx: LongInt; out P: PExpr): Boolean;
+var
+  pr: TProc;
+  b, last: PStmt;
+  i: SizeInt;
+begin
+  Result := False;
+  P := nil;
+  pr := FProcs[Idx];
+  b := pr.Body;
+  if (b = nil) or (not pr.IsFunc) then
+    Exit;
+  last := b;
+  if b^.Kind = skBlock then
+  begin
+    if Length(b^.Stmts) = 0 then
+      Exit;
+    last := b^.Stmts[High(b^.Stmts)];
+  end;
+  if (last = nil) or (last^.Kind <> skAssign) or (last^.Dest = nil) or (last^.Dest^.Kind <> ekVar) then
+    Exit;
+  if not (SameId(last^.Dest^.Name, 'result') or SameId(last^.Dest^.Name, pr.Name)) then
+    Exit;
+  if (last^.E = nil) or (last^.E^.Typ <> pr.RetTyp) or (not Pure(last^.E)) then
+    Exit;
+  if not ((last^.E^.Kind = ekVar) or (last^.E^.Kind = ekField) or (last^.E^.Kind = ekIndex) or
+    (last^.E^.Kind = ekDeref)) then
+    Exit;
+  if (NameUses(last^.E, 'result') > 0) or (NameUses(last^.E, pr.Name) > 0) or AddrOwn(last^.E, pr) then
+    Exit;
+  if b^.Kind = skBlock then
+    for i := 0 to High(b^.Stmts) - 1 do
+      if NamesS(b^.Stmts[i], 'result') or NamesS(b^.Stmts[i], pr.Name) then
+        Exit;
+  P := last^.E;
+  Result := True;
+end;
+
+{ Where C stands in E: 0 nowhere, 1 under a read of a part of it whose
+  value is read whole (WordTyp), 2 elsewhere, as a whole or under an @.
+  Top is the type of the outermost part read so far, -1 outside one. }
+function TOpt.PartOf(E, C: PExpr; Top: LongInt): LongInt;
+var
+  i: SizeInt;
+  t: LongInt;
+begin
+  Result := 0;
+  if E = nil then
+    Exit;
+  if E = C then
+  begin
+    if (Top >= 0) and WordTyp(Top) then
+      Result := 1
+    else
+      Result := 2;
+    Exit;
+  end;
+  if (E^.Kind = ekField) or (E^.Kind = ekIndex) or (E^.Kind = ekDeref) then
+  begin
+    t := Top;
+    if t < 0 then
+      t := E^.Typ;
+    Result := PartOf(E^.L, C, t);
+    if Result = 0 then
+      Result := PartOf(E^.R, C, -1);
+    Exit;
+  end;
+  Result := PartOf(E^.L, C, -1);
+  if Result = 0 then
+    Result := PartOf(E^.R, C, -1);
+  for i := 0 to High(E^.Args) do
+    if Result = 0 then
+      Result := PartOf(E^.Args[i], C, -1);
+end;
+
+function TOpt.PartIn(S: PStmt; C: PExpr): LongInt;
+var
+  i: SizeInt;
+begin
+  Result := PartOf(S^.E, C, -1);
+  if Result = 0 then
+    Result := PartOf(S^.Dest, C, -1);
+  for i := 0 to High(S^.Args) do
+    if Result = 0 then
+      Result := PartOf(S^.Args[i], C, -1);
+end;
+
+function TOpt.NamedIn(const A: TExprArray; const N: string): Boolean;
+var
+  i: SizeInt;
+begin
+  Result := False;
+  for i := 0 to High(A) do
+    if NameUses(A[i], N) > 0 then
+    begin
+      Result := True;
+      Exit;
+    end;
+end;
+
+function TOpt.HasTry(S: PStmt): Boolean;
+var
+  i: SizeInt;
+begin
+  Result := False;
+  if S = nil then
+    Exit;
+  if S^.Kind = skTry then
+  begin
+    Result := True;
+    Exit;
+  end;
+  Result := HasTry(S^.ThenSt) or HasTry(S^.ElseSt) or HasTry(S^.Body);
+  for i := 0 to High(S^.Stmts) do
+    if not Result then
+      Result := HasTry(S^.Stmts[i]);
+  for i := 0 to High(S^.Arms) do
+    if not Result then
+      Result := HasTry(S^.Arms[i].Body);
+  for i := 0 to High(S^.Sels) do
+    if not Result then
+      Result := HasTry(S^.Sels[i].Body);
+end;
+
 procedure TOpt.MapName(const N: string; E: PExpr);
 var
   k: SizeInt;
@@ -749,8 +948,8 @@ begin
       why := 'nested in another routine'
     else if pr.Body = nil then
       why := 'without a body'
-    else if pr.IsFunc and (not Scalar(pr.RetTyp)) then
-      why := 'its result is not a scalar';
+    else if pr.IsFunc and (not Scalar(pr.RetTyp)) and (not BlockTyp(pr.RetTyp)) then
+      why := 'its result is not a scalar, a record, a static array or a set of 32 bytes';
     { A var or out parameter of a record is the place the caller gives:
       InlineAt makes that place stand for the name (PlaceOK), so its
       fields read and write the caller's record, as through the address
@@ -863,6 +1062,9 @@ function TOpt.ZeroOf(T: LongInt): PExpr;
 begin
   if FProg^.Types[T].Kind = tykPointer then
     Result := NewNil
+  else if BlockTyp(T) then
+    { a block's zero, Default(T) (P368) }
+    Result := NewCall('rt_default', nil, T)
   else
   begin
     Result := NewInt(0);
@@ -1171,6 +1373,16 @@ begin
       Result := Ahead(E^.L) and Ahead(E^.R);
     ekAddr:
       Result := (E^.L <> nil) and (E^.L^.Kind = ekVar);
+    { a field of a record such a variable holds, or an element of a
+      static array in one at a constant, which no failure can stop
+      (P368): the part a block result put in place is read from }
+    ekField:
+      Result := (E^.L <> nil) and RecordTyp(E^.L^.Typ) and Ahead(E^.L) and
+        ((E^.L^.Kind = ekVar) or (E^.L^.Kind = ekField) or (E^.L^.Kind = ekIndex));
+    ekIndex:
+      Result := (E^.L <> nil) and (E^.R <> nil) and (E^.R^.Kind = ekInt) and
+        BlockTyp(E^.L^.Typ) and (FProg^.Types[E^.L^.Typ].Kind = tykArray) and Ahead(E^.L) and
+        ((E^.L^.Kind = ekVar) or (E^.L^.Kind = ekField) or (E^.L^.Kind = ekIndex));
   else
     Result := False;
   end;
@@ -1760,9 +1972,11 @@ var
   args: TExprArray;
   i, k: SizeInt;
   blk, st: PStmt;
-  hv, arg, res: PExpr;
+  hv, arg, res, place, pc: PExpr;
   refs, deps, keep: TStrArray;
   d, m: SizeInt;
+  direct: Boolean;
+  body: PStmt;
 begin
   Result := nil;
   if S = nil then
@@ -1773,7 +1987,7 @@ begin
     args := S^.Args;
   end
   else if (S^.Kind = skAssign) and (S^.E <> nil) and (S^.E^.Kind = ekCall) and
-    (S^.Dest <> nil) then
+    ((S^.Dest <> nil) or FWantPlace) then
   begin
     idx := FindProc(S^.E^.Name);
     args := S^.E^.Args;
@@ -1790,6 +2004,24 @@ begin
   if (S^.Kind = skAssign) and (not pr.IsFunc) then
     Exit;
   if Length(args) <> Length(pr.Params) then
+    Exit;
+  { a block result (P368): the place the body gives, or Result the
+    variable the value goes to }
+  place := nil;
+  direct := False;
+  if (S^.Kind = skAssign) and BlockTyp(pr.RetTyp) then
+  begin
+    if not PlaceBody(idx, place) then
+    begin
+      if (FHoistTo <> nil) and (S^.Dest = FHoistTo) then
+        direct := True
+      else if (S^.Dest <> nil) and (S^.Dest^.Kind = ekVar) and (S^.Dest^.Typ = pr.RetTyp) and
+        (FCur >= 0) and CallerLocal(S^.Dest^.Name) and (not NamedIn(args, S^.Dest^.Name)) and
+        (not HasTry(FProcs[FCur].Body)) then
+        direct := True;
+    end;
+  end;
+  if FWantPlace and (place = nil) then
     Exit;
   { the places given for var and out parameters }
   for i := 0 to High(pr.Params) do
@@ -1883,7 +2115,7 @@ begin
   for i := 0 to High(pr.Locals) do
   begin
     hv := Hidden(pr.Locals[i].Name, pr.Locals[i].Typ);
-    if not WritesFirst(pr.Body, pr.Locals[i].Name, '') then
+    if NeedZero(pr.Body, pr.Locals[i].Name, '', pr.Locals[i].Typ) then
     begin
       st := AddStmt(blk, NewStmt(skAssign));
       st^.Line := S^.Line;
@@ -1893,23 +2125,47 @@ begin
     MapName(pr.Locals[i].Name, hv);
   end;
   res := nil;
-  if pr.IsFunc then
+  { a place for the value has no Result }
+  if pr.IsFunc and (place = nil) then
   begin
-    res := Hidden('result', pr.RetTyp);
-    if not WritesFirst(pr.Body, 'result', pr.Name) then
+    if direct then
+      res := S^.Dest
+    else
+      res := Hidden('result', pr.RetTyp);
+    if NeedZero(pr.Body, 'result', pr.Name, pr.RetTyp) then
     begin
       st := AddStmt(blk, NewStmt(skAssign));
       st^.Line := S^.Line;
-      st^.Dest := res;
+      st^.Dest := CloneE(res);
       st^.E := ZeroOf(pr.RetTyp);
     end;
     MapName('result', res);
     MapName(pr.Name, res);
   end;
   FInlining := True;
-  AddStmt(blk, CopyS(pr.Body));
+  body := CopyS(pr.Body);
+  pc := nil;
+  if place <> nil then
+  begin
+    pc := CopyE(place);
+    { the last statement, Result := the place, goes }
+    if body^.Kind = skBlock then
+      SetLength(body^.Stmts, Length(body^.Stmts) - 1)
+    else
+      body := NewStmt(skBlock);
+  end;
   FInlining := False;
-  if S^.Kind = skAssign then
+  AddStmt(blk, body);
+  if (S^.Kind = skAssign) and (place <> nil) and FWantPlace then
+    FPlace := pc
+  else if (S^.Kind = skAssign) and (place <> nil) then
+  begin
+    st := AddStmt(blk, NewStmt(skAssign));
+    st^.Line := S^.Line;
+    st^.Dest := S^.Dest;
+    st^.E := pc;
+  end
+  else if (S^.Kind = skAssign) and (not direct) then
   begin
     st := AddStmt(blk, NewStmt(skAssign));
     st^.Line := S^.Line;
@@ -1943,10 +2199,11 @@ end;
   nothing is taken. }
 function TOpt.HoistAt(S: PStmt): PStmt;
 var
-  c, hv: PExpr;
+  c, hv, pl: PExpr;
   idx: LongInt;
   i: SizeInt;
   st, r, blk: PStmt;
+  want: Boolean;
 begin
   Result := nil;
   if S = nil then
@@ -1987,14 +2244,31 @@ begin
   if idx < 0 then
     Exit;
   Inc(FN);
-  hv := Hidden('h', FProcs[idx].RetTyp);
+  { a block result (P368): a part of it read where the call was, from a
+    body that gives a place, is that part of the place; else Result is
+    the hidden variable }
+  want := BlockTyp(FProcs[idx].RetTyp) and PlaceBody(idx, pl) and (PartIn(S, c) = 1);
   st := NewStmt(skAssign);
   st^.Line := S^.Line;
-  st^.Dest := hv;
   st^.E := c;
+  hv := nil;
+  if want then
+    FWantPlace := True
+  else
+  begin
+    hv := Hidden('h', FProcs[idx].RetTyp);
+    st^.Dest := hv;
+    if BlockTyp(FProcs[idx].RetTyp) then
+      FHoistTo := hv;
+  end;
+  FPlace := nil;
   r := InlineAt(st);
+  FWantPlace := False;
+  FHoistTo := nil;
   if r = nil then
     Exit;
+  if want then
+    hv := FPlace;
   case S^.Kind of
     skIf, skCase:
       ReplaceE(S^.E, c, CloneE(hv));
@@ -2163,7 +2437,9 @@ begin
   Result := False;
   B := nil;
   pr := FProcs[Idx];
-  if (not pr.IsFunc) or (Length(pr.Locals) > 0) then
+  { a block result as an expression would stand where a copy was, a
+    const argument too, which takes it by address (P368) }
+  if (not pr.IsFunc) or (Length(pr.Locals) > 0) or (not Scalar(pr.RetTyp)) then
     Exit;
   st := pr.Body;
   if (st <> nil) and (st^.Kind = skBlock) and (Length(st^.Stmts) = 1) then
