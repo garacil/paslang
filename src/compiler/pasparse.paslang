@@ -44,6 +44,7 @@ type
     HasQ: Boolean;
     Owner: string;  { the unit it comes from (P138) }
     Nest: LongInt;  { the depth of the routine that declares it, 0 at the top (P159) }
+    Prev: LongInt;  { the entry before of the same name, -1 none (P376) }
   end;
 
   TOpEnt = record
@@ -66,6 +67,16 @@ type
     Nest: LongInt;     { a nested routine's depth: 0 at the top (1.0.133) }
     Owner: string;     { the unit it comes from, '' for the one being compiled (P138) }
     IsOver: Boolean;   { declared overload: the routines of its name around it stay visible (P160) }
+    Prev: LongInt;     { the entry before of the same name, -1 none (P376) }
+  end;
+
+  { P376: a table's names, each the index of its last entry, by the
+    name's spelling in any case as SameId compares; open addressing, at
+    least twice as many slots as names. }
+  TNameHead = record
+    Keys: TStrArray;
+    Vals: array of LongInt;
+    Used: SizeInt;
   end;
 
   TTypeName = record
@@ -170,6 +181,7 @@ type
     FNameCheck: Boolean;  { declarations of the source refuse the reserved names (1.0.131) }
     FReserved: TStrArray;   { the predefined names, lowercase and sorted (1.0.138) }
     FCoreNames: TStrArray;  { what the core units export: reserved outside them (1.0.138) }
+    FConstHead, FProcHead, FCoreHead: TNameHead;  { P376: the last constant, routine and core name of each name }
     FUPath: TStrArray;
     FLoaded: TStrArray;
     FLoadedSum: TStrArray;
@@ -294,6 +306,11 @@ type
     function ReservedName(const N: string): Boolean;
     function CoreName(const N: string): Boolean;
     procedure AddCoreName(const N: string);
+    procedure ConstChainAdd(I: SizeInt);
+    procedure ConstChainDrop(N: SizeInt);
+    procedure ProcChainAdd(I: SizeInt);
+    procedure ProcChainDrop(N: SizeInt);
+    procedure ChainsRebuild;
     function IsCoreUnit(const AName: string): Boolean;
     procedure CheckName(const N: string);
     function ReservedHere(const Next: string): Boolean;
@@ -1918,6 +1935,166 @@ function TParser.IsName: Boolean;
 begin
   Result := (FTok.Kind = tkIdent) or
     ((Ord(FTok.Kind) >= Ord(tkProgram)) and (Ord(FTok.Kind) <= Ord(tkFalse)));
+end;
+
+{ ---- Names found in a table (P376) ----
+
+  Compiling src/rtl/sysutils.paslang, SameId ran 0.43G instructions of
+  2.96G (P375's figures), CoreName, ConstIdx, AddVar, ParsePrimary0,
+  NamedType and ResolveProc walking every constant, routine and core name
+  and comparing each with the one looked for. Go's types2 keeps a scope's
+  objects in a map (Scope, elems map[string]Object). The constants, the
+  routines and the core names are found by a head table now, FNV-1a of
+  the name's letters as SameId compares them (A to Z as a to z), and a
+  chain through the entries of a name, the last first, as the walks from
+  the end found them. }
+function NameHash(const S: string): Int64;
+var
+  i: SizeInt;
+  c: Char;
+begin
+  Result := 2166136261;
+  for i := 1 to Length(S) do
+  begin
+    c := S[i];
+    if (c >= 'A') and (c <= 'Z') then
+      c := Char(Ord(c) + 32);
+    Result := ((Result xor Int64(Ord(c))) * 16777619) and 4294967295;
+  end;
+end;
+
+function NameEq(const A, B: string): Boolean;
+var
+  i: SizeInt;
+  ca, cb: Char;
+begin
+  Result := False;
+  if Length(A) <> Length(B) then
+    Exit;
+  for i := 1 to Length(A) do
+  begin
+    ca := A[i];
+    cb := B[i];
+    if (ca >= 'A') and (ca <= 'Z') then
+      ca := Char(Ord(ca) + 32);
+    if (cb >= 'A') and (cb <= 'Z') then
+      cb := Char(Ord(cb) + 32);
+    if ca <> cb then
+      Exit;
+  end;
+  Result := True;
+end;
+
+{ The slot of S in T, or the empty one where it would go. }
+function NameSlot(const T: TNameHead; const S: string): SizeInt;
+var
+  m: SizeInt;
+begin
+  m := Length(T.Keys);
+  Result := SizeInt(NameHash(S) and Int64(m - 1));
+  while (T.Vals[Result] <> -2) and not NameEq(T.Keys[Result], S) do
+    Result := (Result + 1) and (m - 1);
+end;
+
+{ The last entry of the name S, -1 none. }
+function NameGet(const T: TNameHead; const S: string): LongInt;
+var
+  k: SizeInt;
+begin
+  Result := -1;
+  if Length(T.Keys) = 0 then
+    Exit;
+  k := NameSlot(T, S);
+  if T.Vals[k] <> -2 then
+    Result := T.Vals[k];
+end;
+
+procedure NameSet(var T: TNameHead; const S: string; V: LongInt);
+var
+  k, i, m: SizeInt;
+  ok: TStrArray;
+  ov: array of LongInt;
+begin
+  if 2 * (T.Used + 1) > Length(T.Keys) then
+  begin
+    ok := T.Keys;
+    ov := T.Vals;
+    m := 64;
+    while m < 4 * (T.Used + 1) do
+      m := m * 2;
+    T.Keys := nil;
+    T.Vals := nil;
+    SetLength(T.Keys, m);
+    SetLength(T.Vals, m);
+    for i := 0 to m - 1 do
+      T.Vals[i] := -2;
+    T.Used := 0;
+    for i := 0 to High(ok) do
+      if ov[i] <> -2 then
+      begin
+        k := NameSlot(T, ok[i]);
+        T.Keys[k] := ok[i];
+        T.Vals[k] := ov[i];
+        Inc(T.Used);
+      end;
+  end;
+  k := NameSlot(T, S);
+  if T.Vals[k] = -2 then
+  begin
+    T.Keys[k] := S;
+    Inc(T.Used);
+  end;
+  T.Vals[k] := V;
+end;
+
+procedure NameClear(var T: TNameHead);
+begin
+  T.Keys := nil;
+  T.Vals := nil;
+  T.Used := 0;
+end;
+
+{ Constant I goes on its name's chain. }
+procedure TParser.ConstChainAdd(I: SizeInt);
+begin
+  FConsts[I].Prev := NameGet(FConstHead, FConsts[I].Name);
+  NameSet(FConstHead, FConsts[I].Name, LongInt(I));
+end;
+
+{ The constants from N on leave their chains, the last first. }
+procedure TParser.ConstChainDrop(N: SizeInt);
+var
+  i: SizeInt;
+begin
+  for i := High(FConsts) downto N do
+    NameSet(FConstHead, FConsts[i].Name, FConsts[i].Prev);
+end;
+
+procedure TParser.ProcChainAdd(I: SizeInt);
+begin
+  FProcs[I].Prev := NameGet(FProcHead, FProcs[I].Name);
+  NameSet(FProcHead, FProcs[I].Name, LongInt(I));
+end;
+
+procedure TParser.ProcChainDrop(N: SizeInt);
+var
+  i: SizeInt;
+begin
+  for i := High(FProcs) downto N do
+    NameSet(FProcHead, FProcs[i].Name, FProcs[i].Prev);
+end;
+
+{ After names were changed in place (HideUnitNames): every chain again. }
+procedure TParser.ChainsRebuild;
+var
+  i: SizeInt;
+begin
+  NameClear(FConstHead);
+  for i := 0 to High(FConsts) do
+    ConstChainAdd(i);
+  NameClear(FProcHead);
+  for i := 0 to High(FProcs) do
+    ProcChainAdd(i);
 end;
 
 function TParser.SameId(const A, B: string): Boolean;
@@ -5659,8 +5836,14 @@ begin
   begin
     cand[i] := False;
     ranks[i] := -1;
-    if SameId(FProcs[i].Name, AName) and not HiddenBy(AName, FProcs[i].Nest, False) then
+  end;
+  { the routines of the name, by their chain (P376) }
+  i := NameGet(FProcHead, AName);
+  while i >= 0 do
+  begin
+    if not HiddenBy(AName, FProcs[i].Nest, False) then
       ranks[i] := ProcRank(FProcs[i]);
+    i := FProcs[i].Prev;
   end;
   top := High(LongInt);
   repeat
@@ -5845,9 +6028,8 @@ begin
       Exit;
     end;
   end;
-  Result := High(FConsts);
-  while (Result >= 0) and not SameId(FConsts[Result].Name, AName) do
-    Result := Result - 1;
+  { the last constant of the name (P376) }
+  Result := NameGet(FConstHead, AName);
 end;
 
 { A name with a dot: a class variable's global (Class.Name, P123), a
@@ -5944,9 +6126,10 @@ procedure TParser.HideUnitNames(const AName: string; Kind: Char; const Params: T
   const Keep: string);
 var
   i, j: SizeInt;
-  hide: Boolean;
+  hide, renamed: Boolean;
   u: string;
 begin
+  renamed := False;
   if HasDotName(AName) then
     Exit;
   for i := 0 to High(FProcs) do
@@ -5963,12 +6146,20 @@ begin
             hide := False;
       end;
       if hide then
+      begin
         FProcs[i].Name := '.' + FProcs[i].Name;
+        renamed := True;
+      end;
     end;
   for i := 0 to High(FConsts) do
     if (FConsts[i].Owner <> '') and (not SameId(FConsts[i].Owner, Keep)) and
       SameId(FConsts[i].Name, AName) then
+    begin
       FConsts[i].Name := '.' + FConsts[i].Name;
+      renamed := True;
+    end;
+  if renamed then
+    ChainsRebuild;
   { a unit's variable is named unit.Name in its symbol }
   for i := 0 to High(FVars) do
     if FVars[i].Ext and (not FVars[i].Alias) and SameId(FVars[i].Name, AName) then
@@ -6873,14 +7064,9 @@ end;
   loads nothing into one), so a core unit declares its own exports and
   nothing else may. }
 function TParser.CoreName(const N: string): Boolean;
-var
-  i: SizeInt;
 begin
-  Result := True;
-  for i := 0 to High(FCoreNames) do
-    if SameId(FCoreNames[i], N) then
-      Exit;
-  Result := False;
+  { by the head table (P376) }
+  Result := NameGet(FCoreHead, N) >= 0;
 end;
 
 procedure TParser.AddCoreName(const N: string);
@@ -6892,6 +7078,7 @@ begin
   k := Length(FCoreNames);
   SetLength(FCoreNames, k + 1);
   FCoreNames[k] := N;
+  NameSet(FCoreHead, N, LongInt(k));
 end;
 
 { The eleven units the language is built on: LoadCore links them into
@@ -6943,15 +7130,22 @@ begin
   end;
   { a constant of its own depth; one around it a routine's variable
     hides, as in Free Pascal (P159) }
-  for i := High(FConsts) downto 0 do
-    if (FConsts[i].Owner = '') and ((not Local) or (FConsts[i].Nest = FNest)) and
-      SameId(FConsts[i].Name, AName) then
+  i := NameGet(FConstHead, AName);
+  while i >= 0 do
+  begin
+    if (FConsts[i].Owner = '') and ((not Local) or (FConsts[i].Nest = FNest)) then
       Die('duplicate identifier ' + AName + ' (a constant of the name)' + DupAt);
+    i := FConsts[i].Prev;
+  end;
   { a routine of the program's or around it, at any depth: inside, a call
     of it would find the variable (P151) }
-  for i := High(FProcs) downto 0 do
-    if (FProcs[i].Owner = '') and SameId(FProcs[i].Name, AName) then
+  i := NameGet(FProcHead, AName);
+  while i >= 0 do
+  begin
+    if FProcs[i].Owner = '' then
       Die('duplicate identifier ' + AName + ' (a routine of the name)' + DupAt);
+    i := FProcs[i].Prev;
+  end;
   if Local then
   begin
     len := Length(FLocals);
@@ -7004,6 +7198,7 @@ begin
   FConsts[len].Typ := Typ;
   FConsts[len].Txt := S;
   FConsts[len].Nest := FNest;
+  ConstChainAdd(len);
   if FUnitName <> '' then
     AddScoped(AName, Typ, 1, FUnitName + '.' + AName)
   else AddScoped(AName, Typ, 1, AName);
@@ -7490,6 +7685,7 @@ begin
   len := Length(FProcs);
   SetLength(FProcs, len + 1);
   FProcs[len].Name := AName;
+  ProcChainAdd(len);
   FProcs[len].Sym := ASym;
   FProcs[len].IsFunc := IsFunc;
   FProcs[len].NParams := NParams;
@@ -23536,6 +23732,7 @@ begin
     Eat(tkSemi);
   { the routine's names go: its constants, the types it named, its nested
     routines; the types themselves stay, what was compiled uses them }
+  ConstChainDrop(FConstScope);
   SetLength(FConsts, FConstScope);
   j := FTypeScope;
   for i := FTypeScope to High(FTypeNames) do
@@ -23548,6 +23745,7 @@ begin
     end;
   end;
   SetLength(FTypeNames, j);
+  ProcChainDrop(FProcScope);
   j := FProcScope;
   for i := FProcScope to High(FProcs) do
     if FProcs[i].Nest < FNest then
@@ -23556,6 +23754,8 @@ begin
       j := j + 1;
     end;
   SetLength(FProcs, j);
+  for i := FProcScope to j - 1 do
+    ProcChainAdd(i);
   FConstScope := savedCScope;
   FTypeScope := savedTScope;
   FFwdScope := savedFScope;
