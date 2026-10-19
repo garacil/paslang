@@ -9,12 +9,18 @@
   allocation of a large block whose pages held something, string = and
   <, XxHash3, XxHash64, XxHash32), so both Ps are busy, while a third
   wakes every millisecond, makes a little garbage for the collector and
-  counts its wakes; the wakes that fall while both calls run are counted
-  (from the later start to the earlier end). The runtime goes 256 KiB a
-  piece and calls rt_yieldpoint between two when sysmon or the
-  collector has asked the routine to stop: five wakes or more fall
-  while both run. With the whole length in one go, at most one at an
-  edge did (1.1.120). The two calls read the same source, and those of
+  counts the wakes that find both calls running (each call marks itself
+  busy in its own word, no lock taken around it). The runtime goes 256
+  KiB a piece and calls rt_yieldpoint between two when sysmon or the
+  collector has asked the routine to stop, and only then can the third
+  routine run while both calls do: with the whole length in one go it
+  finds both busy never, as both Ps are theirs (1.1.120). A family runs
+  again, its setup and its two calls, until five such wakes are counted
+  in all, twelve tries or two minutes at most: a machine loaded with
+  other work makes the wakes rarer and the test longer, never wrong
+  (P379: it counted the wakes of one try between the later start and
+  the earlier end, which a loaded machine once brought under five, the
+  answer right). The two calls read the same source, and those of
   Move and FillChar write the same bytes to the same place, so the test
   holds 512 MiB at most. The allocation needs pages the heap reuses
   without giving them back to the kernel first: make check runs it with
@@ -53,8 +59,8 @@ var
   src, dst: array of Byte;
   s1, s2: string;
   family, n: Integer;
-  ready, ticks, finished: Integer;
-  t0, t1, res: array[0..1] of Integer;
+  ready, ticks, finished, both: Integer;
+  busy, res: array[0..1] of Integer;
   mu: mutex;
   wg: waitgroup;
 
@@ -141,9 +147,9 @@ begin
     ready := ready + 1;
   while ready < 2 do
     Yield;
-  t0[Id] := ticks;
+  busy[Id] := 1;
   Call(Id);
-  t1[Id] := ticks;
+  busy[Id] := 0;
   lock mu do
     finished := finished + 1;
   wg.Done;
@@ -156,6 +162,8 @@ begin
   while finished < 2 do
   begin
     ticks := ticks + 1;
+    if (busy[0] = 1) and (busy[1] = 1) then
+      both := both + 1;
     s := IntToStr(ticks) + 'x';
     if Length(s) = 0 then
       WriteLn('never');
@@ -165,9 +173,77 @@ begin
 end;
 
 var
-  f, h, both, i: Integer;
+  f, h, i, total, tries, start: Integer;
   right: Boolean;
   keep: array of Integer;
+
+{ One try of family F: its setup, its two calls with the ticker beside
+  them, their answer, and the wakes that found both busy added to total. }
+procedure TryFamily(F: Integer);
+begin
+  case F of
+    0:
+      begin
+        { first, while the heap is fresh: the pages both blocks will
+          take hold integers before; a try again drops the blocks of the
+          one before first }
+        GcCollect;
+        SetLength(keep, n div 64);
+        dwg.Add(1);
+        { a little more than twice: each block is n bytes and a header,
+          a page more than n }
+        pas Drop(2 * n + (n div 64));
+        dwg.Wait;
+        GcCollect;
+        GcCollect;
+      end;
+    1:
+      begin
+        SetLength(keep, 0);
+        SetLength(src, n);
+        for i := 0 to n div 4096 - 1 do
+          src[i * 4096] := Byte(i);
+        src[n - 1] := 9;
+        SetLength(dst, n);
+      end;
+    2:
+      begin
+        SetLength(src, 0);
+        { the fill writes n bytes of dst, which the copy sized for its own }
+        if Length(dst) < n then
+          SetLength(dst, n);
+      end;
+    3:
+      begin
+        SetLength(dst, 0);
+        SetLength(s1, n);
+        FillChar(s1[1], n, 97);
+        s2 := Copy(s1, 1, n);
+      end;
+    4: s2[n] := 'b';
+  end;
+  ready := 0;
+  ticks := 0;
+  finished := 0;
+  both := 0;
+  busy[0] := 0;
+  busy[1] := 0;
+  wg.Add(3);
+  pas Ticker;
+  pas Work(0);
+  pas Work(1);
+  wg.Wait;
+  { the answer: both calls alike, and right where it can be known, at
+    every try }
+  right := right and (res[0] = res[1]);
+  if F <= 3 then
+    right := right and (res[0] = 1);
+  if F = 4 then
+    right := right and (res[0] = 1);
+  if F >= 5 then
+    right := right and (res[0] = Hashes[F]);
+  total := total + both;
+end;
 
 begin
   if ParamStr(1) = 'hog' then
@@ -188,70 +264,17 @@ begin
       n := MiBAmd[f] shl 20
     else
       n := MiBArm[f] shl 20;
-    case f of
-      0:
-        begin
-          { first, while the heap is fresh: the pages both blocks will
-            take hold integers before }
-          SetLength(keep, n div 64);
-          dwg.Add(1);
-          { a little more than twice: each block is n bytes and a header,
-            a page more than n }
-          pas Drop(2 * n + (n div 64));
-          dwg.Wait;
-          GcCollect;
-          GcCollect;
-        end;
-      1:
-        begin
-          SetLength(keep, 0);
-          SetLength(src, n);
-          for i := 0 to n div 4096 - 1 do
-            src[i * 4096] := Byte(i);
-          src[n - 1] := 9;
-          SetLength(dst, n);
-        end;
-      2:
-        begin
-          SetLength(src, 0);
-          { the fill writes n bytes of dst, which the copy sized for its own }
-          if Length(dst) < n then
-            SetLength(dst, n);
-        end;
-      3:
-        begin
-          SetLength(dst, 0);
-          SetLength(s1, n);
-          FillChar(s1[1], n, 97);
-          s2 := Copy(s1, 1, n);
-        end;
-      4: s2[n] := 'b';
+    total := 0;
+    tries := 0;
+    right := True;
+    start := Nanotime;
+    while (total < 5) and (tries < 12) and (Nanotime - start < 120000000000) do
+    begin
+      Inc(tries);
+      TryFamily(f);
     end;
-    ready := 0;
-    ticks := 0;
-    finished := 0;
-    wg.Add(3);
-    pas Ticker;
-    pas Work(0);
-    pas Work(1);
-    wg.Wait;
-    { the answer: both calls alike, and right where it can be known }
-    right := res[0] = res[1];
-    if f <= 3 then
-      right := right and (res[0] = 1);
-    if f = 4 then
-      right := right and (res[0] = 1);
-    if f >= 5 then
-      right := right and (res[0] = Hashes[f]);
-    both := t1[0];
-    if t1[1] < both then
-      both := t1[1];
-    if t0[0] > t0[1] then
-      both := both - t0[0]
-    else
-      both := both - t0[1];
     WriteLn(Names[f], ': the right answer ', right, ', the other routine ran while both calls ran: ',
-      both >= 5);
+      total >= 5);
   end;
   Halt(0);
 end.
