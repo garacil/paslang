@@ -209,6 +209,7 @@ type
     Keep: Boolean;    { a callee-saved register: its caller's value is kept in Save }
     Part: LongInt;    { 0 the variable; 1 a slice's pointer word, 2 its length (P100) }
   end;
+  TPromoList = array of TPromo;
 
   { An index EmitFor proved in range for a whole run of a for (P100):
     counter + C into a static array Lo..Hi (Arr empty) or into the slice
@@ -419,6 +420,17 @@ type
     FPromoOn: Boolean;      { a loop is being emitted with variables in registers (P93) }
     FPromo: array of TPromo;
     FResReg: string;        { the register Result lives in while a loop keeps it there }
+    FIsles: TStmtArray;     { the statements with calls a region emits as outside it (P384) }
+    FIsleW: array of Int64; { each one's passes, weighed as PromoScanS weighs a use, 64 a pass }
+    FIsleNames: array of TStrArray;  { the names each one mentions }
+    FIsleAll: array of Boolean;      { it reads every local (DumpLocals) }
+    FIsleOdd: array of Boolean;      { it holds a statement whose writes WritesVar does not see }
+    FIsleTry: Boolean;      { the region is in a try of its routine: a handler may read any home }
+    FIsleOn: Boolean;       { an island is being emitted }
+    FIsleBrk: LongInt;      { the loops open when it began: a break or a continue out of it reloads }
+    FIsleStack: array of TPromoList;  { the variables of each region an island being emitted is in, innermost last }
+    FIsleBacks: array of TPromoList;  { and those its island's end loads }
+    FIsleFroms: TStrArray;  { where each of the region's variables is in its register from }
     FAddrNames: array of string; { lower-case names whose address is taken in this compilation }
     FLocAddr: array of string; { those taken in the routine being emitted and the routines nested in it (1.0.128) }
     FSelBody: PStmt;        { the body being emitted, whose load addresses a select looks at (P307) }
@@ -923,6 +935,22 @@ type
     procedure LoadHome(const S: TSym; const Reg: string);
     procedure StoreHome(const S: TSym; const Reg: string);
     function EmitPromoted(S: PStmt): Boolean;
+    function IsleOK(S: PStmt; InLoop: Boolean): Boolean;
+    function RegionStmtOK(S: PStmt; InLoop: Boolean; W: Int64): Boolean;
+    function IsleAt(S: PStmt): SizeInt;
+    function IsleRef(const P: TPromo): Boolean;
+    function IsleOddS(S: PStmt): Boolean;
+    function MayLeave(S: PStmt): Boolean;
+    function IsleReads(K: SizeInt; const P: TPromo): Boolean;
+    function IsleBack(K: SizeInt; const P: TPromo): Boolean;
+    function IsleWorth(const P: TPromo; Kept: Boolean): Boolean;
+    procedure IsleLoad(const L: TPromoList);
+    procedure IsleRanges(const E: string; K: SizeInt; Loopy: Boolean);
+    procedure EmitIsle(S: PStmt; K: SizeInt);
+    procedure IsleKeptBack;
+    procedure IsleReload;
+    function TryKeep: LongInt;
+    procedure TryKeepBack(Base: LongInt);
     function EmitRegion(const L: TStmtArray; A, Z: SizeInt): Boolean;
     procedure EmitBlockStmts(S: PStmt);
     function OrdPool(D: LongInt): string;
@@ -5850,11 +5878,15 @@ begin
     S := S^.Stmts[0];
   if S = nil then
     Exit;
-  if (S^.Kind = skExit) and (S^.E = nil) and NoUnwind(0) then
+  { an exit in a region with islands is one (P384), and a break or a
+    continue out of an island loads the registers first }
+  if (S^.Kind = skExit) and (S^.E = nil) and NoUnwind(0) and (Length(FIsleStack) = 0) and
+    not (FPromoOn and (Length(FIsles) > 0)) then
   begin
     Target := FEpi;
     Result := True;
   end
+  else if FIsleOn and (LongInt(Length(FBrk)) = FIsleBrk) then
   else if (S^.Kind = skBreak) and (Length(FBrk) > 0) and
     NoUnwind(LongInt(Length(FBrk))) then
   begin
@@ -13066,7 +13098,10 @@ begin
   old := FCurDa;
   if FDaOn and (S <> nil) and (S^.DaGen = FDaGen) then
     FCurDa := S^.Da;
-  EmitStmtNow(S);
+  if FPromoOn and (Length(FIsles) > 0) and (IsleAt(S) >= 0) then
+    EmitIsle(S, IsleAt(S))
+  else
+    EmitStmtNow(S);
   FCurDa := old;
 end;
 
@@ -27258,6 +27293,7 @@ var
   td: TTypeDef;
   off, so: LongInt;
   vs: TSym;
+  tk: LongInt;
 begin
   if S = nil then
     Exit;
@@ -27680,6 +27716,7 @@ begin
         begin
           a := Lab;
           b := Lab;
+          tk := TryKeep;
           MapHint4(1, 1, 1, 0);
           Line('  sub sp, sp, #32');
           Line('  ldr x9, [x28, #224]');
@@ -27704,10 +27741,12 @@ begin
             EmitStmt(S^.ElseSt);
           Line('  b ' + b);
           Line(a + ':');
+          TryKeepBack(tk);
           EmitStmt(S^.ElseSt);
           if S^.Name = 'finally' then
             Line('  bl rt_raise');
           Line(b + ':');
+          FPinned := FPinned - 64;
         end;
       skIf:
         { a word's assignment as a select (P307) }
@@ -27818,6 +27857,8 @@ begin
           if Length(FBrk) = 0 then
             Die('break not in loop');
           UnwindTry(LongInt(Length(FBrk)));
+          if FIsleOn and (LongInt(Length(FBrk)) = FIsleBrk) then
+            IsleReload;
           Line('  b ' + FBrk[High(FBrk)]);
         end;
       skContinue:
@@ -27825,6 +27866,8 @@ begin
           if Length(FCont) = 0 then
             Die('continue not in loop');
           UnwindTry(LongInt(Length(FBrk)));
+          if FIsleOn and (LongInt(Length(FBrk)) = FIsleBrk) then
+            IsleReload;
           Line('  b ' + FCont[High(FCont)]);
         end;
       skForIn:
@@ -27987,6 +28030,8 @@ begin
               StFP('x0', FResOff);
           end;
           UnwindTry(0);
+          if FIsleOn then
+            IsleKeptBack;
           Line('  b ' + FEpi);
         end;
       skHalt:
@@ -28459,6 +28504,7 @@ begin
       begin
         a := Lab;
         b := Lab;
+        tk := TryKeep;
         { The record: the previous one, rbp, the stack pointer to go back
           to (stack addresses a moved stack adjusts) and the handler. }
         MapHint4(1, 1, 1, 0);
@@ -28484,10 +28530,12 @@ begin
           EmitStmt(S^.ElseSt);
         Line('  jmp ' + b);
         Line(a + ':');
+        TryKeepBack(tk);
         EmitStmt(S^.ElseSt);
         if S^.Name = 'finally' then
           Line('  call rt_raise');
         Line(b + ':');
+        FPinned := FPinned - 32;
       end;
     skIf:
       { a word's assignment as a select (P307) }
@@ -28763,6 +28811,8 @@ begin
             Line('  movq %rax, ' + IntToStr(FResOff) + '(%rbp)');
         end;
         UnwindTry(0);
+        if FIsleOn then
+          IsleKeptBack;
         Line('  jmp ' + FEpi);
       end;
     skHalt:
@@ -28833,6 +28883,8 @@ begin
         if Length(FBrk) = 0 then
           Die('break not in loop');
         UnwindTry(LongInt(Length(FBrk)));
+        if FIsleOn and (LongInt(Length(FBrk)) = FIsleBrk) then
+          IsleReload;
         Line('  jmp ' + FBrk[High(FBrk)]);
       end;
     skContinue:
@@ -28840,6 +28892,8 @@ begin
         if Length(FCont) = 0 then
           Die('continue not in loop');
         UnwindTry(LongInt(Length(FBrk)));
+        if FIsleOn and (LongInt(Length(FBrk)) = FIsleBrk) then
+          IsleReload;
         Line('  jmp ' + FCont[High(FCont)]);
       end;
   end;
@@ -29266,6 +29320,18 @@ begin
       Result := PromoExprOK(E^.L) and PromoExprOK(E^.R);
     ekField, ekDeref:
       Result := PromoExprOK(E^.L);
+    ekAddr:
+      { the address of an element, a field or a pointer's target (P384):
+        EmitAddr's, as a region's stores take it, with no call but a
+        string's character's, whose string is made its own first }
+      if (E^.L <> nil) and not PtrAccess(E^.L) then
+      begin
+        if E^.L^.Kind = ekIndex then
+          Result := (E^.L^.L <> nil) and (not IsStr(E^.L^.L^.Typ)) and
+            PromoExprOK(E^.L^.L) and PromoExprOK(E^.L^.R)
+        else if (E^.L^.Kind = ekField) or (E^.L^.Kind = ekDeref) then
+          Result := PromoExprOK(E^.L^.L);
+      end;
     ekSet:
       begin
         for i := 0 to High(E^.Args) do
@@ -29642,6 +29708,9 @@ var
 begin
   if S = nil then
     Exit;
+  { an island's uses read the homes (P384) }
+  if (Length(FIsles) > 0) and (IsleAt(S) >= 0) then
+    Exit;
   w := Weight;
   if ((S^.Kind = skWhile) or (S^.Kind = skRepeat) or (S^.Kind = skFor)) and
     (w < 100000) then
@@ -29816,14 +29885,541 @@ end;
 function TEmitter.EmitPromoted(S: PStmt): Boolean;
 var
   one: TStmtArray;
+  i: SizeInt;
 begin
   Result := False;
-  if not PromoStmtOK(S, False) then
+  FIsles := nil;
+  FIsleW := nil;
+  FIsleNames := nil;
+  FIsleAll := nil;
+  FIsleOdd := nil;
+  { a loop that calls: its statements with calls are islands (P384) }
+  if (not PromoStmtOK(S, False)) and
+    ((not RegionStmtOK(S, False, 64)) or (Length(FIsles) = 0) or (IsleAt(S) >= 0)) then
+  begin
+    FIsles := nil;
     Exit;
+  end;
+  FIsleTry := False;
+  for i := 0 to High(FTryRec) do
+    if FTryRec[i] then
+      FIsleTry := True;
   one := nil;
   SetLength(one, 1);
   one[0] := S;
   Result := EmitRegion(one, 0, 0);
+  FIsles := nil;
+  FIsleW := nil;
+  FIsleNames := nil;
+  FIsleAll := nil;
+  FIsleOdd := nil;
+end;
+
+{ P384: a loop whose body calls keeps its variables in registers all the
+  same. Each statement with a call is an island: it compiles as outside
+  any region, its variables at home. Around it the region keeps in its
+  register a variable of rbx, r12, r13 or r15 (x19 to x26), which every
+  routine keeps as the psABI (3.2.1, figure 3.4) and AAPCS64 (6.1.1)
+  have it and paslang's do (a region stores what they held and gives it
+  back, a park keeps them in .pk_res, an asm block pushes the ones it
+  names, the runtime pushes the ones it uses: scripts/check_calleesaved
+  reads every routine of it), unless the island assigns it: a variable
+  passed by reference has its address taken and none, so no routine an
+  island calls writes one (ScanAddrE). The island's end loads what it
+  assigns; a pointer, which a stack that moves relocates at home; a
+  slice's words, an array's address and Carry; and every variable of a
+  register a call takes (r8 to r11). Before it go home what the region
+  wrote of those, of what the island reads there, and of a pointer or a
+  class reference, which the collector reads at home; all of it when
+  the island leaves the routine (exit, raise, halt), or when the region
+  is in a try whose handler may read a home.
+  Go keeps no register across a call: its ABI has every register the
+  caller's to save (cmd/compile/internal/abi, ABIInternal), so its
+  register allocator spills a value live across a call and restores it
+  after (cmd/compile/internal/ssa/regalloc.go, placeSpills); a region
+  keeps a callee-saved register's variable across the call at no cost. }
+
+{ S may be an island: it comes back to the region only through its end,
+  or through a break or a continue of a loop of the region (InLoop),
+  which loads the registers first; or it leaves the routine (exit,
+  raise, halt). A try and an asm block stay out. }
+function TEmitter.IsleOK(S: PStmt; InLoop: Boolean): Boolean;
+var
+  i: SizeInt;
+  lp: Boolean;
+begin
+  Result := True;
+  if S = nil then
+    Exit;
+  Result := False;
+  if (S^.Kind = skTry) or (S^.Kind = skAsm) then
+    Exit;
+  if (S^.Kind = skBreak) or (S^.Kind = skContinue) then
+  begin
+    Result := InLoop;
+    Exit;
+  end;
+  lp := InLoop or (S^.Kind = skWhile) or (S^.Kind = skRepeat) or (S^.Kind = skFor) or
+    (S^.Kind = skForIn);
+  if not (IsleOK(S^.ThenSt, InLoop) and IsleOK(S^.ElseSt, InLoop) and IsleOK(S^.Body, lp)) then
+    Exit;
+  for i := 0 to High(S^.Stmts) do
+    if not IsleOK(S^.Stmts[i], InLoop) then
+      Exit;
+  for i := 0 to High(S^.Arms) do
+    if not IsleOK(S^.Arms[i].Body, InLoop) then
+      Exit;
+  for i := 0 to High(S^.Sels) do
+    if not IsleOK(S^.Sels[i].Body, InLoop) then
+      Exit;
+  Result := True;
+end;
+
+{ S compiles in a region whose statements with calls are islands: one
+  PromoStmtOK takes, a block, an if, a loop or a case whose own
+  expressions call nothing and whose statements are such, or else an
+  island, which goes into FIsles with the names it mentions. W weighs a
+  pass through S as PromoScanS weighs a use, times 64: eight times in a
+  loop's body, a quarter in an arm of an if or a case, which most passes
+  skip (an exit, a refill, an escaped string). An exit, a raise or a
+  halt leaves for good: it weighs nothing. }
+function TEmitter.RegionStmtOK(S: PStmt; InLoop: Boolean; W: Int64): Boolean;
+var
+  i, n0: SizeInt;
+  wl, wa: Int64;
+  sy: TSym;
+  m: TStrArray;
+begin
+  Result := True;
+  if (S = nil) or PromoStmtOK(S, InLoop) then
+    Exit;
+  n0 := Length(FIsles);
+  wl := W;
+  if wl < 6400000 then
+    wl := wl * 8;
+  wa := W div 4;
+  if wa < 1 then
+    wa := 1;
+  Result := False;
+  case S^.Kind of
+    skBlock:
+      begin
+        Result := True;
+        for i := 0 to High(S^.Stmts) do
+          if Result and not RegionStmtOK(S^.Stmts[i], InLoop, W) then
+            Result := False;
+      end;
+    skIf:
+      Result := PromoExprOK(S^.E) and RegionStmtOK(S^.ThenSt, InLoop, wa) and
+        RegionStmtOK(S^.ElseSt, InLoop, wa);
+    skWhile, skRepeat:
+      Result := PromoExprOK(S^.E) and RegionStmtOK(S^.Body, True, wl);
+    skFor:
+      Result := (S^.Name <> '') and (S^.E <> nil) and (S^.E2 <> nil) and
+        TryFindSym(S^.Name, sy) and PromoScalar(sy.Typ) and PromoExprOK(S^.E) and
+        PromoExprOK(S^.E2) and RegionStmtOK(S^.Body, True, wl);
+    skCase:
+      if PromoExprOK(S^.E) then
+      begin
+        Result := True;
+        for i := 0 to High(S^.Arms) do
+          if Result and not RegionStmtOK(S^.Arms[i].Body, InLoop, wa) then
+            Result := False;
+        Result := Result and RegionStmtOK(S^.ElseSt, InLoop, wa);
+      end;
+    skWith:
+      Result := RegionStmtOK(S^.Body, InLoop, W);
+  end;
+  if Result then
+    Exit;
+  { S whole is one island, none inside it }
+  SetLength(FIsles, n0);
+  SetLength(FIsleW, n0);
+  SetLength(FIsleNames, n0);
+  SetLength(FIsleAll, n0);
+  SetLength(FIsleOdd, n0);
+  if not IsleOK(S, InLoop) then
+    Exit;
+  SetLength(FIsles, n0 + 1);
+  SetLength(FIsleW, n0 + 1);
+  SetLength(FIsleNames, n0 + 1);
+  SetLength(FIsleAll, n0 + 1);
+  SetLength(FIsleOdd, n0 + 1);
+  FIsleOdd[n0] := IsleOddS(S);
+  FIsles[n0] := S;
+  if (S^.Kind = skExit) or (S^.Kind = skRaise) or (S^.Kind = skHalt) then
+    FIsleW[n0] := 0
+  else
+    FIsleW[n0] := W;
+  m := nil;
+  FSawDump := False;
+  CollectNames(S, m);
+  FIsleNames[n0] := m;
+  FIsleAll[n0] := FSawDump;
+  FSawDump := False;
+  Result := True;
+end;
+
+function TEmitter.IsleAt(S: PStmt): SizeInt;
+var
+  i: SizeInt;
+begin
+  Result := -1;
+  for i := 0 to High(FIsles) do
+    if FIsles[i] = S then
+    begin
+      Result := i;
+      Exit;
+    end;
+end;
+
+{ P's register holds a reference: a pointer, which may point into a
+  stack that moves, or a class reference, which the collector reads. }
+function TEmitter.IsleRef(const P: TPromo): Boolean;
+begin
+  Result := (P.Part = 0) and ((TKind(P.Place.Typ) = tykPointer) or
+    (TKind(P.Place.Typ) = tykClass));
+end;
+
+{ S holds a statement that may write a variable WritesVar does not
+  see: one other than an assignment, an Inc, a Dec, a call, a Write, an
+  exit, a raise or the statements that hold them; a ReadLn, a New, a
+  select's receive, a for in. }
+function TEmitter.IsleOddS(S: PStmt): Boolean;
+var
+  i: SizeInt;
+begin
+  Result := False;
+  if S = nil then
+    Exit;
+  Result := True;
+  if not ((S^.Kind = skAssign) or (S^.Kind = skInc) or (S^.Kind = skDec) or
+    (S^.Kind = skCall) or (S^.Kind = skWrite) or (S^.Kind = skWriteLn) or
+    (S^.Kind = skExit) or (S^.Kind = skRaise) or (S^.Kind = skHalt) or
+    (S^.Kind = skIf) or (S^.Kind = skWhile) or (S^.Kind = skRepeat) or
+    (S^.Kind = skFor) or (S^.Kind = skCase) or (S^.Kind = skBlock) or
+    (S^.Kind = skWith) or (S^.Kind = skBreak) or (S^.Kind = skContinue)) then
+    Exit;
+  if IsleOddS(S^.ThenSt) or IsleOddS(S^.ElseSt) or IsleOddS(S^.Body) then
+    Exit;
+  for i := 0 to High(S^.Stmts) do
+    if IsleOddS(S^.Stmts[i]) then
+      Exit;
+  for i := 0 to High(S^.Arms) do
+    if IsleOddS(S^.Arms[i].Body) then
+      Exit;
+  Result := False;
+end;
+
+{ S may leave the routine from inside it: an exit, a raise or a halt at
+  any depth (an exit in an if whose test calls). The code that leaves
+  gives back the kept registers alone, so the region stores before such
+  an island all it wrote, as before one that is an exit. }
+function TEmitter.MayLeave(S: PStmt): Boolean;
+var
+  i: SizeInt;
+begin
+  Result := False;
+  if S = nil then
+    Exit;
+  Result := True;
+  if (S^.Kind = skExit) or (S^.Kind = skRaise) or (S^.Kind = skHalt) then
+    Exit;
+  if MayLeave(S^.ThenSt) or MayLeave(S^.ElseSt) or MayLeave(S^.Body) then
+    Exit;
+  for i := 0 to High(S^.Stmts) do
+    if MayLeave(S^.Stmts[i]) then
+      Exit;
+  for i := 0 to High(S^.Arms) do
+    if MayLeave(S^.Arms[i].Body) then
+      Exit;
+  for i := 0 to High(S^.Sels) do
+    if MayLeave(S^.Sels[i].Body) then
+      Exit;
+  Result := False;
+end;
+
+{ Island K reads P's variable at home: it names it, or reads every local. }
+function TEmitter.IsleReads(K: SizeInt; const P: TPromo): Boolean;
+begin
+  Result := FIsleAll[K] or InNames(FIsleNames[K], NormName(P.Place.Name));
+end;
+
+{ Island K's end loads P: a call takes P's register, P is no word of
+  its own a call leaves alone, or the island may assign its variable
+  (Result, which an exit and the routine's own name write, whenever it
+  names it). }
+function TEmitter.IsleBack(K: SizeInt; const P: TPromo): Boolean;
+var
+  n: string;
+begin
+  Result := True;
+  if (not P.Keep) or (P.Part <> 0) or (TKind(P.Place.Typ) = tykPointer) then
+    Exit;
+  n := NormName(P.Place.Name);
+  Result := False;
+  if not InNames(FIsleNames[K], n) then
+    Exit;
+  Result := FIsleOdd[K] or (n = 'result') or ((not P.Place.Global) and FHasRes and
+    (P.Place.Off = FResOff)) or WritesVar(FIsles[K], P.Place.Name);
+end;
+
+{ In a region with islands a variable pays for its register, a kept one
+  or a free one, when its uses outweigh what the islands cost it: a load
+  at the end of each that loads it, a store before when the region
+  writes it, and before each when a handler may read it, it holds a
+  reference or the island may leave the routine. }
+function TEmitter.IsleWorth(const P: TPromo; Kept: Boolean): Boolean;
+var
+  k: SizeInt;
+  c, per: Int64;
+  t: TPromo;
+begin
+  t := P;
+  t.Keep := Kept;
+  c := 0;
+  for k := 0 to High(FIsles) do
+  begin
+    per := 0;
+    if IsleBack(k, t) then
+      per := 1;
+    if t.Written and ((per = 1) or FIsleTry or IsleRef(t) or IsleReads(k, t) or
+      MayLeave(FIsles[k])) then
+      per := per + 1;
+    c := c + FIsleW[k] * per;
+  end;
+  Result := Int64(P.Refs) * 64 > c;
+end;
+
+procedure TEmitter.IsleLoad(const L: TPromoList);
+var
+  i: SizeInt;
+begin
+  for i := 0 to High(L) do
+    if L[i].Part > 0 then
+      LoadHomePart(L[i].Place, L[i].Part, L[i].Reg)
+    else
+      LoadHome(L[i].Place, L[i].Reg);
+end;
+
+{ A range of the debugger's location lists for each variable in its
+  register from FIsleFroms to E: all of them at the region's end (K -1),
+  at island K those its end loads, or all when a loop in it may lend
+  their registers to a region of its own. Each variable's ranges come
+  in the order of the code, a region in an island adding its own
+  between two of them. }
+procedure TEmitter.IsleRanges(const E: string; K: SizeInt; Loopy: Boolean);
+var
+  i, j: SizeInt;
+begin
+  for i := 0 to High(FPromo) do
+    if (not FPromo[i].Place.Global) and (FPromo[i].Part = 0) and
+      ((K < 0) or Loopy or IsleBack(K, FPromo[i])) then
+    begin
+      j := Length(FLocRanges);
+      SetLength(FLocRanges, j + 1);
+      FLocRanges[j].Proc := FCurProc;
+      FLocRanges[j].Off := FPromo[i].Place.Off;
+      FLocRanges[j].Dw := FPromo[i].Dw;
+      FLocRanges[j].B := FIsleFroms[i];
+      FLocRanges[j].E := E;
+    end;
+end;
+
+{ Island K, S: what the region wrote of the variables the island reads
+  or its end loads, and of the references, home before it, and all of it
+  when the island may leave the routine; the statement as outside any
+  region; those its end loads back in their registers after it, unless
+  it leaves for good. The region's state
+  waits aside, so a loop in the island makes a region of its own. }
+procedure TEmitter.EmitIsle(S: PStmt; K: SizeInt);
+var
+  svPromo, back: TPromoList;
+  svIsles: TStmtArray;
+  svW: array of Int64;
+  svNames: array of TStrArray;
+  svAll, svOdd: array of Boolean;
+  svFat, svFroms: TStrArray;
+  svStubs, svChunk, s1, e1: string;
+  svBrk, svChunkSave, svChunkDw, svVTop, svVNeed, svVCopy: LongInt;
+  svR8, svOn, svTry, leaving, leaves, loopy: Boolean;
+  i, n: SizeInt;
+begin
+  leaving := (S^.Kind = skExit) or (S^.Kind = skRaise) or (S^.Kind = skHalt);
+  leaves := leaving or MayLeave(S);
+  loopy := HasLoop(S);
+  for i := 0 to High(FPromo) do
+    if FPromo[i].Written and (leaves or FIsleTry or IsleRef(FPromo[i]) or
+      IsleReads(K, FPromo[i]) or IsleBack(K, FPromo[i])) then
+      StoreHome(FPromo[i].Place, FPromo[i].Reg);
+  s1 := Lab;
+  Line(s1 + ':');
+  IsleRanges(s1, K, loopy);
+  back := nil;
+  if not leaving then
+    for i := 0 to High(FPromo) do
+      if IsleBack(K, FPromo[i]) then
+      begin
+        n := Length(back);
+        SetLength(back, n + 1);
+        back[n] := FPromo[i];
+      end;
+  n := Length(FIsleStack);
+  SetLength(FIsleStack, n + 1);
+  SetLength(FIsleBacks, n + 1);
+  FIsleStack[n] := FPromo;
+  FIsleBacks[n] := back;
+  svPromo := FPromo;
+  svIsles := FIsles;
+  svW := FIsleW;
+  svNames := FIsleNames;
+  svAll := FIsleAll;
+  svOdd := FIsleOdd;
+  svTry := FIsleTry;
+  svFroms := FIsleFroms;
+  svFat := FFatWritten;
+  svStubs := FStubs;
+  svChunk := FChunkReg;
+  svChunkSave := FChunkSave;
+  svChunkDw := FChunkDw;
+  svR8 := FR8Lent;
+  svVTop := FVecTop;
+  svVNeed := FVecNeed;
+  svVCopy := FVecCopy;
+  svBrk := FIsleBrk;
+  svOn := FIsleOn;
+  PromoMark(False);
+  FPromoOn := False;
+  FIsles := nil;
+  FStubs := '';
+  FIsleOn := True;
+  FIsleBrk := LongInt(Length(FBrk));
+  EmitStmtNow(S);
+  FIsleOn := svOn;
+  FIsleBrk := svBrk;
+  FPromo := svPromo;
+  FIsles := svIsles;
+  FIsleW := svW;
+  FIsleNames := svNames;
+  FIsleAll := svAll;
+  FIsleOdd := svOdd;
+  FIsleTry := svTry;
+  FIsleFroms := svFroms;
+  FFatWritten := svFat;
+  FStubs := svStubs;
+  FChunkReg := svChunk;
+  FChunkSave := svChunkSave;
+  FChunkDw := svChunkDw;
+  FR8Lent := svR8;
+  FVecTop := svVTop;
+  FVecNeed := svVNeed;
+  FVecCopy := svVCopy;
+  SetLength(FIsleStack, n);
+  SetLength(FIsleBacks, n);
+  FPromoOn := True;
+  PromoMark(True);
+  IsleLoad(back);
+  e1 := Lab;
+  Line(e1 + ':');
+  for i := 0 to High(FPromo) do
+    if loopy or IsleBack(K, FPromo[i]) then
+      FIsleFroms[i] := e1;
+end;
+
+{ An exit in an island leaves the routine: each region the island is in
+  gives the kept registers their caller's values back, the innermost
+  first, as its own end would. }
+procedure TEmitter.IsleKeptBack;
+var
+  k, i: SizeInt;
+begin
+  for k := High(FIsleStack) downto 0 do
+    for i := 0 to High(FIsleStack[k]) do
+      if FIsleStack[k][i].Keep then
+      begin
+        if FArm then
+          LdFP(FIsleStack[k][i].Reg, FIsleStack[k][i].Save)
+        else
+          Line('  movq ' + IntToStr(FIsleStack[k][i].Save) + '(%rbp), %' +
+            FIsleStack[k][i].Reg);
+      end;
+end;
+
+{ A break or a continue out of an island lands in its region: the
+  registers its end loads get their variables first. }
+procedure TEmitter.IsleReload;
+begin
+  IsleLoad(FIsleBacks[High(FIsleBacks)]);
+end;
+
+{ A try keeps what rbx, r12, r13 and r15 (x19 to x26) hold, in frame
+  slots kept for it as a region keeps its own (FPinned): a raise from a
+  routine whose region had them goes past the region's end, and the
+  handler gives them back, so the routine still returns them as its
+  caller left them, which a caller's region with islands counts on
+  (P384). Base is where the slots start. }
+function TEmitter.TryKeep: LongInt;
+var
+  r, o: LongInt;
+begin
+  Result := FScratchOff - FPinned;
+  if FArm then
+  begin
+    FPinned := FPinned + 64;
+    { x19 at Base - 8 down to x26 at Base - 64, two a STP where its
+      signed offset reaches (ARM DDI 0487 M.c C6.2.414, STP, and
+      C6.2.214, LDP: a multiple of 8 from -512 to 504) }
+    for r := 0 to 3 do
+    begin
+      o := Result - 16 - 16 * r;
+      if (o >= -512) and (o <= 504) then
+        Line('  stp x' + IntToStr(20 + 2 * r) + ', x' + IntToStr(19 + 2 * r) +
+          ', [x29, #' + IntToStr(o) + ']')
+      else
+      begin
+        StFP('x' + IntToStr(19 + 2 * r), o + 8);
+        StFP('x' + IntToStr(20 + 2 * r), o);
+      end;
+    end;
+  end
+  else
+  begin
+    FPinned := FPinned + 32;
+    Line('  movq %rbx, ' + IntToStr(Result - 8) + '(%rbp)');
+    Line('  movq %r12, ' + IntToStr(Result - 16) + '(%rbp)');
+    Line('  movq %r13, ' + IntToStr(Result - 24) + '(%rbp)');
+    Line('  movq %r15, ' + IntToStr(Result - 32) + '(%rbp)');
+  end;
+  if FPinned > FScratchMax then
+    FScratchMax := FPinned;
+end;
+
+procedure TEmitter.TryKeepBack(Base: LongInt);
+var
+  r, o: LongInt;
+begin
+  if FArm then
+  begin
+    for r := 0 to 3 do
+    begin
+      o := Base - 16 - 16 * r;
+      if (o >= -512) and (o <= 504) then
+        Line('  ldp x' + IntToStr(20 + 2 * r) + ', x' + IntToStr(19 + 2 * r) +
+          ', [x29, #' + IntToStr(o) + ']')
+      else
+      begin
+        LdFP('x' + IntToStr(19 + 2 * r), o + 8);
+        LdFP('x' + IntToStr(20 + 2 * r), o);
+      end;
+    end;
+  end
+  else
+  begin
+    Line('  movq ' + IntToStr(Base - 8) + '(%rbp), %rbx');
+    Line('  movq ' + IntToStr(Base - 16) + '(%rbp), %r12');
+    Line('  movq ' + IntToStr(Base - 24) + '(%rbp), %r13');
+    Line('  movq ' + IntToStr(Base - 32) + '(%rbp), %r15');
+  end;
 end;
 
 { The statements of a block, a run of statements without calls at a
@@ -29861,12 +30457,12 @@ end;
   not pay for its loads and stores. }
 function TEmitter.EmitRegion(const L: TStmtArray; A, Z: SizeInt): Boolean;
 var
-  i, j, n, nf, nk, base, need, nfMax, nkMax: LongInt;
+  i, j, n, nf, nk, base, need, nfMax, nkMax, kind: LongInt;
   k: SizeInt;
   t: TPromo;
   b, e, b2: string;
   chosen: array of TPromo;
-  fw: TStrArray;
+  fw, froms: TStrArray;
   pure: Boolean;
   inner: Boolean;
 begin
@@ -29906,8 +30502,9 @@ begin
   FChunkReg := '';
   FChunkSave := 0;
   inner := False;
+  { a region with islands keeps no run's end: a call would take it }
   for k := A to Z do
-    if HasInnerFor(L[k]) then
+    if HasInnerFor(L[k]) and (Length(FIsles) = 0) then
       inner := True;
   nfMax := 3;
   nkMax := 8;
@@ -29928,7 +30525,7 @@ begin
   end;
   { r8 as well in a region of integer arithmetic alone (1.1.1): a
     mixer's loop of eight live values kept two in memory }
-  pure := not FArm;
+  pure := (not FArm) and (Length(FIsles) = 0);
   for k := A to Z do
     if pure and (not PureIntS(L[k])) then
       pure := False;
@@ -29938,9 +30535,24 @@ begin
   for i := 0 to n - 1 do
   begin
     j := Length(chosen);
+    { with islands a kept register first on amd64: a call keeps it, its
+      variable not loaded after (P384) }
+    kind := 0;
     if FArm then
     begin
-      if (nk < nkMax) and (FPromo[i].Refs >= 3) then
+      if (nk < nkMax) and (FPromo[i].Refs >= 3) and IsleWorth(FPromo[i], True) then
+        kind := 2;
+    end
+    else if (Length(FIsles) > 0) and (nk < 4) and (FPromo[i].Refs >= 3) and
+      IsleWorth(FPromo[i], True) then
+      kind := 2
+    else if (nf < nfMax) and (FPromo[i].Refs >= 2) and IsleWorth(FPromo[i], False) then
+      kind := 1
+    else if (nk < 4) and (FPromo[i].Refs >= 3) and IsleWorth(FPromo[i], True) then
+      kind := 2;
+    if FArm then
+    begin
+      if kind = 2 then
       begin
         SetLength(chosen, j + 1);
         chosen[j] := FPromo[i];
@@ -29951,7 +30563,7 @@ begin
         chosen[j].Save := base - 8 * nk;
       end;
     end
-    else if (nf < nfMax) and (FPromo[i].Refs >= 2) then
+    else if kind = 1 then
     begin
       SetLength(chosen, j + 1);
       chosen[j] := FPromo[i];
@@ -29980,7 +30592,7 @@ begin
       chosen[j].Save := 0;
       Inc(nf);
     end
-    else if (nk < 4) and (FPromo[i].Refs >= 3) then
+    else if kind = 2 then
     begin
       SetLength(chosen, j + 1);
       chosen[j] := FPromo[i];
@@ -30013,8 +30625,11 @@ begin
   end;
   FPromo := chosen;
   n := Length(FPromo);
-  { the vector variables' registers (P107, 1.0.128) }
+  { the vector variables' registers (P107, 1.0.128); none in a region
+    with islands, whose calls take every vector register }
   VecChoose(L, A, Z);
+  if Length(FIsles) > 0 then
+    FVPromo := nil;
   if (n = 0) and (Length(FVPromo) = 0) then
   begin
     FPromo := nil;
@@ -30070,7 +30685,13 @@ begin
   { A local the region writes before it reads is not loaded; a global
     always is, since a slow path before its first write would spill the
     register over the value other routines see (P96). }
-  fw := FirstWrites(L, A, Z);
+  { with islands every one is: an island may store a variable the region
+    wrote, and a home the collector reads must not get a register that
+    was never set }
+  if Length(FIsles) > 0 then
+    fw := nil
+  else
+    fw := FirstWrites(L, A, Z);
   for i := 0 to n - 1 do
     if FPromo[i].Part > 0 then
       LoadHomePart(FPromo[i].Place, FPromo[i].Part, FPromo[i].Reg)
@@ -30079,6 +30700,11 @@ begin
       LoadHome(FPromo[i].Place, FPromo[i].Reg);
   b := Lab;
   Line(b + ':');
+  froms := FIsleFroms;
+  FIsleFroms := nil;
+  SetLength(FIsleFroms, n);
+  for i := 0 to n - 1 do
+    FIsleFroms[i] := b;
   PromoMark(True);
   FPromoOn := True;
   FStubs := '';
@@ -30101,17 +30727,8 @@ begin
       StoreHome(FPromo[i].Place, FPromo[i].Reg);
   e := Lab;
   Line(e + ':');
-  for i := 0 to n - 1 do
-    if (not FPromo[i].Place.Global) and (FPromo[i].Part = 0) then
-    begin
-      j := Length(FLocRanges);
-      SetLength(FLocRanges, j + 1);
-      FLocRanges[j].Proc := FCurProc;
-      FLocRanges[j].Off := FPromo[i].Place.Off;
-      FLocRanges[j].Dw := FPromo[i].Dw;
-      FLocRanges[j].B := b;
-      FLocRanges[j].E := e;
-    end;
+  IsleRanges(e, -1, False);
+  FIsleFroms := froms;
   for i := 0 to n - 1 do
     if FPromo[i].Keep then
     begin

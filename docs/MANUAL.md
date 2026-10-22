@@ -2379,7 +2379,15 @@ the limit by a constant of 1 to 1023 once a pass, at its top level.
 A loop keeps a variable of its routine in a register; a global only in
 the main block, and only one no routine names: another routine may
 write it while the loop runs, and the loop reads it from memory at every
-pass (1.1.147).
+pass (1.1.147). A loop that calls keeps them there too (1.1.240, P384):
+a statement that calls runs with the loop's variables in memory, and a
+variable in a register every routine keeps for its caller (`rbx`,
+`r12`, `r13` and `r15` on amd64, `x19` to `x26` on arm64) stays in it
+across the call unless the statement assigns it; what the loop wrote
+of the others is stored before the call and they are loaded after it.
+A `try` keeps those registers too, so a routine that catches a raise
+from one of the routines it calls still returns them as its caller
+left them.
 A `for` of a constant count of four passes or fewer with a small body
 that neither changes its counter nor takes its address is written out
 once per pass with the pass's value in the counter's place, then the

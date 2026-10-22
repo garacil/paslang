@@ -539,6 +539,9 @@ GOLDEN_A64 += lineend
 # P338: a routine value, a method value and an interface take their kind.
 GOLDEN += valkinds
 GOLDEN_A64 += valkinds
+# P384: a loop that calls keeps its variables in registers.
+GOLDEN += isles
+GOLDEN_A64 += isles
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -2669,6 +2672,13 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/uplevel.out $(BUILDDIR)/uplevel0.got; \
 	python3 -I scripts/check_argpush.py $(BUILDDIR)/uplevel0.s --routines=p_outer_mid_deep; \
 	echo ok uplevel-asm; \
+	: a loop that calls keeps its variables in registers across the calls, P384, at -inline 0 and under the verify and stress modes of the collector; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/isles0 testdata/isles.paslang; \
+	$(BUILDDIR)/isles0 > $(BUILDDIR)/isles0.got; \
+	diff -u testdata/isles.out $(BUILDDIR)/isles0.got; \
+	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=3 PASLANG_GCPOISON=1 timeout 300 $(BUILDDIR)/isles0 > $(BUILDDIR)/isles0.vgot; \
+	diff -u testdata/isles.out $(BUILDDIR)/isles0.vgot; \
+	echo ok isles-asm; \
 	: a routine with nested ones zeroes only the locals a read may reach first, P358; \
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/nestzero0 testdata/nestzero.paslang; \
 	$(BUILDDIR)/nestzero0 > $(BUILDDIR)/nestzero0.got; \
@@ -4234,6 +4244,15 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	diff -u testdata/uplevel.out $(BUILDDIR)/uplevel0-arm.got; \
 	python3 -I scripts/check_argpush.py $(BUILDDIR)/uplevel0-arm.s --arm --routines=p_outer_mid_deep; \
 	echo ok uplevel-arm-asm; \
+	: P384 on arm64: a loop that calls keeps its variables in x19 to x26, a try keeps them for its handler, and the runtime keeps them on both machines; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/isles0-arm testdata/isles.paslang; \
+	timeout 300 $(QEMU_A64) $(BUILDDIR)/isles0-arm > $(BUILDDIR)/isles0-arm.got; \
+	diff -u testdata/isles.out $(BUILDDIR)/isles0-arm.got; \
+	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=3 PASLANG_GCPOISON=1 timeout 300 $(QEMU_A64) $(BUILDDIR)/isles0-arm > $(BUILDDIR)/isles0-arm.vgot; \
+	diff -u testdata/isles.out $(BUILDDIR)/isles0-arm.vgot; \
+	python3 -I scripts/check_isles.py $(BUILDDIR)/isles0.s $(BUILDDIR)/isles0-arm.s; \
+	python3 -I scripts/check_calleesaved.py $(BUILDDIR)/isles0.s $(BUILDDIR)/isles0-arm.s; \
+	echo ok isles-arm-asm; \
 	: P358 on arm64: the locals a read may reach first, zeroed alone; \
 	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/nestzero0-arm testdata/nestzero.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/nestzero0-arm > $(BUILDDIR)/nestzero0-arm.got; \
@@ -4310,7 +4329,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	echo ok aheadres-arm-asm; \
 	: P373 on arm64; \
 	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/elemaddr1-arm testdata/elemaddr.paslang; \
-	awk '/^p_runlocal:/,/cfi_endproc/' $(BUILDDIR)/elemaddr1-arm.s | grep -qE '^  (madd|add) x10, .*x29' || { echo "elemaddr-arm.s: RunLocal works out no element in x10"; exit 1; }; \
+	awk '/^p_runlocal:/,/cfi_endproc/' $(BUILDDIR)/elemaddr1-arm.s | grep -qE '^  (madd|add) x10, ' || { echo "elemaddr-arm.s: RunLocal works out no element in x10"; exit 1; }; \
 	echo ok elemaddr-arm-asm; \
 	: P377 on arm64; \
 	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/boundsidiom1-arm testdata/boundsidiom.paslang; \
