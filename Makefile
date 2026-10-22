@@ -2433,6 +2433,20 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -qF 'unknown type TSqlite at 7:7' $(BUILDDIR)/gc_sqlnouses.err; \
 	echo ok gcsections
 	@set -e; \
+	: SQL read as the SQLite parser reads it, P404; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/sqlparse testdata/sqlparse.paslang; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/sqlparse0 testdata/sqlparse.paslang; \
+	$(OUTDIR)/paslangc -cpu base -o $(BUILDDIR)/sqlparse-base testdata/sqlparse.paslang; \
+	$(BUILDDIR)/sqlparse testdata/sqlparse.sql > $(BUILDDIR)/sqlparse.got; \
+	cmp testdata/sqlparse.out $(BUILDDIR)/sqlparse.got; \
+	$(BUILDDIR)/sqlparse0 testdata/sqlparse.sql > $(BUILDDIR)/sqlparse.got0; \
+	cmp testdata/sqlparse.out $(BUILDDIR)/sqlparse.got0; \
+	$(BUILDDIR)/sqlparse-base testdata/sqlparse.sql > $(BUILDDIR)/sqlparse.gotb; \
+	cmp testdata/sqlparse.out $(BUILDDIR)/sqlparse.gotb; \
+	PASLANG_GCSTRESS=1 PASLANG_GCVERIFY=1 $(BUILDDIR)/sqlparse0 testdata/sqlparse.sql > $(BUILDDIR)/sqlparse.gotgc; \
+	cmp testdata/sqlparse.out $(BUILDDIR)/sqlparse.gotgc; \
+	echo ok sqlparse
+	@set -e; \
 	echo "==== index checks ===="; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/bce_s testdata/bce.paslang; \
 	if sed -n '/^p_table:/,/cfi_endproc/p' $(BUILDDIR)/bce_s.s | grep -q 'call rt_boundsfail'; then echo "bce: p_table kept a bounds check the loop does not need"; exit 1; fi; \
@@ -5437,6 +5451,15 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	fi; \
 	grep -qF 'unknown type TSqlite at 7:7' $(BUILDDIR)/gc_sqlnouses-arm.err; \
 	echo ok gcsections-arm
+	@set -e; \
+	: P404 on arm64: SQL read as the SQLite parser reads it under qemu; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -Fu $(A64DIR) -o $(BUILDDIR)/sqlparse-arm testdata/sqlparse.paslang; \
+	$(OUTDIR)/paslangc -target arm64 -cpu base -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/sqlparse0-arm testdata/sqlparse.paslang; \
+	timeout 600 $(QEMU_A64) $(BUILDDIR)/sqlparse-arm testdata/sqlparse.sql > $(BUILDDIR)/sqlparse-arm.got; \
+	cmp testdata/sqlparse.out $(BUILDDIR)/sqlparse-arm.got; \
+	timeout 600 $(QEMU_A64) $(BUILDDIR)/sqlparse0-arm testdata/sqlparse.sql > $(BUILDDIR)/sqlparse0-arm.got; \
+	cmp testdata/sqlparse.out $(BUILDDIR)/sqlparse0-arm.got; \
+	echo ok sqlparse-arm
 
 install: all installdirs
 	$(NORMAL_INSTALL)

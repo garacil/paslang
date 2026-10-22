@@ -11481,8 +11481,13 @@ from 512 to 65536, overflow pages, UTF-16 databases (as UTF-8),
 own POSIX locks, so a paslang program and the sqlite3 program share a
 file: a database another holds `EXCLUSIVE` gives `ESqliteError` with
 code `SQLITE_BUSY`, 'database is locked'. Errors are `ESqliteError`s
-with SQLite's codes and words. SQL, writes and the rest come with the
-next milestones.
+with SQLite's codes and words. SQL is read as SQLite's parser reads it
+(1.1.248, P404): the tables lemon makes of SQLite's `parse.y`, each of
+its rules reduced as SQLite reduces it, every error in SQLite's own
+words; `SqliteParseTrace(sql)` gives the trees SQLite's debug build
+traces for the statement (`.treetrace 0x10000`), then `ok`, or `error: `
+and the message, as `testdata/sqlparse` checks against SQLite on 1,351
+statements. Writes and the rest come with the next milestones.
 
 With `uses sqlite`, the objects of a database, each row of
 `sqlite_schema`, are listed by their kind and name:
