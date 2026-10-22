@@ -869,6 +869,19 @@ unit's interface record exports them (`testdata/recops`,
 array with no such operator is refused, where `TR(5)` relabelled the
 integer as the record; `x as T` sees the bytes.
 
+The rest of Free Pascal's operators are declared too (1.1.234): at the
+top level `operator := (n: Integer): TVec;` and `operator explicit`,
+the conversions; `-` and `+` of one operand, `not`, `inc` and `dec`
+(whose result is its operand's type; `Inc(v)` is then `v := inc(v)`,
+with no step); and the binary `and`, `or`, `xor`, `shl`, `shr` and
+`in`. A record's class operator takes, besides those symbols, the rest
+of Delphi's names: `Negative`, `Positive`, `LogicalNot`, `BitwiseAnd`,
+`LogicalAnd`, `BitwiseOr`, `LogicalOr`, `BitwiseXor`, `LeftShift`,
+`RightShift`, `In`, `Inc`, `Dec`, `Trunc` and `Round`. A declared
+operator comes before the language's meaning of the operator on its
+values, the logic of a record's bytes among them (`testdata/opunary`,
+`testdata/recops2`, `testdata/units/opunuse`).
+
 `examples/bits.paslang`:
 
 ```pascal
@@ -12692,13 +12705,13 @@ method, a property or an enumeration member of one of these names is a
 compile error that names it, at the name: `Length is a reserved word,
 not a name at 5:3`. A unit's `.pi` is not checked for these names when
 it loads. The compiler loads only a `.pi` of the format it writes,
-`PASLANGI31`, and refuses an older one with the minimum compiler needed to
+`PASLANGI32`, and refuses an older one with the minimum compiler needed to
 rebuild it. A routine whose result is a record, a static array or a set
 of 32 bytes writes it where its caller says (1.1.213), and one of one to
 three words gives it back in registers (1.1.217), which a unit compiled
 before did not; the interface carries the operators it declares
-(1.1.230) and its records' conversions (1.1.233); a field or a property
-carries its `json`
+(1.1.230), its records' conversions (1.1.233) and its operators of one
+operand (1.1.234); a field or a property carries its `json`
 directive (1.1.131); a type may be `json`, kind 26 (1.1.124); Currency adds builtin type id 17; scoped members, generic
 origin/argument identity and every exported alias remain recorded. All
 installed libraries must be rebuilt when this format changes.

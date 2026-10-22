@@ -54,6 +54,15 @@ type
     Own: Boolean;  { declared in this program or unit, not a used unit's (P157) }
   end;
 
+  { An operator of one operand (P381): OpW neg, pos, not, inc, dec,
+    trunc or round on a Typ, giving a Ret, done by Sym. }
+  TUnOpEnt = record
+    OpW: string;
+    Typ, Ret: LongInt;
+    Sym: string;
+    Own: Boolean;
+  end;
+
   { A record's class operator Implicit or Explicit (P171): a value of
     FromTyp made a ToTyp by Sym. }
   TConvEnt = record
@@ -172,6 +181,7 @@ type
     FProcs: array of TProcEnt;
     FOps: array of TOpEnt;
     FConvs: array of TConvEnt;
+    FUnOps: array of TUnOpEnt;
     FTypes: TTypeDefArray;
     FTypeNames: array of TTypeName;
     FFuncName: string;
@@ -686,6 +696,9 @@ type
     function OpOfWord(const W, Path: string): TBinOp;
     function OpTypeWord(T: LongInt): string;
     procedure AddConv(F, T: LongInt; const Sym: string; Explicit, Own: Boolean);
+    procedure AddUnOp(const W: string; T, Ret: LongInt; const Sym: string; Own: Boolean);
+    function UnOpFor(const W: string; E: PExpr; out C: PExpr): Boolean;
+    function UserBinOp(Op: TBinOp; L, R: PExpr; out C: PExpr): Boolean;
     function ConvFor(E: PExpr; Want: LongInt; Explicit: Boolean; out C: PExpr): Boolean;
     function OpNear(Op: TBinOp; L, R: PExpr; out K: SizeInt): Boolean;
     function RecOpWord(out Kind: LongInt; out Op: TBinOp; out OpW, Text: string): Boolean;
@@ -1443,6 +1456,7 @@ begin
     boAnd: Result := 'and';
     boOr: Result := 'or';
     boXor: Result := 'xor';
+    boIn: Result := 'in';
     boEq: Result := '=';
     boNe: Result := '<>';
     boLt: Result := '<';
@@ -12109,7 +12123,10 @@ begin
           args := ParseArgList;
           if Length(args) <> 1 then
             Die('Trunc takes 1 argument');
-          if TypeOf(args[0]^.Typ).Kind = tykCurrency then
+          { a record's class operator Trunc (P381) }
+          if (Length(FUnOps) > 0) and UnOpFor('trunc', args[0], conv) then
+            Result := conv
+          else if TypeOf(args[0]^.Typ).Kind = tykCurrency then
             Result := CurrCall('PasCurrTrunc', args[0], nil, TyInteger)
           else if IsQuadTyp(args[0]^.Typ) then
             Result := QCall('rtq_toint', args[0], NewInt(0), TyInteger)
@@ -12121,7 +12138,10 @@ begin
           args := ParseArgList;
           if Length(args) <> 1 then
             Die('Round takes 1 argument');
-          if TypeOf(args[0]^.Typ).Kind = tykCurrency then
+          { a record's class operator Round (P381) }
+          if (Length(FUnOps) > 0) and UnOpFor('round', args[0], conv) then
+            Result := conv
+          else if TypeOf(args[0]^.Typ).Kind = tykCurrency then
             Result := CurrCall('PasCurrRound', args[0], nil, TyInteger)
           else if IsQuadTyp(args[0]^.Typ) then
             Result := QCall('rtq_toint', args[0], NewInt(1), TyInteger)
@@ -14355,7 +14375,7 @@ end;
 
 function TParser.ParseUnary0: PExpr;
 var
-  e: PExpr;
+  e, ue: PExpr;
   atpe: TProcEnt;
   td: TTypeDef;
   i: SizeInt;
@@ -14365,6 +14385,9 @@ begin
   begin
     FTok := FLex.Next;
     e := Self.ParseUnary;
+    { a declared operator + of one operand (P381) }
+    if (Length(FUnOps) > 0) and UnOpFor('pos', e, ue) then
+      e := ue;
   end
   else if FTok.Kind = tkMinus then
   begin
@@ -14381,16 +14404,22 @@ begin
     else
     begin
       e := Self.ParseUnary;
-      CheckOperand('-', e);
-      e := NewUn(uoNeg, e);
-      if (e^.L <> nil) and (TypeOf(e^.L^.Typ).Kind = tykCurrency) then
-        e := CurrCall('PasCurrNeg', e^.L, nil, TyCurrency)
-      else if (e^.L <> nil) and IsQuadTyp(e^.L^.Typ) then
-        e := QuadNeg(e^.L)
-      else if (e^.L <> nil) and (TypeOf(e^.L^.Typ).Kind = tykReal) then
-        e^.Typ := e^.L^.Typ
-      else if (e^.L <> nil) and IsNarrowId(e^.L^.Typ) then
-        e^.Typ := e^.L^.Typ;
+      { a declared operator - of one operand (P381) }
+      if (Length(FUnOps) > 0) and UnOpFor('neg', e, ue) then
+        e := ue
+      else
+      begin
+        CheckOperand('-', e);
+        e := NewUn(uoNeg, e);
+        if (e^.L <> nil) and (TypeOf(e^.L^.Typ).Kind = tykCurrency) then
+          e := CurrCall('PasCurrNeg', e^.L, nil, TyCurrency)
+        else if (e^.L <> nil) and IsQuadTyp(e^.L^.Typ) then
+          e := QuadNeg(e^.L)
+        else if (e^.L <> nil) and (TypeOf(e^.L^.Typ).Kind = tykReal) then
+          e^.Typ := e^.L^.Typ
+        else if (e^.L <> nil) and IsNarrowId(e^.L^.Typ) then
+          e^.Typ := e^.L^.Typ;
+      end;
     end;
   end
   else if FTok.Kind = tkNot then
@@ -14589,7 +14618,7 @@ var
   sym: string;
   ret, rt: LongInt;
   args: TExprArray;
-  ok: SizeInt;
+  ub: PExpr;
 begin
   args := nil;
   CheckTyped(L);
@@ -14606,23 +14635,9 @@ begin
   end;
   if ((Op = boAdd) or (Op = boSub)) and PtrArith(Op, L, R, Result) then
     Exit;
-  if FindOp(Op, L^.Typ, R^.Typ, sym, ret) then
-  begin
-    SetLength(args, 2);
-    args[0] := L;
-    args[1] := R;
-    Result := NewCall(sym, args, ret);
-  end
-  else if ((TypeOf(L^.Typ).Kind = tykRecord) or (TypeOf(R^.Typ).Kind = tykRecord)) and
-    OpNear(Op, L, R, ok) then
-  begin
-    { the operator whose operands take L and R nearest, converted as a
-      call's arguments (P171) }
-    SetLength(args, 2);
-    args[0] := ValArg(FOps[ok].LTyp, L);
-    args[1] := ValArg(FOps[ok].RTyp, R);
-    Result := NewCall(FOps[ok].Sym, args, FOps[ok].Ret);
-  end
+  { a declared operator, of the exact types or the nearest (P171, P381) }
+  if UserBinOp(Op, L, R, ub) then
+    Result := ub
   else if (TypeOf(L^.Typ).Kind = tykRecord) or
     (TypeOf(R^.Typ).Kind = tykRecord) then
     Die(BinWord(Op) + ' does not take a record' + PosOf(L))
@@ -14807,7 +14822,15 @@ end;
 
 { not E: a Boolean's negation or an integer's bits flipped (1.0.74). }
 function TParser.MakeNot(E: PExpr): PExpr;
+var
+  ue: PExpr;
 begin
+  { a declared operator not (P381), before a record's bytes' logic }
+  if (Length(FUnOps) > 0) and UnOpFor('not', E, ue) then
+  begin
+    Result := ue;
+    Exit;
+  end;
   if (E <> nil) and (TypeOf(E^.Typ).Kind = tykCurrency) then
     Die('not does not take Currency' + PosOf(E));
   if (E <> nil) and (IsBlockNode(E) or IsBlockTyp(E^.Typ) or (TypeOf(E^.Typ).Kind = tykString)) then
@@ -14830,7 +14853,33 @@ end;
   shifts in copies of the top bit of L's width, rol and ror rotate
   within it. }
 function TParser.MakeBin(const K: string; L, R: PExpr): PExpr;
+var
+  bo: TBinOp;
+  ub: PExpr;
 begin
+  { a declared operator and, or, xor, shl or shr (P381), before the
+    language's: a record's bytes' logic among them }
+  if (Length(FOps) > 0) and (L <> nil) and (R <> nil) and
+    ((K = 'and') or (K = 'or') or (K = 'xor') or (K = 'shl') or (K = 'shr')) then
+  begin
+    CheckTyped(L);
+    CheckTyped(R);
+    if K = 'and' then
+      bo := boAnd
+    else if K = 'or' then
+      bo := boOr
+    else if K = 'xor' then
+      bo := boXor
+    else if K = 'shl' then
+      bo := boShl
+    else
+      bo := boShr;
+    if UserBinOp(bo, L, R, ub) then
+    begin
+      Result := ub;
+      Exit;
+    end;
+  end;
   if (K = 'and') or (K = 'nand') or (K = 'andnot') or (K = 'nor') or (K = 'xnor') or
     (K = 'or') or (K = 'xor') then
   begin
@@ -14933,7 +14982,7 @@ end;
 function TParser.ParseCmp: PExpr;
 var
   op: TBinOp;
-  e, r: PExpr;
+  e, r, uin: PExpr;
   id: LongInt;
   mk: TExprArray;
 begin
@@ -14942,6 +14991,18 @@ begin
   begin
     FTok := FLex.Next;
     Result := NewBin(boIn, e, ParseAdd);
+    { a declared operator in on a record (P381) }
+    if (Length(FOps) > 0) and (Result^.L <> nil) and (Result^.R <> nil) then
+    begin
+      CheckTyped(Result^.L);
+      CheckTyped(Result^.R);
+      if ((TypeOf(Result^.L^.Typ).Kind = tykRecord) or (TypeOf(Result^.R^.Typ).Kind = tykRecord)) and
+        UserBinOp(boIn, Result^.L, Result^.R, uin) then
+      begin
+        Result := uin;
+        Exit;
+      end;
+    end;
     if TypeOf(Result^.R^.Typ).Kind = tykJson then
     begin
       { 'k' in j: j is an object with a member named k (P203); False
@@ -17825,7 +17886,7 @@ var
   name, vname: string;
   st, nst, est: PStmt;
   pe: TProcEnt;
-  e, stp: PExpr;
+  e, stp, ue: PExpr;
   lno: LongInt;
   args: TExprArray;
   shared: Boolean;
@@ -18430,6 +18491,20 @@ begin
           if not (IsValueView(e) or (e^.Kind = ekVar) or (e^.Kind = ekField) or
             (e^.Kind = ekIndex) or (e^.Kind = ekDeref) or (MapPlaceRoot(e) <> nil)) then
             Die(name + ' needs a variable' + PosOf(e));
+          { a declared operator inc or dec (P381): Inc(r) is r := inc(r),
+            with no step, as in Free Pascal }
+          if (Length(FUnOps) > 0) and UnOpFor(ToLower(name), e, ue) then
+          begin
+            if FTok.Kind = tkComma then
+              Die('the operator ' + ToLower(name) + ' of ' + TypName(e^.Typ) + ' takes no step' +
+                HerePos);
+            Eat(tkRParen);
+            st := NewStmt(skAssign);
+            st^.Dest := e;
+            st^.E := ue;
+          end
+          else
+          begin
           { a number, an ordinal or a pointer (1.0.140): Inc(s, 'x') of a
             string compiled and left garbage }
           if not (IsIntId(e^.Typ) or (TypeOf(e^.Typ).Kind = tykInteger) or
@@ -18505,6 +18580,7 @@ begin
               st := ViewStore(st^.Dest, ApplyOp(boAdd, st^.Dest, st^.E))
             else
               st := ViewStore(st^.Dest, ApplyOp(boSub, st^.Dest, st^.E));
+          end;
           end;
           end;
         end
@@ -19655,7 +19731,11 @@ begin
     (P171). }
   if Copy(data, 1, 11) = 'PASLANGI30' + #10 then
     Die(path + ' was compiled by a paslang older than 1.1.233; compile ' + AName + ' again');
-  if (Copy(data, 1, 8) = 'PASLANGI') and (Copy(data, 1, 11) <> 'PASLANGI31' + #10) then
+  { From 1.1.234 a unit's interface exports its operators of one operand
+    and its logic, shifts and in (P381). }
+  if Copy(data, 1, 11) = 'PASLANGI31' + #10 then
+    Die(path + ' was compiled by a paslang older than 1.1.234; compile ' + AName + ' again');
+  if (Copy(data, 1, 8) = 'PASLANGI') and (Copy(data, 1, 11) <> 'PASLANGI32' + #10) then
     Die(path + ' was compiled by a newer paslang (' + FirstLine(data) +
       '); compile ' + AName + ' again with this one');
   if not ParseIface(data, iface) then
@@ -19752,6 +19832,10 @@ begin
   for j := 0 to High(iface.Ops) do
     AddOp(OpOfWord(iface.Ops[j].Op, path), MapImport(iface.Ops[j].LTyp),
       MapImport(iface.Ops[j].RTyp), MapImport(iface.Ops[j].Ret), iface.Ops[j].Sym, False);
+  { and its operators of one operand (P381) }
+  for j := 0 to High(iface.UnOps) do
+    AddUnOp(iface.UnOps[j].OpW, MapImport(iface.UnOps[j].Typ), MapImport(iface.UnOps[j].Ret),
+      iface.UnOps[j].Sym, False);
   { and its records' conversions (P171) }
   for j := 0 to High(iface.Convs) do
     AddConv(MapImport(iface.Convs[j].FromTyp), MapImport(iface.Convs[j].ToTyp), iface.Convs[j].Sym,
@@ -24216,6 +24300,87 @@ begin
   FConvs[n].Own := Own;
 end;
 
+{ The operator W of one operand on a T, giving a Ret, done by Sym
+  (P381): a later declaration hides the one before, as AddOp says. }
+procedure TParser.AddUnOp(const W: string; T, Ret: LongInt; const Sym: string; Own: Boolean);
+var
+  i, n: SizeInt;
+begin
+  for i := 0 to High(FUnOps) do
+    if (FUnOps[i].OpW = W) and SameTyp(FUnOps[i].Typ, T) then
+    begin
+      FUnOps[i].Ret := Ret;
+      FUnOps[i].Sym := Sym;
+      FUnOps[i].Own := Own;
+      Exit;
+    end;
+  n := Length(FUnOps);
+  SetLength(FUnOps, n + 1);
+  FUnOps[n].OpW := W;
+  FUnOps[n].Typ := T;
+  FUnOps[n].Ret := Ret;
+  FUnOps[n].Sym := Sym;
+  FUnOps[n].Own := Own;
+end;
+
+{ The call of the operator W of one operand on E, in C (P381): -e, +e,
+  not e, Inc(e), Trunc(e) of a type that declares it. }
+function TParser.UnOpFor(const W: string; E: PExpr; out C: PExpr): Boolean;
+var
+  i: SizeInt;
+  args: TExprArray;
+begin
+  Result := False;
+  C := nil;
+  if (E = nil) or (E^.Typ <= TyNone) then
+    Exit;
+  for i := 0 to High(FUnOps) do
+    if (FUnOps[i].OpW = W) and SameTyp(FUnOps[i].Typ, E^.Typ) then
+    begin
+      args := nil;
+      SetLength(args, 1);
+      args[0] := E;
+      C := NewCall(FUnOps[i].Sym, args, FUnOps[i].Ret);
+      Result := True;
+      Exit;
+    end;
+end;
+
+{ The call of a declared binary operator Op on L and R, in C: the one of
+  their exact types (FindOp), or, when one of them is a record, the one
+  whose operands take them nearest (OpNear, P171), converted as a call's
+  arguments are (P381: ApplyOp's, and the logic's and in's before the
+  language's own). }
+function TParser.UserBinOp(Op: TBinOp; L, R: PExpr; out C: PExpr): Boolean;
+var
+  sym: string;
+  ret: LongInt;
+  args: TExprArray;
+  k: SizeInt;
+begin
+  Result := False;
+  C := nil;
+  if (L = nil) or (R = nil) then
+    Exit;
+  args := nil;
+  SetLength(args, 2);
+  if FindOp(Op, L^.Typ, R^.Typ, sym, ret) then
+  begin
+    args[0] := L;
+    args[1] := R;
+    C := NewCall(sym, args, ret);
+    Result := True;
+  end
+  else if ((TypeOf(L^.Typ).Kind = tykRecord) or (TypeOf(R^.Typ).Kind = tykRecord)) and
+    OpNear(Op, L, R, k) then
+  begin
+    args[0] := ValArg(FOps[k].LTyp, L);
+    args[1] := ValArg(FOps[k].RTyp, R);
+    C := NewCall(FOps[k].Sym, args, FOps[k].Ret);
+    Result := True;
+  end;
+end;
+
 { E made a Want by a record's class operator (P171), in C: an Implicit
   one, and in a cast (Explicit) an Explicit one too, before an Implicit
   of the same price; among them the one whose parameter takes E
@@ -24359,6 +24524,37 @@ begin
     OpW := 'explicit';
     Text := 'Explicit';
   end
+  else if (FTok.Kind = tkAnd) or (w = 'bitwiseand') or (w = 'logicaland') then
+    Op := boAnd
+  else if (FTok.Kind = tkOr) or (w = 'bitwiseor') or (w = 'logicalor') then
+    Op := boOr
+  else if (FTok.Kind = tkXor) or (w = 'bitwisexor') then
+    Op := boXor
+  else if (FTok.Kind = tkShlKw) or (w = 'leftshift') then
+    Op := boShl
+  else if (FTok.Kind = tkShrKw) or (w = 'rightshift') then
+    Op := boShr
+  else if FTok.Kind = tkIn then
+    Op := boIn
+  else if (FTok.Kind = tkNot) or (w = 'logicalnot') then
+  begin
+    { an operator of one operand (P381): Kind 3, its word in OpW }
+    Kind := 3;
+    OpW := 'not';
+    Text := 'not';
+  end
+  else if (w = 'negative') or (w = 'positive') or (w = 'inc') or (w = 'dec') or
+    (w = 'trunc') or (w = 'round') then
+  begin
+    Kind := 3;
+    if w = 'negative' then
+      OpW := 'neg'
+    else if w = 'positive' then
+      OpW := 'pos'
+    else
+      OpW := w;
+    Text := FTok.Lexeme;
+  end
   else
     Result := False;
   if Result and (Kind = 0) then
@@ -24376,8 +24572,14 @@ begin
       boLt: OpW := 'lt';
       boLe: OpW := 'le';
       boGt: OpW := 'gt';
+      boGe: OpW := 'ge';
+      boAnd: OpW := 'and';
+      boOr: OpW := 'or';
+      boXor: OpW := 'xor';
+      boShl: OpW := 'shl';
+      boShr: OpW := 'shr';
     else
-      OpW := 'ge';
+      OpW := 'in';
     end;
     Text := BinWord(Op);
   end;
@@ -24418,8 +24620,8 @@ begin
   at := HerePos;
   FDeclAt := at;
   if not RecOpWord(kind, op, opw, txt) then
-    Die('a record''s class operator is +, -, *, /, div, mod, a comparison, Implicit (:=) or ' +
-      'Explicit, or its name (Add, Equal...), not ' + FTok.Lexeme + at);
+    Die('a record''s class operator is a symbol of Free Pascal''s or a name of Delphi''s ' +
+      '(Free Pascal''s reference, table 9.1), not ' + FTok.Lexeme + at);
   FTok := FLex.Next;
   Eat(tkLParen);
   pr := Default(TProc);
@@ -24469,7 +24671,29 @@ begin
     FTok := FLex.Next;
     Eat(tkSemi);
   end;
-  if kind = 0 then
+  { + and - of one operand are Positive and Negative (P381) }
+  if (kind = 0) and (Length(pr.Params) = 1) and ((op = boAdd) or (op = boSub)) then
+  begin
+    kind := 3;
+    if op = boAdd then
+      opw := 'pos'
+    else
+      opw := 'neg';
+  end;
+  if kind = 3 then
+  begin
+    if Length(pr.Params) <> 1 then
+      Die('class operator ' + txt + ' takes 1 operand' + at);
+    lt := pr.Params[0].Typ;
+    rt := TyNone;
+    if lt <> recT then
+      Die(rname + '''s class operator ' + txt + ' takes a ' + rname + at);
+    if ((opw = 'inc') or (opw = 'dec')) and (pr.RetTyp <> recT) then
+      Die('class operator ' + txt + ' gives a ' + rname + at);
+    what := 'class operator ' + txt + ' on ' + rname;
+    pr.Name := 'op_' + opw + '_' + TypeOf(lt).Name;
+  end
+  else if kind = 0 then
   begin
     if Length(pr.Params) <> 2 then
       Die('class operator ' + txt + ' takes 2 operands' + at);
@@ -24497,8 +24721,11 @@ begin
     what := 'class operator ' + txt + ' from ' + TypName(lt) + ' to ' + TypName(rt);
     pr.Name := 'op_' + opw + '_' + TypeOf(lt).Name + '_' + TypeOf(rt).Name;
   end;
-  pr.Sym := ProcSym('', StemOfName(rname) + '_op_' + opw + '_' + OpTypeWord(lt) + '_' +
-    OpTypeWord(rt));
+  if kind = 3 then
+    pr.Sym := ProcSym('', StemOfName(rname) + '_op_' + opw + '_' + OpTypeWord(lt))
+  else
+    pr.Sym := ProcSym('', StemOfName(rname) + '_op_' + opw + '_' + OpTypeWord(lt) + '_' +
+      OpTypeWord(rt));
   pr.Nest := 0;
   if not Head then
   begin
@@ -24512,7 +24739,8 @@ begin
     if FProg.Procs[pidx].Body <> nil then
       Die(rname + '''s ' + what + ' has a body already' + at);
     if (FProg.Procs[pidx].RetTyp <> pr.RetTyp) or (FProg.Procs[pidx].Params[0].Typ <> lt) or
-      ((kind = 0) and (FProg.Procs[pidx].Params[1].Typ <> rt)) then
+      ((kind = 0) and (FProg.Procs[pidx].Params[1].Typ <> rt)) or
+      (Length(FProg.Procs[pidx].Params) <> Length(pr.Params)) then
       Die('the body of ' + rname + '''s ' + what + ' is of other types than its head' + at);
     FProg.Procs[pidx].Params := pr.Params;
     ApplyParams(pr.Name, pr.Params);
@@ -24524,7 +24752,13 @@ begin
   end;
   { a second one of the same types in one program or unit, here or at
     the top level, is one too many; a used unit's is hidden instead }
-  if kind = 0 then
+  if kind = 3 then
+  begin
+    for i := 0 to High(FUnOps) do
+      if FUnOps[i].Own and (FUnOps[i].OpW = opw) and SameTyp(FUnOps[i].Typ, lt) then
+        Die(what + ' declared twice' + at);
+  end
+  else if kind = 0 then
   begin
     for i := 0 to High(FOps) do
       if FOps[i].Own and (FOps[i].Op = op) and SameTyp(FOps[i].LTyp, lt) and
@@ -24544,13 +24778,24 @@ begin
   SetLength(FProg.Procs, n + 1);
   FProg.Procs[n] := pr;
   RememberMethod(pr.Sym, rname + '''s ' + what, at);
-  if kind = 0 then
+  if kind = 3 then
+    AddUnOp(opw, lt, pr.RetTyp, pr.Sym, True)
+  else if kind = 0 then
     AddOp(op, lt, rt, pr.RetTyp, pr.Sym, True)
   else
     AddConv(lt, rt, pr.Sym, kind = 2, True);
   if FIsUnit and not FInImpl then
   begin
-    if kind = 0 then
+    if kind = 3 then
+    begin
+      n := Length(FProg.UnOps);
+      SetLength(FProg.UnOps, n + 1);
+      FProg.UnOps[n].OpW := opw;
+      FProg.UnOps[n].Typ := lt;
+      FProg.UnOps[n].Ret := pr.RetTyp;
+      FProg.UnOps[n].Sym := pr.Sym;
+    end
+    else if kind = 0 then
     begin
       n := Length(FProg.Ops);
       SetLength(FProg.Ops, n + 1);
@@ -24600,6 +24845,18 @@ begin
     Result := boDiv
   else if W = 'mod' then
     Result := boMod
+  else if W = 'and' then
+    Result := boAnd
+  else if W = 'or' then
+    Result := boOr
+  else if W = 'xor' then
+    Result := boXor
+  else if W = 'shl' then
+    Result := boShl
+  else if W = 'shr' then
+    Result := boShr
+  else if W = 'in' then
+    Result := boIn
   else
     Die('bad compiled interface ' + Path + ': operator ' + W);
 end;
@@ -24642,12 +24899,19 @@ var
   op: TBinOp;
   names: array of string;
   nn, i, n, pidx: SizeInt;
-  t: LongInt;
-  oname, at: string;
+  t, ck, lt, rt: LongInt;
+  oname, at, ukind, otext, what, sw: string;
+  same: Boolean;
 begin
   FTok := FLex.Next;
   { where the operator is told (P157) }
   at := HerePos;
+  { a conversion (P381): ck 1 for :=, Implicit, 2 for explicit; an
+    operator of one operand: ukind its word }
+  ck := 0;
+  ukind := '';
+  op := boAdd;
+  oname := '';
   if FTok.Kind = tkPlus then
   begin
     op := boAdd;
@@ -24708,6 +24972,44 @@ begin
     op := boMod;
     oname := 'mod';
   end
+  else if FTok.Kind = tkAnd then
+  begin
+    op := boAnd;
+    oname := 'and';
+  end
+  else if FTok.Kind = tkOr then
+  begin
+    op := boOr;
+    oname := 'or';
+  end
+  else if FTok.Kind = tkXor then
+  begin
+    op := boXor;
+    oname := 'xor';
+  end
+  else if FTok.Kind = tkShlKw then
+  begin
+    op := boShl;
+    oname := 'shl';
+  end
+  else if FTok.Kind = tkShrKw then
+  begin
+    op := boShr;
+    oname := 'shr';
+  end
+  else if FTok.Kind = tkIn then
+  begin
+    op := boIn;
+    oname := 'in';
+  end
+  else if FTok.Kind = tkNot then
+    ukind := 'not'
+  else if FTok.Kind = tkAssign then
+    ck := 1
+  else if (FTok.Kind = tkIdent) and SameId(FTok.Lexeme, 'explicit') then
+    ck := 2
+  else if (FTok.Kind = tkIdent) and (SameId(FTok.Lexeme, 'inc') or SameId(FTok.Lexeme, 'dec')) then
+    ukind := ToLower(FTok.Lexeme)
   else
     Die('operator symbol');
   FTok := FLex.Next;
@@ -24751,20 +25053,74 @@ begin
     FTok := FLex.Next;
   end;
   Eat(tkRParen);
-  if Length(pr.Params) <> 2 then
+  { + and - of one operand are the unary ones (P381) }
+  if (ck = 0) and (ukind = '') and (Length(pr.Params) = 1) and ((op = boAdd) or (op = boSub)) then
+  begin
+    if op = boAdd then
+      ukind := 'pos'
+    else
+      ukind := 'neg';
+  end;
+  if ck = 1 then
+    otext := ':='
+  else if ck = 2 then
+    otext := 'explicit'
+  else if ukind = 'neg' then
+    otext := '-'
+  else if ukind = 'pos' then
+    otext := '+'
+  else if ukind <> '' then
+    otext := ukind
+  else
+    otext := BinWord(op);
+  if (ck <> 0) or (ukind <> '') then
+  begin
+    if Length(pr.Params) <> 1 then
+      Die('operator ' + otext + ' takes 1 argument' + at);
+  end
+  else if Length(pr.Params) <> 2 then
     Die('operator takes 2 arguments');
   Eat(tkColon);
   pr.RetTyp := Self.ParseType;
   Eat(tkSemi);
-  pr.Name := 'op_' + oname + '_' + TypeOf(pr.Params[0].Typ).Name;
+  lt := pr.Params[0].Typ;
+  if ck <> 0 then
+  begin
+    rt := pr.RetTyp;
+    if SameTyp(lt, rt) then
+      Die('operator ' + otext + ' takes and gives a ' + TypName(lt) +
+        '; a conversion goes from one type to another' + at);
+    if ck = 1 then
+      oname := 'implicit'
+    else
+      oname := 'explicit';
+    what := 'operator ' + otext + ' from ' + TypName(lt) + ' to ' + TypName(rt);
+    pr.Name := 'op_' + oname + '_' + TypeOf(lt).Name + '_' + TypeOf(rt).Name;
+    sw := 'op_' + oname + '_' + OpTypeWord(lt) + '_' + OpTypeWord(rt);
+  end
+  else if ukind <> '' then
+  begin
+    rt := TyNone;
+    if ((ukind = 'inc') or (ukind = 'dec')) and not SameTyp(pr.RetTyp, lt) then
+      Die('operator ' + otext + ' gives a ' + TypName(lt) + at);
+    oname := ukind;
+    what := 'operator ' + otext + ' on ' + TypName(lt);
+    pr.Name := 'op_' + oname + '_' + TypeOf(lt).Name;
+    sw := 'op_' + oname + '_' + OpTypeWord(lt);
+  end
+  else
+  begin
+    rt := pr.Params[1].Typ;
+    what := 'operator ' + otext + ' on ' + TypName(lt) + ' and ' + TypName(rt);
+    pr.Name := 'op_' + oname + '_' + TypeOf(lt).Name;
+    sw := 'op_' + oname + '_' + OpTypeWord(lt) + '_' + OpTypeWord(rt);
+  end;
   { a unit's operator carries the unit's name, as its routines do (P154):
     two units may each give a TVec its + }
   if FIsUnit and not IsCoreUnit(FUnitName) then
-    pr.Sym := ProcSym(FUnitName, 'op_' + oname + '_' + OpTypeWord(pr.Params[0].Typ) + '_' +
-      OpTypeWord(pr.Params[1].Typ))
+    pr.Sym := ProcSym(FUnitName, sw)
   else
-    pr.Sym := ProcSym('', 'op_' + oname + '_' + OpTypeWord(pr.Params[0].Typ) + '_' +
-      OpTypeWord(pr.Params[1].Typ));
+    pr.Sym := ProcSym('', sw);
   pr.Nest := 0;
   { the implementation's operator whose head the interface declared }
   pidx := -1;
@@ -24774,11 +25130,13 @@ begin
         pidx := i;
   if pidx >= 0 then
   begin
-    if (FProg.Procs[pidx].RetTyp <> pr.RetTyp) or
-      (FProg.Procs[pidx].Params[0].Typ <> pr.Params[0].Typ) or
-      (FProg.Procs[pidx].Params[1].Typ <> pr.Params[1].Typ) then
-      Die('implementation does not match operator ' + BinWord(op) + ' on ' + TypName(pr.Params[0].Typ) +
-        ' and ' + TypName(pr.Params[1].Typ) + at);
+    same := (FProg.Procs[pidx].RetTyp = pr.RetTyp) and
+      (Length(FProg.Procs[pidx].Params) = Length(pr.Params));
+    for i := 0 to High(pr.Params) do
+      if same and (FProg.Procs[pidx].Params[i].Typ <> pr.Params[i].Typ) then
+        same := False;
+    if not same then
+      Die('implementation does not match ' + what + at);
     FProg.Procs[pidx].Params := pr.Params;
     ApplyParams(pr.Name, pr.Params);
     { nested routines append to FProg.Procs and may move the array }
@@ -24790,12 +25148,25 @@ begin
   { a second operator on the same types in one program or unit, a head
     or a body, is one too many; a used unit's is hidden instead. Two
     bodies gave the assembler one symbol twice. }
-  for i := 0 to High(FOps) do
-    if FOps[i].Own and (FOps[i].Op = op) and SameTyp(FOps[i].LTyp, pr.Params[0].Typ) and
-      SameTyp(FOps[i].RTyp, pr.Params[1].Typ) then
-      Die('operator ' + BinWord(op) + ' on ' + TypName(pr.Params[0].Typ) + ' and ' +
-        TypName(pr.Params[1].Typ) + ' declared twice' + at);
-  AddProcEnt(pr.Name, pr.Sym, True, 2, pr.RetTyp);
+  if ck <> 0 then
+  begin
+    for i := 0 to High(FConvs) do
+      if FConvs[i].Own and (FConvs[i].Explicit = (ck = 2)) and SameTyp(FConvs[i].FromTyp, lt) and
+        SameTyp(FConvs[i].ToTyp, rt) then
+        Die(what + ' declared twice' + at);
+  end
+  else if ukind <> '' then
+  begin
+    for i := 0 to High(FUnOps) do
+      if FUnOps[i].Own and (FUnOps[i].OpW = ukind) and SameTyp(FUnOps[i].Typ, lt) then
+        Die(what + ' declared twice' + at);
+  end
+  else
+    for i := 0 to High(FOps) do
+      if FOps[i].Own and (FOps[i].Op = op) and SameTyp(FOps[i].LTyp, lt) and
+        SameTyp(FOps[i].RTyp, rt) then
+        Die(what + ' declared twice' + at);
+  AddProcEnt(pr.Name, pr.Sym, True, Length(pr.Params), pr.RetTyp);
   ApplyParams(pr.Name, pr.Params);
   if NeedBody then
     ParseProcBody(pr)
@@ -24807,16 +25178,42 @@ begin
   n := Length(FProg.Procs);
   SetLength(FProg.Procs, n + 1);
   FProg.Procs[n] := pr;
-  AddOp(op, pr.Params[0].Typ, pr.Params[1].Typ, pr.RetTyp, pr.Sym, True);
+  if ck <> 0 then
+    AddConv(lt, rt, pr.Sym, ck = 2, True)
+  else if ukind <> '' then
+    AddUnOp(ukind, lt, pr.RetTyp, pr.Sym, True)
+  else
+    AddOp(op, lt, rt, pr.RetTyp, pr.Sym, True);
   if FIsUnit and (not NeedBody) then
   begin
-    n := Length(FProg.Ops);
-    SetLength(FProg.Ops, n + 1);
-    FProg.Ops[n].Op := op;
-    FProg.Ops[n].LTyp := pr.Params[0].Typ;
-    FProg.Ops[n].RTyp := pr.Params[1].Typ;
-    FProg.Ops[n].Ret := pr.RetTyp;
-    FProg.Ops[n].Sym := pr.Sym;
+    if ck <> 0 then
+    begin
+      n := Length(FProg.Convs);
+      SetLength(FProg.Convs, n + 1);
+      FProg.Convs[n].FromTyp := lt;
+      FProg.Convs[n].ToTyp := rt;
+      FProg.Convs[n].Explicit := ck = 2;
+      FProg.Convs[n].Sym := pr.Sym;
+    end
+    else if ukind <> '' then
+    begin
+      n := Length(FProg.UnOps);
+      SetLength(FProg.UnOps, n + 1);
+      FProg.UnOps[n].OpW := ukind;
+      FProg.UnOps[n].Typ := lt;
+      FProg.UnOps[n].Ret := pr.RetTyp;
+      FProg.UnOps[n].Sym := pr.Sym;
+    end
+    else
+    begin
+      n := Length(FProg.Ops);
+      SetLength(FProg.Ops, n + 1);
+      FProg.Ops[n].Op := op;
+      FProg.Ops[n].LTyp := lt;
+      FProg.Ops[n].RTyp := rt;
+      FProg.Ops[n].Ret := pr.RetTyp;
+      FProg.Ops[n].Sym := pr.Sym;
+    end;
   end;
 end;
 
@@ -26605,6 +27002,10 @@ begin
           Die('missing implementation of class operator Implicit from ' +
             TypName(FConvs[j].FromTyp) + ' to ' + TypName(FConvs[j].ToTyp));
         end;
+      for j := 0 to High(FUnOps) do
+        if FUnOps[j].Own and (FUnOps[j].Sym = FProg.Procs[i].Sym) then
+          Die('missing implementation of operator ' + FUnOps[j].OpW + ' on ' +
+            TypName(FUnOps[j].Typ));
       Die('missing implementation of ' + FProg.Procs[i].Name);
     end;
     if FProg.Procs[i].IsFwd and (FProg.Procs[i].Body = nil) then
