@@ -335,6 +335,7 @@ type
     procedure CheckLeaves(E: PExpr; const What: string);
     function CoreMethod(Base: PExpr; const MName: string): PExpr;
     function ParseCtorCall(Id: LongInt): PExpr;
+    function HelperCtorOwner(Id: LongInt; const AName: string): LongInt;
     function MakeCtor(Id: LongInt; const CName: string; var CArgs: TExprArray;
       CLine, CCol: LongInt): PExpr;
     function ClassDot(Id: LongInt): PExpr;
@@ -8904,19 +8905,16 @@ begin
     Exit;
   end;
   isCtor := False;
-  if (FTok.Kind = tkConstructor) and (not isClassM) and ((Rec <> 0) or (Td.Lo <> 2)) then
+  if (FTok.Kind = tkConstructor) and not isClassM then
     { a record's constructor, or a record or type helper's (P165): a
       method on Self, which v.Create runs on v and T.Create on a new
-      value, its value }
+      value, its value; a class helper's (P170), a constructor of the
+      class: T.Create runs it on a new object of T, obj.Create on obj }
     isCtor := True
   else if FTok.Kind = tkDestructor then
     Die(Who + ' has no destructor' + HerePos)
   else if FTok.Kind = tkConstructor then
-  begin
-    if isClassM then
-      Die(Who + ' has no class constructor' + HerePos);
-    Die('a class helper has no constructor: a static class function makes an object' + HerePos);
-  end;
+    Die(Who + ' has no class constructor' + HerePos);
   if (FTok.Kind <> tkProcedure) and (FTok.Kind <> tkFunction) and not isCtor then
   begin
     if isClassM then
@@ -20067,13 +20065,31 @@ end;
 
 { Id.CName(CArgs), the arguments read: the constructor that takes them,
   a new object of class Id. }
+{ The class helper for class Id, or the helper it descends from, that
+  declares a constructor named AName (P170); 0 when none does. }
+function TParser.HelperCtorOwner(Id: LongInt; const AName: string): LongInt;
+var
+  i: SizeInt;
+begin
+  Result := HelperFor(Id);
+  while Result > 0 do
+  begin
+    for i := 0 to High(FTypes[Result].Meths) do
+      if FTypes[Result].Meths[i].IsCtor and SameId(FTypes[Result].Meths[i].Name, AName) then
+        Exit;
+    Result := FTypes[Result].Parent;
+  end;
+  Result := 0;
+end;
+
 function TParser.MakeCtor(Id: LongInt; const CName: string; var CArgs: TExprArray;
   CLine, CCol: LongInt): PExpr;
 var
   st, rt: TTypeDef;
   mname: string;
   args: TExprArray;
-  i, k, best, byCount, named, nline, ncol, root, ai, ri: LongInt;
+  ms: array of TMethInfo;
+  i, k, best, byCount, named, nline, ncol, root, ai, ri, owner: LongInt;
   fits: Boolean;
 begin
   mname := CName;
@@ -20081,37 +20097,56 @@ begin
   nline := CLine;
   ncol := CCol;
   st := TypeOf(Id);
+  { a class helper's constructor of the name hides the class's, as its
+    methods do (P170): it runs on a new object of Id all the same }
+  owner := HelperCtorOwner(Id, mname);
+  if owner > 0 then
+    ms := FTypes[owner].Meths
+  else
+  begin
+    owner := Id;
+    ms := st.Meths;
+  end;
   best := -1;
   byCount := -1;
   named := 0;
-  for i := High(st.Meths) downto 0 do
-    if SameId(st.Meths[i].Name, mname) and st.Meths[i].IsCtor and CallableMeth(st.Meths[i]) then
+  for i := High(ms) downto 0 do
+    if SameId(ms[i].Name, mname) and ms[i].IsCtor and CallableMeth(ms[i]) then
     begin
       Inc(named);
-      if (Length(args) < MinArgs(st.Meths[i])) or (Length(args) > st.Meths[i].NParams) then
+      if (Length(args) < MinArgs(ms[i])) or (Length(args) > ms[i].NParams) then
         Continue;
       if byCount < 0 then
         byCount := i;
       fits := True;
       for k := 0 to High(args) do
-        if (k > High(st.Meths[i].ParamTyps)) or
-          (st.Meths[i].ParamTyps[k] <> args[k]^.Typ) then
+        if (k > High(ms[i].ParamTyps)) or (ms[i].ParamTyps[k] <> args[k]^.Typ) then
           fits := False;
       if fits and (best < 0) then
         best := i;
     end;
   if best < 0 then
     best := byCount;
-  { a constructor has its section's visibility too (1.0.137) }
-  if best >= 0 then
-    CheckVis(Id, 1, best, nline, ncol);
-  if best >= 0 then
+  { a constructor has its section's visibility too (1.0.137); a
+    helper's, as HelperMember says of its methods }
+  if (best >= 0) and (owner = Id) then
+    CheckVis(Id, 1, best, nline, ncol)
+  else if best >= 0 then
   begin
-    CoerceArgs(st.Meths[best].ParamTyps, st.Meths[best].ByRef, args);
-    FillMethDefs(st.Meths[best], args);
+    if (ms[best].Vis = VisStrictPrivate) and (FHelperTyp <> owner) and not FGenMode then
+      Die(mname + ' is strict private to ' + FTypes[owner].Name + ' at ' + IntToStr(nline) +
+        ':' + IntToStr(ncol));
+    if (ms[best].Vis = VisPrivate) and FTypes[owner].Imported and not FGenMode then
+      Die(mname + ' is private to ' + FTypes[owner].Name + '''s unit at ' + IntToStr(nline) +
+        ':' + IntToStr(ncol));
   end;
   if best >= 0 then
-    Result := NewCtor(st.Meths[best].Sym, Id, st.Size)
+  begin
+    CoerceArgs(ms[best].ParamTyps, ms[best].ByRef, args);
+    FillMethDefs(ms[best], args);
+  end;
+  if best >= 0 then
+    Result := NewCtor(ms[best].Sym, Id, st.Size)
   else if named > 0 then
     Die('wrong number of arguments for ' + st.Name + '.' + mname)
   else if SameId(mname, 'Create') and (Length(args) = 0) then
@@ -20366,10 +20401,34 @@ var
   i, mi: SizeInt;
   args: TExprArray;
   have, anyMeth, anyCtor: Boolean;
+  h: LongInt;
 begin
   Result := True;
   Res := nil;
   if ScopedValue(Cls, AName, Res) then Exit;
+  { a member of the class's helper (P170), before the class's own, as on
+    an object (DotMember): its constructor makes an object of Cls, or of
+    the class VmtE holds, and its static method is a routine's call; the
+    class alone was looked at }
+  h := HelperFor(Cls);
+  if (h <> 0) and HelperHas(h, AName) then
+  begin
+    if HelperCtorOwner(Cls, AName) > 0 then
+    begin
+      if VmtE = nil then
+      begin
+        args := nil;
+        if FTok.Kind = tkLParen then
+          args := ParseArgList;
+        Res := MakeCtor(Cls, AName, args, ALine, ACol);
+      end
+      else
+        Res := CtorThrough(Cls, VmtE, AName, ALine, ACol);
+      Exit;
+    end;
+    Res := HelperMember(nil, h, AName, ALine, ACol);
+    Exit;
+  end;
   st := TypeOf(Cls);
   i := CVarIndex(Cls, AName);
   if i >= 0 then
@@ -21097,11 +21156,13 @@ begin
       begin
         found := True;
         { a record's constructor (P165): a method on Self, by reference;
-          TRec.Create calls it through its maker, CtorMaker }
+          TRec.Create calls it through its maker, CtorMaker. A class
+          helper's (P170) is a class's constructor on Self, the object,
+          which it gives back: T.Create makes the object first. }
         if TypeOf(pr.ClassTyp).Meths[oi].IsCtor then
         begin
-          pr.RecCtor := True;
-          pr.IsCtor := False;
+          pr.RecCtor := TypeOf(pr.ClassTyp).Lo <> 2;
+          pr.IsCtor := not pr.RecCtor;
         end;
       end;
     if not found then

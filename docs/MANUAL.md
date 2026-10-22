@@ -4019,8 +4019,16 @@ gnalsap 2 0
 - A type or record helper may declare a constructor. `T.Create(...)`
   returns a new zero-initialized value of the helped type;
   `v.Create(...)` runs it on `v`. Inside it, `Self` is that value by
-  reference, just as in a record's constructor. A class helper does
-  not yet declare a constructor.
+  reference, just as in a record's constructor.
+- A class helper may declare a constructor too (1.1.231), a
+  constructor of the class: `TFoo.Make(5)` runs it on a new `TFoo` and
+  then its `AfterConstruction`, `TBar.Make(5)` on a new `TBar`, a class
+  reference's `c.Make(5)` on a new object of the class it holds, and
+  `f.Make(5)` on `f`, as a method, with no new object. A static method
+  of a class helper is called through the class's name too,
+  `TFoo.Helped`; the helper's member of the name hides the class's, as
+  on an object (`testdata/helpctor`, `testdata/units/helpctoruse`). A
+  helper has no class constructor and no destructor.
 - `property P: T read GetP write SetP;` reads and writes through the
   helper's methods, with an index in brackets as a class's does.
 - `type helper(TBase) for string` descends from another helper for the

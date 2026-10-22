@@ -397,6 +397,9 @@ GOLDEN_A64 += hidshare
 # P157: operators on two types with no name are two routines.
 GOLDEN += opanon
 GOLDEN_A64 += opanon
+# P170: a class helper's constructor and static method through the class's name.
+GOLDEN += helpctor
+GOLDEN_A64 += helpctor
 # P354: a routine's record keeps no saved register once it is loaded back.
 GOLDEN += gstale
 GOLDEN_A64 += gstale
@@ -1552,7 +1555,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'bad subrange: 3 is above 1 at 6:12' $(BUILDDIR)/arrbad_idxrev.err; \
 	echo ok arrbad; \
 	echo "==== helper rejects (P127) ===="; \
-	for n in typerec recint field virt clsstat lastone strict typecall nodecl ctor otherkind nomember; do \
+	for n in typerec recint field virt clsstat lastone strict typecall nodecl clsctor valmeth otherkind nomember; do \
 	  if $(OUTDIR)/paslangc -o $(BUILDDIR)/helpbad_$$n testdata/helpbad/$$n.paslang >$(BUILDDIR)/helpbad_$$n.err 2>&1; then \
 	    echo "$$n should fail"; exit 1; \
 	  fi; \
@@ -1566,7 +1569,8 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'Hidden is strict private to TH at 24:13' $(BUILDDIR)/helpbad_strict.err; \
 	grep -q 'TH.Twice is a method of a value, not of the type at 13:19' $(BUILDDIR)/helpbad_typecall.err; \
 	grep -q 'TH declares no method Thrice of these parameters at 12:13' $(BUILDDIR)/helpbad_nodecl.err; \
-	grep -q 'a class helper has no constructor: a static class function makes an object at 7:5' $(BUILDDIR)/helpbad_ctor.err; \
+	grep -q 'a helper has no class constructor at 7:11' $(BUILDDIR)/helpbad_clsctor.err; \
+	grep -q 'TH.Twice is a method of a value, not of the type at 14:16' $(BUILDDIR)/helpbad_valmeth.err; \
 	grep -q 'a helper descends from a helper of its kind at 9:22' $(BUILDDIR)/helpbad_otherkind.err; \
 	grep -q 'Integer has no members: Twice needs a record, an object or a helper for Integer at 6:13' $(BUILDDIR)/helpbad_nomember.err; \
 	echo ok helpbad; \
@@ -3714,6 +3718,12 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	if grep -q '^OPER div ' $(BUILDDIR)/opvecu.pi; then echo "opvecu.pi carries the div of its implementation"; exit 1; fi; \
 	awk '/^pas_main:/,/cfi_endproc/' $(BUILDDIR)/opvecuse.s | grep -q 'call p_opcolu_op_lt_tvec_tvec$$' || { echo "opvecuse.s: the main block's < is not opcolu's"; exit 1; }; \
 	echo ok opvecuse; \
+	echo "==== a unit's class helper constructor (P170) ===="; \
+	$(OUTDIR)/paslangc testdata/units/helpctoru.paslang; \
+	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/helpctoruse testdata/units/helpctoruse.paslang; \
+	$(BUILDDIR)/helpctoruse > $(BUILDDIR)/helpctoruse.got; \
+	diff -u testdata/units/helpctoruse.out $(BUILDDIR)/helpctoruse.got; \
+	echo ok helpctoruse; \
 	echo "==== pkg ===="; \
 	$(OUTDIR)/paslangc -install $(BUILDDIR)/pkg testdata/pkg/arithkit.paslang; \
 	test -f $(BUILDDIR)/pkg/scale.pi; \
@@ -4925,6 +4935,12 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	$(QEMU_A64) $(BUILDDIR)/opvecuse-arm > $(BUILDDIR)/opvecuse-arm.got; \
 	diff -u testdata/units/opvecuse.out $(BUILDDIR)/opvecuse-arm.got; \
 	echo ok opvecuse-arm; \
+	echo "==== a unit's class helper constructor arm64 (P170) ===="; \
+	$(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/a64/helpctoru testdata/units/helpctoru.paslang; \
+	$(OUTDIR)/paslangc -target arm64 -Fu $(BUILDDIR)/a64 -o $(BUILDDIR)/helpctoruse-arm testdata/units/helpctoruse.paslang; \
+	$(QEMU_A64) $(BUILDDIR)/helpctoruse-arm > $(BUILDDIR)/helpctoruse-arm.got; \
+	diff -u testdata/units/helpctoruse.out $(BUILDDIR)/helpctoruse-arm.got; \
+	echo ok helpctoruse-arm; \
 	echo "==== unit init arm64 ===="; \
 	mkdir -p $(BUILDDIR)/a64; \
 	$(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/a64/inita testdata/units/inita.paslang; \
