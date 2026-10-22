@@ -7992,7 +7992,7 @@ prints
 
 ## 16. The core library and pasnet
 
-Eleven units, the core, are compiled into `build/` (and `build/a64/`
+Twelve units, the core, are compiled into `build/` (and `build/a64/`
 for arm64) by `make`, for the base processor (`-cpu base`, so the
 installed units serve a program compiled for any processor) and again
 for a level (P143), and installed beside the compiler by `make
@@ -8041,9 +8041,25 @@ install`. Every program links them without `uses`:
   holds; and the escape finder, the first byte of a string that JSON
   writes escaped. Each has a kernel per machine (AVX2, SSE2, NEON) and
   its Pascal body, chosen when the unit is built (docs/KERNELS.md).
+- `passqlite` is SQLite 3 in paslang, written from SQLite's own file
+  format, documents and sources (1.1.245, P403, the first of P403 to
+  P414): `TSqlite.Open(path)` or `TSqlite.Open(path, flags)` opens a
+  database file as `sqlite3_open_v2` does (`SQLITE_OPEN_READONLY`,
+  `SQLITE_OPEN_READWRITE`, `SQLITE_OPEN_CREATE`), or one in memory for
+  `':memory:'`; `Schema` gives `sqlite_schema`'s rows, `Rows(name)` the
+  rows of a table by rowid or the keys of an index in key order, each
+  a record of `TSqliteValue`s (`SQLITE_INTEGER`, `SQLITE_FLOAT`,
+  `SQLITE_TEXT`, `SQLITE_BLOB`, `SQLITE_NULL`). It reads every page
+  size from 512 to 65536, overflow pages, UTF-16 databases (as UTF-8),
+  `WITHOUT ROWID` tables and indexes of any collation, and takes
+  SQLite's own POSIX locks, so a paslang program and the sqlite3
+  program share a file: a database another holds `EXCLUSIVE` gives
+  `ESqliteError` with code `SQLITE_BUSY`, 'database is locked'.
+  Errors are `ESqliteError`s with SQLite's codes and words. SQL, writes
+  and the rest come with the next milestones.
 
-The names of `pasobject`, `pasroutines`, `pasfmt`, `passtr`, `pashash`
-and `pastree` are every program's, as those of a unit in `uses` are;
+The names of `pasobject`, `pasroutines`, `pasfmt`, `passtr`, `pashash`,
+`pastree` and `passqlite` are every program's, as those of a unit in `uses` are;
 `pasnum`, `pasmap`, `pasheap`, `pasquad` and `pasjson` are only linked
 (`uses pasnum`, `uses pasquad` or `uses pasjson` brings its names in).
 Their

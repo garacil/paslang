@@ -551,6 +551,9 @@ GOLDEN_A64 += ptrelem
 # P386: a store whose place is registers alone pushes no value.
 GOLDEN += storereg
 GOLDEN_A64 += storereg
+# P403: passqlite named in a uses clause, a database in memory.
+GOLDEN += sqluses
+GOLDEN_A64 += sqluses
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -566,7 +569,8 @@ CORE_UNITS := \
 	src/lib/pasfmt.paslang \
 	src/lib/passtr.paslang \
 	src/lib/pasquad.paslang \
-	src/lib/pasjson.paslang
+	src/lib/pasjson.paslang \
+	src/lib/passqlite.paslang
 
 # The library units a program reaches with a uses clause. They are not
 # part of the language, but they are part of the installation, so a
@@ -2393,6 +2397,29 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(OUTDIR)/paslangc testdata/units/safeu.paslang; \
 	if grep -q '^CHECKPTR$$' $(BUILDDIR)/safeu.pi; then echo "safeu.pi says CHECKPTR without -checkptr"; exit 1; fi; \
 	echo ok checkptr
+	@set -e; \
+	: SQLite files the C library writes read as it reads them, P403; \
+	python3 -I scripts/sqlfixtures.py $(BUILDDIR)/sqlfx; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/sqlread testdata/sqlread.paslang; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/sqlread0 testdata/sqlread.paslang; \
+	$(OUTDIR)/paslangc -cpu base -o $(BUILDDIR)/sqlread-base testdata/sqlread.paslang; \
+	for d in p512 p1024 p4096 p8192 p65536 big wr u16le u16be nocase free; do \
+	  $(BUILDDIR)/sqlread $(BUILDDIR)/sqlfx/$$d.db > $(BUILDDIR)/sqlfx/$$d.got; \
+	  cmp $(BUILDDIR)/sqlfx/$$d.exp $(BUILDDIR)/sqlfx/$$d.got; \
+	done; \
+	for d in p512 p65536 wr u16be nocase free; do \
+	  $(BUILDDIR)/sqlread0 $(BUILDDIR)/sqlfx/$$d.db > $(BUILDDIR)/sqlfx/$$d.got0; \
+	  cmp $(BUILDDIR)/sqlfx/$$d.exp $(BUILDDIR)/sqlfx/$$d.got0; \
+	  $(BUILDDIR)/sqlread-base $(BUILDDIR)/sqlfx/$$d.db > $(BUILDDIR)/sqlfx/$$d.gotb; \
+	  cmp $(BUILDDIR)/sqlfx/$$d.exp $(BUILDDIR)/sqlfx/$$d.gotb; \
+	done; \
+	PASLANG_GCSTRESS=1 PASLANG_GCVERIFY=1 $(BUILDDIR)/sqlread0 $(BUILDDIR)/sqlfx/p1024.db > $(BUILDDIR)/sqlfx/p1024.gotgc; \
+	cmp $(BUILDDIR)/sqlfx/p1024.exp $(BUILDDIR)/sqlfx/p1024.gotgc; \
+	$(BUILDDIR)/sqlread $(BUILDDIR)/sqlfx/empty.db | grep -qx 'pagesize 4096 encoding 1 userversion 0'; \
+	$(BUILDDIR)/sqlread $(BUILDDIR)/sqlfx/notadb.db notadb | grep -qx 'notadb 26 26 file is not a database'; \
+	$(BUILDDIR)/sqlread x memory | grep -qx 'memory pages 0 objects 0'; \
+	python3 -I scripts/check_sqllock.py $(BUILDDIR)/sqlread $(BUILDDIR)/sqlfx/wr.db; \
+	echo ok sqlread
 	@set -e; \
 	echo "==== index checks ===="; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/bce_s testdata/bce.paslang; \
@@ -5371,6 +5398,21 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	timeout 25 $(QEMU_A64) $(BUILDDIR)/logx-arm > $(BUILDDIR)/logx-arm.got; \
 	diff -u testdata/logx.out $(BUILDDIR)/logx-arm.got; \
 	echo ok logx-arm
+	@set -e; \
+	: P403 on arm64: SQLite files the C library writes read under qemu, its locks kept; \
+	python3 -I scripts/sqlfixtures.py $(BUILDDIR)/sqlfx-arm; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -Fu $(A64DIR) -o $(BUILDDIR)/sqlread-arm testdata/sqlread.paslang; \
+	$(OUTDIR)/paslangc -target arm64 -cpu base -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/sqlread0-arm testdata/sqlread.paslang; \
+	for d in p512 p65536 big wr u16le u16be nocase free; do \
+	  timeout 600 $(QEMU_A64) $(BUILDDIR)/sqlread-arm $(BUILDDIR)/sqlfx-arm/$$d.db > $(BUILDDIR)/sqlfx-arm/$$d.got; \
+	  cmp $(BUILDDIR)/sqlfx-arm/$$d.exp $(BUILDDIR)/sqlfx-arm/$$d.got; \
+	done; \
+	for d in p1024 wr u16be; do \
+	  timeout 600 $(QEMU_A64) $(BUILDDIR)/sqlread0-arm $(BUILDDIR)/sqlfx-arm/$$d.db > $(BUILDDIR)/sqlfx-arm/$$d.got0; \
+	  cmp $(BUILDDIR)/sqlfx-arm/$$d.exp $(BUILDDIR)/sqlfx-arm/$$d.got0; \
+	done; \
+	python3 -I scripts/check_sqllock.py $(BUILDDIR)/sqlread-arm $(BUILDDIR)/sqlfx-arm/wr.db $(QEMU_A64); \
+	echo ok sqlread-arm
 
 install: all installdirs
 	$(NORMAL_INSTALL)

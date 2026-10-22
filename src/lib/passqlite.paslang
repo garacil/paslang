@@ -1,0 +1,1654 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+
+  paslang is free software: you can redistribute it and/or modify it
+  under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+
+  paslang is distributed in the hope that it will be useful, but
+  WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+  General Public License for more details.
+
+  Under Section 7 of GPL version 3, you are granted additional
+  permissions described in the paslang Runtime Library Exception,
+  version 1.0, in the file COPYING.RUNTIME.
+
+  You should have received a copy of the GNU General Public License
+  along with paslang.  If not, see <https://www.gnu.org/licenses/>. }
+
+
+{ SQLite 3 in pure paslang (P403 onwards): a database file read as
+  SQLite 3.54 reads it, every word written from SQLite's own documents
+  and sources (docs/ref/sqlite; docs/SQLITE.md is the study). The file
+  (fileformat2.html): pages of 512 to 65536 bytes, the 100-byte header on
+  page 1, table b-trees keyed by rowid and index b-trees keyed by
+  records, cells whose payload spills to overflow chains, records of
+  serial types. The OS layer takes SQLite's POSIX locks (lockingv3.html,
+  os_unix.c unixLock): a SHARED lock is a read lock on the shared range
+  at 0x40000002 taken under a read lock on PENDING_BYTE, so the sqlite3
+  CLI and a paslang program share a file as two SQLite programs do. A
+  connection is used by one routine at a time, as SQLite's serialized
+  mode keeps it, through its mutex. ':memory:' is a database with no
+  file. Writes, SQL and the rest come with P404 to P411. }
+unit passqlite;
+
+interface
+
+uses pasobject, pasroutines;
+
+const
+  { result codes (sqlite3.h) }
+  SQLITE_OK = 0;
+  SQLITE_ERROR = 1;
+  SQLITE_INTERNAL = 2;
+  SQLITE_PERM = 3;
+  SQLITE_ABORT = 4;
+  SQLITE_BUSY = 5;
+  SQLITE_LOCKED = 6;
+  SQLITE_NOMEM = 7;
+  SQLITE_READONLY = 8;
+  SQLITE_INTERRUPT = 9;
+  SQLITE_IOERR = 10;
+  SQLITE_CORRUPT = 11;
+  SQLITE_NOTFOUND = 12;
+  SQLITE_FULL = 13;
+  SQLITE_CANTOPEN = 14;
+  SQLITE_PROTOCOL = 15;
+  SQLITE_EMPTY = 16;
+  SQLITE_SCHEMA = 17;
+  SQLITE_TOOBIG = 18;
+  SQLITE_CONSTRAINT = 19;
+  SQLITE_MISMATCH = 20;
+  SQLITE_MISUSE = 21;
+  SQLITE_NOLFS = 22;
+  SQLITE_AUTH = 23;
+  SQLITE_FORMAT = 24;
+  SQLITE_RANGE = 25;
+  SQLITE_NOTADB = 26;
+  SQLITE_NOTICE = 27;
+  SQLITE_WARNING = 28;
+  SQLITE_ROW = 100;
+  SQLITE_DONE = 101;
+  SQLITE_ABORT_ROLLBACK = 516;
+  { extended result codes (sqlite3.h): the primary code in the low byte }
+  SQLITE_IOERR_READ = 266;
+  SQLITE_IOERR_SHORT_READ = 522;
+  SQLITE_IOERR_FSTAT = 1802;
+  SQLITE_IOERR_UNLOCK = 2058;
+  SQLITE_IOERR_LOCK = 3850;
+  SQLITE_IOERR_CLOSE = 4106;
+  SQLITE_CANTOPEN_ISDIR = 526;
+  { sqlite3_open_v2's flags }
+  SQLITE_OPEN_READONLY = 1;
+  SQLITE_OPEN_READWRITE = 2;
+  SQLITE_OPEN_CREATE = 4;
+  SQLITE_OPEN_URI = 64;
+  SQLITE_OPEN_MEMORY = 128;
+  SQLITE_OPEN_NOMUTEX = 32768;
+  SQLITE_OPEN_FULLMUTEX = 65536;
+  { the fundamental datatypes }
+  SQLITE_INTEGER = 1;
+  SQLITE_FLOAT = 2;
+  SQLITE_TEXT = 3;
+  SQLITE_BLOB = 4;
+  SQLITE_NULL = 5;
+  { text encodings (header offset 56) }
+  SQLITE_UTF8 = 1;
+  SQLITE_UTF16LE = 2;
+  SQLITE_UTF16BE = 3;
+
+type
+  { An error of SQLite's: its extended result code, its primary code
+    (the low byte, sqlite3_errcode's) and the message sqlite3_errmsg
+    would give. Like every raised object, it belongs to the routine
+    that raised it. }
+  ESqliteError = class(TObject)
+  private
+    FExtended: Integer;
+    FMessage: string;
+  public
+    constructor Create(AExtended: Integer; const AMessage: string);
+    function ToString: string; override;
+    function Code: Integer;
+    property ExtendedCode: Integer read FExtended;
+    property Message: string read FMessage;
+  end;
+
+  { A value as SQLite keeps it: Kind is SQLITE_INTEGER (I), SQLITE_FLOAT
+    (R), SQLITE_TEXT (S, UTF-8), SQLITE_BLOB (S, its bytes) or
+    SQLITE_NULL. }
+  TSqliteValue = record
+    Kind: Integer;
+    I: Int64;
+    R: Double;
+    S: string;
+  end;
+  TSqliteValues = array of TSqliteValue;
+
+  { A row of sqlite_schema: 'table', 'index', 'view' or 'trigger', its
+    name, its table's, its root page (0 for a view or a trigger) and the
+    SQL that made it (empty for an index a constraint made). }
+  TSqliteObject = record
+    Kind, Name, TblName: string;
+    RootPage: Int64;
+    Sql: string;
+  end;
+  TSqliteObjects = array of TSqliteObject;
+
+  { The file of a database and the lock SQLite's protocol holds on it
+    (os_unix.c's unixFile). }
+  TSqlFile = class
+  private
+    FFd: Integer;
+    FPath: string;
+    FKey: string;
+    FLock: Integer;
+  public
+    constructor Open(const APath: string; Flags: Integer);
+    procedure Release;
+    function Size: Int64;
+    procedure ReadAt(var Buf: string; Off: Int64);
+    function LockTo(Level: Integer): Integer;
+    procedure UnlockTo(Level: Integer);
+    property Path: string read FPath;
+    property Level: Integer read FLock;
+  end;
+
+  { The pages of a database read through a cache (pager.c's read path),
+  a slot for each page (a bounded cache comes with P413):
+    a read transaction holds SHARED while it lasts and finds the cache
+    stale when the file's change counter moved. }
+  TSqlPager = class
+  private
+    FFile: TSqlFile;
+    FCache: array of string;
+    FPageSize, FUsable, FPages, FReaders, FEncoding: Integer;
+    FHeader: string;
+    FChange: Integer;
+    FReadOnly: Boolean;
+    procedure ReadHeader;
+  public
+    constructor Create(AFile: TSqlFile);
+    procedure BeginRead;
+    procedure EndRead;
+    function Page(N: Integer): string;
+    function HeaderInt(Off: Integer): Integer;
+    property PageSize: Integer read FPageSize;
+    property Usable: Integer read FUsable;
+    property PageCount: Integer read FPages;
+    property Encoding: Integer read FEncoding;
+  end;
+
+  { A walk of one b-tree in key order (btree.c's BtCursor): a table's
+    rows by rowid, an index's keys, an interior cell of an index in its
+    place between its children. }
+  TSqlCursor = class
+  private
+    FPager: TSqlPager;
+    FRoot: Integer;
+    FIndex, FAtInterior, FValid: Boolean;
+    FDepth: Integer;
+    FPg: array of string;
+    FPgNo, FAt, FCount, FBase: array of Integer;
+    FLeaf: array of Boolean;
+    procedure PushPage(PgNo: Integer);
+    function Child(D, I: Integer): Integer;
+    procedure DownLeft(PgNo: Integer);
+    function Settle: Boolean;
+    function Up: Boolean;
+    function CellOff(D, I: Integer): Integer;
+  public
+    constructor Create(APager: TSqlPager; ARoot: Integer);
+    function First: Boolean;
+    function Next: Boolean;
+    function Key: Int64;
+    function Payload: string;
+    property IsIndex: Boolean read FIndex;
+    property Valid: Boolean read FValid;
+  end;
+
+  TSqlite = class;
+
+  { The rows of a table in rowid order, or the keys of an index in key
+    order, each a record's values; the read transaction lasts until the
+    last row or Finish. }
+  TSqliteRows = class
+  private
+    FDb: TSqlite;
+    FCur: TSqlCursor;
+    FVals: TSqliteValues;
+    FRowId: Int64;
+    FStarted, FOpen: Boolean;
+  public
+    function Next: Boolean;
+    procedure Finish;
+    function RowId: Int64;
+    function ColumnCount: Integer;
+    function Column(I: Integer): TSqliteValue;
+    function Values: TSqliteValues;
+    { the rows are an index b-tree's keys: an index's or a WITHOUT ROWID
+      table's, with no rowid }
+    function IsIndex: Boolean;
+  end;
+
+  { A connection to a database file, or to one in memory (':memory:',
+    or SQLITE_OPEN_MEMORY): sqlite3_open_v2's flags, READWRITE and
+    CREATE when none are given. }
+  TSqlite = class
+  private
+    FMu: mutex;
+    FPager: TSqlPager;
+    FFile: TSqlFile;
+    FPath: string;
+    FFlags: Integer;
+    FMemory: Boolean;
+    function FindRoot(const Name: string): Integer;
+  public
+    constructor Open(const APath: string); overload;
+    constructor Open(const APath: string; Flags: Integer); overload;
+    destructor Destroy; override;
+    procedure Disconnect;
+    function Schema: TSqliteObjects;
+    function Rows(const Name: string): TSqliteRows;
+    function RowsAt(RootPage: Integer): TSqliteRows;
+    function PageSize: Integer;
+    function PageCount: Integer;
+    function Encoding: Integer;
+    function UserVersion: Integer;
+    function SchemaCookie: Integer;
+    property Path: string read FPath;
+  end;
+
+{ sqlite3_errstr: the English of a result code. }
+function SqliteErrStr(Code: Integer): string;
+{ A record's values (fileformat2.html 2.1), its text in Encoding. }
+function SqliteRecord(const Rec: string; Encoding: Integer): TSqliteValues;
+{ The value as the CLI's quote() writes it for an integer, a text, a
+  blob and NULL; a real as the hexadecimal of its 64 bits. }
+function SqliteQuote(const V: TSqliteValue): string;
+
+implementation
+
+const
+  PendingByte = 1073741824;
+  ReservedByte = PendingByte + 1;
+  SharedFirst = PendingByte + 2;
+  SharedSize = 510;
+  NoLock = 0;
+  SharedLock = 1;
+  ReservedLock = 2;
+  PendingLock = 3;
+  ExclusiveLock = 4;
+  MaxDepth = 20;
+
+type
+  { The locks this process holds on one file, whatever the descriptor:
+    POSIX locks belong to the process, and closing any descriptor of a
+    file drops them all (os_unix.c's unixInodeInfo). }
+  TSqlInode = class
+    Key: string;
+    Shared, Locks, Refs, Level: Integer;
+    Unused: array of Integer;
+  end;
+
+var
+  GInodes: array of TSqlInode;
+  GInodeMu: mutex;
+
+{ The inode whose key is Key, nil for none: a process opens few files. }
+function FindInode(const Key: string): TSqlInode;
+var
+  i: Integer;
+begin
+  for i := 0 to High(GInodes) do
+    if GInodes[i].Key = Key then
+    begin
+      Result := GInodes[i];
+      Exit;
+    end;
+  Result := nil;
+end;
+
+procedure DropInode(Ino: TSqlInode);
+var
+  i, j: Integer;
+begin
+  for i := 0 to High(GInodes) do
+    if GInodes[i] = Ino then
+    begin
+      for j := i to High(GInodes) - 1 do
+        GInodes[j] := GInodes[j + 1];
+      SetLength(GInodes, Length(GInodes) - 1);
+      Exit;
+    end;
+end;
+
+{ ---- text ---- }
+
+{ V in decimal. }
+function IStr(V: Int64): string;
+var
+  neg: Boolean;
+  u: Int64;
+begin
+  if V = 0 then
+  begin
+    Result := '0';
+    Exit;
+  end;
+  neg := V < 0;
+  Result := '';
+  while V <> 0 do
+  begin
+    u := V mod 10;
+    if u < 0 then
+      u := -u;
+    Result := Chr(48 + u) + Result;
+    V := V div 10;
+  end;
+  if neg then
+    Result := '-' + Result;
+end;
+
+{ S with ASCII's capitals folded, as SQLite folds identifiers
+  (sqlite3StrICmp, sqlite3UpperToLower). }
+function AsciiLower(const S: string): string;
+var
+  i: Integer;
+begin
+  Result := S;
+  for i := 1 to Length(Result) do
+    if (Result[i] >= 'A') and (Result[i] <= 'Z') then
+      Result[i] := Chr(Ord(Result[i]) + 32);
+end;
+
+{ ---- errors ---- }
+
+function SqliteErrStr(Code: Integer): string;
+begin
+  case Code of
+    SQLITE_ABORT_ROLLBACK: Result := 'abort due to ROLLBACK';
+    SQLITE_ROW: Result := 'another row available';
+    SQLITE_DONE: Result := 'no more rows available';
+  else
+    case Code and 255 of
+      SQLITE_OK: Result := 'not an error';
+      SQLITE_ERROR: Result := 'SQL logic error';
+      SQLITE_PERM: Result := 'access permission denied';
+      SQLITE_ABORT: Result := 'query aborted';
+      SQLITE_BUSY: Result := 'database is locked';
+      SQLITE_LOCKED: Result := 'database table is locked';
+      SQLITE_NOMEM: Result := 'out of memory';
+      SQLITE_READONLY: Result := 'attempt to write a readonly database';
+      SQLITE_INTERRUPT: Result := 'interrupted';
+      SQLITE_IOERR: Result := 'disk I/O error';
+      SQLITE_CORRUPT: Result := 'database disk image is malformed';
+      SQLITE_NOTFOUND: Result := 'unknown operation';
+      SQLITE_FULL: Result := 'database or disk is full';
+      SQLITE_CANTOPEN: Result := 'unable to open database file';
+      SQLITE_PROTOCOL: Result := 'locking protocol';
+      SQLITE_SCHEMA: Result := 'database schema has changed';
+      SQLITE_TOOBIG: Result := 'string or blob too big';
+      SQLITE_CONSTRAINT: Result := 'constraint failed';
+      SQLITE_MISMATCH: Result := 'datatype mismatch';
+      SQLITE_MISUSE: Result := 'bad parameter or other API misuse';
+      SQLITE_NOLFS: Result := 'large file support is disabled';
+      SQLITE_AUTH: Result := 'authorization denied';
+      SQLITE_RANGE: Result := 'column index out of range';
+      SQLITE_NOTADB: Result := 'file is not a database';
+      SQLITE_NOTICE: Result := 'notification message';
+      SQLITE_WARNING: Result := 'warning message';
+    else
+      Result := 'unknown error';
+    end;
+  end;
+end;
+
+constructor ESqliteError.Create(AExtended: Integer; const AMessage: string);
+begin
+  FExtended := AExtended;
+  if AMessage = '' then
+    FMessage := SqliteErrStr(AExtended)
+  else
+    FMessage := AMessage;
+end;
+
+function ESqliteError.Code: Integer;
+begin
+  Result := FExtended and 255;
+end;
+
+function ESqliteError.ToString: string;
+begin
+  Result := 'ESqliteError: ' + FMessage;
+end;
+
+procedure Fail(Code: Integer; const Msg: string);
+begin
+  raise ESqliteError.Create(Code, Msg);
+end;
+
+{ SQLITE_CORRUPT as sqlite3CorruptError reports it, the page named. }
+procedure Corrupt(PgNo: Integer);
+begin
+  if PgNo > 0 then
+    Fail(SQLITE_CORRUPT, 'database disk image is malformed (page ' + IStr(PgNo) + ')')
+  else
+    Fail(SQLITE_CORRUPT, '');
+end;
+
+{ ---- bytes (big-endian, as every multibyte field of the file) ---- }
+
+function G1(const P: string; O: Integer): Integer;
+begin
+  Result := Ord(P[O + 1]);
+end;
+
+function G2(const P: string; O: Integer): Integer;
+begin
+  Result := (Ord(P[O + 1]) shl 8) or Ord(P[O + 2]);
+end;
+
+function G4(const P: string; O: Integer): Integer;
+begin
+  Result := (Ord(P[O + 1]) shl 24) or (Ord(P[O + 2]) shl 16) or (Ord(P[O + 3]) shl 8) or
+    Ord(P[O + 4]);
+end;
+
+{ A varint at O (fileformat2.html 1.6, util.c sqlite3GetVarint): seven
+  bits of each byte with its high bit set, eight of a ninth; O moves
+  past it. }
+function GetVarint(const P: string; var O: Integer): Int64;
+var
+  i, b: Integer;
+begin
+  Result := 0;
+  for i := 1 to 8 do
+  begin
+    if O >= Length(P) then
+      Corrupt(0);
+    b := Ord(P[O + 1]);
+    Inc(O);
+    Result := (Result shl 7) or (b and 127);
+    if b < 128 then
+      Exit;
+  end;
+  if O >= Length(P) then
+    Corrupt(0);
+  Result := (Result shl 8) or Ord(P[O + 1]);
+  Inc(O);
+end;
+
+{ ---- system calls (amd64 numbers, then arm64's) ---- }
+
+function ZStr(const S: string): string;
+begin
+  Result := S + #0;
+end;
+
+function SysOpen(const Path: string; Flags, Mode: Integer): Integer;
+var
+  z: string;
+begin
+  z := ZStr(Path);
+  if Amd64 = 1 then
+    Result := Syscall(2, Integer(@z[1]), Flags, Mode)
+  else
+    Result := Syscall(56, -100, Integer(@z[1]), Flags, Mode);
+end;
+
+function SysClose(Fd: Integer): Integer;
+begin
+  if Amd64 = 1 then
+    Result := Syscall(3, Fd)
+  else
+    Result := Syscall(57, Fd);
+end;
+
+function SysPread(Fd, Buf, N: Integer; Off: Int64): Integer;
+begin
+  if Amd64 = 1 then
+    Result := Syscall(17, Fd, Buf, N, Off)
+  else
+    Result := Syscall(67, Fd, Buf, N, Off);
+end;
+
+function SysFstat(Fd, Buf: Integer): Integer;
+begin
+  if Amd64 = 1 then
+    Result := Syscall(5, Fd, Buf)
+  else
+    Result := Syscall(80, Fd, Buf);
+end;
+
+function SysFcntl(Fd, Cmd, Arg: Integer): Integer;
+begin
+  if Amd64 = 1 then
+    Result := Syscall(72, Fd, Cmd, Arg)
+  else
+    Result := Syscall(25, Fd, Cmd, Arg);
+end;
+
+const
+  ENOENT = 2;
+  EINTR = 4;
+  EAGAIN = 11;
+  EACCES = 13;
+  EISDIR = 21;
+  ORdOnly = 0;
+  ORdWr = 2;
+  OCreat = 64;
+  OCloexec = 524288;
+  FSetLk = 6;
+  FRdLck = 0;
+  FWrLck = 1;
+  FUnLck = 2;
+
+{ ---- the file and its locks ---- }
+
+constructor TSqlFile.Open(const APath: string; Flags: Integer);
+var
+  f, fd: Integer;
+  st: string;
+  ino: TSqlInode;
+begin
+  FPath := APath;
+  FFd := -1;
+  f := OCloexec;
+  if (Flags and SQLITE_OPEN_READWRITE) <> 0 then
+    f := f or ORdWr
+  else
+    f := f or ORdOnly;
+  if (Flags and SQLITE_OPEN_CREATE) <> 0 then
+    f := f or OCreat;
+  repeat
+    fd := SysOpen(APath, f, 420);
+  until fd <> -EINTR;
+  { a read-write open of a file only readable opens it read-only, as
+    unixOpen retries }
+  if (fd = -EACCES) and ((f and ORdWr) <> 0) then
+    fd := SysOpen(APath, (f and not (ORdWr or OCreat)) or ORdOnly, 420);
+  if fd = -EISDIR then
+    Fail(SQLITE_CANTOPEN_ISDIR, '');
+  if fd < 0 then
+    Fail(SQLITE_CANTOPEN, '');
+  FFd := fd;
+  SetLength(st, 256);
+  if SysFstat(fd, Integer(@st[1])) < 0 then
+  begin
+    SysClose(fd);
+    FFd := -1;
+    Fail(SQLITE_IOERR_FSTAT, '');
+  end;
+  { the inode, by device and inode number }
+  FKey := IStr(PInt64(@st[1])^) + ':' + IStr(PInt64(@st[9])^);
+  lock GInodeMu do
+  begin
+    ino := FindInode(FKey);
+    if ino = nil then
+    begin
+      ino := TSqlInode.Create;
+      ino.Key := FKey;
+      SetLength(GInodes, Length(GInodes) + 1);
+      GInodes[High(GInodes)] := ino;
+    end;
+    Inc(ino.Refs);
+  end;
+end;
+
+{ The file's size in bytes (fstat's st_size, at 48 on both machines). }
+function TSqlFile.Size: Int64;
+var
+  st: string;
+begin
+  SetLength(st, 256);
+  if SysFstat(FFd, Integer(@st[1])) < 0 then
+    Fail(SQLITE_IOERR_FSTAT, '');
+  Result := PInt64(@st[49])^;
+end;
+
+{ Length(Buf) bytes at Off; past the end of the file the rest is zero,
+  as unixRead fills a short read. }
+procedure TSqlFile.ReadAt(var Buf: string; Off: Int64);
+var
+  got, at, n: Integer;
+begin
+  at := 0;
+  n := Length(Buf);
+  while at < n do
+  begin
+    got := SysPread(FFd, Integer(@Buf[1]) + at, n - at, Off + at);
+    if got = -EINTR then
+      Continue;
+    if got < 0 then
+      Fail(SQLITE_IOERR_READ, '');
+    if got = 0 then
+    begin
+      while at < n do
+      begin
+        Buf[at + 1] := #0;
+        Inc(at);
+      end;
+      Exit;
+    end;
+    at := at + got;
+  end;
+end;
+
+{ One fcntl lock of Kind on [Start, Start + Len): 0 or the errno. }
+function FileLock(Fd, Kind: Integer; Start, Len: Int64): Integer;
+var
+  fl: string;
+  r: Integer;
+begin
+  SetLength(fl, 32);
+  FillChar(fl[1], 32, 0);
+  PWord(@fl[1])^ := Word(Kind);
+  PWord(@fl[3])^ := 0;
+  PInt64(@fl[9])^ := Start;
+  PInt64(@fl[17])^ := Len;
+  repeat
+    r := SysFcntl(Fd, FSetLk, Integer(@fl[1]));
+  until r <> -EINTR;
+  if r < 0 then
+    Result := -r
+  else
+    Result := 0;
+end;
+
+{ A lock at Level or above (unixLock): SQLITE_OK or SQLITE_BUSY. The
+  process's other descriptors of the file share its locks through the
+  inode. }
+function TSqlFile.LockTo(Level: Integer): Integer;
+var
+  ino: TSqlInode;
+  e: Integer;
+begin
+  Result := SQLITE_OK;
+  if FLock >= Level then
+    Exit;
+  lock GInodeMu do
+  begin
+    ino := FindInode(FKey);
+    if (FLock <> ino.Level) and ((ino.Level >= PendingLock) or (Level > SharedLock)) then
+    begin
+      Result := SQLITE_BUSY;
+      Exit;
+    end;
+    if (Level = SharedLock) and ((ino.Level = SharedLock) or (ino.Level = ReservedLock)) then
+    begin
+      FLock := SharedLock;
+      Inc(ino.Shared);
+      Inc(ino.Locks);
+      Exit;
+    end;
+    if (Level = SharedLock) or ((Level = ExclusiveLock) and (FLock = ReservedLock)) then
+    begin
+      if Level = SharedLock then
+        e := FileLock(FFd, FRdLck, PendingByte, 1)
+      else
+        e := FileLock(FFd, FWrLck, PendingByte, 1);
+      if e <> 0 then
+      begin
+        if (e = EAGAIN) or (e = EACCES) then
+          Result := SQLITE_BUSY
+        else
+          Result := SQLITE_IOERR_LOCK;
+        Exit;
+      end;
+      if Level = ExclusiveLock then
+      begin
+        FLock := PendingLock;
+        ino.Level := PendingLock;
+      end;
+    end;
+    if Level = SharedLock then
+    begin
+      e := FileLock(FFd, FRdLck, SharedFirst, SharedSize);
+      FileLock(FFd, FUnLck, PendingByte, 1);
+      if e <> 0 then
+      begin
+        if (e = EAGAIN) or (e = EACCES) then
+          Result := SQLITE_BUSY
+        else
+          Result := SQLITE_IOERR_LOCK;
+        Exit;
+      end;
+      FLock := SharedLock;
+      Inc(ino.Locks);
+      ino.Shared := 1;
+      ino.Level := SharedLock;
+      Exit;
+    end;
+    if (Level = ExclusiveLock) and (ino.Shared > 1) then
+    begin
+      Result := SQLITE_BUSY;
+      Exit;
+    end;
+    if Level = ReservedLock then
+      e := FileLock(FFd, FWrLck, ReservedByte, 1)
+    else
+      e := FileLock(FFd, FWrLck, SharedFirst, SharedSize);
+    if e <> 0 then
+    begin
+      if (e = EAGAIN) or (e = EACCES) then
+        Result := SQLITE_BUSY
+      else
+        Result := SQLITE_IOERR_LOCK;
+      Exit;
+    end;
+    FLock := Level;
+    ino.Level := Level;
+  end;
+end;
+
+{ Down to Level, NoLock or SharedLock (posixUnlock): the locks above it
+  released; the last shared lock of the process releases the range,
+  and descriptors closed while it was held close now. }
+procedure TSqlFile.UnlockTo(Level: Integer);
+var
+  ino: TSqlInode;
+  i: Integer;
+begin
+  if FLock <= Level then
+    Exit;
+  lock GInodeMu do
+  begin
+    ino := FindInode(FKey);
+    if FLock > SharedLock then
+    begin
+      if Level = SharedLock then
+        FileLock(FFd, FRdLck, SharedFirst, SharedSize);
+      FileLock(FFd, FUnLck, PendingByte, 2);
+      ino.Level := SharedLock;
+    end;
+    if Level = NoLock then
+    begin
+      Dec(ino.Shared);
+      if ino.Shared = 0 then
+      begin
+        FileLock(FFd, FUnLck, 0, 0);
+        ino.Level := NoLock;
+      end;
+      Dec(ino.Locks);
+      if ino.Locks = 0 then
+      begin
+        for i := 0 to High(ino.Unused) do
+          SysClose(ino.Unused[i]);
+        SetLength(ino.Unused, 0);
+      end;
+    end;
+    FLock := Level;
+  end;
+end;
+
+{ The descriptor closes now, or with the inode's last lock (unixClose):
+  closing it while another descriptor of the process holds a lock would
+  drop that lock. }
+procedure TSqlFile.Release;
+var
+  ino: TSqlInode;
+begin
+  if FFd < 0 then
+    Exit;
+  UnlockTo(NoLock);
+  lock GInodeMu do
+  begin
+    ino := FindInode(FKey);
+    if ino.Locks > 0 then
+    begin
+      SetLength(ino.Unused, Length(ino.Unused) + 1);
+      ino.Unused[High(ino.Unused)] := FFd;
+    end
+    else
+      SysClose(FFd);
+    Dec(ino.Refs);
+    if ino.Refs = 0 then
+      DropInode(ino);
+  end;
+  FFd := -1;
+end;
+
+{ ---- the pager ---- }
+
+constructor TSqlPager.Create(AFile: TSqlFile);
+begin
+  FFile := AFile;
+  FPageSize := 4096;
+  FUsable := 4096;
+  FEncoding := SQLITE_UTF8;
+  FChange := -1;
+end;
+
+function TSqlPager.HeaderInt(Off: Integer): Integer;
+begin
+  if Length(FHeader) < 100 then
+    Result := 0
+  else
+    Result := G4(FHeader, Off);
+end;
+
+{ Page 1's header read and checked as lockBtree checks it: the magic,
+  the read version, the fractions 64, 32 and 32, a page size that is a
+  power of two from 512 to 65536, a usable size of 480 or more; the
+  size in pages from the header when its change counter is the
+  version-valid-for, else from the file; a database bigger in its
+  header than its file is corrupt. }
+procedure TSqlPager.ReadHeader;
+var
+  fsize: Int64;
+  ps, n, filePages: Integer;
+begin
+  fsize := FFile.Size;
+  SetLength(FHeader, 100);
+  FFile.ReadAt(FHeader, 0);
+  if fsize = 0 then
+  begin
+    FPages := 0;
+    Exit;
+  end;
+  if Copy(FHeader, 1, 16) <> 'SQLite format 3'#0 then
+    Fail(SQLITE_NOTADB, '');
+  if G1(FHeader, 19) > 2 then
+    Fail(SQLITE_NOTADB, '');
+  FReadOnly := G1(FHeader, 18) > 2;
+  if (G1(FHeader, 21) <> 64) or (G1(FHeader, 22) <> 32) or (G1(FHeader, 23) <> 32) then
+    Fail(SQLITE_NOTADB, '');
+  ps := (G1(FHeader, 16) shl 8) or (G1(FHeader, 17) shl 16);
+  if (((ps - 1) and ps) <> 0) or (ps > 65536) or (ps <= 256) then
+    Fail(SQLITE_NOTADB, '');
+  if ps - G1(FHeader, 20) < 480 then
+    Fail(SQLITE_NOTADB, '');
+  if ps <> FPageSize then
+    FCache := nil;
+  FPageSize := ps;
+  FUsable := ps - G1(FHeader, 20);
+  filePages := Integer((fsize + ps - 1) div ps);
+  n := G4(FHeader, 28);
+  if (n = 0) or (G4(FHeader, 24) <> G4(FHeader, 92)) then
+    n := filePages;
+  if n > filePages then
+    Corrupt(1);
+  FPages := n;
+  FEncoding := G4(FHeader, 56);
+  if FEncoding = 0 then
+    FEncoding := SQLITE_UTF8;
+  if (FEncoding < 1) or (FEncoding > 3) then
+    Fail(SQLITE_NOTADB, '');
+end;
+
+{ A read transaction: SHARED, and the cache dropped when another
+  process changed the file since this one last read it (the change
+  counter at 24). A file in WAL mode reads here only while its -wal
+  file is empty; reading through a WAL comes with P410. A hot
+  journal's rollback comes with P406. }
+procedure TSqlPager.BeginRead;
+var
+  rc, ch: Integer;
+  side: TSqlFile;
+  hot: Boolean;
+begin
+  if FReaders > 0 then
+  begin
+    Inc(FReaders);
+    Exit;
+  end;
+  if FFile = nil then
+  begin
+    Inc(FReaders);
+    Exit;
+  end;
+  rc := FFile.LockTo(SharedLock);
+  if rc <> SQLITE_OK then
+    Fail(rc, '');
+  try
+    hot := False;
+    side := nil;
+    try
+      side := TSqlFile.Open(FFile.Path + '-journal', SQLITE_OPEN_READONLY);
+      hot := side.Size > 0;
+    except
+      on E: ESqliteError do
+        hot := False;
+    end;
+    if side <> nil then
+      side.Release;
+    if hot then
+      Fail(SQLITE_BUSY, 'database has a hot journal: its rollback comes with P406');
+    ReadHeader;
+    if (FPages > 0) and (G1(FHeader, 19) = 2) then
+    begin
+      side := nil;
+      try
+        side := TSqlFile.Open(FFile.Path + '-wal', SQLITE_OPEN_READONLY);
+        hot := side.Size > 0;
+      except
+        on E: ESqliteError do
+          hot := False;
+      end;
+      if side <> nil then
+        side.Release;
+      if hot then
+        Fail(SQLITE_BUSY, 'database is in WAL mode with frames in its -wal file: reading them comes with P410');
+    end;
+    ch := G4(FHeader, 24);
+    if ch <> FChange then
+      FCache := nil;
+    FChange := ch;
+  except
+    FFile.UnlockTo(NoLock);
+    raise;
+  end;
+  Inc(FReaders);
+end;
+
+procedure TSqlPager.EndRead;
+begin
+  if FReaders = 0 then
+    Exit;
+  Dec(FReaders);
+  if (FReaders = 0) and (FFile <> nil) then
+    FFile.UnlockTo(NoLock);
+end;
+
+{ Page N's bytes, its first 100 those of the header on page 1. }
+function TSqlPager.Page(N: Integer): string;
+begin
+  if (N < 1) or (N > FPages) then
+    Corrupt(N);
+  if N < Length(FCache) then
+  begin
+    Result := FCache[N];
+    if Result <> '' then
+      Exit;
+  end
+  else
+    SetLength(FCache, FPages + 1);
+  SetLength(Result, FPageSize);
+  FFile.ReadAt(Result, Int64(N - 1) * FPageSize);
+  FCache[N] := Result;
+end;
+
+{ ---- the b-tree cursor ---- }
+
+constructor TSqlCursor.Create(APager: TSqlPager; ARoot: Integer);
+begin
+  FPager := APager;
+  FRoot := ARoot;
+  SetLength(FPg, MaxDepth);
+  SetLength(FPgNo, MaxDepth);
+  SetLength(FAt, MaxDepth);
+  SetLength(FCount, MaxDepth);
+  SetLength(FBase, MaxDepth);
+  SetLength(FLeaf, MaxDepth);
+end;
+
+{ The page PgNo on top of the walk, its header checked: a b-tree page of
+  the tree's kind. }
+procedure TSqlCursor.PushPage(PgNo: Integer);
+var
+  p: string;
+  base, t: Integer;
+begin
+  if FDepth >= MaxDepth then
+    Corrupt(PgNo);
+  p := FPager.Page(PgNo);
+  if PgNo = 1 then
+    base := 100
+  else
+    base := 0;
+  t := G1(p, base);
+  if FDepth = 0 then
+    FIndex := (t = 2) or (t = 10);
+  if FIndex then
+  begin
+    if (t <> 2) and (t <> 10) then
+      Corrupt(PgNo);
+  end
+  else if (t <> 5) and (t <> 13) then
+    Corrupt(PgNo);
+  FPg[FDepth] := p;
+  FPgNo[FDepth] := PgNo;
+  FBase[FDepth] := base;
+  FLeaf[FDepth] := (t = 10) or (t = 13);
+  FCount[FDepth] := G2(p, base + 3);
+  FAt[FDepth] := 0;
+  Inc(FDepth);
+end;
+
+{ Where cell I of the page at depth D starts. }
+function TSqlCursor.CellOff(D, I: Integer): Integer;
+var
+  h: Integer;
+begin
+  if FLeaf[D] then
+    h := 8
+  else
+    h := 12;
+  Result := G2(FPg[D], FBase[D] + h + 2 * I);
+  if (Result < FBase[D] + h) or (Result >= Length(FPg[D])) then
+    Corrupt(FPgNo[D]);
+end;
+
+{ Child I of the interior page at depth D: the left child of cell I, or
+  the right-most pointer for I = its count. }
+function TSqlCursor.Child(D, I: Integer): Integer;
+begin
+  if I >= FCount[D] then
+    Result := G4(FPg[D], FBase[D] + 8)
+  else
+    Result := G4(FPg[D], CellOff(D, I));
+end;
+
+{ Down from PgNo by the left-most children to a leaf. }
+procedure TSqlCursor.DownLeft(PgNo: Integer);
+begin
+  PushPage(PgNo);
+  while not FLeaf[FDepth - 1] do
+    PushPage(Child(FDepth - 1, 0));
+end;
+
+{ The walk past the cells of the leaf on top: up to the parent, whose
+  cell between the children is the next entry of an index; a table's
+  parent goes on to its next child. }
+function TSqlCursor.Up: Boolean;
+var
+  d: Integer;
+begin
+  Result := False;
+  repeat
+    Dec(FDepth);
+    if FDepth = 0 then
+    begin
+      FValid := False;
+      Exit;
+    end;
+    d := FDepth - 1;
+    if FIndex and (FAt[d] < FCount[d]) then
+    begin
+      FAtInterior := True;
+      FValid := True;
+      Result := True;
+      Exit;
+    end;
+    FAt[d] := FAt[d] + 1;
+    if FAt[d] <= FCount[d] then
+    begin
+      DownLeft(Child(d, FAt[d]));
+      if FCount[FDepth - 1] > 0 then
+      begin
+        FValid := True;
+        Result := True;
+        Exit;
+      end;
+    end;
+  until False;
+end;
+
+{ A position on a leaf with a cell, or the next entry above it. }
+function TSqlCursor.Settle: Boolean;
+begin
+  if FAt[FDepth - 1] < FCount[FDepth - 1] then
+  begin
+    FValid := True;
+    Result := True;
+  end
+  else
+    Result := Up;
+end;
+
+function TSqlCursor.First: Boolean;
+begin
+  FDepth := 0;
+  FAtInterior := False;
+  FValid := False;
+  DownLeft(FRoot);
+  Result := Settle;
+end;
+
+function TSqlCursor.Next: Boolean;
+var
+  d: Integer;
+begin
+  Result := False;
+  if not FValid then
+    Exit;
+  if FAtInterior then
+  begin
+    FAtInterior := False;
+    d := FDepth - 1;
+    FAt[d] := FAt[d] + 1;
+    DownLeft(Child(d, FAt[d]));
+    Result := Settle;
+    Exit;
+  end;
+  FAt[FDepth - 1] := FAt[FDepth - 1] + 1;
+  Result := Settle;
+end;
+
+{ The rowid of a table's entry. }
+function TSqlCursor.Key: Int64;
+var
+  d, o: Integer;
+begin
+  d := FDepth - 1;
+  o := CellOff(d, FAt[d]);
+  GetVarint(FPg[d], o);
+  Result := GetVarint(FPg[d], o);
+end;
+
+{ The entry's whole payload, its overflow chain followed
+  (fileformat2.html 1.6 and 1.7): X = U-35 for a table's leaf,
+  ((U-12)*64/255)-23 for an index; M = ((U-12)*32/255)-23; K =
+  M+((P-M) mod (U-4)); P <= X all local, else K local when K <= X, else
+  M. }
+function TSqlCursor.Payload: string;
+var
+  d, o, u, x, m, k, loc, ov, at, take, n: Integer;
+  p: Int64;
+  pg, ovp: string;
+begin
+  d := FDepth - 1;
+  pg := FPg[d];
+  o := CellOff(d, FAt[d]);
+  if not FLeaf[d] then
+    o := o + 4;
+  p := GetVarint(pg, o);
+  if not FIndex then
+    GetVarint(pg, o);
+  u := FPager.Usable;
+  if FIndex then
+    x := ((u - 12) * 64 div 255) - 23
+  else
+    x := u - 35;
+  if (p < 0) or (p > 2147483647) then
+    Corrupt(FPgNo[d]);
+  if p <= x then
+    loc := Integer(p)
+  else
+  begin
+    m := ((u - 12) * 32 div 255) - 23;
+    k := m + Integer((p - m) mod (u - 4));
+    if k <= x then
+      loc := k
+    else
+      loc := m;
+  end;
+  if o + loc > Length(pg) then
+    Corrupt(FPgNo[d]);
+  SetLength(Result, Integer(p));
+  if loc > 0 then
+    Move(pg[o + 1], Result[1], loc);
+  at := loc;
+  if at < p then
+  begin
+    if o + loc + 4 > Length(pg) then
+      Corrupt(FPgNo[d]);
+    ov := G4(pg, o + loc);
+    n := 0;
+    while at < p do
+    begin
+      if (ov < 2) or (ov > FPager.PageCount) then
+        Corrupt(FPgNo[d]);
+      Inc(n);
+      if n > FPager.PageCount then
+        Corrupt(ov);
+      ovp := FPager.Page(ov);
+      take := u - 4;
+      if p - at < take then
+        take := Integer(p - at);
+      Move(ovp[5], Result[at + 1], take);
+      at := at + take;
+      ov := G4(ovp, 0);
+    end;
+  end;
+end;
+
+{ ---- records ---- }
+
+{ UTF-16 in the byte order of Big to UTF-8 (utf.c): a surrogate pair is
+  one code point, a lone surrogate U+FFFD. }
+function Utf16ToUtf8(const S: string; Big: Boolean): string;
+var
+  i, n, c, c2: Integer;
+
+  function Unit16(J: Integer): Integer;
+  begin
+    if Big then
+      Result := (Ord(S[J]) shl 8) or Ord(S[J + 1])
+    else
+      Result := Ord(S[J]) or (Ord(S[J + 1]) shl 8);
+  end;
+
+  procedure Put(C: Integer);
+  begin
+    if C < 128 then
+      Result := Result + Chr(C)
+    else if C < 2048 then
+      Result := Result + Chr(192 or (C shr 6)) + Chr(128 or (C and 63))
+    else if C < 65536 then
+      Result := Result + Chr(224 or (C shr 12)) + Chr(128 or ((C shr 6) and 63)) +
+        Chr(128 or (C and 63))
+    else
+      Result := Result + Chr(240 or (C shr 18)) + Chr(128 or ((C shr 12) and 63)) +
+        Chr(128 or ((C shr 6) and 63)) + Chr(128 or (C and 63));
+  end;
+
+begin
+  Result := '';
+  n := Length(S) - (Length(S) mod 2);
+  i := 1;
+  while i < n do
+  begin
+    c := Unit16(i);
+    i := i + 2;
+    if (c >= $D800) and (c <= $DBFF) and (i < n) then
+    begin
+      c2 := Unit16(i);
+      if (c2 >= $DC00) and (c2 <= $DFFF) then
+      begin
+        c := $10000 + ((c - $D800) shl 10) + (c2 - $DC00);
+        i := i + 2;
+      end
+      else
+        c := $FFFD;
+    end
+    else if (c >= $D800) and (c <= $DFFF) then
+      c := $FFFD;
+    Put(c);
+  end;
+end;
+
+function SqliteRecord(const Rec: string; Encoding: Integer): TSqliteValues;
+var
+  o, hdr, body, n, k, j: Integer;
+  t, v: Int64;
+  bits: Int64;
+  types: array of Int64;
+begin
+  Result := nil;
+  if Length(Rec) = 0 then
+    Exit;
+  o := 0;
+  hdr := Integer(GetVarint(Rec, o));
+  if (hdr < o) or (hdr > Length(Rec)) then
+    Corrupt(0);
+  types := nil;
+  while o < hdr do
+  begin
+    SetLength(types, Length(types) + 1);
+    types[High(types)] := GetVarint(Rec, o);
+  end;
+  if o <> hdr then
+    Corrupt(0);
+  SetLength(Result, Length(types));
+  body := hdr;
+  for k := 0 to High(types) do
+  begin
+    t := types[k];
+    case t of
+      0, 10, 11:
+        begin
+          Result[k].Kind := SQLITE_NULL;
+          n := 0;
+        end;
+      1, 2, 3, 4, 5, 6:
+        begin
+          case t of
+            1: n := 1;
+            2: n := 2;
+            3: n := 3;
+            4: n := 4;
+            5: n := 6;
+          else
+            n := 8;
+          end;
+          if body + n > Length(Rec) then
+            Corrupt(0);
+          v := Ord(Rec[body + 1]);
+          if v >= 128 then
+            v := v - 256;
+          for j := 1 to n - 1 do
+            v := (v shl 8) or Ord(Rec[body + j + 1]);
+          Result[k].Kind := SQLITE_INTEGER;
+          Result[k].I := v;
+        end;
+      7:
+        begin
+          n := 8;
+          if body + n > Length(Rec) then
+            Corrupt(0);
+          bits := 0;
+          for j := 0 to 7 do
+            bits := (bits shl 8) or Ord(Rec[body + j + 1]);
+          Result[k].Kind := SQLITE_FLOAT;
+          Result[k].R := PDouble(@bits)^;
+        end;
+      8, 9:
+        begin
+          n := 0;
+          Result[k].Kind := SQLITE_INTEGER;
+          Result[k].I := t - 8;
+        end;
+    else
+      begin
+        n := Integer((t - 12) div 2);
+        if body + n > Length(Rec) then
+          Corrupt(0);
+        Result[k].S := Copy(Rec, body + 1, n);
+        if Odd(t) then
+        begin
+          Result[k].Kind := SQLITE_TEXT;
+          if Encoding = SQLITE_UTF16LE then
+            Result[k].S := Utf16ToUtf8(Result[k].S, False)
+          else if Encoding = SQLITE_UTF16BE then
+            Result[k].S := Utf16ToUtf8(Result[k].S, True);
+        end
+        else
+          Result[k].Kind := SQLITE_BLOB;
+      end;
+    end;
+    body := body + n;
+  end;
+end;
+
+function SqliteQuote(const V: TSqliteValue): string;
+const
+  HexDigits = '0123456789ABCDEF';
+var
+  i: Integer;
+  bits: Int64;
+  r: Double;
+begin
+  case V.Kind of
+    SQLITE_INTEGER:
+      Result := IStr(V.I);
+    SQLITE_FLOAT:
+      begin
+        r := V.R;
+        bits := PInt64(@r)^;
+        Result := '';
+        for i := 15 downto 0 do
+          Result := Result + HexDigits[((bits shr (4 * i)) and 15) + 1];
+      end;
+    SQLITE_TEXT:
+      begin
+        Result := '''';
+        for i := 1 to Length(V.S) do
+          if V.S[i] = '''' then
+            Result := Result + ''''''
+          else
+            Result := Result + V.S[i];
+        Result := Result + '''';
+      end;
+    SQLITE_BLOB:
+      begin
+        Result := 'X''';
+        for i := 1 to Length(V.S) do
+          Result := Result + HexDigits[(Ord(V.S[i]) shr 4) + 1] + HexDigits[(Ord(V.S[i]) and 15) + 1];
+        Result := Result + '''';
+      end;
+  else
+    Result := 'NULL';
+  end;
+end;
+
+{ ---- rows ---- }
+
+function TSqliteRows.Next: Boolean;
+begin
+  Result := False;
+  if not FOpen then
+    Exit;
+  lock FDb.FMu do
+  begin
+    try
+      if not FStarted then
+      begin
+        FStarted := True;
+        Result := FCur.First;
+      end
+      else
+        Result := FCur.Next;
+      if Result then
+      begin
+        FVals := SqliteRecord(FCur.Payload, FDb.FPager.Encoding);
+        if FCur.IsIndex then
+          FRowId := 0
+        else
+          FRowId := FCur.Key;
+      end;
+    except
+      FOpen := False;
+      FDb.FPager.EndRead;
+      raise;
+    end;
+    if not Result then
+    begin
+      FOpen := False;
+      FVals := nil;
+      FDb.FPager.EndRead;
+    end;
+  end;
+end;
+
+procedure TSqliteRows.Finish;
+begin
+  if not FOpen then
+    Exit;
+  lock FDb.FMu do
+  begin
+    FOpen := False;
+    FVals := nil;
+    FDb.FPager.EndRead;
+  end;
+end;
+
+function TSqliteRows.RowId: Int64;
+begin
+  Result := FRowId;
+end;
+
+function TSqliteRows.ColumnCount: Integer;
+begin
+  Result := Length(FVals);
+end;
+
+function TSqliteRows.Column(I: Integer): TSqliteValue;
+begin
+  if (I < 0) or (I > High(FVals)) then
+  begin
+    Result.Kind := SQLITE_NULL;
+    Result.I := 0;
+    Result.R := 0;
+    Result.S := '';
+    Exit;
+  end;
+  Result := FVals[I];
+end;
+
+function TSqliteRows.Values: TSqliteValues;
+begin
+  Result := FVals;
+end;
+
+function TSqliteRows.IsIndex: Boolean;
+begin
+  Result := FCur.IsIndex;
+end;
+
+{ ---- the connection ---- }
+
+constructor TSqlite.Open(const APath: string);
+begin
+  Open(APath, SQLITE_OPEN_READWRITE or SQLITE_OPEN_CREATE);
+end;
+
+{ sqlite3_open_v2: ':memory:', an empty name or SQLITE_OPEN_MEMORY is a
+  database in memory; else the file, made when CREATE asks it. }
+constructor TSqlite.Open(const APath: string; Flags: Integer);
+begin
+  FPath := APath;
+  if (Flags and (SQLITE_OPEN_READONLY or SQLITE_OPEN_READWRITE)) = 0 then
+    Flags := Flags or SQLITE_OPEN_READWRITE or SQLITE_OPEN_CREATE;
+  FFlags := Flags;
+  FMemory := (APath = ':memory:') or (APath = '') or ((Flags and SQLITE_OPEN_MEMORY) <> 0);
+  if FMemory then
+    FFile := nil
+  else
+    FFile := TSqlFile.Open(APath, Flags);
+  FPager := TSqlPager.Create(FFile);
+  if FMemory then
+    FPager.FPages := 0;
+end;
+
+destructor TSqlite.Destroy;
+begin
+  Disconnect;
+end;
+
+procedure TSqlite.Disconnect;
+begin
+  lock FMu do
+  begin
+    if FFile <> nil then
+    begin
+      FFile.Release;
+      FFile := nil;
+    end;
+    if FPager <> nil then
+      FPager.FFile := nil;
+  end;
+end;
+
+{ sqlite_schema's rows, page 1's table b-tree. }
+function TSqlite.Schema: TSqliteObjects;
+var
+  c: TSqlCursor;
+  v: TSqliteValues;
+  n: Integer;
+begin
+  Result := nil;
+  lock FMu do
+  begin
+    FPager.BeginRead;
+    try
+      if FPager.PageCount > 0 then
+      begin
+        c := TSqlCursor.Create(FPager, 1);
+        if c.First then
+          repeat
+            v := SqliteRecord(c.Payload, FPager.Encoding);
+            n := Length(Result);
+            SetLength(Result, n + 1);
+            if Length(v) > 0 then
+              Result[n].Kind := v[0].S;
+            if Length(v) > 1 then
+              Result[n].Name := v[1].S;
+            if Length(v) > 2 then
+              Result[n].TblName := v[2].S;
+            if (Length(v) > 3) and (v[3].Kind = SQLITE_INTEGER) then
+              Result[n].RootPage := v[3].I;
+            if (Length(v) > 4) and (v[4].Kind = SQLITE_TEXT) then
+              Result[n].Sql := v[4].S;
+          until not c.Next;
+      end;
+    finally
+      FPager.EndRead;
+    end;
+  end;
+end;
+
+{ The root page of the table or the index Name, its case folded as
+  SQLite folds identifiers (ASCII); sqlite_schema and its aliases are
+  page 1. }
+function TSqlite.FindRoot(const Name: string): Integer;
+var
+  s: TSqliteObjects;
+  i: Integer;
+  n: string;
+begin
+  n := AsciiLower(Name);
+  if (n = 'sqlite_schema') or (n = 'sqlite_master') then
+  begin
+    Result := 1;
+    Exit;
+  end;
+  s := Schema;
+  for i := 0 to High(s) do
+    if (AsciiLower(s[i].Name) = n) and ((s[i].Kind = 'table') or (s[i].Kind = 'index')) and
+      (s[i].RootPage > 0) then
+    begin
+      Result := Integer(s[i].RootPage);
+      Exit;
+    end;
+  Fail(SQLITE_ERROR, 'no such table: ' + Name);
+end;
+
+function TSqlite.Rows(const Name: string): TSqliteRows;
+begin
+  Result := RowsAt(FindRoot(Name));
+end;
+
+{ The rows of the b-tree whose root is RootPage, in a read transaction
+  that lasts until the last row or Finish. }
+function TSqlite.RowsAt(RootPage: Integer): TSqliteRows;
+begin
+  Result := TSqliteRows.Create;
+  Result.FDb := Self;
+  lock FMu do
+  begin
+    FPager.BeginRead;
+    Result.FOpen := True;
+    if FPager.PageCount = 0 then
+    begin
+      FPager.EndRead;
+      Fail(SQLITE_ERROR, 'no such table');
+    end;
+    Result.FCur := TSqlCursor.Create(FPager, RootPage);
+  end;
+end;
+
+function TSqlite.PageSize: Integer;
+begin
+  Result := FPager.PageSize;
+end;
+
+function TSqlite.PageCount: Integer;
+begin
+  lock FMu do
+  begin
+    FPager.BeginRead;
+    Result := FPager.PageCount;
+    FPager.EndRead;
+  end;
+end;
+
+function TSqlite.Encoding: Integer;
+begin
+  Result := FPager.Encoding;
+end;
+
+function TSqlite.UserVersion: Integer;
+begin
+  lock FMu do
+  begin
+    FPager.BeginRead;
+    Result := FPager.HeaderInt(60);
+    FPager.EndRead;
+  end;
+end;
+
+function TSqlite.SchemaCookie: Integer;
+begin
+  lock FMu do
+  begin
+    FPager.BeginRead;
+    Result := FPager.HeaderInt(40);
+    FPager.EndRead;
+  end;
+end;
+
+end.
