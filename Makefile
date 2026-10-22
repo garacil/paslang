@@ -415,6 +415,9 @@ GOLDEN_A64 += jsonbuild jsonmod
 # P382: a write to a broken pipe is EPIPE.
 GOLDEN += brokenpipe
 GOLDEN_A64 += brokenpipe
+# P208: json streams that park.
+GOLDEN += jsonstream jsonpark
+GOLDEN_A64 += jsonstream jsonpark
 # P354: a routine's record keeps no saved register once it is loaded back.
 GOLDEN += gstale
 GOLDEN_A64 += gstale
@@ -1040,7 +1043,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  PASLANG_GCSTRESS=3 PASLANG_GCPOISON=1 timeout 300 $(BUILDDIR)/gcbasic > $(BUILDDIR)/gcbasic.got; \
 	  diff -u testdata/gcbasic.out $(BUILDDIR)/gcbasic.got; \
 	done; \
-	for t in heapspan map2 sync2 strs mapsplit closurebox tree1 tree2 hash1 store1 mapseed strview ioretry stdlocks strshrink json1 jsonshare; do \
+	for t in heapspan map2 sync2 strs mapsplit closurebox tree1 tree2 hash1 store1 mapseed strview ioretry stdlocks strshrink json1 jsonshare jsonstream jsonpark; do \
 	  PASLANG_GCSTRESS=5 PASLANG_GCPOISON=1 timeout 300 $(BUILDDIR)/$$t > $(BUILDDIR)/$$t.got; \
 	  diff -u testdata/$$t.out $(BUILDDIR)/$$t.got; \
 	done; \
@@ -3883,7 +3886,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'paslang: unlock of an unlocked mutex' $(BUILDDIR)/unlockfree.err; \
 	echo ok unlockfree; \
 	echo "==== fatal ===="; \
-	for t in divzero nilptr deep oom oomlimit closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg leafnil bmaskwide bmodneg bmaskone bforpast bvarctr bnestctr bsumstat bsumdyn bsumneg bkeepfirst bkeepmoved bkeepstat bkeepshrunk brunlen brunloc divfirst idxline nilline bflatidx bflatpush nilblk nilbig nilzero nildest nilmeth elemidx jsonbusy; do \
+	for t in divzero nilptr deep oom oomlimit closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg leafnil bmaskwide bmodneg bmaskone bforpast bvarctr bnestctr bsumstat bsumdyn bsumneg bkeepfirst bkeepmoved bkeepstat bkeepshrunk brunlen brunloc divfirst idxline nilline bflatidx bflatpush nilblk nilbig nilzero nildest nilmeth elemidx jsonbusy jsonrbusy jsonwbusy; do \
 	  $(OUTDIR)/paslangc -o $(BUILDDIR)/fatal_$$t testdata/fatal/$$t.paslang; \
 	  set +e; \
 	  if [ $$t = oomlimit ]; then \
@@ -3975,6 +3978,8 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'paslang: index 5 out of range \[0..1\] at line 13' $(BUILDDIR)/fatal_bnested.err; \
 	grep -q 'paslang: index 7 out of range \[0..4\] at line 10' $(BUILDDIR)/fatal_bconst.err; \
 	grep -q 'paslang: concurrent json builder use' $(BUILDDIR)/fatal_jsonbusy.err; \
+	grep -q 'paslang: concurrent json reader use' $(BUILDDIR)/fatal_jsonrbusy.err; \
+	grep -q 'paslang: concurrent json writer use' $(BUILDDIR)/fatal_jsonwbusy.err; \
 	grep -q 'paslang: index 4 out of range \[1..3\] at line 16' $(BUILDDIR)/fatal_bstrcall.err; \
 	grep -q '^paslang: string view length -2 out of range$$' $(BUILDDIR)/fatal_svneg.err; \
 	grep -q '^paslang: string view of nil with length 3$$' $(BUILDDIR)/fatal_svnil.err; \
@@ -3987,6 +3992,13 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	(set +e; $(BUILDDIR)/brokenpipe_die err; echo $$? > $(BUILDDIR)/brokenpipe_err.rc) 2>&1 > /dev/null | head -c 1 > /dev/null; \
 	test "`cat $(BUILDDIR)/brokenpipe_out.rc` `cat $(BUILDDIR)/brokenpipe_err.rc`" = "141 141"; \
 	echo ok brokenpipe; \
+	: P208 a reader parked while 32 routines parse, on one processor, and under the collector stress there; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/jsonpark1 testdata/jsonpark.paslang; \
+	taskset -c 0 timeout 120 $(BUILDDIR)/jsonpark1 > $(BUILDDIR)/jsonpark1.got; \
+	diff -u testdata/jsonpark.out $(BUILDDIR)/jsonpark1.got; \
+	PASLANG_GCSTRESS=5 PASLANG_GCPOISON=1 taskset -c 0 timeout 120 $(BUILDDIR)/jsonpark1 > $(BUILDDIR)/jsonpark1.got; \
+	diff -u testdata/jsonpark.out $(BUILDDIR)/jsonpark1.got; \
+	echo ok jsonpark; \
 	echo "==== deadlock ===="; \
 	for t in dlrecv dlsend dlcycle dlmutex dlmain dlselect; do \
 	  $(OUTDIR)/paslangc -o $(BUILDDIR)/fatal_$$t testdata/fatal/$$t.paslang; \
@@ -4004,7 +4016,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	test "$$ticks" -lt 20; \
 	echo "ok idlecpu ($$ticks user ticks after one second)"; \
 	echo "==== examples ===="; \
-	for t in hello values control routines varargs records scopedtypes classes registry helpers convert report money systemerrors boundedfiles filemetadata directories paths environments processes temporaryresources systempaths textbuilding textencoding textbuffers valuehelpers identifiers generics errors excobjects bank concurrent blockedio fanin maps sync wordcount strings maths narrow pointers single quad bits rotations carry bigrot bitfields wide atomics views vectors machine assembly hashes closures slices properties cleanup pipeline kvstore sorting timeout digest bitmap trees dates jsonread jsonwrite jsonlang jsonbind jsonunbind; do \
+	for t in hello values control routines varargs records scopedtypes classes registry helpers convert report money systemerrors boundedfiles filemetadata directories paths environments processes temporaryresources systempaths textbuilding textencoding textbuffers valuehelpers identifiers generics errors excobjects bank concurrent blockedio fanin maps sync wordcount strings maths narrow pointers single quad bits rotations carry bigrot bitfields wide atomics views vectors machine assembly hashes closures slices properties cleanup pipeline kvstore sorting timeout digest bitmap trees dates jsonread jsonwrite jsonlang jsonbind jsonunbind jsonstream; do \
 	  $(OUTDIR)/paslangc -o $(BUILDDIR)/ex_$$t examples/$$t.paslang; \
 	  $(BUILDDIR)/ex_$$t > $(BUILDDIR)/ex_$$t.got; \
 	  diff -u examples/$$t.out $(BUILDDIR)/ex_$$t.got; \
@@ -4762,7 +4774,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	grep -q 'paslang: unlock of an unlocked mutex' $(BUILDDIR)/unlockfree-arm.err; \
 	echo ok unlockfree-arm; \
 	echo "==== fatal arm64 ===="; \
-	for t in divzero nilptr deep oom closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg leafnil bmaskwide bmodneg bmaskone bforpast bvarctr bnestctr bsumstat bsumdyn bsumneg bkeepfirst bkeepmoved bkeepstat bkeepshrunk brunlen brunloc divfirst idxline nilline bflatidx bflatpush nilblk nilbig nilzero nildest nilmeth elemidx jsonbusy; do \
+	for t in divzero nilptr deep oom closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg leafnil bmaskwide bmodneg bmaskone bforpast bvarctr bnestctr bsumstat bsumdyn bsumneg bkeepfirst bkeepmoved bkeepstat bkeepshrunk brunlen brunloc divfirst idxline nilline bflatidx bflatpush nilblk nilbig nilzero nildest nilmeth elemidx jsonbusy jsonrbusy jsonwbusy; do \
 	  $(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/fatal_$$t-arm testdata/fatal/$$t.paslang; \
 	  set +e; timeout 60 $(QEMU_A64) $(BUILDDIR)/fatal_$$t-arm > $(BUILDDIR)/fatal_$$t-arm.got 2> $(BUILDDIR)/fatal_$$t-arm.err; rc=$$?; set -e; \
 	  test $$rc -eq 1; \
@@ -4840,6 +4852,8 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	grep -q 'paslang: index 5 out of range \[0..1\] at line 13' $(BUILDDIR)/fatal_bnested-arm.err; \
 	grep -q 'paslang: index 7 out of range \[0..4\] at line 10' $(BUILDDIR)/fatal_bconst-arm.err; \
 	grep -q 'paslang: concurrent json builder use' $(BUILDDIR)/fatal_jsonbusy-arm.err; \
+	grep -q 'paslang: concurrent json reader use' $(BUILDDIR)/fatal_jsonrbusy-arm.err; \
+	grep -q 'paslang: concurrent json writer use' $(BUILDDIR)/fatal_jsonwbusy-arm.err; \
 	grep -q 'paslang: index 4 out of range \[1..3\] at line 16' $(BUILDDIR)/fatal_bstrcall-arm.err; \
 	grep -q '^paslang: string view length -2 out of range$$' $(BUILDDIR)/fatal_svneg-arm.err; \
 	grep -q '^paslang: string view of nil with length 3$$' $(BUILDDIR)/fatal_svnil-arm.err; \
@@ -4851,6 +4865,10 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	(set +e; $(QEMU_A64) $(BUILDDIR)/brokenpipe_die-arm err; echo $$? > $(BUILDDIR)/brokenpipe_err-arm.rc) 2>&1 > /dev/null | head -c 1 > /dev/null; \
 	test "`cat $(BUILDDIR)/brokenpipe_out-arm.rc` `cat $(BUILDDIR)/brokenpipe_err-arm.rc`" = "141 141"; \
 	echo ok brokenpipe-arm; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -Fu $(A64DIR) -o $(BUILDDIR)/jsonpark1-arm testdata/jsonpark.paslang; \
+	taskset -c 0 timeout 600 $(QEMU_A64) $(BUILDDIR)/jsonpark1-arm > $(BUILDDIR)/jsonpark1-arm.got; \
+	diff -u testdata/jsonpark.out $(BUILDDIR)/jsonpark1-arm.got; \
+	echo ok jsonpark-arm; \
 	echo "==== deadlock arm64 ===="; \
 	for t in dlrecv dlsend dlcycle dlmutex dlmain dlselect; do \
 	  $(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/fatal_$$t-arm testdata/fatal/$$t.paslang; \
@@ -4861,7 +4879,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	done; \
 	echo ok deadlock-arm; \
 	echo "==== examples arm64 ===="; \
-	for t in hello values control routines varargs records scopedtypes classes registry helpers convert report money systemerrors boundedfiles filemetadata directories paths environments processes temporaryresources systempaths textbuilding textencoding textbuffers valuehelpers identifiers generics errors excobjects bank concurrent blockedio fanin maps sync wordcount strings maths narrow pointers single quad bits rotations carry bigrot bitfields wide atomics views vectors machine assembly hashes closures slices properties cleanup pipeline kvstore sorting timeout digest bitmap trees dates jsonread jsonwrite jsonlang jsonbind jsonunbind; do \
+	for t in hello values control routines varargs records scopedtypes classes registry helpers convert report money systemerrors boundedfiles filemetadata directories paths environments processes temporaryresources systempaths textbuilding textencoding textbuffers valuehelpers identifiers generics errors excobjects bank concurrent blockedio fanin maps sync wordcount strings maths narrow pointers single quad bits rotations carry bigrot bitfields wide atomics views vectors machine assembly hashes closures slices properties cleanup pipeline kvstore sorting timeout digest bitmap trees dates jsonread jsonwrite jsonlang jsonbind jsonunbind jsonstream; do \
 	  $(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/ex_$$t-arm examples/$$t.paslang; \
 	  timeout 60 $(QEMU_A64) $(BUILDDIR)/ex_$$t-arm > $(BUILDDIR)/ex_$$t-arm.got; \
 	  diff -u examples/$$t.out $(BUILDDIR)/ex_$$t-arm.got; \

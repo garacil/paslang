@@ -163,6 +163,7 @@ type
     FJsonNames: array of LongInt; { the enumerations whose names a decoder reads }
     FJsonDEnt: array of LongInt;  { the types JsonDecode, TryJsonDecode, a typed for and TryGet take }
     FJsonDForm: array of LongInt; { the entries of each a unit calls, Jd* }
+    FJsonWrite: array of LongInt; { the types a typed JsonWrite takes (P208) }
     FRecMembers: Boolean;  { a record's fields stop where its members begin (P165) }
     FRecVis: Byte;         { the visibility of the record's fields being read (P165) }
     FRecSelf: LongInt;     { the record being declared, which no field of it may be (P165) }
@@ -681,6 +682,7 @@ type
     function JsonDecEntries(T: LongInt; Forms: LongInt; var Heads: string): string;
     function JsonNeedEntry(T: LongInt; Form: LongInt): string;
     function JsonDecodeCall(IsTry: Boolean; const Args: TExprArray): PExpr;
+    function JsonStreamCall(const Name: string; const Args: TExprArray; ALine, ACol: LongInt): PExpr;
     function JsonTypedGet(const Args: TExprArray): PExpr;
     procedure GenJsonCode;
     function ParseVariant(var Td: TTypeDef; Start: LongInt; Stop: TTokKind): LongInt;
@@ -13236,6 +13238,16 @@ begin
             Die('Delete takes a map and a key, or a string variable, an index and a count' +
               ' at ' + IntToStr(nline) + ':' + IntToStr(ncol));
         end
+        else if (SameId(name, 'JsonRead') or SameId(name, 'TryJsonRead') or
+          SameId(name, 'JsonWrite')) and (FTok.Kind = tkLParen) and
+          FindProc('PasJsonReadBegin', pe) then
+        begin
+          { JsonRead(r, x), TryJsonRead(r, x, err) and JsonWrite(w, x):
+            of a json pasjson's, of any other x the functions the
+            compiler writes for its type (P208) }
+          args := ParseArgList;
+          Result := JsonStreamCall(name, args, nline, ncol);
+        end
         else if (SameId(name, 'JsonDecode') or SameId(name, 'TryJsonDecode')) and
           (FTok.Kind = tkLParen) and FindProc('JsonParse', pe) then
         begin
@@ -23162,6 +23174,8 @@ const
   JdGet = 16;
   JdItem = 32;
   JdMerge = 64;
+  JdRead = 128;
+  JdTryRead = 256;
   { the variables a check reads values into and drops }
   JsonChkVars = 'cI: Integer; cB: Boolean; cC: Char; cF: Double; cS: Single; cQ: Quad; ' +
     'cY: Currency; cT: string; nb: Integer;';
@@ -26525,6 +26539,28 @@ begin
       'try' + #10 + '$jdjson' + id + '(D, X, Opts);' + #10 + 'except' + #10 +
       'on E: EJsonError do begin Err := E; Result := False; end;' + #10 + 'end;' + #10 + 'end;' + #10;
   end;
+  if (Forms and (JdRead or JdTryRead)) <> 0 then
+  begin
+    { a stream's next value (P208): its text decoded as JsonDecode decodes
+      one, an error raised again at its place in the stream }
+    h := 'function $jdread' + id + '(Rd: TJsonReader; var X: ' + tr + '): Boolean;';
+    Heads := Heads + h + ' forward;' + #10;
+    Result := Result + h + #10 + 'var R: TJsonIn; t: ' + tr + '; ' + JsonChkVars + #10 + 'begin' +
+      #10 + 'R := Default(TJsonIn);' + #10 + 'Result := PasJsonReadBegin(Rd, R);' + #10 +
+      'if not Result then Exit;' + #10 + 'try' + #10 + 'try' + #10 + 't := Default(' + tr + ');' +
+      #10 + JsonDecValue(T, 't', 0, TypName(T), False) + #10 + 'PasJsonInEnd(R);' + #10 + 'except' +
+      #10 + 'on E: EJsonError do PasJsonReadFail(Rd, E);' + #10 + 'end;' + #10 + 'finally' + #10 +
+      'PasJsonReadEnd(Rd);' + #10 + 'end;' + #10 + 'X := t;' + #10 + 'end;' + #10;
+  end;
+  if (Forms and JdTryRead) <> 0 then
+  begin
+    h := 'function $jdtryread' + id + '(Rd: TJsonReader; var X: ' + tr +
+      '; out Err: EJsonError): Boolean;';
+    Heads := Heads + h + ' forward;' + #10;
+    Result := Result + h + #10 + 'begin' + #10 + 'Err := nil;' + #10 + 'try' + #10 +
+      'Result := $jdread' + id + '(Rd, X);' + #10 + 'except' + #10 +
+      'on E: EJsonError do begin Err := E; Result := False; end;' + #10 + 'end;' + #10 + 'end;' + #10;
+  end;
   if (Forms and JdGet) <> 0 then
   begin
     h := 'function $jdget' + id + '(D: json; const K: string; var X: ' + tr + '): Boolean;';
@@ -26572,10 +26608,105 @@ begin
     JdTryText: Result := 'json.dtryt';
     JdTryJson: Result := 'json.dtryj';
     JdGet: Result := 'json.dget';
+    JdRead: Result := 'json.dread';
+    JdTryRead: Result := 'json.dtryread';
   else
     Result := 'json.ditem';
   end;
   Result := ProcSym(FUnitName, Result + IntToStr(T));
+end;
+
+{ JsonRead(r, x), TryJsonRead(r, x, err) and JsonWrite(w, x) (P208): of
+  a json (or nil) pasjson's own; of a variable x of any other type with
+  a JSON form, the stream's next value decoded into it (json.dread,
+  json.dtryread), and of any other value w's next value written by its
+  type's encoder into w's buffer, as Go's MarshalEncode writes into its
+  Encoder's (json.write). }
+function TParser.JsonStreamCall(const Name: string; const Args: TExprArray; ALine, ACol: LongInt): PExpr;
+var
+  pe: TProcEnt;
+  x: PExpr;
+  t, rt, et: LongInt;
+  why, at: string;
+  a: TExprArray;
+  i: SizeInt;
+  isWrite, isTry, found: Boolean;
+begin
+  at := ' at ' + IntToStr(ALine) + ':' + IntToStr(ACol);
+  isWrite := SameId(Name, 'JsonWrite');
+  isTry := SameId(Name, 'TryJsonRead');
+  for i := 0 to High(Args) do
+    CheckTyped(Args[i]);
+  if (Length(Args) < 2) or (Args[1]^.Kind = ekNil) or (TypeOf(Args[1]^.Typ).Kind = tykJson) then
+  begin
+    FCallAt := at;
+    a := Args;
+    if not FindProc(Name, pe) or not ResolveProc(Name, a, pe) then
+      Die('wrong arguments for ' + Name + at);
+    FillDefaults(pe, a);
+    for i := 0 to High(a) do
+      if (i <= High(pe.ByRef)) and pe.ByRef[i] then
+        a[i] := VarArgOf(a[i]);
+    Result := NewCall(pe.Sym, a, pe.RetTyp);
+    Exit;
+  end;
+  if (isTry and (Length(Args) <> 3)) or (not isTry and (Length(Args) <> 2)) then
+  begin
+    if isWrite then
+      Die('JsonWrite takes a writer and a value' + at)
+    else if isTry then
+      Die('TryJsonRead takes a reader, a variable and the error' + at)
+    else
+      Die('JsonRead takes a reader and a variable' + at);
+  end;
+  x := Args[1];
+  t := x^.Typ;
+  if not JsonForm(t, why) then
+    Die(Name + ' takes a value of a type with a JSON form, and ' + TypName(t) + ' has none' + at);
+  if FJsonAt = '' then
+    FJsonAt := at;
+  a := nil;
+  if isWrite then
+  begin
+    if not NamedType('TJsonWriter', rt) then
+      Die('JsonWrite needs pasjson' + at);
+    found := False;
+    for i := 0 to High(FJsonWrite) do
+      if FJsonWrite[i] = t then
+        found := True;
+    if not found then
+    begin
+      i := Length(FJsonWrite);
+      SetLength(FJsonWrite, i + 1);
+      FJsonWrite[i] := t;
+    end;
+    SetLength(a, 2);
+    a[0] := ValArg(rt, Args[0]);
+    a[1] := x;
+    Result := NewCall(ProcSym(FUnitName, 'json.write' + IntToStr(t)), a, TyNone);
+    Exit;
+  end;
+  if not ((x^.Kind = ekVar) or (x^.Kind = ekField) or (x^.Kind = ekIndex) or
+    (x^.Kind = ekDeref)) then
+    Die(Name + '(r, x): x needs a variable' + at);
+  if not NamedType('TJsonReader', rt) then
+    Die(Name + ' needs pasjson' + at);
+  if isTry then
+    SetLength(a, 3)
+  else
+    SetLength(a, 2);
+  a[0] := ValArg(rt, Args[0]);
+  a[1] := NewAddr(x);
+  if isTry then
+  begin
+    if not NamedType('EJsonError', et) then
+      Die(Name + ' needs pasjson' + at);
+    CheckOutVar(Args[2], et, 'TryJsonRead(r, x, err): err');
+    a[2] := NewAddr(Args[2]);
+    Result := NewCall(JsonNeedEntry(t, JdTryRead), a, TyBoolean);
+  end
+  else
+    Result := NewCall(JsonNeedEntry(t, JdRead), a, TyBoolean);
 end;
 
 { JsonDecode(src, x[, opts]) and TryJsonDecode(src, x, err[, opts]):
@@ -26719,7 +26850,7 @@ var
   saveImpl, saveCheck: Boolean;
   lex: TLexer;
 begin
-  if (Length(FJsonText) = 0) and (Length(FJsonDEnt) = 0) then
+  if (Length(FJsonText) = 0) and (Length(FJsonDEnt) = 0) and (Length(FJsonWrite) = 0) then
     Exit;
   heads := '';
   bodies := '';
@@ -26739,6 +26870,21 @@ begin
     heads := heads + h + ' forward;' + #10;
     bodies := bodies + h + #10 + 'begin' + #10 +
       'Result := JsonParse($jtext' + IntToStr(t) + '(X, JsonDefaults));' + #10 + 'end;' + #10;
+  end;
+  { the typed JsonWrite's (P208): the value's encoder into the buffer the
+    writer gives, the writer as it was when the encoder fails }
+  for i := 0 to High(FJsonWrite) do
+  begin
+    t := FJsonWrite[i];
+    h := 'procedure $jput' + IntToStr(t) + '(var W: TJsonOut; const X: ' + JsonTypRef(t) + ');';
+    heads := heads + h + ' forward;' + #10;
+    bodies := bodies + h + #10 + 'begin' + #10 + JsonValue(t, 'X', 0, TypName(t)) + #10 + 'end;' + #10;
+    h := 'procedure $jwrite' + IntToStr(t) + '(Wr: TJsonWriter; const X: ' + JsonTypRef(t) + ');';
+    heads := heads + h + ' forward;' + #10;
+    bodies := bodies + h + #10 + 'var P: PJsonOut;' + #10 + 'begin' + #10 +
+      'P := PasJsonWriteBegin(Wr);' + #10 + 'try' + #10 + '$jput' + IntToStr(t) + '(P^, X);' + #10 +
+      'except' + #10 + 'PasJsonWriteUndo(Wr);' + #10 + 'raise;' + #10 + 'end;' + #10 +
+      'PasJsonWriteEnd(Wr);' + #10 + 'end;' + #10;
   end;
   { the decodes' entries (P206), and the checks Merge needs }
   for i := 0 to High(FJsonDEnt) do

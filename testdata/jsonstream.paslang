@@ -1,0 +1,380 @@
+{ P208: streams of json. A reader of a text, of a descriptor and of a
+  source routine that gives one byte at a time; values one after
+  another, NDJSON with its errors and a blank line, an RFC 7464
+  sequence with a number cut short; an error kept in a plain stream as
+  Go's Decoder keeps it; the token level with its pointer, a name twice,
+  a comma missing and a typed JsonRead of each element of an array;
+  MaxValue, MaxBytes and a deadline; a writer of memory, of a pipe and
+  of a sink, typed and json values, the token words and their misuse,
+  sequences, pretty and canonical writing, EPIPE as an error; and the
+  reader's descriptor left open. }
+program jsonstream;
+
+uses
+  paslinux, pasnet;
+
+type
+  TPoint = record
+    X, Y: Integer;
+    Tag: string;
+  end;
+
+  TFds = array[0..1] of Int32;
+
+const
+  TokName: array[TJsonToken] of string = ('end', 'null', 'false', 'true', 'number', 'string',
+    '{', '}', '[', ']');
+  KindName: array[TJsonErrorKind] of string = ('syntax', 'encoding', 'duplicate', 'depth',
+    'too large', 'missing', 'type', 'range', 'unknown', 'test', 'io');
+
+var
+  r: TJsonReader;
+  w: TJsonWriter;
+  j: json;
+  e: EJsonError;
+  p: TPoint;
+  f, g: TFds;
+  src, sunk: string;
+  at, n, sum, i: Integer;
+  tok: TJsonToken;
+  wg: waitgroup;
+  o: TJsonOptions;
+
+function NbPipe(var F: TFds): Boolean;
+begin
+  F[0] := 0;
+  F[1] := 0;
+  if Amd64 = 1 then
+    Result := Syscall(293, @F[0], 524288 or ONonblock) = 0
+  else
+    Result := Syscall(59, @F[0], 524288 or ONonblock) = 0;
+end;
+
+procedure Fails(E: EJsonError);
+begin
+  WriteLn('  ', KindName[E.Kind], ': ', E.Message);
+end;
+
+{ every value of R, and each error with it }
+procedure All(R: TJsonReader; Most: Integer);
+var
+  v: json;
+  x: EJsonError;
+  k: Integer;
+begin
+  for k := 1 to Most do
+  begin
+    if TryJsonRead(R, v, x) then
+      WriteLn('  ', JsonEncode(v), ' (', R.Offset, ')')
+    else if x <> nil then
+      Fails(x)
+    else
+    begin
+      WriteLn('  end at ', R.Offset);
+      Exit;
+    end;
+  end;
+end;
+
+{ the point of every line of R, typed, and each error }
+procedure Points(R: TJsonReader);
+var
+  q: TPoint;
+  x: EJsonError;
+begin
+  while True do
+  begin
+    q := Default(TPoint);
+    if TryJsonRead(R, q, x) then
+      WriteLn('  ', q.X, ' ', q.Y, ' ', q.Tag)
+    else if x <> nil then
+      Fails(x)
+    else
+      Break;
+  end;
+end;
+
+procedure Tokens(R: TJsonReader);
+var
+  t: TJsonToken;
+begin
+  try
+    repeat
+      t := R.Next;
+      Write('  ', TokName[t], ' depth ', R.Depth, ' path "', R.Path, '"');
+      if t = jtkString then
+        Write(' ', R.AsString);
+      if t = jtkNumber then
+        Write(' ', R.AsNumber);
+      WriteLn;
+    until t = jtkEnd;
+  except
+    on x: EJsonError do
+      Fails(x);
+  end;
+end;
+
+{ a writer misused: the call raises and the writer is as it was }
+procedure Misuse(W: TJsonWriter; K: Integer);
+var
+  nan: Double;
+begin
+  try
+    case K of
+      0: W.Name('k');
+      1: W.Add(1);
+      2: W.EndArray;
+      3: W.AddNumber('01');
+      4: W.Name('n');
+      5: W.Name('m');
+      6: begin nan := 0; nan := nan / nan; W.Add(nan); end;
+      7: W.Add('a' + #255);
+      8: W.EndObject;
+      9: W.Add(3);
+      10: W.Name('outside');
+      11: W.EndObject;
+      12: W.Add(JsonParse('[1,2]'));
+    end;
+    WriteLn('  no error ', K);
+  except
+    on x: EJsonError do
+      Fails(x);
+  end;
+end;
+
+procedure PipeWriter(Fd: Integer);
+var
+  ww: TJsonWriter;
+  q: TPoint;
+  k: Integer;
+begin
+  ww := JsonWriter(Fd);
+  ww.Buffered := True;
+  for k := 1 to 1000 do
+  begin
+    q.X := k;
+    q.Y := 2 * k;
+    q.Tag := 'p' + Chr(48 + k mod 10);
+    JsonWrite(ww, q);
+  end;
+  ww.Flush;
+  OsClose(Fd);
+  wg.Done;
+end;
+
+procedure LateValue(Fd: Integer);
+var
+  ww: TJsonWriter;
+begin
+  Sleep(60);
+  ww := JsonWriter(Fd);
+  JsonWrite(ww, JsonParse('{"late":true}'));
+  wg.Done;
+end;
+
+function Fragments: string;
+begin
+  Result := '';
+  if at <= Length(src) then
+  begin
+    Result := src[at];
+    at := at + 1;
+  end;
+end;
+
+function Sink(const S: string): Boolean;
+begin
+  sunk := sunk + S;
+  Result := Length(sunk) < 40;
+end;
+
+begin
+  WriteLn('values one after another:');
+  r := JsonReader('{"a":1} [1, 2]'#10'"s" 12 true null'#10'  {"b":{"c":[]}}  ');
+  All(r, 10);
+
+  WriteLn('an error a plain stream keeps:');
+  r := JsonReader('1 {"a":} 2');
+  All(r, 3);
+
+  WriteLn('NDJSON:');
+  r := JsonReader('{"n":1}'#10#10'{"n":2,}'#10'  [3]  '#13#10'{"n":4} x'#10'{"n":'#10'5');
+  r.Lines := True;
+  All(r, 10);
+
+  WriteLn('an RFC 7464 sequence:');
+  r := JsonReader(' 0'#10#30'{"a":1}'#10#30'123'#30'[2]'#10#30#30'"x"'#10#30'true'#10);
+  r.Seq := True;
+  All(r, 10);
+
+  WriteLn('typed lines:');
+  r := JsonReader('{"X":1,"Y":2,"Tag":"a"}'#10'{"X":"bad"}'#10'{"X":3,"Y":4,"Tag":"c"}'#10'[1]'#10);
+  r.Lines := True;
+  Points(r);
+
+  WriteLn('tokens:');
+  r := JsonReader('{"name":"x","list":[1,2.5e1,{"k":null}],"t":true}');
+  Tokens(r);
+  r := JsonReader('{"a":1,"b":[],"a":2}');
+  Tokens(r);
+  r := JsonReader('[1 2]');
+  Tokens(r);
+  try
+    WriteLn('  ', TokName[r.Peek]);
+  except
+    on x: EJsonError do
+      WriteLn('  kept: ', x.Message);
+  end;
+
+  WriteLn('the elements of an array, typed:');
+  r := JsonReader('[{"X":1,"Y":1,"Tag":"p"}, {"X":2,"Y":4,"Tag":"q"}]');
+  tok := r.Next;
+  while JsonRead(r, p) do
+    WriteLn('  ', p.X, ' ', p.Y, ' ', p.Tag, ' at ', r.Path);
+  tok := r.Next;
+  WriteLn('  ', TokName[tok], ' then ', TokName[r.Next]);
+
+  WriteLn('MaxValue, a line and a plain stream:');
+  src := '{"short":1}'#10'["' + StringOfChar('x', 200) + '"]'#10'{"after":2}'#10;
+  at := 1;
+  r := JsonReader(@Fragments);
+  r.Lines := True;
+  r.MaxValue := 64;
+  All(r, 5);
+  at := 1;
+  r := JsonReader(@Fragments);
+  r.MaxValue := 64;
+  All(r, 4);
+
+  WriteLn('MaxBytes:');
+  o := JsonDefaults;
+  o.MaxBytes := 20;
+  src := '{"a":1} {"b":2} {"c":3} {"d":4}';
+  at := 1;
+  r := JsonReader(@Fragments);
+  r.Options := o;
+  All(r, 5);
+
+  WriteLn('one byte at a time:');
+  src := '{"n":1}'#10'[1,"two",{"three":3}]'#10'"é\"q"'#10'-0.5e-3'#10;
+  at := 1;
+  r := JsonReader(@Fragments);
+  r.Lines := True;
+  All(r, 6);
+
+  WriteLn('a pipe, a routine writing 1000 values:');
+  if not NbPipe(f) then
+    Halt(1);
+  wg.Add(1);
+  pas PipeWriter(f[1]);
+  r := JsonReader(f[0]);
+  r.Lines := True;
+  n := 0;
+  sum := 0;
+  while JsonRead(r, p) do
+  begin
+    n := n + 1;
+    sum := sum + p.X + p.Y;
+  end;
+  wg.Wait;
+  WriteLn('  ', n, ' values, sum ', sum, ', line ', r.Line);
+  { fcntl F_GETFD: 72 on amd64, 25 on arm64 }
+  if Amd64 = 1 then
+    n := Syscall(72, f[0], 1, 0)
+  else
+    n := Syscall(25, f[0], 1, 0);
+  WriteLn('  the reader left its descriptor open: ', n >= 0);
+  OsClose(f[0]);
+
+  WriteLn('a deadline:');
+  if not NbPipe(g) then
+    Halt(1);
+  r := JsonReader(g[0]);
+  r.Ms := 20;
+  if not TryJsonRead(r, j, e) and (e <> nil) then
+    Fails(e);
+  wg.Add(1);
+  pas LateValue(g[1]);
+  r.Ms := 5000;
+  if JsonRead(r, j) then
+    WriteLn('  then ', JsonEncode(j));
+  wg.Wait;
+  OsClose(g[1]);
+  if not JsonRead(r, j) then
+    WriteLn('  and the end');
+  OsClose(g[0]);
+
+  WriteLn('a writer of memory:');
+  w := JsonWriter;
+  JsonWrite(w, JsonParse('{"a":[1,2]}'));
+  p.X := 7;
+  p.Y := -1;
+  p.Tag := 'é<>';
+  JsonWrite(w, p);
+  JsonWrite(w, 'str');
+  JsonWrite(w, 42);
+  JsonWrite(w, nil);
+  w.BeginObject;
+  w.Name('k');
+  w.BeginArray;
+  w.Add(1);
+  w.Add('two');
+  w.AddNull;
+  w.AddNumber('1e3');
+  w.Add(True);
+  w.Add(2.5);
+  JsonWrite(w, p);
+  w.EndArray;
+  w.Name('j');
+  w.Add(JsonParse('{"x":1}'));
+  for i := 0 to 9 do
+    Misuse(w, i);
+  w.EndObject;
+  for i := 10 to 12 do
+    Misuse(w, i);
+  Write(w.Text);
+  WriteLn('  depth ', w.Depth, ', offset ', w.Offset);
+
+  WriteLn('a sequence, pretty, canonical:');
+  w.Seq := True;
+  JsonWrite(w, JsonParse('[1]'));
+  w.Seq := False;
+  w.Options := JsonPretty;
+  JsonWrite(w, JsonParse('{"b":[1,{"c":2}],"a":{}}'));
+  w.Options := JsonCanonical;
+  JsonWrite(w, JsonParse('{"b":1.50,"a":"x","é":0}'));
+  JsonWrite(w, p);
+  Write(w.Text);
+
+  WriteLn('a sink that takes 40 bytes:');
+  sunk := '';
+  w := JsonWriter(@Sink);
+  try
+    for i := 1 to 9 do
+      JsonWrite(w, JsonParse('{"i":' + Chr(48 + i) + '}'));
+  except
+    on x: EJsonError do
+      Fails(x);
+  end;
+  Write(sunk);
+
+  WriteLn('EPIPE:');
+  if not NbPipe(f) then
+    Halt(1);
+  OsClose(f[0]);
+  w := JsonWriter(f[1]);
+  try
+    JsonWrite(w, JsonParse('[1]'));
+  except
+    on x: EJsonError do
+      Fails(x);
+  end;
+  OsClose(f[1]);
+  WriteLn('still running');
+end.
+
+{ This file is part of paslang's tests.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+  paslang is free software under the GNU General Public License,
+  version 3 or (at your option) any later version; see the file
+  COPYING. It comes with ABSOLUTELY NO WARRANTY. }

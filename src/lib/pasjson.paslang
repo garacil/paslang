@@ -98,7 +98,7 @@ interface
   compiler (Regla 15), compiles the scans alone, which that compiler
   links. }
 {$if PASLANG_FULLVERSION >= 1001124}
-uses pasobject, pasnum, passtr, pasfmt;
+uses pasobject, pasnum, passtr, pasfmt, pasroutines;
 {$endif}
 
 type
@@ -124,9 +124,10 @@ type
     that is not there (jeMissing), of a value of another kind (jeType)
     or for an element or a number past its range (jeRange); a decode met
     a member no field takes with RejectUnknown (jeUnknown, P206); a
-    JsonPatch's test found another value (jeTest, P207). }
+    JsonPatch's test found another value (jeTest, P207); a stream's
+    read or write failed or passed its deadline (jeIO, P208). }
   TJsonErrorKind = (jeSyntax, jeEncoding, jeDuplicate, jeDepth, jeTooLarge, jeMissing, jeType,
-    jeRange, jeUnknown, jeTest);
+    jeRange, jeUnknown, jeTest, jeIO);
 
   { How a parse reads and how JsonEncode writes, one call at a time:
     nothing about JSON is global. JsonDefaults, JsonPretty and
@@ -317,6 +318,173 @@ type
     procedure AddNumber(const Text: string);
     function Done: json;
   end;
+  { A stream's bytes (P208): the next ones, '' at its end; a routine
+    value, a closure as any, which may park. }
+  TJsonSource = function: string;
+  { Where a writer's bytes go: False stops the writer, an EJsonError of
+    kind jeIO. }
+  TJsonSink = function(const S: string): Boolean;
+  { The kind of a stream's next token (P208): jtkEnd after its last. }
+  TJsonToken = (jtkEnd, jtkNull, jtkFalse, jtkTrue, jtkNumber, jtkString, jtkBeginObject,
+    jtkEndObject, jtkBeginArray, jtkEndArray);
+  { An open object or array of a reader's or a writer's tokens: its
+    tokens so far, and an object's names, one by one up to 64 and then
+    through a table of their places too, for twins. }
+  TJsonLevel = record
+    Obj: Boolean;
+    Count: Integer;
+    NN: Integer;
+    Names: array of string;
+    Tab: array of Integer;
+    Lit: string;        { a writer's: the last name as written, "name": }
+  end;
+  PJsonOut = ^TJsonOut;
+  { stage 1's places, a reader's for its values' extents and parses }
+  TJsonPlaces = array of UInt32;
+
+  { A stream's values one by one (P208), from a text, a descriptor or a
+    source routine: JsonRead and TryJsonRead give the next as a json, or
+    into a variable of any type with a JSON form, and Peek, Next, Value
+    and Skip read it a token at a time. A read that waits parks the
+    routine and leaves its M free; memory is bounded by MaxValue,
+    whatever the stream's size; the reader never closes its
+    descriptor. Lines reads NDJSON, a value a line, and Seq an RFC 7464
+    sequence; after an error in one the next read starts at the next
+    line or record. One routine's at a time: a call that finds another
+    running in it ends the program. }
+  TJsonReader = class(TObject)
+  private
+    FKind: Integer;           { 0 a text, 1 a descriptor, 2 a source }
+    FFd: Integer;
+    FSrc: TJsonSource;
+    FText: string;            { a text's bytes }
+    FBuf: array of Byte;      { a descriptor's or a source's }
+    FP: PByte;                { the bytes: FText's or FBuf's }
+    FStart, FEnd: Integer;    { the bytes not read yet, from FP }
+    FBase: Integer;           { the stream's offset of FP[0] }
+    FCnt, FLine, FLineAt: Integer;  { the lines counted before FCnt, and where the last began }
+    FAtEnd, FCut: Boolean;
+    FOpts, FPOpts: TJsonOptions;
+    FMaxValue: Integer;
+    FLines, FSeq: Boolean;
+    FMs: Integer;
+    FBusy: Integer;
+    FIdx: TJsonPlaces;        { stage 1's places, for a value's extent and its parse }
+    FDepth: Integer;
+    FLv: array of TJsonLevel;
+    FTok: json;
+    FCache: array of string;  { names, Go's stringCache }
+    FLastAt, FLastLine, FLastLineAt: Integer;  { where the last value read starts, its line and the line's start }
+    FErr: EJsonError;         { the error every read gives again, as Go's Decoder keeps its first }
+    FSkip: Boolean;           { the rest of a line or a record too long, dropped at the next read }
+    FValAt: Integer;          { the stream's offset of the value whose extent is being found, -1 none }
+    FIn: Pointer;             { the parse state of a typed read's decode, kept from one value to the next }
+    FPast: Integer;           { where a typed read goes on after its value, from FStart }
+    procedure Enter;
+    procedure Leave;
+    procedure Keep(X: EJsonError; AsDoc: Boolean);
+    procedure SetMaxValue(N: Integer);
+    procedure SetOptions(const O: TJsonOptions);
+    procedure CountTo(K: Integer);
+    procedure PlaceOf(At: Integer; out ALine, ACol: Integer);
+    procedure Started(S: Integer);
+    procedure FailAt(At: Integer; K: TJsonErrorKind; const Reason: string);
+    procedure IoFail(N: Integer);
+    function More(Deadline: Integer): Boolean;
+    function ByteAt(K, Deadline: Integer): Integer;
+    function DueAt: Integer;
+    function Closes(G: Integer; var Lv, At: Integer): Boolean;
+    function NextValue(Dl: Integer; AsDoc: Boolean; out S, E, Past: Integer): Boolean;
+    function ParseAt(S, E: Integer): json;
+    procedure Shrink;
+    function ReadDoc(out J: json): Boolean;
+    function Intern(P: PByte; N: Integer): string;
+    function NeedDelim: Integer;
+    function TokenAt(Dl: Integer; out K: Integer): Integer;
+    procedure Counted;
+    procedure Descend(Obj: Boolean; At: Integer);
+    function InNext(out S, E, Past: Integer): Boolean;
+    function InValue(out J: json): Boolean;
+  public
+    constructor Create;
+    function Peek: TJsonToken;
+    function Next: TJsonToken;
+    function Token: json;
+    function AsString: string;
+    function AsNumber: string;
+    function Value: json;
+    procedure Skip;
+    function Depth: Integer;
+    function Offset: Integer;
+    function Line: Integer;
+    function Column: Integer;
+    function Path: string;
+    property Lines: Boolean read FLines write FLines;
+    property Seq: Boolean read FSeq write FSeq;
+    property Ms: Integer read FMs write FMs;
+    property MaxValue: Integer read FMaxValue write SetMaxValue;
+    property Options: TJsonOptions read FOpts write SetOptions;
+  end;
+
+  { Values and tokens written to a descriptor, a sink routine or memory
+    (P208): JsonWrite writes a json, or a value of any type with a JSON
+    form, and BeginObject, Name, Add... write one a token at a time. A
+    value at the top level is followed by a line feed (NDJSON), and in a
+    sequence (Seq) preceded by RS; the bytes go out after each one, or,
+    Buffered, when the buffer is three quarters full and at Flush. A
+    write that waits parks the routine; one that fails, EPIPE among
+    them, is an EJsonError of kind jeIO, what was not written kept. The
+    writer never closes its descriptor. One routine's at a time. }
+  TJsonWriter = class(TObject)
+  private
+    FKind: Integer;           { 0 memory, 1 a descriptor, 2 a sink }
+    FFd: Integer;
+    FSink: TJsonSink;
+    FOut: TJsonOut;
+    FTmp: TJsonOut;           { a value written for Canonical }
+    FOpts: TJsonOptions;
+    FSeq, FBuffered: Boolean;
+    FMs: Integer;
+    FBusy: Integer;
+    FNamed: Boolean;          { in an object: a name written, its value not yet }
+    FBase: Integer;           { the bytes given to the descriptor or the sink }
+    FLv: array of TJsonLevel;
+    FMarkN, FMarkDepth, FMarkCount: Integer;
+    FMarkNamed: Boolean;
+    procedure Enter;
+    procedure Leave;
+    procedure SetOptions(const O: TJsonOptions);
+    procedure Mark;
+    procedure Undo;
+    procedure ValueStart;
+    procedure ValueEnd;
+    procedure Drain;
+    procedure OpenLevel(Obj: Boolean);
+    procedure CloseLevel(Obj: Boolean);
+    procedure Scalar(Kind: Integer; const S: string; I: Integer; D: Double; J: json);
+  public
+    constructor Create;
+    procedure BeginObject;
+    procedure BeginArray;
+    procedure EndObject;
+    procedure EndArray;
+    procedure Name(const S: string);
+    procedure Add(const S: string); overload;
+    procedure Add(V: Integer); overload;
+    procedure Add(V: Double); overload;
+    procedure Add(V: Boolean); overload;
+    procedure Add(V: json); overload;
+    procedure AddNull;
+    procedure AddNumber(const ANumber: string);
+    procedure Flush;
+    function Text: string;
+    function Depth: Integer;
+    function Offset: Integer;
+    property Seq: Boolean read FSeq write FSeq;
+    property Buffered: Boolean read FBuffered write FBuffered;
+    property Ms: Integer read FMs write FMs;
+    property Options: TJsonOptions read FOpts write SetOptions;
+  end;
 {$endif}
 
 
@@ -361,6 +529,29 @@ function JsonPatch(J, Patch: json): json;
 function JsonMergePatch(J, Patch: json): json;
 { JsonObject([...]) and JsonArray([...]): the list the compiler builds }
 function PasJsonOfConsts(const A: array of TJsonVarItem; Obj: Boolean): json;
+
+{ Streams that park (P208): a reader of a text, a descriptor or a
+  source routine, a writer of memory, a descriptor or a sink. JsonRead
+  gives the next value, False after the last (inside a container, the
+  next element or member value, False at its end); TryJsonRead gives
+  its error instead of raising it; JsonWrite writes a value. Their
+  forms of a variable of any type with a JSON form are the compiler's,
+  through the words after them. }
+function JsonReader(const Text: string): TJsonReader; overload;
+function JsonReader(Fd: Integer): TJsonReader; overload;
+function JsonReader(Src: TJsonSource): TJsonReader; overload;
+function JsonWriter: TJsonWriter; overload;
+function JsonWriter(Fd: Integer): TJsonWriter; overload;
+function JsonWriter(Sink: TJsonSink): TJsonWriter; overload;
+function JsonRead(R: TJsonReader; out J: json): Boolean;
+function TryJsonRead(R: TJsonReader; out J: json; out Err: EJsonError): Boolean;
+procedure JsonWrite(W: TJsonWriter; J: json);
+function PasJsonReadBegin(R: TJsonReader; var D: TJsonIn): Boolean;
+procedure PasJsonReadFail(R: TJsonReader; E: EJsonError);
+procedure PasJsonReadEnd(R: TJsonReader);
+function PasJsonWriteBegin(W: TJsonWriter): PJsonOut;
+procedure PasJsonWriteEnd(W: TJsonWriter);
+procedure PasJsonWriteUndo(W: TJsonWriter);
 
 { The words the compiler writes for j['k'], j[i], 'k' in j, TryGet,
   Length, =, Write and for ... in (P203). }
@@ -1982,7 +2173,7 @@ type
     NodeCap: Int64;
     Arena: Int64;      { the arena's next byte, from D }
     ArenaEnd: Int64;
-    Idx: array of UInt32;
+    Idx: TJsonPlaces;
     NIdx, I, Done0: Int64;
     Scan: TPasJsonScan;
     St: array of TJFrame;
@@ -4778,7 +4969,7 @@ end;
 { The text of the value at Root, written once into a string that grows
   (Grow), first as long as the document's text when Root is a root.
   Mode 0 compact, 1 pretty, 2 canonical. }
-function JsonWrite(Root: PJNode; Mode: Integer; const Indent: string; Html: Boolean): string;
+function DocText(Root: PJNode; Mode: Integer; const Indent: string; Html: Boolean): string;
 var
   o: TJOut;
   base: PByte;
@@ -4901,12 +5092,45 @@ begin
     end;
 end;
 
-{ The error of a parse that failed, its line and column counted now. }
+{ The error of a parse that failed, at offset Off, line Line and column
+  Col: its text's, or a stream's (P208). }
+function ParseErrorAt(const E: TJErr; Off, Line, Col: Int64): EJsonError;
+var
+  i: Int64;
+  k: TJsonErrorKind;
+  nm: string;
+begin
+  case E.Kind of
+    1: k := jeEncoding;
+    2: k := jeDuplicate;
+    3: k := jeDepth;
+    4: k := jeTooLarge;
+  else
+    k := jeSyntax;
+  end;
+  if k <> jeDuplicate then
+  begin
+    Result := EJsonError.Create(k, Off, Line, Col, E.Path, E.Path, E.Reason);
+    Exit;
+  end;
+  { a name twice: the message names it, within its object }
+  i := Length(E.Path);
+  while (i > 0) and (E.Path[i] <> '/') do
+    i := i - 1;
+  nm := Copy(E.Path, i + 1, Length(E.Path));
+  nm := StringReplaceAll(StringReplaceAll(nm, '~1', '/'), '~0', '~');
+  Result := EJsonError.Create(k, Off, Line, Col, E.Path, Copy(E.Path, 1, i - 1), E.Reason);
+  Result.FMessage := 'json: ' + E.Reason + ' ' + GoQuoteStr(nm) + ' at ' + IntText(Line) + ':' +
+    IntText(Col) + ' (byte ' + IntText(Off) + ')';
+  if i > 1 then
+    Result.FMessage := Result.FMessage + ' within ' +
+      GoQuoteStr(TruncPointer(Copy(E.Path, 1, i - 1), 100));
+end;
+
+{ The error of a parse of S that failed, its line and column counted now. }
 function ParseError(const S: string; const E: TJErr): EJsonError;
 var
   i, line, col: Int64;
-  k: TJsonErrorKind;
-  nm: string;
 begin
   line := 1;
   col := 1;
@@ -4918,31 +5142,7 @@ begin
     end
     else
       col := col + 1;
-  case E.Kind of
-    1: k := jeEncoding;
-    2: k := jeDuplicate;
-    3: k := jeDepth;
-    4: k := jeTooLarge;
-  else
-    k := jeSyntax;
-  end;
-  if k <> jeDuplicate then
-  begin
-    Result := EJsonError.Create(k, E.Offset, line, col, E.Path, E.Path, E.Reason);
-    Exit;
-  end;
-  { a name twice: the message names it, within its object }
-  i := Length(E.Path);
-  while (i > 0) and (E.Path[i] <> '/') do
-    i := i - 1;
-  nm := Copy(E.Path, i + 1, Length(E.Path));
-  nm := StringReplaceAll(StringReplaceAll(nm, '~1', '/'), '~0', '~');
-  Result := EJsonError.Create(k, E.Offset, line, col, E.Path, Copy(E.Path, 1, i - 1), E.Reason);
-  Result.FMessage := 'json: ' + E.Reason + ' ' + GoQuoteStr(nm) + ' at ' + IntText(line) + ':' +
-    IntText(col) + ' (byte ' + IntText(E.Offset) + ')';
-  if i > 1 then
-    Result.FMessage := Result.FMessage + ' within ' +
-      GoQuoteStr(TruncPointer(Copy(E.Path, 1, i - 1), 100));
+  Result := ParseErrorAt(E, E.Offset, line, col);
 end;
 
 function JKindOf(J: PJNode): TJsonKind;
@@ -5605,7 +5805,20 @@ end;
   window at a time under stage 2; Plain reads a byte at a time instead.
   A text past MaxBytes, or past 4 GiB - 1 (the index holds 32-bit
   places, as simdjson's), is refused before it is read. }
-function ParseText(const S: string; const O: TJsonOptions; Plain: Boolean; out E: TJErr): PJNode;
+{ The places stage 1 writes for a window of a text of N bytes: the
+  window's bytes, a whole block, and the 8 a kernel's last step may
+  write past them (P208: no longer JsonWin's for any text). }
+function IdxRoom(N: Int64): Int64;
+begin
+  if N > JsonWin then
+    N := JsonWin;
+  Result := ((N + 63) and not 63) + 8;
+end;
+
+{ The text T[0..N-1] parsed where it lies, with the places of Idx, which
+  grows to the text's window and is kept for the next (a reader's). }
+function ParseCore(T: PByte; N: Int64; const O: TJsonOptions; Plain: Boolean; out E: TJErr;
+  var Idx: TJsonPlaces): PJNode;
 var
   p: TJParse;
   scan: TPasJsonScan;
@@ -5616,18 +5829,18 @@ begin
   lim := JsonMaxDoc;
   if (O.MaxBytes > 0) and (O.MaxBytes < lim) then
     lim := O.MaxBytes;
-  if Length(S) > lim then
+  if N > lim then
   begin
     E.Kind := 4;
     E.Offset := lim;
     E.Path := '';
-    E.Reason := 'the text has ' + IntText(Length(S)) + ' bytes, more than the ' + IntText(lim) +
+    E.Reason := 'the text has ' + IntText(N) + ' bytes, more than the ' + IntText(lim) +
       ' a parse takes';
     Exit;
   end;
   p := Default(TJParse);
-  p.T := PByte(Pointer(S));
-  p.N := Length(S);
+  p.T := T;
+  p.N := N;
   p.MaxDepth := O.MaxDepth;
   if p.MaxDepth <= 0 then
     p.MaxDepth := JsonDepthMax;
@@ -5636,7 +5849,9 @@ begin
     p.Bad := -1
   else
     p.Bad := PasUtf8Valid(p.T, p.N, True);
-  SetLength(p.Idx, JsonWin + 8);
+  if Length(Idx) < IdxRoom(N) then
+    SetLength(Idx, IdxRoom(N));
+  p.Idx := Idx;
   PasJsonScanStart(scan);
   at := 0;
   while at < p.N do
@@ -5678,6 +5893,19 @@ begin
   PInt64(@p.D[16])^ := p.Arena;
   PInt64(@p.D[24])^ := p.N;
   Result := PJNode(@p.D[JsonHead]);
+end;
+
+function ParseText(const S: string; const O: TJsonOptions; Plain: Boolean; out E: TJErr): PJNode;
+var
+  idx: TJsonPlaces;
+begin
+  idx := nil;
+  Result := ParseCore(PByte(Pointer(S)), Length(S), O, Plain, E, idx);
+end;
+
+function ParseMem(T: PByte; N: Int64; const O: TJsonOptions; out E: TJErr; var Idx: TJsonPlaces): PJNode;
+begin
+  Result := ParseCore(T, N, O, False, E, Idx);
 end;
 
 function NodeOfJ(J: json): PJNode;
@@ -5787,7 +6015,7 @@ begin
   if J = nil then
     Result := 'null'
   else
-    Result := JsonWrite(NodeOfJ(J), mode, Opts.Indent, Opts.EscapeHtml);
+    Result := DocText(NodeOfJ(J), mode, Opts.Indent, Opts.EscapeHtml);
 end;
 
 function JsonEncode(J: json): string;
@@ -5795,7 +6023,7 @@ begin
   if J = nil then
     Result := 'null'
   else
-    Result := JsonWrite(NodeOfJ(J), 0, '', False);
+    Result := DocText(NodeOfJ(J), 0, '', False);
 end;
 
 function PasJsonText(J: json): string;
@@ -6757,9 +6985,9 @@ begin
     Exit;
   end;
   if W.Indent = '' then
-    t := JsonWrite(NodeOfJ(J), 0, '', W.Html)
+    t := DocText(NodeOfJ(J), 0, '', W.Html)
   else
-    t := JsonWrite(NodeOfJ(J), 1, W.Indent, W.Html);
+    t := DocText(NodeOfJ(J), 1, W.Indent, W.Html);
   if (W.Indent = '') or (W.Depth = 0) then
   begin
     PasJsonOutRaw(W, t);
@@ -7439,9 +7667,17 @@ end;
 function StStart(var P: TJParse; const S: string; const Opts: TJsonOptions): Boolean;
 var
   lim: Int64;
+  keep: TJParse;
 begin
   Result := False;
+  { the places, the scratch block and the frames of the last text read,
+    kept: a reader's decodes reserve nothing for each value (P208) }
+  keep := P;
   P := Default(TJParse);
+  P.Idx := keep.Idx;
+  P.Doc := keep.Doc;
+  P.St := keep.St;
+  P.Idx2 := keep.Idx2;
   P.Stream := True;
   lim := JsonMaxDoc;
   if (Opts.MaxBytes > 0) and (Opts.MaxBytes < lim) then
@@ -7462,17 +7698,20 @@ begin
   if P.MaxDepth <= 0 then
     P.MaxDepth := JsonDepthMax;
   P.Bad := PasUtf8Valid(P.T, P.N, True);
-  SetLength(P.Idx, JsonWin + 8);
+  if Length(P.Idx) < IdxRoom(P.N) then
+    SetLength(P.Idx, IdxRoom(P.N));
   P.IdxP := @P.Idx[0];
   PasJsonScanStart(P.Scan);
-  SetLength(P.Doc, 4096);
+  if Length(P.Doc) < 4096 then
+    SetLength(P.Doc, 4096);
   P.D := @P.Doc[0];
   P.NTop := JsonHead + 16;
   P.Top := nil;
   P.Ahead := 2 * P.N;
   P.Seed := NextSeed;
   P.State := SValue;
-  SetLength(P.St, 16);
+  if Length(P.St) < 16 then
+    SetLength(P.St, 16);
   Result := True;
 end;
 
@@ -8140,8 +8379,8 @@ begin
     { the window ends: the text after it, indexed again }
     if (ofs >= P.N) or (P.Ahead <= 0) then
       Exit;
-    if Length(P.Idx2) = 0 then
-      SetLength(P.Idx2, JsonWin + 8);
+    if Length(P.Idx2) < IdxRoom(P.N) then
+      SetLength(P.Idx2, IdxRoom(P.N));
     take := P.N - ofs;
     if take > JsonWin then
     begin
@@ -8792,7 +9031,7 @@ begin
   K.Names[K.N] := Copy(PasStrView(b, n), 1, n);
   if R.S = nil then
   begin
-    v := JsonWrite(PJNode(R.Cur), 0, '', False);
+    v := DocText(PJNode(R.Cur), 0, '', False);
     InNext(R);
   end
   else
@@ -10500,6 +10739,1794 @@ begin
     Leave;
   end;
 end;
+
+{ ---- Streams that park (P208) ----
+
+  A reader takes the values of a stream one by one, as Go's
+  jsontext.Decoder does (encoding/json/jsontext/decode.go): the bytes
+  in a buffer, FP[FStart..FEnd), whose first byte is the stream's
+  FBase, so every place is an offset that holds however the buffer
+  moves or grows (decodeBuffer's baseOffset; no pointer is kept across
+  a fetch). A fetch moves what is unread to the front and reads more;
+  the buffer doubles only while one value needs it (fetch's prevStart
+  0 and the buffer full), up to MaxValue, and goes back to its size
+  after that value. A value's extent is found first, and the parser
+  reads it where it lies: a line of NDJSON to its line feed and a
+  record of a sequence to the next RS, by IndexByte; any other value by
+  stage 1, the structural index of whole blocks of 64 bytes, its
+  carries (an escape, a string open) kept from one fetch to the next,
+  its brackets counted to the one that closes it. A descriptor is read
+  through PasIoRead, which parks the routine while nothing is there and
+  leaves its M to others (P199); the reader never closes it. }
+
+const
+  JsonReadMin = 4096;          { a reader's first buffer }
+  JsonReadKeep = 65536;        { the most a reader keeps between values }
+  JsonMaxValue = 67108864;     { the longest value a reader takes by default: 64 MiB }
+  JsonScanStep = 64;           { the blocks stage 1 indexes a step, for a value's extent }
+  JsonWriteBuf = 65536;        { a writer's buffer }
+
+{ The place of byte C in P[0..N-1], -1 when it is not there: the kernel
+  of the processor the unit is built for (P148), as passtr's. }
+function ByteFind(P: Pointer; N, C: Int64): Int64;
+begin
+{$if defined(CPU_AVX2)}
+  Result := PasFindByteCpu(P, N, C);
+{$else}
+  Result := PasFindByteBase(P, N, C);
+{$endif}
+end;
+
+function IsJsonSpace(C: Integer): Boolean;
+begin
+  Result := (C = 32) or (C = 10) or (C = 13) or (C = 9);
+end;
+
+{ A failed system call's answer as Go's syscall.Errno says it, and a
+  deadline's as os.ErrDeadlineExceeded. }
+function ErrnoText(N: Int64): string;
+begin
+  case -N of
+    110: Result := 'i/o timeout';
+    32: Result := 'broken pipe';
+    104: Result := 'connection reset by peer';
+    9: Result := 'bad file descriptor';
+    5: Result := 'input/output error';
+    11: Result := 'resource temporarily unavailable';
+  else
+    Result := 'errno ' + IntText(-N);
+  end;
+end;
+
+constructor TJsonReader.Create;
+begin
+  FOpts := JsonDefaults;
+  FPOpts := FOpts;
+  FMaxValue := JsonMaxValue;
+  FLine := 1;
+  SetLength(FCache, 256);
+end;
+
+function JsonReader(const Text: string): TJsonReader;
+begin
+  Result := TJsonReader.Create;
+  Result.FText := Text;
+  Result.FP := PByte(Pointer(Result.FText));
+  Result.FEnd := Length(Text);
+  Result.FAtEnd := True;
+end;
+
+function JsonReader(Fd: Integer): TJsonReader;
+begin
+  Result := TJsonReader.Create;
+  Result.FKind := 1;
+  Result.FFd := Fd;
+end;
+
+function JsonReader(Src: TJsonSource): TJsonReader;
+begin
+  Result := TJsonReader.Create;
+  Result.FKind := 2;
+  Result.FSrc := Src;
+end;
+
+procedure TJsonReader.Enter;
+begin
+  if FBusy <> 0 then
+    JsonFatal('paslang: concurrent json reader use');
+  FBusy := 1;
+end;
+
+procedure TJsonReader.Leave;
+begin
+  if FBusy <> 1 then
+    JsonFatal('paslang: concurrent json reader use');
+  FBusy := 0;
+end;
+
+{ An error after which no next value can be found is the reader's from
+  then on, every read raising it again, as Go's Decoder keeps its
+  first: any in a plain stream or among tokens, and the end MaxBytes
+  puts to a stream. In NDJSON and a sequence the next line or record
+  starts afresh, and a read that failed or passed its deadline may be
+  made again. }
+procedure TJsonReader.Keep(X: EJsonError; AsDoc: Boolean);
+begin
+  if X.Kind = jeIO then
+    Exit;
+  if FCut and (X.Kind = jeTooLarge) then
+  begin
+    FErr := X;
+    Exit;
+  end;
+  if AsDoc and (FDepth = 0) and (FLines or FSeq) then
+    Exit;
+  FErr := X;
+end;
+
+procedure TJsonReader.SetMaxValue(N: Integer);
+begin
+  if N < 64 then
+    N := 64;
+  if N > JsonMaxDoc then
+    N := JsonMaxDoc;
+  FMaxValue := N;
+end;
+
+{ The options a value is parsed with: the reader's, but MaxBytes, which
+  is the stream's. }
+procedure TJsonReader.SetOptions(const O: TJsonOptions);
+begin
+  FOpts := O;
+  FPOpts := O;
+  FPOpts.MaxBytes := 0;
+end;
+
+{ The lines the bytes before FP[K] end, counted once before they go: a
+  line feed at a time from the last byte counted (IndexByte). }
+procedure TJsonReader.CountTo(K: Integer);
+var
+  i, j: Integer;
+begin
+  i := FCnt - FBase;
+  while i < K do
+  begin
+    j := ByteFind(@FP[i], K - i, 10);
+    if j < 0 then
+      Break;
+    i := i + j + 1;
+    FLine := FLine + 1;
+    FLineAt := FBase + i;
+  end;
+  if FBase + K > FCnt then
+    FCnt := FBase + K;
+end;
+
+{ The line and the column, from 1, the column in bytes, of the stream's
+  byte at offset At, which the buffer holds or ends at. }
+procedure TJsonReader.PlaceOf(At: Integer; out ALine, ACol: Integer);
+var
+  i, j, k, l, ls: Integer;
+begin
+  l := FLine;
+  ls := FLineAt;
+  i := FCnt - FBase;
+  k := At - FBase;
+  while i < k do
+  begin
+    j := ByteFind(@FP[i], k - i, 10);
+    if j < 0 then
+      Break;
+    i := i + j + 1;
+    l := l + 1;
+    ls := FBase + i;
+  end;
+  ALine := l;
+  ACol := At - ls + 1;
+end;
+
+{ A value starts at FP[FStart + S]: the lines before it counted, its
+  place kept for the errors of a decode of its text. }
+procedure TJsonReader.Started(S: Integer);
+begin
+  CountTo(FStart + S);
+  FLastAt := FBase + FStart + S;
+  FLastLine := FLine;
+  FLastLineAt := FLineAt;
+end;
+
+procedure TJsonReader.FailAt(At: Integer; K: TJsonErrorKind; const Reason: string);
+var
+  l, c: Integer;
+begin
+  PlaceOf(At, l, c);
+  raise EJsonError.Create(K, At, l, c, '', '', Reason);
+end;
+
+procedure TJsonReader.IoFail(N: Integer);
+begin
+  raise EJsonError.Create(jeIO, FBase + FEnd, 0, 0, '', '', 'read: ' + ErrnoText(N));
+end;
+
+function TJsonReader.DueAt: Integer;
+begin
+  Result := 0;
+  if FMs > 0 then
+    Result := PasIoDeadline(FMs);
+end;
+
+{ More bytes after FEnd, as Go's decodeBuffer.fetch takes them: what is
+  read dropped, the rest moved to the front, the buffer doubled when
+  one value fills it, never past MaxValue; False at the stream's end.
+  A descriptor's read parks until it is ready or Deadline (a Nanotime,
+  0 none) passes; a source's call may park as it likes. A stream longer
+  than Options.MaxBytes ends there, and a read that reaches its end
+  fails with jeTooLarge. }
+function TJsonReader.More(Deadline: Integer): Boolean;
+var
+  n, lim: Integer;
+  s: string;
+  nb: array of Byte;
+begin
+  Result := False;
+  if FAtEnd then
+    Exit;
+  if FStart > 0 then
+  begin
+    CountTo(FStart);
+    if FEnd > FStart then
+      Move(FBuf[FStart], FBuf[0], FEnd - FStart);
+    FBase := FBase + FStart;
+    FEnd := FEnd - FStart;
+    FStart := 0;
+  end;
+  if FEnd >= Length(FBuf) then
+  begin
+    if FEnd >= FMaxValue then
+    begin
+      n := FBase;
+      if FValAt >= 0 then
+        n := FValAt;
+      FailAt(n, jeTooLarge, 'a value of more than ' + IntText(FMaxValue) +
+        ' bytes, the reader''s MaxValue');
+    end;
+    n := Length(FBuf) * 2;
+    if n < JsonReadMin then
+      n := JsonReadMin;
+    if n > FMaxValue then
+      n := FMaxValue;
+    nb := nil;
+    SetLength(nb, n);
+    if FEnd > 0 then
+      Move(FBuf[0], nb[0], FEnd);
+    FBuf := nb;
+    FP := @FBuf[0];
+  end;
+  if FKind = 1 then
+  begin
+    n := PasIoRead(FFd, @FBuf[FEnd], Length(FBuf) - FEnd, Deadline);
+    if n < 0 then
+      IoFail(n);
+    if n = 0 then
+    begin
+      FAtEnd := True;
+      Exit;
+    end;
+    FEnd := FEnd + n;
+  end
+  else
+  begin
+    s := FSrc();
+    if s = '' then
+    begin
+      FAtEnd := True;
+      Exit;
+    end;
+    { a chunk the room does not hold: the buffer grows to hold it all }
+    if FEnd + Length(s) > Length(FBuf) then
+    begin
+      n := Length(FBuf) * 2;
+      if n < FEnd + Length(s) then
+        n := FEnd + Length(s);
+      nb := nil;
+      SetLength(nb, n);
+      if FEnd > 0 then
+        Move(FBuf[0], nb[0], FEnd);
+      FBuf := nb;
+      FP := @FBuf[0];
+    end;
+    Move(PByte(Pointer(s))^, FBuf[FEnd], Length(s));
+    FEnd := FEnd + Length(s);
+  end;
+  lim := FOpts.MaxBytes;
+  if (lim > 0) and (FBase + FEnd > lim) then
+  begin
+    FEnd := lim - FBase;
+    FAtEnd := True;
+    FCut := True;
+  end;
+  Result := True;
+end;
+
+{ The byte K after FStart, -1 at the stream's end, fetching. }
+function TJsonReader.ByteAt(K, Deadline: Integer): Integer;
+begin
+  while FStart + K >= FEnd do
+    if not More(Deadline) then
+    begin
+      Result := -1;
+      Exit;
+    end;
+  Result := FP[FStart + K];
+end;
+
+{ The bracket that closes a container among the G places stage 1 put
+  in FIdx, the level counted from Lv: True with At past it; a control
+  byte in a string ends the value there too, which the parse names. }
+function TJsonReader.Closes(G: Integer; var Lv, At: Integer): Boolean;
+var
+  m, a, b: Integer;
+begin
+  Result := False;
+  for m := 0 to G - 1 do
+  begin
+    a := FIdx[m];
+    b := FP[FStart + a];
+    if (b = 123) or (b = 91) then
+      Lv := Lv + 1
+    else if (b = 125) or (b = 93) then
+    begin
+      Lv := Lv - 1;
+      if Lv = 0 then
+      begin
+        At := a + 1;
+        Result := True;
+        Exit;
+      end;
+    end
+    else if b < 32 then
+    begin
+      At := a + 1;
+      Result := True;
+      Exit;
+    end;
+  end;
+end;
+
+{ The next value's extent, from FStart: its first byte S, the byte
+  past its last E, and Past, where the next read starts; False at the
+  stream's end. AsDoc at the top level, with Lines a value is its line,
+  to its line feed; otherwise a container to the bracket that closes
+  it (stage 1, a string's control byte ending it in error), a string to
+  its closing quote, a number or a literal to the next byte that is no
+  part of one. In a sequence (Seq) a value comes after RS, and a number
+  or a literal must have white space after it, the canary of a text
+  not cut short (RFC 7464 2.4); a text with neither is dropped to the
+  next RS. A value is seen as soon as its last byte comes: the bytes
+  short of a whole block are indexed too, on a copy of the carries
+  (a byte's class depends on the bytes before it alone), so a stream
+  that pauses after a value gives it at once. }
+function TJsonReader.NextValue(Dl: Integer; AsDoc: Boolean; out S, E, Past: Integer): Boolean;
+var
+  i, k, n, at, done, nb, got, lvl, q, bs: Integer;
+  c, d: Integer;
+  rs, seq: Boolean;
+  sc, sc2: TPasJsonScan;
+
+begin
+  Result := False;
+  S := 0;
+  E := 0;
+  Past := 0;
+  FValAt := -1;
+  seq := AsDoc and FSeq and not FLines;
+  if FSkip and AsDoc and (FLines or FSeq) then
+  begin
+    { the rest of a line too long, to its line feed, or of a record that
+      failed, to the RS of the next }
+    if FLines then
+      d := 10
+    else
+      d := 30;
+    while True do
+    begin
+      n := FEnd - FStart;
+      if n > 0 then
+      begin
+        at := ByteFind(@FP[FStart], n, d);
+        if at >= 0 then
+        begin
+          FStart := FStart + at;
+          if FLines then
+            FStart := FStart + 1;
+          Break;
+        end;
+        FStart := FEnd;
+      end;
+      if not More(Dl) then
+        Break;
+    end;
+    FSkip := False;
+  end;
+  i := 0;
+  rs := False;
+  while True do
+  begin
+    c := ByteAt(i, Dl);
+    if c < 0 then
+    begin
+      FStart := FStart + i;
+      if FCut then
+        FailAt(FBase + FEnd, jeTooLarge, 'the stream has more than ' + IntText(FOpts.MaxBytes) +
+          ' bytes, the reader''s MaxBytes');
+      Exit;
+    end;
+    if IsJsonSpace(c) then
+      i := i + 1
+    else if seq and (c = 30) then
+    begin
+      rs := True;
+      i := i + 1;
+    end
+    else
+      Break;
+  end;
+  S := i;
+  FValAt := FBase + FStart + S;
+  if AsDoc and FLines then
+  begin
+    k := i + 1;
+    while True do
+    begin
+      n := FEnd - FStart - k;
+      if n > 0 then
+      begin
+        at := ByteFind(@FP[FStart + k], n, 10);
+        if at >= 0 then
+        begin
+          E := k + at;
+          Break;
+        end;
+        k := k + n;
+      end;
+      if FEnd - FStart >= FMaxValue then
+      begin
+        { a line longer than MaxValue: what it has so far dropped, the
+          rest of it at the next read }
+        at := FBase + FStart + S;
+        FStart := FEnd;
+        FSkip := True;
+        FailAt(at, jeTooLarge, 'a value of more than ' + IntText(FMaxValue) +
+          ' bytes, the reader''s MaxValue');
+      end;
+      if not More(Dl) then
+      begin
+        if FCut then
+          FailAt(FBase + FEnd, jeTooLarge, 'the stream has more than ' + IntText(FOpts.MaxBytes) +
+            ' bytes, the reader''s MaxBytes');
+        E := FEnd - FStart;
+        Break;
+      end;
+    end;
+    Past := E;
+    if E < FEnd - FStart then
+      Past := E + 1;
+    Result := True;
+    Exit;
+  end;
+  if seq and not rs then
+  begin
+    at := FBase + FStart + S;
+    FStart := FStart + S;
+    FSkip := True;
+    FailAt(at, jeSyntax, 'a text of a sequence comes after RS (RFC 7464)');
+  end;
+  if (c = 123) or (c = 91) then
+  begin
+    PasJsonScanStart(sc);
+    lvl := 0;
+    done := i;
+    if Length(FIdx) < JsonScanStep * 64 + 8 then
+      SetLength(FIdx, JsonScanStep * 64 + 8);
+    while True do
+    begin
+      nb := (FEnd - FStart - done) shr 6;
+      if nb > 0 then
+      begin
+        if nb > JsonScanStep then
+          nb := JsonScanStep;
+        got := PasJsonIndexBlocks(@FP[FStart + done], nb, sc, @FIdx[0], done);
+        if Closes(got, lvl, E) then
+          Break;
+        done := done + nb * 64;
+        Continue;
+      end;
+      n := FEnd - FStart - done;
+      if n > 0 then
+      begin
+        sc2 := sc;
+        k := lvl;
+        got := PasJsonIndex(@FP[FStart + done], n, sc2, @FIdx[0], done);
+        if Closes(got, k, E) then
+          Break;
+      end;
+      if not More(Dl) then
+      begin
+        { the stream ends inside the value, which the parse says }
+        if FCut then
+          FailAt(FBase + FEnd, jeTooLarge, 'the stream has more than ' + IntText(FOpts.MaxBytes) +
+            ' bytes, the reader''s MaxBytes');
+        E := FEnd - FStart;
+        Break;
+      end;
+    end;
+  end
+  else if c = 34 then
+  begin
+    { to the quote no backslash escapes }
+    k := i + 1;
+    while True do
+    begin
+      n := FEnd - FStart - k;
+      q := -1;
+      if n > 0 then
+        q := ByteFind(@FP[FStart + k], n, 34);
+      if q >= 0 then
+      begin
+        q := k + q;
+        bs := 0;
+        while (q - bs - 1 > i) and (FP[FStart + q - bs - 1] = 92) do
+          bs := bs + 1;
+        k := q + 1;
+        if not Odd(bs) then
+        begin
+          E := k;
+          Break;
+        end;
+        Continue;
+      end;
+      if n > 0 then
+        k := k + n;
+      if not More(Dl) then
+      begin
+        if FCut then
+          FailAt(FBase + FEnd, jeTooLarge, 'the stream has more than ' + IntText(FOpts.MaxBytes) +
+            ' bytes, the reader''s MaxBytes');
+        E := FEnd - FStart;
+        Break;
+      end;
+    end;
+  end
+  else
+  begin
+    k := i + 1;
+    while True do
+    begin
+      c := ByteAt(k, Dl);
+      if (c < 0) or IsJsonSpace(c) or (c = 44) or (c = 58) or (c = 91) or (c = 93) or
+        (c = 123) or (c = 125) or (c = 34) or (c = 30) then
+        Break;
+      k := k + 1;
+    end;
+    E := k;
+    if FCut and (c < 0) then
+      FailAt(FBase + FEnd, jeTooLarge, 'the stream has more than ' + IntText(FOpts.MaxBytes) +
+        ' bytes, the reader''s MaxBytes');
+    if seq and not IsJsonSpace(c) then
+    begin
+      at := FBase + FStart + E;
+      FStart := FStart + E;
+      FSkip := True;
+      FailAt(at, jeSyntax, 'a number or a literal with no white space after it may be cut short ' +
+        '(RFC 7464 2.4)');
+    end;
+  end;
+  Past := E;
+  Result := True;
+end;
+
+{ The value FP[FStart + S..FStart + E) parsed where it lies, with the
+  reader's index; an error raised at its place in the stream: the
+  offset from the stream's first byte, its line and column. }
+function TJsonReader.ParseAt(S, E: Integer): json;
+var
+  er: TJErr;
+  r: PJNode;
+  at, l, c: Integer;
+begin
+  r := ParseMem(@FP[FStart + S], E - S, FPOpts, er, FIdx);
+  if r = nil then
+  begin
+    at := FBase + FStart + S + er.Offset;
+    PlaceOf(at, l, c);
+    raise ParseErrorAt(er, at, l, c);
+  end;
+  Result := JsonOfN(r);
+end;
+
+{ A value much longer than the buffer kept made it grow: back to its
+  size, a new block, so the old one goes. }
+procedure TJsonReader.Shrink;
+var
+  nb: array of Byte;
+begin
+  if (FKind = 0) or (Length(FBuf) <= JsonReadKeep) or (FEnd - FStart > JsonReadKeep div 2) then
+    Exit;
+  CountTo(FStart);
+  nb := nil;
+  SetLength(nb, JsonReadKeep);
+  if FEnd > FStart then
+    Move(FBuf[FStart], nb[0], FEnd - FStart);
+  FBase := FBase + FStart;
+  FEnd := FEnd - FStart;
+  FStart := 0;
+  FBuf := nb;
+  FP := @FBuf[0];
+end;
+
+{ The next value at the top level as a document, False at the stream's
+  end. An error in a line of NDJSON leaves the reader at the next line,
+  in a record of a sequence at the next RS. }
+function TJsonReader.ReadDoc(out J: json): Boolean;
+var
+  s, e, past: Integer;
+begin
+  J := nil;
+  if not NextValue(DueAt, True, s, e, past) then
+  begin
+    Result := False;
+    Exit;
+  end;
+  Started(s);
+  try
+    J := ParseAt(s, e);
+  except
+    on X: EJsonError do
+    begin
+      FStart := FStart + past;
+      if FSeq and not FLines then
+        FSkip := True;
+      raise;
+    end;
+  end;
+  FStart := FStart + past;
+  Shrink;
+  Result := True;
+end;
+
+function JsonRead(R: TJsonReader; out J: json): Boolean;
+var
+  doc: Boolean;
+begin
+  J := nil;
+  R.Enter;
+  try
+    if R.FErr <> nil then
+      raise R.FErr;
+    doc := R.FDepth = 0;
+    try
+      if doc then
+        Result := R.ReadDoc(J)
+      else
+        Result := R.InValue(J);
+    except
+      on X: EJsonError do
+      begin
+        R.Keep(X, doc);
+        raise;
+      end;
+    end;
+  finally
+    R.Leave;
+  end;
+end;
+
+function TryJsonRead(R: TJsonReader; out J: json; out Err: EJsonError): Boolean;
+begin
+  Err := nil;
+  J := nil;
+  try
+    Result := JsonRead(R, J);
+  except
+    on X: EJsonError do
+    begin
+      Err := X;
+      J := nil;
+      Result := False;
+    end;
+  end;
+end;
+
+{ The typed JsonRead the compiler writes (P208): Begin finds the next
+  value and points the decode cursor D at its text, through the
+  reader's parse state, kept from one value to the next (StStart reuses
+  its places, its scratch block and its frames), so a stream of small
+  values reserves nothing for each; the reader is held until End, which
+  goes past the value, so no other routine moves its buffer or its
+  state during the decode. Fail raises a decode's error again at its
+  place in the stream; one about the text's syntax, in a plain stream
+  or inside a container, is kept as a JsonRead's is. }
+function PasJsonReadBegin(R: TJsonReader; var D: TJsonIn): Boolean;
+var
+  s0, e, past: Integer;
+  P: PJParse;
+  t: string;
+begin
+  R.Enter;
+  try
+    if R.FErr <> nil then
+      raise R.FErr;
+    if R.FDepth > 0 then
+      Result := R.InNext(s0, e, past)
+    else
+      Result := R.NextValue(R.DueAt, True, s0, e, past);
+  except
+    on X: EJsonError do
+    begin
+      R.Keep(X, R.FDepth = 0);
+      R.Leave;
+      raise;
+    end;
+  end;
+  if not Result then
+  begin
+    R.Leave;
+    Exit;
+  end;
+  R.Started(s0);
+  R.FPast := past;
+  t := BytesStr(@R.FP[R.FStart + s0], e - s0);
+  if R.FIn = nil then
+  begin
+    New(P);
+    R.FIn := P;
+  end;
+  P := PJParse(R.FIn);
+  D.Merge := False;
+  D.Reject := R.FPOpts.RejectUnknown;
+  D.Text := t;
+  D.Opts := R.FPOpts;
+  D.S := P;
+  StStart(P^, D.Text, R.FPOpts);
+end;
+
+procedure PasJsonReadFail(R: TJsonReader; E: EJsonError);
+var
+  l, c: Integer;
+  x: EJsonError;
+begin
+  if E.Line <= 0 then
+    x := EJsonError.Create(E.Kind, R.FLastAt, 0, 0, E.Path, E.Path, E.Reason)
+  else
+  begin
+    l := R.FLastLine + E.Line - 1;
+    if E.Line > 1 then
+      c := E.Column
+    else
+      c := R.FLastAt - R.FLastLineAt + E.Column;
+    x := EJsonError.Create(E.Kind, R.FLastAt + E.Offset, l, c, E.Path, E.Path, E.Reason);
+  end;
+  if E.Kind in [jeSyntax, jeEncoding, jeDuplicate, jeDepth, jeTooLarge] then
+    R.Keep(x, R.FDepth = 0);
+  raise x;
+end;
+
+procedure PasJsonReadEnd(R: TJsonReader);
+begin
+  R.FStart := R.FStart + R.FPast;
+  R.FPast := 0;
+  if R.FDepth > 0 then
+    R.Counted
+  else
+    R.Shrink;
+  R.Leave;
+end;
+
+{ ---- A reader's tokens (P208), as Go's jsontext.Decoder reads them ----
+
+  The state is Go's stateMachine (jsontext/state.go): each open object
+  or array its count of tokens, so a name is a string at an even count
+  of an object and its value at the odd one after; a colon after a name
+  and a comma after a value are read with the next token, which must be
+  the one the state needs (needDelim) unless it closes its container.
+  An object's names are checked for twins as they come, one by one up
+  to JsonLinear and then through a table, as a parse checks them. The
+  token level reads the stream as values one after another, white
+  space between them; Lines and Seq are JsonRead's at the top level. }
+
+{ Go's hash64 of intern.go: XXH32's two rounds over two 32-bit words,
+  without its final mix. }
+function Hash64(Lo, Hi: Int64): Int64;
+var
+  h: Int64;
+begin
+  h := $165667B1 + 8;
+  h := (h + Lo * $C2B2AE3D) and $FFFFFFFF;
+  h := ((((h shl 17) or (h shr 15)) and $FFFFFFFF) * $27D4EB2F) and $FFFFFFFF;
+  h := (h + Hi * $C2B2AE3D) and $FFFFFFFF;
+  h := ((((h shl 17) or (h shr 15)) and $FFFFFFFF) * $27D4EB2F) and $FFFFFFFF;
+  Result := h;
+end;
+
+{ FNV-1a of a name, for NameInto's table. }
+function NameHash(const S: string): Integer;
+var
+  i: Integer;
+begin
+  Result := Int64($CBF29CE484222325);
+  for i := 1 to Length(S) do
+    Result := (Result xor Ord(S[i])) * $100000001B3;
+end;
+
+{ A byte quoted as Go's error quotes a character: 'x', or '\xHH' past
+  ASCII and for the control bytes. }
+function QuoteByte(C: Integer): string;
+begin
+  if (C < 32) or (C >= 127) then
+    Result := '''\x' + Hex4Text(C, 2) + ''''
+  else if C = 39 then
+    Result := '''\'''''
+  else
+    Result := '''' + Chr(C) + '''';
+end;
+
+{ Go's stringCache (encoding/json/v2 intern.go makeString): a name of 2
+  to 256 bytes is looked up in 256 slots by a hash of its first and its
+  last bytes, the string there given again when it is the same, so a
+  stream that repeats its names makes each once. }
+function TJsonReader.Intern(P: PByte; N: Integer): string;
+var
+  lo, hi, h: Int64;
+  i: Integer;
+begin
+  if (N < 2) or (N > 256) then
+  begin
+    Result := BytesStr(P, N);
+    Exit;
+  end;
+  if N >= 8 then
+  begin
+    lo := PInt64(P)^;
+    hi := PInt64(@P[N - 8])^;
+    h := Hash64(lo and $FFFFFFFF, (lo shr 32) and $FFFFFFFF) xor
+      Hash64(hi and $FFFFFFFF, (hi shr 32) and $FFFFFFFF);
+  end
+  else if N >= 4 then
+    h := Hash64(PUInt32(P)^, PUInt32(@P[N - 4])^)
+  else
+    h := Hash64(P[0] or (P[1] shl 8), P[N - 2] or (P[N - 1] shl 8));
+  i := (h and $FFFFFFFF) mod 256;
+  if (Length(FCache[i]) = N) and PasMemEqBase(Pointer(FCache[i]), P, N) then
+  begin
+    Result := FCache[i];
+    Exit;
+  end;
+  Result := BytesStr(P, N);
+  FCache[i] := Result;
+end;
+
+{ A name into the open object L's set: False when it is there already. }
+function NameInto(var L: TJsonLevel; const S: string): Boolean;
+var
+  i, n, m, h: Integer;
+begin
+  Result := False;
+  n := L.NN;
+  if n < JsonLinear then
+  begin
+    for i := 0 to n - 1 do
+      if L.Names[i] = S then
+        Exit;
+  end
+  else
+  begin
+    m := Length(L.Tab) - 1;
+    if n * 2 >= m then
+    begin
+      { the table at four times the names, every one put in again }
+      if m < 255 then
+        m := 255;
+      while m < n * 4 do
+        m := m * 2 + 1;
+      SetLength(L.Tab, m + 1);
+      for i := 0 to m do
+        L.Tab[i] := -1;
+      for i := 0 to n - 1 do
+      begin
+        h := NameHash(L.Names[i]) and m;
+        while L.Tab[h] >= 0 do
+          h := (h + 1) and m;
+        L.Tab[h] := i;
+      end;
+    end;
+    h := NameHash(S) and m;
+    while L.Tab[h] >= 0 do
+    begin
+      if L.Names[L.Tab[h]] = S then
+        Exit;
+      h := (h + 1) and m;
+    end;
+    L.Tab[h] := n;
+  end;
+  if n >= Length(L.Names) then
+    SetLength(L.Names, n * 2 + 8);
+  L.Names[n] := S;
+  L.NN := n + 1;
+  Result := True;
+end;
+
+
+{ The delimiter the next token needs, as Go's needDelim: a colon after
+  a name, a comma after a value in an open container; 0 for none. }
+function TJsonReader.NeedDelim: Integer;
+begin
+  Result := 0;
+  if FDepth = 0 then
+    Exit;
+  if FLv[FDepth].Obj and Odd(FLv[FDepth].Count) then
+    Result := 58
+  else if FLv[FDepth].Count > 0 then
+    Result := 44;
+end;
+
+{ Past the space before the next token and the delimiter the state
+  needs before it: the next token's first byte, K bytes after FStart,
+  -1 at the stream's end. Its errors as Go's checkDelim words them. }
+function TJsonReader.TokenAt(Dl: Integer; out K: Integer): Integer;
+var
+  c, d: Integer;
+  w: string;
+begin
+  K := 0;
+  c := ByteAt(K, Dl);
+  while IsJsonSpace(c) do
+  begin
+    K := K + 1;
+    c := ByteAt(K, Dl);
+  end;
+  Result := c;
+  if c < 0 then
+    Exit;
+  d := NeedDelim;
+  if ((c = 125) or (c = 93)) and (d <> 58) then
+    Exit;
+  if d = 0 then
+    Exit;
+  if c <> d then
+  begin
+    if d = 58 then
+      w := 'after object name (expecting '':'')'
+    else if FLv[FDepth].Obj then
+      w := 'after object value (expecting '','' or ''}'')'
+    else
+      w := 'after array element (expecting '','' or '']'')';
+    FailAt(FBase + FStart + K, jeSyntax, 'invalid character ' + QuoteByte(c) + ' ' + w);
+  end;
+  K := K + 1;
+  c := ByteAt(K, Dl);
+  while IsJsonSpace(c) do
+  begin
+    K := K + 1;
+    c := ByteAt(K, Dl);
+  end;
+  Result := c;
+  if (c = 125) or (c = 93) then
+    FailAt(FBase + FStart + K, jeSyntax, 'invalid character ' + QuoteByte(c) + ' at start of value');
+end;
+
+
+{ The kind of the next token, nothing read: jtkEnd at the stream's end. }
+function TJsonReader.Peek: TJsonToken;
+var
+  k: Integer;
+  c: Integer;
+begin
+  Enter;
+  try
+    if FErr <> nil then
+      raise FErr;
+    try
+      c := TokenAt(DueAt, k);
+      case c of
+        -1: Result := jtkEnd;
+        123: Result := jtkBeginObject;
+        125: Result := jtkEndObject;
+        91: Result := jtkBeginArray;
+        93: Result := jtkEndArray;
+        34: Result := jtkString;
+        110: Result := jtkNull;
+        116: Result := jtkTrue;
+        102: Result := jtkFalse;
+      else
+        Result := jtkNumber;
+      end;
+    except
+      on X: EJsonError do
+      begin
+        Keep(X, False);
+        raise;
+      end;
+    end;
+  finally
+    Leave;
+  end;
+end;
+
+{ A value read: one more token of its container. }
+procedure TJsonReader.Counted;
+begin
+  if FDepth > 0 then
+    FLv[FDepth].Count := FLv[FDepth].Count + 1;
+end;
+
+procedure TJsonReader.Descend(Obj: Boolean; At: Integer);
+var
+  md: Integer;
+begin
+  md := FOpts.MaxDepth;
+  if md <= 0 then
+    md := JsonDepthMax;
+  if FDepth >= md then
+    FailAt(At, jeDepth, 'exceeded max depth');
+  Counted;
+  FDepth := FDepth + 1;
+  if FDepth >= Length(FLv) then
+    SetLength(FLv, FDepth * 2 + 8);
+  FLv[FDepth].Obj := Obj;
+  FLv[FDepth].Count := 0;
+  FLv[FDepth].NN := 0;
+  FLv[FDepth].Tab := nil;
+end;
+
+{ The next token, read: a scalar's value through Token, AsString and AsNumber; a
+  name is a string at a name's place, its twin an error. At the end of
+  the stream jtkEnd, and inside a container that is an error. }
+function TJsonReader.Next: TJsonToken;
+var
+  k, s, e, past, at: Integer;
+  c: Integer;
+  nd: PJNode;
+  nm: string;
+begin
+  Enter;
+  try
+    if FErr <> nil then
+      raise FErr;
+    try
+      FTok := nil;
+      c := TokenAt(DueAt, k);
+      at := FBase + FStart + k;
+      if c < 0 then
+      begin
+        if FDepth > 0 then
+          FailAt(at, jeSyntax, 'unexpected EOF');
+        Result := jtkEnd;
+        Exit;
+      end;
+      if (FDepth > 0) and FLv[FDepth].Obj and not Odd(FLv[FDepth].Count) and (c <> 34) and
+        (c <> 125) then
+        FailAt(at, jeSyntax, 'invalid character ' + QuoteByte(c) +
+          ' at start of string (expecting ''"'')');
+      if (c = 123) or (c = 91) then
+      begin
+        Descend(c = 123, at);
+        FStart := FStart + k + 1;
+        if c = 123 then
+          Result := jtkBeginObject
+        else
+          Result := jtkBeginArray;
+        Exit;
+      end;
+      if (c = 125) or (c = 93) then
+      begin
+        if (FDepth = 0) or (FLv[FDepth].Obj <> (c = 125)) then
+          FailAt(at, jeSyntax, 'invalid character ' + QuoteByte(c) + ' at start of value');
+        FDepth := FDepth - 1;
+        FStart := FStart + k + 1;
+        if c = 125 then
+          Result := jtkEndObject
+        else
+          Result := jtkEndArray;
+        Exit;
+      end;
+      { a scalar: its extent as a value's, parsed alone }
+      FStart := FStart + k;
+      if not NextValue(DueAt, False, s, e, past) then
+        FailAt(at, jeSyntax, 'unexpected EOF');
+      FTok := ParseAt(s, e);
+      nd := NodeOfJ(FTok);
+      if (FDepth > 0) and FLv[FDepth].Obj and not Odd(FLv[FDepth].Count) then
+      begin
+        nm := Intern(StrBytes(nd), StrLen(nd));
+        if not NameInto(FLv[FDepth], nm) then
+          FailAt(at, jeDuplicate, 'duplicate object member name ' + GoQuoteStr(nm));
+      end;
+      Counted;
+      FStart := FStart + past;
+      if nd = nil then
+        Result := jtkNull
+      else
+        case nd^.W0 and 7 of
+          JtNull: Result := jtkNull;
+          JtFalse: Result := jtkFalse;
+          JtTrue: Result := jtkTrue;
+          JtNum: Result := jtkNumber;
+        else
+          Result := jtkString;
+        end;
+    except
+      on X: EJsonError do
+      begin
+        Keep(X, False);
+        raise;
+      end;
+    end;
+  finally
+    Leave;
+  end;
+end;
+
+{ The last scalar read as a json; nil after a bracket. }
+function TJsonReader.Token: json;
+begin
+  Result := FTok;
+end;
+
+{ The last string read, a name or a value: a name from the reader's
+  cache. }
+function TJsonReader.AsString: string;
+var
+  nd: PJNode;
+begin
+  nd := NodeOfJ(FTok);
+  if (nd = nil) or ((nd^.W0 and 7) <> JtStr) then
+    raise EJsonError.Create(jeType, FLastAt, 0, 0, '', '', 'the last token is not a string');
+  Result := Intern(StrBytes(nd), StrLen(nd));
+end;
+
+{ The last number read, its text as it was written. }
+function TJsonReader.AsNumber: string;
+var
+  nd: PJNode;
+begin
+  nd := NodeOfJ(FTok);
+  if (nd = nil) or ((nd^.W0 and 7) <> JtNum) then
+    raise EJsonError.Create(jeType, FLastAt, 0, 0, '', '', 'the last token is not a number');
+  Result := FTok.AsNumber;
+end;
+
+{ Inside a container, the next value's extent at the place the state
+  is, its delimiter read: an element, or a member's value after its
+  name; False when the next token closes the container, which is not
+  read. }
+function TJsonReader.InNext(out S, E, Past: Integer): Boolean;
+var
+  k, at: Integer;
+  c: Integer;
+begin
+  Result := False;
+  S := 0;
+  E := 0;
+  Past := 0;
+  c := TokenAt(DueAt, k);
+  at := FBase + FStart + k;
+  if c < 0 then
+    FailAt(at, jeSyntax, 'unexpected EOF');
+  if (c = 125) or (c = 93) then
+  begin
+    if FLv[FDepth].Obj <> (c = 125) then
+      FailAt(at, jeSyntax, 'invalid character ' + QuoteByte(c) + ' at start of value');
+    Exit;
+  end;
+  if FLv[FDepth].Obj and not Odd(FLv[FDepth].Count) then
+    raise EJsonError.Create(jeSyntax, at, 0, 0, '', '',
+      'json reader: a member''s value is read after its name');
+  FStart := FStart + k;
+  if not NextValue(DueAt, False, S, E, Past) then
+    FailAt(at, jeSyntax, 'unexpected EOF');
+  Result := True;
+end;
+
+{ The next value inside a container as a document, False at its end. }
+function TJsonReader.InValue(out J: json): Boolean;
+var
+  s, e, past: Integer;
+begin
+  J := nil;
+  Result := InNext(s, e, past);
+  if not Result then
+    Exit;
+  Started(s);
+  try
+    J := ParseAt(s, e);
+  finally
+    FStart := FStart + past;
+  end;
+  Counted;
+end;
+
+{ The next value whole as a document, where the state is: a member's
+  value, an element, a value at the top level (as JsonRead's, Lines
+  and Seq aside). }
+function TJsonReader.Value: json;
+var
+  s, e, past: Integer;
+begin
+  Enter;
+  try
+    if FErr <> nil then
+      raise FErr;
+    try
+      Result := nil;
+      if FDepth > 0 then
+      begin
+        if not InValue(Result) then
+          FailAt(FBase + FStart, jeSyntax, 'json reader: no value before the container''s end');
+      end
+      else
+      begin
+        if not NextValue(DueAt, False, s, e, past) then
+          FailAt(FBase + FStart, jeSyntax, 'unexpected EOF');
+        Started(s);
+        try
+          Result := ParseAt(s, e);
+        finally
+          FStart := FStart + past;
+        end;
+      end;
+    except
+      on X: EJsonError do
+      begin
+        Keep(X, False);
+        raise;
+      end;
+    end;
+  finally
+    Leave;
+  end;
+end;
+
+{ The next value read past and checked, nothing kept. }
+procedure TJsonReader.Skip;
+var
+  j: json;
+begin
+  j := Value;
+end;
+
+function TJsonReader.Depth: Integer;
+begin
+  Result := FDepth;
+end;
+
+{ The stream's offset of the next byte to read. }
+function TJsonReader.Offset: Integer;
+begin
+  Result := FBase + FStart;
+end;
+
+function TJsonReader.Line: Integer;
+var
+  l, c: Integer;
+begin
+  PlaceOf(FBase + FStart, l, c);
+  Result := l;
+end;
+
+function TJsonReader.Column: Integer;
+var
+  l, c: Integer;
+begin
+  PlaceOf(FBase + FStart, l, c);
+  Result := c;
+end;
+
+{ The JSON Pointer of the reader's place: each open container by its
+  last member's name or its last element's index, as Go's
+  Decoder.StackPointer. }
+function TJsonReader.Path: string;
+var
+  d: Integer;
+begin
+  Result := '';
+  for d := 1 to FDepth do
+    if FLv[d].Obj then
+    begin
+      if FLv[d].Count > 0 then
+        Result := Result + '/' + KeyToken(FLv[d].Names[FLv[d].NN - 1]);
+    end
+    else if FLv[d].Count > 0 then
+      Result := Result + '/' + IntText(FLv[d].Count - 1);
+end;
+
+{ ---- A writer that parks (P208) ----
+
+  A writer writes into a buffer, a TJsonOut as the encoders the
+  compiler writes use one, and gives it to its descriptor through
+  PasIoWrite, which parks the routine while the descriptor is full and
+  leaves its M to others; to its sink; or keeps it, a writer of memory,
+  whose Text takes it. As Go's jsontext.Encoder, a value at the top
+  level is followed by a line feed, and in a sequence (Seq, RFC 7464
+  2.2) preceded by RS; the buffer goes out after each value at the top
+  level (encode.go NeedFlush: Tokens.Depth() == 1) and whenever more
+  than three quarters of it are used (len(e.Buf) > 3*cap(e.Buf)/4);
+  Buffered keeps the first for Flush, one system call for many small
+  values, as a Go Encoder over a bufio.Writer. A write that fails is an
+  EJsonError of kind jeIO, EPIPE among them (P382), and what was not
+  written stays, as Go's Flush keeps the unflushed portion; the writer
+  never closes its descriptor. A token misplaced, a name twice in an
+  object, a number's text that is none, a string that is not UTF-8
+  raise EJsonError and leave the writer as it was before the call. }
+
+{ The buffer starts small and grows as the values need, as Go's Encoder
+  grows its own: a server's thousands of writers keep little. }
+constructor TJsonWriter.Create;
+begin
+  FOpts := JsonDefaults;
+  PasJsonOutInit(FOut, FOpts, 192);
+end;
+
+function JsonWriter: TJsonWriter;
+begin
+  Result := TJsonWriter.Create;
+end;
+
+function JsonWriter(Fd: Integer): TJsonWriter;
+begin
+  Result := TJsonWriter.Create;
+  Result.FKind := 1;
+  Result.FFd := Fd;
+end;
+
+function JsonWriter(Sink: TJsonSink): TJsonWriter;
+begin
+  Result := TJsonWriter.Create;
+  Result.FKind := 2;
+  Result.FSink := Sink;
+end;
+
+procedure TJsonWriter.Enter;
+begin
+  if FBusy <> 0 then
+    JsonFatal('paslang: concurrent json writer use');
+  FBusy := 1;
+end;
+
+procedure TJsonWriter.Leave;
+begin
+  if FBusy <> 1 then
+    JsonFatal('paslang: concurrent json writer use');
+  FBusy := 0;
+end;
+
+procedure WFail(const Reason: string);
+begin
+  raise EJsonError.Create(jeSyntax, -1, 0, 0, '', '', 'json writer: ' + Reason);
+end;
+
+{ A json written into the buffer where it lies: on one line, or pretty
+  at the top level, by the document writer straight into the buffer;
+  pretty inside a container, a line at this level each. }
+procedure OutDoc(var W: TJsonOut; J: json; Canon: Boolean);
+var
+  o: TJOut;
+  mode: Integer;
+begin
+  if J = nil then
+  begin
+    PasJsonOutNull(W);
+    Exit;
+  end;
+  if (W.Indent <> '') and (W.Depth > 0) and not Canon then
+  begin
+    PasJsonOutJson(W, J);
+    Exit;
+  end;
+  mode := 0;
+  if Canon then
+    mode := 2
+  else if W.Indent <> '' then
+    mode := 1;
+  o := Default(TJOut);
+  o.Indent := W.Indent;
+  o.Pretty := mode = 1;
+  o.Canon := mode = 2;
+  o.Html := W.Html and (mode <> 2);
+  o.S := W.S;
+  W.S := '';
+  o.B := PByte(Pointer(o.S));
+  o.N := W.N;
+  PutValue(@o, NodeOfJ(J));
+  W.S := o.S;
+  W.N := o.N;
+end;
+
+{ The options of what comes next: the indent, EscapeHtml and MaxDepth
+  of the buffer; Canonical writes each value in RFC 8785's form. }
+procedure TJsonWriter.SetOptions(const O: TJsonOptions);
+begin
+  FOpts := O;
+  FOut.Html := O.EscapeHtml and not O.Canonical;
+  if O.Canonical then
+    FOut.Indent := ''
+  else
+    FOut.Indent := O.Indent;
+  FOut.Pad := '';
+  FOut.MaxDepth := O.MaxDepth;
+  if FOut.MaxDepth <= 0 then
+    FOut.MaxDepth := JsonDepthMax;
+end;
+
+{ Where the writer is before a call, and back there when it fails. }
+procedure TJsonWriter.Mark;
+begin
+  FMarkN := FOut.N;
+  FMarkDepth := FOut.Depth;
+  FMarkCount := FOut.Lv[FOut.Depth].Count;
+  FMarkNamed := FNamed;
+end;
+
+procedure TJsonWriter.Undo;
+begin
+  FOut.N := FMarkN;
+  FOut.Depth := FMarkDepth;
+  FOut.Lv[FOut.Depth].Count := FMarkCount;
+  FNamed := FMarkNamed;
+end;
+
+{ A value comes: at the top level its RS in a sequence; in an array a
+  comma and its line; in an object after its name. }
+procedure TJsonWriter.ValueStart;
+begin
+  if FOut.Depth = 0 then
+  begin
+    if FSeq then
+      PasJsonOutRaw(FOut, #30);
+  end
+  else if FOut.Lv[FOut.Depth].Obj then
+  begin
+    if not FNamed then
+      WFail('a member''s value comes after its name');
+    FNamed := False;
+  end
+  else
+    PasJsonOutItem(FOut);
+end;
+
+{ A value is written: at the top level its line feed, and the buffer
+  out unless Buffered; at any level the buffer out past three quarters. }
+procedure TJsonWriter.ValueEnd;
+begin
+  if FOut.Depth = 0 then
+  begin
+    PasJsonOutRaw(FOut, #10);
+    if (FKind <> 0) and not FBuffered then
+    begin
+      Drain;
+      Exit;
+    end;
+  end;
+  if (FKind <> 0) and (FOut.N > JsonWriteBuf * 3 div 4) then
+    Drain;
+end;
+
+{ The buffer to the descriptor or the sink, all of it: what went out
+  goes from the buffer, the rest stays when a write fails. A buffer a
+  long value grew goes back to its size, a new block. }
+procedure TJsonWriter.Drain;
+var
+  done, n, dl: Integer;
+  s: string;
+begin
+  if (FKind = 0) or (FOut.N = 0) then
+    Exit;
+  if FKind = 1 then
+  begin
+    dl := 0;
+    if FMs > 0 then
+      dl := PasIoDeadline(FMs);
+    done := 0;
+    while done < FOut.N do
+    begin
+      n := PasIoWrite(FFd, @PByte(Pointer(FOut.S))[done], FOut.N - done, dl);
+      if n <= 0 then
+      begin
+        if done > 0 then
+          Move(PByte(Pointer(FOut.S))[done], PByte(Pointer(FOut.S))[0], FOut.N - done);
+        FOut.N := FOut.N - done;
+        FBase := FBase + done;
+        if n = 0 then
+          n := -5;
+        raise EJsonError.Create(jeIO, FBase, 0, 0, '', '', 'write: ' + ErrnoText(n));
+      end;
+      done := done + n;
+    end;
+  end
+  else
+  begin
+    s := BytesStr(Pointer(FOut.S), FOut.N);
+    if not FSink(s) then
+      raise EJsonError.Create(jeIO, FBase, 0, 0, '', '', 'write: the sink took no more');
+  end;
+  FBase := FBase + FOut.N;
+  FOut.N := 0;
+  if Length(FOut.S) > JsonWriteBuf * 2 then
+  begin
+    FOut.S := '';
+    SetLength(FOut.S, JsonWriteBuf + JsonWriteBuf div 8 + 64);
+  end;
+end;
+
+procedure TJsonWriter.Flush;
+begin
+  Enter;
+  try
+    Drain;
+  finally
+    Leave;
+  end;
+end;
+
+{ A writer of memory's text so far, taken out: the writer starts again. }
+function TJsonWriter.Text: string;
+begin
+  Enter;
+  try
+    if FKind <> 0 then
+      WFail('Text is a writer of memory''s');
+    if FOut.Depth > 0 then
+      WFail('Text with an object or an array open');
+    Result := BytesStr(Pointer(FOut.S), FOut.N);
+    FBase := FBase + FOut.N;
+    FOut.N := 0;
+  finally
+    Leave;
+  end;
+end;
+
+function TJsonWriter.Depth: Integer;
+begin
+  Result := FOut.Depth;
+end;
+
+{ The bytes written so far, those out and those in the buffer. }
+function TJsonWriter.Offset: Integer;
+begin
+  Result := FBase + FOut.N;
+end;
+
+procedure TJsonWriter.OpenLevel(Obj: Boolean);
+var
+  d: Integer;
+begin
+  Enter;
+  try
+    Mark;
+    try
+      ValueStart;
+      PasJsonOutOpen(FOut, Obj);
+    except
+      Undo;
+      raise;
+    end;
+    d := FOut.Depth;
+    if d >= Length(FLv) then
+      SetLength(FLv, d * 2 + 8);
+    FLv[d].Obj := Obj;
+    FLv[d].NN := 0;
+    FLv[d].Tab := nil;
+  finally
+    Leave;
+  end;
+end;
+
+procedure TJsonWriter.CloseLevel(Obj: Boolean);
+begin
+  Enter;
+  try
+    if FOut.Depth = 0 then
+      WFail('nothing open to close');
+    if FOut.Lv[FOut.Depth].Obj <> Obj then
+    begin
+      if Obj then
+        WFail('an array closed as an object')
+      else
+        WFail('an object closed as an array');
+    end;
+    if FNamed then
+      WFail('a name with no value before the object''s end');
+    FLv[FOut.Depth].Names := nil;
+    FLv[FOut.Depth].Tab := nil;
+    PasJsonOutClose(FOut);
+    ValueEnd;
+  finally
+    Leave;
+  end;
+end;
+
+procedure TJsonWriter.BeginObject;
+begin
+  OpenLevel(True);
+end;
+
+procedure TJsonWriter.BeginArray;
+begin
+  OpenLevel(False);
+end;
+
+procedure TJsonWriter.EndObject;
+begin
+  CloseLevel(True);
+end;
+
+procedure TJsonWriter.EndArray;
+begin
+  CloseLevel(False);
+end;
+
+procedure TJsonWriter.Name(const S: string);
+var
+  d, k, m: Integer;
+begin
+  Enter;
+  try
+    d := FOut.Depth;
+    if (d = 0) or not FOut.Lv[d].Obj then
+      WFail('a name goes in an object');
+    if FNamed then
+      WFail('a name after a name: its value first');
+    if PasUtf8Valid(Pointer(S), Length(S), True) >= 0 then
+      raise EJsonError.Create(jeEncoding, FBase + FOut.N, 0, 0, '', '',
+        'json writer: a name that is not UTF-8 or holds a noncharacter');
+    if not NameInto(FLv[d], S) then
+      raise EJsonError.Create(jeDuplicate, FBase + FOut.N, 0, 0, '', '',
+        'duplicate object member name ' + GoQuoteStr(S));
+    k := FOut.N;
+    PasJsonOutNameStr(FOut, S);
+    { the name as written, "name":, kept for the pointer of an error in
+      its value, as an encoder's literal is }
+    while PByte(Pointer(FOut.S))[k] <> 34 do
+      k := k + 1;
+    m := FOut.ValAt;
+    while PByte(Pointer(FOut.S))[m - 1] <> 58 do
+      m := m - 1;
+    FLv[d].Lit := BytesStr(@PByte(Pointer(FOut.S))[k], m - k);
+    FOut.Lv[d].NameP := Pointer(FLv[d].Lit);
+    FOut.Lv[d].NameN := m - k;
+    FNamed := True;
+  finally
+    Leave;
+  end;
+end;
+
+{ A scalar of Kind: 0 a string, 1 an integer, 2 a Double, 3 a Boolean,
+  4 null, 5 a number's text, 6 a json; the value written or nothing. }
+procedure TJsonWriter.Scalar(Kind: Integer; const S: string; I: Integer; D: Double; J: json);
+var
+  sc: TPasNumScan;
+begin
+  Enter;
+  try
+    if (Kind = 5) and not WholeNumber(PByte(Pointer(S)), Length(S), sc) then
+      WFail('"' + S + '" is no JSON number');
+    Mark;
+    try
+      ValueStart;
+      case Kind of
+        0: PasJsonOutStr(FOut, S);
+        1: PasJsonOutInt(FOut, I, False);
+        2: PasJsonOutF64(FOut, D, False);
+        3: PasJsonOutBool(FOut, I <> 0);
+        4: PasJsonOutNull(FOut);
+        5: PasJsonOutRaw(FOut, S);
+      else
+        OutDoc(FOut, J, FOpts.Canonical);
+      end;
+    except
+      Undo;
+      raise;
+    end;
+    ValueEnd;
+  finally
+    Leave;
+  end;
+end;
+
+procedure TJsonWriter.Add(const S: string);
+begin
+  Scalar(0, S, 0, 0, nil);
+end;
+
+procedure TJsonWriter.Add(V: Integer);
+begin
+  Scalar(1, '', V, 0, nil);
+end;
+
+procedure TJsonWriter.Add(V: Double);
+begin
+  Scalar(2, '', 0, V, nil);
+end;
+
+procedure TJsonWriter.Add(V: Boolean);
+begin
+  Scalar(3, '', Ord(V), 0, nil);
+end;
+
+procedure TJsonWriter.AddNull;
+begin
+  Scalar(4, '', 0, 0, nil);
+end;
+
+procedure TJsonWriter.AddNumber(const ANumber: string);
+begin
+  Scalar(5, ANumber, 0, 0, nil);
+end;
+
+procedure TJsonWriter.Add(V: json);
+begin
+  Scalar(6, '', 0, 0, V);
+end;
+
+procedure JsonWrite(W: TJsonWriter; J: json);
+begin
+  W.Add(J);
+end;
+
+{ The typed JsonWrite the compiler writes (P208): Begin gives the
+  buffer the value's encoder writes into, after what goes before a
+  value; End writes what goes after it; Undo takes back a value whose
+  encoder failed. With Canonical the encoder writes into a buffer of
+  its own, whose text End puts in RFC 8785's form. }
+function PasJsonWriteBegin(W: TJsonWriter): PJsonOut;
+begin
+  W.Enter;
+  W.Mark;
+  try
+    W.ValueStart;
+  except
+    W.Undo;
+    W.Leave;
+    raise;
+  end;
+  if W.FOpts.Canonical then
+  begin
+    PasJsonOutInit(W.FTmp, W.FOpts, 256);
+    Result := @W.FTmp;
+  end
+  else
+    Result := @W.FOut;
+end;
+
+procedure PasJsonWriteEnd(W: TJsonWriter);
+var
+  t: string;
+begin
+  try
+    if W.FOpts.Canonical then
+    begin
+      try
+        t := PasJsonOutText(W.FTmp, W.FOpts);
+        W.FTmp := Default(TJsonOut);
+        PasJsonOutRaw(W.FOut, t);
+      except
+        W.FTmp := Default(TJsonOut);
+        W.Undo;
+        raise;
+      end;
+    end;
+    W.ValueEnd;
+  finally
+    W.Leave;
+  end;
+end;
+
+procedure PasJsonWriteUndo(W: TJsonWriter);
+begin
+  W.FTmp := Default(TJsonOut);
+  W.Undo;
+  W.Leave;
+end;
+
 {$endif}
 
 end.

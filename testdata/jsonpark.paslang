@@ -1,0 +1,466 @@
+{ P208, Regla 11: json streams that park. A reader that waits parks
+  its routine and leaves its M to the others, and so does a writer:
+  - a reader parked on an empty pipe while 32 routines parse without
+    end, more than there are Ps, gets its value when it comes;
+  - pipes and sockets written a byte at a time, and the 2000 NDJSON
+    requests and answers of 50 connections at once over Unix socket
+    pairs and over TCP, a reader and a writer on each end, typed;
+  - a regular file of 2000 values written and read back while the 32
+    routines parse;
+  - a writer whose reader closed gets EPIPE as an error, and a reader
+    whose writer closed in the middle of a value gets its error;
+  - a reader handed to another routine through a channel goes on where
+    the first left it;
+  - a reader parked in the middle of a value, the collector run three
+    times while it waits, reads the value whole. }
+program jsonpark;
+
+uses
+  paslib, paslinux, pasnet;
+
+type
+  TReq = record
+    Id: Integer;
+    Name: string;
+    Vals: array of Integer;
+  end;
+
+  TAns = record
+    Id: Integer;
+    Sum: Integer;
+  end;
+
+  TFds = array[0..1] of Int32;
+
+const
+  Hogs = 32;
+  Conns = 50;
+  Each = 40;     { requests a connection makes: 50 * 40 = 2000 }
+  KindName: array[TJsonErrorKind] of string = ('syntax', 'encoding', 'duplicate', 'depth',
+    'too large', 'missing', 'type', 'range', 'unknown', 'test', 'io');
+
+var
+  stop, parsed, answered, total, bad: Integer;
+  wg, herd: waitgroup;
+  f: TFds;
+  r: TJsonReader;
+  w: TJsonWriter;
+  j: json;
+  q: TReq;
+  n, sum, k, l, fd, port: Integer;
+  path: string;
+  handed: chan of TJsonReader;
+  e: EJsonError;
+
+function NbPipe(var F: TFds): Boolean;
+begin
+  F[0] := 0;
+  F[1] := 0;
+  if Amd64 = 1 then
+    Result := Syscall(293, @F[0], 524288 or ONonblock) = 0
+  else
+    Result := Syscall(59, @F[0], 524288 or ONonblock) = 0;
+end;
+
+procedure Hog;
+var
+  d: json;
+  m: Integer;
+begin
+  m := 0;
+  while AtomicLoad(stop) = 0 do
+  begin
+    d := JsonParse('{"a":[1,2,3,{"b":"c"}],"d":true,"e":null,"f":-1.5e3}');
+    if d['f'].AsFloat = -1500 then
+      m := m + 1;
+  end;
+  AtomicAdd(@parsed, m);
+  herd.Done;
+end;
+
+procedure StartHogs;
+var
+  h: Integer;
+begin
+  AtomicStore(stop, 0);
+  herd.Add(Hogs);
+  for h := 1 to Hogs do
+    pas Hog;
+end;
+
+procedure StopHogs;
+begin
+  AtomicStore(stop, 1);
+  herd.Wait;
+end;
+
+procedure ParkedReader(Fd: Integer);
+var
+  rr: TJsonReader;
+  v: json;
+begin
+  rr := JsonReader(Fd);
+  if JsonRead(rr, v) and (v['late'].AsInteger = 7) then
+    AtomicAdd(@answered, 1);
+  wg.Done;
+end;
+
+{ a request's text a byte at a time, Yield between }
+procedure Trickle(Fd, Count: Integer);
+var
+  ww: TJsonWriter;
+  rq: TReq;
+  s: string;
+  c, m: Integer;
+begin
+  ww := JsonWriter;
+  for c := 1 to Count do
+  begin
+    rq.Id := c;
+    rq.Name := 'r' + Chr(48 + c mod 10);
+    SetLength(rq.Vals, c mod 4);
+    for m := 0 to High(rq.Vals) do
+      rq.Vals[m] := c + m;
+    JsonWrite(ww, rq);
+  end;
+  s := ww.Text;
+  for c := 1 to Length(s) do
+  begin
+    while OsWrite(Fd, Int64(@s[c]), 1) <> 1 do
+      Yield;
+    Yield;
+  end;
+  OsClose(Fd);
+  wg.Done;
+end;
+
+{ every request of R, typed: the count and the sum of their values }
+procedure Drink(R: TJsonReader; out Count, Total: Integer);
+var
+  rq: TReq;
+  m: Integer;
+begin
+  Count := 0;
+  Total := 0;
+  while JsonRead(R, rq) do
+  begin
+    Count := Count + 1;
+    Total := Total + rq.Id;
+    for m := 0 to High(rq.Vals) do
+      Total := Total + rq.Vals[m];
+  end;
+end;
+
+{ one end of a connection: each request answered with its values' sum }
+procedure Server(Fd: Integer);
+var
+  rr: TJsonReader;
+  ww: TJsonWriter;
+  rq: TReq;
+  an: TAns;
+  m: Integer;
+begin
+  rr := JsonReader(Fd);
+  rr.Lines := True;
+  ww := JsonWriter(Fd);
+  while JsonRead(rr, rq) do
+  begin
+    an.Id := rq.Id;
+    an.Sum := 0;
+    for m := 0 to High(rq.Vals) do
+      an.Sum := an.Sum + rq.Vals[m];
+    JsonWrite(ww, an);
+  end;
+  OsClose(Fd);
+  wg.Done;
+end;
+
+{ the other end: Each requests, each answer read before the next }
+procedure Client(Fd, Base: Integer);
+var
+  rr: TJsonReader;
+  ww: TJsonWriter;
+  rq: TReq;
+  an: TAns;
+  c, m, want: Integer;
+begin
+  rr := JsonReader(Fd);
+  rr.Lines := True;
+  ww := JsonWriter(Fd);
+  for c := 1 to Each do
+  begin
+    rq.Id := Base + c;
+    rq.Name := 'q';
+    SetLength(rq.Vals, 3);
+    want := 0;
+    for m := 0 to 2 do
+    begin
+      rq.Vals[m] := rq.Id * (m + 1);
+      want := want + rq.Vals[m];
+    end;
+    JsonWrite(ww, rq);
+    if not JsonRead(rr, an) or (an.Id <> rq.Id) or (an.Sum <> want) then
+      AtomicAdd(@bad, 1)
+    else
+    begin
+      AtomicAdd(@answered, 1);
+      AtomicAdd(@total, an.Sum);
+    end;
+  end;
+  { the server's end then sees the end of the stream }
+  if Amd64 = 1 then
+    Syscall(48, Fd, 1)
+  else
+    Syscall(210, Fd, 1);
+  if JsonRead(rr, an) then
+    AtomicAdd(@bad, 1);
+  OsClose(Fd);
+  wg.Done;
+end;
+
+procedure Acceptor(L: Integer);
+var
+  c, s: Integer;
+begin
+  for c := 1 to Conns do
+  begin
+    s := TcpAccept(L);
+    if s < 0 then
+      AtomicAdd(@bad, 1)
+    else
+      pas Server(s);
+  end;
+  wg.Done;
+end;
+
+procedure TcpClient(Port, Base: Integer);
+var
+  s: Integer;
+begin
+  s := TcpConnectTo('127.0.0.1', Port);
+  if s < 0 then
+  begin
+    AtomicAdd(@bad, 1);
+    wg.Done;
+    Exit;
+  end;
+  Client(s, Base);
+end;
+
+procedure Reads(Fd, Count: Integer);
+var
+  ww: TJsonWriter;
+  c: Integer;
+begin
+  ww := JsonWriter(Fd);
+  ww.Buffered := True;
+  for c := 1 to Count do
+    JsonWrite(ww, JsonParse('{"n":' + Chr(48 + c mod 10) + '}'));
+  ww.Flush;
+  OsClose(Fd);
+  wg.Done;
+end;
+
+procedure FirstHalf(R: TJsonReader);
+var
+  v: json;
+  c: Integer;
+begin
+  for c := 1 to 10 do
+    if JsonRead(R, v) then
+      AtomicAdd(@sum, v['n'].AsInteger);
+  Send(handed, R);
+  wg.Done;
+end;
+
+procedure SecondHalf;
+var
+  rr: TJsonReader;
+  v: json;
+begin
+  rr := Recv(handed);
+  while JsonRead(rr, v) do
+    AtomicAdd(@sum, v['n'].AsInteger);
+  wg.Done;
+end;
+
+procedure HalfAValue(Fd: Integer);
+var
+  s: string;
+  c: Integer;
+begin
+  s := '{"kept":[';
+  OsWrite(Fd, Int64(Pointer(s)), Length(s));
+  Sleep(30);
+  for c := 1 to 3 do
+    GcCollect;
+  s := '"through", "the", "collector"], "n": 3}' + #10;
+  OsWrite(Fd, Int64(Pointer(s)), Length(s));
+  OsClose(Fd);
+  wg.Done;
+end;
+
+var
+  a, b, i: Integer;
+  cpath: string;
+  rr: TJsonReader;
+  ww: TJsonWriter;
+begin
+  WriteLn('a reader parked while every P parses:');
+  StartHogs;
+  if not NbPipe(f) then
+    Halt(1);
+  answered := 0;
+  wg.Add(1);
+  pas ParkedReader(f[0]);
+  Sleep(30);
+  ww := JsonWriter(f[1]);
+  JsonWrite(ww, JsonParse('{"late":7}'));
+  wg.Wait;
+  StopHogs;
+  OsClose(f[0]);
+  OsClose(f[1]);
+  WriteLn('  woken ', answered, ', the others parsed: ', parsed > 0);
+
+  WriteLn('a pipe and a socket a byte at a time:');
+  if not NbPipe(f) then
+    Halt(1);
+  wg.Add(1);
+  pas Trickle(f[1], 300);
+  r := JsonReader(f[0]);
+  r.Lines := True;
+  Drink(r, n, sum);
+  wg.Wait;
+  OsClose(f[0]);
+  WriteLn('  pipe: ', n, ' requests, sum ', sum);
+  if not UnixPair(a, b) then
+    Halt(1);
+  wg.Add(1);
+  pas Trickle(b, 300);
+  r := JsonReader(a);
+  Drink(r, n, sum);
+  wg.Wait;
+  OsClose(a);
+  WriteLn('  socket, a plain stream: ', n, ' requests, sum ', sum);
+
+  WriteLn('2000 requests and answers over Unix socket pairs:');
+  answered := 0;
+  total := 0;
+  bad := 0;
+  wg.Add(2 * Conns);
+  for i := 0 to Conns - 1 do
+  begin
+    if not UnixPair(a, b) then
+      Halt(1);
+    pas Server(b);
+    pas Client(a, i * 1000);
+  end;
+  wg.Wait;
+  WriteLn('  ', answered, ' answered, total ', total, ', bad ', bad);
+
+  WriteLn('2000 requests and answers over TCP:');
+  answered := 0;
+  total := 0;
+  l := TcpListen(0);
+  if l < 0 then
+    Halt(1);
+  port := TcpPort(l);
+  wg.Add(1 + 2 * Conns);
+  pas Acceptor(l);
+  for i := 0 to Conns - 1 do
+    pas TcpClient(port, i * 1000);
+  wg.Wait;
+  TcpClose(l);
+  WriteLn('  ', answered, ' answered, total ', total, ', bad ', bad);
+
+  WriteLn('a regular file while every P parses:');
+  path := ParamStr(0) + '.ndjson';
+  cpath := path + #0;
+  fd := OsOpen(Int64(@cpath[1]), OWronly or OCreat or OTrunc or OCloexec, 420);
+  if fd < 0 then
+    Halt(1);
+  w := JsonWriter(fd);
+  w.Buffered := True;
+  for i := 1 to 2000 do
+  begin
+    q.Id := i;
+    q.Name := 'file';
+    SetLength(q.Vals, 2);
+    q.Vals[0] := i;
+    q.Vals[1] := -i;
+    JsonWrite(w, q);
+  end;
+  w.Flush;
+  OsClose(fd);
+  StartHogs;
+  fd := OsOpen(Int64(@cpath[1]), ORdonly or OCloexec, 0);
+  r := JsonReader(fd);
+  r.Lines := True;
+  Drink(r, n, sum);
+  StopHogs;
+  OsClose(fd);
+  if Amd64 = 1 then
+    Syscall(87, @cpath[1])
+  else
+    Syscall(35, -100, @cpath[1], 0);
+  WriteLn('  ', n, ' values, sum ', sum, ', line ', r.Line);
+
+  WriteLn('closed ends:');
+  if not NbPipe(f) then
+    Halt(1);
+  r := JsonReader(f[0]);
+  w := JsonWriter(f[1]);
+  JsonWrite(w, JsonParse('[1]'));
+  if JsonRead(r, j) then
+    WriteLn('  read ', JsonEncode(j));
+  OsClose(f[0]);
+  try
+    JsonWrite(w, JsonParse('[2]'));
+  except
+    on x: EJsonError do
+      WriteLn('  ', KindName[x.Kind], ': ', x.Message);
+  end;
+  OsClose(f[1]);
+  if not NbPipe(f) then
+    Halt(1);
+  cpath := '{"cut": [1, 2';
+  OsWrite(f[1], Int64(@cpath[1]), Length(cpath));
+  OsClose(f[1]);
+  r := JsonReader(f[0]);
+  if not TryJsonRead(r, j, e) and (e <> nil) then
+    WriteLn('  ', KindName[e.Kind], ': ', e.Message);
+  OsClose(f[0]);
+
+  WriteLn('a reader handed through a channel:');
+  handed := MakeChan();
+  if not NbPipe(f) then
+    Halt(1);
+  sum := 0;
+  wg.Add(3);
+  pas Reads(f[1], 25);
+  r := JsonReader(f[0]);
+  r.Lines := True;
+  pas FirstHalf(r);
+  pas SecondHalf;
+  wg.Wait;
+  OsClose(f[0]);
+  WriteLn('  sum ', sum);
+
+  WriteLn('the collector while a reader waits in a value:');
+  if not NbPipe(f) then
+    Halt(1);
+  wg.Add(1);
+  pas HalfAValue(f[1]);
+  r := JsonReader(f[0]);
+  r.Lines := True;
+  if JsonRead(r, j) then
+    WriteLn('  ', JsonEncode(j));
+  wg.Wait;
+  OsClose(f[0]);
+end.
+
+{ This file is part of paslang's tests.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+  paslang is free software under the GNU General Public License,
+  version 3 or (at your option) any later version; see the file
+  COPYING. It comes with ABSOLUTELY NO WARRANTY. }

@@ -5820,8 +5820,9 @@ that hold a noncharacter, as I-JSON says.
 `EJsonError` has the error's `Kind` (`TJsonErrorKind`: `jeSyntax`,
 `jeEncoding`, `jeDuplicate`, `jeDepth`, `jeTooLarge` for a parse,
 `jeMissing`, `jeType`, `jeRange` for a read, `jeUnknown` for a
-decode's member no field takes, below, and `jeTest` for a `JsonPatch`
-test that found another value), its `Offset` (the byte
+decode's member no field takes, below, `jeTest` for a `JsonPatch`
+test that found another value, and `jeIO` for a stream's read or write
+that failed or passed its deadline), its `Offset` (the byte
 from 0), `Line` and `Column` (from 1, the column in bytes), the `Path` of
 the value it is about (a JSON Pointer; for a read, of what was asked),
 its `Reason` and a `Message`:
@@ -6394,6 +6395,178 @@ containers' counts and spans made again; a merge writes its result
 through a builder with a stack of its own, so nothing recurses however
 deep the documents are (`testdata/jsonbuild`, `testdata/jsonmod`, which
 holds RFC 6902's and RFC 7396's examples).
+
+### Streams
+
+A reader takes a stream's values one by one, and a writer writes them,
+as Go's `jsontext.Decoder` and `Encoder` do (1.1.237):
+
+```pascal
+r := JsonReader(fd);          { or JsonReader(text), JsonReader(source) }
+r.Lines := True;              { NDJSON: a value a line }
+while JsonRead(r, rec) do     { rec of any type with a JSON form, or a json }
+  Handle(rec);
+
+w := JsonWriter(fd);          { or JsonWriter, of memory; JsonWriter(sink) }
+JsonWrite(w, rec);            { the value and a line feed, out at once }
+```
+
+| Word | What it does |
+|---|---|
+| `JsonReader(text)`, `JsonReader(fd)`, `JsonReader(source)` | a reader of a string, of a descriptor, or of a routine value `function: string` that gives the next bytes, `''` at the end |
+| `JsonRead(r, x)` | the next value into `x`, a `json` or a variable of any type with a JSON form (decoded as `JsonDecode` decodes); `False` after the last |
+| `TryJsonRead(r, x, err)` | the same, its error in `err` instead of raised: `False` with `err` `nil` at the end |
+| `r.Lines`, `r.Seq` | NDJSON, a value a line; an RFC 7464 sequence, a value after each RS |
+| `r.Ms` | each read's deadline in milliseconds, 0 none: `jeIO` when it passes, and the read can be made again |
+| `r.MaxValue` | the longest value a reader of a descriptor or a source keeps, 64 MiB by default: `jeTooLarge` past it |
+| `r.Options` | the parse's options; `MaxBytes` is the most the whole stream gives |
+| `r.Peek`, `r.Next` | the next token's kind (`jtkEnd`, `jtkNull` … `jtkBeginObject`, `jtkEndArray`), only looked at or read |
+| `r.Token`, `r.AsString`, `r.AsNumber` | the scalar last read, as a `json`, a string (a name too), a number's text |
+| `r.Value`, `r.Skip` | the next value whole, as a document, or read past |
+| `r.Depth`, `r.Offset`, `r.Line`, `r.Column`, `r.Path` | where the reader is: the open containers, the next byte's place, its line and column, the JSON Pointer of the last member or element |
+| `JsonWriter`, `JsonWriter(fd)`, `JsonWriter(sink)` | a writer of memory (`w.Text` takes what it wrote), of a descriptor, or of a routine value `function(const S: string): Boolean` that takes the bytes, `False` to stop |
+| `JsonWrite(w, x)` | `x`, a `json` or a value of any type with a JSON form, written by its type's encoder straight into the writer's buffer: at the top level a value and a line feed, in a sequence (`w.Seq`) RS before it; inside an array the next element, inside an object the value of the name just written |
+| `w.BeginObject`, `w.Name`, `w.Add`, `w.AddNull`, `w.AddNumber`, `w.EndArray`… | a value a token at a time, as `TJsonBuilder`'s words; a name twice in an object, a value with no name, a container closed by the other kind raise `EJsonError` and leave the writer as it was |
+| `w.Buffered`, `w.Flush`, `w.Ms`, `w.Options` | the bytes out at `Flush` or when the buffer is three quarters full, instead of after each value; a deadline for each write; the indent, `EscapeHtml` and `Canonical` of what comes next |
+
+A read that waits parks its routine and leaves the thread to the others,
+as any read of paslang's does; a reader of a regular file reads it
+straight. Memory is what one value needs: the buffer grows only while a
+value does not fit, never past `MaxValue`, and goes back to 64 KiB after
+it. A value is given as soon as its last byte comes, so a request and its
+answer go back and forth over one connection. The parser reads each
+value where it lies, and an error carries its place in the stream: its
+`Offset` from the stream's first byte, its line and column, and the
+pointer inside the value. In NDJSON an error leaves the reader at the
+next line, and in a sequence at the next RS, so one bad line costs that
+line; in a plain stream, or among tokens, the error stays and every read
+raises it again, as Go's `Decoder` keeps its first. A typed read whose
+value does not fit the type raises `jeType` (or `jeRange`, `jeMissing`)
+at the value's place and goes on after it.
+
+A writer flushes after each value at the top level, as Go's `Encoder`
+does, or, `Buffered`, when its 64 KiB are three quarters full and at
+`Flush`: one system call for many small values, as a Go `Encoder` over a
+`bufio.Writer`. A write that fails raises `EJsonError` of kind `jeIO`,
+and what was not written stays; a pipe or a socket whose reader has gone
+is `write: broken pipe`, an error the program handles (1.1.236). Neither
+a reader nor a writer closes its descriptor. Each is one routine's at a
+time, and one that finds another inside it ends the program with
+`paslang: concurrent json reader use` (or `writer`). `testdata/jsonstream`
+reads texts, pipes and a source that gives a byte at a time, NDJSON and
+sequences with their errors, tokens and typed elements, and writes in
+every way; `testdata/jsonpark` reads while 32 routines parse, a byte at
+a time from pipes and sockets, 2000 requests and answers over Unix
+socket pairs and over TCP, a regular file, a reader handed through a
+channel and one parked while the collector runs.
+
+`examples/jsonstream.paslang`, a small NDJSON service:
+
+```pascal
+{ JSON streams: a service that answers requests over a connection, a
+  request and its answer an NDJSON line each. The server reads each
+  request into a record as it comes and writes its answer at once; the
+  client writes a request and reads its answer; both park while they
+  wait. A request that does not fit the record is answered with its
+  error, and the server goes on at the next line. }
+program jsonstream;
+
+uses
+  pasnet;
+
+type
+  TRequest = record
+    Id: Integer json 'id';
+    Op: string json 'op';
+    Args: array of Double json 'args';
+  end;
+
+  TAnswer = record
+    Id: Integer json 'id';
+    Value: Double json 'value' omitzero;
+    Error: string json 'error' omitempty;
+  end;
+
+var
+  done: waitgroup;
+
+procedure Serve(Fd: Integer);
+var
+  r: TJsonReader;
+  w: TJsonWriter;
+  q: TRequest;
+  a: TAnswer;
+  e: EJsonError;
+  i: Integer;
+begin
+  r := JsonReader(Fd);
+  r.Lines := True;
+  w := JsonWriter(Fd);
+  while True do
+  begin
+    q := Default(TRequest);
+    a := Default(TAnswer);
+    if TryJsonRead(r, q, e) then
+    begin
+      a.Id := q.Id;
+      if q.Op = 'sum' then
+        for i := 0 to High(q.Args) do
+          a.Value := a.Value + q.Args[i]
+      else if (q.Op = 'div') and (Length(q.Args) = 2) and (q.Args[1] <> 0) then
+        a.Value := q.Args[0] / q.Args[1]
+      else
+        a.Error := 'cannot ' + q.Op;
+    end
+    else if e <> nil then
+      a.Error := e.Message
+    else
+      Break;
+    JsonWrite(w, a);
+  end;
+  TcpClose(Fd);
+  done.Done;
+end;
+
+var
+  client, server: Integer;
+  r: TJsonReader;
+  w: TJsonWriter;
+  a: TAnswer;
+
+procedure Ask(const Request: string);
+begin
+  JsonWrite(w, JsonParse(Request));
+  if JsonRead(r, a) then
+    WriteLn(Request, ' -> ', JsonEncode(a));
+end;
+
+begin
+  if not UnixPair(client, server) then
+    Halt(1);
+  done.Add(1);
+  pas Serve(server);
+  w := JsonWriter(client);
+  r := JsonReader(client);
+  r.Lines := True;
+  Ask('{"id":1,"op":"sum","args":[1,2,3.5]}');
+  Ask('{"id":2,"op":"div","args":[1,8]}');
+  Ask('{"id":3,"op":"div","args":[1,0]}');
+  Ask('{"id":"four","op":"sum"}');
+  Ask('{"id":5,"op":"sum","args":[]}');
+  TcpClose(client);
+  done.Wait;
+end.
+```
+
+prints
+
+```
+{"id":1,"op":"sum","args":[1,2,3.5]} -> {"id":1,"value":6.5}
+{"id":2,"op":"div","args":[1,8]} -> {"id":2,"value":0.125}
+{"id":3,"op":"div","args":[1,0]} -> {"id":3,"error":"cannot div"}
+{"id":"four","op":"sum"} -> {"id":0,"error":"json: cannot decode \"four\" into Integer at 4:7 (byte 109) within \"/id\""}
+{"id":5,"op":"sum","args":[]} -> {"id":5}
+```
 
 ### Speed
 
@@ -12750,7 +12923,7 @@ its place:
   pastree's `PasTreeNew` … `PasStoreAbandon`, pasjson's JSON words
   (§12) `JsonParse TryJsonParse JsonEncode JsonIndex JsonDefaults
   JsonPretty JsonCanonical`, its types `TJsonKind` (`jkNull` …
-  `jkObject`), `TJsonErrorKind` (`jeSyntax` … `jeTest`), `TJsonOptions`,
+  `jkObject`), `TJsonErrorKind` (`jeSyntax` … `jeIO`), `TJsonOptions`,
   `EJsonError`, `TJsonIter`, `TJsonIndex`, `TJsonHelper`, the
   writer's `TJsonOut`, `TJsonOutLevel`, `TJsonOutMark`, `TJsonOutPair` and
   `TJsonOutPairs` and the reader's `TJsonIn` and `TJsonKeep`, and its
