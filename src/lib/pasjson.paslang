@@ -123,9 +123,10 @@ type
     is longer than MaxBytes (jeTooLarge); a read asked for a member
     that is not there (jeMissing), of a value of another kind (jeType)
     or for an element or a number past its range (jeRange); a decode met
-    a member no field takes with RejectUnknown (jeUnknown, P206). }
+    a member no field takes with RejectUnknown (jeUnknown, P206); a
+    JsonPatch's test found another value (jeTest, P207). }
   TJsonErrorKind = (jeSyntax, jeEncoding, jeDuplicate, jeDepth, jeTooLarge, jeMissing, jeType,
-    jeRange, jeUnknown);
+    jeRange, jeUnknown, jeTest);
 
   { How a parse reads and how JsonEncode writes, one call at a time:
     nothing about JSON is global. JsonDefaults, JsonPretty and
@@ -263,6 +264,59 @@ type
     N: Integer;
     Names, Vals: array of string;
   end;
+
+  { A document being built (P207): its nodes, two words each, and its
+    arena so far, a string's node keeping the place of its characters
+    and a number's the place of its text until Done writes the offsets;
+    the containers open, their counts and whether each holds a
+    container. TJsonBuilder's, and the edits'. }
+  TJsonBuild = record
+    Nd: array of Int64;
+    NN: Int64;
+    Ar: array of Byte;
+    NA: Int64;
+    Open, Cnt: array of Int64;
+    Cont: array of Boolean;
+    Depth: Int64;
+    Named: Boolean;   { in an object: a name given, its value not yet }
+    Roots: Int64;     { values at the top level: one makes a document }
+  end;
+
+  { An item of an array of const as TVarRec lays it out (P124): the
+    kind, then the value's words, a string's two at 8, a Quad at 16.
+    JsonObject and JsonArray give their lists as these (P207). }
+  TJsonVarItem = record
+    VType: Int64;
+    VAnsiString: string;
+    VPad: Int64;
+  end;
+
+  { A document written value by value (P207): BeginObject, Name, Add,
+    EndObject... Done, which reserves it once at its size and starts the
+    builder again. One routine at a time: a call that finds another in
+    the same builder ends the program, as a map written by two does. }
+  TJsonBuilder = class(TObject)
+  private
+    FB: TJsonBuild;
+    FBusy: Integer;
+    procedure Enter;
+    procedure Leave;
+  public
+    constructor Create;
+    procedure BeginObject;
+    procedure BeginArray;
+    procedure EndObject;
+    procedure EndArray;
+    procedure Name(const S: string);
+    procedure Add(const S: string); overload;
+    procedure Add(V: Integer); overload;
+    procedure Add(V: Double); overload;
+    procedure Add(V: Boolean); overload;
+    procedure Add(V: json); overload;
+    procedure AddNull;
+    procedure AddNumber(const Text: string);
+    function Done: json;
+  end;
 {$endif}
 
 
@@ -290,6 +344,23 @@ function TryJsonParse(const S: string; out J: json; out Err: EJsonError;
   const Opts: TJsonOptions): Boolean; overload;
 function JsonEncode(J: json): string; overload;
 function JsonEncode(J: json; const Opts: TJsonOptions): string; overload;
+
+{ New documents from old ones (P207), the old ones unchanged: the value
+  at an RFC 6901 pointer set (an object's member added when it has
+  none, an array's element replaced, "-" appending) or removed; RFC
+  6902's operations and RFC 7396's merge; a value as a document of its
+  own, which keeps the one it came from alive no longer. }
+function JsonClone(J: json): json;
+function JsonSet(J: json; const Path: string; V: json): json; overload;
+function JsonSet(J: json; const Path: string; const V: string): json; overload;
+function JsonSet(J: json; const Path: string; V: Integer): json; overload;
+function JsonSet(J: json; const Path: string; V: Double): json; overload;
+function JsonSet(J: json; const Path: string; V: Boolean): json; overload;
+function JsonRemove(J: json; const Path: string): json;
+function JsonPatch(J, Patch: json): json;
+function JsonMergePatch(J, Patch: json): json;
+{ JsonObject([...]) and JsonArray([...]): the list the compiler builds }
+function PasJsonOfConsts(const A: array of TJsonVarItem; Obj: Boolean): json;
 
 { The words the compiler writes for j['k'], j[i], 'k' in j, TryGet,
   Length, =, Write and for ... in (P203). }
@@ -6475,15 +6546,18 @@ end;
 { A Quad: its shortest digits (PasQuadDigits, P103), written as
   ECMAScript writes a Number (7.1.12.1): plain from 10^-6 to 10^21,
   with an exponent past them. }
-procedure PasJsonOutQuad(var W: TJsonOut; V: Quad; Quoted: Boolean);
+{ A Quad's JSON text, its digits exact as PasQuadDigits gives them; ''
+  for NaN and the infinities, which have none (P207: the builder's too). }
+function QuadJsonText(V: Quad): string;
 var
   w2: array[0..1] of Int64;
   digs, t: string;
   dp, k, nd: Integer;
 begin
+  Result := '';
   Move(V, w2, 16);
   if ((w2[1] shr 48) and $7FFF) = $7FFF then
-    PasJsonOutFail(W, jeRange, 'a Quad that is NaN or infinite has no JSON form');
+    Exit;
   digs := PasQuadDigits(w2[0], w2[1], 0, 0, dp);
   t := '';
   if w2[1] < 0 then
@@ -6516,6 +6590,16 @@ begin
     else
       t := t + 'e' + IntText(dp - 1);
   end;
+  Result := t;
+end;
+
+procedure PasJsonOutQuad(var W: TJsonOut; V: Quad; Quoted: Boolean);
+var
+  t: string;
+begin
+  t := QuadJsonText(V);
+  if t = '' then
+    PasJsonOutFail(W, jeRange, 'a Quad that is NaN or infinite has no JSON form');
   if Quoted then
     OutB(W, 34);
   PasJsonOutRaw(W, t);
@@ -6524,8 +6608,8 @@ begin
 end;
 
 { A Currency exactly: its integer and its four places, the trailing
-  zeros of the places left out. }
-procedure PasJsonOutCur(var W: TJsonOut; V: Currency; Quoted: Boolean);
+  zeros of the places left out (P207: the builder's text too). }
+function CurJsonText(V: Currency): string;
 var
   u, ip, fp: Int64;
   t: string;
@@ -6535,18 +6619,13 @@ begin
   t := '';
   if u < 0 then
   begin
-    t := '-';
     { the smallest Int64 has no positive: its places are 5808 }
     if u = Low(Int64) then
     begin
-      t := '-922337203685477.5808';
-      if Quoted then
-        OutB(W, 34);
-      PasJsonOutRaw(W, t);
-      if Quoted then
-        OutB(W, 34);
+      Result := '-922337203685477.5808';
       Exit;
     end;
+    t := '-';
     u := -u;
   end;
   ip := u div 10000;
@@ -6561,6 +6640,14 @@ begin
       k := k - 1;
     SetLength(t, k);
   end;
+  Result := t;
+end;
+
+procedure PasJsonOutCur(var W: TJsonOut; V: Currency; Quoted: Boolean);
+var
+  t: string;
+begin
+  t := CurJsonText(V);
   if Quoted then
     OutB(W, 34);
   PasJsonOutRaw(W, t);
@@ -9216,6 +9303,1202 @@ begin
     Result := True
   else if PasStrView(p, n) <> 'false' then
     KeyFail(R, jeType, T, '');
+end;
+
+{ ---- Building and transforming (P207) ---- }
+
+{ The build: a document made value by value (TJsonBuilder, JsonObject,
+  JsonArray, the edits). Its nodes and its arena grow in B as they come,
+  a string's node keeping the place of its characters in the arena and
+  a number's the place of its text, until Done reserves the document
+  once at its size and writes every node's offset there, as a parse
+  does. The containers open are a stack, no recursion. }
+
+procedure BReset(var B: TJsonBuild);
+begin
+  B.NN := 0;
+  B.NA := 0;
+  B.Depth := 0;
+  B.Named := False;
+  B.Roots := 0;
+end;
+
+{ Room for K more nodes and N more bytes of arena, doubling. }
+procedure BRoom(var B: TJsonBuild; K, N: Int64);
+var
+  c: Int64;
+begin
+  if (B.NN + K) * 2 > Length(B.Nd) then
+  begin
+    c := Length(B.Nd) * 2;
+    if c < 64 then
+      c := 64;
+    while c < (B.NN + K) * 2 do
+      c := c * 2;
+    SetLength(B.Nd, c);
+  end;
+  if B.NA + N > Length(B.Ar) then
+  begin
+    c := Length(B.Ar) * 2;
+    if c < 256 then
+      c := 256;
+    while c < B.NA + N do
+      c := c * 2;
+    SetLength(B.Ar, c);
+  end;
+end;
+
+procedure BFail(const Reason: string);
+begin
+  raise EJsonError.Create(jeSyntax, -1, 0, 0, '', '', 'json builder: ' + Reason);
+end;
+
+{ A value comes: at the top level the first and only one, in an array
+  one more element, in an object the value of the name just given. }
+procedure BValue(var B: TJsonBuild; Container: Boolean);
+var
+  d: Int64;
+begin
+  if B.Depth = 0 then
+  begin
+    if B.Roots > 0 then
+      BFail('a second value at the top level');
+    B.Roots := 1;
+    Exit;
+  end;
+  d := B.Depth - 1;
+  if (B.Nd[B.Open[d] * 2] and 7) = JtObj then
+  begin
+    if not B.Named then
+      BFail('a member''s value comes after its name');
+    B.Named := False;
+  end;
+  B.Cnt[d] := B.Cnt[d] + 1;
+  if Container then
+    B.Cont[d] := True;
+end;
+
+{ A node of W0 and W1 at the end. }
+procedure BNode(var B: TJsonBuild; W0, W1: Int64);
+begin
+  B.Nd[B.NN * 2] := W0;
+  B.Nd[B.NN * 2 + 1] := W1;
+  B.NN := B.NN + 1;
+end;
+
+{ A string's node and its characters, 01h before them: a name or a
+  value. The characters are UTF-8 without noncharacters (I-JSON,
+  RFC 7493 2.1), as a parse takes them. }
+procedure BStrNode(var B: TJsonBuild; P: PByte; N: Int64);
+var
+  w: Int64;
+begin
+  if PasUtf8Valid(P, N, True) >= 0 then
+    BFail('a string that is not UTF-8 without noncharacters');
+  BRoom(B, 1, N + 1);
+  w := JtStr or (N shl 8);
+  if PasJsonEscIndex(P, N, False) < 0 then
+    w := w or JfNoEsc;
+  B.Ar[B.NA] := 1;
+  if N > 0 then
+    Move(P^, B.Ar[B.NA + 1], N);
+  BNode(B, w, B.NA + 1);
+  B.NA := B.NA + 1 + N;
+end;
+
+procedure BStr(var B: TJsonBuild; const S: string);
+begin
+  BValue(B, False);
+  BStrNode(B, PByte(Pointer(S)), Length(S));
+end;
+
+procedure BName(var B: TJsonBuild; const S: string);
+begin
+  if (B.Depth = 0) or ((B.Nd[B.Open[B.Depth - 1] * 2] and 7) <> JtObj) then
+    BFail('a name goes in an object');
+  if B.Named then
+    BFail('a name after a name: its value first');
+  BStrNode(B, PByte(Pointer(S)), Length(S));
+  B.Named := True;
+end;
+
+{ A number of the N bytes of text at P, which are one JSON number,
+  whole: its value as a parse takes it (NumNode), so the document is
+  the one JsonParse makes of its text. }
+procedure BNumText(var B: TJsonBuild; P: PByte; N: Int64);
+var
+  sc: TPasNumScan;
+  v, sub: Int64;
+begin
+  if not WholeNumber(P, N, sc) then
+    BFail('"' + BytesStr(P, N) + '" is no JSON number');
+  BValue(B, False);
+  if sc.IntLit and PasNumI64(P, sc, v) then
+    sub := JnInt or JnIntLit
+  else if sc.IntLit and PasNumU64(P, sc, v) then
+    sub := JnUint or JnIntLit
+  else
+  begin
+    if PasNumF64(P, sc, v) then
+      sub := JnFloat
+    else
+      sub := JnHuge;
+    if sc.IntLit then
+      sub := sub or JnIntLit;
+  end;
+  BRoom(B, 1, 9 + N);
+  PInt64(@B.Ar[B.NA])^ := N;
+  B.Ar[B.NA + 8] := 1;
+  Move(P^, B.Ar[B.NA + 9], N);
+  BNode(B, JtNum or sub or (B.NA shl 8), v);
+  B.NA := B.NA + 9 + N;
+end;
+
+procedure BInt(var B: TJsonBuild; V: Int64);
+var
+  t: string;
+begin
+  t := IntText(V);
+  BNumText(B, PByte(Pointer(t)), Length(t));
+end;
+
+{ A Double, as its shortest text (Go's jsonwire.AppendFloat): NaN and
+  the infinities have no JSON form, as Go's encoder refuses them. }
+procedure BF64(var B: TJsonBuild; D: Double);
+var
+  bits, n: Int64;
+  buf: array[0..PasNumTextMax - 1] of Byte;
+begin
+  bits := D as Int64;
+  if (bits and $7FF0000000000000) = $7FF0000000000000 then
+    BFail('a NaN or an infinity has no JSON form');
+  n := PasNumAppendF64(@buf[0], bits);
+  BNumText(B, @buf[0], n);
+end;
+
+procedure BLit(var B: TJsonBuild; Kind: Int64);
+begin
+  BValue(B, False);
+  BRoom(B, 1, 0);
+  BNode(B, Kind, 0);
+end;
+
+procedure BOpen(var B: TJsonBuild; Obj: Boolean);
+var
+  n: Int64;
+begin
+  BValue(B, True);
+  BRoom(B, 1, 0);
+  n := Length(B.Open);
+  if B.Depth >= n then
+  begin
+    if n < 8 then
+      n := 8
+    else
+      n := n * 2;
+    SetLength(B.Open, n);
+    SetLength(B.Cnt, n);
+    SetLength(B.Cont, n);
+  end;
+  B.Open[B.Depth] := B.NN;
+  B.Cnt[B.Depth] := 0;
+  B.Cont[B.Depth] := False;
+  B.Depth := B.Depth + 1;
+  if Obj then
+    BNode(B, JtObj, 0)
+  else
+    BNode(B, JtArr, 0);
+end;
+
+{ The names of the object at node K, each against the others: two of
+  one name are an error, as a parse finds them (Go's v2 encoder refuses
+  a duplicate name too); one by one up to JsonLinear, then sorted. }
+procedure BTwins(var B: TJsonBuild; K, Members: Int64);
+var
+  names: array of string;
+  i, j, at: Int64;
+  t: string;
+begin
+  names := nil;
+  SetLength(names, Members);
+  at := K + 1;
+  for i := 0 to Members - 1 do
+  begin
+    names[i] := BytesStr(@B.Ar[B.Nd[at * 2 + 1]], B.Nd[at * 2] shr 8);
+    { past the name and the value, its span when a container }
+    at := at + 1;
+    if (B.Nd[at * 2] and 7) >= JtArr then
+      at := at + B.Nd[at * 2 + 1]
+    else
+      at := at + 1;
+  end;
+  if Members <= JsonLinear then
+  begin
+    for i := 1 to Members - 1 do
+      for j := 0 to i - 1 do
+        if names[i] = names[j] then
+          BFail('duplicate object member name ' + GoQuoteStr(names[i]));
+    Exit;
+  end;
+  { insertion by halves would do as well; a shell sort keeps it short }
+  j := Members div 2;
+  while j > 0 do
+  begin
+    for i := j to Members - 1 do
+    begin
+      t := names[i];
+      at := i;
+      while (at >= j) and (names[at - j] > t) do
+      begin
+        names[at] := names[at - j];
+        at := at - j;
+      end;
+      names[at] := t;
+    end;
+    j := j div 2;
+  end;
+  for i := 1 to Members - 1 do
+    if names[i] = names[i - 1] then
+      BFail('duplicate object member name ' + GoQuoteStr(names[i]));
+end;
+
+procedure BClose(var B: TJsonBuild; Obj: Boolean);
+var
+  k, d, w: Int64;
+begin
+  if B.Depth = 0 then
+  begin
+    if Obj then
+      BFail('EndObject with no object open')
+    else
+      BFail('EndArray with no array open');
+  end;
+  d := B.Depth - 1;
+  k := B.Open[d];
+  if ((B.Nd[k * 2] and 7) = JtObj) <> Obj then
+  begin
+    if Obj then
+      BFail('EndObject where an array is open')
+    else
+      BFail('EndArray where an object is open');
+  end;
+  if Obj and B.Named then
+    BFail('a name with no value at the object''s end');
+  if Obj then
+    BTwins(B, k, B.Cnt[d]);
+  w := (B.Nd[k * 2] and 7) or (B.Cnt[d] shl 8);
+  if not B.Cont[d] then
+    w := w or JfFlat;
+  B.Nd[k * 2] := w;
+  B.Nd[k * 2 + 1] := B.NN - k;
+  B.Depth := d;
+end;
+
+{ J's value whole, copied: its nodes as they are, its strings' and
+  numbers' bytes into the arena. }
+procedure BJson(var B: TJsonBuild; J: PJNode);
+var
+  span, i, n: Int64;
+  s: PJNode;
+  t: PByte;
+begin
+  if J = nil then
+  begin
+    BLit(B, JtNull);
+    Exit;
+  end;
+  BValue(B, (J^.W0 and 7) >= JtArr);
+  span := NodeSpan(J);
+  n := 0;
+  for i := 0 to span - 1 do
+    n := n + ArenaOf(NodeAdd(J, i));
+  BRoom(B, span, n);
+  for i := 0 to span - 1 do
+  begin
+    s := NodeAdd(J, i);
+    case s^.W0 and 7 of
+      JtStr:
+        begin
+          n := StrLen(s);
+          B.Ar[B.NA] := 1;
+          if n > 0 then
+            Move(StrBytes(s)^, B.Ar[B.NA + 1], n);
+          BNode(B, s^.W0, B.NA + 1);
+          B.NA := B.NA + 1 + n;
+        end;
+      JtNum:
+        begin
+          t := NumText(s);
+          n := 9 + PInt64(t)^;
+          Move(t^, B.Ar[B.NA], n);
+          BNode(B, (s^.W0 and 255) or (B.NA shl 8), s^.W1);
+          B.NA := B.NA + n;
+        end;
+    else
+      BNode(B, s^.W0, s^.W1);
+    end;
+  end;
+end;
+
+{ Nodes From to From+K-1 of B at Dst of the document D, its arena from
+  A on: each string's and number's bytes after the last, its offset from
+  its node made there; the arena's next byte. }
+function BCopyOut(var B: TJsonBuild; D: PByte; Dst, From, K, A: Int64): Int64;
+var
+  i, off, w0, w1, n: Int64;
+  dn: PJNode;
+begin
+  for i := 0 to K - 1 do
+  begin
+    w0 := B.Nd[(From + i) * 2];
+    w1 := B.Nd[(From + i) * 2 + 1];
+    off := JsonHead + (Dst + i) * 16;
+    dn := PJNode(@D[off]);
+    case w0 and 7 of
+      JtStr:
+        begin
+          n := w0 shr 8;
+          D[A] := 1;
+          if n > 0 then
+            Move(B.Ar[w1], D[A + 1], n);
+          dn^.W0 := w0;
+          dn^.W1 := (A + 1) - off;
+          A := A + 1 + n;
+        end;
+      JtNum:
+        begin
+          n := 9 + PInt64(@B.Ar[w0 shr 8])^;
+          Move(B.Ar[w0 shr 8], D[A], n);
+          dn^.W0 := (w0 and 255) or ((A - off) shl 8);
+          dn^.W1 := w1;
+          A := A + n;
+        end;
+    else
+      begin
+        dn^.W0 := w0;
+        dn^.W1 := w1;
+      end;
+    end;
+  end;
+  Result := A;
+end;
+
+{ The document B holds: one value, every container closed; the block
+  reserved once at its size. B is empty after it. }
+function BDone(var B: TJsonBuild): json;
+var
+  d: PByte;
+begin
+  if B.Depth > 0 then
+    BFail('Done with a container open');
+  if B.Roots = 0 then
+    BFail('Done before any value');
+  d := NewDoc(B.NN, B.NA);
+  BCopyOut(B, d, 0, 0, B.NN, JsonHead + B.NN * 16);
+  BReset(B);
+  Result := JsonOfN(PJNode(@d[JsonHead]));
+end;
+
+{ ---- The edits: a new document, the old one unchanged (P207) ---- }
+
+type
+  TJStrs = array of string;
+  TJPlaces = array of Int64;
+
+{ The tokens of the JSON Pointer P (RFC 6901 3), ~1 and ~0 read as / and
+  ~; False when P is no pointer. '' has none. }
+function PtrTokens(const P: string; out T: TJStrs): Boolean;
+var
+  i, n, k: Int64;
+  tok: string;
+begin
+  T := nil;
+  Result := True;
+  n := Length(P);
+  if n = 0 then
+    Exit;
+  if P[1] <> '/' then
+  begin
+    Result := False;
+    Exit;
+  end;
+  i := 2;
+  tok := '';
+  while True do
+  begin
+    if (i > n) or (P[i] = '/') then
+    begin
+      k := Length(T);
+      SetLength(T, k + 1);
+      T[k] := tok;
+      tok := '';
+      if i > n then
+        Break;
+      i := i + 1;
+    end
+    else if P[i] = '~' then
+    begin
+      if (i < n) and (P[i + 1] = '0') then
+        tok := tok + '~'
+      else if (i < n) and (P[i + 1] = '1') then
+        tok := tok + '/'
+      else
+      begin
+        Result := False;
+        Exit;
+      end;
+      i := i + 2;
+    end
+    else
+    begin
+      tok := tok + P[i];
+      i := i + 1;
+    end;
+  end;
+end;
+
+{ An array's index token (RFC 6901 4): 0 or digits with no leading 0;
+  -1 for any other, -2 for "-", the place past the last element. }
+function PtrIndex(const T: string): Int64;
+var
+  k: Int64;
+begin
+  if T = '-' then
+  begin
+    Result := -2;
+    Exit;
+  end;
+  Result := -1;
+  if (Length(T) = 0) or (Length(T) > 18) or ((Length(T) > 1) and (T[1] = '0')) then
+    Exit;
+  Result := 0;
+  for k := 1 to Length(T) do
+    if (T[k] >= '0') and (T[k] <= '9') then
+      Result := Result * 10 + (Ord(T[k]) - 48)
+    else
+    begin
+      Result := -1;
+      Exit;
+    end;
+end;
+
+{ The place of node N from node J, in nodes. }
+function PlaceOf(J, N: PJNode): Int64;
+begin
+  Result := (Integer(N) - Integer(J)) div 16;
+end;
+
+procedure PtrFail(J: PJNode; const P: string; Bad: Integer);
+var
+  w: string;
+begin
+  w := NodePath(J);
+  if Bad = 1 then
+    raise EJsonError.Create(jeSyntax, -1, 0, 0, w + P, w, 'invalid JSON Pointer "' + P + '"')
+  else
+    raise EJsonError.Create(jeMissing, -1, 0, 0, w + P, w, 'no value at "' + P + '"');
+end;
+
+{ The container the last token of T names a member or an element of,
+  from J: its place in Chain's last, the containers above it before;
+  nil when a token before the last names nothing or a scalar. }
+function PtrParent(J: PJNode; const T: TJStrs; out Chain: TJPlaces): PJNode;
+var
+  i, idx: Int64;
+  cur: PJNode;
+begin
+  Chain := nil;
+  SetLength(Chain, Length(T));
+  cur := J;
+  for i := 0 to High(T) do
+  begin
+    if (cur = nil) or ((cur^.W0 and 7) < JtArr) then
+    begin
+      Result := nil;
+      Exit;
+    end;
+    Chain[i] := PlaceOf(J, cur);
+    if i = High(T) then
+      Break;
+    if (cur^.W0 and 7) = JtObj then
+      cur := FindMember(cur, T[i])
+    else
+    begin
+      idx := PtrIndex(T[i]);
+      if (idx >= 0) and (idx < cur^.W0 shr 8) then
+        cur := ItemOf(cur, idx)
+      else
+        cur := nil;
+    end;
+  end;
+  Result := cur;
+end;
+
+{ The document of J's value with its nodes At to At+Del-1 taken out and
+  Ins's nodes put there, one copy of each run (CopyRun, BCopyOut): the
+  containers at Chain (places from J) spans of Ins's nodes less Del
+  longer, the last of them Count more members or elements, and no
+  longer flat (JfFlat) when Cont says a container goes in. }
+function Splice(J: PJNode; At, Del: Int64; var Ins: TJsonBuild; const Chain: TJPlaces;
+  Count: Int64; Cont: Boolean): json;
+var
+  span, arena, i, a, total, delta: Int64;
+  d: PByte;
+  nd: PJNode;
+begin
+  span := NodeSpan(J);
+  delta := Ins.NN - Del;
+  total := span + delta;
+  arena := Ins.NA;
+  for i := 0 to At - 1 do
+    arena := arena + ArenaOf(NodeAdd(J, i));
+  for i := At + Del to span - 1 do
+    arena := arena + ArenaOf(NodeAdd(J, i));
+  d := NewDoc(total, arena);
+  a := JsonHead + total * 16;
+  a := CopyRun(d, 0, J, At, a);
+  a := BCopyOut(Ins, d, At, 0, Ins.NN, a);
+  a := CopyRun(d, At + Ins.NN, NodeAdd(J, At + Del), span - At - Del, a);
+  for i := 0 to High(Chain) do
+  begin
+    nd := PJNode(@d[JsonHead + Chain[i] * 16]);
+    nd^.W1 := nd^.W1 + delta;
+    if i = High(Chain) then
+    begin
+      nd^.W0 := nd^.W0 + (Count shl 8);
+      if Cont then
+        nd^.W0 := nd^.W0 and not Int64(JfFlat);
+    end;
+  end;
+  Result := JsonOfN(PJNode(@d[JsonHead]));
+end;
+
+const
+  { how an edit puts its value: JsonSet's set, JsonPatch's add and
+    replace }
+  EdSet = 0;
+  EdAdd = 1;
+  EdReplace = 2;
+
+{ J with the value at P made V (Mode EdSet, EdAdd or EdReplace) or taken
+  out (Remove): an object's member replaced, or added at its end when
+  it has none and the mode adds; an array's element replaced (EdSet,
+  EdReplace) or V put before it (EdAdd), "-" or the length the place
+  past the last, where EdSet and EdAdd append. The containers above
+  must be there. }
+function EditAt(J: PJNode; const P: string; V: PJNode; Mode: Integer; Remove: Boolean): json;
+var
+  t: TJStrs;
+  chain: TJPlaces;
+  par, tgt: PJNode;
+  last: string;
+  idx, n, at, del, cnt: Int64;
+  ins: TJsonBuild;
+  cont: Boolean;
+begin
+  if not PtrTokens(P, t) then
+    PtrFail(J, P, 1);
+  if Length(t) = 0 then
+  begin
+    { the whole value }
+    if Remove then
+      raise EJsonError.Create(jeMissing, -1, 0, 0, NodePath(J), NodePath(J),
+        'the root is no member or element to remove');
+    Result := JsonCopy(V);
+    Exit;
+  end;
+  par := PtrParent(J, t, chain);
+  if par = nil then
+    PtrFail(J, P, 2);
+  last := t[High(t)];
+  ins := Default(TJsonBuild);
+  BReset(ins);
+  cont := (V <> nil) and ((V^.W0 and 7) >= JtArr);
+  n := par^.W0 shr 8;
+  if (par^.W0 and 7) = JtObj then
+  begin
+    tgt := FindMember(par, last);
+    if Remove then
+    begin
+      if tgt = nil then
+        PtrFail(J, P, 2);
+      Result := Splice(J, PlaceOf(J, tgt) - 1, 1 + NodeSpan(tgt), ins, chain, -1, False);
+      Exit;
+    end;
+    if tgt <> nil then
+    begin
+      BJson(ins, V);
+      Result := Splice(J, PlaceOf(J, tgt), NodeSpan(tgt), ins, chain, 0, cont);
+      Exit;
+    end;
+    if Mode = EdReplace then
+      PtrFail(J, P, 2);
+    BStrNode(ins, PByte(Pointer(last)), Length(last));
+    BJson(ins, V);
+    Result := Splice(J, PlaceOf(J, par) + NodeSpan(par), 0, ins, chain, 1, cont);
+    Exit;
+  end;
+  idx := PtrIndex(last);
+  if idx = -2 then
+    idx := n;
+  if (idx < 0) or (idx > n) or ((idx = n) and (Remove or (Mode = EdReplace))) then
+    PtrFail(J, P, 2);
+  if idx = n then
+  begin
+    BJson(ins, V);
+    Result := Splice(J, PlaceOf(J, par) + NodeSpan(par), 0, ins, chain, 1, cont);
+    Exit;
+  end;
+  tgt := ItemOf(par, idx);
+  at := PlaceOf(J, tgt);
+  if Remove then
+  begin
+    Result := Splice(J, at, NodeSpan(tgt), ins, chain, -1, False);
+    Exit;
+  end;
+  BJson(ins, V);
+  if Mode = EdAdd then
+  begin
+    del := 0;
+    cnt := 1;
+  end
+  else
+  begin
+    del := NodeSpan(tgt);
+    cnt := 0;
+  end;
+  Result := Splice(J, at, del, ins, chain, cnt, cont);
+end;
+
+{ J's value as a document of its own (P207): a subtree copied keeps its
+  document alive no longer, as Go's v2 copies a jsontext.Value. }
+function JsonClone(J: json): json;
+begin
+  Result := JsonCopy(NodeOfJ(J));
+end;
+
+function JsonSet(J: json; const Path: string; V: json): json;
+begin
+  Result := EditAt(NodeOfJ(J), Path, NodeOfJ(V), EdSet, False);
+end;
+
+{ A scalar for JsonSet: its own small document. }
+function ScalarDoc(Kind: Integer; const S: string; I: Int64; D: Double): json;
+var
+  b: TJsonBuild;
+begin
+  b := Default(TJsonBuild);
+  BReset(b);
+  case Kind of
+    0: BStr(b, S);
+    1: BInt(b, I);
+    2: BF64(b, D);
+    3: BLit(b, JtFalse + Ord(I <> 0));
+  end;
+  Result := BDone(b);
+end;
+
+function JsonSet(J: json; const Path: string; const V: string): json;
+begin
+  Result := JsonSet(J, Path, ScalarDoc(0, V, 0, 0));
+end;
+
+function JsonSet(J: json; const Path: string; V: Integer): json;
+begin
+  Result := JsonSet(J, Path, ScalarDoc(1, '', V, 0));
+end;
+
+function JsonSet(J: json; const Path: string; V: Double): json;
+begin
+  Result := JsonSet(J, Path, ScalarDoc(2, '', 0, V));
+end;
+
+function JsonSet(J: json; const Path: string; V: Boolean): json;
+begin
+  Result := JsonSet(J, Path, ScalarDoc(3, '', Ord(V), 0));
+end;
+
+function JsonRemove(J: json; const Path: string): json;
+begin
+  Result := EditAt(NodeOfJ(J), Path, nil, EdSet, True);
+end;
+
+{ ---- JSON Patch (RFC 6902) ---- }
+
+procedure OpFail(K: TJsonErrorKind; const Reason: string);
+begin
+  raise EJsonError.Create(K, -1, 0, 0, '', '', Reason);
+end;
+
+{ The string member K of operation Op. }
+function OpStr(Op: PJNode; const K: string): string;
+var
+  m: PJNode;
+begin
+  m := FindMember(Op, K);
+  if (m = nil) or ((m^.W0 and 7) <> JtStr) then
+    OpFail(jeSyntax, 'no string "' + K + '"');
+  Result := BytesStr(StrBytes(m), StrLen(m));
+end;
+
+{ The value at P of J, which an operation needs there. }
+function OpAt(J: PJNode; const P: string): PJNode;
+var
+  bad: Integer;
+begin
+  Result := PtrFind(J, P, bad);
+  if bad = 1 then
+    OpFail(jeSyntax, 'invalid JSON Pointer "' + P + '"');
+  if bad <> 0 then
+    OpFail(jeMissing, 'no value at "' + P + '"');
+end;
+
+{ Cur with operation Op done (RFC 6902 4): add, remove, replace, move,
+  copy or test; a new document, or Cur when the operation changes
+  nothing. }
+function PatchOp(Cur: json; Op: PJNode): json;
+var
+  v, m: PJNode;
+  kind, path, from: string;
+begin
+  Result := Cur;
+  if (Op^.W0 and 7) <> JtObj then
+    OpFail(jeSyntax, 'an operation is an object');
+  kind := OpStr(Op, 'op');
+  path := OpStr(Op, 'path');
+  if (kind = 'add') or (kind = 'replace') or (kind = 'test') then
+  begin
+    { "value": null is a value, a null node; no member is none }
+    v := FindMember(Op, 'value');
+    if v = nil then
+      OpFail(jeSyntax, 'no "value"');
+    if kind = 'test' then
+    begin
+      if not PasJsonEqual(JsonOfN(OpAt(NodeOfJ(Cur), path)), JsonOfN(v)) then
+        OpFail(jeTest, 'the value at "' + path + '" is another');
+    end
+    else if kind = 'add' then
+      Result := EditAt(NodeOfJ(Cur), path, v, EdAdd, False)
+    else
+    begin
+      m := OpAt(NodeOfJ(Cur), path);
+      Result := EditAt(NodeOfJ(Cur), path, v, EdReplace, False);
+    end;
+  end
+  else if kind = 'remove' then
+  begin
+    m := OpAt(NodeOfJ(Cur), path);
+    Result := EditAt(NodeOfJ(Cur), path, nil, EdSet, True);
+  end
+  else if (kind = 'move') or (kind = 'copy') then
+  begin
+    from := OpStr(Op, 'from');
+    v := OpAt(NodeOfJ(Cur), from);
+    if kind = 'copy' then
+      Result := EditAt(NodeOfJ(Cur), path, v, EdAdd, False)
+    else
+    begin
+      { a value goes into no place inside itself (4.4) }
+      if (path <> from) and (Copy(path, 1, Length(from) + 1) = from + '/') then
+        OpFail(jeSyntax, '"from" "' + from + '" is above "path" "' + path + '"');
+      { the same place is the value where it was; else the value stays
+        alive in the document before, which v points into, while the
+        remove makes a new one }
+      if path <> from then
+        Result := EditAt(NodeOfJ(EditAt(NodeOfJ(Cur), from, nil, EdSet, True)), path, v, EdAdd,
+          False);
+    end;
+  end
+  else
+    OpFail(jeSyntax, 'no operation "' + kind + '"');
+end;
+
+{ J with the operations of Patch done in turn (RFC 6902 4); each makes
+  a new document, and one that fails raises EJsonError with its place
+  in Patch, J unchanged as any json is. }
+function JsonPatch(J, Patch: json): json;
+var
+  pa: PJNode;
+  i, n: Int64;
+  cur: json;
+begin
+  pa := NodeOfJ(Patch);
+  if (pa = nil) or ((pa^.W0 and 7) <> JtArr) then
+    raise EJsonError.Create(jeType, -1, 0, 0, '', '', 'json patch: a patch is an array of operations');
+  cur := J;
+  n := pa^.W0 shr 8;
+  for i := 0 to n - 1 do
+    try
+      cur := PatchOp(cur, ItemOf(pa, i));
+    except
+      on E: EJsonError do
+        raise EJsonError.Create(E.Kind, -1, 0, 0, '/' + IntText(i), '/' + IntText(i),
+          'json patch: operation ' + IntText(i) + ': ' + E.Reason);
+    end;
+  Result := cur;
+end;
+
+{ ---- JSON Merge Patch (RFC 7396) ---- }
+
+type
+  { an object of the merge being written: the target's members (nil for
+    none), the patch's, and where each walk is }
+  TJMerge = record
+    T, P: PJNode;
+    Phase: Integer;   { 0 the target's members, 1 the patch's that are new }
+    Cur: PJNode;      { the next member's name }
+    Left: Int64;
+  end;
+
+{ RFC 7396 2: a patch that is no object is the value; one that is
+  merges member by member into the target as an object, a null taking
+  the member out, an object merging into the member's value, anything
+  else replacing it. An explicit stack of the objects being written,
+  no recursion, so a patch nested 10000 deep needs no stack. }
+function JsonMergePatch(J, Patch: json): json;
+var
+  b: TJsonBuild;
+  st: array of TJMerge;
+  d: Int64;
+  p, t, nm, pv, tv: PJNode;
+  name: string;
+
+  procedure Nest(Tg, Pt: PJNode);
+  begin
+    if d >= Length(st) then
+      SetLength(st, Length(st) * 2 + 8);
+    st[d].T := Tg;
+    st[d].P := Pt;
+    if Tg <> nil then
+    begin
+      st[d].Phase := 0;
+      st[d].Cur := NodeAdd(Tg, 1);
+      st[d].Left := Tg^.W0 shr 8;
+    end
+    else
+    begin
+      st[d].Phase := 1;
+      st[d].Cur := NodeAdd(Pt, 1);
+      st[d].Left := Pt^.W0 shr 8;
+    end;
+    d := d + 1;
+    BOpen(b, True);
+  end;
+
+begin
+  p := NodeOfJ(Patch);
+  if (p = nil) or ((p^.W0 and 7) <> JtObj) then
+  begin
+    Result := JsonCopy(p);
+    Exit;
+  end;
+  b := Default(TJsonBuild);
+  BReset(b);
+  st := nil;
+  d := 0;
+  t := NodeOfJ(J);
+  if (t <> nil) and ((t^.W0 and 7) <> JtObj) then
+    t := nil;
+  Nest(t, p);
+  while d > 0 do
+  begin
+    if st[d - 1].Left = 0 then
+    begin
+      if st[d - 1].Phase = 0 then
+      begin
+        st[d - 1].Phase := 1;
+        st[d - 1].Cur := NodeAdd(st[d - 1].P, 1);
+        st[d - 1].Left := st[d - 1].P^.W0 shr 8;
+        Continue;
+      end;
+      BClose(b, True);
+      d := d - 1;
+      Continue;
+    end;
+    nm := st[d - 1].Cur;
+    tv := NodeAdd(nm, 1);
+    st[d - 1].Cur := NodeAdd(tv, NodeSpan(tv));
+    st[d - 1].Left := st[d - 1].Left - 1;
+    name := BytesStr(StrBytes(nm), StrLen(nm));
+    if st[d - 1].Phase = 0 then
+    begin
+      { a member of the target: the patch's of its name, if any }
+      pv := FindMember(st[d - 1].P, name);
+      if pv = nil then
+      begin
+        BName(b, name);
+        BJson(b, tv);
+      end
+      else if (pv^.W0 and 7) = JtObj then
+      begin
+        BName(b, name);
+        if (tv^.W0 and 7) = JtObj then
+          Nest(tv, pv)
+        else
+          Nest(nil, pv);
+      end
+      { a null takes the member out }
+      else if (pv^.W0 and 7) <> JtNull then
+      begin
+        BName(b, name);
+        BJson(b, pv);
+      end;
+    end
+    else
+    begin
+      { a member of the patch: the target's of its name went before }
+      pv := tv;
+      { one the target has is merged already; a null takes out nothing }
+      if ((st[d - 1].T = nil) or (FindMember(st[d - 1].T, name) = nil)) and
+        ((pv^.W0 and 7) <> JtNull) then
+      begin
+        BName(b, name);
+        if (pv^.W0 and 7) = JtObj then
+          Nest(nil, pv)
+        else
+          BJson(b, pv);
+      end;
+    end;
+  end;
+  Result := BDone(b);
+end;
+
+{ ---- JsonObject and JsonArray (P207) ---- }
+
+{ The value of item A of an array of const into B, by its kind
+  (TVarRec's: the compiler writes a json for any value of a JSON form
+  that goes into none, JsonOf's). }
+procedure BItem(var B: TJsonBuild; const A: TJsonVarItem; I: Int64);
+var
+  p: PByte;
+  w: Int64;
+  q: Quad;
+  c: Currency;
+  t: string;
+begin
+  p := PByte(@A);
+  w := PInt64(@p[8])^;
+  case A.VType of
+    0: BInt(B, w);
+    1: BLit(B, JtFalse + Ord((w and 255) <> 0));
+    2: BStr(B, Char(w and 255));
+    3: BF64(B, w as Double);
+    5:
+      if w = 0 then
+        BLit(B, JtNull)
+      else
+        BFail('item ' + IntText(I) + ' is a pointer, which has no JSON form');
+    11: BStr(B, A.VAnsiString);
+    12:
+      begin
+        Move(p[8], c, 8);
+        t := CurJsonText(c);
+        BNumText(B, PByte(Pointer(t)), Length(t));
+      end;
+    19:
+      begin
+        Move(p[16], q, 16);
+        t := QuadJsonText(q);
+        if t = '' then
+          BFail('a Quad that is NaN or infinite has no JSON form');
+        BNumText(B, PByte(Pointer(t)), Length(t));
+      end;
+    20: BJson(B, PJNode(Pointer(w)));
+  else
+    BFail('item ' + IntText(I) + ' has no JSON form here: JsonOf(x) makes one');
+  end;
+end;
+
+{ JsonObject([name, value, ...]) and JsonArray([value, ...]): the
+  compiler builds the array of const as for any call and gives it here,
+  each value of a kind TVarRec has, or a json JsonOf made. }
+function PasJsonOfConsts(const A: array of TJsonVarItem; Obj: Boolean): json;
+var
+  b: TJsonBuild;
+  i: Int64;
+  p: PByte;
+begin
+  b := Default(TJsonBuild);
+  BReset(b);
+  if Obj and Odd(Length(A)) then
+    BFail('JsonObject takes names and values in pairs');
+  BOpen(b, Obj);
+  for i := 0 to High(A) do
+    if Obj and not Odd(i) then
+    begin
+      p := PByte(@A[i]);
+      if A[i].VType = 11 then
+        BName(b, A[i].VAnsiString)
+      else if A[i].VType = 2 then
+        BName(b, Char(p[8]))
+      else
+        BFail('JsonObject''s item ' + IntText(i) + ' is a member''s name, a string');
+    end
+    else
+      BItem(b, A[i], i);
+  BClose(b, Obj);
+  Result := BDone(b);
+end;
+
+{ ---- TJsonBuilder (P207) ---- }
+
+procedure JsonFatal(const Msg: string);
+begin
+  WriteLn(ErrOutput, Msg);
+  Halt(1);
+end;
+
+constructor TJsonBuilder.Create;
+begin
+  FB := Default(TJsonBuild);
+  BReset(FB);
+  FBusy := 0;
+end;
+
+{ One routine at a time, as pasmap's Writing says of a map: a call that
+  finds another running in the same builder ends the program. }
+procedure TJsonBuilder.Enter;
+begin
+  if FBusy <> 0 then
+    JsonFatal('paslang: concurrent json builder use');
+  FBusy := 1;
+end;
+
+procedure TJsonBuilder.Leave;
+begin
+  if FBusy <> 1 then
+    JsonFatal('paslang: concurrent json builder use');
+  FBusy := 0;
+end;
+
+procedure TJsonBuilder.BeginObject;
+begin
+  Enter;
+  try
+    BOpen(FB, True);
+  finally
+    Leave;
+  end;
+end;
+
+procedure TJsonBuilder.BeginArray;
+begin
+  Enter;
+  try
+    BOpen(FB, False);
+  finally
+    Leave;
+  end;
+end;
+
+procedure TJsonBuilder.EndObject;
+begin
+  Enter;
+  try
+    BClose(FB, True);
+  finally
+    Leave;
+  end;
+end;
+
+procedure TJsonBuilder.EndArray;
+begin
+  Enter;
+  try
+    BClose(FB, False);
+  finally
+    Leave;
+  end;
+end;
+
+procedure TJsonBuilder.Name(const S: string);
+begin
+  Enter;
+  try
+    BName(FB, S);
+  finally
+    Leave;
+  end;
+end;
+
+procedure TJsonBuilder.Add(const S: string);
+begin
+  Enter;
+  try
+    BStr(FB, S);
+  finally
+    Leave;
+  end;
+end;
+
+procedure TJsonBuilder.Add(V: Integer);
+begin
+  Enter;
+  try
+    BInt(FB, V);
+  finally
+    Leave;
+  end;
+end;
+
+procedure TJsonBuilder.Add(V: Double);
+begin
+  Enter;
+  try
+    BF64(FB, V);
+  finally
+    Leave;
+  end;
+end;
+
+procedure TJsonBuilder.Add(V: Boolean);
+begin
+  Enter;
+  try
+    BLit(FB, JtFalse + Ord(V));
+  finally
+    Leave;
+  end;
+end;
+
+procedure TJsonBuilder.Add(V: json);
+begin
+  Enter;
+  try
+    BJson(FB, NodeOfJ(V));
+  finally
+    Leave;
+  end;
+end;
+
+procedure TJsonBuilder.AddNull;
+begin
+  Enter;
+  try
+    BLit(FB, JtNull);
+  finally
+    Leave;
+  end;
+end;
+
+procedure TJsonBuilder.AddNumber(const Text: string);
+begin
+  Enter;
+  try
+    BNumText(FB, PByte(Pointer(Text)), Length(Text));
+  finally
+    Leave;
+  end;
+end;
+
+function TJsonBuilder.Done: json;
+begin
+  Enter;
+  try
+    Result := BDone(FB);
+  finally
+    Leave;
+  end;
 end;
 {$endif}
 

@@ -5819,8 +5819,9 @@ that hold a noncharacter, as I-JSON says.
 
 `EJsonError` has the error's `Kind` (`TJsonErrorKind`: `jeSyntax`,
 `jeEncoding`, `jeDuplicate`, `jeDepth`, `jeTooLarge` for a parse,
-`jeMissing`, `jeType`, `jeRange` for a read, and `jeUnknown` for a
-decode's member no field takes, below), its `Offset` (the byte
+`jeMissing`, `jeType`, `jeRange` for a read, `jeUnknown` for a
+decode's member no field takes, below, and `jeTest` for a `JsonPatch`
+test that found another value), its `Offset` (the byte
 from 0), `Line` and `Column` (from 1, the column in bytes), the `Path` of
 the value it is about (a JSON Pointer; for a read, of what was asked),
 its `Reason` and a `Message`:
@@ -6342,6 +6343,57 @@ with `-cpu base` (`scripts/bench/b36unbind`); its peak is 55 MB against
 Go's 40, from the size of the data itself (a map of three entries 400
 bytes against 265, a short string a block of its own, a slice's
 frontier), which P285 to P287 take on.
+
+### Building and transforming
+
+`JsonObject([name, value, ...])` and `JsonArray([value, ...])` make a
+document of a list in brackets, an array of const as a call builds it
+(1.1.235): an integer, a Boolean, a `Char`, a real, a string, a `Quad`,
+a `Currency`, `nil` (null) and a `json` go in as they are, and any other
+value with a JSON form (a record, an array, an enumeration, a set, an
+object) as `JsonOf` writes it; a member's name is a string or a `Char`.
+`TJsonBuilder` writes one value by value:
+
+```pascal
+b := TJsonBuilder.Create;
+b.BeginObject;
+b.Name('list');
+b.BeginArray;
+b.Add(10); b.Add('x'); b.AddNull; b.AddNumber('1e3'); b.Add(j);
+b.EndArray;
+b.EndObject;
+doc := b.Done;
+```
+
+`Add` takes a string, an integer, a `Double`, a `Boolean` or a `json`,
+`AddNumber` a number's text, which is kept as written; `Done` reserves
+the document once, at its size, and leaves the builder empty to start
+again. A misuse raises `EJsonError`: a member's value with no name, a
+name outside an object or after a name, a container closed by the other
+kind, `Done` with one open or with no value, two values at the top
+level, a name twice in an object (one by one up to 64 members, sorted
+past them), a number's text that is no JSON number, a NaN or an
+infinity, a string that is not UTF-8 or holds a noncharacter. A builder
+is one routine's at a time: a call that finds another running in it
+ends the program with `paslang: concurrent json builder use`, as a map
+written by two does.
+
+A document never changes, so these make a new one, and the old one is
+still there for whoever reads it:
+
+| Word | What it gives |
+|---|---|
+| `JsonSet(j, path, v)` | `j` with the value at the RFC 6901 pointer `path` made `v`, a `json`, a string, an integer, a `Double` or a `Boolean`: an object's member replaced, or added at its end when it has none; an array's element replaced, `-` appending; `''` the whole value |
+| `JsonRemove(j, path)` | `j` without that member or element; the root is none |
+| `JsonPatch(j, patch)` | `j` with the operations of the RFC 6902 patch done in turn (`add`, `remove`, `replace`, `move`, `copy`, `test`); one that fails raises `EJsonError` with its number and its place in the patch, `jeTest` for a test |
+| `JsonMergePatch(j, patch)` | RFC 7396's merge of `patch` into `j`: a null takes a member out, an object merges, anything else replaces |
+| `JsonClone(j)` | `j`'s value as a document of its own, which keeps the one it came from alive no longer |
+
+An edit is one copy of the document with the change spliced in, its
+containers' counts and spans made again; a merge writes its result
+through a builder with a stack of its own, so nothing recurses however
+deep the documents are (`testdata/jsonbuild`, `testdata/jsonmod`, which
+holds RFC 6902's and RFC 7396's examples).
 
 ### Speed
 
@@ -12688,7 +12740,7 @@ its place:
   pastree's `PasTreeNew` … `PasStoreAbandon`, pasjson's JSON words
   (§12) `JsonParse TryJsonParse JsonEncode JsonIndex JsonDefaults
   JsonPretty JsonCanonical`, its types `TJsonKind` (`jkNull` …
-  `jkObject`), `TJsonErrorKind` (`jeSyntax` … `jeUnknown`), `TJsonOptions`,
+  `jkObject`), `TJsonErrorKind` (`jeSyntax` … `jeTest`), `TJsonOptions`,
   `EJsonError`, `TJsonIter`, `TJsonIndex`, `TJsonHelper`, the
   writer's `TJsonOut`, `TJsonOutLevel`, `TJsonOutMark`, `TJsonOutPair` and
   `TJsonOutPairs` and the reader's `TJsonIn` and `TJsonKeep`, and its
