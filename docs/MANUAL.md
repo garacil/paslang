@@ -6568,6 +6568,41 @@ prints
 {"id":5,"op":"sum","args":[]} -> {"id":5}
 ```
 
+### Constants
+
+A typed constant of `json` is the text of its value, and the compiler
+parses it when it compiles (1.1.238), with the parser `JsonParse` runs:
+a constant the program can hold is one `JsonParse` takes, and one it
+cannot is an error of the compile, with the parser's words, at its
+line and column inside the literal:
+
+```pascal
+const
+  Defaults: json = '{"retries":3,"hosts":["a","b"]}';
+  Nothing: json = nil;                  { null }
+```
+
+```
+paslangc: json constant: invalid character '}' at start of value within "/a" at 3:19 in prog.paslang
+```
+
+The value is made once, before the main block and its class
+constructors run (in a unit, its initialization), and read as a
+variable; a routine's constant is made once too. A text made of pieces
+(`'a' + #10 + 'b'`) is one text, its error placed at the byte of it
+when the pieces are not side by side. `JsonParse('...')` of a constant
+string is the same: parsed when compiling, made once, the same document
+each time it is read, one for each text in a unit; with options, or of
+a text that varies, it is the call it was, and its error the program's
+(`TryJsonParse` too). A unit's constant in its interface is a program's
+through the unit, made by the unit. The compiler links `pasjson` for
+this (Regla 15 took Free Pascal out of its build, so the core parser is
+the compiler's too): `scripts/check_jsonconst.py` writes every document
+of JSONTestSuite, of Go's corpus and of `check_json.py`'s cases as a
+constant and holds what the compile takes, makes and refuses, and
+where, to `JsonParse` (`testdata/jsonconst`, `testdata/jsonconstbad`,
+`testdata/units/jsonconstu`).
+
 ### Speed
 
 The text is scanned 64 bytes at a time by the kernel of the processor

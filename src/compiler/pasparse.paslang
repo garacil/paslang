@@ -31,7 +31,7 @@ function ParseSource(const Src: string; const UPath: array of string;
 implementation
 
 uses
-  paslib, pasiface, pasfmt, pasquad, pashelp;
+  paslib, pasiface, pasfmt, pasquad, pashelp, pasjson;
 
 
 type
@@ -163,6 +163,8 @@ type
     FJsonNames: array of LongInt; { the enumerations whose names a decoder reads }
     FJsonDEnt: array of LongInt;  { the types JsonDecode, TryJsonDecode, a typed for and TryGet take }
     FJsonDForm: array of LongInt; { the entries of each a unit calls, Jd* }
+    FJsonCSyms: TStrArray;        { the json constants' variables (P209) }
+    FJsonCTexts: TStrArray;       { and their texts, each parsed once in the initialization }
     FJsonWrite: array of LongInt; { the types a typed JsonWrite takes (P208) }
     FRecMembers: Boolean;  { a record's fields stop where its members begin (P165) }
     FRecVis: Byte;         { the visibility of the record's fields being read (P165) }
@@ -682,6 +684,10 @@ type
     function JsonDecEntries(T: LongInt; Forms: LongInt; var Heads: string): string;
     function JsonNeedEntry(T: LongInt; Form: LongInt): string;
     function JsonDecodeCall(IsTry: Boolean; const Args: TExprArray): PExpr;
+    function LitPlace(ALine, ACol: LongInt; Off: Int64; out L, C: LongInt): Boolean;
+    procedure JsonConstCheck(const Text: string; ALine, ACol: LongInt);
+    function JsonConstRef(const Text: string; ALine, ACol: LongInt): PExpr;
+    function JsonConstInits: PStmt;
     function JsonStreamCall(const Name: string; const Args: TExprArray; ALine, ACol: LongInt): PExpr;
     function JsonTypedGet(const Args: TExprArray): PExpr;
     procedure GenJsonCode;
@@ -13248,6 +13254,25 @@ begin
           args := ParseArgList;
           Result := JsonStreamCall(name, args, nline, ncol);
         end
+        else if SameId(name, 'JsonParse') and (FTok.Kind = tkLParen) and not FGenMode and
+          FindProc('JsonParse', pe) then
+        begin
+          { JsonParse('...') of a constant text (P209): parsed now, an
+            error stopping the compile at its place, and made once when
+            the unit starts; with options, or of a text that varies, the
+            call }
+          args := ParseArgList;
+          if (Length(args) = 1) and (args[0]^.Kind = ekStr) then
+            Result := JsonConstRef(args[0]^.Txt, args[0]^.PosLine, args[0]^.PosCol)
+          else
+          begin
+            FCallAt := ' at ' + IntToStr(nline) + ':' + IntToStr(ncol);
+            if not ResolveProc(name, args, pe) then
+              Die('wrong arguments for ' + name + ' at ' + IntToStr(nline) + ':' + IntToStr(ncol));
+            FillDefaults(pe, args);
+            Result := NewCall(pe.Sym, args, pe.RetTyp);
+          end;
+        end
         else if (SameId(name, 'JsonDecode') or SameId(name, 'TryJsonDecode')) and
           (FTok.Kind = tkLParen) and FindProc('JsonParse', pe) then
         begin
@@ -19267,6 +19292,10 @@ var
   s: string;
   d: TVarDecl;
   sz, k: LongInt;
+  jtext: string;
+  jat: Boolean;
+  jl, jc: LongInt;
+  jt: LongInt;
 begin
   Eat(tkConst);
   while ((FTok.Kind = tkIdent) and not ((FMemberScope > 0) and RecMemberAhead)) or ReservedHere('=:') do
@@ -19281,6 +19310,29 @@ begin
       FTok := FLex.Next;
       t := ParseType;
       Eat(tkEq);
+      jtext := '';
+      jat := False;
+      if TypeOf(t).Kind = tykJson then
+      begin
+        { a json constant (P209): its text parsed now, the value made
+          once when the unit starts; nil is null }
+        if FTok.Kind = tkNil then
+          FTok := FLex.Next
+        else
+        begin
+          jl := FTok.Line;
+          jc := FTok.Col;
+          ParseConstValue(v, jt, jtext);
+          if not (IsStrTyp(jt) or IsCharT(jt)) then
+            Die('a json constant takes the text of its value, a string, or nil' + at);
+          if IsCharT(jt) then
+            jtext := Char(v);
+          JsonConstCheck(jtext, jl, jc);
+          jat := True;
+        end;
+        if FTok.Kind <> tkSemi then
+          Die('a json constant takes a string constant or nil' + at);
+      end;
       { A typed constant is a variable that starts with its value: the
         value was read and dropped, so it started at zero (1.0.77). }
       d := Default(TVarDecl);
@@ -19292,7 +19344,8 @@ begin
       SetLength(s, sz);
       for k := 1 to sz do
         s[k] := #0;
-      ParseTypedInit(t, 0, s, d);
+      if TypeOf(t).Kind <> tykJson then
+        ParseTypedInit(t, 0, s, d);
       SortRel(d);
       if FNest > 0 then
       begin
@@ -19317,6 +19370,11 @@ begin
       FVars[High(FVars)].Rel := d.Rel;
       FVars[High(FVars)].RelStr := d.RelStr;
       AddScoped(name, t, 2, VarSym(name));
+      if jat then
+      begin
+        AppendStr(FJsonCSyms, FVars[High(FVars)].Name);
+        AppendStr(FJsonCTexts, jtext);
+      end;
       Eat(tkSemi);
     end
     else
@@ -26709,6 +26767,194 @@ begin
     Result := NewCall(JsonNeedEntry(t, JdRead), a, TyBoolean);
 end;
 
+{ ---- json constants (P209) ---- }
+
+{ The place in the source of byte Off of a string constant whose
+  expression starts at ALine:ACol, walking its pieces as the lexer read
+  them: 'text', a doubled quote one byte, and #nn, one byte, with space
+  between them. False when the byte is past them (pieces joined by +, a
+  named constant), with the place where the walk began, the expression's
+  (a #nn first at its #). }
+function TParser.LitPlace(ALine, ACol: LongInt; Off: Int64; out L, C: LongInt): Boolean;
+var
+  src: string;
+  i, n, k: SizeInt;
+  sl, sc: LongInt;
+begin
+  Result := False;
+  L := ALine;
+  C := ACol;
+  src := FLex.Source;
+  i := FLex.SourceAt(ALine, ACol);
+  n := Length(src);
+  k := 0;
+  { a #nn first: the lexer's place is past its # }
+  if (i > 1) and (i <= n) and (src[i - 1] = '#') and (src[i] >= '0') and (src[i] <= '9') then
+  begin
+    i := i - 1;
+    C := C - 1;
+  end;
+  sl := L;
+  sc := C;
+  while i <= n do
+  begin
+    if src[i] = '''' then
+    begin
+      i := i + 1;
+      C := C + 1;
+      while i <= n do
+      begin
+        if src[i] = '''' then
+        begin
+          if (i < n) and (src[i + 1] = '''') then
+          begin
+            if k = Off then
+            begin
+              Result := True;
+              Exit;
+            end;
+            k := k + 1;
+            i := i + 2;
+            C := C + 2;
+            Continue;
+          end;
+          Break;
+        end;
+        if k = Off then
+        begin
+          Result := True;
+          Exit;
+        end;
+        k := k + 1;
+        if src[i] = #10 then
+        begin
+          L := L + 1;
+          C := 1;
+        end
+        else
+          C := C + 1;
+        i := i + 1;
+      end;
+      { past the closing quote }
+      i := i + 1;
+      C := C + 1;
+    end
+    else if (src[i] = '#') and (i < n) and (src[i + 1] >= '0') and (src[i + 1] <= '9') then
+    begin
+      if k = Off then
+      begin
+        Result := True;
+        Exit;
+      end;
+      k := k + 1;
+      i := i + 1;
+      C := C + 1;
+      while (i <= n) and (src[i] >= '0') and (src[i] <= '9') do
+      begin
+        i := i + 1;
+        C := C + 1;
+      end;
+    end
+    else if (src[i] = ' ') or (src[i] = #9) or (src[i] = #13) then
+    begin
+      i := i + 1;
+      C := C + 1;
+    end
+    else if src[i] = #10 then
+    begin
+      i := i + 1;
+      L := L + 1;
+      C := 1;
+    end
+    else
+      Break;
+  end;
+  L := sl;
+  C := sc;
+end;
+
+{ Text, a string constant at ALine:ACol, read as JsonParse reads a text,
+  by pasjson's own parser, which the compiler links: a constant the
+  compiler takes is one JsonParse takes, and its error is the parser's,
+  its words and its pointer, at its place in the literal. }
+procedure TParser.JsonConstCheck(const Text: string; ALine, ACol: LongInt);
+var
+  j: json;
+  e: EJsonError;
+  l, c: LongInt;
+  msg, place: string;
+  k: SizeInt;
+begin
+  if TryJsonParse(Text, j, e) then
+    Exit;
+  msg := e.Message;
+  if Copy(msg, 1, 6) = 'json: ' then
+    msg := Copy(msg, 7, Length(msg));
+  place := ' at ' + IntToStr(e.Line) + ':' + IntToStr(e.Column) + ' (byte ' + IntToStr(e.Offset) + ')';
+  k := Pos(place, msg);
+  if k > 0 then
+    msg := Copy(msg, 1, k - 1) + Copy(msg, k + Length(place), Length(msg));
+  if LitPlace(ALine, ACol, e.Offset, l, c) then
+    Die('json constant: ' + msg + ' at ' + IntToStr(l) + ':' + IntToStr(c))
+  else
+    Die('json constant: ' + msg + ' at byte ' + IntToStr(e.Offset) + ' of the text that starts at ' +
+      IntToStr(l) + ':' + IntToStr(c));
+end;
+
+{ JsonParse of the constant Text: checked now, and the hidden variable
+  the unit's initialization makes it into, one for each text. }
+function TParser.JsonConstRef(const Text: string; ALine, ACol: LongInt): PExpr;
+var
+  i: SizeInt;
+  hid: string;
+begin
+  JsonConstCheck(Text, ALine, ACol);
+  hid := '';
+  for i := 0 to High(FJsonCTexts) do
+    if (FJsonCTexts[i] = Text) and (Copy(FJsonCSyms[i], 1, 6) = 'json.k') then
+      hid := FJsonCSyms[i];
+  if hid = '' then
+  begin
+    hid := 'json.k' + IntToStr(Length(FJsonCTexts) + 1);
+    AddVar(hid, InternJson, False);
+    if FIsUnit then
+    begin
+      FVars[High(FVars)].Sym := FUnitName + '.' + hid;
+      FVars[High(FVars)].Pub := False;
+    end;
+    AppendStr(FJsonCSyms, hid);
+    AppendStr(FJsonCTexts, Text);
+  end;
+  Result := NewVar(VarSym(hid), InternJson);
+end;
+
+{ The statements that make the unit's json constants, each by JsonParse
+  of its text, before the class constructors run. }
+function TParser.JsonConstInits: PStmt;
+var
+  i: SizeInt;
+  st: PStmt;
+  pe: TProcEnt;
+  a: TExprArray;
+begin
+  Result := nil;
+  if Length(FJsonCSyms) = 0 then
+    Exit;
+  Result := NewStmt(skBlock);
+  for i := 0 to High(FJsonCSyms) do
+  begin
+    a := nil;
+    SetLength(a, 1);
+    a[0] := NewStr(FJsonCTexts[i]);
+    if not FindProc('JsonParse', pe) or not ResolveProc('JsonParse', a, pe) then
+      Die('a json constant needs pasjson');
+    st := NewStmt(skAssign);
+    st^.Dest := NewVar(VarSym(FJsonCSyms[i]), InternJson);
+    st^.E := NewCall(pe.Sym, a, InternJson);
+    AppendStmt(Result, st);
+  end;
+end;
+
 { JsonDecode(src, x[, opts]) and TryJsonDecode(src, x, err[, opts]):
   src a string or a json, x a variable of a type with a JSON form. }
 function TParser.JsonDecodeCall(IsTry: Boolean; const Args: TExprArray): PExpr;
@@ -27136,6 +27382,8 @@ begin
     it, last first (P123) }
   FProg.Body := JoinStmts(JoinStmts(LifeCalls(FClassCtors, False), FProg.Body),
     LifeCalls(FClassDtors, True));
+  { the json constants first (P209) }
+  FProg.Body := JoinStmts(JsonConstInits, FProg.Body);
   FProg.Vars := FVars;
   Eat(tkDot);
   { the encoders the program's JsonEncode and JsonOf need (P205) }
@@ -27241,6 +27489,8 @@ begin
   { the class constructors before the unit's initialization, the
     destructors after its finalization, last first (P123) }
   FProg.InitBody := JoinStmts(LifeCalls(FClassCtors, False), FProg.InitBody);
+  { the json constants first (P209) }
+  FProg.InitBody := JoinStmts(JsonConstInits, FProg.InitBody);
   FProg.FiniBody := JoinStmts(FProg.FiniBody, LifeCalls(FClassDtors, True));
   Eat(tkEnd);
   Eat(tkDot);

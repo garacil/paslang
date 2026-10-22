@@ -418,6 +418,9 @@ GOLDEN_A64 += brokenpipe
 # P208: json streams that park.
 GOLDEN += jsonstream jsonpark
 GOLDEN_A64 += jsonstream jsonpark
+# P209: json constants checked by the compiler.
+GOLDEN += jsonconst
+GOLDEN_A64 += jsonconst
 # P354: a routine's record keeps no saved register once it is loaded back.
 GOLDEN += gstale
 GOLDEN_A64 += gstale
@@ -1135,6 +1138,8 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  python3 -I scripts/check_json.py $(BUILDDIR)/jsoncheck -; \
 	fi; \
 	python3 -I scripts/check_json.py $(BUILDDIR)/jsoncheck-base -; \
+	: every document of the suite, the corpus and the cases as a json constant, taken or refused at its byte as JsonParse does, P209; \
+	python3 -I scripts/check_jsonconst.py $(OUTDIR)/paslangc $(BUILDDIR); \
 	: typed JSON held to the Go v2 of the model, schema by schema P205; \
 	python3 -I scripts/jsonmodel.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64); \
 	: what the compiler refuses of a json, each with its message; \
@@ -1619,6 +1624,21 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q "the operator inc of TV takes no step at 17:8" $(BUILDDIR)/opunbad_incstep.err; \
 	grep -q "class operator Inc gives a TV at 6:20" $(BUILDDIR)/opunbad_recinc.err; \
 	echo ok opunbad; \
+	echo "==== json constants the compiler refuses (P209) ===="; \
+	for n in place lines joined twice utf8 notext quote control; do \
+	  if $(OUTDIR)/paslangc -o $(BUILDDIR)/jsonconstbad_$$n testdata/jsonconstbad/$$n.paslang >$(BUILDDIR)/jsonconstbad_$$n.err 2>&1; then \
+	    echo "$$n should fail"; exit 1; \
+	  fi; \
+	done; \
+	grep -q 'json constant: invalid character .}. at start of value within "/a" at 3:19' $(BUILDDIR)/jsonconstbad_place.err; \
+	grep -q 'json constant: invalid character .]. at start of value within "/2" at 6:3' $(BUILDDIR)/jsonconstbad_lines.err; \
+	grep -q 'json constant: invalid character .{. after top-level value at byte 7 of the text that starts at 3:13' $(BUILDDIR)/jsonconstbad_joined.err; \
+	grep -q 'json constant: duplicate object member name "a" within "/y" at 3:32' $(BUILDDIR)/jsonconstbad_twice.err; \
+	grep -q 'json constant: invalid UTF-8 within "/0" at 3:20' $(BUILDDIR)/jsonconstbad_utf8.err; \
+	grep -q 'a json constant takes the text of its value, a string, or nil at 3:3' $(BUILDDIR)/jsonconstbad_notext.err; \
+	grep -q 'json constant: invalid character .... at start of value within "/0" at 3:15' $(BUILDDIR)/jsonconstbad_quote.err; \
+	grep -q 'json constant: invalid character ..t. in string (expecting non-control character) within "/a" at 5:29' $(BUILDDIR)/jsonconstbad_control.err; \
+	echo ok jsonconstbad; \
 	echo "==== record member rejects (P165) ===="; \
 	for n in strictf strictm virt prot dtor clsctor nostat fieldafter typecall ctorres selfrec nodecl plainrec; do \
 	  if $(OUTDIR)/paslangc -o $(BUILDDIR)/recbad_$$n testdata/recbad/$$n.paslang >$(BUILDDIR)/recbad_$$n.err 2>&1; then \
@@ -3797,6 +3817,12 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	test $$(grep -c '^UNOP ' $(BUILDDIR)/opunu.pi) -eq 4 || { echo "opunu.pi does not carry its four operators of one operand"; exit 1; }; \
 	grep -q '^OPER xor ' $(BUILDDIR)/opunu.pi || { echo "opunu.pi does not carry its xor"; exit 1; }; \
 	echo ok opunuse; \
+	echo "==== a unit's json constants (P209) ===="; \
+	$(OUTDIR)/paslangc testdata/units/jsonconstu.paslang; \
+	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/jsonconstuse testdata/units/jsonconstuse.paslang; \
+	$(BUILDDIR)/jsonconstuse > $(BUILDDIR)/jsonconstuse.got; \
+	diff -u testdata/units/jsonconstuse.out $(BUILDDIR)/jsonconstuse.got; \
+	echo ok jsonconstuse; \
 	echo "==== pkg ===="; \
 	$(OUTDIR)/paslangc -install $(BUILDDIR)/pkg testdata/pkg/arithkit.paslang; \
 	test -f $(BUILDDIR)/pkg/scale.pi; \
@@ -5054,6 +5080,12 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	$(QEMU_A64) $(BUILDDIR)/opunuse-arm > $(BUILDDIR)/opunuse-arm.got; \
 	diff -u testdata/units/opunuse.out $(BUILDDIR)/opunuse-arm.got; \
 	echo ok opunuse-arm; \
+	echo "==== a unit's json constants arm64 (P209) ===="; \
+	$(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/a64/jsonconstu testdata/units/jsonconstu.paslang; \
+	$(OUTDIR)/paslangc -target arm64 -Fu $(BUILDDIR)/a64 -o $(BUILDDIR)/jsonconstuse-arm testdata/units/jsonconstuse.paslang; \
+	$(QEMU_A64) $(BUILDDIR)/jsonconstuse-arm > $(BUILDDIR)/jsonconstuse-arm.got; \
+	diff -u testdata/units/jsonconstuse.out $(BUILDDIR)/jsonconstuse-arm.got; \
+	echo ok jsonconstuse-arm; \
 	echo "==== unit init arm64 ===="; \
 	mkdir -p $(BUILDDIR)/a64; \
 	$(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/a64/inita testdata/units/inita.paslang; \
