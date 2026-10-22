@@ -8056,7 +8056,10 @@ install`. Every program links them without `uses`:
   program share a file: a database another holds `EXCLUSIVE` gives
   `ESqliteError` with code `SQLITE_BUSY`, 'database is locked'.
   Errors are `ESqliteError`s with SQLite's codes and words. SQL, writes
-  and the rest come with the next milestones.
+  and the rest come with the next milestones. A program that names none
+  of it carries none of it: each read-only item of a unit (a literal, a
+  class's tables, a call site's descriptor) is a section of its own that
+  the linker keeps only when kept code reaches it (1.1.246, P417).
 
 The names of `pasobject`, `pasroutines`, `pasfmt`, `passtr`, `pashash`,
 `pastree` and `passqlite` are every program's, as those of a unit in `uses` are;

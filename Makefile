@@ -2421,6 +2421,12 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	python3 -I scripts/check_sqllock.py $(BUILDDIR)/sqlread $(BUILDDIR)/sqlfx/wr.db; \
 	echo ok sqlread
 	@set -e; \
+	: a unit item nothing reaches leaves the program, P417; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/gc_hello testdata/hello.paslang; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/gc_sqluses testdata/sqluses.paslang; \
+	python3 -I scripts/check_gcsections.py $(BUILDDIR)/gc_hello $(BUILDDIR)/gc_sqluses; \
+	echo ok gcsections
+	@set -e; \
 	echo "==== index checks ===="; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/bce_s testdata/bce.paslang; \
 	if sed -n '/^p_table:/,/cfi_endproc/p' $(BUILDDIR)/bce_s.s | grep -q 'call rt_boundsfail'; then echo "bce: p_table kept a bounds check the loop does not need"; exit 1; fi; \
@@ -5413,6 +5419,12 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	done; \
 	python3 -I scripts/check_sqllock.py $(BUILDDIR)/sqlread-arm $(BUILDDIR)/sqlfx-arm/wr.db $(QEMU_A64); \
 	echo ok sqlread-arm
+	@set -e; \
+	: P417 on arm64: a unit item nothing reaches leaves the program; \
+	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/gc_hello-arm testdata/hello.paslang; \
+	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/gc_sqluses-arm testdata/sqluses.paslang; \
+	python3 -I scripts/check_gcsections.py $(BUILDDIR)/gc_hello-arm $(BUILDDIR)/gc_sqluses-arm --arm; \
+	echo ok gcsections-arm
 
 install: all installdirs
 	$(NORMAL_INSTALL)
