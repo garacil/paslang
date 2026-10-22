@@ -3,7 +3,7 @@
 # Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
 # paslang is free software under the GNU General Public License,
 # version 3 or (at your option) any later version; see the file COPYING.
-"""passqlite takes SQLite's locks (P403): while the C library holds a
+"""The unit sqlite takes SQLite's locks (P403): while the C library holds a
 database EXCLUSIVE, testdata/sqlread's open meets SQLITE_BUSY ('database
 is locked'); while it holds RESERVED, a reader still reads, as SQLite's
 readers do; when it lets go, the dump is the whole database. The process

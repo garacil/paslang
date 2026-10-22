@@ -3,8 +3,8 @@
 # Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
 # paslang is free software under the GNU General Public License,
 # version 3 or (at your option) any later version; see the file COPYING.
-"""SQLite databases made by the C library and what passqlite must read in
-them (P403): every database as SQLite 3 writes it (Python's sqlite3 module
+"""SQLite databases made by the C library and what the unit sqlite must
+read in them (P403): every database as SQLite 3 writes it (Python's sqlite3 module
 is the system's libsqlite3), and its dump as testdata/sqlread prints it:
 the header's page size, text encoding and user version, sqlite_schema's
 rows, then each table's rows by rowid and each index's keys in key order,

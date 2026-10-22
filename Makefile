@@ -551,7 +551,7 @@ GOLDEN_A64 += ptrelem
 # P386: a store whose place is registers alone pushes no value.
 GOLDEN += storereg
 GOLDEN_A64 += storereg
-# P403: passqlite named in a uses clause, a database in memory.
+# P403: SQLite named in a uses clause, uses sqlite since P418, a database in memory.
 GOLDEN += sqluses
 GOLDEN_A64 += sqluses
 
@@ -569,8 +569,7 @@ CORE_UNITS := \
 	src/lib/pasfmt.paslang \
 	src/lib/passtr.paslang \
 	src/lib/pasquad.paslang \
-	src/lib/pasjson.paslang \
-	src/lib/passqlite.paslang
+	src/lib/pasjson.paslang
 
 # The library units a program reaches with a uses clause. They are not
 # part of the language, but they are part of the installation, so a
@@ -585,7 +584,8 @@ LIB_UNITS := \
 	src/lib/passort.paslang \
 	src/lib/pastime.paslang \
 	src/lib/pasx11.paslang \
-	src/rtl/sysutils.paslang
+	src/rtl/sysutils.paslang \
+	src/lib/sqlite.paslang
 
 all: $(OUTDIR)/paslangc $(if $(AMD64),core libs) $(if $(ARM64),core-arm64 libs-arm64) $(OUTDIR)/pasdbg
 
@@ -2421,10 +2421,16 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	python3 -I scripts/check_sqllock.py $(BUILDDIR)/sqlread $(BUILDDIR)/sqlfx/wr.db; \
 	echo ok sqlread
 	@set -e; \
-	: a unit item nothing reaches leaves the program, P417; \
+	: a unit item nothing reaches leaves the program, P417, and SQLite is the library unit sqlite, P418; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/gc_hello testdata/hello.paslang; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/gc_sqlnone testdata/sqlnone.paslang; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/gc_sqluses testdata/sqluses.paslang; \
-	python3 -I scripts/check_gcsections.py $(BUILDDIR)/gc_hello $(BUILDDIR)/gc_sqluses; \
+	python3 -I scripts/check_gcsections.py $(BUILDDIR)/gc_hello $(BUILDDIR)/gc_sqlnone $(BUILDDIR)/gc_sqluses; \
+	$(BUILDDIR)/gc_sqlnone | grep -qx 'names sqlite, reaches none of it'; \
+	if $(OUTDIR)/paslangc -o $(BUILDDIR)/gc_sqlnouses testdata/sqlnouses.paslang > $(BUILDDIR)/gc_sqlnouses.err 2>&1; then \
+	  echo 'sqlnouses: TSqlite with no uses sqlite should not compile'; exit 1; \
+	fi; \
+	grep -qF 'unknown type TSqlite at 7:7' $(BUILDDIR)/gc_sqlnouses.err; \
 	echo ok gcsections
 	@set -e; \
 	echo "==== index checks ===="; \
@@ -5420,10 +5426,16 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	python3 -I scripts/check_sqllock.py $(BUILDDIR)/sqlread-arm $(BUILDDIR)/sqlfx-arm/wr.db $(QEMU_A64); \
 	echo ok sqlread-arm
 	@set -e; \
-	: P417 on arm64: a unit item nothing reaches leaves the program; \
+	: P417 and P418 on arm64: a unit item nothing reaches leaves the program, SQLite is the library unit sqlite; \
 	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/gc_hello-arm testdata/hello.paslang; \
+	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/gc_sqlnone-arm testdata/sqlnone.paslang; \
 	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/gc_sqluses-arm testdata/sqluses.paslang; \
-	python3 -I scripts/check_gcsections.py $(BUILDDIR)/gc_hello-arm $(BUILDDIR)/gc_sqluses-arm --arm; \
+	python3 -I scripts/check_gcsections.py $(BUILDDIR)/gc_hello-arm $(BUILDDIR)/gc_sqlnone-arm $(BUILDDIR)/gc_sqluses-arm --arm; \
+	timeout 25 $(QEMU_A64) $(BUILDDIR)/gc_sqlnone-arm | grep -qx 'names sqlite, reaches none of it'; \
+	if $(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/gc_sqlnouses-arm testdata/sqlnouses.paslang > $(BUILDDIR)/gc_sqlnouses-arm.err 2>&1; then \
+	  echo 'sqlnouses: TSqlite with no uses sqlite should not compile'; exit 1; \
+	fi; \
+	grep -qF 'unknown type TSqlite at 7:7' $(BUILDDIR)/gc_sqlnouses-arm.err; \
 	echo ok gcsections-arm
 
 install: all installdirs
@@ -5434,6 +5446,11 @@ install: all installdirs
 	  $(INSTALL_PROGRAM) $(OUTDIR)/paslangc-arm64 $(DESTDIR)$(bindir)/paslangc-arm64; \
 	fi
 	$(PRE_INSTALL)
+	: P418, passqlite was a unit of the core up to 1.1.246 and is the library unit sqlite now, its old files go so that uses passqlite finds none; \
+	rm -f $(DESTDIR)$(libdir)/paslang/passqlite.pi $(DESTDIR)$(libdir)/paslang/passqlite.o \
+	  $(DESTDIR)$(libdir)/paslang/$(LVL_X64)/passqlite.o \
+	  $(DESTDIR)$(libdir)/paslang/aarch64/passqlite.pi $(DESTDIR)$(libdir)/paslang/aarch64/passqlite.o \
+	  '$(DESTDIR)$(libdir)/paslang/aarch64/$(LVL_A64)/passqlite.o'
 	: the amd64 units, built on amd64, AMD64: every core unit, passtr too, P143: a list written out left it behind; \
 	if [ -n '$(AMD64)' ]; then \
 	  for u in $(CORE_UNITS) $(LIB_UNITS); do \
