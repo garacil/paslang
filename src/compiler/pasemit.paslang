@@ -785,6 +785,7 @@ type
     function LastAddX0(out Pt: SizeInt; out B: string; out V: Int64): Boolean;
     function ArmAddPlus(K: Int64): Boolean;
     procedure ArmPairAt(N: LongInt; out B: string; out V: Int64);
+    function ArmRegAt(Size: LongInt; const Keep: string): string;
     function ArmMem(const B: string; V: Int64): string;
     procedure ScaleAtX86(const Disp, B: string; K: Int64);
     procedure PutArgsKept(const Args: TExprArray; Comp, Reg0: LongInt; const Held: TStrArray);
@@ -6613,6 +6614,34 @@ begin
             Ppop('x1');
             Line('  add x0, x1, x0');
           end
+          else if (TKind(E^.L^.Typ) = tykPointer) and (not FCheckPtr) and
+            (WordReg(E^.L) <> '') then
+          begin
+            { the pointer in its register: the index where the pool or
+              EmitExpr leaves it, one ADD (ARM DDI 0487 M.c C6.2.6, the
+              shifted register form) into the register asked for (P385) }
+            esz := TSize(FTypes[E^.L^.Typ].Elem);
+            dr := 'x0';
+            if into <> '' then
+            begin
+              dr := into;
+              FAddrDone := True;
+            end;
+            if (E^.R^.Kind = ekInt) and Fits32(E^.R^.Num) and Fits32(E^.R^.Num * esz) then
+              AddImmArm(dr, WordReg(E^.L), E^.R^.Num * esz)
+            else
+            begin
+              xr := WordReg(E^.R);
+              if xr = '' then
+                xr := PoolWord(E^.R);
+              if xr = '' then
+              begin
+                EmitExpr(E^.R);
+                xr := 'x0';
+              end;
+              ScaleAddArm(dr, WordReg(E^.L), xr, esz, 'x16', 'x17');
+            end;
+          end
           else if IsDyn(E^.L^.Typ) or (TKind(E^.L^.Typ) = tykPointer) then
           begin
             esz := TSize(FTypes[E^.L^.Typ].Elem);
@@ -6929,6 +6958,36 @@ begin
             FAddrDone := True;
           end;
           ScaleAddX86(dr, '%rcx', '%rax', esz, '%rdx');
+        end
+        else if (TKind(E^.L^.Typ) = tykPointer) and (not FCheckPtr) and
+          (WordReg(E^.L) <> '') and ((TSize(FTypes[E^.L^.Typ].Elem) = 1) or
+          (TSize(FTypes[E^.L^.Typ].Elem) = 2) or (TSize(FTypes[E^.L^.Typ].Elem) = 4) or
+          (TSize(FTypes[E^.L^.Typ].Elem) = 8)) then
+        begin
+          { the pointer in its register: the index where the pool or
+            EmitExpr leaves it, one LEA (SDM vol. 2A table 2-3, the SIB
+            byte's scale) into the register asked for (P385) }
+          esz := TSize(FTypes[E^.L^.Typ].Elem);
+          dr := '%rax';
+          if into <> '' then
+          begin
+            dr := '%' + into;
+            FAddrDone := True;
+          end;
+          if (E^.R^.Kind = ekInt) and Fits32(E^.R^.Num) and Fits32(E^.R^.Num * esz) then
+            Line('  leaq ' + IntToStr(E^.R^.Num * esz) + '(%' + WordReg(E^.L) + '), ' + dr)
+          else
+          begin
+            xr := WordReg(E^.R);
+            if xr = '' then
+              xr := PoolWord(E^.R);
+            if xr = '' then
+            begin
+              EmitExpr(E^.R);
+              xr := 'rax';
+            end;
+            Line('  leaq (%' + WordReg(E^.L) + ',%' + xr + ',' + IntToStr(esz) + '), ' + dr);
+          end;
         end
         else if TKind(E^.L^.Typ) = tykPointer then
         begin
@@ -14716,7 +14775,7 @@ begin
       { P330: a word or less in x8 while the address is worked out }
       Line('  mov x8, x0');
       EmitAddr(Dest);
-      StoreFrom('[x0]', TSize(LoadTyp(Dest)), 'x8');
+      StoreFrom(ArmRegAt(TSize(LoadTyp(Dest)), 'x8'), TSize(LoadTyp(Dest)), 'x8');
     end
     else
     begin
@@ -14726,8 +14785,11 @@ begin
       FAddrWrite := (Dest^.Kind = ekIndex) and (Dest^.L <> nil) and
         IsStr(Dest^.L^.Typ);
       EmitAddr(Dest);
+      { the element's base and index in the store, neither the x1 the pop
+        takes (P385) }
+      op := ArmRegAt(TSize(LoadTyp(Dest)), 'x1');
       Ppop('x1');
-      StoreFrom('[x0]', TSize(LoadTyp(Dest)), 'x1');
+      StoreFrom(op, TSize(LoadTyp(Dest)), 'x1');
     end;
     Exit;
   end;
@@ -16515,6 +16577,72 @@ begin
   FLastIns := '';
   B := b0;
   V := v0;
+end;
+
+{ arm64, right after EmitAddr (P385): the last line '  add x0, B, X'
+  or '  add x0, B, X, lsl #S', B and X registers and S the log2 of Size,
+  taken out of the text when neither is Keep: a load or a store of Size
+  bytes, 1, 2, 4 or 8, the only sizes the form has, takes [B, X] or
+  [B, X, lsl #S] itself (ARM DDI 0487 M.c C6.2.218 LDR, C6.2.221 LDRB,
+  C6.2.223 LDRH, C6.2.416 STR, C6.2.418 STRB, C6.2.420 STRH, the
+  register offset form: LSL #0, or #3, #2 and #1 by the size), one
+  instruction where the add and the access were two; '[x0]' else. x0
+  keeps what it held before, as ArmPairAt's. }
+function TEmitter.ArmRegAt(Size: LongInt; const Keep: string): string;
+var
+  pt, e, q, i: SizeInt;
+  t, b, x, sh, rest: string;
+  lg: LongInt;
+begin
+  Result := '[x0]';
+  if (not FArm) or FAsmText or (FColdAt >= 0) or (FLen < 2) or (FOut[FLen] <> Char(10)) or
+    not ((Size = 1) or (Size = 2) or (Size = 4) or (Size = 8)) then
+    Exit;
+  e := FLen;
+  pt := e - 1;
+  while (pt > 0) and (FOut[pt] <> Char(10)) do
+    Dec(pt);
+  t := Copy(FOut, pt + 1, e - pt - 1);
+  if Copy(t, 1, 10) <> '  add x0, ' then
+    Exit;
+  rest := Copy(t, 11, Length(t) - 10);
+  q := Pos(', ', rest);
+  if q = 0 then
+    Exit;
+  b := Copy(rest, 1, q - 1);
+  rest := Copy(rest, q + 2, Length(rest) - q - 1);
+  q := Pos(', ', rest);
+  sh := '';
+  x := rest;
+  if q > 0 then
+  begin
+    x := Copy(rest, 1, q - 1);
+    sh := Copy(rest, q + 2, Length(rest) - q - 1);
+  end;
+  if (b <> 'sp') and ((Length(b) < 2) or (b[1] <> 'x')) then
+    Exit;
+  if (Length(x) < 2) or (x[1] <> 'x') then
+    Exit;
+  for i := 2 to Length(b) do
+    if (b <> 'sp') and ((b[i] < '0') or (b[i] > '9')) then
+      Exit;
+  for i := 2 to Length(x) do
+    if (x[i] < '0') or (x[i] > '9') then
+      Exit;
+  if sh <> '' then
+  begin
+    lg := Pow2Log(Size);
+    if (lg < 1) or (sh <> 'lsl #' + IntToStr(lg)) then
+      Exit;
+  end;
+  if (b = Keep) or (x = Keep) then
+    Exit;
+  FLen := pt;
+  FLastIns := '';
+  if sh = '' then
+    Result := '[' + b + ', ' + x + ']'
+  else
+    Result := '[' + b + ', ' + x + ', ' + sh + ']';
 end;
 
 { The operand [B, #V], [B] for V of 0 (P329). }
@@ -25024,7 +25152,8 @@ begin
               Line('  ldp x0, x2, ' + ArmMem(ab, av));
             end
             else
-              LoadTo('[x0]', LoadTyp(E), 'x0');
+              { the element's base and index in the load (P385) }
+              LoadTo(ArmRegAt(TSize(LoadTyp(E)), ''), LoadTyp(E), 'x0');
             BufFree(E);
           end;
         end;

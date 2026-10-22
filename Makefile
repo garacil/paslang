@@ -545,6 +545,9 @@ GOLDEN_A64 += valkinds
 # P384: a loop that calls keeps its variables in registers.
 GOLDEN += isles
 GOLDEN_A64 += isles
+# P385: the address of a pointer's element is one instruction.
+GOLDEN += ptrelem
+GOLDEN_A64 += ptrelem
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -2682,6 +2685,12 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=3 PASLANG_GCPOISON=1 timeout 300 $(BUILDDIR)/isles0 > $(BUILDDIR)/isles0.vgot; \
 	diff -u testdata/isles.out $(BUILDDIR)/isles0.vgot; \
 	echo ok isles-asm; \
+	: the address of a pointer element is one lea from the registers of the pointer and the index, and the loads and stores through it take them, P385; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/ptrelem0 testdata/ptrelem.paslang; \
+	$(BUILDDIR)/ptrelem0 > $(BUILDDIR)/ptrelem0.got; \
+	diff -u testdata/ptrelem.out $(BUILDDIR)/ptrelem0.got; \
+	python3 -I scripts/check_ptrelem.py $(BUILDDIR)/ptrelem0.s; \
+	echo ok ptrelem-asm; \
 	: a routine with nested ones zeroes only the locals a read may reach first, P358; \
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/nestzero0 testdata/nestzero.paslang; \
 	$(BUILDDIR)/nestzero0 > $(BUILDDIR)/nestzero0.got; \
@@ -4256,6 +4265,12 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	python3 -I scripts/check_isles.py $(BUILDDIR)/isles0.s $(BUILDDIR)/isles0-arm.s; \
 	python3 -I scripts/check_calleesaved.py $(BUILDDIR)/isles0.s $(BUILDDIR)/isles0-arm.s; \
 	echo ok isles-arm-asm; \
+	: P385 on arm64: the address of a pointer element is one add of the shifted register, and the loads and stores through it take the register offset; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/ptrelem0-arm testdata/ptrelem.paslang; \
+	timeout 300 $(QEMU_A64) $(BUILDDIR)/ptrelem0-arm > $(BUILDDIR)/ptrelem0-arm.got; \
+	diff -u testdata/ptrelem.out $(BUILDDIR)/ptrelem0-arm.got; \
+	python3 -I scripts/check_ptrelem.py $(BUILDDIR)/ptrelem0-arm.s --arm; \
+	echo ok ptrelem-arm-asm; \
 	: P358 on arm64: the locals a read may reach first, zeroed alone; \
 	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/nestzero0-arm testdata/nestzero.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/nestzero0-arm > $(BUILDDIR)/nestzero0-arm.got; \

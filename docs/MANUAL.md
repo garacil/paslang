@@ -3409,7 +3409,11 @@ itself uses its own.
   result only (`q := PDWord(p) + 1`) or for good (`Inc(PDWord(p))`,
   `Inc(PWord(p), 3)`, `p := PByte(p) + 1`). `q - r` of two pointers of
   one type is the elements between them (two types need one view);
-  `=`, `<>`, `<` and `>` compare addresses.
+  `=`, `<>`, `<` and `>` compare addresses. `@p[i]` is that element's
+  address, one instruction from the registers that hold `p` and `i`
+  in a loop, a `lea` on amd64 and an `add` of the shifted register on
+  arm64, and a load or a store through it, `PInt64(@p[i])^`, takes
+  them itself (1.1.242, P385).
 
 `examples/pointers.paslang`:
 
