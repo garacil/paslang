@@ -4036,6 +4036,14 @@ gnalsap 2 0
   the last one declared or brought by `uses`, as in Free Pascal: a
   second helper for `Int64` hides the first unless it descends from it.
   `private` and `strict private` hold as in a class.
+- A class's member is looked up from the value's class to its parents,
+  at each class the helper for that class first and then the class's
+  own members, as Free Pascal's compiler does (1.1.232): a helper for
+  `TFoo` hides `TFoo`'s method of its name, but not a `TBar`'s own
+  method, its override or its field of that name, and a helper for
+  `TBar` leaves `TFoo`'s helper in reach for the names it does not
+  have. A `TBar` held in a `TFoo` variable reaches `TFoo`'s helper; the
+  class's name and a `with` look the same way (`testdata/helplevel`).
 - A helper's method is a routine whose first parameter is `Self`; a call
   costs what a routine's call costs.
 

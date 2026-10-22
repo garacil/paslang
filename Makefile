@@ -400,6 +400,9 @@ GOLDEN_A64 += opanon
 # P170: a class helper's constructor and static method through the class's name.
 GOLDEN += helpctor
 GOLDEN_A64 += helpctor
+# P380: a class's helper is searched at the class's own level.
+GOLDEN += helplevel
+GOLDEN_A64 += helplevel
 # P354: a routine's record keeps no saved register once it is loaded back.
 GOLDEN += gstale
 GOLDEN_A64 += gstale

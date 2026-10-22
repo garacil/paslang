@@ -557,6 +557,10 @@ type
     function ParseClassType(const AName: string): LongInt;
     function ParseHelperType(const AName: string; HKind: LongInt): LongInt;
     function HelperFor(T: LongInt): LongInt;
+    function HelperOfClass(C: LongInt): LongInt;
+    function ClassOwnHas(C: LongInt; const AName: string): Boolean;
+    function ClassHelperFor(Cls: LongInt; const AName: string): LongInt;
+    function MemberHelper(T: LongInt; const AName: string): LongInt;
     function HelperHas(H: LongInt; const AName: string): Boolean;
     function HelperSelf(Obj: PExpr; H: LongInt): PExpr;
     function HelperMember(Obj: PExpr; H: LongInt; const AName: string; ALine, ACol: LongInt): PExpr;
@@ -6832,7 +6836,7 @@ begin
     ni := ScopedIndex(t, AName, owner);
     if (RecFieldIdx(t, AName) >= 0) or ((TypeOf(t).Kind = tykClass) and ClassHas(t, AName)) or
       ((ni >= 0) and (FTypes[owner].Nested[ni].Kind <> 0)) or
-      ((HelperFor(t) <> 0) and HelperHas(HelperFor(t), AName)) then
+      (MemberHelper(t, AName) <> 0) then
     begin
       Result := i;
       Exit;
@@ -9166,8 +9170,97 @@ begin
   FMemberScope := saveScope;
 end;
 
+{ The helper declared last for class C itself (P380): Free Pascal keys a
+  class's helper by the class (search_last_objectpascal_helper), and a
+  helper for C's parent is reached at the parent. A class two units'
+  .pi both carry is one class, by its stem, as ClassUnder says. }
+function TParser.HelperOfClass(C: LongInt): LongInt;
+var
+  i: SizeInt;
+  h, tg: LongInt;
+begin
+  Result := 0;
+  for i := High(FHelpers) downto 0 do
+  begin
+    h := FHelpers[i];
+    tg := FTypes[h].Elem;
+    if (FTypes[h].Lo = 2) and (tg > 0) and
+      ((tg = C) or (TypeStemOf(FTypes[tg]) = TypeStemOf(FTypes[C]))) then
+    begin
+      Result := h;
+      Exit;
+    end;
+  end;
+end;
+
+{ Class C declares a member AName itself (P380): a field, a method, an
+  override among them, a property or a class variable of its own, not
+  the copy of its parent's it starts with (MemberOwner). }
+function TParser.ClassOwnHas(C: LongInt; const AName: string): Boolean;
+var
+  i: SizeInt;
+begin
+  Result := True;
+  for i := 0 to High(FTypes[C].Fields) do
+    if SameId(FTypes[C].Fields[i].Name, AName) and (MemberOwner(C, 0, i) = C) then
+      Exit;
+  for i := 0 to High(FTypes[C].Meths) do
+    if SameId(FTypes[C].Meths[i].Name, AName) and (MemberOwner(C, 1, i) = C) then
+      Exit;
+  for i := 0 to High(FTypes[C].Props) do
+    if SameId(FTypes[C].Props[i].Name, AName) and (MemberOwner(C, 2, i) = C) then
+      Exit;
+  for i := 0 to High(FTypes[C].CVars) do
+    if SameId(FTypes[C].CVars[i].Name, AName) and (MemberOwner(C, 3, i) = C) then
+      Exit;
+  Result := False;
+end;
+
+{ The helper whose member AName a value or the name of class Cls reaches
+  (P380), 0 when the class's own comes first or none has it: from Cls to
+  its parents, at each class the helper for that class first and then
+  the class's own members, as Free Pascal's searchsym_in_class walks
+  them. A helper for TFoo hid TBar's own method of its name, and a helper
+  for TBar TFoo's helper. }
+function TParser.ClassHelperFor(Cls: LongInt; const AName: string): LongInt;
+var
+  c, h, n: LongInt;
+begin
+  Result := 0;
+  c := Cls;
+  n := 0;
+  while (c > 0) and (c <= High(FTypes)) and (n < 10000) do
+  begin
+    h := HelperOfClass(c);
+    if (h <> 0) and HelperHas(h, AName) then
+    begin
+      Result := h;
+      Exit;
+    end;
+    if ClassOwnHas(c, AName) or (FTypes[c].Parent = c) then
+      Exit;
+    c := FTypes[c].Parent;
+    Inc(n);
+  end;
+end;
+
+{ The helper whose member AName a value of type T reaches, 0 for none: a
+  class's by its levels (ClassHelperFor), any other type's the one in
+  scope for it (P127), before the type's own members. }
+function TParser.MemberHelper(T: LongInt; const AName: string): LongInt;
+begin
+  Result := 0;
+  if T <= 0 then
+    Exit;
+  if TypeOf(T).Kind = tykClass then
+    Result := ClassHelperFor(T, AName)
+  else if (HelperFor(T) <> 0) and HelperHas(HelperFor(T), AName) then
+    Result := HelperFor(T);
+end;
+
 { The helper in scope for type T (P127): the last declared or loaded for
-  it, a class helper for T or an ancestor; 0 when there is none. }
+  it, a class helper for T or an ancestor; 0 when there is none. A
+  class's member is looked up through ClassHelperFor (P380). }
 function TParser.HelperFor(T: LongInt): LongInt;
 var
   i: SizeInt;
@@ -11207,7 +11300,7 @@ function TParser.DotMember(E: PExpr; const AName: string; ALine, ACol: LongInt):
 var
   st: TTypeDef;
   i, k, mi: SizeInt;
-  ftyp, foff, cls: LongInt;
+  ftyp, foff, cls, hk: LongInt;
   fname: string;
   found, have: Boolean;
   args: TExprArray;
@@ -11215,10 +11308,12 @@ begin
   if ScopedValue(E^.Typ, AName, Result) then
     Exit;
   { a member of the value's helper (P127), before the type's own: a
-    helper's method hides a class's of the name, as in FPC }
-  if (E^.Typ > 0) and (HelperFor(E^.Typ) <> 0) and HelperHas(HelperFor(E^.Typ), AName) then
+    helper's method hides a class's of the name, as in FPC, the class's
+    at the helper's own level (P380) }
+  hk := MemberHelper(E^.Typ, AName);
+  if hk <> 0 then
   begin
-    Result := HelperMember(E, HelperFor(E^.Typ), AName, ALine, ACol);
+    Result := HelperMember(E, hk, AName, ALine, ACol);
     Exit;
   end;
   cls := E^.Typ;
@@ -20071,7 +20166,8 @@ function TParser.HelperCtorOwner(Id: LongInt; const AName: string): LongInt;
 var
   i: SizeInt;
 begin
-  Result := HelperFor(Id);
+  { the helper the name reaches at its class's level (P380) }
+  Result := ClassHelperFor(Id, AName);
   while Result > 0 do
   begin
     for i := 0 to High(FTypes[Result].Meths) do
@@ -20410,8 +20506,8 @@ begin
     an object (DotMember): its constructor makes an object of Cls, or of
     the class VmtE holds, and its static method is a routine's call; the
     class alone was looked at }
-  h := HelperFor(Cls);
-  if (h <> 0) and HelperHas(h, AName) then
+  h := ClassHelperFor(Cls, AName);
+  if h <> 0 then
   begin
     if HelperCtorOwner(Cls, AName) > 0 then
     begin
