@@ -847,6 +847,28 @@ type. Operators on two types with no name, `array of Integer` and
 `array of Byte`, are two routines (`testdata/opanon`), where they were
 one symbol.
 
+A record declares its operators as well (1.1.233), as Free Pascal's
+extended records do, by symbol or by Delphi's name (table 9.1 of Free
+Pascal's reference): `class operator +(a, b: TComplex): TComplex;` or
+`class operator Add(const a, b: TComplex): TComplex;` in the record, and
+the body after the declarations, `class operator TComplex.+ (...)` or
+`class operator TComplex.Add(...)`. `Add`, `Subtract`, `Multiply`,
+`Divide`, `IntDivide`, `Modulus`, `Equal`, `NotEqual`, `LessThan`,
+`LessThanOrEqual`, `GreaterThan` and `GreaterThanOrEqual` are the binary
+operators, found for the record's values as a top-level one is; a
+comparison gives a Boolean, and one of the operands is the record.
+`Implicit` (or `:=`) makes a value of one type another, the record one
+of the two: wherever the value is assigned, passed or returned
+(`m := 250`, `Cents(300)`, `i := m`), and in a cast; `Explicit` in a
+cast alone (`Double(c)`, `TMoney(125)`). A value passes through one
+such operator at most, the one whose parameter takes it nearest. An
+operator's operands, a top-level one's too, take what a call's
+arguments take: `a * 3` finds `Multiply(a: TComplex; k: Double)`. A
+unit's interface record exports them (`testdata/recops`,
+`testdata/units/recopsuse`). Another type cast to a record or a static
+array with no such operator is refused, where `TR(5)` relabelled the
+integer as the record; `x as T` sees the bytes.
+
 `examples/bits.paslang`:
 
 ```pascal
@@ -12670,12 +12692,13 @@ method, a property or an enumeration member of one of these names is a
 compile error that names it, at the name: `Length is a reserved word,
 not a name at 5:3`. A unit's `.pi` is not checked for these names when
 it loads. The compiler loads only a `.pi` of the format it writes,
-`PASLANGI30`, and refuses an older one with the minimum compiler needed to
+`PASLANGI31`, and refuses an older one with the minimum compiler needed to
 rebuild it. A routine whose result is a record, a static array or a set
 of 32 bytes writes it where its caller says (1.1.213), and one of one to
 three words gives it back in registers (1.1.217), which a unit compiled
 before did not; the interface carries the operators it declares
-(1.1.230); a field or a property carries its `json`
+(1.1.230) and its records' conversions (1.1.233); a field or a property
+carries its `json`
 directive (1.1.131); a type may be `json`, kind 26 (1.1.124); Currency adds builtin type id 17; scoped members, generic
 origin/argument identity and every exported alias remain recorded. All
 installed libraries must be rebuilt when this format changes.

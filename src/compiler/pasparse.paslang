@@ -54,6 +54,15 @@ type
     Own: Boolean;  { declared in this program or unit, not a used unit's (P157) }
   end;
 
+  { A record's class operator Implicit or Explicit (P171): a value of
+    FromTyp made a ToTyp by Sym. }
+  TConvEnt = record
+    FromTyp, ToTyp: LongInt;
+    Sym: string;
+    Explicit: Boolean;
+    Own: Boolean;
+  end;
+
   TProcEnt = record
     Name: string;
     Sym: string;
@@ -162,6 +171,7 @@ type
     FModNoAddr: Boolean;      { ExprMod: an address taken is not a change (the const check, 1.1.1) }
     FProcs: array of TProcEnt;
     FOps: array of TOpEnt;
+    FConvs: array of TConvEnt;
     FTypes: TTypeDefArray;
     FTypeNames: array of TTypeName;
     FFuncName: string;
@@ -675,6 +685,11 @@ type
     procedure AddOp(Op: TBinOp; L, R, Ret: LongInt; const Sym: string; Own: Boolean);
     function OpOfWord(const W, Path: string): TBinOp;
     function OpTypeWord(T: LongInt): string;
+    procedure AddConv(F, T: LongInt; const Sym: string; Explicit, Own: Boolean);
+    function ConvFor(E: PExpr; Want: LongInt; Explicit: Boolean; out C: PExpr): Boolean;
+    function OpNear(Op: TBinOp; L, R: PExpr; out K: SizeInt): Boolean;
+    function RecOpWord(out Kind: LongInt; out Op: TBinOp; out OpW, Text: string): Boolean;
+    procedure ParseRecOperator(Rec: LongInt; const RecName: string; Head: Boolean);
     function ParseInherited: PExpr;
     function ParseExpr: PExpr;
     function ParseOr: PExpr;
@@ -4888,12 +4903,19 @@ end;
 function TParser.ValArg(Want: LongInt; E: PExpr): PExpr;
 var
   k: TTypeKind;
-  nl: PExpr;
+  nl, cv: PExpr;
 begin
   Result := StrArg(Want, E);
   if E = nil then
     Exit;
   CheckTyped(E);
+  { a record's class operator Implicit (P171): a value where the record
+    goes, or the record where another type goes }
+  if (Length(FConvs) > 0) and ConvFor(E, Want, False, cv) then
+  begin
+    Result := cv;
+    Exit;
+  end;
   { json (P203): only a json or nil goes into one, and a json only where
     a json goes: text becomes a json through JsonParse, a json's value
     comes out through j.AsString, j.AsInteger and the other members }
@@ -8724,6 +8746,12 @@ begin
     FTok := FLex.Next;
     isClassM := True;
   end;
+  { a record's class operator (P171) }
+  if isClassM and (Rec <> 0) and (FTok.Kind = tkIdent) and SameId(FTok.Lexeme, 'operator') then
+  begin
+    ParseRecOperator(Rec, AName, True);
+    Exit;
+  end;
   if isClassM and (FTok.Kind = tkVar) and (Rec <> 0) then
   begin
     FTok := FLex.Next;
@@ -11697,6 +11725,7 @@ function TParser.ParsePrimary0: PExpr;
 var
   name, mname, buf, fname: string;
   cv: Int64;
+  conv: PExpr;
   cft: LongInt;
   cfs: string;
   nstr, nchr, nline, ncol: LongInt;
@@ -11841,6 +11870,9 @@ begin
           CheckReach(e^.L, 0, 8);
           Exit;
         end;
+        { a record's class operator Explicit or Implicit (P171) }
+        if (Length(FConvs) > 0) and ConvFor(e, TyInteger, True, Result) then
+          Exit;
         st := TypeOf(e^.Typ);
         if not ((st.Kind = tykPointer) or (st.Kind = tykClass) or
           (st.Kind = tykMap) or (st.Kind = tykTree) or (st.Kind = tykHeap) or
@@ -11874,6 +11906,9 @@ begin
         Eat(tkLParen);
         e := ParseExpr;
         Eat(tkRParen);
+        { a record's class operator Explicit or Implicit (P171) }
+        if (Length(FConvs) > 0) and ConvFor(e, TyBoolean, True, Result) then
+          Exit;
         Result := BoolOf(e);
       end;
     tkStringKw:
@@ -13948,7 +13983,10 @@ begin
               Die('a json becomes ' + TypName(id) + ' through its members, j.AsString, ' +
                 'j.AsInteger and the others; j as ' + TypName(id) + ' sees its bytes' +
                 ' at ' + IntToStr(nline) + ':' + IntToStr(ncol));
-            if TypeOf(id).Kind = tykCurrency then
+            { a record's class operator Explicit or Implicit (P171) }
+            if (Length(FConvs) > 0) and ConvFor(args[0], id, True, conv) then
+              Result := conv
+            else if TypeOf(id).Kind = tykCurrency then
               Result := CurrOf(args[0])
             else if (TypeOf(args[0]^.Typ).Kind = tykCurrency) and (TypeOf(id).Kind = tykReal) then
             begin
@@ -14025,6 +14063,14 @@ begin
               if (TypeOf(args[0]^.Typ).Kind = tykReal) and (TypeOf(id).Kind <> tykReal) then
                 Die('a real becomes ' + TypName(id) + ' through Trunc or Round; x as ' +
                   TypName(id) + ' sees its bits' + HerePos);
+              { a record or a static array is made of its own type alone, or by
+                a class operator (P171): TR(5) relabelled the integer as the
+                record, whose other words were not the value's }
+              if (IsBlockTyp(id) or IsBlockTyp(args[0]^.Typ)) and (args[0]^.Typ <> TyNone) and
+                not SameTyp(id, args[0]^.Typ) then
+                Die(TypName(args[0]^.Typ) + ' does not go into ' + TypName(id) +
+                  ': a class operator Explicit or Implicit makes one, x as T sees its bytes' +
+                  PosOf(args[0]));
               if (TypeOf(args[0]^.Typ).Kind = tykBoolean) and (TypeOf(id).Kind <> tykBoolean) then
                 Result := AsInt(args[0], id)
               else
@@ -14543,6 +14589,7 @@ var
   sym: string;
   ret, rt: LongInt;
   args: TExprArray;
+  ok: SizeInt;
 begin
   args := nil;
   CheckTyped(L);
@@ -14565,6 +14612,16 @@ begin
     args[0] := L;
     args[1] := R;
     Result := NewCall(sym, args, ret);
+  end
+  else if ((TypeOf(L^.Typ).Kind = tykRecord) or (TypeOf(R^.Typ).Kind = tykRecord)) and
+    OpNear(Op, L, R, ok) then
+  begin
+    { the operator whose operands take L and R nearest, converted as a
+      call's arguments (P171) }
+    SetLength(args, 2);
+    args[0] := ValArg(FOps[ok].LTyp, L);
+    args[1] := ValArg(FOps[ok].RTyp, R);
+    Result := NewCall(FOps[ok].Sym, args, FOps[ok].Ret);
   end
   else if (TypeOf(L^.Typ).Kind = tykRecord) or
     (TypeOf(R^.Typ).Kind = tykRecord) then
@@ -19594,7 +19651,11 @@ begin
   { From 1.1.230 a unit's interface exports its operators (P157). }
   if Copy(data, 1, 11) = 'PASLANGI29' + #10 then
     Die(path + ' was compiled by a paslang older than 1.1.230; compile ' + AName + ' again');
-  if (Copy(data, 1, 8) = 'PASLANGI') and (Copy(data, 1, 11) <> 'PASLANGI30' + #10) then
+  { From 1.1.233 a unit's interface exports its records' conversions
+    (P171). }
+  if Copy(data, 1, 11) = 'PASLANGI30' + #10 then
+    Die(path + ' was compiled by a paslang older than 1.1.233; compile ' + AName + ' again');
+  if (Copy(data, 1, 8) = 'PASLANGI') and (Copy(data, 1, 11) <> 'PASLANGI31' + #10) then
     Die(path + ' was compiled by a newer paslang (' + FirstLine(data) +
       '); compile ' + AName + ' again with this one');
   if not ParseIface(data, iface) then
@@ -19691,6 +19752,10 @@ begin
   for j := 0 to High(iface.Ops) do
     AddOp(OpOfWord(iface.Ops[j].Op, path), MapImport(iface.Ops[j].LTyp),
       MapImport(iface.Ops[j].RTyp), MapImport(iface.Ops[j].Ret), iface.Ops[j].Sym, False);
+  { and its records' conversions (P171) }
+  for j := 0 to High(iface.Convs) do
+    AddConv(MapImport(iface.Convs[j].FromTyp), MapImport(iface.Convs[j].ToTyp), iface.Convs[j].Sym,
+      iface.Convs[j].Explicit, False);
   for j := 0 to High(iface.Consts) do
   begin
     k := ConstIdx(iface.Consts[j].Name);
@@ -24127,6 +24192,386 @@ begin
     end;
 end;
 
+{ The conversion of a value of type F into a T done by Sym (P171): a
+  later declaration of it hides the one before, a later unit's an
+  earlier one's and the program's own a unit's, as AddOp says. }
+procedure TParser.AddConv(F, T: LongInt; const Sym: string; Explicit, Own: Boolean);
+var
+  i, n: SizeInt;
+begin
+  for i := 0 to High(FConvs) do
+    if (FConvs[i].Explicit = Explicit) and SameTyp(FConvs[i].FromTyp, F) and
+      SameTyp(FConvs[i].ToTyp, T) then
+    begin
+      FConvs[i].Sym := Sym;
+      FConvs[i].Own := Own;
+      Exit;
+    end;
+  n := Length(FConvs);
+  SetLength(FConvs, n + 1);
+  FConvs[n].FromTyp := F;
+  FConvs[n].ToTyp := T;
+  FConvs[n].Sym := Sym;
+  FConvs[n].Explicit := Explicit;
+  FConvs[n].Own := Own;
+end;
+
+{ E made a Want by a record's class operator (P171), in C: an Implicit
+  one, and in a cast (Explicit) an Explicit one too, before an Implicit
+  of the same price; among them the one whose parameter takes E
+  nearest, as a call's overloads are priced (MatchCost), its argument
+  converted as a call's is; two at one price are ambiguous. A value
+  passes through one such operator at most, as in Free Pascal. }
+function TParser.ConvFor(E: PExpr; Want: LongInt; Explicit: Boolean; out C: PExpr): Boolean;
+var
+  i, best: SizeInt;
+  cost, bc: LongInt;
+  amb: Boolean;
+  args: TExprArray;
+begin
+  Result := False;
+  C := nil;
+  if (Length(FConvs) = 0) or (E = nil) or (Want <= TyNone) or (E^.Typ <= TyNone) or
+    SameTyp(E^.Typ, Want) then
+    Exit;
+  best := -1;
+  bc := 0;
+  amb := False;
+  for i := 0 to High(FConvs) do
+    if SameTyp(FConvs[i].ToTyp, Want) and (Explicit or not FConvs[i].Explicit) then
+    begin
+      cost := MatchCost(E, FConvs[i].FromTyp, False);
+      if cost < 0 then
+        Continue;
+      cost := 2 * cost;
+      if not FConvs[i].Explicit then
+        cost := cost + 1;
+      if (best < 0) or (cost < bc) then
+      begin
+        best := i;
+        bc := cost;
+        amb := False;
+      end
+      else if cost = bc then
+        amb := True;
+    end;
+  if best < 0 then
+    Exit;
+  if amb then
+    Die('two class operators make ' + TypName(E^.Typ) + ' a ' + TypName(Want) + PosOf(E));
+  args := nil;
+  SetLength(args, 1);
+  args[0] := ValArg(FConvs[best].FromTyp, E);
+  C := NewCall(FConvs[best].Sym, args, Want);
+  Result := True;
+end;
+
+{ The operator Op whose operands L and R take nearest (P171), its index
+  in FOps in K: L and R priced as a call's arguments (MatchCost), the
+  least total wins and a tie is ambiguous. FindOp took the exact types
+  alone, so a * 3 found no operator * (A: TComplex; K: Double). }
+function TParser.OpNear(Op: TBinOp; L, R: PExpr; out K: SizeInt): Boolean;
+var
+  i: SizeInt;
+  cl, cr, bc: LongInt;
+  amb: Boolean;
+begin
+  Result := False;
+  K := -1;
+  bc := 0;
+  amb := False;
+  for i := 0 to High(FOps) do
+    if FOps[i].Op = Op then
+    begin
+      cl := MatchCost(L, FOps[i].LTyp, False);
+      cr := MatchCost(R, FOps[i].RTyp, False);
+      if (cl < 0) or (cr < 0) then
+        Continue;
+      if (K < 0) or (cl + cr < bc) then
+      begin
+        K := i;
+        bc := cl + cr;
+        amb := False;
+      end
+      else if cl + cr = bc then
+        amb := True;
+    end;
+  if K < 0 then
+    Exit;
+  if amb then
+    Die('two operators ' + BinWord(Op) + ' take ' + TypName(L^.Typ) + ' and ' + TypName(R^.Typ) +
+      PosOf(L));
+  Result := True;
+end;
+
+{ The word of a record's class operator at FTok (P171), as Free Pascal
+  writes it (+, -, *, /, div, mod, the comparisons, := for Implicit) or
+  as Delphi names it (Add, Subtract, Multiply, Divide, IntDivide,
+  Modulus, Equal, NotEqual, LessThan, LessThanOrEqual, GreaterThan,
+  GreaterThanOrEqual, Implicit, Explicit); Kind 0 a binary operator Op,
+  1 Implicit, 2 Explicit; OpW the routine's word, Text as it is told.
+  False for none of these. }
+function TParser.RecOpWord(out Kind: LongInt; out Op: TBinOp; out OpW, Text: string): Boolean;
+var
+  w: string;
+begin
+  Result := True;
+  Kind := 0;
+  Op := boAdd;
+  OpW := '';
+  Text := FTok.Lexeme;
+  w := '';
+  if FTok.Kind = tkIdent then
+    w := ToLower(FTok.Lexeme);
+  if (FTok.Kind = tkPlus) or (w = 'add') then
+    Op := boAdd
+  else if (FTok.Kind = tkMinus) or (w = 'subtract') then
+    Op := boSub
+  else if (FTok.Kind = tkStar) or (w = 'multiply') then
+    Op := boMul
+  else if (FTok.Kind = tkSlash) or (w = 'divide') then
+    Op := boSlash
+  else if (FTok.Kind = tkDivKw) or (w = 'intdivide') then
+    Op := boDiv
+  else if (FTok.Kind = tkModKw) or (w = 'modulus') then
+    Op := boMod
+  else if (FTok.Kind = tkEq) or (w = 'equal') then
+    Op := boEq
+  else if (FTok.Kind = tkNe) or (w = 'notequal') then
+    Op := boNe
+  else if (FTok.Kind = tkLt) or (w = 'lessthan') then
+    Op := boLt
+  else if (FTok.Kind = tkLe) or (w = 'lessthanorequal') then
+    Op := boLe
+  else if (FTok.Kind = tkGt) or (w = 'greaterthan') then
+    Op := boGt
+  else if (FTok.Kind = tkGe) or (w = 'greaterthanorequal') then
+    Op := boGe
+  else if (FTok.Kind = tkAssign) or (w = 'implicit') then
+  begin
+    Kind := 1;
+    OpW := 'implicit';
+    Text := 'Implicit';
+  end
+  else if w = 'explicit' then
+  begin
+    Kind := 2;
+    OpW := 'explicit';
+    Text := 'Explicit';
+  end
+  else
+    Result := False;
+  if Result and (Kind = 0) then
+  begin
+    { the word ParseOperator gives a top-level operator's routine }
+    case Op of
+      boAdd: OpW := 'add';
+      boSub: OpW := 'sub';
+      boMul: OpW := 'mul';
+      boSlash: OpW := 'slash';
+      boDiv: OpW := 'div';
+      boMod: OpW := 'mod';
+      boEq: OpW := 'eq';
+      boNe: OpW := 'ne';
+      boLt: OpW := 'lt';
+      boLe: OpW := 'le';
+      boGt: OpW := 'gt';
+    else
+      OpW := 'ge';
+    end;
+    Text := BinWord(Op);
+  end;
+end;
+
+{ A record's class operator (P171): its head in the record Rec, named
+  RecName (Head), or its body after the declarations, class operator
+  TRec.Add(...) or TRec.+ (...). A binary one takes two operands, one of
+  them the record, a comparison gives a Boolean; Implicit and Explicit
+  take one value and make another, the record one of the two. The head
+  is a routine without a body yet, which the body completes, its types
+  the head's; a binary one goes into FOps as a top-level operator does
+  (P157), a conversion into FConvs, and a unit's interface record
+  exports them. }
+procedure TParser.ParseRecOperator(Rec: LongInt; const RecName: string; Head: Boolean);
+var
+  pr, held: TProc;
+  op: TBinOp;
+  kind: LongInt;
+  names: array of string;
+  nn, i, n, pidx: SizeInt;
+  t, recT, lt, rt: LongInt;
+  rname, opw, txt, at, what: string;
+begin
+  recT := Rec;
+  rname := RecName;
+  FTok := FLex.Next;
+  if not Head then
+  begin
+    if FTok.Kind <> tkIdent then
+      Die('the record''s name goes before its class operator''s' + HerePos);
+    rname := FTok.Lexeme;
+    if (not NamedType(rname, recT)) or (TypeOf(recT).Kind <> tykRecord) then
+      Die(rname + ' is no record of this program or unit' + HerePos);
+    FTok := FLex.Next;
+    Eat(tkDot);
+  end;
+  at := HerePos;
+  FDeclAt := at;
+  if not RecOpWord(kind, op, opw, txt) then
+    Die('a record''s class operator is +, -, *, /, div, mod, a comparison, Implicit (:=) or ' +
+      'Explicit, or its name (Add, Equal...), not ' + FTok.Lexeme + at);
+  FTok := FLex.Next;
+  Eat(tkLParen);
+  pr := Default(TProc);
+  pr.IsFunc := True;
+  pr.Params := nil;
+  while True do
+  begin
+    { const as Delphi writes it: the operand is a value all the same }
+    if FTok.Kind = tkConst then
+      FTok := FLex.Next;
+    names := nil;
+    nn := 0;
+    while True do
+    begin
+      if not IsName then
+        Die('parameter name');
+      SetLength(names, nn + 1);
+      names[nn] := FTok.Lexeme;
+      Inc(nn);
+      FTok := FLex.Next;
+      if FTok.Kind <> tkComma then
+        Break;
+      FTok := FLex.Next;
+    end;
+    Eat(tkColon);
+    t := Self.ParseType;
+    for i := 0 to nn - 1 do
+    begin
+      n := Length(pr.Params);
+      SetLength(pr.Params, n + 1);
+      pr.Params[n].Name := names[i];
+      pr.Params[n].Typ := t;
+      pr.Params[n].ByRef := False;
+      pr.Params[n].HasDef := False;
+      pr.Params[n].DefStr := '';
+    end;
+    if FTok.Kind <> tkSemi then
+      Break;
+    FTok := FLex.Next;
+  end;
+  Eat(tkRParen);
+  Eat(tkColon);
+  pr.RetTyp := Self.ParseType;
+  Eat(tkSemi);
+  while (FTok.Kind = tkIdent) and (SameId(FTok.Lexeme, 'inline') or SameId(FTok.Lexeme, 'overload')) do
+  begin
+    FTok := FLex.Next;
+    Eat(tkSemi);
+  end;
+  if kind = 0 then
+  begin
+    if Length(pr.Params) <> 2 then
+      Die('class operator ' + txt + ' takes 2 operands' + at);
+    lt := pr.Params[0].Typ;
+    rt := pr.Params[1].Typ;
+    if (lt <> recT) and (rt <> recT) then
+      Die(rname + '''s class operator ' + txt + ' takes a ' + rname + at);
+    if ((op = boEq) or (op = boNe) or (op = boLt) or (op = boLe) or (op = boGt) or (op = boGe)) and
+      (pr.RetTyp <> TyBoolean) then
+      Die('class operator ' + txt + ' gives a Boolean' + at);
+    what := 'operator ' + txt + ' on ' + TypName(lt) + ' and ' + TypName(rt);
+    pr.Name := 'op_' + opw + '_' + TypeOf(lt).Name;
+  end
+  else
+  begin
+    if Length(pr.Params) <> 1 then
+      Die('class operator ' + txt + ' takes 1 value' + at);
+    lt := pr.Params[0].Typ;
+    rt := pr.RetTyp;
+    if (lt <> recT) and (rt <> recT) then
+      Die(rname + '''s class operator ' + txt + ' takes or gives a ' + rname + at);
+    if SameTyp(lt, rt) then
+      Die('class operator ' + txt + ' takes and gives a ' + TypName(lt) +
+        '; a conversion goes from one type to another' + at);
+    what := 'class operator ' + txt + ' from ' + TypName(lt) + ' to ' + TypName(rt);
+    pr.Name := 'op_' + opw + '_' + TypeOf(lt).Name + '_' + TypeOf(rt).Name;
+  end;
+  pr.Sym := ProcSym('', StemOfName(rname) + '_op_' + opw + '_' + OpTypeWord(lt) + '_' +
+    OpTypeWord(rt));
+  pr.Nest := 0;
+  if not Head then
+  begin
+    { the body of the head the record declared }
+    pidx := -1;
+    for i := 0 to High(FProg.Procs) do
+      if (FProg.Procs[i].Sym = pr.Sym) and not FProg.Procs[i].IsExt then
+        pidx := i;
+    if pidx < 0 then
+      Die(rname + ' declares no ' + what + at);
+    if FProg.Procs[pidx].Body <> nil then
+      Die(rname + '''s ' + what + ' has a body already' + at);
+    if (FProg.Procs[pidx].RetTyp <> pr.RetTyp) or (FProg.Procs[pidx].Params[0].Typ <> lt) or
+      ((kind = 0) and (FProg.Procs[pidx].Params[1].Typ <> rt)) then
+      Die('the body of ' + rname + '''s ' + what + ' is of other types than its head' + at);
+    FProg.Procs[pidx].Params := pr.Params;
+    ApplyParams(pr.Name, pr.Params);
+    { nested routines append to FProg.Procs and may move the array }
+    held := FProg.Procs[pidx];
+    ParseProcBody(held);
+    FProg.Procs[pidx] := held;
+    Exit;
+  end;
+  { a second one of the same types in one program or unit, here or at
+    the top level, is one too many; a used unit's is hidden instead }
+  if kind = 0 then
+  begin
+    for i := 0 to High(FOps) do
+      if FOps[i].Own and (FOps[i].Op = op) and SameTyp(FOps[i].LTyp, lt) and
+        SameTyp(FOps[i].RTyp, rt) then
+        Die(what + ' declared twice' + at);
+  end
+  else
+    for i := 0 to High(FConvs) do
+      if FConvs[i].Own and (FConvs[i].Explicit = (kind = 2)) and SameTyp(FConvs[i].FromTyp, lt) and
+        SameTyp(FConvs[i].ToTyp, rt) then
+        Die(what + ' declared twice' + at);
+  pr.InIface := FIsUnit and not FInImpl;
+  pr.Body := nil;
+  AddProcEnt(pr.Name, pr.Sym, True, Length(pr.Params), pr.RetTyp);
+  ApplyParams(pr.Name, pr.Params);
+  n := Length(FProg.Procs);
+  SetLength(FProg.Procs, n + 1);
+  FProg.Procs[n] := pr;
+  RememberMethod(pr.Sym, rname + '''s ' + what, at);
+  if kind = 0 then
+    AddOp(op, lt, rt, pr.RetTyp, pr.Sym, True)
+  else
+    AddConv(lt, rt, pr.Sym, kind = 2, True);
+  if FIsUnit and not FInImpl then
+  begin
+    if kind = 0 then
+    begin
+      n := Length(FProg.Ops);
+      SetLength(FProg.Ops, n + 1);
+      FProg.Ops[n].Op := op;
+      FProg.Ops[n].LTyp := lt;
+      FProg.Ops[n].RTyp := rt;
+      FProg.Ops[n].Ret := pr.RetTyp;
+      FProg.Ops[n].Sym := pr.Sym;
+    end
+    else
+    begin
+      n := Length(FProg.Convs);
+      SetLength(FProg.Convs, n + 1);
+      FProg.Convs[n].FromTyp := lt;
+      FProg.Convs[n].ToTyp := rt;
+      FProg.Convs[n].Explicit := kind = 2;
+      FProg.Convs[n].Sym := pr.Sym;
+    end;
+  end;
+end;
+
 { The operator an OPER line of a .pi names (P157). }
 function TParser.OpOfWord(const W, Path: string): TBinOp;
 begin
@@ -24272,6 +24717,9 @@ begin
   pr.Params := nil;
   while True do
   begin
+    { const, as Free Pascal allows it: the operand is a value (P171) }
+    if FTok.Kind = tkConst then
+      FTok := FLex.Next;
     names := nil;
     nn := 0;
     while True do
@@ -25949,12 +26397,22 @@ begin
         begin
           { the body of a class method, constructor or destructor (P123) }
           FTok := FLex.Next;
-          if (FTok.Kind <> tkProcedure) and (FTok.Kind <> tkFunction) and
-            (FTok.Kind <> tkConstructor) and (FTok.Kind <> tkDestructor) then
-            Die('class goes before the body of a class method' + HerePos);
-          if not NeedBody then
-            Die('a class method belongs to a class' + HerePos);
-          FNextClassMeth := True;
+          if (FTok.Kind = tkIdent) and SameId(FTok.Lexeme, 'operator') then
+          begin
+            { the body of a record's class operator (P171) }
+            if not NeedBody then
+              Die('the body of a class operator goes in the implementation' + HerePos);
+            ParseRecOperator(0, '', False);
+          end
+          else
+          begin
+            if (FTok.Kind <> tkProcedure) and (FTok.Kind <> tkFunction) and
+              (FTok.Kind <> tkConstructor) and (FTok.Kind <> tkDestructor) then
+              Die('class goes before the body of a class method' + HerePos);
+            if not NeedBody then
+              Die('a class method belongs to a class' + HerePos);
+            FNextClassMeth := True;
+          end;
         end;
       tkProcedure, tkFunction, tkConstructor, tkDestructor:
         begin
@@ -26138,6 +26596,15 @@ begin
         if FOps[j].Own and (FOps[j].Sym = FProg.Procs[i].Sym) then
           Die('missing implementation of operator ' + BinWord(FOps[j].Op) + ' on ' +
             TypName(FOps[j].LTyp) + ' and ' + TypName(FOps[j].RTyp));
+      for j := 0 to High(FConvs) do
+        if FConvs[j].Own and (FConvs[j].Sym = FProg.Procs[i].Sym) then
+        begin
+          if FConvs[j].Explicit then
+            Die('missing implementation of class operator Explicit from ' +
+              TypName(FConvs[j].FromTyp) + ' to ' + TypName(FConvs[j].ToTyp));
+          Die('missing implementation of class operator Implicit from ' +
+            TypName(FConvs[j].FromTyp) + ' to ' + TypName(FConvs[j].ToTyp));
+        end;
       Die('missing implementation of ' + FProg.Procs[i].Name);
     end;
     if FProg.Procs[i].IsFwd and (FProg.Procs[i].Body = nil) then
