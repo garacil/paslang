@@ -51,6 +51,7 @@ type
     Op: TBinOp;
     LTyp, RTyp, Ret: LongInt;
     Sym: string;
+    Own: Boolean;  { declared in this program or unit, not a used unit's (P157) }
   end;
 
   TProcEnt = record
@@ -665,7 +666,10 @@ type
     function CurrOf(E: PExpr): PExpr;
     function CurrCall(const Name: string; A, B: PExpr; Ret: LongInt): PExpr;
     function CurrBin(Op: TBinOp; L, R: PExpr): PExpr;
-    procedure ParseOperator;
+    procedure ParseOperator(NeedBody: Boolean);
+    procedure AddOp(Op: TBinOp; L, R, Ret: LongInt; const Sym: string; Own: Boolean);
+    function OpOfWord(const W, Path: string): TBinOp;
+    function OpTypeWord(T: LongInt): string;
     function ParseInherited: PExpr;
     function ParseExpr: PExpr;
     function ParseOr: PExpr;
@@ -1419,6 +1423,12 @@ begin
     boAnd: Result := 'and';
     boOr: Result := 'or';
     boXor: Result := 'xor';
+    boEq: Result := '=';
+    boNe: Result := '<>';
+    boLt: Result := '<';
+    boLe: Result := '<=';
+    boGt: Result := '>';
+    boGe: Result := '>=';
   else
     Result := 'this operator';
   end;
@@ -19488,7 +19498,10 @@ begin
     (P366). }
   if Copy(data, 1, 11) = 'PASLANGI28' + #10 then
     Die(path + ' was compiled by a paslang older than 1.1.217; compile ' + AName + ' again');
-  if (Copy(data, 1, 8) = 'PASLANGI') and (Copy(data, 1, 11) <> 'PASLANGI29' + #10) then
+  { From 1.1.230 a unit's interface exports its operators (P157). }
+  if Copy(data, 1, 11) = 'PASLANGI29' + #10 then
+    Die(path + ' was compiled by a paslang older than 1.1.230; compile ' + AName + ' again');
+  if (Copy(data, 1, 8) = 'PASLANGI') and (Copy(data, 1, 11) <> 'PASLANGI30' + #10) then
     Die(path + ' was compiled by a newer paslang (' + FirstLine(data) +
       '); compile ' + AName + ' again with this one');
   if not ParseIface(data, iface) then
@@ -19580,6 +19593,11 @@ begin
     SetLength(FProg.Procs, n + 1);
     FProg.Procs[n] := pr;
   end;
+  { the unit's operators (P157): a later unit's on the same types hides
+    an earlier one's, as its routines do (P138) }
+  for j := 0 to High(iface.Ops) do
+    AddOp(OpOfWord(iface.Ops[j].Op, path), MapImport(iface.Ops[j].LTyp),
+      MapImport(iface.Ops[j].RTyp), MapImport(iface.Ops[j].Ret), iface.Ops[j].Sym, False);
   for j := 0 to High(iface.Consts) do
   begin
     k := ConstIdx(iface.Consts[j].Name);
@@ -23916,8 +23934,9 @@ begin
   Result := False;
   Sym := '';
   Ret := TyNone;
+  { a type two units' .pi brought in is one type under two ids (P157) }
   for i := 0 to High(FOps) do
-    if (FOps[i].Op = Op) and (FOps[i].LTyp = L) and (FOps[i].RTyp = R) then
+    if (FOps[i].Op = Op) and SameTyp(FOps[i].LTyp, L) and SameTyp(FOps[i].RTyp, R) then
     begin
       Sym := FOps[i].Sym;
       Ret := FOps[i].Ret;
@@ -23926,16 +23945,107 @@ begin
     end;
 end;
 
-procedure TParser.ParseOperator;
+{ A type's word in the symbol of an operator (P157): its name, or '.'
+  and its number for a type with no name or a name no symbol holds
+  (array of Integer, a specialization), which no name is. Two operators
+  on two such types were one symbol twice. }
+function TParser.OpTypeWord(T: LongInt): string;
 var
-  pr: TProc;
+  i: SizeInt;
+  c: Char;
+begin
+  Result := TypeOf(T).Name;
+  if Result = '' then
+    Result := '.' + IntToStr(T)
+  else
+    for i := 1 to Length(Result) do
+    begin
+      c := Result[i];
+      if not (((c >= 'a') and (c <= 'z')) or ((c >= 'A') and (c <= 'Z')) or
+        ((c >= '0') and (c <= '9')) or (c = '_')) then
+      begin
+        Result := '.' + IntToStr(T);
+        Exit;
+      end;
+    end;
+end;
+
+{ The operator an OPER line of a .pi names (P157). }
+function TParser.OpOfWord(const W, Path: string): TBinOp;
+begin
+  Result := boAdd;
+  if W = 'add' then
+    Result := boAdd
+  else if W = 'sub' then
+    Result := boSub
+  else if W = 'mul' then
+    Result := boMul
+  else if W = 'eq' then
+    Result := boEq
+  else if W = 'ne' then
+    Result := boNe
+  else if W = 'lt' then
+    Result := boLt
+  else if W = 'le' then
+    Result := boLe
+  else if W = 'gt' then
+    Result := boGt
+  else if W = 'ge' then
+    Result := boGe
+  else if W = 'slash' then
+    Result := boSlash
+  else if W = 'div' then
+    Result := boDiv
+  else if W = 'mod' then
+    Result := boMod
+  else
+    Die('bad compiled interface ' + Path + ': operator ' + W);
+end;
+
+{ The operator Op on L and R, done by Sym: a later declaration of it on
+  the same types hides the one before, a later unit's an earlier one's
+  (P138) and the program's own a unit's (P158) (P157). The types are
+  the same as SameTyp says: each unit's .pi brings its own copy of a
+  type another unit declared. Own says the program or unit being
+  compiled declares it. }
+procedure TParser.AddOp(Op: TBinOp; L, R, Ret: LongInt; const Sym: string; Own: Boolean);
+var
+  i, n: SizeInt;
+begin
+  for i := 0 to High(FOps) do
+    if (FOps[i].Op = Op) and SameTyp(FOps[i].LTyp, L) and SameTyp(FOps[i].RTyp, R) then
+    begin
+      FOps[i].Ret := Ret;
+      FOps[i].Sym := Sym;
+      FOps[i].Own := Own;
+      Exit;
+    end;
+  n := Length(FOps);
+  SetLength(FOps, n + 1);
+  FOps[n].Op := Op;
+  FOps[n].LTyp := L;
+  FOps[n].RTyp := R;
+  FOps[n].Ret := Ret;
+  FOps[n].Sym := Sym;
+  FOps[n].Own := Own;
+end;
+
+{ operator + (A, B: T): R; and its body. In a unit's interface the head
+  alone, which the .pi exports (P157, as Free Pascal's interface
+  declares an operator); the implementation's operator of the same types
+  gives that head its body. }
+procedure TParser.ParseOperator(NeedBody: Boolean);
+var
+  pr, held: TProc;
   op: TBinOp;
   names: array of string;
-  nn, i, n: SizeInt;
+  nn, i, n, pidx: SizeInt;
   t: LongInt;
-  oname: string;
+  oname, at: string;
 begin
   FTok := FLex.Next;
+  { where the operator is told (P157) }
+  at := HerePos;
   if FTok.Kind = tkPlus then
   begin
     op := boAdd;
@@ -24045,23 +24155,64 @@ begin
   { a unit's operator carries the unit's name, as its routines do (P154):
     two units may each give a TVec its + }
   if FIsUnit and not IsCoreUnit(FUnitName) then
-    pr.Sym := ProcSym(FUnitName, pr.Name + '_' + TypeOf(pr.Params[1].Typ).Name)
+    pr.Sym := ProcSym(FUnitName, 'op_' + oname + '_' + OpTypeWord(pr.Params[0].Typ) + '_' +
+      OpTypeWord(pr.Params[1].Typ))
   else
-    pr.Sym := ProcSym('', pr.Name + '_' + TypeOf(pr.Params[1].Typ).Name);
+    pr.Sym := ProcSym('', 'op_' + oname + '_' + OpTypeWord(pr.Params[0].Typ) + '_' +
+      OpTypeWord(pr.Params[1].Typ));
   pr.Nest := 0;
+  { the implementation's operator whose head the interface declared }
+  pidx := -1;
+  if NeedBody then
+    for i := 0 to High(FProg.Procs) do
+      if FProg.Procs[i].InIface and (FProg.Procs[i].Body = nil) and (FProg.Procs[i].Sym = pr.Sym) then
+        pidx := i;
+  if pidx >= 0 then
+  begin
+    if (FProg.Procs[pidx].RetTyp <> pr.RetTyp) or
+      (FProg.Procs[pidx].Params[0].Typ <> pr.Params[0].Typ) or
+      (FProg.Procs[pidx].Params[1].Typ <> pr.Params[1].Typ) then
+      Die('implementation does not match operator ' + BinWord(op) + ' on ' + TypName(pr.Params[0].Typ) +
+        ' and ' + TypName(pr.Params[1].Typ) + at);
+    FProg.Procs[pidx].Params := pr.Params;
+    ApplyParams(pr.Name, pr.Params);
+    { nested routines append to FProg.Procs and may move the array }
+    held := FProg.Procs[pidx];
+    ParseProcBody(held);
+    FProg.Procs[pidx] := held;
+    Exit;
+  end;
+  { a second operator on the same types in one program or unit, a head
+    or a body, is one too many; a used unit's is hidden instead. Two
+    bodies gave the assembler one symbol twice. }
+  for i := 0 to High(FOps) do
+    if FOps[i].Own and (FOps[i].Op = op) and SameTyp(FOps[i].LTyp, pr.Params[0].Typ) and
+      SameTyp(FOps[i].RTyp, pr.Params[1].Typ) then
+      Die('operator ' + BinWord(op) + ' on ' + TypName(pr.Params[0].Typ) + ' and ' +
+        TypName(pr.Params[1].Typ) + ' declared twice' + at);
   AddProcEnt(pr.Name, pr.Sym, True, 2, pr.RetTyp);
   ApplyParams(pr.Name, pr.Params);
-  ParseProcBody(pr);
+  if NeedBody then
+    ParseProcBody(pr)
+  else
+  begin
+    pr.InIface := True;
+    pr.Body := nil;
+  end;
   n := Length(FProg.Procs);
   SetLength(FProg.Procs, n + 1);
   FProg.Procs[n] := pr;
-  n := Length(FOps);
-  SetLength(FOps, n + 1);
-  FOps[n].Op := op;
-  FOps[n].LTyp := pr.Params[0].Typ;
-  FOps[n].RTyp := pr.Params[1].Typ;
-  FOps[n].Ret := pr.RetTyp;
-  FOps[n].Sym := pr.Sym;
+  AddOp(op, pr.Params[0].Typ, pr.Params[1].Typ, pr.RetTyp, pr.Sym, True);
+  if FIsUnit and (not NeedBody) then
+  begin
+    n := Length(FProg.Ops);
+    SetLength(FProg.Ops, n + 1);
+    FProg.Ops[n].Op := op;
+    FProg.Ops[n].LTyp := pr.Params[0].Typ;
+    FProg.Ops[n].RTyp := pr.Params[1].Typ;
+    FProg.Ops[n].Ret := pr.RetTyp;
+    FProg.Ops[n].Sym := pr.Sym;
+  end;
 end;
 
 { ---- typed JSON: the encoders the compiler writes (P205) ----
@@ -25618,7 +25769,7 @@ begin
   begin
     if (FTok.Kind = tkIdent) and SameId(FTok.Lexeme, 'operator') then
     begin
-      ParseOperator;
+      ParseOperator(NeedBody);
       Continue;
     end;
     case FTok.Kind of
@@ -25776,7 +25927,7 @@ end;
 
 function TParser.ParseUnit: TProgram;
 var
-  i, n0: SizeInt;
+  i, j, n0: SizeInt;
   cpuGen: LongInt;
 begin
   FNameCheck := True;
@@ -25825,7 +25976,13 @@ begin
   for i := 0 to High(FProg.Procs) do
   begin
     if FProg.Procs[i].InIface and (FProg.Procs[i].Body = nil) then
+    begin
+      for j := 0 to High(FOps) do
+        if FOps[j].Own and (FOps[j].Sym = FProg.Procs[i].Sym) then
+          Die('missing implementation of operator ' + BinWord(FOps[j].Op) + ' on ' +
+            TypName(FOps[j].LTyp) + ' and ' + TypName(FOps[j].RTyp));
       Die('missing implementation of ' + FProg.Procs[i].Name);
+    end;
     if FProg.Procs[i].IsFwd and (FProg.Procs[i].Body = nil) then
       Die('missing body of ' + FProg.Procs[i].Name);
   end;

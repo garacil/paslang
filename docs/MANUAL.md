@@ -831,6 +831,22 @@ Then `c := a + b` calls it; the operands may be of two types
 (`operator * (A: TPoint; K: Integer): TPoint`), and a comparison
 returns a Boolean (`testdata/opadd`, `opmore`).
 
+A unit's interface may declare an operator's head alone,
+`operator + (A, B: TVec): TVec;`, as Free Pascal's does, and its
+implementation gives the body, where an operator may call one whose
+body comes later. The unit's `.pi` carries it, and a program or a unit
+that uses the unit finds it (1.1.230): a later unit's operator on the
+same types hides an earlier one's, and the program's own hides a
+unit's, as routines do, while inside each unit its own stays in force
+(`testdata/units/opvecuse`). An operator only the implementation
+declares stays the unit's. One operator on the same types declared
+twice in one program or unit, two heads or two bodies, is a compile
+error at the second, where the assembler saw one symbol twice; so is
+an interface's operator with no body, or whose body returns another
+type. Operators on two types with no name, `array of Integer` and
+`array of Byte`, are two routines (`testdata/opanon`), where they were
+one symbol.
+
 `examples/bits.paslang`:
 
 ```pascal
@@ -12638,11 +12654,12 @@ method, a property or an enumeration member of one of these names is a
 compile error that names it, at the name: `Length is a reserved word,
 not a name at 5:3`. A unit's `.pi` is not checked for these names when
 it loads. The compiler loads only a `.pi` of the format it writes,
-`PASLANGI29`, and refuses an older one with the minimum compiler needed to
+`PASLANGI30`, and refuses an older one with the minimum compiler needed to
 rebuild it. A routine whose result is a record, a static array or a set
 of 32 bytes writes it where its caller says (1.1.213), and one of one to
 three words gives it back in registers (1.1.217), which a unit compiled
-before did not; a field or a property carries its `json`
+before did not; the interface carries the operators it declares
+(1.1.230); a field or a property carries its `json`
 directive (1.1.131); a type may be `json`, kind 26 (1.1.124); Currency adds builtin type id 17; scoped members, generic
 origin/argument identity and every exported alias remain recorded. All
 installed libraries must be rebuilt when this format changes.
