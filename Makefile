@@ -412,6 +412,9 @@ GOLDEN_A64 += opunary recops2
 # P207: building and transforming json.
 GOLDEN += jsonbuild jsonmod
 GOLDEN_A64 += jsonbuild jsonmod
+# P382: a write to a broken pipe is EPIPE.
+GOLDEN += brokenpipe
+GOLDEN_A64 += brokenpipe
 # P354: a routine's record keeps no saved register once it is loaded back.
 GOLDEN += gstale
 GOLDEN_A64 += gstale
@@ -3978,6 +3981,12 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q '^paslang: string view over bytes not marked shared$$' $(BUILDDIR)/fatal_svmark.err; \
 	grep -q '^paslang: string view length 16 out of range$$' $(BUILDDIR)/fatal_svwrap.err; \
 	echo ok fatal; \
+	: P382 a broken standard output or error ends the program by SIGPIPE, 141, as in Go; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/brokenpipe_die testdata/brokenpipe.paslang; \
+	(set +e; $(BUILDDIR)/brokenpipe_die out; echo $$? > $(BUILDDIR)/brokenpipe_out.rc) | head -c 1 > /dev/null; \
+	(set +e; $(BUILDDIR)/brokenpipe_die err; echo $$? > $(BUILDDIR)/brokenpipe_err.rc) 2>&1 > /dev/null | head -c 1 > /dev/null; \
+	test "`cat $(BUILDDIR)/brokenpipe_out.rc` `cat $(BUILDDIR)/brokenpipe_err.rc`" = "141 141"; \
+	echo ok brokenpipe; \
 	echo "==== deadlock ===="; \
 	for t in dlrecv dlsend dlcycle dlmutex dlmain dlselect; do \
 	  $(OUTDIR)/paslangc -o $(BUILDDIR)/fatal_$$t testdata/fatal/$$t.paslang; \
@@ -4837,6 +4846,11 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	grep -q '^paslang: string view over bytes not marked shared$$' $(BUILDDIR)/fatal_svmark-arm.err; \
 	grep -q '^paslang: string view length 16 out of range$$' $(BUILDDIR)/fatal_svwrap-arm.err; \
 	echo ok fatal-arm; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -Fu $(A64DIR) -o $(BUILDDIR)/brokenpipe_die-arm testdata/brokenpipe.paslang; \
+	(set +e; $(QEMU_A64) $(BUILDDIR)/brokenpipe_die-arm out; echo $$? > $(BUILDDIR)/brokenpipe_out-arm.rc) | head -c 1 > /dev/null; \
+	(set +e; $(QEMU_A64) $(BUILDDIR)/brokenpipe_die-arm err; echo $$? > $(BUILDDIR)/brokenpipe_err-arm.rc) 2>&1 > /dev/null | head -c 1 > /dev/null; \
+	test "`cat $(BUILDDIR)/brokenpipe_out-arm.rc` `cat $(BUILDDIR)/brokenpipe_err-arm.rc`" = "141 141"; \
+	echo ok brokenpipe-arm; \
 	echo "==== deadlock arm64 ===="; \
 	for t in dlrecv dlsend dlcycle dlmutex dlmain dlselect; do \
 	  $(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/fatal_$$t-arm testdata/fatal/$$t.paslang; \

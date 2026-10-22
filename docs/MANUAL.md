@@ -7575,6 +7575,16 @@ that expects such bursts can also raise the backlog. A write to a peer
 that has gone away fails (`TcpWrite` below 0) and the program goes on:
 socket writes never raise `SIGPIPE`.
 
+Any write to a pipe or a socket whose other end has gone away answers
+`EPIPE` (-32) and the program goes on (1.1.236): every paslang program
+has a handler for `SIGPIPE` that does nothing, as a Go program has, so
+the kernel's signal ends nothing, and a program it starts gets the
+default action back at `exec`, which ignoring the signal would not
+give. The standard output and error are the exception, as `os.Stdout`
+and `os.Stderr` are in Go: `Write` and `WriteLn` to a pipe whose reader
+has gone end the program by `SIGPIPE` (141 in the shell), as `cat`
+ends, so `prog | head` stops `prog` (`testdata/brokenpipe`).
+
 `examples/httpd.paslang`:
 
 ```pascal
