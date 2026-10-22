@@ -751,6 +751,7 @@ type
     procedure LoadTo(const M: string; T: LongInt; const R: string);
     procedure StoreFrom(const M: string; Sz: LongInt; const R: string);
     procedure StoreTo(Dest: PExpr);
+    function RegPlace(Dest: PExpr; out Op: string): Boolean;
     function TreeKey(T: LongInt): LongInt;
     function TreeVal(T: LongInt): LongInt;
     procedure LoadSlot(Sz: LongInt);
@@ -14490,6 +14491,120 @@ begin
     (not FPromoOn) and (not FFlat) and not (FArm and IsDyn(Dest^.Typ));
 end;
 
+{ P386: Dest's address is registers and a constant alone, so no code
+  works it out: in a region or a routine with no frame, a pointer kept
+  in a register (WordReg), its target or its element at an index kept in
+  a register or a constant, through @ and a view of one pointer as
+  another; Op the operand, (B), (B,X,K) or D(B) on amd64 (SDM vol. 2A
+  table 2-3), [B], [B, #D], or [B, X] and [B, X, lsl #S] with S the log2
+  of the size on arm64 (ARM DDI 0487 M.c C6.2.416 STR, C6.2.418 STRB,
+  C6.2.420 STRH, the register offset form; C6.2.415, C6.2.417 and
+  C6.2.419, the unsigned offset a multiple of the size up to 4095 of
+  them, and C6.2.446 to C6.2.448, STUR's -256 to 255, which the
+  assembler picks for an offset the other cannot take), or [x16] after
+  one ADD of the shifted register for an element whose size the register
+  offset cannot scale by (C6.2.6). The value stored waits where EmitExpr
+  left it, where it was pushed while the address was worked out and
+  popped for the store; Go stores a register to an address of registers
+  in one instruction (cmd/compile/internal/ssa/_gen/AMD64Ops.go,
+  MOVQstoreidx1). }
+function TEmitter.RegPlace(Dest: PExpr; out Op: string): Boolean;
+var
+  e: PExpr;
+  br, xr: string;
+  esz, sz: LongInt;
+  k: Int64;
+begin
+  Result := False;
+  Op := '';
+  if (Dest = nil) or FCheckPtr or ((not FPromoOn) and (not FFlat)) or IsFat(Dest^.Typ) or
+    IsBlob(Dest^.Typ) then
+    Exit;
+  sz := TSize(LoadTyp(Dest));
+  if (sz <> 1) and (sz <> 2) and (sz <> 4) and (sz <> 8) then
+    Exit;
+  e := Dest;
+  if e^.Kind = ekDeref then
+  begin
+    e := e^.L;
+    while (e <> nil) and (e^.Kind = ekUn) and (e^.Un = uoConv) and (e^.L <> nil) and
+      (TKind(e^.Typ) = tykPointer) and (TKind(e^.L^.Typ) = tykPointer) do
+      e := e^.L;
+    if e = nil then
+      Exit;
+    if e^.Kind = ekVar then
+    begin
+      br := WordReg(e);
+      if (br = '') or (TKind(e^.Typ) <> tykPointer) then
+        Exit;
+      if FArm then
+        Op := '[' + br + ']'
+      else
+        Op := '(%' + br + ')';
+      Result := True;
+      Exit;
+    end;
+    if (e^.Kind <> ekAddr) or (e^.L = nil) then
+      Exit;
+    e := e^.L;
+  end;
+  if (e^.Kind <> ekIndex) or (e^.L = nil) or (e^.R = nil) or
+    (TKind(e^.L^.Typ) <> tykPointer) then
+    Exit;
+  br := WordReg(e^.L);
+  if br = '' then
+    Exit;
+  esz := TSize(FTypes[e^.L^.Typ].Elem);
+  if e^.R^.Kind = ekInt then
+  begin
+    if not (Fits32(e^.R^.Num) and Fits32(e^.R^.Num * esz)) then
+      Exit;
+    k := e^.R^.Num * esz;
+    if FArm then
+    begin
+      if k = 0 then
+        Op := '[' + br + ']'
+      else if ((k >= 0) and (k mod sz = 0) and (k div sz <= 4095)) or
+        ((k >= -256) and (k <= 255)) then
+        Op := '[' + br + ', #' + IntToStr(k) + ']'
+      else
+        Exit;
+    end
+    else if k = 0 then
+      Op := '(%' + br + ')'
+    else
+      Op := IntToStr(k) + '(%' + br + ')';
+    Result := True;
+    Exit;
+  end;
+  xr := WordReg(e^.R);
+  if xr = '' then
+    Exit;
+  if FArm then
+  begin
+    if esz = 1 then
+      Op := '[' + br + ', ' + xr + ']'
+    else if (esz = sz) and (Pow2Log(esz) >= 1) then
+      Op := '[' + br + ', ' + xr + ', lsl #' + IntToStr(Pow2Log(esz)) + ']'
+    else if (Pow2Log(esz) >= 1) and (Pow2Log(esz) <= 63) then
+    begin
+      { a view the element's scale does not fit: the address in x16,
+        which no value and no variable takes }
+      Line('  add x16, ' + br + ', ' + xr + ', lsl #' + IntToStr(Pow2Log(esz)));
+      Op := '[x16]';
+    end
+    else
+      Exit;
+  end
+  else
+  begin
+    if (esz <> 1) and (esz <> 2) and (esz <> 4) and (esz <> 8) then
+      Exit;
+    Op := '(%' + br + ',%' + xr + ',' + IntToStr(esz) + ')';
+  end;
+  Result := True;
+end;
+
 procedure TEmitter.StoreTo(Dest: PExpr);
 var
   sym, smap, op, ab: string;
@@ -14769,6 +14884,9 @@ begin
       Ppop('x1');
       Line('  str x1, [x0, #8]');
     end
+    else if RegPlace(Dest, op) then
+      { the place's operand at once, the value in x0 (P386) }
+      StoreFrom(op, TSize(LoadTyp(Dest)), 'x0')
     else if KeptStore(Dest) and not ((Dest^.Kind = ekIndex) and (Dest^.L <> nil) and
       IsStr(Dest^.L^.Typ)) then
     begin
@@ -14866,6 +14984,9 @@ begin
     Line('.stdone' + IntToStr(FLab) + ':');
     Inc(FLab);
   end
+  else if RegPlace(Dest, op) then
+    { the place's operand at once, the value in rax (P386) }
+    StoreFrom(op, TSize(LoadTyp(Dest)), 'rax')
   else if KeptStore(Dest) and not ((Dest^.Kind = ekIndex) and (Dest^.L <> nil) and
     IsStr(Dest^.L^.Typ)) then
   begin

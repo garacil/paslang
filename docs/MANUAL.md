@@ -3413,7 +3413,9 @@ itself uses its own.
   address, one instruction from the registers that hold `p` and `i`
   in a loop, a `lea` on amd64 and an `add` of the shifted register on
   arm64, and a load or a store through it, `PInt64(@p[i])^`, takes
-  them itself (1.1.242, P385).
+  them itself (1.1.242, P385); the value stored goes from the register
+  it was worked out in, with no push while the place is named
+  (1.1.243, P386).
 
 `examples/pointers.paslang`:
 
