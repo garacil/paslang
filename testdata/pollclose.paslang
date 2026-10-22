@@ -1,0 +1,172 @@
+{ P401: a descriptor the runtime put in its epoll set is taken out of
+  it before a close through Syscall, as Go's poll.FD.destroy takes it
+  out before it closes (internal/poll/fd_unix.go, netpollclose's
+  EPOLL_CTL_DEL). Left in, a socket closed while an epoll_wait polled it
+  could stay open with its peer waiting for ever: the polling thread
+  held the file's last reference (fs/eventpoll.c, epi_fget) and its
+  release waited for that thread to come back to user space
+  (fs/file_table.c, TWA_RESUME). That race is not one a test can call
+  up at will; its precondition can be seen: a dup keeps the socket's
+  open file description alive, and an entry stays in a set until every
+  descriptor of the description is closed (epoll(7), Q6), so after the
+  close of the polled descriptor /proc/self/fdinfo of the set
+  (proc_pid_fdinfo(5): one tfd line an entry) still lists it unless the
+  close took it out. A fork's child shares the set with its parent and
+  closes without taking anything out of it. }
+program pollclose;
+
+uses
+  paslib, paslinux, pasnet;
+
+var
+  got: chan of string;
+  acc: chan of Integer;
+  l, port, c, s, d, ep, pid, w: Integer;
+  status: array[0..1] of LongInt;
+
+{ The runtime's epoll set: the descriptor /proc/self/fd names
+  anon_inode:[eventpoll]. }
+function EpollFd: Integer;
+var
+  i: Integer;
+  t: string;
+begin
+  Result := -1;
+  for i := 0 to 255 do
+    if ReadLink('/proc/self/fd/' + IntToStr(i), t) and (t = 'anon_inode:[eventpoll]') then
+    begin
+      Result := i;
+      Exit;
+    end;
+end;
+
+{ Whether the set has an entry for Fd: a line tfd: Fd in its fdinfo. }
+function InSet(Ep, Fd: Integer): Boolean;
+var
+  t: string;
+  i, k, v: Integer;
+begin
+  Result := False;
+  if not ReadFile('/proc/self/fdinfo/' + IntToStr(Ep), t) then
+  begin
+    WriteLn('no fdinfo of the set');
+    Halt(2);
+  end;
+  for i := 1 to Length(t) - 4 do
+    if (t[i] = 't') and (t[i + 1] = 'f') and (t[i + 2] = 'd') and (t[i + 3] = ':') then
+    begin
+      k := i + 4;
+      while (k <= Length(t)) and (t[k] = ' ') do
+        Inc(k);
+      v := 0;
+      while (k <= Length(t)) and (t[k] >= '0') and (t[k] <= '9') do
+      begin
+        v := v * 10 + Ord(t[k]) - Ord('0');
+        Inc(k);
+      end;
+      if v = Fd then
+        Result := True;
+    end;
+end;
+
+{ Waits, a millisecond at a time, for Fd to be in the set. }
+procedure WaitInSet(Fd: Integer; const What: string);
+var
+  n: Integer;
+begin
+  n := 0;
+  while not InSet(ep, Fd) do
+  begin
+    Inc(n);
+    if n > 5000 then
+    begin
+      WriteLn(What, ' never in the set');
+      Halt(3);
+    end;
+    Sleep(1);
+  end;
+end;
+
+procedure Acceptor(L: Integer);
+begin
+  Send(acc, TcpAccept(L));
+end;
+
+procedure Reader(Fd: Integer);
+begin
+  Send(got, TcpRead(Fd, 16));
+end;
+
+function Dup(Fd: Integer): Integer;
+begin
+  if Amd64 = 1 then
+    Result := Syscall(32, Fd)
+  else
+    Result := Syscall(23, Fd);
+end;
+
+function Where(Fd: Integer): string;
+begin
+  if InSet(ep, Fd) then
+    Result := 'in the set'
+  else
+    Result := 'out of the set';
+end;
+
+begin
+  got := MakeChan();
+  acc := MakeChan();
+  l := TcpListen(0);
+  port := TcpPort(l);
+  pas Acceptor(l);
+  c := TcpConnectTo('127.0.0.1', port);
+  s := Recv(acc);
+  if (l < 0) or (c < 0) or (s < 0) then
+  begin
+    WriteLn('no connection');
+    Halt(1);
+  end;
+  { the reader parks on c, which puts c in the set }
+  pas Reader(c);
+  ep := -1;
+  w := 0;
+  while ep < 0 do
+  begin
+    ep := EpollFd;
+    Inc(w);
+    if w > 5000 then
+    begin
+      WriteLn('no epoll set');
+      Halt(4);
+    end;
+    if ep < 0 then
+      Sleep(1);
+  end;
+  WaitInSet(c, 'the polled socket');
+  TcpWrite(s, 'x');
+  WriteLn('read through the polled socket: ', Recv(got));
+  d := Dup(c);
+  OsClose(c);
+  WriteLn('closed while its dup lives: ', Where(c));
+  { the dup parks too: its own entry, the description's second }
+  pas Reader(d);
+  WaitInSet(d, 'the dup');
+  TcpWrite(s, 'y');
+  WriteLn('read through the dup: ', Recv(got));
+  pid := OsFork;
+  if pid < 0 then
+    Halt(5);
+  if pid = 0 then
+  begin
+    OsClose(d);
+    OsExit(7);
+  end;
+  status[0] := 0;
+  OsWait(pid, Integer(@status[0]), 0, 0);
+  WriteLn('a child closed it and left with ', (status[0] shr 8) and 255, ': ', Where(d));
+  TcpClose(d);
+  WriteLn('closed by TcpClose: ', Where(d));
+  TcpClose(s);
+  TcpClose(l);
+  WriteLn('done');
+end.

@@ -418,6 +418,9 @@ GOLDEN_A64 += brokenpipe
 # P208: json streams that park.
 GOLDEN += jsonstream jsonpark
 GOLDEN_A64 += jsonstream jsonpark
+# P401: a descriptor the poller holds leaves its set before it is closed.
+GOLDEN += pollclose
+GOLDEN_A64 += pollclose
 # P209: json constants checked by the compiler.
 GOLDEN += jsonconst
 GOLDEN_A64 += jsonconst

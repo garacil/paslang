@@ -11375,6 +11375,15 @@ program has without `uses`:
 | `WaitIo(fd, ev)` | parks until `fd` is ready for `ev`: 1 to read, 4 to write; 0 on wake, negative errno if registration fails |
 | `WaitMs(fd, ev, ms)` | `WaitIo`, which also wakes after `ms` milliseconds; 0 or less does not wait and answers 0, the answer of a deadline that came, as Go answers a deadline already past. Failed registration returns negative errno and removes its deadline |
 
+A descriptor a wait has put in the epoll set leaves it before it is
+closed, by `NetClose` and by any close made with `Syscall` (`OsClose`,
+`FileClose`, `TcpClose`), as Go's poller takes a descriptor out before
+it closes it (1.1.241): left in, a socket closed while the thread in
+`epoll_wait` looked at it stayed open until that thread came back from
+the kernel, and its peer waited for an end of the stream that did not
+come. A fork's child closes its copies without touching the set, which
+is its parent's.
+
 The three `Wait` words park the routine on the runtime's epoll, one wake
 per wait, and the thread goes on with other routines. After a wake the
 caller tries its read or its write again. That loop is written once,

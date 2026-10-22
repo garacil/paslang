@@ -40522,6 +40522,13 @@ begin
   Line('  syscall');
   Line('  testq %rax, %rax');
   Line('  jns .wi_success');
+  { not in the set yet: in it from here, so a close takes it out
+    first (P401) }
+  Line('  cmpq $65536, %rbx');
+  Line('  jae .wi_add');
+  Line('  leaq rt_epset(%rip), %rax');
+  Line('  movb $1, (%rax,%rbx)');
+  Line('.wi_add:');
   Line('  movq rt_epfd(%rip), %rdi');
   Line('  movq $1, %rsi');
   Line('  movq %rbx, %rdx');
@@ -40849,6 +40856,11 @@ begin
   Line('  syscall');
   Line('  testq %rax, %rax');
   Line('  jns .aw_added');
+  Line('  cmpq $65536, %rbx');
+  Line('  jae .aw_add');
+  Line('  leaq rt_epset(%rip), %rax');
+  Line('  movb $1, (%rax,%rbx)');
+  Line('.aw_add:');
   Line('  movq rt_epfd(%rip), %rdi');
   Line('  movq $1, %rsi');
   Line('  movq %rbx, %rdx');
@@ -40936,6 +40948,11 @@ begin
   Line('  movq $233, %rax');
   Line('  syscall');
   Line('  addq $16, %rsp');
+  Line('  cmpq $65536, %rbx');
+  Line('  jae .tc_cl');
+  Line('  leaq rt_epset(%rip), %rax');
+  Line('  movb $0, (%rax,%rbx)');
+  Line('.tc_cl:');
   Line('  movq %rbx, %rdi');
   Line('  movq $3, %rax');
   Line('  syscall');
@@ -45948,6 +45965,56 @@ begin
   Line('.gw_ret:');
   Line('  ret');
   Line('');
+  { A close of a descriptor in the poller's set takes it out first
+    (EPOLL_CTL_DEL), as Go's poll.FD.destroy does before it closes
+    (internal/poll/fd_unix.go: "Poller may want to unregister fd in
+    readiness notification mechanism, so this must be executed before
+    CloseFunc"; runtime/netpoll.go poll_runtime_pollClose and
+    netpoll_epoll.go netpollclose). Left in the set, a socket closed
+    while an epoll_wait polled it was not released: ep_item_poll holds
+    a reference of the file while it polls (fs/eventpoll.c, epi_fget),
+    and when the close came in between, its fput was the last and
+    __fput_deferred gave the release to the polling thread as task_work
+    with TWA_RESUME (fs/file_table.c), run only when that thread comes
+    back to user space; the M asleep in epoll_wait with no event and no
+    timer kept the socket in CLOSE-WAIT, its peer waiting for an end of
+    the stream that never came (jsonpark's TCP section, one run in
+    three hundred, P401). EPOLL_CTL_DEL takes ep->mtx, which
+    ep_send_events holds while it polls, so once it returns no poll holds
+    the file and the close is its last reference. rdi the descriptor;
+    every register kept but rcx and r11. }
+  Line('rt_closeout:');
+  Line('  cmpq $0, rt_epfd(%rip)');
+  Line('  je .co_ret');
+  Line('  cmpq $65536, %rdi');
+  Line('  jae .co_del');
+  Line('  pushq %rax');
+  Line('  leaq rt_epset(%rip), %rax');
+  Line('  cmpb $0, (%rax,%rdi)');
+  Line('  je .co_pop');
+  Line('  movb $0, (%rax,%rdi)');
+  Line('  popq %rax');
+  Line('.co_del:');
+  Line('  pushq %rax');
+  Line('  pushq %rdi');
+  Line('  pushq %rsi');
+  Line('  pushq %rdx');
+  Line('  pushq %r10');
+  Line('  movq %rdi, %rdx');
+  Line('  movq rt_epfd(%rip), %rdi');
+  Line('  movq $2, %rsi');
+  Line('  movq %rsp, %r10');
+  Line('  movq $233, %rax');
+  Line('  syscall');
+  Line('  popq %r10');
+  Line('  popq %rdx');
+  Line('  popq %rsi');
+  Line('  popq %rdi');
+  Line('.co_pop:');
+  Line('  popq %rax');
+  Line('.co_ret:');
+  Line('  ret');
+  Line('');
   { rt_syscall: the Syscall builtin. rax the number, rdi, rsi, rdx, r10,
     r8, r9 the arguments, as the instruction takes them; rax the result,
     rcx and r11 clobbered, as by the instruction. A routine that holds no
@@ -45961,6 +46028,12 @@ begin
   Line('  jz .sy_raw');
   Line('  cmpl $0, 184(%r14)');
   Line('  jne .sy_raw');
+  { close (3): out of the poller's set first (P401); not in a fork's
+    child, raw above, whose set is its parent's }
+  Line('  cmpq $3, %rax');
+  Line('  jne .sy_go');
+  Line('  call rt_closeout');
+  Line('.sy_go:');
   Line('  pushq %rbx');
   Line('  pushq %rbp');
   Line('  pushq %r12');
@@ -49583,6 +49656,11 @@ begin
     Line('  .quad 0');
     Line('rt_iotab:');
     Line('  .zero 1024');
+    { A byte a descriptor below 65,536 the runtime put in its epoll set
+      (rt_waitio, rt_acwait), 1 from its registration to its close
+      (P401). }
+    Line('rt_epset:');
+    Line('  .zero 65536');
     Line('rt_argc:');
     Line('  .quad 0');
     Line('rt_argv:');
@@ -59820,6 +59898,33 @@ begin
   Line('  cbz x28, .asy_raw0');
   Line('  ldr w16, [x28, #184]');
   Line('  cbnz w16, .asy_raw0');
+  { close (57): out of the poller's set first, as on amd64 (P401);
+    x16 and x17 are kept above, x0 to x3 and x8 here }
+  Line('  cmp x8, #57');
+  Line('  b.ne .asy_go');
+  LdS('rt_epfd', 'x16');
+  Line('  cbz x16, .asy_go');
+  Line('  mov x17, #65536');
+  Line('  cmp x0, x17');
+  Line('  b.hs .asy_del');
+  LeaS('rt_epset', 'x17');
+  Line('  ldrb w16, [x17, x0]');
+  Line('  cbz w16, .asy_go');
+  Line('  strb wzr, [x17, x0]');
+  Line('.asy_del:');
+  Line('  stp x0, x1, [sp, #-16]!');
+  Line('  stp x2, x3, [sp, #-16]!');
+  Line('  str x8, [sp, #-16]!');
+  Line('  mov x2, x0');
+  LdS('rt_epfd', 'x0');
+  Line('  mov x1, #2');
+  Line('  mov x3, sp');
+  Line('  mov x8, #21');
+  Line('  svc #0');
+  Line('  ldr x8, [sp], #16');
+  Line('  ldp x2, x3, [sp], #16');
+  Line('  ldp x0, x1, [sp], #16');
+  Line('.asy_go:');
   Line('  stp x29, x30, [sp, #-16]!');
   Line('  stp x19, x20, [sp, #-16]!');
   Line('  stp x21, x22, [sp, #-16]!');
@@ -61776,6 +61881,14 @@ begin
   Line('  svc #0');
   Line('  cmp x0, #0');
   Line('  b.ge .awi_success');
+  { in the set from here, as on amd64 (P401) }
+  Line('  mov x9, #65536');
+  Line('  cmp x19, x9');
+  Line('  b.hs .awi_add');
+  LeaS('rt_epset', 'x9');
+  Line('  mov w10, #1');
+  Line('  strb w10, [x9, x19]');
+  Line('.awi_add:');
   LdS('rt_epfd', 'x0');
   Line('  mov x1, #1');
   Line('  mov x2, x19');
@@ -62083,6 +62196,13 @@ begin
   Line('  svc #0');
   Line('  cmp x0, #0');
   Line('  b.ge .bw_added');
+  Line('  mov x9, #65536');
+  Line('  cmp x19, x9');
+  Line('  b.hs .bw_add');
+  LeaS('rt_epset', 'x9');
+  Line('  mov w10, #1');
+  Line('  strb w10, [x9, x19]');
+  Line('.bw_add:');
   LdS('rt_epfd', 'x0');
   Line('  mov x1, #1');
   Line('  mov x2, x19');
@@ -62162,6 +62282,12 @@ begin
   Line('  mov x8, #21');
   Line('  svc #0');
   Line('  add sp, sp, #16');
+  Line('  mov x9, #65536');
+  Line('  cmp x19, x9');
+  Line('  b.hs .atc_cl');
+  LeaS('rt_epset', 'x9');
+  Line('  strb wzr, [x9, x19]');
+  Line('.atc_cl:');
   Line('  mov x0, x19');
   Line('  mov x8, #57');
   Line('  svc #0');
