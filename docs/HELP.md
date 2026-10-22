@@ -63,7 +63,7 @@ Topics:
 | Topic | What it answers |
 |---|---|
 | flags | `-h`, `-v`/`--version`, `--help`, `-o`, `-c`, `-checkptr`, `-Fu` and the unit search order, `-install`, `-cpu` and `-tune`, `-inline` and `-inline-trace`, `-debug`, `-target`, `--lex`, exit status |
-| types | sizes: `Integer` 64, the narrow integers 8/16/32, `Char` 1 byte, `string` pointer+length, `Real` binary64, `Single` binary32, `Quad` binary128, slices, records, sets, channels, maps, the sync types, method and interface values, pointers and views |
+| types | sizes: `Integer` 64, the narrow integers 8/16/32, `Char` 1 byte, `string` pointer+length, `Real` binary64, `Single` binary32, `Quad` binary128, slices, records, sets, channels, maps, `json` (its reads, encoders and decoders, building and transforming, streams and constants), the sync types, method and interface values, pointers and views |
 | lang | statements, units, classes, channels, a hello program |
 | runtime | G/M, preemption, the collector, the fatal errors, `Syscall`, and the builtins: the calculation set, hashing, `GetMem`, the debugging words, RTTI, the atomics and the scheduler's words |
 | lib | the eleven core units (`pasnum`, `pasobject`, `pasroutines`, `pasmap`, `pashash`, `pastree`, `pasfmt`, `passtr`, `pasheap`, `pasquad`, `pasjson`), the installed units `pastime`, `pasrand`, `passort`, `paslib`, `pasnet`, `pasdebug` (written by `-debug`) and `pasx11`, and the `Net` builtins under `pasnet` |

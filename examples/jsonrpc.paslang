@@ -1,0 +1,382 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+
+  paslang is free software: you can redistribute it and/or modify it
+  under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+
+  paslang is distributed in the hope that it will be useful, but
+  WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+  General Public License for more details.
+
+  You should have received a copy of the GNU General Public License
+  along with paslang.  If not, see <https://www.gnu.org/licenses/>. }
+
+{ JSON-RPC 2.0 over NDJSON on TCP (P210), as its specification says
+  (jsonrpc.org/specification): a request and its answer a line each.
+  One routine a connection reads each line as it comes (a TJsonReader
+  of the socket, Lines), decodes a request into a record, calls the
+  method and writes the answer, a record too (a TJsonWriter of the
+  socket); a batch, an array of requests, gets an array of answers in
+  their order; a notification, a request with no id, none. The methods
+  of the specification's examples: subtract, its params by position or
+  by name, sum and get_data; its errors: -32700 for a line that is no
+  JSON, -32600 for a request that is none, -32601 for a method that is
+  not there, -32602 for params that do not fit.
+
+    jsonrpc [port]          serve (4000 by default) until killed
+    jsonrpc -selftest [n]   n client routines (2000 by default), each on
+                            its own connection sending the examples of
+                            the specification's section 7 and checking
+                            every answer; prints the totals
+
+  make check runs the self-test on both machines. }
+program jsonrpc;
+
+uses pasnet, paslib;
+
+type
+  TRequest = record
+    Version: string json 'jsonrpc';
+    Method: string json 'method';
+    Params: json json 'params';
+    Id: json json 'id';
+  end;
+
+  TNamed = record                 { subtract's params by name }
+    Minuend: Double json 'minuend';
+    Subtrahend: Double json 'subtrahend';
+  end;
+
+  TAnswer = record
+    Version: string json 'jsonrpc';
+    Value: json json 'result';
+    Id: json json 'id';
+  end;
+
+  TError = record
+    Code: Integer json 'code';
+    Message: string json 'message';
+  end;
+
+  TFailure = record
+    Version: string json 'jsonrpc';
+    Error: TError json 'error';
+    Id: json json 'id';
+  end;
+
+var
+  calls, answers, bad: Integer;   { the counters, AtomicAdd from every routine }
+  done: WaitGroup;
+
+procedure Fail(var F: TFailure; Code: Integer; const Message: string; Id: json);
+begin
+  F.Version := '2.0';
+  F.Error.Code := Code;
+  F.Error.Message := Message;
+  F.Id := Id;
+end;
+
+{ The answer to the request J: 0 none (a notification), 1 A, 2 F. }
+function Respond(J: json; var A: TAnswer; var F: TFailure): Integer;
+var
+  q: TRequest;
+  named: TNamed;
+  nums: array of Double;
+  e: EJsonError;
+  v: json;
+  x: Double;
+  i: Integer;
+  known, fits, notify: Boolean;
+begin
+  AtomicAdd(@calls, 1);
+  if (J.Kind <> jkObject) or not TryJsonDecode(J, q, e) or (q.Version <> '2.0') or
+    (q.Method = '') or not (('method' in J) and (J['method'].Kind = jkString)) then
+  begin
+    Fail(F, -32600, 'Invalid Request', nil);
+    Result := 2;
+    Exit;
+  end;
+  notify := not ('id' in J);
+  known := True;
+  fits := False;
+  v := nil;
+  if q.Method = 'subtract' then
+  begin
+    if (q.Params <> nil) and (q.Params.Kind = jkArray) and TryJsonDecode(q.Params, nums, e) and
+      (Length(nums) = 2) then
+    begin
+      v := JsonOf(nums[0] - nums[1]);
+      fits := True;
+    end
+    else if (q.Params <> nil) and (q.Params.Kind = jkObject) and ('minuend' in q.Params) and
+      ('subtrahend' in q.Params) and TryJsonDecode(q.Params, named, e) then
+    begin
+      v := JsonOf(named.Minuend - named.Subtrahend);
+      fits := True;
+    end;
+  end
+  else if q.Method = 'sum' then
+  begin
+    if (q.Params <> nil) and (q.Params.Kind = jkArray) and TryJsonDecode(q.Params, nums, e) then
+    begin
+      x := 0;
+      for i := 0 to High(nums) do
+        x := x + nums[i];
+      v := JsonOf(x);
+      fits := True;
+    end;
+  end
+  else if q.Method = 'get_data' then
+  begin
+    v := JsonArray(['hello', 5]);
+    fits := True;
+  end
+  else
+    known := False;
+  if notify then
+  begin
+    Result := 0;
+    Exit;
+  end;
+  if not known then
+  begin
+    Fail(F, -32601, 'Method not found', q.Id);
+    Result := 2;
+  end
+  else if not fits then
+  begin
+    Fail(F, -32602, 'Invalid params', q.Id);
+    Result := 2;
+  end
+  else
+  begin
+    A.Version := '2.0';
+    A.Value := v;
+    A.Id := q.Id;
+    Result := 1;
+  end;
+end;
+
+{ One connection: a line read, its answer written, until the peer
+  closes. An answer is counted before it is written: its client reads
+  it, ends and the self-test prints the totals, and a count after the
+  write could come after the print. }
+procedure Serve(C: Integer);
+var
+  r: TJsonReader;
+  w: TJsonWriter;
+  j: json;
+  e: EJsonError;
+  a: TAnswer;
+  f: TFailure;
+  replies: array of json;
+  i, n: Integer;
+begin
+  r := JsonReader(C);
+  r.Lines := True;
+  w := JsonWriter(C);
+  while True do
+  begin
+    if not TryJsonRead(r, j, e) then
+    begin
+      if (e = nil) or (e.Kind = jeIO) then
+        Break;
+      AtomicAdd(@calls, 1);
+      Fail(f, -32700, 'Parse error', nil);
+      AtomicAdd(@answers, 1);
+      JsonWrite(w, f);
+      Continue;
+    end;
+    if (j <> nil) and (j.Kind = jkArray) and (Length(j) > 0) then
+    begin
+      { a batch: its answers in an array, nothing when every one is a
+        notification }
+      replies := nil;
+      n := 0;
+      for i := 0 to Length(j) - 1 do
+        case Respond(j[i], a, f) of
+          1: begin SetLength(replies, n + 1); replies[n] := JsonOf(a); n := n + 1; end;
+          2: begin SetLength(replies, n + 1); replies[n] := JsonOf(f); n := n + 1; end;
+        end;
+      if n > 0 then
+      begin
+        AtomicAdd(@answers, 1);
+        w.BeginArray;
+        for i := 0 to n - 1 do
+          w.Add(replies[i]);
+        w.EndArray;
+      end;
+    end
+    else
+      case Respond(j, a, f) of
+        1: begin AtomicAdd(@answers, 1); JsonWrite(w, a); end;
+        2: begin AtomicAdd(@answers, 1); JsonWrite(w, f); end;
+      end;
+  end;
+  TcpClose(C);
+end;
+
+procedure Listen(L: Integer);
+var
+  c: Integer;
+begin
+  while True do
+  begin
+    c := TcpAccept(L);
+    if c < 0 then
+      Break;
+    pas Serve(c);
+  end;
+end;
+
+const
+  { The specification's section 7, each line a request and the answer
+    it gets, '' for none; a batch of several lines there is one line
+    here, as NDJSON has it. }
+  Script: array[0..15, 0..1] of string = (
+    ('{"jsonrpc": "2.0", "method": "subtract", "params": [42, 23], "id": 1}',
+     '{"jsonrpc": "2.0", "result": 19, "id": 1}'),
+    ('{"jsonrpc": "2.0", "method": "subtract", "params": [23, 42], "id": 2}',
+     '{"jsonrpc": "2.0", "result": -19, "id": 2}'),
+    ('{"jsonrpc": "2.0", "method": "subtract", "params": {"subtrahend": 23, "minuend": 42}, "id": 3}',
+     '{"jsonrpc": "2.0", "result": 19, "id": 3}'),
+    ('{"jsonrpc": "2.0", "method": "subtract", "params": {"minuend": 42, "subtrahend": 23}, "id": 4}',
+     '{"jsonrpc": "2.0", "result": 19, "id": 4}'),
+    ('{"jsonrpc": "2.0", "method": "update", "params": [1,2,3,4,5]}', ''),
+    ('{"jsonrpc": "2.0", "method": "foobar"}', ''),
+    ('{"jsonrpc": "2.0", "method": "foobar", "id": "1"}',
+     '{"jsonrpc": "2.0", "error": {"code": -32601, "message": "Method not found"}, "id": "1"}'),
+    ('{"jsonrpc": "2.0", "method": "foobar, "params": "bar", "baz]',
+     '{"jsonrpc": "2.0", "error": {"code": -32700, "message": "Parse error"}, "id": null}'),
+    ('{"jsonrpc": "2.0", "method": 1, "params": "bar"}',
+     '{"jsonrpc": "2.0", "error": {"code": -32600, "message": "Invalid Request"}, "id": null}'),
+    ('[{"jsonrpc": "2.0", "method": "sum", "params": [1,2,4], "id": "1"}, {"jsonrpc": "2.0", "method"]',
+     '{"jsonrpc": "2.0", "error": {"code": -32700, "message": "Parse error"}, "id": null}'),
+    ('[]', '{"jsonrpc": "2.0", "error": {"code": -32600, "message": "Invalid Request"}, "id": null}'),
+    ('[1]', '[{"jsonrpc": "2.0", "error": {"code": -32600, "message": "Invalid Request"}, "id": null}]'),
+    ('[1,2,3]', '[{"jsonrpc": "2.0", "error": {"code": -32600, "message": "Invalid Request"}, "id": null},' +
+     '{"jsonrpc": "2.0", "error": {"code": -32600, "message": "Invalid Request"}, "id": null},' +
+     '{"jsonrpc": "2.0", "error": {"code": -32600, "message": "Invalid Request"}, "id": null}]'),
+    ('[{"jsonrpc": "2.0", "method": "sum", "params": [1,2,4], "id": "1"}, ' +
+     '{"jsonrpc": "2.0", "method": "notify_hello", "params": [7]}, ' +
+     '{"jsonrpc": "2.0", "method": "subtract", "params": [42,23], "id": "2"}, {"foo": "boo"}, ' +
+     '{"jsonrpc": "2.0", "method": "foo.get", "params": {"name": "myself"}, "id": "5"}, ' +
+     '{"jsonrpc": "2.0", "method": "get_data", "id": "9"}]',
+     '[{"jsonrpc": "2.0", "result": 7, "id": "1"}, {"jsonrpc": "2.0", "result": 19, "id": "2"}, ' +
+     '{"jsonrpc": "2.0", "error": {"code": -32600, "message": "Invalid Request"}, "id": null}, ' +
+     '{"jsonrpc": "2.0", "error": {"code": -32601, "message": "Method not found"}, "id": "5"}, ' +
+     '{"jsonrpc": "2.0", "result": ["hello", 5], "id": "9"}]'),
+    ('[{"jsonrpc": "2.0", "method": "notify_sum", "params": [1,2,4]}, ' +
+     '{"jsonrpc": "2.0", "method": "notify_hello", "params": [7]}]', ''),
+    ('{"jsonrpc": "2.0", "method": "sum", "params": [1.5, 2.5], "id": "last"}',
+     '{"jsonrpc": "2.0", "result": 4, "id": "last"}'));
+
+function StrToIntDef(const S: string; Def: Integer): Integer;
+var
+  v, i: Integer;
+begin
+  v := 0;
+  if S = '' then
+  begin
+    Result := Def;
+    Exit;
+  end;
+  for i := 1 to Length(S) do
+  begin
+    if (S[i] < '0') or (S[i] > '9') then
+    begin
+      Result := Def;
+      Exit;
+    end;
+    v := v * 10 + Ord(S[i]) - 48;
+  end;
+  Result := v;
+end;
+
+{ A client of the self-test: the script on one connection, each answer
+  read and held to the one the specification gives, as a value. }
+procedure Client(Port: Integer);
+var
+  c, k: Integer;
+  r: TJsonReader;
+  got: json;
+begin
+  c := TcpConnectTo('127.0.0.1', Port);
+  if c < 0 then
+  begin
+    AtomicAdd(@bad, 1);
+    done.Done;
+    Exit;
+  end;
+  r := JsonReader(c);
+  r.Lines := True;
+  for k := 0 to High(Script) do
+  begin
+    if TcpWrite(c, Script[k, 0] + #10) < 0 then
+    begin
+      AtomicAdd(@bad, 1);
+      Break;
+    end;
+    if Script[k, 1] = '' then
+      Continue;
+    if not JsonRead(r, got) or (got <> JsonParse(Script[k, 1])) then
+    begin
+      AtomicAdd(@bad, 1);
+      Break;
+    end;
+  end;
+  TcpClose(c);
+  done.Done;
+end;
+
+procedure SelfTest(N: Integer);
+var
+  l, i, lim: Integer;
+begin
+  lim := RaiseFdLimit;
+  if lim < 2 * N + 64 then
+    N := (lim - 64) div 2;
+  l := TcpListen(0);
+  if l < 0 then
+  begin
+    WriteLn('jsonrpc: cannot listen');
+    Halt(1);
+  end;
+  pas Listen(l);
+  done.Add(N);
+  for i := 1 to N do
+    pas Client(TcpPort(l));
+  done.Wait;
+  WriteLn(N, ' clients, ', calls, ' calls, ', answers, ' answers, ', bad, ' bad');
+  if bad <> 0 then
+    Halt(1);
+  Halt(0);                { the server routine parks for ever: end without waiting for it }
+end;
+
+var
+  port, l: Integer;
+begin
+  if (ParamCount >= 1) and (ParamStr(1) = '-selftest') then
+  begin
+    if ParamCount >= 2 then
+      SelfTest(StrToIntDef(ParamStr(2), 2000))
+    else
+      SelfTest(2000);
+    Exit;
+  end;
+  port := 4000;
+  if ParamCount >= 1 then
+    port := StrToIntDef(ParamStr(1), 4000);
+  RaiseFdLimit;
+  l := TcpListenAt('', port, 1024);
+  if l < 0 then
+  begin
+    WriteLn('jsonrpc: cannot listen on port ', port);
+    Halt(1);
+  end;
+  WriteLn('jsonrpc: listening on port ', TcpPort(l), ' (JSON-RPC 2.0, a request a line)');
+  Listen(l);
+end.

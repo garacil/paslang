@@ -753,6 +753,19 @@ one after the last found first. A `json` member takes a copy of its
 subtree, its own document; a string is copied. A typed `for` over a
 json and a typed `TryGet` call the same entries.
 
+A json constant (P209) is a variable of the unit, `<unit>.<name>` as
+any typed constant, its image zero; `JsonParse` of a constant text is a
+hidden one, `<unit>.json.k<n>`, one for each text. The unit's
+initialization (a program's main block) makes each by `JsonParse` of
+its text before the class constructors run, so a document of a
+constant lives as long as the program. `TJsonReader` (P208) keeps the
+bytes of a stream in a buffer it owns, `FBuf` (a text reader reads the
+string itself), every place in it an offset from the stream's first
+byte, and a parse state it reuses for typed reads; `TJsonWriter` writes
+into a `TJsonOut`, the buffer the encoders the compiler writes use.
+Neither holds a pointer into another routine's memory, and each is one
+routine's at a time.
+
 ## Sync types
 
 `mutex` (32 bytes), `rwmutex` (48), `waitgroup` (24), `cond` (16), and

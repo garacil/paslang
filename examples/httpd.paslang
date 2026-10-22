@@ -18,12 +18,14 @@
   parked on the runtime's poller while it waits, so ten thousand open
   connections are ten thousand small stacks and no threads. Keep-alive
   by default, as the protocol says; GET / is a page, GET /hello a
-  greeting, GET /stats the counters, anything else 404.
+  greeting, GET /stats the counters, GET /stats.json the same as JSON,
+  JsonOf of a record (P210), anything else 404.
 
     httpd [port]            serve (8080 by default) until killed
     httpd -selftest [n]     n client routines (2000 by default), three
                             requests each on one kept-alive connection,
-                            in this same process; prints the totals
+                            in this same process, then /stats.json read
+                            back into the record; prints the totals
 
   make check runs the self-test on both machines. }
 program httpd;
@@ -33,16 +35,24 @@ uses pasnet, paslib;
 const
   Requests = 3;
 
+type
+  TStats = record
+    Connections: Integer json 'connections';
+    Requests: Integer json 'requests';
+    Bad: Integer json 'bad';
+  end;
+
 var
   served, opened, bad: Integer;   { the counters, AtomicAdd from every routine }
   done: WaitGroup;
 
-function Header(Code: Integer; const Text: string; const Body: string; KeepAlive: Boolean): string;
+function Header(Code: Integer; const Text: string; const Body: string; KeepAlive: Boolean;
+  const Kind: string = 'text/plain'): string;
 var
   h: string;
 begin
   h := 'HTTP/1.1 ' + IntToStr(Code) + ' ' + Text + #13#10 +
-    'Content-Type: text/plain; charset=utf-8' + #13#10 +
+    'Content-Type: ' + Kind + '; charset=utf-8' + #13#10 +
     'Content-Length: ' + IntToStr(Length(Body)) + #13#10;
   if KeepAlive then
     h := h + 'Connection: keep-alive' + #13#10
@@ -68,6 +78,7 @@ end;
 function Answer(const Method, Path: string; KeepAlive: Boolean): string;
 var
   body: string;
+  st: TStats;
 begin
   if Method <> 'GET' then
   begin
@@ -76,12 +87,20 @@ begin
   end;
   if Path = '/' then
     body := 'paslang httpd: a routine per connection, parked between requests.' + #10 +
-      'Try /hello and /stats.' + #10
+      'Try /hello, /stats and /stats.json.' + #10
   else if Path = '/hello' then
     body := 'hello' + #10
   else if Path = '/stats' then
     body := 'connections ' + IntToStr(opened) + #10 + 'requests ' + IntToStr(served) + #10 +
       'bad ' + IntToStr(bad) + #10
+  else if Path = '/stats.json' then
+  begin
+    st.Connections := opened;
+    st.Requests := served;
+    st.Bad := bad;
+    Result := Header(200, 'OK', JsonEncode(JsonOf(st)) + #10, KeepAlive, 'application/json');
+    Exit;
+  end
   else
   begin
     Result := Header(404, 'Not Found', 'no ' + Path + #10, KeepAlive);
@@ -171,6 +190,34 @@ begin
   Result := v;
 end;
 
+{ The body of the answer to GET Path on a new connection, '' when it
+  fails. }
+function Fetch(Port: Integer; const Path: string): string;
+var
+  c, i, n: Integer;
+  buf, line, body: string;
+begin
+  Result := '';
+  c := TcpConnectTo('127.0.0.1', Port);
+  if c < 0 then
+    Exit;
+  buf := '';
+  n := -1;
+  if (TcpWrite(c, 'GET ' + Path + ' HTTP/1.1' + #13#10 + 'Connection: close' + #13#10 + #13#10) >= 0) and
+    TcpReadLine(c, buf, line) and (line = 'HTTP/1.1 200 OK') then
+  begin
+    while TcpReadLine(c, buf, line) and (line <> '') do
+    begin
+      i := 1;
+      if Token(line, i) = 'Content-Length:' then
+        n := StrToIntDef(Token(line, i), -1);
+    end;
+    if (n >= 0) and TcpReadN(c, n, buf, body) then
+      Result := body;
+  end;
+  TcpClose(c);
+end;
+
 { A client of the self-test: one connection, Requests requests, each
   answer checked. }
 procedure Client(Port, Id: Integer);
@@ -219,6 +266,8 @@ end;
 procedure SelfTest(N: Integer);
 var
   l, i, lim: Integer;
+  st: TStats;
+  e: EJsonError;
 begin
   lim := RaiseFdLimit;
   if lim < 2 * N + 64 then
@@ -237,6 +286,14 @@ begin
   WriteLn(N, ' clients, ', N * Requests, ' requests, ', served, ' served, ', bad, ' bad');
   if (served <> N * Requests) or (bad <> 0) then
     Halt(1);
+  { the counters as JSON, read back into the record: this request is
+    the last one served and its connection the last opened }
+  if not TryJsonDecode(Fetch(TcpPort(l), '/stats.json'), st, e) then
+  begin
+    WriteLn('httpd: /stats.json: ', e.Message);
+    Halt(1);
+  end;
+  WriteLn('stats.json: ', st.Connections, ' connections, ', st.Requests, ' requests, ', st.Bad, ' bad');
   Halt(0);                { the server routine parks for ever: end without waiting for it }
 end;
 
@@ -261,6 +318,6 @@ begin
     WriteLn('httpd: cannot listen on port ', port);
     Halt(1);
   end;
-  WriteLn('httpd: listening on port ', TcpPort(l), ' (GET /, /hello, /stats)');
+  WriteLn('httpd: listening on port ', TcpPort(l), ' (GET /, /hello, /stats, /stats.json)');
   Listen(l);
 end.

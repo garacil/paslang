@@ -28,6 +28,13 @@ Source files use the `.paslang` extension.
 - **Hash words.** `Sha256`, `Sha1`, `Sha512`, `Sha3_256`, `Md5`, the
   HMACs, `Crc32`, `Crc32c`, `XxHash3` and more, each on the processor's
   own instructions where it has them.
+- **JSON.** `json` is a type of the language: a value inside a
+  document that never changes, read strict as Go's `encoding/json/v2`
+  by scans on the processor's vectors; records, classes and any value
+  go to JSON and back through code the compiler writes for their type;
+  documents are built and transformed (RFC 6902, RFC 7396); streams,
+  NDJSON and RFC 7464 sequences, are read and written on parked
+  routines; and a constant's text is checked when the program compiles.
 - **The network.** TCP and UDP over both address families,
   Unix-domain sockets, a resolver and DNS messages, all on parked
   routines: a server of tens of thousands of connections is that many

@@ -4063,7 +4063,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(BUILDDIR)/ex_usegeom > $(BUILDDIR)/ex_usegeom.got; \
 	diff -u examples/units/usegeom.out $(BUILDDIR)/ex_usegeom.got; \
 	python3 scripts/check_examples.py; \
-	for t in httpd dnsd termd ftpd ntpd wsd chat proxy; do \
+	for t in httpd dnsd termd ftpd ntpd wsd chat proxy jsonrpc; do \
 	  $(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/ex_$$t examples/$$t.paslang; \
 	  timeout 120 $(BUILDDIR)/ex_$$t -selftest 2000 > $(BUILDDIR)/ex_$$t.got; \
 	  diff -u examples/$$t.out $(BUILDDIR)/ex_$$t.got; \
@@ -5204,7 +5204,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	  $(OUTDIR)/paslangc -target arm64 -Fu $(BUILDDIR)/a64 -o $(BUILDDIR)/ex_$$t-arm examples/$$t.paslang; \
 	  timeout 120 $(QEMU_A64) $(BUILDDIR)/ex_$$t-arm -selftest 300 > $(BUILDDIR)/ex_$$t-arm.got; \
 	done; \
-	echo "300 clients, 900 requests, 900 served, 0 bad" | diff -u - $(BUILDDIR)/ex_httpd-arm.got; \
+	printf '300 clients, 900 requests, 900 served, 0 bad\nstats.json: 301 connections, 901 requests, 0 bad\n' | diff -u - $(BUILDDIR)/ex_httpd-arm.got; \
 	echo "300 clients, 300 answered, 0 missed, 0 bad" | diff -u - $(BUILDDIR)/ex_dnsd-arm.got; \
 	echo "300 sessions, 300 quit, 0 bad" | diff -u - $(BUILDDIR)/ex_termd-arm.got; \
 	echo "300 sessions, 300 stored, 300 fetched, 0 bad" | diff -u - $(BUILDDIR)/ex_ftpd-arm.got; \
@@ -5212,6 +5212,10 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	echo "300 clients, 900 frames, 900 echoed, 0 bad" | diff -u - $(BUILDDIR)/ex_wsd-arm.got; \
 	echo "300 clients, 300 said, 2700 delivered of 2700, 0 bad" | diff -u - $(BUILDDIR)/ex_chat-arm.got; \
 	echo "300 clients, 300 forwarded, 900 requests, 900 served, 0 bad" | diff -u - $(BUILDDIR)/ex_proxy-arm.got; \
+	: P210 JSON-RPC over NDJSON, its 2000 clients under qemu too; \
+	$(OUTDIR)/paslangc -target arm64 -Fu $(BUILDDIR)/a64 -o $(BUILDDIR)/ex_jsonrpc-arm examples/jsonrpc.paslang; \
+	timeout 300 $(QEMU_A64) $(BUILDDIR)/ex_jsonrpc-arm -selftest 2000 > $(BUILDDIR)/ex_jsonrpc-arm.got; \
+	diff -u examples/jsonrpc.out $(BUILDDIR)/ex_jsonrpc-arm.got; \
 	echo ok network-servers-arm; \
 	echo "==== ip6park arm64 ===="; \
 	$(OUTDIR)/paslangc -target arm64 -c src/lib/pasnet.paslang; \

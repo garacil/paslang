@@ -5563,13 +5563,16 @@ first.
 ```pascal
 { The store: a key-value database in two files, the table and its log.
   A put or a delete goes to the log first; StoreAbandon closes the files
-  as a crash would leave them, and the next open replays the log. }
+  as a crash would leave them, and the next open replays the log. A
+  json document is stored as its text, and the SHA-256 of its canonical
+  form names it, whatever its spaces and the order of its members. }
 program kvstore;
 
 var
   Path: string;
   db: store;
   i: Integer;
+  doc: json;
 
 { unlink(2) is 87 on amd64; arm64 has only unlinkat(2), 35. }
 procedure Remove(const Name: string);
@@ -5607,6 +5610,16 @@ begin
   StoreClose(db);
   db := StoreOpen(Path);
   WriteLn('key1' in db, ' ', StoreGet(db, 'key4'));   { 0 value 4 }
+  StorePut(db, 'doc1', '{"b": [1, 2.50], "a": "x", "c": {"z": null, "y": true}}');
+  StorePut(db, 'doc2', JsonEncode(JsonParse('{"a":"x","c":{"y":true,"z":null},"b":[1,2.5]}')));
+  StoreClose(db);
+  db := StoreOpen(Path);
+  for i := 1 to 2 do
+  begin
+    doc := JsonParse(StoreGet(db, 'doc' + Chr(Ord('0') + i)));   { the text read back, a document again }
+    WriteLn(Hex(Sha256(JsonEncode(doc, JsonCanonical))));      { RFC 8785: the same for both }
+  end;
+  WriteLn(JsonEncode(doc, JsonCanonical));   { its members in order, 2.50 as 2.5 }
   StoreClose(db);
   Remove(Path);                          { so the next run starts clean too }
   Remove(Path + '.wal');
@@ -5621,6 +5634,9 @@ three 1 0
 value 1 three 0
 value 6 1 0
 0 value 4
+27cb2199c3cb261001e8560a8d7b4c4d25daf66481fd0271c60c618aadd57bc4
+27cb2199c3cb261001e8560a8d7b4c4d25daf66481fd0271c60c618aadd57bc4
+{"a":"x","b":[1,2.5],"c":{"y":true,"z":null}}
 ```
 
 The two files: `path` is the table, which begins with a header page of
@@ -6567,6 +6583,399 @@ prints
 {"id":"four","op":"sum"} -> {"id":0,"error":"json: cannot decode \"four\" into Integer at 4:7 (byte 109) within \"/id\""}
 {"id":5,"op":"sum","args":[]} -> {"id":5}
 ```
+
+### A JSON-RPC service
+
+`examples/jsonrpc.paslang` serves JSON-RPC 2.0 over NDJSON on TCP, a
+request and its answer a line each, as the specification says
+(jsonrpc.org/specification, `docs/ref/json/jsonrpc-2.0-specification.html`):
+one routine a connection reads each request into a record, calls the
+method and writes the answer, a record too; a batch gets an array of
+answers, a notification none, and the four errors the specification
+names come where it says. Its self-test sends the specification's
+examples of section 7 from 2000 connections at once and holds every
+answer to the one the specification gives (both machines, in make
+check):
+
+```pascal
+{ JSON-RPC 2.0 over NDJSON on TCP (P210), as its specification says
+  (jsonrpc.org/specification): a request and its answer a line each.
+  One routine a connection reads each line as it comes (a TJsonReader
+  of the socket, Lines), decodes a request into a record, calls the
+  method and writes the answer, a record too (a TJsonWriter of the
+  socket); a batch, an array of requests, gets an array of answers in
+  their order; a notification, a request with no id, none. The methods
+  of the specification's examples: subtract, its params by position or
+  by name, sum and get_data; its errors: -32700 for a line that is no
+  JSON, -32600 for a request that is none, -32601 for a method that is
+  not there, -32602 for params that do not fit.
+
+    jsonrpc [port]          serve (4000 by default) until killed
+    jsonrpc -selftest [n]   n client routines (2000 by default), each on
+                            its own connection sending the examples of
+                            the specification's section 7 and checking
+                            every answer; prints the totals
+
+  make check runs the self-test on both machines. }
+program jsonrpc;
+
+uses pasnet, paslib;
+
+type
+  TRequest = record
+    Version: string json 'jsonrpc';
+    Method: string json 'method';
+    Params: json json 'params';
+    Id: json json 'id';
+  end;
+
+  TNamed = record                 { subtract's params by name }
+    Minuend: Double json 'minuend';
+    Subtrahend: Double json 'subtrahend';
+  end;
+
+  TAnswer = record
+    Version: string json 'jsonrpc';
+    Value: json json 'result';
+    Id: json json 'id';
+  end;
+
+  TError = record
+    Code: Integer json 'code';
+    Message: string json 'message';
+  end;
+
+  TFailure = record
+    Version: string json 'jsonrpc';
+    Error: TError json 'error';
+    Id: json json 'id';
+  end;
+
+var
+  calls, answers, bad: Integer;   { the counters, AtomicAdd from every routine }
+  done: WaitGroup;
+
+procedure Fail(var F: TFailure; Code: Integer; const Message: string; Id: json);
+begin
+  F.Version := '2.0';
+  F.Error.Code := Code;
+  F.Error.Message := Message;
+  F.Id := Id;
+end;
+
+{ The answer to the request J: 0 none (a notification), 1 A, 2 F. }
+function Respond(J: json; var A: TAnswer; var F: TFailure): Integer;
+var
+  q: TRequest;
+  named: TNamed;
+  nums: array of Double;
+  e: EJsonError;
+  v: json;
+  x: Double;
+  i: Integer;
+  known, fits, notify: Boolean;
+begin
+  AtomicAdd(@calls, 1);
+  if (J.Kind <> jkObject) or not TryJsonDecode(J, q, e) or (q.Version <> '2.0') or
+    (q.Method = '') or not (('method' in J) and (J['method'].Kind = jkString)) then
+  begin
+    Fail(F, -32600, 'Invalid Request', nil);
+    Result := 2;
+    Exit;
+  end;
+  notify := not ('id' in J);
+  known := True;
+  fits := False;
+  v := nil;
+  if q.Method = 'subtract' then
+  begin
+    if (q.Params <> nil) and (q.Params.Kind = jkArray) and TryJsonDecode(q.Params, nums, e) and
+      (Length(nums) = 2) then
+    begin
+      v := JsonOf(nums[0] - nums[1]);
+      fits := True;
+    end
+    else if (q.Params <> nil) and (q.Params.Kind = jkObject) and ('minuend' in q.Params) and
+      ('subtrahend' in q.Params) and TryJsonDecode(q.Params, named, e) then
+    begin
+      v := JsonOf(named.Minuend - named.Subtrahend);
+      fits := True;
+    end;
+  end
+  else if q.Method = 'sum' then
+  begin
+    if (q.Params <> nil) and (q.Params.Kind = jkArray) and TryJsonDecode(q.Params, nums, e) then
+    begin
+      x := 0;
+      for i := 0 to High(nums) do
+        x := x + nums[i];
+      v := JsonOf(x);
+      fits := True;
+    end;
+  end
+  else if q.Method = 'get_data' then
+  begin
+    v := JsonArray(['hello', 5]);
+    fits := True;
+  end
+  else
+    known := False;
+  if notify then
+  begin
+    Result := 0;
+    Exit;
+  end;
+  if not known then
+  begin
+    Fail(F, -32601, 'Method not found', q.Id);
+    Result := 2;
+  end
+  else if not fits then
+  begin
+    Fail(F, -32602, 'Invalid params', q.Id);
+    Result := 2;
+  end
+  else
+  begin
+    A.Version := '2.0';
+    A.Value := v;
+    A.Id := q.Id;
+    Result := 1;
+  end;
+end;
+
+{ One connection: a line read, its answer written, until the peer
+  closes. An answer is counted before it is written: its client reads
+  it, ends and the self-test prints the totals, and a count after the
+  write could come after the print. }
+procedure Serve(C: Integer);
+var
+  r: TJsonReader;
+  w: TJsonWriter;
+  j: json;
+  e: EJsonError;
+  a: TAnswer;
+  f: TFailure;
+  replies: array of json;
+  i, n: Integer;
+begin
+  r := JsonReader(C);
+  r.Lines := True;
+  w := JsonWriter(C);
+  while True do
+  begin
+    if not TryJsonRead(r, j, e) then
+    begin
+      if (e = nil) or (e.Kind = jeIO) then
+        Break;
+      AtomicAdd(@calls, 1);
+      Fail(f, -32700, 'Parse error', nil);
+      AtomicAdd(@answers, 1);
+      JsonWrite(w, f);
+      Continue;
+    end;
+    if (j <> nil) and (j.Kind = jkArray) and (Length(j) > 0) then
+    begin
+      { a batch: its answers in an array, nothing when every one is a
+        notification }
+      replies := nil;
+      n := 0;
+      for i := 0 to Length(j) - 1 do
+        case Respond(j[i], a, f) of
+          1: begin SetLength(replies, n + 1); replies[n] := JsonOf(a); n := n + 1; end;
+          2: begin SetLength(replies, n + 1); replies[n] := JsonOf(f); n := n + 1; end;
+        end;
+      if n > 0 then
+      begin
+        AtomicAdd(@answers, 1);
+        w.BeginArray;
+        for i := 0 to n - 1 do
+          w.Add(replies[i]);
+        w.EndArray;
+      end;
+    end
+    else
+      case Respond(j, a, f) of
+        1: begin AtomicAdd(@answers, 1); JsonWrite(w, a); end;
+        2: begin AtomicAdd(@answers, 1); JsonWrite(w, f); end;
+      end;
+  end;
+  TcpClose(C);
+end;
+
+procedure Listen(L: Integer);
+var
+  c: Integer;
+begin
+  while True do
+  begin
+    c := TcpAccept(L);
+    if c < 0 then
+      Break;
+    pas Serve(c);
+  end;
+end;
+
+const
+  { The specification's section 7, each line a request and the answer
+    it gets, '' for none; a batch of several lines there is one line
+    here, as NDJSON has it. }
+  Script: array[0..15, 0..1] of string = (
+    ('{"jsonrpc": "2.0", "method": "subtract", "params": [42, 23], "id": 1}',
+     '{"jsonrpc": "2.0", "result": 19, "id": 1}'),
+    ('{"jsonrpc": "2.0", "method": "subtract", "params": [23, 42], "id": 2}',
+     '{"jsonrpc": "2.0", "result": -19, "id": 2}'),
+    ('{"jsonrpc": "2.0", "method": "subtract", "params": {"subtrahend": 23, "minuend": 42}, "id": 3}',
+     '{"jsonrpc": "2.0", "result": 19, "id": 3}'),
+    ('{"jsonrpc": "2.0", "method": "subtract", "params": {"minuend": 42, "subtrahend": 23}, "id": 4}',
+     '{"jsonrpc": "2.0", "result": 19, "id": 4}'),
+    ('{"jsonrpc": "2.0", "method": "update", "params": [1,2,3,4,5]}', ''),
+    ('{"jsonrpc": "2.0", "method": "foobar"}', ''),
+    ('{"jsonrpc": "2.0", "method": "foobar", "id": "1"}',
+     '{"jsonrpc": "2.0", "error": {"code": -32601, "message": "Method not found"}, "id": "1"}'),
+    ('{"jsonrpc": "2.0", "method": "foobar, "params": "bar", "baz]',
+     '{"jsonrpc": "2.0", "error": {"code": -32700, "message": "Parse error"}, "id": null}'),
+    ('{"jsonrpc": "2.0", "method": 1, "params": "bar"}',
+     '{"jsonrpc": "2.0", "error": {"code": -32600, "message": "Invalid Request"}, "id": null}'),
+    ('[{"jsonrpc": "2.0", "method": "sum", "params": [1,2,4], "id": "1"}, {"jsonrpc": "2.0", "method"]',
+     '{"jsonrpc": "2.0", "error": {"code": -32700, "message": "Parse error"}, "id": null}'),
+    ('[]', '{"jsonrpc": "2.0", "error": {"code": -32600, "message": "Invalid Request"}, "id": null}'),
+    ('[1]', '[{"jsonrpc": "2.0", "error": {"code": -32600, "message": "Invalid Request"}, "id": null}]'),
+    ('[1,2,3]', '[{"jsonrpc": "2.0", "error": {"code": -32600, "message": "Invalid Request"}, "id": null},' +
+     '{"jsonrpc": "2.0", "error": {"code": -32600, "message": "Invalid Request"}, "id": null},' +
+     '{"jsonrpc": "2.0", "error": {"code": -32600, "message": "Invalid Request"}, "id": null}]'),
+    ('[{"jsonrpc": "2.0", "method": "sum", "params": [1,2,4], "id": "1"}, ' +
+     '{"jsonrpc": "2.0", "method": "notify_hello", "params": [7]}, ' +
+     '{"jsonrpc": "2.0", "method": "subtract", "params": [42,23], "id": "2"}, {"foo": "boo"}, ' +
+     '{"jsonrpc": "2.0", "method": "foo.get", "params": {"name": "myself"}, "id": "5"}, ' +
+     '{"jsonrpc": "2.0", "method": "get_data", "id": "9"}]',
+     '[{"jsonrpc": "2.0", "result": 7, "id": "1"}, {"jsonrpc": "2.0", "result": 19, "id": "2"}, ' +
+     '{"jsonrpc": "2.0", "error": {"code": -32600, "message": "Invalid Request"}, "id": null}, ' +
+     '{"jsonrpc": "2.0", "error": {"code": -32601, "message": "Method not found"}, "id": "5"}, ' +
+     '{"jsonrpc": "2.0", "result": ["hello", 5], "id": "9"}]'),
+    ('[{"jsonrpc": "2.0", "method": "notify_sum", "params": [1,2,4]}, ' +
+     '{"jsonrpc": "2.0", "method": "notify_hello", "params": [7]}]', ''),
+    ('{"jsonrpc": "2.0", "method": "sum", "params": [1.5, 2.5], "id": "last"}',
+     '{"jsonrpc": "2.0", "result": 4, "id": "last"}'));
+
+function StrToIntDef(const S: string; Def: Integer): Integer;
+var
+  v, i: Integer;
+begin
+  v := 0;
+  if S = '' then
+  begin
+    Result := Def;
+    Exit;
+  end;
+  for i := 1 to Length(S) do
+  begin
+    if (S[i] < '0') or (S[i] > '9') then
+    begin
+      Result := Def;
+      Exit;
+    end;
+    v := v * 10 + Ord(S[i]) - 48;
+  end;
+  Result := v;
+end;
+
+{ A client of the self-test: the script on one connection, each answer
+  read and held to the one the specification gives, as a value. }
+procedure Client(Port: Integer);
+var
+  c, k: Integer;
+  r: TJsonReader;
+  got: json;
+begin
+  c := TcpConnectTo('127.0.0.1', Port);
+  if c < 0 then
+  begin
+    AtomicAdd(@bad, 1);
+    done.Done;
+    Exit;
+  end;
+  r := JsonReader(c);
+  r.Lines := True;
+  for k := 0 to High(Script) do
+  begin
+    if TcpWrite(c, Script[k, 0] + #10) < 0 then
+    begin
+      AtomicAdd(@bad, 1);
+      Break;
+    end;
+    if Script[k, 1] = '' then
+      Continue;
+    if not JsonRead(r, got) or (got <> JsonParse(Script[k, 1])) then
+    begin
+      AtomicAdd(@bad, 1);
+      Break;
+    end;
+  end;
+  TcpClose(c);
+  done.Done;
+end;
+
+procedure SelfTest(N: Integer);
+var
+  l, i, lim: Integer;
+begin
+  lim := RaiseFdLimit;
+  if lim < 2 * N + 64 then
+    N := (lim - 64) div 2;
+  l := TcpListen(0);
+  if l < 0 then
+  begin
+    WriteLn('jsonrpc: cannot listen');
+    Halt(1);
+  end;
+  pas Listen(l);
+  done.Add(N);
+  for i := 1 to N do
+    pas Client(TcpPort(l));
+  done.Wait;
+  WriteLn(N, ' clients, ', calls, ' calls, ', answers, ' answers, ', bad, ' bad');
+  if bad <> 0 then
+    Halt(1);
+  Halt(0);                { the server routine parks for ever: end without waiting for it }
+end;
+
+var
+  port, l: Integer;
+begin
+  if (ParamCount >= 1) and (ParamStr(1) = '-selftest') then
+  begin
+    if ParamCount >= 2 then
+      SelfTest(StrToIntDef(ParamStr(2), 2000))
+    else
+      SelfTest(2000);
+    Exit;
+  end;
+  port := 4000;
+  if ParamCount >= 1 then
+    port := StrToIntDef(ParamStr(1), 4000);
+  RaiseFdLimit;
+  l := TcpListenAt('', port, 1024);
+  if l < 0 then
+  begin
+    WriteLn('jsonrpc: cannot listen on port ', port);
+    Halt(1);
+  end;
+  WriteLn('jsonrpc: listening on port ', TcpPort(l), ' (JSON-RPC 2.0, a request a line)');
+  Listen(l);
+end.
+```
+
+prints
+
+```
+2000 clients, 48000 calls, 26000 answers, 0 bad
+```
+
+`examples/httpd` answers `GET /stats.json` with its counters, `JsonOf`
+of a record, and its self-test reads them back into the record;
+`examples/kvstore` stores json documents as their text and names each
+by the SHA-256 of its canonical form (§11).
 
 ### Constants
 
@@ -7800,12 +8209,14 @@ ends, so `prog | head` stops `prog` (`testdata/brokenpipe`).
   parked on the runtime's poller while it waits, so ten thousand open
   connections are ten thousand small stacks and no threads. Keep-alive
   by default, as the protocol says; GET / is a page, GET /hello a
-  greeting, GET /stats the counters, anything else 404.
+  greeting, GET /stats the counters, GET /stats.json the same as JSON,
+  JsonOf of a record (P210), anything else 404.
 
     httpd [port]            serve (8080 by default) until killed
     httpd -selftest [n]     n client routines (2000 by default), three
                             requests each on one kept-alive connection,
-                            in this same process; prints the totals
+                            in this same process, then /stats.json read
+                            back into the record; prints the totals
 
   make check runs the self-test on both machines. }
 program httpd;
@@ -7815,16 +8226,24 @@ uses pasnet, paslib;
 const
   Requests = 3;
 
+type
+  TStats = record
+    Connections: Integer json 'connections';
+    Requests: Integer json 'requests';
+    Bad: Integer json 'bad';
+  end;
+
 var
   served, opened, bad: Integer;   { the counters, AtomicAdd from every routine }
   done: WaitGroup;
 
-function Header(Code: Integer; const Text: string; const Body: string; KeepAlive: Boolean): string;
+function Header(Code: Integer; const Text: string; const Body: string; KeepAlive: Boolean;
+  const Kind: string = 'text/plain'): string;
 var
   h: string;
 begin
   h := 'HTTP/1.1 ' + IntToStr(Code) + ' ' + Text + #13#10 +
-    'Content-Type: text/plain; charset=utf-8' + #13#10 +
+    'Content-Type: ' + Kind + '; charset=utf-8' + #13#10 +
     'Content-Length: ' + IntToStr(Length(Body)) + #13#10;
   if KeepAlive then
     h := h + 'Connection: keep-alive' + #13#10
@@ -7850,6 +8269,7 @@ end;
 function Answer(const Method, Path: string; KeepAlive: Boolean): string;
 var
   body: string;
+  st: TStats;
 begin
   if Method <> 'GET' then
   begin
@@ -7858,12 +8278,20 @@ begin
   end;
   if Path = '/' then
     body := 'paslang httpd: a routine per connection, parked between requests.' + #10 +
-      'Try /hello and /stats.' + #10
+      'Try /hello, /stats and /stats.json.' + #10
   else if Path = '/hello' then
     body := 'hello' + #10
   else if Path = '/stats' then
     body := 'connections ' + IntToStr(opened) + #10 + 'requests ' + IntToStr(served) + #10 +
       'bad ' + IntToStr(bad) + #10
+  else if Path = '/stats.json' then
+  begin
+    st.Connections := opened;
+    st.Requests := served;
+    st.Bad := bad;
+    Result := Header(200, 'OK', JsonEncode(JsonOf(st)) + #10, KeepAlive, 'application/json');
+    Exit;
+  end
   else
   begin
     Result := Header(404, 'Not Found', 'no ' + Path + #10, KeepAlive);
@@ -7953,6 +8381,34 @@ begin
   Result := v;
 end;
 
+{ The body of the answer to GET Path on a new connection, '' when it
+  fails. }
+function Fetch(Port: Integer; const Path: string): string;
+var
+  c, i, n: Integer;
+  buf, line, body: string;
+begin
+  Result := '';
+  c := TcpConnectTo('127.0.0.1', Port);
+  if c < 0 then
+    Exit;
+  buf := '';
+  n := -1;
+  if (TcpWrite(c, 'GET ' + Path + ' HTTP/1.1' + #13#10 + 'Connection: close' + #13#10 + #13#10) >= 0) and
+    TcpReadLine(c, buf, line) and (line = 'HTTP/1.1 200 OK') then
+  begin
+    while TcpReadLine(c, buf, line) and (line <> '') do
+    begin
+      i := 1;
+      if Token(line, i) = 'Content-Length:' then
+        n := StrToIntDef(Token(line, i), -1);
+    end;
+    if (n >= 0) and TcpReadN(c, n, buf, body) then
+      Result := body;
+  end;
+  TcpClose(c);
+end;
+
 { A client of the self-test: one connection, Requests requests, each
   answer checked. }
 procedure Client(Port, Id: Integer);
@@ -8001,6 +8457,8 @@ end;
 procedure SelfTest(N: Integer);
 var
   l, i, lim: Integer;
+  st: TStats;
+  e: EJsonError;
 begin
   lim := RaiseFdLimit;
   if lim < 2 * N + 64 then
@@ -8019,6 +8477,14 @@ begin
   WriteLn(N, ' clients, ', N * Requests, ' requests, ', served, ' served, ', bad, ' bad');
   if (served <> N * Requests) or (bad <> 0) then
     Halt(1);
+  { the counters as JSON, read back into the record: this request is
+    the last one served and its connection the last opened }
+  if not TryJsonDecode(Fetch(TcpPort(l), '/stats.json'), st, e) then
+  begin
+    WriteLn('httpd: /stats.json: ', e.Message);
+    Halt(1);
+  end;
+  WriteLn('stats.json: ', st.Connections, ' connections, ', st.Requests, ' requests, ', st.Bad, ' bad');
   Halt(0);                { the server routine parks for ever: end without waiting for it }
 end;
 
@@ -8043,7 +8509,7 @@ begin
     WriteLn('httpd: cannot listen on port ', port);
     Halt(1);
   end;
-  WriteLn('httpd: listening on port ', TcpPort(l), ' (GET /, /hello, /stats)');
+  WriteLn('httpd: listening on port ', TcpPort(l), ' (GET /, /hello, /stats, /stats.json)');
   Listen(l);
 end.
 ```
@@ -12636,6 +13102,13 @@ the commands on standard input, under `--debug-mode` and under
   in paslang, so `omitzero` then leaves it out where Go keeps a slice
   that is not `nil`; an integer key of a map is read only from the
   digits JsonEncode writes for it (no `-0`, which Go takes as 0).
+  A stream's reader (1.1.237) reads NDJSON a line at a time and an RFC
+  7464 sequence a record at a time, an error costing that line or
+  record, where Go's `Decoder` reads values only and keeps its first
+  error, as paslang's does in a plain stream; a writer can hold its
+  values for `Flush` (`Buffered`) where Go writes each at once. A json
+  constant (1.1.238) is parsed when compiling, which neither Go nor
+  Free Pascal does: a constant text that is no JSON is no program.
 - SysUtils file buffers are typed, bounded `TBytes`, not untyped memory
   whose extent cannot be checked. Whole-file reads require a byte budget;
   excess is an explicit error, never silent truncation. DOS file-sharing
@@ -12898,8 +13371,9 @@ its place:
   High Odd SizeOf Length Copy Delete Clear TryGet Default Assigned
   SetLength Inc Dec GetMem FreeMem Move FillChar CompareByte IndexByte
   View MemBase MemSize MemEnd`, and Pascal's string words `Pos Insert Concat UpCase LowerCase
-  StringOfChar Str Val` (1.1.10), `JsonOf` (§12, 1.1.131), and
-  `JsonDecode` and `TryJsonDecode` (§12, 1.1.133); the options
+  StringOfChar Str Val` (1.1.10), `JsonOf` (§12, 1.1.131),
+  `JsonDecode` and `TryJsonDecode` (§12, 1.1.133), and `JsonObject` and
+  `JsonArray` (§12, 1.1.235); the options
   of a `json` directive, `omitzero` … `rfc3339`, are words only after
   `json` and stay names;
 - the tree, heap and store words (§11): `Rank KeyAt PopLow PopHigh Split
@@ -12957,13 +13431,19 @@ its place:
   pashash's `PasHex PasMd5 PasSha1Cpu` … `PasMerkleCheckBase` and
   pastree's `PasTreeNew` … `PasStoreAbandon`, pasjson's JSON words
   (§12) `JsonParse TryJsonParse JsonEncode JsonIndex JsonDefaults
-  JsonPretty JsonCanonical`, its types `TJsonKind` (`jkNull` …
+  JsonPretty JsonCanonical JsonClone JsonSet JsonRemove JsonPatch
+  JsonMergePatch` (1.1.235) and `JsonReader JsonWriter JsonRead
+  TryJsonRead JsonWrite` (1.1.237), its types `TJsonKind` (`jkNull` …
   `jkObject`), `TJsonErrorKind` (`jeSyntax` … `jeIO`), `TJsonOptions`,
-  `EJsonError`, `TJsonIter`, `TJsonIndex`, `TJsonHelper`, the
+  `EJsonError`, `TJsonIter`, `TJsonIndex`, `TJsonHelper`, `TJsonBuild`,
+  `TJsonVarItem` and `TJsonBuilder` (1.1.235), `TJsonSource`, `TJsonSink`,
+  `TJsonToken` (`jtkEnd` … `jtkEndArray`), `TJsonLevel`, `PJsonOut`,
+  `TJsonPlaces`, `TJsonReader` and `TJsonWriter` (1.1.237), the
   writer's `TJsonOut`, `TJsonOutLevel`, `TJsonOutMark`, `TJsonOutPair` and
   `TJsonOutPairs` and the reader's `TJsonIn` and `TJsonKeep`, and its
   `PasJsonIndex` … `PasJsonImage`, `PasJsonOutInit` … `PasJsonOutIntName`
-  and `PasJsonInText` … `PasJsonInNameBool` routines, and pasobject's `TObject`
+  and `PasJsonInText` … `PasJsonInNameBool` routines, `PasJsonOfConsts`
+  (1.1.235) and `PasJsonReadBegin` … `PasJsonWriteUndo` (1.1.237), and pasobject's `TObject`
   with `PasClassName` … `PasUncaught`, and the compiler's `TClass`
   (`class of TObject`), `TVarRec` and its kinds `vtInteger` …
   `vtJson`. A core unit declares its
