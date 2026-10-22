@@ -262,6 +262,7 @@ type
   TMapSite = record
     Lab: string;
     Kind: LongInt;
+    Cold: Boolean;       { in a cold block, which goes after the routine's ret (P388) }
     Pushed: array of Byte;
     ScrOff: array of LongInt;
     ScrK: array of Byte;
@@ -529,6 +530,7 @@ type
     procedure MapLoc(Off: LongInt; K: Byte);
     procedure MapEnd(F: LongInt);
     procedure MapOutLine(const S: string);
+    function PlainMapSec(const T: string): string;
     function MapDesc(const D: string): string;
     procedure MapHint(K: Byte);
     procedure MapHint2(K0, K1: Byte);
@@ -2374,6 +2376,7 @@ begin
   n := Length(FMapSites);
   SetLength(FMapSites, n + 1);
   FMapSites[n].Lab := gl;
+  FMapSites[n].Cold := FColdAt >= 0;
   if FMapOn then
     FMapSites[n].Kind := 0
   else
@@ -2524,14 +2527,33 @@ end;
   the ones among them nobody knows. }
 procedure TEmitter.MapEnd(F: LongInt);
 var
-  s, i, j, n, nb, idx: SizeInt;
+  s, i, j, n, nb, idx, k: SizeInt;
   cls: array of Byte;
+  order: array of SizeInt;
   d: string;
   w, u: Int64;
 begin
   cls := nil;
+  { the sites in the order of their code (P388): the body's as they
+    were written, then its cold blocks', which ColdFlush placed after
+    the ret in the order they were cut out }
+  SetLength(order, Length(FMapSites));
+  k := 0;
   for s := 0 to High(FMapSites) do
+    if not FMapSites[s].Cold then
+    begin
+      order[k] := s;
+      k := k + 1;
+    end;
+  for s := 0 to High(FMapSites) do
+    if FMapSites[s].Cold then
+    begin
+      order[k] := s;
+      k := k + 1;
+    end;
+  for k := 0 to High(order) do
   begin
+    s := order[k];
     if FMapSites[s].Kind = 1 then
       d := '  .quad 1'
     else
@@ -2590,12 +2612,12 @@ begin
         d := d + ', ' + IntToStr(u);
       end;
     end;
-    if (s = 0) and (FOwnSec <> '') then
+    if (k = 0) and (FOwnSec <> '') then
     begin
       { the entries of a routine in its own section go to a section the
-        linker keeps with the routine's (SHF_LINK_ORDER) and lays inside
-        pasgcmaps by the script the driver writes; the runtime sorts the
-        table at start }
+        linker keeps with the routine's (SHF_LINK_ORDER) and lays in
+        pasgcmaps in the order of the code, as it lays the plain .text's
+        (PlainMapSec, P388) }
       if FArm then
         MapOutLine('.section pasgcmaps.' + FOwnSec + ',"awo",%progbits,' + FOwnSec)
       else
@@ -2605,10 +2627,29 @@ begin
     MapOutLine('  .quad ' + FMapSites[s].Lab + ', ' + MapDesc(d));
   end;
   if (Length(FMapSites) > 0) and (FOwnSec <> '') then
-    MapOutLine('.section pasgcmaps,"aw"');
+    MapOutLine(PlainMapSec('pasgcmaps'));
   SetLength(FMapSites, 0);
   FMapOn := False;
   FMapPro := False;
+end;
+
+{ The section of table T's entries for the code of the plain .text (the
+  main block, the life blocks, the runtime's), linked to it by .Ltext0
+  at its start as a routine's are to its own section (P388): GNU ld lays
+  the pieces an input statement takes in the order of the code they are
+  linked to (SHF_LINK_ORDER, the ELF gABI's chapter 4: "a table that
+  references text or data sections in address order"; ld/ldelfgen.c,
+  fixup_link_order) and keeps a piece when it keeps its code
+  (bfd/elflink.c, _bfd_elf_gc_mark_extra_sections), so pasgcmaps and
+  pasasync are sorted when the program starts, as Go's linker writes
+  its function table in the order of the text (cmd/link/internal/ld/
+  pcln.go). }
+function TEmitter.PlainMapSec(const T: string): string;
+begin
+  if FArm then
+    Result := '.section ' + T + '..text,"awo",%progbits,.Ltext0'
+  else
+    Result := '.section ' + T + '..text,"awo",@progbits,.Ltext0';
 end;
 
 procedure TEmitter.MapOutLine(const S: string);
@@ -35624,8 +35665,8 @@ begin
 end;
 
 { The main block's code for rt_sigurg (P293), as EmitProc gives each
-  routine's: in the section every object adds to, since the main block
-  sits in .text with the runtime and is always linked. }
+  routine's: in the piece of the plain .text, since the main block sits
+  there with the runtime (P388). }
 procedure TEmitter.MainAsync;
 var
   e: string;
@@ -35634,14 +35675,14 @@ begin
   begin
     e := Lab;
     Line(e + ':');
-    MapOutLine('.section pasasync,"aw"');
+    MapOutLine(PlainMapSec('pasasync'));
     MapOutLine('.balign 8');
     { from after the prologue's stack check, as a routine's }
     if FAsyncFrom = '' then
       FAsyncFrom := 'pas_main';
     MapOutLine('  .quad ' + FAsyncFrom + ', ' + e);
-    { the main block's call sites follow, in the maps' own section }
-    MapOutLine('.section pasgcmaps,"aw"');
+    { the main block's call sites follow, in the plain .text's piece }
+    MapOutLine(PlainMapSec('pasgcmaps'));
   end;
   FAsyncOK := False;
 end;
@@ -37942,9 +37983,9 @@ begin
       MapOutLine('.section pasasync.' + Pr.Sym + ',"awo",@progbits,' + Pr.Sym);
     MapOutLine('.balign 8');
     MapOutLine('  .quad ' + FAsyncFrom + ', ' + dend);
-    { back to the maps' own section: the main block's and a unit's life
-      blocks write their call sites without naming one }
-    MapOutLine('.section pasgcmaps,"aw"');
+    { back to the plain .text's piece: the main block's and a unit's
+      life blocks write their call sites without naming one }
+    MapOutLine(PlainMapSec('pasgcmaps'));
   end;
   FAsyncOK := False;
   Line('.text');
@@ -50000,11 +50041,12 @@ begin
       end;
   end;
   { The stack maps (P95c): a pair per call site, the return address and
-    its descriptor, in a section the linker gathers from every object
-    file (writable: the runtime sorts it once); the descriptors after. }
+    its descriptor, in pieces linked to their code that the linker lays
+    in its order (PlainMapSec, P388; writable: a table linked otherwise
+    the runtime sorts once); the descriptors after. }
   if FMapOutN > 0 then
   begin
-    Line('.section pasgcmaps,"aw"');
+    Line(PlainMapSec('pasgcmaps'));
     Line('.balign 8');
     for i := 0 to FMapOutN - 1 do
       Line(FMapOut[i]);
