@@ -579,6 +579,9 @@ GOLDEN_A64 += httpsrv
 # P438: Argon2 and BLAKE2b against their published vectors, the PHC string.
 GOLDEN += argon2kat
 GOLDEN_A64 += argon2kat
+# P440: the digests in pieces equal the whole-message words, every cut.
+GOLDEN += hashpieces
+GOLDEN_A64 += hashpieces
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -1115,7 +1118,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/stackmap.out $(BUILDDIR)/stackmap.vgot; \
 	echo ok stackmaps; \
 	echo "==== the base processor (-cpu base) ===="; \
-	for t in vectors vecmore vecpool bitwords xxh3 inlineasm hash1 tree1 store1 mapsplit set256 strwords strkern strcmpk cmpwords sysutils1 utf8kern jsonkern longslice rtlong fillkern json1 jsoncanon hmacstream; do \
+	for t in vectors vecmore vecpool bitwords xxh3 inlineasm hash1 tree1 store1 mapsplit set256 strwords strkern strcmpk cmpwords sysutils1 utf8kern jsonkern longslice rtlong fillkern json1 jsoncanon hmacstream hashpieces; do \
 	  $(OUTDIR)/paslangc -cpu base -o $(BUILDDIR)/$$t-base testdata/$$t.paslang; \
 	  $(BUILDDIR)/$$t-base > $(BUILDDIR)/$$t.bgot; \
 	  diff -u testdata/$$t.out $(BUILDDIR)/$$t.bgot; \
@@ -1124,6 +1127,9 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	done; \
 	grep -q 'p_pashash_passha256cpu' $(BUILDDIR)/hash1.s; \
 	grep -q 'p_pashash_passha256base' $(BUILDDIR)/hash1-base.s; \
+	grep -q 'p_pashash_passha256updatecpu' $(BUILDDIR)/hashpieces.s; \
+	grep -q 'p_pashash_passha256updatebase' $(BUILDDIR)/hashpieces-base.s; \
+	if grep -q 'p_pashash_passha256updatecpu' $(BUILDDIR)/hashpieces-base.s; then echo "hashpieces-base.s calls the SHA-NI body"; exit 1; fi; \
 	if grep -q 'p_pashash_passha256cpu' $(BUILDDIR)/hash1-base.s; then echo "hash1-base.s calls the SHA-NI body"; exit 1; fi; \
 	if grep -q 'popcntq' $(BUILDDIR)/bitwords-base.s; then echo "bitwords-base.s carries popcnt"; exit 1; fi; \
 	if grep -q 'btq \$$13, rt_cpufeat' $(BUILDDIR)/vectors.s; then echo "vectors.s tests rt_cpufeat at run time"; exit 1; fi; \
@@ -4794,13 +4800,15 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	diff -u testdata/cputuse.out $(BUILDDIR)/cputuse-arm.got
 	@set -e; \
 	echo "==== the base processor arm64 ===="; \
-	for t in hash1 tree1 store1 vectors bitwords set256 strwords strkern strcmpk cmpwords sysutils1 utf8kern jsonkern longslice rtlong fillkern json1 jsoncanon hmacstream; do \
+	for t in hash1 tree1 store1 vectors bitwords set256 strwords strkern strcmpk cmpwords sysutils1 utf8kern jsonkern longslice rtlong fillkern json1 jsoncanon hmacstream hashpieces; do \
 	  $(OUTDIR)/paslangc -target arm64 -cpu base -o $(BUILDDIR)/$$t-arm-base testdata/$$t.paslang; \
 	  timeout 120 $(QEMU_A64) $(BUILDDIR)/$$t-arm-base > $(BUILDDIR)/$$t-arm.bgot; \
 	  diff -u testdata/$$t.out $(BUILDDIR)/$$t-arm.bgot; \
 	done; \
 	grep -q 'p_pashash_passha256cpu' $(BUILDDIR)/hash1-arm.s; \
 	grep -q 'p_pashash_passha512cpu' $(BUILDDIR)/hash1-arm.s; \
+	grep -q 'p_pashash_passha256updatecpu' $(BUILDDIR)/hashpieces-arm.s; \
+	if grep -q 'p_pashash_passha256updatecpu' $(BUILDDIR)/hashpieces-arm-base.s; then echo "hashpieces-arm-base.s calls the SHA-256 body"; exit 1; fi; \
 	if grep -q 'p_pashash_passha256cpu' $(BUILDDIR)/hash1-arm-base.s; then echo "hash1-arm-base.s calls the SHA-256 body"; exit 1; fi; \
 	echo ok cpu-base-arm; \
 	: the json type on arm64, P203: every document of the oracle test as expect.txt holds it, the index and a byte at a time alike; \

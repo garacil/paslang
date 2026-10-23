@@ -485,6 +485,238 @@ SIP = '''    v0 := v0 + v1;
     v2 := RotateLeft(v2, 32);'''
 
 
+
+def incremental(v):
+    """The pieces of a digest (P440): Update feeds any bytes, Final pads
+    and gives the digest, each calling only its own block routine as the
+    whole-message words do (XxxCpu and XxxBase)."""
+    blk256 = 'Sha256BlocksCpu' if v == 'Cpu' else 'Sha256BlocksPlain'
+    blk1 = 'Sha1BlocksCpu' if v == 'Cpu' else 'Sha1BlocksPlain'
+    blk512 = 'Sha512BlocksCpu' if v == 'Cpu' else 'Sha512BlocksPlain'
+    t = r"""
+{ The bytes of S into the state: the block held filled first and
+  compressed when full, whole blocks straight from S in slices of
+  HashMaxBytes, the rest held. W goes in and out as the digest's own
+  width. }
+procedure Pas{F}Update{V}(var St: THashState; const S: string);
+var
+  w: array[0..7] of {WT};
+  i, n, k, nblk, take, done: Integer;
+  p: Pointer;
+begin
+  n := Length(S);
+  if n = 0 then
+    Exit;
+  for i := 0 to 7 do
+    w[i] := {WT}(St.W[i]);
+  p := Pointer(S);
+  St.Total := St.Total + n;
+  done := 0;
+  if St.Fill > 0 then
+  begin
+    k := {BS} - St.Fill;
+    if k > n then
+      k := n;
+    for i := 0 to k - 1 do
+      St.Buf[St.Fill + i] := PByte(p)[i];
+    St.Fill := St.Fill + k;
+    done := k;
+    if St.Fill = {BS} then
+    begin
+      {BLK}(@w[0], @St.Buf[0], 1);
+      St.Fill := 0;
+    end;
+  end;
+  nblk := (n - done) div {BS};
+  while nblk > 0 do
+  begin
+    take := nblk;
+    if take > HashMaxBytes div {BS} then
+      take := HashMaxBytes div {BS};
+    {BLK}(@w[0], Pointer(Integer(p) + done), take);
+    done := done + take * {BS};
+    nblk := nblk - take;
+  end;
+  k := n - done;
+  for i := 0 to k - 1 do
+    St.Buf[i] := PByte(p)[done + i];
+  if k > 0 then
+    St.Fill := k;
+  for i := 0 to 7 do
+    St.W[i] := Integer(w[i]);
+end;
+
+{ FIPS 180-4 5.1: a 1 bit, zeros and the length in bits, one block or
+  two; the digest of the words the algorithm keeps }
+function Pas{F}Final{V}(var St: THashState): string;
+var
+  w: array[0..7] of {WT};
+  buf: array[0..{BUFMAX}] of Byte;
+  i, nb, outw: Integer;
+begin
+  for i := 0 to 7 do
+    w[i] := {WT}(St.W[i]);
+  for i := 0 to {BUFMAX} do
+    buf[i] := 0;
+  for i := 0 to St.Fill - 1 do
+    buf[i] := St.Buf[i];
+  buf[St.Fill] := 128;
+  if St.Fill < {BS} - {LENB} then
+    nb := 1
+  else
+    nb := 2;
+  StoreBE64(@buf[nb * {BS} - 8], St.Total * 8);
+  {BLK}(@w[0], @buf[0], nb);
+  {OUT}
+end;
+"""
+    def fam(name, wt, bs, lenb, blk, out):
+        return (t.replace('{F}', name).replace('{WT}', wt).replace('{BS}', str(bs))
+                .replace('{LENB}', str(lenb)).replace('{BLK}', blk)
+                .replace('{BUFMAX}', str(2 * bs - 1)).replace('{OUT}', out).replace('{V}', v))
+    out256 = r"""if St.Alg = 2 then
+    outw := 7
+  else
+    outw := 8;
+  SetLength(Result, outw * 4);
+  for i := 0 to outw - 1 do
+    StoreBE32(@Result[i * 4 + 1], w[i]);"""
+    out1 = r"""outw := 5;
+  SetLength(Result, 20);
+  for i := 0 to 4 do
+    StoreBE32(@Result[i * 4 + 1], w[i]);"""
+    out512 = r"""if St.Alg = 4 then
+    outw := 6
+  else
+    outw := 8;
+  SetLength(Result, outw * 8);
+  for i := 0 to outw - 1 do
+    StoreBE64(@Result[i * 8 + 1], w[i]);"""
+    return (fam('Sha256', 'UInt32', 64, 8, blk256, out256) + fam('Sha1', 'UInt32', 64, 8, blk1, out1) +
+            fam('Sha512', 'Integer', 128, 16, blk512, out512))
+
+
+MD5_INC = r"""
+{ MD5 in pieces: the same buffering on Md5Blocks, which has one body; the
+  length is the little-endian count of bits (RFC 1321 3.2 and 3.4) }
+procedure PasMd5Update(var St: THashState; const S: string);
+var
+  w: array[0..3] of UInt32;
+  i, n, k, nblk, take, done: Integer;
+  p: Pointer;
+begin
+  n := Length(S);
+  if n = 0 then
+    Exit;
+  for i := 0 to 3 do
+    w[i] := UInt32(St.W[i]);
+  p := Pointer(S);
+  St.Total := St.Total + n;
+  done := 0;
+  if St.Fill > 0 then
+  begin
+    k := 64 - St.Fill;
+    if k > n then
+      k := n;
+    for i := 0 to k - 1 do
+      St.Buf[St.Fill + i] := PByte(p)[i];
+    St.Fill := St.Fill + k;
+    done := k;
+    if St.Fill = 64 then
+    begin
+      Md5Blocks(@w[0], @St.Buf[0], 1);
+      St.Fill := 0;
+    end;
+  end;
+  nblk := (n - done) div 64;
+  while nblk > 0 do
+  begin
+    take := nblk;
+    if take > HashMaxBytes div 64 then
+      take := HashMaxBytes div 64;
+    Md5Blocks(@w[0], Pointer(Integer(p) + done), take);
+    done := done + take * 64;
+    nblk := nblk - take;
+  end;
+  k := n - done;
+  for i := 0 to k - 1 do
+    St.Buf[i] := PByte(p)[done + i];
+  if k > 0 then
+    St.Fill := k;
+  for i := 0 to 3 do
+    St.W[i] := Integer(w[i]);
+end;
+
+function PasMd5Final(var St: THashState): string;
+var
+  w: array[0..3] of UInt32;
+  buf: array[0..127] of Byte;
+  i, nb: Integer;
+begin
+  for i := 0 to 3 do
+    w[i] := UInt32(St.W[i]);
+  for i := 0 to 127 do
+    buf[i] := 0;
+  for i := 0 to St.Fill - 1 do
+    buf[i] := St.Buf[i];
+  buf[St.Fill] := 128;
+  if St.Fill < 56 then
+    nb := 1
+  else
+    nb := 2;
+  StoreLE64(@buf[nb * 64 - 8], St.Total * 8);
+  Md5Blocks(@w[0], @buf[0], nb);
+  SetLength(Result, 16);
+  for i := 0 to 3 do
+    StoreLE32(@Result[i * 4 + 1], w[i]);
+end;
+
+{ Begin: the digest Alg (0 MD5, 1 SHA-1, 2 SHA-224, 3 SHA-256, 4 SHA-384,
+  5 SHA-512, as HMAC numbers them) with nothing fed }
+procedure PasHashBegin(var St: THashState; Alg: Integer);
+var
+  i: Integer;
+begin
+  St.Alg := Alg;
+  St.Total := 0;
+  St.Fill := 0;
+  for i := 0 to 7 do
+    St.W[i] := 0;
+  for i := 0 to 127 do
+    St.Buf[i] := 0;
+  case Alg of
+    0:
+      begin
+        St.W[0] := $67452301;
+        St.W[1] := $efcdab89;
+        St.W[2] := $98badcfe;
+        St.W[3] := $10325476;
+      end;
+    1:
+      begin
+        St.W[0] := $67452301;
+        St.W[1] := $efcdab89;
+        St.W[2] := $98badcfe;
+        St.W[3] := $10325476;
+        St.W[4] := $c3d2e1f0;
+      end;
+    2:
+      for i := 0 to 7 do
+        St.W[i] := H224[i];
+    3:
+      for i := 0 to 7 do
+        St.W[i] := H256[i];
+    4:
+      for i := 0 to 7 do
+        St.W[i] := H384[i];
+  else
+    for i := 0 to 7 do
+      St.W[i] := H512[i];
+  end;
+end;
+"""
+
+
 def variant(v):
     """The entry points of the words that have a body on the processor:
     XxxCpu and XxxBase, each calling only its own block routine. The
@@ -866,6 +1098,34 @@ unit pashash;
 
 interface
 
+type
+  { A digest computed in pieces (P440): which one, the bytes fed, the
+    bytes held for the next block, the state words (the 32-bit digests
+    in the low half of each) and the block held; Begin, Update and
+    Final are the words Md5Begin ... Sha512Final of the language }
+  THashState = record
+    Alg: Integer;
+    Total: Integer;
+    Fill: Integer;
+    W: array[0..7] of Integer;
+    Buf: array[0..127] of Byte;
+  end;
+
+procedure PasHashBegin(var St: THashState; Alg: Integer);
+procedure PasMd5Update(var St: THashState; const S: string);
+function PasMd5Final(var St: THashState): string;
+procedure PasSha1UpdateCpu(var St: THashState; const S: string);
+procedure PasSha1UpdateBase(var St: THashState; const S: string);
+function PasSha1FinalCpu(var St: THashState): string;
+function PasSha1FinalBase(var St: THashState): string;
+procedure PasSha256UpdateCpu(var St: THashState; const S: string);
+procedure PasSha256UpdateBase(var St: THashState; const S: string);
+function PasSha256FinalCpu(var St: THashState): string;
+function PasSha256FinalBase(var St: THashState): string;
+procedure PasSha512UpdateCpu(var St: THashState; const S: string);
+procedure PasSha512UpdateBase(var St: THashState; const S: string);
+function PasSha512FinalCpu(var St: THashState): string;
+function PasSha512FinalBase(var St: THashState): string;
 function PasHex(const S: string): string;
 function PasMd5(const S: string): string;
 function PasSha1Cpu(const S: string): string;
@@ -1758,6 +2018,9 @@ end;
     out.append(rest)
     out.append(variant('Cpu'))
     out.append(variant('Base'))
+    out.append(MD5_INC)
+    out.append(incremental('Cpu'))
+    out.append(incremental('Base'))
     out.append('\nend.\n')
     text = align_loops('\n'.join(out))
     path = os.path.join(ROOT, 'src', 'lib', 'pashash.paslang')

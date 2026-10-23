@@ -775,6 +775,8 @@ type
     procedure CpuHeld(Gen: LongInt; const Where: string);
     function CpuSuffix(const Feat: string): string;
     function ShaSuffix(const Ext: string): string;
+    function HashPieceAlg(const N: string): LongInt;
+    function ParseHashPiece(const AName: string; ALine, ACol: LongInt): PExpr;
   end;
 
 constructor TParser.Create(Lex: TLexer; const UPath: array of string; Arm: Boolean);
@@ -7076,6 +7078,10 @@ begin
   AddReserved('storesync storeclose storeabandon include exclude');
   { the hash words (P111) }
   AddReserved('hex md5 sha1 sha224 sha384 sha512 sha3_224 sha3_256 sha3_384');
+  { the digests in pieces (P440) }
+  AddReserved('md5begin md5update md5final sha1begin sha1update sha1final');
+  AddReserved('sha224begin sha224update sha224final sha256begin sha256update sha256final');
+  AddReserved('sha384begin sha384update sha384final sha512begin sha512update sha512final');
   AddReserved('sha3_512 hmacmd5 hmacsha1 hmacsha224 hmacsha256 hmacsha384');
   AddReserved('hmacsha512 crc32 crc32c adler32 fnv1a32 fnv1a64 murmur3 siphash');
   AddReserved('tryget default assigned setlength inc dec getmem freemem move jsonof jsondecode');
@@ -12849,6 +12855,8 @@ begin
             Die('Pi takes no arguments');
           Result := NewPi;
         end
+        else if (HashPieceAlg(name) >= 0) and (FTok.Kind = tkLParen) then
+          Result := ParseHashPiece(name, nline, ncol)
         else if (SameId(name, 'Hex') or SameId(name, 'Md5') or SameId(name, 'Sha1') or
           SameId(name, 'Sha224') or SameId(name, 'Sha256') or SameId(name, 'Sha384') or
           SameId(name, 'Sha512') or SameId(name, 'Fnv1a32') or SameId(name, 'Fnv1a64')) and
@@ -20337,6 +20345,96 @@ end;
   its SHA-NI code moves with VMOVDQA/VMOVDQU; pashash's moves are the
   legacy MOVDQA/MOVDQU, so AVX is not one of its features. On arm64
   the SHA1/SHA256 instructions are the crypto extension alone. }
+{ Which digest a word of the pieces names: 0 MD5, 1 SHA-1, 2 SHA-224, 3
+  SHA-256, 4 SHA-384, 5 SHA-512 (HMAC's numbers) for Md5Begin,
+  Sha256Update, Sha512Final and their kin; -1 for any other name (P440) }
+function TParser.HashPieceAlg(const N: string): LongInt;
+var
+  l, f: string;
+begin
+  Result := -1;
+  l := ToLower(N);
+  if (Length(l) < 8) or (Length(l) > 14) then
+    Exit;
+  if (Copy(l, Length(l) - 4, 5) = 'begin') or (Copy(l, Length(l) - 4, 5) = 'final') then
+    f := Copy(l, 1, Length(l) - 5)
+  else if Copy(l, Length(l) - 5, 6) = 'update' then
+    f := Copy(l, 1, Length(l) - 6)
+  else
+    Exit;
+  if f = 'md5' then
+    Result := 0
+  else if f = 'sha1' then
+    Result := 1
+  else if f = 'sha224' then
+    Result := 2
+  else if f = 'sha256' then
+    Result := 3
+  else if f = 'sha384' then
+    Result := 4
+  else if f = 'sha512' then
+    Result := 5;
+end;
+
+{ Sha256Begin(st), Sha256Update(st, s), Sha256Final(st): a digest in
+  pieces on a THashState (P440); the Cpu or Base body by the family's
+  features, as the whole-message word chooses. The name is read, the
+  parenthesis is next. }
+function TParser.ParseHashPiece(const AName: string; ALine, ACol: LongInt): PExpr;
+var
+  args: TExprArray;
+  alg, id: LongInt;
+  act, sfx, fam, where: string;
+  l: string;
+begin
+  args := ParseArgList;
+  alg := HashPieceAlg(AName);
+  l := ToLower(AName);
+  if Copy(l, Length(l) - 5, 6) = 'update' then
+    act := 'Update'
+  else if Copy(l, Length(l) - 4, 5) = 'begin' then
+    act := 'Begin'
+  else
+    act := 'Final';
+  where := ' at ' + IntToStr(ALine) + ':' + IntToStr(ACol);
+  if not NamedType('THashState', id) then
+    Die(AName + ' needs the core unit pashash' + where);
+  if act = 'Update' then
+  begin
+    if Length(args) <> 2 then
+      Die(AName + ' takes a THashState and a string' + where);
+  end
+  else if Length(args) <> 1 then
+    Die(AName + ' takes a THashState' + where);
+  CheckOutVar(args[0], id, AName);
+  if act = 'Begin' then
+  begin
+    SetLength(args, 2);
+    args[1] := NewInt(alg);
+    Exit(CoreProc('PasHashBegin', args, TyNone));
+  end;
+  if act = 'Update' then
+    args[1] := StrArg(TyString, args[1]);
+  case alg of
+    0: sfx := '';
+    1: sfx := ShaSuffix('sha1');
+    2, 3: sfx := ShaSuffix('sha2');
+  else
+    sfx := CpuSuffix('sha512');
+  end;
+  case alg of
+    0: fam := 'Md5';
+    1: fam := 'Sha1';
+    2, 3: fam := 'Sha256';
+  else
+    fam := 'Sha512';
+  end;
+  if act = 'Update' then
+    Result := CoreProc('Pas' + fam + 'Update' + sfx, args, TyNone)
+  else
+    Result := CoreProc('Pas' + fam + 'Final' + sfx, args, TyString);
+end;
+
 function TParser.ShaSuffix(const Ext: string): string;
 begin
   if FArm then

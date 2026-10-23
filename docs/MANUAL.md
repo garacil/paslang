@@ -7703,10 +7703,17 @@ The ways to get one:
   is one string, since a string is only bounded by memory.
 - A stream in pieces: `Crc32`, `Crc32c` and `Adler32` go on from the
   value so far (`Crc32(part, crc)`), so a file read a block at a time
-  gets the checksum of the whole. The digest words take the whole
-  message: read it whole, or hash each block and put the block digests
-  in a Merkle tree (`MerkleRoot`), which is what the large-file formats
-  do.
+  gets the checksum of the whole. A digest goes in pieces too
+  (1.1.259, P440): `Sha256Begin(st)` on a `THashState` variable,
+  `Sha256Update(st, part)` for each piece of any size, `Sha256Final(st)`
+  for the digest, which is the one `Sha256` gives the pieces joined; the
+  same words for `Md5`, `Sha1`, `Sha224`, `Sha384` and `Sha512` (`Begin`,
+  `Update`, `Final` after the name). A piece is held up to a block and
+  the whole blocks go straight to the digest's kernel, so a file read
+  4 KiB at a time is hashed in the memory of one block and costs what
+  the whole-message word costs; `Begin` again starts another digest on
+  the same variable. The state is a record of 216 bytes: copy it to
+  fork a digest. HMAC and SHA-3 in pieces are not there yet.
 - A key: `HmacSha256(key, msg)` for authentication, `SipHash(s, k0,
   k1)` for a table; a seed: `Murmur3(s, seed)`, `XxHash3(s, seed)`.
 
@@ -13773,7 +13780,10 @@ its place:
   Sha3_224 Sha3_256 Sha3_384 Sha3_512 HmacMd5 HmacSha1 HmacSha224
   HmacSha256 HmacSha384 HmacSha512 Crc32 Crc32c Adler32 Fnv1a32 Fnv1a64
   Murmur3 SipHash MerkleRoot MerkleProof MerkleCheck` (the table in §14,
-  The algorithms, says what each computes and what it is for);
+  The algorithms, says what each computes and what it is for), and the
+  pieces of a digest (1.1.259): `Md5Begin Md5Update Md5Final` and the
+  same for `Sha1 Sha224 Sha256 Sha384 Sha512`, with the type
+  `THashState`;
 - the calculation set (§15): `Abs Sqr Sqrt Trunc Round Int Frac Floor
   Ceil Min Max Pi Exp Ln LnXP1 Log10 Log2 LogN Power Hypot Ldexp Poly
   Sin Cos Tan Cot Sec Csc ArcSin ArcCos ArcTan ArcTan2 ArcCot ArcSec
