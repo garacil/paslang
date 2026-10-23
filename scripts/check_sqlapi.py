@@ -21,7 +21,7 @@ import sys
 import tarfile
 
 GROUPS = ('a1 c1 d1 d2 p2a p3 p4 p5 p6+p6b r1+r2+r3 an1+an2 v2 w1 w2 dt1 j1 vac1 bk1 md1 coll1 fn1 params fpd'
-          ).split()
+          ' m1').split()
 SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'testdata', 'sqlite')
 
 

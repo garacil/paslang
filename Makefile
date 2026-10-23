@@ -2476,6 +2476,15 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	python3 -I scripts/check_sqlapi.py $(BUILDDIR)/sqlapi $(BUILDDIR)/sqlapi.d --corpus; \
 	python3 -I scripts/check_sqlapi.py $(BUILDDIR)/sqlapi0 $(BUILDDIR)/sqlapi0.d; \
 	PASLANG_GCSTRESS=1 PASLANG_GCVERIFY=1 python3 -I scripts/check_sqlapi.py $(BUILDDIR)/sqlapi0 $(BUILDDIR)/sqlapi0gc.d --only d1,j1,w2,v2,fn1,coll1; \
+	: P411: the math functions on 20000 arguments each as SQLite on glibc 2.44 answers them, the FMA instruction and the integer FMA; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/sqlmath testdata/sqlmath.paslang; \
+	$(OUTDIR)/paslangc -cpu base -inline 0 -o $(BUILDDIR)/sqlmath0 testdata/sqlmath.paslang; \
+	$(BUILDDIR)/sqlmath > $(BUILDDIR)/sqlmath.got; \
+	cmp testdata/sqlmath.out $(BUILDDIR)/sqlmath.got; \
+	PASLANG_CPU=base $(BUILDDIR)/sqlmath > $(BUILDDIR)/sqlmath.gotb; \
+	cmp testdata/sqlmath.out $(BUILDDIR)/sqlmath.gotb; \
+	$(BUILDDIR)/sqlmath0 > $(BUILDDIR)/sqlmath.got0; \
+	cmp testdata/sqlmath.out $(BUILDDIR)/sqlmath.got0; \
 	: the unit beside the system SQLite on the same files, read back, killed in a commit, at once, checkpoints, a million rows; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/sqlcompat testdata/sqlcompat.paslang; \
 	python3 -I scripts/check_sqlite.py $(BUILDDIR)/sqlcompat $(BUILDDIR)/sqlcompat.d; \
@@ -5505,6 +5514,10 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	$(OUTDIR)/paslangc -target arm64 -cpu base -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/sqlapi0-arm testdata/sqlapi.paslang; \
 	python3 -I scripts/check_sqlapi.py $(BUILDDIR)/sqlapi-arm $(BUILDDIR)/sqlapi-arm.d $(QEMU_A64) --corpus; \
 	python3 -I scripts/check_sqlapi.py $(BUILDDIR)/sqlapi0-arm $(BUILDDIR)/sqlapi0-arm.d $(QEMU_A64); \
+	: P411 on arm64: the math functions with FMADD, as on amd64; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -Fu $(A64DIR) -o $(BUILDDIR)/sqlmath-arm testdata/sqlmath.paslang; \
+	timeout 600 $(QEMU_A64) $(BUILDDIR)/sqlmath-arm > $(BUILDDIR)/sqlmath-arm.got; \
+	cmp testdata/sqlmath.out $(BUILDDIR)/sqlmath-arm.got; \
 	$(OUTDIR)/paslangc -target arm64 -cpu max -Fu $(A64DIR) -o $(BUILDDIR)/sqlcompat-arm testdata/sqlcompat.paslang; \
 	python3 -I scripts/check_sqlite.py $(BUILDDIR)/sqlcompat-arm $(BUILDDIR)/sqlcompat-arm.d $(QEMU_A64); \
 	$(OUTDIR)/paslangc -target arm64 -cpu max -Fu $(A64DIR) -o $(BUILDDIR)/sqlroutines-arm testdata/sqlroutines.paslang; \

@@ -11497,6 +11497,22 @@ answers: the same rows, the same types, the same result codes and the
 same messages, which `testdata/sqlapi` compares with SQLite's own on
 UTF-8 and UTF-16 databases.
 
+SQL's math functions are there as the `sqlite3` program and the
+distributions build SQLite, with `SQLITE_ENABLE_MATH_FUNCTIONS` (1.1.255,
+P411): `ceil`, `ceiling`, `floor`, `trunc`, `ln`, `log`, `log10`, `log2`,
+`log(B, X)`, `exp`, `pow`, `power`, `mod`, `sqrt`, `pi`, `radians`,
+`degrees`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `sinh`,
+`cosh`, `tanh`, `asinh`, `acosh` and `atanh` (lang_mathfunc.html), and
+`sqlite_compileoption_used('ENABLE_MATH_FUNCTIONS')` is 1. SQLite answers
+them with the C library's libm; the unit carries a port of glibc 2.44's,
+as its build for a processor with FMA computes them, so each answer is
+the double SQLite on a current Linux gives, to the bit, on both machines
+and on any processor (`testdata/sqlmath` checks 20000 arguments of each
+against SQLite's own). `exp`, `log`, `log2` and `pow` are Arm's
+optimized-routines; `sin`, `cos`, `tan`, `asin`, `acos`, `atan` and
+`atan2` IBM's Accurate Mathematical Library; the hyperbolic functions
+CORE-MATH's, correctly rounded; their notices are in the unit.
+
 `TSqlite` is a connection as a class. `TSqlite.Open(path)` opens or
 makes a database file (`':memory:'` for one in memory), and
 `TSqlite.Open(path, flags)` takes `sqlite3_open_v2`'s flags

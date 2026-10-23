@@ -1,0 +1,186 @@
+{ P411: SQL's math functions answered as SQLite built with
+  SQLITE_ENABLE_MATH_FUNCTIONS answers them on glibc 2.44 with FMA, bit for
+  bit. Each function gets 20000 arguments from splitmix64 (whole range
+  bit patterns, uniform ranges, near 1, the exponents of every double),
+  bound as doubles; every answer is a line (n for NULL, i and the integer,
+  else the double's 16 hex digits), and the lines' FNV-1a 64 is printed
+  beside the function's name. scripts/sqlmath_oracle.c prints the same
+  from SQLite's amalgamation; testdata/sqlmath.out is its answer. Run
+  again with PASLANG_CPU=base, the fused multiply-adds are Go's integer
+  FMA instead of the instruction: the same answers. }
+program sqlmath;
+
+uses
+  sqlite, pashash;
+
+const
+  N = 20000;
+
+var
+  GS: Integer;
+
+function GNext: Integer;
+var
+  z: Integer;
+begin
+  GS := GS + Integer($9E3779B97F4A7C15);
+  z := GS;
+  z := (z xor (z shr 30)) * Integer($BF58476D1CE4E5B9);
+  z := (z xor (z shr 27)) * Integer($94D049BB133111EB);
+  Result := z xor (z shr 31);
+end;
+
+{ the argument of mode M: 0 any bit pattern, 1 to 4 uniform in [-1,1),
+  [-20,20), [-1000,1000), [-1e6,1e6), 5 a random exponent in [-30,30],
+  6 any normal exponent, 7 near 1, 8 in [-4,4) }
+function GGen(Mode: Integer): Double;
+var
+  u: Double;
+  e, b: Integer;
+begin
+  case Mode of
+    0:
+      begin
+        b := GNext;
+        Exit(b as Double);
+      end;
+    5:
+      begin
+        e := (GNext shr 11) mod 61;
+        b := (GNext and Integer($800FFFFFFFFFFFFF)) or ((1023 + e - 30) shl 52);
+        Exit(b as Double);
+      end;
+    6:
+      begin
+        e := (GNext shr 11) mod 2046 + 1;
+        b := (GNext and Integer($800FFFFFFFFFFFFF)) or (e shl 52);
+        Exit(b as Double);
+      end;
+  end;
+  b := $3CA0000000000000;
+  u := Double(GNext shr 11) * (b as Double);
+  u := 2 * u - 1;
+  case Mode of
+    1: Result := u;
+    2: Result := u * 20;
+    3: Result := u * 1000;
+    7: Result := 1 + u / 8;
+    8: Result := u * 4;
+  else
+    Result := u * 1e6;
+  end;
+end;
+
+function Hex16(V: Integer): string;
+const
+  D: string = '0123456789abcdef';
+var
+  i: Integer;
+begin
+  SetLength(Result, 16);
+  for i := 16 downto 1 do
+  begin
+    Result[i] := D[(V and 15) + 1];
+    V := V shr 4;
+  end;
+end;
+
+var
+  db: TSqlite3;
+
+{ Run: SQL with ?1 (and ?2 when NArg is 2; IntY gives ?2 integers from
+  -1000 to 1000) over N arguments }
+procedure Run(const Name, Sql: string; NArg: Integer; IntY: Boolean);
+var
+  st: TSqlite3Stmt;
+  i, rows: Integer;
+  x, y: Double;
+  s: string;
+begin
+  if sqlite3_prepare_v2(db, Sql, st) <> SQLITE_OK then
+  begin
+    WriteLn(Name, ': ', sqlite3_errmsg(db));
+    Halt(1);
+  end;
+  GS := 1;
+  s := '';
+  rows := 0;
+  for i := 0 to N - 1 do
+  begin
+    if NArg = 0 then
+    begin
+      if i > 0 then
+        Break;
+    end
+    else
+    begin
+      x := GGen(i mod 9);
+      sqlite3_bind_double(st, 1, x);
+      if NArg = 2 then
+      begin
+        if IntY then
+          y := Double((GNext shr 11) mod 2001) - 1000
+        else
+          y := GGen((i div 9) mod 9);
+        sqlite3_bind_double(st, 2, y);
+      end;
+    end;
+    if sqlite3_step(st) <> SQLITE_ROW then
+    begin
+      WriteLn(Name, ': ', sqlite3_errmsg(db));
+      Halt(1);
+    end;
+    case sqlite3_column_type(st, 0) of
+      SQLITE_NULL: s := s + 'n'#10;
+      SQLITE_INTEGER: s := s + 'i' + IntToStr(sqlite3_column_int64(st, 0)) + #10;
+    else
+      s := s + Hex16(sqlite3_column_double(st, 0) as Integer) + #10;
+    end;
+    sqlite3_reset(st);
+    Inc(rows);
+  end;
+  sqlite3_finalize(st);
+  WriteLn(Name, ' ', rows, ' ', Hex16(PasFnv1a64(s)));
+end;
+
+begin
+  if sqlite3_open(':memory:', db) <> SQLITE_OK then
+    Halt(1);
+  Run('ceil', 'SELECT ceil(?1)', 1, False);
+  Run('ceiling', 'SELECT ceiling(?1)', 1, False);
+  Run('floor', 'SELECT floor(?1)', 1, False);
+  Run('trunc', 'SELECT trunc(?1)', 1, False);
+  Run('ln', 'SELECT ln(?1)', 1, False);
+  Run('log', 'SELECT log(?1)', 1, False);
+  Run('log10', 'SELECT log10(?1)', 1, False);
+  Run('log2', 'SELECT log2(?1)', 1, False);
+  Run('logb', 'SELECT log(?1, ?2)', 2, False);
+  Run('exp', 'SELECT exp(?1)', 1, False);
+  Run('pow', 'SELECT pow(?1, ?2)', 2, False);
+  Run('power', 'SELECT power(?1, ?2)', 2, True);
+  Run('mod', 'SELECT mod(?1, ?2)', 2, False);
+  Run('acos', 'SELECT acos(?1)', 1, False);
+  Run('asin', 'SELECT asin(?1)', 1, False);
+  Run('atan', 'SELECT atan(?1)', 1, False);
+  Run('atan2', 'SELECT atan2(?1, ?2)', 2, False);
+  Run('cos', 'SELECT cos(?1)', 1, False);
+  Run('sin', 'SELECT sin(?1)', 1, False);
+  Run('tan', 'SELECT tan(?1)', 1, False);
+  Run('cosh', 'SELECT cosh(?1)', 1, False);
+  Run('sinh', 'SELECT sinh(?1)', 1, False);
+  Run('tanh', 'SELECT tanh(?1)', 1, False);
+  Run('acosh', 'SELECT acosh(?1)', 1, False);
+  Run('asinh', 'SELECT asinh(?1)', 1, False);
+  Run('atanh', 'SELECT atanh(?1)', 1, False);
+  Run('sqrt', 'SELECT sqrt(?1)', 1, False);
+  Run('radians', 'SELECT radians(?1)', 1, False);
+  Run('degrees', 'SELECT degrees(?1)', 1, False);
+  Run('pi', 'SELECT pi()', 0, False);
+  sqlite3_close(db);
+end.
+
+{ This file is part of paslang's tests.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+  paslang is free software under the GNU General Public License,
+  version 3 or (at your option) any later version; see the file
+  COPYING. It comes with ABSOLUTELY NO WARRANTY. }

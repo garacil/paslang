@@ -5,8 +5,11 @@
 
    testdata/sqlapi's oracle: SQLite 3.54.1 itself, built from the
    amalgamation the project keeps:
-     gcc -O1 -w -Idocs/ref/sqlite/amalg/sqlite-amalgamation-3540100 \
+     gcc -O1 -w -DSQLITE_ENABLE_MATH_FUNCTIONS \
+       -Idocs/ref/sqlite/amalg/sqlite-amalgamation-3540100 \
        -o sqlapi_oracle scripts/sqlapi_oracle.c -lm
+   (with SQL's math functions, as the sqlite3 program and the
+   distributions build SQLite, since 1.1.255; the system's libm answers)
    run as testdata/sqlapi runs (DB SCRIPT [ENCODING]); its output is
    testdata/sqlite's NAME.out (scripts/check_sqlapi.py). */
 /* P405 test oracle: a script run through SQLite's API as an application

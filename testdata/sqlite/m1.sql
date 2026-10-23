@@ -1,0 +1,20 @@
+-- P411: SQL's math functions (lang_mathfunc.html) on every kind of argument
+select ceil(1.5), ceil(-1.5), ceil(2), typeof(ceil(2)), typeof(ceil(2.0)), ceiling(-0.5), floor(-0.5), trunc(-2.7), trunc(9223372036854775807);
+select ceil('1.5'), floor('x'), ceil(null), ceil(x'31'), floor('-3'), typeof(floor('-3')), trunc('2.9e1');
+select ln(1), ln(0), ln(-1), ln(2.718281828459045), log(100), log(0.001), log10(1e22), log2(8), log2(1024.5);
+select log(2, 8), log(10, 1000), log(1, 5), log(0.5, 8), log(2, -1), log(2, 'x'), log('x', 8), log(-2, 8), log(2, null);
+select exp(0), exp(1), exp(-745.2), exp(709.78), exp(710), exp(-1e9), exp('2'), exp(null);
+select pow(2, 10), power(2, 0.5), pow(-8, 1.0/3), pow(-2, 3), pow(0, -1), pow(-0.0, -3), pow(10, 309), pow(2, null), pow('a', 2);
+select mod(10, 3), mod(-10, 3), mod(10.5, 3), mod(10, 0), mod(5, -0.0), mod(1e300, 3), mod(7, 'x');
+select acos(1), acos(-1), acos(2), asin(0.5), asin(-1.0000000001), atan(1), atan(1e300), atan2(1, 1), atan2(-0.0, -1), atan2(0, 0), atan2(1e-300, 1e300);
+select cos(0), cos(1e22), sin(3.141592653589793), sin(1e300), tan(1.5707963267948966), tan(-1e10), cos('x');
+select cosh(0), cosh(710.5), sinh(-1e-10), sinh(711), tanh(20), tanh(-0.25), acosh(1), acosh(0.5), asinh(-1e300), atanh(1), atanh(-0.99999999999);
+select sqrt(4), sqrt(2), sqrt(-1), sqrt(0), sqrt(-0.0), sqrt(1e308), radians(180), degrees(3.141592653589793), radians(1), degrees(-1);
+select pi(), typeof(pi()), pi() * 2, sin(pi()), cos(pi() / 3);
+select x, round(sin(x), 12), round(exp(x / 10.0), 9), sqrt(x) from (select 1 as x union all select 2 union all select 3 union all select 4);
+select sum(sqrt(value)), avg(ln(value)), max(log2(value)) from generate_series(1, 100);
+create table t(v);
+insert into t values (1), (2.5), ('3'), ('four'), (null), (x'00'), (-7);
+select v, typeof(v), ceil(v), floor(v), sqrt(v), exp(v), ln(v) from t order by rowid;
+select sqlite_compileoption_used('ENABLE_MATH_FUNCTIONS'), sqlite_compileoption_used('SQLITE_ENABLE_MATH_FUNCTIONS');
+select name, narg from pragma_function_list where name in ('ln', 'log', 'pow', 'power', 'mod', 'pi', 'trunc', 'atanh') order by name, narg;
