@@ -11720,6 +11720,54 @@ phc := Argon2idHash(password);                 { stored at sign-up }
 if Argon2idVerify(password, phc) then ...      { at login }
 ```
 
+`uses pascodec` has the text codecs a service needs (1.1.260, P435), as
+Go's packages give them, checked against Go's own output
+(`testdata/codec`, with `scripts/codec_oracle.go`):
+- `Base64Encode(s, url, pad)` and `Base64Decode(s, url, pad, out r)`:
+  the standard alphabet, or with `url` the one with `-` and `_`, with
+  `pad` the `=` at the end. The decoder reads as `DecodeString` does: CR
+  and LF are skipped anywhere, nothing but the alphabet is let by, and
+  the padding must be there with `pad` and must not be without it;
+  `False` for what it refuses.
+- `UrlQueryEscape` and `UrlPathEscape` are `url.QueryEscape` (a space is
+  `+`, all but letters, digits and `-_.~` is `%XX`) and `url.PathEscape`
+  (a path segment, which keeps `$&+=:@`); `UrlQueryUnescape(s, out r)`
+  and `UrlPathUnescape` read them back, `False` for a `%` not followed
+  by two hex digits.
+- `TCsvReader.Create(text)` reads records as `csv.Reader` does:
+  `ReadRecord(out fields)` gives the next record, `False` at the end, and
+  raises `ECsvError` (`Kind` 1 for a bare quote, 2 for an extraneous or
+  missing quote, 3 for a wrong number of fields, `StartLine`, `Line`,
+  `Column`) for a bad one. A line ends at LF or CRLF, a CRLF in a quoted
+  field is read as LF, empty lines and the lines that start with
+  `Comment` are skipped, a UTF-8 byte order mark at the start is dropped
+  (Go keeps it), and the settings are fields: `Comma` and `Comment` (one
+  byte each), `FieldsPerRecord` (0: the first record's count, above 0:
+  that count, below 0: any), `LazyQuotes` and `TrimLeadingSpace`.
+  `CsvLine(fields, comma, crlf)` writes one record as `csv.Writer` does.
+- `FoldAccents(s)` takes the marks off the letters of Latin-1 and Latin
+  Extended-A for a search key that ignores accents (`é` is `e`, `ñ` is
+  `n`, `ç` is `c`; `ß` is `ss`, `æ` is `ae`, `œ` is `oe`, `ø` is `o`,
+  `ł` is `l`, `þ` is `th`), and `UpperText` and `LowerText` map the code
+  points U+0000 to U+017F as Go's `strings.ToUpper` and `ToLower` do
+  (`ñ` to `Ñ`, `ÿ` to `Ÿ`; `ß` stays). Other code points, and bytes that
+  are not UTF-8, pass as they are.
+
+`LoadZone(name)` of `uses pastime` (1.1.260) gives a `TZone` for a zone of
+the system's zoneinfo, whatever `TZ` is: `LoadZone('Europe/Madrid')`.
+It is Go's `time.LoadLocation`: `''` and `'UTC'` are UTC, `'Local'` the
+local clock, a name a file under `/usr/share/zoneinfo` (and the other
+directories the local zone looks in), and `nil` for a name that names no
+zone or that has `..` in it or starts with `/` or a backslash. A `TZone`
+is read once and never changes, so any number of routines may use one.
+`z.OffsetAt(t)`, `z.AbbrevAt(t)` and `z.IsDstAt(t)` say what the zone is
+at the Unix second `t`; `z.ToDate(t)` is the date its clock shows;
+`z.ToUnix(y, m, d, hh, mm, ss)` is the moment its clock shows that
+reading, one of the two when the clock skipped or showed it twice, as
+`time.Date` does; `z.Name` is the name it was loaded by. A service that
+cuts off at 13:00 in Madrid asks `LoadZone('Europe/Madrid')` once and
+needs no `TZ=Europe/Madrid` in its environment.
+
 `uses sqlite` gives SQLite 3.54.1 in paslang: the library itself, written
 from SQLite's own file format, documents and sources (P403 the file,
 P404 the SQL, 1.1.253 P405 the rest). It is a library unit, as `pasnet`
@@ -11854,6 +11902,7 @@ zone (`CEST`, 7200 seconds east of UTC, daylight saving time),
 as that date, a time the clock skipped or showed twice taking one of
 its two offsets as Go's `time.Date` does. Past the file's last
 transition the POSIX rule at its end goes on, in 2080 as in 2026.
+`LoadZone(name)` gives any other zone by name beside it (below).
 
 `NowUnix` is seconds and `NowNanos` nanoseconds of the wall clock,
 `Monotonic` nanoseconds of `CLOCK_MONOTONIC` and `Since(t0)` is

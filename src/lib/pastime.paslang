@@ -89,6 +89,30 @@ function LocalOffset(T: Int64): Int64;
 function UnixToLocalDate(T: Int64): TDate;
 function LocalDateToUnix(Y, M, D, HH, MM, SS: Integer): Int64;
 
+{ A zone of the system's zoneinfo by name, whatever $TZ is (P435, Go's
+  time.LoadLocation): 'Europe/Madrid', 'America/New_York', 'UTC' (also
+  ''), 'Local' (the local clock's). LoadZone gives nil for a name that
+  names no zone, or that has .. in it or starts with / or a backslash. A
+  zone is read once and never changed, so any number of routines may use
+  one at once. The moments are Unix seconds, the dates as the zone's
+  clock shows them; ToUnix is the moment a clock reading is (the time
+  Go's Date gives), a reading the clock skipped or showed twice taking
+  one of the two as Go's does. }
+type
+  TZone = class
+  private
+    FData: TObject;
+  public
+    function Name: string;
+    function OffsetAt(T: Int64): Int64;
+    function AbbrevAt(T: Int64): string;
+    function IsDstAt(T: Int64): Boolean;
+    function ToDate(T: Int64): TDate;
+    function ToUnix(Y, M, D, HH, MM, SS: Integer): Int64;
+  end;
+
+function LoadZone(const Name: string): TZone;
+
 { Written out, as an ISO date is written. }
 function DateStr(T: Int64): string;
 function TimeStr(T: Int64): string;
@@ -351,12 +375,18 @@ const
   ZAlpha = Low(Int64);
   ZOmega = High(Int64);
 
+type
+  { the zones of one TZif file: the local clock's, or a LoadZone's }
+  TZoneData = class
+    Name: string;
+    Kinds: array of TZoneKind;
+    Tx: array of TZoneTx;
+    Extend: string;
+  end;
+
 var
   ZOnce: once;
-  ZName: string;
-  ZKinds: array of TZoneKind;
-  ZTx: array of TZoneTx;
-  ZExtend: string;
+  ZLocal: TZoneData;
 
 { A big-endian number of 4 bytes at P (1-based) of D, unsigned; Bad when
   D has not the bytes. }
@@ -376,7 +406,7 @@ end;
 { The zones of TZif data D (LoadLocationFromTZData): False when D is
   not one. Version 2 and 3 files hold the 32-bit data and then the same
   in 64 bits, which is the one read. }
-function ZParse(const D: string): Boolean;
+function ZParse(Z: TZoneData; const D: string): Boolean;
 var
   p, version, i, k, nz, ntx, pt, pz, pzd, pab, e: Int64;
   n: array[0..5] of Int64;
@@ -428,29 +458,29 @@ begin
     Exit;
   abbrev := Copy(D, pab, n[5]);
   { the zones: utcoff[4] isdst[1] abbrind[1] }
-  ZKinds := nil;
-  SetLength(ZKinds, nz);
+  Z.Kinds := nil;
+  SetLength(Z.Kinds, nz);
   p := pzd;
   for i := 0 to nz - 1 do
   begin
-    ZKinds[i].Offset := ZBig4(D, p, bad);
-    if ZKinds[i].Offset >= 2147483648 then
-      ZKinds[i].Offset := ZKinds[i].Offset - 4294967296;
-    ZKinds[i].IsDST := D[p] <> #0;
+    Z.Kinds[i].Offset := ZBig4(D, p, bad);
+    if Z.Kinds[i].Offset >= 2147483648 then
+      Z.Kinds[i].Offset := Z.Kinds[i].Offset - 4294967296;
+    Z.Kinds[i].IsDST := D[p] <> #0;
     k := Ord(D[p + 1]);
     p := p + 2;
     if k >= Length(abbrev) then
       Exit;
-    ZKinds[i].Abbrev := '';
+    Z.Kinds[i].Abbrev := '';
     while (k < Length(abbrev)) and (abbrev[k + 1] <> #0) do
     begin
-      ZKinds[i].Abbrev := ZKinds[i].Abbrev + abbrev[k + 1];
+      Z.Kinds[i].Abbrev := Z.Kinds[i].Abbrev + abbrev[k + 1];
       k := k + 1;
     end;
   end;
   { the transitions }
-  ZTx := nil;
-  SetLength(ZTx, ntx);
+  Z.Tx := nil;
+  SetLength(Z.Tx, ntx);
   p := pt;
   for i := 0 to ntx - 1 do
   begin
@@ -459,16 +489,16 @@ begin
       { two reads that each move p: in two statements, not one expression
         whose operands may be read in either order }
       hw := ZBig4(D, p, bad);
-      ZTx[i].When := (hw shl 32) or ZBig4(D, p, bad);
+      Z.Tx[i].When := (hw shl 32) or ZBig4(D, p, bad);
     end
     else
     begin
-      ZTx[i].When := ZBig4(D, p, bad);
-      if ZTx[i].When >= 2147483648 then
-        ZTx[i].When := ZTx[i].When - 4294967296;
+      Z.Tx[i].When := ZBig4(D, p, bad);
+      if Z.Tx[i].When >= 2147483648 then
+        Z.Tx[i].When := Z.Tx[i].When - 4294967296;
     end;
-    ZTx[i].Index := Ord(D[pz + i]);
-    if ZTx[i].Index >= nz then
+    Z.Tx[i].Index := Ord(D[pz + i]);
+    if Z.Tx[i].Index >= nz then
       Exit;
   end;
   if bad then
@@ -476,20 +506,20 @@ begin
   { none: one that covers all time, as a fixed zone (Etc/GMT0) }
   if ntx = 0 then
   begin
-    SetLength(ZTx, 1);
-    ZTx[0].When := ZAlpha;
-    ZTx[0].Index := 0;
+    SetLength(Z.Tx, 1);
+    Z.Tx[0].When := ZAlpha;
+    Z.Tx[0].Index := 0;
   end;
   { the POSIX rule for after the last transition: the rest, \n...\n }
-  ZExtend := '';
+  Z.Extend := '';
   if (Length(D) - e + 1 > 2) and (D[e] = #10) and (D[Length(D)] = #10) then
-    ZExtend := Copy(D, e + 1, Length(D) - e - 1);
+    Z.Extend := Copy(D, e + 1, Length(D) - e - 1);
   Result := True;
 end;
 
 { Load the zone of the file Name in one of the Dirs (loadLocation): the
   first that reads and parses. }
-function ZLoad(const Name: string; const Dirs: array of string): Boolean;
+function ZLoad(Z: TZoneData; const Name: string; const Dirs: array of string): Boolean;
 var
   i: Integer;
   path, data: string;
@@ -501,7 +531,7 @@ begin
       path := Dirs[i] + '/' + Name
     else
       path := Name;
-    if ReadFile(path, data) and ZParse(data) then
+    if ReadFile(path, data) and ZParse(Z, data) then
     begin
       Result := True;
       Exit;
@@ -518,16 +548,17 @@ var
   tz: string;
   ok: Boolean;
 begin
-  ZKinds := nil;
-  ZTx := nil;
-  ZExtend := '';
-  ZName := 'UTC';
+  ZLocal := TZoneData.Create;
+  ZLocal.Kinds := nil;
+  ZLocal.Tx := nil;
+  ZLocal.Extend := '';
+  ZLocal.Name := 'UTC';
   ok := LookupEnv('TZ', tz);
   if not ok then
   begin
-    if ZLoad('localtime', ['/etc']) then
+    if ZLoad(ZLocal, 'localtime', ['/etc']) then
     begin
-      ZName := 'Local';
+      ZLocal.Name := 'Local';
       Exit;
     end;
   end
@@ -537,29 +568,29 @@ begin
       tz := Copy(tz, 2, Length(tz) - 1);
     if (tz <> '') and (tz[1] = '/') then
     begin
-      if ZLoad(tz, ['']) then
+      if ZLoad(ZLocal, tz, ['']) then
       begin
         if tz = '/etc/localtime' then
-          ZName := 'Local'
+          ZLocal.Name := 'Local'
         else
-          ZName := tz;
+          ZLocal.Name := tz;
         Exit;
       end;
     end
     else if (tz <> '') and (tz <> 'UTC') then
     begin
-      if ZLoad(tz, ['/usr/share/zoneinfo/', '/usr/share/lib/zoneinfo/', '/usr/lib/locale/TZ/',
+      if ZLoad(ZLocal, tz, ['/usr/share/zoneinfo/', '/usr/share/lib/zoneinfo/', '/usr/lib/locale/TZ/',
         '/etc/zoneinfo']) then
       begin
-        ZName := tz;
+        ZLocal.Name := tz;
         Exit;
       end;
     end;
   end;
   { UTC: no zones }
-  ZKinds := nil;
-  ZTx := nil;
-  ZExtend := '';
+  ZLocal.Kinds := nil;
+  ZLocal.Tx := nil;
+  ZLocal.Extend := '';
 end;
 
 { ---- the POSIX rule (tzset) ---- }
@@ -876,27 +907,27 @@ end;
 
 { The zone of the first moments, before the first transition
   (lookupFirstZone). }
-function ZFirstKind: Int64;
+function ZFirstKind(Z: TZoneData): Int64;
 var
   i: Int64;
   used: Boolean;
 begin
   used := False;
-  for i := 0 to High(ZTx) do
-    if ZTx[i].Index = 0 then
+  for i := 0 to High(Z.Tx) do
+    if Z.Tx[i].Index = 0 then
       used := True;
   Result := 0;
   if not used then
     Exit;
-  if (Length(ZTx) > 0) and ZKinds[ZTx[0].Index].IsDST then
-    for i := ZTx[0].Index - 1 downto 0 do
-      if not ZKinds[i].IsDST then
+  if (Length(Z.Tx) > 0) and Z.Kinds[Z.Tx[0].Index].IsDST then
+    for i := Z.Tx[0].Index - 1 downto 0 do
+      if not Z.Kinds[i].IsDST then
       begin
         Result := i;
         Exit;
       end;
-  for i := 0 to High(ZKinds) do
-    if not ZKinds[i].IsDST then
+  for i := 0 to High(Z.Kinds) do
+    if not Z.Kinds[i].IsDST then
     begin
       Result := i;
       Exit;
@@ -907,7 +938,7 @@ end;
 { The local zone at Unix second Tm, and the moments it began and ends
   (lookup): a binary search of the transitions, the POSIX rule after the
   last. }
-procedure ZLookup(Tm: Int64; out Abbrev: string; out Offset: Int64; out Start, Stop: Int64;
+procedure ZLookup(Z: TZoneData; Tm: Int64; out Abbrev: string; out Offset: Int64; out Start, Stop: Int64;
   out IsDST: Boolean);
 var
   lo, hi, mid, k: Int64;
@@ -915,9 +946,7 @@ var
   eo, es, ee: Int64;
   ed: Boolean;
 begin
-  once ZOnce do
-    ZInit;
-  if Length(ZKinds) = 0 then
+  if Length(Z.Kinds) = 0 then
   begin
     Abbrev := 'UTC';
     Offset := 0;
@@ -926,40 +955,40 @@ begin
     IsDST := False;
     Exit;
   end;
-  if (Length(ZTx) = 0) or (Tm < ZTx[0].When) then
+  if (Length(Z.Tx) = 0) or (Tm < Z.Tx[0].When) then
   begin
-    k := ZFirstKind;
-    Abbrev := ZKinds[k].Abbrev;
-    Offset := ZKinds[k].Offset;
+    k := ZFirstKind(Z);
+    Abbrev := Z.Kinds[k].Abbrev;
+    Offset := Z.Kinds[k].Offset;
     Start := ZAlpha;
-    if Length(ZTx) > 0 then
-      Stop := ZTx[0].When
+    if Length(Z.Tx) > 0 then
+      Stop := Z.Tx[0].When
     else
       Stop := ZOmega;
-    IsDST := ZKinds[k].IsDST;
+    IsDST := Z.Kinds[k].IsDST;
     Exit;
   end;
   Stop := ZOmega;
   lo := 0;
-  hi := Length(ZTx);
+  hi := Length(Z.Tx);
   while hi - lo > 1 do
   begin
     mid := (lo + hi) shr 1;
-    if Tm < ZTx[mid].When then
+    if Tm < Z.Tx[mid].When then
     begin
-      Stop := ZTx[mid].When;
+      Stop := Z.Tx[mid].When;
       hi := mid;
     end
     else
       lo := mid;
   end;
-  k := ZTx[lo].Index;
-  Abbrev := ZKinds[k].Abbrev;
-  Offset := ZKinds[k].Offset;
-  Start := ZTx[lo].When;
-  IsDST := ZKinds[k].IsDST;
-  if (lo = High(ZTx)) and (ZExtend <> '') then
-    if ZTzset(ZExtend, Start, Tm, ea, eo, es, ee, ed) then
+  k := Z.Tx[lo].Index;
+  Abbrev := Z.Kinds[k].Abbrev;
+  Offset := Z.Kinds[k].Offset;
+  Start := Z.Tx[lo].When;
+  IsDST := Z.Kinds[k].IsDST;
+  if (lo = High(Z.Tx)) and (Z.Extend <> '') then
+    if ZTzset(Z.Extend, Start, Tm, ea, eo, es, ee, ed) then
     begin
       Abbrev := ea;
       Offset := eo;
@@ -969,18 +998,27 @@ begin
     end;
 end;
 
+{ the local zone at Tm, read from $TZ the first time any routine asks }
+procedure ZLookupLocal(Tm: Int64; out Abbrev: string; out Offset: Int64; out Start, Stop: Int64;
+  out IsDST: Boolean);
+begin
+  once ZOnce do
+    ZInit;
+  ZLookup(ZLocal, Tm, Abbrev, Offset, Start, Stop, IsDST);
+end;
+
 function LocalZoneName: string;
 begin
   once ZOnce do
     ZInit;
-  Result := ZName;
+  Result := ZLocal.Name;
 end;
 
 procedure LocalZoneAt(T: Int64; out Abbrev: string; out Offset: Int64; out IsDST: Boolean);
 var
   s, e: Int64;
 begin
-  ZLookup(T, Abbrev, Offset, s, e, IsDST);
+  ZLookupLocal(T, Abbrev, Offset, s, e, IsDST);
 end;
 
 function LocalOffset(T: Int64): Int64;
@@ -989,7 +1027,7 @@ var
   s, e: Int64;
   d: Boolean;
 begin
-  ZLookup(T, a, Result, s, e, d);
+  ZLookupLocal(T, a, Result, s, e, d);
 end;
 
 function UnixToLocalDate(T: Int64): TDate;
@@ -997,25 +1035,32 @@ begin
   Result := UnixToDate(T + LocalOffset(T));
 end;
 
-{ The moment the local clock shows as that date and time (Go's Date):
+{ The moment the clock of zone Z shows as that date and time (Go's Date):
   the offset at the moment read as UTC, and if the moment the offset
   gives falls outside that zone's span, the offset there. A time the
   clock skipped or showed twice takes one of them, as Go's does. }
-function LocalDateToUnix(Y, M, D, HH, MM, SS: Integer): Int64;
+function ZDateToUnix(Z: TZoneData; Y, M, D, HH, MM, SS: Integer): Int64;
 var
   a: string;
   off, s, e, utc: Int64;
   dst: Boolean;
 begin
   Result := DateToUnix(Y, M, D, HH, MM, SS);
-  ZLookup(Result, a, off, s, e, dst);
+  ZLookup(Z, Result, a, off, s, e, dst);
   if off <> 0 then
   begin
     utc := Result - off;
     if (utc < s) or (utc >= e) then
-      ZLookup(utc, a, off, s, e, dst);
+      ZLookup(Z, utc, a, off, s, e, dst);
     Result := Result - off;
   end;
+end;
+
+function LocalDateToUnix(Y, M, D, HH, MM, SS: Integer): Int64;
+begin
+  once ZOnce do
+    ZInit;
+  Result := ZDateToUnix(ZLocal, Y, M, D, HH, MM, SS);
 end;
 
 function DateOf(const D: TDate): string;
@@ -1096,6 +1141,83 @@ begin
     Result := 'November'
   else if M = 12 then
     Result := 'December';
+end;
+
+{ ---- LoadZone (P435) ---- }
+
+function TZone.Name: string;
+begin
+  Result := TZoneData(FData).Name;
+end;
+
+function TZone.OffsetAt(T: Int64): Int64;
+var
+  a: string;
+  s, e: Int64;
+  d: Boolean;
+begin
+  ZLookup(TZoneData(FData), T, a, Result, s, e, d);
+end;
+
+function TZone.AbbrevAt(T: Int64): string;
+var
+  o, s, e: Int64;
+  d: Boolean;
+begin
+  ZLookup(TZoneData(FData), T, Result, o, s, e, d);
+end;
+
+function TZone.IsDstAt(T: Int64): Boolean;
+var
+  a: string;
+  o, s, e: Int64;
+begin
+  ZLookup(TZoneData(FData), T, a, o, s, e, Result);
+end;
+
+function TZone.ToDate(T: Int64): TDate;
+begin
+  Result := UnixToDate(T + OffsetAt(T));
+end;
+
+function TZone.ToUnix(Y, M, D, HH, MM, SS: Integer): Int64;
+begin
+  Result := ZDateToUnix(TZoneData(FData), Y, M, D, HH, MM, SS);
+end;
+
+{ Go's LoadLocation: '' and UTC are UTC, Local the local clock's, a name
+  a file of the zoneinfo directories (not one with .. in it or one that
+  starts with / or a backslash, which go outside them) }
+function LoadZone(const Name: string): TZone;
+var
+  z: TZoneData;
+begin
+  Result := nil;
+  if (Name = '') or (Name = 'UTC') then
+  begin
+    z := TZoneData.Create;
+    z.Name := 'UTC';
+    Result := TZone.Create;
+    Result.FData := z;
+    Exit;
+  end;
+  if Name = 'Local' then
+  begin
+    once ZOnce do
+      ZInit;
+    Result := TZone.Create;
+    Result.FData := ZLocal;
+    Exit;
+  end;
+  if (Name[1] = '/') or (Name[1] = Chr(92)) or (Pos('..', Name) > 0) then
+    Exit;
+  z := TZoneData.Create;
+  z.Name := Name;
+  if not ZLoad(z, Name, ['/usr/share/zoneinfo/', '/usr/share/lib/zoneinfo/', '/usr/lib/locale/TZ/',
+    '/etc/zoneinfo']) then
+    Exit;
+  Result := TZone.Create;
+  Result.FData := z;
 end;
 
 end.

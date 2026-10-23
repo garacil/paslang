@@ -582,6 +582,10 @@ GOLDEN_A64 += argon2kat
 # P440: the digests in pieces equal the whole-message words, every cut.
 GOLDEN += hashpieces
 GOLDEN_A64 += hashpieces
+# P435: base64, URL, CSV and letters against Go's own output; LoadZone
+# against time.LoadLocation (the system's zoneinfo).
+GOLDEN += codec zones
+GOLDEN_A64 += codec zones
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -615,6 +619,7 @@ LIB_UNITS := \
 	src/lib/pasx11.paslang \
 	src/rtl/sysutils.paslang \
 	src/lib/argon2.paslang \
+	src/lib/pascodec.paslang \
 	src/lib/httpserver.paslang \
 	src/lib/sqlite.paslang
 
