@@ -11473,50 +11473,96 @@ whether the name is set at all (`TZ=` is set and empty), `IntToStr`, `StrToInt64
 `IntToHex2(b)`, `ToLower`, `HasSuffix`, `ChangeExt`, `BaseName`,
 `DirName` and `JoinPath` shape strings and paths.
 
-`uses sqlite` gives SQLite 3 in paslang, written from SQLite's own
-file format, documents and sources (1.1.245, P403, the first of P403 to
-P414). It is a library unit, as `pasnet` and `sysutils` are (1.1.247,
-P418): installed with the compiler and built for each processor level,
-its names are a program's when the program names it and not otherwise,
-and a program that does not name it carries nothing of it. A program
-that names it and reaches none of it carries none of it either: each
-read-only item of a unit (a literal, a class's tables, a call site's
-descriptor) is a section of its own that the linker keeps only when
-kept code reaches it (1.1.246, P417), and so is each of its variables
-and typed constants, with its entry in the collector's roots (1.1.250,
-P420): a program that reads a database carries none of the tables of
-SQL's parser.
+`uses sqlite` gives SQLite 3.54.1 in paslang: the library itself, written
+from SQLite's own file format, documents and sources (P403 the file,
+P404 the SQL, 1.1.253 P405 the rest). It is a library unit, as `pasnet`
+and `sysutils` are (1.1.247, P418): installed with the compiler and
+built for each processor level, its names are a program's when the
+program names it and not otherwise, and a program that does not name it
+carries nothing of it. A program that names it and reaches none of it
+carries none of it either: each read-only item of a unit (a literal, a
+class's tables, a call site's descriptor) is a section of its own that
+the linker keeps only when kept code reaches it (1.1.246, P417), and so
+is each of its variables and typed constants, with its entry in the
+collector's roots (1.1.250, P420).
 
-`TSqlite.Open(path)` or `TSqlite.Open(path, flags)` opens a database
-file as `sqlite3_open_v2` does (`SQLITE_OPEN_READONLY`,
-`SQLITE_OPEN_READWRITE`, `SQLITE_OPEN_CREATE`), or one in memory for
-`':memory:'`; `Schema` gives `sqlite_schema`'s rows, `Rows(name)` the
-rows of a table by rowid or the keys of an index in key order, each a
-record of `TSqliteValue`s (`SQLITE_INTEGER`, `SQLITE_FLOAT`,
-`SQLITE_TEXT`, `SQLITE_BLOB`, `SQLITE_NULL`). It reads every page size
-from 512 to 65536, overflow pages, UTF-16 databases (as UTF-8),
-`WITHOUT ROWID` tables and indexes of any collation, and takes SQLite's
-own POSIX locks, so a paslang program and the sqlite3 program share a
-file: a database another holds `EXCLUSIVE` gives `ESqliteError` with
-code `SQLITE_BUSY`, 'database is locked'. Errors are `ESqliteError`s
-with SQLite's codes and words. SQL is read as SQLite's parser reads it
-(1.1.248, P404): the tables lemon makes of SQLite's `parse.y`, each of
-its rules reduced as SQLite reduces it, every error in SQLite's own
-words; `SqliteParseTrace(sql)` gives the trees SQLite's debug build
-traces for the statement (`.treetrace 0x10000`), then `ok`, or `error: `
-and the message, as `testdata/sqlparse` checks against SQLite on 1,351
-statements. Writes and the rest come with the next milestones.
+Its files are SQLite's to the byte: a database a paslang program
+writes, in rollback-journal or WAL mode, is one the `sqlite3` program
+reads, and the other way, at the same time, with SQLite's own POSIX
+locks; a program killed in the middle of a commit leaves a file either
+side brings back to the state before the transaction or after it. Its
+SQL is SQLite's (every statement, pragma, function, window, JSON and
+date function, virtual table, `ATTACH`, `VACUUM INTO`), and so are its
+answers: the same rows, the same types, the same result codes and the
+same messages, which `testdata/sqlapi` compares with SQLite's own on
+UTF-8 and UTF-16 databases.
 
-With `uses sqlite`, the objects of a database, each row of
-`sqlite_schema`, are listed by their kind and name:
+`TSqlite` is a connection as a class. `TSqlite.Open(path)` opens or
+makes a database file (`':memory:'` for one in memory), and
+`TSqlite.Open(path, flags)` takes `sqlite3_open_v2`'s flags
+(`SQLITE_OPEN_READONLY`, `SQLITE_OPEN_READWRITE`, `SQLITE_OPEN_CREATE`,
+`SQLITE_OPEN_URI`, ...). `Exec(sql)` runs every statement of a text;
+`Exec(sql, [args])` runs one with its parameters (`?`, `?NNN`, `:name`,
+`@name`, `$name`) bound in order: an integer, a Boolean, a real, a
+string (a text), `nil` (NULL), or `SqliteBlob(bytes)` for a blob; it
+gives the rows changed. `Query(sql, [args])` gives the rows of a query,
+a `TSqliteRows` walked with `Next`, each row's `Column(i)` a
+`TSqliteValue` (its `Kind` `SQLITE_INTEGER`, `SQLITE_FLOAT`,
+`SQLITE_TEXT`, `SQLITE_BLOB` or `SQLITE_NULL`, its value in `I`, `R` or
+`S`) and `ColumnName(i)` its name; `QueryValue(sql, [args])` the first
+column of the first row. `LastInsertRowId` and `Changes` are
+`sqlite3_last_insert_rowid` and `sqlite3_changes64`. An error raises
+`ESqliteError` with SQLite's extended code (`ExtendedCode`), its primary
+code (`Code`) and SQLite's words (`Message`). `Schema` gives
+`sqlite_schema`'s rows, and `Rows(name)` and `RowsAt(rootpage)` the
+records of a table's b-tree by rowid, or an index's keys in their order,
+as the file holds them.
 
 ```
-db := TSqlite.Open('test.db', SQLITE_OPEN_READONLY);
-objs := db.Schema;                       { a TSqliteObjects }
-for i := 0 to High(objs) do
-  WriteLn(objs[i].Kind, ' ', objs[i].Name);
+db := TSqlite.Open('shop.db');
+db.Exec('CREATE TABLE IF NOT EXISTS item(id INTEGER PRIMARY KEY, name TEXT, price REAL)');
+db.Exec('INSERT INTO item(name, price) VALUES(?, ?)', ['pen', 1.25]);
+rows := db.Query('SELECT id, name, price FROM item WHERE price < ?', [10]);
+while rows.Next do
+  WriteLn(rows.Column(0).I, ' ', rows.Column(1).S, ' ', rows.Column(2).R);
 db.Free;
 ```
+
+Underneath is SQLite's C interface, under its own names and with its
+constants (all of `sqlite3.h`'s): `sqlite3_open_v2`, `sqlite3_exec`,
+`sqlite3_prepare_v2` and `_v3`, `sqlite3_step`, `sqlite3_reset`,
+`sqlite3_finalize`, `sqlite3_bind_*`, `sqlite3_column_*`,
+`sqlite3_value_*`, `sqlite3_result_*`, `sqlite3_create_function_v2`,
+`sqlite3_create_window_function`, `sqlite3_create_collation_v2`,
+`sqlite3_create_module_v2`, `sqlite3_backup_*`, `sqlite3_blob_*`,
+`sqlite3_serialize`, `sqlite3_deserialize`, `sqlite3_wal_checkpoint_v2`,
+the hooks, `sqlite3_trace_v2`, `sqlite3_db_config`, `sqlite3_db_status`
+and the rest, on the classes `TSqlite3` (a connection, `sqlite3*`),
+`TSqlite3Stmt`, `TSqlite3Context`, `TSqlite3Value`, `TSqlite3Backup`
+and `TSqlite3Blob`; `TSqlite.Handle` is a `TSqlite` connection's. A
+text is a string (UTF-8; the `16` routines take and give UTF-16 in the
+machine's order), and where C tells a NULL text from an empty one an
+overload says it in `IsNull`. A callback is a routine value and C's
+`void*` an object: an application's function is a procedure of a
+context and its arguments, `procedure(Ctx: TSqlite3Context; Argc:
+Integer; const Argv: array of TSqlite3Value)`, and
+`sqlite3_aggregate_context(Ctx, TMyState)` makes an aggregate's state an
+object of a class. A virtual table is a `TSqlite3Module` of routine
+values over classes derived from `TSqlite3Vtab` and
+`TSqlite3VtabCursor`.
+
+A connection can be shared by routines: as in SQLite's default build,
+each call holds the connection's mutex, which the routine that holds it
+may take again (a function of the application runs SQL on the
+connection that calls it), and a routine that waits for it, or for a
+file another connection holds (`sqlite3_busy_timeout`), parks while the
+others run. A statement belongs to one routine at a time. The unit
+keeps no count of its memory, which is the collector's
+(`sqlite3_memory_used` is 0), and loads no extension library.
+
+`SqliteParseTrace(sql)` gives the trees SQLite's debug build traces for
+a statement (`.treetrace 0x10000`), then `ok`, or `error: ` and the
+message (1.1.248, P404).
 
 ## 17. The clock, chance and order
 

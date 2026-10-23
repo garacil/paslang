@@ -11,8 +11,9 @@ section of their own, with their roots for the collector linked to
 them, so it carries no class table of it (vmt_, rtti_), none of its
 methods, routines or variables, only the unit's start (u_sqlite_).
 sqluses, which opens a database, carries TSqlite's (a library unit's
-names carry the unit's: vmt_sqlite_tsqlite) and none of the tables of
-SQL's parser (v_sqlite.yy_*, v_sqlite.sqlkw*). It prints hello's loaded
+names carry the unit's: vmt_sqlite_tsqlite) and the engine under it,
+sqlite3_open_v2 and the tables of SQL's parser (P405: a connection runs
+SQL). It prints hello's loaded
 bytes (all its sections but the debug ones) and its .data, and refuses
 more than BUDGET loaded when one is given.
 
@@ -66,15 +67,14 @@ def main():
     for s in ('vmt_sqlite_tsqlite', 'p_sqlite_tsqlite_open', 'vmt_sqlite_esqliteerror'):
         if not any(x.startswith(s) for x in u):
             raise SystemExit('check_gcsections: sqluses carries no %s' % s)
-    tables = sorted(x for x in u if x.startswith(('v_sqlite.yy', 'v_sqlite.sqlkw')))
-    if tables:
-        raise SystemExit('check_gcsections: sqluses carries the parser\'s tables: %s' % ' '.join(tables[:8]))
+    if not any(x.startswith('p_sqlite_sqlite3_open_v2') for x in u):
+        raise SystemExit('check_gcsections: sqluses carries no sqlite3_open_v2')
     secs = sections(hello, arm)
     n = loaded(secs)
     if budget and n > budget:
         raise SystemExit('check_gcsections: hello loads %d bytes, budget %d' % (n, budget))
     print('check_gcsections: hello carries nothing of sqlite, loads %d bytes, .data %d; sqlnone only its start,'
-          ' %d names; sqluses carries TSqlite and none of the parser\'s tables' % (n, secs.get('.data', 0), len(unit)))
+          ' %d names; sqluses carries TSqlite and the engine' % (n, secs.get('.data', 0), len(unit)))
 
 
 if __name__ == '__main__':

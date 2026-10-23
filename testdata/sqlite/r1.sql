@@ -1,0 +1,10 @@
+select count(*), sum(length(b)), min(a), max(a) from t;
+select a, length(b) from t where a between 100 and 110 order by a;
+select * from sqlite_master;
+select a from t where a > 4990 order by a desc limit 5;
+select typeof(a), count(*) from t group by 1;
+select a, b from t where rowid = 7;
+explain select a from t where a = 5;
+explain query plan select a from t where a = 5;
+select count(distinct a) from t;
+pragma user_version;

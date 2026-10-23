@@ -2466,6 +2466,22 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	cmp testdata/sqlparse.out $(BUILDDIR)/sqlparse.gotgc; \
 	echo ok sqlparse
 	@set -e; \
+	: SQLite whole, P405: every script of testdata/sqlite through the C interface as SQLite 3.54.1 answers it, on UTF-8 and UTF-16 databases, and its corpora; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/sqlapi testdata/sqlapi.paslang; \
+	$(OUTDIR)/paslangc -cpu base -inline 0 -o $(BUILDDIR)/sqlapi0 testdata/sqlapi.paslang; \
+	python3 -I scripts/check_sqlapi.py $(BUILDDIR)/sqlapi $(BUILDDIR)/sqlapi.d --corpus; \
+	python3 -I scripts/check_sqlapi.py $(BUILDDIR)/sqlapi0 $(BUILDDIR)/sqlapi0.d; \
+	PASLANG_GCSTRESS=1 PASLANG_GCVERIFY=1 python3 -I scripts/check_sqlapi.py $(BUILDDIR)/sqlapi0 $(BUILDDIR)/sqlapi0gc.d --only d1,j1,w2,v2,fn1,coll1; \
+	: the unit beside the system SQLite on the same files, read back, killed in a commit, at once, checkpoints, a million rows; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/sqlcompat testdata/sqlcompat.paslang; \
+	python3 -I scripts/check_sqlite.py $(BUILDDIR)/sqlcompat $(BUILDDIR)/sqlcompat.d; \
+	: routines on one connection and on one file, Regla 11; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/sqlroutines testdata/sqlroutines.paslang; \
+	rm -f $(BUILDDIR)/sqlroutines.db $(BUILDDIR)/sqlroutines.db-wal $(BUILDDIR)/sqlroutines.db-shm; \
+	$(BUILDDIR)/sqlroutines $(BUILDDIR)/sqlroutines.db > $(BUILDDIR)/sqlroutines.got; \
+	cmp testdata/sqlroutines.out $(BUILDDIR)/sqlroutines.got; \
+	echo ok sqlapi
+	@set -e; \
 	echo "==== index checks ===="; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/bce_s testdata/bce.paslang; \
 	if sed -n '/^p_table:/,/cfi_endproc/p' $(BUILDDIR)/bce_s.s | grep -q 'call rt_boundsfail'; then echo "bce: p_table kept a bounds check the loop does not need"; exit 1; fi; \
@@ -5479,6 +5495,19 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	timeout 600 $(QEMU_A64) $(BUILDDIR)/sqlparse0-arm testdata/sqlparse.sql > $(BUILDDIR)/sqlparse0-arm.got; \
 	cmp testdata/sqlparse.out $(BUILDDIR)/sqlparse0-arm.got; \
 	echo ok sqlparse-arm
+	@set -e; \
+	: P405 on arm64: every script of testdata/sqlite as SQLite answers it, the unit beside the system SQLite, routines; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -Fu $(A64DIR) -o $(BUILDDIR)/sqlapi-arm testdata/sqlapi.paslang; \
+	$(OUTDIR)/paslangc -target arm64 -cpu base -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/sqlapi0-arm testdata/sqlapi.paslang; \
+	python3 -I scripts/check_sqlapi.py $(BUILDDIR)/sqlapi-arm $(BUILDDIR)/sqlapi-arm.d $(QEMU_A64) --corpus; \
+	python3 -I scripts/check_sqlapi.py $(BUILDDIR)/sqlapi0-arm $(BUILDDIR)/sqlapi0-arm.d $(QEMU_A64); \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -Fu $(A64DIR) -o $(BUILDDIR)/sqlcompat-arm testdata/sqlcompat.paslang; \
+	python3 -I scripts/check_sqlite.py $(BUILDDIR)/sqlcompat-arm $(BUILDDIR)/sqlcompat-arm.d $(QEMU_A64); \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -Fu $(A64DIR) -o $(BUILDDIR)/sqlroutines-arm testdata/sqlroutines.paslang; \
+	rm -f $(BUILDDIR)/sqlroutines-arm.db $(BUILDDIR)/sqlroutines-arm.db-wal $(BUILDDIR)/sqlroutines-arm.db-shm; \
+	timeout 600 $(QEMU_A64) $(BUILDDIR)/sqlroutines-arm $(BUILDDIR)/sqlroutines-arm.db > $(BUILDDIR)/sqlroutines-arm.got; \
+	cmp testdata/sqlroutines.out $(BUILDDIR)/sqlroutines-arm.got; \
+	echo ok sqlapi-arm
 
 install: all installdirs
 	$(NORMAL_INSTALL)

@@ -1,0 +1,187 @@
+{ SQLite from pasroutines (Regla 11): eight routines on one connection,
+  which its mutex serializes as SQLite's default build does; eight
+  routines each with its own connection to one file in WAL mode, whose
+  writers wait for each other in the busy handler, parked; a routine that
+  counts while a writer holds the file and another waits for it; the
+  collector running all the while. }
+program sqlroutines;
+
+uses
+  paslib, sysutils, sqlite;
+
+const
+  N = 8;
+  Rows = 150;
+
+var
+  wg, wgr: waitgroup;
+  shared: TSqlite;
+  path: string;
+  ticks, waited, errs: Integer;
+  stop, waitDone: Integer;
+
+{ one connection, shared: each insert a statement of its own }
+procedure SharedWriter(K: Integer);
+var
+  i: Integer;
+begin
+  try
+    for i := 1 to Rows do
+    begin
+      shared.Exec('INSERT INTO s VALUES(?, ?, ?)', [K, i, StringOfChar('x', (K * i) mod 300)]);
+      if i mod 50 = 0 then
+        GcCollect;
+    end;
+  except
+    on E: ESqliteError do
+      AtomicAdd(@errs, 1);
+  end;
+  wg.Done;
+end;
+
+{ a connection of its own: transactions of ten rows }
+procedure OwnWriter(K: Integer);
+var
+  db: TSqlite;
+  i, j: Integer;
+begin
+  try
+    db := TSqlite.Open(path);
+    db.Exec('PRAGMA busy_timeout=60000');
+    for i := 0 to Rows div 10 - 1 do
+    begin
+      db.Exec('BEGIN IMMEDIATE');
+      for j := 1 to 10 do
+        db.Exec('INSERT INTO o VALUES(?, ?)', [K, i * 10 + j]);
+      db.Exec('COMMIT');
+    end;
+    db.Free;
+  except
+    on E: ESqliteError do
+    begin
+      WriteLn('own writer ', K, ': ', E.Message);
+      AtomicAdd(@errs, 1);
+    end;
+  end;
+  wg.Done;
+end;
+
+{ counts while the others write: never half a transaction }
+procedure Reader;
+var
+  db: TSqlite;
+  n: Integer;
+begin
+  try
+    db := TSqlite.Open(path);
+    db.Exec('PRAGMA busy_timeout=60000');
+    while AtomicLoad(stop) = 0 do
+    begin
+      n := db.QueryValue('SELECT count(*) FROM o', []).I;
+      if n mod 10 <> 0 then
+        AtomicAdd(@errs, 1);
+      Sleep(1);
+    end;
+    db.Free;
+  except
+    on E: ESqliteError do
+      AtomicAdd(@errs, 1);
+  end;
+  wgr.Done;
+end;
+
+{ ticks while a writer holds the file and another waits on it }
+procedure Ticker;
+begin
+  while AtomicLoad(stop) = 0 do
+  begin
+    AtomicAdd(@ticks, 1);
+    Sleep(1);
+  end;
+  wg.Done;
+end;
+
+procedure Holder;
+var
+  db: TSqlite;
+begin
+  db := TSqlite.Open(path);
+  db.Exec('BEGIN IMMEDIATE');
+  db.Exec('INSERT INTO o VALUES(-1, 0)');
+  Sleep(300);
+  db.Exec('ROLLBACK');
+  db.Free;
+  wg.Done;
+end;
+
+procedure Waiter;
+var
+  db: TSqlite;
+  t0: Integer;
+begin
+  Sleep(50);
+  db := TSqlite.Open(path);
+  db.Exec('PRAGMA busy_timeout=10000');
+  t0 := ticks;
+  db.Exec('BEGIN IMMEDIATE');
+  waited := ticks - t0;
+  AtomicStore(waitDone, 1);
+  db.Exec('ROLLBACK');
+  db.Free;
+  wg.Done;
+end;
+
+var
+  i: Integer;
+  setup: TSqlite;
+begin
+  path := ParamStr(1);
+  shared := TSqlite.Open(':memory:');
+  shared.Exec('CREATE TABLE s(k, i, pad)');
+  wg.Add(N);
+  for i := 1 to N do
+    pas SharedWriter(i);
+  wg.Wait;
+  WriteLn('shared: ', shared.QueryValue('SELECT count(*) FROM s', []).I, ' rows, ',
+    shared.QueryValue('SELECT count(DISTINCT k) FROM s', []).I, ' writers, ',
+    shared.QueryValue('PRAGMA integrity_check', []).S);
+  shared.Free;
+
+  setup := TSqlite.Open(path);
+  setup.Exec('PRAGMA journal_mode=WAL');
+  setup.Exec('CREATE TABLE IF NOT EXISTS o(k, i)');
+  setup.Free;
+  stop := 0;
+  wgr.Add(1);
+  pas Reader;
+  wg.Add(N);
+  for i := 1 to N do
+    pas OwnWriter(i);
+  wg.Wait;
+  AtomicStore(stop, 1);
+  wgr.Wait;
+  setup := TSqlite.Open(path);
+  WriteLn('own: ', setup.QueryValue('SELECT count(*) FROM o', []).I, ' rows, ',
+    setup.QueryValue('SELECT count(DISTINCT k) FROM o', []).I, ' writers, ',
+    setup.QueryValue('PRAGMA integrity_check', []).S);
+  setup.Free;
+
+  stop := 0;
+  ticks := 0;
+  wg.Add(3);
+  pas Ticker;
+  pas Holder;
+  pas Waiter;
+  while AtomicLoad(waitDone) = 0 do
+    Sleep(5);
+  AtomicStore(stop, 1);
+  wg.Wait;
+  WriteLn('a routine ran while another waited for the file: ', waited > 10);
+  WriteLn('errors: ', errs);
+end.
+
+{ This file is part of paslang's tests.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+  paslang is free software under the GNU General Public License,
+  version 3 or (at your option) any later version; see the file
+  COPYING. It comes with ABSOLUTELY NO WARRANTY. }

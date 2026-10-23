@@ -1,0 +1,13 @@
+create table t(a text);
+insert into t values('Abc'),('abc'),('ABD'),('xyz');
+create index ta on t(a);
+select a from t where a like 'ab%' order by a;
+explain query plan select a from t where a like 'ab%';
+pragma case_sensitive_like=1;
+select a from t where a like 'ab%' order by a;
+select a from t where a like 'Ab%' order by a;
+explain query plan select a from t where a like 'Ab%';
+select 'ABC' like 'abc', 'abc' like 'abc', like('a%','ABC'), like('a$%','a%', '$');
+pragma case_sensitive_like=0;
+select a from t where a like 'ab%' order by a;
+select 'ABC' like 'abc';

@@ -1,0 +1,10 @@
+create table t(a text, b real, c as (b*3) virtual);
+create index te on t(a||'x', b*1.1);
+create index tc on t(c);
+with recursive n(i) as (select 1 union all select i+1 from n where i<200) insert into t(a,b) select 'k'||i, i*0.1 from n;
+pragma integrity_check;
+delete from t where b > 5;
+pragma integrity_check;
+update t set b = b + 0.3 where a like 'k1%';
+pragma integrity_check;
+select count(*), sum(b), sum(c) from t;

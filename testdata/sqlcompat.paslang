@@ -1,0 +1,160 @@
+{ SQLite's file shared with SQLite itself (scripts/check_sqlite.py drives
+  it beside Python's sqlite3, the system's libsqlite3): this program
+  writes, reads, recovers and checkpoints a database the way the other
+  side does, through uses sqlite.
+    write DB N MODE     N rows in one transaction (MODE delete or wal)
+    query DB SQL        SQL's rows, one a line, columns by '|'
+    crash DB N MODE     as write, "begun" before the commit: killed there
+    readloop DB K       K counts of t, each a whole number of batches
+    writeloop DB K      K transactions of 100 rows
+    ckpt DB KIND        PRAGMA wal_checkpoint(KIND), with no busy wait
+    million DB          a million rows in one transaction }
+program sqlcompat;
+
+uses
+  paslib, sysutils, sqlite;
+
+const
+  Batch = 100;
+
+{ the row I of every table, the same on both sides (check_sqlite.py) }
+procedure Schema(Db: TSqlite; const Mode: string);
+begin
+  Db.Exec('PRAGMA journal_mode=' + Mode);
+  Db.Exec('CREATE TABLE IF NOT EXISTS t(a INTEGER PRIMARY KEY, b REAL, c TEXT, d BLOB, e)');
+  Db.Exec('CREATE INDEX IF NOT EXISTS tc ON t(c)');
+  Db.Exec('CREATE TABLE IF NOT EXISTS w(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID');
+end;
+
+procedure AddRows(Db: TSqlite; First, N: Integer);
+var
+  i: Integer;
+begin
+  for i := First to First + N - 1 do
+  begin
+    Db.Exec('INSERT INTO t VALUES(?, ?, ?, zeroblob(?), ?)', [i, i / 7, 'row ' + IntToStr(i * 7919 mod 100003),
+      (i * 13) mod 3000, nil]);
+    Db.Exec('INSERT INTO w VALUES(?, ?)', ['k' + IntToStr(i), i * i]);
+  end;
+  Db.Exec('UPDATE t SET e = a * 2 WHERE a % 5 = 0 AND a >= ? AND a < ?', [First, First + N]);
+  Db.Exec('DELETE FROM w WHERE v % 11 = 3');
+end;
+
+procedure Query(Db: TSqlite; const Sql: string);
+var
+  r: TSqliteRows;
+  i: Integer;
+  v: TSqliteValue;
+  s: string;
+begin
+  r := Db.Query(Sql);
+  while r.Next do
+  begin
+    s := '';
+    for i := 0 to r.ColumnCount - 1 do
+    begin
+      if i > 0 then
+        s := s + '|';
+      v := r.Column(i);
+      case v.Kind of
+        SQLITE_INTEGER: s := s + IntToStr(v.I);
+        SQLITE_TEXT: s := s + v.S;
+        SQLITE_NULL: s := s + 'NULL';
+      else
+        s := s + '?';
+      end;
+    end;
+    WriteLn(s);
+  end;
+end;
+
+var
+  db: TSqlite;
+  mode: string;
+  i, n, k: Integer;
+  st: TSqlite3Stmt;
+begin
+  mode := ParamStr(1);
+  try
+    db := TSqlite.Open(ParamStr(2));
+    db.Exec('PRAGMA busy_timeout=20000');
+    if mode = 'write' then
+    begin
+      Schema(db, ParamStr(4));
+      db.Exec('BEGIN');
+      AddRows(db, 1, StrToInt(ParamStr(3)));
+      db.Exec('COMMIT');
+      WriteLn('done');
+    end
+    else if mode = 'query' then
+      Query(db, ParamStr(3))
+    else if mode = 'crash' then
+    begin
+      Schema(db, ParamStr(4));
+      n := db.QueryValue('SELECT count(*) FROM t', []).I;
+      db.Exec('BEGIN');
+      AddRows(db, n + 1, StrToInt(ParamStr(3)));
+      WriteLn('begun');
+      db.Exec('COMMIT');
+      WriteLn('done');
+    end
+    else if mode = 'readloop' then
+    begin
+      k := StrToInt(ParamStr(3));
+      for i := 1 to k do
+      begin
+        n := db.QueryValue('SELECT count(*) FROM t', []).I;
+        if n mod Batch <> 0 then
+          WriteLn('torn read ', n);
+      end;
+      WriteLn('read ', k);
+    end
+    else if mode = 'writeloop' then
+    begin
+      Schema(db, ParamStr(4));
+      k := StrToInt(ParamStr(3));
+      for i := 1 to k do
+      begin
+        db.Exec('BEGIN IMMEDIATE');
+        n := db.QueryValue('SELECT count(*) FROM t', []).I;
+        AddRows(db, n + 1, Batch);
+        db.Exec('COMMIT');
+      end;
+      WriteLn('wrote ', k);
+    end
+    else if mode = 'ckpt' then
+    begin
+      db.Exec('PRAGMA busy_timeout=0');
+      Query(db, 'PRAGMA wal_checkpoint(' + ParamStr(3) + ')');
+    end
+    else if mode = 'million' then
+    begin
+      db.Exec('CREATE TABLE m(a INTEGER PRIMARY KEY, b, c)');
+      db.Exec('BEGIN');
+      if sqlite3_prepare_v2(db.Handle, 'INSERT INTO m VALUES(?, ?, ?)', st) <> SQLITE_OK then
+        raise ESqliteError.Create(sqlite3_extended_errcode(db.Handle), sqlite3_errmsg(db.Handle));
+      for i := 1 to 1000000 do
+      begin
+        sqlite3_bind_int64(st, 1, i);
+        sqlite3_bind_int64(st, 2, i * 3 mod 1000);
+        sqlite3_bind_text(st, 3, 'm' + IntToStr(i));
+        if sqlite3_step(st) <> SQLITE_DONE then
+          raise ESqliteError.Create(sqlite3_extended_errcode(db.Handle), sqlite3_errmsg(db.Handle));
+        sqlite3_reset(st);
+      end;
+      sqlite3_finalize(st);
+      db.Exec('COMMIT');
+      Query(db, 'SELECT count(*), sum(b), max(length(c)) FROM m');
+    end;
+    db.Free;
+  except
+    on E: ESqliteError do
+      WriteLn('error ', E.ExtendedCode, ' ', E.Message);
+  end;
+end.
+
+{ This file is part of paslang's tests.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+  paslang is free software under the GNU General Public License,
+  version 3 or (at your option) any later version; see the file
+  COPYING. It comes with ABSOLUTELY NO WARRANTY. }

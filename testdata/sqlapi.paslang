@@ -1,0 +1,786 @@
+{ SQLite's C interface, scripts/sqlapi_oracle.c's twin, through uses sqlite:
+  every statement of a script prepared, described, stepped and
+  finalized, each answer printed as the oracle prints SQLite's. }
+program sqlapi;
+
+uses
+  paslib, sqlite;
+
+const
+  HexD: array[0..15] of Char = ('0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f');
+
+{ the oracle's hexs: the bytes in hex, "-" for none, "~" for NULL }
+function HexS(const S: string; IsNull: Boolean): string;
+var
+  i: Integer;
+begin
+  if IsNull then
+  begin
+    Result := '~';
+    Exit;
+  end;
+  if S = '' then
+  begin
+    Result := '-';
+    Exit;
+  end;
+  Result := '';
+  for i := 1 to Length(S) do
+    Result := Result + HexD[Ord(S[i]) shr 4] + HexD[Ord(S[i]) and 15];
+end;
+
+function Hex16(V: Integer): string;
+var
+  i: Integer;
+begin
+  Result := '';
+  for i := 15 downto 0 do
+    Result := Result + HexD[(V shr (i * 4)) and 15];
+end;
+
+{ memcmp of two byte strings, then their lengths }
+function ByteCmp(const A, B: string): Integer;
+var
+  i, n: Integer;
+begin
+  n := Length(A);
+  if Length(B) < n then
+    n := Length(B);
+  for i := 1 to n do
+    if A[i] <> B[i] then
+    begin
+      if Ord(A[i]) < Ord(B[i]) then
+        Result := -1
+      else
+        Result := 1;
+      Exit;
+    end;
+  Result := Length(A) - Length(B);
+end;
+
+{ sqlite3_log's lines }
+procedure LogCb(Arg: TObject; Code: Integer; const Msg: string);
+begin
+  WriteLn('L ', Code, ' ', HexS(Msg, False));
+end;
+
+{ the oracle's test modules: series and kv }
+type
+  TSerCur = class(TSqlite3VtabCursor)
+    I, Start, Stop, Step: Integer;
+  end;
+
+  TKvRow = record
+    Rowid: Integer;
+    K, V: string;
+    Live: Boolean;
+  end;
+
+  TKvTab = class(TSqlite3Vtab)
+    A: array of TKvRow;
+    N: Integer;
+    Next: Integer;
+    Db: TSqlite3;
+  end;
+
+  TKvCur = class(TSqlite3VtabCursor)
+    I: Integer;
+    One: Boolean;
+  end;
+
+function SerConnect(Db: TSqlite3; Aux: TObject; const Argv: TSqlite3StrArray; out Vtab: TSqlite3Vtab;
+  var Err: TSqlite3ErrOut): Integer;
+begin
+  Vtab := nil;
+  Result := sqlite3_declare_vtab(Db, 'CREATE TABLE x(value, start hidden, stop hidden, step hidden)');
+  if Result = SQLITE_OK then
+    Vtab := TSqlite3Vtab.Create;
+end;
+
+function SerDisconnect(Vtab: TSqlite3Vtab): Integer;
+begin
+  Result := 0;
+end;
+
+function SerBestIndex(Vtab: TSqlite3Vtab; Info: TSqlite3IndexInfo): Integer;
+var
+  i, n: Integer;
+  cols: string;
+begin
+  n := 0;
+  cols := '';
+  for i := 0 to Info.NConstraint - 1 do
+    if (Info.AConstraint[i].IColumn >= 1) and (Info.AConstraint[i].Op = SQLITE_INDEX_CONSTRAINT_EQ) then
+    begin
+      if not Info.AConstraint[i].Usable then
+      begin
+        Result := SQLITE_CONSTRAINT;
+        Exit;
+      end;
+      if Length(cols) < 7 then
+      begin
+        Inc(n);
+        Info.AConstraintUsage[i].ArgvIndex := n;
+        Info.AConstraintUsage[i].Omit := True;
+        cols := cols + Chr(Ord('0') + Info.AConstraint[i].IColumn);
+      end;
+    end;
+  Info.IdxNum := Length(cols);
+  Info.IdxStr := cols;
+  Info.HasIdxStr := True;
+  Info.NeedToFreeIdxStr := True;
+  if Length(cols) >= 2 then
+  begin
+    Info.EstimatedCost := 10.0;
+    Info.EstimatedRows := 10;
+  end
+  else
+  begin
+    Info.EstimatedCost := 1000000.0;
+    Info.EstimatedRows := 1000;
+  end;
+  if (Info.NOrderBy = 1) and (Info.AOrderBy[0].IColumn = 0) and not Info.AOrderBy[0].Desc then
+    Info.OrderByConsumed := True;
+  Result := SQLITE_OK;
+end;
+
+function SerOpen(Vtab: TSqlite3Vtab; out Cur: TSqlite3VtabCursor): Integer;
+begin
+  Cur := TSerCur.Create;
+  Result := SQLITE_OK;
+end;
+
+function SerClose(Cur: TSqlite3VtabCursor): Integer;
+begin
+  Result := SQLITE_OK;
+end;
+
+function SerFilter(Cur: TSqlite3VtabCursor; IdxNum: Integer; const IdxStr: string; HasIdxStr: Boolean;
+  const Argv: TSqlite3ValueArray): Integer;
+var
+  c: TSerCur;
+  i, x: Integer;
+begin
+  c := Cur as TSerCur;
+  c.Start := 0;
+  c.Stop := 10;
+  c.Step := 1;
+  i := 0;
+  while HasIdxStr and (i < Length(Argv)) and (i < Length(IdxStr)) do
+  begin
+    x := sqlite3_value_int64(Argv[i]);
+    if IdxStr[i + 1] = '1' then
+      c.Start := x
+    else if IdxStr[i + 1] = '2' then
+      c.Stop := x
+    else
+      c.Step := x;
+    Inc(i);
+  end;
+  if c.Step <= 0 then
+    c.Step := 1;
+  c.I := c.Start;
+  Result := SQLITE_OK;
+end;
+
+function SerNext(Cur: TSqlite3VtabCursor): Integer;
+begin
+  (Cur as TSerCur).I := (Cur as TSerCur).I + (Cur as TSerCur).Step;
+  Result := SQLITE_OK;
+end;
+
+function SerEof(Cur: TSqlite3VtabCursor): Integer;
+begin
+  Result := Ord((Cur as TSerCur).I > (Cur as TSerCur).Stop);
+end;
+
+function SerColumn(Cur: TSqlite3VtabCursor; Ctx: TSqlite3Context; I: Integer): Integer;
+var
+  c: TSerCur;
+begin
+  c := Cur as TSerCur;
+  case I of
+    0: sqlite3_result_int64(Ctx, c.I);
+    1: sqlite3_result_int64(Ctx, c.Start);
+    2: sqlite3_result_int64(Ctx, c.Stop);
+  else
+    sqlite3_result_int64(Ctx, c.Step);
+  end;
+  Result := SQLITE_OK;
+end;
+
+function SerRowid(Cur: TSqlite3VtabCursor; out Rowid: Integer): Integer;
+begin
+  Rowid := (Cur as TSerCur).I;
+  Result := SQLITE_OK;
+end;
+
+function KvInit(Db: TSqlite3; const Argv: TSqlite3StrArray; out Vtab: TSqlite3Vtab; const What: string): Integer;
+var
+  i: Integer;
+  o: string;
+  t: TKvTab;
+begin
+  Vtab := nil;
+  o := 'V ' + What;
+  for i := 0 to High(Argv) do
+    o := o + ' ' + Argv[i];
+  WriteLn(o);
+  Result := sqlite3_declare_vtab(Db, 'CREATE TABLE x(k TEXT, v)');
+  if Result = SQLITE_OK then
+  begin
+    t := TKvTab.Create;
+    t.Next := 1;
+    t.Db := Db;
+    Vtab := t;
+  end;
+end;
+
+function KvCreate(Db: TSqlite3; Aux: TObject; const Argv: TSqlite3StrArray; out Vtab: TSqlite3Vtab;
+  var Err: TSqlite3ErrOut): Integer;
+begin
+  Result := KvInit(Db, Argv, Vtab, 'create');
+end;
+
+function KvConnect(Db: TSqlite3; Aux: TObject; const Argv: TSqlite3StrArray; out Vtab: TSqlite3Vtab;
+  var Err: TSqlite3ErrOut): Integer;
+begin
+  Result := KvInit(Db, Argv, Vtab, 'connect');
+end;
+
+function KvDisconnect(Vtab: TSqlite3Vtab): Integer;
+begin
+  WriteLn('V disconnect');
+  Result := 0;
+end;
+
+function KvDestroy(Vtab: TSqlite3Vtab): Integer;
+begin
+  WriteLn('V destroy');
+  Result := 0;
+end;
+
+function KvBestIndex(Vtab: TSqlite3Vtab; Info: TSqlite3IndexInfo): Integer;
+var
+  i: Integer;
+begin
+  Info.IdxNum := 0;
+  Info.EstimatedCost := 100.0;
+  for i := 0 to Info.NConstraint - 1 do
+    if (Info.AConstraint[i].IColumn = -1) and (Info.AConstraint[i].Op = SQLITE_INDEX_CONSTRAINT_EQ) and
+      Info.AConstraint[i].Usable then
+    begin
+      Info.AConstraintUsage[i].ArgvIndex := 1;
+      Info.AConstraintUsage[i].Omit := True;
+      Info.IdxNum := 1;
+      Info.EstimatedCost := 1.0;
+      Info.EstimatedRows := 1;
+      Info.IdxFlags := SQLITE_INDEX_SCAN_UNIQUE;
+      Break;
+    end;
+  Result := SQLITE_OK;
+end;
+
+function KvOpen(Vtab: TSqlite3Vtab; out Cur: TSqlite3VtabCursor): Integer;
+begin
+  Cur := TKvCur.Create;
+  Result := SQLITE_OK;
+end;
+
+function KvClose(Cur: TSqlite3VtabCursor): Integer;
+begin
+  Result := SQLITE_OK;
+end;
+
+procedure KvSkip(C: TKvCur);
+var
+  t: TKvTab;
+begin
+  t := C.Vtab as TKvTab;
+  while (C.I < t.N) and not t.A[C.I].Live do
+    Inc(C.I);
+end;
+
+function KvFilter(Cur: TSqlite3VtabCursor; IdxNum: Integer; const IdxStr: string; HasIdxStr: Boolean;
+  const Argv: TSqlite3ValueArray): Integer;
+var
+  c: TKvCur;
+  t: TKvTab;
+  r: Integer;
+begin
+  c := Cur as TKvCur;
+  t := Cur.Vtab as TKvTab;
+  c.I := 0;
+  c.One := False;
+  if IdxNum = 1 then
+  begin
+    r := sqlite3_value_int64(Argv[0]);
+    c.One := True;
+    while (c.I < t.N) and not (t.A[c.I].Live and (t.A[c.I].Rowid = r)) do
+      Inc(c.I);
+  end
+  else
+    KvSkip(c);
+  Result := SQLITE_OK;
+end;
+
+function KvNext(Cur: TSqlite3VtabCursor): Integer;
+var
+  c: TKvCur;
+begin
+  c := Cur as TKvCur;
+  if c.One then
+    c.I := (Cur.Vtab as TKvTab).N
+  else
+  begin
+    Inc(c.I);
+    KvSkip(c);
+  end;
+  Result := SQLITE_OK;
+end;
+
+function KvEof(Cur: TSqlite3VtabCursor): Integer;
+begin
+  Result := Ord((Cur as TKvCur).I >= (Cur.Vtab as TKvTab).N);
+end;
+
+function KvColumn(Cur: TSqlite3VtabCursor; Ctx: TSqlite3Context; I: Integer): Integer;
+var
+  c: TKvCur;
+  t: TKvTab;
+begin
+  c := Cur as TKvCur;
+  t := Cur.Vtab as TKvTab;
+  Result := SQLITE_OK;
+  if sqlite3_vtab_nochange(Ctx) <> 0 then
+  begin
+    WriteLn('V nochange ', I);
+    Exit;
+  end;
+  if I = 0 then
+    sqlite3_result_text(Ctx, t.A[c.I].K)
+  else
+    sqlite3_result_text(Ctx, t.A[c.I].V);
+end;
+
+function KvRowid(Cur: TSqlite3VtabCursor; out Rowid: Integer): Integer;
+begin
+  Rowid := (Cur.Vtab as TKvTab).A[(Cur as TKvCur).I].Rowid;
+  Result := SQLITE_OK;
+end;
+
+function KvFind(T: TKvTab; R: Integer): Integer;
+var
+  i: Integer;
+begin
+  for i := 0 to T.N - 1 do
+    if T.A[i].Live and (T.A[i].Rowid = R) then
+    begin
+      Result := i;
+      Exit;
+    end;
+  Result := -1;
+end;
+
+{ the text of a value cut to 31 bytes, as snprintf(32) does }
+function Txt31(R: TSqlite3Value): string;
+begin
+  Result := Copy(sqlite3_value_text(R), 1, 31);
+end;
+
+function KvUpdate(Vtab: TSqlite3Vtab; const Argv: TSqlite3ValueArray; var Rowid: Integer): Integer;
+var
+  t: TKvTab;
+  i, r: Integer;
+  k: string;
+  hasK: Boolean;
+begin
+  t := Vtab as TKvTab;
+  WriteLn('V update ', Length(Argv), ' ', sqlite3_vtab_on_conflict(t.Db));
+  Result := SQLITE_OK;
+  if Length(Argv) = 1 then
+  begin
+    i := KvFind(t, sqlite3_value_int64(Argv[0]));
+    if i >= 0 then
+      t.A[i].Live := False;
+    Exit;
+  end;
+  if sqlite3_value_type(Argv[0]) = SQLITE_NULL then
+  begin
+    hasK := sqlite3_value_type(Argv[2]) <> SQLITE_NULL;
+    k := sqlite3_value_text(Argv[2]);
+    if hasK and (k = 'bad') then
+    begin
+      Vtab.ErrMsg := 'kv refuses ' + k;
+      Vtab.HasErrMsg := True;
+      Result := SQLITE_CONSTRAINT;
+      Exit;
+    end;
+    if t.N >= 64 then
+    begin
+      Result := SQLITE_FULL;
+      Exit;
+    end;
+    if sqlite3_value_type(Argv[1]) = SQLITE_NULL then
+      r := t.Next
+    else
+      r := sqlite3_value_int64(Argv[1]);
+    if r >= t.Next then
+      t.Next := r + 1;
+    i := t.N;
+    Inc(t.N);
+    SetLength(t.A, t.N);
+    t.A[i].Rowid := r;
+    t.A[i].Live := True;
+    t.A[i].K := Copy(k, 1, 31);
+    t.A[i].V := Txt31(Argv[3]);
+    Rowid := r;
+    Exit;
+  end;
+  i := KvFind(t, sqlite3_value_int64(Argv[0]));
+  if i >= 0 then
+  begin
+    t.A[i].Rowid := sqlite3_value_int64(Argv[1]);
+    if sqlite3_value_nochange(Argv[2]) = 0 then
+      t.A[i].K := Txt31(Argv[2]);
+    if sqlite3_value_nochange(Argv[3]) = 0 then
+      t.A[i].V := Txt31(Argv[3]);
+  end;
+end;
+
+function KvBegin(Vtab: TSqlite3Vtab): Integer;
+begin
+  WriteLn('V begin');
+  Result := SQLITE_OK;
+end;
+
+function KvSync(Vtab: TSqlite3Vtab): Integer;
+begin
+  WriteLn('V sync');
+  Result := SQLITE_OK;
+end;
+
+function KvCommit(Vtab: TSqlite3Vtab): Integer;
+begin
+  WriteLn('V commit');
+  Result := SQLITE_OK;
+end;
+
+function KvRollback(Vtab: TSqlite3Vtab): Integer;
+begin
+  WriteLn('V rollback');
+  Result := SQLITE_OK;
+end;
+
+function KvRename(Vtab: TSqlite3Vtab; const NewName: string): Integer;
+begin
+  WriteLn('V rename ', NewName);
+  Result := SQLITE_OK;
+end;
+
+function KvIntegrity(Vtab: TSqlite3Vtab; const Schema, TabName: string; MFlags: Integer;
+  var Err: TSqlite3ErrOut): Integer;
+begin
+  WriteLn('V integrity ', Schema, ' ', TabName, ' ', MFlags);
+  if TabName = 'k4' then
+  begin
+    Err.Msg := 'kv finds ' + Schema + '.' + TabName + ' wanting';
+    Err.Has := True;
+  end;
+  Result := SQLITE_OK;
+end;
+
+procedure KvMatch(Ctx: TSqlite3Context; Argc: Integer; const Argv: array of TSqlite3Value);
+var
+  ha, hb: Boolean;
+begin
+  ha := sqlite3_value_type(Argv[0]) <> SQLITE_NULL;
+  hb := sqlite3_value_type(Argv[1]) <> SQLITE_NULL;
+  sqlite3_result_int64(Ctx, Ord(ha and hb and (Pos(sqlite3_value_text(Argv[0]), sqlite3_value_text(Argv[1])) > 0)));
+end;
+
+function KvFindFunction(Vtab: TSqlite3Vtab; NArg: Integer; const Name: string; out XFunc: TSqlite3Func;
+  out Arg: TObject): Integer;
+begin
+  XFunc := nil;
+  Arg := nil;
+  Result := 0;
+  if (Name = 'match') and (NArg = 2) then
+  begin
+    XFunc := @KvMatch;
+    Result := 1;
+  end;
+end;
+
+procedure MakeTestModules(Db: TSqlite3);
+var
+  ser, kv: TSqlite3Module;
+begin
+  ser := TSqlite3Module.Create;
+  ser.XConnect := @SerConnect;
+  ser.XBestIndex := @SerBestIndex;
+  ser.XDisconnect := @SerDisconnect;
+  ser.XOpen := @SerOpen;
+  ser.XClose := @SerClose;
+  ser.XFilter := @SerFilter;
+  ser.XNext := @SerNext;
+  ser.XEof := @SerEof;
+  ser.XColumn := @SerColumn;
+  ser.XRowid := @SerRowid;
+  sqlite3_create_module(Db, 'series', ser, nil);
+  kv := TSqlite3Module.Create;
+  kv.XCreate := @KvCreate;
+  kv.XConnect := @KvConnect;
+  kv.XBestIndex := @KvBestIndex;
+  kv.XDisconnect := @KvDisconnect;
+  kv.XDestroy := @KvDestroy;
+  kv.XOpen := @KvOpen;
+  kv.XClose := @KvClose;
+  kv.XFilter := @KvFilter;
+  kv.XNext := @KvNext;
+  kv.XEof := @KvEof;
+  kv.XColumn := @KvColumn;
+  kv.XRowid := @KvRowid;
+  kv.XUpdate := @KvUpdate;
+  kv.XBegin := @KvBegin;
+  kv.XSync := @KvSync;
+  kv.XCommit := @KvCommit;
+  kv.XRollback := @KvRollback;
+  kv.XFindFunction := @KvFindFunction;
+  kv.XRename := @KvRename;
+  kv.IVersion := 4;
+  kv.XIntegrity := @KvIntegrity;
+  sqlite3_create_module(Db, 'kv', kv, nil);
+end;
+
+{ backup_to(FILE, NPAGE): the main database backed up into FILE, NPAGE
+  pages a step, each step printed }
+procedure BackupToFunc(Ctx: TSqlite3Context; Argc: Integer; const Argv: array of TSqlite3Value);
+var
+  src, dest: TSqlite3;
+  b: TSqlite3Backup;
+  rc, np: Integer;
+begin
+  src := sqlite3_context_db_handle(Ctx);
+  np := sqlite3_value_int(Argv[1]);
+  rc := sqlite3_open_v2(sqlite3_value_text(Argv[0]), dest, SQLITE_OPEN_READWRITE or SQLITE_OPEN_CREATE, '');
+  b := sqlite3_backup_init(dest, 'main', src, 'main');
+  if b = nil then
+  begin
+    WriteLn('B init ', sqlite3_errcode(dest), ' ', HexS(sqlite3_errmsg(dest), False));
+    sqlite3_close(dest);
+    sqlite3_result_int64(Ctx, -1);
+    Exit;
+  end;
+  repeat
+    rc := sqlite3_backup_step(b, np);
+    WriteLn('B step ', rc, ' ', sqlite3_backup_remaining(b), ' ', sqlite3_backup_pagecount(b));
+  until rc <> SQLITE_OK;
+  rc := sqlite3_backup_finish(b);
+  WriteLn('B finish ', rc, ' ', sqlite3_errcode(dest));
+  WriteLn('B close ', sqlite3_close(dest));
+  sqlite3_result_int64(Ctx, rc);
+end;
+
+{ ser(SCHEMA): the database's bytes; deser(SCHEMA, BLOB): the database
+  made those bytes, in memory }
+procedure SerFunc(Ctx: TSqlite3Context; Argc: Integer; const Argv: array of TSqlite3Value);
+var
+  sz: Int64;
+  data: string;
+begin
+  data := sqlite3_serialize(sqlite3_context_db_handle(Ctx), sqlite3_value_text(Argv[0]), sz, 0);
+  WriteLn('Ser ', sz, ' ', Ord(sz >= 0));
+  if sz >= 0 then
+    sqlite3_result_blob(Ctx, data);
+end;
+
+procedure DeserFunc(Ctx: TSqlite3Context; Argc: Integer; const Argv: array of TSqlite3Value);
+var
+  data: string;
+  rc: Integer;
+begin
+  data := sqlite3_value_blob(Argv[1]);
+  rc := sqlite3_deserialize(sqlite3_context_db_handle(Ctx), sqlite3_value_text(Argv[0]), data, Length(data),
+    Length(data), SQLITE_DESERIALIZE_FREEONCLOSE or SQLITE_DESERIALIZE_RESIZEABLE);
+  WriteLn('Deser ', rc);
+  sqlite3_result_int64(Ctx, rc);
+end;
+
+{ fpdigits(N): SQLITE_DBCONFIG_FP_DIGITS set to N (0 leaves it); the
+  digits after }
+procedure FpDigitsFunc(Ctx: TSqlite3Context; Argc: Integer; const Argv: array of TSqlite3Value);
+var
+  rc, o: Integer;
+begin
+  rc := sqlite3_db_config(sqlite3_context_db_handle(Ctx), SQLITE_DBCONFIG_FP_DIGITS, sqlite3_value_int(Argv[0]), o);
+  sqlite3_result_int(Ctx, rc * 1000 + o);
+end;
+
+{ the oracle's test collations: rev (reverse order, UTF-8), len16 and
+  lenbe (shorter first, then the bytes; UTF-16LE and UTF-16BE), and lazy,
+  made when asked for }
+function RevCmp(PUser: TObject; const A, B: string): Integer;
+var
+  r: Integer;
+begin
+  r := ByteCmp(A, B);
+  if r < 0 then
+    Result := 1
+  else if r > 0 then
+    Result := -1
+  else
+    Result := 0;
+end;
+
+function LenCmp(PUser: TObject; const A, B: string): Integer;
+var
+  r: Integer;
+begin
+  if Length(A) <> Length(B) then
+  begin
+    if Length(A) < Length(B) then
+      Result := -1
+    else
+      Result := 1;
+    Exit;
+  end;
+  r := ByteCmp(A, B);
+  if r < 0 then
+    Result := -1
+  else if r > 0 then
+    Result := 1
+  else
+    Result := 0;
+end;
+
+procedure CollNeeded(Arg: TObject; Db: TSqlite3; Enc: Integer; const Name: string);
+begin
+  WriteLn('N ', Enc, ' ', Name);
+  if Name = 'lazy' then
+    sqlite3_create_collation(Db, 'lazy', SQLITE_UTF8, nil, @RevCmp);
+end;
+
+var
+  sql, rest, tail, z, o: string;
+  db: TSqlite3;
+  st: TSqlite3Stmt;
+  rc, i, ncol, t, off: Integer;
+  d: Double;
+  bits: Integer;
+  isNull: Boolean;
+  np, k, brc: Integer;
+begin
+  ReadFile(ParamStr(2), sql);
+  sqlite3_config_log(@LogCb, nil);
+  rc := sqlite3_open_v2(ParamStr(1), db, SQLITE_OPEN_READWRITE or SQLITE_OPEN_CREATE, '');
+  MakeTestModules(db);
+  sqlite3_create_function(db, 'backup_to', 2, SQLITE_UTF8, nil, @BackupToFunc, nil, nil);
+  sqlite3_create_function(db, 'ser', 1, SQLITE_UTF8, nil, @SerFunc, nil, nil);
+  sqlite3_create_function(db, 'deser', 2, SQLITE_UTF8, nil, @DeserFunc, nil, nil);
+  sqlite3_create_function(db, 'fpdigits', 1, SQLITE_UTF8, nil, @FpDigitsFunc, nil, nil);
+  sqlite3_create_collation(db, 'rev', SQLITE_UTF8, nil, @RevCmp);
+  sqlite3_create_collation(db, 'len16', SQLITE_UTF16LE, nil, @LenCmp);
+  sqlite3_create_collation(db, 'lenbe', SQLITE_UTF16BE, nil, @LenCmp);
+  sqlite3_collation_needed(db, nil, @CollNeeded);
+  { a third argument: the new database's encoding, set before the script }
+  if ParamCount >= 3 then
+    sqlite3_exec(db, 'PRAGMA encoding=''' + ParamStr(3) + '''', nil, nil, z);
+  WriteLn('O ', rc, ' ', sqlite3_extended_errcode(db), ' ', HexS(sqlite3_errmsg(db), False));
+  i := Pos(#0, sql);
+  if i > 0 then
+    sql := Copy(sql, 1, i - 1);
+  rest := sql;
+  while rest <> '' do
+  begin
+    st := nil;
+    rc := sqlite3_prepare_v2(db, rest, st, tail);
+    off := Length(sql) - Length(tail);
+    WriteLn('P ', rc, ' ', sqlite3_extended_errcode(db), ' ', off, ' ', HexS(sqlite3_errmsg(db), False));
+    if rc <> 0 then
+    begin
+      if Length(tail) >= Length(rest) then
+        Break;
+      rest := tail;
+      Continue;
+    end;
+    rest := tail;
+    if st = nil then
+      Continue;
+    WriteLn('S ', HexS(sqlite3_sql(st), False), ' ', sqlite3_stmt_readonly(st), ' ', sqlite3_stmt_isexplain(st), ' ',
+      sqlite3_bind_parameter_count(st));
+    { every parameter bound, by its index: an integer, a real, a text, a
+      blob, NULL and a zeroblob in turn; its name and the bind's answer }
+    np := sqlite3_bind_parameter_count(st);
+    if np > 0 then
+    begin
+      o := 'B ' + IntToStr(np);
+      for k := 1 to np do
+      begin
+        z := sqlite3_bind_parameter_name(st, k, isNull);
+        case k mod 6 of
+          0: brc := sqlite3_bind_int64(st, k, k * 1000 + 7);
+          1: brc := sqlite3_bind_double(st, k, k + 0.25);
+          2: brc := sqlite3_bind_text(st, k, 'p' + IntToStr(k));
+          3: brc := sqlite3_bind_blob(st, k, Chr(k and 255) + Chr(255));
+          4: brc := sqlite3_bind_null(st, k);
+        else
+          brc := sqlite3_bind_zeroblob(st, k, k);
+        end;
+        o := o + ' ' + HexS(z, isNull) + ':' + IntToStr(brc);
+      end;
+      WriteLn(o, ' ', sqlite3_bind_parameter_index(st, '$x'));
+    end;
+    ncol := sqlite3_column_count(st);
+    o := 'C ' + IntToStr(ncol);
+    for i := 0 to ncol - 1 do
+    begin
+      z := sqlite3_column_name(st, i);
+      o := o + ' ' + HexS(z, False);
+      z := sqlite3_column_decltype(st, i, isNull);
+      o := o + '/' + HexS(z, isNull);
+    end;
+    WriteLn(o);
+    rc := sqlite3_step(st);
+    while rc = SQLITE_ROW do
+    begin
+      o := 'R';
+      for i := 0 to ncol - 1 do
+      begin
+        t := sqlite3_column_type(st, i);
+        o := o + ' ' + IntToStr(t) + ':';
+        if t = SQLITE_FLOAT then
+        begin
+          d := sqlite3_column_double(st, i);
+          Move(d, bits, 8);
+          o := o + Hex16(bits) + ':';
+        end;
+        if t = SQLITE_BLOB then
+        begin
+          { sqlite3_column_blob is NULL for an empty blob }
+          z := sqlite3_column_blob(st, i);
+          o := o + HexS(z, z = '');
+        end
+        else
+        begin
+          z := sqlite3_column_text(st, i);
+          o := o + HexS(z, t = SQLITE_NULL);
+        end;
+      end;
+      WriteLn(o);
+      rc := sqlite3_step(st);
+    end;
+    WriteLn('D ', rc, ' ', sqlite3_extended_errcode(db), ' ', HexS(sqlite3_errmsg(db), False));
+    rc := sqlite3_finalize(st);
+    WriteLn('F ', rc, ' ', sqlite3_extended_errcode(db), ' ', sqlite3_changes64(db), ' ', sqlite3_total_changes64(db),
+      ' ', sqlite3_last_insert_rowid(db), ' ', sqlite3_get_autocommit(db));
+  end;
+  rc := sqlite3_close(db);
+  WriteLn('Z ', rc);
+end.
+
+{ This file is part of paslang's tests.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+  paslang is free software under the GNU General Public License,
+  version 3 or (at your option) any later version; see the file
+  COPYING. It comes with ABSOLUTELY NO WARRANTY. }

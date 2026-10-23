@@ -1,0 +1,10 @@
+select 0.1 + 0.2, cast(0.1 + 0.2 as text), upper(0.1 + 0.2), 1.0/3, length(1.0/3);
+select fpdigits(10);
+select 0.1 + 0.2, cast(0.1 + 0.2 as text), upper(0.1 + 0.2), 1.0/3, length(1.0/3), 1e100/3 || '', quote(1.0/3), printf('%s', 1.0/3);
+create table t(a text, b real, c);
+insert into t values(1.0/3, 2.0/3, 1e-7/3);
+select a, b, c, typeof(a), c || '' from t;
+select fpdigits(3), fpdigits(4), fpdigits(23), fpdigits(24), fpdigits(0);
+select 1.0/7 || '';
+select fpdigits(17);
+select 1.0/7 || '', a from t;
