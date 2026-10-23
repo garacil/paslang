@@ -573,6 +573,9 @@ GOLDEN_A64 += gcdeadreg
 # P439: signals as the os/signal of Go sends them, uses passignal; on arm64 in
 # its own block, whose children run under qemu.
 GOLDEN += signals
+# P434: the HTTP server, every limit, deadline, error and feature.
+GOLDEN += httpsrv
+GOLDEN_A64 += httpsrv
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -605,6 +608,7 @@ LIB_UNITS := \
 	src/lib/pastime.paslang \
 	src/lib/pasx11.paslang \
 	src/rtl/sysutils.paslang \
+	src/lib/httpserver.paslang \
 	src/lib/sqlite.paslang
 
 all: $(OUTDIR)/paslangc $(if $(AMD64),core libs) $(if $(ARM64),core-arm64 libs-arm64) $(OUTDIR)/pasdbg
@@ -2505,6 +2509,14 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/signals.out $(BUILDDIR)/signals0.got; \
 	echo ok signals0
 	@set -e; \
+	: P434: the HTTP server on the base processor with no inlining, and the sockets systemd passes as sd_listen_fds gives them; \
+	$(OUTDIR)/paslangc -cpu base -inline 0 -o $(BUILDDIR)/httpsrv0 testdata/httpsrv.paslang; \
+	timeout 300 $(BUILDDIR)/httpsrv0 > $(BUILDDIR)/httpsrv0.got; \
+	diff -u testdata/httpsrv.out $(BUILDDIR)/httpsrv0.got; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/httpsrv-sd testdata/httpsrv.paslang; \
+	timeout 300 python3 -I scripts/check_httpsystemd.py $(BUILDDIR)/httpsrv-sd; \
+	echo ok httpsrv0
+	@set -e; \
 	echo "==== index checks ===="; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/bce_s testdata/bce.paslang; \
 	if sed -n '/^p_table:/,/cfi_endproc/p' $(BUILDDIR)/bce_s.s | grep -q 'call rt_boundsfail'; then echo "bce: p_table kept a bounds check the loop does not need"; exit 1; fi; \
@@ -4213,7 +4225,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(BUILDDIR)/ex_usegeom > $(BUILDDIR)/ex_usegeom.got; \
 	diff -u examples/units/usegeom.out $(BUILDDIR)/ex_usegeom.got; \
 	python3 scripts/check_examples.py; \
-	for t in httpd dnsd termd ftpd ntpd wsd chat proxy jsonrpc; do \
+	for t in httpd dnsd termd ftpd ntpd wsd chat proxy jsonrpc apisrv; do \
 	  $(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/ex_$$t examples/$$t.paslang; \
 	  timeout 120 $(BUILDDIR)/ex_$$t -selftest 2000 > $(BUILDDIR)/ex_$$t.got; \
 	  diff -u examples/$$t.out $(BUILDDIR)/ex_$$t.got; \
@@ -5376,7 +5388,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	echo ok debug-console-arm; \
 	echo "==== network servers arm64 ===="; \
 	$(OUTDIR)/paslangc -target arm64 -c src/lib/pasnet.paslang; \
-	for t in httpd dnsd termd ftpd ntpd wsd chat proxy; do \
+	for t in httpd dnsd termd ftpd ntpd wsd chat proxy apisrv; do \
 	  $(OUTDIR)/paslangc -target arm64 -Fu $(BUILDDIR)/a64 -o $(BUILDDIR)/ex_$$t-arm examples/$$t.paslang; \
 	  timeout 120 $(QEMU_A64) $(BUILDDIR)/ex_$$t-arm -selftest 300 > $(BUILDDIR)/ex_$$t-arm.got; \
 	done; \
@@ -5388,6 +5400,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	echo "300 clients, 900 frames, 900 echoed, 0 bad" | diff -u - $(BUILDDIR)/ex_wsd-arm.got; \
 	echo "300 clients, 300 said, 2700 delivered of 2700, 0 bad" | diff -u - $(BUILDDIR)/ex_chat-arm.got; \
 	echo "300 clients, 300 forwarded, 900 requests, 900 served, 0 bad" | diff -u - $(BUILDDIR)/ex_proxy-arm.got; \
+	echo "300 clients, 900 requests, 900 served, 0 bad" | diff -u - $(BUILDDIR)/ex_apisrv-arm.got; \
 	: P210 JSON-RPC over NDJSON, its 2000 clients under qemu too; \
 	$(OUTDIR)/paslangc -target arm64 -Fu $(BUILDDIR)/a64 -o $(BUILDDIR)/ex_jsonrpc-arm examples/jsonrpc.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/ex_jsonrpc-arm -selftest 2000 > $(BUILDDIR)/ex_jsonrpc-arm.got; \
@@ -5546,6 +5559,14 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=3 PASLANG_GCPOISON=1 timeout 1800 $(QEMU_A64) $(BUILDDIR)/signals0-arm $(QEMU_A64) > $(BUILDDIR)/signals0-arm.vgot; \
 	diff -u testdata/signals.out $(BUILDDIR)/signals0-arm.vgot; \
 	echo ok signals-arm
+	@set -e; \
+	: P434 on arm64: the HTTP server with no inlining under qemu, and the sockets systemd passes through it; \
+	$(OUTDIR)/paslangc -target arm64 -cpu base -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/httpsrv0-arm testdata/httpsrv.paslang; \
+	timeout 600 $(QEMU_A64) $(BUILDDIR)/httpsrv0-arm > $(BUILDDIR)/httpsrv0-arm.got; \
+	diff -u testdata/httpsrv.out $(BUILDDIR)/httpsrv0-arm.got; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -Fu $(A64DIR) -o $(BUILDDIR)/httpsrv-sd-arm testdata/httpsrv.paslang; \
+	timeout 600 python3 -I scripts/check_httpsystemd.py $(BUILDDIR)/httpsrv-sd-arm $(QEMU_A64); \
+	echo ok httpsrv-arm
 
 install: all installdirs
 	$(NORMAL_INSTALL)

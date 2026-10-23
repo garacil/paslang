@@ -1,0 +1,204 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+
+  paslang is free software: you can redistribute it and/or modify it
+  under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+
+  paslang is distributed in the hope that it will be useful, but
+  WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+  General Public License for more details.
+
+  You should have received a copy of the GNU General Public License
+  along with paslang.  If not, see <https://www.gnu.org/licenses/>. }
+
+{ A JSON API on uses httpserver (P434): a router with a parameter, a
+  JSON body read and a JSON answer, a routine per connection. It serves
+  until SIGTERM or SIGINT and then lets what is in flight finish.
+
+    apisrv [port]          serve on 127.0.0.1 (8080 by default)
+    apisrv -selftest [n]   n client routines in this process, each
+                           GET /hello, GET /api/items/:id and POST
+                           /api/items on one kept connection
+
+  make check runs the self-test on both machines, and
+  scripts/bench/servers.py runs it against its Go twin. }
+program apisrv;
+
+uses
+  httpserver, passignal, pasnet, sysutils;
+
+const
+  Requests = 3;
+
+var
+  served, bad: Integer;
+  done: waitgroup;
+  srv: THttpServer;
+
+procedure Hello(Req: THttpRequest; Resp: THttpResponse);
+begin
+  AtomicAdd(@served, 1);
+  Resp.ReplyText(200, 'hello' + #10);
+end;
+
+procedure GetItem(Req: THttpRequest; Resp: THttpResponse);
+var
+  id: Integer;
+begin
+  AtomicAdd(@served, 1);
+  if not TryStrToInt(Req.Param('id'), id) then
+  begin
+    Resp.ReplyError(400, 'bad id');
+    Exit;
+  end;
+  Resp.ReplyJson(200, JsonObject(['id', id, 'name', 'item ' + IntToStr(id)]));
+end;
+
+procedure AddItem(Req: THttpRequest; Resp: THttpResponse);
+var
+  j: json;
+begin
+  AtomicAdd(@served, 1);
+  j := Req.ReadJson;
+  Resp.ReplyJson(201, JsonObject(['id', j['id'].AsInteger + 1, 'name', j['name'].AsString]));
+end;
+
+{ the status line of an answer and its body by Content-Length, read
+  through Buf, which keeps what comes after it }
+function Answer(C: Integer; var Buf: string; out Status: string): string;
+var
+  part, head: string;
+  i, k, e, n: Integer;
+begin
+  Result := '';
+  Status := '';
+  i := Pos(#13#10#13#10, Buf);
+  while i = 0 do
+  begin
+    NetRead(C, 1024, part);
+    if part = '' then
+      Exit;
+    Buf := Buf + part;
+    i := Pos(#13#10#13#10, Buf);
+  end;
+  head := Copy(Buf, 1, i + 1);
+  Buf := Copy(Buf, i + 4, Length(Buf) - i - 3);
+  Status := Copy(head, 1, Pos(#13#10, head) - 1);
+  k := Pos('Content-Length: ', head);
+  if k = 0 then
+    Exit;
+  e := Pos(#13#10, head, k);
+  n := StrToIntDef(Copy(head, k + 16, e - k - 16), -1);
+  while Length(Buf) < n do
+  begin
+    NetRead(C, 1024, part);
+    if part = '' then
+      Exit;
+    Buf := Buf + part;
+  end;
+  Result := Copy(Buf, 1, n);
+  Buf := Copy(Buf, n + 1, Length(Buf) - n);
+end;
+
+procedure Client(Port, Id: Integer);
+var
+  c, k: Integer;
+  buf, body, status, want: string;
+  ok: Boolean;
+begin
+  c := TcpConnectTo('127.0.0.1', Port);
+  if c < 0 then
+  begin
+    AtomicAdd(@bad, 1);
+    done.Done;
+    Exit;
+  end;
+  buf := '';
+  for k := 1 to Requests do
+  begin
+    case k of
+      1:
+        begin
+          TcpWrite(c, 'GET /hello HTTP/1.1' + #13#10 + 'Host: self' + #13#10 + #13#10);
+          want := 'hello' + #10;
+        end;
+      2:
+        begin
+          TcpWrite(c, 'GET /api/items/' + IntToStr(Id) + ' HTTP/1.1' + #13#10 + 'Host: self' + #13#10 + #13#10);
+          want := '{"id":' + IntToStr(Id) + ',"name":"item ' + IntToStr(Id) + '"}';
+        end;
+    else
+      body := '{"id":' + IntToStr(Id) + ',"name":"new"}';
+      TcpWrite(c, 'POST /api/items HTTP/1.1' + #13#10 + 'Host: self' + #13#10 +
+        'Content-Type: application/json' + #13#10 + 'Content-Length: ' + IntToStr(Length(body)) + #13#10 +
+        #13#10 + body);
+      want := '{"id":' + IntToStr(Id + 1) + ',"name":"new"}';
+    end;
+    body := Answer(c, buf, status);
+    ok := ((k < 3) and (status = 'HTTP/1.1 200 OK')) or ((k = 3) and (status = 'HTTP/1.1 201 Created'));
+    if not ok or (body <> want) then
+    begin
+      AtomicAdd(@bad, 1);
+      Break;
+    end;
+  end;
+  TcpClose(c);
+  done.Done;
+end;
+
+procedure Serve(S: THttpServer);
+begin
+  S.Serve;
+end;
+
+procedure SelfTest(N: Integer);
+var
+  i, lim: Integer;
+begin
+  lim := RaiseFdLimit;
+  if lim < 2 * N + 64 then
+    N := (lim - 64) div 2;
+  srv.AccessLog := False;
+  if not srv.ListenTcp('127.0.0.1', 0) then
+  begin
+    WriteLn('apisrv: cannot listen');
+    Halt(1);
+  end;
+  pas Serve(srv);
+  done.Add(N);
+  for i := 1 to N do
+    pas Client(srv.Port, i);
+  done.Wait;
+  srv.Shutdown;
+  WriteLn(N, ' clients, ', N * Requests, ' requests, ', served, ' served, ', bad, ' bad');
+  if (served <> N * Requests) or (bad <> 0) then
+    Halt(1);
+end;
+
+var
+  router: THttpRouter;
+  port: Integer;
+
+begin
+  router := THttpRouter.Create;
+  router.Handle('GET', '/hello', @Hello);
+  router.Handle('GET', '/api/items/:id', @GetItem);
+  router.Handle('POST', '/api/items', @AddItem);
+  srv := THttpServer.Create(router);
+  if ParamStr(1) = '-selftest' then
+  begin
+    SelfTest(StrToIntDef(ParamStr(2), 2000));
+    Exit;
+  end;
+  port := StrToIntDef(ParamStr(1), 8080);
+  if not srv.ListenTcp('127.0.0.1', port) then
+  begin
+    WriteLn('apisrv: cannot listen on ', port);
+    Halt(1);
+  end;
+  WriteLn('apisrv: listening on 127.0.0.1:', srv.Port);
+  WriteLn('apisrv: stopped on ', SignalName(srv.ServeUntilSignal));
+end.

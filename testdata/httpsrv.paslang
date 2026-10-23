@@ -1,0 +1,668 @@
+{ P434: uses httpserver against requests written byte by byte. A
+  server on TCP at 127.0.0.1 and one on a Unix socket with its mode and
+  group; keep-alive, HTTP/1.0, HEAD; the router's parameters, 404 and
+  405 with Allow; the query, a percent-decoded path, cookies read and
+  set; JSON in and out; a chunked request and a chunked answer; 100
+  Continue; every limit (431 for the head's size and for its count of
+  lines, 413 by Content-Length and in a chunked body) and every
+  deadline (the first request, the head, the body, between requests,
+  the answer); the protocol's errors (400, 501, 505, 417); an exception
+  that is a 500 and an EHttpError its own status; a multipart upload of
+  three parts, one of 300000 bytes, its SHA-256 checked; a file
+  answered by sendfile with Content-Disposition; 200 clients of three
+  requests each at once; Shutdown with a request in flight, which
+  finishes; and SIGTERM ending ServeUntilSignal. Every answer is
+  printed with its Date line taken out. }
+program httpsrv;
+
+uses
+  httpserver, passignal, pasnet, paslib, sysutils;
+
+var
+  Srv, Dl: THttpServer;
+  Router: THttpRouter;
+  Port: Integer;
+  LogMu: mutex;
+  Logs: TStringArray;
+  Big: string;
+  Payload: string;
+  FilePath: string;
+  served, bad: Integer;
+  clients: waitgroup;
+
+{ ---- handlers ---- }
+
+procedure HHello(Req: THttpRequest; Resp: THttpResponse);
+begin
+  Resp.ReplyText(200, 'hello' + #10);
+end;
+
+procedure HItem(Req: THttpRequest; Resp: THttpResponse);
+var
+  ys: TStringArray;
+begin
+  ys := Req.QueryValues('y');
+  Resp.Header.Put('X-Item', Req.Param('id'));
+  Resp.ReplyJson(200, JsonParse('{"id":' + JsonEncode(JsonOf(Req.Param('id'))) + ',"x":' +
+    JsonEncode(JsonOf(Req.Query('x'))) + ',"ys":' + IntToStr(Length(ys)) + ',"y1":' +
+    JsonEncode(JsonOf(ys[1])) + ',"z":' + JsonEncode(JsonOf(Req.HasQuery('z'))) + '}'));
+end;
+
+procedure HCreate(Req: THttpRequest; Resp: THttpResponse);
+var
+  j: json;
+begin
+  j := Req.ReadJson(8);
+  Resp.ReplyJson(201, JsonParse('{"name":' + JsonEncode(j['name']) + ',"n":' + IntToStr(j['n'].AsInteger + 1) + '}'));
+end;
+
+procedure HFiles(Req: THttpRequest; Resp: THttpResponse);
+begin
+  Resp.ReplyText(200, 'path=[' + Req.Param('path') + '] decoded=[' + Req.Path + ']' + #10);
+end;
+
+procedure HCookie(Req: THttpRequest; Resp: THttpResponse);
+var
+  c: THttpCookie;
+begin
+  c := Default(THttpCookie);
+  c.Name := 'session';
+  c.Value := 'abc 123';
+  c.Path := '/app';
+  c.MaxAge := 3600;
+  c.HttpOnly := True;
+  c.Secure := True;
+  c.SameSite := 'Strict';
+  Resp.SetCookie(c);
+  c := Default(THttpCookie);
+  c.Name := 'old';
+  c.MaxAge := -1;
+  Resp.SetCookie(c);
+  Resp.ReplyText(200, 'sid=[' + Req.Cookie('sid') + '] has a ' + BoolToStr(Req.HasCookie('a'), True) +
+    ' has bad ' + BoolToStr(Req.HasCookie('bad'), True) + ' has nope ' + BoolToStr(Req.HasCookie('nope'), True) + #10);
+end;
+
+procedure HEcho(Req: THttpRequest; Resp: THttpResponse);
+begin
+  Resp.ReplyText(200, 'got [' + Req.ReadAllBody + ']' + #10);
+end;
+
+procedure HStream(Req: THttpRequest; Resp: THttpResponse);
+var
+  i: Integer;
+begin
+  Resp.Header.Put('Content-Type', 'text/plain');
+  for i := 1 to 3 do
+    Resp.WriteData(StringOfChar(Chr(Ord('a') + i - 1), 10000));
+end;
+
+procedure HFail(Req: THttpRequest; Resp: THttpResponse);
+begin
+  raise Exception.Create('boom');
+end;
+
+procedure HTeapot(Req: THttpRequest; Resp: THttpResponse);
+begin
+  raise EHttpError.CreateStatus(418, 'short and stout');
+end;
+
+procedure HUpload(Req: THttpRequest; Resp: THttpResponse);
+var
+  m: THttpMultipart;
+  p: THttpPart;
+  answer, data: string;
+begin
+  m := Req.Multipart;
+  answer := '';
+  p := m.Next;
+  while p <> nil do
+  begin
+    data := p.ReadAllData(1048576);
+    answer := answer + 'part name=[' + p.Name + '] file=[' + p.FileName + '] type=[' + p.ContentType + '] ' +
+      IntToStr(Length(data)) + ' bytes sha256 ' + Copy(Hex(Sha256(data)), 1, 16) + #10;
+    p := m.Next;
+  end;
+  Resp.ReplyText(200, answer);
+end;
+
+procedure HDownload(Req: THttpRequest; Resp: THttpResponse);
+begin
+  Resp.ServeFile(FilePath, 'application/pdf', 'informe año.pdf');
+end;
+
+procedure HMissing(Req: THttpRequest; Resp: THttpResponse);
+begin
+  Resp.ServeFile(FilePath + '.none', 'application/pdf', '');
+end;
+
+procedure HSlow(Req: THttpRequest; Resp: THttpResponse);
+begin
+  Sleep(300);
+  Resp.ReplyText(200, 'slow done' + #10);
+end;
+
+procedure HBig(Req: THttpRequest; Resp: THttpResponse);
+begin
+  Resp.Reply(200, 'application/octet-stream', Big);
+end;
+
+procedure HHeadOnly(Req: THttpRequest; Resp: THttpResponse);
+begin
+  Resp.Redirect(303, '/hello');
+end;
+
+procedure HPrivate(Req: THttpRequest; Resp: THttpResponse);
+begin
+  Resp.ReplyText(200, 'private data' + #10);
+end;
+
+procedure HForm(Req: THttpRequest; Resp: THttpResponse);
+var
+  tags: TStringArray;
+begin
+  tags := Req.FormValues('tag');
+  Resp.ReplyText(200, 'name=[' + Req.Form('name') + '] tags=' + IntToStr(Length(tags)) + ' has x ' +
+    BoolToStr(Req.HasForm('x'), True) + ' has y ' + BoolToStr(Req.HasForm('y'), True) + #10);
+end;
+
+{ the outer middleware: /private needs X-Token, compared in constant time }
+function Guard(Next: THttpHandler): THttpHandler;
+begin
+  Result := procedure(Req: THttpRequest; Resp: THttpResponse)
+  begin
+    if Copy(Req.Path, 1, 8) = '/private' then
+    begin
+      Resp.Header.Put('X-Guard', 'checked');
+      if not ConstantTimeEqual(Req.Header.Get('X-Token'), 'secret') then
+      begin
+        Resp.ReplyError(401, 'no token');
+        Exit;
+      end;
+    end;
+    Next(Req, Resp);
+  end;
+end;
+
+{ the inner one: a header after the guard's }
+function Tag(Next: THttpHandler): THttpHandler;
+begin
+  Result := procedure(Req: THttpRequest; Resp: THttpResponse)
+  begin
+    if Copy(Req.Path, 1, 8) = '/private' then
+      Resp.Header.Add('X-Order', 'tag after guard');
+    Next(Req, Resp);
+  end;
+end;
+
+procedure CollectLog(const Line: string);
+var
+  n: Integer;
+begin
+  LogMu.Lock;
+  n := Length(Logs);
+  SetLength(Logs, n + 1);
+  Logs[n] := Line;
+  LogMu.Unlock;
+end;
+
+{ ---- the client side ---- }
+
+{ Data out on C, in pieces of Piece bytes when Piece > 0 }
+procedure Put(C: Integer; const Data: string; Piece: Integer = 0);
+var
+  i: Integer;
+begin
+  if Piece <= 0 then
+  begin
+    TcpWrite(C, Data);
+    Exit;
+  end;
+  i := 1;
+  while i <= Length(Data) do
+  begin
+    TcpWrite(C, Copy(Data, i, Piece));
+    i := i + Piece;
+  end;
+end;
+
+{ everything until the server closes, within 20 s }
+function ReadToEnd(C: Integer): string;
+var
+  s: string;
+begin
+  Result := '';
+  while True do
+  begin
+    s := TcpReadDeadline(C, 512, 20000);
+    if s = '' then
+      Break;
+    Result := Result + s;
+  end;
+end;
+
+{ An answer as printed: the Date line out, a long body as its length }
+function Shown(const A: string): string;
+var
+  i, j: Integer;
+  head, body, line: string;
+begin
+  i := Pos(#13#10#13#10, A);
+  if i = 0 then
+  begin
+    Result := '[' + IntToStr(Length(A)) + ' bytes, no head]';
+    Exit;
+  end;
+  head := Copy(A, 1, i + 1);
+  body := Copy(A, i + 4, Length(A) - i - 3);
+  Result := '';
+  while head <> '' do
+  begin
+    j := Pos(#13#10, head);
+    line := Copy(head, 1, j - 1);
+    head := Copy(head, j + 2, Length(head) - j - 1);
+    if Copy(line, 1, 6) <> 'Date: ' then
+      Result := Result + '  ' + line + #10;
+  end;
+  if Length(body) > 300 then
+    Result := Result + '  <' + IntToStr(Length(body)) + ' bytes of body>' + #10
+  else if body <> '' then
+    Result := Result + '  | ' + StringReplace(body, #10, #10 + '  | ', [rfReplaceAll]) + #10;
+end;
+
+{ One request on a new connection to the TCP server, the whole answer }
+function Ask(const Req: string): string;
+var
+  c: Integer;
+begin
+  c := TcpConnectTo('127.0.0.1', Port);
+  Put(c, Req);
+  Result := ReadToEnd(c);
+  TcpClose(c);
+end;
+
+procedure Show(const Title, Req: string);
+begin
+  WriteLn(Title);
+  Write(Shown(Ask(Req)));
+end;
+
+{ The head of an answer and its body by Content-Length or chunked, from a
+  kept connection; Buf keeps what came after it }
+function ReadAnswer(C: Integer; var Buf: string): string;
+var
+  line, head, body, data: string;
+  n, size: Integer;
+  chunked: Boolean;
+begin
+  head := '';
+  n := -1;
+  chunked := False;
+  while TcpReadLine(C, Buf, line) and (line <> '') do
+  begin
+    if Copy(line, 1, 6) <> 'Date: ' then
+      head := head + '  ' + line + #10;
+    if Copy(LowerCase(line), 1, 16) = 'content-length: ' then
+      n := StrToInt(Copy(line, 17, Length(line) - 16));
+    if LowerCase(line) = 'transfer-encoding: chunked' then
+      chunked := True;
+  end;
+  body := '';
+  if chunked then
+  begin
+    while TcpReadLine(C, Buf, line) do
+    begin
+      size := StrToInt('$' + line);
+      if size = 0 then
+      begin
+        TcpReadLine(C, Buf, line);
+        Break;
+      end;
+      TcpReadN(C, size, Buf, data);
+      body := body + data;
+      TcpReadLine(C, Buf, line);
+    end;
+    Result := head + '  <chunked body of ' + IntToStr(Length(body)) + ' bytes: ' + Copy(body, 1, 3) + '...' +
+      Copy(body, Length(body) - 2, 3) + '>' + #10;
+    Exit;
+  end;
+  if n > 0 then
+    TcpReadN(C, n, Buf, body);
+  Result := head;
+  if body <> '' then
+    Result := Result + '  | ' + body;
+end;
+
+{ A client of the load test: Requests GETs on one kept connection }
+procedure LoadClient(Id: Integer);
+var
+  c, k: Integer;
+  buf, a: string;
+begin
+  c := TcpConnectTo('127.0.0.1', Port);
+  buf := '';
+  for k := 1 to 3 do
+  begin
+    Put(c, 'GET /hello HTTP/1.1' + #13#10 + 'Host: load' + #13#10 + #13#10);
+    a := ReadAnswer(c, buf);
+    if Pos('hello', a) > 0 then
+      AtomicAdd(@served, 1)
+    else
+      AtomicAdd(@bad, 1);
+  end;
+  TcpClose(c);
+  clients.Done;
+end;
+
+{ N in octal, for a file's mode }
+function Oct(N: Integer): string;
+begin
+  Result := '';
+  repeat
+    Result := Chr(48 + N mod 8) + Result;
+    N := N div 8;
+  until N = 0;
+end;
+
+procedure RunServer(S: THttpServer);
+begin
+  S.Serve;
+end;
+
+procedure SlowClient(Ch: chan of Integer);
+var
+  a: string;
+begin
+  a := Ask('GET /slow HTTP/1.1' + #13#10 + 'Host: x' + #13#10 + #13#10);
+  WriteLn('in flight during Shutdown:');
+  Write(Shown(a));
+  Send(Ch, 1);
+end;
+
+function UntilSignal(S: THttpServer): Integer;
+begin
+  Result := S.ServeUntilSignal;
+end;
+
+procedure Stopper(S: THttpServer; Ch: chan of Integer);
+begin
+  Send(Ch, S.ServeUntilSignal);
+end;
+
+const
+  H = #13#10;
+
+var
+  c, i, n, mygid, t0: Integer;
+  a, buf, body, boundary, sock, mp: string;
+  st: array[0..31] of Int64;
+  done, stopped: chan of Integer;
+  usrv: THttpServer;
+  usr: THttpRouter;
+  p: string;
+
+begin
+  if ParamStr(1) = 'systemd' then
+  begin
+    { scripts/check_httpsystemd.py passes a TCP socket as 3 and a Unix
+      one as 4, with LISTEN_PID and LISTEN_FDS as systemd sets them }
+    usr := THttpRouter.Create;
+    usr.Handle('GET', '/hello', @HHello);
+    usrv := THttpServer.Create(usr);
+    usrv.AccessLog := False;
+    WriteLn('systemd sockets: ', usrv.ListenSystemd);
+    WriteLn('ready');
+    WriteLn('stopped on ', SignalName(usrv.ServeUntilSignal));
+    Exit;
+  end;
+  Router := THttpRouter.Create;
+  Router.Handle('GET', '/hello', @HHello);
+  Router.Handle('GET', '/api/items/:id', @HItem);
+  Router.Handle('POST', '/api/items', @HCreate);
+  Router.Handle('DELETE', '/api/items/:id', @HHello);
+  Router.Handle('GET', '/files/*path', @HFiles);
+  Router.Handle('GET', '/files/readme', @HHello);
+  Router.Handle('GET', '/cookie', @HCookie);
+  Router.Handle('POST', '/echo', @HEcho, 100);
+  Router.Handle('GET', '/stream', @HStream);
+  Router.Handle('GET', '/fail', @HFail);
+  Router.Handle('GET', '/teapot', @HTeapot);
+  Router.Handle('POST', '/upload', @HUpload, 26214400);
+  Router.Handle('GET', '/download', @HDownload);
+  Router.Handle('GET', '/missing', @HMissing);
+  Router.Handle('GET', '/slow', @HSlow);
+  Router.Handle('GET', '/big', @HBig);
+  Router.Handle('GET', '/see', @HHeadOnly);
+  Router.Handle('GET', '/private/data', @HPrivate);
+  Router.Handle('POST', '/form', @HForm);
+  Router.Use(@Guard);
+  Router.Use(@Tag);
+  Srv := THttpServer.Create(Router);
+  Srv.MaxHeaderBytes := 4096;
+  Srv.MaxHeaders := 20;
+  Srv.ShutdownTimeoutMs := 5000;
+  Srv.LogTo := @CollectLog;
+  Srv.AccessLog := False;
+  if not Srv.ListenTcp('127.0.0.1', 0) then
+    Halt(1);
+  Port := Srv.Port;
+  { the deadlines of a second server, a second each: each case below
+    times from bytes the client has already sent, so a slow machine
+    makes no other answer }
+  Dl := THttpServer.Create(Router);
+  Dl.HeaderTimeoutMs := 1000;
+  Dl.IdleTimeoutMs := 1000;
+  Dl.BodyTimeoutMs := 1000;
+  Dl.WriteTimeoutMs := 1000;
+  Dl.AccessLog := False;
+  if not Dl.ListenTcp('127.0.0.1', 0) then
+    Halt(1);
+  Big := StringOfChar('B', 33554432);
+  FilePath := ParamStr(0) + '.pdf';
+  Payload := '';
+  for i := 0 to 299999 do
+    Payload := Payload + Chr((i * 7919 + i div 251) mod 256);
+  WriteFile(FilePath, Copy(Payload, 1, 100000));
+  pas RunServer(Srv);
+  pas RunServer(Dl);
+
+  Show('GET /hello:', 'GET /hello HTTP/1.1' + H + 'Host: x' + H + 'Connection: close' + H + H);
+  Show('HEAD /hello:', 'HEAD /hello HTTP/1.1' + H + 'Host: x' + H + 'Connection: close' + H + H);
+  Show('HTTP/1.0 /hello:', 'GET /hello HTTP/1.0' + H + H);
+  Show('a route with :id, the query:', 'GET /api/items/42?x=1&y=a+b&y=c%20d&z HTTP/1.1' + H + 'Host: x' + H +
+    'Connection: close' + H + H);
+  Show('*path, percent-decoded:', 'GET /files/a%20b/c%2Fd HTTP/1.1' + H + 'Host: x' + H + 'Connection: close' + H + H);
+  Show('a literal wins over *path:', 'GET /files/readme HTTP/1.1' + H + 'Host: x' + H + 'Connection: close' + H + H);
+  Show('404:', 'GET /nothing HTTP/1.1' + H + 'Host: x' + H + 'Connection: close' + H + H);
+  Show('405 with Allow:', 'PUT /api/items/7 HTTP/1.1' + H + 'Host: x' + H + 'Content-Length: 0' + H +
+    'Connection: close' + H + H);
+  Show('cookies:', 'GET /cookie HTTP/1.1' + H + 'Host: x' + H + 'Cookie: a=1; sid="xyz"; bad=a\b' + H +
+    'Connection: close' + H + H);
+  Show('JSON in and out:', 'POST /api/items HTTP/1.1' + H + 'Host: x' + H + 'Content-Type: application/json' + H +
+    'Content-Length: 25' + H + 'Connection: close' + H + H + '{"name":"Ana","n":41}    ');
+  Show('JSON that is not:', 'POST /api/items HTTP/1.1' + H + 'Host: x' + H + 'Content-Length: 10' + H +
+    'Connection: close' + H + H + '{"name":,}');
+  Show('JSON too deep:', 'POST /api/items HTTP/1.1' + H + 'Host: x' + H + 'Content-Length: 20' + H +
+    'Connection: close' + H + H + '[[[[[[[[[[]]]]]]]]]]');
+  Show('a chunked request:', 'POST /echo HTTP/1.1' + H + 'Host: x' + H + 'Transfer-Encoding: chunked' + H +
+    'Connection: close' + H + H + '5' + H + 'hello' + H + '7;ext=1' + H + ', world' + H + '0' + H + 'X-Trailer: t' + H + H);
+  Show('a chunked answer:', 'GET /stream HTTP/1.1' + H + 'Host: x' + H + 'Connection: close' + H + H);
+  Show('an exception:', 'GET /fail HTTP/1.1' + H + 'Host: x' + H + 'Connection: close' + H + H);
+  Show('EHttpError:', 'GET /teapot HTTP/1.1' + H + 'Host: x' + H + 'Connection: close' + H + H);
+  Show('a redirect:', 'GET /see HTTP/1.1' + H + 'Host: x' + H + 'Connection: close' + H + H);
+  Show('middleware, no token:', 'GET /private/data HTTP/1.1' + H + 'Host: x' + H + 'Connection: close' + H + H);
+  Show('middleware, the token:', 'GET /private/data HTTP/1.1' + H + 'Host: x' + H + 'X-Token: secret' + H +
+    'Connection: close' + H + H);
+  Show('a urlencoded form:', 'POST /form HTTP/1.1' + H + 'Host: x' + H +
+    'Content-Type: application/x-www-form-urlencoded' + H + 'Content-Length: 41' + H + 'Connection: close' + H + H +
+    'name=Ana+Mar%C3%ADa&tag=a&tag=b&x&bad=%zz');
+  Show('a form of another type:', 'POST /form HTTP/1.1' + H + 'Host: x' + H + 'Content-Type: text/plain' + H +
+    'Content-Length: 6' + H + 'Connection: close' + H + H + 'name=z');
+
+  WriteLn('the limits:');
+  Show('431, a head past 4096 bytes:', 'GET /hello HTTP/1.1' + H + 'Host: x' + H + 'X-Long: ' +
+    StringOfChar('l', 5000) + H + H);
+  a := 'GET /hello HTTP/1.1' + H + 'Host: x' + H;
+  for i := 1 to 25 do
+    a := a + 'X-H' + IntToStr(i) + ': v' + H;
+  Show('431, 26 header lines:', a + H);
+  Show('413 by Content-Length:', 'POST /echo HTTP/1.1' + H + 'Host: x' + H + 'Content-Length: 101' + H + H);
+  Show('413 in a chunked body:', 'POST /echo HTTP/1.1' + H + 'Host: x' + H + 'Transfer-Encoding: chunked' + H + H +
+    '96' + H + StringOfChar('x', 150) + H + '0' + H + H);
+  Show('a body within its route''s 100 bytes:', 'POST /echo HTTP/1.1' + H + 'Host: x' + H + 'Content-Length: 100' + H +
+    'Connection: close' + H + H + StringOfChar('y', 100));
+
+  WriteLn('the protocol''s errors:');
+  Show('400, a malformed request line:', 'GET  /hello HTTP/1.1' + H + 'Host: x' + H + H);
+  Show('400, no Host:', 'GET /hello HTTP/1.1' + H + H);
+  Show('400, a space in a header name:', 'GET /hello HTTP/1.1' + H + 'Host: x' + H + 'Bad Name: v' + H + H);
+  Show('400, a folded line:', 'GET /hello HTTP/1.1' + H + 'Host: x' + H + 'X-A: 1' + H + ' 2' + H + H);
+  Show('400, Content-Length twice and different:', 'POST /echo HTTP/1.1' + H + 'Host: x' + H + 'Content-Length: 1' + H +
+    'Content-Length: 2' + H + H + 'ab');
+  Show('400, Transfer-Encoding and Content-Length:', 'POST /echo HTTP/1.1' + H + 'Host: x' + H +
+    'Transfer-Encoding: chunked' + H + 'Content-Length: 3' + H + H + 'abc');
+  Show('400, a bad escape in the path:', 'GET /files/%zz HTTP/1.1' + H + 'Host: x' + H + H);
+  Show('400, a dot-dot segment:', 'GET /files/../etc/passwd HTTP/1.1' + H + 'Host: x' + H + H);
+  Show('501, gzip:', 'POST /echo HTTP/1.1' + H + 'Host: x' + H + 'Transfer-Encoding: gzip' + H + H);
+  Show('505, HTTP/2.0:', 'GET /hello HTTP/2.0' + H + 'Host: x' + H + H);
+  Show('417, an expectation unknown:', 'POST /echo HTTP/1.1' + H + 'Host: x' + H + 'Expect: nothing' + H +
+    'Content-Length: 1' + H + H + 'a');
+
+  WriteLn('100 Continue:');
+  c := TcpConnectTo('127.0.0.1', Port);
+  Put(c, 'POST /echo HTTP/1.1' + H + 'Host: x' + H + 'Expect: 100-continue' + H + 'Content-Length: 4' + H +
+    'Connection: close' + H + H);
+  buf := '';
+  TcpReadLine(c, buf, a);
+  WriteLn('  ', a);
+  TcpReadLine(c, buf, a);
+  Put(c, 'ping');
+  Write(Shown(buf + ReadToEnd(c)));
+  TcpClose(c);
+
+  WriteLn('keep-alive, three requests on one connection:');
+  c := TcpConnectTo('127.0.0.1', Port);
+  buf := '';
+  for i := 1 to 3 do
+  begin
+    Put(c, 'GET /hello HTTP/1.1' + H + 'Host: x' + H + H);
+    Write(ReadAnswer(c, buf));
+  end;
+  WriteLn('HTTP/1.0 keep-alive:');
+  Put(c, 'GET /hello HTTP/1.0' + H + 'Connection: keep-alive' + H + H);
+  Write(ReadAnswer(c, buf));
+  TcpClose(c);
+
+  WriteLn('the deadlines, a second each:');
+  c := TcpConnectTo('127.0.0.1', Dl.Port);
+  WriteLn('  a connection that sends nothing: closed, ', Length(ReadToEnd(c)), ' bytes');
+  TcpClose(c);
+  c := TcpConnectTo('127.0.0.1', Dl.Port);
+  buf := '';
+  Put(c, 'GET /hello HTTP/1.1' + H + 'Host: x' + H + H);
+  Write(ReadAnswer(c, buf));
+  WriteLn('  then idle: the server closes, read gives ', Length(ReadToEnd(c)), ' bytes');
+  TcpClose(c);
+  c := TcpConnectTo('127.0.0.1', Dl.Port);
+  Put(c, 'GET /hello HTTP/1.1' + H + 'Host: x' + H);
+  WriteLn('  a head that stops half way:');
+  Write(Shown(ReadToEnd(c)));
+  TcpClose(c);
+  c := TcpConnectTo('127.0.0.1', Dl.Port);
+  Put(c, 'POST /echo HTTP/1.1' + H + 'Host: x' + H + 'Content-Length: 10' + H + H + 'abc');
+  WriteLn('  a body that stops half way:');
+  Write(Shown(ReadToEnd(c)));
+  TcpClose(c);
+  c := TcpConnectTo('127.0.0.1', Dl.Port);
+  Put(c, 'GET /big HTTP/1.1' + H + 'Host: x' + H + H);
+  Sleep(3000);
+  a := ReadToEnd(c);
+  WriteLn('  32 MiB answered to a client that reads nothing for 3 s: cut short ', Length(a) < Length(Big));
+  TcpClose(c);
+  Dl.Shutdown;
+
+  WriteLn('a multipart upload:');
+  boundary := '----paslang' + StringOfChar('7', 20);
+  mp := 'preamble to skip' + H + '--' + boundary + H +
+    'Content-Disposition: form-data; name="title"' + H + H + 'Informe' + H +
+    '--' + boundary + '  ' + H +
+    'Content-Disposition: form-data; name="doc"; filename="dir/informe.pdf"' + H +
+    'Content-Type: application/pdf' + H + H + Payload + H +
+    '--' + boundary + H +
+    'Content-Disposition: form-data; name="note"; filename="x.txt"; filename*=UTF-8''''a%C3%B1o.txt' + H + H +
+    H + '--' + boundary + 'not yet' + H + '--' + boundary + '--' + H + 'epilogue';
+  c := TcpConnectTo('127.0.0.1', Port);
+  Put(c, 'POST /upload HTTP/1.1' + H + 'Host: x' + H + 'Content-Type: multipart/form-data; boundary="' + boundary + '"' + H +
+    'Content-Length: ' + IntToStr(Length(mp)) + H + 'Connection: close' + H + H + mp, 777);
+  Write(Shown(ReadToEnd(c)));
+  TcpClose(c);
+  WriteLn('  the file sent: sha256 ', Copy(Hex(Sha256(Payload)), 1, 16), '; the last part''s: ',
+    Copy(Hex(Sha256(H + '--' + boundary + 'not yet')), 1, 16));
+
+  WriteLn('a file by sendfile:');
+  a := Ask('GET /download HTTP/1.1' + H + 'Host: x' + H + 'Connection: close' + H + H);
+  Write(Shown(a));
+  i := Pos(H + H, a);
+  WriteLn('  the body is the file: ', Copy(a, i + 4, Length(a) - i - 3) = Copy(Payload, 1, 100000));
+  Show('HEAD of it:', 'HEAD /download HTTP/1.1' + H + 'Host: x' + H + 'Connection: close' + H + H);
+  Show('a file that is not there:', 'GET /missing HTTP/1.1' + H + 'Host: x' + H + 'Connection: close' + H + H);
+
+  WriteLn('200 clients, three requests each:');
+  clients.Add(200);
+  for i := 1 to 200 do
+    pas LoadClient(i);
+  clients.Wait;
+  WriteLn('  served ', served, ', bad ', bad);
+
+  WriteLn('the access log, its times taken out:');
+  Srv.AccessLog := True;
+  a := Ask('GET /hello?secret=1 HTTP/1.1' + H + 'Host: x' + H + 'X-Real-IP: 203.0.113.7' + H + 'Cookie: sid=s' + H +
+    'Authorization: Bearer t' + H + 'Connection: close' + H + H);
+  a := Ask('POST /echo HTTP/1.1' + H + 'Host: x' + H + 'Content-Length: 3' + H + 'Connection: close' + H + H + 'xyz');
+  Srv.AccessLog := False;
+  LogMu.Lock;
+  for i := 0 to High(Logs) do
+    WriteLn('  ', Copy(Logs[i], 1, LastDelimiter(' ', Logs[i])), '<ms>');
+  LogMu.Unlock;
+
+  { a Unix socket with its mode and group }
+  usr := THttpRouter.Create;
+  usr.Handle('GET', '/hello', @HHello);
+  usrv := THttpServer.Create(usr);
+  usrv.AccessLog := False;
+  sock := ParamStr(0) + '.sock';
+  if Amd64 = 1 then
+    mygid := Syscall(104)
+  else
+    mygid := Syscall(176);
+  WriteLn('a Unix socket, mode 0660 and the process''s group: ', usrv.ListenUnix(sock, 432, IntToStr(mygid)));
+  p := sock + #0;
+  if Amd64 = 1 then
+    i := Syscall(332, -100, @p[1], 0, $201, @st[0])
+  else
+    i := Syscall(291, -100, @p[1], 0, $201, @st[0]);
+  WriteLn('  mode ', Oct((st[3] shr 32) and $FFF), ', group the process''s ', (st[3] and $FFFFFFFF) = mygid);
+  stopped := MakeChan(1);
+  pas Stopper(usrv, stopped);
+  c := UnixConnect(sock);
+  Put(c, 'GET /hello HTTP/1.1' + H + 'Host: x' + H + 'Connection: close' + H + H);
+  Write(Shown(ReadToEnd(c)));
+  UnixClose(c);
+  SignalRaise(SIGTERM);
+  WriteLn('  ServeUntilSignal stopped on ', SignalName(Recv(stopped)), '; the socket file is gone: ', not FileExists(sock));
+
+  { Shutdown with a request in flight }
+  done := MakeChan(1);
+  pas SlowClient(done);
+  Sleep(100);
+  Srv.Shutdown;
+  n := Recv(done);
+  WriteLn('after Shutdown: connections ', Srv.Active, ', a new one refused: ', TcpConnectTo('127.0.0.1', Port) < 0);
+  DeleteFile(FilePath);
+  WriteLn('done');
+end.
+
+{ This file is part of paslang's tests.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+  paslang is free software under the GNU General Public License,
+  version 3 or (at your option) any later version; see the file
+  COPYING. It comes with ABSOLUTELY NO WARRANTY. }

@@ -1,0 +1,3347 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+
+  paslang is free software: you can redistribute it and/or modify it
+  under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+
+  paslang is distributed in the hope that it will be useful, but
+  WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+  General Public License for more details.
+
+  Under Section 7 of GPL version 3, you are granted additional
+  permissions described in the paslang Runtime Library Exception,
+  version 1.0, in the file COPYING.RUNTIME.
+
+  You should have received a copy of the GNU General Public License
+  along with paslang.  If not, see <https://www.gnu.org/licenses/>. }
+
+{ An HTTP/1.1 server (P434, 1.1.257), as Go's net/http serves: one
+  routine per connection, parked while it waits (Regla 11), on a Unix
+  socket, on TCP or on the sockets systemd passes. Requests of HTTP/1.1,
+  kept alive, and of HTTP/1.0; the head held to a size and a count of
+  header lines (431), a body to a size of its route (413), a malformed
+  request answered 400; a body by Content-Length or chunked, read a
+  piece at a time, multipart/form-data parts streamed; deadlines for
+  the head, the time between requests, the body and the answer. A
+  router by method and path with :name and *name segments (404, and
+  405 with Allow), HEAD, cookies, JSON in and out, a file answered by
+  sendfile(2). An exception a handler raises is a 500 for its request
+  alone; SIGTERM or SIGINT stops accepting, lets what is in flight
+  finish and returns. One line of the access log a request on standard
+  output, never a body, a cookie or a credential. RFC 9110 and 9112,
+  RFC 6265 (cookies), RFC 7578 and 2046 (multipart), RFC 6266 and 8187
+  (Content-Disposition); Go's net/http, net/textproto and
+  mime/multipart are the reference. }
+unit httpserver;
+
+interface
+
+uses
+  sysutils;
+
+const
+  { the defaults of a THttpServer }
+  HttpMaxHeaderBytes = 16384;
+  HttpMaxHeaders = 100;
+  HttpMaxBody = 1048576;
+  HttpHeaderTimeoutMs = 10000;
+  HttpIdleTimeoutMs = 60000;
+  HttpBodyTimeoutMs = 60000;
+  HttpWriteTimeoutMs = 60000;
+  HttpShutdownTimeoutMs = 10000;
+
+type
+  { A handler raises it to answer Status with Message as text; the
+    reader of a body raises it at a limit (413), a deadline (408) or a
+    body that breaks the protocol (400) }
+  EHttpError = class(Exception)
+  public
+    Status: Integer;
+    constructor CreateStatus(AStatus: Integer; const AMessage: string);
+  end;
+
+  { Header lines in their order; names compared without case }
+  THttpHeaders = class
+  private
+    FNames: array of string;
+    FValues: array of string;
+    FCount: Integer;
+  public
+    { the first value of Name, '' when there is none }
+    function Get(const Name: string): string;
+    { every value of Name, in order }
+    function Values(const Name: string): TStringArray;
+    function Has(const Name: string): Boolean;
+    procedure Add(const Name, Value: string);
+    { Name with this one value, every other one taken out }
+    procedure Put(const Name, Value: string);
+    procedure Remove(const Name: string);
+    function Count: Integer;
+    function NameAt(I: Integer): string;
+    function ValueAt(I: Integer): string;
+  end;
+
+  { A cookie to set (RFC 6265 4.1). MaxAge 0 puts no Max-Age, below 0
+    Max-Age=0, which deletes it; SameSite is 'Strict', 'Lax', 'None'
+    or '' }
+  THttpCookie = record
+    Name: string;
+    Value: string;
+    Path: string;
+    Domain: string;
+    MaxAge: Integer;
+    Secure: Boolean;
+    HttpOnly: Boolean;
+    SameSite: string;
+  end;
+
+  THttpServer = class;
+  THttpConn = class;
+  THttpMultipart = class;
+
+  { A part of a multipart/form-data body: its form name, its file
+    name (RFC 7578 4.2, '' for a plain field), its type and its header
+    lines, and its bytes read a piece at a time }
+  THttpPart = class
+  private
+    FMp: THttpMultipart;
+    FDone: Boolean;
+  public
+    Name: string;
+    FileName: string;
+    ContentType: string;
+    Header: THttpHeaders;
+    { up to MaxN bytes of the part, '' at its end }
+    function ReadData(MaxN: Integer): string;
+    { the rest of the part, 413 past Limit bytes }
+    function ReadAllData(Limit: Integer): string;
+  end;
+
+  { The parts of a multipart/form-data body, in order }
+  THttpMultipart = class
+  private
+    FConn: THttpConn;
+    { what the body gave and the multipart reader has not taken, from
+      FPos; FEof once the body is at its end }
+    FBuf: string;
+    FPos: Integer;
+    FEof: Boolean;
+    { '--boundary', and CRLF '--boundary' before every part but the first
+      (LF alone when the first boundary line ends so, as Go takes it) }
+    FDash: string;
+    FDelim: string;
+    FPart: THttpPart;
+    FParts: Integer;
+    FEnded: Boolean;
+  public
+    { the next part, nil after the last; what is left of the one
+      before is passed over }
+    function Next: THttpPart;
+  end;
+
+  THttpRequest = class
+  private
+    FConn: THttpConn;
+    FParamNames: array of string;
+    FParamValues: array of string;
+    FQueryNames: array of string;
+    FQueryValues: array of string;
+    FQueryParsed: Boolean;
+    FFormNames: array of string;
+    FFormValues: array of string;
+    FFormParsed: Boolean;
+    FMultipart: THttpMultipart;
+  public
+    { 'GET', 'POST', ... as sent }
+    Method: string;
+    { the request target as sent: '/a/b%20c?x=1' }
+    Target: string;
+    { the path before '?', as sent, and percent-decoded }
+    RawPath: string;
+    Path: string;
+    { the query after '?', as sent }
+    RawQuery: string;
+    { 'HTTP/1.1' or 'HTTP/1.0' }
+    Proto: string;
+    Header: THttpHeaders;
+    { the body's length, -1 when chunked, 0 when there is none }
+    ContentLength: Int64;
+    { X-Real-IP, the client's address the proxy sets }
+    RealIP: string;
+    { the peer as the socket names it (getpeername(2), asked when called) }
+    function RemoteAddr: string;
+    { the route's :name or *name }
+    function Param(const Name: string): string;
+    { the first value of Name in the query, decoded ('+' is a space),
+      '' when absent; all of them; whether it is there }
+    function Query(const Name: string): string;
+    function QueryValues(const Name: string): TStringArray;
+    function HasQuery(const Name: string): Boolean;
+    { a field of an application/x-www-form-urlencoded body, read whole
+      within the route's limit at the first call and decoded as the query
+      is (Go's PostFormValue): the first value, '' when absent; all of
+      them; whether it is there }
+    function Form(const Name: string): string;
+    function FormValues(const Name: string): TStringArray;
+    function HasForm(const Name: string): Boolean;
+    { the value of the cookie Name, '' when absent; whether it is there }
+    function Cookie(const Name: string): string;
+    function HasCookie(const Name: string): Boolean;
+    { up to MaxN bytes of the body, '' at its end }
+    function ReadBody(MaxN: Integer): string;
+    { the whole body, within the route's limit }
+    function ReadAllBody: string;
+    { the whole body as JSON within the route's limit and MaxDepth;
+      400 with the parser's words when it is not }
+    function ReadJson(MaxDepth: Integer = 64): json;
+    { the body's parts; 400 when it is not multipart/form-data }
+    function Multipart: THttpMultipart;
+  end;
+
+  THttpResponse = class
+  private
+    FConn: THttpConn;
+  public
+    Header: THttpHeaders;
+    { the status the head will carry, 200 until set }
+    procedure SetStatus(Code: Integer);
+    function Status: Integer;
+    { whether the head has gone }
+    function HeadSent: Boolean;
+    { a piece of the body: the head first, with Content-Length when the
+      handler put one, chunked otherwise (HTTP/1.1); a small answer is
+      held and sent whole with its length when the handler ends }
+    procedure WriteData(const Data: string);
+    { Code with this Content-Type and this whole body }
+    procedure Reply(Code: Integer; const ContentType, Body: string);
+    procedure ReplyText(Code: Integer; const Body: string);
+    { application/json; charset=utf-8, the value on one line }
+    procedure ReplyJson(Code: Integer; const V: json);
+    procedure ReplyError(Code: Integer; const Message: string);
+    procedure Redirect(Code: Integer; const Location: string);
+    procedure SetCookie(const C: THttpCookie);
+    { a file by sendfile(2) with its Content-Type and Content-Length; with
+      DownloadName, Content-Disposition: attachment (RFC 6266, the name
+      in UTF-8 by RFC 8187); False, and 404 answered, when it is no
+      regular file that opens }
+    function ServeFile(const Path, ContentType, DownloadName: string): Boolean;
+  end;
+
+  THttpHandler = procedure(Req: THttpRequest; Resp: THttpResponse);
+  { a handler made of another, around it: a check before, a header after }
+  THttpMiddleware = function(Next: THttpHandler): THttpHandler;
+  THttpLog = procedure(const Line: string);
+
+  THttpRoute = record
+    Method: string;
+    Segs: array of string;
+    Handler: THttpHandler;
+    { Handler inside every middleware, made when Serve begins }
+    Run: THttpHandler;
+    MaxBody: Int64;
+  end;
+
+  { Routes by method and path: a segment ':name' takes one segment of
+    the path and '*name', last, the rest of it; a literal segment wins
+    over ':name', which wins over '*name'. A path no route has is 404,
+    one whose routes take other methods 405 with Allow; GET answers HEAD
+    too. }
+  THttpRouter = class
+  private
+    FRoutes: array of THttpRoute;
+    FMiddleware: array of THttpMiddleware;
+  public
+    { MaxBody -1 takes the server's }
+    procedure Handle(const Method, Pattern: string; Handler: THttpHandler; MaxBody: Int64 = -1);
+    { M around every route's handler, the first used outermost; routes
+      and middleware are set before Serve }
+    procedure Use(M: THttpMiddleware);
+  end;
+
+  { The segments of a request's path: where they lie in the path as sent
+    when it has no escape and at most 32 of them, so no string is made
+    for a literal compared; else each one decoded }
+  TSegView = record
+    Raw: string;
+    Count: Integer;
+    A, B: array[0..31] of Integer;
+    Decs: TStringArray;
+    Decoded: Boolean;
+  end;
+
+  THttpListener = record
+    Fd: Integer;
+    IsUnix: Boolean;
+    Path: string;
+  end;
+
+  THttpServer = class
+  private
+    FRouter: THttpRouter;
+    FListeners: array of THttpListener;
+    FMu: mutex;
+    FConns: array of THttpConn;
+    FCount: Integer;
+    FClosing: Integer;
+    FAccepting: waitgroup;
+    FServing: waitgroup;
+    FDone: chan of Integer;
+    FSignal: Integer;
+    FLogMu: mutex;
+    FPort: Integer;
+    { CLOCK_REALTIME less Nanotime, and when it was taken (DateNow) }
+    FWallOffset: Int64;
+    FCalibrated: Int64;
+    procedure Track(C: THttpConn);
+    procedure Untrack(C: THttpConn);
+  public
+    MaxHeaderBytes: Integer;
+    MaxHeaders: Integer;
+    MaxBody: Int64;
+    HeaderTimeoutMs: Integer;
+    IdleTimeoutMs: Integer;
+    BodyTimeoutMs: Integer;
+    WriteTimeoutMs: Integer;
+    ShutdownTimeoutMs: Integer;
+    { one line a request, 'ip method path status bytes Nms' (ip from
+      X-Real-IP, '-' without it; the path without its query): to LogTo
+      when it is set, else to standard output }
+    AccessLog: Boolean;
+    LogTo: THttpLog;
+    constructor Create(ARouter: THttpRouter);
+    { a Unix stream socket at Path ('@name' an abstract one), the file
+      there removed first, then given Mode (0660 is 432) and Group (a
+      name of /etc/group or a number; '' leaves it) }
+    function ListenUnix(const Path: string; Mode: Integer; const Group: string): Boolean;
+    { TCP at Host and Port; Port 0 asks the kernel for one (Port) }
+    function ListenTcp(const Host: string; APort: Integer): Boolean;
+    { the sockets systemd passed (LISTEN_PID, LISTEN_FDS, from 3) }
+    function ListenSystemd: Boolean;
+    { the TCP port listened on }
+    function Port: Integer;
+    { serves until Shutdown; each connection its own routine }
+    procedure Serve;
+    { stops accepting, closes the idle connections, lets the requests in
+      flight finish within ShutdownTimeoutMs and then cuts what is
+      left; Serve returns }
+    procedure Shutdown;
+    { Serve until SIGTERM or SIGINT, then Shutdown: the signal }
+    function ServeUntilSignal: Integer;
+    { the connections open }
+    function Active: Integer;
+  end;
+
+  { one connection; the server's own }
+  THttpConn = class
+  private
+    Server: THttpServer;
+    Fd: Integer;
+    Peer: string;
+    PeerKnown: Boolean;
+    { its place in the server's FConns }
+    Slot: Integer;
+    Buf: array of Byte;
+    BufPos: Integer;
+    BufEnd: Integer;
+    Idle: Integer;
+    Closed: Boolean;
+    { the request being served }
+    Req: THttpRequest;
+    Resp: THttpResponse;
+    Route: Integer;
+    BodyLimit: Int64;
+    BodyLeft: Int64;
+    BodyRead: Int64;
+    Chunked: Boolean;
+    ChunkLeft: Int64;
+    BodyEnded: Boolean;
+    BodyDeadline: Integer;
+    Continue100: Boolean;
+    IsHead: Boolean;
+    KeepAlive: Boolean;
+    Proto11: Boolean;
+    StatusCode: Integer;
+    Sent: Boolean;
+    OutChunked: Boolean;
+    OutLength: Int64;
+    OutWritten: Int64;
+    OutBody: Int64;
+    Held: string;
+    { the length a Reply knows before its body is held, -1 otherwise }
+    KnownLen: Int64;
+    { the head and small bodies, gathered for one write }
+    OutBuf: array of Byte;
+    OutLen: Integer;
+    { the path of the request being served, its segments }
+    PathV: TSegView;
+    WriteDeadline: Integer;
+    Broken: Boolean;
+    DateSec: Int64;
+    DateText: string;
+  end;
+
+{ Go's StatusText: 'OK' for 200, '' for a code it does not name }
+function HttpStatusText(Code: Integer): string;
+{ IMF-fixdate (RFC 9110 5.6.7): 'Sun, 06 Nov 1994 08:49:37 GMT' }
+function HttpDate(UnixSecs: Int64): string;
+{ S percent-decoded, '+' a space when Plus; False for a bad escape }
+function HttpUnescape(const S: string; Plus: Boolean; out R: string): Boolean;
+{ S with every byte but the unreserved ones (RFC 3986 2.3) as %XX }
+function HttpEscape(const S: string): string;
+{ whether A and B are equal, in a time that depends on their length
+  alone (Go's crypto/subtle.ConstantTimeCompare): for tokens and MACs }
+function ConstantTimeEqual(const A, B: string): Boolean;
+
+implementation
+
+uses
+  pasnet, passignal, pastime, paslib;
+
+const
+  CRLF = #13#10;
+
+{ ---- helpers ---- }
+
+constructor EHttpError.CreateStatus(AStatus: Integer; const AMessage: string);
+begin
+  inherited Create(AMessage);
+  Status := AStatus;
+end;
+
+function LowerAscii(const S: string): string;
+var
+  i: Integer;
+begin
+  Result := S;
+  for i := 1 to Length(Result) do
+    if (Result[i] >= 'A') and (Result[i] <= 'Z') then
+      Result[i] := Chr(Ord(Result[i]) + 32);
+end;
+
+function EqualFold(const A, B: string): Boolean;
+var
+  i: Integer;
+  x, y: Char;
+begin
+  Result := False;
+  if Length(A) <> Length(B) then
+    Exit;
+  for i := 1 to Length(A) do
+  begin
+    x := A[i];
+    y := B[i];
+    if (x >= 'A') and (x <= 'Z') then
+      x := Chr(Ord(x) + 32);
+    if (y >= 'A') and (y <= 'Z') then
+      y := Chr(Ord(y) + 32);
+    if x <> y then
+      Exit;
+  end;
+  Result := True;
+end;
+
+{ tchar of RFC 9110 5.6.2 }
+function IsTokenChar(C: Char): Boolean;
+begin
+  case C of
+    'a'..'z', 'A'..'Z', '0'..'9', '!', '#', '$', '%', '&', '''', '*', '+', '-', '.', '^', '_', '`', '|', '~':
+      Result := True;
+  else
+    Result := False;
+  end;
+end;
+
+function IsToken(const S: string): Boolean;
+var
+  i: Integer;
+begin
+  Result := S <> '';
+  for i := 1 to Length(S) do
+    if not IsTokenChar(S[i]) then
+    begin
+      Result := False;
+      Exit;
+    end;
+end;
+
+{ OWS trimmed: spaces and tabs at both ends }
+function TrimOws(const S: string): string;
+var
+  a, b: Integer;
+begin
+  a := 1;
+  b := Length(S);
+  while (a <= b) and ((S[a] = ' ') or (S[a] = #9)) do
+    a := a + 1;
+  while (b >= a) and ((S[b] = ' ') or (S[b] = #9)) do
+    b := b - 1;
+  Result := Copy(S, a, b - a + 1);
+end;
+
+function HexDigit(C: Char): Integer;
+begin
+  case C of
+    '0'..'9': Result := Ord(C) - 48;
+    'a'..'f': Result := Ord(C) - 87;
+    'A'..'F': Result := Ord(C) - 55;
+  else
+    Result := -1;
+  end;
+end;
+
+function HttpUnescape(const S: string; Plus: Boolean; out R: string): Boolean;
+var
+  i, n, h, l: Integer;
+begin
+  Result := False;
+  R := '';
+  if (Pos('%', S) = 0) and not (Plus and (Pos('+', S) > 0)) then
+  begin
+    R := S;
+    Result := True;
+    Exit;
+  end;
+  SetLength(R, Length(S));
+  n := 0;
+  i := 1;
+  while i <= Length(S) do
+  begin
+    if S[i] = '%' then
+    begin
+      if i + 2 > Length(S) then
+        Exit;
+      h := HexDigit(S[i + 1]);
+      l := HexDigit(S[i + 2]);
+      if (h < 0) or (l < 0) then
+        Exit;
+      n := n + 1;
+      R[n] := Chr(h * 16 + l);
+      i := i + 3;
+    end
+    else
+    begin
+      n := n + 1;
+      if Plus and (S[i] = '+') then
+        R[n] := ' '
+      else
+        R[n] := S[i];
+      i := i + 1;
+    end;
+  end;
+  SetLength(R, n);
+  Result := True;
+end;
+
+function HttpEscape(const S: string): string;
+const
+  Hexs: string = '0123456789ABCDEF';
+var
+  i: Integer;
+  c: Char;
+begin
+  Result := '';
+  for i := 1 to Length(S) do
+  begin
+    c := S[i];
+    case c of
+      'a'..'z', 'A'..'Z', '0'..'9', '-', '.', '_', '~':
+        Result := Result + c;
+    else
+      Result := Result + '%' + Hexs[Ord(c) shr 4 + 1] + Hexs[(Ord(c) and 15) + 1];
+    end;
+  end;
+end;
+
+function ConstantTimeEqual(const A, B: string): Boolean;
+var
+  i, v: Integer;
+begin
+  if Length(A) <> Length(B) then
+  begin
+    Result := False;
+    Exit;
+  end;
+  v := 0;
+  for i := 1 to Length(A) do
+    v := v or (Ord(A[i]) xor Ord(B[i]));
+  Result := v = 0;
+end;
+
+function HttpStatusText(Code: Integer): string;
+begin
+  case Code of
+    100: Result := 'Continue';
+    101: Result := 'Switching Protocols';
+    102: Result := 'Processing';
+    103: Result := 'Early Hints';
+    200: Result := 'OK';
+    201: Result := 'Created';
+    202: Result := 'Accepted';
+    203: Result := 'Non-Authoritative Information';
+    204: Result := 'No Content';
+    205: Result := 'Reset Content';
+    206: Result := 'Partial Content';
+    207: Result := 'Multi-Status';
+    208: Result := 'Already Reported';
+    226: Result := 'IM Used';
+    300: Result := 'Multiple Choices';
+    301: Result := 'Moved Permanently';
+    302: Result := 'Found';
+    303: Result := 'See Other';
+    304: Result := 'Not Modified';
+    305: Result := 'Use Proxy';
+    307: Result := 'Temporary Redirect';
+    308: Result := 'Permanent Redirect';
+    400: Result := 'Bad Request';
+    401: Result := 'Unauthorized';
+    402: Result := 'Payment Required';
+    403: Result := 'Forbidden';
+    404: Result := 'Not Found';
+    405: Result := 'Method Not Allowed';
+    406: Result := 'Not Acceptable';
+    407: Result := 'Proxy Authentication Required';
+    408: Result := 'Request Timeout';
+    409: Result := 'Conflict';
+    410: Result := 'Gone';
+    411: Result := 'Length Required';
+    412: Result := 'Precondition Failed';
+    413: Result := 'Request Entity Too Large';
+    414: Result := 'Request URI Too Long';
+    415: Result := 'Unsupported Media Type';
+    416: Result := 'Requested Range Not Satisfiable';
+    417: Result := 'Expectation Failed';
+    418: Result := 'I''m a teapot';
+    421: Result := 'Misdirected Request';
+    422: Result := 'Unprocessable Entity';
+    423: Result := 'Locked';
+    424: Result := 'Failed Dependency';
+    425: Result := 'Too Early';
+    426: Result := 'Upgrade Required';
+    428: Result := 'Precondition Required';
+    429: Result := 'Too Many Requests';
+    431: Result := 'Request Header Fields Too Large';
+    451: Result := 'Unavailable For Legal Reasons';
+    500: Result := 'Internal Server Error';
+    501: Result := 'Not Implemented';
+    502: Result := 'Bad Gateway';
+    503: Result := 'Service Unavailable';
+    504: Result := 'Gateway Timeout';
+    505: Result := 'HTTP Version Not Supported';
+    506: Result := 'Variant Also Negotiates';
+    507: Result := 'Insufficient Storage';
+    508: Result := 'Loop Detected';
+    510: Result := 'Not Extended';
+    511: Result := 'Network Authentication Required';
+  else
+    Result := '';
+  end;
+end;
+
+function Two(N: Integer): string;
+begin
+  Result := Chr(48 + N div 10) + Chr(48 + N mod 10);
+end;
+
+function HttpDate(UnixSecs: Int64): string;
+const
+  Days: array[0..6] of string = ('Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat');
+  Months: array[1..12] of string = ('Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug',
+    'Sep', 'Oct', 'Nov', 'Dec');
+var
+  d: pastime.TDate;
+  wd: Integer;
+begin
+  d := UnixToDate(UnixSecs);
+  { 1970-01-01 was a Thursday }
+  wd := (UnixSecs div 86400 + 4) mod 7;
+  if wd < 0 then
+    wd := wd + 7;
+  Result := Days[wd] + ', ' + Two(d.Day) + ' ' + Months[d.Month] + ' ' + IntToStr(d.Year) + ' ' +
+    Two(d.Hour) + ':' + Two(d.Minute) + ':' + Two(d.Second) + ' GMT';
+end;
+
+{ The media type of a Content-Type, lower case, its parameters left }
+function MediaType(const Ct: string): string;
+var
+  i: Integer;
+begin
+  i := Pos(';', Ct);
+  if i > 0 then
+    Result := LowerAscii(TrimOws(Copy(Ct, 1, i - 1)))
+  else
+    Result := LowerAscii(TrimOws(Ct));
+end;
+
+{ ---- headers ---- }
+
+function THttpHeaders.Get(const Name: string): string;
+var
+  i: Integer;
+begin
+  Result := '';
+  for i := 0 to FCount - 1 do
+    if EqualFold(FNames[i], Name) then
+    begin
+      Result := FValues[i];
+      Exit;
+    end;
+end;
+
+function THttpHeaders.Values(const Name: string): TStringArray;
+var
+  i, n: Integer;
+begin
+  Result := nil;
+  n := 0;
+  for i := 0 to FCount - 1 do
+    if EqualFold(FNames[i], Name) then
+    begin
+      SetLength(Result, n + 1);
+      Result[n] := FValues[i];
+      n := n + 1;
+    end;
+end;
+
+{ how many lines name Name }
+function CountOf(H: THttpHeaders; const Name: string): Integer;
+var
+  i: Integer;
+begin
+  Result := 0;
+  for i := 0 to H.FCount - 1 do
+    if EqualFold(H.FNames[i], Name) then
+      Result := Result + 1;
+end;
+
+function THttpHeaders.Has(const Name: string): Boolean;
+var
+  i: Integer;
+begin
+  Result := False;
+  for i := 0 to FCount - 1 do
+    if EqualFold(FNames[i], Name) then
+    begin
+      Result := True;
+      Exit;
+    end;
+end;
+
+procedure THttpHeaders.Add(const Name, Value: string);
+begin
+  if FCount >= Length(FNames) then
+  begin
+    SetLength(FNames, FCount * 2 + 8);
+    SetLength(FValues, FCount * 2 + 8);
+  end;
+  FNames[FCount] := Name;
+  FValues[FCount] := Value;
+  FCount := FCount + 1;
+end;
+
+procedure THttpHeaders.Put(const Name, Value: string);
+begin
+  Remove(Name);
+  Add(Name, Value);
+end;
+
+procedure THttpHeaders.Remove(const Name: string);
+var
+  i, k: Integer;
+begin
+  k := 0;
+  for i := 0 to FCount - 1 do
+    if not EqualFold(FNames[i], Name) then
+    begin
+      FNames[k] := FNames[i];
+      FValues[k] := FValues[i];
+      k := k + 1;
+    end;
+  FCount := k;
+end;
+
+function THttpHeaders.Count: Integer;
+begin
+  Result := FCount;
+end;
+
+function THttpHeaders.NameAt(I: Integer): string;
+begin
+  Result := FNames[I];
+end;
+
+function THttpHeaders.ValueAt(I: Integer): string;
+begin
+  Result := FValues[I];
+end;
+
+{ ---- the connection's bytes ---- }
+
+{ More bytes into the buffer before Deadline (a Nanotime, 0 none): the
+  count, 0 at the end of the stream, -110 at the deadline, -errno }
+function Fill(C: THttpConn; Deadline: Integer): Integer;
+var
+  n: Integer;
+begin
+  if C.BufPos > 0 then
+  begin
+    if C.BufEnd > C.BufPos then
+      Move(C.Buf[C.BufPos], C.Buf[0], C.BufEnd - C.BufPos);
+    C.BufEnd := C.BufEnd - C.BufPos;
+    C.BufPos := 0;
+  end;
+  if Length(C.Buf) - C.BufEnd < 512 then
+    SetLength(C.Buf, Length(C.Buf) * 2);
+  n := PasIoRead(C.Fd, @C.Buf[C.BufEnd], Length(C.Buf) - C.BufEnd, Deadline);
+  if n > 0 then
+    C.BufEnd := C.BufEnd + n;
+  Result := n;
+end;
+
+function Avail(C: THttpConn): Integer;
+begin
+  Result := C.BufEnd - C.BufPos;
+end;
+
+function TakeBytes(C: THttpConn; N: Integer): string;
+begin
+  SetLength(Result, N);
+  if N > 0 then
+    Move(C.Buf[C.BufPos], Result[1], N);
+  C.BufPos := C.BufPos + N;
+end;
+
+{ The buffer's bytes from A to B (B not included) as a string }
+function BytesOf(C: THttpConn; A, B: Integer): string;
+begin
+  SetLength(Result, B - A);
+  if B > A then
+    Move(C.Buf[A], Result[1], B - A);
+end;
+
+{ Whether the buffer's bytes from A are those of S }
+function BytesAre(C: THttpConn; A, B: Integer; const S: string): Boolean;
+var
+  i: Integer;
+begin
+  Result := False;
+  if B - A <> Length(S) then
+    Exit;
+  for i := 1 to Length(S) do
+    if C.Buf[A + i - 1] <> Ord(S[i]) then
+      Exit;
+  Result := True;
+end;
+
+{ The method or the version, the usual ones as constants, so no string
+  is made for them }
+function CommonOf(C: THttpConn; A, B: Integer): string;
+begin
+  if BytesAre(C, A, B, 'GET') then
+    Result := 'GET'
+  else if BytesAre(C, A, B, 'HTTP/1.1') then
+    Result := 'HTTP/1.1'
+  else if BytesAre(C, A, B, 'POST') then
+    Result := 'POST'
+  else if BytesAre(C, A, B, 'HEAD') then
+    Result := 'HEAD'
+  else if BytesAre(C, A, B, 'PUT') then
+    Result := 'PUT'
+  else if BytesAre(C, A, B, 'DELETE') then
+    Result := 'DELETE'
+  else if BytesAre(C, A, B, 'PATCH') then
+    Result := 'PATCH'
+  else if BytesAre(C, A, B, 'HTTP/1.0') then
+    Result := 'HTTP/1.0'
+  else
+    Result := BytesOf(C, A, B);
+end;
+
+{ All of Data out before the write deadline; False when the peer is gone
+  or the time ran out, and the connection is broken }
+function SendAll(C: THttpConn; const Data: string): Boolean;
+var
+  p, n: Integer;
+begin
+  Result := False;
+  if C.Broken then
+    Exit;
+  p := 1;
+  while p <= Length(Data) do
+  begin
+    n := PasIoWrite(C.Fd, @Data[p], Length(Data) - p + 1, C.WriteDeadline);
+    if n <= 0 then
+    begin
+      C.Broken := True;
+      Exit;
+    end;
+    p := p + n;
+  end;
+  C.OutWritten := C.OutWritten + Length(Data);
+  Result := True;
+end;
+
+{ ---- the request's body ---- }
+
+{ A line of a chunked body (its size, or a trailer) within MaxHeaderBytes }
+function BodyLine(C: THttpConn): string;
+var
+  i, n: Integer;
+begin
+  while True do
+  begin
+    for i := C.BufPos to C.BufEnd - 1 do
+      if C.Buf[i] = 10 then
+      begin
+        Result := TakeBytes(C, i - C.BufPos);
+        C.BufPos := C.BufPos + 1;
+        if (Length(Result) > 0) and (Result[Length(Result)] = #13) then
+          SetLength(Result, Length(Result) - 1);
+        Exit;
+      end;
+    if Avail(C) > C.Server.MaxHeaderBytes then
+      raise EHttpError.CreateStatus(400, 'chunk line too long');
+    n := Fill(C, C.BodyDeadline);
+    if n = -110 then
+      raise EHttpError.CreateStatus(408, 'body read timed out');
+    if n <= 0 then
+      raise EHttpError.CreateStatus(400, 'body cut short');
+  end;
+end;
+
+{ The 100 Continue a client that sent Expect waits for, once, before
+  the first read of the body (RFC 9110 10.1.1, Go's expectContinueReader) }
+procedure SendContinue(C: THttpConn);
+begin
+  if C.Continue100 then
+  begin
+    C.Continue100 := False;
+    if not C.Sent then
+      SendAll(C, 'HTTP/1.1 100 Continue' + CRLF + CRLF);
+  end;
+end;
+
+{ The next chunk's size, the trailers after the last one }
+procedure BeginChunk(C: THttpConn);
+var
+  line: string;
+  i, d: Integer;
+  n: Int64;
+begin
+  line := BodyLine(C);
+  i := Pos(';', line);
+  if i > 0 then
+    SetLength(line, i - 1);
+  line := TrimOws(line);
+  if (line = '') or (Length(line) > 15) then
+    raise EHttpError.CreateStatus(400, 'bad chunk size');
+  n := 0;
+  for i := 1 to Length(line) do
+  begin
+    d := HexDigit(line[i]);
+    if d < 0 then
+      raise EHttpError.CreateStatus(400, 'bad chunk size');
+    n := n * 16 + d;
+  end;
+  C.ChunkLeft := n;
+  if n = 0 then
+  begin
+    { the trailer section, read and dropped (RFC 9112 7.1.2) }
+    repeat
+      line := BodyLine(C);
+    until line = '';
+    C.BodyEnded := True;
+  end;
+end;
+
+{ Up to MaxN bytes of the body, '' at its end }
+function BodyPiece(C: THttpConn; MaxN: Integer): string;
+var
+  n, k: Integer;
+  crlf2: string;
+begin
+  Result := '';
+  if C.BodyEnded or (MaxN <= 0) then
+    Exit;
+  SendContinue(C);
+  if C.Chunked then
+  begin
+    if C.ChunkLeft = 0 then
+    begin
+      BeginChunk(C);
+      if C.BodyEnded then
+        Exit;
+    end;
+    k := MaxN;
+    if k > C.ChunkLeft then
+      k := C.ChunkLeft;
+  end
+  else
+  begin
+    if C.BodyLeft = 0 then
+    begin
+      C.BodyEnded := True;
+      Exit;
+    end;
+    k := MaxN;
+    if k > C.BodyLeft then
+      k := C.BodyLeft;
+  end;
+  if Avail(C) = 0 then
+  begin
+    n := Fill(C, C.BodyDeadline);
+    if n = -110 then
+      raise EHttpError.CreateStatus(408, 'body read timed out');
+    if n <= 0 then
+      raise EHttpError.CreateStatus(400, 'body cut short');
+  end;
+  if k > Avail(C) then
+    k := Avail(C);
+  if C.BodyRead + k > C.BodyLimit then
+    raise EHttpError.CreateStatus(413, 'body larger than ' + IntToStr(C.BodyLimit) + ' bytes');
+  Result := TakeBytes(C, k);
+  C.BodyRead := C.BodyRead + k;
+  if C.Chunked then
+  begin
+    C.ChunkLeft := C.ChunkLeft - k;
+    if C.ChunkLeft = 0 then
+    begin
+      while Avail(C) < 2 do
+      begin
+        n := Fill(C, C.BodyDeadline);
+        if n = -110 then
+          raise EHttpError.CreateStatus(408, 'body read timed out');
+        if n <= 0 then
+          raise EHttpError.CreateStatus(400, 'body cut short');
+      end;
+      crlf2 := TakeBytes(C, 2);
+      if crlf2 <> CRLF then
+        raise EHttpError.CreateStatus(400, 'malformed chunked encoding');
+    end;
+  end
+  else
+  begin
+    C.BodyLeft := C.BodyLeft - k;
+    if C.BodyLeft = 0 then
+      C.BodyEnded := True;
+  end;
+end;
+
+function THttpRequest.ReadBody(MaxN: Integer): string;
+begin
+  Result := BodyPiece(FConn, MaxN);
+end;
+
+function THttpRequest.ReadAllBody: string;
+var
+  s: string;
+begin
+  Result := '';
+  repeat
+    s := BodyPiece(FConn, 65536);
+    Result := Result + s;
+  until s = '';
+end;
+
+function THttpRequest.ReadJson(MaxDepth: Integer): json;
+var
+  o: TJsonOptions;
+  e: EJsonError;
+  text: string;
+begin
+  text := ReadAllBody;
+  o := JsonDefaults;
+  o.MaxDepth := MaxDepth;
+  if not TryJsonParse(text, Result, e, o) then
+    raise EHttpError.CreateStatus(400, e.Message);
+end;
+
+{ ---- the query, the route's parameters, cookies ---- }
+
+{ name=value pairs separated by '&' (Go's url.ParseQuery): '+' a
+  space, a pair with a ';' or a bad escape dropped }
+procedure ParsePairs(const Text: string; var Names, Values: array of string);
+var
+  rest, part, k, v: string;
+  i, n: Integer;
+begin
+  rest := Text;
+  n := 0;
+  while rest <> '' do
+  begin
+    i := Pos('&', rest);
+    if i > 0 then
+    begin
+      part := Copy(rest, 1, i - 1);
+      rest := Copy(rest, i + 1, Length(rest) - i);
+    end
+    else
+    begin
+      part := rest;
+      rest := '';
+    end;
+    if (part = '') or (Pos(';', part) > 0) then
+      Continue;
+    i := Pos('=', part);
+    if i > 0 then
+    begin
+      if not HttpUnescape(Copy(part, 1, i - 1), True, k) then
+        Continue;
+      if not HttpUnescape(Copy(part, i + 1, Length(part) - i), True, v) then
+        Continue;
+    end
+    else
+    begin
+      if not HttpUnescape(part, True, k) then
+        Continue;
+      v := '';
+    end;
+    SetLength(Names, n + 1);
+    SetLength(Values, n + 1);
+    Names[n] := k;
+    Values[n] := v;
+    n := n + 1;
+  end;
+end;
+
+procedure ParseQuery(R: THttpRequest);
+begin
+  R.FQueryParsed := True;
+  ParsePairs(R.RawQuery, R.FQueryNames, R.FQueryValues);
+end;
+
+procedure ParseForm(R: THttpRequest);
+begin
+  R.FFormParsed := True;
+  if MediaType(R.Header.Get('Content-Type')) = 'application/x-www-form-urlencoded' then
+    ParsePairs(R.ReadAllBody, R.FFormNames, R.FFormValues);
+end;
+
+function THttpRequest.Form(const Name: string): string;
+var
+  i: Integer;
+begin
+  if not FFormParsed then
+    ParseForm(Self);
+  Result := '';
+  for i := 0 to High(FFormNames) do
+    if FFormNames[i] = Name then
+    begin
+      Result := FFormValues[i];
+      Exit;
+    end;
+end;
+
+function THttpRequest.FormValues(const Name: string): TStringArray;
+var
+  i, n: Integer;
+begin
+  if not FFormParsed then
+    ParseForm(Self);
+  Result := nil;
+  n := 0;
+  for i := 0 to High(FFormNames) do
+    if FFormNames[i] = Name then
+    begin
+      SetLength(Result, n + 1);
+      Result[n] := FFormValues[i];
+      n := n + 1;
+    end;
+end;
+
+function THttpRequest.HasForm(const Name: string): Boolean;
+var
+  i: Integer;
+begin
+  if not FFormParsed then
+    ParseForm(Self);
+  Result := False;
+  for i := 0 to High(FFormNames) do
+    if FFormNames[i] = Name then
+    begin
+      Result := True;
+      Exit;
+    end;
+end;
+
+function THttpRequest.Query(const Name: string): string;
+var
+  i: Integer;
+begin
+  if not FQueryParsed then
+    ParseQuery(Self);
+  Result := '';
+  for i := 0 to High(FQueryNames) do
+    if FQueryNames[i] = Name then
+    begin
+      Result := FQueryValues[i];
+      Exit;
+    end;
+end;
+
+function THttpRequest.QueryValues(const Name: string): TStringArray;
+var
+  i, n: Integer;
+begin
+  if not FQueryParsed then
+    ParseQuery(Self);
+  Result := nil;
+  n := 0;
+  for i := 0 to High(FQueryNames) do
+    if FQueryNames[i] = Name then
+    begin
+      SetLength(Result, n + 1);
+      Result[n] := FQueryValues[i];
+      n := n + 1;
+    end;
+end;
+
+function THttpRequest.HasQuery(const Name: string): Boolean;
+var
+  i: Integer;
+begin
+  if not FQueryParsed then
+    ParseQuery(Self);
+  Result := False;
+  for i := 0 to High(FQueryNames) do
+    if FQueryNames[i] = Name then
+    begin
+      Result := True;
+      Exit;
+    end;
+end;
+
+function THttpRequest.RemoteAddr: string;
+begin
+  if not FConn.PeerKnown then
+  begin
+    FConn.Peer := TcpPeer(FConn.Fd);
+    FConn.PeerKnown := True;
+  end;
+  Result := FConn.Peer;
+end;
+
+function THttpRequest.Param(const Name: string): string;
+var
+  i: Integer;
+begin
+  Result := '';
+  for i := 0 to High(FParamNames) do
+    if FParamNames[i] = Name then
+    begin
+      Result := FParamValues[i];
+      Exit;
+    end;
+end;
+
+function ValidCookieValueByte(C: Char): Boolean;
+begin
+  Result := (Ord(C) >= $20) and (Ord(C) < $7F) and (C <> '"') and (C <> ';') and (C <> '\');
+end;
+
+{ Go's readCookies: the Cookie lines split at ';', each name=value whose
+  name is a token and whose value, its quotes taken off, holds only the
+  bytes RFC 6265 allows; Found says whether Name was there }
+function FindCookie(R: THttpRequest; const Name: string; out Found: Boolean): string;
+var
+  lines: TStringArray;
+  line, part, k, v: string;
+  i, j: Integer;
+  ok: Boolean;
+begin
+  Result := '';
+  Found := False;
+  lines := R.Header.Values('Cookie');
+  for i := 0 to High(lines) do
+  begin
+    line := lines[i];
+    while line <> '' do
+    begin
+      j := Pos(';', line);
+      if j > 0 then
+      begin
+        part := TrimOws(Copy(line, 1, j - 1));
+        line := Copy(line, j + 1, Length(line) - j);
+      end
+      else
+      begin
+        part := TrimOws(line);
+        line := '';
+      end;
+      if part = '' then
+        Continue;
+      j := Pos('=', part);
+      if j > 0 then
+      begin
+        k := TrimOws(Copy(part, 1, j - 1));
+        v := Copy(part, j + 1, Length(part) - j);
+      end
+      else
+      begin
+        k := part;
+        v := '';
+      end;
+      if (k <> Name) or not IsToken(k) then
+        Continue;
+      if (Length(v) > 1) and (v[1] = '"') and (v[Length(v)] = '"') then
+        v := Copy(v, 2, Length(v) - 2);
+      ok := True;
+      for j := 1 to Length(v) do
+        if not ValidCookieValueByte(v[j]) then
+          ok := False;
+      if not ok then
+        Continue;
+      Result := v;
+      Found := True;
+      Exit;
+    end;
+  end;
+end;
+
+function THttpRequest.Cookie(const Name: string): string;
+var
+  found: Boolean;
+begin
+  Result := FindCookie(Self, Name, found);
+end;
+
+function THttpRequest.HasCookie(const Name: string): Boolean;
+begin
+  FindCookie(Self, Name, Result);
+end;
+
+{ ---- multipart/form-data (RFC 7578, RFC 2046 5.1; Go's mime/multipart) ---- }
+
+{ The parameter Key of a header value like 'form-data; name="a"' (RFC
+  9110 5.6.6, a quoted-string with its backslashes), '' when absent;
+  key* by RFC 8187 (charset''pct-encoded) wins over key, as Go's
+  mime.ParseMediaType decodes it }
+function HeaderParam(const Value, Key: string): string;
+var
+  i, j, n: Integer;
+  k, v, star: string;
+  quoted: Boolean;
+begin
+  Result := '';
+  star := '';
+  n := Length(Value);
+  i := Pos(';', Value);
+  if i = 0 then
+    Exit;
+  while i <= n do
+  begin
+    { past ';' and spaces }
+    while (i <= n) and ((Value[i] = ';') or (Value[i] = ' ') or (Value[i] = #9)) do
+      i := i + 1;
+    j := i;
+    while (j <= n) and (Value[j] <> '=') and (Value[j] <> ';') do
+      j := j + 1;
+    k := LowerAscii(TrimOws(Copy(Value, i, j - i)));
+    v := '';
+    quoted := False;
+    if (j <= n) and (Value[j] = '=') then
+    begin
+      j := j + 1;
+      while (j <= n) and ((Value[j] = ' ') or (Value[j] = #9)) do
+        j := j + 1;
+      if (j <= n) and (Value[j] = '"') then
+      begin
+        quoted := True;
+        j := j + 1;
+        while (j <= n) and (Value[j] <> '"') do
+        begin
+          if (Value[j] = '\') and (j < n) then
+            j := j + 1;
+          v := v + Value[j];
+          j := j + 1;
+        end;
+        j := j + 1;
+      end
+      else
+      begin
+        i := j;
+        while (j <= n) and (Value[j] <> ';') do
+          j := j + 1;
+        v := TrimOws(Copy(Value, i, j - i));
+      end;
+    end;
+    if (k = LowerAscii(Key) + '*') and not quoted then
+      star := v
+    else if (k = LowerAscii(Key)) and (Result = '') then
+      Result := v;
+    i := j;
+  end;
+  if star <> '' then
+  begin
+    { charset'language'value; UTF-8 and US-ASCII are taken as they are }
+    i := Pos('''', star);
+    if i > 0 then
+    begin
+      j := Pos('''', star, i + 1);
+      if (j > 0) and (EqualFold(Copy(star, 1, i - 1), 'utf-8') or
+        EqualFold(Copy(star, 1, i - 1), 'us-ascii')) and
+        HttpUnescape(Copy(star, j + 1, Length(star) - j), False, v) then
+        Result := v;
+    end;
+  end;
+end;
+
+
+{ More of the body into the multipart reader's buffer; False at its end }
+function MpMore(M: THttpMultipart): Boolean;
+var
+  s: string;
+begin
+  Result := False;
+  if M.FEof then
+    Exit;
+  s := BodyPiece(M.FConn, 65536);
+  if s = '' then
+  begin
+    M.FEof := True;
+    Exit;
+  end;
+  if M.FPos > 1 then
+  begin
+    M.FBuf := Copy(M.FBuf, M.FPos, Length(M.FBuf) - M.FPos + 1);
+    M.FPos := 1;
+  end;
+  M.FBuf := M.FBuf + s;
+  Result := True;
+end;
+
+{ A line of the multipart body without its LF, and the CR before it
+  taken off (HadCR); False at the end of the body with no LF left, the
+  rest in Line }
+function MpLine(M: THttpMultipart; Limit: Integer; out Line: string; out HadCR: Boolean): Boolean;
+var
+  i: Integer;
+begin
+  HadCR := False;
+  while True do
+  begin
+    i := Pos(#10, M.FBuf, M.FPos);
+    if i > 0 then
+    begin
+      Line := Copy(M.FBuf, M.FPos, i - M.FPos);
+      M.FPos := i + 1;
+      if (Line <> '') and (Line[Length(Line)] = #13) then
+      begin
+        SetLength(Line, Length(Line) - 1);
+        HadCR := True;
+      end;
+      Result := True;
+      Exit;
+    end;
+    if Length(M.FBuf) - M.FPos + 1 > Limit then
+      raise EHttpError.CreateStatus(400, 'multipart line too long');
+    if not MpMore(M) then
+    begin
+      Line := Copy(M.FBuf, M.FPos, Length(M.FBuf) - M.FPos + 1);
+      M.FPos := Length(M.FBuf) + 1;
+      Result := False;
+      Exit;
+    end;
+  end;
+end;
+
+{ S without the spaces and tabs at its end, RFC 2046's transport padding }
+function TrimRightLwsp(const S: string): string;
+var
+  n: Integer;
+begin
+  n := Length(S);
+  while (n > 0) and ((S[n] = ' ') or (S[n] = #9)) do
+    n := n - 1;
+  Result := Copy(S, 1, n);
+end;
+
+{ After a delimiter: '--' ends the body (Go's isFinalBoundary), an empty
+  line starts the next part's head }
+procedure AfterDelimiter(M: THttpMultipart);
+var
+  line: string;
+  got, cr: Boolean;
+begin
+  got := MpLine(M, 1024, line, cr);
+  line := TrimRightLwsp(line);
+  if line = '--' then
+    M.FEnded := True
+  else if line <> '' then
+    raise EHttpError.CreateStatus(400, 'malformed multipart delimiter')
+  else if not got then
+    raise EHttpError.CreateStatus(400, 'multipart body cut short');
+end;
+
+{ The head of a part: lines up to an empty one, 10 KiB and 100 lines at
+  most }
+procedure ReadPartHead(M: THttpMultipart; P: THttpPart);
+var
+  line, k, v: string;
+  i, bytes: Integer;
+  cr: Boolean;
+begin
+  bytes := 0;
+  while True do
+  begin
+    if not MpLine(M, 10240, line, cr) then
+      raise EHttpError.CreateStatus(400, 'multipart body cut short');
+    bytes := bytes + Length(line) + 2;
+    if bytes > 10240 then
+      raise EHttpError.CreateStatus(400, 'multipart part head too long');
+    if line = '' then
+      Exit;
+    i := Pos(':', line);
+    if i <= 1 then
+      raise EHttpError.CreateStatus(400, 'malformed multipart part head');
+    if P.Header.Count >= 100 then
+      raise EHttpError.CreateStatus(400, 'too many multipart header lines');
+    k := Copy(line, 1, i - 1);
+    v := TrimOws(Copy(line, i + 1, Length(line) - i));
+    P.Header.Add(k, v);
+  end;
+end;
+
+{ Up to MaxN bytes of the part before the next delimiter (Go's
+  scanUntilBoundary): what lies before a delimiter found is the part's;
+  without one, all but the delimiter's length less one bytes, which may
+  be its start, are; the rest waits for more of the body }
+function PartPiece(P: THttpPart; MaxN: Integer): string;
+var
+  m: THttpMultipart;
+  i, j, k, n: Integer;
+begin
+  Result := '';
+  m := P.FMp;
+  if P.FDone or (MaxN <= 0) then
+    Exit;
+  while True do
+  begin
+    i := Pos(m.FDelim, m.FBuf, m.FPos);
+    if i > 0 then
+    begin
+      n := i - m.FPos;
+      if n = 0 then
+      begin
+        { Go's matchAfterPrefix: a space, a tab, CR, LF or '--' after
+          the delimiter make it one; another byte makes it data; too
+          few bytes yet wait for more }
+        j := i + Length(m.FDelim);
+        if j > Length(m.FBuf) then
+          k := 0
+        else if m.FBuf[j] in [' ', #9, #13, #10] then
+          k := 1
+        else if m.FBuf[j] = '-' then
+        begin
+          if j + 1 > Length(m.FBuf) then
+            k := 0
+          else if m.FBuf[j + 1] = '-' then
+            k := 1
+          else
+            k := -1;
+        end
+        else
+          k := -1;
+        if (k = 0) and m.FEof then
+          k := 1;
+        if k = 1 then
+        begin
+          m.FPos := j;
+          P.FDone := True;
+          AfterDelimiter(m);
+          Exit;
+        end;
+        if k = -1 then
+          n := Length(m.FDelim);
+      end;
+    end
+    else
+      n := Length(m.FBuf) - m.FPos + 1 - (Length(m.FDelim) - 1);
+    if n > 0 then
+    begin
+      if n > MaxN then
+        n := MaxN;
+      Result := Copy(m.FBuf, m.FPos, n);
+      m.FPos := m.FPos + n;
+      Exit;
+    end;
+    if not MpMore(m) then
+      raise EHttpError.CreateStatus(400, 'multipart body cut short');
+  end;
+end;
+
+function THttpPart.ReadData(MaxN: Integer): string;
+begin
+  Result := PartPiece(Self, MaxN);
+end;
+
+function THttpPart.ReadAllData(Limit: Integer): string;
+var
+  s: string;
+begin
+  Result := '';
+  repeat
+    s := PartPiece(Self, 65536);
+    if Length(Result) + Length(s) > Limit then
+      raise EHttpError.CreateStatus(413, 'part larger than ' + IntToStr(Limit) + ' bytes');
+    Result := Result + s;
+  until s = '';
+end;
+
+{ Go's Part.FileName: the last element of the path the client sent }
+function BaseOf(const S: string): string;
+var
+  i: Integer;
+begin
+  Result := S;
+  for i := Length(S) downto 1 do
+    if S[i] = '/' then
+    begin
+      Result := Copy(S, i + 1, Length(S) - i);
+      Break;
+    end;
+  if (Result = '.') or (Result = '..') then
+    Result := '';
+end;
+
+function THttpMultipart.Next: THttpPart;
+var
+  line, rest: string;
+  got, cr: Boolean;
+  p: THttpPart;
+  cd: string;
+begin
+  Result := nil;
+  if FEnded then
+    Exit;
+  if (FPart <> nil) and not FPart.FDone then
+    while PartPiece(FPart, 65536) <> '' do
+      ;
+  if FEnded then
+    Exit;
+  if FParts = 0 then
+  begin
+    { the preamble, up to the first boundary line (RFC 2046 5.1.1) }
+    while True do
+    begin
+      got := MpLine(Self, 10240, line, cr);
+      if Copy(line, 1, Length(FDash)) = FDash then
+      begin
+        rest := TrimRightLwsp(Copy(line, Length(FDash) + 1, Length(line) - Length(FDash)));
+        if rest = '' then
+        begin
+          if not cr then
+            FDelim := #10 + FDash;
+          Break;
+        end;
+        if rest = '--' then
+        begin
+          FEnded := True;
+          Exit;
+        end;
+      end;
+      if not got then
+        raise EHttpError.CreateStatus(400, 'multipart body has no boundary');
+    end;
+  end;
+  if FParts >= 1000 then
+    raise EHttpError.CreateStatus(400, 'too many multipart parts');
+  p := THttpPart.Create;
+  p.FMp := Self;
+  p.Header := THttpHeaders.Create;
+  ReadPartHead(Self, p);
+  cd := p.Header.Get('Content-Disposition');
+  p.Name := HeaderParam(cd, 'name');
+  p.FileName := BaseOf(HeaderParam(cd, 'filename'));
+  p.ContentType := p.Header.Get('Content-Type');
+  FParts := FParts + 1;
+  FPart := p;
+  Result := p;
+end;
+
+function THttpRequest.Multipart: THttpMultipart;
+var
+  ct, b: string;
+  m: THttpMultipart;
+begin
+  if FMultipart <> nil then
+    Exit(FMultipart);
+  ct := Header.Get('Content-Type');
+  if MediaType(ct) <> 'multipart/form-data' then
+    raise EHttpError.CreateStatus(400, 'not multipart/form-data');
+  b := HeaderParam(ct, 'boundary');
+  { RFC 2046 5.1.1: 1 to 70 characters }
+  if (b = '') or (Length(b) > 70) then
+    raise EHttpError.CreateStatus(400, 'bad multipart boundary');
+  m := THttpMultipart.Create;
+  m.FConn := FConn;
+  m.FPos := 1;
+  m.FDash := '--' + b;
+  m.FDelim := CRLF + m.FDash;
+  FMultipart := m;
+  Result := m;
+end;
+
+{ ---- the response ---- }
+
+function NoBodyStatus(Code: Integer): Boolean;
+begin
+  Result := ((Code >= 100) and (Code < 200)) or (Code = 204) or (Code = 304);
+end;
+
+function ValidValueByte(C: Char): Boolean;
+begin
+  Result := (Ord(C) >= 32) and (Ord(C) <> 127) or (C = #9) or (Ord(C) >= 128);
+end;
+
+{ A value as Go's Header.Write puts it: a CR or an LF a space, the ends
+  trimmed }
+function CleanValue(const V: string): string;
+var
+  i: Integer;
+  clean: Boolean;
+begin
+  clean := (V = '') or ((V[1] <> ' ') and (V[1] <> #9) and (V[Length(V)] <> ' ') and (V[Length(V)] <> #9));
+  for i := 1 to Length(V) do
+    if (V[i] = #13) or (V[i] = #10) or not ValidValueByte(V[i]) then
+      clean := False;
+  if clean then
+    Exit(V);
+  Result := V;
+  for i := 1 to Length(Result) do
+    if (Result[i] = #13) or (Result[i] = #10) or not ValidValueByte(Result[i]) then
+      Result[i] := ' ';
+  Result := TrimOws(Result);
+end;
+
+{ The wall clock's second from Nanotime (the vDSO's monotonic clock) and
+  an offset to CLOCK_REALTIME the server takes again each minute, as
+  reading the wall clock is a system call (pastime's NowNanos) }
+function DateNow(C: THttpConn): string;
+var
+  t, m: Int64;
+  S: THttpServer;
+begin
+  S := C.Server;
+  m := Nanotime;
+  if m - AtomicLoad(S.FCalibrated) > 60000000000 then
+  begin
+    AtomicStore(S.FWallOffset, NowNanos - Nanotime);
+    AtomicStore(S.FCalibrated, m);
+  end;
+  t := (m + AtomicLoad(S.FWallOffset)) div 1000000000;
+  if t <> C.DateSec then
+  begin
+    C.DateSec := t;
+    C.DateText := HttpDate(t);
+  end;
+  Result := C.DateText;
+end;
+
+procedure OutRoom(C: THttpConn; N: Integer);
+var
+  k: Integer;
+begin
+  if C.OutLen + N > Length(C.OutBuf) then
+  begin
+    k := Length(C.OutBuf) * 2;
+    if k < C.OutLen + N then
+      k := C.OutLen + N + 1024;
+    SetLength(C.OutBuf, k);
+  end;
+end;
+
+procedure OutStr(C: THttpConn; const S: string);
+begin
+  if S = '' then
+    Exit;
+  OutRoom(C, Length(S));
+  Move(S[1], C.OutBuf[C.OutLen], Length(S));
+  C.OutLen := C.OutLen + Length(S);
+end;
+
+procedure OutInt(C: THttpConn; N: Int64);
+var
+  d: array[0..19] of Byte;
+  k, i: Integer;
+begin
+  k := 0;
+  repeat
+    d[k] := Byte(48 + N mod 10);
+    N := N div 10;
+    k := k + 1;
+  until N = 0;
+  OutRoom(C, k);
+  for i := k - 1 downto 0 do
+  begin
+    C.OutBuf[C.OutLen] := d[i];
+    C.OutLen := C.OutLen + 1;
+  end;
+end;
+
+{ What OutBuf gathered, out before the write deadline }
+function FlushOut(C: THttpConn): Boolean;
+var
+  p, n: Integer;
+begin
+  Result := not C.Broken;
+  p := 0;
+  while (p < C.OutLen) and not C.Broken do
+  begin
+    n := PasIoWrite(C.Fd, @C.OutBuf[p], C.OutLen - p, C.WriteDeadline);
+    if n <= 0 then
+    begin
+      C.Broken := True;
+      Result := False;
+      Break;
+    end;
+    p := p + n;
+  end;
+  C.OutWritten := C.OutWritten + p;
+  C.OutLen := 0;
+end;
+
+{ The head: the status line, the handler's lines and Date, and the
+  framing: Content-Length when Length is known (0 or more) or put by the
+  handler, chunked on HTTP/1.1 otherwise, the end of the connection on
+  HTTP/1.0 (RFC 9112 6.3, Go's chunkWriter.writeHeader) }
+procedure MakeHead(C: THttpConn; Length_: Int64);
+var
+  h: THttpHeaders;
+  i: Integer;
+  cl: Int64;
+  name: string;
+  setLen: Boolean;
+begin
+  h := C.Resp.Header;
+  C.OutChunked := False;
+  C.OutLength := -1;
+  setLen := False;
+  if AtomicLoad(C.Server.FClosing) <> 0 then
+    C.KeepAlive := False;
+  if NoBodyStatus(C.StatusCode) then
+  begin
+    h.Remove('Content-Length');
+    h.Remove('Transfer-Encoding');
+  end
+  else if h.Has('Content-Length') then
+  begin
+    if TryStrToInt64(h.Get('Content-Length'), cl) and (cl >= 0) then
+      C.OutLength := cl
+    else
+    begin
+      h.Remove('Content-Length');
+      C.KeepAlive := False;
+    end;
+  end
+  else if Length_ >= 0 then
+  begin
+    C.OutLength := Length_;
+    setLen := True;
+  end
+  else if C.Proto11 and not C.IsHead then
+  begin
+    C.OutChunked := True;
+    h.Put('Transfer-Encoding', 'chunked');
+  end
+  else
+    C.KeepAlive := False;
+  if C.Proto11 then
+    OutStr(C, 'HTTP/1.1 ')
+  else
+    OutStr(C, 'HTTP/1.0 ');
+  OutInt(C, C.StatusCode);
+  OutStr(C, ' ');
+  OutStr(C, HttpStatusText(C.StatusCode));
+  OutStr(C, CRLF);
+  for i := 0 to h.Count - 1 do
+  begin
+    name := h.NameAt(i);
+    if not IsToken(name) or EqualFold(name, 'Connection') or EqualFold(name, 'Date') then
+      Continue;
+    OutStr(C, name);
+    OutStr(C, ': ');
+    OutStr(C, CleanValue(h.ValueAt(i)));
+    OutStr(C, CRLF);
+  end;
+  if setLen then
+  begin
+    OutStr(C, 'Content-Length: ');
+    OutInt(C, Length_);
+    OutStr(C, CRLF);
+  end;
+  OutStr(C, 'Date: ');
+  OutStr(C, DateNow(C));
+  OutStr(C, CRLF);
+  if not C.KeepAlive and C.Proto11 then
+    OutStr(C, 'Connection: close' + CRLF)
+  else if C.KeepAlive and not C.Proto11 then
+    OutStr(C, 'Connection: keep-alive' + CRLF);
+  OutStr(C, CRLF);
+  C.Sent := True;
+end;
+
+function HexLen(N: Integer): string;
+const
+  Hexs: string = '0123456789abcdef';
+begin
+  Result := '';
+  repeat
+    Result := Hexs[(N and 15) + 1] + Result;
+    N := N shr 4;
+  until N = 0;
+end;
+
+{ Body bytes after what OutBuf holds (the head, or nothing), in their
+  framing, and all of it out: a body up to 64 KiB in the same write as
+  the head, a larger one written from its own string; nothing of the
+  body for HEAD or a status that has none }
+procedure Emit(C: THttpConn; const Data: string);
+var
+  quiet: Boolean;
+begin
+  quiet := C.IsHead or NoBodyStatus(C.StatusCode);
+  if (Data <> '') and not quiet then
+  begin
+    if (C.OutLength >= 0) and (C.OutBody + Length(Data) > C.OutLength) then
+    begin
+      C.Broken := True;
+      raise Exception.Create('httpserver: wrote more than the declared Content-Length');
+    end;
+    C.OutBody := C.OutBody + Length(Data);
+  end;
+  if quiet or (Data = '') then
+  begin
+    FlushOut(C);
+    Exit;
+  end;
+  if C.OutChunked then
+  begin
+    OutStr(C, HexLen(Length(Data)));
+    OutStr(C, CRLF);
+  end;
+  if Length(Data) <= 65536 then
+  begin
+    OutStr(C, Data);
+    if C.OutChunked then
+      OutStr(C, CRLF);
+    FlushOut(C);
+    Exit;
+  end;
+  FlushOut(C);
+  SendAll(C, Data);
+  if C.OutChunked then
+    SendAll(C, CRLF);
+end;
+
+procedure THttpResponse.SetStatus(Code: Integer);
+begin
+  if not FConn.Sent and (Code >= 100) and (Code <= 999) then
+    FConn.StatusCode := Code;
+end;
+
+function THttpResponse.Status: Integer;
+begin
+  Result := FConn.StatusCode;
+end;
+
+function THttpResponse.HeadSent: Boolean;
+begin
+  Result := FConn.Sent;
+end;
+
+procedure THttpResponse.WriteData(const Data: string);
+var
+  c: THttpConn;
+  held: string;
+begin
+  c := FConn;
+  if not c.Sent then
+  begin
+    c.Held := c.Held + Data;
+    { up to 16 KiB is held, so a small answer goes whole with its length }
+    if Length(c.Held) <= 16384 then
+      Exit;
+    held := c.Held;
+    c.Held := '';
+    MakeHead(c, c.KnownLen);
+    Emit(c, held);
+    Exit;
+  end;
+  Emit(c, Data);
+end;
+
+procedure THttpResponse.Reply(Code: Integer; const ContentType, Body: string);
+begin
+  SetStatus(Code);
+  if not FConn.Sent then
+  begin
+    if ContentType <> '' then
+      Header.Put('Content-Type', ContentType);
+    if FConn.Held = '' then
+      FConn.KnownLen := Length(Body);
+  end;
+  WriteData(Body);
+end;
+
+procedure THttpResponse.ReplyText(Code: Integer; const Body: string);
+begin
+  Reply(Code, 'text/plain; charset=utf-8', Body);
+end;
+
+procedure THttpResponse.ReplyJson(Code: Integer; const V: json);
+begin
+  Reply(Code, 'application/json; charset=utf-8', JsonEncode(V));
+end;
+
+{ Go's http.Error }
+procedure THttpResponse.ReplyError(Code: Integer; const Message: string);
+begin
+  if not FConn.Sent then
+  begin
+    Header.Remove('Content-Length');
+    Header.Put('Content-Type', 'text/plain; charset=utf-8');
+    Header.Put('X-Content-Type-Options', 'nosniff');
+  end;
+  Reply(Code, '', Message + #10);
+end;
+
+procedure THttpResponse.Redirect(Code: Integer; const Location: string);
+begin
+  if not FConn.Sent then
+    Header.Put('Location', Location);
+  Reply(Code, '', '');
+end;
+
+function ValidPathByte(C: Char): Boolean;
+begin
+  Result := (Ord(C) >= $20) and (Ord(C) < $7F) and (C <> ';');
+end;
+
+{ Go's Cookie.String: the value kept to RFC 6265's bytes and quoted when
+  it holds a space or a comma; a bad name sets nothing; a bad domain is
+  left out }
+procedure THttpResponse.SetCookie(const C: THttpCookie);
+var
+  v, path, s: string;
+  i: Integer;
+  okDomain: Boolean;
+begin
+  if FConn.Sent or not IsToken(C.Name) then
+    Exit;
+  v := '';
+  for i := 1 to Length(C.Value) do
+    if ValidCookieValueByte(C.Value[i]) then
+      v := v + C.Value[i];
+  if (Pos(' ', v) > 0) or (Pos(',', v) > 0) then
+    v := '"' + v + '"';
+  s := C.Name + '=' + v;
+  if C.Path <> '' then
+  begin
+    path := '';
+    for i := 1 to Length(C.Path) do
+      if ValidPathByte(C.Path[i]) then
+        path := path + C.Path[i];
+    s := s + '; Path=' + path;
+  end;
+  if C.Domain <> '' then
+  begin
+    okDomain := Length(C.Domain) <= 255;
+    for i := 1 to Length(C.Domain) do
+      if not (C.Domain[i] in ['a'..'z', 'A'..'Z', '0'..'9', '-', '.']) then
+        okDomain := False;
+    if okDomain then
+    begin
+      if C.Domain[1] = '.' then
+        s := s + '; Domain=' + Copy(C.Domain, 2, Length(C.Domain) - 1)
+      else
+        s := s + '; Domain=' + C.Domain;
+    end;
+  end;
+  if C.MaxAge > 0 then
+    s := s + '; Max-Age=' + IntToStr(C.MaxAge)
+  else if C.MaxAge < 0 then
+    s := s + '; Max-Age=0';
+  if C.HttpOnly then
+    s := s + '; HttpOnly';
+  if C.Secure then
+    s := s + '; Secure';
+  if EqualFold(C.SameSite, 'Strict') then
+    s := s + '; SameSite=Strict'
+  else if EqualFold(C.SameSite, 'Lax') then
+    s := s + '; SameSite=Lax'
+  else if EqualFold(C.SameSite, 'None') then
+    s := s + '; SameSite=None';
+  Header.Add('Set-Cookie', s);
+end;
+
+{ RFC 8187 3.2.1's attr-char kept, every other byte %XX, for filename* }
+function ExtValue(const S: string): string;
+const
+  Hexs: string = '0123456789ABCDEF';
+var
+  i: Integer;
+  c: Char;
+begin
+  Result := '';
+  for i := 1 to Length(S) do
+  begin
+    c := S[i];
+    if c in ['a'..'z', 'A'..'Z', '0'..'9', '!', '#', '$', '&', '+', '-', '.', '^', '_', '`', '|', '~'] then
+      Result := Result + c
+    else
+      Result := Result + '%' + Hexs[Ord(c) shr 4 + 1] + Hexs[(Ord(c) and 15) + 1];
+  end;
+end;
+
+{ the name for an old client: ASCII printable, no quote and no backslash
+  (RFC 6266 appendix D) }
+function AsciiName(const S: string): string;
+var
+  i: Integer;
+begin
+  Result := S;
+  for i := 1 to Length(Result) do
+    if (Ord(Result[i]) < 32) or (Ord(Result[i]) > 126) or (Result[i] = '"') or (Result[i] = '\') then
+      Result[i] := '_';
+end;
+
+function SysOpenAt: Integer;
+begin
+  if Amd64 = 1 then
+    Result := 257
+  else
+    Result := 56;
+end;
+
+function SysStatx: Integer;
+begin
+  if Amd64 = 1 then
+    Result := 332
+  else
+    Result := 291;
+end;
+
+function SysSendfile: Integer;
+begin
+  if Amd64 = 1 then
+    Result := 40
+  else
+    Result := 71;
+end;
+
+function SysCloseNr: Integer;
+begin
+  if Amd64 = 1 then
+    Result := 3
+  else
+    Result := 57;
+end;
+
+function THttpResponse.ServeFile(const Path, ContentType, DownloadName: string): Boolean;
+var
+  c: THttpConn;
+  p, empty: string;
+  fd, n, r: Integer;
+  st: array[0..31] of Int64;
+  mode, size, off, left, want: Int64;
+begin
+  Result := False;
+  c := FConn;
+  p := Path + #0;
+  fd := Syscall(SysOpenAt, -100, @p[1], $80000, 0);
+  if fd < 0 then
+  begin
+    ReplyError(404, '404 page not found');
+    Exit;
+  end;
+  { statx(fd, "", AT_EMPTY_PATH, STATX_TYPE | STATX_SIZE): stx_mode is
+    the 16 bits at 28, stx_size the 64 at 40 (linux/stat.h) }
+  empty := #0;
+  r := Syscall(SysStatx, fd, @empty[1], $1000, $201, @st[0]);
+  mode := (st[3] shr 32) and $FFFF;
+  size := st[5];
+  if (r < 0) or ((mode and $F000) <> $8000) or c.Sent or (c.Held <> '') then
+  begin
+    n := Syscall(SysCloseNr, fd);
+    if not c.Sent then
+      ReplyError(404, '404 page not found');
+    Exit;
+  end;
+  if ContentType <> '' then
+    Header.Put('Content-Type', ContentType);
+  Header.Put('Content-Length', IntToStr(size));
+  if DownloadName <> '' then
+    Header.Put('Content-Disposition', 'attachment; filename="' + AsciiName(DownloadName) +
+      '"; filename*=UTF-8''''' + ExtValue(DownloadName));
+  MakeHead(c, size);
+  if not FlushOut(c) then
+  begin
+    n := Syscall(SysCloseNr, fd);
+    Exit;
+  end;
+  if not c.IsHead then
+  begin
+    { sendfile(2) from the file's offset off, parked while the socket is
+      full; a file that grows shorter on the way breaks the connection }
+    off := 0;
+    left := size;
+    while left > 0 do
+    begin
+      want := left;
+      if want > 1073741824 then
+        want := 1073741824;
+      repeat
+        n := Syscall(SysSendfile, c.Fd, fd, @off, want);
+      until not PasIoRetry(n, c.Fd, 4, c.WriteDeadline);
+      if n <= 0 then
+      begin
+        c.Broken := True;
+        Break;
+      end;
+      left := left - n;
+      c.OutWritten := c.OutWritten + n;
+    end;
+    c.OutBody := size - left;
+  end;
+  n := Syscall(SysCloseNr, fd);
+  Result := not c.Broken;
+end;
+
+{ ---- the router ---- }
+
+function SplitPath(const P: string): TStringArray;
+var
+  i, a, n: Integer;
+begin
+  Result := nil;
+  n := 0;
+  a := 2;
+  for i := 2 to Length(P) + 1 do
+    if (i > Length(P)) or (P[i] = '/') then
+    begin
+      SetLength(Result, n + 1);
+      Result[n] := Copy(P, a, i - a);
+      n := n + 1;
+      a := i + 1;
+    end;
+end;
+
+procedure THttpRouter.Use(M: THttpMiddleware);
+var
+  n: Integer;
+begin
+  n := Length(FMiddleware);
+  SetLength(FMiddleware, n + 1);
+  FMiddleware[n] := M;
+end;
+
+{ each route's handler inside the middleware, the first used outermost }
+procedure WrapRoutes(R: THttpRouter);
+var
+  i, k: Integer;
+  h: THttpHandler;
+begin
+  for i := 0 to High(R.FRoutes) do
+  begin
+    h := R.FRoutes[i].Handler;
+    for k := High(R.FMiddleware) downto 0 do
+      h := R.FMiddleware[k](h);
+    R.FRoutes[i].Run := h;
+  end;
+end;
+
+procedure THttpRouter.Handle(const Method, Pattern: string; Handler: THttpHandler; MaxBody: Int64);
+var
+  n: Integer;
+begin
+  if (Pattern = '') or (Pattern[1] <> '/') then
+    raise Exception.Create('httpserver: a pattern starts with /: ' + Pattern);
+  n := Length(FRoutes);
+  SetLength(FRoutes, n + 1);
+  FRoutes[n].Method := Method;
+  FRoutes[n].Segs := SplitPath(Pattern);
+  FRoutes[n].Handler := Handler;
+  FRoutes[n].Run := Handler;
+  FRoutes[n].MaxBody := MaxBody;
+end;
+
+function SegLen(const V: TSegView; I: Integer): Integer;
+begin
+  if V.Decoded then
+    Result := Length(V.Decs[I])
+  else
+    Result := V.B[I] - V.A[I];
+end;
+
+function SegStr(const V: TSegView; I: Integer): string;
+begin
+  if V.Decoded then
+    Result := V.Decs[I]
+  else
+    Result := Copy(V.Raw, V.A[I], V.B[I] - V.A[I]);
+end;
+
+function SegIs(const V: TSegView; I: Integer; const S: string): Boolean;
+begin
+  if V.Decoded then
+    Exit(V.Decs[I] = S);
+  Result := (Length(S) = V.B[I] - V.A[I]) and ((S = '') or (CompareByte(S[1], V.Raw[V.A[I]], Length(S)) = 0));
+end;
+
+{ the segments from I to the end, joined by '/' }
+function SegRest(const V: TSegView; I: Integer): string;
+var
+  j: Integer;
+begin
+  if not V.Decoded then
+  begin
+    if I >= V.Count then
+      Exit('');
+    Exit(Copy(V.Raw, V.A[I], Length(V.Raw) - V.A[I] + 1));
+  end;
+  Result := '';
+  for j := I to V.Count - 1 do
+  begin
+    if j > I then
+      Result := Result + '/';
+    Result := Result + V.Decs[j];
+  end;
+end;
+
+{ The view of Raw, a path that starts with '/'; False for a segment '.'
+  or '..' or an escape that does not decode }
+function ViewPath(const Raw: string; out V: TSegView): Boolean;
+var
+  i, a, n: Integer;
+  value: string;
+begin
+  Result := False;
+  V.Raw := Raw;
+  V.Decoded := Pos('%', Raw) > 0;
+  n := 0;
+  a := 2;
+  if not V.Decoded then
+    for i := 2 to Length(Raw) + 1 do
+      if (i > Length(Raw)) or (Raw[i] = '/') then
+      begin
+        if n >= 32 then
+        begin
+          V.Decoded := True;
+          Break;
+        end;
+        V.A[n] := a;
+        V.B[n] := i;
+        if ((i - a = 1) and (Raw[a] = '.')) or ((i - a = 2) and (Raw[a] = '.') and (Raw[a + 1] = '.')) then
+          Exit;
+        n := n + 1;
+        a := i + 1;
+      end;
+  if V.Decoded then
+  begin
+    V.Decs := SplitPath(Raw);
+    n := Length(V.Decs);
+    for i := 0 to n - 1 do
+    begin
+      if (V.Decs[i] = '.') or (V.Decs[i] = '..') or not HttpUnescape(V.Decs[i], False, value) then
+        Exit;
+      V.Decs[i] := value;
+    end;
+  end;
+  V.Count := n;
+  Result := True;
+end;
+
+{ Whether route R takes the path's segments: its score, two bits a
+  segment, 3 literal, 2 :name, 1 *name, so the most specific is the
+  greatest; -1 when it does not }
+function RouteScore(const R: THttpRoute; const V: TSegView): Int64;
+var
+  i: Integer;
+  s: string;
+begin
+  Result := 0;
+  for i := 0 to High(R.Segs) do
+  begin
+    s := R.Segs[i];
+    if (s <> '') and (s[1] = '*') and (i = High(R.Segs)) then
+    begin
+      if V.Count < i then
+        Exit(-1);
+      Result := Result * 4 + 1;
+      Exit;
+    end;
+    if i >= V.Count then
+      Exit(-1);
+    if (s <> '') and (s[1] = ':') then
+    begin
+      if SegLen(V, i) = 0 then
+        Exit(-1);
+      Result := Result * 4 + 2;
+    end
+    else if SegIs(V, i, s) then
+      Result := Result * 4 + 3
+    else
+      Exit(-1);
+  end;
+  if V.Count <> Length(R.Segs) then
+    Result := -1;
+end;
+
+{ The parameters route R takes from the path }
+procedure BindParams(Req: THttpRequest; const R: THttpRoute; const V: TSegView);
+var
+  i, n: Integer;
+  s, v2: string;
+begin
+  n := 0;
+  for i := 0 to High(R.Segs) do
+  begin
+    s := R.Segs[i];
+    if (s = '') or ((s[1] <> ':') and (s[1] <> '*')) then
+      Continue;
+    if s[1] = '*' then
+      v2 := SegRest(V, i)
+    else
+      v2 := SegStr(V, i);
+    SetLength(Req.FParamNames, n + 1);
+    SetLength(Req.FParamValues, n + 1);
+    Req.FParamNames[n] := Copy(s, 2, Length(s) - 1);
+    Req.FParamValues[n] := v2;
+    n := n + 1;
+  end;
+end;
+
+{ ---- one connection ---- }
+
+procedure LogLine(S: THttpServer; const Line: string);
+begin
+  S.FLogMu.Lock;
+  try
+    if Assigned(S.LogTo) then
+      S.LogTo(Line)
+    else
+      WriteLn(Line);
+  finally
+    S.FLogMu.Unlock;
+  end;
+end;
+
+{ An answer of its own before or instead of a handler's: the protocol's
+  errors (Go's "HTTP/1.1 " + publicErr + errorHeaders + publicErr) and
+  the router's 404 and 405 }
+procedure Plain(C: THttpConn; Code: Integer; const Msg: string; const Extra: string = '');
+var
+  body: string;
+begin
+  { the protocol's errors end the connection, as Go's "Connection:
+    close"; the router's 404 and 405 keep it }
+  if (Code <> 404) and (Code <> 405) then
+    C.KeepAlive := False;
+  C.StatusCode := Code;
+  body := Msg + #10;
+  C.Resp.Header.Put('Content-Type', 'text/plain; charset=utf-8');
+  C.Resp.Header.Put('X-Content-Type-Options', 'nosniff');
+  if Extra <> '' then
+    C.Resp.Header.Put('Allow', Extra);
+  MakeHead(C, Length(body));
+  Emit(C, body);
+end;
+
+{ The end of the head in the buffer: the index past the empty line that
+  ends it, -1 when it has not come; leading empty lines before the
+  request line are dropped (RFC 9112 2.2) }
+function HeadEnd(C: THttpConn): Integer;
+var
+  i: Integer;
+begin
+  Result := -1;
+  while (C.BufPos < C.BufEnd) and ((C.Buf[C.BufPos] = 13) or (C.Buf[C.BufPos] = 10)) do
+    C.BufPos := C.BufPos + 1;
+  i := C.BufPos;
+  while i < C.BufEnd do
+  begin
+    if C.Buf[i] = 10 then
+    begin
+      if (i + 1 < C.BufEnd) and (C.Buf[i + 1] = 10) then
+        Exit(i + 2);
+      if (i + 2 < C.BufEnd) and (C.Buf[i + 1] = 13) and (C.Buf[i + 2] = 10) then
+        Exit(i + 3);
+    end;
+    i := i + 1;
+  end;
+end;
+
+function ValidTarget(const T: string): Boolean;
+var
+  i: Integer;
+begin
+  Result := T <> '';
+  for i := 1 to Length(T) do
+    if (Ord(T[i]) <= 32) or (Ord(T[i]) = 127) then
+      Result := False;
+end;
+
+{ One request and its answer: False when the connection ends after it }
+function ServeOne(C: THttpConn; First: Boolean): Boolean;
+var
+  S: THttpServer;
+  n, e, i, j, k, best, hp, q, le, la, vs, ve: Integer;
+  value, target, te, conn, expect, allow, method, path: string;
+  score, bestScore: Int64;
+  cl, v: Int64;
+  t0: Integer;
+  req: THttpRequest;
+  resp: THttpResponse;
+  ncl: Integer;
+  headDeadline: Integer;
+  ok, failed, pathFound: Boolean;
+  methods: TStringArray;
+  errMsg: string;
+begin
+  Result := False;
+  S := C.Server;
+  { the first byte of a request: the connection is idle until it comes }
+  if Avail(C) = 0 then
+  begin
+    AtomicStore(C.Idle, 1);
+    if AtomicLoad(S.FClosing) <> 0 then
+      Exit;
+    if First then
+      n := Fill(C, PasIoDeadline(S.HeaderTimeoutMs))
+    else
+      n := Fill(C, PasIoDeadline(S.IdleTimeoutMs));
+    AtomicStore(C.Idle, 0);
+    if n <= 0 then
+      Exit;
+  end;
+  t0 := Nanotime;
+  headDeadline := PasIoDeadline(S.HeaderTimeoutMs);
+  req := THttpRequest.Create;
+  req.FConn := C;
+  req.Header := THttpHeaders.Create;
+  resp := THttpResponse.Create;
+  resp.FConn := C;
+  resp.Header := THttpHeaders.Create;
+  C.Req := req;
+  C.Resp := resp;
+  C.StatusCode := 200;
+  C.Sent := False;
+  C.Held := '';
+  C.KnownLen := -1;
+  C.OutLen := 0;
+  C.OutChunked := False;
+  C.OutLength := -1;
+  C.OutBody := 0;
+  C.OutWritten := 0;
+  C.Broken := False;
+  C.KeepAlive := False;
+  C.Proto11 := True;
+  C.IsHead := False;
+  C.Continue100 := False;
+  C.Chunked := False;
+  C.ChunkLeft := 0;
+  C.BodyLeft := 0;
+  C.BodyRead := 0;
+  C.BodyEnded := True;
+  C.WriteDeadline := PasIoDeadline(S.WriteTimeoutMs);
+  { the head, within MaxHeaderBytes and HeaderTimeoutMs }
+  e := HeadEnd(C);
+  while e < 0 do
+  begin
+    if Avail(C) > S.MaxHeaderBytes then
+    begin
+      Plain(C, 431, '431 Request Header Fields Too Large');
+      Exit;
+    end;
+    n := Fill(C, headDeadline);
+    if n = -110 then
+    begin
+      Plain(C, 408, '408 Request Timeout');
+      Exit;
+    end;
+    if n <= 0 then
+      Exit;
+    e := HeadEnd(C);
+  end;
+  if e - C.BufPos > S.MaxHeaderBytes then
+  begin
+    Plain(C, 431, '431 Request Header Fields Too Large');
+    Exit;
+  end;
+  { the head is read where it lies in the buffer: the request line,
+    then each header line, each without its CR (RFC 9112 2.2) }
+  hp := C.BufPos;
+  C.BufPos := e;
+  q := hp;
+  while C.Buf[q] <> 10 do
+    q := q + 1;
+  le := q;
+  if (le > hp) and (C.Buf[le - 1] = 13) then
+    le := le - 1;
+  { the request line: method SP target SP version (RFC 9112 3) }
+  i := hp;
+  while (i < le) and (C.Buf[i] <> 32) do
+    i := i + 1;
+  j := i + 1;
+  while (j < le) and (C.Buf[j] <> 32) do
+    j := j + 1;
+  ok := (i > hp) and (i < le) and (j > i + 1) and (j < le);
+  for k := j + 1 to le - 1 do
+    if C.Buf[k] = 32 then
+      ok := False;
+  if not ok then
+  begin
+    Plain(C, 400, '400 Bad Request: malformed request line');
+    Exit;
+  end;
+  method := CommonOf(C, hp, i);
+  target := BytesOf(C, i + 1, j);
+  req.Proto := CommonOf(C, j + 1, le);
+  if not IsToken(method) or not ValidTarget(target) then
+  begin
+    Plain(C, 400, '400 Bad Request: malformed request line');
+    Exit;
+  end;
+  if req.Proto = 'HTTP/1.1' then
+    C.Proto11 := True
+  else if req.Proto = 'HTTP/1.0' then
+    C.Proto11 := False
+  else if (Length(req.Proto) = 8) and (Copy(req.Proto, 1, 5) = 'HTTP/') and (req.Proto[6] in ['0'..'9']) and
+    (req.Proto[7] = '.') and (req.Proto[8] in ['0'..'9']) then
+  begin
+    Plain(C, 505, '505 HTTP Version Not Supported: unsupported protocol version');
+    Exit;
+  end
+  else
+  begin
+    Plain(C, 400, '400 Bad Request: malformed HTTP version');
+    Exit;
+  end;
+  C.KeepAlive := C.Proto11;
+  { the header lines (RFC 9112 5): no space before the colon, no line
+    folded, no control byte in a value; MaxHeaders of them }
+  la := q + 1;
+  while la < e do
+  begin
+    q := la;
+    while C.Buf[q] <> 10 do
+      q := q + 1;
+    le := q;
+    if (le > la) and (C.Buf[le - 1] = 13) then
+      le := le - 1;
+    if le = la then
+      Break;
+    if (C.Buf[la] = 32) or (C.Buf[la] = 9) then
+    begin
+      Plain(C, 400, '400 Bad Request: obsolete line folding');
+      Exit;
+    end;
+    i := la;
+    while (i < le) and (C.Buf[i] <> 58) and IsTokenChar(Chr(C.Buf[i])) do
+      i := i + 1;
+    if (i = la) or (i >= le) or (C.Buf[i] <> 58) then
+    begin
+      Plain(C, 400, '400 Bad Request: invalid header name');
+      Exit;
+    end;
+    vs := i + 1;
+    while (vs < le) and ((C.Buf[vs] = 32) or (C.Buf[vs] = 9)) do
+      vs := vs + 1;
+    ve := le;
+    while (ve > vs) and ((C.Buf[ve - 1] = 32) or (C.Buf[ve - 1] = 9)) do
+      ve := ve - 1;
+    for k := vs to ve - 1 do
+      if ((C.Buf[k] < 32) and (C.Buf[k] <> 9)) or (C.Buf[k] = 127) then
+      begin
+        Plain(C, 400, '400 Bad Request: invalid header value');
+        Exit;
+      end;
+    if req.Header.Count >= S.MaxHeaders then
+    begin
+      Plain(C, 431, '431 Request Header Fields Too Large');
+      Exit;
+    end;
+    req.Header.Add(BytesOf(C, la, i), BytesOf(C, vs, ve));
+    la := q + 1;
+  end;
+  req.Method := method;
+  req.Target := target;
+  k := CountOf(req.Header, 'Host');
+  if (C.Proto11 and (k = 0)) or (k > 1) then
+  begin
+    Plain(C, 400, '400 Bad Request: missing required Host header');
+    Exit;
+  end;
+  { the connection's options (RFC 9110 7.6.1) }
+  conn := LowerAscii(req.Header.Get('Connection'));
+  if Pos('close', conn) > 0 then
+    C.KeepAlive := False
+  else if not C.Proto11 and (Pos('keep-alive', conn) > 0) then
+    C.KeepAlive := True;
+  { the body's framing (RFC 9112 6.1 to 6.3) }
+  te := LowerAscii(TrimOws(req.Header.Get('Transfer-Encoding')));
+  ncl := CountOf(req.Header, 'Content-Length');
+  if req.Header.Has('Transfer-Encoding') then
+  begin
+    if not C.Proto11 or (ncl > 0) then
+    begin
+      Plain(C, 400, '400 Bad Request: Transfer-Encoding with Content-Length or on HTTP/1.0');
+      Exit;
+    end;
+    if te <> 'chunked' then
+    begin
+      Plain(C, 501, '501 Not Implemented: unsupported transfer encoding');
+      Exit;
+    end;
+    C.Chunked := True;
+    C.BodyEnded := False;
+    req.ContentLength := -1;
+  end
+  else if ncl > 0 then
+  begin
+    cl := -1;
+    for k := 0 to req.Header.FCount - 1 do
+    begin
+      if not EqualFold(req.Header.FNames[k], 'Content-Length') then
+        Continue;
+      value := TrimOws(req.Header.FValues[k]);
+      ok := value <> '';
+      for j := 1 to Length(value) do
+        if not (value[j] in ['0'..'9']) then
+          ok := False;
+      if not ok or (Length(value) > 18) or not TryStrToInt64(value, v) or ((cl >= 0) and (v <> cl)) then
+      begin
+        Plain(C, 400, '400 Bad Request: bad Content-Length');
+        Exit;
+      end;
+      cl := v;
+    end;
+    req.ContentLength := cl;
+    C.BodyLeft := cl;
+    C.BodyEnded := cl = 0;
+  end
+  else
+    req.ContentLength := 0;
+  expect := LowerAscii(TrimOws(req.Header.Get('Expect')));
+  if expect <> '' then
+  begin
+    if expect <> '100-continue' then
+    begin
+      Plain(C, 417, '417 Expectation Failed');
+      Exit;
+    end;
+    C.Continue100 := C.Proto11 and not C.BodyEnded;
+  end;
+  { the target: origin form, or absolute form, whose path is taken
+    (RFC 9112 3.2) }
+  if Copy(LowerAscii(target), 1, 7) = 'http://' then
+  begin
+    i := Pos('/', target, 8);
+    if i = 0 then
+      target := '/'
+    else
+      target := Copy(target, i, Length(target) - i + 1);
+  end
+  else if Copy(LowerAscii(target), 1, 8) = 'https://' then
+  begin
+    i := Pos('/', target, 9);
+    if i = 0 then
+      target := '/'
+    else
+      target := Copy(target, i, Length(target) - i + 1);
+  end;
+  i := Pos('?', target);
+  if i > 0 then
+  begin
+    req.RawPath := Copy(target, 1, i - 1);
+    req.RawQuery := Copy(target, i + 1, Length(target) - i);
+  end
+  else
+    req.RawPath := target;
+  req.RealIP := req.Header.Get('X-Real-IP');
+  C.IsHead := method = 'HEAD';
+  { the body's deadline and the answer's from the end of the head, as Go
+    sets them at the end of readRequest }
+  C.BodyDeadline := PasIoDeadline(S.BodyTimeoutMs);
+  C.WriteDeadline := PasIoDeadline(S.WriteTimeoutMs);
+  C.BodyLimit := S.MaxBody;
+  { the route }
+  best := -1;
+  failed := False;
+  if (req.RawPath = '') or (req.RawPath[1] <> '/') or not HttpUnescape(req.RawPath, False, path) then
+  begin
+    if not ((req.RawPath = '*') and (method = 'OPTIONS')) then
+    begin
+      Plain(C, 400, '400 Bad Request: bad request path');
+      failed := True;
+    end;
+  end;
+  req.Path := path;
+  if not failed and not ViewPath(req.RawPath, C.PathV) then
+  begin
+    Plain(C, 400, '400 Bad Request: bad request path');
+    failed := True;
+  end;
+  if not failed then
+  begin
+    bestScore := -1;
+    methods := nil;
+    pathFound := False;
+    for k := 0 to High(S.FRouter.FRoutes) do
+    begin
+      score := RouteScore(S.FRouter.FRoutes[k], C.PathV);
+      if score < 0 then
+        Continue;
+      pathFound := True;
+      if (S.FRouter.FRoutes[k].Method = method) or
+        (C.IsHead and (S.FRouter.FRoutes[k].Method = 'GET')) then
+        if (best < 0) or (score > bestScore) or
+          ((score = bestScore) and (S.FRouter.FRoutes[k].Method = method)) then
+        begin
+          best := k;
+          bestScore := score;
+        end;
+    end;
+    if best < 0 then
+    begin
+      if not pathFound then
+        Plain(C, 404, '404 page not found')
+      else
+      begin
+        for k := 0 to High(S.FRouter.FRoutes) do
+          if RouteScore(S.FRouter.FRoutes[k], C.PathV) >= 0 then
+          begin
+            SetLength(methods, Length(methods) + 1);
+            methods[High(methods)] := S.FRouter.FRoutes[k].Method;
+          end;
+        { Allow: the methods of the path, HEAD with GET, sorted (Go's
+          ServeMux) }
+        allow := '';
+        for k := 0 to High(methods) do
+          if methods[k] = 'GET' then
+          begin
+            SetLength(methods, Length(methods) + 1);
+            methods[High(methods)] := 'HEAD';
+            Break;
+          end;
+        for k := 0 to High(methods) do
+          for j := k + 1 to High(methods) do
+            if methods[j] < methods[k] then
+            begin
+              value := methods[k];
+              methods[k] := methods[j];
+              methods[j] := value;
+            end;
+        for k := 0 to High(methods) do
+          if (k = 0) or (methods[k] <> methods[k - 1]) then
+          begin
+            if allow <> '' then
+              allow := allow + ', ';
+            allow := allow + methods[k];
+          end;
+        Plain(C, 405, 'Method Not Allowed', allow);
+      end;
+      failed := True;
+    end;
+  end;
+  if not failed then
+  begin
+    BindParams(req, S.FRouter.FRoutes[best], C.PathV);
+    if S.FRouter.FRoutes[best].MaxBody >= 0 then
+      C.BodyLimit := S.FRouter.FRoutes[best].MaxBody;
+    if req.ContentLength > C.BodyLimit then
+    begin
+      C.KeepAlive := False;
+      Plain(C, 413, '413 Request Entity Too Large');
+      failed := True;
+    end;
+  end;
+  if not failed then
+  begin
+    { the handler: what it raises answers this request alone }
+    try
+      S.FRouter.FRoutes[best].Run(req, resp);
+      if not C.Sent then
+      begin
+        MakeHead(C, Length(C.Held));
+        Emit(C, C.Held);
+      end
+      else if C.OutChunked and not C.Broken then
+        SendAll(C, '0' + CRLF + CRLF);
+      if (C.OutLength >= 0) and (C.OutBody < C.OutLength) and not C.IsHead and
+        not NoBodyStatus(C.StatusCode) then
+        C.KeepAlive := False;
+    except
+      on E: EHttpError do
+      begin
+        if not C.Sent then
+        begin
+          C.Held := '';
+          resp.Header := THttpHeaders.Create;
+          if (E.Status = 408) or (E.Status = 413) or (E.Status = 400) then
+            C.KeepAlive := False;
+          Plain(C, E.Status, E.Message);
+        end
+        else
+          C.Broken := True;
+      end;
+      on E: Exception do
+      begin
+        WriteLn(ErrOutput, 'httpserver: ', method, ' ', req.RawPath, ': ', E.ClassName, ': ', E.Message);
+        if not C.Sent then
+        begin
+          C.Held := '';
+          resp.Header := THttpHeaders.Create;
+          Plain(C, 500, 'Internal Server Error');
+        end
+        else
+          C.Broken := True;
+      end;
+    end;
+  end;
+  { what is left of the body: read and dropped up to 256 KiB, as Go's
+    server does before it keeps a connection, else the connection ends }
+  if not C.BodyEnded and C.KeepAlive and not C.Broken then
+  begin
+    if not C.Chunked and (C.BodyLeft > 262144) then
+      C.KeepAlive := False
+    else
+    begin
+      C.BodyLimit := C.BodyRead + 262144;
+      C.Continue100 := False;
+      try
+        while BodyPiece(C, 65536) <> '' do
+          ;
+      except
+        on E: Exception do
+          C.KeepAlive := False;
+      end;
+    end;
+  end;
+  if S.AccessLog then
+  begin
+    value := req.RealIP;
+    if value = '' then
+      value := '-';
+    LogLine(S, value + ' ' + method + ' ' + req.RawPath + ' ' + IntToStr(C.StatusCode) + ' ' +
+      IntToStr(C.OutBody) + ' ' + IntToStr((Nanotime - t0) div 1000000) + 'ms');
+  end;
+  Result := C.KeepAlive and not C.Broken and (AtomicLoad(S.FClosing) = 0);
+end;
+
+procedure ConnMain(S: THttpServer; Fd: Integer);
+var
+  c: THttpConn;
+  first: Boolean;
+begin
+  c := THttpConn.Create;
+  c.Server := S;
+  c.Fd := Fd;
+  SetLength(c.Buf, 2048);
+  SetLength(c.OutBuf, 512);
+  S.Track(c);
+  try
+    first := True;
+    while ServeOne(c, first) do
+      first := False;
+  finally
+    S.Untrack(c);
+    TcpClose(Fd);
+    S.FServing.Done;
+  end;
+end;
+
+{ ---- the server ---- }
+
+constructor THttpServer.Create(ARouter: THttpRouter);
+begin
+  FRouter := ARouter;
+  MaxHeaderBytes := HttpMaxHeaderBytes;
+  MaxHeaders := HttpMaxHeaders;
+  MaxBody := HttpMaxBody;
+  HeaderTimeoutMs := HttpHeaderTimeoutMs;
+  IdleTimeoutMs := HttpIdleTimeoutMs;
+  BodyTimeoutMs := HttpBodyTimeoutMs;
+  WriteTimeoutMs := HttpWriteTimeoutMs;
+  ShutdownTimeoutMs := HttpShutdownTimeoutMs;
+  AccessLog := True;
+  FDone := MakeChan(1);
+  FWallOffset := NowNanos - Nanotime;
+  FCalibrated := Nanotime;
+end;
+
+{ FConns holds the open connections in its first FCount places, each
+  knowing its place (Slot), so one goes in and out in constant time }
+procedure THttpServer.Track(C: THttpConn);
+begin
+  FMu.Lock;
+  if FCount >= Length(FConns) then
+    SetLength(FConns, FCount * 2 + 64);
+  FConns[FCount] := C;
+  C.Slot := FCount;
+  FCount := FCount + 1;
+  FMu.Unlock;
+end;
+
+procedure THttpServer.Untrack(C: THttpConn);
+var
+  last: THttpConn;
+begin
+  FMu.Lock;
+  FCount := FCount - 1;
+  last := FConns[FCount];
+  FConns[C.Slot] := last;
+  last.Slot := C.Slot;
+  FConns[FCount] := nil;
+  FMu.Unlock;
+end;
+
+function THttpServer.Active: Integer;
+begin
+  FMu.Lock;
+  Result := FCount;
+  FMu.Unlock;
+end;
+
+procedure AddListener(S: THttpServer; Fd: Integer; IsUnix: Boolean; const Path: string);
+var
+  n: Integer;
+begin
+  n := Length(S.FListeners);
+  SetLength(S.FListeners, n + 1);
+  S.FListeners[n].Fd := Fd;
+  S.FListeners[n].IsUnix := IsUnix;
+  S.FListeners[n].Path := Path;
+end;
+
+{ a group's number from /etc/group (group(5): name:password:GID:members)
+  or from its digits; -1 when there is no such group }
+function GroupId(const Group: string): Integer;
+var
+  data, line, rest: string;
+  i, j: Integer;
+  v: Int64;
+begin
+  Result := -1;
+  if TryStrToInt64(Group, v) and (v >= 0) then
+    Exit(v);
+  if not ReadFile('/etc/group', data) then
+    Exit;
+  rest := data;
+  while rest <> '' do
+  begin
+    i := Pos(#10, rest);
+    if i > 0 then
+    begin
+      line := Copy(rest, 1, i - 1);
+      rest := Copy(rest, i + 1, Length(rest) - i);
+    end
+    else
+    begin
+      line := rest;
+      rest := '';
+    end;
+    i := Pos(':', line);
+    if (i = 0) or (Copy(line, 1, i - 1) <> Group) then
+      Continue;
+    i := Pos(':', line, i + 1);
+    j := Pos(':', line, i + 1);
+    if (i > 0) and (j > i) and TryStrToInt64(Copy(line, i + 1, j - i - 1), v) then
+      Exit(v);
+  end;
+end;
+
+function THttpServer.ListenUnix(const Path: string; Mode: Integer; const Group: string): Boolean;
+var
+  fd, grp, r: Integer;
+  p: string;
+begin
+  Result := False;
+  fd := UnixListen(Path);
+  if fd < 0 then
+    Exit;
+  if (Path <> '') and (Path[1] <> '@') then
+  begin
+    p := Path + #0;
+    { fchmodat(2) and fchownat(2): 268 and 260 on amd64, 53 and 54 on arm64 }
+    if Mode > 0 then
+    begin
+      if Amd64 = 1 then
+        r := Syscall(268, -100, @p[1], Mode)
+      else
+        r := Syscall(53, -100, @p[1], Mode, 0);
+      if r < 0 then
+      begin
+        UnixClose(fd);
+        Exit;
+      end;
+    end;
+    if Group <> '' then
+    begin
+      grp := GroupId(Group);
+      if grp < 0 then
+      begin
+        UnixClose(fd);
+        Exit;
+      end;
+      if Amd64 = 1 then
+        r := Syscall(260, -100, @p[1], -1, grp, 0)
+      else
+        r := Syscall(54, -100, @p[1], -1, grp, 0);
+      if r < 0 then
+      begin
+        UnixClose(fd);
+        Exit;
+      end;
+    end;
+  end;
+  AddListener(Self, fd, True, Path);
+  Result := True;
+end;
+
+function THttpServer.ListenTcp(const Host: string; APort: Integer): Boolean;
+var
+  fd: Integer;
+begin
+  Result := False;
+  fd := TcpListenAt(Host, APort, 4096);
+  if fd < 0 then
+    Exit;
+  FPort := TcpPort(fd);
+  AddListener(Self, fd, False, '');
+  Result := True;
+end;
+
+function SysFcntl: Integer;
+begin
+  if Amd64 = 1 then
+    Result := 72
+  else
+    Result := 25;
+end;
+
+{ sd_listen_fds(3): LISTEN_PID this process, LISTEN_FDS sockets from 3;
+  each made nonblocking and closed on exec; its family by getsockname }
+function THttpServer.ListenSystemd: Boolean;
+var
+  pid, n, fd, fl, r, size: Integer;
+  v: Int64;
+  sa: array[0..109] of Byte;
+  path: string;
+  i: Integer;
+begin
+  Result := False;
+  if Amd64 = 1 then
+    pid := Syscall(39)
+  else
+    pid := Syscall(172);
+  if not TryStrToInt64(GetEnv('LISTEN_PID'), v) or (v <> pid) then
+    Exit;
+  if not TryStrToInt64(GetEnv('LISTEN_FDS'), v) or (v < 1) then
+    Exit;
+  n := v;
+  for fd := 3 to 3 + n - 1 do
+  begin
+    fl := Syscall(SysFcntl, fd, 3, 0);
+    if fl < 0 then
+      Exit;
+    r := Syscall(SysFcntl, fd, 4, fl or 2048);
+    r := Syscall(SysFcntl, fd, 2, 1);
+    size := 110;
+    for i := 0 to 109 do
+      sa[i] := 0;
+    if Amd64 = 1 then
+      r := Syscall(51, fd, @sa[0], @size)
+    else
+      r := Syscall(204, fd, @sa[0], @size);
+    if (r >= 0) and (sa[0] = 1) then
+    begin
+      path := '';
+      if (size > 2) and (sa[2] = 0) then
+      begin
+        path := '@';
+        for i := 3 to size - 1 do
+          path := path + Chr(sa[i]);
+      end
+      else
+        for i := 2 to size - 1 do
+        begin
+          if sa[i] = 0 then
+            Break;
+          path := path + Chr(sa[i]);
+        end;
+      AddListener(Self, fd, True, '=' + path);
+    end
+    else
+    begin
+      FPort := TcpPort(fd);
+      AddListener(Self, fd, False, '');
+    end;
+  end;
+  Result := True;
+end;
+
+function THttpServer.Port: Integer;
+begin
+  Result := FPort;
+end;
+
+procedure SetNoDelayFd(Fd: Integer);
+var
+  one: Int32;
+  r: Integer;
+begin
+  one := 1;
+  if Amd64 = 1 then
+    r := Syscall(54, Fd, 6, 1, @one, 4)
+  else
+    r := Syscall(208, Fd, 6, 1, @one, 4);
+end;
+
+procedure AcceptLoop(S: THttpServer; K: Integer);
+var
+  fd: Integer;
+  l: THttpListener;
+begin
+  l := S.FListeners[K];
+  while True do
+  begin
+    fd := NetAccept(l.Fd);
+    if AtomicLoad(S.FClosing) <> 0 then
+    begin
+      if fd >= 0 then
+        TcpClose(fd);
+      Break;
+    end;
+    if fd < 0 then
+    begin
+      { out of descriptors: wait a little, as Go's Serve backs off }
+      if (fd = -24) or (fd = -23) or (fd = -12) or (fd = -105) then
+        Sleep(5)
+      else if fd = -22 then
+        Break;
+      Continue;
+    end;
+    if not l.IsUnix then
+      SetNoDelayFd(fd);
+    S.FServing.Add(1);
+    pas ConnMain(S, fd);
+  end;
+  NetClose(l.Fd);
+  { a socket file Listen made goes with it, as Go's UnixListener does }
+  if l.IsUnix and (l.Path <> '') and (l.Path[1] <> '@') and (l.Path[1] <> '=') then
+    UnixUnlink(l.Path);
+  S.FAccepting.Done;
+end;
+
+procedure THttpServer.Serve;
+var
+  i: Integer;
+begin
+  WrapRoutes(FRouter);
+  for i := 0 to High(FListeners) do
+  begin
+    FAccepting.Add(1);
+    pas AcceptLoop(Self, i);
+  end;
+  FAccepting.Wait;
+end;
+
+{ The routine parked in accept woken: a TCP listener by shutdown(2),
+  which makes accept answer EINVAL; a Unix one by a connection to it,
+  which shutdown does not wake (P441) }
+procedure WakeAcceptor(const L: THttpListener);
+var
+  r, c: Integer;
+  path: string;
+begin
+  if not L.IsUnix then
+  begin
+    if Amd64 = 1 then
+      r := Syscall(48, L.Fd, 2)
+    else
+      r := Syscall(210, L.Fd, 2);
+  end
+  else
+  begin
+    path := L.Path;
+    if (path <> '') and (path[1] = '=') then
+      path := Copy(path, 2, Length(path) - 1);
+    c := UnixConnect(path);
+    if c >= 0 then
+      UnixClose(c);
+  end;
+end;
+
+procedure THttpServer.Shutdown;
+var
+  i, k, n, t, hard: Integer;
+  cut: array of Integer;
+begin
+  if AtomicExchange(FClosing, 1) <> 0 then
+    Exit;
+  for i := 0 to High(FListeners) do
+    WakeAcceptor(FListeners[i]);
+  { idle connections end now (shutdown(2) wakes their read); the others
+    after the answer in flight, within ShutdownTimeoutMs, then are cut;
+    a handler that still runs a second after is left to end on its own
+    (Go's Shutdown returns when its context ends) }
+  t := Nanotime + ShutdownTimeoutMs * 1000000;
+  hard := t + 1000000000;
+  while True do
+  begin
+    FMu.Lock;
+    cut := nil;
+    for i := 0 to FCount - 1 do
+      if (AtomicLoad(FConns[i].Idle) <> 0) or (Nanotime >= t) then
+      begin
+        SetLength(cut, Length(cut) + 1);
+        cut[High(cut)] := FConns[i].Fd;
+      end;
+    n := FCount;
+    FMu.Unlock;
+    for k := 0 to High(cut) do
+      TcpShutdown(cut[k], 2);
+    if (n = 0) or (Nanotime >= hard) then
+      Break;
+    Sleep(5);
+  end;
+  FAccepting.Wait;
+end;
+
+procedure WatchStop(S: THttpServer; C: chan of Integer);
+var
+  sig: Integer;
+begin
+  sig := Recv(C);
+  if sig > 0 then
+  begin
+    S.FSignal := sig;
+    S.Shutdown;
+  end;
+  Send(S.FDone, 1);
+end;
+
+function THttpServer.ServeUntilSignal: Integer;
+var
+  c: chan of Integer;
+  x: Integer;
+begin
+  c := MakeChan(1);
+  SignalNotify(c, [SIGTERM, SIGINT]);
+  pas WatchStop(Self, c);
+  Serve;
+  SignalStop(c);
+  select
+    Send(c, 0): ;
+  else
+    ;
+  end;
+  x := Recv(FDone);
+  Result := FSignal;
+end;
+
+end.

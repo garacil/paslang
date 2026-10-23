@@ -11517,6 +11517,164 @@ sig := Recv(stop);
 WriteLn('stopping on ', SignalName(sig));
 ```
 
+`uses httpserver` is an HTTP/1.1 server (1.1.257, P434), as Go's
+`net/http` serves: one routine per connection, parked while it waits
+for the network (§19), behind a proxy such as Nginx on a Unix socket,
+on TCP, or on the sockets systemd passes. A `THttpRouter` takes routes
+by method and path: `router.Handle('GET', '/api/items/:id', @GetItem)`
+and `router.Handle('POST', '/upload', @Upload, 26214400)`, whose last
+argument is the route's limit on a request body (the server's `MaxBody`
+when it is left out). A segment `:name` takes one segment of the path
+and `*name`, last, the rest of it; a literal segment wins over
+`:name`, which wins over `*name`. A path no route takes is answered
+404, and one whose routes take other methods 405 with `Allow` listing
+them, sorted, `HEAD` with `GET`; a route for `GET` answers `HEAD` too,
+with the head alone. A handler is a `procedure(Req: THttpRequest;
+Resp: THttpResponse)`. `router.Use(m)` puts a middleware around every
+route's handler, the first used outermost: a `THttpMiddleware` is a
+`function(Next: THttpHandler): THttpHandler` that gives a closure
+(§5), which may answer by itself (a check of a token) or call `Next`.
+Routes and middleware are set before `Serve`.
+
+`THttpServer.Create(router)` makes a server whose settings are fields,
+set before it serves:
+- `MaxHeaderBytes` (16384) and `MaxHeaders` (100) bound the request
+  line and the header lines, and either past its bound is answered 431;
+- `MaxBody` (1 MiB) bounds a body, answered 413;
+- `HeaderTimeoutMs` (10 s) is the time from a request's first byte to
+  the end of its head, and from a new connection to its first byte;
+- `IdleTimeoutMs` (60 s) is the time a kept connection waits for its
+  next request;
+- `BodyTimeoutMs` (60 s) is the time from the end of the head to the
+  end of the body;
+- `WriteTimeoutMs` (60 s) is the time from the end of the head to the
+  end of the answer;
+- `ShutdownTimeoutMs` (10 s), below;
+- `AccessLog` (on) writes one line a request, `ip method path status
+  bytes Nms`: the address from `X-Real-IP` (`-` without it) and the
+  path without its query. It never writes a body, a cookie or a
+  credential. The line goes to `LogTo` when it is set, else to standard
+  output.
+
+`ListenUnix(path, mode, group)` listens on a Unix socket (a path, or an
+abstract `@name`): the file there is removed first, then given `mode`
+(`432` is 0660) and `group` (a name of `/etc/group` or a number). Go's
+`UnixListener` removes it again when it stops. `ListenTcp(host, port)`
+listens on TCP, port 0 asking the kernel for one (`Port`).
+`ListenSystemd` takes the sockets systemd passes for socket activation
+(`LISTEN_PID`, `LISTEN_FDS`, from descriptor 3). `Serve` serves until
+`Shutdown`, which:
+- stops accepting;
+- ends the idle connections at once;
+- lets the requests in flight finish, with `Connection: close`, within
+  `ShutdownTimeoutMs`, and then cuts what is left.
+`ServeUntilSignal` serves until SIGTERM or SIGINT (`uses passignal`),
+then shuts down and gives the signal, so a service under systemd
+stops cleanly. `Active` counts the connections open.
+
+A request (RFC 9110, 9112):
+- comes on HTTP/1.1, kept alive unless it says `Connection: close`, or
+  on HTTP/1.0, kept alive when it says `Connection: keep-alive`;
+- has its body by `Content-Length` or chunked, the trailers read and
+  dropped, `Expect: 100-continue` answered as the body is first read;
+- answered 400 when it is malformed: a malformed request line, no
+  `Host` on HTTP/1.1, a space before a header's colon, a folded line, a
+  control byte in a value, two `Content-Length`s that differ,
+  `Transfer-Encoding` beside `Content-Length` or on HTTP/1.0, a bad
+  escape or a `.` or `..` segment in the path;
+- answered 501 for a transfer coding other than chunked, 505 for a
+  version other than 1.0 and 1.1, and 417 for an expectation other than
+  100-continue;
+- after one of these, has its connection closed, as Go does.
+A body the handler leaves unread is read and dropped up to 256 KiB, so
+the connection is kept; past that it is closed.
+
+`THttpRequest` holds:
+- `Method`, `Target` (as sent), `RawPath` and `Path` (percent-decoded),
+  `RawQuery` and `Proto`;
+- `Header` (a `THttpHeaders`: `Get`, `Values`, `Has`, `Count`, `NameAt`,
+  `ValueAt`, names compared without case);
+- `ContentLength` (-1 when chunked), `RemoteAddr`, and `RealIP` (the
+  `X-Real-IP` the proxy sets);
+- `Param(name)`, the route's `:name` or `*name`;
+- `Query(name)`, `QueryValues(name)` and `HasQuery(name)`, the query
+  decoded as Go's `url.ParseQuery` decodes it (`+` a space, a pair with
+  a `;` or a bad escape dropped);
+- `Form(name)`, `FormValues(name)` and `HasForm(name)`, the fields of an
+  `application/x-www-form-urlencoded` body, read whole within the
+  route's limit and decoded as the query is (Go's `PostFormValue`);
+- `Cookie(name)` and `HasCookie(name)`, the `Cookie` lines read as Go's
+  `readCookies` reads them;
+- `ReadBody(n)`, up to `n` bytes of the body, `''` at its end;
+  `ReadAllBody`, the whole of it; `ReadJson(depth)`, the body as a
+  `json` within the route's limit and a nesting of `depth` (64 by
+  default), 400 with the parser's words when it is no JSON;
+- `Multipart`, the parts of a `multipart/form-data` body (RFC 7578,
+  2046) as a `THttpMultipart`. Its `Next` gives each `THttpPart` in turn
+  (`nil` after the last) with its `Name`, its `FileName` (the last
+  element of the path the client sent, and the RFC 8187 `filename*`
+  when there is one), its `ContentType` and its `Header`. `ReadData(n)`
+  gives the part's bytes a piece at a time, so an upload of tens of
+  megabytes is never held whole, and `ReadAllData(limit)` gives them
+  all.
+A read past the route's limit raises `EHttpError` with 413, past
+`BodyTimeoutMs` with 408, and on a body that breaks the protocol with
+400.
+
+`THttpResponse` holds:
+- `Header` (with `Add`, `Put` and `Remove` too), `SetStatus(code)` and
+  `Status`;
+- `WriteData(s)`: a piece of the body. Up to 16 KiB is held, so a small
+  answer goes whole with its `Content-Length` in one write; past that
+  the head goes first, chunked unless the handler put a
+  `Content-Length`;
+- `Reply(code, contentType, body)`; `ReplyText` (text/plain;
+  charset=utf-8); `ReplyJson(code, j)` (application/json;
+  charset=utf-8); `ReplyError(code, message)`, as Go's `http.Error`;
+  `Redirect(code, location)`;
+- `SetCookie(c)`: a `THttpCookie` with `Name`, `Value`, `Path`,
+  `Domain`, `MaxAge` (0 none, below 0 `Max-Age=0`), `Secure`,
+  `HttpOnly` and `SameSite`, written as Go's `Cookie.String` writes it;
+- `ServeFile(path, contentType, downloadName)`: a regular file by
+  sendfile(2) with its `Content-Length` and, with a name,
+  `Content-Disposition: attachment; filename="..."; filename*=UTF-8''...`
+  (RFC 6266, RFC 8187). It answers 404 and gives `False` when the file
+  is not there.
+The server sends `Date` itself and never guesses a `Content-Type`: the
+handler names it.
+
+An exception the handler raises answers that request alone, and every
+other routine and connection goes on: an `EHttpError` answers its
+`Status` with its message as text; any other exception answers 500 and
+writes a line on the error output. A runtime fault (a nil pointer, an
+index out of range) still ends the program, as everywhere (§19). When
+the head has already gone, the connection is closed instead.
+`ConstantTimeEqual(a, b)` compares two strings in a time that depends
+on their length alone, as Go's `crypto/subtle`, for tokens and MACs.
+`HttpStatusText`, `HttpDate`, `HttpEscape` and `HttpUnescape` are the
+helpers it uses.
+
+There is no HTTP/2, no TLS, no compression and no `Range`: the proxy in
+front gives them. `testdata/httpsrv` checks every limit, deadline,
+error and feature above on both machines, the sockets systemd passes
+included (`scripts/check_httpsystemd.py`).
+`examples/apisrv` is a JSON API with a self-test, and
+`scripts/bench/servers.py` measures it against its Go twin
+(`scripts/bench/servers/apisrv.go`).
+
+```
+procedure GetItem(Req: THttpRequest; Resp: THttpResponse);
+begin
+  Resp.ReplyJson(200, JsonObject(['id', StrToInt(Req.Param('id'))]));
+end;
+
+router := THttpRouter.Create;
+router.Handle('GET', '/api/items/:id', @GetItem);
+srv := THttpServer.Create(router);
+srv.ListenUnix('/run/app/app.sock', 432, 'www-data');
+srv.ServeUntilSignal;
+```
+
 `uses sqlite` gives SQLite 3.54.1 in paslang: the library itself, written
 from SQLite's own file format, documents and sources (P403 the file,
 P404 the SQL, 1.1.253 P405 the rest). It is a library unit, as `pasnet`
@@ -13511,7 +13669,10 @@ the commands on standard input, under `--debug-mode` and under
   in silence, and a record of the unit's name was refused).
 - A map key cannot be a record, a real, a slice, a map or a method value.
 - A map is not safe for concurrent writers; the runtime stops the
-  program when it catches that.
+  program when it catches that (`concurrent map writes`, `concurrent
+  map read and map write`, `concurrent map iteration and map write`).
+  Any number of routines may read, walk and test a map at once while
+  none writes it, as in Go: a read changes nothing in the map (1.1.257).
 - A bare `Syscall(...)` statement makes the call and drops its answer
   (1.0.136; it ran whatever call a register happened to hold).
 - A routine takes at most 32 parameters. `pas` passes values, so it

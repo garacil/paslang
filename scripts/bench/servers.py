@@ -51,7 +51,8 @@ OUT = os.path.join(ROOT, "build", "bench", "servers")
 # two-second retry, some runs and not others.
 PAIRS = [("httpd", [2000, 10000], "2000 clients, 6000 requests, 6000 served, 0 bad"),
          ("dnsd", [2000, 5000], "2000 clients, 2000 answered, 0 missed, 0 bad"),
-         ("termd", [2000, 10000], "2000 sessions, 2000 quit, 0 bad")]
+         ("termd", [2000, 10000], "2000 sessions, 2000 quit, 0 bad"),
+         ("apisrv", [2000, 10000], "2000 clients, 6000 requests, 6000 served, 0 bad")]
 # paslang / Go, per pair, the median of the runs' ratios (each run of a
 # pair alternates which side goes first): below 1.00 for time and memory
 # (P223, Regla 12). From P115 to P223 it was 1.10 for time and nothing for
@@ -62,7 +63,7 @@ PAIRS = [("httpd", [2000, 10000], "2000 clients, 6000 requests, 6000 served, 0 b
 # budget under 0.99 would fail at random. dnsd (0.93, 1.12; 0.98, 0.96)
 # and termd (1.01, 0.30; 1.09, 0.57, its memory 0.98 and 1.01 at 10,000)
 # go under with their hitos.
-BUDGET = {"httpd": 0.99, "dnsd": 0.99, "termd": 0.99}
+BUDGET = {"httpd": 0.99, "dnsd": 0.99, "termd": 0.99, "apisrv": 0.99}
 MEM_BUDGET = 0.99
 
 CONNTRACK = "/proc/sys/net/netfilter/nf_conntrack_"
