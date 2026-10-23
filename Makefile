@@ -558,6 +558,10 @@ GOLDEN_A64 += sqluses
 # block go; a nil array set to length 0 and the literal [] take no block.
 GOLDEN += setlenzero
 GOLDEN_A64 += setlenzero
+# P421: a routine value, a closure and a method value called with 7, 9
+# and 12 arguments, past the registers on the stack.
+GOLDEN += callvalargs
+GOLDEN_A64 += callvalargs
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a

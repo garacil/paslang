@@ -2724,9 +2724,11 @@ closure (1.0.134): the value carries the link to its parent's
 variables. Such a
 value can be a parameter, a field of a record, an element of an array,
 and what a function gives back, and a call can be written on any of
-them, including on what another call returned. At most six arguments
-travel through one on amd64 and eight on arm64; beyond that the
-compiler refuses rather than pass them wrongly. `passort` takes one as
+them, including on what another call returned. A call through one
+passes every argument as a direct call does, past the sixth on amd64
+and the eighth on arm64 on the stack (1.1.251, P421: such a call was
+refused), as Go calls a closure with the ABI of any function.
+`passort` takes one as
 the order to sort by, which is what Go's `sort.Slice` does.
 
 `procedure(x: Integer) of object` and `function(x: Integer): T of
