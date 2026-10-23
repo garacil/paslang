@@ -12661,7 +12661,8 @@ cycle comes when what was handed out since the last one reaches twice
 what it left alive: `PASLANG_GC=100` is the default, a larger number
 trades memory for fewer cycles, and `PASLANG_GC=off` never collects.
 `GcCollect` runs a cycle at once and answers 1 (0 when it cannot, under
-a runtime lock). `HeapStat(k)` reads the heap's figures: 0 cycles, 1
+a runtime lock); a register the call may overwrite is dead there, as in
+Go, and keeps nothing alive (1.1.254, P423). `HeapStat(k)` reads the heap's figures: 0 cycles, 1
 bytes alive after the last one, 2 the next goal, 3 bytes mapped, 4 given
 back to the kernel, 5 in use, 6 free, 7 handed out, 8 and 9 the total
 and the last pause in nanoseconds, 14 the workers that marked the last

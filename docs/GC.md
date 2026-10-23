@@ -520,7 +520,8 @@ worker that held them gave every 16 of them, 4 ms. Each was found by
 sampling every CPU's instruction pointer (`perf_event_open`) and fixed as Go does it or better.
 `HeapStat(14)` counts the workers that marked the last cycle and
 `HeapStat(15)` how many may, 16 to 18 the last cycle's stop, mark and
-sweep. `GcCollect` runs one cycle now; `HeapCheck` counts inconsistent
+sweep. `GcCollect` runs one cycle now, its call clearing the scratch
+registers first, which are dead at any call (rt_gccollectcall, P423); `HeapCheck` counts inconsistent
 heap spans (0 is sound) and `HeapMaskOf(p)` is the pointer bitmap of
 the block holding `p` (its first 64 words, -1 off the heap): the words
 of `--help runtime` that a test uses to look at the collector. Since P91 the Ms have threads only when there is work for them,

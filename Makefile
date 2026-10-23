@@ -566,6 +566,10 @@ GOLDEN_A64 += callvalargs
 # arrays any array of their element type.
 GOLDEN += varparamtype
 GOLDEN_A64 += varparamtype
+# P423: GcCollect frees a block whose address only dead scratch registers
+# hold, put there by inline assembly before the call.
+GOLDEN += gcdeadreg
+GOLDEN_A64 += gcdeadreg
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
