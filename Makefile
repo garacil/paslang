@@ -554,6 +554,10 @@ GOLDEN_A64 += storereg
 # P403: SQLite named in a uses clause, uses sqlite since P418, a database in memory.
 GOLDEN += sqluses
 GOLDEN_A64 += sqluses
+# P419: SetLength(a, 0) of a dynamic array leaves it nil and lets its
+# block go; a nil array set to length 0 and the literal [] take no block.
+GOLDEN += setlenzero
+GOLDEN_A64 += setlenzero
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a

@@ -3271,7 +3271,12 @@ concurrent callers would need an atomic counter or a mutex.
 type adds `u`'s elements, `s`'s own too. `Cap(s)` is its capacity: a
 `SetLength` to a new length takes exactly that many, a grow with room to
 spare as many as the block it takes holds, as Go's, and a shrink leaves
-the capacity at the new length (1.1.141). A
+the capacity at the new length (1.1.141). `SetLength(s, 0)` leaves `s`
+`nil` and lets its block go, as Pascal's `SetLength` and Go's `s = nil`
+do (1.1.249: the slice kept its data pointer, so the whole block lived
+until the variable died); `[]` and an `Append` of nothing to an empty
+slice are `nil` too, and an `Append` of nothing gives the slice as it
+was, as Go's `append(s)`. A
 list in brackets where a slice goes is a new slice of it: `u := [10,
 20, 30]`, `Total([1, 2, 3])`, `g := Append(g, [1, 2])`; `[]` is empty.
 So `Append(s, [a, b])` adds `a` and `b` (1.0.136; the list went in as
