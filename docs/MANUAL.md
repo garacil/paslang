@@ -11675,6 +11675,44 @@ srv.ListenUnix('/run/app/app.sock', 432, 'www-data');
 srv.ServeUntilSignal;
 ```
 
+`uses argon2` hashes passwords with Argon2 (RFC 9106; 1.1.258, P438), on
+BLAKE2b (RFC 7693), as Go's `golang.org/x/crypto/argon2` computes it,
+each lane of each pass a routine of its own. `Argon2idHash(password)`
+gives the string a users table keeps,
+`$argon2id$v=19$m=65536,t=3,p=4$<salt>$<tag>`: RFC 9106's second
+recommended option (64 MiB of memory, 3 passes, 4 lanes), a 16-byte
+salt from the kernel (`RandomBytes`) and a 32-byte tag, the salt and the
+tag in base64 with no padding, as the PHC string format says.
+`Argon2idVerify(password, phc)` computes the tag again with the
+parameters the string names and compares in a time that depends on the
+lengths alone; it answers `False` for a string that is not an
+`$argon2id$` string of version 19. `Argon2idHashWith(password, salt, t,
+m, p, tagLen)` takes its own parameters, and `Argon2idParse(phc, out t,
+m, p, salt, tag)` reads a string without computing. `Argon2idKey`,
+`Argon2iKey` and `Argon2dKey(password, salt, t, m, p, tagLen)` give the
+raw tag of each type, and `Argon2Raw(mode, password, salt, secret,
+data, t, m, p, tagLen)` takes RFC 9106's secret K and associated data X
+too; `''` for a parameter outside its range (a salt under 8 bytes, a
+tag under 4, no pass, no lane, more than 255 lanes, less than 8 KiB a
+lane). A hash of the default parameters holds 64 MiB while it runs and
+takes about a tenth of a second on this machine: a login burst of N
+users holds N times that, which is the point of the function.
+
+`Blake2b(s, size, key)` is BLAKE2b of 1 to 64 bytes, keyed with up to 64
+bytes or `''`; `TBlake2b` with `Blake2bInit`, `Blake2bUpdate` and
+`Blake2bFinal` takes a message in pieces. `Base64NoPad(s)` and
+`Base64NoPadDecode(s, out r)` are RFC 4648's base64 without padding;
+the decoder refuses a byte outside the alphabet, a length of 1 mod 4
+and nonzero bits left over. `testdata/argon2kat` checks the reference
+implementation's vectors of the three types with a secret and
+associated data, RFC 7693's vectors, the PHC string written, parsed and
+verified, and the refusals, on both machines.
+
+```
+phc := Argon2idHash(password);                 { stored at sign-up }
+if Argon2idVerify(password, phc) then ...      { at login }
+```
+
 `uses sqlite` gives SQLite 3.54.1 in paslang: the library itself, written
 from SQLite's own file format, documents and sources (P403 the file,
 P404 the SQL, 1.1.253 P405 the rest). It is a library unit, as `pasnet`

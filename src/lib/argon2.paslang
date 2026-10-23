@@ -1,0 +1,790 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+
+  paslang is free software: you can redistribute it and/or modify it
+  under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+
+  paslang is distributed in the hope that it will be useful, but
+  WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+  General Public License for more details.
+
+  Under Section 7 of GPL version 3, you are granted additional
+  permissions described in the paslang Runtime Library Exception,
+  version 1.0, in the file COPYING.RUNTIME.
+
+  You should have received a copy of the GNU General Public License
+  along with paslang.  If not, see <https://www.gnu.org/licenses/>. }
+
+{ Argon2 (RFC 9106), the password hash: Argon2id, Argon2i and Argon2d,
+  version 19, on BLAKE2b (RFC 7693), in pure paslang as Go's
+  golang.org/x/crypto/argon2 and blake2b (v0.58.0) compute them, each
+  lane of a pass a routine (P438, 1.1.258). Argon2idHash gives the PHC
+  string a users table keeps, $argon2id$v=19$m=65536,t=3,p=4$salt$hash,
+  with RFC 9106's second recommended parameters (64 MiB, 3 passes, 4
+  lanes) and a 16-byte salt from the kernel; Argon2idVerify checks a
+  password against such a string, with the parameters it names, in a
+  time that depends on nothing but them. The base64 of the string is
+  RFC 4648's standard alphabet with no padding, as the PHC format says. }
+unit argon2;
+
+interface
+
+const
+  Argon2Version = 19;
+  { the type, RFC 9106 3.1 }
+  Argon2d = 0;
+  Argon2i = 1;
+  Argon2id = 2;
+  { the second recommended option, RFC 9106 4 }
+  Argon2DefaultMemory = 65536;
+  Argon2DefaultTime = 3;
+  Argon2DefaultLanes = 4;
+  Argon2DefaultSaltLen = 16;
+  Argon2DefaultTagLen = 32;
+
+{ The tag of TagLen bytes (4 or more) for Password and Salt (8 bytes or
+  more), with Time passes (1 or more) over MemKiB KiB of memory (8 times
+  Lanes or more) in Lanes lanes (1 to 255); Secret and Data are RFC
+  9106's K and X, '' when none. '' for a parameter outside its range. }
+function Argon2Raw(Mode: Integer; const Password, Salt, Secret, Data: string;
+  Time, MemKiB, Lanes, TagLen: Integer): string;
+{ the same with no secret and no data, as Go's IDKey and Key }
+function Argon2idKey(const Password, Salt: string; Time, MemKiB, Lanes, TagLen: Integer): string;
+function Argon2iKey(const Password, Salt: string; Time, MemKiB, Lanes, TagLen: Integer): string;
+function Argon2dKey(const Password, Salt: string; Time, MemKiB, Lanes, TagLen: Integer): string;
+
+{ The PHC string of Password with the default parameters and a random
+  salt, '$argon2id$v=19$m=65536,t=3,p=4$<salt>$<tag>' }
+function Argon2idHash(const Password: string): string;
+{ the same with these parameters and this salt }
+function Argon2idHashWith(const Password, Salt: string; Time, MemKiB, Lanes, TagLen: Integer): string;
+{ whether Password gives the tag of the PHC string, computed with the
+  parameters the string names; False for a string that is not one }
+function Argon2idVerify(const Password, Phc: string): Boolean;
+{ the parameters of a PHC string, without computing anything; False
+  when it is not an $argon2id$ string of version 19 }
+function Argon2idParse(const Phc: string; out Time, MemKiB, Lanes: Integer; out Salt, Tag: string): Boolean;
+
+{ BLAKE2b (RFC 7693) of Size bytes (1 to 64), keyed with Key (up to 64
+  bytes, '' for none), of the whole of S; '' for a size or a key outside }
+function Blake2b(const S: string; Size: Integer; const Key: string): string;
+{ an incremental BLAKE2b: Init, any number of Update, then Final }
+type
+  TBlake2b = record
+    H: array[0..7] of Integer;
+    C0, C1: Integer;
+    Buf: array[0..127] of Byte;
+    Off: Integer;
+    Size: Integer;
+  end;
+procedure Blake2bInit(var B: TBlake2b; Size: Integer; const Key: string);
+procedure Blake2bUpdate(var B: TBlake2b; const S: string);
+function Blake2bFinal(var B: TBlake2b): string;
+
+{ RFC 4648 base64 of the standard alphabet with no padding, as the PHC
+  format writes a salt and a tag }
+function Base64NoPad(const S: string): string;
+function Base64NoPadDecode(const S: string; out R: string): Boolean;
+
+implementation
+
+uses
+  sysutils;
+
+{ ---- BLAKE2b, blake2b_generic.go ---- }
+
+const
+  B2Iv: array[0..7] of Integer = (Integer($6A09E667F3BCC908), Integer($BB67AE8584CAA73B),
+    Integer($3C6EF372FE94F82B), Integer($A54FF53A5F1D36F1), Integer($510E527FADE682D1),
+    Integer($9B05688C2B3E6C1F), Integer($1F83D9ABFB41BD6B), Integer($5BE0CD19137E2179));
+  { the message schedule of the twelve rounds, Go's precomputed }
+  B2Sigma: array[0..11, 0..15] of Byte = (
+    (0, 2, 4, 6, 1, 3, 5, 7, 8, 10, 12, 14, 9, 11, 13, 15),
+    (14, 4, 9, 13, 10, 8, 15, 6, 1, 0, 11, 5, 12, 2, 7, 3),
+    (11, 12, 5, 15, 8, 0, 2, 13, 10, 3, 7, 9, 14, 6, 1, 4),
+    (7, 3, 13, 11, 9, 1, 12, 14, 2, 5, 4, 15, 6, 10, 0, 8),
+    (9, 5, 2, 10, 0, 7, 4, 15, 14, 11, 6, 3, 1, 12, 8, 13),
+    (2, 6, 0, 8, 12, 10, 11, 3, 4, 7, 15, 1, 13, 5, 14, 9),
+    (12, 1, 14, 4, 5, 15, 13, 10, 0, 6, 9, 8, 7, 3, 2, 11),
+    (13, 7, 12, 3, 11, 14, 1, 9, 5, 15, 8, 2, 0, 4, 6, 10),
+    (6, 14, 11, 0, 15, 9, 3, 8, 12, 13, 1, 10, 2, 7, 4, 5),
+    (10, 8, 7, 1, 2, 4, 6, 5, 15, 9, 3, 13, 11, 14, 12, 0),
+    (0, 2, 4, 6, 1, 3, 5, 7, 8, 10, 12, 14, 9, 11, 13, 15),
+    (14, 4, 9, 13, 10, 8, 15, 6, 1, 0, 11, 5, 12, 2, 7, 3));
+
+{ the G of BLAKE2b, RFC 7693 3.1, on four words and two message words }
+procedure B2G(var A, B, C, D: Integer; X, Y: Integer); inline;
+begin
+  A := A + B + X;
+  D := (D xor A) ror 32;
+  C := C + D;
+  B := (B xor C) ror 24;
+  A := A + B + Y;
+  D := (D xor A) ror 16;
+  C := C + D;
+  B := (B xor C) ror 63;
+end;
+
+{ One block of 128 bytes at P into H, the counter C0:C1 already counted,
+  Flag the last block's $FFFFFFFFFFFFFFFF (Go's hashBlocksGeneric) }
+procedure B2Compress(var H: array[0..7] of Integer; C0, C1, Flag: Integer; P: Pointer);
+var
+  m: array[0..15] of Integer;
+  v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15: Integer;
+  i: Integer;
+begin
+  for i := 0 to 15 do
+    m[i] := LoadLE64(Pointer(Integer(P) + 8 * i));
+  v0 := H[0]; v1 := H[1]; v2 := H[2]; v3 := H[3];
+  v4 := H[4]; v5 := H[5]; v6 := H[6]; v7 := H[7];
+  v8 := B2Iv[0]; v9 := B2Iv[1]; v10 := B2Iv[2]; v11 := B2Iv[3];
+  v12 := B2Iv[4] xor C0; v13 := B2Iv[5] xor C1; v14 := B2Iv[6] xor Flag; v15 := B2Iv[7];
+  for i := 0 to 11 do
+  begin
+    B2G(v0, v4, v8, v12, m[B2Sigma[i, 0]], m[B2Sigma[i, 4]]);
+    B2G(v1, v5, v9, v13, m[B2Sigma[i, 1]], m[B2Sigma[i, 5]]);
+    B2G(v2, v6, v10, v14, m[B2Sigma[i, 2]], m[B2Sigma[i, 6]]);
+    B2G(v3, v7, v11, v15, m[B2Sigma[i, 3]], m[B2Sigma[i, 7]]);
+    B2G(v0, v5, v10, v15, m[B2Sigma[i, 8]], m[B2Sigma[i, 12]]);
+    B2G(v1, v6, v11, v12, m[B2Sigma[i, 9]], m[B2Sigma[i, 13]]);
+    B2G(v2, v7, v8, v13, m[B2Sigma[i, 10]], m[B2Sigma[i, 14]]);
+    B2G(v3, v4, v9, v14, m[B2Sigma[i, 11]], m[B2Sigma[i, 15]]);
+  end;
+  H[0] := H[0] xor v0 xor v8;
+  H[1] := H[1] xor v1 xor v9;
+  H[2] := H[2] xor v2 xor v10;
+  H[3] := H[3] xor v3 xor v11;
+  H[4] := H[4] xor v4 xor v12;
+  H[5] := H[5] xor v5 xor v13;
+  H[6] := H[6] xor v6 xor v14;
+  H[7] := H[7] xor v7 xor v15;
+end;
+
+{ the counter grows by 128 a block, 128 bits wide }
+procedure B2Count(var B: TBlake2b; N: Integer);
+var
+  old: Integer;
+begin
+  old := B.C0;
+  B.C0 := B.C0 + N;
+  if (B.C0 as UInt64) < (old as UInt64) then
+    B.C1 := B.C1 + 1;
+end;
+
+procedure Blake2bInit(var B: TBlake2b; Size: Integer; const Key: string);
+var
+  i: Integer;
+begin
+  for i := 0 to 7 do
+    B.H[i] := B2Iv[i];
+  { the parameter block's first word: digest length, key length, fanout
+    1 and depth 1 (RFC 7693 2.5) }
+  B.H[0] := B.H[0] xor (Size or (Length(Key) shl 8) or (1 shl 16) or (1 shl 24));
+  B.C0 := 0;
+  B.C1 := 0;
+  B.Off := 0;
+  B.Size := Size;
+  for i := 0 to 127 do
+    B.Buf[i] := 0;
+  if Key <> '' then
+  begin
+    { a key is a first block of its own, padded with zeros }
+    for i := 1 to Length(Key) do
+      B.Buf[i - 1] := Byte(Ord(Key[i]));
+    B.Off := 128;
+  end;
+end;
+
+{ Go's Write: the buffer filled first and compressed when full, then the
+  whole blocks of S but the last, then what is left into the buffer; a
+  block is compressed only when more follows, since the last one goes
+  with the final flag }
+procedure Blake2bUpdate(var B: TBlake2b; const S: string);
+var
+  p, n, k: Integer;
+begin
+  p := 1;
+  n := Length(S);
+  if B.Off > 0 then
+  begin
+    k := 128 - B.Off;
+    if n <= k then
+    begin
+      Move(S[1], B.Buf[B.Off], n);
+      B.Off := B.Off + n;
+      Exit;
+    end;
+    { k is 0 when a key filled the block, which goes out now (Go's Write) }
+    if k > 0 then
+      Move(S[1], B.Buf[B.Off], k);
+    B2Count(B, 128);
+    B2Compress(B.H, B.C0, B.C1, 0, @B.Buf[0]);
+    B.Off := 0;
+    p := p + k;
+    n := n - k;
+  end;
+  while n > 128 do
+  begin
+    B2Count(B, 128);
+    B2Compress(B.H, B.C0, B.C1, 0, @S[p]);
+    p := p + 128;
+    n := n - 128;
+  end;
+  if n > 0 then
+  begin
+    Move(S[p], B.Buf[0], n);
+    B.Off := n;
+  end;
+end;
+
+function Blake2bFinal(var B: TBlake2b): string;
+var
+  i: Integer;
+  h: array[0..7] of Integer;
+begin
+  for i := B.Off to 127 do
+    B.Buf[i] := 0;
+  B2Count(B, B.Off);
+  for i := 0 to 7 do
+    h[i] := B.H[i];
+  B2Compress(h, B.C0, B.C1, -1, @B.Buf[0]);
+  SetLength(Result, B.Size);
+  for i := 1 to B.Size do
+    Result[i] := Chr((h[(i - 1) shr 3] shr (8 * ((i - 1) and 7))) and 255);
+end;
+
+function Blake2b(const S: string; Size: Integer; const Key: string): string;
+var
+  b: TBlake2b;
+begin
+  Result := '';
+  if (Size < 1) or (Size > 64) or (Length(Key) > 64) then
+    Exit;
+  Blake2bInit(b, Size, Key);
+  Blake2bUpdate(b, S);
+  Result := Blake2bFinal(b);
+end;
+
+function Le32(N: Integer): string;
+begin
+  SetLength(Result, 4);
+  Result[1] := Chr(N and 255);
+  Result[2] := Chr((N shr 8) and 255);
+  Result[3] := Chr((N shr 16) and 255);
+  Result[4] := Chr((N shr 24) and 255);
+end;
+
+{ H' of RFC 9106 3.3, Go's blake2bHash: BLAKE2b of LE32(n) || in, of
+  size n up to 64; past 64, 64-byte digests chained, each one giving
+  its first 32 bytes, the last one of what is left }
+function HPrime(const S: string; N: Integer): string;
+var
+  b: TBlake2b;
+  v: string;
+  left, r: Integer;
+begin
+  if N <= 64 then
+  begin
+    Blake2bInit(b, N, '');
+    Blake2bUpdate(b, Le32(N));
+    Blake2bUpdate(b, S);
+    Result := Blake2bFinal(b);
+    Exit;
+  end;
+  Blake2bInit(b, 64, '');
+  Blake2bUpdate(b, Le32(N));
+  Blake2bUpdate(b, S);
+  v := Blake2bFinal(b);
+  Result := Copy(v, 1, 32);
+  left := N - 32;
+  while left > 64 do
+  begin
+    v := Blake2b(v, 64, '');
+    Result := Result + Copy(v, 1, 32);
+    left := left - 32;
+  end;
+  r := ((N + 31) div 32) - 2;
+  Result := Result + Blake2b(v, N - 32 * r, '');
+end;
+
+{ ---- Argon2, argon2.go and blamka_generic.go ---- }
+
+const
+  BlockWords = 128;
+  SyncPoints = 4;
+
+type
+  { the memory, every lane's blocks one after another, and the
+    parameters a segment's routine reads }
+  TArgon = class
+    B: array of Integer;
+    Memory, Lanes, LaneLen, SegLen, Time, Mode: Integer;
+    Wg: waitgroup;
+  end;
+
+{ the G of BlaMka: BLAKE2b's with a + b + 2 * lo32(a) * lo32(b) }
+procedure BlamkaG(var A, B, C, D: Integer); inline;
+begin
+  A := A + B + 2 * (A and $FFFFFFFF) * (B and $FFFFFFFF);
+  D := (D xor A) ror 32;
+  C := C + D + 2 * (C and $FFFFFFFF) * (D and $FFFFFFFF);
+  B := (B xor C) ror 24;
+  A := A + B + 2 * (A and $FFFFFFFF) * (B and $FFFFFFFF);
+  D := (D xor A) ror 16;
+  C := C + D + 2 * (C and $FFFFFFFF) * (D and $FFFFFFFF);
+  B := (B xor C) ror 63;
+end;
+
+{ the round on sixteen words of T at these places (Go's blamkaGeneric) }
+procedure BlamkaRound(var T: array[0..127] of Integer; I0, I1, I2, I3, I4, I5, I6, I7,
+  I8, I9, I10, I11, I12, I13, I14, I15: Integer);
+var
+  v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15: Integer;
+begin
+  v0 := T[I0]; v1 := T[I1]; v2 := T[I2]; v3 := T[I3];
+  v4 := T[I4]; v5 := T[I5]; v6 := T[I6]; v7 := T[I7];
+  v8 := T[I8]; v9 := T[I9]; v10 := T[I10]; v11 := T[I11];
+  v12 := T[I12]; v13 := T[I13]; v14 := T[I14]; v15 := T[I15];
+  BlamkaG(v0, v4, v8, v12);
+  BlamkaG(v1, v5, v9, v13);
+  BlamkaG(v2, v6, v10, v14);
+  BlamkaG(v3, v7, v11, v15);
+  BlamkaG(v0, v5, v10, v15);
+  BlamkaG(v1, v6, v11, v12);
+  BlamkaG(v2, v7, v8, v13);
+  BlamkaG(v3, v4, v9, v14);
+  T[I0] := v0; T[I1] := v1; T[I2] := v2; T[I3] := v3;
+  T[I4] := v4; T[I5] := v5; T[I6] := v6; T[I7] := v7;
+  T[I8] := v8; T[I9] := v9; T[I10] := v10; T[I11] := v11;
+  T[I12] := v12; T[I13] := v13; T[I14] := v14; T[I15] := v15;
+end;
+
+{ The compression G of RFC 9106 3.5 (Go's processBlockGeneric): the
+  block at OutOff is, or is xored with when Xor, P(In1 xor In2) xor In1
+  xor In2, P the rows then the columns of eight 16-byte registers }
+procedure ProcessBlock(A: TArgon; OutOff, In1Off, In2Off: Integer; DoXor: Boolean);
+var
+  t: array[0..127] of Integer;
+  i: Integer;
+begin
+  for i := 0 to 127 do
+    t[i] := A.B[In1Off + i] xor A.B[In2Off + i];
+  i := 0;
+  while i < 128 do
+  begin
+    BlamkaRound(t, i, i + 1, i + 2, i + 3, i + 4, i + 5, i + 6, i + 7, i + 8, i + 9, i + 10, i + 11,
+      i + 12, i + 13, i + 14, i + 15);
+    i := i + 16;
+  end;
+  i := 0;
+  while i < 16 do
+  begin
+    BlamkaRound(t, i, i + 1, 16 + i, 17 + i, 32 + i, 33 + i, 48 + i, 49 + i, 64 + i, 65 + i, 80 + i, 81 + i,
+      96 + i, 97 + i, 112 + i, 113 + i);
+    i := i + 2;
+  end;
+  if DoXor then
+    for i := 0 to 127 do
+      A.B[OutOff + i] := A.B[OutOff + i] xor A.B[In1Off + i] xor A.B[In2Off + i] xor t[i]
+  else
+    for i := 0 to 127 do
+      A.B[OutOff + i] := A.B[In1Off + i] xor A.B[In2Off + i] xor t[i];
+end;
+
+{ the same on three local blocks (the address blocks of Argon2i) }
+procedure ProcessLocal(var OutB: array[0..127] of Integer; const In1, In2: array[0..127] of Integer);
+var
+  t: array[0..127] of Integer;
+  i: Integer;
+begin
+  for i := 0 to 127 do
+    t[i] := In1[i] xor In2[i];
+  i := 0;
+  while i < 128 do
+  begin
+    BlamkaRound(t, i, i + 1, i + 2, i + 3, i + 4, i + 5, i + 6, i + 7, i + 8, i + 9, i + 10, i + 11,
+      i + 12, i + 13, i + 14, i + 15);
+    i := i + 16;
+  end;
+  i := 0;
+  while i < 16 do
+  begin
+    BlamkaRound(t, i, i + 1, 16 + i, 17 + i, 32 + i, 33 + i, 48 + i, 49 + i, 64 + i, 65 + i, 80 + i, 81 + i,
+      96 + i, 97 + i, 112 + i, 113 + i);
+    i := i + 2;
+  end;
+  for i := 0 to 127 do
+    OutB[i] := In1[i] xor In2[i] xor t[i];
+end;
+
+{ the block referenced, RFC 9106 3.4 (Go's indexAlpha and phi): a block
+  index in the whole memory }
+function IndexAlpha(A: TArgon; Rand, N, Slice, Lane, Index: Integer): Integer;
+var
+  refLane, m, s, p: Integer;
+begin
+  refLane := ((Rand shr 32) and $FFFFFFFF) mod A.Lanes;
+  if (N = 0) and (Slice = 0) then
+    refLane := Lane;
+  m := 3 * A.SegLen;
+  s := ((Slice + 1) mod SyncPoints) * A.SegLen;
+  if Lane = refLane then
+    m := m + Index;
+  if N = 0 then
+  begin
+    m := Slice * A.SegLen;
+    s := 0;
+    if (Slice = 0) or (Lane = refLane) then
+      m := m + Index;
+  end;
+  if (Index = 0) or (Lane = refLane) then
+    m := m - 1;
+  { phi: the 32-bit value squared and scaled, unsigned }
+  p := Rand and $FFFFFFFF;
+  p := (p * p) shr 32;
+  p := (p * m) shr 32;
+  Result := refLane * A.LaneLen + ((s + m - (p + 1)) mod A.LaneLen);
+end;
+
+{ one segment of one lane of pass N, Go's processSegment, as a routine }
+procedure Segment(A: TArgon; N, Slice, Lane: Integer);
+var
+  addresses, inb, zero: array[0..127] of Integer;
+  index, offset, prev, newOff, rnd, i: Integer;
+  indep: Boolean;
+begin
+  for i := 0 to 127 do
+  begin
+    addresses[i] := 0;
+    inb[i] := 0;
+    zero[i] := 0;
+  end;
+  indep := (A.Mode = Argon2i) or ((A.Mode = Argon2id) and (N = 0) and (Slice < SyncPoints div 2));
+  if indep then
+  begin
+    inb[0] := N;
+    inb[1] := Lane;
+    inb[2] := Slice;
+    inb[3] := A.Memory;
+    inb[4] := A.Time;
+    inb[5] := A.Mode;
+  end;
+  index := 0;
+  if (N = 0) and (Slice = 0) then
+  begin
+    index := 2;
+    if indep then
+    begin
+      inb[6] := inb[6] + 1;
+      ProcessLocal(addresses, inb, zero);
+      ProcessLocal(addresses, addresses, zero);
+    end;
+  end;
+  offset := Lane * A.LaneLen + Slice * A.SegLen + index;
+  while index < A.SegLen do
+  begin
+    prev := offset - 1;
+    if (index = 0) and (Slice = 0) then
+      prev := prev + A.LaneLen;
+    if indep then
+    begin
+      if index mod BlockWords = 0 then
+      begin
+        inb[6] := inb[6] + 1;
+        ProcessLocal(addresses, inb, zero);
+        ProcessLocal(addresses, addresses, zero);
+      end;
+      rnd := addresses[index mod BlockWords];
+    end
+    else
+      rnd := A.B[prev * BlockWords];
+    newOff := IndexAlpha(A, rnd, N, Slice, Lane, index);
+    ProcessBlock(A, offset * BlockWords, prev * BlockWords, newOff * BlockWords, True);
+    index := index + 1;
+    offset := offset + 1;
+  end;
+  A.Wg.Done;
+end;
+
+function Argon2Raw(Mode: Integer; const Password, Salt, Secret, Data: string;
+  Time, MemKiB, Lanes, TagLen: Integer): string;
+var
+  b: TBlake2b;
+  h0, blk: string;
+  a: TArgon;
+  memory, lane, j, i, n, slice: Integer;
+begin
+  Result := '';
+  if (Mode < Argon2d) or (Mode > Argon2id) or (Time < 1) or (Lanes < 1) or (Lanes > 255) or
+    (TagLen < 4) or (Length(Salt) < 8) or (MemKiB < 8 * Lanes) or (MemKiB > 4194304) then
+    Exit;
+  { H0, RFC 9106 3.2 }
+  Blake2bInit(b, 64, '');
+  Blake2bUpdate(b, Le32(Lanes) + Le32(TagLen) + Le32(MemKiB) + Le32(Time) + Le32(Argon2Version) + Le32(Mode));
+  Blake2bUpdate(b, Le32(Length(Password)) + Password);
+  Blake2bUpdate(b, Le32(Length(Salt)) + Salt);
+  Blake2bUpdate(b, Le32(Length(Secret)) + Secret);
+  Blake2bUpdate(b, Le32(Length(Data)) + Data);
+  h0 := Blake2bFinal(b);
+  memory := MemKiB div (SyncPoints * Lanes) * (SyncPoints * Lanes);
+  if memory < 2 * SyncPoints * Lanes then
+    memory := 2 * SyncPoints * Lanes;
+  a := TArgon.Create;
+  a.Memory := memory;
+  a.Lanes := Lanes;
+  a.LaneLen := memory div Lanes;
+  a.SegLen := a.LaneLen div SyncPoints;
+  a.Time := Time;
+  a.Mode := Mode;
+  SetLength(a.B, memory * BlockWords);
+  { the first two blocks of each lane: H' of H0 || LE32(i) || LE32(lane) }
+  for lane := 0 to Lanes - 1 do
+  begin
+    j := lane * a.LaneLen;
+    for i := 0 to 1 do
+    begin
+      blk := HPrime(h0 + Le32(i) + Le32(lane), 1024);
+      for n := 0 to 127 do
+        a.B[(j + i) * BlockWords + n] := LoadLE64(@blk[8 * n + 1]);
+    end;
+  end;
+  for n := 0 to Time - 1 do
+    for slice := 0 to SyncPoints - 1 do
+    begin
+      a.Wg.Add(Lanes);
+      for lane := 0 to Lanes - 1 do
+        pas Segment(a, n, slice, lane);
+      a.Wg.Wait;
+    end;
+  { the last blocks of every lane xored, then H' of the result }
+  for lane := 0 to Lanes - 2 do
+    for i := 0 to 127 do
+      a.B[(memory - 1) * BlockWords + i] := a.B[(memory - 1) * BlockWords + i] xor
+        a.B[(lane * a.LaneLen + a.LaneLen - 1) * BlockWords + i];
+  SetLength(blk, 1024);
+  for i := 0 to 127 do
+    StoreLE64(@blk[8 * i + 1], a.B[(memory - 1) * BlockWords + i]);
+  Result := HPrime(blk, TagLen);
+  a.B := nil;
+end;
+
+function Argon2idKey(const Password, Salt: string; Time, MemKiB, Lanes, TagLen: Integer): string;
+begin
+  Result := Argon2Raw(Argon2id, Password, Salt, '', '', Time, MemKiB, Lanes, TagLen);
+end;
+
+function Argon2iKey(const Password, Salt: string; Time, MemKiB, Lanes, TagLen: Integer): string;
+begin
+  Result := Argon2Raw(Argon2i, Password, Salt, '', '', Time, MemKiB, Lanes, TagLen);
+end;
+
+function Argon2dKey(const Password, Salt: string; Time, MemKiB, Lanes, TagLen: Integer): string;
+begin
+  Result := Argon2Raw(Argon2d, Password, Salt, '', '', Time, MemKiB, Lanes, TagLen);
+end;
+
+{ ---- base64 with no padding, RFC 4648 4 ---- }
+
+const
+  B64: string = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+
+function Base64NoPad(const S: string): string;
+var
+  i, n, v: Integer;
+begin
+  Result := '';
+  n := Length(S);
+  i := 1;
+  while i + 2 <= n do
+  begin
+    v := (Ord(S[i]) shl 16) or (Ord(S[i + 1]) shl 8) or Ord(S[i + 2]);
+    Result := Result + B64[(v shr 18) + 1] + B64[((v shr 12) and 63) + 1] + B64[((v shr 6) and 63) + 1] +
+      B64[(v and 63) + 1];
+    i := i + 3;
+  end;
+  if n - i = 1 then
+  begin
+    v := (Ord(S[i]) shl 16) or (Ord(S[i + 1]) shl 8);
+    Result := Result + B64[(v shr 18) + 1] + B64[((v shr 12) and 63) + 1] + B64[((v shr 6) and 63) + 1];
+  end
+  else if n - i = 0 then
+  begin
+    v := Ord(S[i]) shl 16;
+    Result := Result + B64[(v shr 18) + 1] + B64[((v shr 12) and 63) + 1];
+  end;
+end;
+
+function B64Val(C: Char): Integer;
+begin
+  case C of
+    'A'..'Z': Result := Ord(C) - 65;
+    'a'..'z': Result := Ord(C) - 71;
+    '0'..'9': Result := Ord(C) + 4;
+    '+': Result := 62;
+    '/': Result := 63;
+  else
+    Result := -1;
+  end;
+end;
+
+{ False for a byte outside the alphabet, a length of 1 mod 4, or
+  nonzero bits left over (RFC 4648 3.5, as Go's strict decoding) }
+function Base64NoPadDecode(const S: string; out R: string): Boolean;
+var
+  i, n, v, bits, d: Integer;
+begin
+  Result := False;
+  R := '';
+  n := Length(S);
+  if n mod 4 = 1 then
+    Exit;
+  v := 0;
+  bits := 0;
+  for i := 1 to n do
+  begin
+    d := B64Val(S[i]);
+    if d < 0 then
+      Exit;
+    v := (v shl 6) or d;
+    bits := bits + 6;
+    if bits >= 8 then
+    begin
+      bits := bits - 8;
+      R := R + Chr((v shr bits) and 255);
+    end;
+  end;
+  if (v and ((1 shl bits) - 1)) <> 0 then
+    Exit;
+  Result := True;
+end;
+
+{ ---- the PHC string ---- }
+
+{ equal, in a time that depends on the lengths alone (Go's
+  crypto/subtle.ConstantTimeCompare) }
+function ConstantTimeEq(const A, B: string): Boolean;
+var
+  i, v: Integer;
+begin
+  Result := False;
+  if Length(A) <> Length(B) then
+    Exit;
+  v := 0;
+  for i := 1 to Length(A) do
+    v := v or (Ord(A[i]) xor Ord(B[i]));
+  Result := v = 0;
+end;
+
+function Argon2idHashWith(const Password, Salt: string; Time, MemKiB, Lanes, TagLen: Integer): string;
+var
+  tag: string;
+begin
+  Result := '';
+  tag := Argon2idKey(Password, Salt, Time, MemKiB, Lanes, TagLen);
+  if tag = '' then
+    Exit;
+  Result := '$argon2id$v=19$m=' + IntToStr(MemKiB) + ',t=' + IntToStr(Time) + ',p=' + IntToStr(Lanes) + '$' +
+    Base64NoPad(Salt) + '$' + Base64NoPad(tag);
+end;
+
+function Argon2idHash(const Password: string): string;
+var
+  salt: TBytes;
+  s: string;
+  i: Integer;
+begin
+  salt := RandomBytes(Argon2DefaultSaltLen);
+  SetLength(s, Argon2DefaultSaltLen);
+  for i := 0 to Argon2DefaultSaltLen - 1 do
+    s[i + 1] := Chr(salt[i]);
+  Result := Argon2idHashWith(Password, s, Argon2DefaultTime, Argon2DefaultMemory, Argon2DefaultLanes,
+    Argon2DefaultTagLen);
+end;
+
+{ the fields between '$', in order }
+function Field(const S: string; var P: Integer): string;
+var
+  q: Integer;
+begin
+  q := Pos('$', S, P);
+  if q = 0 then
+    q := Length(S) + 1;
+  Result := Copy(S, P, q - P);
+  P := q + 1;
+end;
+
+{ 'm=65536,t=3,p=4' in that order, as the reference writes it }
+function Params(const S: string; out M, T, P: Integer): Boolean;
+var
+  parts: TStringArray;
+  i: Integer;
+  v: Int64;
+begin
+  Result := False;
+  parts := S.SplitText(',');
+  if Length(parts) <> 3 then
+    Exit;
+  for i := 0 to 2 do
+    if (Length(parts[i]) < 3) or (parts[i][2] <> '=') or not TryStrToInt64(Copy(parts[i], 3, Length(parts[i]) - 2), v) or
+      (v < 1) or (v > 4294967295) or (Copy(parts[i], 3, 1) = '+') or (Copy(parts[i], 3, 1) = '-') then
+      Exit;
+  if (parts[0][1] <> 'm') or (parts[1][1] <> 't') or (parts[2][1] <> 'p') then
+    Exit;
+  M := StrToInt64(Copy(parts[0], 3, Length(parts[0]) - 2));
+  T := StrToInt64(Copy(parts[1], 3, Length(parts[1]) - 2));
+  P := StrToInt64(Copy(parts[2], 3, Length(parts[2]) - 2));
+  Result := True;
+end;
+
+function Argon2idParse(const Phc: string; out Time, MemKiB, Lanes: Integer; out Salt, Tag: string): Boolean;
+var
+  p: Integer;
+  f: string;
+begin
+  Result := False;
+  Time := 0;
+  MemKiB := 0;
+  Lanes := 0;
+  Salt := '';
+  Tag := '';
+  if (Phc = '') or (Phc[1] <> '$') then
+    Exit;
+  p := 2;
+  if Field(Phc, p) <> 'argon2id' then
+    Exit;
+  if Field(Phc, p) <> 'v=19' then
+    Exit;
+  if not Params(Field(Phc, p), MemKiB, Time, Lanes) then
+    Exit;
+  f := Field(Phc, p);
+  if (f = '') or not Base64NoPadDecode(f, Salt) then
+    Exit;
+  if p > Length(Phc) then
+    Exit;
+  f := Field(Phc, p);
+  { the tag is the last field }
+  if (f = '') or (p <> Length(Phc) + 2) then
+    Exit;
+  if not Base64NoPadDecode(f, Tag) then
+    Exit;
+  Result := (Lanes <= 255) and (Length(Salt) >= 8) and (Length(Tag) >= 4);
+end;
+
+function Argon2idVerify(const Password, Phc: string): Boolean;
+var
+  t, m, p: Integer;
+  salt, tag, got: string;
+begin
+  Result := False;
+  if not Argon2idParse(Phc, t, m, p, salt, tag) then
+    Exit;
+  got := Argon2idKey(Password, salt, t, m, p, Length(tag));
+  if got = '' then
+    Exit;
+  Result := ConstantTimeEq(got, tag);
+end;
+
+end.

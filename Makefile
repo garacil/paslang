@@ -576,6 +576,9 @@ GOLDEN += signals
 # P434: the HTTP server, every limit, deadline, error and feature.
 GOLDEN += httpsrv
 GOLDEN_A64 += httpsrv
+# P438: Argon2 and BLAKE2b against their published vectors, the PHC string.
+GOLDEN += argon2kat
+GOLDEN_A64 += argon2kat
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -608,6 +611,7 @@ LIB_UNITS := \
 	src/lib/pastime.paslang \
 	src/lib/pasx11.paslang \
 	src/rtl/sysutils.paslang \
+	src/lib/argon2.paslang \
 	src/lib/httpserver.paslang \
 	src/lib/sqlite.paslang
 
