@@ -2559,6 +2559,14 @@ routine around it (§20).
 
 A routine takes up to 32 parameters. `var` passes the caller's variable,
 `out` the same but for results only, `const` promises not to change it.
+A `var` or `out` parameter takes a variable of its own type alone, as
+Pascal's reference says: a `Single` for a `var Double`, a `TDer`
+variable for a `var TBase`, another record or another enumeration is
+refused (`var parameter of type TBase given a TDer`), and an open
+array parameter, `var A: array of T`, takes any array of `T`, a named
+one too, and no array of another element (1.1.252, P422: they were
+taken, and the routine wrote one type's bytes into a variable of
+another).
 A parameter without them is a copy: a routine that changes its string,
 record or array parameter changes its own copy, and the caller's
 variable keeps its value (a routine that only reads it pays nothing for

@@ -562,6 +562,10 @@ GOLDEN_A64 += setlenzero
 # and 12 arguments, past the registers on the stack.
 GOLDEN += callvalargs
 GOLDEN_A64 += callvalargs
+# P422: var and out parameters given variables of their own types, open
+# arrays any array of their element type.
+GOLDEN += varparamtype
+GOLDEN_A64 += varparamtype
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -2219,6 +2223,13 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  'mapinto:map[string] of Integer does not go into map[Integer] of string at 10:8' \
 	  'incstr:Inc takes a number, an ordinal or a pointer, not string at 9:7' \
 	  'vararr:array[0..3] of Byte does not go into a var array of Byte parameter: a slice does at 13:8' \
+	  'varelem:var parameter of type array of TRec given a array of TObj at 21:8' \
+	  'outelem:var parameter of type array of Byte given a array of Word at 10:8' \
+	  'varreal:var parameter of type Real given a Single at 12:8' \
+	  'varclass:var parameter of type TBase given a TDer at 17:11' \
+	  'varenum:var parameter of type TColor given a TOther at 15:9' \
+	  'varbool:var parameter of type Boolean given a Integer at 11:8' \
+	  'varrec:var parameter of type TA given a TB at 19:8' \
 	  'atomicval:AtomicAdd takes the address of an Integer, as AtomicAdd(@v, ...), not the Integer itself at 5:13' \
 	  'atomiccasval:AtomicCas takes the address of an Integer, as AtomicCas(@v, ...), not the Integer itself at 5:16' \
 	  'merklestatic:MerkleRoot takes the leaves as a slice, array of string, not the static array[0..2] of string: SetLength one and fill it at 8:29' \
