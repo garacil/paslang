@@ -11472,7 +11472,10 @@ and a program that does not name it carries nothing of it. A program
 that names it and reaches none of it carries none of it either: each
 read-only item of a unit (a literal, a class's tables, a call site's
 descriptor) is a section of its own that the linker keeps only when
-kept code reaches it (1.1.246, P417).
+kept code reaches it (1.1.246, P417), and so is each of its variables
+and typed constants, with its entry in the collector's roots (1.1.250,
+P420): a program that reads a database carries none of the tables of
+SQL's parser.
 
 `TSqlite.Open(path)` or `TSqlite.Open(path, flags)` opens a database
 file as `sqlite3_open_v2` does (`SQLITE_OPEN_READONLY`,
@@ -13577,8 +13580,10 @@ paslangc [options] file.paslang
 
 The program is linked statically, with only the routines it reaches:
 every routine sits in a section of its own and the linker drops the
-ones nothing names (1.1.1), so a program that uses no tree, hash or
-map carries none of their code (`hello` is about 114 KB of code on
+ones nothing names (1.1.1), and so does every global variable and typed
+constant, with its entry in the collector's roots (1.1.250, P420), so a
+program that uses no tree, hash or map carries none of their code or
+data (`hello` is about 114 KB of code on
 amd64 and 154 on arm64, where it was 374).
 
 A missing file, a syntax error or a failed assemble or link prints a

@@ -1036,7 +1036,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'gctype TPair size 32 words 1 mask 0x0000000000000005' $(BUILDDIR)/gctypes.s; \
 	grep -q 'gctype TBox instance size 48 words 1 mask 0x000000000000000a' $(BUILDDIR)/gctypes.s; \
 	if grep -q 'gctype TPlain' $(BUILDDIR)/gctypes.s; then echo "gctypes.s has a descriptor for TPlain, which holds no pointer"; exit 1; fi; \
-	grep -qx '.section pasgcroots,"aw"' $(BUILDDIR)/gctypes.s; \
+	grep -qx '.section pasgcroots.v_pl,"awo",@progbits,v_pl' $(BUILDDIR)/gctypes.s; \
 	grep -A1 -x '  .quad v_pl' $(BUILDDIR)/gctypes.s | grep -qx '  .quad 8'; \
 	grep -A1 -x '  .quad v_pairs' $(BUILDDIR)/gctypes.s | grep -qx '  .quad 24'; \
 	if grep -qx '  .quad v_total' $(BUILDDIR)/gctypes.s; then echo "gctypes.s lists v_total, which holds no pointer, as a root"; exit 1; fi; \
