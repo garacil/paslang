@@ -1,0 +1,234 @@
+{ P439: signals as Go's os/signal gives them (uses passignal). A signal
+  sent on every channel that asks for it and on no other; a channel
+  stopped gets none; the ones the runtime keeps and the faults refused;
+  a thousand signals on a channel of one; signals while every processor
+  spins, while a routine parks on a pipe with a deadline and while one
+  sleeps; and in child processes, the program itself again (through
+  the launcher given as the first argument, qemu for arm64): the
+  default action given back by SignalReset, an ignored signal still
+  ignored after exec, and a main routine that returns at once after
+  SignalNotify, which ends the program. }
+program signals;
+
+uses
+  passignal, paslinux, sysutils;
+
+var
+  Launcher: string;
+  stop, sink: Integer;
+  spinners: waitgroup;
+
+{ The program itself with Mode: its exit code, or 128 and the signal
+  that ended it }
+function Child(const Mode: string): Integer;
+begin
+  if Launcher = '' then
+    Result := ExecuteProcess(ParamStr(0), [Mode])
+  else
+    Result := ExecuteProcess(Launcher, [ParamStr(0), Mode]);
+end;
+
+{ the modes of a child }
+procedure RunChild(const Mode: string);
+var
+  c: chan of Integer;
+begin
+  c := MakeChan(1);
+  if Mode = 'reset' then
+  begin
+    { SIGUSR2's default action ends the process }
+    SignalNotify(c, [SIGUSR2]);
+    SignalReset([SIGUSR2]);
+    SignalRaise(SIGUSR2);
+    Sleep(20000);
+    Halt(7);
+  end
+  else if Mode = 'raise' then
+  begin
+    { ignored by the parent before exec: still ignored here }
+    SignalRaise(SIGUSR2);
+    SignalRaise(SIGUSR2);
+    if SignalIgnored(SIGUSR2) then
+      Halt(3);
+    Halt(4);
+  end
+  else if Mode = 'quick' then
+  begin
+    { main returns with the sending routine parked: the program ends }
+    if not SignalNotify(c, [SIGUSR1, SIGTERM]) then
+      Halt(5);
+  end
+  else
+    Halt(9);
+end;
+
+procedure Spin(K: Integer);
+var
+  x: Integer;
+begin
+  x := K;
+  while AtomicLoad(stop) = 0 do
+    x := x * 3 + 1;
+  sink := x;
+  spinners.Done;
+end;
+
+procedure Raiser(N: Integer);
+var
+  i: Integer;
+begin
+  for i := 1 to N do
+  begin
+    SignalRaise(SIGUSR1);
+    Sleep(1);
+  end;
+end;
+
+{ empty when no value waits on C }
+function Peek(C: chan of Integer): string;
+var
+  x: Integer;
+begin
+  select
+    Recv(C, x): Result := IntToStr(x);
+  else
+    Result := 'none';
+  end;
+end;
+
+var
+  a, b, c, d, f: chan of Integer;
+  i, n, x, got, rc, t0: Integer;
+  fds: array[0..1] of Int32;
+  buf: array[0..7] of Byte;
+  hup: Boolean;
+
+begin
+  if (ParamCount >= 1) and (Copy(ParamStr(1), 1, 1) <> '/') and (Copy(ParamStr(1), 1, 2) <> './') then
+  begin
+    RunChild(ParamStr(1));
+    Exit;
+  end;
+  if ParamCount >= 1 then
+    Launcher := ParamStr(1);
+
+  WriteLn(SignalName(SIGTERM), ' ', SignalName(SIGINT), ' ', SignalName(SIGHUP), ' ',
+    SignalName(35), ' [', SignalName(0), '] [', SignalName(65), ']');
+
+  a := MakeChan(1);
+  b := MakeChan(1);
+  { refused: the faults, the two no program catches, the runtime's two,
+    and no signal at all; nothing changes }
+  WriteLn('refused: ', SignalNotify(a, [SIGKILL]), ' ', SignalNotify(a, [SIGSTOP]), ' ',
+    SignalNotify(a, [SIGSEGV]), ' ', SignalNotify(a, [SIGBUS]), ' ', SignalNotify(a, [SIGFPE]), ' ',
+    SignalNotify(a, [SIGILL]), ' ', SignalNotify(a, [SIGPIPE]), ' ', SignalNotify(a, [SIGURG]), ' ',
+    SignalNotify(a, [0]), ' ', SignalNotify(a, [65]), ' ', SignalNotify(a, [SIGUSR1, SIGKILL]), ' ',
+    SignalIgnore([SIGSEGV]), ' ', SignalReset([SIGURG]));
+
+  { one channel, then two }
+  WriteLn('notify: ', SignalNotify(a, [SIGUSR1]));
+  SignalRaise(SIGUSR1);
+  WriteLn('a got ', Recv(a));
+  WriteLn('notify b: ', SignalNotify(b, [SIGUSR1, SIGUSR2]));
+  SignalRaise(SIGUSR1);
+  x := Recv(a);
+  WriteLn('both got ', x, ' ', Recv(b));
+  { a is sent to before b in one round: once b has SIGUSR2, a's turn
+    has passed }
+  SignalRaise(SIGUSR2);
+  x := Recv(b);
+  WriteLn('b got ', x, ', a got ', Peek(a));
+
+  { b stopped: SIGUSR1 still reaches a, never b }
+  SignalStop(b);
+  SignalRaise(SIGUSR1);
+  x := Recv(a);
+  WriteLn('after stop: a got ', x, ', b got ', Peek(b));
+
+  { a thousand on a channel of one: the first waits, the rest are
+    dropped or merged, and nothing waits for a receiver }
+  for i := 1 to 1000 do
+    SignalRaise(SIGUSR1);
+  x := Recv(a);
+  WriteLn('a thousand: got ', x);
+
+  { every processor spinning in a loop that calls nothing: the sending
+    routine still gets its turn }
+  stop := 0;
+  spinners.Add(32);
+  for i := 1 to 32 do
+    pas Spin(i);
+  while Peek(a) <> 'none' do
+    ;
+  SignalRaise(SIGUSR1);
+  x := Recv(a);
+  AtomicStore(stop, 1);
+  spinners.Wait;
+  WriteLn('while spinning: got ', x);
+
+  { a routine parked on a pipe with a deadline of 300 ms while fifty
+    signals come: the read ends with the deadline, not EINTR; and a
+    Sleep of 200 ms lasts 200 ms }
+  if OsPipe2(Int64(@fds[0]), 526336) < 0 then
+    Halt(1);
+  while Peek(a) <> 'none' do
+    ;
+  pas Raiser(50);
+  n := PasIoRead(fds[0], @buf[0], 8, PasIoDeadline(300));
+  WriteLn('pipe read: ', n);
+  t0 := Nanotime;
+  pas Raiser(50);
+  Sleep(200);
+  WriteLn('sleep: ', (Nanotime - t0) div 1000000 >= 200);
+  OsClose(fds[0]);
+  OsClose(fds[1]);
+
+  { SIGWINCH, whose default is to do nothing: sent on while asked for,
+    then given back }
+  c := MakeChan(1);
+  SignalNotify(c, [SIGWINCH]);
+  SignalRaise(SIGWINCH);
+  WriteLn('winch: ', Recv(c), ', ignored ', SignalIgnored(SIGWINCH));
+  WriteLn('reset winch: ', SignalReset([SIGWINCH]), ', ignored ', SignalIgnored(SIGWINCH));
+
+  { an empty list asks for every signal a program may catch }
+  d := MakeChan(4);
+  WriteLn('all: ', SignalNotify(d, []));
+  SignalRaise(SIGUSR2);
+  WriteLn('d got ', Recv(d));
+  SignalStop(d);
+
+  { child processes }
+  rc := Child('reset');
+  WriteLn('reset in a child: ', rc, ' (', SignalName(rc - 128), ')');
+  WriteLn('ignore: ', SignalIgnore([SIGUSR2]), ', ignored ', SignalIgnored(SIGUSR2));
+  rc := Child('raise');
+  WriteLn('ignored across exec: ', rc);
+  WriteLn('reset usr2: ', SignalReset([SIGUSR2]), ', ignored ', SignalIgnored(SIGUSR2));
+  rc := Child('quick');
+  WriteLn('quick child: ', rc);
+
+  { SIGHUP ignored, then given back as it was when the program began
+    (ignored under nohup) }
+  hup := SignalIgnored(SIGHUP);
+  SignalIgnore([SIGHUP]);
+  SignalRaise(SIGHUP);
+  got := Ord(SignalIgnored(SIGHUP));
+  SignalReset([SIGHUP]);
+  WriteLn('hup: ignored ', got, ', back as it was ', SignalIgnored(SIGHUP) = hup);
+
+  { SIGTERM, as a service waits for it }
+  f := MakeChan(1);
+  SignalNotify(f, [SIGTERM, SIGINT]);
+  SignalRaise(SIGTERM);
+  WriteLn('stopping on ', SignalName(Recv(f)));
+  SignalRaise(SIGINT);
+  WriteLn('and on ', SignalName(Recv(f)));
+  WriteLn('done');
+end.
+
+{ This file is part of paslang's tests.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+  paslang is free software under the GNU General Public License,
+  version 3 or (at your option) any later version; see the file
+  COPYING. It comes with ABSOLUTELY NO WARRANTY. }

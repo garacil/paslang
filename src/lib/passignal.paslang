@@ -1,0 +1,642 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+
+  paslang is free software: you can redistribute it and/or modify it
+  under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+
+  paslang is distributed in the hope that it will be useful, but
+  WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+  General Public License for more details.
+
+  Under Section 7 of GPL version 3, you are granted additional
+  permissions described in the paslang Runtime Library Exception,
+  version 1.0, in the file COPYING.RUNTIME.
+
+  You should have received a copy of the GNU General Public License
+  along with paslang.  If not, see <https://www.gnu.org/licenses/>. }
+
+{ Signals as Go's os/signal gives them (P439, 1.1.256): a signal the
+  program asks for no longer does its default action but is sent on
+  every channel that asked for it, as an Integer, without waiting for a
+  receiver (a channel of capacity 1 is enough for one kind of signal).
+  The handler the kernel runs only marks the signal and writes to an
+  eventfd; one routine of this unit, parked on that eventfd, sends it
+  on, so a routine that waits for a signal parks like any other wait
+  (Regla 11). That routine is not one the program waits for when its
+  main routine ends. SignalStop returns when no signal can reach its
+  channel any more; SignalReset gives a signal back the disposition it
+  had before this unit first touched it, SignalIgnore ignores it. A
+  child process a program starts takes the default action of each
+  signal caught here and keeps each one ignored: the runtime resets
+  caught handlers before exec (P185). Signals 1 to 64, but not the
+  faults a program's own instructions raise (SIGILL, SIGTRAP, SIGBUS,
+  SIGFPE, SIGSEGV, SIGSYS), the two no program can catch (SIGKILL,
+  SIGSTOP) and the two the runtime keeps (SIGPIPE, SIGURG). }
+unit passignal;
+
+interface
+
+const
+  { asm-generic/signal.h, the same numbers on amd64 and arm64 (signal(7)) }
+  SIGHUP = 1;
+  SIGINT = 2;
+  SIGQUIT = 3;
+  SIGILL = 4;
+  SIGTRAP = 5;
+  SIGABRT = 6;
+  SIGBUS = 7;
+  SIGFPE = 8;
+  SIGKILL = 9;
+  SIGUSR1 = 10;
+  SIGSEGV = 11;
+  SIGUSR2 = 12;
+  SIGPIPE = 13;
+  SIGALRM = 14;
+  SIGTERM = 15;
+  SIGSTKFLT = 16;
+  SIGCHLD = 17;
+  SIGCONT = 18;
+  SIGSTOP = 19;
+  SIGTSTP = 20;
+  SIGTTIN = 21;
+  SIGTTOU = 22;
+  SIGURG = 23;
+  SIGXCPU = 24;
+  SIGXFSZ = 25;
+  SIGVTALRM = 26;
+  SIGPROF = 27;
+  SIGWINCH = 28;
+  SIGIO = 29;
+  SIGPWR = 30;
+  SIGSYS = 31;
+  SIGRTMIN = 32;
+  SIGRTMAX = 64;
+
+{ SignalNotify: each signal of Sigs (every one a program may catch when
+  Sigs is empty) is sent on C from now on; False, and nothing changed,
+  when one of them is not a signal a program may catch or the eventfd
+  cannot be made. Calls with the same channel add to its signals. }
+function SignalNotify(C: chan of Integer; const Sigs: array of Integer): Boolean;
+{ SignalStop: C gets no signal from the moment it returns; a signal no
+  other channel asks for goes back to its disposition before }
+procedure SignalStop(C: chan of Integer);
+{ SignalReset: no channel gets these signals (all when Sigs is empty),
+  and each has the disposition it had before this unit first touched it }
+function SignalReset(const Sigs: array of Integer): Boolean;
+{ SignalIgnore: no channel gets these signals (all when Sigs is empty),
+  and the kernel drops them }
+function SignalIgnore(const Sigs: array of Integer): Boolean;
+{ SignalIgnored: whether Sig's disposition is to be ignored }
+function SignalIgnored(Sig: Integer): Boolean;
+{ SignalName: 'SIGTERM' for 15, 'SIGRTMIN+3' for 35, '' outside 1..64 }
+function SignalName(Sig: Integer): string;
+{ SignalRaise: Sig sent to this process (kill(2) of its own pid) }
+function SignalRaise(Sig: Integer): Boolean;
+
+implementation
+
+type
+  TSigEntry = record
+    C: chan of Integer;
+    { bit s mod 64 of word s div 64: the signals sent on C }
+    Mask: array[0..1] of Integer;
+  end;
+
+var
+  { written by the handler: the signals caught and not yet sent on,
+    bit s mod 64 of word s div 64, and how many it has caught }
+  Pending: array[0..1] of Integer;
+  Received: Integer;
+  { the eventfd the handler writes to, and the 8 bytes it writes }
+  WakeFd: Integer;
+  WakeOne: Integer;
+  { the handler's address, and amd64's sa_restorer }
+  HandlerAddr: Integer;
+  RestorerAddr: Integer;
+  { everything below is under Mu }
+  Mu: mutex;
+  { broadcast after each round of sending on, with Handled }
+  Idle: cond;
+  { Received as the sending routine read it before its last round }
+  Handled: Integer;
+  Entries: array of TSigEntry;
+  { channels SignalStop is taking out, still sent to until it returns }
+  Stopping: array of TSigEntry;
+  { channels that ask for each signal }
+  Refs: array[0..64] of Integer;
+  { whether the handler is this unit's, and the sigaction each signal
+    had before this unit first touched it }
+  Handling: array[0..64] of Boolean;
+  Touched: array[0..64] of Boolean;
+  Orig: array[0..64, 0..3] of Integer;
+  Started: Boolean;
+
+{ A signal a program may catch: 1 to 64 but the faults of its own
+  instructions, SIGKILL and SIGSTOP, and the runtime's SIGPIPE and
+  SIGURG }
+function Catchable(Sig: Integer): Boolean;
+begin
+  Result := (Sig >= 1) and (Sig <= 64) and (Sig <> SIGILL) and (Sig <> SIGTRAP) and
+    (Sig <> SIGBUS) and (Sig <> SIGFPE) and (Sig <> SIGKILL) and (Sig <> SIGSEGV) and
+    (Sig <> SIGPIPE) and (Sig <> SIGSTOP) and (Sig <> SIGURG) and (Sig <> SIGSYS);
+end;
+
+function AllCatchable(const Sigs: array of Integer): Boolean;
+var
+  i: Integer;
+begin
+  Result := True;
+  for i := 0 to High(Sigs) do
+    if not Catchable(Sigs[i]) then
+      Result := False;
+end;
+
+{ rt_sigaction(2): 13 on amd64, 134 on arm64; the kernel's struct
+  sigaction is the handler, the flags, the restorer and the mask, eight
+  bytes each on both }
+function SigAction(Sig: Integer; Act, Old: Pointer): Integer;
+begin
+  if Amd64 = 1 then
+    Result := Syscall(13, Sig, Act, Old, 8)
+  else
+    Result := Syscall(134, Sig, Act, Old, 8);
+end;
+
+{ The disposition before this unit first changes Sig's, kept to give it
+  back (Go's fwdSig, runtime/signal_unix.go sigenable) }
+procedure Touch(Sig: Integer);
+var
+  old: array[0..3] of Integer;
+  i: Integer;
+begin
+  if Touched[Sig] then
+    Exit;
+  if SigAction(Sig, nil, @old[0]) < 0 then
+    for i := 0 to 3 do
+      old[i] := 0;
+  for i := 0 to 3 do
+    Orig[Sig, i] := old[i];
+  Touched[Sig] := True;
+end;
+
+{ The handler the kernel runs on the M's signal stack, and its address.
+  It sets the signal's bit in Pending, counts it in Received and writes
+  8 bytes to WakeFd, all three safe in a handler (signal-safety(7):
+  write is async-signal-safe), and returns; the system call it broke
+  goes on (SA_RESTART). amd64: one lock bts on the 128-bit string
+  Pending (SDM vol. 2A, BTS: "can be used with a LOCK prefix", a
+  register offset reaching past the first quadword), lock incq, write
+  (1). arm64: the ldaxr/stlxr loops of Go's Or64 and Xadd64 without LSE
+  (internal/runtime/atomic/atomic_arm64.s), which every arm64 has,
+  then write (64). }
+procedure FindHandler;
+begin
+  asm amd64
+    jmp 92f
+  .p2align 5
+  91:
+    lock btsq %rdi, v_passignal.pending(%rip)
+    lock incq v_passignal.received(%rip)
+    movq v_passignal.wakefd(%rip), %rdi
+    testq %rdi, %rdi
+    js 93f
+    leaq v_passignal.wakeone(%rip), %rsi
+    movq $8, %rdx
+    movq $1, %rax
+    syscall
+  93:
+    ret
+  92:
+    leaq 91b(%rip), %rax
+    movq %rax, v_passignal.handleraddr(%rip)
+    leaq rt_sigreturn(%rip), %rax
+    movq %rax, v_passignal.restoreraddr(%rip)
+  end;
+  asm arm64
+    b 92f
+  .p2align 5
+  91:
+    lsr x9, x0, #6
+    and x10, x0, #63
+    adrp x11, v_passignal.pending
+    add x11, x11, :lo12:v_passignal.pending
+    add x11, x11, x9, lsl #3
+    mov x12, #1
+    lsl x12, x12, x10
+  .p2align 5
+  94:
+    ldaxr x13, [x11]
+    orr x13, x13, x12
+    stlxr w14, x13, [x11]
+    cbnz w14, 94b
+    adrp x11, v_passignal.received
+    add x11, x11, :lo12:v_passignal.received
+  .p2align 5
+  95:
+    ldaxr x13, [x11]
+    add x13, x13, #1
+    stlxr w14, x13, [x11]
+    cbnz w14, 95b
+    adrp x11, v_passignal.wakefd
+    add x11, x11, :lo12:v_passignal.wakefd
+    ldr x0, [x11]
+    tbnz x0, #63, 93f
+    adrp x1, v_passignal.wakeone
+    add x1, x1, :lo12:v_passignal.wakeone
+    mov x2, #8
+    mov x8, #64
+    svc #0
+  93:
+    ret
+  92:
+    adr x9, 91b
+    adrp x10, v_passignal.handleraddr
+    add x10, x10, :lo12:v_passignal.handleraddr
+    str x9, [x10]
+  end;
+end;
+
+{ This unit's handler for Sig (Go's sigenable): SA_ONSTACK, the M's
+  signal stack; SA_RESTART; on amd64 SA_RESTORER and the runtime's
+  rt_sigreturn, as the runtime's own handlers (sigaction(2)) }
+procedure Enable(Sig: Integer);
+var
+  act: array[0..3] of Integer;
+begin
+  if Handling[Sig] then
+    Exit;
+  Touch(Sig);
+  act[0] := HandlerAddr;
+  if Amd64 = 1 then
+  begin
+    act[1] := $1C000000;
+    act[2] := RestorerAddr;
+  end
+  else
+  begin
+    act[1] := $18000000;
+    act[2] := 0;
+  end;
+  act[3] := 0;
+  if SigAction(Sig, @act[0], nil) >= 0 then
+    Handling[Sig] := True;
+end;
+
+{ The disposition Sig had before (Go's sigdisable) }
+procedure Disable(Sig: Integer);
+var
+  act: array[0..3] of Integer;
+  i: Integer;
+begin
+  if not Touched[Sig] then
+    Exit;
+  for i := 0 to 3 do
+    act[i] := Orig[Sig, i];
+  SigAction(Sig, @act[0], nil);
+  Handling[Sig] := False;
+end;
+
+{ SIG_IGN, 1 (Go's sigignore) }
+procedure IgnoreOne(Sig: Integer);
+var
+  act: array[0..3] of Integer;
+begin
+  Touch(Sig);
+  act[0] := 1;
+  act[1] := 0;
+  act[2] := 0;
+  act[3] := 0;
+  SigAction(Sig, @act[0], nil);
+  Handling[Sig] := False;
+end;
+
+function Wants(const E: TSigEntry; Sig: Integer): Boolean;
+begin
+  Result := ((E.Mask[Sig shr 6] shr (Sig and 63)) and 1) <> 0;
+end;
+
+{ Sig sent on every channel that asks for it, never waiting: a channel
+  that is full misses it, as Go's process does }
+procedure Process(Sig: Integer);
+var
+  i: Integer;
+begin
+  for i := 0 to High(Entries) do
+    if Wants(Entries[i], Sig) then
+      select
+        Send(Entries[i].C, Sig): ;
+      else
+        ;
+      end;
+  for i := 0 to High(Stopping) do
+    if Wants(Stopping[i], Sig) then
+      select
+        Send(Stopping[i].C, Sig): ;
+      else
+        ;
+      end;
+end;
+
+{ Out of the routines the program waits for at its end, as pasdebug's
+  serving routine: the runtime ends the program when the main routine
+  has returned and the live count is one (rt_nlive, rt_waitall) }
+procedure Daemon;
+begin
+  asm amd64
+    lock decq rt_nlive(%rip)
+  end;
+  asm arm64
+    adrp x9, rt_nlive
+    add x9, x9, :lo12:rt_nlive
+  .p2align 5
+  1:
+    ldaxr x10, [x9]
+    sub x10, x10, #1
+    stlxr w11, x10, [x9]
+    cbnz w11, 1b
+  end;
+end;
+
+{ The routine that sends signals on (Go's os/signal loop and
+  signal_recv): it parks on the eventfd, takes every pending bit, sends
+  each signal on, and says the round is over. It leaves the count of
+  live routines before it tells SignalNotify it runs, so a main routine
+  that returns at once still ends the program. }
+procedure Loop(Ready: chan of Integer);
+var
+  buf, n, r, w, bits, s: Integer;
+begin
+  Daemon;
+  Send(Ready, 1);
+  while True do
+  begin
+    n := PasIoRead(WakeFd, @buf, 8, 0);
+    if n < 0 then
+      Sleep(1);
+    r := AtomicLoad(Received);
+    Mu.Lock;
+    for w := 0 to 1 do
+    begin
+      bits := AtomicExchange(Pending[w], 0);
+      while bits <> 0 do
+      begin
+        s := TrailingZeros(bits) + 64 * w;
+        bits := bits and (bits - 1);
+        Process(s);
+      end;
+    end;
+    Handled := r;
+    Idle.Broadcast;
+    Mu.Unlock;
+  end;
+end;
+
+{ The eventfd, the handler's address and the sending routine, once;
+  under Mu. eventfd2(2): 290 on amd64, 19 on arm64, EFD_CLOEXEC (O_CLOEXEC,
+  1 shl 19) and EFD_NONBLOCK (O_NONBLOCK, 1 shl 11), asm-generic/fcntl.h }
+function Start: Boolean;
+var
+  fd: Integer;
+  ready: chan of Integer;
+begin
+  Result := Started;
+  if Started then
+    Exit;
+  if Amd64 = 1 then
+    fd := Syscall(290, 0, 526336)
+  else
+    fd := Syscall(19, 0, 526336);
+  if fd < 0 then
+    Exit;
+  WakeFd := fd;
+  FindHandler;
+  ready := MakeChan();
+  pas Loop(ready);
+  fd := Recv(ready);
+  Started := True;
+  Result := True;
+end;
+
+function FindEntry(const List: array of TSigEntry; C: chan of Integer): Integer;
+var
+  i: Integer;
+begin
+  Result := -1;
+  for i := 0 to High(List) do
+    if List[i].C = C then
+    begin
+      Result := i;
+      Exit;
+    end;
+end;
+
+procedure Want(var E: TSigEntry; Sig: Integer);
+begin
+  if Wants(E, Sig) then
+    Exit;
+  E.Mask[Sig shr 6] := E.Mask[Sig shr 6] or (1 shl (Sig and 63));
+  if Refs[Sig] = 0 then
+    Enable(Sig);
+  Refs[Sig] := Refs[Sig] + 1;
+end;
+
+function SignalNotify(C: chan of Integer; const Sigs: array of Integer): Boolean;
+var
+  i, k, s: Integer;
+begin
+  Result := False;
+  if not AllCatchable(Sigs) then
+    Exit;
+  Mu.Lock;
+  try
+    if not Start then
+      Exit;
+    k := FindEntry(Entries, C);
+    if k < 0 then
+    begin
+      k := Length(Entries);
+      SetLength(Entries, k + 1);
+      Entries[k].C := C;
+      Entries[k].Mask[0] := 0;
+      Entries[k].Mask[1] := 0;
+    end;
+    if Length(Sigs) = 0 then
+    begin
+      for s := 1 to 64 do
+        if Catchable(s) then
+          Want(Entries[k], s);
+    end
+    else
+      for i := 0 to High(Sigs) do
+        Want(Entries[k], Sigs[i]);
+    Result := True;
+  finally
+    Mu.Unlock;
+  end;
+end;
+
+procedure Remove(var List: array of TSigEntry; K: Integer);
+var
+  i: Integer;
+begin
+  for i := K to High(List) - 1 do
+    List[i] := List[i + 1];
+  SetLength(List, Length(List) - 1);
+end;
+
+procedure SignalStop(C: chan of Integer);
+var
+  k, s, target: Integer;
+  e: TSigEntry;
+begin
+  Mu.Lock;
+  try
+    k := FindEntry(Entries, C);
+    if k < 0 then
+      Exit;
+    e := Entries[k];
+    Remove(Entries, k);
+    for s := 1 to 64 do
+      if Wants(e, s) then
+      begin
+        Refs[s] := Refs[s] - 1;
+        if Refs[s] = 0 then
+          Disable(s);
+      end;
+    { A signal caught before its handler went may still be on its way:
+      C stays among the channels sent to until the sending routine has
+      finished a round that saw every signal counted so far (Go's
+      Stop and signalWaitUntilIdle) }
+    k := Length(Stopping);
+    SetLength(Stopping, k + 1);
+    Stopping[k] := e;
+    target := AtomicLoad(Received);
+    while Handled < target do
+      Idle.Wait(Mu);
+    k := FindEntry(Stopping, C);
+    if k >= 0 then
+      Remove(Stopping, k);
+  finally
+    Mu.Unlock;
+  end;
+end;
+
+{ Go's cancel: no channel asks for Sig any more, then Action }
+procedure Cancel(Sig: Integer; Ignore: Boolean);
+var
+  i: Integer;
+begin
+  i := 0;
+  while i <= High(Entries) do
+  begin
+    if Wants(Entries[i], Sig) then
+    begin
+      Entries[i].Mask[Sig shr 6] := Entries[i].Mask[Sig shr 6] and not (1 shl (Sig and 63));
+      Refs[Sig] := Refs[Sig] - 1;
+      if (Entries[i].Mask[0] = 0) and (Entries[i].Mask[1] = 0) then
+      begin
+        Remove(Entries, i);
+        Continue;
+      end;
+    end;
+    i := i + 1;
+  end;
+  if Ignore then
+    IgnoreOne(Sig)
+  else
+    Disable(Sig);
+end;
+
+function CancelAll(const Sigs: array of Integer; Ignore: Boolean): Boolean;
+var
+  i, s: Integer;
+begin
+  Result := AllCatchable(Sigs);
+  if not Result then
+    Exit;
+  Mu.Lock;
+  try
+    if Length(Sigs) = 0 then
+    begin
+      for s := 1 to 64 do
+        if Catchable(s) then
+          Cancel(s, Ignore);
+    end
+    else
+      for i := 0 to High(Sigs) do
+        Cancel(Sigs[i], Ignore);
+  finally
+    Mu.Unlock;
+  end;
+end;
+
+function SignalReset(const Sigs: array of Integer): Boolean;
+begin
+  Result := CancelAll(Sigs, False);
+end;
+
+function SignalIgnore(const Sigs: array of Integer): Boolean;
+begin
+  Result := CancelAll(Sigs, True);
+end;
+
+function SignalIgnored(Sig: Integer): Boolean;
+var
+  cur: array[0..3] of Integer;
+begin
+  Result := False;
+  if (Sig < 1) or (Sig > 64) then
+    Exit;
+  if SigAction(Sig, nil, @cur[0]) < 0 then
+    Exit;
+  Result := cur[0] = 1;
+end;
+
+function SignalName(Sig: Integer): string;
+const
+  Names: array[1..31] of string = ('SIGHUP', 'SIGINT', 'SIGQUIT', 'SIGILL', 'SIGTRAP',
+    'SIGABRT', 'SIGBUS', 'SIGFPE', 'SIGKILL', 'SIGUSR1', 'SIGSEGV', 'SIGUSR2', 'SIGPIPE',
+    'SIGALRM', 'SIGTERM', 'SIGSTKFLT', 'SIGCHLD', 'SIGCONT', 'SIGSTOP', 'SIGTSTP',
+    'SIGTTIN', 'SIGTTOU', 'SIGURG', 'SIGXCPU', 'SIGXFSZ', 'SIGVTALRM', 'SIGPROF',
+    'SIGWINCH', 'SIGIO', 'SIGPWR', 'SIGSYS');
+var
+  n: string;
+begin
+  if (Sig >= 1) and (Sig <= 31) then
+    Result := Names[Sig]
+  else if (Sig >= SIGRTMIN) and (Sig <= SIGRTMAX) then
+  begin
+    Str(Sig - SIGRTMIN, n);
+    Result := 'SIGRTMIN+' + n;
+  end
+  else
+    Result := '';
+end;
+
+{ kill(2) of getpid(2): 62 and 39 on amd64, 129 and 172 on arm64 }
+function SignalRaise(Sig: Integer): Boolean;
+var
+  pid: Integer;
+begin
+  Result := False;
+  if (Sig < 1) or (Sig > 64) then
+    Exit;
+  if Amd64 = 1 then
+  begin
+    pid := Syscall(39);
+    Result := Syscall(62, pid, Sig) >= 0;
+  end
+  else
+  begin
+    pid := Syscall(172);
+    Result := Syscall(129, pid, Sig) >= 0;
+  end;
+end;
+
+initialization
+  WakeFd := -1;
+  WakeOne := 1;
+end.

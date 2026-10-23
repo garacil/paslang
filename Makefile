@@ -570,6 +570,9 @@ GOLDEN_A64 += varparamtype
 # hold, put there by inline assembly before the call.
 GOLDEN += gcdeadreg
 GOLDEN_A64 += gcdeadreg
+# P439: signals as the os/signal of Go sends them, uses passignal; on arm64 in
+# its own block, whose children run under qemu.
+GOLDEN += signals
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -595,6 +598,7 @@ LIB_UNITS := \
 	src/lib/paslinux.paslang \
 	src/lib/paslib.paslang \
 	src/lib/pasnet.paslang \
+	src/lib/passignal.paslang \
 	src/lib/pasdebug.paslang \
 	src/lib/pasrand.paslang \
 	src/lib/passort.paslang \
@@ -2494,6 +2498,12 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(BUILDDIR)/sqlroutines $(BUILDDIR)/sqlroutines.db > $(BUILDDIR)/sqlroutines.got; \
 	cmp testdata/sqlroutines.out $(BUILDDIR)/sqlroutines.got; \
 	echo ok sqlapi
+	@set -e; \
+	: P439: signals on the base processor with no inlining, its children the program itself; \
+	$(OUTDIR)/paslangc -cpu base -inline 0 -o $(BUILDDIR)/signals0 testdata/signals.paslang; \
+	timeout 300 $(BUILDDIR)/signals0 > $(BUILDDIR)/signals0.got; \
+	diff -u testdata/signals.out $(BUILDDIR)/signals0.got; \
+	echo ok signals0
 	@set -e; \
 	echo "==== index checks ===="; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/bce_s testdata/bce.paslang; \
@@ -5525,6 +5535,17 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	timeout 600 $(QEMU_A64) $(BUILDDIR)/sqlroutines-arm $(BUILDDIR)/sqlroutines-arm.db > $(BUILDDIR)/sqlroutines-arm.got; \
 	cmp testdata/sqlroutines.out $(BUILDDIR)/sqlroutines-arm.got; \
 	echo ok sqlapi-arm
+	@set -e; \
+	: P439 on arm64: signals, each child the program again under qemu, given as the first argument, and under the collector stress; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -Fu $(A64DIR) -o $(BUILDDIR)/signals-arm testdata/signals.paslang; \
+	$(OUTDIR)/paslangc -target arm64 -cpu base -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/signals0-arm testdata/signals.paslang; \
+	timeout 300 $(QEMU_A64) $(BUILDDIR)/signals-arm $(QEMU_A64) > $(BUILDDIR)/signals-arm.got; \
+	diff -u testdata/signals.out $(BUILDDIR)/signals-arm.got; \
+	timeout 300 $(QEMU_A64) $(BUILDDIR)/signals0-arm $(QEMU_A64) > $(BUILDDIR)/signals0-arm.got; \
+	diff -u testdata/signals.out $(BUILDDIR)/signals0-arm.got; \
+	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=3 PASLANG_GCPOISON=1 timeout 1800 $(QEMU_A64) $(BUILDDIR)/signals0-arm $(QEMU_A64) > $(BUILDDIR)/signals0-arm.vgot; \
+	diff -u testdata/signals.out $(BUILDDIR)/signals0-arm.vgot; \
+	echo ok signals-arm
 
 install: all installdirs
 	$(NORMAL_INSTALL)

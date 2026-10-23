@@ -11473,6 +11473,50 @@ whether the name is set at all (`TZ=` is set and empty), `IntToStr`, `StrToInt64
 `IntToHex2(b)`, `ToLower`, `HasSuffix`, `ChangeExt`, `BaseName`,
 `DirName` and `JoinPath` shape strings and paths.
 
+`uses passignal` gives signals as Go's `os/signal` does (1.1.256,
+P439). `SignalNotify(c, [SIGTERM, SIGINT])` makes those signals, sent to
+the program, no longer do their default action: each comes as its
+number on the `chan of Integer` `c`, and on every other channel that
+asked for it. An empty list asks for every signal a program may catch,
+and a second call with the same channel adds to its signals. A signal
+is sent on without waiting for a receiver, so `c` is made with room
+(`MakeChan(1)` is enough for one kind of signal): a channel that is
+full misses it, and many of one kind that come together may arrive as
+one, as in Go. `SignalStop(c)` returns when no signal can reach `c` any
+more. `SignalReset(sigs)` gives each signal the disposition it had
+before the program first changed it (an empty list: every one), and
+`SignalIgnore(sigs)` has the kernel drop them; neither sends them on any
+channel after. `SignalIgnored(sig)` says whether `sig` is dropped,
+`SignalRaise(sig)` sends it to the program itself, and `SignalName(sig)`
+gives `'SIGTERM'` for 15 and `'SIGRTMIN+3'` for 35. The constants
+`SIGHUP` to `SIGSYS`, `SIGRTMIN` and `SIGRTMAX` are Linux's, the same
+on both machines. A program may catch every signal from 1 to 64 but the
+faults its own instructions raise (`SIGILL`, `SIGTRAP`, `SIGBUS`,
+`SIGFPE`, `SIGSEGV`, `SIGSYS`), the two no program catches (`SIGKILL`,
+`SIGSTOP`) and the two the runtime keeps (`SIGPIPE`, `SIGURG`):
+`SignalNotify`, `SignalReset` and `SignalIgnore` answer `False` for a
+list that names one of them, and change nothing.
+
+The kernel's handler only marks the signal and writes to an eventfd;
+one routine of the unit, parked on that eventfd, sends it on. So a
+routine that waits on the channel parks like any other wait, and while
+the unit's routine waits for a signal no program is reported as
+deadlocked, as in Go after `signal.Notify`: a signal may still come.
+That routine is not one the program waits for when its main routine
+ends. A program it starts (`ExecuteProcess`, `Run`) takes each caught
+signal's default action and keeps each ignored one ignored, as the
+runtime resets caught handlers before `exec`. `testdata/signals` checks
+all of it on both machines.
+
+```pascal
+{ a service that stops cleanly when systemd sends SIGTERM }
+stop := MakeChan(1);
+SignalNotify(stop, [SIGTERM, SIGINT]);
+pas Serve(listener);
+sig := Recv(stop);
+WriteLn('stopping on ', SignalName(sig));
+```
+
 `uses sqlite` gives SQLite 3.54.1 in paslang: the library itself, written
 from SQLite's own file format, documents and sources (P403 the file,
 P404 the SQL, 1.1.253 P405 the rest). It is a library unit, as `pasnet`
