@@ -607,6 +607,9 @@ GOLDEN_A64 += url httpmsg httpcli
 # P433: mail against Go (mime, net/mail, net/smtp) and Python (email), SMTP and IMAP over loopback.
 GOLDEN += mime mailtree mailbuild mailscale mailtls smtp imap
 GOLDEN_A64 += mime mailtree mailbuild mailscale mailtls smtp imap
+# P451: base64 as it was written first, against the faster one.
+GOLDEN += base64fast
+GOLDEN_A64 += base64fast
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
