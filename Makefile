@@ -586,6 +586,9 @@ GOLDEN_A64 += hashpieces
 # against time.LoadLocation (the system's zoneinfo).
 GOLDEN += codec zones
 GOLDEN_A64 += codec zones
+# P445: a closure over a const parameter of every kind, kept past the call.
+GOLDEN += closureconst
+GOLDEN_A64 += closureconst
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a

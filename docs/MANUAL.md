@@ -2980,7 +2980,9 @@ prints
 What a closure keeps is the variable, not its value at the time:
 `Tally`'s `sum` is written through `add` and read through `total` after
 `Tally` has returned, and `Adder`'s `N`, a value parameter, is kept the
-same way (a `var` or `out` parameter cannot be: `X is a var parameter
+same way, and so is a `const` one, a string, a record or an array that
+arrives as an address, whose value the block takes (1.1.262: until then
+a closure over a const string read it empty) (a `var` or `out` parameter cannot be: `X is a var parameter
 of Make, which has a closure inside: a closure may outlive the variable
 it points at; copy it to a local`). The variables live as long as a
 value that keeps them does: their block is on the heap, and the
