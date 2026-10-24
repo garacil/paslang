@@ -11978,9 +11978,23 @@ Out := b.Save;                           { the workbook as an archive }
   cells and rows around are kept (the sheet is read and written by pasxml).
   A text with a space at either end or a line end is written
   `xml:space="preserve"`; characters XML does not allow become U+FFFD. The
-  shared strings table is not touched (a string that was shared stays
-  shared until it is overwritten; the table's counts are then too high,
-  which no application minds).
+  shared strings table is not touched unless a text is written as a shared
+  string or a cell that was one is written over (see the next point).
+- **Shared strings (1.1.268, P454).** `SetSharedText(ref, s)` writes the cell
+  as a shared string, `t="s"`, the form Vodafone's lots have, and `b.TextAsShared := True`
+  makes `SetText` do it. The text goes at the end of `xl/sharedStrings.xml` as
+  `<si><t xml:space="preserve">text</t></si>`, the existing items and their indices are
+  kept, an item that is only that text (no runs) is used again when the text is equal
+  (the item with runs is never taken), and a book with no table gets the part, its
+  relationship and its content type. When the book is saved with the table touched,
+  `count` is the number of cells of the book that are shared strings, counted again
+  (a file whose own count was wrong comes out right), and `uniqueCount` the number
+  of items; a cell that was a shared string and is written over is no longer
+  counted. `CopyRowAttrs(from, to)` gives row `to` (made if need be) the `ht`,
+  `customHeight`, `s` and `customFormat` of row `from`, False when `from` has no
+  record: a row made for a template that had none is a bare `<row r="n">`.
+  `testdata/xlsxsst` checks it on both templates and on 2,000 references to 500
+  texts, and `scripts/xlsx_sst_verify.py` has openpyxl and LibreOffice read the books.
 - **Formulas.** Writing a formula, or writing over one, drops the
   calculation chain (`xl/calcChain.xml`, its relationship and its content
   type), which an application builds again, and sets `fullCalcOnLoad` in

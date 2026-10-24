@@ -90,8 +90,20 @@ type
     { the greatest row and column that have a cell }
     function LastRow: Integer;
     function LastColumn: Integer;
-    { an inline string; the style of the cell stays, a new cell has none }
+    { a string: inline, or a shared one when the book's TextAsShared is set; the
+      style of the cell stays, a new cell has none }
     procedure SetText(const Ref, S: string);
+    { a shared string, whatever TextAsShared says: the text is put at the end of
+      the table of shared strings as <si><t xml:space="preserve">text</t></si>
+      (the indices of the items there are kept), or the index of a plain item
+      with the same text is used }
+    procedure SetSharedText(const Ref, S: string);
+    { the row ToRow (made if it is not there) gets the height and the style
+      of the row FromRow: ht, customHeight, s and customFormat; False when
+      FromRow has no record }
+    function CopyRowAttrs(FromRow, ToRow: Integer): Boolean;
+    { the cells of the sheet that are shared strings }
+    function SharedRefs: Integer;
     { a number as its decimal text (digits, one point, an exponent) }
     procedure SetNumber(const Ref, Num: string);
     procedure SetInteger(const Ref: string; V: Integer);
@@ -121,6 +133,13 @@ type
     FShared: array of string;
     FSharedLoaded: Boolean;
     FSharedPath: string;
+    FWbDir: string;
+    FSstDoc: TXmlDoc;
+    FSstDirty: Boolean;
+    FSstTouched: Boolean;
+    FSstPlain: array of Boolean;
+    FSstTab: array of Integer;
+    FTextAsShared: Boolean;
     FDate1904: Boolean;
     FDropChain: Boolean;
     FChainPath: string;
@@ -129,6 +148,13 @@ type
     function PartDoc(const APath: string): TXmlDoc;
     function ResolveTarget(const Base, Target: string): string;
     procedure LoadShared;
+    procedure SstOpen;
+    procedure SstTabPut(const S: string; Idx: Integer);
+    function SstIndex(const S: string): Integer;
+    procedure SstUse;
+    procedure SstRelease;
+    procedure SstFinish;
+    function CountSharedRefs: Integer;
     procedure NoteFormula;
     procedure DropChain;
   public
@@ -141,6 +167,8 @@ type
     function SharedString(I: Integer): string;
     function SharedCount: Integer;
     function Date1904: Boolean;
+    { SetText of the book's sheets writes shared strings (t="s") and not inline ones }
+    property TextAsShared: Boolean read FTextAsShared write FTextAsShared;
     { ask the application to calculate every formula when it opens the file }
     procedure RecalcOnLoad;
     { the bytes of a part of the package, inflated; '' with Has false when absent }
@@ -658,6 +686,8 @@ end;
   value metadata dropped (it described the old value), Inner put in }
 procedure TXlsxSheet.PutCell(Cell: TXmlNode; const TypeAttr, Inner: string);
 begin
+  if Cell.Attr('t') = 's' then
+    FBook.SstRelease;
   if Cell.Elem('f') <> nil then
     FBook.NoteFormula;
   while Cell.Count > 0 do
@@ -678,11 +708,51 @@ var
   n: TXmlNode;
   open: string;
 begin
+  if FBook.TextAsShared then
+  begin
+    SetSharedText(Ref, S);
+    Exit;
+  end;
   n := CellAt(Ref, True);
   open := '<t>';
   if (S <> '') and ((S[1] = ' ') or (S[Length(S)] = ' ') or (Pos(#10, S) > 0) or (Pos(#9, S) > 0) or (Pos(#13, S) > 0)) then
     open := '<t xml:space="preserve">';
   PutCell(n, 'inlineStr', '<is>' + open + XmlEscapeText(S) + '</t></is>');
+end;
+
+procedure TXlsxSheet.SetSharedText(const Ref, S: string);
+var
+  n: TXmlNode;
+  idx: Integer;
+begin
+  n := CellAt(Ref, True);
+  idx := FBook.SstIndex(S);
+  PutCell(n, 's', '<v>' + IntToStr(idx) + '</v>');
+  FBook.SstUse;
+end;
+
+function TXlsxSheet.CopyRowAttrs(FromRow, ToRow: Integer): Boolean;
+var
+  src, dst: TXmlNode;
+  names: array[0..3] of string;
+  i: Integer;
+begin
+  Result := False;
+  src := FindRow(FromRow, False);
+  if src = nil then
+    Exit;
+  dst := FindRow(ToRow, True);
+  names[0] := 'ht';
+  names[1] := 'customHeight';
+  names[2] := 's';
+  names[3] := 'customFormat';
+  for i := 0 to 3 do
+    if src.HasAttr(names[i]) then
+      dst.SetAttr(names[i], src.Attr(names[i]))
+    else
+      dst.RemoveAttr(names[i]);
+  FDirty := True;
+  Result := True;
 end;
 
 procedure TXlsxSheet.SetNumber(const Ref, Num: string);
@@ -982,6 +1052,7 @@ begin
   while (i > 0) and (FWbPath[i] <> '/') do
     i := i - 1;
   wbDir := Copy(FWbPath, 1, i);
+  FWbDir := wbDir;
   FRelsPath := wbDir + '_rels/' + Copy(FWbPath, i + 1, Length(FWbPath)) + '.rels';
   if FZip.Find(FRelsPath) < 0 then
     raise EXlsxError.Create('xlsx: no relationships for the workbook (' + FRelsPath + ')');
@@ -1083,6 +1154,240 @@ begin
   Result := FShared[I];
 end;
 
+{ the cells of a sheet part's text that are shared strings, told without reading it as XML:
+  the start tags <c ...> (not <col>, not <cfRule>) with t="s" }
+function RawSharedRefs(const X: string): Integer;
+var
+  i, j, n: Integer;
+  q: Char;
+  c: Char;
+begin
+  Result := 0;
+  n := Length(X);
+  i := 1;
+  while i + 3 <= n do
+  begin
+    if (X[i] = '<') and (X[i + 1] = 'c') and ((X[i + 2] = ' ') or (X[i + 2] = #9) or (X[i + 2] = #10) or (X[i + 2] = #13)) then
+    begin
+      j := i + 3;
+      q := #0;
+      while j <= n do
+      begin
+        c := X[j];
+        if q <> #0 then
+        begin
+          if c = q then
+            q := #0;
+        end
+        else if (c = '"') or (c = '''') then
+          q := c
+        else if c = '>' then
+          Break
+        else if (c = 't') and (j + 4 <= n) and (X[j + 1] = '=') and (X[j + 3] = 's') and (X[j + 4] = X[j + 2]) and
+          ((X[j + 2] = '"') or (X[j + 2] = '''')) and ((X[j - 1] = ' ') or (X[j - 1] = #9) or (X[j - 1] = #10) or (X[j - 1] = #13)) then
+          Result := Result + 1;
+        j := j + 1;
+      end;
+      i := j;
+    end;
+    i := i + 1;
+  end;
+end;
+
+{ the cells of a loaded sheet that are shared strings }
+function TXlsxSheet.SharedRefs: Integer;
+var
+  i, j: Integer;
+  k: TXmlNode;
+begin
+  Result := 0;
+  for i := 0 to FRowN - 1 do
+    for j := 0 to FRowNode[i].Count - 1 do
+    begin
+      k := FRowNode[i].Item(j);
+      if (k.Kind = xkElement) and (k.Local = 'c') and (k.Attr('t') = 's') then
+        Result := Result + 1;
+    end;
+end;
+
+{ every cell of the book that is a shared string }
+function TXlsxBook.CountSharedRefs: Integer;
+var
+  k: Integer;
+begin
+  Result := 0;
+  for k := 0 to Length(FSheets) - 1 do
+    if FSheets[k].FDoc <> nil then
+      Result := Result + FSheets[k].SharedRefs
+    else
+      Result := Result + RawSharedRefs(ReadPart(FSheets[k].FPath));
+end;
+
+{ ---- the table of shared strings, written ---- }
+
+function SstKeyHash(const K: string): Integer;
+var
+  h, i: Integer;
+begin
+  h := 2166136261;
+  for i := 1 to Length(K) do
+    h := ((h xor Ord(K[i])) * 16777619) and $FFFFFFFF;
+  Result := h;
+end;
+
+{ whether a shared string item is only a text: one t and nothing else (no runs,
+  no phonetic runs), the only kind that is reused }
+function SstIsPlain(N: TXmlNode): Boolean;
+var
+  i, ts: Integer;
+  k: TXmlNode;
+begin
+  Result := False;
+  ts := 0;
+  for i := 0 to N.Count - 1 do
+  begin
+    k := N.Item(i);
+    if k.Kind <> xkElement then
+      Continue;
+    if k.Local = 't' then
+      ts := ts + 1
+    else
+      Exit;
+  end;
+  Result := ts = 1;
+end;
+
+{ the part is read for writing; when the book has none it is made, with its
+  relationship and its content type }
+procedure TXlsxBook.SstOpen;
+var
+  si, ra: TXmlNodeArray;
+  i, v, maxId, code: Integer;
+  id: string;
+begin
+  if FSstDoc <> nil then
+    Exit;
+  LoadShared;
+  if (FSharedPath <> '') and (FZip.Find(FSharedPath) >= 0) then
+  begin
+    FSstDoc := PartDoc(FSharedPath);
+    si := FSstDoc.Root.Elems('si');
+    SetLength(FSstPlain, Length(si));
+    for i := 0 to Length(si) - 1 do
+      FSstPlain[i] := SstIsPlain(si[i]);
+    Exit;
+  end;
+  FSharedPath := FWbDir + 'sharedStrings.xml';
+  FSstDoc := XmlParse('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' + #10 + '<sst xmlns="' + NsMain + '" count="0" uniqueCount="0"/>');
+  SetLength(FShared, 0);
+  SetLength(FSstPlain, 0);
+  FSstDirty := True;
+  maxId := 0;
+  ra := FRels.Root.Elems('Relationship');
+  for i := 0 to Length(ra) - 1 do
+  begin
+    id := ra[i].Attr('Id');
+    if (Length(id) > 3) and (Copy(id, 1, 3) = 'rId') then
+    begin
+      Val(Copy(id, 4, Length(id) - 3), v, code);
+      if (code = 0) and (v > maxId) then
+        maxId := v;
+    end;
+  end;
+  FRels.Root.AppendXml('<Relationship Id="rId' + IntToStr(maxId + 1) + '" Type="' + RelNs1 + RelShared + '" Target="sharedStrings.xml"/>');
+  FRelsDirty := True;
+  if FCt = nil then
+    FCt := PartDoc('[Content_Types].xml');
+  FCt.Root.AppendXml('<Override PartName="/' + FSharedPath +
+    '" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>');
+  FCtDirty := True;
+end;
+
+procedure TXlsxBook.SstTabPut(const S: string; Idx: Integer);
+var
+  h, mask: Integer;
+begin
+  mask := Length(FSstTab) - 1;
+  h := SstKeyHash(S) and mask;
+  while FSstTab[h] >= 0 do
+  begin
+    if FShared[FSstTab[h]] = S then
+      Exit;
+    h := (h + 1) and mask;
+  end;
+  FSstTab[h] := Idx;
+end;
+
+{ the index of an item that is a plain text equal to S, or a new one at the end }
+function TXlsxBook.SstIndex(const S: string): Integer;
+var
+  i, n, size, h, mask: Integer;
+  tag: string;
+begin
+  SstOpen;
+  n := Length(FShared);
+  if (Length(FSstTab) = 0) or ((n + 1) * 2 > Length(FSstTab)) then
+  begin
+    size := 64;
+    while size < (n + 1) * 4 do
+      size := size * 2;
+    SetLength(FSstTab, size);
+    for i := 0 to size - 1 do
+      FSstTab[i] := -1;
+    for i := 0 to n - 1 do
+      if FSstPlain[i] then
+        SstTabPut(FShared[i], i);
+  end;
+  mask := Length(FSstTab) - 1;
+  h := SstKeyHash(S) and mask;
+  while FSstTab[h] >= 0 do
+  begin
+    if FShared[FSstTab[h]] = S then
+    begin
+      Result := FSstTab[h];
+      Exit;
+    end;
+    h := (h + 1) and mask;
+  end;
+  { new: every text of the files this was made for has xml:space="preserve" }
+  tag := '<t xml:space="preserve">';
+  FSstDoc.Root.AppendXml('<si>' + tag + XmlEscapeText(S) + '</t></si>');
+  SetLength(FShared, n + 1);
+  SetLength(FSstPlain, n + 1);
+  FShared[n] := S;
+  FSstPlain[n] := True;
+  FSstTab[h] := n;
+  FSstDirty := True;
+  Result := n;
+end;
+
+procedure TXlsxBook.SstUse;
+begin
+  FSstTouched := True;
+end;
+
+procedure TXlsxBook.SstRelease;
+begin
+  FSstTouched := True;
+end;
+
+{ before the book is saved: count and uniqueCount say what the cells and the
+  items are (the cells counted, which makes them exact even in a file whose
+  own count was not), and the part is put among those that are written }
+procedure TXlsxBook.SstFinish;
+var
+  root: TXmlNode;
+begin
+  SstOpen;
+  root := FSstDoc.Root;
+  if root.HasAttr('count') then
+    root.SetAttr('count', IntToStr(CountSharedRefs));
+  FSstTouched := False;
+  if root.HasAttr('uniqueCount') then
+    root.SetAttr('uniqueCount', IntToStr(Length(FShared)));
+  SetPart(FSharedPath, FSstDoc.Xml);
+end;
+
 function TXlsxBook.Date1904: Boolean;
 begin
   Result := FDate1904;
@@ -1174,6 +1479,8 @@ var
 begin
   if FDropChain then
     DropChain;
+  if FSstDirty or FSstTouched then
+    SstFinish;
   w := TZipWriter.Create;
   w.Comment := FZip.Comment;
   SetLength(done, Length(FOverName));

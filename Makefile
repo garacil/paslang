@@ -598,6 +598,9 @@ GOLDEN_A64 += flate flatec zip
 # P436: XLSX templates filled, the entries not written kept as they were.
 GOLDEN += xlsx
 GOLDEN_A64 += xlsx
+# P454: shared strings written, rows given a model row's attributes.
+GOLDEN += xlsxsst
+GOLDEN_A64 += xlsxsst
 # P432: URLs and HTTP messages against Go, and the HTTP client over loopback.
 GOLDEN += url httpmsg httpcli
 GOLDEN_A64 += url httpmsg httpcli
