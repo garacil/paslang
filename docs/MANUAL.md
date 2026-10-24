@@ -11941,6 +11941,71 @@ Archive := w.Finish;
   any number of routines may each have one, and an archive's bytes may be
   read by any number of readers at once.
 
+`uses pasxlsx` fills XLSX workbooks (1.1.265, P436): a book is opened from
+its bytes, cells are read and written, and the book is saved with everything
+that was not written exactly as it was. It is made for a template that a
+service fills each day: the sheets, styles, hidden sheets, validations,
+merged cells, defined names, document properties and the archive's other
+entries are the template's own, byte for byte, and Excel and LibreOffice
+open the result. It is checked on two templates written by
+`scripts/xlsx_make.py` (one laid out as Excel writes a file, one
+pretty-printed, in the 1904 date system, with cells that have no `r`)
+by `testdata/xlsx`, which shows every changed part and checks that every
+other entry is the entry it was (its compressed bytes, CRC-32, times and
+attributes), and by `scripts/xlsx_verify.py`, which has openpyxl and
+LibreOffice read what is saved; nine workbooks that other programs wrote
+(an options model, budgets, a calendar, a tracker, a pipeline, forecasts and
+two valuation models of up to 16 sheets) were filled and read the same way.
+
+```pascal
+b := TXlsxBook.Open(Template);           { EXlsxError: not a workbook, a part missing }
+s := b.SheetByName('Datos');             { nil when there is none; the name is compared without case }
+s.SetText('A2', '007');                  { an inline string: zeros, spaces and codes stay as written }
+s.SetNumber('B2', '1234.50');            { the number as its text; SetInteger, SetBool }
+s.SetDate('C2', 2024, 10, 24);           { days since the book's epoch; the cell wants a date style }
+s.SetFormula('D2', 'B2*2');
+s.SetStyle('E2', 4);  s.Blank('F2');     { a style index of the template's; a cell emptied keeps its style }
+x := s.GetText('A1');                    { a shared or inline string resolved, a number as stored }
+Out := b.Save;                           { the workbook as an archive }
+```
+- **What a write does.** The cell element is changed where it is: its
+  `r` and style `s` stay, its type is set (`inlineStr` for text, none for a
+  number, `b`), its old value and formula go, its value metadata (`vm`,
+  `cm`) goes. A cell that is not there is added in the row, in its column's
+  place, and the row's `spans` widens if it must; a row that is not there is
+  added in its place among the rows; the sheet's `dimension` takes in the
+  cells added. White space between the cells, the order of attributes, the
+  cells and rows around are kept (the sheet is read and written by pasxml).
+  A text with a space at either end or a line end is written
+  `xml:space="preserve"`; characters XML does not allow become U+FFFD. The
+  shared strings table is not touched (a string that was shared stays
+  shared until it is overwritten; the table's counts are then too high,
+  which no application minds).
+- **Formulas.** Writing a formula, or writing over one, drops the
+  calculation chain (`xl/calcChain.xml`, its relationship and its content
+  type), which an application builds again, and sets `fullCalcOnLoad` in
+  the workbook so Excel calculates every formula when it opens the file.
+  The values other formulas had stay until then: LibreOffice by default
+  does not recalculate a file it did not write, so a formula that depends
+  on a cell written keeps its old value there.
+  `RecalcOnLoad` sets the flag without a formula.
+- **Reading.** `Sheet(i)`, `SheetCount`, `Name`, `State` (visible, hidden,
+  veryHidden), `Path`; `GetText`, `CellType` (`s`, `inlineStr`, `str`, `b`,
+  `e`, `n`), `HasCell`, `HasFormula`, `Formula`, `StyleOf`, `LastRow`,
+  `LastColumn`; `SharedString(i)`, `SharedCount` (the text of a rich string
+  is its runs', a phonetic run is left out); `Date1904`. The workbook is
+  found through the package's relationships, as the Open Packaging
+  Conventions say, so a sheet at any path or an absolute target is found.
+- **The package.** `HasPart`, `ReadPart(name)` and `SetPart(name, data)`
+  reach any part (a part set is written in its place in the archive with the
+  times and attributes it had, or added at the end). `XlsxParseRef`,
+  `XlsxColumnName` and `XlsxCellRef` turn `A1` into column and row and back
+  (columns up to XFD, rows up to 1048576).
+- **Left out.** A table (`xl/tables`) is not widened when cells are written
+  below it; a chart sheet is not a sheet to write to; adding a sheet is not
+  done; a cell's rich text cannot be written (inline strings are plain).
+- **Routines.** A book belongs to the routine that edits it.
+
 `uses sqlite` gives SQLite 3.54.1 in paslang: the library itself, written
 from SQLite's own file format, documents and sources (P403 the file,
 P404 the SQL, 1.1.253 P405 the rest). It is a library unit, as `pasnet`

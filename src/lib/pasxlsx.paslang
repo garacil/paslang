@@ -1,0 +1,1223 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+
+  paslang is free software: you can redistribute it and/or modify it
+  under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+
+  paslang is distributed in the hope that it will be useful, but
+  WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+  General Public License for more details.
+
+  Under Section 7 of GPL version 3, you are granted additional
+  permissions described in the paslang Runtime Library Exception,
+  version 1.0, in the file COPYING.RUNTIME.
+
+  You should have received a copy of the GNU General Public License
+  along with paslang.  If not, see <https://www.gnu.org/licenses/>. }
+
+{ XLSX workbooks filled from a template (P436), over pasxml and paszip:
+  ECMA-376 Part 1 (SpreadsheetML) on the Open Packaging Conventions.
+
+  TXlsxBook opens a workbook held in a string, finds its sheets through
+  the package's relationships, and gives each sheet's cells to read and
+  to write. What is written is a cell of the sheet's XML changed where it
+  is: the rest of the sheet, the other parts of the workbook, and the
+  archive's other entries are what they were, byte for byte (the sheet
+  through pasxml's tree, which writes back what it did not touch, the
+  entries copied compressed as they are). A text goes in as an inline
+  string, so it is kept as it is written (a leading zero, a number-like
+  code, spaces) and the shared strings table is not touched; the style of
+  a cell, its hidden sheets, data validations, merged cells, defined names
+  and everything else the template holds stay. Writing over a formula, or
+  writing one, drops the calculation chain (xl/calcChain.xml, its
+  relationship and its content type), which a spreadsheet application
+  builds again, and asks it to calculate when it opens the file.
+
+  Free of state (Regla 11); a book belongs to the routine that edits it. }
+unit pasxlsx;
+
+interface
+
+uses
+  sysutils, pasxml, pasflate, paszip;
+
+type
+  EXlsxError = class(Exception);
+
+  TXlsxBook = class;
+
+  TXlsxSheet = class
+  private
+    FBook: TXlsxBook;
+    FName: string;
+    FPath: string;
+    FState: string;
+    FDoc: TXmlDoc;
+    FData: TXmlNode;
+    FRowNo: array of Integer;
+    FRowNode: array of TXmlNode;
+    FRowN: Integer;
+    FDirty: Boolean;
+    FMinC, FMinR, FMaxC, FMaxR: Integer;
+    procedure Load;
+    function FindRow(R: Integer; Make: Boolean): TXmlNode;
+    function FindCell(RowNode: TXmlNode; C: Integer; Make: Boolean): TXmlNode;
+    function CellAt(const Ref: string; Make: Boolean): TXmlNode;
+    procedure PutCell(Cell: TXmlNode; const TypeAttr, Inner: string);
+    procedure Finish;
+  public
+    constructor Create(ABook: TXlsxBook; const AName, APath, AState: string);
+    property Name: string read FName;
+    { the part's name in the package, xl/worksheets/sheet1.xml }
+    property Path: string read FPath;
+    { visible, hidden or veryHidden }
+    property State: string read FState;
+    { whether the cell has a record (a styled empty cell has one) }
+    function HasCell(const Ref: string): Boolean;
+    { the cell's text: a shared or inline string resolved, a number or a
+      formula's result as it is stored; '' when there is no cell }
+    function GetText(const Ref: string): string;
+    { the cell's type as the file has it: s, inlineStr, str, b, e or n
+      (n also for a cell with no t) and '' when there is no cell }
+    function CellType(const Ref: string): string;
+    function HasFormula(const Ref: string): Boolean;
+    function Formula(const Ref: string): string;
+    { the cell's style index, or -1 when there is no cell }
+    function StyleOf(const Ref: string): Integer;
+    { the greatest row and column that have a cell }
+    function LastRow: Integer;
+    function LastColumn: Integer;
+    { an inline string; the style of the cell stays, a new cell has none }
+    procedure SetText(const Ref, S: string);
+    { a number as its decimal text (digits, one point, an exponent) }
+    procedure SetNumber(const Ref, Num: string);
+    procedure SetInteger(const Ref: string; V: Integer);
+    procedure SetBool(const Ref: string; V: Boolean);
+    { a date, as the number of days since the book's epoch, and
+      optionally the time of day; the cell wants a date style }
+    procedure SetDate(const Ref: string; Y, M, D: Integer);
+    procedure SetDateTime(const Ref: string; Y, M, D, H, Mi, Secs: Integer);
+    procedure SetFormula(const Ref, F: string);
+    { the cell empty, its style kept }
+    procedure Blank(const Ref: string);
+    procedure SetStyle(const Ref: string; Idx: Integer);
+  end;
+
+  TXlsxBook = class
+  private
+    FZip: TZipReader;
+    FSheets: array of TXlsxSheet;
+    FWb: TXmlDoc;
+    FWbPath: string;
+    FWbDirty: Boolean;
+    FRels: TXmlDoc;
+    FRelsPath: string;
+    FRelsDirty: Boolean;
+    FCt: TXmlDoc;
+    FCtDirty: Boolean;
+    FShared: array of string;
+    FSharedLoaded: Boolean;
+    FSharedPath: string;
+    FDate1904: Boolean;
+    FDropChain: Boolean;
+    FChainPath: string;
+    FOverName: array of string;
+    FOverData: array of string;
+    function PartDoc(const APath: string): TXmlDoc;
+    function ResolveTarget(const Base, Target: string): string;
+    procedure LoadShared;
+    procedure NoteFormula;
+    procedure DropChain;
+  public
+    constructor Open(const AData: string);
+    function SheetCount: Integer;
+    function Sheet(I: Integer): TXlsxSheet;
+    { the sheet of that name (Excel's names are compared without case),
+      nil when there is none }
+    function SheetByName(const AName: string): TXlsxSheet;
+    function SharedString(I: Integer): string;
+    function SharedCount: Integer;
+    function Date1904: Boolean;
+    { ask the application to calculate every formula when it opens the file }
+    procedure RecalcOnLoad;
+    { the bytes of a part of the package, inflated; '' with Has false when absent }
+    function HasPart(const APath: string): Boolean;
+    function ReadPart(const APath: string): string;
+    { a part replaced by other bytes, in its place in the archive and with
+      its times and attributes; a part that is not there is added at the end }
+    procedure SetPart(const APath, AData: string);
+    { the workbook as an archive }
+    function Save: string;
+  end;
+
+{ A1 to (column, row) numbers from 1; False for what is not a cell
+  reference or lies outside the sheet (columns up to XFD, rows up to
+  1048576). $ marks are let by. }
+function XlsxParseRef(const Ref: string; out C, R: Integer): Boolean;
+function XlsxColumnName(C: Integer): string;
+function XlsxCellRef(C, R: Integer): string;
+
+implementation
+
+const
+  NsMain = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
+  RelDoc = '/officeDocument';
+  RelSheet = '/worksheet';
+  RelShared = '/sharedStrings';
+  RelChain = '/calcChain';
+  RelNs1 = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+  RelNs2 = 'http://purl.oclc.org/ooxml/officeDocument/relationships';
+
+function XlsxParseRef(const Ref: string; out C, R: Integer): Boolean;
+var
+  i, n: Integer;
+begin
+  Result := False;
+  C := 0;
+  R := 0;
+  n := Length(Ref);
+  i := 1;
+  if (i <= n) and (Ref[i] = '$') then
+    i := i + 1;
+  while (i <= n) and (((Ref[i] >= 'A') and (Ref[i] <= 'Z')) or ((Ref[i] >= 'a') and (Ref[i] <= 'z'))) do
+  begin
+    C := C * 26 + (Ord(UpCase(Ref[i])) - 64);
+    if C > 16384 then
+      Exit;
+    i := i + 1;
+  end;
+  if C = 0 then
+    Exit;
+  if (i <= n) and (Ref[i] = '$') then
+    i := i + 1;
+  if (i > n) or (Ref[i] < '0') or (Ref[i] > '9') then
+    Exit;
+  while (i <= n) and (Ref[i] >= '0') and (Ref[i] <= '9') do
+  begin
+    R := R * 10 + (Ord(Ref[i]) - 48);
+    if R > 1048576 then
+      Exit;
+    i := i + 1;
+  end;
+  if (i <= n) or (R < 1) then
+    Exit;
+  Result := True;
+end;
+
+function XlsxColumnName(C: Integer): string;
+begin
+  Result := '';
+  while C > 0 do
+  begin
+    Result := Chr(65 + (C - 1) mod 26) + Result;
+    C := (C - 1) div 26;
+  end;
+end;
+
+function XlsxCellRef(C, R: Integer): string;
+begin
+  Result := XlsxColumnName(C) + IntToStr(R);
+end;
+
+{ the cell's reference as a node has it, its column from 1 or 0 }
+function NodeColumn(N: TXmlNode): Integer;
+var
+  c, r: Integer;
+begin
+  if XlsxParseRef(N.Attr('r'), c, r) then
+    Result := c
+  else
+    Result := 0;
+end;
+
+function StrToIntOr(const S: string; Def: Integer): Integer;
+var
+  i, v: Integer;
+begin
+  if S = '' then
+  begin
+    Result := Def;
+    Exit;
+  end;
+  v := 0;
+  for i := 1 to Length(S) do
+  begin
+    if (S[i] < '0') or (S[i] > '9') then
+    begin
+      Result := Def;
+      Exit;
+    end;
+    v := v * 10 + (Ord(S[i]) - 48);
+    if v > 2000000000 then
+    begin
+      Result := Def;
+      Exit;
+    end;
+  end;
+  Result := v;
+end;
+
+{ days from 1970-01-01 to the civil date, after Howard Hinnant's days_from_civil }
+function DaysFromCivil(Y, M, D: Integer): Integer;
+var
+  era, yoe, doy, doe: Integer;
+begin
+  if M <= 2 then
+    Y := Y - 1;
+  if Y >= 0 then
+    era := Y div 400
+  else
+    era := (Y - 399) div 400;
+  yoe := Y - era * 400;
+  if M > 2 then
+    doy := (153 * (M - 3) + 2) div 5 + D - 1
+  else
+    doy := (153 * (M + 9) + 2) div 5 + D - 1;
+  doe := yoe * 365 + yoe div 4 - yoe div 100 + doy;
+  Result := era * 146097 + doe - 719468;
+end;
+
+function LooksNumeric(const S: string): Boolean;
+var
+  i, n, digits: Integer;
+begin
+  Result := False;
+  n := Length(S);
+  i := 1;
+  if (i <= n) and ((S[i] = '+') or (S[i] = '-')) then
+    i := i + 1;
+  digits := 0;
+  while (i <= n) and (S[i] >= '0') and (S[i] <= '9') do
+  begin
+    i := i + 1;
+    digits := digits + 1;
+  end;
+  if (i <= n) and (S[i] = '.') then
+  begin
+    i := i + 1;
+    while (i <= n) and (S[i] >= '0') and (S[i] <= '9') do
+    begin
+      i := i + 1;
+      digits := digits + 1;
+    end;
+  end;
+  if digits = 0 then
+    Exit;
+  if (i <= n) and ((S[i] = 'e') or (S[i] = 'E')) then
+  begin
+    i := i + 1;
+    if (i <= n) and ((S[i] = '+') or (S[i] = '-')) then
+      i := i + 1;
+    digits := 0;
+    while (i <= n) and (S[i] >= '0') and (S[i] <= '9') do
+    begin
+      i := i + 1;
+      digits := digits + 1;
+    end;
+    if digits = 0 then
+      Exit;
+  end;
+  Result := i > n;
+end;
+
+{ the text of a string item (si) or of an inline string (is): the runs'
+  text, not the phonetic runs' }
+function ItemText(N: TXmlNode): string;
+var
+  i, j: Integer;
+  k, r: TXmlNode;
+begin
+  Result := '';
+  for i := 0 to N.Count - 1 do
+  begin
+    k := N.Item(i);
+    if k.Kind <> xkElement then
+      Continue;
+    if k.Local = 't' then
+      Result := Result + k.Text
+    else if k.Local = 'r' then
+      for j := 0 to k.Count - 1 do
+      begin
+        r := k.Item(j);
+        if (r.Kind = xkElement) and (r.Local = 't') then
+          Result := Result + r.Text;
+      end;
+  end;
+end;
+
+{ ---- the sheet ---- }
+
+constructor TXlsxSheet.Create(ABook: TXlsxBook; const AName, APath, AState: string);
+begin
+  inherited Create;
+  FBook := ABook;
+  FName := AName;
+  FPath := APath;
+  FState := AState;
+  FMinC := 0;
+end;
+
+procedure TXlsxSheet.Load;
+var
+  rows: TXmlNodeArray;
+  i, n, last: Integer;
+begin
+  if FDoc <> nil then
+    Exit;
+  FDoc := FBook.PartDoc(FPath);
+  if FDoc.Root.Local <> 'worksheet' then
+    raise EXlsxError.Create('xlsx: "' + FName + '" (' + FPath + ') is not a worksheet');
+  FData := FDoc.Root.Elem('sheetData');
+  if FData = nil then
+    raise EXlsxError.Create('xlsx: "' + FName + '" has no sheetData');
+  rows := FData.Elems('row');
+  n := Length(rows);
+  SetLength(FRowNo, n + 16);
+  SetLength(FRowNode, n + 16);
+  FRowN := 0;
+  last := 0;
+  for i := 0 to n - 1 do
+  begin
+    { a row with no r is the one after the last, as the schema says }
+    FRowNo[FRowN] := StrToIntOr(rows[i].Attr('r'), last + 1);
+    last := FRowNo[FRowN];
+    FRowNode[FRowN] := rows[i];
+    FRowN := FRowN + 1;
+  end;
+end;
+
+{ the row element of row R; with Make, one is added in its place }
+function TXlsxSheet.FindRow(R: Integer; Make: Boolean): TXmlNode;
+var
+  lo, hi, mid, idx, i: Integer;
+  after: TXmlNode;
+begin
+  Load;
+  lo := 0;
+  hi := FRowN - 1;
+  while lo <= hi do
+  begin
+    mid := (lo + hi) div 2;
+    if FRowNo[mid] = R then
+    begin
+      Result := FRowNode[mid];
+      Exit;
+    end;
+    if FRowNo[mid] < R then
+      lo := mid + 1
+    else
+      hi := mid - 1;
+  end;
+  Result := nil;
+  if not Make then
+    Exit;
+  { lo is where it goes among the rows; among the children of sheetData it
+    goes after the row before it }
+  if lo >= FRowN then
+    idx := FData.Count
+  else if lo > 0 then
+    idx := FRowNode[lo - 1].IndexInParent + 1
+  else
+    idx := 0;
+  FData.InsertXml(idx, '<row r="' + IntToStr(R) + '"/>');
+  Result := FData.Item(idx);
+  if FRowN >= Length(FRowNo) then
+  begin
+    SetLength(FRowNo, FRowN * 2 + 16);
+    SetLength(FRowNode, FRowN * 2 + 16);
+  end;
+  for i := FRowN downto lo + 1 do
+  begin
+    FRowNo[i] := FRowNo[i - 1];
+    FRowNode[i] := FRowNode[i - 1];
+  end;
+  FRowNo[lo] := R;
+  FRowNode[lo] := Result;
+  FRowN := FRowN + 1;
+  after := nil;
+  FDirty := True;
+end;
+
+function TXlsxSheet.FindCell(RowNode: TXmlNode; C: Integer; Make: Boolean): TXmlNode;
+var
+  i, cc, idx, lastCol: Integer;
+  k: TXmlNode;
+  spans: string;
+  p, a, b: Integer;
+begin
+  Result := nil;
+  idx := -1;
+  lastCol := 0;
+  for i := 0 to RowNode.Count - 1 do
+  begin
+    k := RowNode.Item(i);
+    if (k.Kind <> xkElement) or (k.Local <> 'c') then
+      Continue;
+    { a cell with no r follows the one before it }
+    cc := NodeColumn(k);
+    if cc = 0 then
+      cc := lastCol + 1;
+    lastCol := cc;
+    if cc = C then
+    begin
+      Result := k;
+      Exit;
+    end;
+    if cc < C then
+      idx := i + 1
+    else if idx < 0 then
+    begin
+      idx := i;
+      Break;
+    end;
+  end;
+  if not Make then
+    Exit;
+  if idx < 0 then
+    idx := RowNode.Count;
+  { the first cell goes before the white space that may follow the row's
+    start only if there is none: after the last cell it follows, else at
+    the start }
+  RowNode.InsertXml(idx, '<c r="' + XlsxCellRef(C, StrToIntOr(RowNode.Attr('r'), 1)) + '"/>');
+  Result := RowNode.Item(idx);
+  FDirty := True;
+  { the row's spans is only a hint, but a wrong one is wrong }
+  spans := RowNode.Attr('spans');
+  if spans <> '' then
+  begin
+    p := Pos(':', spans);
+    a := StrToIntOr(Copy(spans, 1, p - 1), 0);
+    b := StrToIntOr(Copy(spans, p + 1, Length(spans)), 0);
+    if (p > 0) and (a > 0) and (b > 0) then
+    begin
+      if C < a then
+        a := C;
+      if C > b then
+        b := C;
+      RowNode.SetAttr('spans', IntToStr(a) + ':' + IntToStr(b));
+    end;
+  end;
+end;
+
+function TXlsxSheet.CellAt(const Ref: string; Make: Boolean): TXmlNode;
+var
+  c, r: Integer;
+  rn: TXmlNode;
+begin
+  if not XlsxParseRef(Ref, c, r) then
+    raise EXlsxError.Create('xlsx: "' + Ref + '" is not a cell reference');
+  Result := nil;
+  rn := FindRow(r, Make);
+  if rn = nil then
+    Exit;
+  Result := FindCell(rn, c, Make);
+  if Make then
+  begin
+    if (FMinC = 0) or (c < FMinC) then
+      FMinC := c;
+    if (FMinC = 0) or (c > FMaxC) then
+      FMaxC := c;
+    if (FMinR = 0) or (r < FMinR) then
+      FMinR := r;
+    if r > FMaxR then
+      FMaxR := r;
+    if FMinC > c then
+      FMinC := c;
+  end;
+end;
+
+function TXlsxSheet.HasCell(const Ref: string): Boolean;
+begin
+  Result := CellAt(Ref, False) <> nil;
+end;
+
+function TXlsxSheet.GetText(const Ref: string): string;
+var
+  n, v, isn: TXmlNode;
+  t: string;
+  i: Integer;
+begin
+  Result := '';
+  n := CellAt(Ref, False);
+  if n = nil then
+    Exit;
+  t := n.Attr('t');
+  if t = 'inlineStr' then
+  begin
+    isn := n.Elem('is');
+    if isn <> nil then
+      Result := ItemText(isn);
+    Exit;
+  end;
+  v := n.Elem('v');
+  if v = nil then
+    Exit;
+  if t = 's' then
+  begin
+    i := StrToIntOr(Trim(v.Text), -1);
+    if (i < 0) or (i >= FBook.SharedCount) then
+      raise EXlsxError.Create('xlsx: ' + Ref + ' names shared string ' + v.Text + ', which is not there');
+    Result := FBook.SharedString(i);
+  end
+  else
+    Result := v.Text;
+end;
+
+function TXlsxSheet.CellType(const Ref: string): string;
+var
+  n: TXmlNode;
+begin
+  Result := '';
+  n := CellAt(Ref, False);
+  if n = nil then
+    Exit;
+  Result := n.Attr('t');
+  if Result = '' then
+    Result := 'n';
+end;
+
+function TXlsxSheet.HasFormula(const Ref: string): Boolean;
+var
+  n: TXmlNode;
+begin
+  n := CellAt(Ref, False);
+  Result := (n <> nil) and (n.Elem('f') <> nil);
+end;
+
+function TXlsxSheet.Formula(const Ref: string): string;
+var
+  n, f: TXmlNode;
+begin
+  Result := '';
+  n := CellAt(Ref, False);
+  if n = nil then
+    Exit;
+  f := n.Elem('f');
+  if f <> nil then
+    Result := f.Text;
+end;
+
+function TXlsxSheet.StyleOf(const Ref: string): Integer;
+var
+  n: TXmlNode;
+begin
+  n := CellAt(Ref, False);
+  if n = nil then
+    Result := -1
+  else
+    Result := StrToIntOr(n.Attr('s'), 0);
+end;
+
+function TXlsxSheet.LastRow: Integer;
+var
+  i, j, best, r: Integer;
+  k: TXmlNode;
+begin
+  Load;
+  best := 0;
+  for i := 0 to FRowN - 1 do
+    for j := 0 to FRowNode[i].Count - 1 do
+    begin
+      k := FRowNode[i].Item(j);
+      if (k.Kind = xkElement) and (k.Local = 'c') then
+      begin
+        r := FRowNo[i];
+        if r > best then
+          best := r;
+        Break;
+      end;
+    end;
+  Result := best;
+end;
+
+function TXlsxSheet.LastColumn: Integer;
+var
+  i, j, best, c: Integer;
+  k: TXmlNode;
+begin
+  Load;
+  best := 0;
+  for i := 0 to FRowN - 1 do
+    for j := 0 to FRowNode[i].Count - 1 do
+    begin
+      k := FRowNode[i].Item(j);
+      if (k.Kind = xkElement) and (k.Local = 'c') then
+      begin
+        c := NodeColumn(k);
+        if c > best then
+          best := c;
+      end;
+    end;
+  Result := best;
+end;
+
+{ a cell's content made new: its children taken off, its type set, its
+  value metadata dropped (it described the old value), Inner put in }
+procedure TXlsxSheet.PutCell(Cell: TXmlNode; const TypeAttr, Inner: string);
+begin
+  if Cell.Elem('f') <> nil then
+    FBook.NoteFormula;
+  while Cell.Count > 0 do
+    Cell.RemoveAt(Cell.Count - 1);
+  if TypeAttr = '' then
+    Cell.RemoveAttr('t')
+  else
+    Cell.SetAttr('t', TypeAttr);
+  Cell.RemoveAttr('vm');
+  Cell.RemoveAttr('cm');
+  if Inner <> '' then
+    Cell.AppendXml(Inner);
+  FDirty := True;
+end;
+
+procedure TXlsxSheet.SetText(const Ref, S: string);
+var
+  n: TXmlNode;
+  open: string;
+begin
+  n := CellAt(Ref, True);
+  open := '<t>';
+  if (S <> '') and ((S[1] = ' ') or (S[Length(S)] = ' ') or (Pos(#10, S) > 0) or (Pos(#9, S) > 0) or (Pos(#13, S) > 0)) then
+    open := '<t xml:space="preserve">';
+  PutCell(n, 'inlineStr', '<is>' + open + XmlEscapeText(S) + '</t></is>');
+end;
+
+procedure TXlsxSheet.SetNumber(const Ref, Num: string);
+var
+  n: TXmlNode;
+begin
+  if not LooksNumeric(Num) then
+    raise EXlsxError.Create('xlsx: "' + Num + '" is not a number');
+  n := CellAt(Ref, True);
+  PutCell(n, '', '<v>' + Num + '</v>');
+end;
+
+procedure TXlsxSheet.SetInteger(const Ref: string; V: Integer);
+begin
+  SetNumber(Ref, IntToStr(V));
+end;
+
+procedure TXlsxSheet.SetBool(const Ref: string; V: Boolean);
+var
+  n: TXmlNode;
+begin
+  n := CellAt(Ref, True);
+  if V then
+    PutCell(n, 'b', '<v>1</v>')
+  else
+    PutCell(n, 'b', '<v>0</v>');
+end;
+
+procedure TXlsxSheet.SetDate(const Ref: string; Y, M, D: Integer);
+begin
+  SetDateTime(Ref, Y, M, D, 0, 0, 0);
+end;
+
+procedure TXlsxSheet.SetDateTime(const Ref: string; Y, M, D, H, Mi, Secs: Integer);
+var
+  days, tod, fraction, i: Integer;
+  fs, txt: string;
+begin
+  if (M < 1) or (M > 12) or (D < 1) or (D > 31) or (H < 0) or (H > 23) or (Mi < 0) or (Mi > 59) or (Secs < 0) or
+    (Secs > 59) then
+    raise EXlsxError.Create('xlsx: not a date: ' + IntToStr(Y) + '-' + IntToStr(M) + '-' + IntToStr(D));
+  if FBook.Date1904 then
+    days := DaysFromCivil(Y, M, D) - DaysFromCivil(1904, 1, 1)
+  else
+  begin
+    days := DaysFromCivil(Y, M, D) - DaysFromCivil(1899, 12, 30);
+    { the 1900 system counts a 29 February 1900 that never was: dates before
+      1 March 1900 are one day less }
+    if days < 61 then
+      days := days - 1;
+  end;
+  if days < 0 then
+    raise EXlsxError.Create('xlsx: a date before the epoch of the book');
+  tod := H * 3600 + Mi * 60 + Secs;
+  txt := IntToStr(days);
+  if tod > 0 then
+  begin
+    { the day's fraction to twelve digits, whole seconds being the exact
+      fractions they are to that many }
+    fraction := (tod * 1000000000000 + 43200) div 86400;
+    fs := IntToStr(fraction);
+    while Length(fs) < 12 do
+      fs := '0' + fs;
+    i := Length(fs);
+    while (i > 1) and (fs[i] = '0') do
+      i := i - 1;
+    txt := txt + '.' + Copy(fs, 1, i);
+  end;
+  SetNumber(Ref, txt);
+end;
+
+procedure TXlsxSheet.SetFormula(const Ref, F: string);
+var
+  n: TXmlNode;
+begin
+  n := CellAt(Ref, True);
+  PutCell(n, '', '<f>' + XmlEscapeText(F) + '</f>');
+  FBook.NoteFormula;
+end;
+
+procedure TXlsxSheet.Blank(const Ref: string);
+var
+  n: TXmlNode;
+begin
+  n := CellAt(Ref, False);
+  if n = nil then
+    Exit;
+  PutCell(n, '', '');
+end;
+
+procedure TXlsxSheet.SetStyle(const Ref: string; Idx: Integer);
+var
+  n: TXmlNode;
+begin
+  if Idx < 0 then
+    raise EXlsxError.Create('xlsx: a negative style');
+  n := CellAt(Ref, True);
+  n.SetAttr('s', IntToStr(Idx));
+  FDirty := True;
+end;
+
+{ before the sheet is written: its dimension takes in the cells added }
+procedure TXlsxSheet.Finish;
+var
+  d: TXmlNode;
+  ref, a, b: string;
+  p, c1, r1, c2, r2: Integer;
+begin
+  if (FDoc = nil) or (not FDirty) or (FMinC = 0) then
+    Exit;
+  d := FDoc.Root.Elem('dimension');
+  if d = nil then
+    Exit;
+  ref := d.Attr('ref');
+  p := Pos(':', ref);
+  if p > 0 then
+  begin
+    a := Copy(ref, 1, p - 1);
+    b := Copy(ref, p + 1, Length(ref));
+  end
+  else
+  begin
+    a := ref;
+    b := ref;
+  end;
+  if (not XlsxParseRef(a, c1, r1)) or (not XlsxParseRef(b, c2, r2)) then
+    Exit;
+  if FMinC < c1 then
+    c1 := FMinC;
+  if FMinR < r1 then
+    r1 := FMinR;
+  if FMaxC > c2 then
+    c2 := FMaxC;
+  if FMaxR > r2 then
+    r2 := FMaxR;
+  if (c1 = c2) and (r1 = r2) then
+    ref := XlsxCellRef(c1, r1)
+  else
+    ref := XlsxCellRef(c1, r1) + ':' + XlsxCellRef(c2, r2);
+  if ref <> d.Attr('ref') then
+    d.SetAttr('ref', ref);
+end;
+
+{ ---- the book ---- }
+
+{ a part name as the archive spells it: a target relative to the part that
+  names it, or absolute from the package's root }
+function TXlsxBook.ResolveTarget(const Base, Target: string): string;
+var
+  parts: array of string;
+  n, i, start: Integer;
+  src, seg: string;
+begin
+  if (Target <> '') and (Target[1] = '/') then
+    src := Copy(Target, 2, Length(Target))
+  else
+  begin
+    i := Length(Base);
+    while (i > 0) and (Base[i] <> '/') do
+      i := i - 1;
+    src := Copy(Base, 1, i) + Target;
+  end;
+  SetLength(parts, Length(src) + 1);
+  n := 0;
+  start := 1;
+  for i := 1 to Length(src) + 1 do
+    if (i > Length(src)) or (src[i] = '/') then
+    begin
+      seg := Copy(src, start, i - start);
+      start := i + 1;
+      if (seg = '') or (seg = '.') then
+        Continue;
+      if seg = '..' then
+      begin
+        if n > 0 then
+          n := n - 1;
+        Continue;
+      end;
+      parts[n] := seg;
+      n := n + 1;
+    end;
+  Result := '';
+  for i := 0 to n - 1 do
+  begin
+    if i > 0 then
+      Result := Result + '/';
+    Result := Result + parts[i];
+  end;
+end;
+
+function TXlsxBook.HasPart(const APath: string): Boolean;
+var
+  i: Integer;
+begin
+  for i := 0 to Length(FOverName) - 1 do
+    if FOverName[i] = APath then
+    begin
+      Result := True;
+      Exit;
+    end;
+  Result := FZip.Find(APath) >= 0;
+end;
+
+function TXlsxBook.ReadPart(const APath: string): string;
+var
+  i: Integer;
+begin
+  for i := 0 to Length(FOverName) - 1 do
+    if FOverName[i] = APath then
+    begin
+      Result := FOverData[i];
+      Exit;
+    end;
+  i := FZip.Find(APath);
+  if i < 0 then
+    raise EXlsxError.Create('xlsx: no part ' + APath);
+  Result := FZip.Extract(i);
+end;
+
+procedure TXlsxBook.SetPart(const APath, AData: string);
+var
+  i: Integer;
+begin
+  for i := 0 to Length(FOverName) - 1 do
+    if FOverName[i] = APath then
+    begin
+      FOverData[i] := AData;
+      Exit;
+    end;
+  SetLength(FOverName, Length(FOverName) + 1);
+  SetLength(FOverData, Length(FOverData) + 1);
+  FOverName[Length(FOverName) - 1] := APath;
+  FOverData[Length(FOverData) - 1] := AData;
+end;
+
+function TXlsxBook.PartDoc(const APath: string): TXmlDoc;
+begin
+  try
+    Result := XmlParse(ReadPart(APath));
+  except
+    on E: EXmlError do
+      raise EXlsxError.Create('xlsx: ' + APath + ': ' + E.Message);
+  end;
+end;
+
+function TargetOf(Rel: TXmlNode): string;
+begin
+  Result := Rel.Attr('Target');
+end;
+
+function TypeEndsWith(const T, Suffix: string): Boolean;
+begin
+  Result := (Length(T) >= Length(Suffix)) and (Copy(T, Length(T) - Length(Suffix) + 1, Length(Suffix)) = Suffix);
+end;
+
+constructor TXlsxBook.Open(const AData: string);
+var
+  root, rels, sheets, relItems: TXmlNode;
+  rd: TXmlDoc;
+  i, j, n: Integer;
+  rid, target, nm, st, wbDir: string;
+  found: Boolean;
+  ra: TXmlNodeArray;
+  sa: TXmlNodeArray;
+  wp: TXmlNode;
+begin
+  inherited Create;
+  try
+    FZip := TZipReader.Create(AData);
+  except
+    on E: EZipError do
+      raise EXlsxError.Create('xlsx: ' + E.Message);
+  end;
+  { the workbook is the part the package's root relationships call the
+    officeDocument }
+  FWbPath := '';
+  if FZip.Find('_rels/.rels') >= 0 then
+  begin
+    rd := PartDoc('_rels/.rels');
+    ra := rd.Root.Elems('Relationship');
+    for i := 0 to Length(ra) - 1 do
+      if TypeEndsWith(ra[i].Attr('Type'), RelDoc) and (ra[i].Attr('TargetMode') <> 'External') then
+      begin
+        FWbPath := ResolveTarget('', TargetOf(ra[i]));
+        Break;
+      end;
+  end;
+  if (FWbPath = '') or (FZip.Find(FWbPath) < 0) then
+    raise EXlsxError.Create('xlsx: no workbook part (not an XLSX file)');
+  FWb := PartDoc(FWbPath);
+  if FWb.Root.Local <> 'workbook' then
+    raise EXlsxError.Create('xlsx: ' + FWbPath + ' is not a workbook');
+  wp := FWb.Root.Elem('workbookPr');
+  if wp <> nil then
+    FDate1904 := (wp.Attr('date1904') = '1') or (wp.Attr('date1904') = 'true');
+  i := Length(FWbPath);
+  while (i > 0) and (FWbPath[i] <> '/') do
+    i := i - 1;
+  wbDir := Copy(FWbPath, 1, i);
+  FRelsPath := wbDir + '_rels/' + Copy(FWbPath, i + 1, Length(FWbPath)) + '.rels';
+  if FZip.Find(FRelsPath) < 0 then
+    raise EXlsxError.Create('xlsx: no relationships for the workbook (' + FRelsPath + ')');
+  FRels := PartDoc(FRelsPath);
+  FSharedPath := '';
+  FChainPath := '';
+  ra := FRels.Root.Elems('Relationship');
+  for i := 0 to Length(ra) - 1 do
+    if ra[i].Attr('TargetMode') <> 'External' then
+    begin
+      if TypeEndsWith(ra[i].Attr('Type'), RelShared) then
+        FSharedPath := ResolveTarget(FWbPath, TargetOf(ra[i]))
+      else if TypeEndsWith(ra[i].Attr('Type'), RelChain) then
+        FChainPath := ResolveTarget(FWbPath, TargetOf(ra[i]));
+    end;
+  sheets := FWb.Root.Elem('sheets');
+  if sheets = nil then
+    raise EXlsxError.Create('xlsx: the workbook has no sheets');
+  sa := sheets.Elems('sheet');
+  for i := 0 to Length(sa) - 1 do
+  begin
+    rid := sa[i].AttrNS(RelNs1, 'id');
+    if rid = '' then
+      rid := sa[i].AttrNS(RelNs2, 'id');
+    target := '';
+    for j := 0 to Length(ra) - 1 do
+      if ra[j].Attr('Id') = rid then
+      begin
+        target := ResolveTarget(FWbPath, TargetOf(ra[j]));
+        Break;
+      end;
+    if target = '' then
+      raise EXlsxError.Create('xlsx: sheet "' + sa[i].Attr('name') + '" names a relationship (' + rid + ') that is not there');
+    if FZip.Find(target) < 0 then
+      raise EXlsxError.Create('xlsx: sheet "' + sa[i].Attr('name') + '" is ' + target + ', which the archive does not hold');
+    st := sa[i].Attr('state');
+    if st = '' then
+      st := 'visible';
+    n := Length(FSheets);
+    SetLength(FSheets, n + 1);
+    FSheets[n] := TXlsxSheet.Create(Self, sa[i].Attr('name'), target, st);
+  end;
+end;
+
+function TXlsxBook.SheetCount: Integer;
+begin
+  Result := Length(FSheets);
+end;
+
+function TXlsxBook.Sheet(I: Integer): TXlsxSheet;
+begin
+  if (I < 0) or (I >= Length(FSheets)) then
+    raise EXlsxError.Create('xlsx: no sheet ' + IntToStr(I));
+  Result := FSheets[I];
+end;
+
+function TXlsxBook.SheetByName(const AName: string): TXlsxSheet;
+var
+  i: Integer;
+begin
+  Result := nil;
+  for i := 0 to Length(FSheets) - 1 do
+    if LowerCase(FSheets[i].Name) = LowerCase(AName) then
+    begin
+      Result := FSheets[i];
+      Exit;
+    end;
+end;
+
+procedure TXlsxBook.LoadShared;
+var
+  d: TXmlDoc;
+  si: TXmlNodeArray;
+  i: Integer;
+begin
+  if FSharedLoaded then
+    Exit;
+  FSharedLoaded := True;
+  if (FSharedPath = '') or (FZip.Find(FSharedPath) < 0) then
+    Exit;
+  d := PartDoc(FSharedPath);
+  si := d.Root.Elems('si');
+  SetLength(FShared, Length(si));
+  for i := 0 to Length(si) - 1 do
+    FShared[i] := ItemText(si[i]);
+end;
+
+function TXlsxBook.SharedCount: Integer;
+begin
+  LoadShared;
+  Result := Length(FShared);
+end;
+
+function TXlsxBook.SharedString(I: Integer): string;
+begin
+  LoadShared;
+  if (I < 0) or (I >= Length(FShared)) then
+    raise EXlsxError.Create('xlsx: no shared string ' + IntToStr(I));
+  Result := FShared[I];
+end;
+
+function TXlsxBook.Date1904: Boolean;
+begin
+  Result := FDate1904;
+end;
+
+{ a formula was written or written over: the chain that lists the cells
+  that have one is stale, and the values must be calculated again }
+procedure TXlsxBook.NoteFormula;
+begin
+  FDropChain := True;
+  RecalcOnLoad;
+end;
+
+procedure TXlsxBook.RecalcOnLoad;
+var
+  cp, prev: TXmlNode;
+  i, at: Integer;
+  k: TXmlNode;
+  nm: string;
+begin
+  cp := FWb.Root.Elem('calcPr');
+  if cp <> nil then
+  begin
+    if cp.Attr('fullCalcOnLoad') <> '1' then
+    begin
+      cp.SetAttr('fullCalcOnLoad', '1');
+      FWbDirty := True;
+    end;
+    Exit;
+  end;
+  { calcPr follows definedNames, externalReferences, functionGroups, sheets
+    and what comes before them }
+  at := -1;
+  for i := 0 to FWb.Root.Count - 1 do
+  begin
+    k := FWb.Root.Item(i);
+    if k.Kind <> xkElement then
+      Continue;
+    nm := k.Local;
+    if (nm = 'fileVersion') or (nm = 'fileSharing') or (nm = 'workbookPr') or (nm = 'workbookProtection') or
+      (nm = 'bookViews') or (nm = 'sheets') or (nm = 'functionGroups') or (nm = 'externalReferences') or
+      (nm = 'definedNames') then
+      at := i + 1;
+  end;
+  prev := nil;
+  if at < 0 then
+    at := FWb.Root.Count;
+  FWb.Root.InsertXml(at, '<calcPr fullCalcOnLoad="1"/>');
+  FWbDirty := True;
+end;
+
+{ the chain's part, its relationship and its content type go }
+procedure TXlsxBook.DropChain;
+var
+  ra: TXmlNodeArray;
+  i: Integer;
+begin
+  if FChainPath = '' then
+    Exit;
+  ra := FRels.Root.Elems('Relationship');
+  for i := 0 to Length(ra) - 1 do
+    if TypeEndsWith(ra[i].Attr('Type'), RelChain) then
+    begin
+      ra[i].Detach;
+      FRelsDirty := True;
+    end;
+  if FZip.Find('[Content_Types].xml') >= 0 then
+  begin
+    if FCt = nil then
+      FCt := PartDoc('[Content_Types].xml');
+    ra := FCt.Root.Elems('Override');
+    for i := 0 to Length(ra) - 1 do
+      if ResolveTarget('', ra[i].Attr('PartName')) = FChainPath then
+      begin
+        ra[i].Detach;
+        FCtDirty := True;
+      end;
+  end;
+end;
+
+function TXlsxBook.Save: string;
+var
+  w: TZipWriter;
+  i, k: Integer;
+  e: TZipEntry;
+  nm: string;
+  done: array of Boolean;
+  handled: Boolean;
+begin
+  if FDropChain then
+    DropChain;
+  w := TZipWriter.Create;
+  w.Comment := FZip.Comment;
+  SetLength(done, Length(FOverName));
+  for i := 0 to FZip.Count - 1 do
+  begin
+    e := FZip.Entry(i);
+    nm := e.Name;
+    if FDropChain and (FChainPath <> '') and (nm = FChainPath) then
+      Continue;
+    handled := False;
+    for k := 0 to Length(FOverName) - 1 do
+      if FOverName[k] = nm then
+      begin
+        w.Replace(e, FOverData[k]);
+        done[k] := True;
+        handled := True;
+        Break;
+      end;
+    if handled then
+      Continue;
+    if (nm = FWbPath) and FWbDirty then
+      w.Replace(e, FWb.Xml)
+    else if (nm = FRelsPath) and FRelsDirty then
+      w.Replace(e, FRels.Xml)
+    else if (nm = '[Content_Types].xml') and FCtDirty then
+      w.Replace(e, FCt.Xml)
+    else
+    begin
+      for k := 0 to Length(FSheets) - 1 do
+        if (FSheets[k].FPath = nm) and (FSheets[k].FDoc <> nil) and FSheets[k].FDirty then
+        begin
+          FSheets[k].Finish;
+          handled := True;
+          w.Replace(e, FSheets[k].FDoc.Xml);
+          Break;
+        end;
+      if not handled then
+        w.AddRaw(e, FZip.Raw(i));
+    end;
+  end;
+  for k := 0 to Length(FOverName) - 1 do
+    if not done[k] then
+      w.Add(FOverName[k], FOverData[k]);
+  Result := w.Finish;
+end;
+
+end.

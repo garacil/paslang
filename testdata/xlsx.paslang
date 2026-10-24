@@ -1,0 +1,292 @@
+{ P436: pasxlsx on two template workbooks (testdata/xlsxtpl.txt, which
+  scripts/xlsx_make.py writes): tpl1 laid out as Excel writes a file (shared
+  strings, rich runs, formulas with values, a hidden and a very hidden
+  sheet, a calculation chain, validations, merged cells), tpl2 the other way
+  (pretty-printed, the 1904 date system, inline strings, cells with no r,
+  absolute targets). The cells are read, then cells are written (text that
+  keeps its zeros and spaces, numbers, dates, a Boolean, formulas, cells in a
+  row that exist and cells that do not, rows between rows and after the last,
+  a cell written over a formula), the book saved and read again; every entry
+  of the archive that was not written is the entry it was (compressed bytes,
+  times and attributes), and the sheets, workbook, relationships and content
+  types that changed are written out as they now are, so the bytes that
+  differ from the template are the ones the output shows. With the argument
+  dump the saved books are written as `NAME BASE64` for scripts/
+  xlsx_verify.py, which has openpyxl and LibreOffice read them. }
+program xlsx;
+
+uses
+  sysutils, pascodec, pasflate, paszip, pasxml, pasxlsx;
+
+var
+  Dump: Boolean;
+
+procedure Say(const S: string);
+begin
+  if not Dump then
+    WriteLn(S);
+end;
+
+function Template(const Name: string): string;
+var
+  corpus, line: string;
+  p, nl, q: Integer;
+begin
+  Result := '';
+  if not ReadFile('testdata/xlsxtpl.txt', corpus) then
+  begin
+    WriteLn('no testdata/xlsxtpl.txt');
+    Halt(2);
+  end;
+  p := 1;
+  while p <= Length(corpus) do
+  begin
+    nl := p;
+    while (nl <= Length(corpus)) and (corpus[nl] <> #10) do
+      nl := nl + 1;
+    line := Copy(corpus, p, nl - p);
+    p := nl + 1;
+    q := Pos(' ', line);
+    if Copy(line, 1, q - 1) = Name then
+    begin
+      if not Base64Decode(Copy(line, q + 1, Length(line)), False, True, Result) then
+      begin
+        WriteLn('bad base64');
+        Halt(2);
+      end;
+      Exit;
+    end;
+  end;
+  WriteLn('no template ', Name);
+  Halt(2);
+end;
+
+function Quote(const S: string): string;
+var
+  i: Integer;
+begin
+  Result := '';
+  for i := 1 to Length(S) do
+    if S[i] = #10 then
+      Result := Result + '\n'
+    else
+      Result := Result + S[i];
+end;
+
+procedure Show(Sh: TXlsxSheet; const Ref: string);
+begin
+  if Sh.HasCell(Ref) then
+    Say('  ' + Ref + ' type ' + Sh.CellType(Ref) + ' style ' + IntToStr(Sh.StyleOf(Ref)) + ' formula ' + BoolToStr(Sh.HasFormula(Ref), True) +
+      ' [' + Quote(Sh.GetText(Ref)) + ']')
+  else
+    Say('  ' + Ref + ' none');
+end;
+
+procedure Entries(const Title: string; const Data: string);
+var
+  r: TZipReader;
+  i: Integer;
+  e: TZipEntry;
+begin
+  r := TZipReader.Create(Data);
+  Say(Title + ': ' + IntToStr(r.Count) + ' entries');
+  for i := 0 to r.Count - 1 do
+  begin
+    e := r.Entry(i);
+    Say('  ' + e.Name + ' method ' + IntToStr(e.Method) + ' ' + IntToStr(e.CompSize) + '/' + IntToStr(e.Size) + ' crc ' + IntToStr(e.Crc) +
+      ' time ' + IntToStr(e.DosDate) + ' ' + IntToStr(e.DosTime) + ' attr ' + IntToStr(e.ExternalAttr));
+  end;
+end;
+
+{ every entry of Old that is not in the list of names that changed is the
+  entry it was in New; the result says how many were kept and how many
+  went }
+procedure Compare(const OldData, NewData: string; const Changed: array of string);
+var
+  a, b: TZipReader;
+  i, j, k, kept, gone: Integer;
+  ea, eb: TZipEntry;
+  isChanged: Boolean;
+begin
+  a := TZipReader.Create(OldData);
+  b := TZipReader.Create(NewData);
+  kept := 0;
+  gone := 0;
+  for i := 0 to a.Count - 1 do
+  begin
+    ea := a.Entry(i);
+    isChanged := False;
+    for k := 0 to High(Changed) do
+      if Changed[k] = ea.Name then
+        isChanged := True;
+    j := b.Find(ea.Name);
+    if j < 0 then
+    begin
+      Say('  gone: ' + ea.Name);
+      gone := gone + 1;
+      Continue;
+    end;
+    eb := b.Entry(j);
+    if isChanged then
+    begin
+      if (eb.DosDate <> ea.DosDate) or (eb.DosTime <> ea.DosTime) or (eb.ExternalAttr <> ea.ExternalAttr) or (j <> i - gone) then
+        Say('  CHANGED ENTRY LOST ITS TIMES, ATTRIBUTES OR PLACE: ' + ea.Name);
+      Say('  rewritten: ' + ea.Name);
+      Continue;
+    end;
+    if (b.Raw(j) <> a.Raw(i)) or (eb.Crc <> ea.Crc) or (eb.Method <> ea.Method) or (eb.DosDate <> ea.DosDate) or
+      (eb.DosTime <> ea.DosTime) or (eb.ExternalAttr <> ea.ExternalAttr) or (eb.Flags <> ea.Flags) or (j <> i - gone) then
+      Say('  NOT AS IT WAS: ' + ea.Name)
+    else
+      kept := kept + 1;
+  end;
+  Say('  kept as they were: ' + IntToStr(kept) + ', gone: ' + IntToStr(gone) + ', now ' + IntToStr(b.Count));
+end;
+
+procedure PartOf(const Data, Name: string);
+var
+  b: TXlsxBook;
+begin
+  b := TXlsxBook.Open(Data);
+  Say('--- ' + Name);
+  Say(b.ReadPart(Name));
+end;
+
+procedure Fails(const What: string; Act: Integer);
+var
+  b: TXlsxBook;
+begin
+  try
+    case Act of
+      0:
+        b := TXlsxBook.Open('not a zip file at all, but long enough for the end record 0123456789');
+      1:
+        begin
+          b := TXlsxBook.Open(Template('tpl1'));
+          b.Sheet(0).SetText('A0', 'x');
+        end;
+      2:
+        begin
+          b := TXlsxBook.Open(Template('tpl1'));
+          b.Sheet(0).SetNumber('A1', '12x');
+        end;
+      3:
+        begin
+          b := TXlsxBook.Open(Template('tpl1'));
+          b.Sheet(7);
+        end;
+      4:
+        begin
+          b := TXlsxBook.Open(Template('tpl1'));
+          b.Sheet(0).SetText('XFE1', 'x');
+        end;
+      5:
+        begin
+          b := TXlsxBook.Open(Template('tpl1'));
+          b.Sheet(0).SetDate('A1', 2024, 13, 1);
+        end;
+    end;
+    Say(What + ': no error');
+  except
+    on E: EXlsxError do
+      Say(What + ': ' + E.Message);
+  end;
+end;
+
+var
+  src, out1, out2: string;
+  b, b2: TXlsxBook;
+  s, s2: TXlsxSheet;
+  i: Integer;
+begin
+  Dump := (ParamCount > 0) and (ParamStr(1) = 'dump');
+  src := Template('tpl1');
+  b := TXlsxBook.Open(src);
+  Say('tpl1: ' + IntToStr(b.SheetCount) + ' sheets, ' + IntToStr(b.SharedCount) + ' shared strings, date1904 ' + BoolToStr(b.Date1904, True));
+  for i := 0 to b.SheetCount - 1 do
+    Say('  ' + b.Sheet(i).Name + ' ' + b.Sheet(i).State + ' ' + b.Sheet(i).Path);
+  s := b.SheetByName('datos');
+  Say('  by name: ' + BoolToStr(s <> nil, True) + ' ' + BoolToStr(b.SheetByName('nada') = nil, True) + ' last row ' + IntToStr(s.LastRow) +
+    ' last column ' + IntToStr(s.LastColumn));
+  Say('read:');
+  for i := 0 to 11 do
+    Show(s, Copy('A1B1C2D2E2A3D3A4A5B5F5A6', i * 2 + 1, 2));
+  Show(s, 'C2');
+  Show(s, 'Z9');
+  Say('write:');
+  s.SetText('A2', '007');
+  s.SetDate('C3', 2024, 10, 24);
+  s.SetNumber('B3', '10.5');
+  s.SetText('E3', 'nuevo');
+  s.SetText('G3', 'fuera de spans');
+  s.SetText('A7', 'fila nueva');
+  s.SetText('A9', ' <a & b>' + #10 + 'x ');
+  s.SetText('A8', 'entre filas');
+  s.SetText('D5', 'era una fórmula');
+  s.SetFormula('B2', 'B3*2');
+  s.SetBool('F2', True);
+  s.Blank('E2');
+  s.SetStyle('D1', 4);
+  s.SetInteger('C9', -17);
+  s.SetDateTime('C8', 2024, 10, 24, 13, 45, 30);
+  s.Blank('Q40');
+  b.SheetByName('Listas').SetText('A4', 'cuatro');
+  out1 := b.Save;
+  Entries('saved tpl1', out1);
+  Compare(src, out1, ['xl/workbook.xml', 'xl/_rels/workbook.xml.rels', '[Content_Types].xml', 'xl/worksheets/sheet1.xml',
+    'xl/worksheets/sheet2.xml', 'xl/calcChain.xml']);
+  if Dump then
+    WriteLn('tpl1 ', Base64Encode(out1, False, True));
+  b2 := TXlsxBook.Open(out1);
+  s2 := b2.Sheet(0);
+  Say('reread: last row ' + IntToStr(s2.LastRow) + ' last column ' + IntToStr(s2.LastColumn));
+  for i := 0 to 16 do
+    Show(s2, Copy('A1D1A2B2C2E2F2B3C3E3G3A5D5A7A8C8A9', i * 2 + 1, 2));
+  Show(s2, 'C9');
+  Show(b2.Sheet(1), 'A4');
+  PartOf(out1, 'xl/worksheets/sheet1.xml');
+  PartOf(out1, 'xl/worksheets/sheet2.xml');
+  PartOf(out1, 'xl/workbook.xml');
+  PartOf(out1, 'xl/_rels/workbook.xml.rels');
+  PartOf(out1, '[Content_Types].xml');
+  { nothing written: the archive is the same entry by entry }
+  b := TXlsxBook.Open(src);
+  s := b.Sheet(0);
+  s.SetText('A2', 'x');
+  out2 := TXlsxBook.Open(src).Save;
+  Say('saved untouched, same bytes as the template: ' + BoolToStr(out2 = src, True));
+  Compare(src, out2, []);
+  { the second template }
+  src := Template('tpl2');
+  b := TXlsxBook.Open(src);
+  s := b.Sheet(0);
+  Say('tpl2: ' + b.Sheet(0).Name + ' ' + b.Sheet(0).Path + ' date1904 ' + BoolToStr(b.Date1904, True) + ' last row ' + IntToStr(s.LastRow));
+  Show(s, 'A1');
+  Show(s, 'C1');
+  Show(s, 'A2');
+  Show(s, 'B2');
+  s.SetDate('B2', 2024, 10, 24);
+  s.SetNumber('C2', '5');
+  s.SetText('A3', '0043');
+  s.SetStyle('A3', 2);
+  s.SetDate('B3', 1904, 1, 2);
+  s.SetText('B4', 'fila vacía antes');
+  s.SetText('B1', 'Fecha de alta');
+  out1 := b.Save;
+  Entries('saved tpl2', out1);
+  Compare(src, out1, ['xl/worksheets/hoja.xml']);
+  if Dump then
+    WriteLn('tpl2 ', Base64Encode(out1, False, True));
+  PartOf(out1, 'xl/worksheets/hoja.xml');
+  b2 := TXlsxBook.Open(out1);
+  Show(b2.Sheet(0), 'B2');
+  Show(b2.Sheet(0), 'B3');
+  Show(b2.Sheet(0), 'A3');
+  Say('errors:');
+  Fails('not a zip', 0);
+  Fails('bad reference', 1);
+  Fails('bad number', 2);
+  Fails('no such sheet', 3);
+  Fails('column past XFD', 4);
+  Fails('bad date', 5);
+end.

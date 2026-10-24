@@ -595,6 +595,9 @@ GOLDEN_A64 += xmlcorpus xmldom
 # P427: DEFLATE, zlib and gzip read against zlib and Go on 1893 streams, the writer round trip, ZIP against zipfile and Go.
 GOLDEN += flate flatec zip
 GOLDEN_A64 += flate flatec zip
+# P436: XLSX templates filled, the entries not written kept as they were.
+GOLDEN += xlsx
+GOLDEN_A64 += xlsx
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -632,6 +635,7 @@ LIB_UNITS := \
 	src/lib/pasxml.paslang \
 	src/lib/pasflate.paslang \
 	src/lib/paszip.paslang \
+	src/lib/pasxlsx.paslang \
 	src/lib/httpserver.paslang \
 	src/lib/sqlite.paslang
 
