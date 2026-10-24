@@ -690,12 +690,12 @@ type
   { quotedprintable.Writer: lines of at most 76 bytes, = ending a soft break }
   TQpWriter = class
   private
-    FLine: string;
-    FLi: Integer;
-    FOut: string;
+    FBuf: string;
+    { the bytes of FBuf that are written, and where the line being made starts }
+    FLen: Integer;
+    FLs: Integer;
     FCr: Boolean;
-    procedure Flush;
-    procedure Put(C: Char);
+    procedure Room(N: Integer);
     procedure Crlf;
     procedure SoftBreak;
     procedure Enc(B: Integer);
@@ -710,97 +710,142 @@ type
 constructor TQpWriter.Create;
 begin
   inherited Create;
-  SetLength(FLine, 160);
+  FBuf := '';
+  FLen := 0;
+  FLs := 0;
+  FCr := False;
 end;
 
-procedure TQpWriter.Flush;
+{ the buffer holds N more bytes }
+procedure TQpWriter.Room(N: Integer);
+var
+  need: Integer;
 begin
-  FOut := FOut + Copy(FLine, 1, FLi);
-  FLi := 0;
-end;
-
-procedure TQpWriter.Put(C: Char);
-begin
-  FLi := FLi + 1;
-  if FLi > Length(FLine) then
-    SetLength(FLine, FLi * 2);
-  FLine[FLi] := C;
+  need := FLen + N;
+  if Length(FBuf) < need then
+  begin
+    if need < Length(FBuf) * 2 then
+      need := Length(FBuf) * 2;
+    SetLength(FBuf, need);
+  end;
 end;
 
 procedure TQpWriter.Crlf;
 begin
-  Put(#13);
-  Put(#10);
-  Flush;
+  FBuf[FLen + 1] := #13;
+  FBuf[FLen + 2] := #10;
+  FLen := FLen + 2;
+  FLs := FLen;
 end;
 
 procedure TQpWriter.SoftBreak;
 begin
-  Put('=');
+  FBuf[FLen + 1] := '=';
+  FLen := FLen + 1;
   Crlf;
 end;
 
 procedure TQpWriter.Enc(B: Integer);
 begin
-  if 75 - FLi < 3 then
+  if 75 - (FLen - FLs) < 3 then
     SoftBreak;
-  Put('=');
-  Put(UpperHex[(B shr 4) + 1]);
-  Put(UpperHex[(B and 15) + 1]);
+  FBuf[FLen + 1] := '=';
+  FBuf[FLen + 2] := UpperHex[(B shr 4) + 1];
+  FBuf[FLen + 3] := UpperHex[(B and 15) + 1];
+  FLen := FLen + 3;
 end;
 
 procedure TQpWriter.CheckLast;
 var
   lb: Integer;
 begin
-  if FLi = 0 then
+  if FLen - FLs = 0 then
     Exit;
-  lb := Ord(FLine[FLi]);
+  lb := Ord(FBuf[FLen]);
   if (lb = 32) or (lb = 9) then
   begin
-    FLi := FLi - 1;
+    FLen := FLen - 1;
     Enc(lb);
   end;
 end;
 
 procedure TQpWriter.Feed(const S: string);
 var
-  i, b: Integer;
-  c: Char;
+  i, n, b, k, ls: Integer;
+  cr: Boolean;
+  dp: PByte;
 begin
-  for i := 1 to Length(S) do
+  n := Length(S);
+  if n = 0 then
+    Exit;
+  { an input byte takes at most four bytes of the output }
+  Room(n * 4 + 16);
+  dp := PByte(@FBuf[1]);
+  k := FLen;
+  ls := FLs;
+  cr := FCr;
+  for i := 1 to n do
   begin
-    c := S[i];
-    b := Ord(c);
+    b := Ord(S[i]);
     if ((b >= 33) and (b <= 126) and (b <> 61)) or (b = 32) or (b = 9) then
     begin
-      if FLi = 75 then
-        SoftBreak;
-      Put(c);
-      FCr := False;
+      if k - ls = 75 then
+      begin
+        dp[k] := 61;
+        dp[k + 1] := 13;
+        dp[k + 2] := 10;
+        k := k + 3;
+        ls := k;
+      end;
+      dp[k] := Byte(b);
+      k := k + 1;
+      cr := False;
     end
     else if ((b = 10) or (b = 13)) and (not Binary) then
     begin
-      if FCr and (b = 10) then
+      { a line end goes the slow way, through the fields }
+      if cr and (b = 10) then
       begin
-        FCr := False;
+        cr := False;
         Continue;
       end;
-      if b = 13 then
-        FCr := True;
+      FLen := k;
+      FLs := ls;
+      FCr := (b = 13);
       CheckLast;
       Crlf;
+      k := FLen;
+      ls := FLs;
+      cr := FCr;
     end
     else
-      Enc(b);
+    begin
+      { a byte that is written as =XX }
+      if 75 - (k - ls) < 3 then
+      begin
+        dp[k] := 61;
+        dp[k + 1] := 13;
+        dp[k + 2] := 10;
+        k := k + 3;
+        ls := k;
+      end;
+      dp[k] := 61;
+      dp[k + 1] := Byte(Ord(UpperHex[(b shr 4) + 1]));
+      dp[k + 2] := Byte(Ord(UpperHex[(b and 15) + 1]));
+      k := k + 3;
+    end;
   end;
+  FLen := k;
+  FLs := ls;
+  FCr := cr;
 end;
 
 function TQpWriter.Finish: string;
 begin
+  Room(16);
   CheckLast;
-  Flush;
-  Result := FOut;
+  SetLength(FBuf, FLen);
+  Result := FBuf;
 end;
 
 function QpEncode(const S: string; Binary: Boolean): string;
@@ -901,19 +946,18 @@ end;
 
 function NeedsEncoding(const S: string): Boolean;
 var
-  i, sz, r: Integer;
+  i, c: Integer;
 begin
   Result := False;
-  i := 1;
-  while i <= Length(S) do
+  { a byte of 128 or more starts a code point past 126, so no decoding is needed to know }
+  for i := 1 to Length(S) do
   begin
-    r := Utf8Next(S, i, sz);
-    if ((r < 32) or (r > 126)) and (r <> 9) then
+    c := Ord(S[i]);
+    if ((c < 32) or (c > 126)) and (c <> 9) then
     begin
       Result := True;
       Exit;
     end;
-    i := i + sz;
   end;
 end;
 
@@ -924,19 +968,40 @@ end;
 
 function QString(const S: string): string;
 var
-  i, b: Integer;
+  i, b, n, k: Integer;
+  dp: PByte;
 begin
-  Result := '';
-  for i := 1 to Length(S) do
+  n := Length(S);
+  if n = 0 then
+  begin
+    Result := '';
+    Exit;
+  end;
+  SetLength(Result, n * 3);
+  dp := PByte(@Result[1]);
+  k := 0;
+  for i := 1 to n do
   begin
     b := Ord(S[i]);
     if b = 32 then
-      Result := Result + '_'
+    begin
+      dp[k] := 95;
+      k := k + 1;
+    end
     else if (b >= 33) and (b <= 126) and (b <> 61) and (b <> 63) and (b <> 95) then
-      Result := Result + S[i]
+    begin
+      dp[k] := Byte(b);
+      k := k + 1;
+    end
     else
-      Result := Result + '=' + UpperHex[(b shr 4) + 1] + UpperHex[(b and 15) + 1];
+    begin
+      dp[k] := 61;
+      dp[k + 1] := Byte(Ord(UpperHex[(b shr 4) + 1]));
+      dp[k + 2] := Byte(Ord(UpperHex[(b and 15) + 1]));
+      k := k + 3;
+    end;
   end;
+  SetLength(Result, k);
 end;
 
 const
@@ -947,7 +1012,8 @@ const
 function MimeEncodeWord(const Charset, S: string; B: Boolean): string;
 var
   open0, enc: string;
-  i, curLen, last, encLen, runeLen, c: Integer;
+  i, j, k, n, curLen, last, encLen, runeLen, c: Integer;
+  dp: PByte;
 begin
   if not NeedsEncoding(S) then
   begin
@@ -991,9 +1057,20 @@ begin
     Result := Result + QString(S) + '?=';
     Exit;
   end;
+  { the words are written into a buffer of the size they can have: a word holds at least
+    21 bytes of the text, the text takes at most three bytes a byte }
+  n := Length(S);
+  SetLength(Result, n * 3 + (n div 21 + 2) * (Length(open0) + 3) + 8);
+  dp := PByte(@Result[1]);
+  k := 0;
+  for j := 1 to Length(open0) do
+  begin
+    dp[k] := Byte(Ord(open0[j]));
+    k := k + 1;
+  end;
   curLen := 0;
   i := 1;
-  while i <= Length(S) do
+  while i <= n do
   begin
     c := Ord(S[i]);
     if (c >= 32) and (c <= 126) and (c <> 61) and (c <> 63) and (c <> 95) then
@@ -1008,21 +1085,53 @@ begin
     end;
     if curLen + encLen > MaxContentLen then
     begin
-      Result := Result + '?= ' + open0;
+      dp[k] := 63;
+      dp[k + 1] := 61;
+      dp[k + 2] := 32;
+      k := k + 3;
+      for j := 1 to Length(open0) do
+      begin
+        dp[k] := Byte(Ord(open0[j]));
+        k := k + 1;
+      end;
       curLen := 0;
     end;
-    Result := Result + QString(Copy(S, i, runeLen));
+    for j := i to i + runeLen - 1 do
+    begin
+      c := Ord(S[j]);
+      if c = 32 then
+      begin
+        dp[k] := 95;
+        k := k + 1;
+      end
+      else if (c >= 33) and (c <= 126) and (c <> 61) and (c <> 63) and (c <> 95) then
+      begin
+        dp[k] := Byte(c);
+        k := k + 1;
+      end
+      else
+      begin
+        dp[k] := 61;
+        dp[k + 1] := Byte(Ord(UpperHex[(c shr 4) + 1]));
+        dp[k + 2] := Byte(Ord(UpperHex[(c and 15) + 1]));
+        k := k + 3;
+      end;
+    end;
     curLen := curLen + encLen;
     i := i + runeLen;
   end;
-  Result := Result + '?=';
+  dp[k] := 63;
+  dp[k + 1] := 61;
+  k := k + 2;
+  SetLength(Result, k);
 end;
 
 { mime.decode of the text of a word: False when it is not a B or Q text }
 function DecodeWordText(Enc: Char; const Text: string; out R: string): Boolean;
 var
-  i, hi, lo: Integer;
+  i, hi, lo, n, k: Integer;
   c: Char;
+  dp: PByte;
 begin
   Result := False;
   R := '';
@@ -1033,29 +1142,56 @@ begin
   end;
   if (Enc <> 'Q') and (Enc <> 'q') then
     Exit;
+  { the text is never longer decoded than it is: written into a buffer of its size }
+  n := Length(Text);
+  if n = 0 then
+  begin
+    Result := True;
+    Exit;
+  end;
+  SetLength(R, n);
+  dp := PByte(@R[1]);
+  k := 0;
   i := 1;
-  while i <= Length(Text) do
+  while i <= n do
   begin
     c := Text[i];
     if c = '_' then
-      R := R + ' '
+    begin
+      dp[k] := 32;
+      k := k + 1;
+    end
     else if c = '=' then
     begin
-      if i + 2 > Length(Text) then
+      if i + 2 > n then
+      begin
+        R := '';
         Exit;
+      end;
       hi := HexVal(Text[i + 1]);
       lo := HexVal(Text[i + 2]);
       if (hi < 0) or (lo < 0) then
+      begin
+        R := '';
         Exit;
-      R := R + Chr(hi * 16 + lo);
+      end;
+      dp[k] := Byte(hi * 16 + lo);
+      k := k + 1;
       i := i + 2;
     end
     else if ((c <= '~') and (c >= ' ')) or (c = #10) or (c = #13) or (c = #9) then
-      R := R + c
+    begin
+      dp[k] := Byte(Ord(c));
+      k := k + 1;
+    end
     else
+    begin
+      R := '';
       Exit;
+    end;
     i := i + 1;
   end;
+  SetLength(R, k);
   Result := True;
 end;
 
@@ -2173,6 +2309,18 @@ begin
   Result := (R = 32) or (R = 9);
 end;
 
+const
+  { what an ASCII byte is as atext (RFC 5322): 0 not, 1 yes, 2 the dot, which is when the atom may hold dots }
+  AtextAscii: array[0..127] of Byte = (
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 1, 0, 1, 1, 1, 1, 1, 0, 0, 1, 1, 0, 1, 2, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 0, 1,
+    0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0);
+
 function IsAtext(R: Integer; Dot: Boolean): Boolean;
 begin
   case R of
@@ -2519,13 +2667,27 @@ end;
 
 function TAddrParser.ConsumeAtom(Dot, Permissive: Boolean; out Atom: string): Boolean;
 var
-  i, sz, r: Integer;
+  i, sz, r, n, c: Integer;
 begin
   Result := False;
   Atom := '';
   i := FP;
+  n := Length(FS);
   while True do
   begin
+    { an ASCII byte is told by a table, only the others are decoded }
+    if i > n then
+      Break;
+    c := Ord(FS[i]);
+    if c < 128 then
+    begin
+      if AtextAscii[c] = 0 then
+        Break;
+      if (AtextAscii[c] = 2) and (not Dot) then
+        Break;
+      i := i + 1;
+      Continue;
+    end;
     r := Utf8Next(FS, i, sz);
     if (sz = 1) and (r = $FFFD) then
     begin
@@ -4312,32 +4474,41 @@ end;
 function MlCrlf(const S: string): string;
 var
   i, n, k: Integer;
+  sp, dp: PByte;
+  c: Byte;
 begin
   n := Length(S);
-  Result := '';
-  SetLength(Result, n * 2);
-  k := 0;
-  i := 1;
-  while i <= n do
+  if n = 0 then
   begin
-    if S[i] = #13 then
+    Result := '';
+    Exit;
+  end;
+  SetLength(Result, n * 2);
+  sp := PByte(Pointer(S));
+  dp := PByte(@Result[1]);
+  k := 0;
+  i := 0;
+  while i < n do
+  begin
+    c := sp[i];
+    if c = 13 then
     begin
-      if (i < n) and (S[i + 1] = #10) then
+      if (i + 1 < n) and (sp[i + 1] = 10) then
         i := i + 1;
-      Result[k + 1] := #13;
-      Result[k + 2] := #10;
+      dp[k] := 13;
+      dp[k + 1] := 10;
       k := k + 2;
     end
-    else if S[i] = #10 then
+    else if c = 10 then
     begin
-      Result[k + 1] := #13;
-      Result[k + 2] := #10;
+      dp[k] := 13;
+      dp[k + 1] := 10;
       k := k + 2;
     end
     else
     begin
+      dp[k] := c;
       k := k + 1;
-      Result[k] := S[i];
     end;
     i := i + 1;
   end;
