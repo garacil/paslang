@@ -179,6 +179,15 @@ a unit's `.pi` in each `-Fu` directory in the order given, then in
 only), in `build`, in
 `.`, and beside the source file, and reads the first one it finds.
 
+Units may use units that use others, to any depth, and a program may
+name them in any order: a record of a unit, `TSysError` of `SysUtils`
+or one of your own with methods, is one type however many units' `.pi`
+bring it in, and a routine of any unit of the chain takes it by `var`
+or `out` (1.1.273; the `.pi` of a unit whose interface used a unit that
+used a record with methods named the record's own helper by the
+record's name, and the record became that helper where the next unit
+read it: `var parameter of type TSysError given a TSysError`).
+
 Eleven units are part of the language and need no `uses`; every program
 links them. `pasobject` (`TObject`, the root of every class),
 `pasroutines` (the sync types), `pasfmt` (what `Write`

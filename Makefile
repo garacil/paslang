@@ -3512,6 +3512,19 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/hideab-arm testdata/units/hideab.paslang; \
 	timeout 60 $(QEMU_A64) $(BUILDDIR)/hideab-arm > $(BUILDDIR)/hideab-arm.got; \
 	diff -u testdata/units/hideab.out $(BUILDDIR)/hideab-arm.got; \
+	: a chain of units gives one type of each record, TSysError and the records with methods of the units, whatever the order the program names them, P458; \
+	for u in idchain1 idchain2 idchain3 idchain4 idsys1 idsys2 idsys3; do \
+	  $(OUTDIR)/paslangc -Fu $(BUILDDIR) testdata/units/$$u.paslang; \
+	  $(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) testdata/units/$$u.paslang; \
+	done; \
+	for p in idchainuse idchainuse2 idsysuse; do \
+	  $(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/$$p testdata/units/$$p.paslang; \
+	  $(BUILDDIR)/$$p > $(BUILDDIR)/$$p.got; \
+	  diff -u testdata/units/$$p.out $(BUILDDIR)/$$p.got; \
+	  $(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/$$p-arm testdata/units/$$p.paslang; \
+	  timeout 60 $(QEMU_A64) $(BUILDDIR)/$$p-arm > $(BUILDDIR)/$$p-arm.got; \
+	  diff -u testdata/units/$$p.out $(BUILDDIR)/$$p-arm.got; \
+	done; \
 	: a unit names hide those of a unit its implementation uses, P158; \
 	$(OUTDIR)/paslangc testdata/units/hidelo.paslang; \
 	$(OUTDIR)/paslangc -Fu $(BUILDDIR) testdata/units/hidehi.paslang; \
