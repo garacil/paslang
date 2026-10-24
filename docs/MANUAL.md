@@ -11770,6 +11770,108 @@ reading, one of the two when the clock skipped or showed it twice, as
 cuts off at 13:00 in Madrid asks `LoadZone('Europe/Madrid')` once and
 needs no `TZ=Europe/Madrid` in its environment.
 
+`uses pasxml` reads, edits and writes XML (1.1.263, P426): a reader that
+refuses what XML 1.0 (Fifth Edition) and Namespaces in XML 1.0 (Third
+Edition) call not well-formed, with the line and column; a tree that keeps
+the bytes of every node it read, so a document edited and written back
+differs from the original only where it was edited; a writer; escaping.
+It is made for the parts of a spreadsheet, a feed or a configuration, and
+it is checked three ways: `testdata/xmlcorpus` reads 2,672 documents (one
+for each production of the two recommendations, and the same with bytes
+changed, inserted and removed) with and without namespaces and gets what
+expat gets (`scripts/xml_corpus.py` has pyexpat make the expected lines);
+the W3C conformance suite (`scripts/xmlconf.py`, with the suite from
+w3.org) runs 1,494 cases that apply to a processor that reads the internal
+subset and no external entity, and the cases it does not pass are listed in
+ENGINEERING; `testdata/xmldom` reads each of those documents and writes it
+back byte for byte, and makes six edits on up to a dozen elements of each,
+each edit leaving every byte outside the edited element as it was.
+
+```pascal
+d := XmlParse(Text);                  { EXmlError (Offset, Line, Column, Reason) when not well-formed }
+sheet := d.Root.Find('sheetData');    { children by local name, joined with / }
+for each row in sheet.Elems('row') ...
+c := row.Item(0);                     { all kinds: elements, text, CDATA, comments, PIs }
+c.Attr('r'); c.Find('is/t').Text;     { an attribute; all the text under an element }
+c.Find('is/t').SetText('new & "text"');  { escaped on writing }
+row.SetAttr('ht', '20'); row.RemoveAttr('spans');
+sheet.AppendXml('<row r="3"><c r="A3"><v>1</v></c></row>');   { read in sheet's namespace scope }
+Out := d.Xml;                         { the document written; Text itself when nothing changed }
+```
+- **What is kept.** A node that was read knows its bytes. Writing copies an
+  untouched node as it was: its attribute order, quotes, white space,
+  entity and character references (`&#169;`, `&amp;`), CDATA sections,
+  comments, the XML declaration, the DOCTYPE, the line ends (CRLF as CRLF)
+  and a byte order mark. An edited element is written again as far as it
+  changed: a changed attribute is written `name="value"` (keeping its quote
+  character) in its place, the others as they were; a new attribute goes
+  after the last with one space; text you set is escaped (`&`, `<`, `>`,
+  CR) and every character XML does not allow becomes U+FFFD. `<a/>` given
+  a child becomes `<a>..</a>`, and an element emptied keeps its end tag.
+  A document read as UTF-16 or ISO-8859-1 is written as UTF-8 with its
+  declaration saying so.
+- **Reading.** Names are XML Names (the Fifth Edition's characters);
+  attributes are unique, with their prefixes expanded too; `]]>` is not
+  text; `--` is not in a comment; the XML declaration is only at the start
+  and its version, encoding and standalone are checked; text before or
+  after the root, a second root, a second DOCTYPE and an unbound prefix are
+  refused. The DOCTYPE's internal subset is read for its syntax: element,
+  attribute-list and notation declarations, comments and processing
+  instructions, and entities. Entities are the five of XML, character
+  references and the internal general entities, expanded in text and in
+  attribute values; a loop, more than `MaxExpansion` bytes (16 MiB), or
+  more than 20 levels is refused, so a billion-laughs document is. **Left
+  out:** an entity whose text holds markup is refused, not misread; an
+  external entity, an external subset and a parameter entity are never
+  read, and a reference to one is refused; default attribute values and
+  the declared types of attributes are not applied; names in the namespace
+  are not checked as URIs. UTF-16 is taken with a byte order mark or when
+  it starts `<?`, ISO-8859-1 when the declaration says so, and any other
+  declared encoding is refused, as Go's decoder refuses it without a
+  `CharsetReader`.
+- **The tree.** `TXmlNode`: `Kind` (`xkElement`, `xkText`, `xkCData`,
+  `xkComment`, `xkPI`, `xkDoctype`, `xkDecl`), `Name` as written, `Prefix`,
+  `Local`, `URI`, `Parent`; `Count`/`Item(i)`, `Elem(name)`/`Elems(name)`
+  (a name with a colon is the qualified name, else the local name),
+  `ElemNS(uri, local)`/`ElemsNS`, `Find('a/b/c')`; `Attr`, `HasAttr`,
+  `AttrNS(uri, local)`, `AttrCount`/`AttrAt(i)` (name, prefix, local, URI,
+  value, `IsNs` for a declaration), `SetAttr`, `RemoveAttr`; `Text`,
+  `SetText`, `Value` (text, CDATA, comment and PI data, readable and
+  writable); `AddElem(name)` (made, appended and returned), `AddChild`,
+  `InsertChild(i, n)`, `RemoveAt`, `Detach`, `AppendText`, `AppendXml(s)` and
+  `InsertXml(i, s)` (content in XML text, read in the scope of the element,
+  its namespace declarations included); `OuterXml`, `InnerXml`; `Offset` and
+  `ByteLength` in the text it was read from. `TXmlDoc`: `Root`,
+  `Count`/`Item(i)` for the top level (the declaration, comments, the
+  DOCTYPE and the white space between them), `CreateElement`, `CreateText`,
+  `CreateCData`, `CreateComment`, `CreatePI`, `AddTop`, `Xml`, and the
+  declaration's `Encoding`, `Standalone` and `Version`. A node made with
+  `CreateElement('r:id')` gets its namespace from the prefixes in scope
+  where it is put. A node has one parent; `Detach` it to move it. An edit
+  that cannot be made (a name that is no name, a second root, a node put
+  inside itself) raises `EXmlError` with `Offset` -1.
+- **The pull reader.** `TXmlReader.Create(text)` and `Next(tok)` give the
+  tokens one at a time (`xtStart` with `Attrs`, `Trail` and the places of
+  its bytes, `xtEnd` (a tag `<a/>` gives both, the end with `Synth`),
+  `xtText`, `xtCData`, `xtComment`, `xtPI`, `xtDecl`, `xtDoctype`),
+  checking the document as it goes, so a part of any size is read in memory
+  that grows with its depth and its longest token. `SkipElement`,
+  `OpenCount`, `LineColumn`, and the options `Namespaces`, `MaxDepth`
+  (10,000) and `MaxExpansion`. `TXmlReader.CreateFragment(text)` with
+  `Bind(prefix, uri)` reads content, as `AppendXml` does.
+  On a 91 MB sheet the reader takes 1.7 times less than Go's
+  `xml.Decoder.Token` (`scripts/bench/b37xml`).
+- **The writer.** `TXmlWriter`: `Decl`, `Start(name)`, `Attr(name, value)`,
+  `Text`, `CData`, `Comment`, `ProcInst`, `Raw`, `Element(name, text)`,
+  `EndElement` and `Output`; an element with nothing in it is `<a/>`,
+  `Indent` puts each element on a line of its own where no text has been
+  written, and `Raw` XML and text suppress the indentation of their parent.
+  `XmlEscapeText`, `XmlEscapeAttr`, `XmlIsName` and `XmlIsNCName` stand
+  alone.
+- **Routines.** A document that is not edited may be read by any number of
+  routines at once; an edit needs one routine that owns the tree, as a map
+  written does. A reader belongs to the routine that uses it.
+
 `uses sqlite` gives SQLite 3.54.1 in paslang: the library itself, written
 from SQLite's own file format, documents and sources (P403 the file,
 P404 the SQL, 1.1.253 P405 the rest). It is a library unit, as `pasnet`

@@ -76,7 +76,9 @@ PAIRS = ["b1loop", "b2str", "b3spawn", "b4chan", "b5map", "b6smap", "b7narrow", 
          # P205: typed JSON written (JsonEncode of a record against Marshal)
          "b35bind",
          # P206: typed JSON read (JsonDecode into records against Unmarshal)
-         "b36unbind"]
+         "b36unbind",
+         # P426: XML read token by token (TXmlReader.Next against Decoder.Token)
+         "b38xml"]
 # The longest one run may take, in seconds: a run past it is killed, its
 # unit stops being measured and fails (Go's side of every pair takes
 # under 1 s; paslang's append of a character, quadratic until its hito,
@@ -110,6 +112,7 @@ SECTIONS = {
     "b34json": ["parse", "parse1", "compact", "compact1", "pretty", "pretty1", "canonical"],
     "b35bind": ["marshal", "marshal1", "indent", "indent1"],
     "b36unbind": ["unmarshal", "unmarshal1"],
+    "b38xml": ["tokens"],
 }
 CHECKPTR = ["b8ptr"]
 PROBES = ["p1alloccap", "p2deeprec", "p3divzero", "p4nil", "p5bounds", "p6strbounds", "p7parked"]

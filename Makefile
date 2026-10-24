@@ -589,6 +589,9 @@ GOLDEN_A64 += codec zones
 # P445: a closure over a const parameter of every kind, kept past the call.
 GOLDEN += closureconst
 GOLDEN_A64 += closureconst
+# P426: the XML reader against expat on 2672 documents, and the tree's edits.
+GOLDEN += xmlcorpus xmldom
+GOLDEN_A64 += xmlcorpus xmldom
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -623,6 +626,7 @@ LIB_UNITS := \
 	src/rtl/sysutils.paslang \
 	src/lib/argon2.paslang \
 	src/lib/pascodec.paslang \
+	src/lib/pasxml.paslang \
 	src/lib/httpserver.paslang \
 	src/lib/sqlite.paslang
 

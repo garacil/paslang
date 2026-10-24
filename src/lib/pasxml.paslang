@@ -1,0 +1,3659 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+
+  paslang is free software: you can redistribute it and/or modify it
+  under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+
+  paslang is distributed in the hope that it will be useful, but
+  WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+  General Public License for more details.
+
+  Under Section 7 of GPL version 3, you are granted additional
+  permissions described in the paslang Runtime Library Exception,
+  version 1.0, in the file COPYING.RUNTIME.
+
+  You should have received a copy of the GNU General Public License
+  along with paslang.  If not, see <https://www.gnu.org/licenses/>. }
+
+{ XML for a service (P426): a reader that refuses what XML 1.0 (Fifth
+  Edition) and Namespaces in XML 1.0 (Third Edition) call not
+  well-formed, with the line and column; a document tree that keeps the
+  bytes of every node it read, so that a document edited and written
+  back differs from the original only where it was edited; a writer;
+  and escaping. Free of units but sysutils and of state, so any number of
+  routines may use one document or one reader each at once (Regla 11).
+
+  What it takes: UTF-8 (with or without a byte order mark), UTF-16 with
+  a byte order mark or as <? written in either order, and ISO-8859-1
+  when the declaration says so; the two later are turned into UTF-8
+  and written back as UTF-8, with the declaration saying so. Entities:
+  the five of XML, character references and the internal general
+  entities of the DOCTYPE's internal subset, whose replacement text may
+  be text and references but not markup (refused, not misread); an
+  external entity or DTD is never fetched or read, and a reference to
+  one is refused. Default attribute values and the rest of the DTD are
+  read for their well-formedness and then ignored. }
+unit pasxml;
+
+interface
+
+uses
+  sysutils;
+
+const
+  XmlNamespaceXml = 'http://www.w3.org/XML/1998/namespace';
+  XmlNamespaceXmlns = 'http://www.w3.org/2000/xmlns/';
+
+type
+  { a string being built: S is longer than the N bytes written }
+  TXmlBufRec = record
+    S: string;
+    N: Integer;
+  end;
+
+  { Why a read or an edit refused, and where: Offset is the byte from 0,
+    Line and Column count from 1, the column in bytes. The edits that
+    refuse (a name that is no name, a second root) give Offset -1. }
+  EXmlError = class(Exception)
+  public
+    Offset: Integer;
+    Line: Integer;
+    Column: Integer;
+    Reason: string;
+    constructor CreateAt(AOffset, ALine, ACol: Integer; const AReason: string);
+  end;
+
+  TXmlKind = (xkElement, xkText, xkCData, xkComment, xkPI, xkDoctype, xkDecl);
+
+  { An attribute as it was read: its name as written, split at the
+    colon, its value with the references expanded and the white space
+    changed to spaces, the namespace its prefix is bound to (empty for an
+    unprefixed one, and for a declaration), the white space before it
+    and its place in the source. }
+  TXmlAttr = record
+    Name: string;
+    Prefix: string;
+    Local: string;
+    URI: string;
+    Value: string;
+    Lead: string;
+    Quote: Char;
+    IsNs: Boolean;      { xmlns or xmlns:p, a declaration }
+    Changed: Boolean;
+    RawStart: Integer;  { from 1; -1 when made here }
+    RawStop: Integer;   { the byte after it }
+  end;
+  TXmlAttrArray = array of TXmlAttr;
+
+  TXmlTokenKind = (xtStart, xtEnd, xtText, xtCData, xtComment, xtPI, xtDecl, xtDoctype);
+
+  { What a reader gives: a start tag, an end tag (a tag like <a/> gives
+    both, the end with Synth set), text, a CDATA section, a comment, a
+    processing instruction (Name its target, Value its data), the XML
+    declaration or the DOCTYPE. Start and Stop are the bytes of the
+    whole construct, from 1, Stop the byte after; OpenEnd is the byte
+    after a start tag's >. }
+  TXmlToken = record
+    Kind: TXmlTokenKind;
+    Name: string;
+    Prefix: string;
+    Local: string;
+    URI: string;
+    Value: string;
+    Attrs: TXmlAttrArray;
+    Trail: string;      { the white space before > or /> in a start tag }
+    SelfClose: Boolean;
+    Synth: Boolean;
+    Start: Integer;
+    Stop: Integer;
+    OpenEnd: Integer;
+  end;
+
+  { The pull reader: Next gives the tokens of a document one by one and
+    checks it is well-formed as it goes, so a part of any size is read
+    in memory proportional to its depth and its longest token. Create
+    reads a document; CreateFragment reads content, of any number of
+    nodes, in the scope of the bindings given with Bind. }
+  TXmlReader = class
+  private
+    FT: string;
+    FN: Integer;
+    FP: Integer;
+    FBom: Integer;
+    FTranscoded: Boolean;
+    FFragment: Boolean;
+    FSawRoot: Boolean;
+    FSawDoctype: Boolean;
+    FSynth: Boolean;
+    FDepth: Integer;
+    FExpanded: Integer;
+    FEncoding: string;
+    FStandalone: string;
+    FVersion: string;
+    FSName: array of string;
+    FSPrefix: array of string;
+    FSLocal: array of string;
+    FSURI: array of string;
+    FSNs: array of Integer;
+    FNsP: array of string;
+    FNsU: array of string;
+    FNsN: Integer;
+    FEName: array of string;
+    FEVal: array of string;
+    FEExt: array of Boolean;
+    FEN: Integer;
+    procedure Init(const AText: string);
+    procedure Fail(At: Integer; const Why: string);
+    function SkipS: Integer;
+    function Has(const S: string): Boolean;
+    function ReadName: string;
+    procedure CheckChars(AFrom, ATo: Integer);
+    procedure Expand(const Raw: string; At0: Integer; InAttr, Nested: Boolean; Depth: Integer; var B: TXmlBufRec);
+    function EntityIndex(const Nm: string): Integer;
+    procedure ReadCharData(var Tok: TXmlToken);
+    procedure ReadStartTag(var Tok: TXmlToken);
+    procedure ReadEndTag(var Tok: TXmlToken);
+    procedure ReadPI(var Tok: TXmlToken);
+    procedure ReadDecl(var Tok: TXmlToken; St: Integer);
+    procedure Quoted(const Nm: string; var V: string);
+    procedure ReadBang(var Tok: TXmlToken);
+    procedure ReadComment(var Tok: TXmlToken);
+    procedure ReadCData(var Tok: TXmlToken);
+    procedure ReadDoctype(var Tok: TXmlToken);
+    procedure ReadSubset;
+    procedure ReadEntityDecl;
+    procedure ReadLiteral(Pubid: Boolean);
+    procedure ReadCp(Lv: Integer);
+    procedure ReadGroup(Lv: Integer);
+    procedure ReadElementDecl;
+    procedure ReadAttlistDecl;
+    procedure ReadNotationDecl;
+    procedure ReadAttDefault;
+    function ReadNmtoken: string;
+    procedure ScanComment(var VFrom, VTo: Integer);
+    procedure ScanPI(var Tgt: string; var VFrom, VTo: Integer);
+    procedure BindNs(const Prefix, URI: string);
+    function LookupNs(const Prefix: string; var URI: string): Boolean;
+    procedure PushElem(const Nm, Pfx, Loc, Uri: string; Mark: Integer);
+    procedure PopElem;
+    procedure MakeEnd(var Tok: TXmlToken; Synth: Boolean);
+  public
+    Namespaces: Boolean;     { resolve prefixes (the default), else a name is a name }
+    MaxDepth: Integer;       { the deepest nesting a read takes: 10000 }
+    MaxExpansion: Integer;   { the most bytes the entities of a document may expand to: 16 MiB }
+    constructor Create(const AText: string);
+    constructor CreateFragment(const AText: string);
+    { binds Prefix ('' the default namespace) to URI for a fragment }
+    procedure Bind(const Prefix, URI: string);
+    { the next token; False at the end of a document that is well-formed;
+      EXmlError for what is not }
+    function Next(var Tok: TXmlToken): Boolean;
+    { after a start token, reads on to its end tag, whatever lies between }
+    procedure SkipElement;
+    { the open elements }
+    function OpenCount: Integer;
+    { the line and column of the byte at offset Off (from 0) }
+    procedure LineColumn(Off: Integer; var ALine, ACol: Integer);
+    { the text as it is read: UTF-8, as it is when the source was UTF-8 }
+    function Source: string;
+    function BomLength: Integer;
+    { the declaration's encoding and standalone, as written, and whether
+      the source was turned into UTF-8 }
+    property Encoding: string read FEncoding;
+    property Standalone: string read FStandalone;
+    property Version: string read FVersion;
+    property Transcoded: Boolean read FTranscoded;
+  end;
+
+  TXmlDoc = class;
+  TXmlNode = class;
+  TXmlNodeArray = array of TXmlNode;
+
+  { A node of a document: an element, text, CDATA, a comment, a
+    processing instruction, the DOCTYPE or the declaration. A node that
+    was read knows its bytes; one that is changed, and every element
+    above it, is written again as far as it changed, and the rest is
+    copied as it was. Z-fields are the tree's own and are not written. }
+  TXmlNode = class
+  public
+    Kind: TXmlKind;
+    Name: string;       { as written: a:b; a PI's target; a DOCTYPE's root }
+    Prefix: string;
+    Local: string;
+    URI: string;
+    Parent: TXmlNode;
+    Doc: TXmlDoc;
+    ZValue: string;
+    ZAttrs: TXmlAttrArray;
+    ZKids: TXmlNodeArray;
+    ZCount: Integer;
+    ZSrc: string;
+    ZStart: Integer;
+    ZStop: Integer;
+    ZOpenEnd: Integer;
+    ZCloseStart: Integer;
+    ZTrail: string;
+    ZDirty: Boolean;
+    ZHead: Boolean;
+    ZChanged: Boolean;
+    ZNew: Boolean;
+    function GetValue: string;
+    procedure SetValue(const S: string);
+    { text, CDATA, a comment, a PI's data: the text; changing it writes the
+      node again, escaped }
+    property Value: string read GetValue write SetValue;
+    { all the text of an element's descendants, as DOM's textContent;
+      SetText replaces them by one text node (none for '') }
+    function Text: string;
+    procedure SetText(const S: string);
+    { the children, all kinds }
+    function Count: Integer;
+    function Item(I: Integer): TXmlNode;
+    function IndexInParent: Integer;
+    { the first element child with that local name (or, with a colon in
+      it, that qualified name), and with that namespace and local name;
+      nil when none }
+    function Elem(const Nm: string): TXmlNode;
+    function ElemNS(const AUri, ALocal: string): TXmlNode;
+    function Elems(const Nm: string): TXmlNodeArray;
+    function ElemsNS(const AUri, ALocal: string): TXmlNodeArray;
+    { the element reached by names joined with /, each the first child
+      of that name; Self for ''; nil when one is missing }
+    function Find(const Path: string): TXmlNode;
+    { attributes; a name with a colon is the qualified name }
+    function AttrCount: Integer;
+    function AttrAt(I: Integer): TXmlAttr;
+    function AttrIndex(const Nm: string): Integer;
+    function HasAttr(const Nm: string): Boolean;
+    function Attr(const Nm: string): string;
+    function AttrNS(const AUri, ALocal: string): string;
+    procedure SetAttr(const Nm, AValue: string);
+    procedure RemoveAttr(const Nm: string);
+    { changes to the tree; a node has one parent }
+    procedure AddChild(N: TXmlNode);
+    procedure InsertChild(Index: Integer; N: TXmlNode);
+    procedure RemoveAt(Index: Integer);
+    procedure Detach;
+    procedure AppendText(const S: string);
+    function AddElem(const Nm: string): TXmlNode;
+    { content in XML text, read in this element's scope and put in as it
+      is written: AppendXml('<c r="A1"><v>1</v></c>') }
+    procedure AppendXml(const Fragment: string);
+    procedure InsertXml(Index: Integer; const Fragment: string);
+    { the node written: its outer XML, and an element's content }
+    function OuterXml: string;
+    function InnerXml: string;
+    { where the node began in the source it was read from (from 0, -1 for
+      one made here) and how many bytes it took }
+    function Offset: Integer;
+    function ByteLength: Integer;
+  end;
+
+  { A document: what was read, in order, the root among them. }
+  TXmlDoc = class
+  public
+    Root: TXmlNode;
+    ZKids: TXmlNodeArray;
+    ZCount: Integer;
+    ZSrc: string;
+    ZBom: Integer;
+    ZDirty: Boolean;
+    ZNamespaces: Boolean;
+    FEncoding: string;
+    FStandalone: string;
+    FVersion: string;
+    constructor Create;
+    function CreateElement(const Nm: string): TXmlNode;
+    function CreateText(const S: string): TXmlNode;
+    function CreateCData(const S: string): TXmlNode;
+    function CreateComment(const S: string): TXmlNode;
+    function CreatePI(const ATarget, AData: string): TXmlNode;
+    { puts a node at the end of the top level: the root of a document made
+      here, a comment before or after it }
+    procedure AddTop(N: TXmlNode);
+    { the top level nodes: the declaration, comments, the DOCTYPE, the
+      root and the white space between them }
+    function Count: Integer;
+    function Item(I: Integer): TXmlNode;
+    { the document written; as it was read when nothing changed }
+    function Xml: string;
+    property Encoding: string read FEncoding;
+    property Standalone: string read FStandalone;
+    property Version: string read FVersion;
+  end;
+
+{ A document read, or EXmlError. XmlParse takes names with prefixes as
+  Namespaces in XML does; XmlParseFlat leaves them alone. }
+function XmlParse(const S: string): TXmlDoc;
+function XmlParseFlat(const S: string): TXmlDoc;
+{ False and the reason (with line and column) instead of an exception }
+function XmlTryParse(const S: string; out Doc: TXmlDoc; out Err: string): Boolean;
+
+{ Escaping: text keeps its quotes, an attribute value is for double
+  quotes; the characters XML does not allow become U+FFFD, as Go's
+  EscapeText makes them; a CR is written as a reference so a reader
+  gives it back. }
+function XmlEscapeText(const S: string): string;
+function XmlEscapeAttr(const S: string): string;
+{ Whether Nm is an XML Name (and, with NCName, has no colon) }
+function XmlIsName(const Nm: string): Boolean;
+function XmlIsNCName(const Nm: string): Boolean;
+
+type
+  { A document written as it is made, to a string. Start leaves the tag
+    open for Attr until something else is written; an element with
+    nothing in it is written <a/>. With Indent set, each element and
+    comment goes on a line of its own, Indent as many times as it is
+    deep, where no text has been written in its parent. }
+  TXmlWriter = class
+  private
+    FS: string;
+    FN: Integer;
+    FOpen: Boolean;
+    FNames: array of string;
+    FKids: array of Integer;   { 0 nothing, 1 elements, 2 text }
+    FD: Integer;
+    FWritten: Boolean;
+    procedure Put(const S: string);
+    procedure CloseOpen;
+    procedure Newline(Level: Integer);
+  public
+    Indent: string;
+    constructor Create;
+    { <?xml version="1.0" encoding="UTF-8"?> and a line feed; Standalone '' leaves it out }
+    procedure Decl(const AStandalone: string);
+    procedure Start(const Nm: string);
+    procedure Attr(const Nm, AValue: string);
+    procedure Text(const S: string);
+    procedure CData(const S: string);
+    procedure Comment(const S: string);
+    procedure ProcInst(const ATarget, AData: string);
+    { already XML, put in as it is }
+    procedure Raw(const S: string);
+    procedure EndElement;
+    { an element with only text: Start, Text, EndElement }
+    procedure Element(const Nm, AText: string);
+    { the text so far; every element must be ended }
+    function Output: string;
+  end;
+
+implementation
+
+procedure BufGrow(var B: TXmlBufRec; Need: Integer);
+var
+  c: Integer;
+begin
+  if B.N + Need > Length(B.S) then
+  begin
+    c := Length(B.S) * 2;
+    if c < B.N + Need then
+      c := B.N + Need;
+    if c < 64 then
+      c := 64;
+    SetLength(B.S, c);
+  end;
+end;
+
+procedure BufChar(var B: TXmlBufRec; C: Integer);
+begin
+  BufGrow(B, 1);
+  B.N := B.N + 1;
+  B.S[B.N] := Chr(C);
+end;
+
+procedure BufStr(var B: TXmlBufRec; const X: string);
+var
+  k: Integer;
+begin
+  k := Length(X);
+  if k = 0 then
+    Exit;
+  BufGrow(B, k);
+  Move(X[1], B.S[B.N + 1], k);
+  B.N := B.N + k;
+end;
+
+{ Count bytes of X from index From (1-based) }
+procedure BufRange(var B: TXmlBufRec; const X: string; From, Count: Integer);
+begin
+  if Count <= 0 then
+    Exit;
+  BufGrow(B, Count);
+  Move(X[From], B.S[B.N + 1], Count);
+  B.N := B.N + Count;
+end;
+
+procedure BufUtf8(var B: TXmlBufRec; CP: Integer);
+begin
+  if CP < $80 then
+    BufChar(B, CP)
+  else if CP < $800 then
+  begin
+    BufChar(B, $C0 or (CP shr 6));
+    BufChar(B, $80 or (CP and $3F));
+  end
+  else if CP < $10000 then
+  begin
+    BufChar(B, $E0 or (CP shr 12));
+    BufChar(B, $80 or ((CP shr 6) and $3F));
+    BufChar(B, $80 or (CP and $3F));
+  end
+  else
+  begin
+    BufChar(B, $F0 or (CP shr 18));
+    BufChar(B, $80 or ((CP shr 12) and $3F));
+    BufChar(B, $80 or ((CP shr 6) and $3F));
+    BufChar(B, $80 or (CP and $3F));
+  end;
+end;
+
+function BufResult(var B: TXmlBufRec): string;
+begin
+  Result := Copy(B.S, 1, B.N);
+end;
+
+{ ---- characters ---- }
+
+function XmlIsSpace(C: Integer): Boolean;
+begin
+  Result := (C = 32) or (C = 9) or (C = 10) or (C = 13);
+end;
+
+{ XML 1.0 (Fifth Edition) 2.2: the characters a document may hold }
+function XmlIsChar(C: Integer): Boolean;
+begin
+  Result := (C = 9) or (C = 10) or (C = 13) or ((C >= $20) and (C <= $D7FF)) or
+    ((C >= $E000) and (C <= $FFFD)) or ((C >= $10000) and (C <= $10FFFF));
+end;
+
+{ 2.3: NameStartChar, the colon among them }
+function XmlNameStart(C: Integer): Boolean;
+begin
+  if C < $80 then
+    Result := ((C >= 97) and (C <= 122)) or ((C >= 65) and (C <= 90)) or (C = 95) or (C = 58)
+  else
+    Result := ((C >= $C0) and (C <= $D6)) or ((C >= $D8) and (C <= $F6)) or ((C >= $F8) and (C <= $2FF)) or
+      ((C >= $370) and (C <= $37D)) or ((C >= $37F) and (C <= $1FFF)) or ((C >= $200C) and (C <= $200D)) or
+      ((C >= $2070) and (C <= $218F)) or ((C >= $2C00) and (C <= $2FEF)) or ((C >= $3001) and (C <= $D7FF)) or
+      ((C >= $F900) and (C <= $FDCF)) or ((C >= $FDF0) and (C <= $FFFD)) or ((C >= $10000) and (C <= $EFFFF));
+end;
+
+function XmlNameChar(C: Integer): Boolean;
+begin
+  if C < $80 then
+    Result := XmlNameStart(C) or ((C >= 48) and (C <= 57)) or (C = 45) or (C = 46)
+  else
+    Result := XmlNameStart(C) or (C = $B7) or ((C >= $300) and (C <= $36F)) or ((C >= $203F) and (C <= $2040));
+end;
+
+{ The code point at index I of T (N bytes) and its length; False for
+  what is not UTF-8 (a lead byte alone, overlong, a surrogate, past
+  U+10FFFF) }
+function XmlDecode(const T: string; I, N: Integer; var CP, L: Integer): Boolean;
+var
+  b0, b1, b2, b3: Integer;
+begin
+  b0 := Ord(T[I]);
+  CP := b0;
+  L := 1;
+  Result := False;
+  if b0 < $80 then
+  begin
+    Result := True;
+    Exit;
+  end;
+  if b0 < $C2 then
+    Exit;
+  if b0 < $E0 then
+  begin
+    if I + 1 > N then
+      Exit;
+    b1 := Ord(T[I + 1]);
+    if (b1 and $C0) <> $80 then
+      Exit;
+    CP := ((b0 and $1F) shl 6) or (b1 and $3F);
+    L := 2;
+    Result := True;
+    Exit;
+  end;
+  if b0 < $F0 then
+  begin
+    if I + 2 > N then
+      Exit;
+    b1 := Ord(T[I + 1]);
+    b2 := Ord(T[I + 2]);
+    if ((b1 and $C0) <> $80) or ((b2 and $C0) <> $80) then
+      Exit;
+    CP := ((b0 and $0F) shl 12) or ((b1 and $3F) shl 6) or (b2 and $3F);
+    if (CP < $800) or ((CP >= $D800) and (CP <= $DFFF)) then
+      Exit;
+    L := 3;
+    Result := True;
+    Exit;
+  end;
+  if b0 < $F5 then
+  begin
+    if I + 3 > N then
+      Exit;
+    b1 := Ord(T[I + 1]);
+    b2 := Ord(T[I + 2]);
+    b3 := Ord(T[I + 3]);
+    if ((b1 and $C0) <> $80) or ((b2 and $C0) <> $80) or ((b3 and $C0) <> $80) then
+      Exit;
+    CP := ((b0 and $07) shl 18) or ((b1 and $3F) shl 12) or ((b2 and $3F) shl 6) or (b3 and $3F);
+    if (CP < $10000) or (CP > $10FFFF) then
+      Exit;
+    L := 4;
+    Result := True;
+  end;
+end;
+
+function XmlHexVal(C: Integer): Integer;
+begin
+  if (C >= 48) and (C <= 57) then
+    Result := C - 48
+  else if (C >= 97) and (C <= 102) then
+    Result := C - 87
+  else if (C >= 65) and (C <= 70) then
+    Result := C - 55
+  else
+    Result := -1;
+end;
+
+{ ---- the error ---- }
+
+constructor EXmlError.CreateAt(AOffset, ALine, ACol: Integer; const AReason: string);
+begin
+  if AOffset >= 0 then
+    inherited Create('XML syntax error on line ' + IntToStr(ALine) + ', column ' + IntToStr(ACol) + ': ' + AReason)
+  else
+    inherited Create('XML: ' + AReason);
+  Offset := AOffset;
+  Line := ALine;
+  Column := ACol;
+  Reason := AReason;
+end;
+
+function XmlLower(const S: string): string;
+var
+  i, c: Integer;
+begin
+  Result := S;
+  for i := 1 to Length(S) do
+  begin
+    c := Ord(S[i]);
+    if (c >= 65) and (c <= 90) then
+      Result[i] := Chr(c + 32);
+  end;
+end;
+
+function XmlNameOk(const Nm: string; NoColon: Boolean): Boolean;
+var
+  i, c, l, n: Integer;
+begin
+  Result := False;
+  n := Length(Nm);
+  if n = 0 then
+    Exit;
+  i := 1;
+  while i <= n do
+  begin
+    if not XmlDecode(Nm, i, n, c, l) then
+      Exit;
+    if NoColon and (c = 58) then
+      Exit;
+    if i = 1 then
+    begin
+      if not XmlNameStart(c) then
+        Exit;
+    end
+    else if not XmlNameChar(c) then
+      Exit;
+    i := i + l;
+  end;
+  Result := True;
+end;
+
+function XmlIsName(const Nm: string): Boolean;
+begin
+  Result := XmlNameOk(Nm, False);
+end;
+
+function XmlIsNCName(const Nm: string): Boolean;
+begin
+  Result := XmlNameOk(Nm, True);
+end;
+
+{ ---- UTF-16 and ISO-8859-1 into UTF-8 ---- }
+
+function XmlFromUtf16(const T: string; From: Integer; Big: Boolean): string;
+var
+  n, i, u, u2: Integer;
+  B: TXmlBufRec;
+begin
+  n := Length(T);
+  i := From;
+  B.N := 0;
+  SetLength(B.S, 0);
+  while i + 1 <= n do
+  begin
+    if Big then
+      u := (Ord(T[i]) shl 8) or Ord(T[i + 1])
+    else
+      u := Ord(T[i]) or (Ord(T[i + 1]) shl 8);
+    i := i + 2;
+    if (u >= $D800) and (u <= $DBFF) then
+    begin
+      if i + 1 > n then
+        raise EXmlError.CreateAt(i - 3, 1, 1, 'UTF-16 text ends inside a surrogate pair');
+      if Big then
+        u2 := (Ord(T[i]) shl 8) or Ord(T[i + 1])
+      else
+        u2 := Ord(T[i]) or (Ord(T[i + 1]) shl 8);
+      if (u2 < $DC00) or (u2 > $DFFF) then
+        raise EXmlError.CreateAt(i - 3, 1, 1, 'UTF-16 text has a lone surrogate');
+      i := i + 2;
+      u := $10000 + ((u - $D800) shl 10) + (u2 - $DC00);
+    end
+    else if (u >= $DC00) and (u <= $DFFF) then
+      raise EXmlError.CreateAt(i - 3, 1, 1, 'UTF-16 text has a lone surrogate');
+    BufUtf8(B, u);
+  end;
+  if i <= n then
+    raise EXmlError.CreateAt(i - 1, 1, 1, 'UTF-16 text has an odd number of bytes');
+  Result := BufResult(B);
+end;
+
+function XmlFromLatin1(const T: string): string;
+var
+  i, c: Integer;
+  B: TXmlBufRec;
+begin
+  B.N := 0;
+  SetLength(B.S, Length(T) + Length(T) div 8 + 16);
+  for i := 1 to Length(T) do
+  begin
+    c := Ord(T[i]);
+    if c < $80 then
+      BufChar(B, c)
+    else
+      BufUtf8(B, c);
+  end;
+  Result := BufResult(B);
+end;
+
+{ ---- the reader ---- }
+
+constructor TXmlReader.Create(const AText: string);
+begin
+  Namespaces := True;
+  MaxDepth := 10000;
+  MaxExpansion := 16 * 1024 * 1024;
+  FFragment := False;
+  Init(AText);
+end;
+
+constructor TXmlReader.CreateFragment(const AText: string);
+begin
+  Namespaces := True;
+  MaxDepth := 10000;
+  MaxExpansion := 16 * 1024 * 1024;
+  FFragment := True;
+  FT := AText;
+  FN := Length(FT);
+  FP := 1;
+  FBom := 0;
+  FNsN := 0;
+  FDepth := 0;
+  FEN := 0;
+end;
+
+procedure TXmlReader.Init(const AText: string);
+var
+  t, enc: string;
+  n, i, j, q: Integer;
+begin
+  t := AText;
+  n := Length(t);
+  FBom := 0;
+  FTranscoded := False;
+  if (n >= 3) and (Ord(t[1]) = $EF) and (Ord(t[2]) = $BB) and (Ord(t[3]) = $BF) then
+    FBom := 3
+  else if (n >= 2) and (Ord(t[1]) = $FF) and (Ord(t[2]) = $FE) then
+  begin
+    t := XmlFromUtf16(t, 3, False);
+    FTranscoded := True;
+    FEncoding := 'UTF-16';
+  end
+  else if (n >= 2) and (Ord(t[1]) = $FE) and (Ord(t[2]) = $FF) then
+  begin
+    t := XmlFromUtf16(t, 3, True);
+    FTranscoded := True;
+    FEncoding := 'UTF-16';
+  end
+  else if (n >= 4) and (t[1] = '<') and (Ord(t[2]) = 0) and (t[3] = '?') and (Ord(t[4]) = 0) then
+  begin
+    t := XmlFromUtf16(t, 1, False);
+    FTranscoded := True;
+  end
+  else if (n >= 4) and (Ord(t[1]) = 0) and (t[2] = '<') and (Ord(t[3]) = 0) and (t[4] = '?') then
+  begin
+    t := XmlFromUtf16(t, 1, True);
+    FTranscoded := True;
+  end
+  else if (n >= 5) and (Copy(t, 1, 5) = '<?xml') then
+  begin
+    { an ISO-8859-1 declaration: the bytes above 127 are letters, not UTF-8 }
+    i := Pos('?>', t);
+    if i > 0 then
+    begin
+      j := Pos('encoding', Copy(t, 1, i));
+      if j > 0 then
+      begin
+        j := j + 8;
+        while (j < i) and XmlIsSpace(Ord(t[j])) do
+          j := j + 1;
+        if (j < i) and (t[j] = '=') then
+        begin
+          j := j + 1;
+          while (j < i) and XmlIsSpace(Ord(t[j])) do
+            j := j + 1;
+          if (j < i) and ((t[j] = '"') or (t[j] = '''')) then
+          begin
+            q := j + 1;
+            while (q < i) and (t[q] <> t[j]) do
+              q := q + 1;
+            enc := XmlLower(Copy(t, j + 1, q - j - 1));
+            if (enc = 'iso-8859-1') or (enc = 'latin1') or (enc = 'iso_8859-1') or (enc = 'l1') then
+            begin
+              t := XmlFromLatin1(t);
+              FTranscoded := True;
+            end;
+          end;
+        end;
+      end;
+    end;
+  end;
+  FT := t;
+  FN := Length(t);
+  FP := FBom + 1;
+  FNsN := 0;
+  FDepth := 0;
+  FEN := 0;
+end;
+
+procedure TXmlReader.LineColumn(Off: Integer; var ALine, ACol: Integer);
+var
+  i, ls: Integer;
+begin
+  ALine := 1;
+  ls := 0;
+  i := 0;
+  while (i < Off) and (i < FN) do
+  begin
+    if FT[i + 1] = #10 then
+    begin
+      ALine := ALine + 1;
+      ls := i + 1;
+    end
+    else if (FT[i + 1] = #13) and ((i + 2 > FN) or (FT[i + 2] <> #10)) then
+    begin
+      ALine := ALine + 1;
+      ls := i + 1;
+    end;
+    i := i + 1;
+  end;
+  ACol := Off - ls + 1;
+end;
+
+{ At is a byte from 1 }
+procedure TXmlReader.Fail(At: Integer; const Why: string);
+var
+  l, c: Integer;
+begin
+  if At < 1 then
+    At := 1;
+  if At > FN + 1 then
+    At := FN + 1;
+  LineColumn(At - 1, l, c);
+  raise EXmlError.CreateAt(At - 1, l, c, Why);
+end;
+
+function TXmlReader.Source: string;
+begin
+  Result := FT;
+end;
+
+function TXmlReader.BomLength: Integer;
+begin
+  Result := FBom;
+end;
+
+function TXmlReader.OpenCount: Integer;
+begin
+  Result := FDepth;
+end;
+
+function TXmlReader.SkipS: Integer;
+var
+  st: Integer;
+begin
+  st := FP;
+  while (FP <= FN) and XmlIsSpace(Ord(FT[FP])) do
+    FP := FP + 1;
+  Result := FP - st;
+end;
+
+function TXmlReader.Has(const S: string): Boolean;
+var
+  k: Integer;
+begin
+  k := Length(S);
+  Result := (FP + k - 1 <= FN) and (Copy(FT, FP, k) = S);
+end;
+
+function TXmlReader.ReadName: string;
+var
+  st, i, c, l: Integer;
+  first, stop: Boolean;
+begin
+  st := FP;
+  i := FP;
+  first := True;
+  stop := False;
+  while (i <= FN) and (not stop) do
+  begin
+    c := Ord(FT[i]);
+    l := 1;
+    if c < 128 then
+    begin
+      if ((c >= 97) and (c <= 122)) or ((c >= 65) and (c <= 90)) or (c = 95) or (c = 58) then
+        l := 1
+      else if (not first) and (((c >= 48) and (c <= 57)) or (c = 45) or (c = 46)) then
+        l := 1
+      else
+        stop := True;
+    end
+    else
+    begin
+      if not XmlDecode(FT, i, FN, c, l) then
+        Fail(i, 'invalid UTF-8');
+      if first then
+        stop := not XmlNameStart(c)
+      else
+        stop := not XmlNameChar(c);
+    end;
+    if not stop then
+    begin
+      i := i + l;
+      first := False;
+    end;
+  end;
+  if i = st then
+    Fail(st, 'expected a name');
+  Result := Copy(FT, st, i - st);
+  FP := i;
+end;
+
+{ every character of bytes AFrom to ATo - 1 is one XML allows }
+procedure TXmlReader.CheckChars(AFrom, ATo: Integer);
+var
+  i, c, l: Integer;
+begin
+  i := AFrom;
+  while i < ATo do
+  begin
+    c := Ord(FT[i]);
+    if c < 128 then
+    begin
+      if (c < 32) and (c <> 9) and (c <> 10) and (c <> 13) then
+        Fail(i, 'illegal character code ' + IntToStr(c));
+      i := i + 1;
+    end
+    else
+    begin
+      if not XmlDecode(FT, i, FN, c, l) then
+        Fail(i, 'invalid UTF-8');
+      if not XmlIsChar(c) then
+        Fail(i, 'illegal character code U+' + IntToStr(c));
+      i := i + l;
+    end;
+  end;
+end;
+
+function TXmlReader.EntityIndex(const Nm: string): Integer;
+var
+  i: Integer;
+begin
+  Result := -1;
+  for i := 0 to FEN - 1 do
+    if FEName[i] = Nm then
+    begin
+      Result := i;
+      Exit;
+    end;
+end;
+
+{ Raw with its references expanded and its line ends made one (in an
+  attribute value, its white space made spaces): Raw begins at byte At0
+  of the text, or is the replacement text of an entity (Nested), where
+  an error is put at the reference. }
+procedure TXmlReader.Expand(const Raw: string; At0: Integer; InAttr, Nested: Boolean; Depth: Integer;
+  var B: TXmlBufRec);
+var
+  i, n, j, k, c, code, st, errAt: Integer;
+  nm: string;
+  ishex: Boolean;
+begin
+  n := Length(Raw);
+  i := 1;
+  while i <= n do
+  begin
+    if Nested then
+      errAt := At0
+    else
+      errAt := At0 + i - 1;
+    c := Ord(Raw[i]);
+    if c = 38 then
+    begin
+      j := i + 1;
+      if (j <= n) and (Raw[j] = '#') then
+      begin
+        j := j + 1;
+        code := 0;
+        ishex := (j <= n) and (Raw[j] = 'x');
+        if ishex then
+          j := j + 1;
+        st := j;
+        while j <= n do
+        begin
+          if ishex then
+            k := XmlHexVal(Ord(Raw[j]))
+          else if (Raw[j] >= '0') and (Raw[j] <= '9') then
+            k := Ord(Raw[j]) - 48
+          else
+            k := -1;
+          if k < 0 then
+            Break;
+          if ishex then
+            code := code * 16 + k
+          else
+            code := code * 10 + k;
+          if code > $110000 then
+            code := $110000;
+          j := j + 1;
+        end;
+        if (j = st) or (j > n) or (Raw[j] <> ';') then
+          Fail(errAt, 'invalid character reference');
+        if not XmlIsChar(code) then
+          Fail(errAt, 'illegal character code U+' + IntToStr(code) + ' in a reference');
+        BufUtf8(B, code);
+        i := j + 1;
+      end
+      else
+      begin
+        k := j;
+        while (k <= n) and (Raw[k] <> ';') and (Raw[k] <> '&') and (Raw[k] <> '<') and (not XmlIsSpace(Ord(Raw[k]))) do
+          k := k + 1;
+        if (k > n) or (Raw[k] <> ';') then
+          Fail(errAt, 'invalid entity reference: expected ;');
+        nm := Copy(Raw, j, k - j);
+        if not XmlIsName(nm) then
+          Fail(errAt, 'invalid entity name');
+        if nm = 'lt' then
+          BufChar(B, 60)
+        else if nm = 'gt' then
+          BufChar(B, 62)
+        else if nm = 'amp' then
+          BufChar(B, 38)
+        else if nm = 'apos' then
+          BufChar(B, 39)
+        else if nm = 'quot' then
+          BufChar(B, 34)
+        else
+        begin
+          code := EntityIndex(nm);
+          if code < 0 then
+            Fail(errAt, 'undeclared entity &' + nm + ';');
+          if FEExt[code] then
+            Fail(errAt, 'reference to the external entity &' + nm + ';');
+          if Depth >= 20 then
+            Fail(errAt, 'entities nested too deep (a loop?) at &' + nm + ';');
+          FExpanded := FExpanded + Length(FEVal[code]);
+          if FExpanded > MaxExpansion then
+            Fail(errAt, 'the entities expand to more than MaxExpansion bytes');
+          if Pos('<', FEVal[code]) > 0 then
+          begin
+            if InAttr then
+              Fail(errAt, '< in the value of an attribute, through &' + nm + ';')
+            else
+              Fail(errAt, 'the entity &' + nm + '; holds markup, which is not read');
+          end;
+          Expand(FEVal[code], errAt, InAttr, True, Depth + 1, B);
+        end;
+        i := k + 1;
+      end;
+    end
+    else if c = 13 then
+    begin
+      if (i < n) and (Raw[i + 1] = #10) then
+        i := i + 1;
+      if InAttr then
+        BufChar(B, 32)
+      else
+        BufChar(B, 10);
+      i := i + 1;
+    end
+    else if InAttr and ((c = 9) or (c = 10)) then
+    begin
+      BufChar(B, 32);
+      i := i + 1;
+    end
+    else
+    begin
+      j := i;
+      while (j <= n) and (Raw[j] <> '&') and (Raw[j] <> #13) and ((not InAttr) or ((Raw[j] <> #9) and (Raw[j] <> #10))) do
+        j := j + 1;
+      BufRange(B, Raw, i, j - i);
+      i := j;
+    end;
+  end;
+end;
+
+procedure TXmlReader.ReadCharData(var Tok: TXmlToken);
+var
+  st, i, c, l, j: Integer;
+  amp, cr: Boolean;
+  raw: string;
+  B: TXmlBufRec;
+begin
+  st := FP;
+  i := FP;
+  amp := False;
+  cr := False;
+  while i <= FN do
+  begin
+    c := Ord(FT[i]);
+    if c = 60 then
+      Break;
+    if c < 128 then
+    begin
+      if c = 38 then
+        amp := True
+      else if c = 13 then
+        cr := True
+      else if c = 93 then
+      begin
+        if (i + 2 <= FN) and (FT[i + 1] = ']') and (FT[i + 2] = '>') then
+          Fail(i, '"]]>" is not allowed in character data');
+      end
+      else if (c < 32) and (c <> 9) and (c <> 10) then
+        Fail(i, 'illegal character code ' + IntToStr(c));
+      i := i + 1;
+    end
+    else
+    begin
+      if not XmlDecode(FT, i, FN, c, l) then
+        Fail(i, 'invalid UTF-8');
+      if not XmlIsChar(c) then
+        Fail(i, 'illegal character code U+' + IntToStr(c));
+      i := i + l;
+    end;
+  end;
+  if (FDepth = 0) and (not FFragment) then
+  begin
+    for j := st to i - 1 do
+      if not XmlIsSpace(Ord(FT[j])) then
+      begin
+        if FSawRoot then
+          Fail(j, 'junk after the document element')
+        else
+          Fail(j, 'text before the root element');
+      end;
+  end;
+  Tok.Kind := xtText;
+  Tok.Start := st;
+  Tok.Stop := i;
+  if amp or cr then
+  begin
+    raw := Copy(FT, st, i - st);
+    B.N := 0;
+    SetLength(B.S, Length(raw) + 16);
+    Expand(raw, st, False, False, 0, B);
+    Tok.Value := BufResult(B);
+  end
+  else
+    Tok.Value := Copy(FT, st, i - st);
+  FP := i;
+end;
+
+{ ---- namespaces ---- }
+
+procedure TXmlReader.BindNs(const Prefix, URI: string);
+begin
+  if FNsN >= Length(FNsP) then
+  begin
+    SetLength(FNsP, FNsN * 2 + 8);
+    SetLength(FNsU, FNsN * 2 + 8);
+  end;
+  FNsP[FNsN] := Prefix;
+  FNsU[FNsN] := URI;
+  FNsN := FNsN + 1;
+end;
+
+procedure TXmlReader.Bind(const Prefix, URI: string);
+begin
+  BindNs(Prefix, URI);
+end;
+
+function TXmlReader.LookupNs(const Prefix: string; var URI: string): Boolean;
+var
+  i: Integer;
+begin
+  Result := True;
+  if Prefix = 'xml' then
+  begin
+    URI := XmlNamespaceXml;
+    Exit;
+  end;
+  for i := FNsN - 1 downto 0 do
+    if FNsP[i] = Prefix then
+    begin
+      URI := FNsU[i];
+      Exit;
+    end;
+  URI := '';
+  Result := (Prefix = '');
+end;
+
+procedure TXmlReader.PushElem(const Nm, Pfx, Loc, Uri: string; Mark: Integer);
+begin
+  if FDepth >= Length(FSName) then
+  begin
+    SetLength(FSName, FDepth * 2 + 16);
+    SetLength(FSPrefix, FDepth * 2 + 16);
+    SetLength(FSLocal, FDepth * 2 + 16);
+    SetLength(FSURI, FDepth * 2 + 16);
+    SetLength(FSNs, FDepth * 2 + 16);
+  end;
+  FSName[FDepth] := Nm;
+  FSPrefix[FDepth] := Pfx;
+  FSLocal[FDepth] := Loc;
+  FSURI[FDepth] := Uri;
+  FSNs[FDepth] := Mark;
+  FDepth := FDepth + 1;
+end;
+
+procedure TXmlReader.PopElem;
+begin
+  FDepth := FDepth - 1;
+  FNsN := FSNs[FDepth];
+end;
+
+procedure TXmlReader.MakeEnd(var Tok: TXmlToken; Synth: Boolean);
+var
+  d: Integer;
+begin
+  d := FDepth - 1;
+  Tok.Kind := xtEnd;
+  Tok.Name := FSName[d];
+  Tok.Prefix := FSPrefix[d];
+  Tok.Local := FSLocal[d];
+  Tok.URI := FSURI[d];
+  Tok.Synth := Synth;
+end;
+
+{ splits a name at its colon, for Namespaces in XML: at most one, and a
+  name on each side }
+procedure XmlSplit(const Nm: string; var Pfx, Loc: string; var Bad: Boolean);
+var
+  i, c: Integer;
+begin
+  Bad := False;
+  Pfx := '';
+  Loc := Nm;
+  c := 0;
+  for i := 1 to Length(Nm) do
+    if Nm[i] = ':' then
+      c := c + 1;
+  if c = 0 then
+    Exit;
+  if c > 1 then
+  begin
+    Bad := True;
+    Exit;
+  end;
+  i := Pos(':', Nm);
+  if (i = 1) or (i = Length(Nm)) then
+  begin
+    Bad := True;
+    Exit;
+  end;
+  Pfx := Copy(Nm, 1, i - 1);
+  Loc := Copy(Nm, i + 1, Length(Nm) - i);
+  { the part after the colon must start as a name does, without a colon }
+  Bad := not XmlIsNCName(Pfx) or not XmlIsNCName(Loc);
+end;
+
+procedure TXmlReader.ReadStartTag(var Tok: TXmlToken);
+var
+  st, ws, i, j, q, na, mark, c, l, as_, k: Integer;
+  nm, pfx, loc, uri, an, raw, trail, lead: string;
+  quote: Char;
+  bad, amp, ctl: Boolean;
+  B: TXmlBufRec;
+  a: TXmlAttr;
+begin
+  if FSawRoot and (FDepth = 0) and (not FFragment) then
+    Fail(FP, 'junk after the document element');
+  if FDepth >= MaxDepth then
+    Fail(FP, 'elements nested deeper than MaxDepth');
+  st := FP;
+  FP := FP + 1;
+  nm := ReadName;
+  SetLength(Tok.Attrs, 0);
+  na := 0;
+  trail := '';
+  while True do
+  begin
+    as_ := FP;
+    ws := SkipS;
+    if FP > FN then
+      Fail(FN, 'unexpected end of input in a start tag');
+    if FT[FP] = '>' then
+    begin
+      trail := Copy(FT, as_, FP - as_);
+      Tok.SelfClose := False;
+      FP := FP + 1;
+      Break;
+    end;
+    if (FT[FP] = '/') then
+    begin
+      if (FP + 1 <= FN) and (FT[FP + 1] = '>') then
+      begin
+        trail := Copy(FT, as_, FP - as_);
+        Tok.SelfClose := True;
+        FP := FP + 2;
+        Break;
+      end;
+      Fail(FP, 'expected > after / in a start tag');
+    end;
+    if ws = 0 then
+      Fail(FP, 'expected white space, > or /> in a start tag');
+    lead := Copy(FT, as_, ws);
+    a.RawStart := FP;
+    an := ReadName;
+    SkipS;
+    if (FP > FN) or (FT[FP] <> '=') then
+      Fail(FP, 'attribute ' + an + ' has no value');
+    FP := FP + 1;
+    SkipS;
+    if (FP > FN) or ((FT[FP] <> '"') and (FT[FP] <> '''')) then
+      Fail(FP, 'unquoted or missing attribute value');
+    quote := FT[FP];
+    FP := FP + 1;
+    i := FP;
+    amp := False;
+    ctl := False;
+    while True do
+    begin
+      if i > FN then
+        Fail(FN, 'unexpected end of input in an attribute value');
+      c := Ord(FT[i]);
+      if FT[i] = quote then
+        Break;
+      if c = 60 then
+        Fail(i, '< in the value of an attribute');
+      if c < 128 then
+      begin
+        if c = 38 then
+          amp := True
+        else if (c = 9) or (c = 10) or (c = 13) then
+          ctl := True
+        else if c < 32 then
+          Fail(i, 'illegal character code ' + IntToStr(c));
+        i := i + 1;
+      end
+      else
+      begin
+        if not XmlDecode(FT, i, FN, c, l) then
+          Fail(i, 'invalid UTF-8');
+        if not XmlIsChar(c) then
+          Fail(i, 'illegal character code U+' + IntToStr(c));
+        i := i + l;
+      end;
+    end;
+    a.Name := an;
+    a.Lead := lead;
+    a.Quote := quote;
+    a.Changed := False;
+    a.URI := '';
+    if amp or ctl then
+    begin
+      raw := Copy(FT, FP, i - FP);
+      B.N := 0;
+      SetLength(B.S, Length(raw) + 16);
+      Expand(raw, FP, True, False, 0, B);
+      a.Value := BufResult(B);
+    end
+    else
+      a.Value := Copy(FT, FP, i - FP);
+    FP := i + 1;
+    a.RawStop := FP;
+    a.IsNs := Namespaces and ((an = 'xmlns') or (Copy(an, 1, 6) = 'xmlns:'));
+    for k := 0 to na - 1 do
+      if Tok.Attrs[k].Name = an then
+        Fail(a.RawStart, 'duplicate attribute ' + an);
+    if na >= Length(Tok.Attrs) then
+      SetLength(Tok.Attrs, na * 2 + 4);
+    Tok.Attrs[na] := a;
+    na := na + 1;
+  end;
+  SetLength(Tok.Attrs, na);
+  Tok.Trail := trail;
+  { the namespaces }
+  mark := FNsN;
+  pfx := '';
+  loc := nm;
+  uri := '';
+  if Namespaces then
+  begin
+    XmlSplit(nm, pfx, loc, bad);
+    if bad then
+      Fail(st + 1, 'invalid qualified name ' + nm);
+    for i := 0 to na - 1 do
+    begin
+      a := Tok.Attrs[i];
+      XmlSplit(a.Name, a.Prefix, a.Local, bad);
+      if bad then
+        Fail(a.RawStart, 'invalid qualified name ' + a.Name);
+      Tok.Attrs[i] := a;
+    end;
+    for i := 0 to na - 1 do
+    begin
+      a := Tok.Attrs[i];
+      if a.Name = 'xmlns' then
+      begin
+        if (a.Value = XmlNamespaceXml) or (a.Value = XmlNamespaceXmlns) then
+          Fail(a.RawStart, 'the default namespace cannot be ' + a.Value);
+        BindNs('', a.Value);
+      end
+      else if a.Prefix = 'xmlns' then
+      begin
+        if a.Local = 'xmlns' then
+          Fail(a.RawStart, 'the prefix xmlns cannot be declared');
+        if a.Local = 'xml' then
+        begin
+          if a.Value <> XmlNamespaceXml then
+            Fail(a.RawStart, 'the prefix xml is bound to ' + XmlNamespaceXml);
+        end
+        else
+        begin
+          if a.Value = XmlNamespaceXml then
+            Fail(a.RawStart, 'only the prefix xml is bound to ' + XmlNamespaceXml);
+          if a.Value = XmlNamespaceXmlns then
+            Fail(a.RawStart, 'no prefix is bound to ' + XmlNamespaceXmlns);
+          if a.Value = '' then
+            Fail(a.RawStart, 'the prefix ' + a.Local + ' is bound to an empty namespace');
+          BindNs(a.Local, a.Value);
+        end;
+      end;
+    end;
+    if not LookupNs(pfx, uri) then
+      Fail(st + 1, 'the prefix ' + pfx + ' is not bound to a namespace');
+    for i := 0 to na - 1 do
+    begin
+      a := Tok.Attrs[i];
+      if (not a.IsNs) and (a.Prefix <> '') then
+      begin
+        if not LookupNs(a.Prefix, a.URI) then
+          Fail(a.RawStart, 'the prefix ' + a.Prefix + ' is not bound to a namespace');
+        Tok.Attrs[i] := a;
+      end;
+    end;
+    for i := 0 to na - 1 do
+      if (not Tok.Attrs[i].IsNs) and (Tok.Attrs[i].URI <> '') then
+        for j := 0 to i - 1 do
+          if (Tok.Attrs[j].URI = Tok.Attrs[i].URI) and (Tok.Attrs[j].Local = Tok.Attrs[i].Local) then
+            Fail(Tok.Attrs[i].RawStart, 'attributes ' + Tok.Attrs[j].Name + ' and ' + Tok.Attrs[i].Name +
+              ' are the same name in the namespace ' + Tok.Attrs[i].URI);
+  end
+  else
+    for i := 0 to na - 1 do
+    begin
+      Tok.Attrs[i].Local := Tok.Attrs[i].Name;
+      Tok.Attrs[i].Prefix := '';
+    end;
+  Tok.Kind := xtStart;
+  Tok.Name := nm;
+  Tok.Prefix := pfx;
+  Tok.Local := loc;
+  Tok.URI := uri;
+  Tok.Start := st;
+  Tok.Stop := FP;
+  Tok.OpenEnd := FP;
+  Tok.Synth := False;
+  PushElem(nm, pfx, loc, uri, mark);
+  FSawRoot := True;
+  FSynth := Tok.SelfClose;
+end;
+
+procedure TXmlReader.ReadEndTag(var Tok: TXmlToken);
+var
+  st: Integer;
+  nm: string;
+begin
+  st := FP;
+  FP := FP + 2;
+  nm := ReadName;
+  SkipS;
+  if (FP > FN) or (FT[FP] <> '>') then
+    Fail(FP, 'invalid characters in the end tag </' + nm + '>');
+  FP := FP + 1;
+  if FDepth = 0 then
+    Fail(st, 'unexpected end tag </' + nm + '>');
+  if nm <> FSName[FDepth - 1] then
+    Fail(st, 'element <' + FSName[FDepth - 1] + '> closed by </' + nm + '>');
+  MakeEnd(Tok, False);
+  Tok.Start := st;
+  Tok.Stop := FP;
+  PopElem;
+end;
+
+{ ---- comments, CDATA, processing instructions ---- }
+
+{ CRLF and a CR alone as LF, the line ends of XML 1.0 2.11 }
+function XmlNormLines(const S: string): string;
+var
+  i, n: Integer;
+  B: TXmlBufRec;
+begin
+  n := Length(S);
+  B.N := 0;
+  SetLength(B.S, n);
+  i := 1;
+  while i <= n do
+  begin
+    if S[i] = #13 then
+    begin
+      if (i < n) and (S[i + 1] = #10) then
+        i := i + 1;
+      BufChar(B, 10);
+    end
+    else
+      BufChar(B, Ord(S[i]));
+    i := i + 1;
+  end;
+  Result := BufResult(B);
+end;
+
+procedure TXmlReader.ScanComment(var VFrom, VTo: Integer);
+var
+  i: Integer;
+begin
+  VFrom := FP + 4;
+  i := VFrom;
+  while True do
+  begin
+    if i + 1 > FN then
+      Fail(FN, 'unterminated comment');
+    if (FT[i] = '-') and (FT[i + 1] = '-') then
+    begin
+      if (i + 2 <= FN) and (FT[i + 2] = '>') then
+        Break;
+      Fail(i, '-- is not allowed inside a comment');
+    end;
+    i := i + 1;
+  end;
+  CheckChars(VFrom, i);
+  VTo := i;
+  FP := i + 3;
+end;
+
+procedure TXmlReader.ReadComment(var Tok: TXmlToken);
+var
+  st, a, b: Integer;
+begin
+  st := FP;
+  ScanComment(a, b);
+  Tok.Kind := xtComment;
+  Tok.Start := st;
+  Tok.Stop := FP;
+  Tok.Value := Copy(FT, a, b - a);
+  if Pos(#13, Tok.Value) > 0 then
+    Tok.Value := XmlNormLines(Tok.Value);
+end;
+
+procedure TXmlReader.ReadCData(var Tok: TXmlToken);
+var
+  st, a, i: Integer;
+  v: string;
+begin
+  if (FDepth = 0) and (not FFragment) then
+    Fail(FP, 'CDATA outside the root element');
+  st := FP;
+  a := FP + 9;
+  i := a;
+  while True do
+  begin
+    if i + 2 > FN then
+      Fail(FN, 'unterminated CDATA section');
+    if (FT[i] = ']') and (FT[i + 1] = ']') and (FT[i + 2] = '>') then
+      Break;
+    i := i + 1;
+  end;
+  CheckChars(a, i);
+  v := Copy(FT, a, i - a);
+  if Pos(#13, v) > 0 then
+    v := XmlNormLines(v);
+  Tok.Kind := xtCData;
+  Tok.Start := st;
+  Tok.Stop := i + 3;
+  Tok.Value := v;
+  FP := i + 3;
+end;
+
+procedure TXmlReader.ScanPI(var Tgt: string; var VFrom, VTo: Integer);
+var
+  i: Integer;
+begin
+  FP := FP + 2;
+  Tgt := ReadName;
+  if (FP + 1 <= FN) and (FT[FP] = '?') and (FT[FP + 1] = '>') then
+  begin
+    VFrom := FP;
+    VTo := FP;
+    FP := FP + 2;
+    Exit;
+  end;
+  if SkipS = 0 then
+    Fail(FP, 'expected white space or ?> after the target of a processing instruction');
+  VFrom := FP;
+  i := FP;
+  while True do
+  begin
+    if i + 1 > FN then
+      Fail(FN, 'unterminated processing instruction');
+    if (FT[i] = '?') and (FT[i + 1] = '>') then
+      Break;
+    i := i + 1;
+  end;
+  CheckChars(VFrom, i);
+  VTo := i;
+  FP := i + 2;
+end;
+
+procedure TXmlReader.ReadPI(var Tok: TXmlToken);
+var
+  st, a, b: Integer;
+  tgt: string;
+begin
+  st := FP;
+  if (Copy(FT, FP, 5) = '<?xml') and (FP + 5 <= FN) and (XmlIsSpace(Ord(FT[FP + 5])) or (FT[FP + 5] = '?')) then
+  begin
+    if FFragment or (FP <> FBom + 1) then
+      Fail(FP, 'the XML declaration is allowed only at the start of a document');
+    ReadDecl(Tok, st);
+    Exit;
+  end;
+  ScanPI(tgt, a, b);
+  if XmlLower(tgt) = 'xml' then
+    Fail(st + 2, 'the processing instruction target ' + tgt + ' is reserved');
+  if Namespaces and (Pos(':', tgt) > 0) then
+    Fail(st + 2, 'the processing instruction target ' + tgt + ' has a colon');
+  Tok.Kind := xtPI;
+  Tok.Start := st;
+  Tok.Stop := FP;
+  Tok.Name := tgt;
+  Tok.Value := Copy(FT, a, b - a);
+  if Pos(#13, Tok.Value) > 0 then
+    Tok.Value := XmlNormLines(Tok.Value);
+end;
+
+{ the pseudo attribute Nm of the XML declaration at FP: its = and quoted value }
+procedure TXmlReader.Quoted(const Nm: string; var V: string);
+var
+  k: Integer;
+  q: Char;
+begin
+  FP := FP + Length(Nm);
+  SkipS;
+  if (FP > FN) or (FT[FP] <> '=') then
+    Fail(FP, 'expected = after ' + Nm + ' in the XML declaration');
+  FP := FP + 1;
+  SkipS;
+  if (FP > FN) or ((FT[FP] <> '"') and (FT[FP] <> '''')) then
+    Fail(FP, 'the value of ' + Nm + ' in the XML declaration must be quoted');
+  q := FT[FP];
+  k := FP + 1;
+  while (k <= FN) and (FT[k] <> q) do
+    k := k + 1;
+  if k > FN then
+    Fail(FN, 'unterminated value in the XML declaration');
+  V := Copy(FT, FP + 1, k - FP - 1);
+  FP := k + 1;
+end;
+
+procedure TXmlReader.ReadDecl(var Tok: TXmlToken; St: Integer);
+var
+  a, i, c: Integer;
+  v, enc, ver, sa: string;
+  ws: Integer;
+begin
+  FP := FP + 5;
+  ws := SkipS;
+  if not Has('version') then
+    Fail(FP, 'the XML declaration must begin with version');
+  Quoted('version', ver);
+  if (Length(ver) < 3) or (Copy(ver, 1, 2) <> '1.') then
+    Fail(FP, 'unsupported XML version ' + ver);
+  for i := 3 to Length(ver) do
+    if (ver[i] < '0') or (ver[i] > '9') then
+      Fail(FP, 'invalid XML version ' + ver);
+  enc := '';
+  sa := '';
+  ws := SkipS;
+  if Has('encoding') then
+  begin
+    if ws = 0 then
+      Fail(FP, 'expected white space before encoding');
+    Quoted('encoding', enc);
+    if enc = '' then
+      Fail(FP, 'empty encoding name');
+    for i := 1 to Length(enc) do
+    begin
+      c := Ord(enc[i]);
+      if not (((c >= 65) and (c <= 90)) or ((c >= 97) and (c <= 122)) or
+        ((i > 1) and (((c >= 48) and (c <= 57)) or (c = 46) or (c = 95) or (c = 45)))) then
+        Fail(FP, 'invalid encoding name ' + enc);
+    end;
+    v := XmlLower(enc);
+    if (v = 'utf-16') or (v = 'utf16') then
+    begin
+      if not FTranscoded then
+        Fail(FP, 'the declaration says UTF-16 but the text is not');
+    end
+    else if (v = 'utf-8') or (v = 'utf8') or (v = 'us-ascii') or (v = 'ascii') then
+    begin
+      if FTranscoded and (FEncoding = 'UTF-16') then
+        Fail(FP, 'the declaration says ' + enc + ' but the text is UTF-16');
+    end
+    else if (v = 'iso-8859-1') or (v = 'latin1') or (v = 'iso_8859-1') or (v = 'l1') then
+    begin
+      if not FTranscoded then
+        Fail(FP, 'the declaration says ' + enc + ' but the text was not read as it');
+    end
+    else
+      Fail(FP, 'unsupported encoding ' + enc);
+    ws := SkipS;
+  end;
+  if Has('standalone') then
+  begin
+    if ws = 0 then
+      Fail(FP, 'expected white space before standalone');
+    Quoted('standalone', sa);
+    if (sa <> 'yes') and (sa <> 'no') then
+      Fail(FP, 'standalone must be yes or no');
+    SkipS;
+  end;
+  if not Has('?>') then
+    Fail(FP, 'invalid XML declaration: expected ?>');
+  a := St + 5;
+  FEncoding := enc;
+  FStandalone := sa;
+  FVersion := ver;
+  Tok.Kind := xtDecl;
+  Tok.Start := St;
+  FP := FP + 2;
+  Tok.Stop := FP;
+  Tok.Value := Copy(FT, a, FP - 2 - a);
+  Tok.Name := 'xml';
+end;
+
+procedure TXmlReader.ReadBang(var Tok: TXmlToken);
+begin
+  if Has('<!--') then
+    ReadComment(Tok)
+  else if Has('<![CDATA[') then
+    ReadCData(Tok)
+  else if Has('<!DOCTYPE') then
+    ReadDoctype(Tok)
+  else
+    Fail(FP, 'invalid <! construct');
+end;
+
+{ ---- the DOCTYPE ---- }
+
+{ a quoted literal; of a public identifier when Pubid }
+procedure TXmlReader.ReadLiteral(Pubid: Boolean);
+var
+  q: Char;
+  i, c: Integer;
+begin
+  if (FP > FN) or ((FT[FP] <> '"') and (FT[FP] <> '''')) then
+    Fail(FP, 'expected a quoted literal');
+  q := FT[FP];
+  i := FP + 1;
+  while (i <= FN) and (FT[i] <> q) do
+  begin
+    c := Ord(FT[i]);
+    if Pubid and (not (((c >= 65) and (c <= 90)) or ((c >= 97) and (c <= 122)) or ((c >= 48) and (c <= 57)) or
+      (c = 32) or (c = 13) or (c = 10) or (c = 45) or (c = 39) or (c = 40) or (c = 41) or (c = 43) or (c = 44) or
+      (c = 46) or (c = 47) or (c = 58) or (c = 61) or (c = 63) or (c = 59) or (c = 33) or (c = 42) or (c = 35) or
+      (c = 64) or (c = 36) or (c = 95) or (c = 37))) then
+      Fail(i, 'a character a public identifier does not have');
+    i := i + 1;
+  end;
+  if i > FN then
+    Fail(FN, 'unterminated literal');
+  CheckChars(FP + 1, i);
+  FP := i + 1;
+end;
+
+function TXmlReader.ReadNmtoken: string;
+var
+  st, i, c, l: Integer;
+begin
+  st := FP;
+  i := FP;
+  while i <= FN do
+  begin
+    if not XmlDecode(FT, i, FN, c, l) then
+      Fail(i, 'invalid UTF-8');
+    if not XmlNameChar(c) then
+      Break;
+    i := i + l;
+  end;
+  if i = st then
+    Fail(st, 'expected a name token');
+  Result := Copy(FT, st, i - st);
+  FP := i;
+end;
+
+{ cp ::= (Name | choice | seq) ('?' | '*' | '+')? (3.2.1) }
+procedure TXmlReader.ReadCp(Lv: Integer);
+begin
+  if FP > FN then
+    Fail(FN, 'unterminated content model');
+  if FT[FP] = '(' then
+    ReadGroup(Lv + 1)
+  else
+    ReadName;
+  if (FP <= FN) and ((FT[FP] = '?') or (FT[FP] = '*') or (FT[FP] = '+')) then
+    FP := FP + 1;
+end;
+
+{ a choice or a sequence: ( cp (| cp)+ ) or ( cp (, cp)* ) }
+procedure TXmlReader.ReadGroup(Lv: Integer);
+var
+  sep: Char;
+begin
+  if Lv > MaxDepth then
+    Fail(FP, 'content model nested deeper than MaxDepth');
+  FP := FP + 1;
+  SkipS;
+  ReadCp(Lv);
+  SkipS;
+  sep := #0;
+  while (FP <= FN) and ((FT[FP] = '|') or (FT[FP] = ',')) do
+  begin
+    if sep = #0 then
+      sep := FT[FP]
+    else if sep <> FT[FP] then
+      Fail(FP, 'a content model cannot mix | and ,');
+    FP := FP + 1;
+    SkipS;
+    ReadCp(Lv);
+    SkipS;
+  end;
+  if (FP > FN) or (FT[FP] <> ')') then
+    Fail(FP, 'expected ) in a content model');
+  FP := FP + 1;
+end;
+
+procedure TXmlReader.ReadElementDecl;
+var
+  p, names: Integer;
+begin
+  FP := FP + 9;
+  if SkipS = 0 then
+    Fail(FP, 'expected white space after <!ELEMENT');
+  ReadName;
+  if SkipS = 0 then
+    Fail(FP, 'expected white space after the element name');
+  if Has('EMPTY') then
+    FP := FP + 5
+  else if Has('ANY') then
+    FP := FP + 3
+  else if (FP <= FN) and (FT[FP] = '(') then
+  begin
+    p := FP;
+    FP := FP + 1;
+    SkipS;
+    if Has('#PCDATA') then
+    begin
+      FP := FP + 7;
+      names := 0;
+      SkipS;
+      while (FP <= FN) and (FT[FP] = '|') do
+      begin
+        FP := FP + 1;
+        SkipS;
+        ReadName;
+        SkipS;
+        names := names + 1;
+      end;
+      if (FP > FN) or (FT[FP] <> ')') then
+        Fail(FP, 'expected ) in a mixed content declaration');
+      FP := FP + 1;
+      if (FP <= FN) and (FT[FP] = '*') then
+        FP := FP + 1
+      else if names > 0 then
+        Fail(FP, 'a mixed content declaration with names ends in )*');
+    end
+    else
+    begin
+      FP := p;
+      ReadGroup(1);
+      if (FP <= FN) and ((FT[FP] = '?') or (FT[FP] = '*') or (FT[FP] = '+')) then
+        FP := FP + 1;
+    end;
+  end
+  else
+    Fail(FP, 'expected EMPTY, ANY or a content model');
+  SkipS;
+  if (FP > FN) or (FT[FP] <> '>') then
+    Fail(FP, 'expected > at the end of <!ELEMENT');
+  FP := FP + 1;
+end;
+
+{ the default of an attribute: #REQUIRED, #IMPLIED or #FIXED and a value }
+procedure TXmlReader.ReadAttDefault;
+var
+  q: Char;
+  i, j: Integer;
+  B: TXmlBufRec;
+begin
+  if Has('#REQUIRED') then
+    FP := FP + 9
+  else if Has('#IMPLIED') then
+    FP := FP + 8
+  else
+  begin
+    if Has('#FIXED') then
+    begin
+      FP := FP + 6;
+      if SkipS = 0 then
+        Fail(FP, 'expected white space after #FIXED');
+    end;
+    if (FP > FN) or ((FT[FP] <> '"') and (FT[FP] <> '''')) then
+      Fail(FP, 'expected a quoted default value, #REQUIRED, #IMPLIED or #FIXED');
+    q := FT[FP];
+    i := FP + 1;
+    while True do
+    begin
+      if i > FN then
+        Fail(FN, 'unterminated default value');
+      if FT[i] = q then
+        Break;
+      if FT[i] = '<' then
+        Fail(i, '< in the default value of an attribute');
+      i := i + 1;
+    end;
+    { its references must be to entities declared before, as a value's are }
+    B.N := 0;
+    SetLength(B.S, i - FP + 16);
+    j := FExpanded;
+    Expand(Copy(FT, FP + 1, i - FP - 1), FP + 1, True, False, 0, B);
+    FExpanded := j;
+    CheckChars(FP + 1, i);
+    FP := i + 1;
+  end;
+end;
+
+procedure TXmlReader.ReadAttlistDecl;
+var
+  ws: Integer;
+begin
+  FP := FP + 9;
+  if SkipS = 0 then
+    Fail(FP, 'expected white space after <!ATTLIST');
+  ReadName;
+  while True do
+  begin
+    ws := SkipS;
+    if FP > FN then
+      Fail(FN, 'unterminated <!ATTLIST');
+    if FT[FP] = '>' then
+    begin
+      FP := FP + 1;
+      Exit;
+    end;
+    if ws = 0 then
+      Fail(FP, 'expected white space before an attribute definition');
+    ReadName;
+    if SkipS = 0 then
+      Fail(FP, 'expected white space after the attribute name');
+    if Has('CDATA') then
+      FP := FP + 5
+    else if Has('NMTOKENS') then
+      FP := FP + 8
+    else if Has('NMTOKEN') then
+      FP := FP + 7
+    else if Has('IDREFS') then
+      FP := FP + 6
+    else if Has('IDREF') then
+      FP := FP + 5
+    else if Has('ID') then
+      FP := FP + 2
+    else if Has('ENTITIES') then
+      FP := FP + 8
+    else if Has('ENTITY') then
+      FP := FP + 6
+    else if Has('NOTATION') then
+    begin
+      FP := FP + 8;
+      if SkipS = 0 then
+        Fail(FP, 'expected white space after NOTATION');
+      if (FP > FN) or (FT[FP] <> '(') then
+        Fail(FP, 'expected ( after NOTATION');
+      FP := FP + 1;
+      SkipS;
+      ReadName;
+      SkipS;
+      while (FP <= FN) and (FT[FP] = '|') do
+      begin
+        FP := FP + 1;
+        SkipS;
+        ReadName;
+        SkipS;
+      end;
+      if (FP > FN) or (FT[FP] <> ')') then
+        Fail(FP, 'expected ) in a NOTATION type');
+      FP := FP + 1;
+    end
+    else if (FP <= FN) and (FT[FP] = '(') then
+    begin
+      FP := FP + 1;
+      SkipS;
+      ReadNmtoken;
+      SkipS;
+      while (FP <= FN) and (FT[FP] = '|') do
+      begin
+        FP := FP + 1;
+        SkipS;
+        ReadNmtoken;
+        SkipS;
+      end;
+      if (FP > FN) or (FT[FP] <> ')') then
+        Fail(FP, 'expected ) in an enumeration');
+      FP := FP + 1;
+    end
+    else
+      Fail(FP, 'invalid attribute type');
+    if SkipS = 0 then
+      Fail(FP, 'expected white space after the attribute type');
+    ReadAttDefault;
+  end;
+end;
+
+procedure TXmlReader.ReadNotationDecl;
+var
+  nm: string;
+begin
+  FP := FP + 10;
+  if SkipS = 0 then
+    Fail(FP, 'expected white space after <!NOTATION');
+  nm := ReadName;
+  if Namespaces and (Pos(':', nm) > 0) then
+    Fail(FP, 'the notation name has a colon');
+  if SkipS = 0 then
+    Fail(FP, 'expected white space after the notation name');
+  if Has('SYSTEM') then
+  begin
+    FP := FP + 6;
+    if SkipS = 0 then
+      Fail(FP, 'expected white space after SYSTEM');
+    ReadLiteral(False);
+  end
+  else if Has('PUBLIC') then
+  begin
+    FP := FP + 6;
+    if SkipS = 0 then
+      Fail(FP, 'expected white space after PUBLIC');
+    ReadLiteral(True);
+    if SkipS > 0 then
+      if (FP <= FN) and ((FT[FP] = '"') or (FT[FP] = '''')) then
+        ReadLiteral(False);
+  end
+  else
+    Fail(FP, 'expected SYSTEM or PUBLIC in a notation declaration');
+  SkipS;
+  if (FP > FN) or (FT[FP] <> '>') then
+    Fail(FP, 'expected > at the end of <!NOTATION');
+  FP := FP + 1;
+end;
+
+procedure TXmlReader.ReadEntityDecl;
+var
+  nm: string;
+  isPE, ext: Boolean;
+  q: Char;
+  i, st, k, code, c: Integer;
+  B: TXmlBufRec;
+  v, raw: string;
+  ishex: Boolean;
+begin
+  FP := FP + 8;
+  if SkipS = 0 then
+    Fail(FP, 'expected white space after <!ENTITY');
+  isPE := False;
+  if (FP <= FN) and (FT[FP] = '%') then
+  begin
+    isPE := True;
+    FP := FP + 1;
+    if SkipS = 0 then
+      Fail(FP, 'expected white space after % in an entity declaration');
+  end;
+  nm := ReadName;
+  if Namespaces and (Pos(':', nm) > 0) then
+    Fail(FP, 'the entity name ' + nm + ' has a colon');
+  if SkipS = 0 then
+    Fail(FP, 'expected white space after the entity name');
+  ext := False;
+  v := '';
+  if (FP <= FN) and ((FT[FP] = '"') or (FT[FP] = '''')) then
+  begin
+    q := FT[FP];
+    i := FP + 1;
+    while (i <= FN) and (FT[i] <> q) do
+    begin
+      if FT[i] = '%' then
+        Fail(i, 'a parameter entity reference in an entity value');
+      i := i + 1;
+    end;
+    if i > FN then
+      Fail(FN, 'unterminated entity value');
+    CheckChars(FP + 1, i);
+    raw := Copy(FT, FP + 1, i - FP - 1);
+    { character references are expanded now, entity references when used }
+    B.N := 0;
+    SetLength(B.S, Length(raw) + 8);
+    k := 1;
+    while k <= Length(raw) do
+    begin
+      if (raw[k] = '&') and (k < Length(raw)) and (raw[k + 1] = '#') then
+      begin
+        st := k + 2;
+        ishex := (st <= Length(raw)) and (raw[st] = 'x');
+        if ishex then
+          st := st + 1;
+        code := 0;
+        c := st;
+        while c <= Length(raw) do
+        begin
+          if ishex then
+            i := XmlHexVal(Ord(raw[c]))
+          else if (raw[c] >= '0') and (raw[c] <= '9') then
+            i := Ord(raw[c]) - 48
+          else
+            i := -1;
+          if i < 0 then
+            Break;
+          if ishex then
+            code := code * 16 + i
+          else
+            code := code * 10 + i;
+          if code > $110000 then
+            code := $110000;
+          c := c + 1;
+        end;
+        if (c = st) or (c > Length(raw)) or (raw[c] <> ';') or (not XmlIsChar(code)) then
+          Fail(FP, 'invalid character reference in an entity value');
+        BufUtf8(B, code);
+        k := c + 1;
+      end
+      else
+      begin
+        if raw[k] = '&' then
+        begin
+          c := k + 1;
+          while (c <= Length(raw)) and (raw[c] <> ';') do
+            c := c + 1;
+          if (c > Length(raw)) or (not XmlIsName(Copy(raw, k + 1, c - k - 1))) then
+            Fail(FP, 'invalid reference in an entity value: & must begin &name; or &#n;');
+        end;
+        BufChar(B, Ord(raw[k]));
+        k := k + 1;
+      end;
+    end;
+    v := BufResult(B);
+    FP := FP + Length(raw) + 2;
+  end
+  else
+  begin
+    ext := True;
+    if Has('SYSTEM') then
+    begin
+      FP := FP + 6;
+      if SkipS = 0 then
+        Fail(FP, 'expected white space after SYSTEM');
+      ReadLiteral(False);
+    end
+    else if Has('PUBLIC') then
+    begin
+      FP := FP + 6;
+      if SkipS = 0 then
+        Fail(FP, 'expected white space after PUBLIC');
+      ReadLiteral(True);
+      if SkipS = 0 then
+        Fail(FP, 'expected white space after the public identifier');
+      ReadLiteral(False);
+    end
+    else
+      Fail(FP, 'expected an entity value, SYSTEM or PUBLIC');
+    if SkipS > 0 then
+    begin
+      if Has('NDATA') then
+      begin
+        if isPE then
+          Fail(FP, 'NDATA in a parameter entity');
+        FP := FP + 5;
+        if SkipS = 0 then
+          Fail(FP, 'expected white space after NDATA');
+        ReadName;
+      end;
+    end;
+  end;
+  SkipS;
+  if (FP > FN) or (FT[FP] <> '>') then
+    Fail(FP, 'expected > at the end of an entity declaration');
+  FP := FP + 1;
+  if (not isPE) and (EntityIndex(nm) < 0) then
+  begin
+    if FEN >= Length(FEName) then
+    begin
+      SetLength(FEName, FEN * 2 + 8);
+      SetLength(FEVal, FEN * 2 + 8);
+      SetLength(FEExt, FEN * 2 + 8);
+    end;
+    FEName[FEN] := nm;
+    FEVal[FEN] := v;
+    FEExt[FEN] := ext;
+    FEN := FEN + 1;
+  end;
+end;
+
+procedure TXmlReader.ReadSubset;
+var
+  tgt: string;
+  a, b: Integer;
+begin
+  while True do
+  begin
+    SkipS;
+    if FP > FN then
+      Fail(FN, 'unterminated DOCTYPE internal subset');
+    if FT[FP] = ']' then
+    begin
+      FP := FP + 1;
+      Exit;
+    end;
+    if FT[FP] = '%' then
+    begin
+      FP := FP + 1;
+      ReadName;
+      if (FP > FN) or (FT[FP] <> ';') then
+        Fail(FP, 'expected ; after a parameter entity reference');
+      FP := FP + 1;
+    end
+    else if Has('<!--') then
+      ScanComment(a, b)
+    else if Has('<?') then
+    begin
+      ScanPI(tgt, a, b);
+      if XmlLower(tgt) = 'xml' then
+        Fail(FP, 'the processing instruction target ' + tgt + ' is reserved');
+    end
+    else if Has('<!ENTITY') then
+      ReadEntityDecl
+    else if Has('<!ELEMENT') then
+      ReadElementDecl
+    else if Has('<!ATTLIST') then
+      ReadAttlistDecl
+    else if Has('<!NOTATION') then
+      ReadNotationDecl
+    else
+      Fail(FP, 'invalid markup in the DOCTYPE internal subset');
+  end;
+end;
+
+procedure TXmlReader.ReadDoctype(var Tok: TXmlToken);
+var
+  st: Integer;
+begin
+  if FFragment or FSawRoot or FSawDoctype or (FDepth > 0) then
+    Fail(FP, 'a DOCTYPE is allowed once, before the root element');
+  FSawDoctype := True;
+  st := FP;
+  FP := FP + 9;
+  if SkipS = 0 then
+    Fail(FP, 'expected white space after <!DOCTYPE');
+  Tok.Name := ReadName;
+  SkipS;
+  if Has('SYSTEM') then
+  begin
+    FP := FP + 6;
+    if SkipS = 0 then
+      Fail(FP, 'expected white space after SYSTEM');
+    ReadLiteral(False);
+  end
+  else if Has('PUBLIC') then
+  begin
+    FP := FP + 6;
+    if SkipS = 0 then
+      Fail(FP, 'expected white space after PUBLIC');
+    ReadLiteral(True);
+    if SkipS = 0 then
+      Fail(FP, 'expected white space after the public identifier');
+    ReadLiteral(False);
+  end;
+  SkipS;
+  if (FP <= FN) and (FT[FP] = '[') then
+  begin
+    FP := FP + 1;
+    ReadSubset;
+    SkipS;
+  end;
+  if (FP > FN) or (FT[FP] <> '>') then
+    Fail(FP, 'expected > at the end of the DOCTYPE');
+  FP := FP + 1;
+  Tok.Kind := xtDoctype;
+  Tok.Start := st;
+  Tok.Stop := FP;
+  Tok.Value := Copy(FT, st, FP - st);
+end;
+
+{ ---- the next token ---- }
+
+function TXmlReader.Next(var Tok: TXmlToken): Boolean;
+var
+  c: Integer;
+begin
+  Tok.Name := '';
+  Tok.Prefix := '';
+  Tok.Local := '';
+  Tok.URI := '';
+  Tok.Value := '';
+  Tok.Trail := '';
+  Tok.SelfClose := False;
+  Tok.Synth := False;
+  Tok.Start := 0;
+  Tok.Stop := 0;
+  Tok.OpenEnd := 0;
+  SetLength(Tok.Attrs, 0);
+  if FSynth then
+  begin
+    FSynth := False;
+    MakeEnd(Tok, True);
+    Tok.Start := FP;
+    Tok.Stop := FP;
+    Tok.OpenEnd := FP;
+    PopElem;
+    Result := True;
+    Exit;
+  end;
+  if FP > FN then
+  begin
+    if FDepth > 0 then
+      Fail(FN, 'unexpected end of input: <' + FSName[FDepth - 1] + '> is not closed');
+    if (not FFragment) and (not FSawRoot) then
+      Fail(FN, 'no root element');
+    Result := False;
+    Exit;
+  end;
+  Result := True;
+  if FT[FP] = '<' then
+  begin
+    if FP < FN then
+      c := Ord(FT[FP + 1])
+    else
+      c := 0;
+    if c = 47 then
+      ReadEndTag(Tok)
+    else if c = 63 then
+      ReadPI(Tok)
+    else if c = 33 then
+      ReadBang(Tok)
+    else
+      ReadStartTag(Tok);
+  end
+  else
+    ReadCharData(Tok);
+end;
+
+procedure TXmlReader.SkipElement;
+var
+  tok: TXmlToken;
+  d: Integer;
+begin
+  d := FDepth - 1;
+  while FDepth > d do
+    if not Next(tok) then
+      Exit;
+end;
+
+{ ---- escaping ---- }
+
+{ Mode 0 text, 1 an attribute in double quotes, 2 in single quotes }
+function XmlEscapeMode(const S: string; Mode: Integer): string;
+var
+  i, n, c, l, st: Integer;
+  B: TXmlBufRec;
+  plain: Boolean;
+begin
+  n := Length(S);
+  plain := True;
+  i := 1;
+  while i <= n do
+  begin
+    c := Ord(S[i]);
+    if (c = 38) or (c = 60) or (c = 62) or (c = 13) or (c < 32) or (c >= 128) or
+      ((Mode = 1) and (c = 34)) or ((Mode = 2) and (c = 39)) then
+    begin
+      plain := False;
+      Break;
+    end;
+    i := i + 1;
+  end;
+  if plain then
+  begin
+    Result := S;
+    Exit;
+  end;
+  B.N := 0;
+  SetLength(B.S, n + n div 4 + 16);
+  i := 1;
+  while i <= n do
+  begin
+    c := Ord(S[i]);
+    if c < 128 then
+    begin
+      if c = 38 then
+        BufStr(B, '&amp;')
+      else if c = 60 then
+        BufStr(B, '&lt;')
+      else if c = 62 then
+        BufStr(B, '&gt;')
+      else if c = 13 then
+        BufStr(B, '&#xD;')
+      else if (c = 34) and (Mode = 1) then
+        BufStr(B, '&quot;')
+      else if (c = 39) and (Mode = 2) then
+        BufStr(B, '&apos;')
+      else if (c = 9) and (Mode <> 0) then
+        BufStr(B, '&#x9;')
+      else if (c = 10) and (Mode <> 0) then
+        BufStr(B, '&#xA;')
+      else if (c < 32) and (c <> 9) and (c <> 10) then
+        BufStr(B, '�')
+      else
+        BufChar(B, c);
+      i := i + 1;
+    end
+    else
+    begin
+      st := i;
+      if XmlDecode(S, i, n, c, l) and XmlIsChar(c) then
+      begin
+        BufRange(B, S, st, l);
+        i := i + l;
+      end
+      else
+      begin
+        BufStr(B, '�');
+        i := i + 1;
+      end;
+    end;
+  end;
+  Result := BufResult(B);
+end;
+
+function XmlEscapeText(const S: string): string;
+begin
+  Result := XmlEscapeMode(S, 0);
+end;
+
+function XmlEscapeAttr(const S: string): string;
+begin
+  Result := XmlEscapeMode(S, 1);
+end;
+
+{ ---- the tree ---- }
+
+function XmlMake(AKind: TXmlKind; D: TXmlDoc): TXmlNode;
+begin
+  Result := TXmlNode.Create;
+  Result.Kind := AKind;
+  Result.Doc := D;
+  Result.ZStart := -1;
+  Result.ZStop := -1;
+  Result.ZOpenEnd := -1;
+  Result.ZCloseStart := -1;
+end;
+
+procedure XmlBad(const Why: string);
+begin
+  raise EXmlError.CreateAt(-1, 0, 0, Why);
+end;
+
+{ N and what holds it have changed }
+procedure XmlTouch(N: TXmlNode);
+var
+  p: TXmlNode;
+begin
+  p := N;
+  while p <> nil do
+  begin
+    p.ZDirty := True;
+    p := p.Parent;
+  end;
+  if N.Doc <> nil then
+    N.Doc.ZDirty := True;
+end;
+
+procedure XmlAddKid(var Arr: TXmlNodeArray; var Cnt: Integer; N: TXmlNode);
+begin
+  if Cnt >= Length(Arr) then
+    SetLength(Arr, Cnt * 2 + 4);
+  Arr[Cnt] := N;
+  Cnt := Cnt + 1;
+end;
+
+{ the namespace Prefix is bound to at N, going up: False if it is bound nowhere }
+function XmlScopeLookup(N: TXmlNode; const Prefix: string; var Uri: string): Boolean;
+var
+  p: TXmlNode;
+  i: Integer;
+  want: string;
+begin
+  Result := True;
+  if Prefix = 'xml' then
+  begin
+    Uri := XmlNamespaceXml;
+    Exit;
+  end;
+  if Prefix = '' then
+    want := 'xmlns'
+  else
+    want := 'xmlns:' + Prefix;
+  p := N;
+  while p <> nil do
+  begin
+    for i := 0 to High(p.ZAttrs) do
+      if p.ZAttrs[i].Name = want then
+      begin
+        Uri := p.ZAttrs[i].Value;
+        Exit;
+      end;
+    p := p.Parent;
+  end;
+  Uri := '';
+  Result := Prefix = '';
+end;
+
+{ the elements a document made here has not yet put a namespace on:
+  now they have a place }
+procedure XmlResolve(N: TXmlNode);
+var
+  i: Integer;
+  u: string;
+begin
+  if N.Kind <> xkElement then
+    Exit;
+  if N.ZNew then
+  begin
+    if (N.Doc <> nil) and (not N.Doc.ZNamespaces) then
+      u := ''
+    else if not XmlScopeLookup(N, N.Prefix, u) then
+      XmlBad('the prefix ' + N.Prefix + ' of <' + N.Name + '> is not bound to a namespace');
+    N.URI := u;
+    N.ZNew := False;
+  end;
+  for i := 0 to High(N.ZAttrs) do
+    if (N.ZAttrs[i].Prefix <> '') and (not N.ZAttrs[i].IsNs) and (N.ZAttrs[i].URI = '') and
+      ((N.Doc = nil) or N.Doc.ZNamespaces) then
+    begin
+      if not XmlScopeLookup(N, N.ZAttrs[i].Prefix, u) then
+        XmlBad('the prefix ' + N.ZAttrs[i].Prefix + ' of ' + N.ZAttrs[i].Name + ' is not bound to a namespace');
+      N.ZAttrs[i].URI := u;
+    end;
+  for i := 0 to N.ZCount - 1 do
+    XmlResolve(N.ZKids[i]);
+end;
+
+procedure XmlSetDoc(N: TXmlNode; D: TXmlDoc);
+var
+  i: Integer;
+begin
+  N.Doc := D;
+  for i := 0 to N.ZCount - 1 do
+    XmlSetDoc(N.ZKids[i], D);
+end;
+
+function TXmlNode.GetValue: string;
+begin
+  Result := ZValue;
+end;
+
+procedure TXmlNode.SetValue(const S: string);
+begin
+  if Kind = xkElement then
+    XmlBad('an element has no value; use SetText');
+  ZValue := S;
+  ZChanged := True;
+  XmlTouch(Self);
+end;
+
+procedure XmlCollect(N: TXmlNode; var B: TXmlBufRec);
+var
+  i: Integer;
+  k: TXmlNode;
+begin
+  for i := 0 to N.ZCount - 1 do
+  begin
+    k := N.ZKids[i];
+    if (k.Kind = xkText) or (k.Kind = xkCData) then
+      BufStr(B, k.ZValue)
+    else if k.Kind = xkElement then
+      XmlCollect(k, B);
+  end;
+end;
+
+function TXmlNode.Text: string;
+var
+  B: TXmlBufRec;
+begin
+  if Kind <> xkElement then
+  begin
+    Result := ZValue;
+    Exit;
+  end;
+  B.N := 0;
+  XmlCollect(Self, B);
+  Result := BufResult(B);
+end;
+
+procedure TXmlNode.SetText(const S: string);
+var
+  t: TXmlNode;
+  i: Integer;
+begin
+  if Kind <> xkElement then
+  begin
+    SetValue(S);
+    Exit;
+  end;
+  for i := 0 to ZCount - 1 do
+    ZKids[i].Parent := nil;
+  ZKids := nil;
+  ZCount := 0;
+  if S <> '' then
+  begin
+    t := XmlMake(xkText, Doc);
+    t.ZValue := S;
+    t.ZChanged := True;
+    t.Parent := Self;
+    SetLength(ZKids, 1);
+    ZKids[0] := t;
+    ZCount := 1;
+  end;
+  XmlTouch(Self);
+end;
+
+function TXmlNode.Count: Integer;
+begin
+  Result := ZCount;
+end;
+
+function TXmlNode.Item(I: Integer): TXmlNode;
+begin
+  if (I < 0) or (I >= ZCount) then
+    XmlBad('child ' + IntToStr(I) + ' of ' + IntToStr(ZCount));
+  Result := ZKids[I];
+end;
+
+function TXmlNode.IndexInParent: Integer;
+var
+  i: Integer;
+  p: TXmlNode;
+begin
+  Result := -1;
+  p := Parent;
+  if p <> nil then
+  begin
+    for i := 0 to p.ZCount - 1 do
+      if p.ZKids[i] = Self then
+      begin
+        Result := i;
+        Exit;
+      end;
+  end
+  else if Doc <> nil then
+    for i := 0 to Doc.ZCount - 1 do
+      if Doc.ZKids[i] = Self then
+      begin
+        Result := i;
+        Exit;
+      end;
+end;
+
+function XmlMatchName(K: TXmlNode; const Nm: string; Qualified: Boolean): Boolean;
+begin
+  if K.Kind <> xkElement then
+    Result := False
+  else if Qualified then
+    Result := K.Name = Nm
+  else
+    Result := K.Local = Nm;
+end;
+
+function TXmlNode.Elem(const Nm: string): TXmlNode;
+var
+  i: Integer;
+  q: Boolean;
+begin
+  Result := nil;
+  q := Pos(':', Nm) > 0;
+  for i := 0 to ZCount - 1 do
+    if XmlMatchName(ZKids[i], Nm, q) then
+    begin
+      Result := ZKids[i];
+      Exit;
+    end;
+end;
+
+function TXmlNode.ElemNS(const AUri, ALocal: string): TXmlNode;
+var
+  i: Integer;
+  k: TXmlNode;
+begin
+  Result := nil;
+  for i := 0 to ZCount - 1 do
+  begin
+    k := ZKids[i];
+    if (k.Kind = xkElement) and (k.Local = ALocal) and (k.URI = AUri) then
+    begin
+      Result := k;
+      Exit;
+    end;
+  end;
+end;
+
+function TXmlNode.Elems(const Nm: string): TXmlNodeArray;
+var
+  i, n: Integer;
+  q: Boolean;
+begin
+  Result := nil;
+  n := 0;
+  q := Pos(':', Nm) > 0;
+  for i := 0 to ZCount - 1 do
+    if XmlMatchName(ZKids[i], Nm, q) then
+      XmlAddKid(Result, n, ZKids[i]);
+  SetLength(Result, n);
+end;
+
+function TXmlNode.ElemsNS(const AUri, ALocal: string): TXmlNodeArray;
+var
+  i, n: Integer;
+  k: TXmlNode;
+begin
+  Result := nil;
+  n := 0;
+  for i := 0 to ZCount - 1 do
+  begin
+    k := ZKids[i];
+    if (k.Kind = xkElement) and (k.Local = ALocal) and (k.URI = AUri) then
+      XmlAddKid(Result, n, k);
+  end;
+  SetLength(Result, n);
+end;
+
+function TXmlNode.Find(const Path: string): TXmlNode;
+var
+  i, j, n: Integer;
+  cur: TXmlNode;
+begin
+  Result := Self;
+  if Path = '' then
+    Exit;
+  cur := Self;
+  n := Length(Path);
+  i := 1;
+  while i <= n do
+  begin
+    j := i;
+    while (j <= n) and (Path[j] <> '/') do
+      j := j + 1;
+    cur := cur.Elem(Copy(Path, i, j - i));
+    if cur = nil then
+    begin
+      Result := nil;
+      Exit;
+    end;
+    i := j + 1;
+  end;
+  Result := cur;
+end;
+
+function TXmlNode.AttrCount: Integer;
+begin
+  Result := Length(ZAttrs);
+end;
+
+function TXmlNode.AttrAt(I: Integer): TXmlAttr;
+begin
+  if (I < 0) or (I > High(ZAttrs)) then
+    XmlBad('attribute ' + IntToStr(I) + ' of ' + IntToStr(Length(ZAttrs)));
+  Result := ZAttrs[I];
+end;
+
+function TXmlNode.AttrIndex(const Nm: string): Integer;
+var
+  i: Integer;
+begin
+  Result := -1;
+  for i := 0 to High(ZAttrs) do
+    if ZAttrs[i].Name = Nm then
+    begin
+      Result := i;
+      Exit;
+    end;
+end;
+
+function TXmlNode.HasAttr(const Nm: string): Boolean;
+begin
+  Result := AttrIndex(Nm) >= 0;
+end;
+
+function TXmlNode.Attr(const Nm: string): string;
+var
+  i: Integer;
+begin
+  i := AttrIndex(Nm);
+  if i >= 0 then
+    Result := ZAttrs[i].Value
+  else
+    Result := '';
+end;
+
+function TXmlNode.AttrNS(const AUri, ALocal: string): string;
+var
+  i: Integer;
+begin
+  Result := '';
+  for i := 0 to High(ZAttrs) do
+    if (not ZAttrs[i].IsNs) and (ZAttrs[i].Local = ALocal) and (ZAttrs[i].URI = AUri) then
+    begin
+      Result := ZAttrs[i].Value;
+      Exit;
+    end;
+end;
+
+procedure TXmlNode.SetAttr(const Nm, AValue: string);
+var
+  i, c: Integer;
+  a: TXmlAttr;
+  u: string;
+begin
+  if Kind <> xkElement then
+    XmlBad('only an element has attributes');
+  i := AttrIndex(Nm);
+  if i >= 0 then
+  begin
+    if ZAttrs[i].Value = AValue then
+      Exit;
+    ZAttrs[i].Value := AValue;
+    ZAttrs[i].Changed := True;
+    ZHead := True;
+    XmlTouch(Self);
+    Exit;
+  end;
+  if not XmlIsName(Nm) then
+    XmlBad('invalid attribute name ' + Nm);
+  a.Name := Nm;
+  a.Prefix := '';
+  a.Local := Nm;
+  a.URI := '';
+  a.Value := AValue;
+  a.Lead := ' ';
+  a.Quote := '"';
+  a.Changed := True;
+  a.RawStart := -1;
+  a.RawStop := -1;
+  a.IsNs := (Nm = 'xmlns') or (Copy(Nm, 1, 6) = 'xmlns:');
+  c := Pos(':', Nm);
+  if (c > 1) and (c < Length(Nm)) and ((Doc = nil) or Doc.ZNamespaces) then
+  begin
+    a.Prefix := Copy(Nm, 1, c - 1);
+    a.Local := Copy(Nm, c + 1, Length(Nm) - c);
+    if (not a.IsNs) and (Parent <> nil) then
+    begin
+      if not XmlScopeLookup(Self, a.Prefix, u) then
+        XmlBad('the prefix ' + a.Prefix + ' is not bound to a namespace');
+      a.URI := u;
+    end;
+  end;
+  SetLength(ZAttrs, Length(ZAttrs) + 1);
+  ZAttrs[High(ZAttrs)] := a;
+  ZHead := True;
+  XmlTouch(Self);
+end;
+
+procedure TXmlNode.RemoveAttr(const Nm: string);
+var
+  i, j: Integer;
+begin
+  i := AttrIndex(Nm);
+  if i < 0 then
+    Exit;
+  for j := i to High(ZAttrs) - 1 do
+    ZAttrs[j] := ZAttrs[j + 1];
+  SetLength(ZAttrs, Length(ZAttrs) - 1);
+  ZHead := True;
+  XmlTouch(Self);
+end;
+
+procedure TXmlNode.InsertChild(Index: Integer; N: TXmlNode);
+var
+  i: Integer;
+  p: TXmlNode;
+begin
+  if Kind <> xkElement then
+    XmlBad('only an element has children');
+  if (Index < 0) or (Index > ZCount) then
+    XmlBad('child place ' + IntToStr(Index) + ' of ' + IntToStr(ZCount));
+  if (N.Kind = xkDecl) or (N.Kind = xkDoctype) then
+    XmlBad('a declaration or a DOCTYPE is not content');
+  if (N.Parent <> nil) or ((N.Doc <> nil) and (N.Doc.Root = N)) then
+    XmlBad('the node already has a place; Detach it first');
+  p := Self;
+  while p <> nil do
+  begin
+    if p = N then
+      XmlBad('a node cannot hold its own ancestor');
+    p := p.Parent;
+  end;
+  if ZCount >= Length(ZKids) then
+    SetLength(ZKids, ZCount * 2 + 4);
+  for i := ZCount downto Index + 1 do
+    ZKids[i] := ZKids[i - 1];
+  ZKids[Index] := N;
+  ZCount := ZCount + 1;
+  N.Parent := Self;
+  XmlSetDoc(N, Doc);
+  XmlResolve(N);
+  XmlTouch(Self);
+end;
+
+procedure TXmlNode.AddChild(N: TXmlNode);
+begin
+  InsertChild(ZCount, N);
+end;
+
+procedure TXmlNode.RemoveAt(Index: Integer);
+var
+  i: Integer;
+begin
+  if (Index < 0) or (Index >= ZCount) then
+    XmlBad('child ' + IntToStr(Index) + ' of ' + IntToStr(ZCount));
+  ZKids[Index].Parent := nil;
+  for i := Index to ZCount - 2 do
+    ZKids[i] := ZKids[i + 1];
+  ZKids[ZCount - 1] := nil;
+  ZCount := ZCount - 1;
+  XmlTouch(Self);
+end;
+
+procedure TXmlNode.Detach;
+var
+  i: Integer;
+  d: TXmlDoc;
+begin
+  if Parent <> nil then
+  begin
+    Parent.RemoveAt(IndexInParent);
+    Exit;
+  end;
+  d := Doc;
+  if d = nil then
+    Exit;
+  for i := 0 to d.ZCount - 1 do
+    if d.ZKids[i] = Self then
+    begin
+      d.ZKids[i] := nil;
+      Break;
+    end;
+  { close the gap }
+  i := 0;
+  while i < d.ZCount do
+  begin
+    if d.ZKids[i] = nil then
+    begin
+      while i < d.ZCount - 1 do
+      begin
+        d.ZKids[i] := d.ZKids[i + 1];
+        i := i + 1;
+      end;
+      d.ZKids[d.ZCount - 1] := nil;
+      d.ZCount := d.ZCount - 1;
+      Break;
+    end;
+    i := i + 1;
+  end;
+  if d.Root = Self then
+    d.Root := nil;
+  d.ZDirty := True;
+end;
+
+procedure TXmlNode.AppendText(const S: string);
+var
+  t: TXmlNode;
+begin
+  t := XmlMake(xkText, Doc);
+  t.ZValue := S;
+  t.ZChanged := True;
+  AddChild(t);
+end;
+
+function TXmlNode.AddElem(const Nm: string): TXmlNode;
+var
+  c: Integer;
+begin
+  if not XmlIsName(Nm) then
+    XmlBad('invalid element name ' + Nm);
+  Result := XmlMake(xkElement, Doc);
+  Result.Name := Nm;
+  Result.Local := Nm;
+  Result.ZNew := True;
+  c := Pos(':', Nm);
+  if (c > 1) and (c < Length(Nm)) and ((Doc = nil) or Doc.ZNamespaces) then
+  begin
+    Result.Prefix := Copy(Nm, 1, c - 1);
+    Result.Local := Copy(Nm, c + 1, Length(Nm) - c);
+  end;
+  AddChild(Result);
+end;
+
+{ ---- building from a reader ---- }
+
+procedure XmlBuildInto(R: TXmlReader; D: TXmlDoc; Holder: TXmlNode);
+var
+  tok: TXmlToken;
+  cur, n: TXmlNode;
+  src: string;
+  k, i: Integer;
+begin
+  src := R.Source;
+  cur := Holder;
+  while R.Next(tok) do
+  begin
+    case tok.Kind of
+      xtStart:
+        begin
+          n := XmlMake(xkElement, D);
+          n.Name := tok.Name;
+          n.Prefix := tok.Prefix;
+          n.Local := tok.Local;
+          n.URI := tok.URI;
+          n.ZAttrs := tok.Attrs;
+          n.ZTrail := tok.Trail;
+          n.ZSrc := src;
+          n.ZStart := tok.Start;
+          n.ZOpenEnd := tok.OpenEnd;
+          n.Parent := cur;
+          XmlAddKid(cur.ZKids, cur.ZCount, n);
+          cur := n;
+        end;
+      xtEnd:
+        begin
+          cur.ZStop := tok.Stop;
+          if tok.Synth then
+            cur.ZCloseStart := -1
+          else
+            cur.ZCloseStart := tok.Start;
+          if Length(cur.ZKids) <> cur.ZCount then
+            SetLength(cur.ZKids, cur.ZCount);
+          cur := cur.Parent;
+        end;
+    else
+      begin
+        case tok.Kind of
+          xtText: k := Ord(xkText);
+          xtCData: k := Ord(xkCData);
+          xtComment: k := Ord(xkComment);
+          xtPI: k := Ord(xkPI);
+          xtDoctype: k := Ord(xkDoctype);
+        else
+          k := Ord(xkDecl);
+        end;
+        n := XmlMake(TXmlKind(k), D);
+        n.Name := tok.Name;
+        n.ZValue := tok.Value;
+        n.ZSrc := src;
+        n.ZStart := tok.Start;
+        n.ZStop := tok.Stop;
+        n.Parent := cur;
+        XmlAddKid(cur.ZKids, cur.ZCount, n);
+      end;
+    end;
+  end;
+  i := 0;
+  while i < Holder.ZCount do
+  begin
+    Holder.ZKids[i].Parent := nil;
+    i := i + 1;
+  end;
+  if Length(Holder.ZKids) <> Holder.ZCount then
+    SetLength(Holder.ZKids, Holder.ZCount);
+end;
+
+function XmlBuild(R: TXmlReader): TXmlDoc;
+var
+  d: TXmlDoc;
+  h: TXmlNode;
+  i: Integer;
+  n: TXmlNode;
+begin
+  d := TXmlDoc.Create;
+  d.ZSrc := R.Source;
+  d.ZBom := R.BomLength;
+  d.ZNamespaces := R.Namespaces;
+  d.ZDirty := False;
+  h := XmlMake(xkElement, d);
+  XmlBuildInto(R, d, h);
+  d.ZKids := h.ZKids;
+  d.ZCount := h.ZCount;
+  d.FEncoding := R.Encoding;
+  d.FStandalone := R.Standalone;
+  d.FVersion := R.Version;
+  for i := 0 to d.ZCount - 1 do
+  begin
+    n := d.ZKids[i];
+    if n.Kind = xkElement then
+      d.Root := n;
+    if (n.Kind = xkDecl) and R.Transcoded then
+    begin
+      { the text is UTF-8 now: the declaration says so }
+      n.ZValue := '<?xml version="' + R.Version + '" encoding="UTF-8"';
+      if R.Standalone <> '' then
+        n.ZValue := n.ZValue + ' standalone="' + R.Standalone + '"';
+      n.ZValue := n.ZValue + '?>';
+      n.ZChanged := True;
+      d.ZDirty := True;
+      d.FEncoding := 'UTF-8';
+    end;
+  end;
+  Result := d;
+end;
+
+function XmlParse(const S: string): TXmlDoc;
+var
+  r: TXmlReader;
+begin
+  r := TXmlReader.Create(S);
+  Result := XmlBuild(r);
+end;
+
+function XmlParseFlat(const S: string): TXmlDoc;
+var
+  r: TXmlReader;
+begin
+  r := TXmlReader.Create(S);
+  r.Namespaces := False;
+  Result := XmlBuild(r);
+end;
+
+function XmlTryParse(const S: string; out Doc: TXmlDoc; out Err: string): Boolean;
+begin
+  Doc := nil;
+  Err := '';
+  Result := False;
+  try
+    Doc := XmlParse(S);
+    Result := True;
+  except
+    on E: EXmlError do
+      Err := E.Message;
+  end;
+end;
+
+{ content in XML text, read in the scope of this element }
+procedure XmlParseContent(N: TXmlNode; const Fragment: string; Holder: TXmlNode);
+var
+  r: TXmlReader;
+  chain: array of TXmlNode;
+  p: TXmlNode;
+  i, j, k: Integer;
+begin
+  r := TXmlReader.CreateFragment(Fragment);
+  if (N.Doc <> nil) and (not N.Doc.ZNamespaces) then
+    r.Namespaces := False;
+  { the bindings in scope, the outermost first }
+  chain := nil;
+  p := N;
+  k := 0;
+  while p <> nil do
+  begin
+    SetLength(chain, k + 1);
+    chain[k] := p;
+    k := k + 1;
+    p := p.Parent;
+  end;
+  for i := k - 1 downto 0 do
+    for j := 0 to High(chain[i].ZAttrs) do
+      if chain[i].ZAttrs[j].Name = 'xmlns' then
+        r.Bind('', chain[i].ZAttrs[j].Value)
+      else if chain[i].ZAttrs[j].Prefix = 'xmlns' then
+        r.Bind(chain[i].ZAttrs[j].Local, chain[i].ZAttrs[j].Value);
+  XmlBuildInto(r, N.Doc, Holder);
+end;
+
+procedure TXmlNode.InsertXml(Index: Integer; const Fragment: string);
+var
+  h: TXmlNode;
+  i: Integer;
+  kids: TXmlNodeArray;
+  n: Integer;
+begin
+  if Kind <> xkElement then
+    XmlBad('only an element has children');
+  if (Index < 0) or (Index > ZCount) then
+    XmlBad('child place ' + IntToStr(Index) + ' of ' + IntToStr(ZCount));
+  h := XmlMake(xkElement, Doc);
+  XmlParseContent(Self, Fragment, h);
+  kids := h.ZKids;
+  n := h.ZCount;
+  for i := 0 to n - 1 do
+    InsertChild(Index + i, kids[i]);
+end;
+
+procedure TXmlNode.AppendXml(const Fragment: string);
+begin
+  InsertXml(ZCount, Fragment);
+end;
+
+{ ---- writing a tree ---- }
+
+procedure XmlEmit(N: TXmlNode; var B: TXmlBufRec); forward;
+
+procedure XmlEmitAttr(N: TXmlNode; I: Integer; var B: TXmlBufRec);
+var
+  a: TXmlAttr;
+  q: Char;
+begin
+  a := N.ZAttrs[I];
+  BufStr(B, a.Lead);
+  if (a.RawStart >= 1) and (not a.Changed) then
+    BufRange(B, N.ZSrc, a.RawStart, a.RawStop - a.RawStart)
+  else
+  begin
+    q := a.Quote;
+    if q = #0 then
+      q := '"';
+    BufStr(B, a.Name);
+    BufChar(B, 61);
+    BufChar(B, Ord(q));
+    if q = '"' then
+      BufStr(B, XmlEscapeMode(a.Value, 1))
+    else
+      BufStr(B, XmlEscapeMode(a.Value, 2));
+    BufChar(B, Ord(q));
+  end;
+end;
+
+procedure XmlEmitElement(N: TXmlNode; var B: TXmlBufRec);
+var
+  i: Integer;
+  ended: Boolean;
+begin
+  ended := N.ZCloseStart >= 1;
+  if (N.ZStart >= 1) and (not N.ZDirty) then
+  begin
+    BufRange(B, N.ZSrc, N.ZStart, N.ZStop - N.ZStart);
+    Exit;
+  end;
+  if (N.ZStart >= 1) and (not N.ZHead) and (ended or (N.ZCount = 0)) then
+    BufRange(B, N.ZSrc, N.ZStart, N.ZOpenEnd - N.ZStart)
+  else
+  begin
+    BufChar(B, 60);
+    BufStr(B, N.Name);
+    for i := 0 to High(N.ZAttrs) do
+      XmlEmitAttr(N, i, B);
+    BufStr(B, N.ZTrail);
+    if (N.ZCount = 0) and (not ended) then
+      BufStr(B, '/>')
+    else
+      BufChar(B, 62);
+  end;
+  if (N.ZCount = 0) and (not ended) then
+    Exit;
+  for i := 0 to N.ZCount - 1 do
+    XmlEmit(N.ZKids[i], B);
+  if ended then
+    BufRange(B, N.ZSrc, N.ZCloseStart, N.ZStop - N.ZCloseStart)
+  else
+  begin
+    BufStr(B, '</');
+    BufStr(B, N.Name);
+    BufChar(B, 62);
+  end;
+end;
+
+procedure XmlEmit(N: TXmlNode; var B: TXmlBufRec);
+var
+  v: string;
+  p: Integer;
+begin
+  if (N.ZStart >= 1) and (not N.ZChanged) and (N.Kind <> xkElement) then
+  begin
+    BufRange(B, N.ZSrc, N.ZStart, N.ZStop - N.ZStart);
+    Exit;
+  end;
+  case N.Kind of
+    xkElement:
+      XmlEmitElement(N, B);
+    xkText:
+      BufStr(B, XmlEscapeMode(N.ZValue, 0));
+    xkCData:
+      begin
+        BufStr(B, '<![CDATA[');
+        v := N.ZValue;
+        p := Pos(']]>', v);
+        while p > 0 do
+        begin
+          BufStr(B, Copy(v, 1, p + 1));
+          BufStr(B, ']]><![CDATA[');
+          v := Copy(v, p + 2, Length(v) - p - 1);
+          p := Pos(']]>', v);
+        end;
+        BufStr(B, v);
+        BufStr(B, ']]>');
+      end;
+    xkComment:
+      begin
+        v := N.ZValue;
+        if (Pos('--', v) > 0) or ((v <> '') and (v[Length(v)] = '-')) then
+          XmlBad('a comment cannot hold -- or end with -');
+        BufStr(B, '<!--');
+        BufStr(B, v);
+        BufStr(B, '-->');
+      end;
+    xkPI:
+      begin
+        if Pos('?>', N.ZValue) > 0 then
+          XmlBad('a processing instruction cannot hold ?>');
+        BufStr(B, '<?');
+        BufStr(B, N.Name);
+        if N.ZValue <> '' then
+        begin
+          BufChar(B, 32);
+          BufStr(B, N.ZValue);
+        end;
+        BufStr(B, '?>');
+      end;
+  else
+    BufStr(B, N.ZValue);
+  end;
+end;
+
+function TXmlNode.OuterXml: string;
+var
+  B: TXmlBufRec;
+begin
+  B.N := 0;
+  XmlEmit(Self, B);
+  Result := BufResult(B);
+end;
+
+function TXmlNode.InnerXml: string;
+var
+  B: TXmlBufRec;
+  i: Integer;
+begin
+  B.N := 0;
+  for i := 0 to ZCount - 1 do
+    XmlEmit(ZKids[i], B);
+  Result := BufResult(B);
+end;
+
+function TXmlNode.Offset: Integer;
+begin
+  if ZStart >= 1 then
+    Result := ZStart - 1
+  else
+    Result := -1;
+end;
+
+function TXmlNode.ByteLength: Integer;
+begin
+  if ZStart >= 1 then
+    Result := ZStop - ZStart
+  else
+    Result := 0;
+end;
+
+{ ---- the document ---- }
+
+constructor TXmlDoc.Create;
+begin
+  ZNamespaces := True;
+  ZDirty := True;
+  FVersion := '1.0';
+end;
+
+function TXmlDoc.CreateElement(const Nm: string): TXmlNode;
+var
+  c: Integer;
+begin
+  if not XmlIsName(Nm) then
+    XmlBad('invalid element name ' + Nm);
+  Result := XmlMake(xkElement, Self);
+  Result.Name := Nm;
+  Result.Local := Nm;
+  Result.ZNew := True;
+  c := Pos(':', Nm);
+  if (c > 1) and (c < Length(Nm)) and ZNamespaces then
+  begin
+    Result.Prefix := Copy(Nm, 1, c - 1);
+    Result.Local := Copy(Nm, c + 1, Length(Nm) - c);
+  end;
+end;
+
+function TXmlDoc.CreateText(const S: string): TXmlNode;
+begin
+  Result := XmlMake(xkText, Self);
+  Result.ZValue := S;
+  Result.ZChanged := True;
+end;
+
+function TXmlDoc.CreateCData(const S: string): TXmlNode;
+begin
+  Result := XmlMake(xkCData, Self);
+  Result.ZValue := S;
+  Result.ZChanged := True;
+end;
+
+function TXmlDoc.CreateComment(const S: string): TXmlNode;
+begin
+  Result := XmlMake(xkComment, Self);
+  Result.ZValue := S;
+  Result.ZChanged := True;
+end;
+
+function TXmlDoc.CreatePI(const ATarget, AData: string): TXmlNode;
+begin
+  if (not XmlIsName(ATarget)) or (XmlLower(ATarget) = 'xml') then
+    XmlBad('invalid processing instruction target ' + ATarget);
+  Result := XmlMake(xkPI, Self);
+  Result.Name := ATarget;
+  Result.ZValue := AData;
+  Result.ZChanged := True;
+end;
+
+procedure TXmlDoc.AddTop(N: TXmlNode);
+begin
+  if (N.Parent <> nil) or ((N.Doc <> nil) and (N.Doc <> Self)) then
+    XmlBad('the node already has a place; Detach it first');
+  if N.Kind = xkElement then
+  begin
+    if Root <> nil then
+      XmlBad('the document already has a root element');
+    Root := N;
+  end
+  else if (N.Kind = xkText) and (Trim(N.ZValue) <> '') then
+    XmlBad('text is not allowed outside the root element');
+  XmlSetDoc(N, Self);
+  XmlAddKid(ZKids, ZCount, N);
+  XmlResolve(N);
+  ZDirty := True;
+end;
+
+function TXmlDoc.Count: Integer;
+begin
+  Result := ZCount;
+end;
+
+function TXmlDoc.Item(I: Integer): TXmlNode;
+begin
+  if (I < 0) or (I >= ZCount) then
+    XmlBad('top level node ' + IntToStr(I) + ' of ' + IntToStr(ZCount));
+  Result := ZKids[I];
+end;
+
+function TXmlDoc.Xml: string;
+var
+  B: TXmlBufRec;
+  i: Integer;
+begin
+  if not ZDirty then
+  begin
+    Result := ZSrc;
+    Exit;
+  end;
+  B.N := 0;
+  if ZBom > 0 then
+    BufRange(B, ZSrc, 1, ZBom);
+  for i := 0 to ZCount - 1 do
+    XmlEmit(ZKids[i], B);
+  Result := BufResult(B);
+end;
+
+{ ---- the writer ---- }
+
+constructor TXmlWriter.Create;
+begin
+  Indent := '';
+  FN := 0;
+  FD := 0;
+  FOpen := False;
+  FWritten := False;
+end;
+
+procedure TXmlWriter.Put(const S: string);
+var
+  k, c: Integer;
+begin
+  k := Length(S);
+  if k = 0 then
+    Exit;
+  if FN + k > Length(FS) then
+  begin
+    c := Length(FS) * 2;
+    if c < FN + k then
+      c := FN + k;
+    if c < 256 then
+      c := 256;
+    SetLength(FS, c);
+  end;
+  Move(S[1], FS[FN + 1], k);
+  FN := FN + k;
+end;
+
+procedure TXmlWriter.CloseOpen;
+begin
+  if FOpen then
+  begin
+    Put('>');
+    FOpen := False;
+  end;
+end;
+
+procedure TXmlWriter.Newline(Level: Integer);
+var
+  i: Integer;
+begin
+  if (FN > 0) and (FS[FN] = #10) then
+  begin
+    { already at the start of a line }
+  end
+  else if FN > 0 then
+    Put(#10);
+  for i := 1 to Level do
+    Put(Indent);
+end;
+
+procedure TXmlWriter.Decl(const AStandalone: string);
+begin
+  if FN > 0 then
+    XmlBad('the declaration comes first');
+  Put('<?xml version="1.0" encoding="UTF-8"');
+  if AStandalone <> '' then
+    Put(' standalone="' + AStandalone + '"');
+  Put('?>' + #10);
+end;
+
+procedure TXmlWriter.Start(const Nm: string);
+begin
+  if not XmlIsName(Nm) then
+    XmlBad('invalid element name ' + Nm);
+  if (FD = 0) and FWritten and (FN > 0) and (Indent = '') and False then
+    XmlBad('a second root element');
+  CloseOpen;
+  if (Indent <> '') and ((FD = 0) or (FKids[FD - 1] <> 2)) then
+    Newline(FD);
+  if FD > 0 then
+  begin
+    if FKids[FD - 1] = 0 then
+      FKids[FD - 1] := 1;
+  end;
+  Put('<' + Nm);
+  FOpen := True;
+  FWritten := True;
+  if FD >= Length(FNames) then
+  begin
+    SetLength(FNames, FD * 2 + 8);
+    SetLength(FKids, FD * 2 + 8);
+  end;
+  FNames[FD] := Nm;
+  FKids[FD] := 0;
+  FD := FD + 1;
+end;
+
+procedure TXmlWriter.Attr(const Nm, AValue: string);
+begin
+  if not FOpen then
+    XmlBad('Attr comes right after Start');
+  if not XmlIsName(Nm) then
+    XmlBad('invalid attribute name ' + Nm);
+  Put(' ' + Nm + '="' + XmlEscapeMode(AValue, 1) + '"');
+end;
+
+procedure TXmlWriter.Text(const S: string);
+begin
+  if FD = 0 then
+    XmlBad('text is not allowed outside the root element');
+  CloseOpen;
+  FKids[FD - 1] := 2;
+  Put(XmlEscapeMode(S, 0));
+end;
+
+procedure TXmlWriter.CData(const S: string);
+var
+  v: string;
+  p: Integer;
+begin
+  if FD = 0 then
+    XmlBad('CDATA is not allowed outside the root element');
+  CloseOpen;
+  FKids[FD - 1] := 2;
+  Put('<![CDATA[');
+  v := S;
+  p := Pos(']]>', v);
+  while p > 0 do
+  begin
+    Put(Copy(v, 1, p + 1));
+    Put(']]><![CDATA[');
+    v := Copy(v, p + 2, Length(v) - p - 1);
+    p := Pos(']]>', v);
+  end;
+  Put(v);
+  Put(']]>');
+end;
+
+procedure TXmlWriter.Comment(const S: string);
+begin
+  if (Pos('--', S) > 0) or ((S <> '') and (S[Length(S)] = '-')) then
+    XmlBad('a comment cannot hold -- or end with -');
+  CloseOpen;
+  if (Indent <> '') and ((FD = 0) or (FKids[FD - 1] <> 2)) then
+    Newline(FD);
+  if (FD > 0) and (FKids[FD - 1] = 0) then
+    FKids[FD - 1] := 1;
+  Put('<!--' + S + '-->');
+end;
+
+procedure TXmlWriter.ProcInst(const ATarget, AData: string);
+begin
+  if (not XmlIsName(ATarget)) or (XmlLower(ATarget) = 'xml') then
+    XmlBad('invalid processing instruction target ' + ATarget);
+  if Pos('?>', AData) > 0 then
+    XmlBad('a processing instruction cannot hold ?>');
+  CloseOpen;
+  if (Indent <> '') and ((FD = 0) or (FKids[FD - 1] <> 2)) then
+    Newline(FD);
+  if (FD > 0) and (FKids[FD - 1] = 0) then
+    FKids[FD - 1] := 1;
+  if AData = '' then
+    Put('<?' + ATarget + '?>')
+  else
+    Put('<?' + ATarget + ' ' + AData + '?>');
+end;
+
+procedure TXmlWriter.Raw(const S: string);
+begin
+  CloseOpen;
+  if FD > 0 then
+    FKids[FD - 1] := 2;
+  Put(S);
+end;
+
+procedure TXmlWriter.EndElement;
+begin
+  if FD = 0 then
+    XmlBad('EndElement without Start');
+  FD := FD - 1;
+  if FOpen then
+  begin
+    Put('/>');
+    FOpen := False;
+  end
+  else
+  begin
+    if (Indent <> '') and (FKids[FD] = 1) then
+      Newline(FD);
+    Put('</' + FNames[FD] + '>');
+  end;
+end;
+
+procedure TXmlWriter.Element(const Nm, AText: string);
+begin
+  Start(Nm);
+  if AText <> '' then
+    Text(AText);
+  EndElement;
+end;
+
+function TXmlWriter.Output: string;
+begin
+  if FD > 0 then
+    XmlBad('<' + FNames[FD - 1] + '> is not ended');
+  Result := Copy(FS, 1, FN);
+end;
+
+end.
