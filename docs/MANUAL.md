@@ -12103,6 +12103,101 @@ u: TUrl;  UrlParse('http://u:p@h:81/a%20b?q=1#f', u, err);  UrlString(u);  UrlRe
   guarded); a response, a reader and a `TUrlValues` belong to the routine
   that uses them.
 
+`uses pasmime`, `uses passmtp` and `uses pasimap` are mail (1.1.267, P433): `pasmime`
+reads and writes Internet messages as Go's `mime`, `mime/multipart`, `mime/quotedprintable`
+and `net/mail` do (quoted-printable, encoded words, media types with RFC 2231 parameters,
+multipart, addresses, dates) and adds what a mail program needs on top, a message read into a tree of
+parts and a composer; `passmtp` is `net/smtp` (the same commands, the same replies read the same way, the
+same dot writer) with AUTH LOGIN and XOAUTH2 added; `pasimap` is an IMAP4rev1 client. They sit on
+`pasconn` (P432), so a connection is TCP and TLS will come from the TLS unit through
+`TlsDialer` (SMTPS on 465, IMAPS on 993, `SmtpImplicit`, `ImapImplicit`) and `TlsUpgrader` (STARTTLS on 587 and
+143); until there is one a TLS connection is refused with a message and a plain one works (and PLAIN and LOGIN are refused
+on a connection that is neither TLS nor to localhost, as Go's PlainAuth refuses). Checked: `testdata/mime`
+has 2,213 cases (quoted-printable both ways, encoded words, media types, multipart, 653 addresses and lists, 302 dates,
+89 messages) with what Go's `mime`, `net/mail` and `mime/multipart` answer, error text included; `testdata/mailtree`
+has 153 messages that Python's `email` package reads and the same tree is read here; `testdata/mailbuild` builds 93
+messages that `scripts/mail_build_verify.py` reads back with `email` (seven bits, CRLF, line lengths, fields,
+bodies, files, structure); `testdata/mailscale` reads a text of 1 MB, a header of 20,000 words, a Content-Type of 20,000 parameters, 5,000 parts and the like in milliseconds; `testdata/mailtls` checks the TLS hooks with an upgrader of its own; `testdata/smtp` runs 57 scenarios of a scripted server and prints what the server received,
+identical to what `scripts/smtp_client_go.go` prints for Go's `smtp.SendMail`; `testdata/imap` runs 47 scenarios
+(the examples of RFC 3501 and what go-imap's server and Python's `imaplib` send and take) against a server of
+its own, and `scripts/imap_python_check.py` reads a mailbox a go-imap server holds with `imaplib` after
+this client wrote to it, and the other way.
+
+```pascal
+{ read }
+if MailParseEntity(raw, e, err) then
+begin
+  WriteLn(e.HeaderText('Subject'));                         { encoded words decoded }
+  t := MailFindText(e, False);                               { the plain text part, nil if none }
+  if t <> nil then Body := t.Text(True);                     { in UTF-8, by the charset (True: also windows-1252, ISO-8859-15) }
+  atts := MailAttachments(e);                                { FileName, MediaType, Body (decoded), ContentId }
+end;
+MailParseAddressList('"Garc' + ... + '" <g@x.y>, =?UTF-8?Q?Mar=C3=ADa?= <m@x.z>', True, list, err);
+MailParseDate('Tue, 10 Jun 2003 04:00:00 +0200', unix, offset, err);
+
+{ compose and send }
+b := TMailBuilder.Create;
+b.Sender.Name := 'Ana'; b.Sender.Address := 'ana@example.com';
+b.AddTo('Bea', 'bea@example.org');  b.AddBcc('', 'audit@example.com');
+b.Subject := 'Informe'; b.TextBody := Texto; b.HtmlBody := Pagina;       { alternative when both }
+b.Attach('informe.xlsx', '', Datos);  b.AttachInline('logo.png', 'image/png', 'logo1', Png);
+b.SetDate(NowUnix, 7200);                                       { NowUnix of pastime }
+SmtpSend('smtp.example.com', 587, SmtpStartTls, 'ana', Clave, b, 30000);   { EMimeError for what is refused, ESmtpError }
+
+{ read a mailbox }
+c := ImapDial('imap.example.com', 143, ImapStartTls, 30000);
+c.Login('ana', Clave);
+sel := c.SelectMailbox('INBOX', False);                      { Exists, UidValidity, UidNext, Flags... }
+uids := c.UidSearch('UNSEEN SINCE 1-Oct-2026');             { the UIDs, in the server's order }
+msgs := c.UidFetch('1:*', '(UID FLAGS RFC822.SIZE ENVELOPE)');  { or '(BODY.PEEK[])' and MailParseEntity(m.Body, ...) }
+c.UidStore('12', '+FLAGS', '(\Seen)');  c.UidMove('12', 'Archivo');  c.Logout;
+```
+- **Messages.** `MailParseEntity` gives a `TMailEntity`: `Header` (`TMimeFields`), `MediaType`, `Params`,
+  `Disposition`, `Encoding`, `Body` (the transfer encoding undone: base64 and quoted-printable as mail readers take
+  them, bytes that do not belong passed over and `BodyErr` set), `Kid(i)` for a multipart's parts and for the message
+  inside a `message/rfc822`, `Text(Extra)`, `FileName` (the disposition's, else the type's `name`, an encoded word
+  decoded), `ContentId`, `IsAttachment`, `HeaderText(key)`. `MailFindText(e, Html)` and `MailAttachments(e)` find
+  the body and the files. The reading is the lenient one a mail reader needs (a message that Go's `ReadMessage`
+  refuses is refused here too, the parts of a broken multipart are kept, a part with no Content-Type is text/plain,
+  the parts of `multipart/digest` are messages); at most 24 levels and 4,000 parts.
+- **Addresses and dates.** `MailParseAddress` and `MailParseAddressList` are `net/mail`'s parser (groups, comments,
+  quoted strings, domain literals, encoded words), the error texts Go's; `Extra` adds windows-1252 and ISO-8859-15
+  to the three charsets of Go's default decoder, which Spanish mail needs. `MailAddressString` writes a name quoted or
+  as encoded words. `MailParseDate` tries mail's 48 layouts as `time.Parse` does (a zone `GMT+3` keeps the
+  clock reading as UTC, as Go does) except that the North American names EST to PDT have their offsets (Go knows them
+  only when its local zone has them; elsewhere it takes them for UTC); `MailFormatDate` writes the RFC 5322 form.
+- **Words and media types.** `MimeEncodeWord`, `MimeDecodeWord`, `MimeDecodeHeader`, `MimeParseMediaType` and
+  `MimeParseMediaTypeEx` (Loose: also the RFC 2231 parameters in iso-8859-1, windows-1252 and iso-8859-15, which `MimeParseMediaType` drops as Go does) and `MimeFormatMediaType` (RFC 2231 continuations and encodings), `QpEncode`, `QpDecode` (Go's reader, strict) and
+  `MailDecodeQp`, `MailDecodeBase64` (lenient), `MimeReadMultipart`, `MimeWriteMultipart`, `MimeNewBoundary`.
+- **The composer.** `TMailBuilder.Build` gives the message with CRLF and seven bits: `text/plain` alone, or
+  `multipart/alternative` with the page, `multipart/related` when the page has inline files, `multipart/mixed` with
+  the attachments; text parts as 7bit when they are ASCII with lines of at most 998 bytes, else quoted-printable or
+  base64, whichever is shorter; files in base64 of 76 columns; names and subject beyond ASCII as encoded words; every
+  field folded to 78 where a space allows; a `Message-ID` from random bytes and the sender's domain, a boundary from
+  random bytes (both can be set, and are in the tests); no `Date` unless `SetDate` (a submission server adds it);
+  `Bcc` is never written, only returned by `Recipients`. A CR or LF in an address, a name, the subject or a
+  header, an address with no `@`, a boundary that is not valid: `EMimeError`, nothing is written.
+- **SMTP.** `SmtpSendMail(host, port, mode, user, pass, from, rcpts, msg, ms)` is `smtp.SendMail`: EHLO (HELO when it is
+  refused), STARTTLS when offered and a TLS unit is linked (`SmtpStartTls` demands it), AUTH when `user` is not empty
+  (PLAIN, else LOGIN, else CRAM-MD5), `MAIL FROM` with `BODY=8BITMIME` and `SMTPUTF8` when the server has them,
+  `RCPT TO` for each, `DATA` with the text as the dot writer writes it, `QUIT`. `TSmtpClient` has the steps
+  (`Hello`, `Extension`, `StartTls`, `AuthPlain`, `AuthLogin`, `AuthCramMd5`, `AuthXOAuth2`, `MailFrom`, `RcptTo`,
+  `SendData`, `Verify`, `Reset`, `Noop`, `Quit`, `Disconnect`). An error is an `ESmtpError` with `Code` (the reply's, 0 when
+  none) and `Timeout`; its text for a reply is Go's: `550 "no such user"`.
+- **IMAP.** `ImapDial(host, port, mode, ms)` reads the greeting; `TImapClient` has `Login`, `AuthenticatePlain`,
+  `AuthenticateXOAuth2`, `StartTls`, `ListMailboxes`, `SelectMailbox`, `MailboxStatus`, `UidSearch`, `UidFetch`,
+  `FetchRaw`, `UidStore`, `Expunge`, `UidCopy`, `UidMove` (MOVE, else copy, mark and expunge), `AppendMessage` (the
+  UID of UIDPLUS or 0), `CreateMailbox`, `DeleteMailbox`, `RenameMailbox`, `Subscribe`, `Unsubscribe`, `CloseMailbox`,
+  `Idle(ms)` (True when the server told of a change), `Noop`, `Logout`. Mailbox names are UTF-8 and travel in the
+  modified UTF-7 of RFC 3501 5.1.3 (`ImapEncodeMailbox`, `ImapDecodeMailbox`); a string with a CR, LF, NUL or a
+  byte past 127 goes as a literal, after the server's `+` or at once with LITERAL+ (or LITERAL- when it is short). A
+  response is read by the grammar of section 9: `TImapMessage.Attr('BODYSTRUCTURE')` gives any item as a
+  `TImapNode` tree, `ImapParseEnvelope` the envelope (encoded words decoded, groups left out),
+  `ImapParseInternalDate` the date; `Body`, `Header` and `BodyText` hold `BODY[]`, `BODY[HEADER]` and `BODY[TEXT]`.
+  An error is an `EImapError`: `Kind` is `ImapNo`, `ImapBad` (the server said NO or BAD, `Code` is its response
+  code, TRYCREATE and AUTHENTICATIONFAILED among them), `ImapBye`, `ImapIo` or `ImapProtocol` (the bytes were
+  not IMAP). A literal is taken up to 1 GiB and a line up to 1 MiB. `Close`, `Select` and `Append` are words of
+  the language, so the methods are `Disconnect`, `SelectMailbox` and `AppendMessage` (`CloseMailbox` is CLOSE).
 `uses sqlite` gives SQLite 3.54.1 in paslang: the library itself, written
 from SQLite's own file format, documents and sources (P403 the file,
 P404 the SQL, 1.1.253 P405 the rest). It is a library unit, as `pasnet`

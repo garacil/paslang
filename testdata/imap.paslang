@@ -1,0 +1,745 @@
+{ P433: pasimap, scenario by scenario. testdata/imap.txt (scripts/imap_cases.py
+  writes it) holds 47 scenarios: a script for a server (what it sends for each
+  command it receives, with the texts of RFC 3501 section 8 and what go-imap's
+  server and Python's imaplib were seen to send and take) and the operations
+  the client runs (login, list, select, fetch, store, append, idle...). Each
+  runs against a server of this program's own over TCP on 127.0.0.1 and is
+  printed as the lines the server received (S:, L: for a literal's data) and
+  the result of each operation (R:). The golden file is this output; the
+  results were read against the RFCs, and scripts/imap_python_check.py with
+  go-imap's server read the same data back with Python's imaplib. Then the
+  helpers (mailbox names in modified UTF-7, UID sets, quoting, dates) are
+  checked on their own. }
+program imap;
+
+uses
+  sysutils, pascodec, pastextproto, pasnet, pasconn, pasmime, pasimap;
+
+const
+  HexDigits: string = '0123456789abcdef';
+
+type
+  TScenario = record
+    Name: string;
+    Replies: array of string;
+    OpNames: array of string;
+    OpArgs: array of TStringArray;
+  end;
+
+var
+  SrvReplies: array of string;
+  SrvOut: string;
+  SrvAccepted: Boolean;
+  WG: waitgroup;
+
+function Un64(const S: string): string;
+begin
+  if S = '-' then
+    Result := ''
+  else if not Base64Decode(S, False, True, Result) then
+  begin
+    WriteLn('bad base64');
+    Halt(2);
+  end;
+end;
+
+function Esc(const S: string): string;
+var
+  i, c: Integer;
+begin
+  Result := '';
+  for i := 1 to Length(S) do
+  begin
+    c := Ord(S[i]);
+    if c = 92 then
+      Result := Result + '\\'
+    else if c = 13 then
+      Result := Result + '\r'
+    else if c = 10 then
+      Result := Result + '\n'
+    else if (c >= 32) and (c < 127) then
+      Result := Result + S[i]
+    else
+      Result := Result + '\x' + HexDigits[(c shr 4) + 1] + HexDigits[(c and 15) + 1];
+  end;
+end;
+
+function Hex8(V: Integer): string;
+var
+  i: Integer;
+begin
+  SetLength(Result, 8);
+  for i := 8 downto 1 do
+  begin
+    Result[i] := HexDigits[(V and 15) + 1];
+    V := V shr 4;
+  end;
+end;
+
+function Sum(const S: string): string;
+begin
+  Result := IntToStr(Length(S)) + ':' + Hex8(Crc32(S));
+end;
+
+{ ---- the server ---- }
+
+function IsBang(const S: string): Boolean;
+begin
+  Result := (S <> '') and (S[1] = '!');
+end;
+
+{ sends the next item and the ones after it that start with ! ; when none is
+  left the server stops writing }
+procedure SendNext(C: Integer; var Idx: Integer; var Closed: Boolean; out Sent: string);
+var
+  n: Integer;
+  t: string;
+begin
+  n := Length(SrvReplies);
+  Sent := '';
+  if (not Closed) and (Idx < n) then
+  begin
+    t := SrvReplies[Idx];
+    if IsBang(t) then
+      t := Copy(t, 2, Length(t) - 1);
+    TcpWrite(C, t);
+    Sent := t;
+    Idx := Idx + 1;
+    while (Idx < n) and IsBang(SrvReplies[Idx]) do
+    begin
+      Sleep(20);
+      t := SrvReplies[Idx];
+      TcpWrite(C, Copy(t, 2, Length(t) - 1));
+      Idx := Idx + 1;
+    end;
+  end;
+  if (not Closed) and (Idx >= n) then
+  begin
+    TcpShutdown(C, 1);
+    Closed := True;
+  end;
+end;
+
+{ the data of a literal: the text if it is short, else its size and sum }
+function LitText(const S: string): string;
+begin
+  if Length(S) <= 120 then
+    Result := Esc(S)
+  else
+    Result := '<' + Sum(S) + '>';
+end;
+
+{ one line of the client from the buffer and the socket (the LF off); False at the end }
+function SrvLine(C: Integer; var Buf: string; out Line: string): Boolean;
+var
+  p: Integer;
+  chunk: string;
+begin
+  Result := False;
+  Line := '';
+  p := Pos(#10, Buf);
+  while p = 0 do
+  begin
+    chunk := TcpReadDeadline(C, 65536, 5000);
+    if chunk = '' then
+    begin
+      if Buf <> '' then
+      begin
+        Line := Buf;
+        Buf := '';
+        Result := True;
+      end;
+      Exit;
+    end;
+    Buf := Buf + chunk;
+    p := Pos(#10, Buf);
+  end;
+  Line := Copy(Buf, 1, p - 1);
+  Buf := Copy(Buf, p + 1, Length(Buf) - p);
+  Result := True;
+end;
+
+function SrvBytes(C: Integer; var Buf: string; N: Integer; out Data: string): Boolean;
+var
+  chunk: string;
+begin
+  Result := False;
+  while Length(Buf) < N do
+  begin
+    chunk := TcpReadDeadline(C, 65536, 5000);
+    if chunk = '' then
+    begin
+      Data := Buf;
+      Buf := '';
+      Exit;
+    end;
+    Buf := Buf + chunk;
+  end;
+  Data := Copy(Buf, 1, N);
+  Buf := Copy(Buf, N + 1, Length(Buf) - N);
+  Result := True;
+end;
+
+{ the count of a literal at the end of a line (in braces, a + before the closing brace when it needs no wait); -1 when there is none }
+function LiteralAtEnd(const Line: string; out Sync: Boolean): Integer;
+var
+  e, i, n: Integer;
+  l: string;
+begin
+  Result := -1;
+  Sync := True;
+  l := Line;
+  if (l <> '') and (l[Length(l)] = #13) then
+    l := Copy(l, 1, Length(l) - 1);
+  if (l = '') or (l[Length(l)] <> '}') then
+    Exit;
+  e := Length(l) - 1;
+  if (e >= 1) and (l[e] = '+') then
+  begin
+    Sync := False;
+    e := e - 1;
+  end;
+  i := e;
+  while (i >= 1) and (l[i] >= '0') and (l[i] <= '9') do
+    i := i - 1;
+  if (i = e) or (i < 1) or (l[i] <> '{') then
+    Exit;
+  n := StrToInt(Copy(l, i + 1, e - i));
+  Result := n;
+end;
+
+procedure ServeOne(L: Integer);
+var
+  c, idx, n: Integer;
+  buf, line, data: string;
+  closed, sync: Boolean;
+  sent: string;
+begin
+  c := TcpAccept(L);
+  if c < 0 then
+  begin
+    WG.Done;
+    Exit;
+  end;
+  SrvAccepted := True;
+  idx := 0;
+  closed := False;
+  buf := '';
+  SendNext(c, idx, closed, sent);
+  while True do
+  begin
+    if not SrvLine(c, buf, line) then
+      Break;
+    SrvOut := SrvOut + 'S: ' + Esc(line) + #10;
+    n := LiteralAtEnd(line, sync);
+    while n >= 0 do
+    begin
+      if sync then
+      begin
+        SendNext(c, idx, closed, sent);
+        { an answer that is no + ends the command: no literal follows }
+        if (sent = '') or (sent[1] <> '+') then
+          Break;
+      end;
+      if not SrvBytes(c, buf, n, data) then
+      begin
+        SrvOut := SrvOut + 'L: ' + LitText(data) + #10;
+        TcpClose(c);
+        WG.Done;
+        Exit;
+      end;
+      SrvOut := SrvOut + 'L: ' + LitText(data) + #10;
+      if not SrvLine(c, buf, line) then
+      begin
+        TcpClose(c);
+        WG.Done;
+        Exit;
+      end;
+      SrvOut := SrvOut + 'S: ' + Esc(line) + #10;
+      n := LiteralAtEnd(line, sync);
+    end;
+    if n < 0 then
+      SendNext(c, idx, closed, sent);
+  end;
+  TcpClose(c);
+  WG.Done;
+end;
+
+{ ---- the client's operations ---- }
+
+function DumpNode(N: TImapNode): string;
+var
+  i: Integer;
+begin
+  if N = nil then
+  begin
+    Result := '<absent>';
+    Exit;
+  end;
+  if N.IsNil then
+    Result := 'NIL'
+  else if N.IsList then
+  begin
+    Result := '(';
+    for i := 0 to N.Count - 1 do
+    begin
+      if i > 0 then
+        Result := Result + ' ';
+      Result := Result + DumpNode(N.Item(i));
+    end;
+    Result := Result + ')';
+  end
+  else if N.Kind = inString then
+    Result := '"' + Esc(N.Text) + '"'
+  else
+    Result := Esc(N.Text);
+end;
+
+function JoinStr(const A: TStringArray): string;
+var
+  i: Integer;
+begin
+  Result := '';
+  for i := 0 to Length(A) - 1 do
+  begin
+    if i > 0 then
+      Result := Result + ',';
+    Result := Result + A[i];
+  end;
+end;
+
+function AddrsText(const A: TMailAddressArray): string;
+var
+  i: Integer;
+begin
+  Result := '';
+  for i := 0 to Length(A) - 1 do
+  begin
+    if i > 0 then
+      Result := Result + '; ';
+    Result := Result + Esc(A[i].Name) + ' <' + Esc(A[i].Address) + '>';
+  end;
+end;
+
+procedure Out1(const S: string);
+begin
+  WriteLn('R: ', S);
+end;
+
+procedure DoOp(C: TImapClient; const Op: string; const A: TStringArray);
+var
+  boxes: TImapMailboxArray;
+  sel: TImapSelected;
+  st: TImapStatus;
+  uids: TImapUidArray;
+  msgs: TImapMessageArray;
+  env: TImapEnvelope;
+  i, j, u, unix, off: Integer;
+  s, probe: string;
+  m: TImapMessage;
+  caps: TStringArray;
+  args: TStringArray;
+begin
+  if Op = 'login' then
+  begin
+    C.Login(A[0], A[1]);
+    Out1('login ok authenticated=' + BoolToStr(C.IsAuthenticated, True));
+  end
+  else if Op = 'plain' then
+  begin
+    C.AuthenticatePlain(A[0], A[1]);
+    Out1('plain ok');
+  end
+  else if Op = 'xoauth' then
+  begin
+    C.AuthenticateXOAuth2(A[0], A[1]);
+    Out1('xoauth ok');
+  end
+  else if Op = 'caps' then
+  begin
+    caps := C.Capabilities;
+    Out1('caps ' + JoinStr(caps) + ' idle=' + BoolToStr(C.HasCapability('idle'), True) + ' nope=' + BoolToStr(C.HasCapability('nope'), True));
+  end
+  else if Op = 'noop' then
+  begin
+    C.Noop;
+    Out1('noop ok');
+  end
+  else if Op = 'list' then
+  begin
+    boxes := C.ListMailboxes(A[0], A[1]);
+    Out1('list ' + IntToStr(Length(boxes)));
+    for i := 0 to Length(boxes) - 1 do
+      Out1('  name=' + Esc(boxes[i].Name) + ' delim=' + Esc(boxes[i].Delimiter) + ' attrs=' + JoinStr(boxes[i].Attrs));
+  end
+  else if Op = 'select' then
+  begin
+    sel := C.SelectMailbox(A[0], A[1] = '1');
+    Out1('select ' + Esc(sel.Name) + ' exists=' + IntToStr(sel.Exists) + ' recent=' + IntToStr(sel.Recent) + ' uidvalidity=' +
+      IntToStr(sel.UidValidity) + ' uidnext=' + IntToStr(sel.UidNext) + ' unseen=' + IntToStr(sel.Unseen) + ' readonly=' +
+      BoolToStr(sel.ReadOnly, True) + ' flags=' + JoinStr(sel.Flags) + ' permanent=' + JoinStr(sel.PermanentFlags));
+  end
+  else if Op = 'state' then
+  begin
+    sel := C.Selected;
+    Out1('state exists=' + IntToStr(sel.Exists) + ' recent=' + IntToStr(sel.Recent) + ' flags=' + JoinStr(sel.Flags));
+  end
+  else if Op = 'status' then
+  begin
+    st := C.MailboxStatus(A[0]);
+    Out1('status messages=' + IntToStr(st.Messages) + ' recent=' + IntToStr(st.Recent) + ' uidnext=' + IntToStr(st.UidNext) +
+      ' uidvalidity=' + IntToStr(st.UidValidity) + ' unseen=' + IntToStr(st.Unseen));
+  end
+  else if Op = 'search' then
+  begin
+    uids := C.UidSearch(A[0]);
+    s := '';
+    for i := 0 to Length(uids) - 1 do
+    begin
+      if i > 0 then
+        s := s + ',';
+      s := s + IntToStr(uids[i]);
+    end;
+    Out1('search ' + IntToStr(Length(uids)) + ' uids=' + s);
+  end
+  else if Op = 'searchwith' then
+  begin
+    SetLength(args, Length(A) - 1);
+    for i := 1 to Length(A) - 1 do
+      args[i - 1] := A[i];
+    uids := C.UidSearchWith(A[0], args);
+    s := '';
+    for i := 0 to Length(uids) - 1 do
+    begin
+      if i > 0 then
+        s := s + ',';
+      s := s + IntToStr(uids[i]);
+    end;
+    Out1('searchwith ' + IntToStr(Length(uids)) + ' uids=' + s);
+  end
+  else if Op = 'fetch' then
+  begin
+    msgs := C.UidFetch(A[0], A[1]);
+    Out1('fetch ' + IntToStr(Length(msgs)));
+    for i := 0 to Length(msgs) - 1 do
+    begin
+      m := msgs[i];
+      s := '  seq=' + IntToStr(m.Seq) + ' uid=' + IntToStr(m.Uid) + ' size=' + IntToStr(m.Size) + ' flags=' + JoinStr(m.Flags) +
+        ' date=' + Esc(m.InternalDate) + ' body=' + Sum(m.Body) + ' header=' + Sum(m.Header) + ' text=' + Sum(m.BodyText);
+      if ImapParseInternalDate(m.InternalDate, unix, off) then
+        s := s + ' unix=' + IntToStr(unix) + ' off=' + IntToStr(off);
+      Out1(s);
+      for j := 0 to 3 do
+      begin
+        case j of
+          0: probe := 'X-GM-MSGID';
+          1: probe := 'BODYSTRUCTURE';
+          2: probe := 'BODY[1.2]<0>';
+          3: probe := 'BODY[HEADER.FIELDS (SUBJECT FROM)]';
+        end;
+        if m.Attr(probe) <> nil then
+          Out1('    ' + probe + ' = ' + DumpNode(m.Attr(probe)));
+      end;
+      s := '    has Seen=' + BoolToStr(m.HasFlag('\seen'), True);
+      Out1(s);
+    end;
+  end
+  else if Op = 'env' then
+  begin
+    msgs := C.UidFetch(A[0], '(UID ENVELOPE)');
+    for i := 0 to Length(msgs) - 1 do
+    begin
+      if ImapParseEnvelope(msgs[i].Attr('ENVELOPE'), env) then
+      begin
+        Out1('env uid=' + IntToStr(msgs[i].Uid) + ' date=[' + Esc(env.Date) + '] subject=[' + Esc(env.Subject) + '] inreplyto=[' +
+          Esc(env.InReplyTo) + '] messageid=[' + Esc(env.MessageId) + ']');
+        Out1('  from=' + AddrsText(env.From) + ' sender=' + AddrsText(env.Sender) + ' replyto=' + AddrsText(env.ReplyTo));
+        Out1('  to=' + AddrsText(env.ToList) + ' cc=' + AddrsText(env.Cc) + ' bcc=' + AddrsText(env.Bcc));
+      end
+      else
+        Out1('env uid=' + IntToStr(msgs[i].Uid) + ' no envelope');
+    end;
+  end
+  else if Op = 'fetchraw' then
+  begin
+    s := C.FetchRaw(StrToInt(A[0]));
+    Out1('fetchraw ' + Sum(s));
+  end
+  else if Op = 'store' then
+  begin
+    C.UidStore(A[0], A[1], A[2]);
+    Out1('store ok');
+  end
+  else if Op = 'expunge' then
+  begin
+    C.Expunge;
+    sel := C.Selected;
+    Out1('expunge ok exists=' + IntToStr(sel.Exists));
+  end
+  else if Op = 'copy' then
+  begin
+    C.UidCopy(A[0], A[1]);
+    Out1('copy ok');
+  end
+  else if Op = 'move' then
+  begin
+    if Length(A) > 1 then
+      C.UidMove(A[0], A[1])
+    else
+      C.UidMove(A[0], 'Trash');
+    Out1('move ok');
+  end
+  else if Op = 'append' then
+  begin
+    u := C.AppendMessage(A[0], A[1], A[2]);
+    Out1('append uid=' + IntToStr(u));
+  end
+  else if Op = 'create' then
+  begin
+    C.CreateMailbox(A[0]);
+    Out1('create ok');
+  end
+  else if Op = 'delete' then
+  begin
+    C.DeleteMailbox(A[0]);
+    Out1('delete ok');
+  end
+  else if Op = 'rename' then
+  begin
+    C.RenameMailbox(A[0], A[1]);
+    Out1('rename ok');
+  end
+  else if Op = 'subscribe' then
+  begin
+    C.Subscribe(A[0]);
+    Out1('subscribe ok');
+  end
+  else if Op = 'unsubscribe' then
+  begin
+    C.Unsubscribe(A[0]);
+    Out1('unsubscribe ok');
+  end
+  else if Op = 'close' then
+  begin
+    C.CloseMailbox;
+    Out1('close ok');
+  end
+  else if Op = 'idle' then
+  begin
+    Out1('idle news=' + BoolToStr(C.Idle(StrToInt(A[0])), True));
+  end
+  else if Op = 'logout' then
+  begin
+    C.Logout;
+    Out1('logout ok');
+  end
+  else
+    Out1('unknown op ' + Op);
+end;
+
+procedure Run(const S: TScenario);
+var
+  l, port, w, i: Integer;
+  c: TImapClient;
+  failed: Boolean;
+begin
+  SrvReplies := S.Replies;
+  SrvOut := '';
+  SrvAccepted := False;
+  l := TcpListenAt('127.0.0.1', 0, 4);
+  port := TcpPort(l);
+  WG.Add(1);
+  pas ServeOne(l);
+  WriteLn('== ', S.Name);
+  c := nil;
+  try
+    c := ImapDial('127.0.0.1', port, ImapPlain, 3000);
+    Out1('connected tls=' + BoolToStr(c.IsTls, True) + ' authenticated=' + BoolToStr(c.IsAuthenticated, True));
+  except
+    on E: EImapError do
+      Out1('dial error kind=' + IntToStr(E.Kind) + ' code=[' + E.Code + '] ' + Esc(E.Message));
+  end;
+  if c <> nil then
+  begin
+    i := 0;
+    failed := False;
+    while (i < Length(S.OpNames)) and not failed do
+    begin
+      try
+        DoOp(c, S.OpNames[i], S.OpArgs[i]);
+      except
+        on E: EImapError do
+        begin
+          Out1(S.OpNames[i] + ' error kind=' + IntToStr(E.Kind) + ' code=[' + E.Code + '] timeout=' + BoolToStr(E.Timeout, True) +
+            ' ' + Esc(E.Message));
+          { a failed connection ends the scenario }
+          if (E.Kind = ImapIo) or (E.Kind = ImapProtocol) or (E.Kind = ImapBye) then
+            failed := True;
+        end;
+      end;
+      i := i + 1;
+    end;
+    c.Disconnect;
+  end;
+  if not SrvAccepted then
+  begin
+    w := TcpConnect('127.0.0.1', port);
+    if w >= 0 then
+      TcpClose(w);
+  end;
+  WG.Wait;
+  TcpClose(l);
+  Write(SrvOut);
+end;
+
+{ ---- the helpers on their own ---- }
+
+procedure Own;
+var
+  a: array of Integer;
+  s, r: string;
+  i, unix, off: Integer;
+  seed: Integer;
+  ok: Boolean;
+begin
+  WriteLn('== helpers');
+  SetLength(a, 8);
+  a[0] := 1;
+  a[1] := 2;
+  a[2] := 3;
+  a[3] := 7;
+  a[4] := 9;
+  a[5] := 10;
+  a[6] := 11;
+  a[7] := 20;
+  WriteLn('uidset ', ImapUidSet(a));
+  SetLength(a, 0);
+  WriteLn('uidset empty [', ImapUidSet(a), ']');
+  WriteLn('quote ', ImapQuote('plain'), ' ', ImapQuote('a"b\c'), ' [', ImapQuote('a' + #10), '] [', ImapQuote('caf' + #195 + #169), '] ', ImapQuote(''));
+  { RFC 3501 5.1.3: ~peter/mail/&U,BTFw-/&ZeVnLIqe- is ~peter/mail/ + Taipei + / + Nihongo }
+  s := '~peter/mail/' + #229 + #143 + #176 + #229 + #140 + #151 + '/' + #230 + #151 + #165 + #230 + #156 + #172 + #232 + #170 + #158;
+  WriteLn('utf7 enc ', ImapEncodeMailbox(s));
+  WriteLn('utf7 dec ok ', ImapDecodeMailbox('~peter/mail/&U,BTFw-/&ZeVnLIqe-') = s);
+  WriteLn('utf7 amp ', ImapEncodeMailbox('Tom & Jerry'), ' ', ImapDecodeMailbox('Tom &- Jerry'));
+  WriteLn('utf7 ascii ', ImapEncodeMailbox('INBOX/Sub folder'), ' ', ImapDecodeMailbox('INBOX/Sub folder'));
+  WriteLn('utf7 bmp ', ImapEncodeMailbox('Pap' + #195 + #169 + 'les'), ' ', ImapEncodeMailbox(#195 + #177), ' ', ImapEncodeMailbox('a' + #195 + #177 + 'b' + #195 + #177));
+  WriteLn('utf7 astral ', ImapEncodeMailbox(#240 + #159 + #152 + #128), ' ', ImapDecodeMailbox('&2D3eAA-') = #240 + #159 + #152 + #128);
+  WriteLn('utf7 control ', ImapEncodeMailbox('a' + #9 + 'b'), ' ', ImapEncodeMailbox(#127));
+  WriteLn('utf7 bad dec [', ImapDecodeMailbox('&Jjo!'), '] [', ImapDecodeMailbox('&AOk'), '] [', ImapDecodeMailbox('&!!!-'), ']');
+  { round trips of a pseudo-random run of code points }
+  seed := 12345;
+  ok := True;
+  for i := 1 to 300 do
+  begin
+    r := '';
+    seed := (seed * 1103515245 + 12345) and $7FFFFFFF;
+    case seed mod 5 of
+      0: r := 'abc' + Utf8Append('', 32 + (seed shr 8) mod 90) + Utf8Append('', 160 + (seed shr 12) mod 2000);
+      1: r := Utf8Append('', 1 + (seed shr 8) mod 31) + 'x&y';
+      2: r := Utf8Append('', $10000 + (seed shr 6) mod 60000) + Utf8Append('', 20000 + (seed shr 10) mod 20000);
+      3: r := Utf8Append('', 127) + '&' + Utf8Append('', $FF00 + (seed shr 8) mod 200) + '-';
+      4: r := Utf8Append('', 233) + Utf8Append('', 233) + 'z' + Utf8Append('', 233);
+    end;
+    if ImapDecodeMailbox(ImapEncodeMailbox(r)) <> r then
+    begin
+      ok := False;
+      WriteLn('utf7 round trip fails for ', Esc(r));
+    end;
+  end;
+  WriteLn('utf7 round trips ', ok);
+  if ImapParseInternalDate('17-Jul-1996 02:44:25 -0700', unix, off) then
+    WriteLn('date ', unix, ' ', off)
+  else
+    WriteLn('date no');
+  if ImapParseInternalDate(' 7-Jul-2026 10:00:00 +0530', unix, off) then
+    WriteLn('date ', unix, ' ', off)
+  else
+    WriteLn('date no');
+  WriteLn('date bad ', ImapParseInternalDate('17-Foo-1996 02:44:25 -0700', unix, off), ' ', ImapParseInternalDate('x', unix, off), ' ',
+    ImapParseInternalDate('17-Jul-1996 25:44:25 -0700', unix, off));
+end;
+
+var
+  spec, line, op, rest: string;
+  p, nl, q1: Integer;
+  sc: TScenario;
+  have: Boolean;
+  args: TStringArray;
+begin
+  if not ReadFile('testdata/imap.txt', spec) then
+  begin
+    WriteLn('no testdata/imap.txt');
+    Halt(2);
+  end;
+  have := False;
+  p := 1;
+  while p <= Length(spec) do
+  begin
+    nl := p;
+    while (nl <= Length(spec)) and (spec[nl] <> #10) do
+      nl := nl + 1;
+    line := Copy(spec, p, nl - p);
+    p := nl + 1;
+    if line = '' then
+      Continue;
+    q1 := Pos(' ', line);
+    if q1 = 0 then
+    begin
+      op := line;
+      rest := '';
+    end
+    else
+    begin
+      op := Copy(line, 1, q1 - 1);
+      rest := Copy(line, q1 + 1, Length(line) - q1);
+    end;
+    if op = 'case' then
+    begin
+      sc.Name := rest;
+      SetLength(sc.Replies, 0);
+      SetLength(sc.OpNames, 0);
+      SetLength(sc.OpArgs, 0);
+      have := True;
+    end
+    else if op = 'reply' then
+    begin
+      SetLength(sc.Replies, Length(sc.Replies) + 1);
+      sc.Replies[Length(sc.Replies) - 1] := Un64(rest);
+    end
+    else if op = 'op' then
+    begin
+      SetLength(args, 0);
+      q1 := Pos(' ', rest);
+      if q1 = 0 then
+        line := rest
+      else
+      begin
+        line := Copy(rest, 1, q1 - 1);
+        rest := Copy(rest, q1 + 1, Length(rest) - q1);
+        while rest <> '' do
+        begin
+          q1 := Pos(' ', rest);
+          SetLength(args, Length(args) + 1);
+          if q1 = 0 then
+          begin
+            args[Length(args) - 1] := Un64(rest);
+            rest := '';
+          end
+          else
+          begin
+            args[Length(args) - 1] := Un64(Copy(rest, 1, q1 - 1));
+            rest := Copy(rest, q1 + 1, Length(rest) - q1);
+          end;
+        end;
+      end;
+      SetLength(sc.OpNames, Length(sc.OpNames) + 1);
+      SetLength(sc.OpArgs, Length(sc.OpArgs) + 1);
+      sc.OpNames[Length(sc.OpNames) - 1] := line;
+      sc.OpArgs[Length(sc.OpArgs) - 1] := args;
+    end
+    else if op = 'end' then
+      Run(sc);
+  end;
+  Own;
+  Halt(0);
+end.

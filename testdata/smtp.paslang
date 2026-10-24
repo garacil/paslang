@@ -1,0 +1,265 @@
+{ P433: passmtp against Go's net/smtp. testdata/smtp.txt (scripts/smtp_cases.py
+  writes it) holds 57 scenarios: a script for a server (the replies it gives in
+  turn) and a mail to send, with a login or without. Each is run here against a
+  server of this program's own, over a TCP socket on 127.0.0.1, and printed as
+  the lines the server received (C:), the DATA blocks (D:) and how SmtpSendMail
+  ended (=> ok, or the error). scripts/smtp_client_go.go prints the same for
+  Go's smtp.SendMail; the two outputs are identical (Go's loginAuth stands for
+  LOGIN, which net/smtp has not). The golden file is this output. }
+program smtp;
+
+uses
+  sysutils, pascodec, pastextproto, pasnet, pasconn, pasmime, passmtp;
+
+type
+  TScenario = record
+    Name: string;
+    Replies: array of string;
+    Mech: string;
+    User: string;
+    Pass: string;
+    From: string;
+    Rcpts: array of string;
+    Msg: string;
+  end;
+
+var
+  SrvReplies: array of string;
+  SrvOut: string;
+  SrvAccepted: Boolean;
+  WG: waitgroup;
+
+function Un64(const S: string): string;
+begin
+  if S = '-' then
+    Result := ''
+  else if not Base64Decode(S, False, True, Result) then
+  begin
+    WriteLn('bad base64');
+    Halt(2);
+  end;
+end;
+
+function Esc(const S: string): string;
+var
+  i, c: Integer;
+begin
+  Result := '';
+  for i := 1 to Length(S) do
+  begin
+    c := Ord(S[i]);
+    if c = 92 then
+      Result := Result + '\\'
+    else if c = 13 then
+      Result := Result + '\r'
+    else if c = 10 then
+      Result := Result + '\n'
+    else if (c >= 32) and (c < 127) then
+      Result := Result + S[i]
+    else
+      Result := Result + '\x' + Copy('0123456789abcdef', (c shr 4) + 1, 1) + Copy('0123456789abcdef', (c and 15) + 1, 1);
+  end;
+end;
+
+{ the server of one scenario: the replies in turn, the DATA block read after a
+  354, what is received written to SrvOut; after its last reply it stops
+  writing and goes on reading until the client is gone }
+procedure ServeOne(L: Integer);
+var
+  c, idx, p, n: Integer;
+  last, buf, chunk, line, data: string;
+  closed: Boolean;
+begin
+  c := TcpAccept(L);
+  if c < 0 then
+  begin
+    WG.Done;
+    Exit;
+  end;
+  SrvAccepted := True;
+  idx := 0;
+  last := '';
+  closed := False;
+  buf := '';
+  n := Length(SrvReplies);
+  { the greeting }
+  if idx < n then
+  begin
+    last := SrvReplies[idx];
+    TcpWrite(c, last);
+    idx := idx + 1;
+  end;
+  if idx >= n then
+  begin
+    TcpShutdown(c, 1);
+    closed := True;
+  end;
+  while True do
+  begin
+    if Copy(last, 1, 3) = '354' then
+    begin
+      while not ((Length(buf) >= 5) and (Copy(buf, Length(buf) - 4, 5) = #13#10 + '.' + #13#10)) do
+      begin
+        chunk := TcpReadDeadline(c, 65536, 5000);
+        if chunk = '' then
+        begin
+          if buf <> '' then
+            SrvOut := SrvOut + 'D: ' + Esc(buf) + #10;
+          TcpClose(c);
+          WG.Done;
+          Exit;
+        end;
+        buf := buf + chunk;
+      end;
+      SrvOut := SrvOut + 'D: ' + Esc(buf) + #10;
+      buf := '';
+      last := '';
+    end
+    else
+    begin
+      p := Pos(#10, buf);
+      while p = 0 do
+      begin
+        chunk := TcpReadDeadline(c, 65536, 5000);
+        if chunk = '' then
+        begin
+          if buf <> '' then
+            SrvOut := SrvOut + 'C: ' + Esc(buf) + #10;
+          TcpClose(c);
+          WG.Done;
+          Exit;
+        end;
+        buf := buf + chunk;
+        p := Pos(#10, buf);
+      end;
+      line := Copy(buf, 1, p - 1);
+      buf := Copy(buf, p + 1, Length(buf) - p);
+      SrvOut := SrvOut + 'C: ' + Esc(line) + #10;
+    end;
+    if not closed then
+    begin
+      if idx < n then
+      begin
+        last := SrvReplies[idx];
+        TcpWrite(c, last);
+        idx := idx + 1;
+      end;
+      if idx >= n then
+      begin
+        TcpShutdown(c, 1);
+        closed := True;
+      end;
+    end;
+  end;
+end;
+
+procedure Run(const S: TScenario);
+var
+  l, port, w: Integer;
+  outcome: string;
+begin
+  SrvReplies := S.Replies;
+  SrvOut := '';
+  SrvAccepted := False;
+  l := TcpListenAt('127.0.0.1', 0, 4);
+  port := TcpPort(l);
+  WG.Add(1);
+  pas ServeOne(l);
+  try
+    SmtpSendMail('127.0.0.1', port, SmtpAuto, S.User, S.Pass, S.From, S.Rcpts, S.Msg, 10000);
+    outcome := '=> ok';
+  except
+    on E: ESmtpError do
+      outcome := '=> error: ' + Esc(E.Message);
+  end;
+  { a client that never dialed leaves the server waiting to accept }
+  if not SrvAccepted then
+  begin
+    w := TcpConnect('127.0.0.1', port);
+    if w >= 0 then
+      TcpClose(w);
+  end;
+  WG.Wait;
+  TcpClose(l);
+  WriteLn('== ', S.Name);
+  Write(SrvOut);
+  WriteLn(outcome);
+end;
+
+var
+  spec, line, op, rest: string;
+  p, nl, q1, count: Integer;
+  sc: TScenario;
+  have: Boolean;
+begin
+  if not ReadFile('testdata/smtp.txt', spec) then
+  begin
+    WriteLn('no testdata/smtp.txt');
+    Halt(2);
+  end;
+  have := False;
+  count := 0;
+  p := 1;
+  while p <= Length(spec) do
+  begin
+    nl := p;
+    while (nl <= Length(spec)) and (spec[nl] <> #10) do
+      nl := nl + 1;
+    line := Copy(spec, p, nl - p);
+    p := nl + 1;
+    if line = '' then
+      Continue;
+    q1 := Pos(' ', line);
+    if q1 = 0 then
+    begin
+      op := line;
+      rest := '';
+    end
+    else
+    begin
+      op := Copy(line, 1, q1 - 1);
+      rest := Copy(line, q1 + 1, Length(line) - q1);
+    end;
+    if op = 'case' then
+    begin
+      sc.Name := rest;
+      SetLength(sc.Replies, 0);
+      SetLength(sc.Rcpts, 0);
+      sc.Mech := '';
+      sc.User := '';
+      sc.Pass := '';
+      sc.From := '';
+      sc.Msg := '';
+      have := True;
+    end
+    else if op = 'reply' then
+    begin
+      SetLength(sc.Replies, Length(sc.Replies) + 1);
+      sc.Replies[Length(sc.Replies) - 1] := Un64(rest);
+    end
+    else if op = 'auth' then
+    begin
+      q1 := Pos(' ', rest);
+      sc.Mech := Copy(rest, 1, q1 - 1);
+      rest := Copy(rest, q1 + 1, Length(rest) - q1);
+      q1 := Pos(' ', rest);
+      sc.User := Un64(Copy(rest, 1, q1 - 1));
+      sc.Pass := Un64(Copy(rest, q1 + 1, Length(rest) - q1));
+    end
+    else if op = 'from' then
+      sc.From := Un64(rest)
+    else if op = 'rcpt' then
+    begin
+      SetLength(sc.Rcpts, Length(sc.Rcpts) + 1);
+      sc.Rcpts[Length(sc.Rcpts) - 1] := Un64(rest);
+    end
+    else if op = 'msg' then
+      sc.Msg := Un64(rest)
+    else if op = 'end' then
+    begin
+      Run(sc);
+      count := count + 1;
+    end;
+  end;
+  Halt(0);
+end.

@@ -601,6 +601,9 @@ GOLDEN_A64 += xlsx
 # P432: URLs and HTTP messages against Go, and the HTTP client over loopback.
 GOLDEN += url httpmsg httpcli
 GOLDEN_A64 += url httpmsg httpcli
+# P433: mail against Go (mime, net/mail, net/smtp) and Python (email), SMTP and IMAP over loopback.
+GOLDEN += mime mailtree mailbuild mailscale mailtls smtp imap
+GOLDEN_A64 += mime mailtree mailbuild mailscale mailtls smtp imap
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -644,6 +647,9 @@ LIB_UNITS := \
 	src/lib/pastextproto.paslang \
 	src/lib/pashttp.paslang \
 	src/lib/httpclient.paslang \
+	src/lib/pasmime.paslang \
+	src/lib/passmtp.paslang \
+	src/lib/pasimap.paslang \
 	src/lib/httpserver.paslang \
 	src/lib/sqlite.paslang
 

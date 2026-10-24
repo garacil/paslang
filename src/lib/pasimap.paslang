@@ -1,0 +1,1908 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+
+  paslang is free software: you can redistribute it and/or modify it
+  under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+
+  paslang is distributed in the hope that it will be useful, but
+  WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+  General Public License for more details.
+
+  Under Section 7 of GPL version 3, you are granted additional
+  permissions described in the paslang Runtime Library Exception,
+  version 1.0, in the file COPYING.RUNTIME.
+
+  You should have received a copy of the GNU General Public License
+  along with paslang.  If not, see <https://www.gnu.org/licenses/>. }
+
+{ An IMAP4rev1 client (P433, RFC 3501 with the extensions mail needs: LITERAL+
+  of RFC 7888, SASL-IR of RFC 4959, UIDPLUS of RFC 4315, MOVE of RFC 6851,
+  IDLE of RFC 2177; STARTTLS of RFC 2595/3501 through pasconn's TlsUpgrader,
+  the connection of TLS through TlsDialer). The responses are read by the
+  grammar of section 9: atoms, numbers, quoted strings, literals (the count in braces and the
+  n bytes after it), lists and NIL, the bracketed section of BODY[...], a
+  response code in brackets. A command is sent with its literals waiting for
+  the server's "+" (or not, with LITERAL+). The commands that mail needs have
+  words of their own: LIST, SELECT, STATUS, UID SEARCH, UID FETCH, UID STORE,
+  EXPUNGE, UID COPY and UID MOVE, APPEND, CREATE, DELETE, RENAME, IDLE;
+  mailbox names go in UTF-8 and travel in the modified UTF-7 of section
+  5.1.3. An error is an EImapError: NO and BAD with their text and code, the
+  server's BYE, a connection that failed, a response that is no IMAP. }
+unit pasimap;
+
+interface
+
+uses
+  sysutils, pascodec, pastextproto, pasconn, pasmime;
+
+const
+  { EImapError.Kind }
+  ImapNo = 1;
+  ImapBad = 2;
+  ImapBye = 3;
+  ImapIo = 4;
+  ImapProtocol = 5;
+  { TImapNode.Kind }
+  inNil = 0;
+  inAtom = 1;
+  inString = 2;
+  inList = 3;
+  { the choice of TLS of ImapDial }
+  ImapPlain = 0;
+  ImapStartTls = 1;
+  ImapImplicit = 2;
+
+type
+  EImapError = class(Exception)
+  public
+    Kind: Integer;
+    { the response code in brackets, in upper case (TRYCREATE, ALREADYEXISTS,
+      AUTHENTICATIONFAILED...), '' when there is none }
+    Code: string;
+    Timeout: Boolean;
+    constructor CreateKind(AKind: Integer; const ACode, AText: string);
+    constructor CreateIo(const AText: string; ATimeout: Boolean);
+  end;
+
+  { one value of a response: NIL, an atom, a string (quoted or literal) or
+    a parenthesized list }
+  TImapNode = class
+  private
+    FKind: Integer;
+    FText: string;
+    FKids: array of TImapNode;
+  public
+    constructor Create(AKind: Integer; const AText: string);
+    procedure Add(N: TImapNode);
+    function Kind: Integer;
+    function IsNil: Boolean;
+    function IsList: Boolean;
+    { the bytes of an atom or a string }
+    function Text: string;
+    function Count: Integer;
+    function Item(I: Integer): TImapNode;
+    { an atom's number, -1 when it is not one }
+    function Number: Integer;
+    { an atom or a string equal to S with no regard to case }
+    function Eq(const S: string): Boolean;
+    { the strings and atoms of a list, in order }
+    function Strings: TStringArray;
+  end;
+
+  { a response: "* ..." (Tag '*'), "+ ..." (Tag '+') or a tagged one }
+  TImapResponse = class
+  private
+    FItems: array of TImapNode;
+    FCodeArgs: array of TImapNode;
+  public
+    Tag: string;
+    { the first word in upper case: OK, NO, BAD, BYE, PREAUTH, CAPABILITY,
+      LIST, SEARCH, FLAGS, EXISTS, FETCH ...; '' for a continuation }
+    Kind: string;
+    { the number before EXISTS, RECENT, EXPUNGE, FETCH; -1 when none }
+    Num: Integer;
+    { of a status response: the code in brackets in upper case, its
+      arguments, and the text }
+    Code: string;
+    Text: string;
+    function ItemCount: Integer;
+    function Item(I: Integer): TImapNode;
+    function CodeArgCount: Integer;
+    function CodeArg(I: Integer): TImapNode;
+  end;
+
+  TImapUidArray = array of Integer;
+
+  TImapMailbox = record
+    Name: string;
+    Delimiter: string;
+    Attrs: TStringArray;
+  end;
+  TImapMailboxArray = array of TImapMailbox;
+
+  { what SELECT or EXAMINE tells; -1 for what the server did not say }
+  TImapSelected = record
+    Name: string;
+    Exists: Integer;
+    Recent: Integer;
+    UidValidity: Integer;
+    UidNext: Integer;
+    Unseen: Integer;
+    ReadOnly: Boolean;
+    Flags: TStringArray;
+    PermanentFlags: TStringArray;
+  end;
+
+  { -1 for an item that was not asked }
+  TImapStatus = record
+    Messages: Integer;
+    Recent: Integer;
+    UidNext: Integer;
+    UidValidity: Integer;
+    Unseen: Integer;
+  end;
+
+  TImapMessage = class
+  private
+    FNames: array of string;
+    FNodes: array of TImapNode;
+  public
+    Seq: Integer;
+    Uid: Integer;
+    Size: Integer;
+    Flags: TStringArray;
+    InternalDate: string;
+    { BODY[] or RFC822, BODY[HEADER] or RFC822.HEADER, BODY[TEXT] or
+      RFC822.TEXT when they were asked for }
+    Body: string;
+    Header: string;
+    BodyText: string;
+    constructor Create;
+    procedure SetAttr(const Name: string; N: TImapNode);
+    { an item of the response by name in upper case (ENVELOPE, BODYSTRUCTURE,
+      BODY[1.2], BODY[HEADER.FIELDS (SUBJECT)]...); nil when it is not there }
+    function Attr(const Name: string): TImapNode;
+    function HasFlag(const F: string): Boolean;
+  end;
+  TImapMessageArray = array of TImapMessage;
+
+  TImapEnvelope = record
+    Date: string;
+    Subject: string;
+    InReplyTo: string;
+    MessageId: string;
+    From: TMailAddressArray;
+    Sender: TMailAddressArray;
+    ReplyTo: TMailAddressArray;
+    ToList: TMailAddressArray;
+    Cc: TMailAddressArray;
+    Bcc: TMailAddressArray;
+  end;
+
+  TImapClient = class
+  private
+    FStream: TNetStream;
+    FBuf: string;
+    FHost: string;
+    FTls: Boolean;
+    FTimeoutMs: Integer;
+    FTagNo: Integer;
+    FLine: string;
+    FPos: Integer;
+    FCaps: TStringArray;
+    FResp: array of TImapResponse;
+    FSel: TImapSelected;
+    FBye: Boolean;
+    FByeText: string;
+    FClosed: Boolean;
+    FAuthed: Boolean;
+    FParts: TStringArray;
+    FSync: array of Boolean;
+    FData: array of Boolean;
+    FLastLit: Boolean;
+    FGreeting: TImapResponse;
+    function DeadlineAt: Integer;
+    function ReadOneLine(Dl: Integer): string;
+    procedure LoadLine(const L: string);
+    function PeekCh: Char;
+    function AtEnd: Boolean;
+    procedure SkipSp;
+    function ParseValue: TImapNode;
+    function ParseAtom: string;
+    procedure ParseStatusText(R: TImapResponse);
+    function ReadResponse: TImapResponse;
+    procedure Handle(R: TImapResponse);
+    procedure CmdBegin(const Text: string);
+    procedure CmdText(const Text: string);
+    procedure CmdAstring(const S: string);
+    procedure CmdMailbox(const Name: string);
+    procedure CmdLiteral(const Data: string);
+    procedure Run;
+    procedure Fail(R: TImapResponse);
+    procedure Write1(const Data: string);
+    function HasCap(const Name: string): Boolean;
+    procedure TakeCaps(R: TImapResponse);
+  public
+    constructor Create(AStream: TNetStream; const AHost: string; ATls: Boolean; ATimeoutMs: Integer);
+    function IsTls: Boolean;
+    function IsAuthenticated: Boolean;
+    { the capabilities in upper case (as the server last said them) }
+    function Capabilities: TStringArray;
+    function HasCapability(const Name: string): Boolean;
+    function Selected: TImapSelected;
+    procedure StartTls;
+    { LOGIN, refused on a connection that is not TLS unless it is to
+      localhost, and when the server says LOGINDISABLED }
+    procedure Login(const User, Pass: string);
+    procedure AuthenticatePlain(const User, Pass: string);
+    procedure AuthenticateXOAuth2(const User, Token: string);
+    procedure Noop;
+    function ListMailboxes(const Ref, Pattern: string): TImapMailboxArray;
+    function SelectMailbox(const Mailbox: string; ReadOnly: Boolean): TImapSelected;
+    function MailboxStatus(const Mailbox: string): TImapStatus;
+    { UID SEARCH with Criteria as it goes (strings in it quoted with
+      ImapQuote): the UIDs in the order the server gives them }
+    function UidSearch(const Criteria: string): TImapUidArray;
+    { the same with a format: each %s of Fmt is replaced by the next of Args as
+      a quoted string, or as a literal when it holds a line break or a byte
+      past 127 (CHARSET UTF-8 SUBJECT %s) }
+    function UidSearchWith(const Fmt: string; const Args: array of string): TImapUidArray;
+    { UID FETCH of the set with the items as they go ("(FLAGS BODY.PEEK[])",
+      "(UID RFC822.SIZE ENVELOPE)") }
+    function UidFetch(const UidSet, Items: string): TImapMessageArray;
+    { the whole message of a UID, read without marking it seen }
+    function FetchRaw(Uid: Integer): string;
+    { UID STORE: Mode is FLAGS, +FLAGS or -FLAGS, Flags "(\Seen \Deleted)" }
+    procedure UidStore(const UidSet, Mode, Flags: string);
+    procedure Expunge;
+    procedure UidCopy(const UidSet, Mailbox: string);
+    { UID MOVE when the server has MOVE, else copy, mark deleted, expunge
+      those (UIDPLUS) }
+    procedure UidMove(const UidSet, Mailbox: string);
+    { APPEND; the UID the server gave (UIDPLUS) or 0 }
+    function AppendMessage(const Mailbox, Flags, Msg: string): Integer;
+    procedure CreateMailbox(const Mailbox: string);
+    procedure DeleteMailbox(const Mailbox: string);
+    procedure RenameMailbox(const OldName, NewName: string);
+    procedure Subscribe(const Mailbox: string);
+    procedure Unsubscribe(const Mailbox: string);
+    procedure CloseMailbox;
+    { IDLE: waits up to TimeoutMs for the server to tell of a change; True if
+      it did (EXISTS, EXPUNGE, FETCH or RECENT came) }
+    function Idle(TimeoutMs: Integer): Boolean;
+    procedure Logout;
+    procedure Disconnect;
+  end;
+
+{ A client on a new connection to Host:Port; the greeting is read (an error
+  for BYE) }
+function ImapDial(const Host: string; Port, Mode, TimeoutMs: Integer): TImapClient;
+{ a string as a quoted string of the grammar (the quotes and backslashes
+  escaped); '' when S holds a CR, LF, NUL or a byte past 127, which only a
+  literal carries }
+function ImapQuote(const S: string): string;
+{ a mailbox name in UTF-8 as the modified UTF-7 of RFC 3501 5.1.3, and back
+  (a name that is not valid UTF-7 comes back as it was) }
+function ImapEncodeMailbox(const Utf8: string): string;
+function ImapDecodeMailbox(const Name: string): string;
+{ a set of UIDs as "1:3,7,9:12" }
+function ImapUidSet(const Uids: array of Integer): string;
+{ INTERNALDATE ("17-Jul-1996 02:44:25 -0700"): the Unix second and the offset }
+function ImapParseInternalDate(const S: string; out Unix, Offset: Integer): Boolean;
+{ the ENVELOPE of a FETCH response }
+function ImapParseEnvelope(N: TImapNode; out E: TImapEnvelope): Boolean;
+
+implementation
+
+constructor EImapError.CreateKind(AKind: Integer; const ACode, AText: string);
+begin
+  if ACode <> '' then
+    inherited Create(ACode + ' ' + AText)
+  else
+    inherited Create(AText);
+  Kind := AKind;
+  Code := ACode;
+  Timeout := False;
+end;
+
+constructor EImapError.CreateIo(const AText: string; ATimeout: Boolean);
+begin
+  inherited Create(AText);
+  Kind := ImapIo;
+  Code := '';
+  Timeout := ATimeout;
+end;
+
+{ ---- values ---- }
+
+constructor TImapNode.Create(AKind: Integer; const AText: string);
+begin
+  FKind := AKind;
+  FText := AText;
+end;
+
+procedure TImapNode.Add(N: TImapNode);
+var
+  k: Integer;
+begin
+  k := Length(FKids);
+  SetLength(FKids, k + 1);
+  FKids[k] := N;
+end;
+
+function TImapNode.Kind: Integer;
+begin
+  Result := FKind;
+end;
+
+function TImapNode.IsNil: Boolean;
+begin
+  Result := FKind = inNil;
+end;
+
+function TImapNode.IsList: Boolean;
+begin
+  Result := FKind = inList;
+end;
+
+function TImapNode.Text: string;
+begin
+  Result := FText;
+end;
+
+function TImapNode.Count: Integer;
+begin
+  Result := Length(FKids);
+end;
+
+function TImapNode.Item(I: Integer): TImapNode;
+begin
+  Result := FKids[I];
+end;
+
+function TImapNode.Number: Integer;
+var
+  i, v: Integer;
+begin
+  Result := -1;
+  if (FKind <> inAtom) or (FText = '') or (Length(FText) > 10) then
+    Exit;
+  v := 0;
+  for i := 1 to Length(FText) do
+  begin
+    if (FText[i] < '0') or (FText[i] > '9') then
+      Exit;
+    v := v * 10 + (Ord(FText[i]) - 48);
+  end;
+  Result := v;
+end;
+
+function TImapNode.Eq(const S: string): Boolean;
+begin
+  Result := ((FKind = inAtom) or (FKind = inString)) and (UpperCase(FText) = UpperCase(S));
+end;
+
+function TImapNode.Strings: TStringArray;
+var
+  i, n: Integer;
+begin
+  SetLength(Result, 0);
+  for i := 0 to Length(FKids) - 1 do
+    if (FKids[i].FKind = inAtom) or (FKids[i].FKind = inString) then
+    begin
+      n := Length(Result);
+      SetLength(Result, n + 1);
+      Result[n] := FKids[i].FText;
+    end;
+end;
+
+function TImapResponse.ItemCount: Integer;
+begin
+  Result := Length(FItems);
+end;
+
+function TImapResponse.Item(I: Integer): TImapNode;
+begin
+  Result := FItems[I];
+end;
+
+function TImapResponse.CodeArgCount: Integer;
+begin
+  Result := Length(FCodeArgs);
+end;
+
+function TImapResponse.CodeArg(I: Integer): TImapNode;
+begin
+  Result := FCodeArgs[I];
+end;
+
+constructor TImapMessage.Create;
+begin
+  Seq := 0;
+  Uid := 0;
+  Size := -1;
+  InternalDate := '';
+end;
+
+procedure TImapMessage.SetAttr(const Name: string; N: TImapNode);
+var
+  k: Integer;
+begin
+  k := Length(FNames);
+  SetLength(FNames, k + 1);
+  SetLength(FNodes, k + 1);
+  FNames[k] := Name;
+  FNodes[k] := N;
+end;
+
+function TImapMessage.Attr(const Name: string): TImapNode;
+var
+  i: Integer;
+  u: string;
+begin
+  Result := nil;
+  u := UpperCase(Name);
+  for i := 0 to Length(FNames) - 1 do
+    if FNames[i] = u then
+    begin
+      Result := FNodes[i];
+      Exit;
+    end;
+end;
+
+function TImapMessage.HasFlag(const F: string): Boolean;
+var
+  i: Integer;
+begin
+  Result := False;
+  for i := 0 to Length(Flags) - 1 do
+    if UpperCase(Flags[i]) = UpperCase(F) then
+    begin
+      Result := True;
+      Exit;
+    end;
+end;
+
+{ ---- the client ---- }
+
+constructor TImapClient.Create(AStream: TNetStream; const AHost: string; ATls: Boolean; ATimeoutMs: Integer);
+var
+  r: TImapResponse;
+begin
+  FStream := AStream;
+  FBuf := '';
+  FHost := AHost;
+  FTls := ATls;
+  FTimeoutMs := ATimeoutMs;
+  FTagNo := 0;
+  FClosed := False;
+  FAuthed := False;
+  FBye := False;
+  FSel.Exists := -1;
+  FSel.Recent := -1;
+  FSel.UidValidity := -1;
+  FSel.UidNext := -1;
+  FSel.Unseen := -1;
+  try
+    r := ReadResponse;
+    FGreeting := r;
+    if (r.Tag <> '*') or ((r.Kind <> 'OK') and (r.Kind <> 'PREAUTH') and (r.Kind <> 'BYE')) then
+      raise EImapError.CreateKind(ImapProtocol, '', 'unexpected greeting');
+    Handle(r);
+    if r.Kind = 'BYE' then
+      raise EImapError.CreateKind(ImapBye, r.Code, r.Text);
+    if r.Kind = 'PREAUTH' then
+      FAuthed := True;
+    if Length(FCaps) = 0 then
+    begin
+      CmdBegin('CAPABILITY');
+      Run;
+    end;
+  except
+    Disconnect;
+    raise;
+  end;
+end;
+
+function TImapClient.DeadlineAt: Integer;
+begin
+  if FTimeoutMs > 0 then
+    Result := Nanotime + FTimeoutMs * 1000000
+  else
+    Result := 0;
+end;
+
+function TImapClient.ReadOneLine(Dl: Integer): string;
+var
+  err: Integer;
+begin
+  if ReadLineFrom(FStream, FBuf, Result, 1048576, Dl, err) then
+    Exit;
+  if err = -110 then
+    raise EImapError.CreateIo('i/o timeout', True)
+  else if err = 0 then
+  begin
+    if FBuf <> '' then
+    begin
+      Result := FBuf;
+      FBuf := '';
+      Exit;
+    end;
+    if FBye then
+      raise EImapError.CreateKind(ImapBye, '', FByeText);
+    raise EImapError.CreateIo('EOF', False);
+  end
+  else if err = -90 then
+    raise EImapError.CreateKind(ImapProtocol, '', 'response line too long')
+  else
+    raise EImapError.CreateIo('read error ' + IntToStr(-err), False);
+end;
+
+procedure TImapClient.LoadLine(const L: string);
+begin
+  FLine := L;
+  FPos := 1;
+end;
+
+function TImapClient.PeekCh: Char;
+begin
+  if FPos <= Length(FLine) then
+    Result := FLine[FPos]
+  else
+    Result := #0;
+end;
+
+function TImapClient.AtEnd: Boolean;
+begin
+  Result := FPos > Length(FLine);
+end;
+
+procedure TImapClient.SkipSp;
+begin
+  while (FPos <= Length(FLine)) and (FLine[FPos] = ' ') do
+    FPos := FPos + 1;
+end;
+
+{ an atom: up to a space, a parenthesis or the end, a bracketed section
+  (BODY[HEADER.FIELDS (DATE)]) taken whole }
+function TImapClient.ParseAtom: string;
+var
+  s0: Integer;
+begin
+  s0 := FPos;
+  while FPos <= Length(FLine) do
+  begin
+    case FLine[FPos] of
+      ' ', '(', ')':
+        Break;
+      '[':
+        begin
+          while (FPos <= Length(FLine)) and (FLine[FPos] <> ']') do
+            FPos := FPos + 1;
+          if FPos <= Length(FLine) then
+            FPos := FPos + 1;
+          Continue;
+        end;
+    end;
+    FPos := FPos + 1;
+  end;
+  Result := Copy(FLine, s0, FPos - s0);
+end;
+
+function TImapClient.ParseValue: TImapNode;
+var
+  c: Char;
+  s, lit, atom: string;
+  n, err, digits: Integer;
+  sync: Boolean;
+  item: TImapNode;
+  sb: string;
+begin
+  c := PeekCh;
+  if c = '(' then
+  begin
+    FPos := FPos + 1;
+    Result := TImapNode.Create(inList, '');
+    while True do
+    begin
+      SkipSp;
+      if AtEnd then
+        raise EImapError.CreateKind(ImapProtocol, '', 'unclosed list in a response');
+      if PeekCh = ')' then
+      begin
+        FPos := FPos + 1;
+        Break;
+      end;
+      item := ParseValue;
+      Result.Add(item);
+    end;
+    Exit;
+  end;
+  if c = '"' then
+  begin
+    FPos := FPos + 1;
+    sb := '';
+    while True do
+    begin
+      if AtEnd then
+        raise EImapError.CreateKind(ImapProtocol, '', 'unclosed quoted string in a response');
+      c := FLine[FPos];
+      FPos := FPos + 1;
+      if c = '"' then
+        Break;
+      if (c = '\') and (FPos <= Length(FLine)) then
+      begin
+        c := FLine[FPos];
+        FPos := FPos + 1;
+      end;
+      sb := sb + c;
+    end;
+    Result := TImapNode.Create(inString, sb);
+    Exit;
+  end;
+  if c = '{' then
+  begin
+    FPos := FPos + 1;
+    n := 0;
+    digits := 0;
+    while (FPos <= Length(FLine)) and (FLine[FPos] >= '0') and (FLine[FPos] <= '9') do
+    begin
+      n := n * 10 + (Ord(FLine[FPos]) - 48);
+      digits := digits + 1;
+      FPos := FPos + 1;
+      if n > 1073741824 then
+        raise EImapError.CreateKind(ImapProtocol, '', 'literal too large');
+    end;
+    if (digits = 0) or (PeekCh <> '}') or (FPos <> Length(FLine)) then
+      raise EImapError.CreateKind(ImapProtocol, '', 'bad literal in a response');
+    if not ReadExactFrom(FStream, FBuf, n, lit, DeadlineAt, err) then
+    begin
+      if err = -110 then
+        raise EImapError.CreateIo('i/o timeout', True)
+      else
+        raise EImapError.CreateIo('EOF', False);
+    end;
+    { the rest of the response line follows the literal }
+    LoadLine(ReadOneLine(DeadlineAt));
+    Result := TImapNode.Create(inString, lit);
+    Exit;
+  end;
+  atom := ParseAtom;
+  if atom = '' then
+    raise EImapError.CreateKind(ImapProtocol, '', 'unexpected character in a response');
+  if UpperCase(atom) = 'NIL' then
+    Result := TImapNode.Create(inNil, '')
+  else
+    Result := TImapNode.Create(inAtom, atom);
+end;
+
+{ resp-text: an optional [code args] and the text }
+procedure TImapClient.ParseStatusText(R: TImapResponse);
+var
+  e, k, sp: Integer;
+  inside, savedLine: string;
+  savedPos: Integer;
+  node: TImapNode;
+begin
+  SkipSp;
+  R.Code := '';
+  if PeekCh = '[' then
+  begin
+    e := FPos;
+    while (e <= Length(FLine)) and (FLine[e] <> ']') do
+      e := e + 1;
+    if e <= Length(FLine) then
+    begin
+      inside := Copy(FLine, FPos + 1, e - FPos - 1);
+      FPos := e + 1;
+      SkipSp;
+      sp := Pos(' ', inside);
+      if sp = 0 then
+        R.Code := UpperCase(inside)
+      else
+      begin
+        R.Code := UpperCase(Copy(inside, 1, sp - 1));
+        { the arguments are values of the grammar }
+        savedLine := FLine;
+        savedPos := FPos;
+        LoadLine(Copy(inside, sp + 1, Length(inside) - sp));
+        while True do
+        begin
+          SkipSp;
+          if AtEnd then
+            Break;
+          node := ParseValue;
+          k := Length(R.FCodeArgs);
+          SetLength(R.FCodeArgs, k + 1);
+          R.FCodeArgs[k] := node;
+        end;
+        FLine := savedLine;
+        FPos := savedPos;
+      end;
+    end;
+  end;
+  R.Text := Copy(FLine, FPos, Length(FLine) - FPos + 1);
+end;
+
+function TImapClient.ReadResponse: TImapResponse;
+var
+  line, w: string;
+  r: TImapResponse;
+  sp, k: Integer;
+  node: TImapNode;
+begin
+  line := ReadOneLine(DeadlineAt);
+  r := TImapResponse.Create;
+  r.Num := -1;
+  r.Kind := '';
+  r.Code := '';
+  r.Text := '';
+  Result := r;
+  if line = '' then
+    raise EImapError.CreateKind(ImapProtocol, '', 'an empty response line');
+  LoadLine(line);
+  if line[1] = '+' then
+  begin
+    r.Tag := '+';
+    r.Text := Copy(line, 3, Length(line) - 2);
+    Exit;
+  end;
+  if line[1] = '*' then
+  begin
+    r.Tag := '*';
+    FPos := 2;
+    SkipSp;
+    w := ParseAtom;
+    if w = '' then
+      raise EImapError.CreateKind(ImapProtocol, '', 'bad untagged response');
+    node := TImapNode.Create(inAtom, w);
+    if node.Number >= 0 then
+    begin
+      r.Num := node.Number;
+      SkipSp;
+      w := ParseAtom;
+    end;
+    r.Kind := UpperCase(w);
+    if (r.Kind = 'OK') or (r.Kind = 'NO') or (r.Kind = 'BAD') or (r.Kind = 'BYE') or (r.Kind = 'PREAUTH') then
+    begin
+      ParseStatusText(r);
+      Exit;
+    end;
+    while True do
+    begin
+      SkipSp;
+      if AtEnd then
+        Break;
+      node := ParseValue;
+      k := Length(r.FItems);
+      SetLength(r.FItems, k + 1);
+      r.FItems[k] := node;
+    end;
+    Exit;
+  end;
+  { tagged: the tag, then OK, NO or BAD and the text }
+  sp := Pos(' ', line);
+  if sp = 0 then
+    raise EImapError.CreateKind(ImapProtocol, '', 'bad tagged response: ' + MimeQuote(line));
+  r.Tag := Copy(line, 1, sp - 1);
+  FPos := sp + 1;
+  w := ParseAtom;
+  r.Kind := UpperCase(w);
+  if (r.Kind <> 'OK') and (r.Kind <> 'NO') and (r.Kind <> 'BAD') then
+    raise EImapError.CreateKind(ImapProtocol, '', 'bad tagged response: ' + MimeQuote(line));
+  ParseStatusText(r);
+end;
+
+procedure TImapClient.TakeCaps(R: TImapResponse);
+var
+  i, k: Integer;
+begin
+  SetLength(FCaps, 0);
+  if R.Kind = 'CAPABILITY' then
+  begin
+    for i := 0 to R.ItemCount - 1 do
+    begin
+      k := Length(FCaps);
+      SetLength(FCaps, k + 1);
+      FCaps[k] := UpperCase(R.Item(i).Text);
+    end;
+  end
+  else
+    for i := 0 to R.CodeArgCount - 1 do
+    begin
+      k := Length(FCaps);
+      SetLength(FCaps, k + 1);
+      FCaps[k] := UpperCase(R.CodeArg(i).Text);
+    end;
+end;
+
+procedure TImapClient.Handle(R: TImapResponse);
+var
+  i, k: Integer;
+begin
+  if R.Tag = '+' then
+    Exit;
+  if R.Kind = 'CAPABILITY' then
+    TakeCaps(R)
+  else if R.Kind = 'EXISTS' then
+    FSel.Exists := R.Num
+  else if R.Kind = 'RECENT' then
+    FSel.Recent := R.Num
+  else if R.Kind = 'EXPUNGE' then
+  begin
+    if FSel.Exists > 0 then
+      FSel.Exists := FSel.Exists - 1;
+  end
+  else if R.Kind = 'FLAGS' then
+  begin
+    if (R.ItemCount > 0) and R.Item(0).IsList then
+      FSel.Flags := R.Item(0).Strings;
+  end
+  else if R.Kind = 'BYE' then
+  begin
+    FBye := True;
+    FByeText := R.Text;
+  end;
+  if (R.Kind = 'OK') or (R.Kind = 'NO') or (R.Kind = 'BAD') or (R.Kind = 'PREAUTH') then
+  begin
+    if R.Code = 'CAPABILITY' then
+      TakeCaps(R)
+    else if (R.Code = 'UIDVALIDITY') and (R.CodeArgCount > 0) then
+      FSel.UidValidity := R.CodeArg(0).Number
+    else if (R.Code = 'UIDNEXT') and (R.CodeArgCount > 0) then
+      FSel.UidNext := R.CodeArg(0).Number
+    else if (R.Code = 'UNSEEN') and (R.CodeArgCount > 0) then
+      FSel.Unseen := R.CodeArg(0).Number
+    else if (R.Code = 'PERMANENTFLAGS') and (R.CodeArgCount > 0) and R.CodeArg(0).IsList then
+      FSel.PermanentFlags := R.CodeArg(0).Strings
+    else if R.Code = 'READ-ONLY' then
+      FSel.ReadOnly := True
+    else if R.Code = 'READ-WRITE' then
+      FSel.ReadOnly := False;
+  end;
+  k := Length(FResp);
+  SetLength(FResp, k + 1);
+  FResp[k] := R;
+end;
+
+function TImapClient.HasCap(const Name: string): Boolean;
+var
+  i: Integer;
+  u: string;
+begin
+  Result := False;
+  u := UpperCase(Name);
+  for i := 0 to Length(FCaps) - 1 do
+    if FCaps[i] = u then
+    begin
+      Result := True;
+      Exit;
+    end;
+end;
+
+function TImapClient.HasCapability(const Name: string): Boolean;
+begin
+  Result := HasCap(Name);
+end;
+
+function TImapClient.Capabilities: TStringArray;
+begin
+  Result := FCaps;
+end;
+
+function TImapClient.Selected: TImapSelected;
+begin
+  Result := FSel;
+end;
+
+function TImapClient.IsTls: Boolean;
+begin
+  Result := FTls;
+end;
+
+function TImapClient.IsAuthenticated: Boolean;
+begin
+  Result := FAuthed;
+end;
+
+{ ---- commands ---- }
+
+procedure TImapClient.CmdBegin(const Text: string);
+begin
+  SetLength(FParts, 1);
+  SetLength(FSync, 1);
+  SetLength(FData, 1);
+  FParts[0] := Text;
+  FSync[0] := False;
+  FData[0] := False;
+  FLastLit := False;
+  SetLength(FResp, 0);
+end;
+
+procedure TImapClient.CmdText(const Text: string);
+var
+  k: Integer;
+begin
+  if FLastLit then
+  begin
+    k := Length(FParts);
+    SetLength(FParts, k + 1);
+    SetLength(FSync, k + 1);
+    SetLength(FData, k + 1);
+    FParts[k] := Text;
+    FSync[k] := False;
+    FData[k] := False;
+    FLastLit := False;
+    Exit;
+  end;
+  FParts[Length(FParts) - 1] := FParts[Length(FParts) - 1] + Text;
+end;
+
+{ a literal: the count ends the part (with CRLF) and the data starts the
+  next; the server's + is waited for unless it takes LITERAL+ }
+procedure TImapClient.CmdLiteral(const Data: string);
+var
+  k: Integer;
+  plus: Boolean;
+begin
+  plus := HasCap('LITERAL+') or (HasCap('LITERAL-') and (Length(Data) <= 4096));
+  if plus then
+    CmdText('{' + IntToStr(Length(Data)) + '+}' + #13#10)
+  else
+    CmdText('{' + IntToStr(Length(Data)) + '}' + #13#10);
+  k := Length(FParts);
+  SetLength(FParts, k + 1);
+  SetLength(FSync, k + 1);
+  SetLength(FData, k + 1);
+  FParts[k] := Data;
+  FSync[k] := not plus;
+  FData[k] := True;
+  FLastLit := True;
+end;
+
+procedure TImapClient.CmdAstring(const S: string);
+var
+  q: string;
+begin
+  q := ImapQuote(S);
+  if q = '' then
+    CmdLiteral(S)
+  else
+    CmdText(q);
+end;
+
+procedure TImapClient.CmdMailbox(const Name: string);
+begin
+  if UpperCase(Name) = 'INBOX' then
+    CmdText('INBOX')
+  else
+    CmdAstring(ImapEncodeMailbox(Name));
+end;
+
+procedure TImapClient.Write1(const Data: string);
+begin
+  if not FStream.WriteAll(Data, DeadlineAt) then
+    raise EImapError.CreateIo('write failed', False);
+end;
+
+procedure TImapClient.Fail(R: TImapResponse);
+var
+  k: Integer;
+begin
+  if R.Kind = 'NO' then
+    k := ImapNo
+  else
+    k := ImapBad;
+  raise EImapError.CreateKind(k, R.Code, R.Text);
+end;
+
+{ sends FParts under a new tag and reads until its tagged response; the
+  untagged ones are in FResp }
+procedure TImapClient.Run;
+var
+  tag, t: string;
+  i: Integer;
+  r: TImapResponse;
+  got: Boolean;
+begin
+  if FClosed then
+    raise EImapError.CreateIo('use of a closed connection', False);
+  { a command that holds a line break would be two commands }
+  for i := 0 to Length(FParts) - 1 do
+    if not FData[i] then
+    begin
+      t := FParts[i];
+      if (Length(t) >= 2) and (Copy(t, Length(t) - 1, 2) = #13#10) then
+        t := Copy(t, 1, Length(t) - 2);
+      if (Pos(#13, t) > 0) or (Pos(#10, t) > 0) or (Pos(#0, t) > 0) then
+        raise EImapError.CreateKind(ImapBad, '', 'a command holds a line break');
+    end;
+  FTagNo := FTagNo + 1;
+  tag := 'A' + IntToStr(FTagNo);
+  FParts[0] := tag + ' ' + FParts[0];
+  { the command ends with a CRLF; a part that is a literal's data is followed by the rest of the line }
+  FParts[Length(FParts) - 1] := FParts[Length(FParts) - 1] + #13#10;
+  for i := 0 to Length(FParts) - 1 do
+  begin
+    if (i > 0) and FSync[i] then
+    begin
+      got := False;
+      while not got do
+      begin
+        r := ReadResponse;
+        if r.Tag = '+' then
+          got := True
+        else if r.Tag = tag then
+        begin
+          if r.Kind = 'OK' then
+            raise EImapError.CreateKind(ImapProtocol, '', 'the server ended the command before its literal')
+          else
+            Fail(r);
+        end
+        else
+          Handle(r);
+      end;
+    end;
+    Write1(FParts[i]);
+  end;
+  while True do
+  begin
+    r := ReadResponse;
+    if r.Tag = '+' then
+    begin
+      { a challenge or a continuation nobody waits for: cancelled }
+      Write1('*' + #13#10);
+      Continue;
+    end;
+    if r.Tag = '*' then
+    begin
+      Handle(r);
+      if r.Kind = 'BYE' then
+      begin
+        { the tagged response of a LOGOUT follows; else the server hung up }
+        Continue;
+      end;
+      Continue;
+    end;
+    if r.Tag <> tag then
+      raise EImapError.CreateKind(ImapProtocol, '', 'a tagged response for another command: ' + r.Tag);
+    Handle(r);
+    if r.Kind <> 'OK' then
+      Fail(r);
+    Exit;
+  end;
+end;
+
+procedure TImapClient.StartTls;
+var
+  ns: TNetStream;
+begin
+  if TlsUpgrader = nil then
+    raise EImapError.CreateIo('imap: STARTTLS needs a TLS unit and none is linked', False);
+  CmdBegin('STARTTLS');
+  Run;
+  ns := TlsUpgrader.Upgrade(FStream, FHost, FTimeoutMs);
+  if ns = nil then
+    raise EImapError.CreateIo('imap: the TLS handshake failed', False);
+  FStream := ns;
+  FBuf := '';
+  FTls := True;
+  { the capabilities are asked again over the new connection }
+  CmdBegin('CAPABILITY');
+  Run;
+end;
+
+function ImapLocalhost(const Name: string): Boolean;
+begin
+  Result := (Name = 'localhost') or (Name = '127.0.0.1') or (Name = '::1');
+end;
+
+procedure TImapClient.Login(const User, Pass: string);
+begin
+  if (not FTls) and (not ImapLocalhost(FHost)) then
+    raise EImapError.CreateIo('unencrypted connection', False);
+  if HasCap('LOGINDISABLED') then
+    raise EImapError.CreateIo('imap: the server has LOGINDISABLED', False);
+  CmdBegin('LOGIN ');
+  CmdAstring(User);
+  CmdText(' ');
+  CmdAstring(Pass);
+  Run;
+  FAuthed := True;
+  { the response code CAPABILITY, when the tagged OK had one, is taken by Run }
+end;
+
+procedure TImapClient.AuthenticatePlain(const User, Pass: string);
+var
+  resp: string;
+begin
+  if (not FTls) and (not ImapLocalhost(FHost)) then
+    raise EImapError.CreateIo('unencrypted connection', False);
+  resp := Base64Encode(#0 + User + #0 + Pass, False, True);
+  if HasCap('SASL-IR') then
+    CmdBegin('AUTHENTICATE PLAIN ' + resp)
+  else
+  begin
+    CmdBegin('AUTHENTICATE PLAIN' + #13#10);
+    SetLength(FParts, 2);
+    SetLength(FSync, 2);
+    SetLength(FData, 2);
+    FParts[1] := resp;
+    FSync[1] := True;
+    FData[1] := False;
+  end;
+  Run;
+  FAuthed := True;
+end;
+
+procedure TImapClient.AuthenticateXOAuth2(const User, Token: string);
+var
+  resp: string;
+begin
+  resp := Base64Encode('user=' + User + #1 + 'auth=Bearer ' + Token + #1#1, False, True);
+  if HasCap('SASL-IR') then
+    CmdBegin('AUTHENTICATE XOAUTH2 ' + resp)
+  else
+  begin
+    CmdBegin('AUTHENTICATE XOAUTH2' + #13#10);
+    SetLength(FParts, 2);
+    SetLength(FSync, 2);
+    SetLength(FData, 2);
+    FParts[1] := resp;
+    FSync[1] := True;
+    FData[1] := False;
+  end;
+  Run;
+  FAuthed := True;
+end;
+
+procedure TImapClient.Noop;
+begin
+  CmdBegin('NOOP');
+  Run;
+end;
+
+function TImapClient.ListMailboxes(const Ref, Pattern: string): TImapMailboxArray;
+var
+  i, k: Integer;
+  r: TImapResponse;
+begin
+  SetLength(Result, 0);
+  CmdBegin('LIST ');
+  CmdAstring(ImapEncodeMailbox(Ref));
+  CmdText(' ');
+  CmdAstring(ImapEncodeMailbox(Pattern));
+  Run;
+  for i := 0 to Length(FResp) - 1 do
+  begin
+    r := FResp[i];
+    if (r.Tag = '*') and (r.Kind = 'LIST') and (r.ItemCount >= 3) then
+    begin
+      k := Length(Result);
+      SetLength(Result, k + 1);
+      Result[k].Attrs := r.Item(0).Strings;
+      if r.Item(1).IsNil then
+        Result[k].Delimiter := ''
+      else
+        Result[k].Delimiter := r.Item(1).Text;
+      Result[k].Name := ImapDecodeMailbox(r.Item(2).Text);
+    end;
+  end;
+end;
+
+function TImapClient.SelectMailbox(const Mailbox: string; ReadOnly: Boolean): TImapSelected;
+begin
+  FSel.Exists := -1;
+  FSel.Recent := -1;
+  FSel.UidValidity := -1;
+  FSel.UidNext := -1;
+  FSel.Unseen := -1;
+  FSel.ReadOnly := ReadOnly;
+  SetLength(FSel.Flags, 0);
+  SetLength(FSel.PermanentFlags, 0);
+  FSel.Name := Mailbox;
+  if ReadOnly then
+    CmdBegin('EXAMINE ')
+  else
+    CmdBegin('SELECT ');
+  CmdMailbox(Mailbox);
+  Run;
+  Result := FSel;
+end;
+
+function TImapClient.MailboxStatus(const Mailbox: string): TImapStatus;
+var
+  i, j: Integer;
+  r: TImapResponse;
+  l: TImapNode;
+  nm: string;
+begin
+  Result.Messages := -1;
+  Result.Recent := -1;
+  Result.UidNext := -1;
+  Result.UidValidity := -1;
+  Result.Unseen := -1;
+  CmdBegin('STATUS ');
+  CmdMailbox(Mailbox);
+  CmdText(' (MESSAGES RECENT UIDNEXT UIDVALIDITY UNSEEN)');
+  Run;
+  for i := 0 to Length(FResp) - 1 do
+  begin
+    r := FResp[i];
+    if (r.Tag = '*') and (r.Kind = 'STATUS') and (r.ItemCount >= 2) and r.Item(1).IsList then
+    begin
+      l := r.Item(1);
+      j := 0;
+      while j + 1 < l.Count do
+      begin
+        nm := UpperCase(l.Item(j).Text);
+        if nm = 'MESSAGES' then
+          Result.Messages := l.Item(j + 1).Number
+        else if nm = 'RECENT' then
+          Result.Recent := l.Item(j + 1).Number
+        else if nm = 'UIDNEXT' then
+          Result.UidNext := l.Item(j + 1).Number
+        else if nm = 'UIDVALIDITY' then
+          Result.UidValidity := l.Item(j + 1).Number
+        else if nm = 'UNSEEN' then
+          Result.Unseen := l.Item(j + 1).Number;
+        j := j + 2;
+      end;
+    end;
+  end;
+end;
+
+function TImapClient.UidSearch(const Criteria: string): TImapUidArray;
+var
+  i, j, k: Integer;
+  r: TImapResponse;
+begin
+  SetLength(Result, 0);
+  CmdBegin('UID SEARCH ' + Criteria);
+  Run;
+  for i := 0 to Length(FResp) - 1 do
+  begin
+    r := FResp[i];
+    if (r.Tag = '*') and (r.Kind = 'SEARCH') then
+      for j := 0 to r.ItemCount - 1 do
+        if r.Item(j).Number >= 0 then
+        begin
+          k := Length(Result);
+          SetLength(Result, k + 1);
+          Result[k] := r.Item(j).Number;
+        end;
+  end;
+end;
+
+function TImapClient.UidSearchWith(const Fmt: string; const Args: array of string): TImapUidArray;
+var
+  i, j, k, n: Integer;
+  r: TImapResponse;
+begin
+  SetLength(Result, 0);
+  CmdBegin('UID SEARCH ');
+  i := 1;
+  n := 0;
+  while i <= Length(Fmt) do
+  begin
+    j := i;
+    while (j < Length(Fmt)) and not ((Fmt[j] = '%') and (Fmt[j + 1] = 's')) do
+      j := j + 1;
+    if (j < Length(Fmt)) and (Fmt[j] = '%') and (Fmt[j + 1] = 's') then
+    begin
+      CmdText(Copy(Fmt, i, j - i));
+      if n > High(Args) then
+        raise EImapError.CreateKind(ImapBad, '', 'UidSearchWith: more %s than arguments');
+      CmdAstring(Args[n]);
+      n := n + 1;
+      i := j + 2;
+    end
+    else
+    begin
+      CmdText(Copy(Fmt, i, Length(Fmt) - i + 1));
+      i := Length(Fmt) + 1;
+    end;
+  end;
+  Run;
+  for i := 0 to Length(FResp) - 1 do
+  begin
+    r := FResp[i];
+    if (r.Tag = '*') and (r.Kind = 'SEARCH') then
+      for j := 0 to r.ItemCount - 1 do
+        if r.Item(j).Number >= 0 then
+        begin
+          k := Length(Result);
+          SetLength(Result, k + 1);
+          Result[k] := r.Item(j).Number;
+        end;
+  end;
+end;
+
+function TImapClient.UidFetch(const UidSet, Items: string): TImapMessageArray;
+var
+  i, j, k: Integer;
+  r: TImapResponse;
+  l: TImapNode;
+  m: TImapMessage;
+  nm: string;
+  v: TImapNode;
+  fl: TStringArray;
+begin
+  SetLength(Result, 0);
+  CmdBegin('UID FETCH ' + UidSet + ' ' + Items);
+  Run;
+  for i := 0 to Length(FResp) - 1 do
+  begin
+    r := FResp[i];
+    if (r.Tag = '*') and (r.Kind = 'FETCH') and (r.ItemCount >= 1) and r.Item(0).IsList then
+    begin
+      m := TImapMessage.Create;
+      m.Seq := r.Num;
+      l := r.Item(0);
+      j := 0;
+      while j + 1 < l.Count do
+      begin
+        nm := UpperCase(l.Item(j).Text);
+        v := l.Item(j + 1);
+        m.SetAttr(nm, v);
+        if nm = 'UID' then
+          m.Uid := v.Number
+        else if nm = 'FLAGS' then
+          m.Flags := v.Strings
+        else if nm = 'RFC822.SIZE' then
+          m.Size := v.Number
+        else if nm = 'INTERNALDATE' then
+          m.InternalDate := v.Text
+        else if (nm = 'BODY[]') or (nm = 'RFC822') then
+          m.Body := v.Text
+        else if (nm = 'BODY[HEADER]') or (nm = 'RFC822.HEADER') then
+          m.Header := v.Text
+        else if (nm = 'BODY[TEXT]') or (nm = 'RFC822.TEXT') then
+          m.BodyText := v.Text;
+        j := j + 2;
+      end;
+      k := Length(Result);
+      SetLength(Result, k + 1);
+      Result[k] := m;
+    end;
+  end;
+end;
+
+function TImapClient.FetchRaw(Uid: Integer): string;
+var
+  m: TImapMessageArray;
+begin
+  m := UidFetch(IntToStr(Uid), '(BODY.PEEK[])');
+  if Length(m) = 0 then
+    raise EImapError.CreateKind(ImapNo, '', 'no such message');
+  Result := m[0].Body;
+end;
+
+procedure TImapClient.UidStore(const UidSet, Mode, Flags: string);
+begin
+  CmdBegin('UID STORE ' + UidSet + ' ' + Mode + ' ' + Flags);
+  Run;
+end;
+
+procedure TImapClient.Expunge;
+begin
+  CmdBegin('EXPUNGE');
+  Run;
+end;
+
+procedure TImapClient.UidCopy(const UidSet, Mailbox: string);
+begin
+  CmdBegin('UID COPY ' + UidSet + ' ');
+  CmdMailbox(Mailbox);
+  Run;
+end;
+
+procedure TImapClient.UidMove(const UidSet, Mailbox: string);
+begin
+  if HasCap('MOVE') then
+  begin
+    CmdBegin('UID MOVE ' + UidSet + ' ');
+    CmdMailbox(Mailbox);
+    Run;
+    Exit;
+  end;
+  UidCopy(UidSet, Mailbox);
+  UidStore(UidSet, '+FLAGS.SILENT', '(\Deleted)');
+  if HasCap('UIDPLUS') then
+  begin
+    CmdBegin('UID EXPUNGE ' + UidSet);
+    Run;
+  end
+  else
+    Expunge;
+end;
+
+function TImapClient.AppendMessage(const Mailbox, Flags, Msg: string): Integer;
+var
+  i: Integer;
+  r: TImapResponse;
+begin
+  Result := 0;
+  CmdBegin('APPEND ');
+  CmdMailbox(Mailbox);
+  if Flags <> '' then
+    CmdText(' ' + Flags);
+  CmdText(' ');
+  CmdLiteral(Msg);
+  Run;
+  for i := 0 to Length(FResp) - 1 do
+  begin
+    r := FResp[i];
+    if (r.Tag <> '*') and (r.Tag <> '+') and (r.Code = 'APPENDUID') and (r.CodeArgCount >= 2) then
+      Result := r.CodeArg(1).Number;
+  end;
+end;
+
+procedure TImapClient.CreateMailbox(const Mailbox: string);
+begin
+  CmdBegin('CREATE ');
+  CmdMailbox(Mailbox);
+  Run;
+end;
+
+procedure TImapClient.DeleteMailbox(const Mailbox: string);
+begin
+  CmdBegin('DELETE ');
+  CmdMailbox(Mailbox);
+  Run;
+end;
+
+procedure TImapClient.RenameMailbox(const OldName, NewName: string);
+begin
+  CmdBegin('RENAME ');
+  CmdMailbox(OldName);
+  CmdText(' ');
+  CmdMailbox(NewName);
+  Run;
+end;
+
+procedure TImapClient.Subscribe(const Mailbox: string);
+begin
+  CmdBegin('SUBSCRIBE ');
+  CmdMailbox(Mailbox);
+  Run;
+end;
+
+procedure TImapClient.Unsubscribe(const Mailbox: string);
+begin
+  CmdBegin('UNSUBSCRIBE ');
+  CmdMailbox(Mailbox);
+  Run;
+end;
+
+procedure TImapClient.CloseMailbox;
+begin
+  CmdBegin('CLOSE');
+  Run;
+end;
+
+function TImapClient.Idle(TimeoutMs: Integer): Boolean;
+var
+  tag, data: string;
+  r: TImapResponse;
+  dl, n: Integer;
+begin
+  Result := False;
+  if not HasCap('IDLE') then
+    raise EImapError.CreateKind(ImapBad, '', 'the server does not have IDLE');
+  FTagNo := FTagNo + 1;
+  tag := 'A' + IntToStr(FTagNo);
+  SetLength(FResp, 0);
+  Write1(tag + ' IDLE' + #13#10);
+  r := ReadResponse;
+  while r.Tag = '*' do
+  begin
+    Handle(r);
+    r := ReadResponse;
+  end;
+  if r.Tag <> '+' then
+  begin
+    if r.Tag = tag then
+      Fail(r);
+    raise EImapError.CreateKind(ImapProtocol, '', 'IDLE was not continued');
+  end;
+  { news, or the time out: whatever bytes arrive are put back to be read as a response }
+  if FBuf = '' then
+  begin
+    dl := Nanotime + TimeoutMs * 1000000;
+    n := FStream.ReadSome(4096, dl, data);
+    if n > 0 then
+      FBuf := data
+    else if n = 0 then
+      raise EImapError.CreateIo('EOF', False);
+  end;
+  if FBuf <> '' then
+  begin
+    r := ReadResponse;
+    Handle(r);
+    if (r.Kind = 'EXISTS') or (r.Kind = 'EXPUNGE') or (r.Kind = 'FETCH') or (r.Kind = 'RECENT') then
+      Result := True;
+  end;
+  Write1('DONE' + #13#10);
+  while True do
+  begin
+    r := ReadResponse;
+    if r.Tag = tag then
+    begin
+      Handle(r);
+      if r.Kind <> 'OK' then
+        Fail(r);
+      Break;
+    end;
+    if r.Tag = '*' then
+    begin
+      Handle(r);
+      if (r.Kind = 'EXISTS') or (r.Kind = 'EXPUNGE') or (r.Kind = 'FETCH') or (r.Kind = 'RECENT') then
+        Result := True;
+    end;
+  end;
+end;
+
+procedure TImapClient.Logout;
+begin
+  try
+    CmdBegin('LOGOUT');
+    Run;
+  except
+    on E: EImapError do
+      if not FBye then
+        raise;
+  end;
+  Disconnect;
+end;
+
+procedure TImapClient.Disconnect;
+begin
+  if not FClosed then
+  begin
+    FClosed := True;
+    FStream.Dispose;
+  end;
+end;
+
+function ImapDial(const Host: string; Port, Mode, TimeoutMs: Integer): TImapClient;
+var
+  s: TNetStream;
+begin
+  if Mode = ImapImplicit then
+  begin
+    if TlsDialer = nil then
+      raise EImapError.CreateIo('imap: TLS needs a TLS unit and none is linked', False);
+    s := TlsDialer.Dial(Host, Port, TimeoutMs);
+  end
+  else
+    s := DialTcp(Host, Port, TimeoutMs);
+  if s = nil then
+    raise EImapError.CreateIo('dial tcp ' + Host + ':' + IntToStr(Port) + ': connection failed', False);
+  Result := TImapClient.Create(s, Host, Mode = ImapImplicit, TimeoutMs);
+  if (Mode = ImapStartTls) and (not Result.IsTls) then
+  begin
+    if not Result.HasCapability('STARTTLS') then
+    begin
+      Result.Disconnect;
+      raise EImapError.CreateIo('imap: server doesn''t support STARTTLS', False);
+    end;
+    try
+      Result.StartTls;
+    except
+      Result.Disconnect;
+      raise;
+    end;
+  end;
+end;
+
+{ ---- strings, names, dates ---- }
+
+function ImapQuote(const S: string): string;
+var
+  i: Integer;
+  c: Char;
+begin
+  Result := '"';
+  for i := 1 to Length(S) do
+  begin
+    c := S[i];
+    if (c = #13) or (c = #10) or (c = #0) or (Ord(c) >= 128) then
+    begin
+      Result := '';
+      Exit;
+    end;
+    if (c = '"') or (c = '\') then
+      Result := Result + '\';
+    Result := Result + c;
+  end;
+  Result := Result + '"';
+end;
+
+function ImapUidSet(const Uids: array of Integer): string;
+var
+  i, a, b: Integer;
+begin
+  Result := '';
+  i := 0;
+  while i <= High(Uids) do
+  begin
+    a := Uids[i];
+    b := a;
+    while (i < High(Uids)) and (Uids[i + 1] = b + 1) do
+    begin
+      i := i + 1;
+      b := Uids[i];
+    end;
+    if Result <> '' then
+      Result := Result + ',';
+    if b > a then
+      Result := Result + IntToStr(a) + ':' + IntToStr(b)
+    else
+      Result := Result + IntToStr(a);
+    i := i + 1;
+  end;
+end;
+
+const
+  Utf7Alphabet: string = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+,';
+
+{ the UTF-16 big-endian bytes of UTF-8 text }
+function Utf16Of(const S: string): string;
+var
+  i, sz, r: Integer;
+begin
+  Result := '';
+  i := 1;
+  while i <= Length(S) do
+  begin
+    r := Utf8Next(S, i, sz);
+    i := i + sz;
+    if r >= $10000 then
+    begin
+      r := r - $10000;
+      Result := Result + Chr($D8 + (r shr 18)) + Chr((r shr 10) and 255) + Chr($DC + ((r shr 8) and 3)) + Chr(r and 255);
+    end
+    else
+      Result := Result + Chr(r shr 8) + Chr(r and 255);
+  end;
+end;
+
+function ImapEncodeMailbox(const Utf8: string): string;
+var
+  i, sz, r: Integer;
+  run, b: string;
+  pending: Boolean;
+begin
+  Result := '';
+  run := '';
+  pending := False;
+  i := 1;
+  while i <= Length(Utf8) do
+  begin
+    r := Utf8Next(Utf8, i, sz);
+    if (r >= $20) and (r <= $7E) then
+    begin
+      if pending then
+      begin
+        b := Base64Encode(Utf16Of(run), False, False);
+        Result := Result + '&' + StringReplace(b, '/', ',', [rfReplaceAll]) + '-';
+        run := '';
+        pending := False;
+      end;
+      if r = 38 then
+        Result := Result + '&-'
+      else
+        Result := Result + Chr(r);
+    end
+    else
+    begin
+      Utf8Add(run, r);
+      pending := True;
+    end;
+    i := i + sz;
+  end;
+  if pending then
+  begin
+    b := Base64Encode(Utf16Of(run), False, False);
+    Result := Result + '&' + StringReplace(b, '/', ',', [rfReplaceAll]) + '-';
+  end;
+end;
+
+function ImapDecodeMailbox(const Name: string): string;
+var
+  i, j, k, u, v: Integer;
+  raw, b: string;
+begin
+  Result := '';
+  i := 1;
+  while i <= Length(Name) do
+  begin
+    if Name[i] <> '&' then
+    begin
+      Result := Result + Name[i];
+      i := i + 1;
+      Continue;
+    end;
+    j := i + 1;
+    while (j <= Length(Name)) and (Name[j] <> '-') do
+      j := j + 1;
+    if j > Length(Name) then
+    begin
+      Result := Name;
+      Exit;
+    end;
+    if j = i + 1 then
+    begin
+      Result := Result + '&';
+      i := j + 1;
+      Continue;
+    end;
+    b := StringReplace(Copy(Name, i + 1, j - i - 1), ',', '/', [rfReplaceAll]);
+    if not Base64Decode(b, False, False, raw) then
+    begin
+      Result := Name;
+      Exit;
+    end;
+    if Length(raw) mod 2 <> 0 then
+    begin
+      Result := Name;
+      Exit;
+    end;
+    k := 1;
+    while k < Length(raw) do
+    begin
+      u := Ord(raw[k]) * 256 + Ord(raw[k + 1]);
+      k := k + 2;
+      if (u >= $D800) and (u < $DC00) and (k < Length(raw)) then
+      begin
+        v := Ord(raw[k]) * 256 + Ord(raw[k + 1]);
+        if (v >= $DC00) and (v < $E000) then
+        begin
+          u := $10000 + ((u - $D800) shl 10) + (v - $DC00);
+          k := k + 2;
+        end;
+      end;
+      Utf8Add(Result, u);
+    end;
+    i := j + 1;
+  end;
+end;
+
+function ImapParseInternalDate(const S: string; out Unix, Offset: Integer): Boolean;
+var
+  d, y, hh, mm, ss, zh, zm, mon, i, p: Integer;
+  t, name: string;
+  names: string;
+begin
+  Result := False;
+  Unix := 0;
+  Offset := 0;
+  { dd-Mmm-yyyy hh:mm:ss +zzzz, the day with a space first when one digit }
+  t := S;
+  if (Length(t) < 26) then
+    Exit;
+  p := 1;
+  while (p <= Length(t)) and (t[p] = ' ') do
+    p := p + 1;
+  t := Copy(t, p, Length(t) - p + 1);
+  if Length(t) < 25 then
+    Exit;
+  i := Pos('-', t);
+  if (i < 2) or (i > 3) then
+    Exit;
+  d := StrToIntDef(Copy(t, 1, i - 1), -1);
+  name := Copy(t, i + 1, 3);
+  names := 'JanFebMarAprMayJunJulAugSepOctNovDec';
+  mon := 0;
+  for p := 0 to 11 do
+    if LowerCase(Copy(names, p * 3 + 1, 3)) = LowerCase(name) then
+      mon := p + 1;
+  if (mon = 0) or (t[i + 4] <> '-') then
+    Exit;
+  y := StrToIntDef(Copy(t, i + 5, 4), -1);
+  if (y < 0) or (t[i + 9] <> ' ') or (t[i + 12] <> ':') or (t[i + 15] <> ':') or (t[i + 18] <> ' ') then
+    Exit;
+  hh := StrToIntDef(Copy(t, i + 10, 2), -1);
+  mm := StrToIntDef(Copy(t, i + 13, 2), -1);
+  ss := StrToIntDef(Copy(t, i + 16, 2), -1);
+  zh := StrToIntDef(Copy(t, i + 20, 2), -1);
+  zm := StrToIntDef(Copy(t, i + 22, 2), -1);
+  if (d < 1) or (d > 31) or (hh < 0) or (hh > 23) or (mm < 0) or (mm > 59) or (ss < 0) or (ss > 60) or (zh < 0) or (zm < 0) then
+    Exit;
+  if (t[i + 19] <> '+') and (t[i + 19] <> '-') then
+    Exit;
+  Offset := (zh * 60 + zm) * 60;
+  if t[i + 19] = '-' then
+    Offset := -Offset;
+  { the Unix second through the mail date parser }
+  if not MailParseDate(IntToStr(d) + ' ' + Copy(names, (mon - 1) * 3 + 1, 3) + ' ' + IntToStr(y) + ' ' +
+    Copy(t, i + 10, 8) + ' ' + Copy(t, i + 19, 5), Unix, Offset, name) then
+    Exit;
+  Result := True;
+end;
+
+function EnvAddrs(N: TImapNode): TMailAddressArray;
+var
+  i, k: Integer;
+  a: TImapNode;
+  nm, mb, hs: string;
+  dcd, err: string;
+begin
+  SetLength(Result, 0);
+  if (N = nil) or (not N.IsList) then
+    Exit;
+  for i := 0 to N.Count - 1 do
+  begin
+    a := N.Item(i);
+    if (not a.IsList) or (a.Count < 4) then
+      Continue;
+    { a NIL host starts a group and a NIL mailbox ends one: only the members count }
+    if a.Item(2).IsNil or a.Item(3).IsNil then
+      Continue;
+    nm := '';
+    if not a.Item(0).IsNil then
+    begin
+      nm := a.Item(0).Text;
+      if Pos('=?', nm) > 0 then
+        if MimeDecodeHeader(nm, True, dcd, err) then
+          nm := dcd;
+    end;
+    mb := a.Item(2).Text;
+    if a.Item(3).IsNil then
+      hs := ''
+    else
+      hs := a.Item(3).Text;
+    k := Length(Result);
+    SetLength(Result, k + 1);
+    Result[k].Name := nm;
+    if hs = '' then
+      Result[k].Address := mb
+    else
+      Result[k].Address := mb + '@' + hs;
+  end;
+end;
+
+function ImapParseEnvelope(N: TImapNode; out E: TImapEnvelope): Boolean;
+var
+  dcd, err: string;
+begin
+  Result := False;
+  E.Date := '';
+  E.Subject := '';
+  E.InReplyTo := '';
+  E.MessageId := '';
+  SetLength(E.From, 0);
+  SetLength(E.Sender, 0);
+  SetLength(E.ReplyTo, 0);
+  SetLength(E.ToList, 0);
+  SetLength(E.Cc, 0);
+  SetLength(E.Bcc, 0);
+  if (N = nil) or (not N.IsList) or (N.Count < 10) then
+    Exit;
+  if not N.Item(0).IsNil then
+    E.Date := N.Item(0).Text;
+  if not N.Item(1).IsNil then
+  begin
+    E.Subject := N.Item(1).Text;
+    if Pos('=?', E.Subject) > 0 then
+      if MimeDecodeHeader(E.Subject, True, dcd, err) then
+        E.Subject := dcd;
+  end;
+  E.From := EnvAddrs(N.Item(2));
+  E.Sender := EnvAddrs(N.Item(3));
+  E.ReplyTo := EnvAddrs(N.Item(4));
+  E.ToList := EnvAddrs(N.Item(5));
+  E.Cc := EnvAddrs(N.Item(6));
+  E.Bcc := EnvAddrs(N.Item(7));
+  if not N.Item(8).IsNil then
+    E.InReplyTo := N.Item(8).Text;
+  if not N.Item(9).IsNil then
+    E.MessageId := N.Item(9).Text;
+  Result := True;
+end;
+
+end.

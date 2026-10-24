@@ -1,0 +1,377 @@
+{ P433: pasmime against Go's mime, mime/multipart, mime/quotedprintable and
+  net/mail. testdata/mime.txt (scripts/mime_corpus.py writes it) holds cases of
+  every kind (a quoted-printable text read and written, an encoded word and a
+  header with several read and one made, a media type parsed and formatted, a
+  multipart body read, an address and a list of them, a date, a message) and
+  what Go makes of each; the same verdict is made here and compared, and only
+  the lines that differ are written, then the counts. }
+program mime;
+
+uses
+  sysutils, pascodec, pastextproto, pasmime;
+
+const
+  HexDigits: string = '0123456789abcdef';
+
+function Q(const S: string): string;
+var
+  i, c: Integer;
+begin
+  Result := '';
+  for i := 1 to Length(S) do
+  begin
+    c := Ord(S[i]);
+    if (c > 32) and (c < 127) and (c <> 124) then
+      Result := Result + S[i]
+    else
+      Result := Result + '\x' + HexDigits[(c shr 4) + 1] + HexDigits[(c and 15) + 1];
+  end;
+  if Result = '' then
+    Result := '-';
+end;
+
+function Hex8(V: Integer): string;
+var
+  i: Integer;
+begin
+  SetLength(Result, 8);
+  for i := 8 downto 1 do
+  begin
+    Result[i] := HexDigits[(V and 15) + 1];
+    V := V shr 4;
+  end;
+end;
+
+function Un64(const S: string): string;
+begin
+  if S = '-' then
+    Result := ''
+  else if not Base64Decode(S, False, True, Result) then
+  begin
+    WriteLn('bad base64');
+    Halt(2);
+  end;
+end;
+
+{ the keys of the parameters in byte order, k=v joined by a comma }
+function DumpParams(P: TMimeParams): string;
+var
+  order: array of Integer;
+  i, j, t: Integer;
+begin
+  if P.Count = 0 then
+  begin
+    Result := '-';
+    Exit;
+  end;
+  SetLength(order, P.Count);
+  for i := 0 to P.Count - 1 do
+    order[i] := i;
+  for i := 1 to P.Count - 1 do
+  begin
+    t := order[i];
+    j := i - 1;
+    while (j >= 0) and (P.KeyName(order[j]) > P.KeyName(t)) do
+    begin
+      order[j + 1] := order[j];
+      j := j - 1;
+    end;
+    order[j + 1] := t;
+  end;
+  Result := '';
+  for i := 0 to P.Count - 1 do
+  begin
+    if i > 0 then
+      Result := Result + ',';
+    Result := Result + Q(P.KeyName(order[i])) + '=' + Q(P.ValueAt(order[i]));
+  end;
+end;
+
+{ the fields with their keys sorted, each key=value+value }
+function DumpFields(F: TMimeFields): string;
+var
+  keys: array of string;
+  i, j, k: Integer;
+  found: Boolean;
+  t, v: string;
+  vals: TStringArray;
+begin
+  SetLength(keys, 0);
+  for i := 0 to F.Count - 1 do
+  begin
+    found := False;
+    for j := 0 to Length(keys) - 1 do
+      if keys[j] = F.NameAt(i) then
+        found := True;
+    if not found then
+    begin
+      SetLength(keys, Length(keys) + 1);
+      keys[Length(keys) - 1] := F.NameAt(i);
+    end;
+  end;
+  for i := 1 to Length(keys) - 1 do
+  begin
+    t := keys[i];
+    j := i - 1;
+    while (j >= 0) and (keys[j] > t) do
+    begin
+      keys[j + 1] := keys[j];
+      j := j - 1;
+    end;
+    keys[j + 1] := t;
+  end;
+  if Length(keys) = 0 then
+  begin
+    Result := '-';
+    Exit;
+  end;
+  Result := '';
+  for i := 0 to Length(keys) - 1 do
+  begin
+    if i > 0 then
+      Result := Result + ',';
+    vals := F.ValuesOf(keys[i]);
+    v := '';
+    for k := 0 to Length(vals) - 1 do
+    begin
+      if k > 0 then
+        v := v + '+';
+      v := v + Q(vals[k]);
+    end;
+    Result := Result + Q(keys[i]) + '=' + v;
+  end;
+end;
+
+function Split0(const S: string): TStringArray;
+var
+  i, start, n: Integer;
+begin
+  SetLength(Result, 0);
+  start := 1;
+  for i := 1 to Length(S) + 1 do
+    if (i > Length(S)) or (S[i] = #0) then
+    begin
+      n := Length(Result);
+      SetLength(Result, n + 1);
+      Result[n] := Copy(S, start, i - start);
+      start := i + 1;
+    end;
+end;
+
+function DumpAddrs(const L: TMailAddressArray): string;
+var
+  i: Integer;
+begin
+  if Length(L) = 0 then
+  begin
+    Result := '-';
+    Exit;
+  end;
+  Result := '';
+  for i := 0 to Length(L) - 1 do
+  begin
+    if i > 0 then
+      Result := Result + ',';
+    Result := Result + Q(L[i].Name) + '<' + Q(L[i].Address) + '>';
+  end;
+end;
+
+function Verdict(const Kind: string; const A: array of string; out Known: Boolean): string;
+var
+  ad: TMailAddress;
+  al: TMailAddressArray;
+  hf: TMimeFields;
+  body: string;
+  unix, off: Integer;
+  r, err, mt: string;
+  ok: Boolean;
+  p: TMimeParams;
+  parts: TMimePartArray;
+  i, k: Integer;
+  kv: TStringArray;
+begin
+  Known := True;
+  if Kind = 'qpdec' then
+  begin
+    ok := QpDecode(A[0], r, err);
+    if ok then
+      Result := 'ok|' + Q(r)
+    else
+      Result := 'err|' + Q(r) + '|' + Q(err);
+  end
+  else if Kind = 'qpenc' then
+    Result := 'ok|' + Q(QpEncode(A[0], A[1] = '1'))
+  else if Kind = 'wdec' then
+  begin
+    if MimeDecodeWord(A[0], False, r, err) then
+      Result := 'ok|' + Q(r)
+    else
+      Result := 'err';
+  end
+  else if Kind = 'hdec' then
+  begin
+    if MimeDecodeHeader(A[0], False, r, err) then
+      Result := 'ok|' + Q(r)
+    else
+      Result := 'err';
+  end
+  else if Kind = 'wenc' then
+    Result := 'ok|' + Q(MimeEncodeWord(A[0], A[1], A[2] = 'b'))
+  else if Kind = 'mt' then
+  begin
+    p := TMimeParams.Create;
+    ok := MimeParseMediaType(A[0], mt, p, err);
+    if ok then
+      Result := 'ok|' + Q(mt) + '|' + DumpParams(p)
+    else
+      Result := 'err|' + Q(mt) + '|' + Q(err);
+  end
+  else if Kind = 'fmt' then
+  begin
+    p := TMimeParams.Create;
+    kv := Split0(A[1]);
+    i := 0;
+    while i + 1 < Length(kv) do
+    begin
+      p.Put(kv[i], kv[i + 1]);
+      i := i + 2;
+    end;
+    Result := 'ok|' + Q(MimeFormatMediaType(A[0], p));
+  end
+  else if Kind = 'mp' then
+  begin
+    ok := MimeReadMultipart(A[0], A[1], A[2] = '1', parts, err);
+    Result := '';
+    for i := 0 to Length(parts) - 1 do
+    begin
+      if Result <> '' then
+        Result := Result + '|';
+      Result := Result + 'P|' + DumpFields(parts[i].Header) + '|' + IntToStr(Length(parts[i].Body)) + ':' + Hex8(Crc32(parts[i].Body)) + '|';
+      if parts[i].BodyErr = '' then
+        Result := Result + '-'
+      else
+        Result := Result + Q(parts[i].BodyErr);
+    end;
+    if Result <> '' then
+      Result := Result + '|';
+    if ok and (err = '') then
+      Result := Result + 'END'
+    else
+      Result := Result + 'ERR|' + Q(err);
+    k := 0;
+  end
+  else if Kind = 'addr' then
+  begin
+    if MailParseAddress(A[0], False, ad, err) then
+      Result := 'ok|' + Q(ad.Name) + '<' + Q(ad.Address) + '>|' + Q(MailAddressString(ad))
+    else
+      Result := 'err|' + Q(err);
+  end
+  else if Kind = 'addrs' then
+  begin
+    if MailParseAddressList(A[0], False, al, err) then
+    begin
+      Result := 'ok|' + DumpAddrs(al) + '|';
+      for i := 0 to Length(al) - 1 do
+      begin
+        if i > 0 then
+          Result := Result + ',';
+        Result := Result + Q(MailAddressString(al[i]));
+      end;
+    end
+    else
+      Result := 'err|' + Q(err);
+  end
+  else if Kind = 'date' then
+  begin
+    if MailParseDate(A[0], unix, off, err) then
+      Result := 'ok|' + IntToStr(unix) + '|' + IntToStr(off)
+    else
+      Result := 'err|' + Q(err);
+  end
+  else if Kind = 'msg' then
+  begin
+    hf := TMimeFields.Create;
+    if MailReadMessage(A[0], hf, body, err) then
+      Result := 'ok|' + DumpFields(hf) + '|' + IntToStr(Length(body)) + ':' + Hex8(Crc32(body))
+    else
+      Result := 'err|' + Q(err);
+  end
+  else
+  begin
+    Known := False;
+    Result := '';
+  end;
+end;
+
+var
+  corpus, line, id, kind, rest, want, got: string;
+  args: array of string;
+  p, nl, q1, count, bad, skipped: Integer;
+  known: Boolean;
+begin
+  if not ReadFile('testdata/mime.txt', corpus) then
+  begin
+    WriteLn('no testdata/mime.txt');
+    Halt(2);
+  end;
+  p := 1;
+  count := 0;
+  bad := 0;
+  skipped := 0;
+  while p <= Length(corpus) do
+  begin
+    nl := p;
+    while (nl <= Length(corpus)) and (corpus[nl] <> #10) do
+      nl := nl + 1;
+    line := Copy(corpus, p, nl - p);
+    p := nl + 1;
+    q1 := Pos(' ', line);
+    id := Copy(line, 1, q1 - 1);
+    line := Copy(line, q1 + 1, Length(line) - q1);
+    q1 := Pos(' ', line);
+    kind := Copy(line, 1, q1 - 1);
+    rest := Copy(line, q1 + 1, Length(line) - q1);
+    q1 := Pos(' = ', rest);
+    want := Copy(rest, q1 + 3, Length(rest) - q1 - 2);
+    rest := Copy(rest, 1, q1 - 1);
+    SetLength(args, 0);
+    while rest <> '' do
+    begin
+      q1 := Pos(' ', rest);
+      SetLength(args, Length(args) + 1);
+      if q1 = 0 then
+      begin
+        args[Length(args) - 1] := Un64(rest);
+        rest := '';
+      end
+      else
+      begin
+        args[Length(args) - 1] := Un64(Copy(rest, 1, q1 - 1));
+        rest := Copy(rest, q1 + 1, Length(rest) - q1);
+      end;
+    end;
+    got := Verdict(kind, args, known);
+    if not known then
+    begin
+      skipped := skipped + 1;
+      Continue;
+    end;
+    count := count + 1;
+    { either#A#B: two references differ and either will do }
+    if (Copy(want, 1, 7) = 'either#') and ((got = Copy(want, 8, Pos('#', Copy(want, 8, Length(want))) - 1)) or
+       (got = Copy(want, 8 + Pos('#', Copy(want, 8, Length(want))), Length(want)))) then
+      want := got;
+    if got <> want then
+    begin
+      bad := bad + 1;
+      if bad <= 15 then
+      begin
+        WriteLn('DIFFERS ', id, ' ', kind, ' ', Q(args[0]));
+        WriteLn('  go   ', want);
+        WriteLn('  here ', got);
+      end;
+    end;
+  end;
+  WriteLn('cases ', count, ', differ from Go ', bad + skipped);
+end.

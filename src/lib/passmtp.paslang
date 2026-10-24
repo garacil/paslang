@@ -1,0 +1,835 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+
+  paslang is free software: you can redistribute it and/or modify it
+  under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+
+  paslang is distributed in the hope that it will be useful, but
+  WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+  General Public License for more details.
+
+  Under Section 7 of GPL version 3, you are granted additional
+  permissions described in the paslang Runtime Library Exception,
+  version 1.0, in the file COPYING.RUNTIME.
+
+  You should have received a copy of the GNU General Public License
+  along with paslang.  If not, see <https://www.gnu.org/licenses/>. }
+
+{ An SMTP client (P433), as Go's net/smtp is (RFC 5321, with the extensions
+  8BITMIME, AUTH of RFC 4954 and STARTTLS of RFC 3207, SMTPUTF8 of RFC
+  6531): the same commands in the same order, a reply read as net/textproto
+  reads it (multi-line replies, the messages joined with a line feed, the
+  error text 250 "text"), the body written as textproto's DotWriter does
+  (every bare line feed a CRLF, a leading dot doubled, the closing dot).
+  Beyond Go: AUTH LOGIN and XOAUTH2 beside PLAIN and CRAM-MD5, a deadline for
+  each command, and the choice of when TLS is used. TLS itself comes from
+  the TLS unit through pasconn's TlsDialer and TlsUpgrader; with none
+  linked a plain connection works and a TLS one is refused with a message.
+  Port 25 is the servers', 587 the submission one (STARTTLS), 465 the
+  implicit TLS one. An error is an ESmtpError. }
+unit passmtp;
+
+interface
+
+uses
+  sysutils, pascodec, pastextproto, pasconn, pasmime;
+
+const
+  { SmtpSendMail's choice of TLS: STARTTLS when the server offers it and a
+    TLS unit is linked (Go's SendMail does it whenever it is offered) }
+  SmtpAuto = 0;
+  { never }
+  SmtpPlain = 1;
+  { STARTTLS, or an error when it is not offered }
+  SmtpStartTls = 2;
+  { TLS from the first byte }
+  SmtpImplicit = 3;
+
+type
+  { Code is the reply's three digits, 0 when the failure is not a reply
+    (the connection, the time, a line that is no reply); Message is 250 and the text
+    quoted as Go writes %q for a reply (textproto.Error), else a text of its own }
+  ESmtpError = class(Exception)
+  public
+    Code: Integer;
+    Timeout: Boolean;
+    constructor CreateReply(ACode: Integer; const AText: string);
+    constructor CreateIo(const AText: string; ATimeout: Boolean);
+  end;
+
+  TSmtpClient = class
+  private
+    FStream: TNetStream;
+    FBuf: string;
+    FHost: string;
+    FTls: Boolean;
+    FLocalName: string;
+    FDidHello: Boolean;
+    FHelloErr: ESmtpError;
+    FHasExt: Boolean;
+    FExtKeys: TStringArray;
+    FExtVals: TStringArray;
+    FTimeoutMs: Integer;
+    FClosed: Boolean;
+    function DeadlineAt: Integer;
+    procedure SendLine(const Line: string);
+    function ReadOneLine(Dl: Integer): string;
+    procedure ReadReply(Want: Integer; out Code: Integer; out Msg: string);
+    procedure Cmd(Want: Integer; const Line: string; out Code: Integer; out Msg: string);
+    procedure Ehlo;
+    procedure Helo;
+    procedure AuthRun(const Mech, Initial: string; Kind: Integer; const User, Secret: string);
+  public
+    { takes a connection and reads the greeting (220). Host is the server's
+      name, which the TLS check and PLAIN's rules use; Tls whether the
+      connection is TLS already. TimeoutMs is the time of a command (0
+      none). }
+    constructor Create(AStream: TNetStream; const AHost: string; ATls: Boolean; ATimeoutMs: Integer);
+    { the greeting exchange, made by the first command that needs it; an error
+      of it is given again by each later command }
+    procedure Hello;
+    { whether the server answered EHLO (HELO gives no extensions) }
+    function HasExtensions: Boolean;
+    { the name in EHLO, localhost when never set; before any command }
+    procedure SetLocalName(const N: string);
+    { whether the server offers the extension (the name in any case), and
+      what follows it in the EHLO line }
+    function Extension(const Name: string; out Param: string): Boolean;
+    function IsTls: Boolean;
+    procedure StartTls;
+    { AUTH by the mechanism; PLAIN and LOGIN are refused on a connection
+      that is neither TLS nor to localhost (Go's rule) }
+    procedure AuthPlain(const Identity, User, Pass: string);
+    procedure AuthLogin(const User, Pass: string);
+    procedure AuthCramMd5(const User, Secret: string);
+    procedure AuthXOAuth2(const User, Token: string);
+    { PLAIN if the server offers it, else LOGIN, else CRAM-MD5 }
+    procedure Authenticate(const User, Pass: string);
+    procedure MailFrom(const From: string);
+    procedure RcptTo(const Addr: string);
+    { DATA, the message as the dot writer writes it, and the closing reply }
+    procedure SendData(const Msg: string);
+    procedure Verify(const Addr: string);
+    procedure Reset;
+    procedure Noop;
+    procedure Quit;
+    procedure Disconnect;
+  end;
+
+{ A client on a new connection to Host:Port (Mode SmtpImplicit has TLS from
+  the start, any other a plain TCP one); the greeting is read }
+function SmtpDial(const Host: string; Port, Mode, TimeoutMs: Integer): TSmtpClient;
+{ net/smtp.SendMail: dial, hello, STARTTLS as Mode says, AUTH when User is not
+  empty and the server has EHLO's extensions, MAIL, RCPT for each, DATA, QUIT }
+procedure SmtpSendMail(const Host: string; Port, Mode: Integer; const User, Pass, From: string;
+  const Rcpts: array of string; const Msg: string; TimeoutMs: Integer);
+{ the same for a message made with TMailBuilder: its sender, recipients (Bcc
+  among them) and text }
+procedure SmtpSend(const Host: string; Port, Mode: Integer; const User, Pass: string; B: TMailBuilder; TimeoutMs: Integer);
+{ the message as the closing dot writer of Go's textproto writes it }
+function SmtpDotStuff(const Msg: string): string;
+
+implementation
+
+constructor ESmtpError.CreateReply(ACode: Integer; const AText: string);
+var
+  c: string;
+begin
+  c := IntToStr(ACode);
+  while Length(c) < 3 do
+    c := '0' + c;
+  inherited Create(c + ' ' + MimeQuote(AText));
+  Code := ACode;
+  Timeout := False;
+end;
+
+constructor ESmtpError.CreateIo(const AText: string; ATimeout: Boolean);
+begin
+  inherited Create(AText);
+  Code := 0;
+  Timeout := ATimeout;
+end;
+
+constructor TSmtpClient.Create(AStream: TNetStream; const AHost: string; ATls: Boolean; ATimeoutMs: Integer);
+var
+  code: Integer;
+  msg: string;
+begin
+  FStream := AStream;
+  FBuf := '';
+  FHost := AHost;
+  FTls := ATls;
+  FLocalName := 'localhost';
+  FDidHello := False;
+  FHelloErr := nil;
+  FHasExt := False;
+  FTimeoutMs := ATimeoutMs;
+  FClosed := False;
+  try
+    ReadReply(220, code, msg);
+  except
+    Disconnect;
+    raise;
+  end;
+end;
+
+function TSmtpClient.DeadlineAt: Integer;
+begin
+  if FTimeoutMs > 0 then
+    Result := Nanotime + FTimeoutMs * 1000000
+  else
+    Result := 0;
+end;
+
+procedure TSmtpClient.SendLine(const Line: string);
+var
+  d: string;
+begin
+  d := Line + #13#10;
+  if not FStream.WriteAll(d, DeadlineAt) then
+    raise ESmtpError.CreateIo('write failed', False);
+end;
+
+{ textproto's parseCodeLine: the code, whether a - follows it, the message;
+  False with Err for a line that is no reply }
+function ParseCodeLine(const Line: string; out Code: Integer; out Continued: Boolean; out Msg, Err: string): Boolean;
+var
+  i: Integer;
+begin
+  Result := False;
+  Code := 0;
+  Continued := False;
+  Msg := '';
+  Err := '';
+  if (Length(Line) < 4) or ((Line[4] <> ' ') and (Line[4] <> '-')) then
+  begin
+    Err := 'short response: ' + MimeQuote(Line);
+    Exit;
+  end;
+  Continued := Line[4] = '-';
+  for i := 1 to 3 do
+    if (Line[i] < '0') or (Line[i] > '9') then
+    begin
+      Err := 'invalid response code: ' + MimeQuote(Line);
+      Exit;
+    end;
+  Code := (Ord(Line[1]) - 48) * 100 + (Ord(Line[2]) - 48) * 10 + (Ord(Line[3]) - 48);
+  if Code < 100 then
+  begin
+    Err := 'invalid response code: ' + MimeQuote(Line);
+    Exit;
+  end;
+  Msg := Copy(Line, 5, Length(Line) - 4);
+  Result := True;
+end;
+
+function CodeMatches(Code, Want: Integer): Boolean;
+begin
+  if (Want >= 1) and (Want < 10) then
+    Result := Code div 100 = Want
+  else if (Want >= 10) and (Want < 100) then
+    Result := Code div 10 = Want
+  else if (Want >= 100) and (Want < 1000) then
+    Result := Code = Want
+  else
+    Result := True;
+end;
+
+{ a line of the stream, the CR and LF off; a last line with no LF is a line
+  (bufio's ReadLine gives it) }
+function TSmtpClient.ReadOneLine(Dl: Integer): string;
+var
+  err: Integer;
+begin
+  if ReadLineFrom(FStream, FBuf, Result, 65536, Dl, err) then
+    Exit;
+  if err = -110 then
+    raise ESmtpError.CreateIo('i/o timeout', True)
+  else if err = 0 then
+  begin
+    if FBuf <> '' then
+    begin
+      Result := FBuf;
+      FBuf := '';
+      Exit;
+    end;
+    raise ESmtpError.CreateIo('EOF', False);
+  end
+  else if err = -90 then
+    raise ESmtpError.CreateIo('smtp: reply line too long', False)
+  else
+    raise ESmtpError.CreateIo('read error ' + IntToStr(-err), False);
+end;
+
+procedure TSmtpClient.ReadReply(Want: Integer; out Code: Integer; out Msg: string);
+var
+  line, first, more, perr: string;
+  code2, lines: Integer;
+  continued, mismatch: Boolean;
+  dl: Integer;
+begin
+  Code := 0;
+  Msg := '';
+  dl := DeadlineAt;
+  line := ReadOneLine(dl);
+  if not ParseCodeLine(line, Code, continued, first, perr) then
+    raise ESmtpError.CreateIo(perr, False);
+  mismatch := not CodeMatches(Code, Want);
+  Msg := first;
+  lines := 1;
+  while continued do
+  begin
+    line := ReadOneLine(dl);
+    lines := lines + 1;
+    if lines > 5000 then
+      raise ESmtpError.CreateIo('smtp: reply of too many lines', False);
+    if (not ParseCodeLine(line, code2, continued, more, perr)) or (code2 <> Code) then
+    begin
+      Msg := Msg + #10 + line;
+      continued := True;
+      Continue;
+    end;
+    Msg := Msg + #10 + more;
+  end;
+  if mismatch then
+    raise ESmtpError.CreateReply(Code, Msg);
+end;
+
+procedure TSmtpClient.Cmd(Want: Integer; const Line: string; out Code: Integer; out Msg: string);
+begin
+  SendLine(Line);
+  ReadReply(Want, Code, Msg);
+end;
+
+procedure TSmtpClient.Ehlo;
+var
+  code, i, p, start, n: Integer;
+  msg, ex: string;
+begin
+  Cmd(250, 'EHLO ' + FLocalName, code, msg);
+  SetLength(FExtKeys, 0);
+  SetLength(FExtVals, 0);
+  { the first line is the greeting, the others "KEYWORD parameters" }
+  start := 1;
+  n := 0;
+  while start <= Length(msg) + 1 do
+  begin
+    p := start;
+    while (p <= Length(msg)) and (msg[p] <> #10) do
+      p := p + 1;
+    ex := Copy(msg, start, p - start);
+    if n > 0 then
+    begin
+      i := Pos(' ', ex);
+      SetLength(FExtKeys, Length(FExtKeys) + 1);
+      SetLength(FExtVals, Length(FExtVals) + 1);
+      if i > 0 then
+      begin
+        FExtKeys[Length(FExtKeys) - 1] := UpperCase(Copy(ex, 1, i - 1));
+        FExtVals[Length(FExtVals) - 1] := Copy(ex, i + 1, Length(ex) - i);
+      end
+      else
+      begin
+        FExtKeys[Length(FExtKeys) - 1] := UpperCase(ex);
+        FExtVals[Length(FExtVals) - 1] := '';
+      end;
+    end;
+    n := n + 1;
+    start := p + 1;
+  end;
+  FHasExt := True;
+end;
+
+procedure TSmtpClient.Helo;
+var
+  code: Integer;
+  msg: string;
+begin
+  FHasExt := False;
+  SetLength(FExtKeys, 0);
+  SetLength(FExtVals, 0);
+  Cmd(250, 'HELO ' + FLocalName, code, msg);
+end;
+
+procedure TSmtpClient.Hello;
+var
+  failed: Boolean;
+begin
+  if not FDidHello then
+  begin
+    FDidHello := True;
+    failed := False;
+    try
+      Ehlo;
+    except
+      on E: ESmtpError do
+        failed := True;
+    end;
+    if failed then
+    begin
+      try
+        Helo;
+      except
+        on E2: ESmtpError do
+        begin
+          FHelloErr := E2;
+          raise;
+        end;
+      end;
+    end;
+    Exit;
+  end;
+  if FHelloErr <> nil then
+    raise FHelloErr;
+end;
+
+procedure TSmtpClient.SetLocalName(const N: string);
+var
+  i: Integer;
+begin
+  for i := 1 to Length(N) do
+    if (N[i] = #13) or (N[i] = #10) then
+      raise ESmtpError.CreateIo('smtp: A line must not contain CR or LF', False);
+  if FDidHello then
+    raise ESmtpError.CreateIo('smtp: Hello called after other methods', False);
+  FLocalName := N;
+  Hello;
+end;
+
+function TSmtpClient.Extension(const Name: string; out Param: string): Boolean;
+var
+  i: Integer;
+  k: string;
+begin
+  Result := False;
+  Param := '';
+  try
+    Hello;
+  except
+    on E: ESmtpError do
+      Exit;
+  end;
+  if not FHasExt then
+    Exit;
+  k := UpperCase(Name);
+  for i := 0 to Length(FExtKeys) - 1 do
+    if FExtKeys[i] = k then
+    begin
+      Param := FExtVals[i];
+      Result := True;
+      Exit;
+    end;
+end;
+
+function TSmtpClient.HasExtensions: Boolean;
+begin
+  Result := FHasExt;
+end;
+
+function TSmtpClient.IsTls: Boolean;
+begin
+  Result := FTls;
+end;
+
+procedure TSmtpClient.StartTls;
+var
+  code: Integer;
+  msg: string;
+  ns: TNetStream;
+begin
+  Hello;
+  if TlsUpgrader = nil then
+    raise ESmtpError.CreateIo('smtp: STARTTLS needs a TLS unit and none is linked', False);
+  Cmd(220, 'STARTTLS', code, msg);
+  ns := TlsUpgrader.Upgrade(FStream, FHost, FTimeoutMs);
+  if ns = nil then
+    raise ESmtpError.CreateIo('smtp: the TLS handshake failed', False);
+  FStream := ns;
+  FBuf := '';
+  FTls := True;
+  Ehlo;
+end;
+
+function IsLocalhost(const Name: string): Boolean;
+begin
+  Result := (Name = 'localhost') or (Name = '127.0.0.1') or (Name = '::1');
+end;
+
+{ AUTH as net/smtp.Client.Auth runs it. Kind: 0 PLAIN, 1 LOGIN, 2 CRAM-MD5,
+  3 XOAUTH2. Initial is the first response, '' when there is none. }
+procedure TSmtpClient.AuthRun(const Mech, Initial: string; Kind: Integer; const User, Secret: string);
+var
+  code, step: Integer;
+  msg, line, challenge, reply: string;
+  haveReply, ok: Boolean;
+  cd: Integer;
+  m2: string;
+begin
+  Hello;
+  if (Kind = 0) or (Kind = 1) then
+    if (not FTls) and (not IsLocalhost(FHost)) then
+    begin
+      try
+        Quit;
+      except
+        on E: ESmtpError do
+          ;
+      end;
+      raise ESmtpError.CreateIo('unencrypted connection', False);
+    end;
+  line := 'AUTH ' + Mech;
+  if Initial <> '' then
+    line := line + ' ' + Base64Encode(Initial, False, True);
+  step := 0;
+  Cmd(0, line, code, msg);
+  while True do
+  begin
+    haveReply := False;
+    reply := '';
+    if code = 334 then
+    begin
+      if not Base64Decode(msg, False, True, challenge) then
+        ok := False
+      else
+        ok := True;
+      if not ok then
+      begin
+        try
+          Cmd(501, '*', cd, m2);
+        except
+          on E: ESmtpError do
+            ;
+        end;
+        try
+          Quit;
+        except
+          on E: ESmtpError do
+            ;
+        end;
+        raise ESmtpError.CreateIo('illegal base64 data at input byte 0', False);
+      end;
+      if Kind = 0 then
+        ok := False
+      else if Kind = 1 then
+      begin
+        if step = 0 then
+          reply := User
+        else if step = 1 then
+          reply := Secret
+        else
+          ok := False;
+        if step <= 1 then
+          ok := True;
+        haveReply := True;
+      end
+      else if Kind = 2 then
+      begin
+        reply := User + ' ' + Hex(HmacMd5(Secret, challenge));
+        haveReply := True;
+        ok := True;
+      end
+      else
+      begin
+        { XOAUTH2's error challenge is answered with an empty line }
+        reply := '';
+        haveReply := True;
+        ok := True;
+      end;
+      step := step + 1;
+      if not ok then
+      begin
+        try
+          Cmd(501, '*', cd, m2);
+        except
+          on E: ESmtpError do
+            ;
+        end;
+        try
+          Quit;
+        except
+          on E: ESmtpError do
+            ;
+        end;
+        raise ESmtpError.CreateIo('unexpected server challenge', False);
+      end;
+    end
+    else if code = 235 then
+    begin
+      { the last message is no challenge }
+      Exit;
+    end
+    else
+    begin
+      try
+        Cmd(501, '*', cd, m2);
+      except
+        on E: ESmtpError do
+          ;
+      end;
+      try
+        Quit;
+      except
+        on E: ESmtpError do
+          ;
+      end;
+      raise ESmtpError.CreateReply(code, msg);
+    end;
+    if not haveReply then
+      Exit;
+    Cmd(0, Base64Encode(reply, False, True), code, msg);
+  end;
+end;
+
+procedure TSmtpClient.AuthPlain(const Identity, User, Pass: string);
+begin
+  AuthRun('PLAIN', Identity + #0 + User + #0 + Pass, 0, User, Pass);
+end;
+
+procedure TSmtpClient.AuthLogin(const User, Pass: string);
+begin
+  AuthRun('LOGIN', '', 1, User, Pass);
+end;
+
+procedure TSmtpClient.AuthCramMd5(const User, Secret: string);
+begin
+  AuthRun('CRAM-MD5', '', 2, User, Secret);
+end;
+
+procedure TSmtpClient.AuthXOAuth2(const User, Token: string);
+begin
+  AuthRun('XOAUTH2', 'user=' + User + #1 + 'auth=Bearer ' + Token + #1#1, 3, User, Token);
+end;
+
+procedure TSmtpClient.Authenticate(const User, Pass: string);
+var
+  mechs, list: string;
+begin
+  if not Extension('AUTH', mechs) then
+    raise ESmtpError.CreateIo('smtp: server doesn''t support AUTH', False);
+  list := ' ' + UpperCase(mechs) + ' ';
+  if Pos(' PLAIN ', list) > 0 then
+    AuthPlain('', User, Pass)
+  else if Pos(' LOGIN ', list) > 0 then
+    AuthLogin(User, Pass)
+  else if Pos(' CRAM-MD5 ', list) > 0 then
+    AuthCramMd5(User, Pass)
+  else
+    raise ESmtpError.CreateIo('smtp: no supported authentication mechanism', False);
+end;
+
+procedure CheckLine(const What: string);
+var
+  i: Integer;
+begin
+  for i := 1 to Length(What) do
+    if (What[i] = #13) or (What[i] = #10) then
+      raise ESmtpError.CreateIo('smtp: A line must not contain CR or LF', False);
+end;
+
+procedure TSmtpClient.MailFrom(const From: string);
+var
+  code: Integer;
+  msg, line, junk: string;
+begin
+  CheckLine(From);
+  Hello;
+  line := 'MAIL FROM:<' + From + '>';
+  if FHasExt then
+  begin
+    if Extension('8BITMIME', junk) then
+      line := line + ' BODY=8BITMIME';
+    if Extension('SMTPUTF8', junk) then
+      line := line + ' SMTPUTF8';
+  end;
+  Cmd(250, line, code, msg);
+end;
+
+procedure TSmtpClient.RcptTo(const Addr: string);
+var
+  code: Integer;
+  msg: string;
+begin
+  CheckLine(Addr);
+  Cmd(25, 'RCPT TO:<' + Addr + '>', code, msg);
+end;
+
+{ textproto's DotWriter: a bare line feed becomes CRLF, a dot at the start
+  of a line is doubled, the text is ended with a CRLF if it is not, and the
+  closing dot line follows }
+function SmtpDotStuff(const Msg: string): string;
+var
+  i, n, k: Integer;
+  state: Integer;
+  c: Char;
+begin
+  { state 0 begin or line start, 1 data, 2 after CR }
+  n := Length(Msg);
+  Result := '';
+  SetLength(Result, n * 2 + 8);
+  k := 0;
+  state := 0;
+  for i := 1 to n do
+  begin
+    c := Msg[i];
+    if state = 0 then
+    begin
+      state := 1;
+      if c = '.' then
+      begin
+        k := k + 1;
+        Result[k] := '.';
+      end;
+    end;
+    if state = 1 then
+    begin
+      if c = #13 then
+        state := 2;
+      if c = #10 then
+      begin
+        k := k + 1;
+        Result[k] := #13;
+        state := 0;
+      end;
+    end
+    else if state = 2 then
+    begin
+      state := 1;
+      if c = #10 then
+        state := 0;
+    end;
+    k := k + 1;
+    Result[k] := c;
+  end;
+  SetLength(Result, k);
+  if n = 0 then
+    Result := #13#10
+  else if state = 1 then
+    Result := Result + #13#10
+  else if state = 2 then
+    Result := Result + #10;
+  Result := Result + '.' + #13#10;
+end;
+
+procedure TSmtpClient.SendData(const Msg: string);
+var
+  code: Integer;
+  txt: string;
+begin
+  Cmd(354, 'DATA', code, txt);
+  if not FStream.WriteAll(SmtpDotStuff(Msg), DeadlineAt) then
+    raise ESmtpError.CreateIo('write failed', False);
+  ReadReply(250, code, txt);
+end;
+
+procedure TSmtpClient.Verify(const Addr: string);
+var
+  code: Integer;
+  msg: string;
+begin
+  CheckLine(Addr);
+  Hello;
+  Cmd(250, 'VRFY ' + Addr, code, msg);
+end;
+
+procedure TSmtpClient.Reset;
+var
+  code: Integer;
+  msg: string;
+begin
+  Hello;
+  Cmd(250, 'RSET', code, msg);
+end;
+
+procedure TSmtpClient.Noop;
+var
+  code: Integer;
+  msg: string;
+begin
+  Hello;
+  Cmd(250, 'NOOP', code, msg);
+end;
+
+procedure TSmtpClient.Quit;
+var
+  code: Integer;
+  msg: string;
+begin
+  try
+    Hello;
+  except
+    on E: ESmtpError do
+      ;
+  end;
+  Cmd(221, 'QUIT', code, msg);
+  Disconnect;
+end;
+
+procedure TSmtpClient.Disconnect;
+begin
+  if not FClosed then
+  begin
+    FClosed := True;
+    FStream.Dispose;
+  end;
+end;
+
+function SmtpDial(const Host: string; Port, Mode, TimeoutMs: Integer): TSmtpClient;
+var
+  s: TNetStream;
+begin
+  if Mode = SmtpImplicit then
+  begin
+    if TlsDialer = nil then
+      raise ESmtpError.CreateIo('smtp: TLS needs a TLS unit and none is linked', False);
+    s := TlsDialer.Dial(Host, Port, TimeoutMs);
+  end
+  else
+    s := DialTcp(Host, Port, TimeoutMs);
+  if s = nil then
+    raise ESmtpError.CreateIo('dial tcp ' + Host + ':' + IntToStr(Port) + ': connection failed', False);
+  Result := TSmtpClient.Create(s, Host, Mode = SmtpImplicit, TimeoutMs);
+end;
+
+procedure SmtpSendMail(const Host: string; Port, Mode: Integer; const User, Pass, From: string;
+  const Rcpts: array of string; const Msg: string; TimeoutMs: Integer);
+var
+  c: TSmtpClient;
+  i: Integer;
+  junk: string;
+begin
+  CheckLine(From);
+  for i := 0 to High(Rcpts) do
+    CheckLine(Rcpts[i]);
+  c := SmtpDial(Host, Port, Mode, TimeoutMs);
+  try
+    c.Hello;
+    if Mode <> SmtpPlain then
+      if (not c.IsTls) and c.Extension('STARTTLS', junk) and ((TlsUpgrader <> nil) or (Mode = SmtpStartTls)) then
+        c.StartTls
+      else if (Mode = SmtpStartTls) and (not c.IsTls) then
+        raise ESmtpError.CreateIo('smtp: server doesn''t support STARTTLS', False);
+    if (User <> '') and c.HasExtensions then
+    begin
+      if not c.Extension('AUTH', junk) then
+        raise ESmtpError.CreateIo('smtp: server doesn''t support AUTH', False);
+      c.Authenticate(User, Pass);
+    end;
+    c.MailFrom(From);
+    for i := 0 to High(Rcpts) do
+      c.RcptTo(Rcpts[i]);
+    c.SendData(Msg);
+    c.Quit;
+  finally
+    c.Disconnect;
+  end;
+end;
+
+procedure SmtpSend(const Host: string; Port, Mode: Integer; const User, Pass: string; B: TMailBuilder; TimeoutMs: Integer);
+begin
+  SmtpSendMail(Host, Port, Mode, User, Pass, B.Sender.Address, B.Recipients, B.Build, TimeoutMs);
+end;
+
+end.

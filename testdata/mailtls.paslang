@@ -1,0 +1,276 @@
+{ P433: the hooks for TLS of pasconn as the mail clients use them. No TLS unit
+  exists yet, so what is checked is what a client does without one (a TLS
+  connection or STARTTLS is refused with a message, before anything is sent
+  where it can be told) and, with an upgrader of this program's own that hands
+  back the same connection, the order of STARTTLS: the command, the new
+  greeting exchange (EHLO again, CAPABILITY again) and what the client then
+  says of itself (IsTls), against scripted servers on 127.0.0.1. }
+program mailtls;
+
+uses
+  sysutils, pascodec, pastextproto, pasnet, pasconn, pasmime, passmtp, pasimap;
+
+type
+  { "TLS" that is the same connection: what the hook is told is recorded }
+  TFakeUpgrader = class(TNetUpgrader)
+  public
+    Calls: Integer;
+    LastHost: string;
+    Refuse: Boolean;
+    function Upgrade(S: TNetStream; const Host: string; ConnectMs: Integer): TNetStream; override;
+  end;
+
+function TFakeUpgrader.Upgrade(S: TNetStream; const Host: string; ConnectMs: Integer): TNetStream;
+begin
+  Calls := Calls + 1;
+  LastHost := Host;
+  if Refuse then
+    Result := nil
+  else
+    Result := S;
+end;
+
+var
+  SrvReplies: array of string;
+  SrvOut: string;
+  WG: waitgroup;
+
+function Esc(const S: string): string;
+var
+  i, c: Integer;
+begin
+  Result := '';
+  for i := 1 to Length(S) do
+  begin
+    c := Ord(S[i]);
+    if c = 13 then
+      Result := Result + '\r'
+    else if c = 10 then
+      Result := Result + '\n'
+    else if (c >= 32) and (c < 127) then
+      Result := Result + S[i]
+    else
+      Result := Result + '\x' + Copy('0123456789abcdef', (c shr 4) + 1, 1) + Copy('0123456789abcdef', (c and 15) + 1, 1);
+  end;
+end;
+
+{ a server that answers each line of the client with the next reply, the greeting first,
+  and stops writing after the last }
+procedure Serve(L: Integer);
+var
+  c, idx, p: Integer;
+  buf, chunk, line: string;
+  closed: Boolean;
+begin
+  c := TcpAccept(L);
+  if c < 0 then
+  begin
+    WG.Done;
+    Exit;
+  end;
+  idx := 0;
+  closed := False;
+  buf := '';
+  while True do
+  begin
+    if (not closed) and (idx < Length(SrvReplies)) then
+    begin
+      TcpWrite(c, SrvReplies[idx]);
+      idx := idx + 1;
+    end;
+    if (not closed) and (idx >= Length(SrvReplies)) then
+    begin
+      TcpShutdown(c, 1);
+      closed := True;
+    end;
+    p := Pos(#10, buf);
+    while p = 0 do
+    begin
+      chunk := TcpReadDeadline(c, 65536, 3000);
+      if chunk = '' then
+      begin
+        TcpClose(c);
+        WG.Done;
+        Exit;
+      end;
+      buf := buf + chunk;
+      p := Pos(#10, buf);
+    end;
+    line := Copy(buf, 1, p - 1);
+    buf := Copy(buf, p + 1, Length(buf) - p);
+    SrvOut := SrvOut + 'S: ' + Esc(line) + #10;
+  end;
+end;
+
+function Begin1(const R: array of string): Integer;
+var
+  i, l: Integer;
+begin
+  SetLength(SrvReplies, Length(R));
+  for i := 0 to High(R) do
+    SrvReplies[i] := R[i];
+  SrvOut := '';
+  l := TcpListenAt('127.0.0.1', 0, 4);
+  WG.Add(1);
+  pas Serve(l);
+  Result := l;
+end;
+
+procedure End1(L, Port: Integer; Dialed: Boolean);
+var
+  w: Integer;
+begin
+  if not Dialed then
+  begin
+    w := TcpConnect('127.0.0.1', Port);
+    if w >= 0 then
+      TcpClose(w);
+  end;
+  WG.Wait;
+  TcpClose(L);
+  Write(SrvOut);
+end;
+
+var
+  up: TFakeUpgrader;
+  l, port: Integer;
+  bld: TMailBuilder;
+  ic: TImapClient;
+  junk: string;
+begin
+  up := TFakeUpgrader.Create;
+  { no TLS unit linked }
+  WriteLn('== no TLS unit');
+  try
+    SmtpDial('127.0.0.1', 1, SmtpImplicit, 100);
+  except
+    on E: ESmtpError do
+      WriteLn('smtp implicit: ', E.Message);
+  end;
+  try
+    ImapDial('127.0.0.1', 1, ImapImplicit, 100);
+  except
+    on E: EImapError do
+      WriteLn('imap implicit: ', E.Message);
+  end;
+  l := Begin1(['220 hi' + #13#10, '250-hi' + #13#10 + '250 STARTTLS' + #13#10, '221 bye' + #13#10]);
+  port := TcpPort(l);
+  try
+    SmtpSendMail('127.0.0.1', port, SmtpStartTls, '', '', 'a@b.c', ['d@e.f'], 'x', 2000);
+  except
+    on E: ESmtpError do
+      WriteLn('smtp starttls required: ', E.Message);
+  end;
+  End1(l, port, True);
+  l := Begin1(['220 hi' + #13#10, '250-hi' + #13#10 + '250 STARTTLS' + #13#10, '250 ok' + #13#10, '250 ok' + #13#10, '354 go' + #13#10, '250 queued' + #13#10, '221 bye' + #13#10]);
+  port := TcpPort(l);
+  try
+    SmtpSendMail('127.0.0.1', port, SmtpAuto, '', '', 'a@b.c', ['d@e.f'], 'x', 2000);
+    WriteLn('smtp auto, STARTTLS offered and no unit: sent in the clear');
+  except
+    on E: ESmtpError do
+      WriteLn('smtp auto: ', E.Message);
+  end;
+  End1(l, port, True);
+  l := Begin1(['* OK [CAPABILITY IMAP4rev1 STARTTLS LOGINDISABLED] hi' + #13#10]);
+  port := TcpPort(l);
+  try
+    ImapDial('127.0.0.1', port, ImapStartTls, 2000);
+  except
+    on E: EImapError do
+      WriteLn('imap starttls: ', E.Message);
+  end;
+  End1(l, port, True);
+  l := Begin1(['* OK [CAPABILITY IMAP4rev1] hi' + #13#10]);
+  port := TcpPort(l);
+  try
+    ImapDial('127.0.0.1', port, ImapStartTls, 2000);
+  except
+    on E: EImapError do
+      WriteLn('imap starttls not offered: ', E.Message);
+  end;
+  End1(l, port, True);
+  { an upgrader that hands the connection back }
+  WriteLn('== with an upgrader');
+  TlsUpgrader := up;
+  l := Begin1(['220 hi' + #13#10, '250-hi' + #13#10 + '250 STARTTLS' + #13#10, '220 go ahead' + #13#10, '250-hi again' + #13#10 + '250 8BITMIME' + #13#10,
+    '250 ok' + #13#10, '250 ok' + #13#10, '354 go' + #13#10, '250 queued' + #13#10, '221 bye' + #13#10]);
+  port := TcpPort(l);
+  try
+    SmtpSendMail('127.0.0.1', port, SmtpAuto, '', '', 'a@b.c', ['d@e.f'], 'x', 2000);
+    WriteLn('smtp auto sent, upgrader calls ', up.Calls, ' for ', up.LastHost);
+  except
+    on E: ESmtpError do
+      WriteLn('smtp auto: ', E.Message);
+  end;
+  End1(l, port, True);
+  up.Calls := 0;
+  l := Begin1(['220 hi' + #13#10, '250-hi' + #13#10 + '250 STARTTLS' + #13#10, '454 TLS not available' + #13#10, '221 bye' + #13#10]);
+  port := TcpPort(l);
+  try
+    SmtpSendMail('127.0.0.1', port, SmtpStartTls, '', '', 'a@b.c', ['d@e.f'], 'x', 2000);
+  except
+    on E: ESmtpError do
+      WriteLn('smtp starttls refused by the server: ', E.Message, ' upgrader calls ', up.Calls);
+  end;
+  End1(l, port, True);
+  up.Refuse := True;
+  l := Begin1(['220 hi' + #13#10, '250-hi' + #13#10 + '250 STARTTLS' + #13#10, '220 go ahead' + #13#10]);
+  port := TcpPort(l);
+  try
+    SmtpSendMail('127.0.0.1', port, SmtpStartTls, '', '', 'a@b.c', ['d@e.f'], 'x', 2000);
+  except
+    on E: ESmtpError do
+      WriteLn('smtp handshake failed: ', E.Message);
+  end;
+  End1(l, port, True);
+  up.Refuse := False;
+  l := Begin1(['* OK [CAPABILITY IMAP4rev1 STARTTLS] hi' + #13#10, 'A1 OK Begin TLS negotiation now' + #13#10,
+    '* CAPABILITY IMAP4rev1 AUTH=PLAIN' + #13#10 + 'A2 OK done' + #13#10]);
+  port := TcpPort(l);
+  up.Calls := 0;
+  try
+    ic := ImapDial('127.0.0.1', port, ImapStartTls, 2000);
+    WriteLn('imap starttls: tls=', ic.IsTls, ' plain=', ic.HasCapability('AUTH=PLAIN'), ' starttls=', ic.HasCapability('STARTTLS'),
+      ' upgrader calls ', up.Calls, ' for ', up.LastHost);
+    ic.Disconnect;
+  except
+    on E: EImapError do
+      WriteLn('imap starttls: ', E.Message);
+  end;
+  End1(l, port, True);
+  l := Begin1(['* OK [CAPABILITY IMAP4rev1 STARTTLS] hi' + #13#10, 'A1 NO [ALERT] TLS is down' + #13#10]);
+  port := TcpPort(l);
+  try
+    ImapDial('127.0.0.1', port, ImapStartTls, 2000);
+  except
+    on E: EImapError do
+      WriteLn('imap starttls refused: ', E.Message);
+  end;
+  End1(l, port, True);
+  { SmtpSend: a message made with the composer, its recipients (Bcc among them) for the envelope }
+  WriteLn('== SmtpSend');
+  TlsUpgrader := nil;
+  bld := TMailBuilder.Create;
+  bld.Sender.Name := 'Ana';
+  bld.Sender.Address := 'ana@example.com';
+  bld.AddTo('Bea', 'bea@example.org');
+  bld.AddCc('', 'cc@example.org');
+  bld.AddBcc('Oculto', 'hidden@example.org');
+  bld.Subject := 'Hola';
+  bld.TextBody := 'texto' + #10 + '.punto' + #10;
+  bld.SetDate(1700000000, 3600);
+  bld.MessageId := 'id1@example.com';
+  l := Begin1(['220 hi' + #13#10, '250 hi' + #13#10, '250 ok' + #13#10, '250 ok' + #13#10, '250 ok' + #13#10, '250 ok' + #13#10,
+    '354 go' + #13#10, '250 queued' + #13#10, '221 bye' + #13#10]);
+  port := TcpPort(l);
+  try
+    SmtpSend('127.0.0.1', port, SmtpPlain, '', '', bld, 2000);
+    WriteLn('sent');
+  except
+    on E: Exception do
+      WriteLn('smtp: ', E.Message);
+  end;
+  End1(l, port, True);
+  Halt(0);
+end.
