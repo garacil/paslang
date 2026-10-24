@@ -1,0 +1,2203 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+
+  paslang is free software: you can redistribute it and/or modify it
+  under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+
+  paslang is distributed in the hope that it will be useful, but
+  WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+  General Public License for more details.
+
+  Under Section 7 of GPL version 3, you are granted additional
+  permissions described in the paslang Runtime Library Exception,
+  version 1.0, in the file COPYING.RUNTIME.
+
+  You should have received a copy of the GNU General Public License
+  along with paslang.  If not, see <https://www.gnu.org/licenses/>. }
+
+{ DEFLATE, zlib and gzip (P427), in pure paslang: DEFLATE as RFC 1951
+  writes it, and the zlib stream of RFC 1950 and the gzip member of RFC
+  1952 around it; paszip puts the ZIP container of APPNOTE 6.3.10 on top.
+
+  TInflater reads a stream fed to it in pieces of any size: it takes a
+  symbol, a block header or a stored run only when all its bits are
+  there, and goes back to where it was when they are not, so the bytes
+  of one symbol may come in two Feeds. TDeflater writes one the same
+  way, a block when it holds enough input to be worth one. An error in
+  the data is an EFlateError with the byte of the input it was found
+  at; nothing in this unit looks past the end of its input or makes
+  more output than MaxOutput lets it. Free of units but sysutils and of
+  state, so any number of routines may each use a reader or a writer
+  (Regla 11); a reader or writer is one routine's at a time. }
+unit pasflate;
+
+interface
+
+uses
+  sysutils;
+
+type
+  { Offset is the byte of the input where the data was found wrong, or -1 }
+  EFlateError = class(Exception)
+  public
+    Offset: Integer;
+    constructor CreateAt(AOffset: Integer; const AReason: string);
+  end;
+
+  { the decoding tables of one prefix code: the symbols by code, how many
+    codes have each length, and the symbol and length of every code of 10
+    bits or less read at once }
+  THuffman = record
+    Count: array[0..15] of Integer;
+    Sym: array[0..319] of Integer;
+    Fast: array[0..1023] of Integer;
+  end;
+
+const
+  { what a TInflater reads and a TDeflater writes: DEFLATE alone, with
+    zlib's two-byte header and Adler-32, or in a gzip member }
+  flRaw = 0;
+  flZlib = 1;
+  flGzip = 2;
+
+type
+  TInflater = class
+  private
+    FKind: Integer;
+    FIn: string;
+    FPos: Integer;
+    FInBase: Integer;
+    FBuf: Integer;
+    FCnt: Integer;
+    FOut: string;
+    FOutLen: Integer;
+    FTaken: Integer;
+    FHashed: Integer;
+    FSlid: Integer;
+    FState: Integer;
+    FFinal: Boolean;
+    FStored: Integer;
+    FLit: THuffman;
+    FDist: THuffman;
+    FCrc: Integer;
+    FAdler: Integer;
+    FMemberAt: Integer;
+    FLimit: Integer;
+    FMulti: Boolean;
+    FTmp: array of Integer;
+    FClen: THuffman;
+    procedure Fail(const Why: string);
+    procedure Refill;
+    function TakeBits(N: Integer): Integer;
+    function NextSym(var H: THuffman): Integer;
+    procedure Rewind(P, B, C: Integer);
+    procedure Grow(N: Integer);
+    procedure HashTo;
+    procedure Slide;
+    procedure EndBlocks;
+    function ReadStreamHeader: Boolean;
+    function ReadBlockHeader: Boolean;
+    function ReadDynamic: Boolean;
+    function CopyStored: Boolean;
+    procedure FastCodes;
+    function ReadCodes: Boolean;
+    function ReadTrailer: Boolean;
+    procedure Run;
+  public
+    { the last gzip header read }
+    HeaderName: string;
+    HeaderComment: string;
+    HeaderMTime: Integer;
+    HeaderOS: Integer;
+    HeaderExtra: string;
+    constructor Create(AKind: Integer);
+    { the stream's next bytes; they are read as far as they go }
+    procedure Feed(const S: string);
+    { the output made since the last Take }
+    function Take: string;
+    { the stream has ended and its checksum was right (a gzip stream
+      that holds several members is done at the end of each, when the
+      input has no more yet) }
+    function Done: Boolean;
+    { the input after the end of the stream; for a gzip stream read with
+      Multistream off, what follows its first member }
+    function Unused: string;
+    { how many bytes of the input the stream took, the header and trailer
+      included }
+    function Consumed: Integer;
+    { the output Take would give, less what went before it }
+    function Total: Integer;
+    { raises when the stream is not at its end; otherwise what Take gives }
+    function Finish: string;
+    { the most the stream may make; more is an error (0 is no limit) }
+    property MaxOutput: Integer read FLimit write FLimit;
+    { whether a gzip stream goes on with the next member (the default,
+      as gzip(1) and Go's reader do) }
+    property Multistream: Boolean read FMulti write FMulti;
+  end;
+
+  TDeflater = class
+  private
+    FKind: Integer;
+    FLevel: Integer;
+    FOut: string;
+    FOutLen: Integer;
+    FWb: Integer;
+    FWn: Integer;
+    FPend: string;
+    FPendPos: Integer;
+    FWin: string;
+    FHead: array[0..32767] of UInt32;
+    FPrev: array[0..32767] of UInt32;
+    FTokD: array[0..32767] of UInt16;
+    FTokL: array[0..32767] of Byte;
+    FTokN: Integer;
+    FTokMax: Integer;
+    FLitFreq: array[0..287] of Integer;
+    FDistFreq: array[0..29] of Integer;
+    FLLen: array[0..287] of Integer;
+    FLCode: array[0..287] of Integer;
+    FDLen: array[0..29] of Integer;
+    FDCode: array[0..29] of Integer;
+    FCLen: array[0..18] of Integer;
+    FCCode: array[0..18] of Integer;
+    FClFreq: array[0..18] of Integer;
+    FFLen: array[0..287] of Integer;
+    FFCode: array[0..287] of Integer;
+    FFDCode: array[0..29] of Integer;
+    FFixReady: Boolean;
+    FLenSym: array[0..255] of Integer;
+    FDistSym: array[0..511] of Integer;
+    FClSym: array[0..319] of Integer;
+    FClExt: array[0..319] of Integer;
+    FKeys: array[0..287] of Integer;
+    FNodeW: array[0..575] of Integer;
+    FNodeP: array[0..575] of Integer;
+    FNodeD: array[0..575] of Integer;
+    FLens: array[0..319] of Integer;
+    FBase: Integer;
+    FRebaseAt: Integer;
+    FStrStart: Integer;
+    FLookahead: Integer;
+    FBlockStart: Integer;
+    FMatchStart: Integer;
+    FMatchLength: Integer;
+    FPrevLength: Integer;
+    FPrevMatch: Integer;
+    FMatchAvail: Boolean;
+    FGood: Integer;
+    FLazy: Integer;
+    FNice: Integer;
+    FChain: Integer;
+    FFast: Boolean;
+    FCrc: Integer;
+    FAdler: Integer;
+    FTotal: Integer;
+    FStarted: Boolean;
+    FEnded: Boolean;
+    procedure PutByte(B: Integer);
+    procedure PutBits(V, N: Integer);
+    procedure PadByte;
+    procedure StartStream;
+    procedure BuildCodes(Freq: PInteger; N, MaxBits: Integer; Len, Code: PInteger);
+    procedure FixedTables;
+    function ScanLengths(NLit, NDist: Integer): Integer;
+    procedure WriteBlock(Last: Boolean);
+    procedure FlushBlock(Last: Boolean);
+    procedure Tally(Dist, LenOrLit: Integer);
+    procedure FillWindow;
+    function InsertString(At: Integer): Integer;
+    function LongestMatch(Cur: Integer): Integer;
+    procedure ProcessFast(AllIn: Boolean);
+    procedure ProcessSlow(AllIn: Boolean);
+    procedure Process(AllIn: Boolean);
+    procedure StoredBlocks(Last: Boolean);
+    procedure StoredBlockOf(const S: string; At, N: Integer; Last: Boolean);
+  public
+    HeaderName: string;
+    HeaderComment: string;
+    HeaderMTime: Integer;
+    { the position, in bytes written, at which the hash chains are made
+      to start over from small numbers: 1 GiB, which only a test lowers }
+    property RebaseAt: Integer read FRebaseAt write FRebaseAt;
+    { Level 0 stores, 1 to 9 look for matches harder each step (zlib's
+      table of good, lazy, nice and chain lengths), -1 is 6 }
+    constructor Create(AKind, ALevel: Integer);
+    procedure Feed(const S: string);
+    { the output made so far, which a reader may not yet be able to
+      finish: Flush makes it so }
+    function Take: string;
+    { everything fed so far can be read: the block ends and an empty stored
+      block follows (zlib's Z_SYNC_FLUSH); the matches go on across it }
+    procedure Flush;
+    { ends the stream and gives the rest of the output }
+    function Finish: string;
+  end;
+
+{ One DEFLATE stream (flRaw) read from Start (1-based) of S: the bytes
+  it makes, and Used, how many bytes of S it took. }
+function FlateInflate(const S: string; Start: Integer; out Used: Integer): string;
+{ A zlib stream, the bytes after it refused. }
+function ZlibDecode(const S: string): string;
+{ A gzip file: every member, one after the other. }
+function GzipDecode(const S: string): string;
+{ S as a DEFLATE stream, a zlib stream and a gzip file at Level (0 to 9,
+  -1 for 6). }
+function FlateDeflate(const S: string; Level: Integer): string;
+function ZlibEncode(const S: string; Level: Integer): string;
+function GzipEncode(const S: string; Level: Integer): string;
+
+implementation
+
+const
+  LenBase: array[0..28] of Integer = (3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99,
+    115, 131, 163, 195, 227, 258);
+  LenExtra: array[0..28] of Integer = (0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0);
+  DistBase: array[0..29] of Integer = (1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025,
+    1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577);
+  DistExtra: array[0..29] of Integer = (0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12,
+    13, 13);
+  ClenOrder: array[0..18] of Integer = (16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15);
+  { the window DEFLATE looks back into, and the output a reader lets
+    pile up before it drops what is past the window }
+  WindowSize = 32768;
+  SlideAt = 262144;
+
+constructor EFlateError.CreateAt(AOffset: Integer; const AReason: string);
+begin
+  if AOffset >= 0 then
+    inherited Create('flate: ' + AReason + ' at byte ' + IntToStr(AOffset))
+  else
+    inherited Create('flate: ' + AReason);
+  Offset := AOffset;
+end;
+
+function FlipBits(V, N: Integer): Integer;
+var
+  i: Integer;
+begin
+  Result := 0;
+  for i := 1 to N do
+  begin
+    Result := (Result shl 1) or (V and 1);
+    V := V shr 1;
+  end;
+end;
+
+{ The tables of the lengths L[0..N-1]. 0 when they are good, 1 for a set
+  of lengths that more codes than there are fit (over-subscribed), 2 for
+  one that leaves codes unused, which zlib and Go let pass only for the
+  one code of one bit; Complete asks for no unused code at all (the code
+  of the code lengths). No code at all is good: a block of literals only
+  has no distance codes. }
+function HuffBuild(var H: THuffman; const L: array of Integer; N: Integer; Complete: Boolean): Integer;
+var
+  i, len, left, mx, k, j, s, idx, step, r: Integer;
+  offs: array[0..16] of Integer;
+  nxt: array[0..16] of Integer;
+  code: Integer;
+begin
+  Result := 0;
+  for i := 0 to 15 do
+    H.Count[i] := 0;
+  for i := 0 to 1023 do
+    H.Fast[i] := 0;
+  mx := 0;
+  for i := 0 to N - 1 do
+  begin
+    H.Count[L[i]] := H.Count[L[i]] + 1;
+    if L[i] > mx then
+      mx := L[i];
+  end;
+  if H.Count[0] = N then
+    Exit;
+  left := 1;
+  for len := 1 to 15 do
+  begin
+    left := left * 2 - H.Count[len];
+    if left < 0 then
+    begin
+      Result := 1;
+      Exit;
+    end;
+  end;
+  offs[1] := 0;
+  for len := 1 to 14 do
+    offs[len + 1] := offs[len] + H.Count[len];
+  for i := 0 to N - 1 do
+    if L[i] <> 0 then
+    begin
+      H.Sym[offs[L[i]]] := i;
+      offs[L[i]] := offs[L[i]] + 1;
+    end;
+  if (left > 0) and (Complete or (mx <> 1)) then
+  begin
+    Result := 2;
+    Exit;
+  end;
+  code := 0;
+  nxt[0] := 0;
+  for len := 1 to 15 do
+  begin
+    if len = 1 then
+      code := 0
+    else
+      code := (code + H.Count[len - 1]) shl 1;
+    nxt[len] := code;
+  end;
+  k := 0;
+  for len := 1 to 10 do
+  begin
+    for j := 0 to H.Count[len] - 1 do
+    begin
+      s := H.Sym[k + j];
+      r := FlipBits(nxt[len] + j, len);
+      step := 1 shl len;
+      idx := r;
+      while idx < 1024 do
+      begin
+        H.Fast[idx] := (s shl 4) or len;
+        idx := idx + step;
+      end;
+    end;
+    k := k + H.Count[len];
+  end;
+end;
+
+{ ---- the reader ---- }
+
+constructor TInflater.Create(AKind: Integer);
+begin
+  inherited Create;
+  FKind := AKind;
+  FMulti := True;
+  if AKind = flRaw then
+    FState := 1
+  else
+    FState := 0;
+  FCrc := 0;
+  FAdler := 1;
+  SetLength(FTmp, 320);
+end;
+
+procedure TInflater.Fail(const Why: string);
+var
+  errAt: Integer;
+begin
+  errAt := FInBase + FPos - FCnt div 8;
+  FState := 9;
+  raise EFlateError.CreateAt(errAt, Why);
+end;
+
+procedure TInflater.Refill;
+begin
+  while (FCnt <= 48) and (FPos < Length(FIn)) do
+  begin
+    FBuf := FBuf or (Ord(FIn[FPos + 1]) shl FCnt);
+    FCnt := FCnt + 8;
+    FPos := FPos + 1;
+  end;
+end;
+
+{ N bits (N up to 16), or -1 and nothing taken when the input has fewer }
+function TInflater.TakeBits(N: Integer): Integer;
+begin
+  if FCnt < N then
+  begin
+    Refill;
+    if FCnt < N then
+    begin
+      Result := -1;
+      Exit;
+    end;
+  end;
+  Result := FBuf and ((1 shl N) - 1);
+  FBuf := FBuf shr N;
+  FCnt := FCnt - N;
+end;
+
+{ The next symbol of the code H; -1 and nothing taken when the input has
+  too few bits for it, -2 for bits that are no code. }
+function TInflater.NextSym(var H: THuffman): Integer;
+var
+  e, l, code, first, ix, cnt, b: Integer;
+begin
+  if FCnt < 15 then
+    Refill;
+  e := H.Fast[FBuf and 1023];
+  if e <> 0 then
+  begin
+    l := e and 15;
+    if l > FCnt then
+    begin
+      Result := -1;
+      Exit;
+    end;
+    FBuf := FBuf shr l;
+    FCnt := FCnt - l;
+    Result := e shr 4;
+    Exit;
+  end;
+  code := 0;
+  first := 0;
+  ix := 0;
+  b := FBuf;
+  for l := 1 to 15 do
+  begin
+    if l > FCnt then
+    begin
+      Result := -1;
+      Exit;
+    end;
+    code := code or (b and 1);
+    b := b shr 1;
+    cnt := H.Count[l];
+    if code - cnt < first then
+    begin
+      FBuf := FBuf shr l;
+      FCnt := FCnt - l;
+      Result := H.Sym[ix + (code - first)];
+      Exit;
+    end;
+    ix := ix + cnt;
+    first := (first + cnt) shl 1;
+    code := code shl 1;
+  end;
+  Result := -2;
+end;
+
+procedure TInflater.Rewind(P, B, C: Integer);
+begin
+  FPos := P;
+  FBuf := B;
+  FCnt := C;
+end;
+
+{ room for N more bytes of output }
+procedure TInflater.Grow(N: Integer);
+var
+  want: Integer;
+begin
+  if FOutLen + N > Length(FOut) then
+  begin
+    want := Length(FOut) * 2;
+    if want < FOutLen + N then
+      want := FOutLen + N;
+    if want < 65536 then
+      want := 65536;
+    SetLength(FOut, want);
+  end;
+end;
+
+{ the checksum of the output so far, for the trailer }
+procedure TInflater.HashTo;
+var
+  piece: string;
+begin
+  if (FKind <> flRaw) and (FOutLen > FHashed) then
+  begin
+    piece := Copy(FOut, FHashed + 1, FOutLen - FHashed);
+    if FKind = flGzip then
+      FCrc := Crc32(piece, FCrc)
+    else
+      FAdler := Adler32(piece, FAdler);
+  end;
+  FHashed := FOutLen;
+end;
+
+{ drop the output that is past the window, all of it taken and hashed }
+procedure TInflater.Slide;
+var
+  moved: Integer;
+begin
+  moved := FOutLen - WindowSize;
+  FOut := Copy(FOut, moved + 1, WindowSize);
+  FSlid := FSlid + moved;
+  FOutLen := WindowSize;
+  FTaken := WindowSize;
+  FHashed := WindowSize;
+end;
+
+function TInflater.Take: string;
+begin
+  HashTo;
+  Result := Copy(FOut, FTaken + 1, FOutLen - FTaken);
+  FTaken := FOutLen;
+  if FOutLen >= SlideAt then
+    Slide;
+end;
+
+procedure TInflater.Feed(const S: string);
+begin
+  if FState = 9 then
+    raise EFlateError.CreateAt(-1, 'the stream was found wrong before');
+  if Length(S) = 0 then
+    Exit;
+  if FPos > 0 then
+  begin
+    FIn := Copy(FIn, FPos + 1, Length(FIn) - FPos);
+    FInBase := FInBase + FPos;
+    FPos := 0;
+  end;
+  FIn := FIn + S;
+  Run;
+end;
+
+{ the blocks are over: back to whole bytes, and on to the trailer }
+procedure TInflater.EndBlocks;
+begin
+  HashTo;
+  FPos := FPos - FCnt div 8;
+  FBuf := 0;
+  FCnt := 0;
+  if FKind = flRaw then
+    FState := 5
+  else
+    FState := 4;
+end;
+
+{ A zlib header (RFC 1950, 2.2) or a gzip member's (RFC 1952, 2.3) }
+function TInflater.ReadStreamHeader: Boolean;
+var
+  q, n, flg, xlen, cmf, i: Integer;
+  c: Integer;
+  nm, cm: string;
+  hc: Integer;
+begin
+  Result := False;
+  q := FPos;
+  if FKind = flZlib then
+  begin
+    if Length(FIn) - q < 2 then
+      Exit;
+    cmf := Ord(FIn[q + 1]);
+    flg := Ord(FIn[q + 2]);
+    if (cmf and 15) <> 8 then
+      Fail('zlib header names a method that is not deflate');
+    if (cmf shr 4) > 7 then
+      Fail('zlib header has a window larger than 32 KiB');
+    if ((cmf * 256) + flg) mod 31 <> 0 then
+      Fail('zlib header check failed');
+    if (flg and 32) <> 0 then
+      Fail('zlib stream wants a preset dictionary');
+    FPos := q + 2;
+    FAdler := 1;
+    FState := 1;
+    Result := True;
+    Exit;
+  end;
+  if Length(FIn) - q < 10 then
+    Exit;
+  if (Ord(FIn[q + 1]) <> 31) or (Ord(FIn[q + 2]) <> 139) then
+  begin
+    FPos := q;
+    Fail('not a gzip member (the identification bytes are wrong)');
+  end;
+  if Ord(FIn[q + 3]) <> 8 then
+    Fail('gzip member names a method that is not deflate');
+  flg := Ord(FIn[q + 4]);
+  if (flg and 224) <> 0 then
+    Fail('gzip member has flags that are reserved');
+  n := q + 10;
+  HeaderExtra := '';
+  HeaderName := '';
+  HeaderComment := '';
+  if (flg and 4) <> 0 then
+  begin
+    if Length(FIn) - n < 2 then
+      Exit;
+    xlen := Ord(FIn[n + 1]) or (Ord(FIn[n + 2]) shl 8);
+    n := n + 2;
+    if Length(FIn) - n < xlen then
+      Exit;
+    HeaderExtra := Copy(FIn, n + 1, xlen);
+    n := n + xlen;
+  end;
+  if (flg and 8) <> 0 then
+  begin
+    i := n;
+    while (i < Length(FIn)) and (FIn[i + 1] <> #0) do
+      i := i + 1;
+    if i >= Length(FIn) then
+      Exit;
+    nm := Copy(FIn, n + 1, i - n);
+    n := i + 1;
+    HeaderName := nm;
+  end;
+  if (flg and 16) <> 0 then
+  begin
+    i := n;
+    while (i < Length(FIn)) and (FIn[i + 1] <> #0) do
+      i := i + 1;
+    if i >= Length(FIn) then
+      Exit;
+    cm := Copy(FIn, n + 1, i - n);
+    n := i + 1;
+    HeaderComment := cm;
+  end;
+  if (flg and 2) <> 0 then
+  begin
+    if Length(FIn) - n < 2 then
+      Exit;
+    hc := Crc32(Copy(FIn, q + 1, n - q), 0) and 65535;
+    c := Ord(FIn[n + 1]) or (Ord(FIn[n + 2]) shl 8);
+    if hc <> c then
+      Fail('gzip header check failed');
+    n := n + 2;
+  end;
+  HeaderMTime := Ord(FIn[q + 5]) or (Ord(FIn[q + 6]) shl 8) or (Ord(FIn[q + 7]) shl 16) or (Ord(FIn[q + 8]) shl 24);
+  HeaderOS := Ord(FIn[q + 10]);
+  FPos := n;
+  FCrc := 0;
+  FMemberAt := FSlid + FOutLen;
+  FState := 1;
+  Result := True;
+end;
+
+{ A dynamic block's header (RFC 1951, 3.2.7); False with the input as it
+  was when the bits are not all there. }
+function TInflater.ReadDynamic: Boolean;
+var
+  hlit, hdist, hclen, i, k, x, rep, prev, sym, nn, r: Integer;
+begin
+  Result := False;
+  x := TakeBits(14);
+  if x < 0 then
+    Exit;
+  hlit := (x and 31) + 257;
+  hdist := ((x shr 5) and 31) + 1;
+  hclen := (x shr 10) + 4;
+  if (hlit > 286) or (hdist > 30) then
+    Fail('too many length or distance codes');
+  for i := 0 to 18 do
+    FTmp[i] := 0;
+  for i := 0 to hclen - 1 do
+  begin
+    x := TakeBits(3);
+    if x < 0 then
+      Exit;
+    FTmp[ClenOrder[i]] := x;
+  end;
+  r := HuffBuild(FClen, FTmp, 19, True);
+  if r <> 0 then
+    Fail('the code of the code lengths is not a complete prefix code');
+  nn := hlit + hdist;
+  i := 0;
+  prev := 0;
+  while i < nn do
+  begin
+    sym := NextSym(FClen);
+    if sym = -1 then
+      Exit;
+    if sym < 0 then
+      Fail('bad code in the code lengths');
+    if sym < 16 then
+    begin
+      FTmp[i] := sym;
+      prev := sym;
+      i := i + 1;
+    end
+    else
+    begin
+      if sym = 16 then
+      begin
+        if i = 0 then
+          Fail('a repeat of the previous length with none before');
+        x := TakeBits(2);
+        if x < 0 then
+          Exit;
+        rep := 3 + x;
+        k := prev;
+      end
+      else if sym = 17 then
+      begin
+        x := TakeBits(3);
+        if x < 0 then
+          Exit;
+        rep := 3 + x;
+        k := 0;
+      end
+      else
+      begin
+        x := TakeBits(7);
+        if x < 0 then
+          Exit;
+        rep := 11 + x;
+        k := 0;
+      end;
+      if i + rep > nn then
+        Fail('the code lengths repeat past the codes');
+      while rep > 0 do
+      begin
+        FTmp[i] := k;
+        i := i + 1;
+        rep := rep - 1;
+      end;
+      prev := k;
+    end;
+  end;
+  if FTmp[256] = 0 then
+    Fail('the block has no end-of-block code');
+  r := HuffBuild(FLit, FTmp, hlit, False);
+  if r = 1 then
+    Fail('the literal/length codes are over-subscribed');
+  if r = 2 then
+    Fail('the literal/length codes are an incomplete prefix code');
+  for i := 0 to hdist - 1 do
+    FTmp[i] := FTmp[hlit + i];
+  r := HuffBuild(FDist, FTmp, hdist, False);
+  if r = 1 then
+    Fail('the distance codes are over-subscribed');
+  if r = 2 then
+    Fail('the distance codes are an incomplete prefix code');
+  Result := True;
+end;
+
+function TInflater.ReadBlockHeader: Boolean;
+var
+  sp, sb, sc, x, ty, i, mlen, nl: Integer;
+begin
+  Result := False;
+  sp := FPos;
+  sb := FBuf;
+  sc := FCnt;
+  x := TakeBits(3);
+  if x < 0 then
+    Exit;
+  FFinal := (x and 1) <> 0;
+  ty := x shr 1;
+  if ty = 0 then
+  begin
+    { drop the rest of the byte, then LEN and NLEN }
+    x := FCnt and 7;
+    FBuf := FBuf shr x;
+    FCnt := FCnt - x;
+    mlen := TakeBits(16);
+    nl := -1;
+    if mlen >= 0 then
+      nl := TakeBits(16);
+    if (mlen < 0) or (nl < 0) then
+    begin
+      Rewind(sp, sb, sc);
+      Exit;
+    end;
+    if (mlen xor nl) <> 65535 then
+      Fail('a stored block whose length does not match its complement');
+    { the bytes the bit buffer holds ahead are input again }
+    FPos := FPos - FCnt div 8;
+    FBuf := 0;
+    FCnt := 0;
+    FStored := mlen;
+    FState := 2;
+    Result := True;
+    Exit;
+  end;
+  if ty = 1 then
+  begin
+    for i := 0 to 143 do
+      FTmp[i] := 8;
+    for i := 144 to 255 do
+      FTmp[i] := 9;
+    for i := 256 to 279 do
+      FTmp[i] := 7;
+    for i := 280 to 287 do
+      FTmp[i] := 8;
+    HuffBuild(FLit, FTmp, 288, True);
+    for i := 0 to 31 do
+      FTmp[i] := 5;
+    HuffBuild(FDist, FTmp, 32, True);
+    FState := 3;
+    Result := True;
+    Exit;
+  end;
+  if ty = 3 then
+    Fail('a block of the reserved type');
+  if not ReadDynamic then
+  begin
+    Rewind(sp, sb, sc);
+    Exit;
+  end;
+  FState := 3;
+  Result := True;
+end;
+
+function TInflater.CopyStored: Boolean;
+var
+  n, i: Integer;
+  p: Pointer;
+begin
+  n := Length(FIn) - FPos;
+  if n > FStored then
+    n := FStored;
+  if n > 0 then
+  begin
+    Grow(n);
+    p := Pointer(FOut);
+    Move(FIn[FPos + 1], PByte(p)[FOutLen], n);
+    FOutLen := FOutLen + n;
+    FPos := FPos + n;
+    FStored := FStored - n;
+    if (FLimit > 0) and (FSlid + FOutLen > FLimit) then
+      Fail('the output is larger than the limit');
+  end;
+  Result := FStored = 0;
+  if Result then
+  begin
+    if FFinal then
+      EndBlocks
+    else
+      FState := 1;
+  end;
+end;
+
+{ The fast path of a block, as zlib's inflate_fast and Go's huffmanBlock:
+  while the input has eight bytes to load at once and the output has room,
+  the bit buffer lives in locals, a symbol is looked up in the table of
+  codes of ten bits or less, and nothing is called. It stops, with the
+  state put back before the symbol, at anything else: a longer code, the
+  end of the block, a fault, the last bytes of the input, the output's
+  limit; ReadCodes takes those one by one. The refill loads eight bytes
+  and counts the whole ones that fit: the bits above the count are the
+  next bytes' own, which the next refill puts there again. }
+procedure TInflater.FastCodes;
+var
+  buf, cnt, bpos, inEnd, outLen, outEnd, e, l, sym, mlen, ds, dist, n, srcp, i, sp, sb, sc: Integer;
+  inp, outp: Pointer;
+begin
+  Grow(4096 + 266);
+  buf := FBuf;
+  cnt := FCnt;
+  bpos := FPos;
+  outLen := FOutLen;
+  inEnd := Length(FIn) - 8;
+  inp := Pointer(FIn);
+  outp := Pointer(FOut);
+  outEnd := Length(FOut) - 266;
+  if (FLimit > 0) and (outEnd > FLimit - FSlid - 258) then
+    outEnd := FLimit - FSlid - 258;
+  while (bpos <= inEnd) and (outLen <= outEnd) do
+  begin
+    if cnt < 48 then
+    begin
+      n := (63 - cnt) shr 3;
+      buf := buf or (PInteger(PByte(inp) + bpos)^ shl cnt);
+      bpos := bpos + n;
+      cnt := cnt + n * 8;
+    end;
+    sp := bpos;
+    sb := buf;
+    sc := cnt;
+    e := FLit.Fast[buf and 1023];
+    if e = 0 then
+      Break;
+    l := e and 15;
+    buf := buf shr l;
+    cnt := cnt - l;
+    sym := e shr 4;
+    if sym < 256 then
+    begin
+      PByte(outp)[outLen] := Byte(sym);
+      outLen := outLen + 1;
+      Continue;
+    end;
+    if (sym = 256) or (sym >= 286) then
+    begin
+      bpos := sp;
+      buf := sb;
+      cnt := sc;
+      Break;
+    end;
+    sym := sym - 257;
+    mlen := LenBase[sym];
+    n := LenExtra[sym];
+    if n > 0 then
+    begin
+      mlen := mlen + (buf and ((1 shl n) - 1));
+      buf := buf shr n;
+      cnt := cnt - n;
+    end;
+    e := FDist.Fast[buf and 1023];
+    ds := e shr 4;
+    if (e = 0) or (ds >= 30) then
+    begin
+      bpos := sp;
+      buf := sb;
+      cnt := sc;
+      Break;
+    end;
+    l := e and 15;
+    buf := buf shr l;
+    cnt := cnt - l;
+    dist := DistBase[ds];
+    n := DistExtra[ds];
+    if n > 0 then
+    begin
+      dist := dist + (buf and ((1 shl n) - 1));
+      buf := buf shr n;
+      cnt := cnt - n;
+    end;
+    if dist > outLen then
+    begin
+      bpos := sp;
+      buf := sb;
+      cnt := sc;
+      Break;
+    end;
+    srcp := outLen - dist;
+    if dist >= 8 then
+    begin
+      i := 0;
+      while i < mlen do
+      begin
+        PInteger(PByte(outp) + outLen + i)^ := PInteger(PByte(outp) + srcp + i)^;
+        i := i + 8;
+      end;
+    end
+    else
+      for i := 0 to mlen - 1 do
+        PByte(outp)[outLen + i] := PByte(outp)[srcp + i];
+    outLen := outLen + mlen;
+  end;
+  FBuf := buf;
+  FCnt := cnt;
+  FPos := bpos;
+  FOutLen := outLen;
+end;
+
+{ The symbols of a block; False when the input ends inside one. }
+function TInflater.ReadCodes: Boolean;
+var
+  sp, sb, sc, sym, mlen, ds, x, dist, i, srcp: Integer;
+  p: Pointer;
+begin
+  Result := False;
+  while True do
+  begin
+    FastCodes;
+    sp := FPos;
+    sb := FBuf;
+    sc := FCnt;
+    Grow(258 + 8);
+    p := Pointer(FOut);
+    sym := NextSym(FLit);
+    if sym < 0 then
+    begin
+      if sym = -2 then
+        Fail('bad literal/length code');
+      Rewind(sp, sb, sc);
+      Exit;
+    end;
+    if sym < 256 then
+    begin
+      PByte(p)[FOutLen] := Byte(sym);
+      FOutLen := FOutLen + 1;
+      Continue;
+    end;
+    if sym = 256 then
+    begin
+      if FFinal then
+        EndBlocks
+      else
+        FState := 1;
+      Result := True;
+      Exit;
+    end;
+    sym := sym - 257;
+    if sym >= 29 then
+      Fail('literal/length symbol that is not used');
+    mlen := LenBase[sym];
+    if LenExtra[sym] > 0 then
+    begin
+      x := TakeBits(LenExtra[sym]);
+      if x < 0 then
+      begin
+        Rewind(sp, sb, sc);
+        Exit;
+      end;
+      mlen := mlen + x;
+    end;
+    ds := NextSym(FDist);
+    if ds < 0 then
+    begin
+      if ds = -2 then
+        Fail('bad distance code');
+      Rewind(sp, sb, sc);
+      Exit;
+    end;
+    if ds >= 30 then
+      Fail('distance symbol that is not used');
+    dist := DistBase[ds];
+    if DistExtra[ds] > 0 then
+    begin
+      x := TakeBits(DistExtra[ds]);
+      if x < 0 then
+      begin
+        Rewind(sp, sb, sc);
+        Exit;
+      end;
+      dist := dist + x;
+    end;
+    if dist > FOutLen then
+      Fail('a distance that reaches before the start of the output');
+    srcp := FOutLen - dist;
+    if dist >= 8 then
+    begin
+      { eight bytes a step; a block read lies wholly before the block
+        written, and the room past the match is Grow's }
+      i := 0;
+      while i < mlen do
+      begin
+        PInteger(PByte(p) + FOutLen + i)^ := PInteger(PByte(p) + srcp + i)^;
+        i := i + 8;
+      end;
+    end
+    else
+      for i := 0 to mlen - 1 do
+        PByte(p)[FOutLen + i] := PByte(p)[srcp + i];
+    FOutLen := FOutLen + mlen;
+    if (FLimit > 0) and (FSlid + FOutLen > FLimit) then
+      Fail('the output is larger than the limit');
+  end;
+end;
+
+function TInflater.ReadTrailer: Boolean;
+var
+  q, want, got: Integer;
+begin
+  Result := False;
+  q := FPos;
+  if FKind = flZlib then
+  begin
+    if Length(FIn) - q < 4 then
+      Exit;
+    want := (Ord(FIn[q + 1]) shl 24) or (Ord(FIn[q + 2]) shl 16) or (Ord(FIn[q + 3]) shl 8) or Ord(FIn[q + 4]);
+    if want <> FAdler then
+      Fail('the zlib checksum does not match');
+    FPos := q + 4;
+  end
+  else
+  begin
+    if Length(FIn) - q < 8 then
+      Exit;
+    want := Ord(FIn[q + 1]) or (Ord(FIn[q + 2]) shl 8) or (Ord(FIn[q + 3]) shl 16) or (Ord(FIn[q + 4]) shl 24);
+    if want <> FCrc then
+      Fail('the gzip checksum does not match');
+    want := Ord(FIn[q + 5]) or (Ord(FIn[q + 6]) shl 8) or (Ord(FIn[q + 7]) shl 16) or (Ord(FIn[q + 8]) shl 24);
+    got := (FSlid + FOutLen - FMemberAt) and $FFFFFFFF;
+    if want <> got then
+      Fail('the gzip length does not match');
+    FPos := q + 8;
+  end;
+  FState := 5;
+  Result := True;
+end;
+
+procedure TInflater.Run;
+begin
+  while True do
+  begin
+    case FState of
+      0:
+        if not ReadStreamHeader then
+          Exit;
+      1:
+        if not ReadBlockHeader then
+          Exit;
+      2:
+        if not CopyStored then
+          Exit;
+      3:
+        if not ReadCodes then
+          Exit;
+      4:
+        if not ReadTrailer then
+          Exit;
+      5:
+        begin
+          { a gzip file goes on with another member when there is one }
+          if (FKind = flGzip) and FMulti and (FPos < Length(FIn)) then
+            FState := 0
+          else
+            Exit;
+        end;
+    else
+      Exit;
+    end;
+  end;
+end;
+
+function TInflater.Done: Boolean;
+begin
+  Result := FState = 5;
+end;
+
+function TInflater.Unused: string;
+begin
+  Result := Copy(FIn, FPos + 1, Length(FIn) - FPos);
+end;
+
+function TInflater.Consumed: Integer;
+begin
+  Result := FInBase + FPos - FCnt div 8;
+end;
+
+function TInflater.Total: Integer;
+begin
+  Result := FSlid + FOutLen;
+end;
+
+function TInflater.Finish: string;
+begin
+  if FState <> 5 then
+    raise EFlateError.CreateAt(FInBase + FPos - FCnt div 8, 'the input ends before the stream does');
+  Result := Take;
+end;
+
+function FlateInflate(const S: string; Start: Integer; out Used: Integer): string;
+var
+  z: TInflater;
+begin
+  z := TInflater.Create(flRaw);
+  z.Feed(Copy(S, Start, Length(S) - Start + 1));
+  Result := z.Finish;
+  Used := z.Consumed;
+end;
+
+function ZlibDecode(const S: string): string;
+var
+  z: TInflater;
+begin
+  z := TInflater.Create(flZlib);
+  z.Feed(S);
+  Result := z.Finish;
+  if z.Consumed <> Length(S) then
+    raise EFlateError.CreateAt(z.Consumed, 'bytes after the end of the zlib stream');
+end;
+
+function GzipDecode(const S: string): string;
+var
+  z: TInflater;
+begin
+  z := TInflater.Create(flGzip);
+  z.Feed(S);
+  Result := z.Finish;
+end;
+
+{ ---- the writer ---- }
+
+const
+  MinMatch = 3;
+  MaxMatch = 258;
+  { the longest match and the bytes a match is looked for with }
+  MinLookahead = MaxMatch + MinMatch + 1;
+  MaxDist = WindowSize - MinLookahead;
+  WMask = WindowSize - 1;
+  HashSize = 32768;
+  { a match of three bytes this far back costs more than it saves }
+  TooFar = 4096;
+  TokenBlock = 32768;
+
+{ the codes of RFC 1951, 3.2.2, from their lengths, written with the
+  first bit of the code in the lowest bit }
+procedure AssignCodes(Len: PInteger; N: Integer; Code: PInteger);
+var
+  bl: array[0..16] of Integer;
+  nxt: array[0..16] of Integer;
+  i, bits, c: Integer;
+begin
+  for i := 0 to 16 do
+    bl[i] := 0;
+  for i := 0 to N - 1 do
+    bl[Len[i]] := bl[Len[i]] + 1;
+  bl[0] := 0;
+  c := 0;
+  nxt[0] := 0;
+  for bits := 1 to 15 do
+  begin
+    c := (c + bl[bits - 1]) shl 1;
+    nxt[bits] := c;
+  end;
+  for i := 0 to N - 1 do
+    if Len[i] <> 0 then
+    begin
+      Code[i] := FlipBits(nxt[Len[i]], Len[i]);
+      nxt[Len[i]] := nxt[Len[i]] + 1;
+    end
+    else
+      Code[i] := 0;
+end;
+
+constructor TDeflater.Create(AKind, ALevel: Integer);
+var
+  s, l, top, d, idx: Integer;
+begin
+  inherited Create;
+  FKind := AKind;
+  if ALevel < 0 then
+    ALevel := 6;
+  if ALevel > 9 then
+    ALevel := 9;
+  FLevel := ALevel;
+  FAdler := 1;
+  FCrc := 0;
+  FTokMax := TokenBlock;
+  FRebaseAt := $40000000;
+  case ALevel of
+    1: begin FGood := 4; FLazy := 4; FNice := 8; FChain := 4; end;
+    2: begin FGood := 4; FLazy := 5; FNice := 16; FChain := 8; end;
+    3: begin FGood := 4; FLazy := 6; FNice := 32; FChain := 32; end;
+    4: begin FGood := 4; FLazy := 4; FNice := 16; FChain := 16; end;
+    5: begin FGood := 8; FLazy := 16; FNice := 32; FChain := 32; end;
+    6: begin FGood := 8; FLazy := 16; FNice := 128; FChain := 128; end;
+    7: begin FGood := 8; FLazy := 32; FNice := 128; FChain := 256; end;
+    8: begin FGood := 32; FLazy := 128; FNice := 258; FChain := 1024; end;
+    9: begin FGood := 32; FLazy := 258; FNice := 258; FChain := 4096; end;
+  else
+    FGood := 0;
+  end;
+  FFast := (ALevel >= 1) and (ALevel <= 3);
+  for s := 0 to 28 do
+  begin
+    top := LenBase[s] + (1 shl LenExtra[s]) - 1;
+    if top > MaxMatch then
+      top := MaxMatch;
+    for l := LenBase[s] to top do
+      FLenSym[l - MinMatch] := s;
+  end;
+  for s := 0 to 29 do
+    for d := DistBase[s] to DistBase[s] + (1 shl DistExtra[s]) - 1 do
+    begin
+      idx := d - 1;
+      if idx < 256 then
+        FDistSym[idx] := s
+      else
+        FDistSym[256 + (idx shr 7)] := s;
+    end;
+  if ALevel > 0 then
+  begin
+    SetLength(FWin, 2 * WindowSize + 512);
+    FLitFreq[256] := 1;
+    FMatchLength := MinMatch - 1;
+    FPrevLength := MinMatch - 1;
+    { position 0 is what a hash chain ends with, so no string is at 0 }
+    FStrStart := 1;
+    FBlockStart := 1;
+  end;
+end;
+
+procedure TDeflater.PutByte(B: Integer);
+begin
+  if FOutLen >= Length(FOut) then
+  begin
+    if Length(FOut) < 2048 then
+      SetLength(FOut, 4096)
+    else
+      SetLength(FOut, Length(FOut) * 2);
+  end;
+  PByte(Pointer(FOut))[FOutLen] := Byte(B);
+  FOutLen := FOutLen + 1;
+end;
+
+{ N bits of V, N up to 16, the lowest first }
+procedure TDeflater.PutBits(V, N: Integer);
+begin
+  FWb := FWb or (V shl FWn);
+  FWn := FWn + N;
+  while FWn >= 8 do
+  begin
+    PutByte(FWb and 255);
+    FWb := FWb shr 8;
+    FWn := FWn - 8;
+  end;
+end;
+
+procedure TDeflater.PadByte;
+begin
+  if FWn > 0 then
+  begin
+    PutByte(FWb and 255);
+    FWb := 0;
+    FWn := 0;
+  end;
+end;
+
+{ the stream's header: RFC 1950, 2.2 or RFC 1952, 2.3 }
+procedure TDeflater.StartStream;
+var
+  d, l, i, flg: Integer;
+begin
+  FStarted := True;
+  if FKind = flZlib then
+  begin
+    if FLevel < 2 then
+      l := 0
+    else if FLevel < 6 then
+      l := 1
+    else if FLevel = 6 then
+      l := 2
+    else
+      l := 3;
+    d := ($78 shl 8) + (l shl 6);
+    d := d + 31 - (d mod 31);
+    PutByte(d shr 8);
+    PutByte(d and 255);
+  end
+  else if FKind = flGzip then
+  begin
+    flg := 0;
+    if HeaderName <> '' then
+      flg := flg or 8;
+    if HeaderComment <> '' then
+      flg := flg or 16;
+    PutByte(31);
+    PutByte(139);
+    PutByte(8);
+    PutByte(flg);
+    PutByte(HeaderMTime and 255);
+    PutByte((HeaderMTime shr 8) and 255);
+    PutByte((HeaderMTime shr 16) and 255);
+    PutByte((HeaderMTime shr 24) and 255);
+    if FLevel = 9 then
+      PutByte(2)
+    else if FLevel = 1 then
+      PutByte(4)
+    else
+      PutByte(0);
+    PutByte(255);
+    if HeaderName <> '' then
+    begin
+      for i := 1 to Length(HeaderName) do
+        PutByte(Ord(HeaderName[i]));
+      PutByte(0);
+    end;
+    if HeaderComment <> '' then
+    begin
+      for i := 1 to Length(HeaderComment) do
+        PutByte(Ord(HeaderComment[i]));
+      PutByte(0);
+    end;
+  end;
+end;
+
+function TDeflater.Take: string;
+begin
+  Result := Copy(FOut, 1, FOutLen);
+  FOutLen := 0;
+end;
+
+{ A Huffman code for the symbols with a frequency in Freq[0..N-1], none
+  longer than MaxBits: the tree of the least frequent two joined (the
+  nodes are made in order of weight, so two queues do), and the lengths
+  that go past MaxBits brought back as zlib's trees.c does: the leaves
+  past the limit are cut to it and the code made whole again by moving
+  a leaf down one level at a time. A code with fewer than two symbols
+  gets another, so that it is a whole code every reader takes. }
+procedure TDeflater.BuildCodes(Freq: PInteger; N, MaxBits: Integer; Len, Code: PInteger);
+var
+  cnt, i, j, k, a, b, ni, x, y, gap, t, overflow, bits, bpos, d: Integer;
+  bl: array[0..16] of Integer;
+begin
+  for i := 0 to N - 1 do
+  begin
+    Len[i] := 0;
+    Code[i] := 0;
+  end;
+  cnt := 0;
+  for i := 0 to N - 1 do
+    if Freq[i] > 0 then
+      cnt := cnt + 1;
+  i := 0;
+  while cnt < 2 do
+  begin
+    if Freq[i] = 0 then
+    begin
+      Freq[i] := 1;
+      cnt := cnt + 1;
+    end;
+    i := i + 1;
+  end;
+  cnt := 0;
+  for i := 0 to N - 1 do
+    if Freq[i] > 0 then
+    begin
+      FKeys[cnt] := Freq[i] * 1024 + i;
+      cnt := cnt + 1;
+    end;
+  gap := cnt div 2;
+  while gap > 0 do
+  begin
+    for i := gap to cnt - 1 do
+    begin
+      t := FKeys[i];
+      j := i;
+      while (j >= gap) and (FKeys[j - gap] > t) do
+      begin
+        FKeys[j] := FKeys[j - gap];
+        j := j - gap;
+      end;
+      FKeys[j] := t;
+    end;
+    gap := gap div 2;
+  end;
+  for i := 0 to cnt - 1 do
+    FNodeW[i] := FKeys[i] shr 10;
+  a := 0;
+  b := cnt;
+  ni := cnt;
+  for k := 1 to cnt - 1 do
+  begin
+    if (a < cnt) and ((b >= ni) or (FNodeW[a] <= FNodeW[b])) then
+    begin
+      x := a;
+      a := a + 1;
+    end
+    else
+    begin
+      x := b;
+      b := b + 1;
+    end;
+    if (a < cnt) and ((b >= ni) or (FNodeW[a] <= FNodeW[b])) then
+    begin
+      y := a;
+      a := a + 1;
+    end
+    else
+    begin
+      y := b;
+      b := b + 1;
+    end;
+    FNodeP[x] := ni;
+    FNodeP[y] := ni;
+    FNodeW[ni] := FNodeW[x] + FNodeW[y];
+    ni := ni + 1;
+  end;
+  FNodeD[ni - 1] := 0;
+  for x := ni - 2 downto 0 do
+    FNodeD[x] := FNodeD[FNodeP[x]] + 1;
+  for i := 0 to 16 do
+    bl[i] := 0;
+  overflow := 0;
+  for i := 0 to cnt - 1 do
+  begin
+    d := FNodeD[i];
+    if d > MaxBits then
+    begin
+      d := MaxBits;
+      overflow := overflow + 1;
+    end;
+    bl[d] := bl[d] + 1;
+  end;
+  while overflow > 0 do
+  begin
+    bits := MaxBits - 1;
+    while bl[bits] = 0 do
+      bits := bits - 1;
+    bl[bits] := bl[bits] - 1;
+    bl[bits + 1] := bl[bits + 1] + 2;
+    bl[MaxBits] := bl[MaxBits] - 1;
+    overflow := overflow - 2;
+  end;
+  { the least frequent symbols get the longest codes }
+  bpos := 0;
+  for bits := MaxBits downto 1 do
+    for k := 1 to bl[bits] do
+    begin
+      Len[FKeys[bpos] and 1023] := bits;
+      bpos := bpos + 1;
+    end;
+  AssignCodes(Len, N, Code);
+end;
+
+procedure TDeflater.FixedTables;
+var
+  i: Integer;
+begin
+  if FFixReady then
+    Exit;
+  FFixReady := True;
+  for i := 0 to 143 do
+    FFLen[i] := 8;
+  for i := 144 to 255 do
+    FFLen[i] := 9;
+  for i := 256 to 279 do
+    FFLen[i] := 7;
+  for i := 280 to 287 do
+    FFLen[i] := 8;
+  AssignCodes(@FFLen[0], 288, @FFCode[0]);
+  for i := 0 to 29 do
+    FFDCode[i] := FlipBits(i, 5);
+end;
+
+{ The lengths of the literal/length and the distance code as the run of
+  code lengths RFC 1951, 3.2.7 sends: FClSym and FClExt, and how many. }
+function TDeflater.ScanLengths(NLit, NDist: Integer): Integer;
+var
+  i, n, v, run, r, cn: Integer;
+begin
+  for i := 0 to NLit - 1 do
+    FLens[i] := FLLen[i];
+  for i := 0 to NDist - 1 do
+    FLens[NLit + i] := FDLen[i];
+  n := NLit + NDist;
+  i := 0;
+  cn := 0;
+  while i < n do
+  begin
+    v := FLens[i];
+    run := 1;
+    while (i + run < n) and (FLens[i + run] = v) do
+      run := run + 1;
+    i := i + run;
+    if v = 0 then
+    begin
+      while run >= 11 do
+      begin
+        r := run;
+        if r > 138 then
+          r := 138;
+        FClSym[cn] := 18;
+        FClExt[cn] := r - 11;
+        cn := cn + 1;
+        run := run - r;
+      end;
+      if run >= 3 then
+      begin
+        FClSym[cn] := 17;
+        FClExt[cn] := run - 3;
+        cn := cn + 1;
+        run := 0;
+      end;
+      while run > 0 do
+      begin
+        FClSym[cn] := 0;
+        FClExt[cn] := 0;
+        cn := cn + 1;
+        run := run - 1;
+      end;
+    end
+    else
+    begin
+      FClSym[cn] := v;
+      FClExt[cn] := 0;
+      cn := cn + 1;
+      run := run - 1;
+      while run >= 3 do
+      begin
+        r := run;
+        if r > 6 then
+          r := 6;
+        FClSym[cn] := 16;
+        FClExt[cn] := r - 3;
+        cn := cn + 1;
+        run := run - r;
+      end;
+      while run > 0 do
+      begin
+        FClSym[cn] := v;
+        FClExt[cn] := 0;
+        cn := cn + 1;
+        run := run - 1;
+      end;
+    end;
+  end;
+  Result := cn;
+end;
+
+{ A stored block of S[At+1 .. At+N] }
+procedure TDeflater.StoredBlockOf(const S: string; At, N: Integer; Last: Boolean);
+var
+  i: Integer;
+begin
+  if Last then
+    PutBits(1, 3)
+  else
+    PutBits(0, 3);
+  PadByte;
+  PutByte(N and 255);
+  PutByte(N shr 8);
+  PutByte((N xor 65535) and 255);
+  PutByte((N xor 65535) shr 8);
+  for i := 1 to N do
+    PutByte(Ord(S[At + i]));
+end;
+
+{ the block of the tokens made since the last one, as the smallest of the
+  three ways RFC 1951 gives: stored, fixed Huffman, or Huffman codes
+  made for it }
+procedure TDeflater.WriteBlock(Last: Boolean);
+var
+  i, s, nlit, ndist, ncl, hclen, extra, fixedBits, dynBits, storedBits, hdr, body, pad, sbytes, c: Integer;
+  storedOk: Boolean;
+begin
+  extra := 0;
+  for i := 0 to 28 do
+    extra := extra + FLitFreq[257 + i] * LenExtra[i];
+  for i := 0 to 29 do
+    extra := extra + FDistFreq[i] * DistExtra[i];
+  fixedBits := 3 + extra;
+  for i := 0 to 285 do
+  begin
+    if i < 144 then
+      fixedBits := fixedBits + FLitFreq[i] * 8
+    else if i < 256 then
+      fixedBits := fixedBits + FLitFreq[i] * 9
+    else if i < 280 then
+      fixedBits := fixedBits + FLitFreq[i] * 7
+    else
+      fixedBits := fixedBits + FLitFreq[i] * 8;
+  end;
+  for i := 0 to 29 do
+    fixedBits := fixedBits + FDistFreq[i] * 5;
+  BuildCodes(@FLitFreq[0], 286, 15, @FLLen[0], @FLCode[0]);
+  BuildCodes(@FDistFreq[0], 30, 15, @FDLen[0], @FDCode[0]);
+  nlit := 286;
+  while (nlit > 257) and (FLLen[nlit - 1] = 0) do
+    nlit := nlit - 1;
+  ndist := 30;
+  while (ndist > 1) and (FDLen[ndist - 1] = 0) do
+    ndist := ndist - 1;
+  ncl := ScanLengths(nlit, ndist);
+  for i := 0 to 18 do
+    FClFreq[i] := 0;
+  for i := 0 to ncl - 1 do
+    FClFreq[FClSym[i]] := FClFreq[FClSym[i]] + 1;
+  BuildCodes(@FClFreq[0], 19, 7, @FCLen[0], @FCCode[0]);
+  hclen := 19;
+  while (hclen > 4) and (FCLen[ClenOrder[hclen - 1]] = 0) do
+    hclen := hclen - 1;
+  hdr := 14 + 3 * hclen + FClFreq[16] * 2 + FClFreq[17] * 3 + FClFreq[18] * 7;
+  for i := 0 to 18 do
+    hdr := hdr + FClFreq[i] * FCLen[i];
+  body := extra;
+  for i := 0 to 285 do
+    body := body + FLitFreq[i] * FLLen[i];
+  for i := 0 to 29 do
+    body := body + FDistFreq[i] * FDLen[i];
+  dynBits := 3 + hdr + body;
+  sbytes := FStrStart - FBlockStart;
+  storedOk := (FBlockStart >= 0) and (sbytes <= 65535);
+  pad := (8 - ((FWn + 3) and 7)) and 7;
+  storedBits := 3 + pad + 32 + 8 * sbytes;
+  if storedOk and (storedBits <= fixedBits) and (storedBits <= dynBits) then
+  begin
+    StoredBlockOf(FWin, FBlockStart, sbytes, Last);
+    Exit;
+  end;
+  if fixedBits <= dynBits then
+  begin
+    FixedTables;
+    if Last then
+      PutBits(3, 3)
+    else
+      PutBits(2, 3);
+    for i := 0 to FTokN - 1 do
+    begin
+      if FTokD[i] = 0 then
+        PutBits(FFCode[FTokL[i]], FFLen[FTokL[i]])
+      else
+      begin
+        s := FLenSym[FTokL[i]];
+        PutBits(FFCode[257 + s], FFLen[257 + s]);
+        if LenExtra[s] > 0 then
+          PutBits(FTokL[i] + MinMatch - LenBase[s], LenExtra[s]);
+        c := FTokD[i] - 1;
+        if c < 256 then
+          s := FDistSym[c]
+        else
+          s := FDistSym[256 + (c shr 7)];
+        PutBits(FFDCode[s], 5);
+        if DistExtra[s] > 0 then
+          PutBits(FTokD[i] - DistBase[s], DistExtra[s]);
+      end;
+    end;
+    PutBits(FFCode[256], FFLen[256]);
+    Exit;
+  end;
+  if Last then
+    PutBits(5, 3)
+  else
+    PutBits(4, 3);
+  PutBits(nlit - 257, 5);
+  PutBits(ndist - 1, 5);
+  PutBits(hclen - 4, 4);
+  for i := 0 to hclen - 1 do
+    PutBits(FCLen[ClenOrder[i]], 3);
+  for i := 0 to ncl - 1 do
+  begin
+    s := FClSym[i];
+    PutBits(FCCode[s], FCLen[s]);
+    if s = 16 then
+      PutBits(FClExt[i], 2)
+    else if s = 17 then
+      PutBits(FClExt[i], 3)
+    else if s = 18 then
+      PutBits(FClExt[i], 7);
+  end;
+  for i := 0 to FTokN - 1 do
+  begin
+    if FTokD[i] = 0 then
+      PutBits(FLCode[FTokL[i]], FLLen[FTokL[i]])
+    else
+    begin
+      s := FLenSym[FTokL[i]];
+      PutBits(FLCode[257 + s], FLLen[257 + s]);
+      if LenExtra[s] > 0 then
+        PutBits(FTokL[i] + MinMatch - LenBase[s], LenExtra[s]);
+      c := FTokD[i] - 1;
+      if c < 256 then
+        s := FDistSym[c]
+      else
+        s := FDistSym[256 + (c shr 7)];
+      PutBits(FDCode[s], FDLen[s]);
+      if DistExtra[s] > 0 then
+        PutBits(FTokD[i] - DistBase[s], DistExtra[s]);
+    end;
+  end;
+  PutBits(FLCode[256], FLLen[256]);
+end;
+
+procedure TDeflater.FlushBlock(Last: Boolean);
+var
+  i: Integer;
+begin
+  WriteBlock(Last);
+  FTokN := 0;
+  for i := 0 to 287 do
+    FLitFreq[i] := 0;
+  for i := 0 to 29 do
+    FDistFreq[i] := 0;
+  FLitFreq[256] := 1;
+  FBlockStart := FStrStart;
+end;
+
+{ a literal (Dist 0, LenOrLit its byte) or a match (its distance, its
+  length less 3) }
+procedure TDeflater.Tally(Dist, LenOrLit: Integer);
+var
+  c: Integer;
+begin
+  FTokD[FTokN] := UInt16(Dist);
+  FTokL[FTokN] := Byte(LenOrLit);
+  FTokN := FTokN + 1;
+  if Dist = 0 then
+    FLitFreq[LenOrLit] := FLitFreq[LenOrLit] + 1
+  else
+  begin
+    FLitFreq[257 + FLenSym[LenOrLit]] := FLitFreq[257 + FLenSym[LenOrLit]] + 1;
+    c := Dist - 1;
+    if c < 256 then
+      FDistFreq[FDistSym[c]] := FDistFreq[FDistSym[c]] + 1
+    else
+      FDistFreq[FDistSym[256 + (c shr 7)]] := FDistFreq[FDistSym[256 + (c shr 7)]] + 1;
+  end;
+end;
+
+{ Bring input into the window: the upper half moves down when the next
+  bytes would pass its end. The chains keep the positions they have, as
+  numbers counted from the start of the stream (FBase is the number of
+  the window's first byte), so that a move touches no chain; only after
+  a very long stream are they all brought back to small numbers. }
+procedure TDeflater.FillWindow;
+var
+  more, n, avail, i, m, delta: Integer;
+  w: Pointer;
+begin
+  repeat
+    more := 2 * WindowSize - FLookahead - FStrStart;
+    if FStrStart >= WindowSize + MaxDist then
+    begin
+      w := Pointer(FWin);
+      Move(PByte(w)[WindowSize], PByte(w)[0], WindowSize);
+      FMatchStart := FMatchStart - WindowSize;
+      FStrStart := FStrStart - WindowSize;
+      FBlockStart := FBlockStart - WindowSize;
+      FBase := FBase + WindowSize;
+      if FBase >= FRebaseAt then
+      begin
+        delta := FBase - WindowSize;
+        for i := 0 to HashSize - 1 do
+        begin
+          m := FHead[i];
+          if m > delta then
+            FHead[i] := UInt32(m - delta)
+          else
+            FHead[i] := 0;
+        end;
+        for i := 0 to WindowSize - 1 do
+        begin
+          m := FPrev[i];
+          if m > delta then
+            FPrev[i] := UInt32(m - delta)
+          else
+            FPrev[i] := 0;
+        end;
+        FBase := WindowSize;
+      end;
+      more := more + WindowSize;
+    end;
+    avail := Length(FPend) - FPendPos;
+    if avail = 0 then
+      Exit;
+    n := more;
+    if n > avail then
+      n := avail;
+    w := Pointer(FWin);
+    Move(FPend[FPendPos + 1], PByte(w)[FStrStart + FLookahead], n);
+    FPendPos := FPendPos + n;
+    FLookahead := FLookahead + n;
+  until FLookahead >= MinLookahead;
+end;
+
+{ the string at local position At goes into the chain of its hash; the
+  string that was at the head of it is the answer, as a number counted
+  from the start of the stream, 0 if none }
+function TDeflater.InsertString(At: Integer): Integer;
+var
+  w: Pointer;
+  h, a: Integer;
+begin
+  w := Pointer(FWin);
+  h := ((PByte(w)[At] shl 10) xor (PByte(w)[At + 1] shl 5) xor PByte(w)[At + 2]) and (HashSize - 1);
+  a := At + FBase;
+  Result := FHead[h];
+  FPrev[a and WMask] := UInt32(Result);
+  FHead[h] := UInt32(a);
+end;
+
+{ The longest match for the string at FStrStart in the chain that starts
+  at Cur (a number counted from the start of the stream), longer than
+  FPrevLength; its start is FMatchStart, a position in the window. }
+function TDeflater.LongestMatch(Cur: Integer): Integer;
+var
+  w: Pointer;
+  s, best, nice, lim, chainLeft, k, e0, e1, m, x: Integer;
+begin
+  w := Pointer(FWin);
+  s := FStrStart;
+  chainLeft := FChain;
+  best := FPrevLength;
+  if FPrevLength >= FGood then
+    chainLeft := chainLeft shr 2;
+  nice := FNice;
+  if nice > FLookahead then
+    nice := FLookahead;
+  lim := FBase;
+  if s > MaxDist then
+    lim := lim + s - MaxDist;
+  e0 := PByte(w)[s + best];
+  e1 := PByte(w)[s + best - 1];
+  while True do
+  begin
+    m := Cur - FBase;
+    if (PByte(w)[m + best] = e0) and (PByte(w)[m + best - 1] = e1) and (PByte(w)[m] = PByte(w)[s]) and
+      (PByte(w)[m + 1] = PByte(w)[s + 1]) then
+    begin
+      { eight bytes a step, the first byte that differs found by its
+        bit, then the last two of the 258 one by one }
+      k := 0;
+      while k + 8 <= MaxMatch do
+      begin
+        x := PInteger(PByte(w) + m + k)^ xor PInteger(PByte(w) + s + k)^;
+        if x <> 0 then
+        begin
+          k := k + (TrailingZeros(x) shr 3);
+          Break;
+        end;
+        k := k + 8;
+      end;
+      while (k < MaxMatch) and (PByte(w)[m + k] = PByte(w)[s + k]) do
+        k := k + 1;
+      if k > best then
+      begin
+        FMatchStart := m;
+        best := k;
+        if k >= nice then
+          Break;
+        e0 := PByte(w)[s + best];
+        e1 := PByte(w)[s + best - 1];
+      end;
+    end;
+    Cur := FPrev[Cur and WMask];
+    if Cur <= lim then
+      Break;
+    chainLeft := chainLeft - 1;
+    if chainLeft = 0 then
+      Break;
+  end;
+  if best > FLookahead then
+    Result := FLookahead
+  else
+    Result := best;
+end;
+
+{ levels 1 to 3: a match is taken when found, and the strings inside a
+  short one go into the chains }
+procedure TDeflater.ProcessFast(AllIn: Boolean);
+var
+  head: Integer;
+  w: Pointer;
+begin
+  while True do
+  begin
+    if FLookahead < MinLookahead then
+    begin
+      FillWindow;
+      if (FLookahead < MinLookahead) and (not AllIn) then
+        Exit;
+      if FLookahead = 0 then
+        Break;
+    end;
+    head := 0;
+    if FLookahead >= MinMatch then
+      head := InsertString(FStrStart);
+    if (head <> 0) and (FStrStart + FBase - head <= MaxDist) then
+      FMatchLength := LongestMatch(head);
+    if FMatchLength >= MinMatch then
+    begin
+      Tally(FStrStart - FMatchStart, FMatchLength - MinMatch);
+      FLookahead := FLookahead - FMatchLength;
+      if (FMatchLength <= FLazy) and (FLookahead >= MinMatch) then
+      begin
+        FMatchLength := FMatchLength - 1;
+        repeat
+          FStrStart := FStrStart + 1;
+          InsertString(FStrStart);
+          FMatchLength := FMatchLength - 1;
+        until FMatchLength = 0;
+        FStrStart := FStrStart + 1;
+      end
+      else
+      begin
+        FStrStart := FStrStart + FMatchLength;
+        FMatchLength := 0;
+      end;
+    end
+    else
+    begin
+      w := Pointer(FWin);
+      Tally(0, PByte(w)[FStrStart]);
+      FLookahead := FLookahead - 1;
+      FStrStart := FStrStart + 1;
+    end;
+    if FTokN = FTokMax then
+      FlushBlock(False);
+  end;
+end;
+
+{ levels 4 to 9: lazy matching, a match taken only if the next position
+  has none longer }
+procedure TDeflater.ProcessSlow(AllIn: Boolean);
+var
+  head, maxInsert: Integer;
+  w: Pointer;
+begin
+  while True do
+  begin
+    if FLookahead < MinLookahead then
+    begin
+      FillWindow;
+      if (FLookahead < MinLookahead) and (not AllIn) then
+        Exit;
+      if FLookahead = 0 then
+        Break;
+    end;
+    head := 0;
+    if FLookahead >= MinMatch then
+      head := InsertString(FStrStart);
+    FPrevLength := FMatchLength;
+    FPrevMatch := FMatchStart;
+    FMatchLength := MinMatch - 1;
+    if (head <> 0) and (FPrevLength < FLazy) and (FStrStart + FBase - head <= MaxDist) then
+    begin
+      FMatchLength := LongestMatch(head);
+      if (FMatchLength = MinMatch) and (FStrStart - FMatchStart > TooFar) then
+        FMatchLength := MinMatch - 1;
+    end;
+    if (FPrevLength >= MinMatch) and (FMatchLength <= FPrevLength) then
+    begin
+      maxInsert := FStrStart + FLookahead - MinMatch;
+      Tally(FStrStart - 1 - FPrevMatch, FPrevLength - MinMatch);
+      FLookahead := FLookahead - (FPrevLength - 1);
+      FPrevLength := FPrevLength - 2;
+      repeat
+        FStrStart := FStrStart + 1;
+        if FStrStart <= maxInsert then
+          InsertString(FStrStart);
+        FPrevLength := FPrevLength - 1;
+      until FPrevLength = 0;
+      FMatchAvail := False;
+      FMatchLength := MinMatch - 1;
+      FStrStart := FStrStart + 1;
+      if FTokN = FTokMax then
+        FlushBlock(False);
+    end
+    else if FMatchAvail then
+    begin
+      w := Pointer(FWin);
+      Tally(0, PByte(w)[FStrStart - 1]);
+      if FTokN = FTokMax then
+        FlushBlock(False);
+      FStrStart := FStrStart + 1;
+      FLookahead := FLookahead - 1;
+    end
+    else
+    begin
+      FMatchAvail := True;
+      FStrStart := FStrStart + 1;
+      FLookahead := FLookahead - 1;
+    end;
+  end;
+  if FMatchAvail then
+  begin
+    w := Pointer(FWin);
+    Tally(0, PByte(w)[FStrStart - 1]);
+    FMatchAvail := False;
+  end;
+end;
+
+procedure TDeflater.Process(AllIn: Boolean);
+begin
+  if FFast then
+    ProcessFast(AllIn)
+  else
+    ProcessSlow(AllIn);
+end;
+
+{ level 0: the input as stored blocks of the most RFC 1951 allows }
+procedure TDeflater.StoredBlocks(Last: Boolean);
+var
+  n: Integer;
+begin
+  while Length(FPend) - FPendPos >= 65535 do
+  begin
+    StoredBlockOf(FPend, FPendPos, 65535, False);
+    FPendPos := FPendPos + 65535;
+  end;
+  if Last then
+  begin
+    n := Length(FPend) - FPendPos;
+    StoredBlockOf(FPend, FPendPos, n, True);
+    FPendPos := FPendPos + n;
+  end;
+end;
+
+procedure TDeflater.Feed(const S: string);
+begin
+  if FEnded then
+    raise EFlateError.CreateAt(-1, 'the stream was ended');
+  if not FStarted then
+    StartStream;
+  if Length(S) = 0 then
+    Exit;
+  if FKind = flGzip then
+    FCrc := Crc32(S, FCrc)
+  else if FKind = flZlib then
+    FAdler := Adler32(S, FAdler);
+  FTotal := FTotal + Length(S);
+  if FPendPos > 0 then
+  begin
+    FPend := Copy(FPend, FPendPos + 1, Length(FPend) - FPendPos);
+    FPendPos := 0;
+  end;
+  FPend := FPend + S;
+  if FLevel = 0 then
+    StoredBlocks(False)
+  else
+    Process(False);
+end;
+
+procedure TDeflater.Flush;
+var
+  n: Integer;
+begin
+  if FEnded then
+    Exit;
+  if not FStarted then
+    StartStream;
+  if FLevel = 0 then
+  begin
+    StoredBlocks(False);
+    n := Length(FPend) - FPendPos;
+    if n > 0 then
+    begin
+      StoredBlockOf(FPend, FPendPos, n, False);
+      FPendPos := FPendPos + n;
+    end;
+  end
+  else
+  begin
+    Process(True);
+    if FTokN > 0 then
+      FlushBlock(False);
+  end;
+  StoredBlockOf('', 0, 0, False);
+end;
+
+function TDeflater.Finish: string;
+begin
+  if not FEnded then
+  begin
+    if not FStarted then
+      StartStream;
+    if FLevel = 0 then
+      StoredBlocks(True)
+    else
+    begin
+      Process(True);
+      FlushBlock(True);
+    end;
+    PadByte;
+    if FKind = flZlib then
+    begin
+      PutByte((FAdler shr 24) and 255);
+      PutByte((FAdler shr 16) and 255);
+      PutByte((FAdler shr 8) and 255);
+      PutByte(FAdler and 255);
+    end
+    else if FKind = flGzip then
+    begin
+      PutByte(FCrc and 255);
+      PutByte((FCrc shr 8) and 255);
+      PutByte((FCrc shr 16) and 255);
+      PutByte((FCrc shr 24) and 255);
+      PutByte(FTotal and 255);
+      PutByte((FTotal shr 8) and 255);
+      PutByte((FTotal shr 16) and 255);
+      PutByte((FTotal shr 24) and 255);
+    end;
+    FEnded := True;
+  end;
+  Result := Take;
+end;
+
+function FlateDeflate(const S: string; Level: Integer): string;
+var
+  z: TDeflater;
+begin
+  z := TDeflater.Create(flRaw, Level);
+  z.Feed(S);
+  Result := z.Finish;
+end;
+
+function ZlibEncode(const S: string; Level: Integer): string;
+var
+  z: TDeflater;
+begin
+  z := TDeflater.Create(flZlib, Level);
+  z.Feed(S);
+  Result := z.Finish;
+end;
+
+function GzipEncode(const S: string; Level: Integer): string;
+var
+  z: TDeflater;
+begin
+  z := TDeflater.Create(flGzip, Level);
+  z.Feed(S);
+  Result := z.Finish;
+end;
+
+end.

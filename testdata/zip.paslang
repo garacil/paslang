@@ -1,0 +1,267 @@
+{ P427: paszip against Python's zipfile. testdata/zip.txt holds archives
+  (scripts/zip_corpus.py writes it): what zipfile writes, archives with
+  something in front, with data descriptors, with zip64 or encryption or
+  another method (refused here), hand-made faults and mutants of the good
+  ones, each with the verdict zipfile and Go's archive/zip give when they
+  agree (when they do not, either|ZIPFILE|GO and either will do): err,
+  or the count of entries and the CRC-32 of their listing (name, size and
+  CRC-32 of the bytes, one line each). Only the lines that differ from the verdict are
+  written, then the counts. Then the writer: archives made with TZipWriter
+  and read back, copied entry by entry with AddRaw into the same bytes,
+  and edited in one entry with the rest copied as they were. With the
+  argument dump the writer's archives are written as lines `NAME CRC32
+  HEX` for scripts/zip_verify.py to read with zipfile. }
+program zip;
+
+uses
+  sysutils, pascodec, pasflate, paszip;
+
+const
+  HexDigits: string = '0123456789abcdef';
+  Words: array[0..7] of string = ('sheet', 'row', 'cell', 'value', 'style', 'text', 'total', 'x');
+
+var
+  GS: Integer;
+
+function GNext: Integer;
+var
+  z: Integer;
+begin
+  GS := GS + Integer($9E3779B97F4A7C15);
+  z := GS;
+  z := (z xor (z shr 30)) * Integer($BF58476D1CE4E5B9);
+  z := (z xor (z shr 27)) * Integer($94D049BB133111EB);
+  Result := z xor (z shr 31);
+end;
+
+function Rnd(N: Integer): Integer;
+begin
+  Result := (GNext shr 11) mod N;
+end;
+
+{ a stream of the corpus, base64 as scripts write it }
+function Unb64(const S: string): string;
+begin
+  if not Base64Decode(S, False, True, Result) then
+  begin
+    WriteLn('bad base64 in the corpus');
+    Halt(2);
+  end;
+end;
+
+function ToHex(const S: string): string;
+var
+  i: Integer;
+begin
+  SetLength(Result, Length(S) * 2);
+  for i := 1 to Length(S) do
+  begin
+    Result[i * 2 - 1] := HexDigits[(Ord(S[i]) shr 4) + 1];
+    Result[i * 2] := HexDigits[(Ord(S[i]) and 15) + 1];
+  end;
+end;
+
+function Hex16(V: Integer): string;
+var
+  i: Integer;
+begin
+  SetLength(Result, 16);
+  for i := 16 downto 1 do
+  begin
+    Result[i] := HexDigits[(V and 15) + 1];
+    V := V shr 4;
+  end;
+end;
+
+function Fnv(const S: string): Integer;
+var
+  i: Integer;
+begin
+  Result := Integer($CBF29CE484222325);
+  for i := 1 to Length(S) do
+    Result := (Result xor Ord(S[i])) * Integer($100000001B3);
+end;
+
+{ the verdict as scripts/zip_corpus.py spells it }
+function Verdict(const Blob: string): string;
+var
+  r: TZipReader;
+  i: Integer;
+  data, lst: string;
+begin
+  try
+    r := TZipReader.Create(Blob);
+    lst := '';
+    for i := 0 to r.Count - 1 do
+    begin
+      data := r.Extract(i);
+      lst := lst + r.Entry(i).Name + #9 + IntToStr(Length(data)) + #9 + IntToStr(Crc32(data)) + #10;
+    end;
+    Result := 'ok:' + IntToStr(r.Count) + ':' + IntToStr(Crc32(lst));
+  except
+    on E: EZipError do
+      Result := 'err';
+  end;
+end;
+
+function Text(N: Integer): string;
+begin
+  Result := '';
+  while Length(Result) < N do
+    Result := Result + Words[Rnd(8)] + ' ';
+end;
+
+function Noise(N: Integer): string;
+var
+  i: Integer;
+begin
+  SetLength(Result, N);
+  for i := 1 to N do
+    Result[i] := Chr(Rnd(256));
+end;
+
+function ListOf(const Blob: string): string;
+var
+  r: TZipReader;
+  i: Integer;
+  data: string;
+begin
+  r := TZipReader.Create(Blob);
+  Result := '';
+  for i := 0 to r.Count - 1 do
+  begin
+    data := r.Extract(i);
+    Result := Result + r.Entry(i).Name + #9 + IntToStr(Length(data)) + #9 + IntToStr(Crc32(data)) + #10;
+  end;
+end;
+
+procedure Emit(const Name, Blob: string; Dump: Boolean);
+begin
+  if Dump then
+    WriteLn(Name, ' ', Crc32(ListOf(Blob)), ' ', ToHex(Blob));
+end;
+
+var
+  corpus, line, id, want, hx, blob, v: string;
+  p, q, nl, count, bad, i: Integer;
+  dump: Boolean;
+  w: TZipWriter;
+  a, b, c, got: string;
+  r, r2: TZipReader;
+  e: TZipEntry;
+  okAll: Boolean;
+begin
+  dump := (ParamCount > 0) and (ParamStr(1) = 'dump');
+  GS := 4270;
+  if not dump then
+  begin
+    if not ReadFile('testdata/zip.txt', corpus) then
+    begin
+      WriteLn('no testdata/zip.txt');
+      Halt(2);
+    end;
+    p := 1;
+    count := 0;
+    bad := 0;
+    while p <= Length(corpus) do
+    begin
+      nl := p;
+      while (nl <= Length(corpus)) and (corpus[nl] <> #10) do
+        nl := nl + 1;
+      line := Copy(corpus, p, nl - p);
+      p := nl + 1;
+      q := Pos(' ', line);
+      id := Copy(line, 1, q - 1);
+      line := Copy(line, q + 1, Length(line) - q);
+      q := Pos(' ', line);
+      want := Copy(line, 1, q - 1);
+      hx := Copy(line, q + 1, Length(line) - q);
+      if hx = '-' then
+        blob := ''
+      else
+        blob := Unb64(hx);
+      v := Verdict(blob);
+      { zipfile and Go agree, or they differ and a verdict of either will do }
+      if Copy(want, 1, 7) = 'either|' then
+        want := Copy(want, 8, Length(want)) + '|';
+      if (v <> want) and (Pos('|' + v + '|', '|' + want) = 0) then
+      begin
+        bad := bad + 1;
+        WriteLn('DIFFERS ', id, ' zipfile ', want, ' here ', v);
+      end;
+      count := count + 1;
+    end;
+    WriteLn('archives ', count, ', differ from zipfile ', bad);
+  end;
+  { the writer }
+  w := TZipWriter.Create;
+  w.Add('[Content_Types].xml', '<?xml version="1.0"?><Types>' + Text(600) + '</Types>');
+  w.Add('xl/', '');
+  w.DosDate := 22655;
+  w.DosTime := 25565;
+  w.Add('xl/worksheets/sheet1.xml', Text(40000));
+  w.DosDate := 33;
+  w.DosTime := 0;
+  w.Add('xl/media/noise.bin', Noise(3000));
+  w.Add('empty.txt', '');
+  w.Add('ñandú/日本語.txt', 'name in UTF-8');
+  a := w.Finish;
+  Emit('written', a, dump);
+  r := TZipReader.Create(a);
+  okAll := (r.Count = 6) and (r.Extract(0)[1] = '<') and (r.Entry(2).Method = 8) and (r.Entry(3).Method = 0) and
+    (r.Entry(1).Size = 0) and (r.Entry(5).Flags = $800) and (r.Entry(0).Flags = 0);
+  if not dump then
+  begin
+    WriteLn('written ', Length(a), ' ', Hex16(Fnv(a)), ' ', okAll);
+    for i := 0 to r.Count - 1 do
+    begin
+      e := r.Entry(i);
+      WriteLn('  ', e.Name, ' method ', e.Method, ' ', e.CompSize, '/', e.Size, ' crc ', e.Crc, ' flags ', e.Flags, ' dir ', r.IsDir(i));
+    end;
+  end;
+  { each entry copied as it is: the same archive }
+  w := TZipWriter.Create;
+  for i := 0 to r.Count - 1 do
+    w.AddRaw(r.Entry(i), r.Raw(i));
+  b := w.Finish;
+  if not dump then
+    WriteLn('copied the same: ', a = b);
+  { one entry edited, the rest copied }
+  w := TZipWriter.Create;
+  for i := 0 to r.Count - 1 do
+    if i = 2 then
+      w.Replace(r.Entry(i), Text(900))
+    else
+      w.AddRaw(r.Entry(i), r.Raw(i));
+  c := w.Finish;
+  Emit('edited', c, dump);
+  r2 := TZipReader.Create(c);
+  got := '';
+  okAll := r2.Count = r.Count;
+  for i := 0 to r.Count - 1 do
+    if (i <> 2) and ((r2.Raw(i) <> r.Raw(i)) or (r2.Extract(i) <> r.Extract(i)) or (r2.Entry(i).Crc <> r.Entry(i).Crc)) then
+      okAll := False;
+  if (Length(r2.Extract(2)) < 900) or (r2.Entry(2).DosDate <> 22655) or (r2.Entry(2).DosTime <> 25565) or
+    (r2.Entry(2).Name <> r.Entry(2).Name) then
+    okAll := False;
+  if not dump then
+    WriteLn('edited, the rest as it was: ', okAll, ' ', Length(c), ' ', Hex16(Fnv(c)));
+  { limits and faults of the reader }
+  r2.MaxEntrySize := 500;
+  try
+    r2.Extract(2);
+    if not dump then
+      WriteLn('limit: read');
+  except
+    on E1: EZipError do
+      if not dump then
+        WriteLn('limit: ', E1.Message);
+  end;
+  if not dump then
+  begin
+    WriteLn('safe names: ', ZipNameIsSafe('a/b.txt'), ' ', ZipNameIsSafe('../x'), ' ', ZipNameIsSafe('/etc/passwd'), ' ', ZipNameIsSafe('a/../../x'),
+      ' ', ZipNameIsSafe('C:\x'), ' ', ZipNameIsSafe('a\..\x'), ' ', ZipNameIsSafe('..a/b'));
+    ZipDosFromUnix(1711888258, i, q);
+    WriteLn('dos ', i, ' ', q, ' ', ZipUnixFromDos(i, q));
+  end;
+end.

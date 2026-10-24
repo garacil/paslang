@@ -11872,6 +11872,75 @@ Out := d.Xml;                         { the document written; Text itself when n
   routines at once; an edit needs one routine that owns the tree, as a map
   written does. A reader belongs to the routine that uses it.
 
+`uses pasflate` reads and writes DEFLATE (RFC 1951), zlib (RFC 1950) and
+gzip (RFC 1952) streams, and `uses paszip` ZIP archives (PKWARE's APPNOTE
+6.3.10), in paslang (1.1.264, P427). They are made for a workbook or a
+package taken apart, one part edited and the file written back with every
+other part as it was, and they are checked against zlib and Go on 1,893
+streams read whole and in pieces (`testdata/flate`), a writer round trip
+of twelve shapes of data at the ten levels (`testdata/flatec`, its output
+read by zlib, gzip and Go through `scripts/flate_verify.py`) and 189
+archives against Python's zipfile and Go's archive/zip (`testdata/zip`).
+
+```pascal
+Text := ZlibDecode(Bytes);                 { EFlateError (Offset, Message) when the stream is wrong }
+Bytes := GzipEncode(Text, 6);              { levels 0 (stored) to 9; -1 is 6 }
+z := TInflater.Create(flGzip);             { or flRaw, flZlib }
+z.MaxOutput := 64 shl 20;                  { more than this is an error, before it is made }
+while Read(piece) do begin z.Feed(piece); Out := Out + z.Take; end;
+Out := Out + z.Finish;                     { raises if the stream has not ended }
+r := TZipReader.Create(Archive);
+i := r.Find('xl/worksheets/sheet1.xml');   { -1 when absent }
+Sheet := r.Extract(i);                     { inflated, its size and CRC-32 checked }
+w := TZipWriter.Create;
+for k := 0 to r.Count - 1 do
+  if k = i then w.Add(r.Entry(k).Name, NewSheet)
+  else w.AddRaw(r.Entry(k), r.Raw(k));     { the entry as it was: bytes, method, CRC, times }
+Archive := w.Finish;
+```
+- **Streams.** `TInflater.Create(kind)` with `Feed(s)`, `Take` (the output
+  made so far), `Done`, `Finish`, `Unused` (the input after the stream),
+  `Consumed`, `Total`, `MaxOutput` (0 is no limit) and, for gzip,
+  `Multistream` (on: a file of several members is read on, as gzip(1) does)
+  and the header's `HeaderName`, `HeaderComment`, `HeaderMTime`,
+  `HeaderOS`, `HeaderExtra`. A piece may end anywhere, even inside a
+  symbol. `FlateInflate(s, start, used)`, `ZlibDecode(s)` and
+  `GzipDecode(s)` do it in one call. `TDeflater.Create(kind, level)` with
+  `Feed`, `Take`, `Flush` (ends the block so what was fed can be read;
+  zlib's Z_SYNC_FLUSH) and `Finish`, and the gzip header's name, comment
+  and time; `FlateDeflate`, `ZlibEncode`, `GzipEncode` in one call. The
+  writer is zlib's algorithm with zlib's table of levels, and its streams
+  are within 0.1 % of zlib's size; what it writes is deterministic, the
+  same bytes on both machines. Refused: a preset dictionary, a method that
+  is not deflate, a reserved flag, a bad checksum or length, a code table
+  that is not a prefix code, a distance before the start. An error says the
+  byte of the input it was found at.
+- **Archives.** `TZipReader.Create(bytes)`: `Count`, `Entry(i)` (a
+  `TZipEntry`: `Name`, `Comment`, `Method` 0 stored or 8 deflated, `Flags`,
+  `DosTime`, `DosDate`, `Crc`, `CompSize`, `Size`, `ExternalAttr`, `Extra`,
+  `LocalExtra`, `HeaderOffset`), `Find(name)`, `Extract(i)`, `Raw(i)`,
+  `IsDir(i)`, `Comment`, `MaxEntrySize`. The directory is what is read, as
+  Go does, so an archive written to a stream (sizes after the data) and one
+  with bytes in front of it (a self-extractor) read. **Refused**, with
+  `EZipError`: ZIP64, encryption, a method other than stored and deflated,
+  a wrong signature, size, CRC or offset. `TZipWriter`: `Add(name, data)`
+  (deflated at `Level`, stored when that is not smaller, the UTF-8 flag
+  when the name needs it), `AddRaw(entry, raw)`, `Replace(entry, data)` (an
+  entry of another archive with new data: name, times, flags, attributes and
+  extra fields as it had them), `Comment`, `DosDate` and
+  `DosTime` (1980-01-01 00:00 unless set, so an archive is the same each
+  time), `Finish`; the local headers hold the sizes, no descriptors.
+  `ZipDosFromUnix(secs, date, time)`, `ZipUnixFromDos(date, time)` (UTC, as
+  Go reads them) and `ZipNameIsSafe(name)` (no `..`, not absolute, no drive,
+  no NUL) stand alone.
+- **Speed.** On an 11 MB worksheet inflate takes 18 ms against zlib's 30
+  and Go's 40; deflate at level 6 takes 190 ms against zlib's 105 and Go's
+  53 (Go's levels 1 to 6 are another algorithm that writes 1 to 2 % more;
+  P449 is the gap). `scripts/bench/b39flate` measures both.
+- **Routines.** A reader or a writer belongs to the routine that uses it;
+  any number of routines may each have one, and an archive's bytes may be
+  read by any number of readers at once.
+
 `uses sqlite` gives SQLite 3.54.1 in paslang: the library itself, written
 from SQLite's own file format, documents and sources (P403 the file,
 P404 the SQL, 1.1.253 P405 the rest). It is a library unit, as `pasnet`

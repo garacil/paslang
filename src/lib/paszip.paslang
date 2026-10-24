@@ -1,0 +1,689 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+
+  paslang is free software: you can redistribute it and/or modify it
+  under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+
+  paslang is distributed in the hope that it will be useful, but
+  WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+  General Public License for more details.
+
+  Under Section 7 of GPL version 3, you are granted additional
+  permissions described in the paslang Runtime Library Exception,
+  version 1.0, in the file COPYING.RUNTIME.
+
+  You should have received a copy of the GNU General Public License
+  along with paslang.  If not, see <https://www.gnu.org/licenses/>. }
+
+{ ZIP archives (P427), as PKWARE's APPNOTE 6.3.10 describes them and as
+  Go's archive/zip reads and writes them, over pasflate.
+
+  TZipReader opens an archive held in a string: it finds the end of the
+  central directory, reads every entry's record from the directory (not
+  from the local headers, which an archive may leave unfilled when the
+  sizes follow the data), and gives an entry's bytes inflated and checked
+  against its CRC-32 and its size, or as they are stored. An archive
+  with something in front of its first entry (a self-extractor) is read
+  from where its directory says, shifted by what is in front. ZIP64,
+  encryption and a method other than stored and
+  deflated are refused with an EZipError that says which. The disk
+  numbers of the end record are not looked at, as Go and zipfile do not
+  look at them.
+
+  TZipWriter writes an archive to a string: Add compresses an entry (or
+  stores it when that is smaller), and AddRaw puts in an entry of another
+  archive as it is, its compressed bytes, method, CRC-32, times, flags,
+  attributes and extra fields untouched, so a workbook with one part
+  edited is written back compressing only that part and keeping the
+  order of the rest. The archive has no data descriptors: every local
+  header holds the sizes and the CRC-32. Free of state (Regla 11). }
+unit paszip;
+
+interface
+
+uses
+  sysutils, pasflate;
+
+type
+  { Offset is the byte of the archive the fault was found at, or -1 }
+  EZipError = class(Exception)
+  public
+    Offset: Integer;
+    constructor CreateAt(AOffset: Integer; const AReason: string);
+  end;
+
+  { one entry as the central directory has it }
+  TZipEntry = record
+    Name: string;
+    Comment: string;
+    { 0 stored, 8 deflated }
+    Method: Integer;
+    { the general purpose bit flag as it is in the archive: bit 0 is
+      encryption, bit 3 a data descriptor, bit 11 a name in UTF-8 }
+    Flags: Integer;
+    VersionMade: Integer;
+    VersionNeeded: Integer;
+    { the MS-DOS time and date words as they are in the archive }
+    DosTime: Integer;
+    DosDate: Integer;
+    Crc: Integer;
+    CompSize: Integer;
+    Size: Integer;
+    ExternalAttr: Integer;
+    { the extra fields of the directory record and of the local header }
+    Extra: string;
+    LocalExtra: string;
+    { where the local header is, in the archive }
+    HeaderOffset: Integer;
+  end;
+
+  TZipReader = class
+  private
+    FData: string;
+    FBase: Integer;
+    FEntries: array of TZipEntry;
+    FComment: string;
+    FLimit: Integer;
+    function U16(At: Integer): Integer;
+    function U32(At: Integer): Integer;
+    procedure Fail(At: Integer; const Why: string);
+    function BodyStart(I: Integer): Integer;
+  public
+    constructor Create(const AData: string);
+    function Count: Integer;
+    function Entry(I: Integer): TZipEntry;
+    { the first entry of that name, or -1 }
+    function Find(const AName: string): Integer;
+    { the entry's bytes: inflated if it is deflated, and checked against
+      its size and CRC-32 }
+    function Extract(I: Integer): string;
+    { the entry's bytes as the archive holds them, to AddRaw }
+    function Raw(I: Integer): string;
+    { whether the entry is a directory (its name ends in /) }
+    function IsDir(I: Integer): Boolean;
+    property Comment: string read FComment;
+    { an entry that would make more than this many bytes is refused
+      before it is inflated (0 is no limit) }
+    property MaxEntrySize: Integer read FLimit write FLimit;
+  end;
+
+  TZipWriter = class
+  private
+    FBody: string;
+    FDir: string;
+    FCount: Integer;
+    FComment: string;
+    FDosTime: Integer;
+    FDosDate: Integer;
+    FLevel: Integer;
+    procedure Put(const E: TZipEntry; const Comp: string);
+  public
+    constructor Create;
+    { an entry, deflated at Level, or stored when that is not smaller;
+      its time is the writer's }
+    procedure Add(const AName, AData: string);
+    { an entry as it is in another archive: E from its directory, Comp
+      what TZipReader.Raw gave }
+    procedure AddRaw(const E: TZipEntry; const Comp: string);
+    { an entry of another archive with new bytes: its name, times, flags
+      (but for the data descriptor and the deflate level bits), attributes
+      and extra fields as E has them, the data deflated at Level or stored }
+    procedure Replace(const E: TZipEntry; const AData: string);
+    { the archive }
+    function Finish: string;
+    property Comment: string read FComment write FComment;
+    { deflate level of Add, 0 to 9 (6) }
+    property Level: Integer read FLevel write FLevel;
+    { the time of the entries Add makes, as the MS-DOS words (the default
+      is 1980-01-01 00:00:00, so that an archive is the same each time) }
+    property DosTime: Integer read FDosTime write FDosTime;
+    property DosDate: Integer read FDosDate write FDosDate;
+  end;
+
+{ unix seconds (UTC) as the MS-DOS date and time words; the years 1980 to
+  2107 only }
+procedure ZipDosFromUnix(Secs: Integer; out ADate, ATime: Integer);
+{ the MS-DOS words as unix seconds, read as UTC as Go does }
+function ZipUnixFromDos(ADate, ATime: Integer): Integer;
+{ whether an entry's name stays inside a directory it is extracted to:
+  not absolute, no .. part, no NUL, no backslash drive }
+function ZipNameIsSafe(const AName: string): Boolean;
+
+implementation
+
+const
+  SigLocal = $04034B50;
+  SigDir = $02014B50;
+  SigEnd = $06054B50;
+  SigEnd64Loc = $07064B50;
+
+constructor EZipError.CreateAt(AOffset: Integer; const AReason: string);
+begin
+  if AOffset >= 0 then
+    inherited Create('zip: ' + AReason + ' at byte ' + IntToStr(AOffset))
+  else
+    inherited Create('zip: ' + AReason);
+  Offset := AOffset;
+end;
+
+{ ---- dates ---- }
+
+{ days from 1970-01-01 to the civil date, after Howard Hinnant's
+  days_from_civil }
+function DaysFromCivil(Y, M, D: Integer): Integer;
+var
+  era, yoe, doy, doe: Integer;
+begin
+  if M <= 2 then
+    Y := Y - 1;
+  if Y >= 0 then
+    era := Y div 400
+  else
+    era := (Y - 399) div 400;
+  yoe := Y - era * 400;
+  if M > 2 then
+    doy := (153 * (M - 3) + 2) div 5 + D - 1
+  else
+    doy := (153 * (M + 9) + 2) div 5 + D - 1;
+  doe := yoe * 365 + yoe div 4 - yoe div 100 + doy;
+  Result := era * 146097 + doe - 719468;
+end;
+
+procedure CivilFromDays(Z: Integer; out Y, M, D: Integer);
+var
+  era, doe, yoe, doy, mp: Integer;
+begin
+  Z := Z + 719468;
+  if Z >= 0 then
+    era := Z div 146097
+  else
+    era := (Z - 146096) div 146097;
+  doe := Z - era * 146097;
+  yoe := (doe - doe div 1460 + doe div 36524 - doe div 146096) div 365;
+  Y := yoe + era * 400;
+  doy := doe - (365 * yoe + yoe div 4 - yoe div 100);
+  mp := (5 * doy + 2) div 153;
+  D := doy - (153 * mp + 2) div 5 + 1;
+  if mp < 10 then
+    M := mp + 3
+  else
+    M := mp - 9;
+  if M <= 2 then
+    Y := Y + 1;
+end;
+
+procedure ZipDosFromUnix(Secs: Integer; out ADate, ATime: Integer);
+var
+  days, rest, y, m, d: Integer;
+begin
+  if Secs < 315532800 then
+    Secs := 315532800;
+  days := Secs div 86400;
+  rest := Secs mod 86400;
+  CivilFromDays(days, y, m, d);
+  if y > 2107 then
+  begin
+    y := 2107;
+    m := 12;
+    d := 31;
+    rest := 86398;
+  end;
+  ADate := ((y - 1980) shl 9) or (m shl 5) or d;
+  ATime := ((rest div 3600) shl 11) or (((rest mod 3600) div 60) shl 5) or ((rest mod 60) div 2);
+end;
+
+function ZipUnixFromDos(ADate, ATime: Integer): Integer;
+var
+  y, m, d: Integer;
+begin
+  y := (ADate shr 9) + 1980;
+  m := (ADate shr 5) and 15;
+  d := ADate and 31;
+  if m < 1 then
+    m := 1;
+  if m > 12 then
+    m := 12;
+  if d < 1 then
+    d := 1;
+  Result := DaysFromCivil(y, m, d) * 86400 + (ATime shr 11) * 3600 + ((ATime shr 5) and 63) * 60 + (ATime and 31) * 2;
+end;
+
+function ZipNameIsSafe(const AName: string): Boolean;
+var
+  i, start: Integer;
+  part: string;
+begin
+  Result := False;
+  if (AName = '') or (AName[1] = '/') or (AName[1] = '\') then
+    Exit;
+  if (Length(AName) >= 2) and (AName[2] = ':') then
+    Exit;
+  start := 1;
+  for i := 1 to Length(AName) + 1 do
+    if (i > Length(AName)) or (AName[i] = '/') or (AName[i] = '\') then
+    begin
+      part := Copy(AName, start, i - start);
+      if part = '..' then
+        Exit;
+      start := i + 1;
+    end;
+  for i := 1 to Length(AName) do
+    if AName[i] = #0 then
+      Exit;
+  Result := True;
+end;
+
+function ValidUtf8(const S: string): Boolean;
+var
+  i, n, c: Integer;
+begin
+  Result := True;
+  i := 1;
+  while i <= Length(S) do
+  begin
+    c := Ord(S[i]);
+    if c < 128 then
+      n := 0
+    else if (c >= 194) and (c <= 223) then
+      n := 1
+    else if (c >= 224) and (c <= 239) then
+      n := 2
+    else if (c >= 240) and (c <= 244) then
+      n := 3
+    else
+    begin
+      Result := False;
+      Exit;
+    end;
+    if i + n > Length(S) then
+    begin
+      Result := False;
+      Exit;
+    end;
+    while n > 0 do
+    begin
+      i := i + 1;
+      if (Ord(S[i]) and 192) <> 128 then
+      begin
+        Result := False;
+        Exit;
+      end;
+      n := n - 1;
+    end;
+    i := i + 1;
+  end;
+end;
+
+function HasHighByte(const S: string): Boolean;
+var
+  i: Integer;
+begin
+  Result := False;
+  for i := 1 to Length(S) do
+    if Ord(S[i]) >= 128 then
+    begin
+      Result := True;
+      Exit;
+    end;
+end;
+
+{ ---- the reader ---- }
+
+function TZipReader.U16(At: Integer): Integer;
+begin
+  Result := Ord(FData[At + 1]) or (Ord(FData[At + 2]) shl 8);
+end;
+
+function TZipReader.U32(At: Integer): Integer;
+begin
+  Result := Ord(FData[At + 1]) or (Ord(FData[At + 2]) shl 8) or (Ord(FData[At + 3]) shl 16) or (Ord(FData[At + 4]) shl 24);
+end;
+
+procedure TZipReader.Fail(At: Integer; const Why: string);
+begin
+  raise EZipError.CreateAt(At, Why);
+end;
+
+constructor TZipReader.Create(const AData: string);
+var
+  n, i, endAt, lo, nEnt, dirSize, dirOffset, commentLen, p, nameLen, extraLen, cmtLen, k, localAt: Integer;
+  found: Boolean;
+begin
+  inherited Create;
+  FData := AData;
+  n := Length(FData);
+  if n < 22 then
+    Fail(-1, 'the data is too short to be an archive');
+  { the end of central directory record: the last 22 bytes, or before a
+    comment of up to 65535 }
+  lo := n - 22 - 65535;
+  if lo < 0 then
+    lo := 0;
+  endAt := -1;
+  found := False;
+  i := n - 22;
+  while i >= lo do
+  begin
+    if (U32(i) = SigEnd) then
+    begin
+      commentLen := U16(i + 20);
+      if i + 22 + commentLen <= n then
+      begin
+        endAt := i;
+        found := True;
+        Break;
+      end;
+    end;
+    i := i - 1;
+  end;
+  if not found then
+    Fail(-1, 'no end of central directory record (not a zip archive)');
+  nEnt := U16(endAt + 10);
+  dirSize := U32(endAt + 12);
+  dirOffset := U32(endAt + 16);
+  commentLen := U16(endAt + 20);
+  FComment := Copy(FData, endAt + 23, commentLen);
+  if (endAt >= 20) and (U32(endAt - 20) = SigEnd64Loc) then
+    Fail(endAt - 20, 'zip64 archives are not supported');
+  if (nEnt = $FFFF) or (dirSize = $FFFFFFFF) or (dirOffset = $FFFFFFFF) then
+    Fail(endAt, 'zip64 archives are not supported');
+  if dirSize > endAt then
+    Fail(endAt, 'the central directory is larger than the archive');
+  { data in front of the archive moves everything by the same amount }
+  FBase := endAt - dirSize - dirOffset;
+  if FBase < 0 then
+    Fail(endAt, 'the central directory offset is past the end of the archive');
+  p := FBase + dirOffset;
+  SetLength(FEntries, nEnt);
+  for i := 0 to nEnt - 1 do
+  begin
+    if p + 46 > endAt then
+      Fail(p, 'the central directory ends inside an entry');
+    if U32(p) <> SigDir then
+      Fail(p, 'bad signature in the central directory');
+    FEntries[i].VersionMade := U16(p + 4);
+    FEntries[i].VersionNeeded := U16(p + 6);
+    FEntries[i].Flags := U16(p + 8);
+    FEntries[i].Method := U16(p + 10);
+    FEntries[i].DosTime := U16(p + 12);
+    FEntries[i].DosDate := U16(p + 14);
+    FEntries[i].Crc := U32(p + 16);
+    FEntries[i].CompSize := U32(p + 20);
+    FEntries[i].Size := U32(p + 24);
+    nameLen := U16(p + 28);
+    extraLen := U16(p + 30);
+    cmtLen := U16(p + 32);
+    FEntries[i].ExternalAttr := U32(p + 38);
+    localAt := U32(p + 42);
+    if (FEntries[i].CompSize = $FFFFFFFF) or (FEntries[i].Size = $FFFFFFFF) or (localAt = $FFFFFFFF) then
+      Fail(p, 'zip64 archives are not supported');
+    FEntries[i].HeaderOffset := localAt;
+    if p + 46 + nameLen + extraLen + cmtLen > endAt then
+      Fail(p, 'the central directory ends inside an entry');
+    FEntries[i].Name := Copy(FData, p + 47, nameLen);
+    FEntries[i].Extra := Copy(FData, p + 47 + nameLen, extraLen);
+    FEntries[i].Comment := Copy(FData, p + 47 + nameLen + extraLen, cmtLen);
+    p := p + 46 + nameLen + extraLen + cmtLen;
+    { the local header's extra field, which may differ from the directory's }
+    k := FBase + localAt;
+    if (k >= 0) and (k + 30 <= n) and (U32(k) = SigLocal) then
+    begin
+      if k + 30 + U16(k + 26) + U16(k + 28) <= n then
+        FEntries[i].LocalExtra := Copy(FData, k + 31 + U16(k + 26), U16(k + 28));
+    end;
+  end;
+end;
+
+function TZipReader.Count: Integer;
+begin
+  Result := Length(FEntries);
+end;
+
+function TZipReader.Entry(I: Integer): TZipEntry;
+begin
+  if (I < 0) or (I >= Length(FEntries)) then
+    raise EZipError.CreateAt(-1, 'no entry ' + IntToStr(I));
+  Result := FEntries[I];
+end;
+
+function TZipReader.Find(const AName: string): Integer;
+var
+  i: Integer;
+begin
+  Result := -1;
+  for i := 0 to Length(FEntries) - 1 do
+    if FEntries[i].Name = AName then
+    begin
+      Result := i;
+      Exit;
+    end;
+end;
+
+function TZipReader.IsDir(I: Integer): Boolean;
+begin
+  Result := (Length(FEntries[I].Name) > 0) and (FEntries[I].Name[Length(FEntries[I].Name)] = '/');
+end;
+
+{ where the entry's data starts: after its local header }
+function TZipReader.BodyStart(I: Integer): Integer;
+var
+  k: Integer;
+begin
+  k := FBase + FEntries[I].HeaderOffset;
+  if (k < 0) or (k + 30 > Length(FData)) then
+    Fail(k, 'the local header of "' + FEntries[I].Name + '" is outside the archive');
+  if U32(k) <> SigLocal then
+    Fail(k, 'bad signature in the local header of "' + FEntries[I].Name + '"');
+  Result := k + 30 + U16(k + 26) + U16(k + 28);
+end;
+
+function TZipReader.Raw(I: Integer): string;
+var
+  at: Integer;
+begin
+  if (I < 0) or (I >= Length(FEntries)) then
+    raise EZipError.CreateAt(-1, 'no entry ' + IntToStr(I));
+  at := BodyStart(I);
+  if at + FEntries[I].CompSize > Length(FData) then
+    Fail(at, 'the data of "' + FEntries[I].Name + '" goes past the end of the archive');
+  Result := Copy(FData, at + 1, FEntries[I].CompSize);
+end;
+
+function TZipReader.Extract(I: Integer): string;
+var
+  e: TZipEntry;
+  comp: string;
+  z: TInflater;
+begin
+  e := Entry(I);
+  if (e.Flags and 1) <> 0 then
+    Fail(-1, '"' + e.Name + '" is encrypted, which is not supported');
+  if (e.Method <> 0) and (e.Method <> 8) then
+    Fail(-1, '"' + e.Name + '" uses compression method ' + IntToStr(e.Method) + ', which is not supported');
+  if (FLimit > 0) and (e.Size > FLimit) then
+    Fail(-1, '"' + e.Name + '" is larger than the limit');
+  comp := Raw(I);
+  if e.Method = 0 then
+  begin
+    if e.CompSize <> e.Size then
+      Fail(-1, '"' + e.Name + '" is stored but its two sizes differ');
+    Result := comp;
+  end
+  else
+  begin
+    z := TInflater.Create(flRaw);
+    if e.Size > 0 then
+      z.MaxOutput := e.Size
+    else
+      z.MaxOutput := 1;
+    try
+      z.Feed(comp);
+      Result := z.Finish;
+    except
+      on E1: EFlateError do
+        Fail(-1, '"' + e.Name + '": ' + E1.Message);
+    end;
+  end;
+  if Length(Result) <> e.Size then
+    Fail(-1, '"' + e.Name + '" is ' + IntToStr(Length(Result)) + ' bytes, not the ' + IntToStr(e.Size) + ' its directory says');
+  if Crc32(Result) <> e.Crc then
+    Fail(-1, 'the checksum of "' + e.Name + '" does not match');
+end;
+
+{ ---- the writer ---- }
+
+constructor TZipWriter.Create;
+begin
+  inherited Create;
+  FLevel := 6;
+  FDosDate := 33;
+  FDosTime := 0;
+end;
+
+procedure PutLe16(var S: string; V: Integer);
+begin
+  S := S + Chr(V and 255) + Chr((V shr 8) and 255);
+end;
+
+procedure PutLe32(var S: string; V: Integer);
+begin
+  S := S + Chr(V and 255) + Chr((V shr 8) and 255) + Chr((V shr 16) and 255) + Chr((V shr 24) and 255);
+end;
+
+{ the entry's local header and data go in the body, its record in the
+  directory }
+procedure TZipWriter.Put(const E: TZipEntry; const Comp: string);
+var
+  flags, at: Integer;
+begin
+  if (FCount >= 65534) or (Length(FBody) + Length(Comp) > $7FFFFFF0) then
+    raise EZipError.CreateAt(-1, 'too many or too large entries (zip64 is not supported)');
+  if Length(E.Name) > 65535 then
+    raise EZipError.CreateAt(-1, 'a name longer than 65535 bytes');
+  { no data descriptor follows: the sizes are in the header }
+  flags := E.Flags and (not 8);
+  at := Length(FBody);
+  PutLe32(FBody, SigLocal);
+  PutLe16(FBody, E.VersionNeeded);
+  PutLe16(FBody, flags);
+  PutLe16(FBody, E.Method);
+  PutLe16(FBody, E.DosTime);
+  PutLe16(FBody, E.DosDate);
+  PutLe32(FBody, E.Crc);
+  PutLe32(FBody, E.CompSize);
+  PutLe32(FBody, E.Size);
+  PutLe16(FBody, Length(E.Name));
+  PutLe16(FBody, Length(E.LocalExtra));
+  FBody := FBody + E.Name + E.LocalExtra + Comp;
+  PutLe32(FDir, SigDir);
+  PutLe16(FDir, E.VersionMade);
+  PutLe16(FDir, E.VersionNeeded);
+  PutLe16(FDir, flags);
+  PutLe16(FDir, E.Method);
+  PutLe16(FDir, E.DosTime);
+  PutLe16(FDir, E.DosDate);
+  PutLe32(FDir, E.Crc);
+  PutLe32(FDir, E.CompSize);
+  PutLe32(FDir, E.Size);
+  PutLe16(FDir, Length(E.Name));
+  PutLe16(FDir, Length(E.Extra));
+  PutLe16(FDir, Length(E.Comment));
+  PutLe16(FDir, 0);
+  PutLe16(FDir, 0);
+  PutLe32(FDir, E.ExternalAttr);
+  PutLe32(FDir, at);
+  FDir := FDir + E.Name + E.Extra + E.Comment;
+  FCount := FCount + 1;
+end;
+
+procedure TZipWriter.Add(const AName, AData: string);
+var
+  e: TZipEntry;
+  comp: string;
+begin
+  e.Name := AName;
+  e.Comment := '';
+  e.Extra := '';
+  e.LocalExtra := '';
+  e.VersionMade := 20;
+  e.ExternalAttr := 0;
+  e.Flags := 0;
+  if HasHighByte(AName) and ValidUtf8(AName) then
+    e.Flags := $800;
+  e.DosTime := FDosTime;
+  e.DosDate := FDosDate;
+  e.Crc := Crc32(AData);
+  e.Size := Length(AData);
+  e.Method := 0;
+  e.VersionNeeded := 10;
+  comp := AData;
+  if (FLevel > 0) and (Length(AData) > 0) then
+  begin
+    comp := FlateDeflate(AData, FLevel);
+    if Length(comp) < Length(AData) then
+    begin
+      e.Method := 8;
+      e.VersionNeeded := 20;
+    end
+    else
+      comp := AData;
+  end;
+  e.CompSize := Length(comp);
+  Put(e, comp);
+end;
+
+procedure TZipWriter.AddRaw(const E: TZipEntry; const Comp: string);
+begin
+  if Length(Comp) <> E.CompSize then
+    raise EZipError.CreateAt(-1, 'the compressed bytes of "' + E.Name + '" are not the ' + IntToStr(E.CompSize) + ' its record says');
+  Put(E, Comp);
+end;
+
+procedure TZipWriter.Replace(const E: TZipEntry; const AData: string);
+var
+  n: TZipEntry;
+  comp: string;
+begin
+  n := E;
+  n.Crc := Crc32(AData);
+  n.Size := Length(AData);
+  n.Method := 0;
+  n.VersionNeeded := 10;
+  comp := AData;
+  if (FLevel > 0) and (Length(AData) > 0) then
+  begin
+    comp := FlateDeflate(AData, FLevel);
+    if Length(comp) < Length(AData) then
+    begin
+      n.Method := 8;
+      n.VersionNeeded := 20;
+    end
+    else
+      comp := AData;
+  end;
+  n.CompSize := Length(comp);
+  { bits 1 and 2 say how hard the deflate worked, bit 3 that a descriptor follows }
+  n.Flags := n.Flags and (not 14);
+  Put(n, comp);
+end;
+
+function TZipWriter.Finish: string;
+var
+  tail: string;
+begin
+  tail := '';
+  PutLe32(tail, SigEnd);
+  PutLe16(tail, 0);
+  PutLe16(tail, 0);
+  PutLe16(tail, FCount);
+  PutLe16(tail, FCount);
+  PutLe32(tail, Length(FDir));
+  PutLe32(tail, Length(FBody));
+  PutLe16(tail, Length(FComment));
+  Result := FBody + FDir + tail + FComment;
+end;
+
+end.
