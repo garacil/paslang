@@ -604,6 +604,9 @@ GOLDEN_A64 += xlsxsst
 # P432: URLs and HTTP messages against Go, and the HTTP client over loopback.
 GOLDEN += url httpmsg httpcli
 GOLDEN_A64 += url httpmsg httpcli
+# P453: a head fed a byte at a time costs time linear in its size.
+GOLDEN += httpslow
+GOLDEN_A64 += httpslow
 # P433: mail against Go (mime, net/mail, net/smtp) and Python (email), SMTP and IMAP over loopback.
 GOLDEN += mime mailtree mailbuild mailscale mailtls smtp imap
 GOLDEN_A64 += mime mailtree mailbuild mailscale mailtls smtp imap
