@@ -12006,6 +12006,103 @@ Out := b.Save;                           { the workbook as an archive }
   done; a cell's rich text cannot be written (inline strings are plain).
 - **Routines.** A book belongs to the routine that edits it.
 
+`uses httpclient` is an HTTP/1.1 client, and `pasconn`, `pastextproto`, `pashttp`
+and `pasurl` are what it is made of (1.1.266, P432): `pasconn` is the connection as an object
+(`TNetStream`: `ReadSome` and `WriteAll` with a deadline, TCP or a Unix socket,
+`DialTcp`, `DialUnix`, `ReadLineFrom`), `pasurl` reads and writes URLs as Go's `net/url`
+does, `pastextproto` reads header blocks as `net/textproto` does (`TMimeFields`,
+`MimeReadHeader`; mail uses it too), `pashttp` reads HTTP/1.1 messages as `net/http` and `net/textproto` do,
+and `httpclient` sends a request and reads the answer a piece at a time. They
+are written for a service that calls other services (the portal calls a JSON
+API over HTTPS and fetches files); the connection is TCP, or a Unix socket,
+and a TLS unit gives `https` (`TlsDialer` of `pasconn`, and `TlsUpgrader` for STARTTLS, which the IMAP and
+SMTP clients will use too; until there is one an `https` address is refused
+with a clear error). Each is checked against Go:
+`testdata/url` runs 1,232 strings (RFC 3986's examples, Go's own cases, and
+the same with a character put in, changed or taken out) through `Parse`,
+`ParseRequestURI`, three `ResolveReference`s and `ParseQuery`, with Go's
+answer and its error texts; `testdata/httpmsg` reads 2,492 requests and
+responses (every framing, each cut short and with a byte changed) whole and
+in pieces of 1, 2, 3 and 7 bytes, and gets what `ReadRequest`, `ReadResponse`
+and the body read to its end get; `testdata/httpcli` runs the client against
+the project's own server and a scripted one, and
+`scripts/http_client_go.sh` runs the same checks against Go's `net/http` and
+diffs what is printed.
+
+```pascal
+c := THttpClient.Create;
+c.TimeoutMs := 30000;                         { the whole exchange; also ConnectTimeoutMs, ReadTimeoutMs, HeaderTimeoutMs }
+f := THttpFields.Create;
+f.Add('Authorization', 'Bearer ' + Key);  f.Add('Content-Type', 'application/json');
+r := c.Perform('POST', 'http://127.0.0.1:8080/v1/chat', f, Body);
+if r.Status = 200 then j := JsonParse(r.ReadAll(1 shl 20));   { EHttpClientError past the limit }
+while r.ReadChunk(piece) do ...               { or the body as it arrives: an event stream }
+r.Dispose;                                    { not needed after the body was read to its end }
+u: TUrl;  UrlParse('http://u:p@h:81/a%20b?q=1#f', u, err);  UrlString(u);  UrlResolve(base, ref);
+```
+- **The client.** `Get`, `Head`, `Post(url, type, body)` and `Perform(method,
+  url, fields, body)` give a `THttpClientResponse` once the head is read:
+  `Status`, `StatusLine`, `Proto`, `Fields`, `Url` (after redirects),
+  `Redirects`, `ContentLength` (-1 when unknown or decoded), `Uncompressed`,
+  and the body by `ReadChunk` (a piece when there is one, False at the end)
+  or `ReadAll(max)`; `Trailers` once the body is read. The request is
+  written as Go's `Request.Write` writes it: the request line, `Host`,
+  `User-Agent`, `Content-Length` (also 0 for POST, PUT and PATCH), the other
+  fields in name order, then `Accept-Encoding: gzip` (a gzip body is decoded
+  while it is read, as the transport does, and `Content-Encoding` and
+  `Content-Length` go; `DisableCompression` leaves it) and `Connection:
+  close` when `DisableKeepAlives`. Connections are kept (`MaxIdle` 4,
+  `IdleTimeoutMs` 90 s) and used again; a request that finds the kept
+  connection closed by the server and got no byte back is made again on a
+  new one when it is safe (GET, HEAD, OPTIONS, TRACE, or no body and not
+  POST or PATCH). 1xx answers but 101 are passed over. Redirects (301, 302
+  and 303 become GET without the body, 307 and 308 keep both; `Location`
+  resolved against the URL; at most `MaxRedirects`, 10) are followed unless
+  `FollowRedirects` is off; `Authorization`, `Www-Authenticate`, `Cookie` and
+  `Cookie2` are dropped when the host is not the old one or a subdomain of
+  it; `Referer` is set unless it goes from https to http. `UnixPath` sends
+  every request to a Unix socket.
+- **Limits and deadlines.** Every wait has a deadline and every size a limit:
+  `TimeoutMs` (the whole exchange, body included), `ConnectTimeoutMs`
+  (30 s; the name's resolution inside it), `HeaderTimeoutMs`, `ReadTimeoutMs`
+  (each wait for bytes), `MaxHeaderBytes` (10 MiB, as Go's transport),
+  `MaxBodyBytes`. A routine that waits parks. `EHttpClientError` has `Kind`
+  (`ceUrl`, `ceDial`, `ceTimeout`, `ceProtocol`, `ceClosed`, `ceTooLarge`,
+  `ceRedirects`, `ceTls`) and `Timeout`.
+- **Messages.** `THttpMessageReader.Create(IsRequest, ReqMethod)` is fed with
+  `Feed` and says `State` (`msHead`, `msBody`, `msDone`), `Head` (a
+  `THttpHead`: method, target, `Url`, `Host`, proto and version, `Status`,
+  `StatusLine`, `Fields`, `ConnClose`, `Chunked`, `ContentLength`,
+  `BodyKind`), the decoded body by `TakeBody`, `Trailers`, `Unused` and
+  `AtEof`. It does no I/O, so a server can use it as the client does. The
+  rules are `net/http`'s: the header lines of `textproto.ReadMIMEHeader`
+  (continuation lines, the colon, the bytes a name and a value may hold, the
+  key made canonical), `Transfer-Encoding` chunked on HTTP/1.1 only, one
+  `Content-Length` (several that agree are one), no body for HEAD, 1xx, 204
+  and 304, until the connection closes for a response with neither, chunk
+  extensions and a trailer, the HTTP/2 preface read as `net/http` reads it;
+  the error texts are Go's, and `MaxHeaderBytes` and `MaxHeaders` make an
+  `EHttpMsgError` with `TooLarge`. `THttpFields` keeps the lines in their
+  order (`Add`, `Put`, `Get`, `ValuesOf`, `Has`, `HasToken`, `Remove`).
+  `HttpChunk`, `HttpLastChunk`, `HttpRequestLine` and `HttpStatusLine` write.
+- **URLs.** `UrlParse` and `UrlParseRequestURI` give a `TUrl` (scheme, opaque,
+  user and password, host with its port, path decoded with `RawPath` when its
+  spelling is not the canonical one, query, fragment), `UrlString`,
+  `UrlRequestURI`, `UrlEscapedPath`, `UrlHostname`, `UrlPort`,
+  `UrlResolve(base, ref)` and `UrlParseRef(base, text)`; the errors are
+  Go's (`parse "x": reason`), the IPv6 literal checked as `netip.ParseAddr`
+  checks it. `UrlEscape(s, mode)` and `UrlUnescape(s, mode, r, err)` with the
+  seven modes of Go's `shouldEscape`; `TUrlValues` and `UrlParseQuery` are
+  `url.Values` and `ParseQuery` (`Encode` sorts the keys). `pascodec` has
+  `UrlQueryEscape` and `UrlPathEscape` for whole strings.
+- **Left out.** Proxies, cookies (`Cookie` is a field the program sets),
+  authentication beyond `HttpBasicAuth`, HTTP/2, `Expect: 100-continue` and
+  a request body that is not a string. `httpserver` still reads requests
+  with its own code (P450 moves it onto `pashttp`).
+- **Routines.** A client may be used by any number of routines (its pool is
+  guarded); a response, a reader and a `TUrlValues` belong to the routine
+  that uses them.
+
 `uses sqlite` gives SQLite 3.54.1 in paslang: the library itself, written
 from SQLite's own file format, documents and sources (P403 the file,
 P404 the SQL, 1.1.253 P405 the rest). It is a library unit, as `pasnet`

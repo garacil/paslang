@@ -1,0 +1,856 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+
+  paslang is free software: you can redistribute it and/or modify it
+  under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+
+  paslang is distributed in the hope that it will be useful, but
+  WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+  General Public License for more details.
+
+  Under Section 7 of GPL version 3, you are granted additional
+  permissions described in the paslang Runtime Library Exception,
+  version 1.0, in the file COPYING.RUNTIME.
+
+  You should have received a copy of the GNU General Public License
+  along with paslang.  If not, see <https://www.gnu.org/licenses/>. }
+
+{ An HTTP/1.1 client (P432), as Go's net/http Client and Transport do it,
+  over pashttp's reader: a request written as Request.Write writes it
+  (Host, User-Agent, Content-Length, the fields sorted, then the
+  Accept-Encoding and Connection the transport adds), the response read a
+  piece at a time so a body of any size, or a stream of events, is read in
+  memory that does not grow with it; connections kept alive and used again
+  (a request on a connection the server had closed is made again on a new
+  one when it is safe to); redirects followed as Client.CheckRedirect's
+  default does (301, 302 and 303 become GET, 307 and 308 keep the method
+  and the body, at most ten, the fields that name the user dropped when the
+  host changes); a gzip body decoded as the transport decodes it. A
+  routine that waits for the server parks; every wait has a deadline (the
+  whole exchange, a connection, a read) and every size a limit. An https
+  address needs a TLS dialer, which the TLS unit sets (pasconn's TlsDialer); until
+  then it is refused with a clear error. Free of state but the connection
+  pool of each client, which a mutex guards (Regla 11). }
+unit httpclient;
+
+interface
+
+uses
+  sysutils, pasnet, pasconn, pasurl, pashttp, pasflate;
+
+type
+  { what went wrong: Kind says which of them, Timeout that a deadline passed }
+  EHttpClientError = class(Exception)
+  public
+    Kind: Integer;
+    Timeout: Boolean;
+    constructor CreateKind(AKind: Integer; const AMessage: string);
+  end;
+
+const
+  ceUrl = 1;
+  ceDial = 2;
+  ceTimeout = 3;
+  ceProtocol = 4;
+  ceClosed = 5;
+  ceTooLarge = 6;
+  ceRedirects = 7;
+  ceTls = 8;
+
+type
+  THttpClient = class;
+
+  THttpClientResponse = class
+  private
+    FClient: THttpClient;
+    FStream: TNetStream;
+    FReader: THttpMessageReader;
+    FInfl: TInflater;
+    FKey: string;
+    FDeadline: Integer;
+    FReadMs: Integer;
+    FMaxBody: Int64;
+    FRead: Int64;
+    FDone: Boolean;
+    FReleased: Boolean;
+    FKeep: Boolean;
+    function Pull: Boolean;
+    procedure Finish;
+  public
+    Status: Integer;
+    { the status line after the version: 200 OK }
+    StatusLine: string;
+    Proto: string;
+    Fields: THttpFields;
+    Trailers: THttpFields;
+    { where the response came from, after redirects }
+    Url: TUrl;
+    Redirects: Integer;
+    { the length the server said, -1 when unknown or when the body was
+      decoded }
+    ContentLength: Int64;
+    { the body was gzip and was decoded }
+    Uncompressed: Boolean;
+    { the body that follows, a piece at a time: False at its end }
+    function ReadChunk(out Piece: string): Boolean;
+    { the whole body, EHttpClientError if it is longer than MaxBytes (0
+      for the client's limit) }
+    function ReadAll(MaxBytes: Int64): string;
+    { gives the connection back to the pool if the body was read to its end
+      and the server keeps it, else closes it }
+    procedure Dispose;
+  end;
+
+  THttpClient = class
+  private
+    FMu: mutex;
+    FIdleKeys: array of string;
+    FIdleStreams: array of TNetStream;
+    FIdleSince: array of Int64;
+    function TakeIdle(const Key: string): TNetStream;
+    procedure PutIdle(const Key: string; S: TNetStream);
+    function Connect(const U: TUrl; Deadline: Integer): TNetStream;
+    function Exchange(const Method: string; const U: TUrl; Fields: THttpFields; const Body: string;
+      Deadline: Integer; Redirects: Integer): THttpClientResponse;
+    procedure Release(const Key: string; S: TNetStream; Keep: Boolean);
+  public
+    { the whole exchange (0 is no limit), a connection, one wait for bytes,
+      the response's head }
+    TimeoutMs: Integer;
+    ConnectTimeoutMs: Integer;
+    ReadTimeoutMs: Integer;
+    HeaderTimeoutMs: Integer;
+    MaxRedirects: Integer;
+    FollowRedirects: Boolean;
+    UserAgent: string;
+    { Accept-Encoding: gzip is not sent and a gzip body is left as it is }
+    DisableCompression: Boolean;
+    { a connection is not kept after its response }
+    DisableKeepAlives: Boolean;
+    MaxIdle: Integer;
+    IdleTimeoutMs: Integer;
+    { the response head and body limits (the head 10 MiB as Go's transport,
+      the body 0 for none) }
+    MaxHeaderBytes: Integer;
+    MaxBodyBytes: Int64;
+    { every request goes to this Unix socket, whatever its host }
+    UnixPath: string;
+    constructor Create;
+    function Perform(const Method, Url: string; Fields: THttpFields; const Body: string): THttpClientResponse;
+    { Perform and the body read to its end }
+    function Get(const Url: string): THttpClientResponse;
+    function Head(const Url: string): THttpClientResponse;
+    function Post(const Url, ContentType, Body: string): THttpClientResponse;
+    { drops the idle connections }
+    procedure CloseIdle;
+  end;
+
+{ Authorization: Basic ... for a user and a password }
+function HttpBasicAuth(const User, Password: string): string;
+
+implementation
+
+uses
+  pascodec;
+
+const
+  KeepAliveMax = 1000000;
+
+{ what an errno of a socket says, in Go's words for the usual ones }
+function ErrnoText(E: Integer): string;
+begin
+  case E of
+    104: Result := 'connection reset by peer';
+    32: Result := 'broken pipe';
+    110: Result := 'connection timed out';
+    111: Result := 'connection refused';
+    113: Result := 'no route to host';
+  else
+    Result := 'errno ' + IntToStr(E);
+  end;
+end;
+
+constructor EHttpClientError.CreateKind(AKind: Integer; const AMessage: string);
+begin
+  inherited Create(AMessage);
+  Kind := AKind;
+  Timeout := AKind = ceTimeout;
+end;
+
+function HttpBasicAuth(const User, Password: string): string;
+begin
+  Result := 'Basic ' + Base64Encode(User + ':' + Password, False, True);
+end;
+
+{ ---- the response ---- }
+
+{ more of the body from the stream into the reader; False when the stream
+  ended }
+function THttpClientResponse.Pull: Boolean;
+var
+  data: string;
+  n, dl: Integer;
+begin
+  Result := True;
+  dl := FDeadline;
+  if FReadMs > 0 then
+    if (dl = 0) or (PasIoDeadline(FReadMs) < dl) then
+      dl := PasIoDeadline(FReadMs);
+  n := FStream.ReadSome(16384, dl, data);
+  if n > 0 then
+  begin
+    FReader.Feed(data);
+    Exit;
+  end;
+  if n = 0 then
+  begin
+    Result := False;
+    try
+      FReader.AtEof;
+    except
+      on E: EHttpMsgError do
+      begin
+        FStream.Dispose;
+        FReleased := True;
+        raise EHttpClientError.CreateKind(ceProtocol, 'http: ' + E.Message);
+      end;
+    end;
+    Exit;
+  end;
+  FStream.Dispose;
+  FReleased := True;
+  if n = -110 then
+    raise EHttpClientError.CreateKind(ceTimeout, 'http: timeout awaiting the response body')
+  else
+    raise EHttpClientError.CreateKind(ceClosed, 'http: read: ' + ErrnoText(-n));
+end;
+
+procedure THttpClientResponse.Finish;
+begin
+  if FReleased then
+    Exit;
+  FDone := True;
+  FReleased := True;
+  FKeep := (FReader.State = msDone) and (not FReader.Head.ConnClose) and (FReader.Pending = 0);
+  if FClient <> nil then
+    FClient.Release(FKey, FStream, FKeep)
+  else
+    FStream.Dispose;
+  Trailers := FReader.Trailers;
+end;
+
+function THttpClientResponse.ReadChunk(out Piece: string): Boolean;
+var
+  data: string;
+begin
+  Piece := '';
+  Result := False;
+  while True do
+  begin
+    if FReleased and (FReader.State <> msDone) and (FReader.State <> msBody) then
+      Exit;
+    data := FReader.TakeBody;
+    if data <> '' then
+    begin
+      FRead := FRead + Length(data);
+      if (FMaxBody > 0) and (FRead > FMaxBody) then
+      begin
+        FStream.Dispose;
+        FReleased := True;
+        raise EHttpClientError.CreateKind(ceTooLarge, 'http: response body is larger than the limit');
+      end;
+      if FInfl <> nil then
+      begin
+        try
+          FInfl.Feed(data);
+        except
+          on E: EFlateError do
+          begin
+            FStream.Dispose;
+            FReleased := True;
+            raise EHttpClientError.CreateKind(ceProtocol, 'http: bad gzip body: ' + E.Message);
+          end;
+        end;
+        Piece := FInfl.Take;
+        if Piece = '' then
+          Continue;
+      end
+      else
+        Piece := data;
+      Result := True;
+      Exit;
+    end;
+    if FReader.State = msDone then
+    begin
+      if FInfl <> nil then
+      begin
+        try
+          Piece := FInfl.Finish;
+        except
+          on E: EFlateError do
+          begin
+            FStream.Dispose;
+            FReleased := True;
+            raise EHttpClientError.CreateKind(ceProtocol, 'http: bad gzip body: ' + E.Message);
+          end;
+        end;
+        FInfl := nil;
+        if Piece <> '' then
+        begin
+          Result := True;
+          Finish;
+          Exit;
+        end;
+      end;
+      Finish;
+      Exit;
+    end;
+    if FReleased then
+      Exit;
+    Pull;
+  end;
+end;
+
+function THttpClientResponse.ReadAll(MaxBytes: Int64): string;
+var
+  piece: string;
+  limit: Int64;
+begin
+  Result := '';
+  limit := MaxBytes;
+  if limit = 0 then
+    limit := FMaxBody;
+  while ReadChunk(piece) do
+  begin
+    Result := Result + piece;
+    if (limit > 0) and (Length(Result) > limit) then
+    begin
+      Dispose;
+      raise EHttpClientError.CreateKind(ceTooLarge, 'http: response body is larger than the limit');
+    end;
+  end;
+end;
+
+procedure THttpClientResponse.Dispose;
+begin
+  if FReleased then
+    Exit;
+  if (FReader.State = msDone) and (not FDone) then
+    Finish
+  else
+  begin
+    FReleased := True;
+    FStream.Dispose;
+  end;
+end;
+
+{ ---- the client ---- }
+
+constructor THttpClient.Create;
+begin
+  inherited Create;
+  ConnectTimeoutMs := 30000;
+  MaxRedirects := 10;
+  FollowRedirects := True;
+  UserAgent := 'paslang-http/1.1';
+  MaxIdle := 4;
+  IdleTimeoutMs := 90000;
+  MaxHeaderBytes := 10485760;
+end;
+
+function THttpClient.TakeIdle(const Key: string): TNetStream;
+var
+  i, j: Integer;
+  now: Int64;
+begin
+  Result := nil;
+  now := Nanotime;
+  FMu.Lock;
+  try
+    { the newest connection of that key first; the stale ones are dropped }
+    i := Length(FIdleKeys) - 1;
+    while i >= 0 do
+    begin
+      if (IdleTimeoutMs > 0) and (now - FIdleSince[i] > Int64(IdleTimeoutMs) * 1000000) then
+      begin
+        FIdleStreams[i].Dispose;
+        for j := i to Length(FIdleKeys) - 2 do
+        begin
+          FIdleKeys[j] := FIdleKeys[j + 1];
+          FIdleStreams[j] := FIdleStreams[j + 1];
+          FIdleSince[j] := FIdleSince[j + 1];
+        end;
+        SetLength(FIdleKeys, Length(FIdleKeys) - 1);
+        SetLength(FIdleStreams, Length(FIdleStreams) - 1);
+        SetLength(FIdleSince, Length(FIdleSince) - 1);
+      end
+      else if (Result = nil) and (FIdleKeys[i] = Key) then
+      begin
+        Result := FIdleStreams[i];
+        for j := i to Length(FIdleKeys) - 2 do
+        begin
+          FIdleKeys[j] := FIdleKeys[j + 1];
+          FIdleStreams[j] := FIdleStreams[j + 1];
+          FIdleSince[j] := FIdleSince[j + 1];
+        end;
+        SetLength(FIdleKeys, Length(FIdleKeys) - 1);
+        SetLength(FIdleStreams, Length(FIdleStreams) - 1);
+        SetLength(FIdleSince, Length(FIdleSince) - 1);
+      end;
+      i := i - 1;
+    end;
+  finally
+    FMu.Unlock;
+  end;
+end;
+
+procedure THttpClient.PutIdle(const Key: string; S: TNetStream);
+var
+  n: Integer;
+begin
+  FMu.Lock;
+  try
+    if Length(FIdleKeys) >= MaxIdle then
+    begin
+      S.Dispose;
+      Exit;
+    end;
+    n := Length(FIdleKeys);
+    SetLength(FIdleKeys, n + 1);
+    SetLength(FIdleStreams, n + 1);
+    SetLength(FIdleSince, n + 1);
+    FIdleKeys[n] := Key;
+    FIdleStreams[n] := S;
+    FIdleSince[n] := Nanotime;
+  finally
+    FMu.Unlock;
+  end;
+end;
+
+procedure THttpClient.Release(const Key: string; S: TNetStream; Keep: Boolean);
+begin
+  if Keep and (not DisableKeepAlives) then
+    PutIdle(Key, S)
+  else
+    S.Dispose;
+end;
+
+procedure THttpClient.CloseIdle;
+var
+  i: Integer;
+begin
+  FMu.Lock;
+  try
+    for i := 0 to Length(FIdleStreams) - 1 do
+      FIdleStreams[i].Dispose;
+    SetLength(FIdleKeys, 0);
+    SetLength(FIdleStreams, 0);
+    SetLength(FIdleSince, 0);
+  finally
+    FMu.Unlock;
+  end;
+end;
+
+function DefaultPort(const Scheme: string): Integer;
+begin
+  if Scheme = 'https' then
+    Result := 443
+  else
+    Result := 80;
+end;
+
+function PortOf(const U: TUrl): Integer;
+var
+  p: string;
+  i, v: Integer;
+begin
+  p := UrlPort(U);
+  if p = '' then
+  begin
+    Result := DefaultPort(U.Scheme);
+    Exit;
+  end;
+  v := 0;
+  for i := 1 to Length(p) do
+    v := v * 10 + (Ord(p[i]) - 48);
+  Result := v;
+end;
+
+function KeyOf(const U: TUrl): string;
+begin
+  Result := U.Scheme + '://' + UrlHostname(U) + ':' + IntToStr(PortOf(U));
+end;
+
+function THttpClient.Connect(const U: TUrl; Deadline: Integer): TNetStream;
+var
+  ms, left: Integer;
+  host: string;
+begin
+  ms := ConnectTimeoutMs;
+  if Deadline <> 0 then
+  begin
+    { the exchange's own deadline may come first }
+    left := (Deadline - Nanotime) div 1000000;
+    if left < 1 then
+      left := 1;
+    if (ms = 0) or (left < ms) then
+      ms := left;
+  end;
+  if UnixPath <> '' then
+  begin
+    Result := DialUnix(UnixPath);
+    if Result = nil then
+      raise EHttpClientError.CreateKind(ceDial, 'http: dial unix ' + UnixPath + ': connection failed');
+    Exit;
+  end;
+  host := UrlHostname(U);
+  if U.Scheme = 'https' then
+  begin
+    if TlsDialer = nil then
+      raise EHttpClientError.CreateKind(ceTls, 'http: https needs a TLS dialer (uses a TLS unit)');
+    Result := TlsDialer.Dial(host, PortOf(U), ConnectTimeoutMs);
+    if Result = nil then
+      raise EHttpClientError.CreateKind(ceDial, 'http: dial ' + host + ': TLS connection failed');
+    Exit;
+  end;
+  if U.Scheme <> 'http' then
+    raise EHttpClientError.CreateKind(ceUrl, 'http: unsupported protocol scheme "' + U.Scheme + '"');
+  Result := DialTcp(host, PortOf(U), ms);
+  if Result = nil then
+    raise EHttpClientError.CreateKind(ceDial, 'http: dial tcp ' + host + ':' + IntToStr(PortOf(U)) + ': connection failed');
+end;
+
+{ the key a field sorts by, for Request.Write's sorted block }
+procedure SortedNames(F: THttpFields; var Order: array of Integer);
+var
+  i, j, t: Integer;
+begin
+  for i := 0 to F.Count - 1 do
+    Order[i] := i;
+  for i := 1 to F.Count - 1 do
+  begin
+    t := Order[i];
+    j := i - 1;
+    while (j >= 0) and (F.NameAt(Order[j]) > F.NameAt(t)) do
+    begin
+      Order[j + 1] := Order[j];
+      j := j - 1;
+    end;
+    Order[j + 1] := t;
+  end;
+end;
+
+function IsIdempotent(const Method: string; HasBody: Boolean): Boolean;
+begin
+  Result := (Method = 'GET') or (Method = 'HEAD') or (Method = 'OPTIONS') or (Method = 'TRACE') or
+    ((not HasBody) and (Method <> 'POST') and (Method <> 'PATCH'));
+end;
+
+function THttpClient.Exchange(const Method: string; const U: TUrl; Fields: THttpFields; const Body: string;
+  Deadline: Integer; Redirects: Integer): THttpClientResponse;
+var
+  key, req, hostHdr, target: string;
+  stream: TNetStream;
+  reused, retried, gz, sent, gotAny: Boolean;
+  order: array of Integer;
+  i, n, dl: Integer;
+  r: THttpMessageReader;
+  data, spill: string;
+  resp: THttpClientResponse;
+  h: THttpHead;
+  hasBody: Boolean;
+  ex: THttpFields;
+begin
+  key := KeyOf(U);
+  hostHdr := U.Host;
+  if hostHdr = '' then
+    raise EHttpClientError.CreateKind(ceUrl, 'http: no Host in request URL');
+  target := UrlRequestURI(U);
+  hasBody := Body <> '';
+  retried := False;
+  while True do
+  begin
+    stream := nil;
+    reused := False;
+    if not DisableKeepAlives then
+      stream := TakeIdle(key);
+    if stream <> nil then
+      reused := True
+    else
+      stream := Connect(U, Deadline);
+    { the request as Request.Write writes it }
+    req := HttpRequestLine(Method, target) + 'Host: ' + hostHdr + #13#10;
+    if (Fields = nil) or (not Fields.Has('User-Agent')) then
+      req := req + 'User-Agent: ' + UserAgent + #13#10
+    else
+      req := req + 'User-Agent: ' + Fields.Get('User-Agent') + #13#10;
+    if hasBody or (Method = 'POST') or (Method = 'PUT') or (Method = 'PATCH') then
+      req := req + 'Content-Length: ' + IntToStr(Length(Body)) + #13#10;
+    if Fields <> nil then
+    begin
+      SetLength(order, Fields.Count);
+      SortedNames(Fields, order);
+      for i := 0 to Fields.Count - 1 do
+      begin
+        n := order[i];
+        if (Fields.NameAt(n) = 'User-Agent') or (Fields.NameAt(n) = 'Host') or (Fields.NameAt(n) = 'Content-Length') then
+          Continue;
+        req := req + Fields.NameAt(n) + ': ' + Fields.ValueAt(n) + #13#10;
+      end;
+    end;
+    gz := (not DisableCompression) and (Method <> 'HEAD') and ((Fields = nil) or ((not Fields.Has('Accept-Encoding')) and
+      (not Fields.Has('Range'))));
+    if gz then
+      req := req + 'Accept-Encoding: gzip' + #13#10;
+    if DisableKeepAlives then
+      req := req + 'Connection: close' + #13#10;
+    req := req + #13#10 + Body;
+    dl := Deadline;
+    if HeaderTimeoutMs > 0 then
+      if (dl = 0) or (PasIoDeadline(HeaderTimeoutMs) < dl) then
+        dl := PasIoDeadline(HeaderTimeoutMs);
+    sent := stream.WriteAll(req, Deadline);
+    r := THttpMessageReader.Create(False, Method);
+    r.MaxHeaderBytes := MaxHeaderBytes;
+    spill := '';
+    if sent then
+    begin
+      try
+        while r.State = msHead do
+        begin
+          dl := Deadline;
+          if ReadTimeoutMs > 0 then
+            if (dl = 0) or (PasIoDeadline(ReadTimeoutMs) < dl) then
+              dl := PasIoDeadline(ReadTimeoutMs);
+          if HeaderTimeoutMs > 0 then
+            if (dl = 0) or (PasIoDeadline(HeaderTimeoutMs) < dl) then
+              dl := PasIoDeadline(HeaderTimeoutMs);
+          n := stream.ReadSome(16384, dl, data);
+          if n > 0 then
+          begin
+            gotAny := True;
+            r.Feed(data);
+            { a 1xx head other than 101 is passed over: the response is the next }
+            if (r.State <> msHead) and (r.Head.Status >= 100) and (r.Head.Status < 200) and (r.Head.Status <> 101) then
+            begin
+              spill := r.Unused;
+              r := THttpMessageReader.Create(False, Method);
+              r.MaxHeaderBytes := MaxHeaderBytes;
+              if spill <> '' then
+                r.Feed(spill);
+            end;
+          end
+          else if n = 0 then
+          begin
+            r.AtEof;
+          end
+          else
+          begin
+            stream.Dispose;
+            if n = -110 then
+              raise EHttpClientError.CreateKind(ceTimeout, 'http: timeout awaiting the response headers')
+            else
+              raise EHttpClientError.CreateKind(ceClosed, 'http: read: ' + ErrnoText(-n));
+          end;
+        end;
+      except
+        on E: EHttpMsgError do
+        begin
+          stream.Dispose;
+          sent := False;
+          if E.TooLarge then
+            raise EHttpClientError.CreateKind(ceTooLarge, 'http: server response headers exceeded ' + IntToStr(MaxHeaderBytes) + ' bytes; aborted');
+          { the server closed a connection kept idle before it saw the request: once more on a new one }
+          if reused and (not retried) and (not gotAny) and IsIdempotent(Method, hasBody) then
+          begin
+            retried := True;
+            Continue;
+          end;
+          raise EHttpClientError.CreateKind(ceProtocol, 'http: ' + E.Message);
+        end;
+      end;
+    end;
+    if not sent then
+    begin
+      stream.Dispose;
+      if reused and (not retried) and IsIdempotent(Method, hasBody) then
+      begin
+        retried := True;
+        Continue;
+      end;
+      raise EHttpClientError.CreateKind(ceClosed, 'http: could not write the request to ' + hostHdr);
+    end;
+    h := r.Head;
+    resp := THttpClientResponse.Create;
+    resp.FClient := Self;
+    resp.FStream := stream;
+    resp.FReader := r;
+    resp.FKey := key;
+    resp.FDeadline := Deadline;
+    resp.FReadMs := ReadTimeoutMs;
+    resp.FMaxBody := MaxBodyBytes;
+    resp.Status := h.Status;
+    resp.StatusLine := h.StatusLine;
+    resp.Proto := h.Proto;
+    resp.Fields := h.Fields;
+    resp.Trailers := THttpFields.Create;
+    resp.Url := U;
+    resp.Redirects := Redirects;
+    resp.ContentLength := h.ContentLength;
+    if gz and HttpEqualFold(h.Fields.Get('Content-Encoding'), 'gzip') and (h.BodyKind <> bkNone) then
+    begin
+      resp.Uncompressed := True;
+      resp.FInfl := TInflater.Create(flGzip);
+      h.Fields.Remove('Content-Encoding');
+      h.Fields.Remove('Content-Length');
+      resp.ContentLength := -1;
+    end;
+    if r.State = msDone then
+      resp.Finish;
+    Result := resp;
+    Exit;
+  end;
+end;
+
+{ whether the redirect keeps the credentials: the new host is the old one
+  or a subdomain of it }
+function SameDomain(const OldHost, NewHost: string): Boolean;
+var
+  a, b: string;
+begin
+  a := LowerCase(OldHost);
+  b := LowerCase(NewHost);
+  if a = b then
+  begin
+    Result := True;
+    Exit;
+  end;
+  Result := (Length(b) > Length(a)) and (Copy(b, Length(b) - Length(a), Length(a) + 1) = '.' + a);
+end;
+
+function THttpClient.Perform(const Method, Url: string; Fields: THttpFields; const Body: string): THttpClientResponse;
+var
+  u, next, loc: TUrl;
+  err, m, b, location: string;
+  deadline, redirects: Integer;
+  f: THttpFields;
+  resp: THttpClientResponse;
+  i: Integer;
+  junk: string;
+begin
+  if not UrlParse(Url, u, err) then
+    raise EHttpClientError.CreateKind(ceUrl, 'http: ' + err);
+  if (u.Scheme <> 'http') and (u.Scheme <> 'https') then
+    raise EHttpClientError.CreateKind(ceUrl, 'http: unsupported protocol scheme "' + u.Scheme + '"');
+  if UrlHostname(u) = '' then
+    raise EHttpClientError.CreateKind(ceUrl, 'http: no Host in request URL');
+  deadline := 0;
+  if TimeoutMs > 0 then
+    deadline := PasIoDeadline(TimeoutMs);
+  m := Method;
+  if m = '' then
+    m := 'GET';
+  b := Body;
+  if Fields <> nil then
+    f := Fields.Clone
+  else
+    f := nil;
+  redirects := 0;
+  while True do
+  begin
+    resp := Exchange(m, u, f, b, deadline, redirects);
+    if (not FollowRedirects) or ((resp.Status <> 301) and (resp.Status <> 302) and (resp.Status <> 303) and
+      (resp.Status <> 307) and (resp.Status <> 308)) then
+    begin
+      Result := resp;
+      Exit;
+    end;
+    location := resp.Fields.Get('Location');
+    if location = '' then
+    begin
+      Result := resp;
+      Exit;
+    end;
+    if redirects >= MaxRedirects then
+    begin
+      resp.Dispose;
+      raise EHttpClientError.CreateKind(ceRedirects, 'http: stopped after ' + IntToStr(MaxRedirects) + ' redirects');
+    end;
+    if not UrlParseRef(u, location, next, err) then
+    begin
+      resp.Dispose;
+      raise EHttpClientError.CreateKind(ceUrl, 'http: failed to parse Location header ' + HttpQuote(location) + ': ' + err);
+    end;
+    if (next.Scheme <> 'http') and (next.Scheme <> 'https') then
+    begin
+      resp.Dispose;
+      raise EHttpClientError.CreateKind(ceUrl, 'http: unsupported protocol scheme "' + next.Scheme + '"');
+    end;
+    { the body of the redirect is not wanted: read to reuse the connection }
+    try
+      junk := resp.ReadAll(1048576);
+    except
+      on E: EHttpClientError do
+        resp.Dispose;
+    end;
+    redirects := redirects + 1;
+    if (resp.Status = 301) or (resp.Status = 302) or (resp.Status = 303) then
+    begin
+      if (m <> 'GET') and (m <> 'HEAD') then
+        m := 'GET';
+      b := '';
+      if f <> nil then
+      begin
+        f.Remove('Content-Type');
+        f.Remove('Content-Length');
+        f.Remove('Transfer-Encoding');
+      end;
+    end;
+    if f = nil then
+      f := THttpFields.Create;
+    if not SameDomain(UrlHostname(u), UrlHostname(next)) then
+    begin
+      f.Remove('Authorization');
+      f.Remove('Www-Authenticate');
+      f.Remove('Cookie');
+      f.Remove('Cookie2');
+    end;
+    if not ((u.Scheme = 'https') and (next.Scheme = 'http')) then
+    begin
+      loc := u;
+      loc.HasUser := False;
+      loc.User := '';
+      loc.HasPassword := False;
+      loc.Password := '';
+      loc.Fragment := '';
+      loc.RawFragment := '';
+      f.Put('Referer', UrlString(loc));
+    end;
+    u := next;
+  end;
+end;
+
+function THttpClient.Get(const Url: string): THttpClientResponse;
+begin
+  Result := Perform('GET', Url, nil, '');
+end;
+
+function THttpClient.Head(const Url: string): THttpClientResponse;
+begin
+  Result := Perform('HEAD', Url, nil, '');
+end;
+
+function THttpClient.Post(const Url, ContentType, Body: string): THttpClientResponse;
+var
+  f: THttpFields;
+begin
+  f := THttpFields.Create;
+  if ContentType <> '' then
+    f.Add('Content-Type', ContentType);
+  Result := Perform('POST', Url, f, Body);
+end;
+
+end.

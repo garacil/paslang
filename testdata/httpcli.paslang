@@ -1,0 +1,669 @@
+{ P432: httpclient against the project's own server (httpserver) and a
+  scripted one that sends the bytes it is told to. What the client writes
+  is printed byte for byte (a request as Go's Request.Write writes it); the
+  answers: a body by Content-Length, chunked with a trailer, until the
+  connection closes, after a 100 Continue, gzip decoded whole and in chunks,
+  a HEAD; connections kept and used again (and a request made again when the
+  server had closed the kept one), redirects of every kind (301, 302, 303
+  and 307, relative and absolute, a loop, the credentials dropped when the
+  host changes), a body read a piece at a time, every limit and every
+  deadline, a Unix socket, https without a TLS dialer, and 40 clients at
+  once. The ports are written as <port>. }
+program httpcli;
+
+uses
+  httpserver, httpclient, pasconn, pashttp, pasurl, pasflate, pascodec, pasnet, sysutils;
+
+type
+  TScript = record
+    Reply: string;
+    CloseAfter: Boolean;
+    Silent: Boolean;
+    Delay: Integer;
+  end;
+
+var
+  Srv: THttpServer;
+  Router: THttpRouter;
+  Port, RawPort: Integer;
+  RawFd: Integer;
+  Accepts: Integer;
+  AccMu: mutex;
+  LastReq: string;
+  ReqMu: mutex;
+  Gz: string;
+
+{ ---- the real server ---- }
+
+procedure HHello(Req: THttpRequest; Resp: THttpResponse);
+begin
+  Resp.ReplyText(200, 'hello' + #10);
+end;
+
+procedure HEcho(Req: THttpRequest; Resp: THttpResponse);
+begin
+  Resp.ReplyText(200, Req.Method + ' ct=[' + Req.Header.Get('Content-Type') + '] body=[' + Req.ReadAllBody + ']' + #10);
+end;
+
+procedure HHdrs(Req: THttpRequest; Resp: THttpResponse);
+begin
+  Resp.ReplyText(200, 'ua=[' + Req.Header.Get('User-Agent') + '] ae=[' + Req.Header.Get('Accept-Encoding') + '] auth=[' +
+    Req.Header.Get('Authorization') + '] referer=[' + Req.Header.Get('Referer') + '] cookie=[' + Req.Header.Get('Cookie') + '] x=[' +
+    Req.Header.Get('X-Custom') + '] host=[' + Req.Header.Get('Host') + ']' + #10);
+end;
+
+procedure HR301(Req: THttpRequest; Resp: THttpResponse);
+begin
+  Resp.Redirect(301, '/hello');
+end;
+
+procedure HR302(Req: THttpRequest; Resp: THttpResponse);
+begin
+  Resp.Redirect(302, '/echo');
+end;
+
+procedure HR303(Req: THttpRequest; Resp: THttpResponse);
+begin
+  Resp.Redirect(303, '/echo');
+end;
+
+procedure HR307(Req: THttpRequest; Resp: THttpResponse);
+begin
+  Resp.Redirect(307, '/echo');
+end;
+
+procedure HR308(Req: THttpRequest; Resp: THttpResponse);
+begin
+  Resp.Redirect(308, 'echo');
+end;
+
+procedure HRel(Req: THttpRequest; Resp: THttpResponse);
+begin
+  Resp.Redirect(302, 'sub/../hello?x=1');
+end;
+
+procedure HLoop(Req: THttpRequest; Resp: THttpResponse);
+begin
+  Resp.Redirect(302, '/loop');
+end;
+
+procedure HAbroad(Req: THttpRequest; Resp: THttpResponse);
+begin
+  Resp.Redirect(302, 'http://localhost:' + IntToStr(Port) + '/hdrs');
+end;
+
+procedure HNoLoc(Req: THttpRequest; Resp: THttpResponse);
+begin
+  Resp.ReplyText(302, 'no Location here');
+end;
+
+procedure HGz(Req: THttpRequest; Resp: THttpResponse);
+begin
+  Resp.Header.Put('Content-Encoding', 'gzip');
+  Resp.Reply(200, 'text/plain', Gz);
+end;
+
+procedure HStream(Req: THttpRequest; Resp: THttpResponse);
+var
+  i: Integer;
+begin
+  Resp.Header.Put('Content-Type', 'text/plain');
+  for i := 1 to 3 do
+    Resp.WriteData(StringOfChar(Chr(Ord('a') + i - 1), 10000));
+end;
+
+procedure HBig(Req: THttpRequest; Resp: THttpResponse);
+begin
+  Resp.Reply(200, 'application/octet-stream', StringOfChar('B', 1500000));
+end;
+
+procedure HClose(Req: THttpRequest; Resp: THttpResponse);
+begin
+  Resp.Header.Put('Connection', 'close');
+  Resp.ReplyText(200, 'bye' + #10);
+end;
+
+procedure HSlow(Req: THttpRequest; Resp: THttpResponse);
+begin
+  Sleep(1500);
+  Resp.ReplyText(200, 'late' + #10);
+end;
+
+procedure HStatus(Req: THttpRequest; Resp: THttpResponse);
+begin
+  Resp.ReplyText(StrToInt(Req.Param('code')), 'status ' + Req.Param('code') + #10);
+end;
+
+procedure RunServer(S: THttpServer);
+begin
+  S.Serve;
+end;
+
+{ ---- the scripted server ---- }
+
+function ScriptFor(const Target: string): TScript;
+var
+  body: string;
+begin
+  Result.Reply := '';
+  Result.CloseAfter := False;
+  Result.Silent := False;
+  Result.Delay := 0;
+  if Target = '/raw/ok' then
+    Result.Reply := 'HTTP/1.1 200 OK' + #13#10 + 'Content-Length: 5' + #13#10 + #13#10 + 'hello'
+  else if Target = '/raw/continue' then
+    Result.Reply := 'HTTP/1.1 100 Continue' + #13#10 + #13#10 + 'HTTP/1.1 200 OK' + #13#10 + 'Content-Length: 2' + #13#10 + #13#10 + 'ok'
+  else if Target = '/raw/http10' then
+  begin
+    Result.Reply := 'HTTP/1.0 200 OK' + #13#10 + #13#10 + 'until the connection closes';
+    Result.CloseAfter := True;
+  end
+  else if Target = '/raw/chunked' then
+    Result.Reply := 'HTTP/1.1 200 OK' + #13#10 + 'Transfer-Encoding: chunked' + #13#10 + 'Trailer: X-Sum' + #13#10 + #13#10 +
+      '5;ext=1' + #13#10 + 'hello' + #13#10 + '6' + #13#10 + ' world' + #13#10 + '0' + #13#10 + 'X-Sum: 11' + #13#10 + #13#10
+  else if Target = '/raw/gzip' then
+    Result.Reply := 'HTTP/1.1 200 OK' + #13#10 + 'Content-Encoding: gzip' + #13#10 + 'Content-Length: ' + IntToStr(Length(Gz)) + #13#10 +
+      #13#10 + Gz
+  else if Target = '/raw/gzipchunked' then
+    Result.Reply := 'HTTP/1.1 200 OK' + #13#10 + 'Content-Encoding: gzip' + #13#10 + 'Transfer-Encoding: chunked' + #13#10 + #13#10 +
+      HttpChunk(Copy(Gz, 1, 7)) + HttpChunk(Copy(Gz, 8, 100)) + HttpChunk(Copy(Gz, 108, Length(Gz))) + HttpLastChunk(nil)
+  else if Target = '/raw/badgzip' then
+    Result.Reply := 'HTTP/1.1 200 OK' + #13#10 + 'Content-Encoding: gzip' + #13#10 + 'Content-Length: 10' + #13#10 + #13#10 + 'not a gzip'
+  else if Target = '/raw/cut' then
+  begin
+    Result.Reply := 'HTTP/1.1 200 OK' + #13#10 + 'Content-Length: 10' + #13#10 + #13#10 + 'abc';
+    Result.CloseAfter := True;
+  end
+  else if Target = '/raw/hugehead' then
+    Result.Reply := 'HTTP/1.1 200 OK' + #13#10 + 'X-Big: ' + StringOfChar('x', 12000) + #13#10 + 'Content-Length: 0' + #13#10 + #13#10
+  else if Target = '/raw/silent' then
+    Result.Silent := True
+  else if Target = '/raw/slowbody' then
+  begin
+    Result.Reply := 'HTTP/1.1 200 OK' + #13#10 + 'Content-Length: 100' + #13#10 + #13#10 + 'part';
+    Result.Silent := False;
+    Result.Delay := -1;
+  end
+  else if Target = '/raw/idleclose' then
+  begin
+    Result.Reply := 'HTTP/1.1 200 OK' + #13#10 + 'Content-Length: 4' + #13#10 + #13#10 + 'once';
+    Result.Delay := -2;
+  end
+  else if Target = '/raw/head' then
+    Result.Reply := 'HTTP/1.1 200 OK' + #13#10 + 'Content-Length: 5' + #13#10 + #13#10
+  else if Target = '/raw/conclose' then
+  begin
+    Result.Reply := 'HTTP/1.1 200 OK' + #13#10 + 'Connection: close' + #13#10 + 'Content-Length: 2' + #13#10 + #13#10 + 'cc';
+    Result.CloseAfter := True;
+  end
+  else if Target = '/raw/garbage' then
+  begin
+    Result.Reply := 'this is not http' + #13#10 + #13#10;
+    Result.CloseAfter := True;
+  end
+  else if Target = '/v1/chat/completions' then
+  begin
+    body := '{"id":"cmpl-1","object":"chat.completion","created":1700000000,"model":"deepseek-chat","choices":[{"index":0,"message":{"role":"assistant","content":"Hola, ¿qué tal?"},"finish_reason":"stop"}],"usage":{"prompt_tokens":9,"completion_tokens":6,"total_tokens":15}}';
+    Result.Reply := 'HTTP/1.1 200 OK' + #13#10 + 'Content-Type: application/json' + #13#10 + 'Content-Length: ' + IntToStr(Length(body)) + #13#10 + #13#10 + body;
+  end
+  else if Target = '/v1/chat/stream' then
+    Result.Reply := 'HTTP/1.1 200 OK' + #13#10 + 'Content-Type: text/event-stream' + #13#10 + 'Cache-Control: no-cache' + #13#10 + 'Transfer-Encoding: chunked' + #13#10 + #13#10 +
+      HttpChunk('data: {"choices":[{"delta":{"content":"Ho"}}]}' + #10 + #10) + HttpChunk('data: {"choices":[{"delta":{"con') +
+      HttpChunk('tent":"la"}}]}' + #10 + #10 + 'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}' + #10 + #10) + HttpChunk('data: [DONE]' + #10 + #10) +
+      HttpLastChunk(nil)
+  else if Target = '/raw/big' then
+    Result.Reply := 'HTTP/1.1 200 OK' + #13#10 + 'Content-Length: 2000000' + #13#10 + #13#10 + StringOfChar('z', 2000000)
+  else
+    Result.Reply := 'HTTP/1.1 404 Not Found' + #13#10 + 'Content-Length: 0' + #13#10 + #13#10;
+end;
+
+procedure RawConn(Fd: Integer);
+var
+  buf, chunk: string;
+  p, n, cl, i: Integer;
+  head, target, line: string;
+  sc: TScript;
+  data: string;
+begin
+  buf := '';
+  while True do
+  begin
+    { a request: its head, and its body by Content-Length }
+    while Pos(#13#10#13#10, buf) = 0 do
+    begin
+      SetLength(chunk, 65536);
+      n := PasIoRead(Fd, @chunk[1], 65536, PasIoDeadline(8000));
+      if n <= 0 then
+      begin
+        TcpClose(Fd);
+        Exit;
+      end;
+      buf := buf + Copy(chunk, 1, n);
+    end;
+    p := Pos(#13#10#13#10, buf);
+    head := Copy(buf, 1, p + 3);
+    buf := Copy(buf, p + 4, Length(buf) - p - 3);
+    cl := 0;
+    i := Pos('Content-Length: ', head);
+    if i > 0 then
+    begin
+      line := Copy(head, i + 16, 12);
+      cl := StrToInt(Copy(line, 1, Pos(#13, line) - 1));
+    end;
+    while Length(buf) < cl do
+    begin
+      SetLength(chunk, 65536);
+      n := PasIoRead(Fd, @chunk[1], 65536, PasIoDeadline(8000));
+      if n <= 0 then
+      begin
+        TcpClose(Fd);
+        Exit;
+      end;
+      buf := buf + Copy(chunk, 1, n);
+    end;
+    data := Copy(buf, 1, cl);
+    buf := Copy(buf, cl + 1, Length(buf) - cl);
+    ReqMu.Lock;
+    LastReq := head + data;
+    ReqMu.Unlock;
+    p := Pos(' ', head);
+    target := Copy(head, p + 1, Length(head));
+    target := Copy(target, 1, Pos(' ', target) - 1);
+    if Pos('?', target) > 0 then
+      target := Copy(target, 1, Pos('?', target) - 1);
+    sc := ScriptFor(target);
+    if sc.Silent then
+    begin
+      Sleep(6000);
+      TcpClose(Fd);
+      Exit;
+    end;
+    if sc.Delay = -1 then
+    begin
+      PasIoWrite(Fd, @sc.Reply[1], Length(sc.Reply), PasIoDeadline(5000));
+      Sleep(6000);
+      TcpClose(Fd);
+      Exit;
+    end;
+    PasIoWrite(Fd, @sc.Reply[1], Length(sc.Reply), PasIoDeadline(5000));
+    if (sc.Delay = -2) or sc.CloseAfter then
+    begin
+      Sleep(50);
+      TcpClose(Fd);
+      Exit;
+    end;
+  end;
+end;
+
+procedure RawAccept(L: Integer);
+var
+  c: Integer;
+begin
+  while True do
+  begin
+    c := TcpAccept(L);
+    if c < 0 then
+      Exit;
+    AccMu.Lock;
+    Accepts := Accepts + 1;
+    AccMu.Unlock;
+    pas RawConn(c);
+  end;
+end;
+
+{ ---- the checks ---- }
+
+function Hash(const S: string): string;
+begin
+  Result := IntToStr(Length(S)) + ':' + IntToStr(Crc32(S));
+end;
+
+procedure ShowFields(R: THttpClientResponse; const Names: array of string);
+var
+  i: Integer;
+begin
+  for i := 0 to High(Names) do
+    if R.Fields.Has(Names[i]) then
+      WriteLn('  ', Names[i], ': ', R.Fields.Get(Names[i]));
+end;
+
+procedure Fetch(C: THttpClient; const Title, Method, Url: string; F: THttpFields; const Body: string);
+var
+  r: THttpClientResponse;
+  b: string;
+begin
+  Write(Title, ': ');
+  try
+    r := C.Perform(Method, Url, F, Body);
+    b := r.ReadAll(0);
+    WriteLn(r.Status, ' ', r.StatusLine, ' ', Length(b), ' bytes');
+    if Length(b) < 200 then
+      WriteLn('  [', StringReplace(StringReplace(b, IntToStr(Port), '<port>', [rfReplaceAll]), #10, '\n', [rfReplaceAll]), ']');
+  except
+    on E: EHttpClientError do
+      WriteLn('error kind ', E.Kind, ' timeout ', E.Timeout, ': ', E.Message);
+  end;
+end;
+
+function Masked(const S: string): string;
+begin
+  Result := StringReplace(StringReplace(S, IntToStr(Port), '<port>', [rfReplaceAll]), IntToStr(RawPort), '<rawport>', [rfReplaceAll]);
+  Result := StringReplace(Result, #13#10, '\r\n' + #10, [rfReplaceAll]);
+end;
+
+procedure ShowReq(const Title: string);
+begin
+  ReqMu.Lock;
+  WriteLn(Title, ' as sent:');
+  Write(Masked(LastReq));
+  if (LastReq <> '') and (LastReq[Length(LastReq)] <> #10) then
+    WriteLn;
+  ReqMu.Unlock;
+end;
+
+var
+  Clients: waitgroup;
+  Served, BadOnes: Integer;
+
+procedure OneClient(Idx: Integer);
+var
+  cl: THttpClient;
+  i: Integer;
+  ok: Boolean;
+  rr: THttpClientResponse;
+begin
+  ok := True;
+  cl := THttpClient.Create;
+  cl.TimeoutMs := 30000;
+  try
+    for i := 1 to 3 do
+    begin
+      rr := cl.Get('http://127.0.0.1:' + IntToStr(Port) + '/hello');
+      if rr.ReadAll(0) <> 'hello' + #10 then
+        ok := False;
+    end;
+  except
+    on E: EHttpClientError do
+    begin
+      ok := False;
+      WriteLn('client ', Idx, ': ', E.Message);
+    end;
+  end;
+  if ok then
+    AtomicAdd(@Served, 1)
+  else
+    AtomicAdd(@BadOnes, 1);
+  Clients.Done;
+end;
+
+{ the checks that a Go server answers the same, with the real server's address }
+procedure RealChecks;
+var
+  c, c2: THttpClient;
+  f: THttpFields;
+  r: THttpClientResponse;
+  s, piece: string;
+  i, n, total: Integer;
+begin
+  s := '';
+  for i := 1 to 400 do
+    s := s + 'line ' + IntToStr(i) + ' of the compressed body' + #10;
+  c := THttpClient.Create;
+  c.TimeoutMs := 20000;
+  WriteLn('== the real server');
+  Fetch(c, 'GET /hello', 'GET', 'http://127.0.0.1:' + IntToStr(Port) + '/hello', nil, '');
+  f := THttpFields.Create;
+  f.Add('Content-Type', 'application/json');
+  f.Add('x-custom', 'Value');
+  Fetch(c, 'POST /echo', 'POST', 'http://127.0.0.1:' + IntToStr(Port) + '/echo', f, '{"a":1}');
+  Fetch(c, 'PUT /echo (empty body)', 'PUT', 'http://127.0.0.1:' + IntToStr(Port) + '/echo', nil, '');
+  Fetch(c, 'GET /hdrs', 'GET', 'http://127.0.0.1:' + IntToStr(Port) + '/hdrs', f, '');
+  f := THttpFields.Create;
+  f.Add('Authorization', HttpBasicAuth('ana', 'p@ss'));
+  f.Add('Cookie', 'sid=1');
+  Fetch(c, 'basic auth', 'GET', 'http://127.0.0.1:' + IntToStr(Port) + '/hdrs', f, '');
+  Fetch(c, 'status 404', 'GET', 'http://127.0.0.1:' + IntToStr(Port) + '/status/404', nil, '');
+  Fetch(c, 'status 500', 'GET', 'http://127.0.0.1:' + IntToStr(Port) + '/status/500', nil, '');
+  Fetch(c, 'unknown path', 'GET', 'http://127.0.0.1:' + IntToStr(Port) + '/nothing', nil, '');
+  Fetch(c, 'close', 'GET', 'http://127.0.0.1:' + IntToStr(Port) + '/close', nil, '');
+  Fetch(c, 'after close', 'GET', 'http://127.0.0.1:' + IntToStr(Port) + '/hello', nil, '');
+  WriteLn('== redirects');
+  Fetch(c, '301 GET', 'GET', 'http://127.0.0.1:' + IntToStr(Port) + '/r301', nil, '');
+  f := THttpFields.Create;
+  f.Add('Content-Type', 'text/plain');
+  Fetch(c, '302 POST becomes GET', 'POST', 'http://127.0.0.1:' + IntToStr(Port) + '/r302', f, 'body');
+  Fetch(c, '303 POST becomes GET', 'POST', 'http://127.0.0.1:' + IntToStr(Port) + '/r303', f, 'body');
+  Fetch(c, '307 POST stays', 'POST', 'http://127.0.0.1:' + IntToStr(Port) + '/r307', f, 'body');
+  Fetch(c, '308 POST stays, relative', 'POST', 'http://127.0.0.1:' + IntToStr(Port) + '/r308', f, 'body');
+  Fetch(c, 'relative with ..', 'GET', 'http://127.0.0.1:' + IntToStr(Port) + '/rel', nil, '');
+  Fetch(c, 'a loop', 'GET', 'http://127.0.0.1:' + IntToStr(Port) + '/loop', nil, '');
+  Fetch(c, 'no Location', 'GET', 'http://127.0.0.1:' + IntToStr(Port) + '/noloc', nil, '');
+  f := THttpFields.Create;
+  f.Add('Authorization', 'Bearer secret');
+  f.Add('Cookie', 'sid=1');
+  f.Add('X-Custom', 'kept');
+  Fetch(c, 'other host drops credentials', 'GET', 'http://127.0.0.1:' + IntToStr(Port) + '/abroad', f, '');
+  c2 := THttpClient.Create;
+  c2.FollowRedirects := False;
+  r := c2.Get('http://127.0.0.1:' + IntToStr(Port) + '/r301');
+  WriteLn('not followed: ', r.Status, ' Location ', r.Fields.Get('Location'), ' [', r.ReadAll(0), ']');
+  c2.MaxRedirects := 2;
+  c2.FollowRedirects := True;
+  Fetch(c2, 'two redirects allowed', 'GET', 'http://127.0.0.1:' + IntToStr(Port) + '/loop', nil, '');
+  WriteLn('== bodies');
+  r := c.Get('http://127.0.0.1:' + IntToStr(Port) + '/gz');
+  WriteLn('gzip: ', r.Status, ' uncompressed ', r.Uncompressed, ' length ', r.ContentLength, ' Content-Encoding [', r.Fields.Get('Content-Encoding'),
+    '] body ', Hash(r.ReadAll(0)), ' same as the text ', Hash(s));
+  c2 := THttpClient.Create;
+  c2.DisableCompression := True;
+  r := c2.Get('http://127.0.0.1:' + IntToStr(Port) + '/gz');
+  WriteLn('gzip kept: uncompressed ', r.Uncompressed, ' Content-Encoding [', r.Fields.Get('Content-Encoding'), '] decodes to ', Hash(GzipDecode(r.ReadAll(0))));
+  r := c.Get('http://127.0.0.1:' + IntToStr(Port) + '/stream');
+  total := 0;
+  n := 0;
+  while r.ReadChunk(piece) do
+  begin
+    total := total + Length(piece);
+    n := n + 1;
+  end;
+  WriteLn('stream: ', total, ' bytes in pieces, chunked ', r.Fields.Has('Content-Length') = False);
+  r := c.Get('http://127.0.0.1:' + IntToStr(Port) + '/big');
+  WriteLn('big: read ', Length(r.ReadAll(0)));
+  c2 := THttpClient.Create;
+  c2.MaxBodyBytes := 1000000;
+  Fetch(c2, 'body past MaxBodyBytes', 'GET', 'http://127.0.0.1:' + IntToStr(Port) + '/big', nil, '');
+  r := c.Get('http://127.0.0.1:' + IntToStr(Port) + '/big');
+  try
+    r.ReadAll(1000);
+    WriteLn('limit: not stopped');
+  except
+    on E: EHttpClientError do
+      WriteLn('limit by ReadAll: ', E.Message);
+  end;
+end;
+
+var
+  c, c2, c3: THttpClient;
+  f: THttpFields;
+  r: THttpClientResponse;
+  s, piece, got: string;
+  i, n, base: Integer;
+  total: Integer;
+  usrv: THttpServer;
+  urouter: THttpRouter;
+  sock, line2: string;
+  jv: json;
+begin
+  if ParamStr(1) = 'gosrv' then
+  begin
+    { scripts/http_client_go.sh: the same checks against Go's net/http on the port given }
+    Port := StrToInt(ParamStr(2));
+    RealChecks;
+    Halt(0);
+  end;
+  { gzip of a text, for the server and the scripted one }
+  s := '';
+  for i := 1 to 400 do
+    s := s + 'line ' + IntToStr(i) + ' of the compressed body' + #10;
+  Gz := GzipEncode(s, 6);
+  Router := THttpRouter.Create;
+  Router.Handle('GET', '/hello', @HHello);
+  Router.Handle('POST', '/echo', @HEcho);
+  Router.Handle('PUT', '/echo', @HEcho);
+  Router.Handle('GET', '/echo', @HEcho);
+  Router.Handle('GET', '/hdrs', @HHdrs);
+  Router.Handle('GET', '/r301', @HR301);
+  Router.Handle('POST', '/r302', @HR302);
+  Router.Handle('POST', '/r303', @HR303);
+  Router.Handle('POST', '/r307', @HR307);
+  Router.Handle('POST', '/r308', @HR308);
+  Router.Handle('GET', '/rel', @HRel);
+  Router.Handle('GET', '/loop', @HLoop);
+  Router.Handle('GET', '/abroad', @HAbroad);
+  Router.Handle('GET', '/noloc', @HNoLoc);
+  Router.Handle('GET', '/gz', @HGz);
+  Router.Handle('GET', '/stream', @HStream);
+  Router.Handle('GET', '/big', @HBig);
+  Router.Handle('GET', '/close', @HClose);
+  Router.Handle('GET', '/slow', @HSlow);
+  Router.Handle('GET', '/status/:code', @HStatus);
+  Srv := THttpServer.Create(Router);
+  Srv.AccessLog := False;
+  if not Srv.ListenTcp('127.0.0.1', 0) then
+    Halt(1);
+  Port := Srv.Port;
+  pas RunServer(Srv);
+  RawFd := TcpListenAt('127.0.0.1', 0, 64);
+  RawPort := TcpPort(RawFd);
+  pas RawAccept(RawFd);
+
+  RealChecks;
+  c := THttpClient.Create;
+  c.TimeoutMs := 20000;
+  WriteLn('== the scripted server: what is sent');
+  Fetch(c, 'raw ok', 'GET', 'http://127.0.0.1:' + IntToStr(RawPort) + '/raw/ok?x=1&y=a%20b', nil, '');
+  ShowReq('GET');
+  f := THttpFields.Create;
+  f.Add('content-type', 'application/json');
+  f.Add('Authorization', 'Bearer abc');
+  f.Add('x-trace', 'zz');
+  f.Add('Accept', 'application/json');
+  Fetch(c, 'raw POST', 'POST', 'http://127.0.0.1:' + IntToStr(RawPort) + '/raw/ok', f, '{"model":"x","stream":false}');
+  ShowReq('POST');
+  Fetch(c, 'raw PUT empty', 'PUT', 'http://user:pw@127.0.0.1:' + IntToStr(RawPort) + '/raw/ok#frag', nil, '');
+  ShowReq('PUT');
+  c2 := THttpClient.Create;
+  c2.DisableKeepAlives := True;
+  c2.UserAgent := 'my-agent/2';
+  Fetch(c2, 'raw close + agent', 'GET', 'http://127.0.0.1:' + IntToStr(RawPort) + '/raw/ok', nil, '');
+  ShowReq('GET');
+  Fetch(c, 'raw HEAD', 'HEAD', 'http://127.0.0.1:' + IntToStr(RawPort) + '/raw/head', nil, '');
+  ShowReq('HEAD');
+  WriteLn('== the scripted server: what comes back');
+  Fetch(c, '100 Continue first', 'GET', 'http://127.0.0.1:' + IntToStr(RawPort) + '/raw/continue', nil, '');
+  Fetch(c, 'HTTP/1.0 until close', 'GET', 'http://127.0.0.1:' + IntToStr(RawPort) + '/raw/http10', nil, '');
+  r := c.Get('http://127.0.0.1:' + IntToStr(RawPort) + '/raw/chunked');
+  got := r.ReadAll(0);
+  WriteLn('chunked: [', got, '] trailer X-Sum=', r.Trailers.Get('X-Sum'));
+  r := c.Get('http://127.0.0.1:' + IntToStr(RawPort) + '/raw/gzip');
+  WriteLn('gzip by length: ', Hash(r.ReadAll(0)), ' ', r.Uncompressed);
+  r := c.Get('http://127.0.0.1:' + IntToStr(RawPort) + '/raw/gzipchunked');
+  WriteLn('gzip chunked: ', Hash(r.ReadAll(0)), ' ', r.Uncompressed);
+  Fetch(c, 'bad gzip', 'GET', 'http://127.0.0.1:' + IntToStr(RawPort) + '/raw/badgzip', nil, '');
+  Fetch(c, 'cut off', 'GET', 'http://127.0.0.1:' + IntToStr(RawPort) + '/raw/cut', nil, '');
+  Fetch(c, 'not HTTP', 'GET', 'http://127.0.0.1:' + IntToStr(RawPort) + '/raw/garbage', nil, '');
+  Fetch(c, 'Connection: close answer', 'GET', 'http://127.0.0.1:' + IntToStr(RawPort) + '/raw/conclose', nil, '');
+  c3 := THttpClient.Create;
+  c3.MaxHeaderBytes := 4096;
+  Fetch(c3, 'head too large', 'GET', 'http://127.0.0.1:' + IntToStr(RawPort) + '/raw/hugehead', nil, '');
+  Fetch(c3, 'head within 10 MiB', 'GET', 'http://127.0.0.1:' + IntToStr(RawPort) + '/raw/ok', nil, '');
+  c3 := THttpClient.Create;
+  c3.MaxBodyBytes := 100000;
+  Fetch(c3, 'body of 2 MB past 100000', 'GET', 'http://127.0.0.1:' + IntToStr(RawPort) + '/raw/big', nil, '');
+  WriteLn('== a JSON API, as the portal calls one');
+  f := THttpFields.Create;
+  f.Add('Authorization', 'Bearer sk-test');
+  r := c.Perform('POST', 'http://127.0.0.1:' + IntToStr(RawPort) + '/v1/chat/completions', f,
+    '{"model":"deepseek-chat","messages":[{"role":"user","content":"hola"}],"stream":false}');
+  jv := JsonParse(r.ReadAll(0));
+  WriteLn('chat: ', r.Status, ' ', r.Fields.Get('Content-Type'), ' content=[', jv['choices'][0]['message']['content'].AsString, '] tokens ',
+    jv['usage']['total_tokens'].AsInteger);
+  ShowReq('chat request');
+  r := c.Perform('POST', 'http://127.0.0.1:' + IntToStr(RawPort) + '/v1/chat/stream', f, '{"model":"deepseek-chat","stream":true}');
+  WriteLn('stream: ', r.Status, ' ', r.Fields.Get('Content-Type'));
+  got := '';
+  n := 0;
+  while r.ReadChunk(piece) do
+  begin
+    got := got + piece;
+    n := n + 1;
+    while Pos(#10#10, got) > 0 do
+    begin
+      i := Pos(#10#10, got);
+      line2 := Copy(got, 1, i - 1);
+      got := Copy(got, i + 2, Length(got) - i - 1);
+      WriteLn('  event [', line2, ']');
+    end;
+  end;
+  WriteLn('  ', Length(got), ' left over');
+  WriteLn('== connections kept');
+  c3 := THttpClient.Create;
+  base := Accepts;
+  for i := 1 to 5 do
+    c3.Get('http://127.0.0.1:' + IntToStr(RawPort) + '/raw/ok').ReadAll(0);
+  WriteLn('5 requests on ', Accepts - base, ' connection');
+  c3.DisableKeepAlives := True;
+  base := Accepts;
+  for i := 1 to 3 do
+    c3.Get('http://127.0.0.1:' + IntToStr(RawPort) + '/raw/ok').ReadAll(0);
+  WriteLn('3 requests with keep-alives off on ', Accepts - base, ' connections');
+  c3 := THttpClient.Create;
+  base := Accepts;
+  Fetch(c3, 'first, then the server closes', 'GET', 'http://127.0.0.1:' + IntToStr(RawPort) + '/raw/idleclose', nil, '');
+  Sleep(300);
+  Fetch(c3, 'second, on a connection that is gone', 'GET', 'http://127.0.0.1:' + IntToStr(RawPort) + '/raw/idleclose', nil, '');
+  WriteLn('on ', Accepts - base, ' connections');
+  Fetch(c3, 'POST on a connection that is gone', 'POST', 'http://127.0.0.1:' + IntToStr(RawPort) + '/raw/idleclose', nil, 'x');
+  Sleep(300);
+  Fetch(c3, 'POST again', 'POST', 'http://127.0.0.1:' + IntToStr(RawPort) + '/raw/idleclose', nil, 'y');
+  WriteLn('== deadlines');
+  c2 := THttpClient.Create;
+  c2.HeaderTimeoutMs := 400;
+  Fetch(c2, 'no answer within HeaderTimeoutMs', 'GET', 'http://127.0.0.1:' + IntToStr(RawPort) + '/raw/silent', nil, '');
+  c2 := THttpClient.Create;
+  c2.TimeoutMs := 400;
+  Fetch(c2, 'TimeoutMs on a slow handler', 'GET', 'http://127.0.0.1:' + IntToStr(Port) + '/slow', nil, '');
+  c2 := THttpClient.Create;
+  c2.ReadTimeoutMs := 400;
+  Fetch(c2, 'ReadTimeoutMs on a body that stops', 'GET', 'http://127.0.0.1:' + IntToStr(RawPort) + '/raw/slowbody', nil, '');
+  c2 := THttpClient.Create;
+  c2.TimeoutMs := 5000;
+  Fetch(c2, 'connection refused', 'GET', 'http://127.0.0.1:1/', nil, '');
+  Fetch(c2, 'no such host', 'GET', 'http://no-such-host.invalid/', nil, '');
+  WriteLn('== addresses');
+  Fetch(c2, 'bad URL', 'GET', 'http://[::1/', nil, '');
+  Fetch(c2, 'no scheme', 'GET', 'example.com/x', nil, '');
+  Fetch(c2, 'ftp', 'GET', 'ftp://example.com/x', nil, '');
+  Fetch(c2, 'no host', 'GET', 'http:///x', nil, '');
+  Fetch(c2, 'https without a TLS dialer', 'GET', 'https://example.com/', nil, '');
+  WriteLn('== a Unix socket');
+  sock := ParamStr(0) + '.sock';
+  urouter := THttpRouter.Create;
+  urouter.Handle('GET', '/hello', @HHello);
+  usrv := THttpServer.Create(urouter);
+  usrv.AccessLog := False;
+  usrv.ListenUnix(sock, 432, '');
+  pas RunServer(usrv);
+  c2 := THttpClient.Create;
+  c2.UnixPath := sock;
+  Fetch(c2, 'GET over the socket', 'GET', 'http://anything/hello', nil, '');
+  usrv.Shutdown;
+  WriteLn('== 40 clients at once');
+  Clients.Add(40);
+  for i := 1 to 40 do
+    pas OneClient(i);
+  Clients.Wait;
+  WriteLn(Served, ' of 40 clients, three requests each, ', BadOnes, ' failed');
+  Srv.Shutdown;
+  Halt(0);
+end.

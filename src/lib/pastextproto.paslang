@@ -1,0 +1,556 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+
+  paslang is free software: you can redistribute it and/or modify it
+  under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+
+  paslang is distributed in the hope that it will be useful, but
+  WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+  General Public License for more details.
+
+  Under Section 7 of GPL version 3, you are granted additional
+  permissions described in the paslang Runtime Library Exception,
+  version 1.0, in the file COPYING.RUNTIME.
+
+  You should have received a copy of the GNU General Public License
+  along with paslang.  If not, see <https://www.gnu.org/licenses/>. }
+
+{ Header blocks as Go's net/textproto reads them (P432), for HTTP and for
+  mail: a block of `Name: value` lines read from a string by
+  textproto.ReadMIMEHeader's rules (continuation lines, the colon, the bytes a
+  name and a value may hold, the name made canonical), kept in the order they
+  came by TMimeFields. The reader works on a string that may not be all there
+  yet: a line that runs out is EMimeNeedMore, not a fault, so a reader fed in
+  pieces can ask for more; with Eof set the end of the input is the end of the
+  line, as bufio's ReadLine gives it. The error texts are Go's. Free of units
+  but sysutils and of state (Regla 11). }
+unit pastextproto;
+
+interface
+
+uses
+  sysutils;
+
+type
+  { a message that is not MIME or HTTP; Message is Go's text. TooLarge is a head or
+    a line past its limit (a server says 431, a client gives up) }
+  EMimeError = class(Exception)
+  public
+    TooLarge: Boolean;
+    constructor CreateTooLarge(const AMessage: string);
+  end;
+
+  { the input runs out before the block ends: more is wanted, not a fault }
+  EMimeNeedMore = class(EMimeError);
+
+  TMimeFields = class
+  private
+    FNames: array of string;
+    FValues: array of string;
+    FCount: Integer;
+  public
+    { Name is made canonical (Go's CanonicalMIMEHeaderKey) }
+    procedure Add(const Name, Value: string);
+    { every value of Name replaced by this one }
+    procedure Put(const Name, Value: string);
+    procedure Remove(const Name: string);
+    { the first value of Name, '' when there is none }
+    function Get(const Name: string): string;
+    function Has(const Name: string): Boolean;
+    function ValuesOf(const Name: string): TStringArray;
+    function CountOf(const Name: string): Integer;
+    { whether a value of Name has Token in its comma-separated list, with
+      no regard to case (Connection: keep-alive, Close) }
+    function HasToken(const Name, Token: string): Boolean;
+    function Count: Integer;
+    function NameAt(I: Integer): string;
+    function ValueAt(I: Integer): string;
+    function Clone: TMimeFields;
+    { Name: value and CRLF for each field }
+    function Text: string;
+  end;
+
+
+function MimeCanonicalKey(const S: string): string;
+function MimeIsToken(const S: string): Boolean;
+function MimeEqualFold(const A, B: string): Boolean;
+{ Go's strconv.Quote of the printable ASCII range, for messages }
+function MimeQuote(const S: string): string;
+{ textproto.TrimString and the trim of optional white space (space, tab) }
+function MimeTrimSpace(const S: string): string;
+function MimeTrimOws(const S: string): string;
+{ whether Token is in the comma-separated list V, with no regard to case }
+function MimeValueHasToken(const V, Token: string): Boolean;
+{ one line of Text from Pos0: False when there is none yet; the line has
+  neither its LF nor the CR before it. With Eof a last line with no LF is
+  a line. }
+function MimeCutLine(const Text: string; var Pos0: Integer; out Line: string; Eof: Boolean): Boolean;
+{ the header block of Text from Pos0 to its blank line, into Fields; MaxFields
+  is the count allowed (0 any); EMimeNeedMore when the block is not all there }
+procedure MimeReadHeader(const Text: string; var Pos0: Integer; Fields: TMimeFields; MaxFields: Integer; Eof: Boolean);
+{ raises what NeedMore or the end of the input means }
+procedure MimeNeedMore(Eof: Boolean);
+function MimeFieldByte(C: Char): Boolean;
+function MimeValueByte(C: Char): Boolean;
+function MimeLower(C: Char): Char;
+
+implementation
+
+constructor EMimeError.CreateTooLarge(const AMessage: string);
+begin
+  inherited Create(AMessage);
+  TooLarge := True;
+end;
+
+procedure MimeNeedMore(Eof: Boolean);
+begin
+  if Eof then
+    raise EMimeError.Create('unexpected EOF')
+  else
+    raise EMimeNeedMore.Create('more input');
+end;
+
+function MimeLower(C: Char): Char;
+begin
+  if (C >= 'A') and (C <= 'Z') then
+    Result := Chr(Ord(C) + 32)
+  else
+    Result := C;
+end;
+
+function LowerStr(const S: string): string;
+var
+  i: Integer;
+begin
+  Result := S;
+  for i := 1 to Length(Result) do
+    Result[i] := MimeLower(Result[i]);
+end;
+
+function MimeEqualFold(const A, B: string): Boolean;
+var
+  i: Integer;
+begin
+  Result := False;
+  if Length(A) <> Length(B) then
+    Exit;
+  for i := 1 to Length(A) do
+    if MimeLower(A[i]) <> MimeLower(B[i]) then
+      Exit;
+  Result := True;
+end;
+
+function MimeIsTchar(C: Char): Boolean;
+begin
+  Result := ((C >= '0') and (C <= '9')) or ((C >= 'a') and (C <= 'z')) or ((C >= 'A') and (C <= 'Z'));
+  if Result then
+    Exit;
+  case C of
+    '!', '#', '$', '%', '&', '''', '*', '+', '-', '.', '^', '_', '`', '|', '~':
+      Result := True;
+  end;
+end;
+
+function MimeIsToken(const S: string): Boolean;
+var
+  i: Integer;
+begin
+  Result := S <> '';
+  for i := 1 to Length(S) do
+    if not MimeIsTchar(S[i]) then
+    begin
+      Result := False;
+      Exit;
+    end;
+end;
+
+function MimeQuote(const S: string): string;
+var
+  i, c: Integer;
+begin
+  Result := '"';
+  for i := 1 to Length(S) do
+  begin
+    c := Ord(S[i]);
+    if S[i] = '"' then
+      Result := Result + '\"'
+    else if S[i] = '\' then
+      Result := Result + '\\'
+    else if c = 7 then
+      Result := Result + '\a'
+    else if c = 8 then
+      Result := Result + '\b'
+    else if c = 9 then
+      Result := Result + '\t'
+    else if c = 10 then
+      Result := Result + '\n'
+    else if c = 11 then
+      Result := Result + '\v'
+    else if c = 12 then
+      Result := Result + '\f'
+    else if c = 13 then
+      Result := Result + '\r'
+    else if (c < 32) or (c = 127) then
+      Result := Result + '\x' + Copy('0123456789abcdef', (c shr 4) + 1, 1) + Copy('0123456789abcdef', (c and 15) + 1, 1)
+    else
+      Result := Result + S[i];
+  end;
+  Result := Result + '"';
+end;
+
+{ textproto.TrimString }
+function MimeTrimSpace(const S: string): string;
+var
+  a, b: Integer;
+begin
+  a := 1;
+  b := Length(S);
+  while (a <= b) and ((S[a] = ' ') or (S[a] = #9) or (S[a] = #10) or (S[a] = #13)) do
+    a := a + 1;
+  while (b >= a) and ((S[b] = ' ') or (S[b] = #9) or (S[b] = #10) or (S[b] = #13)) do
+    b := b - 1;
+  Result := Copy(S, a, b - a + 1);
+end;
+
+function MimeTrimOws(const S: string): string;
+var
+  a, b: Integer;
+begin
+  a := 1;
+  b := Length(S);
+  while (a <= b) and ((S[a] = ' ') or (S[a] = #9)) do
+    a := a + 1;
+  while (b >= a) and ((S[b] = ' ') or (S[b] = #9)) do
+    b := b - 1;
+  Result := Copy(S, a, b - a + 1);
+end;
+
+{ validHeaderFieldByte }
+function MimeFieldByte(C: Char): Boolean;
+begin
+  Result := MimeIsTchar(C);
+end;
+
+{ validHeaderValueByte: VCHAR, SP, HTAB and the obs-text bytes }
+function MimeValueByte(C: Char): Boolean;
+var
+  v: Integer;
+begin
+  v := Ord(C);
+  Result := (v = 9) or ((v >= 32) and (v < 127)) or (v >= 128);
+end;
+
+{ canonicalMIMEHeaderKey: a name of field bytes made Like-This; with a
+  space in it (a server's slip) it is let through as it is; anything else
+  is not a name }
+function MimeCanonKey(const A: string; out Ok: Boolean): string;
+var
+  i: Integer;
+  upper, noCanon: Boolean;
+  c: Char;
+begin
+  Ok := False;
+  Result := A;
+  if A = '' then
+    Exit;
+  noCanon := False;
+  for i := 1 to Length(A) do
+  begin
+    if MimeFieldByte(A[i]) then
+      Continue;
+    if A[i] = ' ' then
+    begin
+      noCanon := True;
+      Continue;
+    end;
+    Exit;
+  end;
+  Ok := True;
+  if noCanon then
+    Exit;
+  upper := True;
+  for i := 1 to Length(Result) do
+  begin
+    c := Result[i];
+    if upper and (c >= 'a') and (c <= 'z') then
+      c := Chr(Ord(c) - 32)
+    else if (not upper) and (c >= 'A') and (c <= 'Z') then
+      c := Chr(Ord(c) + 32);
+    Result[i] := c;
+    upper := c = '-';
+  end;
+end;
+
+function MimeCanonicalKey(const S: string): string;
+var
+  i: Integer;
+  ok: Boolean;
+begin
+  for i := 1 to Length(S) do
+    if not MimeFieldByte(S[i]) then
+    begin
+      Result := S;
+      Exit;
+    end;
+  Result := MimeCanonKey(S, ok);
+end;
+
+{ ---- fields ---- }
+
+procedure TMimeFields.Add(const Name, Value: string);
+begin
+  if FCount >= Length(FNames) then
+  begin
+    SetLength(FNames, FCount * 2 + 8);
+    SetLength(FValues, FCount * 2 + 8);
+  end;
+  FNames[FCount] := MimeCanonicalKey(Name);
+  FValues[FCount] := Value;
+  FCount := FCount + 1;
+end;
+
+procedure TMimeFields.Remove(const Name: string);
+var
+  i, j: Integer;
+  k: string;
+begin
+  k := MimeCanonicalKey(Name);
+  j := 0;
+  for i := 0 to FCount - 1 do
+    if FNames[i] <> k then
+    begin
+      FNames[j] := FNames[i];
+      FValues[j] := FValues[i];
+      j := j + 1;
+    end;
+  FCount := j;
+end;
+
+procedure TMimeFields.Put(const Name, Value: string);
+begin
+  Remove(Name);
+  Add(Name, Value);
+end;
+
+function TMimeFields.Get(const Name: string): string;
+var
+  i: Integer;
+  k: string;
+begin
+  k := MimeCanonicalKey(Name);
+  for i := 0 to FCount - 1 do
+    if FNames[i] = k then
+    begin
+      Result := FValues[i];
+      Exit;
+    end;
+  Result := '';
+end;
+
+function TMimeFields.Has(const Name: string): Boolean;
+begin
+  Result := CountOf(Name) > 0;
+end;
+
+function TMimeFields.CountOf(const Name: string): Integer;
+var
+  i: Integer;
+  k: string;
+begin
+  k := MimeCanonicalKey(Name);
+  Result := 0;
+  for i := 0 to FCount - 1 do
+    if FNames[i] = k then
+      Result := Result + 1;
+end;
+
+function TMimeFields.ValuesOf(const Name: string): TStringArray;
+var
+  i, n: Integer;
+  k: string;
+begin
+  k := MimeCanonicalKey(Name);
+  SetLength(Result, CountOf(Name));
+  n := 0;
+  for i := 0 to FCount - 1 do
+    if FNames[i] = k then
+    begin
+      Result[n] := FValues[i];
+      n := n + 1;
+    end;
+end;
+
+{ httpguts.headerValueContainsToken }
+function MimeValueHasToken(const V, Token: string): Boolean;
+var
+  rest: string;
+  p: Integer;
+begin
+  rest := V;
+  p := Pos(',', rest);
+  while p > 0 do
+  begin
+    if MimeEqualFold(MimeTrimOws(Copy(rest, 1, p - 1)), Token) then
+    begin
+      Result := True;
+      Exit;
+    end;
+    rest := Copy(rest, p + 1, Length(rest) - p);
+    p := Pos(',', rest);
+  end;
+  Result := MimeEqualFold(MimeTrimOws(rest), Token);
+end;
+
+function TMimeFields.HasToken(const Name, Token: string): Boolean;
+var
+  i: Integer;
+  k: string;
+begin
+  k := MimeCanonicalKey(Name);
+  Result := False;
+  for i := 0 to FCount - 1 do
+    if (FNames[i] = k) and MimeValueHasToken(FValues[i], Token) then
+    begin
+      Result := True;
+      Exit;
+    end;
+end;
+
+function TMimeFields.Count: Integer;
+begin
+  Result := FCount;
+end;
+
+function TMimeFields.NameAt(I: Integer): string;
+begin
+  Result := FNames[I];
+end;
+
+function TMimeFields.ValueAt(I: Integer): string;
+begin
+  Result := FValues[I];
+end;
+
+function TMimeFields.Clone: TMimeFields;
+var
+  i: Integer;
+begin
+  Result := TMimeFields.Create;
+  for i := 0 to FCount - 1 do
+    Result.Add(FNames[i], FValues[i]);
+end;
+
+function TMimeFields.Text: string;
+var
+  i: Integer;
+begin
+  Result := '';
+  for i := 0 to FCount - 1 do
+    Result := Result + FNames[i] + ': ' + FValues[i] + #13#10;
+end;
+
+{ ---- lines and the MIME header ---- }
+
+{ one line of Text from Pos0: False when there is none yet; the line has
+  neither its LF nor the CR before it. At the end of the input a last line
+  with no LF is a line, as bufio's ReadLine gives it. }
+function MimeCutLine(const Text: string; var Pos0: Integer; out Line: string; Eof: Boolean): Boolean;
+var
+  i, n: Integer;
+begin
+  n := Length(Text);
+  i := Pos0;
+  while (i <= n) and (Text[i] <> #10) do
+    i := i + 1;
+  if i > n then
+  begin
+    if Eof and (Pos0 <= n) then
+    begin
+      Line := Copy(Text, Pos0, n - Pos0 + 1);
+      Pos0 := n + 1;
+      Result := True;
+    end
+    else
+      Result := False;
+    Exit;
+  end;
+  if (i > Pos0) and (Text[i - 1] = #13) then
+    Line := Copy(Text, Pos0, i - Pos0 - 1)
+  else
+    Line := Copy(Text, Pos0, i - Pos0);
+  Pos0 := i + 1;
+  Result := True;
+end;
+
+{ textproto.readMIMEHeader over Text from Pos0 up to its blank line.
+  MaxFields is the count of fields allowed (0 any). }
+procedure MimeReadHeader(const Text: string; var Pos0: Integer; Fields: TMimeFields; MaxFields: Integer; Eof: Boolean);
+var
+  line, kv, k, v, key: string;
+  p, i, nfields: Integer;
+  ok: Boolean;
+  save: Integer;
+begin
+  nfields := 0;
+  if (Pos0 <= Length(Text)) and ((Text[Pos0] = ' ') or (Text[Pos0] = #9)) then
+  begin
+    if not MimeCutLine(Text, Pos0, line, Eof) then
+      MimeNeedMore(Eof);
+    if Length(line) > 80 then
+      raise EMimeError.CreateTooLarge('message too large');
+    raise EMimeError.Create('malformed MIME header initial line: ' + MimeQuote(line));
+  end;
+  while True do
+  begin
+    if not MimeCutLine(Text, Pos0, line, Eof) then
+      MimeNeedMore(Eof);
+    if line = '' then
+      Exit;
+    if Pos(':', line) = 0 then
+      raise EMimeError.Create('malformed MIME header: missing colon: ' + MimeQuote(line));
+    kv := MimeTrimOws(line);
+    { continuation lines: a line that starts with a space or a tab is more of this one }
+    { the next byte says whether this line goes on, so it has to be there }
+    if (Pos0 > Length(Text)) and (not Eof) then
+      MimeNeedMore(False);
+    while (Pos0 <= Length(Text)) and ((Text[Pos0] = ' ') or (Text[Pos0] = #9)) do
+    begin
+      while (Pos0 <= Length(Text)) and ((Text[Pos0] = ' ') or (Text[Pos0] = #9)) do
+        Pos0 := Pos0 + 1;
+      kv := kv + ' ';
+      save := Pos0;
+      if not MimeCutLine(Text, Pos0, line, Eof) then
+      begin
+        Pos0 := save;
+        MimeNeedMore(Eof);
+      end;
+      kv := kv + MimeTrimOws(line);
+      if (Pos0 > Length(Text)) and (not Eof) then
+        MimeNeedMore(False);
+    end;
+    p := Pos(':', kv);
+    if p = 0 then
+      raise EMimeError.Create('malformed MIME header line: ' + MimeQuote(kv));
+    k := Copy(kv, 1, p - 1);
+    v := Copy(kv, p + 1, Length(kv) - p);
+    key := MimeCanonKey(k, ok);
+    if not ok then
+      raise EMimeError.Create('malformed MIME header line: ' + MimeQuote(kv));
+    for i := 1 to Length(v) do
+      if not MimeValueByte(v[i]) then
+        { Go canonicalizes the name in the line's own buffer, so the line it quotes has it }
+        raise EMimeError.Create('malformed MIME header line: ' + MimeQuote(key + ':' + v));
+    nfields := nfields + 1;
+    if (MaxFields > 0) and (nfields > MaxFields) then
+      raise EMimeError.CreateTooLarge('message too large');
+    i := 1;
+    while (i <= Length(v)) and ((v[i] = ' ') or (v[i] = #9)) do
+      i := i + 1;
+    Fields.Add(key, Copy(v, i, Length(v) - i + 1));
+  end;
+end;
+
+end.

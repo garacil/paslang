@@ -1,0 +1,259 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+
+  paslang is free software: you can redistribute it and/or modify it
+  under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+
+  paslang is distributed in the hope that it will be useful, but
+  WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+  General Public License for more details.
+
+  Under Section 7 of GPL version 3, you are granted additional
+  permissions described in the paslang Runtime Library Exception,
+  version 1.0, in the file COPYING.RUNTIME.
+
+  You should have received a copy of the GNU General Public License
+  along with paslang.  If not, see <https://www.gnu.org/licenses/>. }
+
+{ Connections (P432): the stream a protocol client reads and writes, as one
+  object whatever carries it. A TNetStream gives the bytes in and out with a
+  deadline on each wait (the routine that waits parks), TTcpStream is a TCP
+  or Unix socket, and a TLS unit gives another kind through TlsDialer (RFC
+  8446 on top of a TcpStream). HTTP, IMAP and SMTP clients are written
+  against TNetStream, so each is TLS-ready when TlsDialer is set. Free of
+  units but sysutils and pasnet, and of state (Regla 11); a stream belongs
+  to the routine that uses it. }
+unit pasconn;
+
+interface
+
+uses
+  sysutils, pasnet;
+
+type
+  { an open connection to a server }
+  TNetStream = class
+  public
+    { up to MaxN bytes before Deadline (a Nanotime, 0 none): the count, 0
+      at the end of the stream, -110 at the deadline, -errno }
+    function ReadSome(MaxN, Deadline: Integer; out Data: string): Integer; virtual;
+    { all of Data before Deadline; False when the peer is gone or time ran out }
+    function WriteAll(const Data: string; Deadline: Integer): Boolean; virtual;
+    procedure Dispose; virtual;
+  end;
+
+  TTcpStream = class(TNetStream)
+  private
+    FFd: Integer;
+  public
+    constructor Create(AFd: Integer);
+    function ReadSome(MaxN, Deadline: Integer; out Data: string): Integer; override;
+    function WriteAll(const Data: string; Deadline: Integer): Boolean; override;
+    procedure Dispose; override;
+  end;
+
+  { dials a TLS connection to Host:Port within ConnectMs; the TLS unit sets
+    TlsDialer. Dial gives nil when it could not. }
+  TNetDialer = class
+  public
+    function Dial(const Host: string; Port, ConnectMs: Integer): TNetStream; virtual;
+  end;
+
+  { turns a connection already open into a TLS one, for STARTTLS (SMTP, IMAP):
+    Host is the server name to check. The TLS unit sets TlsUpgrader. Upgrade
+    gives nil when the handshake failed (the connection is then of no use). }
+  TNetUpgrader = class
+  public
+    function Upgrade(S: TNetStream; const Host: string; ConnectMs: Integer): TNetStream; virtual;
+  end;
+
+var
+  { nil until a TLS unit sets one }
+  TlsDialer: TNetDialer;
+  { nil until a TLS unit sets one }
+  TlsUpgrader: TNetUpgrader;
+
+{ A TCP connection to Host:Port within Ms milliseconds (0 none), the name's
+  resolution included; nil when it fails }
+function DialTcp(const Host: string; Port, Ms: Integer): TNetStream;
+{ A Unix socket }
+function DialUnix(const Path: string): TNetStream;
+{ A line of the stream (to LF, the CR before it dropped) from Buf and the
+  stream, more read into Buf as needed; False at the end of the stream or the
+  deadline (Err says which: 0 end, -110 deadline, else -errno), and for a
+  line longer than MaxLine (Err is -90) }
+function ReadLineFrom(S: TNetStream; var Buf: string; out Line: string; MaxLine, Deadline: Integer; out Err: Integer): Boolean;
+{ N bytes from Buf and the stream }
+function ReadExactFrom(S: TNetStream; var Buf: string; N: Integer; out Data: string; Deadline: Integer; out Err: Integer): Boolean;
+
+implementation
+
+function TNetStream.ReadSome(MaxN, Deadline: Integer; out Data: string): Integer;
+begin
+  Data := '';
+  Result := 0;
+end;
+
+function TNetStream.WriteAll(const Data: string; Deadline: Integer): Boolean;
+begin
+  Result := False;
+end;
+
+procedure TNetStream.Dispose;
+begin
+end;
+
+constructor TTcpStream.Create(AFd: Integer);
+begin
+  inherited Create;
+  FFd := AFd;
+end;
+
+function TTcpStream.ReadSome(MaxN, Deadline: Integer; out Data: string): Integer;
+var
+  buf: string;
+begin
+  Data := '';
+  if FFd < 0 then
+  begin
+    Result := -9;
+    Exit;
+  end;
+  SetLength(buf, MaxN);
+  Result := PasIoRead(FFd, @buf[1], MaxN, Deadline);
+  if Result > 0 then
+    Data := Copy(buf, 1, Result);
+end;
+
+function TTcpStream.WriteAll(const Data: string; Deadline: Integer): Boolean;
+var
+  p, n: Integer;
+begin
+  Result := False;
+  if FFd < 0 then
+    Exit;
+  p := 1;
+  while p <= Length(Data) do
+  begin
+    n := PasIoWrite(FFd, @Data[p], Length(Data) - p + 1, Deadline);
+    if n <= 0 then
+      Exit;
+    p := p + n;
+  end;
+  Result := True;
+end;
+
+procedure TTcpStream.Dispose;
+begin
+  if FFd >= 0 then
+  begin
+    TcpClose(FFd);
+    FFd := -1;
+  end;
+end;
+
+function TNetDialer.Dial(const Host: string; Port, ConnectMs: Integer): TNetStream;
+begin
+  Result := nil;
+end;
+
+function TNetUpgrader.Upgrade(S: TNetStream; const Host: string; ConnectMs: Integer): TNetStream;
+begin
+  Result := nil;
+end;
+
+
+function DialTcp(const Host: string; Port, Ms: Integer): TNetStream;
+var
+  fd: Integer;
+begin
+  Result := nil;
+  if Ms > 0 then
+    fd := TcpConnectToMs(Host, Port, Ms)
+  else
+    fd := TcpConnectTo(Host, Port);
+  if fd < 0 then
+    Exit;
+  TcpKeepAlive(fd, True);
+  Result := TTcpStream.Create(fd);
+end;
+
+function DialUnix(const Path: string): TNetStream;
+var
+  fd: Integer;
+begin
+  Result := nil;
+  fd := UnixConnect(Path);
+  if fd < 0 then
+    Exit;
+  Result := TTcpStream.Create(fd);
+end;
+
+function ReadLineFrom(S: TNetStream; var Buf: string; out Line: string; MaxLine, Deadline: Integer; out Err: Integer): Boolean;
+var
+  p, n: Integer;
+  data: string;
+begin
+  Result := False;
+  Err := 0;
+  Line := '';
+  while True do
+  begin
+    p := Pos(#10, Buf);
+    if p > 0 then
+    begin
+      if (p > 1) and (Buf[p - 1] = #13) then
+        Line := Copy(Buf, 1, p - 2)
+      else
+        Line := Copy(Buf, 1, p - 1);
+      Buf := Copy(Buf, p + 1, Length(Buf) - p);
+      if (MaxLine > 0) and (Length(Line) > MaxLine) then
+      begin
+        Err := -90;
+        Exit;
+      end;
+      Result := True;
+      Exit;
+    end;
+    if (MaxLine > 0) and (Length(Buf) > MaxLine) then
+    begin
+      Err := -90;
+      Exit;
+    end;
+    n := S.ReadSome(16384, Deadline, data);
+    if n <= 0 then
+    begin
+      Err := n;
+      Exit;
+    end;
+    Buf := Buf + data;
+  end;
+end;
+
+function ReadExactFrom(S: TNetStream; var Buf: string; N: Integer; out Data: string; Deadline: Integer; out Err: Integer): Boolean;
+var
+  k: Integer;
+  more: string;
+begin
+  Result := False;
+  Err := 0;
+  Data := '';
+  while Length(Buf) < N do
+  begin
+    k := S.ReadSome(16384, Deadline, more);
+    if k <= 0 then
+    begin
+      Err := k;
+      Exit;
+    end;
+    Buf := Buf + more;
+  end;
+  Data := Copy(Buf, 1, N);
+  Buf := Copy(Buf, N + 1, Length(Buf) - N);
+  Result := True;
+end;
+
+end.

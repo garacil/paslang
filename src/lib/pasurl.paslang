@@ -1,0 +1,1498 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+
+  paslang is free software: you can redistribute it and/or modify it
+  under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+
+  paslang is distributed in the hope that it will be useful, but
+  WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+  General Public License for more details.
+
+  Under Section 7 of GPL version 3, you are granted additional
+  permissions described in the paslang Runtime Library Exception,
+  version 1.0, in the file COPYING.RUNTIME.
+
+  You should have received a copy of the GNU General Public License
+  along with paslang.  If not, see <https://www.gnu.org/licenses/>. }
+
+{ URLs (P432), as Go's net/url reads and writes them (RFC 3986): Parse and
+  ParseRequestURI into a TUrl (the scheme, the userinfo, the host with its
+  port, the path decoded and the path's own spelling kept when it differs
+  from the canonical one, the query as it is, the fragment), String,
+  RequestURI, EscapedPath, ResolveReference (RFC 3986, 5.2) for redirects
+  and links, and the query values: ParseQuery, Encode, the escaping of each
+  part of a URL. The error texts are Go's (parse "x": reason). Free of
+  units but sysutils and of state (Regla 11). }
+unit pasurl;
+
+interface
+
+uses
+  sysutils;
+
+type
+  { how a string is escaped, by the part of the URL it belongs to }
+  TUrlMode = (umPath, umPathSegment, umHost, umZone, umUserPassword, umQueryComponent, umFragment);
+
+  TUrl = record
+    Scheme: string;
+    { encoded opaque data of scheme:opaque }
+    Opaque: string;
+    HasUser: Boolean;
+    User: string;
+    HasPassword: Boolean;
+    Password: string;
+    { host or host:port; an IPv6 address in brackets }
+    Host: string;
+    { the path, decoded; RawPath is its spelling when that is not the
+      canonical escaping of Path }
+    Path: string;
+    RawPath: string;
+    RawQuery: string;
+    Fragment: string;
+    RawFragment: string;
+    { the URL had a ? with nothing after it }
+    ForceQuery: Boolean;
+    { an empty host is not written (file:///x) }
+    OmitHost: Boolean;
+  end;
+
+  { query values: keys in the order first seen, each with its values }
+  TUrlValues = class
+  private
+    FKeys: array of string;
+    FVals: array of array of string;
+    function IndexOf(const Key: string): Integer;
+  public
+    function Get(const Key: string): string;
+    function GetAll(const Key: string): TStringArray;
+    function Has(const Key: string): Boolean;
+    procedure Add(const Key, Value: string);
+    procedure SetValue(const Key, Value: string);
+    procedure Del(const Key: string);
+    function Count: Integer;
+    function KeyName(I: Integer): string;
+    { key=value pairs joined by &, keys sorted, as Go's Values.Encode }
+    function Encode: string;
+  end;
+
+{ Go's url.Parse and url.ParseRequestURI: True with U, else Err is Go's
+  error text }
+function UrlParse(const Raw: string; out U: TUrl; out Err: string): Boolean;
+function UrlParseRequestURI(const Raw: string; out U: TUrl; out Err: string): Boolean;
+function UrlString(const U: TUrl): string;
+function UrlEscapedPath(const U: TUrl): string;
+function UrlEscapedFragment(const U: TUrl): string;
+{ the path and query of a request line }
+function UrlRequestURI(const U: TUrl): string;
+function UrlHostname(const U: TUrl): string;
+function UrlPort(const U: TUrl): string;
+function UrlIsAbs(const U: TUrl): Boolean;
+{ RFC 3986, 5.2: Ref seen from Base }
+function UrlResolve(const Base, Ref: TUrl): TUrl;
+{ Base.Parse(Ref) }
+function UrlParseRef(const Base: TUrl; const Ref: string; out U: TUrl; out Err: string): Boolean;
+
+function UrlEscape(const S: string; Mode: TUrlMode): string;
+{ False with Err (invalid URL escape "%zz") for a bad escape }
+function UrlUnescape(const S: string; Mode: TUrlMode; out R: string; out Err: string): Boolean;
+{ Go's url.ParseQuery: the values read, and the first fault as Err (the
+  other pairs are still read) }
+function UrlParseQuery(const Query: string; V: TUrlValues): string;
+
+implementation
+
+const
+  UpperHex: string = '0123456789ABCDEF';
+
+function IsHex(C: Char): Boolean;
+begin
+  Result := ((C >= '0') and (C <= '9')) or ((C >= 'a') and (C <= 'f')) or ((C >= 'A') and (C <= 'F'));
+end;
+
+function UnHex(C: Char): Integer;
+begin
+  if (C >= '0') and (C <= '9') then
+    Result := Ord(C) - 48
+  else if (C >= 'a') and (C <= 'f') then
+    Result := Ord(C) - 87
+  else
+    Result := Ord(C) - 55;
+end;
+
+function QuoteGo(const S: string): string;
+var
+  i: Integer;
+  c: Integer;
+begin
+  Result := '"';
+  for i := 1 to Length(S) do
+  begin
+    c := Ord(S[i]);
+    if S[i] = '"' then
+      Result := Result + '\"'
+    else if S[i] = '\' then
+      Result := Result + '\\'
+    else if c = 7 then
+      Result := Result + '\a'
+    else if c = 8 then
+      Result := Result + '\b'
+    else if c = 9 then
+      Result := Result + '\t'
+    else if c = 10 then
+      Result := Result + '\n'
+    else if c = 11 then
+      Result := Result + '\v'
+    else if c = 12 then
+      Result := Result + '\f'
+    else if c = 13 then
+      Result := Result + '\r'
+    else if (c < 32) or (c = 127) then
+      Result := Result + '\x' + Copy('0123456789abcdef', (c shr 4) + 1, 1) + Copy('0123456789abcdef', (c and 15) + 1, 1)
+    else
+      Result := Result + S[i];
+  end;
+  Result := Result + '"';
+end;
+
+{ Go's shouldEscape }
+function ShouldEscape(C: Char; Mode: TUrlMode): Boolean;
+begin
+  Result := True;
+  if ((C >= 'a') and (C <= 'z')) or ((C >= 'A') and (C <= 'Z')) or ((C >= '0') and (C <= '9')) then
+  begin
+    Result := False;
+    Exit;
+  end;
+  if (Mode = umHost) or (Mode = umZone) then
+    case C of
+      '!', '$', '&', '''', '(', ')', '*', '+', ',', ';', '=', ':', '[', ']', '<', '>', '"':
+        begin
+          Result := False;
+          Exit;
+        end;
+    end;
+  case C of
+    '-', '_', '.', '~':
+      begin
+        Result := False;
+        Exit;
+      end;
+    '$', '&', '+', ',', '/', ':', ';', '=', '?', '@':
+      case Mode of
+        umPath:
+          begin
+            Result := C = '?';
+            Exit;
+          end;
+        umPathSegment:
+          begin
+            Result := (C = '/') or (C = ';') or (C = ',') or (C = '?');
+            Exit;
+          end;
+        umUserPassword:
+          begin
+            Result := (C = '@') or (C = '/') or (C = '?') or (C = ':');
+            Exit;
+          end;
+        umQueryComponent:
+          begin
+            Result := True;
+            Exit;
+          end;
+        umFragment:
+          begin
+            Result := False;
+            Exit;
+          end;
+      end;
+  end;
+  if Mode = umFragment then
+    case C of
+      '!', '(', ')', '*':
+        begin
+          Result := False;
+          Exit;
+        end;
+    end;
+end;
+
+function UrlEscape(const S: string; Mode: TUrlMode): string;
+var
+  i, spaces, hexes, j: Integer;
+  c: Char;
+begin
+  spaces := 0;
+  hexes := 0;
+  for i := 1 to Length(S) do
+    if ShouldEscape(S[i], Mode) then
+    begin
+      if (S[i] = ' ') and (Mode = umQueryComponent) then
+        spaces := spaces + 1
+      else
+        hexes := hexes + 1;
+    end;
+  if (spaces = 0) and (hexes = 0) then
+  begin
+    Result := S;
+    Exit;
+  end;
+  SetLength(Result, Length(S) + 2 * hexes);
+  j := 0;
+  for i := 1 to Length(S) do
+  begin
+    c := S[i];
+    if (c = ' ') and (Mode = umQueryComponent) then
+    begin
+      j := j + 1;
+      Result[j] := '+';
+    end
+    else if ShouldEscape(c, Mode) then
+    begin
+      Result[j + 1] := '%';
+      Result[j + 2] := UpperHex[(Ord(c) shr 4) + 1];
+      Result[j + 3] := UpperHex[(Ord(c) and 15) + 1];
+      j := j + 3;
+    end
+    else
+    begin
+      j := j + 1;
+      Result[j] := c;
+    end;
+  end;
+end;
+
+function UrlUnescape(const S: string; Mode: TUrlMode; out R: string; out Err: string): Boolean;
+var
+  i, n: Integer;
+  hasPlus: Boolean;
+  piece: string;
+  v: Integer;
+  plusChar: Char;
+begin
+  Result := False;
+  R := '';
+  Err := '';
+  n := 0;
+  hasPlus := False;
+  i := 1;
+  while i <= Length(S) do
+  begin
+    case S[i] of
+      '%':
+        begin
+          n := n + 1;
+          if (i + 2 > Length(S)) or (not IsHex(S[i + 1])) or (not IsHex(S[i + 2])) then
+          begin
+            piece := Copy(S, i, 3);
+            Err := 'invalid URL escape ' + QuoteGo(piece);
+            Exit;
+          end;
+          if (Mode = umHost) and (UnHex(S[i + 1]) < 8) and (Copy(S, i, 3) <> '%25') then
+          begin
+            Err := 'invalid URL escape ' + QuoteGo(Copy(S, i, 3));
+            Exit;
+          end;
+          if Mode = umZone then
+          begin
+            v := UnHex(S[i + 1]) * 16 + UnHex(S[i + 2]);
+            if (Copy(S, i, 3) <> '%25') and (v <> 32) and ShouldEscape(Chr(v), umHost) then
+            begin
+              Err := 'invalid URL escape ' + QuoteGo(Copy(S, i, 3));
+              Exit;
+            end;
+          end;
+          i := i + 3;
+        end;
+      '+':
+        begin
+          hasPlus := Mode = umQueryComponent;
+          i := i + 1;
+        end;
+    else
+      if ((Mode = umHost) or (Mode = umZone)) and (Ord(S[i]) < 128) and ShouldEscape(S[i], Mode) then
+      begin
+        Err := 'invalid character ' + QuoteGo(S[i]) + ' in host name';
+        Exit;
+      end;
+      i := i + 1;
+    end;
+  end;
+  if (n = 0) and (not hasPlus) then
+  begin
+    R := S;
+    Result := True;
+    Exit;
+  end;
+  if Mode = umQueryComponent then
+    plusChar := ' '
+  else
+    plusChar := '+';
+  R := '';
+  i := 1;
+  while i <= Length(S) do
+  begin
+    if S[i] = '%' then
+    begin
+      R := R + Chr(UnHex(S[i + 1]) * 16 + UnHex(S[i + 2]));
+      i := i + 3;
+    end
+    else if S[i] = '+' then
+    begin
+      R := R + plusChar;
+      i := i + 1;
+    end
+    else
+    begin
+      R := R + S[i];
+      i := i + 1;
+    end;
+  end;
+  Result := True;
+end;
+
+{ ---- parsing ---- }
+
+function HasCtl(const S: string): Boolean;
+var
+  i: Integer;
+begin
+  Result := False;
+  for i := 1 to Length(S) do
+    if (Ord(S[i]) < 32) or (Ord(S[i]) = 127) then
+    begin
+      Result := True;
+      Exit;
+    end;
+end;
+
+function CutAt(const S: string; Sep: Char; out Before, After: string): Boolean;
+var
+  p: Integer;
+begin
+  p := Pos(Sep, S);
+  if p = 0 then
+  begin
+    Before := S;
+    After := '';
+    Result := False;
+  end
+  else
+  begin
+    Before := Copy(S, 1, p - 1);
+    After := Copy(S, p + 1, Length(S) - p);
+    Result := True;
+  end;
+end;
+
+function LastIndexOf(const S: string; C: Char): Integer;
+var
+  i: Integer;
+begin
+  Result := 0;
+  for i := Length(S) downto 1 do
+    if S[i] = C then
+    begin
+      Result := i;
+      Exit;
+    end;
+end;
+
+function CountOf(const S: string; C: Char): Integer;
+var
+  i: Integer;
+begin
+  Result := 0;
+  for i := 1 to Length(S) do
+    if S[i] = C then
+      Result := Result + 1;
+end;
+
+function StartsWith(const S, P: string): Boolean;
+begin
+  Result := Copy(S, 1, Length(P)) = P;
+end;
+
+function EndsWith(const S, P: string): Boolean;
+begin
+  Result := (Length(S) >= Length(P)) and (Copy(S, Length(S) - Length(P) + 1, Length(P)) = P);
+end;
+
+function ToLowerAscii(const S: string): string;
+var
+  i: Integer;
+begin
+  Result := S;
+  for i := 1 to Length(Result) do
+    if (Result[i] >= 'A') and (Result[i] <= 'Z') then
+      Result[i] := Chr(Ord(Result[i]) + 32);
+end;
+
+function GetScheme(const Raw: string; out Scheme, Path: string; out Err: string): Boolean;
+var
+  i: Integer;
+  c: Char;
+begin
+  Result := True;
+  Err := '';
+  for i := 1 to Length(Raw) do
+  begin
+    c := Raw[i];
+    if ((c >= 'a') and (c <= 'z')) or ((c >= 'A') and (c <= 'Z')) then
+      Continue;
+    if ((c >= '0') and (c <= '9')) or (c = '+') or (c = '-') or (c = '.') then
+    begin
+      if i = 1 then
+      begin
+        Scheme := '';
+        Path := Raw;
+        Exit;
+      end;
+      Continue;
+    end;
+    if c = ':' then
+    begin
+      if i = 1 then
+      begin
+        Scheme := '';
+        Path := '';
+        Err := 'missing protocol scheme';
+        Result := False;
+        Exit;
+      end;
+      Scheme := Copy(Raw, 1, i - 1);
+      Path := Copy(Raw, i + 1, Length(Raw) - i);
+      Exit;
+    end;
+    Scheme := '';
+    Path := Raw;
+    Exit;
+  end;
+  Scheme := '';
+  Path := Raw;
+end;
+
+function ValidOptionalPort(const Port: string): Boolean;
+var
+  i: Integer;
+begin
+  Result := False;
+  if Port = '' then
+  begin
+    Result := True;
+    Exit;
+  end;
+  if Port[1] <> ':' then
+    Exit;
+  for i := 2 to Length(Port) do
+    if (Port[i] < '0') or (Port[i] > '9') then
+      Exit;
+  Result := True;
+end;
+
+function ValidUserinfo(const S: string): Boolean;
+var
+  i: Integer;
+  c: Char;
+begin
+  Result := False;
+  for i := 1 to Length(S) do
+  begin
+    c := S[i];
+    if ((c >= 'A') and (c <= 'Z')) or ((c >= 'a') and (c <= 'z')) or ((c >= '0') and (c <= '9')) then
+      Continue;
+    case c of
+      '-', '.', '_', ':', '~', '!', '$', '&', '''', '(', ')', '*', '+', ',', ';', '=', '%', '@':
+        Continue;
+    end;
+    Exit;
+  end;
+  Result := True;
+end;
+
+{ netip.ParseAddr's error: parseAddrError.Error }
+function AddrErr(const InText, Msg, At: string): string;
+begin
+  Result := 'ParseAddr(' + QuoteGo(InText) + '): ' + Msg;
+  if At <> '' then
+    Result := Result + ' (at ' + QuoteGo(At) + ')';
+end;
+
+{ netip's parseIPv4Fields on In[Off+1 .. End] }
+function ParseIPv4Fields(const InText: string; Off, EndAt: Integer; out Err: string): Boolean;
+var
+  s: string;
+  i, oct, dots4, digLen: Integer;
+begin
+  Result := False;
+  Err := '';
+  s := Copy(InText, Off + 1, EndAt - Off);
+  oct := 0;
+  dots4 := 0;
+  digLen := 0;
+  for i := 1 to Length(s) do
+  begin
+    if (s[i] >= '0') and (s[i] <= '9') then
+    begin
+      if (digLen = 1) and (oct = 0) then
+      begin
+        Err := AddrErr(InText, 'IPv4 field has octet with leading zero', '');
+        Exit;
+      end;
+      oct := oct * 10 + (Ord(s[i]) - 48);
+      digLen := digLen + 1;
+      if oct > 255 then
+      begin
+        Err := AddrErr(InText, 'IPv4 field has value >255', '');
+        Exit;
+      end;
+    end
+    else if s[i] = '.' then
+    begin
+      if (i = 1) or (i = Length(s)) or (s[i - 1] = '.') then
+      begin
+        Err := AddrErr(InText, 'IPv4 field must have at least one digit', Copy(s, i, Length(s) - i + 1));
+        Exit;
+      end;
+      if dots4 = 3 then
+      begin
+        Err := AddrErr(InText, 'IPv4 address too long', '');
+        Exit;
+      end;
+      dots4 := dots4 + 1;
+      oct := 0;
+      digLen := 0;
+    end
+    else
+    begin
+      Err := AddrErr(InText, 'unexpected character', Copy(s, i, Length(s) - i + 1));
+      Exit;
+    end;
+  end;
+  if dots4 < 3 then
+  begin
+    Err := AddrErr(InText, 'IPv4 address too short', '');
+    Exit;
+  end;
+  Result := True;
+end;
+
+{ netip's parseIPv6 }
+function ParseIPv6Text(const InText: string; out Err: string): Boolean;
+var
+  s, zone: string;
+  i, p, off, ellipsis, endAt: Integer;
+  acc: Integer;
+  c: Char;
+begin
+  Result := False;
+  Err := '';
+  s := InText;
+  zone := '';
+  p := Pos('%', s);
+  if p > 0 then
+  begin
+    zone := Copy(s, p + 1, Length(s) - p);
+    s := Copy(s, 1, p - 1);
+    if zone = '' then
+    begin
+      Err := AddrErr(InText, 'zone must be a non-empty string', '');
+      Exit;
+    end;
+  end;
+  ellipsis := -1;
+  if (Length(s) >= 2) and (s[1] = ':') and (s[2] = ':') then
+  begin
+    ellipsis := 0;
+    s := Copy(s, 3, Length(s) - 2);
+    if s = '' then
+    begin
+      Result := True;
+      Exit;
+    end;
+  end;
+  i := 0;
+  while i < 16 do
+  begin
+    off := 0;
+    acc := 0;
+    while off < Length(s) do
+    begin
+      c := s[off + 1];
+      if (c >= '0') and (c <= '9') then
+        acc := (acc shl 4) + (Ord(c) - 48)
+      else if (c >= 'a') and (c <= 'f') then
+        acc := (acc shl 4) + (Ord(c) - 87)
+      else if (c >= 'A') and (c <= 'F') then
+        acc := (acc shl 4) + (Ord(c) - 55)
+      else
+        Break;
+      if off > 3 then
+      begin
+        Err := AddrErr(InText, 'each group must have 4 or less digits', s);
+        Exit;
+      end;
+      if acc > 65535 then
+      begin
+        Err := AddrErr(InText, 'IPv6 field has value >=2^16', s);
+        Exit;
+      end;
+      off := off + 1;
+    end;
+    if off = 0 then
+    begin
+      Err := AddrErr(InText, 'each colon-separated field must have at least one digit', s);
+      Exit;
+    end;
+    if (off < Length(s)) and (s[off + 1] = '.') then
+    begin
+      if (ellipsis < 0) and (i <> 12) then
+      begin
+        Err := AddrErr(InText, 'embedded IPv4 address must replace the final 2 fields of the address', s);
+        Exit;
+      end;
+      if i + 4 > 16 then
+      begin
+        Err := AddrErr(InText, 'too many hex fields to fit an embedded IPv4 at the end of the address', s);
+        Exit;
+      end;
+      endAt := Length(InText);
+      if Length(zone) > 0 then
+        endAt := endAt - (Length(zone) + 1);
+      if not ParseIPv4Fields(InText, endAt - Length(s), endAt, Err) then
+        Exit;
+      s := '';
+      i := i + 4;
+      Break;
+    end;
+    i := i + 2;
+    s := Copy(s, off + 1, Length(s) - off);
+    if s = '' then
+      Break;
+    if s[1] <> ':' then
+    begin
+      Err := AddrErr(InText, 'unexpected character, want colon', s);
+      Exit;
+    end
+    else if Length(s) = 1 then
+    begin
+      Err := AddrErr(InText, 'colon must be followed by more characters', s);
+      Exit;
+    end;
+    s := Copy(s, 2, Length(s) - 1);
+    if s[1] = ':' then
+    begin
+      if ellipsis >= 0 then
+      begin
+        Err := AddrErr(InText, 'multiple :: in address', s);
+        Exit;
+      end;
+      ellipsis := i;
+      s := Copy(s, 2, Length(s) - 1);
+      if s = '' then
+        Break;
+    end;
+  end;
+  if s <> '' then
+  begin
+    Err := AddrErr(InText, 'trailing garbage after address', s);
+    Exit;
+  end;
+  if i < 16 then
+  begin
+    if ellipsis < 0 then
+    begin
+      Err := AddrErr(InText, 'address string too short', '');
+      Exit;
+    end;
+  end
+  else if ellipsis >= 0 then
+  begin
+    Err := AddrErr(InText, 'the :: must expand to at least one field of zeros', '');
+    Exit;
+  end;
+  Result := True;
+end;
+
+{ netip.ParseAddr: True with Is4 when the text is an IPv4 address }
+function ParseAddrText(const S: string; out Is4: Boolean; out Err: string): Boolean;
+var
+  i: Integer;
+begin
+  Is4 := False;
+  Err := '';
+  for i := 1 to Length(S) do
+    case S[i] of
+      '.':
+        begin
+          Result := ParseIPv4Fields(S, 0, Length(S), Err);
+          Is4 := Result;
+          Exit;
+        end;
+      ':':
+        begin
+          Result := ParseIPv6Text(S, Err);
+          Exit;
+        end;
+      '%':
+        begin
+          Err := AddrErr(S, 'missing IPv6 address', '');
+          Result := False;
+          Exit;
+        end;
+    end;
+  Err := AddrErr(S, 'unable to parse IP', '');
+  Result := False;
+end;
+
+function ParseHost(const Scheme, Host: string; out R: string; out Err: string): Boolean;
+var
+  openAt, closeAt, p, i, lastColon, zoneIdx: Integer;
+  colonPort, unPort, hostname, unHostname, hostPart, zonePart, aerr: string;
+  is4: Boolean;
+begin
+  Result := False;
+  R := '';
+  openAt := LastIndexOf(Host, '[');
+  if openAt > 1 then
+  begin
+    Err := 'invalid IP-literal';
+    Exit;
+  end
+  else if openAt = 1 then
+  begin
+    closeAt := LastIndexOf(Host, ']');
+    if closeAt = 0 then
+    begin
+      Err := 'missing '']'' in host';
+      Exit;
+    end;
+    colonPort := Copy(Host, closeAt + 1, Length(Host) - closeAt);
+    if not ValidOptionalPort(colonPort) then
+    begin
+      Err := 'invalid port ' + QuoteGo(colonPort) + ' after host';
+      Exit;
+    end;
+    if not UrlUnescape(colonPort, umHost, unPort, Err) then
+      Exit;
+    hostname := Copy(Host, 2, closeAt - 2);
+    zoneIdx := Pos('%25', hostname);
+    if zoneIdx > 0 then
+    begin
+      if not UrlUnescape(Copy(hostname, 1, zoneIdx - 1), umHost, hostPart, Err) then
+        Exit;
+      if not UrlUnescape(Copy(hostname, zoneIdx, Length(hostname) - zoneIdx + 1), umZone, zonePart, Err) then
+        Exit;
+      unHostname := hostPart + zonePart;
+    end
+    else if not UrlUnescape(hostname, umHost, unHostname, Err) then
+      Exit;
+    if not ParseAddrText(unHostname, is4, aerr) then
+    begin
+      Err := 'invalid host: ' + aerr;
+      Exit;
+    end;
+    if is4 then
+    begin
+      Err := 'invalid IP-literal';
+      Exit;
+    end;
+    R := '[' + unHostname + ']' + unPort;
+    Result := True;
+    Exit;
+  end;
+  p := Pos(':', Host);
+  if p > 0 then
+  begin
+    i := p;
+    lastColon := LastIndexOf(Host, ':');
+    if lastColon <> i then
+    begin
+      { more than one colon: for http and https that is a fault, for any
+        other scheme the port is after the last }
+      if (Scheme <> 'http') and (Scheme <> 'https') then
+        i := lastColon;
+    end;
+    colonPort := Copy(Host, i, Length(Host) - i + 1);
+    if not ValidOptionalPort(colonPort) then
+    begin
+      Err := 'invalid port ' + QuoteGo(colonPort) + ' after host';
+      Exit;
+    end;
+  end;
+  if not UrlUnescape(Host, umHost, R, Err) then
+    Exit;
+  Result := True;
+end;
+
+procedure SetPath(var U: TUrl; const P: string; out Ok: Boolean; out Err: string);
+var
+  path: string;
+begin
+  Ok := UrlUnescape(P, umPath, path, Err);
+  if not Ok then
+    Exit;
+  U.Path := path;
+  if P = UrlEscape(path, umPath) then
+    U.RawPath := ''
+  else
+    U.RawPath := P;
+end;
+
+procedure SetFragment(var U: TUrl; const F: string; out Ok: Boolean; out Err: string);
+var
+  frag: string;
+begin
+  Ok := UrlUnescape(F, umFragment, frag, Err);
+  if not Ok then
+    Exit;
+  U.Fragment := frag;
+  if F = UrlEscape(frag, umFragment) then
+    U.RawFragment := ''
+  else
+    U.RawFragment := F;
+end;
+
+function ParseAuthority(const Scheme, Authority: string; var U: TUrl; out Err: string): Boolean;
+var
+  i: Integer;
+  host, userinfo, name, pass, un: string;
+begin
+  Result := False;
+  i := LastIndexOf(Authority, '@');
+  if i = 0 then
+  begin
+    if not ParseHost(Scheme, Authority, host, Err) then
+      Exit;
+    U.Host := host;
+    Result := True;
+    Exit;
+  end;
+  if not ParseHost(Scheme, Copy(Authority, i + 1, Length(Authority) - i), host, Err) then
+    Exit;
+  userinfo := Copy(Authority, 1, i - 1);
+  if not ValidUserinfo(userinfo) then
+  begin
+    Err := 'net/url: invalid userinfo';
+    Exit;
+  end;
+  U.Host := host;
+  U.HasUser := True;
+  if Pos(':', userinfo) = 0 then
+  begin
+    if not UrlUnescape(userinfo, umUserPassword, un, Err) then
+      Exit;
+    U.User := un;
+  end
+  else
+  begin
+    CutAt(userinfo, ':', name, pass);
+    if not UrlUnescape(name, umUserPassword, un, Err) then
+      Exit;
+    U.User := un;
+    if not UrlUnescape(pass, umUserPassword, un, Err) then
+      Exit;
+    U.Password := un;
+    U.HasPassword := True;
+  end;
+  Result := True;
+end;
+
+function ParseCore(const Raw: string; ViaRequest: Boolean; out U: TUrl; out Err: string): Boolean;
+var
+  rest, segment, authority, q, ignore: string;
+  ok: Boolean;
+  i: Integer;
+begin
+  Result := False;
+  Err := '';
+  U.Scheme := '';
+  U.Opaque := '';
+  U.HasUser := False;
+  U.User := '';
+  U.HasPassword := False;
+  U.Password := '';
+  U.Host := '';
+  U.Path := '';
+  U.RawPath := '';
+  U.RawQuery := '';
+  U.Fragment := '';
+  U.RawFragment := '';
+  U.ForceQuery := False;
+  U.OmitHost := False;
+  if HasCtl(Raw) then
+  begin
+    Err := 'net/url: invalid control character in URL';
+    Exit;
+  end;
+  if (Raw = '') and ViaRequest then
+  begin
+    Err := 'empty url';
+    Exit;
+  end;
+  if Raw = '*' then
+  begin
+    U.Path := '*';
+    Result := True;
+    Exit;
+  end;
+  if not GetScheme(Raw, U.Scheme, rest, Err) then
+    Exit;
+  U.Scheme := ToLowerAscii(U.Scheme);
+  if EndsWith(rest, '?') and (CountOf(rest, '?') = 1) then
+  begin
+    U.ForceQuery := True;
+    rest := Copy(rest, 1, Length(rest) - 1);
+  end
+  else
+  begin
+    CutAt(rest, '?', segment, q);
+    rest := segment;
+    U.RawQuery := q;
+  end;
+  if not StartsWith(rest, '/') then
+  begin
+    if U.Scheme <> '' then
+    begin
+      U.Opaque := rest;
+      Result := True;
+      Exit;
+    end;
+    if ViaRequest then
+    begin
+      Err := 'invalid URI for request';
+      Exit;
+    end;
+    CutAt(rest, '/', segment, ignore);
+    if Pos(':', segment) > 0 then
+    begin
+      Err := 'first path segment in URL cannot contain colon';
+      Exit;
+    end;
+  end;
+  if ((U.Scheme <> '') or ((not ViaRequest) and (not StartsWith(rest, '///')))) and StartsWith(rest, '//') then
+  begin
+    authority := Copy(rest, 3, Length(rest) - 2);
+    rest := '';
+    i := Pos('/', authority);
+    if i > 0 then
+    begin
+      rest := Copy(authority, i, Length(authority) - i + 1);
+      authority := Copy(authority, 1, i - 1);
+    end;
+    if not ParseAuthority(U.Scheme, authority, U, Err) then
+      Exit;
+  end
+  else if (U.Scheme <> '') and StartsWith(rest, '/') then
+    U.OmitHost := True;
+  SetPath(U, rest, ok, Err);
+  if not ok then
+    Exit;
+  Result := True;
+end;
+
+function UrlParse(const Raw: string; out U: TUrl; out Err: string): Boolean;
+var
+  u0, frag, e2: string;
+  ok: Boolean;
+  hadFrag: Boolean;
+begin
+  hadFrag := CutAt(Raw, '#', u0, frag);
+  if not ParseCore(u0, False, U, Err) then
+  begin
+    Err := 'parse ' + QuoteGo(u0) + ': ' + Err;
+    Result := False;
+    Exit;
+  end;
+  Result := True;
+  if frag = '' then
+    Exit;
+  SetFragment(U, frag, ok, e2);
+  if not ok then
+  begin
+    Err := 'parse ' + QuoteGo(Raw) + ': ' + e2;
+    Result := False;
+  end;
+end;
+
+function UrlParseRequestURI(const Raw: string; out U: TUrl; out Err: string): Boolean;
+begin
+  Result := ParseCore(Raw, True, U, Err);
+  if not Result then
+    Err := 'parse ' + QuoteGo(Raw) + ': ' + Err;
+end;
+
+{ ---- writing ---- }
+
+function ValidEncoded(const S: string; Mode: TUrlMode): Boolean;
+var
+  i: Integer;
+begin
+  Result := False;
+  for i := 1 to Length(S) do
+    case S[i] of
+      '!', '$', '&', '''', '(', ')', '*', '+', ',', ';', '=', ':', '@', '[', ']', '%':
+        ;
+    else
+      if ShouldEscape(S[i], Mode) then
+        Exit;
+    end;
+  Result := True;
+end;
+
+function UrlEscapedPath(const U: TUrl): string;
+var
+  p, err: string;
+begin
+  if (U.RawPath <> '') and ValidEncoded(U.RawPath, umPath) then
+    if UrlUnescape(U.RawPath, umPath, p, err) and (p = U.Path) then
+    begin
+      Result := U.RawPath;
+      Exit;
+    end;
+  if U.Path = '*' then
+  begin
+    Result := '*';
+    Exit;
+  end;
+  Result := UrlEscape(U.Path, umPath);
+end;
+
+function UrlEscapedFragment(const U: TUrl): string;
+var
+  f, err: string;
+begin
+  if (U.RawFragment <> '') and ValidEncoded(U.RawFragment, umFragment) then
+    if UrlUnescape(U.RawFragment, umFragment, f, err) and (f = U.Fragment) then
+    begin
+      Result := U.RawFragment;
+      Exit;
+    end;
+  Result := UrlEscape(U.Fragment, umFragment);
+end;
+
+function UserInfoString(const U: TUrl): string;
+begin
+  Result := UrlEscape(U.User, umUserPassword);
+  if U.HasPassword then
+    Result := Result + ':' + UrlEscape(U.Password, umUserPassword);
+end;
+
+function UrlString(const U: TUrl): string;
+var
+  path, segment, ignore: string;
+begin
+  Result := '';
+  if U.Scheme <> '' then
+    Result := U.Scheme + ':';
+  if U.Opaque <> '' then
+    Result := Result + U.Opaque
+  else
+  begin
+    if (U.Scheme <> '') or (U.Host <> '') or U.HasUser then
+    begin
+      if U.OmitHost and (U.Host = '') and (not U.HasUser) then
+      begin
+        { omit empty host }
+      end
+      else
+      begin
+        if (U.Host <> '') or (U.Path <> '') or U.HasUser then
+          Result := Result + '//';
+        if U.HasUser then
+          Result := Result + UserInfoString(U) + '@';
+        if U.Host <> '' then
+          Result := Result + UrlEscape(U.Host, umHost);
+      end;
+    end;
+    path := UrlEscapedPath(U);
+    if U.OmitHost and (U.Host = '') and (not U.HasUser) and StartsWith(path, '//') then
+    begin
+      Result := Result + '%2F';
+      path := Copy(path, 2, Length(path) - 1);
+    end;
+    if (path <> '') and (path[1] <> '/') and (U.Host <> '') then
+      Result := Result + '/';
+    if Result = '' then
+    begin
+      CutAt(path, '/', segment, ignore);
+      if Pos(':', segment) > 0 then
+        Result := Result + './';
+    end;
+    Result := Result + path;
+  end;
+  if U.ForceQuery or (U.RawQuery <> '') then
+    Result := Result + '?' + U.RawQuery;
+  if U.Fragment <> '' then
+    Result := Result + '#' + UrlEscapedFragment(U);
+end;
+
+function UrlRequestURI(const U: TUrl): string;
+begin
+  Result := U.Opaque;
+  if Result = '' then
+  begin
+    Result := UrlEscapedPath(U);
+    if Result = '' then
+      Result := '/';
+  end
+  else if StartsWith(Result, '//') then
+    Result := U.Scheme + ':' + Result;
+  if U.ForceQuery or (U.RawQuery <> '') then
+    Result := Result + '?' + U.RawQuery;
+end;
+
+procedure SplitHostPort(const HostPort: string; out Host, Port: string);
+var
+  colon: Integer;
+begin
+  Host := HostPort;
+  Port := '';
+  colon := LastIndexOf(Host, ':');
+  if (colon > 0) and ValidOptionalPort(Copy(Host, colon, Length(Host) - colon + 1)) then
+  begin
+    Port := Copy(Host, colon + 1, Length(Host) - colon);
+    Host := Copy(Host, 1, colon - 1);
+  end;
+  if StartsWith(Host, '[') and EndsWith(Host, ']') then
+    Host := Copy(Host, 2, Length(Host) - 2);
+end;
+
+function UrlHostname(const U: TUrl): string;
+var
+  p: string;
+begin
+  SplitHostPort(U.Host, Result, p);
+end;
+
+function UrlPort(const U: TUrl): string;
+var
+  h: string;
+begin
+  SplitHostPort(U.Host, h, Result);
+end;
+
+function UrlIsAbs(const U: TUrl): Boolean;
+begin
+  Result := U.Scheme <> '';
+end;
+
+{ ---- references ---- }
+
+function ResolvePath(const Base, Ref: string): string;
+var
+  full, remaining, elem, dst: string;
+  i, p: Integer;
+  found, first: Boolean;
+begin
+  if Ref = '' then
+    full := Base
+  else if Ref[1] <> '/' then
+  begin
+    i := LastIndexOf(Base, '/');
+    full := Copy(Base, 1, i) + Ref;
+  end
+  else
+    full := Ref;
+  if full = '' then
+  begin
+    Result := '';
+    Exit;
+  end;
+  dst := '/';
+  elem := '';
+  remaining := full;
+  found := True;
+  first := True;
+  while found do
+  begin
+    p := Pos('/', remaining);
+    if p = 0 then
+    begin
+      elem := remaining;
+      remaining := '';
+      found := False;
+    end
+    else
+    begin
+      elem := Copy(remaining, 1, p - 1);
+      remaining := Copy(remaining, p + 1, Length(remaining) - p);
+    end;
+    if elem = '.' then
+    begin
+      first := False;
+      Continue;
+    end;
+    if elem = '..' then
+    begin
+      { drop the last element of dst after its leading slash }
+      i := LastIndexOf(Copy(dst, 2, Length(dst) - 1), '/');
+      if i > 0 then
+        dst := Copy(dst, 1, i)
+      else
+        dst := '/';
+      first := Length(dst) = 1;
+    end
+    else
+    begin
+      if not first then
+        dst := dst + '/';
+      dst := dst + elem;
+      first := False;
+    end;
+  end;
+  if (elem = '.') or (elem = '..') then
+    dst := dst + '/';
+  if (Length(dst) > 1) and (dst[2] = '/') then
+    Result := Copy(dst, 2, Length(dst) - 1)
+  else
+    Result := dst;
+end;
+
+function UrlResolve(const Base, Ref: TUrl): TUrl;
+var
+  ok: Boolean;
+  err: string;
+begin
+  Result := Ref;
+  if Ref.Scheme = '' then
+    Result.Scheme := Base.Scheme;
+  if (Ref.Scheme <> '') or (Ref.Host <> '') or Ref.HasUser then
+  begin
+    SetPath(Result, ResolvePath(UrlEscapedPath(Ref), ''), ok, err);
+    Exit;
+  end;
+  if Ref.Opaque <> '' then
+  begin
+    Result.HasUser := False;
+    Result.User := '';
+    Result.HasPassword := False;
+    Result.Password := '';
+    Result.Host := '';
+    Result.Path := '';
+    Exit;
+  end;
+  if (Ref.Path = '') and (not Ref.ForceQuery) and (Ref.RawQuery = '') then
+  begin
+    Result.RawQuery := Base.RawQuery;
+    if Ref.Fragment = '' then
+    begin
+      Result.Fragment := Base.Fragment;
+      Result.RawFragment := Base.RawFragment;
+    end;
+  end;
+  if (Ref.Path = '') and (Base.Opaque <> '') then
+  begin
+    Result.Opaque := Base.Opaque;
+    Result.HasUser := False;
+    Result.User := '';
+    Result.HasPassword := False;
+    Result.Password := '';
+    Result.Host := '';
+    Result.Path := '';
+    Exit;
+  end;
+  Result.Host := Base.Host;
+  Result.HasUser := Base.HasUser;
+  Result.User := Base.User;
+  Result.HasPassword := Base.HasPassword;
+  Result.Password := Base.Password;
+  SetPath(Result, ResolvePath(UrlEscapedPath(Base), UrlEscapedPath(Ref)), ok, err);
+end;
+
+function UrlParseRef(const Base: TUrl; const Ref: string; out U: TUrl; out Err: string): Boolean;
+var
+  r: TUrl;
+begin
+  Result := UrlParse(Ref, r, Err);
+  if Result then
+    U := UrlResolve(Base, r);
+end;
+
+{ ---- query values ---- }
+
+function TUrlValues.IndexOf(const Key: string): Integer;
+var
+  i: Integer;
+begin
+  Result := -1;
+  for i := 0 to Length(FKeys) - 1 do
+    if FKeys[i] = Key then
+    begin
+      Result := i;
+      Exit;
+    end;
+end;
+
+function TUrlValues.Get(const Key: string): string;
+var
+  i: Integer;
+begin
+  i := IndexOf(Key);
+  if (i < 0) or (Length(FVals[i]) = 0) then
+    Result := ''
+  else
+    Result := FVals[i][0];
+end;
+
+function TUrlValues.GetAll(const Key: string): TStringArray;
+var
+  i: Integer;
+begin
+  i := IndexOf(Key);
+  if i < 0 then
+    SetLength(Result, 0)
+  else
+    Result := FVals[i];
+end;
+
+function TUrlValues.Has(const Key: string): Boolean;
+begin
+  Result := IndexOf(Key) >= 0;
+end;
+
+procedure TUrlValues.Add(const Key, Value: string);
+var
+  i, n: Integer;
+begin
+  i := IndexOf(Key);
+  if i < 0 then
+  begin
+    n := Length(FKeys);
+    SetLength(FKeys, n + 1);
+    SetLength(FVals, n + 1);
+    FKeys[n] := Key;
+    i := n;
+  end;
+  n := Length(FVals[i]);
+  SetLength(FVals[i], n + 1);
+  FVals[i][n] := Value;
+end;
+
+procedure TUrlValues.SetValue(const Key, Value: string);
+var
+  i, n: Integer;
+begin
+  i := IndexOf(Key);
+  if i < 0 then
+  begin
+    n := Length(FKeys);
+    SetLength(FKeys, n + 1);
+    SetLength(FVals, n + 1);
+    FKeys[n] := Key;
+    i := n;
+  end;
+  SetLength(FVals[i], 1);
+  FVals[i][0] := Value;
+end;
+
+procedure TUrlValues.Del(const Key: string);
+var
+  i, j: Integer;
+begin
+  i := IndexOf(Key);
+  if i < 0 then
+    Exit;
+  for j := i to Length(FKeys) - 2 do
+  begin
+    FKeys[j] := FKeys[j + 1];
+    FVals[j] := FVals[j + 1];
+  end;
+  SetLength(FKeys, Length(FKeys) - 1);
+  SetLength(FVals, Length(FVals) - 1);
+end;
+
+function TUrlValues.Count: Integer;
+begin
+  Result := Length(FKeys);
+end;
+
+function TUrlValues.KeyName(I: Integer): string;
+begin
+  Result := FKeys[I];
+end;
+
+function TUrlValues.Encode: string;
+var
+  order: array of Integer;
+  i, j, t, k: Integer;
+  ke: string;
+begin
+  Result := '';
+  SetLength(order, Length(FKeys));
+  for i := 0 to Length(FKeys) - 1 do
+    order[i] := i;
+  { keys sorted by their bytes; an insertion sort, there are few }
+  for i := 1 to Length(order) - 1 do
+  begin
+    t := order[i];
+    j := i - 1;
+    while (j >= 0) and (FKeys[order[j]] > FKeys[t]) do
+    begin
+      order[j + 1] := order[j];
+      j := j - 1;
+    end;
+    order[j + 1] := t;
+  end;
+  for i := 0 to Length(order) - 1 do
+  begin
+    ke := UrlEscape(FKeys[order[i]], umQueryComponent);
+    for k := 0 to Length(FVals[order[i]]) - 1 do
+    begin
+      if Result <> '' then
+        Result := Result + '&';
+      Result := Result + ke + '=' + UrlEscape(FVals[order[i]][k], umQueryComponent);
+    end;
+  end;
+end;
+
+function UrlParseQuery(const Query: string; V: TUrlValues): string;
+var
+  q, key, value, k1, v1, e1, ignore: string;
+  firstErr: string;
+  cnt: Integer;
+begin
+  firstErr := '';
+  if CountOf(Query, '&') + 1 > 10000 then
+  begin
+    Result := 'number of URL query parameters exceeded limit';
+    Exit;
+  end;
+  q := Query;
+  while q <> '' do
+  begin
+    CutAt(q, '&', key, ignore);
+    cnt := Pos('&', q);
+    if cnt = 0 then
+      q := ''
+    else
+      q := Copy(q, cnt + 1, Length(q) - cnt);
+    if Pos(';', key) > 0 then
+    begin
+      firstErr := 'invalid semicolon separator in query';
+      Continue;
+    end;
+    if key = '' then
+      Continue;
+    CutAt(key, '=', k1, v1);
+    if not UrlUnescape(k1, umQueryComponent, key, e1) then
+    begin
+      if firstErr = '' then
+        firstErr := e1;
+      Continue;
+    end;
+    if not UrlUnescape(v1, umQueryComponent, value, e1) then
+    begin
+      if firstErr = '' then
+        firstErr := e1;
+      Continue;
+    end;
+    V.Add(key, value);
+  end;
+  Result := firstErr;
+end;
+
+end.

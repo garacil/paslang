@@ -1,0 +1,281 @@
+{ P432: pashttp against Go's net/http. testdata/httpmsg.txt (scripts/
+  http_corpus.py writes it) holds 2,492 messages, requests and responses of
+  every framing, each cut short and with a byte changed, and what Go's
+  ReadRequest or ReadResponse and the reading of the body to its end make of
+  each: the start line, the fields, Close, the length, whether it is chunked,
+  the body (its length and CRC-32, or the error), the trailer and the bytes
+  left over. Each is fed whole and then in pieces of 1, 2, 3 and 7 bytes, and
+  the same cells are made and compared; only the lines that differ are
+  written, then the counts. Then the writer's pieces. }
+program httpmsg;
+
+uses
+  sysutils, pascodec, pasurl, pastextproto, pashttp;
+
+const
+  HexDigits: string = '0123456789abcdef';
+  Chunks: array[0..4] of Integer = (100000, 1, 2, 3, 7);
+
+function Q(const S: string): string;
+var
+  i, c: Integer;
+begin
+  Result := '';
+  for i := 1 to Length(S) do
+  begin
+    c := Ord(S[i]);
+    if (c > 32) and (c < 127) and (c <> 124) then
+      Result := Result + S[i]
+    else
+      Result := Result + '\x' + HexDigits[(c shr 4) + 1] + HexDigits[(c and 15) + 1];
+  end;
+  if Result = '' then
+    Result := '-';
+end;
+
+function Bit(V: Boolean): string;
+begin
+  if V then
+    Result := '1'
+  else
+    Result := '0';
+end;
+
+function Hex8(V: Integer): string;
+var
+  i: Integer;
+begin
+  SetLength(Result, 8);
+  for i := 8 downto 1 do
+  begin
+    Result[i] := HexDigits[(V and 15) + 1];
+    V := V shr 4;
+  end;
+end;
+
+{ the fields with their keys sorted, each key=value+value; Announced are the
+  keys of a Trailer header, with no value unless Actual has them }
+function DumpFields(F: THttpFields; Announced: TStringArray; Actual: THttpFields): string;
+var
+  keys: array of string;
+  i, j, k, n: Integer;
+  t, v: string;
+  found: Boolean;
+  vals: TStringArray;
+begin
+  SetLength(keys, 0);
+  if F <> nil then
+    for i := 0 to F.Count - 1 do
+    begin
+      found := False;
+      for j := 0 to Length(keys) - 1 do
+        if keys[j] = F.NameAt(i) then
+          found := True;
+      if not found then
+      begin
+        SetLength(keys, Length(keys) + 1);
+        keys[Length(keys) - 1] := F.NameAt(i);
+      end;
+    end;
+  for i := 0 to Length(Announced) - 1 do
+  begin
+    found := False;
+    for j := 0 to Length(keys) - 1 do
+      if keys[j] = Announced[i] then
+        found := True;
+    if not found then
+    begin
+      SetLength(keys, Length(keys) + 1);
+      keys[Length(keys) - 1] := Announced[i];
+    end;
+  end;
+  if Actual <> nil then
+    for i := 0 to Actual.Count - 1 do
+    begin
+      found := False;
+      for j := 0 to Length(keys) - 1 do
+        if keys[j] = Actual.NameAt(i) then
+          found := True;
+      if not found then
+      begin
+        SetLength(keys, Length(keys) + 1);
+        keys[Length(keys) - 1] := Actual.NameAt(i);
+      end;
+    end;
+  for i := 1 to Length(keys) - 1 do
+  begin
+    t := keys[i];
+    j := i - 1;
+    while (j >= 0) and (keys[j] > t) do
+    begin
+      keys[j + 1] := keys[j];
+      j := j - 1;
+    end;
+    keys[j + 1] := t;
+  end;
+  if Length(keys) = 0 then
+  begin
+    Result := '-';
+    Exit;
+  end;
+  Result := '';
+  for i := 0 to Length(keys) - 1 do
+  begin
+    if i > 0 then
+      Result := Result + ',';
+    if (Actual <> nil) and Actual.Has(keys[i]) then
+      vals := Actual.ValuesOf(keys[i])
+    else if F <> nil then
+      vals := F.ValuesOf(keys[i])
+    else
+      SetLength(vals, 0);
+    v := '';
+    for k := 0 to Length(vals) - 1 do
+    begin
+      if k > 0 then
+        v := v + '+';
+      v := v + Q(vals[k]);
+    end;
+    n := 0;
+    Result := Result + Q(keys[i]) + '=' + v;
+  end;
+end;
+
+function Verdict(IsReq: Boolean; const Method, Msg: string; Chunk: Integer): string;
+var
+  r: THttpMessageReader;
+  i, n: Integer;
+  body, headErr, bodyErr, bd, u, st: string;
+  h: THttpHead;
+  hf: THttpFields;
+  none: TStringArray;
+begin
+  r := THttpMessageReader.Create(IsReq, Method);
+  r.MaxHeaderBytes := 0;
+  body := '';
+  headErr := '';
+  bodyErr := '';
+  try
+    i := 1;
+    while i <= Length(Msg) do
+    begin
+      n := Chunk;
+      if i + n - 1 > Length(Msg) then
+        n := Length(Msg) - i + 1;
+      r.Feed(Copy(Msg, i, n));
+      body := body + r.TakeBody;
+      i := i + n;
+    end;
+    r.AtEof;
+    body := body + r.TakeBody;
+  except
+    on E: EHttpMsgError do
+    begin
+      if r.State = msHead then
+        headErr := E.Message
+      else
+        bodyErr := E.Message;
+      body := body + r.TakeBody;
+    end;
+  end;
+  if headErr <> '' then
+  begin
+    Result := 'err|' + Q(headErr);
+    Exit;
+  end;
+  h := r.Head;
+  if bodyErr <> '' then
+    bd := 'err:' + Q(bodyErr)
+  else
+    bd := IntToStr(Length(body)) + ':' + Hex8(Crc32(body));
+  SetLength(none, 0);
+  if IsReq then
+  begin
+    { ReadRequest hands the Host field over as Request.Host and drops it from the header }
+    hf := h.Fields.Clone;
+    hf.Remove('Host');
+    u := UrlString(h.Url);
+    Result := 'ok|' + Q(h.Method) + '|' + Q(h.Target) + '|' + Q(h.Proto) + '|' + IntToStr(h.Major) + '|' + IntToStr(h.Minor) + '|' +
+      Q(h.Host) + '|' + Q(u) + '|-|' + Bit(h.ConnClose) + '|' + IntToStr(h.ContentLength) + '|' + Bit(h.Chunked) + '|' +
+      DumpFields(hf, none, nil) + '|' + bd;
+  end
+  else
+    Result := 'ok|-|-|' + Q(h.Proto) + '|' + IntToStr(h.Major) + '|' + IntToStr(h.Minor) + '|-|-|' + Q(h.StatusLine) + '|' +
+      Bit(h.ConnClose) + '|' + IntToStr(h.ContentLength) + '|' + Bit(h.Chunked) + '|' + DumpFields(h.Fields, none, nil) + '|' + bd;
+  if bodyErr <> '' then
+    Result := Result + '|?|?'
+  else
+    Result := Result + '|' + DumpFields(nil, h.TrailerKeys, r.Trailers) + '|' + IntToStr(Length(r.Unused));
+end;
+
+var
+  corpus, line, id, kind, method, b64, want, raw, got: string;
+  p, nl, q1, count, bad, k: Integer;
+begin
+  if not ReadFile('testdata/httpmsg.txt', corpus) then
+  begin
+    WriteLn('no testdata/httpmsg.txt');
+    Halt(2);
+  end;
+  p := 1;
+  count := 0;
+  bad := 0;
+  while p <= Length(corpus) do
+  begin
+    nl := p;
+    while (nl <= Length(corpus)) and (corpus[nl] <> #10) do
+      nl := nl + 1;
+    line := Copy(corpus, p, nl - p);
+    p := nl + 1;
+    q1 := Pos(' ', line);
+    id := Copy(line, 1, q1 - 1);
+    line := Copy(line, q1 + 1, Length(line) - q1);
+    q1 := Pos(' ', line);
+    kind := Copy(line, 1, q1 - 1);
+    line := Copy(line, q1 + 1, Length(line) - q1);
+    q1 := Pos(' ', line);
+    method := Copy(line, 1, q1 - 1);
+    line := Copy(line, q1 + 1, Length(line) - q1);
+    q1 := Pos(' ', line);
+    b64 := Copy(line, 1, q1 - 1);
+    want := Copy(line, q1 + 1, Length(line) - q1);
+    if b64 = '-' then
+      raw := ''
+    else if not Base64Decode(b64, False, True, raw) then
+    begin
+      WriteLn('bad base64 ', id);
+      Halt(2);
+    end;
+    k := StrToInt(id) mod 5;
+    got := Verdict(kind = 'req', method, raw, 100000);
+    if (got <> want) and (Pos('|?|?', want) = 0) then
+    begin
+      bad := bad + 1;
+      if bad <= 12 then
+      begin
+        WriteLn('DIFFERS ', id, ' ', kind, ' ', method, ' [', Q(raw), ']');
+        WriteLn('  go   ', want);
+        WriteLn('  here ', got);
+      end;
+    end
+    else if (got <> want) and (Copy(got, 1, Length(got) - 4) <> Copy(want, 1, Length(want) - 4)) then
+    begin
+      bad := bad + 1;
+      if bad <= 12 then
+      begin
+        WriteLn('DIFFERS ', id, ' ', kind, ' ', method, ' [', Q(raw), ']');
+        WriteLn('  go   ', want);
+        WriteLn('  here ', got);
+      end;
+    end;
+    if Chunks[k] <> 100000 then
+      if Verdict(kind = 'req', method, raw, Chunks[k]) <> got then
+      begin
+        bad := bad + 1;
+        if bad <= 12 then
+          WriteLn('PIECES DIFFER ', id, ' ', Chunks[k]);
+      end;
+    count := count + 1;
+  end;
+  WriteLn('messages ', count, ', differ from Go or in pieces ', bad);
+end.

@@ -1,0 +1,940 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+
+  paslang is free software: you can redistribute it and/or modify it
+  under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+
+  paslang is distributed in the hope that it will be useful, but
+  WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+  General Public License for more details.
+
+  Under Section 7 of GPL version 3, you are granted additional
+  permissions described in the paslang Runtime Library Exception,
+  version 1.0, in the file COPYING.RUNTIME.
+
+  You should have received a copy of the GNU General Public License
+  along with paslang.  If not, see <https://www.gnu.org/licenses/>. }
+
+{ HTTP/1.1 messages (P432), RFC 9110 and 9112, as Go's net/http and
+  net/textproto read them: one reader for requests and responses that is
+  fed bytes in pieces of any size and does no I/O, so a client over TCP or
+  TLS and a server share it, and a message that arrives in a hundred pieces
+  is the message that arrives in one.
+
+  THttpFields is a header block (names canonical as Go's
+  CanonicalMIMEHeaderKey, values in the order they came). The reader takes
+  the start line and the header lines as textproto.ReadMIMEHeader does
+  (continuation lines, the colon, the bytes a name and a value may hold),
+  the version, the method, the target as url.ParseRequestURI takes it, the
+  status code, and then settles how the body is framed as net/http's
+  readTransfer does: Transfer-Encoding chunked on HTTP/1.1 only, one
+  Content-Length (several that agree are one), none for HEAD, 1xx, 204 and
+  304, until the connection closes for a response with neither. It then
+  gives the body decoded, a piece at a time, with the trailer of a chunked
+  one. The error texts are Go's. Free of units but sysutils and pasurl, and
+  of state (Regla 11); a reader belongs to the routine that feeds it. }
+unit pashttp;
+
+interface
+
+uses
+  sysutils, pasurl, pastextproto;
+
+type
+  { a message that is not HTTP; Message is Go's text. TooLarge is a head or
+    a line past its limit (a server says 431, a client gives up) }
+  EHttpMsgError = EMimeError;
+  { a header block: names canonical, values in the order they came }
+  THttpFields = TMimeFields;
+
+  TBodyKind = (bkNone, bkLength, bkChunked, bkUntilClose);
+
+  { a message's start line and header fields, with how its body is framed }
+  THttpHead = class
+  public
+    IsRequest: Boolean;
+    Method: string;
+    { the request-target as it was sent }
+    Target: string;
+    Proto: string;
+    Major: Integer;
+    Minor: Integer;
+    Url: TUrl;
+    { the Host header, or the host of an absolute target }
+    Host: string;
+    Status: Integer;
+    { the status line after the version, '200 OK' }
+    StatusLine: string;
+    Fields: THttpFields;
+    { the connection is not kept after this message }
+    ConnClose: Boolean;
+    Chunked: Boolean;
+    { -1 when unknown }
+    ContentLength: Int64;
+    BodyKind: TBodyKind;
+    { the keys the Trailer header announced }
+    TrailerKeys: TStringArray;
+    constructor Create;
+  end;
+
+  TMsgState = (msHead, msBody, msDone);
+
+  THttpMessageReader = class
+  private
+    FIsRequest: Boolean;
+    FReqMethod: string;
+    FBuf: string;
+    FPos: Integer;
+    FState: TMsgState;
+    FHead: THttpHead;
+    FTrailers: THttpFields;
+    FOut: string;
+    { the body's framing in progress }
+    FKind: TBodyKind;
+    FLeft: Int64;
+    FChunkLeft: Int64;
+    FChunkStage: Integer;
+    FExcess: Int64;
+    FTotal: Int64;
+    FEof: Boolean;
+    function TakeLine(out Line: string; Limit: Integer): Integer;
+    function TryHead(Eof: Boolean): Boolean;
+    procedure RunBody;
+    procedure RunChunked;
+  public
+    { per-message limits: the head's bytes (1 MiB), the header fields
+      (0 is any number) }
+    MaxHeaderBytes: Integer;
+    MaxHeaders: Integer;
+    { ReqMethod is the method of the request a response answers (HEAD has
+      no body) }
+    constructor Create(IsRequest: Boolean; const ReqMethod: string);
+    { more bytes of the message; EHttpMsgError for what is not one }
+    procedure Feed(const S: string);
+    { the connection ended: an until-close body is complete, any other
+      message that is not is cut off }
+    procedure AtEof;
+    property State: TMsgState read FState;
+    { valid once State is msBody or msDone }
+    property Head: THttpHead read FHead;
+    { the body decoded since the last call }
+    function TakeBody: string;
+    { the trailer of a chunked body, when it is msDone }
+    property Trailers: THttpFields read FTrailers;
+    { the bytes after the message, once it is msDone }
+    function Unused: string;
+    { bytes fed and not yet part of a head or a body }
+    function Pending: Integer;
+  end;
+
+function HttpCanonicalKey(const S: string): string;
+function HttpIsToken(const S: string): Boolean;
+function HttpEqualFold(const A, B: string): Boolean;
+{ ParseHTTPVersion: HTTP/1.1, HTTP/1.0 and HTTP/X.Y }
+function HttpParseVersion(const V: string; out Major, Minor: Integer): Boolean;
+{ whether a response with that status has a body }
+function HttpBodyAllowed(Status: Integer): Boolean;
+{ the head of a request or a response as it goes on the wire, the fields
+  in their order }
+function HttpRequestLine(const Method, Target: string): string;
+function HttpStatusLine(Status: Integer; const Reason: string): string;
+{ a chunk of a chunked body, and its end with the trailer fields }
+function HttpChunk(const Data: string): string;
+function HttpLastChunk(Trailer: THttpFields): string;
+{ Go's strconv.Quote of the printable ASCII range, for messages }
+function HttpQuote(const S: string): string;
+
+implementation
+
+{ Go's badStringError: what, a space and the value quoted }
+function BadString(const What, Txt: string): string;
+begin
+  Result := What + ' ' + MimeQuote(Txt);
+end;
+
+function HttpCanonicalKey(const S: string): string;
+begin
+  Result := MimeCanonicalKey(S);
+end;
+
+function HttpIsToken(const S: string): Boolean;
+begin
+  Result := MimeIsToken(S);
+end;
+
+function HttpEqualFold(const A, B: string): Boolean;
+begin
+  Result := MimeEqualFold(A, B);
+end;
+
+function HttpQuote(const S: string): string;
+begin
+  Result := MimeQuote(S);
+end;
+
+constructor THttpHead.Create;
+begin
+  inherited Create;
+  Fields := THttpFields.Create;
+  ContentLength := -1;
+end;
+
+
+function HttpParseVersion(const V: string; out Major, Minor: Integer): Boolean;
+begin
+  Result := False;
+  Major := 0;
+  Minor := 0;
+  if V = 'HTTP/1.1' then
+  begin
+    Major := 1;
+    Minor := 1;
+    Result := True;
+    Exit;
+  end;
+  if V = 'HTTP/1.0' then
+  begin
+    Major := 1;
+    Result := True;
+    Exit;
+  end;
+  if Copy(V, 1, 5) <> 'HTTP/' then
+    Exit;
+  if Length(V) <> 8 then
+    Exit;
+  if V[7] <> '.' then
+    Exit;
+  if (V[6] < '0') or (V[6] > '9') or (V[8] < '0') or (V[8] > '9') then
+    Exit;
+  Major := Ord(V[6]) - 48;
+  Minor := Ord(V[8]) - 48;
+  Result := True;
+end;
+
+function HttpBodyAllowed(Status: Integer): Boolean;
+begin
+  Result := not (((Status >= 100) and (Status <= 199)) or (Status = 204) or (Status = 304));
+end;
+
+{ strconv.Atoi for the status code: an optional sign and digits }
+function AtoiOk(const S: string; out V: Integer): Boolean;
+var
+  i, start: Integer;
+  neg: Boolean;
+begin
+  Result := False;
+  V := 0;
+  if S = '' then
+    Exit;
+  start := 1;
+  neg := False;
+  if (S[1] = '+') or (S[1] = '-') then
+  begin
+    neg := S[1] = '-';
+    start := 2;
+  end;
+  if start > Length(S) then
+    Exit;
+  for i := start to Length(S) do
+  begin
+    if (S[i] < '0') or (S[i] > '9') then
+      Exit;
+    V := V * 10 + (Ord(S[i]) - 48);
+    if V > 2000000000 then
+      Exit;
+  end;
+  if neg then
+    V := -V;
+  Result := True;
+end;
+
+{ strconv.ParseUint(s, 10, 63) }
+function ParseUint63(const S: string; out V: Int64): Boolean;
+var
+  i: Integer;
+  d: Int64;
+begin
+  Result := False;
+  V := 0;
+  if S = '' then
+    Exit;
+  for i := 1 to Length(S) do
+  begin
+    if (S[i] < '0') or (S[i] > '9') then
+      Exit;
+    d := Ord(S[i]) - 48;
+    if V > (9223372036854775807 - d) div 10 then
+      Exit;
+    V := V * 10 + d;
+  end;
+  Result := True;
+end;
+
+{ net/http's parseContentLength of the values of the field: -1 when there is none }
+function ParseContentLength(F: THttpFields): Int64;
+var
+  cl: string;
+  vals: TStringArray;
+begin
+  vals := F.ValuesOf('Content-Length');
+  if Length(vals) = 0 then
+  begin
+    Result := -1;
+    Exit;
+  end;
+  cl := MimeTrimSpace(vals[0]);
+  if cl = '' then
+    raise EHttpMsgError.Create(BadString('invalid empty Content-Length', cl));
+  if not ParseUint63(cl, Result) then
+    raise EHttpMsgError.Create(BadString('bad Content-Length', cl));
+end;
+
+{ Go's shouldClose }
+function ShouldClose(Major, Minor: Integer; F: THttpFields; RemoveClose: Boolean): Boolean;
+var
+  hasClose: Boolean;
+begin
+  if Major < 1 then
+  begin
+    Result := True;
+    Exit;
+  end;
+  hasClose := F.HasToken('Connection', 'close');
+  if (Major = 1) and (Minor = 0) then
+  begin
+    Result := hasClose or (not F.HasToken('Connection', 'keep-alive'));
+    Exit;
+  end;
+  if hasClose and RemoveClose then
+    F.Remove('Connection');
+  Result := hasClose;
+end;
+
+{ the keys a Trailer header announces: net/http's fixTrailer }
+procedure FixTrailer(H: THttpHead; MaxFields: Integer);
+var
+  vals: TStringArray;
+  i, j, n, cnt: Integer;
+  v, item, key: string;
+  parts: array of string;
+  p: Integer;
+  keys: array of string;
+  dup: Boolean;
+begin
+  SetLength(H.TrailerKeys, 0);
+  if not H.Fields.Has('Trailer') then
+    Exit;
+  if not H.Chunked then
+    Exit;
+  vals := H.Fields.ValuesOf('Trailer');
+  H.Fields.Remove('Trailer');
+  cnt := 0;
+  for i := 0 to Length(vals) - 1 do
+  begin
+    n := 1;
+    for j := 1 to Length(vals[i]) do
+      if vals[i][j] = ',' then
+        n := n + 1;
+    cnt := cnt + n;
+  end;
+  if (MaxFields > 0) and (cnt > MaxFields) then
+    raise EHttpMsgError.CreateTooLarge('http: server returned too many headers');
+  SetLength(keys, 0);
+  for i := 0 to Length(vals) - 1 do
+  begin
+    v := MimeTrimSpace(vals[i]);
+    if v = '' then
+      Continue;
+    SetLength(parts, 0);
+    while True do
+    begin
+      p := Pos(',', v);
+      SetLength(parts, Length(parts) + 1);
+      if p = 0 then
+      begin
+        parts[Length(parts) - 1] := v;
+        Break;
+      end;
+      parts[Length(parts) - 1] := Copy(v, 1, p - 1);
+      v := Copy(v, p + 1, Length(v) - p);
+    end;
+    for j := 0 to Length(parts) - 1 do
+    begin
+      item := MimeTrimSpace(parts[j]);
+      if item = '' then
+        Continue;
+      key := HttpCanonicalKey(item);
+      if (key = 'Transfer-Encoding') or (key = 'Trailer') or (key = 'Content-Length') then
+        raise EHttpMsgError.Create(BadString('bad trailer key', key));
+      dup := False;
+      for n := 0 to Length(keys) - 1 do
+        if keys[n] = key then
+          dup := True;
+      if not dup then
+      begin
+        SetLength(keys, Length(keys) + 1);
+        keys[Length(keys) - 1] := key;
+      end;
+    end;
+  end;
+  H.TrailerKeys := keys;
+end;
+
+{ readTransfer: how the body of the head just read is framed, the fields
+  adjusted as net/http adjusts them }
+procedure Frame(H: THttpHead; const ReqMethod: string; MaxFields: Integer);
+var
+  te: TStringArray;
+  cls: TStringArray;
+  i: Integer;
+  first, ct: string;
+  realLen: Int64;
+  isResponse: Boolean;
+  nt, maj, min1: Integer;
+begin
+  isResponse := not H.IsRequest;
+  maj := H.Major;
+  min1 := H.Minor;
+  if isResponse then
+    H.ConnClose := ShouldClose(H.Major, H.Minor, H.Fields, True);
+  { HTTP/0.0 is taken as HTTP/1.1 from here on, the head keeping what it said }
+  if (maj = 0) and (min1 = 0) then
+  begin
+    maj := 1;
+    min1 := 1;
+  end;
+  if H.Fields.Has('Pragma') and (H.Fields.Get('Pragma') = 'no-cache') and (not H.Fields.Has('Cache-Control')) then
+    H.Fields.Add('Cache-Control', 'no-cache');
+  { Transfer-Encoding: only chunked, only on HTTP/1.1 }
+  H.Chunked := False;
+  if H.Fields.Has('Transfer-Encoding') then
+  begin
+    te := H.Fields.ValuesOf('Transfer-Encoding');
+    H.Fields.Remove('Transfer-Encoding');
+    if (maj > 1) or ((maj = 1) and (min1 >= 1)) then
+    begin
+      if Length(te) <> 1 then
+      begin
+        ct := '[';
+        for i := 0 to Length(te) - 1 do
+        begin
+          if i > 0 then
+            ct := ct + ' ';
+          ct := ct + HttpQuote(te[i]);
+        end;
+        raise EHttpMsgError.Create('too many transfer encodings: ' + ct + ']');
+      end;
+      if not HttpEqualFold(te[0], 'chunked') then
+        raise EHttpMsgError.Create('unsupported transfer encoding: ' + HttpQuote(te[0]));
+      H.Chunked := True;
+    end;
+  end;
+  { fixLength }
+  cls := H.Fields.ValuesOf('Content-Length');
+  if Length(cls) > 1 then
+  begin
+    first := MimeTrimSpace(cls[0]);
+    for i := 1 to Length(cls) - 1 do
+      if MimeTrimSpace(cls[i]) <> first then
+      begin
+        ct := '[';
+        for nt := 0 to Length(cls) - 1 do
+        begin
+          if nt > 0 then
+            ct := ct + ' ';
+          ct := ct + HttpQuote(cls[nt]);
+        end;
+        raise EHttpMsgError.Create('http: message cannot contain multiple Content-Length headers; got ' + ct + ']');
+      end;
+    H.Fields.Remove('Content-Length');
+    H.Fields.Add('Content-Length', first);
+  end;
+  realLen := -1;
+  if H.Fields.Has('Content-Length') then
+    realLen := ParseContentLength(H.Fields);
+  if isResponse and (ReqMethod = 'HEAD') then
+    realLen := 0
+  else if (H.Status div 100 = 1) and isResponse then
+    realLen := 0
+  else if H.Status = 204 then
+    realLen := 0
+  else if H.Status = 304 then
+    realLen := 0
+  else if H.Chunked then
+  begin
+    H.Fields.Remove('Content-Length');
+    realLen := -1;
+  end
+  else if realLen >= 0 then
+  begin
+    { as the header says }
+  end
+  else
+  begin
+    H.Fields.Remove('Content-Length');
+    if not isResponse then
+      realLen := 0
+    else
+      realLen := -1;
+  end;
+  { a request is status 200 as far as the rules for 1xx, 204 and 304 go }
+  if isResponse and (ReqMethod = 'HEAD') then
+  begin
+    if H.Fields.Has('Content-Length') then
+      H.ContentLength := ParseContentLength(H.Fields)
+    else
+      H.ContentLength := -1;
+  end
+  else
+    H.ContentLength := realLen;
+  FixTrailer(H, MaxFields);
+  { the HTTP/2 connection preface looks like a request: net/http hands it over with no length and the connection to be closed }
+  if H.IsRequest and (H.Method = 'PRI') and (H.Fields.Count = 0) and (H.Url.Path = '*') and (H.Proto = 'HTTP/2.0') then
+  begin
+    H.ConnClose := True;
+    H.ContentLength := -1;
+    H.BodyKind := bkNone;
+    Exit;
+  end;
+  if isResponse and (realLen = -1) and (not H.Chunked) and HttpBodyAllowed(H.Status) then
+    H.ConnClose := True;
+  if H.Chunked then
+  begin
+    if isResponse and ((ReqMethod = 'HEAD') or (not HttpBodyAllowed(H.Status))) then
+      H.BodyKind := bkNone
+    else
+      H.BodyKind := bkChunked;
+  end
+  else if realLen = 0 then
+    H.BodyKind := bkNone
+  else if realLen > 0 then
+    H.BodyKind := bkLength
+  else if H.ConnClose then
+    H.BodyKind := bkUntilClose
+  else
+    H.BodyKind := bkNone;
+end;
+
+{ ---- the reader ---- }
+
+constructor THttpMessageReader.Create(IsRequest: Boolean; const ReqMethod: string);
+begin
+  inherited Create;
+  FIsRequest := IsRequest;
+  FReqMethod := ReqMethod;
+  FPos := 1;
+  MaxHeaderBytes := 1048576;
+  FTrailers := THttpFields.Create;
+end;
+
+procedure THttpMessageReader.Feed(const S: string);
+begin
+  if Length(S) = 0 then
+    Exit;
+  if FPos > 1 then
+  begin
+    FBuf := Copy(FBuf, FPos, Length(FBuf) - FPos + 1);
+    FPos := 1;
+  end;
+  FBuf := FBuf + S;
+  if FState = msHead then
+  begin
+    if TryHead(False) then
+      RunBody;
+  end
+  else if FState = msBody then
+    RunBody;
+end;
+
+function THttpMessageReader.Pending: Integer;
+begin
+  Result := Length(FBuf) - FPos + 1;
+end;
+
+function THttpMessageReader.Unused: string;
+begin
+  Result := Copy(FBuf, FPos, Length(FBuf) - FPos + 1);
+end;
+
+function THttpMessageReader.TakeBody: string;
+begin
+  Result := FOut;
+  FOut := '';
+end;
+
+{ a line from the buffer: 1 got it, 0 needs more input, -1 too long }
+function THttpMessageReader.TakeLine(out Line: string; Limit: Integer): Integer;
+var
+  p: Integer;
+begin
+  p := FPos;
+  if MimeCutLine(FBuf, p, Line, False) then
+  begin
+    if Length(Line) > Limit then
+    begin
+      Result := -1;
+      Exit;
+    end;
+    FPos := p;
+    Result := 1;
+    Exit;
+  end;
+  if Length(FBuf) - FPos + 1 > Limit then
+    Result := -1
+  else
+    Result := 0;
+end;
+
+{ the head, when all of it is in the buffer (or, with Eof, as much of it
+  as there is); False when more input is wanted }
+function THttpMessageReader.TryHead(Eof: Boolean): Boolean;
+var
+  p: Integer;
+  line, rest, a, b, c: string;
+  h: THttpHead;
+  sp, code: Integer;
+  ok: Boolean;
+begin
+  Result := False;
+  p := FPos;
+  if not MimeCutLine(FBuf, p, line, Eof) then
+  begin
+    if (MaxHeaderBytes > 0) and (Length(FBuf) - FPos + 1 > MaxHeaderBytes) then
+      raise EHttpMsgError.CreateTooLarge('message too large');
+    if Eof then
+    begin
+      if FIsRequest then
+        raise EHttpMsgError.Create('EOF')
+      else
+        raise EHttpMsgError.Create('unexpected EOF');
+    end;
+    Exit;
+  end;
+  h := THttpHead.Create;
+  h.IsRequest := FIsRequest;
+  if FIsRequest then
+  begin
+    sp := Pos(' ', line);
+    if sp = 0 then
+      raise EHttpMsgError.Create(BadString('malformed HTTP request', line));
+    a := Copy(line, 1, sp - 1);
+    rest := Copy(line, sp + 1, Length(line) - sp);
+    sp := Pos(' ', rest);
+    if sp = 0 then
+      raise EHttpMsgError.Create(BadString('malformed HTTP request', line));
+    b := Copy(rest, 1, sp - 1);
+    c := Copy(rest, sp + 1, Length(rest) - sp);
+    h.Method := a;
+    h.Target := b;
+    h.Proto := c;
+    if not HttpIsToken(a) then
+      raise EHttpMsgError.Create(BadString('invalid method', a));
+    if not HttpParseVersion(c, h.Major, h.Minor) then
+      raise EHttpMsgError.Create(BadString('malformed HTTP version', c));
+    if (a = 'CONNECT') and (Copy(b, 1, 1) <> '/') then
+    begin
+      if not UrlParseRequestURI('http://' + b, h.Url, rest) then
+        raise EHttpMsgError.Create(rest);
+      h.Url.Scheme := '';
+    end
+    else if not UrlParseRequestURI(b, h.Url, rest) then
+      raise EHttpMsgError.Create(rest);
+  end
+  else
+  begin
+    sp := Pos(' ', line);
+    if sp = 0 then
+      raise EHttpMsgError.Create(BadString('malformed HTTP response', line));
+    h.Proto := Copy(line, 1, sp - 1);
+    rest := Copy(line, sp + 1, Length(line) - sp);
+    sp := 1;
+    while (sp <= Length(rest)) and (rest[sp] = ' ') do
+      sp := sp + 1;
+    rest := Copy(rest, sp, Length(rest) - sp + 1);
+    h.StatusLine := rest;
+    sp := Pos(' ', rest);
+    if sp = 0 then
+      a := rest
+    else
+      a := Copy(rest, 1, sp - 1);
+    if Length(a) <> 3 then
+      raise EHttpMsgError.Create(BadString('malformed HTTP status code', a));
+    ok := AtoiOk(a, code);
+    if (not ok) or (code < 0) then
+      raise EHttpMsgError.Create(BadString('malformed HTTP status code', a));
+    h.Status := code;
+    if not HttpParseVersion(h.Proto, h.Major, h.Minor) then
+      raise EHttpMsgError.Create(BadString('malformed HTTP version', h.Proto));
+  end;
+  try
+    MimeReadHeader(FBuf, p, h.Fields, MaxHeaders, Eof);
+  except
+    on E: EMimeNeedMore do
+    begin
+      if (MaxHeaderBytes > 0) and (Length(FBuf) - FPos + 1 > MaxHeaderBytes) then
+        raise EHttpMsgError.CreateTooLarge('message too large');
+      Exit;
+    end;
+  end;
+  if (MaxHeaderBytes > 0) and (p - FPos > MaxHeaderBytes) then
+    raise EHttpMsgError.CreateTooLarge('message too large');
+  FPos := p;
+  if FIsRequest then
+  begin
+    if h.Fields.CountOf('Host') > 1 then
+      raise EHttpMsgError.Create('too many Host headers');
+    h.Host := h.Url.Host;
+    if h.Host = '' then
+      h.Host := h.Fields.Get('Host');
+    h.ConnClose := ShouldClose(h.Major, h.Minor, h.Fields, False);
+  end;
+  if FIsRequest then
+    Frame(h, h.Method, MaxHeaders)
+  else
+    Frame(h, FReqMethod, MaxHeaders);
+  FHead := h;
+  FState := msBody;
+  FKind := h.BodyKind;
+  FLeft := h.ContentLength;
+  FChunkStage := 0;
+  Result := True;
+end;
+
+procedure THttpMessageReader.RunBody;
+var
+  n: Int64;
+begin
+  case FKind of
+    bkNone:
+      FState := msDone;
+    bkLength:
+      begin
+        n := Length(FBuf) - FPos + 1;
+        if n > FLeft then
+          n := FLeft;
+        if n > 0 then
+        begin
+          FOut := FOut + Copy(FBuf, FPos, n);
+          FPos := FPos + n;
+          FLeft := FLeft - n;
+        end;
+        if FLeft = 0 then
+          FState := msDone
+        else if FEof then
+          raise EHttpMsgError.Create('unexpected EOF');
+      end;
+    bkUntilClose:
+      begin
+        n := Length(FBuf) - FPos + 1;
+        if n > 0 then
+        begin
+          FOut := FOut + Copy(FBuf, FPos, n);
+          FPos := FPos + n;
+        end;
+        if FEof then
+          FState := msDone;
+      end;
+    bkChunked:
+      RunChunked;
+  end;
+end;
+
+{ the chunked body of internal/chunked.go: stage 0 a chunk-size line, 1 the
+  data, 2 the CRLF after it, 3 the trailer }
+procedure THttpMessageReader.RunChunked;
+var
+  line, hexs: string;
+  lf, cr, i, semi: Integer;
+  raw: string;
+  n: Int64;
+  d: Int64;
+  tp: Integer;
+  trailerEnd: Boolean;
+  tl: string;
+  save: Integer;
+begin
+  while FState = msBody do
+  begin
+    case FChunkStage of
+      0:
+        begin
+          { the chunk-size line, as readChunkLine takes it }
+          lf := FPos;
+          while (lf <= Length(FBuf)) and (FBuf[lf] <> #10) do
+            lf := lf + 1;
+          if lf > Length(FBuf) then
+          begin
+            if Length(FBuf) - FPos + 1 >= 4096 then
+              raise EHttpMsgError.Create('header line too long');
+            if FEof then
+              raise EHttpMsgError.Create('unexpected EOF');
+            Exit;
+          end;
+          raw := Copy(FBuf, FPos, lf - FPos + 1);
+          cr := Pos(#13, raw);
+          if cr = 0 then
+            raise EHttpMsgError.Create('chunked line ends with bare LF')
+          else if cr <> Length(raw) - 1 then
+            raise EHttpMsgError.Create('invalid CR in chunked line');
+          line := Copy(raw, 1, Length(raw) - 2);
+          if Length(line) >= 4096 then
+            raise EHttpMsgError.Create('header line too long');
+          FPos := lf + 1;
+          FExcess := FExcess + Length(line) + 2;
+          while (Length(line) > 0) and ((line[Length(line)] = ' ') or (line[Length(line)] = #9)) do
+            line := Copy(line, 1, Length(line) - 1);
+          semi := Pos(';', line);
+          if semi > 0 then
+            line := Copy(line, 1, semi - 1);
+          hexs := line;
+          if hexs = '' then
+            raise EHttpMsgError.Create('empty hex number for chunk length');
+          n := 0;
+          for i := 1 to Length(hexs) do
+          begin
+            if (hexs[i] >= '0') and (hexs[i] <= '9') then
+              d := Ord(hexs[i]) - 48
+            else if (hexs[i] >= 'a') and (hexs[i] <= 'f') then
+              d := Ord(hexs[i]) - 87
+            else if (hexs[i] >= 'A') and (hexs[i] <= 'F') then
+              d := Ord(hexs[i]) - 55
+            else
+              raise EHttpMsgError.Create('invalid byte in chunk length');
+            if i = 17 then
+              raise EHttpMsgError.Create('http chunk length too large');
+            n := (n shl 4) or d;
+          end;
+          if n < 0 then
+            raise EHttpMsgError.Create('http chunk length too large');
+          FExcess := FExcess - (16 + 2 * n);
+          if FExcess < 0 then
+            FExcess := 0;
+          if FExcess > 16384 then
+            raise EHttpMsgError.Create('chunked encoding contains too much non-data');
+          FChunkLeft := n;
+          if n = 0 then
+            FChunkStage := 3
+          else
+            FChunkStage := 1;
+        end;
+      1:
+        begin
+          n := Length(FBuf) - FPos + 1;
+          if n = 0 then
+          begin
+            if FEof then
+              raise EHttpMsgError.Create('unexpected EOF');
+            Exit;
+          end;
+          if n > FChunkLeft then
+            n := FChunkLeft;
+          FOut := FOut + Copy(FBuf, FPos, n);
+          FPos := FPos + n;
+          FChunkLeft := FChunkLeft - n;
+          if FChunkLeft = 0 then
+            FChunkStage := 2;
+        end;
+      2:
+        begin
+          if Length(FBuf) - FPos + 1 < 2 then
+          begin
+            if FEof then
+              raise EHttpMsgError.Create('unexpected EOF');
+            Exit;
+          end;
+          if (FBuf[FPos] <> #13) or (FBuf[FPos + 1] <> #10) then
+            raise EHttpMsgError.Create('malformed chunked encoding');
+          FPos := FPos + 2;
+          FChunkStage := 0;
+        end;
+      3:
+        begin
+          { the trailer, as body.readTrailer takes it: a blank line, or
+            fields that end in CRLF CRLF within what the reader holds }
+          if Length(FBuf) - FPos + 1 < 2 then
+          begin
+            if FEof then
+              raise EHttpMsgError.Create('http: unexpected EOF reading trailer');
+            Exit;
+          end;
+          if (FBuf[FPos] = #13) and (FBuf[FPos + 1] = #10) then
+          begin
+            FPos := FPos + 2;
+            FState := msDone;
+            Exit;
+          end;
+          if Pos(#13#10#13#10, Copy(FBuf, FPos, Length(FBuf) - FPos + 1)) = 0 then
+          begin
+            if FEof or (Length(FBuf) - FPos + 1 >= 4096) then
+              raise EHttpMsgError.Create('http: suspiciously long trailer after chunked body');
+            Exit;
+          end;
+          save := FPos;
+          MimeReadHeader(FBuf, save, FTrailers, MaxHeaders, False);
+          FPos := save;
+          FState := msDone;
+        end;
+    end;
+  end;
+end;
+
+procedure THttpMessageReader.AtEof;
+begin
+  FEof := True;
+  if FState = msHead then
+  begin
+    if not TryHead(True) then
+      raise EHttpMsgError.Create('unexpected EOF');
+  end;
+  if FState = msBody then
+    RunBody;
+  if FState <> msDone then
+    raise EHttpMsgError.Create('unexpected EOF');
+end;
+
+{ ---- writing ---- }
+
+function HttpRequestLine(const Method, Target: string): string;
+begin
+  Result := Method + ' ' + Target + ' HTTP/1.1' + #13#10;
+end;
+
+function HttpStatusLine(Status: Integer; const Reason: string): string;
+begin
+  Result := 'HTTP/1.1 ' + IntToStr(Status) + ' ' + Reason + #13#10;
+end;
+
+function HttpChunk(const Data: string): string;
+const
+  HexChars: string = '0123456789abcdef';
+var
+  n: Integer;
+  h: string;
+begin
+  if Data = '' then
+  begin
+    Result := '';
+    Exit;
+  end;
+  n := Length(Data);
+  h := '';
+  while n > 0 do
+  begin
+    h := Copy(HexChars, (n and 15) + 1, 1) + h;
+    n := n shr 4;
+  end;
+  Result := h + #13#10 + Data + #13#10;
+end;
+
+function HttpLastChunk(Trailer: THttpFields): string;
+begin
+  Result := '0' + #13#10;
+  if Trailer <> nil then
+    Result := Result + Trailer.Text;
+  Result := Result + #13#10;
+end;
+
+end.

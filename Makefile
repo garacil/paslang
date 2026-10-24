@@ -598,6 +598,9 @@ GOLDEN_A64 += flate flatec zip
 # P436: XLSX templates filled, the entries not written kept as they were.
 GOLDEN += xlsx
 GOLDEN_A64 += xlsx
+# P432: URLs and HTTP messages against Go, and the HTTP client over loopback.
+GOLDEN += url httpmsg httpcli
+GOLDEN_A64 += url httpmsg httpcli
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -636,6 +639,11 @@ LIB_UNITS := \
 	src/lib/pasflate.paslang \
 	src/lib/paszip.paslang \
 	src/lib/pasxlsx.paslang \
+	src/lib/pasconn.paslang \
+	src/lib/pasurl.paslang \
+	src/lib/pastextproto.paslang \
+	src/lib/pashttp.paslang \
+	src/lib/httpclient.paslang \
 	src/lib/httpserver.paslang \
 	src/lib/sqlite.paslang
 
