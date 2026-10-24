@@ -589,6 +589,9 @@ GOLDEN_A64 += codec zones
 # P445: a closure over a const parameter of every kind, kept past the call.
 GOLDEN += closureconst
 GOLDEN_A64 += closureconst
+# P456: Default of a block passed as an argument and stored where no plain variable is.
+GOLDEN += defaultarg
+GOLDEN_A64 += defaultarg
 # P426: the XML reader against expat on 2672 documents, and the tree's edits.
 GOLDEN += xmlcorpus xmldom
 GOLDEN_A64 += xmlcorpus xmldom

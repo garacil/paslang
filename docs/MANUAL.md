@@ -561,7 +561,9 @@ the same, a second spelling. Pointers, views over memory and how they
 are checked are in §6.
 `Default(T)` is the zero value of any type `T`; `Default(Integer)`,
 `Default(string)` and `Default(Boolean)` too since 1.0.136 (the compile
-stopped on them with `Default type`).
+stopped on them with `Default type`). A record's, a static array's or a
+set's `Default(T)` is a value wherever one stands, an argument by value or
+`const` among them (1.1.272: until then the routine read it through nil).
 `SizeOf(T)` and `SizeOf(expr)` give sizes.
 
 A set, `set of T`, is a bitset for a `T` whose values lie in 0..255:
