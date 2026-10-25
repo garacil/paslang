@@ -14154,8 +14154,13 @@ the commands on standard input, under `--debug-mode` and under
   1970-01-01 00:00:01), a moment past 2038 is itself (3.2.2 wraps it to
   1902), `UniversalTimeToLocal` and `LocalTimeToUniversal` of one
   argument add the zone's offset to the second (Kolkata's +5:21:10
-  before 1942; Free Pascal counts whole minutes), and `GetUniversalTime`
-  fills the day of the week too, where 3.2.2 leaves it as it was.
+  before 1942; Free Pascal counts whole minutes), `LocalTimeToUniversal`
+  of a time the clock showed twice (the hour a change of summer time
+  repeats) is the later moment and of a time it skipped the moment Go's
+  `time.Date` gives, 02:30 of the night the clock goes from 02:00 to
+  03:00 being the moment the clock then shows 03:30 (1.1.275; it was the
+  moment 01:30 showed, an hour earlier), and `GetUniversalTime` fills the
+  day of the week too, where 3.2.2 leaves it as it was.
 - An exception object is not freed when its handler ends, as Free
   Pascal frees it: the collector takes it back when nothing points to
   it, so a handler may keep it or raise it again with `raise E`.

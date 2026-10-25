@@ -3656,9 +3656,11 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -qF 'FCount is private to TCache at 3:22' $(BUILDDIR)/recspriv.err; \
 	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/zone1 testdata/zone1.paslang; \
 	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/dates3 testdata/dates3.paslang; \
+	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/dates4 testdata/dates4.paslang; \
 	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/zone1-arm testdata/zone1.paslang; \
 	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/dates3-arm testdata/dates3.paslang; \
-	for t in zone1 dates3; do \
+	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/dates4-arm testdata/dates4.paslang; \
+	for t in zone1 dates3 dates4; do \
 	  : > $(BUILDDIR)/$$t.got; \
 	  : > $(BUILDDIR)/$$t-arm.got; \
 	  for z in Europe_Madrid America_New_York Asia_Kolkata Australia_Sydney Pacific_Chatham; do \

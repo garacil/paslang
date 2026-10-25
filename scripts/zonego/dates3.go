@@ -36,6 +36,6 @@ func main() {
 		b := func(x bool) int { if x { return 1 }; return 0 }
 		// FPC's sign: minutes to add to local for UTC; div truncates
 		fmt.Printf(" offU %d %d offL %d %d", -offU/60, b(dstU), -offL/60, b(dstL))
-		fmt.Printf(" u2l %s l2u %s\n", f(ut.Add(time.Duration(offU)*time.Second)), f(ut.Add(-time.Duration(offL)*time.Second)))
+		fmt.Printf(" u2l %s l2u %s\n", f(ut.Add(time.Duration(offU)*time.Second)), f(lt.UTC()))
 	}
 }
