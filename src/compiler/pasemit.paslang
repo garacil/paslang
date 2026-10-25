@@ -784,6 +784,8 @@ type
     function CallProof(E: PExpr): Boolean;
     function LeftFirst(E: PExpr): Boolean;
     function KeepLeft(E: PExpr): Boolean;
+    function ParkLeft(E: PExpr): Boolean;
+    function RdxFree(R: PExpr): Boolean;
     function LeftSrc: string;
     procedure ValPair(E: PExpr; const R0, R1: string);
     function LastLeaRax(out B: SizeInt; out Op: string): Boolean;
@@ -15449,7 +15451,7 @@ begin
   Result := False;
   if (E^.Bin = boDiv) or (E^.Bin = boMod) then
   begin
-    Result := KeepLeft(E);
+    Result := KeepLeft(E) or ParkLeft(E);
     Exit;
   end;
   if not ((E^.Bin = boAdd) or (E^.Bin = boSub) or (E^.Bin = boMul) or (E^.Bin = boAnd) or
@@ -15557,7 +15559,7 @@ begin
     Result := True;
     Exit;
   end;
-  Result := KeepLeft(E);
+  Result := KeepLeft(E) or ParkLeft(E);
 end;
 
 { P360: L op R with L a word that calls and R one the pool works out
@@ -15627,6 +15629,130 @@ begin
     FLeftOp := '%r11'
   else
     Line('  movq %r11, %rcx');
+  FLeftIn := True;
+end;
+
+{ R's code names nothing but the pool and rax (P391): an ordinal of
+  constants, variables, elements, fields and targets, with no call and
+  no division, modulo or MulHi, which take rdx. }
+function TEmitter.RdxFree(R: PExpr): Boolean;
+var
+  i: SizeInt;
+begin
+  Result := True;
+  if R = nil then
+    Exit;
+  case R^.Kind of
+    ekInt, ekNil, ekVar:
+      Exit;
+    ekStr:
+      begin
+        Result := Length(R^.Txt) = 1;
+        Exit;
+      end;
+    ekBin:
+      if (R^.Bin = boDiv) or (R^.Bin = boMod) or (R^.Bin = boMulHi) or (R^.Bin = boMulHiS) then
+      begin
+        Result := False;
+        Exit;
+      end;
+    ekUn, ekIndex, ekField, ekDeref:
+      ;
+  else
+    begin
+      Result := False;
+      Exit;
+    end;
+  end;
+  Result := RdxFree(R^.L) and RdxFree(R^.R);
+  for i := 0 to High(R^.Args) do
+    if not RdxFree(R^.Args[i]) then
+      Result := False;
+end;
+
+{ P391: L op R with R an ordinal that calls nothing and the pool works
+  out alone, L any ordinal: L worked out and kept in a register while R
+  is worked out, then into rcx or x1 for the operation, an operand of +
+  * and or xor as it is, or kept for a division (FLeftReg): where L was
+  pushed and popped, as KeepLeft keeps a calling L in r11 or x8 outside
+  a region (P360), and a region's pool, lent down to two or three
+  registers, sent every deeper expression to the stack. On amd64 the
+  register is rdx, which R's code does not name (RdxFree: no call, no
+  division, no MulHi) and which nothing holds across the working out of
+  an ordinal, a division's work taking it; on arm64 the pool's top one,
+  R worked out in the pool capped below it, as nothing keeps a value in
+  a pool register across another expression (OrdPool). While R is worked
+  out no line names the register (FArgGuard, P355), which would stop the
+  compiler. False with nothing written when E is not such: an argument
+  waits (FArgGuard), a division's dividend is kept already, or R does
+  not fit. }
+function TEmitter.ParkLeft(E: PExpr): Boolean;
+var
+  was, n: LongInt;
+  park: string;
+  ok, comm: Boolean;
+begin
+  Result := False;
+  if (E^.L = nil) or (E^.R = nil) or (Length(FArgGuard) > 0) or (FLeftReg <> '') then
+    Exit;
+  { the left side the generic way keeps whole in rax, of any width: no
+    set, real, string, slice or block, whose words go otherwise }
+  if RealBin(E) or (TKind(E^.Typ) = tykSet) or (TKind(E^.L^.Typ) = tykSet) or
+    (TKind(E^.R^.Typ) = tykSet) or (TKind(E^.L^.Typ) = tykReal) or
+    (TKind(E^.R^.Typ) = tykReal) or IsFat(E^.L^.Typ) or IsFat(E^.R^.Typ) or
+    IsBlob(E^.L^.Typ) or IsBlob(E^.R^.Typ) then
+    Exit;
+  if EHasCall(E^.R) or not ((E^.R^.Kind = ekBin) or (E^.R^.Kind = ekUn) or
+    (E^.R^.Kind = ekIndex) or (E^.R^.Kind = ekField) or (E^.R^.Kind = ekDeref) or
+    (E^.R^.Kind = ekVar)) then
+    Exit;
+  was := FPoolCap;
+  if FArm then
+  begin
+    n := PoolSize;
+    if n < 2 then
+      Exit;
+    FPoolCap := n - 1;
+    ok := OrdSimple(E^.R, 0);
+    FPoolCap := was;
+    if not ok then
+      Exit;
+    park := OrdPool(n - 1);
+  end
+  else
+  begin
+    if not (OrdSimple(E^.R, 0) and RdxFree(E^.R)) then
+      Exit;
+    n := 0;
+    park := 'rdx';
+  end;
+  EmitExpr(E^.L);
+  if FArm then
+  begin
+    Line('  mov ' + park + ', x0');
+    FPoolCap := n - 1;
+  end
+  else
+    Line('  movq %rax, %rdx');
+  SetLength(FArgGuard, 1);
+  FArgGuard[0] := park;
+  EmitExpr(E^.R);
+  FArgGuard := nil;
+  FPoolCap := was;
+  Result := True;
+  if (E^.Bin = boDiv) or (E^.Bin = boMod) then
+  begin
+    FLeftReg := park;
+    Exit;
+  end;
+  comm := (E^.Bin = boAdd) or (E^.Bin = boMul) or (E^.Bin = boAnd) or (E^.Bin = boOr) or
+    (E^.Bin = boXor);
+  if FArm then
+    Line('  mov x1, ' + park)
+  else if comm then
+    FLeftOp := '%' + park
+  else
+    Line('  movq %' + park + ', %rcx');
   FLeftIn := True;
 end;
 
@@ -37213,6 +37339,32 @@ begin
   end;
 end;
 
+{ T holds a multiply of one operand, mulq or imulq, which writes rdx and
+  rax (P391): IMUL of two or three operands keeps the truncated product
+  in its first and names no other (Intel SDM Vol. 2A, IMUL: the one-,
+  two- and three-operand forms; MUL has the one-operand form alone).
+  The operands are counted by their commas outside parentheses, a memory
+  operand's own inside them. }
+function MulOneOp(const T: string): Boolean;
+var
+  p, i, depth, commas: SizeInt;
+begin
+  Result := False;
+  p := Pos('mulq ', T);
+  if p = 0 then
+    Exit;
+  depth := 0;
+  commas := 0;
+  for i := p + 5 to Length(T) do
+    if T[i] = '(' then
+      Inc(depth)
+    else if T[i] = ')' then
+      Dec(depth)
+    else if (T[i] = ',') and (depth = 0) then
+      Inc(commas);
+  Result := commas = 0;
+end;
+
 { The text T names register R (amd64) at any width, or writes it behind
   its text: cqto, cltq, a division or a one-operand multiply rdx (and
   rax), a string instruction rcx, rsi and rdi, a syscall rcx (P296). }
@@ -37233,7 +37385,7 @@ begin
     if Pos(w[i], T) > 0 then
       Exit;
   if ((R = 'rdx') or (R = 'rax')) and ((Pos('cqto', T) > 0) or (Pos('cltd', T) > 0) or (Pos('div', T) > 0) or
-    (Pos('mulq %', T) > 0) or (Pos('imulq %', T) > 0) or (Pos('rdtsc', T) > 0) or (Pos('cpuid', T) > 0)) then
+    MulOneOp(T) or (Pos('rdtsc', T) > 0) or (Pos('cpuid', T) > 0)) then
     Exit;
   if ((R = 'rcx') or (R = 'rsi') or (R = 'rdi') or (R = 'rax')) and ((Pos('rep', T) > 0) or
     (Pos('syscall', T) > 0)) then

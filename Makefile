@@ -554,6 +554,9 @@ GOLDEN_A64 += storereg
 # P390: a comparison deeper than the pool, as a condition, makes no Boolean.
 GOLDEN += cmpdeep
 GOLDEN_A64 += cmpdeep
+# P391: an expression deeper than the pool keeps its partial values in registers.
+GOLDEN += parkleft
+GOLDEN_A64 += parkleft
 # P403: SQLite named in a uses clause, uses sqlite since P418, a database in memory.
 GOLDEN += sqluses
 GOLDEN_A64 += sqluses
@@ -2890,6 +2893,13 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	python3 -I scripts/check_cmpdeep.py $(BUILDDIR)/cmpdeep.s; \
 	python3 -I scripts/check_cmpdeep.py $(BUILDDIR)/cmpdeep0.s; \
 	echo ok cmpdeep-asm; \
+	: an expression deeper than the pool keeps a left side in rdx while its right side is worked out in the pool, no push, P391; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/parkleft0 testdata/parkleft.paslang; \
+	$(BUILDDIR)/parkleft0 > $(BUILDDIR)/parkleft0.got; \
+	diff -u testdata/parkleft.out $(BUILDDIR)/parkleft0.got; \
+	python3 -I scripts/check_parkleft.py $(BUILDDIR)/parkleft.s; \
+	python3 -I scripts/check_parkleft.py $(BUILDDIR)/parkleft0.s; \
+	echo ok parkleft-asm; \
 	: a routine with nested ones zeroes only the locals a read may reach first, P358; \
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/nestzero0 testdata/nestzero.paslang; \
 	$(BUILDDIR)/nestzero0 > $(BUILDDIR)/nestzero0.got; \
@@ -4528,6 +4538,13 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	python3 -I scripts/check_cmpdeep.py $(BUILDDIR)/cmpdeep-arm.s --arm; \
 	python3 -I scripts/check_cmpdeep.py $(BUILDDIR)/cmpdeep0-arm.s --arm; \
 	echo ok cmpdeep-arm-asm; \
+	: P391 on arm64: an expression deeper than the pool keeps a left side in the pool top register, no push; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/parkleft0-arm testdata/parkleft.paslang; \
+	timeout 300 $(QEMU_A64) $(BUILDDIR)/parkleft0-arm > $(BUILDDIR)/parkleft0-arm.got; \
+	diff -u testdata/parkleft.out $(BUILDDIR)/parkleft0-arm.got; \
+	python3 -I scripts/check_parkleft.py $(BUILDDIR)/parkleft-arm.s --arm; \
+	python3 -I scripts/check_parkleft.py $(BUILDDIR)/parkleft0-arm.s --arm; \
+	echo ok parkleft-arm-asm; \
 	: P358 on arm64: the locals a read may reach first, zeroed alone; \
 	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/nestzero0-arm testdata/nestzero.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/nestzero0-arm > $(BUILDDIR)/nestzero0-arm.got; \

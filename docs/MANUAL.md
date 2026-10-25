@@ -660,7 +660,9 @@ is worked out as one subtraction and one compare without sign
 the two tests would read, since neither side may call. A comparison of
 integers as a condition, of an `if`, a `while` or an `until`, is one
 compare and one branch however deep its sides, never a Boolean made and
-tested (1.1.277, P390). The logic family
+tested (1.1.277, P390), and the left side of an operation deeper than
+the registers left to work it out waits in a register while the right
+one is worked out, not on the stack (1.1.278, P391). The logic family
 adds four words, on Booleans and integers alike:
 
 | Operator | Is | `12 op 10` |
