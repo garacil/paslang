@@ -557,6 +557,9 @@ GOLDEN_A64 += cmpdeep
 # P391: an expression deeper than the pool keeps its partial values in registers.
 GOLDEN += parkleft
 GOLDEN_A64 += parkleft
+# P392: a slice's element from its pointer and length alone.
+GOLDEN += slicehead
+GOLDEN_A64 += slicehead
 # P403: SQLite named in a uses clause, uses sqlite since P418, a database in memory.
 GOLDEN += sqluses
 GOLDEN_A64 += sqluses
@@ -2900,6 +2903,9 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	python3 -I scripts/check_parkleft.py $(BUILDDIR)/parkleft.s; \
 	python3 -I scripts/check_parkleft.py $(BUILDDIR)/parkleft0.s; \
 	echo ok parkleft-asm; \
+	: an element of a slice from its place is worked out from the slice pointer and length alone, its capacity not loaded, P392; \
+	python3 -I scripts/check_slicehead.py $(BUILDDIR)/slicehead.s; \
+	echo ok slicehead-asm; \
 	: a routine with nested ones zeroes only the locals a read may reach first, P358; \
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/nestzero0 testdata/nestzero.paslang; \
 	$(BUILDDIR)/nestzero0 > $(BUILDDIR)/nestzero0.got; \
@@ -4545,6 +4551,9 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	python3 -I scripts/check_parkleft.py $(BUILDDIR)/parkleft-arm.s --arm; \
 	python3 -I scripts/check_parkleft.py $(BUILDDIR)/parkleft0-arm.s --arm; \
 	echo ok parkleft-arm-asm; \
+	: P392 on arm64: one LDP of a slice pointer and length for its element, no load of its capacity; \
+	python3 -I scripts/check_slicehead.py $(BUILDDIR)/slicehead-arm.s --arm; \
+	echo ok slicehead-arm-asm; \
 	: P358 on arm64: the locals a read may reach first, zeroed alone; \
 	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/nestzero0-arm testdata/nestzero.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/nestzero0-arm > $(BUILDDIR)/nestzero0-arm.got; \

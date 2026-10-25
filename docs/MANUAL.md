@@ -3123,7 +3123,9 @@ where Free Pascal reads without an end (1.1.22, P147).
 strings (of a variable, a field or an element, the length's word is
 read alone, and `(i < 0) or (i > High(a))`, its kin with `>=
 Length(a)` and their negations, for a slice `a` and an `Integer` `i`,
-are one compare without sign and one branch, 1.1.226): a string's `Low` is 1, its first index, and its `High` its
+are one compare without sign and one branch, 1.1.226; an element of
+such a slice is worked out from its pointer and length alone, its
+capacity not read, 1.1.279): a string's `Low` is 1, its first index, and its `High` its
 length (1.0.136; `Low` gave 0). `Length` also counts the entries of a
 map, a tree or a heap and is 1 for a `Char`, and `Low(h)` of a heap is
 its least element (§11). `High(x)` and `Low(x)` of an ordinal value are its
