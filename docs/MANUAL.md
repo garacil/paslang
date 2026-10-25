@@ -14358,8 +14358,12 @@ method, a property or an enumeration member of one of these names is a
 compile error that names it, at the name: `Length is a reserved word,
 not a name at 5:3`. A unit's `.pi` is not checked for these names when
 it loads. The compiler loads only a `.pi` of the format it writes,
-`PASLANGI33`, and refuses an older one with the minimum compiler needed to
-rebuild it. A routine whose result is a record, a static array or a set
+`PASLANGI34`, and refuses an older one with the minimum compiler needed to
+rebuild it. A type is once in a compilation and in the `.pi` it writes,
+however many units' `.pi` bring it in: a type another unit made says that
+unit and its number there (1.1.274; a unit's `.pi` held a copy of every
+table its unit had read, the core's again in each, and was twice the size
+of the one it used, 19 MB for the tenth of a chain of ten units). A routine whose result is a record, a static array or a set
 of 32 bytes writes it where its caller says (1.1.213), and one of one to
 three words gives it back in registers (1.1.217), which a unit compiled
 before did not; the interface carries the operators it declares
