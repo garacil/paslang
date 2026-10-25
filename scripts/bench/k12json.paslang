@@ -1,0 +1,159 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+  GPL version 3 or later; see COPYING. No warranty. }
+
+{ P211: JSON's stages one at a time on each file of Go's corpus
+  (build/bench/json, which run.py writes), for the processor the program
+  is built for: -cpu native and -cpu base give each one's kernels. For
+  each stage, the gigabytes a second, the best of five runs of enough rounds
+  for a tenth of a second, and the time stamp counter's ticks a byte
+  (RDTSC, SDM vol. 2B 4-559; an invariant TSC runs at one rate whatever
+  the clock, vol. 3B 20.17.1, the rate the first line gives; on arm64 the
+  virtual counter, CNTVCT_EL0, at its own rate). The stages: the text's
+  UTF-8 checked (PasUtf8Valid); its structural index, a window of 64 KiB
+  at a time with no counts, as JsonValid scans (stage 1); JsonValid,
+  stage 1 and the check over the index; JsonParse into a document; and
+  JsonEncode of that document, compact. }
+program k12json;
+
+uses SysUtils, pastime;
+
+const
+  Files: array[0..6] of string = ('canada_geometry', 'citm_catalog', 'golang_source',
+    'string_escaped', 'string_unicode', 'synthea_fhir', 'twitter_status');
+  Stages: array[0..4] of string = ('utf8', 'index', 'valid', 'parse', 'encode');
+  Win = 65536;
+
+var
+  text: string;
+  idx: array of UInt32;
+  doc, back: json;
+  sink: Int64;
+  f, st, r, rounds, best, bestc, t0, c0, t, c, n0, n1, k0, k1: Int64;
+
+function Counter: Int64;
+begin
+  Result := 0;
+  asm amd64 (Result: out rax)
+    rdtsc
+    shlq $32, %rdx
+    orq %rdx, %rax
+  end;
+  asm arm64 (Result: out x0)
+    mrs x0, cntvct_el0
+  end;
+end;
+
+function Load(const Path: string): string;
+var
+  h: THandle;
+  n: Integer;
+  buf: TBytes;
+begin
+  Result := '';
+  h := FileOpen(Path, fmOpenRead);
+  if h < 0 then
+  begin
+    WriteLn('no ', Path, ': run.py writes it');
+    Halt(1);
+  end;
+  n := FileSeek(h, 0, 2);
+  FileSeek(h, 0, 0);
+  SetLength(buf, n);
+  if FileRead(h, buf, n) <> n then
+    Halt(1);
+  FileClose(h);
+  SetLength(Result, n);
+  Move(buf[0], Result[1], n);
+end;
+
+{ the structural index of the text, a window at a time, no counts }
+function Index: Int64;
+var
+  sc: TPasJsonScan;
+  off, take: Int64;
+begin
+  Result := 0;
+  PasJsonScanStart(sc);
+  sc.NoCount := 1;
+  off := 0;
+  while off < Length(text) do
+  begin
+    take := Length(text) - off;
+    if take > Win then
+    begin
+      take := Win;
+      Result := Result + PasJsonIndexBlocks(@PByte(Pointer(text))[off], take shr 6, sc, @idx[0], off);
+    end
+    else
+      Result := Result + PasJsonIndex(@PByte(Pointer(text))[off], take, sc, @idx[0], off);
+    off := off + take;
+  end;
+end;
+
+procedure Run(Stage: Int64);
+begin
+  case Stage of
+    0: sink := sink + PasUtf8Valid(PByte(Pointer(text)), Length(text), True);
+    1: sink := sink + Index;
+    2: sink := sink + Ord(JsonValid(text));
+    3:
+      begin
+        back := JsonParse(text);
+        sink := sink + 1;
+      end;
+  else
+    sink := sink + Length(JsonEncode(doc));
+  end;
+end;
+
+begin
+  SetLength(idx, Win + 128);
+  sink := 0;
+  { the counter's rate against the monotonic clock, over a tenth of a second }
+  t0 := Monotonic;
+  c0 := Counter;
+  while Monotonic - t0 < 100000000 do
+    sink := sink + 1;
+  t := Monotonic - t0;
+  c := Counter - c0;
+  WriteLn('counter ', c * 1000 div t, ' MHz');
+  WriteLn('file             stage    GB/s  ticks/B');
+  for f := 0 to High(Files) do
+  begin
+    text := Load('build/bench/json/' + Files[f] + '.json');
+    doc := JsonParse(text);
+    for st := 0 to High(Stages) do
+    begin
+      { rounds for a tenth of a second }
+      rounds := 1;
+      repeat
+        t0 := Monotonic;
+        for r := 1 to rounds do
+          Run(st);
+        t := Monotonic - t0;
+        if t < 100000000 then
+          rounds := rounds * 2;
+      until t >= 100000000;
+      best := High(Int64);
+      bestc := High(Int64);
+      for k0 := 1 to 5 do
+      begin
+        n0 := Monotonic;
+        k1 := Counter;
+        for r := 1 to rounds do
+          Run(st);
+        n1 := Monotonic - n0;
+        c := Counter - k1;
+        if n1 < best then
+          best := n1;
+        if c < bestc then
+          bestc := c;
+      end;
+      WriteLn(Format('%-16s %-6s %7.2f %8.2f', [Files[f], Stages[st],
+        Int64(Length(text)) * rounds / best, bestc / (Int64(Length(text)) * rounds)]));
+    end;
+  end;
+  if sink = 0 then
+    WriteLn('nothing');
+end.

@@ -6,7 +6,8 @@
 disassembly (objdump -d): the instructions past the base processor
 (SSE2) are those of BMI1 and BMI2, LZCNT, POPCNT, MOVBE, SSE4.2's
 CRC32, and every VEX or EVEX instruction (a ymm or zmm register, or a
-v mnemonic).
+v mnemonic). A TZCNT counts in none of the routines AS_BSF names,
+whose TZCNT is BSF to a processor without BMI1.
 
   check_cpubin.py base   EXE   none: a program for the base processor
                                links no kernel past it (P268)
@@ -18,6 +19,14 @@ import sys
 
 PAST = re.compile(r'\b(lzcnt|tzcnt|popcnt|andn|blsr|blsi|blsmsk|bzhi|shlx|shrx|sarx|rorx|mulx|pdep|pext|movbe'
                   r'|crc32[bwlq]?)\b|%[yz]mm|^v[a-z0-9]+\b')
+
+# The routines whose TZCNT is BSF's encoding to a processor without BMI1
+# ("On processors that do not support TZCNT, the instruction byte
+# encoding is executed as BSF", SDM vol. 2B 4-731), each on a source that
+# is not zero, or whose result is not read when it is, where the two
+# agree: pasjson's base kernels (P211), whose TZCNT is 2 ops on AMD's
+# Family 17h where BSF is 6, one each two cycles (56305's latency sheet).
+AS_BSF = {'p_pasjson_pasjsonindexbase', 'p_pasjson_pasjsonescindexbase'}
 
 
 def scan(exe):
@@ -32,6 +41,8 @@ def scan(exe):
                 cur = m.group(1)
             continue
         ins = line.split('\t')[-1].strip()
+        if cur in AS_BSF and ins.startswith('tzcnt'):
+            continue
         if '\t' in line and PAST.search(ins):
             hits.setdefault(cur, []).append(ins)
     return hits

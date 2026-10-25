@@ -111,6 +111,7 @@ type
     Nodes: Int64;     { values and member names: strings, other scalars, opening brackets and braces }
     Scalars: Int64;   { scalars that are not strings }
     Bytes: Int64;     { bytes of the strings from their opening quote, and of the other scalars }
+    NoCount: Int64;   { 1 when nobody reads the counts: a kernel may leave them (P211) }
   end;
 
 {$if PASLANG_FULLVERSION >= 1001124}
@@ -222,6 +223,7 @@ type
     NameP: Pointer;     { the last member's name as it was written, "name": }
     NameN: Integer;
   end;
+  PJsonOutLevel = ^TJsonOutLevel;
   TJsonOut = record
     S: string;          { the text, longer than what is written }
     N: Integer;         { the bytes written }
@@ -337,7 +339,10 @@ type
     Names: array of string;
     Tab: array of Integer;
     Lit: string;        { a writer's: the last name as written, "name": }
+    NMark: Integer;     { a reader's: where its names begin in FNRef (P211) }
+    Seen: Int64;        { a reader's: a bit of each of its names (P211) }
   end;
+  PJsonLevel = ^TJsonLevel;
   PJsonOut = ^TJsonOut;
   { stage 1's places, a reader's for its values' extents and parses }
   TJsonPlaces = array of UInt32;
@@ -380,6 +385,18 @@ type
     FValAt: Integer;          { the stream's offset of the value whose extent is being found, -1 none }
     FIn: Pointer;             { the parse state of a typed read's decode, kept from one value to the next }
     FPast: Integer;           { where a typed read goes on after its value, from FStart }
+    FFast: Integer;           { a text's tokens read in place (P211): 0 not yet looked at, 1 yes }
+    FBad: Integer;            { the text's first byte that is no UTF-8 or a noncharacter, -1 none }
+    FFastTok: Boolean;        { the last token read in place: FTA to FTB, the token's bytes }
+    FTA, FTB: Integer;
+    FTKind: TJsonToken;
+    FTEsc, FTName: Boolean;   { a string with escapes; a name }
+    FNRef: array of Int64;    { the open objects' names read in place: address and length }
+    FNRefTop: Integer;
+    FLastTk: TJsonToken;      { the last token Next read (P211) }
+    function NextFast(out T: TJsonToken): Boolean;
+    function NextSlow: TJsonToken;
+    procedure SlowNames(L: Integer);
     procedure Enter;
     procedure Leave;
     procedure Keep(X: EJsonError; AsDoc: Boolean);
@@ -451,6 +468,14 @@ type
     FLv: array of TJsonLevel;
     FMarkN, FMarkDepth, FMarkCount: Integer;
     FMarkNamed: Boolean;
+    FWRef: array of Int64;    { the open objects' names Token wrote: address and length (P211) }
+    FWRefTop: Integer;
+    FWBase: PByte;            { the text's address the pairs were made at }
+    FPlain: Boolean;          { memory, no Indent, EscapeHtml, Canonical or Seq: Token's own way (P211) }
+    procedure WRebase;
+    procedure Replain;
+    procedure SetSeq(V: Boolean);
+    procedure SlowWNames(D: Integer);
     procedure Enter;
     procedure Leave;
     procedure SetOptions(const O: TJsonOptions);
@@ -476,11 +501,13 @@ type
     procedure Add(V: json); overload;
     procedure AddNull;
     procedure AddNumber(const ANumber: string);
+    { the reader's last token written as it was read (P211) }
+    procedure Token(R: TJsonReader);
     procedure Flush;
     function Text: string;
     function Depth: Integer;
     function Offset: Integer;
-    property Seq: Boolean read FSeq write FSeq;
+    property Seq: Boolean read FSeq write SetSeq;
     property Buffered: Boolean read FBuffered write FBuffered;
     property Ms: Integer read FMs write FMs;
     property Options: TJsonOptions read FOpts write SetOptions;
@@ -510,6 +537,10 @@ function JsonParse(const S: string; const Opts: TJsonOptions): json; overload;
 function TryJsonParse(const S: string; out J: json; out Err: EJsonError): Boolean; overload;
 function TryJsonParse(const S: string; out J: json; out Err: EJsonError;
   const Opts: TJsonOptions): Boolean; overload;
+{ Whether S is a text JsonParse takes, checked with no document made
+  (P211, Go's jsontext.Value.IsValid). }
+function JsonValid(const S: string): Boolean; overload;
+function JsonValid(const S: string; const Opts: TJsonOptions): Boolean; overload;
 function JsonEncode(J: json): string; overload;
 function JsonEncode(J: json; const Opts: TJsonOptions): string; overload;
 
@@ -701,6 +732,7 @@ begin
   S.Nodes := 0;
   S.Scalars := 0;
   S.Bytes := 0;
+  S.NoCount := 0;
 end;
 
 { The scan of P[0..N-1], a byte at a time, from the state S and on into
@@ -778,7 +810,12 @@ end;
   CNT (C7.2.39) and UADDLP (C7.2.407) into 64-bit lanes; the index by
   RBIT (C6.2.321) once and, a place a time, CLZ (C6.2.91) and an EOR
   with 1 shl 63 shifted right by it (LSRV takes the amount modulo 64,
-  C6.2.274), as simdjson's arm64 bit_indexer. }
+  C6.2.274), as simdjson's arm64 bit_indexer. On amd64 a block of more
+  than eight entries goes a byte of its mask a step (P211): the byte's
+  places from JFlatTab, eight bytes widened to eight dwords by VPMOVZXBD
+  (vol. 2B), the block's offset added by VPADDD, stored whole by VMOVDQU,
+  the pointer moved by the byte's POPCNT, where TZCNT and BLSR, two
+  operations of latency 2 each on Zen 2, made a chain a place long. }
 function PasJsonIndexCpu(P: Pointer; NBlocks: Int64; var S: TPasJsonScan; Idx: Pointer; Off: Int64): Int64;
 begin
   asm amd64 (P: in rsi; NBlocks: in rbx; @S: in rdi; Idx: in rdx; Off: in r8; Result: out rax)
@@ -822,6 +859,9 @@ begin
     vmovd %eax, %xmm14
     vpbroadcastb %xmm14, %ymm14
     vpxor %ymm15, %ymm15, %ymm15
+    movl $8, %eax
+    vmovd %eax, %xmm7
+    vpbroadcastd %xmm7, %ymm7
     .p2align 5
     1:
     cmpq 8(%rsp), %rsi
@@ -942,6 +982,74 @@ begin
     popcntq %rbp, %rbx
     testq %rbp, %rbp
     jz 4f
+    cmpq $8, %rbx
+    jbe 2f
+    vmovd %r8d, %xmm5
+    vpbroadcastd %xmm5, %ymm5
+    leaq v_pasjson.jflattab(%rip), %rdi
+    movzbl %bpl, %eax
+    vpmovzxbd (%rdi,%rax,8), %ymm6
+    vpaddd %ymm5, %ymm6, %ymm6
+    vmovdqu %ymm6, (%rdx)
+    popcntl %eax, %eax
+    leaq (%rdx,%rax,4), %rdx
+    shrq $8, %rbp
+    vpaddd %ymm7, %ymm5, %ymm5
+    movzbl %bpl, %eax
+    vpmovzxbd (%rdi,%rax,8), %ymm6
+    vpaddd %ymm5, %ymm6, %ymm6
+    vmovdqu %ymm6, (%rdx)
+    popcntl %eax, %eax
+    leaq (%rdx,%rax,4), %rdx
+    shrq $8, %rbp
+    vpaddd %ymm7, %ymm5, %ymm5
+    movzbl %bpl, %eax
+    vpmovzxbd (%rdi,%rax,8), %ymm6
+    vpaddd %ymm5, %ymm6, %ymm6
+    vmovdqu %ymm6, (%rdx)
+    popcntl %eax, %eax
+    leaq (%rdx,%rax,4), %rdx
+    shrq $8, %rbp
+    vpaddd %ymm7, %ymm5, %ymm5
+    movzbl %bpl, %eax
+    vpmovzxbd (%rdi,%rax,8), %ymm6
+    vpaddd %ymm5, %ymm6, %ymm6
+    vmovdqu %ymm6, (%rdx)
+    popcntl %eax, %eax
+    leaq (%rdx,%rax,4), %rdx
+    shrq $8, %rbp
+    vpaddd %ymm7, %ymm5, %ymm5
+    movzbl %bpl, %eax
+    vpmovzxbd (%rdi,%rax,8), %ymm6
+    vpaddd %ymm5, %ymm6, %ymm6
+    vmovdqu %ymm6, (%rdx)
+    popcntl %eax, %eax
+    leaq (%rdx,%rax,4), %rdx
+    shrq $8, %rbp
+    vpaddd %ymm7, %ymm5, %ymm5
+    movzbl %bpl, %eax
+    vpmovzxbd (%rdi,%rax,8), %ymm6
+    vpaddd %ymm5, %ymm6, %ymm6
+    vmovdqu %ymm6, (%rdx)
+    popcntl %eax, %eax
+    leaq (%rdx,%rax,4), %rdx
+    shrq $8, %rbp
+    vpaddd %ymm7, %ymm5, %ymm5
+    movzbl %bpl, %eax
+    vpmovzxbd (%rdi,%rax,8), %ymm6
+    vpaddd %ymm5, %ymm6, %ymm6
+    vmovdqu %ymm6, (%rdx)
+    popcntl %eax, %eax
+    leaq (%rdx,%rax,4), %rdx
+    shrq $8, %rbp
+    vpaddd %ymm7, %ymm5, %ymm5
+    movzbl %bpl, %eax
+    vpmovzxbd (%rdi,%rax,8), %ymm6
+    vpaddd %ymm5, %ymm6, %ymm6
+    vmovdqu %ymm6, (%rdx)
+    popcntl %eax, %eax
+    leaq (%rdx,%rax,4), %rdx
+    jmp 4f
     .p2align 5
     2:
     tzcntq %rbp, %rax
@@ -1263,7 +1371,23 @@ end;
   brace, a closing one a closing brace), a control byte as one whose
   minimum with 20h (PMINUB, 4-342) is not 20h; four PMOVMSKB of 16 bits
   a mask; the counts by halves (SWAR: pairs, nibbles, bytes, and a
-  multiply to add the bytes); BSF (vol. 2A 3-108) for the index. }
+  multiply to add the bytes), left when the scan says nobody reads them
+  (NoCount: the opening brackets, which only the nodes' count reads, and
+  the three counts); for the index TZCNT, which a processor without
+  BMI1 runs as BSF (vol. 2B 4-731), the same on a mask that is not
+  zero, and on one that is only past the block's entries, where the
+  next block writes over its stores: on AMD's Family 17h BSF is 6 ops,
+  one each two cycles, TZCNT 2 ops, four a cycle (56305's latency
+  sheet); and for a block of more than eight entries a byte of its
+  mask a step
+  (P211): the byte's places from JFlatTab by MOVQ, widened by PUNPCKLBW,
+  PUNPCKLWD and PUNPCKHWD, the offset added by PADDD, stored by two
+  MOVDQU, the pointer moved by the byte's count from JFlatCnt. The
+  escapes are worked out only in a block with a backslash or one
+  escaped from the block before, which few have, by code set before
+  the loop: the loop branches back to it and it comes back forward, so
+  the one label the loop branches back to stays its aligned head
+  (P302). }
 function PasJsonIndexBase(P: Pointer; NBlocks: Int64; var S: TPasJsonScan; Idx: Pointer; Off: Int64): Int64;
 begin
 {$ifdef CPUAARCH64}
@@ -1272,9 +1396,11 @@ begin
   asm amd64 (P: in rsi; NBlocks: in rbx; @S: in rdi; Idx: in rdx; Off: in r8; Result: out rax)
     pushq %rbp
     pushq %r14
-    subq $104, %rsp
+    subq $112, %rsp
     movq %rdi, 16(%rsp)
     movq %rdx, 24(%rsp)
+    movq 48(%rdi), %rax
+    movq %rax, 104(%rsp)
     movabsq $0xAAAAAAAAAAAAAAAA, %rax
     movq %rax, (%rsp)
     movabsq $0x5555555555555555, %rax
@@ -1324,6 +1450,24 @@ begin
     movl $0x0D0D0D0D, %eax
     movd %eax, %xmm15
     pshufd $0, %xmm15, %xmm15
+    jmp 1f
+    .p2align 4
+    5:
+    movq %r9, %rcx
+    notq %rcx
+    andq %rax, %rcx
+    leaq (%rcx,%rcx), %rdi
+    orq (%rsp), %rdi
+    subq %rcx, %rdi
+    xorq (%rsp), %rdi
+    movq %rdi, %rcx
+    andq %rax, %rcx
+    orq %r9, %rax
+    xorq %rdi, %rax
+    movq %rcx, %r9
+    shrq $63, %r9
+    movq %rcx, 32(%rsp)
+    jmp 55f
     .p2align 5
     1:
     cmpq 8(%rsp), %rsi
@@ -1451,6 +1595,8 @@ begin
     movq %rax, 40(%rsp)
     notq %rcx
     movq %rcx, 48(%rsp)
+    cmpq $0, 104(%rsp)
+    jne 6f
     movdqa %xmm0, %xmm4
     por %xmm12, %xmm4
     pcmpeqb %xmm10, %xmm4
@@ -1474,6 +1620,7 @@ begin
     shlq $48, %rdi
     orq %rdi, %rax
     movq %rax, 56(%rsp)
+    6:
     movdqa %xmm0, %xmm4
     pminub %xmm12, %xmm4
     pcmpeqb %xmm12, %xmm4
@@ -1516,20 +1663,11 @@ begin
     pmovmskb %xmm4, %edi
     shlq $48, %rdi
     orq %rdi, %rax
-    movq %r9, %rcx
-    notq %rcx
-    andq %rax, %rcx
-    leaq (%rcx,%rcx), %rdi
-    orq (%rsp), %rdi
-    subq %rcx, %rdi
-    xorq (%rsp), %rdi
-    movq %rdi, %rcx
-    andq %rax, %rcx
-    orq %r9, %rax
-    xorq %rdi, %rax
-    movq %rcx, %r9
-    shrq $63, %r9
+    movq %rax, %rcx
+    orq %r9, %rcx
+    jnz 5b
     movq %rcx, 32(%rsp)
+    55:
     movdqa %xmm0, %xmm4
     pcmpeqb %xmm7, %xmm4
     pmovmskb %xmm4, %edi
@@ -1582,6 +1720,8 @@ begin
     shrq $63, %r11
     notq %rbx
     andq %rbp, %rbx
+    cmpq $0, 104(%rsp)
+    jne 7f
     orq %rax, %r14
     movq %r14, %rcx
     shrq $1, %rcx
@@ -1643,6 +1783,7 @@ begin
     imulq 96(%rsp), %rbp
     shrq $56, %rbp
     addq %rbp, %r12
+    7:
     movq 40(%rsp), %rbp
     orq %rbx, %rbp
     movq %rax, %rcx
@@ -1671,44 +1812,165 @@ begin
     shrq $56, %rbx
     testq %rbp, %rbp
     jz 4f
+    cmpq $8, %rbx
+    jbe 2f
+    pxor %xmm0, %xmm0
+    movd %r8d, %xmm1
+    pshufd $0, %xmm1, %xmm1
+    movl $8, %eax
+    movd %eax, %xmm3
+    pshufd $0, %xmm3, %xmm3
+    leaq v_pasjson.jflattab(%rip), %rdi
+    leaq v_pasjson.jflatcnt(%rip), %r14
+    movzbl %bpl, %eax
+    movq (%rdi,%rax,8), %xmm2
+    punpcklbw %xmm0, %xmm2
+    movdqa %xmm2, %xmm4
+    punpcklwd %xmm0, %xmm2
+    punpckhwd %xmm0, %xmm4
+    paddd %xmm1, %xmm2
+    paddd %xmm1, %xmm4
+    movdqu %xmm2, (%rdx)
+    movdqu %xmm4, 16(%rdx)
+    movzbl (%r14,%rax), %eax
+    leaq (%rdx,%rax,4), %rdx
+    shrq $8, %rbp
+    paddd %xmm3, %xmm1
+    movzbl %bpl, %eax
+    movq (%rdi,%rax,8), %xmm2
+    punpcklbw %xmm0, %xmm2
+    movdqa %xmm2, %xmm4
+    punpcklwd %xmm0, %xmm2
+    punpckhwd %xmm0, %xmm4
+    paddd %xmm1, %xmm2
+    paddd %xmm1, %xmm4
+    movdqu %xmm2, (%rdx)
+    movdqu %xmm4, 16(%rdx)
+    movzbl (%r14,%rax), %eax
+    leaq (%rdx,%rax,4), %rdx
+    shrq $8, %rbp
+    paddd %xmm3, %xmm1
+    movzbl %bpl, %eax
+    movq (%rdi,%rax,8), %xmm2
+    punpcklbw %xmm0, %xmm2
+    movdqa %xmm2, %xmm4
+    punpcklwd %xmm0, %xmm2
+    punpckhwd %xmm0, %xmm4
+    paddd %xmm1, %xmm2
+    paddd %xmm1, %xmm4
+    movdqu %xmm2, (%rdx)
+    movdqu %xmm4, 16(%rdx)
+    movzbl (%r14,%rax), %eax
+    leaq (%rdx,%rax,4), %rdx
+    shrq $8, %rbp
+    paddd %xmm3, %xmm1
+    movzbl %bpl, %eax
+    movq (%rdi,%rax,8), %xmm2
+    punpcklbw %xmm0, %xmm2
+    movdqa %xmm2, %xmm4
+    punpcklwd %xmm0, %xmm2
+    punpckhwd %xmm0, %xmm4
+    paddd %xmm1, %xmm2
+    paddd %xmm1, %xmm4
+    movdqu %xmm2, (%rdx)
+    movdqu %xmm4, 16(%rdx)
+    movzbl (%r14,%rax), %eax
+    leaq (%rdx,%rax,4), %rdx
+    shrq $8, %rbp
+    paddd %xmm3, %xmm1
+    movzbl %bpl, %eax
+    movq (%rdi,%rax,8), %xmm2
+    punpcklbw %xmm0, %xmm2
+    movdqa %xmm2, %xmm4
+    punpcklwd %xmm0, %xmm2
+    punpckhwd %xmm0, %xmm4
+    paddd %xmm1, %xmm2
+    paddd %xmm1, %xmm4
+    movdqu %xmm2, (%rdx)
+    movdqu %xmm4, 16(%rdx)
+    movzbl (%r14,%rax), %eax
+    leaq (%rdx,%rax,4), %rdx
+    shrq $8, %rbp
+    paddd %xmm3, %xmm1
+    movzbl %bpl, %eax
+    movq (%rdi,%rax,8), %xmm2
+    punpcklbw %xmm0, %xmm2
+    movdqa %xmm2, %xmm4
+    punpcklwd %xmm0, %xmm2
+    punpckhwd %xmm0, %xmm4
+    paddd %xmm1, %xmm2
+    paddd %xmm1, %xmm4
+    movdqu %xmm2, (%rdx)
+    movdqu %xmm4, 16(%rdx)
+    movzbl (%r14,%rax), %eax
+    leaq (%rdx,%rax,4), %rdx
+    shrq $8, %rbp
+    paddd %xmm3, %xmm1
+    movzbl %bpl, %eax
+    movq (%rdi,%rax,8), %xmm2
+    punpcklbw %xmm0, %xmm2
+    movdqa %xmm2, %xmm4
+    punpcklwd %xmm0, %xmm2
+    punpckhwd %xmm0, %xmm4
+    paddd %xmm1, %xmm2
+    paddd %xmm1, %xmm4
+    movdqu %xmm2, (%rdx)
+    movdqu %xmm4, 16(%rdx)
+    movzbl (%r14,%rax), %eax
+    leaq (%rdx,%rax,4), %rdx
+    shrq $8, %rbp
+    paddd %xmm3, %xmm1
+    movzbl %bpl, %eax
+    movq (%rdi,%rax,8), %xmm2
+    punpcklbw %xmm0, %xmm2
+    movdqa %xmm2, %xmm4
+    punpcklwd %xmm0, %xmm2
+    punpckhwd %xmm0, %xmm4
+    paddd %xmm1, %xmm2
+    paddd %xmm1, %xmm4
+    movdqu %xmm2, (%rdx)
+    movdqu %xmm4, 16(%rdx)
+    movzbl (%r14,%rax), %eax
+    leaq (%rdx,%rax,4), %rdx
+    jmp 4f
     .p2align 5
     2:
-    bsfq %rbp, %rax
+    tzcntq %rbp, %rax
     addl %r8d, %eax
     movl %eax, (%rdx)
     leaq -1(%rbp), %rcx
     andq %rcx, %rbp
-    bsfq %rbp, %rax
+    tzcntq %rbp, %rax
     addl %r8d, %eax
     movl %eax, 4(%rdx)
     leaq -1(%rbp), %rcx
     andq %rcx, %rbp
-    bsfq %rbp, %rax
+    tzcntq %rbp, %rax
     addl %r8d, %eax
     movl %eax, 8(%rdx)
     leaq -1(%rbp), %rcx
     andq %rcx, %rbp
-    bsfq %rbp, %rax
+    tzcntq %rbp, %rax
     addl %r8d, %eax
     movl %eax, 12(%rdx)
     leaq -1(%rbp), %rcx
     andq %rcx, %rbp
-    bsfq %rbp, %rax
+    tzcntq %rbp, %rax
     addl %r8d, %eax
     movl %eax, 16(%rdx)
     leaq -1(%rbp), %rcx
     andq %rcx, %rbp
-    bsfq %rbp, %rax
+    tzcntq %rbp, %rax
     addl %r8d, %eax
     movl %eax, 20(%rdx)
     leaq -1(%rbp), %rcx
     andq %rcx, %rbp
-    bsfq %rbp, %rax
+    tzcntq %rbp, %rax
     addl %r8d, %eax
     movl %eax, 24(%rdx)
     leaq -1(%rbp), %rcx
     andq %rcx, %rbp
-    bsfq %rbp, %rax
+    tzcntq %rbp, %rax
     addl %r8d, %eax
     movl %eax, 28(%rdx)
     leaq -1(%rbp), %rcx
@@ -1732,7 +1994,7 @@ begin
     movq %rdx, %rax
     subq 24(%rsp), %rax
     shrq $2, %rax
-    addq $104, %rsp
+    addq $112, %rsp
     popq %r14
     popq %rbp
   end;
@@ -1964,8 +2226,9 @@ end;
 { The base processor's: SSE2 alone on amd64, 16 bytes a step from P
   rounded down to 16, PCMPEQB for the quote, the backslash and the HTML
   bytes (ANDed with a mask of Html), a control byte as one whose
-  minimum with 20h (PMINUB) is not 20h, BSF for the first; the same
-  NEON on arm64. }
+  minimum with 20h (PMINUB) is not 20h, TZCNT for the first, on a mask
+  that is not zero, which a processor without BMI1 runs as BSF (vol.
+  2B 4-731); the same NEON on arm64. }
 function PasJsonEscIndexBase(P: Pointer; N: Int64; Html: Boolean): Int64;
 begin
 {$ifdef CPUAARCH64}
@@ -2041,7 +2304,7 @@ begin
     4:
     testl %eax, %eax
     jz 2b
-    bsfl %eax, %eax
+    tzcntl %eax, %eax
     addq %rdi, %rax
     subq %rsi, %rax
     cmpq %rbx, %rax
@@ -2122,6 +2385,107 @@ const
   { an object's names are checked for twins one by one up to this many,
     then through a set: Go's objectNamespace switches to its map past 64 }
   JsonLinear = 64;
+  { the index entries StCount walks to count an array's elements (P211) }
+  JsonCountMax = 2048;
+  { the value of a hex digit, 16 for a byte that is none (P211) }
+  JHexTab: array[0..255] of Byte = (
+    16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16,
+    16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 16, 16, 16, 16, 16,
+    16, 10, 11, 12, 13, 14, 15, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16,
+    16, 10, 11, 12, 13, 14, 15, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16,
+    16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16,
+    16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16,
+    16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16,
+    16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16);
+  { the places of the set bits of each byte, in order, eight bytes a byte
+    (P211): the index kernel's flattening of a block a byte at a time }
+  JFlatTab: array[0..2047] of Byte = (
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
+    2, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 1, 2, 0, 0, 0, 0, 0, 0, 0, 1, 2, 0, 0, 0, 0, 0,
+    3, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 1, 3, 0, 0, 0, 0, 0, 0, 0, 1, 3, 0, 0, 0, 0, 0,
+    2, 3, 0, 0, 0, 0, 0, 0, 0, 2, 3, 0, 0, 0, 0, 0, 1, 2, 3, 0, 0, 0, 0, 0, 0, 1, 2, 3, 0, 0, 0, 0,
+    4, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 1, 4, 0, 0, 0, 0, 0, 0, 0, 1, 4, 0, 0, 0, 0, 0,
+    2, 4, 0, 0, 0, 0, 0, 0, 0, 2, 4, 0, 0, 0, 0, 0, 1, 2, 4, 0, 0, 0, 0, 0, 0, 1, 2, 4, 0, 0, 0, 0,
+    3, 4, 0, 0, 0, 0, 0, 0, 0, 3, 4, 0, 0, 0, 0, 0, 1, 3, 4, 0, 0, 0, 0, 0, 0, 1, 3, 4, 0, 0, 0, 0,
+    2, 3, 4, 0, 0, 0, 0, 0, 0, 2, 3, 4, 0, 0, 0, 0, 1, 2, 3, 4, 0, 0, 0, 0, 0, 1, 2, 3, 4, 0, 0, 0,
+    5, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 1, 5, 0, 0, 0, 0, 0, 0, 0, 1, 5, 0, 0, 0, 0, 0,
+    2, 5, 0, 0, 0, 0, 0, 0, 0, 2, 5, 0, 0, 0, 0, 0, 1, 2, 5, 0, 0, 0, 0, 0, 0, 1, 2, 5, 0, 0, 0, 0,
+    3, 5, 0, 0, 0, 0, 0, 0, 0, 3, 5, 0, 0, 0, 0, 0, 1, 3, 5, 0, 0, 0, 0, 0, 0, 1, 3, 5, 0, 0, 0, 0,
+    2, 3, 5, 0, 0, 0, 0, 0, 0, 2, 3, 5, 0, 0, 0, 0, 1, 2, 3, 5, 0, 0, 0, 0, 0, 1, 2, 3, 5, 0, 0, 0,
+    4, 5, 0, 0, 0, 0, 0, 0, 0, 4, 5, 0, 0, 0, 0, 0, 1, 4, 5, 0, 0, 0, 0, 0, 0, 1, 4, 5, 0, 0, 0, 0,
+    2, 4, 5, 0, 0, 0, 0, 0, 0, 2, 4, 5, 0, 0, 0, 0, 1, 2, 4, 5, 0, 0, 0, 0, 0, 1, 2, 4, 5, 0, 0, 0,
+    3, 4, 5, 0, 0, 0, 0, 0, 0, 3, 4, 5, 0, 0, 0, 0, 1, 3, 4, 5, 0, 0, 0, 0, 0, 1, 3, 4, 5, 0, 0, 0,
+    2, 3, 4, 5, 0, 0, 0, 0, 0, 2, 3, 4, 5, 0, 0, 0, 1, 2, 3, 4, 5, 0, 0, 0, 0, 1, 2, 3, 4, 5, 0, 0,
+    6, 0, 0, 0, 0, 0, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 1, 6, 0, 0, 0, 0, 0, 0, 0, 1, 6, 0, 0, 0, 0, 0,
+    2, 6, 0, 0, 0, 0, 0, 0, 0, 2, 6, 0, 0, 0, 0, 0, 1, 2, 6, 0, 0, 0, 0, 0, 0, 1, 2, 6, 0, 0, 0, 0,
+    3, 6, 0, 0, 0, 0, 0, 0, 0, 3, 6, 0, 0, 0, 0, 0, 1, 3, 6, 0, 0, 0, 0, 0, 0, 1, 3, 6, 0, 0, 0, 0,
+    2, 3, 6, 0, 0, 0, 0, 0, 0, 2, 3, 6, 0, 0, 0, 0, 1, 2, 3, 6, 0, 0, 0, 0, 0, 1, 2, 3, 6, 0, 0, 0,
+    4, 6, 0, 0, 0, 0, 0, 0, 0, 4, 6, 0, 0, 0, 0, 0, 1, 4, 6, 0, 0, 0, 0, 0, 0, 1, 4, 6, 0, 0, 0, 0,
+    2, 4, 6, 0, 0, 0, 0, 0, 0, 2, 4, 6, 0, 0, 0, 0, 1, 2, 4, 6, 0, 0, 0, 0, 0, 1, 2, 4, 6, 0, 0, 0,
+    3, 4, 6, 0, 0, 0, 0, 0, 0, 3, 4, 6, 0, 0, 0, 0, 1, 3, 4, 6, 0, 0, 0, 0, 0, 1, 3, 4, 6, 0, 0, 0,
+    2, 3, 4, 6, 0, 0, 0, 0, 0, 2, 3, 4, 6, 0, 0, 0, 1, 2, 3, 4, 6, 0, 0, 0, 0, 1, 2, 3, 4, 6, 0, 0,
+    5, 6, 0, 0, 0, 0, 0, 0, 0, 5, 6, 0, 0, 0, 0, 0, 1, 5, 6, 0, 0, 0, 0, 0, 0, 1, 5, 6, 0, 0, 0, 0,
+    2, 5, 6, 0, 0, 0, 0, 0, 0, 2, 5, 6, 0, 0, 0, 0, 1, 2, 5, 6, 0, 0, 0, 0, 0, 1, 2, 5, 6, 0, 0, 0,
+    3, 5, 6, 0, 0, 0, 0, 0, 0, 3, 5, 6, 0, 0, 0, 0, 1, 3, 5, 6, 0, 0, 0, 0, 0, 1, 3, 5, 6, 0, 0, 0,
+    2, 3, 5, 6, 0, 0, 0, 0, 0, 2, 3, 5, 6, 0, 0, 0, 1, 2, 3, 5, 6, 0, 0, 0, 0, 1, 2, 3, 5, 6, 0, 0,
+    4, 5, 6, 0, 0, 0, 0, 0, 0, 4, 5, 6, 0, 0, 0, 0, 1, 4, 5, 6, 0, 0, 0, 0, 0, 1, 4, 5, 6, 0, 0, 0,
+    2, 4, 5, 6, 0, 0, 0, 0, 0, 2, 4, 5, 6, 0, 0, 0, 1, 2, 4, 5, 6, 0, 0, 0, 0, 1, 2, 4, 5, 6, 0, 0,
+    3, 4, 5, 6, 0, 0, 0, 0, 0, 3, 4, 5, 6, 0, 0, 0, 1, 3, 4, 5, 6, 0, 0, 0, 0, 1, 3, 4, 5, 6, 0, 0,
+    2, 3, 4, 5, 6, 0, 0, 0, 0, 2, 3, 4, 5, 6, 0, 0, 1, 2, 3, 4, 5, 6, 0, 0, 0, 1, 2, 3, 4, 5, 6, 0,
+    7, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 1, 7, 0, 0, 0, 0, 0, 0, 0, 1, 7, 0, 0, 0, 0, 0,
+    2, 7, 0, 0, 0, 0, 0, 0, 0, 2, 7, 0, 0, 0, 0, 0, 1, 2, 7, 0, 0, 0, 0, 0, 0, 1, 2, 7, 0, 0, 0, 0,
+    3, 7, 0, 0, 0, 0, 0, 0, 0, 3, 7, 0, 0, 0, 0, 0, 1, 3, 7, 0, 0, 0, 0, 0, 0, 1, 3, 7, 0, 0, 0, 0,
+    2, 3, 7, 0, 0, 0, 0, 0, 0, 2, 3, 7, 0, 0, 0, 0, 1, 2, 3, 7, 0, 0, 0, 0, 0, 1, 2, 3, 7, 0, 0, 0,
+    4, 7, 0, 0, 0, 0, 0, 0, 0, 4, 7, 0, 0, 0, 0, 0, 1, 4, 7, 0, 0, 0, 0, 0, 0, 1, 4, 7, 0, 0, 0, 0,
+    2, 4, 7, 0, 0, 0, 0, 0, 0, 2, 4, 7, 0, 0, 0, 0, 1, 2, 4, 7, 0, 0, 0, 0, 0, 1, 2, 4, 7, 0, 0, 0,
+    3, 4, 7, 0, 0, 0, 0, 0, 0, 3, 4, 7, 0, 0, 0, 0, 1, 3, 4, 7, 0, 0, 0, 0, 0, 1, 3, 4, 7, 0, 0, 0,
+    2, 3, 4, 7, 0, 0, 0, 0, 0, 2, 3, 4, 7, 0, 0, 0, 1, 2, 3, 4, 7, 0, 0, 0, 0, 1, 2, 3, 4, 7, 0, 0,
+    5, 7, 0, 0, 0, 0, 0, 0, 0, 5, 7, 0, 0, 0, 0, 0, 1, 5, 7, 0, 0, 0, 0, 0, 0, 1, 5, 7, 0, 0, 0, 0,
+    2, 5, 7, 0, 0, 0, 0, 0, 0, 2, 5, 7, 0, 0, 0, 0, 1, 2, 5, 7, 0, 0, 0, 0, 0, 1, 2, 5, 7, 0, 0, 0,
+    3, 5, 7, 0, 0, 0, 0, 0, 0, 3, 5, 7, 0, 0, 0, 0, 1, 3, 5, 7, 0, 0, 0, 0, 0, 1, 3, 5, 7, 0, 0, 0,
+    2, 3, 5, 7, 0, 0, 0, 0, 0, 2, 3, 5, 7, 0, 0, 0, 1, 2, 3, 5, 7, 0, 0, 0, 0, 1, 2, 3, 5, 7, 0, 0,
+    4, 5, 7, 0, 0, 0, 0, 0, 0, 4, 5, 7, 0, 0, 0, 0, 1, 4, 5, 7, 0, 0, 0, 0, 0, 1, 4, 5, 7, 0, 0, 0,
+    2, 4, 5, 7, 0, 0, 0, 0, 0, 2, 4, 5, 7, 0, 0, 0, 1, 2, 4, 5, 7, 0, 0, 0, 0, 1, 2, 4, 5, 7, 0, 0,
+    3, 4, 5, 7, 0, 0, 0, 0, 0, 3, 4, 5, 7, 0, 0, 0, 1, 3, 4, 5, 7, 0, 0, 0, 0, 1, 3, 4, 5, 7, 0, 0,
+    2, 3, 4, 5, 7, 0, 0, 0, 0, 2, 3, 4, 5, 7, 0, 0, 1, 2, 3, 4, 5, 7, 0, 0, 0, 1, 2, 3, 4, 5, 7, 0,
+    6, 7, 0, 0, 0, 0, 0, 0, 0, 6, 7, 0, 0, 0, 0, 0, 1, 6, 7, 0, 0, 0, 0, 0, 0, 1, 6, 7, 0, 0, 0, 0,
+    2, 6, 7, 0, 0, 0, 0, 0, 0, 2, 6, 7, 0, 0, 0, 0, 1, 2, 6, 7, 0, 0, 0, 0, 0, 1, 2, 6, 7, 0, 0, 0,
+    3, 6, 7, 0, 0, 0, 0, 0, 0, 3, 6, 7, 0, 0, 0, 0, 1, 3, 6, 7, 0, 0, 0, 0, 0, 1, 3, 6, 7, 0, 0, 0,
+    2, 3, 6, 7, 0, 0, 0, 0, 0, 2, 3, 6, 7, 0, 0, 0, 1, 2, 3, 6, 7, 0, 0, 0, 0, 1, 2, 3, 6, 7, 0, 0,
+    4, 6, 7, 0, 0, 0, 0, 0, 0, 4, 6, 7, 0, 0, 0, 0, 1, 4, 6, 7, 0, 0, 0, 0, 0, 1, 4, 6, 7, 0, 0, 0,
+    2, 4, 6, 7, 0, 0, 0, 0, 0, 2, 4, 6, 7, 0, 0, 0, 1, 2, 4, 6, 7, 0, 0, 0, 0, 1, 2, 4, 6, 7, 0, 0,
+    3, 4, 6, 7, 0, 0, 0, 0, 0, 3, 4, 6, 7, 0, 0, 0, 1, 3, 4, 6, 7, 0, 0, 0, 0, 1, 3, 4, 6, 7, 0, 0,
+    2, 3, 4, 6, 7, 0, 0, 0, 0, 2, 3, 4, 6, 7, 0, 0, 1, 2, 3, 4, 6, 7, 0, 0, 0, 1, 2, 3, 4, 6, 7, 0,
+    5, 6, 7, 0, 0, 0, 0, 0, 0, 5, 6, 7, 0, 0, 0, 0, 1, 5, 6, 7, 0, 0, 0, 0, 0, 1, 5, 6, 7, 0, 0, 0,
+    2, 5, 6, 7, 0, 0, 0, 0, 0, 2, 5, 6, 7, 0, 0, 0, 1, 2, 5, 6, 7, 0, 0, 0, 0, 1, 2, 5, 6, 7, 0, 0,
+    3, 5, 6, 7, 0, 0, 0, 0, 0, 3, 5, 6, 7, 0, 0, 0, 1, 3, 5, 6, 7, 0, 0, 0, 0, 1, 3, 5, 6, 7, 0, 0,
+    2, 3, 5, 6, 7, 0, 0, 0, 0, 2, 3, 5, 6, 7, 0, 0, 1, 2, 3, 5, 6, 7, 0, 0, 0, 1, 2, 3, 5, 6, 7, 0,
+    4, 5, 6, 7, 0, 0, 0, 0, 0, 4, 5, 6, 7, 0, 0, 0, 1, 4, 5, 6, 7, 0, 0, 0, 0, 1, 4, 5, 6, 7, 0, 0,
+    2, 4, 5, 6, 7, 0, 0, 0, 0, 2, 4, 5, 6, 7, 0, 0, 1, 2, 4, 5, 6, 7, 0, 0, 0, 1, 2, 4, 5, 6, 7, 0,
+    3, 4, 5, 6, 7, 0, 0, 0, 0, 3, 4, 5, 6, 7, 0, 0, 1, 3, 4, 5, 6, 7, 0, 0, 0, 1, 3, 4, 5, 6, 7, 0,
+    2, 3, 4, 5, 6, 7, 0, 0, 0, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7, 0, 0, 1, 2, 3, 4, 5, 6, 7);
+  { the number of set bits of each byte (P211): the base index kernel's
+    step, which has no POPCNT }
+  JFlatCnt: array[0..255] of Byte = (
+    0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4, 1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5,
+    1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5, 2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6,
+    1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5, 2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6,
+    2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6, 3, 4, 4, 5, 4, 5, 5, 6, 4, 5, 5, 6, 5, 6, 6, 7,
+    1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5, 2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6,
+    2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6, 3, 4, 4, 5, 4, 5, 5, 6, 4, 5, 5, 6, 5, 6, 6, 7,
+    2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6, 3, 4, 4, 5, 4, 5, 5, 6, 4, 5, 5, 6, 5, 6, 6, 7,
+    3, 4, 4, 5, 4, 5, 5, 6, 4, 5, 5, 6, 5, 6, 6, 7, 4, 5, 5, 6, 5, 6, 6, 7, 5, 6, 6, 7, 6, 7, 7, 8);
+  { the bytes that may follow a number or a literal: a blank or one a
+    token begins with; the state after it says whether it may come (P211) }
+  JEndTab: array[0..255] of Byte = (
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
   JsonMaxDoc = 4294967295;
   JsonDepthMax = 10000;
   { U+2026, the horizontal ellipsis of a pointer cut short }
@@ -2155,6 +2519,8 @@ type
     NSet: Int64;      { past JsonLinear members: the names in Names }
     Names: array of Int64;
     Mark: Int64;      { stream: where its names begin in the arena (P280) }
+    NMark: Int64;     { check: where its names begin in NRef (P211) }
+    Seen: Int64;      { check: a bit of each of its names by its length and ends (P211) }
   end;
 
   TJErr = record
@@ -2188,12 +2554,13 @@ type
     Err: TJErr;
     Stream: Boolean;   { read a token at a time for a decode, no document (P280) }
     NTop: Int64;       { stream: the end of the open objects' names in the arena }
+    NRef: array of Int64;  { check: the open objects' names, where each is and its length (P211) }
+    NRefP: PInt64;     { check: @NRef[0] }
+    NRefTop: Int64;    { check: the pairs in NRef }
     ValAt: Int64;      { stream: where the last value read starts }
     NameAt: Int64;     { stream: where the last name read starts }
     Top: PJFrame;      { stream: the innermost open container's frame }
     IdxP: PUInt32;     { stream: the index's first entry }
-    Idx2: array of UInt32;  { stream: the window StCount reads ahead with }
-    Ahead: Int64;      { stream: the bytes StCount may still read ahead }
   end;
   PJParse = ^TJParse;
 
@@ -2977,22 +3344,18 @@ begin
     Result := -1;
 end;
 
-{ The 4 hex digits at T[Off..Off+3], -1 when one is not. }
+{ The 4 hex digits at T[Off..Off+3], -1 when one is not: each through
+  JHexTab, 16 for a byte that is no digit (P211). }
 function Hex4(var P: TJParse; Off: Int64): Integer;
 var
-  k, h: Integer;
+  t: PByte;
 begin
-  Result := 0;
-  for k := 0 to 3 do
-  begin
-    h := HexVal(P.T[Off + k]);
-    if h < 0 then
-    begin
-      Result := -1;
-      Exit;
-    end;
-    Result := Result * 16 + h;
-  end;
+  t := @P.T[Off];
+  if (JHexTab[t[0]] or JHexTab[t[1]] or JHexTab[t[2]] or JHexTab[t[3]]) > 15 then
+    Result := -1
+  else
+    Result := (JHexTab[t[0]] shl 12) or (JHexTab[t[1]] shl 8) or (JHexTab[t[2]] shl 4) or
+      JHexTab[t[3]];
 end;
 
 
@@ -3159,8 +3522,9 @@ end;
   are copied whole. False on an error. }
 function ParseStr(var P: TJParse; Q: Int64; out Node: Int64): Boolean;
 var
-  a, src, e, c, start: Int64;
+  a, src, e, c, start, r: Int64;
   noesc, pair: Boolean;
+  t, d: PByte;
 begin
   Result := False;
   Node := -1;
@@ -3198,6 +3562,66 @@ begin
       Exit;
     end;
     noesc := False;
+    { a letter escape, or one \u of the BMP outside the surrogates and
+      the noncharacters, written here, as Go's AppendUnquote writes it
+      (P211): its digits through JHexTab, its UTF-8 in place; a pair, an
+      error or the text's end through Escape }
+    t := P.T;
+    d := P.D;
+    if e + 1 < P.N then
+    begin
+      c := t[e + 1];
+      if (c = 117) and (e + 6 <= P.N) then
+      begin
+        if (JHexTab[t[e + 2]] or JHexTab[t[e + 3]] or JHexTab[t[e + 4]] or JHexTab[t[e + 5]]) <= 15 then
+        begin
+          r := (JHexTab[t[e + 2]] shl 12) or (JHexTab[t[e + 3]] shl 8) or
+            (JHexTab[t[e + 4]] shl 4) or JHexTab[t[e + 5]];
+          if (r < $D800) or ((r > $DFFF) and (r < $FDD0)) or ((r > $FDEF) and (r < $FFFE)) then
+          begin
+            if r < $80 then
+            begin
+              d[a] := Byte(r);
+              a := a + 1;
+            end
+            else if r < $800 then
+            begin
+              d[a] := Byte($C0 or (r shr 6));
+              d[a + 1] := Byte($80 or (r and $3F));
+              a := a + 2;
+            end
+            else
+            begin
+              d[a] := Byte($E0 or (r shr 12));
+              d[a + 1] := Byte($80 or ((r shr 6) and $3F));
+              d[a + 2] := Byte($80 or (r and $3F));
+              a := a + 3;
+            end;
+            src := e + 6;
+            Continue;
+          end;
+        end;
+      end
+      else
+      begin
+        r := 0;
+        case c of
+          34, 92, 47: r := c;
+          98: r := 8;
+          102: r := 12;
+          110: r := 10;
+          114: r := 13;
+          116: r := 9;
+        end;
+        if r <> 0 then
+        begin
+          d[a] := Byte(r);
+          a := a + 1;
+          src := e + 2;
+          Continue;
+        end;
+      end;
+    end;
     if not Escape(P, e, a, src, pair) then
       Exit;
     { the second backslash of a pair is in the index: take it }
@@ -3717,7 +4141,7 @@ function ParseStrEsc(var P: TJParse; Q: Int64; out Node: Int64): Boolean;
 var
   t, d: PByte;
   ix: PUInt32;
-  i, n, a, start, b, r, r2, h, k: Int64;
+  i, n, a, start, b, r, r2, k: Int64;
 begin
   Result := False;
   Node := -1;
@@ -3743,27 +4167,19 @@ begin
       begin
         if i + 6 > n then
           Exit;
-        r := 0;
-        for k := 2 to 5 do
-        begin
-          h := HexVal(t[i + k]);
-          if h < 0 then
-            Exit;
-          r := r * 16 + h;
-        end;
+        if (JHexTab[t[i + 2]] or JHexTab[t[i + 3]] or JHexTab[t[i + 4]] or JHexTab[t[i + 5]]) > 15 then
+          Exit;
+        r := (JHexTab[t[i + 2]] shl 12) or (JHexTab[t[i + 3]] shl 8) or
+          (JHexTab[t[i + 4]] shl 4) or JHexTab[t[i + 5]];
         i := i + 6;
         if (r >= $D800) and (r <= $DFFF) then
         begin
           if (r > $DBFF) or (i + 6 > n) or (t[i] <> 92) or (t[i + 1] <> 117) then
             Exit;
-          r2 := 0;
-          for k := 2 to 5 do
-          begin
-            h := HexVal(t[i + k]);
-            if h < 0 then
-              Exit;
-            r2 := r2 * 16 + h;
-          end;
+          if (JHexTab[t[i + 2]] or JHexTab[t[i + 3]] or JHexTab[t[i + 4]] or JHexTab[t[i + 5]]) > 15 then
+            Exit;
+          r2 := (JHexTab[t[i + 2]] shl 12) or (JHexTab[t[i + 3]] shl 8) or
+            (JHexTab[t[i + 4]] shl 4) or JHexTab[t[i + 5]];
           if (r2 < $DC00) or (r2 > $DFFF) then
             Exit;
           r := $10000 + ((r - $D800) shl 10) + (r2 - $DC00);
@@ -5880,6 +6296,7 @@ begin
   p.NodeCap := scan.Nodes;
   p.Seed := NextSeed;
   PasJsonScanStart(p.Scan);
+  p.Scan.NoCount := 1;
   if Plain then
     ParseDoc(p)
   else
@@ -6559,6 +6976,16 @@ begin
     end;
     p := PByte(W.Lv[d].NameP);
     n := W.Lv[d].NameN;
+    if n < 0 then
+    begin
+      { a name a writer's Token wrote (P211): its "name": in the text,
+        a writer of memory's, which keeps it }
+      p := @PByte(Pointer(W.S))[-n - 1];
+      n := 1;
+      while p[n] <> 34 do
+        n := n + 1;
+      n := n + 2;
+    end;
     lit := '';
     SetLength(lit, n);
     if n > 0 then
@@ -7677,7 +8104,6 @@ begin
   P.Idx := keep.Idx;
   P.Doc := keep.Doc;
   P.St := keep.St;
-  P.Idx2 := keep.Idx2;
   P.Stream := True;
   lim := JsonMaxDoc;
   if (Opts.MaxBytes > 0) and (Opts.MaxBytes < lim) then
@@ -7702,12 +8128,12 @@ begin
     SetLength(P.Idx, IdxRoom(P.N));
   P.IdxP := @P.Idx[0];
   PasJsonScanStart(P.Scan);
+  P.Scan.NoCount := 1;
   if Length(P.Doc) < 4096 then
     SetLength(P.Doc, 4096);
   P.D := @P.Doc[0];
   P.NTop := JsonHead + 16;
   P.Top := nil;
-  P.Ahead := 2 * P.N;
   P.Seed := NextSeed;
   P.State := SValue;
   if Length(P.St) < 16 then
@@ -7925,9 +8351,26 @@ begin
     end;
     P.Nodes := 0;
     P.Arena := P.NTop;
-    SRoom(P, P.Arena + 64);
-    if not ParseStr(P, e, node) then
-      Exit;
+    { a string with escapes whose closing quote is in the index's
+      window: read in place by ParseStrEsc, as ParseFast reads one, the
+      arena first holding as many bytes as its text, which an escape
+      never comes out longer than (P211); else ParseStr, which copies a
+      plain string's run whole }
+    k := P.I;
+    if (k < P.NIdx) and (t[ix[k]] = 92) then
+    begin
+      while (k < P.NIdx) and (t[ix[k]] <> 34) do
+        k := k + 1;
+    end
+    else
+      k := P.NIdx;
+    if k < P.NIdx then
+      SRoom(P, P.Arena + (ix[k] - e) + 64)
+    else
+      SRoom(P, P.Arena + 64);
+    if (k >= P.NIdx) or not ParseStrEsc(P, e, node) then
+      if not ParseStr(P, e, node) then
+        Exit;
     if P.Top <> nil then
       P.Top^.Count := P.Top^.Count + 1;
     P.State := SAfter;
@@ -8247,9 +8690,25 @@ begin
   at := P.NTop;
   P.Nodes := 0;
   P.Arena := at + 8;
-  SRoom(P, P.Arena + 64);
-  if not ParseStr(P, e, node) then
-    Exit;
+  { a name with escapes in place, as StValue reads a string (P211): the
+    text and the index again, which StPeek may have refilled }
+  t := P.T;
+  ix := P.IdxP;
+  k := P.I;
+  if (k < P.NIdx) and (t[ix[k]] = 92) then
+  begin
+    while (k < P.NIdx) and (t[ix[k]] <> 34) do
+      k := k + 1;
+  end
+  else
+    k := P.NIdx;
+  if k < P.NIdx then
+    SRoom(P, P.Arena + (ix[k] - e) + 64)
+  else
+    SRoom(P, P.Arena + 64);
+  if (k >= P.NIdx) or not ParseStrEsc(P, e, node) then
+    if not ParseStr(P, e, node) then
+      Exit;
   PInt64(@P.D[at])^ := StrLen(NodeAt(P, 0));
   P.NameAt := e;
   f := P.Top;
@@ -8329,73 +8788,53 @@ begin
 end;
 
 { The elements of the array just opened, counted on the index from
-  where the reader is to its closing bracket: a decode reserves the
-  array at its length, with no copy as it grows. Past the reader's
-  window the text after it is indexed again into a window of the
-  count's own, from the scan's state there; that reading ahead takes at
-  most twice the text over a decode (Ahead), so arrays in arrays past
-  their windows cost no more; then -1. A text that is no JSON may give a
-  wrong count, which the decode corrects as it reads. }
+  where the reader is to its closing bracket, when the reader's window
+  holds it within JsonCountMax entries: a decode reserves the array at
+  its length, with no copy as it grows; else -1, and the decode grows
+  the array as it reads it, doubling its length. Reading the text after
+  the window ahead to count an array that goes past it indexed most of a
+  text twice, and counting an array of arrays walked each of them again;
+  growing costs less (P211: a decode of synthea_fhir 95.0 ms where it is
+  76.3, golang_source 136.9 where 101.8, at -cpu base). A text that is
+  no JSON may give a wrong count, which the decode corrects as it reads. }
 function StCount(var P: TJParse): Int64;
 var
-  i, depth, n, ni, ofs, take: Int64;
+  i, depth, n, ni: Int64;
   c: Integer;
   ix: PUInt32;
   t: PByte;
-  sc: TPasJsonScan;
 begin
   Result := -1;
   i := P.I;
   ni := P.NIdx;
+  if ni > i + JsonCountMax then
+    ni := i + JsonCountMax;
   ix := P.IdxP;
   t := P.T;
-  ofs := P.Done0;
-  sc := P.Scan;
   depth := 0;
   n := 0;
-  while True do
+  while i < ni do
   begin
-    while i < ni do
+    c := t[ix[i]];
+    i := i + 1;
+    if (c = 91) or (c = 123) then
+      depth := depth + 1
+    else if (c = 93) or (c = 125) then
     begin
-      c := t[ix[i]];
-      i := i + 1;
-      if (c = 91) or (c = 123) then
-        depth := depth + 1
-      else if (c = 93) or (c = 125) then
+      if depth = 0 then
       begin
-        if depth = 0 then
-        begin
-          Result := n;
-          Exit;
-        end;
-        depth := depth - 1;
-      end
-      else if (c = 44) and (depth = 0) then
-        n := n + 1;
-      { an element starts: the first one counts }
-      if n = 0 then
-        n := 1;
-    end;
-    { the window ends: the text after it, indexed again }
-    if (ofs >= P.N) or (P.Ahead <= 0) then
-      Exit;
-    if Length(P.Idx2) < IdxRoom(P.N) then
-      SetLength(P.Idx2, IdxRoom(P.N));
-    take := P.N - ofs;
-    if take > JsonWin then
-    begin
-      take := JsonWin;
-      ni := PasJsonIndexBlocks(@t[ofs], take shr 6, sc, @P.Idx2[0], ofs);
+        Result := n;
+        Exit;
+      end;
+      depth := depth - 1;
     end
-    else
-      ni := PasJsonIndex(@t[ofs], take, sc, @P.Idx2[0], ofs);
-    ofs := ofs + take;
-    P.Ahead := P.Ahead - take;
-    ix := @P.Idx2[0];
-    i := 0;
+    else if (c = 44) and (depth = 0) then
+      n := n + 1;
+    { an element starts: the first one counts }
+    if n = 0 then
+      n := 1;
   end;
 end;
-
 { The rest of the container the last StValue opened, read and checked:
   False after an error. }
 function StRest(var P: TJParse): Boolean;
@@ -8446,6 +8885,787 @@ begin
     Exit;
   end;
   Result := True;
+end;
+
+
+{ ---- A text checked with no document (P211) ----
+
+  CheckFast is ParseFast with nothing written: stage 2 over the same
+  index, the same state machine and its fast cases, a string's bytes
+  passed over (its escapes checked in place where it has any), a number
+  checked by its grammar and never converted, an object's names kept in
+  the scratch block back to back (the arena of the stream mode, P280)
+  and checked for twins one by one up to JsonLinear and through a set
+  past it, as Go's objectNamespace. It answers True for a text JsonParse
+  takes; anything off its fast cases (a byte that is no UTF-8, a name
+  with escapes, any error) answers False, and JsonValid then asks the
+  stream reader, which knows why: so False is never CheckFast's alone. }
+
+{ A string with escapes, its opening quote at Q: its escapes and the
+  characters they make checked, as ParseStrEsc checks them, nothing
+  written; its closing quote's place, -1 for anything ParseStrEsc would
+  not take at once. }
+function EscEndP(Txt: PByte; Len, Q: Int64): Int64;
+var
+  t1: PByte;
+  i, n, b, r, r2, w, m: Int64;
+begin
+  Result := -1;
+  t1 := Txt;
+  n := Len;
+  i := Q + 1;
+  while True do
+  begin
+    { eight bytes a pass while none is a quote (22h), a backslash (5Ch)
+      or below 20h: the lowest byte that is shows in the word's high
+      bits, x - 01h with x's own high bit clear, x the byte xor the one
+      looked for, or the byte itself for below 20h (a byte of 80h up
+      never shows) }
+    while n - i >= 8 do
+    begin
+      w := PInt64(@t1[i])^;
+      m := w xor $2222222222222222;
+      r := (m - $0101010101010101) and not m;
+      m := w xor $5C5C5C5C5C5C5C5C;
+      r := r or ((m - $0101010101010101) and not m);
+      r := (r or ((w - $2020202020202020) and not w)) and Int64($8080808080808080);
+      if r <> 0 then
+      begin
+        i := i + (TrailingZeros(r) shr 3);
+        Break;
+      end;
+      i := i + 8;
+    end;
+    if i >= n then
+      Exit;
+    b := t1[i];
+    if b = 34 then
+      Break;
+    if b < 32 then
+      Exit;
+    if b = 92 then
+    begin
+      if i + 1 >= n then
+        Exit;
+      b := t1[i + 1];
+      if b = 117 then
+      begin
+        if i + 6 > n then
+          Exit;
+        r := JHexTab[t1[i + 2]] or JHexTab[t1[i + 3]] or JHexTab[t1[i + 4]] or JHexTab[t1[i + 5]];
+        if r > 15 then
+          Exit;
+        r := (JHexTab[t1[i + 2]] shl 12) or (JHexTab[t1[i + 3]] shl 8) or
+          (JHexTab[t1[i + 4]] shl 4) or JHexTab[t1[i + 5]];
+        i := i + 6;
+        if (r >= $D800) and (r <= $DFFF) then
+        begin
+          if (r > $DBFF) or (i + 6 > n) or (t1[i] <> 92) or (t1[i + 1] <> 117) then
+            Exit;
+          r2 := JHexTab[t1[i + 2]] or JHexTab[t1[i + 3]] or JHexTab[t1[i + 4]] or JHexTab[t1[i + 5]];
+          if r2 > 15 then
+            Exit;
+          r2 := (JHexTab[t1[i + 2]] shl 12) or (JHexTab[t1[i + 3]] shl 8) or
+            (JHexTab[t1[i + 4]] shl 4) or JHexTab[t1[i + 5]];
+          if (r2 < $DC00) or (r2 > $DFFF) then
+            Exit;
+          r := $10000 + ((r - $D800) shl 10) + (r2 - $DC00);
+          i := i + 6;
+        end;
+        if ((r >= $FDD0) and (r <= $FDEF)) or ((r and $FFFE) = $FFFE) then
+          Exit;
+      end
+      else if (b = 34) or (b = 92) or (b = 47) or (b = 98) or (b = 102) or (b = 110) or
+        (b = 114) or (b = 116) then
+        i := i + 2
+      else
+        Exit;
+    end
+    else
+      i := i + 1;
+  end;
+  Result := i;
+end;
+
+function EscEnd(var P: TJParse; Q: Int64): Int64;
+begin
+  Result := EscEndP(P.T, P.N, Q);
+end;
+
+{ Whether the name of N bytes at A is among the Count names R holds,
+  each a pair of words, its address and its length: a leaf that calls
+  nothing, with no more variables than the registers a routine with no
+  frame has (P296: six on amd64 beside a loop that counts), so it has
+  none; a name compared by its length, its first byte, then byte by
+  byte, as Go's objectNamespace compares a small object's names one by
+  one. }
+function NameSeen(R: PInt64; Count: Int64; A: PByte; N: Int64): Boolean;
+var
+  k: Int64;
+begin
+  Result := False;
+  while Count > 0 do
+  begin
+    if (R[1] = N) and ((N = 0) or (PByte(R[0])[0] = A[0])) then
+    begin
+      k := 1;
+      while (k < N) and (PByte(R[0])[k] = A[k]) do
+        k := k + 1;
+      if k >= N then
+      begin
+        Result := True;
+        Exit;
+      end;
+    end;
+    R := R + 2;
+    Count := Count - 1;
+  end;
+end;
+
+{ An object past JsonLinear names, or one with a name with escapes: its
+  names in the scratch block, after their length and 01h (as the stream
+  mode keeps its names, so a view of them may be taken), and in F's set,
+  as Go's objectNamespace keeps a big object's names in a map. The name
+  of N bytes is at A, or with Esc made 9 bytes past the scratch block's
+  top. The names the list held go there first. False when the name is
+  there already: the check then stops, and nothing it kept is read
+  again. }
+function NameInSet(var P: TJParse; var F: TJFrame; A: PByte; N: Int64; Esc: Boolean): Boolean;
+var
+  k, kl, j, h, s, m, cur: Int64;
+  d: PByte;
+begin
+  Result := False;
+  d := P.D;
+  cur := -1;
+  if Esc then
+  begin
+    cur := P.NTop;
+    PInt64(@d[cur])^ := N;
+    d[cur + 8] := 1;
+    P.NTop := cur + 9 + N;
+  end;
+  if F.NSet = 0 then
+  begin
+    { every name before it into the scratch block and into the set, at
+      four slots a name }
+    s := 64;
+    while s < 4 * (F.Count + 1) do
+      s := s * 2;
+    SetLength(F.Names, s);
+    for k := 0 to s - 1 do
+      F.Names[k] := -1;
+    m := s - 1;
+    for j := F.NMark to P.NRefTop - 1 do
+    begin
+      kl := P.NRef[2 * j + 1];
+      if P.NTop + 9 + kl + 16 > Length(P.Doc) then
+        SRoom(P, P.NTop + 9 + kl + 16);
+      d := P.D;
+      k := P.NTop;
+      PInt64(@d[k])^ := kl;
+      d[k + 8] := 1;
+      if kl > 0 then
+        Move(PByte(P.NRef[2 * j])^, d[k + 9], kl);
+      P.NTop := k + 9 + kl;
+      h := XxHash3(PasStrView(@d[k + 9], kl), P.Seed) and m;
+      while F.Names[h] >= 0 do
+        h := (h + 1) and m;
+      F.Names[h] := k;
+      F.NSet := F.NSet + 1;
+    end;
+    P.NRefTop := F.NMark;
+  end;
+  if cur < 0 then
+  begin
+    if P.NTop + 9 + N + 16 > Length(P.Doc) then
+      SRoom(P, P.NTop + 9 + N + 16);
+    d := P.D;
+    cur := P.NTop;
+    PInt64(@d[cur])^ := N;
+    d[cur + 8] := 1;
+    if N > 0 then
+      Move(A^, d[cur + 9], N);
+    P.NTop := cur + 9 + N;
+  end;
+  m := Length(F.Names) - 1;
+  h := XxHash3(PasStrView(@d[cur + 9], N), P.Seed) and m;
+  while F.Names[h] >= 0 do
+  begin
+    k := F.Names[h];
+    kl := PInt64(@d[k])^;
+    if (kl = N) and ((N = 0) or (CompareByte(d[k + 9], d[cur + 9], N) = 0)) then
+      Exit;
+    h := (h + 1) and m;
+  end;
+  F.Names[h] := cur;
+  F.NSet := F.NSet + 1;
+  if F.NSet * 2 > Length(F.Names) then
+  begin
+    { twice the slots, every name in again: F's names are the scratch
+      block's from F.Mark up, back to back }
+    SetLength(F.Names, Length(F.Names) * 2);
+    m := Length(F.Names) - 1;
+    for k := 0 to m do
+      F.Names[k] := -1;
+    F.NSet := 0;
+    k := F.Mark;
+    while k < P.NTop do
+    begin
+      kl := PInt64(@d[k])^;
+      h := XxHash3(PasStrView(@d[k + 9], kl), P.Seed) and m;
+      while F.Names[h] >= 0 do
+        h := (h + 1) and m;
+      F.Names[h] := k;
+      F.NSet := F.NSet + 1;
+      k := k + 9 + kl;
+    end;
+  end;
+  Result := True;
+end;
+
+{ The N bytes at Src, a string's whose escapes EscEnd has checked, as
+  the characters they are at Dst (never more bytes than at Src): how
+  many. }
+function Unesc(Src: PByte; N: Int64; Dst: PByte): Int64;
+var
+  i, a, b, r, r2: Int64;
+begin
+  i := 0;
+  a := 0;
+  while i < N do
+  begin
+    b := Src[i];
+    if b <> 92 then
+    begin
+      Dst[a] := Byte(b);
+      a := a + 1;
+      i := i + 1;
+      Continue;
+    end;
+    b := Src[i + 1];
+    if b <> 117 then
+    begin
+      case b of
+        98: Dst[a] := 8;
+        102: Dst[a] := 12;
+        110: Dst[a] := 10;
+        114: Dst[a] := 13;
+        116: Dst[a] := 9;
+      else
+        Dst[a] := Byte(b);
+      end;
+      a := a + 1;
+      i := i + 2;
+      Continue;
+    end;
+    r := (JHexTab[Src[i + 2]] shl 12) or (JHexTab[Src[i + 3]] shl 8) or
+      (JHexTab[Src[i + 4]] shl 4) or JHexTab[Src[i + 5]];
+    i := i + 6;
+    if (r >= $D800) and (r <= $DBFF) then
+    begin
+      r2 := (JHexTab[Src[i + 2]] shl 12) or (JHexTab[Src[i + 3]] shl 8) or
+        (JHexTab[Src[i + 4]] shl 4) or JHexTab[Src[i + 5]];
+      r := $10000 + ((r - $D800) shl 10) + (r2 - $DC00);
+      i := i + 6;
+    end;
+    if r < $80 then
+    begin
+      Dst[a] := Byte(r);
+      a := a + 1;
+    end
+    else if r < $800 then
+    begin
+      Dst[a] := Byte($C0 or (r shr 6));
+      Dst[a + 1] := Byte($80 or (r and $3F));
+      a := a + 2;
+    end
+    else if r < $10000 then
+    begin
+      Dst[a] := Byte($E0 or (r shr 12));
+      Dst[a + 1] := Byte($80 or ((r shr 6) and $3F));
+      Dst[a + 2] := Byte($80 or (r and $3F));
+      a := a + 3;
+    end
+    else
+    begin
+      Dst[a] := Byte($F0 or (r shr 18));
+      Dst[a + 1] := Byte($80 or ((r shr 12) and $3F));
+      Dst[a + 2] := Byte($80 or ((r shr 6) and $3F));
+      Dst[a + 3] := Byte($80 or (r and $3F));
+      a := a + 4;
+    end;
+  end;
+  Result := a;
+end;
+
+{ A number's digits are read eight at a time, a byte one when its high
+  half is 3 and its low half below 10, which plus 6 carries into the
+  high half past 9; TrailingZeros finds the first that is not, the
+  lowest byte first; the tail, fewer than eight, a byte at a time. The
+  byte after a number or a literal is one JEndTab marks. }
+function CheckFast(var P: TJParse): Boolean;
+var
+  e, c, q, k, at, n, i, ni, depth, state, fsz, len, w, nrt, nrc: Int64;
+  t: PByte;
+  ix: PUInt32;
+  fb, fr: PJFrame;
+  nrp: PInt64;
+begin
+  Result := False;
+  t := P.T;
+  n := P.N;
+  if P.Bad >= 0 then
+    Exit;
+  if Length(P.St) = 0 then
+    SetLength(P.St, 16);
+  fb := @P.St[0];
+  fsz := SizeOf(TJFrame);
+  { the open objects' names, where each is and its length (P211): their
+    top, the pairs' address and their room, P's own written back where
+    NameInSet reads them }
+  P.NRefTop := 0;
+  nrt := 0;
+  nrc := Length(P.NRef) shr 1;
+  nrp := nil;
+  if nrc > 0 then
+    nrp := @P.NRef[0];
+  i := 0;
+  ni := 0;
+  depth := 0;
+  state := SValue;
+  fr := nil;
+  while True do
+  begin
+    if i >= ni then
+    begin
+      P.I := i;
+      if not Refill(P) then
+      begin
+        Result := (state = SAfter) and (depth = 0);
+        Exit;
+      end;
+      i := P.I;
+      ni := P.NIdx;
+      ix := @P.Idx[0];
+    end;
+    e := ix[i];
+    i := i + 1;
+    c := t[e];
+    { the states that are no value's; a value's, after it, takes the
+      rest, and the value after a name and its colon in the same pass }
+    if state >= SObjFirst then
+    begin
+      case state of
+        SObjFirst, SObjName:
+          begin
+            if (state = SObjFirst) and (c = 125) then
+            begin
+              depth := depth - 1;
+              P.NTop := fr^.Mark;
+              nrt := fr^.NMark;
+              if depth > 0 then
+                fr := PJFrame(Pointer(Integer(fb) + (depth - 1) * fsz))
+              else
+                fr := nil;
+              state := SAfter;
+              Continue;
+            end;
+            if c <> 34 then
+              Exit;
+            if (i < ni) and (t[ix[i]] = 34) then
+            begin
+              { no escape: the name where it is in the text, against the
+                object's names before it in place, up to JsonLinear of
+                them (NameSeen, with no frame), a pair of words in NRef
+                each, its address and its length; through the set past
+                them, or once a name had escapes (NameInSet) }
+              q := ix[i];
+              i := i + 1;
+              len := q - e - 1;
+              { e the name's address from here: short steps, which the
+                register pool works out with nothing pushed }
+              e := Int64(@t[e + 1]);
+              if (fr^.NSet <> 0) or (fr^.Count >= JsonLinear) then
+              begin
+                P.NRefTop := nrt;
+                if not NameInSet(P, fr^, PByte(e), len, False) then
+                  Exit;
+                nrt := P.NRefTop;
+              end
+              else
+              begin
+                { a bit of the object's word by the name's length and its
+                  middle byte: clear, the name is new with no compare; set,
+                  NameSeen compares it with the others }
+                k := nrt;
+                w := (9 * len + PByte(e)[len shr 1]) and 63;
+                w := Int64(1) shl w;
+                if (fr^.Seen and w) <> 0 then
+                  if NameSeen(@nrp[2 * fr^.NMark], k - fr^.NMark, PByte(e), len) then
+                    Exit;
+                fr^.Seen := fr^.Seen or w;
+                if k >= nrc then
+                begin
+                  SetLength(P.NRef, 2 * Length(P.NRef) + 64);
+                  P.NRefP := @P.NRef[0];
+                  nrp := P.NRefP;
+                  nrc := Length(P.NRef) shr 1;
+                end;
+                nrp[2 * k] := e;
+                nrp[2 * k + 1] := len;
+                nrt := k + 1;
+              end;
+            end
+            else
+            begin
+              { escapes, or a closing quote in the next window: the name
+                checked, its characters made in the scratch block, the
+                entries up to its closing quote passed over }
+              q := EscEnd(P, e);
+              if q < 0 then
+                Exit;
+              if P.NTop + 9 + (q - e) + 16 > Length(P.Doc) then
+                SRoom(P, P.NTop + 9 + (q - e) + 16);
+              len := Unesc(@t[e + 1], q - e - 1, @P.D[P.NTop + 9]);
+              while True do
+              begin
+                while (i < ni) and (ix[i] <= q) do
+                  i := i + 1;
+                if i < ni then
+                  Break;
+                P.I := i;
+                if not Refill(P) then
+                begin
+                  i := 0;
+                  ni := 0;
+                  Break;
+                end;
+                i := P.I;
+                ni := P.NIdx;
+                ix := @P.Idx[0];
+              end;
+              P.NRefTop := nrt;
+              if not NameInSet(P, fr^, nil, len, True) then
+                Exit;
+              nrt := P.NRefTop;
+            end;
+            fr^.Count := fr^.Count + 1;
+            { its colon in the same pass, when the window has it, and the
+              value after it, checked below in the same pass too }
+            if (i < ni) and (t[ix[i]] = 58) then
+            begin
+              i := i + 1;
+              state := SValue;
+              if i >= ni then
+                Continue;
+              e := ix[i];
+              i := i + 1;
+              c := t[e];
+            end
+            else
+            begin
+              state := SColon;
+              Continue;
+            end;
+          end;
+        SColon:
+          begin
+            if c <> 58 then
+              Exit;
+            state := SValue;
+            Continue;
+          end;
+        SAfter:
+          begin
+            if (depth > 0) and (c = 44) then
+            begin
+              if fr^.Obj then
+                state := SObjName
+              else
+                state := SValue;
+            end
+            else if (depth > 0) and (((c = 93) and not fr^.Obj) or ((c = 125) and fr^.Obj)) then
+            begin
+              depth := depth - 1;
+              P.NTop := fr^.Mark;
+              nrt := fr^.NMark;
+              if fr^.NSet > 0 then
+                fr^.Names := nil;
+              if depth > 0 then
+                fr := PJFrame(Pointer(Integer(fb) + (depth - 1) * fsz))
+              else
+                fr := nil;
+              state := SAfter;
+            end
+            else
+              Exit;
+            Continue;
+          end;
+      end;
+    end;
+    if c = 34 then
+    begin
+      if (i < ni) and (t[ix[i]] = 34) then
+        i := i + 1
+      else
+      begin
+        { escapes, or a closing quote in the next window: the
+          string checked in place, the index's entries up to its
+          closing quote passed over, window after window }
+        q := EscEnd(P, e);
+        if q < 0 then
+          Exit;
+        while True do
+        begin
+          while (i < ni) and (ix[i] <= q) do
+            i := i + 1;
+          if i < ni then
+            Break;
+          P.I := i;
+          if not Refill(P) then
+          begin
+            i := 0;
+            ni := 0;
+            Break;
+          end;
+          i := P.I;
+          ni := P.NIdx;
+          ix := @P.Idx[0];
+        end;
+      end;
+      { the comma after it in the same pass, when the window has it }
+      if (depth > 0) and (i < ni) and (t[ix[i]] = 44) then
+      begin
+        i := i + 1;
+        if fr^.Obj then
+          state := SObjName
+        else
+          state := SValue;
+      end
+      else
+        state := SAfter;
+      Continue;
+    end;
+    if (c = 45) or ((c >= 48) and (c <= 57)) then
+    begin
+      { a number by its grammar (RFC 8259 6), never converted: a
+        minus, its digits with no 0 before another, a point and
+        digits, an e, a sign and digits; a run of digits eight
+        bytes a step, a byte at a time when fewer are left, and
+        the byte after the digits read once: one JEndTab marks
+        ends the number, its common case, with no point and no
+        e, and after a fraction with no e }
+      k := e;
+      if c = 45 then
+        k := k + 1;
+      at := k;
+      while True do
+      begin
+        if n - k < 8 then
+        begin
+          while (k < n) and (t[k] >= 48) and (t[k] <= 57) do
+            k := k + 1;
+          Break;
+        end;
+        w := PInt64(@t[k])^ xor $3030303030303030;
+        w := ((w + $7676767676767676) or w) and Int64($8080808080808080);
+        if w <> 0 then
+        begin
+          k := k + (TrailingZeros(w) shr 3);
+          Break;
+        end;
+        k := k + 8;
+      end;
+      if (k = at) or ((t[at] = 48) and (k - at > 1)) then
+        Exit;
+      if (k < n) and (JEndTab[t[k]] = 0) then
+      begin
+        if t[k] = 46 then
+        begin
+          k := k + 1;
+          at := k;
+          while True do
+          begin
+            if n - k < 8 then
+            begin
+              while (k < n) and (t[k] >= 48) and (t[k] <= 57) do
+                k := k + 1;
+              Break;
+            end;
+            w := PInt64(@t[k])^ xor $3030303030303030;
+            w := ((w + $7676767676767676) or w) and Int64($8080808080808080);
+            if w <> 0 then
+            begin
+              k := k + (TrailingZeros(w) shr 3);
+              Break;
+            end;
+            k := k + 8;
+          end;
+          if k = at then
+            Exit;
+        end;
+        { an e, or what follows ends it where a token can begin }
+        if (k < n) and (JEndTab[t[k]] = 0) then
+        begin
+          if (t[k] <> 101) and (t[k] <> 69) then
+            Exit;
+          k := k + 1;
+          if (k < n) and ((t[k] = 43) or (t[k] = 45)) then
+            k := k + 1;
+          at := k;
+          while True do
+          begin
+            if n - k < 8 then
+            begin
+              while (k < n) and (t[k] >= 48) and (t[k] <= 57) do
+                k := k + 1;
+              Break;
+            end;
+            w := PInt64(@t[k])^ xor $3030303030303030;
+            w := ((w + $7676767676767676) or w) and Int64($8080808080808080);
+            if w <> 0 then
+            begin
+              k := k + (TrailingZeros(w) shr 3);
+              Break;
+            end;
+            k := k + 8;
+          end;
+          if (k = at) or ((k < n) and (JEndTab[t[k]] = 0)) then
+            Exit;
+        end;
+      end;
+      q := k;
+    end
+    else if (c = 123) or (c = 91) then
+    begin
+      if depth >= P.MaxDepth then
+        Exit;
+      if (i < ni) and (t[ix[i]] = c + 2) then
+      begin
+        { an empty array or object, whole: its closing byte is the
+          opening one plus 2 }
+        i := i + 1;
+        { the comma after it in the same pass, when the window has it }
+        if (depth > 0) and (i < ni) and (t[ix[i]] = 44) then
+        begin
+          i := i + 1;
+          if fr^.Obj then
+            state := SObjName
+          else
+            state := SValue;
+        end
+        else
+          state := SAfter;
+        Continue;
+      end;
+      if depth >= Length(P.St) then
+      begin
+        SetLength(P.St, Length(P.St) * 2 + 8);
+        fb := @P.St[0];
+      end;
+      fr := PJFrame(Pointer(Integer(fb) + depth * fsz));
+      fr^.Count := 0;
+      fr^.Obj := c = 123;
+      fr^.NSet := 0;
+      fr^.Mark := P.NTop;
+      fr^.NMark := nrt;
+      fr^.Seen := 0;
+      depth := depth + 1;
+      if c = 123 then
+        state := SObjFirst
+      else
+        state := SArrFirst;
+      Continue;
+    end
+    else if (c = 93) and (state = SArrFirst) then
+    begin
+      depth := depth - 1;
+      if depth > 0 then
+        fr := PJFrame(Pointer(Integer(fb) + (depth - 1) * fsz))
+      else
+        fr := nil;
+      state := SAfter;
+      Continue;
+    end
+    else if (c = 116) and (e + 4 <= n) and (t[e + 1] = 114) and (t[e + 2] = 117) and
+      (t[e + 3] = 101) then
+      q := e + 4
+    else if (c = 102) and (e + 5 <= n) and (t[e + 1] = 97) and (t[e + 2] = 108) and
+      (t[e + 3] = 115) and (t[e + 4] = 101) then
+      q := e + 5
+    else if (c = 110) and (e + 4 <= n) and (t[e + 1] = 117) and (t[e + 2] = 108) and
+      (t[e + 3] = 108) then
+      q := e + 4
+    else
+      Exit;
+    { a literal ends where a token can begin, as a number does }
+    if (c >= 97) and (q < n) and (JEndTab[t[q]] = 0) then
+      Exit;
+    { the comma after it in the same pass, when the window has it }
+    if (depth > 0) and (i < ni) and (t[ix[i]] = 44) then
+    begin
+      i := i + 1;
+      if fr^.Obj then
+        state := SObjName
+      else
+        state := SValue;
+    end
+    else
+      state := SAfter;
+  end;
+end;
+
+
+{ The fast check first (CheckFast); a text it does not take, the reader
+  a decode reads text through (P280): a token at a time with the
+  parse's own state machine and checks, its value whole and nothing
+  after it, no document made either way. }
+function JsonValid(const S: string; const Opts: TJsonOptions): Boolean;
+var
+  p: TJParse;
+  k: Integer;
+  lim: Int64;
+begin
+  Result := False;
+  lim := JsonMaxDoc;
+  if (Opts.MaxBytes > 0) and (Opts.MaxBytes < lim) then
+    lim := Opts.MaxBytes;
+  if Length(S) <= lim then
+  begin
+    p := Default(TJParse);
+    p.T := PByte(Pointer(S));
+    p.N := Length(S);
+    p.MaxDepth := Opts.MaxDepth;
+    if p.MaxDepth <= 0 then
+      p.MaxDepth := JsonDepthMax;
+    p.Bad := PasUtf8Valid(p.T, p.N, True);
+    SetLength(p.Idx, IdxRoom(p.N));
+    PasJsonScanStart(p.Scan);
+    p.Scan.NoCount := 1;
+    SetLength(p.Doc, 4096);
+    p.D := @p.Doc[0];
+    p.Seed := NextSeed;
+    if CheckFast(p) then
+    begin
+      Result := True;
+      Exit;
+    end;
+  end;
+  p := Default(TJParse);
+  if not StStart(p, S, Opts) then
+    Exit;
+  k := StValue(p);
+  if k < 0 then
+    Exit;
+  if (k >= JtArr) and not StRest(p) then
+    Exit;
+  Result := StEnd(p);
+end;
+
+function JsonValid(const S: string): Boolean;
+begin
+  Result := JsonValid(S, JsonDefaults);
 end;
 
 { The pointer of the value the last StValue read (Done) or opened: the
@@ -11224,6 +12444,7 @@ begin
   if (c = 123) or (c = 91) then
   begin
     PasJsonScanStart(sc);
+    sc.NoCount := 1;
     lvl := 0;
     done := i;
     if Length(FIdx) < JsonScanStep * 64 + 8 then
@@ -11776,12 +12997,355 @@ begin
   FLv[FDepth].Count := 0;
   FLv[FDepth].NN := 0;
   FLv[FDepth].Tab := nil;
+  FLv[FDepth].NMark := FNRefTop;
+  FLv[FDepth].Seen := 0;
 end;
+
+{ The names of level L read in place (NextFast) put among its names the
+  slow way, for a name read the slow way to be checked against them. }
+procedure TJsonReader.SlowNames(L: Integer);
+var
+  j: Integer;
+begin
+  for j := FLv[L].NMark to FNRefTop - 1 do
+    NameInto(FLv[L], BytesStr(PByte(FNRef[2 * j]), FNRef[2 * j + 1]));
+  FNRefTop := FLv[L].NMark;
+end;
+
+{ The first byte at or after K of P[0..N-1] that is no white space: a
+  run of spaces, a text's indentation, eight bytes a step, past its first
+  when a space follows it, the others a byte at a time (P211). }
+function JsonSkipWs(P: PByte; K, N: Integer): Integer;
+var
+  c, w: Integer;
+begin
+  while K < N do
+  begin
+    c := P[K];
+    if c = 32 then
+    begin
+      K := K + 1;
+      if (N - K >= 8) and (P[K] = 32) then
+        while N - K >= 8 do
+        begin
+          w := PInt64(@P[K])^ xor $2020202020202020;
+          if w <> 0 then
+          begin
+            K := K + (TrailingZeros(w) shr 3);
+            Break;
+          end;
+          K := K + 8;
+        end;
+    end
+    else if (c = 10) or (c = 13) or (c = 9) then
+      K := K + 1
+    else
+      Break;
+  end;
+  Result := K;
+end;
+
+{ A text's next token read where it lies (P211): white space, the
+  delimiter its place wants, then the token by its first byte: a
+  bracket; a string to its closing quote, its escapes checked in place;
+  a number by its grammar (RFC 8259 6); a literal; what follows a number
+  or a literal a byte JEndTab marks. A name is checked against its
+  object's names by their places and a word of bits, as CheckFast
+  checks them, up to JsonLinear names of an object that has had none
+  read the slow way. Nothing is made: Token, AsString and AsNumber make
+  their values from FTA to FTB. Anything else, an error among them,
+  answers False with nothing changed, and Next reads the token the slow
+  way, which says why. The text's bytes were checked for UTF-8 once
+  (FBad); a token over a bad one goes the slow way too. The open level's
+  fields are read through one pointer, lp; JsonSkipWs is called only at
+  a byte of 20h or below, a text with no white space calling it never. }
+function TJsonReader.NextFast(out T: TJsonToken): Boolean;
+var
+  p: PByte;
+  k, n, c, d, a, b, lv, md, len, w, at: Integer;
+  esc, nm: Boolean;
+  lp: PJsonLevel;
+begin
+  Result := False;
+  T := jtkEnd;
+  p := FP;
+  n := FEnd;
+  k := FStart;
+  if (k < n) and (p[k] <= 32) then
+    k := JsonSkipWs(p, k, n);
+  if k >= n then
+    Exit;
+  c := p[k];
+  lv := FDepth;
+  d := 0;
+  lp := nil;
+  nm := False;
+  if lv > 0 then
+  begin
+    lp := @FLv[lv];
+    if lp^.Obj and Odd(lp^.Count) then
+      d := 58
+    else if lp^.Count > 0 then
+      d := 44;
+    nm := lp^.Obj and not Odd(lp^.Count);
+  end;
+  if (d <> 0) and not (((c = 125) or (c = 93)) and (d <> 58)) then
+  begin
+    if c <> d then
+      Exit;
+    k := k + 1;
+    if (k < n) and (p[k] <= 32) then
+      k := JsonSkipWs(p, k, n);
+    if k >= n then
+      Exit;
+    c := p[k];
+    if (c = 125) or (c = 93) then
+      Exit;
+  end;
+  if nm and (c <> 34) and (c <> 125) then
+    Exit;
+  if (c = 123) or (c = 91) then
+  begin
+    md := FOpts.MaxDepth;
+    if md <= 0 then
+      md := JsonDepthMax;
+    if lv >= md then
+      Exit;
+    if lv > 0 then
+      lp^.Count := lp^.Count + 1;
+    FDepth := lv + 1;
+    if FDepth >= Length(FLv) then
+      SetLength(FLv, FDepth * 2 + 8);
+    FLv[FDepth].Obj := c = 123;
+    FLv[FDepth].Count := 0;
+    FLv[FDepth].NN := 0;
+    FLv[FDepth].Tab := nil;
+    FLv[FDepth].NMark := FNRefTop;
+    FLv[FDepth].Seen := 0;
+    FStart := k + 1;
+    FFastTok := False;
+    FTok := nil;
+    if c = 123 then
+      T := jtkBeginObject
+    else
+      T := jtkBeginArray;
+    Result := True;
+    Exit;
+  end;
+  if (c = 125) or (c = 93) then
+  begin
+    if (lv = 0) or (lp^.Obj <> (c = 125)) then
+      Exit;
+    FNRefTop := lp^.NMark;
+    FDepth := lv - 1;
+    FStart := k + 1;
+    FFastTok := False;
+    FTok := nil;
+    if c = 125 then
+      T := jtkEndObject
+    else
+      T := jtkEndArray;
+    Result := True;
+    Exit;
+  end;
+  a := k;
+  esc := False;
+  if c = 34 then
+  begin
+    { to the closing quote, eight bytes a pass while none is a quote, a
+      backslash or below 20h (EscEnd's test), then a byte at a time }
+    b := k + 1;
+    while n - b >= 8 do
+    begin
+      w := PInt64(@p[b])^;
+      at := w xor $2222222222222222;
+      len := (at - $0101010101010101) and not at;
+      at := w xor $5C5C5C5C5C5C5C5C;
+      len := len or ((at - $0101010101010101) and not at);
+      len := (len or ((w - $2020202020202020) and not w)) and Int64($8080808080808080);
+      if len <> 0 then
+      begin
+        b := b + (TrailingZeros(len) shr 3);
+        Break;
+      end;
+      b := b + 8;
+    end;
+    while (b < n) and (p[b] <> 34) and (p[b] <> 92) and (p[b] >= 32) do
+      b := b + 1;
+    if b >= n then
+      Exit;
+    if p[b] = 92 then
+    begin
+      esc := True;
+      b := EscEndP(p, n, k);
+      if b < 0 then
+        Exit;
+    end
+    else if p[b] <> 34 then
+      Exit;
+    if (FBad >= 0) and (FBad > k) and (FBad < b) then
+      Exit;
+    len := b - k - 1;
+    if nm then
+    begin
+      { a name: against its object's names, by a bit of the object's
+        word, then in place (NameSeen) }
+      if esc or (lp^.NN > 0) or (FNRefTop - lp^.NMark >= JsonLinear) then
+        Exit;
+      w := Int64(1) shl ((9 * len + p[k + 1 + (len shr 1)]) and 63);
+      if ((lp^.Seen and w) <> 0) and NameSeen(PInt64(@FNRef[2 * lp^.NMark]),
+        FNRefTop - lp^.NMark, @p[k + 1], len) then
+        Exit;
+      lp^.Seen := lp^.Seen or w;
+      if 2 * FNRefTop + 2 > Length(FNRef) then
+        SetLength(FNRef, 2 * Length(FNRef) + 64);
+      FNRef[2 * FNRefTop] := Int64(@p[k + 1]);
+      FNRef[2 * FNRefTop + 1] := len;
+      FNRefTop := FNRefTop + 1;
+    end;
+    b := b + 1;
+    T := jtkString;
+  end
+  else if (c = 45) or ((c >= 48) and (c <= 57)) then
+  begin
+    { a number by its grammar: a minus, digits with no 0 before another,
+      a point and digits, an e, a sign and digits }
+    b := k;
+    if c = 45 then
+      b := b + 1;
+    at := b;
+    while n - b >= 8 do
+    begin
+      w := PInt64(@p[b])^ xor $3030303030303030;
+      w := ((w + $7676767676767676) or w) and Int64($8080808080808080);
+      if w <> 0 then
+      begin
+        b := b + (TrailingZeros(w) shr 3);
+        Break;
+      end;
+      b := b + 8;
+    end;
+    while (b < n) and (p[b] >= 48) and (p[b] <= 57) do
+      b := b + 1;
+    if (b = at) or ((p[at] = 48) and (b - at > 1)) then
+      Exit;
+    if (b < n) and (p[b] = 46) then
+    begin
+      b := b + 1;
+      at := b;
+      while n - b >= 8 do
+      begin
+        w := PInt64(@p[b])^ xor $3030303030303030;
+        w := ((w + $7676767676767676) or w) and Int64($8080808080808080);
+        if w <> 0 then
+        begin
+          b := b + (TrailingZeros(w) shr 3);
+          Break;
+        end;
+        b := b + 8;
+      end;
+      while (b < n) and (p[b] >= 48) and (p[b] <= 57) do
+        b := b + 1;
+      if b = at then
+        Exit;
+    end;
+    if (b < n) and ((p[b] = 101) or (p[b] = 69)) then
+    begin
+      b := b + 1;
+      if (b < n) and ((p[b] = 43) or (p[b] = 45)) then
+        b := b + 1;
+      at := b;
+      while n - b >= 8 do
+      begin
+        w := PInt64(@p[b])^ xor $3030303030303030;
+        w := ((w + $7676767676767676) or w) and Int64($8080808080808080);
+        if w <> 0 then
+        begin
+          b := b + (TrailingZeros(w) shr 3);
+          Break;
+        end;
+        b := b + 8;
+      end;
+      while (b < n) and (p[b] >= 48) and (p[b] <= 57) do
+        b := b + 1;
+      if b = at then
+        Exit;
+    end;
+    T := jtkNumber;
+  end
+  else if (c = 116) and (k + 4 <= n) and (p[k + 1] = 114) and (p[k + 2] = 117) and
+    (p[k + 3] = 101) then
+  begin
+    b := k + 4;
+    T := jtkTrue;
+  end
+  else if (c = 102) and (k + 5 <= n) and (p[k + 1] = 97) and (p[k + 2] = 108) and
+    (p[k + 3] = 115) and (p[k + 4] = 101) then
+  begin
+    b := k + 5;
+    T := jtkFalse;
+  end
+  else if (c = 110) and (k + 4 <= n) and (p[k + 1] = 117) and (p[k + 2] = 108) and
+    (p[k + 3] = 108) then
+  begin
+    b := k + 4;
+    T := jtkNull;
+  end
+  else
+    Exit;
+  if (T <> jtkString) and (b < n) and (JEndTab[p[b]] = 0) then
+    Exit;
+  if (FBad >= 0) and (FBad >= a) and (FBad < b) then
+    Exit;
+  if b - a > FMaxValue then
+    Exit;
+  if lv > 0 then
+    lp^.Count := lp^.Count + 1;
+  FTA := a;
+  FTB := b;
+  FTKind := T;
+  FTEsc := esc;
+  FTName := nm;
+  FFastTok := True;
+  FTok := nil;
+  FLastAt := FBase + a;
+  FStart := b;
+  Result := True;
+end;
+
 
 { The next token, read: a scalar's value through Token, AsString and AsNumber; a
   name is a string at a name's place, its twin an error. At the end of
   the stream jtkEnd, and inside a container that is an error. }
 function TJsonReader.Next: TJsonToken;
+begin
+  { a text's token read in place, where it can be (P211) }
+  if (FKind = 0) and (FErr = nil) and (FBusy = 0) and not (FLines or FSeq or FSkip) then
+  begin
+    if FFast = 0 then
+    begin
+      FBad := PasUtf8Valid(FP, FEnd, True);
+      FFast := 1;
+    end;
+    FBusy := 1;
+    if NextFast(Result) then
+    begin
+      FBusy := 0;
+      FLastTk := Result;
+      Exit;
+    end;
+    FBusy := 0;
+    if (FDepth > 0) and FLv[FDepth].Obj and not Odd(FLv[FDepth].Count) and
+      (FNRefTop > FLv[FDepth].NMark) then
+      SlowNames(FDepth);
+  end;
+  FFastTok := False;
+  FLastTk := jtkEnd;
+  Result := NextSlow;
+  FLastTk := Result;
+end;
+
+function TJsonReader.NextSlow: TJsonToken;
 var
   k, s, e, past, at: Integer;
   c: Integer;
@@ -11821,6 +13385,7 @@ begin
       begin
         if (FDepth = 0) or (FLv[FDepth].Obj <> (c = 125)) then
           FailAt(at, jeSyntax, 'invalid character ' + QuoteByte(c) + ' at start of value');
+        FNRefTop := FLv[FDepth].NMark;
         FDepth := FDepth - 1;
         FStart := FStart + k + 1;
         if c = 125 then
@@ -11866,9 +13431,19 @@ begin
   end;
 end;
 
-{ The last scalar read as a json; nil after a bracket. }
+{ The last scalar read as a json; nil after a bracket. A token read in
+  place is made now from its bytes, and kept. }
 function TJsonReader.Token: json;
+var
+  er: TJErr;
+  r: PJNode;
 begin
+  if FFastTok and (FTok = nil) then
+  begin
+    r := ParseMem(@FP[FTA], FTB - FTA, FPOpts, er, FIdx);
+    if r <> nil then
+      FTok := JsonOfN(r);
+  end;
   Result := FTok;
 end;
 
@@ -11877,8 +13452,26 @@ end;
 function TJsonReader.AsString: string;
 var
   nd: PJNode;
+  n: Integer;
 begin
-  nd := NodeOfJ(FTok);
+  if FFastTok and (FTKind = jtkString) then
+  begin
+    { from the bytes between its quotes: a name from the cache, a string
+      with escapes made with them undone }
+    n := FTB - FTA - 2;
+    if FTEsc then
+    begin
+      SetLength(Result, n);
+      if n > 0 then
+        SetLength(Result, Unesc(@FP[FTA + 1], n, PByte(Pointer(Result))));
+    end
+    else if FTName then
+      Result := Intern(@FP[FTA + 1], n)
+    else
+      Result := BytesStr(@FP[FTA + 1], n);
+    Exit;
+  end;
+  nd := NodeOfJ(Token);
   if (nd = nil) or ((nd^.W0 and 7) <> JtStr) then
     raise EJsonError.Create(jeType, FLastAt, 0, 0, '', '', 'the last token is not a string');
   Result := Intern(StrBytes(nd), StrLen(nd));
@@ -11889,7 +13482,12 @@ function TJsonReader.AsNumber: string;
 var
   nd: PJNode;
 begin
-  nd := NodeOfJ(FTok);
+  if FFastTok and (FTKind = jtkNumber) then
+  begin
+    Result := BytesStr(@FP[FTA], FTB - FTA);
+    Exit;
+  end;
+  nd := NodeOfJ(Token);
   if (nd = nil) or ((nd^.W0 and 7) <> JtNum) then
     raise EJsonError.Create(jeType, FLastAt, 0, 0, '', '', 'the last token is not a number');
   Result := FTok.AsNumber;
@@ -12026,14 +13624,25 @@ end;
   Decoder.StackPointer. }
 function TJsonReader.Path: string;
 var
-  d: Integer;
+  d, k: Integer;
 begin
   Result := '';
   for d := 1 to FDepth do
     if FLv[d].Obj then
     begin
-      if FLv[d].Count > 0 then
-        Result := Result + '/' + KeyToken(FLv[d].Names[FLv[d].NN - 1]);
+      { its last name: the slow way's, or the last one read in place,
+        before the next level's or at the top }
+      if (FLv[d].Count > 0) and (FLv[d].NN > 0) then
+        Result := Result + '/' + KeyToken(FLv[d].Names[FLv[d].NN - 1])
+      else if FLv[d].Count > 0 then
+      begin
+        if d < FDepth then
+          k := FLv[d + 1].NMark
+        else
+          k := FNRefTop;
+        if k > FLv[d].NMark then
+          Result := Result + '/' + KeyToken(BytesStr(PByte(FNRef[2 * k - 2]), FNRef[2 * k - 1]));
+      end;
     end
     else if FLv[d].Count > 0 then
       Result := Result + '/' + IntText(FLv[d].Count - 1);
@@ -12064,6 +13673,21 @@ constructor TJsonWriter.Create;
 begin
   FOpts := JsonDefaults;
   PasJsonOutInit(FOut, FOpts, 192);
+  Replain;
+end;
+
+{ FPlain worked out again when what it sums up changes, for Token to
+  test one field where it tested five on every token. }
+procedure TJsonWriter.Replain;
+begin
+  FPlain := (FKind = 0) and (Length(FOut.Indent) = 0) and not FOut.Html and
+    not FOpts.Canonical and not FSeq;
+end;
+
+procedure TJsonWriter.SetSeq(V: Boolean);
+begin
+  FSeq := V;
+  Replain;
 end;
 
 function JsonWriter: TJsonWriter;
@@ -12076,6 +13700,7 @@ begin
   Result := TJsonWriter.Create;
   Result.FKind := 1;
   Result.FFd := Fd;
+  Result.Replain;
 end;
 
 function JsonWriter(Sink: TJsonSink): TJsonWriter;
@@ -12083,6 +13708,7 @@ begin
   Result := TJsonWriter.Create;
   Result.FKind := 2;
   Result.FSink := Sink;
+  Result.Replain;
 end;
 
 procedure TJsonWriter.Enter;
@@ -12155,6 +13781,7 @@ begin
   FOut.MaxDepth := O.MaxDepth;
   if FOut.MaxDepth <= 0 then
     FOut.MaxDepth := JsonDepthMax;
+  Replain;
 end;
 
 { Where the writer is before a call, and back there when it fails. }
@@ -12315,6 +13942,8 @@ begin
     FLv[d].Obj := Obj;
     FLv[d].NN := 0;
     FLv[d].Tab := nil;
+    FLv[d].NMark := FWRefTop;
+    FLv[d].Seen := 0;
   finally
     Leave;
   end;
@@ -12337,6 +13966,7 @@ begin
       WFail('a name with no value before the object''s end');
     FLv[FOut.Depth].Names := nil;
     FLv[FOut.Depth].Tab := nil;
+    FWRefTop := FLv[FOut.Depth].NMark;
     PasJsonOutClose(FOut);
     ValueEnd;
   finally
@@ -12373,6 +14003,8 @@ begin
     d := FOut.Depth;
     if (d = 0) or not FOut.Lv[d].Obj then
       WFail('a name goes in an object');
+    if FWRefTop > FLv[d].NMark then
+      SlowWNames(d);
     if FNamed then
       WFail('a name after a name: its value first');
     if PasUtf8Valid(Pointer(S), Length(S), True) >= 0 then
@@ -12435,6 +14067,278 @@ end;
 procedure TJsonWriter.Add(const S: string);
 begin
   Scalar(0, S, 0, 0, nil);
+end;
+
+{ The pairs of the names Token wrote made at the text's address again,
+  the text having moved as it grew. }
+procedure TJsonWriter.WRebase;
+var
+  j: Integer;
+  dl: Int64;
+begin
+  dl := Int64(PByte(Pointer(FOut.S))) - Int64(FWBase);
+  for j := 0 to FWRefTop - 1 do
+    FWRef[2 * j] := FWRef[2 * j] + dl;
+  FWBase := PByte(Pointer(FOut.S));
+end;
+
+{ The names Token wrote in level D put among its names the slow way,
+  for a name written the slow way to be checked against them. }
+procedure TJsonWriter.SlowWNames(D: Integer);
+var
+  j: Integer;
+begin
+  if FWBase <> PByte(Pointer(FOut.S)) then
+    WRebase;
+  for j := FLv[D].NMark to FWRefTop - 1 do
+    NameInto(FLv[D], BytesStr(PByte(FWRef[2 * j]), FWRef[2 * j + 1]));
+  FWRefTop := FLv[D].NMark;
+end;
+
+{ The reader R's last token written as it was read (P211), as Go's
+  Encoder.WriteToken writes a Decoder's token: a bracket opens or closes
+  a level; a string at a name's place is a name, else a value. A token
+  a text reader read in place with no escape goes out as its bytes, the
+  reader having checked its grammar and its UTF-8, a name checked
+  against its object's names in the text written by a word of bits and
+  in place (NameSeen), as the reader checks its own; anything else (a
+  token read the slow way, a string with escapes, a writer of a
+  descriptor or a sink, Indent, EscapeHtml, Canonical, Seq, a twin)
+  through Name or Add, which check it and say what is wrong. A level's
+  fields are read through a pointer to it, ol in FOut and lw in FLv. }
+procedure TJsonWriter.Token(R: TJsonReader);
+var
+  d, k, len, at: Integer;
+  w: Int64;
+  base, p: PByte;
+  nm: Boolean;
+  ol: PJsonOutLevel;
+  lw: PJsonLevel;
+  pw: PInt64;
+begin
+  d := FOut.Depth;
+  if (R.FLastTk >= jtkBeginObject) and FPlain and (FBusy = 0) then
+  begin
+    { a bracket of a writer of memory, as OpenLevel and CloseLevel write
+      it, the guard and the mark aside: what they would refuse they do
+      the slow way and say so }
+    if (R.FLastTk = jtkBeginObject) or (R.FLastTk = jtkBeginArray) then
+    begin
+      if (d + 1 < FOut.MaxDepth) and ((d = 0) or (not FOut.Lv[d].Obj) or FNamed) then
+      begin
+        k := 0;
+        if d > 0 then
+        begin
+          ol := @FOut.Lv[d];
+          if ol^.Obj then
+            FNamed := False
+          else
+          begin
+            if ol^.Count > 0 then
+              k := 1;
+            ol^.Count := ol^.Count + 1;
+          end;
+        end;
+        if FOut.N + 2 > Length(FOut.S) then
+          OutRoom(FOut, 2);
+        base := PByte(Pointer(FOut.S));
+        at := FOut.N;
+        if k = 1 then
+        begin
+          base[at] := 44;
+          at := at + 1;
+        end;
+        if R.FLastTk = jtkBeginObject then
+          base[at] := 123
+        else
+          base[at] := 91;
+        FOut.N := at + 1;
+        d := d + 1;
+        FOut.Depth := d;
+        if d >= Length(FOut.Lv) then
+          SetLength(FOut.Lv, Length(FOut.Lv) * 2);
+        ol := @FOut.Lv[d];
+        ol^.Count := 0;
+        ol^.Obj := R.FLastTk = jtkBeginObject;
+        ol^.NameP := nil;
+        ol^.NameN := 0;
+        if d >= Length(FLv) then
+          SetLength(FLv, d * 2 + 8);
+        lw := @FLv[d];
+        lw^.Obj := ol^.Obj;
+        lw^.NN := 0;
+        lw^.Tab := nil;
+        lw^.NMark := FWRefTop;
+        lw^.Seen := 0;
+        Exit;
+      end;
+    end
+    else if (d > 0) and (FOut.Lv[d].Obj = (R.FLastTk = jtkEndObject)) and not FNamed then
+    begin
+      lw := @FLv[d];
+      lw^.Names := nil;
+      lw^.Tab := nil;
+      FWRefTop := lw^.NMark;
+      if FOut.N + 2 > Length(FOut.S) then
+        OutRoom(FOut, 2);
+      base := PByte(Pointer(FOut.S));
+      at := FOut.N;
+      if R.FLastTk = jtkEndObject then
+        base[at] := 125
+      else
+        base[at] := 93;
+      at := at + 1;
+      FOut.Depth := d - 1;
+      if d = 1 then
+      begin
+        base[at] := 10;
+        at := at + 1;
+      end;
+      FOut.N := at;
+      Exit;
+    end;
+  end;
+  { a scalar skips the case: brackets and the end alone are in it }
+  if (R.FLastTk >= jtkBeginObject) or (R.FLastTk = jtkEnd) then
+    case R.FLastTk of
+      jtkBeginObject:
+        begin
+          BeginObject;
+          Exit;
+        end;
+      jtkBeginArray:
+        begin
+          BeginArray;
+          Exit;
+        end;
+      jtkEndObject:
+        begin
+          EndObject;
+          Exit;
+        end;
+      jtkEndArray:
+        begin
+          EndArray;
+          Exit;
+        end;
+      jtkEnd:
+        begin
+          Enter;
+          try
+            WFail('no token read to write');
+          finally
+            Leave;
+          end;
+        end;
+    end;
+  d := FOut.Depth;
+  ol := nil;
+  lw := nil;
+  nm := False;
+  if d > 0 then
+  begin
+    ol := @FOut.Lv[d];
+    nm := ol^.Obj and not FNamed;
+    if nm then
+      lw := @FLv[d];
+  end;
+  if (not R.FFastTok) or R.FTEsc or not FPlain or (FBusy <> 0) or (nm and
+    ((R.FTKind <> jtkString) or (lw^.NN > 0) or (FWRefTop - lw^.NMark >= JsonLinear))) then
+  begin
+    case R.FLastTk of
+      jtkString:
+        if nm then
+          Name(R.AsString)
+        else
+          Add(R.AsString);
+      jtkNumber:
+        AddNumber(R.AsNumber);
+      jtkTrue:
+        Add(True);
+      jtkFalse:
+        Add(False);
+    else
+      AddNull;
+    end;
+    Exit;
+  end;
+  p := @R.FP[R.FTA];
+  len := R.FTB - R.FTA;
+  if nm then
+  begin
+    { a name: against the object's names Token wrote, by a bit of the
+      level's word, then in place; a twin the slow way, which says so }
+    if FWBase <> PByte(Pointer(FOut.S)) then
+      WRebase;
+    w := Int64(1) shl ((9 * (len - 2) + p[1 + ((len - 2) shr 1)]) and 63);
+    if ((lw^.Seen and w) <> 0) and NameSeen(PInt64(@FWRef[2 * lw^.NMark]),
+      FWRefTop - lw^.NMark, @p[1], len - 2) then
+    begin
+      Name(R.AsString);
+      Exit;
+    end;
+    k := 0;
+    if ol^.Count > 0 then
+      k := 1;
+    if FOut.N + k + len + 1 > Length(FOut.S) then
+      OutRoom(FOut, k + len + 1);
+    base := PByte(Pointer(FOut.S));
+    if FWBase <> base then
+      WRebase;
+    at := FOut.N;
+    if k = 1 then
+    begin
+      base[at] := 44;
+      at := at + 1;
+    end;
+    Move(p^, base[at], len);
+    base[at + len] := 58;
+    if 2 * FWRefTop + 2 > Length(FWRef) then
+      SetLength(FWRef, 2 * Length(FWRef) + 64);
+    pw := @FWRef[2 * FWRefTop];
+    pw[0] := Int64(@base[at + 1]);
+    pw[1] := len - 2;
+    FWRefTop := FWRefTop + 1;
+    lw^.Seen := lw^.Seen or w;
+    FOut.N := at + len + 1;
+    ol^.Count := ol^.Count + 1;
+    ol^.NameP := nil;
+    ol^.NameN := -(at + 1);
+    FOut.ValAt := FOut.N;
+    FNamed := True;
+    Exit;
+  end;
+  { a value: in an object after its name, in an array after a comma
+    when it is not the first, at the top level a line feed after it }
+  k := 0;
+  if d > 0 then
+  begin
+    if ol^.Obj then
+      FNamed := False
+    else
+    begin
+      if ol^.Count > 0 then
+        k := 1;
+      ol^.Count := ol^.Count + 1;
+    end;
+  end;
+  if FOut.N + k + len + 1 > Length(FOut.S) then
+    OutRoom(FOut, k + len + 1);
+  base := PByte(Pointer(FOut.S));
+  at := FOut.N;
+  if k = 1 then
+  begin
+    base[at] := 44;
+    at := at + 1;
+  end;
+  Move(p^, base[at], len);
+  at := at + len;
+  if d = 0 then
+  begin
+    base[at] := 10;
+    at := at + 1;
+  end;
+  FOut.N := at;
 end;
 
 procedure TJsonWriter.Add(V: Integer);

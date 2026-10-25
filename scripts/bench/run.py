@@ -77,6 +77,8 @@ PAIRS = ["b1loop", "b2str", "b3spawn", "b4chan", "b5map", "b6smap", "b7narrow", 
          "b35bind",
          # P206: typed JSON read (JsonDecode into records against Unmarshal)
          "b36unbind",
+         # P211: each operation on each file of Go's corpus, against v2 and v1
+         "b37json",
          # P426: XML read token by token (TXmlReader.Next against Decoder.Token)
          "b38xml",
          # P427: DEFLATE at level 6 and inflate against compress/flate
@@ -118,6 +120,11 @@ SECTIONS = {
     "b34json": ["parse", "parse1", "compact", "compact1", "pretty", "pretty1", "canonical"],
     "b35bind": ["marshal", "marshal1", "indent", "indent1"],
     "b36unbind": ["unmarshal", "unmarshal1"],
+    "b37json": [op + "-" + f
+                for op in ["parse", "parse1", "valid", "valid1", "decode", "decode1", "encode", "encode1",
+                           "compact", "compact1", "pretty", "pretty1", "canonical", "build"]
+                for f in ["canada_geometry", "citm_catalog", "golang_source", "string_escaped",
+                          "string_unicode", "synthea_fhir", "twitter_status"]],
     "b38xml": ["tokens"],
     "b39flate": ["deflate", "inflate"],
     "b40mail": ["message", "addr", "build", "words"],
@@ -181,6 +188,49 @@ BUDGET.update({"b35bind:marshal": 0.88, "b35bind:marshal1": 0.88, "b35bind:inden
 # 0.70/0.73 of v1, the peak 55 MB against Go's 40, now the data's own size
 # (P285 to P287).
 BUDGET.update({"b36unbind:unmarshal": 0.88, "b36unbind:unmarshal1": 0.81})
+# P211 (1.1.280): b37json, each operation on each file of Go's corpus
+# against v2 and v1, fifteen alternating rounds (rounds.py), native and
+# base; each section keeps what it won, the larger of its two medians
+# plus 0.075 rounded up to 0.05, at most 0.99, then raised to the larger of
+# that and the same rule on five rounds of the installed 1.1.280 on a machine
+# with other jobs running (every section still below Go's time). The medians,
+# native/base,
+# the files in _B37F's order:
+#   parse     0.61/0.66 0.31/0.36 0.36/0.41 0.49/0.52 0.59/0.66 0.28/0.30 0.40/0.45
+#   parse1    0.30/0.33 0.16/0.21 0.18/0.22 0.39/0.35 0.49/0.41 0.15/0.17 0.23/0.26
+#   valid     0.89/0.92 0.68/0.77 0.54/0.61 0.73/0.79 0.63/0.67 0.58/0.66 0.50/0.62
+#   valid1    0.85/0.93 0.87/0.93 0.85/0.94 0.78/0.85 0.66/0.72 0.74/0.84 0.68/0.85
+#   decode    0.69/0.73 0.66/0.69 0.69/0.71 0.52/0.53 0.63/0.65 0.86/0.88 0.74/0.81
+#   decode1   0.60/0.68 0.55/0.57 0.62/0.63 0.42/0.42 0.47/0.53 0.73/0.74 0.57/0.64
+#   encode    0.89/0.90 0.58/0.57 0.51/0.52 0.53/0.57 0.56/0.63 0.72/0.72 0.60/0.66
+#   encode1   0.87/0.89 0.55/0.54 0.49/0.53 0.54/0.56 0.54/0.59 0.72/0.72 0.58/0.65
+#   compact   0.32/0.33 0.29/0.32 0.24/0.24 0.49/0.51 0.50/0.54 0.24/0.25 0.28/0.29
+#   compact1  0.31/0.32 0.25/0.25 0.20/0.21 0.51/0.53 0.48/0.50 0.20/0.21 0.20/0.23
+#   pretty    0.42/0.41 0.35/0.36 0.24/0.30 0.50/0.53 0.51/0.49 0.31/0.34 0.37/0.39
+#   pretty1   0.36/0.37 0.30/0.29 0.21/0.24 0.44/0.43 0.44/0.40 0.23/0.24 0.23/0.23
+#   canonical 0.82/0.79 0.81/0.88 0.62/0.62 0.46/0.44 0.54/0.56 0.78/0.81 0.69/0.69
+#   build     0.86/0.89 0.94/0.93 0.82/0.82 0.54/0.57 0.49/0.51 0.84/0.81 0.79/0.80
+_B37F = ["canada_geometry", "citm_catalog", "golang_source", "string_escaped",
+         "string_unicode", "synthea_fhir", "twitter_status"]
+_B37 = {
+    "parse": [0.75, 0.50, 0.70, 0.60, 0.75, 0.50, 0.55],
+    "parse1": [0.45, 0.35, 0.40, 0.50, 0.60, 0.35, 0.40],
+    "valid": [0.99, 0.90, 0.75, 0.90, 0.75, 0.85, 0.75],
+    "valid1": [0.99, 0.99, 0.99, 0.95, 0.80, 0.99, 0.99],
+    "decode": [0.85, 0.80, 0.80, 0.65, 0.75, 0.99, 0.90],
+    "decode1": [0.80, 0.70, 0.75, 0.50, 0.60, 0.85, 0.75],
+    "encode": [0.99, 0.80, 0.75, 0.65, 0.75, 0.95, 0.80],
+    "encode1": [0.99, 0.75, 0.75, 0.65, 0.70, 0.99, 0.75],
+    "compact": [0.55, 0.45, 0.45, 0.60, 0.65, 0.40, 0.45],
+    "compact1": [0.55, 0.40, 0.40, 0.65, 0.60, 0.35, 0.40],
+    "pretty": [0.55, 0.45, 0.55, 0.65, 0.60, 0.55, 0.55],
+    "pretty1": [0.55, 0.45, 0.50, 0.55, 0.55, 0.45, 0.35],
+    "canonical": [0.90, 0.99, 0.80, 0.55, 0.65, 0.99, 0.95],
+    "build": [0.99, 0.99, 0.99, 0.80, 0.60, 0.99, 0.90],
+}
+for _op in _B37:
+    for _f, _v in zip(_B37F, _B37[_op]):
+        BUDGET["b37json:" + _op + "-" + _f] = _v
 # paslangc -checkptr / the plain build, per pair in CHECKPTR (P104).
 CHECKPTR_BUDGET = {"b8ptr": 10.0}
 # Peak resident memory, paslang / Go, the medians of MEM_RUNS traced runs:
@@ -408,6 +458,19 @@ def probes():
         print(f"{p:12s} {st:7d}  {first}")
 
 
+def stages(cpus):
+    """JSON's stages one at a time (P211): k12json built for each
+    processor, on the corpus prepare() writes, its lines as it prints them."""
+    prepare()
+    for cpu in cpus:
+        build("k12json", go=False, cpu=cpu)
+        print(f"-cpu {cpu}")
+        p = subprocess.run([pl_path("k12json", cpu)], capture_output=True, text=True, cwd=ROOT)
+        print(p.stdout, end="")
+        if p.returncode != 0:
+            sys.exit(p.stderr)
+
+
 def main():
     # One line as each pair is measured, also into a file (make bench > log).
     sys.stdout.reconfigure(line_buffering=True)
@@ -429,6 +492,9 @@ def main():
     record = {"machine": machine(), "runs_per_program": n, "scale": scale, "cpus": cpus, "pairs": [], "checkptr": []}
     if args == ["probes"]:
         probes()
+        return
+    if args == ["stages"]:
+        stages(cpus)
         return
     bad = 0
     prepare()

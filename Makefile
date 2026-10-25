@@ -560,6 +560,10 @@ GOLDEN_A64 += parkleft
 # P392: a slice's element from its pointer and length alone.
 GOLDEN += slicehead
 GOLDEN_A64 += slicehead
+# P211: JsonValid where its window ends, a text again by Token, a decode's
+# arrays counted within a bound and grown past it, escapes undone in place.
+GOLDEN += jsonvalidwin jsontoken jsondecgrow jsondecesc
+GOLDEN_A64 += jsonvalidwin jsontoken jsondecgrow jsondecesc
 # P403: SQLite named in a uses clause, uses sqlite since P418, a database in memory.
 GOLDEN += sqluses
 GOLDEN_A64 += sqluses
@@ -991,6 +995,12 @@ $(OUTDIR)/pasdbg: $(OUTDIR)/paslangc $(if $(AMD64),libs,libs-arm64) cmd/pasdbg/p
 # machine that runs anything else. After make bench, which builds them.
 bench-rounds:
 	python3 scripts/bench/rounds.py -n 40 --json $(BUILDDIR)/bench/rounds.json
+
+# JSON's stages one at a time, GB/s and the time stamp counter's ticks a
+# byte, for this processor and the base one (P211): scripts/bench/k12json.
+bench-stages: $(OUTDIR)/paslangc core libs
+	@mkdir -p $(BUILDDIR)/bench
+	PATH="$(abspath $(OUTDIR)):$$PATH" python3 scripts/bench/run.py stages
 
 bench-servers: $(OUTDIR)/paslangc core libs
 	PATH=$(OUTDIR):$$PATH python3 scripts/bench/servers.py -n 3 --json $(BUILDDIR)/bench/servers.json

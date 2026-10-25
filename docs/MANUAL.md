@@ -5740,7 +5740,11 @@ errors carry Go's reasons, offsets and JSON Pointers (RFC 6901).
 
 `JsonParse(s)` parses the text `s` and gives its value, or raises
 `EJsonError`; `TryJsonParse(s, j, err)` gives `False` and the error in
-`err` instead. Both take a `TJsonOptions` last.
+`err` instead. Both take a `TJsonOptions` last. `JsonValid(s)` says
+whether `s` is a document `JsonParse` takes, and makes nothing: the
+scan's index and one pass over it, each object's names checked for a
+twin in place (1.1.280); with options, their `MaxDepth` and
+`MaxBytes`.
 
 `examples/jsonread.paslang`:
 
@@ -6491,6 +6495,7 @@ JsonWrite(w, rec);            { the value and a line feed, out at once }
 | `r.Depth`, `r.Offset`, `r.Line`, `r.Column`, `r.Path` | where the reader is: the open containers, the next byte's place, its line and column, the JSON Pointer of the last member or element |
 | `JsonWriter`, `JsonWriter(fd)`, `JsonWriter(sink)` | a writer of memory (`w.Text` takes what it wrote), of a descriptor, or of a routine value `function(const S: string): Boolean` that takes the bytes, `False` to stop |
 | `JsonWrite(w, x)` | `x`, a `json` or a value of any type with a JSON form, written by its type's encoder straight into the writer's buffer: at the top level a value and a line feed, in a sequence (`w.Seq`) RS before it; inside an array the next element, inside an object the value of the name just written |
+| `w.Token(r)` | the token `r` read last, written as it was read, as Go's `Encoder.WriteToken` writes a `Decoder`'s token (1.1.280): `while r.Next <> jtkEnd do w.Token(r)` writes a text again a token at a time; a token `r` read in place goes out as its bytes, and a name twice in an object raises `jeDuplicate` |
 | `w.BeginObject`, `w.Name`, `w.Add`, `w.AddNull`, `w.AddNumber`, `w.EndArray`… | a value a token at a time, as `TJsonBuilder`'s words; a name twice in an object, a value with no name, a container closed by the other kind raise `EJsonError` and leave the writer as it was |
 | `w.Buffered`, `w.Flush`, `w.Ms`, `w.Options` | the bytes out at `Flush` or when the buffer is three quarters full, instead of after each value; a deadline for each write; the indent, `EscapeHtml` and `Canonical` of what comes next |
 
@@ -7066,32 +7071,39 @@ where, to `JsonParse` (`testdata/jsonconst`, `testdata/jsonconstbad`,
 The text is scanned 64 bytes at a time by the kernel of the processor
 (`PasJsonIndex`, P202: AVX2, SSE2 or NEON, §14 and `docs/KERNELS.md`), the
 document reserved once at the size the scan counts, and filled a token
-at a time, the common strings, integers and literals with no call. On
-an AMD Ryzen 7 4800H (Zen 2), the median of three rounds of the best of
-30 parses of each file of Go's corpus, against Go 1.27's
-`encoding/json/v2` unmarshalling it into `any`:
+at a time, the common strings, integers and literals with no call.
+`JsonValid` checks a text in the scan's pass and one more over its
+index, with no document; a reader of a text reads a token where it lies
+and a writer's `Token` copies such a token as its bytes; a typed decode
+undoes a string's escapes in place (P211). A document is written in one
+pass into a string that grows. RFC 8785's form sorts an object's names
+only when they are not in order already and remembers the order of the
+last eight shapes of object it sorted.
 
-| File | Bytes | paslang | Go v2 | Ratio |
-|---|---|---|---|---|
-| canada_geometry | 270403 | 1.918 ms | 3.566 ms | 0.54 |
-| citm_catalog | 1727204 | 2.238 ms | 9.968 ms | 0.22 |
-| golang_source | 1940472 | 8.186 ms | 23.792 ms | 0.34 |
-| string_escaped | 42062 | 0.209 ms | 0.243 ms | 0.86 |
-| string_unicode | 18124 | 0.015 ms | 0.048 ms | 0.31 |
-| synthea_fhir | 2008494 | 3.249 ms | 14.013 ms | 0.23 |
-| twitter_status | 631514 | 1.467 ms | 4.498 ms | 0.33 |
+On an AMD Ryzen 7 4800H (Zen 2), `scripts/bench/b37json` does each
+operation ten times on each file of Go's corpus, against Go 1.27's
+`encoding/json/v2`, `jsontext` and `v1`; the median of fifteen
+alternating rounds, paslang's time over Go's, from the file where
+paslang does best to the one where it does least well (`make bench`
+holds each file to its budget, and `scripts/bench/rounds.py b37json`
+shows them all):
 
-A document is written in one pass into a string that grows, and on one
-line or a value a line takes from 0.05 to 0.44 of the time Go's `v2`
-takes to marshal its `any` on every file (`scripts/bench/b34json`,
-whose sections hold each of these against Go's `v2` and `v1` in `make
-bench`). RFC 8785's form sorts an object's names only when they are not
-in order already and remembers the order of the last eight shapes of
-object it sorted. From text to RFC 8785's text, a parse and a write,
-the whole corpus takes 0.95 of the time of Go's `Value.Canonicalize`;
-canada_geometry, 111000 reals read and written in their shortest form,
-takes 1.37, as the numbers of the core unit pasnum are slower than Go's
-`strconv` (hito P240).
+| Operation | Go's side | -cpu native | -cpu base |
+|---|---|---|---|
+| parse | v2's `Unmarshal` into `any`, walked | 0.28 to 0.61 | 0.30 to 0.66 |
+| parse1 | v1's | 0.15 to 0.49 | 0.17 to 0.41 |
+| valid | `jsontext.Value.IsValid` | 0.50 to 0.89 | 0.61 to 0.92 |
+| valid1 | v1's `Valid` | 0.66 to 0.87 | 0.72 to 0.94 |
+| decode | v2's `Unmarshal` into the file's types | 0.52 to 0.86 | 0.53 to 0.88 |
+| decode1 | v1's | 0.42 to 0.73 | 0.42 to 0.74 |
+| encode | v2's `Marshal` of them | 0.51 to 0.89 | 0.52 to 0.90 |
+| encode1 | v1's | 0.49 to 0.87 | 0.53 to 0.89 |
+| compact | v2's `Marshal` of the `any` | 0.24 to 0.50 | 0.24 to 0.54 |
+| compact1 | v1's | 0.20 to 0.51 | 0.21 to 0.53 |
+| pretty | v2's with `WithIndent` | 0.24 to 0.51 | 0.30 to 0.53 |
+| pretty1 | v1's `MarshalIndent` | 0.21 to 0.44 | 0.23 to 0.43 |
+| canonical | `jsontext.Value.Canonicalize` | 0.46 to 0.82 | 0.44 to 0.88 |
+| build | `jsontext` `Decoder` tokens into an `Encoder` | 0.49 to 0.94 | 0.51 to 0.93 |
 
 ## 13. Sync: mutex, rwmutex, waitgroup, cond, once
 
