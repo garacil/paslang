@@ -657,7 +657,10 @@ against both ends of a constant range, `(c >= '0') and (c <= '9')` or
 `(b < 48) or (b > 57)`, constants on either side and `<` or `<=` alike,
 is worked out as one subtraction and one compare without sign
 (1.1.146), as Go's compiler does; the value is read once, which is all
-the two tests would read, since neither side may call. The logic family
+the two tests would read, since neither side may call. A comparison of
+integers as a condition, of an `if`, a `while` or an `until`, is one
+compare and one branch however deep its sides, never a Boolean made and
+tested (1.1.277, P390). The logic family
 adds four words, on Booleans and integers alike:
 
 | Operator | Is | `12 op 10` |

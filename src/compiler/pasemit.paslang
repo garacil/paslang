@@ -362,6 +362,10 @@ type
     FLeftOp: string;        { with FLeftIn on amd64: the left side as an operand, its home or a constant, '' for rcx (P297) }
     FRightK: Int64;         { with FRightOn: the left side in rax or x0 and the right this constant (P297) }
     FRightOn: Boolean;
+    FCondE: PExpr;          { the comparison CondBranch hands EmitExpr: EmitCmp branches on it (P390) }
+    FCondTarget: string;    { ... to this label }
+    FCondTrue: Boolean;     { ... when it holds, else when it fails }
+    FCondDone: Boolean;     { EmitCmp wrote the branch }
     FPoolCap: LongInt;      { the pool at most this many registers, 0 for all: r10 and r11 keep a call's code and second word (P297) }
     FArgGuard: TStrArray;   { the registers a call's arguments wait in, which no line names (P355) }
     FDivTop: PExpr;         { the expression whose value a reader takes in FDivDest (P356) }
@@ -775,7 +779,7 @@ type
     procedure DaWalk(S: PStmt; var M: Int64);
     procedure DaSetup(const Pr: TProc; Loc0: LongInt);
     procedure EmitForRunes(S: PStmt);
-    procedure EmitCmp(const Setcc: string);
+    procedure EmitCmp(E: PExpr; const Setcc: string);
     procedure PopLeft;
     function CallProof(E: PExpr): Boolean;
     function LeftFirst(E: PExpr): Boolean;
@@ -856,7 +860,6 @@ type
     function CountedLoop(S: PStmt; out Leaf: PExpr; out Up: Boolean): Boolean;
     procedure RunRest(E, Leaf: PExpr; var Rest: TExprArray);
     function EmitLoopRun(S: PStmt): Boolean;
-    procedure RunBool(const Target: string; WhenTrue: Boolean);
     procedure RunEnd(E: PExpr; const V: string; Up: Boolean);
     function WritesVar(S: PStmt; const N: string): Boolean;
     procedure ForRunTail(S: PStmt; const Vs: TSym; const Top, Brk: string);
@@ -11465,7 +11468,9 @@ end;
   the condition worked out as a value and tested, as before P265. }
 procedure TEmitter.CondBranch(E: PExpr; const Target: string; WhenTrue: Boolean);
 var
-  r: string;
+  r, wasTarget: string;
+  wasE: PExpr;
+  wasTrue, wasDone, done: Boolean;
 begin
   if CondJmp(E, Target, WhenTrue) then
     Exit;
@@ -11474,7 +11479,33 @@ begin
   r := PoolWord(E);
   if r = '' then
   begin
-    EmitExpr(E);
+    if (E <> nil) and (E^.Kind = ekBin) and ((E^.Bin = boEq) or (E^.Bin = boNe) or
+      (E^.Bin = boLt) or (E^.Bin = boLe) or (E^.Bin = boGt) or (E^.Bin = boGe)) then
+    begin
+      { a comparison the pool cannot hold (P390): EmitExpr works its sides
+        out as for a value, and EmitCmp branches on its compare where it
+        made the Boolean tested below; a comparison another way makes
+        (strings, reals, sets) is still tested. A condition inside it,
+        an inlined body's, keeps its own. }
+      wasE := FCondE;
+      wasTarget := FCondTarget;
+      wasTrue := FCondTrue;
+      wasDone := FCondDone;
+      FCondE := E;
+      FCondTarget := Target;
+      FCondTrue := WhenTrue;
+      FCondDone := False;
+      EmitExpr(E);
+      done := FCondDone;
+      FCondE := wasE;
+      FCondTarget := wasTarget;
+      FCondTrue := wasTrue;
+      FCondDone := wasDone;
+      if done then
+        Exit;
+    end
+    else
+      EmitExpr(E);
     if FArm then
       r := 'x0'
     else
@@ -12962,24 +12993,12 @@ begin
   begin
     JumpCC(CondCC(leaf^.Bin, not wt), head);
     for i := 0 to High(rest) - 1 do
-      if not CondJmp(rest[i], b, not wt) then
-      begin
-        EmitExpr(rest[i]);
-        RunBool(b, not wt);
-      end;
-    if not CondJmp(rest[High(rest)], a, wt) then
-    begin
-      EmitExpr(rest[High(rest)]);
-      RunBool(a, wt);
-    end;
+      CondBranch(rest[i], b, not wt);
+    CondBranch(rest[High(rest)], a, wt);
     JumpCC('', b);
   end;
   Line(head + ':');
-  if not CondJmp(S^.E, b, not wt) then
-  begin
-    EmitExpr(S^.E);
-    RunBool(b, not wt);
-  end;
+  CondBranch(S^.E, b, not wt);
   EmitStackCheck(head, '16');
   RunEnd(leaf^.R, vs.Reg, up);
   JumpCC('', a);
@@ -13037,27 +13056,6 @@ begin
       Line('  cmovgq %' + l + ', %' + ch)
     else
       Line('  cmovlq %' + l + ', %' + ch);
-  end;
-end;
-
-{ The Boolean in rax (x0): on to Target when it is True if WhenTrue,
-  when it is False otherwise. }
-procedure TEmitter.RunBool(const Target: string; WhenTrue: Boolean);
-begin
-  if FArm then
-  begin
-    if WhenTrue then
-      Line('  cbnz x0, ' + Target)
-    else
-      Line('  cbz x0, ' + Target);
-  end
-  else
-  begin
-    Line('  testq %rax, %rax');
-    if WhenTrue then
-      Line('  jnz ' + Target)
-    else
-      Line('  jz ' + Target);
   end;
 end;
 
@@ -15632,7 +15630,11 @@ begin
   FLeftIn := True;
 end;
 
-procedure TEmitter.EmitCmp(const Setcc: string);
+{ The comparison E of the sides EmitExprRaw left in rcx and rax (x1 and
+  x0), or of rax and a constant: one compare, then its flags made the
+  Boolean Setcc says; when E is the condition CondBranch handed EmitExpr
+  (FCondE), a branch on them to its target instead, no Boolean (P390). }
+procedure TEmitter.EmitCmp(E: PExpr; const Setcc: string);
 var
   cc: string;
 begin
@@ -15646,6 +15648,13 @@ begin
     end
     else
       Line('  cmp x1, x0');
+    if (E <> nil) and (E = FCondE) then
+    begin
+      FCondE := nil;
+      FCondDone := True;
+      Line('  b.' + CondCC(E^.Bin, FCondTrue) + ' ' + FCondTarget);
+      Exit;
+    end;
     cc := 'eq';
     if Setcc = 'sete' then
       cc := 'eq'
@@ -15670,6 +15679,13 @@ begin
   end
   else
     Line('  cmpq %rax, %rcx');
+  if (E <> nil) and (E = FCondE) then
+  begin
+    FCondE := nil;
+    FCondDone := True;
+    Line('  ' + X86Jcc(CondCC(E^.Bin, FCondTrue)) + ' ' + FCondTarget);
+    Exit;
+  end;
   Line('  movq $0, %rax');
   Line('  ' + Setcc + ' %al');
 end;
@@ -26310,12 +26326,12 @@ else if (E^.Name = 'rt_high') and LenPlace(E^.Args[0]) then
                   Line('  sdiv x9, ' + dv + ', x0');
                   Line('  msub x0, x9, x0, ' + dv);
                 end;
-              boEq: EmitCmp('sete');
-              boNe: EmitCmp('setne');
-              boLt: EmitCmp('setl');
-              boLe: EmitCmp('setle');
-              boGt: EmitCmp('setg');
-              boGe: EmitCmp('setge');
+              boEq: EmitCmp(E, 'sete');
+              boNe: EmitCmp(E, 'setne');
+              boLt: EmitCmp(E, 'setl');
+              boLe: EmitCmp(E, 'setle');
+              boGt: EmitCmp(E, 'setg');
+              boGe: EmitCmp(E, 'setge');
               boAnd:
                 begin
                   PopLeft;
@@ -27369,12 +27385,12 @@ else if (E^.Name = 'rt_high') and LenPlace(E^.Args[0]) then
                 SignedDiv(E, True);
                 Line('  movq %rdx, %rax');
               end;
-            boEq: EmitCmp('sete');
-            boNe: EmitCmp('setne');
-            boLt: EmitCmp('setl');
-            boLe: EmitCmp('setle');
-            boGt: EmitCmp('setg');
-            boGe: EmitCmp('setge');
+            boEq: EmitCmp(E, 'sete');
+            boNe: EmitCmp(E, 'setne');
+            boLt: EmitCmp(E, 'setl');
+            boLe: EmitCmp(E, 'setle');
+            boGt: EmitCmp(E, 'setg');
+            boGe: EmitCmp(E, 'setge');
             boAnd:
               begin
                 PopLeft;
@@ -28228,33 +28244,13 @@ begin
         if EmitSelectIf(S) then
         else if (S^.ElseSt = nil) and DirectJump(S^.ThenSt, c) then
         begin
-          if not JccTrue(S^.E, c) then
-          begin
-            { a word the pool works out is tested where it is (P328) }
-            pw := PoolWord(S^.E);
-            if pw = '' then
-            begin
-              EmitExpr(S^.E);
-              pw := 'x0';
-            end;
-            Line('  cbnz ' + pw + ', ' + c);
-          end;
+          CondBranch(S^.E, c, True);
         end
         else
         begin
           a := Lab;
           b := Lab;
-          if not FastJcc(S^.E, a) then
-          begin
-            { a word the pool works out is tested where it is (P328) }
-            pw := PoolWord(S^.E);
-            if pw = '' then
-            begin
-              EmitExpr(S^.E);
-              pw := 'x0';
-            end;
-            Line('  cbz ' + pw + ', ' + a);
-          end;
+          CondBranch(S^.E, a, False);
           EmitStmt(S^.ThenSt);
           { no else: nothing to jump over (P305) }
           if NoStmt(S^.ElseSt) then
@@ -28283,17 +28279,7 @@ begin
           Line(c + ':');
           EmitLoc(S^.Line);
           EmitStackCheck(c, '16');
-          if not JccTrue(S^.E, a) then
-          begin
-            { a word the pool works out is tested where it is (P328) }
-            pw := PoolWord(S^.E);
-            if pw = '' then
-            begin
-              EmitExpr(S^.E);
-              pw := 'x0';
-            end;
-            Line('  cbnz ' + pw + ', ' + a);
-          end;
+          CondBranch(S^.E, a, True);
           Line(b + ':');
           PopLoop;
         end;
@@ -28309,17 +28295,7 @@ begin
           EmitStmt(S^.Body);
           if FDaOn and (S^.DaGen = FDaGen) then
             FCurDa := S^.Da2;
-          if not FastJcc(S^.E, a) then
-          begin
-            { a word the pool works out is tested where it is (P328) }
-            pw := PoolWord(S^.E);
-            if pw = '' then
-            begin
-              EmitExpr(S^.E);
-              pw := 'x0';
-            end;
-            Line('  cbz ' + pw + ', ' + a);
-          end;
+          CondBranch(S^.E, a, False);
           Line(b + ':');
           PopLoop;
         end;
@@ -29017,35 +28993,13 @@ begin
       if EmitSelectIf(S) then
       else if (S^.ElseSt = nil) and DirectJump(S^.ThenSt, c) then
       begin
-        if not JccTrue(S^.E, c) then
-        begin
-          { a word the pool works out is tested where it is (P328) }
-          pw := PoolWord(S^.E);
-          if pw = '' then
-          begin
-            EmitExpr(S^.E);
-            pw := 'rax';
-          end;
-          Line('  testq %' + pw + ', %' + pw);
-          Line('  jnz ' + c);
-        end;
+        CondBranch(S^.E, c, True);
       end
       else
       begin
         a := Lab;
         b := Lab;
-        if not FastJcc(S^.E, a) then
-        begin
-          { a word the pool works out is tested where it is (P328) }
-          pw := PoolWord(S^.E);
-          if pw = '' then
-          begin
-            EmitExpr(S^.E);
-            pw := 'rax';
-          end;
-          Line('  testq %' + pw + ', %' + pw);
-          Line('  jz ' + a);
-        end;
+        CondBranch(S^.E, a, False);
         EmitStmt(S^.ThenSt);
         { no else: nothing to jump over, where every pass through the
           then took a jump to the next instruction (P305) }
@@ -29075,18 +29029,7 @@ begin
         Line(c + ':');
         EmitLoc(S^.Line);
         EmitStackCheck(c, '16');
-        if not JccTrue(S^.E, a) then
-        begin
-          { a word the pool works out is tested where it is (P328) }
-          pw := PoolWord(S^.E);
-          if pw = '' then
-          begin
-            EmitExpr(S^.E);
-            pw := 'rax';
-          end;
-          Line('  testq %' + pw + ', %' + pw);
-          Line('  jnz ' + a);
-        end;
+        CondBranch(S^.E, a, True);
         Line(b + ':');
         PopLoop;
       end;
@@ -29102,18 +29045,7 @@ begin
         EmitStmt(S^.Body);
         if FDaOn and (S^.DaGen = FDaGen) then
           FCurDa := S^.Da2;
-        if not FastJcc(S^.E, a) then
-        begin
-          { a word the pool works out is tested where it is (P328) }
-          pw := PoolWord(S^.E);
-          if pw = '' then
-          begin
-            EmitExpr(S^.E);
-            pw := 'rax';
-          end;
-          Line('  testq %' + pw + ', %' + pw);
-          Line('  jz ' + a);
-        end;
+        CondBranch(S^.E, a, False);
         Line(b + ':');
         PopLoop;
       end;

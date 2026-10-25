@@ -551,6 +551,9 @@ GOLDEN_A64 += ptrelem
 # P386: a store whose place is registers alone pushes no value.
 GOLDEN += storereg
 GOLDEN_A64 += storereg
+# P390: a comparison deeper than the pool, as a condition, makes no Boolean.
+GOLDEN += cmpdeep
+GOLDEN_A64 += cmpdeep
 # P403: SQLite named in a uses clause, uses sqlite since P418, a database in memory.
 GOLDEN += sqluses
 GOLDEN_A64 += sqluses
@@ -2880,6 +2883,13 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/storereg.out $(BUILDDIR)/storereg0.got; \
 	python3 -I scripts/check_storereg.py $(BUILDDIR)/storereg0.s; \
 	echo ok storereg-asm; \
+	: a comparison whose sides the pool cannot hold, as a condition, is one compare and one branch, no Boolean made and tested, P390; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/cmpdeep0 testdata/cmpdeep.paslang; \
+	$(BUILDDIR)/cmpdeep0 > $(BUILDDIR)/cmpdeep0.got; \
+	diff -u testdata/cmpdeep.out $(BUILDDIR)/cmpdeep0.got; \
+	python3 -I scripts/check_cmpdeep.py $(BUILDDIR)/cmpdeep.s; \
+	python3 -I scripts/check_cmpdeep.py $(BUILDDIR)/cmpdeep0.s; \
+	echo ok cmpdeep-asm; \
 	: a routine with nested ones zeroes only the locals a read may reach first, P358; \
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/nestzero0 testdata/nestzero.paslang; \
 	$(BUILDDIR)/nestzero0 > $(BUILDDIR)/nestzero0.got; \
@@ -4511,6 +4521,13 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	diff -u testdata/storereg.out $(BUILDDIR)/storereg0-arm.got; \
 	python3 -I scripts/check_storereg.py $(BUILDDIR)/storereg0-arm.s --arm; \
 	echo ok storereg-arm-asm; \
+	: P390 on arm64: a comparison deeper than the pool, as a condition, is one compare and one branch; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/cmpdeep0-arm testdata/cmpdeep.paslang; \
+	timeout 300 $(QEMU_A64) $(BUILDDIR)/cmpdeep0-arm > $(BUILDDIR)/cmpdeep0-arm.got; \
+	diff -u testdata/cmpdeep.out $(BUILDDIR)/cmpdeep0-arm.got; \
+	python3 -I scripts/check_cmpdeep.py $(BUILDDIR)/cmpdeep-arm.s --arm; \
+	python3 -I scripts/check_cmpdeep.py $(BUILDDIR)/cmpdeep0-arm.s --arm; \
+	echo ok cmpdeep-arm-asm; \
 	: P358 on arm64: the locals a read may reach first, zeroed alone; \
 	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/nestzero0-arm testdata/nestzero.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/nestzero0-arm > $(BUILDDIR)/nestzero0-arm.got; \
