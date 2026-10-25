@@ -12856,13 +12856,18 @@ checked output and run on both targets in `make check`.
 **Immutable environments.** `GetEnvironmentVariable`,
 `TryGetEnvironmentVariable` (distinguishes missing from an empty value),
 `GetEnvironmentVariableCount` and 1-based `GetEnvironmentString` read
-the initial Linux exec vector. It is copied before user code, shared
-read-only by all libraries, and has no `/proc` dependency. Lookup is
+the initial Linux exec vector. It is read where Linux put it and shared
+read-only by all libraries, and has no `/proc` dependency (1.1.276:
+nothing is copied before a program asks, and the map of names is built at
+the first lookup, under a `once` the pasroutines that look at the same
+time wait on, as Go's `syscall.copyenv` does at the first `Getenv`; a
+program that reads no variable does not pay for it when it starts). Lookup is
 case-sensitive, rejects empty/`=`/NUL names and selects the first
 duplicate. Raw enumeration retains malformed entries; invalid indexes
 return `''`. Returned strings are owned COW values.
 
-`TEnvironment.Current` provides a normalized immutable value;
+`TEnvironment.Current` provides a normalized immutable value, made at
+its first use as well;
 `TEnvironment.Create(entries)` validates `NAME=value` without NUL and
 selects the last explicit duplicate value. Its `Count`, 1-based
 `Entry`, `Lookup`, `ToArray`, `WithValue` and `WithoutValue` offer
