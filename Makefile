@@ -573,6 +573,9 @@ GOLDEN_A64 += bitnz
 # P395: the token reader's errors in Go's Decoder's words.
 GOLDEN += jsontokerr
 GOLDEN_A64 += jsontokerr
+# P396: a routine's straight code keeps its variables in registers.
+GOLDEN += straight
+GOLDEN_A64 += straight
 # P403: SQLite named in a uses clause, uses sqlite since P418, a database in memory.
 GOLDEN += sqluses
 GOLDEN_A64 += sqluses
@@ -2980,6 +2983,22 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	python3 -I scripts/check_bitnz.py $(BUILDDIR)/bitnz-base.s; \
 	python3 -I scripts/check_bitnz.py $(BUILDDIR)/bitnz-base0.s; \
 	echo ok bitnz-asm; \
+	: the straight code of a routine keeps its variables in registers across its calls, Move in a region, a zero only where a read may come first, P396; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/straight0 testdata/straight.paslang; \
+	$(BUILDDIR)/straight0 > $(BUILDDIR)/straight0.got; \
+	diff -u testdata/straight.out $(BUILDDIR)/straight0.got; \
+	$(OUTDIR)/paslangc -cpu base -o $(BUILDDIR)/straight-base testdata/straight.paslang; \
+	$(BUILDDIR)/straight-base > $(BUILDDIR)/straight-base.got; \
+	diff -u testdata/straight.out $(BUILDDIR)/straight-base.got; \
+	$(OUTDIR)/paslangc -cpu base -inline 0 -o $(BUILDDIR)/straight-base0 testdata/straight.paslang; \
+	$(BUILDDIR)/straight-base0 > $(BUILDDIR)/straight-base0.got; \
+	diff -u testdata/straight.out $(BUILDDIR)/straight-base0.got; \
+	PASLANG_GCSTRESS=1 PASLANG_GCVERIFY=1 $(BUILDDIR)/straight0 > $(BUILDDIR)/straight0-gc.got; \
+	diff -u testdata/straight.out $(BUILDDIR)/straight0-gc.got; \
+	python3 -I scripts/check_straight.py $(BUILDDIR)/straight.s; \
+	python3 -I scripts/check_straight.py $(BUILDDIR)/straight0.s; \
+	python3 -I scripts/check_straight.py $(BUILDDIR)/straight-base.s; \
+	echo ok straight-asm; \
 	: a routine with nested ones zeroes only the locals a read may reach first, P358; \
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/nestzero0 testdata/nestzero.paslang; \
 	$(BUILDDIR)/nestzero0 > $(BUILDDIR)/nestzero0.got; \
@@ -4638,6 +4657,18 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	: P394 on arm64: the narrow trailing count of a value an if proved not zero takes no sentinel bit; \
 	python3 -I scripts/check_bitnz.py $(BUILDDIR)/bitnz-arm.s --arm; \
 	echo ok bitnz-arm-asm; \
+	: P396 on arm64: the straight code of a routine keeps its variables in x19 to x26 across its calls; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/straight0-arm testdata/straight.paslang; \
+	timeout 300 $(QEMU_A64) $(BUILDDIR)/straight0-arm > $(BUILDDIR)/straight0-arm.got; \
+	diff -u testdata/straight.out $(BUILDDIR)/straight0-arm.got; \
+	$(OUTDIR)/paslangc -target arm64 -cpu base -Fu $(A64DIR) -o $(BUILDDIR)/straight-base-arm testdata/straight.paslang; \
+	timeout 300 $(QEMU_A64) $(BUILDDIR)/straight-base-arm > $(BUILDDIR)/straight-base-arm.got; \
+	diff -u testdata/straight.out $(BUILDDIR)/straight-base-arm.got; \
+	PASLANG_GCSTRESS=1 PASLANG_GCVERIFY=1 timeout 600 $(QEMU_A64) $(BUILDDIR)/straight0-arm > $(BUILDDIR)/straight0-arm-gc.got; \
+	diff -u testdata/straight.out $(BUILDDIR)/straight0-arm-gc.got; \
+	python3 -I scripts/check_straight.py $(BUILDDIR)/straight-arm.s --arm; \
+	python3 -I scripts/check_straight.py $(BUILDDIR)/straight0-arm.s --arm; \
+	echo ok straight-arm-asm; \
 	: P358 on arm64: the locals a read may reach first, zeroed alone; \
 	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/nestzero0-arm testdata/nestzero.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/nestzero0-arm > $(BUILDDIR)/nestzero0-arm.got; \

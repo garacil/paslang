@@ -2407,7 +2407,17 @@ across the call unless the statement assigns it; what the loop wrote
 of the others is stored before the call and they are loaded after it.
 A `try` keeps those registers too, so a routine that catches a raise
 from one of the routines it calls still returns them as its caller
-left them.
+left them. A routine's straight code keeps its variables in registers
+the same way (1.1.285, P396), its statements that call left as they
+are: a variable takes a register where its uses outweigh what the
+register costs the run of statements, its load at the start where a
+path may read it first and its stores where a call or what comes after
+reads it, and an arm of an `if` or a `case` that calls, raises or
+halts counts as less likely to run, as Go's `likelyadjust` ranks a
+branch. A `Move` is no call there: its copy keeps every register a
+loop or a run keeps a variable in. A local that every path writes
+before anything reads it, a `try`'s handler and its `finally` part
+among the readers, is not zeroed at the routine's start.
 A `for` of a constant count of four passes or fewer with a small body
 that neither changes its counter nor takes its address is written out
 once per pass with the pass's value in the counter's place, then the

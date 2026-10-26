@@ -1,0 +1,605 @@
+{ P396: a routine's straight code keeps its variables in registers
+  across its calls and branches, a run of statements with its calls as
+  islands, and what a register costs weighed against the uses it saves.
+  Calls between the uses of many locals, a variable written in one arm
+  and an island in the other, variables dead after an island, a pointer
+  into the frame across a call that grows the stack, objects held only
+  by registers while a call churns the heap, an exit after Result was
+  written, a try whose handler reads a local the body may not have
+  written, Move of every size in straight code and in a loop, one past
+  256 KiB, Move through pointer parameters, an if whose test calls only
+  after a part that calls nothing, a case whose arms call or raise, a
+  loop with an inner for beside calls, a var parameter's address, the
+  main block's globals, a method whose first island holds a block that
+  is a run of its own, before a loop whose island reads the loop's
+  counter, a record Result whose words are locals of their own (P366),
+  which the epilogue reads, a loop whose island reads at home a
+  variable nothing else reads, at every pass, and a raise in a loop
+  whose message reads the loop's counter. Every line is the same at
+  -inline 0. }
+program straight;
+
+uses SysUtils;
+
+type
+  TBox = class
+    V: Integer;
+    constructor Create(A: Integer);
+  end;
+  PInt = ^Integer;
+
+  TPair = record
+    A, B: Integer;
+  end;
+
+  TCache = class
+    Key, Cur: string;
+    Names: array of string;
+    Tags: array of Integer;
+    Resets: Integer;
+    function Find(const N: string): Integer;
+  end;
+
+var
+  gside, churned, gtotal, gtries: Integer;
+  big1, big2: array of Byte;
+
+constructor TBox.Create(A: Integer);
+begin
+  V := A;
+end;
+
+function Twice(X: Integer): Integer;
+begin
+  Result := X * 2 + Ord(X < 0);
+end;
+
+procedure Note(X: Integer);
+begin
+  gside := gside * 31 + X;
+end;
+
+function Probe(X: Integer): Boolean;
+begin
+  gside := gside + 1;
+  Result := X mod 5 = 3;
+end;
+
+{ calls between the uses of many locals }
+function Kept(N: Integer): Integer;
+var
+  a, b, c, d, e, f, g: Integer;
+begin
+  a := N + 1;
+  b := a * 3;
+  c := Twice(a) + b;
+  d := c - a;
+  Note(d);
+  e := d xor b;
+  f := Twice(e) + a + b;
+  g := f - c + d;
+  Note(g);
+  a := a + g;
+  b := b xor a;
+  Result := a + b + c + d + e + f + g + Twice(b);
+end;
+
+{ t written in one arm, an island in the other: the island must not
+  store a t this path never set }
+function Joins(C: Boolean; N: Integer): Integer;
+var
+  a, b, t: Integer;
+begin
+  a := N;
+  if C then
+    t := a * 3
+  else
+    Note(a);
+  b := Twice(a);
+  if C then
+    Result := t + b
+  else
+    Result := b - a;
+end;
+
+{ x, y and z die at the calls; w lives across them }
+function Dead(N: Integer): Integer;
+var
+  x, y, z, w: Integer;
+begin
+  x := N * 7;
+  y := x + 3;
+  w := x xor y;
+  Note(y);
+  z := Twice(w);
+  Note(z);
+  w := w + z;
+  Note(w);
+  Result := w;
+end;
+
+{ a call that grows the stack: a pointer into this frame is relocated }
+function Deep(N: Integer): Integer;
+var
+  pad: array[0..63] of Integer;
+begin
+  pad[N and 63] := N;
+  if N = 0 then
+    Result := 0
+  else
+    Result := Deep(N - 1) + pad[N and 63] - N + 1;
+end;
+
+function PtrStack(N: Integer): Integer;
+var
+  arr: array[0..7] of Integer;
+  p: PInt;
+  s: Integer;
+begin
+  arr[3] := 33;
+  arr[4] := 44;
+  p := @arr[3];
+  s := p^;
+  s := s + Deep(3000 + N);
+  s := s + p^;
+  p^ := p^ + 1;
+  s := s + Deep(2000);
+  Inc(p);
+  s := s + p^;
+  Result := s + arr[3];
+end;
+
+{ objects only the registers hold while a call churns the heap }
+procedure Churn;
+var
+  k: Integer;
+  b: TBox;
+  s: string;
+begin
+  for k := 0 to 999 do
+  begin
+    b := TBox.Create(k);
+    s := IntToStr(b.V) + 'x';
+    churned := churned + Length(s);
+  end;
+end;
+
+function Held(N: Integer): Integer;
+var
+  a, b, x: TBox;
+  s: Integer;
+begin
+  a := TBox.Create(N);
+  b := TBox.Create(N + 4);
+  s := a.V * b.V;
+  x := a;
+  a := b;
+  Churn;
+  s := s + x.V;
+  b := TBox.Create(x.V + 1);
+  Churn;
+  s := s xor (x.V shl 2) + a.V + b.V;
+  Result := s;
+end;
+
+{ Result written, then an exit whose test calls }
+function ExitMid(N: Integer): Integer;
+var
+  k: Integer;
+begin
+  Result := N * 2;
+  k := Twice(N);
+  if Probe(k) then
+    Exit;
+  Result := Result + k;
+  if Probe(Result) then
+    Exit(Result - 1);
+  Result := Result + 3;
+end;
+
+{ the handler reads a local the body may not have written: it starts
+  as zero }
+function TryRead(N: Integer): Integer;
+var
+  a: Integer;
+begin
+  try
+    if N > 5 then
+      raise Exception.Create('big');
+    a := 7;
+  except
+    Result := a + 100;
+    Exit;
+  end;
+  Result := a;
+end;
+
+{ a local the body writes before anything reads it, a raise between }
+function TryWrite(N: Integer): Integer;
+var
+  a, b: Integer;
+  bx: TBox;
+begin
+  b := 0;
+  try
+    a := N * 2;
+    bx := TBox.Create(a);
+    Churn;
+    if N > 5 then
+      raise Exception.Create('big');
+    b := bx.V + 1;
+  except
+    on E: Exception do
+      b := -1;
+  end;
+  Result := b;
+end;
+
+function TryFin(N: Integer): Integer;
+var
+  bx: TBox;
+  k: Integer;
+begin
+  k := N;
+  try
+    bx := TBox.Create(N * 3);
+    Churn;
+    Result := bx.V + k;
+  finally
+    Churn;
+    gside := gside + 1;
+  end;
+end;
+
+function Sum(P: PByte; N: Integer): Integer;
+var
+  i: Integer;
+begin
+  Result := 0;
+  for i := 0 to N - 1 do
+    Result := Result * 7 + P[i] + i;
+end;
+
+{ Move of every size in straight code, registers live around it }
+function MoveRun(N: Integer): Integer;
+var
+  src, dst: array[0..399] of Byte;
+  i, a, b, len: Integer;
+  ps, pd: PByte;
+begin
+  for i := 0 to 399 do
+  begin
+    src[i] := Byte((i * 7 + N) and 255);
+    dst[i] := 0;
+  end;
+  a := N;
+  b := N * 3;
+  len := N mod 41;
+  ps := @src[1];
+  pd := @dst[2];
+  Move(ps^, pd^, len);
+  a := a + pd[0] + len;
+  Move(src[5], dst[100], 17);
+  b := b xor dst[100];
+  len := len + 300;
+  Move(ps^, pd^, len);
+  a := a + Sum(@dst[0], 400);
+  Move(dst[0], dst[3], 200);
+  b := b + Sum(@dst[0], 400);
+  Move(dst[10], dst[0], 100);
+  Result := a + b + Sum(@dst[0], 400);
+end;
+
+{ Move in a loop's region }
+function MoveLoop(N: Integer): Integer;
+var
+  src, dst: array[0..63] of Byte;
+  i, k, s: Integer;
+begin
+  for i := 0 to 63 do
+    src[i] := Byte(i * 3 + 1);
+  s := 0;
+  for k := 0 to N - 1 do
+  begin
+    Move(src[k and 15], dst[0], (k mod 33) + 1);
+    s := s + dst[0] + dst[k mod 33] + k;
+  end;
+  Result := s;
+end;
+
+{ Move through pointer parameters: a routine that could have no frame }
+procedure CopyP(P, Q: PByte; N: Integer);
+begin
+  Move(P^, Q^, N);
+end;
+
+function MoveBig: Integer;
+var
+  i, n, s: Integer;
+begin
+  n := 300000;
+  SetLength(big1, n + 64);
+  SetLength(big2, n + 64);
+  for i := 0 to n + 63 do
+    big1[i] := Byte((i * 13) and 255);
+  Move(big1[0], big2[0], n);
+  Move(big2[0], big2[33], n);
+  CopyP(@big1[7], @big2[1], n - 8);
+  s := 0;
+  i := 0;
+  while i < n + 64 do
+  begin
+    s := s * 3 + big2[i];
+    i := i + 997;
+  end;
+  Result := s;
+end;
+
+{ the test calls only after a part that calls nothing }
+function AndSplit(N: Integer): Integer;
+var
+  a, b: Integer;
+begin
+  a := N mod 7;
+  b := N;
+  gtries := gtries + 1;
+  if (a > 2) and Probe(b) then
+    b := b * 10;
+  if (a > 2) and (b > 0) and Probe(b + 1) then
+    b := b + 5;
+  if (a < 0) and Probe(b) then
+    b := -1;
+  Result := a * 1000 + b + gside mod 97;
+end;
+
+{ a case whose arms call, raise or neither }
+function Arms(N: Integer): Integer;
+var
+  a, b: Integer;
+begin
+  a := N * 5;
+  b := 0;
+  try
+    case N mod 4 of
+      0: b := a + 1;
+      1: b := Twice(a);
+      2:
+        begin
+          Note(a);
+          b := a - 1;
+        end;
+    else
+      if N > 1000 then
+        raise Exception.Create('arm');
+      b := a xor 3;
+    end;
+  except
+    b := -7;
+  end;
+  Result := a + b;
+end;
+
+{ a loop with an inner for beside calls, and a loop that calls }
+function Loops(N: Integer): Integer;
+var
+  arr: array[0..99] of Integer;
+  i, j, s, t: Integer;
+begin
+  s := Twice(N);
+  for i := 0 to 9 do
+    for j := 0 to 9 do
+      arr[i * 10 + j] := i * j + N;
+  t := 0;
+  for i := 0 to 99 do
+    t := t + arr[i];
+  Note(t);
+  for i := 0 to 9 do
+    s := s + Twice(arr[i * 11]);
+  Result := s + t;
+end;
+
+{ the first island's block is a run of its own: the places of the
+  loop's island stay the outer run's }
+function TCache.Find(const N: string): Integer;
+var
+  i, k: Integer;
+begin
+  if (Key <> Cur) or (Length(Names) > 9) then
+  begin
+    Key := Cur;
+    Names := nil;
+    Tags := nil;
+    Resets := Resets + 1;
+  end;
+  k := -1;
+  for i := 0 to High(Names) do
+    if Names[i] = N then
+    begin
+      k := i;
+      Break;
+    end;
+  if k < 0 then
+  begin
+    k := Length(Names);
+    SetLength(Names, k + 1);
+    SetLength(Tags, k + 1);
+    Names[k] := N;
+    Tags[k] := k * 7 + Length(N);
+  end;
+  Result := Tags[k] * 100 + k;
+end;
+
+function Cached: Integer;
+var
+  c: TCache;
+  j, s: Integer;
+begin
+  c := TCache.Create;
+  c.Cur := 'a';
+  s := 0;
+  for j := 0 to 60 do
+  begin
+    if j = 30 then
+      c.Cur := 'b';
+    s := s * 3 + c.Find(Chr(Ord('a') + (j * 7) mod 9));
+    s := s mod 1000000007;
+  end;
+  Result := s + c.Resets * 7 + Length(c.Names);
+end;
+
+{ Result's words are locals the epilogue loads: the run that ends the
+  body stores them }
+function MkPair(N: Integer): TPair;
+var
+  t: Integer;
+begin
+  t := Twice(N);
+  Result.A := t + 1;
+  Note(t);
+  Result.B := t * 3 + Result.A;
+  if Probe(N) then
+    Exit;
+  Result.A := Result.A + Result.B;
+end;
+
+{ the same with no call: one run, the whole body }
+function SwapP(const P: TPair): TPair;
+begin
+  Result.A := P.B + 1;
+  Result.B := P.A * 2 + Result.A;
+end;
+
+{ its loop's region takes the free registers r9 to r11 }
+function Probe2(M, O: Integer): Integer;
+var
+  a, b, c, j: Integer;
+begin
+  if O < 0 then
+    raise Exception.Create('negative');
+  a := M;
+  b := O;
+  c := 0;
+  for j := 0 to 3 do
+  begin
+    c := c + a * j + b;
+    a := a xor c;
+    b := b + j;
+  end;
+  gside := gside + 1;
+  Result := M * 3 + O + (c and 0);
+end;
+
+{ off is read in the region by one branch's loop, which keeps it in a
+  register, and at home by the other's island, at every pass: its
+  register is stored before each pass's call, so it lives across them }
+function LowBound(N, Key: Integer; Fast: Boolean): Integer;
+var
+  lo, hi, mid, off: Integer;
+begin
+  off := N div 4 + 1;
+  lo := 0;
+  hi := N;
+  if Fast then
+    while lo < hi do
+    begin
+      mid := (lo + hi) shr 1;
+      if (mid xor off) * 3 + off < Key + (off and 1) then
+        lo := mid + 1
+      else
+        hi := mid;
+    end
+  else
+    while lo < hi do
+    begin
+      mid := (lo + hi) shr 1;
+      if Probe2(mid, off) < Key then
+        lo := mid + 1
+      else
+        hi := mid;
+    end;
+  Result := lo * 1000 + mid;
+end;
+
+{ the raise reads i and Line at home: stored before it, though it
+  never comes back }
+function Digits(const S: string; Line: Integer): Integer;
+var
+  i: Integer;
+begin
+  Result := 0;
+  for i := 1 to Length(S) do
+  begin
+    if (S[i] < '0') or (S[i] > '9') then
+      raise Exception.Create('line ' + IntToStr(Line) + ' col ' + IntToStr(i) + ': ' + S[i]);
+    Result := Result * 10 + Ord(S[i]) - Ord('0');
+  end;
+end;
+
+function DigitsOr(const S: string; Line: Integer): string;
+begin
+  try
+    Result := IntToStr(Digits(S, Line));
+  except
+    on E: Exception do
+      Result := E.Message;
+  end;
+end;
+
+procedure AddTo(var X: Integer; D: Integer);
+var
+  y: Integer;
+begin
+  y := Twice(D);
+  X := X + y;
+  Note(X);
+  X := X + D;
+end;
+
+function VarParam(N: Integer): Integer;
+var
+  v: Integer;
+begin
+  v := N;
+  AddTo(v, 3);
+  AddTo(v, v);
+  Result := v;
+end;
+
+var
+  i, r, total: Integer;
+  p2: TPair;
+
+begin
+  total := 0;
+  for i := 0 to 11 do
+  begin
+    r := Kept(i);
+    total := total + r;
+    WriteLn('kept ', i, ' ', r);
+    WriteLn('joins ', i, ' ', Joins(Odd(i), i), ' ', Joins(not Odd(i), i));
+    WriteLn('dead ', i, ' ', Dead(i));
+    WriteLn('exitmid ', i, ' ', ExitMid(i));
+    WriteLn('tryread ', i, ' ', TryRead(i), ' trywrite ', TryWrite(i), ' tryfin ', TryFin(i));
+    WriteLn('moverun ', i, ' ', MoveRun(i * 5 + 1));
+    WriteLn('andsplit ', i, ' ', AndSplit(i));
+    WriteLn('arms ', i, ' ', Arms(i), ' ', Arms(i + 2000));
+    WriteLn('varparam ', i, ' ', VarParam(i));
+    WriteLn('digits ', i, ' ', DigitsOr(IntToStr(i * 37) + 'x' + IntToStr(i), i), ' ',
+      DigitsOr(IntToStr(i * 41), i));
+    p2 := MkPair(i);
+    WriteLn('mkpair ', i, ' ', p2.A, ' ', p2.B);
+    p2 := SwapP(p2);
+    WriteLn('swapp ', i, ' ', p2.A, ' ', p2.B);
+    WriteLn('lowbound ', i, ' ', LowBound(i * 9 + 5, i * 13 + 7, True), ' ',
+      LowBound(i * 9 + 5, i * 13 + 7, False));
+  end;
+  WriteLn('ptrstack ', PtrStack(1), ' ', PtrStack(7));
+  WriteLn('held ', Held(3), ' ', Held(10), ' churned ', churned);
+  WriteLn('moveloop ', MoveLoop(200));
+  WriteLn('movebig ', MoveBig);
+  WriteLn('loops ', Loops(3), ' ', Loops(8));
+  WriteLn('cached ', Cached);
+  gtotal := total;
+  Note(gtotal);
+  WriteLn('total ', gtotal, ' side ', gside);
+end.
