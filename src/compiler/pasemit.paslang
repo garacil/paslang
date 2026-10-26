@@ -454,6 +454,7 @@ type
     FOwnLine: array of LongInt;
     FLocRanges: array of TLocRange;
     FCtrFacts: array of TCtrFact;
+    FNzFacts: TStrArray;    { the variables an if's branch knows are not zero (P394) }
     FAsyncOK: Boolean;      { the routine being emitted is in the pasasync table: a signal may stop it anywhere (P293) }
     FAsyncFrom: string;     { the label after the prologue's stack check, where the routine's pasasync entry starts (P293) }
     FInMain: Boolean;       { the main block's body is being emitted (P293) }
@@ -737,6 +738,9 @@ type
     procedure CpuBitX(const R: string; Src, Dst: LongInt; const Gate: string);
     procedure StoreWidth(const R, Addr: string; Sz: LongInt);
     procedure EmitBitUn(E: PExpr; const R: string);
+    function NzFactOf(E: PExpr; Branch: PStmt; WhenNe: Boolean): string;
+    function NzKnown(E: PExpr): Boolean;
+    function HasWith(S: PStmt): Boolean;
     procedure RotX86(Op: TBinOp; T: LongInt);
     procedure RotArm(Op: TBinOp; T: LongInt);
     procedure EmitOrdRotArm(E: PExpr; D: LongInt);
@@ -24936,6 +24940,84 @@ begin
   Line(ok + ':');
 end;
 
+{ The variable whose test E proves it not zero in Branch, the then of
+  x <> 0 or 0 <> x (WhenNe) or the else of x = 0 or 0 = x, '' for none
+  (P394): a local of this routine that the branch does not write, whose
+  address nothing takes and that no nested routine reaches, as P289
+  takes a for's counter, in a branch with no with, whose fields may
+  bear its name. Go's prove pass marks a count whose argument it bounds
+  away from zero (cmd/compile/internal/ssacompile/prove.go, OpCtz64 to
+  OpCtz64NonZero), lowered to a lone BSFQ under GOAMD64 v1 and v2
+  (cmd/compile/internal/ssa/_gen/AMD64.rules: (Ctz64NonZero x) =>
+  (Select0 (BSFQ x))). }
+function TEmitter.NzFactOf(E: PExpr; Branch: PStmt; WhenNe: Boolean): string;
+var
+  x: PExpr;
+  vs: TSym;
+  k: SizeInt;
+begin
+  Result := '';
+  if (E = nil) or (Branch = nil) or (E^.Kind <> ekBin) or (E^.L = nil) or (E^.R = nil) then
+    Exit;
+  if WhenNe and (E^.Bin <> boNe) then
+    Exit;
+  if (not WhenNe) and (E^.Bin <> boEq) then
+    Exit;
+  if (E^.R^.Kind = ekInt) and (E^.R^.Num = 0) then
+    x := E^.L
+  else if (E^.L^.Kind = ekInt) and (E^.L^.Num = 0) then
+    x := E^.R
+  else
+    Exit;
+  if (x^.Kind <> ekVar) or (TKind(x^.Typ) <> tykInteger) or (not TryFindSym(x^.Name, vs)) then
+    Exit;
+  if vs.Global or vs.ByRef or (vs.Up <> 0) or vs.Boxed or LocAddrTaken(x^.Name) or
+    WritesVar(Branch, x^.Name) or HasWith(Branch) then
+    Exit;
+  for k := 0 to High(FProgProcs) do
+    if FProgProcs[k].ParentSym = FCurProc then
+      Exit;
+  Result := x^.Name;
+end;
+
+{ E is a variable an enclosing if proved not zero (FNzFacts, P394). }
+function TEmitter.NzKnown(E: PExpr): Boolean;
+var
+  i: SizeInt;
+begin
+  Result := False;
+  if (E = nil) or (E^.Kind <> ekVar) then
+    Exit;
+  for i := High(FNzFacts) downto 0 do
+    if SameSym(FNzFacts[i], E^.Name) then
+    begin
+      Result := True;
+      Exit;
+    end;
+end;
+
+{ S holds a with statement. }
+function TEmitter.HasWith(S: PStmt): Boolean;
+var
+  i: SizeInt;
+begin
+  Result := False;
+  if S = nil then
+    Exit;
+  Result := True;
+  if S^.Kind = skWith then
+    Exit;
+  if HasWith(S^.ThenSt) or HasWith(S^.ElseSt) or HasWith(S^.Body) then
+    Exit;
+  for i := 0 to High(S^.Stmts) do
+    if HasWith(S^.Stmts[i]) then
+      Exit;
+  for i := 0 to High(S^.Arms) do
+    if HasWith(S^.Arms[i].Body) then
+      Exit;
+  Result := False;
+end;
+
 { A bit word of P105 on the clean value in R, in the width of its
   operand's type (1.0.117). A signed narrow value is zero-extended
   first. amd64 (R rax or a pool register; rax, rcx and rdx are free,
@@ -24953,9 +25035,12 @@ procedure TEmitter.EmitBitUn(E: PExpr; const R: string);
 var
   t, w: LongInt;
   t1, t2, x: string;
+  nz: Boolean;
 begin
   t := E^.L^.Typ;
   w := IntBits(t);
+  { a value an if proved not zero needs no sentinel (P394) }
+  nz := NzKnown(E^.L);
   if FArm then
   begin
     x := WReg(R);
@@ -24975,7 +25060,7 @@ begin
         end;
       uoCtz:
         begin
-          if w < 64 then
+          if (w < 64) and not nz then
             Line('  orr ' + R + ', ' + R + ', #' + IntToStr(Int64(1) shl w));
           Line('  rbit ' + R + ', ' + R);
           Line('  clz ' + R + ', ' + R);
@@ -25071,6 +25156,8 @@ begin
           Line('  tzcntl %' + X86Sub(R, 4) + ', %' + X86Sub(R, 4));
         end;
       end
+      else if nz then
+        Line('  bsfq %' + R + ', %' + R)
       else if w < 64 then
       begin
         Line('  btsq $' + IntToStr(w) + ', %' + R);
@@ -25098,6 +25185,17 @@ begin
           if w < 32 then
             Line('  subl $' + IntToStr(32 - w) + ', %' + X86Sub(R, 4));
         end;
+      end
+      else if nz and (w = 64) then
+      begin
+        Line('  bsrq %' + R + ', %' + R);
+        Line('  xorq $63, %' + R);
+      end
+      else if nz then
+      begin
+        Line('  bsrq %' + R + ', %' + R);
+        Line('  negq %' + R);
+        Line('  addq $' + IntToStr(w - 1) + ', %' + R);
       end
       else if w < 64 then
       begin
@@ -28068,7 +28166,7 @@ procedure TEmitter.EmitStmtNow(S: PStmt);
 var
   i, j, n, nreg, nv, ns: SizeInt;
   ist: PStmt;
-  a, b, c, d, smap, op, pw: string;
+  a, b, c, d, smap, op, pw, nz: string;
   boxoff: array of LongInt;
   td: TTypeDef;
   off, so: LongInt;
@@ -28540,7 +28638,13 @@ begin
           a := Lab;
           b := Lab;
           CondBranch(S^.E, a, False);
+          { x <> 0 known in the then, x = 0's else (P394) }
+          nz := NzFactOf(S^.E, S^.ThenSt, True);
+          if nz <> '' then
+            AddName(FNzFacts, nz);
           EmitStmt(S^.ThenSt);
+          if nz <> '' then
+            SetLength(FNzFacts, Length(FNzFacts) - 1);
           { no else: nothing to jump over (P305) }
           if NoStmt(S^.ElseSt) then
             Line(a + ':')
@@ -28548,7 +28652,12 @@ begin
           begin
             Line('  b ' + b);
             Line(a + ':');
+            nz := NzFactOf(S^.E, S^.ElseSt, False);
+            if nz <> '' then
+              AddName(FNzFacts, nz);
             EmitStmt(S^.ElseSt);
+            if nz <> '' then
+              SetLength(FNzFacts, Length(FNzFacts) - 1);
             Line(b + ':');
           end;
         end;
@@ -29289,7 +29398,13 @@ begin
         a := Lab;
         b := Lab;
         CondBranch(S^.E, a, False);
+        { x <> 0 known in the then, x = 0's else (P394) }
+        nz := NzFactOf(S^.E, S^.ThenSt, True);
+        if nz <> '' then
+          AddName(FNzFacts, nz);
         EmitStmt(S^.ThenSt);
+        if nz <> '' then
+          SetLength(FNzFacts, Length(FNzFacts) - 1);
         { no else: nothing to jump over, where every pass through the
           then took a jump to the next instruction (P305) }
         if NoStmt(S^.ElseSt) then
@@ -29298,7 +29413,12 @@ begin
         begin
           Line('  jmp ' + b);
           Line(a + ':');
+          nz := NzFactOf(S^.E, S^.ElseSt, False);
+          if nz <> '' then
+            AddName(FNzFacts, nz);
           EmitStmt(S^.ElseSt);
+          if nz <> '' then
+            SetLength(FNzFacts, Length(FNzFacts) - 1);
           Line(b + ':');
         end;
       end;
@@ -49257,6 +49377,7 @@ begin
     end;
   FLocRanges := nil;
   FCtrFacts := nil;
+  FNzFacts := nil;
   FAsyncOK := False;
   FInMain := False;
   FRtUnit := False;

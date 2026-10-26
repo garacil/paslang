@@ -1008,7 +1008,9 @@ byte, or `orq $8` on the register a loop keeps it in; `IsBitSet` a
 shift and an `and`; `TrailingZeros` `tzcnt` and `LeadingZeros`
 `lzcnt` when the processor has BMI1 and LZCNT (`-cpu`, §22; 1.1.114),
 each giving the width for 0 by itself, and else `bsf` over a sentinel
-bit and `bsr` with a `cmov` for 0 (`rbit` + `clz` and `clz` on arm64);
+bit and `bsr` with a `cmov` for 0 (`rbit` + `clz` and `clz` on arm64),
+or `bsf` and `bsr` alone for a variable an `if x <> 0` proved not zero
+(1.1.282);
 `ByteSwap`
 `bswap` or `rev`; `ReverseBits` `rbit` on arm64 and a `bswap` with three
 swaps on amd64, which has no bit reversal; `PopCount` `popcnt` when the

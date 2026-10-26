@@ -567,6 +567,9 @@ GOLDEN_A64 += jsonvalidwin jsontoken jsondecgrow jsondecesc
 # P387: a byte's test against a constant set, its bit in the set's word.
 GOLDEN += bytesetin
 GOLDEN_A64 += bytesetin
+# P394: a bit count of a value an if proved not zero, no sentinel.
+GOLDEN += bitnz
+GOLDEN_A64 += bitnz
 # P403: SQLite named in a uses clause, uses sqlite since P418, a database in memory.
 GOLDEN += sqluses
 GOLDEN_A64 += sqluses
@@ -2930,6 +2933,16 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	python3 -I scripts/check_bytesetin.py $(BUILDDIR)/bytesetin0.s; \
 	python3 -I scripts/check_bytesetin.py $(BUILDDIR)/bytesetin-base.s; \
 	echo ok bytesetin-asm; \
+	: a bit count of a value an if proved not zero is bsf or bsr alone under -cpu base, no sentinel, P394; \
+	$(OUTDIR)/paslangc -cpu base -o $(BUILDDIR)/bitnz-base testdata/bitnz.paslang; \
+	$(BUILDDIR)/bitnz-base > $(BUILDDIR)/bitnz-base.got; \
+	diff -u testdata/bitnz.out $(BUILDDIR)/bitnz-base.got; \
+	$(OUTDIR)/paslangc -cpu base -inline 0 -o $(BUILDDIR)/bitnz-base0 testdata/bitnz.paslang; \
+	$(BUILDDIR)/bitnz-base0 > $(BUILDDIR)/bitnz-base0.got; \
+	diff -u testdata/bitnz.out $(BUILDDIR)/bitnz-base0.got; \
+	python3 -I scripts/check_bitnz.py $(BUILDDIR)/bitnz-base.s; \
+	python3 -I scripts/check_bitnz.py $(BUILDDIR)/bitnz-base0.s; \
+	echo ok bitnz-asm; \
 	: a routine with nested ones zeroes only the locals a read may reach first, P358; \
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/nestzero0 testdata/nestzero.paslang; \
 	$(BUILDDIR)/nestzero0 > $(BUILDDIR)/nestzero0.got; \
@@ -4585,6 +4598,9 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	python3 -I scripts/check_bytesetin.py $(BUILDDIR)/bytesetin-arm.s --arm; \
 	python3 -I scripts/check_bytesetin.py $(BUILDDIR)/bytesetin0-arm.s --arm; \
 	echo ok bytesetin-arm-asm; \
+	: P394 on arm64: the narrow trailing count of a value an if proved not zero takes no sentinel bit; \
+	python3 -I scripts/check_bitnz.py $(BUILDDIR)/bitnz-arm.s --arm; \
+	echo ok bitnz-arm-asm; \
 	: P358 on arm64: the locals a read may reach first, zeroed alone; \
 	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/nestzero0-arm testdata/nestzero.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/nestzero0-arm > $(BUILDDIR)/nestzero0-arm.got; \
