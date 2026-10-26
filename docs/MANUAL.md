@@ -460,6 +460,12 @@ default value, an argument, `WriteLn(b + 300)`. `shr` keeps the sign in
 `Int8`, `Int16` and `Int32`; `div` and `mod` wrap like the rest; `Inc`
 and `Dec` wrap; a `for` with a narrow counter stops on its limit, so
 `for b := 0 to 255` ends. A `var` parameter takes its own type.
+`Inc` and `Dec` of a variable in memory, a field or an element, by a
+constant, a variable or a field of an object a register holds, are on
+amd64 one `add` or `sub` at the place's width with the place as its
+operand (`addq $1, v_g(%rip)`, `addb $100, 18(%rdi)`), whose stored
+bits are those the wrap leaves, and on arm64 its load, add and store
+(1.1.288, P402).
 
 `examples/narrow.paslang`:
 

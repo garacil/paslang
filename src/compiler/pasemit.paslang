@@ -925,6 +925,7 @@ type
     function RegVarIn(E: PExpr): Boolean;
     function PoolWord(E: PExpr): string;
     function RegLeaf(E: PExpr; out Op: string; out Ty: LongInt): Boolean;
+    function IncDirect(S: PStmt): Boolean;
     procedure ArgInto(E: PExpr; const R: string);
     function CallFree(E: PExpr; Depth: LongInt): Boolean;
     function KeepArg(E: PExpr): Boolean;
@@ -16650,6 +16651,133 @@ begin
   Result := True;
 end;
 
+{ Inc and Dec of a place no register holds, by a constant or the value
+  of a word variable (P402): the place's operand is worked out first and
+  the step read after it, nothing pushed. On amd64 one add or sub at the
+  place's width with the place as its operand, addq $1, v_g(%rip) or
+  addl %ecx, 16(%rdi): its stored bits are those a load, an add, the
+  width's cleanup and a store leave (Intel SDM vol. 2A, ADD and SUB with
+  a memory destination), as Go folds a load, an add and a store of one
+  place into ADDQconstmodify and ADDQmodify
+  (cmd/compile/internal/ssa/_gen/AMD64.rules, AMD64Ops.go). arm64 has no
+  such instruction: the load, the add and the store, at the place. A
+  field of an object a register holds is its own operand (RegLeaf). }
+function TEmitter.IncDirect(S: PStmt): Boolean;
+var
+  sy: TSym;
+  k: Int64;
+  op, src, sfx, ins, r, fop: string;
+  ty, lt, sz, ft: LongInt;
+  isk, isf: Boolean;
+begin
+  Result := False;
+  if (S^.E = nil) or (S^.Dest = nil) then
+    Exit;
+  ty := LoadTyp(S^.Dest);
+  sz := TSize(ty);
+  if ((sz <> 1) and (sz <> 2) and (sz <> 4) and (sz <> 8)) or not WordInt(ty) then
+    Exit;
+  isk := (S^.E^.Kind = ekInt) and Fits32(S^.E^.Num) and (S^.E^.Num > Low(Int64));
+  isf := False;
+  if (not isk) and not ((S^.E^.Kind = ekVar) and WordVar(S^.E, sy) and
+    (TSize(sy.Typ) = 8)) then
+  begin
+    { a word field of an object a register holds, loaded after the
+      place's address as a variable is }
+    isf := RegLeaf(S^.E, fop, ft) and (TSize(ft) = 8);
+    if not isf then
+      Exit;
+  end;
+  if not (RegLeaf(S^.Dest, op, lt) and (lt = ty)) then
+  begin
+    FAddrWrite := True;
+    EmitAddr(S^.Dest);
+    if FArm then
+      op := '[x0]'
+    else
+      op := AddrOp('rcx,rdx,rsp');
+  end;
+  if FArm then
+  begin
+    LoadTo(op, ty, 'x2');
+    if isk then
+    begin
+      k := S^.E^.Num;
+      if S^.Kind = skDec then
+        k := -k;
+      AddImmArmT('x2', 'x2', k, 'x1');
+    end
+    else
+    begin
+      if isf then
+      begin
+        WordLoad(fop, ft, 'x1');
+        r := 'x1';
+      end
+      else
+      begin
+        r := sy.Reg;
+        if r = '' then
+        begin
+          LoadWordVar(sy, 'x1');
+          r := 'x1';
+        end;
+      end;
+      if S^.Kind = skInc then
+        Line('  add x2, x2, ' + r)
+      else
+        Line('  sub x2, x2, ' + r);
+    end;
+    CanonReg('x2', ty);
+    StoreFrom(op, sz, 'x2');
+    Result := True;
+    Exit;
+  end;
+  if isk then
+  begin
+    k := S^.E^.Num;
+    { the width's own immediate: the same low bits }
+    if sz = 1 then
+      k := ((k and 255) xor 128) - 128
+    else if sz = 2 then
+      k := ((k and 65535) xor 32768) - 32768
+    else if sz = 4 then
+      k := ((k and $FFFFFFFF) xor $80000000) - $80000000;
+    src := '$' + IntToStr(k);
+  end
+  else
+  begin
+    if isf then
+    begin
+      WordLoad(fop, ft, 'rcx');
+      r := 'rcx';
+    end
+    else
+    begin
+      r := sy.Reg;
+      if r = '' then
+      begin
+        LoadWordVar(sy, 'rcx');
+        r := 'rcx';
+      end;
+    end;
+    src := '%' + X86Sub(r, sz);
+  end;
+  case sz of
+    1: sfx := 'b';
+    2: sfx := 'w';
+    4: sfx := 'l';
+  else
+    sfx := 'q';
+  end;
+  if S^.Kind = skInc then
+    ins := 'add'
+  else
+    ins := 'sub';
+  Line('  ' + ins + sfx + ' ' + src + ', ' + op);
+  Result := True;
+end;
+
 { E reads a variable that lives in register R (P328). }
 function TEmitter.ReadsReg(E: PExpr; const R: string): Boolean;
 var
@@ -29263,7 +29391,7 @@ begin
           end;
           CanonReg(vs.Reg, vs.Typ);
         end
-        else
+        else if not IncDirect(S) then
         begin
           EmitExpr(S^.E);
           PshK('x0', VCls(S^.E^.Typ, 0));
@@ -30011,7 +30139,7 @@ begin
         end;
         CanonReg(vs.Reg, vs.Typ);
       end
-      else
+      else if not IncDirect(S) then
       begin
         EmitExpr(S^.E);
         PushK('rax', VCls(S^.E^.Typ, 0));

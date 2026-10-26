@@ -579,6 +579,9 @@ GOLDEN_A64 += straight
 # P397: a field of an object a register holds is a leaf of an expression.
 GOLDEN += regleaf
 GOLDEN_A64 += regleaf
+# P402: Inc and Dec of a place in memory are one add or sub.
+GOLDEN += incplace
+GOLDEN_A64 += incplace
 # P463: ToLower of a string with no capital is the string itself.
 GOLDEN += tolowershare
 GOLDEN_A64 += tolowershare
@@ -3018,6 +3021,17 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	python3 -I scripts/check_regleaf.py $(BUILDDIR)/regleaf0.s; \
 	python3 -I scripts/check_regleaf.py $(BUILDDIR)/regleaf-base.s; \
 	echo ok regleaf-asm; \
+	: Inc and Dec of a place in memory by a constant or a register are one add or sub with the place as its operand, P402; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/incplace0 testdata/incplace.paslang; \
+	$(BUILDDIR)/incplace0 > $(BUILDDIR)/incplace0.got; \
+	diff -u testdata/incplace.out $(BUILDDIR)/incplace0.got; \
+	$(OUTDIR)/paslangc -cpu base -o $(BUILDDIR)/incplace-base testdata/incplace.paslang; \
+	$(BUILDDIR)/incplace-base > $(BUILDDIR)/incplace-base.got; \
+	diff -u testdata/incplace.out $(BUILDDIR)/incplace-base.got; \
+	python3 -I scripts/check_incplace.py $(BUILDDIR)/incplace.s; \
+	python3 -I scripts/check_incplace.py $(BUILDDIR)/incplace0.s; \
+	python3 -I scripts/check_incplace.py $(BUILDDIR)/incplace-base.s; \
+	echo ok incplace-asm; \
 	: a routine with nested ones zeroes only the locals a read may reach first, P358; \
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/nestzero0 testdata/nestzero.paslang; \
 	$(BUILDDIR)/nestzero0 > $(BUILDDIR)/nestzero0.got; \
@@ -4700,6 +4714,16 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	python3 -I scripts/check_regleaf.py $(BUILDDIR)/regleaf-arm.s --arm; \
 	python3 -I scripts/check_regleaf.py $(BUILDDIR)/regleaf0-arm.s --arm; \
 	echo ok regleaf-arm-asm; \
+	: P402 on arm64: Inc and Dec of a place in memory load, add and store at the place, nothing pushed; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/incplace0-arm testdata/incplace.paslang; \
+	timeout 300 $(QEMU_A64) $(BUILDDIR)/incplace0-arm > $(BUILDDIR)/incplace0-arm.got; \
+	diff -u testdata/incplace.out $(BUILDDIR)/incplace0-arm.got; \
+	$(OUTDIR)/paslangc -target arm64 -cpu base -Fu $(A64DIR) -o $(BUILDDIR)/incplace-base-arm testdata/incplace.paslang; \
+	timeout 300 $(QEMU_A64) $(BUILDDIR)/incplace-base-arm > $(BUILDDIR)/incplace-base-arm.got; \
+	diff -u testdata/incplace.out $(BUILDDIR)/incplace-base-arm.got; \
+	python3 -I scripts/check_incplace.py $(BUILDDIR)/incplace-arm.s --arm; \
+	python3 -I scripts/check_incplace.py $(BUILDDIR)/incplace0-arm.s --arm; \
+	echo ok incplace-arm-asm; \
 	: P358 on arm64: the locals a read may reach first, zeroed alone; \
 	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/nestzero0-arm testdata/nestzero.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/nestzero0-arm > $(BUILDDIR)/nestzero0-arm.got; \
