@@ -580,9 +580,11 @@ A set, `set of T`, is a bitset for a `T` whose values lie in 0..255:
 element 63 it is one word; past it, 32 bytes (`set of Char`, `set of
 Byte`). `[1, 3..5]` is a set and `[]` the empty one; `+` is the union,
 `*` the intersection, `-` the difference, `=` and `<>` compare, `<=`
-and `>=` test a subset and a superset, `x in s` tests, `Include(s, x)`
-and `Exclude(s, x)` change the variable, and `for x in s do` walks the
-members from the lowest:
+and `>=` test a subset and a superset, `x in s` tests (a value of
+0..255 against a set of constants is one test of the bit in the set's
+word, nothing pushed, 1.1.281), `Include(s, x)` and `Exclude(s, x)`
+change the variable, and `for x in s do` walks the members from the
+lowest:
 
 ```pascal
 type

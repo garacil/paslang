@@ -912,6 +912,7 @@ type
     function IsWSet(Id: LongInt): Boolean;
     procedure EmitSetCheck(T: LongInt);
     procedure EmitWSetLit(E: PExpr);
+    function ConstByteIn(E: PExpr): Boolean;
     procedure EmitSetBin(E: PExpr);
     procedure EmitSetFor(S: PStmt);
     procedure EmitSetIncl(E: PExpr);
@@ -3515,6 +3516,127 @@ begin
   Line(ok + ':');
 end;
 
+{ x in [constants] with x of 0..255, IntRange's (P387): x worked out
+  into rax (x0) and its bit tested in the set's word with nothing pushed
+  and no range check: a word given at once when x and the set lie below
+  64, else the word at x shr 6 of the set's 32 bytes in .rodata
+  (SetConst), the bits past a small set's last element 0. BT takes a
+  register's bit offset mod 64 (SDM vol. 2A 3-112) and LSRV its shift
+  mod 64 (ARM DDI 0487 M.c C6.2.274). The carry or the bit made the
+  Boolean, or branched on when E is the condition CondBranch handed
+  EmitExpr (FCondE, P390), as Go tests a bit of a word by BTQ and reads
+  the carry by SETB or a branch (cmd/compile/internal/ssa/_gen/
+  AMD64.rules: (SET(NE|EQ) (TESTQ (SHLQ (MOVQconst [1]) x) y)) =>
+  (SET(B|AE) (BTQ x y))). }
+function TEmitter.ConstByteIn(E: PExpr): Boolean;
+var
+  w: TInt64Arr;
+  lo, hi, a, b, v, one: Int64;
+  i: SizeInt;
+  small, branch: Boolean;
+  x: PExpr;
+begin
+  Result := False;
+  if (E^.R = nil) or (E^.R^.Kind <> ekSet) or (E^.L = nil) then
+    Exit;
+  if (not IntRange(E^.L, lo, hi)) or (lo < 0) or (hi > 255) then
+    Exit;
+  w := nil;
+  SetLength(w, 4);
+  for i := 0 to 3 do
+    w[i] := 0;
+  one := 1;
+  for i := 0 to High(E^.R^.Args) do
+  begin
+    x := E^.R^.Args[i];
+    if x^.Kind = ekRange then
+    begin
+      if (x^.L^.Kind <> ekInt) or (x^.R^.Kind <> ekInt) then
+        Exit;
+      a := x^.L^.Num;
+      b := x^.R^.Num;
+    end
+    else if x^.Kind = ekInt then
+    begin
+      a := x^.Num;
+      b := a;
+    end
+    else
+      Exit;
+    if a < 0 then
+      a := 0;
+    if b > 255 then
+      b := 255;
+    v := a;
+    while v <= b do
+    begin
+      w[v shr 6] := w[v shr 6] or (one shl (v and 63));
+      v := v + 1;
+    end;
+  end;
+  small := hi <= 63;
+  branch := E = FCondE;
+  EmitExpr(E^.L);
+  if FArm then
+  begin
+    if small then
+      Imm('x1', w[0])
+    else
+    begin
+      Line('  lsr x9, x0, #6');
+      LeaS(SetConst(w), 'x1');
+      Line('  ldr x1, [x1, x9, lsl #3]');
+    end;
+    Line('  lsr x2, x1, x0');
+    if branch then
+    begin
+      FCondE := nil;
+      FCondDone := True;
+      Line('  tst x2, #1');
+      if FCondTrue then
+        Line('  b.ne ' + FCondTarget)
+      else
+        Line('  b.eq ' + FCondTarget);
+    end
+    else
+      Line('  and x0, x2, #1');
+  end
+  else
+  begin
+    if small then
+    begin
+      if (w[0] >= 0) and (w[0] < 4294967296) then
+        Line('  movl $' + IntToStr(w[0]) + ', %edx')
+      else
+        Line('  movabsq $' + IntToStr(w[0]) + ', %rdx');
+      Line('  btq %rax, %rdx');
+    end
+    else
+    begin
+      Line('  movl %eax, %ecx');
+      Line('  shrl $6, %eax');
+      Line('  leaq ' + SetConst(w) + '(%rip), %rdx');
+      Line('  movq (%rdx,%rax,8), %rdx');
+      Line('  btq %rcx, %rdx');
+    end;
+    if branch then
+    begin
+      FCondE := nil;
+      FCondDone := True;
+      if FCondTrue then
+        Line('  jc ' + FCondTarget)
+      else
+        Line('  jnc ' + FCondTarget);
+    end
+    else
+    begin
+      Line('  setc %al');
+      Line('  movzbl %al, %eax');
+    end;
+  end;
+  Result := True;
+end;
+
 { [a, b..c] of a set of 32 bytes: its address. All constant, the set in
   .rodata; else a scratch region cleared and each element's bit set,
   each element checked against the set's range. }
@@ -3717,6 +3839,10 @@ begin
   avx := (not FArm) and HasFeat(CpuFeatBit('avx2', False));
   sse41 := (not FArm) and HasFeat(CpuFeatBit('sse41', False));
   bmi := (not FArm) and HasFeat(CpuFeatBit('bmi1', False));
+  { a value of 0..255 against a constant set: its bit in the set's word
+    (P387) }
+  if (op = boIn) and ConstByteIn(E) then
+    Exit;
   if op = boIn then
   begin
     { the element, unsigned against the set's last bit: an element out
@@ -11517,13 +11643,15 @@ begin
   if r = '' then
   begin
     if (E <> nil) and (E^.Kind = ekBin) and ((E^.Bin = boEq) or (E^.Bin = boNe) or
-      (E^.Bin = boLt) or (E^.Bin = boLe) or (E^.Bin = boGt) or (E^.Bin = boGe)) then
+      (E^.Bin = boLt) or (E^.Bin = boLe) or (E^.Bin = boGt) or (E^.Bin = boGe) or
+      ((E^.Bin = boIn) and (E^.R <> nil) and (E^.R^.Kind = ekSet))) then
     begin
       { a comparison the pool cannot hold (P390): EmitExpr works its sides
         out as for a value, and EmitCmp branches on its compare where it
         made the Boolean tested below; a comparison another way makes
         (strings, reals, sets) is still tested. A condition inside it,
-        an inlined body's, keeps its own. }
+        an inlined body's, keeps its own. A byte against a constant set
+        branches on its bit (ConstByteIn, P387). }
       wasE := FCondE;
       wasTarget := FCondTarget;
       wasTrue := FCondTrue;
