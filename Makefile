@@ -576,6 +576,9 @@ GOLDEN_A64 += jsontokerr
 # P396: a routine's straight code keeps its variables in registers.
 GOLDEN += straight
 GOLDEN_A64 += straight
+# P463: ToLower of a string with no capital is the string itself.
+GOLDEN += tolowershare
+GOLDEN_A64 += tolowershare
 # P403: SQLite named in a uses clause, uses sqlite since P418, a database in memory.
 GOLDEN += sqluses
 GOLDEN_A64 += sqluses
