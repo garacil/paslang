@@ -613,6 +613,9 @@ GOLDEN_A64 += httpsrv
 # P438: Argon2 and BLAKE2b against their published vectors, the PHC string.
 GOLDEN += argon2kat
 GOLDEN_A64 += argon2kat
+# P428: AES, GCM, ChaCha20-Poly1305, HKDF and the TLS 1.2 PRF against Go's tests and Wycheproof.
+GOLDEN += cipherkat cipherwyche
+GOLDEN_A64 += cipherkat cipherwyche
 # P440: the digests in pieces equal the whole-message words, every cut.
 GOLDEN += hashpieces
 GOLDEN_A64 += hashpieces
@@ -683,6 +686,7 @@ LIB_UNITS := \
 	src/lib/pasx11.paslang \
 	src/rtl/sysutils.paslang \
 	src/lib/argon2.paslang \
+	src/lib/pascipher.paslang \
 	src/lib/pascodec.paslang \
 	src/lib/pasxml.paslang \
 	src/lib/pasflate.paslang \
@@ -1205,7 +1209,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/stackmap.out $(BUILDDIR)/stackmap.vgot; \
 	echo ok stackmaps; \
 	echo "==== the base processor (-cpu base) ===="; \
-	for t in vectors vecmore vecpool bitwords xxh3 inlineasm hash1 tree1 store1 mapsplit set256 strwords strkern strcmpk cmpwords sysutils1 utf8kern jsonkern longslice rtlong fillkern json1 jsoncanon hmacstream hashpieces; do \
+	for t in vectors vecmore vecpool bitwords xxh3 inlineasm hash1 tree1 store1 mapsplit set256 strwords strkern strcmpk cmpwords sysutils1 utf8kern jsonkern longslice rtlong fillkern json1 jsoncanon hmacstream hashpieces cipherkat cipherwyche; do \
 	  $(OUTDIR)/paslangc -cpu base -o $(BUILDDIR)/$$t-base testdata/$$t.paslang; \
 	  $(BUILDDIR)/$$t-base > $(BUILDDIR)/$$t.bgot; \
 	  diff -u testdata/$$t.out $(BUILDDIR)/$$t.bgot; \
@@ -1219,6 +1223,17 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	if grep -q 'p_pashash_passha256updatecpu' $(BUILDDIR)/hashpieces-base.s; then echo "hashpieces-base.s calls the SHA-NI body"; exit 1; fi; \
 	if grep -q 'p_pashash_passha256cpu' $(BUILDDIR)/hash1-base.s; then echo "hash1-base.s calls the SHA-NI body"; exit 1; fi; \
 	if grep -q 'popcntq' $(BUILDDIR)/bitwords-base.s; then echo "bitwords-base.s carries popcnt"; exit 1; fi; \
+	: pascipher compiled for this processor seals through AES-NI and PCLMULQDQ, its base build through neither, P428; \
+	mkdir -p $(BUILDDIR)/cipherk; \
+	$(OUTDIR)/paslangc -c -Fu $(BUILDDIR) -o $(BUILDDIR)/cipherk/pascipher src/lib/pascipher.paslang; \
+	grep -q 'aesenc %xmm1, %xmm0' $(BUILDDIR)/cipherk/pascipher.s; \
+	grep -q 'pclmulqdq' $(BUILDDIR)/cipherk/pascipher.s; \
+	if grep -q 'aesenc %xmm\|pclmulqdq' $(BUILDDIR)/pascipher.s; then echo "pascipher's base build carries AES-NI"; exit 1; fi; \
+	for t in cipherkat cipherwyche; do \
+	  $(OUTDIR)/paslangc -Fu $(BUILDDIR)/cipherk -Fu $(BUILDDIR) -o $(BUILDDIR)/$$t-k testdata/$$t.paslang; \
+	  $(BUILDDIR)/$$t-k > $(BUILDDIR)/$$t.kgot; \
+	  diff -u testdata/$$t.out $(BUILDDIR)/$$t.kgot; \
+	done; \
 	if grep -q 'btq \$$13, rt_cpufeat' $(BUILDDIR)/vectors.s; then echo "vectors.s tests rt_cpufeat at run time"; exit 1; fi; \
 	$(OUTDIR)/paslangc -cpu v2 -o $(BUILDDIR)/set256-v2 testdata/set256.paslang; \
 	$(BUILDDIR)/set256-v2 > $(BUILDDIR)/set256.v2got; \
@@ -1239,7 +1254,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -qw 'ptest' $(BUILDDIR)/set256-v2.s; \
 	if grep -qw 'vptest' $(BUILDDIR)/set256-v2.s; then echo "set256-v2.s carries AVX2"; exit 1; fi; \
 	: a program for the base processor links no instruction past it, P268: inlineasm writes AVX2 itself and strkern calls the AVX2 kernels to test them; \
-	for t in vectors vecmore vecpool bitwords xxh3 hash1 tree1 store1 mapsplit set256 strwords strcmpk cmpwords sysutils1 utf8kern jsonkern longslice rtlong fillkern json1 jsoncanon hmacstream; do \
+	for t in vectors vecmore vecpool bitwords xxh3 hash1 tree1 store1 mapsplit set256 strwords strcmpk cmpwords sysutils1 utf8kern jsonkern longslice rtlong fillkern json1 jsoncanon hmacstream cipherkat cipherwyche; do \
 	  python3 -I scripts/check_cpubin.py base $(BUILDDIR)/$$t-base > /dev/null || { python3 -I scripts/check_cpubin.py base $(BUILDDIR)/$$t-base; exit 1; }; \
 	done; \
 	: the UTF-8 kernels against the strict decoder of Python, P201: the expected output is the model output; \
@@ -5096,7 +5111,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	diff -u testdata/cputuse.out $(BUILDDIR)/cputuse-arm.got
 	@set -e; \
 	echo "==== the base processor arm64 ===="; \
-	for t in hash1 tree1 store1 vectors bitwords set256 strwords strkern strcmpk cmpwords sysutils1 utf8kern jsonkern longslice rtlong fillkern json1 jsoncanon hmacstream hashpieces; do \
+	for t in hash1 tree1 store1 vectors bitwords set256 strwords strkern strcmpk cmpwords sysutils1 utf8kern jsonkern longslice rtlong fillkern json1 jsoncanon hmacstream hashpieces cipherkat cipherwyche; do \
 	  $(OUTDIR)/paslangc -target arm64 -cpu base -o $(BUILDDIR)/$$t-arm-base testdata/$$t.paslang; \
 	  timeout 120 $(QEMU_A64) $(BUILDDIR)/$$t-arm-base > $(BUILDDIR)/$$t-arm.bgot; \
 	  diff -u testdata/$$t.out $(BUILDDIR)/$$t-arm.bgot; \
@@ -5106,6 +5121,10 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	grep -q 'p_pashash_passha256updatecpu' $(BUILDDIR)/hashpieces-arm.s; \
 	if grep -q 'p_pashash_passha256updatecpu' $(BUILDDIR)/hashpieces-arm-base.s; then echo "hashpieces-arm-base.s calls the SHA-256 body"; exit 1; fi; \
 	if grep -q 'p_pashash_passha256cpu' $(BUILDDIR)/hash1-arm-base.s; then echo "hash1-arm-base.s calls the SHA-256 body"; exit 1; fi; \
+	: pascipher at the arm64 level seals through aese and pmull, its base build through neither, P428; \
+	grep -q 'aese v0.16b, v1.16b' '$(A64DIR)/$(LVL_A64)/pascipher.s'; \
+	grep -q 'pmull2 v6.1q' '$(A64DIR)/$(LVL_A64)/pascipher.s'; \
+	if grep -q 'aese v0\|pmull' $(A64DIR)/pascipher.s; then echo "pascipher's arm64 base build carries the crypto extension"; exit 1; fi; \
 	echo ok cpu-base-arm; \
 	: the json type on arm64, P203: every document of the oracle test as expect.txt holds it, the index and a byte at a time alike; \
 	$(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/jsoncheck-arm testdata/jsoncheck.paslang; \

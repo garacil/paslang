@@ -1,0 +1,146 @@
+{ P428: pascipher against the known answers of Go's own tests
+  (testdata/cipherkat.txt, written by scripts/cipher_kat.py): FIPS 197's
+  AES examples both ways, Go's AES-GCM table (keys of 16, 24 and 32
+  bytes, nonces of 1 to 128 bytes, each sealed and opened, and opened
+  again with a bit of its tag or its text changed; an empty nonce
+  refused), x/crypto's
+  ChaCha20-Poly1305 and Poly1305 tables, RFC 5869's HKDF and the TLS 1.2
+  PRF; then RFC 8439's examples written out, and AES in counter mode
+  against SP 800-38A F.5.1. Each kind prints how many answers matched. }
+program cipherkat;
+
+uses
+  pascipher, paslib, sysutils;
+
+function UnHex(const H: string): string;
+var
+  i, d, v: Integer;
+  c: Char;
+begin
+  Result := '';
+  if H = '-' then
+    Exit;
+  SetLength(Result, Length(H) div 2);
+  v := 0;
+  for i := 1 to Length(H) do
+  begin
+    c := H[i];
+    if (c >= '0') and (c <= '9') then
+      d := Ord(c) - 48
+    else
+      d := Ord(c) - 87;
+    if Odd(i) then
+      v := d shl 4
+    else
+      Result[i div 2] := Chr(v or d);
+  end;
+end;
+
+var
+  text, line, plain, got, sealed, bad: string;
+  f: TStringArray;
+  kinds: array[0..5] of string = ('aes', 'gcm', 'ccp', 'poly', 'hkdf', 'prf');
+  okc, allc: array[0..5] of Integer;
+  i, k: Integer;
+  a: TAes;
+  g: TGcm;
+  ok: Boolean;
+
+begin
+  if not ReadFile('testdata/cipherkat.txt', text) then
+  begin
+    WriteLn('no testdata/cipherkat.txt');
+    Halt(1);
+  end;
+  for line in text.SplitText(#10) do
+  begin
+    if line = '' then
+      Continue;
+    f := line.SplitText(' ');
+    k := 0;
+    while kinds[k] <> f[0] do
+      Inc(k);
+    Inc(allc[k]);
+    ok := False;
+    case k of
+      0:
+        begin
+          AesInit(a, UnHex(f[1]));
+          ok := (AesEncrypt(a, UnHex(f[2])) = UnHex(f[3])) and (AesDecrypt(a, UnHex(f[3])) = UnHex(f[2]));
+        end;
+      1:
+        if f[2] = '-' then
+        begin
+          { an empty nonce is refused, as Go's NewGCMWithNonceSize(aes, 0) }
+          GcmInit(g, UnHex(f[1]));
+          ok := (GcmSeal(g, '', UnHex(f[3]), UnHex(f[4])) = '') and not GcmOpen(g, '', UnHex(f[5]), UnHex(f[4]), plain);
+        end
+        else
+        begin
+          GcmInit(g, UnHex(f[1]));
+          sealed := GcmSeal(g, UnHex(f[2]), UnHex(f[3]), UnHex(f[4]));
+          ok := (sealed = UnHex(f[5])) and GcmOpen(g, UnHex(f[2]), sealed, UnHex(f[4]), plain) and
+            (plain = UnHex(f[3]));
+          bad := sealed;
+          bad[Length(bad)] := Chr(Ord(bad[Length(bad)]) xor 1);
+          ok := ok and not GcmOpen(g, UnHex(f[2]), bad, UnHex(f[4]), plain) and (plain = '');
+          if Length(sealed) > 16 then
+          begin
+            bad := sealed;
+            bad[1] := Chr(Ord(bad[1]) xor $80);
+            ok := ok and not GcmOpen(g, UnHex(f[2]), bad, UnHex(f[4]), plain);
+          end;
+        end;
+      2:
+        begin
+          sealed := ChaChaPolySeal(UnHex(f[1]), UnHex(f[2]), UnHex(f[3]), UnHex(f[4]));
+          ok := (sealed = UnHex(f[5])) and ChaChaPolyOpen(UnHex(f[1]), UnHex(f[2]), sealed, UnHex(f[4]), plain) and
+            (plain = UnHex(f[3]));
+          bad := sealed;
+          bad[Length(bad) - 15] := Chr(Ord(bad[Length(bad) - 15]) xor 4);
+          ok := ok and not ChaChaPolyOpen(UnHex(f[1]), UnHex(f[2]), bad, UnHex(f[4]), plain) and (plain = '');
+        end;
+      3:
+        ok := Poly1305Tag(UnHex(f[1]), UnHex(f[2])) = UnHex(f[3]);
+      4:
+        begin
+          got := HkdfExpand(StrToIntDef(f[1], 0), HkdfExtract(StrToIntDef(f[1], 0), UnHex(f[2]), UnHex(f[3])),
+            UnHex(f[4]), StrToIntDef(f[5], 0));
+          ok := got = UnHex(f[6]);
+        end;
+      5:
+        ok := Tls12Prf(StrToIntDef(f[1], 0), UnHex(f[2]), UnHex(f[3]), UnHex(f[4]), StrToIntDef(f[5], 0)) = UnHex(f[6]);
+    end;
+    if ok then
+      Inc(okc[k])
+    else
+      WriteLn('wrong: ', Copy(line, 1, 70));
+  end;
+  for i := 0 to 5 do
+    WriteLn(kinds[i], ' ', okc[i], ' of ', allc[i]);
+  { RFC 8439 2.4.2: the sunscreen text, key 00..1f, nonce 000000000000004a00000000, counter 1 }
+  text := 'Ladies and Gentlemen of the class of ''99: If I could offer you only one tip for the future, sunscreen would be it.';
+  line := '';
+  for i := 0 to 31 do
+    line := line + Chr(i);
+  got := ChaCha20Xor(line, UnHex('000000000000004a00000000'), 1, text);
+  WriteLn('chacha20 2.4.2: ', Hex(Copy(got, 1, 16)), '...', Hex(Copy(got, Length(got) - 3, 4)));
+  WriteLn('chacha20 back: ', ChaCha20Xor(line, UnHex('000000000000004a00000000'), 1, got) = text);
+  { RFC 8439 2.5.2 }
+  WriteLn('poly1305 2.5.2: ', Hex(Poly1305Tag(UnHex('85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b'),
+    'Cryptographic Forum Research Group')));
+  { RFC 8439 2.8.2 }
+  sealed := ChaChaPolySeal(UnHex('808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f'),
+    UnHex('070000004041424344454647'), text, UnHex('50515253c0c1c2c3c4c5c6c7'));
+  WriteLn('aead 2.8.2 tag: ', Hex(Copy(sealed, Length(sealed) - 15, 16)));
+  { SP 800-38A F.5.1, CTR-AES128.Encrypt }
+  AesInit(a, UnHex('2b7e151628aed2a6abf7158809cf4f3c'));
+  got := AesCtr(a, UnHex('f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff'),
+    UnHex('6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e51'));
+  WriteLn('ctr F.5.1: ', Hex(got));
+  { what the routines refuse }
+  WriteLn('refused: ', AesInit(a, 'short'), ' ', GcmInit(g, StringOfChar('k', 20)), ' ',
+    ChaChaPolySeal('k', StringOfChar('n', 12), 'x', '') = '', ' ',
+    ChaChaPolyOpen(StringOfChar('k', 32), StringOfChar('n', 12), 'short', '', plain), ' ',
+    GcmOpen(g, '', StringOfChar('x', 20), '', plain), ' ', HkdfExpand(CipherSha256, 'prk', '', 255 * 32 + 1) = '');
+end.

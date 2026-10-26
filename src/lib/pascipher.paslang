@@ -1,0 +1,1354 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+
+  paslang is free software: you can redistribute it and/or modify it
+  under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+
+  paslang is distributed in the hope that it will be useful, but
+  WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+  General Public License for more details.
+
+  Under Section 7 of GPL version 3, you are granted additional
+  permissions described in the paslang Runtime Library Exception,
+  version 1.0, in the file COPYING.RUNTIME.
+
+  You should have received a copy of the GNU General Public License
+  along with paslang.  If not, see <https://www.gnu.org/licenses/>. }
+
+
+{ The ciphers TLS needs, in pure paslang (P428): AES-128, AES-192 and
+  AES-256 (FIPS 197), AES-GCM (SP 800-38D), ChaCha20 and Poly1305 and
+  their AEAD (RFC 8439), HKDF (RFC 5869) and the TLS 1.2 PRF (RFC 5246
+  5). A key, a nonce, a message and a tag are strings of their bytes.
+
+  Nothing here branches on a secret or indexes memory with one. AES and
+  GHASH have a kernel on each machine's own instructions (Regla 8,
+  docs/KERNELS.md): AES-NI's aesenc and PCLMULQDQ on amd64, FEAT_AES's
+  aese and FEAT_PMULL's pmull on arm64, chosen when the unit is
+  compiled ($ifdef CPU_AES, CPU_PMULL), never at run time. The base
+  path reads no table either: the S-box is worked out as the inverse in
+  GF(2^8) followed by the affine map, eight bytes of a word at once, and
+  GHASH multiplies with integer products whose carries fall in holes
+  between the bits (BearSSL's ghash_ctmul64). ChaCha20 and Poly1305 are
+  additions, rotations and products, constant time as Go's
+  golang.org/x/crypto v0.58.0 writes them, which this follows routine by
+  routine (chacha_generic.go, sum_generic.go). A kernel takes at most
+  1024 blocks a call, so the routine can be stopped between two. }
+unit pascipher;
+
+interface
+
+const
+  { the hash of HKDF and of the TLS 1.2 PRF }
+  CipherSha256 = 0;
+  CipherSha384 = 1;
+  CipherSha512 = 2;
+  { the sizes of a GCM and a ChaCha20-Poly1305 tag and nonce }
+  AeadTagSize = 16;
+  AeadNonceSize = 12;
+
+type
+  { an AES key made ready: the round keys of encryption (the state's
+    bytes, 16 a round) and those of the equivalent inverse cipher }
+  TAes = record
+    Rounds: Integer;
+    EncK: array[0..239] of Byte;
+    DecK: array[0..239] of Byte;
+  end;
+
+  { an AES-GCM key: its AES and H, E(K, 0^128), as two big-endian words }
+  TGcm = record
+    Aes: TAes;
+    H0, H1: Integer;
+  end;
+
+{ False for a key that is not 16, 24 or 32 bytes }
+function AesInit(var A: TAes; const Key: string): Boolean;
+{ one 16-byte block from Src to Dst (they may be the same) }
+procedure AesEncryptBlock(const A: TAes; Src, Dst: Pointer);
+procedure AesDecryptBlock(const A: TAes; Src, Dst: Pointer);
+{ the same on a string of 16 bytes }
+function AesEncrypt(const A: TAes; const Block: string): string;
+function AesDecrypt(const A: TAes; const Block: string): string;
+{ AES in counter mode: Src xor the encryption of Iv, Iv + 1, ... (the
+  whole 16 bytes a big-endian counter, as Go's cipher.NewCTR) }
+function AesCtr(const A: TAes; const Iv, Src: string): string;
+
+{ False for a key that is not 16, 24 or 32 bytes }
+function GcmInit(var G: TGcm; const Key: string): Boolean;
+{ the ciphertext followed by its 16-byte tag; Nonce of any length but
+  empty, 12 bytes as TLS takes it }
+function GcmSeal(const G: TGcm; const Nonce, Plain, Ad: string): string;
+{ False, with Plain empty, when the tag does not match }
+function GcmOpen(const G: TGcm; const Nonce, Sealed, Ad: string; out Plain: string): Boolean;
+
+{ the ChaCha20 key stream from block Counter of Key (32 bytes) and
+  Nonce (12 bytes) xored into Src; '' for a wrong key or nonce size }
+function ChaCha20Xor(const Key, Nonce: string; Counter: Integer; const Src: string): string;
+{ the Poly1305 tag (16 bytes) of Msg under a one-time Key of 32 bytes }
+function Poly1305Tag(const Key, Msg: string): string;
+{ RFC 8439's AEAD: Key of 32 bytes, Nonce of 12 }
+function ChaChaPolySeal(const Key, Nonce, Plain, Ad: string): string;
+function ChaChaPolyOpen(const Key, Nonce, Sealed, Ad: string; out Plain: string): Boolean;
+
+{ HKDF (RFC 5869) on CipherSha256, CipherSha384 or CipherSha512 }
+function HkdfExtract(Hash: Integer; const Salt, Ikm: string): string;
+function HkdfExpand(Hash: Integer; const Prk, Info: string; Len: Integer): string;
+{ the TLS 1.2 PRF, P_hash(secret, label + seed) of Len bytes }
+function Tls12Prf(Hash: Integer; const Secret, Lbl, Seed: string; Len: Integer): string;
+{ the HMAC of the hash; the size of its digest }
+function CipherHmac(Hash: Integer; const Key, Msg: string): string;
+function CipherHashSize(Hash: Integer): Integer;
+
+implementation
+
+{ ---- shared ---- }
+
+{ whether A and B are equal, in a time that depends on their lengths
+  alone }
+function CtEqual(const A, B: string): Boolean;
+var
+  i, d: Integer;
+begin
+  Result := False;
+  if Length(A) <> Length(B) then
+    Exit;
+  d := 0;
+  for i := 1 to Length(A) do
+    d := d or (Ord(A[i]) xor Ord(B[i]));
+  Result := d = 0;
+end;
+
+{ ---- ChaCha20 (RFC 8439 2.3, Go's chacha_generic.go) ---- }
+
+type
+  TChaKey = array[0..7] of UInt32;
+
+procedure ChaChaBlock(const Key: TChaKey; Counter: UInt32; N0, N1, N2: UInt32; OutP: Pointer);
+var
+  x0, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15: UInt32;
+  i: Integer;
+begin
+  x0 := $61707865; x1 := $3320646e; x2 := $79622d32; x3 := $6b206574;
+  x4 := Key[0]; x5 := Key[1]; x6 := Key[2]; x7 := Key[3];
+  x8 := Key[4]; x9 := Key[5]; x10 := Key[6]; x11 := Key[7];
+  x12 := Counter; x13 := N0; x14 := N1; x15 := N2;
+  for i := 1 to 10 do
+  begin
+    { the columns }
+    x0 := x0 + x4; x12 := RotateLeft(x12 xor x0, 16); x8 := x8 + x12; x4 := RotateLeft(x4 xor x8, 12);
+    x0 := x0 + x4; x12 := RotateLeft(x12 xor x0, 8); x8 := x8 + x12; x4 := RotateLeft(x4 xor x8, 7);
+    x1 := x1 + x5; x13 := RotateLeft(x13 xor x1, 16); x9 := x9 + x13; x5 := RotateLeft(x5 xor x9, 12);
+    x1 := x1 + x5; x13 := RotateLeft(x13 xor x1, 8); x9 := x9 + x13; x5 := RotateLeft(x5 xor x9, 7);
+    x2 := x2 + x6; x14 := RotateLeft(x14 xor x2, 16); x10 := x10 + x14; x6 := RotateLeft(x6 xor x10, 12);
+    x2 := x2 + x6; x14 := RotateLeft(x14 xor x2, 8); x10 := x10 + x14; x6 := RotateLeft(x6 xor x10, 7);
+    x3 := x3 + x7; x15 := RotateLeft(x15 xor x3, 16); x11 := x11 + x15; x7 := RotateLeft(x7 xor x11, 12);
+    x3 := x3 + x7; x15 := RotateLeft(x15 xor x3, 8); x11 := x11 + x15; x7 := RotateLeft(x7 xor x11, 7);
+    { the diagonals }
+    x0 := x0 + x5; x15 := RotateLeft(x15 xor x0, 16); x10 := x10 + x15; x5 := RotateLeft(x5 xor x10, 12);
+    x0 := x0 + x5; x15 := RotateLeft(x15 xor x0, 8); x10 := x10 + x15; x5 := RotateLeft(x5 xor x10, 7);
+    x1 := x1 + x6; x12 := RotateLeft(x12 xor x1, 16); x11 := x11 + x12; x6 := RotateLeft(x6 xor x11, 12);
+    x1 := x1 + x6; x12 := RotateLeft(x12 xor x1, 8); x11 := x11 + x12; x6 := RotateLeft(x6 xor x11, 7);
+    x2 := x2 + x7; x13 := RotateLeft(x13 xor x2, 16); x8 := x8 + x13; x7 := RotateLeft(x7 xor x8, 12);
+    x2 := x2 + x7; x13 := RotateLeft(x13 xor x2, 8); x8 := x8 + x13; x7 := RotateLeft(x7 xor x8, 7);
+    x3 := x3 + x4; x14 := RotateLeft(x14 xor x3, 16); x9 := x9 + x14; x4 := RotateLeft(x4 xor x9, 12);
+    x3 := x3 + x4; x14 := RotateLeft(x14 xor x3, 8); x9 := x9 + x14; x4 := RotateLeft(x4 xor x9, 7);
+  end;
+  StoreLE32(OutP, x0 + $61707865);
+  StoreLE32(OutP + 4, x1 + $3320646e);
+  StoreLE32(OutP + 8, x2 + $79622d32);
+  StoreLE32(OutP + 12, x3 + $6b206574);
+  StoreLE32(OutP + 16, x4 + Key[0]);
+  StoreLE32(OutP + 20, x5 + Key[1]);
+  StoreLE32(OutP + 24, x6 + Key[2]);
+  StoreLE32(OutP + 28, x7 + Key[3]);
+  StoreLE32(OutP + 32, x8 + Key[4]);
+  StoreLE32(OutP + 36, x9 + Key[5]);
+  StoreLE32(OutP + 40, x10 + Key[6]);
+  StoreLE32(OutP + 44, x11 + Key[7]);
+  StoreLE32(OutP + 48, x12 + Counter);
+  StoreLE32(OutP + 52, x13 + N0);
+  StoreLE32(OutP + 56, x14 + N1);
+  StoreLE32(OutP + 60, x15 + N2);
+end;
+
+function ChaCha20Xor(const Key, Nonce: string; Counter: Integer; const Src: string): string;
+var
+  k: TChaKey;
+  ks: array[0..63] of Byte;
+  n0, n1, n2, ctr: UInt32;
+  i, j, n, off: Integer;
+  w: Integer;
+begin
+  Result := '';
+  if (Length(Key) <> 32) or (Length(Nonce) <> 12) then
+    Exit;
+  for i := 0 to 7 do
+    k[i] := UInt32(LoadLE32(@Key[1 + 4 * i]));
+  n0 := UInt32(LoadLE32(@Nonce[1]));
+  n1 := UInt32(LoadLE32(@Nonce[5]));
+  n2 := UInt32(LoadLE32(@Nonce[9]));
+  n := Length(Src);
+  if n = 0 then
+    Exit;
+  SetLength(Result, n);
+  ctr := UInt32(Counter);
+  off := 0;
+  while off < n do
+  begin
+    ChaChaBlock(k, ctr, n0, n1, n2, @ks[0]);
+    ctr := ctr + 1;
+    if n - off >= 64 then
+    begin
+      for j := 0 to 7 do
+      begin
+        w := LoadLE64(@Src[1 + off + 8 * j]) xor LoadLE64(@ks[8 * j]);
+        StoreLE64(@Result[1 + off + 8 * j], w);
+      end;
+      off := off + 64;
+    end
+    else
+    begin
+      for j := 0 to n - off - 1 do
+        Result[1 + off + j] := Chr(Ord(Src[1 + off + j]) xor ks[j]);
+      off := n;
+    end;
+  end;
+  FillChar(ks, SizeOf(ks), 0);
+  FillChar(k, SizeOf(k), 0);
+end;
+
+{ ---- Poly1305 (RFC 8439 2.5, Go's internal/poly1305/sum_generic.go) ---- }
+
+type
+  TPoly = record
+    H0, H1, H2: Integer;
+    R0, R1: Integer;
+    S0, S1: Integer;
+  end;
+
+procedure PolyInit(var P: TPoly; Key: Pointer);
+begin
+  P.R0 := LoadLE64(Key) and $0FFFFFFC0FFFFFFF;
+  P.R1 := LoadLE64(Key + 8) and $0FFFFFFC0FFFFFFC;
+  P.S0 := LoadLE64(Key + 16);
+  P.S1 := LoadLE64(Key + 24);
+  P.H0 := 0;
+  P.H1 := 0;
+  P.H2 := 0;
+end;
+
+{ the blocks of N bytes at Msg, each a number with a 1 past its last
+  byte (the 2^128 bit of a full block), added to the accumulator and
+  multiplied by r modulo 2^130 - 5 (updateGeneric) }
+procedure PolyBlocks(var P: TPoly; Msg: Pointer; N: Integer);
+var
+  h0, h1, h2, r0, r1, c, t0, t1, t2, t3: Integer;
+  h0r0h, h0r0l, h1r0h, h1r0l, h2r0h, h2r0l, h0r1h, h0r1l, h1r1h, h1r1l, h2r1h, h2r1l: Integer;
+  m1h, m1l, m2h, m2l, cclo, cchi: Integer;
+  buf: array[0..15] of Byte;
+  i: Integer;
+begin
+  h0 := P.H0; h1 := P.H1; h2 := P.H2;
+  r0 := P.R0; r1 := P.R1;
+  while N > 0 do
+  begin
+    if N >= 16 then
+    begin
+      h0 := AddCarry(h0, LoadLE64(Msg), 0, c);
+      h1 := AddCarry(h1, LoadLE64(Msg + 8), c, c);
+      h2 := h2 + c + 1;
+      Msg := Msg + 16;
+      N := N - 16;
+    end
+    else
+    begin
+      FillChar(buf, SizeOf(buf), 0);
+      for i := 0 to N - 1 do
+        buf[i] := PByte(Msg + i)^;
+      buf[N] := 1;
+      h0 := AddCarry(h0, LoadLE64(@buf[0]), 0, c);
+      h1 := AddCarry(h1, LoadLE64(@buf[8]), c, c);
+      h2 := h2 + c;
+      N := 0;
+    end;
+    Mul128(h0, r0, h0r0h, h0r0l);
+    Mul128(h1, r0, h1r0h, h1r0l);
+    Mul128(h2, r0, h2r0h, h2r0l);
+    Mul128(h0, r1, h0r1h, h0r1l);
+    Mul128(h1, r1, h1r1h, h1r1l);
+    Mul128(h2, r1, h2r1h, h2r1l);
+    { m1 = h1r0 + h0r1, m2 = h2r0 + h1r1: no overflow, the top bits of
+      r0 and r1 are masked }
+    m1l := AddCarry(h1r0l, h0r1l, 0, c);
+    m1h := h1r0h + h0r1h + c;
+    m2l := AddCarry(h2r0l, h1r1l, 0, c);
+    m2h := h2r0h + h1r1h + c;
+    t0 := h0r0l;
+    t1 := AddCarry(m1l, h0r0h, 0, c);
+    t2 := AddCarry(m2l, m1h, c, c);
+    t3 := AddCarry(h2r1l, m2h, c, c);
+    h0 := t0;
+    h1 := t1;
+    h2 := t2 and 3;
+    cclo := t2 and (not 3);
+    cchi := t3;
+    h0 := AddCarry(h0, cclo, 0, c);
+    h1 := AddCarry(h1, cchi, c, c);
+    h2 := h2 + c;
+    cclo := (cclo shr 2) or (cchi shl 62);
+    cchi := cchi shr 2;
+    h0 := AddCarry(h0, cclo, 0, c);
+    h1 := AddCarry(h1, cchi, c, c);
+    h2 := h2 + c;
+  end;
+  P.H0 := h0; P.H1 := h1; P.H2 := h2;
+end;
+
+procedure PolyFinal(var P: TPoly; OutP: Pointer);
+var
+  h0, h1, m0, m1, b, c, dummy: Integer;
+begin
+  h0 := P.H0;
+  h1 := P.H1;
+  { h - p, p = 2^130 - 5; the borrow keeps h when h < p }
+  m0 := SubBorrow(h0, -5, 0, b);
+  m1 := SubBorrow(h1, -1, b, b);
+  dummy := SubBorrow(P.H2, 3, b, b);
+  { b = 1: h < p, keep h; b = 0: take h - p }
+  h0 := (h0 and (-b)) or (m0 and (b - 1));
+  h1 := (h1 and (-b)) or (m1 and (b - 1));
+  h0 := AddCarry(h0, P.S0, 0, c);
+  h1 := AddCarry(h1, P.S1, c, c);
+  StoreLE64(OutP, h0);
+  StoreLE64(OutP + 8, h1);
+end;
+
+function Poly1305Tag(const Key, Msg: string): string;
+var
+  p: TPoly;
+begin
+  Result := '';
+  if Length(Key) <> 32 then
+    Exit;
+  PolyInit(p, @Key[1]);
+  if Msg <> '' then
+    PolyBlocks(p, @Msg[1], Length(Msg));
+  SetLength(Result, 16);
+  PolyFinal(p, @Result[1]);
+end;
+
+{ ---- ChaCha20-Poly1305 (RFC 8439 2.8) ---- }
+
+{ the tag of RFC 8439 2.8 over Ad and the ciphertext C, with the one-time
+  key of block 0 }
+procedure ChaChaPolyTag(const Key, Nonce, Ad: string; C: Pointer; CLen: Integer; OutP: Pointer);
+var
+  zeros: string;
+  pk: string;
+  p: TPoly;
+  lens: array[0..15] of Byte;
+  pad: array[0..15] of Byte;
+begin
+  SetLength(zeros, 32);
+  pk := ChaCha20Xor(Key, Nonce, 0, zeros);
+  PolyInit(p, @pk[1]);
+  FillChar(pad, SizeOf(pad), 0);
+  if Ad <> '' then
+  begin
+    PolyBlocks(p, @Ad[1], Length(Ad) - Length(Ad) mod 16);
+    if Length(Ad) mod 16 <> 0 then
+    begin
+      Move(Ad[1 + Length(Ad) - Length(Ad) mod 16], pad[0], Length(Ad) mod 16);
+      PolyBlocks(p, @pad[0], 16);
+      FillChar(pad, SizeOf(pad), 0);
+    end;
+  end;
+  if CLen > 0 then
+  begin
+    PolyBlocks(p, C, CLen - CLen mod 16);
+    if CLen mod 16 <> 0 then
+    begin
+      Move(PByte(C + CLen - CLen mod 16)^, pad[0], CLen mod 16);
+      PolyBlocks(p, @pad[0], 16);
+    end;
+  end;
+  StoreLE64(@lens[0], Length(Ad));
+  StoreLE64(@lens[8], CLen);
+  PolyBlocks(p, @lens[0], 16);
+  PolyFinal(p, OutP);
+  FillChar(pk[1], 32, 0);
+end;
+
+function ChaChaPolySeal(const Key, Nonce, Plain, Ad: string): string;
+var
+  c: string;
+  n: Integer;
+begin
+  Result := '';
+  if (Length(Key) <> 32) or (Length(Nonce) <> 12) then
+    Exit;
+  c := ChaCha20Xor(Key, Nonce, 1, Plain);
+  n := Length(c);
+  SetLength(c, n + 16);
+  if n = 0 then
+    ChaChaPolyTag(Key, Nonce, Ad, nil, 0, @c[1])
+  else
+    ChaChaPolyTag(Key, Nonce, Ad, @c[1], n, @c[1 + n]);
+  Result := c;
+end;
+
+function ChaChaPolyOpen(const Key, Nonce, Sealed, Ad: string; out Plain: string): Boolean;
+var
+  tag: string;
+  n: Integer;
+begin
+  Plain := '';
+  Result := False;
+  if (Length(Key) <> 32) or (Length(Nonce) <> 12) or (Length(Sealed) < 16) then
+    Exit;
+  n := Length(Sealed) - 16;
+  SetLength(tag, 16);
+  if n = 0 then
+    ChaChaPolyTag(Key, Nonce, Ad, nil, 0, @tag[1])
+  else
+    ChaChaPolyTag(Key, Nonce, Ad, @Sealed[1], n, @tag[1]);
+  if not CtEqual(tag, Copy(Sealed, n + 1, 16)) then
+    Exit;
+  Plain := ChaCha20Xor(Key, Nonce, 1, Copy(Sealed, 1, n));
+  Result := True;
+end;
+
+{ ---- HKDF and the TLS 1.2 PRF ---- }
+
+function CipherHashSize(Hash: Integer): Integer;
+begin
+  case Hash of
+    CipherSha384: Result := 48;
+    CipherSha512: Result := 64;
+  else
+    Result := 32;
+  end;
+end;
+
+function CipherHmac(Hash: Integer; const Key, Msg: string): string;
+begin
+  case Hash of
+    CipherSha384: Result := HmacSha384(Key, Msg);
+    CipherSha512: Result := HmacSha512(Key, Msg);
+  else
+    Result := HmacSha256(Key, Msg);
+  end;
+end;
+
+function HkdfExtract(Hash: Integer; const Salt, Ikm: string): string;
+var
+  s: string;
+begin
+  s := Salt;
+  if s = '' then
+  begin
+    SetLength(s, CipherHashSize(Hash));
+    FillChar(s[1], Length(s), 0);
+  end;
+  Result := CipherHmac(Hash, s, Ikm);
+end;
+
+function HkdfExpand(Hash: Integer; const Prk, Info: string; Len: Integer): string;
+var
+  t: string;
+  i: Integer;
+begin
+  Result := '';
+  if (Len <= 0) or (Len > 255 * CipherHashSize(Hash)) then
+    Exit;
+  t := '';
+  i := 1;
+  while Length(Result) < Len do
+  begin
+    t := CipherHmac(Hash, Prk, t + Info + Chr(i));
+    Result := Result + t;
+    i := i + 1;
+  end;
+  SetLength(Result, Len);
+end;
+
+function Tls12Prf(Hash: Integer; const Secret, Lbl, Seed: string; Len: Integer): string;
+var
+  a, s: string;
+begin
+  Result := '';
+  s := Lbl + Seed;
+  a := s;
+  while Length(Result) < Len do
+  begin
+    a := CipherHmac(Hash, Secret, a);
+    Result := Result + CipherHmac(Hash, Secret, a + s);
+  end;
+  SetLength(Result, Len);
+end;
+
+{ ---- AES (FIPS 197) ---- }
+
+type
+  TBlock16 = array[0..15] of Byte;
+
+const
+  L01 = $0101010101010101;
+  L7F = $7F7F7F7F7F7F7F7F;
+
+{ xtime of each of the eight bytes of X: times x in GF(2^8) }
+function XTime8(X: Integer): Integer; inline;
+begin
+  Result := ((X and L7F) shl 1) xor (((X shr 7) and L01) * $1B);
+end;
+
+{ the product in GF(2^8) of each byte of A by the byte of B beside it }
+function GMul8(A, B: Integer): Integer;
+var
+  i, r: Integer;
+begin
+  r := 0;
+  for i := 0 to 7 do
+  begin
+    r := r xor (A and (((B shr i) and L01) * $FF));
+    A := XTime8(A);
+  end;
+  Result := r;
+end;
+
+{ each byte to its inverse in GF(2^8), 0 to 0: x^254, by an addition
+  chain of seven squares and four products }
+function GInv8(X: Integer): Integer;
+var
+  x2, x3, x12, x15, x240: Integer;
+begin
+  x2 := GMul8(X, X);
+  x3 := GMul8(x2, X);
+  x12 := GMul8(x3, x3);
+  x12 := GMul8(x12, x12);
+  x15 := GMul8(x12, x3);
+  x240 := GMul8(x15, x15);
+  x240 := GMul8(x240, x240);
+  x240 := GMul8(x240, x240);
+  x240 := GMul8(x240, x240);
+  Result := GMul8(GMul8(x240, x12), x2);
+end;
+
+{ each byte rotated left by N inside itself }
+function Rot8(X, N: Integer): Integer; inline;
+var
+  hi: Integer;
+begin
+  hi := L01 * (($FF shl N) and $FF);
+  Result := ((X shl N) and hi) or ((X shr (8 - N)) and (L01 * ($FF shr (8 - N))));
+end;
+
+{ the S-box of each of the eight bytes (FIPS 197 5.1.1) }
+function SubBytes8(X: Integer): Integer;
+var
+  b: Integer;
+begin
+  b := GInv8(X);
+  Result := b xor Rot8(b, 1) xor Rot8(b, 2) xor Rot8(b, 3) xor Rot8(b, 4) xor (L01 * $63);
+end;
+
+{ the inverse S-box (FIPS 197 5.3.2): the inverse affine map, then the
+  inverse in GF(2^8) }
+function InvSubBytes8(X: Integer): Integer;
+begin
+  Result := GInv8(Rot8(X, 1) xor Rot8(X, 3) xor Rot8(X, 6) xor (L01 * $05));
+end;
+
+{ the state: bytes 0..7 in Lo and 8..15 in Hi, little-endian, byte
+  r + 4c the row r of the column c }
+
+{ the byte K (0..15) of the state }
+function SByte(Lo, Hi, K: Integer): Integer; inline;
+begin
+  if K < 8 then
+    Result := (Lo shr (8 * K)) and $FF
+  else
+    Result := (Hi shr (8 * (K - 8))) and $FF;
+end;
+
+{ ShiftRows (5.1.2): row r of column c from column c + r }
+procedure ShiftRows(var Lo, Hi: Integer);
+var
+  l, h: Integer;
+begin
+  l := SByte(Lo, Hi, 0) or (SByte(Lo, Hi, 5) shl 8) or (SByte(Lo, Hi, 10) shl 16) or (SByte(Lo, Hi, 15) shl 24)
+    or (SByte(Lo, Hi, 4) shl 32) or (SByte(Lo, Hi, 9) shl 40) or (SByte(Lo, Hi, 14) shl 48) or (SByte(Lo, Hi, 3) shl 56);
+  h := SByte(Lo, Hi, 8) or (SByte(Lo, Hi, 13) shl 8) or (SByte(Lo, Hi, 2) shl 16) or (SByte(Lo, Hi, 7) shl 24)
+    or (SByte(Lo, Hi, 12) shl 32) or (SByte(Lo, Hi, 1) shl 40) or (SByte(Lo, Hi, 6) shl 48) or (SByte(Lo, Hi, 11) shl 56);
+  Lo := l;
+  Hi := h;
+end;
+
+{ InvShiftRows (5.3.1): row r of column c from column c - r }
+procedure InvShiftRows(var Lo, Hi: Integer);
+var
+  l, h: Integer;
+begin
+  l := SByte(Lo, Hi, 0) or (SByte(Lo, Hi, 13) shl 8) or (SByte(Lo, Hi, 10) shl 16) or (SByte(Lo, Hi, 7) shl 24)
+    or (SByte(Lo, Hi, 4) shl 32) or (SByte(Lo, Hi, 1) shl 40) or (SByte(Lo, Hi, 14) shl 48) or (SByte(Lo, Hi, 11) shl 56);
+  h := SByte(Lo, Hi, 8) or (SByte(Lo, Hi, 5) shl 8) or (SByte(Lo, Hi, 2) shl 16) or (SByte(Lo, Hi, 15) shl 24)
+    or (SByte(Lo, Hi, 12) shl 32) or (SByte(Lo, Hi, 9) shl 40) or (SByte(Lo, Hi, 6) shl 48) or (SByte(Lo, Hi, 3) shl 56);
+  Lo := l;
+  Hi := h;
+end;
+
+{ the bytes of each 32-bit column moved down by N rows: row r takes row
+  r + N }
+function RotCol(X, N: Integer): Integer; inline;
+var
+  m: Integer;
+begin
+  m := $FFFFFFFF shr (8 * N);
+  m := m or (m shl 32);
+  Result := ((X shr (8 * N)) and m) or ((X shl (32 - 8 * N)) and (not m));
+end;
+
+{ MixColumns (5.1.3) of the two columns in X }
+function MixCol8(X: Integer): Integer; inline;
+var
+  t1: Integer;
+begin
+  t1 := RotCol(X, 1);
+  Result := XTime8(X xor t1) xor t1 xor RotCol(X, 2) xor RotCol(X, 3);
+end;
+
+{ InvMixColumns (5.3.3): MixColumns after a multiply by 4x^2 + 5 in each
+  column, as FIPS 197's matrix factors }
+function InvMixCol8(X: Integer): Integer;
+var
+  u: Integer;
+begin
+  u := XTime8(XTime8(X xor RotCol(X, 2)));
+  Result := MixCol8(X xor u);
+end;
+
+procedure AesEncryptPlain(const A: TAes; Src, Dst: Pointer);
+var
+  lo, hi, r: Integer;
+begin
+  lo := LoadLE64(Src) xor LoadLE64(@A.EncK[0]);
+  hi := LoadLE64(Src + 8) xor LoadLE64(@A.EncK[8]);
+  for r := 1 to A.Rounds do
+  begin
+    lo := SubBytes8(lo);
+    hi := SubBytes8(hi);
+    ShiftRows(lo, hi);
+    if r < A.Rounds then
+    begin
+      lo := MixCol8(lo);
+      hi := MixCol8(hi);
+    end;
+    lo := lo xor LoadLE64(@A.EncK[16 * r]);
+    hi := hi xor LoadLE64(@A.EncK[16 * r + 8]);
+  end;
+  StoreLE64(Dst, lo);
+  StoreLE64(Dst + 8, hi);
+end;
+
+procedure AesDecryptPlain(const A: TAes; Src, Dst: Pointer);
+var
+  lo, hi, r: Integer;
+begin
+  lo := LoadLE64(Src) xor LoadLE64(@A.EncK[16 * A.Rounds]);
+  hi := LoadLE64(Src + 8) xor LoadLE64(@A.EncK[16 * A.Rounds + 8]);
+  for r := A.Rounds - 1 downto 0 do
+  begin
+    InvShiftRows(lo, hi);
+    lo := InvSubBytes8(lo);
+    hi := InvSubBytes8(hi);
+    lo := lo xor LoadLE64(@A.EncK[16 * r]);
+    hi := hi xor LoadLE64(@A.EncK[16 * r + 8]);
+    if r > 0 then
+    begin
+      lo := InvMixCol8(lo);
+      hi := InvMixCol8(hi);
+    end;
+  end;
+  StoreLE64(Dst, lo);
+  StoreLE64(Dst + 8, hi);
+end;
+
+{ the key schedule (5.2), its words little-endian as the state's bytes
+  lie; SubWord through the same S-box, the low half of a word }
+function AesInit(var A: TAes; const Key: string): Boolean;
+var
+  nk, i, total, t, rcon, lo, hi: Integer;
+  w: array[0..59] of UInt32;
+begin
+  Result := False;
+  nk := Length(Key) div 4;
+  if (Length(Key) <> 16) and (Length(Key) <> 24) and (Length(Key) <> 32) then
+    Exit;
+  A.Rounds := nk + 6;
+  total := 4 * (A.Rounds + 1);
+  for i := 0 to nk - 1 do
+    w[i] := UInt32(LoadLE32(@Key[1 + 4 * i]));
+  rcon := 1;
+  for i := nk to total - 1 do
+  begin
+    t := w[i - 1];
+    if i mod nk = 0 then
+    begin
+      { RotWord then SubWord, then Rcon in the first byte }
+      t := RotateRight(UInt32(t), 8);
+      t := SubBytes8(t) and $FFFFFFFF;
+      t := t xor rcon;
+      rcon := XTime8(rcon) and $FF;
+    end
+    else if (nk > 6) and (i mod nk = 4) then
+      t := SubBytes8(t) and $FFFFFFFF;
+    w[i] := w[i - nk] xor UInt32(t);
+  end;
+  for i := 0 to total - 1 do
+    StoreLE32(@A.EncK[4 * i], w[i]);
+  { the equivalent inverse cipher's keys (5.3.5): the rounds' keys in
+    reverse, InvMixColumns on all but the first and the last }
+  for i := 0 to A.Rounds do
+  begin
+    lo := LoadLE64(@A.EncK[16 * (A.Rounds - i)]);
+    hi := LoadLE64(@A.EncK[16 * (A.Rounds - i) + 8]);
+    if (i > 0) and (i < A.Rounds) then
+    begin
+      lo := InvMixCol8(lo);
+      hi := InvMixCol8(hi);
+    end;
+    StoreLE64(@A.DecK[16 * i], lo);
+    StoreLE64(@A.DecK[16 * i + 8], hi);
+  end;
+  FillChar(w, SizeOf(w), 0);
+  Result := True;
+end;
+
+
+{ ---- the processor's AES (AES-NI, FEAT_AES) ---- }
+
+{$ifdef CPU_AES}
+
+{ one block from Src to Dst through the Rounds + 1 keys at K: AES-NI's
+  aesenc and aesenclast (Intel SDM vol. 2A), FEAT_AES's aese and aesmc,
+  aese being AddRoundKey, SubBytes and ShiftRows (Arm ARM C7.2) }
+procedure AesEncCpu(K: Pointer; Rounds: Integer; Src, Dst: Pointer);
+begin
+  asm amd64 (K: in rdx; Rounds: in rcx; Src: in rsi; Dst: in rdi)
+    movdqu (%rsi), %xmm0
+    movdqu (%rdx), %xmm1
+    pxor %xmm1, %xmm0
+    decq %rcx
+  .p2align 5
+  1:
+    addq $16, %rdx
+    movdqu (%rdx), %xmm1
+    aesenc %xmm1, %xmm0
+    decq %rcx
+    jnz 1b
+    movdqu 16(%rdx), %xmm1
+    aesenclast %xmm1, %xmm0
+    movdqu %xmm0, (%rdi)
+  end;
+  asm arm64 (K: in x2; Rounds: in x3; Src: in x0; Dst: in x1)
+    ld1 {v0.16b}, [x0]
+    sub x3, x3, #1
+  .p2align 5
+  1:
+    ld1 {v1.16b}, [x2], #16
+    aese v0.16b, v1.16b
+    aesmc v0.16b, v0.16b
+    subs x3, x3, #1
+    b.ne 1b
+    ld1 {v1.16b}, [x2], #16
+    aese v0.16b, v1.16b
+    ld1 {v2.16b}, [x2]
+    eor v0.16b, v0.16b, v2.16b
+    st1 {v0.16b}, [x1]
+  end;
+end;
+
+{ the same backwards through the equivalent inverse cipher's keys at K:
+  aesdec and aesdeclast, aesd and aesimc }
+procedure AesDecCpu(K: Pointer; Rounds: Integer; Src, Dst: Pointer);
+begin
+  asm amd64 (K: in rdx; Rounds: in rcx; Src: in rsi; Dst: in rdi)
+    movdqu (%rsi), %xmm0
+    movdqu (%rdx), %xmm1
+    pxor %xmm1, %xmm0
+    decq %rcx
+  .p2align 5
+  1:
+    addq $16, %rdx
+    movdqu (%rdx), %xmm1
+    aesdec %xmm1, %xmm0
+    decq %rcx
+    jnz 1b
+    movdqu 16(%rdx), %xmm1
+    aesdeclast %xmm1, %xmm0
+    movdqu %xmm0, (%rdi)
+  end;
+  asm arm64 (K: in x2; Rounds: in x3; Src: in x0; Dst: in x1)
+    ld1 {v0.16b}, [x0]
+    sub x3, x3, #1
+  .p2align 5
+  1:
+    ld1 {v1.16b}, [x2], #16
+    aesd v0.16b, v1.16b
+    aesimc v0.16b, v0.16b
+    subs x3, x3, #1
+    b.ne 1b
+    ld1 {v1.16b}, [x2], #16
+    aesd v0.16b, v1.16b
+    ld1 {v2.16b}, [x2]
+    eor v0.16b, v0.16b, v2.16b
+    st1 {v0.16b}, [x1]
+  end;
+end;
+
+{ N blocks: each of the N counter blocks at Ctr encrypted and xored with
+  the block of Src into the block of Dst }
+procedure AesXorBlocksCpu(K: Pointer; Rounds: Integer; Ctr, Src, Dst: Pointer; N: Integer);
+begin
+  asm amd64 (K: in rdx; Rounds: in rcx; Ctr: in r8; Src: in rsi; Dst: in rdi; N: in r9)
+  .p2align 5
+  1:
+    movdqu (%r8), %xmm0
+    movdqu (%rdx), %xmm1
+    pxor %xmm1, %xmm0
+    movq %rdx, %r10
+    movq %rcx, %r11
+    decq %r11
+  .p2align 5
+  2:
+    addq $16, %r10
+    movdqu (%r10), %xmm1
+    aesenc %xmm1, %xmm0
+    decq %r11
+    jnz 2b
+    movdqu 16(%r10), %xmm1
+    aesenclast %xmm1, %xmm0
+    movdqu (%rsi), %xmm2
+    pxor %xmm2, %xmm0
+    movdqu %xmm0, (%rdi)
+    addq $16, %r8
+    addq $16, %rsi
+    addq $16, %rdi
+    decq %r9
+    jnz 1b
+  end;
+  asm arm64 (K: in x2; Rounds: in x3; Ctr: in x4; Src: in x5; Dst: in x6; N: in x7)
+  .p2align 5
+  1:
+    ld1 {v0.16b}, [x4], #16
+    mov x9, x2
+    sub x10, x3, #1
+  .p2align 5
+  2:
+    ld1 {v1.16b}, [x9], #16
+    aese v0.16b, v1.16b
+    aesmc v0.16b, v0.16b
+    subs x10, x10, #1
+    b.ne 2b
+    ld1 {v1.16b}, [x9], #16
+    aese v0.16b, v1.16b
+    ld1 {v2.16b}, [x9]
+    eor v0.16b, v0.16b, v2.16b
+    ld1 {v3.16b}, [x5], #16
+    eor v0.16b, v0.16b, v3.16b
+    st1 {v0.16b}, [x6], #16
+    subs x7, x7, #1
+    b.ne 1b
+  end;
+end;
+
+{$endif}
+
+{ ---- the processor's GHASH (PCLMULQDQ, FEAT_PMULL) ---- }
+
+{$if defined(CPU_PMULL) and (defined(CPU_SSSE3) or defined(CPUAARCH64))}
+
+{ N blocks at P into Y, Y and H each held as the 128-bit value of their
+  bytes reversed (the low word the second big-endian half): the product
+  of four carry-less multiplies, shifted left by one for GCM's reflected
+  bits, and reduced modulo x^128 + x^7 + x^2 + x + 1 (Intel's white paper
+  on PCLMULQDQ and GCM, Gueron and Kounavis, 2014, its gfmul) }
+procedure GhashBlocksCpu(Y, H, P: Pointer; N: Integer);
+begin
+  asm amd64 (Y: in rdi; H: in rsi; P: in rdx; N: in rcx)
+    movq $0x08090a0b0c0d0e0f, %rax
+    movq %rax, %xmm15
+    movq $0x0001020304050607, %rax
+    movq %rax, %xmm14
+    punpcklqdq %xmm14, %xmm15
+    movdqu (%rdi), %xmm0
+    movdqu (%rsi), %xmm1
+  .p2align 5
+  1:
+    movdqu (%rdx), %xmm2
+    pshufb %xmm15, %xmm2
+    pxor %xmm2, %xmm0
+    movdqa %xmm0, %xmm3
+    pclmulqdq $0x00, %xmm1, %xmm3
+    movdqa %xmm0, %xmm4
+    pclmulqdq $0x10, %xmm1, %xmm4
+    movdqa %xmm0, %xmm5
+    pclmulqdq $0x01, %xmm1, %xmm5
+    movdqa %xmm0, %xmm6
+    pclmulqdq $0x11, %xmm1, %xmm6
+    pxor %xmm5, %xmm4
+    movdqa %xmm4, %xmm5
+    pslldq $8, %xmm5
+    psrldq $8, %xmm4
+    pxor %xmm5, %xmm3
+    pxor %xmm4, %xmm6
+    movdqa %xmm3, %xmm7
+    psrld $31, %xmm7
+    movdqa %xmm6, %xmm8
+    psrld $31, %xmm8
+    pslld $1, %xmm3
+    pslld $1, %xmm6
+    movdqa %xmm7, %xmm9
+    psrldq $12, %xmm9
+    pslldq $4, %xmm8
+    pslldq $4, %xmm7
+    por %xmm7, %xmm3
+    por %xmm8, %xmm6
+    por %xmm9, %xmm6
+    movdqa %xmm3, %xmm7
+    pslld $31, %xmm7
+    movdqa %xmm3, %xmm8
+    pslld $30, %xmm8
+    movdqa %xmm3, %xmm9
+    pslld $25, %xmm9
+    pxor %xmm8, %xmm7
+    pxor %xmm9, %xmm7
+    movdqa %xmm7, %xmm8
+    psrldq $4, %xmm8
+    pslldq $12, %xmm7
+    pxor %xmm7, %xmm3
+    movdqa %xmm3, %xmm2
+    psrld $1, %xmm2
+    movdqa %xmm3, %xmm4
+    psrld $2, %xmm4
+    movdqa %xmm3, %xmm5
+    psrld $7, %xmm5
+    pxor %xmm4, %xmm2
+    pxor %xmm5, %xmm2
+    pxor %xmm8, %xmm2
+    pxor %xmm2, %xmm3
+    pxor %xmm3, %xmm6
+    movdqa %xmm6, %xmm0
+    addq $16, %rdx
+    decq %rcx
+    jnz 1b
+    movdqu %xmm0, (%rdi)
+  end;
+  asm arm64 (Y: in x0; H: in x1; P: in x2; N: in x3)
+    movi v31.16b, #0
+    ld1 {v0.16b}, [x0]
+    ld1 {v1.16b}, [x1]
+    ext v17.16b, v1.16b, v1.16b, #8
+  .p2align 5
+  1:
+    ld1 {v2.16b}, [x2], #16
+    rev64 v2.16b, v2.16b
+    ext v2.16b, v2.16b, v2.16b, #8
+    eor v0.16b, v0.16b, v2.16b
+    pmull v3.1q, v0.1d, v1.1d
+    pmull2 v6.1q, v0.2d, v1.2d
+    pmull v4.1q, v0.1d, v17.1d
+    pmull2 v5.1q, v0.2d, v17.2d
+    eor v4.16b, v4.16b, v5.16b
+    ext v5.16b, v31.16b, v4.16b, #8
+    ext v4.16b, v4.16b, v31.16b, #8
+    eor v3.16b, v3.16b, v5.16b
+    eor v6.16b, v6.16b, v4.16b
+    ushr v7.4s, v3.4s, #31
+    ushr v16.4s, v6.4s, #31
+    shl v3.4s, v3.4s, #1
+    shl v6.4s, v6.4s, #1
+    ext v18.16b, v7.16b, v31.16b, #12
+    ext v16.16b, v31.16b, v16.16b, #12
+    ext v7.16b, v31.16b, v7.16b, #12
+    orr v3.16b, v3.16b, v7.16b
+    orr v6.16b, v6.16b, v16.16b
+    orr v6.16b, v6.16b, v18.16b
+    shl v7.4s, v3.4s, #31
+    shl v16.4s, v3.4s, #30
+    shl v18.4s, v3.4s, #25
+    eor v7.16b, v7.16b, v16.16b
+    eor v7.16b, v7.16b, v18.16b
+    ext v16.16b, v7.16b, v31.16b, #4
+    ext v7.16b, v31.16b, v7.16b, #4
+    eor v3.16b, v3.16b, v7.16b
+    ushr v2.4s, v3.4s, #1
+    ushr v4.4s, v3.4s, #2
+    ushr v5.4s, v3.4s, #7
+    eor v2.16b, v2.16b, v4.16b
+    eor v2.16b, v2.16b, v5.16b
+    eor v2.16b, v2.16b, v16.16b
+    eor v3.16b, v3.16b, v2.16b
+    eor v0.16b, v6.16b, v3.16b
+    subs x3, x3, #1
+    b.ne 1b
+    st1 {v0.16b}, [x0]
+  end;
+end;
+
+{$endif}
+
+procedure AesEncryptBlock(const A: TAes; Src, Dst: Pointer);
+begin
+{$ifdef CPU_AES}
+  AesEncCpu(@A.EncK[0], A.Rounds, Src, Dst);
+{$else}
+  AesEncryptPlain(A, Src, Dst);
+{$endif}
+end;
+
+procedure AesDecryptBlock(const A: TAes; Src, Dst: Pointer);
+begin
+{$ifdef CPU_AES}
+  AesDecCpu(@A.DecK[0], A.Rounds, Src, Dst);
+{$else}
+  AesDecryptPlain(A, Src, Dst);
+{$endif}
+end;
+
+function AesEncrypt(const A: TAes; const Block: string): string;
+begin
+  Result := '';
+  if Length(Block) <> 16 then
+    Exit;
+  SetLength(Result, 16);
+  AesEncryptBlock(A, @Block[1], @Result[1]);
+end;
+
+function AesDecrypt(const A: TAes; const Block: string): string;
+begin
+  Result := '';
+  if Length(Block) <> 16 then
+    Exit;
+  SetLength(Result, 16);
+  AesDecryptBlock(A, @Block[1], @Result[1]);
+end;
+
+{ the counter blocks from Ctr (big-endian, its low 32 bits counting when
+  Inc32, all 128 otherwise) encrypted and xored into N bytes from Src to
+  Dst; Ctr is left past the last block used }
+procedure CtrXor(const A: TAes; var Ctr: TBlock16; Src, Dst: Pointer; N: Integer; Inc32: Boolean);
+var
+  ks: array[0..15] of Byte;
+  ctrs: array[0..1023] of Byte;
+  off, j, k, c, nb, b: Integer;
+begin
+  off := 0;
+{$ifdef CPU_AES}
+  if Inc32 then
+    while N - off >= 16 do
+    begin
+      nb := (N - off) div 16;
+      if nb > 64 then
+        nb := 64;
+      for b := 0 to nb - 1 do
+      begin
+        Move(Ctr[0], ctrs[16 * b], 16);
+        StoreBE32(@Ctr[12], UInt32(LoadBE32(@Ctr[12]) + 1));
+      end;
+      AesXorBlocksCpu(@A.EncK[0], A.Rounds, @ctrs[0], Src + off, Dst + off, nb);
+      off := off + 16 * nb;
+    end;
+{$endif}
+  while off < N do
+  begin
+    AesEncryptBlock(A, @Ctr[0], @ks[0]);
+    { the counter + 1 }
+    if Inc32 then
+      StoreBE32(@Ctr[12], UInt32(LoadBE32(@Ctr[12]) + 1))
+    else
+    begin
+      c := 1;
+      for k := 15 downto 0 do
+      begin
+        c := Ctr[k] + c;
+        Ctr[k] := Byte(c);
+        c := c shr 8;
+      end;
+    end;
+    if N - off >= 16 then
+    begin
+      StoreLE64(Dst + off, LoadLE64(Src + off) xor LoadLE64(@ks[0]));
+      StoreLE64(Dst + off + 8, LoadLE64(Src + off + 8) xor LoadLE64(@ks[8]));
+      off := off + 16;
+    end
+    else
+    begin
+      for j := 0 to N - off - 1 do
+        PByte(Dst + off + j)^ := PByte(Src + off + j)^ xor ks[j];
+      off := N;
+    end;
+  end;
+  FillChar(ks, SizeOf(ks), 0);
+  FillChar(ctrs, SizeOf(ctrs), 0);
+end;
+
+function AesCtr(const A: TAes; const Iv, Src: string): string;
+var
+  ctr: TBlock16;
+begin
+  Result := '';
+  if (Length(Iv) <> 16) or (Src = '') then
+    Exit;
+  Move(Iv[1], ctr[0], 16);
+  SetLength(Result, Length(Src));
+  CtrXor(A, ctr, @Src[1], @Result[1], Length(Src), False);
+end;
+
+{ ---- GHASH (SP 800-38D 6.4) ---- }
+
+{ the low 64 bits of the carry-less product of X and Y: each takes four
+  sets of bits four apart, so the integer products' carries fall in the
+  holes between them (BearSSL's bmul64) }
+function BMul64(X, Y: Integer): Integer;
+var
+  x0, x1, x2, x3, y0, y1, y2, y3, z0, z1, z2, z3: Integer;
+begin
+  x0 := X and $1111111111111111;
+  x1 := X and $2222222222222222;
+  x2 := X and $4444444444444444;
+  x3 := X and $8888888888888888;
+  y0 := Y and $1111111111111111;
+  y1 := Y and $2222222222222222;
+  y2 := Y and $4444444444444444;
+  y3 := Y and $8888888888888888;
+  z0 := (x0 * y0) xor (x1 * y3) xor (x2 * y2) xor (x3 * y1);
+  z1 := (x0 * y1) xor (x1 * y0) xor (x2 * y3) xor (x3 * y2);
+  z2 := (x0 * y2) xor (x1 * y1) xor (x2 * y0) xor (x3 * y3);
+  z3 := (x0 * y3) xor (x1 * y2) xor (x2 * y1) xor (x3 * y0);
+  Result := (z0 and $1111111111111111) or (z1 and $2222222222222222)
+    or (z2 and $4444444444444444) or (z3 and $8888888888888888);
+end;
+
+function Rev64(X: Integer): Integer; inline;
+begin
+  X := ((X shr 1) and $5555555555555555) or ((X and $5555555555555555) shl 1);
+  X := ((X shr 2) and $3333333333333333) or ((X and $3333333333333333) shl 2);
+  X := ((X shr 4) and $0F0F0F0F0F0F0F0F) or ((X and $0F0F0F0F0F0F0F0F) shl 4);
+  Result := ByteSwap(X);
+end;
+
+{ Y1:Y0 (big-endian words of the block, Y1 its first eight bytes) times
+  H in GF(2^128) as GCM orders its bits (BearSSL's ghash_ctmul64) }
+procedure GhashMulPlain(var Y1, Y0: Integer; H1, H0: Integer);
+var
+  h2, h0r, h1r, h2r, y2, y0r, y1r, y2r: Integer;
+  z0, z1, z2, z0h, z1h, z2h, v0, v1, v2, v3: Integer;
+begin
+  h2 := H0 xor H1;
+  h0r := Rev64(H0);
+  h1r := Rev64(H1);
+  h2r := h0r xor h1r;
+  y2 := Y0 xor Y1;
+  y0r := Rev64(Y0);
+  y1r := Rev64(Y1);
+  y2r := y0r xor y1r;
+  z0 := BMul64(Y0, H0);
+  z1 := BMul64(Y1, H1);
+  z2 := BMul64(y2, h2);
+  z0h := BMul64(y0r, h0r);
+  z1h := BMul64(y1r, h1r);
+  z2h := BMul64(y2r, h2r);
+  z2 := z2 xor z0 xor z1;
+  z2h := z2h xor z0h xor z1h;
+  z0h := Rev64(z0h) shr 1;
+  z1h := Rev64(z1h) shr 1;
+  z2h := Rev64(z2h) shr 1;
+  v0 := z0;
+  v1 := z0h xor z2;
+  v2 := z1 xor z2h;
+  v3 := z1h;
+  v3 := (v3 shl 1) or (v2 shr 63);
+  v2 := (v2 shl 1) or (v1 shr 63);
+  v1 := (v1 shl 1) or (v0 shr 63);
+  v0 := v0 shl 1;
+  v2 := v2 xor v0 xor (v0 shr 1) xor (v0 shr 2) xor (v0 shr 7);
+  v1 := v1 xor (v0 shl 63) xor (v0 shl 62) xor (v0 shl 57);
+  v3 := v3 xor v1 xor (v1 shr 1) xor (v1 shr 2) xor (v1 shr 7);
+  v2 := v2 xor (v1 shl 63) xor (v1 shl 62) xor (v1 shl 57);
+  Y0 := v2;
+  Y1 := v3;
+end;
+
+{ GHASH of N bytes at P into Y1:Y0, the last block padded with zeros }
+procedure GhashUpdate(const G: TGcm; var Y1, Y0: Integer; P: Pointer; N: Integer);
+var
+  buf: array[0..15] of Byte;
+  y: array[0..1] of Integer;
+  i, nb, k: Integer;
+begin
+{$if defined(CPU_PMULL) and (defined(CPU_SSSE3) or defined(CPUAARCH64))}
+  begin
+    y[0] := Y0;
+    y[1] := Y1;
+    { at most 1024 blocks a call, so the routine can be stopped between
+      two (the kernels' rule, docs/KERNELS.md) }
+    nb := N div 16;
+    while nb > 0 do
+    begin
+      k := nb;
+      if k > 1024 then
+        k := 1024;
+      GhashBlocksCpu(@y[0], @G.H0, P, k);
+      P := P + 16 * k;
+      nb := nb - k;
+    end;
+    N := N mod 16;
+    if N <> 0 then
+    begin
+      FillChar(buf, SizeOf(buf), 0);
+      for i := 0 to N - 1 do
+        buf[i] := PByte(P + i)^;
+      GhashBlocksCpu(@y[0], @G.H0, @buf[0], 1);
+    end;
+    Y0 := y[0];
+    Y1 := y[1];
+  end;
+{$else}
+  while N >= 16 do
+  begin
+    Y1 := Y1 xor LoadBE64(P);
+    Y0 := Y0 xor LoadBE64(P + 8);
+    GhashMulPlain(Y1, Y0, G.H1, G.H0);
+    P := P + 16;
+    N := N - 16;
+  end;
+  if N > 0 then
+  begin
+    FillChar(buf, SizeOf(buf), 0);
+    for i := 0 to N - 1 do
+      buf[i] := PByte(P + i)^;
+    Y1 := Y1 xor LoadBE64(@buf[0]);
+    Y0 := Y0 xor LoadBE64(@buf[8]);
+    GhashMulPlain(Y1, Y0, G.H1, G.H0);
+  end;
+{$endif}
+end;
+
+{ ---- GCM (SP 800-38D 7) ---- }
+
+function GcmInit(var G: TGcm; const Key: string): Boolean;
+var
+  z: array[0..15] of Byte;
+begin
+  Result := AesInit(G.Aes, Key);
+  if not Result then
+    Exit;
+  FillChar(z, SizeOf(z), 0);
+  AesEncryptBlock(G.Aes, @z[0], @z[0]);
+  G.H1 := LoadBE64(@z[0]);
+  G.H0 := LoadBE64(@z[8]);
+  FillChar(z, SizeOf(z), 0);
+end;
+
+{ J0 of the nonce (7.1 step 2) }
+procedure GcmJ0(const G: TGcm; const Nonce: string; var J0: TBlock16);
+var
+  y1, y0: Integer;
+  lens: array[0..15] of Byte;
+begin
+  if Length(Nonce) = 12 then
+  begin
+    Move(Nonce[1], J0[0], 12);
+    J0[12] := 0; J0[13] := 0; J0[14] := 0; J0[15] := 1;
+  end
+  else
+  begin
+    y1 := 0;
+    y0 := 0;
+    GhashUpdate(G, y1, y0, @Nonce[1], Length(Nonce));
+    StoreBE64(@lens[0], 0);
+    StoreBE64(@lens[8], 8 * Length(Nonce));
+    GhashUpdate(G, y1, y0, @lens[0], 16);
+    StoreBE64(@J0[0], y1);
+    StoreBE64(@J0[8], y0);
+  end;
+end;
+
+{ the tag of Ad and the ciphertext C under J0 }
+procedure GcmTag(const G: TGcm; const J0: TBlock16; const Ad: string; C: Pointer; CLen: Integer; OutP: Pointer);
+var
+  y1, y0: Integer;
+  lens, ek: array[0..15] of Byte;
+begin
+  y1 := 0;
+  y0 := 0;
+  if Ad <> '' then
+    GhashUpdate(G, y1, y0, @Ad[1], Length(Ad));
+  if CLen > 0 then
+    GhashUpdate(G, y1, y0, C, CLen);
+  StoreBE64(@lens[0], 8 * Length(Ad));
+  StoreBE64(@lens[8], 8 * CLen);
+  GhashUpdate(G, y1, y0, @lens[0], 16);
+  AesEncryptBlock(G.Aes, @J0[0], @ek[0]);
+  StoreBE64(OutP, y1 xor LoadBE64(@ek[0]));
+  StoreBE64(OutP + 8, y0 xor LoadBE64(@ek[8]));
+  FillChar(ek, SizeOf(ek), 0);
+end;
+
+function GcmSeal(const G: TGcm; const Nonce, Plain, Ad: string): string;
+var
+  j0, ctr: TBlock16;
+  n: Integer;
+begin
+  Result := '';
+  if Nonce = '' then
+    Exit;
+  GcmJ0(G, Nonce, j0);
+  n := Length(Plain);
+  SetLength(Result, n + 16);
+  Move(j0[0], ctr[0], 16);
+  StoreBE32(@ctr[12], UInt32(LoadBE32(@ctr[12]) + 1));
+  if n > 0 then
+  begin
+    CtrXor(G.Aes, ctr, @Plain[1], @Result[1], n, True);
+    GcmTag(G, j0, Ad, @Result[1], n, @Result[1 + n]);
+  end
+  else
+    GcmTag(G, j0, Ad, nil, 0, @Result[1]);
+end;
+
+function GcmOpen(const G: TGcm; const Nonce, Sealed, Ad: string; out Plain: string): Boolean;
+var
+  j0, ctr: TBlock16;
+  tag: string;
+  n: Integer;
+begin
+  Plain := '';
+  Result := False;
+  if (Nonce = '') or (Length(Sealed) < 16) then
+    Exit;
+  GcmJ0(G, Nonce, j0);
+  n := Length(Sealed) - 16;
+  SetLength(tag, 16);
+  if n > 0 then
+    GcmTag(G, j0, Ad, @Sealed[1], n, @tag[1])
+  else
+    GcmTag(G, j0, Ad, nil, 0, @tag[1]);
+  if not CtEqual(tag, Copy(Sealed, n + 1, 16)) then
+    Exit;
+  if n > 0 then
+  begin
+    SetLength(Plain, n);
+    Move(j0[0], ctr[0], 16);
+    StoreBE32(@ctr[12], UInt32(LoadBE32(@ctr[12]) + 1));
+    CtrXor(G.Aes, ctr, @Sealed[1], @Plain[1], n, True);
+  end;
+  Result := True;
+end;
+
+end.

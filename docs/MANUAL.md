@@ -11782,6 +11782,49 @@ phc := Argon2idHash(password);                 { stored at sign-up }
 if Argon2idVerify(password, phc) then ...      { at login }
 ```
 
+`uses pascipher` has the ciphers TLS needs, in pure paslang (1.1.290,
+P428), following Go's `crypto/aes`, `crypto/cipher` and
+`golang.org/x/crypto`'s `chacha20` and `poly1305` routine by routine.
+Keys, nonces, messages and tags are strings of bytes.
+- `AesInit(a, key)` makes a `TAes` of a 16, 24 or 32-byte key (FIPS 197)
+  and `False` for another size; `AesEncrypt(a, block)` and
+  `AesDecrypt(a, block)` take a block of 16 bytes, and
+  `AesEncryptBlock(a, src, dst)` and `AesDecryptBlock` two pointers.
+  `AesCtr(a, iv, s)` is counter mode over the whole 16-byte counter, as
+  Go's `cipher.NewCTR`.
+- `GcmInit(g, key)` makes a `TGcm` (SP 800-38D); `GcmSeal(g, nonce,
+  plain, ad)` gives the ciphertext followed by its 16-byte tag, and
+  `GcmOpen(g, nonce, sealed, ad, plain)` gives `False`, with `plain`
+  empty, when the tag does not match. The nonce is 12 bytes in TLS and
+  any length but empty otherwise.
+- `ChaChaPolySeal(key, nonce, plain, ad)` and `ChaChaPolyOpen(key,
+  nonce, sealed, ad, plain)` are RFC 8439's AEAD (a 32-byte key, a
+  12-byte nonce); `ChaCha20Xor(key, nonce, counter, s)` and
+  `Poly1305Tag(key, s)` its parts.
+- `HkdfExtract(hash, salt, ikm)` and `HkdfExpand(hash, prk, info, n)`
+  are RFC 5869's, `Tls12Prf(hash, secret, label, seed, n)` RFC 5246's
+  P_hash, and `CipherHmac(hash, key, s)` the HMAC they use, on
+  `CipherSha256`, `CipherSha384` or `CipherSha512`.
+
+None of them branches on a secret or reads a table with one. AES and
+GHASH have a kernel on each machine (AES-NI and PCLMULQDQ, FEAT_AES and
+FEAT_PMULL, docs/KERNELS.md) that `-cpu` chooses; the base path works
+the S-box out in GF(2^8) eight bytes at a time and multiplies GHASH's
+blocks with integer products, so it holds no table either.
+`testdata/cipherkat` checks Go's own known answers (FIPS 197, Go's GCM
+table, x/crypto's ChaCha20-Poly1305 and Poly1305 tables, RFC 5869),
+RFC 8439's examples and SP 800-38A's counter mode, and
+`testdata/cipherwyche` Wycheproof's 893 vectors of AES-GCM,
+ChaCha20-Poly1305 and HKDF, through the kernels and the base path, on
+both machines.
+
+```
+g: TGcm;
+GcmInit(g, key);                           { 16 or 32 bytes }
+sealed := GcmSeal(g, nonce, 'text', ad);   { 4 bytes, then the 16 of the tag }
+if GcmOpen(g, nonce, sealed, ad, plain) then ...
+```
+
 `uses pascodec` has the text codecs a service needs (1.1.260, P435), as
 Go's packages give them, checked against Go's own output
 (`testdata/codec`, with `scripts/codec_oracle.go`):

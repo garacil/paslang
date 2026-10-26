@@ -1,0 +1,112 @@
+{ P428: pascipher against Wycheproof's vectors (testdata/wycheproof, the
+  version Go 1.27 pins): AES-GCM and ChaCha20-Poly1305, each valid case
+  sealed to its ciphertext and tag and opened to its message, each
+  invalid one refused (a changed tag, text or nonce, a nonce of no
+  length or a key of a wrong size); the groups of a tag shorter than
+  128 bits are counted apart, since TLS seals with 16 bytes; HKDF on
+  SHA-256, SHA-384 and SHA-512, sizes past 255 hashes refused. }
+program cipherwyche;
+
+uses
+  pascipher, paslib;
+
+function UnHex(const h: string): string;
+var
+  i, d, v: Integer;
+  c: Char;
+begin
+  SetLength(Result, Length(h) div 2);
+  for i := 1 to Length(h) do
+  begin
+    c := h[i];
+    if (c >= '0') and (c <= '9') then d := Ord(c) - 48
+    else if (c >= 'a') and (c <= 'f') then d := Ord(c) - 87
+    else d := Ord(c) - 55;
+    if Odd(i) then v := d shl 4
+    else Result[i div 2] := Chr(v or d);
+  end;
+end;
+
+procedure RunFile(const Kind, Name: string);
+var
+  text, key, iv, aad, msg, ct, tag, res, got, plain: string;
+  doc, grp, tc: json;
+  pass, fail, skip, n, hash: Integer;
+  g: TGcm;
+  ok, valid: Boolean;
+begin
+  if not ReadFile('testdata/wycheproof/' + Name, text) then
+  begin
+    WriteLn('cannot read ', Name);
+    Halt(1);
+  end;
+  doc := JsonParse(text);
+  pass := 0; fail := 0; skip := 0;
+  hash := CipherSha256;
+  if Kind = 'hkdf384' then hash := CipherSha384;
+  if Kind = 'hkdf512' then hash := CipherSha512;
+  for grp in doc['testGroups'] do
+    for tc in grp['tests'] do
+    begin
+      res := tc['result'].AsString;
+      valid := res = 'valid';
+      if Copy(Kind, 1, 4) = 'hkdf' then
+      begin
+        got := HkdfExpand(hash, HkdfExtract(hash, UnHex(tc['salt'].AsString), UnHex(tc['ikm'].AsString)),
+          UnHex(tc['info'].AsString), tc['size'].AsInteger);
+        ok := (got <> '') and (got = UnHex(tc['okm'].AsString));
+        if ok = valid then Inc(pass)
+        else if res = 'acceptable' then Inc(pass)
+        else begin Inc(fail); WriteLn('FAIL ', tc['tcId'].AsInteger, ' ', res); end;
+        Continue;
+      end;
+      if grp['tagSize'].AsInteger <> 128 then
+      begin
+        Inc(skip);
+        Continue;
+      end;
+      key := UnHex(tc['key'].AsString);
+      iv := UnHex(tc['iv'].AsString);
+      aad := UnHex(tc['aad'].AsString);
+      msg := UnHex(tc['msg'].AsString);
+      ct := UnHex(tc['ct'].AsString);
+      tag := UnHex(tc['tag'].AsString);
+      if Kind = 'gcm' then
+      begin
+        if not GcmInit(g, key) then
+        begin
+          if valid then begin Inc(fail); WriteLn('FAIL key ', tc['tcId'].AsInteger); end else Inc(pass);
+          Continue;
+        end;
+        got := GcmSeal(g, iv, msg, aad);
+        ok := GcmOpen(g, iv, ct + tag, aad, plain);
+      end
+      else
+      begin
+        got := ChaChaPolySeal(key, iv, msg, aad);
+        ok := ChaChaPolyOpen(key, iv, ct + tag, aad, plain);
+      end;
+      if valid then
+      begin
+        if (got = ct + tag) and ok and (plain = msg) then Inc(pass)
+        else begin Inc(fail); WriteLn('FAIL ', tc['tcId'].AsInteger, ' valid'); end;
+      end
+      else if res = 'invalid' then
+      begin
+        if not ok then Inc(pass)
+        else begin Inc(fail); WriteLn('FAIL ', tc['tcId'].AsInteger, ' invalid opened'); end;
+      end
+      else
+        Inc(pass);
+    end;
+  n := pass + fail + skip;
+  WriteLn(Name, ': ', n, ' tests, ', pass, ' pass, ', fail, ' fail, ', skip, ' with a shorter tag');
+end;
+
+begin
+  RunFile('gcm', 'aes_gcm_test.json');
+  RunFile('ccp', 'chacha20_poly1305_test.json');
+  RunFile('hkdf256', 'hkdf_sha256_test.json');
+  RunFile('hkdf384', 'hkdf_sha384_test.json');
+  RunFile('hkdf512', 'hkdf_sha512_test.json');
+end.
