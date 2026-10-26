@@ -1719,6 +1719,40 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'a helper descends from a helper of its kind at 9:22' $(BUILDDIR)/helpbad_otherkind.err; \
 	grep -q 'Integer has no members: Twice needs a record, an object or a helper for Integer at 6:13' $(BUILDDIR)/helpbad_nomember.err; \
 	echo ok helpbad; \
+	echo "==== every error says where it is and what it met (P383) ===="; \
+	for n in fieldkw fieldsym methname paramname ordargs sqrtargs enummember emptyenum unitname unitkw progname forvar readlnvar propname propword inheritedout vardefault ifacevar opsymbol genname breakout; do \
+	  if $(OUTDIR)/paslangc -o $(BUILDDIR)/placebad_$$n testdata/placebad/$$n.paslang >$(BUILDDIR)/placebad_$$n.err 2>&1; then \
+	    echo "$$n should fail"; exit 1; \
+	  fi; \
+	done; \
+	grep -q 'tree is a reserved word, not a field.s name at 5:5 \[tree\]' $(BUILDDIR)/placebad_fieldkw.err; \
+	grep -q 'a field.s name expected at 5:5 \[5\]' $(BUILDDIR)/placebad_fieldsym.err; \
+	grep -q 'a method.s name expected at 4:15 \[1\]' $(BUILDDIR)/placebad_methname.err; \
+	grep -q 'a parameter.s name expected at 2:13 \[1\]' $(BUILDDIR)/placebad_paramname.err; \
+	grep -q 'Ord takes 1 argument at 6:5' $(BUILDDIR)/placebad_ordargs.err; \
+	grep -q 'Sqrt takes 1 argument at 5:8' $(BUILDDIR)/placebad_sqrtargs.err; \
+	grep -q 'an enumeration.s member expected at 3:14 \[1\]' $(BUILDDIR)/placebad_enummember.err; \
+	grep -q 'an enumeration.s member expected at 3:9 \[)\]' $(BUILDDIR)/placebad_emptyenum.err; \
+	grep -q 'a unit.s name expected at 2:6 \[1\]' $(BUILDDIR)/placebad_unitname.err; \
+	grep -q 'tree is a reserved word, not a unit.s name at 2:6 \[tree\]' $(BUILDDIR)/placebad_unitkw.err; \
+	grep -q 'the program.s name expected at 1:9 \[1\]' $(BUILDDIR)/placebad_progname.err; \
+	grep -q 'the for.s variable expected at 5:7 \[1\]' $(BUILDDIR)/placebad_forvar.err; \
+	grep -q 'a variable for ReadLn expected at 3:10 \[1\]' $(BUILDDIR)/placebad_readlnvar.err; \
+	grep -q 'a property.s name expected at 5:14 \[1\]' $(BUILDDIR)/placebad_propname.err; \
+	grep -q 'read, write or json expected in a property, or its semicolon at 5:25 \[reed\]' $(BUILDDIR)/placebad_propword.err; \
+	grep -q 'inherited is for a method of a class: it calls the parent.s at 4:3' $(BUILDDIR)/placebad_inheritedout.err; \
+	grep -q 'a var parameter takes no default value at 2:28' $(BUILDDIR)/placebad_vardefault.err; \
+	grep -q 'procedure or function expected in an interface at 4:5 \[var\]' $(BUILDDIR)/placebad_ifacevar.err; \
+	grep -q 'an operator.s symbol expected at 6:10 \[@\]' $(BUILDDIR)/placebad_opsymbol.err; \
+	grep -q 'a generic type.s name expected at 3:11 \[1\]' $(BUILDDIR)/placebad_genname.err; \
+	grep -q 'break not in loop at line 7' $(BUILDDIR)/placebad_breakout.err; \
+	: the emitter on arm64 refuses with the line it emits too, P383; \
+	if $(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/placebad_breakouta testdata/placebad/breakout.paslang >$(BUILDDIR)/placebad_breakouta.err 2>&1; then \
+	  echo "breakout should fail on arm64"; exit 1; \
+	fi; \
+	grep -q 'break not in loop at line 7' $(BUILDDIR)/placebad_breakouta.err; \
+	python3 -I scripts/check_dieplace.py src/compiler/pasparse.paslang src/compiler/pasemit.paslang; \
+	echo ok placebad; \
 	echo "==== record operator rejects (P171) ===="; \
 	for n in nobody badname notbool norec twice bodytypes cast explicitonly; do \
 	  if $(OUTDIR)/paslangc -o $(BUILDDIR)/recopbad_$$n testdata/recopbad/$$n.paslang >$(BUILDDIR)/recopbad_$$n.err 2>&1; then \
@@ -3354,7 +3388,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	if $(OUTDIR)/paslangc -o $(BUILDDIR)/defaults_var testdata/defaults_var.paslang >$(BUILDDIR)/defaults_var.err 2>&1; then \
 	  echo 'default on var should fail'; exit 1; \
 	fi; \
-	grep -q 'default on var parameter' $(BUILDDIR)/defaults_var.err; \
+	grep -q 'a var parameter takes no default value at ' $(BUILDDIR)/defaults_var.err; \
 	if $(OUTDIR)/paslangc -o $(BUILDDIR)/defaults_short testdata/defaults_short.paslang >$(BUILDDIR)/defaults_short.err 2>&1; then \
 	  echo 'omitted required parameter should fail'; exit 1; \
 	fi; \

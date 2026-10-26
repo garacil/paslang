@@ -14455,8 +14455,11 @@ amd64 and 154 on arm64, where it was 374).
 
 A missing file, a syntax error or a failed assemble or link prints a
 message on standard error and exits with a non-zero status. A compile
-error names its file, and its line and column when it has them:
-`paslangc: two pointers do not add at 7:13 in src/demo.paslang`.
+error names its file and its line and column: `paslangc: two pointers do
+not add at 7:13 in src/demo.paslang`; where a name or a token goes, what
+it met as well (`tree is a reserved word, not a field's name at 5:5
+[tree]`, `a parameter's name expected at 2:13 [1]`), and one the
+code generator gives, the line it was compiling (`at line 7`, 1.1.283).
 
 The whole source tree is checked with `make check`: the golden programs
 in `testdata/`, the examples of this manual, the network tests, the
