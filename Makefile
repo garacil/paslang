@@ -112,7 +112,10 @@ endif
 # every feature of the level links those objects, so a unit's words
 # that choose a kernel by -cpu take the program's, as Go compiles every
 # package at its GOAMD64 level. The interfaces (.pi) are the same.
+# amd64's level is x86-64-v3 with AES-NI and PCLMULQDQ (P465), which v3
+# leaves out and pascipher's kernels need, in the directory v3.
 LVL_X64 := v3
+LVL_X64_CPU := v3+aes+pclmul
 LVL_A64 := v8.2+crypto
 A64_OBJDUMP ?= aarch64-linux-gnu-objdump
 
@@ -721,7 +724,7 @@ libs: $(OUTDIR)/paslangc core $(LIB_UNITS) | $(BUILDDIR)
 	for u in $(LIB_UNITS); do \
 	  b=$$(basename $$u .paslang); \
 	  echo "lib $(LVL_X64) $$b"; \
-	  $(OUTDIR)/paslangc -cpu $(LVL_X64) -c -Fu $(BUILDDIR) -o $(BUILDDIR)/$(LVL_X64)/$$b $$u; \
+	  $(OUTDIR)/paslangc -cpu $(LVL_X64_CPU) -c -Fu $(BUILDDIR) -o $(BUILDDIR)/$(LVL_X64)/$$b $$u; \
 	done
 
 # The library units for arm64 too (1.0.80): the installed compiler could
@@ -755,7 +758,7 @@ core: $(OUTDIR)/paslangc $(CORE_UNITS) | $(BUILDDIR)
 	for u in $(CORE_UNITS); do \
 	  b=$$(basename $$u .paslang); \
 	  echo "core $(LVL_X64) $$b"; \
-	  $(OUTDIR)/paslangc -cpu $(LVL_X64) -c -Fu $(BUILDDIR) -o $(BUILDDIR)/$(LVL_X64)/$$b $$u; \
+	  $(OUTDIR)/paslangc -cpu $(LVL_X64_CPU) -c -Fu $(BUILDDIR) -o $(BUILDDIR)/$(LVL_X64)/$$b $$u; \
 	done
 
 core-arm64: $(OUTDIR)/paslangc $(CORE_UNITS) | $(BUILDDIR)
@@ -3890,21 +3893,27 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/units/ivuse.out $(BUILDDIR)/ivuse-arm.got; \
 	: a unit built for a processor level, P143: a program links the build its -cpu allows; \
 	$(OUTDIR)/paslangc -cpu base testdata/units/lvlu.paslang; \
-	$(OUTDIR)/paslangc -cpu $(LVL_X64) -c -Fu $(BUILDDIR) -o $(BUILDDIR)/$(LVL_X64)/lvlu testdata/units/lvlu.paslang; \
-	for c in base $(LVL_X64); do \
+	$(OUTDIR)/paslangc -cpu $(LVL_X64_CPU) -c -Fu $(BUILDDIR) -o $(BUILDDIR)/$(LVL_X64)/lvlu testdata/units/lvlu.paslang; \
+	for c in base $(LVL_X64_CPU); do \
 	  $(OUTDIR)/paslangc -cpu $$c -Fu $(BUILDDIR) -o $(BUILDDIR)/lvluse-$$c testdata/units/lvluse.paslang; \
 	  $(BUILDDIR)/lvluse-$$c > $(BUILDDIR)/lvluse-$$c.got; \
 	  diff -u testdata/units/lvluse.out $(BUILDDIR)/lvluse-$$c.got; \
 	done; \
 	objdump -d --no-show-raw-insn $(BUILDDIR)/lvluse-base | awk '/<p_lvlu_check>:/,/ret/' | grep -q pascrc32cbase; \
-	objdump -d --no-show-raw-insn $(BUILDDIR)/lvluse-$(LVL_X64) | awk '/<p_lvlu_check>:/,/ret/' | grep -q pascrc32ccpu; \
-	for c in base $(LVL_X64); do \
+	objdump -d --no-show-raw-insn $(BUILDDIR)/lvluse-$(LVL_X64_CPU) | awk '/<p_lvlu_check>:/,/ret/' | grep -q pascrc32ccpu; \
+	: a program for plain v3 lacks the level and links the base build, P465; \
+	$(OUTDIR)/paslangc -cpu v3 -Fu $(BUILDDIR) -o $(BUILDDIR)/lvluse-v3plain testdata/units/lvluse.paslang; \
+	objdump -d --no-show-raw-insn $(BUILDDIR)/lvluse-v3plain | awk '/<p_lvlu_check>:/,/ret/' | grep -q pascrc32cbase; \
+	: pascipher at the amd64 level seals through AES-NI and PCLMULQDQ, P465; \
+	grep -q 'aesenc %xmm1, %xmm0' $(BUILDDIR)/$(LVL_X64)/pascipher.s; \
+	grep -q 'pclmulqdq' $(BUILDDIR)/$(LVL_X64)/pascipher.s; \
+	for c in base $(LVL_X64_CPU); do \
 	  $(OUTDIR)/paslangc -cpu $$c -o $(BUILDDIR)/sysutils1-$$c testdata/sysutils1.paslang; \
 	  $(BUILDDIR)/sysutils1-$$c > $(BUILDDIR)/sysutils1-$$c.got; \
 	  diff -u testdata/sysutils1.out $(BUILDDIR)/sysutils1-$$c.got; \
 	done; \
 	objdump -d --no-show-raw-insn $(BUILDDIR)/sysutils1-base | awk '/<p_sysutils_uppercase>:/,/ret/' | grep -q pasupperbase; \
-	objdump -d --no-show-raw-insn $(BUILDDIR)/sysutils1-$(LVL_X64) | awk '/<p_sysutils_uppercase>:/,/ret/' | grep -q pasuppercpu; \
+	objdump -d --no-show-raw-insn $(BUILDDIR)/sysutils1-$(LVL_X64_CPU) | awk '/<p_sysutils_uppercase>:/,/ret/' | grep -q pasuppercpu; \
 	$(OUTDIR)/paslangc -target arm64 -cpu base testdata/units/lvlu.paslang; \
 	$(OUTDIR)/paslangc -target arm64 -cpu $(LVL_A64) -c -Fu $(A64DIR) -o '$(A64DIR)/$(LVL_A64)/lvlu' testdata/units/lvlu.paslang; \
 	for c in base max; do \

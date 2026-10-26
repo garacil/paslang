@@ -13,8 +13,10 @@ runs the tests both ways on both machines.
 
 A unit chooses its kernels where it is compiled. So every installed unit
 is built twice (P143): for the base processor, and for one level of each
-machine, x86-64-v3 (`v3`) and ARMv8.2 with crypto (`v8.2+crypto`), in a
-directory of that name beside the base build. A program whose `-cpu` has
+machine, x86-64-v3 with AES-NI and PCLMULQDQ (`v3+aes+pclmul`, in the
+directory `v3`; v3 alone has neither and pascipher's kernels need both,
+P465) and ARMv8.2 with crypto (`v8.2+crypto`, in a directory of that
+name), beside the base build. A program whose `-cpu` has
 every feature of the level links the level's objects; the interfaces are
 the same. A unit's `UpCase` of a string calls `PasUpperCpu` in a program
 compiled `-cpu native` on an AVX2 machine and `PasUpperBase` under `-cpu
