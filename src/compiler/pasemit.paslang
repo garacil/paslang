@@ -371,6 +371,9 @@ type
     FLeftOp: string;        { with FLeftIn on amd64: the left side as an operand, its home or a constant, '' for rcx (P297) }
     FRightK: Int64;         { with FRightOn: the left side in rax or x0 and the right this constant (P297) }
     FRightOn: Boolean;
+    FLeftK: Int64;          { with FLeftKOn: the left side of a shift this constant, the count in rax or x0 (P397) }
+    FLeftKOn: Boolean;
+    FRightMem: string;      { with FLeftIn on amd64: a comparison's right side as a memory operand, the left in rax (P397) }
     FCondE: PExpr;          { the comparison CondBranch hands EmitExpr: EmitCmp branches on it (P390) }
     FCondTarget: string;    { ... to this label }
     FCondTrue: Boolean;     { ... when it holds, else when it fails }
@@ -921,6 +924,7 @@ type
     function ChainArg(E: PExpr): Boolean;
     function RegVarIn(E: PExpr): Boolean;
     function PoolWord(E: PExpr): string;
+    function RegLeaf(E: PExpr; out Op: string; out Ty: LongInt): Boolean;
     procedure ArgInto(E: PExpr; const R: string);
     function CallFree(E: PExpr; Depth: LongInt): Boolean;
     function KeepArg(E: PExpr): Boolean;
@@ -6951,6 +6955,27 @@ begin
               ScaleAddArm(dr, WordReg(E^.L), xr, esz, 'x16', 'x17');
             end;
           end
+          else if (TKind(E^.L^.Typ) = tykPointer) and (not FCheckPtr) and
+            OrdSimple(E^.L, 0) and (((E^.R^.Kind = ekInt) and Fits32(E^.R^.Num) and
+            Fits32(E^.R^.Num * TSize(FTypes[E^.L^.Typ].Elem))) or OrdSimple(E^.R, 1)) then
+          begin
+            { the pointer and the index worked out in the pool, one ADD (P397) }
+            esz := TSize(FTypes[E^.L^.Typ].Elem);
+            dr := 'x0';
+            if into <> '' then
+            begin
+              dr := into;
+              FAddrDone := True;
+            end;
+            EmitOrdTo(E^.L, 0);
+            if E^.R^.Kind = ekInt then
+              AddImmArm(dr, OrdPool(0), E^.R^.Num * esz)
+            else
+            begin
+              EmitOrdTo(E^.R, 1);
+              ScaleAddArm(dr, OrdPool(0), OrdPool(1), esz, 'x16', 'x17');
+            end;
+          end
           else if IsDyn(E^.L^.Typ) or (TKind(E^.L^.Typ) = tykPointer) then
           begin
             esz := TSize(FTypes[E^.L^.Typ].Elem);
@@ -7299,6 +7324,30 @@ begin
               xr := 'rax';
             end;
             Line('  leaq (%' + WordReg(E^.L) + ',%' + xr + ',' + IntToStr(esz) + '), ' + dr);
+          end;
+        end
+        else if (TKind(E^.L^.Typ) = tykPointer) and (not FCheckPtr) and
+          ((TSize(FTypes[E^.L^.Typ].Elem) = 1) or (TSize(FTypes[E^.L^.Typ].Elem) = 2) or
+          (TSize(FTypes[E^.L^.Typ].Elem) = 4) or (TSize(FTypes[E^.L^.Typ].Elem) = 8)) and
+          OrdSimple(E^.L, 0) and (((E^.R^.Kind = ekInt) and Fits32(E^.R^.Num) and
+          Fits32(E^.R^.Num * TSize(FTypes[E^.L^.Typ].Elem))) or OrdSimple(E^.R, 1)) then
+        begin
+          { the pointer and the index worked out in the pool, a field of
+            an object a register holds among them, one LEA (P397) }
+          esz := TSize(FTypes[E^.L^.Typ].Elem);
+          dr := '%rax';
+          if into <> '' then
+          begin
+            dr := '%' + into;
+            FAddrDone := True;
+          end;
+          EmitOrdTo(E^.L, 0);
+          if E^.R^.Kind = ekInt then
+            Line('  leaq ' + IntToStr(E^.R^.Num * esz) + '(%' + OrdPool(0) + '), ' + dr)
+          else
+          begin
+            EmitOrdTo(E^.R, 1);
+            Line('  leaq (%' + OrdPool(0) + ',%' + OrdPool(1) + ',' + IntToStr(esz) + '), ' + dr);
           end;
         end
         else if TKind(E^.L^.Typ) = tykPointer then
@@ -15729,6 +15778,8 @@ var
   sy: TSym;
   k: Int64;
   comm: Boolean;
+  lop: string;
+  lt: LongInt;
 begin
   Result := False;
   if (E^.Bin = boDiv) or (E^.Bin = boMod) then
@@ -15767,9 +15818,11 @@ begin
   end;
   if (E^.R^.Kind = ekInt) or (E^.R^.Kind = ekNil) or
     ((E^.R^.Kind = ekStr) and (Length(E^.R^.Txt) = 1)) or
-    ((E^.R^.Kind = ekVar) and WordVar(E^.R, sy)) then
+    ((E^.R^.Kind = ekVar) and WordVar(E^.R, sy)) or
+    ((FArm or (E^.Bin = boSub)) and (TKind(E^.Typ) <> tykSet) and RegLeaf(E^.R, lop, lt)) then
   begin
-    { L, then R: R's load touches nothing but rax or x0 }
+    { L, then R: R's load touches nothing but rax or x0 (a field of an
+      object a register holds too, P397) }
     if (E^.L^.Kind = ekStr) and (Length(E^.L^.Txt) = 1) then
     begin
       if FArm then
@@ -15840,6 +15893,43 @@ begin
     FLeftIn := True;
     Result := True;
     Exit;
+  end;
+  { P397: a word field of an object a register holds is one load at an
+    offset from that register: + * and or xor take it as their operand
+    where it lies, the other side worked out into rax first, and a
+    comparison as its right side, cmpq 32(%rdi), %rax, the flags of L - R
+    as cmpq %rax, %rcx gives them with L in rcx (Intel SDM vol. 2A, CMP) }
+  if not FArm then
+  begin
+    comm := ((E^.Bin = boAdd) or (E^.Bin = boMul) or (E^.Bin = boAnd) or (E^.Bin = boOr) or
+      (E^.Bin = boXor)) and (TKind(E^.Typ) <> tykSet) and WordInt(E^.Typ) and
+      WordInt(E^.L^.Typ) and WordInt(E^.R^.Typ);
+    if comm and (not EHasCall(E^.R)) and RegLeaf(E^.L, lop, lt) and (TSize(lt) = 8) then
+    begin
+      EmitExpr(E^.R);
+      FLeftOp := lop;
+      FLeftIn := True;
+      Result := True;
+      Exit;
+    end;
+    if comm and (not EHasCall(E^.L)) and RegLeaf(E^.R, lop, lt) and (TSize(lt) = 8) then
+    begin
+      EmitExpr(E^.L);
+      FLeftOp := lop;
+      FLeftIn := True;
+      Result := True;
+      Exit;
+    end;
+    if ((E^.Bin = boEq) or (E^.Bin = boNe) or (E^.Bin = boLt) or (E^.Bin = boLe) or
+      (E^.Bin = boGt) or (E^.Bin = boGe)) and WordInt(E^.L^.Typ) and WordInt(E^.R^.Typ) and
+      (not EHasCall(E^.L)) and RegLeaf(E^.R, lop, lt) and (TSize(lt) = 8) then
+    begin
+      EmitExpr(E^.L);
+      FRightMem := lop;
+      FLeftIn := True;
+      Result := True;
+      Exit;
+    end;
   end;
   Result := KeepLeft(E) or ParkLeft(E);
 end;
@@ -16084,6 +16174,12 @@ begin
   begin
     FRightOn := False;
     Line('  cmpq $' + IntToStr(FRightK) + ', %rax');
+  end
+  else if FRightMem <> '' then
+  begin
+    { L in rax, R where it lies (P397) }
+    Line('  cmpq ' + FRightMem + ', %rax');
+    FRightMem := '';
   end
   else
     Line('  cmpq %rax, %rcx');
@@ -16482,6 +16578,76 @@ begin
     Exit;
   EmitOrdTo(E, 0);
   Result := OrdPool(0);
+end;
+
+{ E is one load at an offset from a register that holds an object
+  (P397): a word field of an object a variable in a register holds, of
+  a record in such an object too, or
+  Pointer(S) of a string field of one, which the parser gives as the
+  field retyped in place (LoadTyp keeps the string): the string's first
+  word, the address of its characters. Op is the load's operand,
+  off(%reg) on amd64, [reg] or [reg, #off] on arm64 where the offset is
+  the unsigned immediate LDR scales by the size (ARM DDI 0487 M.c
+  C6.2.216); Ty the type it loads. The load touches no register but the
+  one it loads, as a word variable's does, and a pool that is empty (a
+  routine with no frame whose registers hold its arguments, a region
+  that lent its pool out) takes it as well. Go loads a field at its
+  offset from the register that holds the pointer and folds the load
+  into the operation that uses it (cmd/compile/internal/ssa/_gen/
+  AMD64.rules: MOVQload with an offset, ADDQload, CMPQload). }
+function TEmitter.RegLeaf(E: PExpr; out Op: string; out Ty: LongInt): Boolean;
+var
+  r: string;
+  asz: LongInt;
+  off: Int64;
+  b: PExpr;
+begin
+  Result := False;
+  Op := '';
+  Ty := TyNone;
+  if (E = nil) or (E^.Kind <> ekField) or (E^.L = nil) or PtrAccess(E) then
+    Exit;
+  Ty := LoadTyp(E);
+  if IsStr(Ty) then
+  begin
+    if IsFat(E^.Typ) or IsBlob(E^.Typ) or (TSize(E^.Typ) <> 8) or not WordInt(E^.Typ) then
+      Exit;
+    Ty := E^.Typ;
+  end
+  else if not WordScalar(E) then
+    Exit;
+  { a field of a record the object holds, at any depth: the offsets add
+    up (FOut.S of a writer) }
+  off := E^.Off;
+  b := E^.L;
+  while (b^.Kind = ekField) and (TKind(b^.Typ) = tykRecord) and (b^.L <> nil) and
+    not PtrAccess(b) do
+  begin
+    off := off + b^.Off;
+    b := b^.L;
+  end;
+  if TKind(b^.Typ) <> tykClass then
+    Exit;
+  r := WordReg(b);
+  if r = '' then
+    Exit;
+  asz := TSize(Ty);
+  if FArm then
+  begin
+    if off = 0 then
+      Op := '[' + r + ']'
+    else if (off > 0) and (off mod asz = 0) and (off div asz <= 4095) then
+      Op := '[' + r + ', #' + IntToStr(off) + ']'
+    else
+      Exit;
+  end
+  else
+  begin
+    if not Fits32(off) then
+      Exit;
+    Op := IntToStr(off) + '(%' + r + ')';
+  end;
+  Result := True;
 end;
 
 { E reads a variable that lives in register R (P328). }
@@ -25907,7 +26073,8 @@ end;
 procedure TEmitter.EmitExprRaw(E: PExpr);
 var
   i, nreg, nuser, ntot, ns: SizeInt;
-  a, b, op, ab, dv: string;
+  a, b, op, ab, dv, rl: string;
+  rt: LongInt;
   av: Int64;
   off, soff: LongInt;
   rx: PExpr;
@@ -25965,6 +26132,17 @@ begin
       Line('  mov x0, ' + OrdPool(0))
     else
       Line('  movq %' + OrdPool(0) + ', %rax');
+    Exit;
+  end;
+  { a word field of an object a register holds: one load from that
+    register, with the pool empty too (P397) }
+  if (E^.Kind = ekField) and RegLeaf(E, rl, rt) then
+  begin
+    FSkipCanon := False;
+    if FArm then
+      WordLoad(rl, rt, 'x0')
+    else
+      WordLoad(rl, rt, 'rax');
     Exit;
   end;
   if FArm then
@@ -26748,7 +26926,14 @@ else if (E^.Name = 'rt_high') and LenPlace(E^.Args[0]) then
           end
           else
           begin
-            if not LeftFirst(E) then
+            { a constant shifted by a count: the count first, no push (P397) }
+            if ((E^.Bin = boShl) or (E^.Bin = boShr)) and (E^.L^.Kind = ekInt) then
+            begin
+              EmitExpr(E^.R);
+              FLeftKOn := True;
+              FLeftK := E^.L^.Num;
+            end
+            else if not LeftFirst(E) then
             begin
               if (E^.L^.Kind = ekStr) and (Length(E^.L^.Txt) = 1) then
                 Imm('x0', Ord(E^.L^.Txt[1]))
@@ -26868,13 +27053,25 @@ else if (E^.Name = 'rt_high') and LenPlace(E^.Args[0]) then
               boShl:
                 begin
                   Line('  mov x1, x0');
-                  Ppop('x0');
+                  if FLeftKOn then
+                  begin
+                    FLeftKOn := False;
+                    Imm('x0', FLeftK);
+                  end
+                  else
+                    Ppop('x0');
                   Line('  lsl x0, x0, x1');
                 end;
               boShr:
                 begin
                   Line('  mov x1, x0');
-                  Ppop('x0');
+                  if FLeftKOn then
+                  begin
+                    FLeftKOn := False;
+                    Imm('x0', FLeftK);
+                  end
+                  else
+                    Ppop('x0');
                   { A clean Int8, Int16 or Int32 shifts by its sign (P99). }
                   if (E^.Typ = TyInt8) or (E^.Typ = TyInt16) or (E^.Typ = TyInt32) then
                     Line('  asr x0, x0, x1')
@@ -27808,7 +28005,15 @@ else if (E^.Name = 'rt_high') and LenPlace(E^.Args[0]) then
         end
         else
         begin
-          if not LeftFirst(E) then
+          { a constant shifted by a count: the count first, the constant
+            loaded after it, no push (P397) }
+          if ((E^.Bin = boShl) or (E^.Bin = boShr)) and (E^.L^.Kind = ekInt) then
+          begin
+            EmitExpr(E^.R);
+            FLeftKOn := True;
+            FLeftK := E^.L^.Num;
+          end
+          else if not LeftFirst(E) then
           begin
             if (E^.L^.Kind = ekStr) and (Length(E^.L^.Txt) = 1) then
               Line('  movq $' + IntToStr(Ord(E^.L^.Txt[1])) + ', %rax')
@@ -27945,13 +28150,25 @@ else if (E^.Name = 'rt_high') and LenPlace(E^.Args[0]) then
             boShl:
               begin
                 Line('  movq %rax, %rcx');
-                Line('  popq %rax');
+                if FLeftKOn then
+                begin
+                  FLeftKOn := False;
+                  LoadImmR('rax', FLeftK);
+                end
+                else
+                  Line('  popq %rax');
                 Line('  shlq %cl, %rax');
               end;
             boShr:
               begin
                 Line('  movq %rax, %rcx');
-                Line('  popq %rax');
+                if FLeftKOn then
+                begin
+                  FLeftKOn := False;
+                  LoadImmR('rax', FLeftK);
+                end
+                else
+                  Line('  popq %rax');
                 { A clean Int8, Int16 or Int32 shifts by its sign (P99). }
                 if (E^.Typ = TyInt8) or (E^.Typ = TyInt16) or (E^.Typ = TyInt32) then
                   Line('  sarq %cl, %rax')

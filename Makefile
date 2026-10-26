@@ -576,6 +576,9 @@ GOLDEN_A64 += jsontokerr
 # P396: a routine's straight code keeps its variables in registers.
 GOLDEN += straight
 GOLDEN_A64 += straight
+# P397: a field of an object a register holds is a leaf of an expression.
+GOLDEN += regleaf
+GOLDEN_A64 += regleaf
 # P463: ToLower of a string with no capital is the string itself.
 GOLDEN += tolowershare
 GOLDEN_A64 += tolowershare
@@ -3002,12 +3005,27 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	python3 -I scripts/check_straight.py $(BUILDDIR)/straight0.s; \
 	python3 -I scripts/check_straight.py $(BUILDDIR)/straight-base.s; \
 	echo ok straight-asm; \
+	: a word field of an object a register holds is one load where it lies, an operand of add and cmp, P397; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/regleaf0 testdata/regleaf.paslang; \
+	$(BUILDDIR)/regleaf0 > $(BUILDDIR)/regleaf0.got; \
+	diff -u testdata/regleaf.out $(BUILDDIR)/regleaf0.got; \
+	$(OUTDIR)/paslangc -cpu base -o $(BUILDDIR)/regleaf-base testdata/regleaf.paslang; \
+	$(BUILDDIR)/regleaf-base > $(BUILDDIR)/regleaf-base.got; \
+	diff -u testdata/regleaf.out $(BUILDDIR)/regleaf-base.got; \
+	PASLANG_GCSTRESS=1 PASLANG_GCVERIFY=1 $(BUILDDIR)/regleaf0 > $(BUILDDIR)/regleaf0-gc.got; \
+	diff -u testdata/regleaf.out $(BUILDDIR)/regleaf0-gc.got; \
+	python3 -I scripts/check_regleaf.py $(BUILDDIR)/regleaf.s; \
+	python3 -I scripts/check_regleaf.py $(BUILDDIR)/regleaf0.s; \
+	python3 -I scripts/check_regleaf.py $(BUILDDIR)/regleaf-base.s; \
+	echo ok regleaf-asm; \
 	: a routine with nested ones zeroes only the locals a read may reach first, P358; \
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/nestzero0 testdata/nestzero.paslang; \
 	$(BUILDDIR)/nestzero0 > $(BUILDDIR)/nestzero0.got; \
 	diff -u testdata/nestzero.out $(BUILDDIR)/nestzero0.got; \
 	python3 -I scripts/check_nestzero.py $(BUILDDIR)/nestzero0.s --expect=p_early:2,p_late:0,p_branch:2,p_writeback:1; \
-	echo ok nestzero-asm; \
+	echo ok nestzero-asm
+	@set -e; \
+	: the asm checks go on in a recipe of their own, each under 64 KiB, P397; \
 	: the left side of a binary operation waits in r11 while a right side that calls nothing is worked out, P360; \
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/keepleft0 testdata/keepleft.paslang; \
 	$(BUILDDIR)/keepleft0 > $(BUILDDIR)/keepleft0.got; \
@@ -4672,6 +4690,16 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	python3 -I scripts/check_straight.py $(BUILDDIR)/straight-arm.s --arm; \
 	python3 -I scripts/check_straight.py $(BUILDDIR)/straight0-arm.s --arm; \
 	echo ok straight-arm-asm; \
+	: P397 on arm64: a word field of an object a register holds is one ldr at an offset from that register; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/regleaf0-arm testdata/regleaf.paslang; \
+	timeout 300 $(QEMU_A64) $(BUILDDIR)/regleaf0-arm > $(BUILDDIR)/regleaf0-arm.got; \
+	diff -u testdata/regleaf.out $(BUILDDIR)/regleaf0-arm.got; \
+	$(OUTDIR)/paslangc -target arm64 -cpu base -Fu $(A64DIR) -o $(BUILDDIR)/regleaf-base-arm testdata/regleaf.paslang; \
+	timeout 300 $(QEMU_A64) $(BUILDDIR)/regleaf-base-arm > $(BUILDDIR)/regleaf-base-arm.got; \
+	diff -u testdata/regleaf.out $(BUILDDIR)/regleaf-base-arm.got; \
+	python3 -I scripts/check_regleaf.py $(BUILDDIR)/regleaf-arm.s --arm; \
+	python3 -I scripts/check_regleaf.py $(BUILDDIR)/regleaf0-arm.s --arm; \
+	echo ok regleaf-arm-asm; \
 	: P358 on arm64: the locals a read may reach first, zeroed alone; \
 	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/nestzero0-arm testdata/nestzero.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/nestzero0-arm > $(BUILDDIR)/nestzero0-arm.got; \

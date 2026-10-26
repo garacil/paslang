@@ -2417,7 +2417,14 @@ halts counts as less likely to run, as Go's `likelyadjust` ranks a
 branch. A `Move` is no call there: its copy keeps every register a
 loop or a run keeps a variable in. A local that every path writes
 before anything reads it, a `try`'s handler and its `finally` part
-among the readers, is not zeroed at the routine's start.
+among the readers, is not zeroed at the routine's start. A word field
+of an object a register holds, of a record in such an object too, and
+`Pointer(S)` of a string field of one are one load at an offset from
+that register (1.1.287, P397): on amd64 `+`, `*`, `and`, `or` and `xor`
+take it as their operand where it lies and a comparison as its right
+side, and nothing is pushed to keep the other side while it is
+loaded; a constant shifted by a count, `Int64(1) shl n`, is loaded
+after the count.
 A `for` of a constant count of four passes or fewer with a small body
 that neither changes its counter nor takes its address is written out
 once per pass with the pass's value in the counter's place, then the
