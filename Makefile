@@ -570,6 +570,9 @@ GOLDEN_A64 += bytesetin
 # P394: a bit count of a value an if proved not zero, no sentinel.
 GOLDEN += bitnz
 GOLDEN_A64 += bitnz
+# P395: the token reader's errors in Go's Decoder's words.
+GOLDEN += jsontokerr
+GOLDEN_A64 += jsontokerr
 # P403: SQLite named in a uses clause, uses sqlite since P418, a database in memory.
 GOLDEN += sqluses
 GOLDEN_A64 += sqluses

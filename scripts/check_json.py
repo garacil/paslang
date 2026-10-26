@@ -13,7 +13,8 @@ jsoncheck.paslang) writes in modes p, i and c what Go writes
 8785's form, or the error's offset, pointer and reason; mode P parses
 it with the index and a byte at a time and must give the same; mode V
 checks it with JsonValid, which must take and refuse what the parse
-does (P211).
+does (P211); mode R reads it a token at a time with the token reader,
+which must as well (P395).
 
 Python's json, made strict (no NaN, no name twice, no lone surrogate),
 must take and refuse the same documents, but for a noncharacter.
@@ -247,6 +248,13 @@ def main():
             bad += 1
             if bad < 20:
                 print('the parse and the decode differ on %r: %s' % (d[:80], l))
+    # the token reader, a token at a time, takes what the parse takes (P395)
+    same = run(pas, 'R', docs)
+    for d, l in zip(docs, same):
+        if l != 'same':
+            bad += 1
+            if bad < 30:
+                print('the parse and the token reader differ on %r: %s' % (d[:80], l))
     # JsonValid, no document made, takes what the parse takes (P211)
     same = run(pas, 'V', docs)
     for d, l in zip(docs, same):

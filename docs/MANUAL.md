@@ -6511,7 +6511,10 @@ it. A value is given as soon as its last byte comes, so a request and its
 answer go back and forth over one connection. The parser reads each
 value where it lies, and an error carries its place in the stream: its
 `Offset` from the stream's first byte, its line and column, and the
-pointer inside the value. In NDJSON an error leaves the reader at the
+pointer inside the value; among tokens, in Go's Decoder's words, at
+its offsets (`[tru]` is invalid character ']' in literal true
+(expecting 'e'), `[1,2,]` the comma at the start of a value, 1.1.284).
+In NDJSON an error leaves the reader at the
 next line, and in a sequence at the next RS, so one bad line costs that
 line; in a plain stream, or among tokens, the error stays and every read
 raises it again, as Go's `Decoder` keeps its first. A typed read whose

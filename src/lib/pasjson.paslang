@@ -413,6 +413,7 @@ type
     function Closes(G: Integer; var Lv, At: Integer): Boolean;
     function NextValue(Dl: Integer; AsDoc: Boolean; out S, E, Past: Integer): Boolean;
     function ParseAt(S, E: Integer): json;
+    function ScalarAt(S: Integer; var E, Past: Integer): json;
     procedure Shrink;
     function ReadDoc(out J: json): Boolean;
     function Intern(P: PByte; N: Integer): string;
@@ -12565,6 +12566,38 @@ begin
   Result := JsonOfN(r);
 end;
 
+{ The scalar FP[FStart + S..FStart + E) parsed where it lies, wrong in
+  the words of Go's Decoder (P395): one cut short, before a byte the
+  stream has, parsed again with that byte, which says what came where
+  it wanted more (encoding/json/internal/jsonwire/decode.go:
+  ConsumeLiteral's in literal true (expecting 'e'), ConsumeNumber's in
+  number (expecting digit)); one with more after it ended where its
+  value ends, Past there, so that the next token wants its delimiter
+  (after array element, as Go reads a 0 and then a 1). }
+function TJsonReader.ScalarAt(S: Integer; var E, Past: Integer): json;
+var
+  er: TJErr;
+  r: PJNode;
+begin
+  r := ParseMem(@FP[FStart + S], E - S, FPOpts, er, FIdx);
+  if r <> nil then
+  begin
+    Result := JsonOfN(r);
+    Exit;
+  end;
+  if (Pos('unexpected EOF', er.Reason) > 0) and (E < FEnd - FStart) then
+    Result := ParseAt(S, E + 1)
+  else if (er.Offset > 0) and (er.Offset < E - S) and
+    (Pos('after top-level value', er.Reason) > 0) then
+  begin
+    E := S + er.Offset;
+    Past := E;
+    Result := ParseAt(S, E);
+  end
+  else
+    Result := ParseAt(S, E);
+end;
+
 { A value much longer than the buffer kept made it grow: back to its
   size, a new block, so the old one goes. }
 procedure TJsonReader.Shrink;
@@ -12713,20 +12746,34 @@ end;
 
 procedure PasJsonReadFail(R: TJsonReader; E: EJsonError);
 var
-  l, c: Integer;
+  l, c, off: Integer;
   x: EJsonError;
+  er: TJErr;
 begin
-  if E.Line <= 0 then
-    x := EJsonError.Create(E.Kind, R.FLastAt, 0, 0, E.Path, E.Path, E.Reason)
-  else
+  off := R.FLastAt;
+  l := 0;
+  c := 0;
+  if E.Line > 0 then
   begin
     l := R.FLastLine + E.Line - 1;
     if E.Line > 1 then
       c := E.Column
     else
       c := R.FLastAt - R.FLastLineAt + E.Column;
-    x := EJsonError.Create(E.Kind, R.FLastAt + E.Offset, l, c, E.Path, E.Path, E.Reason);
+    off := R.FLastAt + E.Offset;
   end;
+  if E.Kind = jeDuplicate then
+  begin
+    { a name twice, named in the message within its object as the parse
+      names it (ParseErrorAt) and Go's Decoder does (P395) }
+    er.Kind := 2;
+    er.Offset := off;
+    er.Path := E.Path;
+    er.Reason := E.Reason;
+    x := ParseErrorAt(er, off, l, c);
+  end
+  else
+    x := EJsonError.Create(E.Kind, off, l, c, E.Path, E.Path, E.Reason);
   if E.Kind in [jeSyntax, jeEncoding, jeDuplicate, jeDepth, jeTooLarge] then
     R.Keep(x, R.FDepth = 0);
   raise x;
@@ -12895,7 +12942,7 @@ end;
   -1 at the stream's end. Its errors as Go's checkDelim words them. }
 function TJsonReader.TokenAt(Dl: Integer; out K: Integer): Integer;
 var
-  c, d: Integer;
+  c, d, kd: Integer;
   w: string;
 begin
   K := 0;
@@ -12923,6 +12970,7 @@ begin
       w := 'after array element (expecting '','' or '']'')';
     FailAt(FBase + FStart + K, jeSyntax, 'invalid character ' + QuoteByte(c) + ' ' + w);
   end;
+  kd := K;
   K := K + 1;
   c := ByteAt(K, Dl);
   while IsJsonSpace(c) do
@@ -12931,8 +12979,20 @@ begin
     c := ByteAt(K, Dl);
   end;
   Result := c;
+  { a closing bracket after a delimiter, as Go's checkDelim words it from
+    the end of the token before it (jsontext/decode.go; P395): a comma
+    is the byte in the wrong, after a colon a brace finds the value
+    missing and a bracket closes what is no array }
   if (c = 125) or (c = 93) then
-    FailAt(FBase + FStart + K, jeSyntax, 'invalid character ' + QuoteByte(c) + ' at start of value');
+  begin
+    if d = 44 then
+      FailAt(FBase + FStart + kd, jeSyntax, 'invalid character '','' at start of value')
+    else if c = 125 then
+      FailAt(FBase + FStart + K, jeSyntax, 'missing value after object name')
+    else
+      FailAt(FBase + FStart + K, jeSyntax,
+        'invalid character '']'' after object value (expecting '','' or ''}'')');
+  end;
 end;
 
 
@@ -13398,7 +13458,7 @@ begin
       FStart := FStart + k;
       if not NextValue(DueAt, False, s, e, past) then
         FailAt(at, jeSyntax, 'unexpected EOF');
-      FTok := ParseAt(s, e);
+      FTok := ScalarAt(s, e, past);
       nd := NodeOfJ(FTok);
       if (FDepth > 0) and FLv[FDepth].Obj and not Odd(FLv[FDepth].Count) then
       begin
