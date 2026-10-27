@@ -6458,6 +6458,12 @@ document of a list in brackets, an array of const as a call builds it
 a `Currency`, `nil` (null) and a `json` go in as they are, and any other
 value with a JSON form (a record, an array, an enumeration, a set, an
 object) as `JsonOf` writes it; a member's name is a string or a `Char`.
+A list in brackets of strings or reals is no set, and has no type until
+something takes it: `JsonEncode(['a', 'b'])` and `JsonOf(['a', 'b'])` are
+refused when the program is compiled (1.1.297, P474; they used to stop at
+run time, writing the list as a set), and a variable of an array type, or
+`JsonEncode(JsonArray(['a', 'b']))`, is the way. A list of `Char`, `Byte` or
+enumeration values is a set and is written as one.
 `TJsonBuilder` writes one value by value:
 
 ```pascal

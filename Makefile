@@ -591,6 +591,9 @@ GOLDEN_A64 += sliceat
 # P399: Move's three arguments go straight to their registers.
 GOLDEN += moveregs
 GOLDEN_A64 += moveregs
+# P474: JsonEncode still takes a set, a typed variable and JsonArray of a list.
+GOLDEN += jsonlistok
+GOLDEN_A64 += jsonlistok
 # P463: ToLower of a string with no capital is the string itself.
 GOLDEN += tolowershare
 GOLDEN_A64 += tolowershare
@@ -2061,6 +2064,16 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  grep -qF "$$w" $(BUILDDIR)/valplace_$$n.err || { cat $(BUILDDIR)/valplace_$$n.err; exit 1; }; \
 	done; \
 	echo ok valplace; \
+	echo "==== JsonEncode and JsonOf refuse a list in brackets that is no set (P474) ===="; \
+	for f in 'strs:it with JsonArray([...]) at 5:11' 'vars:it with JsonArray([...]) at 9:11' 'reals:it with JsonArray([...]) at 5:11' \
+	  'bigint:it with JsonArray([...]) at 5:11' 'jsonof:it with JsonArray([...]) at 7:8'; do \
+	  n=$${f%%:*}; w=$${f#*:}; \
+	  if $(OUTDIR)/paslangc -o $(BUILDDIR)/jsonlist_$$n testdata/jsonlist/$$n.paslang >$(BUILDDIR)/jsonlist_$$n.err 2>&1; then \
+	    echo "$$n should fail"; exit 1; \
+	  fi; \
+	  grep -qF "$$w" $(BUILDDIR)/jsonlist_$$n.err || { cat $(BUILDDIR)/jsonlist_$$n.err; exit 1; }; \
+	done; \
+	echo ok jsonlist; \
 	echo "==== variables with a value and absolute rejects (P144) ===="; \
 	for f in 'absnone:unknown variable nothing at 3:21' 'abstwo:absolute names one variable at a time at 4:15' \
 	  'abstype:b: Byte absolute x: Integer; absolute is another name for a variable of its own type' \
