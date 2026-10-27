@@ -11,17 +11,20 @@ slow TcpConnectTo, after the fill's TcpConnectToMs) is pointed at
 descriptor 100, a UDP socket the fixture keeps writable: the routine
 wakes while its connection is still on its way, SO_ERROR says 0, and
 getpeername must answer ENOTCONN so it waits again (Go issues 14548 and
-19289). Last, with CONNWAIT_DNS=1, the sendto of the name's query to
-port 53 becomes getpid: nothing leaves the machine, no answer comes,
-and TcpConnectToMs must end at its 600 ms deadline with the resolution
-(net/dial.go: dialCtx's deadline bounds resolveAddrList too); the
-nameserver is the first of /etc/resolv.conf, so that file must name one.
+19289). Last, with CONNWAIT_DNS=1, the resolver's socket is connected
+to port 53 of the nameserver, which is read in the connect's sockaddr,
+and the query's sendto on it becomes getpid (P224: a socket connected
+to the nameserver, as Go's exchange dials it): nothing leaves the
+machine, no answer comes, and TcpConnectToMs must end at its 600 ms
+deadline with the resolution (net/dial.go: dialCtx's deadline bounds
+resolveAddrList too); the nameserver is the first of /etc/resolv.conf,
+so that file must name one.
 The fixture exits 0 only when every connection had a peer at once and
 carried its bytes and the name gave up in time.
 
-Every stop is in PasConnect or UdpSendTo, which only connections and
-sends run: a breakpoint on rt_syscall or rt_waitio stops every routine's
-every call, and under QEMU's stub that is not a tool (P220). A line of
+Every stop is in PasConnect or AskWithin, which only connections and
+the resolver run: a breakpoint on rt_syscall or rt_waitio stops every
+routine's every call, and under QEMU's stub that is not a tool (P220). A line of
 the source is found by its text, as inject_debug_growth.py finds one;
 the call it makes, by disassembling forward from the line. Breakpoints
 are set outside Breakpoint.stop:
@@ -33,20 +36,21 @@ import gdb
 
 arm = gdb.selected_inferior().architecture().name() == "aarch64"
 if arm:
-    number, answer, first, sockaddr = "x8", "x0", "x0", "x4"
+    number, answer, first, connaddr = "x8", "x0", "x0", "x1"
     getpid = 172
 else:
-    number, answer, first, sockaddr = "rax", "rax", "rdi", "r8"
+    number, answer, first, connaddr = "rax", "rax", "rdi", "rsi"
     getpid = 39
 
 
-def line_of(path, header, statement):
-    """The line of statement in the body that follows header."""
+def line_of(path, header, statement, heads=2):
+    """The line of statement in the body that follows header, which the
+    unit declares and defines (heads 2) or defines alone (1)."""
     lines = Path(path).read_text().splitlines()
     start = [i for i, text in enumerate(lines) if text == header]
-    if len(start) != 2:
-        raise gdb.GdbError(f"{header} is not declared and defined once in {path}")
-    for i in range(start[1], len(lines)):
+    if len(start) != heads:
+        raise gdb.GdbError(f"{header} is not written {heads} times in {path}")
+    for i in range(start[-1], len(lines)):
         if lines[i].strip() == statement:
             return f"{path}:{i + 1}"
         if lines[i] == "end;":
@@ -84,9 +88,11 @@ connect_line = line_of(routines, connects, "Result := Syscall(nconnect, Fd, Sa, 
 timed_line = line_of(routines, connects, "w := WaitMs(Fd, 4, left div 1000000 + 1);")
 wait_line = line_of(routines, connects, "w := WaitIo(Fd, 4);")
 peer_line = line_of(routines, connects, "if Syscall(ngetpeername, Fd, @peer, @plen) = 0 then")
-send_line = line_of("src/lib/pasnet.paslang",
-                    "function UdpSendTo(Fd: Integer; const Host: string; Port: Integer; const Data: string): Integer;",
-                    "Result := Syscall(SnSendto, Fd, Pointer(Data), n, 0, @sa, size);")
+asks = "function AskWithin(const Host, Server: string; Port, Deadline: Integer): string;"
+ask_connect_line = line_of("src/lib/pasnet.paslang", asks,
+                           "if (not FillSockaddr(Server, Port, sa, size)) or (Syscall(SnConnect, fd, @sa, size) < 0) then", 1)
+send_line = line_of("src/lib/pasnet.paslang", asks,
+                    "n := Syscall(SnSendto, fd, Pointer(q), Length(q), 0, 0, 0);", 1)
 
 # The first connect: main's TcpConnectTo, with no other connect running.
 point = gdb.Breakpoint(connect_line, internal=True)
@@ -117,15 +123,19 @@ stop_at(f"*{back}", "getpeername's answer")
 if value(answer) != -107:
     raise gdb.GdbError(f"getpeername after the spurious wake answered {value(answer)}, not ENOTCONN")
 
-# The fixture sends no datagram of its own: the next sendto is the
-# resolver's query. Network byte order: port 53 is bytes 0 and 53 at
-# offset 2 of the sockaddr.
-stop_at(send_line, "the name's query (does /etc/resolv.conf name an IPv4 nameserver?)")
+# The resolver connects its socket to the nameserver (P224), which sends
+# nothing: network byte order, port 53 is bytes 0 and 53 at offset 2 of
+# the connect's sockaddr. The fixture sends no datagram of its own: the
+# next sendto is the resolver's query on that socket.
+stop_at(ask_connect_line, "the resolver's connect (does /etc/resolv.conf name an IPv4 nameserver?)")
+call, _ = call_ahead("rt_syscall")
+stop_at(f"*{call}", "the connect's call of rt_syscall")
+port = gdb.selected_inferior().read_memory(value(connaddr) + 2, 2).tobytes()
+if port != b"\x00\x35":
+    raise gdb.GdbError(f"the resolver connected to port {int.from_bytes(port, 'big')}, not 53")
+stop_at(send_line, "the name's query")
 call, _ = call_ahead("rt_syscall")
 stop_at(f"*{call}", "the query's call of rt_syscall")
-port = gdb.selected_inferior().read_memory(value(sockaddr) + 2, 2).tobytes()
-if port != b"\x00\x35":
-    raise gdb.GdbError(f"the first datagram went to port {int.from_bytes(port, 'big')}, not 53")
 gdb.execute(f"set ${number} = {getpid}")
 gdb.write("the name's query became getpid\n")
 

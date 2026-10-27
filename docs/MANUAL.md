@@ -8251,7 +8251,17 @@ gives back when nothing holds it.
 `fe80::1`, `::ffff:1.2.3.4`, with or without brackets) or a name,
 which `Resolve(name)` turns into a dotted quad by /etc/hosts and then
 the first nameserver of /etc/resolv.conf over UDP (`localhost` is
-`127.0.0.1`; `''` when nothing knows it). `HostToV4(s, ip)`,
+`127.0.0.1`; `''` when nothing knows it). It asks as Go's resolver does
+(1.1.299): each question takes an id from the kernel's randomness, goes
+over a socket connected to the nameserver, and every datagram that is
+not the response to it (its id, its question's type, class and name,
+the letters without regard to case) is ignored until the try's two
+seconds run out; a response, with an answer or with none, ends it. A
+host that is no domain name (letters, digits, hyphens and underscores
+in labels of 1 to 63, not digits and dots alone) is no host and goes to
+no nameserver, as in Go. `ResolveVia(name, server, port, ms)` asks the
+nameserver it names,
+within `ms` milliseconds. `HostToV4(s, ip)`,
 `HostToV6(s, a)` (16 bytes), `V4ToStr`, `V6ToStr` (the longest run of
 zeros as `::`, a mapped address as `::ffff:a.b.c.d`) and `IsV6Text`
 read and write them.

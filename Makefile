@@ -412,6 +412,9 @@ GOLDEN_A64 += recops
 # P381: the rest of the operators, top level and a record's.
 GOLDEN += opunary recops2
 GOLDEN_A64 += opunary recops2
+# P224: Resolve asks as Go's resolver does.
+GOLDEN += resolveask
+GOLDEN_A64 += resolveask
 # P207: building and transforming json.
 GOLDEN += jsonbuild jsonmod
 GOLDEN_A64 += jsonbuild jsonmod
