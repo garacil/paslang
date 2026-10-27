@@ -591,6 +591,9 @@ GOLDEN_A64 += sliceat
 # P399: Move's three arguments go straight to their registers.
 GOLDEN += moveregs
 GOLDEN_A64 += moveregs
+# P400: a statement whose expression calls keeps the rest of it in the region.
+GOLDEN += splitcall
+GOLDEN_A64 += splitcall
 # P474: JsonEncode still takes a set, a typed variable and JsonArray of a list.
 GOLDEN += jsonlistok
 GOLDEN_A64 += jsonlistok
@@ -3125,6 +3128,21 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	python3 -I scripts/check_moveregs.py $(BUILDDIR)/moveregs0.s; \
 	python3 -I scripts/check_moveregs.py $(BUILDDIR)/moveregs-base.s; \
 	echo ok moveregs-asm; \
+	: a call in a statement goes first into a hidden variable and a call alone takes and leaves registers, P400; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/splitcall0 testdata/splitcall.paslang; \
+	$(BUILDDIR)/splitcall0 > $(BUILDDIR)/splitcall0.got; \
+	diff -u testdata/splitcall.out $(BUILDDIR)/splitcall0.got; \
+	$(OUTDIR)/paslangc -cpu base -inline 0 -o $(BUILDDIR)/splitcall-base0 testdata/splitcall.paslang; \
+	$(BUILDDIR)/splitcall-base0 > $(BUILDDIR)/splitcall-base0.got; \
+	diff -u testdata/splitcall.out $(BUILDDIR)/splitcall-base0.got; \
+	$(OUTDIR)/paslangc -cpu base -o $(BUILDDIR)/splitcall-base testdata/splitcall.paslang; \
+	$(BUILDDIR)/splitcall-base > $(BUILDDIR)/splitcall-base.got; \
+	diff -u testdata/splitcall.out $(BUILDDIR)/splitcall-base.got; \
+	PASLANG_GCSTRESS=1 PASLANG_GCVERIFY=1 $(BUILDDIR)/splitcall0 > $(BUILDDIR)/splitcall0-gc.got; \
+	diff -u testdata/splitcall.out $(BUILDDIR)/splitcall0-gc.got; \
+	python3 -I scripts/check_splitcall.py $(BUILDDIR)/splitcall0.s; \
+	python3 -I scripts/check_splitcall.py $(BUILDDIR)/splitcall-base0.s; \
+	echo ok splitcall-asm; \
 	: a routine with nested ones zeroes only the locals a read may reach first, P358; \
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/nestzero0 testdata/nestzero.paslang; \
 	$(BUILDDIR)/nestzero0 > $(BUILDDIR)/nestzero0.got; \
@@ -4420,7 +4438,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'paslang: unlock of an unlocked mutex' $(BUILDDIR)/unlockfree.err; \
 	echo ok unlockfree; \
 	echo "==== fatal ===="; \
-	for t in divzero nilptr deep oom oomlimit closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg leafnil bmaskwide bmodneg bmaskone bforpast bvarctr bnestctr bsumstat bsumdyn bsumneg bkeepfirst bkeepmoved bkeepstat bkeepshrunk brunlen brunloc divfirst idxline nilline bflatidx bflatpush nilblk nilbig nilzero nildest nilmeth elemidx jsonbusy jsonrbusy jsonwbusy; do \
+	for t in divzero nilptr deep oom oomlimit closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg leafnil bmaskwide bmodneg bmaskone bforpast bvarctr bnestctr bsumstat bsumdyn bsumneg bkeepfirst bkeepmoved bkeepstat bkeepshrunk brunlen brunloc divfirst idxline nilline bflatidx bflatpush nilblk nilbig nilzero nildest nilmeth elemidx jsonbusy jsonrbusy jsonwbusy divcall; do \
 	  $(OUTDIR)/paslangc -o $(BUILDDIR)/fatal_$$t testdata/fatal/$$t.paslang; \
 	  set +e; \
 	  if [ $$t = oomlimit ]; then \
@@ -4434,6 +4452,13 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	done; \
 	grep -q 'paslang: integer divide by zero at line 11' $(BUILDDIR)/fatal_divzero.err; \
 	grep -q 'paslang: integer divide by zero at line 15' $(BUILDDIR)/fatal_divfirst.err; \
+	: P400: a division that stops the program comes before the call after it, put in place or not; \
+	grep -q 'paslang: integer divide by zero at line 17' $(BUILDDIR)/fatal_divcall.err; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/fatal_divcall0 testdata/fatal/divcall.paslang; \
+	set +e; $(BUILDDIR)/fatal_divcall0 > $(BUILDDIR)/fatal_divcall0.got 2> $(BUILDDIR)/fatal_divcall0.err; rc=$$?; set -e; \
+	test $$rc -eq 1; \
+	diff -u testdata/fatal/expected.out $(BUILDDIR)/fatal_divcall0.got; \
+	grep -q 'paslang: integer divide by zero at line 17' $(BUILDDIR)/fatal_divcall0.err; \
 	grep -q 'paslang: index 12 out of range \[0..9\] at line 15' $(BUILDDIR)/fatal_idxline.err; \
 	grep -q 'paslang: nil pointer dereference at line 20' $(BUILDDIR)/fatal_nilline.err; \
 	: P370: a block read or written through nil stops at its line, in line and past rt_memcpy and rt_fill; \
@@ -4847,6 +4872,17 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	python3 -I scripts/check_moveregs.py $(BUILDDIR)/moveregs-arm.s --arm; \
 	python3 -I scripts/check_moveregs.py $(BUILDDIR)/moveregs0-arm.s --arm; \
 	echo ok moveregs-arm-asm; \
+	: P400 on arm64: a call alone takes its arguments from x19 to x26 and leaves its value in one; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/splitcall0-arm testdata/splitcall.paslang; \
+	timeout 300 $(QEMU_A64) $(BUILDDIR)/splitcall0-arm > $(BUILDDIR)/splitcall0-arm.got; \
+	diff -u testdata/splitcall.out $(BUILDDIR)/splitcall0-arm.got; \
+	$(OUTDIR)/paslangc -target arm64 -cpu base -Fu $(A64DIR) -o $(BUILDDIR)/splitcall-base-arm testdata/splitcall.paslang; \
+	timeout 300 $(QEMU_A64) $(BUILDDIR)/splitcall-base-arm > $(BUILDDIR)/splitcall-base-arm.got; \
+	diff -u testdata/splitcall.out $(BUILDDIR)/splitcall-base-arm.got; \
+	PASLANG_GCSTRESS=1 PASLANG_GCVERIFY=1 timeout 600 $(QEMU_A64) $(BUILDDIR)/splitcall0-arm > $(BUILDDIR)/splitcall0-arm-gc.got; \
+	diff -u testdata/splitcall.out $(BUILDDIR)/splitcall0-arm-gc.got; \
+	python3 -I scripts/check_splitcall.py $(BUILDDIR)/splitcall0-arm.s --arm; \
+	echo ok splitcall-arm-asm; \
 	: P358 on arm64: the locals a read may reach first, zeroed alone; \
 	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/nestzero0-arm testdata/nestzero.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/nestzero0-arm > $(BUILDDIR)/nestzero0-arm.got; \
@@ -5433,7 +5469,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	grep -q 'paslang: unlock of an unlocked mutex' $(BUILDDIR)/unlockfree-arm.err; \
 	echo ok unlockfree-arm; \
 	echo "==== fatal arm64 ===="; \
-	for t in divzero nilptr deep oom closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg leafnil bmaskwide bmodneg bmaskone bforpast bvarctr bnestctr bsumstat bsumdyn bsumneg bkeepfirst bkeepmoved bkeepstat bkeepshrunk brunlen brunloc divfirst idxline nilline bflatidx bflatpush nilblk nilbig nilzero nildest nilmeth elemidx jsonbusy jsonrbusy jsonwbusy; do \
+	for t in divzero nilptr deep oom closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg leafnil bmaskwide bmodneg bmaskone bforpast bvarctr bnestctr bsumstat bsumdyn bsumneg bkeepfirst bkeepmoved bkeepstat bkeepshrunk brunlen brunloc divfirst idxline nilline bflatidx bflatpush nilblk nilbig nilzero nildest nilmeth elemidx jsonbusy jsonrbusy jsonwbusy divcall; do \
 	  $(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/fatal_$$t-arm testdata/fatal/$$t.paslang; \
 	  set +e; timeout 60 $(QEMU_A64) $(BUILDDIR)/fatal_$$t-arm > $(BUILDDIR)/fatal_$$t-arm.got 2> $(BUILDDIR)/fatal_$$t-arm.err; rc=$$?; set -e; \
 	  test $$rc -eq 1; \
@@ -5441,6 +5477,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	done; \
 	grep -q 'paslang: integer divide by zero at line 11' $(BUILDDIR)/fatal_divzero-arm.err; \
 	grep -q 'paslang: integer divide by zero at line 15' $(BUILDDIR)/fatal_divfirst-arm.err; \
+	grep -q 'paslang: integer divide by zero at line 17' $(BUILDDIR)/fatal_divcall-arm.err; \
 	grep -q 'paslang: index 12 out of range \[0..9\] at line 15' $(BUILDDIR)/fatal_idxline-arm.err; \
 	grep -q 'paslang: nil pointer dereference at line 20' $(BUILDDIR)/fatal_nilline-arm.err; \
 	grep -q 'paslang: nil pointer dereference at line 19' $(BUILDDIR)/fatal_nilblk-arm.err; \

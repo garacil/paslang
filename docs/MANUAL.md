@@ -2439,7 +2439,23 @@ it; only a `var` parameter's descriptor, which may be nil, is tested.
 register its copy takes it in (1.1.296, P399): a variable, a fixed
 place's address, `p^`, `p[i]` of a pointer and an index in registers, a
 field of an object, each in one or two loads, and one argument that is
-none of these worked out first, so nothing is pushed.
+none of these worked out first, so nothing is pushed. A statement whose
+expression calls a function that returns a word keeps the rest of it in
+the region too (1.1.298, P400): the call goes first into a hidden
+variable, `c := Twice(a) + b` as `h := Twice(a); c := h + b`, when it is
+a call of a routine of the program's whose arguments are variables,
+constants and addresses but one, the operands before it are ones no
+call can change and nothing in them can stop the program (constants,
+the routine's own variables whose address is not taken and that no
+nested routine names, arithmetic with no division but by a constant),
+and what is left calls nothing else; the rest is a statement of the
+region. A call alone of a routine of the program's, its arguments variables,
+constants, addresses of variables and one other worked out with no
+call, takes them straight from the registers that hold them (four at
+most on amd64, eight on arm64) and leaves its value in its variable's
+register: only what the call takes is stored before it and loaded
+after it. A division by a variable that comes before a call keeps the
+call after it, in a body put in place too.
 A `for` of a constant count of four passes or fewer with a small body
 that neither changes its counter nor takes its address is written out
 once per pass with the pass's value in the counter's place, then the

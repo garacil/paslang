@@ -330,6 +330,7 @@ type
     FObjReady: Boolean;  { EmitArmMeth: an interface's code and Self in x0, x2 (1.0.135) }  { the frame slot of the routine's box, 0 when it has none (1.0.134) }
     FProcSyms: array of string;
     FProcNests: array of LongInt;
+    FProcHash: array of LongInt;  { P400: FProcSyms by symbol, open addressing, -1 empty }
     FOwnNames: array of string;
     FOwnEnds: array of string;
     FOwnPas: array of string;
@@ -442,6 +443,8 @@ type
     FIsleNames: array of TStrArray;  { the names each one mentions }
     FIsleAll: array of Boolean;      { it reads every local (DumpLocals) }
     FIsleOdd: array of Boolean;      { it holds a statement whose writes WritesVar does not see }
+    FIsleCall: array of LongInt;     { a call alone (CallIsleOK, P400): 1 a statement, 2 assigned to FIsleDst }
+    FIsleDst: array of TSym;
     FIsleTry: Boolean;      { the region is in a try of its routine: a handler may read any home }
     FRunToEnd: Boolean;     { the region ends the routine's body: its locals die there (P396) }
     FStraight: Boolean;     { a straight run is being looked at for a region (P396) }
@@ -969,6 +972,7 @@ type
     procedure ShiftArgs(N, NReg, Reg0: LongInt);
     procedure EmitLink(CalleeNest: LongInt);
     function ProcNest(const Sym: string): LongInt;
+    function ProcSlot(const Sym: string): SizeInt;
     procedure EmitStackCheck(const Entry: string; const Frame: string);
     function TryFindSym(const N: string; out S: TSym): Boolean;
     function AddrTaken(const N: string): Boolean;
@@ -1035,6 +1039,10 @@ type
     procedure IsleLoad(const L: TPromoList);
     procedure IsleRanges(const E: string; K: SizeInt; Loopy: Boolean);
     procedure EmitIsle(S: PStmt; K: SizeInt);
+    function CallLeaf(E: PExpr): Boolean;
+    function CallIsleOK(S: PStmt; out D: TSym; out HasD: Boolean): Boolean;
+    function IsleDest(K: SizeInt; const P: TPromo): Boolean;
+    procedure EmitCallIsle(S: PStmt; K: SizeInt);
     procedure IsleKeptBack;
     procedure IsleReload;
     function TryKeep: LongInt;
@@ -18850,17 +18858,36 @@ begin
   end;
 end;
 
+{ The slot of FProcHash where Sym is, or the empty one it would take:
+  its FNV-1a hash, then the next slots in turn. }
+function TEmitter.ProcSlot(const Sym: string): SizeInt;
+var
+  m, i: SizeInt;
+  v: Int64;
+begin
+  m := Length(FProcHash);
+  v := 2166136261;
+  for i := 1 to Length(Sym) do
+    v := ((v xor Int64(Ord(Sym[i]))) * 16777619) and 4294967295;
+  Result := SizeInt(v and Int64(m - 1));
+  while (FProcHash[Result] <> -1) and (FProcSyms[FProcHash[Result]] <> Sym) do
+    Result := (Result + 1) and (m - 1);
+end;
+
+{ The nesting of the routine whose symbol is Sym, the first of them, 0
+  for none: one probe of FProcHash, where a walk of every routine was a
+  hundredth of a unit's compile and the calls alone of a region (P400)
+  asked it at every island. }
 function TEmitter.ProcNest(const Sym: string): LongInt;
 var
-  i: SizeInt;
+  h: SizeInt;
 begin
   Result := 0;
-  for i := 0 to High(FProcSyms) do
-    if FProcSyms[i] = Sym then
-    begin
-      Result := FProcNests[i];
-      Exit;
-    end;
+  if Length(FProcHash) = 0 then
+    Exit;
+  h := ProcSlot(Sym);
+  if FProcHash[h] >= 0 then
+    Result := FProcNests[FProcHash[h]];
 end;
 
 procedure TEmitter.EmitLink(CalleeNest: LongInt);
@@ -31396,12 +31423,26 @@ begin
   { an island's uses read the homes (P384) }
   if (Length(FIsles) > 0) and (IsleAt(S) >= 0) then
   begin
+    k := IsleAt(S);
     if FStraight then
     begin
-      k := IsleAt(S);
       FIslePos[k] := FRunPos;
       FIsleLoA[k] := FScanLoop;
     end;
+    { but a call alone's: its arguments in their registers, its value
+      into its variable's (P400) }
+    if FIsleCall[k] = 2 then
+    begin
+      for i := 0 to High(S^.E^.Args) do
+        PromoScanE(S^.E^.Args[i], Weight);
+      if S^.Dest = nil then
+        PromoAdd(S^.Name, True, Weight)
+      else
+        PromoAdd(S^.Dest^.Name, True, Weight);
+    end
+    else if FIsleCall[k] = 1 then
+      for i := 0 to High(S^.Args) do
+        PromoScanE(S^.Args[i], Weight);
     Exit;
   end;
   w := Weight;
@@ -31621,6 +31662,8 @@ begin
   FIsleNames := nil;
   FIsleAll := nil;
   FIsleOdd := nil;
+  FIsleCall := nil;
+  FIsleDst := nil;
   { a loop that calls: its statements with calls are islands (P384) }
   if (not PromoStmtOK(S, False)) and
     ((not RegionStmtOK(S, False, 64)) or (Length(FIsles) = 0) or (IsleAt(S) >= 0)) then
@@ -31641,6 +31684,8 @@ begin
   FIsleNames := nil;
   FIsleAll := nil;
   FIsleOdd := nil;
+  FIsleCall := nil;
+  FIsleDst := nil;
 end;
 
 { P384: a loop whose body calls keeps its variables in registers all the
@@ -31716,8 +31761,9 @@ var
   i, n0: SizeInt;
   wl, wa, w1, w2: Int64;
   lo: LongInt;
-  sy: TSym;
+  sy, dsy: TSym;
   m: TStrArray;
+  hd: Boolean;
 begin
   Result := True;
   if (S = nil) or PromoStmtOK(S, InLoop) then
@@ -31797,6 +31843,8 @@ begin
   SetLength(FIsleNames, n0);
   SetLength(FIsleAll, n0);
   SetLength(FIsleOdd, n0);
+  SetLength(FIsleCall, n0);
+  SetLength(FIsleDst, n0);
   if not IsleOK(S, InLoop) then
     Exit;
   SetLength(FIsles, n0 + 1);
@@ -31804,7 +31852,15 @@ begin
   SetLength(FIsleNames, n0 + 1);
   SetLength(FIsleAll, n0 + 1);
   SetLength(FIsleOdd, n0 + 1);
+  SetLength(FIsleCall, n0 + 1);
+  SetLength(FIsleDst, n0 + 1);
   FIsleOdd[n0] := IsleOddS(S);
+  FIsleCall[n0] := 0;
+  if CallIsleOK(S, dsy, hd) then
+  begin
+    FIsleCall[n0] := 1 + Ord(hd);
+    FIsleDst[n0] := dsy;
+  end;
   FIsles[n0] := S;
   { an exit of a straight run outside its loops weighs as its arm: each
     pass gives back the kept registers (P396) }
@@ -31971,11 +32027,18 @@ begin
     (n[6] = 't'));
 end;
 
-{ Island K reads P's variable at home: it names it, or reads every local. }
+{ Island K reads P's variable at home: it names it, or reads every local.
+  A call alone reads its arguments in their registers, and the routine
+  it calls reaches none of a region's variables (PromoCand) (P400). }
 function TEmitter.IsleReads(K: SizeInt; const P: TPromo): Boolean;
 var
   i: SizeInt;
 begin
+  if FIsleCall[K] > 0 then
+  begin
+    Result := False;
+    Exit;
+  end;
   if P.HrOn then
   begin
     Result := True;
@@ -32003,6 +32066,12 @@ begin
     Result := False;
     Exit;
   end;
+  { a call alone's value goes straight into its variable's register (P400) }
+  if IsleDest(K, P) then
+  begin
+    Result := False;
+    Exit;
+  end;
   Result := True;
   if ((FKeepAs < 0) and not P.Keep) or (FKeepAs = 0) or (P.Part <> 0) then
     Exit;
@@ -32012,7 +32081,8 @@ begin
     Exit;
   n := IsleName(K, P);
   Result := False;
-  if n = '' then
+  { a call alone writes no variable of the routine's but its own }
+  if (n = '') or (FIsleCall[K] > 0) then
     Exit;
   Result := FIsleOdd[K] or (n = 'result') or ((not P.Place.Global) and FHasRes and
     (P.Place.Off = FResOff)) or WritesVar(FIsles[K], n);
@@ -32496,8 +32566,10 @@ begin
       k := IsleAt(FRunL[i]);
   if (k < 0) or (FIsleLoA[k] >= 0) then
     Exit;
-  if ((P.MinRd >= 0) and (P.MinRd < FIslePos[k])) or
-    ((P.MinWr >= 0) and (P.MinWr < FIslePos[k])) then
+  { a call alone reads and writes at its own place, in the registers
+    (P400) }
+  if ((P.MinRd >= 0) and (P.MinRd <= FIslePos[k])) or
+    ((P.MinWr >= 0) and (P.MinWr <= FIslePos[k])) then
     Exit;
   for i := 0 to High(FIsles) do
     if (FIslePos[i] < FIslePos[k]) and IsleReads(i, P) then
@@ -32682,6 +32754,8 @@ begin
   FIsleNames := nil;
   FIsleAll := nil;
   FIsleOdd := nil;
+  FIsleCall := nil;
+  FIsleDst := nil;
   if LoopOwn(S^.Stmts[I]) then
     Exit;
   FStraight := True;
@@ -32710,6 +32784,8 @@ begin
     FIsleNames := nil;
     FIsleAll := nil;
     FIsleOdd := nil;
+    FIsleCall := nil;
+    FIsleDst := nil;
     j := I - 1;
     while (j + 1 <= m) and RegionStmtOK(S^.Stmts[j + 1], False, 64) do
       Inc(j);
@@ -32771,6 +32847,8 @@ var
   svW: array of Int64;
   svNames: array of TStrArray;
   svAll, svOdd: array of Boolean;
+  svCall: array of LongInt;
+  svDst: array of TSym;
   svFat, svFroms: TStrArray;
   svStubs, svChunk, s1, e1: string;
   svBrk, svChunkSave, svChunkDw, svVTop, svVNeed, svVCopy: LongInt;
@@ -32780,6 +32858,11 @@ var
   svRunA, svRunZ: SizeInt;
   i, n: SizeInt;
 begin
+  if FIsleCall[K] > 0 then
+  begin
+    EmitCallIsle(S, K);
+    Exit;
+  end;
   leaving := (S^.Kind = skExit) or (S^.Kind = skRaise) or (S^.Kind = skHalt);
   loopy := HasLoop(S);
   for i := 0 to High(FPromo) do
@@ -32808,6 +32891,8 @@ begin
   svNames := FIsleNames;
   svAll := FIsleAll;
   svOdd := FIsleOdd;
+  svCall := FIsleCall;
+  svDst := FIsleDst;
   svTry := FIsleTry;
   svFroms := FIsleFroms;
   svFat := FFatWritten;
@@ -32857,6 +32942,8 @@ begin
   FIsleNames := svNames;
   FIsleAll := svAll;
   FIsleOdd := svOdd;
+  FIsleCall := svCall;
+  FIsleDst := svDst;
   FIsleTry := svTry;
   FIsleFroms := svFroms;
   FFatWritten := svFat;
@@ -32879,6 +32966,213 @@ begin
     if FRunOn and (RunDead(FPromo[i], K) or RunKilled(FPromo[i], K)) then
       FIsleFroms[i] := ''
     else if (loopy or IsleBackK(K, FPromo[i])) and (FIsleFroms[i] <> '') then
+      FIsleFroms[i] := e1;
+end;
+
+{ ---- A call alone in a region (P400) ----
+
+  An island that is one call of a routine of the program's, its
+  arguments leaves that need no register to be worked out (CallLeaf),
+  its value a word assigned to a variable of the routine's own or none,
+  reads no home: its arguments go straight from the registers that hold
+  them to the call's (MoveLeaf), at most four on amd64, rdi, rsi, rdx
+  and rcx, which no region keeps a variable in, and at most eight on
+  arm64, x0 to x7; the routine called reaches no variable a region
+  keeps (PromoCand: a routine nested in this one, which reaches its
+  frame, is no such call). Its value goes from rax or x0 straight into
+  its variable's register, which is a write of the region. Only what
+  the call takes is stored before it and loaded after it: a free
+  register a later statement reads, a reference the collector reads at
+  home, a pointer a stack that moves relocates there. Go passes a call's
+  arguments in registers (cmd/compile/abi-internal.md) and keeps the
+  values live across a call in registers or spill slots
+  (cmd/compile/internal/ssa/regalloc.go). }
+
+{ E goes straight to an argument's register whatever holds it: a
+  constant, a word variable of the routine's own or a global, in a
+  register or at home, the address of a variable. }
+function TEmitter.CallLeaf(E: PExpr): Boolean;
+var
+  sy: TSym;
+  k: TTypeKind;
+begin
+  Result := False;
+  if E = nil then
+    Exit;
+  case E^.Kind of
+    ekInt:
+      begin
+        k := TKind(E^.Typ);
+        Result := (k <> tykReal) and (k <> tykQuad) and (k <> tykCurrency) and (k <> tykSet) and
+          (not IsFat(E^.Typ)) and not IsBlob(E^.Typ);
+      end;
+    ekVar:
+      if TryFindSym(E^.Name, sy) and (sy.Up = 0) and (not sy.ByRef) and (not sy.Boxed) and
+        (TSize(sy.Typ) = 8) and (TSize(E^.Typ) = 8) and WordInt(sy.Typ) and WordInt(E^.Typ) then
+      begin
+        k := TKind(sy.Typ);
+        Result := (k <> tykInterface) and (k <> tykMethod) and (k <> tykArray) and
+          (k <> tykRecord);
+      end;
+    ekAddr:
+      Result := (E^.L <> nil) and (E^.L^.Kind = ekVar) and TryFindSym(E^.L^.Name, sy) and
+        (sy.Up = 0) and (not sy.Boxed) and (sy.Name <> '');
+  end;
+end;
+
+{ S is a call alone of a routine of the program's whose arguments are
+  CallLeaf but one at most, a word a region works out with no call
+  (PromoExprOK): a call statement, or an assignment of its value, a
+  word, to a word variable D of the routine's own or a global (HasD). }
+function TEmitter.CallIsleOK(S: PStmt; out D: TSym; out HasD: Boolean): Boolean;
+var
+  e: PExpr;
+  args: TExprArray;
+  nm: string;
+  i, nl: SizeInt;
+begin
+  Result := False;
+  HasD := False;
+  D := Default(TSym);
+  if (S = nil) or FDebug or FCheckPtr then
+    Exit;
+  if S^.Kind = skAssign then
+  begin
+    e := S^.E;
+    if (e = nil) or (e^.Kind <> ekCall) or (TSize(e^.Typ) <> 8) or not WordInt(e^.Typ) then
+      Exit;
+    nm := S^.Name;
+    if S^.Dest <> nil then
+    begin
+      if S^.Dest^.Kind <> ekVar then
+        Exit;
+      nm := S^.Dest^.Name;
+    end;
+    if (nm = '') or not TryFindSym(nm, D) then
+      Exit;
+    if D.ByRef or (D.Up <> 0) or D.Boxed or (TSize(D.Typ) <> 8) or (not PromoScalar(D.Typ)) or
+      not WordInt(D.Typ) then
+      Exit;
+    HasD := True;
+    nm := e^.Name;
+    args := e^.Args;
+  end
+  else if (S^.Kind = skCall) and (S^.E = nil) then
+  begin
+    nm := S^.Name;
+    args := S^.Args;
+  end
+  else
+    Exit;
+  if (Copy(nm, 1, 2) <> 'p_') or (Length(args) > 8) or ((not FArm) and (Length(args) > 4)) then
+    Exit;
+  nl := 0;
+  for i := 0 to High(args) do
+    if not CallLeaf(args[i]) then
+    begin
+      if (nl > 0) or (args[i] = nil) or EHasCall(args[i]) or (not WordInt(args[i]^.Typ)) or
+        not PromoExprOK(args[i]) then
+        Exit;
+      Inc(nl);
+    end;
+  Result := (BlobRet(nm) < 0) and (ProcNest(nm) = 0);
+end;
+
+{ P is the variable island K, a call alone, assigns its value to. }
+function TEmitter.IsleDest(K: SizeInt; const P: TPromo): Boolean;
+begin
+  Result := (FIsleCall[K] = 2) and (P.Part = 0) and (FIsleDst[K].Global = P.Place.Global) and
+    SamePlace(FIsleDst[K], P.Place);
+end;
+
+{ Island K, S, a call alone: the stores IsleStores asks for, the
+  argument that is no leaf worked out where its register takes it
+  (ArgInto, P328), with the region's pool, then the leaves from where
+  they lie, the call, its value into its variable's register or home,
+  and the loads back the call needs. }
+procedure TEmitter.EmitCallIsle(S: PStmt; K: SizeInt);
+var
+  back: TPromoList;
+  args: TExprArray;
+  nm, r, ar, s1, e1: string;
+  i, n: SizeInt;
+  j: LongInt;
+begin
+  for i := 0 to High(FPromo) do
+    if IsleStores(K, FPromo[i]) then
+      StoreHome(FPromo[i].Place, FPromo[i].Reg);
+  s1 := Lab;
+  Line(s1 + ':');
+  IsleRanges(s1, K, False);
+  back := nil;
+  for i := 0 to High(FPromo) do
+    if IsleBackK(K, FPromo[i]) then
+    begin
+      n := Length(back);
+      SetLength(back, n + 1);
+      back[n] := FPromo[i];
+    end;
+  FScratchCur := 0;
+  SetLength(FScrOff, 0);
+  SetLength(FScrK, 0);
+  EmitLoc(S^.Line);
+  if S^.Kind = skAssign then
+  begin
+    nm := S^.E^.Name;
+    args := S^.E^.Args;
+  end
+  else
+  begin
+    nm := S^.Name;
+    args := S^.Args;
+  end;
+  for i := 0 to High(args) do
+    if not CallLeaf(args[i]) then
+    begin
+      if FArm then
+        ArgInto(args[i], ArgR(LongInt(i)))
+      else
+        ArgInto(args[i], ArgReg(LongInt(i)));
+    end;
+  for i := 0 to High(args) do
+    if CallLeaf(args[i]) then
+    begin
+      if FArm then
+        ar := ArgR(LongInt(i))
+      else
+        ar := ArgReg(LongInt(i));
+      if not MoveLeaf(args[i], ar, True, r) then
+        Refuse('a call alone in a region: an argument of ' + nm + ' is no leaf');
+    end;
+  if FArm then
+    Line('  bl ' + nm)
+  else
+    Line('  call ' + nm);
+  if FIsleCall[K] = 2 then
+  begin
+    j := -1;
+    for i := 0 to High(FPromo) do
+      if IsleDest(K, FPromo[i]) then
+        j := LongInt(i);
+    if j >= 0 then
+    begin
+      if FArm then
+        Line('  mov ' + FPromo[j].Reg + ', x0')
+      else
+        Line('  movq %rax, %' + FPromo[j].Reg);
+    end
+    else if FArm then
+      StoreHome(FIsleDst[K], 'x0')
+    else
+      StoreHome(FIsleDst[K], 'rax');
+  end;
+  IsleLoad(back);
+  e1 := Lab;
+  Line(e1 + ':');
+  for i := 0 to High(FPromo) do
+    if FRunOn and (RunDead(FPromo[i], K) or RunKilled(FPromo[i], K)) then
+      FIsleFroms[i] := ''
+    else if IsleBackK(K, FPromo[i]) and (FIsleFroms[i] <> '') then
       FIsleFroms[i] := e1;
 end;
 
@@ -33011,6 +33305,8 @@ begin
         FIsleNames := nil;
         FIsleAll := nil;
         FIsleOdd := nil;
+        FIsleCall := nil;
+        FIsleDst := nil;
         if not ok then
           for k := i to j do
             EmitStmt(S^.Stmts[k]);
@@ -33022,6 +33318,8 @@ begin
       FIsleNames := nil;
       FIsleAll := nil;
       FIsleOdd := nil;
+      FIsleCall := nil;
+      FIsleDst := nil;
     end;
     if (not FPromoOn) and (not FDebug) and PromoStmtOK(S^.Stmts[i], False) then
     begin
@@ -51169,7 +51467,7 @@ end;
 
 function TEmitter.Emit(const Prog: TProgram): string;
 var
-  i, j, k, mi, mb0: SizeInt;
+  i, j, k, mi, mb0, ph, ps: SizeInt;
   sz, rp, slot: LongInt;
   big: Int64;
   sruns: TInt64Arr;
@@ -51230,6 +51528,21 @@ begin
   begin
     FProcSyms[i] := Prog.Procs[i].Sym;
     FProcNests[i] := Prog.Procs[i].Nest;
+  end;
+  { the table ProcNest probes, twice the routines at least, the first
+    of a symbol kept (P400) }
+  ph := 16;
+  while ph < 2 * Length(Prog.Procs) do
+    ph := ph * 2;
+  FProcHash := nil;
+  SetLength(FProcHash, ph);
+  for i := 0 to ph - 1 do
+    FProcHash[i] := -1;
+  for i := 0 to High(Prog.Procs) do
+  begin
+    ps := ProcSlot(FProcSyms[i]);
+    if FProcHash[ps] = -1 then
+      FProcHash[ps] := LongInt(i);
   end;
   BlobTable(Prog);
   FTakeTyp := -1;

@@ -119,6 +119,16 @@ type
     function AddStmt(Blk: PStmt; St: PStmt): PStmt;
     function InlineAt(S: PStmt): PStmt;
     function HoistAt(S: PStmt): PStmt;
+    function SplitTyp(T: LongInt): Boolean;
+    function NoFail(E: PExpr): Boolean;
+    function SplitAhead(E: PExpr): Boolean;
+    function SplitFirst(E: PExpr): PExpr;
+    function TypKind(T: LongInt): TTypeKind;
+    function SplitRest(E: PExpr): Boolean;
+    function SplitCall(E: PExpr): Boolean;
+    function Word8(T: LongInt): Boolean;
+    function SplitAt(S: PStmt): PStmt;
+    function SplitS(S: PStmt): PStmt;
     function OwnContinue(S: PStmt; Loops: LongInt): Boolean;
     function LoopAt(S: PStmt): PStmt;
     function InlineS(S: PStmt): PStmt;
@@ -1587,9 +1597,9 @@ begin
 end;
 
 { The call evaluated first in E that goes in, or nil: down the left
-  operands, into a right operand only past a safe left one and never
-  past a Boolean and or or, into a call's arguments in order past safe
-  ones. }
+  operands, into a right operand only past a safe left one (SplitAhead)
+  and never past a Boolean and or or, into a call's arguments in order
+  past safe ones. }
 function TOpt.FirstCall(E: PExpr): PExpr;
 var
   i: SizeInt;
@@ -1613,7 +1623,7 @@ begin
             Result := FirstCall(E^.Args[i]);
           if Result <> nil then
             Exit;
-          if not Ahead(E^.Args[i]) then
+          if not SplitAhead(E^.Args[i]) then
             Exit;
         end;
       end;
@@ -1628,7 +1638,7 @@ begin
         if E^.L = nil then
           Exit;
         Result := FirstCall(E^.L);
-        if (Result <> nil) or (not Ahead(E^.L)) then
+        if (Result <> nil) or (not SplitAhead(E^.L)) then
           Exit;
         for i := 0 to High(E^.Args) do
         begin
@@ -1636,7 +1646,7 @@ begin
             Result := FirstCall(E^.Args[i]);
           if Result <> nil then
             Exit;
-          if not Ahead(E^.Args[i]) then
+          if not SplitAhead(E^.Args[i]) then
             Exit;
         end;
       end;
@@ -1645,13 +1655,13 @@ begin
     ekIndex:
       begin
         Result := FirstCall(E^.L);
-        if (Result = nil) and Ahead(E^.L) then
+        if (Result = nil) and SplitAhead(E^.L) then
           Result := FirstCall(E^.R);
       end;
     ekBin:
       begin
         Result := FirstCall(E^.L);
-        if (Result = nil) and Ahead(E^.L) and
+        if (Result = nil) and SplitAhead(E^.L) and
           (not ((E^.Typ = TyBoolean) and ((E^.Bin = boAnd) or (E^.Bin = boOr)))) then
           Result := FirstCall(E^.R);
       end;
@@ -2416,7 +2426,7 @@ begin
         c := FirstCall(S^.E);
         { the place written, whose address is taken after the value:
           a call in it goes ahead when the value is ahead-safe }
-        if (c = nil) and Ahead(S^.E) then
+        if (c = nil) and SplitAhead(S^.E) then
           c := FirstCall(S^.Dest);
       end;
     skCall, skWrite, skWriteLn:
@@ -2434,7 +2444,7 @@ begin
               c := nil;
             Break;
           end;
-          if not Ahead(S^.Args[i]) then
+          if not SplitAhead(S^.Args[i]) then
             Break;
         end;
   else
@@ -2491,6 +2501,283 @@ begin
   AddStmt(blk, r);
   AddStmt(blk, S);
   Result := blk;
+end;
+
+{ ---- A call out of the rest of its statement (P400) ----
+
+  A statement whose expression calls is an island of its region as a
+  whole (P384, P396): c := Twice(a) + b read a and b at home and stored
+  c there, the call taking its statement's other variables out of their
+  registers. The call goes first into a hidden variable, and the
+  statement takes the variable in its place: h := Twice(a); c := h + b,
+  the rest a statement of the region. Go's SSA form has no expressions
+  to split: each call is a value of its own, and the register allocator
+  keeps the values live across it in registers or spill slots and uses
+  them around it (cmd/compile/internal/ssa/regalloc.go). Only a call
+  whose value is a word (SplitTyp) and only past operands no call
+  changes and no failure stops (SplitAhead), so the program sees
+  nothing in another order. }
+
+{ A value a hidden variable holds in a register and a call leaves whole
+  in rax or x0: an integer, an enumeration, a subrange, a pointer, an
+  object or a class of eight bytes. }
+function TOpt.SplitTyp(T: LongInt): Boolean;
+begin
+  Result := (Scalar(T) or ((T >= 0) and (T <= High(FProg^.Types)) and
+    ((FProg^.Types[T].Kind = tykClass) or (FProg^.Types[T].Kind = tykClassRef)))) and
+    Word8(T);
+end;
+
+{ T's values take eight bytes: an object's is its reference. }
+function TOpt.Word8(T: LongInt): Boolean;
+begin
+  Result := (T >= 0) and (T <= High(FProg^.Types)) and
+    ((FProg^.Types[T].Kind = tykClass) or (FProg^.Types[T].Size = 8));
+end;
+
+{ E, a call of a routine of the program's whose value is a word, is one
+  the emitter makes a call alone of in a region (pasemit CallIsleOK,
+  P400): not nested, four arguments at most, each a constant, a
+  variable of eight bytes or a variable's address but one at most,
+  which calls nothing. }
+function TOpt.SplitCall(E: PExpr): Boolean;
+var
+  idx: LongInt;
+  i, nl: SizeInt;
+  a: PExpr;
+begin
+  Result := False;
+  idx := FindProc(E^.Name);
+  if (idx < 0) or (not FProcs[idx].IsFunc) or (FProcs[idx].Nest > 0) or
+    (not SplitTyp(FProcs[idx].RetTyp)) or (not SplitTyp(E^.Typ)) or (Length(E^.Args) > 4) then
+    Exit;
+  nl := 0;
+  for i := 0 to High(E^.Args) do
+  begin
+    a := E^.Args[i];
+    if a = nil then
+      Exit;
+    if (a^.Kind = ekInt) or ((a^.Kind = ekVar) and Word8(a^.Typ) and WordTyp(a^.Typ)) or
+      ((a^.Kind = ekAddr) and (a^.L <> nil) and (a^.L^.Kind = ekVar)) then
+      Continue;
+    if (nl > 0) or (not QuietE(a)) or not SplitRest(a) then
+      Exit;
+    Inc(nl);
+  end;
+  Result := True;
+end;
+
+{ E, one of Ahead's, stops at no failure: no division but by a
+  constant other than 0 and -1, no as, no real division, no element of
+  a static array at a constant outside its bounds, which stops the
+  program when it is reached (P87). A call goes ahead only of such
+  operands: before, x := a div b + Loud(a) put in place ran Loud's
+  body, its WriteLn, and then stopped at the division. Go's order of
+  evaluation keeps a division's check, a panic, ahead of a call that
+  comes after it (cmd/compile/internal/walk/order.go: the operands
+  in their order; ssagen/ssa.go: the check where the division is). }
+function TOpt.NoFail(E: PExpr): Boolean;
+var
+  t: LongInt;
+begin
+  Result := True;
+  if E = nil then
+    Exit;
+  case E^.Kind of
+    ekBin:
+      if (E^.Bin = boDiv) or (E^.Bin = boMod) then
+        Result := (E^.R <> nil) and (E^.R^.Kind = ekInt) and (E^.R^.Num <> 0) and
+          (E^.R^.Num <> -1)
+      else
+        Result := (E^.Bin <> boAs) and (E^.Bin <> boSlash);
+    ekIndex:
+      if (E^.L <> nil) and (E^.R <> nil) and (E^.R^.Kind = ekInt) then
+      begin
+        t := E^.L^.Typ;
+        Result := (t >= 0) and (t <= High(FProg^.Types)) and
+          (E^.R^.Num >= FProg^.Types[t].Lo) and (E^.R^.Num <= FProg^.Types[t].Hi);
+      end
+      else
+        Result := False;
+  end;
+  Result := Result and NoFail(E^.L) and NoFail(E^.R);
+end;
+
+{ E may be worked out after a call that came after it: Ahead, and no
+  failure in it (NoFail). }
+function TOpt.SplitAhead(E: PExpr): Boolean;
+begin
+  Result := Ahead(E) and NoFail(E);
+end;
+
+{ The call evaluated first in E that SplitCall takes, or nil: down the
+  left operands, into a right one only past a SplitAhead left one and
+  never past a Boolean and or or, into an index past its array, into
+  the base of a field or a pointer's target. The arguments of a call
+  that stays are not looked into, nor anything after it. }
+function TOpt.SplitFirst(E: PExpr): PExpr;
+begin
+  Result := nil;
+  if E = nil then
+    Exit;
+  case E^.Kind of
+    ekCall:
+      if SplitCall(E) then
+        Result := E;
+    ekUn, ekDeref, ekField:
+      Result := SplitFirst(E^.L);
+    ekIndex:
+      begin
+        Result := SplitFirst(E^.L);
+        if (Result = nil) and SplitAhead(E^.L) then
+          Result := SplitFirst(E^.R);
+      end;
+    ekBin:
+      begin
+        Result := SplitFirst(E^.L);
+        if (Result = nil) and SplitAhead(E^.L) and
+          (not ((E^.Typ = TyBoolean) and ((E^.Bin = boAnd) or (E^.Bin = boOr)))) then
+          Result := SplitFirst(E^.R);
+      end;
+  end;
+end;
+
+function TOpt.TypKind(T: LongInt): TTypeKind;
+begin
+  Result := tykNone;
+  if (T >= 0) and (T <= High(FProg^.Types)) then
+    Result := FProg^.Types[T].Kind;
+end;
+
+{ E, what is left of a statement's expression once its calls are out,
+  is one a region works out in its registers, as the emitter's
+  PromoExprOK takes it: integer and pointer arithmetic, compares,
+  fields, elements, addresses, and the words that call nothing (Length,
+  High, Low, Odd, Abs, ...); no real arithmetic, no string's compare or
+  concatenation, no is, as or call. Else the statement stays an island
+  whatever is split out of it, and a split would only store and load
+  the hidden variable. }
+function TOpt.SplitRest(E: PExpr): Boolean;
+var
+  i: SizeInt;
+begin
+  Result := True;
+  if E = nil then
+    Exit;
+  Result := False;
+  case E^.Kind of
+    ekInt, ekNil, ekStr, ekVar:
+      Result := True;
+    ekUn, ekField, ekDeref, ekAddr:
+      Result := SplitRest(E^.L);
+    ekIndex:
+      Result := SplitRest(E^.L) and SplitRest(E^.R);
+    ekBin:
+      begin
+        if (E^.L = nil) or (E^.R = nil) or (E^.Bin = boConcat) or (E^.Bin = boIs) or
+          (E^.Bin = boAs) or (E^.Bin = boSlash) then
+          Exit;
+        if (TypKind(E^.Typ) = tykReal) or (TypKind(E^.L^.Typ) = tykReal) or
+          (TypKind(E^.R^.Typ) = tykReal) then
+          Exit;
+        if (TypKind(E^.L^.Typ) = tykString) and (TypKind(E^.R^.Typ) = tykString) then
+          Exit;
+        Result := SplitRest(E^.L) and SplitRest(E^.R);
+      end;
+    ekCall:
+      if (E^.Name = 'rt_length') or (E^.Name = 'rt_high') or (E^.Name = 'rt_low') or
+        (E^.Name = 'rt_odd') or (E^.Name = 'rt_absint') or (E^.Name = 'rt_bitchk') or
+        (E^.Name = 'rt_rot') or (E^.Name = 'rt_funnel') or (E^.Name = 'rt_carry') then
+      begin
+        Result := True;
+        for i := 0 to High(E^.Args) do
+          if not SplitRest(E^.Args[i]) then
+            Result := False;
+      end;
+  end;
+end;
+
+{ S's calls, each into a hidden variable ahead of it, as many as
+  SplitFirst gives: the block of them and S, nil when none. An
+  expression that is a call alone stays as it is: its value is where
+  the call leaves it. Only when the rest then calls nothing a region
+  could not take (SplitRest), as a copy of the expression split first
+  tells. }
+function TOpt.SplitAt(S: PStmt): PStmt;
+var
+  c, hv, e2: PExpr;
+  st, blk: PStmt;
+  n: LongInt;
+begin
+  Result := nil;
+  if (S = nil) or not ((S^.Kind = skAssign) or (S^.Kind = skIf) or (S^.Kind = skCase)) then
+    Exit;
+  { most expressions call nothing: no Ahead asked of them }
+  if QuietE(S^.E) then
+    Exit;
+  c := SplitFirst(S^.E);
+  if (c = nil) or (c = S^.E) then
+    Exit;
+  e2 := CloneE(S^.E);
+  n := 0;
+  repeat
+    c := SplitFirst(e2);
+    if (c = nil) or (c = e2) then
+      Break;
+    hv := NewVar('inl.0.split', c^.Typ);
+    ReplaceE(e2, c, hv);
+    Inc(n);
+  until False;
+  if (n = 0) or not SplitRest(e2) then
+    Exit;
+  blk := nil;
+  repeat
+    c := SplitFirst(S^.E);
+    if (c = nil) or (c = S^.E) then
+      Break;
+    Inc(FN);
+    { the reach stays as it was: a split takes no address }
+    if (FReachFor = FCur) and (FReachN = FN - 1) then
+      FReachN := FN;
+    hv := Hidden('c', c^.Typ);
+    st := NewStmt(skAssign);
+    st^.Line := S^.Line;
+    st^.Dest := hv;
+    st^.E := c;
+    ReplaceE(S^.E, c, CloneE(hv));
+    if blk = nil then
+    begin
+      blk := NewStmt(skBlock);
+      blk^.Line := S^.Line;
+    end;
+    AddStmt(blk, st);
+  until False;
+  if blk = nil then
+    Exit;
+  AddStmt(blk, S);
+  Result := blk;
+end;
+
+function TOpt.SplitS(S: PStmt): PStmt;
+var
+  i: SizeInt;
+  r: PStmt;
+begin
+  Result := S;
+  if (S = nil) or (S^.Kind = skAsm) then
+    Exit;
+  S^.ThenSt := SplitS(S^.ThenSt);
+  S^.ElseSt := SplitS(S^.ElseSt);
+  S^.Body := SplitS(S^.Body);
+  for i := 0 to High(S^.Stmts) do
+    S^.Stmts[i] := SplitS(S^.Stmts[i]);
+  for i := 0 to High(S^.Arms) do
+    S^.Arms[i].Body := SplitS(S^.Arms[i].Body);
+  for i := 0 to High(S^.Sels) do
+    S^.Sels[i].Body := SplitS(S^.Sels[i].Body);
+  r := SplitAt(S);
+  if r <> nil then
+    Result := r;
 end;
 
 { A Continue at the loop's own level (not one of a loop inside). }
@@ -2855,6 +3142,21 @@ begin
     Prog.Body := FoldStmt(Prog.Body);
     Prog.InitBody := FoldStmt(Prog.InitBody);
     Prog.FiniBody := FoldStmt(Prog.FiniBody);
+  end;
+  { P400: a call out of the rest of its statement, in the routines a
+    region may keep in registers }
+  if not Prog.Debug then
+  begin
+    for i := 0 to High(Prog.Procs) do
+      if (not Prog.Procs[i].IsExt) and (Prog.Procs[i].Body <> nil) and
+        (not Prog.Procs[i].Boxing) and (not Dumps(Prog.Procs[i].Body)) and
+        (not HasAsmS(Prog.Procs[i].Body)) then
+      begin
+        FCur := LongInt(i);
+        Prog.Procs[i].Body := SplitS(Prog.Procs[i].Body);
+      end;
+    FCur := -1;
+    FProcs := Prog.Procs;
   end;
   { P345: the main block's own globals let their values go after their
     last use }

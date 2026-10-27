@@ -15,8 +15,9 @@ two run ends worked out. AndSplit tests the and's part that calls
 nothing in the region, before the island that calls Probe: its first
 test against 2 reads a register. Dead stores before its first call
 only what that call or a later read needs, x dead there: at most 3
-words on amd64, its parameter's among them, 4 on arm64, which keeps
-x19's caller value in the frame too.
+words on amd64, its parameter's among them, 5 on arm64, whose region
+keeps x, y, w and z in x19 to x22, each saved (P400: the whole body is
+one region; a region on arm64 lends no register a call spares).
 
 usage: check_straight.py file.s [--arm]
 """
@@ -61,7 +62,7 @@ def main():
         store = re.compile(r'^\s+(str|stur) x\d+, \[x29, #-\d+\]$')
         call = 'bl p_note'
         kept = lambda r: r in ['x%d' % i for i in range(19, 27)]
-        most = 4
+        most = 5
     else:
         zero = re.compile(r'movq \$0, -\d+\(%rbp\)')
         chunk = re.compile(r'leaq 1023\(')
