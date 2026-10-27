@@ -11884,6 +11884,40 @@ made by `CreateCertificate`, Go's own tables, NIST's PKITS, the chains of
 two real servers at fixed times), `x509pem` on 522 PEM texts, and
 `x509conc` has eight routines share one pool.
 
+`uses pastls` is a TLS client (1.1.294, P431), Go's `crypto/tls` routine
+by routine: TLS 1.3 (RFC 8446) with AES-128-GCM, AES-256-GCM and
+ChaCha20-Poly1305 over X25519, P-256 or P-384 (a HelloRetryRequest when
+the server wants another group, KeyUpdate both ways) and TLS 1.2 with
+ECDHE and the same ciphers (RFC 5289, RFC 7905), the extended master
+secret (RFC 7627) and the downgrade sentinel; SNI, ALPN, an empty
+certificate when the server asks for one; the server's chain checked by
+`pasx509` against the system's roots and its name, its signatures by
+`pasnist` and `pasrsa`. AES-GCM comes first when the unit is compiled
+for a processor with AES, ChaCha20 first without, as Go orders them. A
+program that uses it has `pasconn`'s `TlsDialer` and `TlsUpgrader` set,
+so `ImapDial(host, 993, ImapImplicit, ms)`, SMTPS and `https` work with
+nothing more. `TlsDial(host, port, ms, config, out err)` and
+`TlsClient(stream, config, host, deadline, out err)` give a
+`TTlsStream` (a `TNetStream`: `ReadSome`, `WriteAll`, `Dispose` sends
+close_notify), with `Version`, `CipherSuite`, `Protocol`,
+`PeerCertificates` and `LastError`; `TTlsConfig` has `ServerName`,
+`Alpn`, `MinVersion`, `MaxVersion`, `RootsPem` (roots of one's own
+instead of the system's), `NowUnix` and Go's `InsecureSkipVerify`, for
+tests only. Errors are Go's texts (`tls: failed to verify certificate:
+x509: ...`, `remote error: tls: handshake failure`). Every wait parks
+the routine until its deadline.
+
+```
+uses pasimap, pastls;
+c := ImapDial('correo.example.com', 993, ImapImplicit, 15000);   { IMAPS }
+```
+
+`scripts/tls_interop.sh` runs `testdata/tlsinterop` against Go's
+`crypto/tls` (25 cases: every version, suite, group and key, the
+HelloRetryRequest, ALPN, a certificate request, a MiB each way, wrong
+names refused, eight routines at once) and `openssl s_server` (17
+cases), on both machines, in make check when Go and openssl are there.
+
 `uses pascodec` has the text codecs a service needs (1.1.260, P435), as
 Go's packages give them, checked against Go's own output
 (`testdata/codec`, with `scripts/codec_oracle.go`):
@@ -12191,8 +12225,8 @@ does, `pastextproto` reads header blocks as `net/textproto` does (`TMimeFields`,
 and `httpclient` sends a request and reads the answer a piece at a time. They
 are written for a service that calls other services (the portal calls a JSON
 API over HTTPS and fetches files); the connection is TCP, or a Unix socket,
-and a TLS unit gives `https` (`TlsDialer` of `pasconn`, and `TlsUpgrader` for STARTTLS, which the IMAP and
-SMTP clients will use too; until there is one an `https` address is refused
+and `uses pastls` gives `https` (`TlsDialer` of `pasconn`, and `TlsUpgrader` for STARTTLS, which the IMAP and
+SMTP clients use too; a program that links no TLS unit has an `https` address refused
 with a clear error). Each is checked against Go:
 `testdata/url` runs 1,232 strings (RFC 3986's examples, Go's own cases, and
 the same with a character put in, changed or taken out) through `Parse`,
@@ -12285,9 +12319,9 @@ and `net/mail` do (quoted-printable, encoded words, media types with RFC 2231 pa
 multipart, addresses, dates) and adds what a mail program needs on top, a message read into a tree of
 parts and a composer; `passmtp` is `net/smtp` (the same commands, the same replies read the same way, the
 same dot writer) with AUTH LOGIN and XOAUTH2 added; `pasimap` is an IMAP4rev1 client. They sit on
-`pasconn` (P432), so a connection is TCP and TLS will come from the TLS unit through
+`pasconn` (P432), so a connection is TCP and TLS comes from `pastls` (P431) through
 `TlsDialer` (SMTPS on 465, IMAPS on 993, `SmtpImplicit`, `ImapImplicit`) and `TlsUpgrader` (STARTTLS on 587 and
-143); until there is one a TLS connection is refused with a message and a plain one works (and PLAIN and LOGIN are refused
+143), set when the program uses it; without it a TLS connection is refused with a message and a plain one works (and PLAIN and LOGIN are refused
 on a connection that is neither TLS nor to localhost, as Go's PlainAuth refuses). Checked: `testdata/mime`
 has 2,213 cases (quoted-printable both ways, encoded words, media types, multipart, 653 addresses and lists, 302 dates,
 89 messages) with what Go's `mime`, `net/mail` and `mime/multipart` answer, error text included; `testdata/mailtree`

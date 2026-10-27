@@ -1,0 +1,164 @@
+{ P431: the client side of pastls' interop tests (scripts/tls_interop.sh
+  runs it against Go's crypto/tls and openssl s_server): dials host and
+  port with the options of the mode (alpn, only12, only13, big, conc,
+  now), sends a line, prints what came back and the session's version,
+  suite and protocol; 'big' reads a MiB and prints its SHA-256; 'conc'
+  has eight routines dial and talk at once. Arguments: host port mode
+  roots.pem [server name]. }
+program tlsinterop;
+
+uses
+  sysutils, paslib, pasconn, pastls;
+
+var
+  wg: waitgroup;
+  mu: mutex;
+  concGood, concBad: Integer;
+  chost: string;
+  cport: Integer;
+  ccfg: TTlsConfig;
+
+function Reversed(const S: string): string;
+var
+  i: Integer;
+begin
+  SetLength(Result, Length(S));
+  for i := 1 to Length(S) do
+    Result[i] := S[Length(S) + 1 - i];
+end;
+
+procedure ConcWorker(K: Integer);
+var
+  st: TTlsStream;
+  e, d, g: string;
+  n, dl: Integer;
+  ok: Boolean;
+begin
+  ok := False;
+  st := TlsDial(chost, cport, 10000, ccfg, e);
+  if st <> nil then
+  begin
+    dl := Nanotime + 10000000000;
+    st.WriteAll('routine ' + IntToStr(K) + #10, dl);
+    g := '';
+    while Pos(#10, g) = 0 do
+    begin
+      n := st.ReadSome(4096, dl, d);
+      if n <= 0 then
+        Break;
+      g := g + d;
+    end;
+    ok := Pos('routine ' + IntToStr(K), g) > 0;
+    if not ok then
+      ok := Pos(Reversed('routine ' + IntToStr(K)), g) > 0;
+    st.Dispose;
+  end;
+  lock mu do
+    if ok then
+      Inc(concGood)
+    else
+      Inc(concBad);
+  wg.Done;
+end;
+
+var
+  cfg: TTlsConfig;
+  s: TTlsStream;
+  err, data, got, roots, host, mode: string;
+  port, n, i, dl: Integer;
+
+begin
+  host := ParamStr(1);
+  port := StrToIntDef(ParamStr(2), 0);
+  mode := ParamStr(3);
+  cfg := TTlsConfig.Create;
+  if ParamStr(4) <> '' then
+  begin
+    if not ReadFile(ParamStr(4), roots) then
+    begin
+      WriteLn('no roots file');
+      Halt(1);
+    end;
+    cfg.RootsPem := roots;
+  end;
+  cfg.NowUnix := 1811808000;   { 2027-06-01 }
+  if ParamStr(5) <> '' then
+    cfg.ServerName := ParamStr(5);
+  if Pos('alpn', mode) > 0 then
+  begin
+    SetLength(cfg.Alpn, 2);
+    cfg.Alpn[0] := 'http/1.1';
+    cfg.Alpn[1] := 'h2';
+  end;
+  if Pos('only12', mode) > 0 then
+    cfg.MaxVersion := TlsVersion12;
+  if Pos('only13', mode) > 0 then
+    cfg.MinVersion := TlsVersion13;
+  if Pos('now', mode) > 0 then
+    cfg.NowUnix := 0;
+  if Pos('conc', mode) > 0 then
+  begin
+    chost := host;
+    cport := port;
+    ccfg := cfg;
+    wg.Add(8);
+    for i := 1 to 8 do
+      pas ConcWorker(i);
+    wg.Wait;
+    WriteLn('routines right ', concGood, ' wrong ', concBad);
+    Halt(0);
+  end;
+  s := TlsDial(host, port, 10000, cfg, err);
+  if s = nil then
+  begin
+    WriteLn('handshake failed: ', err);
+    Halt(0);
+  end;
+  WriteLn('version ', IntToHex(s.Version, 4), ' suite ', IntToHex(s.CipherSuite, 4), ' alpn [', s.Protocol, '] certs ', Length(s.PeerCertificates));
+  dl := Nanotime + 10000000000;
+  if Pos('big', mode) > 0 then
+  begin
+    s.WriteAll('big'#10, dl);
+    got := '';
+    while Length(got) < 1 shl 20 do
+    begin
+      n := s.ReadSome(65536, dl, data);
+      if n <= 0 then
+        Break;
+      got := got + data;
+    end;
+    WriteLn('big ', Length(got), ' ', Hex(Sha256(got)));
+  end;
+  if Pos('raw', mode) > 0 then
+  begin
+    s.WriteAll(ParamStr(6) + #13#10, dl);
+    got := '';
+    for i := 1 to 3 do
+    begin
+      n := s.ReadSome(65536, dl, data);
+      if n <= 0 then
+        Break;
+      got := got + data;
+      if Pos(#10, got) > 0 then
+        Break;
+    end;
+    WriteLn('reply ', Copy(got, 1, 60));
+  end
+  else
+  begin
+    s.WriteAll('hello pastls'#10, dl);
+    got := '';
+    while Pos(#10, got) = 0 do
+    begin
+      n := s.ReadSome(65536, dl, data);
+      if n <= 0 then
+      begin
+        WriteLn('read ', n, ' ', s.LastError);
+        Break;
+      end;
+      got := got + data;
+    end;
+    Write('echo ', got);
+  end;
+  s.Dispose;
+end.

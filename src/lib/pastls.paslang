@@ -1,0 +1,2086 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+
+  paslang is free software: you can redistribute it and/or modify it
+  under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+
+  paslang is distributed in the hope that it will be useful, but
+  WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+  General Public License for more details.
+
+  Under Section 7 of GPL version 3, you are granted additional
+  permissions described in the paslang Runtime Library Exception,
+  version 1.0, in the file COPYING.RUNTIME.
+
+  You should have received a copy of the GNU General Public License
+  along with paslang.  If not, see <https://www.gnu.org/licenses/>. }
+
+
+{ A TLS client in pure paslang (P431): TLS 1.3 (RFC 8446) and TLS 1.2
+  (RFC 5246, ECDHE with AES-GCM and ChaCha20-Poly1305, RFC 5289 and
+  RFC 7905, the extended master secret of RFC 7627), following Go's
+  crypto/tls routine by routine: handshake_client.go,
+  handshake_client_tls13.go, key_schedule.go and
+  crypto/internal/fips140/tls13, conn.go's record layer,
+  handshake_messages.go, cipher_suites.go, prf.go, auth.go. A client
+  only: no server, no resumption, no 0-RTT, no client certificate (an
+  empty one is sent when the server asks).
+
+  The keys come from X25519 (pasx25519) or P-256 and P-384 (pasnist),
+  the records are sealed by pascipher, the server's chain is checked by
+  pasx509 against the system's roots and the server's signatures by
+  pasnist and pasrsa. TTlsStream is a TNetStream (pasconn), so the HTTP,
+  IMAP and SMTP clients read and write through it; a program that uses
+  this unit sets pasconn's TlsDialer and TlsUpgrader. A stream belongs
+  to the routine that uses it; every wait parks that routine until its
+  deadline (Regla 11). }
+unit pastls;
+
+interface
+
+uses
+  sysutils, pastime, pasconn, pascipher, pasx25519, pasnist, pasrsa, pasx509;
+
+const
+  TlsVersion12 = $0303;
+  TlsVersion13 = $0304;
+
+type
+  { what a client asks for; the zero values are Go's defaults }
+  TTlsConfig = class
+  public
+    { the name sent in SNI and checked in the certificate; '' takes the
+      host dialed }
+    ServerName: string;
+    { the application protocols offered, in order of preference (ALPN) }
+    Alpn: TStringArray;
+    { TlsVersion12 or TlsVersion13; 0 is 1.2 and 1.3 }
+    MinVersion, MaxVersion: Integer;
+    { the roots to trust as PEM text; '' trusts the system's }
+    RootsPem: string;
+    { no certificate check at all, as Go's InsecureSkipVerify: tests only }
+    InsecureSkipVerify: Boolean;
+    { the time the certificates are checked at, Unix seconds; 0 is now }
+    NowUnix: Integer;
+  end;
+
+  TTlsStream = class(TNetStream)
+  private
+    FRaw: TNetStream;
+    FInBuf: string;
+    FHand: string;
+    FPlain: string;
+    FVers: Integer;
+    FSuite: Integer;
+    FAlpn: string;
+    FPeerChain: TStringArray;
+    FLeaf: TX509Cert;
+    FClosed: Boolean;
+    FBroken: Boolean;
+    FErr: string;
+    FDone: Boolean;
+    FUseless: Integer;
+    { the two directions: AEAD 0 none, 1 AES-GCM, 2 ChaCha20-Poly1305 }
+    FRdAead, FWrAead: Integer;
+    FRdGcm, FWrGcm: TGcm;
+    FRdKey, FWrKey, FRdIv, FWrIv: string;
+    FRdSeq, FWrSeq: Integer;
+    FRdSecret, FWrSecret: string;
+    FHashAlg: Integer;
+    function ReadRecord(Deadline: Integer; ExpectCcs: Boolean; out Typ: Integer; out Data: string): Boolean;
+    function WriteRecord(Typ: Integer; const Data: string; Deadline: Integer): Boolean;
+    function ReadMsg(Deadline: Integer; out Typ: Integer; out Body, Raw: string): Boolean;
+    procedure Fail(Alert: Integer; const Msg: string; Deadline: Integer);
+    procedure SetRead(Aead: Integer; const Key, Iv: string);
+    procedure SetWrite(Aead: Integer; const Key, Iv: string);
+    procedure SetTraffic13(ForRead: Boolean; const Secret: string);
+    function Seal(Typ: Integer; const Data: string): string;
+    function Open(Typ: Integer; const Header, Payload: string; out Plain: string; out PlainTyp: Integer): Boolean;
+    function Handshake(Config: TTlsConfig; const Host: string; Deadline: Integer): Boolean;
+    function Handshake12(Config: TTlsConfig; const Host, Hello, ClientRandom, ServerRandom: string;
+      const Ext: string; Deadline: Integer): Boolean;
+    function CheckChain(Config: TTlsConfig; const Host: string): Boolean;
+    function VerifySig(Scheme: Integer; const Signed, Sig: string; Tls13: Boolean): Boolean;
+    function PostHandshake(Typ: Integer; const Body: string; Deadline: Integer): Boolean;
+  public
+    constructor Create(Raw: TNetStream);
+    { up to MaxN bytes of application data before Deadline (a Nanotime, 0
+      none): the count, 0 at close_notify or the end of the stream, -110
+      at the deadline, -71 (EPROTO) for a TLS error (LastError says it) }
+    function ReadSome(MaxN, Deadline: Integer; out Data: string): Integer; override;
+    function WriteAll(const Data: string; Deadline: Integer): Boolean; override;
+    { close_notify, then the connection under it }
+    procedure Dispose; override;
+    { TlsVersion12 or TlsVersion13 }
+    function Version: Integer;
+    { the IANA number of the cipher suite }
+    function CipherSuite: Integer;
+    { the protocol the server chose by ALPN, '' none }
+    function Protocol: string;
+    { the server's certificates as it sent them, DER, the leaf first }
+    function PeerCertificates: TStringArray;
+    { what went wrong, in Go's words; '' when nothing did }
+    function LastError: string;
+  end;
+
+{ the handshake as a client over Raw, an open connection: the stream, or
+  nil with Err set (Raw is disposed then) }
+function TlsClient(Raw: TNetStream; Config: TTlsConfig; const Host: string; Deadline: Integer;
+  out Err: string): TTlsStream;
+{ a TCP connection to Host:Port and the handshake, within ConnectMs (0 none) }
+function TlsDial(const Host: string; Port, ConnectMs: Integer; Config: TTlsConfig; out Err: string): TTlsStream;
+
+implementation
+
+const
+  RecCcs = 20;
+  RecAlert = 21;
+  RecHandshake = 22;
+  RecData = 23;
+
+  HsClientHello = 1;
+  HsServerHello = 2;
+  HsNewSessionTicket = 4;
+  HsEncryptedExtensions = 8;
+  HsCertificate = 11;
+  HsServerKeyExchange = 12;
+  HsCertificateRequest = 13;
+  HsServerHelloDone = 14;
+  HsCertificateVerify = 15;
+  HsClientKeyExchange = 16;
+  HsFinished = 20;
+  HsKeyUpdate = 24;
+  HsMessageHash = 254;
+
+  AlertCloseNotify = 0;
+  AlertUnexpectedMessage = 10;
+  AlertBadRecordMac = 20;
+  AlertRecordOverflow = 22;
+  AlertHandshakeFailure = 40;
+  AlertBadCertificate = 42;
+  AlertUnsupportedCertificate = 43;
+  AlertCertificateExpired = 45;
+  AlertUnknownCa = 48;
+  AlertDecodeError = 50;
+  AlertDecryptError = 51;
+  AlertProtocolVersion = 70;
+  AlertInternalError = 80;
+  AlertIllegalParameter = 47;
+  AlertMissingExtension = 109;
+  AlertUnsupportedExtension = 110;
+  AlertNoApplicationProtocol = 120;
+
+  ExtServerName = 0;
+  ExtSupportedGroups = 10;
+  ExtPointFormats = 11;
+  ExtSignatureAlgorithms = 13;
+  ExtAlpn = 16;
+  ExtExtendedMasterSecret = 23;
+  ExtSupportedVersions = 43;
+  ExtCookie = 44;
+  ExtKeyShare = 51;
+  ExtRenegotiationInfo = $ff01;
+
+  GroupP256 = 23;
+  GroupP384 = 24;
+  GroupX25519 = 29;
+
+  { the signature schemes offered, Go's defaultSupportedSignatureAlgorithms
+    without those this client cannot check }
+  SigPkcs1Sha256 = $0401;
+  SigPkcs1Sha384 = $0501;
+  SigPkcs1Sha512 = $0601;
+  SigEcdsaP256Sha256 = $0403;
+  SigEcdsaP384Sha384 = $0503;
+  SigPssSha256 = $0804;
+  SigPssSha384 = $0805;
+  SigPssSha512 = $0806;
+
+  { RFC 8446 4.1.3 and Go's helloRetryRequestRandom }
+  HrrRandomHex = 'cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c';
+
+  MaxPlaintext = 16384;
+  MaxUselessRecords = 16;
+
+{ ---- bytes in and out ---- }
+
+function U8(V: Integer): string;
+begin
+  Result := Chr(V and $FF);
+end;
+
+function U16(V: Integer): string;
+begin
+  Result := Chr((V shr 8) and $FF) + Chr(V and $FF);
+end;
+
+function U24(V: Integer): string;
+begin
+  Result := Chr((V shr 16) and $FF) + Chr((V shr 8) and $FF) + Chr(V and $FF);
+end;
+
+function Vec8(const S: string): string;
+begin
+  Result := U8(Length(S)) + S;
+end;
+
+function Vec16(const S: string): string;
+begin
+  Result := U16(Length(S)) + S;
+end;
+
+function Vec24(const S: string): string;
+begin
+  Result := U24(Length(S)) + S;
+end;
+
+function UnHex(const H: string): string;
+var
+  i, d, v: Integer;
+  c: Char;
+begin
+  SetLength(Result, Length(H) div 2);
+  v := 0;
+  for i := 1 to Length(H) do
+  begin
+    c := H[i];
+    if (c >= '0') and (c <= '9') then
+      d := Ord(c) - 48
+    else
+      d := Ord(c) - 87;
+    if Odd(i) then
+      v := d shl 4
+    else
+      Result[i div 2] := Chr(v or d);
+  end;
+end;
+
+type
+  { a reader over a string, as cryptobyte.String: each read moves on, and
+    a read past the end sets Ok to False and gives zero }
+  TRd = record
+    S: string;
+    P: Integer;
+    Ok: Boolean;
+  end;
+
+procedure RdInit(var R: TRd; const S: string);
+begin
+  R.S := S;
+  R.P := 1;
+  R.Ok := True;
+end;
+
+function RdLeft(const R: TRd): Integer;
+begin
+  Result := Length(R.S) - R.P + 1;
+end;
+
+function RdEmpty(const R: TRd): Boolean;
+begin
+  Result := R.P > Length(R.S);
+end;
+
+function Rd8(var R: TRd): Integer;
+begin
+  Result := 0;
+  if RdLeft(R) < 1 then
+  begin
+    R.Ok := False;
+    Exit;
+  end;
+  Result := Ord(R.S[R.P]);
+  Inc(R.P);
+end;
+
+function Rd16(var R: TRd): Integer;
+begin
+  Result := 0;
+  if RdLeft(R) < 2 then
+  begin
+    R.Ok := False;
+    Exit;
+  end;
+  Result := (Ord(R.S[R.P]) shl 8) or Ord(R.S[R.P + 1]);
+  Inc(R.P, 2);
+end;
+
+function Rd24(var R: TRd): Integer;
+begin
+  Result := 0;
+  if RdLeft(R) < 3 then
+  begin
+    R.Ok := False;
+    Exit;
+  end;
+  Result := (Ord(R.S[R.P]) shl 16) or (Ord(R.S[R.P + 1]) shl 8) or Ord(R.S[R.P + 2]);
+  Inc(R.P, 3);
+end;
+
+function RdBytes(var R: TRd; N: Integer): string;
+begin
+  Result := '';
+  if (N < 0) or (RdLeft(R) < N) then
+  begin
+    R.Ok := False;
+    Exit;
+  end;
+  Result := Copy(R.S, R.P, N);
+  Inc(R.P, N);
+end;
+
+function RdVec8(var R: TRd): string;
+begin
+  Result := RdBytes(R, Rd8(R));
+end;
+
+function RdVec16(var R: TRd): string;
+begin
+  Result := RdBytes(R, Rd16(R));
+end;
+
+function RdVec24(var R: TRd): string;
+begin
+  Result := RdBytes(R, Rd24(R));
+end;
+
+function RandomString(N: Integer): string;
+var
+  b: TBytes;
+  i: Integer;
+begin
+  b := RandomBytes(N);
+  SetLength(Result, N);
+  for i := 0 to N - 1 do
+    Result[i + 1] := Chr(b[i]);
+end;
+
+{ an alert's text, Go's alertText and alert.String }
+function AlertText(A: Integer): string;
+begin
+  case A of
+    0: Result := 'tls: close notify';
+    10: Result := 'tls: unexpected message';
+    20: Result := 'tls: bad record MAC';
+    21: Result := 'tls: decryption failed';
+    22: Result := 'tls: record overflow';
+    30: Result := 'tls: decompression failure';
+    40: Result := 'tls: handshake failure';
+    42: Result := 'tls: bad certificate';
+    43: Result := 'tls: unsupported certificate';
+    44: Result := 'tls: revoked certificate';
+    45: Result := 'tls: expired certificate';
+    46: Result := 'tls: unknown certificate';
+    47: Result := 'tls: illegal parameter';
+    48: Result := 'tls: unknown certificate authority';
+    49: Result := 'tls: access denied';
+    50: Result := 'tls: error decoding message';
+    51: Result := 'tls: error decrypting message';
+    60: Result := 'tls: export restriction';
+    70: Result := 'tls: protocol version not supported';
+    71: Result := 'tls: insufficient security level';
+    80: Result := 'tls: internal error';
+    86: Result := 'tls: inappropriate fallback';
+    90: Result := 'tls: user canceled';
+    100: Result := 'tls: no renegotiation';
+    109: Result := 'tls: missing extension';
+    110: Result := 'tls: unsupported extension';
+    111: Result := 'tls: certificate unobtainable';
+    112: Result := 'tls: unrecognized name';
+    113: Result := 'tls: bad certificate status response';
+    114: Result := 'tls: bad certificate hash value';
+    115: Result := 'tls: unknown PSK identity';
+    116: Result := 'tls: certificate required';
+    120: Result := 'tls: no application protocol';
+    121: Result := 'tls: encrypted client hello required';
+  else
+    Result := 'tls: alert(' + IntToStr(A) + ')';
+  end;
+end;
+
+{ ---- the hashes of the suites ---- }
+
+function HashOf(Alg: Integer; const S: string): string;
+begin
+  if Alg = CipherSha384 then
+    Result := Sha384(S)
+  else
+    Result := Sha256(S);
+end;
+
+{ HKDF-Expand-Label (RFC 8446 7.1, Go's tls13.ExpandLabel) }
+function ExpandLabel(Alg: Integer; const Secret, Lbl, Context: string; Len: Integer): string;
+begin
+  Result := HkdfExpand(Alg, Secret, U16(Len) + Vec8('tls13 ' + Lbl) + Vec8(Context), Len);
+end;
+
+{ Derive-Secret over the hash of a transcript (Go's deriveSecret) }
+function DeriveSecret(Alg: Integer; const Secret, Lbl, Transcript: string): string;
+begin
+  Result := ExpandLabel(Alg, Secret, Lbl, HashOf(Alg, Transcript), CipherHashSize(Alg));
+end;
+
+function ZeroString(N: Integer): string;
+begin
+  SetLength(Result, N);
+  if N > 0 then
+    FillChar(Result[1], N, 0);
+end;
+
+{ ---- the cipher suites (Go's cipher_suites.go) ---- }
+
+{ the suites offered, Go's order: AES-GCM first when the unit is compiled
+  for a processor with AES (Go's hasAESGCMHardwareSupport), ChaCha20 first
+  without it }
+function Suites13: string;
+begin
+{$ifdef CPU_AES}
+  Result := U16($1301) + U16($1302) + U16($1303);
+{$else}
+  Result := U16($1303) + U16($1301) + U16($1302);
+{$endif}
+end;
+
+function Suites12: string;
+begin
+{$ifdef CPU_AES}
+  Result := U16($c02b) + U16($c02f) + U16($c02c) + U16($c030) + U16($cca9) + U16($cca8);
+{$else}
+  Result := U16($cca9) + U16($cca8) + U16($c02b) + U16($c02f) + U16($c02c) + U16($c030);
+{$endif}
+end;
+
+function IsSuite13(S: Integer): Boolean;
+begin
+  Result := (S = $1301) or (S = $1302) or (S = $1303);
+end;
+
+function IsSuite12(S: Integer): Boolean;
+begin
+  Result := (S = $c02b) or (S = $c02f) or (S = $c02c) or (S = $c030) or (S = $cca9) or (S = $cca8);
+end;
+
+{ the AEAD (1 AES-GCM, 2 ChaCha20-Poly1305), its key length and the hash
+  of a suite }
+procedure SuiteParams(S: Integer; out Aead, KeyLen, Hash: Integer);
+begin
+  Aead := 1;
+  KeyLen := 16;
+  Hash := CipherSha256;
+  case S of
+    $1302, $c02c, $c030:
+      begin
+        KeyLen := 32;
+        Hash := CipherSha384;
+      end;
+    $1303, $cca9, $cca8:
+      begin
+        Aead := 2;
+        KeyLen := 32;
+      end;
+  end;
+end;
+
+{ whether a TLS 1.2 suite signs with ECDSA (else RSA) }
+function Suite12Ecdsa(S: Integer): Boolean;
+begin
+  Result := (S = $c02b) or (S = $c02c) or (S = $cca9);
+end;
+
+function SigAlgs: string;
+begin
+  Result := U16(SigPssSha256) + U16(SigEcdsaP256Sha256) + U16(SigPssSha384) + U16(SigPssSha512) +
+    U16(SigPkcs1Sha256) + U16(SigPkcs1Sha384) + U16(SigPkcs1Sha512) + U16(SigEcdsaP384Sha384);
+end;
+
+function SigOffered(Scheme: Integer): Boolean;
+begin
+  case Scheme of
+    SigPssSha256, SigEcdsaP256Sha256, SigPssSha384, SigPssSha512, SigPkcs1Sha256, SigPkcs1Sha384,
+    SigPkcs1Sha512, SigEcdsaP384Sha384:
+      Result := True;
+  else
+    Result := False;
+  end;
+end;
+
+{ ---- the stream ---- }
+
+constructor TTlsStream.Create(Raw: TNetStream);
+begin
+  inherited Create;
+  FRaw := Raw;
+end;
+
+function TTlsStream.Version: Integer;
+begin
+  Result := FVers;
+end;
+
+function TTlsStream.CipherSuite: Integer;
+begin
+  Result := FSuite;
+end;
+
+function TTlsStream.Protocol: string;
+begin
+  Result := FAlpn;
+end;
+
+function TTlsStream.PeerCertificates: TStringArray;
+begin
+  Result := FPeerChain;
+end;
+
+function TTlsStream.LastError: string;
+begin
+  Result := FErr;
+end;
+
+procedure TTlsStream.SetRead(Aead: Integer; const Key, Iv: string);
+begin
+  FRdAead := Aead;
+  FRdKey := Key;
+  FRdIv := Iv;
+  FRdSeq := 0;
+  if Aead = 1 then
+    GcmInit(FRdGcm, Key);
+end;
+
+procedure TTlsStream.SetWrite(Aead: Integer; const Key, Iv: string);
+begin
+  FWrAead := Aead;
+  FWrKey := Key;
+  FWrIv := Iv;
+  FWrSeq := 0;
+  if Aead = 1 then
+    GcmInit(FWrGcm, Key);
+end;
+
+{ the keys of a TLS 1.3 traffic secret (RFC 8446 7.3, Go's
+  cipherSuiteTLS13.trafficKey) }
+procedure TTlsStream.SetTraffic13(ForRead: Boolean; const Secret: string);
+var
+  aead, keyLen, hash: Integer;
+  key, iv: string;
+begin
+  SuiteParams(FSuite, aead, keyLen, hash);
+  key := ExpandLabel(hash, Secret, 'key', '', keyLen);
+  iv := ExpandLabel(hash, Secret, 'iv', '', 12);
+  if ForRead then
+  begin
+    FRdSecret := Secret;
+    SetRead(aead, key, iv);
+  end
+  else
+  begin
+    FWrSecret := Secret;
+    SetWrite(aead, key, iv);
+  end;
+end;
+
+{ the per-record nonce: the IV xored with the sequence number (RFC 8446
+  5.3, Go's xorNonceAEAD), or for TLS 1.2's GCM the four fixed bytes and
+  the eight of the sequence (Go's prefixNonceAEAD) }
+function RecNonce(Aead: Integer; const Iv: string; Seq: Integer; Tls13: Boolean): string;
+var
+  i: Integer;
+  s: array[0..7] of Byte;
+begin
+  StoreBE64(@s[0], Seq);
+  if (not Tls13) and (Aead = 1) then
+  begin
+    Result := Iv + Chr(s[0]) + Chr(s[1]) + Chr(s[2]) + Chr(s[3]) + Chr(s[4]) + Chr(s[5]) + Chr(s[6]) + Chr(s[7]);
+    Exit;
+  end;
+  Result := Iv;
+  for i := 0 to 7 do
+    Result[5 + i] := Chr(Ord(Result[5 + i]) xor s[i]);
+end;
+
+function SealWith(Aead: Integer; const Gcm: TGcm; const Key, Nonce, Plain, Ad: string): string;
+begin
+  if Aead = 1 then
+    Result := GcmSeal(Gcm, Nonce, Plain, Ad)
+  else
+    Result := ChaChaPolySeal(Key, Nonce, Plain, Ad);
+end;
+
+function OpenWith(Aead: Integer; const Gcm: TGcm; const Key, Nonce, Sealed, Ad: string; out Plain: string): Boolean;
+begin
+  if Aead = 1 then
+    Result := GcmOpen(Gcm, Nonce, Sealed, Ad, Plain)
+  else
+    Result := ChaChaPolyOpen(Key, Nonce, Sealed, Ad, Plain);
+end;
+
+{ a record's payload, sealed when the write side has keys (Go's
+  halfConn.encrypt) }
+function TTlsStream.Seal(Typ: Integer; const Data: string): string;
+var
+  nonce, ad, seq: string;
+begin
+  if FWrAead = 0 then
+  begin
+    Result := Data;
+    Exit;
+  end;
+  nonce := RecNonce(FWrAead, FWrIv, FWrSeq, FVers = TlsVersion13);
+  if FVers = TlsVersion13 then
+  begin
+    { TLSInnerPlaintext: the content and its type, no padding; the outer
+      type is application_data and the header is the additional data }
+    ad := U8(RecData) + U16($0303) + U16(Length(Data) + 1 + 16);
+    Result := SealWith(FWrAead, FWrGcm, FWrKey, nonce, Data + U8(Typ), ad);
+  end
+  else
+  begin
+    SetLength(seq, 8);
+    StoreBE64(@seq[1], FWrSeq);
+    ad := seq + U8(Typ) + U16($0303) + U16(Length(Data));
+    Result := SealWith(FWrAead, FWrGcm, FWrKey, nonce, Data, ad);
+    if FWrAead = 1 then
+      Result := seq + Result;
+  end;
+  Inc(FWrSeq);
+end;
+
+{ a record's payload opened (Go's halfConn.decrypt): False for a bad tag,
+  PlainTyp the inner type in TLS 1.3 }
+function TTlsStream.Open(Typ: Integer; const Header, Payload: string; out Plain: string; out PlainTyp: Integer): Boolean;
+var
+  nonce, ad, seq, body: string;
+  i: Integer;
+begin
+  Result := False;
+  Plain := '';
+  PlainTyp := Typ;
+  if FRdAead = 0 then
+  begin
+    Plain := Payload;
+    Result := True;
+    Exit;
+  end;
+  if FVers = TlsVersion13 then
+  begin
+    if Typ = RecCcs then
+    begin
+      Plain := Payload;
+      Result := True;
+      Exit;
+    end;
+    nonce := RecNonce(FRdAead, FRdIv, FRdSeq, True);
+    if not OpenWith(FRdAead, FRdGcm, FRdKey, nonce, Payload, Header, body) then
+      Exit;
+    { the type is the last byte that is not zero }
+    i := Length(body);
+    while (i > 0) and (body[i] = #0) do
+      Dec(i);
+    if i = 0 then
+    begin
+      PlainTyp := -1;
+      Result := True;
+      Inc(FRdSeq);
+      Exit;
+    end;
+    PlainTyp := Ord(body[i]);
+    Plain := Copy(body, 1, i - 1);
+  end
+  else
+  begin
+    SetLength(seq, 8);
+    StoreBE64(@seq[1], FRdSeq);
+    if FRdAead = 1 then
+    begin
+      if Length(Payload) < 8 + 16 then
+        Exit;
+      nonce := FRdIv + Copy(Payload, 1, 8);
+      body := Copy(Payload, 9, Length(Payload) - 8);
+    end
+    else
+    begin
+      if Length(Payload) < 16 then
+        Exit;
+      nonce := RecNonce(FRdAead, FRdIv, FRdSeq, False);
+      body := Payload;
+    end;
+    ad := seq + U8(Typ) + U16($0303) + U16(Length(body) - 16);
+    if not OpenWith(FRdAead, FRdGcm, FRdKey, nonce, body, ad, Plain) then
+      Exit;
+  end;
+  Inc(FRdSeq);
+  Result := True;
+end;
+
+{ a fatal alert to the peer (sealed when there are keys) and the error
+  kept; the stream is of no more use }
+procedure TTlsStream.Fail(Alert: Integer; const Msg: string; Deadline: Integer);
+begin
+  if FErr = '' then
+    FErr := Msg;
+  if (not FBroken) and (Alert >= 0) then
+  begin
+    FBroken := True;
+    WriteRecord(RecAlert, U8(2) + U8(Alert), Deadline);
+  end;
+  FBroken := True;
+end;
+
+function TTlsStream.WriteRecord(Typ: Integer; const Data: string; Deadline: Integer): Boolean;
+var
+  vers, outer: Integer;
+begin
+  vers := $0303;
+  if FVers = 0 then
+    vers := $0301;
+  { a sealed TLS 1.3 record says application_data outside (RFC 8446 5.2) }
+  outer := Typ;
+  if (FVers = TlsVersion13) and (FWrAead <> 0) then
+    outer := RecData;
+  Result := FRaw.WriteAll(U8(outer) + U16(vers) + Vec16(Seal(Typ, Data)), Deadline);
+  if not Result then
+  begin
+    FBroken := True;
+    if FErr = '' then
+      FErr := 'tls: write failed';
+  end;
+end;
+
+{ one record, opened (Go's readRecordOrCCS): handshake bytes go to FHand,
+  application data to Data; alerts end the stream; a change_cipher_spec
+  is let by in TLS 1.3 and reported in TLS 1.2 (Typ RecCcs) }
+function TTlsStream.ReadRecord(Deadline: Integer; ExpectCcs: Boolean; out Typ: Integer; out Data: string): Boolean;
+var
+  hdr, payload, plain: string;
+  n, err, vers, ptyp: Integer;
+begin
+  Result := False;
+  Data := '';
+  Typ := 0;
+  while True do
+  begin
+    if not ReadExactFrom(FRaw, FInBuf, 5, hdr, Deadline, err) then
+    begin
+      if err = -110 then
+        FErr := 'tls: read timeout'
+      else if err = 0 then
+        FErr := 'EOF'
+      else
+        FErr := 'tls: read failed';
+      FBroken := err <> -110;
+      Typ := err;
+      Exit;
+    end;
+    Typ := Ord(hdr[1]);
+    vers := (Ord(hdr[2]) shl 8) or Ord(hdr[3]);
+    n := (Ord(hdr[4]) shl 8) or Ord(hdr[5]);
+    if (FVers <> 0) and (vers <> $0303) then
+    begin
+      Fail(AlertProtocolVersion, 'tls: received record with version ' + IntToHex(vers, 0) + ' when expecting version 303', Deadline);
+      Exit;
+    end;
+    if (FVers = 0) and (((Typ <> RecAlert) and (Typ <> RecHandshake)) or (vers >= $1000)) then
+    begin
+      Fail(-1, 'tls: first record does not look like a TLS handshake', Deadline);
+      Exit;
+    end;
+    if ((FVers = TlsVersion13) and (n > 16384 + 256)) or (n > 16384 + 2048) then
+    begin
+      Fail(AlertRecordOverflow, 'tls: oversized record received with length ' + IntToStr(n), Deadline);
+      Exit;
+    end;
+    if not ReadExactFrom(FRaw, FInBuf, n, payload, Deadline, err) then
+    begin
+      FErr := 'unexpected EOF';
+      FBroken := True;
+      Exit;
+    end;
+    if (FVers = TlsVersion13) and (FRdAead <> 0) and (Typ <> RecData) and (Typ <> RecCcs) then
+    begin
+      Fail(AlertUnexpectedMessage, 'tls: unexpected message', Deadline);
+      Exit;
+    end;
+    if not Open(Typ, hdr, payload, plain, ptyp) then
+    begin
+      Fail(AlertBadRecordMac, 'local error: tls: bad record MAC', Deadline);
+      Exit;
+    end;
+    if ptyp = -1 then
+    begin
+      Fail(AlertUnexpectedMessage, 'tls: unexpected message', Deadline);
+      Exit;
+    end;
+    Typ := ptyp;
+    if Length(plain) > MaxPlaintext then
+    begin
+      Fail(AlertRecordOverflow, 'tls: record overflow', Deadline);
+      Exit;
+    end;
+    if (FRdAead = 0) and (Typ = RecData) then
+    begin
+      Fail(AlertUnexpectedMessage, 'tls: unexpected message', Deadline);
+      Exit;
+    end;
+    if (FVers = TlsVersion13) and (Typ <> RecHandshake) and (FHand <> '') then
+    begin
+      Fail(AlertUnexpectedMessage, 'tls: unexpected message', Deadline);
+      Exit;
+    end;
+    case Typ of
+      RecAlert:
+        begin
+          if Length(plain) <> 2 then
+          begin
+            Fail(AlertUnexpectedMessage, 'tls: unexpected message', Deadline);
+            Exit;
+          end;
+          if Ord(plain[2]) = AlertCloseNotify then
+          begin
+            FClosed := True;
+            FErr := 'EOF';
+            Typ := 0;
+            Exit;
+          end;
+          if (FVers <> TlsVersion13) and (Ord(plain[1]) = 1) then
+          begin
+            Inc(FUseless);
+            if FUseless > MaxUselessRecords then
+            begin
+              Fail(AlertUnexpectedMessage, 'tls: too many ignored records', Deadline);
+              Exit;
+            end;
+            Continue;
+          end;
+          FBroken := True;
+          FErr := 'remote error: ' + AlertText(Ord(plain[2]));
+          Typ := -1;
+          Exit;
+        end;
+      RecCcs:
+        begin
+          if (Length(plain) <> 1) or (plain[1] <> #1) then
+          begin
+            Fail(AlertDecodeError, 'tls: decode error', Deadline);
+            Exit;
+          end;
+          if FHand <> '' then
+          begin
+            Fail(AlertUnexpectedMessage, 'tls: unexpected message', Deadline);
+            Exit;
+          end;
+          if FVers = TlsVersion13 then
+          begin
+            Inc(FUseless);
+            if FUseless > MaxUselessRecords then
+            begin
+              Fail(AlertUnexpectedMessage, 'tls: too many ignored records', Deadline);
+              Exit;
+            end;
+            Continue;
+          end;
+          if not ExpectCcs then
+          begin
+            Fail(AlertUnexpectedMessage, 'tls: unexpected message', Deadline);
+            Exit;
+          end;
+          Result := True;
+          Exit;
+        end;
+      RecData:
+        begin
+          if (not FDone) or ExpectCcs then
+          begin
+            Fail(AlertUnexpectedMessage, 'tls: unexpected message', Deadline);
+            Exit;
+          end;
+          if plain = '' then
+          begin
+            Inc(FUseless);
+            if FUseless > MaxUselessRecords then
+            begin
+              Fail(AlertUnexpectedMessage, 'tls: too many ignored records', Deadline);
+              Exit;
+            end;
+            Continue;
+          end;
+          FUseless := 0;
+          Data := plain;
+          Result := True;
+          Exit;
+        end;
+      RecHandshake:
+        begin
+          if (plain = '') or ExpectCcs then
+          begin
+            Fail(AlertUnexpectedMessage, 'tls: unexpected message', Deadline);
+            Exit;
+          end;
+          FUseless := 0;
+          FHand := FHand + plain;
+          Result := True;
+          Exit;
+        end;
+    else
+      Fail(AlertUnexpectedMessage, 'tls: unexpected message', Deadline);
+      Exit;
+    end;
+  end;
+end;
+
+{ the next handshake message (Go's readHandshake): its type, its body and
+  the whole message with its header for the transcript }
+function TTlsStream.ReadMsg(Deadline: Integer; out Typ: Integer; out Body, Raw: string): Boolean;
+var
+  n, rt: Integer;
+  data: string;
+begin
+  Result := False;
+  Typ := 0;
+  Body := '';
+  Raw := '';
+  while Length(FHand) < 4 do
+    if (not ReadRecord(Deadline, False, rt, data)) or (rt <> RecHandshake) then
+    begin
+      if (rt = RecData) and (FErr = '') then
+        Fail(AlertUnexpectedMessage, 'tls: unexpected message', Deadline);
+      Exit;
+    end;
+  n := (Ord(FHand[2]) shl 16) or (Ord(FHand[3]) shl 8) or Ord(FHand[4]);
+  if n > 65536 then
+  begin
+    Fail(AlertInternalError, 'tls: handshake message of length ' + IntToStr(n) + ' bytes exceeds maximum of 65536 bytes', Deadline);
+    Exit;
+  end;
+  while Length(FHand) < 4 + n do
+    if (not ReadRecord(Deadline, False, rt, data)) or (rt <> RecHandshake) then
+    begin
+      if (rt = RecData) and (FErr = '') then
+        Fail(AlertUnexpectedMessage, 'tls: unexpected message', Deadline);
+      Exit;
+    end;
+  Typ := Ord(FHand[1]);
+  Raw := Copy(FHand, 1, 4 + n);
+  Body := Copy(FHand, 5, n);
+  Delete(FHand, 1, 4 + n);
+  Result := True;
+end;
+
+{ whether A and B are equal, in a time that depends on their lengths
+  alone (Go's hmac.Equal) }
+function CtEqualStr(const A, B: string): Boolean;
+var
+  i, d: Integer;
+begin
+  Result := False;
+  if Length(A) <> Length(B) then
+    Exit;
+  d := 0;
+  for i := 1 to Length(A) do
+    d := d or (Ord(A[i]) xor Ord(B[i]));
+  Result := d = 0;
+end;
+
+{ ---- the server's certificate and signatures ---- }
+
+{ the server's chain checked against the roots and the host name
+  (Go's verifyServerCertificate) }
+function TTlsStream.CheckChain(Config: TTlsConfig; const Host: string): Boolean;
+var
+  err: string;
+  now, i: Integer;
+  roots: TX509Pool;
+  c: TX509Cert;
+begin
+  Result := False;
+  if Length(FPeerChain) = 0 then
+  begin
+    Fail(AlertDecodeError, 'tls: received empty certificates message', 0);
+    Exit;
+  end;
+  { every certificate parses, whether checked or not (Go's
+    verifyServerCertificate) }
+  for i := 0 to Length(FPeerChain) - 1 do
+  begin
+    if not X509Parse(FPeerChain[i], c, err) then
+    begin
+      Fail(AlertBadCertificate, 'tls: failed to parse certificate from server: ' + err, 0);
+      Exit;
+    end;
+    if i = 0 then
+      FLeaf := c;
+  end;
+  if (FLeaf.PublicKeyAlgorithm <> X509PkRSA) and (FLeaf.PublicKeyAlgorithm <> X509PkECDSA) then
+  begin
+    Fail(AlertUnsupportedCertificate, 'tls: server''s certificate contains an unsupported type of public key', 0);
+    Exit;
+  end;
+  if Config.InsecureSkipVerify then
+  begin
+    Result := True;
+    Exit;
+  end;
+  now := Config.NowUnix;
+  if now = 0 then
+    now := NowUnix;
+  roots := nil;
+  if Config.RootsPem <> '' then
+  begin
+    roots := TX509Pool.Create;
+    roots.AppendCertsFromPEM(Config.RootsPem);
+  end;
+  if not X509VerifyServer(FPeerChain, Host, now, roots, err) then
+  begin
+    Fail(AlertBadCertificate, 'tls: failed to verify certificate: ' + err, 0);
+    Exit;
+  end;
+  Result := True;
+end;
+
+{ a signature by the leaf's key under a scheme (Go's
+  verifyHandshakeSignature): ECDSA on the key's own curve, RSA PSS with a
+  salt as long as the hash, or PKCS #1 v1.5 (TLS 1.2 only) }
+function TTlsStream.VerifySig(Scheme: Integer; const Signed, Sig: string; Tls13: Boolean): Boolean;
+var
+  rsa, p256, p384: Boolean;
+  pub, n: string;
+  e, curve: Integer;
+begin
+  Result := False;
+  if FLeaf = nil then
+    Exit;
+  rsa := FLeaf.PublicKeyAlgorithm = X509PkRSA;
+  p256 := (FLeaf.PublicKeyAlgorithm = X509PkECDSA) and (FLeaf.EcCurve = X509CurveP256);
+  p384 := (FLeaf.PublicKeyAlgorithm = X509PkECDSA) and (FLeaf.EcCurve = X509CurveP384);
+  pub := FLeaf.EcPoint;
+  n := FLeaf.RsaN;
+  e := FLeaf.RsaE;
+  { TLS 1.3 binds an ECDSA scheme to its curve; TLS 1.2's names only the
+    hash, the curve being the key's (Go's signatureSchemesForPublicKey) }
+  if not Tls13 then
+  begin
+    if p256 then
+      curve := NistP256
+    else
+      curve := NistP384;
+    if Scheme = SigEcdsaP256Sha256 then
+    begin
+      Result := (p256 or p384) and NistEcdsaVerifyAsn1(curve, pub, Sha256(Signed), Sig);
+      Exit;
+    end;
+    if Scheme = SigEcdsaP384Sha384 then
+    begin
+      Result := (p256 or p384) and NistEcdsaVerifyAsn1(curve, pub, Sha384(Signed), Sig);
+      Exit;
+    end;
+  end;
+  case Scheme of
+    SigEcdsaP256Sha256:
+      Result := p256 and NistEcdsaVerifyAsn1(NistP256, pub, Sha256(Signed), Sig);
+    SigEcdsaP384Sha384:
+      Result := p384 and NistEcdsaVerifyAsn1(NistP384, pub, Sha384(Signed), Sig);
+    SigPssSha256:
+      Result := rsa and RsaVerifyPss(n, e, RsaSha256, Sha256(Signed), Sig, 32);
+    SigPssSha384:
+      Result := rsa and RsaVerifyPss(n, e, RsaSha384, Sha384(Signed), Sig, 48);
+    SigPssSha512:
+      Result := rsa and RsaVerifyPss(n, e, RsaSha512, Sha512(Signed), Sig, 64);
+    SigPkcs1Sha256:
+      Result := (not Tls13) and rsa and RsaVerifyPkcs1v15(n, e, RsaSha256, Sha256(Signed), Sig);
+    SigPkcs1Sha384:
+      Result := (not Tls13) and rsa and RsaVerifyPkcs1v15(n, e, RsaSha384, Sha384(Signed), Sig);
+    SigPkcs1Sha512:
+      Result := (not Tls13) and rsa and RsaVerifyPkcs1v15(n, e, RsaSha512, Sha512(Signed), Sig);
+  end;
+end;
+
+{ ---- key shares ---- }
+
+{ a private key and its public share for a group; '' when the group is
+  not one of this client's }
+function KeyShare(Group: Integer; out Priv: string): string;
+begin
+  Result := '';
+  Priv := '';
+  case Group of
+    GroupX25519:
+      begin
+        Priv := RandomString(32);
+        Result := X25519PublicKey(Priv);
+      end;
+    GroupP256, GroupP384:
+      { a scalar in [1, n-1], drawn again when it is not (Go's
+        ecdh.GenerateKey) }
+      repeat
+        if Group = GroupP256 then
+        begin
+          Priv := RandomString(32);
+          Result := NistPublicKey(NistP256, Priv);
+        end
+        else
+        begin
+          Priv := RandomString(48);
+          Result := NistPublicKey(NistP384, Priv);
+        end;
+      until Result <> '';
+  end;
+end;
+
+function SharedSecret(Group: Integer; const Priv, Peer: string; out Shared: string): Boolean;
+begin
+  Shared := '';
+  case Group of
+    GroupX25519:
+      Result := X25519Shared(Priv, Peer, Shared);
+    GroupP256:
+      Result := NistEcdh(NistP256, Priv, Peer, Shared);
+    GroupP384:
+      Result := NistEcdh(NistP384, Priv, Peer, Shared);
+  else
+    Result := False;
+  end;
+end;
+
+{ ---- the handshake ---- }
+
+{ the extensions of a ServerHello by type, each once (Go's
+  serverHelloMsg.unmarshal refuses a repeated one) }
+type
+  TExtMap = record
+    Ids: array of Integer;
+    Vals: array of string;
+  end;
+
+function ParseExts(const S: string; var M: TExtMap): Boolean;
+var
+  r: TRd;
+  id, i, k: Integer;
+  v: string;
+begin
+  Result := False;
+  SetLength(M.Ids, 0);
+  SetLength(M.Vals, 0);
+  RdInit(r, S);
+  while not RdEmpty(r) do
+  begin
+    id := Rd16(r);
+    v := RdVec16(r);
+    if not r.Ok then
+      Exit;
+    for i := 0 to Length(M.Ids) - 1 do
+      if M.Ids[i] = id then
+        Exit;
+    k := Length(M.Ids);
+    SetLength(M.Ids, k + 1);
+    SetLength(M.Vals, k + 1);
+    M.Ids[k] := id;
+    M.Vals[k] := v;
+  end;
+  Result := True;
+end;
+
+function ExtGet(const M: TExtMap; Id: Integer; out V: string): Boolean;
+var
+  i: Integer;
+begin
+  V := '';
+  Result := False;
+  for i := 0 to Length(M.Ids) - 1 do
+    if M.Ids[i] = Id then
+    begin
+      V := M.Vals[i];
+      Result := True;
+      Exit;
+    end;
+end;
+
+{ whether S looks like an IP address, which SNI does not carry (Go's
+  hostnameInSNI) }
+function IsIpLiteral(const S: string): Boolean;
+var
+  i: Integer;
+  c: Char;
+  digitsDots: Boolean;
+begin
+  Result := Pos(':', S) > 0;
+  if Result then
+    Exit;
+  digitsDots := S <> '';
+  for i := 1 to Length(S) do
+  begin
+    c := S[i];
+    if not (((c >= '0') and (c <= '9')) or (c = '.')) then
+      digitsDots := False;
+  end;
+  Result := digitsDots;
+end;
+
+function TTlsStream.Handshake(Config: TTlsConfig; const Host: string; Deadline: Integer): Boolean;
+var
+  minV, maxV, typ, i, aead, keyLen, hash, group, selGroup, legacy: Integer;
+  random, sessionId, suites, versions, exts, hello, body, raw, shRaw, serverRandom, cookie: string;
+  privShare, share, shared, transcript, earlySecret, hsSecret, masterSecret: string;
+  clientHs, serverHs, clientAp, serverAp, finKey, verify, alpnList, sni, v, protos, chainMsg, ctx, cert, sig: string;
+  r, r2: TRd;
+  m: TExtMap;
+  hrr, ok: Boolean;
+  chain: TStringArray;
+  scheme: Integer;
+begin
+  Result := False;
+  minV := Config.MinVersion;
+  if minV = 0 then
+    minV := TlsVersion12;
+  maxV := Config.MaxVersion;
+  if maxV = 0 then
+    maxV := TlsVersion13;
+  if (minV > maxV) or (minV < TlsVersion12) or (maxV > TlsVersion13) then
+  begin
+    FErr := 'tls: no supported versions satisfy MinVersion and MaxVersion';
+    Exit;
+  end;
+  sni := Host;
+  if Config.ServerName <> '' then
+    sni := Config.ServerName;
+  random := RandomString(32);
+  sessionId := RandomString(32);
+  group := GroupX25519;
+  share := KeyShare(group, privShare);
+  suites := '';
+  versions := '';
+  if maxV = TlsVersion13 then
+  begin
+    suites := Suites13;
+    versions := U16(TlsVersion13);
+  end;
+  if minV = TlsVersion12 then
+  begin
+    suites := suites + Suites12;
+    versions := versions + U16(TlsVersion12);
+  end;
+  cookie := '';
+  { the ClientHello (Go's makeClientHello and clientHelloMsg.marshal) }
+  hrr := False;
+  while True do
+  begin
+    exts := '';
+    if (sni <> '') and not IsIpLiteral(sni) then
+      exts := exts + U16(ExtServerName) + Vec16(Vec16(U8(0) + Vec16(sni)));
+    if minV = TlsVersion12 then
+    begin
+      exts := exts + U16(ExtPointFormats) + Vec16(Vec8(U8(0)));
+      exts := exts + U16(ExtRenegotiationInfo) + Vec16(Vec8(''));
+      exts := exts + U16(ExtExtendedMasterSecret) + U16(0);
+    end;
+    exts := exts + U16(ExtSupportedGroups) + Vec16(Vec16(U16(GroupX25519) + U16(GroupP256) + U16(GroupP384)));
+    exts := exts + U16(ExtSignatureAlgorithms) + Vec16(Vec16(SigAlgs));
+    if Length(Config.Alpn) > 0 then
+    begin
+      alpnList := '';
+      for i := 0 to Length(Config.Alpn) - 1 do
+        alpnList := alpnList + Vec8(Config.Alpn[i]);
+      exts := exts + U16(ExtAlpn) + Vec16(Vec16(alpnList));
+    end;
+    exts := exts + U16(ExtSupportedVersions) + Vec16(Vec8(versions));
+    if cookie <> '' then
+      exts := exts + U16(ExtCookie) + Vec16(Vec16(cookie));
+    if maxV = TlsVersion13 then
+      exts := exts + U16(ExtKeyShare) + Vec16(Vec16(U16(group) + Vec16(share)));
+    body := U16($0303) + random + Vec8(sessionId) + Vec16(suites) + Vec8(U8(0)) + Vec16(exts);
+    hello := U8(HsClientHello) + Vec24(body);
+    if not WriteRecord(RecHandshake, hello, Deadline) then
+      Exit;
+    if hrr then
+      transcript := transcript + hello
+    else
+      transcript := hello;
+    { the ServerHello }
+    if not ReadMsg(Deadline, typ, body, shRaw) then
+      Exit;
+    if typ <> HsServerHello then
+    begin
+      Fail(AlertUnexpectedMessage, 'tls: unexpected message', Deadline);
+      Exit;
+    end;
+    RdInit(r, body);
+    legacy := Rd16(r);
+    serverRandom := RdBytes(r, 32);
+    v := RdVec8(r);
+    FSuite := Rd16(r);
+    i := Rd8(r);
+    ok := r.Ok;
+    if RdEmpty(r) then
+      SetLength(m.Ids, 0)
+    else
+      ok := ok and ParseExts(RdVec16(r), m) and r.Ok and RdEmpty(r);
+    if not ok then
+    begin
+      Fail(AlertDecodeError, 'tls: error decoding message', Deadline);
+      Exit;
+    end;
+    if not ExtGet(m, ExtSupportedVersions, v) then
+    begin
+      { TLS 1.2 (or older): Go's pickTLSVersion on the legacy field }
+      if hrr or (legacy <> TlsVersion12) or (minV > TlsVersion12) then
+      begin
+        Fail(AlertProtocolVersion, 'tls: server selected unsupported protocol version ' + IntToHex(legacy, 0), Deadline);
+        Exit;
+      end;
+      { RFC 8446 4.1.3's downgrade sentinel (Go's downgradeCanaryTLS12) }
+      if (maxV = TlsVersion13) and (Copy(serverRandom, 25, 8) = 'DOWNGRD'#1) then
+      begin
+        Fail(AlertIllegalParameter, 'tls: downgrade attempt detected, possibly due to a MitM attack or a broken middlebox', Deadline);
+        Exit;
+      end;
+      FVers := TlsVersion12;
+      Result := Handshake12(Config, sni, transcript + shRaw, random, serverRandom, body, Deadline);
+      Exit;
+    end;
+    { TLS 1.3 (Go's checkServerHelloOrHRR) }
+    RdInit(r2, v);
+    i := Rd16(r2);
+    if (not r2.Ok) or not RdEmpty(r2) then
+    begin
+      Fail(AlertDecodeError, 'tls: error decoding message', Deadline);
+      Exit;
+    end;
+    if (i <> TlsVersion13) or (maxV < TlsVersion13) then
+    begin
+      Fail(AlertIllegalParameter, 'tls: server selected an invalid version after a HelloRetryRequest', Deadline);
+      Exit;
+    end;
+    if legacy <> TlsVersion12 then
+    begin
+      Fail(AlertIllegalParameter, 'tls: server sent an incorrect legacy version', Deadline);
+      Exit;
+    end;
+    FVers := TlsVersion13;
+    for i := 0 to Length(m.Ids) - 1 do
+      if (m.Ids[i] = ExtExtendedMasterSecret) or (m.Ids[i] = ExtRenegotiationInfo) or (m.Ids[i] = ExtAlpn) or
+        (m.Ids[i] = ExtPointFormats) then
+      begin
+        Fail(AlertUnsupportedExtension, 'tls: server sent a ServerHello extension forbidden in TLS 1.3', Deadline);
+        Exit;
+      end;
+    RdInit(r2, body);
+    Rd16(r2);
+    RdBytes(r2, 32);
+    if RdVec8(r2) <> sessionId then
+    begin
+      Fail(AlertIllegalParameter, 'tls: server did not echo the legacy session ID', Deadline);
+      Exit;
+    end;
+    RdInit(r2, body);
+    RdBytes(r2, 2 + 32);
+    RdVec8(r2);
+    Rd16(r2);
+    if Rd8(r2) <> 0 then
+    begin
+      Fail(AlertDecodeError, 'tls: server sent non-zero legacy TLS compression method', Deadline);
+      Exit;
+    end;
+    if (not IsSuite13(FSuite)) or (Pos(U16(FSuite), Suites13) mod 2 <> 1) then
+    begin
+      Fail(AlertIllegalParameter, 'tls: server chose an unconfigured cipher suite', Deadline);
+      Exit;
+    end;
+    SuiteParams(FSuite, aead, keyLen, hash);
+    FHashAlg := hash;
+    if serverRandom <> UnHex(HrrRandomHex) then
+      Break;
+    { a HelloRetryRequest (Go's processHelloRetryRequest) }
+    if hrr then
+    begin
+      Fail(AlertUnexpectedMessage, 'tls: server sent two HelloRetryRequest messages', Deadline);
+      Exit;
+    end;
+    hrr := True;
+    { the dummy change_cipher_spec of middlebox compatibility, once }
+    if not WriteRecord(RecCcs, #1, Deadline) then
+      Exit;
+    transcript := U8(HsMessageHash) + U24(CipherHashSize(hash)) + HashOf(hash, transcript) + shRaw;
+    selGroup := 0;
+    if ExtGet(m, ExtKeyShare, v) then
+    begin
+      RdInit(r2, v);
+      selGroup := Rd16(r2);
+      if (not r2.Ok) or not RdEmpty(r2) then
+      begin
+        Fail(AlertDecodeError, 'tls: received malformed key_share extension', Deadline);
+        Exit;
+      end;
+    end;
+    ExtGet(m, ExtCookie, v);
+    cookie := '';
+    if v <> '' then
+    begin
+      RdInit(r2, v);
+      cookie := RdVec16(r2);
+    end;
+    if (selGroup = 0) and (cookie = '') then
+    begin
+      Fail(AlertIllegalParameter, 'tls: server sent an unnecessary HelloRetryRequest message', Deadline);
+      Exit;
+    end;
+    if selGroup <> 0 then
+    begin
+      if (selGroup <> GroupX25519) and (selGroup <> GroupP256) and (selGroup <> GroupP384) then
+      begin
+        Fail(AlertIllegalParameter, 'tls: server selected unsupported group', Deadline);
+        Exit;
+      end;
+      if selGroup = group then
+      begin
+        Fail(AlertIllegalParameter, 'tls: server sent an unnecessary HelloRetryRequest key_share', Deadline);
+        Exit;
+      end;
+      group := selGroup;
+      share := KeyShare(group, privShare);
+    end;
+  end;
+  transcript := transcript + shRaw;
+  { processServerHello }
+  if ExtGet(m, ExtCookie, v) then
+  begin
+    Fail(AlertUnsupportedExtension, 'tls: server sent a cookie in a normal ServerHello', Deadline);
+    Exit;
+  end;
+  if not ExtGet(m, ExtKeyShare, v) then
+  begin
+    Fail(AlertIllegalParameter, 'tls: server did not send a key share', Deadline);
+    Exit;
+  end;
+  RdInit(r2, v);
+  i := Rd16(r2);
+  v := RdVec16(r2);
+  if (not r2.Ok) or not RdEmpty(r2) then
+  begin
+    Fail(AlertDecodeError, 'tls: received malformed key_share extension', Deadline);
+    Exit;
+  end;
+  if i <> group then
+  begin
+    Fail(AlertIllegalParameter, 'tls: server selected unsupported group', Deadline);
+    Exit;
+  end;
+  if not hrr then
+    if not WriteRecord(RecCcs, #1, Deadline) then
+      Exit;
+  { establishHandshakeKeys }
+  if not SharedSecret(group, privShare, v, shared) then
+  begin
+    Fail(AlertIllegalParameter, 'tls: invalid server key share', Deadline);
+    Exit;
+  end;
+  earlySecret := HkdfExtract(hash, '', ZeroString(CipherHashSize(hash)));
+  hsSecret := HkdfExtract(hash, DeriveSecret(hash, earlySecret, 'derived', ''), shared);
+  clientHs := DeriveSecret(hash, hsSecret, 'c hs traffic', transcript);
+  serverHs := DeriveSecret(hash, hsSecret, 's hs traffic', transcript);
+  SetTraffic13(False, clientHs);
+  SetTraffic13(True, serverHs);
+  masterSecret := HkdfExtract(hash, DeriveSecret(hash, hsSecret, 'derived', ''), ZeroString(CipherHashSize(hash)));
+  { readServerParameters: EncryptedExtensions }
+  if not ReadMsg(Deadline, typ, body, raw) then
+    Exit;
+  if typ <> HsEncryptedExtensions then
+  begin
+    Fail(AlertUnexpectedMessage, 'tls: unexpected message', Deadline);
+    Exit;
+  end;
+  transcript := transcript + raw;
+  RdInit(r, body);
+  ok := ParseExts(RdVec16(r), m) and r.Ok and RdEmpty(r);
+  if not ok then
+  begin
+    Fail(AlertDecodeError, 'tls: error decoding message', Deadline);
+    Exit;
+  end;
+  FAlpn := '';
+  if ExtGet(m, ExtAlpn, v) then
+  begin
+    RdInit(r2, v);
+    protos := RdVec16(r2);
+    RdInit(r2, protos);
+    FAlpn := RdVec8(r2);
+    if (not r2.Ok) or (not RdEmpty(r2)) or (FAlpn = '') then
+    begin
+      Fail(AlertDecodeError, 'tls: error decoding message', Deadline);
+      Exit;
+    end;
+    ok := False;
+    for i := 0 to Length(Config.Alpn) - 1 do
+      if Config.Alpn[i] = FAlpn then
+        ok := True;
+    if not ok then
+    begin
+      Fail(AlertUnsupportedExtension, 'tls: server advertised unrequested ALPN extension', Deadline);
+      Exit;
+    end;
+  end;
+  { readServerCertificate: an optional CertificateRequest, the Certificate,
+    the CertificateVerify }
+  if not ReadMsg(Deadline, typ, body, raw) then
+    Exit;
+  chainMsg := '';
+  if typ = HsCertificateRequest then
+  begin
+    transcript := transcript + raw;
+    RdInit(r, body);
+    ctx := RdVec8(r);
+    chainMsg := U8(HsCertificate) + Vec24(Vec8(ctx) + Vec24(''));
+    if not ReadMsg(Deadline, typ, body, raw) then
+      Exit;
+  end;
+  if typ <> HsCertificate then
+  begin
+    Fail(AlertUnexpectedMessage, 'tls: unexpected message', Deadline);
+    Exit;
+  end;
+  transcript := transcript + raw;
+  RdInit(r, body);
+  RdVec8(r);
+  RdInit(r2, RdVec24(r));
+  ok := r.Ok and RdEmpty(r);
+  SetLength(chain, 0);
+  while ok and not RdEmpty(r2) do
+  begin
+    cert := RdVec24(r2);
+    RdVec16(r2);
+    if (not r2.Ok) or (cert = '') then
+      ok := False
+    else
+    begin
+      SetLength(chain, Length(chain) + 1);
+      chain[Length(chain) - 1] := cert;
+    end;
+  end;
+  if not ok then
+  begin
+    Fail(AlertDecodeError, 'tls: error decoding message', Deadline);
+    Exit;
+  end;
+  FPeerChain := chain;
+  if not CheckChain(Config, sni) then
+  begin
+    Fail(AlertBadCertificate, FErr, Deadline);
+    Exit;
+  end;
+  if not ReadMsg(Deadline, typ, body, raw) then
+    Exit;
+  if typ <> HsCertificateVerify then
+  begin
+    Fail(AlertUnexpectedMessage, 'tls: unexpected message', Deadline);
+    Exit;
+  end;
+  RdInit(r, body);
+  scheme := Rd16(r);
+  sig := RdVec16(r);
+  if (not r.Ok) or not RdEmpty(r) then
+  begin
+    Fail(AlertDecodeError, 'tls: error decoding message', Deadline);
+    Exit;
+  end;
+  if (not SigOffered(scheme)) or (scheme = SigPkcs1Sha256) or (scheme = SigPkcs1Sha384) or (scheme = SigPkcs1Sha512) then
+  begin
+    Fail(AlertIllegalParameter, 'tls: certificate used with invalid signature algorithm', Deadline);
+    Exit;
+  end;
+  { RFC 8446 4.4.3: 64 spaces, the context string, a zero, the hash }
+  if not VerifySig(scheme, StringOfChar(' ', 64) + 'TLS 1.3, server CertificateVerify' + #0 + HashOf(hash, transcript),
+    sig, True) then
+  begin
+    Fail(AlertDecryptError, 'tls: invalid signature by the server certificate', Deadline);
+    Exit;
+  end;
+  transcript := transcript + raw;
+  { readServerFinished }
+  if not ReadMsg(Deadline, typ, body, raw) then
+    Exit;
+  if typ <> HsFinished then
+  begin
+    Fail(AlertUnexpectedMessage, 'tls: unexpected message', Deadline);
+    Exit;
+  end;
+  finKey := ExpandLabel(hash, serverHs, 'finished', '', CipherHashSize(hash));
+  verify := CipherHmac(hash, finKey, HashOf(hash, transcript));
+  if not CtEqualStr(verify, body) then
+  begin
+    Fail(AlertDecryptError, 'tls: invalid server finished hash', Deadline);
+    Exit;
+  end;
+  transcript := transcript + raw;
+  clientAp := DeriveSecret(hash, masterSecret, 'c ap traffic', transcript);
+  serverAp := DeriveSecret(hash, masterSecret, 's ap traffic', transcript);
+  SetTraffic13(True, serverAp);
+  { sendClientCertificate (empty) and sendClientFinished }
+  if chainMsg <> '' then
+  begin
+    if not WriteRecord(RecHandshake, chainMsg, Deadline) then
+      Exit;
+    transcript := transcript + chainMsg;
+  end;
+  finKey := ExpandLabel(hash, clientHs, 'finished', '', CipherHashSize(hash));
+  verify := CipherHmac(hash, finKey, HashOf(hash, transcript));
+  if not WriteRecord(RecHandshake, U8(HsFinished) + Vec24(verify), Deadline) then
+    Exit;
+  SetTraffic13(False, clientAp);
+  FDone := True;
+  Result := True;
+end;
+
+{ TLS 1.2 after its ServerHello (Go's clientHandshakeState.handshake and
+  doFullHandshake): ECDHE only, the extended master secret when the
+  server has it }
+function TTlsStream.Handshake12(Config: TTlsConfig; const Host, Hello, ClientRandom, ServerRandom: string;
+  const Ext: string; Deadline: Integer): Boolean;
+var
+  r, r2: TRd;
+  m: TExtMap;
+  transcript, body, raw, v, sessionId, params, point, sig, privShare, share, shared, pms, master, keys: string;
+  cert, verify, ckx, protos: string;
+  typ, aead, keyLen, hash, curveType, group, scheme, i, rt: Integer;
+  ems, ok, certReq: Boolean;
+  chain: TStringArray;
+  data: string;
+begin
+  Result := False;
+  transcript := Hello;
+  RdInit(r, Ext);
+  Rd16(r);
+  RdBytes(r, 32);
+  sessionId := RdVec8(r);
+  Rd16(r);
+  if Rd8(r) <> 0 then
+  begin
+    Fail(AlertUnexpectedMessage, 'tls: server selected unsupported compression format', Deadline);
+    Exit;
+  end;
+  SetLength(m.Ids, 0);
+  if not RdEmpty(r) then
+    ParseExts(RdVec16(r), m);
+  if (not IsSuite12(FSuite)) or (Pos(U16(FSuite), Suites12) mod 2 <> 1) then
+  begin
+    Fail(AlertHandshakeFailure, 'tls: server chose an unconfigured cipher suite', Deadline);
+    Exit;
+  end;
+  SuiteParams(FSuite, aead, keyLen, hash);
+  FHashAlg := hash;
+  { renegotiation_info: present means empty (Go's processServerHello) }
+  if ExtGet(m, ExtRenegotiationInfo, v) and (v <> #0) then
+  begin
+    Fail(AlertHandshakeFailure, 'tls: initial handshake had non-empty renegotiation extension', Deadline);
+    Exit;
+  end;
+  ems := ExtGet(m, ExtExtendedMasterSecret, v);
+  FAlpn := '';
+  if ExtGet(m, ExtAlpn, v) then
+  begin
+    RdInit(r2, v);
+    protos := RdVec16(r2);
+    RdInit(r2, protos);
+    FAlpn := RdVec8(r2);
+    ok := False;
+    for i := 0 to Length(Config.Alpn) - 1 do
+      if Config.Alpn[i] = FAlpn then
+        ok := True;
+    if (not ok) or (not r2.Ok) or not RdEmpty(r2) then
+    begin
+      Fail(AlertUnsupportedExtension, 'tls: server advertised unrequested ALPN extension', Deadline);
+      Exit;
+    end;
+  end;
+  { the Certificate }
+  if not ReadMsg(Deadline, typ, body, raw) then
+    Exit;
+  if typ <> HsCertificate then
+  begin
+    Fail(AlertUnexpectedMessage, 'tls: unexpected message', Deadline);
+    Exit;
+  end;
+  transcript := transcript + raw;
+  RdInit(r, body);
+  RdInit(r2, RdVec24(r));
+  ok := r.Ok and RdEmpty(r);
+  SetLength(chain, 0);
+  while ok and not RdEmpty(r2) do
+  begin
+    cert := RdVec24(r2);
+    if (not r2.Ok) or (cert = '') then
+      ok := False
+    else
+    begin
+      SetLength(chain, Length(chain) + 1);
+      chain[Length(chain) - 1] := cert;
+    end;
+  end;
+  if not ok then
+  begin
+    Fail(AlertDecodeError, 'tls: error decoding message', Deadline);
+    Exit;
+  end;
+  FPeerChain := chain;
+  if not CheckChain(Config, Host) then
+  begin
+    Fail(AlertBadCertificate, FErr, Deadline);
+    Exit;
+  end;
+  { the ServerKeyExchange: ECDHE parameters and their signature (Go's
+    ecdheKeyAgreement.processServerKeyExchange) }
+  if not ReadMsg(Deadline, typ, body, raw) then
+    Exit;
+  if typ <> HsServerKeyExchange then
+  begin
+    Fail(AlertUnexpectedMessage, 'tls: unexpected message', Deadline);
+    Exit;
+  end;
+  transcript := transcript + raw;
+  RdInit(r, body);
+  curveType := Rd8(r);
+  group := Rd16(r);
+  point := RdVec8(r);
+  params := Copy(body, 1, r.P - 1);
+  scheme := Rd16(r);
+  sig := RdVec16(r);
+  if (not r.Ok) or not RdEmpty(r) then
+  begin
+    Fail(AlertDecodeError, 'tls: server sent invalid key exchange', Deadline);
+    Exit;
+  end;
+  if curveType <> 3 then
+  begin
+    Fail(AlertHandshakeFailure, 'tls: server selected unsupported curve', Deadline);
+    Exit;
+  end;
+  if (group <> GroupX25519) and (group <> GroupP256) and (group <> GroupP384) then
+  begin
+    Fail(AlertHandshakeFailure, 'tls: server selected unsupported curve', Deadline);
+    Exit;
+  end;
+  if not SigOffered(scheme) then
+  begin
+    Fail(AlertIllegalParameter, 'tls: certificate used with invalid signature algorithm', Deadline);
+    Exit;
+  end;
+  if Suite12Ecdsa(FSuite) <> ((scheme = SigEcdsaP256Sha256) or (scheme = SigEcdsaP384Sha384)) then
+  begin
+    Fail(AlertIllegalParameter, 'tls: certificate used with invalid signature algorithm', Deadline);
+    Exit;
+  end;
+  if not VerifySig(scheme, ClientRandom + ServerRandom + params, sig, False) then
+  begin
+    Fail(AlertDecryptError, 'tls: invalid signature by the server certificate', Deadline);
+    Exit;
+  end;
+  { an optional CertificateRequest, then the ServerHelloDone }
+  if not ReadMsg(Deadline, typ, body, raw) then
+    Exit;
+  certReq := typ = HsCertificateRequest;
+  if certReq then
+  begin
+    transcript := transcript + raw;
+    if not ReadMsg(Deadline, typ, body, raw) then
+      Exit;
+  end;
+  if (typ <> HsServerHelloDone) or (body <> '') then
+  begin
+    Fail(AlertUnexpectedMessage, 'tls: unexpected message', Deadline);
+    Exit;
+  end;
+  transcript := transcript + raw;
+  if certReq then
+  begin
+    cert := U8(HsCertificate) + Vec24(Vec24(''));
+    if not WriteRecord(RecHandshake, cert, Deadline) then
+      Exit;
+    transcript := transcript + cert;
+  end;
+  { the ClientKeyExchange }
+  share := KeyShare(group, privShare);
+  if not SharedSecret(group, privShare, point, shared) then
+  begin
+    Fail(AlertIllegalParameter, 'tls: invalid server key share', Deadline);
+    Exit;
+  end;
+  pms := shared;
+  ckx := U8(HsClientKeyExchange) + Vec24(Vec8(share));
+  if not WriteRecord(RecHandshake, ckx, Deadline) then
+    Exit;
+  transcript := transcript + ckx;
+  { the master secret (RFC 5246 8.1, RFC 7627 4) and the keys (6.3) }
+  if ems then
+    master := Tls12Prf(hash, pms, 'extended master secret', HashOf(hash, transcript), 48)
+  else
+    master := Tls12Prf(hash, pms, 'master secret', ClientRandom + ServerRandom, 48);
+  if aead = 1 then
+    keys := Tls12Prf(hash, master, 'key expansion', ServerRandom + ClientRandom, 2 * keyLen + 8)
+  else
+    keys := Tls12Prf(hash, master, 'key expansion', ServerRandom + ClientRandom, 2 * keyLen + 24);
+  if not WriteRecord(RecCcs, #1, Deadline) then
+    Exit;
+  { the key block: the client's key, the server's, the client's IV, the
+    server's; the read side waits for the server's change_cipher_spec }
+  if aead = 1 then
+    SetWrite(aead, Copy(keys, 1, keyLen), Copy(keys, 2 * keyLen + 1, 4))
+  else
+    SetWrite(aead, Copy(keys, 1, keyLen), Copy(keys, 2 * keyLen + 1, 12));
+  verify := Tls12Prf(hash, master, 'client finished', HashOf(hash, transcript), 12);
+  if not WriteRecord(RecHandshake, U8(HsFinished) + Vec24(verify), Deadline) then
+    Exit;
+  transcript := transcript + U8(HsFinished) + Vec24(verify);
+  { the server's change_cipher_spec and Finished }
+  if not ReadRecord(Deadline, True, rt, data) then
+    Exit;
+  if rt <> RecCcs then
+  begin
+    Fail(AlertUnexpectedMessage, 'tls: unexpected message', Deadline);
+    Exit;
+  end;
+  if aead = 1 then
+    SetRead(aead, Copy(keys, keyLen + 1, keyLen), Copy(keys, 2 * keyLen + 5, 4))
+  else
+    SetRead(aead, Copy(keys, keyLen + 1, keyLen), Copy(keys, 2 * keyLen + 13, 12));
+  if not ReadMsg(Deadline, typ, body, raw) then
+    Exit;
+  if typ <> HsFinished then
+  begin
+    Fail(AlertUnexpectedMessage, 'tls: unexpected message', Deadline);
+    Exit;
+  end;
+  verify := Tls12Prf(hash, master, 'server finished', HashOf(hash, transcript), 12);
+  if not CtEqualStr(verify, body) then
+  begin
+    Fail(AlertHandshakeFailure, 'tls: server''s Finished message was incorrect', Deadline);
+    Exit;
+  end;
+  FDone := True;
+  Result := True;
+end;
+
+{ a handshake message after the handshake (Go's handlePostHandshakeMessage):
+  a NewSessionTicket is let by (no resumption here), a KeyUpdate takes the
+  next read secret and, when asked, sends one and takes the next write
+  secret (RFC 8446 4.6.3) }
+function TTlsStream.PostHandshake(Typ: Integer; const Body: string; Deadline: Integer): Boolean;
+var
+  next: string;
+begin
+  Result := False;
+  if FVers <> TlsVersion13 then
+  begin
+    Fail(AlertUnexpectedMessage, 'tls: unexpected message', Deadline);
+    Exit;
+  end;
+  case Typ of
+    HsNewSessionTicket:
+      Result := True;
+    HsKeyUpdate:
+      begin
+        if (Length(Body) <> 1) or (Ord(Body[1]) > 1) then
+        begin
+          Fail(AlertDecodeError, 'tls: error decoding message', Deadline);
+          Exit;
+        end;
+        next := ExpandLabel(FHashAlg, FRdSecret, 'traffic upd', '', CipherHashSize(FHashAlg));
+        SetTraffic13(True, next);
+        if Body[1] = #1 then
+        begin
+          if not WriteRecord(RecHandshake, U8(HsKeyUpdate) + Vec24(#0), Deadline) then
+            Exit;
+          next := ExpandLabel(FHashAlg, FWrSecret, 'traffic upd', '', CipherHashSize(FHashAlg));
+          SetTraffic13(False, next);
+        end;
+        Result := True;
+      end;
+  else
+    Fail(AlertUnexpectedMessage, 'tls: unexpected message', Deadline);
+  end;
+end;
+
+function TTlsStream.ReadSome(MaxN, Deadline: Integer; out Data: string): Integer;
+var
+  typ: Integer;
+  plain, body, raw: string;
+begin
+  Data := '';
+  if MaxN <= 0 then
+  begin
+    Result := 0;
+    Exit;
+  end;
+  while FPlain = '' do
+  begin
+    if FClosed then
+    begin
+      Result := 0;
+      Exit;
+    end;
+    if FBroken then
+    begin
+      Result := -71;
+      Exit;
+    end;
+    if FHand <> '' then
+    begin
+      if not ReadMsg(Deadline, typ, body, raw) then
+      begin
+        if FBroken then
+          Result := -71
+        else if FClosed then
+          Result := 0
+        else
+          Result := -110;
+        Exit;
+      end;
+      PostHandshake(typ, body, Deadline);
+      Continue;
+    end;
+    if not ReadRecord(Deadline, False, typ, plain) then
+    begin
+      if typ = -110 then
+      begin
+        Result := -110;
+        Exit;
+      end;
+      if FClosed then
+      begin
+        Result := 0;
+        Exit;
+      end;
+      if typ = 0 then
+      begin
+        { the end of the stream with no close_notify }
+        Result := 0;
+        Exit;
+      end;
+      Result := -71;
+      Exit;
+    end;
+    if typ = RecData then
+      FPlain := plain;
+  end;
+  if Length(FPlain) <= MaxN then
+  begin
+    Data := FPlain;
+    FPlain := '';
+  end
+  else
+  begin
+    Data := Copy(FPlain, 1, MaxN);
+    Delete(FPlain, 1, MaxN);
+  end;
+  Result := Length(Data);
+end;
+
+function TTlsStream.WriteAll(const Data: string; Deadline: Integer): Boolean;
+var
+  p, n: Integer;
+begin
+  Result := False;
+  if FBroken or FClosed or not FDone then
+    Exit;
+  p := 1;
+  while p <= Length(Data) do
+  begin
+    n := Length(Data) - p + 1;
+    if n > MaxPlaintext then
+      n := MaxPlaintext;
+    if not WriteRecord(RecData, Copy(Data, p, n), Deadline) then
+      Exit;
+    p := p + n;
+  end;
+  Result := True;
+end;
+
+procedure TTlsStream.Dispose;
+begin
+  if FDone and not FBroken then
+  begin
+    WriteRecord(RecAlert, U8(1) + U8(AlertCloseNotify), Nanotime + 1000000000);
+    FBroken := True;
+  end;
+  if FRaw <> nil then
+  begin
+    FRaw.Dispose;
+    FRaw := nil;
+  end;
+end;
+
+function TlsClient(Raw: TNetStream; Config: TTlsConfig; const Host: string; Deadline: Integer;
+  out Err: string): TTlsStream;
+var
+  s: TTlsStream;
+  cfg: TTlsConfig;
+begin
+  Result := nil;
+  Err := '';
+  cfg := Config;
+  if cfg = nil then
+    cfg := TTlsConfig.Create;
+  s := TTlsStream.Create(Raw);
+  if s.Handshake(cfg, Host, Deadline) then
+  begin
+    Result := s;
+    Exit;
+  end;
+  Err := s.FErr;
+  if Err = '' then
+    Err := 'tls: handshake failed';
+  s.FBroken := True;
+  s.Dispose;
+end;
+
+function TlsDial(const Host: string; Port, ConnectMs: Integer; Config: TTlsConfig; out Err: string): TTlsStream;
+var
+  raw: TNetStream;
+  dl: Integer;
+begin
+  Result := nil;
+  dl := 0;
+  if ConnectMs > 0 then
+    dl := Nanotime + ConnectMs * 1000000;
+  raw := DialTcp(Host, Port, ConnectMs);
+  if raw = nil then
+  begin
+    Err := 'dial tcp ' + Host + ':' + IntToStr(Port) + ': connection failed';
+    Exit;
+  end;
+  Result := TlsClient(raw, Config, Host, dl, Err);
+end;
+
+{ ---- pasconn's dialer and upgrader ---- }
+
+type
+  TTlsDialerImpl = class(TNetDialer)
+  public
+    function Dial(const Host: string; Port, ConnectMs: Integer): TNetStream; override;
+  end;
+
+  TTlsUpgraderImpl = class(TNetUpgrader)
+  public
+    function Upgrade(S: TNetStream; const Host: string; ConnectMs: Integer): TNetStream; override;
+  end;
+
+function TTlsDialerImpl.Dial(const Host: string; Port, ConnectMs: Integer): TNetStream;
+var
+  err: string;
+begin
+  Result := TlsDial(Host, Port, ConnectMs, nil, err);
+end;
+
+function TTlsUpgraderImpl.Upgrade(S: TNetStream; const Host: string; ConnectMs: Integer): TNetStream;
+var
+  err: string;
+  dl: Integer;
+begin
+  dl := 0;
+  if ConnectMs > 0 then
+    dl := Nanotime + ConnectMs * 1000000;
+  Result := TlsClient(S, nil, Host, dl, err);
+end;
+
+initialization
+  TlsDialer := TTlsDialerImpl.Create;
+  TlsUpgrader := TTlsUpgraderImpl.Create;
+end.

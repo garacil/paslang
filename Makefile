@@ -707,6 +707,7 @@ LIB_UNITS := \
 	src/lib/pasconn.paslang \
 	src/lib/pasurl.paslang \
 	src/lib/pasx509.paslang \
+	src/lib/pastls.paslang \
 	src/lib/pastextproto.paslang \
 	src/lib/pashttp.paslang \
 	src/lib/httpclient.paslang \
@@ -1236,6 +1237,17 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	if grep -q 'p_pashash_passha256updatecpu' $(BUILDDIR)/hashpieces-base.s; then echo "hashpieces-base.s calls the SHA-NI body"; exit 1; fi; \
 	if grep -q 'p_pashash_passha256cpu' $(BUILDDIR)/hash1-base.s; then echo "hash1-base.s calls the SHA-NI body"; exit 1; fi; \
 	if grep -q 'popcntq' $(BUILDDIR)/bitwords-base.s; then echo "bitwords-base.s carries popcnt"; exit 1; fi; \
+	: pastls against Go crypto/tls and openssl s_server, each case a server on 127.0.0.1, P431; \
+	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/tlsinterop testdata/tlsinterop.paslang; \
+	if command -v go > /dev/null 2>&1; then \
+	  (cd scripts/tlsoracle && GOCACHE=$(abspath $(BUILDDIR))/gocache GOFLAGS=-mod=mod go build -o $(abspath $(BUILDDIR))/tlsoracle .); \
+	  sh scripts/tls_interop.sh go $(BUILDDIR)/tlsoracle $(BUILDDIR)/tlsinterop > $(BUILDDIR)/tlsinterop-go.got; \
+	  diff -u testdata/tlsinterop-go.out $(BUILDDIR)/tlsinterop-go.got; \
+	fi; \
+	if command -v openssl > /dev/null 2>&1; then \
+	  sh scripts/tls_interop.sh openssl - $(BUILDDIR)/tlsinterop > $(BUILDDIR)/tlsinterop-openssl.got; \
+	  diff -u testdata/tlsinterop-openssl.out $(BUILDDIR)/tlsinterop-openssl.got; \
+	fi; \
 	: the system roots pasx509 loads are those Go loads, in the same order, P430; \
 	if command -v go > /dev/null 2>&1; then \
 	  (cd scripts/x509oracle && GOCACHE=$(abspath $(BUILDDIR))/gocache GOFLAGS=-mod=mod go build -o $(abspath $(BUILDDIR))/x509roots-go ./rootcheck); \
@@ -5148,6 +5160,17 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	grep -q 'p_pashash_passha256updatecpu' $(BUILDDIR)/hashpieces-arm.s; \
 	if grep -q 'p_pashash_passha256updatecpu' $(BUILDDIR)/hashpieces-arm-base.s; then echo "hashpieces-arm-base.s calls the SHA-256 body"; exit 1; fi; \
 	if grep -q 'p_pashash_passha256cpu' $(BUILDDIR)/hash1-arm-base.s; then echo "hash1-arm-base.s calls the SHA-256 body"; exit 1; fi; \
+	: pastls for the base arm64 on qemu against Go crypto/tls and openssl s_server on the host, ChaCha20 first, P431; \
+	$(OUTDIR)/paslangc -target arm64 -cpu base -Fu $(A64DIR) -o $(BUILDDIR)/tlsinterop-arm testdata/tlsinterop.paslang; \
+	if command -v go > /dev/null 2>&1; then \
+	  (cd scripts/tlsoracle && GOCACHE=$(abspath $(BUILDDIR))/gocache GOFLAGS=-mod=mod go build -o $(abspath $(BUILDDIR))/tlsoracle .); \
+	  sh scripts/tls_interop.sh go $(BUILDDIR)/tlsoracle $(BUILDDIR)/tlsinterop-arm $(QEMU_A64) > $(BUILDDIR)/tlsinterop-go-arm.got; \
+	  diff -u testdata/tlsinterop-go-base.out $(BUILDDIR)/tlsinterop-go-arm.got; \
+	fi; \
+	if command -v openssl > /dev/null 2>&1; then \
+	  sh scripts/tls_interop.sh openssl - $(BUILDDIR)/tlsinterop-arm $(QEMU_A64) > $(BUILDDIR)/tlsinterop-openssl-arm.got; \
+	  diff -u testdata/tlsinterop-openssl-base.out $(BUILDDIR)/tlsinterop-openssl-arm.got; \
+	fi; \
 	: pascipher at the arm64 level seals through aese and pmull, its base build through neither, P428; \
 	grep -q 'aese v0.16b, v1.16b' '$(A64DIR)/$(LVL_A64)/pascipher.s'; \
 	grep -q 'pmull2 v6.1q' '$(A64DIR)/$(LVL_A64)/pascipher.s'; \
