@@ -11825,6 +11825,36 @@ sealed := GcmSeal(g, nonce, 'text', ad);   { 4 bytes, then the 16 of the tag }
 if GcmOpen(g, nonce, sealed, ad, plain) then ...
 ```
 
+Three units hold the public-key side of TLS, in pure paslang (1.1.292,
+P429), each following Go's code routine by routine:
+- `uses pasx25519` is X25519 (RFC 7748, Go's `crypto/ecdh` and the
+  field of `edwards25519`): `X25519(scalar, u)` is the function itself,
+  `X25519PublicKey(priv)` the scalar times the base point, and
+  `X25519Shared(priv, peer, out shared)` the shared secret, `False` for a
+  low-order peer whose result is all zeros, as Go refuses it.
+- `uses pasnist` is P-256 and P-384 (`NistP256`, `NistP384`; Go's
+  `nistec`, its fiat-crypto field code translated by
+  `scripts/fiat2pas.py`): `NistPublicKey(curve, priv)` the uncompressed
+  point of a private scalar (`''` outside [1, n-1]), `NistEcdh(curve,
+  priv, peer, out shared)` the x-coordinate of the product, refusing a
+  point off the curve, and `NistEcdsaVerify(curve, pub, hash, r, s)` and
+  `NistEcdsaVerifyAsn1(curve, pub, hash, der)` ECDSA verification as
+  Go's `crypto/ecdsa` checks it, the DER parsed as strictly.
+- `uses pasrsa` is RSA verification (RFC 8017; Go's `bigmod` and
+  `fips140/rsa`): `RsaVerifyPkcs1v15(n, e, hash, hashed, sig)` and
+  `RsaVerifyPss(n, e, hash, hashed, sig, saltLen)` (`-1` finds the salt
+  length) on `RsaSha256`, `RsaSha384`, `RsaSha512` and the rest, with
+  Go's checks of the key (1024 bits or more, e odd and below 2^31);
+  `RsaPublicKeyInit` makes a key ready once for many checks. `TNat` and
+  `TModulus` are Go's `bigmod`, its Montgomery products and
+  exponentiations, for what comes later.
+
+What touches a secret (the X25519 ladder, the scalar products of ECDH,
+the field inversions) is constant time; verification works on public
+values and may not be, as Go's. `testdata/x25519kat` checks RFC 7748's
+vectors, and `x25519wyche`, `nistwyche` and `rsawyche` Wycheproof's
+(518 X25519, 1,530 ECDSA, 1,145 ECDH, 1,394 RSA), on both machines.
+
 `uses pascodec` has the text codecs a service needs (1.1.260, P435), as
 Go's packages give them, checked against Go's own output
 (`testdata/codec`, with `scripts/codec_oracle.go`):

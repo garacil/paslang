@@ -1,0 +1,1150 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+
+  paslang is free software: you can redistribute it and/or modify it
+  under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+
+  paslang is distributed in the hope that it will be useful, but
+  WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+  General Public License for more details.
+
+  Under Section 7 of GPL version 3, you are granted additional
+  permissions described in the paslang Runtime Library Exception,
+  version 1.0, in the file COPYING.RUNTIME.
+
+  You should have received a copy of the GNU General Public License
+  along with paslang.  If not, see <https://www.gnu.org/licenses/>. }
+
+{ Modular arithmetic on big natural numbers and RSA signature
+  verification, in pure paslang (P429).
+
+  The first half follows Go 1.27.3's crypto/internal/fips140/bigmod
+  (nat.go) routine by routine: a TNat is a natural number of 64-bit
+  limbs, little-endian, whose announced length (the number of limbs) is
+  public and whose value is not; a TModulus holds an odd or even
+  modulus with the constants of Montgomery multiplication (m0inv, the
+  inverse of -m mod 2^64, and rr, R*R mod m). Everything that may see a
+  secret value runs in a time that depends on announced lengths alone,
+  as Go's: no branch and no memory index on a limb's value (Add, Sub,
+  Mul, Mod, Exp, Equal, the Montgomery product). The routines Go names
+  VarTime leak what their names say (ExpShortVarTime the exponent,
+  BitLenVarTime the bit length).
+
+  The second half is RSA's public operation and the two signature
+  schemes, as Go's crypto/internal/fips140/rsa (rsa.go checkPublicKey
+  and encrypt, pkcs1v15.go verifyPKCS1v15, pkcs1v22.go verifyPSS and
+  emsaPSSVerify) and the key size check of crypto/rsa (rsa.go
+  checkKeySize: 1024 bits at least): RFC 8017 5.2.2 (RSAVP1), 8.1.2
+  (RSASSA-PSS-VERIFY), 8.2.2 (RSASSA-PKCS1-V1_5-VERIFY), 9.1.2
+  (EMSA-PSS-VERIFY), 9.2 (EMSA-PKCS1-v1_5) and B.2.1 (MGF1).
+  Verification works on public data only, so it may take variable
+  time, as Go's does. A modulus, a signature and a digest are strings
+  of bytes; integers are big-endian. }
+unit pasrsa;
+
+interface
+
+const
+  { the hashes of a signature. RsaHashNone signs the digest as given,
+    with no DigestInfo (Go's crypto.Hash(0), TLS 1.0's MD5+SHA1);
+    PKCS #1 v1.5 only }
+  RsaHashNone = 0;
+  RsaSha1 = 1;
+  RsaSha224 = 2;
+  RsaSha256 = 3;
+  RsaSha384 = 4;
+  RsaSha512 = 5;
+  RsaSha3_224 = 6;
+  RsaSha3_256 = 7;
+  RsaSha3_384 = 8;
+  RsaSha3_512 = 9;
+  { the salt length that EMSA-PSS-VERIFY reads from the encoded message,
+    Go's pssSaltLengthAutodetect (crypto/rsa's PSSSaltLengthAuto) }
+  RsaPssSaltAuto = -1;
+
+type
+  { a natural number: Limbs[0] is the least significant 64 bits, and
+    Length(Limbs) is its announced length. Two TNat must not share
+    their Limbs: copy one with NatSet, never with := }
+  TNat = record
+    Limbs: array of Integer;
+  end;
+
+  { a modulus greater than one, kept without leading zero limbs; when
+    it is odd, M0Inv is -Nat^-1 mod 2^64 and RR is R*R mod Nat with
+    R = 2^(64 * Length(Nat.Limbs)), the constants of Montgomery
+    multiplication (Go's bigmod.Modulus) }
+  TModulus = record
+    Nat: TNat;
+    OddModulus: Boolean;
+    M0Inv: Integer;
+    RR: TNat;
+  end;
+
+  { an RSA public key that passed Go's checks (crypto/rsa checkKeySize,
+    fips140/rsa checkPublicKey), its modulus made ready once for many
+    verifications }
+  TRsaPublicKey = record
+    N: TModulus;
+    E: Integer;
+  end;
+
+{ ---- bigmod: natural numbers modulo m (Go's nat.go) ---- }
+
+{ X becomes a zero of N limbs (Go's reset) }
+procedure NatReset(var X: TNat; N: Integer);
+{ X becomes the big-endian B, its announced length that of B's value
+  (Go's resetToBytes): an operand of NatMod of any length }
+procedure NatResetToBytes(var X: TNat; const B: string);
+{ X becomes a copy of Y, of Y's announced length (Go's set) }
+procedure NatSet(var X: TNat; const Y: TNat);
+{ X becomes the one-limb Y (Go's SetUint) }
+procedure NatSetUint(var X: TNat; Y: Integer);
+{ X grows to M's announced length, its value kept (Go's ExpandFor);
+  False when X is longer than M }
+function NatExpandFor(var X: TNat; const M: TModulus): Boolean;
+{ X becomes the big-endian B, of M's announced length (Go's SetBytes);
+  False when B is not below M }
+function NatSetBytes(var X: TNat; const B: string; const M: TModulus): Boolean;
+{ X as big-endian bytes, as many as M has (Go's Bytes); X must be of
+  M's length and not above it, else '' }
+function NatBytes(const X: TNat; const M: TModulus): string;
+{ 1 when X = Y (both of one announced length), else 0, in constant
+  time (Go's Equal) }
+function NatEqual(const X, Y: TNat): Integer;
+{ 1 when X is zero, else 0, in constant time (Go's IsZero) }
+function NatIsZero(const X: TNat): Integer;
+{ 1 when X is odd (Go's IsOdd) }
+function NatIsOdd(const X: TNat): Integer;
+{ the bit length of X's value; leaks it (Go's BitLenVarTime) }
+function NatBitLenVarTime(const X: TNat): Integer;
+{ X := X + Y mod M and X := X - Y mod M, both reduced and of M's
+  length (Go's Add and Sub) }
+procedure NatAdd(var X: TNat; const Y: TNat; const M: TModulus);
+procedure NatSub(var X: TNat; const Y: TNat; const M: TModulus);
+{ X := X * Y mod M, both reduced and of M's length (Go's Mul) }
+procedure NatMul(var X: TNat; const Y: TNat; const M: TModulus);
+{ Res := X mod M for an X of any length (Go's Mod) }
+procedure NatMod(var Res: TNat; const X: TNat; const M: TModulus);
+{ Res := X^E mod M in constant time, E a big-endian exponent of public
+  length, X reduced; M must be odd, else Res is empty (Go's Exp) }
+procedure NatExp(var Res: TNat; const X: TNat; const E: string; const M: TModulus);
+{ Res := X^E mod M for a public E above zero; leaks E (Go's
+  ExpShortVarTime); M must be odd, else Res is empty }
+procedure NatExpShortVarTime(var Res: TNat; const X: TNat; E: Integer; const M: TModulus);
+
+{ M becomes the big-endian B (leading zeros dropped); False when it is
+  not above one (Go's NewModulus) }
+function NewModulus(var M: TModulus; const B: string): Boolean;
+{ M's bit length and its size in bytes (Go's Modulus.BitLen, Size) }
+function ModulusBitLen(const M: TModulus): Integer;
+function ModulusSize(const M: TModulus): Integer;
+{ a copy of M's value (Go's Modulus.Nat) }
+procedure ModulusNat(var X: TNat; const M: TModulus);
+
+{ ---- RSA ---- }
+
+{ the digest of Msg by Hash, '' for RsaHashNone or an unknown one }
+function RsaHash(Hash: Integer; const Msg: string): string;
+{ the size of Hash's digest, -1 for RsaHashNone or an unknown one }
+function RsaHashSize(Hash: Integer): Integer;
+
+{ Key from the big-endian modulus N and the exponent E; False when Go
+  refuses the key: N under 1024 bits (crypto/rsa checkKeySize), N even
+  or not above one, E below 2, even or above 2^31 - 1 (fips140/rsa
+  checkPublicKey) }
+function RsaPublicKeyInit(var Key: TRsaPublicKey; const N: string; E: Integer): Boolean;
+{ the size of Key's modulus in bytes, k of RFC 8017 }
+function RsaPublicKeySize(const Key: TRsaPublicKey): Integer;
+{ RSAVP1 (RFC 8017 5.2.2), Go's encrypt: S^e mod n as k bytes; False
+  when S is not below n }
+function RsaPublicOp(const Key: TRsaPublicKey; const S: string; out Em: string): Boolean;
+
+{ RSASSA-PKCS1-V1_5-VERIFY (RFC 8017 8.2.2) of Sig over the digest
+  Hashed, as Go's VerifyPKCS1v15: the whole encoded message compared
+  byte for byte with the one built from Hashed }
+function RsaKeyVerifyPkcs1v15(const Key: TRsaPublicKey; Hash: Integer; const Hashed, Sig: string): Boolean;
+{ RSASSA-PSS-VERIFY (RFC 8017 8.1.2) with MGF1 on the same hash, as
+  Go's VerifyPSS (SaltLen RsaPssSaltAuto) and VerifyPSSWithSaltLength
+  (SaltLen 0 or more); Hash not RsaHashNone }
+function RsaKeyVerifyPss(const Key: TRsaPublicKey; Hash: Integer; const Hashed, Sig: string; SaltLen: Integer): Boolean;
+
+{ the same from the modulus N and exponent E at once }
+function RsaVerifyPkcs1v15(const N: string; E: Integer; Hash: Integer; const Hashed, Sig: string): Boolean;
+function RsaVerifyPss(const N: string; E: Integer; Hash: Integer; const Hashed, Sig: string; SaltLen: Integer): Boolean;
+
+implementation
+
+const
+  { the limbs a Montgomery product keeps on the stack: moduli up to
+    16384 bits; larger ones take a heap block }
+  StackLimbs = 256;
+  { the sign bit: x xor SignBit < y xor SignBit is x < y without sign }
+  SignBit = Integer($8000000000000000);
+
+type
+  TScratch = array[0..2 * StackLimbs - 1] of Integer;
+
+{ ---- constant-time helpers (nat.go not, ctMask, ctEq) ---- }
+
+{ ctEq: 1 when X = Y, else 0. If X <> Y, either X - Y or Y - X borrows }
+function CtEq(X, Y: Integer): Integer;
+var
+  c1, c2, d: Integer;
+begin
+  d := SubBorrow(X, Y, 0, c1);
+  d := SubBorrow(Y, X, 0, c2);
+  Result := 1 xor (c1 or c2);
+end;
+
+{ ---- Nat (nat.go) ---- }
+
+procedure NatReset(var X: TNat; N: Integer);
+var
+  i: Integer;
+begin
+  if Length(X.Limbs) = N then
+  begin
+    for i := 0 to N - 1 do
+      X.Limbs[i] := 0;
+  end
+  else
+  begin
+    X.Limbs := nil;
+    SetLength(X.Limbs, N);
+  end;
+end;
+
+{ expand: X grows to N limbs, its value unchanged }
+procedure NatExpand(var X: TNat; N: Integer);
+begin
+  if Length(X.Limbs) < N then
+    SetLength(X.Limbs, N);
+end;
+
+procedure NatSet(var X: TNat; const Y: TNat);
+var
+  i, n: Integer;
+begin
+  n := Length(Y.Limbs);
+  NatReset(X, n);
+  for i := 0 to n - 1 do
+    X.Limbs[i] := Y.Limbs[i];
+end;
+
+procedure NatSetUint(var X: TNat; Y: Integer);
+begin
+  NatReset(X, 1);
+  X.Limbs[0] := Y;
+end;
+
+{ trim: drop the most significant zero limbs. Comparison with zero
+  (not the branch) is taken as constant time, as Go does }
+procedure NatTrim(var X: TNat);
+var
+  i: Integer;
+begin
+  i := Length(X.Limbs);
+  while (i > 0) and (X.Limbs[i - 1] = 0) do
+    Dec(i);
+  if i < Length(X.Limbs) then
+    SetLength(X.Limbs, i);
+end;
+
+{ setBytes: the big-endian B into X's limbs (X zeroed); False when B
+  does not fit them }
+function NatSetBytesRaw(var X: TNat; const B: string): Boolean;
+var
+  i, k, s, n: Integer;
+begin
+  i := Length(B);
+  k := 0;
+  n := Length(X.Limbs);
+  while (k < n) and (i >= 8) do
+  begin
+    X.Limbs[k] := LoadBE64(@B[i - 7]);
+    i := i - 8;
+    Inc(k);
+  end;
+  s := 0;
+  while (s < 64) and (k < n) and (i > 0) do
+  begin
+    X.Limbs[k] := X.Limbs[k] or (Ord(B[i]) shl s);
+    Dec(i);
+    s := s + 8;
+  end;
+  Result := i = 0;
+end;
+
+{ resetToBytes }
+procedure NatResetToBytes(var X: TNat; const B: string);
+begin
+  NatReset(X, (Length(B) + 7) div 8);
+  NatSetBytesRaw(X, B);
+  NatTrim(X);
+end;
+
+function NatEqual(const X, Y: TNat): Integer;
+var
+  i, eq: Integer;
+begin
+  eq := 1;
+  for i := 0 to Length(X.Limbs) - 1 do
+    eq := eq and CtEq(X.Limbs[i], Y.Limbs[i]);
+  Result := eq;
+end;
+
+function NatIsZero(const X: TNat): Integer;
+var
+  i, z: Integer;
+begin
+  z := 1;
+  for i := 0 to Length(X.Limbs) - 1 do
+    z := z and CtEq(X.Limbs[i], 0);
+  Result := z;
+end;
+
+{ IsOne: 1 when X = 1 }
+function NatIsOne(const X: TNat): Integer;
+var
+  i, one: Integer;
+begin
+  if Length(X.Limbs) = 0 then
+    Exit(0);
+  one := CtEq(X.Limbs[0], 1);
+  for i := 1 to Length(X.Limbs) - 1 do
+    one := one and CtEq(X.Limbs[i], 0);
+  Result := one;
+end;
+
+function NatIsOdd(const X: TNat): Integer;
+begin
+  if Length(X.Limbs) = 0 then
+    Exit(0);
+  Result := X.Limbs[0] and 1;
+end;
+
+{ cmpGeq: 1 when X >= Y (one announced length): X - Y does not borrow }
+function NatCmpGeq(const X, Y: TNat): Integer;
+var
+  i, c, d: Integer;
+begin
+  c := 0;
+  for i := 0 to Length(X.Limbs) - 1 do
+    d := SubBorrow(X.Limbs[i], Y.Limbs[i], c, c);
+  Result := 1 xor c;
+end;
+
+{ assign: X := Y when On = 1, unchanged when On = 0, in constant time }
+procedure NatAssign(var X: TNat; On: Integer; const Y: TNat);
+var
+  i, mask: Integer;
+begin
+  mask := -On;
+  for i := 0 to Length(X.Limbs) - 1 do
+    X.Limbs[i] := X.Limbs[i] xor (mask and (X.Limbs[i] xor Y.Limbs[i]));
+end;
+
+{ add: X += Y (one announced length), the carry out }
+function NatAddRaw(var X: TNat; const Y: TNat): Integer;
+var
+  i, c: Integer;
+begin
+  c := 0;
+  for i := 0 to Length(X.Limbs) - 1 do
+    X.Limbs[i] := AddCarry(X.Limbs[i], Y.Limbs[i], c, c);
+  Result := c;
+end;
+
+{ sub: X -= Y (one announced length), the borrow out }
+function NatSubRaw(var X: TNat; const Y: TNat): Integer;
+var
+  i, c: Integer;
+begin
+  c := 0;
+  for i := 0 to Length(X.Limbs) - 1 do
+    X.Limbs[i] := SubBorrow(X.Limbs[i], Y.Limbs[i], c, c);
+  Result := c;
+end;
+
+function NatBitLenVarTime(const X: TNat): Integer;
+var
+  i, v, n: Integer;
+begin
+  for i := Length(X.Limbs) - 1 downto 0 do
+    if X.Limbs[i] <> 0 then
+    begin
+      { bitLen: only the bit length of the limb leaks, not its value }
+      v := X.Limbs[i];
+      n := 0;
+      while v <> 0 do
+      begin
+        Inc(n);
+        v := v shr 1;
+      end;
+      Exit(i * 64 + n);
+    end;
+  Result := 0;
+end;
+
+{ ---- Modulus ---- }
+
+function ModulusBitLen(const M: TModulus): Integer;
+begin
+  Result := NatBitLenVarTime(M.Nat);
+end;
+
+function ModulusSize(const M: TModulus): Integer;
+begin
+  Result := (ModulusBitLen(M) + 7) div 8;
+end;
+
+procedure ModulusNat(var X: TNat; const M: TModulus);
+begin
+  NatSet(X, M.Nat);
+end;
+
+function NatExpandFor(var X: TNat; const M: TModulus): Boolean;
+begin
+  Result := Length(X.Limbs) <= Length(M.Nat.Limbs);
+  if Result then
+    NatExpand(X, Length(M.Nat.Limbs));
+end;
+
+{ resetFor: X zeroed, of M's announced length }
+procedure NatResetFor(var X: TNat; const M: TModulus);
+begin
+  NatReset(X, Length(M.Nat.Limbs));
+end;
+
+{ maybeSubtractModulus: X -= M when X >= M or when Always = 1 (the
+  carry of an operation that overflowed X's size), in constant time.
+  X - M is worked out on the stack, as Go's NewNat keeps it there }
+procedure NatMaybeSubtractModulus(var X: TNat; Always: Integer; const M: TModulus);
+var
+  buf: array[0..StackLimbs - 1] of Integer;
+  big: array of Integer;
+  t, xp, mp: PInteger;
+  n, i, underflow, keep, mask: Integer;
+begin
+  n := Length(X.Limbs);
+  if n = 0 then
+    Exit;
+  if n <= StackLimbs then
+    t := @buf[0]
+  else
+  begin
+    SetLength(big, n);
+    t := @big[0];
+  end;
+  xp := @X.Limbs[0];
+  mp := @M.Nat.Limbs[0];
+  { t := x; underflow := t.sub(m.nat) }
+  underflow := 0;
+  for i := 0 to n - 1 do
+    t[i] := SubBorrow(xp[i], mp[i], underflow, underflow);
+  { keep X - M when it did not underflow (X >= M) or when Always }
+  keep := (1 xor underflow) or Always;
+  { x.assign(keep, t) }
+  mask := -keep;
+  for i := 0 to n - 1 do
+    xp[i] := xp[i] xor (mask and (xp[i] xor t[i]));
+end;
+
+procedure NatSub(var X: TNat; const Y: TNat; const M: TModulus);
+var
+  t: TNat;
+  underflow, d: Integer;
+begin
+  underflow := NatSubRaw(X, Y);
+  { if the subtraction underflowed, add M }
+  NatSet(t, X);
+  d := NatAddRaw(t, M.Nat);
+  NatAssign(X, underflow, t);
+end;
+
+procedure NatAdd(var X: TNat; const Y: TNat; const M: TModulus);
+var
+  overflow: Integer;
+begin
+  overflow := NatAddRaw(X, Y);
+  NatMaybeSubtractModulus(X, overflow, M);
+end;
+
+{ addMulVVW: Z[0..N-1] += X[0..N-1] * Y, the final carry out; one row
+  of a pen-and-paper column multiplication. Go adds with bits.Add; here
+  the carry of each addition is the unsigned compare of the sum with an
+  addend (sum < addend), the sign bit flipped on both sides of a signed
+  compare, which is a setl, constant time. AddCarry takes the place of
+  bits.Add elsewhere, but its carry goes through memory, and in this
+  loop that made the whole of RSA verification 2.1 times slower }
+function AddMulVVW(Z, X: PInteger; N, Y: Integer): Integer;
+var
+  i, hi, lo, p, zi, cy: Integer;
+begin
+  cy := 0;
+  for i := 0 to N - 1 do
+  begin
+    { hi, lo := bits.Mul(x[i], y) }
+    p := X[i];
+    lo := p * Y;
+    hi := MulHi(p, Y);
+    { lo, c := bits.Add(lo, z[i], 0); hi, _ := bits.Add(hi, 0, c): hi is
+      at most 2^64 - 2, so neither add to it overflows }
+    zi := Z[i];
+    lo := lo + zi;
+    hi := hi + Ord((lo xor SignBit) < (zi xor SignBit));
+    { lo, c = bits.Add(lo, carry, 0); hi, _ = bits.Add(hi, 0, c) }
+    lo := lo + cy;
+    hi := hi + Ord((lo xor SignBit) < (cy xor SignBit));
+    cy := hi;
+    Z[i] := lo;
+  end;
+  Result := cy;
+end;
+
+{ montgomeryMul: X := A * B / R mod M, R = 2^(64 n), n M's announced
+  length; A and B reduced and of length n, X may be either of them.
+  Word-by-word Montgomery multiplication, Algorithm 4 of Gueron's
+  "Efficient Software Implementations of Modular Exponentiation", as
+  Go's default case: step 1 (T = A * B) runs a digit at a time inside
+  the loop of steps 2 to 6, and step 6 slides the window T[i..] }
+procedure NatMontgomeryMul(var X: TNat; const A, B: TNat; const M: TModulus);
+var
+  buf: TScratch;
+  big: array of Integer;
+  T, ap, mp: PInteger;
+  n, i, c, c1, c2, d, y: Integer;
+begin
+  n := Length(M.Nat.Limbs);
+  if n <= StackLimbs then
+  begin
+    T := @buf[0];
+    FillChar(T^, 16 * n, 0);
+  end
+  else
+  begin
+    SetLength(big, 2 * n);
+    T := @big[0];
+  end;
+  ap := @A.Limbs[0];
+  mp := @M.Nat.Limbs[0];
+  c := 0;
+  for i := 0 to n - 1 do
+  begin
+    d := B.Limbs[i];
+    c1 := AddMulVVW(T + i, ap, n, d);
+    { steps 2 and 3: T mod 2^64 is T[i], k0 is m0inv }
+    y := T[i] * M.M0Inv;
+    { steps 4 and 5: T += Y * M; the two carries go to T[n + i] and its
+      carry to the next round }
+    c2 := AddMulVVW(T + i, mp, n, y);
+    T[n + i] := AddCarry(c1, c2, c, c);
+  end;
+  { step 7: the window T[n..2n-1] into X, M subtracted when X >= M or
+    when it overflowed }
+  NatReset(X, n);
+  for i := 0 to n - 1 do
+    X.Limbs[i] := T[n + i];
+  NatMaybeSubtractModulus(X, c, M);
+end;
+
+{ montgomeryRepresentation: X := X * R mod M, a Montgomery product by
+  R*R }
+procedure NatMontgomeryRepresentation(var X: TNat; const M: TModulus);
+begin
+  NatMontgomeryMul(X, X, M.RR, M);
+end;
+
+{ montgomeryReduction: X := X / R mod M, a Montgomery product by 1 }
+procedure NatMontgomeryReduction(var X: TNat; const M: TModulus);
+var
+  one: TNat;
+begin
+  NatReset(one, Length(M.Nat.Limbs));
+  one.Limbs[0] := 1;
+  NatMontgomeryMul(X, X, one, M);
+end;
+
+{ rr: R*R mod M, R = 2^(64 n). From 2^(bitlen - 1) doublings reach R
+  mod M; then a few more doublings and a square-and-double chain reach
+  R*R (R in Montgomery form), the threshold n / 4 Go's }
+procedure ModulusRR(var RR: TNat; const M: TModulus);
+var
+  n, mLen, logR, i, k, threshold: Integer;
+begin
+  NatReset(RR, Length(M.Nat.Limbs));
+  n := Length(RR.Limbs);
+  mLen := ModulusBitLen(M);
+  logR := 64 * n;
+  { 2^floor(log2 m), the highest bit that needs no reduction }
+  RR.Limbs[n - 1] := 1 shl ((mLen - 1) mod 64);
+  { then doublings up to 2^(64 n) }
+  for i := mLen - 1 to logR - 1 do
+    NatAdd(RR, RR, M);
+  threshold := n div 4;
+  { the most significant bits of the exponent logR done with doublings.
+    Go starts at i = 64, where logR >> 64 is 0 and the loop goes on;
+    a shift by 64 is a shift by 0 on both machines, so start at 63 }
+  i := 63;
+  while (logR shr i) <= threshold do
+    Dec(i);
+  for k := 0 to (logR shr i) - 1 do
+    NatAdd(RR, RR, M);
+  { the rest with a square-and-double chain }
+  while i > 0 do
+  begin
+    NatMontgomeryMul(RR, RR, RR, M);
+    Dec(i);
+    if ((logR shr i) and 1) <> 0 then
+      NatAdd(RR, RR, M);
+  end;
+end;
+
+{ minusInverseModW: -X^-1 mod 2^64 for an odd X; each round doubles the
+  correct low bits of the inverse, three to begin with }
+function MinusInverseModW(X: Integer): Integer;
+var
+  y, i: Integer;
+begin
+  y := X;
+  for i := 0 to 4 do
+    y := y * (2 - X * y);
+  Result := -y;
+end;
+
+{ NewModulus and newModulus }
+function NewModulus(var M: TModulus; const B: string): Boolean;
+begin
+  NatResetToBytes(M.Nat, B);
+  M.OddModulus := False;
+  M.M0Inv := 0;
+  M.RR.Limbs := nil;
+  if (NatIsZero(M.Nat) = 1) or (NatIsOne(M.Nat) = 1) then
+    Exit(False);
+  if NatIsOdd(M.Nat) = 1 then
+  begin
+    M.OddModulus := True;
+    M.M0Inv := MinusInverseModW(M.Nat.Limbs[0]);
+    ModulusRR(M.RR, M);
+  end;
+  Result := True;
+end;
+
+function NatSetBytes(var X: TNat; const B: string; const M: TModulus): Boolean;
+begin
+  NatResetFor(X, M);
+  if not NatSetBytesRaw(X, B) then
+    Exit(False);
+  { input overflows the modulus }
+  Result := NatCmpGeq(X, M.Nat) = 0;
+end;
+
+function NatBytes(const X: TNat; const M: TModulus): string;
+var
+  i, j, k, limb: Integer;
+begin
+  i := ModulusSize(M);
+  Result := '';
+  SetLength(Result, i);
+  for k := 0 to Length(X.Limbs) - 1 do
+  begin
+    limb := X.Limbs[k];
+    for j := 0 to 7 do
+    begin
+      Dec(i);
+      if i < 0 then
+      begin
+        if limb = 0 then
+          Break;
+        { the modulus is smaller than the nat }
+        Exit('');
+      end;
+      Result[i + 1] := Chr(limb and 255);
+      limb := limb shr 8;
+    end;
+  end;
+end;
+
+{ shiftIn: X := X * 2^64 + Y mod M, X reduced. A bit of Y at a time:
+  each round works out 2X + b and 2X + b - M, and the next round (and
+  the end) keeps the one that is reduced }
+procedure NatShiftIn(var X: TNat; Y: Integer; const M: TModulus);
+var
+  d: TNat;
+  size, i, j, cy, borrow, mask, l, needSub: Integer;
+begin
+  NatResetFor(d, M);
+  size := Length(M.Nat.Limbs);
+  needSub := 0;
+  for i := 63 downto 0 do
+  begin
+    cy := (Y shr i) and 1;
+    borrow := 0;
+    mask := -needSub;
+    for j := 0 to size - 1 do
+    begin
+      l := X.Limbs[j] xor (mask and (X.Limbs[j] xor d.Limbs[j]));
+      X.Limbs[j] := AddCarry(l, l, cy, cy);
+      d.Limbs[j] := SubBorrow(X.Limbs[j], M.Nat.Limbs[j], borrow, borrow);
+    end;
+    { subtract when 2X + b - M did not underflow, or when 2X + b
+      overflowed the limbs }
+    needSub := (1 xor borrow) or cy;
+  end;
+  NatAssign(X, needSub, d);
+end;
+
+procedure NatMod(var Res: TNat; const X: TNat; const M: TModulus);
+var
+  i, j, start: Integer;
+  xs: TNat;
+begin
+  { X copied first: Res may be X }
+  NatSet(xs, X);
+  NatResetFor(Res, M);
+  i := Length(xs.Limbs) - 1;
+  { the first N - 1 limbs go straight to their shifted place }
+  start := Length(M.Nat.Limbs) - 2;
+  if i < start then
+    start := i;
+  for j := start downto 0 do
+  begin
+    Res.Limbs[j] := xs.Limbs[i];
+    Dec(i);
+  end;
+  { the rest shifted in, reduced each time }
+  while i >= 0 do
+  begin
+    NatShiftIn(Res, xs.Limbs[i], M);
+    Dec(i);
+  end;
+end;
+
+procedure NatMul(var X: TNat; const Y: TNat; const M: TModulus);
+var
+  xR, t: TNat;
+  n, i: Integer;
+begin
+  if M.OddModulus then
+  begin
+    { a Montgomery product by a value outside the Montgomery domain
+      takes the result out of it: xR = X * R, X = xR * Y / R }
+    NatSet(xR, X);
+    NatMontgomeryRepresentation(xR, M);
+    NatMontgomeryMul(X, xR, Y, M);
+    Exit;
+  end;
+  n := Length(M.Nat.Limbs);
+  NatReset(t, 2 * n);
+  { T = X * Y, then X = T mod M }
+  for i := 0 to n - 1 do
+    t.Limbs[n + i] := AddMulVVW(@t.Limbs[i], @X.Limbs[0], n, Y.Limbs[i]);
+  NatMod(X, t, M);
+end;
+
+procedure NatExp(var Res: TNat; const X: TNat; const E: string; const M: TModulus);
+var
+  table: array[0..14] of TNat;
+  tmp: TNat;
+  i, p, j, b, k: Integer;
+begin
+  if not M.OddModulus then
+  begin
+    NatReset(Res, 0);
+    Exit;
+  end;
+  { a 4-bit window: table[i] = X^(i+1), in Montgomery form }
+  NatSet(table[0], X);
+  NatMontgomeryRepresentation(table[0], M);
+  for i := 1 to 14 do
+    NatMontgomeryMul(table[i], table[i - 1], table[0], M);
+  NatResetFor(Res, M);
+  Res.Limbs[0] := 1;
+  NatMontgomeryRepresentation(Res, M);
+  NatResetFor(tmp, M);
+  for p := 1 to Length(E) do
+  begin
+    b := Ord(E[p]);
+    j := 4;
+    while j >= 0 do
+    begin
+      { square four times }
+      NatMontgomeryMul(Res, Res, Res, M);
+      NatMontgomeryMul(Res, Res, Res, M);
+      NatMontgomeryMul(Res, Res, Res, M);
+      NatMontgomeryMul(Res, Res, Res, M);
+      { X^k chosen from the table in constant time }
+      k := (b shr j) and 15;
+      for i := 0 to 14 do
+        NatAssign(tmp, CtEq(k, i + 1), table[i]);
+      { multiply by X^k, the product dropped when k = 0 }
+      NatMontgomeryMul(tmp, Res, tmp, M);
+      NatAssign(Res, 1 xor CtEq(k, 0), tmp);
+      j := j - 4;
+    end;
+  end;
+  NatMontgomeryReduction(Res, M);
+end;
+
+procedure NatExpShortVarTime(var Res: TNat; const X: TNat; E: Integer; const M: TModulus);
+var
+  xR: TNat;
+  i, bl, v: Integer;
+begin
+  if not M.OddModulus then
+  begin
+    NatReset(Res, 0);
+    Exit;
+  end;
+  { a conditional square-and-multiply chain past the leading zeros }
+  NatSet(xR, X);
+  NatMontgomeryRepresentation(xR, M);
+  NatSet(Res, xR);
+  bl := 0;
+  v := E;
+  while v <> 0 do
+  begin
+    Inc(bl);
+    v := v shr 1;
+  end;
+  for i := 64 - bl + 1 to 63 do
+  begin
+    NatMontgomeryMul(Res, Res, Res, M);
+    if ((E shr (63 - i)) and 1) <> 0 then
+      NatMontgomeryMul(Res, Res, xR, M);
+  end;
+  NatMontgomeryReduction(Res, M);
+end;
+
+{ ---- hashes ---- }
+
+function RsaHash(Hash: Integer; const Msg: string): string;
+begin
+  case Hash of
+    RsaSha1: Result := Sha1(Msg);
+    RsaSha224: Result := Sha224(Msg);
+    RsaSha256: Result := Sha256(Msg);
+    RsaSha384: Result := Sha384(Msg);
+    RsaSha512: Result := Sha512(Msg);
+    RsaSha3_224: Result := Sha3_224(Msg);
+    RsaSha3_256: Result := Sha3_256(Msg);
+    RsaSha3_384: Result := Sha3_384(Msg);
+    RsaSha3_512: Result := Sha3_512(Msg);
+  else
+    Result := '';
+  end;
+end;
+
+{ pkcs1v15.go hashSize }
+function RsaHashSize(Hash: Integer): Integer;
+begin
+  case Hash of
+    RsaSha1: Result := 20;
+    RsaSha224, RsaSha3_224: Result := 28;
+    RsaSha256, RsaSha3_256: Result := 32;
+    RsaSha384, RsaSha3_384: Result := 48;
+    RsaSha512, RsaSha3_512: Result := 64;
+  else
+    Result := -1;
+  end;
+end;
+
+function UnHexConst(const H: string): string;
+var
+  i, d, v: Integer;
+  c: Char;
+begin
+  Result := '';
+  SetLength(Result, Length(H) div 2);
+  v := 0;
+  for i := 1 to Length(H) do
+  begin
+    c := H[i];
+    if (c >= '0') and (c <= '9') then
+      d := Ord(c) - 48
+    else
+      d := Ord(c) - 87;
+    if Odd(i) then
+      v := d shl 4
+    else
+      Result[i div 2] := Chr(v or d);
+  end;
+end;
+
+{ pkcs1v15.go hashPrefixes: the DER of DigestInfo up to the digest
+  (RFC 8017 9.2 note 1) }
+function HashPrefix(Hash: Integer): string;
+begin
+  case Hash of
+    RsaSha1: Result := UnHexConst('3021300906052b0e03021a05000414');
+    RsaSha224: Result := UnHexConst('302d300d06096086480165030402040500041c');
+    RsaSha256: Result := UnHexConst('3031300d060960864801650304020105000420');
+    RsaSha384: Result := UnHexConst('3041300d060960864801650304020205000430');
+    RsaSha512: Result := UnHexConst('3051300d060960864801650304020305000440');
+    RsaSha3_224: Result := UnHexConst('302d300d06096086480165030402070500041c');
+    RsaSha3_256: Result := UnHexConst('3031300d060960864801650304020805000420');
+    RsaSha3_384: Result := UnHexConst('3041300d060960864801650304020905000430');
+    RsaSha3_512: Result := UnHexConst('3051300d060960864801650304020a05000440');
+  else
+    Result := '';
+  end;
+end;
+
+{ ---- RSA (fips140/rsa rsa.go) ---- }
+
+function RsaPublicKeyInit(var Key: TRsaPublicKey; const N: string; E: Integer): Boolean;
+var
+  bits: Integer;
+begin
+  Result := False;
+  Key.E := 0;
+  { crypto/rsa fipsPublicKey: bigmod.NewModulus, the value above one }
+  if not NewModulus(Key.N, N) then
+    Exit;
+  bits := ModulusBitLen(Key.N);
+  { crypto/rsa checkKeySize: 1024 bits at least }
+  if bits < 1024 then
+    Exit;
+  { checkPublicKey: the modulus odd }
+  if not Key.N.OddModulus then
+    Exit;
+  { e at least 2, odd (coprime with p - 1 and q - 1), at most 2^31 - 1 }
+  if E < 2 then
+    Exit;
+  if (E and 1) = 0 then
+    Exit;
+  if E > $7FFFFFFF then
+    Exit;
+  Key.E := E;
+  Result := True;
+end;
+
+function RsaPublicKeySize(const Key: TRsaPublicKey): Integer;
+begin
+  Result := ModulusSize(Key.N);
+end;
+
+{ encrypt: m from S (refused when not below n), m^e mod n, its k bytes }
+function RsaPublicOp(const Key: TRsaPublicKey; const S: string; out Em: string): Boolean;
+var
+  m, c: TNat;
+begin
+  Em := '';
+  if Key.E = 0 then
+    Exit(False);
+  if not NatSetBytes(m, S, Key.N) then
+    Exit(False);
+  NatExpShortVarTime(c, m, Key.E, Key.N);
+  Em := NatBytes(c, Key.N);
+  Result := True;
+end;
+
+{ ---- PKCS #1 v1.5 (pkcs1v15.go) ---- }
+
+{ pkcs1v15ConstructEM: EM = 0x00 || 0x01 || PS || 0x00 || T, T the
+  DigestInfo prefix and the digest, PS 0xff bytes, at least 8 }
+function Pkcs1v15ConstructEM(K: Integer; Hash: Integer; const Hashed: string; out Em: string): Boolean;
+var
+  prefix: string;
+  i: Integer;
+begin
+  Em := '';
+  prefix := '';
+  if Hash <> RsaHashNone then
+  begin
+    prefix := HashPrefix(Hash);
+    { unsupported hash function }
+    if prefix = '' then
+      Exit(False);
+    { hashed message length does not match the hash }
+    if Length(Hashed) <> RsaHashSize(Hash) then
+      Exit(False);
+  end;
+  if K < Length(prefix) + Length(Hashed) + 2 + 8 + 1 then
+    Exit(False);
+  SetLength(Em, K);
+  Em[2] := #1;
+  for i := 3 to K - Length(prefix) - Length(Hashed) - 1 do
+    Em[i] := #255;
+  for i := 1 to Length(prefix) do
+    Em[K - Length(prefix) - Length(Hashed) + i] := prefix[i];
+  for i := 1 to Length(Hashed) do
+    Em[K - Length(Hashed) + i] := Hashed[i];
+  Result := True;
+end;
+
+{ verifyPKCS1v15 }
+function RsaKeyVerifyPkcs1v15(const Key: TRsaPublicKey; Hash: Integer; const Hashed, Sig: string): Boolean;
+var
+  em, expected: string;
+begin
+  Result := False;
+  if Key.E = 0 then
+    Exit;
+  { crypto/rsa VerifyPKCS1v15: the input must be a digest of the hash }
+  if (Hash <> RsaHashNone) and (Length(Hashed) <> RsaHashSize(Hash)) then
+    Exit;
+  { RFC 8017 8.2.2 step 1: S of k octets }
+  if RsaPublicKeySize(Key) <> Length(Sig) then
+    Exit;
+  { step 2: RSAVP1 }
+  if not RsaPublicOp(Key, Sig, em) then
+    Exit;
+  { step 3: EMSA-PKCS1-v1_5 encoding of the digest }
+  if not Pkcs1v15ConstructEM(RsaPublicKeySize(Key), Hash, Hashed, expected) then
+    Exit;
+  { step 4: the two encoded messages compared whole }
+  Result := em = expected;
+end;
+
+{ ---- PSS (pkcs1v22.go) ---- }
+
+{ mgf1XOR: Data[From..From+Len-1] xored with MGF1(Seed, Len) (RFC 8017
+  B.2.1), the counter four big-endian bytes (incCounter) }
+procedure Mgf1Xor(var Data: string; From, Len: Integer; Hash: Integer; const Seed: string);
+var
+  counter: Integer;
+  digest, ctr: string;
+  done, i: Integer;
+begin
+  done := 0;
+  counter := 0;
+  while done < Len do
+  begin
+    ctr := Chr((counter shr 24) and 255) + Chr((counter shr 16) and 255) +
+      Chr((counter shr 8) and 255) + Chr(counter and 255);
+    digest := RsaHash(Hash, Seed + ctr);
+    i := 1;
+    while (i <= Length(digest)) and (done < Len) do
+    begin
+      Data[From + done] := Chr(Ord(Data[From + done]) xor Ord(digest[i]));
+      Inc(done);
+      Inc(i);
+    end;
+    Inc(counter);
+  end;
+end;
+
+{ emsaPSSVerify (RFC 8017 9.1.2) of the digest MHash against EM of
+  EmBits bits; SLen RsaPssSaltAuto finds the salt at the 0x01 that ends
+  the padding }
+function EmsaPssVerify(const MHash: string; Em: string; EmBits, SLen: Integer; Hash: Integer): Boolean;
+var
+  hLen, emLen, dbLen, bitMask, psLen, i: Integer;
+  h, salt, h0: string;
+begin
+  Result := False;
+  hLen := RsaHashSize(Hash);
+  emLen := (EmBits + 7) div 8;
+  if emLen <> Length(Em) then
+    Exit;
+  { steps 1 and 2: mHash of hLen octets }
+  if hLen <> Length(MHash) then
+    Exit;
+  { step 3 }
+  if emLen < hLen + SLen + 2 then
+    Exit;
+  { step 4: the rightmost octet 0xbc }
+  if Ord(Em[emLen]) <> $bc then
+    Exit;
+  { step 5: maskedDB the leftmost emLen - hLen - 1 octets, H the next hLen }
+  dbLen := emLen - hLen - 1;
+  h := Copy(Em, dbLen + 1, hLen);
+  { step 6: the leftmost 8 emLen - emBits bits zero }
+  bitMask := $ff shr (8 * emLen - EmBits);
+  if (Ord(Em[1]) and (not bitMask) and $ff) <> 0 then
+    Exit;
+  { steps 7 and 8: DB = maskedDB xor MGF(H, emLen - hLen - 1) }
+  Mgf1Xor(Em, 1, dbLen, Hash, h);
+  { step 9 }
+  Em[1] := Chr(Ord(Em[1]) and bitMask);
+  { an unknown salt length: the place of the 0x01 delimiter }
+  if SLen = RsaPssSaltAuto then
+  begin
+    psLen := -1;
+    for i := 1 to dbLen do
+      if Em[i] = #1 then
+      begin
+        psLen := i - 1;
+        Break;
+      end;
+    if psLen < 0 then
+      Exit;
+    SLen := dbLen - psLen - 1;
+  end;
+  { step 10: emLen - hLen - sLen - 2 zero octets, then 0x01 }
+  psLen := emLen - hLen - SLen - 2;
+  for i := 1 to psLen do
+    if Em[i] <> #0 then
+      Exit;
+  if Em[psLen + 1] <> #1 then
+    Exit;
+  { step 11: the salt the last sLen octets of DB }
+  salt := Copy(Em, dbLen - SLen + 1, SLen);
+  { steps 12 and 13: H' = Hash(8 zero octets || mHash || salt) }
+  h0 := RsaHash(Hash, StringOfChar(#0, 8) + MHash + salt);
+  { step 14 }
+  Result := h0 = h;
+end;
+
+{ verifyPSS }
+function RsaKeyVerifyPss(const Key: TRsaPublicKey; Hash: Integer; const Hashed, Sig: string; SaltLen: Integer): Boolean;
+var
+  em: string;
+  emBits, emLen, skip: Integer;
+begin
+  Result := False;
+  if Key.E = 0 then
+    Exit;
+  if RsaHashSize(Hash) < 0 then
+    Exit;
+  { VerifyPSSWithSaltLength: the salt length cannot be negative }
+  if SaltLen < RsaPssSaltAuto then
+    Exit;
+  if Length(Sig) <> RsaPublicKeySize(Key) then
+    Exit;
+  emBits := ModulusBitLen(Key.N) - 1;
+  emLen := (emBits + 7) div 8;
+  if not RsaPublicOp(Key, Sig, em) then
+    Exit;
+  { an EM one octet shorter than k when modBits - 1 is a multiple of 8:
+    the leading octet must be zero and is dropped }
+  skip := 0;
+  while (Length(em) - skip > emLen) and (Length(em) - skip > 0) do
+  begin
+    if em[skip + 1] <> #0 then
+      Exit;
+    Inc(skip);
+  end;
+  if skip > 0 then
+    em := Copy(em, skip + 1, Length(em) - skip);
+  Result := EmsaPssVerify(Hashed, em, emBits, SaltLen, Hash);
+end;
+
+function RsaVerifyPkcs1v15(const N: string; E: Integer; Hash: Integer; const Hashed, Sig: string): Boolean;
+var
+  key: TRsaPublicKey;
+begin
+  Result := False;
+  if (Hash <> RsaHashNone) and (Length(Hashed) <> RsaHashSize(Hash)) then
+    Exit;
+  if not RsaPublicKeyInit(key, N, E) then
+    Exit;
+  Result := RsaKeyVerifyPkcs1v15(key, Hash, Hashed, Sig);
+end;
+
+function RsaVerifyPss(const N: string; E: Integer; Hash: Integer; const Hashed, Sig: string; SaltLen: Integer): Boolean;
+var
+  key: TRsaPublicKey;
+begin
+  Result := False;
+  if not RsaPublicKeyInit(key, N, E) then
+    Exit;
+  Result := RsaKeyVerifyPss(key, Hash, Hashed, Sig, SaltLen);
+end;
+
+end.

@@ -1,0 +1,500 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+
+  paslang is free software: you can redistribute it and/or modify it
+  under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+
+  paslang is distributed in the hope that it will be useful, but
+  WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+  General Public License for more details.
+
+  Under Section 7 of GPL version 3, you are granted additional
+  permissions described in the paslang Runtime Library Exception,
+  version 1.0, in the file COPYING.RUNTIME.
+
+  You should have received a copy of the GNU General Public License
+  along with paslang.  If not, see <https://www.gnu.org/licenses/>. }
+
+{ X25519 (RFC 7748 5 and 6.1), the Diffie-Hellman function on
+  Curve25519, in pure paslang as Go's crypto/ecdh x25519.go computes it
+  (Go 1.27.3): the Montgomery ladder of x25519ScalarMult over the field
+  GF(2^255-19) of crypto/internal/fips140/edwards25519/field (fe.go and
+  fe_generic.go), an element five limbs of 51 bits, the 128-bit product
+  of two limbs (Go's bits.Mul64) as MulHi and the low word.
+  Everything that touches the scalar runs in constant time: the ladder
+  reads every bit of the clamped scalar the same way, swaps by a mask
+  and never branches or indexes memory on a secret. X25519Shared refuses
+  an all-zero result, as Go's ecdh does for a low-order peer point
+  (RFC 7748 6.1). }
+unit pasx25519;
+
+interface
+
+const
+  X25519ScalarSize = 32;
+  X25519PointSize = 32;
+
+{ X25519(k, u) of RFC 7748 5: the 32-byte scalar k (clamped here, as the
+  RFC's decodeScalar25519) times the 32-byte little-endian u-coordinate
+  u (its top bit ignored, non-canonical values accepted); the 32-byte
+  result; '' when a size is wrong. No check of the result. }
+function X25519(const Scalar, Point: string): string;
+{ the public key of a 32-byte private key: X25519(Priv, 9); '' when the
+  size is wrong, as Go's ecdh NewPrivateKey }
+function X25519PublicKey(const Priv: string): string;
+{ the shared secret of RFC 7748 6.1, X25519(Priv, PeerPublic), as Go's
+  ecdh X25519 ECDH: False and Shared '' when a size is wrong or the
+  result is all zeros (a low-order peer point) }
+function X25519Shared(const Priv, PeerPublic: string; out Shared: string): Boolean;
+
+implementation
+
+const
+  Mask51 = (1 shl 51) - 1;   { maskLow51Bits of Go's fe.go }
+
+type
+  { t0 + t1*2^51 + t2*2^102 + t3*2^153 + t4*2^204, every limb below 2^52
+    between operations, as Go's field.Element }
+  TFe = array[0..4] of Integer;
+
+{ v = 1, as Go's fe.go One }
+procedure FeOne(var V: TFe);
+begin
+  V[0] := 1; V[1] := 0; V[2] := 0; V[3] := 0; V[4] := 0;
+end;
+
+{ v = 0, as Go's fe.go Zero }
+procedure FeZero(var V: TFe);
+begin
+  V[0] := 0; V[1] := 0; V[2] := 0; V[3] := 0; V[4] := 0;
+end;
+
+{ the limbs l0..l4 brought below 52 bits into v by the reduction identity
+  a * 2^255 + b = a * 19 + b on the l4 carry, as Go's fe_generic.go
+  carryPropagate }
+procedure FeCarryInto(var V: TFe; L0, L1, L2, L3, L4: Integer);
+begin
+  V[0] := (L0 and Mask51) + (L4 shr 51) * 19;
+  V[4] := (L4 and Mask51) + (L3 shr 51);
+  V[3] := (L3 and Mask51) + (L2 shr 51);
+  V[2] := (L2 and Mask51) + (L1 shr 51);
+  V[1] := (L1 and Mask51) + (L0 shr 51);
+end;
+
+{ v reduced modulo 2^255 - 19 to its canonical value, as Go's fe.go
+  reduce: after carryPropagate v < 2^255 + 2^13 * 19, and c is 1 when
+  v + 19 reaches 2^255, that is v >= p }
+procedure FeReduce(var V: TFe);
+var
+  c, l0, l1, l2, l3, l4: Integer;
+begin
+  FeCarryInto(V, V[0], V[1], V[2], V[3], V[4]);
+  l0 := V[0]; l1 := V[1]; l2 := V[2]; l3 := V[3]; l4 := V[4];
+  c := (l0 + 19) shr 51;
+  c := (l1 + c) shr 51;
+  c := (l2 + c) shr 51;
+  c := (l3 + c) shr 51;
+  c := (l4 + c) shr 51;
+  l0 := l0 + 19 * c;
+  l1 := l1 + (l0 shr 51);
+  l0 := l0 and Mask51;
+  l2 := l2 + (l1 shr 51);
+  l1 := l1 and Mask51;
+  l3 := l3 + (l2 shr 51);
+  l2 := l2 and Mask51;
+  l4 := l4 + (l3 shr 51);
+  l3 := l3 and Mask51;
+  l4 := l4 and Mask51;   { no additional carry }
+  V[0] := l0; V[1] := l1; V[2] := l2; V[3] := l3; V[4] := l4;
+end;
+
+{ v = a + b, as Go's fe.go Add, its carryPropagate written in line; v
+  may be a or b }
+procedure FeAdd(var V: TFe; const A, B: TFe);
+var
+  l0, l1, l2, l3, l4: Integer;
+begin
+  l0 := A[0] + B[0];
+  l1 := A[1] + B[1];
+  l2 := A[2] + B[2];
+  l3 := A[3] + B[3];
+  l4 := A[4] + B[4];
+  V[0] := (l0 and Mask51) + (l4 shr 51) * 19;
+  V[4] := (l4 and Mask51) + (l3 shr 51);
+  V[3] := (l3 and Mask51) + (l2 shr 51);
+  V[2] := (l2 and Mask51) + (l1 shr 51);
+  V[1] := (l1 and Mask51) + (l0 shr 51);
+end;
+
+{ v = a - b, as Go's fe.go Subtract: 2 * p is added first so that the
+  subtraction cannot underflow, b being below 2^255 + 2^13 * 19; its
+  carryPropagate written in line; v may be a or b }
+procedure FeSub(var V: TFe; const A, B: TFe);
+var
+  l0, l1, l2, l3, l4: Integer;
+begin
+  l0 := (A[0] + $FFFFFFFFFFFDA) - B[0];
+  l1 := (A[1] + $FFFFFFFFFFFFE) - B[1];
+  l2 := (A[2] + $FFFFFFFFFFFFE) - B[2];
+  l3 := (A[3] + $FFFFFFFFFFFFE) - B[3];
+  l4 := (A[4] + $FFFFFFFFFFFFE) - B[4];
+  V[0] := (l0 and Mask51) + (l4 shr 51) * 19;
+  V[4] := (l4 and Mask51) + (l3 shr 51);
+  V[3] := (l3 and Mask51) + (l2 shr 51);
+  V[2] := (l2 and Mask51) + (l1 shr 51);
+  V[1] := (l1 and Mask51) + (l0 shr 51);
+end;
+
+{ v = a * b, as Go's fe_generic.go feMulGeneric: the columns of the
+  schoolbook product with the limbs above 2^255 folded in times 19 (mul,
+  addMul, addMul19), then two carry chains back to limbs of 52 bits; v
+  may be a or b. Go keeps each column as a 128-bit sum (bits.Add64) and
+  takes shiftRightBy51 and the low 51 bits at the end; here column i is
+  kept as two words, hi * 2^51 + ri, every product split at bit 51 as it
+  is added (its low 51 bits into ri, the rest into hi), so no carry word
+  is needed: Go's carry ci is hi + (ri shr 51) and Go's low 51 bits are
+  ri and Mask51, exactly. ri stays below 5 * 2^51 and hi below 2^60, the
+  column being below 2^111 (Go's bound). }
+procedure FeMul(var V: TFe; const A, B: TFe);
+var
+  a0, a1, a2, a3, a4, b0, b1, b2, b3, b4: Integer;
+  a1t, a2t, a3t, a4t: Integer;
+  r0, r1, r2, r3, r4, h0, h1, h2, h3, h4, ph, pl: Integer;
+  rr0, rr1, rr2, rr3, rr4: Integer;
+begin
+  a0 := A[0]; a1 := A[1]; a2 := A[2]; a3 := A[3]; a4 := A[4];
+  b0 := B[0]; b1 := B[1]; b2 := B[2]; b3 := B[3]; b4 := B[4];
+  a1t := a1 * 19; a2t := a2 * 19; a3t := a3 * 19; a4t := a4 * 19;
+
+  { r0 = a0*b0 + 19*(a1*b4 + a2*b3 + a3*b2 + a4*b1) }
+  pl := a0 * b0; ph := MulHi(a0, b0); r0 := pl and Mask51; h0 := (ph shl 13) or (pl shr 51);
+  pl := a1t * b4; ph := MulHi(a1t, b4); r0 := r0 + (pl and Mask51); h0 := h0 + ((ph shl 13) or (pl shr 51));
+  pl := a2t * b3; ph := MulHi(a2t, b3); r0 := r0 + (pl and Mask51); h0 := h0 + ((ph shl 13) or (pl shr 51));
+  pl := a3t * b2; ph := MulHi(a3t, b2); r0 := r0 + (pl and Mask51); h0 := h0 + ((ph shl 13) or (pl shr 51));
+  pl := a4t * b1; ph := MulHi(a4t, b1); r0 := r0 + (pl and Mask51); h0 := h0 + ((ph shl 13) or (pl shr 51));
+
+  { r1 = a0*b1 + a1*b0 + 19*(a2*b4 + a3*b3 + a4*b2) }
+  pl := a0 * b1; ph := MulHi(a0, b1); r1 := pl and Mask51; h1 := (ph shl 13) or (pl shr 51);
+  pl := a1 * b0; ph := MulHi(a1, b0); r1 := r1 + (pl and Mask51); h1 := h1 + ((ph shl 13) or (pl shr 51));
+  pl := a2t * b4; ph := MulHi(a2t, b4); r1 := r1 + (pl and Mask51); h1 := h1 + ((ph shl 13) or (pl shr 51));
+  pl := a3t * b3; ph := MulHi(a3t, b3); r1 := r1 + (pl and Mask51); h1 := h1 + ((ph shl 13) or (pl shr 51));
+  pl := a4t * b2; ph := MulHi(a4t, b2); r1 := r1 + (pl and Mask51); h1 := h1 + ((ph shl 13) or (pl shr 51));
+
+  { r2 = a0*b2 + a1*b1 + a2*b0 + 19*(a3*b4 + a4*b3) }
+  pl := a0 * b2; ph := MulHi(a0, b2); r2 := pl and Mask51; h2 := (ph shl 13) or (pl shr 51);
+  pl := a1 * b1; ph := MulHi(a1, b1); r2 := r2 + (pl and Mask51); h2 := h2 + ((ph shl 13) or (pl shr 51));
+  pl := a2 * b0; ph := MulHi(a2, b0); r2 := r2 + (pl and Mask51); h2 := h2 + ((ph shl 13) or (pl shr 51));
+  pl := a3t * b4; ph := MulHi(a3t, b4); r2 := r2 + (pl and Mask51); h2 := h2 + ((ph shl 13) or (pl shr 51));
+  pl := a4t * b3; ph := MulHi(a4t, b3); r2 := r2 + (pl and Mask51); h2 := h2 + ((ph shl 13) or (pl shr 51));
+
+  { r3 = a0*b3 + a1*b2 + a2*b1 + a3*b0 + 19*a4*b4 }
+  pl := a0 * b3; ph := MulHi(a0, b3); r3 := pl and Mask51; h3 := (ph shl 13) or (pl shr 51);
+  pl := a1 * b2; ph := MulHi(a1, b2); r3 := r3 + (pl and Mask51); h3 := h3 + ((ph shl 13) or (pl shr 51));
+  pl := a2 * b1; ph := MulHi(a2, b1); r3 := r3 + (pl and Mask51); h3 := h3 + ((ph shl 13) or (pl shr 51));
+  pl := a3 * b0; ph := MulHi(a3, b0); r3 := r3 + (pl and Mask51); h3 := h3 + ((ph shl 13) or (pl shr 51));
+  pl := a4t * b4; ph := MulHi(a4t, b4); r3 := r3 + (pl and Mask51); h3 := h3 + ((ph shl 13) or (pl shr 51));
+
+  { r4 = a0*b4 + a1*b3 + a2*b2 + a3*b1 + a4*b0 }
+  pl := a0 * b4; ph := MulHi(a0, b4); r4 := pl and Mask51; h4 := (ph shl 13) or (pl shr 51);
+  pl := a1 * b3; ph := MulHi(a1, b3); r4 := r4 + (pl and Mask51); h4 := h4 + ((ph shl 13) or (pl shr 51));
+  pl := a2 * b2; ph := MulHi(a2, b2); r4 := r4 + (pl and Mask51); h4 := h4 + ((ph shl 13) or (pl shr 51));
+  pl := a3 * b1; ph := MulHi(a3, b1); r4 := r4 + (pl and Mask51); h4 := h4 + ((ph shl 13) or (pl shr 51));
+  pl := a4 * b0; ph := MulHi(a4, b0); r4 := r4 + (pl and Mask51); h4 := h4 + ((ph shl 13) or (pl shr 51));
+
+  { the carries c_i = r_i >> 51 (shiftRightBy51), r0 below 2^111 and r4
+    below 2^107, so every carry fits a word and 19 * c4 too }
+  rr0 := (r0 and Mask51) + (h4 + (r4 shr 51)) * 19;
+  rr1 := (r1 and Mask51) + h0 + (r0 shr 51);
+  rr2 := (r2 and Mask51) + h1 + (r1 shr 51);
+  rr3 := (r3 and Mask51) + h2 + (r2 shr 51);
+  rr4 := (r4 and Mask51) + h3 + (r3 shr 51);
+
+  V[0] := (rr0 and Mask51) + (rr4 shr 51) * 19;
+  V[1] := (rr1 and Mask51) + (rr0 shr 51);
+  V[2] := (rr2 and Mask51) + (rr1 shr 51);
+  V[3] := (rr3 and Mask51) + (rr2 shr 51);
+  V[4] := (rr4 and Mask51) + (rr3 shr 51);
+end;
+
+{ v = a^(2^n), n >= 1, as Go's fe_generic.go feSquareN, the limbs kept in
+  local variables; each round is feSquare, the multiplication with the
+  symmetric terms grouped (addMul38 is 19 * a times 2 * b), the columns
+  kept split at bit 51 as in FeMul; v may be a }
+procedure FeSquareN(var V: TFe; const A: TFe; N: Integer);
+var
+  l0, l1, l2, l3, l4, d0, d1, d3, d4, l1t, l2t, l3t, l4t: Integer;
+  r0, r1, r2, r3, r4, h0, h1, h2, h3, h4, ph, pl: Integer;
+  rr0, rr1, rr2, rr3, rr4, k: Integer;
+begin
+  l0 := A[0]; l1 := A[1]; l2 := A[2]; l3 := A[3]; l4 := A[4];
+  for k := 1 to N do
+  begin
+    d0 := l0 * 2;
+    d1 := l1 * 2;
+    d3 := l3 * 2;
+    d4 := l4 * 2;
+    l1t := l1 * 19;
+    l2t := l2 * 19;
+    l3t := l3 * 19;
+    l4t := l4 * 19;
+    { r0 = l0*l0 + 38*(l1*l4 + l2*l3) }
+    pl := l0 * l0; ph := MulHi(l0, l0); r0 := pl and Mask51; h0 := (ph shl 13) or (pl shr 51);
+    pl := l1t * d4; ph := MulHi(l1t, d4); r0 := r0 + (pl and Mask51); h0 := h0 + ((ph shl 13) or (pl shr 51));
+    pl := l2t * d3; ph := MulHi(l2t, d3); r0 := r0 + (pl and Mask51); h0 := h0 + ((ph shl 13) or (pl shr 51));
+
+    { r1 = 2*l0*l1 + 38*l2*l4 + 19*l3*l3 }
+    pl := d0 * l1; ph := MulHi(d0, l1); r1 := pl and Mask51; h1 := (ph shl 13) or (pl shr 51);
+    pl := l2t * d4; ph := MulHi(l2t, d4); r1 := r1 + (pl and Mask51); h1 := h1 + ((ph shl 13) or (pl shr 51));
+    pl := l3t * l3; ph := MulHi(l3t, l3); r1 := r1 + (pl and Mask51); h1 := h1 + ((ph shl 13) or (pl shr 51));
+
+    { r2 = 2*l0*l2 + l1*l1 + 38*l3*l4 }
+    pl := d0 * l2; ph := MulHi(d0, l2); r2 := pl and Mask51; h2 := (ph shl 13) or (pl shr 51);
+    pl := l1 * l1; ph := MulHi(l1, l1); r2 := r2 + (pl and Mask51); h2 := h2 + ((ph shl 13) or (pl shr 51));
+    pl := l3t * d4; ph := MulHi(l3t, d4); r2 := r2 + (pl and Mask51); h2 := h2 + ((ph shl 13) or (pl shr 51));
+
+    { r3 = 2*l0*l3 + 2*l1*l2 + 19*l4*l4 }
+    pl := d0 * l3; ph := MulHi(d0, l3); r3 := pl and Mask51; h3 := (ph shl 13) or (pl shr 51);
+    pl := d1 * l2; ph := MulHi(d1, l2); r3 := r3 + (pl and Mask51); h3 := h3 + ((ph shl 13) or (pl shr 51));
+    pl := l4t * l4; ph := MulHi(l4t, l4); r3 := r3 + (pl and Mask51); h3 := h3 + ((ph shl 13) or (pl shr 51));
+
+    { r4 = 2*l0*l4 + 2*l1*l3 + l2*l2 }
+    pl := d0 * l4; ph := MulHi(d0, l4); r4 := pl and Mask51; h4 := (ph shl 13) or (pl shr 51);
+    pl := d1 * l3; ph := MulHi(d1, l3); r4 := r4 + (pl and Mask51); h4 := h4 + ((ph shl 13) or (pl shr 51));
+    pl := l2 * l2; ph := MulHi(l2, l2); r4 := r4 + (pl and Mask51); h4 := h4 + ((ph shl 13) or (pl shr 51));
+
+    rr0 := (r0 and Mask51) + (h4 + (r4 shr 51)) * 19;
+    rr1 := (r1 and Mask51) + h0 + (r0 shr 51);
+    rr2 := (r2 and Mask51) + h1 + (r1 shr 51);
+    rr3 := (r3 and Mask51) + h2 + (r2 shr 51);
+    rr4 := (r4 and Mask51) + h3 + (r3 shr 51);
+
+    l0 := (rr0 and Mask51) + (rr4 shr 51) * 19;
+    l1 := (rr1 and Mask51) + (rr0 shr 51);
+    l2 := (rr2 and Mask51) + (rr1 shr 51);
+    l3 := (rr3 and Mask51) + (rr2 shr 51);
+    l4 := (rr4 and Mask51) + (rr3 shr 51);
+  end;
+  V[0] := l0; V[1] := l1; V[2] := l2; V[3] := l3; V[4] := l4;
+end;
+
+{ v = a * a, as Go's fe.go Square }
+procedure FeSquare(var V: TFe; const A: TFe);
+begin
+  FeSquareN(V, A, 1);
+end;
+
+{ v = x * y for a 32-bit y, as Go's fe.go Mult32 and mul51: each product
+  split at bit 51, the high part of the top limb folded in times 19; the
+  high parts are about 32 bits, so no carry propagation follows }
+procedure FeMult32(var V: TFe; const X: TFe; Y: Integer);
+var
+  mh, ml, lo0, lo1, lo2, lo3, lo4, hi0, hi1, hi2, hi3, hi4: Integer;
+begin
+  Mul128(X[0], Y, mh, ml); lo0 := ml and Mask51; hi0 := (mh shl 13) or (ml shr 51);
+  Mul128(X[1], Y, mh, ml); lo1 := ml and Mask51; hi1 := (mh shl 13) or (ml shr 51);
+  Mul128(X[2], Y, mh, ml); lo2 := ml and Mask51; hi2 := (mh shl 13) or (ml shr 51);
+  Mul128(X[3], Y, mh, ml); lo3 := ml and Mask51; hi3 := (mh shl 13) or (ml shr 51);
+  Mul128(X[4], Y, mh, ml); lo4 := ml and Mask51; hi4 := (mh shl 13) or (ml shr 51);
+  V[0] := lo0 + 19 * hi4;
+  V[1] := lo1 + hi0;
+  V[2] := lo2 + hi1;
+  V[3] := lo3 + hi2;
+  V[4] := lo4 + hi3;
+end;
+
+{ v and u swapped when Bit is 1, left when 0, in constant time, as Go's
+  fe.go Swap with mask64Bits(cond) = -cond }
+procedure FeSwap(var V, U: TFe; Bit: Integer);
+var
+  m, t: Integer;
+begin
+  m := 0 - Bit;
+  t := m and (V[0] xor U[0]); V[0] := V[0] xor t; U[0] := U[0] xor t;
+  t := m and (V[1] xor U[1]); V[1] := V[1] xor t; U[1] := U[1] xor t;
+  t := m and (V[2] xor U[2]); V[2] := V[2] xor t; U[2] := U[2] xor t;
+  t := m and (V[3] xor U[3]); V[3] := V[3] xor t; U[3] := U[3] xor t;
+  t := m and (V[4] xor U[4]); V[4] := V[4] xor t; U[4] := U[4] xor t;
+end;
+
+{ v = 1/z mod p as z^(p-2), 254 squarings and 11 multiplications, as
+  Go's fe.go Invert; 0 for z = 0 }
+procedure FeInvert(var V: TFe; const Z: TFe);
+var
+  z11, t0, t1, t2, t: TFe;
+begin
+  FeSquare(t1, Z);          { 2 }
+  FeSquare(t, t1);          { 4 }
+  FeSquare(t, t);           { 8 }
+  FeMul(t2, t, Z);          { 9 }
+  FeMul(z11, t2, t1);       { 11 }
+  FeSquare(t, z11);         { 22 }
+  FeMul(t0, t, t2);         { 31 = 2^5 - 2^0 }
+
+  FeSquareN(t, t0, 5);      { 2^10 - 2^5 }
+  FeMul(t2, t, t0);         { 2^10 - 1 }
+
+  FeSquareN(t, t2, 5);      { 2^15 - 2^5 }
+  FeMul(t0, t, t0);         { 2^15 - 1 }
+
+  FeSquareN(t, t0, 15);     { 2^30 - 2^15 }
+  FeMul(t1, t, t0);         { 2^30 - 1 }
+
+  FeSquareN(t, t1, 30);     { 2^60 - 2^30 }
+  FeMul(t0, t, t1);         { 2^60 - 1 }
+
+  FeSquareN(t, t0, 60);     { 2^120 - 2^60 }
+  FeMul(t1, t, t0);         { 2^120 - 1 }
+
+  FeSquareN(t, t1, 120);    { 2^240 - 2^120 }
+  FeMul(t, t, t1);          { 2^240 - 1 }
+
+  FeSquareN(t, t, 10);      { 2^250 - 2^10 }
+  FeMul(t, t, t2);          { 2^250 - 1 }
+
+  FeSquareN(t, t, 5);       { 2^255 - 2^5 }
+  FeMul(V, t, z11);         { 2^255 - 21 }
+end;
+
+{ v from the 32 little-endian bytes at P, the top bit ignored and the
+  non-canonical values 2^255-19 .. 2^255-1 accepted (RFC 7748 5), as Go's
+  fe.go SetBytes: the 51-bit limbs read at bytes 0, 6, 12, 19 and 24 }
+procedure FeSetBytes(var V: TFe; P: Pointer);
+begin
+  V[0] := LoadLE64(P) and Mask51;
+  V[1] := (LoadLE64(P + 6) shr 3) and Mask51;
+  V[2] := (LoadLE64(P + 12) shr 6) and Mask51;
+  V[3] := (LoadLE64(P + 19) shr 1) and Mask51;
+  V[4] := (LoadLE64(P + 24) shr 12) and Mask51;
+end;
+
+{ the canonical 32-byte little-endian encoding of v, as Go's fe.go
+  Bytes: reduced, the five limbs packed into four words }
+function FeBytes(const V: TFe): string;
+var
+  t: TFe;
+  u0, u1, u2, u3: Integer;
+begin
+  t := V;
+  FeReduce(t);
+  u0 := (t[1] shl 51) or t[0];
+  u1 := (t[2] shl (102 - 64)) or (t[1] shr (64 - 51));
+  u2 := (t[3] shl (153 - 128)) or (t[2] shr (128 - 102));
+  u3 := (t[4] shl (204 - 192)) or (t[3] shr (192 - 153));
+  SetLength(Result, 32);
+  StoreLE64(@Result[1], u0);
+  StoreLE64(@Result[9], u1);
+  StoreLE64(@Result[17], u2);
+  StoreLE64(@Result[25], u3);
+end;
+
+{ RFC 7748 5, as Go's x25519.go x25519ScalarMult: the scalar clamped
+  (decodeScalar25519), then the Montgomery ladder from bit 254 down with
+  a conditional swap by mask for each bit, and x2 / z2 at the end; both
+  sizes already checked }
+function ScalarMult(const Scalar, Point: string): string;
+var
+  e: array[0..31] of Byte;
+  x1, x2, z2, x3, z3, tmp0, tmp1: TFe;
+  i, bitpos, b, swap: Integer;
+begin
+  for i := 0 to 31 do
+    e[i] := Byte(Ord(Scalar[i + 1]));
+  e[0] := Byte(e[0] and 248);
+  e[31] := Byte(e[31] and 127);
+  e[31] := Byte(e[31] or 64);
+
+  FeSetBytes(x1, @Point[1]);
+  FeOne(x2);
+  FeZero(z2);
+  x3 := x1;
+  FeOne(z3);
+
+  swap := 0;
+  for bitpos := 254 downto 0 do
+  begin
+    b := (e[bitpos shr 3] shr (bitpos and 7)) and 1;
+    swap := swap xor b;
+    FeSwap(x2, x3, swap);
+    FeSwap(z2, z3, swap);
+    swap := b;
+
+    FeSub(tmp0, x3, z3);
+    FeSub(tmp1, x2, z2);
+    FeAdd(x2, x2, z2);
+    FeAdd(z2, x3, z3);
+    FeMul(z3, tmp0, x2);
+    FeMul(z2, z2, tmp1);
+    FeSquare(tmp0, tmp1);
+    FeSquare(tmp1, x2);
+    FeAdd(x3, z3, z2);
+    FeSub(z2, z3, z2);
+    FeMul(x2, tmp1, tmp0);
+    FeSub(tmp1, tmp1, tmp0);
+    FeSquare(z2, z2);
+
+    FeMult32(z3, tmp1, 121666);
+    FeSquare(x3, x3);
+    FeAdd(tmp0, tmp0, z3);
+    FeMul(z3, x1, z2);
+    FeMul(z2, tmp1, tmp0);
+  end;
+
+  FeSwap(x2, x3, swap);
+  FeSwap(z2, z3, swap);
+
+  FeInvert(z2, z2);
+  FeMul(x2, x2, z2);
+  Result := FeBytes(x2);
+  FillChar(e, SizeOf(e), 0);   { the clamped scalar wiped (Go leaves it) }
+end;
+
+function X25519(const Scalar, Point: string): string;
+begin
+  Result := '';
+  if (Length(Scalar) <> X25519ScalarSize) or (Length(Point) <> X25519PointSize) then
+    Exit;
+  Result := ScalarMult(Scalar, Point);
+end;
+
+{ as Go's ecdh x25519.go NewPrivateKey: the scalar times the base point
+  u = 9 (RFC 7748 4.1); no all-zero check, the clamped scalar never
+  being zero and 9 not of low order }
+function X25519PublicKey(const Priv: string): string;
+var
+  base: string;
+begin
+  Result := '';
+  if Length(Priv) <> X25519ScalarSize then
+    Exit;
+  base := StringOfChar(#0, 32);
+  base[1] := #9;
+  Result := ScalarMult(Priv, base);
+end;
+
+{ as Go's ecdh x25519.go ecdh and isZero: the all-zero result, which a
+  peer point of low order gives, refused (RFC 7748 6.1); the bytes OR-ed
+  together so the check reads all of them the same way }
+function X25519Shared(const Priv, PeerPublic: string; out Shared: string): Boolean;
+var
+  i, acc: Integer;
+begin
+  Shared := '';
+  Result := False;
+  if (Length(Priv) <> X25519ScalarSize) or (Length(PeerPublic) <> X25519PointSize) then
+    Exit;
+  Shared := ScalarMult(Priv, PeerPublic);
+  acc := 0;
+  for i := 1 to 32 do
+    acc := acc or Ord(Shared[i]);
+  if acc = 0 then
+  begin
+    Shared := '';
+    Exit;
+  end;
+  Result := True;
+end;
+
+end.
