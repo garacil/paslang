@@ -415,6 +415,9 @@ GOLDEN_A64 += opunary recops2
 # P224: Resolve asks as Go's resolver does.
 GOLDEN += resolveask
 GOLDEN_A64 += resolveask
+# P225: no pasnet word ends the program over a host it cannot read.
+GOLDEN += hostread
+GOLDEN_A64 += hostread
 # P207: building and transforming json.
 GOLDEN += jsonbuild jsonmod
 GOLDEN_A64 += jsonbuild jsonmod

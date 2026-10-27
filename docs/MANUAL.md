@@ -8241,6 +8241,10 @@ UdpBind  UdpPort  UdpSend  UdpRecv  UdpClose
 ```
 
 Port 0 asks the kernel for a free port and `TcpPort` tells which one.
+`TcpConnect` and `UdpSend` read their host as `TcpConnectTo` and
+`UdpSendTo` do, a dotted quad, an IPv6 literal or a name, and answer -1
+for one they cannot use (1.1.300); they ended the program on anything
+but digits and dots.
 `TcpReadDeadline` returns an empty string when the timer fires first,
 and reads at most 512 bytes a call. A
 routine that waits on a socket parks; the thread serves other routines.
