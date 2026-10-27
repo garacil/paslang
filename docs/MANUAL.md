@@ -2430,7 +2430,11 @@ that register (1.1.287, P397): on amd64 `+`, `*`, `and`, `or` and `xor`
 take it as their operand where it lies and a comparison as its right
 side, and nothing is pushed to keep the other side while it is
 loaded; a constant shifted by a count, `Int64(1) shl n`, is loaded
-after the count.
+after the count. An element of a dynamic array or a string such a field
+holds, or a global or a local on amd64, indexed by a constant or a
+variable, is reached with nothing pushed (1.1.295, P398): the index is
+compared with the length where it lies and the pointer is loaded after
+it; only a `var` parameter's descriptor, which may be nil, is tested.
 A `for` of a constant count of four passes or fewer with a small body
 that neither changes its counter nor takes its address is written out
 once per pass with the pass's value in the counter's place, then the

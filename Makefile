@@ -585,6 +585,9 @@ GOLDEN_A64 += regleaf
 # P402: Inc and Dec of a place in memory are one add or sub.
 GOLDEN += incplace
 GOLDEN_A64 += incplace
+# P398: an element of a slice a field holds is reached with no push.
+GOLDEN += sliceat
+GOLDEN_A64 += sliceat
 # P463: ToLower of a string with no capital is the string itself.
 GOLDEN += tolowershare
 GOLDEN_A64 += tolowershare
@@ -3080,6 +3083,21 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	python3 -I scripts/check_incplace.py $(BUILDDIR)/incplace0.s; \
 	python3 -I scripts/check_incplace.py $(BUILDDIR)/incplace-base.s; \
 	echo ok incplace-asm; \
+	: an element of a slice an object field holds takes its pointer and length where they lie, no push, P398; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/sliceat0 testdata/sliceat.paslang; \
+	$(BUILDDIR)/sliceat0 > $(BUILDDIR)/sliceat0.got; \
+	diff -u testdata/sliceat.out $(BUILDDIR)/sliceat0.got; \
+	$(OUTDIR)/paslangc -cpu base -o $(BUILDDIR)/sliceat-base testdata/sliceat.paslang; \
+	$(BUILDDIR)/sliceat-base > $(BUILDDIR)/sliceat-base.got; \
+	diff -u testdata/sliceat.out $(BUILDDIR)/sliceat-base.got; \
+	python3 -I scripts/check_sliceat.py $(BUILDDIR)/sliceat.s; \
+	python3 -I scripts/check_sliceat.py $(BUILDDIR)/sliceat0.s; \
+	python3 -I scripts/check_sliceat.py $(BUILDDIR)/sliceat-base.s; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/sliceoob testdata/sliceoob.paslang; \
+	if $(BUILDDIR)/sliceoob > $(BUILDDIR)/sliceoob.got 2> $(BUILDDIR)/sliceoob.err; then echo "sliceoob ran past the end of its slice"; exit 1; fi; \
+	diff -u testdata/sliceoob.out $(BUILDDIR)/sliceoob.got; \
+	grep -q 'index 2 out of range \[0..1\] at line 25' $(BUILDDIR)/sliceoob.err; \
+	echo ok sliceat-asm; \
 	: a routine with nested ones zeroes only the locals a read may reach first, P358; \
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/nestzero0 testdata/nestzero.paslang; \
 	$(BUILDDIR)/nestzero0 > $(BUILDDIR)/nestzero0.got; \
@@ -4778,6 +4796,20 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	python3 -I scripts/check_incplace.py $(BUILDDIR)/incplace-arm.s --arm; \
 	python3 -I scripts/check_incplace.py $(BUILDDIR)/incplace0-arm.s --arm; \
 	echo ok incplace-arm-asm; \
+	: P398 on arm64: an element of a slice an object field holds loads its pointer and length at an offset, no push; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/sliceat0-arm testdata/sliceat.paslang; \
+	timeout 300 $(QEMU_A64) $(BUILDDIR)/sliceat0-arm > $(BUILDDIR)/sliceat0-arm.got; \
+	diff -u testdata/sliceat.out $(BUILDDIR)/sliceat0-arm.got; \
+	$(OUTDIR)/paslangc -target arm64 -cpu base -Fu $(A64DIR) -o $(BUILDDIR)/sliceat-base-arm testdata/sliceat.paslang; \
+	timeout 300 $(QEMU_A64) $(BUILDDIR)/sliceat-base-arm > $(BUILDDIR)/sliceat-base-arm.got; \
+	diff -u testdata/sliceat.out $(BUILDDIR)/sliceat-base-arm.got; \
+	python3 -I scripts/check_sliceat.py $(BUILDDIR)/sliceat-arm.s --arm; \
+	python3 -I scripts/check_sliceat.py $(BUILDDIR)/sliceat0-arm.s --arm; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -Fu $(A64DIR) -o $(BUILDDIR)/sliceoob-arm testdata/sliceoob.paslang; \
+	if timeout 300 $(QEMU_A64) $(BUILDDIR)/sliceoob-arm > $(BUILDDIR)/sliceoob-arm.got 2> $(BUILDDIR)/sliceoob-arm.err; then echo "sliceoob-arm ran past the end of its slice"; exit 1; fi; \
+	diff -u testdata/sliceoob.out $(BUILDDIR)/sliceoob-arm.got; \
+	grep -q 'index 2 out of range \[0..1\] at line 25' $(BUILDDIR)/sliceoob-arm.err; \
+	echo ok sliceat-arm-asm; \
 	: P358 on arm64: the locals a read may reach first, zeroed alone; \
 	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/nestzero0-arm testdata/nestzero.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/nestzero0-arm > $(BUILDDIR)/nestzero0-arm.got; \

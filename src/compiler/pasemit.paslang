@@ -925,6 +925,8 @@ type
     function RegVarIn(E: PExpr): Boolean;
     function PoolWord(E: PExpr): string;
     function RegLeaf(E: PExpr; out Op: string; out Ty: LongInt): Boolean;
+    function RegPlace(E: PExpr; out R: string; out Off: Int64): Boolean;
+    function SliceOps(B: PExpr; out P, L: string): Boolean;
     function IncDirect(S: PStmt): Boolean;
     procedure ArgInto(E: PExpr; const R: string);
     function CallFree(E: PExpr; Depth: LongInt): Boolean;
@@ -6784,7 +6786,7 @@ var
   esz: LongInt;
   i, sh: LongInt;
   off: LongInt;
-  into, pw, xr, dr: string;
+  into, pw, xr, dr, sp, sl: string;
   ok, ix: string;
   wr, late: Boolean;
 begin
@@ -6976,6 +6978,32 @@ begin
               EmitOrdTo(E^.R, 1);
               ScaleAddArm(dr, OrdPool(0), OrdPool(1), esz, 'x16', 'x17');
             end;
+          end
+          else if IsDyn(E^.L^.Typ) and SimpleIx(E^.R) and SliceOps(E^.L, sp, sl) then
+          begin
+            { the slice's words at an offset from the register that holds
+              its object: the index into x0, the two words loaded after
+              it, nothing pushed (P398) }
+            esz := TSize(FTypes[E^.L^.Typ].Elem);
+            EmitExpr(E^.R);
+            Line('  ldr x1, ' + sp);
+            if not SliceProven(E) then
+            begin
+              Line('  ldr x2, ' + sl);
+              ok := Lab;
+              Line('  cmp x0, x2');
+              ColdBegin('  b.hs');
+              BoundsFailArm('x0', 0, 0, 'x2', 0, -1);
+              ColdEnd;
+              Line(ok + ':');
+            end;
+            dr := 'x0';
+            if into <> '' then
+            begin
+              dr := into;
+              FAddrDone := True;
+            end;
+            ScaleAddArm(dr, 'x1', 'x0', esz, 'x16', 'x17');
           end
           else if IsDyn(E^.L^.Typ) or (TKind(E^.L^.Typ) = tykPointer) then
           begin
@@ -7254,6 +7282,33 @@ begin
           Line('  decq %rax');
           Line('  popq %rcx');
           Line('  addq %rcx, %rax');
+        end
+        else if IsDyn(E^.L^.Typ) and SimpleIx(E^.R) and SliceOps(E^.L, sp, sl) then
+        begin
+          { the slice's words where they lie: the index into rax, checked
+            against the length in memory, the pointer loaded after it,
+            nothing pushed (P398), as Go compares an index with a
+            slice's length word and indexes its pointer
+            (cmd/compile/internal/ssa/_gen/AMD64.rules, CMPQload) }
+          esz := TSize(FTypes[E^.L^.Typ].Elem);
+          EmitExpr(E^.R);
+          if not SliceProven(E) then
+          begin
+            ok := Lab;
+            Line('  cmpq ' + sl + ', %rax');
+            ColdBegin('  jae');
+            BoundsFailX86('%rax', 0, sl, 0, -1);
+            ColdEnd;
+            Line(ok + ':');
+          end;
+          Line('  movq ' + sp + ', %rcx');
+          dr := '%rax';
+          if into <> '' then
+          begin
+            dr := '%' + into;
+            FAddrDone := True;
+          end;
+          ScaleAddX86(dr, '%rcx', '%rax', esz, '%rdx');
         end
         else if IsDyn(E^.L^.Typ) then
         begin
@@ -16581,6 +16636,82 @@ begin
   Result := OrdPool(0);
 end;
 
+{ E, a field, lies Off bytes past the object register R holds: a field
+  of that object or of a record in it, at any depth, the offsets added
+  up (FOut.S of a writer) (P397, P398). }
+function TEmitter.RegPlace(E: PExpr; out R: string; out Off: Int64): Boolean;
+var
+  b: PExpr;
+begin
+  Result := False;
+  R := '';
+  Off := 0;
+  if (E = nil) or (E^.Kind <> ekField) or (E^.L = nil) or PtrAccess(E) then
+    Exit;
+  Off := E^.Off;
+  b := E^.L;
+  while (b^.Kind = ekField) and (TKind(b^.Typ) = tykRecord) and (b^.L <> nil) and
+    not PtrAccess(b) do
+  begin
+    Off := Off + b^.Off;
+    b := b^.L;
+  end;
+  if TKind(b^.Typ) <> tykClass then
+    Exit;
+  R := WordReg(b);
+  Result := R <> '';
+end;
+
+{ The operands of slice B's pointer and length where they lie, its first
+  two words, when no code is needed to reach them (P398): a field of an
+  object a register holds, off(%r) and off+8(%r) on amd64, [r, #off]
+  and [r, #off+8] on arm64 within LDR's scaled offset; on amd64 a
+  global, v_x(%rip), or a local of the frame not in a register, -24(%rbp),
+  not passed by reference. The register is none an element's address
+  writes (rax, rcx, rdx; x0 to x2 and x16, x17). }
+function TEmitter.SliceOps(B: PExpr; out P, L: string): Boolean;
+var
+  r: string;
+  off: Int64;
+  sy: TSym;
+begin
+  Result := False;
+  P := '';
+  L := '';
+  if (B = nil) or not IsDyn(B^.Typ) then
+    Exit;
+  if B^.Kind = ekField then
+  begin
+    if not RegPlace(B, r, off) then
+      Exit;
+    if FArm then
+    begin
+      if (r = 'x0') or (r = 'x1') or (r = 'x2') or (r = 'x16') or (r = 'x17') or
+        (off < 0) or (off mod 8 <> 0) or (off div 8 + 1 > 4095) then
+        Exit;
+      P := '[' + r + ', #' + IntToStr(off) + ']';
+      L := '[' + r + ', #' + IntToStr(off + 8) + ']';
+    end
+    else
+    begin
+      if (r = 'rax') or (r = 'rcx') or (r = 'rdx') or not Fits32(off + 8) then
+        Exit;
+      P := IntToStr(off) + '(%' + r + ')';
+      L := IntToStr(off + 8) + '(%' + r + ')';
+    end;
+    Result := True;
+    Exit;
+  end;
+  if FArm or (B^.Kind <> ekVar) or not TryFindSym(B^.Name, sy) then
+    Exit;
+  if (sy.Reg <> '') or sy.ByRef or (sy.Up > 0) or sy.Boxed then
+    Exit;
+  P := MemA(sy);
+  if not AddDispOp(P, 8, L) then
+    Exit;
+  Result := True;
+end;
+
 { E is one load at an offset from a register that holds an object
   (P397): a word field of an object a variable in a register holds, of
   a record in such an object too, or
@@ -16601,7 +16732,6 @@ var
   r: string;
   asz: LongInt;
   off: Int64;
-  b: PExpr;
 begin
   Result := False;
   Op := '';
@@ -16617,20 +16747,7 @@ begin
   end
   else if not WordScalar(E) then
     Exit;
-  { a field of a record the object holds, at any depth: the offsets add
-    up (FOut.S of a writer) }
-  off := E^.Off;
-  b := E^.L;
-  while (b^.Kind = ekField) and (TKind(b^.Typ) = tykRecord) and (b^.L <> nil) and
-    not PtrAccess(b) do
-  begin
-    off := off + b^.Off;
-    b := b^.L;
-  end;
-  if TKind(b^.Typ) <> tykClass then
-    Exit;
-  r := WordReg(b);
-  if r = '' then
+  if not RegPlace(E, r, off) then
     Exit;
   asz := TSize(Ty);
   if FArm then
@@ -35997,6 +36114,8 @@ var
   ib: PExpr;
   ixvar: Boolean;
   ad: string;
+  rpb: string;
+  rpo: Int64;
 begin
   r := OrdPool(D);
   Result := '';
@@ -36242,6 +36361,22 @@ begin
               lenop := IntToStr(lenoff) + '(%rbp)';
             end;
           end
+          else if RegPlace(E^.L, rpb, rpo) and (rpo >= 0) and
+            ((not FArm) or ((rpo mod 8 = 0) and (rpo div 8 + 1 <= 4095))) and Fits32(rpo + 8) then
+          begin
+            { a field of an object a register holds: its pointer at its
+              offset from that register, its length beside it, read where
+              it lies; an object's field has an address, no descriptor
+              that may be nil (P398) }
+            if FArm then
+              Line('  ldr ' + r + ', [' + rpb + ', #' + IntToStr(rpo) + ']')
+            else
+              Line('  movq ' + IntToStr(rpo) + '(%' + rpb + '), %' + r);
+            lk := 5;
+            lenoff := rpo + 8;
+            lenlab := rpb;
+            lenop := IntToStr(rpo + 8) + '(%' + rpb + ')';
+          end
           else
           begin
             EmitWordBase(E^.L, D);
@@ -36358,6 +36493,8 @@ begin
             end
             else if lk = 4 then
               lenR := lreg
+            else if lk = 5 then
+              Line('  ldr x0, [' + lenlab + ', #' + IntToStr(lenoff) + ']')
             else
               LdFP('x0', lenoff);
             lenkey := lenR;
@@ -36403,7 +36540,7 @@ begin
                 BoundsFailArm(idx, 0, -disp, lenR, 0, -1 - disp);
               ColdEnd;
               ChkKeep(idx, lenkey, 'f' + IntToStr(ixk + disp),
-                ixvar and ((lk <> 2) or MemLenOK(E^.L^.Name)));
+                ixvar and ((lk <> 2) or MemLenOK(E^.L^.Name)) and (lk <> 5));
             end;
             { no label after the check: nothing jumps to it since the
               failure went out of line (P299), and a label would end the
@@ -36454,7 +36591,7 @@ begin
                 BoundsFailX86('%' + idx, -disp, lenop, 0, -1 - disp);
               ColdEnd;
               ChkKeep(idx, lenop, 'f' + IntToStr(ixk + disp),
-                ixvar and ((lk <> 2) or MemLenOK(E^.L^.Name)));
+                ixvar and ((lk <> 2) or MemLenOK(E^.L^.Name)) and (lk <> 5));
             end;
           end;
         end
