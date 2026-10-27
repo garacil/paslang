@@ -1,0 +1,351 @@
+{ P430: pasx509 against Go's crypto/x509 (testdata/x509, written by
+  scripts/x509_gen with Go as the oracle): certificates parsed and
+  chains verified, each verdict and Go's error text compared. The
+  files: PKIs made by CreateCertificate (P-256, P-384 and RSA keys,
+  wildcards, IP names, name constraints, path lengths, key usages, EKUs,
+  expired and future certificates, unknown critical extensions, missing
+  intermediates, cross-signed loops, policies, odd times); the tables of
+  Go's verify_test.go and name_constraints_test.go; NIST's PKITS as Go
+  runs it; the chains of correo.7kas.com and api.deepseek.com at fixed
+  times against their roots. A line for each case that differs, then
+  each file's counts. }
+program x509verify;
+
+uses
+  paslib, sysutils, pasurl, pasx509;
+
+function HexVal(C: Char): Integer;
+begin
+  if (C >= '0') and (C <= '9') then
+    Result := Ord(C) - 48
+  else if (C >= 'a') and (C <= 'f') then
+    Result := Ord(C) - 87
+  else
+    Result := Ord(C) - 55;
+end;
+
+function UnHex(const H: string): string;
+var
+  i: Integer;
+begin
+  SetLength(Result, Length(H) div 2);
+  for i := 1 to Length(H) div 2 do
+    Result[i] := Chr(HexVal(H[2 * i - 1]) * 16 + HexVal(H[2 * i]));
+end;
+
+function B2S(B: Boolean): string;
+begin
+  if B then
+    Result := '1'
+  else
+    Result := '0';
+end;
+
+{ the summary line gen prints for a parsed certificate }
+function Summary(C: TX509Cert): string;
+var
+  i: Integer;
+  u: TUrl;
+  e: string;
+begin
+  Result := 'v' + IntToStr(C.Version) + ' sig' + IntToStr(C.SignatureAlgorithm) + ' pk' + IntToStr(C.PublicKeyAlgorithm) +
+    ' ca' + B2S(C.IsCA) + ' bc' + B2S(C.BasicConstraintsValid) + ' mpl' + IntToStr(C.MaxPathLen) +
+    ' ku' + IntToStr(C.KeyUsage) + ' nb' + IntToStr(C.NotBefore) + ' na' + IntToStr(C.NotAfter) +
+    ' cn=' + C.SubjectCommonName + ' serial=' + X509SerialString(C) + ' dns=';
+  for i := 0 to High(C.DNSNames) do
+  begin
+    if i > 0 then
+      Result := Result + ',';
+    Result := Result + C.DNSNames[i];
+  end;
+  Result := Result + ' ip=';
+  for i := 0 to High(C.IPAddresses) do
+    Result := Result + X509IPString(C.IPAddresses[i]) + ',';
+  Result := Result + ' email=';
+  for i := 0 to High(C.EmailAddresses) do
+  begin
+    if i > 0 then
+      Result := Result + ',';
+    Result := Result + C.EmailAddresses[i];
+  end;
+  Result := Result + ' uri=';
+  for i := 0 to High(C.URIs) do
+  begin
+    if UrlParse(C.URIs[i], u, e) then
+      Result := Result + UrlString(u) + ','
+    else
+      Result := Result + C.URIs[i] + ',';
+  end;
+  Result := Result + ' eku=';
+  for i := 0 to High(C.ExtKeyUsage) do
+    Result := Result + IntToStr(C.ExtKeyUsage[i]) + ',';
+  Result := Result + ' crit=' + IntToStr(Length(C.UnhandledCriticalExtensions)) + ' pol=' + IntToStr(Length(C.Policies)) +
+    ' rep=' + IntToStr(C.RequireExplicitPolicy) + ' iap=' + IntToStr(C.InhibitAnyPolicy) + ' pdns=';
+  for i := 0 to High(C.PermittedDNSDomains) do
+  begin
+    if i > 0 then
+      Result := Result + ',';
+    Result := Result + C.PermittedDNSDomains[i];
+  end;
+  Result := Result + ' xdns=';
+  for i := 0 to High(C.ExcludedDNSDomains) do
+  begin
+    if i > 0 then
+      Result := Result + ',';
+    Result := Result + C.ExcludedDNSDomains[i];
+  end;
+  Result := Result + ' ski=' + Hex(C.SubjectKeyId) + ' aki=' + Hex(C.AuthorityKeyId);
+end;
+
+{ the class of an error: its text up to the first detail }
+function ErrClass(const S: string): string;
+var
+  i: Integer;
+begin
+  Result := S;
+  for i := 7 to Length(S) - 1 do
+    if ((S[i] = ':') and (S[i + 1] = ' ')) or ((S[i] = ' ') and (S[i + 1] = '(')) then
+    begin
+      Result := Copy(S, 1, i - 1);
+      Exit;
+    end;
+end;
+
+function SplitLines(const S: string): array of string;
+var
+  i, st: Integer;
+begin
+  Result := nil;
+  st := 1;
+  for i := 1 to Length(S) do
+    if S[i] = #10 then
+    begin
+      Result := Append(Result, Copy(S, st, i - st));
+      st := i + 1;
+    end;
+  if st <= Length(S) then
+    Result := Append(Result, Copy(S, st, Length(S) - st + 1));
+end;
+
+procedure RunFile(const FileName: string);
+var
+  data, line, kind, id, name, host, want, got, err, ekus, w: string;
+  lines: array of string;
+  li, i, tm, total, verdictBad, textBad, classBad, nok: Integer;
+  leafHex: string;
+  inters, roots: array of string;
+  pool, ipool: TX509Pool;
+  c, ic: TX509Cert;
+  chain: array of string;
+  opts: TX509VerifyOptions;
+  chains: TX509Chains;
+  ok, parsedAll: Boolean;
+  parts: TStringArray;
+  leafs: array of string;
+  pols, flags: string;
+  useSys: Boolean;
+  pchain: TX509Certs;
+begin
+  if not ReadFile('testdata/x509/' + FileName, data) then
+  begin
+    WriteLn('cannot read ', FileName);
+    Halt(2);
+  end;
+  lines := SplitLines(data);
+  total := 0;
+  verdictBad := 0;
+  textBad := 0;
+  classBad := 0;
+  nok := 0;
+  li := 0;
+  while li <= High(lines) do
+  begin
+    line := lines[li];
+    Inc(li);
+    if line = '' then
+      Continue;
+    i := Pos(' ', line);
+    kind := Copy(line, 1, i - 1);
+    line := Copy(line, i + 1, Length(line) - i);
+    i := Pos(' ', line);
+    id := Copy(line, 1, i - 1);
+    name := Copy(line, i + 1, Length(line) - i);
+    tm := 0;
+    host := '';
+    ekus := '-';
+    leafHex := '';
+    leafs := nil;
+    useSys := False;
+    pols := '';
+    flags := '';
+    inters := nil;
+    roots := nil;
+    want := '';
+    while li <= High(lines) do
+    begin
+      line := lines[li];
+      Inc(li);
+      if line = 'end' then
+        Break;
+      i := Pos(' ', line);
+      if i = 0 then
+      begin
+        w := line;
+        line := '';
+      end
+      else
+      begin
+        w := Copy(line, 1, i - 1);
+        line := Copy(line, i + 1, Length(line) - i);
+      end;
+      if w = 'time' then
+        tm := StrToIntDef(line, 0)
+      else if w = 'host' then
+      begin
+        if line = '-' then
+          host := ''
+        else
+          host := line;
+      end
+      else if w = 'eku' then
+        ekus := line
+      else if w = 'leaf' then
+      begin
+        if leafHex = '' then
+          leafHex := line;
+        leafs := Append(leafs, line);
+      end
+      else if w = 'sysroots' then
+        useSys := True
+      else if w = 'policies' then
+        pols := line
+      else if w = 'flags' then
+        flags := line
+      else if w = 'inter' then
+        inters := Append(inters, line)
+      else if w = 'root' then
+        roots := Append(roots, line)
+      else if w = 'want' then
+        want := line;
+    end;
+    Inc(total);
+    got := '';
+    if kind = 'case' then
+    begin
+      pool := nil;
+      if not useSys then
+        pool := TX509Pool.Create;
+      for i := 0 to High(roots) do
+        if X509Parse(UnHex(roots[i]), c, err) then
+          pool.AddCert(c);
+      if ekus = '-' then
+      begin
+        chain := nil;
+        chain := Append(chain, UnHex(leafHex));
+        for i := 0 to High(inters) do
+          chain := Append(chain, UnHex(inters[i]));
+        ok := X509VerifyServer(chain, host, tm, pool, err);
+      end
+      else
+      begin
+        ok := False;
+        parsedAll := X509Parse(UnHex(leafHex), c, err);
+        ipool := TX509Pool.Create;
+        if parsedAll then
+          for i := 0 to High(inters) do
+            if X509Parse(UnHex(inters[i]), ic, err) then
+              ipool.AddCert(ic)
+            else
+            begin
+              parsedAll := False;
+              Break;
+            end;
+        if parsedAll then
+        begin
+          opts := Default(TX509VerifyOptions);
+          opts.DNSName := host;
+          opts.Roots := pool;
+          opts.Intermediates := ipool;
+          opts.CurrentTime := tm;
+          parts := ekus.SplitText(',');
+          for i := 0 to High(parts) do
+            opts.KeyUsages := Append(opts.KeyUsages, StrToIntDef(parts[i], -1));
+          ok := X509Verify(c, opts, chains, err);
+        end;
+      end;
+      if ok then
+        got := 'ok'
+      else
+        got := 'err ' + err;
+    end
+    else if kind = 'vh' then
+    begin
+      if X509Parse(UnHex(leafHex), c, err) then
+      begin
+        err := X509VerifyHostname(c, host);
+        if err = '' then
+          got := 'ok'
+        else
+          got := 'err ' + err;
+      end
+      else
+        got := 'err parse ' + err;
+    end
+    else if kind = 'pol' then
+    begin
+      pchain := nil;
+      for i := 0 to High(leafs) do
+        if X509Parse(UnHex(leafs[i]), c, err) then
+          pchain := Append(pchain, c);
+      opts := Default(TX509VerifyOptions);
+      if pols <> '' then
+      begin
+        parts := pols.SplitText(',');
+        for i := 0 to High(parts) do
+          opts.CertificatePolicies := Append(opts.CertificatePolicies, UnHex(parts[i]));
+      end;
+      parts := flags.SplitText(' ');
+      opts.InhibitPolicyMapping := parts[0] = 'true';
+      opts.RequireExplicitPolicy := parts[1] = 'true';
+      opts.InhibitAnyPolicy := parts[2] = 'true';
+      if X509PoliciesValid(pchain, opts) then
+        got := 'ok'
+      else
+        got := 'err invalid policies';
+    end
+    else if kind = 'parse' then
+    begin
+      if X509Parse(UnHex(leafHex), c, err) then
+        got := 'ok ' + Summary(c)
+      else
+        got := 'err ' + err;
+    end;
+    if Copy(got, 1, 2) = 'ok' then
+      Inc(nok);
+    if got = want then
+    else if (Copy(got, 1, 3) <> Copy(want, 1, 3)) then
+    begin
+      Inc(verdictBad);
+      WriteLn(id, ' ', kind, ' ', name, ' VERDICT got ', got, ' | want ', want);
+    end
+    else if ErrClass(got) = ErrClass(want) then
+    begin
+      Inc(textBad);
+      WriteLn(id, ' ', kind, ' ', name, ' TEXT got ', got, ' | want ', want);
+    end
+    else
+    begin
+      Inc(classBad);
+      WriteLn(id, ' ', kind, ' ', name, ' CLASS got ', got, ' | want ', want);
+    end;
+  end;
+  WriteLn(FileName, ': cases ', total, ' ok-verdicts ', nok, ' verdict-mismatch ', verdictBad, ' class-mismatch ', classBad, ' text-mismatch ', textBad);
+end;
+
+begin
+  RunFile('cases.txt');
+  RunFile('go-verify-tests.txt');
+  RunFile('go-constraint-tests.txt');
+  RunFile('go-pkits.txt');
+  RunFile('real.txt');
+end.

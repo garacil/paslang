@@ -11855,6 +11855,35 @@ values and may not be, as Go's. `testdata/x25519kat` checks RFC 7748's
 vectors, and `x25519wyche`, `nistwyche` and `rsawyche` Wycheproof's
 (518 X25519, 1,530 ECDSA, 1,145 ECDH, 1,394 RSA), on both machines.
 
+`uses pasx509` reads and checks certificates as Go's `crypto/x509` does
+(1.1.293, P430), routine by routine:
+- `X509Parse(der, out cert, out err)` is Go's `ParseCertificate`: a
+  `TX509Cert` with its raw parts, validity, public key (`RsaN`, `RsaE`,
+  `EcCurve`, `EcPoint`), names, constraints, key usages, extensions and
+  `UnhandledCriticalExtensions`; `err` in Go's words.
+- `X509VerifyServer(chain, host, now, roots, out err)` checks a chain as
+  TLS gets it (DER, the leaf first, the rest intermediates) for a server
+  name at a Unix time against `roots` (`nil`: the system's): Go's
+  `Verify` with its chain building and limits, validity, name
+  constraints, path lengths, key usages, the server-auth EKU and
+  `VerifyHostname`, and `err` as Go writes it (`x509: certificate signed
+  by unknown authority`, `x509: certificate is valid for a, b, not c`).
+  `X509Verify(cert, opts, ...)` takes Go's options in full.
+- `TX509Pool` (`AppendCertsFromPEM`, `AddCert`) is a pool of roots;
+  `X509SystemRoots(err)` loads the system's once, as Go's
+  `SystemCertPool` (`SSL_CERT_FILE`, `SSL_CERT_DIR`, the first of Go's
+  files for Linux, then its directories), and routines may share a pool
+  they only read. `PemDecode` and `PemDecodeAll` are `encoding/pem`'s.
+
+Signatures are checked by `pasnist` (ECDSA on P-256 and P-384) and
+`pasrsa` (PKCS #1 v1.5 and PSS on SHA-256, SHA-384, SHA-512); SHA-1 and
+MD5 are refused as Go refuses them, and Ed25519, ML-DSA and DSA keys are
+read but their signatures give Go's `algorithm unimplemented`.
+`testdata/x509verify` gives Go's verdict and text on 1,237 cases (PKIs
+made by `CreateCertificate`, Go's own tables, NIST's PKITS, the chains of
+two real servers at fixed times), `x509pem` on 522 PEM texts, and
+`x509conc` has eight routines share one pool.
+
 `uses pascodec` has the text codecs a service needs (1.1.260, P435), as
 Go's packages give them, checked against Go's own output
 (`testdata/codec`, with `scripts/codec_oracle.go`):

@@ -1,0 +1,6012 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+
+  paslang is free software: you can redistribute it and/or modify it
+  under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+
+  paslang is distributed in the hope that it will be useful, but
+  WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+  General Public License for more details.
+
+  Under Section 7 of GPL version 3, you are granted additional
+  permissions described in the paslang Runtime Library Exception,
+  version 1.0, in the file COPYING.RUNTIME.
+
+  You should have received a copy of the GNU General Public License
+  along with paslang.  If not, see <https://www.gnu.org/licenses/>. }
+
+{ X.509 certificates for a TLS client, in pure paslang, as Go 1.27.3
+  reads and verifies them: PEM (encoding/pem Decode), the strict DER
+  reader of cryptobyte (asn1.go, string.go), the certificate parser of
+  crypto/x509 (parser.go parseCertificate and everything it calls), the
+  signature algorithms and checkSignature of x509.go, the pool of
+  cert_pool.go, the system roots of root.go and root_linux.go, and the
+  chain building and verification of verify.go and constraints.go
+  (buildChains with Go's limits, isValid, the name constraints, the
+  policy graph of RFC 5280 6.1 as updated by RFC 9618, the key usages,
+  VerifyHostname with RFC 6125 matching). Error texts are Go's.
+  Signatures are checked by the units pasnist (ECDSA on P-256 and P-384)
+  and pasrsa (RSA PKCS #1 v1.5 and PSS); Ed25519, ML-DSA, DSA and the
+  curves P-224 and P-521 are parsed but their signatures are not
+  checked here (Go's ErrUnsupportedAlgorithm text). Standards: RFC 5280,
+  RFC 6125, RFC 9525, RFC 5480, RFC 8017. A pool that is only read may
+  be shared by any number of routines; the system roots are loaded once
+  (Go's sync.Once in root.go) and kept. P430. }
+unit pasx509;
+
+interface
+
+uses
+  paslib, pascodec, pasurl, pastime, pasnist, pasrsa;
+
+const
+  { Go's PublicKeyAlgorithm }
+  X509PkUnknown = 0;
+  X509PkRSA = 1;
+  X509PkDSA = 2;
+  X509PkECDSA = 3;
+  X509PkEd25519 = 4;
+  X509PkMLDSA = 5;
+
+  { Go's SignatureAlgorithm }
+  X509SigUnknown = 0;
+  X509SigMD2WithRSA = 1;
+  X509SigMD5WithRSA = 2;
+  X509SigSHA1WithRSA = 3;
+  X509SigSHA256WithRSA = 4;
+  X509SigSHA384WithRSA = 5;
+  X509SigSHA512WithRSA = 6;
+  X509SigDSAWithSHA1 = 7;
+  X509SigDSAWithSHA256 = 8;
+  X509SigECDSAWithSHA1 = 9;
+  X509SigECDSAWithSHA256 = 10;
+  X509SigECDSAWithSHA384 = 11;
+  X509SigECDSAWithSHA512 = 12;
+  X509SigSHA256WithRSAPSS = 13;
+  X509SigSHA384WithRSAPSS = 14;
+  X509SigSHA512WithRSAPSS = 15;
+  X509SigPureEd25519 = 16;
+  X509SigMLDSA44 = 17;
+  X509SigMLDSA65 = 18;
+  X509SigMLDSA87 = 19;
+
+  { the named curves of an ECDSA key (RFC 5480 2.1.1.1) }
+  X509CurveNone = 0;
+  X509CurveP224 = 1;
+  X509CurveP256 = 2;
+  X509CurveP384 = 3;
+  X509CurveP521 = 4;
+
+  { Go's KeyUsage bits (RFC 5280 4.2.1.3) }
+  X509KuDigitalSignature = 1;
+  X509KuContentCommitment = 2;
+  X509KuKeyEncipherment = 4;
+  X509KuDataEncipherment = 8;
+  X509KuKeyAgreement = 16;
+  X509KuCertSign = 32;
+  X509KuCRLSign = 64;
+  X509KuEncipherOnly = 128;
+  X509KuDecipherOnly = 256;
+
+  { Go's ExtKeyUsage (RFC 5280 4.2.1.12) }
+  X509EkuAny = 0;
+  X509EkuServerAuth = 1;
+  X509EkuClientAuth = 2;
+  X509EkuCodeSigning = 3;
+  X509EkuEmailProtection = 4;
+  X509EkuIPSECEndSystem = 5;
+  X509EkuIPSECTunnel = 6;
+  X509EkuIPSECUser = 7;
+  X509EkuTimeStamping = 8;
+  X509EkuOCSPSigning = 9;
+  X509EkuMicrosoftServerGatedCrypto = 10;
+  X509EkuNetscapeServerGatedCrypto = 11;
+  X509EkuMicrosoftCommercialCodeSigning = 12;
+  X509EkuMicrosoftKernelCodeSigning = 13;
+
+type
+  TX509Strings = array of string;
+  TX509Ints = array of Integer;
+
+  { one PEM block: Go's pem.Block; Headers keep the order first seen,
+    a key seen again replaces its value as Go's map does }
+  TPemHeader = record
+    Key, Value: string;
+  end;
+  TPemBlock = record
+    BlockType: string;
+    Headers: array of TPemHeader;
+    Bytes: string;
+  end;
+  TPemBlocks = array of TPemBlock;
+
+  { an extension as it is in the certificate: Id is the OID's DER
+    content (Go's OID compares by it), Value the OCTET STRING's bytes }
+  TX509Extension = record
+    Id: string;
+    Critical: Boolean;
+    Value: string;
+  end;
+
+  { an IP range of a name constraint: IP and Mask of 4 or 16 bytes }
+  TX509IPNet = record
+    IP, Mask: string;
+  end;
+  TX509IPNets = array of TX509IPNet;
+
+  { RFC 5280 4.2.1.5, OIDs as DER content }
+  TX509PolicyMapping = record
+    IssuerDomainPolicy, SubjectDomainPolicy: string;
+  end;
+
+  { A parsed certificate: Go's x509.Certificate, field by field. Byte
+    strings are raw; times are Unix seconds, with the zone offset the
+    certificate wrote kept for Go's messages. }
+  TX509Cert = class
+    Raw, RawTBSCertificate, RawSubjectPublicKeyInfo: string;
+    RawSubject, RawIssuer: string;
+    Version: Integer;
+    { the INTEGER's content octets, two's complement, as DER has them }
+    SerialNumber: string;
+    SignatureAlgorithm: Integer;
+    Signature: string;
+    PublicKeyAlgorithm: Integer;
+    { Go's PublicKey <> nil }
+    HasPublicKey: Boolean;
+    { RSA: N big-endian without leading zeros, E }
+    RsaN: string;
+    RsaE: Integer;
+    { ECDSA: the curve and the uncompressed point }
+    EcCurve: Integer;
+    EcPoint: string;
+    { Ed25519 and ML-DSA: the key's bytes; DSA: Y's content octets }
+    KeyBytes: string;
+    { Subject and Issuer, as pkix.Name's CommonName and Organization }
+    SubjectCommonName: string;
+    SubjectOrganization: TX509Strings;
+    IssuerCommonName: string;
+    IssuerOrganization: TX509Strings;
+    NotBefore, NotAfter: Integer;
+    NotBeforeOffset, NotAfterOffset: Integer;
+    Extensions: array of TX509Extension;
+    KeyUsage: Integer;
+    ExtKeyUsage: TX509Ints;
+    UnknownExtKeyUsage: TX509Strings;
+    BasicConstraintsValid, IsCA: Boolean;
+    MaxPathLen: Integer;
+    MaxPathLenZero: Boolean;
+    SubjectKeyId, AuthorityKeyId: string;
+    OCSPServer, IssuingCertificateURL, CRLDistributionPoints: TX509Strings;
+    DNSNames, EmailAddresses: TX509Strings;
+    { 4 or 16 bytes each }
+    IPAddresses: TX509Strings;
+    URIs: TX509Strings;
+    { each URI's host as Go's url.Parse gives it }
+    URIHosts: TX509Strings;
+    PermittedDNSDomainsCritical: Boolean;
+    PermittedDNSDomains, ExcludedDNSDomains: TX509Strings;
+    PermittedIPRanges, ExcludedIPRanges: TX509IPNets;
+    PermittedEmailAddresses, ExcludedEmailAddresses: TX509Strings;
+    PermittedURIDomains, ExcludedURIDomains: TX509Strings;
+    Policies: TX509Strings;
+    PolicyMappings: array of TX509PolicyMapping;
+    InhibitAnyPolicy: Integer;
+    InhibitAnyPolicyZero: Boolean;
+    InhibitPolicyMapping: Integer;
+    InhibitPolicyMappingZero: Boolean;
+    RequireExplicitPolicy: Integer;
+    RequireExplicitPolicyZero: Boolean;
+    { OIDs (DER content) of critical extensions Go does not handle }
+    UnhandledCriticalExtensions: TX509Strings;
+  end;
+  TX509Certs = array of TX509Cert;
+  TX509Chains = array of TX509Certs;
+
+  { Go's CertPool: certificates by subject, each once (by SHA-224 of
+    its DER, as Go). Read-only use from many routines is safe. }
+  TX509Pool = class
+    Certs: TX509Certs;
+    ByName: map[string] of TX509Ints;
+    HaveSum: map[string] of Boolean;
+    constructor Create;
+    procedure AddCert(C: TX509Cert);
+    { every CERTIFICATE block without headers that parses; True when
+      one was added, as Go's AppendCertsFromPEM }
+    function AppendCertsFromPEM(const Pem: string): Boolean;
+    function HasCert(C: TX509Cert): Boolean;
+    function Count: Integer;
+    { Go's findPotentialParents: same subject as C's issuer, matching
+      key id first, then one key id missing, then the rest }
+    function FindPotentialParents(C: TX509Cert): TX509Certs;
+  end;
+
+  { Go's VerifyOptions }
+  TX509VerifyOptions = record
+    DNSName: string;
+    { nil: none }
+    Intermediates: TX509Pool;
+    { nil: the system roots }
+    Roots: TX509Pool;
+    { Unix seconds; 0 is the wall clock now, as Go's zero time }
+    CurrentTime: Integer;
+    { empty: ServerAuth }
+    KeyUsages: TX509Ints;
+    { OIDs as DER content; empty: anyPolicy }
+    CertificatePolicies: TX509Strings;
+    InhibitPolicyMapping, RequireExplicitPolicy, InhibitAnyPolicy: Boolean;
+  end;
+
+{ PEM, as Go's encoding/pem Decode: the first block of Data and the text
+  after it; False when there is none (Rest is then Data) }
+function PemDecode(const Data: string; out Block: TPemBlock; out Rest: string): Boolean;
+{ every block of Data, in order }
+function PemDecodeAll(const Data: string): TPemBlocks;
+
+{ Go's ParseCertificate: one DER certificate and nothing after it.
+  False with Go's error text. }
+function X509Parse(const Der: string; out Cert: TX509Cert; out Err: string): Boolean;
+
+{ Go's Certificate.CheckSignatureFrom: '' when Parent signed Cert, else
+  Go's error text }
+function X509CheckSignatureFrom(Cert, Parent: TX509Cert): string;
+
+{ Go's Certificate.VerifyHostname: '' or Go's error text }
+function X509VerifyHostname(Cert: TX509Cert; const Host: string): string;
+
+{ Go's Certificate.Verify: True with the chains, leaf first, each
+  ending in a root; else False and Go's error text }
+function X509Verify(Cert: TX509Cert; const Opts: TX509VerifyOptions; out Chains: TX509Chains; out Err: string): Boolean;
+
+{ What a TLS client asks (Go's crypto/tls verifyServerCertificate):
+  Chain is the server's DER certificates, leaf first, the rest the
+  intermediates in the order sent; Host the server name ('' skips the
+  name check), NowUnix the time (0: now), Roots the trust anchors (nil:
+  the system roots). True when Go's Verify accepts; else Err is Go's
+  text: a parse error as ParseCertificate gives it, or Verify's. }
+function X509VerifyServer(const Chain: array of string; const Host: string; NowUnix: Integer; Roots: TX509Pool; out Err: string): Boolean;
+
+{ The system roots, loaded once on first use as Go's root.go and
+  root_linux.go load them (SSL_CERT_FILE, SSL_CERT_DIR, the first of
+  Go's certFiles that reads, then every file of certDirectories but
+  same-directory symlinks). Never nil once loaded without error; Err
+  is Go's text when nothing could be read. }
+function X509SystemRoots(out Err: string): TX509Pool;
+{ the same reading, uncached, into a new pool }
+function X509LoadRoots(const CertFile, CertDir: string; out Err: string): TX509Pool;
+
+{ Go's policiesValid on a chain (leaf first, root last) }
+function X509PoliciesValid(const Chain: TX509Certs; const Opts: TX509VerifyOptions): Boolean;
+
+{ helpers that tests and callers use: an OID in dotted form from its
+  DER content, a time as Go's RFC 3339 (offset in seconds east), an IP
+  of 4 or 16 bytes as Go's net.IP String, a string as Go's %q }
+function X509OidString(const Der: string): string;
+function X509TimeRFC3339(Unix, Offset: Integer): string;
+function X509IPString(const IP: string): string;
+function X509Quote(const S: string): string;
+{ Go's netip.ParseAddr: 4 or 16 bytes and the zone; Err as Go's }
+function X509ParseAddr(const S: string; out IP, Zone, Err: string): Boolean;
+{ the serial number in decimal, as big.Int String }
+function X509SerialString(C: TX509Cert): string;
+
+implementation
+
+const
+  { the tags of cryptobyte/asn1 }
+  TagBoolean = 1;
+  TagInteger = 2;
+  TagBitString = 3;
+  TagOctetString = 4;
+  TagNull = 5;
+  TagOid = 6;
+  TagEnum = 10;
+  TagUTF8String = 12;
+  TagSequence = $30;
+  TagSet = $31;
+  TagNumericString = 18;
+  TagPrintableString = 19;
+  TagT61String = 20;
+  TagIA5String = 22;
+  TagUTCTime = 23;
+  TagGeneralizedTime = 24;
+  TagBMPString = 30;
+
+  ErrSigLimit = 'x509: signature check attempts limit reached while verifying certificate chain';
+  ErrUnsupportedAlgorithm = 'x509: cannot verify signature: algorithm unimplemented';
+  ErrConstraintViolation = 'x509: invalid signature: parent certificate cannot sign this kind of certificate';
+  ErrUnhandledCritical = 'x509: unhandled critical extension';
+
+  { OIDs as DER content, the bytes Go's OID keeps }
+  OidSigMD5WithRSA = #42#134#72#134#247#13#1#1#4;
+  OidSigSHA1WithRSA = #42#134#72#134#247#13#1#1#5;
+  OidSigSHA256WithRSA = #42#134#72#134#247#13#1#1#11;
+  OidSigSHA384WithRSA = #42#134#72#134#247#13#1#1#12;
+  OidSigSHA512WithRSA = #42#134#72#134#247#13#1#1#13;
+  OidSigRSAPSS = #42#134#72#134#247#13#1#1#10;
+  OidSigDSAWithSHA1 = #42#134#72#206#56#4#3;
+  OidSigDSAWithSHA256 = #96#134#72#1#101#3#4#3#2;
+  OidSigECDSAWithSHA1 = #42#134#72#206#61#4#1;
+  OidSigECDSAWithSHA256 = #42#134#72#206#61#4#3#2;
+  OidSigECDSAWithSHA384 = #42#134#72#206#61#4#3#3;
+  OidSigECDSAWithSHA512 = #42#134#72#206#61#4#3#4;
+  OidSigEd25519 = #43#101#112;
+  OidISOSigSHA1WithRSA = #43#14#3#2#29;
+  OidSHA256 = #96#134#72#1#101#3#4#2#1;
+  OidSHA384 = #96#134#72#1#101#3#4#2#2;
+  OidSHA512 = #96#134#72#1#101#3#4#2#3;
+  OidMGF1 = #42#134#72#134#247#13#1#1#8;
+  OidPkRSA = #42#134#72#134#247#13#1#1#1;
+  OidPkDSA = #42#134#72#206#56#4#1;
+  OidPkECDSA = #42#134#72#206#61#2#1;
+  OidPkEd25519 = #43#101#112;
+  OidPkMLDSA44 = #96#134#72#1#101#3#4#3#17;
+  OidPkMLDSA65 = #96#134#72#1#101#3#4#3#18;
+  OidPkMLDSA87 = #96#134#72#1#101#3#4#3#19;
+  OidCurveP224 = #43#129#4#0#33;
+  OidCurveP256 = #42#134#72#206#61#3#1#7;
+  OidCurveP384 = #43#129#4#0#34;
+  OidCurveP521 = #43#129#4#0#35;
+  OidExtSAN = #85#29#17;
+  OidExtNameConstraints = #85#29#30;
+  OidAIA = #43#6#1#5#5#7#1#1;
+  OidAIAOcsp = #43#6#1#5#5#7#48#1;
+  OidAIAIssuers = #43#6#1#5#5#7#48#2;
+  OidAnyPolicy = #85#29#32#0;
+  NullBytes = #5#0;
+
+  { the DER of RSA-PSS parameters is checked field by field below }
+  HexDigits: string = '0123456789abcdef';
+
+  { distrustedSPKIHashes of verify.go }
+  DistrustedSpki: array[0..7] of string = (
+    'ebed6475c2c2d80fcb199f3fe8dd6e6b3ce60b77eb15d4e42c3dec0c6f5b5105',
+    '49dd353dc2b919a3770645117d0e60c16115e7d1bc259eefe734b00ea434fe5f',
+    'e0254c7fcdc265e2f0f8a428dabb75ab4ae039b4872d62f5ee57f0877d5a8a41',
+    '5c0660a2b164910d8ff589c18e14552e9e0ec237dcefe2cb736d41a4811f81a0',
+    '43bffa19d6ef651451f6841e019931e96f6f2eaeff28ab4b6f1ce4576de2717b',
+    '63ecefee431d49523bc1136c4e72d0206a477086caf606cd5cf025686c109cf8',
+    'ec4ffa1ad0ac88081314b7aaffef6a91f97cd57291bb5ba686c5415f5eb4f6b6',
+    '92c063d67e8f14db71d288e11266ffdaf69cbf115f7bab14f3bc2f68d25e0e30');
+
+  { the field primes, to tell an unreduced coordinate (nistec SetBytes) }
+  PrimeP256Hex = 'ffffffff00000001000000000000000000000000ffffffffffffffffffffffff';
+  PrimeP384Hex = 'fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffeffffffff0000000000000000ffffffff';
+
+type
+  { a cryptobyte.String: the bytes S[P] .. S[E - 1] of a shared buffer }
+  TDer = record
+    S: string;
+    P, E: Integer;
+  end;
+
+{ ---- small string words ---- }
+
+function DerOf(const S: string): TDer;
+begin
+  Result.S := S;
+  Result.P := 1;
+  Result.E := Length(S) + 1;
+end;
+
+function DerLen(const D: TDer): Integer;
+begin
+  Result := D.E - D.P;
+end;
+
+function DerEmpty(const D: TDer): Boolean;
+begin
+  Result := D.E <= D.P;
+end;
+
+function DerAt(const D: TDer; I: Integer): Integer;
+begin
+  Result := Ord(D.S[D.P + I]);
+end;
+
+function DerStr(const D: TDer): string;
+begin
+  if D.E <= D.P then
+    Result := ''
+  else
+    Result := Copy(D.S, D.P, D.E - D.P);
+end;
+
+function HasPrefixAt(const S: string; P: Integer; const Pre: string): Boolean;
+var
+  i: Integer;
+begin
+  Result := False;
+  if (P < 1) or (P + Length(Pre) - 1 > Length(S)) then
+    Exit;
+  for i := 1 to Length(Pre) do
+    if S[P + i - 1] <> Pre[i] then
+      Exit;
+  Result := True;
+end;
+
+function HasPrefix(const S, Pre: string): Boolean;
+begin
+  Result := (Length(S) >= Length(Pre)) and (Copy(S, 1, Length(Pre)) = Pre);
+end;
+
+function HasSuffix(const S, Suf: string): Boolean;
+begin
+  Result := (Length(S) >= Length(Suf)) and (Copy(S, Length(S) - Length(Suf) + 1, Length(Suf)) = Suf);
+end;
+
+function ContainsByte(const S: string; C: Char): Boolean;
+var
+  i: Integer;
+begin
+  Result := True;
+  for i := 1 to Length(S) do
+    if S[i] = C then
+      Exit;
+  Result := False;
+end;
+
+{ strings.Index: the 0-based place of Sub in S[From..To-1] counted from From, or -1 }
+function IndexIn(const S: string; From, ToX: Integer; const Sub: string): Integer;
+var
+  i, j, n: Integer;
+  ok: Boolean;
+begin
+  Result := -1;
+  n := Length(Sub);
+  i := From;
+  while i + n <= ToX do
+  begin
+    ok := True;
+    for j := 1 to n do
+      if S[i + j - 1] <> Sub[j] then
+      begin
+        ok := False;
+        Break;
+      end;
+    if ok then
+    begin
+      Result := i - From;
+      Exit;
+    end;
+    Inc(i);
+  end;
+end;
+
+{ strings.LastIndex in S[From..To-1], relative to From }
+function LastIndexIn(const S: string; From, ToX: Integer; const Sub: string): Integer;
+var
+  i, j, n: Integer;
+  ok: Boolean;
+begin
+  Result := -1;
+  n := Length(Sub);
+  i := ToX - n;
+  while i >= From do
+  begin
+    ok := True;
+    for j := 1 to n do
+      if S[i + j - 1] <> Sub[j] then
+      begin
+        ok := False;
+        Break;
+      end;
+    if ok then
+    begin
+      Result := i - From;
+      Exit;
+    end;
+    Dec(i);
+  end;
+end;
+
+function IndexChar(const S: string; C: Char): Integer;
+var
+  i: Integer;
+begin
+  for i := 1 to Length(S) do
+    if S[i] = C then
+    begin
+      Result := i - 1;
+      Exit;
+    end;
+  Result := -1;
+end;
+
+function LastIndexChar(const S: string; C: Char): Integer;
+var
+  i: Integer;
+begin
+  for i := Length(S) downto 1 do
+    if S[i] = C then
+    begin
+      Result := i - 1;
+      Exit;
+    end;
+  Result := -1;
+end;
+
+function CountChar(const S: string; C: Char): Integer;
+var
+  i: Integer;
+begin
+  Result := 0;
+  for i := 1 to Length(S) do
+    if S[i] = C then
+      Inc(Result);
+end;
+
+{ strings.Split(S, Sep) for one separator byte; "" gives one empty part }
+function SplitChar(const S: string; C: Char): TX509Strings;
+var
+  i, st: Integer;
+begin
+  Result := nil;
+  st := 1;
+  for i := 1 to Length(S) do
+    if S[i] = C then
+    begin
+      Result := Append(Result, Copy(S, st, i - st));
+      st := i + 1;
+    end;
+  Result := Append(Result, Copy(S, st, Length(S) - st + 1));
+end;
+
+{ toLowerCaseASCII of verify.go: only A-Z change (RFC 6125 6.4.1) }
+function LowerASCII(const S: string): string;
+var
+  i: Integer;
+  c: Char;
+begin
+  Result := S;
+  for i := 1 to Length(S) do
+  begin
+    c := S[i];
+    if (c >= 'A') and (c <= 'Z') then
+    begin
+      if Result = S then
+        Result := Copy(S, 1, Length(S));
+      Result[i] := Chr(Ord(c) + 32);
+    end;
+  end;
+end;
+
+function TrimSuffixDot(const S: string): string;
+begin
+  if (Length(S) > 0) and (S[Length(S)] = '.') then
+    Result := Copy(S, 1, Length(S) - 1)
+  else
+    Result := S;
+end;
+
+function IntStr(N: Integer): string;
+var
+  neg: Boolean;
+  u: Integer;
+begin
+  if N = 0 then
+  begin
+    Result := '0';
+    Exit;
+  end;
+  neg := N < 0;
+  Result := '';
+  if neg then
+  begin
+    { the most negative word has no positive twin: one digit first }
+    if N = Low(Integer) then
+    begin
+      Result := '9223372036854775808';
+      Result := '-' + Result;
+      Exit;
+    end;
+    N := -N;
+  end;
+  while N > 0 do
+  begin
+    u := N mod 10;
+    Result := Chr(48 + u) + Result;
+    N := N div 10;
+  end;
+  if neg then
+    Result := '-' + Result;
+end;
+
+function Pad2(N: Integer): string;
+begin
+  Result := Chr(48 + (N div 10) mod 10) + Chr(48 + N mod 10);
+end;
+
+function Pad4(N: Integer): string;
+begin
+  Result := Chr(48 + (N div 1000) mod 10) + Chr(48 + (N div 100) mod 10) + Chr(48 + (N div 10) mod 10) + Chr(48 + N mod 10);
+end;
+
+function HexOf(const S: string): string;
+var
+  i: Integer;
+begin
+  SetLength(Result, 2 * Length(S));
+  for i := 1 to Length(S) do
+  begin
+    Result[2 * i - 1] := HexDigits[(Ord(S[i]) shr 4) + 1];
+    Result[2 * i] := HexDigits[(Ord(S[i]) and 15) + 1];
+  end;
+end;
+
+{ ---- UTF-8 (unicode/utf8) ---- }
+
+{ the rune at S[I] and its width; a bad sequence is U+FFFD of width 1,
+  as utf8.DecodeRuneInString }
+function DecodeRune(const S: string; I: Integer; out W: Integer): Integer;
+var
+  n, b0, b1, b2, b3: Integer;
+begin
+  n := Length(S) - I + 1;
+  b0 := Ord(S[I]);
+  W := 1;
+  Result := $FFFD;
+  if b0 < $80 then
+  begin
+    Result := b0;
+    Exit;
+  end;
+  if (b0 >= $C2) and (b0 <= $DF) then
+  begin
+    if n < 2 then Exit;
+    b1 := Ord(S[I + 1]);
+    if (b1 and $C0) <> $80 then Exit;
+    Result := ((b0 and $1F) shl 6) or (b1 and $3F);
+    W := 2;
+  end
+  else if (b0 >= $E0) and (b0 <= $EF) then
+  begin
+    if n < 3 then Exit;
+    b1 := Ord(S[I + 1]);
+    b2 := Ord(S[I + 2]);
+    if ((b1 and $C0) <> $80) or ((b2 and $C0) <> $80) then Exit;
+    if (b0 = $E0) and (b1 < $A0) then Exit;
+    if (b0 = $ED) and (b1 > $9F) then Exit;
+    Result := ((b0 and $0F) shl 12) or ((b1 and $3F) shl 6) or (b2 and $3F);
+    W := 3;
+  end
+  else if (b0 >= $F0) and (b0 <= $F4) then
+  begin
+    if n < 4 then Exit;
+    b1 := Ord(S[I + 1]);
+    b2 := Ord(S[I + 2]);
+    b3 := Ord(S[I + 3]);
+    if ((b1 and $C0) <> $80) or ((b2 and $C0) <> $80) or ((b3 and $C0) <> $80) then Exit;
+    if (b0 = $F0) and (b1 < $90) then Exit;
+    if (b0 = $F4) and (b1 > $8F) then Exit;
+    Result := ((b0 and $07) shl 18) or ((b1 and $3F) shl 12) or ((b2 and $3F) shl 6) or (b3 and $3F);
+    W := 4;
+  end;
+end;
+
+function Utf8Valid(const S: string): Boolean;
+var
+  i, w, r: Integer;
+begin
+  Result := False;
+  i := 1;
+  while i <= Length(S) do
+  begin
+    r := DecodeRune(S, i, w);
+    if (r = $FFFD) and (w = 1) then
+      Exit;
+    i := i + w;
+  end;
+  Result := True;
+end;
+
+function EncodeRune(R: Integer): string;
+begin
+  if R < $80 then
+    Result := Chr(R)
+  else if R < $800 then
+    Result := Chr($C0 or (R shr 6)) + Chr($80 or (R and $3F))
+  else if R < $10000 then
+    Result := Chr($E0 or (R shr 12)) + Chr($80 or ((R shr 6) and $3F)) + Chr($80 or (R and $3F))
+  else
+    Result := Chr($F0 or (R shr 18)) + Chr($80 or ((R shr 12) and $3F)) + Chr($80 or ((R shr 6) and $3F)) + Chr($80 or (R and $3F));
+end;
+
+{ strconv.IsPrint, for what certificates hold: ASCII exactly; beyond it
+  the C1 controls, the soft hyphen, the line and paragraph separators,
+  the surrogates and the noncharacters are not printable, the rest is
+  taken as printable (Go's tables also leave out unassigned points) }
+function RunePrintable(R: Integer): Boolean;
+begin
+  if R < $80 then
+    Result := (R >= $20) and (R < $7F)
+  else if R <= $A0 then
+    Result := False
+  else if R = $AD then
+    Result := False
+  else if (R >= $2028) and (R <= $2029) then
+    Result := False
+  else if (R >= $D800) and (R <= $DFFF) then
+    Result := False
+  else if (R >= $FDD0) and (R <= $FDEF) then
+    Result := False
+  else if (R and $FFFE) = $FFFE then
+    Result := False
+  else if (R >= $E000) and (R <= $F8FF) then
+    Result := False
+  else
+    Result := True;
+end;
+
+{ strconv.Quote, which fmt's %q uses }
+function X509Quote(const S: string): string;
+var
+  i, w, r, k: Integer;
+  h: string;
+begin
+  Result := '"';
+  i := 1;
+  while i <= Length(S) do
+  begin
+    r := DecodeRune(S, i, w);
+    if (r = $FFFD) and (w = 1) then
+    begin
+      Result := Result + '\x' + HexOf(S[i]);
+      Inc(i);
+      Continue;
+    end;
+    if (r = Ord('"')) or (r = Ord('\')) then
+      Result := Result + '\' + Chr(r)
+    else if RunePrintable(r) then
+      Result := Result + Copy(S, i, w)
+    else
+    begin
+      case r of
+        7: Result := Result + '\a';
+        8: Result := Result + '\b';
+        12: Result := Result + '\f';
+        10: Result := Result + '\n';
+        13: Result := Result + '\r';
+        9: Result := Result + '\t';
+        11: Result := Result + '\v';
+      else
+        begin
+          if r < $20 then
+            Result := Result + '\x' + HexOf(Chr(r))
+          else if r = $7F then
+            Result := Result + '\x7f'
+          else if r < $10000 then
+          begin
+            h := '';
+            for k := 3 downto 0 do
+              h := h + HexDigits[((r shr (4 * k)) and 15) + 1];
+            Result := Result + '\u' + h;
+          end
+          else
+          begin
+            h := '';
+            for k := 7 downto 0 do
+              h := h + HexDigits[((r shr (4 * k)) and 15) + 1];
+            Result := Result + '\U' + h;
+          end;
+        end;
+      end;
+    end;
+    i := i + w;
+  end;
+  Result := Result + '"';
+end;
+
+{ isIA5String of x509.go: every rune ASCII, so every byte below $80 }
+function IsIA5(const S: string): Boolean;
+var
+  i: Integer;
+begin
+  Result := False;
+  for i := 1 to Length(S) do
+    if Ord(S[i]) > 127 then
+      Exit;
+  Result := True;
+end;
+
+function IA5Err(const S: string): string;
+begin
+  Result := 'x509: ' + X509Quote(S) + ' cannot be encoded as an IA5String';
+end;
+
+{ ---- the DER reader of cryptobyte (asn1.go, string.go) ---- }
+
+{ readASN1: one element of S into O, its tag in Tag, S past it; O is
+  the contents when SkipHeader, else the whole element. Minimal
+  lengths only, four length octets at most, no high tag numbers. O may
+  be S itself (Go's der.ReadASN1(&der, ...)). }
+function DerReadRaw(var S: TDer; var O: TDer; out Tag: Integer; SkipHeader: Boolean): Boolean;
+var
+  n, t, lb, lenLen, len32, hdr, total, i, start: Integer;
+begin
+  Result := False;
+  Tag := 0;
+  n := DerLen(S);
+  if n < 2 then
+    Exit;
+  t := DerAt(S, 0);
+  lb := DerAt(S, 1);
+  if (t and $1F) = $1F then
+    Exit;
+  Tag := t;
+  if (lb and $80) = 0 then
+  begin
+    total := lb + 2;
+    hdr := 2;
+  end
+  else
+  begin
+    lenLen := lb and $7F;
+    if (lenLen = 0) or (lenLen > 4) or (n < 2 + lenLen) then
+      Exit;
+    len32 := 0;
+    for i := 0 to lenLen - 1 do
+      len32 := (len32 shl 8) or DerAt(S, 2 + i);
+    if len32 < 128 then
+      Exit;
+    if (len32 shr ((lenLen - 1) * 8)) = 0 then
+      Exit;
+    hdr := 2 + lenLen;
+    total := hdr + len32;
+  end;
+  if total > n then
+    Exit;
+  start := S.P;
+  S.P := S.P + total;
+  O.S := S.S;
+  O.P := start;
+  O.E := start + total;
+  if SkipHeader then
+    O.P := O.P + hdr;
+  Result := True;
+end;
+
+{ ReadAnyASN1 }
+function DerReadAny(var S: TDer; var O: TDer; out Tag: Integer): Boolean;
+begin
+  Result := DerReadRaw(S, O, Tag, True);
+end;
+
+{ ReadAnyASN1Element }
+function DerReadAnyElement(var S: TDer; var O: TDer; out Tag: Integer): Boolean;
+begin
+  Result := DerReadRaw(S, O, Tag, False);
+end;
+
+{ ReadASN1 }
+function DerRead(var S: TDer; var O: TDer; Tag: Integer): Boolean;
+var
+  t: Integer;
+  s2, o2: TDer;
+begin
+  s2 := S;
+  Result := DerReadRaw(s2, o2, t, True) and (t = Tag);
+  if Result then
+  begin
+    S := s2;
+    O := o2;
+  end;
+end;
+
+{ ReadASN1Element }
+function DerReadElement(var S: TDer; var O: TDer; Tag: Integer): Boolean;
+var
+  t: Integer;
+  s2, o2: TDer;
+begin
+  s2 := S;
+  Result := DerReadRaw(s2, o2, t, False) and (t = Tag);
+  if Result then
+  begin
+    S := s2;
+    O := o2;
+  end;
+end;
+
+{ PeekASN1Tag }
+function DerPeek(const S: TDer; Tag: Integer): Boolean;
+begin
+  Result := (DerLen(S) > 0) and (DerAt(S, 0) = Tag);
+end;
+
+{ SkipOptionalASN1 }
+function DerSkipOptional(var S: TDer; Tag: Integer): Boolean;
+var
+  u: TDer;
+begin
+  if not DerPeek(S, Tag) then
+  begin
+    Result := True;
+    Exit;
+  end;
+  Result := DerRead(S, u, Tag);
+end;
+
+{ ReadOptionalASN1 }
+function DerReadOptional(var S: TDer; var O: TDer; out Present: Boolean; Tag: Integer): Boolean;
+begin
+  Present := DerPeek(S, Tag);
+  Result := True;
+  if Present and not DerRead(S, O, Tag) then
+    Result := False;
+end;
+
+{ checkASN1Integer: not empty, minimally encoded }
+function DerIntOk(const B: TDer): Boolean;
+var
+  n: Integer;
+begin
+  n := DerLen(B);
+  Result := False;
+  if n = 0 then
+    Exit;
+  Result := True;
+  if n = 1 then
+    Exit;
+  if ((DerAt(B, 0) = 0) and ((DerAt(B, 1) and $80) = 0)) or ((DerAt(B, 0) = $FF) and ((DerAt(B, 1) and $80) = $80)) then
+    Result := False;
+end;
+
+{ asn1Signed: at most eight octets, sign-extended }
+function DerSigned(const B: TDer; out V: Integer): Boolean;
+var
+  n, i: Integer;
+begin
+  V := 0;
+  n := DerLen(B);
+  Result := False;
+  if n > 8 then
+    Exit;
+  for i := 0 to n - 1 do
+    V := (V shl 8) or DerAt(B, i);
+  if n < 8 then
+    V := (V shl (64 - n * 8)) sar (64 - n * 8);
+  Result := True;
+end;
+
+{ ReadASN1Integer into an int64 }
+function DerReadInt64(var S: TDer; out V: Integer): Boolean;
+var
+  b: TDer;
+begin
+  V := 0;
+  Result := DerRead(S, b, TagInteger) and DerIntOk(b) and DerSigned(b, V);
+end;
+
+{ ReadASN1Int64WithTag }
+function DerReadInt64Tag(var S: TDer; out V: Integer; Tag: Integer): Boolean;
+var
+  b: TDer;
+begin
+  V := 0;
+  Result := DerRead(S, b, Tag) and DerIntOk(b) and DerSigned(b, V);
+end;
+
+{ ReadASN1Integer into a uint, then mpl > math.MaxInt refused, as
+  parseBasicConstraintsExtension: 0 .. 2^63 - 1 }
+function DerReadUintMax(var S: TDer; out V: Integer): Boolean;
+var
+  b: TDer;
+  n, i: Integer;
+begin
+  V := 0;
+  Result := False;
+  if not (DerRead(S, b, TagInteger) and DerIntOk(b)) then
+    Exit;
+  n := DerLen(b);
+  if (n > 9) or ((n = 9) and (DerAt(b, 0) <> 0)) then
+    Exit;
+  if (DerAt(b, 0) and $80) <> 0 then
+    Exit;
+  if (n = 9) then
+    Exit;
+  for i := 0 to n - 1 do
+    V := (V shl 8) or DerAt(b, i);
+  Result := True;
+end;
+
+{ readASN1BigInt: the content octets (two's complement) }
+function DerReadBigInt(var S: TDer; out V: string): Boolean;
+var
+  b: TDer;
+begin
+  V := '';
+  Result := DerRead(S, b, TagInteger) and DerIntOk(b);
+  if Result then
+    V := DerStr(b);
+end;
+
+{ readBase128Int: a component below 2^31, no leading $80 }
+function DerBase128(var S: TDer; out V: Integer): Boolean;
+var
+  ret, i, b: Integer;
+begin
+  V := 0;
+  Result := False;
+  ret := 0;
+  i := 0;
+  while DerLen(S) > 0 do
+  begin
+    if i = 5 then
+      Exit;
+    if ret >= (1 shl 24) then
+      Exit;
+    ret := ret shl 7;
+    b := DerAt(S, 0);
+    S.P := S.P + 1;
+    if (i = 0) and (b = $80) then
+      Exit;
+    ret := ret or (b and $7F);
+    if (b and $80) = 0 then
+    begin
+      V := ret;
+      Result := True;
+      Exit;
+    end;
+    Inc(i);
+  end;
+end;
+
+{ ReadASN1ObjectIdentifier: the OID's DER content, checked as Go reads
+  each component }
+function DerReadOid(var S: TDer; out Oid: string): Boolean;
+var
+  b, c: TDer;
+  v: Integer;
+begin
+  Oid := '';
+  Result := False;
+  if not DerRead(S, b, TagOid) or DerEmpty(b) then
+    Exit;
+  c := b;
+  if not DerBase128(c, v) then
+    Exit;
+  while DerLen(c) > 0 do
+    if not DerBase128(c, v) then
+      Exit;
+  Oid := DerStr(b);
+  Result := True;
+end;
+
+{ ObjectIdentifier.String of the content octets }
+function X509OidString(const Der: string): string;
+var
+  d: TDer;
+  v: Integer;
+begin
+  Result := '';
+  d := DerOf(Der);
+  if not DerBase128(d, v) then
+    Exit;
+  if v < 80 then
+    Result := IntStr(v div 40) + '.' + IntStr(v mod 40)
+  else
+    Result := '2.' + IntStr(v - 80);
+  while DerLen(d) > 0 do
+  begin
+    if not DerBase128(d, v) then
+      Exit;
+    Result := Result + '.' + IntStr(v);
+  end;
+end;
+
+{ ReadASN1Boolean }
+function DerReadBool(var S: TDer; out V: Boolean): Boolean;
+var
+  b: TDer;
+begin
+  V := False;
+  Result := False;
+  if not DerRead(S, b, TagBoolean) or (DerLen(b) <> 1) then
+    Exit;
+  case DerAt(b, 0) of
+    0: V := False;
+    $FF: V := True;
+  else
+    Exit;
+  end;
+  Result := True;
+end;
+
+{ ReadASN1BitString: the octets after the padding count and the length
+  in bits; the unused bits must be zero }
+function DerReadBitString(var S: TDer; out Bytes: string; out BitLen: Integer): Boolean;
+var
+  b: TDer;
+  pad, n: Integer;
+begin
+  Bytes := '';
+  BitLen := 0;
+  Result := False;
+  if not DerRead(S, b, TagBitString) or (DerLen(b) = 0) then
+    Exit;
+  pad := DerAt(b, 0);
+  b.P := b.P + 1;
+  n := DerLen(b);
+  if (pad > 7) or ((n = 0) and (pad <> 0)) then
+    Exit;
+  if (n > 0) and ((DerAt(b, n - 1) and ((1 shl pad) - 1)) <> 0) then
+    Exit;
+  BitLen := n * 8 - pad;
+  Bytes := DerStr(b);
+  Result := True;
+end;
+
+{ BitString.RightAlign }
+function RightAlign(const Bytes: string; BitLen: Integer): string;
+var
+  shift, i: Integer;
+begin
+  shift := 8 - (BitLen mod 8);
+  if (shift = 8) or (Length(Bytes) = 0) then
+  begin
+    Result := Bytes;
+    Exit;
+  end;
+  SetLength(Result, Length(Bytes));
+  Result[1] := Chr(Ord(Bytes[1]) shr shift);
+  for i := 2 to Length(Bytes) do
+    Result[i] := Chr(((Ord(Bytes[i - 1]) shl (8 - shift)) and 255) or (Ord(Bytes[i]) shr shift));
+end;
+
+{ BitString.At }
+function BitAt(const Bytes: string; BitLen, I: Integer): Integer;
+begin
+  if (I < 0) or (I >= BitLen) then
+    Result := 0
+  else
+    Result := (Ord(Bytes[I div 8 + 1]) shr (7 - I mod 8)) and 1;
+end;
+
+{ ---- times (cryptobyte ReadASN1UTCTime and ReadASN1GeneralizedTime
+  over Go's time.Parse and Format) ---- }
+
+function IsLeap(Y: Integer): Boolean;
+begin
+  Result := ((Y mod 4) = 0) and (((Y mod 100) <> 0) or ((Y mod 400) = 0));
+end;
+
+function DaysIn(M, Y: Integer): Integer;
+begin
+  case M of
+    1, 3, 5, 7, 8, 10, 12: Result := 31;
+    4, 6, 9, 11: Result := 30;
+  else
+    if IsLeap(Y) then
+      Result := 29
+    else
+      Result := 28;
+  end;
+end;
+
+{ days from 1970-01-01 to a civil date (proleptic Gregorian) }
+function DaysFromCivil(Y, M, D: Integer): Integer;
+var
+  era, yoe, doy, doe, mp: Integer;
+begin
+  if M <= 2 then
+    Y := Y - 1;
+  if Y >= 0 then
+    era := Y div 400
+  else
+    era := (Y - 399) div 400;
+  yoe := Y - era * 400;
+  if M > 2 then
+    mp := M - 3
+  else
+    mp := M + 9;
+  doy := (153 * mp + 2) div 5 + D - 1;
+  doe := yoe * 365 + yoe div 4 - yoe div 100 + doy;
+  Result := era * 146097 + doe - 719468;
+end;
+
+procedure CivilFromDays(Z: Integer; out Y, M, D: Integer);
+var
+  era, doe, yoe, doy, mp: Integer;
+begin
+  Z := Z + 719468;
+  if Z >= 0 then
+    era := Z div 146097
+  else
+    era := (Z - 146096) div 146097;
+  doe := Z - era * 146097;
+  yoe := (doe - doe div 1460 + doe div 36524 - doe div 146096) div 365;
+  Y := yoe + era * 400;
+  doy := doe - (365 * yoe + yoe div 4 - yoe div 100);
+  mp := (5 * doy + 2) div 153;
+  D := doy - (153 * mp + 2) div 5 + 1;
+  if mp < 10 then
+    M := mp + 3
+  else
+    M := mp - 9;
+  if M <= 2 then
+    Y := Y + 1;
+end;
+
+function FloorDiv(A, B: Integer): Integer;
+begin
+  Result := A div B;
+  if ((A mod B) <> 0) and ((A < 0) <> (B < 0)) then
+    Result := Result - 1;
+end;
+
+{ Format(time.RFC3339) of the moment Unix in the zone Offset seconds east }
+function X509TimeRFC3339(Unix, Offset: Integer): string;
+var
+  t, days, secs, y, m, d, o: Integer;
+begin
+  t := Unix + Offset;
+  days := FloorDiv(t, 86400);
+  secs := t - days * 86400;
+  CivilFromDays(days, y, m, d);
+  Result := Pad4(y) + '-' + Pad2(m) + '-' + Pad2(d) + 'T' + Pad2(secs div 3600) + ':' + Pad2((secs div 60) mod 60) + ':' + Pad2(secs mod 60);
+  if Offset = 0 then
+    Result := Result + 'Z'
+  else
+  begin
+    o := Offset;
+    if o < 0 then
+    begin
+      Result := Result + '-';
+      o := -o;
+    end
+    else
+      Result := Result + '+';
+    o := o div 60;
+    Result := Result + Pad2(o div 60) + ':' + Pad2(o mod 60);
+  end;
+end;
+
+function Digits(const S: string; P, N: Integer; out V: Integer): Boolean;
+var
+  i: Integer;
+begin
+  V := 0;
+  Result := False;
+  if P + N - 1 > Length(S) then
+    Exit;
+  for i := P to P + N - 1 do
+  begin
+    if (S[i] < '0') or (S[i] > '9') then
+      Exit;
+    V := V * 10 + Ord(S[i]) - 48;
+  end;
+  Result := True;
+end;
+
+{ time.Parse of the layout YYMMDDhhmm[ss]Z0700 (YearDigits 2) or
+  YYYYMMDDhhmmssZ0700 (4); Parsed says whether time.Parse took it, the
+  result whether Format then gives the text back, as cryptobyte
+  demands. A zone is Z or +hhmm / -hhmm (hour up to 24, minute up to
+  60, as Go's range test); Format writes Z for a zero offset and
+  carries a minute of 60 into the hour, so those do not come back. }
+function ParseTimeLayout(const T: string; YearDigits: Integer; WithSeconds: Boolean; out Unix, Offset: Integer; out Parsed: Boolean): Boolean;
+var
+  p, y, mo, d, h, mi, s, zh, zm, sign: Integer;
+  zoned: Boolean;
+begin
+  Unix := 0;
+  Offset := 0;
+  Result := False;
+  Parsed := False;
+  zoned := False;
+  zm := 0;
+  p := 1;
+  if not Digits(T, p, YearDigits, y) then Exit;
+  p := p + YearDigits;
+  if YearDigits = 2 then
+  begin
+    if y >= 69 then
+      y := y + 1900
+    else
+      y := y + 2000;
+  end;
+  if not Digits(T, p, 2, mo) then Exit;
+  p := p + 2;
+  if (mo < 1) or (mo > 12) then Exit;
+  if not Digits(T, p, 2, d) then Exit;
+  p := p + 2;
+  if not Digits(T, p, 2, h) then Exit;
+  p := p + 2;
+  if h >= 24 then Exit;
+  if not Digits(T, p, 2, mi) then Exit;
+  p := p + 2;
+  if mi >= 60 then Exit;
+  s := 0;
+  if WithSeconds then
+  begin
+    if not Digits(T, p, 2, s) then Exit;
+    p := p + 2;
+    if s >= 60 then Exit;
+  end;
+  if p > Length(T) then Exit;
+  if T[p] = 'Z' then
+    p := p + 1
+  else
+  begin
+    if p + 4 > Length(T) then Exit;
+    if T[p] = '+' then
+      sign := 1
+    else if T[p] = '-' then
+      sign := -1
+    else
+      Exit;
+    if not Digits(T, p + 1, 2, zh) then Exit;
+    if not Digits(T, p + 3, 2, zm) then Exit;
+    if (zh > 24) or (zm > 60) then Exit;
+    Offset := sign * (zh * 3600 + zm * 60);
+    zoned := True;
+    p := p + 5;
+  end;
+  if p <= Length(T) then Exit;
+  if (d < 1) or (d > DaysIn(mo, y)) then Exit;
+  Parsed := True;
+  if zoned and ((Offset = 0) or (zm >= 60)) then Exit;
+  { a two-digit year of 2050 and later is 100 years earlier }
+  if (YearDigits = 2) and (y >= 2050) then
+    y := y - 100;
+  Unix := DaysFromCivil(y, mo, d) * 86400 + h * 3600 + mi * 60 + s - Offset;
+  Result := True;
+end;
+
+{ ReadASN1UTCTime }
+function DerReadUTCTime(var S: TDer; out Unix, Offset: Integer): Boolean;
+var
+  b: TDer;
+  t: string;
+  parsed: Boolean;
+begin
+  Unix := 0;
+  Offset := 0;
+  Result := False;
+  if not DerRead(S, b, TagUTCTime) then
+    Exit;
+  t := DerStr(b);
+  Result := ParseTimeLayout(t, 2, True, Unix, Offset, parsed);
+  if not parsed then
+    Result := ParseTimeLayout(t, 2, False, Unix, Offset, parsed);
+end;
+
+{ ReadASN1GeneralizedTime }
+function DerReadGeneralizedTime(var S: TDer; out Unix, Offset: Integer): Boolean;
+var
+  b: TDer;
+  parsed: Boolean;
+begin
+  Unix := 0;
+  Offset := 0;
+  Result := False;
+  if not DerRead(S, b, TagGeneralizedTime) then
+    Exit;
+  Result := ParseTimeLayout(DerStr(b), 4, True, Unix, Offset, parsed);
+end;
+
+{ readASN1Time of parser.go }
+function ReadAsn1Time(var S: TDer; out Unix, Offset: Integer; out Err: string): Boolean;
+begin
+  Err := '';
+  Unix := 0;
+  Offset := 0;
+  Result := False;
+  if DerPeek(S, TagUTCTime) then
+  begin
+    if not DerReadUTCTime(S, Unix, Offset) then
+    begin
+      Err := 'x509: malformed UTCTime';
+      Exit;
+    end;
+  end
+  else if DerPeek(S, TagGeneralizedTime) then
+  begin
+    if not DerReadGeneralizedTime(S, Unix, Offset) then
+    begin
+      Err := 'x509: malformed GeneralizedTime';
+      Exit;
+    end;
+  end
+  else
+  begin
+    Err := 'x509: unsupported time format';
+    Exit;
+  end;
+  Result := True;
+end;
+
+{ ---- IP addresses (net/netip ParseAddr, net.IP String and Equal,
+  net.IPNet Contains) ---- }
+
+{ parseIPv4Fields of netip.go over In[Off .. End-1] (0-based), into
+  four bytes }
+function ParseV4Fields(const InS: string; Off, EndX: Integer; out F: string; out Err: string): Boolean;
+var
+  vl, fpos, digLen, i, n: Integer;
+  c: Char;
+  fields: array[0..3] of Integer;
+begin
+  Result := False;
+  F := '';
+  Err := '';
+  vl := 0;
+  fpos := 0;
+  digLen := 0;
+  n := EndX - Off;
+  for i := 0 to n - 1 do
+  begin
+    c := InS[Off + i + 1];
+    if (c >= '0') and (c <= '9') then
+    begin
+      if (digLen = 1) and (vl = 0) then
+      begin
+        Err := 'IPv4 field has octet with leading zero';
+        Exit;
+      end;
+      vl := vl * 10 + Ord(c) - 48;
+      Inc(digLen);
+      if vl > 255 then
+      begin
+        Err := 'IPv4 field has value >255';
+        Exit;
+      end;
+    end
+    else if c = '.' then
+    begin
+      if (i = 0) or (i = n - 1) or (InS[Off + i] = '.') then
+      begin
+        Err := 'IPv4 field must have at least one digit';
+        Exit;
+      end;
+      if fpos = 3 then
+      begin
+        Err := 'IPv4 address too long';
+        Exit;
+      end;
+      fields[fpos] := vl;
+      Inc(fpos);
+      vl := 0;
+      digLen := 0;
+    end
+    else
+    begin
+      Err := 'unexpected character';
+      Exit;
+    end;
+  end;
+  if fpos < 3 then
+  begin
+    Err := 'IPv4 address too short';
+    Exit;
+  end;
+  fields[3] := vl;
+  F := Chr(fields[0]) + Chr(fields[1]) + Chr(fields[2]) + Chr(fields[3]);
+  Result := True;
+end;
+
+{ parseIPv6 of netip.go }
+function ParseV6(const InS: string; out IP, Zone, Err: string): Boolean;
+var
+  s, f4: string;
+  i, ell, off, acc, j, nn, zi, endX: Integer;
+  c: Char;
+  b: array[0..15] of Integer;
+begin
+  Result := False;
+  IP := '';
+  Zone := '';
+  Err := '';
+  s := InS;
+  zi := IndexChar(s, '%');
+  if zi >= 0 then
+  begin
+    Zone := Copy(s, zi + 2, Length(s) - zi - 1);
+    s := Copy(s, 1, zi);
+    if Zone = '' then
+    begin
+      Err := 'zone must be a non-empty string';
+      Exit;
+    end;
+  end;
+  for i := 0 to 15 do
+    b[i] := 0;
+  ell := -1;
+  if (Length(s) >= 2) and (s[1] = ':') and (s[2] = ':') then
+  begin
+    ell := 0;
+    s := Copy(s, 3, Length(s) - 2);
+    if Length(s) = 0 then
+    begin
+      SetLength(IP, 16);
+      for j := 1 to 16 do
+        IP[j] := #0;
+      Result := True;
+      Exit;
+    end;
+  end;
+  i := 0;
+  while i < 16 do
+  begin
+    off := 0;
+    acc := 0;
+    while off < Length(s) do
+    begin
+      c := s[off + 1];
+      if (c >= '0') and (c <= '9') then
+        acc := (acc shl 4) + Ord(c) - 48
+      else if (c >= 'a') and (c <= 'f') then
+        acc := (acc shl 4) + Ord(c) - 87
+      else if (c >= 'A') and (c <= 'F') then
+        acc := (acc shl 4) + Ord(c) - 55
+      else
+        Break;
+      if off > 3 then
+      begin
+        Err := 'each group must have 4 or less digits';
+        Exit;
+      end;
+      if acc > $FFFF then
+      begin
+        Err := 'IPv6 field has value >=2^16';
+        Exit;
+      end;
+      Inc(off);
+    end;
+    if off = 0 then
+    begin
+      Err := 'each colon-separated field must have at least one digit';
+      Exit;
+    end;
+    if (off < Length(s)) and (s[off + 1] = '.') then
+    begin
+      if (ell < 0) and (i <> 12) then
+      begin
+        Err := 'embedded IPv4 address must replace the final 2 fields of the address';
+        Exit;
+      end;
+      if i + 4 > 16 then
+      begin
+        Err := 'too many hex fields to fit an embedded IPv4 at the end of the address';
+        Exit;
+      end;
+      endX := Length(InS);
+      if Length(Zone) > 0 then
+        endX := endX - (Length(Zone) + 1);
+      if not ParseV4Fields(InS, endX - Length(s), endX, f4, Err) then
+        Exit;
+      for j := 0 to 3 do
+        b[i + j] := Ord(f4[j + 1]);
+      s := '';
+      i := i + 4;
+      Break;
+    end;
+    b[i] := (acc shr 8) and 255;
+    b[i + 1] := acc and 255;
+    i := i + 2;
+    s := Copy(s, off + 1, Length(s) - off);
+    if Length(s) = 0 then
+      Break;
+    if s[1] <> ':' then
+    begin
+      Err := 'unexpected character, want colon';
+      Exit;
+    end
+    else if Length(s) = 1 then
+    begin
+      Err := 'colon must be followed by more characters';
+      Exit;
+    end;
+    s := Copy(s, 2, Length(s) - 1);
+    if s[1] = ':' then
+    begin
+      if ell >= 0 then
+      begin
+        Err := 'multiple :: in address';
+        Exit;
+      end;
+      ell := i;
+      s := Copy(s, 2, Length(s) - 1);
+      if Length(s) = 0 then
+        Break;
+    end;
+  end;
+  if Length(s) <> 0 then
+  begin
+    Err := 'trailing garbage after address';
+    Exit;
+  end;
+  if i < 16 then
+  begin
+    if ell < 0 then
+    begin
+      Err := 'address string too short';
+      Exit;
+    end;
+    nn := 16 - i;
+    for j := i - 1 downto ell do
+      b[j + nn] := b[j];
+    for j := ell to ell + nn - 1 do
+      b[j] := 0;
+  end
+  else if ell >= 0 then
+  begin
+    Err := 'the :: must expand to at least one field of zeros';
+    Exit;
+  end;
+  SetLength(IP, 16);
+  for j := 0 to 15 do
+    IP[j + 1] := Chr(b[j]);
+  Result := True;
+end;
+
+function X509ParseAddr(const S: string; out IP, Zone, Err: string): Boolean;
+var
+  i: Integer;
+  msg: string;
+begin
+  IP := '';
+  Zone := '';
+  Err := '';
+  Result := False;
+  msg := 'unable to parse IP';
+  for i := 1 to Length(S) do
+  begin
+    if S[i] = '.' then
+    begin
+      Result := ParseV4Fields(S, 0, Length(S), IP, msg);
+      Break;
+    end
+    else if S[i] = ':' then
+    begin
+      Result := ParseV6(S, IP, Zone, msg);
+      Break;
+    end
+    else if S[i] = '%' then
+    begin
+      msg := 'missing IPv6 address';
+      Break;
+    end;
+  end;
+  if not Result then
+    Err := 'ParseAddr(' + X509Quote(S) + '): ' + msg;
+end;
+
+{ net.ParseIP: no zone; nil (empty) when it does not parse }
+function ParseIPNet(const S: string): string;
+var
+  ip, zone, err: string;
+begin
+  Result := '';
+  if X509ParseAddr(S, ip, zone, err) and (zone = '') then
+    Result := ip;
+end;
+
+function IsV4Mapped(const IP: string): Boolean;
+var
+  i: Integer;
+begin
+  Result := False;
+  if Length(IP) <> 16 then
+    Exit;
+  for i := 1 to 10 do
+    if IP[i] <> #0 then
+      Exit;
+  Result := (IP[11] = #255) and (IP[12] = #255);
+end;
+
+{ net.IP To4: 4 bytes, or '' }
+function IPTo4(const IP: string): string;
+begin
+  if Length(IP) = 4 then
+    Result := IP
+  else if IsV4Mapped(IP) then
+    Result := Copy(IP, 13, 4)
+  else
+    Result := '';
+end;
+
+function IPEqual(const A, B: string): Boolean;
+begin
+  if Length(A) = Length(B) then
+    Result := A = B
+  else if (Length(A) = 4) and (Length(B) = 16) then
+    Result := IsV4Mapped(B) and (Copy(B, 13, 4) = A)
+  else if (Length(A) = 16) and (Length(B) = 4) then
+    Result := IsV4Mapped(A) and (Copy(A, 13, 4) = B)
+  else
+    Result := False;
+end;
+
+function Hex16(V: Integer): string;
+var
+  started: Boolean;
+  k, dgt: Integer;
+begin
+  Result := '';
+  started := False;
+  for k := 3 downto 0 do
+  begin
+    dgt := (V shr (4 * k)) and 15;
+    if (dgt <> 0) or started or (k = 0) then
+    begin
+      Result := Result + HexDigits[dgt + 1];
+      started := True;
+    end;
+  end;
+end;
+
+{ net.IP String: dotted for IPv4 and IPv4-mapped, RFC 5952 for IPv6 }
+function X509IPString(const IP: string): string;
+var
+  p4: string;
+  i, j, zs, ze: Integer;
+  w: array[0..7] of Integer;
+begin
+  if Length(IP) = 0 then
+  begin
+    Result := '<nil>';
+    Exit;
+  end;
+  if (Length(IP) <> 4) and (Length(IP) <> 16) then
+  begin
+    Result := '?' + HexOf(IP);
+    Exit;
+  end;
+  p4 := IPTo4(IP);
+  if Length(p4) = 4 then
+  begin
+    Result := IntStr(Ord(p4[1])) + '.' + IntStr(Ord(p4[2])) + '.' + IntStr(Ord(p4[3])) + '.' + IntStr(Ord(p4[4]));
+    Exit;
+  end;
+  for i := 0 to 7 do
+    w[i] := Ord(IP[2 * i + 1]) * 256 + Ord(IP[2 * i + 2]);
+  zs := 255;
+  ze := 255;
+  for i := 0 to 7 do
+  begin
+    j := i;
+    while (j < 8) and (w[j] = 0) do
+      Inc(j);
+    if (j - i >= 2) and (j - i > ze - zs) then
+    begin
+      zs := i;
+      ze := j;
+    end;
+  end;
+  Result := '';
+  i := 0;
+  while i < 8 do
+  begin
+    if i = zs then
+    begin
+      Result := Result + '::';
+      i := ze;
+      if i >= 8 then
+        Break;
+    end
+    else if i > 0 then
+      Result := Result + ':';
+    Result := Result + Hex16(w[i]);
+    Inc(i);
+  end;
+end;
+
+{ networkNumberAndMask and IPNet.Contains of net/ip.go }
+function IPNetContains(const N: TX509IPNet; const IP: string): Boolean;
+var
+  nn, m, x: string;
+  i: Integer;
+begin
+  Result := False;
+  nn := IPTo4(N.IP);
+  if nn = '' then
+  begin
+    nn := N.IP;
+    if Length(nn) <> 16 then
+      Exit;
+  end;
+  m := N.Mask;
+  case Length(m) of
+    4: if Length(nn) <> 4 then Exit;
+    16: if Length(nn) = 4 then m := Copy(m, 13, 4);
+  else
+    Exit;
+  end;
+  x := IPTo4(IP);
+  if x = '' then
+    x := IP;
+  if Length(x) <> Length(nn) then
+    Exit;
+  for i := 1 to Length(x) do
+    if (Ord(nn[i]) and Ord(m[i])) <> (Ord(x[i]) and Ord(m[i])) then
+      Exit;
+  Result := True;
+end;
+
+{ IP.Mask of net/ip.go; '' for nil }
+function IPMaskOf(const IP0, Mask0: string): string;
+var
+  ip, mask: string;
+  i, n: Integer;
+  allff: Boolean;
+begin
+  ip := IP0;
+  mask := Mask0;
+  if (Length(mask) = 16) and (Length(ip) = 4) then
+  begin
+    allff := True;
+    for i := 1 to 12 do
+      if mask[i] <> #255 then
+        allff := False;
+    if allff then
+      mask := Copy(mask, 13, 4);
+  end;
+  if (Length(mask) = 4) and (Length(ip) = 16) and IsV4Mapped(ip) then
+    ip := Copy(ip, 13, 4);
+  n := Length(ip);
+  if n <> Length(mask) then
+  begin
+    Result := '';
+    Exit;
+  end;
+  SetLength(Result, n);
+  for i := 1 to n do
+    Result[i] := Chr(Ord(ip[i]) and Ord(mask[i]));
+end;
+
+{ ---- names (parser.go parseName, readASN1Any, parseASN1String) ---- }
+
+function IsPrintableByte(B: Integer): Boolean;
+begin
+  Result := ((B >= Ord('a')) and (B <= Ord('z'))) or ((B >= Ord('A')) and (B <= Ord('Z'))) or
+    ((B >= Ord('0')) and (B <= Ord('9'))) or ((B >= Ord('''')) and (B <= Ord(')'))) or
+    ((B >= Ord('+')) and (B <= Ord('/'))) or (B = Ord(' ')) or (B = Ord(':')) or (B = Ord('=')) or
+    (B = Ord('?')) or (B = Ord('*')) or (B = Ord('&'));
+end;
+
+{ parseASN1String: the value of one string type as UTF-8 }
+function ParseAsn1String(Tag: Integer; const V: string; out R: string; out Err: string): Boolean;
+var
+  i, n, pt: Integer;
+  w: string;
+begin
+  Result := False;
+  R := '';
+  Err := '';
+  case Tag of
+    TagT61String:
+      begin
+        for i := 1 to Length(V) do
+          R := R + EncodeRune(Ord(V[i]));
+        Result := True;
+      end;
+    TagPrintableString:
+      begin
+        for i := 1 to Length(V) do
+          if not IsPrintableByte(Ord(V[i])) then
+          begin
+            Err := 'invalid PrintableString';
+            Exit;
+          end;
+        R := V;
+        Result := True;
+      end;
+    TagUTF8String:
+      begin
+        if not Utf8Valid(V) then
+        begin
+          Err := 'invalid UTF-8 string';
+          Exit;
+        end;
+        R := V;
+        Result := True;
+      end;
+    TagBMPString:
+      begin
+        if (Length(V) mod 2) <> 0 then
+        begin
+          Err := 'invalid BMPString';
+          Exit;
+        end;
+        w := V;
+        n := Length(w);
+        if (n >= 2) and (w[n] = #0) and (w[n - 1] = #0) then
+          w := Copy(w, 1, n - 2);
+        i := 1;
+        while i < Length(w) do
+        begin
+          pt := Ord(w[i]) * 256 + Ord(w[i + 1]);
+          if (pt = $FFFE) or (pt = $FFFF) or ((pt >= $FDD0) and (pt <= $FDEF)) or ((pt >= $D800) and (pt <= $DFFF)) then
+          begin
+            R := '';
+            Err := 'invalid BMPString';
+            Exit;
+          end;
+          R := R + EncodeRune(pt);
+          i := i + 2;
+        end;
+        Result := True;
+      end;
+    TagIA5String:
+      begin
+        if not IsIA5(V) then
+        begin
+          Err := 'invalid IA5String';
+          Exit;
+        end;
+        R := V;
+        Result := True;
+      end;
+    TagNumericString:
+      begin
+        for i := 1 to Length(V) do
+          if not (((V[i] >= '0') and (V[i] <= '9')) or (V[i] = ' ')) then
+          begin
+            Err := 'invalid NumericString';
+            Exit;
+          end;
+        R := V;
+        Result := True;
+      end;
+  else
+    Err := 'unsupported string type: ' + IntStr(Tag);
+  end;
+end;
+
+{ readASN1Any: checks one attribute value as Go reads it; IsString and
+  SVal when it is one of the string types }
+function ReadAsn1Any(var D: TDer; out IsString: Boolean; out SVal: string; out Err: string): Boolean;
+var
+  full, raw: TDer;
+  tag, iv, bl, u, o: Integer;
+  bs, oid, e2: string;
+  bv: Boolean;
+begin
+  Result := False;
+  IsString := False;
+  SVal := '';
+  Err := '';
+  if not DerReadAnyElement(D, full, tag) then
+  begin
+    Err := 'invalid ASN.1 element';
+    Exit;
+  end;
+  case tag of
+    TagT61String, TagPrintableString, TagUTF8String, TagBMPString, TagIA5String, TagNumericString:
+      begin
+        if not DerRead(full, raw, tag) then
+        begin
+          Err := 'invalid ASN.1 element';
+          Exit;
+        end;
+        if not ParseAsn1String(tag, DerStr(raw), SVal, Err) then
+          Exit;
+        IsString := True;
+      end;
+    TagInteger:
+      if not DerReadInt64(full, iv) then
+      begin
+        Err := 'invalid ASN.1 integer';
+        Exit;
+      end;
+    TagBitString:
+      if not DerReadBitString(full, bs, bl) then
+      begin
+        Err := 'invalid ASN.1 BIT STRING';
+        Exit;
+      end;
+    TagOctetString:
+      if not DerRead(full, raw, TagOctetString) then
+      begin
+        Err := 'invalid ASN.1 OCTET STRING';
+        Exit;
+      end;
+    TagOid:
+      if not DerReadOid(full, oid) then
+      begin
+        Err := 'invalid ASN.1 OBJECT IDENTIFIER';
+        Exit;
+      end;
+    TagUTCTime, TagGeneralizedTime:
+      if not ReadAsn1Time(full, u, o, e2) then
+      begin
+        Err := e2;
+        Exit;
+      end;
+    TagBoolean:
+      if not DerReadBool(full, bv) then
+      begin
+        Err := 'invalid ASN.1 BOOLEAN';
+        Exit;
+      end;
+    TagNull: ;
+  else
+    if not DerReadAny(full, raw, tag) then
+    begin
+      Err := 'invalid ASN.1 element';
+      Exit;
+    end;
+  end;
+  Result := True;
+end;
+
+{ parseName and pkix.Name.FillFromRDNSequence: the CommonName (the
+  last one) and the Organizations, the string values of 2.5.4.3 and
+  2.5.4.10 }
+function ParseName(Raw: TDer; out CN: string; out Orgs: TX509Strings; out Err: string): Boolean;
+var
+  rset, atav: TDer;
+  typ, vl: string;
+  isStr: Boolean;
+begin
+  Result := False;
+  CN := '';
+  Orgs := nil;
+  Err := '';
+  if not DerRead(Raw, Raw, TagSequence) then
+  begin
+    Err := 'x509: invalid RDNSequence';
+    Exit;
+  end;
+  while not DerEmpty(Raw) do
+  begin
+    if not DerRead(Raw, rset, TagSet) then
+    begin
+      Err := 'x509: invalid RDNSequence';
+      Exit;
+    end;
+    while not DerEmpty(rset) do
+    begin
+      if not DerRead(rset, atav, TagSequence) then
+      begin
+        Err := 'x509: invalid RDNSequence: invalid attribute';
+        Exit;
+      end;
+      if not DerReadOid(atav, typ) then
+      begin
+        Err := 'x509: invalid RDNSequence: invalid attribute type';
+        Exit;
+      end;
+      if not ReadAsn1Any(atav, isStr, vl, Err) then
+      begin
+        Err := 'x509: invalid RDNSequence: invalid attribute value: ' + Err;
+        Exit;
+      end;
+      if isStr then
+      begin
+        if typ = #85#4#3 then
+          CN := vl
+        else if typ = #85#4#10 then
+          Orgs := Append(Orgs, vl);
+      end;
+    end;
+  end;
+  Result := True;
+end;
+
+{ ---- algorithm identifiers ---- }
+
+{ parseAI: the OID and the parameters' whole element (Go's FullBytes) }
+function ParseAI(D: TDer; out Oid, Params: string; out Err: string): Boolean;
+var
+  p: TDer;
+  tag: Integer;
+begin
+  Result := False;
+  Oid := '';
+  Params := '';
+  Err := '';
+  if not DerReadOid(D, Oid) then
+  begin
+    Err := 'x509: malformed OID';
+    Exit;
+  end;
+  if DerEmpty(D) then
+  begin
+    Result := True;
+    Exit;
+  end;
+  if not DerReadAnyElement(D, p, tag) then
+  begin
+    Err := 'x509: malformed parameters';
+    Exit;
+  end;
+  Params := DerStr(p);
+  Result := True;
+end;
+
+{ encoding/asn1 Unmarshal of an AlgorithmIdentifier (OID, optional any
+  parameters; more elements after them let by, as a SEQUENCE may grow) }
+function UnmarshalAI(const Full: string; out Oid, Params: string): Boolean;
+var
+  d, seq, p: TDer;
+  tag: Integer;
+begin
+  Result := False;
+  Oid := '';
+  Params := '';
+  d := DerOf(Full);
+  if not DerRead(d, seq, TagSequence) then
+    Exit;
+  if not DerReadOid(seq, Oid) then
+    Exit;
+  if not DerEmpty(seq) then
+  begin
+    if not DerReadAnyElement(seq, p, tag) then
+      Exit;
+    Params := DerStr(p);
+  end;
+  Result := True;
+end;
+
+{ the explicit [N] wrapper of encoding/asn1, its content }
+function ReadExplicit(var D: TDer; N: Integer; out Inner: TDer): Boolean;
+begin
+  Inner := D;
+  Inner.E := Inner.P;
+  Result := DerRead(D, Inner, $A0 + N);
+end;
+
+{ getSignatureAlgorithmFromAI of x509.go }
+function SigAlgFromAI(const Oid, Params: string): Integer;
+var
+  d, seq, inner, el: TDer;
+  hashOid, hashParams, mgfOid, mgfParams, mgfHashOid, mgfHashParams: string;
+  salt, trailer, tag: Integer;
+begin
+  Result := X509SigUnknown;
+  if (Oid = OidSigEd25519) or (Oid = OidPkMLDSA44) or (Oid = OidPkMLDSA65) or (Oid = OidPkMLDSA87) then
+    if Length(Params) <> 0 then
+      Exit;
+  if Oid <> OidSigRSAPSS then
+  begin
+    if Oid = OidSigMD5WithRSA then Result := X509SigMD5WithRSA
+    else if Oid = OidSigSHA1WithRSA then Result := X509SigSHA1WithRSA
+    else if Oid = OidISOSigSHA1WithRSA then Result := X509SigSHA1WithRSA
+    else if Oid = OidSigSHA256WithRSA then Result := X509SigSHA256WithRSA
+    else if Oid = OidSigSHA384WithRSA then Result := X509SigSHA384WithRSA
+    else if Oid = OidSigSHA512WithRSA then Result := X509SigSHA512WithRSA
+    else if Oid = OidSigDSAWithSHA1 then Result := X509SigDSAWithSHA1
+    else if Oid = OidSigDSAWithSHA256 then Result := X509SigDSAWithSHA256
+    else if Oid = OidSigECDSAWithSHA1 then Result := X509SigECDSAWithSHA1
+    else if Oid = OidSigECDSAWithSHA256 then Result := X509SigECDSAWithSHA256
+    else if Oid = OidSigECDSAWithSHA384 then Result := X509SigECDSAWithSHA384
+    else if Oid = OidSigECDSAWithSHA512 then Result := X509SigECDSAWithSHA512
+    else if Oid = OidSigEd25519 then Result := X509SigPureEd25519
+    else if Oid = OidPkMLDSA44 then Result := X509SigMLDSA44
+    else if Oid = OidPkMLDSA65 then Result := X509SigMLDSA65
+    else if Oid = OidPkMLDSA87 then Result := X509SigMLDSA87;
+    Exit;
+  end;
+  { RSA-PSS: pssParameters through encoding/asn1: [0] hash, [1] MGF,
+    [2] salt length, optional [3] trailer field (default 1) }
+  d := DerOf(Params);
+  if not DerRead(d, seq, TagSequence) then
+    Exit;
+  if not ReadExplicit(seq, 0, inner) then
+    Exit;
+  if not DerReadAnyElement(inner, el, tag) or (tag <> TagSequence) then
+    Exit;
+  if not UnmarshalAI(DerStr(el), hashOid, hashParams) then
+    Exit;
+  if not ReadExplicit(seq, 1, inner) then
+    Exit;
+  if not DerReadAnyElement(inner, el, tag) or (tag <> TagSequence) then
+    Exit;
+  if not UnmarshalAI(DerStr(el), mgfOid, mgfParams) then
+    Exit;
+  if not ReadExplicit(seq, 2, inner) then
+    Exit;
+  if not DerReadInt64(inner, salt) then
+    Exit;
+  trailer := 1;
+  if DerPeek(seq, $A3) then
+  begin
+    if not ReadExplicit(seq, 3, inner) then
+      Exit;
+    if not DerReadInt64(inner, trailer) then
+      Exit;
+  end;
+  if not UnmarshalAI(mgfParams, mgfHashOid, mgfHashParams) then
+    Exit;
+  if ((Length(hashParams) <> 0) and (hashParams <> NullBytes)) or (mgfOid <> OidMGF1) or
+    (mgfHashOid <> hashOid) or ((Length(mgfHashParams) <> 0) and (mgfHashParams <> NullBytes)) or (trailer <> 1) then
+    Exit;
+  if (hashOid = OidSHA256) and (salt = 32) then
+    Result := X509SigSHA256WithRSAPSS
+  else if (hashOid = OidSHA384) and (salt = 48) then
+    Result := X509SigSHA384WithRSAPSS
+  else if (hashOid = OidSHA512) and (salt = 64) then
+    Result := X509SigSHA512WithRSAPSS;
+end;
+
+function PkAlgFromOid(const Oid: string): Integer;
+begin
+  if Oid = OidPkRSA then Result := X509PkRSA
+  else if Oid = OidPkDSA then Result := X509PkDSA
+  else if Oid = OidPkECDSA then Result := X509PkECDSA
+  else if Oid = OidPkEd25519 then Result := X509PkEd25519
+  else if (Oid = OidPkMLDSA44) or (Oid = OidPkMLDSA65) or (Oid = OidPkMLDSA87) then Result := X509PkMLDSA
+  else Result := X509PkUnknown;
+end;
+
+{ the signature algorithm table: the name, the public key algorithm and
+  the hash (0 none, 1 SHA-1, 2 MD5, 256, 384, 512) }
+procedure SigAlgDetails(Algo: Integer; out Name: string; out PubKeyAlgo, HashBits: Integer; out Pss: Boolean);
+begin
+  Pss := False;
+  PubKeyAlgo := X509PkUnknown;
+  HashBits := 0;
+  Name := IntStr(Algo);
+  case Algo of
+    X509SigMD5WithRSA: begin Name := 'MD5-RSA'; PubKeyAlgo := X509PkRSA; HashBits := 2; end;
+    X509SigSHA1WithRSA: begin Name := 'SHA1-RSA'; PubKeyAlgo := X509PkRSA; HashBits := 1; end;
+    X509SigSHA256WithRSA: begin Name := 'SHA256-RSA'; PubKeyAlgo := X509PkRSA; HashBits := 256; end;
+    X509SigSHA384WithRSA: begin Name := 'SHA384-RSA'; PubKeyAlgo := X509PkRSA; HashBits := 384; end;
+    X509SigSHA512WithRSA: begin Name := 'SHA512-RSA'; PubKeyAlgo := X509PkRSA; HashBits := 512; end;
+    X509SigSHA256WithRSAPSS: begin Name := 'SHA256-RSAPSS'; PubKeyAlgo := X509PkRSA; HashBits := 256; Pss := True; end;
+    X509SigSHA384WithRSAPSS: begin Name := 'SHA384-RSAPSS'; PubKeyAlgo := X509PkRSA; HashBits := 384; Pss := True; end;
+    X509SigSHA512WithRSAPSS: begin Name := 'SHA512-RSAPSS'; PubKeyAlgo := X509PkRSA; HashBits := 512; Pss := True; end;
+    X509SigDSAWithSHA1: begin Name := 'DSA-SHA1'; PubKeyAlgo := X509PkDSA; HashBits := 1; end;
+    X509SigDSAWithSHA256: begin Name := 'DSA-SHA256'; PubKeyAlgo := X509PkDSA; HashBits := 256; end;
+    X509SigECDSAWithSHA1: begin Name := 'ECDSA-SHA1'; PubKeyAlgo := X509PkECDSA; HashBits := 1; end;
+    X509SigECDSAWithSHA256: begin Name := 'ECDSA-SHA256'; PubKeyAlgo := X509PkECDSA; HashBits := 256; end;
+    X509SigECDSAWithSHA384: begin Name := 'ECDSA-SHA384'; PubKeyAlgo := X509PkECDSA; HashBits := 384; end;
+    X509SigECDSAWithSHA512: begin Name := 'ECDSA-SHA512'; PubKeyAlgo := X509PkECDSA; HashBits := 512; end;
+    X509SigPureEd25519: begin Name := 'Ed25519'; PubKeyAlgo := X509PkEd25519; end;
+    X509SigMLDSA44: begin Name := 'ML-DSA-44'; PubKeyAlgo := X509PkMLDSA; end;
+    X509SigMLDSA65: begin Name := 'ML-DSA-65'; PubKeyAlgo := X509PkMLDSA; end;
+    X509SigMLDSA87: begin Name := 'ML-DSA-87'; PubKeyAlgo := X509PkMLDSA; end;
+  end;
+end;
+
+function PkAlgName(A: Integer): string;
+begin
+  case A of
+    X509PkRSA: Result := 'RSA';
+    X509PkDSA: Result := 'DSA';
+    X509PkECDSA: Result := 'ECDSA';
+    X509PkEd25519: Result := 'Ed25519';
+    X509PkMLDSA: Result := 'ML-DSA';
+  else
+    Result := IntStr(A);
+  end;
+end;
+
+{ the type %T prints for a parsed public key }
+function PkTypeName(C: TX509Cert): string;
+begin
+  case C.PublicKeyAlgorithm of
+    X509PkRSA: Result := '*rsa.PublicKey';
+    X509PkDSA: Result := '*dsa.PublicKey';
+    X509PkECDSA: Result := '*ecdsa.PublicKey';
+    X509PkEd25519: Result := 'ed25519.PublicKey';
+    X509PkMLDSA: Result := '*mldsa.PublicKey';
+  else
+    Result := '<nil>';
+  end;
+end;
+
+{ ---- the public key (parser.go parsePublicKey) ---- }
+
+{ A > B for big-endian strings of one length }
+function BytesGE(const A, B: string): Boolean;
+var
+  i: Integer;
+begin
+  for i := 1 to Length(A) do
+    if A[i] <> B[i] then
+    begin
+      Result := Ord(A[i]) > Ord(B[i]);
+      Exit;
+    end;
+  Result := True;
+end;
+
+function UnHexStr(const H: string): string;
+var
+  i, a, b: Integer;
+begin
+  SetLength(Result, Length(H) div 2);
+  for i := 1 to Length(H) div 2 do
+  begin
+    a := Pos(H[2 * i - 1], HexDigits) - 1;
+    b := Pos(H[2 * i], HexDigits) - 1;
+    Result[i] := Chr(a * 16 + b);
+  end;
+end;
+
+{ ecdsa.ParseUncompressedPublicKey and nistec SetBytes: the form, the
+  coordinates below p, the point on the curve (pasnist for P-256 and
+  P-384; for P-224 and P-521 the form only) }
+function ParseEcPoint(Curve: Integer; const Data: string; out Err: string): Boolean;
+var
+  el: Integer;
+  nm, p: string;
+begin
+  Result := False;
+  Err := '';
+  if (Length(Data) < 1) or (Data[1] <> #4) then
+  begin
+    Err := 'ecdsa: invalid uncompressed public key';
+    Exit;
+  end;
+  case Curve of
+    X509CurveP224: begin el := 28; nm := 'P224'; end;
+    X509CurveP256: begin el := 32; nm := 'P256'; end;
+    X509CurveP384: begin el := 48; nm := 'P384'; end;
+  else
+    begin el := 66; nm := 'P521'; end;
+  end;
+  if Length(Data) <> 1 + 2 * el then
+  begin
+    Err := 'invalid ' + nm + ' point encoding';
+    Exit;
+  end;
+  if (Curve = X509CurveP256) or (Curve = X509CurveP384) then
+  begin
+    if Curve = X509CurveP256 then
+      p := UnHexStr(PrimeP256Hex)
+    else
+      p := UnHexStr(PrimeP384Hex);
+    if BytesGE(Copy(Data, 2, el), p) or BytesGE(Copy(Data, 2 + el, el), p) then
+    begin
+      Err := 'invalid ' + nm + ' element encoding';
+      Exit;
+    end;
+    if Curve = X509CurveP256 then
+      Result := NistPointValid(NistP256, Data)
+    else
+      Result := NistPointValid(NistP384, Data);
+    if not Result then
+      Err := nm + ' point not on curve';
+    Exit;
+  end;
+  Result := True;
+end;
+
+{ the magnitude of a non-negative INTEGER's content octets }
+function StripZeros(const V: string): string;
+var
+  i: Integer;
+begin
+  i := 1;
+  while (i < Length(V)) and (V[i] = #0) do
+    Inc(i);
+  Result := Copy(V, i, Length(V) - i + 1);
+end;
+
+function BigSign(const V: string): Integer;
+var
+  i: Integer;
+begin
+  if Length(V) = 0 then
+  begin
+    Result := 0;
+    Exit;
+  end;
+  if (Ord(V[1]) and $80) <> 0 then
+  begin
+    Result := -1;
+    Exit;
+  end;
+  Result := 0;
+  for i := 1 to Length(V) do
+    if V[i] <> #0 then
+      Result := 1;
+end;
+
+function ParsePublicKey(C: TX509Cert; const Oid, Params, Data: string; out Err: string): Boolean;
+var
+  d, pd: TDer;
+  n, y, pp, q, g, curveOid: string;
+  e: Integer;
+begin
+  Result := False;
+  Err := '';
+  if Oid = OidPkRSA then
+  begin
+    if Params <> NullBytes then
+    begin
+      Err := 'x509: RSA key missing NULL parameters';
+      Exit;
+    end;
+    d := DerOf(Data);
+    if not DerRead(d, d, TagSequence) then
+    begin
+      Err := 'x509: invalid RSA public key';
+      Exit;
+    end;
+    if not DerReadBigInt(d, n) then
+    begin
+      Err := 'x509: invalid RSA modulus';
+      Exit;
+    end;
+    if not DerReadInt64(d, e) then
+    begin
+      Err := 'x509: invalid RSA public exponent';
+      Exit;
+    end;
+    if BigSign(n) <= 0 then
+    begin
+      Err := 'x509: RSA modulus is not a positive number';
+      Exit;
+    end;
+    if e <= 0 then
+    begin
+      Err := 'x509: RSA public exponent is not a positive number';
+      Exit;
+    end;
+    C.RsaN := StripZeros(n);
+    C.RsaE := e;
+    C.HasPublicKey := True;
+    Result := True;
+  end
+  else if Oid = OidPkECDSA then
+  begin
+    pd := DerOf(Params);
+    if not DerReadOid(pd, curveOid) then
+    begin
+      Err := 'x509: invalid ECDSA parameters';
+      Exit;
+    end;
+    if curveOid = OidCurveP224 then C.EcCurve := X509CurveP224
+    else if curveOid = OidCurveP256 then C.EcCurve := X509CurveP256
+    else if curveOid = OidCurveP384 then C.EcCurve := X509CurveP384
+    else if curveOid = OidCurveP521 then C.EcCurve := X509CurveP521
+    else
+    begin
+      Err := 'x509: unsupported elliptic curve';
+      Exit;
+    end;
+    if not ParseEcPoint(C.EcCurve, Data, Err) then
+      Exit;
+    C.EcPoint := Data;
+    C.HasPublicKey := True;
+    Result := True;
+  end
+  else if Oid = OidPkEd25519 then
+  begin
+    if Length(Params) <> 0 then
+    begin
+      Err := 'x509: Ed25519 key encoded with illegal parameters';
+      Exit;
+    end;
+    if Length(Data) <> 32 then
+    begin
+      Err := 'x509: wrong Ed25519 public key size';
+      Exit;
+    end;
+    C.KeyBytes := Data;
+    C.HasPublicKey := True;
+    Result := True;
+  end
+  else if (Oid = OidPkMLDSA44) or (Oid = OidPkMLDSA65) or (Oid = OidPkMLDSA87) then
+  begin
+    if Length(Params) <> 0 then
+    begin
+      Err := 'x509: ML-DSA key encoded with illegal parameters';
+      Exit;
+    end;
+    if ((Oid = OidPkMLDSA44) and (Length(Data) <> 1312)) or ((Oid = OidPkMLDSA65) and (Length(Data) <> 1952)) or
+      ((Oid = OidPkMLDSA87) and (Length(Data) <> 2592)) then
+    begin
+      Err := 'mldsa: invalid public key length';
+      Exit;
+    end;
+    C.KeyBytes := Data;
+    C.HasPublicKey := True;
+    Result := True;
+  end
+  else if Oid = OidPkDSA then
+  begin
+    d := DerOf(Data);
+    if not DerReadBigInt(d, y) then
+    begin
+      Err := 'x509: invalid DSA public key';
+      Exit;
+    end;
+    pd := DerOf(Params);
+    if not DerRead(pd, pd, TagSequence) or not DerReadBigInt(pd, pp) or not DerReadBigInt(pd, q) or not DerReadBigInt(pd, g) then
+    begin
+      Err := 'x509: invalid DSA parameters';
+      Exit;
+    end;
+    if (BigSign(y) <= 0) or (BigSign(pp) <= 0) or (BigSign(q) <= 0) or (BigSign(g) <= 0) then
+    begin
+      Err := 'x509: zero or negative DSA parameter';
+      Exit;
+    end;
+    C.KeyBytes := y;
+    C.HasPublicKey := True;
+    Result := True;
+  end
+  else
+    Err := 'x509: unknown public key algorithm';
+end;
+
+{ ---- extensions (parser.go processExtensions and its parsers) ---- }
+
+{ domainNameValid of parser.go, the checks Go enables today }
+function DomainNameValid(const S0: string; Constraint: Boolean): Boolean;
+var
+  s: string;
+  i, lastDot, labelLen: Integer;
+begin
+  Result := True;
+  if Length(S0) = 0 then
+    Exit;
+  Result := False;
+  if S0[Length(S0)] = '.' then
+    Exit;
+  s := S0;
+  lastDot := -1;
+  if Constraint and (s[1] = '.') then
+    s := Copy(s, 2, Length(s) - 1);
+  for i := 0 to Length(s) do
+  begin
+    if (i < Length(s)) and ((Ord(s[i + 1]) < 33) or (Ord(s[i + 1]) > 126)) then
+      Exit;
+    if (i = Length(s)) or (s[i + 1] = '.') then
+    begin
+      labelLen := i;
+      if lastDot >= 0 then
+        labelLen := labelLen - (lastDot + 1);
+      if labelLen = 0 then
+        Exit;
+      lastDot := i;
+    end;
+  end;
+  Result := True;
+end;
+
+type
+  { rfc2821Mailbox of verify.go }
+  TMailbox = record
+    Local, Domain: string;
+  end;
+
+{ parseRFC2821Mailbox of verify.go (RFC 2821 4.1.2, RFC 3696) }
+function ParseMailbox(const In0: string; out M: TMailbox): Boolean;
+var
+  s, local: string;
+  c: Integer;
+  p: Integer;
+  ok: Boolean;
+begin
+  Result := False;
+  M.Local := '';
+  M.Domain := '';
+  if Length(In0) = 0 then
+    Exit;
+  s := In0;
+  local := '';
+  p := 1;
+  if s[1] = '"' then
+  begin
+    p := 2;
+    while True do
+    begin
+      if p > Length(s) then
+        Exit;
+      c := Ord(s[p]);
+      Inc(p);
+      if c = Ord('"') then
+        Break
+      else if c = Ord('\') then
+      begin
+        if p > Length(s) then
+          Exit;
+        c := Ord(s[p]);
+        if (c = 11) or (c = 12) or ((c >= 1) and (c <= 9)) or ((c >= 14) and (c <= 127)) then
+        begin
+          local := local + Chr(c);
+          Inc(p);
+        end
+        else
+          Exit;
+      end
+      else if (c = 11) or (c = 12) or (c = 32) or (c = 33) or (c = 127) or ((c >= 1) and (c <= 8)) or
+        ((c >= 14) and (c <= 31)) or ((c >= 35) and (c <= 91)) or ((c >= 93) and (c <= 126)) then
+        local := local + Chr(c)
+      else
+        Exit;
+    end;
+  end
+  else
+  begin
+    while p <= Length(s) do
+    begin
+      c := Ord(s[p]);
+      ok := False;
+      if c = Ord('\') then
+      begin
+        Inc(p);
+        if p > Length(s) then
+          Exit;
+        ok := True;
+      end
+      else if ((c >= Ord('0')) and (c <= Ord('9'))) or ((c >= Ord('a')) and (c <= Ord('z'))) or
+        ((c >= Ord('A')) and (c <= Ord('Z'))) or (Pos(Chr(c), '!#$%&''*+-/=?^_`{|}~.') > 0) then
+        ok := True;
+      if not ok then
+        Break;
+      local := local + s[p];
+      Inc(p);
+    end;
+    if Length(local) = 0 then
+      Exit;
+    if (local[1] = '.') or (local[Length(local)] = '.') or (Pos('..', local) > 0) then
+      Exit;
+  end;
+  if (p > Length(s)) or (s[p] <> '@') then
+    Exit;
+  Inc(p);
+  s := Copy(s, p, Length(s) - p + 1);
+  if not DomainNameValid(s, False) then
+    Exit;
+  if ContainsByte(s, '@') then
+    Exit;
+  M.Local := local;
+  M.Domain := s;
+  Result := True;
+end;
+
+function OidIn(const Oid: string; C: TX509Cert): Boolean;
+var
+  i: Integer;
+begin
+  Result := True;
+  for i := 0 to High(C.Extensions) do
+    if C.Extensions[i].Id = Oid then
+      Exit;
+  Result := False;
+end;
+
+function HasSANExtension(C: TX509Cert): Boolean;
+begin
+  Result := OidIn(OidExtSAN, C);
+end;
+
+function HasNameConstraints(C: TX509Cert): Boolean;
+begin
+  Result := OidIn(OidExtNameConstraints, C);
+end;
+
+{ parseKeyUsageExtension }
+function ParseKeyUsage(D: TDer; out Usage: Integer; out Err: string): Boolean;
+var
+  bytes: string;
+  bl, i: Integer;
+begin
+  Usage := 0;
+  Err := '';
+  Result := False;
+  if not DerReadBitString(D, bytes, bl) then
+  begin
+    Err := 'x509: invalid key usage';
+    Exit;
+  end;
+  for i := 0 to 8 do
+    if BitAt(bytes, bl, i) <> 0 then
+      Usage := Usage or (1 shl i);
+  Result := True;
+end;
+
+{ parseBasicConstraintsExtension }
+function ParseBasicConstraints(D: TDer; out IsCA: Boolean; out MaxPathLen: Integer; out Err: string): Boolean;
+var
+  mpl: Integer;
+begin
+  Result := False;
+  IsCA := False;
+  MaxPathLen := 0;
+  Err := 'x509: invalid basic constraints';
+  if not DerRead(D, D, TagSequence) then
+    Exit;
+  if DerPeek(D, TagBoolean) then
+    if not DerReadBool(D, IsCA) then
+      Exit;
+  MaxPathLen := -1;
+  if DerPeek(D, TagInteger) then
+  begin
+    if not DerReadUintMax(D, mpl) then
+    begin
+      MaxPathLen := 0;
+      IsCA := False;
+      Exit;
+    end;
+    MaxPathLen := mpl;
+  end;
+  Err := '';
+  Result := True;
+end;
+
+{ parseSANExtension over forEachSAN }
+function ParseSAN(C: TX509Cert; D: TDer; out Err: string): Boolean;
+var
+  san: TDer;
+  tag: Integer;
+  data, e2: string;
+  u: TUrl;
+begin
+  Result := False;
+  Err := '';
+  if not DerRead(D, D, TagSequence) then
+  begin
+    Err := 'x509: invalid subject alternative names';
+    Exit;
+  end;
+  while not DerEmpty(D) do
+  begin
+    if not DerReadAny(D, san, tag) then
+    begin
+      Err := 'x509: invalid subject alternative name';
+      Exit;
+    end;
+    data := DerStr(san);
+    case tag xor $80 of
+      1:
+        begin
+          if not IsIA5(data) then
+          begin
+            Err := 'x509: SAN rfc822Name is malformed';
+            Exit;
+          end;
+          C.EmailAddresses := Append(C.EmailAddresses, data);
+        end;
+      2:
+        begin
+          if not IsIA5(data) then
+          begin
+            Err := 'x509: SAN dNSName is malformed';
+            Exit;
+          end;
+          C.DNSNames := Append(C.DNSNames, data);
+        end;
+      6:
+        begin
+          if not IsIA5(data) then
+          begin
+            Err := 'x509: SAN uniformResourceIdentifier is malformed';
+            Exit;
+          end;
+          if not UrlParse(data, u, e2) then
+          begin
+            Err := 'x509: cannot parse URI ' + X509Quote(data) + ': ' + e2;
+            Exit;
+          end;
+          if (Length(u.Host) > 0) and not DomainNameValid(u.Host, False) then
+          begin
+            Err := 'x509: cannot parse URI ' + X509Quote(data) + ': invalid domain';
+            Exit;
+          end;
+          C.URIs := Append(C.URIs, data);
+          C.URIHosts := Append(C.URIHosts, u.Host);
+        end;
+      7:
+        begin
+          if Length(data) = 16 then
+          begin
+            if IsV4Mapped(data) then
+            begin
+              Err := 'x509: SAN iPAddress contains IPv4-mapped IPv6 address';
+              Exit;
+            end;
+            C.IPAddresses := Append(C.IPAddresses, data);
+          end
+          else if Length(data) = 4 then
+            C.IPAddresses := Append(C.IPAddresses, data)
+          else
+          begin
+            Err := 'x509: cannot parse IP address of length ' + IntStr(Length(data));
+            Exit;
+          end;
+        end;
+    end;
+  end;
+  Result := True;
+end;
+
+{ isValidIPMask }
+function ValidIPMask(const Mask: string): Boolean;
+var
+  seenZero: Boolean;
+  i, b: Integer;
+begin
+  Result := False;
+  seenZero := False;
+  for i := 1 to Length(Mask) do
+  begin
+    b := Ord(Mask[i]);
+    if seenZero then
+    begin
+      if b <> 0 then
+        Exit;
+      Continue;
+    end;
+    case b of
+      $00, $80, $C0, $E0, $F0, $F8, $FC, $FE: seenZero := True;
+      $FF: ;
+    else
+      Exit;
+    end;
+  end;
+  Result := True;
+end;
+
+{ getValues of parseNameConstraintsExtension: one GeneralSubtrees }
+function NameConstraintValues(Sub: TDer; var DNS: TX509Strings; var IPs: TX509IPNets; var Emails, URIDoms: TX509Strings;
+  var Unhandled: Boolean; out Err: string): Boolean;
+var
+  seq, value: TDer;
+  tag: Integer;
+  v, ip, mask: string;
+  m: TMailbox;
+  net1: TX509IPNet;
+begin
+  Result := False;
+  Err := '';
+  while not DerEmpty(Sub) do
+  begin
+    if not DerRead(Sub, seq, TagSequence) or not DerReadAny(seq, value, tag) then
+    begin
+      Err := 'x509: invalid NameConstraints extension';
+      Exit;
+    end;
+    v := DerStr(value);
+    case tag of
+      $82:
+        begin
+          if not IsIA5(v) then
+          begin
+            Err := 'x509: invalid constraint value: ' + IA5Err(v);
+            Exit;
+          end;
+          if not DomainNameValid(v, True) then
+          begin
+            Err := 'x509: failed to parse dnsName constraint ' + X509Quote(v);
+            Exit;
+          end;
+          DNS := Append(DNS, v);
+        end;
+      $87:
+        begin
+          if Length(v) = 8 then
+          begin
+            ip := Copy(v, 1, 4);
+            mask := Copy(v, 5, 4);
+          end
+          else if Length(v) = 32 then
+          begin
+            ip := Copy(v, 1, 16);
+            mask := Copy(v, 17, 16);
+          end
+          else
+          begin
+            Err := 'x509: IP constraint contained value of length ' + IntStr(Length(v));
+            Exit;
+          end;
+          if not ValidIPMask(mask) then
+          begin
+            Err := 'x509: IP constraint contained invalid mask ' + HexOf(mask);
+            Exit;
+          end;
+          if (Length(ip) = 16) and IsV4Mapped(ip) then
+          begin
+            Err := 'x509: IP constraint contained IPv4-mapped IPv6 address';
+            Exit;
+          end;
+          net1.IP := ip;
+          net1.Mask := mask;
+          IPs := Append(IPs, net1);
+        end;
+      $81:
+        begin
+          if not IsIA5(v) then
+          begin
+            Err := 'x509: invalid constraint value: ' + IA5Err(v);
+            Exit;
+          end;
+          if ContainsByte(v, '@') then
+          begin
+            if not ParseMailbox(v, m) then
+            begin
+              Err := 'x509: failed to parse rfc822Name constraint ' + X509Quote(v);
+              Exit;
+            end;
+          end
+          else if not DomainNameValid(v, True) then
+          begin
+            Err := 'x509: failed to parse rfc822Name constraint ' + X509Quote(v);
+            Exit;
+          end;
+          Emails := Append(Emails, v);
+        end;
+      $86:
+        begin
+          if not IsIA5(v) then
+          begin
+            Err := 'x509: invalid constraint value: ' + IA5Err(v);
+            Exit;
+          end;
+          if ParseIPNet(v) <> '' then
+          begin
+            Err := 'x509: failed to parse URI constraint ' + X509Quote(v) + ': cannot be IP address';
+            Exit;
+          end;
+          if not DomainNameValid(v, True) then
+          begin
+            Err := 'x509: failed to parse URI constraint ' + X509Quote(v);
+            Exit;
+          end;
+          URIDoms := Append(URIDoms, v);
+        end;
+    else
+      Unhandled := True;
+    end;
+  end;
+  Result := True;
+end;
+
+{ parseNameConstraintsExtension (RFC 5280 4.2.1.10) }
+function ParseNameConstraints(C: TX509Cert; const E: TX509Extension; out Unhandled: Boolean; out Err: string): Boolean;
+var
+  outer, top, permitted, excluded: TDer;
+  havePermitted, haveExcluded: Boolean;
+begin
+  Result := False;
+  Unhandled := False;
+  Err := '';
+  outer := DerOf(E.Value);
+  permitted := outer;
+  permitted.E := permitted.P;
+  excluded := permitted;
+  if not DerRead(outer, top, TagSequence) or not DerEmpty(outer) or
+    not DerReadOptional(top, permitted, havePermitted, $A0) or
+    not DerReadOptional(top, excluded, haveExcluded, $A1) or not DerEmpty(top) then
+  begin
+    Err := 'x509: invalid NameConstraints extension';
+    Exit;
+  end;
+  if (not havePermitted and not haveExcluded) or ((DerLen(permitted) = 0) and (DerLen(excluded) = 0)) then
+  begin
+    Err := 'x509: empty name constraints extension';
+    Exit;
+  end;
+  if havePermitted then
+    if not NameConstraintValues(permitted, C.PermittedDNSDomains, C.PermittedIPRanges, C.PermittedEmailAddresses,
+      C.PermittedURIDomains, Unhandled, Err) then
+    begin
+      Unhandled := False;
+      Exit;
+    end;
+  if haveExcluded then
+    if not NameConstraintValues(excluded, C.ExcludedDNSDomains, C.ExcludedIPRanges, C.ExcludedEmailAddresses,
+      C.ExcludedURIDomains, Unhandled, Err) then
+    begin
+      Unhandled := False;
+      Exit;
+    end;
+  C.PermittedDNSDomainsCritical := E.Critical;
+  Result := True;
+end;
+
+{ extKeyUsageFromOID }
+function EkuFromOid(const Oid: string; out Eku: Integer): Boolean;
+const
+  Kp = #43#6#1#5#5#7#3;
+begin
+  Result := True;
+  if Oid = #85#29#37#0 then Eku := X509EkuAny
+  else if Oid = Kp + #1 then Eku := X509EkuServerAuth
+  else if Oid = Kp + #2 then Eku := X509EkuClientAuth
+  else if Oid = Kp + #3 then Eku := X509EkuCodeSigning
+  else if Oid = Kp + #4 then Eku := X509EkuEmailProtection
+  else if Oid = Kp + #5 then Eku := X509EkuIPSECEndSystem
+  else if Oid = Kp + #6 then Eku := X509EkuIPSECTunnel
+  else if Oid = Kp + #7 then Eku := X509EkuIPSECUser
+  else if Oid = Kp + #8 then Eku := X509EkuTimeStamping
+  else if Oid = Kp + #9 then Eku := X509EkuOCSPSigning
+  else if Oid = #43#6#1#4#1#130#55#10#3#3 then Eku := X509EkuMicrosoftServerGatedCrypto
+  else if Oid = #96#134#72#1#134#248#66#4#1 then Eku := X509EkuNetscapeServerGatedCrypto
+  else if Oid = #43#6#1#4#1#130#55#2#1#22 then Eku := X509EkuMicrosoftCommercialCodeSigning
+  else if Oid = #43#6#1#4#1#130#55#61#1#1 then Eku := X509EkuMicrosoftKernelCodeSigning
+  else
+  begin
+    Eku := -1;
+    Result := False;
+  end;
+end;
+
+{ newOIDFromDER }
+function OidDerValid(const D: string): Boolean;
+var
+  i, start: Integer;
+begin
+  Result := False;
+  if (Length(D) = 0) or ((Ord(D[Length(D)]) and $80) <> 0) then
+    Exit;
+  start := 1;
+  for i := 1 to Length(D) do
+  begin
+    if (i = start) and (Ord(D[i]) = $80) then
+      Exit;
+    if (Ord(D[i]) and $80) = 0 then
+      start := i + 1;
+  end;
+  Result := True;
+end;
+
+function InStrings(const S: string; const A: TX509Strings): Boolean;
+var
+  i: Integer;
+begin
+  Result := True;
+  for i := 0 to High(A) do
+    if A[i] = S then
+      Exit;
+  Result := False;
+end;
+
+{ processExtensions }
+function ProcessExtensions(C: TX509Cert; out Err: string): Boolean;
+var
+  i, n, eku, v: Integer;
+  e: TX509Extension;
+  unhandled: Boolean;
+  vl, dp, dpName, uri, cp, oidBytes, s, iss, sub, aia, kid: TDer;
+  present: Boolean;
+  method, oid: string;
+  pm: TX509PolicyMapping;
+  seen: TX509Strings;
+begin
+  Result := False;
+  Err := '';
+  for i := 0 to High(C.Extensions) do
+  begin
+    e := C.Extensions[i];
+    unhandled := False;
+    n := Length(e.Id);
+    if (n = 3) and (e.Id[1] = #85) and (e.Id[2] = #29) and (Ord(e.Id[3]) < $80) then
+    begin
+      case Ord(e.Id[3]) of
+        15:
+          if not ParseKeyUsage(DerOf(e.Value), C.KeyUsage, Err) then
+            Exit;
+        19:
+          begin
+            if not ParseBasicConstraints(DerOf(e.Value), C.IsCA, C.MaxPathLen, Err) then
+              Exit;
+            C.BasicConstraintsValid := True;
+            C.MaxPathLenZero := C.MaxPathLen = 0;
+          end;
+        17:
+          begin
+            if not ParseSAN(C, DerOf(e.Value), Err) then
+              Exit;
+            if (Length(C.DNSNames) = 0) and (Length(C.EmailAddresses) = 0) and (Length(C.IPAddresses) = 0) and (Length(C.URIs) = 0) then
+              unhandled := True;
+          end;
+        30:
+          if not ParseNameConstraints(C, e, unhandled, Err) then
+            Exit;
+        31:
+          begin
+            vl := DerOf(e.Value);
+            if not DerRead(vl, vl, TagSequence) then
+            begin
+              Err := 'x509: invalid CRL distribution points';
+              Exit;
+            end;
+            while not DerEmpty(vl) do
+            begin
+              if not DerRead(vl, dp, TagSequence) then
+              begin
+                Err := 'x509: invalid CRL distribution point';
+                Exit;
+              end;
+              dpName := dp;
+              dpName.E := dpName.P;
+              if not DerReadOptional(dp, dpName, present, $A0) then
+              begin
+                Err := 'x509: invalid CRL distribution point';
+                Exit;
+              end;
+              if not present then
+                Continue;
+              if not DerRead(dpName, dpName, $A0) then
+              begin
+                Err := 'x509: invalid CRL distribution point';
+                Exit;
+              end;
+              while not DerEmpty(dpName) do
+              begin
+                if not DerPeek(dpName, $86) then
+                  Break;
+                if not DerRead(dpName, uri, $86) then
+                begin
+                  Err := 'x509: invalid CRL distribution point';
+                  Exit;
+                end;
+                C.CRLDistributionPoints := Append(C.CRLDistributionPoints, DerStr(uri));
+              end;
+            end;
+          end;
+        35:
+          begin
+            if e.Critical then
+            begin
+              Err := 'x509: authority key identifier incorrectly marked critical';
+              Exit;
+            end;
+            vl := DerOf(e.Value);
+            if not DerRead(vl, kid, TagSequence) then
+            begin
+              Err := 'x509: invalid authority key identifier';
+              Exit;
+            end;
+            if DerPeek(kid, $80) then
+            begin
+              if not DerRead(kid, kid, $80) then
+              begin
+                Err := 'x509: invalid authority key identifier';
+                Exit;
+              end;
+              C.AuthorityKeyId := DerStr(kid);
+            end;
+          end;
+        36:
+          begin
+            vl := DerOf(e.Value);
+            if not DerRead(vl, vl, TagSequence) then
+            begin
+              Err := 'x509: invalid policy constraints extension';
+              Exit;
+            end;
+            if DerPeek(vl, $80) then
+            begin
+              if not DerReadInt64Tag(vl, v, $80) then
+              begin
+                Err := 'x509: invalid policy constraints extension';
+                Exit;
+              end;
+              C.RequireExplicitPolicy := v;
+              C.RequireExplicitPolicyZero := v = 0;
+            end;
+            if DerPeek(vl, $81) then
+            begin
+              if not DerReadInt64Tag(vl, v, $81) then
+              begin
+                Err := 'x509: invalid policy constraints extension';
+                Exit;
+              end;
+              C.InhibitPolicyMapping := v;
+              C.InhibitPolicyMappingZero := v = 0;
+            end;
+          end;
+        37:
+          begin
+            vl := DerOf(e.Value);
+            if not DerRead(vl, vl, TagSequence) then
+            begin
+              Err := 'x509: invalid extended key usages';
+              Exit;
+            end;
+            while not DerEmpty(vl) do
+            begin
+              if not DerReadOid(vl, oid) then
+              begin
+                C.ExtKeyUsage := nil;
+                C.UnknownExtKeyUsage := nil;
+                Err := 'x509: invalid extended key usages';
+                Exit;
+              end;
+              if EkuFromOid(oid, eku) then
+                C.ExtKeyUsage := Append(C.ExtKeyUsage, eku)
+              else
+                C.UnknownExtKeyUsage := Append(C.UnknownExtKeyUsage, oid);
+            end;
+          end;
+        14:
+          begin
+            if e.Critical then
+            begin
+              Err := 'x509: subject key identifier incorrectly marked critical';
+              Exit;
+            end;
+            vl := DerOf(e.Value);
+            if not DerRead(vl, kid, TagOctetString) then
+            begin
+              Err := 'x509: invalid subject key identifier';
+              Exit;
+            end;
+            C.SubjectKeyId := DerStr(kid);
+          end;
+        32:
+          begin
+            seen := nil;
+            vl := DerOf(e.Value);
+            if not DerRead(vl, vl, TagSequence) then
+            begin
+              Err := 'x509: invalid certificate policies';
+              Exit;
+            end;
+            while not DerEmpty(vl) do
+            begin
+              if not DerRead(vl, cp, TagSequence) or not DerRead(cp, oidBytes, TagOid) then
+              begin
+                C.Policies := nil;
+                Err := 'x509: invalid certificate policies';
+                Exit;
+              end;
+              oid := DerStr(oidBytes);
+              if InStrings(oid, seen) then
+              begin
+                C.Policies := nil;
+                Err := 'x509: invalid certificate policies';
+                Exit;
+              end;
+              seen := Append(seen, oid);
+              if not OidDerValid(oid) then
+              begin
+                C.Policies := nil;
+                Err := 'x509: invalid certificate policies';
+                Exit;
+              end;
+              C.Policies := Append(C.Policies, oid);
+            end;
+          end;
+        33:
+          begin
+            vl := DerOf(e.Value);
+            if not DerRead(vl, vl, TagSequence) then
+            begin
+              Err := 'x509: invalid policy mappings extension';
+              Exit;
+            end;
+            while not DerEmpty(vl) do
+            begin
+              if not DerRead(vl, s, TagSequence) or not DerRead(s, iss, TagOid) or not DerRead(s, sub, TagOid) then
+              begin
+                Err := 'x509: invalid policy mappings extension';
+                Exit;
+              end;
+              pm.IssuerDomainPolicy := DerStr(iss);
+              pm.SubjectDomainPolicy := DerStr(sub);
+              C.PolicyMappings := Append(C.PolicyMappings, pm);
+            end;
+          end;
+        54:
+          begin
+            vl := DerOf(e.Value);
+            if not DerReadInt64(vl, v) then
+            begin
+              Err := 'x509: invalid inhibit any policy extension';
+              Exit;
+            end;
+            C.InhibitAnyPolicy := v;
+            C.InhibitAnyPolicyZero := v = 0;
+          end;
+      else
+        unhandled := True;
+      end;
+    end
+    else if e.Id = OidAIA then
+    begin
+      if e.Critical then
+      begin
+        Err := 'x509: authority info access incorrectly marked critical';
+        Exit;
+      end;
+      vl := DerOf(e.Value);
+      if not DerRead(vl, vl, TagSequence) then
+      begin
+        Err := 'x509: invalid authority info access';
+        Exit;
+      end;
+      while not DerEmpty(vl) do
+      begin
+        if not DerRead(vl, aia, TagSequence) then
+        begin
+          Err := 'x509: invalid authority info access';
+          Exit;
+        end;
+        if not DerReadOid(aia, method) then
+        begin
+          Err := 'x509: invalid authority info access';
+          Exit;
+        end;
+        if not DerPeek(aia, $86) then
+          Continue;
+        if not DerRead(aia, aia, $86) then
+        begin
+          Err := 'x509: invalid authority info access';
+          Exit;
+        end;
+        if method = OidAIAOcsp then
+          C.OCSPServer := Append(C.OCSPServer, DerStr(aia))
+        else if method = OidAIAIssuers then
+          C.IssuingCertificateURL := Append(C.IssuingCertificateURL, DerStr(aia));
+      end;
+    end
+    else
+      unhandled := True;
+    if e.Critical and unhandled then
+      C.UnhandledCriticalExtensions := Append(C.UnhandledCriticalExtensions, e.Id);
+  end;
+  Result := True;
+end;
+
+{ parseExtension }
+function ParseExtension(D: TDer; out E: TX509Extension; out Err: string): Boolean;
+var
+  v: TDer;
+begin
+  Result := False;
+  Err := '';
+  E.Id := '';
+  E.Critical := False;
+  E.Value := '';
+  if not DerReadOid(D, E.Id) then
+  begin
+    Err := 'x509: malformed extension OID field';
+    Exit;
+  end;
+  if DerPeek(D, TagBoolean) then
+    if not DerReadBool(D, E.Critical) then
+    begin
+      Err := 'x509: malformed extension critical field';
+      Exit;
+    end;
+  if not DerRead(D, v, TagOctetString) then
+  begin
+    Err := 'x509: malformed extension value field';
+    Exit;
+  end;
+  E.Value := DerStr(v);
+  Result := True;
+end;
+
+{ parseCertificate of parser.go; Used is the length of the element read }
+function ParseCertificate(const Der: string; out Cert: TX509Cert; out Used: Integer; out Err: string): Boolean;
+var
+  c: TX509Cert;
+  input, tbs, sigAISeq, outerSigAISeq, issuerSeq, validity, subjectSeq, spki, pkAISeq, exts, ext, inner: TDer;
+  present: Boolean;
+  serial, sigOid, sigParams, pkOid, pkParams, spkBytes, sigBytes: string;
+  spkBits, sigBits, ver: Integer;
+  e: TX509Extension;
+  seen: TX509Strings;
+  oidStr: string;
+begin
+  Result := False;
+  Cert := nil;
+  Used := 0;
+  Err := '';
+  c := TX509Cert.Create;
+  input := DerOf(Der);
+  if not DerReadElement(input, input, TagSequence) then
+  begin
+    Err := 'x509: malformed certificate';
+    Exit;
+  end;
+  c.Raw := DerStr(input);
+  Used := DerLen(input);
+  if not DerRead(input, input, TagSequence) then
+  begin
+    Err := 'x509: malformed certificate';
+    Exit;
+  end;
+  if not DerReadElement(input, tbs, TagSequence) then
+  begin
+    Err := 'x509: malformed tbs certificate';
+    Exit;
+  end;
+  c.RawTBSCertificate := DerStr(tbs);
+  if not DerRead(tbs, tbs, TagSequence) then
+  begin
+    Err := 'x509: malformed tbs certificate';
+    Exit;
+  end;
+  { ReadOptionalASN1Integer(&cert.Version, [0] EXPLICIT, 0) }
+  ver := 0;
+  if DerPeek(tbs, $A0) then
+  begin
+    if not DerRead(tbs, inner, $A0) or not DerReadInt64(inner, ver) or not DerEmpty(inner) then
+    begin
+      Err := 'x509: malformed version';
+      Exit;
+    end;
+  end;
+  if ver < 0 then
+  begin
+    Err := 'x509: malformed version';
+    Exit;
+  end;
+  c.Version := ver + 1;
+  if c.Version > 3 then
+  begin
+    Err := 'x509: invalid version';
+    Exit;
+  end;
+  if not DerReadBigInt(tbs, serial) then
+  begin
+    Err := 'x509: malformed serial number';
+    Exit;
+  end;
+  if BigSign(serial) = -1 then
+  begin
+    Err := 'x509: negative serial number';
+    Exit;
+  end;
+  c.SerialNumber := serial;
+  if not DerReadElement(tbs, sigAISeq, TagSequence) then
+  begin
+    Err := 'x509: malformed signature algorithm identifier';
+    Exit;
+  end;
+  if not DerRead(sigAISeq, sigAISeq, TagSequence) then
+  begin
+    Err := 'x509: malformed signature algorithm identifier';
+    Exit;
+  end;
+  if not DerRead(input, outerSigAISeq, TagSequence) then
+  begin
+    Err := 'x509: malformed algorithm identifier';
+    Exit;
+  end;
+  if DerStr(outerSigAISeq) <> DerStr(sigAISeq) then
+  begin
+    Err := 'x509: inner and outer signature algorithm identifiers don''t match';
+    Exit;
+  end;
+  if not ParseAI(sigAISeq, sigOid, sigParams, Err) then
+    Exit;
+  c.SignatureAlgorithm := SigAlgFromAI(sigOid, sigParams);
+  if not DerReadElement(tbs, issuerSeq, TagSequence) then
+  begin
+    Err := 'x509: malformed issuer';
+    Exit;
+  end;
+  c.RawIssuer := DerStr(issuerSeq);
+  if not ParseName(issuerSeq, c.IssuerCommonName, c.IssuerOrganization, Err) then
+    Exit;
+  if not DerRead(tbs, validity, TagSequence) then
+  begin
+    Err := 'x509: malformed validity';
+    Exit;
+  end;
+  if not ReadAsn1Time(validity, c.NotBefore, c.NotBeforeOffset, Err) then
+    Exit;
+  if not ReadAsn1Time(validity, c.NotAfter, c.NotAfterOffset, Err) then
+    Exit;
+  if not DerReadElement(tbs, subjectSeq, TagSequence) then
+  begin
+    Err := 'x509: malformed issuer';
+    Exit;
+  end;
+  c.RawSubject := DerStr(subjectSeq);
+  if not ParseName(subjectSeq, c.SubjectCommonName, c.SubjectOrganization, Err) then
+    Exit;
+  if not DerReadElement(tbs, spki, TagSequence) then
+  begin
+    Err := 'x509: malformed spki';
+    Exit;
+  end;
+  c.RawSubjectPublicKeyInfo := DerStr(spki);
+  if not DerRead(spki, spki, TagSequence) then
+  begin
+    Err := 'x509: malformed spki';
+    Exit;
+  end;
+  if not DerRead(spki, pkAISeq, TagSequence) then
+  begin
+    Err := 'x509: malformed public key algorithm identifier';
+    Exit;
+  end;
+  if not ParseAI(pkAISeq, pkOid, pkParams, Err) then
+    Exit;
+  c.PublicKeyAlgorithm := PkAlgFromOid(pkOid);
+  if not DerReadBitString(spki, spkBytes, spkBits) then
+  begin
+    Err := 'x509: malformed subjectPublicKey';
+    Exit;
+  end;
+  if c.PublicKeyAlgorithm <> X509PkUnknown then
+    if not ParsePublicKey(c, pkOid, pkParams, RightAlign(spkBytes, spkBits), Err) then
+      Exit;
+  if c.Version > 1 then
+  begin
+    if not DerSkipOptional(tbs, $81) then
+    begin
+      Err := 'x509: malformed issuerUniqueID';
+      Exit;
+    end;
+    if not DerSkipOptional(tbs, $82) then
+    begin
+      Err := 'x509: malformed subjectUniqueID';
+      Exit;
+    end;
+    if c.Version = 3 then
+    begin
+      exts := tbs;
+      exts.E := exts.P;
+      if not DerReadOptional(tbs, exts, present, $A3) then
+      begin
+        Err := 'x509: malformed extensions';
+        Exit;
+      end;
+      if present then
+      begin
+        seen := nil;
+        if not DerRead(exts, exts, TagSequence) then
+        begin
+          Err := 'x509: malformed extensions';
+          Exit;
+        end;
+        while not DerEmpty(exts) do
+        begin
+          if not DerRead(exts, ext, TagSequence) then
+          begin
+            Err := 'x509: malformed extension';
+            Exit;
+          end;
+          if not ParseExtension(ext, e, Err) then
+            Exit;
+          oidStr := X509OidString(e.Id);
+          if InStrings(oidStr, seen) then
+          begin
+            Err := 'x509: certificate contains duplicate extension with OID ' + X509Quote(oidStr);
+            Exit;
+          end;
+          seen := Append(seen, oidStr);
+          c.Extensions := Append(c.Extensions, e);
+        end;
+        if not ProcessExtensions(c, Err) then
+          Exit;
+      end;
+    end;
+  end;
+  if not DerReadBitString(input, sigBytes, sigBits) then
+  begin
+    Err := 'x509: malformed signature';
+    Exit;
+  end;
+  c.Signature := RightAlign(sigBytes, sigBits);
+  Cert := c;
+  Result := True;
+end;
+
+function X509Parse(const Der: string; out Cert: TX509Cert; out Err: string): Boolean;
+var
+  used: Integer;
+begin
+  Result := ParseCertificate(Der, Cert, used, Err);
+  if Result and (Length(Der) <> Length(Cert.Raw)) then
+  begin
+    Cert := nil;
+    Err := 'x509: trailing data';
+    Result := False;
+  end;
+end;
+
+{ ---- signatures (x509.go CheckSignatureFrom, checkSignature) ---- }
+
+function BitLenOf(const N: string): Integer;
+var
+  b: Integer;
+begin
+  Result := 0;
+  if Length(N) = 0 then
+    Exit;
+  b := Ord(N[1]);
+  Result := (Length(N) - 1) * 8;
+  while b > 0 do
+  begin
+    Inc(Result);
+    b := b shr 1;
+  end;
+end;
+
+{ crypto/rsa's checks before a verification (checkPublicKeySize, then
+  checkPublicKey of the FIPS module) }
+function RsaKeyErr(Parent: TX509Cert): string;
+var
+  bits: Integer;
+begin
+  Result := '';
+  bits := BitLenOf(Parent.RsaN);
+  if bits < 1024 then
+    Result := 'crypto/rsa: ' + IntStr(bits) + '-bit keys are insecure (see https://go.dev/pkg/crypto/rsa#hdr-Minimum_key_size)'
+  else if (Ord(Parent.RsaN[Length(Parent.RsaN)]) and 1) = 0 then
+    Result := 'crypto/rsa: public modulus is even'
+  else if Parent.RsaE < 2 then
+    Result := 'crypto/rsa: public exponent too small or negative'
+  else if (Parent.RsaE and 1) = 0 then
+    Result := 'crypto/rsa: public exponent is even'
+  else if Parent.RsaE > $7FFFFFFF then
+    Result := 'crypto/rsa: public exponent too large';
+end;
+
+{ checkSignature with allowSHA1 false, as CheckSignatureFrom calls it }
+function CheckSignature(Algo: Integer; const Signed, Signature: string; Parent: TX509Cert): string;
+var
+  name, hashed, rk: string;
+  pubKeyAlgo, hashBits, rh: Integer;
+  pss, ok: Boolean;
+begin
+  Result := '';
+  SigAlgDetails(Algo, name, pubKeyAlgo, hashBits, pss);
+  hashed := '';
+  case hashBits of
+    0:
+      if (pubKeyAlgo <> X509PkEd25519) and (pubKeyAlgo <> X509PkMLDSA) then
+      begin
+        Result := ErrUnsupportedAlgorithm;
+        Exit;
+      end;
+    1, 2:
+      begin
+        Result := 'x509: cannot verify signature: insecure algorithm ' + name;
+        Exit;
+      end;
+    256: hashed := Sha256(Signed);
+    384: hashed := Sha384(Signed);
+    512: hashed := Sha512(Signed);
+  end;
+  if not Parent.HasPublicKey then
+  begin
+    Result := ErrUnsupportedAlgorithm;
+    Exit;
+  end;
+  case Parent.PublicKeyAlgorithm of
+    X509PkRSA:
+      begin
+        if pubKeyAlgo <> X509PkRSA then
+        begin
+          Result := 'x509: signature algorithm specifies an ' + PkAlgName(pubKeyAlgo) + ' public key, but have public key of type ' + PkTypeName(Parent);
+          Exit;
+        end;
+        rk := RsaKeyErr(Parent);
+        if rk <> '' then
+        begin
+          Result := rk;
+          Exit;
+        end;
+        case hashBits of
+          256: rh := RsaSha256;
+          384: rh := RsaSha384;
+        else
+          rh := RsaSha512;
+        end;
+        if pss then
+          ok := RsaVerifyPss(Parent.RsaN, Parent.RsaE, rh, hashed, Signature, hashBits div 8)
+        else
+          ok := RsaVerifyPkcs1v15(Parent.RsaN, Parent.RsaE, rh, hashed, Signature);
+        if not ok then
+          Result := 'crypto/rsa: verification error';
+      end;
+    X509PkECDSA:
+      begin
+        if pubKeyAlgo <> X509PkECDSA then
+        begin
+          Result := 'x509: signature algorithm specifies an ' + PkAlgName(pubKeyAlgo) + ' public key, but have public key of type ' + PkTypeName(Parent);
+          Exit;
+        end;
+        if Parent.EcCurve = X509CurveP256 then
+          ok := NistEcdsaVerifyAsn1(NistP256, Parent.EcPoint, hashed, Signature)
+        else if Parent.EcCurve = X509CurveP384 then
+          ok := NistEcdsaVerifyAsn1(NistP384, Parent.EcPoint, hashed, Signature)
+        else
+        begin
+          { P-224 and P-521 are parsed but not verified here }
+          Result := ErrUnsupportedAlgorithm;
+          Exit;
+        end;
+        if not ok then
+          Result := 'x509: ECDSA verification failure';
+      end;
+    X509PkEd25519, X509PkMLDSA:
+      begin
+        if pubKeyAlgo <> Parent.PublicKeyAlgorithm then
+        begin
+          Result := 'x509: signature algorithm specifies an ' + PkAlgName(pubKeyAlgo) + ' public key, but have public key of type ' + PkTypeName(Parent);
+          Exit;
+        end;
+        { Ed25519 and ML-DSA signatures are not verified by this unit }
+        Result := ErrUnsupportedAlgorithm;
+      end;
+  else
+    Result := ErrUnsupportedAlgorithm;
+  end;
+end;
+
+function X509CheckSignatureFrom(Cert, Parent: TX509Cert): string;
+begin
+  if ((Parent.Version = 3) and not Parent.BasicConstraintsValid) or (Parent.BasicConstraintsValid and not Parent.IsCA) then
+  begin
+    Result := ErrConstraintViolation;
+    Exit;
+  end;
+  if (Parent.KeyUsage <> 0) and ((Parent.KeyUsage and X509KuCertSign) = 0) then
+  begin
+    Result := ErrConstraintViolation;
+    Exit;
+  end;
+  if Parent.PublicKeyAlgorithm = X509PkUnknown then
+  begin
+    Result := ErrUnsupportedAlgorithm;
+    Exit;
+  end;
+  Result := CheckSignature(Cert.SignatureAlgorithm, Cert.RawTBSCertificate, Cert.Signature, Parent);
+end;
+
+{ ---- host names (verify.go validHostname, matchHostnames,
+  VerifyHostname, HostnameError) ---- }
+
+{ validHostname (RFC 6125 2.2, with Go's leniency) }
+function ValidHostname(const Host0: string; IsPattern: Boolean): Boolean;
+var
+  host: string;
+  parts: TX509Strings;
+  i, j: Integer;
+  c: Char;
+  part: string;
+begin
+  Result := False;
+  host := Host0;
+  if not IsPattern then
+    host := TrimSuffixDot(host);
+  if Length(host) = 0 then
+    Exit;
+  if host = '*' then
+    Exit;
+  parts := SplitChar(host, '.');
+  for i := 0 to High(parts) do
+  begin
+    part := parts[i];
+    if part = '' then
+      Exit;
+    if IsPattern and (i = 0) and (part = '*') then
+      Continue;
+    for j := 1 to Length(part) do
+    begin
+      c := part[j];
+      if (c >= 'a') and (c <= 'z') then Continue;
+      if (c >= '0') and (c <= '9') then Continue;
+      if (c >= 'A') and (c <= 'Z') then Continue;
+      if (c = '-') and (j <> 1) then Continue;
+      if c = '_' then Continue;
+      Exit;
+    end;
+  end;
+  Result := True;
+end;
+
+function MatchExactly(const A, B: string): Boolean;
+begin
+  if (A = '') or (A = '.') or (B = '') or (B = '.') then
+    Result := False
+  else
+    Result := LowerASCII(A) = LowerASCII(B);
+end;
+
+function MatchHostnames(const Pattern0: string; const HostParts: TX509Strings): Boolean;
+var
+  pattern: string;
+  pp: TX509Strings;
+  i: Integer;
+begin
+  Result := False;
+  pattern := LowerASCII(Pattern0);
+  if (Length(pattern) = 0) or (Length(HostParts) = 0) then
+    Exit;
+  pp := SplitChar(pattern, '.');
+  if Length(pp) <> Length(HostParts) then
+    Exit;
+  for i := 0 to High(pp) do
+  begin
+    if (i = 0) and (pp[i] = '*') then
+      Continue;
+    if pp[i] <> HostParts[i] then
+      Exit;
+  end;
+  Result := True;
+end;
+
+function SplitHostname(const Host: string): TX509Strings;
+begin
+  Result := SplitChar(LowerASCII(TrimSuffixDot(Host)), '.');
+end;
+
+function JoinStrings(const A: TX509Strings; const Sep: string): string;
+var
+  i: Integer;
+begin
+  Result := '';
+  for i := 0 to High(A) do
+  begin
+    if i > 0 then
+      Result := Result + Sep;
+    Result := Result + A[i];
+  end;
+end;
+
+{ HostnameError.Error }
+function HostnameErrorText(C: TX509Cert; const Host: string): string;
+var
+  valid: string;
+  i: Integer;
+begin
+  if not HasSANExtension(C) and MatchHostnames(C.SubjectCommonName, SplitHostname(Host)) then
+  begin
+    Result := 'x509: certificate relies on legacy Common Name field, use SANs instead';
+    Exit;
+  end;
+  valid := '';
+  if ParseIPNet(Host) <> '' then
+  begin
+    if Length(C.IPAddresses) = 0 then
+    begin
+      Result := 'x509: cannot validate certificate for ' + Host + ' because it doesn''t contain any IP SANs';
+      Exit;
+    end;
+    if Length(C.IPAddresses) >= 100 then
+    begin
+      Result := 'x509: certificate is valid for ' + IntStr(Length(C.IPAddresses)) + ' IP SANs, but none matched ' + Host;
+      Exit;
+    end;
+    for i := 0 to High(C.IPAddresses) do
+    begin
+      if Length(valid) > 0 then
+        valid := valid + ', ';
+      valid := valid + X509IPString(C.IPAddresses[i]);
+    end;
+  end
+  else
+  begin
+    if Length(C.DNSNames) >= 100 then
+    begin
+      Result := 'x509: certificate is valid for ' + IntStr(Length(C.DNSNames)) + ' names, but none matched ' + Host;
+      Exit;
+    end;
+    valid := JoinStrings(C.DNSNames, ', ');
+  end;
+  if Length(valid) = 0 then
+    Result := 'x509: certificate is not valid for any names, but wanted to match ' + Host
+  else
+    Result := 'x509: certificate is valid for ' + valid + ', not ' + Host;
+end;
+
+function X509VerifyHostname(Cert: TX509Cert; const Host: string): string;
+var
+  candidateIP, ip, zone, err, candidateName: string;
+  validCandidate: Boolean;
+  hostParts: TX509Strings;
+  i: Integer;
+  match: string;
+begin
+  Result := '';
+  candidateIP := Host;
+  if (Length(Host) >= 3) and (Host[1] = '[') and (Host[Length(Host)] = ']') then
+    candidateIP := Copy(Host, 2, Length(Host) - 2);
+  if X509ParseAddr(candidateIP, ip, zone, err) then
+  begin
+    for i := 0 to High(Cert.IPAddresses) do
+      if IPEqual(ip, Cert.IPAddresses[i]) then
+        Exit;
+    Result := HostnameErrorText(Cert, X509IPString(ip));
+    Exit;
+  end;
+  candidateName := LowerASCII(Host);
+  validCandidate := ValidHostname(candidateName, False);
+  hostParts := SplitHostname(candidateName);
+  for i := 0 to High(Cert.DNSNames) do
+  begin
+    match := Cert.DNSNames[i];
+    if validCandidate and ValidHostname(match, True) then
+    begin
+      if MatchHostnames(match, hostParts) then
+        Exit;
+    end
+    else if MatchExactly(match, candidateName) then
+      Exit;
+  end;
+  Result := HostnameErrorText(Cert, Host);
+end;
+
+{ ---- the pool (cert_pool.go) ---- }
+
+constructor TX509Pool.Create;
+begin
+  Certs := nil;
+  New(ByName);
+  New(HaveSum);
+end;
+
+procedure TX509Pool.AddCert(C: TX509Cert);
+var
+  sum: string;
+begin
+  sum := Sha224(C.Raw);
+  if sum in HaveSum then
+    Exit;
+  HaveSum[sum] := True;
+  Certs := Append(Certs, C);
+  ByName[C.RawSubject] := Append(ByName[C.RawSubject], Length(Certs) - 1);
+end;
+
+function TX509Pool.HasCert(C: TX509Cert): Boolean;
+begin
+  Result := Sha224(C.Raw) in HaveSum;
+end;
+
+function TX509Pool.Count: Integer;
+begin
+  Result := Length(Certs);
+end;
+
+function TX509Pool.FindPotentialParents(C: TX509Cert): TX509Certs;
+var
+  idx: TX509Ints;
+  matching, oneKey, mismatch: TX509Certs;
+  i: Integer;
+  cand: TX509Cert;
+begin
+  Result := nil;
+  matching := nil;
+  oneKey := nil;
+  mismatch := nil;
+  if not TryGet(ByName, C.RawIssuer, idx) then
+    Exit;
+  for i := 0 to High(idx) do
+  begin
+    cand := Certs[idx[i]];
+    if cand.SubjectKeyId = C.AuthorityKeyId then
+      matching := Append(matching, cand)
+    else if ((Length(cand.SubjectKeyId) = 0) and (Length(C.AuthorityKeyId) > 0)) or
+      ((Length(cand.SubjectKeyId) > 0) and (Length(C.AuthorityKeyId) = 0)) then
+      oneKey := Append(oneKey, cand)
+    else
+      mismatch := Append(mismatch, cand);
+  end;
+  Result := Append(Result, matching);
+  Result := Append(Result, oneKey);
+  Result := Append(Result, mismatch);
+end;
+
+{ ---- PEM (encoding/pem Decode) ---- }
+
+{ getLine over D[A .. B-1] (1-based, B exclusive): the line without its
+  end and trailing spaces and tabs as [LA, LB), the rest from Next, and
+  the bytes consumed }
+procedure PemGetLine(const D: string; A, B: Integer; out LA, LB, Next, Consumed: Integer);
+var
+  i, j: Integer;
+begin
+  i := IndexIn(D, A, B, #10);
+  if i < 0 then
+  begin
+    i := B - A;
+    j := i;
+  end
+  else
+  begin
+    j := i + 1;
+    if (i > 0) and (D[A + i - 1] = #13) then
+      Dec(i);
+  end;
+  LA := A;
+  LB := A + i;
+  while (LB > LA) and ((D[LB - 1] = ' ') or (D[LB - 1] = #9)) do
+    Dec(LB);
+  Next := A + j;
+  Consumed := j;
+end;
+
+function IsSpaceAt(const S: string; I: Integer; out W: Integer): Boolean;
+var
+  r: Integer;
+begin
+  r := DecodeRune(S, I, W);
+  Result := (r = 9) or (r = 10) or (r = 11) or (r = 12) or (r = 13) or (r = 32) or (r = $85) or (r = $A0) or
+    (r = $1680) or ((r >= $2000) and (r <= $200A)) or (r = $2028) or (r = $2029) or (r = $202F) or (r = $205F) or (r = $3000);
+end;
+
+{ bytes.TrimSpace: Unicode white space off both ends }
+function TrimSpaceGo(const S: string): string;
+var
+  a, b, w, k: Integer;
+begin
+  a := 1;
+  while (a <= Length(S)) and IsSpaceAt(S, a, w) do
+    a := a + w;
+  b := Length(S);
+  while b >= a do
+  begin
+    if Ord(S[b]) < $80 then
+    begin
+      if (S[b] = ' ') or ((Ord(S[b]) >= 9) and (Ord(S[b]) <= 13)) then
+      begin
+        Dec(b);
+        Continue;
+      end;
+      Break;
+    end;
+    { utf8.DecodeLastRune: the rune that ends at b }
+    k := b;
+    while (k > a) and (b - k < 3) and ((Ord(S[k]) and $C0) = $80) do
+      Dec(k);
+    if IsSpaceAt(S, k, w) and (k + w - 1 = b) then
+      b := k - 1
+    else
+      Break;
+  end;
+  Result := Copy(S, a, b - a + 1);
+end;
+
+procedure PemSetHeader(var P: TPemBlock; const K, V: string);
+var
+  i: Integer;
+  h: TPemHeader;
+begin
+  for i := 0 to High(P.Headers) do
+    if P.Headers[i].Key = K then
+    begin
+      P.Headers[i].Value := V;
+      Exit;
+    end;
+  h.Key := K;
+  h.Value := V;
+  P.Headers := Append(P.Headers, h);
+end;
+
+{ Decode on D from the 1-based place Start: True with the block and the
+  1-based place of the rest }
+function PemDecodeAt(const D: string; Start: Integer; out P: TPemBlock; out RestAt: Integer): Boolean;
+var
+  r, n, endIndex, endTrailerIndex, beginIndex, la, lb, nx, consumed, ci, et, etLen, roelA: Integer;
+  typeLine, line, key, vl, b64, bytes: string;
+  i: Integer;
+  hasColon: Boolean;
+begin
+  Result := False;
+  RestAt := Start;
+  P.BlockType := '';
+  P.Headers := nil;
+  P.Bytes := '';
+  n := Length(D) + 1;
+  r := Start;
+  endTrailerIndex := 0;
+  while True do
+  begin
+    if (endTrailerIndex < 0) or (endTrailerIndex > n - r) then
+      Exit;
+    r := r + endTrailerIndex;
+    endIndex := IndexIn(D, r, n, #10'-----END ');
+    if endIndex < 0 then
+      Exit;
+    endTrailerIndex := endIndex + 10;
+    beginIndex := LastIndexIn(D, r, r + endIndex, '-----BEGIN ');
+    if (beginIndex < 0) or ((beginIndex > 0) and (D[r + beginIndex - 1] <> #10)) then
+      Continue;
+    r := r + beginIndex + 11;
+    endIndex := endIndex - (beginIndex + 11);
+    endTrailerIndex := endTrailerIndex - (beginIndex + 11);
+    PemGetLine(D, r, n, la, lb, nx, consumed);
+    typeLine := Copy(D, la, lb - la);
+    r := nx;
+    endIndex := endIndex - consumed;
+    endTrailerIndex := endTrailerIndex - consumed;
+    if not HasSuffix(typeLine, '-----') then
+      Continue;
+    typeLine := Copy(typeLine, 1, Length(typeLine) - 5);
+    P.BlockType := typeLine;
+    P.Headers := nil;
+    P.Bytes := '';
+    while True do
+    begin
+      if r >= n then
+        Exit;
+      PemGetLine(D, r, n, la, lb, nx, consumed);
+      line := Copy(D, la, lb - la);
+      ci := IndexChar(line, ':');
+      hasColon := ci >= 0;
+      if not hasColon then
+        Break;
+      key := TrimSpaceGo(Copy(line, 1, ci));
+      vl := TrimSpaceGo(Copy(line, ci + 2, Length(line) - ci - 1));
+      PemSetHeader(P, key, vl);
+      r := nx;
+      endIndex := endIndex - consumed;
+      endTrailerIndex := endTrailerIndex - consumed;
+    end;
+    if (Length(P.Headers) > 0) and (endIndex < 0) then
+      Continue;
+    { endTrailer := rest[endTrailerIndex:] }
+    et := r + endTrailerIndex;
+    etLen := Length(typeLine) + 5;
+    if n - et < etLen then
+      Continue;
+    roelA := et + etLen;
+    if not HasPrefixAt(D, et, typeLine) or not HasPrefixAt(D, et + etLen - 5, '-----') then
+      Continue;
+    PemGetLine(D, roelA, n, la, lb, nx, consumed);
+    if lb > la then
+      Continue;
+    P.Bytes := '';
+    if endIndex > 0 then
+    begin
+      b64 := '';
+      SetLength(b64, endIndex);
+      ci := 0;
+      for i := r to r + endIndex - 1 do
+        if (D[i] <> ' ') and (D[i] <> #9) then
+        begin
+          Inc(ci);
+          b64[ci] := D[i];
+        end;
+      SetLength(b64, ci);
+      if not Base64Decode(b64, False, True, bytes) then
+        Continue;
+      P.Bytes := bytes;
+    end;
+    PemGetLine(D, r + endIndex + 9, n, la, lb, nx, consumed);
+    RestAt := nx;
+    Result := True;
+    Exit;
+  end;
+end;
+
+function PemDecode(const Data: string; out Block: TPemBlock; out Rest: string): Boolean;
+var
+  at: Integer;
+begin
+  Result := PemDecodeAt(Data, 1, Block, at);
+  if Result then
+    Rest := Copy(Data, at, Length(Data) - at + 1)
+  else
+    Rest := Data;
+end;
+
+function PemDecodeAll(const Data: string): TPemBlocks;
+var
+  at, nat: Integer;
+  b: TPemBlock;
+begin
+  Result := nil;
+  at := 1;
+  while at <= Length(Data) do
+  begin
+    if not PemDecodeAt(Data, at, b, nat) then
+      Break;
+    Result := Append(Result, b);
+    at := nat;
+  end;
+end;
+
+function TX509Pool.AppendCertsFromPEM(const Pem: string): Boolean;
+var
+  at, nat: Integer;
+  b: TPemBlock;
+  c: TX509Cert;
+  err: string;
+begin
+  Result := False;
+  at := 1;
+  while at <= Length(Pem) do
+  begin
+    if not PemDecodeAt(Pem, at, b, nat) then
+      Break;
+    at := nat;
+    if (b.BlockType <> 'CERTIFICATE') or (Length(b.Headers) <> 0) then
+      Continue;
+    if not X509Parse(b.Bytes, c, err) then
+      Continue;
+    AddCert(c);
+    Result := True;
+  end;
+end;
+
+{ ---- the system roots (root.go loadOnDiskRoots, root_linux.go) ---- }
+
+{ ReadDir order: names sorted by their bytes }
+procedure SortNames(var A: TX509Strings);
+var
+  i, j: Integer;
+  t: string;
+begin
+  for i := 1 to High(A) do
+  begin
+    t := A[i];
+    j := i - 1;
+    while (j >= 0) and (A[j] > t) do
+    begin
+      A[j + 1] := A[j];
+      Dec(j);
+    end;
+    A[j + 1] := t;
+  end;
+end;
+
+function X509LoadRoots(const CertFile, CertDir: string; out Err: string): TX509Pool;
+var
+  roots: TX509Pool;
+  files, dirs, names: TX509Strings;
+  i, j: Integer;
+  data, list, target, path: string;
+  parts: TX509Strings;
+begin
+  Err := '';
+  roots := TX509Pool.Create;
+  files := nil;
+  if CertFile <> '' then
+    files := Append(files, CertFile)
+  else
+  begin
+    files := Append(files, '/etc/ssl/certs/ca-certificates.crt');
+    files := Append(files, '/etc/pki/tls/certs/ca-bundle.crt');
+    files := Append(files, '/etc/ssl/ca-bundle.pem');
+    files := Append(files, '/etc/pki/tls/cacert.pem');
+    files := Append(files, '/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem');
+    files := Append(files, '/etc/ssl/cert.pem');
+  end;
+  for i := 0 to High(files) do
+    if ReadFile(files[i], data) then
+    begin
+      roots.AppendCertsFromPEM(data);
+      Break;
+    end;
+  dirs := nil;
+  if CertDir <> '' then
+  begin
+    { filepath.SplitList }
+    parts := SplitChar(CertDir, ':');
+    for i := 0 to High(parts) do
+      dirs := Append(dirs, parts[i]);
+  end
+  else
+  begin
+    dirs := Append(dirs, '/etc/ssl/certs');
+    dirs := Append(dirs, '/etc/pki/tls/certs');
+  end;
+  for i := 0 to High(dirs) do
+  begin
+    list := ListDir(dirs[i]);
+    if list = '' then
+      Continue;
+    names := SplitChar(list, #10);
+    if (Length(names) > 0) and (names[High(names)] = '') then
+      SetLength(names, Length(names) - 1);
+    SortNames(names);
+    for j := 0 to High(names) do
+    begin
+      path := dirs[i] + '/' + names[j];
+      { isSameDirSymlink: a link whose target has no separator }
+      if ReadLink(path, target) and not ContainsByte(target, '/') then
+        Continue;
+      if ReadFile(path, data) then
+        roots.AppendCertsFromPEM(data);
+    end;
+  end;
+  Result := roots;
+end;
+
+var
+  SysOnce: once;
+  SysRoots: TX509Pool;
+  SysErr: string;
+
+procedure LoadSystemRoots;
+var
+  f, d: string;
+begin
+  f := GetEnv('SSL_CERT_FILE');
+  d := GetEnv('SSL_CERT_DIR');
+  SysRoots := X509LoadRoots(f, d, SysErr);
+end;
+
+function X509SystemRoots(out Err: string): TX509Pool;
+begin
+  once SysOnce do
+    LoadSystemRoots;
+  Err := SysErr;
+  Result := SysRoots;
+end;
+
+{ ---- name constraints (constraints.go) ---- }
+
+type
+  { dnsConstraints }
+  TDnsCons = class
+    All, Permitted: Boolean;
+    Names: TX509Strings;
+    ParentKeys, ParentVals: TX509Strings;
+  end;
+  { ipConstraints: Has* say whether each set exists }
+  TIpCons = class
+    HasV4, HasV6: Boolean;
+    V4, V6: TX509IPNets;
+  end;
+  { emailConstraints }
+  TEmailCons = class
+    FullLocal, FullDomain: TX509Strings;
+    Dns: TDnsCons;
+  end;
+  { chainConstraints }
+  TChainCons = class
+    Index: Integer;
+    IpPerm, IpExcl: TIpCons;
+    DnsPerm, DnsExcl, UriPerm, UriExcl: TDnsCons;
+    EmailPerm, EmailExcl: TEmailCons;
+    Next: TChainCons;
+  end;
+
+function BytesCompare(const A, B: string): Integer;
+begin
+  if A = B then
+    Result := 0
+  else if A < B then
+    Result := -1
+  else
+    Result := 1;
+end;
+
+{ dnsCompareTable: A-Z as a-z, the period below every other byte }
+function DnsKey(C: Char): Integer;
+begin
+  Result := Ord(C);
+  if (C >= 'A') and (C <= 'Z') then
+    Result := Result + 32
+  else if C = '.' then
+    Result := 0;
+end;
+
+{ dnsCompare: case-insensitive, from the end }
+function DnsCompare(const A, B: string): Integer;
+var
+  ia, ib, ka, kb: Integer;
+begin
+  ia := Length(A);
+  ib := Length(B);
+  while (ia >= 1) and (ib >= 1) do
+  begin
+    ka := DnsKey(A[ia]);
+    kb := DnsKey(B[ib]);
+    if ka = kb then
+    begin
+      Dec(ia);
+      Dec(ib);
+      Continue;
+    end;
+    if ka < kb then
+      Result := -1
+    else
+      Result := 1;
+    Exit;
+  end;
+  if ia < ib then
+    Result := -1
+  else if ib < ia then
+    Result := 1
+  else
+    Result := 0;
+end;
+
+{ dnsHasSuffix: B is A or a name under A, case-insensitive; a leading
+  period in A asks for one more label }
+function DnsHasSuffix(const A, B: string): Boolean;
+var
+  lenA, lenB, i, offset, ar, br, t: Integer;
+begin
+  Result := False;
+  lenA := Length(A);
+  lenB := Length(B);
+  if lenA > lenB then
+    Exit;
+  offset := lenA - lenB;
+  for i := lenA - 1 downto 0 do
+  begin
+    ar := Ord(A[i + 1]);
+    br := Ord(B[i - offset + 1]);
+    if ar = br then
+      Continue;
+    if br < ar then
+    begin
+      t := ar;
+      ar := br;
+      br := t;
+    end;
+    if (ar >= Ord('A')) and (ar <= Ord('Z')) and (br = ar + 32) then
+      Continue;
+    Exit;
+  end;
+  if (A[1] <> '.') and (lenB > lenA) and (B[lenB - lenA] <> '.') then
+    Exit;
+  Result := True;
+end;
+
+function TrimFirstLabel(const S: string): string;
+var
+  i: Integer;
+begin
+  i := IndexChar(S, '.');
+  if i < 0 then
+    Result := ''
+  else
+    Result := Copy(S, i + 1, Length(S) - i);
+end;
+
+{ strings.ToLower for what these names hold: ASCII, any other byte kept }
+function ToLowerStr(const S: string): string;
+begin
+  Result := LowerASCII(S);
+end;
+
+{ newDNSConstraints; nil for an empty list }
+function NewDnsCons(const L: TX509Strings; Permitted: Boolean): TDnsCons;
+var
+  i, j, w: Integer;
+  t, name, trimmed: string;
+  names: TX509Strings;
+  k: Integer;
+  found: Boolean;
+begin
+  Result := nil;
+  if Length(L) = 0 then
+    Exit;
+  Result := TDnsCons.Create;
+  for i := 0 to High(L) do
+    if Length(L[i]) = 0 then
+    begin
+      Result.All := True;
+      Exit;
+    end;
+  Result.Permitted := Permitted;
+  names := nil;
+  names := Append(names, L);
+  { sortAndPrune(dnsCompare, dnsHasSuffix) }
+  for i := 1 to High(names) do
+  begin
+    t := names[i];
+    j := i - 1;
+    while (j >= 0) and (DnsCompare(names[j], t) > 0) do
+    begin
+      names[j + 1] := names[j];
+      Dec(j);
+    end;
+    names[j + 1] := t;
+  end;
+  if Length(names) >= 2 then
+  begin
+    w := 1;
+    for i := 1 to High(names) do
+      if not DnsHasSuffix(names[w - 1], names[i]) then
+      begin
+        names[w] := names[i];
+        Inc(w);
+      end;
+    SetLength(names, w);
+  end;
+  Result.Names := names;
+  if not Permitted then
+  begin
+    for i := 0 to High(names) do
+    begin
+      name := ToLowerStr(names[i]);
+      trimmed := TrimFirstLabel(name);
+      if trimmed = '' then
+        Continue;
+      found := False;
+      for k := 0 to High(Result.ParentKeys) do
+        if Result.ParentKeys[k] = trimmed then
+        begin
+          Result.ParentVals[k] := name;
+          found := True;
+        end;
+      if not found then
+      begin
+        Result.ParentKeys := Append(Result.ParentKeys, trimmed);
+        Result.ParentVals := Append(Result.ParentVals, name);
+      end;
+    end;
+  end;
+end;
+
+{ nameConstraintsSet.search over strings }
+function DnsSearch(const Names: TX509Strings; const S: string; out Constraint: string): Boolean;
+var
+  lo, hi, mid, i: Integer;
+  cand: string;
+begin
+  Result := False;
+  Constraint := '';
+  if Length(Names) = 0 then
+    Exit;
+  lo := 0;
+  hi := Length(Names);
+  while lo < hi do
+  begin
+    mid := (lo + hi) div 2;
+    if DnsCompare(Names[mid], S) < 0 then
+      lo := mid + 1
+    else
+      hi := mid;
+  end;
+  i := lo;
+  if (i < Length(Names)) and (DnsCompare(Names[i], S) = 0) then
+  begin
+    Constraint := Names[i];
+    Result := True;
+    Exit;
+  end;
+  if i = 0 then
+    cand := Names[0]
+  else
+    cand := Names[i - 1];
+  if DnsHasSuffix(cand, S) then
+  begin
+    Constraint := cand;
+    Result := True;
+  end;
+end;
+
+{ dnsConstraints.query }
+function DnsQuery(D: TDnsCons; const S0: string; out Constraint: string): Boolean;
+var
+  s, trimmed: string;
+  k: Integer;
+begin
+  Constraint := '';
+  Result := True;
+  if D.All then
+    Exit;
+  if DnsSearch(D.Names, S0, Constraint) then
+    Exit;
+  if not D.Permitted and (Length(S0) > 0) and (S0[1] = '*') then
+  begin
+    s := ToLowerStr(S0);
+    trimmed := TrimFirstLabel(s);
+    for k := 0 to High(D.ParentKeys) do
+      if D.ParentKeys[k] = trimmed then
+      begin
+        Constraint := D.ParentVals[k];
+        Exit;
+      end;
+  end;
+  Result := False;
+end;
+
+function IPNetCompare(const A, B: TX509IPNet): Integer;
+begin
+  Result := BytesCompare(A.IP, B.IP);
+  if Result = 0 then
+    Result := BytesCompare(A.Mask, B.Mask);
+end;
+
+{ ipNetworkSubset: B inside A }
+function IPNetSubset(const A, B: TX509IPNet): Boolean;
+var
+  bc: string;
+  i: Integer;
+begin
+  Result := False;
+  if not IPNetContains(A, B.IP) then
+    Exit;
+  bc := B.IP;
+  for i := 1 to Length(bc) do
+    if i <= Length(B.Mask) then
+      bc[i] := Chr(Ord(B.IP[i]) or (not Ord(B.Mask[i]) and 255));
+  Result := IPNetContains(A, bc);
+end;
+
+procedure SortPruneNets(var S: TX509IPNets);
+var
+  i, j, w: Integer;
+  t: TX509IPNet;
+begin
+  if Length(S) < 2 then
+    Exit;
+  for i := 1 to High(S) do
+  begin
+    t := S[i];
+    j := i - 1;
+    while (j >= 0) and (IPNetCompare(S[j], t) > 0) do
+    begin
+      S[j + 1] := S[j];
+      Dec(j);
+    end;
+    S[j + 1] := t;
+  end;
+  w := 1;
+  for i := 1 to High(S) do
+    if not IPNetSubset(S[w - 1], S[i]) then
+    begin
+      S[w] := S[i];
+      Inc(w);
+    end;
+  SetLength(S, w);
+end;
+
+{ newIPNetConstraints; nil for an empty list }
+function NewIpCons(const L: TX509IPNets): TIpCons;
+var
+  i: Integer;
+  n: TX509IPNet;
+  masked: string;
+begin
+  Result := nil;
+  if Length(L) = 0 then
+    Exit;
+  Result := TIpCons.Create;
+  for i := 0 to High(L) do
+  begin
+    n := L[i];
+    masked := IPMaskOf(n.IP, n.Mask);
+    if (masked <> '') and not IPEqual(masked, n.IP) then
+      n.IP := masked;
+    if Length(n.IP) = 4 then
+      Result.V4 := Append(Result.V4, n)
+    else
+      Result.V6 := Append(Result.V6, n);
+  end;
+  Result.HasV4 := Length(Result.V4) > 0;
+  Result.HasV6 := Length(Result.V6) > 0;
+  SortPruneNets(Result.V4);
+  SortPruneNets(Result.V6);
+end;
+
+{ ipConstraints.query }
+function IpQuery(C: TIpCons; const IP: string; out Constraint: TX509IPNet): Boolean;
+var
+  setx: TX509IPNets;
+  has: Boolean;
+  lo, hi, mid, i: Integer;
+begin
+  Result := False;
+  Constraint.IP := '';
+  Constraint.Mask := '';
+  if Length(IP) = 4 then
+  begin
+    has := C.HasV4;
+    setx := C.V4;
+  end
+  else
+  begin
+    has := C.HasV6;
+    setx := C.V6;
+  end;
+  if not has or (Length(setx) = 0) then
+    Exit;
+  lo := 0;
+  hi := Length(setx);
+  while lo < hi do
+  begin
+    mid := (lo + hi) div 2;
+    if BytesCompare(setx[mid].IP, IP) < 0 then
+      lo := mid + 1
+    else
+      hi := mid;
+  end;
+  i := lo;
+  if (i < Length(setx)) and (BytesCompare(setx[i].IP, IP) = 0) then
+  begin
+    Constraint := setx[i];
+    Result := True;
+    Exit;
+  end;
+  if i = 0 then
+    Constraint := setx[0]
+  else
+    Constraint := setx[i - 1];
+  Result := IPNetContains(Constraint, IP);
+end;
+
+{ newEmailConstraints; nil for an empty list }
+function NewEmailCons(const L: TX509Strings; Permitted: Boolean): TEmailCons;
+var
+  i: Integer;
+  domains: TX509Strings;
+  m: TMailbox;
+begin
+  Result := nil;
+  if Length(L) = 0 then
+    Exit;
+  Result := TEmailCons.Create;
+  domains := nil;
+  for i := 0 to High(L) do
+  begin
+    if not ContainsByte(L[i], '@') then
+    begin
+      domains := Append(domains, L[i]);
+      Continue;
+    end;
+    if not ParseMailbox(L[i], m) then
+      Continue;
+    Result.FullLocal := Append(Result.FullLocal, m.Local);
+    Result.FullDomain := Append(Result.FullDomain, ToLowerStr(m.Domain));
+  end;
+  if Length(domains) > 0 then
+    Result.Dns := NewDnsCons(domains, Permitted);
+end;
+
+function EmailQuery(E: TEmailCons; const M: TMailbox; out Constraint: string): Boolean;
+var
+  i: Integer;
+begin
+  Result := True;
+  Constraint := '';
+  for i := 0 to High(E.FullLocal) do
+    if (E.FullLocal[i] = M.Local) and (E.FullDomain[i] = M.Domain) then
+    begin
+      Constraint := M.Local + '@' + M.Domain;
+      Exit;
+    end;
+  Result := False;
+  if E.Dns = nil then
+    Exit;
+  Result := DnsQuery(E.Dns, M.Domain, Constraint);
+end;
+
+{ checkConstraints, one per kind of name }
+function CheckDnsKind(const Kind: string; Perm, Excl: TDnsCons; const S, Shown: string): string;
+var
+  c: string;
+begin
+  Result := '';
+  if Perm <> nil then
+    if not DnsQuery(Perm, S, c) then
+    begin
+      Result := Kind + ' ' + X509Quote(Shown) + ' is not permitted by any constraint';
+      Exit;
+    end;
+  if Excl <> nil then
+    if DnsQuery(Excl, S, c) then
+      Result := Kind + ' ' + X509Quote(Shown) + ' is excluded by constraint ' + X509Quote(c);
+end;
+
+function NetString(const N: TX509IPNet): string;
+var
+  ones, i, b: Integer;
+  canon, seenZero: Boolean;
+begin
+  { IPNet.String: CIDR when the mask is canonical, else the mask in hex }
+  ones := 0;
+  canon := True;
+  seenZero := False;
+  for i := 1 to Length(N.Mask) do
+  begin
+    b := Ord(N.Mask[i]);
+    while b <> 0 do
+    begin
+      if (b and $80) = 0 then
+        canon := False;
+      b := (b shl 1) and 255;
+      Inc(ones);
+      if seenZero then
+        canon := False;
+    end;
+    if Ord(N.Mask[i]) <> 255 then
+      seenZero := True;
+  end;
+  if canon and (Length(N.Mask) = Length(N.IP)) then
+    Result := X509IPString(N.IP) + '/' + IntStr(ones)
+  else
+    Result := X509IPString(N.IP) + '/' + HexOf(N.Mask);
+end;
+
+function CheckIpKind(Perm, Excl: TIpCons; const IP: string): string;
+var
+  c: TX509IPNet;
+begin
+  Result := '';
+  if Perm <> nil then
+    if not IpQuery(Perm, IP, c) then
+    begin
+      Result := 'IP address ' + X509Quote(X509IPString(IP)) + ' is not permitted by any constraint';
+      Exit;
+    end;
+  if Excl <> nil then
+    if IpQuery(Excl, IP, c) then
+      Result := 'IP address ' + X509Quote(X509IPString(IP)) + ' is excluded by constraint ' + X509Quote(NetString(c));
+end;
+
+function CheckEmailKind(Perm, Excl: TEmailCons; const M: TMailbox): string;
+var
+  c, shown: string;
+begin
+  Result := '';
+  shown := M.Local + '@' + M.Domain;
+  if Perm <> nil then
+    if not EmailQuery(Perm, M, c) then
+    begin
+      Result := 'email address ' + X509Quote(shown) + ' is not permitted by any constraint';
+      Exit;
+    end;
+  if Excl <> nil then
+    if EmailQuery(Excl, M, c) then
+      Result := 'email address ' + X509Quote(shown) + ' is excluded by constraint ' + X509Quote(c);
+end;
+
+type
+  TParsedUri = record
+    Shown, Domain: string;
+  end;
+  TParsedUris = array of TParsedUri;
+  TMailboxes = array of TMailbox;
+
+{ chainConstraints.check }
+function ChainConsCheck(CC: TChainCons; C: TX509Cert; const Uris: TParsedUris; const Emails: TMailboxes): string;
+var
+  i: Integer;
+begin
+  for i := 0 to High(C.IPAddresses) do
+  begin
+    Result := CheckIpKind(CC.IpPerm, CC.IpExcl, C.IPAddresses[i]);
+    if Result <> '' then
+      Exit;
+  end;
+  for i := 0 to High(C.DNSNames) do
+  begin
+    if not DomainNameValid(C.DNSNames[i], False) then
+    begin
+      Result := 'x509: cannot parse dnsName ' + X509Quote(C.DNSNames[i]);
+      Exit;
+    end;
+    Result := CheckDnsKind('DNS name', CC.DnsPerm, CC.DnsExcl, C.DNSNames[i], C.DNSNames[i]);
+    if Result <> '' then
+      Exit;
+  end;
+  for i := 0 to High(Uris) do
+  begin
+    if not DomainNameValid(Uris[i].Domain, False) then
+    begin
+      Result := 'x509: internal error: URI SAN ' + X509Quote(Uris[i].Shown) + ' failed to parse';
+      Exit;
+    end;
+    Result := CheckDnsKind('URI', CC.UriPerm, CC.UriExcl, Uris[i].Domain, Uris[i].Shown);
+    if Result <> '' then
+      Exit;
+  end;
+  for i := 0 to High(Emails) do
+  begin
+    if not DomainNameValid(Emails[i].Domain, False) then
+    begin
+      Result := 'x509: cannot parse rfc822Name ' + X509Quote(Emails[i].Local + '@' + Emails[i].Domain);
+      Exit;
+    end;
+    Result := CheckEmailKind(CC.EmailPerm, CC.EmailExcl, Emails[i]);
+    if Result <> '' then
+      Exit;
+  end;
+  Result := '';
+end;
+
+{ net.SplitHostPort: the host, or Err as AddrError.Error }
+function SplitHostPort(const HP: string; out Host, Err: string): Boolean;
+var
+  i, j, k, e: Integer;
+begin
+  Result := False;
+  Host := '';
+  Err := '';
+  j := 0;
+  k := 0;
+  i := LastIndexChar(HP, ':');
+  if i < 0 then
+  begin
+    Err := 'address ' + HP + ': missing port in address';
+    Exit;
+  end;
+  if HP[1] = '[' then
+  begin
+    e := IndexChar(HP, ']');
+    if e < 0 then
+    begin
+      Err := 'address ' + HP + ': missing '']'' in address';
+      Exit;
+    end;
+    if e + 1 = Length(HP) then
+    begin
+      Err := 'address ' + HP + ': missing port in address';
+      Exit;
+    end
+    else if e + 1 <> i then
+    begin
+      if HP[e + 2] = ':' then
+        Err := 'address ' + HP + ': too many colons in address'
+      else
+        Err := 'address ' + HP + ': missing port in address';
+      Exit;
+    end;
+    Host := Copy(HP, 2, e - 1);
+    j := 1;
+    k := e + 1;
+  end
+  else
+  begin
+    Host := Copy(HP, 1, i);
+    if ContainsByte(Host, ':') then
+    begin
+      Host := '';
+      Err := 'address ' + HP + ': too many colons in address';
+      Exit;
+    end;
+  end;
+  if ContainsByte(Copy(HP, j + 1, Length(HP) - j), '[') then
+  begin
+    Host := '';
+    Err := 'address ' + HP + ': unexpected ''['' in address';
+    Exit;
+  end;
+  if ContainsByte(Copy(HP, k + 1, Length(HP) - k), ']') then
+  begin
+    Host := '';
+    Err := 'address ' + HP + ': unexpected '']'' in address';
+    Exit;
+  end;
+  Result := True;
+end;
+
+{ parseURIs of constraints.go }
+function ParseUris(C: TX509Cert; out R: TParsedUris; out Err: string): Boolean;
+var
+  i: Integer;
+  u: TUrl;
+  host, shown, e2, ip, zone, h2: string;
+  pu: TParsedUri;
+begin
+  Result := False;
+  R := nil;
+  Err := '';
+  for i := 0 to High(C.URIs) do
+  begin
+    if UrlParse(C.URIs[i], u, e2) then
+      shown := UrlString(u)
+    else
+      shown := C.URIs[i];
+    host := ToLowerStr(C.URIHosts[i]);
+    if Length(host) = 0 then
+    begin
+      Err := 'URI with empty host (' + X509Quote(shown) + ') cannot be matched against constraints';
+      Exit;
+    end;
+    if ContainsByte(host, ':') and not HasSuffix(host, ']') then
+    begin
+      if not SplitHostPort(C.URIHosts[i], h2, e2) then
+      begin
+        Err := 'cannot parse URI host ' + X509Quote(C.URIHosts[i]) + ': ' + e2;
+        Exit;
+      end;
+      host := h2;
+    end;
+    if X509ParseAddr(host, ip, zone, e2) or (HasPrefix(host, '[') and HasSuffix(host, ']')) then
+    begin
+      Err := 'URI with IP (' + X509Quote(shown) + ') cannot be matched against constraints';
+      Exit;
+    end;
+    pu.Shown := shown;
+    pu.Domain := host;
+    R := Append(R, pu);
+  end;
+  Result := True;
+end;
+
+{ parseMailboxes }
+function ParseMailboxes(C: TX509Cert; out R: TMailboxes; out Err: string): Boolean;
+var
+  i: Integer;
+  m: TMailbox;
+begin
+  Result := False;
+  R := nil;
+  Err := '';
+  for i := 0 to High(C.EmailAddresses) do
+  begin
+    if not ParseMailbox(C.EmailAddresses[i], m) then
+    begin
+      Err := 'cannot parse rfc822Name ' + X509Quote(C.EmailAddresses[i]);
+      Exit;
+    end;
+    m.Domain := ToLowerStr(m.Domain);
+    R := Append(R, m);
+  end;
+  Result := True;
+end;
+
+{ checkChainConstraints }
+function CheckChainConstraints(const Chain: TX509Certs): string;
+var
+  cur, last, cc, nn: TChainCons;
+  i: Integer;
+  c: TX509Cert;
+  uris: TParsedUris;
+  emails: TMailboxes;
+begin
+  Result := '';
+  cur := nil;
+  last := nil;
+  for i := 0 to High(Chain) do
+  begin
+    c := Chain[i];
+    if not HasNameConstraints(c) then
+      Continue;
+    cc := TChainCons.Create;
+    cc.Index := i;
+    cc.IpPerm := NewIpCons(c.PermittedIPRanges);
+    cc.IpExcl := NewIpCons(c.ExcludedIPRanges);
+    cc.DnsPerm := NewDnsCons(c.PermittedDNSDomains, True);
+    cc.DnsExcl := NewDnsCons(c.ExcludedDNSDomains, False);
+    cc.UriPerm := NewDnsCons(c.PermittedURIDomains, True);
+    cc.UriExcl := NewDnsCons(c.ExcludedURIDomains, False);
+    cc.EmailPerm := NewEmailCons(c.PermittedEmailAddresses, True);
+    cc.EmailExcl := NewEmailCons(c.ExcludedEmailAddresses, False);
+    if cur = nil then
+    begin
+      cur := cc;
+      last := cc;
+    end
+    else if last <> nil then
+    begin
+      last.Next := cc;
+      last := cc;
+    end;
+  end;
+  if cur = nil then
+    Exit;
+  for i := 0 to High(Chain) do
+  begin
+    c := Chain[i];
+    if not HasSANExtension(c) then
+      Continue;
+    if i >= cur.Index then
+      while cur.Index <= i do
+      begin
+        if cur.Next = nil then
+          Exit;
+        cur := cur.Next;
+      end;
+    if not ParseUris(c, uris, Result) then
+      Exit;
+    if not ParseMailboxes(c, emails, Result) then
+      Exit;
+    nn := cur;
+    while nn <> nil do
+    begin
+      Result := ChainConsCheck(nn, c, uris, emails);
+      if Result <> '' then
+        Exit;
+      nn := nn.Next;
+    end;
+  end;
+  Result := '';
+end;
+
+{ ---- the policy graph (verify.go policiesValid, RFC 5280 6.1 as
+  updated by RFC 9618) ---- }
+
+type
+  TPolNode = class;
+  TPolNodes = array of TPolNode;
+  TPolNode = class
+    Valid: string;
+    Expected: TX509Strings;
+    Parents, Children: TPolNodes;
+  end;
+  TPolGraph = class
+    Strata: array of TPolNodes;
+    IndexKeys: TX509Strings;
+    IndexVals: array of TPolNodes;
+    Depth: Integer;
+  end;
+
+procedure NodeAddTo(var A: TPolNodes; N: TPolNode);
+var
+  i: Integer;
+begin
+  for i := 0 to High(A) do
+    if A[i] = N then
+      Exit;
+  A := Append(A, N);
+end;
+
+procedure NodeRemoveFrom(var A: TPolNodes; N: TPolNode);
+var
+  i, j: Integer;
+begin
+  for i := 0 to High(A) do
+    if A[i] = N then
+    begin
+      for j := i to High(A) - 1 do
+        A[j] := A[j + 1];
+      SetLength(A, Length(A) - 1);
+      Exit;
+    end;
+end;
+
+function NewPolNode(const Valid: string; const Parents: TPolNodes): TPolNode;
+var
+  i: Integer;
+begin
+  Result := TPolNode.Create;
+  Result.Valid := Valid;
+  Result.Expected := nil;
+  Result.Expected := Append(Result.Expected, Valid);
+  for i := 0 to High(Parents) do
+  begin
+    NodeAddTo(Parents[i].Children, Result);
+    NodeAddTo(Result.Parents, Parents[i]);
+  end;
+end;
+
+function NewPolGraph: TPolGraph;
+var
+  root: TPolNode;
+  st: TPolNodes;
+begin
+  Result := TPolGraph.Create;
+  root := TPolNode.Create;
+  root.Valid := OidAnyPolicy;
+  root.Expected := Append(root.Expected, OidAnyPolicy);
+  st := nil;
+  st := Append(st, root);
+  Result.Strata := nil;
+  Result.Strata := Append(Result.Strata, st);
+  Result.Depth := 0;
+end;
+
+function StratumFind(const St: TPolNodes; const Oid: string): TPolNode;
+var
+  i: Integer;
+begin
+  for i := 0 to High(St) do
+    if St[i].Valid = Oid then
+    begin
+      Result := St[i];
+      Exit;
+    end;
+  Result := nil;
+end;
+
+procedure PgInsert(G: TPolGraph; N: TPolNode);
+var
+  i: Integer;
+begin
+  for i := 0 to High(G.Strata[G.Depth]) do
+    if G.Strata[G.Depth][i].Valid = N.Valid then
+    begin
+      G.Strata[G.Depth][i] := N;
+      Exit;
+    end;
+  G.Strata[G.Depth] := Append(G.Strata[G.Depth], N);
+end;
+
+function PgParentsWithExpected(G: TPolGraph; const Expected: string): TPolNodes;
+var
+  i: Integer;
+begin
+  Result := nil;
+  if G.Depth = 0 then
+    Exit;
+  for i := 0 to High(G.IndexKeys) do
+    if G.IndexKeys[i] = Expected then
+    begin
+      Result := G.IndexVals[i];
+      Exit;
+    end;
+end;
+
+function PgParentWithAnyPolicy(G: TPolGraph): TPolNode;
+begin
+  Result := nil;
+  if G.Depth = 0 then
+    Exit;
+  Result := StratumFind(G.Strata[G.Depth - 1], OidAnyPolicy);
+end;
+
+procedure PgDeleteLeaf(G: TPolGraph; const Policy: string);
+var
+  n: TPolNode;
+  i: Integer;
+begin
+  n := StratumFind(G.Strata[G.Depth], Policy);
+  if n = nil then
+    Exit;
+  for i := 0 to High(n.Parents) do
+    NodeRemoveFrom(n.Parents[i].Children, n);
+  for i := 0 to High(n.Children) do
+    NodeRemoveFrom(n.Children[i].Parents, n);
+  NodeRemoveFrom(G.Strata[G.Depth], n);
+end;
+
+function PgValidPolicyNodes(G: TPolGraph): TPolNodes;
+var
+  i, j: Integer;
+  n: TPolNode;
+begin
+  Result := nil;
+  for i := G.Depth downto 0 do
+    for j := 0 to High(G.Strata[i]) do
+    begin
+      n := G.Strata[i][j];
+      if n.Valid = OidAnyPolicy then
+        Continue;
+      if (Length(n.Parents) = 1) and (n.Parents[0].Valid = OidAnyPolicy) then
+        Result := Append(Result, n);
+    end;
+end;
+
+procedure PgPrune(G: TPolGraph);
+var
+  i, j, k: Integer;
+  st: TPolNodes;
+  n: TPolNode;
+begin
+  for i := G.Depth - 1 downto 1 do
+  begin
+    st := nil;
+    st := Append(st, G.Strata[i]);
+    for j := 0 to High(st) do
+    begin
+      n := st[j];
+      if Length(n.Children) = 0 then
+      begin
+        for k := 0 to High(n.Parents) do
+          NodeRemoveFrom(n.Parents[k].Children, n);
+        NodeRemoveFrom(G.Strata[i], n);
+      end;
+    end;
+  end;
+end;
+
+procedure PgIncrDepth(G: TPolGraph);
+var
+  i, j, k: Integer;
+  n: TPolNode;
+  e: string;
+  found: Boolean;
+  empty: TPolNodes;
+begin
+  G.IndexKeys := nil;
+  G.IndexVals := nil;
+  for i := 0 to High(G.Strata[G.Depth]) do
+  begin
+    n := G.Strata[G.Depth][i];
+    for j := 0 to High(n.Expected) do
+    begin
+      e := n.Expected[j];
+      found := False;
+      for k := 0 to High(G.IndexKeys) do
+        if G.IndexKeys[k] = e then
+        begin
+          G.IndexVals[k] := Append(G.IndexVals[k], n);
+          found := True;
+          Break;
+        end;
+      if not found then
+      begin
+        G.IndexKeys := Append(G.IndexKeys, e);
+        empty := nil;
+        empty := Append(empty, n);
+        G.IndexVals := Append(G.IndexVals, empty);
+      end;
+    end;
+  end;
+  G.Depth := G.Depth + 1;
+  empty := nil;
+  G.Strata := Append(G.Strata, empty);
+end;
+
+
+function X509PoliciesValid(const Chain: TX509Certs; const Opts: TX509VerifyOptions): Boolean;
+var
+  n, i, j, k, q, inhibitAny, explicit, mapping: Integer;
+  pg: TPolGraph;
+  cert: TX509Cert;
+  isSelfSigned, found: Boolean;
+  policies, initial, missKeys, mapKeys, authSet, userSet, newUser: TX509Strings;
+  missVals: array of TPolNodes;
+  mapVals: array of TX509Strings;
+  parents, leaves, prevs, valid, one: TPolNodes;
+  anyParent, matching, nd: TPolNode;
+  policy, e, iss: string;
+  empty: TX509Strings;
+begin
+  Result := True;
+  if Length(Chain) = 1 then
+    Exit;
+  n := Length(Chain) - 1;
+  pg := NewPolGraph;
+  inhibitAny := 0;
+  explicit := 0;
+  mapping := 0;
+  if not Opts.InhibitAnyPolicy then
+    inhibitAny := n + 1;
+  if not Opts.RequireExplicitPolicy then
+    explicit := n + 1;
+  if not Opts.InhibitPolicyMapping then
+    mapping := n + 1;
+  initial := nil;
+  for i := 0 to High(Opts.CertificatePolicies) do
+    if not InStrings(Opts.CertificatePolicies[i], initial) then
+      initial := Append(initial, Opts.CertificatePolicies[i]);
+  if Length(initial) = 0 then
+    initial := Append(initial, OidAnyPolicy);
+  for i := n - 1 downto 0 do
+  begin
+    cert := Chain[i];
+    isSelfSigned := cert.RawIssuer = cert.RawSubject;
+    { 6.1.3 (e) }
+    if Length(cert.Policies) = 0 then
+      pg := nil;
+    { 6.1.3 (f) }
+    if (explicit = 0) and (pg = nil) then
+    begin
+      Result := False;
+      Exit;
+    end;
+    if pg <> nil then
+    begin
+      PgIncrDepth(pg);
+      policies := nil;
+      { 6.1.3 (d) (1) }
+      for j := 0 to High(cert.Policies) do
+      begin
+        policy := cert.Policies[j];
+        if not InStrings(policy, policies) then
+          policies := Append(policies, policy);
+        if policy = OidAnyPolicy then
+          Continue;
+        parents := PgParentsWithExpected(pg, policy);
+        if Length(parents) = 0 then
+        begin
+          anyParent := PgParentWithAnyPolicy(pg);
+          if anyParent <> nil then
+          begin
+            parents := nil;
+            parents := Append(parents, anyParent);
+          end;
+        end;
+        if Length(parents) > 0 then
+          PgInsert(pg, NewPolNode(policy, parents));
+      end;
+      { 6.1.3 (d) (2) }
+      if InStrings(OidAnyPolicy, policies) and ((inhibitAny > 0) or ((n - i < n) and isSelfSigned)) then
+      begin
+        missKeys := nil;
+        missVals := nil;
+        leaves := pg.Strata[pg.Depth];
+        prevs := pg.Strata[pg.Depth - 1];
+        for j := 0 to High(prevs) do
+          for k := 0 to High(prevs[j].Expected) do
+          begin
+            e := prevs[j].Expected[k];
+            if StratumFind(leaves, e) <> nil then
+              Continue;
+            found := False;
+            for q := 0 to High(missKeys) do
+              if missKeys[q] = e then
+              begin
+                missVals[q] := Append(missVals[q], prevs[j]);
+                found := True;
+                Break;
+              end;
+            if not found then
+            begin
+              missKeys := Append(missKeys, e);
+              one := nil;
+              one := Append(one, prevs[j]);
+              missVals := Append(missVals, one);
+            end;
+          end;
+        for q := 0 to High(missKeys) do
+          PgInsert(pg, NewPolNode(missKeys[q], missVals[q]));
+      end;
+      { 6.1.3 (d) (3) }
+      PgPrune(pg);
+      if i <> 0 then
+      begin
+        { 6.1.4 (b) }
+        if Length(cert.PolicyMappings) > 0 then
+        begin
+          mapKeys := nil;
+          mapVals := nil;
+          for j := 0 to High(cert.PolicyMappings) do
+          begin
+            if mapping > 0 then
+            begin
+              if (cert.PolicyMappings[j].IssuerDomainPolicy = OidAnyPolicy) or (cert.PolicyMappings[j].SubjectDomainPolicy = OidAnyPolicy) then
+              begin
+                Result := False;
+                Exit;
+              end;
+              iss := cert.PolicyMappings[j].IssuerDomainPolicy;
+              found := False;
+              for q := 0 to High(mapKeys) do
+                if mapKeys[q] = iss then
+                begin
+                  mapVals[q] := Append(mapVals[q], cert.PolicyMappings[j].SubjectDomainPolicy);
+                  found := True;
+                  Break;
+                end;
+              if not found then
+              begin
+                mapKeys := Append(mapKeys, iss);
+                empty := nil;
+                empty := Append(empty, cert.PolicyMappings[j].SubjectDomainPolicy);
+                mapVals := Append(mapVals, empty);
+              end;
+            end
+            else
+              PgDeleteLeaf(pg, cert.PolicyMappings[j].IssuerDomainPolicy);
+          end;
+          PgPrune(pg);
+          for q := 0 to High(mapKeys) do
+          begin
+            matching := StratumFind(pg.Strata[pg.Depth], mapKeys[q]);
+            if matching <> nil then
+              matching.Expected := mapVals[q]
+            else
+            begin
+              matching := StratumFind(pg.Strata[pg.Depth], OidAnyPolicy);
+              if matching <> nil then
+              begin
+                one := nil;
+                one := Append(one, matching);
+                nd := NewPolNode(mapKeys[q], one);
+                nd.Expected := mapVals[q];
+                PgInsert(pg, nd);
+              end;
+            end;
+          end;
+        end;
+      end;
+    end;
+    if i <> 0 then
+    begin
+      { 6.1.4 (h) }
+      if not isSelfSigned then
+      begin
+        if explicit > 0 then
+          Dec(explicit);
+        if mapping > 0 then
+          Dec(mapping);
+        if inhibitAny > 0 then
+          Dec(inhibitAny);
+      end;
+      { 6.1.4 (i) }
+      if ((cert.RequireExplicitPolicy > 0) or cert.RequireExplicitPolicyZero) and (cert.RequireExplicitPolicy < explicit) then
+        explicit := cert.RequireExplicitPolicy;
+      if ((cert.InhibitPolicyMapping > 0) or cert.InhibitPolicyMappingZero) and (cert.InhibitPolicyMapping < mapping) then
+        mapping := cert.InhibitPolicyMapping;
+      { 6.1.4 (j) }
+      if ((cert.InhibitAnyPolicy > 0) or cert.InhibitAnyPolicyZero) and (cert.InhibitAnyPolicy < inhibitAny) then
+        inhibitAny := cert.InhibitAnyPolicy;
+    end;
+  end;
+  { 6.1.5 (a) }
+  if explicit > 0 then
+    Dec(explicit);
+  { 6.1.5 (b) }
+  if Chain[0].RequireExplicitPolicyZero then
+    explicit := 0;
+  { 6.1.5 (g) }
+  valid := nil;
+  if pg <> nil then
+  begin
+    valid := PgValidPolicyNodes(pg);
+    nd := StratumFind(pg.Strata[pg.Depth], OidAnyPolicy);
+    if nd <> nil then
+      valid := Append(valid, nd);
+  end;
+  authSet := nil;
+  for j := 0 to High(valid) do
+    if not InStrings(valid[j].Valid, authSet) then
+      authSet := Append(authSet, valid[j].Valid);
+  userSet := nil;
+  userSet := Append(userSet, authSet);
+  if (Length(initial) <> 1) or (initial[0] <> OidAnyPolicy) then
+  begin
+    newUser := nil;
+    for j := 0 to High(userSet) do
+      if InStrings(userSet[j], initial) then
+        newUser := Append(newUser, userSet[j]);
+    userSet := newUser;
+    if InStrings(OidAnyPolicy, authSet) then
+      for j := 0 to High(initial) do
+        if not InStrings(initial[j], userSet) then
+          userSet := Append(userSet, initial[j]);
+  end;
+  if (explicit = 0) and (Length(userSet) = 0) then
+    Result := False;
+end;
+
+{ ---- chains (verify.go) ---- }
+
+const
+  LeafCertificate = 0;
+  IntermediateCertificate = 1;
+  RootCertificate = 2;
+  MaxChainSignatureChecks = 100;
+
+{ isValid }
+function IsValidCert(C: TX509Cert; CertType: Integer; const Chain: TX509Certs; const Opts: TX509VerifyOptions; NowT: Integer): string;
+var
+  child: TX509Cert;
+  numIntermediates: Integer;
+begin
+  Result := '';
+  if Length(C.UnhandledCriticalExtensions) > 0 then
+  begin
+    Result := ErrUnhandledCritical;
+    Exit;
+  end;
+  if Length(Chain) > 0 then
+  begin
+    child := Chain[High(Chain)];
+    if child.RawIssuer <> C.RawSubject then
+    begin
+      Result := 'x509: issuer name does not match subject from issuing certificate';
+      Exit;
+    end;
+  end;
+  if NowT < C.NotBefore then
+  begin
+    Result := 'x509: certificate has expired or is not yet valid: current time ' + X509TimeRFC3339(NowT, 0) +
+      ' is before ' + X509TimeRFC3339(C.NotBefore, C.NotBeforeOffset);
+    Exit;
+  end
+  else if NowT > C.NotAfter then
+  begin
+    Result := 'x509: certificate has expired or is not yet valid: current time ' + X509TimeRFC3339(NowT, 0) +
+      ' is after ' + X509TimeRFC3339(C.NotAfter, C.NotAfterOffset);
+    Exit;
+  end;
+  if ((CertType = IntermediateCertificate) or (CertType = RootCertificate)) and (Length(Chain) = 0) then
+  begin
+    Result := 'x509: internal error: empty chain when appending CA cert';
+    Exit;
+  end;
+  if (CertType = IntermediateCertificate) and (not C.BasicConstraintsValid or not C.IsCA) then
+  begin
+    Result := 'x509: certificate is not authorized to sign other certificates';
+    Exit;
+  end;
+  if C.BasicConstraintsValid and (C.MaxPathLen >= 0) then
+  begin
+    numIntermediates := Length(Chain) - 1;
+    if numIntermediates > C.MaxPathLen then
+      Result := 'x509: too many intermediates for path length constraint';
+  end;
+end;
+
+function SANValue(C: TX509Cert; out V: string): Boolean;
+var
+  i: Integer;
+begin
+  for i := 0 to High(C.Extensions) do
+    if C.Extensions[i].Id = OidExtSAN then
+    begin
+      V := C.Extensions[i].Value;
+      Result := True;
+      Exit;
+    end;
+  V := '';
+  Result := False;
+end;
+
+{ alreadyInChain: same subject, same key, same SAN (or none) }
+function AlreadyInChain(Cand: TX509Cert; const Chain: TX509Certs): Boolean;
+var
+  i: Integer;
+  cs, ks: string;
+  hc, hk: Boolean;
+begin
+  Result := True;
+  hc := SANValue(Cand, cs);
+  for i := 0 to High(Chain) do
+  begin
+    if Cand.RawSubject <> Chain[i].RawSubject then
+      Continue;
+    if Cand.RawSubjectPublicKeyInfo <> Chain[i].RawSubjectPublicKeyInfo then
+      Continue;
+    hk := SANValue(Chain[i], ks);
+    if not hc and not hk then
+      Exit
+    else if not hc or not hk then
+    begin
+      Result := False;
+      Exit;
+    end;
+    if cs = ks then
+      Exit;
+  end;
+  Result := False;
+end;
+
+function FreshChain(const Chain: TX509Certs; C: TX509Cert): TX509Certs;
+begin
+  Result := nil;
+  Result := Append(Result, Chain);
+  Result := Append(Result, C);
+end;
+
+{ big.Int String of the serial's content octets }
+function X509SerialString(C: TX509Cert): string;
+var
+  v: string;
+  neg: Boolean;
+  i, rem, d: Integer;
+  allZero: Boolean;
+begin
+  v := C.SerialNumber;
+  neg := (Length(v) > 0) and ((Ord(v[1]) and $80) <> 0);
+  if neg then
+  begin
+    { the magnitude: invert and add one }
+    for i := 1 to Length(v) do
+      v[i] := Chr(not Ord(v[i]) and 255);
+    i := Length(v);
+    while i >= 1 do
+    begin
+      d := Ord(v[i]) + 1;
+      v[i] := Chr(d and 255);
+      if d < 256 then
+        Break;
+      Dec(i);
+    end;
+  end;
+  Result := '';
+  repeat
+    allZero := True;
+    rem := 0;
+    for i := 1 to Length(v) do
+    begin
+      d := rem * 256 + Ord(v[i]);
+      v[i] := Chr(d div 10);
+      rem := d mod 10;
+      if v[i] <> #0 then
+        allZero := False;
+    end;
+    Result := Chr(48 + rem) + Result;
+  until allZero;
+  if neg then
+    Result := '-' + Result;
+end;
+
+{ UnknownAuthorityError.Error }
+function UnknownAuthorityText(const HintErr: string; HintCert: TX509Cert): string;
+var
+  certName: string;
+begin
+  Result := 'x509: certificate signed by unknown authority';
+  if HintErr <> '' then
+  begin
+    certName := HintCert.SubjectCommonName;
+    if Length(certName) = 0 then
+    begin
+      if Length(HintCert.SubjectOrganization) > 0 then
+        certName := HintCert.SubjectOrganization[0]
+      else
+        certName := 'serial:' + X509SerialString(HintCert);
+    end;
+    Result := Result + ' (possibly because of ' + X509Quote(HintErr) + ' while trying to verify candidate authority certificate ' + X509Quote(certName) + ')';
+  end;
+end;
+
+{ buildChains; Err as Go's named result err ends up (the last candidate's
+  isValid error, a child's error, the signature limit, or
+  UnknownAuthorityError) }
+procedure BuildChains(C: TX509Cert; const Current: TX509Certs; var SigChecks: Integer; const Opts: TX509VerifyOptions;
+  NowT: Integer; out Chains: TX509Chains; out Err: string);
+var
+  hintErr, e: string;
+  hintCert: TX509Cert;
+  pass, i, j, certType: Integer;
+  pool: TX509Pool;
+  cands: TX509Certs;
+  cand: TX509Cert;
+  child: TX509Chains;
+  stop: Boolean;
+begin
+  Chains := nil;
+  Err := '';
+  hintErr := '';
+  hintCert := nil;
+  stop := False;
+  for pass := 0 to 1 do
+  begin
+    if pass = 0 then
+    begin
+      pool := Opts.Roots;
+      certType := RootCertificate;
+    end
+    else
+    begin
+      pool := Opts.Intermediates;
+      certType := IntermediateCertificate;
+    end;
+    if pool = nil then
+      Continue;
+    cands := pool.FindPotentialParents(C);
+    for i := 0 to High(cands) do
+    begin
+      cand := cands[i];
+      { considerCandidate }
+      Inc(SigChecks);
+      if SigChecks > MaxChainSignatureChecks then
+      begin
+        Err := ErrSigLimit;
+        stop := True;
+        Break;
+      end;
+      if not cand.HasPublicKey or AlreadyInChain(cand, Current) then
+        Continue;
+      e := X509CheckSignatureFrom(C, cand);
+      if e <> '' then
+      begin
+        if hintErr = '' then
+        begin
+          hintErr := e;
+          hintCert := cand;
+        end;
+        Continue;
+      end;
+      Err := IsValidCert(cand, certType, Current, Opts, NowT);
+      if Err <> '' then
+      begin
+        if hintErr = '' then
+        begin
+          hintErr := Err;
+          hintCert := cand;
+        end;
+        Continue;
+      end;
+      if certType = RootCertificate then
+        Chains := Append(Chains, FreshChain(Current, cand))
+      else
+      begin
+        BuildChains(cand, FreshChain(Current, cand), SigChecks, Opts, NowT, child, Err);
+        for j := 0 to High(child) do
+          Chains := Append(Chains, child[j]);
+      end;
+      if Err = ErrSigLimit then
+      begin
+        stop := True;
+        Break;
+      end;
+    end;
+    if stop then
+      Break;
+  end;
+  if Length(Chains) > 0 then
+    Err := '';
+  if (Length(Chains) = 0) and (Err = '') then
+    Err := UnknownAuthorityText(hintErr, hintCert);
+end;
+
+{ checkChainForKeyUsage }
+function CheckChainForKeyUsage(const Chain: TX509Certs; const KeyUsages: TX509Ints): Boolean;
+var
+  usages: TX509Ints;
+  remaining, i, j, k: Integer;
+  cert: TX509Cert;
+  anyUsage, ok: Boolean;
+begin
+  Result := False;
+  usages := nil;
+  usages := Append(usages, KeyUsages);
+  if Length(Chain) = 0 then
+    Exit;
+  remaining := Length(usages);
+  for i := High(Chain) downto 0 do
+  begin
+    cert := Chain[i];
+    if (Length(cert.ExtKeyUsage) = 0) and (Length(cert.UnknownExtKeyUsage) = 0) then
+      Continue;
+    anyUsage := False;
+    for j := 0 to High(cert.ExtKeyUsage) do
+      if cert.ExtKeyUsage[j] = X509EkuAny then
+        anyUsage := True;
+    if anyUsage then
+      Continue;
+    for j := 0 to High(usages) do
+    begin
+      if usages[j] = -1 then
+        Continue;
+      ok := False;
+      for k := 0 to High(cert.ExtKeyUsage) do
+        if cert.ExtKeyUsage[k] = usages[j] then
+          ok := True;
+      if ok then
+        Continue;
+      usages[j] := -1;
+      Dec(remaining);
+      if remaining = 0 then
+        Exit;
+    end;
+  end;
+  Result := True;
+end;
+
+function ContainsDistrusted(const Chain: TX509Certs): Boolean;
+var
+  i, j: Integer;
+  h: string;
+begin
+  Result := True;
+  for i := 0 to High(Chain) do
+  begin
+    h := HexOf(Sha256(Chain[i].RawSubjectPublicKeyInfo));
+    for j := 0 to High(DistrustedSpki) do
+      if DistrustedSpki[j] = h then
+        Exit;
+  end;
+  Result := False;
+end;
+
+function X509Verify(Cert: TX509Cert; const Opts: TX509VerifyOptions; out Chains: TX509Chains; out Err: string): Boolean;
+var
+  o: TX509VerifyOptions;
+  sysErr, cErr: string;
+  nowT, sigChecks, i, j, invalidPolicies, incompatible: Integer;
+  cand, kept: TX509Chains;
+  anyKeyUsage: Boolean;
+  details: TX509Strings;
+  one: TX509Certs;
+begin
+  Result := False;
+  Chains := nil;
+  Err := '';
+  if Length(Cert.Raw) = 0 then
+  begin
+    Err := 'x509: missing ASN.1 contents; use ParseCertificate';
+    Exit;
+  end;
+  o := Opts;
+  if o.Roots = nil then
+  begin
+    o.Roots := X509SystemRoots(sysErr);
+    if o.Roots = nil then
+    begin
+      Err := 'x509: failed to load system roots and no roots provided';
+      if sysErr <> '' then
+        Err := Err + '; ' + sysErr;
+      Exit;
+    end;
+  end;
+  nowT := o.CurrentTime;
+  if nowT = 0 then
+    nowT := NowUnix;
+  one := nil;
+  Err := IsValidCert(Cert, LeafCertificate, one, o, nowT);
+  if Err <> '' then
+    Exit;
+  if Length(o.DNSName) > 0 then
+  begin
+    Err := X509VerifyHostname(Cert, o.DNSName);
+    if Err <> '' then
+      Exit;
+  end;
+  cand := nil;
+  if o.Roots.HasCert(Cert) then
+  begin
+    one := Append(one, Cert);
+    cand := Append(cand, one);
+  end
+  else
+  begin
+    sigChecks := 0;
+    one := Append(one, Cert);
+    BuildChains(Cert, one, sigChecks, o, nowT, cand, Err);
+    if Err <> '' then
+      Exit;
+  end;
+  anyKeyUsage := False;
+  for i := 0 to High(o.KeyUsages) do
+    if o.KeyUsages[i] = X509EkuAny then
+    begin
+      anyKeyUsage := True;
+      Break;
+    end;
+  if Length(o.KeyUsages) = 0 then
+  begin
+    o.KeyUsages := nil;
+    o.KeyUsages := Append(o.KeyUsages, X509EkuServerAuth);
+  end;
+  invalidPolicies := 0;
+  incompatible := 0;
+  cErr := '';
+  kept := nil;
+  for i := 0 to High(cand) do
+  begin
+    if not X509PoliciesValid(cand[i], o) then
+    begin
+      Inc(invalidPolicies);
+      Continue;
+    end;
+    if not anyKeyUsage and not CheckChainForKeyUsage(cand[i], o.KeyUsages) then
+    begin
+      Inc(incompatible);
+      Continue;
+    end;
+    Err := CheckChainConstraints(cand[i]);
+    if Err <> '' then
+    begin
+      if cErr = '' then
+        cErr := 'x509: a root or intermediate certificate is not authorized to sign for this name: ' + Err;
+      Err := '';
+      Continue;
+    end;
+    if ContainsDistrusted(cand[i]) then
+      Continue;
+    kept := Append(kept, cand[i]);
+  end;
+  if Length(kept) = 0 then
+  begin
+    if cErr <> '' then
+    begin
+      Err := cErr;
+      Exit;
+    end;
+    details := nil;
+    if incompatible > 0 then
+    begin
+      if invalidPolicies = 0 then
+      begin
+        Err := 'x509: certificate specifies an incompatible key usage';
+        Exit;
+      end;
+      details := Append(details, IntStr(incompatible) + ' candidate chains with incompatible key usage');
+    end;
+    if invalidPolicies > 0 then
+      details := Append(details, IntStr(invalidPolicies) + ' candidate chains with invalid policies');
+    Err := 'x509: no valid chains built';
+    if Length(details) > 0 then
+      Err := Err + ': ' + JoinStrings(details, ', ');
+    Exit;
+  end;
+  for j := 0 to High(kept) do
+    Chains := Append(Chains, kept[j]);
+  Err := '';
+  Result := True;
+end;
+
+function X509VerifyServer(const Chain: array of string; const Host: string; NowUnix: Integer; Roots: TX509Pool; out Err: string): Boolean;
+var
+  certs: TX509Certs;
+  c: TX509Cert;
+  i: Integer;
+  opts: TX509VerifyOptions;
+  chains: TX509Chains;
+begin
+  Result := False;
+  Err := '';
+  if Length(Chain) = 0 then
+  begin
+    Err := 'x509: empty certificate chain';
+    Exit;
+  end;
+  certs := nil;
+  for i := 0 to High(Chain) do
+  begin
+    if not X509Parse(Chain[i], c, Err) then
+      Exit;
+    certs := Append(certs, c);
+  end;
+  opts := Default(TX509VerifyOptions);
+  opts.DNSName := Host;
+  opts.Roots := Roots;
+  opts.CurrentTime := NowUnix;
+  opts.Intermediates := TX509Pool.Create;
+  for i := 1 to High(certs) do
+    opts.Intermediates.AddCert(certs[i]);
+  Result := X509Verify(certs[0], opts, chains, Err);
+end;
+
+end.

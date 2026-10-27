@@ -622,6 +622,9 @@ GOLDEN_A64 += cipherkat cipherwyche
 # P429: X25519, P-256 and P-384, RSA against RFC 7748 and Wycheproof.
 GOLDEN += x25519kat x25519wyche nistwyche rsawyche
 GOLDEN_A64 += x25519kat x25519wyche nistwyche rsawyche
+# P430: X.509 against Go's crypto/x509, PEM, routines sharing roots.
+GOLDEN += x509verify x509pem x509conc
+GOLDEN_A64 += x509verify x509pem x509conc
 # P440: the digests in pieces equal the whole-message words, every cut.
 GOLDEN += hashpieces
 GOLDEN_A64 += hashpieces
@@ -703,6 +706,7 @@ LIB_UNITS := \
 	src/lib/pasxlsx.paslang \
 	src/lib/pasconn.paslang \
 	src/lib/pasurl.paslang \
+	src/lib/pasx509.paslang \
 	src/lib/pastextproto.paslang \
 	src/lib/pashttp.paslang \
 	src/lib/httpclient.paslang \
@@ -1232,6 +1236,14 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	if grep -q 'p_pashash_passha256updatecpu' $(BUILDDIR)/hashpieces-base.s; then echo "hashpieces-base.s calls the SHA-NI body"; exit 1; fi; \
 	if grep -q 'p_pashash_passha256cpu' $(BUILDDIR)/hash1-base.s; then echo "hash1-base.s calls the SHA-NI body"; exit 1; fi; \
 	if grep -q 'popcntq' $(BUILDDIR)/bitwords-base.s; then echo "bitwords-base.s carries popcnt"; exit 1; fi; \
+	: the system roots pasx509 loads are those Go loads, in the same order, P430; \
+	if command -v go > /dev/null 2>&1; then \
+	  (cd scripts/x509oracle && GOCACHE=$(abspath $(BUILDDIR))/gocache GOFLAGS=-mod=mod go build -o $(abspath $(BUILDDIR))/x509roots-go ./rootcheck); \
+	  $(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/x509roots testdata/x509roots.paslang; \
+	  $(BUILDDIR)/x509roots-go > $(BUILDDIR)/x509roots.want; \
+	  $(BUILDDIR)/x509roots > $(BUILDDIR)/x509roots.got; \
+	  diff -u $(BUILDDIR)/x509roots.want $(BUILDDIR)/x509roots.got; \
+	fi; \
 	: pascipher compiled for this processor seals through AES-NI and PCLMULQDQ, its base build through neither, P428; \
 	mkdir -p $(BUILDDIR)/cipherk; \
 	$(OUTDIR)/paslangc -c -Fu $(BUILDDIR) -o $(BUILDDIR)/cipherk/pascipher src/lib/pascipher.paslang; \
