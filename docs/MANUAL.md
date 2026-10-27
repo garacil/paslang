@@ -11957,6 +11957,61 @@ uses pasimap, pastls;
 c := ImapDial('correo.example.com', 993, ImapImplicit, 15000);   { IMAPS }
 ```
 
+`TTlsConfig` is a class, as Go's `*tls.Config` is a pointer: `nil` given
+to `TlsDial` or `TlsClient` asks for Go's defaults (the host dialed is
+the name checked, the system's roots, TLS 1.2 and 1.3, no ALPN), and one
+made with `TTlsConfig.Create` has those same defaults until a field is
+set (1.2.301, P473). This program sets four of them and is
+`testdata/tlsdoc`, which make check compiles and runs against Go's
+`crypto/tls` on both machines (`scripts/check_tlsdoc.py` has the manual
+show it word for word):
+
+```
+program tlsdoc;
+
+uses
+  sysutils, paslib, pastls;
+
+var
+  cfg: TTlsConfig;
+  s: TTlsStream;
+  roots, err, got, data: string;
+  n, dl: Integer;
+
+begin
+  { TTlsConfig is a class: nil asks for Go's defaults, a made one sets what
+    it names; the host is checked against ServerName, the roots are
+    RootsPem's instead of the system's, NowUnix is the time the
+    certificates are checked at (0 is now) }
+  cfg := TTlsConfig.Create;
+  cfg.ServerName := 'localhost';
+  if not ReadFile(ParamStr(3), roots) then
+    Halt(1);
+  cfg.RootsPem := roots;
+  cfg.NowUnix := 1811808000;
+  SetLength(cfg.Alpn, 1);
+  cfg.Alpn[0] := 'http/1.1';
+  s := TlsDial(ParamStr(1), StrToInt(ParamStr(2)), 10000, cfg, err);
+  if s = nil then
+  begin
+    WriteLn('handshake failed: ', err);
+    Halt(1);
+  end;
+  dl := Nanotime + 10000000000;
+  s.WriteAll('hello pastls'#10, dl);
+  got := '';
+  while Pos(#10, got) = 0 do
+  begin
+    n := s.ReadSome(65536, dl, data);
+    if n <= 0 then
+      Break;
+    got := got + data;
+  end;
+  Write('TLS ', IntToHex(s.Version, 4), ' ', s.Protocol, ' ', got);
+  s.Dispose;
+end.
+```
+
 `scripts/tls_interop.sh` runs `testdata/tlsinterop` against Go's
 `crypto/tls` (25 cases: every version, suite, group and key, the
 HelloRetryRequest, ALPN, a certificate request, a MiB each way, wrong

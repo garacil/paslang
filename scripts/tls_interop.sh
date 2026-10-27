@@ -4,13 +4,14 @@
 # paslang is free software under the GNU General Public License,
 # version 3 or (at your option) any later version; see the file COPYING.
 #
-# tls_interop.sh go|openssl SERVERBIN CLIENT [RUNNER]: pastls' client
+# tls_interop.sh go|openssl SERVERBIN CLIENT [RUNNER [DOC]]: pastls' client
 # (testdata/tlsinterop, under RUNNER, qemu for arm64) against Go's
 # crypto/tls (SERVERBIN built from scripts/tlsoracle) or openssl s_server,
 # one server a case on 127.0.0.1 with the port it chose; prints a line a
 # case, which make check compares with testdata/tlsinterop-go.out or
-# tlsinterop-openssl.out (P431).
-KIND=$1; SRV=$2; C=$3; R=$4
+# tlsinterop-openssl.out (P431). With DOC (testdata/tlsdoc, the manual's
+# example) a last line has it dial one more server of Go's (P473).
+KIND=$1; SRV=$2; C=$3; R=$4; DOC=$5
 T=$(mktemp -d)
 K=testdata/tls
 go_case() {
@@ -58,6 +59,14 @@ if [ "$KIND" = go ]; then
   go_case tls12-c02b big
   go_case tls12-c02b only13
   go_case tls13 conc
+  if [ -n "$DOC" ]; then
+    $SRV -case alpn -dir $T > $T/port 2> $T/err & pid=$!
+    i=0; while [ ! -s $T/port ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done
+    p=$(head -1 $T/port)
+    out=$($R $DOC 127.0.0.1 $p $T/ca.pem 2>&1 | tr '\n' ' ')
+    kill $pid; wait $pid 2>/dev/null
+    echo "doc: $out"
+  fi
 else
   E="-cert $K/ec.pem -key $K/ec.key"
   RS="-cert $K/rsa.pem -key $K/rsa.key"

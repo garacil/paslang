@@ -1257,9 +1257,12 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	if grep -q 'popcntq' $(BUILDDIR)/bitwords-base.s; then echo "bitwords-base.s carries popcnt"; exit 1; fi; \
 	: pastls against Go crypto/tls and openssl s_server, each case a server on 127.0.0.1, P431; \
 	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/tlsinterop testdata/tlsinterop.paslang; \
+	: the manual shows the program that sets a TTlsConfig and make check runs it against Go, P473; \
+	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/tlsdoc testdata/tlsdoc.paslang; \
+	python3 scripts/check_tlsdoc.py docs/MANUAL.md testdata/tlsdoc.paslang; \
 	if command -v go > /dev/null 2>&1; then \
 	  (cd scripts/tlsoracle && GOCACHE=$(abspath $(BUILDDIR))/gocache GOFLAGS=-mod=mod go build -o $(abspath $(BUILDDIR))/tlsoracle .); \
-	  sh scripts/tls_interop.sh go $(BUILDDIR)/tlsoracle $(BUILDDIR)/tlsinterop > $(BUILDDIR)/tlsinterop-go.got; \
+	  sh scripts/tls_interop.sh go $(BUILDDIR)/tlsoracle $(BUILDDIR)/tlsinterop '' $(BUILDDIR)/tlsdoc > $(BUILDDIR)/tlsinterop-go.got; \
 	  diff -u testdata/tlsinterop-go.out $(BUILDDIR)/tlsinterop-go.got; \
 	fi; \
 	if command -v openssl > /dev/null 2>&1; then \
@@ -5273,9 +5276,10 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	if grep -q 'p_pashash_passha256cpu' $(BUILDDIR)/hash1-arm-base.s; then echo "hash1-arm-base.s calls the SHA-256 body"; exit 1; fi; \
 	: pastls for the base arm64 on qemu against Go crypto/tls and openssl s_server on the host, ChaCha20 first, P431; \
 	$(OUTDIR)/paslangc -target arm64 -cpu base -Fu $(A64DIR) -o $(BUILDDIR)/tlsinterop-arm testdata/tlsinterop.paslang; \
+	$(OUTDIR)/paslangc -target arm64 -cpu base -Fu $(A64DIR) -o $(BUILDDIR)/tlsdoc-arm testdata/tlsdoc.paslang; \
 	if command -v go > /dev/null 2>&1; then \
 	  (cd scripts/tlsoracle && GOCACHE=$(abspath $(BUILDDIR))/gocache GOFLAGS=-mod=mod go build -o $(abspath $(BUILDDIR))/tlsoracle .); \
-	  sh scripts/tls_interop.sh go $(BUILDDIR)/tlsoracle $(BUILDDIR)/tlsinterop-arm $(QEMU_A64) > $(BUILDDIR)/tlsinterop-go-arm.got; \
+	  sh scripts/tls_interop.sh go $(BUILDDIR)/tlsoracle $(BUILDDIR)/tlsinterop-arm $(QEMU_A64) $(BUILDDIR)/tlsdoc-arm > $(BUILDDIR)/tlsinterop-go-arm.got; \
 	  diff -u testdata/tlsinterop-go-base.out $(BUILDDIR)/tlsinterop-go-arm.got; \
 	fi; \
 	if command -v openssl > /dev/null 2>&1; then \
