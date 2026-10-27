@@ -2435,6 +2435,11 @@ holds, or a global or a local on amd64, indexed by a constant or a
 variable, is reached with nothing pushed (1.1.295, P398): the index is
 compared with the length where it lies and the pointer is loaded after
 it; only a `var` parameter's descriptor, which may be nil, is tested.
+`Move(a, b, n)` whose arguments call nothing puts each straight into the
+register its copy takes it in (1.1.296, P399): a variable, a fixed
+place's address, `p^`, `p[i]` of a pointer and an index in registers, a
+field of an object, each in one or two loads, and one argument that is
+none of these worked out first, so nothing is pushed.
 A `for` of a constant count of four passes or fewer with a small body
 that neither changes its counter nor takes its address is written out
 once per pass with the pass's value in the counter's place, then the

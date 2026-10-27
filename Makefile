@@ -588,6 +588,9 @@ GOLDEN_A64 += incplace
 # P398: an element of a slice a field holds is reached with no push.
 GOLDEN += sliceat
 GOLDEN_A64 += sliceat
+# P399: Move's three arguments go straight to their registers.
+GOLDEN += moveregs
+GOLDEN_A64 += moveregs
 # P463: ToLower of a string with no capital is the string itself.
 GOLDEN += tolowershare
 GOLDEN_A64 += tolowershare
@@ -3098,6 +3101,17 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/sliceoob.out $(BUILDDIR)/sliceoob.got; \
 	grep -q 'index 2 out of range \[0..1\] at line 25' $(BUILDDIR)/sliceoob.err; \
 	echo ok sliceat-asm; \
+	: Move whose arguments call nothing sets its three registers with no push, P399; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/moveregs0 testdata/moveregs.paslang; \
+	$(BUILDDIR)/moveregs0 > $(BUILDDIR)/moveregs0.got; \
+	diff -u testdata/moveregs.out $(BUILDDIR)/moveregs0.got; \
+	$(OUTDIR)/paslangc -cpu base -o $(BUILDDIR)/moveregs-base testdata/moveregs.paslang; \
+	$(BUILDDIR)/moveregs-base > $(BUILDDIR)/moveregs-base.got; \
+	diff -u testdata/moveregs.out $(BUILDDIR)/moveregs-base.got; \
+	python3 -I scripts/check_moveregs.py $(BUILDDIR)/moveregs.s; \
+	python3 -I scripts/check_moveregs.py $(BUILDDIR)/moveregs0.s; \
+	python3 -I scripts/check_moveregs.py $(BUILDDIR)/moveregs-base.s; \
+	echo ok moveregs-asm; \
 	: a routine with nested ones zeroes only the locals a read may reach first, P358; \
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/nestzero0 testdata/nestzero.paslang; \
 	$(BUILDDIR)/nestzero0 > $(BUILDDIR)/nestzero0.got; \
@@ -4810,6 +4824,16 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	diff -u testdata/sliceoob.out $(BUILDDIR)/sliceoob-arm.got; \
 	grep -q 'index 2 out of range \[0..1\] at line 25' $(BUILDDIR)/sliceoob-arm.err; \
 	echo ok sliceat-arm-asm; \
+	: P399 on arm64: Move sets x1, x0 and x2 with no push; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/moveregs0-arm testdata/moveregs.paslang; \
+	timeout 300 $(QEMU_A64) $(BUILDDIR)/moveregs0-arm > $(BUILDDIR)/moveregs0-arm.got; \
+	diff -u testdata/moveregs.out $(BUILDDIR)/moveregs0-arm.got; \
+	$(OUTDIR)/paslangc -target arm64 -cpu base -Fu $(A64DIR) -o $(BUILDDIR)/moveregs-base-arm testdata/moveregs.paslang; \
+	timeout 300 $(QEMU_A64) $(BUILDDIR)/moveregs-base-arm > $(BUILDDIR)/moveregs-base-arm.got; \
+	diff -u testdata/moveregs.out $(BUILDDIR)/moveregs-base-arm.got; \
+	python3 -I scripts/check_moveregs.py $(BUILDDIR)/moveregs-arm.s --arm; \
+	python3 -I scripts/check_moveregs.py $(BUILDDIR)/moveregs0-arm.s --arm; \
+	echo ok moveregs-arm-asm; \
 	: P358 on arm64: the locals a read may reach first, zeroed alone; \
 	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/nestzero0-arm testdata/nestzero.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/nestzero0-arm > $(BUILDDIR)/nestzero0-arm.got; \

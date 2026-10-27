@@ -926,6 +926,8 @@ type
     function PoolWord(E: PExpr): string;
     function RegLeaf(E: PExpr; out Op: string; out Ty: LongInt): Boolean;
     function RegPlace(E: PExpr; out R: string; out Off: Int64): Boolean;
+    function MoveLeaf(E: PExpr; const R: string; Put: Boolean; out Reads: string): Boolean;
+    function EmitMoveRegs(S: PStmt): Boolean;
     function SliceOps(B: PExpr; out P, L: string): Boolean;
     function IncDirect(S: PStmt): Boolean;
     procedure ArgInto(E: PExpr; const R: string);
@@ -8525,7 +8527,7 @@ end;
   push (P304), else rt_memcpy. }
 procedure TEmitter.EmitMoveStmt(S: PStmt);
 begin
-  if EmitSmallMove(S) or EmitMoveArgs(S) then
+  if EmitSmallMove(S) or EmitMoveArgs(S) or EmitMoveRegs(S) then
     Exit;
   if FArm then
   begin
@@ -8923,6 +8925,207 @@ begin
       Line('  call rt_strshare');
     end;
   end;
+end;
+
+{ E, one of Move's arguments, straight into register R with no other
+  register written but x16 and x17 on arm64 (P399): a constant, a
+  string literal, a word variable, a fixed variable's address
+  (DirectArg, FixedAddr), the address p^ has, which is p, the address of
+  a pointer's element whose pointer is a register and whose index is a
+  register or a constant (one lea, one add), a word field of an object a
+  register holds (RegLeaf). Reads names the registers it reads, joined
+  by commas. With Put False it only says whether it can. }
+function TEmitter.MoveLeaf(E: PExpr; const R: string; Put: Boolean; out Reads: string): Boolean;
+var
+  s: TSym;
+  t: PExpr;
+  op, br, xr: string;
+  ty: LongInt;
+  esz, k, off: Int64;
+begin
+  Result := False;
+  Reads := '';
+  if E = nil then
+    Exit;
+  if (E^.Kind = ekVar) and TryFindSym(E^.Name, s) and (s.Reg <> '') then
+  begin
+    { a word variable a register holds: that register }
+    if (not WordVar(E, s)) or (TSize(s.Typ) <> 8) or (s.Up > 0) then
+      Exit;
+    Reads := s.Reg;
+    if Put then
+      LoadWordVar(s, R);
+    Result := True;
+    Exit;
+  end;
+  if FixedAddr(E, s, k) then
+  begin
+    if Put then
+      FixedTo(s, k, R);
+    Result := True;
+    Exit;
+  end;
+  if DirectArg(E, R, False) then
+  begin
+    if Put then
+      DirectArg(E, R, True);
+    Result := True;
+    Exit;
+  end;
+  if (E^.Kind = ekField) and RegLeaf(E, op, ty) and (TSize(ty) = 8) and
+    RegPlace(E, br, off) then
+  begin
+    Reads := br;
+    if Put then
+      WordLoad(op, ty, R);
+    Result := True;
+    Exit;
+  end;
+  { a word field of an object a word variable in memory holds: the
+    reference into R, the field from R }
+  if (E^.Kind = ekField) and (E^.L <> nil) and (not PtrAccess(E)) and WordScalar(E) and
+    (TSize(LoadTyp(E)) = 8) and (not IsStr(LoadTyp(E))) then
+  begin
+    off := E^.Off;
+    t := E^.L;
+    while (t^.Kind = ekField) and (TKind(t^.Typ) = tykRecord) and (t^.L <> nil) and
+      not PtrAccess(t) do
+    begin
+      off := off + t^.Off;
+      t := t^.L;
+    end;
+    if (t^.Kind = ekVar) and (TKind(t^.Typ) = tykClass) and WordVar(t, s) and
+      (s.Reg = '') and (s.Up <= 0) and (TSize(s.Typ) = 8) and (off >= 0) and
+      ((FArm and (off mod 8 = 0) and (off div 8 <= 4095)) or ((not FArm) and Fits32(off))) then
+    begin
+      if Put then
+      begin
+        LoadWordVar(s, R);
+        if FArm then
+          WordLoad('[' + R + ', #' + IntToStr(off) + ']', LoadTyp(E), R)
+        else
+          WordLoad(IntToStr(off) + '(%' + R + ')', LoadTyp(E), R);
+      end;
+      Result := True;
+      Exit;
+    end;
+  end;
+  if (E^.Kind <> ekAddr) or (E^.L = nil) or FCheckPtr then
+    Exit;
+  t := E^.L;
+  { p^ is at p }
+  if (t^.Kind = ekDeref) and (t^.L <> nil) and (TKind(t^.L^.Typ) = tykPointer) then
+  begin
+    Result := MoveLeaf(t^.L, R, Put, Reads);
+    Exit;
+  end;
+  { @p[i]: p plus i elements }
+  if (t^.Kind = ekIndex) and (t^.L <> nil) and (t^.R <> nil) and
+    (TKind(t^.L^.Typ) = tykPointer) and (WordReg(t^.L) <> '') then
+  begin
+    esz := TSize(FTypes[t^.L^.Typ].Elem);
+    if (esz <> 1) and (esz <> 2) and (esz <> 4) and (esz <> 8) then
+      Exit;
+    br := WordReg(t^.L);
+    if t^.R^.Kind = ekInt then
+    begin
+      if not Fits32(t^.R^.Num * esz) then
+        Exit;
+      Reads := br;
+      if Put then
+      begin
+        if FArm then
+          AddImmArm(R, br, t^.R^.Num * esz)
+        else
+          Line('  leaq ' + IntToStr(t^.R^.Num * esz) + '(%' + br + '), %' + R);
+      end;
+    end
+    else
+    begin
+      xr := WordReg(t^.R);
+      if xr = '' then
+        Exit;
+      Reads := br + ',' + xr;
+      if Put then
+      begin
+        if FArm then
+          ScaleAddArm(R, br, xr, esz, 'x16', 'x17')
+        else
+          Line('  leaq (%' + br + ',%' + xr + ',' + IntToStr(esz) + '), %' + R);
+      end;
+    end;
+    Result := True;
+  end;
+end;
+
+{ Move(a, b, n) whose arguments call nothing (P399): each leaf straight
+  into its register, rsi, rdi and rcx on amd64, x1, x0 and x2 on arm64,
+  as rt_memcpy takes them, and at most one argument that is no leaf
+  worked out first, in rax or x0, and moved to its register, so nothing
+  is pushed; a leaf that reads one of those registers sends Move the
+  general way, since another may be written first. Go's register ABI
+  passes a call's arguments in registers so (cmd/compile/
+  abi-internal.md). }
+function TEmitter.EmitMoveRegs(S: PStmt): Boolean;
+var
+  tg: array[0..2] of string;
+  rd: array[0..2] of string;
+  lf: array[0..2] of Boolean;
+  i, n, j: LongInt;
+  r: string;
+begin
+  Result := False;
+  if Length(S^.Args) <> 3 then
+    Exit;
+  for i := 0 to 2 do
+    if (S^.Args[i] = nil) or EHasCall(S^.Args[i]) then
+      Exit;
+  if FArm then
+  begin
+    tg[0] := 'x1';
+    tg[1] := 'x0';
+    tg[2] := 'x2';
+  end
+  else
+  begin
+    tg[0] := 'rsi';
+    tg[1] := 'rdi';
+    tg[2] := 'rcx';
+  end;
+  n := -1;
+  for i := 0 to 2 do
+  begin
+    lf[i] := MoveLeaf(S^.Args[i], tg[i], False, rd[i]);
+    if not lf[i] then
+    begin
+      if n >= 0 then
+        Exit;
+      n := i;
+    end
+    else
+      for j := 0 to 2 do
+        if (rd[i] <> '') and (Pos(',' + tg[j] + ',', ',' + rd[i] + ',') > 0) then
+          Exit;
+  end;
+  if n >= 0 then
+  begin
+    EmitExpr(S^.Args[n]);
+    if FArm then
+    begin
+      if tg[n] <> 'x0' then
+        Line('  mov ' + tg[n] + ', x0');
+    end
+    else
+      Line('  movq %rax, %' + tg[n]);
+  end;
+  for i := 0 to 2 do
+    if lf[i] then
+      MoveLeaf(S^.Args[i], tg[i], True, r);
+  if FArm then
+    Line('  bl rt_memcpy')
+  else
+    Line('  call rt_memcpy');
+  Result := True;
 end;
 
 { Move(a, b, n) of any count with a and b fixed variables and n without
