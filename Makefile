@@ -689,6 +689,9 @@ GOLDEN_A64 += valdec
 # P481: FloatToStr of a Double and a Single, as the compiler before it wrote them.
 GOLDEN += ftoashort
 GOLDEN_A64 += ftoashort
+# P482: StrToFloat on the short path and the long, as the compiler before it read them.
+GOLDEN += atoffast
+GOLDEN_A64 += atoffast
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
