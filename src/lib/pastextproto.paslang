@@ -54,6 +54,8 @@ type
   public
     { Name is made canonical (Go's CanonicalMIMEHeaderKey) }
     procedure Add(const Name, Value: string);
+    { Key is canonical already, as the reader makes it }
+    procedure AddCanonical(const Key, Value: string);
     { every value of Name replaced by this one }
     procedure Put(const Name, Value: string);
     procedure Remove(const Name: string);
@@ -61,6 +63,14 @@ type
     function Get(const Name: string): string;
     function Has(const Name: string): Boolean;
     function ValuesOf(const Name: string): TStringArray;
+    { the lookups for a Key that is canonical already (a literal such as
+      'Content-Length'), which spare the pass that makes it so }
+    function GetCanon(const Key: string): string;
+    function HasCanon(const Key: string): Boolean;
+    function CountOfCanon(const Key: string): Integer;
+    function ValuesOfCanon(const Key: string): TStringArray;
+    function HasTokenCanon(const Key, Token: string): Boolean;
+    procedure RemoveCanon(const Key: string);
     function CountOf(const Name: string): Integer;
     { whether a value of Name has Token in its comma-separated list, with
       no regard to case (Connection: keep-alive, Close) }
@@ -153,13 +163,7 @@ end;
 
 function MimeIsTchar(C: Char): Boolean;
 begin
-  Result := ((C >= '0') and (C <= '9')) or ((C >= 'a') and (C <= 'z')) or ((C >= 'A') and (C <= 'Z'));
-  if Result then
-    Exit;
-  case C of
-    '!', '#', '$', '%', '&', '''', '*', '+', '-', '.', '^', '_', '`', '|', '~':
-      Result := True;
-  end;
+  Result := C in ['0'..'9', 'a'..'z', 'A'..'Z', '!', '#', '$', '%', '&', '''', '*', '+', '-', '.', '^', '_', '`', '|', '~'];
 end;
 
 function MimeIsToken(const S: string): Boolean;
@@ -251,13 +255,32 @@ begin
   Result := (v = 9) or ((v >= 32) and (v < 127)) or (v >= 128);
 end;
 
+{ the letters of a name of field bytes made Like-This }
+procedure MimeFixCase(var S: string);
+var
+  i: Integer;
+  upper: Boolean;
+  c: Char;
+begin
+  upper := True;
+  for i := 1 to Length(S) do
+  begin
+    c := S[i];
+    if upper and (c >= 'a') and (c <= 'z') then
+      S[i] := Chr(Ord(c) - 32)
+    else if (not upper) and (c >= 'A') and (c <= 'Z') then
+      S[i] := Chr(Ord(c) + 32);
+    upper := c = '-';
+  end;
+end;
+
 { canonicalMIMEHeaderKey: a name of field bytes made Like-This; with a
   space in it (a server's slip) it is let through as it is; anything else
   is not a name }
 function MimeCanonKey(const A: string; out Ok: Boolean): string;
 var
   i: Integer;
-  upper, noCanon: Boolean;
+  upper, noCanon, changed: Boolean;
   c: Char;
 begin
   Ok := False;
@@ -265,70 +288,94 @@ begin
   if A = '' then
     Exit;
   noCanon := False;
+  changed := False;
+  upper := True;
   for i := 1 to Length(A) do
   begin
-    if MimeFieldByte(A[i]) then
-      Continue;
-    if A[i] = ' ' then
+    c := A[i];
+    if MimeIsTchar(c) then
     begin
-      noCanon := True;
-      Continue;
-    end;
-    Exit;
+      if upper then
+      begin
+        if (c >= 'a') and (c <= 'z') then
+          changed := True;
+      end
+      else if (c >= 'A') and (c <= 'Z') then
+        changed := True;
+      upper := c = '-';
+    end
+    else if c = ' ' then
+      noCanon := True
+    else
+      Exit;
   end;
   Ok := True;
-  if noCanon then
+  if noCanon or not changed then
     Exit;
-  upper := True;
-  for i := 1 to Length(Result) do
-  begin
-    c := Result[i];
-    if upper and (c >= 'a') and (c <= 'z') then
-      c := Chr(Ord(c) - 32)
-    else if (not upper) and (c >= 'A') and (c <= 'Z') then
-      c := Chr(Ord(c) + 32);
-    Result[i] := c;
-    upper := c = '-';
-  end;
+  MimeFixCase(Result);
 end;
 
 function MimeCanonicalKey(const S: string): string;
 var
   i: Integer;
+  upper, stable: Boolean;
+  c: Char;
   ok: Boolean;
 begin
+  { a name with no letter out of place is its own key, whatever its bytes: found in
+    one short pass, as the names a program asks for nearly always are }
+  stable := True;
+  upper := True;
   for i := 1 to Length(S) do
-    if not MimeFieldByte(S[i]) then
+  begin
+    c := S[i];
+    if upper then
     begin
-      Result := S;
-      Exit;
+      if (c >= 'a') and (c <= 'z') then
+      begin
+        stable := False;
+        Break;
+      end;
+    end
+    else if (c >= 'A') and (c <= 'Z') then
+    begin
+      stable := False;
+      Break;
     end;
-  Result := MimeCanonKey(S, ok);
+    upper := c = '-';
+  end;
+  if stable then
+    Result := S
+  else
+    Result := MimeCanonKey(S, ok);
 end;
 
 { ---- fields ---- }
 
-procedure TMimeFields.Add(const Name, Value: string);
+procedure TMimeFields.AddCanonical(const Key, Value: string);
 begin
   if FCount >= Length(FNames) then
   begin
     SetLength(FNames, FCount * 2 + 8);
     SetLength(FValues, FCount * 2 + 8);
   end;
-  FNames[FCount] := MimeCanonicalKey(Name);
+  FNames[FCount] := Key;
   FValues[FCount] := Value;
   FCount := FCount + 1;
 end;
 
-procedure TMimeFields.Remove(const Name: string);
+procedure TMimeFields.Add(const Name, Value: string);
+begin
+  AddCanonical(MimeCanonicalKey(Name), Value);
+end;
+
+procedure TMimeFields.RemoveCanon(const Key: string);
 var
   i, j: Integer;
-  k: string;
 begin
-  k := MimeCanonicalKey(Name);
   j := 0;
   for i := 0 to FCount - 1 do
-    if FNames[i] <> k then
+    if FNames[i] <> Key then
     begin
       FNames[j] := FNames[i];
       FValues[j] := FValues[i];
@@ -337,20 +384,23 @@ begin
   FCount := j;
 end;
 
+procedure TMimeFields.Remove(const Name: string);
+begin
+  RemoveCanon(MimeCanonicalKey(Name));
+end;
+
 procedure TMimeFields.Put(const Name, Value: string);
 begin
   Remove(Name);
   Add(Name, Value);
 end;
 
-function TMimeFields.Get(const Name: string): string;
+function TMimeFields.GetCanon(const Key: string): string;
 var
   i: Integer;
-  k: string;
 begin
-  k := MimeCanonicalKey(Name);
   for i := 0 to FCount - 1 do
-    if FNames[i] = k then
+    if FNames[i] = Key then
     begin
       Result := FValues[i];
       Exit;
@@ -358,37 +408,60 @@ begin
   Result := '';
 end;
 
-function TMimeFields.Has(const Name: string): Boolean;
+function TMimeFields.Get(const Name: string): string;
 begin
-  Result := CountOf(Name) > 0;
+  Result := GetCanon(MimeCanonicalKey(Name));
 end;
 
-function TMimeFields.CountOf(const Name: string): Integer;
+function TMimeFields.HasCanon(const Key: string): Boolean;
 var
   i: Integer;
-  k: string;
 begin
-  k := MimeCanonicalKey(Name);
+  Result := True;
+  for i := 0 to FCount - 1 do
+    if FNames[i] = Key then
+      Exit;
+  Result := False;
+end;
+
+function TMimeFields.Has(const Name: string): Boolean;
+begin
+  Result := HasCanon(MimeCanonicalKey(Name));
+end;
+
+function TMimeFields.CountOfCanon(const Key: string): Integer;
+var
+  i: Integer;
+begin
   Result := 0;
   for i := 0 to FCount - 1 do
-    if FNames[i] = k then
+    if FNames[i] = Key then
       Result := Result + 1;
 end;
 
-function TMimeFields.ValuesOf(const Name: string): TStringArray;
+function TMimeFields.CountOf(const Name: string): Integer;
+begin
+  Result := CountOfCanon(MimeCanonicalKey(Name));
+end;
+
+function TMimeFields.ValuesOfCanon(const Key: string): TStringArray;
 var
   i, n: Integer;
-  k: string;
 begin
-  k := MimeCanonicalKey(Name);
-  SetLength(Result, CountOf(Name));
+  n := CountOfCanon(Key);
+  SetLength(Result, n);
   n := 0;
   for i := 0 to FCount - 1 do
-    if FNames[i] = k then
+    if FNames[i] = Key then
     begin
       Result[n] := FValues[i];
       n := n + 1;
     end;
+end;
+
+function TMimeFields.ValuesOf(const Name: string): TStringArray;
+begin
+  Result := ValuesOfCanon(MimeCanonicalKey(Name));
 end;
 
 { httpguts.headerValueContainsToken }
@@ -412,19 +485,22 @@ begin
   Result := MimeEqualFold(MimeTrimOws(rest), Token);
 end;
 
-function TMimeFields.HasToken(const Name, Token: string): Boolean;
+function TMimeFields.HasTokenCanon(const Key, Token: string): Boolean;
 var
   i: Integer;
-  k: string;
 begin
-  k := MimeCanonicalKey(Name);
   Result := False;
   for i := 0 to FCount - 1 do
-    if (FNames[i] = k) and MimeValueHasToken(FValues[i], Token) then
+    if (FNames[i] = Key) and MimeValueHasToken(FValues[i], Token) then
     begin
       Result := True;
       Exit;
     end;
+end;
+
+function TMimeFields.HasToken(const Name, Token: string): Boolean;
+begin
+  Result := HasTokenCanon(MimeCanonicalKey(Name), Token);
 end;
 
 function TMimeFields.Count: Integer;
@@ -499,10 +575,12 @@ function MimeReadHeaderStep(const Text: string; var Pos0: Integer; Fields: TMime
   var NFields: Integer): Boolean;
 var
   line, kv, k, v, key: string;
-  p, i, save, start: Integer;
-  ok: Boolean;
+  p, i, save, start, n, j, e, c0, vs, ve: Integer;
+  ok, upper, changed: Boolean;
+  c: Char;
 begin
   Result := False;
+  n := Length(Text);
   if (NFields = 0) and (Pos0 <= Length(Text)) and ((Text[Pos0] = ' ') or (Text[Pos0] = #9)) then
   begin
     if not MimeCutLine(Text, Pos0, line, Eof) then
@@ -519,6 +597,67 @@ begin
   begin
     { a field begins here; if it is not all there Pos0 is left here }
     start := Pos0;
+    { a field that lies whole on one line, with a plain name and a plain value, and a line
+      after it that does not go on with it, is made from where it lies; any other goes the
+      long way below, which says what is wrong with it }
+    j := Pos(#10, Text, Pos0);
+    if j = 0 then
+      j := n + 1;
+    if (j > Pos0) and (j < n) and (Text[j + 1] <> ' ') and (Text[j + 1] <> #9) then
+    begin
+      e := j;
+      if Text[e - 1] = #13 then
+        e := e - 1;
+      if (e > Pos0) and (Text[Pos0] <> ' ') and (Text[Pos0] <> #9) then
+      begin
+        c0 := Pos0;
+        upper := True;
+        changed := False;
+        while c0 < e do
+        begin
+          c := Text[c0];
+          if not MimeIsTchar(c) then
+            Break;
+          if upper then
+          begin
+            if (c >= 'a') and (c <= 'z') then
+              changed := True;
+          end
+          else if (c >= 'A') and (c <= 'Z') then
+            changed := True;
+          upper := c = '-';
+          c0 := c0 + 1;
+        end;
+        if (c0 > Pos0) and (c0 < e) and (Text[c0] = ':') then
+        begin
+          vs := c0 + 1;
+          ve := e;
+          while (vs < ve) and ((Text[vs] = ' ') or (Text[vs] = #9)) do
+            vs := vs + 1;
+          while (ve > vs) and ((Text[ve - 1] = ' ') or (Text[ve - 1] = #9)) do
+            ve := ve - 1;
+          ok := True;
+          for i := vs to ve - 1 do
+            if not MimeValueByte(Text[i]) then
+            begin
+              ok := False;
+              Break;
+            end;
+          if ok then
+          begin
+            NFields := NFields + 1;
+            if (MaxFields > 0) and (NFields > MaxFields) then
+              raise EMimeError.CreateTooLarge('message too large');
+            key := Copy(Text, Pos0, c0 - Pos0);
+            if changed then
+              MimeFixCase(key);
+            Fields.AddCanonical(key, Copy(Text, vs, ve - vs));
+            Pos0 := j + 1;
+            Continue;
+          end;
+        end;
+      end;
+    end;
     if not MimeCutLine(Text, Pos0, line, Eof) then
     begin
       Pos0 := start;
@@ -577,7 +716,7 @@ begin
     i := 1;
     while (i <= Length(v)) and ((v[i] = ' ') or (v[i] = #9)) do
       i := i + 1;
-    Fields.Add(key, Copy(v, i, Length(v) - i + 1));
+    Fields.AddCanonical(key, Copy(v, i, Length(v) - i + 1));
   end;
 end;
 
@@ -643,7 +782,7 @@ begin
     i := 1;
     while (i <= Length(v)) and ((v[i] = ' ') or (v[i] = #9)) do
       i := i + 1;
-    Fields.Add(key, Copy(v, i, Length(v) - i + 1));
+    Fields.AddCanonical(key, Copy(v, i, Length(v) - i + 1));
   end;
 end;
 

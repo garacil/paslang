@@ -187,6 +187,7 @@ def build():
     for body, bd, raw in MP:
         rows.append(("mp", [body, bd, str(raw)]))
     base = list(rows)
+    mutants = []
     for i in range(1800):
         kind, args = R.choice(base)
         a = list(args)
@@ -200,7 +201,25 @@ def build():
             a[0] = mutate(a[0])
             if i % 3 == 0:
                 a[0] = mutate(a[0])
-        rows.append((kind, a))
+        mutants.append((kind, a))
+    rows += mutants
+    # P479: the key textproto makes of a name, and whether the name is found
+    # by itself with its letters' case turned; the names of a header block
+    # as they come, in any case, and every byte alone
+    rk = random.Random(4790)
+    names = ["content-type", "Content-Type", "CONTENT-TYPE", "x-forwarded-for", "X-FORWARDED-FOR", "x_y", "X_Y", "a-b-c",
+             "-", "--", "a--b", "1abc", "abc1", "ABC-def-GHI", "a b", "a  b", " a", "a ", "host", "HOST", "hOsT",
+             "content-length", "Content-length", "x-real-ip", "X-Real-IP", "user-agent", "te", "TE", "WWW-Authenticate",
+             "etag", "ETag", "a:b", "a\tb", "\xe9a", "a\xe9", "x-\xe9", "a" * 200, "A" * 200, "a-" * 100]
+    for c in range(32, 127):
+        names.append(chr(c))
+        names.append("a" + chr(c) + "b")
+        names.append("Ab" + chr(c))
+    alpha = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_- !#:\t\x80"
+    for i in range(600):
+        names.append("".join(rk.choice(alpha) for _ in range(rk.randint(1, 18))))
+    for nm in names:
+        rows.append(("hkey", [nm]))
     return rows
 
 

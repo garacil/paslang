@@ -23,6 +23,7 @@ import (
 	"mime/multipart"
 	"mime/quotedprintable"
 	"net/mail"
+	"net/textproto"
 	"os"
 	"sort"
 	"strings"
@@ -134,6 +135,25 @@ func run(f []string) string {
 			e = mime.BEncoding
 		}
 		return "ok|" + q(e.Encode(arg(f, 2), arg(f, 3)))
+	case "hkey":
+		// the key textproto makes of a name, and whether a MIMEHeader that was given the name
+		// finds it by the name with the case of each letter turned
+		name := arg(f, 2)
+		h := textproto.MIMEHeader{}
+		h.Add(name, "v")
+		sw := []byte(name)
+		for i, c := range sw {
+			if c >= 'a' && c <= 'z' {
+				sw[i] = c - 32
+			} else if c >= 'A' && c <= 'Z' {
+				sw[i] = c + 32
+			}
+		}
+		found := "0"
+		if h.Get(string(sw)) != "" {
+			found = "1"
+		}
+		return "ok|" + q(textproto.CanonicalMIMEHeaderKey(name)) + "|" + found
 	case "mt":
 		mt, p, err := mime.ParseMediaType(arg(f, 2))
 		if err != nil {

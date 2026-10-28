@@ -86,7 +86,9 @@ PAIRS = ["b1loop", "b2str", "b3spawn", "b4chan", "b5map", "b6smap", "b7narrow", 
          # P433: mail (messages read into a tree, address lists, the composer, encoded words)
          "b40mail",
          # P451: base64 encode and decode of 3 MB against encoding/base64
-         "b41base64"]
+         "b41base64",
+         # P479: HTTP requests read (pashttp's reader against net/http's ReadRequest)
+         "b42http"]
 # The longest one run may take, in seconds: a run past it is killed, its
 # unit stops being measured and fails (Go's side of every pair takes
 # under 1 s; paslang's append of a character, quadratic until its hito,
@@ -129,6 +131,7 @@ SECTIONS = {
     "b39flate": ["deflate", "inflate"],
     "b40mail": ["message", "addr", "build", "words"],
     "b41base64": ["roundtrip"],
+    "b42http": ["requests"],
 }
 CHECKPTR = ["b8ptr"]
 PROBES = ["p1alloccap", "p2deeprec", "p3divzero", "p4nil", "p5bounds", "p6strbounds", "p7parked"]
@@ -231,6 +234,10 @@ _B37 = {
 for _op in _B37:
     for _f, _v in zip(_B37F, _B37[_op]):
         BUDGET["b37json:" + _op + "-" + _f] = _v
+# P479 (1.2.304): b42http, 200,000 requests read, nine alternating rounds: 0.69
+# native and 0.66 base of net/http's ReadRequest (it was 1.80 and 1.75); the
+# larger plus 0.075 rounded up to 0.05.
+BUDGET["b42http:requests"] = 0.80
 # paslangc -checkptr / the plain build, per pair in CHECKPTR (P104).
 CHECKPTR_BUDGET = {"b8ptr": 10.0}
 # Peak resident memory, paslang / Go, the medians of MEM_RUNS traced runs:
