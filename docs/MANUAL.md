@@ -12082,10 +12082,10 @@ Edition) call not well-formed, with the line and column; a tree that keeps
 the bytes of every node it read, so a document edited and written back
 differs from the original only where it was edited; a writer; escaping.
 It is made for the parts of a spreadsheet, a feed or a configuration, and
-it is checked three ways: `testdata/xmlcorpus` reads 2,672 documents (one
-for each production of the two recommendations, and the same with bytes
-changed, inserted and removed) with and without namespaces and gets what
-expat gets (`scripts/xml_corpus.py` has pyexpat make the expected lines);
+it is checked three ways: `testdata/xmlcorpus` reads 4,165 documents (one
+for each production of the two recommendations, the declarations of a
+DOCTYPE, and the same with bytes changed, inserted and removed) with and
+without namespaces and gets what expat gets (`scripts/xml_corpus.py` has pyexpat make the expected lines);
 the W3C conformance suite (`scripts/xmlconf.py`, with the suite from
 w3.org) runs 1,494 cases that apply to a processor that reads the internal
 subset and no external entity, and the cases it does not pass are listed in
@@ -12108,7 +12108,9 @@ Out := d.Xml;                         { the document written; Text itself when n
   untouched node as it was: its attribute order, quotes, white space,
   entity and character references (`&#169;`, `&amp;`), CDATA sections,
   comments, the XML declaration, the DOCTYPE, the line ends (CRLF as CRLF)
-  and a byte order mark. An edited element is written again as far as it
+  and a byte order mark; the nodes read from an entity's text have no bytes
+  of the document, so when an ancestor is edited they are written as their
+  text and the reference they came from is not. An edited element is written again as far as it
   changed: a changed attribute is written `name="value"` (keeping its quote
   character) in its place, the others as they were; a new attribute goes
   after the last with one space; text you set is escaped (`&`, `<`, `>`,
@@ -12126,12 +12128,22 @@ Out := d.Xml;                         { the document written; Text itself when n
   instructions, and entities. Entities are the five of XML, character
   references and the internal general entities, expanded in text and in
   attribute values; a loop, more than `MaxExpansion` bytes (16 MiB), or
-  more than 20 levels is refused, so a billion-laughs document is. **Left
-  out:** an entity whose text holds markup is refused, not misread; an
-  external entity, an external subset and a parameter entity are never
-  read, and a reference to one is refused; default attribute values and
-  the declared types of attributes are not applied; names in the namespace
-  are not checked as URIs. UTF-16 is taken with a byte order mark or when
+  more than 20 levels is refused, so a billion-laughs document is. What the
+  internal subset declares is applied, as XML 1.0 5.1 asks of a processor
+  that reads it (1.2.303, P446): an entity whose text holds markup is read
+  where it is referenced, as content in the scope of the element it is in
+  (its elements must close inside it; one in an attribute value is
+  refused); an attribute declared with a default value is on the start tags
+  that do not give it, marked `Defaulted` and not written back; the value of
+  an attribute declared with a type other than CDATA has its spaces
+  trimmed and collapsed. Past a reference to a parameter entity, and when
+  `standalone` is not `yes`, the declarations are not used, since the
+  entity may have overridden them, and a reference to an entity not
+  declared, in a document with an external subset or such a reference, is
+  skipped and not refused. **Left out:** an external entity, an external
+  subset and a parameter entity are never read, and a reference to an
+  external entity is refused; names in the namespace are not checked as
+  URIs. UTF-16 is taken with a byte order mark or when
   it starts `<?`, ISO-8859-1 when the declaration says so, and any other
   declared encoding is refused, as Go's decoder refuses it without a
   `CharsetReader`.
@@ -12141,13 +12153,15 @@ Out := d.Xml;                         { the document written; Text itself when n
   (a name with a colon is the qualified name, else the local name),
   `ElemNS(uri, local)`/`ElemsNS`, `Find('a/b/c')`; `Attr`, `HasAttr`,
   `AttrNS(uri, local)`, `AttrCount`/`AttrAt(i)` (name, prefix, local, URI,
-  value, `IsNs` for a declaration), `SetAttr`, `RemoveAttr`; `Text`,
+  value, `IsNs` for a declaration, `Defaulted` for a default value the
+  DOCTYPE gave), `SetAttr`, `RemoveAttr`; `Text`,
   `SetText`, `Value` (text, CDATA, comment and PI data, readable and
   writable); `AddElem(name)` (made, appended and returned), `AddChild`,
   `InsertChild(i, n)`, `RemoveAt`, `Detach`, `AppendText`, `AppendXml(s)` and
   `InsertXml(i, s)` (content in XML text, read in the scope of the element,
   its namespace declarations included); `OuterXml`, `InnerXml`; `Offset` and
-  `ByteLength` in the text it was read from. `TXmlDoc`: `Root`,
+  `ByteLength` in the text it was read from (`Offset` is -1 for a node read
+  from an entity's text). `TXmlDoc`: `Root`,
   `Count`/`Item(i)` for the top level (the declaration, comments, the
   DOCTYPE and the white space between them), `CreateElement`, `CreateText`,
   `CreateCData`, `CreateComment`, `CreatePI`, `AddTop`, `Xml`, and the

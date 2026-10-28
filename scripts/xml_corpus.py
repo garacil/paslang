@@ -160,6 +160,148 @@ HAND = [
     b'<a ' + b' '.join(b'a%d="%d"' % (i, i) for i in range(40)) + b'/>',
 ]
 
+# P446: the DOCTYPE's declarations applied. Entities whose text is markup, read as content;
+# the attributes the subset declares, defaulted and normalized by their type.
+DTD = [
+    # markup in an entity
+    b'<!DOCTYPE a [<!ENTITY e "<b/>">]><a>&e;</a>',
+    b'<!DOCTYPE a [<!ENTITY e "<b>x</b>y">]><a>1&e;2</a>',
+    b'<!DOCTYPE a [<!ENTITY e "<b>x</b>y">]><a>&e;&e;</a>',
+    b'<!DOCTYPE a [<!ENTITY e "pre<b/>post">]><a>[&e;]</a>',
+    b'<!DOCTYPE a [<!ENTITY e1 "<c>&e2;</c>"><!ENTITY e2 "t<d/>">]><a>&e1;</a>',
+    b'<!DOCTYPE a [<!ENTITY e2 "t<d/>"><!ENTITY e1 "<c>&e2;</c>">]><a>&e1;</a>',
+    b'<!DOCTYPE a [<!ENTITY e1 "<c>&e2;</c>"><!ENTITY e2 "t<d/>">]><a>&e1;&e2;&e1;</a>',
+    b'<!DOCTYPE a [<!ENTITY e "<b/>">]>&e;',
+    b'<!DOCTYPE a [<!ENTITY e "<a/>">]>&e;',
+    b'<!DOCTYPE a [<!ENTITY e "<b/>">]><a/>&e;',
+    b'<!DOCTYPE a [<!ENTITY e "<b>">]><a>&e;</a>',
+    b'<!DOCTYPE a [<!ENTITY e "<b>">]><a>&e;</b></a>',
+    b'<!DOCTYPE a [<!ENTITY e "</b>">]><a><b>&e;</a>',
+    b'<!DOCTYPE a [<!ENTITY e "</a><a>">]><a>&e;</a>',
+    b'<!DOCTYPE a [<!ENTITY e "<b></a>">]><a>&e;</a>',
+    b'<!DOCTYPE a [<!ENTITY e "<b">]><a>&e;></a>',
+    b'<!DOCTYPE a [<!ENTITY e "<b x=\'v>">]><a>&e;\'/></a>',
+    b'<!DOCTYPE a [<!ENTITY e "<b/>">]><a x="&e;"/>',
+    b'<!DOCTYPE a [<!ENTITY e "x&#60;y">]><a x="&e;"/>',
+    b'<!DOCTYPE a [<!ENTITY e "x&#60;y">]><a>&e;</a>',
+    b'<!DOCTYPE a [<!ENTITY e "x&#60;/a>">]><a>&e;',
+    b'<!DOCTYPE a [<!ENTITY e "&#38;#60;">]><a>&e;</a>',
+    b'<!DOCTYPE a [<!ENTITY e "&#38;#60;b/>">]><a>&e;</a>',
+    b'<!DOCTYPE a [<!ENTITY e "&#60;!-- c -->">]><a>&e;</a>',
+    b'<!DOCTYPE a [<!ENTITY e "<!--c--><?p d?><![CDATA[x<y]]>">]><a>&e;</a>',
+    b'<!DOCTYPE a [<!ENTITY e "<![CDATA[x">]><a>&e;]]></a>',
+    b'<!DOCTYPE a [<!ENTITY e "]]>">]><a>&e;</a>',
+    b'<!DOCTYPE a [<!ENTITY e "<?xml version=\'1.0\'?>">]><a>&e;</a>',
+    b'<!DOCTYPE a [<!ENTITY e "<?xml?>">]><a>&e;</a>',
+    b'<!DOCTYPE a [<!ENTITY e "<!DOCTYPE b>">]><a>&e;</a>',
+    b'<!DOCTYPE a [<!ENTITY e "<?p?>">]><a>&e;</a>',
+    b'<!DOCTYPE a [<!ENTITY e "<b/>">]><a>&f;</a>',
+    b'<!DOCTYPE a [<!ENTITY e "<b/>&f;">]><a>&e;</a>',
+    b'<!DOCTYPE a [<!ENTITY e "<b/>&f;"><!ENTITY f "t">]><a>&e;</a>',
+    b'<!DOCTYPE a [<!ENTITY e "<b>&e;</b>">]><a>&e;</a>',
+    b'<!DOCTYPE a [<!ENTITY e "&f;<x/>"><!ENTITY f "&e;">]><a>&e;</a>',
+    b'<!DOCTYPE a [<!ENTITY e "<b/>"><!ENTITY e "<c/>">]><a>&e;</a>',
+    b'<!DOCTYPE a [<!ENTITY e "<b/>">]><a>&e;<!--c-->&e;<?p?>&e;</a>',
+    b'<!DOCTYPE a [<!ENTITY e "<b x=\'1\' y=\"2\"/>">]><a>&e;</a>',
+    b'<!DOCTYPE a [<!ENTITY e "<b x=\'1\' x=\'2\'/>">]><a>&e;</a>',
+    b'<!DOCTYPE a [<!ENTITY e "<b x=\'&amp;\'/>">]><a>&e;</a>',
+    b'<!DOCTYPE a [<!ENTITY e "<b x=\'&lt;&#38;\'>&lt;t&#38;</b>">]><a>&e;</a>',
+    b'<!DOCTYPE a [<!ENTITY e "<p:b/>">]><a xmlns:p="u">&e;</a>',
+    b'<!DOCTYPE a [<!ENTITY e "<p:b/>">]><a>&e;</a>',
+    b'<!DOCTYPE a [<!ENTITY e "<b xmlns=\'u\'><c/></b><d/>">]><a>&e;<c/></a>',
+    b'<!DOCTYPE a [<!ENTITY e "<b xmlns:p=\'u\'/>">]><a>&e;<p:c/></a>',
+    b'<!DOCTYPE a [<!ENTITY e "<b a:c=\'1\'/>">]><a xmlns:a="u">&e;</a>',
+    b'<!DOCTYPE a [<!ENTITY e "x\r\ny\rz<b/>">]><a>&e;</a>',
+    b'<!DOCTYPE a [<!ENTITY e "<b/>">]><a>' + b'&e;' * 30 + b'</a>',
+    b'<!DOCTYPE a [<!ENTITY l0 "<l/>"><!ENTITY l1 "&l0;&l0;&l0;&l0;&l0;&l0;&l0;&l0;&l0;&l0;"><!ENTITY l2 "&l1;&l1;&l1;&l1;&l1;&l1;&l1;&l1;&l1;&l1;">]><a>&l2;</a>',
+    b'<!DOCTYPE a [<!ENTITY e1 "<x>&e2;</x>"><!ENTITY e2 "&e3;"><!ENTITY e3 "&e1;">]><a>&e1;</a>',
+    b'<!DOCTYPE a [<!ENTITY e "<b/>">]><a><c>&e;</c></a>',
+    b'<!DOCTYPE a [<!ENTITY e "<b/>">]><a b="x"><c b="y">&e;</c></a>',
+    b'<!DOCTYPE a [<!ENTITY e SYSTEM "x"><!ENTITY f "<b/>">]><a>&f;</a>',
+    b'<!DOCTYPE a [<!ENTITY e "<b/>">]><a>&e</a>',
+    b'<!DOCTYPE a [<!ENTITY e "<b/>">]><a>&e ;</a>',
+    b'<!DOCTYPE a [<!ENTITY e "<b/>">]><a>&#x3C;e;</a>',
+    # the declarations of attributes
+    b'<!DOCTYPE a [<!ATTLIST a x CDATA "1">]><a/>',
+    b'<!DOCTYPE a [<!ATTLIST a x CDATA "1">]><a x="2"/>',
+    b'<!DOCTYPE a [<!ATTLIST a x CDATA "1">]><a y="2"/>',
+    b'<!DOCTYPE a [<!ATTLIST a x CDATA "1">]><a><b/></a>',
+    b'<!DOCTYPE a [<!ATTLIST b x CDATA "1">]><a><b/><b x="3"/></a>',
+    b'<!DOCTYPE a [<!ATTLIST a x CDATA "1"><!ATTLIST a x CDATA "2">]><a/>',
+    b'<!DOCTYPE a [<!ATTLIST a x CDATA "1" y CDATA "2" z CDATA "3">]><a y="9"/>',
+    b'<!DOCTYPE a [<!ATTLIST a x CDATA "1"><!ATTLIST a y CDATA "2">]><a/>',
+    b'<!DOCTYPE a [<!ATTLIST a x CDATA #FIXED "1">]><a/>',
+    b'<!DOCTYPE a [<!ATTLIST a x CDATA #FIXED "1">]><a x="2"/>',
+    b'<!DOCTYPE a [<!ATTLIST a x CDATA #IMPLIED y CDATA #REQUIRED>]><a/>',
+    b'<!DOCTYPE a [<!ATTLIST a x (p|q) "p">]><a/>',
+    b'<!DOCTYPE a [<!ATTLIST a x (p|q) "r">]><a/>',
+    b'<!DOCTYPE a [<!ATTLIST a x NOTATION (n) "n">]><a/>',
+    b'<!DOCTYPE a [<!ATTLIST a x CDATA "&#65;&amp;&lt;">]><a/>',
+    b'<!DOCTYPE a [<!ENTITY e "v"><!ATTLIST a x CDATA "[&e;]">]><a/>',
+    b'<!DOCTYPE a [<!ATTLIST a x CDATA "[&e;]"><!ENTITY e "v">]><a/>',
+    b'<!DOCTYPE a [<!ATTLIST a x CDATA "[&e;]">]><a/>',
+    b'<!DOCTYPE a [<!ENTITY e "<b/>"><!ATTLIST a x CDATA "[&e;]">]><a/>',
+    b'<!DOCTYPE a [<!ATTLIST a x CDATA "a\tb\nc">]><a/>',
+    b'<!DOCTYPE a [<!ATTLIST a x CDATA "  a  b  ">]><a/>',
+    b'<!DOCTYPE a [<!ATTLIST a x NMTOKEN "  a  b  ">]><a/>',
+    b'<!DOCTYPE a [<!ATTLIST a x NMTOKENS "  a  b  ">]><a/>',
+    b'<!DOCTYPE a [<!ATTLIST a x NMTOKENS "  a  b  ">]><a x="  c   d  "/>',
+    b'<!DOCTYPE a [<!ATTLIST a x NMTOKENS CDATA>]><a x="  c   d  "/>',
+    b'<!DOCTYPE a [<!ATTLIST a x ID #IMPLIED>]><a x="  c   d  "/>',
+    b'<!DOCTYPE a [<!ATTLIST a x IDREFS #IMPLIED>]><a x=" c\td\ne\r\nf "/>',
+    b'<!DOCTYPE a [<!ATTLIST a x ENTITY #IMPLIED y ENTITIES #IMPLIED>]><a x="  c " y="  d  e "/>',
+    b'<!DOCTYPE a [<!ATTLIST a x (p|q) #IMPLIED>]><a x="  p  "/>',
+    b'<!DOCTYPE a [<!ATTLIST a x CDATA #IMPLIED>]><a x="  p  q "/>',
+    b'<!DOCTYPE a [<!ATTLIST a x NMTOKEN #IMPLIED>]><a x="&#32; p &#32;&#9;q"/>',
+    b'<!DOCTYPE a [<!ATTLIST a x NMTOKEN #IMPLIED>]><a x="&#9;p&#9;"/>',
+    b'<!DOCTYPE a [<!ATTLIST a x NMTOKEN "&#9;p&#9;">]><a/>',
+    b'<!DOCTYPE a [<!ATTLIST a x NMTOKEN "">]><a/>',
+    b'<!DOCTYPE a [<!ATTLIST a x NMTOKEN "   ">]><a/>',
+    b'<!DOCTYPE a [<!ATTLIST a x NMTOKEN "   ">]><a x="   "/>',
+    b'<!DOCTYPE a [<!ATTLIST a xmlns CDATA "u">]><a/>',
+    b'<!DOCTYPE a [<!ATTLIST a xmlns CDATA "u">]><a><b/></a>',
+    b'<!DOCTYPE a [<!ATTLIST b xmlns CDATA "u">]><a><b/></a>',
+    b'<!DOCTYPE a [<!ATTLIST a xmlns:p CDATA "u">]><p:a/>',
+    b'<!DOCTYPE a [<!ATTLIST p:a xmlns:p CDATA "u">]><p:a/>',
+    b'<!DOCTYPE a [<!ATTLIST p:a xmlns:p CDATA "u" p:x CDATA "1">]><p:a/>',
+    b'<!DOCTYPE a [<!ATTLIST a xmlns:p CDATA "u" p:x CDATA "1">]><a/>',
+    b'<!DOCTYPE a [<!ATTLIST a p:x CDATA "1">]><a/>',
+    b'<!DOCTYPE a [<!ATTLIST a xmlns:p CDATA "u" xmlns:q CDATA "u" p:x CDATA "1" q:x CDATA "2">]><a/>',
+    b'<!DOCTYPE a [<!ATTLIST a xmlns:p CDATA "u" xmlns:q CDATA "v" p:x CDATA "1" q:x CDATA "2">]><a/>',
+    b'<!DOCTYPE a [<!ATTLIST a xmlns CDATA "http://www.w3.org/XML/1998/namespace">]><a/>',
+    b'<!DOCTYPE a [<!ATTLIST a xmlns:p CDATA "">]><a/>',
+    b'<!DOCTYPE a [<!ATTLIST a xmlns CDATA #FIXED "u">]><a xmlns="v"/>',
+    b'<!DOCTYPE a [<!ATTLIST a xmlns:x NMTOKEN #IMPLIED>]><a xmlns:x=" u " xmlns:y="u"/>',
+    b'<!DOCTYPE a [<!ATTLIST a xmlns:x NMTOKEN #IMPLIED>]><a xmlns:x=" u " xmlns:y="u" x:z="1" y:z="2"/>',
+    b'<!DOCTYPE a [<!ATTLIST a xmlns:x NMTOKEN #IMPLIED xmlns:y NMTOKEN #IMPLIED>]><a xmlns:x=" u " xmlns:y="u " x:z="1" y:z="2"/>',
+    b'<!DOCTYPE a [<!ATTLIST a x CDATA "1" x CDATA "2">]><a/>',
+    b'<!DOCTYPE a [<!ATTLIST a x CDATA "1" y CDATA "2"><!ELEMENT a (b)>]><a/>',
+    b'<!DOCTYPE a [<!ATTLIST a x CDATA "1"><!ATTLIST b y CDATA "2">]><a><b/><b y="3"/><b x="4"/></a>',
+    b'<!DOCTYPE a [<!ATTLIST a x CDATA "1"><!ATTLIST b y CDATA "2">]><b/>',
+    b'<!DOCTYPE a [<!ATTLIST a x CDATA "1">]><a x="1" x="2"/>',
+    b'<!DOCTYPE a [<!ATTLIST a x CDATA "1">]><a x=1/>',
+    b'<!DOCTYPE a [<!ATTLIST a x CDATA "1">]><a x/>',
+    b'<!DOCTYPE a [<!ATTLIST a x CDATA "1">]><a y="&e;"/>',
+    b'<!DOCTYPE a [<!ATTLIST a x CDATA "a b">]><a/><!--c-->',
+    b'<!DOCTYPE a [<!ATTLIST a x CDATA "' + b'v' * 300 + b'">]><a/>',
+    b'<!DOCTYPE a [' + b''.join(b'<!ATTLIST a x%d CDATA "%d">' % (i, i) for i in range(60)) + b']><a x30="z"/>',
+    b'<!DOCTYPE a [' + b''.join(b'<!ATTLIST e%d x CDATA "%d">' % (i, i) for i in range(60)) + b']><e7><e59/><e60/></e7>',
+    b'<!DOCTYPE a [<!ENTITY e "<b/>"><!ATTLIST b x CDATA "1">]><a>&e;</a>',
+    b'<!DOCTYPE a SYSTEM "x"><a>&e;</a>',
+    b'<!DOCTYPE a PUBLIC "p" "x"><a x="&e;">&e;</a>',
+    b'<?xml version="1.0" standalone="yes"?><!DOCTYPE a SYSTEM "x"><a>&e;</a>',
+    b'<?xml version="1.0" standalone="no"?><!DOCTYPE a SYSTEM "x"><a>&e;</a>',
+    b'<!DOCTYPE a SYSTEM "x" [<!ENTITY e "<b/>"><!ATTLIST a x CDATA "1">]><a>&e;&f;</a>',
+    b'<!DOCTYPE a SYSTEM "x" [<!ENTITY e "v">]><a x="&f;">&e;</a>',
+    b'<!DOCTYPE a [<!ENTITY % p "v"> %p; <!ATTLIST a x CDATA "1">]><a/>',
+    b'<?xml version="1.0" standalone="yes"?><!DOCTYPE a [<!ENTITY % p "v"> %p; <!ATTLIST a x CDATA "1">]><a/>',
+    b'<?xml version="1.0" standalone="no"?><!DOCTYPE a [<!ENTITY % p "v"> %p; <!ATTLIST a x CDATA "1">]><a/>',
+    b'<!DOCTYPE a [<!ATTLIST a x CDATA "1"> <!ENTITY % p "v"> %p;]><a/>',
+    b'<!DOCTYPE a [<!ENTITY % p "v"> %p; <!ENTITY e "<b/>">]><a>&e;</a>',
+    b'<?xml version="1.0" standalone="yes"?><!DOCTYPE a [<!ENTITY % p "v"> %p; <!ENTITY e "<b/>">]><a>&e;</a>',
+    b'<!DOCTYPE a [<!ATTLIST b x NMTOKEN "  1  "><!ENTITY e "<b x=\'  2   3 \'/>">]><a>&e;</a>',
+]
+
 
 def mutations(seeds, n, seed):
     rnd = random.Random(seed)
@@ -191,6 +333,29 @@ def skip(d):
         v = m.group(1) if m.group(1) is not None else m.group(2)
         if re.search(rb'[\s]', v) or b'&' in v:
             return True
+    # the same in the default value an ATTLIST gives to xmlns or xmlns:p
+    for m in re.finditer(rb'xmlns(?::[^\s]*)?\s+\w+\s+(?:#FIXED\s+)?(?:"([^"]*)"|\'([^\']*)\')', d):
+        v = m.group(1) if m.group(1) is not None else m.group(2)
+        if re.search(rb'[\s]', v) or b'&' in v:
+            return True
+    # past a parameter entity reference that is not read the declarations are skipped (XML 1.0 5.1),
+    # and expat does not check a character reference in what it skips; XML 1.0 4.1 (Legal Character) does
+    if re.search(rb'%[\w.:-]+;', d) and re.search(rb'&#(?:0+|x0+|x?110000|[xX][dD][89a-fA-F][0-9a-fA-F]{2}|[xX][fF]{3}[eEfF])[0-9]*;', d):
+        return True
+    # the same: expat does not check a declared default value for < when it skips the declaration
+    pe = re.search(rb'%[\w.:-]+;', d)
+    if pe and re.search(rb'<!ATTLIST[^"\']*(?:"[^"]*<[^"]*"|\'[^\']*<[^\']*\')', d[pe.end():]):
+        return True
+    # and for a reference in a literal that is no reference
+    if pe and re.search(rb'<!(?:ATTLIST|ENTITY)[^"\']*["\'][^"\']*&(?![#\w][\w.:-]*;)', d[pe.end():]):
+        return True
+    # a character above U+FFFF in a name: expat refuses it, the Fifth Edition allows it
+    if b'<!ENTITY' in d and re.search(rb'&#(?:[xX]0*(?:[1-9a-eA-E][0-9a-fA-F]{4}|10[0-9a-fA-F]{4})|0*[0-9]{5,});', d):
+        return True
+    # a name in a declaration whose local part starts with a digit, a dot or a hyphen: the reading of
+    # Qualified Names in Declarations here refuses it (a local part is an NCName), expat only counts colons
+    if b'<!DOCTYPE' in d and re.search(rb'[\w.-]:[0-9.-]', d):
+        return True
     # encodings neither reads
     m = re.search(rb'encoding\s*=\s*["\']([^"\']*)["\']', d[:200])
     if m and m.group(1).lower() not in (b'utf-8', b'utf-16', b'us-ascii', b'iso-8859-1', b'utf8'):
@@ -200,17 +365,11 @@ def skip(d):
         return True
     # what the DOCTYPE's declarations give a parser that applies them: an attribute's default, and
     # a comment or a processing instruction inside the subset, which expat reports and this reader skips
-    for m in re.finditer(rb'<!ATTLIST[^>]*>', d):
-        if b'"' in m.group(0) or b"'" in m.group(0):
-            return True
     sub = re.search(rb'<!DOCTYPE[^\[>]*\[(.*?)\]\s*>', d, re.S)
     if sub and (b'<!--' in sub.group(1) or b'<?' in sub.group(1)):
         return True
     # a reference to an external entity: expat skips it, this reader refuses it
     if b'<!ENTITY' in d and (b'SYSTEM' in d or b'PUBLIC' in d) and b'&' in d:
-        return True
-    # an entity whose text is markup is not expanded here
-    if b'<!ENTITY' in d and re.search(rb'<!ENTITY[^>]*"[^"]*&#(?:60|x3[cC]);', d):
         return True
     return False
 
@@ -219,6 +378,8 @@ def corpus():
     docs = list(HAND)
     seeds = [d for d in HAND if 5 < len(d) < 400 and b'<!DOCTYPE' not in d and not d.startswith((b'\xff', b'\xfe'))]
     docs += mutations(seeds, 2500, 20261023)
+    docs += DTD
+    docs += mutations([d for d in DTD if len(d) < 400], 1500, 20261027)
     seen, out = set(), []
     for d in docs:
         if d in seen or skip(d):

@@ -83,6 +83,7 @@ type
     Quote: Char;
     IsNs: Boolean;      { xmlns or xmlns:p, a declaration }
     Changed: Boolean;
+    Defaulted: Boolean; { not written: the DOCTYPE gave it, the tag did not }
     RawStart: Integer;  { from 1; -1 when made here }
     RawStop: Integer;   { the byte after it }
   end;
@@ -107,6 +108,7 @@ type
     Trail: string;      { the white space before > or /> in a start tag }
     SelfClose: Boolean;
     Synth: Boolean;
+    Ent: Boolean;       { read from an entity's text: Start, Stop and OpenEnd are places in that text }
     Start: Integer;
     Stop: Integer;
     OpenEnd: Integer;
@@ -144,15 +146,45 @@ type
     FEName: array of string;
     FEVal: array of string;
     FEExt: array of Boolean;
+    FEMk: array of Integer;   { 0 not asked, 1 text only, 2 holds markup, 3 being asked }
     FEN: Integer;
+    FSrc: string;             { the document, while FT is an entity's text }
+    FIT: array of string;     { the text each entity being read was reached from }
+    FIP: array of Integer;    { where that text goes on, past the reference }
+    FID: array of Integer;    { the depth the entity was entered at }
+    FIE: array of Integer;    { the entity }
+    FIC: Integer;
+    FRefAt: Integer;          { the outermost reference, a byte of the document }
+    FTagAt: Integer;          { the start tag being read: where an attribute with no place of its own is }
+    FPeRef: Boolean;          { the subset has referred to a parameter entity, which is not read }
+    FExtSub: Boolean;         { the DOCTYPE names an external subset, which is not read }
+    FAgain: Boolean;
+    FAEl: array of string;    { the attributes the internal subset declares }
+    FAAt: array of string;
+    FADf: array of string;
+    FATy: array of Boolean;   { a type other than CDATA }
+    FAHas: array of Boolean;  { with a default value }
+    FANx: array of Integer;
+    FAHead: array of Integer;
+    FATail: array of Integer;
+    FAN: Integer;
     procedure Init(const AText: string);
     procedure Fail(At: Integer; const Why: string);
     function SkipS: Integer;
     function Has(const S: string): Boolean;
     function ReadName: string;
+    function ReadQName: string;
+    procedure ReadNotationName;
     procedure CheckChars(AFrom, ATo: Integer);
     procedure Expand(const Raw: string; At0: Integer; InAttr, Nested: Boolean; Depth: Integer; var B: TXmlBufRec);
     function EntityIndex(const Nm: string): Integer;
+    function EntityMarkup(Code, Depth: Integer): Boolean;
+    function MarkupRefAt(I: Integer; var Code, Semi: Integer): Boolean;
+    procedure EnterEntity(Code, RefAt, After: Integer);
+    procedure LeaveEntity;
+    procedure DeclAttr(const El, An: string; NonCData, HasDef: Boolean; const Df: string);
+    procedure ApplyAttlist(const El: string; var Attrs: TXmlAttrArray; var Na: Integer);
+    function NextTok(var Tok: TXmlToken): Boolean;
     procedure ReadCharData(var Tok: TXmlToken);
     procedure ReadStartTag(var Tok: TXmlToken);
     procedure ReadEndTag(var Tok: TXmlToken);
@@ -171,7 +203,7 @@ type
     procedure ReadElementDecl;
     procedure ReadAttlistDecl;
     procedure ReadNotationDecl;
-    procedure ReadAttDefault;
+    procedure ReadAttDefault(var HasDef: Boolean; var Df: string);
     function ReadNmtoken: string;
     procedure ScanComment(var VFrom, VTo: Integer);
     procedure ScanPI(var Tgt: string; var VFrom, VTo: Integer);
@@ -703,12 +735,17 @@ begin
   MaxExpansion := 16 * 1024 * 1024;
   FFragment := True;
   FT := AText;
+  FSrc := FT;
   FN := Length(FT);
   FP := 1;
   FBom := 0;
   FNsN := 0;
   FDepth := 0;
   FEN := 0;
+  FIC := 0;
+  FAN := 0;
+  FPeRef := False;
+  FExtSub := False;
 end;
 
 procedure TXmlReader.Init(const AText: string);
@@ -778,11 +815,16 @@ begin
     end;
   end;
   FT := t;
+  FSrc := t;
   FN := Length(t);
   FP := FBom + 1;
   FNsN := 0;
   FDepth := 0;
   FEN := 0;
+  FIC := 0;
+  FAN := 0;
+  FPeRef := False;
+  FExtSub := False;
 end;
 
 procedure TXmlReader.LineColumn(Off: Integer; var ALine, ACol: Integer);
@@ -792,14 +834,14 @@ begin
   ALine := 1;
   ls := 0;
   i := 0;
-  while (i < Off) and (i < FN) do
+  while (i < Off) and (i < Length(FSrc)) do
   begin
-    if FT[i + 1] = #10 then
+    if FSrc[i + 1] = #10 then
     begin
       ALine := ALine + 1;
       ls := i + 1;
     end
-    else if (FT[i + 1] = #13) and ((i + 2 > FN) or (FT[i + 2] <> #10)) then
+    else if (FSrc[i + 1] = #13) and ((i + 2 > Length(FSrc)) or (FSrc[i + 2] <> #10)) then
     begin
       ALine := ALine + 1;
       ls := i + 1;
@@ -813,18 +855,28 @@ end;
 procedure TXmlReader.Fail(At: Integer; const Why: string);
 var
   l, c: Integer;
+  w: string;
 begin
+  w := Why;
+  if FIC > 0 then
+  begin
+    { in an entity's text: the place is the reference in the document }
+    At := FRefAt;
+    w := w + ', in the text of &' + FEName[FIE[0]] + ';';
+  end;
+  if At < 1 then
+    At := FTagAt;
   if At < 1 then
     At := 1;
-  if At > FN + 1 then
-    At := FN + 1;
+  if At > Length(FSrc) + 1 then
+    At := Length(FSrc) + 1;
   LineColumn(At - 1, l, c);
-  raise EXmlError.CreateAt(At - 1, l, c, Why);
+  raise EXmlError.CreateAt(At - 1, l, c, w);
 end;
 
 function TXmlReader.Source: string;
 begin
-  Result := FT;
+  Result := FSrc;
 end;
 
 function TXmlReader.BomLength: Integer;
@@ -937,6 +989,135 @@ begin
     end;
 end;
 
+function XmlNormLines(const S: string): string; forward;
+
+{ Whether the replacement text of entity Code holds markup, in itself or
+  in an entity it refers to, which has to be read as content and not
+  spliced into the text of a run. A loop answers no here and is refused
+  where it is expanded. }
+function TXmlReader.EntityMarkup(Code, Depth: Integer): Boolean;
+var
+  v, nm: string;
+  i, j, k, n, e: Integer;
+begin
+  Result := False;
+  if FEMk[Code] = 2 then
+  begin
+    Result := True;
+    Exit;
+  end;
+  if (FEMk[Code] <> 0) or (Depth >= 20) then
+    Exit;
+  FEMk[Code] := 3;
+  v := FEVal[Code];
+  if Pos('<', v) > 0 then
+    Result := True
+  else
+  begin
+    n := Length(v);
+    i := 1;
+    while (i <= n) and (not Result) do
+    begin
+      if v[i] = '&' then
+      begin
+        j := i + 1;
+        if (j <= n) and (v[j] <> '#') then
+        begin
+          k := j;
+          while (k <= n) and (v[k] <> ';') do
+            k := k + 1;
+          nm := Copy(v, j, k - j);
+          e := EntityIndex(nm);
+          if (e >= 0) and (not FEExt[e]) and EntityMarkup(e, Depth + 1) then
+            Result := True;
+          i := k;
+        end;
+      end;
+      i := i + 1;
+    end;
+  end;
+  if Result then
+    FEMk[Code] := 2
+  else
+    FEMk[Code] := 1;
+end;
+
+{ Whether the text at I, a &, is a reference to an entity that holds
+  markup: its place in the table and the byte of its ; }
+function TXmlReader.MarkupRefAt(I: Integer; var Code, Semi: Integer): Boolean;
+var
+  k, c: Integer;
+  nm: string;
+begin
+  Result := False;
+  if FEN = 0 then
+    Exit;
+  k := I + 1;
+  if (k > FN) or (FT[k] = '#') then
+    Exit;
+  while k <= FN do
+  begin
+    c := Ord(FT[k]);
+    if (c = 59) or (c = 38) or (c = 60) or XmlIsSpace(c) then
+      Break;
+    k := k + 1;
+  end;
+  if (k > FN) or (FT[k] <> ';') then
+    Exit;
+  nm := Copy(FT, I + 1, k - I - 1);
+  if (nm = 'lt') or (nm = 'gt') or (nm = 'amp') or (nm = 'apos') or (nm = 'quot') then
+    Exit;
+  Code := EntityIndex(nm);
+  if (Code < 0) or FEExt[Code] then
+    Exit;
+  if EntityMarkup(Code, FIC) then
+  begin
+    Semi := k;
+    Result := True;
+  end;
+end;
+
+{ The text goes on in the replacement text of entity Code, whose reference
+  is at RefAt and ends before After; LeaveEntity comes back there. }
+procedure TXmlReader.EnterEntity(Code, RefAt, After: Integer);
+begin
+  if FIC >= 20 then
+    Fail(RefAt, 'entities nested too deep (a loop?) at &' + FEName[Code] + ';');
+  FExpanded := FExpanded + Length(FEVal[Code]);
+  if FExpanded > MaxExpansion then
+    Fail(RefAt, 'the entities expand to more than MaxExpansion bytes');
+  if FIC >= Length(FIT) then
+  begin
+    SetLength(FIT, FIC * 2 + 4);
+    SetLength(FIP, FIC * 2 + 4);
+    SetLength(FID, FIC * 2 + 4);
+    SetLength(FIE, FIC * 2 + 4);
+  end;
+  if FIC = 0 then
+    FRefAt := RefAt;
+  FIT[FIC] := FT;
+  FIP[FIC] := After;
+  FID[FIC] := FDepth;
+  FIE[FIC] := Code;
+  FIC := FIC + 1;
+  FT := XmlNormLines(FEVal[Code]);
+  FN := Length(FT);
+  FP := 1;
+  FAgain := True;
+end;
+
+procedure TXmlReader.LeaveEntity;
+begin
+  if FDepth <> FID[FIC - 1] then
+    Fail(FP, 'the text of an entity does not close what it opens');
+  FIC := FIC - 1;
+  FT := FIT[FIC];
+  FIT[FIC] := '';
+  FN := Length(FT);
+  FP := FIP[FIC];
+  FAgain := True;
+end;
+
 { Raw with its references expanded and its line ends made one (in an
   attribute value, its white space made spaces): Raw begins at byte At0
   of the text, or is the replacement text of an entity (Nested), where
@@ -1003,6 +1184,8 @@ begin
         nm := Copy(Raw, j, k - j);
         if not XmlIsName(nm) then
           Fail(errAt, 'invalid entity name');
+        if Namespaces and (Pos(':', nm) > 0) then
+          Fail(errAt, 'the entity name ' + nm + ' has a colon');
         if nm = 'lt' then
           BufChar(B, 60)
         else if nm = 'gt' then
@@ -1017,22 +1200,34 @@ begin
         begin
           code := EntityIndex(nm);
           if code < 0 then
-            Fail(errAt, 'undeclared entity &' + nm + ';');
-          if FEExt[code] then
-            Fail(errAt, 'reference to the external entity &' + nm + ';');
-          if Depth >= 20 then
-            Fail(errAt, 'entities nested too deep (a loop?) at &' + nm + ';');
-          FExpanded := FExpanded + Length(FEVal[code]);
-          if FExpanded > MaxExpansion then
-            Fail(errAt, 'the entities expand to more than MaxExpansion bytes');
-          if Pos('<', FEVal[code]) > 0 then
           begin
-            if InAttr then
-              Fail(errAt, '< in the value of an attribute, through &' + nm + ';')
-            else
-              Fail(errAt, 'the entity &' + nm + '; holds markup, which is not read');
+            { XML 1.0 4.1, Entity Declared: with an external subset or a
+              parameter entity reference that is not read the entity may be
+              declared there, and the reference is skipped, as 5.1 lets a
+              processor that does not read it }
+            if not ((FPeRef or FExtSub) and (FStandalone <> 'yes')) then
+              Fail(errAt, 'undeclared entity &' + nm + ';');
+          end
+          else
+          begin
+            if FEExt[code] then
+              Fail(errAt, 'reference to the external entity &' + nm + ';');
+            if Depth >= 20 then
+              Fail(errAt, 'entities nested too deep (a loop?) at &' + nm + ';');
+            FExpanded := FExpanded + Length(FEVal[code]);
+            if FExpanded > MaxExpansion then
+              Fail(errAt, 'the entities expand to more than MaxExpansion bytes');
+            if Pos('<', FEVal[code]) > 0 then
+            begin
+              if InAttr then
+                Fail(errAt, '< in the value of an attribute, through &' + nm + ';')
+              else
+                Fail(errAt, 'the entity &' + nm + '; holds markup, which is not read');
+            end;
+            if (not InAttr) and (Pos(']]>', FEVal[code]) > 0) then
+              Fail(errAt, '"]]>" is not allowed in character data, through &' + nm + ';');
+            Expand(FEVal[code], errAt, InAttr, True, Depth + 1, B);
           end;
-          Expand(FEVal[code], errAt, InAttr, True, Depth + 1, B);
         end;
         i := k + 1;
       end;
@@ -1065,8 +1260,8 @@ end;
 
 procedure TXmlReader.ReadCharData(var Tok: TXmlToken);
 var
-  st, i, c, l, j: Integer;
-  amp, cr: Boolean;
+  st, i, c, l, j, ecode, esemi: Integer;
+  amp, cr, hit: Boolean;
   raw: string;
   B: TXmlBufRec;
 begin
@@ -1074,6 +1269,7 @@ begin
   i := FP;
   amp := False;
   cr := False;
+  hit := False;
   while i <= FN do
   begin
     c := Ord(FT[i]);
@@ -1082,7 +1278,14 @@ begin
     if c < 128 then
     begin
       if c = 38 then
-        amp := True
+      begin
+        amp := True;
+        if MarkupRefAt(i, ecode, esemi) then
+        begin
+          hit := True;
+          Break;
+        end;
+      end
       else if c = 13 then
         cr := True
       else if c = 93 then
@@ -1113,6 +1316,14 @@ begin
         else
           Fail(j, 'text before the root element');
       end;
+  end;
+  if hit and (i = st) then
+  begin
+    { the text goes on in the entity: read its markup, not a token of this run }
+    if (FDepth = 0) and (not FFragment) then
+      Fail(i, 'text outside the root element');
+    EnterEntity(ecode, i, esemi + 1);
+    Exit;
   end;
   Tok.Kind := xtText;
   Tok.Start := st;
@@ -1238,6 +1449,37 @@ begin
   Bad := not XmlIsNCName(Pfx) or not XmlIsNCName(Loc);
 end;
 
+{ a name in a declaration: for Namespaces in XML 1.0 a qualified name
+  (its Qualified Names in Declarations: the DOCTYPE, ELEMENT and ATTLIST
+  declarations and the content models) }
+function TXmlReader.ReadQName: string;
+var
+  st: Integer;
+  pfx, loc: string;
+  bad: Boolean;
+begin
+  st := FP;
+  Result := ReadName;
+  if Namespaces then
+  begin
+    XmlSplit(Result, pfx, loc, bad);
+    if bad then
+      Fail(st, 'invalid qualified name ' + Result + ' in a declaration');
+  end;
+end;
+
+{ a notation's name in an attribute's type: no colon for Namespaces in XML 1.0 }
+procedure TXmlReader.ReadNotationName;
+var
+  st: Integer;
+  nm: string;
+begin
+  st := FP;
+  nm := ReadName;
+  if Namespaces and (Pos(':', nm) > 0) then
+    Fail(st, 'the notation name ' + nm + ' has a colon');
+end;
+
 procedure TXmlReader.ReadStartTag(var Tok: TXmlToken);
 var
   st, ws, i, j, q, na, mark, c, l, as_, k: Integer;
@@ -1252,6 +1494,7 @@ begin
   if FDepth >= MaxDepth then
     Fail(FP, 'elements nested deeper than MaxDepth');
   st := FP;
+  FTagAt := st;
   FP := FP + 1;
   nm := ReadName;
   SetLength(Tok.Attrs, 0);
@@ -1352,6 +1595,8 @@ begin
     Tok.Attrs[na] := a;
     na := na + 1;
   end;
+  if FAN > 0 then
+    ApplyAttlist(nm, Tok.Attrs, na);
   SetLength(Tok.Attrs, na);
   Tok.Trail := trail;
   { the namespaces }
@@ -1455,6 +1700,8 @@ begin
   FP := FP + 1;
   if FDepth = 0 then
     Fail(st, 'unexpected end tag </' + nm + '>');
+  if (FIC > 0) and (FDepth <= FID[FIC - 1]) then
+    Fail(st, 'the end tag </' + nm + '> closes an element opened outside the entity');
   if nm <> FSName[FDepth - 1] then
     Fail(st, 'element <' + FSName[FDepth - 1] + '> closed by </' + nm + '>');
   MakeEnd(Tok, False);
@@ -1594,7 +1841,7 @@ begin
   st := FP;
   if (Copy(FT, FP, 5) = '<?xml') and (FP + 5 <= FN) and (XmlIsSpace(Ord(FT[FP + 5])) or (FT[FP + 5] = '?')) then
   begin
-    if FFragment or (FP <> FBom + 1) then
+    if FFragment or (FP <> FBom + 1) or (FIC > 0) then
       Fail(FP, 'the XML declaration is allowed only at the start of a document');
     ReadDecl(Tok, st);
     Exit;
@@ -1781,7 +2028,7 @@ begin
   if FT[FP] = '(' then
     ReadGroup(Lv + 1)
   else
-    ReadName;
+    ReadQName;
   if (FP <= FN) and ((FT[FP] = '?') or (FT[FP] = '*') or (FT[FP] = '+')) then
     FP := FP + 1;
 end;
@@ -1821,7 +2068,7 @@ begin
   FP := FP + 9;
   if SkipS = 0 then
     Fail(FP, 'expected white space after <!ELEMENT');
-  ReadName;
+  ReadQName;
   if SkipS = 0 then
     Fail(FP, 'expected white space after the element name');
   if Has('EMPTY') then
@@ -1842,7 +2089,7 @@ begin
       begin
         FP := FP + 1;
         SkipS;
-        ReadName;
+        ReadQName;
         SkipS;
         names := names + 1;
       end;
@@ -1871,12 +2118,14 @@ begin
 end;
 
 { the default of an attribute: #REQUIRED, #IMPLIED or #FIXED and a value }
-procedure TXmlReader.ReadAttDefault;
+procedure TXmlReader.ReadAttDefault(var HasDef: Boolean; var Df: string);
 var
   q: Char;
   i, j: Integer;
   B: TXmlBufRec;
 begin
+  HasDef := False;
+  Df := '';
   if Has('#REQUIRED') then
     FP := FP + 9
   else if Has('#IMPLIED') then
@@ -1910,18 +2159,153 @@ begin
     Expand(Copy(FT, FP + 1, i - FP - 1), FP + 1, True, False, 0, B);
     FExpanded := j;
     CheckChars(FP + 1, i);
+    HasDef := True;
+    Df := BufResult(B);
     FP := i + 1;
+  end;
+end;
+
+{ The attribute An of element El is declared: the first declaration of
+  one stands (XML 1.0 3.3). }
+procedure TXmlReader.DeclAttr(const El, An: string; NonCData, HasDef: Boolean; const Df: string);
+var
+  h, i, k: Integer;
+begin
+  if Length(FAHead) = 0 then
+  begin
+    SetLength(FAHead, 256);
+    SetLength(FATail, 256);
+    for i := 0 to 255 do
+    begin
+      FAHead[i] := -1;
+      FATail[i] := -1;
+    end;
+  end;
+  h := 0;
+  for i := 1 to Length(El) do
+    h := (h * 31 + Ord(El[i])) and 255;
+  i := FAHead[h];
+  while i >= 0 do
+  begin
+    if (FAEl[i] = El) and (FAAt[i] = An) then
+      Exit;
+    i := FANx[i];
+  end;
+  if FAN >= Length(FAEl) then
+  begin
+    k := FAN * 2 + 8;
+    SetLength(FAEl, k);
+    SetLength(FAAt, k);
+    SetLength(FADf, k);
+    SetLength(FATy, k);
+    SetLength(FAHas, k);
+    SetLength(FANx, k);
+  end;
+  FAEl[FAN] := El;
+  FAAt[FAN] := An;
+  FATy[FAN] := NonCData;
+  FAHas[FAN] := HasDef;
+  FADf[FAN] := Df;
+  FANx[FAN] := -1;
+  if FATail[h] >= 0 then
+    FANx[FATail[h]] := FAN
+  else
+    FAHead[h] := FAN;
+  FATail[h] := FAN;
+  FAN := FAN + 1;
+end;
+
+{ An attribute whose declared type is not CDATA has its leading and
+  trailing spaces taken off and each run of spaces made one (XML 1.0
+  3.3.3). }
+function XmlTokenValue(const V: string): string;
+var
+  i, n: Integer;
+  B: TXmlBufRec;
+  sp: Boolean;
+begin
+  n := Length(V);
+  B.N := 0;
+  SetLength(B.S, n);
+  sp := False;
+  for i := 1 to n do
+    if V[i] = ' ' then
+      sp := B.N > 0
+    else
+    begin
+      if sp then
+        BufChar(B, 32);
+      sp := False;
+      BufChar(B, Ord(V[i]));
+    end;
+  Result := BufResult(B);
+end;
+
+{ The tag of El has the attributes the internal subset declares for it:
+  those declared with a type other than CDATA are normalized, and those
+  with a default value that the tag did not give are added, marked
+  Defaulted (XML 1.0 5.1: a processor that reads the declarations applies
+  them). }
+procedure TXmlReader.ApplyAttlist(const El: string; var Attrs: TXmlAttrArray; var Na: Integer);
+var
+  h, i, j, n0: Integer;
+  a: TXmlAttr;
+  found: Boolean;
+begin
+  if Length(FAHead) = 0 then
+    Exit;
+  h := 0;
+  for i := 1 to Length(El) do
+    h := (h * 31 + Ord(El[i])) and 255;
+  n0 := Na;
+  i := FAHead[h];
+  while i >= 0 do
+  begin
+    if FAEl[i] = El then
+    begin
+      found := False;
+      for j := 0 to n0 - 1 do
+        if Attrs[j].Name = FAAt[i] then
+        begin
+          found := True;
+          if FATy[i] then
+            Attrs[j].Value := XmlTokenValue(Attrs[j].Value);
+          Break;
+        end;
+      if (not found) and FAHas[i] then
+      begin
+        a.Name := FAAt[i];
+        a.Prefix := '';
+        a.Local := '';
+        a.URI := '';
+        a.Value := FADf[i];
+        a.Lead := ' ';
+        a.Quote := '"';
+        a.Changed := False;
+        a.Defaulted := True;
+        a.IsNs := Namespaces and ((a.Name = 'xmlns') or (Copy(a.Name, 1, 6) = 'xmlns:'));
+        a.RawStart := -1;
+        a.RawStop := -1;
+        if Na >= Length(Attrs) then
+          SetLength(Attrs, Na * 2 + 4);
+        Attrs[Na] := a;
+        Na := Na + 1;
+      end;
+    end;
+    i := FANx[i];
   end;
 end;
 
 procedure TXmlReader.ReadAttlistDecl;
 var
   ws: Integer;
+  el, an, df: string;
+  nonc, hasdef: Boolean;
 begin
   FP := FP + 9;
   if SkipS = 0 then
     Fail(FP, 'expected white space after <!ATTLIST');
-  ReadName;
+  el := ReadQName;
   while True do
   begin
     ws := SkipS;
@@ -1934,9 +2318,10 @@ begin
     end;
     if ws = 0 then
       Fail(FP, 'expected white space before an attribute definition');
-    ReadName;
+    an := ReadQName;
     if SkipS = 0 then
       Fail(FP, 'expected white space after the attribute name');
+    nonc := not Has('CDATA');
     if Has('CDATA') then
       FP := FP + 5
     else if Has('NMTOKENS') then
@@ -1962,13 +2347,13 @@ begin
         Fail(FP, 'expected ( after NOTATION');
       FP := FP + 1;
       SkipS;
-      ReadName;
+      ReadNotationName;
       SkipS;
       while (FP <= FN) and (FT[FP] = '|') do
       begin
         FP := FP + 1;
         SkipS;
-        ReadName;
+        ReadNotationName;
         SkipS;
       end;
       if (FP > FN) or (FT[FP] <> ')') then
@@ -1996,7 +2381,14 @@ begin
       Fail(FP, 'invalid attribute type');
     if SkipS = 0 then
       Fail(FP, 'expected white space after the attribute type');
-    ReadAttDefault;
+    ReadAttDefault(hasdef, df);
+    if hasdef and nonc then
+      df := XmlTokenValue(df);
+    { XML 1.0 5.1: past a reference to a parameter entity that is not read,
+      the declarations may have been overridden, and are not used unless
+      the document is standalone }
+    if (not FPeRef) or (FStandalone = 'yes') then
+      DeclAttr(el, an, nonc, hasdef, df);
   end;
 end;
 
@@ -2125,6 +2517,8 @@ begin
             c := c + 1;
           if (c > Length(raw)) or (not XmlIsName(Copy(raw, k + 1, c - k - 1))) then
             Fail(FP, 'invalid reference in an entity value: & must begin &name; or &#n;');
+          if Namespaces and (Pos(':', Copy(raw, k + 1, c - k - 1)) > 0) then
+            Fail(FP, 'the entity name in an entity value has a colon');
         end;
         BufChar(B, Ord(raw[k]));
         k := k + 1;
@@ -2164,7 +2558,7 @@ begin
         FP := FP + 5;
         if SkipS = 0 then
           Fail(FP, 'expected white space after NDATA');
-        ReadName;
+        ReadNotationName;
       end;
     end;
   end;
@@ -2172,17 +2566,19 @@ begin
   if (FP > FN) or (FT[FP] <> '>') then
     Fail(FP, 'expected > at the end of an entity declaration');
   FP := FP + 1;
-  if (not isPE) and (EntityIndex(nm) < 0) then
+  if (not isPE) and (EntityIndex(nm) < 0) and ((not FPeRef) or (FStandalone = 'yes')) then
   begin
     if FEN >= Length(FEName) then
     begin
       SetLength(FEName, FEN * 2 + 8);
       SetLength(FEVal, FEN * 2 + 8);
       SetLength(FEExt, FEN * 2 + 8);
+      SetLength(FEMk, FEN * 2 + 8);
     end;
     FEName[FEN] := nm;
     FEVal[FEN] := v;
     FEExt[FEN] := ext;
+    FEMk[FEN] := 0;
     FEN := FEN + 1;
   end;
 end;
@@ -2205,10 +2601,14 @@ begin
     if FT[FP] = '%' then
     begin
       FP := FP + 1;
-      ReadName;
+      a := FP;
+      tgt := ReadName;
+      if Namespaces and (Pos(':', tgt) > 0) then
+        Fail(a, 'the entity name ' + tgt + ' has a colon');
       if (FP > FN) or (FT[FP] <> ';') then
         Fail(FP, 'expected ; after a parameter entity reference');
       FP := FP + 1;
+      FPeRef := True;
     end
     else if Has('<!--') then
       ScanComment(a, b)
@@ -2242,7 +2642,7 @@ begin
   FP := FP + 9;
   if SkipS = 0 then
     Fail(FP, 'expected white space after <!DOCTYPE');
-  Tok.Name := ReadName;
+  Tok.Name := ReadQName;
   SkipS;
   if Has('SYSTEM') then
   begin
@@ -2250,6 +2650,7 @@ begin
     if SkipS = 0 then
       Fail(FP, 'expected white space after SYSTEM');
     ReadLiteral(False);
+    FExtSub := True;
   end
   else if Has('PUBLIC') then
   begin
@@ -2260,6 +2661,7 @@ begin
     if SkipS = 0 then
       Fail(FP, 'expected white space after the public identifier');
     ReadLiteral(False);
+    FExtSub := True;
   end;
   SkipS;
   if (FP <= FN) and (FT[FP] = '[') then
@@ -2280,6 +2682,14 @@ end;
 { ---- the next token ---- }
 
 function TXmlReader.Next(var Tok: TXmlToken): Boolean;
+begin
+  repeat
+    FAgain := False;
+    Result := NextTok(Tok);
+  until not FAgain;
+end;
+
+function TXmlReader.NextTok(var Tok: TXmlToken): Boolean;
 var
   c: Integer;
 begin
@@ -2291,6 +2701,7 @@ begin
   Tok.Trail := '';
   Tok.SelfClose := False;
   Tok.Synth := False;
+  Tok.Ent := FIC > 0;
   Tok.Start := 0;
   Tok.Stop := 0;
   Tok.OpenEnd := 0;
@@ -2308,6 +2719,12 @@ begin
   end;
   if FP > FN then
   begin
+    if FIC > 0 then
+    begin
+      LeaveEntity;
+      Result := True;
+      Exit;
+    end;
     if FDepth > 0 then
       Fail(FN, 'unexpected end of input: <' + FSName[FDepth - 1] + '> is not closed');
     if (not FFragment) and (not FSawRoot) then
@@ -2819,6 +3236,7 @@ begin
       Exit;
     ZAttrs[i].Value := AValue;
     ZAttrs[i].Changed := True;
+    ZAttrs[i].Defaulted := False;
     ZHead := True;
     XmlTouch(Self);
     Exit;
@@ -3015,6 +3433,14 @@ begin
           n.ZSrc := src;
           n.ZStart := tok.Start;
           n.ZOpenEnd := tok.OpenEnd;
+          if tok.Ent then
+          begin
+            { read from an entity's text: no bytes of the document, written from its parts }
+            n.ZStart := -1;
+            n.ZOpenEnd := -1;
+            for i := 0 to High(n.ZAttrs) do
+              n.ZAttrs[i].RawStart := -1;
+          end;
           n.Parent := cur;
           XmlAddKid(cur.ZKids, cur.ZCount, n);
           cur := n;
@@ -3022,10 +3448,12 @@ begin
       xtEnd:
         begin
           cur.ZStop := tok.Stop;
-          if tok.Synth then
+          if tok.Synth or tok.Ent then
             cur.ZCloseStart := -1
           else
             cur.ZCloseStart := tok.Start;
+          if tok.Ent then
+            cur.ZStop := -1;
           if Length(cur.ZKids) <> cur.ZCount then
             SetLength(cur.ZKids, cur.ZCount);
           cur := cur.Parent;
@@ -3047,6 +3475,11 @@ begin
         n.ZSrc := src;
         n.ZStart := tok.Start;
         n.ZStop := tok.Stop;
+        if tok.Ent then
+        begin
+          n.ZStart := -1;
+          n.ZStop := -1;
+        end;
         n.Parent := cur;
         XmlAddKid(cur.ZKids, cur.ZCount, n);
       end;
@@ -3234,7 +3667,8 @@ begin
     BufChar(B, 60);
     BufStr(B, N.Name);
     for i := 0 to High(N.ZAttrs) do
-      XmlEmitAttr(N, i, B);
+      if not N.ZAttrs[i].Defaulted then
+        XmlEmitAttr(N, i, B);
     BufStr(B, N.ZTrail);
     if (N.ZCount = 0) and (not ended) then
       BufStr(B, '/>')
