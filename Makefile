@@ -695,6 +695,9 @@ GOLDEN_A64 += atoffast
 # P483: Format on its short paths and the long, as the compiler before it wrote them.
 GOLDEN += fmtfast
 GOLDEN_A64 += fmtfast
+# P484: Hex by pairs, as the compiler before it wrote it.
+GOLDEN += hexfast
+GOLDEN_A64 += hexfast
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
