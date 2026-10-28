@@ -698,6 +698,9 @@ GOLDEN_A64 += fmtfast
 # P484: Hex by pairs, as the compiler before it wrote it.
 GOLDEN += hexfast
 GOLDEN_A64 += hexfast
+# P485: what the scavenger gives back, and what it keeps.
+GOLDEN += scavenge
+GOLDEN_A64 += scavenge
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
