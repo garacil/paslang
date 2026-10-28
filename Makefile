@@ -701,6 +701,9 @@ GOLDEN_A64 += hexfast
 # P485: what the scavenger gives back, and what it keeps.
 GOLDEN += scavenge
 GOLDEN_A64 += scavenge
+# P487: the rwmutex as Go's, and once on its word.
+GOLDEN += rwstress oncefast
+GOLDEN_A64 += rwstress oncefast
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a

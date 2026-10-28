@@ -44,13 +44,20 @@ type
     Tail: Integer;
   end;
 
-  { Writer preferred: once a writer waits, new readers wait too, so a
-    stream of readers cannot starve it. }
+  { Go's sync.RWMutex (rwmutex.go), P246: writer preferred, once a writer
+    waits new readers wait too, so a stream of readers cannot starve it.
+    RC is the readers in, less 2^30 while a writer is waiting or in; RWait
+    the readers a waiting writer still waits for; W keeps writers from each
+    other. Readers and the writer park on a semaphore each (a count of
+    permits and a queue under Spin), a permit handed to the routine that
+    is woken. A reader that finds no writer is one atomic add. }
   TPasRWMutex = record
+    W: TPasMutex;
     Spin: Integer;
-    Readers: Integer;
-    Writer: Integer;
-    Waiting: Integer;
+    RC: Integer;
+    RWait: Integer;
+    RSem: Integer;
+    WSem: Integer;
     ReadQ: Integer;
     WriteQ: Integer;
   end;
@@ -290,68 +297,103 @@ end;
 
 { ---- rwmutex ---- }
 
-procedure PasRWBeginRead(var R: TPasRWMutex);
+const
+  RWMaxReaders = 1073741824;
+
+{ Go's runtime_SemacquireRWMutexR: a permit if there is one, else parked
+  until a release hands it over. }
+procedure RWReadAcquire(var R: TPasRWMutex);
 begin
   SpinLock(@R.Spin);
-  while (R.Writer <> 0) or (R.Waiting <> 0) do
+  if R.RSem > 0 then
   begin
-    QWait(@R.ReadQ);
-    ParkUnlock(@R.Spin);
-    SpinLock(@R.Spin);
+    R.RSem := R.RSem - 1;
+    SpinUnlock(@R.Spin);
+    Exit;
   end;
-  R.Readers := R.Readers + 1;
+  QWait(@R.ReadQ);
+  ParkUnlock(@R.Spin);
+end;
+
+procedure RWReadRelease(var R: TPasRWMutex);
+var
+  g: Integer;
+begin
+  SpinLock(@R.Spin);
+  g := QWake1(@R.ReadQ);
+  if g = 0 then
+    R.RSem := R.RSem + 1;
   SpinUnlock(@R.Spin);
+  if g <> 0 then
+    ReadyG(g);
+end;
+
+procedure RWWriteAcquire(var R: TPasRWMutex);
+begin
+  SpinLock(@R.Spin);
+  if R.WSem > 0 then
+  begin
+    R.WSem := R.WSem - 1;
+    SpinUnlock(@R.Spin);
+    Exit;
+  end;
+  QWait(@R.WriteQ);
+  ParkUnlock(@R.Spin);
+end;
+
+procedure RWWriteRelease(var R: TPasRWMutex);
+var
+  g: Integer;
+begin
+  SpinLock(@R.Spin);
+  g := QWake1(@R.WriteQ);
+  if g = 0 then
+    R.WSem := R.WSem + 1;
+  SpinUnlock(@R.Spin);
+  if g <> 0 then
+    ReadyG(g);
+end;
+
+procedure PasRWBeginRead(var R: TPasRWMutex);
+begin
+  if AtomicAdd(@R.RC, 1) < 0 then
+    RWReadAcquire(R);
 end;
 
 procedure PasRWEndRead(var R: TPasRWMutex);
 var
-  g: Integer;
+  r1: Integer;
 begin
-  SpinLock(@R.Spin);
-  R.Readers := R.Readers - 1;
-  if R.Readers = 0 then
+  r1 := AtomicAdd(@R.RC, -1);
+  if r1 < 0 then
   begin
-    g := QWake1(@R.WriteQ);
-    if g <> 0 then
-      ReadyG(g);
+    if (r1 + 1 = 0) or (r1 + 1 = -RWMaxReaders) then
+      Fatal('paslang: unlock read of an unlocked rwmutex');
+    if AtomicAdd(@R.RWait, -1) = 0 then
+      RWWriteRelease(R);
   end;
-  SpinUnlock(@R.Spin);
 end;
 
 procedure PasRWLock(var R: TPasRWMutex);
+var
+  r1: Integer;
 begin
-  SpinLock(@R.Spin);
-  R.Waiting := R.Waiting + 1;
-  while (R.Writer <> 0) or (R.Readers <> 0) do
-  begin
-    QWait(@R.WriteQ);
-    ParkUnlock(@R.Spin);
-    SpinLock(@R.Spin);
-  end;
-  R.Waiting := R.Waiting - 1;
-  R.Writer := 1;
-  SpinUnlock(@R.Spin);
+  PasMutexLock(R.W);
+  r1 := AtomicAdd(@R.RC, -RWMaxReaders) + RWMaxReaders;
+  if (r1 <> 0) and (AtomicAdd(@R.RWait, r1) <> 0) then
+    RWWriteAcquire(R);
 end;
 
 procedure PasRWUnlock(var R: TPasRWMutex);
 var
-  g: Integer;
+  r1, i: Integer;
 begin
-  SpinLock(@R.Spin);
-  R.Writer := 0;
-  g := QWake1(@R.WriteQ);
-  if g <> 0 then
-    ReadyG(g)
-  else
-  begin
-    g := QWake1(@R.ReadQ);
-    while g <> 0 do
-    begin
-      ReadyG(g);
-      g := QWake1(@R.ReadQ);
-    end;
-  end;
-  SpinUnlock(@R.Spin);
+  r1 := AtomicAdd(@R.RC, RWMaxReaders);
+  if r1 >= RWMaxReaders then
+    Fatal('paslang: unlock of an unlocked rwmutex');
+  for i := 1 to r1 do
+    RWReadRelease(R);
+  PasMutexUnlock(R.W);
 end;
 
 { ---- waitgroup ---- }
@@ -439,11 +481,9 @@ end;
 
 { True for the routine that must run the block. Every other routine
   waits until that block has finished and then gets False. }
-function PasOnceBegin(var O: TPasOnce): Boolean;
+function OnceBeginSlow(var O: TPasOnce): Boolean;
 begin
   Result := False;
-  if O.Fired <> 0 then
-    Exit;
   SpinLock(@O.Spin);
   if O.Fired <> 0 then
   begin
@@ -459,6 +499,16 @@ begin
   O.Running := 1;
   SpinUnlock(@O.Spin);
   Result := True;
+end;
+
+{ The fast path alone, small enough to be put in place at every once ... do:
+  a once that has run is one load and a compare. }
+function PasOnceBegin(var O: TPasOnce): Boolean;
+begin
+  if O.Fired <> 0 then
+    Result := False
+  else
+    Result := OnceBeginSlow(O);
 end;
 
 procedure PasOnceEnd(var O: TPasOnce);
