@@ -683,6 +683,9 @@ GOLDEN_A64 += mime mailtree mailbuild mailscale mailtls smtp imap
 # P451: base64 as it was written first, against the faster one.
 GOLDEN += base64fast
 GOLDEN_A64 += base64fast
+# P480: Val and StrToInt on the short path and the long, as the compiler before it read them.
+GOLDEN += valdec
+GOLDEN_A64 += valdec
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
