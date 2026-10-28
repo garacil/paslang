@@ -299,6 +299,7 @@ type
     FSym: array of TSym;
     FFrame: LongInt;
     FStrs: array of string;
+    FRealC: array of Int64;   { the Double constants .Lrc<n> in .rodata (P486) }
     FTypes: TTypeDefArray;
     FResName: string;
     FResOff: LongInt;
@@ -845,6 +846,15 @@ type
     function KeptStore(Dest: PExpr): Boolean;
     function RealBin(E: PExpr): Boolean;
     procedure EmitRealBin(E: PExpr);
+    function RealPure(E: PExpr): Boolean;
+    function RealLeaf(E: PExpr): Boolean;
+    function RealOperand(E: PExpr; K: LongInt): Boolean;
+    procedure RealTo(E: PExpr; K: LongInt);
+    function RealAssign(S: PStmt): Boolean;
+    function InternReal(Bits: Int64): string;
+    function RealRhs(E: PExpr): string;
+    function RealCondBranch(E: PExpr; const Target: string; WhenTrue: Boolean): Boolean;
+    function RealHome(const N: string; out Sy: TSym; out Where: string): Boolean;
     procedure RealIntCheck;
     function EmitQuadFn(E: PExpr): Boolean;
     procedure QuadCall2(E: PExpr; const Fn: string);
@@ -983,6 +993,7 @@ type
     procedure ScanAddrS(S: PStmt);
     function PromoCand(const S: TSym): Boolean;
     function PromoScalar(Typ: LongInt): Boolean;
+    function PromoRealLValOK(D: PExpr): Boolean;
     function PromoConst(E: PExpr): Boolean;
     function PromoExprOK(E: PExpr): Boolean;
     function PromoLValOK(D: PExpr): Boolean;
@@ -1742,6 +1753,9 @@ begin
   for i := 1 to Length(src) do
     if (src[i] = ',') or (src[i] = '(') then
       Exit;
+  { an xmm register takes no immediate (P486) }
+  if (Copy(dst, 1, 3) = 'xmm') and (src[1] = '$') then
+    Exit;
   if src = '%' + dst then
   begin
     Drop := True;
@@ -12070,6 +12084,8 @@ var
   wasE: PExpr;
   wasTrue, wasDone, done: Boolean;
 begin
+  if RealCondBranch(E, Target, WhenTrue) then
+    Exit;
   if CondJmp(E, Target, WhenTrue) then
     Exit;
   { a word the pool works out is tested where it is (P328): p xor q was
@@ -18942,6 +18958,297 @@ begin
       Result := True;
 end;
 
+{ P486 (amd64): a real operation worked out in the xmm registers. A leaf is an
+  expression whose code touches rax and the integer registers only (no call,
+  no real operation inside): it is computed into rax and converted into its
+  register; an operation puts its left operand in xmmK and its right in xmmK+1
+  (a deeper tree goes on up to xmm7), so nothing is pushed and the left operand
+  waits in its register while the right is worked out. }
+function TEmitter.RealPure(E: PExpr): Boolean;
+begin
+  Result := False;
+  if E = nil then
+    Exit;
+  case E^.Kind of
+    ekInt, ekNil, ekVar:
+      Result := True;
+    ekReal:
+      Result := TKind(E^.Typ) = tykReal;
+    ekUn:
+      Result := (TKind(E^.Typ) <> tykReal) and RealPure(E^.L);
+    ekBin:
+      begin
+        if (E^.L = nil) or (E^.R = nil) then
+          Exit;
+        if (E^.Bin = boConcat) or (E^.Bin = boIs) or (E^.Bin = boAs) or (E^.Bin = boSlash) or
+          (E^.Bin = boIn) then
+          Exit;
+        if RealBin(E) or IsStr(E^.L^.Typ) or IsStr(E^.R^.Typ) then
+          Exit;
+        Result := RealPure(E^.L) and RealPure(E^.R);
+      end;
+    ekField, ekDeref:
+      Result := RealPure(E^.L);
+    ekIndex:
+      Result := (E^.L <> nil) and (not IsStr(E^.L^.Typ)) and RealPure(E^.L) and RealPure(E^.R);
+  end;
+end;
+
+function TEmitter.RealLeaf(E: PExpr): Boolean;
+var
+  k: TTypeKind;
+begin
+  Result := False;
+  if E = nil then
+    Exit;
+  k := TKind(E^.Typ);
+  if (k <> tykReal) and (k <> tykInteger) and (k <> tykSubrange) then
+    Exit;
+  if (k = tykReal) and (TSize(E^.Typ) > 8) then
+    Exit;
+  if PtrAccess(E) then
+    Exit;
+  Result := RealPure(E);
+end;
+
+function TEmitter.RealOperand(E: PExpr; K: LongInt): Boolean;
+begin
+  Result := False;
+  if (E = nil) or (K > 7) then
+    Exit;
+  if RealLeaf(E) then
+  begin
+    Result := True;
+    Exit;
+  end;
+  if (E^.Kind <> ekBin) or (K > 6) then
+    Exit;
+  if not ((E^.Bin = boAdd) or (E^.Bin = boSub) or (E^.Bin = boMul) or (E^.Bin = boSlash)) then
+    Exit;
+  if not RealBin(E) then
+    Exit;
+  { Double arithmetic: a Single's, a Quad's and a mixed one's rounding differ }
+  if (TKind(E^.Typ) <> tykReal) or (E^.Typ = TySingle) then
+    Exit;
+  Result := RealOperand(E^.L, K) and RealOperand(E^.R, K + 1);
+end;
+
+function TEmitter.InternReal(Bits: Int64): string;
+var
+  i, n: SizeInt;
+begin
+  n := Length(FRealC);
+  for i := 0 to n - 1 do
+    if FRealC[i] = Bits then
+    begin
+      Result := '.Lrc' + IntToStr(i);
+      Exit;
+    end;
+  SetLength(FRealC, n + 1);
+  FRealC[n] := Bits;
+  Result := '.Lrc' + IntToStr(n);
+end;
+
+{ A Double variable's home as an operand of movsd/movapd: its xmm register (a loop
+  keeps it there), or its place in the frame or in the data, when it is a plain one. }
+function TEmitter.RealHome(const N: string; out Sy: TSym; out Where: string): Boolean;
+begin
+  Result := False;
+  if not TryFindSym(N, Sy) then
+    Exit;
+  if (TKind(Sy.Typ) <> tykReal) or (Sy.Typ = TySingle) or (TSize(Sy.Typ) <> 8) then
+    Exit;
+  if Sy.Reg <> '' then
+  begin
+    Where := '%' + Sy.Reg;
+    Result := True;
+    Exit;
+  end;
+  if Sy.ByRef or Sy.Boxed or (Sy.Up > 0) then
+    Exit;
+  if Sy.Global then
+    Where := VarLabel(Sy.Name) + '(%rip)'
+  else
+    Where := IntToStr(Sy.Off) + '(%rbp)';
+  Result := True;
+end;
+
+{ The right operand of an operation as an operand of the instruction itself, when it
+  is a Double constant, or a Double variable in an xmm register or a plain place:
+  mulsd %xmm8, %xmm0, mulsd -8(%rbp), %xmm0, mulsd .Lrc0(%rip), %xmm0; '' otherwise. }
+function TEmitter.RealRhs(E: PExpr): string;
+var
+  sy: TSym;
+  w: string;
+begin
+  Result := '';
+  if E = nil then
+    Exit;
+  if (E^.Kind = ekReal) and (TKind(E^.Typ) = tykReal) and (E^.Typ <> TySingle) and
+    (TSize(E^.Typ) = 8) then
+  begin
+    Result := InternReal(E^.Num) + '(%rip)';
+    Exit;
+  end;
+  if (E^.Kind = ekVar) and (TKind(E^.Typ) = tykReal) and RealHome(E^.Name, sy, w) then
+    if (sy.Reg = '') or (Copy(sy.Reg, 1, 3) = 'xmm') then
+      Result := w;
+end;
+
+{ A comparison of Doubles in a branch: ucomisd and the jump of the flags, with the
+  parity of an unordered pair (a NaN is below, above and equal to nothing); False,
+  and nothing written, when the operands are not for the xmm registers. }
+function TEmitter.RealCondBranch(E: PExpr; const Target: string; WhenTrue: Boolean): Boolean;
+var
+  op: TBinOp;
+  rhs, skip: string;
+  swap: Boolean;
+begin
+  Result := False;
+  if FArm or (E = nil) or (E^.Kind <> ekBin) then
+    Exit;
+  op := E^.Bin;
+  if not ((op = boEq) or (op = boNe) or (op = boLt) or (op = boLe) or (op = boGt) or (op = boGe)) then
+    Exit;
+  if (E^.L = nil) or (E^.R = nil) or (not RealBin(E)) then
+    Exit;
+  if (E^.L^.Typ = TySingle) or (E^.R^.Typ = TySingle) then
+    Exit;
+  if (TKind(E^.L^.Typ) = tykQuad) or (TKind(E^.R^.Typ) = tykQuad) then
+    Exit;
+  if not (RealOperand(E^.L, 0) and RealOperand(E^.R, 1)) then
+    Exit;
+  swap := (op = boLt) or (op = boLe);
+  if swap then
+  begin
+    { a < b is b > a: the flags of b against a, where CF and ZF both clear is above }
+    RealTo(E^.R, 0);
+    RealTo(E^.L, 1);
+  end
+  else
+  begin
+    RealTo(E^.L, 0);
+    RealTo(E^.R, 1);
+  end;
+  Line('  ucomisd %xmm1, %xmm0');
+  if (op = boGt) or (op = boLt) then
+  begin
+    if WhenTrue then
+      Line('  ja ' + Target)
+    else
+      Line('  jbe ' + Target);
+  end
+  else if (op = boGe) or (op = boLe) then
+  begin
+    if WhenTrue then
+      Line('  jae ' + Target)
+    else
+      Line('  jb ' + Target);
+  end
+  else if (op = boEq) = WhenTrue then
+  begin
+    { taken when equal and ordered }
+    skip := Lab;
+    Line('  jp ' + skip);
+    Line('  je ' + Target);
+    Line(skip + ':');
+  end
+  else
+  begin
+    { taken when different or unordered }
+    Line('  jp ' + Target);
+    Line('  jne ' + Target);
+  end;
+  Result := True;
+end;
+
+procedure TEmitter.RealTo(E: PExpr; K: LongInt);
+var
+  r, w, rhs, op: string;
+  sy: TSym;
+begin
+  r := '%xmm' + IntToStr(K);
+  if (E^.Kind = ekReal) and (TKind(E^.Typ) = tykReal) and (E^.Typ <> TySingle) and
+    (TSize(E^.Typ) = 8) then
+  begin
+    if E^.Num = 0 then
+      Line('  xorpd ' + r + ', ' + r)
+    else
+      Line('  movsd ' + InternReal(E^.Num) + '(%rip), ' + r);
+    Exit;
+  end;
+  if RealLeaf(E) then
+  begin
+    if (E^.Kind = ekVar) and (TKind(E^.Typ) = tykReal) and RealHome(E^.Name, sy, w) then
+    begin
+      if Copy(sy.Reg, 1, 3) = 'xmm' then
+        Line('  movapd ' + w + ', ' + r)
+      else if sy.Reg <> '' then
+        Line('  movq ' + w + ', ' + r)
+      else
+        Line('  movsd ' + w + ', ' + r);
+      Exit;
+    end;
+    EmitExpr(E);
+    RealInto(E^.Typ, False, 'xmm' + IntToStr(K));
+    Exit;
+  end;
+  RealTo(E^.L, K);
+  rhs := RealRhs(E^.R);
+  if rhs = '' then
+  begin
+    RealTo(E^.R, K + 1);
+    rhs := '%xmm' + IntToStr(K + 1);
+  end;
+  if E^.Bin = boAdd then
+    op := 'addsd '
+  else if E^.Bin = boSub then
+    op := 'subsd '
+  else if E^.Bin = boMul then
+    op := 'mulsd '
+  else
+    op := 'divsd ';
+  Line('  ' + op + rhs + ', ' + r);
+end;
+
+{ x := a real expression, x a Double variable: worked out in xmm0 and stored from it,
+  with no trip through rax. }
+function TEmitter.RealAssign(S: PStmt): Boolean;
+var
+  sy: TSym;
+  w, nm: string;
+  t: LongInt;
+begin
+  Result := False;
+  if FArm or (S = nil) or (S^.E = nil) then
+    Exit;
+  if S^.Dest <> nil then
+  begin
+    if (S^.Dest^.Kind <> ekVar) or (S^.Dest^.Typ <> S^.E^.Typ) then
+      Exit;
+    nm := S^.Dest^.Name;
+  end
+  else
+    nm := S^.Name;
+  t := S^.E^.Typ;
+  if (TKind(t) <> tykReal) or (t = TySingle) or (TSize(t) <> 8) then
+    Exit;
+  if not RealHome(nm, sy, w) then
+    Exit;
+  if sy.Typ <> t then
+    Exit;
+  if not RealOperand(S^.E, 0) then
+    Exit;
+  RealTo(S^.E, 0);
+  if Copy(sy.Reg, 1, 3) = 'xmm' then
+    Line('  movapd %xmm0, ' + w)
+  else if sy.Reg <> '' then
+    Line('  movq %xmm0, ' + w)
+  else
+    Line('  movsd %xmm0, ' + w);
+  Result := True;
+end;
+
 procedure TEmitter.EmitRealBin(E: PExpr);
 var
   sgl, isCmp: Boolean;
@@ -19006,12 +19313,20 @@ begin
       f := 'ss'
     else
       f := 'sd';
-    EmitExpr(E^.L);
-    PushK('rax', VCls(E^.L^.Typ, 0));
-    EmitExpr(E^.R);
-    RealInto(E^.R^.Typ, sgl, 'xmm1');
-    Line('  popq %rax');
-    RealInto(E^.L^.Typ, sgl, 'xmm0');
+    if (not sgl) and RealOperand(E^.L, 0) and RealOperand(E^.R, 1) then
+    begin
+      RealTo(E^.L, 0);
+      RealTo(E^.R, 1);
+    end
+    else
+    begin
+      EmitExpr(E^.L);
+      PushK('rax', VCls(E^.L^.Typ, 0));
+      EmitExpr(E^.R);
+      RealInto(E^.R^.Typ, sgl, 'xmm1');
+      Line('  popq %rax');
+      RealInto(E^.L^.Typ, sgl, 'xmm0');
+    end;
     if isCmp then
     begin
       Line('  ucomi' + f + ' %xmm1, %xmm0');
@@ -29764,6 +30079,7 @@ begin
     skAssign:
       begin
         if not VecAssign(S) then
+        if not RealAssign(S) then
         if not FastAssign(S) then
         if not OrdAssign(S) then
         if not EmitStrAppend(S) then
@@ -30863,8 +31179,11 @@ begin
     Exit;
   { An integer, a Boolean, a pointer or a class reference (P96): the
     slow path spills and reloads, so a pointer into a stack that moves
-    is relocated in its home and comes back relocated. }
+    is relocated in its home and comes back relocated. A Double too on
+    amd64 (P486), in an xmm register. }
   k := TKind(S.Typ);
+  if (k = tykReal) and (not FArm) and (TSize(S.Typ) = 8) then
+    k := tykInteger;
   if (k <> tykInteger) and (k <> tykEnum) and (k <> tykSubrange) and
     (k <> tykBoolean) and (k <> tykPointer) and (k <> tykClass) then
     Exit;
@@ -30940,16 +31259,26 @@ begin
   case E^.Kind of
     ekInt, ekNil, ekStr, ekVar:
       Result := True;
+    ekReal:
+      { a Double or a Single literal is one movabsq into rax (a Quad's takes rdx too) }
+      Result := TKind(E^.Typ) = tykReal;
     ekUn:
       Result := PromoExprOK(E^.L);
     ekBin:
       begin
         if (E^.L = nil) or (E^.R = nil) then
           Exit;
-        if (E^.Bin = boConcat) or (E^.Bin = boIs) or (E^.Bin = boAs) or
-          (E^.Bin = boSlash) then
+        if (E^.Bin = boConcat) or (E^.Bin = boIs) or (E^.Bin = boAs) then
           Exit;
         if RealBin(E) then
+        begin
+          { a real operation (EmitRealBin) works in rax, rcx and xmm0, xmm1 and
+            the stack, nothing a region keeps: its operands are what a region
+            may compute }
+          Result := PromoExprOK(E^.L) and PromoExprOK(E^.R);
+          Exit;
+        end;
+        if E^.Bin = boSlash then
           Exit;
         if IsStr(E^.L^.Typ) and IsStr(E^.R^.Typ) then
           Exit;
@@ -30982,7 +31311,9 @@ begin
       if (E^.Name = 'rt_length') or (E^.Name = 'rt_high') or
         (E^.Name = 'rt_low') or (E^.Name = 'rt_odd') or
         (E^.Name = 'rt_absint') or (E^.Name = 'rt_bitchk') or (E^.Name = 'rt_rot') or
-        (E^.Name = 'rt_funnel') or (E^.Name = 'rt_carry') then
+        (E^.Name = 'rt_funnel') or (E^.Name = 'rt_carry') or
+        (E^.Name = 'rt_sqrt') or (E^.Name = 'rt_sqrreal') or (E^.Name = 'rt_int2real') or
+        (E^.Name = 'rt_absreal') then
       begin
         for i := 0 to High(E^.Args) do
           if not PromoExprOK(E^.Args[i]) then
@@ -31009,6 +31340,29 @@ begin
     ekVar:
       if TryFindSym(D^.Name, s) then
         Result := PromoScalar(s.Typ);
+    ekIndex:
+      Result := PromoExprOK(D^.L) and PromoExprOK(D^.R);
+    ekField, ekDeref:
+      Result := PromoExprOK(D^.L);
+  end;
+end;
+
+{ A Double or a Single place a region may store to: a variable, an element or a field
+  whose own parts a region may compute; it is never kept in a register. }
+function TEmitter.PromoRealLValOK(D: PExpr): Boolean;
+var
+  s: TSym;
+begin
+  Result := False;
+  if D = nil then
+    Exit;
+  if (TKind(D^.Typ) <> tykReal) or (TSize(D^.Typ) > 8) then
+    Exit;
+  if PtrAccess(D) then
+    Exit;
+  case D^.Kind of
+    ekVar:
+      Result := TryFindSym(D^.Name, s);
     ekIndex:
       Result := PromoExprOK(D^.L) and PromoExprOK(D^.R);
     ekField, ekDeref:
@@ -31065,9 +31419,9 @@ begin
         if not PromoExprOK(S^.E) then
           Exit;
         if S^.Dest <> nil then
-          Result := PromoLValOK(S^.Dest)
+          Result := PromoLValOK(S^.Dest) or PromoRealLValOK(S^.Dest)
         else if TryFindSym(S^.Name, sy) then
-          Result := PromoScalar(sy.Typ);
+          Result := PromoScalar(sy.Typ) or ((TKind(sy.Typ) = tykReal) and (TSize(sy.Typ) <= 8));
       end;
     skIf:
       Result := PromoExprOK(S^.E) and PromoStmtOK(S^.ThenSt, InLoop) and
@@ -33347,7 +33701,8 @@ end;
   not pay for its loads and stores. }
 function TEmitter.EmitRegion(const L: TStmtArray; A, Z: SizeInt): Boolean;
 var
-  i, j, n, nf, nk, base, need, nfMax, nkMax, kind: LongInt;
+  i, j, n, nf, nk, nr, base, need, nfMax, nkMax, kind: LongInt;
+  noReal: Boolean;
   k: SizeInt;
   t: TPromo;
   b, e, b2: string;
@@ -33432,6 +33787,27 @@ begin
   chosen := nil;
   nf := 0;
   nk := 0;
+  nr := 0;
+  { a Double is kept in xmm8 and up only in a region with no vector word and no
+    island (a call takes every xmm register) and not in a straight run (P486) }
+  noReal := FArm or (Length(FIsles) > 0);
+  { in a try the handler may read a variable at home, which an exception from the
+    region (a bounds check) would find as the region began }
+  for i := 0 to High(FTryRec) do
+    if FTryRec[i] then
+      noReal := True;
+  if not noReal then
+  begin
+    FVCand := nil;
+    need := 0;
+    for k := A to Z do
+      VScanS(L[k], 1);
+    for k := A to Z do
+      VNeedS(L[k], need);
+    if (need > 0) or (Length(FVCand) > 0) then
+      noReal := True;
+    FVCand := nil;
+  end;
   base := FScratchOff - FPinned;
   { An innermost for keeps the end of its run of 1024 in a register of
     its own (EmitFor), set aside first: it saves a compare and a branch
@@ -33476,7 +33852,12 @@ begin
     { with islands a kept register first on amd64: a call keeps it, its
       variable not loaded after (P384) }
     kind := 0;
-    if run then
+    if TKind(FPromo[i].Place.Typ) = tykReal then
+    begin
+      if (not noReal) and (nr < 6) and ((FPromo[i].Refs >= 2) and (not run) or (FPromo[i].Refs >= 64)) then
+        kind := 3;
+    end
+    else if run then
       kind := RunKind(FPromo[i], L, A, Z, toEnd, (not FArm) and (nf < nfMax),
         (FArm and (nk < nkMax)) or ((not FArm) and (nk < 4)))
     else if FArm then
@@ -33503,6 +33884,16 @@ begin
         Inc(nk);
         chosen[j].Save := base - 8 * nk;
       end;
+    end
+    else if kind = 3 then
+    begin
+      SetLength(chosen, j + 1);
+      chosen[j] := FPromo[i];
+      chosen[j].Reg := 'xmm' + IntToStr(8 + nr);
+      chosen[j].Dw := 25 + nr;
+      chosen[j].Keep := False;
+      chosen[j].Save := 0;
+      Inc(nr);
     end
     else if kind = 1 then
     begin
@@ -51489,6 +51880,7 @@ begin
   FDbgFn := '';
   FLastIns := '';
   FStrs := nil;
+  FRealC := nil;
   FGcTypes := nil;
   FGcInst := nil;
   FRootWords := nil;
@@ -52400,6 +52792,14 @@ begin
     Line('.Lsf' + IntToStr(i) + ':');
     Line('  .quad .Ls' + IntToStr(i));
     Line('  .quad ' + IntToStr(Length(FStrs[i])));
+  end;
+  { the Double constants of real expressions (P486) }
+  for i := 0 to High(FRealC) do
+  begin
+    RoSec('rc' + IntToStr(i));
+    Line('.balign 8');
+    Line('.Lrc' + IntToStr(i) + ':');
+    Line('  .quad ' + IntToStr(FRealC[i]));
   end;
   { the vector constants (1.0.128): each lane's low bits, 32 bytes }
   for i := 0 to High(FVecCLane) do

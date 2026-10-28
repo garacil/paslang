@@ -88,7 +88,9 @@ PAIRS = ["b1loop", "b2str", "b3spawn", "b4chan", "b5map", "b6smap", "b7narrow", 
          # P451: base64 encode and decode of 3 MB against encoding/base64
          "b41base64",
          # P479: HTTP requests read (pashttp's reader against net/http's ReadRequest)
-         "b42http"]
+         "b42http",
+         # P486: real arithmetic (Doubles in a Mandelbrot loop)
+         "b43real"]
 # The longest one run may take, in seconds: a run past it is killed, its
 # unit stops being measured and fails (Go's side of every pair takes
 # under 1 s; paslang's append of a character, quadratic until its hito,
@@ -132,6 +134,7 @@ SECTIONS = {
     "b40mail": ["message", "addr", "build", "words"],
     "b41base64": ["roundtrip"],
     "b42http": ["requests"],
+    "b43real": ["mandel"],
 }
 CHECKPTR = ["b8ptr"]
 PROBES = ["p1alloccap", "p2deeprec", "p3divzero", "p4nil", "p5bounds", "p6strbounds", "p7parked"]

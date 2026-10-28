@@ -704,6 +704,9 @@ GOLDEN_A64 += scavenge
 # P487: the rwmutex as Go's, and once on its word.
 GOLDEN += rwstress oncefast
 GOLDEN_A64 += rwstress oncefast
+# P486: real expressions in the xmm registers, against the compiler before.
+GOLDEN += realregs
+GOLDEN_A64 += realregs
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
