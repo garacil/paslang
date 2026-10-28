@@ -12340,6 +12340,82 @@ Out := b.Save;                           { the workbook as an archive }
   done; a cell's rich text cannot be written (inline strings are plain).
 - **Routines.** A book belongs to the routine that edits it.
 
+`uses paspdf` reads PDF files (1.2.313, P476): their objects, their pages and
+the text on them. It was asked for by the portal, to look into a customer's
+invoice for a phone number. The file is held in a string, as the other readers
+of this chapter take theirs, and what comes out is UTF-8.
+
+```pascal
+d := TPdfDoc.Create(Data);         { EPdfError: not a PDF, encrypted, no catalog }
+n := d.PageCount;                  { the pages of the page tree }
+t := d.PageText(0);                { page 1 in lines, from the top down, each left to right }
+r := d.PageTextRaw(0);             { the same in the order the content stream shows it }
+all := d.Text;                     { every page, a form feed after each }
+p := d.Info('Producer');           { the document information, as UTF-8 }
+s := PdfText(Data);                { one call for the text of a file }
+for i := 0 to d.WarningCount - 1 do WriteLn(d.WarningAt(i));   { what was read round }
+```
+- **What it reads.** The cross-reference tables and streams of ISO 32000-1 7.5
+  (a table, a stream, a hybrid of both, any number of incremental updates), the
+  object streams of PDF 1.5, the filters of 7.4 (Flate and LZW with their TIFF
+  and PNG predictors, ASCII85, ASCIIHex, RunLength) and the page tree with the
+  Resources the pages inherit. A page's content streams are read as 7.8 and 9.4
+  have them: `Tj TJ ' "` and the operators that move the text (`Td TD Tm T*`), the
+  text state (`Tc Tw Tz TL Tf Tr Ts`), `q Q cm`, form XObjects (`Do`, with their
+  matrix and their own resources) and inline images (left out). Whatever
+  an operator needs and does not have is left alone.
+- **Fonts.** A simple font by its Encoding (WinAnsi, MacRoman, Standard) and the
+  Differences array, whose glyph names are read through the Adobe Glyph List
+  (`uniXXXX`, `uXXXXXX`, `f_i`, `A.sc` as the specification of the list reads
+  them); a Type0 font by Identity-H and -V, by the Unicode CMaps (UCS2, UTF16)
+  and by an embedded CMap with its code space (one and two bytes together). The
+  font's ToUnicode map wins where there is one: bfchar and bfrange, with the
+  array form, surrogate pairs and a target of several characters. The widths of
+  Widths and W (and DW) place the strings, so the spaces between them are found.
+  The ligatures of the Alphabetic Presentation Forms (U+FB00 to U+FB06) and the
+  private-use fi and fl (U+F001, U+F002) are written as their letters. A Type0
+  font with no map gives U+FFFD for each code, and `WarningAt` says which font.
+- **Text.** `PageText` puts a space between two strings of a line when the gap is
+  wider than 0.15 of the font's size, and inside a TJ array where an adjustment
+  is 180 thousandths or more; a line is the strings whose baselines are within
+  0.4 of the smaller size. Text drawn invisible (mode 3, the layer an OCR program
+  adds to a scan) is text. Rotated text comes after the lines, in the order of the
+  stream. What is not read: encryption (EPdfError "encrypted", P494), images and
+  scans (there is no recognition), the text of form fields and annotations, a
+  font that has neither Encoding nor ToUnicode beyond the guess of Latin-1 (P495).
+- **Damage.** A file with no `startxref`, a table that points to the wrong places
+  (junk in front, an edit that moved the objects), a trailer that lost its Root,
+  false stream lengths, a missing `endstream` or `endobj`, a Flate stream cut short
+  or with a bad checksum or with no zlib header, is read as far as it can be: the
+  table is rebuilt by looking for `N G obj` in the file and the catalog by its
+  type. Each repair is a warning.
+- **Limits.** Objects nest 100 deep, pages 64, forms 12, the graphics state 256;
+  a file has at most 4,000,000 objects; a decoded stream is at most `MaxStreamSize`
+  (128 MiB) and the object streams together 512 MiB; a page gives at most
+  3,000,000 strings. Whatever the bytes, `TPdfDoc.Create` and the readings raise
+  EPdfError or return; the reader writes nothing, runs nothing the file holds
+  (JavaScript, actions) and reads nothing but the string it was given.
+- **Routines.** A TPdfDoc caches its objects, fonts and decoded object streams
+  without a lock: it belongs to the routine that uses it, and any number of
+  routines may each have one.
+- **Checked.** `testdata/pdftext` reads 64 files and gives their text: 58 made
+  byte by byte by `scripts/gen_pdf_tests.py` (every filter, both kinds of table and
+  object streams, a hybrid file, an update, the encodings, ToUnicode maps, Type0
+  fonts with mixed code lengths, forms, an inline image that holds `EI`, the page
+  tree with a loop, sixteen kinds of damage, an encrypted file, a file that is
+  no PDF), and six that cairo, Skia (Edge), LibreOffice, Ghostscript, groff and
+  librsvg wrote from invented text; `qpdf --check` accepts the valid ones and
+  `pdftotext` gives the same words (`--verify`). Then every file is bent 12 times
+  (cut, a piece taken out, bytes changed, a piece copied over, bits flipped, junk
+  in front) by a fixed generator and read again: 756 files, 595 read and 161
+  refused, none anything else; 37,800 more of another seed, and 6,300 on the
+  collector's stress (`PASLANG_GCSTRESS=3`, verify and poison), gave the same
+  result. Against pdftotext's words on the first pages of six public manuals
+  (about 230,000 words) 98.9 to 99.7 % agree.
+  A whole manual of 963 pages (2.6 MB of text) takes 0.83 s, pdftotext -raw 2.2 s;
+  the 5,364 pages of the Intel manual take 2.4 s against 5.6 s. Go has no PDF reader
+  in its library, so there is no pair against Go yet (P496).
+
 `uses httpclient` is an HTTP/1.1 client, and `pasconn`, `pastextproto`, `pashttp`
 and `pasurl` are what it is made of (1.1.266, P432): `pasconn` is the connection as an object
 (`TNetStream`: `ReadSome` and `WriteAll` with a deadline, TCP or a Unix socket,

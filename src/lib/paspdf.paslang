@@ -1,0 +1,4788 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+
+  paslang is free software: you can redistribute it and/or modify it
+  under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+
+  paslang is distributed in the hope that it will be useful, but
+  WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+  General Public License for more details.
+
+  Under Section 7 of GPL version 3, you are granted additional
+  permissions described in the paslang Runtime Library Exception,
+  version 1.0, in the file COPYING.RUNTIME.
+
+  You should have received a copy of the GNU General Public License
+  along with paslang.  If not, see <https://www.gnu.org/licenses/>. }
+
+{ PDF files read (P476): their objects, their pages and the text on them.
+
+  TPdfDoc opens a file held in a string. It reads the cross-reference
+  tables and streams as ISO 32000-1 7.5 has them (a table, a stream, a
+  hybrid of both, any number of incremental updates, the object streams of
+  PDF 1.5), the filters of 7.4 (Flate and LZW with their predictors,
+  ASCII85, ASCIIHex, RunLength; the filters of images are refused where a
+  stream is asked for), the page tree of 7.7 with the Resources the pages
+  inherit, and the content streams of 7.8 and 9.4: the text operators, the
+  graphics state's matrices, form XObjects, inline images (left out). A
+  file whose table is missing or wrong, whose offsets are shifted, whose
+  stream lengths are false, whose Flate data is cut or has a bad checksum,
+  is read as far as it can be: the table is rebuilt by looking for the
+  objects, and what was wrong is told by WarningAt. A file that cannot be
+  read at all is an EPdfError that says where. The reader never writes,
+  never runs anything the file holds (no JavaScript, no actions, no
+  launch), and never reads outside the string it was given.
+
+  Fonts: simple fonts by their Encoding (WinAnsi, MacRoman, Standard, a
+  Differences array read through the Adobe Glyph List) and Type0 fonts by
+  Identity-H and -V, by the Unicode CMaps (UCS2, UTF16) and by an embedded
+  CMap, all with their ToUnicode map, which wins where there is one; the
+  widths of Widths and W. The ligatures of the presentation forms are
+  written as the letters they join. A Type0 font with no ToUnicode gives
+  U+FFFD for each code (P495); the standard 14 fonts' widths are taken as
+  500, and 600 for Courier, where there is no Widths array.
+
+  Text: PageText gives a page in lines from the top down, each from left
+  to right, a space where the gap between two strings is wider than 0.15
+  of the font's size (and inside a TJ array where an adjustment is 0.18 of
+  it or more); PageTextRaw gives it in the order the content stream shows
+  it, a line break where the baseline changes. Text drawn invisible (mode
+  3, an OCR layer) is text. What is not read: encryption (an EPdfError that
+  says so; P494), images, scans (there is no recognition), the text of
+  form fields and annotations, the order of a tagged structure.
+
+  Hostile files: nesting of objects stops at 100, of pages at 64, of forms
+  at 12, the graphics state stack at 256; a file has at most 4,000,000
+  objects; a decoded stream is at most MaxStreamSize bytes (128 MiB) and
+  the object streams together hold at most 512 MiB; a page gives at most
+  3,000,000 strings; loops in the page tree, the forms and the references
+  are cut. Whatever the bytes, TPdfDoc raises EPdfError or returns.
+
+  A TPdfDoc and what it holds belong to the routine that uses them (it
+  caches objects, fonts and decoded object streams without a lock); any
+  number of routines may each have one. Free of global state (Regla 11). }
+unit paspdf;
+
+interface
+
+uses
+  sysutils, pasflate, paspdfenc;
+
+const
+  { the kinds of a PDF object, ISO 32000-1 7.3 }
+  pdfNull = 0;
+  pdfBool = 1;
+  pdfInt = 2;
+  pdfReal = 3;
+  pdfString = 4;
+  pdfName = 5;
+  pdfArray = 6;
+  pdfDict = 7;
+  pdfStream = 8;
+  pdfRef = 9;
+
+type
+  { Offset is the byte of the file the fault was found at, or -1 }
+  EPdfError = class(Exception)
+  public
+    Offset: Integer;
+    constructor CreateAt(AOffset: Integer; const AReason: string);
+  end;
+
+  { one PDF object. Kind says which fields mean something: IVal is an
+    integer, a Boolean (0 or 1) or the number of the object a reference
+    points to (Gen is its generation); RVal a real (an integer's value is
+    in RVal as well); SVal the bytes of a string or the characters of a name
+    (without the slash, with its #xx escapes undone); Items the elements
+    of an array; Keys and Vals the entries of a dictionary, in the order
+    of the file, which a stream has as well. A stream's data lies in the
+    file at StmPos, StmLen bytes (the bytes after the stream keyword, not
+    decoded). }
+  TPdfObj = class
+  public
+    Kind: Integer;
+    IVal: Integer;
+    Gen: Integer;
+    RVal: Double;
+    SVal: string;
+    Items: array of TPdfObj;
+    Keys: array of string;
+    Vals: array of TPdfObj;
+    StmPos: Integer;
+    StmLen: Integer;
+    { the entry of a dictionary or stream as it is in the file (a
+      reference stays a reference), or nil when there is none }
+    function Get(const Key: string): TPdfObj;
+    function IsName(const AName: string): Boolean;
+  end;
+
+  { an object stream's header, read once: the numbers of its objects and
+    their offsets from First }
+  TPdfStmCache = record
+    Num: Integer;
+    Data: string;
+    Nums: array of Integer;
+    Offs: array of Integer;
+    First: Integer;
+  end;
+
+  { one string shown on a page: where it starts and ends (device space,
+    the point on the baseline), the font's size in device units, its text }
+  TPdfRun = record
+    X0: Double;
+    Y0: Double;
+    X1: Double;
+    Y1: Double;
+    FS: Double;
+    Text: string;
+  end;
+
+  TPdfRunList = record
+    Items: array of TPdfRun;
+    N: Integer;
+  end;
+
+  TPdfDoc = class
+  private
+    FData: string;
+    FXKind: array of Integer;
+    FXA: array of Integer;
+    FXB: array of Integer;
+    FCache: array of TPdfObj;
+    FState: array of Integer;
+    FStmIdx: array of Integer;
+    FStms: array of TPdfStmCache;
+    FSize: Integer;
+    FTrailer: TPdfObj;
+    FRebuilt: Boolean;
+    FMaxStream: Integer;
+    FStmBytes: Integer;
+    FWarn: array of string;
+    FPages: array of TPdfObj;
+    FPagesDone: Boolean;
+    FExt: TObject;
+    procedure Warn(const Msg: string);
+    procedure Fail(At: Integer; const Why: string);
+    procedure GrowXref(N: Integer);
+    procedure SetEntry(Num, Kind, A, B: Integer);
+    function FindStartXref: Integer;
+    function ReadXrefAt(At: Integer; var Trailer: TPdfObj): Boolean;
+    function ReadXrefTable(At: Integer; var Trailer: TPdfObj): Boolean;
+    function ReadXrefStream(At: Integer; var Trailer: TPdfObj): Boolean;
+    procedure LoadXref;
+    procedure Rebuild;
+    function LoadAt(Num, Off: Integer): TPdfObj;
+    function LoadFromStm(Num, StmNum, Idx: Integer): TPdfObj;
+    function StmCacheFor(StmNum: Integer): Integer;
+    function RawStream(S: TPdfObj): string;
+    function ApplyFilter(const Name: string; Parms: TPdfObj; const Data: string; Limit: Integer): string;
+    procedure LoadPages;
+    procedure WalkPages(Node, Parent: TPdfObj; Depth: Integer; var Seen: array of Integer);
+  public
+    constructor Create(const AData: string);
+    { the object of that number, or nil when the file has none (a free
+      entry, a number past the table) }
+    function GetObject(Num: Integer): TPdfObj;
+    { O with its references followed (a loop or a chain of more than 32 is
+      nil), or nil when O is nil or points at nothing }
+    function Resolve(O: TPdfObj): TPdfObj;
+    { the entry of a dictionary or stream with its reference followed }
+    function Dict(O: TPdfObj; const Key: string): TPdfObj;
+    function IntOf(O: TPdfObj; Dflt: Integer): Integer;
+    function NameOf(O: TPdfObj): string;
+    { a stream's data with its filters undone (Flate with its predictors,
+      LZW, ASCII85, ASCIIHex, RunLength; an image filter is an EPdfError) }
+    function StreamData(S: TPdfObj): string;
+    { the entry of the trailer, followed }
+    function TrailerEntry(const Key: string): TPdfObj;
+    { the number of objects the file's table has room for }
+    property ObjectCount: Integer read FSize;
+    property Data: string read FData;
+    property Rebuilt: Boolean read FRebuilt;
+    { a stream that would make more than this many bytes is refused
+      (the default is 128 MiB) }
+    property MaxStreamSize: Integer read FMaxStream write FMaxStream;
+    { an entry of the document information dictionary (Title, Author,
+      Subject, Keywords, Creator, Producer, CreationDate, ModDate) as
+      UTF-8: a text string, in PDFDocEncoding or in UTF-16BE or UTF-8 with
+      their marks; empty when there is none }
+    function Info(const Key: string): string;
+    { the pages in the order of the page tree (the entries of Kids, to a
+      depth of 64; a tree with a loop or a node that is no page is cut
+      there). An inherited Resources is put in the page. }
+    function PageCount: Integer;
+    function PageObject(I: Integer): TPdfObj;
+    { the text of page I (from 0): the text in lines, the lines from the
+      top of the page down, and the runs of a line from left to right,
+      with a space where the gap between two is wider than 0.15 of the
+      font's size. UTF-8. }
+    function PageText(I: Integer): string;
+    { the same in the order the content stream shows it: a line break
+      where the next run starts on another line }
+    function PageTextRaw(I: Integer): string;
+    { every page's text, a form feed after each }
+    function Text: string;
+    { what was found wrong and read round: the file's table rebuilt, a
+      stream cut short, a font without a map to text }
+    procedure AddWarning(const Msg: string);
+    function WarningCount: Integer;
+    function WarningAt(I: Integer): string;
+  end;
+
+{ the text of a file in memory: every page's, in reading order, a form feed
+  after each page; EPdfError when the file is not a PDF it can read }
+function PdfText(const Data: string): string;
+
+implementation
+
+const
+  tkEOF = 0;
+  tkInt = 1;
+  tkReal = 2;
+  tkString = 3;
+  tkName = 4;
+  tkKeyword = 5;
+  tkArrayOpen = 6;
+  tkArrayClose = 7;
+  tkDictOpen = 8;
+  tkDictClose = 9;
+  { how deep arrays and dictionaries may nest, and the most elements of
+    one array or dictionary }
+  MaxDepth = 100;
+  MaxElems = 4000000;
+
+constructor EPdfError.CreateAt(AOffset: Integer; const AReason: string);
+begin
+  if AOffset >= 0 then
+    inherited Create('pdf: ' + AReason + ' at byte ' + IntToStr(AOffset))
+  else
+    inherited Create('pdf: ' + AReason);
+  Offset := AOffset;
+end;
+
+function TPdfObj.Get(const Key: string): TPdfObj;
+var
+  i: Integer;
+begin
+  Result := nil;
+  if (Kind <> pdfDict) and (Kind <> pdfStream) then
+    Exit;
+  for i := 0 to Length(Keys) - 1 do
+    if Keys[i] = Key then
+    begin
+      Result := Vals[i];
+      Exit;
+    end;
+end;
+
+function TPdfObj.IsName(const AName: string): Boolean;
+begin
+  Result := (Kind = pdfName) and (SVal = AName);
+end;
+
+{ ---- characters (ISO 32000-1 7.2.2) ---- }
+
+const
+  { the class of each byte: 0 regular, 1 white space, 2 delimiter
+    (ISO 32000-1 7.2.2) }
+  CCls: array[0..255] of Byte = (
+    1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    1, 0, 0, 0, 0, 2, 0, 0, 2, 2, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 2, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 2, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 2, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+
+function IsWhite(C: Integer): Boolean;
+begin
+  Result := CCls[C and 255] = 1;
+end;
+
+function IsDelim(C: Integer): Boolean;
+begin
+  Result := CCls[C and 255] = 2;
+end;
+
+function IsRegular(C: Integer): Boolean;
+begin
+  Result := CCls[C and 255] = 0;
+end;
+
+{ a real as an integer, held to a range where the conversion means
+  something (a hostile file may write 1e300 or a NaN) }
+function SafeTrunc(X: Double): Integer;
+begin
+  if X <> X then
+    Result := 0
+  else if X > 1000000000000000.0 then
+    Result := 1000000000000000
+  else if X < -1000000000000000.0 then
+    Result := -1000000000000000
+  else
+    Result := Trunc(X);
+end;
+
+function HexVal(C: Integer): Integer;
+begin
+  if (C >= 48) and (C <= 57) then
+    Result := C - 48
+  else if (C >= 65) and (C <= 70) then
+    Result := C - 55
+  else if (C >= 97) and (C <= 102) then
+    Result := C - 87
+  else
+    Result := -1;
+end;
+
+function LitStringAt(const S: string; var P: Integer; E: Integer): string;
+var
+  start, depth, c, n, k, oct: Integer;
+  r: string;
+begin
+  { P is after the opening ( }
+  start := P;
+  SetLength(r, E - P + 2);
+  n := 0;
+  depth := 1;
+  while True do
+  begin
+    if P > E then
+      raise EPdfError.CreateAt(P - 1, 'a string is not closed');
+    c := Ord(S[P]);
+    P := P + 1;
+    if c = 40 then
+    begin
+      depth := depth + 1;
+      n := n + 1;
+      r[n] := Chr(c);
+    end
+    else if c = 41 then
+    begin
+      depth := depth - 1;
+      if depth = 0 then
+        Break;
+      n := n + 1;
+      r[n] := Chr(c);
+    end
+    else if c = 92 then
+    begin
+      if P > E then
+        raise EPdfError.CreateAt(P - 1, 'a string is not closed');
+      c := Ord(S[P]);
+      P := P + 1;
+      if c = 110 then
+      begin
+        n := n + 1;
+        r[n] := #10;
+      end
+      else if c = 114 then
+      begin
+        n := n + 1;
+        r[n] := #13;
+      end
+      else if c = 116 then
+      begin
+        n := n + 1;
+        r[n] := #9;
+      end
+      else if c = 98 then
+      begin
+        n := n + 1;
+        r[n] := #8;
+      end
+      else if c = 102 then
+      begin
+        n := n + 1;
+        r[n] := #12;
+      end
+      else if (c >= 48) and (c <= 55) then
+      begin
+        oct := c - 48;
+        k := 1;
+        while (k < 3) and (P <= E) and (Ord(S[P]) >= 48) and (Ord(S[P]) <= 55) do
+        begin
+          oct := oct * 8 + (Ord(S[P]) - 48);
+          P := P + 1;
+          k := k + 1;
+        end;
+        n := n + 1;
+        r[n] := Chr(oct and 255);
+      end
+      else if c = 13 then
+      begin
+        { a line break after the backslash is no character }
+        if (P <= E) and (Ord(S[P]) = 10) then
+          P := P + 1;
+      end
+      else if c = 10 then
+      begin
+      end
+      else
+      begin
+        n := n + 1;
+        r[n] := Chr(c);
+      end;
+    end
+    else if c = 13 then
+    begin
+      { an end of line inside a string is a line feed (7.3.4.2) }
+      if (P <= E) and (Ord(S[P]) = 10) then
+        P := P + 1;
+      n := n + 1;
+      r[n] := #10;
+    end
+    else
+    begin
+      n := n + 1;
+      r[n] := Chr(c);
+    end;
+  end;
+  SetLength(r, n);
+  Result := r;
+end;
+
+function HexStringAt(const S: string; var P: Integer; E: Integer): string;
+var
+  c, hi, n: Integer;
+  r: string;
+  haveHi: Boolean;
+begin
+  { P is after the < }
+  SetLength(r, (E - P) div 2 + 2);
+  n := 0;
+  hi := 0;
+  haveHi := False;
+  while True do
+  begin
+    if P > E then
+      raise EPdfError.CreateAt(P - 1, 'a hexadecimal string is not closed');
+    c := Ord(S[P]);
+    P := P + 1;
+    if c = 62 then
+      Break;
+    if IsWhite(c) then
+      Continue;
+    c := HexVal(c);
+    if c < 0 then
+      Continue;
+    if haveHi then
+    begin
+      n := n + 1;
+      r[n] := Chr(hi * 16 + c);
+      haveHi := False;
+    end
+    else
+    begin
+      hi := c;
+      haveHi := True;
+    end;
+  end;
+  if haveHi then
+  begin
+    n := n + 1;
+    r[n] := Chr(hi * 16);
+  end;
+  SetLength(r, n);
+  Result := r;
+end;
+
+function NameAt(const S: string; var P: Integer; E: Integer): string;
+var
+  start, n, c, h1, h2: Integer;
+  r: string;
+begin
+  { P is after the slash }
+  start := P;
+  while (P <= E) and (CCls[Ord(S[P])] = 0) do
+    P := P + 1;
+  SetLength(r, P - start);
+  n := 0;
+  while start < P do
+  begin
+    c := Ord(S[start]);
+    if (c = 35) and (start + 2 < P + 0) and (HexVal(Ord(S[start + 1])) >= 0) and (HexVal(Ord(S[start + 2])) >= 0) then
+    begin
+      h1 := HexVal(Ord(S[start + 1]));
+      h2 := HexVal(Ord(S[start + 2]));
+      c := h1 * 16 + h2;
+      start := start + 2;
+    end;
+    n := n + 1;
+    r[n] := Chr(c);
+    start := start + 1;
+  end;
+  SetLength(r, n);
+  Result := r;
+end;
+
+
+{ the bytes of a literal string at P (after the opening parenthesis),
+  appended to Pool at PoolN: what LitStringAt reads, without a string
+  made for it }
+procedure LitInto(const S: string; var P: Integer; E: Integer; var Pool: string; var PoolN: Integer);
+var
+  depth, c, k, oct: Integer;
+begin
+  depth := 1;
+  while True do
+  begin
+    if P > E then
+      raise EPdfError.CreateAt(P - 1, 'a string is not closed');
+    c := Ord(S[P]);
+    P := P + 1;
+    if c = 40 then
+      depth := depth + 1
+    else if c = 41 then
+    begin
+      depth := depth - 1;
+      if depth = 0 then
+        Break;
+    end
+    else if c = 92 then
+    begin
+      if P > E then
+        raise EPdfError.CreateAt(P - 1, 'a string is not closed');
+      c := Ord(S[P]);
+      P := P + 1;
+      if c = 110 then
+        c := 10
+      else if c = 114 then
+        c := 13
+      else if c = 116 then
+        c := 9
+      else if c = 98 then
+        c := 8
+      else if c = 102 then
+        c := 12
+      else if (c >= 48) and (c <= 55) then
+      begin
+        oct := c - 48;
+        k := 1;
+        while (k < 3) and (P <= E) and (Ord(S[P]) >= 48) and (Ord(S[P]) <= 55) do
+        begin
+          oct := oct * 8 + (Ord(S[P]) - 48);
+          P := P + 1;
+          k := k + 1;
+        end;
+        c := oct and 255;
+      end
+      else if c = 13 then
+      begin
+        if (P <= E) and (Ord(S[P]) = 10) then
+          P := P + 1;
+        Continue;
+      end
+      else if c = 10 then
+        Continue;
+    end
+    else if c = 13 then
+    begin
+      if (P <= E) and (Ord(S[P]) = 10) then
+        P := P + 1;
+      c := 10;
+    end;
+    if PoolN >= Length(Pool) then
+      SetLength(Pool, (PoolN + 64) * 2);
+    PoolN := PoolN + 1;
+    Pool[PoolN] := Chr(c);
+  end;
+end;
+
+procedure HexInto(const S: string; var P: Integer; E: Integer; var Pool: string; var PoolN: Integer);
+var
+  c, hi: Integer;
+  haveHi: Boolean;
+begin
+  hi := 0;
+  haveHi := False;
+  while True do
+  begin
+    if P > E then
+      raise EPdfError.CreateAt(P - 1, 'a hexadecimal string is not closed');
+    c := Ord(S[P]);
+    P := P + 1;
+    if c = 62 then
+      Break;
+    c := HexVal(c);
+    if c < 0 then
+      Continue;
+    if haveHi then
+    begin
+      if PoolN >= Length(Pool) then
+        SetLength(Pool, (PoolN + 64) * 2);
+      PoolN := PoolN + 1;
+      Pool[PoolN] := Chr(hi * 16 + c);
+      haveHi := False;
+    end
+    else
+    begin
+      hi := c;
+      haveHi := True;
+    end;
+  end;
+  if haveHi then
+  begin
+    if PoolN >= Length(Pool) then
+      SetLength(Pool, (PoolN + 64) * 2);
+    PoolN := PoolN + 1;
+    Pool[PoolN] := Chr(hi * 16);
+  end;
+end;
+
+{ ---- the lexer ---- }
+
+type
+  TPdfLex = class
+  public
+    S: string;
+    P: Integer;
+    E: Integer;
+    { the token Next read }
+    Tok: Integer;
+    TokStr: string;
+    TokInt: Integer;
+    TokReal: Double;
+    TokAt: Integer;
+    { whether an integer pair followed by R is read as a reference }
+    Refs: Boolean;
+    constructor Create(const AData: string; AStart, AEnd: Integer);
+    procedure Fail(const Why: string);
+    procedure SkipWhite;
+    function Next: Integer;
+    function ParseObject(Depth: Integer): TPdfObj;
+    function ParseStringLit: string;
+    function ParseHexStr: string;
+    function ParseName: string;
+    function ParseNumber(First, Last: Integer): Boolean;
+  end;
+
+constructor TPdfLex.Create(const AData: string; AStart, AEnd: Integer);
+begin
+  inherited Create;
+  S := AData;
+  P := AStart;
+  E := AEnd;
+  if E > Length(S) then
+    E := Length(S);
+  Tok := tkEOF;
+  Refs := True;
+end;
+
+procedure TPdfLex.Fail(const Why: string);
+begin
+  raise EPdfError.CreateAt(P - 1, Why);
+end;
+
+function TPdfLex.ParseStringLit: string;
+begin
+  Result := LitStringAt(S, P, E);
+end;
+
+function TPdfLex.ParseHexStr: string;
+begin
+  Result := HexStringAt(S, P, E);
+end;
+
+function TPdfLex.ParseName: string;
+begin
+  Result := NameAt(S, P, E);
+end;
+
+procedure TPdfLex.SkipWhite;
+var
+  c: Integer;
+begin
+  while P <= E do
+  begin
+    c := Ord(S[P]);
+    if IsWhite(c) then
+      P := P + 1
+    else if c = 37 then
+    begin
+      while (P <= E) and (Ord(S[P]) <> 10) and (Ord(S[P]) <> 13) do
+        P := P + 1;
+    end
+    else
+      Break;
+  end;
+end;
+
+{ a number from the characters First to Last: optional signs, digits with
+  at most one point; the text of a number the way real readers take it
+  (a point alone, 4. and -.5 are numbers) }
+function TPdfLex.ParseNumber(First, Last: Integer): Boolean;
+var
+  i, c, digits, fdig: Integer;
+  neg, seenPoint: Boolean;
+  v, scale: Double;
+  iv: Integer;
+  big: Boolean;
+begin
+  Result := False;
+  i := First;
+  neg := False;
+  while (i <= Last) and ((Ord(S[i]) = 43) or (Ord(S[i]) = 45)) do
+  begin
+    if Ord(S[i]) = 45 then
+      neg := True;
+    i := i + 1;
+  end;
+  digits := 0;
+  seenPoint := False;
+  iv := 0;
+  big := False;
+  v := 0;
+  scale := 1;
+  fdig := 0;
+  while i <= Last do
+  begin
+    c := Ord(S[i]);
+    if (c >= 48) and (c <= 57) then
+    begin
+      digits := digits + 1;
+      if seenPoint then
+      begin
+        fdig := fdig + 1;
+        if fdig <= 18 then
+        begin
+          scale := scale * 10;
+          v := v * 10 + (c - 48);
+        end;
+      end
+      else
+      begin
+        v := v * 10 + (c - 48);
+        if iv < 100000000000000 then
+          iv := iv * 10 + (c - 48)
+        else
+          big := True;
+      end;
+    end
+    else if (c = 46) and not seenPoint then
+      seenPoint := True
+    else
+      Exit;
+    i := i + 1;
+  end;
+  if digits = 0 then
+    Exit;
+  if seenPoint then
+  begin
+    TokReal := v / scale;
+    if neg then
+      TokReal := -TokReal;
+    TokInt := 0;
+    Tok := tkReal;
+  end
+  else
+  begin
+    if big then
+      iv := 100000000000000;
+    if neg then
+    begin
+      iv := -iv;
+      TokReal := -v;
+    end
+    else
+      TokReal := v;
+    TokInt := iv;
+    Tok := tkInt;
+  end;
+  Result := True;
+end;
+
+
+
+
+function TPdfLex.Next: Integer;
+var
+  c, st: Integer;
+begin
+  SkipWhite;
+  TokAt := P;
+  TokStr := '';
+  if P > E then
+  begin
+    Tok := tkEOF;
+    Result := Tok;
+    Exit;
+  end;
+  c := Ord(S[P]);
+  if c = 47 then
+  begin
+    P := P + 1;
+    TokStr := ParseName;
+    Tok := tkName;
+  end
+  else if c = 40 then
+  begin
+    P := P + 1;
+    TokStr := ParseStringLit;
+    Tok := tkString;
+  end
+  else if c = 60 then
+  begin
+    if (P < E) and (Ord(S[P + 1]) = 60) then
+    begin
+      P := P + 2;
+      Tok := tkDictOpen;
+    end
+    else
+    begin
+      P := P + 1;
+      TokStr := ParseHexStr;
+      Tok := tkString;
+    end;
+  end
+  else if c = 62 then
+  begin
+    if (P < E) and (Ord(S[P + 1]) = 62) then
+    begin
+      P := P + 2;
+      Tok := tkDictClose;
+    end
+    else
+    begin
+      P := P + 1;
+      TokStr := '>';
+      Tok := tkKeyword;
+    end;
+  end
+  else if c = 91 then
+  begin
+    P := P + 1;
+    Tok := tkArrayOpen;
+  end
+  else if c = 93 then
+  begin
+    P := P + 1;
+    Tok := tkArrayClose;
+  end
+  else if (c = 123) or (c = 125) or (c = 41) then
+  begin
+    P := P + 1;
+    TokStr := Chr(c);
+    Tok := tkKeyword;
+  end
+  else
+  begin
+    st := P;
+    while (P <= E) and (CCls[Ord(S[P])] = 0) do
+      P := P + 1;
+    if not ParseNumber(st, P - 1) then
+    begin
+      TokStr := Copy(S, st, P - st);
+      Tok := tkKeyword;
+    end;
+  end;
+  Result := Tok;
+end;
+
+{ one object, from the token Next reads; the keywords of the file's
+  structure (obj, endobj, stream) end the object that was open, and the
+  dictionary or array in front of them is taken as it stands }
+function TPdfLex.ParseObject(Depth: Integer): TPdfObj;
+var
+  o, v: TPdfObj;
+  n, save, num, gen: Integer;
+  key: string;
+  t: Integer;
+begin
+  if Depth > MaxDepth then
+    Fail('objects nest too deep');
+  o := TPdfObj.Create;
+  Result := o;
+  case Tok of
+    tkInt:
+      begin
+        o.Kind := pdfInt;
+        o.IVal := TokInt;
+        o.RVal := TokReal;
+        if Refs and (TokInt >= 0) then
+        begin
+          num := TokInt;
+          save := P;
+          if Next = tkInt then
+          begin
+            if (TokInt >= 0) and (TokInt < 65536) then
+            begin
+              gen := TokInt;
+              if (Next = tkKeyword) and (TokStr = 'R') then
+              begin
+                o.Kind := pdfRef;
+                o.IVal := num;
+                o.Gen := gen;
+                Exit;
+              end;
+            end;
+          end;
+          P := save;
+        end;
+      end;
+    tkReal:
+      begin
+        o.Kind := pdfReal;
+        o.RVal := TokReal;
+      end;
+    tkString:
+      begin
+        o.Kind := pdfString;
+        o.SVal := TokStr;
+      end;
+    tkName:
+      begin
+        o.Kind := pdfName;
+        o.SVal := TokStr;
+      end;
+    tkKeyword:
+      begin
+        if TokStr = 'true' then
+        begin
+          o.Kind := pdfBool;
+          o.IVal := 1;
+        end
+        else if TokStr = 'false' then
+        begin
+          o.Kind := pdfBool;
+          o.IVal := 0;
+        end
+        else if TokStr = 'null' then
+          o.Kind := pdfNull
+        else
+          Fail('unexpected ' + TokStr);
+      end;
+    tkArrayOpen:
+      begin
+        o.Kind := pdfArray;
+        n := 0;
+        SetLength(o.Items, 8);
+        while True do
+        begin
+          t := Next;
+          if t = tkArrayClose then
+            Break;
+          if t = tkEOF then
+            Fail('an array is not closed');
+          if (t = tkKeyword) and ((TokStr = 'endobj') or (TokStr = 'endstream') or (TokStr = 'stream') or (TokStr = 'obj')) then
+          begin
+            P := TokAt;
+            Break;
+          end;
+          if (t = tkDictClose) then
+            Fail('unexpected >> in an array');
+          if n >= MaxElems then
+            Fail('an array is too long');
+          if (t = tkKeyword) and (TokStr <> 'true') and (TokStr <> 'false') and (TokStr <> 'null') then
+            Continue;
+          v := ParseObject(Depth + 1);
+          if n >= Length(o.Items) then
+            SetLength(o.Items, Length(o.Items) * 2);
+          o.Items[n] := v;
+          n := n + 1;
+        end;
+        SetLength(o.Items, n);
+      end;
+    tkDictOpen:
+      begin
+        o.Kind := pdfDict;
+        n := 0;
+        SetLength(o.Keys, 8);
+        SetLength(o.Vals, 8);
+        while True do
+        begin
+          t := Next;
+          if t = tkDictClose then
+            Break;
+          if t = tkEOF then
+            Fail('a dictionary is not closed');
+          if (t = tkKeyword) and ((TokStr = 'endobj') or (TokStr = 'endstream') or (TokStr = 'stream') or (TokStr = 'obj')) then
+          begin
+            P := TokAt;
+            Break;
+          end;
+          if t <> tkName then
+            Fail('a dictionary key is not a name');
+          key := TokStr;
+          t := Next;
+          if t = tkDictClose then
+          begin
+            v := TPdfObj.Create;
+          end
+          else if t = tkEOF then
+            Fail('a dictionary is not closed')
+          else
+            v := ParseObject(Depth + 1);
+          if n >= MaxElems then
+            Fail('a dictionary is too long');
+          if n >= Length(o.Keys) then
+          begin
+            SetLength(o.Keys, Length(o.Keys) * 2);
+            SetLength(o.Vals, Length(o.Vals) * 2);
+          end;
+          o.Keys[n] := key;
+          o.Vals[n] := v;
+          n := n + 1;
+          if t = tkDictClose then
+            Break;
+        end;
+        SetLength(o.Keys, n);
+        SetLength(o.Vals, n);
+      end;
+  else
+    Fail('unexpected token');
+  end;
+end;
+
+const
+  { the most objects a file may have, and how long a chain of
+    cross-reference sections may be }
+  MaxObjects = 4000000;
+  MaxXrefChain = 4096;
+  DefaultMaxStream = 134217728;
+  MaxStmBytes = 536870912;
+
+procedure TPdfDoc.Warn(const Msg: string);
+begin
+  if Length(FWarn) < 1000 then
+  begin
+    SetLength(FWarn, Length(FWarn) + 1);
+    FWarn[Length(FWarn) - 1] := Msg;
+  end;
+end;
+
+procedure TPdfDoc.Fail(At: Integer; const Why: string);
+begin
+  raise EPdfError.CreateAt(At, Why);
+end;
+
+procedure TPdfDoc.AddWarning(const Msg: string);
+begin
+  Warn(Msg);
+end;
+
+function TPdfDoc.WarningCount: Integer;
+begin
+  Result := Length(FWarn);
+end;
+
+function TPdfDoc.WarningAt(I: Integer): string;
+begin
+  Result := FWarn[I];
+end;
+
+procedure TPdfDoc.GrowXref(N: Integer);
+var
+  old, i: Integer;
+begin
+  { room for the objects 0 to N - 1 }
+  if N > MaxObjects then
+    Fail(-1, 'the file has too many objects');
+  old := Length(FXKind);
+  if N <= old then
+    Exit;
+  if N < old * 2 then
+    N := old * 2;
+  if N > MaxObjects then
+    N := MaxObjects;
+  SetLength(FXKind, N);
+  SetLength(FXA, N);
+  SetLength(FXB, N);
+  SetLength(FCache, N);
+  SetLength(FState, N);
+  SetLength(FStmIdx, N);
+  for i := old to N - 1 do
+  begin
+    FXKind[i] := -1;
+    FStmIdx[i] := -1;
+  end;
+  FSize := N;
+end;
+
+{ the first word to say what an object is wins: the sections are read
+  from the newest }
+procedure TPdfDoc.SetEntry(Num, Kind, A, B: Integer);
+begin
+  if (Num < 0) or (Num >= MaxObjects) then
+    Exit;
+  if Num >= Length(FXKind) then
+    GrowXref(Num + 1);
+  if FXKind[Num] = -1 then
+  begin
+    FXKind[Num] := Kind;
+    FXA[Num] := A;
+    FXB[Num] := B;
+  end;
+end;
+
+function TPdfDoc.FindStartXref: Integer;
+var
+  lo, i, n: Integer;
+  lx: TPdfLex;
+begin
+  Result := -1;
+  n := Length(FData);
+  lo := n - 8192;
+  if lo < 1 then
+    lo := 1;
+  i := n - 8;
+  while i >= lo do
+  begin
+    if (FData[i] = 's') and (Copy(FData, i, 9) = 'startxref') then
+    begin
+      lx := TPdfLex.Create(FData, i + 9, n);
+      if lx.Next = tkInt then
+        Result := lx.TokInt;
+      Exit;
+    end;
+    i := i - 1;
+  end;
+end;
+
+{ the object that starts at Off: its number and generation, then the
+  object, then, if it is a stream, where its data is }
+function ParseIndirectRaw(const Data: string; Off: Integer; var Num, Gen: Integer; var Lex: TPdfLex): TPdfObj;
+begin
+  Result := nil;
+  if (Off < 0) or (Off >= Length(Data)) then
+    Exit;
+  Lex := TPdfLex.Create(Data, Off + 1, Length(Data));
+  if Lex.Next <> tkInt then
+    Exit;
+  Num := Lex.TokInt;
+  if Lex.Next <> tkInt then
+    Exit;
+  Gen := Lex.TokInt;
+  if (Lex.Next <> tkKeyword) or (Lex.TokStr <> 'obj') then
+    Exit;
+  if Lex.Next = tkEOF then
+    Exit;
+  Result := Lex.ParseObject(0);
+end;
+
+function TPdfDoc.LoadAt(Num, Off: Integer): TPdfObj;
+var
+  n, g, p, q, len: Integer;
+  lx: TPdfLex;
+  o, lo: TPdfObj;
+  ok: Boolean;
+begin
+  Result := nil;
+  o := ParseIndirectRaw(FData, Off, n, g, lx);
+  if (o = nil) or (n <> Num) then
+    Exit;
+  if (o.Kind = pdfDict) then
+  begin
+    { a stream? }
+    p := lx.P;
+    if (lx.Next = tkKeyword) and (lx.TokStr = 'stream') then
+    begin
+      p := lx.P;
+      if (p <= Length(FData)) and (Ord(FData[p]) = 13) then
+      begin
+        p := p + 1;
+        if (p <= Length(FData)) and (Ord(FData[p]) = 10) then
+          p := p + 1;
+      end
+      else if (p <= Length(FData)) and (Ord(FData[p]) = 10) then
+        p := p + 1;
+      o.Kind := pdfStream;
+      o.StmPos := p - 1;
+      len := -1;
+      lo := o.Get('Length');
+      if lo <> nil then
+      begin
+        if lo.Kind = pdfInt then
+          len := lo.IVal
+        else if (lo.Kind = pdfRef) and (FSize > 0) and (lo.IVal <> Num) then
+        begin
+          lo := GetObject(lo.IVal);
+          if (lo <> nil) and (lo.Kind = pdfInt) then
+            len := lo.IVal;
+        end;
+      end;
+      ok := False;
+      if (len >= 0) and (p - 1 + len <= Length(FData)) then
+      begin
+        q := p + len;
+        while (q <= Length(FData)) and IsWhite(Ord(FData[q])) do
+          q := q + 1;
+        if Copy(FData, q, 9) = 'endstream' then
+          ok := True;
+      end;
+      if not ok then
+      begin
+        { the length is wrong or missing: the data goes to endstream, less
+          the line break in front of it }
+        q := Pos('endstream', FData, p);
+        if q = 0 then
+        begin
+          q := Pos('endobj', FData, p);
+          if q = 0 then
+            q := Length(FData) + 1;
+        end;
+        len := q - p;
+        if (len > 0) and (Ord(FData[p + len - 1]) = 10) then
+          len := len - 1;
+        if (len > 0) and (Ord(FData[p + len - 1]) = 13) then
+          len := len - 1;
+        Warn('object ' + IntToStr(Num) + ': the stream length is wrong');
+      end;
+      o.StmLen := len;
+    end;
+  end;
+  o.Gen := g;
+  Result := o;
+end;
+
+{ the entries of a cross-reference table section at Pos, and its
+  trailer }
+function TPdfDoc.ReadXrefTable(At: Integer; var Trailer: TPdfObj): Boolean;
+var
+  lx: TPdfLex;
+  first, cnt, i, off, gen, t: Integer;
+  kw: string;
+  tr, xs: TPdfObj;
+begin
+  Result := False;
+  lx := TPdfLex.Create(FData, At + 1, Length(FData));
+  if (lx.Next <> tkKeyword) or (lx.TokStr <> 'xref') then
+    Exit;
+  while True do
+  begin
+    t := lx.Next;
+    if t = tkKeyword then
+    begin
+      if lx.TokStr = 'trailer' then
+        Break;
+      Exit;
+    end;
+    if t <> tkInt then
+      Exit;
+    first := lx.TokInt;
+    if lx.Next <> tkInt then
+      Exit;
+    cnt := lx.TokInt;
+    if (cnt < 0) or (cnt > MaxObjects) or (first < 0) or (first + cnt > MaxObjects) then
+      Exit;
+    for i := 0 to cnt - 1 do
+    begin
+      if lx.Next <> tkInt then
+        Exit;
+      off := lx.TokInt;
+      if lx.Next <> tkInt then
+        Exit;
+      gen := lx.TokInt;
+      if lx.Next <> tkKeyword then
+        Exit;
+      kw := lx.TokStr;
+      { a section that starts at 1 with the free head entry is one that
+        starts at 0 }
+      if (i = 0) and (first = 1) and (kw = 'f') and (gen = 65535) then
+        first := 0;
+      if kw = 'n' then
+        SetEntry(first + i, 1, off, gen)
+      else if kw = 'f' then
+        SetEntry(first + i, 0, off, gen)
+      else
+        Exit;
+    end;
+  end;
+  if lx.Next = tkEOF then
+    Exit;
+  tr := lx.ParseObject(0);
+  if tr.Kind <> pdfDict then
+    Exit;
+  Trailer := tr;
+  { a hybrid file: the objects of the stream come after this section's
+    own and before the previous section's }
+  xs := tr.Get('XRefStm');
+  if (xs <> nil) and (xs.Kind = pdfInt) then
+  begin
+    try
+      ReadXrefStream(xs.IVal, xs);
+    except
+      on E: EPdfError do
+        Warn('the XRefStm of a hybrid file could not be read: ' + E.Message);
+    end;
+  end;
+  Result := True;
+end;
+
+function TPdfDoc.ReadXrefStream(At: Integer; var Trailer: TPdfObj): Boolean;
+var
+  num, gen, i, j, k, w0, w1, w2, wsum, nsub, cnt, first, size, base, x, f1, f2, f3, p: Integer;
+  lx: TPdfLex;
+  o, wa, ia, sz: TPdfObj;
+  data: string;
+begin
+  Result := False;
+  { the stream object, read without the table: its length is direct }
+  o := ParseIndirectRaw(FData, At, num, gen, lx);
+  if (o = nil) or (o.Kind <> pdfDict) then
+    Exit;
+  if (lx.Next <> tkKeyword) or (lx.TokStr <> 'stream') then
+    Exit;
+  p := lx.P;
+  if (p <= Length(FData)) and (Ord(FData[p]) = 13) then
+  begin
+    p := p + 1;
+    if (p <= Length(FData)) and (Ord(FData[p]) = 10) then
+      p := p + 1;
+  end
+  else if (p <= Length(FData)) and (Ord(FData[p]) = 10) then
+    p := p + 1;
+  o.Kind := pdfStream;
+  o.StmPos := p - 1;
+  x := -1;
+  sz := o.Get('Length');
+  if (sz <> nil) and (sz.Kind = pdfInt) then
+    x := sz.IVal;
+  if (x < 0) or (p - 1 + x > Length(FData)) then
+  begin
+    i := Pos('endstream', FData, p);
+    if i = 0 then
+      Exit;
+    x := i - p;
+  end;
+  o.StmLen := x;
+  if not o.IsName('XRef') and not ((o.Get('Type') <> nil) and o.Get('Type').IsName('XRef')) then
+    Exit;
+  data := StreamData(o);
+  wa := o.Get('W');
+  if (wa = nil) or (wa.Kind <> pdfArray) or (Length(wa.Items) < 3) then
+    Exit;
+  w0 := wa.Items[0].IVal;
+  w1 := wa.Items[1].IVal;
+  w2 := wa.Items[2].IVal;
+  if (w0 < 0) or (w1 < 0) or (w2 < 0) or (w0 > 8) or (w1 > 8) or (w2 > 8) then
+    Exit;
+  wsum := w0 + w1 + w2;
+  if wsum = 0 then
+    Exit;
+  sz := o.Get('Size');
+  if (sz = nil) or (sz.Kind <> pdfInt) then
+    Exit;
+  size := sz.IVal;
+  if (size < 0) or (size > MaxObjects) then
+    Exit;
+  ia := o.Get('Index');
+  k := 0;
+  if (ia <> nil) and (ia.Kind = pdfArray) and (Length(ia.Items) >= 2) then
+    nsub := Length(ia.Items) div 2
+  else
+    nsub := 1;
+  base := 1;
+  for j := 0 to nsub - 1 do
+  begin
+    if (ia <> nil) and (ia.Kind = pdfArray) and (Length(ia.Items) >= 2) then
+    begin
+      first := ia.Items[j * 2].IVal;
+      cnt := ia.Items[j * 2 + 1].IVal;
+    end
+    else
+    begin
+      first := 0;
+      cnt := size;
+    end;
+    if (first < 0) or (cnt < 0) or (first + cnt > MaxObjects) then
+      Exit;
+    for i := 0 to cnt - 1 do
+    begin
+      if base + wsum - 1 > Length(data) then
+        Break;
+      f1 := 1;
+      if w0 > 0 then
+      begin
+        f1 := 0;
+        for k := 0 to w0 - 1 do
+          f1 := (f1 shl 8) or Ord(data[base + k]);
+      end;
+      f2 := 0;
+      for k := 0 to w1 - 1 do
+        f2 := (f2 shl 8) or Ord(data[base + w0 + k]);
+      f3 := 0;
+      for k := 0 to w2 - 1 do
+        f3 := (f3 shl 8) or Ord(data[base + w0 + w1 + k]);
+      base := base + wsum;
+      if f1 = 1 then
+        SetEntry(first + i, 1, f2, f3)
+      else if f1 = 2 then
+        SetEntry(first + i, 2, f2, f3)
+      else if f1 = 0 then
+        SetEntry(first + i, 0, f2, f3);
+    end;
+  end;
+  Trailer := o;
+  Result := True;
+end;
+
+function TPdfDoc.ReadXrefAt(At: Integer; var Trailer: TPdfObj): Boolean;
+var
+  q: Integer;
+begin
+  { skip white space before the keyword or the object number }
+  q := At;
+  while (q < Length(FData)) and IsWhite(Ord(FData[q + 1])) do
+    q := q + 1;
+  if (q + 4 <= Length(FData)) and (Copy(FData, q + 1, 4) = 'xref') then
+    Result := ReadXrefTable(q, Trailer)
+  else
+    Result := ReadXrefStream(q, Trailer);
+end;
+
+procedure TPdfDoc.LoadXref;
+var
+  xp, n, i: Integer;
+  tr, first, pv: TPdfObj;
+  seen: array of Integer;
+  ok: Boolean;
+begin
+  xp := FindStartXref;
+  if xp < 0 then
+  begin
+    Warn('no startxref: the file''s table is rebuilt');
+    Rebuild;
+    Exit;
+  end;
+  first := nil;
+  n := 0;
+  ok := True;
+  try
+    while xp >= 0 do
+    begin
+      for i := 0 to n - 1 do
+        if seen[i] = xp then
+          Fail(xp, 'the cross-reference sections form a loop');
+      if n >= MaxXrefChain then
+        Fail(xp, 'too many cross-reference sections');
+      SetLength(seen, n + 1);
+      seen[n] := xp;
+      n := n + 1;
+      tr := nil;
+      if not ReadXrefAt(xp, tr) then
+        Fail(xp, 'no cross-reference section where startxref says');
+      if first = nil then
+        first := tr;
+      pv := tr.Get('Prev');
+      if (pv <> nil) and (pv.Kind = pdfInt) then
+        xp := pv.IVal
+      else if (pv <> nil) and (pv.Kind = pdfReal) then
+        xp := SafeTrunc(pv.RVal)
+      else
+        xp := -1;
+    end;
+  except
+    on E: EPdfError do
+      ok := False;
+  end;
+  if ok then
+  begin
+    FTrailer := first;
+    if (FTrailer.Get('Root') = nil) or (FTrailer.Get('Root').Kind <> pdfRef) then
+      ok := False;
+  end;
+  if not ok then
+  begin
+    Warn('the file''s table is damaged: it is rebuilt');
+    Rebuild;
+  end;
+end;
+
+procedure TPdfDoc.Rebuild;
+var
+  n, i, j, k, numStart, genStart, num, gen, stmOff, rootNum, c, e: Integer;
+  lx: TPdfLex;
+  o, tr, nt, tp: TPdfObj;
+  stmNums: array of Integer;
+  nstm: Integer;
+  found: Boolean;
+  data: string;
+begin
+  FRebuilt := True;
+  SetLength(FXKind, 0);
+  SetLength(FXA, 0);
+  SetLength(FXB, 0);
+  SetLength(FCache, 0);
+  SetLength(FState, 0);
+  SetLength(FStmIdx, 0);
+  SetLength(FStms, 0);
+  FSize := 0;
+  FTrailer := nil;
+  n := Length(FData);
+  nstm := 0;
+  rootNum := -1;
+  i := Pos('obj', FData, 1);
+  while i > 0 do
+  begin
+    { "N G obj" before it }
+    j := i - 1;
+    found := False;
+    if (j >= 1) and IsWhite(Ord(FData[j])) and ((i + 3 > n) or not IsRegular(Ord(FData[i + 3])) or (Ord(FData[i + 3]) = 60)) then
+    begin
+      while (j >= 1) and IsWhite(Ord(FData[j])) do
+        j := j - 1;
+      e := j;
+      while (j >= 1) and (Ord(FData[j]) >= 48) and (Ord(FData[j]) <= 57) do
+        j := j - 1;
+      if (j < e) and (e - j <= 5) then
+      begin
+        genStart := j + 1;
+        gen := 0;
+        for k := genStart to e do
+          gen := gen * 10 + (Ord(FData[k]) - 48);
+        c := j;
+        if (c >= 1) and IsWhite(Ord(FData[c])) then
+        begin
+          while (c >= 1) and IsWhite(Ord(FData[c])) do
+            c := c - 1;
+          e := c;
+          while (c >= 1) and (Ord(FData[c]) >= 48) and (Ord(FData[c]) <= 57) do
+            c := c - 1;
+          if (c < e) and (e - c <= 10) and ((c < 1) or not IsRegular(Ord(FData[c])) or (Ord(FData[c]) = 62)) then
+          begin
+            numStart := c + 1;
+            num := 0;
+            for k := numStart to e do
+              num := num * 10 + (Ord(FData[k]) - 48);
+            if num < MaxObjects then
+            begin
+              if num >= Length(FXKind) then
+                GrowXref(num + 1);
+              FXKind[num] := 1;
+              FXA[num] := numStart - 1;
+              FXB[num] := gen;
+              found := True;
+              { is it a catalog, an object stream or a cross-reference
+                stream? look at the start of the object }
+              data := Copy(FData, i + 3, 400);
+              k := Pos('endobj', data);
+              if k > 0 then
+                data := Copy(data, 1, k - 1);
+              if (Pos('/ObjStm', data) > 0) and (Pos('/Type', data) > 0) then
+              begin
+                SetLength(stmNums, nstm + 1);
+                stmNums[nstm] := num;
+                nstm := nstm + 1;
+              end;
+              if (Pos('/Catalog', data) > 0) and (Pos('/Type', data) > 0) then
+                rootNum := num;
+              if (Pos('/XRef', data) > 0) and (Pos('/Type', data) > 0) then
+              begin
+                try
+                  o := LoadAt(num, numStart - 1);
+                except
+                  on E: EPdfError do
+                    o := nil;
+                end;
+                if (o <> nil) and (o.Get('Root') <> nil) then
+                  FTrailer := o;
+              end;
+            end;
+          end;
+        end;
+      end;
+    end;
+    i := Pos('obj', FData, i + 3);
+  end;
+  { the trailers written as such }
+  i := Pos('trailer', FData, 1);
+  while i > 0 do
+  begin
+    lx := TPdfLex.Create(FData, i + 7, n);
+    try
+      if lx.Next <> tkEOF then
+      begin
+        tr := lx.ParseObject(0);
+        if (tr.Kind = pdfDict) and (tr.Get('Root') <> nil) then
+          FTrailer := tr;
+      end;
+    except
+      on E: EPdfError do
+        tr := nil;
+    end;
+    i := Pos('trailer', FData, i + 7);
+  end;
+  { the objects inside object streams }
+  for i := 0 to nstm - 1 do
+  begin
+    stmOff := FXA[stmNums[i]];
+    j := StmCacheFor(stmNums[i]);
+    if j >= 0 then
+      for k := 0 to Length(FStms[j].Nums) - 1 do
+      begin
+        num := FStms[j].Nums[k];
+        if (num >= 0) and (num < MaxObjects) then
+        begin
+          if num >= Length(FXKind) then
+            GrowXref(num + 1);
+          if (FXKind[num] <> 1) or (FXA[num] < stmOff) then
+          begin
+            FXKind[num] := 2;
+            FXA[num] := stmNums[i];
+            FXB[num] := k;
+          end;
+        end;
+      end;
+  end;
+  if (FTrailer = nil) or (FTrailer.Get('Root') = nil) then
+  begin
+    if rootNum < 0 then
+      Fail(-1, 'no document catalog found in the file');
+    tp := TPdfObj.Create;
+    tp.Kind := pdfDict;
+    SetLength(tp.Keys, 1);
+    SetLength(tp.Vals, 1);
+    tp.Keys[0] := 'Root';
+    nt := TPdfObj.Create;
+    nt.Kind := pdfRef;
+    nt.IVal := rootNum;
+    tp.Vals[0] := nt;
+    FTrailer := tp;
+  end;
+  if FSize = 0 then
+    GrowXref(1);
+end;
+
+{ ---- objects by number ---- }
+
+function TPdfDoc.StmCacheFor(StmNum: Integer): Integer;
+var
+  o, nObj, fObj: TPdfObj;
+  data: string;
+  n, first, i: Integer;
+  lx: TPdfLex;
+  c: TPdfStmCache;
+begin
+  Result := -1;
+  if (StmNum < 0) or (StmNum >= Length(FXKind)) then
+    Exit;
+  if FStmIdx[StmNum] >= 0 then
+  begin
+    Result := FStmIdx[StmNum];
+    Exit;
+  end;
+  if FXKind[StmNum] <> 1 then
+    Exit;
+  try
+    o := LoadAt(StmNum, FXA[StmNum]);
+    if (o = nil) or (o.Kind <> pdfStream) then
+      Exit;
+    nObj := Resolve(o.Get('N'));
+    fObj := Resolve(o.Get('First'));
+    if (nObj = nil) or (fObj = nil) or (nObj.Kind <> pdfInt) or (fObj.Kind <> pdfInt) then
+      Exit;
+    n := nObj.IVal;
+    first := fObj.IVal;
+    data := StreamData(o);
+    if (n < 0) or (first < 0) or (first > Length(data)) or (n > Length(data) div 2) then
+      Exit;
+    if FStmBytes + Length(data) > MaxStmBytes then
+    begin
+      Warn('the object streams hold more than ' + IntToStr(MaxStmBytes) + ' bytes: object stream ' + IntToStr(StmNum) + ' is left out');
+      Exit;
+    end;
+    FStmBytes := FStmBytes + Length(data);
+    c.Num := StmNum;
+    c.Data := data;
+    c.First := first;
+    SetLength(c.Nums, n);
+    SetLength(c.Offs, n);
+    lx := TPdfLex.Create(data, 1, first);
+    lx.Refs := False;
+    for i := 0 to n - 1 do
+    begin
+      if lx.Next <> tkInt then
+      begin
+        SetLength(c.Nums, i);
+        SetLength(c.Offs, i);
+        Break;
+      end;
+      c.Nums[i] := lx.TokInt;
+      if lx.Next <> tkInt then
+      begin
+        SetLength(c.Nums, i);
+        SetLength(c.Offs, i);
+        Break;
+      end;
+      c.Offs[i] := lx.TokInt;
+    end;
+  except
+    on E: EPdfError do
+    begin
+      Warn('object stream ' + IntToStr(StmNum) + ' could not be read: ' + E.Message);
+      Exit;
+    end;
+  end;
+  SetLength(FStms, Length(FStms) + 1);
+  FStms[Length(FStms) - 1] := c;
+  FStmIdx[StmNum] := Length(FStms) - 1;
+  Result := Length(FStms) - 1;
+end;
+
+function TPdfDoc.LoadFromStm(Num, StmNum, Idx: Integer): TPdfObj;
+var
+  ci, i, at: Integer;
+  lx: TPdfLex;
+begin
+  Result := nil;
+  ci := StmCacheFor(StmNum);
+  if ci < 0 then
+    Exit;
+  if (Idx < 0) or (Idx >= Length(FStms[ci].Nums)) or (FStms[ci].Nums[Idx] <> Num) then
+  begin
+    Idx := -1;
+    for i := 0 to Length(FStms[ci].Nums) - 1 do
+      if FStms[ci].Nums[i] = Num then
+      begin
+        Idx := i;
+        Break;
+      end;
+    if Idx < 0 then
+      Exit;
+  end;
+  at := FStms[ci].First + FStms[ci].Offs[Idx];
+  if (at < 0) or (at >= Length(FStms[ci].Data)) then
+    Exit;
+  lx := TPdfLex.Create(FStms[ci].Data, at + 1, Length(FStms[ci].Data));
+  if lx.Next = tkEOF then
+    Exit;
+  Result := lx.ParseObject(0);
+end;
+
+function TPdfDoc.GetObject(Num: Integer): TPdfObj;
+var
+  o: TPdfObj;
+  k, a, b: Integer;
+begin
+  Result := nil;
+  if (Num < 0) or (Num >= Length(FXKind)) then
+    Exit;
+  if FCache[Num] <> nil then
+  begin
+    Result := FCache[Num];
+    Exit;
+  end;
+  if FState[Num] = 1 then
+    Exit;
+  FState[Num] := 1;
+  o := nil;
+  try
+    k := FXKind[Num];
+    a := FXA[Num];
+    b := FXB[Num];
+    if k = 1 then
+    begin
+      o := LoadAt(Num, a);
+      if (o = nil) and not FRebuilt then
+      begin
+        Warn('object ' + IntToStr(Num) + ' is not where the table says: the file''s table is rebuilt');
+        Rebuild;
+        if Num < Length(FState) then
+          FState[Num] := 1;
+        if (Num < Length(FXKind)) and (FXKind[Num] = 1) then
+          o := LoadAt(Num, FXA[Num])
+        else if (Num < Length(FXKind)) and (FXKind[Num] = 2) then
+          o := LoadFromStm(Num, FXA[Num], FXB[Num]);
+      end;
+    end
+    else if k = 2 then
+      o := LoadFromStm(Num, a, b);
+  except
+    on E: EPdfError do
+    begin
+      Warn('object ' + IntToStr(Num) + ' could not be read: ' + E.Message);
+      o := nil;
+    end;
+  end;
+  if Num < Length(FState) then
+    FState[Num] := 0;
+  if (o <> nil) and (Num < Length(FCache)) then
+  begin
+    FCache[Num] := o;
+    FState[Num] := 2;
+  end;
+  Result := o;
+end;
+
+function TPdfDoc.Resolve(O: TPdfObj): TPdfObj;
+var
+  hops: Integer;
+begin
+  hops := 0;
+  while (O <> nil) and (O.Kind = pdfRef) do
+  begin
+    hops := hops + 1;
+    if hops > 32 then
+    begin
+      Result := nil;
+      Exit;
+    end;
+    O := GetObject(O.IVal);
+  end;
+  Result := O;
+end;
+
+function TPdfDoc.Dict(O: TPdfObj; const Key: string): TPdfObj;
+begin
+  O := Resolve(O);
+  if O = nil then
+    Result := nil
+  else
+    Result := Resolve(O.Get(Key));
+end;
+
+function TPdfDoc.IntOf(O: TPdfObj; Dflt: Integer): Integer;
+begin
+  O := Resolve(O);
+  if O = nil then
+    Result := Dflt
+  else if O.Kind = pdfInt then
+    Result := O.IVal
+  else if O.Kind = pdfReal then
+    Result := SafeTrunc(O.RVal)
+  else
+    Result := Dflt;
+end;
+
+function TPdfDoc.NameOf(O: TPdfObj): string;
+begin
+  O := Resolve(O);
+  if (O <> nil) and (O.Kind = pdfName) then
+    Result := O.SVal
+  else
+    Result := '';
+end;
+
+function TPdfDoc.TrailerEntry(const Key: string): TPdfObj;
+begin
+  if FTrailer = nil then
+    Result := nil
+  else
+    Result := Resolve(FTrailer.Get(Key));
+end;
+
+constructor TPdfDoc.Create(const AData: string);
+var
+  head: string;
+begin
+  inherited Create;
+  FData := AData;
+  FMaxStream := DefaultMaxStream;
+  head := Copy(FData, 1, 1024);
+  if Pos('%PDF-', head) = 0 then
+    Fail(-1, 'not a PDF file (no %PDF- header)');
+  LoadXref;
+  { a file whose objects are encrypted cannot show its catalog: the
+    reason is the first thing to say }
+  if (FTrailer <> nil) and (FTrailer.Get('Encrypt') <> nil) then
+    Fail(-1, 'encrypted documents are not supported');
+  if TrailerEntry('Root') = nil then
+  begin
+    if not FRebuilt then
+    begin
+      Warn('the document catalog is missing: the file''s table is rebuilt');
+      Rebuild;
+    end;
+    if (FTrailer <> nil) and (FTrailer.Get('Encrypt') <> nil) then
+      Fail(-1, 'encrypted documents are not supported');
+    if TrailerEntry('Root') = nil then
+      Fail(-1, 'the document has no catalog');
+  end;
+end;
+
+{ ---- the filters (ISO 32000-1 7.4) ---- }
+
+type
+  TPdfBuf = record
+    S: string;
+    N: Integer;
+  end;
+
+procedure BufPut(var B: TPdfBuf; C: Integer);
+begin
+  if B.N >= Length(B.S) then
+  begin
+    if Length(B.S) = 0 then
+      SetLength(B.S, 256)
+    else
+      SetLength(B.S, Length(B.S) * 2);
+  end;
+  B.N := B.N + 1;
+  B.S[B.N] := Chr(C and 255);
+end;
+
+function BufText(var B: TPdfBuf): string;
+begin
+  SetLength(B.S, B.N);
+  Result := B.S;
+end;
+
+function AsciiHexDecode(const S: string): string;
+var
+  b: TPdfBuf;
+  i, c, hi: Integer;
+  have: Boolean;
+begin
+  b.N := 0;
+  hi := 0;
+  have := False;
+  for i := 1 to Length(S) do
+  begin
+    c := Ord(S[i]);
+    if c = 62 then
+      Break;
+    c := HexVal(c);
+    if c < 0 then
+      Continue;
+    if have then
+    begin
+      BufPut(b, hi * 16 + c);
+      have := False;
+    end
+    else
+    begin
+      hi := c;
+      have := True;
+    end;
+  end;
+  if have then
+    BufPut(b, hi * 16);
+  Result := BufText(b);
+end;
+
+function Ascii85Decode(const S: string): string;
+var
+  b: TPdfBuf;
+  i, c, n, k: Integer;
+  v: Integer;
+  grp: array[0..4] of Integer;
+begin
+  b.N := 0;
+  i := 1;
+  { an optional <~ in front }
+  while (i <= Length(S)) and IsWhite(Ord(S[i])) do
+    i := i + 1;
+  if (i + 1 <= Length(S)) and (S[i] = '<') and (S[i + 1] = '~') then
+    i := i + 2;
+  n := 0;
+  while i <= Length(S) do
+  begin
+    c := Ord(S[i]);
+    i := i + 1;
+    if IsWhite(c) then
+      Continue;
+    if c = 126 then
+      Break;
+    if c = 122 then
+    begin
+      if n = 0 then
+      begin
+        BufPut(b, 0);
+        BufPut(b, 0);
+        BufPut(b, 0);
+        BufPut(b, 0);
+      end;
+      Continue;
+    end;
+    if (c < 33) or (c > 117) then
+      Continue;
+    grp[n] := c - 33;
+    n := n + 1;
+    if n = 5 then
+    begin
+      v := 0;
+      for k := 0 to 4 do
+        v := v * 85 + grp[k];
+      v := v and $FFFFFFFF;
+      BufPut(b, v shr 24);
+      BufPut(b, v shr 16);
+      BufPut(b, v shr 8);
+      BufPut(b, v);
+      n := 0;
+    end;
+  end;
+  if n > 1 then
+  begin
+    for k := n to 4 do
+      grp[k] := 84;
+    v := 0;
+    for k := 0 to 4 do
+      v := v * 85 + grp[k];
+    v := v and $FFFFFFFF;
+    BufPut(b, v shr 24);
+    if n > 2 then
+      BufPut(b, v shr 16);
+    if n > 3 then
+      BufPut(b, v shr 8);
+  end;
+  Result := BufText(b);
+end;
+
+function RunLengthDecode(const S: string; Limit: Integer): string;
+var
+  b: TPdfBuf;
+  i, n, k, c: Integer;
+begin
+  b.N := 0;
+  i := 1;
+  while i <= Length(S) do
+  begin
+    n := Ord(S[i]);
+    i := i + 1;
+    if n = 128 then
+      Break;
+    if n < 128 then
+    begin
+      for k := 0 to n do
+      begin
+        if i > Length(S) then
+          Break;
+        BufPut(b, Ord(S[i]));
+        i := i + 1;
+      end;
+    end
+    else
+    begin
+      if i > Length(S) then
+        Break;
+      c := Ord(S[i]);
+      i := i + 1;
+      for k := 1 to 257 - n do
+        BufPut(b, c);
+    end;
+    if (Limit > 0) and (b.N > Limit) then
+      raise EPdfError.CreateAt(-1, 'a stream is larger than the limit');
+  end;
+  Result := BufText(b);
+end;
+
+function LzwDecode(const S: string; Early: Integer; Limit: Integer): string;
+var
+  b: TPdfBuf;
+  prefix: array[0..4095] of Integer;
+  suffix: array[0..4095] of Integer;
+  tmp: array[0..4095] of Integer;
+  nextCode, width, code, prev, i, bits, nbits, entry, n, c, first: Integer;
+  xp: Integer;
+begin
+  b.N := 0;
+  nextCode := 258;
+  width := 9;
+  prev := -1;
+  bits := 0;
+  nbits := 0;
+  xp := 1;
+  while True do
+  begin
+    while (nbits < width) and (xp <= Length(S)) do
+    begin
+      bits := (bits shl 8) or Ord(S[xp]);
+      xp := xp + 1;
+      nbits := nbits + 8;
+    end;
+    if nbits < width then
+      Break;
+    code := (bits shr (nbits - width)) and ((1 shl width) - 1);
+    nbits := nbits - width;
+    bits := bits and ((1 shl nbits) - 1);
+    if code = 257 then
+      Break;
+    if code = 256 then
+    begin
+      nextCode := 258;
+      width := 9;
+      prev := -1;
+      Continue;
+    end;
+    if prev < 0 then
+    begin
+      if code > 255 then
+        raise EPdfError.CreateAt(-1, 'LZW data is damaged');
+      BufPut(b, code);
+      prev := code;
+      Continue;
+    end;
+    { the string of code, or of prev plus its own first byte }
+    if code < nextCode then
+      entry := code
+    else if code = nextCode then
+      entry := prev
+    else
+      raise EPdfError.CreateAt(-1, 'LZW data is damaged');
+    n := 0;
+    c := entry;
+    while c >= 256 do
+    begin
+      tmp[n] := suffix[c];
+      n := n + 1;
+      c := prefix[c];
+      if n > 4090 then
+        raise EPdfError.CreateAt(-1, 'LZW data is damaged');
+    end;
+    tmp[n] := c;
+    n := n + 1;
+    first := c;
+    for i := n - 1 downto 0 do
+      BufPut(b, tmp[i]);
+    if code = nextCode then
+      BufPut(b, first);
+    if nextCode < 4096 then
+    begin
+      prefix[nextCode] := prev;
+      suffix[nextCode] := first;
+      nextCode := nextCode + 1;
+    end;
+    if nextCode + Early >= 4096 then
+      width := 12
+    else if nextCode + Early >= 2048 then
+      width := 12
+    else if nextCode + Early >= 1024 then
+      width := 11
+    else if nextCode + Early >= 512 then
+      width := 10
+    else
+      width := 9;
+    prev := code;
+    if (Limit > 0) and (b.N > Limit) then
+      raise EPdfError.CreateAt(-1, 'a stream is larger than the limit');
+  end;
+  Result := BufText(b);
+end;
+
+{ the predictors of Flate and LZW data (7.4.4.4) }
+function Unpredict(const D: string; Pdr, Colors, Bpc, Columns: Integer): string;
+var
+  b: TPdfBuf;
+  rowBytes, bpp, rows, r, i, tag, a, bb, c, p, pa, pb, pc, x, rowStart, n, k, mask, sample, shiftv, per: Integer;
+  nrows, src, base, produced: Integer;
+  res: string;
+begin
+  Result := D;
+  if (Pdr < 2) or (Colors < 1) or (Bpc < 1) or (Columns < 1) then
+    Exit;
+  if (Colors > 32) or (Bpc > 16) or (Columns > 100000000) then
+    raise EPdfError.CreateAt(-1, 'the predictor parameters are out of range');
+  rowBytes := (Colors * Bpc * Columns + 7) div 8;
+  if Pdr = 2 then
+  begin
+    b.S := D;
+    b.N := Length(D);
+    rows := (Length(D) + rowBytes - 1) div rowBytes;
+    for r := 0 to rows - 1 do
+    begin
+      rowStart := r * rowBytes;
+      n := Length(D) - rowStart;
+      if n > rowBytes then
+        n := rowBytes;
+      if Bpc = 8 then
+      begin
+        for i := Colors to n - 1 do
+          b.S[rowStart + i + 1] := Chr((Ord(b.S[rowStart + i + 1]) + Ord(b.S[rowStart + i - Colors + 1])) and 255);
+      end
+      else if Bpc = 16 then
+      begin
+        i := Colors * 2;
+        while i + 1 < n do
+        begin
+          x := (Ord(b.S[rowStart + i + 1]) shl 8) or Ord(b.S[rowStart + i + 2]);
+          x := x + ((Ord(b.S[rowStart + i - Colors * 2 + 1]) shl 8) or Ord(b.S[rowStart + i - Colors * 2 + 2]));
+          b.S[rowStart + i + 1] := Chr((x shr 8) and 255);
+          b.S[rowStart + i + 2] := Chr(x and 255);
+          i := i + 2;
+        end;
+      end
+      else
+      begin
+        { 1, 2 and 4 bits: sample by sample }
+        mask := (1 shl Bpc) - 1;
+        per := 8 div Bpc;
+        for i := Colors to Colors * Columns - 1 do
+        begin
+          if (i div per) >= n then
+            Break;
+          k := rowStart + (i div per) + 1;
+          shiftv := 8 - Bpc - (i mod per) * Bpc;
+          sample := (Ord(b.S[k]) shr shiftv) and mask;
+          x := (i - Colors);
+          a := (Ord(b.S[rowStart + (x div per) + 1]) shr (8 - Bpc - (x mod per) * Bpc)) and mask;
+          sample := (sample + a) and mask;
+          b.S[k] := Chr((Ord(b.S[k]) and (255 - (mask shl shiftv))) or (sample shl shiftv));
+        end;
+      end;
+    end;
+    Result := b.S;
+    Exit;
+  end;
+  { PNG: a tag byte in front of each row. The rows are written one after
+    the other into the result, and a row reads the one before it there. }
+  bpp := (Colors * Bpc + 7) div 8;
+  if bpp < 1 then
+    bpp := 1;
+  nrows := (Length(D) + rowBytes) div (rowBytes + 1);
+  SetLength(res, nrows * rowBytes);
+  src := 1;
+  r := 0;
+  produced := 0;
+  while src <= Length(D) do
+  begin
+    tag := Ord(D[src]);
+    src := src + 1;
+    n := Length(D) - src + 1;
+    if n > rowBytes then
+      n := rowBytes;
+    if n <= 0 then
+      Break;
+    base := r * rowBytes;
+    for i := 1 to n do
+    begin
+      x := Ord(D[src + i - 1]);
+      if i > bpp then
+        a := Ord(res[base + i - bpp])
+      else
+        a := 0;
+      if r > 0 then
+        bb := Ord(res[base - rowBytes + i])
+      else
+        bb := 0;
+      if (r > 0) and (i > bpp) then
+        c := Ord(res[base - rowBytes + i - bpp])
+      else
+        c := 0;
+      if tag = 1 then
+        x := x + a
+      else if tag = 2 then
+        x := x + bb
+      else if tag = 3 then
+        x := x + ((a + bb) div 2)
+      else if tag = 4 then
+      begin
+        p := a + bb - c;
+        pa := Abs(p - a);
+        pb := Abs(p - bb);
+        pc := Abs(p - c);
+        if (pa <= pb) and (pa <= pc) then
+          x := x + a
+        else if pb <= pc then
+          x := x + bb
+        else
+          x := x + c;
+      end;
+      res[base + i] := Chr(x and 255);
+    end;
+    for i := n + 1 to rowBytes do
+      res[base + i] := #0;
+    produced := base + n;
+    src := src + n;
+    r := r + 1;
+  end;
+  SetLength(res, produced);
+  Result := res;
+end;
+
+function TPdfDoc.ApplyFilter(const Name: string; Parms: TPdfObj; const Data: string; Limit: Integer): string;
+var
+  pdr, colors, bpc, cols, early: Integer;
+  inf: TInflater;
+  out1: string;
+  isFlate, isLzw: Boolean;
+  skip: Integer;
+begin
+  isFlate := (Name = 'FlateDecode') or (Name = 'Fl');
+  isLzw := (Name = 'LZWDecode') or (Name = 'LZW');
+  if isFlate then
+  begin
+    inf := TInflater.Create(flZlib);
+    inf.MaxOutput := Limit;
+    try
+      inf.Feed(Data);
+    except
+      on E: EFlateError do
+        Warn('Flate data is damaged: ' + E.Message);
+    end;
+    out1 := inf.Take;
+    if (Limit > 0) and (Length(out1) >= Limit) then
+      Fail(-1, 'a stream is larger than the limit');
+    if out1 = '' then
+    begin
+      { a header that is no header: the data may be DEFLATE alone, with or
+        without two bytes in front }
+      for skip := 0 to 1 do
+      begin
+        inf := TInflater.Create(flRaw);
+        inf.MaxOutput := Limit;
+        try
+          inf.Feed(Copy(Data, 1 + skip * 2, Length(Data)));
+        except
+          on E: EFlateError do
+            Warn('Flate data is damaged: ' + E.Message);
+        end;
+        out1 := inf.Take;
+        if out1 <> '' then
+          Break;
+      end;
+    end;
+  end
+  else if isLzw then
+  begin
+    early := 1;
+    if Parms <> nil then
+      early := IntOf(Parms.Get('EarlyChange'), 1);
+    out1 := LzwDecode(Data, early, Limit);
+  end
+  else if (Name = 'ASCIIHexDecode') or (Name = 'AHx') then
+    Result := AsciiHexDecode(Data)
+  else if (Name = 'ASCII85Decode') or (Name = 'A85') then
+    Result := Ascii85Decode(Data)
+  else if (Name = 'RunLengthDecode') or (Name = 'RL') then
+    Result := RunLengthDecode(Data, Limit)
+  else if Name = 'Crypt' then
+    Result := Data
+  else
+    Fail(-1, 'the filter ' + Name + ' is not supported');
+  if isFlate or isLzw then
+  begin
+    pdr := 1;
+    colors := 1;
+    bpc := 8;
+    cols := 1;
+    if Parms <> nil then
+    begin
+      pdr := IntOf(Parms.Get('Predictor'), 1);
+      colors := IntOf(Parms.Get('Colors'), 1);
+      bpc := IntOf(Parms.Get('BitsPerComponent'), 8);
+      cols := IntOf(Parms.Get('Columns'), 1);
+    end;
+    Result := Unpredict(out1, pdr, colors, bpc, cols);
+  end;
+end;
+
+function TPdfDoc.RawStream(S: TPdfObj): string;
+begin
+  Result := Copy(FData, S.StmPos + 1, S.StmLen);
+end;
+
+function TPdfDoc.StreamData(S: TPdfObj): string;
+var
+  data: string;
+  f, p, fo, po: TPdfObj;
+  i: Integer;
+begin
+  S := Resolve(S);
+  if (S = nil) or (S.Kind <> pdfStream) then
+    Fail(-1, 'not a stream');
+  data := RawStream(S);
+  f := Resolve(S.Get('Filter'));
+  if f = nil then
+    f := Resolve(S.Get('F'));
+  p := Resolve(S.Get('DecodeParms'));
+  if p = nil then
+    p := Resolve(S.Get('DP'));
+  if f = nil then
+  begin
+    Result := data;
+    Exit;
+  end;
+  if f.Kind = pdfName then
+  begin
+    po := p;
+    if (po <> nil) and (po.Kind = pdfArray) then
+    begin
+      if Length(po.Items) > 0 then
+        po := Resolve(po.Items[0])
+      else
+        po := nil;
+    end;
+    if (po <> nil) and (po.Kind <> pdfDict) then
+      po := nil;
+    Result := ApplyFilter(f.SVal, po, data, FMaxStream);
+    Exit;
+  end;
+  if f.Kind <> pdfArray then
+    Fail(-1, 'the Filter of a stream is not a name or an array');
+  for i := 0 to Length(f.Items) - 1 do
+  begin
+    fo := Resolve(f.Items[i]);
+    if (fo = nil) or (fo.Kind <> pdfName) then
+      Fail(-1, 'a filter of a stream is not a name');
+    po := nil;
+    if (p <> nil) and (p.Kind = pdfArray) and (i < Length(p.Items)) then
+      po := Resolve(p.Items[i])
+    else if (p <> nil) and (p.Kind = pdfDict) and (Length(f.Items) = 1) then
+      po := p;
+    if (po <> nil) and (po.Kind <> pdfDict) then
+      po := nil;
+    data := ApplyFilter(fo.SVal, po, data, FMaxStream);
+  end;
+  Result := data;
+end;
+
+{ ---- the page tree (7.7.3) ---- }
+
+const
+  MaxPages = 200000;
+  MaxPageDepth = 64;
+
+procedure TPdfDoc.WalkPages(Node, Parent: TPdfObj; Depth: Integer; var Seen: array of Integer);
+var
+  n, kids, ty: TPdfObj;
+  isPages: Boolean;
+  i, j: Integer;
+  rs: TPdfObj;
+  num: Integer;
+begin
+  { Node is as the Kids array has it: a reference }
+  if (Depth > MaxPageDepth) or (Length(FPages) >= MaxPages) then
+    Exit;
+  num := -1;
+  if (Node <> nil) and (Node.Kind = pdfRef) then
+  begin
+    num := Node.IVal;
+    if num >= Length(Seen) then
+      Exit;
+    if Seen[num] <> 0 then
+      Exit;
+    Seen[num] := 1;
+  end;
+  n := Resolve(Node);
+  if (n = nil) or (n.Kind <> pdfDict) then
+    Exit;
+  kids := Resolve(n.Get('Kids'));
+  ty := Resolve(n.Get('Type'));
+  isPages := (kids <> nil) and (kids.Kind = pdfArray) and ((ty = nil) or ty.IsName('Pages'));
+  { an inherited Resources goes into the node (the nearest wins) }
+  rs := n.Get('Resources');
+  if (rs = nil) and (Parent <> nil) then
+  begin
+    rs := Parent.Get('Resources');
+    if rs <> nil then
+    begin
+      j := Length(n.Keys);
+      SetLength(n.Keys, j + 1);
+      SetLength(n.Vals, j + 1);
+      n.Keys[j] := 'Resources';
+      n.Vals[j] := rs;
+    end;
+  end;
+  if isPages then
+  begin
+    for i := 0 to Length(kids.Items) - 1 do
+      WalkPages(kids.Items[i], n, Depth + 1, Seen);
+  end
+  else
+  begin
+    j := Length(FPages);
+    SetLength(FPages, j + 1);
+    FPages[j] := n;
+  end;
+end;
+
+procedure TPdfDoc.LoadPages;
+var
+  root, pages: TPdfObj;
+  seen: array of Integer;
+  i: Integer;
+  o: TPdfObj;
+begin
+  if FPagesDone then
+    Exit;
+  FPagesDone := True;
+  SetLength(seen, Length(FXKind));
+  root := TrailerEntry('Root');
+  if root <> nil then
+  begin
+    pages := root.Get('Pages');
+    if pages <> nil then
+      WalkPages(pages, nil, 0, seen);
+  end;
+  if Length(FPages) = 0 then
+  begin
+    { a tree that gives nothing: every object that says it is a page }
+    Warn('the page tree gives no page: the pages are looked for in the objects');
+    { GetObject may rebuild the table: the bound is read each time }
+    i := 1;
+    while i < Length(FXKind) do
+    begin
+      if (FXKind[i] = 1) or (FXKind[i] = 2) then
+      begin
+        o := GetObject(i);
+        if (o <> nil) and (o.Kind = pdfDict) and (o.Get('Type') <> nil) and o.Get('Type').IsName('Page') then
+        begin
+          SetLength(FPages, Length(FPages) + 1);
+          FPages[Length(FPages) - 1] := o;
+          if Length(FPages) >= MaxPages then
+            Break;
+        end;
+      end;
+      i := i + 1;
+    end;
+  end;
+end;
+
+function TPdfDoc.PageCount: Integer;
+begin
+  LoadPages;
+  Result := Length(FPages);
+end;
+
+function TPdfDoc.PageObject(I: Integer): TPdfObj;
+begin
+  LoadPages;
+  if (I < 0) or (I >= Length(FPages)) then
+    Fail(-1, 'no such page');
+  Result := FPages[I];
+end;
+
+{ ---- CMaps (9.7.5, 9.10.3) ---- }
+
+type
+  TPdfCMap = class
+  public
+    { the code space: byte counts and the ranges }
+    CsN: array of Integer;
+    CsLo: array of Integer;
+    CsHi: array of Integer;
+    { code to text: single codes, and ranges whose text is the first
+      one counted up in its last character (keys carry the byte count
+      in bits 32 and up) }
+    SKey: array of Integer;
+    SText: array of string;
+    RLo: array of Integer;
+    RHi: array of Integer;
+    RText: array of string;
+    { code to CID, as ranges }
+    CLo: array of Integer;
+    CHi: array of Integer;
+    CCid: array of Integer;
+    Sorted: Boolean;
+    NS: Integer;
+    NR: Integer;
+    NC: Integer;
+    constructor Create;
+    procedure Parse(const Data: string);
+    procedure Finish;
+    function Lookup(Key: Integer; var Text: string): Boolean;
+    function Cid(Key: Integer): Integer;
+    function HasCodeSpace: Boolean;
+    { the length of the code that starts at I (1 based) of S, by the
+      code space: 0 when no range fits }
+    function CodeLen(const S: string; I, Last: Integer): Integer;
+  end;
+
+const
+  MaxCMapEntries = 600000;
+
+constructor TPdfCMap.Create;
+begin
+  inherited Create;
+  Sorted := False;
+end;
+
+{ the permutation that puts Keys in ascending order (stable) }
+function SortedOrder(const Keys: array of Integer; N: Integer): array of Integer;
+var
+  a, b: array of Integer;
+  i, w, lo, mid, hi, p, q, k: Integer;
+begin
+  SetLength(a, N);
+  SetLength(b, N);
+  for i := 0 to N - 1 do
+    a[i] := i;
+  w := 1;
+  while w < N do
+  begin
+    lo := 0;
+    while lo < N do
+    begin
+      mid := lo + w;
+      if mid > N then
+        mid := N;
+      hi := lo + 2 * w;
+      if hi > N then
+        hi := N;
+      p := lo;
+      q := mid;
+      k := lo;
+      while (p < mid) and (q < hi) do
+      begin
+        if Keys[a[q]] < Keys[a[p]] then
+        begin
+          b[k] := a[q];
+          q := q + 1;
+        end
+        else
+        begin
+          b[k] := a[p];
+          p := p + 1;
+        end;
+        k := k + 1;
+      end;
+      while p < mid do
+      begin
+        b[k] := a[p];
+        p := p + 1;
+        k := k + 1;
+      end;
+      while q < hi do
+      begin
+        b[k] := a[q];
+        q := q + 1;
+        k := k + 1;
+      end;
+      lo := lo + 2 * w;
+    end;
+    for i := 0 to N - 1 do
+      a[i] := b[i];
+    w := w * 2;
+  end;
+  Result := a;
+end;
+
+{ a hex string's bytes as a number, and its length }
+function StrCode(const S: string; var N: Integer): Integer;
+var
+  i: Integer;
+begin
+  Result := 0;
+  N := Length(S);
+  if N > 4 then
+    N := 4;
+  for i := 1 to N do
+    Result := (Result shl 8) or Ord(S[i]);
+end;
+
+{ the text cut to at most N bytes, at a character }
+function CapText(const T: string; N: Integer): string;
+var
+  k: Integer;
+begin
+  if Length(T) <= N then
+  begin
+    Result := T;
+    Exit;
+  end;
+  k := N;
+  while (k > 0) and ((Ord(T[k + 1]) and $C0) = $80) do
+    k := k - 1;
+  Result := Copy(T, 1, k);
+end;
+
+{ UTF-16BE bytes as UTF-8; a single byte is the character of that code }
+function Utf16ToUtf8(const S: string): string;
+var
+  i, u, v: Integer;
+begin
+  Result := '';
+  if Length(S) = 1 then
+  begin
+    Result := PdfRuneToUtf8(Ord(S[1]));
+    Exit;
+  end;
+  i := 1;
+  while i + 1 <= Length(S) do
+  begin
+    u := (Ord(S[i]) shl 8) or Ord(S[i + 1]);
+    i := i + 2;
+    if (u >= $D800) and (u <= $DBFF) and (i + 1 <= Length(S)) then
+    begin
+      v := (Ord(S[i]) shl 8) or Ord(S[i + 1]);
+      if (v >= $DC00) and (v <= $DFFF) then
+      begin
+        u := $10000 + ((u - $D800) shl 10) + (v - $DC00);
+        i := i + 2;
+      end;
+    end;
+    Result := Result + PdfRuneToUtf8(u);
+    if Length(Result) > 64 then
+      Break;
+  end;
+  Result := CapText(Result, 64);
+end;
+
+{ the ligatures of the Alphabetic Presentation Forms (U+FB00 to U+FB06) as
+  the letters they join, as pdftotext and the readers of text do: for the
+  text to be looked into the letters are what is asked }
+function ExpandLigatures(const T: string): string;
+var
+  i, n: Integer;
+  r: string;
+begin
+  n := Length(T);
+  i := Pos(Chr($EF) + Chr($AC), T);
+  if (i = 0) and (Pos(Chr($EF) + Chr($80), T) = 0) then
+  begin
+    Result := T;
+    Exit;
+  end;
+  r := '';
+  i := 1;
+  while i <= n do
+  begin
+    { the private-use fi and fl that fonts of the Mac and Symbol sets
+      give (U+F001, U+F002) }
+    if (Ord(T[i]) = $EF) and (i + 2 <= n) and (Ord(T[i + 1]) = $80) and ((Ord(T[i + 2]) = $81) or (Ord(T[i + 2]) = $82)) then
+    begin
+      if Ord(T[i + 2]) = $81 then
+        r := r + 'fi'
+      else
+        r := r + 'fl';
+      i := i + 3;
+    end
+    else if (Ord(T[i]) = $EF) and (i + 2 <= n) and (Ord(T[i + 1]) = $AC) and (Ord(T[i + 2]) >= $80) and (Ord(T[i + 2]) <= $86) then
+    begin
+      case Ord(T[i + 2]) of
+        $80: r := r + 'ff';
+        $81: r := r + 'fi';
+        $82: r := r + 'fl';
+        $83: r := r + 'ffi';
+        $84: r := r + 'ffl';
+        $85: r := r + 'st';
+        $86: r := r + 'st';
+      end;
+      i := i + 3;
+    end
+    else
+    begin
+      r := r + T[i];
+      i := i + 1;
+    end;
+  end;
+  Result := r;
+end;
+
+{ the text with its last character counted up by Delta }
+function TextPlus(const T: string; Delta: Integer): string;
+var
+  i, c, n, base: Integer;
+begin
+  Result := T;
+  if (Delta = 0) or (T = '') then
+    Exit;
+  { the last character starts at the last byte that is no continuation }
+  i := Length(T);
+  while (i > 1) and ((Ord(T[i]) and $C0) = $80) do
+    i := i - 1;
+  c := Ord(T[i]);
+  if c < $80 then
+  begin
+    n := c;
+  end
+  else if c < $E0 then
+    n := ((c and $1F) shl 6) or (Ord(T[i + 1]) and $3F)
+  else if c < $F0 then
+    n := ((c and $0F) shl 12) or ((Ord(T[i + 1]) and $3F) shl 6) or (Ord(T[i + 2]) and $3F)
+  else
+    n := ((c and $07) shl 18) or ((Ord(T[i + 1]) and $3F) shl 12) or ((Ord(T[i + 2]) and $3F) shl 6) or (Ord(T[i + 3]) and $3F);
+  base := n + Delta;
+  Result := Copy(T, 1, i - 1) + PdfRuneToUtf8(base);
+end;
+
+procedure TPdfCMap.Parse(const Data: string);
+var
+  lx: TPdfLex;
+  t, n1, n2: Integer;
+  kw, a, b, d: string;
+  lo, hi, k, j: Integer;
+begin
+  lx := TPdfLex.Create(Data, 1, Length(Data));
+  lx.Refs := False;
+  t := lx.Next;
+  while t <> tkEOF do
+  begin
+    if t = tkKeyword then
+    begin
+      kw := lx.TokStr;
+      if kw = 'begincodespacerange' then
+      begin
+        while True do
+        begin
+          t := lx.Next;
+          if t <> tkString then
+            Break;
+          a := lx.TokStr;
+          if lx.Next <> tkString then
+            Break;
+          b := lx.TokStr;
+          if (Length(Data) > 0) and (Length(a) >= 1) and (Length(a) <= 4) and (Length(b) = Length(a)) then
+          begin
+            k := Length(CsN);
+            SetLength(CsN, k + 1);
+            SetLength(CsLo, k + 1);
+            SetLength(CsHi, k + 1);
+            CsN[k] := Length(a);
+            CsLo[k] := StrCode(a, n1);
+            CsHi[k] := StrCode(b, n2);
+          end;
+        end;
+        Continue;
+      end
+      else if kw = 'beginbfchar' then
+      begin
+        while True do
+        begin
+          t := lx.Next;
+          if t <> tkString then
+            Break;
+          a := lx.TokStr;
+          t := lx.Next;
+          if t = tkString then
+            d := Utf16ToUtf8(lx.TokStr)
+          else if t = tkName then
+            d := PdfGlyphText(lx.TokStr)
+          else
+            Break;
+          if NS >= MaxCMapEntries then
+            Break;
+          if NS >= Length(SKey) then
+          begin
+            SetLength(SKey, (NS + 16) * 2);
+            SetLength(SText, (NS + 16) * 2);
+          end;
+          k := StrCode(a, n1);
+          SKey[NS] := (n1 shl 32) or k;
+          SText[NS] := d;
+          NS := NS + 1;
+        end;
+        Continue;
+      end
+      else if kw = 'beginbfrange' then
+      begin
+        while True do
+        begin
+          t := lx.Next;
+          if t <> tkString then
+            Break;
+          a := lx.TokStr;
+          if lx.Next <> tkString then
+            Break;
+          b := lx.TokStr;
+          lo := StrCode(a, n1);
+          hi := StrCode(b, n2);
+          t := lx.Next;
+          if t = tkString then
+          begin
+            if NR >= MaxCMapEntries then
+              Break;
+            if NR >= Length(RLo) then
+            begin
+              SetLength(RLo, (NR + 16) * 2);
+              SetLength(RHi, (NR + 16) * 2);
+              SetLength(RText, (NR + 16) * 2);
+            end;
+            RLo[NR] := (n1 shl 32) or lo;
+            RHi[NR] := (n1 shl 32) or hi;
+            RText[NR] := Utf16ToUtf8(lx.TokStr);
+            NR := NR + 1;
+          end
+          else if t = tkArrayOpen then
+          begin
+            j := 0;
+            while True do
+            begin
+              t := lx.Next;
+              if t <> tkString then
+                Break;
+              if (NS < MaxCMapEntries) and (lo + j <= hi) then
+              begin
+                if NS >= Length(SKey) then
+                begin
+                  SetLength(SKey, (NS + 16) * 2);
+                  SetLength(SText, (NS + 16) * 2);
+                end;
+                SKey[NS] := (n1 shl 32) or (lo + j);
+                SText[NS] := Utf16ToUtf8(lx.TokStr);
+                NS := NS + 1;
+              end;
+              j := j + 1;
+            end;
+          end
+          else
+            Break;
+        end;
+        Continue;
+      end
+      else if (kw = 'begincidrange') or (kw = 'beginnotdefrange') then
+      begin
+        while True do
+        begin
+          t := lx.Next;
+          if t <> tkString then
+            Break;
+          a := lx.TokStr;
+          if lx.Next <> tkString then
+            Break;
+          b := lx.TokStr;
+          if lx.Next <> tkInt then
+            Break;
+          if (kw = 'begincidrange') and (NC < MaxCMapEntries) then
+          begin
+            if NC >= Length(CLo) then
+            begin
+              SetLength(CLo, (NC + 16) * 2);
+              SetLength(CHi, (NC + 16) * 2);
+              SetLength(CCid, (NC + 16) * 2);
+            end;
+            CLo[NC] := (Length(a) shl 32) or StrCode(a, n1);
+            CHi[NC] := (Length(b) shl 32) or StrCode(b, n2);
+            CCid[NC] := lx.TokInt;
+            NC := NC + 1;
+          end;
+        end;
+        Continue;
+      end
+      else if kw = 'begincidchar' then
+      begin
+        while True do
+        begin
+          t := lx.Next;
+          if t <> tkString then
+            Break;
+          a := lx.TokStr;
+          if lx.Next <> tkInt then
+            Break;
+          if NC < MaxCMapEntries then
+          begin
+            if NC >= Length(CLo) then
+            begin
+              SetLength(CLo, (NC + 16) * 2);
+              SetLength(CHi, (NC + 16) * 2);
+              SetLength(CCid, (NC + 16) * 2);
+            end;
+            CLo[NC] := (Length(a) shl 32) or StrCode(a, n1);
+            CHi[NC] := CLo[NC];
+            CCid[NC] := lx.TokInt;
+            NC := NC + 1;
+          end;
+        end;
+        Continue;
+      end;
+    end;
+    t := lx.Next;
+  end;
+end;
+
+procedure TPdfCMap.Finish;
+var
+  ord1: array of Integer;
+  k1: array of Integer;
+  t1: array of string;
+  l1, h1, c1: array of Integer;
+  i: Integer;
+begin
+  Sorted := True;
+  if NS > 1 then
+  begin
+    ord1 := SortedOrder(SKey, NS);
+    SetLength(k1, NS);
+    SetLength(t1, NS);
+    for i := 0 to NS - 1 do
+    begin
+      k1[i] := SKey[ord1[i]];
+      t1[i] := SText[ord1[i]];
+    end;
+    for i := 0 to NS - 1 do
+    begin
+      SKey[i] := k1[i];
+      SText[i] := t1[i];
+    end;
+  end;
+  if NR > 1 then
+  begin
+    ord1 := SortedOrder(RLo, NR);
+    SetLength(l1, NR);
+    SetLength(h1, NR);
+    SetLength(t1, NR);
+    for i := 0 to NR - 1 do
+    begin
+      l1[i] := RLo[ord1[i]];
+      h1[i] := RHi[ord1[i]];
+      t1[i] := RText[ord1[i]];
+    end;
+    for i := 0 to NR - 1 do
+    begin
+      RLo[i] := l1[i];
+      RHi[i] := h1[i];
+      RText[i] := t1[i];
+    end;
+  end;
+  if NC > 1 then
+  begin
+    ord1 := SortedOrder(CLo, NC);
+    SetLength(l1, NC);
+    SetLength(h1, NC);
+    SetLength(c1, NC);
+    for i := 0 to NC - 1 do
+    begin
+      l1[i] := CLo[ord1[i]];
+      h1[i] := CHi[ord1[i]];
+      c1[i] := CCid[ord1[i]];
+    end;
+    for i := 0 to NC - 1 do
+    begin
+      CLo[i] := l1[i];
+      CHi[i] := h1[i];
+      CCid[i] := c1[i];
+    end;
+  end;
+end;
+
+function TPdfCMap.Lookup(Key: Integer; var Text: string): Boolean;
+var
+  lo, hi, mid: Integer;
+begin
+  Result := False;
+  lo := 0;
+  hi := NS - 1;
+  while lo <= hi do
+  begin
+    mid := (lo + hi) div 2;
+    if SKey[mid] < Key then
+      lo := mid + 1
+    else if SKey[mid] > Key then
+      hi := mid - 1
+    else
+    begin
+      Text := SText[mid];
+      Result := True;
+      Exit;
+    end;
+  end;
+  { the last range that starts at or before the key }
+  lo := 0;
+  hi := NR - 1;
+  mid := -1;
+  while lo <= hi do
+  begin
+    if RLo[(lo + hi) div 2] <= Key then
+    begin
+      mid := (lo + hi) div 2;
+      lo := mid + 1;
+    end
+    else
+      hi := (lo + hi) div 2 - 1;
+  end;
+  if (mid >= 0) and (RHi[mid] >= Key) then
+  begin
+    Text := TextPlus(RText[mid], Key - RLo[mid]);
+    Result := True;
+  end;
+end;
+
+function TPdfCMap.Cid(Key: Integer): Integer;
+var
+  lo, hi, mid: Integer;
+begin
+  Result := -1;
+  lo := 0;
+  hi := NC - 1;
+  mid := -1;
+  while lo <= hi do
+  begin
+    if CLo[(lo + hi) div 2] <= Key then
+    begin
+      mid := (lo + hi) div 2;
+      lo := mid + 1;
+    end
+    else
+      hi := (lo + hi) div 2 - 1;
+  end;
+  if (mid >= 0) and (CHi[mid] >= Key) then
+    Result := CCid[mid] + (Key - CLo[mid]);
+end;
+
+function TPdfCMap.HasCodeSpace: Boolean;
+begin
+  Result := Length(CsN) > 0;
+end;
+
+function TPdfCMap.CodeLen(const S: string; I, Last: Integer): Integer;
+var
+  n, k, j, code, b, loB, hiB, sh: Integer;
+  ok: Boolean;
+begin
+  Result := 0;
+  for n := 1 to 4 do
+  begin
+    if I + n - 1 > Last then
+      Break;
+    for k := 0 to Length(CsN) - 1 do
+      if CsN[k] = n then
+      begin
+        ok := True;
+        for j := 0 to n - 1 do
+        begin
+          sh := (n - 1 - j) * 8;
+          b := Ord(S[I + j]);
+          loB := (CsLo[k] shr sh) and 255;
+          hiB := (CsHi[k] shr sh) and 255;
+          if (b < loB) or (b > hiB) then
+          begin
+            ok := False;
+            Break;
+          end;
+        end;
+        if ok then
+        begin
+          Result := n;
+          Exit;
+        end;
+      end;
+  end;
+end;
+
+{ ---- fonts (9.5 to 9.10) ---- }
+
+type
+  TPdfFont = class
+  public
+    Doc: TPdfDoc;
+    Src: TPdfObj;
+    Name: string;
+    Composite: Boolean;
+    Vertical: Boolean;
+    { simple fonts: the text and the width (thousandths of the text space)
+      of each code }
+    Uni: array[0..255] of string;
+    W: array[0..255] of Double;
+    ToUni: TPdfCMap;
+    { composite fonts }
+    CodeMap: TPdfCMap;
+    UcsKind: Integer;
+    DW: Double;
+    WLo: array of Integer;
+    WHi: array of Integer;
+    WVal: array of Double;
+    NW: Integer;
+    Warned: Boolean;
+    constructor Create(ADoc: TPdfDoc; AFont: TPdfObj);
+    procedure BuildSimple(F: TPdfObj);
+    procedure BuildComposite(F: TPdfObj);
+    function CidWidth(Cid: Integer): Double;
+    procedure NextGlyph(const S: string; var I: Integer; Last: Integer; var Text: string; var Width: Double; var IsSpace: Boolean);
+  end;
+
+function NumOf(O: TPdfObj): Double;
+begin
+  Result := 0;
+  if O = nil then
+    Exit;
+  if O.Kind = pdfInt then
+    Result := O.IVal
+  else if O.Kind = pdfReal then
+    Result := O.RVal;
+end;
+
+constructor TPdfFont.Create(ADoc: TPdfDoc; AFont: TPdfObj);
+var
+  tu: TPdfObj;
+  i: Integer;
+  st: string;
+begin
+  inherited Create;
+  Doc := ADoc;
+  Src := AFont;
+  Name := ADoc.NameOf(AFont.Get('BaseFont'));
+  for i := 0 to 255 do
+    W[i] := -1;
+  DW := 1000;
+  tu := ADoc.Dict(AFont, 'ToUnicode');
+  if (tu <> nil) and (tu.Kind = pdfStream) then
+  begin
+    try
+      ToUni := TPdfCMap.Create;
+      ToUni.Parse(ADoc.StreamData(tu));
+      ToUni.Finish;
+    except
+      on E: EPdfError do
+      begin
+        ADoc.AddWarning('font ' + Name + ': the ToUnicode map is damaged: ' + E.Message);
+        ToUni := nil;
+      end;
+    end;
+  end;
+  st := ADoc.NameOf(AFont.Get('Subtype'));
+  if st = 'Type0' then
+    BuildComposite(AFont)
+  else
+    BuildSimple(AFont);
+end;
+
+procedure TPdfFont.BuildSimple(F: TPdfObj);
+var
+  enc, diffs, widths, desc, fm, o: TPdfObj;
+  baseEnc, i, code, first, flags, k: Integer;
+  nm, ename, st: string;
+  symbolic, courier: Boolean;
+  mw, scale: Double;
+begin
+  Composite := False;
+  st := Doc.NameOf(F.Get('Subtype'));
+  desc := Doc.Dict(F, 'FontDescriptor');
+  flags := 0;
+  mw := 0;
+  if desc <> nil then
+  begin
+    flags := Doc.IntOf(desc.Get('Flags'), 0);
+    o := Doc.Dict(desc, 'MissingWidth');
+    mw := NumOf(o);
+  end;
+  symbolic := (flags and 4) <> 0;
+  nm := Name;
+  courier := Pos('Courier', nm) > 0;
+  { widths }
+  scale := 1;
+  if st = 'Type3' then
+  begin
+    fm := Doc.Dict(F, 'FontMatrix');
+    if (fm <> nil) and (fm.Kind = pdfArray) and (Length(fm.Items) >= 1) then
+      scale := NumOf(Doc.Resolve(fm.Items[0])) * 1000
+    else
+      scale := 1;
+  end;
+  widths := Doc.Dict(F, 'Widths');
+  first := Doc.IntOf(F.Get('FirstChar'), 0);
+  if (widths <> nil) and (widths.Kind = pdfArray) then
+  begin
+    for i := 0 to Length(widths.Items) - 1 do
+    begin
+      k := first + i;
+      if (k >= 0) and (k <= 255) then
+        W[k] := NumOf(Doc.Resolve(widths.Items[i])) * scale;
+    end;
+  end;
+  for i := 0 to 255 do
+    if W[i] < 0 then
+    begin
+      if courier then
+        W[i] := 600
+      else if (desc <> nil) and (mw > 0) then
+        W[i] := mw
+      else if (widths <> nil) then
+        W[i] := 0
+      else
+        W[i] := 500;
+    end;
+  { the base encoding }
+  baseEnc := -1;
+  enc := Doc.Dict(F, 'Encoding');
+  ename := '';
+  if (enc <> nil) and (enc.Kind = pdfName) then
+    ename := enc.SVal
+  else if (enc <> nil) and (enc.Kind = pdfDict) then
+    ename := Doc.NameOf(enc.Get('BaseEncoding'));
+  if ename = 'WinAnsiEncoding' then
+    baseEnc := peWinAnsi
+  else if ename = 'MacRomanEncoding' then
+    baseEnc := peMacRoman
+  else if ename = 'StandardEncoding' then
+    baseEnc := peStandard
+  else if (ename = '') and not symbolic then
+  begin
+    if st = 'TrueType' then
+      baseEnc := peWinAnsi
+    else
+      baseEnc := peStandard;
+  end;
+  for i := 0 to 255 do
+  begin
+    code := -1;
+    if baseEnc >= 0 then
+      code := PdfEncodingRune(baseEnc, i);
+    if (code < 0) and (i >= 32) and (i < 127) then
+      code := i
+    else if (code < 0) and (i >= 160) and (baseEnc < 0) then
+      code := PdfEncodingRune(peWinAnsi, i);
+    if code >= 0 then
+      Uni[i] := PdfRuneToUtf8(code)
+    else
+      Uni[i] := '';
+  end;
+  { Differences }
+  if (enc <> nil) and (enc.Kind = pdfDict) then
+  begin
+    diffs := Doc.Dict(enc, 'Differences');
+    if (diffs <> nil) and (diffs.Kind = pdfArray) then
+    begin
+      code := 0;
+      for i := 0 to Length(diffs.Items) - 1 do
+      begin
+        o := Doc.Resolve(diffs.Items[i]);
+        if o = nil then
+          Continue;
+        if o.Kind = pdfInt then
+          code := o.IVal
+        else if o.Kind = pdfName then
+        begin
+          if (code >= 0) and (code <= 255) then
+            Uni[code] := PdfGlyphText(o.SVal);
+          code := code + 1;
+        end;
+      end;
+    end;
+  end;
+end;
+
+procedure TPdfFont.BuildComposite(F: TPdfObj);
+var
+  enc, df, desc, wa, o, a, b, c: TPdfObj;
+  nm: string;
+  i, j, cid, k: Integer;
+  ord1: array of Integer;
+  l1, h1: array of Integer;
+  v1: array of Double;
+begin
+  Composite := True;
+  enc := Doc.Dict(F, 'Encoding');
+  UcsKind := 0;
+  if (enc <> nil) and (enc.Kind = pdfName) then
+  begin
+    nm := enc.SVal;
+    if (nm = 'Identity-V') or (Copy(nm, Length(nm) - 1, 2) = '-V') then
+      Vertical := True;
+    if Pos('UCS2', nm) > 0 then
+      UcsKind := 1
+    else if Pos('UTF16', nm) > 0 then
+      UcsKind := 2;
+  end
+  else if (enc <> nil) and (enc.Kind = pdfStream) then
+  begin
+    try
+      CodeMap := TPdfCMap.Create;
+      CodeMap.Parse(Doc.StreamData(enc));
+      CodeMap.Finish;
+      if Doc.IntOf(enc.Get('WMode'), 0) = 1 then
+        Vertical := True;
+    except
+      on E: EPdfError do
+      begin
+        Doc.AddWarning('font ' + Name + ': the Encoding CMap is damaged: ' + E.Message);
+        CodeMap := nil;
+      end;
+    end;
+  end;
+  df := Doc.Dict(F, 'DescendantFonts');
+  if (df <> nil) and (df.Kind = pdfArray) and (Length(df.Items) > 0) then
+    desc := Doc.Resolve(df.Items[0])
+  else
+    desc := nil;
+  if (desc = nil) or (desc.Kind <> pdfDict) then
+    Exit;
+  DW := 1000;
+  o := Doc.Dict(desc, 'DW');
+  if o <> nil then
+    DW := NumOf(o);
+  wa := Doc.Dict(desc, 'W');
+  if (wa <> nil) and (wa.Kind = pdfArray) then
+  begin
+    i := 0;
+    while i < Length(wa.Items) do
+    begin
+      a := Doc.Resolve(wa.Items[i]);
+      if (a = nil) or (i + 1 >= Length(wa.Items)) then
+        Break;
+      b := Doc.Resolve(wa.Items[i + 1]);
+      if (b <> nil) and (b.Kind = pdfArray) then
+      begin
+        cid := SafeTrunc(NumOf(a));
+        for j := 0 to Length(b.Items) - 1 do
+        begin
+          if NW >= MaxCMapEntries then
+            Break;
+          if NW >= Length(WLo) then
+          begin
+            SetLength(WLo, (NW + 16) * 2);
+            SetLength(WHi, (NW + 16) * 2);
+            SetLength(WVal, (NW + 16) * 2);
+          end;
+          WLo[NW] := cid + j;
+          WHi[NW] := cid + j;
+          WVal[NW] := NumOf(Doc.Resolve(b.Items[j]));
+          NW := NW + 1;
+        end;
+        i := i + 2;
+      end
+      else
+      begin
+        if i + 2 >= Length(wa.Items) then
+          Break;
+        c := Doc.Resolve(wa.Items[i + 2]);
+        if NW < MaxCMapEntries then
+        begin
+          if NW >= Length(WLo) then
+          begin
+            SetLength(WLo, (NW + 16) * 2);
+            SetLength(WHi, (NW + 16) * 2);
+            SetLength(WVal, (NW + 16) * 2);
+          end;
+          WLo[NW] := SafeTrunc(NumOf(a));
+          WHi[NW] := SafeTrunc(NumOf(b));
+          WVal[NW] := NumOf(c);
+          NW := NW + 1;
+        end;
+        i := i + 3;
+      end;
+    end;
+    if NW > 1 then
+    begin
+      ord1 := SortedOrder(WLo, NW);
+      SetLength(l1, NW);
+      SetLength(h1, NW);
+      SetLength(v1, NW);
+      for k := 0 to NW - 1 do
+      begin
+        l1[k] := WLo[ord1[k]];
+        h1[k] := WHi[ord1[k]];
+        v1[k] := WVal[ord1[k]];
+      end;
+      for k := 0 to NW - 1 do
+      begin
+        WLo[k] := l1[k];
+        WHi[k] := h1[k];
+        WVal[k] := v1[k];
+      end;
+    end;
+  end;
+end;
+
+function TPdfFont.CidWidth(Cid: Integer): Double;
+var
+  lo, hi, mid: Integer;
+begin
+  Result := DW;
+  lo := 0;
+  hi := NW - 1;
+  mid := -1;
+  while lo <= hi do
+  begin
+    if WLo[(lo + hi) div 2] <= Cid then
+    begin
+      mid := (lo + hi) div 2;
+      lo := mid + 1;
+    end
+    else
+      hi := (lo + hi) div 2 - 1;
+  end;
+  if (mid >= 0) and (WHi[mid] >= Cid) then
+    Result := WVal[mid];
+end;
+
+procedure TPdfFont.NextGlyph(const S: string; var I: Integer; Last: Integer; var Text: string; var Width: Double; var IsSpace: Boolean);
+var
+  code, n, cid, k, u2, c2: Integer;
+  t: string;
+begin
+  IsSpace := False;
+  Text := '';
+  if not Composite then
+  begin
+    code := Ord(S[I]);
+    I := I + 1;
+    IsSpace := code = 32;
+    Width := W[code];
+    if (ToUni <> nil) and ToUni.Lookup((1 shl 32) or code, t) then
+      Text := t
+    else
+    begin
+      Text := Uni[code];
+      if (Text = '') and (code >= 32) then
+        Text := PdfRuneToUtf8(code);
+    end;
+    Exit;
+  end;
+  { a composite font's code: as long as the code space says }
+  n := 0;
+  if (CodeMap <> nil) and CodeMap.HasCodeSpace then
+    n := CodeMap.CodeLen(S, I, Last)
+  else if (ToUni <> nil) and ToUni.HasCodeSpace and (CodeMap = nil) and (UcsKind = 0) then
+    n := ToUni.CodeLen(S, I, Last);
+  if n = 0 then
+  begin
+    n := 2;
+    if I + 1 > Last then
+      n := 1;
+  end;
+  code := 0;
+  for k := 0 to n - 1 do
+    code := (code shl 8) or Ord(S[I + k]);
+  I := I + n;
+  IsSpace := (n = 1) and (code = 32);
+  cid := code;
+  if (CodeMap <> nil) and (CodeMap.NC > 0) then
+  begin
+    cid := CodeMap.Cid((n shl 32) or code);
+    if cid < 0 then
+      cid := 0;
+  end;
+  Width := CidWidth(cid);
+  if (ToUni <> nil) and ToUni.Lookup((n shl 32) or code, t) then
+    Text := t
+  else if (UcsKind = 1) and (n = 2) then
+    Text := PdfRuneToUtf8(code)
+  else if (UcsKind = 2) and (n = 2) then
+  begin
+    u2 := code;
+    if (u2 >= $D800) and (u2 <= $DBFF) and (I + 1 <= Last) then
+    begin
+      c2 := (Ord(S[I]) shl 8) or Ord(S[I + 1]);
+      if (c2 >= $DC00) and (c2 <= $DFFF) then
+      begin
+        I := I + 2;
+        u2 := $10000 + ((u2 - $D800) shl 10) + (c2 - $DC00);
+      end;
+    end;
+    Text := PdfRuneToUtf8(u2);
+  end
+  else
+  begin
+    if not Warned then
+    begin
+      Warned := True;
+      Doc.AddWarning('font ' + Name + ' has no map to text');
+    end;
+    Text := PdfRuneToUtf8($FFFD);
+  end;
+end;
+
+{ ---- the text of a page ---- }
+
+type
+  TPdfMat = record
+    A, B, C, D, E, F: Double;
+  end;
+
+  TPdfGState = record
+    Ctm: TPdfMat;
+    Tc, Tw, Th, Tl, Ts, Tfs: Double;
+    Tr: Integer;
+    Font: TPdfFont;
+  end;
+
+  TPdfExtractor = class
+  public
+    Doc: TPdfDoc;
+    Fonts: array of TPdfFont;
+    Runs: TPdfRunList;
+    GS: TPdfGState;
+    Stack: array of TPdfGState;
+    NStack: Integer;
+    Tm: TPdfMat;
+    Tlm: TPdfMat;
+    SB: TStringBuilder;
+    RunOpen: Boolean;
+    RunsFull: Boolean;
+    RunX0, RunY0, RunFS: Double;
+    LastFont: TPdfFont;
+    Active: array of TPdfObj;
+    { the operands of the operator being read, without an object for
+      each: kind 1 number, 2 name (its bytes in the stream from OPS, OPN
+      of them), 3 string (its bytes in Pool from OPS, OPN of them), 4
+      array (its elements in the E arrays from OPS, OPN of them), 5
+      any other object }
+    OKind: array of Integer;
+    ONum: array of Double;
+    OPS: array of Integer;
+    OPN: array of Integer;
+    OObj: array of TPdfObj;
+    EKind: array of Integer;
+    ENum: array of Double;
+    EPS: array of Integer;
+    EPN: array of Integer;
+    NE: Integer;
+    Pool: string;
+    PoolN: Integer;
+    constructor Create(ADoc: TPdfDoc);
+    procedure ResetPage;
+    function FontFor(Res: TPdfObj; const AName: string): TPdfFont;
+    procedure Show(const S: string; Start, Len: Integer);
+    procedure EndRun;
+    procedure NextLine(Tx, Ty: Double);
+    procedure RunContent(const Data: string; Res: TPdfObj; Depth: Integer);
+    procedure DoXObject(Res: TPdfObj; const AName: string; Depth: Integer);
+    procedure PageContent(Page: TPdfObj);
+  end;
+
+const
+  MaxGStack = 256;
+  MaxFormDepth = 12;
+  MaxOperands = 4096;
+  MaxRuns = 3000000;
+  MaxFonts = 20000;
+  { how far apart two runs of a line are before a space is written
+    between them, in sizes of the font; and how big a gap inside an
+    array of TJ is a space, in thousandths }
+  SpaceGap = 0.15;
+  TjSpace = 180;
+
+function MatMul(const M, N: TPdfMat): TPdfMat;
+begin
+  Result.A := M.A * N.A + M.B * N.C;
+  Result.B := M.A * N.B + M.B * N.D;
+  Result.C := M.C * N.A + M.D * N.C;
+  Result.D := M.C * N.B + M.D * N.D;
+  Result.E := M.E * N.A + M.F * N.C + N.E;
+  Result.F := M.E * N.B + M.F * N.D + N.F;
+end;
+
+function MatIdent: TPdfMat;
+begin
+  Result.A := 1;
+  Result.B := 0;
+  Result.C := 0;
+  Result.D := 1;
+  Result.E := 0;
+  Result.F := 0;
+end;
+
+function MatTrans(X, Y: Double): TPdfMat;
+begin
+  Result := MatIdent;
+  Result.E := X;
+  Result.F := Y;
+end;
+
+constructor TPdfExtractor.Create(ADoc: TPdfDoc);
+begin
+  inherited Create;
+  Doc := ADoc;
+  SB := TStringBuilder.Create(256);
+  ResetPage;
+end;
+
+procedure TPdfExtractor.ResetPage;
+begin
+  GS.Ctm := MatIdent;
+  GS.Tc := 0;
+  GS.Tw := 0;
+  GS.Th := 1;
+  GS.Tl := 0;
+  GS.Ts := 0;
+  GS.Tfs := 0;
+  GS.Tr := 0;
+  GS.Font := nil;
+  NStack := 0;
+  Tm := MatIdent;
+  Tlm := MatIdent;
+  RunOpen := False;
+  RunsFull := False;
+  Runs.N := 0;
+  SetLength(Runs.Items, 0);
+  SetLength(Active, 0);
+end;
+
+function TPdfExtractor.FontFor(Res: TPdfObj; const AName: string): TPdfFont;
+var
+  fd, f: TPdfObj;
+  i: Integer;
+begin
+  Result := nil;
+  fd := Doc.Dict(Res, 'Font');
+  if (fd = nil) or (fd.Kind <> pdfDict) then
+    Exit;
+  f := Doc.Resolve(fd.Get(AName));
+  if (f = nil) or (f.Kind <> pdfDict) then
+    Exit;
+  if (LastFont <> nil) and (LastFont.Src = f) then
+  begin
+    Result := LastFont;
+    Exit;
+  end;
+  for i := 0 to Length(Fonts) - 1 do
+    if Fonts[i].Src = f then
+    begin
+      Result := Fonts[i];
+      LastFont := Result;
+      Exit;
+    end;
+  try
+    Result := TPdfFont.Create(Doc, f);
+  except
+    on E: EPdfError do
+    begin
+      Doc.AddWarning('font ' + AName + ' could not be read: ' + E.Message);
+      Result := nil;
+      Exit;
+    end;
+  end;
+  if Length(Fonts) < MaxFonts then
+  begin
+    SetLength(Fonts, Length(Fonts) + 1);
+    Fonts[Length(Fonts) - 1] := Result;
+  end;
+  LastFont := Result;
+end;
+
+procedure TPdfExtractor.EndRun;
+var
+  m: TPdfMat;
+  r: TPdfRun;
+begin
+  if not RunOpen then
+    Exit;
+  RunOpen := False;
+  if SB.ByteLength = 0 then
+    Exit;
+  m := MatMul(Tm, GS.Ctm);
+  r.X0 := RunX0;
+  r.Y0 := RunY0;
+  r.X1 := m.E - GS.Ts * m.C;
+  r.Y1 := m.F - GS.Ts * m.D;
+  { the rise moves the baseline along the font's up }
+  r.X1 := m.E + GS.Ts * m.C;
+  r.Y1 := m.F + GS.Ts * m.D;
+  r.FS := RunFS;
+  r.Text := SB.ToString;
+  SB.Reset;
+  if Runs.N >= MaxRuns then
+  begin
+    if not RunsFull then
+      Doc.AddWarning('a page has more text runs than ' + IntToStr(MaxRuns) + ': the rest is left out');
+    RunsFull := True;
+    Exit;
+  end;
+  if Runs.N >= Length(Runs.Items) then
+    SetLength(Runs.Items, (Runs.N + 16) * 2);
+  Runs.Items[Runs.N] := r;
+  Runs.N := Runs.N + 1;
+end;
+
+{ a string shown with the current font: its glyphs one after another }
+procedure TPdfExtractor.Show(const S: string; Start, Len: Integer);
+var
+  i, last: Integer;
+  txt: string;
+  w, adv: Double;
+  isSp: Boolean;
+  m: TPdfMat;
+begin
+  if GS.Font = nil then
+    Exit;
+  if not RunOpen then
+  begin
+    RunOpen := True;
+    m := MatMul(Tm, GS.Ctm);
+    RunX0 := m.E + GS.Ts * m.C;
+    RunY0 := m.F + GS.Ts * m.D;
+    RunFS := Abs(GS.Tfs) * Sqrt(m.C * m.C + m.D * m.D);
+    if RunFS < 0.001 then
+      RunFS := Abs(GS.Tfs) * Sqrt(m.A * m.A + m.B * m.B);
+  end;
+  i := Start;
+  last := Start + Len - 1;
+  while i <= last do
+  begin
+    GS.Font.NextGlyph(S, i, last, txt, w, isSp);
+    if Length(txt) >= 3 then
+      txt := ExpandLigatures(txt);
+    SB.AddText(txt);
+    if GS.Font.Vertical then
+    begin
+      adv := -1.0 * GS.Tfs + GS.Tc;
+      if isSp then
+        adv := adv + GS.Tw;
+      Tm := MatMul(MatTrans(0, adv), Tm);
+    end
+    else
+    begin
+      adv := (w / 1000.0 * GS.Tfs + GS.Tc);
+      if isSp then
+        adv := adv + GS.Tw;
+      adv := adv * GS.Th;
+      Tm := MatMul(MatTrans(adv, 0), Tm);
+    end;
+  end;
+end;
+
+procedure TPdfExtractor.NextLine(Tx, Ty: Double);
+begin
+  Tlm := MatMul(MatTrans(Tx, Ty), Tlm);
+  Tm := Tlm;
+end;
+
+function Num(O: TPdfObj): Double;
+begin
+  Result := NumOf(O);
+end;
+
+procedure TPdfExtractor.DoXObject(Res: TPdfObj; const AName: string; Depth: Integer);
+var
+  xo, xr, mt, sub: TPdfObj;
+  i: Integer;
+  saveGS: TPdfGState;
+  saveTm, saveTlm: TPdfMat;
+  m: TPdfMat;
+  data: string;
+begin
+  if Depth >= MaxFormDepth then
+    Exit;
+  xo := Doc.Dict(Res, 'XObject');
+  if (xo = nil) or (xo.Kind <> pdfDict) then
+    Exit;
+  sub := Doc.Resolve(xo.Get(AName));
+  if (sub = nil) or (sub.Kind <> pdfStream) then
+    Exit;
+  if Doc.NameOf(sub.Get('Subtype')) <> 'Form' then
+    Exit;
+  for i := 0 to Length(Active) - 1 do
+    if Active[i] = sub then
+      Exit;
+  try
+    data := Doc.StreamData(sub);
+  except
+    on E: EPdfError do
+    begin
+      Doc.AddWarning('a form XObject could not be read: ' + E.Message);
+      Exit;
+    end;
+  end;
+  xr := Doc.Dict(sub, 'Resources');
+  if (xr = nil) or (xr.Kind <> pdfDict) then
+    xr := Res;
+  saveGS := GS;
+  saveTm := Tm;
+  saveTlm := Tlm;
+  mt := Doc.Dict(sub, 'Matrix');
+  if (mt <> nil) and (mt.Kind = pdfArray) and (Length(mt.Items) >= 6) then
+  begin
+    m.A := Num(Doc.Resolve(mt.Items[0]));
+    m.B := Num(Doc.Resolve(mt.Items[1]));
+    m.C := Num(Doc.Resolve(mt.Items[2]));
+    m.D := Num(Doc.Resolve(mt.Items[3]));
+    m.E := Num(Doc.Resolve(mt.Items[4]));
+    m.F := Num(Doc.Resolve(mt.Items[5]));
+    GS.Ctm := MatMul(m, GS.Ctm);
+  end;
+  SetLength(Active, Length(Active) + 1);
+  Active[Length(Active) - 1] := sub;
+  EndRun;
+  RunContent(data, xr, Depth + 1);
+  EndRun;
+  SetLength(Active, Length(Active) - 1);
+  GS := saveGS;
+  Tm := saveTm;
+  Tlm := saveTlm;
+end;
+
+{ a number at I of S (its characters are the token), and past it; False
+  when the token is no number }
+function NumberAt(const S: string; var I: Integer; E: Integer; var V: Double): Boolean;
+var
+  j, c, digits, fdig: Integer;
+  neg, point: Boolean;
+  v1, scale: Double;
+begin
+  Result := False;
+  j := I;
+  neg := False;
+  while (j <= E) and ((Ord(S[j]) = 43) or (Ord(S[j]) = 45)) do
+  begin
+    if Ord(S[j]) = 45 then
+      neg := True;
+    j := j + 1;
+  end;
+  digits := 0;
+  point := False;
+  v1 := 0;
+  scale := 1;
+  fdig := 0;
+  while j <= E do
+  begin
+    c := Ord(S[j]);
+    if (c >= 48) and (c <= 57) then
+    begin
+      digits := digits + 1;
+      if point then
+      begin
+        fdig := fdig + 1;
+        if fdig <= 18 then
+        begin
+          scale := scale * 10;
+          v1 := v1 * 10 + (c - 48);
+        end;
+      end
+      else
+        v1 := v1 * 10 + (c - 48);
+    end
+    else if (c = 46) and not point then
+      point := True
+    else if CCls[c] = 0 then
+      Exit
+    else
+      Break;
+    j := j + 1;
+  end;
+  if digits = 0 then
+    Exit;
+  V := v1 / scale;
+  if neg then
+    V := -V;
+  I := j;
+  Result := True;
+end;
+
+{ past the dictionary that starts at I (<<), strings and nested
+  dictionaries and all }
+procedure SkipDictAt(const S: string; var I: Integer; E: Integer);
+var
+  depth, c, d: Integer;
+begin
+  depth := 0;
+  while I <= E do
+  begin
+    c := Ord(S[I]);
+    if (c = 60) and (I < E) and (Ord(S[I + 1]) = 60) then
+    begin
+      depth := depth + 1;
+      I := I + 2;
+    end
+    else if (c = 62) and (I < E) and (Ord(S[I + 1]) = 62) then
+    begin
+      depth := depth - 1;
+      I := I + 2;
+      if depth <= 0 then
+        Exit;
+    end
+    else if c = 40 then
+    begin
+      I := I + 1;
+      d := 1;
+      while (I <= E) and (d > 0) do
+      begin
+        c := Ord(S[I]);
+        if c = 92 then
+          I := I + 1
+        else if c = 40 then
+          d := d + 1
+        else if c = 41 then
+          d := d - 1;
+        I := I + 1;
+      end;
+    end
+    else if c = 60 then
+    begin
+      while (I <= E) and (Ord(S[I]) <> 62) do
+        I := I + 1;
+      I := I + 1;
+    end
+    else if c = 37 then
+    begin
+      while (I <= E) and (Ord(S[I]) <> 10) and (Ord(S[I]) <> 13) do
+        I := I + 1;
+    end
+    else
+      I := I + 1;
+  end;
+end;
+
+const
+  opShow = 84 or (106 shl 8);
+  opShowArr = 84 or (74 shl 8);
+  opMove = 84 or (100 shl 8);
+  opMoveLead = 84 or (68 shl 8);
+  opNextLine = 84 or (42 shl 8);
+  opSetTm = 84 or (109 shl 8);
+  opSetFont = 84 or (102 shl 8);
+  opSetTc = 84 or (99 shl 8);
+  opSetTw = 84 or (119 shl 8);
+  opSetTz = 84 or (122 shl 8);
+  opSetLead = 84 or (76 shl 8);
+  opSetRise = 84 or (115 shl 8);
+  opSetMode = 84 or (114 shl 8);
+  opBT = 66 or (84 shl 8);
+  opET = 69 or (84 shl 8);
+  opConcat = 99 or (109 shl 8);
+  opXObj = 68 or (111 shl 8);
+  opInline = 66 or (73 shl 8);
+  opSave = 113;
+  opRestore = 81;
+  opQuote = 39;
+  opDQuote = 34;
+
+procedure TPdfExtractor.RunContent(const Data: string; Res: TPdfObj; Depth: Integer);
+var
+  i, e, n, c, j, k, len, code, a, ne0, pool0: Integer;
+  v, adj: Double;
+  s: string;
+  lx: TPdfLex;
+  o: TPdfObj;
+  m: TPdfMat;
+  found, complex: Boolean;
+
+  procedure Grow;
+  begin
+    if n >= Length(OKind) then
+    begin
+      SetLength(OKind, (n + 8) * 2);
+      SetLength(ONum, (n + 8) * 2);
+      SetLength(OPS, (n + 8) * 2);
+      SetLength(OPN, (n + 8) * 2);
+      SetLength(OObj, (n + 8) * 2);
+    end;
+  end;
+
+  procedure GrowE;
+  begin
+    if NE >= Length(EKind) then
+    begin
+      SetLength(EKind, (NE + 16) * 2);
+      SetLength(ENum, (NE + 16) * 2);
+      SetLength(EPS, (NE + 16) * 2);
+      SetLength(EPN, (NE + 16) * 2);
+    end;
+  end;
+
+begin
+  e := Length(Data);
+  i := 1;
+  n := 0;
+  NE := 0;
+  PoolN := 0;
+  lx := nil;
+  try
+    while i <= e do
+    begin
+      c := Ord(Data[i]);
+      if CCls[c] = 1 then
+      begin
+        i := i + 1;
+        Continue;
+      end;
+      if c = 37 then
+      begin
+        while (i <= e) and (Ord(Data[i]) <> 10) and (Ord(Data[i]) <> 13) do
+          i := i + 1;
+        Continue;
+      end;
+      if n >= MaxOperands then
+        n := 0;
+      if ((c >= 48) and (c <= 57)) or (c = 43) or (c = 45) or (c = 46) then
+      begin
+        if NumberAt(Data, i, e, v) then
+        begin
+          Grow;
+          OKind[n] := 1;
+          ONum[n] := v;
+          n := n + 1;
+          Continue;
+        end;
+      end
+      else if c = 47 then
+      begin
+        i := i + 1;
+        j := i;
+        while (j <= e) and (CCls[Ord(Data[j])] = 0) do
+          j := j + 1;
+        Grow;
+        OKind[n] := 2;
+        OPS[n] := i;
+        OPN[n] := j - i;
+        i := j;
+        n := n + 1;
+        Continue;
+      end
+      else if c = 40 then
+      begin
+        i := i + 1;
+        Grow;
+        OKind[n] := 3;
+        OPS[n] := PoolN + 1;
+        LitInto(Data, i, e, Pool, PoolN);
+        OPN[n] := PoolN - OPS[n] + 1;
+        n := n + 1;
+        Continue;
+      end
+      else if c = 60 then
+      begin
+        if (i < e) and (Ord(Data[i + 1]) = 60) then
+        begin
+          { a dictionary (the properties of marked content): left out }
+          SkipDictAt(Data, i, e);
+          Grow;
+          OKind[n] := 5;
+          OObj[n] := nil;
+          n := n + 1;
+        end
+        else
+        begin
+          i := i + 1;
+          Grow;
+          OKind[n] := 3;
+          OPS[n] := PoolN + 1;
+          HexInto(Data, i, e, Pool, PoolN);
+          OPN[n] := PoolN - OPS[n] + 1;
+          n := n + 1;
+        end;
+        Continue;
+      end
+      else if c = 91 then
+      begin
+        { an array of numbers, strings and names in the pool; anything else in
+          it, and the lexer reads the whole array }
+        j := i + 1;
+        ne0 := NE;
+        pool0 := PoolN;
+        complex := False;
+        while True do
+        begin
+          while (j <= e) and (CCls[Ord(Data[j])] = 1) do
+            j := j + 1;
+          if j > e then
+          begin
+            complex := True;
+            Break;
+          end;
+          c := Ord(Data[j]);
+          if c = 93 then
+          begin
+            j := j + 1;
+            Break;
+          end;
+          GrowE;
+          if ((c >= 48) and (c <= 57)) or (c = 43) or (c = 45) or (c = 46) then
+          begin
+            if NumberAt(Data, j, e, v) then
+            begin
+              EKind[NE] := 1;
+              ENum[NE] := v;
+              NE := NE + 1;
+            end
+            else
+            begin
+              complex := True;
+              Break;
+            end;
+          end
+          else if c = 40 then
+          begin
+            j := j + 1;
+            EKind[NE] := 3;
+            EPS[NE] := PoolN + 1;
+            LitInto(Data, j, e, Pool, PoolN);
+            EPN[NE] := PoolN - EPS[NE] + 1;
+            NE := NE + 1;
+          end
+          else if (c = 60) and ((j = e) or (Ord(Data[j + 1]) <> 60)) then
+          begin
+            j := j + 1;
+            EKind[NE] := 3;
+            EPS[NE] := PoolN + 1;
+            HexInto(Data, j, e, Pool, PoolN);
+            EPN[NE] := PoolN - EPS[NE] + 1;
+            NE := NE + 1;
+          end
+          else if c = 47 then
+          begin
+            j := j + 1;
+            EKind[NE] := 2;
+            while (j <= e) and (CCls[Ord(Data[j])] = 0) do
+              j := j + 1;
+            NE := NE + 1;
+          end
+          else
+          begin
+            complex := True;
+            Break;
+          end;
+        end;
+        Grow;
+        if not complex then
+        begin
+          OKind[n] := 4;
+          OPS[n] := ne0;
+          OPN[n] := NE - ne0;
+          i := j;
+        end
+        else
+        begin
+          NE := ne0;
+          PoolN := pool0;
+          if lx = nil then
+          begin
+            lx := TPdfLex.Create(Data, 1, e);
+            lx.Refs := False;
+          end;
+          lx.P := i;
+          lx.Next;
+          o := lx.ParseObject(0);
+          i := lx.P;
+          OKind[n] := 5;
+          OObj[n] := o;
+        end;
+        n := n + 1;
+        Continue;
+      end
+      else if (c = 93) or (c = 62) or (c = 41) or (c = 123) or (c = 125) then
+      begin
+        i := i + 1;
+        Continue;
+      end;
+      { an operator (or true, false, null) }
+      j := i;
+      while (j <= e) and (CCls[Ord(Data[j])] = 0) do
+        j := j + 1;
+      len := j - i;
+      code := 0;
+      if len <= 3 then
+      begin
+        code := Ord(Data[i]);
+        if len >= 2 then
+          code := code or (Ord(Data[i + 1]) shl 8);
+        if len >= 3 then
+          code := code or (Ord(Data[i + 2]) shl 16);
+      end;
+      if (len = 4) and (Copy(Data, i, 4) = 'true') or (len = 4) and (Copy(Data, i, 4) = 'null') or (len = 5) and (Copy(Data, i, 5) = 'false') then
+      begin
+        i := j;
+        Grow;
+        OKind[n] := 5;
+        OObj[n] := nil;
+        n := n + 1;
+        Continue;
+      end;
+      i := j;
+      if len = 1 then
+      begin
+        if code = opSave then
+        begin
+          EndRun;
+          if NStack < MaxGStack then
+          begin
+            if NStack >= Length(Stack) then
+              SetLength(Stack, (NStack + 8) * 2);
+            Stack[NStack] := GS;
+            NStack := NStack + 1;
+          end;
+        end
+        else if code = opRestore then
+        begin
+          EndRun;
+          if NStack > 0 then
+          begin
+            NStack := NStack - 1;
+            GS := Stack[NStack];
+          end;
+        end
+        else if code = opQuote then
+        begin
+          EndRun;
+          NextLine(0, -GS.Tl);
+          if (n >= 1) and (OKind[n - 1] = 3) then
+            Show(Pool, OPS[n - 1], OPN[n - 1]);
+          EndRun;
+        end
+        else if code = opDQuote then
+        begin
+          EndRun;
+          if (n >= 3) and (OKind[n - 3] = 1) and (OKind[n - 2] = 1) then
+          begin
+            GS.Tw := ONum[n - 3];
+            GS.Tc := ONum[n - 2];
+          end;
+          NextLine(0, -GS.Tl);
+          if (n >= 1) and (OKind[n - 1] = 3) then
+            Show(Pool, OPS[n - 1], OPN[n - 1]);
+          EndRun;
+        end;
+      end
+      else if len = 2 then
+      begin
+        if code = opShow then
+        begin
+          if (n >= 1) and (OKind[n - 1] = 3) then
+            Show(Pool, OPS[n - 1], OPN[n - 1]);
+        end
+        else if code = opShowArr then
+        begin
+          if (n >= 1) and (OKind[n - 1] = 4) then
+          begin
+            for k := OPS[n - 1] to OPS[n - 1] + OPN[n - 1] - 1 do
+            begin
+              if EKind[k] = 3 then
+                Show(Pool, EPS[k], EPN[k])
+              else if EKind[k] = 1 then
+              begin
+                adj := ENum[k];
+                if (adj <= -TjSpace) and RunOpen and (SB.ByteLength > 0) then
+                  SB.AddChar(' ');
+                if (GS.Font <> nil) and GS.Font.Vertical then
+                  Tm := MatMul(MatTrans(0, -adj / 1000.0 * GS.Tfs), Tm)
+                else
+                  Tm := MatMul(MatTrans(-adj / 1000.0 * GS.Tfs * GS.Th, 0), Tm);
+              end;
+            end;
+            EndRun;
+          end
+          else if (n >= 1) and (OKind[n - 1] = 5) and (OObj[n - 1] <> nil) and (OObj[n - 1].Kind = pdfArray) then
+          begin
+            for k := 0 to Length(OObj[n - 1].Items) - 1 do
+            begin
+              o := OObj[n - 1].Items[k];
+              if o.Kind = pdfString then
+                Show(o.SVal, 1, Length(o.SVal))
+              else if (o.Kind = pdfInt) or (o.Kind = pdfReal) then
+              begin
+                adj := NumOf(o);
+                if (adj <= -TjSpace) and RunOpen and (SB.ByteLength > 0) then
+                  SB.AddChar(' ');
+                if (GS.Font <> nil) and GS.Font.Vertical then
+                  Tm := MatMul(MatTrans(0, -adj / 1000.0 * GS.Tfs), Tm)
+                else
+                  Tm := MatMul(MatTrans(-adj / 1000.0 * GS.Tfs * GS.Th, 0), Tm);
+              end;
+            end;
+            EndRun;
+          end;
+        end
+        else if code = opMove then
+        begin
+          EndRun;
+          if (n >= 2) and (OKind[n - 2] = 1) and (OKind[n - 1] = 1) then
+            NextLine(ONum[n - 2], ONum[n - 1]);
+        end
+        else if code = opMoveLead then
+        begin
+          EndRun;
+          if (n >= 2) and (OKind[n - 2] = 1) and (OKind[n - 1] = 1) then
+          begin
+            GS.Tl := -ONum[n - 1];
+            NextLine(ONum[n - 2], ONum[n - 1]);
+          end;
+        end
+        else if code = opNextLine then
+        begin
+          EndRun;
+          NextLine(0, -GS.Tl);
+        end
+        else if code = opSetTm then
+        begin
+          EndRun;
+          if n >= 6 then
+          begin
+            Tm.A := ONum[n - 6];
+            Tm.B := ONum[n - 5];
+            Tm.C := ONum[n - 4];
+            Tm.D := ONum[n - 3];
+            Tm.E := ONum[n - 2];
+            Tm.F := ONum[n - 1];
+            Tlm := Tm;
+          end;
+        end
+        else if code = opSetFont then
+        begin
+          if n >= 2 then
+          begin
+            if OKind[n - 2] = 2 then
+            begin
+              k := OPS[n - 2];
+              GS.Font := FontFor(Res, NameAt(Data, k, e));
+            end;
+            if OKind[n - 1] = 1 then
+              GS.Tfs := ONum[n - 1];
+          end;
+        end
+        else if code = opSetTc then
+        begin
+          if (n >= 1) and (OKind[n - 1] = 1) then
+            GS.Tc := ONum[n - 1];
+        end
+        else if code = opSetTw then
+        begin
+          if (n >= 1) and (OKind[n - 1] = 1) then
+            GS.Tw := ONum[n - 1];
+        end
+        else if code = opSetTz then
+        begin
+          if (n >= 1) and (OKind[n - 1] = 1) then
+            GS.Th := ONum[n - 1] / 100.0;
+        end
+        else if code = opSetLead then
+        begin
+          if (n >= 1) and (OKind[n - 1] = 1) then
+            GS.Tl := ONum[n - 1];
+        end
+        else if code = opSetRise then
+        begin
+          if (n >= 1) and (OKind[n - 1] = 1) then
+            GS.Ts := ONum[n - 1];
+        end
+        else if code = opSetMode then
+        begin
+          if (n >= 1) and (OKind[n - 1] = 1) then
+            GS.Tr := SafeTrunc(ONum[n - 1]);
+        end
+        else if code = opBT then
+        begin
+          EndRun;
+          Tm := MatIdent;
+          Tlm := MatIdent;
+        end
+        else if code = opET then
+          EndRun
+        else if code = opConcat then
+        begin
+          if n >= 6 then
+          begin
+            m.A := ONum[n - 6];
+            m.B := ONum[n - 5];
+            m.C := ONum[n - 4];
+            m.D := ONum[n - 3];
+            m.E := ONum[n - 2];
+            m.F := ONum[n - 1];
+            EndRun;
+            GS.Ctm := MatMul(m, GS.Ctm);
+          end;
+        end
+        else if code = opXObj then
+        begin
+          if (n >= 1) and (OKind[n - 1] = 2) then
+          begin
+            k := OPS[n - 1];
+            s := NameAt(Data, k, e);
+            n := 0;
+            NE := 0;
+            PoolN := 0;
+            DoXObject(Res, s, Depth);
+          end;
+        end
+        else if code = opInline then
+        begin
+          { an inline image: its dictionary, then ID and the data up to a
+            lone EI }
+          a := Pos('ID', Data, i);
+          while (a > 0) and not ((CCls[Ord(Data[a - 1])] <> 0) and ((a + 2 > e) or (CCls[Ord(Data[a + 2])] <> 0))) do
+            a := Pos('ID', Data, a + 2);
+          if a = 0 then
+            i := e + 1
+          else
+          begin
+            j := a + 3;
+            found := False;
+            while j + 1 <= e do
+            begin
+              if (Data[j] = 'E') and (Data[j + 1] = 'I') and (CCls[Ord(Data[j - 1])] = 1) and ((j + 2 > e) or (CCls[Ord(Data[j + 2])] = 1)) then
+              begin
+                { what follows must read as content: no byte past 127 in
+                  the next ten }
+                found := True;
+                for k := j + 2 to j + 12 do
+                  if (k <= e) and (Ord(Data[k]) > 127) then
+                    found := False;
+                if found then
+                  Break;
+              end;
+              j := j + 1;
+            end;
+            if found then
+              i := j + 2
+            else
+              i := e + 1;
+          end;
+        end;
+      end;
+      n := 0;
+      NE := 0;
+      PoolN := 0;
+    end;
+  except
+    on Er: EPdfError do
+      Doc.AddWarning('a content stream is damaged: ' + Er.Message);
+  end;
+  EndRun;
+end;
+
+procedure TPdfExtractor.PageContent(Page: TPdfObj);
+var
+  c, r, s: TPdfObj;
+  data, one: string;
+  i: Integer;
+begin
+  r := Doc.Dict(Page, 'Resources');
+  c := Doc.Dict(Page, 'Contents');
+  if c = nil then
+    Exit;
+  data := '';
+  try
+    if c.Kind = pdfStream then
+      data := Doc.StreamData(c)
+    else if c.Kind = pdfArray then
+    begin
+      for i := 0 to Length(c.Items) - 1 do
+      begin
+        s := Doc.Resolve(c.Items[i]);
+        if (s <> nil) and (s.Kind = pdfStream) then
+        begin
+          try
+            one := Doc.StreamData(s);
+          except
+            on E: EPdfError do
+            begin
+              Doc.AddWarning('a content stream could not be read: ' + E.Message);
+              one := '';
+            end;
+          end;
+          data := data + one + #10;
+        end;
+      end;
+    end;
+  except
+    on E: EPdfError do
+    begin
+      Doc.AddWarning('a content stream could not be read: ' + E.Message);
+      Exit;
+    end;
+  end;
+  RunContent(data, r, 0);
+end;
+
+{ ---- from runs to text ---- }
+
+{ the text of the runs in the order they were shown }
+function RenderRaw(var L: TPdfRunList): string;
+var
+  sb: TStringBuilder;
+  i: Integer;
+  p, r: TPdfRun;
+  dx, dy, len, u, v, fs: Double;
+begin
+  sb := TStringBuilder.Create(1024);
+  try
+    for i := 0 to L.N - 1 do
+    begin
+      r := L.Items[i];
+      if i > 0 then
+      begin
+        p := L.Items[i - 1];
+        dx := p.X1 - p.X0;
+        dy := p.Y1 - p.Y0;
+        len := Sqrt(dx * dx + dy * dy);
+        if len < 0.0001 then
+        begin
+          dx := 1;
+          dy := 0;
+          len := 1;
+        end;
+        dx := dx / len;
+        dy := dy / len;
+        fs := p.FS;
+        if (r.FS > 0) and ((fs <= 0) or (r.FS < fs)) then
+          fs := r.FS;
+        if fs <= 0 then
+          fs := 1;
+        u := (r.X0 - p.X1) * dx + (r.Y0 - p.Y1) * dy;
+        v := Abs((r.X0 - p.X1) * dy - (r.Y0 - p.Y1) * dx);
+        if v > 0.5 * fs then
+          sb.AddChar(#10)
+        else if (u > SpaceGap * fs) or (u < -fs) then
+        begin
+          if (sb.ByteLength > 0) and (r.Text <> '') and (r.Text[1] <> ' ') then
+            sb.AddChar(' ');
+        end;
+      end;
+      sb.AddText(r.Text);
+    end;
+    Result := sb.ToString;
+  finally
+    sb.Free;
+  end;
+end;
+
+{ the text of the runs by lines: from the top of the page down, each line
+  from left to right }
+function RenderLines(var L: TPdfRunList): string;
+var
+  sb: TStringBuilder;
+  ky, kx: array of Integer;
+  n, i, j, g, a, k: Integer;
+  ord1, ord2: array of Integer;
+  r, p: TPdfRun;
+  lineY, lineFS, fs, u: Double;
+  nh: Integer;
+  hidx: array of Integer;
+  rest: TPdfRunList;
+begin
+  n := L.N;
+  { the horizontal runs go by lines; the others keep the order of the
+    content stream, after them }
+  nh := 0;
+  SetLength(hidx, n);
+  rest.N := 0;
+  for i := 0 to n - 1 do
+  begin
+    r := L.Items[i];
+    if Abs(r.Y1 - r.Y0) <= 0.2 * Abs(r.X1 - r.X0) + 0.0001 then
+    begin
+      hidx[nh] := i;
+      nh := nh + 1;
+    end
+    else
+    begin
+      if rest.N >= Length(rest.Items) then
+        SetLength(rest.Items, (rest.N + 8) * 2);
+      rest.Items[rest.N] := r;
+      rest.N := rest.N + 1;
+    end;
+  end;
+  sb := TStringBuilder.Create(1024);
+  try
+    if nh > 0 then
+    begin
+      SetLength(ky, nh);
+      for i := 0 to nh - 1 do
+        ky[i] := -SafeTrunc(L.Items[hidx[i]].Y0 * 8);
+      ord1 := SortedOrder(ky, nh);
+      { lines: a run joins the line when its baseline is within 0.4 of
+        the smaller size from the first run of the line }
+      i := 0;
+      while i < nh do
+      begin
+        r := L.Items[hidx[ord1[i]]];
+        lineY := r.Y0;
+        lineFS := r.FS;
+        j := i + 1;
+        while j < nh do
+        begin
+          p := L.Items[hidx[ord1[j]]];
+          fs := lineFS;
+          if (p.FS > 0) and ((fs <= 0) or (p.FS < fs)) then
+            fs := p.FS;
+          if fs <= 0 then
+            fs := 1;
+          if Abs(p.Y0 - lineY) > 0.4 * fs then
+            Break;
+          j := j + 1;
+        end;
+        { the runs i to j - 1 are one line; from left to right }
+        k := j - i;
+        SetLength(kx, k);
+        for g := 0 to k - 1 do
+          kx[g] := SafeTrunc(L.Items[hidx[ord1[i + g]]].X0 * 8);
+        ord2 := SortedOrder(kx, k);
+        if sb.ByteLength > 0 then
+          sb.AddChar(#10);
+        for g := 0 to k - 1 do
+        begin
+          r := L.Items[hidx[ord1[i + ord2[g]]]];
+          if g > 0 then
+          begin
+            p := L.Items[hidx[ord1[i + ord2[g - 1]]]];
+            fs := p.FS;
+            if (r.FS > 0) and ((fs <= 0) or (r.FS < fs)) then
+              fs := r.FS;
+            if fs <= 0 then
+              fs := 1;
+            u := r.X0 - p.X1;
+            if (u > SpaceGap * fs) or (u < -fs) then
+              if (r.Text <> '') and (r.Text[1] <> ' ') and (sb.ByteLength > 0) then
+                sb.AddChar(' ');
+          end;
+          sb.AddText(r.Text);
+        end;
+        i := j;
+      end;
+    end;
+    if rest.N > 0 then
+    begin
+      if sb.ByteLength > 0 then
+        sb.AddChar(#10);
+      sb.AddText(RenderRaw(rest));
+    end;
+    Result := sb.ToString;
+  finally
+    sb.Free;
+  end;
+end;
+
+procedure RunsOfPage(Doc: TPdfDoc; Ext: TPdfExtractor; Page: TPdfObj);
+begin
+  Ext.ResetPage;
+  Ext.PageContent(Page);
+end;
+
+{ the extractor of the document, made once: its fonts are read once }
+function ExtractorOf(Doc: TPdfDoc; var Slot: TObject): TPdfExtractor;
+begin
+  if Slot = nil then
+    Slot := TPdfExtractor.Create(Doc);
+  Result := Slot as TPdfExtractor;
+end;
+
+function TPdfDoc.PageText(I: Integer): string;
+var
+  ext: TPdfExtractor;
+begin
+  ext := ExtractorOf(Self, FExt);
+  RunsOfPage(Self, ext, PageObject(I));
+  Result := RenderLines(ext.Runs);
+end;
+
+function TPdfDoc.PageTextRaw(I: Integer): string;
+var
+  ext: TPdfExtractor;
+begin
+  ext := ExtractorOf(Self, FExt);
+  RunsOfPage(Self, ext, PageObject(I));
+  Result := RenderRaw(ext.Runs);
+end;
+
+function TPdfDoc.Text: string;
+var
+  ext: TPdfExtractor;
+  sb: TStringBuilder;
+  i: Integer;
+begin
+  ext := ExtractorOf(Self, FExt);
+  sb := TStringBuilder.Create(4096);
+  try
+    for i := 0 to PageCount - 1 do
+    begin
+      RunsOfPage(Self, ext, PageObject(i));
+      sb.AddText(RenderLines(ext.Runs));
+      sb.AddChar(#10);
+      sb.AddChar(#12);
+    end;
+    Result := sb.ToString;
+  finally
+    sb.Free;
+  end;
+end;
+
+function PdfText(const Data: string): string;
+var
+  d: TPdfDoc;
+begin
+  d := TPdfDoc.Create(Data);
+  Result := d.Text;
+end;
+
+function TPdfDoc.Info(const Key: string): string;
+var
+  inf, v: TPdfObj;
+  s: string;
+  i, u: Integer;
+begin
+  Result := '';
+  inf := TrailerEntry('Info');
+  if (inf = nil) or (inf.Kind <> pdfDict) then
+    Exit;
+  v := Dict(inf, Key);
+  if (v = nil) or (v.Kind <> pdfString) then
+    Exit;
+  s := v.SVal;
+  if (Length(s) >= 2) and (Ord(s[1]) = $FE) and (Ord(s[2]) = $FF) then
+    Result := Utf16ToUtf8(Copy(s, 3, Length(s)))
+  else if (Length(s) >= 3) and (Ord(s[1]) = $EF) and (Ord(s[2]) = $BB) and (Ord(s[3]) = $BF) then
+    Result := Copy(s, 4, Length(s))
+  else
+    for i := 1 to Length(s) do
+    begin
+      u := PdfEncodingRune(pePdfDoc, Ord(s[i]));
+      if u < 0 then
+        u := $FFFD;
+      Result := Result + PdfRuneToUtf8(u);
+    end;
+end;
+
+end.
