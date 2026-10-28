@@ -1,0 +1,1893 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+
+  paslang is free software: you can redistribute it and/or modify it
+  under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+
+  paslang is distributed in the hope that it will be useful, but
+  WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+  General Public License for more details.
+
+  Under Section 7 of GPL version 3, you are granted additional
+  permissions described in the paslang Runtime Library Exception,
+  version 1.0, in the file COPYING.RUNTIME.
+
+  You should have received a copy of the GNU General Public License
+  along with paslang.  If not, see <https://www.gnu.org/licenses/>. }
+
+{ PDF forms filled and text laid over a page (P437).
+
+  TPdfEditor opens a PDF file held in a string with paspdf, fills the fields
+  of its AcroForm (ISO 32000-1 12.7), writes text over its pages in the
+  standard 14 fonts, and Save gives the file back with the changes added as
+  an incremental update (7.5.6): every byte of the original stays where it
+  was, so the signatures that cover it stay valid, and what changed is
+  the objects appended after it with a new cross-reference section that
+  points back to the old.
+
+  Fields. They are found by their fully qualified name (parent.child, 12.7.3.2).
+  A text field and a combo box take a text, which is UTF-8 here and is
+  written as the file wants it (PDFDocEncoding if the text fits it, UTF-16BE
+  if not); a check box takes a Boolean, a radio button field a state
+  name (the Opt export values are read), a choice field a text or an item.
+  The appearance of each widget of the field is made again, as 12.7.3.3
+  describes it: the default appearance DA gives the font, its size (a size
+  of 0 is fitted to the widget) and the colour; the quadding Q the
+  alignment; a Multiline field is wrapped to the width of the widget, a Comb
+  field is divided into MaxLen cells; the part of the existing appearance
+  stream that is not the text (the background and border a designer drew) is
+  kept, and the text goes between /Tx BMC and EMC as the standard says. The
+  widths of the standard 14 fonts are Adobe's (paspdfafm); the widths of
+  another simple font are its Widths array. A field whose font cannot be
+  measured or encoded gets the value and the flag NeedAppearances, which asks
+  a viewer to make the appearance.
+
+  Text over a page. DrawText puts a line of text at a point of a page in one
+  of the 14 fonts, in a colour, left, centred or right of the point: the
+  page's content is wrapped in q and Q so that whatever state it leaves does
+  not move the text, the new content is appended, and the font is added
+  to the page's resources.
+
+  Not done: encrypted files (paspdf refuses them), files whose table had to be
+  rebuilt (the update would point back to a table that is not there), XFA
+  forms unless DropXfa is set, fields of Type0 fonts (they get NeedAppearances),
+  signing. JavaScript in a form is neither run nor removed.
+
+  A TPdfEditor belongs to the routine that uses it, as a TPdfDoc does. }
+unit paspdfform;
+
+interface
+
+uses
+  sysutils, paspdfenc, paspdfafm, paspdf;
+
+const
+  { the kinds of a field }
+  ftNone = 0;
+  ftText = 1;
+  ftCheck = 2;
+  ftRadio = 3;
+  ftPush = 4;
+  ftCombo = 5;
+  ftList = 6;
+  ftSignature = 7;
+
+  { where DrawText puts the text in relation to its point }
+  taLeft = 0;
+  taCenter = 1;
+  taRight = 2;
+
+type
+  EPdfFormError = class(Exception)
+  end;
+
+  { one field of the form: its fully qualified name in UTF-8, its kind, its
+    flags (Ff, inherited), its terminal dictionary and the widgets that show
+    it (the dictionary itself when the widget is merged into it) }
+  TPdfField = class
+  public
+    Name: string;
+    Kind: Integer;
+    Flags: Integer;
+    Obj: TPdfObj;
+    Widgets: array of TPdfObj;
+  end;
+
+  TPdfEditor = class
+  private
+    FDoc: TPdfDoc;
+    FFields: array of TPdfField;
+    FLoaded: Boolean;
+    FAcro: TPdfObj;
+    FDirty: array of TPdfObj;
+    FNew: array of TPdfObj;
+    FNewData: array of string;
+    FNewNum: array of Integer;
+    FNext: Integer;
+    FNeedApp: Boolean;
+    FDropXfa: Boolean;
+    FStdFont: array[0..13] of Integer;
+    FInfos: array of TObject;
+    FWrapped: array of TPdfObj;
+    FQObj: Integer;
+    FQEndObj: Integer;
+    FCatalog: TPdfObj;
+    FVisits: Integer;
+    procedure Fail(const Msg: string);
+    procedure LoadFields;
+    procedure WalkField(Node: TPdfObj; const Prefix: string; Depth: Integer);
+    procedure Touch(O: TPdfObj);
+    function NewObject(O: TPdfObj; const Data: string): Integer;
+    function Inh(F: TPdfObj; const Key: string): TPdfObj;
+    function FindOn(F: TPdfField; const Key: string): TPdfObj;
+    procedure SetFieldValue(F: TPdfField; V: TPdfObj);
+    function WidgetBox(W: TPdfObj; var Wd, Ht: Double): Boolean;
+    function AcroEntry(const Key: string): TPdfObj;
+    procedure MakeTextAppearance(F: TPdfField; W: TPdfObj; const Value: string);
+    procedure MakeListAppearance(F: TPdfField; W: TPdfObj; const Value: string);
+    procedure MakeButtonAppearance(W: TPdfObj; const OnName: string; Radio: Boolean);
+    procedure SetAppearance(W: TPdfObj; Wd, Ht: Double; Res: TPdfObj; const Content: string);
+    function OnStateOf(W: TPdfObj): string;
+    function StdFontObject(Std: Integer): Integer;
+    function PageFontName(Page: TPdfObj; Std: Integer): string;
+    function WrapPage(Page: TPdfObj): Integer;
+  public
+    constructor Create(const AData: string);
+    property Doc: TPdfDoc read FDoc;
+    { the fields of the form, none when the file has no AcroForm }
+    function FieldCount: Integer;
+    function Field(I: Integer): TPdfField;
+    function FindField(const AName: string): TPdfField;
+    { a field's value as text: a text field's, a button's state name (Off for
+      a check box that is off), a choice field's first selected item }
+    function FieldValue(F: TPdfField): string;
+    { whether a check box or a radio button field has a state other than Off }
+    function IsChecked(F: TPdfField): Boolean;
+    { the on state of a check box or the states of a radio button field's
+      widgets, as the appearance dictionaries and Opt have them }
+    function StateCount(F: TPdfField): Integer;
+    function StateName(F: TPdfField; I: Integer): string;
+    function OptionCount(F: TPdfField): Integer;
+    function OptionExport(F: TPdfField; I: Integer): string;
+    function OptionLabel(F: TPdfField; I: Integer): string;
+    procedure SetText(F: TPdfField; const Value: string);
+    procedure SetChecked(F: TPdfField; AValue: Boolean);
+    procedure SetState(F: TPdfField; const State: string);
+    procedure SetChoice(F: TPdfField; const Value: string);
+    { the standard fonts' name for DrawText; TextWidth is a text's width in
+      points }
+    function TextWidth(const Text: string; const FontName: string; Size: Double): Double;
+    { Text at (X, Y) of page Page (from 0), Y from the bottom, in the font
+      FontName (one of the 14, or Arial, Times New Roman, Courier New), Size
+      points, colour R G B (0 to 1), Align the side of the point the text
+      is on; the text is UTF-8 and what the font's WinAnsi encoding lacks
+      is left out }
+    procedure DrawText(Page: Integer; X, Y: Double; const Text, FontName: string; Size, R, G, B: Double; Align: Integer);
+    { ask a viewer to build every appearance when it opens the file }
+    property NeedAppearances: Boolean read FNeedApp write FNeedApp;
+    { remove the XFA entry of the AcroForm, so that a viewer shows the fields
+      and not the dynamic form (it is off by default) }
+    property DropXfa: Boolean read FDropXfa write FDropXfa;
+    { the file with the changes appended; the original's bytes untouched }
+    function Save: string;
+  end;
+
+implementation
+
+function IsSp(C: Integer): Boolean;
+begin
+  Result := (C = 32) or (C = 10) or (C = 13) or (C = 9) or (C = 12) or (C = 0);
+end;
+
+const
+  MaxFields = 200000;
+  MaxFieldNodes = 1000000;
+
+procedure TPdfEditor.Fail(const Msg: string);
+begin
+  raise EPdfFormError.Create('pdfform: ' + Msg);
+end;
+
+constructor TPdfEditor.Create(const AData: string);
+begin
+  inherited Create;
+  FDoc := TPdfDoc.Create(AData);
+  FNext := FDoc.ObjectLimit;
+  if FNext < 1 then
+    FNext := 1;
+  FQObj := 0;
+  FQEndObj := 0;
+end;
+
+{ the field dictionary's own entry, or its nearest ancestor's }
+function TPdfEditor.Inh(F: TPdfObj; const Key: string): TPdfObj;
+var
+  d: TPdfObj;
+  hops: Integer;
+begin
+  Result := nil;
+  d := F;
+  hops := 0;
+  while (d <> nil) and (d.Kind = pdfDict) and (hops < 32) do
+  begin
+    if d.Get(Key) <> nil then
+    begin
+      Result := FDoc.Resolve(d.Get(Key));
+      Exit;
+    end;
+    d := FDoc.Resolve(d.Get('Parent'));
+    hops := hops + 1;
+  end;
+end;
+
+function TPdfEditor.FindOn(F: TPdfField; const Key: string): TPdfObj;
+var
+  i: Integer;
+begin
+  { the field's, its ancestors', then its widgets' }
+  Result := Inh(F.Obj, Key);
+  if Result <> nil then
+    Exit;
+  for i := 0 to Length(F.Widgets) - 1 do
+    if F.Widgets[i] <> F.Obj then
+    begin
+      Result := Inh(F.Widgets[i], Key);
+      if Result <> nil then
+        Exit;
+    end;
+end;
+
+procedure TPdfEditor.Touch(O: TPdfObj);
+var
+  i: Integer;
+begin
+  if (O = nil) or (O.Num <= 0) then
+    Fail('an object that is part of another cannot be written alone');
+  for i := 0 to Length(FDirty) - 1 do
+    if FDirty[i] = O then
+      Exit;
+  SetLength(FDirty, Length(FDirty) + 1);
+  FDirty[Length(FDirty) - 1] := O;
+end;
+
+function TPdfEditor.NewObject(O: TPdfObj; const Data: string): Integer;
+var
+  n: Integer;
+begin
+  n := Length(FNew);
+  SetLength(FNew, n + 1);
+  SetLength(FNewData, n + 1);
+  SetLength(FNewNum, n + 1);
+  FNew[n] := O;
+  FNewData[n] := Data;
+  FNewNum[n] := FNext;
+  O.Num := FNext;
+  if Data <> '' then
+    O.Kind := pdfStream;
+  FNext := FNext + 1;
+  Result := O.Num;
+end;
+
+{ ---- the fields of the form ---- }
+
+procedure TPdfEditor.WalkField(Node: TPdfObj; const Prefix: string; Depth: Integer);
+var
+  d, kids, kd, t, ft: TPdfObj;
+  i, nw: Integer;
+  name, part: string;
+  parent: Boolean;
+  f: TPdfField;
+  ffv: Integer;
+begin
+  FVisits := FVisits + 1;
+  if (Depth > 32) or (FVisits > MaxFieldNodes) or (Length(FFields) >= MaxFields) then
+    Exit;
+  d := FDoc.Resolve(Node);
+  if (d = nil) or (d.Kind <> pdfDict) then
+    Exit;
+  t := FDoc.Resolve(d.Get('T'));
+  part := '';
+  if (t <> nil) and (t.Kind = pdfString) then
+    part := PdfDecodeText(t.SVal);
+  name := Prefix;
+  if part <> '' then
+  begin
+    if name <> '' then
+      name := name + '.';
+    name := name + part;
+  end;
+  kids := FDoc.Resolve(d.Get('Kids'));
+  parent := False;
+  if (kids <> nil) and (kids.Kind = pdfArray) then
+    for i := 0 to Length(kids.Items) - 1 do
+    begin
+      kd := FDoc.Resolve(kids.Items[i]);
+      if (kd <> nil) and (kd.Kind = pdfDict) and ((kd.Get('T') <> nil) or (kd.Get('Kids') <> nil)) then
+        parent := True;
+    end;
+  if parent then
+  begin
+    for i := 0 to Length(kids.Items) - 1 do
+      WalkField(kids.Items[i], name, Depth + 1);
+    Exit;
+  end;
+  f := TPdfField.Create;
+  f.Name := name;
+  f.Obj := d;
+  ft := Inh(d, 'FT');
+  ffv := FDoc.IntOf(Inh(d, 'Ff'), 0);
+  f.Flags := ffv;
+  f.Kind := ftNone;
+  if (ft <> nil) and (ft.Kind = pdfName) then
+  begin
+    if ft.SVal = 'Tx' then
+      f.Kind := ftText
+    else if ft.SVal = 'Btn' then
+    begin
+      if (ffv and $10000) <> 0 then
+        f.Kind := ftPush
+      else if (ffv and $8000) <> 0 then
+        f.Kind := ftRadio
+      else
+        f.Kind := ftCheck;
+    end
+    else if ft.SVal = 'Ch' then
+    begin
+      if (ffv and $20000) <> 0 then
+        f.Kind := ftCombo
+      else
+        f.Kind := ftList;
+    end
+    else if ft.SVal = 'Sig' then
+      f.Kind := ftSignature;
+  end;
+  nw := 0;
+  if (kids <> nil) and (kids.Kind = pdfArray) then
+  begin
+    for i := 0 to Length(kids.Items) - 1 do
+    begin
+      kd := FDoc.Resolve(kids.Items[i]);
+      if (kd <> nil) and (kd.Kind = pdfDict) then
+      begin
+        SetLength(f.Widgets, nw + 1);
+        f.Widgets[nw] := kd;
+        nw := nw + 1;
+      end;
+    end;
+  end;
+  if nw = 0 then
+  begin
+    SetLength(f.Widgets, 1);
+    f.Widgets[0] := d;
+  end;
+  SetLength(FFields, Length(FFields) + 1);
+  FFields[Length(FFields) - 1] := f;
+end;
+
+procedure TPdfEditor.LoadFields;
+var
+  root, flds: TPdfObj;
+  i: Integer;
+begin
+  if FLoaded then
+    Exit;
+  FLoaded := True;
+  root := FDoc.TrailerEntry('Root');
+  FCatalog := root;
+  if (root = nil) or (root.Kind <> pdfDict) then
+    Exit;
+  FAcro := FDoc.Dict(root, 'AcroForm');
+  if (FAcro = nil) or (FAcro.Kind <> pdfDict) then
+  begin
+    FAcro := nil;
+    Exit;
+  end;
+  flds := FDoc.Dict(FAcro, 'Fields');
+  if (flds <> nil) and (flds.Kind = pdfArray) then
+    for i := 0 to Length(flds.Items) - 1 do
+      WalkField(flds.Items[i], '', 0);
+end;
+
+function TPdfEditor.FieldCount: Integer;
+begin
+  LoadFields;
+  Result := Length(FFields);
+end;
+
+function TPdfEditor.Field(I: Integer): TPdfField;
+begin
+  LoadFields;
+  if (I < 0) or (I >= Length(FFields)) then
+    Fail('no such field');
+  Result := FFields[I];
+end;
+
+function TPdfEditor.FindField(const AName: string): TPdfField;
+var
+  i: Integer;
+begin
+  LoadFields;
+  Result := nil;
+  for i := 0 to Length(FFields) - 1 do
+    if FFields[i].Name = AName then
+    begin
+      Result := FFields[i];
+      Exit;
+    end;
+end;
+
+function TPdfEditor.FieldValue(F: TPdfField): string;
+var
+  v: TPdfObj;
+begin
+  Result := '';
+  v := FindOn(F, 'V');
+  if v = nil then
+  begin
+    if (F.Kind = ftCheck) or (F.Kind = ftRadio) then
+      Result := 'Off';
+    Exit;
+  end;
+  if v.Kind = pdfString then
+    Result := PdfDecodeText(v.SVal)
+  else if v.Kind = pdfName then
+    Result := v.SVal
+  else if v.Kind = pdfStream then
+    Result := FDoc.StreamData(v)
+  else if (v.Kind = pdfArray) and (Length(v.Items) > 0) then
+  begin
+    v := FDoc.Resolve(v.Items[0]);
+    if (v <> nil) and (v.Kind = pdfString) then
+      Result := PdfDecodeText(v.SVal);
+  end;
+end;
+
+function TPdfEditor.IsChecked(F: TPdfField): Boolean;
+var
+  v: string;
+begin
+  v := FieldValue(F);
+  Result := (v <> '') and (v <> 'Off');
+end;
+
+{ ---- the fonts of a form: what a code shows and how wide it is ---- }
+
+type
+  TFontInfo = record
+    Ok: Boolean;
+    Std: Integer;
+    CharOf: array[0..255] of Integer;
+    Width: array[0..255] of Double;
+    Asc: Double;
+    Desc: Double;
+  end;
+
+{ the width, in thousandths, of a character in a standard font }
+function StdRuneWidth(Std, R: Integer): Integer;
+var
+  c, e, w: Integer;
+begin
+  Result := -1;
+  for e := 2 downto 0 do
+    for c := 0 to 255 do
+      if PdfEncodingRune(e, c) = R then
+      begin
+        w := PdfStdWidth(Std, e, c);
+        if w >= 0 then
+        begin
+          Result := w;
+          Exit;
+        end;
+      end;
+end;
+
+procedure LoadFontInfo(Doc: TPdfDoc; Fnt: TPdfObj; var FI: TFontInfo);
+var
+  enc, diffs, widths, desc, o: TPdfObj;
+  i, c, code, first, base: Integer;
+  st, ename, nm: string;
+  g: string;
+  k, p: Integer;
+  mw: Double;
+  haveWidths: Boolean;
+begin
+  FI.Ok := False;
+  FI.Std := -1;
+  FI.Asc := 750;
+  FI.Desc := -250;
+  for i := 0 to 255 do
+  begin
+    FI.CharOf[i] := -1;
+    FI.Width[i] := 0;
+  end;
+  if (Fnt = nil) or (Fnt.Kind <> pdfDict) then
+    Exit;
+  st := Doc.NameOf(Fnt.Get('Subtype'));
+  if (st <> 'Type1') and (st <> 'TrueType') and (st <> 'MMType1') then
+    Exit;
+  nm := Doc.NameOf(Fnt.Get('BaseFont'));
+  FI.Std := PdfStdFont(nm);
+  if (FI.Std = sfSymbol) or (FI.Std = sfZapfDingbats) then
+    Exit;
+  { the base encoding and the Differences }
+  enc := Doc.Dict(Fnt, 'Encoding');
+  ename := '';
+  if (enc <> nil) and (enc.Kind = pdfName) then
+    ename := enc.SVal
+  else if (enc <> nil) and (enc.Kind = pdfDict) then
+    ename := Doc.NameOf(enc.Get('BaseEncoding'));
+  if ename = 'WinAnsiEncoding' then
+    base := peWinAnsi
+  else if ename = 'MacRomanEncoding' then
+    base := peMacRoman
+  else if ename = 'StandardEncoding' then
+    base := peStandard
+  else if st = 'TrueType' then
+    base := peWinAnsi
+  else
+    base := peStandard;
+  for i := 0 to 255 do
+  begin
+    c := PdfEncodingRune(base, i);
+    if (c < 0) and (i >= 32) and (i < 127) then
+      c := i;
+    FI.CharOf[i] := c;
+  end;
+  if (enc <> nil) and (enc.Kind = pdfDict) then
+  begin
+    diffs := Doc.Dict(enc, 'Differences');
+    if (diffs <> nil) and (diffs.Kind = pdfArray) then
+    begin
+      code := 0;
+      for i := 0 to Length(diffs.Items) - 1 do
+      begin
+        o := Doc.Resolve(diffs.Items[i]);
+        if o = nil then
+          Continue;
+        if o.Kind = pdfInt then
+          code := o.IVal
+        else if o.Kind = pdfName then
+        begin
+          if (code >= 0) and (code <= 255) then
+          begin
+            g := PdfGlyphText(o.SVal);
+            if g = '' then
+              FI.CharOf[code] := -1
+            else
+            begin
+              p := 1;
+              FI.CharOf[code] := PdfNextRune(g, p);
+            end;
+          end;
+          code := code + 1;
+        end;
+      end;
+    end;
+  end;
+  { widths }
+  widths := Doc.Dict(Fnt, 'Widths');
+  desc := Doc.Dict(Fnt, 'FontDescriptor');
+  mw := 0;
+  haveWidths := False;
+  if desc <> nil then
+  begin
+    mw := PdfNumber(Doc.Dict(desc, 'MissingWidth'));
+    if Doc.Dict(desc, 'Ascent') <> nil then
+      FI.Asc := PdfNumber(Doc.Dict(desc, 'Ascent'));
+    if Doc.Dict(desc, 'Descent') <> nil then
+      FI.Desc := PdfNumber(Doc.Dict(desc, 'Descent'));
+    if FI.Desc > 0 then
+      FI.Desc := -FI.Desc;
+  end;
+  if (widths <> nil) and (widths.Kind = pdfArray) then
+  begin
+    haveWidths := True;
+    first := Doc.IntOf(Fnt.Get('FirstChar'), 0);
+    for i := 0 to 255 do
+      FI.Width[i] := mw;
+    for i := 0 to Length(widths.Items) - 1 do
+    begin
+      k := first + i;
+      if (k >= 0) and (k <= 255) then
+        FI.Width[k] := PdfNumber(Doc.Resolve(widths.Items[i]));
+    end;
+  end;
+  if FI.Std >= 0 then
+  begin
+    FI.Asc := PdfStdAscender(FI.Std);
+    FI.Desc := PdfStdDescender(FI.Std);
+    if not haveWidths then
+      for i := 0 to 255 do
+        if FI.CharOf[i] >= 0 then
+        begin
+          k := StdRuneWidth(FI.Std, FI.CharOf[i]);
+          if k >= 0 then
+            FI.Width[i] := k
+          else
+            FI.Width[i] := mw;
+        end;
+    haveWidths := True;
+  end;
+  FI.Ok := haveWidths;
+end;
+
+type
+  TFontEntry = class
+  public
+    Src: TPdfObj;
+    Info: TFontInfo;
+  end;
+
+{ the info of a font dictionary, worked out once }
+function CachedInfo(Doc: TPdfDoc; var Cache: array of TObject; Fnt: TPdfObj; var FI: TFontInfo): Boolean;
+var
+  i, n: Integer;
+  e: TFontEntry;
+begin
+  for i := 0 to Length(Cache) - 1 do
+    if (Cache[i] as TFontEntry).Src = Fnt then
+    begin
+      FI := (Cache[i] as TFontEntry).Info;
+      Result := FI.Ok;
+      Exit;
+    end;
+  e := TFontEntry.Create;
+  e.Src := Fnt;
+  LoadFontInfo(Doc, Fnt, e.Info);
+  n := Length(Cache);
+  SetLength(Cache, n + 1);
+  Cache[n] := e;
+  FI := e.Info;
+  Result := FI.Ok;
+end;
+
+{ the codes that show a UTF-8 text in the font; a character the font lacks
+  is left out }
+function EncodeFor(const FI: TFontInfo; const Text: string; Breaks: Boolean): string;
+var
+  i, r, c, k: Integer;
+begin
+  Result := '';
+  i := 1;
+  while i <= Length(Text) do
+  begin
+    r := PdfNextRune(Text, i);
+    c := -1;
+    for k := 32 to 255 do
+      if FI.CharOf[k] = r then
+      begin
+        c := k;
+        Break;
+      end;
+    if (c < 0) and (r = 9) then
+      c := 32;
+    { a line break stays for a field of several lines and is a space in one of one }
+    if (c < 0) and ((r = 10) or (r = 13)) then
+    begin
+      if Breaks then
+        c := r
+      else
+        c := 32;
+    end;
+    if c >= 0 then
+      Result := Result + Chr(c);
+  end;
+end;
+
+function CodesWidth(const FI: TFontInfo; const Codes: string): Double;
+var
+  i: Integer;
+begin
+  Result := 0;
+  for i := 1 to Length(Codes) do
+    Result := Result + FI.Width[Ord(Codes[i])];
+end;
+
+{ a string operand for a content stream }
+function PdfStringOf(const Codes: string): string;
+begin
+  Result := PdfSerialize(PdfStrObj(Codes));
+end;
+
+{ the text of a default appearance string without its Tf: the font name and
+  size are given back, the rest (the colour operators) in Rest }
+procedure SplitDA(const DA: string; var FontName: string; var Size: Double; var Rest: string);
+var
+  toks: array of string;
+  n, i, j, k: Integer;
+  cur: string;
+  neg, dot: Boolean;
+  v, scale: Double;
+  c: Integer;
+begin
+  FontName := '';
+  Size := 0;
+  Rest := '';
+  n := 0;
+  cur := '';
+  for i := 1 to Length(DA) + 1 do
+  begin
+    if (i > Length(DA)) or (IsSp(Ord(DA[i]))) then
+    begin
+      if cur <> '' then
+      begin
+        SetLength(toks, n + 1);
+        toks[n] := cur;
+        n := n + 1;
+        cur := '';
+      end;
+    end
+    else
+      cur := cur + DA[i];
+  end;
+  j := -1;
+  for i := 2 to n - 1 do
+    if toks[i] = 'Tf' then
+      j := i;
+  if j < 0 then
+  begin
+    for i := 0 to n - 1 do
+      Rest := Rest + toks[i] + ' ';
+    Exit;
+  end;
+  FontName := toks[j - 2];
+  if (FontName <> '') and (FontName[1] = '/') then
+    FontName := Copy(FontName, 2, Length(FontName));
+  neg := False;
+  dot := False;
+  v := 0;
+  scale := 1;
+  for k := 1 to Length(toks[j - 1]) do
+  begin
+    c := Ord(toks[j - 1][k]);
+    if c = 45 then
+      neg := True
+    else if c = 46 then
+      dot := True
+    else if (c >= 48) and (c <= 57) then
+    begin
+      if dot then
+      begin
+        scale := scale * 10;
+        v := v + (c - 48) / scale;
+      end
+      else
+        v := v * 10 + (c - 48);
+    end;
+  end;
+  if neg then
+    v := -v;
+  Size := v;
+  for i := 0 to n - 1 do
+    if (i <> j) and (i <> j - 1) and (i <> j - 2) then
+      Rest := Rest + toks[i] + ' ';
+end;
+
+{ a colour as the operators that set it: an array of 1, 3 or 4 numbers;
+  Stroke selects the stroking operators }
+function ColorOps(Doc: TPdfDoc; A: TPdfObj; Stroke: Boolean): string;
+var
+  n, i: Integer;
+  s: string;
+begin
+  Result := '';
+  if (A = nil) or (A.Kind <> pdfArray) then
+    Exit;
+  n := Length(A.Items);
+  s := '';
+  for i := 0 to n - 1 do
+    s := s + PdfNum(PdfNumber(Doc.Resolve(A.Items[i]))) + ' ';
+  if n = 1 then
+  begin
+    if Stroke then Result := s + 'G ' else Result := s + 'g ';
+  end
+  else if n = 3 then
+  begin
+    if Stroke then Result := s + 'RG ' else Result := s + 'rg ';
+  end
+  else if n = 4 then
+  begin
+    if Stroke then Result := s + 'K ' else Result := s + 'k ';
+  end;
+end;
+
+{ ---- appearances ---- }
+
+function TPdfEditor.AcroEntry(const Key: string): TPdfObj;
+begin
+  Result := nil;
+  if FAcro <> nil then
+    Result := FDoc.Dict(FAcro, Key);
+end;
+
+{ the size of a widget's rectangle }
+function TPdfEditor.WidgetBox(W: TPdfObj; var Wd, Ht: Double): Boolean;
+var
+  r: TPdfObj;
+  x1, y1, x2, y2: Double;
+begin
+  Result := False;
+  r := FDoc.Dict(W, 'Rect');
+  if (r = nil) or (r.Kind <> pdfArray) or (Length(r.Items) < 4) then
+    Exit;
+  x1 := PdfNumber(FDoc.Resolve(r.Items[0]));
+  y1 := PdfNumber(FDoc.Resolve(r.Items[1]));
+  x2 := PdfNumber(FDoc.Resolve(r.Items[2]));
+  y2 := PdfNumber(FDoc.Resolve(r.Items[3]));
+  Wd := Abs(x2 - x1);
+  Ht := Abs(y2 - y1);
+  Result := (Wd > 0) and (Ht > 0);
+end;
+
+{ Content as the widget's normal appearance: a form XObject of that size
+  with these resources }
+procedure TPdfEditor.SetAppearance(W: TPdfObj; Wd, Ht: Double; Res: TPdfObj; const Content: string);
+var
+  fm, bb, ap: TPdfObj;
+  n: Integer;
+begin
+  fm := PdfNewDict;
+  PdfSet(fm, 'Type', PdfNameObj('XObject'));
+  PdfSet(fm, 'Subtype', PdfNameObj('Form'));
+  bb := PdfNewArray;
+  PdfAdd(bb, PdfIntObj(0));
+  PdfAdd(bb, PdfIntObj(0));
+  PdfAdd(bb, PdfRealObj(Wd));
+  PdfAdd(bb, PdfRealObj(Ht));
+  PdfSet(fm, 'BBox', bb);
+  PdfSet(fm, 'Resources', Res);
+  n := NewObject(fm, Content);
+  ap := PdfNewDict;
+  PdfSet(ap, 'N', PdfRefObj(n));
+  PdfSet(W, 'AP', ap);
+  Touch(W);
+end;
+
+{ the Tx part of an appearance stream replaced, or the text appended }
+function SpliceTx(const Old, NewTx: string): string;
+var
+  a, b: Integer;
+begin
+  a := Pos('/Tx BMC', Old);
+  if a > 0 then
+  begin
+    b := Pos('EMC', Old, a);
+    if b > 0 then
+    begin
+      Result := Copy(Old, 1, a - 1) + NewTx + Copy(Old, b + 3, Length(Old));
+      Exit;
+    end;
+  end;
+  Result := Old + #10 + NewTx;
+end;
+
+procedure TPdfEditor.MakeTextAppearance(F: TPdfField; W: TPdfObj; const Value: string);
+var
+  wd, ht, fs, bw, padB, tw, x, y, lead, avail, fs0, asc, desc, cw, wtext, lw: Double;
+  mk, bs, brd, da, dr, fnts, fentry, fdict, oldN, oldRes, res, fd, mxl, qv, o: TPdfObj;
+  rest, fname, codes, cont, txt, line, para, wrd, nl, oldData, bgops, bcops, pre, tx: string;
+  fi: TFontInfo;
+  multiline, comb: Boolean;
+  q, maxlen, i, nlines, p1, cut: Integer;
+  lines: array of string;
+  rr: Integer;
+begin
+  if not WidgetBox(W, wd, ht) then
+  begin
+    FNeedApp := True;
+    Exit;
+  end;
+  mk := FDoc.Dict(W, 'MK');
+  rr := 0;
+  if (mk <> nil) and (mk.Kind = pdfDict) then
+    rr := FDoc.IntOf(mk.Get('R'), 0);
+  if (rr mod 360) <> 0 then
+  begin
+    FNeedApp := True;
+    Exit;
+  end;
+  da := FindOn(F, 'DA');
+  if (da = nil) or (da.Kind <> pdfString) then
+    da := AcroEntry('DA');
+  if (da = nil) or (da.Kind <> pdfString) then
+  begin
+    FNeedApp := True;
+    Exit;
+  end;
+  SplitDA(da.SVal, fname, fs0, rest);
+  dr := AcroEntry('DR');
+  fentry := nil;
+  if (dr <> nil) and (dr.Kind = pdfDict) then
+  begin
+    fnts := FDoc.Dict(dr, 'Font');
+    if (fnts <> nil) and (fnts.Kind = pdfDict) then
+      fentry := fnts.Get(fname);
+  end;
+  if (fname = '') or (fentry = nil) then
+  begin
+    FNeedApp := True;
+    Exit;
+  end;
+  fdict := FDoc.Resolve(fentry);
+  if not CachedInfo(FDoc, FInfos, fdict, fi) then
+  begin
+    FNeedApp := True;
+    Exit;
+  end;
+  multiline := (F.Flags and $1000) <> 0;
+  mxl := FindOn(F, 'MaxLen');
+  maxlen := FDoc.IntOf(mxl, 0);
+  comb := ((F.Flags and $1000000) <> 0) and (maxlen > 0) and not multiline;
+  qv := FindOn(F, 'Q');
+  if qv <> nil then
+    q := FDoc.IntOf(qv, 0)
+  else
+    q := FDoc.IntOf(AcroEntry('Q'), 0);
+  { the border }
+  bw := 1;
+  bs := FDoc.Dict(W, 'BS');
+  brd := FDoc.Dict(W, 'Border');
+  if (bs <> nil) and (bs.Kind = pdfDict) and (bs.Get('W') <> nil) then
+    bw := PdfNumber(FDoc.Resolve(bs.Get('W')))
+  else if (brd <> nil) and (brd.Kind = pdfArray) and (Length(brd.Items) >= 3) then
+    bw := PdfNumber(FDoc.Resolve(brd.Items[2]));
+  bcops := '';
+  bgops := '';
+  if (mk <> nil) and (mk.Kind = pdfDict) then
+  begin
+    bcops := ColorOps(FDoc, FDoc.Dict(mk, 'BC'), True);
+    bgops := ColorOps(FDoc, FDoc.Dict(mk, 'BG'), False);
+  end;
+  if bcops = '' then
+    padB := 0
+  else
+    padB := bw;
+  { the text in the font's codes; a limit of characters }
+  txt := Value;
+  if (maxlen > 0) and not multiline then
+  begin
+    i := 1;
+    cut := 0;
+    p1 := 0;
+    while (i <= Length(txt)) and (p1 < maxlen) do
+    begin
+      PdfNextRune(txt, i);
+      p1 := p1 + 1;
+      cut := i - 1;
+    end;
+    txt := Copy(txt, 1, cut);
+  end;
+  asc := fi.Asc;
+  desc := fi.Desc;
+  avail := wd - 2 * padB - 4;
+  fs := fs0;
+  codes := EncodeFor(fi, txt, multiline);
+  if not multiline then
+  begin
+    { one line: a size of 0 fits the height, at most 12, and the width }
+    if fs <= 0 then
+    begin
+      fs := (ht - 2 * padB - 2) / ((asc - desc) / 1000);
+      if fs > 12 then
+        fs := 12;
+      tw := CodesWidth(fi, codes) / 1000;
+      if (tw > 0) and (avail / tw < fs) then
+        fs := avail / tw;
+      if fs < 4 then
+        fs := 4;
+    end;
+    tw := CodesWidth(fi, codes) * fs / 1000;
+    y := (ht - (asc - desc) * fs / 1000) / 2 - desc * fs / 1000;
+    if q = 1 then
+      x := (wd - tw) / 2
+    else if q = 2 then
+      x := wd - 2 - padB - tw
+    else
+      x := 2 + padB;
+    if comb then
+    begin
+      cw := (wd - 2 * padB) / maxlen;
+      tx := '';
+      lw := 0;
+      for i := 1 to Length(codes) do
+      begin
+        wtext := fi.Width[Ord(codes[i])] * fs / 1000;
+        x := padB + (i - 1) * cw + (cw - wtext) / 2;
+        tx := tx + PdfNum(x - lw) + ' ' + PdfNum(y) + ' Td ' + PdfStringOf(codes[i]) + ' Tj' + #10;
+        lw := x;
+        y := 0;
+      end;
+      { the first Td set the baseline; the others move along it }
+      cont := tx;
+    end
+    else
+      cont := PdfNum(x) + ' ' + PdfNum(y) + ' Td ' + PdfStringOf(codes) + ' Tj' + #10;
+  end
+  else
+  begin
+    { several lines: each paragraph wrapped to the width }
+    if fs <= 0 then
+      fs := 12;
+    lead := fs * 1.15;
+    SetLength(lines, 0);
+    nlines := 0;
+    para := '';
+    i := 1;
+    while i <= Length(codes) + 1 do
+    begin
+      if (i > Length(codes)) or (codes[i] = #10) or (codes[i] = #13) then
+      begin
+        { the paragraph in para, wrd by wrd }
+        line := '';
+        wrd := '';
+        for p1 := 1 to Length(para) + 1 do
+        begin
+          if (p1 > Length(para)) or (para[p1] = ' ') then
+          begin
+            if (line <> '') and (CodesWidth(fi, line + ' ' + wrd) * fs / 1000 > avail) then
+            begin
+              SetLength(lines, nlines + 1);
+              lines[nlines] := line;
+              nlines := nlines + 1;
+              line := wrd;
+            end
+            else if line = '' then
+              line := wrd
+            else
+              line := line + ' ' + wrd;
+            wrd := '';
+          end
+          else
+            wrd := wrd + para[p1];
+        end;
+        SetLength(lines, nlines + 1);
+        lines[nlines] := line;
+        nlines := nlines + 1;
+        para := '';
+        if (i <= Length(codes)) and (codes[i] = #13) and (i < Length(codes)) and (codes[i + 1] = #10) then
+          i := i + 1;
+      end
+      else
+        para := para + codes[i];
+      i := i + 1;
+    end;
+    y := ht - padB - 2 - asc * fs / 1000;
+    cont := '';
+    lw := 0;
+    for i := 0 to nlines - 1 do
+    begin
+      if (i > 0) and (y < padB) and ((F.Flags and $800000) <> 0) then
+        Break;
+      tw := CodesWidth(fi, lines[i]) * fs / 1000;
+      if q = 1 then
+        x := (wd - tw) / 2
+      else if q = 2 then
+        x := wd - 2 - padB - tw
+      else
+        x := 2 + padB;
+      if i = 0 then
+        cont := cont + PdfNum(x) + ' ' + PdfNum(y) + ' Td ' + PdfStringOf(lines[i]) + ' Tj' + #10
+      else
+        cont := cont + PdfNum(x - lw) + ' ' + PdfNum(-lead) + ' Td ' + PdfStringOf(lines[i]) + ' Tj' + #10;
+      lw := x;
+      y := y - lead;
+    end;
+  end;
+  { the stream }
+  tx := '/Tx BMC' + #10 + 'q' + #10;
+  if padB > 0 then
+    tx := tx + PdfNum(padB) + ' ' + PdfNum(padB) + ' ' + PdfNum(wd - 2 * padB) + ' ' + PdfNum(ht - 2 * padB) + ' re W n' + #10;
+  tx := tx + 'BT' + #10 + rest + '/' + fname + ' ' + PdfNum(fs) + ' Tf' + #10 + cont + 'ET' + #10 + 'Q' + #10 + 'EMC';
+  oldN := FDoc.Dict(FDoc.Dict(W, 'AP'), 'N');
+  oldRes := nil;
+  if (oldN <> nil) and (oldN.Kind = pdfStream) and (oldN.Get('Matrix') = nil) then
+  begin
+    try
+      oldData := FDoc.StreamData(oldN);
+      pre := SpliceTx(oldData, tx);
+      oldRes := FDoc.Dict(oldN, 'Resources');
+    except
+      on E: EPdfError do
+        pre := '';
+    end;
+  end;
+  if pre = '' then
+  begin
+    pre := '';
+    if bgops <> '' then
+      pre := pre + 'q ' + bgops + '0 0 ' + PdfNum(wd) + ' ' + PdfNum(ht) + ' re f Q' + #10;
+    if (bcops <> '') and (bw > 0) then
+      pre := pre + 'q ' + bcops + PdfNum(bw) + ' w ' + PdfNum(bw / 2) + ' ' + PdfNum(bw / 2) + ' ' + PdfNum(wd - bw) + ' ' + PdfNum(ht - bw) + ' re S Q' + #10;
+    pre := pre + tx;
+  end;
+  { the resources: the old stream's, with the font added }
+  res := PdfNewDict;
+  if (oldRes <> nil) and (oldRes.Kind = pdfDict) then
+    for i := 0 to Length(oldRes.Keys) - 1 do
+      PdfSet(res, oldRes.Keys[i], oldRes.Vals[i]);
+  fd := PdfNewDict;
+  o := FDoc.Dict(res, 'Font');
+  if (o <> nil) and (o.Kind = pdfDict) then
+    for i := 0 to Length(o.Keys) - 1 do
+      PdfSet(fd, o.Keys[i], o.Vals[i]);
+  if fd.Get(fname) = nil then
+    PdfSet(fd, fname, fentry);
+  PdfSet(res, 'Font', fd);
+  SetAppearance(W, wd, ht, res, pre);
+end;
+
+{ ---- values ---- }
+
+procedure TPdfEditor.SetFieldValue(F: TPdfField; V: TPdfObj);
+begin
+  PdfSet(F.Obj, 'V', V);
+  PdfRemove(F.Obj, 'RV');
+  Touch(F.Obj);
+end;
+
+procedure TPdfEditor.SetText(F: TPdfField; const Value: string);
+var
+  i: Integer;
+begin
+  if (F = nil) or ((F.Kind <> ftText) and (F.Kind <> ftCombo)) then
+    Fail('not a text field');
+  if (F.Kind = ftText) and ((F.Flags and $2000) <> 0) then
+    Fail('a password field is not filled: ' + F.Name);
+  SetFieldValue(F, PdfStrObj(PdfEncodeText(Value)));
+  for i := 0 to Length(F.Widgets) - 1 do
+    MakeTextAppearance(F, F.Widgets[i], Value);
+end;
+
+function TPdfEditor.OptionCount(F: TPdfField): Integer;
+var
+  o: TPdfObj;
+begin
+  Result := 0;
+  o := FindOn(F, 'Opt');
+  if (o <> nil) and (o.Kind = pdfArray) then
+    Result := Length(o.Items);
+end;
+
+function TPdfEditor.OptionExport(F: TPdfField; I: Integer): string;
+var
+  o, e: TPdfObj;
+begin
+  Result := '';
+  o := FindOn(F, 'Opt');
+  if (o = nil) or (o.Kind <> pdfArray) or (I < 0) or (I >= Length(o.Items)) then
+    Exit;
+  e := FDoc.Resolve(o.Items[I]);
+  if (e <> nil) and (e.Kind = pdfArray) and (Length(e.Items) > 0) then
+    e := FDoc.Resolve(e.Items[0]);
+  if (e <> nil) and (e.Kind = pdfString) then
+    Result := PdfDecodeText(e.SVal);
+end;
+
+function TPdfEditor.OptionLabel(F: TPdfField; I: Integer): string;
+var
+  o, e: TPdfObj;
+begin
+  Result := '';
+  o := FindOn(F, 'Opt');
+  if (o = nil) or (o.Kind <> pdfArray) or (I < 0) or (I >= Length(o.Items)) then
+    Exit;
+  e := FDoc.Resolve(o.Items[I]);
+  if (e <> nil) and (e.Kind = pdfArray) and (Length(e.Items) > 1) then
+    e := FDoc.Resolve(e.Items[1])
+  else if (e <> nil) and (e.Kind = pdfArray) and (Length(e.Items) > 0) then
+    e := FDoc.Resolve(e.Items[0]);
+  if (e <> nil) and (e.Kind = pdfString) then
+    Result := PdfDecodeText(e.SVal);
+end;
+
+procedure TPdfEditor.SetChoice(F: TPdfField; const Value: string);
+var
+  i, hit: Integer;
+  expv, lbl: string;
+  w: TPdfObj;
+begin
+  if (F = nil) or ((F.Kind <> ftCombo) and (F.Kind <> ftList)) then
+    Fail('not a choice field');
+  hit := -1;
+  for i := 0 to OptionCount(F) - 1 do
+    if (OptionExport(F, i) = Value) or (OptionLabel(F, i) = Value) then
+    begin
+      hit := i;
+      Break;
+    end;
+  if hit >= 0 then
+  begin
+    expv := OptionExport(F, hit);
+    lbl := OptionLabel(F, hit);
+  end
+  else if (F.Kind = ftCombo) and ((F.Flags and $40000) <> 0) then
+  begin
+    expv := Value;
+    lbl := Value;
+  end
+  else
+    Fail('"' + Value + '" is not an item of ' + F.Name);
+  SetFieldValue(F, PdfStrObj(PdfEncodeText(expv)));
+  PdfRemove(F.Obj, 'I');
+  for i := 0 to Length(F.Widgets) - 1 do
+  begin
+    w := F.Widgets[i];
+    if F.Kind = ftCombo then
+      MakeTextAppearance(F, w, lbl)
+    else
+      MakeListAppearance(F, w, expv);
+  end;
+end;
+
+procedure TPdfEditor.MakeListAppearance(F: TPdfField; W: TPdfObj; const Value: string);
+var
+  wd, ht, fs, lead, y, asc, desc: Double;
+  da, dr, fnts, fentry, fdict, mk, res, fd: TPdfObj;
+  rest, fname, cont, codes, lbl, ops: string;
+  fi: TFontInfo;
+  top, i, rows, k: Integer;
+  bgops, bcops: string;
+  fs0: Double;
+begin
+  if not WidgetBox(W, wd, ht) then
+  begin
+    FNeedApp := True;
+    Exit;
+  end;
+  da := FindOn(F, 'DA');
+  if (da = nil) or (da.Kind <> pdfString) then
+    da := AcroEntry('DA');
+  if (da = nil) or (da.Kind <> pdfString) then
+  begin
+    FNeedApp := True;
+    Exit;
+  end;
+  SplitDA(da.SVal, fname, fs0, rest);
+  dr := AcroEntry('DR');
+  fentry := nil;
+  if (dr <> nil) and (dr.Kind = pdfDict) then
+  begin
+    fnts := FDoc.Dict(dr, 'Font');
+    if (fnts <> nil) and (fnts.Kind = pdfDict) then
+      fentry := fnts.Get(fname);
+  end;
+  if (fname = '') or (fentry = nil) then
+  begin
+    FNeedApp := True;
+    Exit;
+  end;
+  fdict := FDoc.Resolve(fentry);
+  if not CachedInfo(FDoc, FInfos, fdict, fi) then
+  begin
+    FNeedApp := True;
+    Exit;
+  end;
+  fs := fs0;
+  if fs <= 0 then
+    fs := 12;
+  asc := fi.Asc;
+  desc := fi.Desc;
+  lead := fs * 1.15;
+  top := FDoc.IntOf(FindOn(F, 'TI'), 0);
+  rows := Trunc((ht - 4) / lead);
+  mk := FDoc.Dict(W, 'MK');
+  bgops := '';
+  bcops := '';
+  if (mk <> nil) and (mk.Kind = pdfDict) then
+  begin
+    bgops := ColorOps(FDoc, FDoc.Dict(mk, 'BG'), False);
+    bcops := ColorOps(FDoc, FDoc.Dict(mk, 'BC'), True);
+  end;
+  cont := '';
+  if bgops <> '' then
+    cont := cont + 'q ' + bgops + '0 0 ' + PdfNum(wd) + ' ' + PdfNum(ht) + ' re f Q' + #10;
+  cont := cont + '/Tx BMC' + #10 + 'q' + #10 + '1 1 ' + PdfNum(wd - 2) + ' ' + PdfNum(ht - 2) + ' re W n' + #10;
+  y := ht - 2 - lead;
+  for i := top to top + rows - 1 do
+  begin
+    if i >= OptionCount(F) then
+      Break;
+    lbl := OptionLabel(F, i);
+    codes := EncodeFor(fi, lbl, False);
+    k := 0;
+    if OptionExport(F, i) = Value then
+      cont := cont + 'q 0.6 0.75 0.85 rg 1 ' + PdfNum(y - (-desc) * fs / 1000 + 0) + ' ' + PdfNum(wd - 2) + ' ' + PdfNum(lead) + ' re f Q' + #10;
+    cont := cont + 'BT' + #10 + rest + '/' + fname + ' ' + PdfNum(fs) + ' Tf' + #10 + '2 ' + PdfNum(y) + ' Td ' + PdfStringOf(codes) + ' Tj' + #10 + 'ET' + #10;
+    y := y - lead;
+  end;
+  cont := cont + 'Q' + #10 + 'EMC';
+  if (bcops <> '') then
+    cont := cont + #10 + 'q ' + bcops + '1 w 0.5 0.5 ' + PdfNum(wd - 1) + ' ' + PdfNum(ht - 1) + ' re S Q';
+  res := PdfNewDict;
+  fd := PdfNewDict;
+  PdfSet(fd, fname, fentry);
+  PdfSet(res, 'Font', fd);
+  SetAppearance(W, wd, ht, res, cont);
+end;
+
+{ ---- buttons ---- }
+
+function TPdfEditor.OnStateOf(W: TPdfObj): string;
+var
+  n: TPdfObj;
+  i: Integer;
+begin
+  Result := '';
+  n := FDoc.Dict(FDoc.Dict(W, 'AP'), 'N');
+  if (n = nil) or (n.Kind <> pdfDict) then
+    Exit;
+  for i := 0 to Length(n.Keys) - 1 do
+    if n.Keys[i] <> 'Off' then
+    begin
+      Result := n.Keys[i];
+      Exit;
+    end;
+end;
+
+{ the appearances of a button widget that has none: ZapfDingbats' check mark
+  (code 52) or circle (code 108) for the state OnName, nothing for Off }
+procedure TPdfEditor.MakeButtonAppearance(W: TPdfObj; const OnName: string; Radio: Boolean);
+var
+  wd, ht, sz, gw, x, y: Double;
+  fm, bb, res, fd, ap, nd: TPdfObj;
+  code: Integer;
+  fnum, onNum, offNum: Integer;
+
+  function Form(const Content: string): Integer;
+  var
+    d: TPdfObj;
+    b: TPdfObj;
+  begin
+    d := PdfNewDict;
+    PdfSet(d, 'Type', PdfNameObj('XObject'));
+    PdfSet(d, 'Subtype', PdfNameObj('Form'));
+    b := PdfNewArray;
+    PdfAdd(b, PdfIntObj(0));
+    PdfAdd(b, PdfIntObj(0));
+    PdfAdd(b, PdfRealObj(wd));
+    PdfAdd(b, PdfRealObj(ht));
+    PdfSet(d, 'BBox', b);
+    PdfSet(d, 'Resources', res);
+    Result := NewObject(d, Content);
+  end;
+
+begin
+  if not WidgetBox(W, wd, ht) then
+    Exit;
+  fnum := StdFontObject(sfZapfDingbats);
+  res := PdfNewDict;
+  fd := PdfNewDict;
+  PdfSet(fd, 'ZaDb', PdfRefObj(fnum));
+  PdfSet(res, 'Font', fd);
+  if Radio then
+    code := 108
+  else
+    code := 52;
+  sz := wd;
+  if ht < sz then
+    sz := ht;
+  sz := sz * 0.8;
+  gw := PdfStdWidth(sfZapfDingbats, peStandard, code) * sz / 1000;
+  x := (wd - gw) / 2;
+  y := (ht - sz * 0.7) / 2;
+  onNum := Form('q 0 g BT /ZaDb ' + PdfNum(sz) + ' Tf ' + PdfNum(x) + ' ' + PdfNum(y) + ' Td (' + Chr(code) + ') Tj ET Q');
+  offNum := Form(' ');
+  nd := PdfNewDict;
+  PdfSet(nd, OnName, PdfRefObj(onNum));
+  PdfSet(nd, 'Off', PdfRefObj(offNum));
+  ap := PdfNewDict;
+  PdfSet(ap, 'N', nd);
+  PdfSet(W, 'AP', ap);
+  Touch(W);
+end;
+
+procedure TPdfEditor.SetChecked(F: TPdfField; AValue: Boolean);
+var
+  i: Integer;
+  on, first: string;
+  w: TPdfObj;
+begin
+  if (F = nil) or (F.Kind <> ftCheck) then
+    Fail('not a check box');
+  first := '';
+  for i := 0 to Length(F.Widgets) - 1 do
+  begin
+    w := F.Widgets[i];
+    on := OnStateOf(w);
+    if on = '' then
+    begin
+      on := 'Yes';
+      MakeButtonAppearance(w, on, False);
+    end;
+    if first = '' then
+      first := on;
+    if AValue then
+      PdfSet(w, 'AS', PdfNameObj(on))
+    else
+      PdfSet(w, 'AS', PdfNameObj('Off'));
+    Touch(w);
+  end;
+  if AValue then
+    SetFieldValue(F, PdfNameObj(first))
+  else
+    SetFieldValue(F, PdfNameObj('Off'));
+end;
+
+procedure TPdfEditor.SetState(F: TPdfField; const State: string);
+var
+  i: Integer;
+  target, on: string;
+  w: TPdfObj;
+  any: Boolean;
+begin
+  if (F = nil) or (F.Kind <> ftRadio) then
+    Fail('not a radio button field');
+  target := State;
+  for i := 0 to OptionCount(F) - 1 do
+    if OptionExport(F, i) = State then
+    begin
+      target := IntToStr(i);
+      Break;
+    end;
+  any := False;
+  for i := 0 to Length(F.Widgets) - 1 do
+  begin
+    w := F.Widgets[i];
+    on := OnStateOf(w);
+    if on = '' then
+    begin
+      { no appearance: the button's own place is its state, as an Opt
+        makes it (12.7.4.2.3) }
+      on := IntToStr(i);
+      MakeButtonAppearance(w, on, True);
+    end;
+    if on = target then
+    begin
+      PdfSet(w, 'AS', PdfNameObj(on));
+      any := True;
+    end
+    else
+      PdfSet(w, 'AS', PdfNameObj('Off'));
+    Touch(w);
+  end;
+  if not any then
+    Fail('radio button field ' + F.Name + ' has no state ' + State);
+  SetFieldValue(F, PdfNameObj(target));
+end;
+
+function TPdfEditor.StateCount(F: TPdfField): Integer;
+begin
+  Result := Length(F.Widgets);
+end;
+
+function TPdfEditor.StateName(F: TPdfField; I: Integer): string;
+begin
+  Result := '';
+  if (I < 0) or (I >= Length(F.Widgets)) then
+    Exit;
+  if OptionCount(F) > I then
+    Result := OptionExport(F, I)
+  else
+    Result := OnStateOf(F.Widgets[I]);
+end;
+
+{ ---- text over a page ---- }
+
+function TPdfEditor.StdFontObject(Std: Integer): Integer;
+var
+  d: TPdfObj;
+begin
+  if FStdFont[Std] > 0 then
+  begin
+    Result := FStdFont[Std];
+    Exit;
+  end;
+  d := PdfNewDict;
+  PdfSet(d, 'Type', PdfNameObj('Font'));
+  PdfSet(d, 'Subtype', PdfNameObj('Type1'));
+  PdfSet(d, 'BaseFont', PdfNameObj(PdfStdName(Std)));
+  if (Std <> sfSymbol) and (Std <> sfZapfDingbats) then
+    PdfSet(d, 'Encoding', PdfNameObj('WinAnsiEncoding'));
+  FStdFont[Std] := NewObject(d, '');
+  Result := FStdFont[Std];
+end;
+
+{ a name for the standard font in the page's font resources, added if the
+  page has none for it }
+function TPdfEditor.PageFontName(Page: TPdfObj; Std: Integer): string;
+var
+  fnum, k: Integer;
+  rr, res, fe, fd, owner, fowner, e: TPdfObj;
+  nm: string;
+begin
+  fnum := StdFontObject(Std);
+  rr := Page.Get('Resources');
+  if rr = nil then
+  begin
+    res := PdfNewDict;
+    PdfSet(Page, 'Resources', res);
+    owner := Page;
+  end
+  else if rr.Kind = pdfRef then
+  begin
+    res := FDoc.Resolve(rr);
+    owner := res;
+  end
+  else
+  begin
+    res := rr;
+    owner := Page;
+  end;
+  if (res = nil) or (res.Kind <> pdfDict) then
+    Fail('the page has no usable resources');
+  fe := res.Get('Font');
+  if fe = nil then
+  begin
+    fd := PdfNewDict;
+    PdfSet(res, 'Font', fd);
+    fowner := owner;
+  end
+  else if fe.Kind = pdfRef then
+  begin
+    fd := FDoc.Resolve(fe);
+    fowner := fd;
+  end
+  else
+  begin
+    fd := fe;
+    fowner := owner;
+  end;
+  if (fd = nil) or (fd.Kind <> pdfDict) then
+    Fail('the page has no usable font resources');
+  { a name this font already has in them }
+  for k := 0 to Length(fd.Keys) - 1 do
+  begin
+    e := fd.Vals[k];
+    if (e <> nil) and (e.Kind = pdfRef) and (e.IVal = fnum) then
+    begin
+      Result := fd.Keys[k];
+      Exit;
+    end;
+  end;
+  k := 1;
+  nm := 'PdfF1';
+  while fd.Get(nm) <> nil do
+  begin
+    k := k + 1;
+    nm := 'PdfF' + IntToStr(k);
+  end;
+  PdfSet(fd, nm, PdfRefObj(fnum));
+  Touch(fowner);
+  Touch(owner);
+  Result := nm;
+end;
+
+{ the page's content wrapped in q and Q, once: whatever graphics state it
+  leaves does not move what is added }
+function TPdfEditor.WrapPage(Page: TPdfObj): Integer;
+var
+  i: Integer;
+  c, arr, e: TPdfObj;
+  d: TPdfObj;
+begin
+  Result := 0;
+  for i := 0 to Length(FWrapped) - 1 do
+    if FWrapped[i] = Page then
+      Exit;
+  if FQObj = 0 then
+  begin
+    d := PdfNewDict;
+    FQObj := NewObject(d, 'q' + #10);
+    d := PdfNewDict;
+    FQEndObj := NewObject(d, 'Q' + #10);
+  end;
+  arr := PdfNewArray;
+  PdfAdd(arr, PdfRefObj(FQObj));
+  c := Page.Get('Contents');
+  if c <> nil then
+  begin
+    if c.Kind = pdfRef then
+    begin
+      e := FDoc.Resolve(c);
+      if (e <> nil) and (e.Kind = pdfArray) then
+      begin
+        for i := 0 to Length(e.Items) - 1 do
+          PdfAdd(arr, e.Items[i]);
+      end
+      else
+        PdfAdd(arr, c);
+    end
+    else if c.Kind = pdfArray then
+      for i := 0 to Length(c.Items) - 1 do
+        PdfAdd(arr, c.Items[i]);
+  end;
+  PdfAdd(arr, PdfRefObj(FQEndObj));
+  PdfSet(Page, 'Contents', arr);
+  Touch(Page);
+  SetLength(FWrapped, Length(FWrapped) + 1);
+  FWrapped[Length(FWrapped) - 1] := Page;
+end;
+
+{ the codes of a text in a standard font under WinAnsiEncoding, the
+  characters the encoding lacks left out }
+function WinCodes(const Text: string): string;
+var
+  i, r, c, k: Integer;
+begin
+  Result := '';
+  i := 1;
+  while i <= Length(Text) do
+  begin
+    r := PdfNextRune(Text, i);
+    c := -1;
+    for k := 32 to 255 do
+      if PdfEncodingRune(peWinAnsi, k) = r then
+      begin
+        c := k;
+        Break;
+      end;
+    if c >= 0 then
+      Result := Result + Chr(c);
+  end;
+end;
+
+function TPdfEditor.TextWidth(const Text: string; const FontName: string; Size: Double): Double;
+var
+  std, i, w: Integer;
+  codes: string;
+begin
+  std := PdfStdFont(FontName);
+  if (std < 0) or (std = sfSymbol) or (std = sfZapfDingbats) then
+    Fail(FontName + ' is not a standard font with letters');
+  codes := WinCodes(Text);
+  Result := 0;
+  for i := 1 to Length(codes) do
+  begin
+    w := PdfStdWidth(std, peWinAnsi, Ord(codes[i]));
+    if w > 0 then
+      Result := Result + w;
+  end;
+  Result := Result * Size / 1000;
+end;
+
+procedure TPdfEditor.DrawText(Page: Integer; X, Y: Double; const Text, FontName: string; Size, R, G, B: Double; Align: Integer);
+var
+  pg, arr, d: TPdfObj;
+  std, n: Integer;
+  nm, codes, content: string;
+  tw, x0: Double;
+begin
+  std := PdfStdFont(FontName);
+  if (std < 0) or (std = sfSymbol) or (std = sfZapfDingbats) then
+    Fail(FontName + ' is not a standard font with letters');
+  pg := FDoc.PageObject(Page);
+  if pg.Num <= 0 then
+    Fail('the page is not an object of its own');
+  tw := TextWidth(Text, FontName, Size);
+  x0 := X;
+  if Align = taCenter then
+    x0 := X - tw / 2
+  else if Align = taRight then
+    x0 := X - tw;
+  codes := WinCodes(Text);
+  nm := PageFontName(pg, std);
+  WrapPage(pg);
+  content := 'q ' + PdfNum(R) + ' ' + PdfNum(G) + ' ' + PdfNum(B) + ' rg BT /' + nm + ' ' + PdfNum(Size) + ' Tf ' + PdfNum(x0) + ' ' + PdfNum(Y) + ' Td ' + PdfStringOf(codes) + ' Tj ET Q' + #10;
+  d := PdfNewDict;
+  n := NewObject(d, content);
+  arr := pg.Get('Contents');
+  PdfAdd(arr, PdfRefObj(n));
+  Touch(pg);
+end;
+
+{ ---- the file ---- }
+
+type
+  TWritten = record
+    Num: Integer;
+    Off: Integer;
+    Gen: Integer;
+  end;
+
+procedure SortWritten(var A: array of TWritten; N: Integer);
+var
+  gap, i, j: Integer;
+  t: TWritten;
+begin
+  gap := N div 2;
+  while gap > 0 do
+  begin
+    for i := gap to N - 1 do
+    begin
+      t := A[i];
+      j := i;
+      while (j >= gap) and (A[j - gap].Num > t.Num) do
+      begin
+        A[j] := A[j - gap];
+        j := j - gap;
+      end;
+      A[j] := t;
+    end;
+    gap := gap div 2;
+  end;
+end;
+
+function BE(V, N: Integer): string;
+var
+  i: Integer;
+begin
+  Result := '';
+  for i := N - 1 downto 0 do
+    Result := Result + Chr((V shr (i * 8)) and 255);
+end;
+
+function Pad10(V: Integer): string;
+var
+  s: string;
+begin
+  s := IntToStr(V);
+  Result := Copy('0000000000', 1, 10 - Length(s)) + s;
+end;
+
+function Pad5(V: Integer): string;
+var
+  s: string;
+begin
+  s := IntToStr(V);
+  Result := Copy('00000', 1, 5 - Length(s)) + s;
+end;
+
+function TPdfEditor.Save: string;
+var
+  body: TStringBuilder;
+  data, tail, dictText, trailerExtra, idx, rows: string;
+  base, i, j, size, limit, k, n, xnum, xoff, gen, startOff: Integer;
+  w: array of TWritten;
+  o: TPdfObj;
+  entry: TPdfObj;
+  stm: string;
+  isStream: Boolean;
+  first, cnt: Integer;
+begin
+  if (FAcro <> nil) and FDropXfa and (FAcro.Get('XFA') <> nil) then
+  begin
+    PdfRemove(FAcro, 'XFA');
+    if FAcro.Num > 0 then
+      Touch(FAcro)
+    else
+      Touch(FCatalog);
+  end;
+  if (FAcro <> nil) and FNeedApp then
+  begin
+    PdfSet(FAcro, 'NeedAppearances', PdfBoolObj(True));
+    if FAcro.Num > 0 then
+      Touch(FAcro)
+    else
+      Touch(FCatalog);
+  end;
+  if (Length(FDirty) = 0) and (Length(FNew) = 0) then
+  begin
+    Result := FDoc.Data;
+    Exit;
+  end;
+  if FDoc.Rebuilt or (FDoc.StartXref < 0) then
+    Fail('the file had to be rebuilt: an update would point back to a table that is not there');
+  data := FDoc.Data;
+  base := Length(data);
+  if (base = 0) or (data[base] <> #10) then
+  begin
+    tail := #10;
+    base := base + 1;
+  end
+  else
+    tail := '';
+  body := TStringBuilder.Create(4096);
+  try
+    n := Length(FDirty) + Length(FNew);
+    SetLength(w, n);
+    k := 0;
+    for i := 0 to n - 1 do
+    begin
+      if i < Length(FDirty) then
+      begin
+        o := FDirty[i];
+        stm := '';
+        isStream := False;
+        if o.Kind = pdfStream then
+          Fail('an existing stream cannot be rewritten');
+        gen := FDoc.ObjectGen(o.Num);
+        w[k].Num := o.Num;
+      end
+      else
+      begin
+        j := i - Length(FDirty);
+        o := FNew[j];
+        stm := FNewData[j];
+        isStream := o.Kind = pdfStream;
+        gen := 0;
+        w[k].Num := FNewNum[j];
+      end;
+      w[k].Off := base + body.ByteLength;
+      w[k].Gen := gen;
+      body.AddText(IntToStr(w[k].Num) + ' ' + IntToStr(gen) + ' obj' + #10);
+      if isStream then
+      begin
+        PdfSet(o, 'Length', PdfIntObj(Length(stm)));
+        body.AddText(PdfSerialize(o));
+        body.AddText(#10 + 'stream' + #10);
+        body.AddText(stm);
+        body.AddText(#10 + 'endstream' + #10 + 'endobj' + #10);
+      end
+      else
+        body.AddText(PdfSerialize(o) + #10 + 'endobj' + #10);
+      k := k + 1;
+    end;
+    SortWritten(w, n);
+    limit := FDoc.ObjectLimit;
+    size := limit;
+    if FNext > size then
+      size := FNext;
+    { what the trailer repeats from the old one }
+    trailerExtra := '/Root ' + PdfSerialize(FDoc.Trailer.Get('Root'));
+    entry := FDoc.Trailer.Get('Info');
+    if entry <> nil then
+      trailerExtra := trailerExtra + ' /Info ' + PdfSerialize(entry);
+    entry := FDoc.Trailer.Get('ID');
+    if entry <> nil then
+      trailerExtra := trailerExtra + ' /ID ' + PdfSerialize(entry);
+    startOff := base + body.ByteLength;
+    if not FDoc.XrefIsStream then
+    begin
+      body.AddText('xref' + #10);
+      i := 0;
+      while i < n do
+      begin
+        j := i;
+        while (j + 1 < n) and (w[j + 1].Num = w[j].Num + 1) do
+          j := j + 1;
+        body.AddText(IntToStr(w[i].Num) + ' ' + IntToStr(j - i + 1) + #10);
+        for k := i to j do
+          body.AddText(Pad10(w[k].Off) + ' ' + Pad5(w[k].Gen) + ' n ' + #10);
+        i := j + 1;
+      end;
+      body.AddText('trailer' + #10 + '<< /Size ' + IntToStr(size) + ' ' + trailerExtra + ' /Prev ' + IntToStr(FDoc.StartXref) + ' >>' + #10);
+    end
+    else
+    begin
+      { an xref stream of its own, as the file's is }
+      xnum := size;
+      size := size + 1;
+      SetLength(w, n + 1);
+      w[n].Num := xnum;
+      w[n].Off := startOff;
+      w[n].Gen := 0;
+      n := n + 1;
+      SortWritten(w, n);
+      rows := '';
+      idx := '';
+      i := 0;
+      while i < n do
+      begin
+        j := i;
+        while (j + 1 < n) and (w[j + 1].Num = w[j].Num + 1) do
+          j := j + 1;
+        idx := idx + IntToStr(w[i].Num) + ' ' + IntToStr(j - i + 1) + ' ';
+        for k := i to j do
+          rows := rows + Chr(1) + BE(w[k].Off, 4) + BE(w[k].Gen, 2);
+        i := j + 1;
+      end;
+      body.AddText(IntToStr(xnum) + ' 0 obj' + #10 + '<< /Type /XRef /Size ' + IntToStr(size) + ' ' + trailerExtra + ' /Prev ' + IntToStr(FDoc.StartXref) + ' /W [1 4 2] /Index [' + Trim(idx) + '] /Length ' + IntToStr(Length(rows)) + ' >>' + #10 + 'stream' + #10);
+      body.AddText(rows);
+      body.AddText(#10 + 'endstream' + #10 + 'endobj' + #10);
+    end;
+    body.AddText('startxref' + #10 + IntToStr(startOff) + #10 + '%%EOF' + #10);
+    Result := data + tail + body.ToString;
+  finally
+    body.Free;
+  end;
+end;
+
+end.

@@ -710,6 +710,9 @@ GOLDEN_A64 += realregs
 # P476: PDF files read, their text, and the same bytes bent.
 GOLDEN += pdftext
 GOLDEN_A64 += pdftext
+# P437: PDF forms filled and text laid over a page, and the same bytes bent.
+GOLDEN += pdfform
+GOLDEN_A64 += pdfform
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -754,6 +757,8 @@ LIB_UNITS := \
 	src/lib/pasxlsx.paslang \
 	src/lib/paspdfenc.paslang \
 	src/lib/paspdf.paslang \
+	src/lib/paspdfafm.paslang \
+	src/lib/paspdfform.paslang \
 	src/lib/pasconn.paslang \
 	src/lib/pasurl.paslang \
 	src/lib/pasx509.paslang \
@@ -1358,6 +1363,9 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	: paspdfenc is what scripts/gen_pdfenc.py writes and testdata/pdftext.txt what scripts/gen_pdf_tests.py writes, P476; \
 	python3 -I scripts/gen_pdfenc.py --check; \
 	python3 -I scripts/gen_pdf_tests.py --check; \
+	: paspdfafm is what scripts/gen_pdfafm.py writes and testdata/pdfform.txt what scripts/gen_pdf_forms.py writes, P437; \
+	python3 -I scripts/gen_pdfafm.py --check; \
+	python3 -I scripts/gen_pdf_forms.py --check; \
 	grep -q 'call p_passtr_pasfindbytecpu$$' $(BUILDDIR)/longslice.s || { echo "longslice.s does not call the AVX2 front of IndexByte"; exit 1; }; \
 	grep -q 'call p_passtr_pascomparebytecpu$$' $(BUILDDIR)/longslice.s || { echo "longslice.s does not call the AVX2 front of CompareByte"; exit 1; }; \
 	grep -q 'call p_passtr_pasfindbytebase$$' $(BUILDDIR)/longslice-base.s || { echo "longslice-base.s does not call the base front of IndexByte"; exit 1; }; \

@@ -12416,6 +12416,83 @@ for i := 0 to d.WarningCount - 1 do WriteLn(d.WarningAt(i));   { what was read r
   the 5,364 pages of the Intel manual take 2.4 s against 5.6 s. Go has no PDF reader
   in its library, so there is no pair against Go yet (P496).
 
+`uses paspdfform` fills the forms of PDF files and lays text over their pages
+(1.2.314, P437). It is the other half of what the portal asked for: the
+customer's form comes in, its fields are filled, a line of text goes where
+the page has no field, and the file goes out, as the original with the changes
+added at its end (an incremental update, ISO 32000-1 7.5.6), so that every byte
+of the original is where it was and a signature that covers it stays valid.
+
+```pascal
+e := TPdfEditor.Create(Data);                  { EPdfError: not a PDF, encrypted }
+f := e.FindField('person.first');              { the fully qualified name; nil when there is none }
+e.SetText(f, 'Ana García');                    { a text field or a combo box, UTF-8 }
+e.SetChecked(e.FindField('agree'), True);      { a check box }
+e.SetState(e.FindField('plan'), 'plus');       { a radio button field: a state, or an Opt value }
+e.SetChoice(e.FindField('city'), 'Valencia');  { a choice field: an item, its label or its export value }
+e.DrawText(0, 72, 760, 'Ref 2026-0042', 'Helvetica', 11, 0, 0, 0, taLeft);   { page 1, 72 from the left, 760 up }
+Out := e.Save;                                 { EPdfFormError: refused, with the reason }
+```
+- **Fields.** `FieldCount`, `Field(i)` and `FindField` give the fields of the AcroForm
+  with their kind (`ftText`, `ftCheck`, `ftRadio`, `ftPush`, `ftCombo`, `ftList`,
+  `ftSignature`), flags and widgets; `FieldValue` reads a value (a button's state
+  name, `Off` when it is off), `IsChecked`, `OptionCount`, `OptionExport`,
+  `OptionLabel`, `StateCount` and `StateName` read what a button or a choice has.
+  A text is written as the file wants it (PDFDocEncoding when it fits, UTF-16BE
+  when it does not), a rich text value is removed, a password field is refused,
+  a value that is not an item of a list (or of a combo box that cannot be
+  edited) is refused, a radio button's state that no widget has is refused.
+- **Appearances.** Each widget of a field gets its appearance made again, as
+  12.7.3.3 says: the font, its size and the colour from the default appearance
+  DA (the field's, an ancestor's or the AcroForm's), a size of 0 fitted to the
+  widget (the height, the width, at most 12 points, at least 4), the alignment
+  Q, a Multiline field wrapped to the width (line breaks kept), a Comb field
+  divided into MaxLen cells, the text cut to MaxLen, the background and border
+  of MK and BS drawn if the widget had no appearance and kept if it had one (only the
+  part between `/Tx BMC` and `EMC` is replaced). A list box shows its items
+  with the selected one marked, a check box or a radio button that has no
+  appearance is given ZapfDingbats' check mark or circle. The widths are those of
+  the Widths array of the font, or, for the 14 standard fonts, Adobe's
+  (`paspdfafm`, written by `scripts/gen_pdfafm.py` from the AFM files and
+  compared with Ghostscript's fonts: 6,856 widths, no difference). What a
+  font does not have is left out. A widget whose appearance cannot be made
+  (a font that is not simple, one that cannot be measured, a rotated widget, no
+  default appearance) keeps its value and the AcroForm gets `NeedAppearances`,
+  which asks a viewer to make it; `NeedAppearances := True` asks it for all.
+- **Text over a page.** `DrawText(Page, X, Y, Text, Font, Size, R, G, B, Align)` puts
+  a line in Helvetica, Times, Courier (with Bold and Oblique or Italic) or their
+  names Arial, Times New Roman and Courier New, in WinAnsiEncoding, with the
+  colour and `taLeft`, `taCenter` or `taRight` of the point; `TextWidth` measures it.
+  The page's content is wrapped in `q` and `Q` once, so that a graphics state
+  it leaves (a scale, a colour) does not move the new text, the new content is
+  the last of its `Contents`, and the font is added to the resources the page
+  has (or inherits, which are written into the page).
+- **The file.** `Save` appends the changed objects (the field and widget
+  dictionaries, the AcroForm or the catalog when it holds the AcroForm itself,
+  the pages that were written on) and the new ones (appearances, fonts, the
+  content), then a cross-reference section of the file's own kind (a table, or a
+  stream when the file's is one) with `Prev` to the one before. A file that
+  was linearized, that has object streams or a hybrid table, that ends with
+  other bytes or no end of line, is updated the same way. A file whose table
+  had to be rebuilt is refused (an update would point back to a table that is
+  not there), as an encrypted one is by paspdf. `DropXfa := True` takes the
+  XFA entry out of the AcroForm, which a viewer needs to show the fields of a form
+  that has both. JavaScript (formatting, calculation) is neither run nor
+  removed: the value is written as it is given.
+- **Checked.** `testdata/pdfform` fills 26 forms (23 built by
+  `scripts/gen_pdf_forms.py`: text, multiline, comb, right-aligned and
+  auto-sized fields, a hierarchy, two widgets of one field on two pages, check
+  boxes and radio buttons with and without appearances and with Opt, combo and list
+  boxes, a default font with a Differences array over StandardEncoding, inherited DA and Q, an
+  AcroForm inside the catalog, resources inherited, contents in an array,
+  XFA, passwords, the refusals; and three that qpdf wrote from the first:
+  linearized, object streams, QDF), reads each result back (the original's bytes
+  first, the values, the text laid over the page found by paspdf) and bends each
+  form 8 times: 208 files, none raising anything but EPdfError and EPdfFormError.
+  `scripts/gen_pdf_forms.py --verify` has qpdf --check, qpdf's JSON (every value
+  and state), Ghostscript's rendering and pdftotext check the files the test writes
+  (`testdata/pdfform out DIR`); 3,000 fields are filled in 0.6 s.
+
 `uses httpclient` is an HTTP/1.1 client, and `pasconn`, `pastextproto`, `pashttp`
 and `pasurl` are what it is made of (1.1.266, P432): `pasconn` is the connection as an object
 (`TNetStream`: `ReadSome` and `WriteAll` with a deadline, TCP or a Unix socket,

@@ -32,7 +32,9 @@ def read_agl():
     return names, order
 
 
-def read_tables(agl):
+def read_names(agl):
+    """the glyph name of each code in each of the four encodings of annex D.2:
+    [{code: name}] for Standard, MacRoman, WinAnsi and PDFDoc"""
     lines = open(SPEC, encoding='utf-8').read().split('\n')
     start = next(i for i, l in enumerate(lines) if l.startswith('D.2 Latin Character Set and Encodings'))
     end = next(i for i, l in enumerate(lines) if i > start and l.startswith('D.3 PDFDocEncoding'))
@@ -57,11 +59,18 @@ def read_tables(agl):
                     enc[k][code] = name
             seen += 1
     assert seen == 229, seen
+    for k in range(4):
+        for name in enc[k].values():
+            assert name in agl, name
+    return enc
+
+
+def read_tables(agl):
+    enc = read_names(agl)
     tables = []
     for k in range(4):
         row = [-1] * 256
         for code, name in enc[k].items():
-            assert name in agl, name
             row[code] = agl[name][0]
         tables.append(row)
     # the footnotes: space and hyphen are doubled, unused WinAnsi codes are bullets

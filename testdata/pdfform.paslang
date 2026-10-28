@@ -1,0 +1,372 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+
+  paslang is free software: you can redistribute it and/or modify it
+  under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+
+  paslang is distributed in the hope that it will be useful, but
+  WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+  General Public License for more details.
+
+  You should have received a copy of the GNU General Public License
+  along with paslang.  If not, see <https://www.gnu.org/licenses/>. }
+
+{ P437: the forms of testdata/pdfform.txt (built by scripts/gen_pdf_forms.py)
+  are filled with the operations each is given, saved, opened again and
+  read: the file must begin with the original's bytes, the values must be
+  the ones written, the text laid over a page must be found by the reader,
+  an operation that must be refused is, and the same bytes come out each
+  time (a hash of each file is in the expected output). Then every form is
+  bent, as testdata/pdftext bends its files, and filled again: the editor
+  returns or raises EPdfError or EPdfFormError, and nothing else is raised.
+  testdata/pdfformout writes the files to build/ for qpdf and Ghostscript to
+  read (make check does, when they are there). }
+program pdfform;
+
+uses
+  sysutils, pasflate, pascodec, paspdfenc, paspdfafm, paspdf, paspdfform;
+
+var
+  GS: UInt64;
+
+function Rnd(N: Integer): Integer;
+begin
+  if N < 1 then
+    N := 1;
+  GS := GS * 6364136223846793005 + 1442695040888963407;
+  Result := Integer((GS shr 33) mod UInt64(N));
+end;
+
+function Field(const Line: string; K: Integer; Sep: Char): string;
+var
+  i, start, n: Integer;
+begin
+  Result := '';
+  n := 0;
+  start := 1;
+  for i := 1 to Length(Line) + 1 do
+    if (i > Length(Line)) or (Line[i] = Sep) then
+    begin
+      if n = K then
+      begin
+        Result := Copy(Line, start, i - start);
+        Exit;
+      end;
+      n := n + 1;
+      start := i + 1;
+    end;
+end;
+
+function Unb64(const S: string): string;
+var
+  r: string;
+begin
+  if not Base64Decode(S, False, True, r) then
+  begin
+    WriteLn('bad base64 in the corpus');
+    Halt(2);
+  end;
+  Result := r;
+end;
+
+function Fnv(const S: string): UInt64;
+var
+  i: Integer;
+begin
+  Result := $CBF29CE484222325;
+  for i := 1 to Length(S) do
+    Result := (Result xor UInt64(Ord(S[i]))) * 1099511628211;
+end;
+
+function ToFloat(const S: string): Double;
+begin
+  Result := StrToFloat(S);
+end;
+
+{ one operation; False when it was refused, with the reason in Why }
+function Apply(E: TPdfEditor; const OpText: string; var Why: string): Boolean;
+var
+  cmd: string;
+  f: TPdfField;
+begin
+  Result := True;
+  Why := '';
+  cmd := Field(OpText, 0, #2);
+  try
+    if cmd = 'text' then
+    begin
+      f := E.FindField(Field(OpText, 1, #2));
+      if f = nil then
+        raise EPdfFormError.Create('no field');
+      E.SetText(f, Field(OpText, 2, #2));
+    end
+    else if cmd = 'check' then
+    begin
+      f := E.FindField(Field(OpText, 1, #2));
+      if f = nil then
+        raise EPdfFormError.Create('no field');
+      E.SetChecked(f, Field(OpText, 2, #2) = '1');
+    end
+    else if cmd = 'radio' then
+    begin
+      f := E.FindField(Field(OpText, 1, #2));
+      if f = nil then
+        raise EPdfFormError.Create('no field');
+      E.SetState(f, Field(OpText, 2, #2));
+    end
+    else if cmd = 'choice' then
+    begin
+      f := E.FindField(Field(OpText, 1, #2));
+      if f = nil then
+        raise EPdfFormError.Create('no field');
+      E.SetChoice(f, Field(OpText, 2, #2));
+    end
+    else if cmd = 'draw' then
+      E.DrawText(StrToInt(Field(OpText, 1, #2)), ToFloat(Field(OpText, 2, #2)), ToFloat(Field(OpText, 3, #2)), Field(OpText, 7, #2), Field(OpText, 5, #2), ToFloat(Field(OpText, 4, #2)), 0, 0, 0, StrToInt(Field(OpText, 6, #2)))
+    else if cmd = 'needapp' then
+      E.NeedAppearances := True
+    else if cmd = 'dropxfa' then
+      E.DropXfa := True
+    else
+      raise EPdfFormError.Create('unknown operation ' + cmd);
+  except
+    on Er: EPdfFormError do
+    begin
+      Result := False;
+      Why := Er.Message;
+    end;
+    on Er: EPdfError do
+    begin
+      Result := False;
+      Why := Er.Message;
+    end;
+  end;
+end;
+
+var
+  corpus, line, name, pdf, ops, outp, why, op1, shown, flat, txt: string;
+  p, nl, count, bad, i, k, nops, a, b, rounds, ok, faults, other, rr: Integer;
+  lines: array of string;
+  n: Integer;
+  e, e2: TPdfEditor;
+  f: TPdfField;
+  expectFail, changed: Boolean;
+  fv: string;
+  d: TPdfDoc;
+  mut: string;
+  nrounds: Integer;
+  outdir: string;
+begin
+  if not ReadFile('testdata/pdfform.txt', corpus) then
+  begin
+    WriteLn('no testdata/pdfform.txt');
+    Halt(2);
+  end;
+  outdir := '';
+  if (ParamStr(1) = 'out') and (ParamStr(2) <> '') then
+    outdir := ParamStr(2);
+  p := 1;
+  count := 0;
+  bad := 0;
+  n := 0;
+  while p <= Length(corpus) do
+  begin
+    nl := p;
+    while (nl <= Length(corpus)) and (corpus[nl] <> #10) do
+      nl := nl + 1;
+    line := Copy(corpus, p, nl - p);
+    p := nl + 1;
+    if line = '' then
+      Continue;
+    SetLength(lines, n + 1);
+    lines[n] := line;
+    n := n + 1;
+    name := Field(line, 0, #9);
+    pdf := Unb64(Field(line, 1, #9));
+    ops := Unb64(Field(line, 2, #9));
+    count := count + 1;
+    e := TPdfEditor.Create(pdf);
+    nops := 0;
+    k := 0;
+    expectFail := False;
+    shown := '';
+    changed := False;
+    txt := '';
+    i := 0;
+    while True do
+    begin
+      op1 := Field(ops, i, #1);
+      if (op1 = '') and (i >= 1) and (Field(ops, i, #1) = '') and (Length(ops) = 0) then
+        Break;
+      if (i > 0) and (op1 = '') then
+        Break;
+      if (i = 0) and (ops = '') then
+        Break;
+      i := i + 1;
+      expectFail := False;
+      if Field(op1, 0, #2) = 'fail' then
+      begin
+        expectFail := True;
+        op1 := Copy(op1, 6, Length(op1));
+      end;
+      if Apply(e, op1, why) then
+      begin
+        if expectFail then
+        begin
+          bad := bad + 1;
+          WriteLn('NOT REFUSED ', name, ': ', Field(op1, 0, #2), ' ', Field(op1, 1, #2));
+        end
+        else
+        begin
+          nops := nops + 1;
+          changed := True;
+          if Field(op1, 0, #2) = 'draw' then
+            txt := txt + Field(op1, 7, #2) + #1;
+        end;
+      end
+      else if not expectFail then
+      begin
+        bad := bad + 1;
+        WriteLn('REFUSED ', name, ': ', Field(op1, 0, #2), ' ', Field(op1, 1, #2), ': ', why);
+      end;
+    end;
+    outp := e.Save;
+    if (not changed) and (not e.NeedAppearances) then
+    begin
+      if outp <> pdf then
+      begin
+        bad := bad + 1;
+        WriteLn('CHANGED ', name, ': nothing was written and the file is not the same');
+      end;
+    end
+    else if Copy(outp, 1, Length(pdf)) <> pdf then
+    begin
+      bad := bad + 1;
+      WriteLn('PREFIX ', name, ': the file does not begin with the original');
+    end;
+    if outdir <> '' then
+      WriteFile(outdir + '/' + name + '.pdf', outp);
+    { the file read again }
+    e2 := TPdfEditor.Create(outp);
+    shown := '';
+    i := 0;
+    while True do
+    begin
+      op1 := Field(ops, i, #1);
+      if (i > 0) and (op1 = '') then
+        Break;
+      if (i = 0) and (ops = '') then
+        Break;
+      i := i + 1;
+      if Field(op1, 0, #2) = 'fail' then
+        Continue;
+      if (Field(op1, 0, #2) = 'text') or (Field(op1, 0, #2) = 'check') or (Field(op1, 0, #2) = 'radio') or (Field(op1, 0, #2) = 'choice') then
+      begin
+        f := e2.FindField(Field(op1, 1, #2));
+        if f <> nil then
+          shown := shown + ' ' + Field(op1, 1, #2) + '=[' + e2.FieldValue(f) + ']';
+      end;
+    end;
+    { the text laid over the page is found }
+    flat := '';
+    if txt <> '' then
+    begin
+      d := e2.Doc;
+      flat := d.Text;
+      k := 1;
+      while k <= Length(txt) do
+      begin
+        a := k;
+        while (a <= Length(txt)) and (txt[a] <> #1) do
+          a := a + 1;
+        if Pos(Copy(txt, k, a - k), flat) = 0 then
+        begin
+          bad := bad + 1;
+          WriteLn('NO TEXT ', name, ': ', Copy(txt, k, a - k));
+        end;
+        k := a + 1;
+      end;
+    end;
+    WriteLn(name, ': ', nops, ' operations, ', Length(outp) - Length(pdf), ' bytes added, hash ', IntToHex(Fnv(outp), 16), ' fields', shown);
+  end;
+  WriteLn('forms ', count, ', wrong ', bad);
+  { the forms bent }
+  GS := 4370;
+  nrounds := 8;
+  if ParamStr(1) = 'rounds' then
+    nrounds := StrToInt(ParamStr(2));
+  if ParamStr(3) <> '' then
+    GS := StrToInt(ParamStr(3));
+  rounds := 0;
+  ok := 0;
+  faults := 0;
+  other := 0;
+  for rr := 0 to n - 1 do
+  begin
+    pdf := Unb64(Field(lines[rr], 1, #9));
+    ops := Unb64(Field(lines[rr], 2, #9));
+    for k := 1 to nrounds do
+    begin
+      mut := pdf;
+      case Rnd(5) of
+        0: mut := Copy(pdf, 1, Rnd(Length(pdf) + 1));
+        1:
+          begin
+            a := Rnd(Length(pdf)) + 1;
+            mut := Copy(pdf, 1, a - 1) + Copy(pdf, a + 1 + Rnd(40), Length(pdf));
+          end;
+        2:
+          for b := 1 to 1 + Rnd(8) do
+          begin
+            a := Rnd(Length(mut)) + 1;
+            mut[a] := Chr(Rnd(256));
+          end;
+        3:
+          begin
+            a := Rnd(Length(pdf)) + 1;
+            b := Rnd(Length(pdf)) + 1;
+            mut := Copy(pdf, 1, a) + Copy(pdf, b, 30 + Rnd(200)) + Copy(pdf, a + 1, Length(pdf));
+          end;
+        4:
+          for b := 1 to 1 + Rnd(4) do
+          begin
+            a := Rnd(Length(mut)) + 1;
+            mut[a] := Chr(Ord(mut[a]) xor (1 shl Rnd(8)));
+          end;
+      end;
+      rounds := rounds + 1;
+      try
+        e := TPdfEditor.Create(mut);
+        i := 0;
+        while True do
+        begin
+          op1 := Field(ops, i, #1);
+          if (i > 0) and (op1 = '') then
+            Break;
+          if (i = 0) and (ops = '') then
+            Break;
+          i := i + 1;
+          if Field(op1, 0, #2) = 'fail' then
+            op1 := Copy(op1, 6, Length(op1));
+          Apply(e, op1, why);
+        end;
+        outp := e.Save;
+        ok := ok + 1;
+      except
+        on Er: EPdfError do
+          faults := faults + 1;
+        on Er: EPdfFormError do
+          faults := faults + 1;
+        on Er: Exception do
+        begin
+          other := other + 1;
+          WriteLn('OTHER ', Field(lines[rr], 0, #9), ' round ', k, ': ', Er.ClassName, ' ', Er.Message);
+        end;
+      end;
+    end;
+  end;
+  WriteLn('mutations ', rounds, ': saved ', ok, ', refused ', faults, ', other ', other);
+end.

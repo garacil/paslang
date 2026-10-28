@@ -113,11 +113,15 @@ type
     Vals: array of TPdfObj;
     StmPos: Integer;
     StmLen: Integer;
+    { the number of the indirect object it was read as (0 for an object
+      that is part of another, or one made here) }
+    Num: Integer;
     { the entry of a dictionary or stream as it is in the file (a
       reference stays a reference), or nil when there is none }
     function Get(const Key: string): TPdfObj;
     function IsName(const AName: string): Boolean;
   end;
+
 
   { an object stream's header, read once: the numbers of its objects and
     their offsets from First }
@@ -164,6 +168,8 @@ type
     FPages: array of TPdfObj;
     FPagesDone: Boolean;
     FExt: TObject;
+    FStartXref: Integer;
+    FFirstStream: Boolean;
     procedure Warn(const Msg: string);
     procedure Fail(At: Integer; const Why: string);
     procedure GrowXref(N: Integer);
@@ -200,6 +206,24 @@ type
     function TrailerEntry(const Key: string): TPdfObj;
     { the number of objects the file's table has room for }
     property ObjectCount: Integer read FSize;
+    { the trailer dictionary (the dictionary of the xref stream when the
+      newest section is one) }
+    property Trailer: TPdfObj read FTrailer;
+    { where the file says its newest cross-reference section is (the
+      number after the last startxref), -1 when it says nothing and the
+      table was rebuilt }
+    property StartXref: Integer read FStartXref;
+    { whether the newest cross-reference section is a stream }
+    property XrefIsStream: Boolean read FFirstStream;
+    { one more than the highest object number the file has an entry for or
+      its trailer's Size says, whichever is more }
+    function ObjectLimit: Integer;
+    { how the file holds an object: 0 free, 1 at an offset, 2 inside an
+      object stream, -1 not at all; its generation (1) and offset or
+      object stream (1, 2) }
+    function ObjectKind(Num: Integer): Integer;
+    function ObjectGen(Num: Integer): Integer;
+    function ObjectOffset(Num: Integer): Integer;
     property Data: string read FData;
     property Rebuilt: Boolean read FRebuilt;
     { a stream that would make more than this many bytes is refused
@@ -235,6 +259,50 @@ type
 { the text of a file in memory: every page's, in reading order, a form feed
   after each page; EPdfError when the file is not a PDF it can read }
 function PdfText(const Data: string): string;
+
+{ objects made to be written: a null, a Boolean, an integer, a real, a string
+  (its bytes), a name (without the slash), an empty array, an empty
+  dictionary, a reference }
+function PdfNullObj: TPdfObj;
+function PdfBoolObj(V: Boolean): TPdfObj;
+function PdfIntObj(V: Integer): TPdfObj;
+function PdfRealObj(V: Double): TPdfObj;
+function PdfStrObj(const S: string): TPdfObj;
+function PdfNameObj(const S: string): TPdfObj;
+function PdfNewArray: TPdfObj;
+function PdfNewDict: TPdfObj;
+function PdfRefObj(Num: Integer): TPdfObj;
+
+{ the entry Key of a dictionary set to V (added if there is none; if the
+  key is there more than once, the first is set and the others go), and
+  removed }
+procedure PdfSet(D: TPdfObj; const Key: string; V: TPdfObj);
+procedure PdfRemove(D: TPdfObj; const Key: string);
+{ V at the end of an array }
+procedure PdfAdd(A: TPdfObj; V: TPdfObj);
+
+{ an object as PDF writes it (ISO 32000-1 7.3): a stream is its dictionary
+  alone, the caller writes the stream keyword and the data. A string with a
+  byte outside the printable ASCII is written in hexadecimal, a name with
+  # escapes, a real with at most ten decimals and no exponent. }
+function PdfSerialize(O: TPdfObj): string;
+
+{ a text string of a PDF (7.9.2.2: PDFDocEncoding, or UTF-16BE or UTF-8
+  with their marks) as UTF-8, and UTF-8 as a text string: PDFDocEncoding when
+  every character is in it, UTF-16BE with its mark if not }
+function PdfDecodeText(const S: string): string;
+function PdfEncodeText(const U: string): string;
+
+{ a real as a number in a content stream or a dictionary: at most ten
+  decimals, no exponent }
+function PdfNum(V: Double): string;
+
+{ the value of an integer or real object, 0 for anything else (nil too) }
+function PdfNumber(O: TPdfObj): Double;
+
+{ the next character of UTF-8 text at I (1 based) and past it; U+FFFD for a
+  byte that starts no character }
+function PdfNextRune(const S: string; var I: Integer): Integer;
 
 implementation
 
@@ -1236,6 +1304,7 @@ begin
     end;
   end;
   o.Gen := g;
+  o.Num := Num;
   Result := o;
 end;
 
@@ -1443,6 +1512,7 @@ var
   ok: Boolean;
 begin
   xp := FindStartXref;
+  FStartXref := xp;
   if xp < 0 then
   begin
     Warn('no startxref: the file''s table is rebuilt');
@@ -1467,7 +1537,10 @@ begin
       if not ReadXrefAt(xp, tr) then
         Fail(xp, 'no cross-reference section where startxref says');
       if first = nil then
+      begin
         first := tr;
+        FFirstStream := tr.Kind = pdfStream;
+      end;
       pv := tr.Get('Prev');
       if (pv <> nil) and (pv.Kind = pdfInt) then
         xp := pv.IVal
@@ -1504,6 +1577,7 @@ var
   data: string;
 begin
   FRebuilt := True;
+  FStartXref := -1;
   SetLength(FXKind, 0);
   SetLength(FXA, 0);
   SetLength(FXB, 0);
@@ -1752,6 +1826,7 @@ begin
   if lx.Next = tkEOF then
     Exit;
   Result := lx.ParseObject(0);
+  Result.Num := Num;
 end;
 
 function TPdfDoc.GetObject(Num: Integer): TPdfObj;
@@ -1895,6 +1970,44 @@ begin
   end;
 end;
 
+
+function TPdfDoc.ObjectLimit: Integer;
+var
+  i, sz: Integer;
+begin
+  Result := 0;
+  for i := Length(FXKind) - 1 downto 0 do
+    if FXKind[i] >= 0 then
+    begin
+      Result := i + 1;
+      Break;
+    end;
+  sz := IntOf(TrailerEntry('Size'), 0);
+  if sz > Result then
+    Result := sz;
+end;
+
+function TPdfDoc.ObjectKind(Num: Integer): Integer;
+begin
+  if (Num < 0) or (Num >= Length(FXKind)) then
+    Result := -1
+  else
+    Result := FXKind[Num];
+end;
+
+function TPdfDoc.ObjectGen(Num: Integer): Integer;
+begin
+  Result := 0;
+  if (Num >= 0) and (Num < Length(FXKind)) and (FXKind[Num] = 1) then
+    Result := FXB[Num];
+end;
+
+function TPdfDoc.ObjectOffset(Num: Integer): Integer;
+begin
+  Result := -1;
+  if (Num >= 0) and (Num < Length(FXKind)) and (FXKind[Num] >= 1) then
+    Result := FXA[Num];
+end;
 { ---- the filters (ISO 32000-1 7.4) ---- }
 
 type
@@ -3802,11 +3915,6 @@ begin
   Tm := Tlm;
 end;
 
-function Num(O: TPdfObj): Double;
-begin
-  Result := NumOf(O);
-end;
-
 procedure TPdfExtractor.DoXObject(Res: TPdfObj; const AName: string; Depth: Integer);
 var
   xo, xr, mt, sub: TPdfObj;
@@ -3847,12 +3955,12 @@ begin
   mt := Doc.Dict(sub, 'Matrix');
   if (mt <> nil) and (mt.Kind = pdfArray) and (Length(mt.Items) >= 6) then
   begin
-    m.A := Num(Doc.Resolve(mt.Items[0]));
-    m.B := Num(Doc.Resolve(mt.Items[1]));
-    m.C := Num(Doc.Resolve(mt.Items[2]));
-    m.D := Num(Doc.Resolve(mt.Items[3]));
-    m.E := Num(Doc.Resolve(mt.Items[4]));
-    m.F := Num(Doc.Resolve(mt.Items[5]));
+    m.A := NumOf(Doc.Resolve(mt.Items[0]));
+    m.B := NumOf(Doc.Resolve(mt.Items[1]));
+    m.C := NumOf(Doc.Resolve(mt.Items[2]));
+    m.D := NumOf(Doc.Resolve(mt.Items[3]));
+    m.E := NumOf(Doc.Resolve(mt.Items[4]));
+    m.F := NumOf(Doc.Resolve(mt.Items[5]));
     GS.Ctm := MatMul(m, GS.Ctm);
   end;
   SetLength(Active, Length(Active) + 1);
@@ -4760,8 +4868,6 @@ end;
 function TPdfDoc.Info(const Key: string): string;
 var
   inf, v: TPdfObj;
-  s: string;
-  i, u: Integer;
 begin
   Result := '';
   inf := TrailerEntry('Info');
@@ -4770,19 +4876,426 @@ begin
   v := Dict(inf, Key);
   if (v = nil) or (v.Kind <> pdfString) then
     Exit;
-  s := v.SVal;
-  if (Length(s) >= 2) and (Ord(s[1]) = $FE) and (Ord(s[2]) = $FF) then
-    Result := Utf16ToUtf8(Copy(s, 3, Length(s)))
-  else if (Length(s) >= 3) and (Ord(s[1]) = $EF) and (Ord(s[2]) = $BB) and (Ord(s[3]) = $BF) then
-    Result := Copy(s, 4, Length(s))
+  Result := PdfDecodeText(v.SVal);
+end;
+
+function PdfDecodeText(const S: string): string;
+var
+  i, u: Integer;
+begin
+  Result := '';
+  if (Length(S) >= 2) and (Ord(S[1]) = $FE) and (Ord(S[2]) = $FF) then
+    Result := Utf16ToUtf8(Copy(S, 3, Length(S)))
+  else if (Length(S) >= 3) and (Ord(S[1]) = $EF) and (Ord(S[2]) = $BB) and (Ord(S[3]) = $BF) then
+    Result := Copy(S, 4, Length(S))
   else
-    for i := 1 to Length(s) do
+    for i := 1 to Length(S) do
     begin
-      u := PdfEncodingRune(pePdfDoc, Ord(s[i]));
+      u := PdfEncodingRune(pePdfDoc, Ord(S[i]));
       if u < 0 then
         u := $FFFD;
       Result := Result + PdfRuneToUtf8(u);
     end;
 end;
 
+{ the next character of UTF-8 text at I (and past it); U+FFFD for a byte
+  that starts nothing }
+function NextRune(const S: string; var I: Integer): Integer;
+var
+  c, n, k, v: Integer;
+begin
+  c := Ord(S[I]);
+  I := I + 1;
+  if c < $80 then
+  begin
+    Result := c;
+    Exit;
+  end;
+  if (c >= $C2) and (c <= $DF) then
+  begin
+    n := 1;
+    v := c and $1F;
+  end
+  else if (c >= $E0) and (c <= $EF) then
+  begin
+    n := 2;
+    v := c and $0F;
+  end
+  else if (c >= $F0) and (c <= $F4) then
+  begin
+    n := 3;
+    v := c and $07;
+  end
+  else
+  begin
+    Result := $FFFD;
+    Exit;
+  end;
+  if I + n - 1 > Length(S) then
+  begin
+    Result := $FFFD;
+    Exit;
+  end;
+  for k := 0 to n - 1 do
+  begin
+    if (Ord(S[I + k]) and $C0) <> $80 then
+    begin
+      Result := $FFFD;
+      Exit;
+    end;
+    v := (v shl 6) or (Ord(S[I + k]) and $3F);
+  end;
+  I := I + n;
+  Result := v;
+end;
+
+function PdfEncodeText(const U: string): string;
+var
+  i, r, c, k: Integer;
+  runes: array of Integer;
+  n: Integer;
+  doc, u16: string;
+  ok: Boolean;
+begin
+  n := 0;
+  SetLength(runes, Length(U));
+  i := 1;
+  while i <= Length(U) do
+  begin
+    runes[n] := NextRune(U, i);
+    n := n + 1;
+  end;
+  doc := '';
+  ok := True;
+  for i := 0 to n - 1 do
+  begin
+    r := runes[i];
+    c := -1;
+    if (r >= 32) and (r < 127) then
+      c := r
+    else
+      for k := 0 to 255 do
+        if PdfEncodingRune(pePdfDoc, k) = r then
+        begin
+          c := k;
+          Break;
+        end;
+    if c < 0 then
+    begin
+      ok := False;
+      Break;
+    end;
+    doc := doc + Chr(c);
+  end;
+  if ok then
+  begin
+    Result := doc;
+    Exit;
+  end;
+  u16 := Chr($FE) + Chr($FF);
+  for i := 0 to n - 1 do
+  begin
+    r := runes[i];
+    if r >= $10000 then
+    begin
+      r := r - $10000;
+      u16 := u16 + Chr($D8 + (r shr 18)) + Chr((r shr 10) and 255) + Chr($DC + ((r shr 8) and 3)) + Chr(r and 255);
+    end
+    else
+      u16 := u16 + Chr(r shr 8) + Chr(r and 255);
+  end;
+  Result := u16;
+end;
+
+{ ---- objects made and written ---- }
+
+function PdfMake(K: Integer): TPdfObj;
+begin
+  Result := TPdfObj.Create;
+  Result.Kind := K;
+end;
+
+function PdfNullObj: TPdfObj;
+begin
+  Result := PdfMake(pdfNull);
+end;
+
+function PdfBoolObj(V: Boolean): TPdfObj;
+begin
+  Result := PdfMake(pdfBool);
+  if V then
+    Result.IVal := 1;
+end;
+
+function PdfIntObj(V: Integer): TPdfObj;
+begin
+  Result := PdfMake(pdfInt);
+  Result.IVal := V;
+  Result.RVal := V;
+end;
+
+function PdfRealObj(V: Double): TPdfObj;
+begin
+  Result := PdfMake(pdfReal);
+  Result.RVal := V;
+end;
+
+function PdfStrObj(const S: string): TPdfObj;
+begin
+  Result := PdfMake(pdfString);
+  Result.SVal := S;
+end;
+
+function PdfNameObj(const S: string): TPdfObj;
+begin
+  Result := PdfMake(pdfName);
+  Result.SVal := S;
+end;
+
+function PdfNewArray: TPdfObj;
+begin
+  Result := PdfMake(pdfArray);
+end;
+
+function PdfNewDict: TPdfObj;
+begin
+  Result := PdfMake(pdfDict);
+end;
+
+function PdfRefObj(Num: Integer): TPdfObj;
+begin
+  Result := PdfMake(pdfRef);
+  Result.IVal := Num;
+end;
+
+procedure PdfRemove(D: TPdfObj; const Key: string);
+var
+  i, n: Integer;
+begin
+  n := 0;
+  for i := 0 to Length(D.Keys) - 1 do
+    if D.Keys[i] <> Key then
+    begin
+      D.Keys[n] := D.Keys[i];
+      D.Vals[n] := D.Vals[i];
+      n := n + 1;
+    end;
+  SetLength(D.Keys, n);
+  SetLength(D.Vals, n);
+end;
+
+procedure PdfSet(D: TPdfObj; const Key: string; V: TPdfObj);
+var
+  i, n: Integer;
+  found: Boolean;
+begin
+  found := False;
+  n := 0;
+  for i := 0 to Length(D.Keys) - 1 do
+  begin
+    if D.Keys[i] = Key then
+    begin
+      if found then
+        Continue;
+      found := True;
+      D.Vals[i] := V;
+    end;
+    D.Keys[n] := D.Keys[i];
+    D.Vals[n] := D.Vals[i];
+    n := n + 1;
+  end;
+  SetLength(D.Keys, n);
+  SetLength(D.Vals, n);
+  if not found then
+  begin
+    SetLength(D.Keys, n + 1);
+    SetLength(D.Vals, n + 1);
+    D.Keys[n] := Key;
+    D.Vals[n] := V;
+  end;
+end;
+
+procedure PdfAdd(A: TPdfObj; V: TPdfObj);
+begin
+  SetLength(A.Items, Length(A.Items) + 1);
+  A.Items[Length(A.Items) - 1] := V;
+end;
+
+{ a real with at most ten decimals, no exponent, no trailing zeros }
+function FormatReal(V: Double): string;
+var
+  neg: Boolean;
+  ip, fp, k: Integer;
+  fr: Double;
+  s: string;
+begin
+  if V <> V then
+  begin
+    Result := '0';
+    Exit;
+  end;
+  neg := V < 0;
+  if neg then
+    V := -V;
+  if V > 1000000000000000.0 then
+    V := 1000000000000000.0;
+  ip := Trunc(V);
+  fr := V - ip;
+  fp := Round(fr * 10000000000.0);
+  if fp >= 10000000000 then
+  begin
+    ip := ip + 1;
+    fp := 0;
+  end;
+  s := IntToStr(ip);
+  if fp > 0 then
+  begin
+    k := 10;
+    while (k > 0) and (fp mod 10 = 0) do
+    begin
+      fp := fp div 10;
+      k := k - 1;
+    end;
+    s := s + '.';
+    { the decimals, with their leading zeros }
+    s := s + Copy('0000000000', 1, k - Length(IntToStr(fp))) + IntToStr(fp);
+  end;
+  if neg and (s <> '0') then
+    s := '-' + s;
+  Result := s;
+end;
+
+procedure WriteObj(O: TPdfObj; SB: TStringBuilder);
+var
+  i, c: Integer;
+  s: string;
+  plain: Boolean;
+const
+  HexDigits = '0123456789ABCDEF';
+begin
+  if O = nil then
+  begin
+    SB.AddText('null');
+    Exit;
+  end;
+  case O.Kind of
+    pdfNull: SB.AddText('null');
+    pdfBool:
+      if O.IVal <> 0 then
+        SB.AddText('true')
+      else
+        SB.AddText('false');
+    pdfInt: SB.AddText(IntToStr(O.IVal));
+    pdfReal: SB.AddText(FormatReal(O.RVal));
+    pdfRef:
+      begin
+        SB.AddText(IntToStr(O.IVal));
+        SB.AddText(' ');
+        SB.AddText(IntToStr(O.Gen));
+        SB.AddText(' R');
+      end;
+    pdfString:
+      begin
+        s := O.SVal;
+        plain := True;
+        for i := 1 to Length(s) do
+        begin
+          c := Ord(s[i]);
+          if (c < 32) or (c > 126) then
+            plain := False;
+        end;
+        if plain then
+        begin
+          SB.AddChar('(');
+          for i := 1 to Length(s) do
+          begin
+            c := Ord(s[i]);
+            if (c = 40) or (c = 41) or (c = 92) then
+              SB.AddChar('\');
+            SB.AddChar(Chr(c));
+          end;
+          SB.AddChar(')');
+        end
+        else
+        begin
+          SB.AddChar('<');
+          for i := 1 to Length(s) do
+          begin
+            c := Ord(s[i]);
+            SB.AddChar(HexDigits[(c shr 4) + 1]);
+            SB.AddChar(HexDigits[(c and 15) + 1]);
+          end;
+          SB.AddChar('>');
+        end;
+      end;
+    pdfName:
+      begin
+        SB.AddChar('/');
+        s := O.SVal;
+        for i := 1 to Length(s) do
+        begin
+          c := Ord(s[i]);
+          if (c <= 32) or (c >= 127) or (CCls[c] = 2) or (c = 35) then
+          begin
+            SB.AddChar('#');
+            SB.AddChar(HexDigits[(c shr 4) + 1]);
+            SB.AddChar(HexDigits[(c and 15) + 1]);
+          end
+          else
+            SB.AddChar(Chr(c));
+        end;
+      end;
+    pdfArray:
+      begin
+        SB.AddChar('[');
+        for i := 0 to Length(O.Items) - 1 do
+        begin
+          if i > 0 then
+            SB.AddChar(' ');
+          WriteObj(O.Items[i], SB);
+        end;
+        SB.AddChar(']');
+      end;
+    pdfDict, pdfStream:
+      begin
+        SB.AddText('<<');
+        for i := 0 to Length(O.Keys) - 1 do
+        begin
+          SB.AddText(' ');
+          WriteObj(PdfNameObj(O.Keys[i]), SB);
+          SB.AddText(' ');
+          WriteObj(O.Vals[i], SB);
+        end;
+        SB.AddText(' >>');
+      end;
+  end;
+end;
+
+function PdfSerialize(O: TPdfObj): string;
+var
+  sb: TStringBuilder;
+begin
+  sb := TStringBuilder.Create(128);
+  try
+    WriteObj(O, sb);
+    Result := sb.ToString;
+  finally
+    sb.Free;
+  end;
+end;
+
+function PdfNum(V: Double): string;
+begin
+  Result := FormatReal(V);
+end;
+
+function PdfNumber(O: TPdfObj): Double;
+begin
+  Result := NumOf(O);
+end;
+
+function PdfNextRune(const S: string; var I: Integer): Integer;
+begin
+  Result := NextRune(S, I);
+end;
 end.
