@@ -781,6 +781,10 @@ type
     function ShaSuffix(const Ext: string): string;
     function HashPieceAlg(const N: string): LongInt;
     function ParseHashPiece(const AName: string; ALine, ACol: LongInt): PExpr;
+    function HmacPieceAlg(const N: string): LongInt;
+    function ParseHmacPiece(const AName: string; ALine, ACol: LongInt): PExpr;
+    function Sha3PieceBits(const N: string): LongInt;
+    function ParseSha3Piece(const AName: string; ALine, ACol: LongInt): PExpr;
   end;
 
 constructor TParser.Create(Lex: TLexer; const UPath: array of string; Arm: Boolean);
@@ -7114,6 +7118,14 @@ begin
   AddReserved('md5begin md5update md5final sha1begin sha1update sha1final');
   AddReserved('sha224begin sha224update sha224final sha256begin sha256update sha256final');
   AddReserved('sha384begin sha384update sha384final sha512begin sha512update sha512final');
+  { the HMAC and SHA-3 in pieces (P443) }
+  AddReserved('hmacmd5begin hmacmd5update hmacmd5final hmacsha1begin hmacsha1update');
+  AddReserved('hmacsha1final hmacsha224begin hmacsha224update hmacsha224final');
+  AddReserved('hmacsha256begin hmacsha256update hmacsha256final hmacsha384begin');
+  AddReserved('hmacsha384update hmacsha384final hmacsha512begin hmacsha512update');
+  AddReserved('hmacsha512final sha3_224begin sha3_224update sha3_224final');
+  AddReserved('sha3_256begin sha3_256update sha3_256final sha3_384begin sha3_384update');
+  AddReserved('sha3_384final sha3_512begin sha3_512update sha3_512final');
   AddReserved('sha3_512 hmacmd5 hmacsha1 hmacsha224 hmacsha256 hmacsha384');
   AddReserved('hmacsha512 crc32 crc32c adler32 fnv1a32 fnv1a64 murmur3 siphash');
   AddReserved('tryget default assigned setlength inc dec getmem freemem move jsonof jsondecode');
@@ -12889,6 +12901,10 @@ begin
         end
         else if (HashPieceAlg(name) >= 0) and (FTok.Kind = tkLParen) then
           Result := ParseHashPiece(name, nline, ncol)
+        else if (HmacPieceAlg(name) >= 0) and (FTok.Kind = tkLParen) then
+          Result := ParseHmacPiece(name, nline, ncol)
+        else if (Sha3PieceBits(name) > 0) and (FTok.Kind = tkLParen) then
+          Result := ParseSha3Piece(name, nline, ncol)
         else if (SameId(name, 'Hex') or SameId(name, 'Md5') or SameId(name, 'Sha1') or
           SameId(name, 'Sha224') or SameId(name, 'Sha256') or SameId(name, 'Sha384') or
           SameId(name, 'Sha512') or SameId(name, 'Fnv1a32') or SameId(name, 'Fnv1a64')) and
@@ -20525,6 +20541,161 @@ begin
     Result := CoreProc('Pas' + fam + 'Update' + sfx, args, TyNone)
   else
     Result := CoreProc('Pas' + fam + 'Final' + sfx, args, TyString);
+end;
+
+{ Which hash an HMAC in pieces names: 0 MD5 ... 5 SHA-512 for
+  HmacSha256Begin, HmacMd5Update, HmacSha512Final and their kin; -1 for
+  any other name (P443) }
+function TParser.HmacPieceAlg(const N: string): LongInt;
+var
+  l, f: string;
+begin
+  Result := -1;
+  l := ToLower(N);
+  if (Length(l) < 12) or (Length(l) > 17) or (Copy(l, 1, 4) <> 'hmac') then
+    Exit;
+  if (Copy(l, Length(l) - 4, 5) = 'begin') or (Copy(l, Length(l) - 4, 5) = 'final') then
+    f := Copy(l, 5, Length(l) - 9)
+  else if Copy(l, Length(l) - 5, 6) = 'update' then
+    f := Copy(l, 5, Length(l) - 10)
+  else
+    Exit;
+  if f = 'md5' then
+    Result := 0
+  else if f = 'sha1' then
+    Result := 1
+  else if f = 'sha224' then
+    Result := 2
+  else if f = 'sha256' then
+    Result := 3
+  else if f = 'sha384' then
+    Result := 4
+  else if f = 'sha512' then
+    Result := 5;
+end;
+
+{ HmacSha256Begin(st, key), HmacSha256Update(st, s), HmacSha256Final(st):
+  an HMAC in pieces on a THmacState (P443), the Cpu or Base body by the
+  family's features as the whole-message word chooses }
+function TParser.ParseHmacPiece(const AName: string; ALine, ACol: LongInt): PExpr;
+var
+  args: TExprArray;
+  alg, id: LongInt;
+  act, sfx, where: string;
+  l: string;
+begin
+  args := ParseArgList;
+  alg := HmacPieceAlg(AName);
+  l := ToLower(AName);
+  if Copy(l, Length(l) - 5, 6) = 'update' then
+    act := 'Update'
+  else if Copy(l, Length(l) - 4, 5) = 'begin' then
+    act := 'Begin'
+  else
+    act := 'Final';
+  where := ' at ' + IntToStr(ALine) + ':' + IntToStr(ACol);
+  if not NamedType('THmacState', id) then
+    Refuse(AName + ' needs the core unit pashash' + where);
+  if act = 'Begin' then
+  begin
+    if Length(args) <> 2 then
+      Refuse(AName + ' takes a THmacState and the key, a string' + where);
+  end
+  else if act = 'Update' then
+  begin
+    if Length(args) <> 2 then
+      Refuse(AName + ' takes a THmacState and a string' + where);
+  end
+  else if Length(args) <> 1 then
+    Refuse(AName + ' takes a THmacState' + where);
+  CheckOutVar(args[0], id, AName);
+  case alg of
+    0: sfx := 'Base';
+    1: sfx := ShaSuffix('sha1');
+    2, 3: sfx := ShaSuffix('sha2');
+  else
+    sfx := CpuSuffix('sha512');
+  end;
+  if act = 'Final' then
+    Exit(CoreProc('PasHmacFinal' + sfx, args, TyString));
+  args[1] := StrArg(TyString, args[1]);
+  if act = 'Begin' then
+  begin
+    SetLength(args, 3);
+    args[2] := args[1];
+    args[1] := NewInt(alg);
+    Exit(CoreProc('PasHmacBegin' + sfx, args, TyNone));
+  end;
+  Result := CoreProc('PasHmacUpdate' + sfx, args, TyNone);
+end;
+
+{ The size in bits an SHA-3 in pieces names: 224, 256, 384 or 512 for
+  Sha3_256Begin, Sha3_512Update and their kin; 0 for any other name
+  (P443) }
+function TParser.Sha3PieceBits(const N: string): LongInt;
+var
+  l, f: string;
+begin
+  Result := 0;
+  l := ToLower(N);
+  if (Length(l) < 13) or (Length(l) > 14) or (Copy(l, 1, 5) <> 'sha3_') then
+    Exit;
+  if (Copy(l, Length(l) - 4, 5) = 'begin') or (Copy(l, Length(l) - 4, 5) = 'final') then
+    f := Copy(l, 6, Length(l) - 10)
+  else if Copy(l, Length(l) - 5, 6) = 'update' then
+    f := Copy(l, 6, Length(l) - 11)
+  else
+    Exit;
+  if f = '224' then
+    Result := 224
+  else if f = '256' then
+    Result := 256
+  else if f = '384' then
+    Result := 384
+  else if f = '512' then
+    Result := 512;
+end;
+
+{ Sha3_256Begin(st), Sha3_256Update(st, s), Sha3_256Final(st): an SHA-3
+  in pieces on a TSha3State (P443); one body, as Sha3_256 has }
+function TParser.ParseSha3Piece(const AName: string; ALine, ACol: LongInt): PExpr;
+var
+  args: TExprArray;
+  id: LongInt;
+  act, where: string;
+  l: string;
+begin
+  args := ParseArgList;
+  l := ToLower(AName);
+  if Copy(l, Length(l) - 5, 6) = 'update' then
+    act := 'Update'
+  else if Copy(l, Length(l) - 4, 5) = 'begin' then
+    act := 'Begin'
+  else
+    act := 'Final';
+  where := ' at ' + IntToStr(ALine) + ':' + IntToStr(ACol);
+  if not NamedType('TSha3State', id) then
+    Refuse(AName + ' needs the core unit pashash' + where);
+  if act = 'Update' then
+  begin
+    if Length(args) <> 2 then
+      Refuse(AName + ' takes a TSha3State and a string' + where);
+  end
+  else if Length(args) <> 1 then
+    Refuse(AName + ' takes a TSha3State' + where);
+  CheckOutVar(args[0], id, AName);
+  if act = 'Begin' then
+  begin
+    SetLength(args, 2);
+    args[1] := NewInt(Sha3PieceBits(AName));
+    Exit(CoreProc('PasSha3Begin', args, TyNone));
+  end;
+  if act = 'Update' then
+  begin
+    args[1] := StrArg(TyString, args[1]);
+    Exit(CoreProc('PasSha3Update', args, TyNone));
+  end;
+  Result := CoreProc('PasSha3Final', args, TyString);
 end;
 
 function TParser.ShaSuffix(const Ext: string): string;

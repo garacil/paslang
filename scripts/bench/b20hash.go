@@ -76,6 +76,24 @@ func main() {
 			m.Write(s)
 			d = m.Sum(nil)
 		}
+	case "hmacp":
+		for i := 1; i <= 256; i++ {
+			s[0] = byte(i)
+			m := hmac.New(sha256.New, []byte("key of the bench"))
+			for j := 0; j < 256; j++ {
+				m.Write(s[j*4096 : (j+1)*4096])
+			}
+			d = m.Sum(nil)
+		}
+	case "sha3p":
+		for i := 1; i <= 64; i++ {
+			s[0] = byte(i)
+			h := sha3.New256()
+			for j := 0; j < 256; j++ {
+				h.Write(s[j*4096 : (j+1)*4096])
+			}
+			d = h.Sum(nil)
+		}
 	case "crc32":
 		for i := 1; i <= 2048; i++ {
 			s[0] = byte(i & 255)
@@ -95,7 +113,7 @@ func main() {
 			acc ^= int64(h.Sum64())
 		}
 	default:
-		fmt.Println("b20hash: md5, sha1, sha512, sha3, hmac, crc32, adler32 or fnv")
+		fmt.Println("b20hash: md5, sha1, sha512, sha3, hmac, hmacp, sha3p, crc32, adler32 or fnv")
 		os.Exit(2)
 	}
 	if d != nil {

@@ -7806,7 +7806,17 @@ The ways to get one:
   4 KiB at a time is hashed in the memory of one block and costs what
   the whole-message word costs; `Begin` again starts another digest on
   the same variable. The state is a record of 216 bytes: copy it to
-  fork a digest. HMAC and SHA-3 in pieces are not there yet.
+  fork a digest. HMAC and SHA-3 go in pieces the same way (1.2.302,
+  P443): `HmacSha256Begin(st, key)` on a `THmacState` variable,
+  `HmacSha256Update(st, part)` and `HmacSha256Final(st)` for the MAC,
+  which is the one `HmacSha256(key, msg)` gives the pieces joined, and
+  the same for `HmacMd5`, `HmacSha1`, `HmacSha224`, `HmacSha384` and
+  `HmacSha512`; `Sha3_256Begin(st)` on a `TSha3State` variable,
+  `Sha3_256Update` and `Sha3_256Final`, and the same for `Sha3_224`,
+  `Sha3_384` and `Sha3_512`. `Final` leaves the state as it was, as Go's
+  `Sum` does, so more can be fed after it; `Begin` again starts another.
+  The key is read once, at `Begin`, and the state holds the key's two
+  pads, a record of 352 bytes; the SHA-3 state is 360 bytes.
 - A key: `HmacSha256(key, msg)` for authentication, `SipHash(s, k0,
   k1)` for a table; a seed: `Murmur3(s, seed)`, `XxHash3(s, seed)`.
 
@@ -14582,7 +14592,10 @@ its place:
   The algorithms, says what each computes and what it is for), and the
   pieces of a digest (1.1.259): `Md5Begin Md5Update Md5Final` and the
   same for `Sha1 Sha224 Sha256 Sha384 Sha512`, with the type
-  `THashState`;
+  `THashState`, and in pieces too (1.2.302): `HmacMd5Begin HmacMd5Update
+  HmacMd5Final` and the same for the other five HMACs, `Sha3_224Begin
+  Sha3_224Update Sha3_224Final` and the same for the other three sizes,
+  with the types `THmacState` and `TSha3State`;
 - the calculation set (§15): `Abs Sqr Sqrt Trunc Round Int Frac Floor
   Ceil Min Max Pi Exp Ln LnXP1 Log10 Log2 LogN Power Hypot Ldexp Poly
   Sin Cos Tan Cot Sec Csc ArcSin ArcCos ArcTan ArcTan2 ArcCot ArcSec

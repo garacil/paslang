@@ -596,6 +596,199 @@ end;
             fam('Sha512', 'Integer', 128, 16, blk512, out512))
 
 
+SHA3_INC = r"""
+{ SHA-3 in pieces (P443): the sponge of FIPS 202 on the Keccak-f[1600]
+  permutation, the bytes of S absorbed a rate at a time as they come,
+  the rest held; Final pads with 06 and 80 (the domain bits 01 and the
+  pad10*1 rule, FIPS 202 5.1 and 6.1) on a copy, so the state goes on }
+procedure Sha3Absorb(var St: TSha3State; P: Pointer; Rate: Integer);
+var
+  i: Integer;
+begin
+  for i := 0 to Rate div 8 - 1 do
+    St.A[i] := St.A[i] xor LoadLE64(Pointer(Integer(P) + i * 8));
+  KeccakF(@St.A[0]);
+end;
+
+procedure PasSha3Begin(var St: TSha3State; Bits: Integer);
+var
+  i: Integer;
+begin
+  if not ((Bits = 224) or (Bits = 256) or (Bits = 384) or (Bits = 512)) then
+  begin
+    WriteLn(ErrOutput, 'paslang: Sha3 takes 224, 256, 384 or 512 bits');
+    Halt(1);
+  end;
+  St.Bits := Bits;
+  St.Fill := 0;
+  for i := 0 to 24 do
+    St.A[i] := 0;
+  for i := 0 to 143 do
+    St.Buf[i] := 0;
+end;
+
+procedure PasSha3Update(var St: TSha3State; const S: string);
+var
+  rate, i, n, k, done: Integer;
+  p: Pointer;
+begin
+  n := Length(S);
+  if n = 0 then
+    Exit;
+  rate := 200 - 2 * (St.Bits div 8);
+  p := Pointer(S);
+  done := 0;
+  if St.Fill > 0 then
+  begin
+    k := rate - St.Fill;
+    if k > n then
+      k := n;
+    for i := 0 to k - 1 do
+      St.Buf[St.Fill + i] := PByte(p)[i];
+    St.Fill := St.Fill + k;
+    done := k;
+    if St.Fill = rate then
+    begin
+      Sha3Absorb(St, @St.Buf[0], rate);
+      St.Fill := 0;
+    end;
+  end;
+  while n - done >= rate do
+  begin
+    Sha3Absorb(St, Pointer(Integer(p) + done), rate);
+    done := done + rate;
+  end;
+  k := n - done;
+  for i := 0 to k - 1 do
+    St.Buf[i] := PByte(p)[done + i];
+  if k > 0 then
+    St.Fill := k;
+end;
+
+function PasSha3Final(var St: TSha3State): string;
+var
+  a: array[0..24] of Integer;
+  blk: array[0..143] of Byte;
+  rate, i, j, t, outn: Integer;
+begin
+  rate := 200 - 2 * (St.Bits div 8);
+  for i := 0 to 24 do
+    a[i] := St.A[i];
+  for i := 0 to 143 do
+    blk[i] := 0;
+  for i := 0 to St.Fill - 1 do
+    blk[i] := St.Buf[i];
+  blk[St.Fill] := blk[St.Fill] xor $06;
+  blk[rate - 1] := blk[rate - 1] xor $80;
+  for i := 0 to rate div 8 - 1 do
+    a[i] := a[i] xor LoadLE64(@blk[i * 8]);
+  KeccakF(@a[0]);
+  outn := St.Bits div 8;
+  SetLength(Result, outn);
+  i := 0;
+  while i < outn do
+  begin
+    t := a[i div 8];
+    for j := 0 to 7 do
+      if i + j < outn then
+        Result[i + j + 1] := Char((t shr (8 * j)) and 255);
+    i := i + 8;
+  end;
+end;
+"""
+
+
+def hmac_inc(v):
+    """HMAC in pieces (P443): the key block's ipad goes into the inner
+    state at Begin as Go's crypto/hmac writes it, the opad is kept for
+    Final, which finishes a copy of the inner state and hashes the opad
+    and the inner digest in a state of its own; only the Update and Final
+    of its own hash are called, as the whole-message words do."""
+    t = r"""
+{ the digest in pieces of St.Alg, fed and finished by this body }
+procedure HmacFeed{V}(var St: THashState; const S: string);
+begin
+  case St.Alg of
+    0: PasMd5Update(St, S);
+    1: PasSha1Update{V}(St, S);
+    2, 3: PasSha256Update{V}(St, S);
+  else
+    PasSha512Update{V}(St, S);
+  end;
+end;
+
+function HmacEnd{V}(var St: THashState): string;
+begin
+  case St.Alg of
+    0: Result := PasMd5Final(St);
+    1: Result := PasSha1Final{V}(St);
+    2, 3: Result := PasSha256Final{V}(St);
+  else
+    Result := PasSha512Final{V}(St);
+  end;
+end;
+
+{ RFC 2104: the key hashed when longer than the block, padded with zeros,
+  its xor with 36 fed to the inner digest now and its xor with 5c kept }
+procedure PasHmacBegin{V}(var St: THmacState; Alg: Integer; const Key: string);
+var
+  blk, i: Integer;
+  k, ipad: string;
+begin
+  if Alg >= 4 then
+    blk := 128
+  else
+    blk := 64;
+  k := Key;
+  if Length(k) > blk then
+    k := HashBy{V}(Alg, k);
+  SetLength(ipad, blk);
+  for i := 1 to blk do
+    if i <= Length(k) then
+    begin
+      ipad[i] := Char(Ord(k[i]) xor $36);
+      St.Opad[i - 1] := Byte(Ord(k[i]) xor $5c);
+    end
+    else
+    begin
+      ipad[i] := Char($36);
+      St.Opad[i - 1] := $5c;
+    end;
+  St.Alg := Alg;
+  PasHashBegin(St.Inner, Alg);
+  HmacFeed{V}(St.Inner, ipad);
+end;
+
+procedure PasHmacUpdate{V}(var St: THmacState; const S: string);
+begin
+  HmacFeed{V}(St.Inner, S);
+end;
+
+{ the MAC of what was fed; the state is not changed, so more can be fed }
+function PasHmacFinal{V}(var St: THmacState): string;
+var
+  o, c: THashState;
+  d, opad: string;
+  blk, i: Integer;
+begin
+  c := St.Inner;
+  d := HmacEnd{V}(c);
+  if St.Alg >= 4 then
+    blk := 128
+  else
+    blk := 64;
+  SetLength(opad, blk);
+  for i := 1 to blk do
+    opad[i] := Char(St.Opad[i - 1]);
+  PasHashBegin(o, St.Alg);
+  HmacFeed{V}(o, opad);
+  HmacFeed{V}(o, d);
+  Result := HmacEnd{V}(o);
+end;
+"""
+    return t.replace('{V}', v)
+
+
 MD5_INC = r"""
 { MD5 in pieces: the same buffering on Md5Blocks, which has one body; the
   length is the little-endian count of bits (RFC 1321 3.2 and 3.4) }
@@ -1111,7 +1304,35 @@ type
     Buf: array[0..127] of Byte;
   end;
 
+  { SHA-3 in pieces (P443): the digest's size in bits, the bytes held for
+    the next block of the rate, the 25 lanes of the Keccak state and the
+    block held; Sha3_256Begin ... Sha3_512Final are its words }
+  TSha3State = record
+    Bits: Integer;
+    Fill: Integer;
+    A: array[0..24] of Integer;
+    Buf: array[0..143] of Byte;
+  end;
+
+  { An HMAC in pieces (P443): which hash, the inner digest running with
+    the key's ipad already fed, and the key's opad for Final; HmacMd5Begin
+    ... HmacSha512Final are its words }
+  THmacState = record
+    Alg: Integer;
+    Inner: THashState;
+    Opad: array[0..127] of Byte;
+  end;
+
 procedure PasHashBegin(var St: THashState; Alg: Integer);
+procedure PasSha3Begin(var St: TSha3State; Bits: Integer);
+procedure PasSha3Update(var St: TSha3State; const S: string);
+function PasSha3Final(var St: TSha3State): string;
+procedure PasHmacBeginCpu(var St: THmacState; Alg: Integer; const Key: string);
+procedure PasHmacBeginBase(var St: THmacState; Alg: Integer; const Key: string);
+procedure PasHmacUpdateCpu(var St: THmacState; const S: string);
+procedure PasHmacUpdateBase(var St: THmacState; const S: string);
+function PasHmacFinalCpu(var St: THmacState): string;
+function PasHmacFinalBase(var St: THmacState): string;
 procedure PasMd5Update(var St: THashState; const S: string);
 function PasMd5Final(var St: THashState): string;
 procedure PasSha1UpdateCpu(var St: THashState; const S: string);
@@ -2021,6 +2242,9 @@ end;
     out.append(MD5_INC)
     out.append(incremental('Cpu'))
     out.append(incremental('Base'))
+    out.append(SHA3_INC)
+    out.append(hmac_inc('Cpu'))
+    out.append(hmac_inc('Base'))
     out.append('\nend.\n')
     text = align_loops('\n'.join(out))
     path = os.path.join(ROOT, 'src', 'lib', 'pashash.paslang')

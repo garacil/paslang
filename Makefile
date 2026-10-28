@@ -646,6 +646,9 @@ GOLDEN_A64 += x509verify x509pem x509conc
 # P440: the digests in pieces equal the whole-message words, every cut.
 GOLDEN += hashpieces
 GOLDEN_A64 += hashpieces
+# P443: HMAC and SHA-3 in pieces equal the whole-message words, every cut.
+GOLDEN += hashpieces2
+GOLDEN_A64 += hashpieces2
 # P435: base64, URL, CSV and letters against Go's own output; LoadZone
 # against time.LoadLocation (the system's zoneinfo).
 GOLDEN += codec zones
@@ -1241,7 +1244,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/stackmap.out $(BUILDDIR)/stackmap.vgot; \
 	echo ok stackmaps; \
 	echo "==== the base processor (-cpu base) ===="; \
-	for t in vectors vecmore vecpool bitwords xxh3 inlineasm hash1 tree1 store1 mapsplit set256 strwords strkern strcmpk cmpwords sysutils1 utf8kern jsonkern longslice rtlong fillkern json1 jsoncanon hmacstream hashpieces cipherkat cipherwyche x25519kat nistwyche rsawyche; do \
+	for t in vectors vecmore vecpool bitwords xxh3 inlineasm hash1 tree1 store1 mapsplit set256 strwords strkern strcmpk cmpwords sysutils1 utf8kern jsonkern longslice rtlong fillkern json1 jsoncanon hmacstream hashpieces hashpieces2 cipherkat cipherwyche x25519kat nistwyche rsawyche; do \
 	  $(OUTDIR)/paslangc -cpu base -o $(BUILDDIR)/$$t-base testdata/$$t.paslang; \
 	  $(BUILDDIR)/$$t-base > $(BUILDDIR)/$$t.bgot; \
 	  diff -u testdata/$$t.out $(BUILDDIR)/$$t.bgot; \
@@ -1253,6 +1256,10 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'p_pashash_passha256updatecpu' $(BUILDDIR)/hashpieces.s; \
 	grep -q 'p_pashash_passha256updatebase' $(BUILDDIR)/hashpieces-base.s; \
 	if grep -q 'p_pashash_passha256updatecpu' $(BUILDDIR)/hashpieces-base.s; then echo "hashpieces-base.s calls the SHA-NI body"; exit 1; fi; \
+	: the HMAC in pieces calls the Cpu or the Base body of its hash by the processor, P443; \
+	grep -q 'p_pashash_pashmacupdatecpu' $(BUILDDIR)/hashpieces2.s; \
+	grep -q 'p_pashash_pashmacupdatebase' $(BUILDDIR)/hashpieces2-base.s; \
+	if grep -q 'p_pashash_pashmacupdatecpu' $(BUILDDIR)/hashpieces2-base.s; then echo "hashpieces2-base.s calls the SHA-NI body"; exit 1; fi; \
 	if grep -q 'p_pashash_passha256cpu' $(BUILDDIR)/hash1-base.s; then echo "hash1-base.s calls the SHA-NI body"; exit 1; fi; \
 	if grep -q 'popcntq' $(BUILDDIR)/bitwords-base.s; then echo "bitwords-base.s carries popcnt"; exit 1; fi; \
 	: pastls against Go crypto/tls and openssl s_server, each case a server on 127.0.0.1, P431; \
@@ -2086,6 +2093,18 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  grep -qF "$$w" $(BUILDDIR)/jsonlist_$$n.err || { cat $(BUILDDIR)/jsonlist_$$n.err; exit 1; }; \
 	done; \
 	echo ok jsonlist; \
+	echo "==== HMAC and SHA-3 in pieces refuse a wrong state or wrong arguments (P443) ===="; \
+	for f in 'hmacargs:HmacSha256Begin takes a THmacState and the key, a string at 7:3' \
+	  'hmacstate:HmacSha256Update is THashState, not THmacState at 8:20' \
+	  'sha3args:Sha3_256Update takes a TSha3State and a string at 8:3' \
+	  'sha3state:Sha3_256Final is THmacState, not TSha3State at 8:25'; do \
+	  n=$${f%%:*}; w=$${f#*:}; \
+	  if $(OUTDIR)/paslangc -o $(BUILDDIR)/piecebad_$$n testdata/piecebad/$$n.paslang >$(BUILDDIR)/piecebad_$$n.err 2>&1; then \
+	    echo "$$n should fail"; exit 1; \
+	  fi; \
+	  grep -qF "$$w" $(BUILDDIR)/piecebad_$$n.err || { cat $(BUILDDIR)/piecebad_$$n.err; exit 1; }; \
+	done; \
+	echo ok piecebad; \
 	echo "==== variables with a value and absolute rejects (P144) ===="; \
 	for f in 'absnone:unknown variable nothing at 3:21' 'abstwo:absolute names one variable at a time at 4:15' \
 	  'abstype:b: Byte absolute x: Integer; absolute is another name for a variable of its own type' \
@@ -5264,7 +5283,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	diff -u testdata/cputuse.out $(BUILDDIR)/cputuse-arm.got
 	@set -e; \
 	echo "==== the base processor arm64 ===="; \
-	for t in hash1 tree1 store1 vectors bitwords set256 strwords strkern strcmpk cmpwords sysutils1 utf8kern jsonkern longslice rtlong fillkern json1 jsoncanon hmacstream hashpieces cipherkat cipherwyche x25519kat nistwyche rsawyche; do \
+	for t in hash1 tree1 store1 vectors bitwords set256 strwords strkern strcmpk cmpwords sysutils1 utf8kern jsonkern longslice rtlong fillkern json1 jsoncanon hmacstream hashpieces hashpieces2 cipherkat cipherwyche x25519kat nistwyche rsawyche; do \
 	  $(OUTDIR)/paslangc -target arm64 -cpu base -o $(BUILDDIR)/$$t-arm-base testdata/$$t.paslang; \
 	  timeout 120 $(QEMU_A64) $(BUILDDIR)/$$t-arm-base > $(BUILDDIR)/$$t-arm.bgot; \
 	  diff -u testdata/$$t.out $(BUILDDIR)/$$t-arm.bgot; \
@@ -5273,6 +5292,8 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	grep -q 'p_pashash_passha512cpu' $(BUILDDIR)/hash1-arm.s; \
 	grep -q 'p_pashash_passha256updatecpu' $(BUILDDIR)/hashpieces-arm.s; \
 	if grep -q 'p_pashash_passha256updatecpu' $(BUILDDIR)/hashpieces-arm-base.s; then echo "hashpieces-arm-base.s calls the SHA-256 body"; exit 1; fi; \
+	grep -q 'p_pashash_pashmacupdatecpu' $(BUILDDIR)/hashpieces2-arm.s; \
+	if grep -q 'p_pashash_pashmacupdatecpu' $(BUILDDIR)/hashpieces2-arm-base.s; then echo "hashpieces2-arm-base.s calls the SHA-256 body"; exit 1; fi; \
 	if grep -q 'p_pashash_passha256cpu' $(BUILDDIR)/hash1-arm-base.s; then echo "hash1-arm-base.s calls the SHA-256 body"; exit 1; fi; \
 	: pastls for the base arm64 on qemu against Go crypto/tls and openssl s_server on the host, ChaCha20 first, P431; \
 	$(OUTDIR)/paslangc -target arm64 -cpu base -Fu $(A64DIR) -o $(BUILDDIR)/tlsinterop-arm testdata/tlsinterop.paslang; \
