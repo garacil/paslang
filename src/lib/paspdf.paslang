@@ -50,9 +50,19 @@
   of the font's size (and inside a TJ array where an adjustment is 0.18 of
   it or more); PageTextRaw gives it in the order the content stream shows
   it, a line break where the baseline changes. Text drawn invisible (mode
-  3, an OCR layer) is text. What is not read: encryption (an EPdfError that
-  says so; P494), images, scans (there is no recognition), the text of
-  form fields and annotations, the order of a tagged structure.
+  3, an OCR layer) is text. What is not read: images, scans (there is no
+  recognition), the text of form fields and annotations, the order of a
+  tagged structure.
+
+  Encryption: a file protected by the standard security handler (RC4 of 40
+  to 128 bits, AES-128, AES-256 of R5 and R6, with the crypt filters of V4
+  and V5, the metadata clear or not) that opens with the empty password,
+  which is how nearly every encrypted file that readers open without asking
+  is protected (its author forbade copying or printing with an owner
+  password), is read as a file that is not: the strings of its objects and
+  its streams are decrypted as they are read (paspdfcrypt), and Encrypted
+  says it was. A file that needs a password, or whose handler is another,
+  is an EPdfError that says so.
 
   Hostile files: nesting of objects stops at 100, of pages at 64, of forms
   at 12, the graphics state stack at 256; a file has at most 4,000,000
@@ -69,7 +79,7 @@ unit paspdf;
 interface
 
 uses
-  sysutils, pasflate, paspdfenc;
+  sysutils, pasflate, paspdfenc, paspdfcrypt;
 
 const
   { the kinds of a PDF object, ISO 32000-1 7.3 }
@@ -170,6 +180,8 @@ type
     FExt: TObject;
     FStartXref: Integer;
     FFirstStream: Boolean;
+    FCrypt: TPdfCrypt;
+    FEncNum: Integer;
     procedure Warn(const Msg: string);
     procedure Fail(At: Integer; const Why: string);
     procedure GrowXref(N: Integer);
@@ -185,6 +197,9 @@ type
     function StmCacheFor(StmNum: Integer): Integer;
     function RawStream(S: TPdfObj): string;
     function ApplyFilter(const Name: string; Parms: TPdfObj; const Data: string; Limit: Integer): string;
+    procedure SetupCrypt;
+    procedure DecryptStrings(O: TPdfObj; Num, Gen: Integer);
+    function DecryptRaw(S: TPdfObj; const Raw: string): string;
     procedure LoadPages;
     procedure WalkPages(Node, Parent: TPdfObj; Depth: Integer; var Seen: array of Integer);
   public
@@ -206,6 +221,8 @@ type
     function TrailerEntry(const Key: string): TPdfObj;
     { the number of objects the file's table has room for }
     property ObjectCount: Integer read FSize;
+    { whether the file is encrypted (it was opened with the empty password) }
+    function Encrypted: Boolean;
     { the trailer dictionary (the dictionary of the xref stream when the
       newest section is one) }
     property Trailer: TPdfObj read FTrailer;
@@ -1305,6 +1322,8 @@ begin
   end;
   o.Gen := g;
   o.Num := Num;
+  if (FCrypt <> nil) and (Num <> FEncNum) and not ((o.Get('Type') <> nil) and o.Get('Type').IsName('XRef')) then
+    DecryptStrings(o, Num, g);
   Result := o;
 end;
 
@@ -1681,6 +1700,9 @@ begin
     end;
     i := Pos('trailer', FData, i + 7);
   end;
+  { an encrypted file: the key before an object stream is opened }
+  if (FTrailer <> nil) and (FTrailer.Get('Encrypt') <> nil) and (FCrypt = nil) then
+    SetupCrypt;
   { the objects inside object streams }
   for i := 0 to nstm - 1 do
   begin
@@ -1952,10 +1974,10 @@ begin
   if Pos('%PDF-', head) = 0 then
     Fail(-1, 'not a PDF file (no %PDF- header)');
   LoadXref;
-  { a file whose objects are encrypted cannot show its catalog: the
-    reason is the first thing to say }
+  { an encrypted file: the key is made before any object that holds a
+    string or a stream is read }
   if (FTrailer <> nil) and (FTrailer.Get('Encrypt') <> nil) then
-    Fail(-1, 'encrypted documents are not supported');
+    SetupCrypt;
   if TrailerEntry('Root') = nil then
   begin
     if not FRebuilt then
@@ -1963,8 +1985,8 @@ begin
       Warn('the document catalog is missing: the file''s table is rebuilt');
       Rebuild;
     end;
-    if (FTrailer <> nil) and (FTrailer.Get('Encrypt') <> nil) then
-      Fail(-1, 'encrypted documents are not supported');
+    if (FTrailer <> nil) and (FTrailer.Get('Encrypt') <> nil) and (FCrypt = nil) then
+      SetupCrypt;
     if TrailerEntry('Root') = nil then
       Fail(-1, 'the document has no catalog');
   end;
@@ -2007,6 +2029,198 @@ begin
   Result := -1;
   if (Num >= 0) and (Num < Length(FXKind)) and (FXKind[Num] >= 1) then
     Result := FXA[Num];
+end;
+
+function TPdfDoc.Encrypted: Boolean;
+begin
+  Result := FCrypt <> nil;
+end;
+
+{ the crypt filter's method of a name of /CF (or Identity) }
+function CfMethod(Doc: TPdfDoc; Cf: TPdfObj; const AName: string): Integer;
+var
+  d: TPdfObj;
+  m: string;
+begin
+  Result := cmNone;
+  if (AName = '') or (AName = 'Identity') then
+    Exit;
+  d := Doc.Dict(Cf, AName);
+  if (d = nil) or (d.Kind <> pdfDict) then
+    Exit;
+  m := Doc.NameOf(d.Get('CFM'));
+  if m = 'V2' then
+    Result := cmRc4
+  else if m = 'AESV2' then
+    Result := cmAesV2
+  else if m = 'AESV3' then
+    Result := cmAesV3
+  else if m = 'None' then
+    Result := cmNone
+  else
+    Result := -1;
+end;
+
+{ the bytes of a string entry of a dictionary, empty when there is none }
+function StrOfDict(Doc: TPdfDoc; D: TPdfObj; const Key: string): string;
+var
+  o: TPdfObj;
+begin
+  Result := '';
+  o := Doc.Dict(D, Key);
+  if (o <> nil) and (o.Kind = pdfString) then
+    Result := o.SVal;
+end;
+
+procedure TPdfDoc.SetupCrypt;
+var
+  enc, o, id, cf, idx: TPdfObj;
+  v, r, len, p, sm, tm: Integer;
+  why, strm: string;
+  em: Boolean;
+  rawEnc: TPdfObj;
+  prm: TPdfCryptParams;
+begin
+  rawEnc := FTrailer.Get('Encrypt');
+  if (rawEnc <> nil) and (rawEnc.Kind = pdfRef) then
+    FEncNum := rawEnc.IVal;
+  enc := Resolve(rawEnc);
+  if (enc = nil) or (enc.Kind <> pdfDict) then
+    Fail(-1, 'the encryption dictionary is not there');
+  if NameOf(enc.Get('Filter')) <> 'Standard' then
+    Fail(-1, 'the document uses a security handler that is not the standard one (' + NameOf(enc.Get('Filter')) + ')');
+  v := IntOf(enc.Get('V'), 0);
+  r := IntOf(enc.Get('R'), 0);
+  len := IntOf(enc.Get('Length'), 40);
+  p := IntOf(enc.Get('P'), 0);
+  em := True;
+  o := Resolve(enc.Get('EncryptMetadata'));
+  if (o <> nil) and (o.Kind = pdfBool) then
+    em := o.IVal <> 0;
+  if (v = 4) or (v = 5) then
+  begin
+    cf := Dict(enc, 'CF');
+    sm := CfMethod(Self, cf, NameOf(enc.Get('StrF')));
+    tm := CfMethod(Self, cf, NameOf(enc.Get('StmF')));
+    if (sm < 0) or (tm < 0) then
+      Fail(-1, 'the encryption uses a crypt filter that is not read');
+    if v = 5 then
+      len := 256;
+    if (v = 4) and (len < 128) then
+      len := 128;
+  end
+  else
+  begin
+    sm := cmRc4;
+    tm := cmRc4;
+    if v = 1 then
+      len := 40;
+    if (len < 40) or (len > 128) then
+      len := 128;
+  end;
+  id := Resolve(FTrailer.Get('ID'));
+  strm := '';
+  if (id <> nil) and (id.Kind = pdfArray) and (Length(id.Items) > 0) then
+  begin
+    o := Resolve(id.Items[0]);
+    if (o <> nil) and (o.Kind = pdfString) then
+      strm := o.SVal;
+  end;
+  idx := Resolve(enc.Get('O'));
+  o := Resolve(enc.Get('U'));
+  if (idx = nil) or (o = nil) or (idx.Kind <> pdfString) or (o.Kind <> pdfString) then
+    Fail(-1, 'the encryption dictionary is damaged');
+  prm.V := v;
+  prm.R := r;
+  prm.KeyBytes := len div 8;
+  prm.P := p;
+  prm.EncMeta := em;
+  prm.StrMethod := sm;
+  prm.StmMethod := tm;
+  prm.O := idx.SVal;
+  prm.U := o.SVal;
+  prm.OE := StrOfDict(Self, enc, 'OE');
+  prm.UE := StrOfDict(Self, enc, 'UE');
+  prm.ID0 := strm;
+  FCrypt := TPdfCrypt.Create;
+  why := FCrypt.Setup(prm);
+  if why <> '' then
+  begin
+    FCrypt := nil;
+    Fail(-1, why);
+  end;
+end;
+
+
+{ the strings of an object read from the file, decrypted in place }
+procedure TPdfDoc.DecryptStrings(O: TPdfObj; Num, Gen: Integer);
+var
+  i: Integer;
+begin
+  if O = nil then
+    Exit;
+  if O.Kind = pdfString then
+    O.SVal := FCrypt.Decrypt(Num, Gen, O.SVal, FCrypt.StringMethod)
+  else if O.Kind = pdfArray then
+  begin
+    for i := 0 to Length(O.Items) - 1 do
+      DecryptStrings(O.Items[i], Num, Gen);
+  end
+  else if (O.Kind = pdfDict) or (O.Kind = pdfStream) then
+  begin
+    for i := 0 to Length(O.Vals) - 1 do
+      DecryptStrings(O.Vals[i], Num, Gen);
+  end;
+end;
+
+{ a stream's bytes as the file holds them, decrypted: except a
+  cross-reference stream, a metadata stream when the file leaves it clear,
+  and one a Crypt filter says is not encrypted }
+function TPdfDoc.DecryptRaw(S: TPdfObj; const Raw: string): string;
+var
+  t, f, p, nm: TPdfObj;
+  method, i: Integer;
+  isCrypt: Boolean;
+  cname: string;
+begin
+  Result := Raw;
+  if FCrypt = nil then
+    Exit;
+  t := Resolve(S.Get('Type'));
+  if (t <> nil) and t.IsName('XRef') then
+    Exit;
+  if (t <> nil) and t.IsName('Metadata') and not FCrypt.EncryptMetadata then
+    Exit;
+  method := FCrypt.StreamMethod;
+  { a Crypt filter, which names the filter that was used }
+  f := Resolve(S.Get('Filter'));
+  p := Resolve(S.Get('DecodeParms'));
+  isCrypt := False;
+  cname := 'Identity';
+  if (f <> nil) and (f.Kind = pdfName) and (f.SVal = 'Crypt') then
+  begin
+    isCrypt := True;
+    if (p <> nil) and (p.Kind = pdfDict) then
+      cname := NameOf(p.Get('Name'));
+  end
+  else if (f <> nil) and (f.Kind = pdfArray) then
+    for i := 0 to Length(f.Items) - 1 do
+      if (Resolve(f.Items[i]) <> nil) and Resolve(f.Items[i]).IsName('Crypt') then
+      begin
+        isCrypt := True;
+        if (p <> nil) and (p.Kind = pdfArray) and (i < Length(p.Items)) then
+        begin
+          nm := Resolve(p.Items[i]);
+          if (nm <> nil) and (nm.Kind = pdfDict) then
+            cname := NameOf(nm.Get('Name'));
+        end;
+      end;
+  if isCrypt then
+  begin
+    if (cname = '') or (cname = 'Identity') then
+      Exit;
+  end;
+  Result := FCrypt.Decrypt(S.Num, S.Gen, Raw, method);
 end;
 { ---- the filters (ISO 32000-1 7.4) ---- }
 
@@ -2488,7 +2702,7 @@ begin
   S := Resolve(S);
   if (S = nil) or (S.Kind <> pdfStream) then
     Fail(-1, 'not a stream');
-  data := RawStream(S);
+  data := DecryptRaw(S, RawStream(S));
   f := Resolve(S.Get('Filter'));
   if f = nil then
     f := Resolve(S.Get('F'));

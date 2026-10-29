@@ -12380,9 +12380,29 @@ for i := 0 to d.WarningCount - 1 do WriteLn(d.WarningAt(i));   { what was read r
   is 180 thousandths or more; a line is the strings whose baselines are within
   0.4 of the smaller size. Text drawn invisible (mode 3, the layer an OCR program
   adds to a scan) is text. Rotated text comes after the lines, in the order of the
-  stream. What is not read: encryption (EPdfError "encrypted", P494), images and
-  scans (there is no recognition), the text of form fields and annotations, a
+  stream. What is not read: images and scans (there is no recognition), the text of form fields and annotations, a
   font that has neither Encoding nor ToUnicode beyond the guess of Latin-1 (P495).
+- **Encryption (1.2.315, P494).** A file with the standard security handler is read
+  when the empty password opens it, which is how the encrypted files that readers
+  open without asking are protected (an owner password forbids copying or
+  printing): RC4 with a key of 40 to 128 bits (R2, R3), AES-128 (R4, V4's crypt
+  filters) and AES-256 (R5 and R6, V5), with the metadata clear or not, a Crypt
+  filter that names Identity, and the objects held in object streams. `Encrypted`
+  says the file was; the strings of its objects (`Info('Producer')`) and its streams
+  are read as they are in a file that is not. A file that needs the user's password,
+  a handler that is not the standard one and a V or R that is not listed are an
+  EPdfError that says so; the owner password is not tried (it gives the same key).
+  The key and the ciphers are `paspdfcrypt`: Algorithms 1 and 2 and the checks of U
+  of ISO 32000-1 7.6, and for R5 and R6 the file key of Adobe's extension levels 3
+  and 8 (SHA-256, or the hardened hash of Algorithm 2.B for R6), RC4 and AES-CBC with
+  PKCS #5 padding. `testdata/pdfenc` reads 11 files that qpdf wrote from two of
+  `testdata/pdfreal` (RC4 of 40 and 128 bits, AES-128, AES-256 of R5 and R6, metadata
+  clear, object streams) and finds the original's text and information in each,
+  refuses the two that need a password, then bends each file 12 times; every stream of
+  all of them (and of the same encryptions of 963 pages of a manual) is what
+  `qpdf --json` gives; the standard itself, which is R3 with RC4 of 128 bits, reads as
+  its decrypted copy does. A form that is encrypted can be read, not edited
+  (`paspdfform`: what it wrote would have to be encrypted).
 - **Damage.** A file with no `startxref`, a table that points to the wrong places
   (junk in front, an edit that moved the objects), a trailer that lost its Root,
   false stream lengths, a missing `endstream` or `endobj`, a Flate stream cut short
@@ -12475,7 +12495,8 @@ Out := e.Save;                                 { EPdfFormError: refused, with th
   was linearized, that has object streams or a hybrid table, that ends with
   other bytes or no end of line, is updated the same way. A file whose table
   had to be rebuilt is refused (an update would point back to a table that is
-  not there), as an encrypted one is by paspdf. `DropXfa := True` takes the
+  not there), and an encrypted one is read but not edited (what it wrote would
+  have to be encrypted). `DropXfa := True` takes the
   XFA entry out of the AcroForm, which a viewer needs to show the fields of a form
   that has both. JavaScript (formatting, calculation) is neither run nor
   removed: the value is written as it is given.

@@ -713,6 +713,9 @@ GOLDEN_A64 += pdftext
 # P437: PDF forms filled and text laid over a page, and the same bytes bent.
 GOLDEN += pdfform
 GOLDEN_A64 += pdfform
+# P494: encrypted PDF files read with the empty password, and bent.
+GOLDEN += pdfenc
+GOLDEN_A64 += pdfenc
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -755,6 +758,7 @@ LIB_UNITS := \
 	src/lib/pasflate.paslang \
 	src/lib/paszip.paslang \
 	src/lib/pasxlsx.paslang \
+	src/lib/paspdfcrypt.paslang \
 	src/lib/paspdfenc.paslang \
 	src/lib/paspdf.paslang \
 	src/lib/paspdfafm.paslang \

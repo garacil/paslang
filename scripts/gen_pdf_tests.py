@@ -679,7 +679,7 @@ case('flate_nochecksum', 'text', flate_doc(cz[:-4]), txt('\n'.join(all_lines)), 
 case('flate_nozlibheader', 'text', flate_doc(cz[2:-4]), txt('\n'.join(all_lines)), valid=False)
 
 # encryption and no PDF at all
-case('encrypted', 'error', good.replace(b'/Root', b'/Encrypt << /Filter /Standard /V 1 /R 2 /O (x) /U (y) /P -4 >> /Root'), 'encrypted', valid=False)
+case('encrypted', 'error', good.replace(b'/Root', b'/Encrypt << /Filter /Standard /V 1 /R 2 /O (x) /U (y) /P -4 >> /Root'), 'password', valid=False)
 case('notpdf', 'error', b'hello, this is not a PDF file at all\n' * 20, 'not a PDF', valid=False)
 case('empty', 'error', b'', 'not a PDF', valid=False)
 case('headeronly', 'error', b'%PDF-1.4\n%%EOF\n', 'catalog', valid=False)
