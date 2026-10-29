@@ -728,6 +728,9 @@ GOLDEN_A64 += pdfenc
 # P497: calls that pass words on the stack, at every stack depth, under the collector's stress.
 GOLDEN += stkargs
 GOLDEN_A64 += stkargs
+# P498: constructors with var and out parameters.
+GOLDEN += ctorvar
+GOLDEN_A64 += ctorvar
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -1995,7 +1998,8 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  grep -qF 'unknown identifier Nope at 8:7' $(BUILDDIR)/linebad_forvar-$$target.err; \
 	  grep -qF 'unknown identifier Nope at 14:8' $(BUILDDIR)/linebad_methname-$$target.err; \
 	done; \
-	echo ok linebad; \
+	echo ok linebad
+	@set -e; \
 	echo "==== var argument rejects (P325) ===="; \
 	for target in amd64 arm64; do \
 	  for n in constarg exprarg fewargs manyargs; do \
@@ -2791,6 +2795,12 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(BUILDDIR)/sqlroutines $(BUILDDIR)/sqlroutines.db > $(BUILDDIR)/sqlroutines.got; \
 	cmp testdata/sqlroutines.out $(BUILDDIR)/sqlroutines.got; \
 	echo ok sqlapi
+	@set -e; \
+	: P498: a constant for a constructor var parameter is refused with its line, on both machines; \
+	for target in amd64 arm64; do \
+	  if $(OUTDIR)/paslangc -target $$target -o $(BUILDDIR)/ctorconst-$$target testdata/varbad/ctorconst.paslang >$(BUILDDIR)/ctorconst-$$target.err 2>&1; then echo "ctorconst should fail"; exit 1; fi; \
+	  grep -qF 'a var or out parameter needs a variable, not a value at 19:23' $(BUILDDIR)/ctorconst-$$target.err; \
+	done
 	@set -e; \
 	: P439: signals on the base processor with no inlining, its children the program itself; \
 	$(OUTDIR)/paslangc -cpu base -inline 0 -o $(BUILDDIR)/signals0 testdata/signals.paslang; \
