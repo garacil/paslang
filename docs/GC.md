@@ -398,8 +398,9 @@ say what they hold (no push of the compiler's own code is left unknown;
 38 frame words in it are, the registers a promoted loop keeps for its
 caller). `PASLANG_GCVERIFY=1` reads the stacks again word by word after
 the maps and poisons, without freeing, what only that keeps; it moves
-every stack after each cycle and poisons the old copy; `make check`
-runs every golden test so on both machines. The work found three older
+every stack after each cycle and poisons the old copy, which stays
+mapped for the next move at its size (P505); `make check` runs every
+golden test so on both machines. The work found three older
 faults: `PASLANG_GCSTRESS=1` never got past the refill that asked for a
 cycle; `rt_newstack` did not move the head of the try records, so a
 raise after the stack grew twice in a try read an unmapped stack

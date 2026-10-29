@@ -728,6 +728,9 @@ GOLDEN_A64 += pdfenc
 # P497: calls that pass words on the stack, at every stack depth, under the collector's stress.
 GOLDEN += stkargs
 GOLDEN_A64 += stkargs
+# P505: stacks that move at the same size under the collector's verify mode, six routines at once.
+GOLDEN += stkpool
+GOLDEN_A64 += stkpool
 # P498: constructors with var and out parameters.
 GOLDEN += ctorvar
 GOLDEN_A64 += ctorvar
