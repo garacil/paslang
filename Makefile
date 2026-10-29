@@ -731,6 +731,9 @@ GOLDEN_A64 += stkargs
 # P498: constructors with var and out parameters.
 GOLDEN += ctorvar
 GOLDEN_A64 += ctorvar
+# P412: sqllogictest's format run over uses sqlite: its own evidence scripts, scripts made by SQLite, scripts that must fail.
+GOLDEN += sqllogic
+GOLDEN_A64 += sqllogic
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -2801,6 +2804,9 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  if $(OUTDIR)/paslangc -target $$target -o $(BUILDDIR)/ctorconst-$$target testdata/varbad/ctorconst.paslang >$(BUILDDIR)/ctorconst-$$target.err 2>&1; then echo "ctorconst should fail"; exit 1; fi; \
 	  grep -qF 'a var or out parameter needs a variable, not a value at 19:23' $(BUILDDIR)/ctorconst-$$target.err; \
 	done
+	@set -e; \
+	: the kept scripts of testdata/sqllogic are what scripts/gen_sqllogic.py writes while the system SQLite is the one that made them, P412; \
+	python3 -I scripts/gen_sqllogic.py --check
 	@set -e; \
 	: P439: signals on the base processor with no inlining, its children the program itself; \
 	$(OUTDIR)/paslangc -cpu base -inline 0 -o $(BUILDDIR)/signals0 testdata/signals.paslang; \
@@ -6302,3 +6308,24 @@ maintainer-clean:
 
 clean:
 	rm -rf $(OUTDIR) $(BUILDDIR)
+
+# P412: by hand, not in check. make sqllogic SLT=DIR runs every .test file under DIR (sqllogictest's test
+# directory) through testdata/sqllogic.paslang, JOBS at a time; make sqldiff FIRST=1 LAST=100 NQ=300 makes the
+# scripts of those seeds with scripts/gen_sqllogic.py (the answers SQLite's own) and runs them.
+.PHONY: sqllogic sqldiff
+JOBS ?= 4
+FIRST ?= 1
+LAST ?= 20
+NQ ?= 300
+sqllogic: $(OUTDIR)/paslangc libs | $(BUILDDIR)
+	@test -n "$(SLT)" || { echo "make sqllogic SLT=DIR, DIR holding the .test files of sqllogictest"; exit 1; }
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/sqllogic testdata/sqllogic.paslang
+	find $(SLT) -name '*.test' | sort | xargs -n 8 -P $(JOBS) $(BUILDDIR)/sqllogic -q
+
+sqldiff: $(OUTDIR)/paslangc libs | $(BUILDDIR)
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/sqllogic testdata/sqllogic.paslang
+	mkdir -p $(BUILDDIR)/sqldiff
+	s=$(FIRST); while [ $$s -le $(LAST) ]; do \
+	  python3 -I scripts/gen_sqllogic.py $$s $(NQ) $(BUILDDIR)/sqldiff/g$$s.test; \
+	  if $(BUILDDIR)/sqllogic -max 8 $(BUILDDIR)/sqldiff/g$$s.test > $(BUILDDIR)/sqldiff/g$$s.log 2>&1; then rm -f $(BUILDDIR)/sqldiff/g$$s.test $(BUILDDIR)/sqldiff/g$$s.log; else echo "seed $$s differs: $(BUILDDIR)/sqldiff/g$$s.log"; fi; \
+	  s=$$((s+1)); done

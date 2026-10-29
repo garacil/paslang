@@ -1,0 +1,661 @@
+program sqllogic;
+{ sqllogictest's runner (D. Richard Hipp's, sqlite.org/sqllogictest) in paslang, over `uses sqlite`:
+  validation mode only. Each script is run against a new empty database and every record is checked
+  as sqllogictest.c checks it: a statement that must succeed or fail, a query whose values are
+  rendered by its type string (I as a 32-bit %d, R as %.3f, T as text with the unprintable bytes
+  as @, NULL as NULL, an empty text as (empty)), sorted by the sort mode, compared with the
+  results the script holds or, past the hash threshold, with their MD5, and the labels' hashes
+  compared with one another. The conditionals skipif and onlyif name the engine "sqlite".
+
+  sqllogic [-ht N] [-max N] [-q] [-db PATH] FILE.test | @LIST ...
+    @LIST   a file naming a script on each line; ! before a name: the script must fail (the runner's own test)
+    no argument: the scripts testdata/sqllogic/list.txt names (the golden test of make check)
+    -ht N   the hash threshold when a script does not say (sqllogictest.c's 8)
+    -max N  the errors written for each script (20)
+    -q      write only the scripts that fail and the totals
+    -db P   a database file in place of memory (deleted before each script)
+  The exit code is 1 when a script has an error. }
+uses
+  sysutils, paslib, sqlite;
+
+type
+  TStrArr = array of string;
+
+var
+  gHT: Integer;
+  gMax: Integer;
+  gQuiet: Boolean;
+  gDb: string;
+  gLabName: TStrArr;
+  gLabHash: TStrArr;
+  gErrs, gRecs, gSkips: Integer;
+  gFile: string;
+  gFileErrs: Integer;
+  gNote: string;
+  gExpectFail: Boolean;
+  gFirst: string;
+
+procedure Report(Line: Integer; const Msg: string);
+begin
+  Inc(gFileErrs);
+  if gExpectFail then
+  begin
+    { a script that must fail: the first message is what the list shows }
+    if gFirst = '' then
+      gFirst := IntToStr(Line) + ': ' + Msg;
+    Exit;
+  end;
+  Inc(gErrs);
+  if gFileErrs <= gMax then
+    WriteLn(gFile, ':', Line, ': ', Msg);
+end;
+
+{ A line as sqllogictest.c's nextLine leaves it: a final CR removed, a line of white space empty. }
+function CleanLine(const L: string): string;
+var
+  i: Integer;
+begin
+  Result := L;
+  if (Length(Result) > 0) and (Result[Length(Result)] = #13) then
+    Result := Copy(Result, 1, Length(Result) - 1);
+  for i := 1 to Length(Result) do
+    if (Result[i] <> ' ') and ((Result[i] < #9) or (Result[i] > #13)) then
+      Exit;
+  Result := '';
+end;
+
+{ Splits a text at LF. }
+function SplitLines(const S: string): TStrArr;
+var
+  i, a, n: Integer;
+begin
+  Result := nil;
+  n := 0;
+  a := 1;
+  for i := 1 to Length(S) do
+    if S[i] = #10 then
+    begin
+      SetLength(Result, n + 1);
+      Result[n] := CleanLine(Copy(S, a, i - a));
+      Inc(n);
+      a := i + 1;
+    end;
+  if a <= Length(S) then
+  begin
+    SetLength(Result, n + 1);
+    Result[n] := CleanLine(Copy(S, a, Length(S) - a + 1));
+  end;
+end;
+
+{ The first four words of a line, as sqllogictest.c's tokenizeLine. }
+procedure Words(const L: string; var W: TStrArr);
+var
+  i, n, a: Integer;
+begin
+  SetLength(W, 4);
+  for n := 0 to 3 do
+    W[n] := '';
+  i := 1;
+  n := 0;
+  while (i <= Length(L)) and (n < 4) do
+  begin
+    while (i <= Length(L)) and ((L[i] = ' ') or (L[i] = #9) or (L[i] = #13)) do
+      Inc(i);
+    if i > Length(L) then
+      Break;
+    a := i;
+    while (i <= Length(L)) and (L[i] <> ' ') and (L[i] <> #9) and (L[i] <> #13) do
+      Inc(i);
+    W[n] := Copy(L, a, i - a);
+    Inc(n);
+  end;
+end;
+
+function Rendered(Stmt: TSqlite3Stmt; Col: Integer; Ty: Char): string;
+var
+  v: Int64;
+  i: Integer;
+begin
+  if sqlite3_column_type(Stmt, Col) = SQLITE_NULL then
+  begin
+    Result := 'NULL';
+    Exit;
+  end;
+  if Ty = 'T' then
+  begin
+    Result := sqlite3_column_text(Stmt, Col);
+    if Result = '' then
+    begin
+      Result := '(empty)';
+      Exit;
+    end;
+    for i := 1 to Length(Result) do
+      if (Ord(Result[i]) < 32) or (Ord(Result[i]) > 126) then
+        Result[i] := '@';
+  end
+  else if Ty = 'I' then
+  begin
+    { sqlite3_column_int: the low 32 bits, signed }
+    v := sqlite3_column_int64(Stmt, Col) and $FFFFFFFF;
+    if v >= $80000000 then
+      v := v - $100000000;
+    Result := IntToStr(v);
+  end
+  else
+    Result := sqlite3_mprintf('%.3f', [sqlite3_column_double(Stmt, Col)]);
+end;
+
+{ strcmp on the rendered texts: bytes as unsigned. }
+function ByteCmp(const A, B: string): Integer;
+var
+  i, n: Integer;
+begin
+  n := Length(A);
+  if Length(B) < n then
+    n := Length(B);
+  for i := 1 to n do
+    if A[i] <> B[i] then
+    begin
+      Result := Ord(A[i]) - Ord(B[i]);
+      Exit;
+    end;
+  Result := Length(A) - Length(B);
+end;
+
+{ Sorts the rows of Ncol values, by column in turn: an insertion into a
+  merge sort's runs would do; a simple merge sort over row indexes. }
+procedure SortRows(var Vals: TStrArr; Ncol: Integer);
+var
+  nrows, i, j, k, w, lo, mid, hi: Integer;
+  idx, tmp: array of Integer;
+  sorted: TStrArr;
+
+  function Less(A, B: Integer): Boolean;
+  var
+    c, r: Integer;
+  begin
+    r := 0;
+    c := 0;
+    while (c < Ncol) and (r = 0) do
+    begin
+      r := ByteCmp(Vals[A * Ncol + c], Vals[B * Ncol + c]);
+      Inc(c);
+    end;
+    Result := r < 0;
+  end;
+
+begin
+  nrows := Length(Vals) div Ncol;
+  if nrows < 2 then
+    Exit;
+  SetLength(idx, nrows);
+  SetLength(tmp, nrows);
+  for i := 0 to nrows - 1 do
+    idx[i] := i;
+  w := 1;
+  while w < nrows do
+  begin
+    lo := 0;
+    while lo < nrows do
+    begin
+      mid := lo + w;
+      if mid > nrows then
+        mid := nrows;
+      hi := lo + 2 * w;
+      if hi > nrows then
+        hi := nrows;
+      i := lo;
+      j := mid;
+      k := lo;
+      while (i < mid) and (j < hi) do
+      begin
+        if Less(idx[j], idx[i]) then
+        begin
+          tmp[k] := idx[j];
+          Inc(j);
+        end
+        else
+        begin
+          tmp[k] := idx[i];
+          Inc(i);
+        end;
+        Inc(k);
+      end;
+      while i < mid do
+      begin
+        tmp[k] := idx[i];
+        Inc(i);
+        Inc(k);
+      end;
+      while j < hi do
+      begin
+        tmp[k] := idx[j];
+        Inc(j);
+        Inc(k);
+      end;
+      lo := hi;
+    end;
+    for i := 0 to nrows - 1 do
+      idx[i] := tmp[i];
+    w := w * 2;
+  end;
+  SetLength(sorted, Length(Vals));
+  for i := 0 to nrows - 1 do
+    for j := 0 to Ncol - 1 do
+      sorted[i * Ncol + j] := Vals[idx[i] * Ncol + j];
+  Vals := sorted;
+end;
+
+function HashOf(const Vals: TStrArr): string;
+var
+  sb: TStringBuilder;
+  i: Integer;
+begin
+  sb := TStringBuilder.Create;
+  for i := 0 to High(Vals) do
+  begin
+    sb.AddText(Vals[i]);
+    sb.AddChar(#10);
+  end;
+  Result := Hex(Md5(sb.ToString));
+  sb.Free;
+end;
+
+{ A label's hash against the ones seen: the first stores, the others must agree. }
+function LabelAgrees(const Lab, H: string): Boolean;
+var
+  i: Integer;
+  k: string;
+begin
+  k := Copy(Lab, 1, 20);
+  Result := True;
+  for i := 0 to High(gLabName) do
+    if gLabName[i] = k then
+    begin
+      Result := gLabHash[i] = H;
+      Exit;
+    end;
+  SetLength(gLabName, Length(gLabName) + 1);
+  SetLength(gLabHash, Length(gLabHash) + 1);
+  gLabName[High(gLabName)] := k;
+  gLabHash[High(gLabHash)] := H;
+end;
+
+procedure RunScript(const Path: string);
+var
+  text, sql, lab, sortm, ty, h: string;
+  lines, w, want, res: TStrArr;
+  n, i, startLine, ht, c, r, ncol, nres, k: Integer;
+  db: TSqlite3;
+  stmt: TSqlite3Stmt;
+  rc: Integer;
+  skip, isErr: Boolean;
+  errmsg: string;
+  halted: Boolean;
+
+  { the next line that is not a comment, from I; N when none }
+  procedure SkipComments;
+  begin
+    while (i < n) and (Length(lines[i]) > 0) and (lines[i][1] = '#') do
+    begin
+      if Copy(lines[i], 1, 10) = '# SQLite: ' then
+        gNote := Copy(lines[i], 11, 200);
+      Inc(i);
+    end;
+  end;
+
+begin
+  gFile := Path;
+  gFileErrs := 0;
+  gLabName := nil;
+  gLabHash := nil;
+  if not ReadFile(Path, text) then
+  begin
+    WriteLn(Path, ': cannot read');
+    Inc(gErrs);
+    Exit;
+  end;
+  lines := SplitLines(text);
+  text := '';
+  n := Length(lines);
+  if gDb <> '' then
+    DeleteFile(gDb);
+  if gDb <> '' then
+    rc := sqlite3_open(gDb, db)
+  else
+    rc := sqlite3_open(':memory:', db);
+  if rc <> SQLITE_OK then
+  begin
+    WriteLn(Path, ': cannot open the database');
+    Inc(gErrs);
+    Exit;
+  end;
+  sqlite3_exec(db, 'PRAGMA synchronous=OFF', nil, nil, errmsg);
+  ht := gHT;
+  i := 0;
+  halted := False;
+  c := 0;
+  while (i < n) and not halted do
+  begin
+    gNote := '';
+    SkipComments;
+    if i >= n then
+      Break;
+    if (lines[i] = '') or (lines[i] = #13) then
+    begin
+      Inc(i);
+      Continue;
+    end;
+    startLine := i + 1;
+    skip := False;
+    Words(lines[i], w);
+    while (w[0] = 'skipif') or (w[0] = 'onlyif') do
+    begin
+      if (w[0] = 'skipif') = SameText(w[1], 'sqlite') then
+        skip := True
+      else if (w[0] = 'onlyif') and not SameText(w[1], 'sqlite') then
+        skip := True;
+      Inc(i);
+      SkipComments;
+      if i >= n then
+        Break;
+      Words(lines[i], w);
+    end;
+    if i >= n then
+      Break;
+    if w[0] = 'statement' then
+    begin
+      Inc(i);
+      sql := '';
+      while i < n do
+      begin
+        if (Length(lines[i]) > 0) and (lines[i][1] = '#') then
+        begin
+          Inc(i);
+          Continue;
+        end;
+        if (lines[i] = '') or (lines[i] = #13) then
+          Break;
+        if sql <> '' then
+          sql := sql + #10;
+        sql := sql + lines[i];
+        Inc(i);
+      end;
+      if skip then
+      begin
+        Inc(gSkips);
+        Continue;
+      end;
+      Inc(gRecs);
+      rc := sqlite3_exec(db, sql, nil, nil, errmsg);
+      isErr := rc <> SQLITE_OK;
+      if w[1] = 'ok' then
+      begin
+        if isErr then
+          Report(startLine, 'statement error: ' + errmsg + ' [' + sql + ']');
+      end
+      else if w[1] = 'error' then
+      begin
+        if not isErr then
+          Report(startLine, 'statement error: it succeeded; SQLite said ' + gNote + ' [' + sql + ']');
+      end
+      else
+        Report(startLine, 'statement argument should be ok or error');
+    end
+    else if w[0] = 'query' then
+    begin
+      ty := w[1];
+      sortm := w[2];
+      lab := w[3];
+      Inc(i);
+      sql := '';
+      while i < n do
+      begin
+        if (Length(lines[i]) > 0) and (lines[i][1] = '#') then
+        begin
+          Inc(i);
+          Continue;
+        end;
+        if (lines[i] = '') or (lines[i] = #13) or (lines[i] = '----') then
+          Break;
+        if sql <> '' then
+          sql := sql + #10;
+        sql := sql + lines[i];
+        Inc(i);
+      end;
+      want := nil;
+      k := 0;
+      if (i < n) and (lines[i] = '----') then
+      begin
+        Inc(i);
+        while i < n do
+        begin
+          if (Length(lines[i]) > 0) and (lines[i][1] = '#') then
+          begin
+            Inc(i);
+            Continue;
+          end;
+          if (lines[i] = '') or (lines[i] = #13) then
+            Break;
+          SetLength(want, k + 1);
+          want[k] := lines[i];
+          Inc(k);
+          Inc(i);
+        end;
+      end;
+      if skip then
+      begin
+        Inc(gSkips);
+        if lab <> '' then
+        begin
+          { the labelled result of a skipped query still agrees with the others }
+          if (Length(want) = 1) and (Pos(' values hashing to ', want[0]) > 0) then
+            h := Copy(want[0], Pos(' values hashing to ', want[0]) + 19, 32)
+          else
+            h := HashOf(want);
+          if not LabelAgrees(lab, h) then
+            Report(startLine, 'labeled result [' + lab + '] does not agree with previous values');
+        end;
+        Continue;
+      end;
+      Inc(gRecs);
+      ncol := Length(ty);
+      c := 0;
+      for k := 1 to ncol do
+        if (ty[k] <> 'T') and (ty[k] <> 'I') and (ty[k] <> 'R') then
+          c := k;
+      if (ncol = 0) or (c > 0) then
+      begin
+        Report(startLine, 'bad type string [' + ty + ']');
+        Continue;
+      end;
+      rc := sqlite3_prepare_v2(db, sql, stmt);
+      if rc <> SQLITE_OK then
+      begin
+        Report(startLine, 'query failed: ' + sqlite3_errmsg(db) + ' [' + sql + ']');
+        Continue;
+      end;
+      if sqlite3_column_count(stmt) <> ncol then
+      begin
+        Report(startLine, 'wrong number of result columns: expected ' + IntToStr(ncol) + ' but got ' +
+          IntToStr(sqlite3_column_count(stmt)));
+        sqlite3_finalize(stmt);
+        Continue;
+      end;
+      res := nil;
+      nres := 0;
+      r := sqlite3_step(stmt);
+      while r = SQLITE_ROW do
+      begin
+        SetLength(res, nres + ncol);
+        for k := 0 to ncol - 1 do
+          res[nres + k] := Rendered(stmt, k, ty[k + 1]);
+        nres := nres + ncol;
+        r := sqlite3_step(stmt);
+      end;
+      if r <> SQLITE_DONE then
+        Report(startLine, 'query stopped with code ' + IntToStr(r) + ': ' + sqlite3_errmsg(db) + ' [' + sql + ']');
+      sqlite3_finalize(stmt);
+      if (sortm = '') or (sortm = 'nosort') then
+        c := 0
+      else if sortm = 'rowsort' then
+        SortRows(res, ncol)
+      else if sortm = 'valuesort' then
+        SortRows(res, 1)
+      else
+        Report(startLine, 'unknown sort method: ' + sortm);
+      h := '';
+      if (lab <> '') or ((ht > 0) and (nres > ht)) then
+      begin
+        h := HashOf(res);
+        if (lab <> '') and not LabelAgrees(lab, h) then
+          Report(startLine, 'labeled result [' + lab + '] does not agree with previous values');
+      end;
+      if (ht = 0) or (nres <= ht) then
+      begin
+        k := 0;
+        while (k < nres) and (k < Length(want)) do
+        begin
+          if want[k] <> res[k] then
+            Report(startLine, 'wrong result - expected [' + want[k] + '] got [' + res[k] + '] (value ' +
+              IntToStr(k + 1) + ') [' + sql + ']');
+          Inc(k);
+        end;
+        if nres > Length(want) then
+          Report(startLine, 'too many result rows - expected ' + IntToStr(Length(want)) + ' got ' + IntToStr(nres))
+        else if Length(want) > nres then
+          Report(startLine, 'too few result rows - expected ' + IntToStr(Length(want)) + ' got ' + IntToStr(nres));
+      end
+      else
+      begin
+        if (Length(want) <> 1) or (want[0] <> IntToStr(nres) + ' values hashing to ' + h) then
+        begin
+          if Length(want) > 0 then
+            Report(startLine, 'wrong result hash: expected [' + want[0] + '] got [' + IntToStr(nres) +
+              ' values hashing to ' + h + '] [' + sql + ']')
+          else
+            Report(startLine, 'wrong result hash: nothing expected, got ' + IntToStr(nres) + ' values');
+        end;
+      end;
+    end
+    else if w[0] = 'hash-threshold' then
+    begin
+      ht := StrToIntDef(w[1], 0);
+      Inc(i);
+    end
+    else if w[0] = 'halt' then
+    begin
+      halted := True;
+      Inc(i);
+    end
+    else
+    begin
+      Report(startLine, 'unknown record type: ' + w[0]);
+      halted := True;
+    end;
+  end;
+  sqlite3_close(db);
+  if gDb <> '' then
+    DeleteFile(gDb);
+  if gExpectFail then
+  begin
+    if gFileErrs = 0 then
+    begin
+      Inc(gErrs);
+      WriteLn('FAIL ', Path, ': it should have failed');
+    end
+    else
+      WriteLn('ok   ', Path, ' (fails, as it should: ', gFirst, ')');
+    gFileErrs := 0;
+  end
+  else if (gFileErrs > 0) or not gQuiet then
+  begin
+    if gFileErrs > 0 then
+      WriteLn('FAIL ', Path, ': ', gFileErrs, ' errors')
+    else
+      WriteLn('ok   ', Path);
+  end;
+end;
+
+{ The scripts a list file names, one on each line. }
+procedure RunList(const ListPath: string; var NFiles, NBad: Integer);
+var
+  text: string;
+  names: TStrArr;
+  i: Integer;
+begin
+  if not ReadFile(ListPath, text) then
+  begin
+    WriteLn(ListPath, ': cannot read');
+    Inc(gErrs);
+    Exit;
+  end;
+  names := SplitLines(text);
+  for i := 0 to High(names) do
+    if names[i] <> '' then
+    begin
+      Inc(NFiles);
+      gFileErrs := 0;
+      gFirst := '';
+      { a name with ! before it is a script that must fail }
+      gExpectFail := names[i][1] = '!';
+      if gExpectFail then
+        RunScript(Copy(names[i], 2, Length(names[i]) - 1))
+      else
+        RunScript(names[i]);
+      gExpectFail := False;
+      if gFileErrs > 0 then
+        Inc(NBad);
+    end;
+end;
+
+var
+  ai, nfiles, nbad: Integer;
+  a: string;
+begin
+  gHT := 8;
+  gMax := 20;
+  gQuiet := False;
+  gDb := '';
+  nfiles := 0;
+  nbad := 0;
+  ai := 1;
+  while ai <= ParamCount do
+  begin
+    a := ParamStr(ai);
+    if a = '-ht' then
+    begin
+      Inc(ai);
+      gHT := StrToIntDef(ParamStr(ai), 8);
+    end
+    else if a = '-max' then
+    begin
+      Inc(ai);
+      gMax := StrToIntDef(ParamStr(ai), 20);
+    end
+    else if a = '-q' then
+      gQuiet := True
+    else if a = '-db' then
+    begin
+      Inc(ai);
+      gDb := ParamStr(ai);
+    end
+    else if (a <> '') and (a[1] = '@') then
+      RunList(Copy(a, 2, Length(a) - 1), nfiles, nbad)
+    else
+    begin
+      Inc(nfiles);
+      gFileErrs := 0;
+      RunScript(a);
+      if gFileErrs > 0 then
+        Inc(nbad);
+    end;
+    Inc(ai);
+  end;
+  if ParamCount = 0 then
+    RunList('testdata/sqllogic/list.txt', nfiles, nbad);
+  WriteLn(nfiles, ' scripts, ', nbad, ' with errors, ', gRecs, ' records run, ', gSkips, ' skipped, ',
+    gErrs, ' errors');
+  if gErrs > 0 then
+    Halt(1);
+end.
