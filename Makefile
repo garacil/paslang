@@ -737,6 +737,9 @@ GOLDEN_A64 += ctorvar
 # P412: sqllogictest's format run over uses sqlite: its own evidence scripts, scripts made by SQLite, scripts that must fail.
 GOLDEN += sqllogic
 GOLDEN_A64 += sqllogic
+# P506: a connection used after Disconnect raises ESqliteError, SQLITE_MISUSE.
+GOLDEN += sqlclosed
+GOLDEN_A64 += sqlclosed
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
