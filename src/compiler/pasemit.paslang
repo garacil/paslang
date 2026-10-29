@@ -19027,6 +19027,14 @@ begin
     Result := True;
     Exit;
   end;
+  { Fma (P425) of three operands that are Doubles' or integers': in K, K + 1 and
+    K + 2, the instruction at the end }
+  if (E^.Kind = ekCall) and (E^.Name = 'rt_fma') and (Length(E^.Args) = 3) and (K <= 5) then
+  begin
+    Result := RealOperand(E^.Args[0], K) and RealOperand(E^.Args[1], K + 1) and
+      RealOperand(E^.Args[2], K + 2);
+    Exit;
+  end;
   if (E^.Kind <> ekBin) or (K > 6) then
     Exit;
   if not ((E^.Bin = boAdd) or (E^.Bin = boSub) or (E^.Bin = boMul) or (E^.Bin = boSlash)) then
@@ -19288,7 +19296,36 @@ begin
     if FArm then
       RealInto(E^.Typ, False, 'd' + IntToStr(K))
     else
+    begin
+      { cvtsi2sd keeps the register's upper half, so it waits for the last
+        write of it: a zeroed register breaks the chain across iterations
+        (Intel 64 and IA-32 Optimization Reference Manual, 3.5.1.8; Go's
+        ssagen zeroes it too) }
+      if TKind(E^.Typ) <> tykReal then
+        Line('  xorps %xmm' + IntToStr(K) + ', %xmm' + IntToStr(K));
       RealInto(E^.Typ, False, 'xmm' + IntToStr(K));
+    end;
+    Exit;
+  end;
+  if (E^.Kind = ekCall) and (E^.Name = 'rt_fma') then
+  begin
+    { A * B + C in one instruction (P425): A in K, B in K + 1, C where it lies
+      when it is a place (the instruction takes C from memory on amd64) }
+    RealTo(E^.Args[0], K);
+    RealTo(E^.Args[1], K + 1);
+    rhs := RealRhs(E^.Args[2]);
+    if rhs = '' then
+    begin
+      RealTo(E^.Args[2], K + 2);
+      if FArm then
+        rhs := 'd' + IntToStr(K + 2)
+      else
+        rhs := '%xmm' + IntToStr(K + 2);
+    end;
+    if FArm then
+      Line('  fmadd ' + r + ', ' + r + ', d' + IntToStr(K + 1) + ', ' + rhs)
+    else
+      Line('  vfmadd213sd ' + rhs + ', %xmm' + IntToStr(K + 1) + ', ' + r);
     Exit;
   end;
   RealTo(E^.L, K);
@@ -19330,8 +19367,9 @@ end;
 function TEmitter.RealAssign(S: PStmt): Boolean;
 var
   sy: TSym;
-  w, nm: string;
+  w, nm, rb, rc: string;
   t: LongInt;
+  a, b, t2: PExpr;
 begin
   Result := False;
   if (S = nil) or (S^.E = nil) then
@@ -19353,6 +19391,54 @@ begin
     Exit;
   if not RealOperand(S^.E, 0) then
     Exit;
+  { x := Fma(x, b, c), x kept in a register: the instruction works on x where it
+    lies (VFMADD213SD and FMADD take the multiplicand as the destination), with no
+    copy in and out of a temporary that would lengthen the chain from one
+    iteration to the next by two moves (P425) }
+  if (S^.E^.Kind = ekCall) and (S^.E^.Name = 'rt_fma') and (sy.Reg <> '') and
+    (((not FArm) and (Copy(sy.Reg, 1, 3) = 'xmm')) or (FArm and (sy.Reg[1] = 'd'))) then
+  begin
+    a := S^.E^.Args[0];
+    b := S^.E^.Args[1];
+    if not ((a^.Kind = ekVar) and (a^.Name = nm)) then
+    begin
+      t2 := a;
+      a := b;
+      b := t2;
+    end;
+    if (a^.Kind = ekVar) and (a^.Name = nm) then
+    begin
+      rb := RealRhs(b);
+      if FArm then
+      begin
+        if rb = '' then
+        begin
+          RealTo(b, 0);
+          rb := 'd0';
+        end;
+      end
+      else if Copy(rb, 1, 4) <> '%xmm' then
+      begin
+        RealTo(b, 0);
+        rb := '%xmm0';
+      end;
+      rc := RealRhs(S^.E^.Args[2]);
+      if rc = '' then
+      begin
+        RealTo(S^.E^.Args[2], 1);
+        if FArm then
+          rc := 'd1'
+        else
+          rc := '%xmm1';
+      end;
+      if FArm then
+        Line('  fmadd ' + sy.Reg + ', ' + sy.Reg + ', ' + rb + ', ' + rc)
+      else
+        Line('  vfmadd213sd ' + rc + ', ' + rb + ', ' + w);
+      Result := True;
+      Exit;
+    end;
+  end;
   RealTo(S^.E, 0);
   if FArm then
     RealStoreSym(sy)
@@ -20020,8 +20106,9 @@ end;
 function TEmitter.EmitRealFn(E: PExpr): Boolean;
 var
   a, b: string;
-  isreal: Boolean;
+  isreal, sg: Boolean;
   k: LongInt;
+  i: SizeInt;
 begin
   Result := False;
   if E = nil then
@@ -20237,6 +20324,76 @@ begin
     begin
       Line('  popq %r9');
       Line('  call ' + E^.Name);
+    end;
+    Exit;
+  end;
+  { Fma (P425): A * B + C rounded once, in one instruction: VFMADD213SD
+    or SS on amd64 (Intel SDM Vol. 2: xmm1 = xmm2 * xmm1 + xmm3 with the
+    operands as (src3, src2, dest) in AT&T order) and FMADD on arm64
+    (Arm ARM C7.2: Rd = Ra + Rn * Rm). The parser makes the word only
+    where the processor has the instruction. The first two operands wait
+    on the stack while the others are worked out. }
+  if (E^.Name = 'rt_fma') or (E^.Name = 'rt_fmas') then
+  begin
+    Result := True;
+    sg := E^.Name = 'rt_fmas';
+    for i := 0 to 1 do
+    begin
+      EmitExpr(E^.Args[i]);
+      if not sg then
+        ArgToDouble(E^.Args[i]^.Typ);
+      if FArm then
+        PshK('x0', 0)
+      else
+        PushK('rax', 0);
+    end;
+    EmitExpr(E^.Args[2]);
+    if not sg then
+      ArgToDouble(E^.Args[2]^.Typ);
+    if FArm then
+    begin
+      if sg then
+        Line('  fmov s2, w0')
+      else
+        Line('  fmov d2, x0');
+      Ppop('x0');
+      if sg then
+        Line('  fmov s1, w0')
+      else
+        Line('  fmov d1, x0');
+      Ppop('x0');
+      if sg then
+      begin
+        Line('  fmov s0, w0');
+        Line('  fmadd s0, s0, s1, s2');
+        Line('  fmov w0, s0');
+      end
+      else
+      begin
+        Line('  fmov d0, x0');
+        Line('  fmadd d0, d0, d1, d2');
+        Line('  fmov x0, d0');
+      end;
+    end
+    else if sg then
+    begin
+      Line('  movd %eax, %xmm2');
+      Line('  popq %rax');
+      Line('  movd %eax, %xmm1');
+      Line('  popq %rax');
+      Line('  movd %eax, %xmm0');
+      Line('  vfmadd213ss %xmm2, %xmm1, %xmm0');
+      Line('  movd %xmm0, %eax');
+    end
+    else
+    begin
+      Line('  movq %rax, %xmm2');
+      Line('  popq %rax');
+      Line('  movq %rax, %xmm1');
+      Line('  popq %rax');
+      Line('  movq %rax, %xmm0');
+      Line('  vfmadd213sd %xmm2, %xmm1, %xmm0');
+      Line('  movq %xmm0, %rax');
     end;
     Exit;
   end;
@@ -31438,7 +31595,7 @@ begin
         (E^.Name = 'rt_absint') or (E^.Name = 'rt_bitchk') or (E^.Name = 'rt_rot') or
         (E^.Name = 'rt_funnel') or (E^.Name = 'rt_carry') or
         (E^.Name = 'rt_sqrt') or (E^.Name = 'rt_sqrreal') or (E^.Name = 'rt_int2real') or
-        (E^.Name = 'rt_absreal') then
+        (E^.Name = 'rt_absreal') or (E^.Name = 'rt_fma') or (E^.Name = 'rt_fmas') then
       begin
         for i := 0 to High(E^.Args) do
           if not PromoExprOK(E^.Args[i]) then

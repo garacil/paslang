@@ -17741,7 +17741,7 @@ end;
   sources of the system's libm.so.6, docs/ref/glibc), translated with
   their tables and as the build for a processor with FMA computes them:
   each product GCC fused with its sum (read from libm.so.6's *_fma
-  routines) is SqlMFma here, which gives the same bits on every
+  routines) is Fma here, which gives the same bits on every
   processor and on arm64. The sources and their notices:
 
   - exp, log, log2, pow (e_exp.c, e_log.c, e_log2.c, e_pow.c and their
@@ -17788,175 +17788,6 @@ end;
 function SqlMUlt(A, B: Integer): Boolean;
 begin
   Result := (A xor Integer($8000000000000000)) < (B xor Integer($8000000000000000));
-end;
-
-{ SqlMFmaSoft: A*B+C rounded once, from the integers alone: Go's
-  math.FMA (src/math/fma.go), for a processor without the instruction.
-  The product's 106 bits are two words (MulHi and the low product), the
-  addend is aligned to them with the bits shifted out kept as one sticky
-  bit, and the sum is rounded to nearest, ties to even. }
-function SqlMShrCompress(U1, U2, N: Integer; out R2: Integer): Integer;
-begin
-  if N = 0 then
-  begin
-    R2 := U2;
-    Exit(U1);
-  end;
-  if N = 64 then
-  begin
-    R2 := U1 or Ord(U2 <> 0);
-    Exit(0);
-  end;
-  if N >= 128 then
-  begin
-    R2 := Ord((U1 or U2) <> 0);
-    Exit(0);
-  end;
-  if N < 64 then
-  begin
-    R2 := (U2 shr N) or (U1 shl (64 - N));
-    R2 := R2 or Ord((U2 and ((1 shl N) - 1)) <> 0);
-    Exit(U1 shr N);
-  end;
-  R2 := U1 shr (N - 64);
-  R2 := R2 or Ord(((U1 and ((1 shl (N - 64)) - 1)) or U2) <> 0);
-  Result := 0;
-end;
-
-procedure SqlMSplit(B: Integer; out Sign, E, M: Integer);
-var
-  sh: Integer;
-begin
-  Sign := B shr 63;
-  E := (B shr 52) and $7FF;
-  M := B and $000FFFFFFFFFFFFF;
-  if E = 0 then
-  begin
-    sh := LeadingZeros(M) - 11;
-    M := M shl sh;
-    E := 1 - sh;
-  end
-  else
-    M := M or $0010000000000000;
-end;
-
-function SqlMFmaSoft(X, Y, Z: Double): Double;
-var
-  bx, by, bz, xs, xe, xm, ys, ye, ym, zs, ze, zm, pe, pm1, pm2, zm1, zm2,
-    ps, is62, t, m, c, nz, n, s2: Integer;
-begin
-  bx := X as Integer;
-  by := Y as Integer;
-  bz := Z as Integer;
-  if (X = 0.0) or (Y = 0.0) or ((bx and $7FF0000000000000) = $7FF0000000000000) or
-    ((by and $7FF0000000000000) = $7FF0000000000000) then
-    Exit(X * Y + Z);
-  if Z = 0.0 then
-    Exit(X * Y);
-  if (bz and $7FF0000000000000) = $7FF0000000000000 then
-    Exit(Z);
-  SqlMSplit(bx, xs, xe, xm);
-  SqlMSplit(by, ys, ye, ym);
-  SqlMSplit(bz, zs, ze, zm);
-  pe := xe + ye - 1023 + 1;
-  pm1 := MulHi(xm shl 10, ym shl 11);
-  pm2 := (xm shl 10) * (ym shl 11);
-  zm1 := zm shl 10;
-  zm2 := 0;
-  ps := xs xor ys;
-  is62 := ((not pm1) shr 62) and 1;
-  if is62 = 1 then
-  begin
-    pm1 := (pm1 shl 1) or (pm2 shr 63);
-    pm2 := pm2 shl 1;
-  end;
-  pe := pe - is62;
-  if (pe < ze) or ((pe = ze) and SqlMUlt(pm1, zm1)) then
-  begin
-    t := ps; ps := zs; zs := t;
-    t := pe; pe := ze; ze := t;
-    t := pm1; pm1 := zm1; zm1 := t;
-    t := pm2; pm2 := zm2; zm2 := t;
-  end;
-  if (ps <> zs) and (pe = ze) and (pm1 = zm1) and (pm2 = zm2) then
-    Exit(0.0);
-  zm1 := SqlMShrCompress(zm1, zm2, pe - ze, zm2);
-  if ps = zs then
-  begin
-    t := pm2 + zm2;
-    c := Ord(SqlMUlt(t, pm2));
-    pm2 := t;
-    pm1 := pm1 + zm1 + c;
-    pe := pe - ((not pm1) shr 63);
-    pm1 := SqlMShrCompress(pm1, pm2, 64 + (pm1 shr 63), m);
-  end
-  else
-  begin
-    t := pm2 - zm2;
-    c := Ord(SqlMUlt(pm2, zm2));
-    pm2 := t;
-    pm1 := pm1 - zm1 - c;
-    nz := LeadingZeros(pm1);
-    if nz = 64 then
-      nz := nz + LeadingZeros(pm2);
-    pe := pe - nz;
-    n := nz - 1;
-    { shl(pm1, pm2, n) as Go's, n up to 127 }
-    if n >= 64 then
-    begin
-      m := pm2 shl (n - 64);
-      s2 := 0;
-    end
-    else if n = 0 then
-    begin
-      m := pm1;
-      s2 := pm2;
-    end
-    else
-    begin
-      m := (pm1 shl n) or (pm2 shr (64 - n));
-      s2 := pm2 shl n;
-    end;
-    m := m or Ord(s2 <> 0);
-  end;
-  if (pe > 1022 + 1023) or ((pe = 1022 + 1023) and (((m + (1 shl 9)) shr 63) = 1)) then
-    Exit((((ps shl 63) or $7FF0000000000000) as Double));
-  if pe < 0 then
-  begin
-    n := -pe;
-    if n >= 64 then
-      m := Ord(m <> 0)
-    else
-      m := (m shr n) or Ord((m and ((1 shl n) - 1)) <> 0);
-    pe := 0;
-  end;
-  if (m and ((1 shl 10) - 1)) = (1 shl 9) then
-    m := ((m + (1 shl 9)) shr 10) and not 1
-  else
-    m := (m + (1 shl 9)) shr 10;
-  if m = 0 then
-    pe := 0;
-  t := (ps shl 63) + (pe shl 52) + m;
-  Result := t as Double;
-end;
-
-{ SqlMFma: A*B+C rounded once, IEEE 754-2008's fusedMultiplyAdd, as
-  glibc's functions built for a processor with FMA compute it: the
-  instruction where the processor has it (VFMADD213SD, FMADD), Go's
-  integer arithmetic where it does not; both give the same bits. }
-function SqlMFma(A, B, C: Double): Double;
-begin
-  if CpuHas('fma') then
-  begin
-    asm amd64 (A: in xmm0; B: in xmm1; C: in xmm2; Result: out xmm0)
-      vfmadd213sd %xmm2, %xmm1, %xmm0
-    end;
-    asm arm64 (A: in d0; B: in d1; C: in d2; Result: out d0)
-      fmadd d0, d0, d1, d2
-    end;
-  end
-  else
-    Result := SqlMFmaSoft(A, B, C);
 end;
 
 const
@@ -18041,7 +17872,7 @@ begin
     SBits := SBits - (1009 shl 52);
     scale := SBits as Double;
     b := $7F00000000000000;
-    Exit((b as Double) * SqlMFma(scale, Tmp, scale));
+    Exit((b as Double) * Fma(scale, Tmp, scale));
   end;
   SBits := SBits + (1022 shl 52);
   scale := SBits as Double;
@@ -18094,24 +17925,24 @@ begin
     end;
     abstop := 0;
   end;
-  kd := SqlMFma(X, InvLn2N as Double, Shift as Double);
+  kd := Fma(X, InvLn2N as Double, Shift as Double);
   ki := kd as Integer;
   kd := kd - (Shift as Double);
-  r := SqlMFma(kd, NegLn2hiN as Double, X);
-  r := SqlMFma(kd, NegLn2loN as Double, r);
+  r := Fma(kd, NegLn2hiN as Double, X);
+  r := Fma(kd, NegLn2loN as Double, r);
   idx := 2 * (ki and 127);
   top := ki shl 45;
   tail := SqlMExpTab[idx] as Double;
   sbits := SqlMExpTab[idx + 1] + top;
   r2 := r * r;
-  p23 := SqlMFma(r, C3 as Double, C2 as Double);
-  p45 := SqlMFma(r, C5 as Double, C4 as Double);
-  tmp := SqlMFma(p23, r2, r + tail);
-  tmp := SqlMFma(r2 * r2, p45, tmp);
+  p23 := Fma(r, C3 as Double, C2 as Double);
+  p45 := Fma(r, C5 as Double, C4 as Double);
+  tmp := Fma(p23, r2, r + tail);
+  tmp := Fma(r2 * r2, p45, tmp);
   if abstop = 0 then
     Exit(SqlMExpSpecial(tmp, sbits, ki));
   scale := sbits as Double;
-  Result := SqlMFma(scale, tmp, scale);
+  Result := Fma(scale, tmp, scale);
 end;
 
 const
@@ -18211,19 +18042,19 @@ begin
     r := X - 1.0;
     r2 := r * r;
     r3 := r * r2;
-    q := SqlMFma(r2, SqlMLogB[9] as Double, SqlMFma(r, SqlMLogB[8] as Double, SqlMLogB[7] as Double));
-    q := SqlMFma(r3, SqlMLogB[10] as Double, q);
-    q := SqlMFma(q, r3, SqlMFma(r2, SqlMLogB[6] as Double, SqlMFma(r, SqlMLogB[5] as Double, SqlMLogB[4] as Double)));
-    q := SqlMFma(q, r3, SqlMFma(r2, SqlMLogB[3] as Double, SqlMFma(r, SqlMLogB[2] as Double, SqlMLogB[1] as Double)));
-    w := SqlMFma(r, P27 as Double, r);
-    rhi := SqlMFma(-r, P27 as Double, w);
+    q := Fma(r2, SqlMLogB[9] as Double, Fma(r, SqlMLogB[8] as Double, SqlMLogB[7] as Double));
+    q := Fma(r3, SqlMLogB[10] as Double, q);
+    q := Fma(q, r3, Fma(r2, SqlMLogB[6] as Double, Fma(r, SqlMLogB[5] as Double, SqlMLogB[4] as Double)));
+    q := Fma(q, r3, Fma(r2, SqlMLogB[3] as Double, Fma(r, SqlMLogB[2] as Double, SqlMLogB[1] as Double)));
+    w := Fma(r, P27 as Double, r);
+    rhi := Fma(-r, P27 as Double, w);
     rlo := r - rhi;
     b0 := SqlMLogB[0] as Double;
     w := rhi * rhi;
-    hi := SqlMFma(w, b0, r);
-    lo := SqlMFma(w, b0, r - hi);
-    lo := SqlMFma(b0 * rlo, rhi + r, lo);
-    y := SqlMFma(q, r3, lo);
+    hi := Fma(w, b0, r);
+    lo := Fma(w, b0, r - hi);
+    lo := Fma(b0 * rlo, rhi + r, lo);
+    y := Fma(q, r3, lo);
     Exit(hi + y);
   end;
   top := ix shr 48;
@@ -18245,16 +18076,16 @@ begin
   invc := SqlMLogTab[2 * i] as Double;
   logc := SqlMLogTab[2 * i + 1] as Double;
   z := iz as Double;
-  r := SqlMFma(z, invc, -1.0);
+  r := Fma(z, invc, -1.0);
   kd := Double(k);
-  w := SqlMFma(kd, Ln2hi as Double, logc);
+  w := Fma(kd, Ln2hi as Double, logc);
   hi := r + w;
-  lo := SqlMFma(kd, Ln2lo as Double, (w - hi) + r);
+  lo := Fma(kd, Ln2lo as Double, (w - hi) + r);
   r2 := r * r;
   r3 := r * r2;
-  q := SqlMFma(SqlMFma(r, SqlMLogA[4] as Double, SqlMLogA[3] as Double), r2,
-    SqlMFma(r, SqlMLogA[2] as Double, SqlMLogA[1] as Double));
-  y := SqlMFma(r3, q, SqlMFma(r2, SqlMLogA[0] as Double, lo));
+  q := Fma(Fma(r, SqlMLogA[4] as Double, SqlMLogA[3] as Double), r2,
+    Fma(r, SqlMLogA[2] as Double, SqlMLogA[1] as Double));
+  y := Fma(r3, q, Fma(r2, SqlMLogA[0] as Double, lo));
   Result := y + hi;
 end;
 
@@ -18320,17 +18151,17 @@ begin
       Exit(0.0);
     r := X - 1.0;
     hi := r * (InvLn2hi as Double);
-    lo := SqlMFma(r, InvLn2lo as Double, SqlMFma(r, InvLn2hi as Double, -hi));
+    lo := Fma(r, InvLn2lo as Double, Fma(r, InvLn2hi as Double, -hi));
     r2 := r * r;
     r4 := r2 * r2;
-    p := SqlMFma(r, SqlMLog2B[1] as Double, SqlMLog2B[0] as Double);
-    y := SqlMFma(p, r2, hi);
-    lo := SqlMFma(p, r2, hi - y) + lo;
-    q := SqlMFma(SqlMFma(r, SqlMLog2B[9] as Double, SqlMLog2B[8] as Double), r2,
-      SqlMFma(r, SqlMLog2B[7] as Double, SqlMLog2B[6] as Double));
-    q := SqlMFma(q, r4, SqlMFma(SqlMFma(r, SqlMLog2B[5] as Double, SqlMLog2B[4] as Double), r2,
-      SqlMFma(r, SqlMLog2B[3] as Double, SqlMLog2B[2] as Double)));
-    Exit(SqlMFma(q, r4, lo) + y);
+    p := Fma(r, SqlMLog2B[1] as Double, SqlMLog2B[0] as Double);
+    y := Fma(p, r2, hi);
+    lo := Fma(p, r2, hi - y) + lo;
+    q := Fma(Fma(r, SqlMLog2B[9] as Double, SqlMLog2B[8] as Double), r2,
+      Fma(r, SqlMLog2B[7] as Double, SqlMLog2B[6] as Double));
+    q := Fma(q, r4, Fma(Fma(r, SqlMLog2B[5] as Double, SqlMLog2B[4] as Double), r2,
+      Fma(r, SqlMLog2B[3] as Double, SqlMLog2B[2] as Double)));
+    Exit(Fma(q, r4, lo) + y);
   end;
   top := ix shr 48;
   if (top - $10 < 0) or (top - $10 >= $7FE0) then
@@ -18352,18 +18183,18 @@ begin
   logc := SqlMLog2Tab[2 * i + 1] as Double;
   z := iz as Double;
   kd := Double(k);
-  r := SqlMFma(z, invc, -1.0);
+  r := Fma(z, invc, -1.0);
   t1 := r * (InvLn2hi as Double);
-  t2 := SqlMFma(r, InvLn2lo as Double, SqlMFma(r, InvLn2hi as Double, -t1));
+  t2 := Fma(r, InvLn2lo as Double, Fma(r, InvLn2hi as Double, -t1));
   t3 := kd + logc;
   hi := t3 + t1;
   lo := ((t3 - hi) + t1) + t2;
   r2 := r * r;
   r4 := r2 * r2;
-  p := SqlMFma(SqlMFma(r, SqlMLog2A[3] as Double, SqlMLog2A[2] as Double), r2,
-    SqlMFma(r, SqlMLog2A[1] as Double, SqlMLog2A[0] as Double));
-  p := SqlMFma(SqlMFma(r, SqlMLog2A[5] as Double, SqlMLog2A[4] as Double), r4, p);
-  Result := SqlMFma(r2, p, lo) + hi;
+  p := Fma(Fma(r, SqlMLog2A[3] as Double, SqlMLog2A[2] as Double), r2,
+    Fma(r, SqlMLog2A[1] as Double, SqlMLog2A[0] as Double));
+  p := Fma(Fma(r, SqlMLog2A[5] as Double, SqlMLog2A[4] as Double), r4, p);
+  Result := Fma(r2, p, lo) + hi;
 end;
 
 { SqlMLog10: glibc's log10 (e_log10.c, from fdlibm), built without FMA:
@@ -18567,21 +18398,21 @@ begin
   invc := SqlMPowTab[3 * i] as Double;
   logc := SqlMPowTab[3 * i + 1] as Double;
   logctail := SqlMPowTab[3 * i + 2] as Double;
-  r := SqlMFma(z, invc, -1.0);
-  t1 := SqlMFma(kd, Ln2hi as Double, logc);
+  r := Fma(z, invc, -1.0);
+  t1 := Fma(kd, Ln2hi as Double, logc);
   t2 := r + t1;
-  lo1 := SqlMFma(kd, Ln2lo as Double, logctail);
+  lo1 := Fma(kd, Ln2lo as Double, logctail);
   lo2 := (t1 - t2) + r;
   ar := r * (SqlMPowA[0] as Double);
   ar2 := r * ar;
   ar3 := r * ar2;
   hi := t2 + ar2;
-  lo3 := SqlMFma(ar, r, -ar2);
+  lo3 := Fma(ar, r, -ar2);
   lo4 := (t2 - hi) + ar2;
-  q := SqlMFma(r, SqlMPowA[6] as Double, SqlMPowA[5] as Double);
-  q := SqlMFma(q, ar2, SqlMFma(r, SqlMPowA[4] as Double, SqlMPowA[3] as Double));
-  q := SqlMFma(ar2, q, SqlMFma(r, SqlMPowA[2] as Double, SqlMPowA[1] as Double));
-  lo := SqlMFma(ar3, q, ((lo1 + lo2) + lo3) + lo4);
+  q := Fma(r, SqlMPowA[6] as Double, SqlMPowA[5] as Double);
+  q := Fma(q, ar2, Fma(r, SqlMPowA[4] as Double, SqlMPowA[3] as Double));
+  q := Fma(ar2, q, Fma(r, SqlMPowA[2] as Double, SqlMPowA[1] as Double));
+  lo := Fma(ar3, q, ((lo1 + lo2) + lo3) + lo4);
   y := hi + lo;
   Tail := (hi - y) + lo;
   Result := y;
@@ -18625,30 +18456,30 @@ begin
     end;
     abstop := 0;
   end;
-  kd := SqlMFma(X, InvLn2N as Double, Shift as Double);
+  kd := Fma(X, InvLn2N as Double, Shift as Double);
   ki := kd as Integer;
   kd := kd - (Shift as Double);
-  r := SqlMFma(kd, NegLn2hiN as Double, X);
-  r := SqlMFma(kd, NegLn2loN as Double, r);
+  r := Fma(kd, NegLn2hiN as Double, X);
+  r := Fma(kd, NegLn2loN as Double, r);
   r := XTail + r;
   idx := 2 * (ki and 127);
   top := (ki + SignBias) shl 45;
   tail := SqlMExpTab[idx] as Double;
   sbits := SqlMExpTab[idx + 1] + top;
   r2 := r * r;
-  tmp := SqlMFma(SqlMFma(r, C3 as Double, C2 as Double), r2, r + tail);
-  tmp := SqlMFma(SqlMFma(r, C5 as Double, C4 as Double), r2 * r2, tmp);
+  tmp := Fma(Fma(r, C3 as Double, C2 as Double), r2, r + tail);
+  tmp := Fma(Fma(r, C5 as Double, C4 as Double), r2 * r2, tmp);
   if abstop <> 0 then
   begin
     scale := sbits as Double;
-    Exit(SqlMFma(scale, tmp, scale));
+    Exit(Fma(scale, tmp, scale));
   end;
   if (ki and $80000000) = 0 then
   begin
     sbits := sbits - (1009 shl 52);
     scale := sbits as Double;
     b := $7F00000000000000;
-    Exit(SqlMFma(scale, tmp, scale) * (b as Double));
+    Exit(Fma(scale, tmp, scale) * (b as Double));
   end;
   sbits := sbits + (1022 shl 52);
   scale := sbits as Double;
@@ -18761,7 +18592,7 @@ begin
   end;
   hi := SqlMPowLog(ix, lo);
   ehi := Y * hi;
-  elo := SqlMFma(Y, lo, SqlMFma(Y, hi, -ehi));
+  elo := Fma(Y, lo, Fma(Y, hi, -ehi));
   Result := SqlMPowExp(ehi, elo, signbias);
 end;
 
@@ -19365,14 +19196,14 @@ begin
   u := (SqlMBig as Double) + Abs(X);
   X := (Abs(X) - (u - (SqlMBig as Double))) + DX;
   xx := X * X;
-  s := SqlMFma(X * xx, SqlMFma(xx, SqlMSn5 as Double, SqlMSn3 as Double), X);
-  c := xx * SqlMFma(xx, SqlMFma(xx, SqlMCs6 as Double, SqlMCs4 as Double), SqlMCs2 as Double);
+  s := Fma(X * xx, Fma(xx, SqlMSn5 as Double, SqlMSn3 as Double), X);
+  c := xx * Fma(xx, Fma(xx, SqlMCs6 as Double, SqlMCs4 as Double), SqlMCs2 as Double);
   k := ((u as Integer) and $FFFFFFFF) shl 2;
   sn := SqlMSinCosTab[k] as Double;
   ssn := SqlMSinCosTab[k + 1] as Double;
   cs := SqlMSinCosTab[k + 2] as Double;
   ccs := SqlMSinCosTab[k + 3] as Double;
-  cor := SqlMFma(-sn, s, SqlMFma(-cs, c, SqlMFma(-s, ssn, ccs)));
+  cor := Fma(-sn, s, Fma(-cs, c, Fma(-s, ssn, ccs)));
   Result := cs + cor;
 end;
 
@@ -19392,23 +19223,23 @@ begin
   if Abs(X) < (P126 as Double) then
   begin
     xx := X * X;
-    p := SqlMFma(SqlMFma(SqlMFma(S5 as Double, xx, S4 as Double), xx, S3 as Double), xx, S2 as Double);
-    p := SqlMFma(p, xx, S1 as Double);
-    Exit(X + SqlMFma(SqlMFma(p, X, -(0.5 * DX)), xx, DX));
+    p := Fma(Fma(Fma(S5 as Double, xx, S4 as Double), xx, S3 as Double), xx, S2 as Double);
+    p := Fma(p, xx, S1 as Double);
+    Exit(X + Fma(Fma(p, X, -(0.5 * DX)), xx, DX));
   end;
   if X <= 0 then
     DX := -DX;
   u := (SqlMBig as Double) + Abs(X);
   X := Abs(X) - (u - (SqlMBig as Double));
   xx := X * X;
-  s := SqlMFma(X * xx, SqlMFma(xx, SqlMSn5 as Double, SqlMSn3 as Double), DX) + X;
-  c := SqlMFma(X, DX, xx * SqlMFma(xx, SqlMFma(xx, SqlMCs6 as Double, SqlMCs4 as Double), SqlMCs2 as Double));
+  s := Fma(X * xx, Fma(xx, SqlMSn5 as Double, SqlMSn3 as Double), DX) + X;
+  c := Fma(X, DX, xx * Fma(xx, Fma(xx, SqlMCs6 as Double, SqlMCs4 as Double), SqlMCs2 as Double));
   k := ((u as Integer) and $FFFFFFFF) shl 2;
   sn := SqlMSinCosTab[k] as Double;
   ssn := SqlMSinCosTab[k + 1] as Double;
   cs := SqlMSinCosTab[k + 2] as Double;
   ccs := SqlMSinCosTab[k + 3] as Double;
-  cor := SqlMFma(cs, s, SqlMFma(-sn, c, SqlMFma(s, ccs, ssn)));
+  cor := Fma(cs, s, Fma(-sn, c, Fma(s, ccs, ssn)));
   Result := (((sn + cor) as Integer) and $7FFFFFFFFFFFFFFF or ((xold as Integer) and Integer($8000000000000000))) as Double;
 end;
 
@@ -19425,14 +19256,14 @@ const
 var
   t, xn, y, t2, b, db: Double;
 begin
-  t := SqlMFma(X, HpInv as Double, ToInt as Double);
+  t := Fma(X, HpInv as Double, ToInt as Double);
   xn := t - (ToInt as Double);
-  y := SqlMFma(-xn, Mp2 as Double, SqlMFma(-xn, Mp1 as Double, X));
+  y := Fma(-xn, Mp2 as Double, Fma(-xn, Mp1 as Double, X));
   Result := (t as Integer) and 3;
-  t2 := SqlMFma(-xn, Pp3 as Double, y);
-  db := SqlMFma(-xn, Pp3 as Double, y - t2);
-  b := SqlMFma(-xn, Pp4 as Double, t2);
-  db := db + SqlMFma(-xn, Pp4 as Double, t2 - b);
+  t2 := Fma(-xn, Pp3 as Double, y);
+  db := Fma(-xn, Pp3 as Double, y - t2);
+  b := Fma(-xn, Pp4 as Double, t2);
+  db := db + Fma(-xn, Pp4 as Double, t2 - b);
   A := b;
   DA := db;
 end;
@@ -19730,11 +19561,11 @@ begin
   if ya <= (Gy2 as Double) then
   begin
     a2 := A * A;
-    t2 := SqlMFma(a2, D11 as Double, D9 as Double);
-    t2 := SqlMFma(a2, t2, D7 as Double);
-    t2 := SqlMFma(a2, t2, D5 as Double);
-    t2 := SqlMFma(a2, t2, D3 as Double);
-    t2 := SqlMFma(A * a2, t2, DA);
+    t2 := Fma(a2, D11 as Double, D9 as Double);
+    t2 := Fma(a2, t2, D7 as Double);
+    t2 := Fma(a2, t2, D5 as Double);
+    t2 := Fma(a2, t2, D3 as Double);
+    t2 := Fma(A * a2, t2, DA);
     if N <> 0 then
     begin
       b := A + t2;
@@ -19744,8 +19575,8 @@ begin
         db := (t2 - b) + A;
       t1 := 1.0 / b;
       t3 := t1 * b;
-      t4 := SqlMFma(t1, b, -t3);
-      t2 := SqlMFma(-t1, db, ((1.0 - t3) - t4) + 0.0) / b;
+      t4 := Fma(t1, b, -t3);
+      t2 := Fma(-t1, db, ((1.0 - t3) - t4) + 0.0) / b;
       c := t1 + t2;
       dc := (t1 - c) + t2;
       y := c + dc;
@@ -19753,10 +19584,10 @@ begin
     end;
     Exit(A + t2);
   end;
-  i := Trunc(SqlMFma(256, ya, MFftnHf as Double));
+  i := Trunc(Fma(256, ya, MFftnHf as Double));
   z := (ya - (SqlMTanXfg[4 * i] as Double)) + yya;
   z2 := z * z;
-  pz := SqlMFma(z * z2, SqlMFma(z2, E1 as Double, E0 as Double), z);
+  pz := Fma(z * z2, Fma(z2, E1 as Double, E0 as Double), z);
   fi := SqlMTanXfg[4 * i + 1] as Double;
   gi := SqlMTanXfg[4 * i + 2] as Double;
   if N <> 0 then
@@ -19810,22 +19641,22 @@ begin
   if w <= (G2 as Double) then
   begin
     x2 := X * X;
-    t2 := SqlMFma(x2, D11 as Double, D9 as Double);
-    t2 := SqlMFma(x2, t2, D7 as Double);
-    t2 := SqlMFma(x2, t2, D5 as Double);
-    t2 := SqlMFma(x2, t2, D3 as Double);
-    Exit(SqlMFma(t2, X * x2, X));
+    t2 := Fma(x2, D11 as Double, D9 as Double);
+    t2 := Fma(x2, t2, D7 as Double);
+    t2 := Fma(x2, t2, D5 as Double);
+    t2 := Fma(x2, t2, D3 as Double);
+    Exit(Fma(t2, X * x2, X));
   end;
   if w <= (G3 as Double) then
   begin
-    i := Trunc(SqlMFma(256, w, MFftnHf as Double));
+    i := Trunc(Fma(256, w, MFftnHf as Double));
     z := w - (SqlMTanXfg[4 * i] as Double);
     z2 := z * z;
     if X < 0.0 then
       s := -1
     else
       s := 1;
-    pz := SqlMFma(z * z2, SqlMFma(z2, E1 as Double, E0 as Double), z);
+    pz := Fma(z * z2, Fma(z2, E1 as Double, E0 as Double), z);
     fi := SqlMTanXfg[4 * i + 1] as Double;
     gi := SqlMTanXfg[4 * i + 2] as Double;
     t2 := pz * (gi + fi) / (gi - pz);
@@ -19834,24 +19665,24 @@ begin
   end;
   if w <= (G4 as Double) then
   begin
-    t := SqlMFma(X, HpInv as Double, ToInt as Double);
+    t := Fma(X, HpInv as Double, ToInt as Double);
     xn := t - (ToInt as Double);
-    t1 := SqlMFma(-xn, Mp2 as Double, SqlMFma(-xn, Mp1 as Double, X));
+    t1 := Fma(-xn, Mp2 as Double, Fma(-xn, Mp1 as Double, X));
     n := (t as Integer) and 1;
-    a := SqlMFma(-xn, Mp3 as Double, t1);
-    da := SqlMFma(-xn, Mp3 as Double, t1 - a);
+    a := Fma(-xn, Mp3 as Double, t1);
+    da := Fma(-xn, Mp3 as Double, t1 - a);
     Exit(SqlMTanCot(a, da, n));
   end;
   if w <= (G5 as Double) then
   begin
-    t := SqlMFma(X, HpInv as Double, ToInt as Double);
+    t := Fma(X, HpInv as Double, ToInt as Double);
     xn := t - (ToInt as Double);
-    t1 := SqlMFma(-xn, Mp2 as Double, SqlMFma(-xn, Mp1 as Double, X));
+    t1 := Fma(-xn, Mp2 as Double, Fma(-xn, Mp1 as Double, X));
     n := (t as Integer) and 1;
-    t := SqlMFma(-xn, Pp3 as Double, t1);
-    da := SqlMFma(-xn, Pp3 as Double, t1 - t);
-    a := SqlMFma(-xn, Pp4 as Double, t);
-    da := SqlMFma(-xn, Pp4 as Double, t - a) + da;
+    t := Fma(-xn, Pp3 as Double, t1);
+    da := Fma(-xn, Pp3 as Double, t1 - t);
+    a := Fma(-xn, Pp4 as Double, t);
+    da := Fma(-xn, Pp4 as Double, t - a) + da;
     ta := a + da;
     if Abs(a) > Abs(da) then
       tda := (a - ta) + da
@@ -20307,11 +20138,11 @@ const
   last product left for the caller to fuse). }
 function SqlMAtanPoly(V: Double): Double;
 begin
-  Result := SqlMFma(V, SqlMAtD13 as Double, SqlMAtD11 as Double);
-  Result := SqlMFma(V, Result, SqlMAtD9 as Double);
-  Result := SqlMFma(V, Result, SqlMAtD7 as Double);
-  Result := SqlMFma(V, Result, SqlMAtD5 as Double);
-  Result := SqlMFma(V, Result, SqlMAtD3 as Double);
+  Result := Fma(V, SqlMAtD13 as Double, SqlMAtD11 as Double);
+  Result := Fma(V, Result, SqlMAtD9 as Double);
+  Result := Fma(V, Result, SqlMAtD7 as Double);
+  Result := Fma(V, Result, SqlMAtD5 as Double);
+  Result := Fma(V, Result, SqlMAtD3 as Double);
 end;
 
 { SqlMCopySign: Y with X's sign. }
@@ -20350,28 +20181,28 @@ begin
       if u < (A as Double) then
         Exit(X);
       v := X * X;
-      Exit(SqlMFma(SqlMAtanPoly(v), X * v, X));
+      Exit(Fma(SqlMAtanPoly(v), X * v, X));
     end;
-    i := Trunc(SqlMFma(256, u, T52 as Double) - (T52 as Double)) - 16;
+    i := Trunc(Fma(256, u, T52 as Double) - (T52 as Double)) - 16;
     z := u - (SqlMAtanCij[7 * i] as Double);
-    yy := SqlMFma(z, SqlMAtanCij[7 * i + 6] as Double, SqlMAtanCij[7 * i + 5] as Double);
-    yy := SqlMFma(z, yy, SqlMAtanCij[7 * i + 4] as Double);
-    yy := SqlMFma(z, yy, SqlMAtanCij[7 * i + 3] as Double);
-    yy := SqlMFma(z, yy, SqlMAtanCij[7 * i + 2] as Double);
-    Exit(SqlMCopySign(SqlMFma(yy, z, SqlMAtanCij[7 * i + 1] as Double), X));
+    yy := Fma(z, SqlMAtanCij[7 * i + 6] as Double, SqlMAtanCij[7 * i + 5] as Double);
+    yy := Fma(z, yy, SqlMAtanCij[7 * i + 4] as Double);
+    yy := Fma(z, yy, SqlMAtanCij[7 * i + 3] as Double);
+    yy := Fma(z, yy, SqlMAtanCij[7 * i + 2] as Double);
+    Exit(SqlMCopySign(Fma(yy, z, SqlMAtanCij[7 * i + 1] as Double), X));
   end;
   if u < (D as Double) then
   begin
     w := 1 / u;
     t1 := w * u;
-    t2 := SqlMFma(w, u, -t1);
-    i := Trunc(SqlMFma(256, w, T52 as Double) - (T52 as Double)) - 16;
-    z := SqlMFma(w, (1 - t1) - t2, w - (SqlMAtanCij[7 * i] as Double));
-    yy := SqlMFma(z, SqlMAtanCij[7 * i + 6] as Double, SqlMAtanCij[7 * i + 5] as Double);
-    yy := SqlMFma(z, yy, SqlMAtanCij[7 * i + 4] as Double);
-    yy := SqlMFma(z, yy, SqlMAtanCij[7 * i + 3] as Double);
-    yy := SqlMFma(z, yy, SqlMAtanCij[7 * i + 2] as Double);
-    yy := SqlMFma(-z, yy, SqlMHpi1 as Double);
+    t2 := Fma(w, u, -t1);
+    i := Trunc(Fma(256, w, T52 as Double) - (T52 as Double)) - 16;
+    z := Fma(w, (1 - t1) - t2, w - (SqlMAtanCij[7 * i] as Double));
+    yy := Fma(z, SqlMAtanCij[7 * i + 6] as Double, SqlMAtanCij[7 * i + 5] as Double);
+    yy := Fma(z, yy, SqlMAtanCij[7 * i + 4] as Double);
+    yy := Fma(z, yy, SqlMAtanCij[7 * i + 3] as Double);
+    yy := Fma(z, yy, SqlMAtanCij[7 * i + 2] as Double);
+    yy := Fma(-z, yy, SqlMHpi1 as Double);
     t1 := (SqlMHpi as Double) - (SqlMAtanCij[7 * i + 1] as Double);
     Exit(SqlMCopySign(t1 + yy, X));
   end;
@@ -20380,14 +20211,14 @@ begin
     w := 1 / u;
     v := w * w;
     t1 := w * u;
-    t2 := SqlMFma(w, u, -t1);
+    t2 := Fma(w, u, -t1);
     yy := SqlMAtanPoly(v);
     t3 := (SqlMHpi as Double) - w;
     if Abs(SqlMHpi as Double) > Abs(w) then
       cor := ((SqlMHpi as Double) - t3) - w
     else
       cor := (SqlMHpi as Double) - (w + t3);
-    yy := SqlMFma(-yy, w * v, SqlMFma(-w, (1 - t1) - t2, (SqlMHpi1 as Double) + cor));
+    yy := Fma(-yy, w * v, Fma(-w, (1 - t1) - t2, (SqlMHpi1 as Double) + cor));
     Exit(SqlMCopySign(t3 + yy, X));
   end;
   if X > 0 then
@@ -20530,14 +20361,14 @@ begin
   begin
     u := ay / ax;
     v := ax * u;
-    vv := SqlMFma(ax, u, -v);
+    vv := Fma(ax, u, -v);
     du := ((ay - v) - vv) / ax;
   end
   else
   begin
     u := ax / ay;
     v := ay * u;
-    vv := SqlMFma(ay, u, -v);
+    vv := Fma(ay, u, -v);
     du := ((ax - v) - vv) / ay;
   end;
   if X > 0 then
@@ -20547,10 +20378,10 @@ begin
       if u < (Inv16 as Double) then
       begin
         v := u * u;
-        zz := SqlMFma(u * v, SqlMAtanPoly(v), du);
+        zz := Fma(u * v, SqlMAtanPoly(v), du);
         Exit(SqlMCopySign(u + zz, Y));
       end;
-      i := Trunc(SqlMFma(256, u, T52 as Double) - (T52 as Double)) - 16;
+      i := Trunc(Fma(256, u, T52 as Double) - (T52 as Double)) - 16;
       t3 := u - (SqlMAtanCij[7 * i] as Double);
       v := t3 + du;
       if Abs(t3) > Abs(du) then
@@ -20559,10 +20390,10 @@ begin
         dv := (du - v) + t3;
       t1 := SqlMAtanCij[7 * i + 1] as Double;
       t2 := SqlMAtanCij[7 * i + 2] as Double;
-      q := SqlMFma(v, SqlMAtanCij[7 * i + 6] as Double, SqlMAtanCij[7 * i + 5] as Double);
-      q := SqlMFma(v, q, SqlMAtanCij[7 * i + 4] as Double);
-      q := SqlMFma(v, q, SqlMAtanCij[7 * i + 3] as Double);
-      zz := SqlMFma(v, t2, SqlMFma(dv, t2, (v * v) * q));
+      q := Fma(v, SqlMAtanCij[7 * i + 6] as Double, SqlMAtanCij[7 * i + 5] as Double);
+      q := Fma(v, q, SqlMAtanCij[7 * i + 4] as Double);
+      q := Fma(v, q, SqlMAtanCij[7 * i + 3] as Double);
+      zz := Fma(v, t2, Fma(dv, t2, (v * v) * q));
       Exit(SqlMCopySign(t1 + zz, Y));
     end;
     if u < (Inv16 as Double) then
@@ -20576,13 +20407,13 @@ begin
       t3 := (((SqlMHpi1 as Double) + cor) - du) - (u * v) * SqlMAtanPoly(v);
       Exit(SqlMCopySign(t2 + t3, Y));
     end;
-    i := Trunc(SqlMFma(256, u, T52 as Double) - (T52 as Double)) - 16;
+    i := Trunc(Fma(256, u, T52 as Double) - (T52 as Double)) - 16;
     v := (u - (SqlMAtanCij[7 * i] as Double)) + du;
-    q := SqlMFma(v, SqlMAtanCij[7 * i + 6] as Double, SqlMAtanCij[7 * i + 5] as Double);
-    q := SqlMFma(v, q, SqlMAtanCij[7 * i + 4] as Double);
-    q := SqlMFma(v, q, SqlMAtanCij[7 * i + 3] as Double);
-    q := SqlMFma(v, q, SqlMAtanCij[7 * i + 2] as Double);
-    zz := SqlMFma(-v, q, SqlMHpi1 as Double);
+    q := Fma(v, SqlMAtanCij[7 * i + 6] as Double, SqlMAtanCij[7 * i + 5] as Double);
+    q := Fma(v, q, SqlMAtanCij[7 * i + 4] as Double);
+    q := Fma(v, q, SqlMAtanCij[7 * i + 3] as Double);
+    q := Fma(v, q, SqlMAtanCij[7 * i + 2] as Double);
+    zz := Fma(-v, q, SqlMHpi1 as Double);
     t1 := (SqlMHpi as Double) - (SqlMAtanCij[7 * i + 1] as Double);
     Exit(SqlMCopySign(t1 + zz, Y));
   end;
@@ -20599,13 +20430,13 @@ begin
       t3 := (((SqlMHpi1 as Double) + cor) + du) + (u * v) * SqlMAtanPoly(v);
       Exit(SqlMCopySign(t2 + t3, Y));
     end;
-    i := Trunc(SqlMFma(256, u, T52 as Double) - (T52 as Double)) - 16;
+    i := Trunc(Fma(256, u, T52 as Double) - (T52 as Double)) - 16;
     v := (u - (SqlMAtanCij[7 * i] as Double)) + du;
-    q := SqlMFma(v, SqlMAtanCij[7 * i + 6] as Double, SqlMAtanCij[7 * i + 5] as Double);
-    q := SqlMFma(v, q, SqlMAtanCij[7 * i + 4] as Double);
-    q := SqlMFma(v, q, SqlMAtanCij[7 * i + 3] as Double);
-    q := SqlMFma(v, q, SqlMAtanCij[7 * i + 2] as Double);
-    zz := SqlMFma(v, q, SqlMHpi1 as Double);
+    q := Fma(v, SqlMAtanCij[7 * i + 6] as Double, SqlMAtanCij[7 * i + 5] as Double);
+    q := Fma(v, q, SqlMAtanCij[7 * i + 4] as Double);
+    q := Fma(v, q, SqlMAtanCij[7 * i + 3] as Double);
+    q := Fma(v, q, SqlMAtanCij[7 * i + 2] as Double);
+    zz := Fma(v, q, SqlMHpi1 as Double);
     t1 := (SqlMHpi as Double) + (SqlMAtanCij[7 * i + 1] as Double);
     Exit(SqlMCopySign(t1 + zz, Y));
   end;
@@ -20620,13 +20451,13 @@ begin
     t3 := (((Opi1 as Double) + cor) - du) - (u * v) * SqlMAtanPoly(v);
     Exit(SqlMCopySign(t2 + t3, Y));
   end;
-  i := Trunc(SqlMFma(256, u, T52 as Double) - (T52 as Double)) - 16;
+  i := Trunc(Fma(256, u, T52 as Double) - (T52 as Double)) - 16;
   v := (u - (SqlMAtanCij[7 * i] as Double)) + du;
-  q := SqlMFma(v, SqlMAtanCij[7 * i + 6] as Double, SqlMAtanCij[7 * i + 5] as Double);
-  q := SqlMFma(v, q, SqlMAtanCij[7 * i + 4] as Double);
-  q := SqlMFma(v, q, SqlMAtanCij[7 * i + 3] as Double);
-  q := SqlMFma(v, q, SqlMAtanCij[7 * i + 2] as Double);
-  zz := SqlMFma(-v, q, Opi1 as Double);
+  q := Fma(v, SqlMAtanCij[7 * i + 6] as Double, SqlMAtanCij[7 * i + 5] as Double);
+  q := Fma(v, q, SqlMAtanCij[7 * i + 4] as Double);
+  q := Fma(v, q, SqlMAtanCij[7 * i + 3] as Double);
+  q := Fma(v, q, SqlMAtanCij[7 * i + 2] as Double);
+  zz := Fma(-v, q, Opi1 as Double);
   t1 := (Opi as Double) - (SqlMAtanCij[7 * i + 1] as Double);
   Result := SqlMCopySign(t1 + zz, Y);
 end;
@@ -20703,7 +20534,7 @@ begin
   ahlh := CH * XL;
   alhh := CL * XH;
   ahhh := CH * XH;
-  ahhl := SqlMFma(CH, XH, -ahhh);
+  ahhl := Fma(CH, XH, -ahhh);
   ahhl := ahhl + (alhh + ahlh);
   Result := ahhh + ahhl;
   L := (ahhh - Result) + ahhl;
@@ -20716,7 +20547,7 @@ begin
   ahlh := CH * XL;
   alhh := CL * XH;
   ahhh := CH * XH;
-  ahhl := SqlMFma(CH, XH, -ahhh);
+  ahhl := Fma(CH, XH, -ahhh);
   ahhl := ahhl + (alhh + ahlh);
   Result := SqlMFastTwoSum(ahhh, ahhl, L);
 end;
@@ -20724,7 +20555,7 @@ end;
 function SqlMMulDD2(XH, XL, CH, CL: Double; out L: Double): Double;
 begin
   Result := CH * XH;
-  L := (CH * XL + CL * XH) + SqlMFma(CH, XH, -Result);
+  L := (CH * XL + CL * XH) + Fma(CH, XH, -Result);
 end;
 
 function SqlMMulDD3(XH, XL, YH, YL: Double; out L: Double): Double;
@@ -20732,7 +20563,7 @@ var
   ch, cl1, tl0, tl1, cl2: Double;
 begin
   ch := XH * YH;
-  cl1 := SqlMFma(XH, YH, -ch);
+  cl1 := Fma(XH, YH, -ch);
   tl0 := XL * YL;
   tl1 := tl0 + XH * YL;
   cl2 := tl1 + XL * YH;
@@ -20745,7 +20576,7 @@ var
 begin
   ahlh := CH * XL;
   ahhh := CH * XH;
-  ahhl := SqlMFma(CH, XH, -ahhh);
+  ahhl := Fma(CH, XH, -ahhh);
   ahhl := ahhl + ahlh;
   Result := ahhh + ahhl;
   L := (ahhh - Result) + ahhl;
@@ -20757,7 +20588,7 @@ var
 begin
   ahlh := CH * XL;
   ahhh := CH * XH;
-  ahhl := SqlMFma(CH, XH, -ahhh);
+  ahhl := Fma(CH, XH, -ahhh);
   ahhl := ahhl + ahlh;
   Result := SqlMFastTwoSum(ahhh, ahhl, L);
 end;
@@ -20765,13 +20596,13 @@ end;
 function SqlMMulDDD2(X, CH, CL: Double; out L: Double): Double;
 begin
   Result := CH * X;
-  L := CL * X + SqlMFma(CH, X, -Result);
+  L := CL * X + Fma(CH, X, -Result);
 end;
 
 function SqlMMulDDD3(XH, XL, CH: Double; out L: Double): Double;
 begin
   Result := XH * CH;
-  L := SqlMFma(CH, XH, -Result) + XL * CH;
+  L := Fma(CH, XH, -Result) + XL * CH;
 end;
 
 function SqlMPolyDD(XH, XL: Double; N: Integer; const C: array of Integer; var L: Double): Double;
@@ -21032,7 +20863,7 @@ var
 begin
   dx := X - (L2h as Double) * T;
   dxl := (L2l as Double) * T;
-  dxll := (L2ll as Double) * T + SqlMFma(L2l as Double, T, -dxl);
+  dxll := (L2ll as Double) * T + Fma(L2l as Double, T, -dxl);
   dxh := dx + dxl;
   dxl := ((dx - dxh) + dxl) + dxll;
   fl := dxh * ((F1 as Double) + dxh * ((F2 as Double) + dxh * (F3 as Double)));
@@ -21055,7 +20886,7 @@ var
   t, w: Integer;
 begin
   x2 := X * X;
-  x2l := SqlMFma(X, X, -x2);
+  x2l := Fma(X, X, -x2);
   y2 := x2 * ((SqlMChCL[0] as Double) + x2 * ((SqlMChCL[1] as Double) + x2 * ((SqlMChCL[2] as Double) +
     x2 * (SqlMChCL[3] as Double))));
   y1 := SqlMPolyDD(x2, x2l, 4, SqlMChCH[0..7], y2);
@@ -21095,7 +20926,7 @@ var
   jt, v, aix, il, jl, i1, i0, ie, j1, j0, je, uh, ul, eh, el, ml: Integer;
 begin
   ax := Abs(X);
-  v0 := SqlMFma(ax, S as Double, Integer($4198000002000000) as Double);
+  v0 := Fma(ax, S as Double, Integer($4198000002000000) as Double);
   jt := v0 as Integer;
   v := jt and not ((1 shl 26) - 1);
   t := (v as Double) - (Integer($4198000000000000) as Double);
@@ -21103,7 +20934,7 @@ begin
   if aix < $3FC0000000000000 then
   begin
     if aix < $3E50000000000000 then
-      Exit(SqlMFma(ax, Integer($3C80000000000000) as Double, 1));
+      Exit(Fma(ax, Integer($3C80000000000000) as Double, 1));
     x2 := X * X;
     x4 := x2 * x2;
     p := x2 * (((C0[0] as Double) + x2 * (C0[1] as Double)) + x4 * (((C0[2] as Double) + x2 * (C0[3] as Double)) +
@@ -21138,7 +20969,7 @@ begin
   t1h := SqlMShT1[2 * i1 + 1] as Double;
   t1l := SqlMShT1[2 * i1] as Double;
   th := t0h * t1h;
-  tl := t0h * t1l + t1h * t0l + SqlMFma(t0h, t1h, -th);
+  tl := t0h * t1l + t1h * t0l + Fma(t0h, t1h, -th);
   dx := (ax - (L2h as Double) * t) + (L2l as Double) * t;
   dx2 := dx * dx;
   mx := -dx;
@@ -21195,7 +21026,7 @@ begin
       qh := q0h * q1h;
       q0l := SqlMShT0[2 * j0] as Double;
       q1l := SqlMShT1[2 * j1] as Double;
-      ql := q0h * q1l + q1h * q0l + SqlMFma(q0h, q1h, -qh);
+      ql := q0h * q1l + q1h * q0l + Fma(q0h, q1h, -qh);
       qh := qh * sm;
       ql := ql * sm;
       qh := SqlMExpAccurate(-ax, -t, qh, ql, ql);
@@ -21210,7 +21041,7 @@ begin
     q1h := SqlMShT1[2 * j1 + 1] as Double;
     q1l := SqlMShT1[2 * j1] as Double;
     qh := q0h * q1h;
-    ql := q0h * q1l + q1h * q0l + SqlMFma(q0h, q1h, -qh);
+    ql := q0h * q1l + q1h * q0l + Fma(q0h, q1h, -qh);
     th := th * sp;
     tl := tl * sp;
     qh := qh * sm;
@@ -21296,7 +21127,7 @@ var
   t, w: Integer;
 begin
   x2 := X * X;
-  x2l := SqlMFma(X, X, -x2);
+  x2l := Fma(X, X, -x2);
   y2 := x2 * ((Integer($3DE6124613AEF206) as Double) + x2 * ((Integer($3D6AE7F36BEEA815) as Double) +
     x2 * (Integer($3CE95785063CD974) as Double)));
   y1 := SqlMPolyDDCosh(x2, x2l, 5, SqlMShCH[0..9], y2);
@@ -21362,7 +21193,7 @@ var
   jt, v, aix, il, jl, i1, i0, ie, j1, j0, je, uh, ul, eh, el, ml: Integer;
 begin
   ax := Abs(X);
-  v0 := SqlMFma(ax, S as Double, Integer($4198000002000000) as Double);
+  v0 := Fma(ax, S as Double, Integer($4198000002000000) as Double);
   jt := v0 as Integer;
   v := jt and not ((1 shl 26) - 1);
   t := (v as Double) - (Integer($4198000000000000) as Double);
@@ -21370,7 +21201,7 @@ begin
   if aix < $3FD0000000000000 then
   begin
     if aix < $3E57137449123EF7 then
-      Exit(SqlMFma(X, Integer($3C80000000000000) as Double, X));
+      Exit(Fma(X, Integer($3C80000000000000) as Double, X));
     x2 := X * X;
     x3 := x2 * X;
     x4 := x2 * x2;
@@ -21405,7 +21236,7 @@ begin
   t1h := SqlMShT1[2 * i1 + 1] as Double;
   t1l := SqlMShT1[2 * i1] as Double;
   th := t0h * t1h;
-  tl := t0h * t1l + t1h * t0l + SqlMFma(t0h, t1h, -th);
+  tl := t0h * t1l + t1h * t0l + Fma(t0h, t1h, -th);
   dx := (ax - (L2h as Double) * t) + (L2l as Double) * t;
   dx2 := dx * dx;
   mx := -dx;
@@ -21468,7 +21299,7 @@ begin
       qh := q0h * q1h;
       q0l := SqlMShT0[2 * j0] as Double;
       q1l := SqlMShT1[2 * j1] as Double;
-      ql := q0h * q1l + q1h * q0l + SqlMFma(q0h, q1h, -qh);
+      ql := q0h * q1l + q1h * q0l + Fma(q0h, q1h, -qh);
       qh := qh * sm;
       ql := ql * sm;
       qh := SqlMExpAccurate(-ax, -t, qh, ql, ql);
@@ -21483,7 +21314,7 @@ begin
     q1h := SqlMShT1[2 * j1 + 1] as Double;
     q1l := SqlMShT1[2 * j1] as Double;
     qh := q0h * q1h;
-    ql := q0h * q1l + q1h * q0l + SqlMFma(q0h, q1h, -qh);
+    ql := q0h * q1l + q1h * q0l + Fma(q0h, q1h, -qh);
     th := th * sp;
     tl := tl * sp;
     qh := qh * sm;
@@ -21581,7 +21412,7 @@ var
 begin
   dx := X - (L2h as Double) * T;
   dxl := (L2l as Double) * T;
-  dxll := (L2ll as Double) * T + SqlMFma(L2l as Double, T, -dxl);
+  dxll := (L2ll as Double) * T + Fma(L2l as Double, T, -dxl);
   dxh := dx + dxl;
   dxl := ((dx - dxh) + dxl) + dxll;
   fl := dxh * ((F1 as Double) + dxh * ((F2 as Double) + dxh * (F3 as Double)));
@@ -21631,7 +21462,7 @@ var
   t, w: Integer;
 begin
   x2 := X * X;
-  x2l := SqlMFma(X, X, -x2);
+  x2l := Fma(X, X, -x2);
   y2 := x2 * ((SqlMThCL[0] as Double) + x2 * ((SqlMThCL[1] as Double) + x2 * ((SqlMThCL[2] as Double) +
     x2 * ((SqlMThCL[3] as Double) + x2 * (SqlMThCL[4] as Double)))));
   y1 := SqlMPolyDDTanh(x2, x2l, 9, SqlMThCH[0..17], y2);
@@ -21681,7 +21512,7 @@ begin
     df := SqlMCopySign(Integer($3C80000000000000) as Double, X);
     Exit(f - df);
   end;
-  v0 := SqlMFma(ax, Integer($C0C71547652B82FE) as Double, Integer($4188000004000000) as Double);
+  v0 := Fma(ax, Integer($C0C71547652B82FE) as Double, Integer($4188000004000000) as Double);
   jt := v0 as Integer;
   v := jt and not ((1 shl 27) - 1);
   t := (v as Double) - (Integer($4188000000000000) as Double);
@@ -21700,7 +21531,7 @@ begin
       begin
         if aix = 0 then
           Exit(X);
-        Exit(SqlMFma(X, Integer($BC80000000000000) as Double, X));
+        Exit(Fma(X, Integer($BC80000000000000) as Double, X));
       end;
       x2 := X * X;
       x3 := x2 * X;
@@ -21720,7 +21551,7 @@ begin
     end;
     t0l := SqlMShT0[2 * i0] as Double;
     t1l := SqlMShT1[2 * i1] as Double;
-    tl := t0h * t1l + t1h * t0l + SqlMFma(t0h, t1h, -th);
+    tl := t0h * t1l + t1h * t0l + Fma(t0h, t1h, -th);
     th := th * sp;
     tl := tl * sp;
     dx := ((Integer($BF162E42FF000000) as Double) * t - ax) - (Integer($BCF718432A1B0E26) as Double) * t;
@@ -21736,7 +21567,7 @@ begin
     qh := SqlMFastTwoSum(1, qh, qd);
     ql := ql + qd;
     rqh := 1 / qh;
-    rql := (ql * rqh + SqlMFma(rqh, qh, -1)) * -rqh;
+    rql := (ql * rqh + Fma(rqh, qh, -1)) * -rqh;
     ph := SqlMMulDDAcc2(ph, pl, rqh, rql, pl);
     e := rh * (Integer($3C10B00000000000) as Double);
     rh := SqlMFastTwoSub(0.5, ph, rl);
@@ -21750,7 +21581,7 @@ begin
   end
   else
   begin
-    dx := SqlMFma(Integer($BF162E42FEFA39EF) as Double, t, -ax);
+    dx := Fma(Integer($BF162E42FEFA39EF) as Double, t, -ax);
     dx2 := dx * dx;
     p := dx * (((Ch[0] as Double) + dx * (Ch[1] as Double)) + dx2 * ((Ch[2] as Double) + dx * (Ch[3] as Double)));
     rh := th * sp;
@@ -21765,7 +21596,7 @@ begin
       Exit(lb);
     t0l := SqlMShT0[2 * i0] as Double;
     t1l := SqlMShT1[2 * i1] as Double;
-    tl := t0h * t1l + t1h * t0l + SqlMFma(t0h, t1h, -th);
+    tl := t0h * t1l + t1h * t0l + Fma(t0h, t1h, -th);
     th := th * sp;
     tl := tl * sp;
   end;
@@ -21774,7 +21605,7 @@ begin
   ql := rl + qd;
   qh := SqlMFastTwoSum(qh, ql, ql);
   rqh := 1 / qh;
-  rql := (ql * rqh + SqlMFma(rqh, qh, -1)) * -rqh;
+  rql := (ql * rqh + Fma(rqh, qh, -1)) * -rqh;
   ph := SqlMMulDDAcc2(rh, rl, rqh, rql, pl);
   rh := SqlMFastTwoSub(0.5, ph, rl);
   rl := rl - pl;
@@ -22071,12 +21902,12 @@ begin
   t12 := (SqlMAsT1[i1] as Double) * (SqlMAsT2[i2] as Double);
   t34 := (SqlMAsT3[i3] as Double) * (SqlMAsT4[i4] as Double);
   th := t12 * t34;
-  tl := SqlMFma(t12, t34, -th);
+  tl := Fma(t12, t34, -th);
   tf := t as Double;
   dh := th * tf;
-  dl := SqlMFma(th, tf, -dh);
+  dl := Fma(th, tf, -dh);
   sh := tl * tf;
-  sl := SqlMFma(tl, tf, -sh);
+  sl := Fma(tl, tf, -sh);
   xh := SqlMFastTwoSum(dh - 1, dl, xl);
   if ZL <> 0.0 then
   begin
@@ -22143,7 +21974,7 @@ begin
   i1 := j shr 5;
   i2 := j and $1F;
   r := (SqlMAscR1[i1] as Double) * (SqlMAscR2[i2] as Double);
-  dx := SqlMFma(r, t as Double, -1);
+  dx := Fma(r, t as Double, -1);
   dx2 := dx * dx;
   f := dx2 * (((SqlMAscC[0] as Double) + dx * (SqlMAscC[1] as Double)) + dx2 * (((SqlMAscC[2] as Double) +
     dx * (SqlMAscC[3] as Double)) + dx2 * (SqlMAscC[4] as Double)));
@@ -22174,10 +22005,10 @@ begin
     begin
       if u = 0 then
         Exit(X);
-      Exit(SqlMFma(Integer($BC30000000000000) as Double, X, X));
+      Exit(Fma(Integer($BC30000000000000) as Double, X, X));
     end;
     x2h := X * X;
-    x2l := SqlMFma(X, X, -x2h);
+    x2l := Fma(X, X, -x2h);
     x3h := x2h * X;
     if u < $3F93000000000000 then
     begin
@@ -22213,7 +22044,7 @@ begin
   if u < $4190000000000000 then
   begin
     x2h := X * X;
-    x2l := SqlMFma(X, X, -x2h);
+    x2l := Fma(X, X, -x2h);
     if u < $3FF0000000000000 then
       th := SqlMFastTwoSum(1, x2h, tl)
     else
@@ -22221,7 +22052,7 @@ begin
     tl := tl + x2l;
     ah := SqlMSqrt(th);
     rs := 0.5 / th;
-    al := (tl - SqlMFma(ah, ah, -th)) * (rs * ah);
+    al := (tl - Fma(ah, ah, -th)) * (rs * ah);
     ah := SqlMFastTwoSum(ah, ax, tl);
     al := al + tl;
   end
@@ -22414,11 +22245,11 @@ begin
   if ix < $4190000000000000 then
   begin
     x2h := X * X;
-    x2l := SqlMFma(X, X, -x2h);
+    x2l := Fma(X, X, -x2h);
     wh := x2h - 1;
     wh := SqlMFastTwoSum(wh, x2l, wl);
     sh := SqlMSqrt(wh);
-    sl := (wl - SqlMFma(sh, sh, -wh)) / (2.0 * sh);
+    sl := (wl - Fma(sh, sh, -wh)) / (2.0 * sh);
     zh := SqlMFastTwoSum(X, sh, zl);
     zl := zl + sl;
     zh := SqlMFastTwoSum(zh, zl, zl);
@@ -22459,12 +22290,12 @@ begin
   t12 := (SqlMAcT1[i1] as Double) * (SqlMAcT2[i2] as Double);
   t34 := (SqlMAcT3[i3] as Double) * (SqlMAcT4[i4] as Double);
   th := t12 * t34;
-  tl := SqlMFma(t12, t34, -th);
+  tl := Fma(t12, t34, -th);
   tf := t as Double;
   dh := th * tf;
-  dl := SqlMFma(th, tf, -dh);
+  dl := Fma(th, tf, -dh);
   sh := tl * tf;
-  sl := SqlMFma(tl, tf, -sh);
+  sl := Fma(tl, tf, -sh);
   xh := SqlMFastTwoSum(dh - 1, dl, xl);
   if zl <> 0.0 then
   begin
@@ -22535,10 +22366,10 @@ begin
     iz := (Integer($BFD0000000000000) as Double) / z;
     zt := 2 * z;
     sh := SqlMSqrt(zt);
-    sl := SqlMFma(sh, sh, -zt) * (sh * iz);
+    sl := Fma(sh, sh, -zt) * (sh * iz);
     z2 := z * z;
     z4 := z2 * z2;
-    ds := SqlMFma(sh * z, (SqlMAcC1[0] as Double) + z * ((((SqlMAcC1[1] as Double) + z * (SqlMAcC1[2] as Double)) +
+    ds := Fma(sh * z, (SqlMAcC1[0] as Double) + z * ((((SqlMAcC1[1] as Double) + z * (SqlMAcC1[2] as Double)) +
       z2 * ((SqlMAcC1[3] as Double) + z * (SqlMAcC1[4] as Double))) + z4 * (((SqlMAcC1[5] as Double) +
       z * (SqlMAcC1[6] as Double)) + z2 * ((SqlMAcC1[7] as Double) + z * (SqlMAcC1[8] as Double)))), sl);
     eps := ds * (Integer($3CD0000000000000) as Double) - (Integer($3970000000000000) as Double) * sh;
@@ -22553,10 +22384,10 @@ begin
     off := $3FF;
     x2h := X * X;
     wh := x2h - 1;
-    wl := SqlMFma(X, X, -x2h);
+    wl := Fma(X, X, -x2h);
     sh := SqlMSqrt(wh);
     ish := 0.5 / wh;
-    sl := (wl - SqlMFma(sh, sh, -wh)) * (sh * ish);
+    sl := (wl - Fma(sh, sh, -wh)) * (sh * ish);
     th := SqlMFastTwoSum(X, sh, tl);
     tl := tl + sl;
     t := th as Integer;
@@ -22598,7 +22429,7 @@ begin
   i1 := j shr 5;
   i2 := j and $1F;
   r := (SqlMAscR1[i1] as Double) * (SqlMAscR2[i2] as Double);
-  dx := SqlMFma(r, t as Double, -1);
+  dx := Fma(r, t as Double, -1);
   dx2 := dx * dx;
   f := dx2 * (((SqlMAscC[0] as Double) + dx * (SqlMAscC[1] as Double)) + dx2 * (((SqlMAscC[2] as Double) +
     dx * (SqlMAscC[3] as Double)) + dx2 * (SqlMAscC[4] as Double)));
@@ -22782,7 +22613,7 @@ var
   t, w: Integer;
 begin
   x2 := X * X;
-  x2l := SqlMFma(X, X, -x2);
+  x2l := Fma(X, X, -x2);
   y2 := x2 * ((SqlMAtCL[0] as Double) + x2 * ((SqlMAtCL[1] as Double) + x2 * ((SqlMAtCL[2] as Double) +
     x2 * ((SqlMAtCL[3] as Double) + x2 * (SqlMAtCL[4] as Double)))));
   y1 := SqlMPolyDD3(x2, x2l, 13, SqlMAtCH[0..25], y2);
@@ -22868,12 +22699,12 @@ begin
   t12 := (SqlMAtT1[i1] as Double) * (SqlMAtT2[i2] as Double);
   t34 := (SqlMAtT3[i3] as Double) * (SqlMAtT4[i4] as Double);
   th := t12 * t34;
-  tl := SqlMFma(t12, t34, -th);
+  tl := Fma(t12, t34, -th);
   tf := t as Double;
   dh := th * tf;
-  dl := SqlMFma(th, tf, -dh);
+  dl := Fma(th, tf, -dh);
   sh := tl * tf;
-  sl := SqlMFma(tl, tf, -sh);
+  sl := Fma(tl, tf, -sh);
   xh := SqlMFastTwoSum(dh - 1, dl, xl);
   t := ZL as Integer;
   t := t - (e shl 52);
@@ -22941,17 +22772,17 @@ begin
   if aix < $3FD0000000000000 then
   begin
     if aix < $3E4D12ED0AF1A27F then
-      Exit(SqlMFma(X, Integer($3C80000000000000) as Double, X));
+      Exit(Fma(X, Integer($3C80000000000000) as Double, X));
     x2 := X * X;
-    dx2 := SqlMFma(X, X, -x2);
+    dx2 := Fma(X, X, -x2);
     x4 := x2 * x2;
     x3 := x2 * X;
     x8 := x4 * x4;
-    dx3 := SqlMFma(x2, X, -x3) + dx2 * X;
+    dx3 := Fma(x2, X, -x3) + dx2 * X;
     p := (((C0[0] as Double) + x2 * (C0[1] as Double)) + x4 * ((C0[2] as Double) + x2 * (C0[3] as Double))) +
       x8 * ((((C0[4] as Double) + x2 * (C0[5] as Double)) + x4 * ((C0[6] as Double) + x2 * (C0[7] as Double))) +
       x8 * (C0[8] as Double));
-    tt := SqlMFma(x2, p, Integer($3C75555555555555) as Double);
+    tt := Fma(x2, p, Integer($3C75555555555555) as Double);
     ph := SqlMFastTwoSum(Integer($3FD5555555555555) as Double, tt, pl);
     ph := SqlMMulDD2(ph, pl, x3, dx3, pl);
     ph := SqlMFastTwoSum(X, ph, tl);
@@ -22967,7 +22798,7 @@ begin
   qh := SqlMFastTwoSub(1, ax, ql);
   iqh := 1 / qh;
   th := ph * iqh;
-  tl := SqlMFma(ph, iqh, -th) + (pl + ph * (SqlMFma(-qh, iqh, 1) - ql * iqh)) * iqh;
+  tl := Fma(ph, iqh, -th) + (pl + ph * (Fma(-qh, iqh, 1) - ql * iqh)) * iqh;
   t := th as Integer;
   ex := t shr 52;
   e := ex - $3FF;
@@ -22981,10 +22812,10 @@ begin
   i2 := j and $1F;
   tf := t as Double;
   r := (0.5 * (SqlMAtR1[i1] as Double)) * (SqlMAtR2[i2] as Double);
-  dx := SqlMFma(r, tf, -0.5);
+  dx := Fma(r, tf, -0.5);
   dx2 := dx * dx;
   rx := r * tf;
-  dxl := SqlMFma(r, tf, -rx);
+  dxl := Fma(r, tf, -rx);
   f := dx2 * (((C[0] as Double) + dx * (C[1] as Double)) + dx2 * (((C[2] as Double) + dx * (C[3] as Double)) +
     dx2 * (C[4] as Double)));
   lh := ((SqlMAtL1[2 * i1 + 1] as Double) + (SqlMAtL2[2 * i2 + 1] as Double)) + (L2h as Double) * ed;
@@ -23698,10 +23529,10 @@ var
   q: Double;
   k: Integer;
 begin
-  q := SqlMFma(XX, SqlMAsncs[N + Hi] as Double, SqlMAsncs[N + Hi - 1] as Double);
+  q := Fma(XX, SqlMAsncs[N + Hi] as Double, SqlMAsncs[N + Hi - 1] as Double);
   for k := Hi - 2 downto 2 do
-    q := SqlMFma(XX, q, SqlMAsncs[N + k] as Double);
-  Result := SqlMFma(SqlMAsncs[N + 1] as Double, XX, SqlMFma(XX * XX, q, SqlMAsncs[N + Hi + 1] as Double));
+    q := Fma(XX, q, SqlMAsncs[N + k] as Double);
+  Result := Fma(SqlMAsncs[N + 1] as Double, XX, Fma(XX * XX, q, SqlMAsncs[N + Hi + 1] as Double));
 end;
 
 { SqlMAsncsRegion: the table's region of |x| (high word K): its index N
@@ -23745,7 +23576,7 @@ end;
 { SqlMAsinSmallPoly: the Taylor polynomial f1..f6 of asin at X2. }
 function SqlMAsinSmallPoly(X2: Double): Double;
 begin
-  Result := SqlMFma(SqlMFma(SqlMFma(SqlMFma(SqlMFma(SqlMAsF[5] as Double, X2, SqlMAsF[4] as Double), X2,
+  Result := Fma(Fma(Fma(Fma(Fma(SqlMAsF[5] as Double, X2, SqlMAsF[4] as Double), X2,
     SqlMAsF[3] as Double), X2, SqlMAsF[2] as Double), X2, SqlMAsF[1] as Double), X2, SqlMAsF[0] as Double);
 end;
 
@@ -23759,20 +23590,20 @@ var
 begin
   k := ((Z as Integer) shr 32) and $FFFFFFFF;
   t := (SqlMInRoot[(k and $001FFFFF) shr 14] as Double) * (((1023 + 511 - (k shr 21)) shl 52) as Double);
-  r := SqlMFma(-(t * t), Z, 1.0);
-  t := t * SqlMFma(r, SqlMFma(r, SqlMFma(r, SqlMAsRt[3] as Double, SqlMAsRt[2] as Double), SqlMAsRt[1] as Double),
+  r := Fma(-(t * t), Z, 1.0);
+  t := t * Fma(r, Fma(r, Fma(r, SqlMAsRt[3] as Double, SqlMAsRt[2] as Double), SqlMAsRt[1] as Double),
     SqlMAsRt[0] as Double);
   c := t * Z;
-  s := SqlMFma(-(0.5 * t), c, 1.5);
+  s := Fma(-(0.5 * t), c, 1.5);
   if Acos then
   begin
     m := Integer($41A0000000000000) as Double;
-    Y := SqlMFma(-m, c, SqlMFma(m, c, c));
+    Y := Fma(-m, c, Fma(m, c, c));
   end
   else
     Y := (c + (Integer($4170000000000000) as Double)) - (Integer($4170000000000000) as Double);
   { t = c*s is used only in t + y, so GCC fused them }
-  CC := SqlMFma(-Y, Y, Z) / SqlMFma(c, s, Y);
+  CC := Fma(-Y, Y, Z) / Fma(c, s, Y);
   P := SqlMAsinSmallPoly(Z) * Z;
 end;
 
@@ -23793,7 +23624,7 @@ begin
   if k < $3FC00000 then
   begin
     xx := X * X;
-    Exit(SqlMFma(SqlMAsinSmallPoly(xx), xx * X, X));
+    Exit(Fma(SqlMAsinSmallPoly(xx), xx * X, X));
   end;
   if SqlMAsncsRegion(k, n, hi) then
   begin
@@ -23813,8 +23644,8 @@ begin
     else
       z := 0.5 * (1.0 + X);
     SqlMAsinNear1(z, False, y, cc, p);
-    cor := SqlMFma(-(2.0 * (y + cc)), p, SqlMFma(-2.0, cc, SqlMHp1 as Double));
-    res1 := SqlMFma(-2.0, y, SqlMHp0 as Double);
+    cor := Fma(-(2.0 * (y + cc)), p, Fma(-2.0, cc, SqlMHp1 as Double));
+    res1 := Fma(-2.0, y, SqlMHp0 as Double);
     res := res1 + cor;
     if m > 0 then
       Exit(res);
@@ -23847,7 +23678,7 @@ begin
   begin
     x2 := X * X;
     r := (SqlMHp0 as Double) - X;
-    cor := SqlMFma(-SqlMAsinSmallPoly(x2), x2 * X, (((SqlMHp0 as Double) - r) - X) + (SqlMHp1 as Double));
+    cor := Fma(-SqlMAsinSmallPoly(x2), x2 * X, (((SqlMHp0 as Double) - r) - X) + (SqlMHp1 as Double));
     Exit(r + cor);
   end;
   if SqlMAsncsRegion(k, n, hi) then

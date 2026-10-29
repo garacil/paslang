@@ -713,6 +713,9 @@ GOLDEN_A64 += randfast
 # P492: a heap of integers on the words, against the general sifts it replaces.
 GOLDEN += heapfast
 GOLDEN_A64 += heapfast
+# P425: Fma against Python's math.fma and the exact rational, by every way to write it.
+GOLDEN += fmafused
+GOLDEN_A64 += fmafused
 # P476: PDF files read, their text, and the same bytes bent.
 GOLDEN += pdftext
 GOLDEN_A64 += pdftext
@@ -1288,7 +1291,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/stackmap.out $(BUILDDIR)/stackmap.vgot; \
 	echo ok stackmaps; \
 	echo "==== the base processor (-cpu base) ===="; \
-	for t in vectors vecmore vecpool bitwords xxh3 inlineasm hash1 tree1 store1 mapsplit set256 strwords strkern strcmpk cmpwords sysutils1 utf8kern jsonkern longslice rtlong fillkern json1 jsoncanon hmacstream hashpieces hashpieces2 cipherkat cipherwyche x25519kat nistwyche rsawyche; do \
+	for t in vectors vecmore vecpool bitwords xxh3 inlineasm hash1 tree1 store1 mapsplit set256 strwords strkern strcmpk cmpwords sysutils1 utf8kern jsonkern longslice rtlong fillkern json1 jsoncanon hmacstream hashpieces hashpieces2 cipherkat cipherwyche x25519kat nistwyche rsawyche fmafused; do \
 	  $(OUTDIR)/paslangc -cpu base -o $(BUILDDIR)/$$t-base testdata/$$t.paslang; \
 	  $(BUILDDIR)/$$t-base > $(BUILDDIR)/$$t.bgot; \
 	  diff -u testdata/$$t.out $(BUILDDIR)/$$t.bgot; \
@@ -1296,6 +1299,10 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  diff -u testdata/$$t.out $(BUILDDIR)/$$t.bgot; \
 	done; \
 	grep -q 'p_pashash_passha256cpu' $(BUILDDIR)/hash1.s; \
+	$(OUTDIR)/paslangc -cpu v3 -o $(BUILDDIR)/fmafused-v3 testdata/fmafused.paslang; \
+	grep -q 'vfmadd213sd' $(BUILDDIR)/fmafused-v3.s; \
+	grep -q 'call p_pasnum_pasfma' $(BUILDDIR)/fmafused-base.s; \
+	if grep -q 'vfmadd213sd' $(BUILDDIR)/fmafused-base.s; then echo "fmafused-base.s carries vfmadd213sd"; exit 1; fi; \
 	grep -q 'p_pashash_passha256base' $(BUILDDIR)/hash1-base.s; \
 	grep -q 'p_pashash_passha256updatecpu' $(BUILDDIR)/hashpieces.s; \
 	grep -q 'p_pashash_passha256updatebase' $(BUILDDIR)/hashpieces-base.s; \

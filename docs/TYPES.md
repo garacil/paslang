@@ -244,7 +244,8 @@ machines (`testdata/realint.paslang`, `fatal/rr*`). `Sin` and
 `Cos` take radians. `Int` truncates toward zero and returns a real.
 `Frac` is the signed remainder. `ArcTan`, `ArcSin`, and `ArcCos` return radians. `ArcSin` and
 `ArcCos` stop outside `-1..1`. `Power(base, exponent)` returns a real. `Log10` and `Log2` are the
-base-10 and base-2 logarithms. `Hypot(x, y)` is the hypotenuse.
+base-10 and base-2 logarithms. `Hypot(x, y)` is the hypotenuse. `Fma(a, b, c)` is
+`a * b + c` rounded once.
 The Math family completes the calculation set: `Tan`, `Cot`, `Sec`, `Csc`,
 `ArcTan2(y, x)` (four quadrants, `ArcTan2(0,0)` is 0), `ArcCot` (`Pi/2 - ArcTan`),
 `ArcSec`/`ArcCsc` (stop outside `|x| >= 1`), `Sinh`, `Cosh`, `Tanh` (saturates at

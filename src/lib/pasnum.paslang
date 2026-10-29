@@ -113,6 +113,17 @@ function PasNumLog10Pow2(X: Int64): Int64;
 function PasNumDigitCount(D: Int64): Int64;
 procedure PasNumWriteDigits(P: Pointer; D, N: Int64);
 
+{ Fma (P425): A * B + C rounded once, IEEE 754-2008's fusedMultiplyAdd.
+  The compiler writes the instruction itself (VFMADD213SD and SS, FMADD)
+  where the processor it compiles for has one; under a processor that
+  may lack it, Fma is PasFma or PasFmaS, which test the processor once
+  per call. PasFmaSoft and PasFmaSoftS do it from integers and
+  doubles alone, Go's math.FMA, and give the same bits on every machine. }
+function PasFma(A, B, C: Double): Double;
+function PasFmaS(A, B, C: Single): Single;
+function PasFmaSoft(X, Y, Z: Double): Double;
+function PasFmaSoftS(A, B, C: Single): Single;
+
 implementation
 
 const
@@ -2189,6 +2200,222 @@ end;
 function PasNumAppendF32(P: Pointer; Bits: Int64): Int64;
 begin
   Result := AppendShort(P, Bits, True);
+end;
+
+{ PasFmaSoft: A*B+C rounded once, from the integers alone: Go's
+  math.FMA (src/math/fma.go), for a processor without the instruction.
+  The product's 106 bits are two words (MulHi and the low product), the
+  addend is aligned to them with the bits shifted out kept as one sticky
+  bit, and the sum is rounded to nearest, ties to even. }
+function FmaShrCompress(U1, U2, N: Integer; out R2: Integer): Integer;
+begin
+  if N = 0 then
+  begin
+    R2 := U2;
+    Exit(U1);
+  end;
+  if N = 64 then
+  begin
+    R2 := U1 or Ord(U2 <> 0);
+    Exit(0);
+  end;
+  if N >= 128 then
+  begin
+    R2 := Ord((U1 or U2) <> 0);
+    Exit(0);
+  end;
+  if N < 64 then
+  begin
+    R2 := (U2 shr N) or (U1 shl (64 - N));
+    R2 := R2 or Ord((U2 and ((1 shl N) - 1)) <> 0);
+    Exit(U1 shr N);
+  end;
+  R2 := U1 shr (N - 64);
+  R2 := R2 or Ord(((U1 and ((1 shl (N - 64)) - 1)) or U2) <> 0);
+  Result := 0;
+end;
+
+procedure FmaSplit(B: Integer; out Sign, E, M: Integer);
+var
+  sh: Integer;
+begin
+  Sign := B shr 63;
+  E := (B shr 52) and $7FF;
+  M := B and $000FFFFFFFFFFFFF;
+  if E = 0 then
+  begin
+    sh := LeadingZeros(M) - 11;
+    M := M shl sh;
+    E := 1 - sh;
+  end
+  else
+    M := M or $0010000000000000;
+end;
+
+function PasFmaSoft(X, Y, Z: Double): Double;
+var
+  bx, by, bz, xs, xe, xm, ys, ye, ym, zs, ze, zm, pe, pm1, pm2, zm1, zm2,
+    ps, is62, t, m, c, nz, n, s2: Integer;
+begin
+  bx := X as Integer;
+  by := Y as Integer;
+  bz := Z as Integer;
+  if (X = 0.0) or (Y = 0.0) or ((bx and $7FF0000000000000) = $7FF0000000000000) or
+    ((by and $7FF0000000000000) = $7FF0000000000000) then
+    Exit(X * Y + Z);
+  if Z = 0.0 then
+    Exit(X * Y);
+  if (bz and $7FF0000000000000) = $7FF0000000000000 then
+    Exit(Z);
+  FmaSplit(bx, xs, xe, xm);
+  FmaSplit(by, ys, ye, ym);
+  FmaSplit(bz, zs, ze, zm);
+  pe := xe + ye - 1023 + 1;
+  pm1 := MulHi(xm shl 10, ym shl 11);
+  pm2 := (xm shl 10) * (ym shl 11);
+  zm1 := zm shl 10;
+  zm2 := 0;
+  ps := xs xor ys;
+  is62 := ((not pm1) shr 62) and 1;
+  if is62 = 1 then
+  begin
+    pm1 := (pm1 shl 1) or (pm2 shr 63);
+    pm2 := pm2 shl 1;
+  end;
+  pe := pe - is62;
+  if (pe < ze) or ((pe = ze) and ULt(pm1, zm1)) then
+  begin
+    t := ps; ps := zs; zs := t;
+    t := pe; pe := ze; ze := t;
+    t := pm1; pm1 := zm1; zm1 := t;
+    t := pm2; pm2 := zm2; zm2 := t;
+  end;
+  if (ps <> zs) and (pe = ze) and (pm1 = zm1) and (pm2 = zm2) then
+    Exit(0.0);
+  zm1 := FmaShrCompress(zm1, zm2, pe - ze, zm2);
+  if ps = zs then
+  begin
+    t := pm2 + zm2;
+    c := Ord(ULt(t, pm2));
+    pm2 := t;
+    pm1 := pm1 + zm1 + c;
+    pe := pe - ((not pm1) shr 63);
+    pm1 := FmaShrCompress(pm1, pm2, 64 + (pm1 shr 63), m);
+  end
+  else
+  begin
+    t := pm2 - zm2;
+    c := Ord(ULt(pm2, zm2));
+    pm2 := t;
+    pm1 := pm1 - zm1 - c;
+    nz := LeadingZeros(pm1);
+    if nz = 64 then
+      nz := nz + LeadingZeros(pm2);
+    pe := pe - nz;
+    n := nz - 1;
+    { shl(pm1, pm2, n) as Go's, n up to 127 }
+    if n >= 64 then
+    begin
+      m := pm2 shl (n - 64);
+      s2 := 0;
+    end
+    else if n = 0 then
+    begin
+      m := pm1;
+      s2 := pm2;
+    end
+    else
+    begin
+      m := (pm1 shl n) or (pm2 shr (64 - n));
+      s2 := pm2 shl n;
+    end;
+    m := m or Ord(s2 <> 0);
+  end;
+  if (pe > 1022 + 1023) or ((pe = 1022 + 1023) and (((m + (1 shl 9)) shr 63) = 1)) then
+    Exit((((ps shl 63) or $7FF0000000000000) as Double));
+  if pe < 0 then
+  begin
+    n := -pe;
+    if n >= 64 then
+      m := Ord(m <> 0)
+    else
+      m := (m shr n) or Ord((m and ((1 shl n) - 1)) <> 0);
+    pe := 0;
+  end;
+  if (m and ((1 shl 10) - 1)) = (1 shl 9) then
+    m := ((m + (1 shl 9)) shr 10) and not 1
+  else
+    m := (m + (1 shl 9)) shr 10;
+  if m = 0 then
+    pe := 0;
+  t := (ps shl 63) + (pe shl 52) + m;
+  Result := t as Double;
+end;
+
+
+{ PasFmaSoftS: the same for a Single. The product of two Singles is exact
+  in a Double (48 bits of 53), TwoSum gives the sum and its error
+  exactly, and a sum made odd where it was not exact (rounding to odd:
+  the error pulls its last bit to 1) rounds to a Single once, which is
+  the nearest Single to the exact A * B + C (Boldo and Melquiond,
+  Emulation of a FMA and Correctly Rounded Sums: Proved Algorithms Using
+  Rounding to Odd, IEEE Transactions on Computers 57(4), 2008). }
+function PasFmaSoftS(A, B, C: Single): Single;
+var
+  x, y, z, p, s, bv, e: Double;
+  sb: Integer;
+begin
+  x := A;
+  y := B;
+  z := C;
+  p := x * y;
+  s := p + z;
+  sb := s as Integer;
+  if (sb and $7FF0000000000000) = $7FF0000000000000 then
+    Exit(Single(s));
+  bv := s - p;
+  e := (p - (s - bv)) + (z - bv);
+  if (e <> 0.0) and ((sb and 1) = 0) then
+  begin
+    if (e > 0.0) = (s > 0.0) then
+      sb := sb + 1
+    else
+      sb := sb - 1;
+    s := sb as Double;
+  end;
+  Result := Single(s);
+end;
+
+{ PasFma: the instruction where the processor has it, PasFmaSoft where
+  it does not; the same bits. }
+function PasFma(A, B, C: Double): Double;
+begin
+  if CpuHas('fma') then
+  begin
+    asm amd64 (A: in xmm0; B: in xmm1; C: in xmm2; Result: out xmm0)
+      vfmadd213sd %xmm2, %xmm1, %xmm0
+    end;
+    asm arm64 (A: in d0; B: in d1; C: in d2; Result: out d0)
+      fmadd d0, d0, d1, d2
+    end;
+  end
+  else
+    Result := PasFmaSoft(A, B, C);
+end;
+
+function PasFmaS(A, B, C: Single): Single;
+begin
+  if CpuHas('fma') then
+  begin
+    asm amd64 (A: in xmm0; B: in xmm1; C: in xmm2; Result: out xmm0)
+      vfmadd213ss %xmm2, %xmm1, %xmm0
+    end;
+    asm arm64 (A: in s0; B: in s1; C: in s2; Result: out s0)
+      fmadd s0, s0, s1, s2
+    end;
+  end
+  else
+    Result := PasFmaSoftS(A, B, C);
 end;
 
 end.

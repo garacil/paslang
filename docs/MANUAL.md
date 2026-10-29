@@ -7990,6 +7990,7 @@ an infinity (`Exp(1000)` is `+Inf`), not a stop. There is no `Random`;
 | `Exp(x)` | e to the `x` | |
 | `Power(base, e)` | `base` to the `e`; `Power(x, 0)` is 1, `Power(0, -1)` +Inf, and a negative base with a whole exponent works (`Power(-2, 3)` is -8) | a negative base with an exponent that is not whole (`power domain`) |
 | `Hypot(x, y)` | √(x² + y²) | |
+| `Fma(a, b, c)` | `a * b + c` rounded once (IEEE 754-2008's fusedMultiplyAdd), where `a * b + c` rounds the product and then the sum: `Fma(0.1, 10, -1)` is 2⁻⁵⁴ and `0.1 * 10 - 1` is 0. Three `Single`s give a `Single`, anything else a `Double` (an integer converts). One instruction (`VFMADD213SD`, `FMADD`) where the processor has it, which is every arm64 and `-cpu v3` or more; under `-cpu base` the processor is tested at each call and Go's `math.FMA` arithmetic on integers stands in where it has no such instruction: the same bits | |
 | `Ldexp(x, p)` | x × 2^p; `p` is an `Integer`, a real is a compile error | |
 | `Poly(x, a)` | a[0] + a[1]·x + a[2]·x² + …, by Horner; `a` is an `array of Real` | |
 | `Int(x)`, `Frac(x)` | the whole part toward zero, and the rest with x's sign: `Int(-2.75)` is -2.0, `Frac(-2.75)` -0.75 | |
@@ -14785,7 +14786,7 @@ its place:
   Sha3_224Update Sha3_224Final` and the same for the other three sizes,
   with the types `THmacState` and `TSha3State`;
 - the calculation set (§15): `Abs Sqr Sqrt Trunc Round Int Frac Floor
-  Ceil Min Max Pi Exp Ln LnXP1 Log10 Log2 LogN Power Hypot Ldexp Poly
+  Ceil Min Max Pi Exp Ln LnXP1 Log10 Log2 LogN Power Hypot Fma Ldexp Poly
   Sin Cos Tan Cot Sec Csc ArcSin ArcCos ArcTan ArcTan2 ArcCot ArcSec
   ArcCsc Sinh Cosh Tanh ArcSinh ArcCosh ArcTanh IsNan IsInfinite`;
 - the program's, the debugger's and the runtime's words `ParamStr
