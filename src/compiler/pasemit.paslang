@@ -855,6 +855,8 @@ type
     function RealRhs(E: PExpr): string;
     function RealCondBranch(E: PExpr; const Target: string; WhenTrue: Boolean): Boolean;
     function RealHome(const N: string; out Sy: TSym; out Where: string): Boolean;
+    procedure RealLoadSym(const Sy: TSym; K: LongInt);
+    procedure RealStoreSym(const Sy: TSym);
     procedure RealIntCheck;
     function EmitQuadFn(E: PExpr): Boolean;
     procedure QuadCall2(E: PExpr; const Fn: string);
@@ -15755,7 +15757,9 @@ begin
   s := FindSym(N);
   if s.Reg <> '' then
   begin
-    if FArm then
+    if FArm and (s.Reg[1] = 'd') then
+      Line('  fmov x0, ' + s.Reg)
+    else if FArm then
       Line('  mov x0, ' + s.Reg)
     else
       Line('  movq %' + s.Reg + ', %rax');
@@ -15909,7 +15913,9 @@ begin
   s := FindSym(N);
   if s.Reg <> '' then
   begin
-    if FArm then
+    if FArm and (s.Reg[1] = 'd') then
+      Line('  fmov ' + s.Reg + ', x0')
+    else if FArm then
       Line('  mov ' + s.Reg + ', x0')
     else
       Line('  movq %rax, %' + s.Reg);
@@ -19084,6 +19090,14 @@ begin
   Result := '';
   if E = nil then
     Exit;
+  if FArm then
+  begin
+    { arm64 has no memory operand: only a variable a loop keeps in a d register }
+    if (E^.Kind = ekVar) and (TKind(E^.Typ) = tykReal) and RealHome(E^.Name, sy, w) then
+      if (sy.Reg <> '') and (sy.Reg[1] = 'd') then
+        Result := sy.Reg;
+    Exit;
+  end;
   if (E^.Kind = ekReal) and (TKind(E^.Typ) = tykReal) and (E^.Typ <> TySingle) and
     (TSize(E^.Typ) = 8) then
   begin
@@ -19105,7 +19119,7 @@ var
   swap: Boolean;
 begin
   Result := False;
-  if FArm or (E = nil) or (E^.Kind <> ekBin) then
+  if (E = nil) or (E^.Kind <> ekBin) then
     Exit;
   op := E^.Bin;
   if not ((op = boEq) or (op = boNe) or (op = boLt) or (op = boLe) or (op = boGt) or (op = boGe)) then
@@ -19118,6 +19132,44 @@ begin
     Exit;
   if not (RealOperand(E^.L, 0) and RealOperand(E^.R, 1)) then
     Exit;
+  if FArm then
+  begin
+    { FCMP sets N Z C V := 0 0 1 1 for an unordered pair (ARM ARM): gt, ge, mi, ls and eq
+      are false for it and ne is true, so each condition and its negation is one jump }
+    RealTo(E^.L, 0);
+    RealTo(E^.R, 1);
+    Line('  fcmp d0, d1');
+    if op = boGt then
+      skip := 'gt'
+    else if op = boGe then
+      skip := 'ge'
+    else if op = boLt then
+      skip := 'mi'
+    else if op = boLe then
+      skip := 'ls'
+    else if op = boEq then
+      skip := 'eq'
+    else
+      skip := 'ne';
+    if not WhenTrue then
+    begin
+      if op = boGt then
+        skip := 'le'
+      else if op = boGe then
+        skip := 'lt'
+      else if op = boLt then
+        skip := 'pl'
+      else if op = boLe then
+        skip := 'hi'
+      else if op = boEq then
+        skip := 'ne'
+      else
+        skip := 'eq';
+    end;
+    Line('  b.' + skip + ' ' + Target);
+    Result := True;
+    Exit;
+  end;
   swap := (op = boLt) or (op = boLe);
   if swap then
   begin
@@ -19162,12 +19214,53 @@ begin
   Result := True;
 end;
 
+{ A Double variable into dK / xmmK, and d0 into its place, on arm64 (P489): from a d register
+  a loop keeps it in, a general one (a routine with no frame), the frame or the data. }
+procedure TEmitter.RealLoadSym(const Sy: TSym; K: LongInt);
+var
+  r: string;
+begin
+  r := 'd' + IntToStr(K);
+  if Sy.Reg <> '' then
+  begin
+    if Sy.Reg[1] = 'd' then
+      Line('  fmov ' + r + ', ' + Sy.Reg)
+    else
+      Line('  fmov ' + r + ', ' + Sy.Reg);
+  end
+  else if Sy.Global then
+    LdS(VarLabel(Sy.Name), r)
+  else
+    LdFP(r, Sy.Off);
+end;
+
+procedure TEmitter.RealStoreSym(const Sy: TSym);
+begin
+  if Sy.Reg <> '' then
+    Line('  fmov ' + Sy.Reg + ', d0')
+  else if Sy.Global then
+    StS('d0', VarLabel(Sy.Name))
+  else
+    StFP('d0', Sy.Off);
+end;
+
 procedure TEmitter.RealTo(E: PExpr; K: LongInt);
 var
   r, w, rhs, op: string;
   sy: TSym;
 begin
   r := '%xmm' + IntToStr(K);
+  if FArm then
+    r := 'd' + IntToStr(K);
+  if (E^.Kind = ekReal) and (TKind(E^.Typ) = tykReal) and (E^.Typ <> TySingle) and
+    (TSize(E^.Typ) = 8) and FArm then
+  begin
+    if E^.Num = 0 then
+      Line('  fmov ' + r + ', xzr')
+    else
+      LdS(InternReal(E^.Num), r);
+    Exit;
+  end;
   if (E^.Kind = ekReal) and (TKind(E^.Typ) = tykReal) and (E^.Typ <> TySingle) and
     (TSize(E^.Typ) = 8) then
   begin
@@ -19181,7 +19274,9 @@ begin
   begin
     if (E^.Kind = ekVar) and (TKind(E^.Typ) = tykReal) and RealHome(E^.Name, sy, w) then
     begin
-      if Copy(sy.Reg, 1, 3) = 'xmm' then
+      if FArm then
+        RealLoadSym(sy, K)
+      else if Copy(sy.Reg, 1, 3) = 'xmm' then
         Line('  movapd ' + w + ', ' + r)
       else if sy.Reg <> '' then
         Line('  movq ' + w + ', ' + r)
@@ -19190,7 +19285,10 @@ begin
       Exit;
     end;
     EmitExpr(E);
-    RealInto(E^.Typ, False, 'xmm' + IntToStr(K));
+    if FArm then
+      RealInto(E^.Typ, False, 'd' + IntToStr(K))
+    else
+      RealInto(E^.Typ, False, 'xmm' + IntToStr(K));
     Exit;
   end;
   RealTo(E^.L, K);
@@ -19198,7 +19296,23 @@ begin
   if rhs = '' then
   begin
     RealTo(E^.R, K + 1);
-    rhs := '%xmm' + IntToStr(K + 1);
+    if FArm then
+      rhs := 'd' + IntToStr(K + 1)
+    else
+      rhs := '%xmm' + IntToStr(K + 1);
+  end;
+  if FArm then
+  begin
+    if E^.Bin = boAdd then
+      op := 'fadd '
+    else if E^.Bin = boSub then
+      op := 'fsub '
+    else if E^.Bin = boMul then
+      op := 'fmul '
+    else
+      op := 'fdiv ';
+    Line('  ' + op + r + ', ' + r + ', ' + rhs);
+    Exit;
   end;
   if E^.Bin = boAdd then
     op := 'addsd '
@@ -19220,7 +19334,7 @@ var
   t: LongInt;
 begin
   Result := False;
-  if FArm or (S = nil) or (S^.E = nil) then
+  if (S = nil) or (S^.E = nil) then
     Exit;
   if S^.Dest <> nil then
   begin
@@ -19240,7 +19354,9 @@ begin
   if not RealOperand(S^.E, 0) then
     Exit;
   RealTo(S^.E, 0);
-  if Copy(sy.Reg, 1, 3) = 'xmm' then
+  if FArm then
+    RealStoreSym(sy)
+  else if Copy(sy.Reg, 1, 3) = 'xmm' then
     Line('  movapd %xmm0, ' + w)
   else if sy.Reg <> '' then
     Line('  movq %xmm0, ' + w)
@@ -19271,12 +19387,20 @@ begin
       f := 's'
     else
       f := 'd';
-    EmitExpr(E^.L);
-    PshK('x0', VCls(E^.L^.Typ, 0));
-    EmitExpr(E^.R);
-    RealInto(E^.R^.Typ, sgl, f + '1');
-    Ppop('x0');
-    RealInto(E^.L^.Typ, sgl, f + '0');
+    if (not sgl) and RealOperand(E^.L, 0) and RealOperand(E^.R, 1) then
+    begin
+      RealTo(E^.L, 0);
+      RealTo(E^.R, 1);
+    end
+    else
+    begin
+      EmitExpr(E^.L);
+      PshK('x0', VCls(E^.L^.Typ, 0));
+      EmitExpr(E^.R);
+      RealInto(E^.R^.Typ, sgl, f + '1');
+      Ppop('x0');
+      RealInto(E^.L^.Typ, sgl, f + '0');
+    end;
     if isCmp then
     begin
       Line('  fcmp ' + f + '0, ' + f + '1');
@@ -29374,6 +29498,7 @@ begin
       skAssign:
         begin
           if not VecAssign(S) then
+          if not RealAssign(S) then
           if not FastAssign(S) then
           if not OrdAssign(S) then
           if not EmitStrAppend(S) then
@@ -31182,7 +31307,7 @@ begin
     is relocated in its home and comes back relocated. A Double too on
     amd64 (P486), in an xmm register. }
   k := TKind(S.Typ);
-  if (k = tykReal) and (not FArm) and (TSize(S.Typ) = 8) then
+  if (k = tykReal) and (TSize(S.Typ) = 8) then
     k := tykInteger;
   if (k <> tykInteger) and (k <> tykEnum) and (k <> tykSubrange) and
     (k <> tykBoolean) and (k <> tykPointer) and (k <> tykClass) then
@@ -33790,7 +33915,7 @@ begin
   nr := 0;
   { a Double is kept in xmm8 and up only in a region with no vector word and no
     island (a call takes every xmm register) and not in a straight run (P486) }
-  noReal := FArm or (Length(FIsles) > 0);
+  noReal := Length(FIsles) > 0;
   { in a try the handler may read a variable at home, which an exception from the
     region (a bounds check) would find as the region began }
   for i := 0 to High(FTryRec) do
@@ -33872,7 +33997,7 @@ begin
       kind := 1
     else if (nk < 4) and (FPromo[i].Refs >= 3) and IsleWorth(FPromo[i], True) then
       kind := 2;
-    if FArm then
+    if FArm and (kind <> 3) then
     begin
       if kind = 2 then
       begin
@@ -33889,8 +34014,16 @@ begin
     begin
       SetLength(chosen, j + 1);
       chosen[j] := FPromo[i];
-      chosen[j].Reg := 'xmm' + IntToStr(8 + nr);
-      chosen[j].Dw := 25 + nr;
+      if FArm then
+      begin
+        chosen[j].Reg := 'd' + IntToStr(8 + nr);
+        chosen[j].Dw := 72 + nr;
+      end
+      else
+      begin
+        chosen[j].Reg := 'xmm' + IntToStr(8 + nr);
+        chosen[j].Dw := 25 + nr;
+      end;
       chosen[j].Keep := False;
       chosen[j].Save := 0;
       Inc(nr);
@@ -39287,7 +39420,7 @@ begin
   { FSym has room past the routine's own symbols, entries with no name }
   for i := 0 to High(FSym) do
     if (FSym[i].Name <> '') and (not FSym[i].Global) and (FSym[i].Up = 0) and
-      not PromoCand(FSym[i]) then
+      ((not PromoCand(FSym[i])) or (FArm and (TKind(FSym[i].Typ) = tykReal))) then
       Exit;
   Result := True;
 end;
