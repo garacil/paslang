@@ -18,8 +18,8 @@
 """Writes docs/manual/index.html, the paslang book in one page, from the
 canonical Markdown: the programmer's manual (docs/MANUAL.md, every
 program of which make check runs) and the chapters a programmer needs
-to get the most out of the language (TYPES.md, QUAD.md, GC.md,
-KERNELS.md, VISION.md). Nothing is written by hand here: change the
+to get the most out of the language (SQLITE_GUIDE.md, TYPES.md, QUAD.md,
+GC.md, KERNELS.md, VISION.md). Nothing is written by hand here: change the
 Markdown and run this again (make manual).
 
 The Markdown the documents use: # ## ### headings, paragraphs, fenced
@@ -38,6 +38,7 @@ OUT = DOCS / 'manual' / 'index.html'
 
 PARTS = [
     ('manual', 'MANUAL.md', 'The programmer\'s manual'),
+    ('sqlite', 'SQLITE_GUIDE.md', 'SQLite in paslang'),
     ('types', 'TYPES.md', 'Types and the modern ABI'),
     ('quad', 'QUAD.md', 'Quad: IEEE binary128'),
     ('gc', 'GC.md', 'The heap and the collector'),

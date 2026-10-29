@@ -12814,6 +12814,10 @@ keeps no count of its memory, which is the collector's
 a statement (`.treetrace 0x10000`), then `ok`, or `error: ` and the
 message (1.1.248, P404).
 
+The book has a chapter for using it, SQLite in paslang (docs/SQLITE_GUIDE.md, 1.2.325, P414):
+values and types, transactions, the file and the memory, the write-ahead log, functions of
+the program, routines, with seven programs that make check runs.
+
 ## 17. The clock, chance and order
 
 Four more units are installed beside the compiler. They are ordinary

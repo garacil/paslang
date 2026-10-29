@@ -105,7 +105,7 @@ for record in records:
     documentation = compiler.parents[1] / 'share/doc/paslang'
     for source in ('README.md', 'docs/MANUAL.md', 'docs/HELP.md', 'docs/TYPES.md',
                    'docs/GC.md', 'docs/QUAD.md', 'docs/KERNELS.md',
-                   'docs/VISION.md', 'docs/CONSTRAINTS.md'):
+                   'docs/VISION.md', 'docs/CONSTRAINTS.md', 'docs/SQLITE_GUIDE.md'):
         if digest(documentation / Path(source).name) != digest(repo / source):
             raise RuntimeError(f'package documentation is not current: {name}/{source}')
     print(f'ok package format and contents {name}', flush=True)

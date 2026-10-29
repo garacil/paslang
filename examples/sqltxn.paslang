@@ -1,0 +1,110 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+  GPL version 3 or later; see COPYING. No warranty. }
+{ Transactions: what one is, what a failed statement leaves behind, the
+  pattern for a unit of work with try, and savepoints inside it. }
+program sqltxn;
+
+uses sqlite;
+
+var
+  db: TSqlite;
+
+function YesNo(B: Boolean): string;
+begin
+  if B then
+    Result := 'yes'
+  else
+    Result := 'no';
+end;
+
+function InTransaction: string;
+begin
+  Result := YesNo(sqlite3_get_autocommit(db.Handle) = 0);
+end;
+
+procedure Balances(const Title: string);
+var
+  rows: TSqliteRows;
+begin
+  Write(Title, ':');
+  rows := db.Query('SELECT owner, balance FROM account ORDER BY id');
+  while rows.Next do
+    Write(' ', rows.Column(0).S, '=', rows.Column(1).I);
+  WriteLn('  (in a transaction: ', InTransaction, ')');
+end;
+
+{ move Amount from account Src to account Dst, or change nothing }
+procedure Transfer(Src, Dst, Amount: Integer);
+begin
+  db.Exec('BEGIN');
+  try
+    db.Exec('UPDATE account SET balance = balance + ? WHERE id = ?', [Amount, Dst]);
+    db.Exec('UPDATE account SET balance = balance - ? WHERE id = ?', [Amount, Src]);
+    db.Exec('COMMIT');
+  except
+    on E: ESqliteError do
+    begin
+      WriteLn('  ', E.Message);
+      Balances('  the failed statement is undone, the one before it is not');
+      db.Exec('ROLLBACK');
+      raise;
+    end;
+  end;
+end;
+
+begin
+  db := TSqlite.Open(':memory:');
+  try
+    db.Exec('CREATE TABLE account(id INTEGER PRIMARY KEY, owner TEXT, balance INTEGER CHECK(balance >= 0))');
+    db.Exec('INSERT INTO account(owner, balance) VALUES(''ada'', 100), (''bob'', 20)');
+    Balances('start');
+
+    Transfer(1, 2, 30);
+    Balances('after 30 from ada to bob');
+
+    try
+      Transfer(2, 1, 500);
+    except
+      on E: ESqliteError do
+        WriteLn('  Transfer raised, code ', E.Code, ' extended ', E.ExtendedCode);
+    end;
+    Balances('after 500 from bob to ada');
+
+    WriteLn('-- a transaction as SQLite counts it');
+    WriteLn('none ', YesNo(sqlite3_txn_state(db.Handle, '') = SQLITE_TXN_NONE));
+    db.Exec('BEGIN');
+    WriteLn('begun, still none ', YesNo(sqlite3_txn_state(db.Handle, '') = SQLITE_TXN_NONE));
+    db.QueryValue('SELECT count(*) FROM account', []);
+    WriteLn('read ', YesNo(sqlite3_txn_state(db.Handle, '') = SQLITE_TXN_READ));
+    db.Exec('UPDATE account SET balance = balance + 1');
+    WriteLn('write ', YesNo(sqlite3_txn_state(db.Handle, '') = SQLITE_TXN_WRITE));
+    db.Exec('ROLLBACK');
+    WriteLn('rolled back ', YesNo(sqlite3_txn_state(db.Handle, '') = SQLITE_TXN_NONE));
+
+    WriteLn('-- OR ROLLBACK ends the whole transaction');
+    db.Exec('BEGIN');
+    db.Exec('UPDATE account SET balance = balance + 1');
+    try
+      db.Exec('UPDATE OR ROLLBACK account SET balance = -1 WHERE id = 1');
+    except
+      on E: ESqliteError do
+        WriteLn(E.Message);
+    end;
+    WriteLn('in a transaction: ', InTransaction);
+    Balances('unchanged');
+
+    WriteLn('-- savepoints nest, and a rollback to one keeps it');
+    db.Exec('SAVEPOINT work');
+    db.Exec('UPDATE account SET balance = balance + 10 WHERE id = 1');
+    db.Exec('SAVEPOINT risky');
+    db.Exec('UPDATE account SET balance = balance + 1000 WHERE id = 1');
+    Balances('inside risky');
+    db.Exec('ROLLBACK TO risky');
+    Balances('rolled back to risky');
+    db.Exec('RELEASE work');
+    Balances('released (the outermost savepoint commits)');
+  finally
+    db.Free;
+  end;
+end.

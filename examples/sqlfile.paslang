@@ -1,0 +1,187 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+  GPL version 3 or later; see COPYING. No warranty. }
+{ The file SQLite keeps and what moves between it and memory: the pages and
+  the header, the rollback journal while a transaction writes, a connection
+  closed in the middle of one, VACUUM INTO, a backup of a database in memory
+  into a file, and a database as a string of bytes. }
+program sqlfile;
+
+uses sqlite, sysutils;
+
+var
+  dir, path, second: string;
+  db, other: TSqlite;
+  err: TSysError;
+
+function YesNo(B: Boolean): string;
+begin
+  if B then
+    Result := 'yes'
+  else
+    Result := 'no';
+end;
+
+{ the big-endian number of N bytes at offset At of a file's header }
+function Be(const S: string; At, N: Integer): Integer;
+var
+  i: Integer;
+begin
+  Result := 0;
+  for i := 1 to N do
+    Result := Result * 256 + Ord(S[At + i]);
+end;
+
+procedure Forget(const Name: string);
+begin
+  if FileExists(Name) then
+    DeleteFile(Name);
+end;
+
+procedure Header;
+var
+  data: string;
+begin
+  ReadFile(path, data);
+  WriteLn('magic ', Copy(data, 1, 15), ', page size ', Be(data, 16, 2), ', pages ', Be(data, 28, 4),
+    ', encoding ', Be(data, 56, 4), ', user version ', Be(data, 60, 4));
+  WriteLn('the file is ', FileSize(path), ' bytes: ', db.PageCount, ' pages of ', db.PageSize);
+end;
+
+procedure Pragmas;
+const
+  Names: array[0..6] of string = ('journal_mode', 'synchronous', 'locking_mode', 'auto_vacuum', 'cache_size',
+    'foreign_keys', 'encoding');
+var
+  k: Integer;
+  v: TSqliteValue;
+begin
+  for k := 0 to 6 do
+  begin
+    v := db.QueryValue('PRAGMA ' + Names[k], []);
+    if v.Kind = SQLITE_TEXT then
+      WriteLn('  ', Names[k], ' = ', v.S)
+    else
+      WriteLn('  ', Names[k], ' = ', v.I);
+  end;
+end;
+
+procedure Backup;
+var
+  b: TSqlite3Backup;
+  rc: Integer;
+begin
+  db := TSqlite.Open(':memory:');
+  try
+    db.Exec('CREATE TABLE note(id INTEGER PRIMARY KEY, body TEXT)');
+    db.Exec('INSERT INTO note(body) VALUES(?), (?), (?)', ['one', 'two', 'three']);
+    other := TSqlite.Open(second);
+    try
+      b := sqlite3_backup_init(other.Handle, 'main', db.Handle, 'main');
+      rc := sqlite3_backup_step(b, -1);
+      WriteLn('backup step done: ', YesNo(rc = SQLITE_DONE), ', pages ', sqlite3_backup_pagecount(b));
+      sqlite3_backup_finish(b);
+    finally
+      other.Free;
+    end;
+  finally
+    db.Free;
+  end;
+  other := TSqlite.Open(second);
+  try
+    WriteLn('the file has ', other.QueryValue('SELECT count(*) FROM note', []).I, ' notes, check: ',
+      other.QueryValue('PRAGMA integrity_check', []).S);
+  finally
+    other.Free;
+  end;
+end;
+
+procedure Serialized;
+var
+  bytes: string;
+  size: Int64;
+begin
+  db := TSqlite.Open(':memory:');
+  try
+    db.Exec('CREATE TABLE t(x)');
+    db.Exec('INSERT INTO t VALUES(1), (2), (3)');
+    bytes := sqlite3_serialize(db.Handle, '', size, 0);
+    WriteLn('serialized: ', size, ' bytes = ', db.PageCount, ' pages of ', db.PageSize);
+    other := TSqlite.Open(':memory:');
+    try
+      sqlite3_deserialize(other.Handle, '', bytes, size, size, SQLITE_DESERIALIZE_RESIZEABLE);
+      WriteLn('read back: ', other.QueryValue('SELECT sum(x) FROM t', []).I);
+    finally
+      other.Free;
+    end;
+  finally
+    db.Free;
+  end;
+end;
+
+begin
+  if not TryCreateTempDirectoryAt(CurrentDirectoryHandle, '', 'paslang-sql-*', dir, err) then
+    err.RaiseError;
+  path := dir + '/shop.db';
+  second := dir + '/second.db';
+  try
+    WriteLn('-- a file, its pages and its header');
+    db := TSqlite.Open(path);
+    try
+      db.Exec('PRAGMA page_size = 1024');
+      db.Exec('PRAGMA user_version = 42');
+      db.Exec('CREATE TABLE t(id INTEGER PRIMARY KEY, pad BLOB)');
+      db.Exec('INSERT INTO t(pad) SELECT zeroblob(200) FROM (WITH RECURSIVE n(i) AS ' +
+        '(SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 300) SELECT i FROM n)');
+      Header;
+      WriteLn('settings:');
+      Pragmas;
+
+      WriteLn('-- the rollback journal exists while a transaction has written');
+      db.Exec('BEGIN');
+      WriteLn('begun: journal ', YesNo(FileExists(path + '-journal')));
+      db.Exec('UPDATE t SET pad = zeroblob(10) WHERE id < 10');
+      WriteLn('written: journal ', YesNo(FileExists(path + '-journal')));
+      db.Exec('COMMIT');
+      WriteLn('committed: journal ', YesNo(FileExists(path + '-journal')));
+
+      WriteLn('-- closed in the middle of a transaction, it is rolled back');
+      db.Exec('BEGIN');
+      db.Exec('DELETE FROM t');
+      WriteLn('inside: ', db.QueryValue('SELECT count(*) FROM t', []).I, ' rows');
+    finally
+      db.Free;
+    end;
+    db := TSqlite.Open(path);
+    try
+      WriteLn('reopened: ', db.QueryValue('SELECT count(*) FROM t', []).I, ' rows');
+
+      WriteLn('-- deleting rows frees pages for reuse, VACUUM INTO writes a compact copy');
+      db.Exec('DELETE FROM t WHERE id > 20');
+      WriteLn('after the delete: ', db.PageCount, ' pages, ', db.QueryValue('PRAGMA freelist_count', []).I, ' free');
+      db.Exec('VACUUM INTO ?', [second]);
+      other := TSqlite.Open(second);
+      try
+        WriteLn('the copy: ', other.PageCount, ' pages, ', other.QueryValue('SELECT count(*) FROM t', []).I, ' rows');
+      finally
+        other.Free;
+      end;
+    finally
+      db.Free;
+    end;
+    Forget(second);
+
+    WriteLn('-- a database in memory saved to a file');
+    Backup;
+
+    WriteLn('-- a database as bytes');
+    Serialized;
+  finally
+    Forget(path);
+    Forget(path + '-journal');
+    Forget(second);
+    Forget(second + '-journal');
+    if not RemoveDir(dir) then
+      RaiseLastOSError;
+  end;
+end.

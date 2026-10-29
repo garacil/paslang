@@ -1,0 +1,110 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+  GPL version 3 or later; see COPYING. No warranty. }
+{ The write-ahead log: a reader and a writer on the same file at the same
+  time, the snapshot a reader keeps, the checkpoint that copies the log into
+  the file, and what the log leaves on the disk. }
+program sqlwal;
+
+uses sqlite, sysutils;
+
+var
+  dir, path: string;
+  writer, reader: TSqlite;
+  err: TSysError;
+
+function YesNo(B: Boolean): string;
+begin
+  if B then
+    Result := 'yes'
+  else
+    Result := 'no';
+end;
+
+procedure Forget(const Name: string);
+begin
+  if FileExists(Name) then
+    DeleteFile(Name);
+end;
+
+procedure Files;
+begin
+  Write('  the files: log ', YesNo(FileExists(path + '-wal')));
+  if FileExists(path + '-wal') then
+    Write(' (', FileSize(path + '-wal'), ' bytes)');
+  WriteLn(', index ', YesNo(FileExists(path + '-shm')), ', journal ', YesNo(FileExists(path + '-journal')));
+end;
+
+function Count(Db: TSqlite): Int64;
+begin
+  Result := Db.QueryValue('SELECT count(*) FROM t', []).I;
+end;
+
+{ PRAGMA wal_checkpoint(Mode) gives three numbers: 1 when it could not finish for a reader,
+  the frames in the log, the frames copied into the file }
+procedure Checkpoint(const Mode: string);
+var
+  rows: TSqliteRows;
+begin
+  rows := writer.Query('PRAGMA wal_checkpoint(' + Mode + ')');
+  rows.Next;
+  WriteLn('  checkpoint ', Mode, ': blocked ', YesNo(rows.Column(0).I = 1), ', log ', rows.Column(1).I,
+    ' frames, copied ', rows.Column(2).I);
+  rows.Finish;
+end;
+
+begin
+  if not TryCreateTempDirectoryAt(CurrentDirectoryHandle, '', 'paslang-sql-*', dir, err) then
+    err.RaiseError;
+  path := dir + '/log.db';
+  try
+    writer := TSqlite.Open(path);
+    try
+      WriteLn('journal mode: ', writer.QueryValue('PRAGMA journal_mode = WAL', []).S);
+      writer.Exec('CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)');
+      writer.Exec('INSERT INTO t(v) VALUES(?)', ['first']);
+      Files;
+      Checkpoint('PASSIVE');
+      Files;
+
+      WriteLn('-- a reader keeps its snapshot while the writer goes on');
+      reader := TSqlite.Open(path);
+      try
+        reader.Exec('BEGIN');
+        WriteLn('reader sees ', Count(reader), ' row');
+        writer.Exec('INSERT INTO t(v) VALUES(?)', ['second']);
+        writer.Exec('INSERT INTO t(v) VALUES(?)', ['third']);
+        WriteLn('writer committed, sees ', Count(writer), ' rows; reader still sees ', Count(reader));
+        Checkpoint('PASSIVE');
+        Checkpoint('TRUNCATE');
+        reader.Exec('COMMIT');
+        WriteLn('reader ended its transaction and sees ', Count(reader));
+        Checkpoint('TRUNCATE');
+        Files;
+      finally
+        reader.Free;
+      end;
+
+      WriteLn('-- the log starts again with the next commit');
+      writer.Exec('INSERT INTO t(v) VALUES(?)', ['fourth']);
+      Files;
+    finally
+      writer.Free;
+    end;
+    WriteLn('-- the last connection closed: the log is checkpointed and removed');
+    Files;
+    reader := TSqlite.Open(path);
+    try
+      WriteLn('journal mode, kept in the file: ', reader.QueryValue('PRAGMA journal_mode', []).S, ', rows ', Count(reader));
+    finally
+      reader.Free;
+    end;
+  finally
+    Forget(path);
+    Forget(path + '-wal');
+    Forget(path + '-shm');
+    Forget(path + '-journal');
+    if not RemoveDir(dir) then
+      RaiseLastOSError;
+  end;
+end.

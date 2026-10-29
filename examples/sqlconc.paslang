@@ -1,0 +1,147 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+  GPL version 3 or later; see COPYING. No warranty. }
+{ SQLite and routines: two connections to one file in the rollback-journal
+  mode, where a reader keeps a writer from committing; then one connection
+  for each routine in WAL mode, their writers waiting for each other (parked,
+  not blocking a thread), and one connection that several routines share. }
+program sqlconc;
+
+uses sqlite, sysutils;
+
+const
+  Writers = 4;
+  Rows = 25;
+
+var
+  dir, path: string;
+  err: TSysError;
+  wg: WaitGroup;
+  shared: TSqlite;
+  failed: Integer;
+
+procedure Fail(const Where: string; E: ESqliteError);
+begin
+  AtomicAdd(@failed, 1);
+  WriteLn(Where, ': ', E.Message);
+end;
+
+{ a routine with a connection of its own: its writes wait in SQLite's busy handler
+  for the writer that holds the file }
+procedure Writer(K: Integer);
+var
+  db: TSqlite;
+  i: Integer;
+begin
+  try
+    db := TSqlite.Open(path);
+    try
+      sqlite3_busy_timeout(db.Handle, 20000);
+      for i := 1 to Rows do
+        db.Exec('INSERT INTO log(writer, n) VALUES(?, ?)', [K, i]);
+    finally
+      db.Free;
+    end;
+  except
+    on E: ESqliteError do
+      Fail('writer', E);
+  end;
+  wg.Done;
+end;
+
+{ routines that share one connection: each call holds its mutex }
+procedure Sharer(K: Integer);
+var
+  i: Integer;
+begin
+  try
+    for i := 1 to Rows do
+      shared.Exec('INSERT INTO log(writer, n) VALUES(?, ?)', [K, i]);
+  except
+    on E: ESqliteError do
+      Fail('sharer', E);
+  end;
+  wg.Done;
+end;
+
+{ a reader holds the file for as long as its transaction lasts: a writer
+  cannot commit meanwhile, and its transaction stays open to be tried again }
+procedure Locks;
+var
+  other: TSqlite;
+begin
+  other := TSqlite.Open(path);
+  try
+    shared.Exec('BEGIN');
+    WriteLn('the reader sees ', shared.QueryValue('SELECT count(*) FROM log', []).I, ' rows');
+    other.Exec('BEGIN IMMEDIATE');
+    other.Exec('INSERT INTO log(writer, n) VALUES(0, 0)');
+    try
+      other.Exec('COMMIT');
+    except
+      on E: ESqliteError do
+        WriteLn('the writer cannot commit: code ', E.Code, ' ', E.Message);
+    end;
+    shared.Exec('COMMIT');
+    other.Exec('COMMIT');
+    WriteLn('the reader has ended, the writer has committed: ', shared.QueryValue('SELECT count(*) FROM log', []).I,
+      ' row');
+    shared.Exec('DELETE FROM log');
+  finally
+    other.Free;
+  end;
+end;
+
+procedure Report(Db: TSqlite);
+var
+  rows: TSqliteRows;
+begin
+  rows := Db.Query('SELECT writer, count(*), min(n), max(n) FROM log GROUP BY writer ORDER BY writer');
+  while rows.Next do
+    WriteLn('  writer ', rows.Column(0).I, ': ', rows.Column(1).I, ' rows, n from ', rows.Column(2).I,
+      ' to ', rows.Column(3).I);
+  WriteLn('  ', Db.QueryValue('SELECT count(*) FROM log', []).I, ' rows in all');
+end;
+
+var
+  k: Integer;
+
+begin
+  if not TryCreateTempDirectoryAt(CurrentDirectoryHandle, '', 'paslang-sql-*', dir, err) then
+    err.RaiseError;
+  path := dir + '/log.db';
+  try
+    shared := TSqlite.Open(path);
+    try
+      shared.Exec('CREATE TABLE log(id INTEGER PRIMARY KEY, writer INTEGER, n INTEGER)');
+      WriteLn('-- journal mode ', shared.QueryValue('PRAGMA journal_mode', []).S);
+      Locks;
+      WriteLn('-- journal mode ', shared.QueryValue('PRAGMA journal_mode = WAL', []).S);
+      shared.Exec('PRAGMA synchronous = NORMAL');
+
+      WriteLn('-- ', Writers, ' routines, a connection each');
+      wg.Add(Writers);
+      for k := 1 to Writers do
+        pas Writer(k);
+      wg.Wait;
+      Report(shared);
+
+      WriteLn('-- ', Writers, ' routines, one connection');
+      shared.Exec('DELETE FROM log');
+      wg.Add(Writers);
+      for k := 1 to Writers do
+        pas Sharer(k);
+      wg.Wait;
+      Report(shared);
+      WriteLn('failures: ', failed);
+    finally
+      shared.Free;
+    end;
+  finally
+    DeleteFile(path);
+    DeleteFile(path + '-wal');
+    DeleteFile(path + '-shm');
+    if not RemoveDir(dir) then
+      RaiseLastOSError;
+  end;
+end.

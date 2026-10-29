@@ -1,0 +1,205 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+  GPL version 3 or later; see COPYING. No warranty. }
+{ Functions of the program that SQL calls: a scalar function, one that
+  refuses its argument, an aggregate that keeps its state in an object, a
+  window function (an aggregate that can also take a row back out), and a
+  collation, the order of a text. }
+program sqlfunc;
+
+uses sqlite;
+
+type
+  { an aggregate's state: SQLite keeps one for each group, as an object }
+  TSpread = class
+    Seen: Integer;
+    Lo, Hi: Double;
+  end;
+
+  { a window's running sum: rows come in at one end and go out at the other }
+  TRunning = class
+    Total: Int64;
+  end;
+
+var
+  db: TSqlite;
+
+{ clamp(x, lo, hi): x kept between lo and hi, NULL for NULL }
+procedure Clamp(Ctx: TSqlite3Context; Argc: Integer; const Argv: array of TSqlite3Value);
+var
+  v: Double;
+begin
+  if sqlite3_value_type(Argv[0]) = SQLITE_NULL then
+  begin
+    sqlite3_result_null(Ctx);
+    Exit;
+  end;
+  v := sqlite3_value_double(Argv[0]);
+  if v < sqlite3_value_double(Argv[1]) then
+    v := sqlite3_value_double(Argv[1]);
+  if v > sqlite3_value_double(Argv[2]) then
+    v := sqlite3_value_double(Argv[2]);
+  sqlite3_result_double(Ctx, v);
+end;
+
+{ half(n): n / 2 for an even integer, an error for the rest }
+procedure Half(Ctx: TSqlite3Context; Argc: Integer; const Argv: array of TSqlite3Value);
+var
+  n: Int64;
+begin
+  n := sqlite3_value_int64(Argv[0]);
+  if n mod 2 <> 0 then
+    sqlite3_result_error(Ctx, 'half: ' + IntToStr(n) + ' is odd')
+  else
+    sqlite3_result_int64(Ctx, n div 2);
+end;
+
+{ spread(x): the largest x minus the smallest, NULLs left out }
+procedure SpreadStep(Ctx: TSqlite3Context; Argc: Integer; const Argv: array of TSqlite3Value);
+var
+  s: TSpread;
+  v: Double;
+begin
+  if sqlite3_value_type(Argv[0]) = SQLITE_NULL then
+    Exit;
+  s := TSpread(sqlite3_aggregate_context(Ctx, TSpread));
+  v := sqlite3_value_double(Argv[0]);
+  if (s.Seen = 0) or (v < s.Lo) then
+    s.Lo := v;
+  if (s.Seen = 0) or (v > s.Hi) then
+    s.Hi := v;
+  s.Seen := s.Seen + 1;
+end;
+
+procedure SpreadFinal(Ctx: TSqlite3Context);
+var
+  s: TSpread;
+begin
+  s := TSpread(sqlite3_aggregate_context(Ctx, TSpread));
+  if s.Seen = 0 then
+    sqlite3_result_null(Ctx)
+  else
+    sqlite3_result_double(Ctx, s.Hi - s.Lo);
+end;
+
+{ running(x): the sum of the rows in the window }
+procedure RunningStep(Ctx: TSqlite3Context; Argc: Integer; const Argv: array of TSqlite3Value);
+var
+  s: TRunning;
+begin
+  s := TRunning(sqlite3_aggregate_context(Ctx, TRunning));
+  s.Total := s.Total + sqlite3_value_int64(Argv[0]);
+end;
+
+procedure RunningInverse(Ctx: TSqlite3Context; Argc: Integer; const Argv: array of TSqlite3Value);
+var
+  s: TRunning;
+begin
+  s := TRunning(sqlite3_aggregate_context(Ctx, TRunning));
+  s.Total := s.Total - sqlite3_value_int64(Argv[0]);
+end;
+
+procedure RunningValue(Ctx: TSqlite3Context);
+begin
+  sqlite3_result_int64(Ctx, TRunning(sqlite3_aggregate_context(Ctx, TRunning)).Total);
+end;
+
+{ filenum: file2 before file10, the digits compared as numbers }
+function FileNum(Arg: TObject; const A, B: string): Integer;
+var
+  i, j, x, y: Integer;
+begin
+  i := 1;
+  j := 1;
+  while (i <= Length(A)) and (j <= Length(B)) do
+  begin
+    if (A[i] >= '0') and (A[i] <= '9') and (B[j] >= '0') and (B[j] <= '9') then
+    begin
+      x := 0;
+      while (i <= Length(A)) and (A[i] >= '0') and (A[i] <= '9') do
+      begin
+        x := x * 10 + Ord(A[i]) - 48;
+        i := i + 1;
+      end;
+      y := 0;
+      while (j <= Length(B)) and (B[j] >= '0') and (B[j] <= '9') do
+      begin
+        y := y * 10 + Ord(B[j]) - 48;
+        j := j + 1;
+      end;
+      if x <> y then
+      begin
+        if x < y then
+          Result := -1
+        else
+          Result := 1;
+        Exit;
+      end;
+    end
+    else
+    begin
+      if A[i] <> B[j] then
+      begin
+        if A[i] < B[j] then
+          Result := -1
+        else
+          Result := 1;
+        Exit;
+      end;
+      i := i + 1;
+      j := j + 1;
+    end;
+  end;
+  Result := (Length(A) - i) - (Length(B) - j);
+end;
+
+procedure Show(const Title, Sql: string);
+var
+  rows: TSqliteRows;
+  i: Integer;
+begin
+  Write(Title, ':');
+  rows := db.Query(Sql);
+  while rows.Next do
+    for i := 0 to rows.ColumnCount - 1 do
+      case rows.Column(i).Kind of
+        SQLITE_INTEGER: Write(' ', rows.Column(i).I);
+        SQLITE_FLOAT: Write(' ', rows.Column(i).R:0:2);
+        SQLITE_TEXT: Write(' ', rows.Column(i).S);
+        SQLITE_NULL: Write(' NULL');
+      end;
+  WriteLn;
+end;
+
+begin
+  db := TSqlite.Open(':memory:');
+  try
+    sqlite3_create_function(db.Handle, 'clamp', 3, SQLITE_UTF8 or SQLITE_DETERMINISTIC, nil, @Clamp, nil, nil);
+    sqlite3_create_function(db.Handle, 'half', 1, SQLITE_UTF8 or SQLITE_DETERMINISTIC, nil, @Half, nil, nil);
+    sqlite3_create_function(db.Handle, 'spread', 1, SQLITE_UTF8, nil, nil, @SpreadStep, @SpreadFinal);
+    sqlite3_create_window_function(db.Handle, 'running', 1, SQLITE_UTF8, nil, @RunningStep, @RunningValue,
+      @RunningValue, @RunningInverse, nil);
+    sqlite3_create_collation(db.Handle, 'filenum', SQLITE_UTF8, nil, @FileNum);
+
+    db.Exec('CREATE TABLE reading(day INTEGER, temp REAL, name TEXT)');
+    db.Exec('INSERT INTO reading VALUES(1, 4.5, ''file10''), (2, 21.0, ''file2''), (3, NULL, ''file1''), ' +
+      '(4, -3.0, ''File3''), (5, 12.25, ''file20'')');
+
+    Show('scalar', 'SELECT day, clamp(temp, 0, 20) FROM reading');
+    Show('in a WHERE', 'SELECT day FROM reading WHERE clamp(temp, 0, 20) = 20');
+    Show('aggregate', 'SELECT spread(temp), spread(temp) FILTER (WHERE day > 3), spread(temp) FILTER (WHERE day = 3) FROM reading');
+    Show('per group', 'SELECT day % 2, spread(temp) FROM reading GROUP BY day % 2');
+    Show('window', 'SELECT day, running(day) OVER (ORDER BY day ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM reading');
+    Show('binary order', 'SELECT name FROM reading ORDER BY name');
+    Show('file-number order', 'SELECT name FROM reading ORDER BY name COLLATE filenum');
+
+    try
+      db.Exec('SELECT half(day) FROM reading');
+    except
+      on E: ESqliteError do
+        WriteLn('error: code ', E.Code, ', ', E.Message);
+    end;
+  finally
+    db.Free;
+  end;
+end.

@@ -803,7 +803,7 @@ LIB_UNITS := \
 all: $(OUTDIR)/paslangc $(if $(AMD64),core libs) $(if $(ARM64),core-arm64 libs-arm64) $(OUTDIR)/pasdbg
 
 # The book in one page, docs/manual/index.html, from the canonical
-# Markdown (MANUAL.md, TYPES.md, QUAD.md, GC.md, KERNELS.md, VISION.md).
+# Markdown (MANUAL.md, SQLITE_GUIDE.md, TYPES.md, QUAD.md, GC.md, KERNELS.md, VISION.md).
 manual:
 	python3 scripts/manual_html.py
 
@@ -4705,6 +4705,11 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/ex_usegeom examples/units/usegeom.paslang; \
 	$(BUILDDIR)/ex_usegeom > $(BUILDDIR)/ex_usegeom.got; \
 	diff -u examples/units/usegeom.out $(BUILDDIR)/ex_usegeom.got; \
+	for t in sqlbasic sqltypes sqltxn sqlfile sqlwal sqlfunc sqlconc; do \
+	  $(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/ex_$$t examples/$$t.paslang; \
+	  $(BUILDDIR)/ex_$$t > $(BUILDDIR)/ex_$$t.got; \
+	  diff -u examples/$$t.out $(BUILDDIR)/ex_$$t.got; \
+	done; \
 	python3 scripts/check_examples.py; \
 	for t in httpd dnsd termd ftpd ntpd wsd chat proxy jsonrpc apisrv; do \
 	  $(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/ex_$$t examples/$$t.paslang; \
@@ -6225,7 +6230,7 @@ install-strip:
 # carries the arm64 units, so its compiler can compile for arm64 with the
 # cross binutils. build/pkg/paslang-<version>-linux-<machine>.tar.gz.
 PKGDOCS := README.md AUTHORS COPYING COPYING.RUNTIME COPYING.DOC LICENSE-GO docs/MANUAL.md docs/HELP.md docs/TYPES.md \
-	docs/GC.md docs/QUAD.md docs/KERNELS.md docs/VISION.md docs/CONSTRAINTS.md
+	docs/GC.md docs/QUAD.md docs/KERNELS.md docs/VISION.md docs/CONSTRAINTS.md docs/SQLITE_GUIDE.md
 package: all compilers $(OUTDIR)/pasdbg
 	@set -e; \
 	v=$$($(OUTDIR)/paslangc -v | grep -o 'paslangc  *[0-9][0-9.]*' | head -1 | awk '{print $$2}'); \

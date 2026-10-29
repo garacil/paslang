@@ -17,7 +17,7 @@
 
 """The manual and the examples must not drift.
 
-Every ```pascal block of docs/MANUAL.md that declares a program or a unit
+Every ```pascal block of docs/MANUAL.md and of docs/SQLITE_GUIDE.md that declares a program or a unit
 must be byte for byte the file of that name under examples/ (after the
 license notice that heads the file), and the
 ``` block that follows a line reading "prints" must be that file's .out.
@@ -30,6 +30,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 MANUAL = ROOT / "docs" / "MANUAL.md"
+GUIDE = ROOT / "docs" / "SQLITE_GUIDE.md"
 EXAMPLES = ROOT / "examples"
 MAKEFILE = ROOT / "Makefile"
 
@@ -71,9 +72,8 @@ def blocks(text: str):
 
 def main() -> int:
     problems = []
-    text = MANUAL.read_text()
     seen = set()
-    for lang, body, after, lines in blocks(text):
+    for lang, body, after, lines in [b for doc in (MANUAL, GUIDE) for b in blocks(doc.read_text())]:
         if lang != "pascal":
             continue
         m = re.search(r"^(program|unit)\s+(\w+)\s*;", body, re.M)
@@ -82,11 +82,11 @@ def main() -> int:
         name = m.group(2)
         src = find_source(name)
         if src is None:
-            problems.append(f"manual block for {name} has no file under examples/")
+            problems.append(f"a block of the manual or the SQLite chapter for {name} has no file under examples/")
             continue
         seen.add(src)
         if program_text(src) != body:
-            problems.append(f"{src.relative_to(ROOT)} differs from its block in the manual")
+            problems.append(f"{src.relative_to(ROOT)} differs from its block in the manual or the SQLite chapter")
         # The output block: the next fenced block after a line "prints".
         k = after
         while k < len(lines) and lines[k].strip() == "":
@@ -104,7 +104,7 @@ def main() -> int:
                 if not exp.exists():
                     problems.append(f"{exp.relative_to(ROOT)} is missing")
                 elif exp.read_text() != out:
-                    problems.append(f"{exp.relative_to(ROOT)} differs from the output printed in the manual")
+                    problems.append(f"{exp.relative_to(ROOT)} differs from the output printed in the manual or the SQLite chapter")
     mk = MAKEFILE.read_text()
     start = mk.find('==== examples ====')
     end = mk.find('ok examples', start)
