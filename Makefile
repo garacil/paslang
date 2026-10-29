@@ -710,6 +710,9 @@ GOLDEN_A64 += realregs
 # P491: RandBelow and RandReal, as they drew before.
 GOLDEN += randfast
 GOLDEN_A64 += randfast
+# P492: a heap of integers on the words, against the general sifts it replaces.
+GOLDEN += heapfast
+GOLDEN_A64 += heapfast
 # P476: PDF files read, their text, and the same bytes bent.
 GOLDEN += pdftext
 GOLDEN_A64 += pdftext
