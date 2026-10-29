@@ -707,6 +707,9 @@ GOLDEN_A64 += rwstress oncefast
 # P486: real expressions in the xmm registers, against the compiler before.
 GOLDEN += realregs
 GOLDEN_A64 += realregs
+# P491: RandBelow and RandReal, as they drew before.
+GOLDEN += randfast
+GOLDEN_A64 += randfast
 # P476: PDF files read, their text, and the same bytes bent.
 GOLDEN += pdftext
 GOLDEN_A64 += pdftext
