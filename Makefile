@@ -725,6 +725,9 @@ GOLDEN_A64 += pdfform
 # P494: encrypted PDF files read with the empty password, and bent.
 GOLDEN += pdfenc
 GOLDEN_A64 += pdfenc
+# P497: calls that pass words on the stack, at every stack depth, under the collector's stress.
+GOLDEN += stkargs
+GOLDEN_A64 += stkargs
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
