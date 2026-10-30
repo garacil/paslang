@@ -662,6 +662,9 @@ GOLDEN_A64 += defaultarg
 # P426: the XML reader against expat on 2672 documents, and the tree's edits.
 GOLDEN += xmlcorpus xmldom xmlentity
 GOLDEN_A64 += xmlcorpus xmldom xmlentity
+# P477: external parsed entities read through a resolver the program gives, 36 documents against pyexpat and the checks expat has no word for.
+GOLDEN += xmlext
+GOLDEN_A64 += xmlext
 # P427: DEFLATE, zlib and gzip read against zlib and Go on 1893 streams, the writer round trip, ZIP against zipfile and Go.
 GOLDEN += flate flatec zip
 GOLDEN_A64 += flate flatec zip

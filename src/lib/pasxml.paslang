@@ -33,9 +33,10 @@
   the five of XML, character references and the internal general
   entities of the DOCTYPE's internal subset, whose replacement text may
   be text and references but not markup (refused, not misread); an
-  external entity or DTD is never fetched or read, and a reference to
-  one is refused. Default attribute values and the rest of the DTD are
-  read for their well-formedness and then ignored. }
+  external DTD is never fetched or read, and an external entity only
+  through a Resolver the program gives a reader (P477), none by default:
+  a reference to one is refused. Default attribute values and the rest
+  of the DTD are read for their well-formedness and then ignored. }
 unit pasxml;
 
 interface
@@ -114,6 +115,14 @@ type
     OpenEnd: Integer;
   end;
 
+  { What a program gives a reader to read an external parsed entity
+    (P477): the bytes of the entity that the public identifier (its white
+    space made single spaces and trimmed, '' for none) and the system
+    identifier, as the DOCTYPE wrote them, name. Where they are, relative
+    to what, and whether they may be read at all is the program's to
+    say; an exception refuses the entity, and the read with it. }
+  TXmlResolver = function(const PublicId, SystemId: string): string;
+
   { The pull reader: Next gives the tokens of a document one by one and
     checks it is well-formed as it goes, so a part of any size is read
     in memory proportional to its depth and its longest token. Create
@@ -147,6 +156,11 @@ type
     FEVal: array of string;
     FEExt: array of Boolean;
     FEMk: array of Integer;   { 0 not asked, 1 text only, 2 holds markup, 3 being asked }
+    FEPub: array of string;   { an external entity's public identifier }
+    FESys: array of string;   { and its system identifier }
+    FEUn: array of Boolean;   { unparsed: it has NDATA }
+    FERs: array of Boolean;   { the resolver has been asked, and FEVal is its text }
+    FLit: string;             { the literal ReadLiteral read last }
     FEN: Integer;
     FSrc: string;             { the document, while FT is an entity's text }
     FIT: array of string;     { the text each entity being read was reached from }
@@ -181,6 +195,8 @@ type
     function EntityMarkup(Code, Depth: Integer): Boolean;
     function MarkupRefAt(I: Integer; var Code, Semi: Integer): Boolean;
     procedure EnterEntity(Code, RefAt, After: Integer);
+    procedure ResolveEntity(Code, At: Integer);
+    function ExternalText(Code, At: Integer; const Raw: string): string;
     procedure LeaveEntity;
     procedure DeclAttr(const El, An: string; NonCData, HasDef: Boolean; const Df: string);
     procedure ApplyAttlist(const El: string; var Attrs: TXmlAttrArray; var Na: Integer);
@@ -216,6 +232,7 @@ type
     Namespaces: Boolean;     { resolve prefixes (the default), else a name is a name }
     MaxDepth: Integer;       { the deepest nesting a read takes: 10000 }
     MaxExpansion: Integer;   { the most bytes the entities of a document may expand to: 16 MiB }
+    Resolver: TXmlResolver;  { reads an external parsed entity; nil, the default, refuses a reference to one }
     constructor Create(const AText: string);
     constructor CreateFragment(const AText: string);
     { binds Prefix ('' the default namespace) to URI for a fragment }
@@ -363,6 +380,9 @@ function XmlParse(const S: string): TXmlDoc;
 function XmlParseFlat(const S: string): TXmlDoc;
 { False and the reason (with line and column) instead of an exception }
 function XmlTryParse(const S: string; out Doc: TXmlDoc; out Err: string): Boolean;
+{ A document read with the resolver giving its external entities (P477),
+  with prefixes as Namespaces in XML takes them or left alone }
+function XmlParseWith(const S: string; AResolver: TXmlResolver; ANamespaces: Boolean): TXmlDoc;
 
 { Escaping: text keeps its quotes, an attribute value is for double
   quotes; the characters XML does not allow become U+FFFD, as Go's
@@ -717,6 +737,30 @@ begin
   Result := BufResult(B);
 end;
 
+{ A public identifier with each run of white space one space and none at
+  either end (XML 4.2.2) }
+function XmlNormPublic(const S: string): string;
+var
+  i: Integer;
+  B: TXmlBufRec;
+  sp: Boolean;
+begin
+  B.N := 0;
+  SetLength(B.S, Length(S) + 1);
+  sp := False;
+  for i := 1 to Length(S) do
+    if XmlIsSpace(Ord(S[i])) then
+      sp := True
+    else
+    begin
+      if sp and (B.N > 0) then
+        BufChar(B, 32);
+      sp := False;
+      BufChar(B, Ord(S[i]));
+    end;
+  Result := BufResult(B);
+end;
+
 { ---- the reader ---- }
 
 constructor TXmlReader.Create(const AText: string);
@@ -748,38 +792,41 @@ begin
   FExtSub := False;
 end;
 
-procedure TXmlReader.Init(const AText: string);
+{ The text of a document or of an external entity as UTF-8: Bom the bytes
+  of a UTF-8 byte order mark left in it, Transcoded whether it was UTF-16
+  or ISO-8859-1, Enc 'UTF-16' when it was }
+function XmlTranscode(const AText: string; var Bom: Integer; var Transcoded: Boolean; var Enc: string): string;
 var
-  t, enc: string;
+  t, enc2: string;
   n, i, j, q: Integer;
 begin
   t := AText;
   n := Length(t);
-  FBom := 0;
-  FTranscoded := False;
+  Bom := 0;
+  Transcoded := False;
   if (n >= 3) and (Ord(t[1]) = $EF) and (Ord(t[2]) = $BB) and (Ord(t[3]) = $BF) then
-    FBom := 3
+    Bom := 3
   else if (n >= 2) and (Ord(t[1]) = $FF) and (Ord(t[2]) = $FE) then
   begin
     t := XmlFromUtf16(t, 3, False);
-    FTranscoded := True;
-    FEncoding := 'UTF-16';
+    Transcoded := True;
+    Enc := 'UTF-16';
   end
   else if (n >= 2) and (Ord(t[1]) = $FE) and (Ord(t[2]) = $FF) then
   begin
     t := XmlFromUtf16(t, 3, True);
-    FTranscoded := True;
-    FEncoding := 'UTF-16';
+    Transcoded := True;
+    Enc := 'UTF-16';
   end
   else if (n >= 4) and (t[1] = '<') and (Ord(t[2]) = 0) and (t[3] = '?') and (Ord(t[4]) = 0) then
   begin
     t := XmlFromUtf16(t, 1, False);
-    FTranscoded := True;
+    Transcoded := True;
   end
   else if (n >= 4) and (Ord(t[1]) = 0) and (t[2] = '<') and (Ord(t[3]) = 0) and (t[4] = '?') then
   begin
     t := XmlFromUtf16(t, 1, True);
-    FTranscoded := True;
+    Transcoded := True;
   end
   else if (n >= 5) and (Copy(t, 1, 5) = '<?xml') then
   begin
@@ -803,17 +850,25 @@ begin
             q := j + 1;
             while (q < i) and (t[q] <> t[j]) do
               q := q + 1;
-            enc := XmlLower(Copy(t, j + 1, q - j - 1));
-            if (enc = 'iso-8859-1') or (enc = 'latin1') or (enc = 'iso_8859-1') or (enc = 'l1') then
+            enc2 := XmlLower(Copy(t, j + 1, q - j - 1));
+            if (enc2 = 'iso-8859-1') or (enc2 = 'latin1') or (enc2 = 'iso_8859-1') or (enc2 = 'l1') then
             begin
               t := XmlFromLatin1(t);
-              FTranscoded := True;
+              Transcoded := True;
             end;
           end;
         end;
       end;
     end;
   end;
+  Result := t;
+end;
+
+procedure TXmlReader.Init(const AText: string);
+var
+  t: string;
+begin
+  t := XmlTranscode(AText, FBom, FTranscoded, FEncoding);
   FT := t;
   FSrc := t;
   FN := Length(t);
@@ -1028,8 +1083,16 @@ begin
             k := k + 1;
           nm := Copy(v, j, k - j);
           e := EntityIndex(nm);
-          if (e >= 0) and (not FEExt[e]) and EntityMarkup(e, Depth + 1) then
-            Result := True;
+          if e >= 0 then
+          begin
+            if FEExt[e] then
+            begin
+              if (not FEUn[e]) and (Resolver <> nil) then
+                Result := True;
+            end
+            else if EntityMarkup(e, Depth + 1) then
+              Result := True;
+          end;
           i := k;
         end;
       end;
@@ -1068,8 +1131,18 @@ begin
   if (nm = 'lt') or (nm = 'gt') or (nm = 'amp') or (nm = 'apos') or (nm = 'quot') then
     Exit;
   Code := EntityIndex(nm);
-  if (Code < 0) or FEExt[Code] then
+  if Code < 0 then
     Exit;
+  if FEExt[Code] then
+  begin
+    { an external parsed entity is read through the resolver, once, and entered as content }
+    if FEUn[Code] or (Resolver = nil) then
+      Exit;
+    ResolveEntity(Code, I);
+    Semi := k;
+    Result := True;
+    Exit;
+  end;
   if EntityMarkup(Code, FIC) then
   begin
     Semi := k;
@@ -1104,6 +1177,160 @@ begin
   FN := Length(FT);
   FP := 1;
   FAgain := True;
+end;
+
+{ The text declaration of an external entity, XML 4.3.1, and the text without
+  it as UTF-8: Raw the bytes the resolver gave, Code the entity and At where
+  it was referred to, where an error is put }
+function TXmlReader.ExternalText(Code, At: Integer; const Raw: string): string;
+var
+  t, v, enc, why: string;
+  bom, p, n, c, q, sx: Integer;
+  tr: Boolean;
+  e16: string;
+begin
+  bom := 0;
+  tr := False;
+  e16 := '';
+  try
+    t := XmlTranscode(Raw, bom, tr, e16);
+  except
+    on E: EXmlError do
+      Fail(At, 'the text of &' + FEName[Code] + '; is not read: ' + E.Reason);
+  end;
+  if bom > 0 then
+    t := Copy(t, bom + 1, Length(t) - bom);
+  n := Length(t);
+  if (n >= 6) and (Copy(t, 1, 5) = '<?xml') and XmlIsSpace(Ord(t[6])) then
+  begin
+    why := '';
+    p := 6;
+    while (p <= n) and XmlIsSpace(Ord(t[p])) do
+      p := p + 1;
+    enc := '';
+    { VersionInfo?, then EncodingDecl: S, the name, Eq and a quoted value each }
+    sx := 0;
+    while (sx < 2) and (why = '') do
+    begin
+      if Copy(t, p, 7) = 'version' then
+        v := 'version'
+      else if Copy(t, p, 8) = 'encoding' then
+        v := 'encoding'
+      else
+      begin
+        if sx = 0 then
+          why := 'expected encoding'
+        else
+          why := 'expected ?>';
+        Break;
+      end;
+      if (v = 'version') and (sx = 1) then
+      begin
+        why := 'expected ?>';
+        Break;
+      end;
+      p := p + Length(v);
+      while (p <= n) and XmlIsSpace(Ord(t[p])) do
+        p := p + 1;
+      if (p > n) or (t[p] <> '=') then
+      begin
+        why := 'expected = after ' + v;
+        Break;
+      end;
+      p := p + 1;
+      while (p <= n) and XmlIsSpace(Ord(t[p])) do
+        p := p + 1;
+      if (p > n) or ((t[p] <> '"') and (t[p] <> '''')) then
+      begin
+        why := 'expected a quoted value after ' + v;
+        Break;
+      end;
+      q := p + 1;
+      while (q <= n) and (t[q] <> t[p]) do
+        q := q + 1;
+      if q > n then
+      begin
+        why := 'unterminated value of ' + v;
+        Break;
+      end;
+      if v = 'encoding' then
+        enc := Copy(t, p + 1, q - p - 1)
+      else if (Length(Copy(t, p + 1, q - p - 1)) < 3) or (Copy(t, p + 1, 2) <> '1.') then
+      begin
+        why := 'unsupported XML version';
+        Break;
+      end;
+      p := q + 1;
+      c := p;
+      while (p <= n) and XmlIsSpace(Ord(t[p])) do
+        p := p + 1;
+      if v = 'encoding' then
+        sx := 2
+      else
+      begin
+        sx := 1;
+        if p = c then
+          why := 'expected white space before encoding';
+      end;
+    end;
+    if (why = '') and (enc = '') then
+      why := 'a text declaration has an encoding';
+    if why = '' then
+    begin
+      for c := 1 to Length(enc) do
+        if not (((enc[c] >= 'A') and (enc[c] <= 'Z')) or ((enc[c] >= 'a') and (enc[c] <= 'z')) or
+          ((c > 1) and (((enc[c] >= '0') and (enc[c] <= '9')) or (enc[c] = '.') or (enc[c] = '_') or (enc[c] = '-')))) then
+          why := 'invalid encoding name ' + enc;
+    end;
+    if why = '' then
+    begin
+      v := XmlLower(enc);
+      if (v = 'utf-16') or (v = 'utf16') then
+      begin
+        if not tr then
+          why := 'the declaration says UTF-16 but the text is not';
+      end
+      else if (v = 'utf-8') or (v = 'utf8') or (v = 'us-ascii') or (v = 'ascii') then
+      begin
+        if tr and (e16 = 'UTF-16') then
+          why := 'the declaration says ' + enc + ' but the text is UTF-16';
+      end
+      else if (v = 'iso-8859-1') or (v = 'latin1') or (v = 'iso_8859-1') or (v = 'l1') then
+      begin
+        if not tr then
+          why := 'the declaration says ' + enc + ' but the text was not read as it';
+      end
+      else
+        why := 'unsupported encoding ' + enc;
+    end;
+    if (why = '') and (Copy(t, p, 2) <> '?>') then
+      why := 'expected ?> at the end of the text declaration';
+    if why <> '' then
+      Fail(At, 'the text declaration of &' + FEName[Code] + '; is wrong: ' + why);
+    t := Copy(t, p + 2, n - p - 1);
+  end;
+  Result := t;
+end;
+
+{ Asks the resolver for the text of external entity Code, once; the
+  reference to it is at byte At of the text being read }
+procedure TXmlReader.ResolveEntity(Code, At: Integer);
+var
+  raw: string;
+begin
+  if FERs[Code] then
+    Exit;
+  FERs[Code] := True;
+  try
+    raw := Resolver(FEPub[Code], FESys[Code]);
+  except
+    on E: EXmlError do
+      raise;
+    on E: Exception do
+      Fail(At, 'the resolver refused &' + FEName[Code] + '; (' + E.Message + ')');
+  end;
+  FEVal[Code] := ExternalText(Code, At, raw);
+  FEMk[Code] := 2;
 end;
 
 procedure TXmlReader.LeaveEntity;
@@ -1211,7 +1438,14 @@ begin
           else
           begin
             if FEExt[code] then
-              Fail(errAt, 'reference to the external entity &' + nm + ';');
+            begin
+              if FEUn[code] then
+                Fail(errAt, 'reference to the unparsed entity &' + nm + ';')
+              else if InAttr and (Resolver <> nil) then
+                Fail(errAt, 'reference to the external entity &' + nm + '; in an attribute value')
+              else
+                Fail(errAt, 'reference to the external entity &' + nm + ';');
+            end;
             if Depth >= 20 then
               Fail(errAt, 'entities nested too deep (a loop?) at &' + nm + ';');
             FExpanded := FExpanded + Length(FEVal[code]);
@@ -1997,6 +2231,7 @@ begin
   if i > FN then
     Fail(FN, 'unterminated literal');
   CheckChars(FP + 1, i);
+  FLit := Copy(FT, FP + 1, i - FP - 1);
   FP := i + 1;
 end;
 
@@ -2432,14 +2667,17 @@ end;
 procedure TXmlReader.ReadEntityDecl;
 var
   nm: string;
-  isPE, ext: Boolean;
+  isPE, ext, nd: Boolean;
   q: Char;
   i, st, k, code, c: Integer;
   B: TXmlBufRec;
-  v, raw: string;
+  v, raw, pub, sys: string;
   ishex: Boolean;
 begin
   FP := FP + 8;
+  nd := False;
+  pub := '';
+  sys := '';
   if SkipS = 0 then
     Fail(FP, 'expected white space after <!ENTITY');
   isPE := False;
@@ -2536,6 +2774,7 @@ begin
       if SkipS = 0 then
         Fail(FP, 'expected white space after SYSTEM');
       ReadLiteral(False);
+      sys := FLit;
     end
     else if Has('PUBLIC') then
     begin
@@ -2543,9 +2782,11 @@ begin
       if SkipS = 0 then
         Fail(FP, 'expected white space after PUBLIC');
       ReadLiteral(True);
+      pub := XmlNormPublic(FLit);
       if SkipS = 0 then
         Fail(FP, 'expected white space after the public identifier');
       ReadLiteral(False);
+      sys := FLit;
     end
     else
       Fail(FP, 'expected an entity value, SYSTEM or PUBLIC');
@@ -2555,6 +2796,7 @@ begin
       begin
         if isPE then
           Fail(FP, 'NDATA in a parameter entity');
+        nd := True;
         FP := FP + 5;
         if SkipS = 0 then
           Fail(FP, 'expected white space after NDATA');
@@ -2574,11 +2816,19 @@ begin
       SetLength(FEVal, FEN * 2 + 8);
       SetLength(FEExt, FEN * 2 + 8);
       SetLength(FEMk, FEN * 2 + 8);
+      SetLength(FEPub, FEN * 2 + 8);
+      SetLength(FESys, FEN * 2 + 8);
+      SetLength(FEUn, FEN * 2 + 8);
+      SetLength(FERs, FEN * 2 + 8);
     end;
     FEName[FEN] := nm;
     FEVal[FEN] := v;
     FEExt[FEN] := ext;
     FEMk[FEN] := 0;
+    FEPub[FEN] := pub;
+    FESys[FEN] := sys;
+    FEUn[FEN] := nd;
+    FERs[FEN] := False;
     FEN := FEN + 1;
   end;
 end;
@@ -3548,6 +3798,16 @@ var
 begin
   r := TXmlReader.Create(S);
   r.Namespaces := False;
+  Result := XmlBuild(r);
+end;
+
+function XmlParseWith(const S: string; AResolver: TXmlResolver; ANamespaces: Boolean): TXmlDoc;
+var
+  r: TXmlReader;
+begin
+  r := TXmlReader.Create(S);
+  r.Namespaces := ANamespaces;
+  r.Resolver := AResolver;
   Result := XmlBuild(r);
 end;
 

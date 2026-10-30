@@ -12090,7 +12090,8 @@ without namespaces and gets what expat gets (`scripts/xml_corpus.py` has pyexpat
 the W3C conformance suite (`scripts/xmlconf.py`, with the suite from
 w3.org) runs 1,494 cases that apply to a processor that reads the internal
 subset and no external entity, and the cases it does not pass are listed in
-ENGINEERING; `testdata/xmldom` reads each of those documents and writes it
+ENGINEERING (with `--ext` the reader has a resolver and reads the 20 valid
+cases that refer to an external general entity too); `testdata/xmldom` reads each of those documents and writes it
 back byte for byte, and makes six edits on up to a dozen elements of each,
 each edit leaving every byte outside the edited element as it was.
 
@@ -12141,10 +12142,12 @@ Out := d.Xml;                         { the document written; Text itself when n
   `standalone` is not `yes`, the declarations are not used, since the
   entity may have overridden them, and a reference to an entity not
   declared, in a document with an external subset or such a reference, is
-  skipped and not refused. **Left out:** an external entity, an external
-  subset and a parameter entity are never read, and a reference to an
-  external entity is refused; names in the namespace are not checked as
-  URIs. UTF-16 is taken with a byte order mark or when
+  skipped and not refused. **Left out:** an external subset and a
+  parameter entity are never read; an external general entity is read only
+  through a resolver the program gives (`TXmlReader.Resolver`, below), and a
+  reference to one is refused when there is none, in an attribute value and
+  when the entity is unparsed (it has NDATA); names in the namespace are not
+  checked as URIs. UTF-16 is taken with a byte order mark or when
   it starts `<?`, ISO-8859-1 when the declaration says so, and any other
   declared encoding is refused, as Go's decoder refuses it without a
   `CharsetReader`.
@@ -12180,6 +12183,19 @@ Out := d.Xml;                         { the document written; Text itself when n
   `OpenCount`, `LineColumn`, and the options `Namespaces`, `MaxDepth`
   (10,000) and `MaxExpansion`. `TXmlReader.CreateFragment(text)` with
   `Bind(prefix, uri)` reads content, as `AppendXml` does.
+  `Resolver` (1.2.327, P477) is a `function(const PublicId, SystemId: string):
+  string` the program gives to read an external parsed entity: it is asked
+  once for each entity that is referred to, with the identifiers the
+  DOCTYPE wrote (the public one with its white space made single spaces),
+  and returns the bytes; where they are, relative to what and whether they
+  may be read at all is the program's to say, and an exception refuses the
+  entity and the read with it. The bytes are taken as an external parsed
+  entity: a byte order mark skipped, UTF-16 and, when the text declaration
+  says so, ISO-8859-1 turned into UTF-8, the text declaration read and left
+  out, and the rest entered as the text of an internal entity that holds
+  markup is, with the same limits. `XmlParseWith(text, resolver,
+  namespaces)` reads a document with one. With no resolver, the default, a
+  reference to an external entity is refused as before.
   On a 91 MB sheet the reader takes 1.7 times less than Go's
   `xml.Decoder.Token` (`scripts/bench/b37xml`).
 - **The writer.** `TXmlWriter`: `Decl`, `Start(name)`, `Attr(name, value)`,
