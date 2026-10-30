@@ -12508,7 +12508,10 @@ for i := 0 to d.WarningCount - 1 do WriteLn(d.WarningAt(i));   { what was read r
 - **Limits.** Objects nest 100 deep, pages 64, forms 12, the graphics state 256;
   a file has at most 4,000,000 objects; a decoded stream is at most `MaxStreamSize`
   (128 MiB) and the object streams together 512 MiB; a page gives at most
-  3,000,000 strings. Whatever the bytes, `TPdfDoc.Create` and the readings raise
+  3,000,000 strings; a page reads at most `PageWorkLimit` bytes of content stream (a
+  form counted each time it is drawn: 100 MB) and a document `DocWorkLimit` (1 GB),
+  and what is past them is left out with a warning (1.2.337, P520). Whatever the
+  bytes, `TPdfDoc.Create` and the readings raise
   EPdfError or return; the reader writes nothing, runs nothing the file holds
   (JavaScript, actions) and reads nothing but the string it was given.
 - **Routines.** A TPdfDoc caches its objects, fonts and decoded object streams
