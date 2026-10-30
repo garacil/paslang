@@ -734,6 +734,9 @@ GOLDEN_A64 += pdfenc
 # P495: PDF files whose fonts carry no map to text: the 14 standard fonts' widths and encodings, and the same bytes bent.
 GOLDEN += pdffont
 GOLDEN_A64 += pdffont
+# P514: PDF files that draw a string twice in one place, and the same bytes bent.
+GOLDEN += pdfdup
+GOLDEN_A64 += pdfdup
 # P497: calls that pass words on the stack, at every stack depth, under the collector's stress.
 GOLDEN += stkargs
 GOLDEN_A64 += stkargs
@@ -1414,6 +1417,8 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	python3 -I scripts/gen_pdffont.py --check; \
 	: pasfontnames is what scripts/gen_fontnames.py writes from Apple TrueType post chapter and Adobe note 5176, P512 and P513; \
 	python3 -I scripts/gen_fontnames.py --check; \
+	: testdata/pdfdup.txt is what scripts/gen_pdfdup.py writes, P514; \
+	python3 -I scripts/gen_pdfdup.py --check; \
 	grep -q 'call p_passtr_pasfindbytecpu$$' $(BUILDDIR)/longslice.s || { echo "longslice.s does not call the AVX2 front of IndexByte"; exit 1; }; \
 	grep -q 'call p_passtr_pascomparebytecpu$$' $(BUILDDIR)/longslice.s || { echo "longslice.s does not call the AVX2 front of CompareByte"; exit 1; }; \
 	grep -q 'call p_passtr_pasfindbytebase$$' $(BUILDDIR)/longslice-base.s || { echo "longslice-base.s does not call the base front of IndexByte"; exit 1; }; \

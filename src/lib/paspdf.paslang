@@ -4138,6 +4138,16 @@ type
     RunOpen: Boolean;
     RunsFull: Boolean;
     RunX0, RunY0, RunFS: Double;
+    { the strings shown on the page so far, for a string drawn twice in one
+      place (P514): where each starts, its size, font and bytes, in a hash of
+      the cell it falls in }
+    DupX, DupY: array of Double;
+    DupQ: array of Integer;
+    DupKey: array of Int64;
+    DupFont: array of TPdfFont;
+    DupNext: array of Integer;
+    DupHead: array of Integer;
+    DupN: Integer;
     LastFont: TPdfFont;
     Active: array of TPdfObj;
     { the operands of the operator being read, without an object for
@@ -4161,6 +4171,8 @@ type
     procedure ResetPage;
     function FontFor(Res: TPdfObj; const AName: string): TPdfFont;
     procedure Show(const S: string; Start, Len: Integer);
+    function Seen(Key: Int64; X, Y, FS, Ux, Uy: Double; Q8: Integer; ICell: Double): Boolean;
+    procedure Keep(Key: Int64; X, Y: Double; Q8: Integer; ICell: Double);
     procedure EndRun;
     procedure NextLine(Tx, Ty: Double);
     procedure RunContent(const Data: string; Res: TPdfObj; Depth: Integer);
@@ -4179,6 +4191,13 @@ const
     array of TJ is a space, in thousandths }
   SpaceGap = 0.15;
   TjSpace = 180;
+  { a string is a repeat of one before it, a fake bold face or a drop shadow
+    (P514), when the font, the size and the bytes are the same and it starts
+    within this many sizes of it along the line and across it, as pdftotext
+    measured; and how many strings a page keeps for it }
+  DupAlong = 0.1;
+  DupAcross = 0.2;
+  MaxDup = 2000000;
 
 function MatMul(const M, N: TPdfMat): TPdfMat;
 begin
@@ -4234,6 +4253,8 @@ begin
   Runs.N := 0;
   SetLength(Runs.Items, 0);
   SetLength(Active, 0);
+  DupN := 0;
+  SetLength(DupHead, 0);
 end;
 
 function TPdfExtractor.FontFor(Res: TPdfObj; const AName: string): TPdfFont;
@@ -4278,6 +4299,145 @@ begin
   LastFont := Result;
 end;
 
+{ a string's bytes as a number (FNV-1a over the bytes, never 0) }
+function StringKey(const S: string; Start, Len: Integer): Int64;
+var
+  i: Integer;
+begin
+  Result := Int64(-3750763034362895579);
+  for i := Start to Start + Len - 1 do
+    Result := (Result xor Ord(S[i])) * 1099511628211;
+  Result := Result or 1;
+end;
+
+{ the string with the key Key (StringKey of its bytes), shown from X, Y in
+  device space with the size FS along the unit vector Ux, Uy, is one kept
+  before: the same font, size (to an eighth) and bytes, starting within
+  DupAlong of the size along the line and DupAcross across it. A string is
+  looked for in the cells around its place, a cell being 0.4 of its size, of
+  a hash keyed by the size and the cell. }
+function TPdfExtractor.Seen(Key: Int64; X, Y, FS, Ux, Uy: Double; Q8: Integer; ICell: Double): Boolean;
+var
+  px, py, dx, dy, along, across: Double;
+  cx, cy, ox, oy, a, b, slot, k, mask, i, steps: Integer;
+  h: Int64;
+begin
+  Result := False;
+  if (Key = 0) or (DupN = 0) then
+    Exit;
+  px := X * ICell;
+  py := Y * ICell;
+  if (Abs(px) > 1.0e9) or (Abs(py) > 1.0e9) then
+    Exit;
+  cx := Floor(px);
+  cy := Floor(py);
+  if px - Floor(px) < 0.5 then
+    ox := cx - 1
+  else
+    ox := cx + 1;
+  if py - Floor(py) < 0.5 then
+    oy := cy - 1
+  else
+    oy := cy + 1;
+  mask := Length(DupHead) - 1;
+  for a := 0 to 1 do
+    for b := 0 to 1 do
+    begin
+      if a = 0 then
+        i := cx
+      else
+        i := ox;
+      if b = 0 then
+        k := cy
+      else
+        k := oy;
+      h := (Int64(i) * 73856093) xor (Int64(k) * 19349663) xor (Int64(Q8) * 83492791);
+      slot := Integer(h and mask);
+      k := DupHead[slot];
+      { the strings of one place are looked through 64 at most: strings made to
+        meet in one cell would make the search a square of their number }
+      steps := 0;
+      while (k >= 0) and (steps < 64) do
+      begin
+        steps := steps + 1;
+        if (DupKey[k] = Key) and (DupQ[k] = Q8) and (DupFont[k] = GS.Font) then
+        begin
+          dx := X - DupX[k];
+          dy := Y - DupY[k];
+          along := dx * Ux + dy * Uy;
+          across := dy * Ux - dx * Uy;
+          if (Abs(along) < DupAlong * FS) and (Abs(across) < DupAcross * FS) then
+          begin
+            Result := True;
+            Exit;
+          end;
+        end;
+        k := DupNext[k];
+      end;
+    end;
+end;
+
+{ the string is kept for the strings that come after it }
+procedure TPdfExtractor.Keep(Key: Int64; X, Y: Double; Q8: Integer; ICell: Double);
+var
+  cell, px, py: Double;
+  r8, slot, k, mask, i: Integer;
+  h: Int64;
+begin
+  if (Key = 0) or (DupN >= MaxDup) then
+    Exit;
+  px := X * ICell;
+  py := Y * ICell;
+  if (Abs(px) > 1.0e9) or (Abs(py) > 1.0e9) then
+    Exit;
+  if Length(DupHead) = 0 then
+  begin
+    SetLength(DupHead, 1024);
+    for i := 0 to 1023 do
+      DupHead[i] := -1;
+  end;
+  mask := Length(DupHead) - 1;
+  h := (Int64(Floor(px)) * 73856093) xor (Int64(Floor(py)) * 19349663) xor (Int64(Q8) * 83492791);
+  slot := Integer(h and mask);
+  if DupN >= Length(DupX) then
+  begin
+    k := (DupN + 64) * 2;
+    SetLength(DupX, k);
+    SetLength(DupY, k);
+    SetLength(DupQ, k);
+    SetLength(DupKey, k);
+    SetLength(DupFont, k);
+    SetLength(DupNext, k);
+  end;
+  DupX[DupN] := X;
+  DupY[DupN] := Y;
+  DupQ[DupN] := Q8;
+  DupKey[DupN] := Key;
+  DupFont[DupN] := GS.Font;
+  DupNext[DupN] := DupHead[slot];
+  DupHead[slot] := DupN;
+  DupN := DupN + 1;
+  { the table follows the number of strings: a chain stays a few long }
+  if DupN > 2 * Length(DupHead) then
+  begin
+    k := Length(DupHead) * 4;
+    SetLength(DupHead, k);
+    for i := 0 to k - 1 do
+      DupHead[i] := -1;
+    mask := k - 1;
+    for i := 0 to DupN - 1 do
+    begin
+      r8 := DupQ[i];
+      cell := 0.4 * (r8 / 8.0);
+      h := (Int64(Floor(DupX[i] / cell)) * 73856093) xor
+        (Int64(Floor(DupY[i] / cell)) * 19349663) xor (Int64(r8) * 83492791);
+      slot := Integer(h and mask);
+      DupNext[i] := DupHead[slot];
+      DupHead[slot] := i;
+    end;
+  end;
+end;
+
 procedure TPdfExtractor.EndRun;
 var
   m: TPdfMat;
@@ -4315,32 +4475,60 @@ end;
 { a string shown with the current font: its glyphs one after another }
 procedure TPdfExtractor.Show(const S: string; Start, Len: Integer);
 var
-  i, last: Integer;
+  i, q8, last: Integer;
   txt: string;
-  w, adv: Double;
-  isSp: Boolean;
+  w, adv, fs, ul, ux, uy, px, py, icell: Double;
+  isSp, skip: Boolean;
+  key: Int64;
   m: TPdfMat;
 begin
   if GS.Font = nil then
     Exit;
+  m := MatMul(Tm, GS.Ctm);
   if not RunOpen then
   begin
     RunOpen := True;
-    m := MatMul(Tm, GS.Ctm);
     RunX0 := m.E + GS.Ts * m.C;
     RunY0 := m.F + GS.Ts * m.D;
     RunFS := Abs(GS.Tfs) * Sqrt(m.C * m.C + m.D * m.D);
     if RunFS < 0.001 then
       RunFS := Abs(GS.Tfs) * Sqrt(m.A * m.A + m.B * m.B);
   end;
+  { a string shown a second time in its place, a fake bold face or a drop
+    shadow (P514), is read once, the pen moving as it would: the size and
+    the direction of the glyphs are those of the matrix }
+  skip := False;
+  if (Len > 0) and not GS.Font.Vertical then
+  begin
+    fs := Abs(GS.Tfs) * Sqrt(m.C * m.C + m.D * m.D);
+    if fs < 0.001 then
+      fs := Abs(GS.Tfs) * Sqrt(m.A * m.A + m.B * m.B);
+    ul := Sqrt(m.A * m.A + m.B * m.B);
+    if (ul > 0.000001) and (fs >= 0.001) and (fs <= 100000.0) then
+    begin
+      q8 := SafeTrunc(fs * 8.0 + 0.5);
+      icell := 1.0 / (0.4 * (q8 / 8.0));
+      ux := m.A / ul;
+      uy := m.B / ul;
+      px := m.E + GS.Ts * m.C;
+      py := m.F + GS.Ts * m.D;
+      key := StringKey(S, Start, Len);
+      skip := Seen(key, px, py, fs, ux, uy, q8, icell);
+      if not skip then
+        Keep(key, px, py, q8, icell);
+    end;
+  end;
   i := Start;
   last := Start + Len - 1;
   while i <= last do
   begin
     GS.Font.NextGlyph(S, i, last, txt, w, isSp);
-    if Length(txt) >= 3 then
-      txt := ExpandLigatures(txt);
-    SB.AddText(txt);
+    if not skip then
+    begin
+      if Length(txt) >= 3 then
+        txt := ExpandLigatures(txt);
+      SB.AddText(txt);
+    end;
     if GS.Font.Vertical then
     begin
       adv := -1.0 * GS.Tfs + GS.Tc;

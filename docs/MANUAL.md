@@ -12449,7 +12449,12 @@ for i := 0 to d.WarningCount - 1 do WriteLn(d.WarningAt(i));   { what was read r
   wider than 0.15 of the font's size, and inside a TJ array where an adjustment
   is 180 thousandths or more; a line is the strings whose baselines are within
   0.4 of the smaller size. Text drawn invisible (mode 3, the layer an OCR program
-  adds to a scan) is text. Rotated text comes after the lines, in the order of the
+  adds to a scan) is text. A string shown a second time in its place, which is how
+  a face with no bold is faked and a title is given a shadow (1.2.333, P514), is read
+  once: the same font, size (to an eighth of a point) and bytes, starting within a
+  tenth of the size along the line and a fifth across it of one already read on the
+  page, the numbers pdftotext leaves it by; a string moved further, or in another
+  font or size, or with other bytes, is read, and so is vertical writing. Rotated text comes after the lines, in the order of the
   stream. What is not read: images and scans (there is no recognition), the text of form fields and annotations, and
   a font program that says nothing: a CID-keyed CFF with no cmap (a bare CIDFontType0C) has no names to give,
   a TrueType subset that kept no cmap and no names (the CID subsets of cairo) has none, and a symbolic
