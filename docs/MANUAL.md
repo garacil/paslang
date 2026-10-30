@@ -12442,6 +12442,14 @@ for i := 0 to d.WarningCount - 1 do WriteLn(d.WarningAt(i));   { what was read r
   `TCffFont` (`Valid`, `IsCID`, `NumGlyphs`, `GlyphName`, `GlyphOfCode`,
   `CidOfGlyph`, `GlyphOfCid`) and `TType1Font` (`HasEncoding`, `IsStandard`,
   `CodeName`); a damaged program gives nothing and is never a fault.
+  A code the font's encoding does not define is read as pdftotext reads it (1.2.334,
+  P517): a font with no Encoding and nothing else to say what its codes are (a
+  TrueType subset with the symbolic flag, as Ghostscript writes them) is read as
+  WinAnsi, so the codes 0x80 to 0x9F are the Windows characters and never the
+  control characters of Latin-1; MacRomanEncoding has the fifteen signs of Mac OS
+  Roman that the table of the specification lacks (the not-equal sign, infinity,
+  the integral and others); the codes StandardEncoding leaves undefined give
+  nothing; StandardEncoding named by a TrueType font is read as if it were not.
   The ligatures of the Alphabetic Presentation Forms (U+FB00 to U+FB06) and the
   private-use fi and fl (U+F001, U+F002) are written as their letters. A Type0
   font with no map gives U+FFFD for each code, and `WarningAt` says which font.
@@ -12459,7 +12467,7 @@ for i := 0 to d.WarningCount - 1 do WriteLn(d.WarningAt(i));   { what was read r
   a font program that says nothing: a CID-keyed CFF with no cmap (a bare CIDFontType0C) has no names to give,
   a TrueType subset that kept no cmap and no names (the CID subsets of cairo) has none, and a symbolic
   font whose subset has nothing but the codes (LibreOffice's) is only its codes; they give U+FFFD, or the
-  guess of Latin-1 for a simple font.
+  guess of the Windows characters for a simple font (P517).
 - **Encryption (1.2.315, P494).** A file with the standard security handler is read
   when the empty password opens it, which is how the encrypted files that readers
   open without asking are protected (an owner password forbids copying or
