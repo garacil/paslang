@@ -12462,7 +12462,13 @@ for i := 0 to d.WarningCount - 1 do WriteLn(d.WarningAt(i));   { what was read r
   once: the same font, size (to an eighth of a point) and bytes, starting within a
   tenth of the size along the line and a fifth across it of one already read on the
   page, the numbers pdftotext leaves it by; a string moved further, or in another
-  font or size, or with other bytes, is read, and so is vertical writing. Rotated text comes after the lines, in the order of the
+  font or size, or with other bytes, is read, and so is vertical writing. A marked-content sequence tagged
+  Span with an ActualText entry (1.2.335, P516), which is how a producer says what a
+  ligature, a hyphen or a glyph its font has no Unicode for stands for, is read as
+  that text, once, where the sequence begins, in place of its glyphs: the outermost
+  of nested sequences counts, the entry may be in the Properties of the resources, a
+  UTF-16BE or PDFDocEncoding string is decoded and the language escape sequences left
+  out, and a form or a page keeps to itself the sequences it began. Rotated text comes after the lines, in the order of the
   stream. What is not read: images and scans (there is no recognition), the text of form fields and annotations, and
   a font program that says nothing: a CID-keyed CFF with no cmap (a bare CIDFontType0C) has no names to give,
   a TrueType subset that kept no cmap and no names (the CID subsets of cairo) has none, and a symbolic

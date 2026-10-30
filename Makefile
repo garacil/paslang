@@ -740,6 +740,9 @@ GOLDEN_A64 += pdfdup
 # P517: PDF files whose simple fonts leave codes 0x80 to 0xFF to their encoding, in every kind and flag, and the same bytes bent.
 GOLDEN += pdfcodes
 GOLDEN_A64 += pdfcodes
+# P516: PDF files whose marked content says the text it shows (ActualText), and the same bytes bent.
+GOLDEN += pdfactual
+GOLDEN_A64 += pdfactual
 # P497: calls that pass words on the stack, at every stack depth, under the collector's stress.
 GOLDEN += stkargs
 GOLDEN_A64 += stkargs
@@ -1424,6 +1427,8 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	python3 -I scripts/gen_pdfdup.py --check; \
 	: testdata/pdfcodes.txt is what scripts/gen_pdfcodes.py writes, P517; \
 	python3 -I scripts/gen_pdfcodes.py --check; \
+	: testdata/pdfactual.txt is what scripts/gen_pdfactual.py writes, P516; \
+	python3 -I scripts/gen_pdfactual.py --check; \
 	grep -q 'call p_passtr_pasfindbytecpu$$' $(BUILDDIR)/longslice.s || { echo "longslice.s does not call the AVX2 front of IndexByte"; exit 1; }; \
 	grep -q 'call p_passtr_pascomparebytecpu$$' $(BUILDDIR)/longslice.s || { echo "longslice.s does not call the AVX2 front of CompareByte"; exit 1; }; \
 	grep -q 'call p_passtr_pasfindbytebase$$' $(BUILDDIR)/longslice-base.s || { echo "longslice-base.s does not call the base front of IndexByte"; exit 1; }; \

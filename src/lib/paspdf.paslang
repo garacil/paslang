@@ -429,12 +429,34 @@ end;
 
 function LitStringAt(const S: string; var P: Integer; E: Integer): string;
 var
-  start, depth, c, n, k, oct: Integer;
+  start, depth, c, n, k, oct, q: Integer;
   r: string;
 begin
   { P is after the opening ( }
   start := P;
-  SetLength(r, E - P + 2);
+  { the string is no longer than what lies up to its closing parenthesis (or to
+    the end): a buffer of the whole rest of the data for each string made the
+    reading of a stream with many strings a square of its size }
+  q := P;
+  depth := 1;
+  while q <= E do
+  begin
+    c := Ord(S[q]);
+    if c = 92 then
+      q := q + 1
+    else if c = 40 then
+      depth := depth + 1
+    else if c = 41 then
+    begin
+      depth := depth - 1;
+      if depth = 0 then
+        Break;
+    end;
+    q := q + 1;
+  end;
+  if q > E then
+    q := E;
+  SetLength(r, q - P + 2);
   n := 0;
   depth := 1;
   while True do
@@ -4189,6 +4211,17 @@ type
     DupNext: array of Integer;
     DupHead: array of Integer;
     DupN: Integer;
+    { marked content (P516): the ActualText of each open sequence, the level
+      of the outermost one that has any (-1 for none), whether its text was
+      written, how many levels are past the limit, and the level the
+      content stream being read began at }
+    MCText: array of string;
+    MCHas: array of Boolean;
+    MCN: Integer;
+    MCActive: Integer;
+    MCShown: Boolean;
+    MCOver: Integer;
+    MCBase: Integer;
     LastFont: TPdfFont;
     Active: array of TPdfObj;
     { the operands of the operator being read, without an object for
@@ -4215,6 +4248,8 @@ type
     function Seen(Key: Int64; X, Y, FS, Ux, Uy: Double; Q8: Integer; ICell: Double): Boolean;
     procedure Keep(Key: Int64; X, Y: Double; Q8: Integer; ICell: Double);
     procedure EndRun;
+    procedure MarkBegin(HasText: Boolean; const Text: string);
+    procedure MarkEnd;
     procedure NextLine(Tx, Ty: Double);
     procedure RunContent(const Data: string; Res: TPdfObj; Depth: Integer);
     procedure DoXObject(Res: TPdfObj; const AName: string; Depth: Integer);
@@ -4238,7 +4273,46 @@ const
     measured; and how many strings a page keeps for it }
   DupAlong = 0.1;
   DupAcross = 0.2;
+  MaxMark = 256;
   MaxDup = 2000000;
+
+{ a replacement text may carry the language it is in between two U+001B
+  (14.9.4, 7.9.2.2): the escape sequences are not text }
+function StripLanguage(const S: string): string;
+var
+  i, j: Integer;
+begin
+  Result := S;
+  i := Pos(#27, Result);
+  while i > 0 do
+  begin
+    j := Pos(#27, Result, i + 1);
+    if j = 0 then
+      Result := Copy(Result, 1, i - 1)
+    else
+      Result := Copy(Result, 1, i - 1) + Copy(Result, j + 1, Length(Result));
+    i := Pos(#27, Result);
+  end;
+end;
+
+{ the bytes A to Z of S hold the name ActualText }
+function HasActualText(const S: string; A, Z: Integer): Boolean;
+var
+  i: Integer;
+begin
+  Result := False;
+  i := A;
+  while i + 9 <= Z do
+  begin
+    if (S[i] = 'A') and (S[i + 1] = 'c') and (S[i + 2] = 't') and (S[i + 3] = 'u') and (S[i + 4] = 'a') and
+      (S[i + 5] = 'l') and (S[i + 6] = 'T') and (S[i + 7] = 'e') and (S[i + 8] = 'x') and (S[i + 9] = 't') then
+    begin
+      Result := True;
+      Exit;
+    end;
+    i := i + 1;
+  end;
+end;
 
 function MatMul(const M, N: TPdfMat): TPdfMat;
 begin
@@ -4296,6 +4370,11 @@ begin
   SetLength(Active, 0);
   DupN := 0;
   SetLength(DupHead, 0);
+  MCN := 0;
+  MCActive := -1;
+  MCShown := False;
+  MCOver := 0;
+  MCBase := 0;
 end;
 
 function TPdfExtractor.FontFor(Res: TPdfObj; const AName: string): TPdfFont;
@@ -4559,6 +4638,17 @@ begin
         Keep(key, px, py, q8, icell);
     end;
   end;
+  { inside a Span with ActualText the glyphs are not the text: the text the
+    span says is written once, where its first string begins (P516) }
+  if (MCActive >= 0) and (Len > 0) then
+  begin
+    if not skip and not MCShown then
+    begin
+      MCShown := True;
+      SB.AddText(MCText[MCActive]);
+    end;
+    skip := True;
+  end;
   i := Start;
   last := Start + Len - 1;
   while i <= last do
@@ -4586,6 +4676,46 @@ begin
       Tm := MatMul(MatTrans(adv, 0), Tm);
     end;
   end;
+end;
+
+{ a marked-content sequence begins (BMC, BDC): a Span with ActualText (14.9.4)
+  gives the text the sequence shows, in place of the glyphs' own; of nested
+  ones the outermost counts }
+procedure TPdfExtractor.MarkBegin(HasText: Boolean; const Text: string);
+begin
+  if MCN >= MaxMark then
+  begin
+    MCOver := MCOver + 1;
+    Exit;
+  end;
+  if MCN >= Length(MCText) then
+  begin
+    SetLength(MCText, (MCN + 8) * 2);
+    SetLength(MCHas, (MCN + 8) * 2);
+  end;
+  MCText[MCN] := Text;
+  MCHas[MCN] := HasText;
+  if HasText and (MCActive < 0) then
+  begin
+    MCActive := MCN;
+    MCShown := False;
+  end;
+  MCN := MCN + 1;
+end;
+
+procedure TPdfExtractor.MarkEnd;
+begin
+  if MCOver > 0 then
+  begin
+    MCOver := MCOver - 1;
+    Exit;
+  end;
+  { an EMC with no BMC or BDC of this content stream to match is left alone }
+  if MCN <= MCBase then
+    Exit;
+  MCN := MCN - 1;
+  if MCActive = MCN then
+    MCActive := -1;
 end;
 
 procedure TPdfExtractor.NextLine(Tx, Ty: Double);
@@ -4783,6 +4913,9 @@ const
   opConcat = 99 or (109 shl 8);
   opXObj = 68 or (111 shl 8);
   opInline = 66 or (73 shl 8);
+  opBDC = 66 or (68 shl 8) or (67 shl 16);
+  opBMC = 66 or (77 shl 8) or (67 shl 16);
+  opEMC = 69 or (77 shl 8) or (67 shl 16);
   opSave = 113;
   opRestore = 81;
   opQuote = 39;
@@ -4797,6 +4930,7 @@ var
   o: TPdfObj;
   m: TPdfMat;
   found, complex: Boolean;
+  base0: Integer;
 
   procedure Grow;
   begin
@@ -4828,6 +4962,10 @@ begin
   NE := 0;
   PoolN := 0;
   lx := nil;
+  { the marked content of this stream is its own: an EMC does not end a span
+    of the stream that drew it (P516) }
+  base0 := MCBase;
+  MCBase := MCN;
   try
     while i <= e do
     begin
@@ -4885,11 +5023,31 @@ begin
       begin
         if (i < e) and (Ord(Data[i + 1]) = 60) then
         begin
-          { a dictionary (the properties of marked content): left out }
+          { a dictionary (the properties of marked content, whose ActualText is
+            read) }
+          o := nil;
+          j := i;
           SkipDictAt(Data, i, e);
+          { a dictionary with no ActualText (the MCID of a tagged file) is left out }
+          if HasActualText(Data, j, i - 1) then
+          begin
+            if lx = nil then
+            begin
+              lx := TPdfLex.Create(Data, 1, e);
+              lx.Refs := False;
+            end;
+            try
+              lx.P := j;
+              lx.Next;
+              o := lx.ParseObject(0);
+            except
+              on Er: EPdfError do
+                o := nil;
+            end;
+          end;
           Grow;
           OKind[n] := 5;
-          OObj[n] := nil;
+          OObj[n] := o;
           n := n + 1;
         end
         else
@@ -5268,6 +5426,31 @@ begin
               i := e + 1;
           end;
         end;
+      end
+      else if len = 3 then
+      begin
+        if code = opBDC then
+        begin
+          o := nil;
+          { the replacement text is the Span's (14.9.4), as pdftotext reads it }
+          if (n >= 2) and (OKind[n - 2] = 2) and (NameAt(Data, OPS[n - 2], e) = 'Span') then
+          begin
+            if (OKind[n - 1] = 5) and (OObj[n - 1] <> nil) and (OObj[n - 1].Kind = pdfDict) then
+              o := OObj[n - 1]
+            else if OKind[n - 1] = 2 then
+              { a name: the property list is in the Properties of the resources }
+              o := Doc.Dict(Doc.Dict(Res, 'Properties'), NameAt(Data, OPS[n - 1], e));
+          end;
+          o := Doc.Dict(o, 'ActualText');
+          if (o <> nil) and (o.Kind = pdfString) then
+            MarkBegin(True, ExpandLigatures(StripLanguage(PdfDecodeText(o.SVal))))
+          else
+            MarkBegin(False, '');
+        end
+        else if code = opBMC then
+          MarkBegin(False, '')
+        else if code = opEMC then
+          MarkEnd;
       end;
       n := 0;
       NE := 0;
@@ -5278,6 +5461,9 @@ begin
       Doc.AddWarning('a content stream is damaged: ' + Er.Message);
   end;
   EndRun;
+  while MCN > MCBase do
+    MarkEnd;
+  MCBase := base0;
 end;
 
 procedure TPdfExtractor.PageContent(Page: TPdfObj);
