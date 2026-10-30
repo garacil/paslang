@@ -665,6 +665,9 @@ GOLDEN_A64 += xmlcorpus xmldom xmlentity
 # P477: external parsed entities read through a resolver the program gives, 36 documents against pyexpat and the checks expat has no word for.
 GOLDEN += xmlext
 GOLDEN_A64 += xmlext
+# P478: a document written after an edit keeps the reference to an entity whose nodes were not touched.
+GOLDEN += xmlkeep
+GOLDEN_A64 += xmlkeep
 # P427: DEFLATE, zlib and gzip read against zlib and Go on 1893 streams, the writer round trip, ZIP against zipfile and Go.
 GOLDEN += flate flatec zip
 GOLDEN_A64 += flate flatec zip

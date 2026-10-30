@@ -110,6 +110,9 @@ type
     SelfClose: Boolean;
     Synth: Boolean;
     Ent: Boolean;       { read from an entity's text: Start, Stop and OpenEnd are places in that text }
+    RefName: string;    { the first token of the text of an entity referred to in the document: its name, ... }
+    RefStart: Integer;  { ... and the bytes of the reference, from 1, RefStop the byte after }
+    RefStop: Integer;
     Start: Integer;
     Stop: Integer;
     OpenEnd: Integer;
@@ -169,6 +172,10 @@ type
     FIE: array of Integer;    { the entity }
     FIC: Integer;
     FRefAt: Integer;          { the outermost reference, a byte of the document }
+    FGrpNew: Boolean;         { an entity was entered and no token of it has been given yet }
+    FGrpName: string;         { that entity, and the bytes of its reference }
+    FGrpStart: Integer;
+    FGrpStop: Integer;
     FTagAt: Integer;          { the start tag being read: where an attribute with no place of its own is }
     FPeRef: Boolean;          { the subset has referred to a parameter entity, which is not read }
     FExtSub: Boolean;         { the DOCTYPE names an external subset, which is not read }
@@ -289,6 +296,14 @@ type
     ZHead: Boolean;
     ZChanged: Boolean;
     ZNew: Boolean;
+    ZRefId: Integer;    { a top-level node of the text of an entity: the reference it came from (0 for none) ... }
+    ZRefIdx: Integer;   { ... its place among the nodes the entity gave ... }
+    ZRefLen: Integer;   { ... for the first, how many it gave ... }
+    ZRefHead: Boolean;
+    ZRefName: string;
+    ZRefStart: Integer; { ... and, for the first, the bytes of the reference in ZSrc }
+    ZRefStop: Integer;
+    ZRefDoc: TXmlDoc;
     function GetValue: string;
     procedure SetValue(const S: string);
     { text, CDATA, a comment, a PI's data: the text; changing it writes the
@@ -339,6 +354,11 @@ type
       one made here) and how many bytes it took }
     function Offset: Integer;
     function ByteLength: Integer;
+    { the entity this node, or the node it is in, was read from, when the
+      text of an entity gave it ('' for any other): a document written
+      after an edit writes the reference `&name;` where nothing of the
+      entity's nodes was touched, and their text otherwise (P478) }
+    function FromEntity: string;
   end;
 
   { A document: what was read, in order, the root among them. }
@@ -369,6 +389,10 @@ type
     function Item(I: Integer): TXmlNode;
     { the document written; as it was read when nothing changed }
     function Xml: string;
+    { whether writing the document now would write a reference to an entity
+      as the nodes it gave, since an edit has changed one of them or the
+      way they stand (P478) }
+    function EntitiesExpanded: Boolean;
     property Encoding: string read FEncoding;
     property Standalone: string read FStandalone;
     property Version: string read FVersion;
@@ -790,6 +814,7 @@ begin
   FAN := 0;
   FPeRef := False;
   FExtSub := False;
+  FGrpNew := False;
 end;
 
 { The text of a document or of an external entity as UTF-8: Bom the bytes
@@ -880,6 +905,7 @@ begin
   FAN := 0;
   FPeRef := False;
   FExtSub := False;
+  FGrpNew := False;
 end;
 
 procedure TXmlReader.LineColumn(Off: Integer; var ALine, ACol: Integer);
@@ -1167,7 +1193,13 @@ begin
     SetLength(FIE, FIC * 2 + 4);
   end;
   if FIC = 0 then
+  begin
     FRefAt := RefAt;
+    FGrpNew := True;
+    FGrpName := FEName[Code];
+    FGrpStart := RefAt;
+    FGrpStop := After;
+  end;
   FIT[FIC] := FT;
   FIP[FIC] := After;
   FID[FIC] := FDepth;
@@ -1338,6 +1370,8 @@ begin
   if FDepth <> FID[FIC - 1] then
     Fail(FP, 'the text of an entity does not close what it opens');
   FIC := FIC - 1;
+  if FIC = 0 then
+    FGrpNew := False;
   FT := FIT[FIC];
   FIT[FIC] := '';
   FN := Length(FT);
@@ -1557,6 +1591,15 @@ begin
     if (FDepth = 0) and (not FFragment) then
       Fail(i, 'text outside the root element');
     EnterEntity(ecode, i, esemi + 1);
+    { an entity with no text gives an empty text token, so that its reference has a node to be kept by (P478) }
+    if FN = 0 then
+    begin
+      FAgain := False;
+      Tok.Kind := xtText;
+      Tok.Ent := True;
+      Tok.Start := 1;
+      Tok.Stop := 1;
+    end;
     Exit;
   end;
   Tok.Kind := xtText;
@@ -2937,6 +2980,16 @@ begin
     FAgain := False;
     Result := NextTok(Tok);
   until not FAgain;
+  Tok.RefName := '';
+  Tok.RefStart := 0;
+  Tok.RefStop := 0;
+  if Result and Tok.Ent and FGrpNew then
+  begin
+    Tok.RefName := FGrpName;
+    Tok.RefStart := FGrpStart;
+    Tok.RefStop := FGrpStop;
+    FGrpNew := False;
+  end;
 end;
 
 function TXmlReader.NextTok(var Tok: TXmlToken): Boolean;
@@ -3659,17 +3712,66 @@ end;
 
 { ---- building from a reader ---- }
 
+{ N, a node of the text of an entity, joins its reference's group: the
+  first node is its head }
+procedure XmlJoinGroup(N: TXmlNode; var Head: TXmlNode; var Count: Integer; Id: Integer; const Name: string;
+  Start, Stop: Integer; D: TXmlDoc);
+begin
+  N.ZRefId := Id;
+  N.ZRefIdx := Count;
+  N.ZRefName := Name;
+  N.ZRefDoc := D;
+  Count := Count + 1;
+  if Head = nil then
+  begin
+    Head := N;
+    N.ZRefHead := True;
+    N.ZRefStart := Start;
+    N.ZRefStop := Stop;
+  end;
+end;
+
 procedure XmlBuildInto(R: TXmlReader; D: TXmlDoc; Holder: TXmlNode);
 var
   tok: TXmlToken;
-  cur, n: TXmlNode;
-  src: string;
-  k, i: Integer;
+  cur, n, grphead: TXmlNode;
+  src, grpname: string;
+  k, i, lvl, grpid, grpbase, grpn, grpstart, grpstop: Integer;
+  ingroup: Boolean;
 begin
   src := R.Source;
   cur := Holder;
+  lvl := 0;
+  grpid := 0;
+  grpbase := 0;
+  grpn := 0;
+  grpstart := 0;
+  grpstop := 0;
+  grpname := '';
+  grphead := nil;
+  ingroup := False;
   while R.Next(tok) do
   begin
+    { the nodes an entity gave at the level it was referred to are a group,
+      the first knowing the bytes of the reference }
+    if ingroup and ((not tok.Ent) or (tok.RefName <> '')) then
+    begin
+      if grphead <> nil then
+        grphead.ZRefLen := grpn;
+      ingroup := False;
+      grphead := nil;
+    end;
+    if tok.Ent and (tok.RefName <> '') then
+    begin
+      grpid := grpid + 1;
+      ingroup := True;
+      grpbase := lvl;
+      grpn := 0;
+      grphead := nil;
+      grpname := tok.RefName;
+      grpstart := tok.RefStart;
+      grpstop := tok.RefStop;
+    end;
     case tok.Kind of
       xtStart:
         begin
@@ -3693,10 +3795,14 @@ begin
           end;
           n.Parent := cur;
           XmlAddKid(cur.ZKids, cur.ZCount, n);
+          if ingroup and (lvl = grpbase) then
+            XmlJoinGroup(n, grphead, grpn, grpid, grpname, grpstart, grpstop, D);
+          lvl := lvl + 1;
           cur := n;
         end;
       xtEnd:
         begin
+          lvl := lvl - 1;
           cur.ZStop := tok.Stop;
           if tok.Synth or tok.Ent then
             cur.ZCloseStart := -1
@@ -3732,9 +3838,13 @@ begin
         end;
         n.Parent := cur;
         XmlAddKid(cur.ZKids, cur.ZCount, n);
+        if ingroup and (lvl = grpbase) then
+          XmlJoinGroup(n, grphead, grpn, grpid, grpname, grpstart, grpstop, D);
       end;
     end;
   end;
+  if ingroup and (grphead <> nil) then
+    grphead.ZRefLen := grpn;
   i := 0;
   while i < Holder.ZCount do
   begin
@@ -3909,6 +4019,49 @@ begin
   end;
 end;
 
+{ Whether the group that begins at kid I of N is all there, in its order,
+  untouched and in the document that declares its entity: then it is
+  written as its reference (P478) }
+function XmlGroupIntact(N: TXmlNode; I: Integer): Boolean;
+var
+  k, m: TXmlNode;
+  j: Integer;
+begin
+  Result := False;
+  k := N.ZKids[I];
+  if (not k.ZRefHead) or (k.ZRefLen < 1) or (I + k.ZRefLen > N.ZCount) or (k.Doc <> k.ZRefDoc) then
+    Exit;
+  for j := 0 to k.ZRefLen - 1 do
+  begin
+    m := N.ZKids[I + j];
+    if (m.ZRefId <> k.ZRefId) or (m.ZRefIdx <> j) or m.ZChanged or m.ZDirty or (m.Doc <> m.ZRefDoc) then
+      Exit;
+  end;
+  Result := True;
+end;
+
+procedure XmlEmitKids(N: TXmlNode; var B: TXmlBufRec);
+var
+  i: Integer;
+  k: TXmlNode;
+begin
+  i := 0;
+  while i < N.ZCount do
+  begin
+    k := N.ZKids[i];
+    if k.ZRefHead and XmlGroupIntact(N, i) then
+    begin
+      BufRange(B, k.ZSrc, k.ZRefStart, k.ZRefStop - k.ZRefStart);
+      i := i + k.ZRefLen;
+    end
+    else
+    begin
+      XmlEmit(k, B);
+      i := i + 1;
+    end;
+  end;
+end;
+
 procedure XmlEmitElement(N: TXmlNode; var B: TXmlBufRec);
 var
   i: Integer;
@@ -3937,8 +4090,7 @@ begin
   end;
   if (N.ZCount = 0) and (not ended) then
     Exit;
-  for i := 0 to N.ZCount - 1 do
-    XmlEmit(N.ZKids[i], B);
+  XmlEmitKids(N, B);
   if ended then
     BufRange(B, N.ZSrc, N.ZCloseStart, N.ZStop - N.ZCloseStart)
   else
@@ -4021,9 +4173,25 @@ var
   i: Integer;
 begin
   B.N := 0;
-  for i := 0 to ZCount - 1 do
-    XmlEmit(ZKids[i], B);
+  XmlEmitKids(Self, B);
   Result := BufResult(B);
+end;
+
+function TXmlNode.FromEntity: string;
+var
+  p: TXmlNode;
+begin
+  Result := '';
+  p := Self;
+  while p <> nil do
+  begin
+    if p.ZRefId <> 0 then
+    begin
+      Result := p.ZRefName;
+      Exit;
+    end;
+    p := p.Parent;
+  end;
 end;
 
 function TXmlNode.Offset: Integer;
@@ -4128,6 +4296,49 @@ begin
   if (I < 0) or (I >= ZCount) then
     XmlBad('top level node ' + IntToStr(I) + ' of ' + IntToStr(ZCount));
   Result := ZKids[I];
+end;
+
+{ Whether writing the children of N would write a reference as its nodes }
+function XmlExpandedIn(N: TXmlNode): Boolean;
+var
+  i: Integer;
+  k: TXmlNode;
+begin
+  Result := False;
+  i := 0;
+  while i < N.ZCount do
+  begin
+    k := N.ZKids[i];
+    if k.ZRefId <> 0 then
+    begin
+      if k.ZRefHead and XmlGroupIntact(N, i) then
+      begin
+        i := i + k.ZRefLen;
+        Continue;
+      end;
+      Result := True;
+      Exit;
+    end;
+    if (k.Kind = xkElement) and XmlExpandedIn(k) then
+    begin
+      Result := True;
+      Exit;
+    end;
+    i := i + 1;
+  end;
+end;
+
+function TXmlDoc.EntitiesExpanded: Boolean;
+var
+  i: Integer;
+begin
+  Result := False;
+  for i := 0 to ZCount - 1 do
+    if (ZKids[i].Kind = xkElement) and XmlExpandedIn(ZKids[i]) then
+    begin
+      Result := True;
+      Exit;
+    end;
 end;
 
 function TXmlDoc.Xml: string;

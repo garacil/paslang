@@ -12111,8 +12111,15 @@ Out := d.Xml;                         { the document written; Text itself when n
   entity and character references (`&#169;`, `&amp;`), CDATA sections,
   comments, the XML declaration, the DOCTYPE, the line ends (CRLF as CRLF)
   and a byte order mark; the nodes read from an entity's text have no bytes
-  of the document, so when an ancestor is edited they are written as their
-  text and the reference they came from is not. An edited element is written again as far as it
+  of the document, but those at the level of the reference are a group that
+  knows the bytes of it (1.2.328, P478): when an ancestor is edited the
+  reference `&e;` is written again where every node of the group is there,
+  in its order and untouched, and their text where one was changed, removed,
+  added among them or moved (`TXmlNode.FromEntity` is the entity a node was
+  read from, '' for any other, and `TXmlDoc.EntitiesExpanded` says whether
+  writing the document now would write a reference as the nodes it gave); an
+  entity with no text gives an empty text node, that its reference be kept.
+  An edited element is written again as far as it
   changed: a changed attribute is written `name="value"` (keeping its quote
   character) in its place, the others as they were; a new attribute goes
   after the last with one space; text you set is escaped (`&`, `<`, `>`,
