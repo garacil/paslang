@@ -82,7 +82,7 @@ unit paspdf;
 interface
 
 uses
-  sysutils, pasflate, paspdfenc, paspdfafm, paspdfcrypt;
+  sysutils, pasflate, paspdfenc, paspdfafm, pasfonttt, paspdfcrypt;
 
 const
   { the kinds of a PDF object, ISO 32000-1 7.3 }
@@ -3488,9 +3488,18 @@ type
     WVal: array of Double;
     NW: Integer;
     Warned: Boolean;
+    { the font program in the file (P512), when it is a TrueType or an
+      OpenType font and something needs what it says of its glyphs }
+    Prog: TTrueType;
+    ProgTried: Boolean;
+    CidDesc: TPdfObj;
+    CidDict: TPdfObj;
+    CidGid: string;
     constructor Create(ADoc: TPdfDoc; AFont: TPdfObj);
     procedure BuildSimple(F: TPdfObj);
     procedure BuildComposite(F: TPdfObj);
+    procedure LoadProgram(Desc: TPdfObj);
+    function ProgramText(Cid: Integer): string;
     function CidWidth(Cid: Integer): Double;
     procedure NextGlyph(const S: string; var I: Integer; Last: Integer; var Text: string; var Width: Double; var IsSpace: Boolean);
   end;
@@ -3688,6 +3697,36 @@ begin
       else
         W[i] := 500;
     end;
+  { a symbolic TrueType font that names no encoding (ISO 32000-1 9.6.6.4): the
+    code selects a glyph by the font's own (3,0) or (1,0) subtable, and what
+    the glyph is, the font says (its Unicode subtables, its names); a code that
+    a Differences array named keeps the name, and an Encoding the file names is
+    honoured (producers set the symbolic flag with WinAnsi). Only when nothing
+    else maps the text, and what the font cannot say stays what the encoding
+    guessed. A font not flagged symbolic with no Encoding is read as WinAnsi, as
+    pdftotext reads it. }
+  if (ToUni = nil) and (st = 'TrueType') and (desc <> nil) and symbolic and (ename = '') then
+  begin
+    LoadProgram(desc);
+    if Prog <> nil then
+      for i := 0 to 255 do
+        if gname[i] = '' then
+        begin
+          k := Prog.GlyphOfCode(i);
+          if k > 0 then
+          begin
+            code := Prog.GlyphUnicode(k);
+            if code >= 0 then
+              Uni[i] := PdfRuneToUtf8(code)
+            else
+            begin
+              nm := PdfGlyphText(Prog.GlyphName(k));
+              if nm <> '' then
+                Uni[i] := nm;
+            end;
+          end;
+        end;
+  end;
 end;
 
 procedure TPdfFont.BuildComposite(F: TPdfObj);
@@ -3735,6 +3774,8 @@ begin
     desc := nil;
   if (desc = nil) or (desc.Kind <> pdfDict) then
     Exit;
+  CidDict := desc;
+  CidDesc := Doc.Dict(desc, 'FontDescriptor');
   DW := 1000;
   o := Doc.Dict(desc, 'DW');
   if o <> nil then
@@ -3810,6 +3851,84 @@ begin
       end;
     end;
   end;
+end;
+
+{ the TrueType or OpenType program of a font descriptor, if the file has one
+  that reads (P512): FontFile2, or an OpenType FontFile3; a bare CFF (Type1C)
+  is not a TrueType and is nil }
+procedure TPdfFont.LoadProgram(Desc: TPdfObj);
+var
+  ff, mp: TPdfObj;
+  data: string;
+begin
+  ProgTried := True;
+  Prog := nil;
+  if (Desc = nil) or (Desc.Kind <> pdfDict) then
+    Exit;
+  ff := Doc.Dict(Desc, 'FontFile2');
+  if (ff = nil) or (ff.Kind <> pdfStream) then
+    ff := Doc.Dict(Desc, 'FontFile3');
+  if (ff = nil) or (ff.Kind <> pdfStream) then
+    Exit;
+  try
+    data := Doc.StreamData(ff);
+  except
+    on E: EPdfError do
+    begin
+      Doc.AddWarning('font ' + Name + ': the font program cannot be read: ' + E.Message);
+      Exit;
+    end;
+  end;
+  Prog := TTrueType.Create(data);
+  if not Prog.Valid then
+  begin
+    Prog := nil;
+    Exit;
+  end;
+  { a composite font's CIDs select glyphs by the CIDToGIDMap stream, if it has one }
+  if CidDict <> nil then
+  begin
+    mp := Doc.Dict(CidDict, 'CIDToGIDMap');
+    if (mp <> nil) and (mp.Kind = pdfStream) then
+    begin
+      try
+        CidGid := Doc.StreamData(mp);
+      except
+        on E: EPdfError do
+        begin
+          Doc.AddWarning('font ' + Name + ': the CIDToGIDMap cannot be read: ' + E.Message);
+          CidGid := '';
+        end;
+      end;
+    end;
+  end;
+end;
+
+{ the text of a CID of a composite font by its TrueType program: the glyph the
+  CID selects (9.7.4.2), then the character that glyph is in the font's
+  Unicode subtables, else the Adobe Glyph List's reading of its name in `post`;
+  empty where the font says nothing }
+function TPdfFont.ProgramText(Cid: Integer): string;
+var
+  g, u: Integer;
+begin
+  Result := '';
+  if not ProgTried then
+    LoadProgram(CidDesc);
+  if Prog = nil then
+    Exit;
+  g := Cid;
+  if CidGid <> '' then
+  begin
+    if (Cid < 0) or (2 * Cid + 2 > Length(CidGid)) then
+      Exit;
+    g := (Ord(CidGid[2 * Cid + 1]) shl 8) or Ord(CidGid[2 * Cid + 2]);
+  end;
+  u := Prog.GlyphUnicode(g);
+  if u >= 0 then
+    Result := PdfRuneToUtf8(u)
+  else
+    Result := PdfGlyphText(Prog.GlyphName(g));
 end;
 
 function TPdfFont.CidWidth(Cid: Integer): Double;
@@ -3902,12 +4021,16 @@ begin
   end
   else
   begin
-    if not Warned then
+    Text := ProgramText(cid);
+    if Text = '' then
     begin
-      Warned := True;
-      Doc.AddWarning('font ' + Name + ' has no map to text');
+      if not Warned then
+      begin
+        Warned := True;
+        Doc.AddWarning('font ' + Name + ' has no map to text');
+      end;
+      Text := PdfRuneToUtf8($FFFD);
     end;
-    Text := PdfRuneToUtf8($FFFD);
   end;
 end;
 

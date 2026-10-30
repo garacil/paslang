@@ -12419,6 +12419,18 @@ for i := 0 to d.WarningCount - 1 do WriteLn(d.WarningAt(i));   { what was read r
   Encoding they are in StandardEncoding, and Symbol and ZapfDingbats in their own
   built-in encodings (the Greek letters and the dingbats, as the AFM files have
   them; an Encoding the file names is honoured, as pdftotext honours it).
+  A TrueType font program in the file (FontFile2, or an OpenType FontFile3) says
+  what its glyphs are when the file does not (1.2.331, P512): a Type0 font whose
+  descendant is a CIDFontType2, with no ToUnicode map, gives each CID's glyph (by
+  the CIDToGIDMap, Identity if none) the character the font's Unicode subtables
+  map to it, else the Adobe Glyph List's reading of its name in the `post` table;
+  a symbolic simple font that names no encoding is read by its (3,0) or (1,0)
+  subtable as ISO 32000-1 9.6.6.4 asks, and then the same way. `uses pasfonttt`
+  gives the reader of those tables, `TTrueType.Create(Data)`: `Valid`,
+  `NumGlyphs`, the subtables of `cmap` (formats 0, 4, 6, 12) with `CmapGlyph`,
+  `GlyphOfCode`, `GlyphUnicode` (the inverse of the Unicode subtables, the best
+  first, the lowest code where several map to one glyph) and `GlyphName` (`post`
+  formats 1 and 2); a damaged font gives nothing and is never a fault.
   The ligatures of the Alphabetic Presentation Forms (U+FB00 to U+FB06) and the
   private-use fi and fl (U+F001, U+F002) are written as their letters. A Type0
   font with no map gives U+FFFD for each code, and `WarningAt` says which font.
@@ -12428,8 +12440,10 @@ for i := 0 to d.WarningCount - 1 do WriteLn(d.WarningAt(i));   { what was read r
   0.4 of the smaller size. Text drawn invisible (mode 3, the layer an OCR program
   adds to a scan) is text. Rotated text comes after the lines, in the order of the
   stream. What is not read: images and scans (there is no recognition), the text of form fields and annotations, and
-  what a font program embedded in the file says of its own glyphs (P512 for TrueType, P513 for CFF and Type1):
-  such a font with neither Encoding nor ToUnicode is read by the guess of Latin-1.
+  what a CFF or Type1 font program embedded in the file says of its own glyphs (P513): such a font with
+  neither Encoding nor ToUnicode is read by the guess of Latin-1. A TrueType subset that kept no cmap and no
+  names (the CID subsets of cairo) says nothing and gives U+FFFD, and so does a symbolic font whose subset
+  has nothing but the codes (LibreOffice's).
 - **Encryption (1.2.315, P494).** A file with the standard security handler is read
   when the empty password opens it, which is how the encrypted files that readers
   open without asking are protected (an owner password forbids copying or

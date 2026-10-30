@@ -793,6 +793,8 @@ LIB_UNITS := \
 	src/lib/pasxlsx.paslang \
 	src/lib/paspdfcrypt.paslang \
 	src/lib/paspdfenc.paslang \
+	src/lib/pasfontnames.paslang \
+	src/lib/pasfonttt.paslang \
 	src/lib/paspdfafm.paslang \
 	src/lib/paspdf.paslang \
 	src/lib/paspdfform.paslang \
@@ -1409,6 +1411,8 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	python3 -I scripts/gen_pdf_forms.py --check; \
 	: testdata/pdffont.txt is what scripts/gen_pdffont.py writes, P495; \
 	python3 -I scripts/gen_pdffont.py --check; \
+	: pasfontnames is what scripts/gen_fontnames.py writes from Apple TrueType post chapter, P512; \
+	python3 -I scripts/gen_fontnames.py --check; \
 	grep -q 'call p_passtr_pasfindbytecpu$$' $(BUILDDIR)/longslice.s || { echo "longslice.s does not call the AVX2 front of IndexByte"; exit 1; }; \
 	grep -q 'call p_passtr_pascomparebytecpu$$' $(BUILDDIR)/longslice.s || { echo "longslice.s does not call the AVX2 front of CompareByte"; exit 1; }; \
 	grep -q 'call p_passtr_pasfindbytebase$$' $(BUILDDIR)/longslice-base.s || { echo "longslice-base.s does not call the base front of IndexByte"; exit 1; }; \

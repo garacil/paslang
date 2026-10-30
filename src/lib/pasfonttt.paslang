@@ -1,0 +1,670 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+
+  paslang is free software: you can redistribute it and/or modify it
+  under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+
+  paslang is distributed in the hope that it will be useful, but
+  WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+  General Public License for more details.
+
+  Under Section 7 of GPL version 3, you are granted additional
+  permissions described in the paslang Runtime Library Exception,
+  version 1.0, in the file COPYING.RUNTIME.
+
+  You should have received a copy of the GNU General Public License
+  along with paslang.  If not, see <https://www.gnu.org/licenses/>. }
+
+{ What a TrueType or OpenType font file says of its glyphs (P512): the
+  tables a reader needs to turn a glyph number into a character, and no more.
+
+  TTrueType opens a font held in a string. It reads the table directory (the
+  scaler types 0x00010000, 'true' and 'OTTO': a sfnt wrapper around TrueType
+  or CFF outlines), `maxp` for the number of glyphs, the subtables of `cmap`
+  (formats 0, 4, 6 and 12, which are the ones fonts use for Unicode and for the
+  Macintosh and symbol encodings) and `post` (formats 1 and 2, whose names are
+  those of the standard Macintosh ordering and the font's own). The outlines
+  are not read: nothing is drawn.
+
+  CmapGlyph maps a character code to a glyph by one subtable, GlyphOfCode does
+  what ISO 32000-1 9.6.6.4 asks of a simple font with no Encoding or a
+  symbolic one ((3,0) with the code in one of the ranges 0x0000, 0xF000,
+  0xF100, 0xF200, else (1,0)), GlyphUnicode inverts the Unicode subtables, and
+  GlyphName gives the `post` name.
+
+  A damaged font is never an error: the table directory that does not fit the
+  file, a table that runs past its end, a subtable whose counts do not fit its
+  table, a name index past the strings, make the value they would have given
+  absent (0 for a glyph, -1 for a character, '' for a name) and Valid says
+  whether the directory and `maxp` were sound. Every read is checked against
+  the string, and the work of building the inverse of a subtable is bounded
+  (1,200,000 codes a subtable). A TTrueType belongs to the routine that made it
+  (it caches without a lock). Free of global state (Regla 11). }
+unit pasfonttt;
+
+interface
+
+const
+  { the platform ids of `cmap`, and the encoding ids used here }
+  ttpUnicode = 0;
+  ttpMacintosh = 1;
+  ttpWindows = 3;
+
+type
+  TTrueType = class
+  private
+    FData: string;
+    FValid: Boolean;
+    FNumGlyphs: Integer;
+    FNTab: Integer;
+    FTag: array of string;
+    FOff: array of Integer;
+    FLen: array of Integer;
+    FNCmap: Integer;
+    FCPlat: array of Integer;
+    FCEnc: array of Integer;
+    FCOff: array of Integer;
+    FInv: array of Integer;
+    FOwner: array of Integer;
+    FInvDone: Boolean;
+    FPostFmt: Integer;
+    FPostN: Integer;
+    FPostStr: array of Integer;
+    FPostStrN: Integer;
+    FPostDone: Boolean;
+    function U8(P: Integer): Integer;
+    function U16(P: Integer): Integer;
+    function I16(P: Integer): Integer;
+    function U32(P: Integer): Integer;
+    function TableIndex(const Tag: string): Integer;
+    procedure BuildInverse;
+    procedure FillInverse(Sub: Integer);
+    procedure ScanPostNames;
+  public
+    constructor Create(const Data: string);
+    { whether the table directory and maxp are sound }
+    function Valid: Boolean;
+    function NumGlyphs: Integer;
+    function HasTable(const Tag: string): Boolean;
+    { the subtables of cmap: how many, and the platform and encoding of each;
+      -1 for the one that is not there }
+    function CmapCount: Integer;
+    function CmapPlatform(I: Integer): Integer;
+    function CmapEncoding(I: Integer): Integer;
+    function FindCmap(Platform, Encoding: Integer): Integer;
+    { the glyph of a character code by a subtable, 0 (the missing glyph) where
+      it has none }
+    function CmapGlyph(Sub, Code: Integer): Integer;
+    { the glyph a single-byte code of a simple font selects in a symbolic
+      font (or one with no Encoding), 0 where none }
+    function GlyphOfCode(Code: Integer): Integer;
+    { the Unicode scalar of a glyph by the inverse of the Unicode subtables
+      (the lowest code where several map to it), -1 where none }
+    function GlyphUnicode(Glyph: Integer): Integer;
+    { the name of a glyph in `post`, '' where there is none }
+    function GlyphName(Glyph: Integer): string;
+  end;
+
+implementation
+
+uses
+  pasfontnames;
+
+const
+  MaxTables = 256;
+  MaxSubtables = 64;
+  MaxWork = 1200000;
+
+function TTrueType.U8(P: Integer): Integer;
+begin
+  if (P < 1) or (P > Length(FData)) then
+    Result := -1
+  else
+    Result := Ord(FData[P]);
+end;
+
+function TTrueType.U16(P: Integer): Integer;
+begin
+  if (P < 1) or (P + 1 > Length(FData)) then
+    Result := -1
+  else
+    Result := (Ord(FData[P]) shl 8) or Ord(FData[P + 1]);
+end;
+
+function TTrueType.I16(P: Integer): Integer;
+begin
+  Result := U16(P);
+  if Result >= 32768 then
+    Result := Result - 65536;
+end;
+
+function TTrueType.U32(P: Integer): Integer;
+begin
+  if (P < 1) or (P + 3 > Length(FData)) then
+    Result := -1
+  else
+    Result := (Ord(FData[P]) shl 24) or (Ord(FData[P + 1]) shl 16) or (Ord(FData[P + 2]) shl 8) or Ord(FData[P + 3]);
+end;
+
+function TTrueType.TableIndex(const Tag: string): Integer;
+var
+  i: Integer;
+begin
+  Result := -1;
+  for i := 0 to FNTab - 1 do
+    if FTag[i] = Tag then
+    begin
+      Result := i;
+      Exit;
+    end;
+end;
+
+constructor TTrueType.Create(const Data: string);
+var
+  scaler, n, i, rec, off, len, t, nc, c, ofs: Integer;
+  tag: string;
+begin
+  inherited Create;
+  FData := Data;
+  FValid := False;
+  FNumGlyphs := 0;
+  FNTab := 0;
+  FNCmap := 0;
+  FPostFmt := 0;
+  scaler := U32(1);
+  if not ((scaler = $00010000) or (scaler = $74727565) or (scaler = $4F54544F)) then
+    Exit;
+  n := U16(5);
+  if (n < 1) or (n > MaxTables) then
+    Exit;
+  SetLength(FTag, n);
+  SetLength(FOff, n);
+  SetLength(FLen, n);
+  for i := 0 to n - 1 do
+  begin
+    rec := 13 + 16 * i;
+    if rec + 15 > Length(FData) then
+      Break;
+    tag := Copy(FData, rec, 4);
+    off := U32(rec + 8);
+    len := U32(rec + 12);
+    if (off < 0) or (len < 0) or (off >= Length(FData)) then
+      Continue;
+    { a table that runs past the end of the file is cut there }
+    if off + len > Length(FData) then
+      len := Length(FData) - off;
+    FTag[FNTab] := tag;
+    FOff[FNTab] := off + 1;
+    FLen[FNTab] := len;
+    FNTab := FNTab + 1;
+  end;
+  { maxp: the number of glyphs, a 16-bit value after the 4-byte version }
+  t := TableIndex('maxp');
+  if (t < 0) or (FLen[t] < 6) then
+    Exit;
+  FNumGlyphs := U16(FOff[t] + 4);
+  if FNumGlyphs < 1 then
+    Exit;
+  FValid := True;
+  { the subtables of cmap }
+  t := TableIndex('cmap');
+  if (t >= 0) and (FLen[t] >= 4) then
+  begin
+    nc := U16(FOff[t] + 2);
+    if nc > MaxSubtables then
+      nc := MaxSubtables;
+    SetLength(FCPlat, nc);
+    SetLength(FCEnc, nc);
+    SetLength(FCOff, nc);
+    for i := 0 to nc - 1 do
+    begin
+      rec := FOff[t] + 4 + 8 * i;
+      if 8 * (i + 1) + 4 > FLen[t] then
+        Break;
+      ofs := U32(rec + 4);
+      c := U16(rec);
+      if (c < 0) or (ofs < 0) or (ofs + 4 > FLen[t]) then
+        Continue;
+      FCPlat[FNCmap] := c;
+      FCEnc[FNCmap] := U16(rec + 2);
+      FCOff[FNCmap] := FOff[t] + ofs;
+      FNCmap := FNCmap + 1;
+    end;
+  end;
+end;
+
+function TTrueType.Valid: Boolean;
+begin
+  Result := FValid;
+end;
+
+function TTrueType.NumGlyphs: Integer;
+begin
+  Result := FNumGlyphs;
+end;
+
+function TTrueType.HasTable(const Tag: string): Boolean;
+begin
+  Result := TableIndex(Tag) >= 0;
+end;
+
+function TTrueType.CmapCount: Integer;
+begin
+  Result := FNCmap;
+end;
+
+function TTrueType.CmapPlatform(I: Integer): Integer;
+begin
+  if (I < 0) or (I >= FNCmap) then
+    Result := -1
+  else
+    Result := FCPlat[I];
+end;
+
+function TTrueType.CmapEncoding(I: Integer): Integer;
+begin
+  if (I < 0) or (I >= FNCmap) then
+    Result := -1
+  else
+    Result := FCEnc[I];
+end;
+
+function TTrueType.FindCmap(Platform, Encoding: Integer): Integer;
+var
+  i: Integer;
+begin
+  Result := -1;
+  for i := 0 to FNCmap - 1 do
+    if (FCPlat[i] = Platform) and (FCEnc[i] = Encoding) then
+    begin
+      Result := i;
+      Exit;
+    end;
+end;
+
+{ the glyph of Code by subtable Sub: formats 0, 4, 6 and 12 }
+function TTrueType.CmapGlyph(Sub, Code: Integer): Integer;
+var
+  base, fmt, segx2, segs, lo, hi, mid, e, s, d, ro, p, g, n, first, cnt, ng, gp, tlen, endcodes, startcodes, deltas, ranges: Integer;
+begin
+  Result := 0;
+  if (Sub < 0) or (Sub >= FNCmap) or (Code < 0) then
+    Exit;
+  base := FCOff[Sub];
+  fmt := U16(base);
+  if fmt = 0 then
+  begin
+    if Code <= 255 then
+    begin
+      g := U8(base + 6 + Code);
+      if g > 0 then
+        Result := g;
+    end;
+  end
+  else if fmt = 4 then
+  begin
+    if Code > $FFFF then
+      Exit;
+    segx2 := U16(base + 6);
+    if (segx2 < 2) or ((segx2 and 1) <> 0) then
+      Exit;
+    segs := segx2 shr 1;
+    endcodes := base + 14;
+    startcodes := endcodes + segx2 + 2;
+    deltas := startcodes + segx2;
+    ranges := deltas + segx2;
+    if ranges + segx2 - 1 > Length(FData) then
+      Exit;
+    { the first segment whose end is not below the code }
+    lo := 0;
+    hi := segs - 1;
+    while lo < hi do
+    begin
+      mid := (lo + hi) shr 1;
+      if U16(endcodes + 2 * mid) < Code then
+        lo := mid + 1
+      else
+        hi := mid;
+    end;
+    e := U16(endcodes + 2 * lo);
+    s := U16(startcodes + 2 * lo);
+    if (e < Code) or (s > Code) then
+      Exit;
+    d := I16(deltas + 2 * lo);
+    ro := U16(ranges + 2 * lo);
+    if ro = 0 then
+      g := (Code + d) and $FFFF
+    else
+    begin
+      p := ranges + 2 * lo + ro + 2 * (Code - s);
+      g := U16(p);
+      if g > 0 then
+        g := (g + d) and $FFFF
+      else
+        g := 0;
+    end;
+    if g > 0 then
+      Result := g;
+  end
+  else if fmt = 6 then
+  begin
+    first := U16(base + 6);
+    cnt := U16(base + 8);
+    if (first < 0) or (cnt < 0) or (Code < first) or (Code >= first + cnt) then
+      Exit;
+    g := U16(base + 10 + 2 * (Code - first));
+    if g > 0 then
+      Result := g;
+  end
+  else if fmt = 12 then
+  begin
+    ng := U32(base + 12);
+    if ng < 1 then
+      Exit;
+    tlen := Length(FData) - base - 15;
+    if ng > tlen div 12 then
+      ng := tlen div 12;
+    lo := 0;
+    hi := ng - 1;
+    while lo < hi do
+    begin
+      mid := (lo + hi) shr 1;
+      if U32(base + 16 + 12 * mid + 4) < Code then
+        lo := mid + 1
+      else
+        hi := mid;
+    end;
+    gp := base + 16 + 12 * lo;
+    s := U32(gp);
+    e := U32(gp + 4);
+    n := U32(gp + 8);
+    if (s < 0) or (e < Code) or (s > Code) or (n < 0) then
+      Exit;
+    g := n + Code - s;
+    if (g > 0) and (g < 65536) then
+      Result := g;
+  end;
+end;
+
+function TTrueType.GlyphOfCode(Code: Integer): Integer;
+var
+  sub, g, k: Integer;
+begin
+  Result := 0;
+  if (Code < 0) or (Code > 255) then
+    Exit;
+  sub := FindCmap(ttpWindows, 0);
+  if sub >= 0 then
+  begin
+    { 0x0000 - 0x00FF, 0xF000 - 0xF0FF, 0xF100 - 0xF1FF or 0xF200 - 0xF2FF:
+      the high byte the font's subtable uses }
+    for k := 0 to 3 do
+    begin
+      if k = 0 then
+        g := CmapGlyph(sub, Code)
+      else
+        g := CmapGlyph(sub, $F000 + (k - 1) * $100 + Code);
+      if g > 0 then
+      begin
+        Result := g;
+        Exit;
+      end;
+    end;
+    Exit;
+  end;
+  sub := FindCmap(ttpMacintosh, 0);
+  if sub >= 0 then
+    Result := CmapGlyph(sub, Code);
+end;
+
+{ the subtables that say Unicode, best first }
+function UnicodeRank(Plat, Enc: Integer): Integer;
+begin
+  Result := -1;
+  if (Plat = ttpWindows) and (Enc = 10) then
+    Result := 0
+  else if (Plat = ttpUnicode) and (Enc = 4) then
+    Result := 1
+  else if (Plat = ttpUnicode) and (Enc = 6) then
+    Result := 2
+  else if (Plat = ttpWindows) and (Enc = 1) then
+    Result := 3
+  else if (Plat = ttpUnicode) and (Enc = 3) then
+    Result := 4
+  else if (Plat = ttpUnicode) and (Enc <= 2) then
+    Result := 5;
+end;
+
+{ the glyphs of the subtable Sub into FInv: each glyph keeps the lowest code
+  of this subtable that maps to it, and a glyph that a better subtable (one
+  done before) has is left as it is }
+procedure TTrueType.FillInverse(Sub: Integer);
+var
+  base, fmt, segx2, segs, i, c, s, e, d, ro, p, g, work, ng, tlen, gp, n, first, cnt, endcodes, startcodes, deltas, ranges: Integer;
+begin
+  base := FCOff[Sub];
+  fmt := U16(base);
+  work := 0;
+  if fmt = 0 then
+  begin
+    for c := 0 to 255 do
+    begin
+      g := U8(base + 6 + c);
+      if (g > 0) and (g < FNumGlyphs) then
+        if (FInv[g] < 0) or ((FOwner[g] = Sub) and (c < FInv[g])) then
+        begin
+          FInv[g] := c;
+          FOwner[g] := Sub;
+        end;
+    end;
+  end
+  else if fmt = 4 then
+  begin
+    segx2 := U16(base + 6);
+    if (segx2 < 2) or ((segx2 and 1) <> 0) then
+      Exit;
+    segs := segx2 shr 1;
+    endcodes := base + 14;
+    startcodes := endcodes + segx2 + 2;
+    deltas := startcodes + segx2;
+    ranges := deltas + segx2;
+    if ranges + segx2 - 1 > Length(FData) then
+      Exit;
+    for i := 0 to segs - 1 do
+    begin
+      s := U16(startcodes + 2 * i);
+      e := U16(endcodes + 2 * i);
+      d := I16(deltas + 2 * i);
+      ro := U16(ranges + 2 * i);
+      if (s < 0) or (e < s) then
+        Continue;
+      for c := s to e do
+      begin
+        if c = $FFFF then
+          Break;
+        work := work + 1;
+        if work > MaxWork then
+          Exit;
+        if ro = 0 then
+          g := (c + d) and $FFFF
+        else
+        begin
+          p := ranges + 2 * i + ro + 2 * (c - s);
+          g := U16(p);
+          if g > 0 then
+            g := (g + d) and $FFFF
+          else
+            g := 0;
+        end;
+        if (g > 0) and (g < FNumGlyphs) then
+          if (FInv[g] < 0) or ((FOwner[g] = Sub) and (c < FInv[g])) then
+          begin
+            FInv[g] := c;
+            FOwner[g] := Sub;
+          end;
+      end;
+    end;
+  end
+  else if fmt = 6 then
+  begin
+    first := U16(base + 6);
+    cnt := U16(base + 8);
+    if (first < 0) or (cnt < 0) then
+      Exit;
+    for i := 0 to cnt - 1 do
+    begin
+      g := U16(base + 10 + 2 * i);
+      if (g > 0) and (g < FNumGlyphs) then
+        if (FInv[g] < 0) or ((FOwner[g] = Sub) and (first + i < FInv[g])) then
+        begin
+          FInv[g] := first + i;
+          FOwner[g] := Sub;
+        end;
+    end;
+  end
+  else if fmt = 12 then
+  begin
+    ng := U32(base + 12);
+    tlen := Length(FData) - base - 15;
+    if ng > tlen div 12 then
+      ng := tlen div 12;
+    for i := 0 to ng - 1 do
+    begin
+      gp := base + 16 + 12 * i;
+      s := U32(gp);
+      e := U32(gp + 4);
+      n := U32(gp + 8);
+      if (s < 0) or (e < s) or (n < 0) or (e > $10FFFF) then
+        Continue;
+      for c := s to e do
+      begin
+        work := work + 1;
+        if work > MaxWork then
+          Exit;
+        g := n + c - s;
+        if (g > 0) and (g < FNumGlyphs) then
+          if (FInv[g] < 0) or ((FOwner[g] = Sub) and (c < FInv[g])) then
+          begin
+            FInv[g] := c;
+            FOwner[g] := Sub;
+          end;
+      end;
+    end;
+  end;
+end;
+
+procedure TTrueType.BuildInverse;
+var
+  i, r: Integer;
+begin
+  FInvDone := True;
+  SetLength(FInv, FNumGlyphs);
+  SetLength(FOwner, FNumGlyphs);
+  for i := 0 to FNumGlyphs - 1 do
+  begin
+    FInv[i] := -1;
+    FOwner[i] := -1;
+  end;
+  { the best subtable first; a better subtable's glyphs are not touched by the
+    next, one that lacks a glyph gives it }
+  for r := 0 to 5 do
+    for i := 0 to FNCmap - 1 do
+      if UnicodeRank(FCPlat[i], FCEnc[i]) = r then
+        FillInverse(i);
+end;
+
+function TTrueType.GlyphUnicode(Glyph: Integer): Integer;
+begin
+  Result := -1;
+  if (not FValid) or (Glyph < 1) or (Glyph >= FNumGlyphs) then
+    Exit;
+  if not FInvDone then
+    BuildInverse;
+  Result := FInv[Glyph];
+end;
+
+{ the strings of a post format 2 table, where each begins }
+procedure TTrueType.ScanPostNames;
+var
+  t, p, e, n, k, q: Integer;
+begin
+  FPostDone := True;
+  FPostFmt := 0;
+  FPostN := 0;
+  FPostStrN := 0;
+  t := TableIndex('post');
+  if (t < 0) or (FLen[t] < 32) then
+    Exit;
+  case U32(FOff[t]) of
+    $00010000: FPostFmt := 1;
+    $00020000: FPostFmt := 2;
+  end;
+  if FPostFmt <> 2 then
+    Exit;
+  n := U16(FOff[t] + 32);
+  if (n < 0) or (34 + 2 * n > FLen[t]) then
+  begin
+    FPostFmt := 0;
+    Exit;
+  end;
+  FPostN := n;
+  p := FOff[t] + 34 + 2 * n;
+  e := FOff[t] + FLen[t];
+  { the strings are counted first, 65,536 at most, so the table is made once }
+  k := 0;
+  q := p;
+  while (q < e) and (k < 65536) do
+  begin
+    k := k + 1;
+    q := q + 1 + U8(q);
+  end;
+  SetLength(FPostStr, k);
+  k := 0;
+  while (p < e) and (k < Length(FPostStr)) do
+  begin
+    FPostStr[k] := p;
+    k := k + 1;
+    p := p + 1 + U8(p);
+  end;
+  FPostStrN := k;
+end;
+
+function TTrueType.GlyphName(Glyph: Integer): string;
+var
+  t, idx, p, n: Integer;
+begin
+  Result := '';
+  if (not FValid) or (Glyph < 0) or (Glyph >= FNumGlyphs) then
+    Exit;
+  if not FPostDone then
+    ScanPostNames;
+  if FPostFmt = 1 then
+  begin
+    Result := FontMacGlyphName(Glyph);
+    Exit;
+  end;
+  if (FPostFmt <> 2) or (Glyph >= FPostN) then
+    Exit;
+  t := TableIndex('post');
+  idx := U16(FOff[t] + 34 + 2 * Glyph);
+  if idx < 0 then
+    Exit;
+  if idx < 258 then
+  begin
+    Result := FontMacGlyphName(idx);
+    Exit;
+  end;
+  idx := idx - 258;
+  if idx >= FPostStrN then
+    Exit;
+  p := FPostStr[idx];
+  n := U8(p);
+  if (n < 0) or (p + n > FOff[t] + FLen[t] - 1) then
+    Exit;
+  Result := Copy(FData, p + 1, n);
+end;
+
+end.
