@@ -1,0 +1,742 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+
+  paslang is free software: you can redistribute it and/or modify it
+  under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+
+  paslang is distributed in the hope that it will be useful, but
+  WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+  General Public License for more details.
+
+  Under Section 7 of GPL version 3, you are granted additional
+  permissions described in the paslang Runtime Library Exception,
+  version 1.0, in the file COPYING.RUNTIME.
+
+  You should have received a copy of the GNU General Public License
+  along with paslang.  If not, see <https://www.gnu.org/licenses/>. }
+
+{ What a CFF or Type 1 font program says of its glyphs (P513): their names, the
+  encoding built into the font, and for a CID-keyed font the CIDs. The outlines
+  are not read: nothing is drawn.
+
+  TCffFont opens a Compact Font Format file held in a string (Adobe Technical
+  Note 5176: what PDF calls FontFile3 with Subtype Type1C or CIDFontType0C, and
+  the `CFF ` table of an OpenType font). It reads the header, the INDEXes
+  (name, top DICT, string), the operators of the top DICT that say where things
+  are (charset, Encoding, CharStrings, ROS), the charset in its three formats
+  and the three predefined ones, and the Encoding in its two formats with the
+  supplements and the two predefined ones. The names of a font that is not
+  CID-keyed are its strings (the 391 standard ones, and its own); a CID-keyed
+  font has none, and its charset gives each glyph's CID.
+
+  TType1Font opens a Type 1 font program (PDF's FontFile: the clear text, the
+  encrypted part and the trailer) and reads what the clear text says of the
+  /Encoding: StandardEncoding, or the `dup code /name put` lines that follow.
+  Nothing of the encrypted part is read.
+
+  A damaged font is never an error: an INDEX whose offsets are not in order or
+  run past the file, a DICT cut in the middle of a number, a charset or an
+  encoding past the end, a count that does not fit, make the value they would
+  have given absent (0 for a glyph, '' for a name) and Valid says whether the
+  header, the INDEXes and the CharStrings count were sound. Every read is
+  checked against the string. A TCffFont belongs to the routine that made it
+  (it caches without a lock). Free of global state (Regla 11). }
+unit pasfontcff;
+
+interface
+
+type
+  TCffFont = class
+  private
+    FData: string;
+    FValid: Boolean;
+    FIsCID: Boolean;
+    FNumGlyphs: Integer;
+    FStrIndex: Integer;
+    FCharsetOp: Integer;
+    FEncodingOp: Integer;
+    FCharStrings: Integer;
+    FCharset: array of Integer;
+    FEnc: array of Integer;
+    FEncDone: Boolean;
+    FCidGid: array of Integer;
+    FCidDone: Boolean;
+    function U8(P: Integer): Integer;
+    function U16(P: Integer): Integer;
+    function UOff(P, Size: Integer): Integer;
+    function IndexCount(P: Integer): Integer;
+    function IndexEnd(P: Integer): Integer;
+    function IndexItem(P, I: Integer; var Start, Len: Integer): Boolean;
+    procedure ParseTopDict(Start, Len: Integer);
+    procedure ReadCharset;
+    procedure BuildEncoding;
+    function GlyphOfSid(Sid: Integer): Integer;
+  public
+    constructor Create(const Data: string);
+    function Valid: Boolean;
+    { whether the font is CID-keyed (has a ROS operator) }
+    function IsCID: Boolean;
+    function NumGlyphs: Integer;
+    { the name of a glyph; '' for a CID-keyed font and for a glyph that has none }
+    function GlyphName(Glyph: Integer): string;
+    { the glyph the font's own encoding gives a code, 0 where none }
+    function GlyphOfCode(Code: Integer): Integer;
+    { the CID of a glyph of a CID-keyed font (its charset entry), -1 where none }
+    function CidOfGlyph(Glyph: Integer): Integer;
+    { the glyph of a CID: the charset's inverse for a CID-keyed font, the CID
+      itself for one that is not (PDF 9.7.4.2), 0 where none }
+    function GlyphOfCid(Cid: Integer): Integer;
+  end;
+
+  TType1Font = class
+  private
+    FFound: Boolean;
+    FStandard: Boolean;
+    FNames: array of string;
+  public
+    constructor Create(const Data: string);
+    { whether the clear text has an /Encoding }
+    function HasEncoding: Boolean;
+    { whether it is StandardEncoding }
+    function IsStandard: Boolean;
+    { the glyph name a code has in the font's own encoding, '' where none }
+    function CodeName(Code: Integer): string;
+  end;
+
+implementation
+
+uses
+  pasfontnames;
+
+const
+  MaxGlyphs = 65535;
+
+function TCffFont.U8(P: Integer): Integer;
+begin
+  if (P < 1) or (P > Length(FData)) then
+    Result := -1
+  else
+    Result := Ord(FData[P]);
+end;
+
+function TCffFont.U16(P: Integer): Integer;
+begin
+  if (P < 1) or (P + 1 > Length(FData)) then
+    Result := -1
+  else
+    Result := (Ord(FData[P]) shl 8) or Ord(FData[P + 1]);
+end;
+
+{ an offset of Size bytes (1 to 4), -1 where it does not fit }
+function TCffFont.UOff(P, Size: Integer): Integer;
+var
+  i, v, b: Integer;
+begin
+  Result := -1;
+  if (Size < 1) or (Size > 4) or (P < 1) or (P + Size - 1 > Length(FData)) then
+    Exit;
+  v := 0;
+  for i := 0 to Size - 1 do
+  begin
+    b := Ord(FData[P + i]);
+    v := (v shl 8) or b;
+  end;
+  Result := v;
+end;
+
+{ the number of objects of the INDEX at P (1 based), -1 where it does not fit }
+function TCffFont.IndexCount(P: Integer): Integer;
+begin
+  Result := U16(P);
+end;
+
+{ the position past the INDEX at P, 0 where it is not sound: its offsets must
+  begin at 1, not go down, and end inside the file }
+function TCffFont.IndexEnd(P: Integer): Integer;
+var
+  cnt, osz, base, last, first, i, prev, cur: Integer;
+begin
+  Result := 0;
+  cnt := U16(P);
+  if cnt < 0 then
+    Exit;
+  if cnt = 0 then
+  begin
+    Result := P + 2;
+    Exit;
+  end;
+  osz := U8(P + 2);
+  if (osz < 1) or (osz > 4) then
+    Exit;
+  base := P + 3 + (cnt + 1) * osz;
+  if base > Length(FData) + 1 then
+    Exit;
+  first := UOff(P + 3, osz);
+  if first <> 1 then
+    Exit;
+  prev := 1;
+  for i := 1 to cnt do
+  begin
+    cur := UOff(P + 3 + i * osz, osz);
+    if (cur < prev) or (base + cur - 1 > Length(FData) + 1) then
+      Exit;
+    prev := cur;
+  end;
+  last := prev;
+  Result := base + last - 1;
+end;
+
+{ the object I (0 based) of the INDEX at P: where it begins and its length }
+function TCffFont.IndexItem(P, I: Integer; var Start, Len: Integer): Boolean;
+var
+  cnt, osz, base, o1, o2: Integer;
+begin
+  Result := False;
+  cnt := U16(P);
+  if (cnt < 1) or (I < 0) or (I >= cnt) then
+    Exit;
+  osz := U8(P + 2);
+  if (osz < 1) or (osz > 4) then
+    Exit;
+  base := P + 3 + (cnt + 1) * osz;
+  o1 := UOff(P + 3 + I * osz, osz);
+  o2 := UOff(P + 3 + (I + 1) * osz, osz);
+  if (o1 < 1) or (o2 < o1) or (base + o2 - 1 > Length(FData) + 1) then
+    Exit;
+  Start := base + o1 - 1;
+  Len := o2 - o1;
+  Result := True;
+end;
+
+{ the operators of the top DICT that say where things are; the operands are
+  numbers (DICT data, section 4 of the note), integers or reals }
+procedure TCffFont.ParseTopDict(Start, Len: Integer);
+var
+  p, e, b0, b1, v, n, op, k, t: Integer;
+  stack: array[0..47] of Integer;
+begin
+  p := Start;
+  e := Start + Len;
+  n := 0;
+  FCharsetOp := 0;
+  FEncodingOp := 0;
+  FCharStrings := 0;
+  while p < e do
+  begin
+    b0 := U8(p);
+    if b0 < 0 then
+      Exit;
+    if b0 <= 21 then
+    begin
+      op := b0;
+      p := p + 1;
+      if b0 = 12 then
+      begin
+        b1 := U8(p);
+        if b1 < 0 then
+          Exit;
+        op := 1200 + b1;
+        p := p + 1;
+      end;
+      if (op = 15) and (n >= 1) then
+        FCharsetOp := stack[n - 1]
+      else if (op = 16) and (n >= 1) then
+        FEncodingOp := stack[n - 1]
+      else if (op = 17) and (n >= 1) then
+        FCharStrings := stack[n - 1]
+      else if op = 1230 then
+        FIsCID := True;
+      n := 0;
+    end
+    else
+    begin
+      if b0 = 28 then
+      begin
+        v := U16(p + 1);
+        if v < 0 then
+          Exit;
+        if v >= 32768 then
+          v := v - 65536;
+        p := p + 3;
+      end
+      else if b0 = 29 then
+      begin
+        v := UOff(p + 1, 4);
+        if v < 0 then
+          Exit;
+        if v >= $80000000 then
+          v := v - $100000000;
+        p := p + 5;
+      end
+      else if b0 = 30 then
+      begin
+        { a real: nibbles to the first 0xF }
+        p := p + 1;
+        v := 0;
+        t := 0;
+        while (p < e) and (t = 0) do
+        begin
+          k := U8(p);
+          if k < 0 then
+            Exit;
+          if ((k and $F) = $F) or ((k shr 4) = $F) then
+            t := 1;
+          p := p + 1;
+        end;
+      end
+      else if (b0 >= 32) and (b0 <= 246) then
+      begin
+        v := b0 - 139;
+        p := p + 1;
+      end
+      else if (b0 >= 247) and (b0 <= 250) then
+      begin
+        b1 := U8(p + 1);
+        if b1 < 0 then
+          Exit;
+        v := (b0 - 247) * 256 + b1 + 108;
+        p := p + 2;
+      end
+      else if (b0 >= 251) and (b0 <= 254) then
+      begin
+        b1 := U8(p + 1);
+        if b1 < 0 then
+          Exit;
+        v := -(b0 - 251) * 256 - b1 - 108;
+        p := p + 2;
+      end
+      else
+      begin
+        { 22 to 27, 31 and 255 are reserved: the DICT is not sound }
+        Exit;
+      end;
+      if n < 48 then
+      begin
+        stack[n] := v;
+        n := n + 1;
+      end;
+    end;
+  end;
+end;
+
+constructor TCffFont.Create(const Data: string);
+var
+  hdr, osz, p, q, s, l, cnt: Integer;
+begin
+  inherited Create;
+  FData := Data;
+  FValid := False;
+  FIsCID := False;
+  FNumGlyphs := 0;
+  FStrIndex := 0;
+  if (U8(1) <> 1) then
+    Exit;
+  hdr := U8(3);
+  osz := U8(4);
+  if (hdr < 4) or (hdr >= Length(FData)) or (osz < 1) or (osz > 4) then
+    Exit;
+  p := hdr + 1;
+  { the name INDEX, the top DICT INDEX (one font), the string INDEX }
+  q := IndexEnd(p);
+  if q = 0 then
+    Exit;
+  p := q;
+  if (U16(p) < 1) or (not IndexItem(p, 0, s, l)) then
+    Exit;
+  q := IndexEnd(p);
+  if q = 0 then
+    Exit;
+  ParseTopDict(s, l);
+  FStrIndex := q;
+  if IndexEnd(q) = 0 then
+    FStrIndex := 0;
+  if FCharStrings < 1 then
+    Exit;
+  cnt := U16(FCharStrings + 1);
+  if (cnt < 1) or (IndexEnd(FCharStrings + 1) = 0) then
+    Exit;
+  FNumGlyphs := cnt;
+  FValid := True;
+  ReadCharset;
+end;
+
+{ the charset: for each glyph its string id (its CID in a CID-keyed font) }
+procedure TCffFont.ReadCharset;
+var
+  i, fmt, p, g, first, left, sid, n: Integer;
+begin
+  SetLength(FCharset, FNumGlyphs);
+  for i := 0 to FNumGlyphs - 1 do
+    FCharset[i] := 0;
+  if FCharsetOp <= 2 then
+  begin
+    if not FIsCID then
+    begin
+      n := FontCffCharsetCount(FCharsetOp);
+      for i := 0 to FNumGlyphs - 1 do
+        if i < n then
+          FCharset[i] := FontCffCharsetSid(FCharsetOp, i);
+    end
+    else
+    begin
+      { a CID-keyed font does not use a predefined charset: the CIDs are the glyphs }
+      for i := 0 to FNumGlyphs - 1 do
+        FCharset[i] := i;
+    end;
+    Exit;
+  end;
+  p := FCharsetOp + 1;
+  fmt := U8(p);
+  p := p + 1;
+  g := 1;
+  if fmt = 0 then
+  begin
+    while g < FNumGlyphs do
+    begin
+      sid := U16(p);
+      if sid < 0 then
+        Exit;
+      FCharset[g] := sid;
+      g := g + 1;
+      p := p + 2;
+    end;
+  end
+  else if (fmt = 1) or (fmt = 2) then
+  begin
+    while g < FNumGlyphs do
+    begin
+      first := U16(p);
+      if fmt = 1 then
+        left := U8(p + 2)
+      else
+        left := U16(p + 2);
+      if (first < 0) or (left < 0) then
+        Exit;
+      i := 0;
+      while (i <= left) and (g < FNumGlyphs) do
+      begin
+        FCharset[g] := first + i;
+        g := g + 1;
+        i := i + 1;
+      end;
+      if fmt = 1 then
+        p := p + 3
+      else
+        p := p + 4;
+    end;
+  end;
+end;
+
+{ the glyph with a string id, 0 where there is none }
+function TCffFont.GlyphOfSid(Sid: Integer): Integer;
+var
+  i: Integer;
+begin
+  Result := 0;
+  for i := 1 to FNumGlyphs - 1 do
+    if FCharset[i] = Sid then
+    begin
+      Result := i;
+      Exit;
+    end;
+end;
+
+{ the font's own encoding: for each code its glyph }
+procedure TCffFont.BuildEncoding;
+var
+  c, i, p, fmt, n, g, first, left, sid: Integer;
+begin
+  FEncDone := True;
+  SetLength(FEnc, 256);
+  for c := 0 to 255 do
+    FEnc[c] := 0;
+  if FEncodingOp <= 1 then
+  begin
+    for c := 0 to 255 do
+    begin
+      sid := FontCffEncodingSid(FEncodingOp = 1, c);
+      if sid <> 0 then
+        FEnc[c] := GlyphOfSid(sid);
+    end;
+    Exit;
+  end;
+  p := FEncodingOp + 1;
+  fmt := U8(p);
+  if fmt < 0 then
+    Exit;
+  p := p + 1;
+  if (fmt and $7F) = 0 then
+  begin
+    n := U8(p);
+    p := p + 1;
+    for i := 0 to n - 1 do
+    begin
+      c := U8(p + i);
+      if c < 0 then
+        Exit;
+      if i + 1 < FNumGlyphs then
+        FEnc[c] := i + 1;
+    end;
+    p := p + n;
+  end
+  else if (fmt and $7F) = 1 then
+  begin
+    n := U8(p);
+    p := p + 1;
+    g := 1;
+    for i := 0 to n - 1 do
+    begin
+      first := U8(p);
+      left := U8(p + 1);
+      if (first < 0) or (left < 0) then
+        Exit;
+      p := p + 2;
+      for c := first to first + left do
+      begin
+        if (c <= 255) and (g < FNumGlyphs) then
+          FEnc[c] := g;
+        g := g + 1;
+      end;
+    end;
+  end
+  else
+    Exit;
+  if (fmt and $80) <> 0 then
+  begin
+    n := U8(p);
+    p := p + 1;
+    for i := 0 to n - 1 do
+    begin
+      c := U8(p);
+      sid := U16(p + 1);
+      if (c < 0) or (sid < 0) then
+        Exit;
+      p := p + 3;
+      g := GlyphOfSid(sid);
+      if g > 0 then
+        FEnc[c] := g;
+    end;
+  end;
+end;
+
+function TCffFont.Valid: Boolean;
+begin
+  Result := FValid;
+end;
+
+function TCffFont.IsCID: Boolean;
+begin
+  Result := FIsCID;
+end;
+
+function TCffFont.NumGlyphs: Integer;
+begin
+  Result := FNumGlyphs;
+end;
+
+function TCffFont.GlyphName(Glyph: Integer): string;
+var
+  sid, s, l: Integer;
+begin
+  Result := '';
+  if (not FValid) or FIsCID or (Glyph < 0) or (Glyph >= FNumGlyphs) then
+    Exit;
+  if Glyph = 0 then
+  begin
+    Result := '.notdef';
+    Exit;
+  end;
+  sid := FCharset[Glyph];
+  if sid < 391 then
+    Result := FontCffString(sid)
+  else if (FStrIndex > 0) and IndexItem(FStrIndex, sid - 391, s, l) then
+    Result := Copy(FData, s, l);
+end;
+
+function TCffFont.GlyphOfCode(Code: Integer): Integer;
+begin
+  Result := 0;
+  if (not FValid) or FIsCID or (Code < 0) or (Code > 255) then
+    Exit;
+  if not FEncDone then
+    BuildEncoding;
+  Result := FEnc[Code];
+end;
+
+function TCffFont.CidOfGlyph(Glyph: Integer): Integer;
+begin
+  Result := -1;
+  if (not FValid) or (not FIsCID) or (Glyph < 0) or (Glyph >= FNumGlyphs) then
+    Exit;
+  Result := FCharset[Glyph];
+end;
+
+function TCffFont.GlyphOfCid(Cid: Integer): Integer;
+var
+  i, hi: Integer;
+begin
+  Result := 0;
+  if (not FValid) or (Cid < 0) then
+    Exit;
+  if not FIsCID then
+  begin
+    if Cid < FNumGlyphs then
+      Result := Cid;
+    Exit;
+  end;
+  if not FCidDone then
+  begin
+    FCidDone := True;
+    hi := 0;
+    for i := 0 to FNumGlyphs - 1 do
+      if FCharset[i] > hi then
+        hi := FCharset[i];
+    if hi > MaxGlyphs then
+      hi := MaxGlyphs;
+    SetLength(FCidGid, hi + 1);
+    for i := 0 to hi do
+      FCidGid[i] := 0;
+    for i := FNumGlyphs - 1 downto 0 do
+      if FCharset[i] <= hi then
+        FCidGid[FCharset[i]] := i;
+  end;
+  if Cid < Length(FCidGid) then
+    Result := FCidGid[Cid];
+end;
+
+{ ---- Type 1 ---- }
+
+function IsSpace(C: Integer): Boolean;
+begin
+  Result := (C = 32) or (C = 9) or (C = 10) or (C = 13) or (C = 12) or (C = 0);
+end;
+
+function IsDelim(C: Integer): Boolean;
+begin
+  Result := (C = 40) or (C = 41) or (C = 60) or (C = 62) or (C = 91) or (C = 93) or (C = 123) or (C = 125) or (C = 47) or (C = 37);
+end;
+
+{ the clear text of a Type 1 font program, to the eexec: the /Encoding, a
+  token at a time (PostScript tokens as far as they matter here: names,
+  integers, and the words dup, put, def and readonly) }
+constructor TType1Font.Create(const Data: string);
+var
+  e, p, lim, start, code, c: Integer;
+  tok: string;
+
+  { the next token from p: a name keeps its slash; '' at the end }
+  function NextToken: string;
+  var
+    b: Integer;
+  begin
+    Result := '';
+    while p <= lim do
+    begin
+      b := Ord(Data[p]);
+      if IsSpace(b) then
+        p := p + 1
+      else if b = 37 then
+      begin
+        while (p <= lim) and (Ord(Data[p]) <> 10) and (Ord(Data[p]) <> 13) do
+          p := p + 1;
+      end
+      else
+        Break;
+    end;
+    if p > lim then
+      Exit;
+    start := p;
+    b := Ord(Data[p]);
+    if (b = 47) then
+      p := p + 1;
+    if IsDelim(b) and (b <> 47) then
+    begin
+      p := p + 1;
+      Result := Copy(Data, start, 1);
+      Exit;
+    end;
+    while (p <= lim) and (not IsSpace(Ord(Data[p]))) and (not IsDelim(Ord(Data[p]))) do
+      p := p + 1;
+    Result := Copy(Data, start, p - start);
+  end;
+
+begin
+  inherited Create;
+  FFound := False;
+  FStandard := False;
+  SetLength(FNames, 256);
+  lim := Length(Data);
+  { the clear text ends at the eexec }
+  e := Pos('eexec', Data);
+  if e > 0 then
+    lim := e - 1;
+  if lim > 262144 then
+    lim := 262144;
+  p := Pos('/Encoding', Data);
+  if (p = 0) or (p > lim) then
+    Exit;
+  p := p + 9;
+  FFound := True;
+  tok := NextToken;
+  if tok = 'StandardEncoding' then
+  begin
+    FStandard := True;
+    Exit;
+  end;
+  { /Encoding 256 array ... for ... dup code /name put ... def: the first dup
+    after /Encoding begins the assignments, and the first def or readonly
+    after them ends them }
+  while (tok <> '') and (tok <> 'dup') do
+  begin
+    if (tok = 'def') or (tok = 'readonly') then
+      Exit;
+    tok := NextToken;
+  end;
+  while tok = 'dup' do
+  begin
+    tok := NextToken;
+    code := 0;
+    if (tok = '') or (tok[1] < '0') or (tok[1] > '9') then
+      Exit;
+    c := 0;
+    while (c < Length(tok)) and (tok[c + 1] >= '0') and (tok[c + 1] <= '9') and (code < 100000) do
+    begin
+      code := code * 10 + (Ord(tok[c + 1]) - 48);
+      c := c + 1;
+    end;
+    tok := NextToken;
+    if (tok = '') or (tok[1] <> '/') then
+      Exit;
+    if (code >= 0) and (code <= 255) then
+      FNames[code] := Copy(tok, 2, Length(tok));
+    tok := NextToken;
+    if tok <> 'put' then
+      Exit;
+    tok := NextToken;
+  end;
+end;
+
+function TType1Font.HasEncoding: Boolean;
+begin
+  Result := FFound;
+end;
+
+function TType1Font.IsStandard: Boolean;
+begin
+  Result := FStandard;
+end;
+
+function TType1Font.CodeName(Code: Integer): string;
+begin
+  Result := '';
+  if (Code < 0) or (Code > 255) then
+    Exit;
+  Result := FNames[Code];
+  if Result = '.notdef' then
+    Result := '';
+end;
+
+end.

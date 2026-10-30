@@ -2,9 +2,11 @@
 """Writes testdata/pdffont.txt: the PDF files the paspdf font test reads, each
 with the text it must give. They are files whose fonts carry no map to text
 (no ToUnicode, no Encoding, no Widths) and the reader has to know what the
-font itself says (P495): the 14 standard fonts with Adobe's widths and their
-own encodings, Symbol and ZapfDingbats with the built-in encodings of the AFM
-files. The files are built here byte by byte; fixed seed, no clock.
+font itself says: the 14 standard fonts with Adobe's widths and their own
+encodings, Symbol and ZapfDingbats with the built-in encodings of the AFM files
+(P495), TrueType font programs (P512) and CFF and Type 1 ones (P513). The files
+are built here byte by byte, but for two that other programs made
+(testdata/pdfreal/edge.pdf, testdata/pdffontreal/gs-reencoded.pdf); fixed seed, no clock.
 
     python3 scripts/gen_pdffont.py [--check | --verify]
 
@@ -28,8 +30,10 @@ OUT = os.path.join(ROOT, 'testdata', 'pdffont.txt')
 
 # the published tree has no docs/ref: nothing to read the AFM files from, and
 # testdata/pdffont.txt is what make check uses
+FONTS_REF = os.path.join(ROOT, 'docs', 'ref', 'pdf', 'fonts')
 if __name__ == '__main__' and not (os.path.isdir(A.AFMDIR) and os.path.exists(A.E.SPEC) and os.path.exists(A.E.AGL)
-                                   and os.path.exists(A.ZAPF)):
+                                   and os.path.exists(A.ZAPF) and os.path.exists(os.path.join(FONTS_REF, 'Chap6post.html'))
+                                   and os.path.exists(os.path.join(FONTS_REF, '5176.CFF.txt'))):
     print('gen_pdffont.py: docs/ref/pdf is not here, nothing to check')
     sys.exit(0 if '--check' in sys.argv else 1)
 CASES = []   # (name, kind, pdf bytes, expected bytes, valid, compare with pdftotext)
@@ -682,6 +686,359 @@ if os.path.exists(rp):
     assert raw.count(b'/ToUnicode') == 3
     want = open(os.path.join(ROOT, 'testdata', 'pdfreal', 'edge.txt'), 'rb').read()
     case('real_edge_nomap', 'text', raw.replace(b'/ToUnicode', b'/Tounicode'), want, cmp=False)
+
+
+
+# ---------------------------------------------------------------------------
+# 4. CFF and Type 1 font programs (P513). The CFF fonts are made here as the note
+# (Adobe Technical Note 5176) lays them out: the header, the INDEXes, a top DICT
+# whose offsets are 32-bit integers (so its size does not depend on them), the
+# charset and the Encoding in the form the case is about, and a CharStrings
+# INDEX of glyphs that are an endchar and nothing else.
+STD_STRINGS = None
+
+
+def cff_strings():
+    global STD_STRINGS
+    if STD_STRINGS is None:
+        import gen_fontnames
+        STD_STRINGS = gen_fontnames.cff_tables()
+    return STD_STRINGS
+
+
+def cff_index(items):
+    if not items:
+        return u16(0)
+    offs = [1]
+    for it in items:
+        offs.append(offs[-1] + len(it))
+    osz = 1 if offs[-1] < 256 else 2
+    return u16(len(items)) + bytes([osz]) + b''.join(o.to_bytes(osz, 'big') for o in offs) + b''.join(items)
+
+
+def dict_num(v):
+    return b'\x1d' + struct.pack('>i', v)
+
+
+def make_cff(glyphs, strings=(), charset='fmt0', encoding=None, cid=False, charset_at=None, enc_at=None, charset_format=None):
+    """glyphs: the string id (the CID in a CID-keyed font) of glyphs 1..n, glyph 0 being .notdef;
+    strings: the font's own strings (string id 391 on); charset: 'fmt0', 'fmt1', 'fmt2' or the number
+    0, 1, 2 of a predefined one; encoding: None (the operator left out: Standard), 1 (Expert),
+    ('fmt0', [code of glyph 1, code of glyph 2 ...]), ('fmt1', [(first, left), ...]) with
+    supplements as a third item [(code, sid), ...]; cid: write a ROS operator;
+    charset_at and enc_at write another offset in the top DICT (a damaged font), charset_format another
+    first byte of the charset"""
+    n = len(glyphs) + 1
+    charset_data = b''
+    if charset == 'fmt0':
+        charset_data = b'\x00' + b''.join(u16(s) for s in glyphs)
+    elif charset in ('fmt1', 'fmt2'):
+        runs = []
+        for s in glyphs:
+            if runs and s == runs[-1][0] + runs[-1][1] + 1 and (charset == 'fmt2' or runs[-1][1] < 255):
+                runs[-1][1] += 1
+            else:
+                runs.append([s, 0])
+        if charset == 'fmt1':
+            charset_data = b'\x01' + b''.join(u16(a) + bytes([b]) for a, b in runs)
+        else:
+            charset_data = b'\x02' + b''.join(u16(a) + u16(b) for a, b in runs)
+    enc_data = b''
+    if isinstance(encoding, tuple):
+        kind = encoding[0]
+        sup = encoding[2] if len(encoding) > 2 else []
+        if kind == 'fmt0':
+            enc_data = bytes([0x80 if sup else 0, len(encoding[1])]) + bytes(encoding[1])
+        else:
+            enc_data = bytes([0x81 if sup else 1, len(encoding[1])]) + b''.join(bytes([a, b]) for a, b in encoding[1])
+        if sup:
+            enc_data += bytes([len(sup)]) + b''.join(bytes([c]) + u16(s) for c, s in sup)
+    if charset_format is not None:
+        charset_data = bytes([charset_format]) + charset_data[1:]
+    cs = cff_index([b'\x0e'] * n)
+    header = bytes([1, 0, 4, 1])
+    name = cff_index([b'Toy'])
+    strs = cff_index([s.encode('latin-1') for s in strings])
+    gsub = cff_index([])
+    private = b''
+
+    def top(off_charset, off_enc, off_cs, off_priv):
+        d = b''
+        if cid:
+            d += dict_num(391) + dict_num(392) + dict_num(0) + b'\x0c\x1e'    # ROS
+        if isinstance(charset, str):
+            d += dict_num(off_charset) + b'\x0f'
+        elif charset in (1, 2):
+            d += dict_num(charset) + b'\x0f'
+        if isinstance(encoding, tuple):
+            d += dict_num(off_enc) + b'\x10'
+        elif encoding == 1:
+            d += dict_num(1) + b'\x10'
+        d += dict_num(off_cs) + b'\x11'
+        d += dict_num(0) + dict_num(off_priv) + b'\x12'
+        return d
+    topsize = len(cff_index([top(0, 0, 0, 0)]))
+    base = len(header) + len(name) + topsize + len(strs) + len(gsub)
+    off_charset = base
+    off_enc = off_charset + len(charset_data)
+    off_cs = off_enc + len(enc_data)
+    off_priv = off_cs + len(cs)
+    topd = cff_index([top(off_charset if charset_at is None else charset_at, off_enc if enc_at is None else enc_at, off_cs, off_priv)])
+    assert len(topd) == topsize
+    return header + name + topd + strs + gsub + charset_data + enc_data + cs
+
+
+def cff_font_file(p, data, sub):
+    return p.stream('/Subtype /%s /Length1 %d' % (sub, len(data)), data, flate=False)
+
+
+def cff_desc(p, ff, flags, name='AAAAAA+Toy'):
+    return p.add('<< /Type /FontDescriptor /FontName /%s /Flags %d /FontBBox [0 0 1000 1000] /ItalicAngle 0 /Ascent 900 /Descent -200 /CapHeight 700 /StemV 80 /FontFile3 %d 0 R >>' % (name, flags, ff))
+
+
+def simple_cff(p, data, flags, enc='', sub='Type1C', name='AAAAAA+Toy'):
+    ff = cff_font_file(p, data, sub)
+    fd = cff_desc(p, ff, flags, name)
+    ws = ' '.join(['500'] * 224)
+    return p.add('<< /Type /Font /Subtype /Type1 /BaseFont /%s %s /FirstChar 32 /LastChar 255 /Widths [%s] /FontDescriptor %d 0 R >>' % (name, enc, ws, fd))
+
+
+def cid_cff(p, data, sub='CIDFontType0C', cidtype='CIDFontType0', name='AAAAAA+Toy'):
+    ff = cff_font_file(p, data, sub)
+    fd = cff_desc(p, ff, 4, name)
+    d = p.add('<< /Type /Font /Subtype /%s /BaseFont /%s /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor %d 0 R /DW 500 >>' % (cidtype, name, fd))
+    return p.add('<< /Type /Font /Subtype /Type0 /BaseFont /%s /Encoding /Identity-H /DescendantFonts [%d 0 R] >>' % (name, d))
+
+
+def sid(name):
+    return cff_strings()[0].index(name)
+
+
+aglc, _ = A.E.read_agl()
+
+
+def ch(name):
+    return chr(aglc[name][0])
+
+
+# 4.1 the built-in encoding of a simple font: format 0, format 1, with supplements
+names3 = ['alpha', 'beta', 'gamma']
+g3 = [391, 392, 393]     # glyph names the standard strings do not have are the font's own strings
+text3 = ''.join(ch(x) for x in names3)
+for nm, enc, flags in (
+        ('fmt0', ('fmt0', [0x61, 0x62, 0x63]), 4),
+        ('fmt1', ('fmt1', [(0x61, 2)]), 4),
+        ('fmt1_runs', ('fmt1', [(0x61, 0), (0x62, 0), (0x63, 0)]), 4),
+        ('sup', ('fmt0', [0x61, 0x62], [(0x63, 393)]), 4),
+        ('nonsymbolic', ('fmt0', [0x61, 0x62, 0x63]), 32)):
+    data = make_cff(g3, names3, 'fmt0', enc)
+    p = G.Pdf()
+    f = simple_cff(p, data, flags)
+    case('cff_simple_enc_' + nm, 'text', cid_page(p, {'F': f}, show('F', 12, 72, 720, b'abc')), txt(text3), cmp=False)
+
+# 4.2 the encoding left out is StandardEncoding, whatever the flags: 0xAE is the fi ligature there
+std_names = ['A', 'B', 'fi', 'quoteright', 'quoteleft', 'Lslash']
+std_codes = [0x41, 0x42, 0xAE, 0x27, 0x60, 0xE8]
+data = make_cff([sid(x) for x in std_names], [], 'fmt0', None)
+p = G.Pdf()
+f = simple_cff(p, data, 4)
+case('cff_simple_standard', 'text', cid_page(p, {'F': f}, show('F', 12, 72, 720, bytes(std_codes))), txt('ABﬁ’‘Ł'.replace('ﬁ', 'fi')), cmp=False)
+
+# 4.3 the Expert encoding (an encoding of the note's Appendix B) and the predefined charsets
+exp_names = ['exclamsmall', 'commasuperior', 'zerooldstyle', 'onequarter']
+ecodes = {}
+for c in range(256):
+    s_ = cff_strings()[1][1][c]
+    if s_:
+        ecodes.setdefault(cff_strings()[0][s_], c)
+data = make_cff([sid(x) for x in exp_names], [], 'fmt0', 1)
+p = G.Pdf()
+f = simple_cff(p, data, 4)
+case('cff_simple_expert', 'text', cid_page(p, {'F': f}, show('F', 12, 72, 720, bytes(ecodes[x] for x in exp_names))), txt(''.join(ch(x) for x in exp_names)), cmp=False)
+# charset 0 (ISOAdobe: glyph n is string id n), charset 1 (Expert), charset 2 (ExpertSubset), each with an encoding of format 0
+for k, nm in ((0, 'isoadobe'), (1, 'expert'), (2, 'expertsubset')):
+    tab = cff_strings()[2][k]
+    glyph_sids = tab[1:5]
+    gl = [cff_strings()[0][s_] for s_ in glyph_sids]
+    data = make_cff(glyph_sids, [], k, ('fmt0', [0x61, 0x62, 0x63, 0x64]))
+    p = G.Pdf()
+    f = simple_cff(p, data, 4)
+    case('cff_simple_charset_' + nm, 'text', cid_page(p, {'F': f}, show('F', 12, 72, 720, b'abcd')), txt(''.join(ch(x) for x in gl)), cmp=False)
+
+# 4.4 the charset in its three formats, with names of the font's own (string id 391 on) and the standard ones
+own = ['uni00E9', 'f_i', 'u1F600']
+mix = [sid('A'), 391, 392, sid('B'), 393, sid('C'), sid('D'), sid('E')]
+mix_text = 'AéfiB\U0001F600CDE'
+for cs_ in ('fmt0', 'fmt1', 'fmt2'):
+    data = make_cff(mix, own, cs_, ('fmt0', [0x41 + i for i in range(len(mix))]))
+    p = G.Pdf()
+    f = simple_cff(p, data, 4)
+    case('cff_simple_charset_' + cs_, 'text', cid_page(p, {'F': f}, show('F', 12, 72, 720, bytes(0x41 + i for i in range(len(mix))))), txt(mix_text), cmp=False)
+
+# 4.5 Differences name a code, the program has the others; a named Encoding is the author's
+data = make_cff(g3, names3, 'fmt0', ('fmt0', [0x61, 0x62, 0x63]))
+p = G.Pdf()
+f = simple_cff(p, data, 4, '/Encoding << /Type /Encoding /Differences [98 /Euro] >>')
+case('cff_simple_diff', 'text', cid_page(p, {'F': f}, show('F', 12, 72, 720, b'abc')), txt('α€γ'), cmp=False)
+p = G.Pdf()
+f = simple_cff(p, data, 4, '/Encoding /WinAnsiEncoding')
+case('cff_simple_winansi', 'text', cid_page(p, {'F': f}, show('F', 12, 72, 720, b'abc')), txt('abc'), cmp=False)
+
+# 4.6 Type0 over a CFF: the CID is the glyph when the CFF is not CID-keyed, and the glyph's name is the text
+data = make_cff([sid('A'), sid('B'), 391], ['uni00E9'], 'fmt0', None)
+p = G.Pdf()
+f = cid_cff(p, data)
+case('cff_cid_name_keyed', 'text', cid_page(p, {'F': f}, b'BT /F 12 Tf 72 720 Td ' + hexstr([1, 2, 3, 3, 1]) + b' Tj ET'), txt('ABééA'), cmp=False)
+# the same with a CIDToGIDMap-less CIDFontType0 in an OpenType wrapper (FontFile3 /OpenType)
+
+
+def make_otf(cff, nglyphs, cmaps=()):
+    """an OpenType file around a CFF: the CFF table, head, hhea, maxp (0.5), hmtx and the cmap given"""
+    head = (u32(0x00010000) + u32(0x00010000) + u32(0) + u32(0x5F0F3CF5) + u16(0) + u16(1000) + b'\0' * 16 +
+            u16(0) + u16(0) + u16(500) + u16(500) + u16(0) + u16(8) + u16(2) + u16(1) + u16(0))
+    hhea = (u32(0x00010000) + u16(900) + u16(-200) + u16(0) + u16(500) + u16(0) + u16(0) + u16(500) +
+            u16(1) + u16(0) + u16(0) + b'\0' * 8 + u16(0) + u16(nglyphs))
+    maxp = u32(0x00005000) + u16(nglyphs)
+    hmtx = b''.join(u16(500) + u16(0) for _ in range(nglyphs))
+    tables = {'CFF ': cff, 'head': head, 'hhea': hhea, 'maxp': maxp, 'hmtx': hmtx}
+    if cmaps:
+        recs = b''
+        subs = b''
+        base = 4 + 8 * len(cmaps)
+        for plat, enc, sub in cmaps:
+            recs += u16(plat) + u16(enc) + u32(base + len(subs))
+            subs += sub + b'\0' * (-len(sub) % 2)
+        tables['cmap'] = u16(0) + u16(len(cmaps)) + recs + subs
+    tags = sorted(tables)
+    out = b'OTTO' + u16(len(tags)) + u16(0) + u16(0) + u16(0)
+    dirlen = 12 + 16 * len(tags)
+    body = b''
+    for tg in tags:
+        d = tables[tg]
+        out += tg.encode() + u32(0) + u32(dirlen + len(body)) + u32(len(d))
+        body += d + b'\0' * (-len(d) % 4)
+    return out + body
+
+
+# an OpenType font with a name-keyed CFF and no cmap: the CFF names the glyphs
+data = make_otf(make_cff([sid('A'), sid('B'), 391], ['uni00E9']), 4)
+p = G.Pdf()
+f = cid_cff(p, data, 'OpenType')
+case('cff_otf_name_keyed', 'text', cid_page(p, {'F': f}, b'BT /F 12 Tf 72 720 Td ' + hexstr([1, 2, 3]) + b' Tj ET'), txt('ABé'), cmp=False)
+# a CID-keyed CFF has no names; the CIDs 100, 200, 300 are the glyphs 1, 2, 3 by its charset, and the
+# cmap of the OpenType wrapper says what the glyphs are
+cm = {0x41: 1, 0x00E9: 2, 0x20AC: 3}
+data = make_otf(make_cff([100, 200, 300], [], 'fmt0', None, cid=True), 4, [(3, 1, cmap_sub(4, cm))])
+p = G.Pdf()
+f = cid_cff(p, data, 'OpenType')
+case('cff_otf_cid_keyed_cmap', 'text', cid_page(p, {'F': f}, b'BT /F 12 Tf 72 720 Td ' + hexstr([100, 200, 300, 200, 7]) + b' Tj ET'), txt('Aé€é�'), cmp=False)
+# a bare CID-keyed CFF has nothing: U+FFFD, as before
+data = make_cff([100, 200, 300], [], 'fmt0', None, cid=True)
+p = G.Pdf()
+f = cid_cff(p, data)
+case('cff_cid_keyed_nothing', 'text', cid_page(p, {'F': f}, b'BT /F 12 Tf 72 720 Td ' + hexstr([100, 200]) + b' Tj ET'), txt('��'), cmp=False)
+
+# two glyphs with one CID (not a font the note allows): the CID selects the lower glyph
+cmd = {0x41: 1, 0x42: 2, 0x43: 3}
+data = make_otf(make_cff([100, 100, 200], [], 'fmt0', None, cid=True), 4, [(3, 1, cmap_sub(4, cmd))])
+p = G.Pdf()
+f = cid_cff(p, data, 'OpenType')
+case('cff_otf_cid_duplicate', 'text', cid_page(p, {'F': f}, b'BT /F 12 Tf 72 720 Td ' + hexstr([100, 200]) + b' Tj ET'), txt('AC'), cmp=False)
+
+# 4.7 Type 1: the clear text of the program says the encoding
+T1_HEAD = (b'%!PS-AdobeFont-1.0: Toy 001.000\n11 dict begin\n/FontInfo 1 dict dup begin /version (001.000) readonly def end readonly def\n'
+           b'/FontName /Toy def\n/PaintType 0 def\n/FontType 1 def\n/FontMatrix [0.001 0 0 0.001 0 0] readonly def\n')
+T1_TAIL = b'/FontBBox {0 0 1000 1000} readonly def\ncurrentdict end\ncurrentfile eexec\n'
+
+
+def type1(enc_text):
+    clear = T1_HEAD + enc_text + T1_TAIL
+    secret = bytes((i * 37 + 11) & 0xFF for i in range(300))
+    return clear, secret + b'\n' + (b'0' * 64 + b'\n') * 8 + b'cleartomark\n'
+
+
+def simple_t1(p, clear, rest, flags, enc=''):
+    data = clear + rest
+    ff = p.stream('/Length1 %d /Length2 %d /Length3 0' % (len(clear), len(rest)), data, flate=False)
+    fd = p.add('<< /Type /FontDescriptor /FontName /AAAAAA+Toy /Flags %d /FontBBox [0 0 1000 1000] /ItalicAngle 0 /Ascent 900 /Descent -200 /CapHeight 700 /StemV 80 /FontFile %d 0 R >>' % (flags, ff))
+    ws = ' '.join(['500'] * 224)
+    return p.add('<< /Type /Font /Subtype /Type1 /BaseFont /AAAAAA+Toy %s /FirstChar 32 /LastChar 255 /Widths [%s] /FontDescriptor %d 0 R >>' % (enc, ws, fd))
+
+
+t1cases = [
+    ('standard', b'/Encoding StandardEncoding def\n', b'A\xae', 'Afi'),
+    ('custom', b'/Encoding 256 array\n0 1 255 {1 index exch /.notdef put} for\ndup 97 /alpha put\ndup 98 /beta put\ndup 99 /gamma put\nreadonly def\n', b'abc', 'αβγ'),
+    ('tight', b'/Encoding 256 array\n0 1 255 {1 index exch /.notdef put} for\ndup 97/alpha put dup 98/beta put\n% a comment, dup 99 /gamma put\ndup 99 /gamma put\nreadonly def\n', b'abc', 'αβγ'),
+    ('def', b'/Encoding 256 array\n0 1 255 {1 index exch /.notdef put} for\ndup 97 /alpha put\ndup 98 /beta put\ndef\n', b'ab', 'αβ'),
+    ('noencoding', b'', b'ab', 'ab'),
+    ('far_dup', b'/Encoding 256 array\n' + b'0 1 255 {1 index exch /.notdef put} for\n' + b'junk ' * 100 + b'\ndup 97 /alpha put\ndup 98 /beta put\nreadonly def\n', b'ab', '\u03b1\u03b2'),
+    ('cutat_dup', b'/Encoding 256 array\ndup 97 /alpha put\ndup 98', b'ab', 'aβ'.replace('β', 'b')),
+]
+for nm, enc_text, shown, want in t1cases:
+    if nm == 'cutat_dup':
+        clear = T1_HEAD + enc_text
+        rest = b'\n' + b'x' * 20
+        want = 'αb'
+    else:
+        clear, rest = type1(enc_text)
+    p = G.Pdf()
+    f = simple_t1(p, clear, rest, 4)
+    case('t1_' + nm, 'text', cid_page(p, {'F': f}, show('F', 12, 72, 720, shown)), txt(want), cmp=False)
+# Differences win over the program's, the Encoding the file names is the author's
+clear, rest = type1(b'/Encoding 256 array\n0 1 255 {1 index exch /.notdef put} for\ndup 97 /alpha put\ndup 98 /beta put\ndup 99 /gamma put\nreadonly def\n')
+p = G.Pdf()
+f = simple_t1(p, clear, rest, 4, '/Encoding << /Type /Encoding /Differences [98 /Euro] >>')
+case('t1_diff', 'text', cid_page(p, {'F': f}, show('F', 12, 72, 720, b'abc')), txt('α€γ'), cmp=False)
+p = G.Pdf()
+f = simple_t1(p, clear, rest, 4, '/Encoding /WinAnsiEncoding')
+case('t1_winansi', 'text', cid_page(p, {'F': f}, show('F', 12, 72, 720, b'abc')), txt('abc'), cmp=False)
+
+# 4.8 damaged CFF programs: the text is what it was without the font
+goodcff = make_cff(g3, names3, 'fmt0', ('fmt0', [0x61, 0x62, 0x63]))
+goodcid = make_cff([100, 200], [], 'fmt0', None, cid=True)
+
+
+def cff_damaged(name, data, want, shown=b'abc', composite=False):
+    p = G.Pdf()
+    if composite:
+        f = cid_cff(p, data)
+        c = b'BT /F 12 Tf 72 720 Td ' + hexstr([1, 2]) + b' Tj ET'
+    else:
+        f = simple_cff(p, data, 4)
+        c = show('F', 12, 72, 720, shown)
+    case('cff_bad_' + name, 'text', cid_page(p, {'F': f}, c), txt(want), cmp=False)
+
+
+cff_damaged('intact', goodcff, 'αβγ')
+cff_damaged('cut_header', goodcff[:3], 'abc')
+cff_damaged('cut_in_name_index', goodcff[:8], 'abc')
+cff_damaged('major_2', bend(goodcff, [(0, b'\x02')]), 'abc')
+cff_damaged('hdrsize_big', bend(goodcff, [(2, b'\xf0')]), 'abc')
+cff_damaged('offsize_0', bend(goodcff, [(3, b'\x00')]), 'abc')
+cff_damaged('offsize_5', bend(goodcff, [(3, b'\x05')]), 'abc')
+cff_damaged('name_index_count_huge', bend(goodcff, [(4, u16(60000))]), 'abc')
+cff_damaged('topdict_cut', goodcff[:30], 'abc')
+cff_damaged('topdict_reserved_op', bend(goodcff, [(goodcff.index(b'\x1d') + 5, b'\x1f')]), 'abc')
+cff_damaged('charstrings_past_end', bend(goodcff, [(goodcff.rindex(b'\x1d', 0, goodcff.rindex(b'\x11')) - 0 + 1, struct.pack('>i', 0x7FFFFF00))]), 'abc')
+# the font is sound and the charset or the encoding is not: no names, no codes, the text is the guess
+cff_damaged('charset_past_end', make_cff(g3, names3, 'fmt0', ('fmt0', [0x61, 0x62, 0x63]), charset_at=0x7FFFFF00), 'abc')
+cff_damaged('charset_format_3', make_cff(g3, names3, 'fmt0', ('fmt0', [0x61, 0x62, 0x63]), charset_format=3), 'abc')
+cff_damaged('encoding_past_end', make_cff(g3, names3, 'fmt0', ('fmt0', [0x61, 0x62, 0x63]), enc_at=0x7FFFFF00), 'abc')
+cff_damaged('index_first_offset_2', bend(goodcff, [(7, b'\x02')]), 'abc')
+cff_damaged('cid_nothing_intact', goodcid, '��', composite=True)
+cff_damaged('cid_cut', goodcid[:20], '��', composite=True)
+
+# 4.9 a real program: Ghostscript's Type1C subset of a re-encoded Nimbus Sans, whose codes 1 to 14 are
+# H e l o space W r d, e acute, Euro, fi, n tilde, 2, 0; the PDF names an Encoding and has a ToUnicode map,
+# and here both are renamed (/Encodinx, /Tounicode: the same length, so the table is right) so that the
+# font's own encoding is all there is. pdftotext reads it the same way.
+rp = os.path.join(ROOT, 'testdata', 'pdffontreal', 'gs-reencoded.pdf')
+if os.path.exists(rp):
+    raw = open(rp, 'rb').read()
+    assert raw.count(b'/ToUnicode') == 1 and raw.count(b'/Encoding') == 2
+    case('real_gs_type1c_nomap', 'text', raw.replace(b'/Encoding', b'/Encodinx').replace(b'/ToUnicode', b'/Tounicode'),
+         txt('Hello World\n\u00e9\u20ac fi \u00f1 20'))
+    case('real_gs_type1c', 'text', raw, txt('Hello World\n\u00e9\u20ac fi \u00f1 20'))
 
 
 def write_corpus():

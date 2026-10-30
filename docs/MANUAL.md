@@ -12431,6 +12431,17 @@ for i := 0 to d.WarningCount - 1 do WriteLn(d.WarningAt(i));   { what was read r
   `GlyphOfCode`, `GlyphUnicode` (the inverse of the Unicode subtables, the best
   first, the lowest code where several map to one glyph) and `GlyphName` (`post`
   formats 1 and 2); a damaged font gives nothing and is never a fault.
+  A CFF program (FontFile3 with Subtype Type1C or CIDFontType0C, or the CFF table
+  of an OpenType font) and a Type 1 program (FontFile) say what their glyphs are
+  in the same way (1.2.332, P513): a simple font that names no base encoding is
+  read by the program's own encoding (a CFF's, with its charset's names and its
+  strings; a Type 1's `/Encoding`, whose clear text is all that is read), with
+  Differences over it; a CIDFontType0 gets the glyph its CID selects by the CFF's
+  charset (the CID itself where the CFF is not CID-keyed) and then the character
+  of the OpenType wrapper's cmap, else the glyph's name. `uses pasfontcff` gives
+  `TCffFont` (`Valid`, `IsCID`, `NumGlyphs`, `GlyphName`, `GlyphOfCode`,
+  `CidOfGlyph`, `GlyphOfCid`) and `TType1Font` (`HasEncoding`, `IsStandard`,
+  `CodeName`); a damaged program gives nothing and is never a fault.
   The ligatures of the Alphabetic Presentation Forms (U+FB00 to U+FB06) and the
   private-use fi and fl (U+F001, U+F002) are written as their letters. A Type0
   font with no map gives U+FFFD for each code, and `WarningAt` says which font.
@@ -12440,10 +12451,10 @@ for i := 0 to d.WarningCount - 1 do WriteLn(d.WarningAt(i));   { what was read r
   0.4 of the smaller size. Text drawn invisible (mode 3, the layer an OCR program
   adds to a scan) is text. Rotated text comes after the lines, in the order of the
   stream. What is not read: images and scans (there is no recognition), the text of form fields and annotations, and
-  what a CFF or Type1 font program embedded in the file says of its own glyphs (P513): such a font with
-  neither Encoding nor ToUnicode is read by the guess of Latin-1. A TrueType subset that kept no cmap and no
-  names (the CID subsets of cairo) says nothing and gives U+FFFD, and so does a symbolic font whose subset
-  has nothing but the codes (LibreOffice's).
+  a font program that says nothing: a CID-keyed CFF with no cmap (a bare CIDFontType0C) has no names to give,
+  a TrueType subset that kept no cmap and no names (the CID subsets of cairo) has none, and a symbolic
+  font whose subset has nothing but the codes (LibreOffice's) is only its codes; they give U+FFFD, or the
+  guess of Latin-1 for a simple font.
 - **Encryption (1.2.315, P494).** A file with the standard security handler is read
   when the empty password opens it, which is how the encrypted files that readers
   open without asking are protected (an owner password forbids copying or
