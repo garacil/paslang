@@ -35,6 +35,7 @@ FONTS = [
     ('Symbol', 'psyr'), ('ZapfDingbats', 'pzdr'),
 ]
 EURO = {'Courier': 600, 'Helvetica': 556, 'Times': 500}
+ZAPF = os.path.join(E.ROOT, 'docs', 'ref', 'pdf', 'agl', 'zapfdingbats.txt')
 
 
 def read_afm(fn):
@@ -53,6 +54,52 @@ def read_afm(fn):
                 if l.startswith(k + ' '):
                     head[k] = l.split(None, 1)[1].strip()
     return names, codes, head
+
+
+def read_zapf():
+    """the names of the ZapfDingbats list (Adobe, with the Adobe Glyph List) and their scalars"""
+    names = {}
+    for line in open(ZAPF, encoding='utf-8'):
+        if line.startswith('#') or not line.strip():
+            continue
+        n, u = line.strip().split(';')
+        names[n] = [int(x, 16) for x in u.split()]
+    return names
+
+
+def glyph_tables():
+    """every glyph name of the 14 AFM files, sorted; the width of each in each font (-1 where the
+    font lacks it, the Euro as in euro()); the Unicode scalar of each name (the Adobe Glyph List,
+    the ZapfDingbats list for a1 to a206, -1 where neither has it); and the built-in encoding of
+    Symbol and ZapfDingbats, the scalar of each code"""
+    agl, _ = E.read_agl()
+    zapf = read_zapf()
+    per = []
+    codes = []
+    for fontname, fn in FONTS:
+        names, cs, _ = read_afm(fn)
+        if fontname not in ('Symbol', 'ZapfDingbats'):
+            names['Euro'] = euro(fontname)
+        per.append(names)
+    alln = sorted(set().union(*[set(n) for n in per]))
+    gw = []
+    for names in per:
+        gw += [names.get(n, -1) for n in alln]
+    gr = []
+    for n in alln:
+        u = zapf.get(n) or agl.get(n)
+        gr.append(u[0] if u and len(u) == 1 else -1)
+    enc = []
+    for fontname, fn in FONTS[12:]:
+        row = [-1] * 256
+        for l in open(os.path.join(AFMDIR, fn + '.afm'), encoding='latin-1'):
+            m = re.match(r'C (\d+) ; WX \d+ ; N (\S+) ;', l)
+            if m:
+                u = zapf.get(m.group(2)) or agl.get(m.group(2))
+                assert u and len(u) == 1, (fontname, m.group(2))
+                row[int(m.group(1))] = u[0]
+        enc += row
+    return alln, gw, gr, enc
 
 
 def euro(fontname):
@@ -128,7 +175,9 @@ UNIT_PRE = '''{ This file is part of paslang.
   WinAnsiEncoding (the glyph names of ISO 32000-1, annex D.2); Symbol and
   ZapfDingbats have their own encoding, the same in all three. The Euro, which
   the 1990 files lack, is 556, 500 and 600 for Helvetica, Times and Courier. A
-  code with no glyph is -1. }
+  code with no glyph is -1. By the name of the glyph the widths are there too
+  (a Differences array names glyphs), with the Unicode scalar of each name and
+  the built-in encoding of Symbol and ZapfDingbats (P495). }
 unit paspdfafm;
 
 interface
@@ -163,6 +212,21 @@ function PdfStdName(Font: Integer): string;
   no glyph; Enc is peStandard, peMacRoman or peWinAnsi of paspdfenc (and
   ignored by Symbol and ZapfDingbats) }
 function PdfStdWidth(Font, Enc, Code: Integer): Integer;
+
+{ the width of a glyph by its name in the AFM file of the font, in
+  thousandths of the size; -1 where the font has no glyph of the name. The
+  Euro, which the 1990 files lack, is 556, 500 and 600 as for PdfStdWidth }
+function PdfStdGlyphWidth(Font: Integer; const Name: string): Integer;
+
+{ the Unicode scalar of a glyph name of the AFM files (the names of the Adobe
+  Glyph List and of its ZapfDingbats list: alpha, a1), -1 for a name they do
+  not have or that makes more than one character }
+function PdfStdGlyphRune(const Name: string): Integer;
+
+{ the Unicode scalar of a code in the built-in encoding of Symbol and
+  ZapfDingbats (the fonts that have one of their own), -1 for another font or
+  a code with no glyph }
+function PdfStdRune(Font, Code: Integer): Integer;
 
 { the font's Ascender and Descender, and the corners of its FontBBox (K 0 to
   3), in thousandths }
@@ -304,6 +368,54 @@ begin
   Result := Widths[(Font * 3 + Enc) * 256 + Code];
 end;
 
+{ the index of a glyph name in GlyphNames, or -1: the number of bars before
+  its own, less one }
+function GlyphIndex(const Name: string): Integer;
+var
+  at, i: Integer;
+begin
+  Result := -1;
+  if (Name = '') or (Pos('|', Name) > 0) then
+    Exit;
+  at := Pos('|' + Name + '|', GlyphNames);
+  if at = 0 then
+    Exit;
+  Result := -1;
+  for i := 1 to at do
+    if GlyphNames[i] = '|' then
+      Result := Result + 1;
+end;
+
+function PdfStdGlyphWidth(Font: Integer; const Name: string): Integer;
+var
+  k: Integer;
+begin
+  Result := -1;
+  if (Font < 0) or (Font > 13) then
+    Exit;
+  k := GlyphIndex(Name);
+  if k >= 0 then
+    Result := GlyphWidth[Font * NGlyphs + k];
+end;
+
+function PdfStdGlyphRune(const Name: string): Integer;
+var
+  k: Integer;
+begin
+  Result := -1;
+  k := GlyphIndex(Name);
+  if k >= 0 then
+    Result := GlyphRune[k];
+end;
+
+function PdfStdRune(Font, Code: Integer): Integer;
+begin
+  Result := -1;
+  if (Font < 12) or (Font > 13) or (Code < 0) or (Code > 255) then
+    Exit;
+  Result := CodeRune[(Font - 12) * 256 + Code];
+end;
+
 function PdfStdAscender(Font: Integer): Integer;
 begin
   if (Font < 0) or (Font > 13) then
@@ -345,6 +457,33 @@ def build():
     for i in range(0, len(flat), 16):
         lines.append('    ' + ', '.join(str(v) for v in flat[i:i + 16]))
     out.append('  Widths: array[0..%d] of SmallInt = (\n%s);\n\n' % (len(flat) - 1, ',\n'.join(lines)))
+    alln, gw, gr, enc = glyph_tables()
+    out.append('  NGlyphs = %d;\n\n' % len(alln))
+    packed = '|' + '|'.join(alln) + '|'
+    chunks = []
+    cur = ''
+    for n in alln:
+        cur += '|' + n
+        if len(cur) > 90:
+            chunks.append(cur)
+            cur = ''
+    cur += '|'
+    chunks.append(cur)
+    assert ''.join(chunks) == packed
+    out.append('  { the glyph names of the 14 AFM files, sorted, between bars }\n  GlyphNames =\n    ' +
+               " +\n    ".join("'" + c + "'" for c in chunks) + ';\n\n')
+    lines = []
+    for i in range(0, len(gw), 16):
+        lines.append('    ' + ', '.join(str(v) for v in gw[i:i + 16]))
+    out.append('  GlyphWidth: array[0..%d] of SmallInt = (\n%s);\n\n' % (len(gw) - 1, ',\n'.join(lines)))
+    lines = []
+    for i in range(0, len(gr), 16):
+        lines.append('    ' + ', '.join(str(v) for v in gr[i:i + 16]))
+    out.append('  GlyphRune: array[0..%d] of Integer = (\n%s);\n\n' % (len(gr) - 1, ',\n'.join(lines)))
+    lines = []
+    for i in range(0, len(enc), 16):
+        lines.append('    ' + ', '.join(str(v) for v in enc[i:i + 16]))
+    out.append('  CodeRune: array[0..%d] of Integer = (\n%s);\n\n' % (len(enc) - 1, ',\n'.join(lines)))
     out.append('  Asc: array[0..13] of SmallInt = (%s);\n' % ', '.join(h.get('Ascender', '0') for h in heads))
     out.append('  Desc: array[0..13] of SmallInt = (%s);\n' % ', '.join(h.get('Descender', '0') for h in heads))
     bb = []

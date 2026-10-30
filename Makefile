@@ -731,6 +731,9 @@ GOLDEN_A64 += pdfform
 # P494: encrypted PDF files read with the empty password, and bent.
 GOLDEN += pdfenc
 GOLDEN_A64 += pdfenc
+# P495: PDF files whose fonts carry no map to text: the 14 standard fonts' widths and encodings, and the same bytes bent.
+GOLDEN += pdffont
+GOLDEN_A64 += pdffont
 # P497: calls that pass words on the stack, at every stack depth, under the collector's stress.
 GOLDEN += stkargs
 GOLDEN_A64 += stkargs
@@ -790,8 +793,8 @@ LIB_UNITS := \
 	src/lib/pasxlsx.paslang \
 	src/lib/paspdfcrypt.paslang \
 	src/lib/paspdfenc.paslang \
-	src/lib/paspdf.paslang \
 	src/lib/paspdfafm.paslang \
+	src/lib/paspdf.paslang \
 	src/lib/paspdfform.paslang \
 	src/lib/pasconn.paslang \
 	src/lib/pasurl.paslang \
@@ -1404,6 +1407,8 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	: paspdfafm is what scripts/gen_pdfafm.py writes and testdata/pdfform.txt what scripts/gen_pdf_forms.py writes, P437; \
 	python3 -I scripts/gen_pdfafm.py --check; \
 	python3 -I scripts/gen_pdf_forms.py --check; \
+	: testdata/pdffont.txt is what scripts/gen_pdffont.py writes, P495; \
+	python3 -I scripts/gen_pdffont.py --check; \
 	grep -q 'call p_passtr_pasfindbytecpu$$' $(BUILDDIR)/longslice.s || { echo "longslice.s does not call the AVX2 front of IndexByte"; exit 1; }; \
 	grep -q 'call p_passtr_pascomparebytecpu$$' $(BUILDDIR)/longslice.s || { echo "longslice.s does not call the AVX2 front of CompareByte"; exit 1; }; \
 	grep -q 'call p_passtr_pasfindbytebase$$' $(BUILDDIR)/longslice-base.s || { echo "longslice-base.s does not call the base front of IndexByte"; exit 1; }; \
