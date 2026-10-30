@@ -2,7 +2,8 @@
 """gen_fma.py: testdata/fma.paslang (P425). Cases of A * B + C for Doubles and
 for Singles with the result rounded once: random operands of every exponent,
 products that cancel the addend, exact ties, subnormals, overflow and
-underflow, zeros of both signs, infinities and NaNs. The Double results are
+underflow, zeros of both signs, infinities and NaNs, and (P493) products that are the smaller
+operand with bits beyond the routine's window. The Double results are
 Python's math.fma (C99 fma); the Single results are rounded from the exact
 rational by this file, which checks the same routine on the Doubles against
 math.fma. A NaN is expected only as 'any NaN', its bits being the machine's."""
@@ -243,6 +244,23 @@ for _ in range(150):
     b = struct.unpack('<f', struct.pack('<f', b))[0]
     adds(a, b, b2s(rnd.getrandbits(23)))
     adds(a, b, -b2s(rnd.getrandbits(23)))
+
+
+# sticky (P493): the product is the smaller operand and its top bit the half-ulp of the
+# addend, its low bits beyond the 128 bits the routine keeps: (1 + t)(1 - t + t^2) = 1 + t^3,
+# so the product is a power of two and a bit 3u places below it, with the addend 50 to 140
+# places above or a few places below
+srnd = random.Random(4931)
+for u in (18, 20, 22, 24, 25, 26):
+    for off in (-60, -54, -53, -52, -2, 0, 1, 50, 52, 53, 54, 55, 56, 62, 63, 64, 65, 66, 100, 127, 128, 129, 140):
+        for _ in range(3):
+            e1 = srnd.randint(-100, 100)
+            e2 = srnd.randint(-100, 100)
+            t = 2.0 ** -u
+            a = math.ldexp(1 + t, e1)
+            b = math.ldexp(1 - t + t * t, e2)
+            z = math.ldexp(1 + srnd.getrandbits(3) * 2.0 ** -52, e1 + e2 + off)
+            addd(a, b, z if srnd.getrandbits(1) else -z)
 
 
 def check_double_model():
