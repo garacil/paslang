@@ -12472,8 +12472,15 @@ for i := 0 to d.WarningCount - 1 do WriteLn(d.WarningAt(i));   { what was read r
   that text, once, where the sequence begins, in place of its glyphs: the outermost
   of nested sequences counts, the entry may be in the Properties of the resources, a
   UTF-16BE or PDFDocEncoding string is decoded and the language escape sequences left
-  out, and a form or a page keeps to itself the sequences it began. Rotated text comes after the lines, in the order of the
-  stream. What is not read: images and scans (there is no recognition), the text of form fields and annotations, and
+  out, and a form or a page keeps to itself the sequences it began. The text of the annotations
+  of a page comes after its own (1.2.338, P521), where pdftotext reads it: the normal
+  appearance of each one that is shown (not those flagged Hidden or NoView) is drawn
+  into the box of its Rect as 12.5.5 asks, a form field's value, a stamp, a free text
+  note; of a checkbox the state /AS names, else Off, else the first; a text or
+  choice field that has no appearance gives its value (a list box its options, a
+  password a star for each character), its entries inherited from its parents.
+  Rotated text comes after the lines, in the order of the
+  stream. What is not read: images and scans (there is no recognition), and
   a font program that says nothing: a CID-keyed CFF with no cmap (a bare CIDFontType0C) has no names to give,
   a TrueType subset that kept no cmap and no names (the CID subsets of cairo) has none, and a symbolic
   font whose subset has nothing but the codes (LibreOffice's) is only its codes; they give U+FFFD, or the

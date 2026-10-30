@@ -749,6 +749,9 @@ GOLDEN_A64 += pdfgap
 # P520: PDF files whose forms draw forms, read under limits of content small enough to be reached, and the same bytes bent.
 GOLDEN += pdfwork
 GOLDEN_A64 += pdfwork
+# P521: PDF files with annotations and form fields, whose appearance is text, and the same bytes bent.
+GOLDEN += pdfannot
+GOLDEN_A64 += pdfannot
 # P497: calls that pass words on the stack, at every stack depth, under the collector's stress.
 GOLDEN += stkargs
 GOLDEN_A64 += stkargs
@@ -1439,6 +1442,8 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	python3 -I scripts/gen_pdfgap.py --check; \
 	: testdata/pdfwork.txt is what scripts/gen_pdfwork.py writes, P520; \
 	python3 -I scripts/gen_pdfwork.py --check; \
+	: testdata/pdfannot.txt is what scripts/gen_pdfannot.py writes, P521; \
+	python3 -I scripts/gen_pdfannot.py --check; \
 	grep -q 'call p_passtr_pasfindbytecpu$$' $(BUILDDIR)/longslice.s || { echo "longslice.s does not call the AVX2 front of IndexByte"; exit 1; }; \
 	grep -q 'call p_passtr_pascomparebytecpu$$' $(BUILDDIR)/longslice.s || { echo "longslice.s does not call the AVX2 front of CompareByte"; exit 1; }; \
 	grep -q 'call p_passtr_pasfindbytebase$$' $(BUILDDIR)/longslice-base.s || { echo "longslice-base.s does not call the base front of IndexByte"; exit 1; }; \
