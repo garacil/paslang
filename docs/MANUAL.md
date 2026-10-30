@@ -12456,7 +12456,11 @@ for i := 0 to d.WarningCount - 1 do WriteLn(d.WarningAt(i));   { what was read r
 - **Text.** `PageText` puts a space between two strings of a line when the gap is
   wider than 0.15 of the font's size, and inside a TJ array where an adjustment
   is 180 thousandths or more; a line is the strings whose baselines are within
-  0.4 of the smaller size. Text drawn invisible (mode 3, the layer an OCR program
+  0.4 of the smaller size; where every string of a line is one glyph (letter-spaced
+  text, which Chromium writes a Tj to a glyph) or every piece of a TJ array is, the
+  least gap of the line is the spacing of the letters and a space is a gap more than
+  1.3 times it, at least 0.15 of the size and at most 0.4 of it, as pdftotext reads it
+  (1.2.336, P518); no space is put after a space. Text drawn invisible (mode 3, the layer an OCR program
   adds to a scan) is text. A string shown a second time in its place, which is how
   a face with no bold is faked and a title is given a shadow (1.2.333, P514), is read
   once: the same font, size (to an eighth of a point) and bytes, starting within a

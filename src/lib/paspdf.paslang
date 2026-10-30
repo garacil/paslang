@@ -154,6 +154,8 @@ type
     X1: Double;
     Y1: Double;
     FS: Double;
+    { how many glyphs it shows (P518) }
+    Glyphs: Integer;
     Text: string;
   end;
 
@@ -4222,6 +4224,13 @@ type
     MCShown: Boolean;
     MCOver: Integer;
     MCBase: Integer;
+    { the glyphs of the run being made and whether its text ends in a space
+      (P518) }
+    RunGlyphs: Integer;
+    SBSpace: Boolean;
+    { the space last put in was a gap of a TJ array, which a space glyph that
+      follows it does not double }
+    SBGap: Boolean;
     LastFont: TPdfFont;
     Active: array of TPdfObj;
     { the operands of the operator being read, without an object for
@@ -4267,6 +4276,11 @@ const
     array of TJ is a space, in thousandths }
   SpaceGap = 0.15;
   TjSpace = 180;
+  { the gap of letter-spaced text (P518): where every glyph of a line has a gap
+    of its own after it, a break is a gap wider than this many times the least
+    of them, but never over this much of the size, as pdftotext measured }
+  SpaceRatio = 1.3;
+  SpaceCap = 0.4;
   { a string is a repeat of one before it, a fake bold face or a drop shadow
     (P514), when the font, the size and the bytes are the same and it starts
     within this many sizes of it along the line and across it, as pdftotext
@@ -4567,7 +4581,12 @@ begin
     Exit;
   RunOpen := False;
   if SB.ByteLength = 0 then
+  begin
+    RunGlyphs := 0;
+    SBSpace := False;
+    SBGap := False;
     Exit;
+  end;
   m := MatMul(Tm, GS.Ctm);
   r.X0 := RunX0;
   r.Y0 := RunY0;
@@ -4577,6 +4596,10 @@ begin
   r.X1 := m.E + GS.Ts * m.C;
   r.Y1 := m.F + GS.Ts * m.D;
   r.FS := RunFS;
+  r.Glyphs := RunGlyphs;
+  RunGlyphs := 0;
+  SBSpace := False;
+  SBGap := False;
   r.Text := SB.ToString;
   SB.Reset;
   if Runs.N >= MaxRuns then
@@ -4646,6 +4669,8 @@ begin
     begin
       MCShown := True;
       SB.AddText(MCText[MCActive]);
+      RunGlyphs := RunGlyphs + 1;
+      SBSpace := (MCText[MCActive] <> '') and (MCText[MCActive][Length(MCText[MCActive])] = ' ');
     end;
     skip := True;
   end;
@@ -4658,7 +4683,14 @@ begin
     begin
       if Length(txt) >= 3 then
         txt := ExpandLigatures(txt);
+      { a space glyph right after the space of a gap is that space (P518) }
+      if SBGap and (txt <> '') and (txt[1] = ' ') then
+        txt := Copy(txt, 2, Length(txt));
+      SBGap := False;
       SB.AddText(txt);
+      RunGlyphs := RunGlyphs + 1;
+      if txt <> '' then
+        SBSpace := txt[Length(txt)] = ' ';
     end;
     if GS.Font.Vertical then
     begin
@@ -4929,8 +4961,9 @@ var
   lx: TPdfLex;
   o: TPdfObj;
   m: TPdfMat;
-  found, complex: Boolean;
+  found, complex, multi: Boolean;
   base0: Integer;
+  tjb, tjlim: Double;
 
   procedure Grow;
   begin
@@ -5243,6 +5276,31 @@ begin
         begin
           if (n >= 1) and (OKind[n - 1] = 4) then
           begin
+            { letter-spaced text (P518): where every string of the array is one
+              glyph, the least adjustment is the spacing of the letters }
+            tjb := 1.0e9;
+            multi := False;
+            for k := OPS[n - 1] to OPS[n - 1] + OPN[n - 1] - 1 do
+              if EKind[k] = 3 then
+              begin
+                a := EPN[k];
+                if (GS.Font <> nil) and GS.Font.Composite then
+                  a := a div 2;
+                if a >= 2 then
+                  multi := True;
+                { one string right after another has no gap between them }
+                if (k > OPS[n - 1]) and (EKind[k - 1] = 3) then
+                  tjb := 0;
+              end
+              else if (EKind[k] = 1) and (-ENum[k] < tjb) then
+                tjb := -ENum[k];
+            if tjb < 0 then
+              tjb := 0;
+            tjlim := TjSpace;
+            if (not multi) and (SpaceRatio * tjb > tjlim) then
+              tjlim := SpaceRatio * tjb;
+            if tjlim > 1000.0 * SpaceCap + 1.0 then
+              tjlim := 1000.0 * SpaceCap + 1.0;
             for k := OPS[n - 1] to OPS[n - 1] + OPN[n - 1] - 1 do
             begin
               if EKind[k] = 3 then
@@ -5250,8 +5308,12 @@ begin
               else if EKind[k] = 1 then
               begin
                 adj := ENum[k];
-                if (adj <= -TjSpace) and RunOpen and (SB.ByteLength > 0) then
+                if (-adj >= tjlim) and RunOpen and (SB.ByteLength > 0) and not SBSpace then
+                begin
                   SB.AddChar(' ');
+                  SBSpace := True;
+                  SBGap := True;
+                end;
                 if (GS.Font <> nil) and GS.Font.Vertical then
                   Tm := MatMul(MatTrans(0, -adj / 1000.0 * GS.Tfs), Tm)
                 else
@@ -5262,6 +5324,31 @@ begin
           end
           else if (n >= 1) and (OKind[n - 1] = 5) and (OObj[n - 1] <> nil) and (OObj[n - 1].Kind = pdfArray) then
           begin
+            tjb := 1.0e9;
+            multi := False;
+            for k := 0 to Length(OObj[n - 1].Items) - 1 do
+            begin
+              o := OObj[n - 1].Items[k];
+              if o.Kind = pdfString then
+              begin
+                a := Length(o.SVal);
+                if (GS.Font <> nil) and GS.Font.Composite then
+                  a := a div 2;
+                if a >= 2 then
+                  multi := True;
+                if (k > 0) and (OObj[n - 1].Items[k - 1].Kind = pdfString) then
+                  tjb := 0;
+              end
+              else if ((o.Kind = pdfInt) or (o.Kind = pdfReal)) and (-NumOf(o) < tjb) then
+                tjb := -NumOf(o);
+            end;
+            if tjb < 0 then
+              tjb := 0;
+            tjlim := TjSpace;
+            if (not multi) and (SpaceRatio * tjb > tjlim) then
+              tjlim := SpaceRatio * tjb;
+            if tjlim > 1000.0 * SpaceCap + 1.0 then
+              tjlim := 1000.0 * SpaceCap + 1.0;
             for k := 0 to Length(OObj[n - 1].Items) - 1 do
             begin
               o := OObj[n - 1].Items[k];
@@ -5270,8 +5357,12 @@ begin
               else if (o.Kind = pdfInt) or (o.Kind = pdfReal) then
               begin
                 adj := NumOf(o);
-                if (adj <= -TjSpace) and RunOpen and (SB.ByteLength > 0) then
+                if (-adj >= tjlim) and RunOpen and (SB.ByteLength > 0) and not SBSpace then
+                begin
                   SB.AddChar(' ');
+                  SBSpace := True;
+                  SBGap := True;
+                end;
                 if (GS.Font <> nil) and GS.Font.Vertical then
                   Tm := MatMul(MatTrans(0, -adj / 1000.0 * GS.Tfs), Tm)
                 else
@@ -5519,8 +5610,10 @@ var
   i: Integer;
   p, r: TPdfRun;
   dx, dy, len, u, v, fs: Double;
+  lastSp: Boolean;
 begin
   sb := TStringBuilder.Create(1024);
+  lastSp := True;
   try
     for i := 0 to L.N - 1 do
     begin
@@ -5547,14 +5640,22 @@ begin
         u := (r.X0 - p.X1) * dx + (r.Y0 - p.Y1) * dy;
         v := Abs((r.X0 - p.X1) * dy - (r.Y0 - p.Y1) * dx);
         if v > 0.5 * fs then
-          sb.AddChar(#10)
+        begin
+          sb.AddChar(#10);
+          lastSp := True;
+        end
         else if (u > SpaceGap * fs) or (u < -fs) then
         begin
-          if (sb.ByteLength > 0) and (r.Text <> '') and (r.Text[1] <> ' ') then
+          if (sb.ByteLength > 0) and (r.Text <> '') and (r.Text[1] <> ' ') and not lastSp then
+          begin
             sb.AddChar(' ');
+            lastSp := True;
+          end;
         end;
       end;
       sb.AddText(r.Text);
+      if r.Text <> '' then
+        lastSp := r.Text[Length(r.Text)] = ' ';
     end;
     Result := sb.ToString;
   finally
@@ -5571,10 +5672,11 @@ var
   n, i, j, g, a, k: Integer;
   ord1, ord2: array of Integer;
   r, p: TPdfRun;
-  lineY, lineFS, fs, u: Double;
+  lineY, lineFS, fs, u, base, lim: Double;
   nh: Integer;
   hidx: array of Integer;
   rest: TPdfRunList;
+  allOne, lastSp: Boolean;
 begin
   n := L.N;
   { the horizontal runs go by lines; the others keep the order of the
@@ -5635,6 +5737,30 @@ begin
         ord2 := SortedOrder(kx, k);
         if sb.ByteLength > 0 then
           sb.AddChar(#10);
+        { letter-spaced text (P518): where every run of the line is one glyph the
+          least gap is the spacing of the letters, and a break is a gap well
+          over it }
+        base := 0;
+        if k >= 2 then
+        begin
+          allOne := True;
+          for g := 0 to k - 1 do
+            if L.Items[hidx[ord1[i + ord2[g]]]].Glyphs <> 1 then
+              allOne := False;
+          if allOne then
+          begin
+            base := 1.0e30;
+            for g := 1 to k - 1 do
+            begin
+              u := L.Items[hidx[ord1[i + ord2[g]]]].X0 - L.Items[hidx[ord1[i + ord2[g - 1]]]].X1;
+              if u < 0 then
+                u := 0;
+              if u < base then
+                base := u;
+            end;
+          end;
+        end;
+        lastSp := True;
         for g := 0 to k - 1 do
         begin
           r := L.Items[hidx[ord1[i + ord2[g]]]];
@@ -5647,11 +5773,21 @@ begin
             if fs <= 0 then
               fs := 1;
             u := r.X0 - p.X1;
-            if (u > SpaceGap * fs) or (u < -fs) then
-              if (r.Text <> '') and (r.Text[1] <> ' ') and (sb.ByteLength > 0) then
+            lim := SpaceGap * fs;
+            if SpaceRatio * base > lim then
+              lim := SpaceRatio * base;
+            if lim > SpaceCap * fs then
+              lim := SpaceCap * fs;
+            if (u > lim) or (u < -fs) then
+              if (r.Text <> '') and (r.Text[1] <> ' ') and (sb.ByteLength > 0) and not lastSp then
+              begin
                 sb.AddChar(' ');
+                lastSp := True;
+              end;
           end;
           sb.AddText(r.Text);
+          if r.Text <> '' then
+            lastSp := r.Text[Length(r.Text)] = ' ';
         end;
         i := j;
       end;
