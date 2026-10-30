@@ -119,3 +119,58 @@ var
   Chk('h15 no resolver by default', rd.Resolver = nil, 'set');
   m := MsgOf(src, @RaiseXml, 0);
   Chk('h16 an XML error of the resolver is its own', Has(m, 'mine') and (not Has(m, 'refused')), m);
+  { the external subset and the external parameter entities (P511) }
+  Begin_('h');
+  Ent_('x.dtd', ToHex('<!ENTITY e ''from the dtd''> <!ATTLIST doc a CDATA ''dflt''>'));
+  src := '<!DOCTYPE doc PUBLIC "  -//X//DTD  x//EN " "x.dtd">' + Chr(10) + '<doc>&e;</doc>';
+  Calls := 0;
+  m := MsgOf(src, @Serve, 0);
+  Chk('h17 the subset is not asked for by default', (m = 'OK') and (Calls = 0), IntToStr(Calls));
+  d := XmlParseDtd(src, @Serve, False);
+  Chk('h18 the subset is read with LoadSubset', (d.Root.Text = 'from the dtd') and (d.Root.Attr('a') = 'dflt'), d.Root.Text);
+  Chk('h19 asked once, with the identifiers', (Calls = 1) and (LastSys = 'x.dtd') and (LastPub = '-//X//DTD x//EN'), LastPub);
+  Begin_('h');
+  Ent_('x.dtd', ToHex('text'));
+  try
+    XmlParseDtd(src, @Serve, False);
+    Chk('h20 a subset that is no declarations', False, 'read');
+  except
+    on E: EXmlError do
+      Chk('h20 a subset that is no declarations', Has(E.Message, 'invalid markup') and Has(E.Message, 'external subset') and (E.Line = 1), E.Message);
+  end;
+  Begin_('h');
+  m := MsgOf(src, @Serve, 0);
+  Chk('h21 no subset to read is no matter without LoadSubset', m = 'OK', m);
+  try
+    XmlParseDtd(src, @Serve, False);
+    Chk('h22 the resolver refuses the subset', False, 'read');
+  except
+    on E: EXmlError do
+      Chk('h22 the resolver refuses the subset', Has(E.Message, 'the resolver refused the external subset') and Has(E.Message, 'no entity x.dtd'), E.Message);
+  end;
+  Begin_('h');
+  Ent_('x.dtd', ToHex('<!ENTITY % a ''&#37;b;''> <!ENTITY % b ''&#37;a;''> %a;'));
+  try
+    XmlParseDtd(src, @Serve, False);
+    Chk('h23 parameter entities that loop', False, 'read');
+  except
+    on E: EXmlError do
+      Chk('h23 parameter entities that loop', Has(E.Message, 'nested too deep'), E.Message);
+  end;
+  Begin_('h');
+  Ent_('x.dtd', ToHex('<!ENTITY % big ''0123456789012345678901234567890123456789''> <!ENTITY e ''%big;%big;''>'));
+  d := XmlParseDtd(src, @Serve, False);
+  Chk('h24 text through a parameter entity', d.Root.Text = '01234567890123456789012345678901234567890123456789012345678901234567890123456789', d.Root.Text);
+  rd := TXmlReader.Create(src);
+  rd.Resolver := @Serve;
+  rd.LoadSubset := True;
+  rd.MaxExpansion := 100;
+  try
+    while rd.Next(tok) do
+      ;
+    Chk('h25 parameter entities are held to MaxExpansion', False, 'read');
+  except
+    on E: EXmlError do
+      Chk('h25 parameter entities are held to MaxExpansion', Has(E.Message, 'MaxExpansion'), E.Message);
+  end;
+

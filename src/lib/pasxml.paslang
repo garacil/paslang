@@ -32,11 +32,15 @@
   and written back as UTF-8, with the declaration saying so. Entities:
   the five of XML, character references and the internal general
   entities of the DOCTYPE's internal subset, whose replacement text may
-  be text and references but not markup (refused, not misread); an
-  external DTD is never fetched or read, and an external entity only
-  through a Resolver the program gives a reader (P477), none by default:
-  a reference to one is refused. Default attribute values and the rest
-  of the DTD are read for their well-formedness and then ignored. }
+  be text and references but not markup (refused, not misread); the
+  parameter entities of the internal subset where a declaration may
+  stand; an external DTD is never fetched or read, and an external
+  entity only through a Resolver the program gives a reader (P477), none
+  by default: a reference to one is refused. With LoadSubset (P511) the
+  resolver is asked for the DOCTYPE's external subset and for external
+  parameter entities too, which are read with their conditional
+  sections. Default attribute values and the rest of the DTD are read
+  for their well-formedness and then ignored. }
 unit pasxml;
 
 interface
@@ -162,6 +166,18 @@ type
     FEPub: array of string;   { an external entity's public identifier }
     FESys: array of string;   { and its system identifier }
     FEUn: array of Boolean;   { unparsed: it has NDATA }
+    FEPe: array of Boolean;   { a parameter entity }
+    FEDx: array of Boolean;   { declared in a parameter entity or the external subset }
+    FPeSeen: Boolean;         { the subset has a parameter entity reference, read or not }
+    FBase: string;            { the system identifier of the text being read, '' for the document }
+    FPD: Integer;             { how deep the text of parameter entities is being read }
+    FSubDepth: Integer;       { how many texts a subset is being read from: a parameter entity, the external subset }
+    FSubAt: Integer;          { where an error in them is put: the reference in the document, the DOCTYPE }
+    FExtMode: Boolean;        { reading the external subset or an external parameter entity }
+    FPeCnt: Integer;          { the references one declaration has had included }
+    FDocAt: Integer;          { the DOCTYPE, and the identifiers of its external subset }
+    FDocPub: string;
+    FDocSys: string;
     FERs: array of Boolean;   { the resolver has been asked, and FEVal is its text }
     FLit: string;             { the literal ReadLiteral read last }
     FEN: Integer;
@@ -203,7 +219,17 @@ type
     function MarkupRefAt(I: Integer; var Code, Semi: Integer): Boolean;
     procedure EnterEntity(Code, RefAt, After: Integer);
     procedure ResolveEntity(Code, At: Integer);
-    function ExternalText(Code, At: Integer; const Raw: string): string;
+    function ExternalText(const What: string; At: Integer; const Raw: string): string;
+    function PeIndex(const Nm: string): Integer;
+    function EntRef(Code: Integer): string;
+    function ExpandPeAt(I: Integer; Q: Char): Boolean;
+    procedure ExpandDecl;
+    procedure SkipSPe;
+    procedure IncludePE;
+    procedure ReadDecls(Mode: Integer);
+    procedure ReadConditional;
+    procedure ReadExternalSubset;
+    function RefIndex(const Nm: string): Integer;
     procedure LeaveEntity;
     procedure DeclAttr(const El, An: string; NonCData, HasDef: Boolean; const Df: string);
     procedure ApplyAttlist(const El: string; var Attrs: TXmlAttrArray; var Na: Integer);
@@ -240,6 +266,7 @@ type
     MaxDepth: Integer;       { the deepest nesting a read takes: 10000 }
     MaxExpansion: Integer;   { the most bytes the entities of a document may expand to: 16 MiB }
     Resolver: TXmlResolver;  { reads an external parsed entity; nil, the default, refuses a reference to one }
+    LoadSubset: Boolean;     { with a Resolver, also asks it for the DOCTYPE's external subset and the external parameter entities (P511) }
     constructor Create(const AText: string);
     constructor CreateFragment(const AText: string);
     { binds Prefix ('' the default namespace) to URI for a fragment }
@@ -407,6 +434,9 @@ function XmlTryParse(const S: string; out Doc: TXmlDoc; out Err: string): Boolea
 { A document read with the resolver giving its external entities (P477),
   with prefixes as Namespaces in XML takes them or left alone }
 function XmlParseWith(const S: string; AResolver: TXmlResolver; ANamespaces: Boolean): TXmlDoc;
+{ and, with the resolver, the external subset the DOCTYPE names and the
+  external parameter entities (P511) }
+function XmlParseDtd(const S: string; AResolver: TXmlResolver; ANamespaces: Boolean): TXmlDoc;
 
 { Escaping: text keeps its quotes, an attribute value is for double
   quotes; the characters XML does not allow become U+FFFD, as Go's
@@ -815,6 +845,13 @@ begin
   FPeRef := False;
   FExtSub := False;
   FGrpNew := False;
+  FPD := 0;
+  FSubDepth := 0;
+  FExtMode := False;
+  FPeSeen := False;
+  FBase := '';
+  FDocPub := '';
+  FDocSys := '';
 end;
 
 { The text of a document or of an external entity as UTF-8: Bom the bytes
@@ -906,6 +943,13 @@ begin
   FPeRef := False;
   FExtSub := False;
   FGrpNew := False;
+  FPD := 0;
+  FSubDepth := 0;
+  FExtMode := False;
+  FPeSeen := False;
+  FBase := '';
+  FDocPub := '';
+  FDocSys := '';
 end;
 
 procedure TXmlReader.LineColumn(Off: Integer; var ALine, ACol: Integer);
@@ -944,6 +988,12 @@ begin
     { in an entity's text: the place is the reference in the document }
     At := FRefAt;
     w := w + ', in the text of &' + FEName[FIE[0]] + ';';
+  end;
+  if FSubDepth > 0 then
+  begin
+    { in a parameter entity or the external subset: the place is the reference, or the DOCTYPE }
+    At := FSubAt;
+    w := w + ', in a parameter entity or the external subset';
   end;
   if At < 1 then
     At := FTagAt;
@@ -1063,11 +1113,104 @@ var
 begin
   Result := -1;
   for i := 0 to FEN - 1 do
-    if FEName[i] = Nm then
+    if (FEName[i] = Nm) and (not FEPe[i]) then
     begin
       Result := i;
       Exit;
     end;
+end;
+
+{ the general entity a reference names: one that was declared in a parameter
+  entity or the external subset is not there in a standalone document }
+{ A system identifier Ref met in the text of the entity Base (the document's
+  when empty): an absolute one, with a scheme or from the root, stays; any
+  other is relative to the directory of Base, its . and .. segments gone }
+function XmlJoinSystemId(const Base, Ref: string): string;
+var
+  i, c: Integer;
+  r, d, seg: string;
+  segs: array of string;
+  n: Integer;
+begin
+  Result := Ref;
+  if (Base = '') or (Ref = '') or (Ref[1] = '/') then
+    Exit;
+  c := Pos(':', Ref);
+  i := Pos('/', Ref);
+  if (c > 1) and ((i = 0) or (c < i)) then
+    Exit;
+  i := Length(Base);
+  while (i > 0) and (Base[i] <> '/') do
+    i := i - 1;
+  d := Copy(Base, 1, i);
+  r := d + Ref;
+  n := 0;
+  segs := nil;
+  seg := '';
+  i := 1;
+  while i <= Length(r) + 1 do
+  begin
+    if (i > Length(r)) or (r[i] = '/') then
+    begin
+      if seg = '..' then
+      begin
+        if (n > 0) and (segs[n - 1] <> '..') then
+          n := n - 1
+        else
+        begin
+          SetLength(segs, n + 1);
+          segs[n] := seg;
+          n := n + 1;
+        end;
+      end
+      else if (seg <> '.') and ((seg <> '') or (i > Length(r))) then
+      begin
+        SetLength(segs, n + 1);
+        segs[n] := seg;
+        n := n + 1;
+      end;
+      seg := '';
+    end
+    else
+      seg := seg + r[i];
+    i := i + 1;
+  end;
+  Result := '';
+  for i := 0 to n - 1 do
+  begin
+    if i > 0 then
+      Result := Result + '/';
+    Result := Result + segs[i];
+  end;
+end;
+
+function TXmlReader.RefIndex(const Nm: string): Integer;
+begin
+  Result := EntityIndex(Nm);
+  if (Result >= 0) and (FStandalone = 'yes') and FEDx[Result] then
+    Result := -1;
+end;
+
+function TXmlReader.PeIndex(const Nm: string): Integer;
+var
+  i: Integer;
+begin
+  Result := -1;
+  for i := 0 to FEN - 1 do
+    if (FEName[i] = Nm) and FEPe[i] then
+    begin
+      Result := i;
+      Exit;
+    end;
+end;
+
+{ the entity as a reference is written }
+function TXmlReader.EntRef(Code: Integer): string;
+begin
+  if FEPe[Code] then
+    Result := '%' + FEName[Code] + ';'
+  else
+    Result := '&' + FEName[Code] + ';';
 end;
 
 function XmlNormLines(const S: string): string; forward;
@@ -1108,7 +1251,7 @@ begin
           while (k <= n) and (v[k] <> ';') do
             k := k + 1;
           nm := Copy(v, j, k - j);
-          e := EntityIndex(nm);
+          e := RefIndex(nm);
           if e >= 0 then
           begin
             if FEExt[e] then
@@ -1156,7 +1299,7 @@ begin
   nm := Copy(FT, I + 1, k - I - 1);
   if (nm = 'lt') or (nm = 'gt') or (nm = 'amp') or (nm = 'apos') or (nm = 'quot') then
     Exit;
-  Code := EntityIndex(nm);
+  Code := RefIndex(nm);
   if Code < 0 then
     Exit;
   if FEExt[Code] then
@@ -1214,7 +1357,7 @@ end;
 { The text declaration of an external entity, XML 4.3.1, and the text without
   it as UTF-8: Raw the bytes the resolver gave, Code the entity and At where
   it was referred to, where an error is put }
-function TXmlReader.ExternalText(Code, At: Integer; const Raw: string): string;
+function TXmlReader.ExternalText(const What: string; At: Integer; const Raw: string): string;
 var
   t, v, enc, why: string;
   bom, p, n, c, q, sx: Integer;
@@ -1228,7 +1371,7 @@ begin
     t := XmlTranscode(Raw, bom, tr, e16);
   except
     on E: EXmlError do
-      Fail(At, 'the text of &' + FEName[Code] + '; is not read: ' + E.Reason);
+      Fail(At, 'the text of ' + What + ' is not read: ' + E.Reason);
   end;
   if bom > 0 then
     t := Copy(t, bom + 1, Length(t) - bom);
@@ -1338,7 +1481,7 @@ begin
     if (why = '') and (Copy(t, p, 2) <> '?>') then
       why := 'expected ?> at the end of the text declaration';
     if why <> '' then
-      Fail(At, 'the text declaration of &' + FEName[Code] + '; is wrong: ' + why);
+      Fail(At, 'the text declaration of ' + What + ' is wrong: ' + why);
     t := Copy(t, p + 2, n - p - 1);
   end;
   Result := t;
@@ -1359,9 +1502,9 @@ begin
     on E: EXmlError do
       raise;
     on E: Exception do
-      Fail(At, 'the resolver refused &' + FEName[Code] + '; (' + E.Message + ')');
+      Fail(At, 'the resolver refused ' + EntRef(Code) + ' (' + E.Message + ')');
   end;
-  FEVal[Code] := ExternalText(Code, At, raw);
+  FEVal[Code] := ExternalText(EntRef(Code), At, raw);
   FEMk[Code] := 2;
 end;
 
@@ -1459,14 +1602,14 @@ begin
           BufChar(B, 34)
         else
         begin
-          code := EntityIndex(nm);
+          code := RefIndex(nm);
           if code < 0 then
           begin
             { XML 1.0 4.1, Entity Declared: with an external subset or a
               parameter entity reference that is not read the entity may be
               declared there, and the reference is skipped, as 5.1 lets a
               processor that does not read it }
-            if not ((FPeRef or FExtSub) and (FStandalone <> 'yes')) then
+            if not ((FPeRef or FPeSeen or FExtSub) and (FStandalone <> 'yes')) then
               Fail(errAt, 'undeclared entity &' + nm + ';');
           end
           else
@@ -2817,7 +2960,7 @@ begin
       if SkipS = 0 then
         Fail(FP, 'expected white space after SYSTEM');
       ReadLiteral(False);
-      sys := FLit;
+      sys := XmlJoinSystemId(FBase, FLit);
     end
     else if Has('PUBLIC') then
     begin
@@ -2829,7 +2972,7 @@ begin
       if SkipS = 0 then
         Fail(FP, 'expected white space after the public identifier');
       ReadLiteral(False);
-      sys := FLit;
+      sys := XmlJoinSystemId(FBase, FLit);
     end
     else
       Fail(FP, 'expected an entity value, SYSTEM or PUBLIC');
@@ -2851,7 +2994,8 @@ begin
   if (FP > FN) or (FT[FP] <> '>') then
     Fail(FP, 'expected > at the end of an entity declaration');
   FP := FP + 1;
-  if (not isPE) and (EntityIndex(nm) < 0) and ((not FPeRef) or (FStandalone = 'yes')) then
+  if ((not isPE) and (EntityIndex(nm) < 0) and ((not FPeRef) or (FStandalone = 'yes'))) or
+    (isPE and (PeIndex(nm) < 0)) then
   begin
     if FEN >= Length(FEName) then
     begin
@@ -2863,6 +3007,8 @@ begin
       SetLength(FESys, FEN * 2 + 8);
       SetLength(FEUn, FEN * 2 + 8);
       SetLength(FERs, FEN * 2 + 8);
+      SetLength(FEPe, FEN * 2 + 8);
+      SetLength(FEDx, FEN * 2 + 8);
     end;
     FEName[FEN] := nm;
     FEVal[FEN] := v;
@@ -2872,11 +3018,284 @@ begin
     FESys[FEN] := sys;
     FEUn[FEN] := nd;
     FERs[FEN] := False;
+    FEPe[FEN] := isPE;
+    FEDx[FEN] := FSubDepth > 0;
     FEN := FEN + 1;
   end;
 end;
 
-procedure TXmlReader.ReadSubset;
+{ In the external subset a parameter entity reference may stand inside a markup
+  declaration (XML 1.0 4.4.8): the reference at FT[I] is replaced by the text of its entity,
+  between two spaces outside a literal, and as it is inside an entity value (4.4.5), where
+  the quote, the % and the & that the text could end or begin something with are written as
+  references so that they stay data. False when it is no reference. An entity that is not
+  there is skipped, as a processor that does not read it may (5.1), unless the document is
+  standalone. Q is the quote of the literal, or #0 }
+function TXmlReader.ExpandPeAt(I: Integer; Q: Char): Boolean;
+var
+  k, code: Integer;
+  nm, txt, o: string;
+  j: Integer;
+begin
+  Result := False;
+  k := I + 1;
+  while (k <= FN) and (FT[k] <> ';') and (FT[k] <> '%') and (FT[k] <> '>') and (FT[k] <> '"') and
+    (FT[k] <> '''') and (FT[k] <> '<') and (not XmlIsSpace(Ord(FT[k]))) do
+    k := k + 1;
+  if (k > FN) or (FT[k] <> ';') then
+    Exit;
+  nm := Copy(FT, I + 1, k - I - 1);
+  if not XmlIsName(nm) then
+    Exit;
+  if Namespaces and (Pos(':', nm) > 0) then
+    Fail(I, 'the entity name ' + nm + ' has a colon');
+  FPeSeen := True;
+  FPeCnt := FPeCnt + 1;
+  if FPeCnt > 10000 then
+    Fail(I, 'parameter entities nested too deep (a loop?) at %' + nm + ';');
+  code := PeIndex(nm);
+  txt := '';
+  if code < 0 then
+  begin
+    if FStandalone = 'yes' then
+      Fail(I, 'undeclared parameter entity %' + nm + ';');
+    FPeRef := True;
+  end
+  else if FEExt[code] then
+  begin
+    if LoadSubset and (Resolver <> nil) then
+    begin
+      ResolveEntity(code, I);
+      txt := XmlNormLines(FEVal[code]);
+    end
+    else
+      FPeRef := True;
+  end
+  else
+    txt := XmlNormLines(FEVal[code]);
+  FExpanded := FExpanded + Length(txt);
+  if FExpanded > MaxExpansion then
+    Fail(I, 'the entities expand to more than MaxExpansion bytes');
+  if Q <> #0 then
+  begin
+    o := '';
+    for j := 1 to Length(txt) do
+      if txt[j] = Q then
+      begin
+        if Q = '"' then
+          o := o + '&#34;'
+        else
+          o := o + '&#39;';
+      end
+      else if txt[j] = '%' then
+        o := o + '&#37;'
+      else
+        o := o + txt[j];
+    FT := Copy(FT, 1, I - 1) + o + Copy(FT, k + 1, FN - k);
+  end
+  else if code < 0 then
+    FT := Copy(FT, 1, I - 1) + ' ' + Copy(FT, k + 1, FN - k)
+  else
+    FT := Copy(FT, 1, I - 1) + ' ' + txt + ' ' + Copy(FT, k + 1, FN - k);
+  FN := Length(FT);
+  Result := True;
+end;
+
+{ The markup declaration at FP of the external subset, its parameter entity references
+  included (ExpandPeAt): those outside a literal and in the entity value of an <!ENTITY,
+  not in the other literals, a comment or a processing instruction }
+procedure TXmlReader.ExpandDecl;
+var
+  i: Integer;
+  q: Char;
+  isEnt, kw, lit: Boolean;
+begin
+  FPeCnt := 0;
+  isEnt := Has('<!ENTITY');
+  kw := False;
+  lit := False;
+  q := #0;
+  i := FP + 2;
+  while i <= FN do
+  begin
+    if q <> #0 then
+    begin
+      if FT[i] = q then
+        q := #0
+      else if lit and (FT[i] = '%') then
+      begin
+        if ExpandPeAt(i, q) then
+          Continue;
+      end;
+      i := i + 1;
+    end
+    else if (FT[i] = '"') or (FT[i] = '''') then
+    begin
+      q := FT[i];
+      lit := isEnt and (not kw);
+      i := i + 1;
+    end
+    else if FT[i] = '>' then
+      Exit
+    else if FT[i] = '%' then
+    begin
+      if ExpandPeAt(i, #0) then
+        Continue;
+      i := i + 1;
+    end
+    else if isEnt and ((Copy(FT, i, 6) = 'SYSTEM') or (Copy(FT, i, 6) = 'PUBLIC')) and
+      XmlIsSpace(Ord(FT[i - 1])) and ((i + 6 > FN) or XmlIsSpace(Ord(FT[i + 6])) or (FT[i + 6] = '"') or (FT[i + 6] = '''')) then
+    begin
+      kw := True;
+      i := i + 6;
+    end
+    else
+      i := i + 1;
+  end;
+end;
+
+{ white space, and parameter entity references that stand for it, at FP }
+procedure TXmlReader.SkipSPe;
+begin
+  while True do
+  begin
+    SkipS;
+    if (FP <= FN) and (FT[FP] = '%') then
+    begin
+      FPeCnt := 0;
+      if ExpandPeAt(FP, #0) then
+        Continue;
+    end;
+    Exit;
+  end;
+end;
+
+{ A parameter entity reference where a declaration may stand: the entity's text is read as
+  declarations (XML 1.0 4.4.8). One that is not there is skipped, as 5.1 lets a processor that
+  does not read it (a validity constraint is all that Entity Declared makes of it) unless the
+  document stands alone (the well-formedness constraint) }
+procedure TXmlReader.IncludePE;
+var
+  a, code, sP, sN: Integer;
+  nm, txt, sT, sB: string;
+  sExt: Boolean;
+begin
+  a := FP;
+  FP := FP + 1;
+  nm := ReadName;
+  if Namespaces and (Pos(':', nm) > 0) then
+    Fail(a + 1, 'the entity name ' + nm + ' has a colon');
+  if (FP > FN) or (FT[FP] <> ';') then
+    Fail(FP, 'expected ; after a parameter entity reference');
+  FP := FP + 1;
+  FPeSeen := True;
+  code := PeIndex(nm);
+  if code < 0 then
+  begin
+    if FStandalone = 'yes' then
+      Fail(a, 'undeclared parameter entity %' + nm + ';');
+    FPeRef := True;
+    Exit;
+  end;
+  if FEExt[code] then
+  begin
+    if (not LoadSubset) or (Resolver = nil) then
+    begin
+      FPeRef := True;
+      Exit;
+    end;
+    ResolveEntity(code, a);
+  end;
+  txt := XmlNormLines(FEVal[code]);
+  if FPD >= 20 then
+    Fail(a, 'parameter entities nested too deep (a loop?) at %' + nm + ';');
+  FExpanded := FExpanded + Length(txt);
+  if FExpanded > MaxExpansion then
+    Fail(a, 'the entities expand to more than MaxExpansion bytes');
+  sT := FT;
+  sP := FP;
+  sN := FN;
+  sExt := FExtMode;
+  sB := FBase;
+  if FEExt[code] then
+    FBase := FESys[code];
+  if FSubDepth = 0 then
+    FSubAt := a;
+  FT := ' ' + txt + ' ';
+  FN := Length(FT);
+  FP := 1;
+  FExtMode := FExtMode or FEExt[code];
+  FPD := FPD + 1;
+  FSubDepth := FSubDepth + 1;
+  ReadDecls(1);
+  FSubDepth := FSubDepth - 1;
+  FPD := FPD - 1;
+  FBase := sB;
+  FExtMode := sExt;
+  FT := sT;
+  FP := sP;
+  FN := sN;
+end;
+
+{ A conditional section of the external subset, XML 1.0 3.4: INCLUDE reads its declarations,
+  IGNORE skips to the end of it, nested sections counted. FP is at its <![ }
+procedure TXmlReader.ReadConditional;
+var
+  lvl, i: Integer;
+  incl: Boolean;
+begin
+  FP := FP + 3;
+  SkipSPe;
+  if Has('INCLUDE') then
+  begin
+    incl := True;
+    FP := FP + 7;
+  end
+  else if Has('IGNORE') then
+  begin
+    incl := False;
+    FP := FP + 6;
+  end
+  else
+  begin
+    incl := False;
+    Fail(FP, 'expected INCLUDE or IGNORE in a conditional section');
+  end;
+  SkipSPe;
+  if (FP > FN) or (FT[FP] <> '[') then
+    Fail(FP, 'expected [ in a conditional section');
+  FP := FP + 1;
+  if incl then
+    ReadDecls(2)
+  else
+  begin
+    lvl := 1;
+    i := FP;
+    while (i <= FN) and (lvl > 0) do
+    begin
+      if Copy(FT, i, 3) = '<![' then
+      begin
+        lvl := lvl + 1;
+        i := i + 3;
+      end
+      else if Copy(FT, i, 3) = ']]>' then
+      begin
+        lvl := lvl - 1;
+        i := i + 3;
+      end
+      else
+        i := i + 1;
+    end;
+    if lvl > 0 then
+      Fail(FN, 'unterminated conditional section');
+    FP := i;
+  end;
+end;
+
+{ The declarations of a subset, comments, processing instructions and parameter entity
+  references among them. Mode 0: the internal subset, to its ]; 1: the text of the external
+  subset or of a parameter entity, to its end; 2: a conditional section, to its ]]> }
+procedure TXmlReader.ReadDecls(Mode: Integer);
 var
   tgt: string;
   a, b: Integer;
@@ -2885,24 +3304,25 @@ begin
   begin
     SkipS;
     if FP > FN then
+    begin
+      if Mode = 1 then
+        Exit;
+      if Mode = 2 then
+        Fail(FN, 'unterminated conditional section');
       Fail(FN, 'unterminated DOCTYPE internal subset');
-    if FT[FP] = ']' then
+    end;
+    if (Mode = 0) and (FT[FP] = ']') then
     begin
       FP := FP + 1;
       Exit;
     end;
-    if FT[FP] = '%' then
+    if (Mode = 2) and Has(']]>') then
     begin
-      FP := FP + 1;
-      a := FP;
-      tgt := ReadName;
-      if Namespaces and (Pos(':', tgt) > 0) then
-        Fail(a, 'the entity name ' + tgt + ' has a colon');
-      if (FP > FN) or (FT[FP] <> ';') then
-        Fail(FP, 'expected ; after a parameter entity reference');
-      FP := FP + 1;
-      FPeRef := True;
-    end
+      FP := FP + 3;
+      Exit;
+    end;
+    if FT[FP] = '%' then
+      IncludePE
     else if Has('<!--') then
       ScanComment(a, b)
     else if Has('<?') then
@@ -2912,16 +3332,77 @@ begin
         Fail(FP, 'the processing instruction target ' + tgt + ' is reserved');
     end
     else if Has('<!ENTITY') then
-      ReadEntityDecl
+    begin
+      if FExtMode then
+        ExpandDecl;
+      ReadEntityDecl;
+    end
     else if Has('<!ELEMENT') then
-      ReadElementDecl
+    begin
+      if FExtMode then
+        ExpandDecl;
+      ReadElementDecl;
+    end
     else if Has('<!ATTLIST') then
-      ReadAttlistDecl
+    begin
+      if FExtMode then
+        ExpandDecl;
+      ReadAttlistDecl;
+    end
     else if Has('<!NOTATION') then
-      ReadNotationDecl
+    begin
+      if FExtMode then
+        ExpandDecl;
+      ReadNotationDecl;
+    end
+    else if FExtMode and Has('<![') then
+      ReadConditional
     else
       Fail(FP, 'invalid markup in the DOCTYPE internal subset');
   end;
+end;
+
+procedure TXmlReader.ReadSubset;
+begin
+  ReadDecls(0);
+end;
+
+{ The external subset the DOCTYPE names, asked of the resolver and read after the internal
+  subset (XML 1.0 2.8: the internal subset's declarations come first and bind first) }
+procedure TXmlReader.ReadExternalSubset;
+var
+  raw, txt, sT, sB: string;
+  sP, sN: Integer;
+  sExt: Boolean;
+begin
+  try
+    raw := Resolver(FDocPub, FDocSys);
+  except
+    on E: EXmlError do
+      raise;
+    on E: Exception do
+      Fail(FDocAt, 'the resolver refused the external subset (' + E.Message + ')');
+  end;
+  txt := ExternalText('the external subset', FDocAt, raw);
+  sT := FT;
+  sP := FP;
+  sN := FN;
+  sExt := FExtMode;
+  sB := FBase;
+  FBase := FDocSys;
+  FT := XmlNormLines(txt);
+  FN := Length(FT);
+  FP := 1;
+  FExtMode := True;
+  FSubAt := FDocAt;
+  FSubDepth := FSubDepth + 1;
+  ReadDecls(1);
+  FSubDepth := FSubDepth - 1;
+  FBase := sB;
+  FExtMode := sExt;
+  FT := sT;
+  FP := sP;
+  FN := sN;
 end;
 
 procedure TXmlReader.ReadDoctype(var Tok: TXmlToken);
@@ -2932,6 +3413,7 @@ begin
     Fail(FP, 'a DOCTYPE is allowed once, before the root element');
   FSawDoctype := True;
   st := FP;
+  FDocAt := st;
   FP := FP + 9;
   if SkipS = 0 then
     Fail(FP, 'expected white space after <!DOCTYPE');
@@ -2943,6 +3425,7 @@ begin
     if SkipS = 0 then
       Fail(FP, 'expected white space after SYSTEM');
     ReadLiteral(False);
+    FDocSys := FLit;
     FExtSub := True;
   end
   else if Has('PUBLIC') then
@@ -2951,9 +3434,11 @@ begin
     if SkipS = 0 then
       Fail(FP, 'expected white space after PUBLIC');
     ReadLiteral(True);
+    FDocPub := XmlNormPublic(FLit);
     if SkipS = 0 then
       Fail(FP, 'expected white space after the public identifier');
     ReadLiteral(False);
+    FDocSys := FLit;
     FExtSub := True;
   end;
   SkipS;
@@ -2970,6 +3455,8 @@ begin
   Tok.Start := st;
   Tok.Stop := FP;
   Tok.Value := Copy(FT, st, FP - st);
+  if FExtSub and LoadSubset and (Resolver <> nil) then
+    ReadExternalSubset;
 end;
 
 { ---- the next token ---- }
@@ -3918,6 +4405,17 @@ begin
   r := TXmlReader.Create(S);
   r.Namespaces := ANamespaces;
   r.Resolver := AResolver;
+  Result := XmlBuild(r);
+end;
+
+function XmlParseDtd(const S: string; AResolver: TXmlResolver; ANamespaces: Boolean): TXmlDoc;
+var
+  r: TXmlReader;
+begin
+  r := TXmlReader.Create(S);
+  r.Namespaces := ANamespaces;
+  r.Resolver := AResolver;
+  r.LoadSubset := True;
   Result := XmlBuild(r);
 end;
 

@@ -12145,16 +12145,20 @@ Out := d.Xml;                         { the document written; Text itself when n
   refused); an attribute declared with a default value is on the start tags
   that do not give it, marked `Defaulted` and not written back; the value of
   an attribute declared with a type other than CDATA has its spaces
-  trimmed and collapsed. Past a reference to a parameter entity, and when
-  `standalone` is not `yes`, the declarations are not used, since the
-  entity may have overridden them, and a reference to an entity not
-  declared, in a document with an external subset or such a reference, is
-  skipped and not refused. **Left out:** an external subset and a
-  parameter entity are never read; an external general entity is read only
-  through a resolver the program gives (`TXmlReader.Resolver`, below), and a
-  reference to one is refused when there is none, in an attribute value and
-  when the entity is unparsed (it has NDATA); names in the namespace are not
-  checked as URIs. UTF-16 is taken with a byte order mark or when
+  trimmed and collapsed. The parameter entities of the internal subset are
+  read where a declaration may stand (1.2.329, P511): their text is read as
+  declarations and what it declares is used, and one inside a declaration
+  of the internal subset is refused. Past a reference to a parameter entity
+  that is not read, and when `standalone` is not `yes`, the declarations
+  are not used, since the entity may have overridden them, and a reference
+  to an entity not declared, in a document with an external subset or with
+  a reference to a parameter entity, is skipped and not refused. **Left
+  out:** the DOCTYPE's external subset and the external parameter entities
+  are not read unless the program gives a resolver and sets `LoadSubset`
+  (below); an external general entity is read only through a resolver the
+  program gives (`TXmlReader.Resolver`, below), and a reference to one is
+  refused when there is none, in an attribute value and when the entity is
+  unparsed (it has NDATA); names in the namespace are not checked as URIs. UTF-16 is taken with a byte order mark or when
   it starts `<?`, ISO-8859-1 when the declaration says so, and any other
   declared encoding is refused, as Go's decoder refuses it without a
   `CharsetReader`.
@@ -12202,7 +12206,21 @@ Out := d.Xml;                         { the document written; Text itself when n
   out, and the rest entered as the text of an internal entity that holds
   markup is, with the same limits. `XmlParseWith(text, resolver,
   namespaces)` reads a document with one. With no resolver, the default, a
-  reference to an external entity is refused as before.
+  reference to an external entity is refused as before. `LoadSubset`
+  (1.2.329, P511), false by default, makes the reader ask the resolver also
+  for the external subset the DOCTYPE names, after the internal subset
+  (whose declarations bind first), and for the external parameter entities:
+  their text is read as declarations (XML 1.0 4.4.8), a parameter entity
+  reference may stand inside a declaration and in an entity value there,
+  the conditional sections `<![INCLUDE[` and `<![IGNORE[` are read, a
+  system identifier met in the text of an entity is relative to that
+  entity's (the resolver is given it joined, the document's own being
+  the program's to place), and in a standalone document what is declared
+  there is not used (WFC Entity Declared). `XmlParseDtd(text, resolver,
+  namespaces)` reads a document with it set. `scripts/xmlconf.py --dtd`
+  runs the W3C suite so: all 1,494 cases but one of the Second Edition's
+  are as the suite says, and `testdata/xmlcorpus` has expat read the
+  parameter entities of its documents too.
   On a 91 MB sheet the reader takes 1.7 times less than Go's
   `xml.Decoder.Token` (`scripts/bench/b37xml`).
 - **The writer.** `TXmlWriter`: `Decl`, `Start(name)`, `Attr(name, value)`,

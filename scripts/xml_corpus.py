@@ -15,7 +15,10 @@ order of name), the text (adjacent pieces joined), the comments and the
 processing instructions, which are written as hex and hashed (FNV-1a 64).
 What expat and a reader that does not read external entities, does not
 check namespace names as URIs and does not expand markup inside an entity
-give differently is left out of the corpus (see skip()).
+give differently is left out of the corpus (see skip()). expat is told to
+parse parameter entities, as the reader does since P511 (it skips them
+otherwise); the external ones are not given to it, as the reader is given
+no resolver.
 
   scripts/xml_corpus.py            write testdata/xmlcorpus.txt and .out
   scripts/xml_corpus.py --check    fail if either differs from what this makes
@@ -55,6 +58,7 @@ def dump(data, ns):
     p.CharacterDataHandler = lambda d: st['line'].extend(d.encode('utf-8'))
     p.CommentHandler = lambda d: (flush(), out.append('C ' + d.encode().hex()))
     p.ProcessingInstructionHandler = lambda t, d: (flush(), out.append('P ' + t.encode().hex() + ' ' + d.encode().hex()))
+    p.SetParamEntityParsing(pyexpat.XML_PARAM_ENTITY_PARSING_ALWAYS)
     try:
         p.Parse(data, True)
     except Exception:
@@ -300,6 +304,48 @@ DTD = [
     b'<!DOCTYPE a [<!ENTITY % p "v"> %p; <!ENTITY e "<b/>">]><a>&e;</a>',
     b'<?xml version="1.0" standalone="yes"?><!DOCTYPE a [<!ENTITY % p "v"> %p; <!ENTITY e "<b/>">]><a>&e;</a>',
     b'<!DOCTYPE a [<!ATTLIST b x NMTOKEN "  1  "><!ENTITY e "<b x=\'  2   3 \'/>">]><a>&e;</a>',
+    # parameter entities of the internal subset (P511): read where a declaration may stand
+    b'<!DOCTYPE a [<!ENTITY % p "<!ELEMENT a ANY>"> %p;]><a/>',
+    b'<!DOCTYPE a [<!ENTITY % p "<!ATTLIST a x CDATA \'1\'>"> %p;]><a/>',
+    b'<!DOCTYPE a [<!ENTITY % p "<!ENTITY e \'v\'>"> %p;]><a>&e;</a>',
+    b'<!DOCTYPE a [<!ENTITY % p "<!ENTITY e \'v\'>"> %p; <!ENTITY e \'w\'>]><a>&e;</a>',
+    b'<!DOCTYPE a [<!ENTITY e \'w\'> <!ENTITY % p "<!ENTITY e \'v\'>"> %p;]><a>&e;</a>',
+    b'<!DOCTYPE a [<!ENTITY % p "<!ENTITY e \'1\'>"> <!ENTITY % p "<!ENTITY e \'2\'>"> %p;]><a>&e;</a>',
+    b'<!DOCTYPE a [%p; <!ENTITY % p "<!ELEMENT a ANY>">]><a/>',
+    b'<!DOCTYPE a [%p;]><a/>',
+    b'<!DOCTYPE a [<!ENTITY % p "">%p;]><a/>',
+    b'<!DOCTYPE a [<!ENTITY % p " ">%p;]><a/>',
+    b'<!DOCTYPE a [<!ENTITY % p "<!-- c --><?pi x?>"> %p;]><a/>',
+    b'<!DOCTYPE a [<!ENTITY % p "<!ELEMENT"> %p; a ANY>]><a/>',
+    b'<!DOCTYPE a [<!ENTITY % p "<!ELEMENT a ANY"> %p;>]><a/>',
+    b'<!DOCTYPE a [<!ENTITY % p "ANY"> <!ELEMENT a %p;>]><a/>',
+    b'<!DOCTYPE a [<!ENTITY % p "a"> <!ELEMENT %p; ANY>]><a/>',
+    b'<!DOCTYPE a [<!ENTITY % q "<!ELEMENT a ANY>"> <!ENTITY % p "%q;"> %p;]><a/>',
+    b'<!DOCTYPE a [<!ENTITY % q "<!ELEMENT a ANY>"> <!ENTITY % p "&#37;q;"> %p;]><a/>',
+    b'<!DOCTYPE a [<!ENTITY % p "&#37;p;"> %p;]><a/>',
+    b'<!DOCTYPE a [<!ENTITY % p "%p;">]><a/>',
+    b'<!DOCTYPE a [<!ENTITY % p "<!ENTITY e \'&#38;#60;\'>"> %p;]><a>&e;</a>',
+    b'<!DOCTYPE a [<!ENTITY % p "<!ENTITY e \'&amp;\'>"> %p;]><a>&e;</a>',
+    b'<!DOCTYPE a [<!ENTITY % p "<!ENTITY e \'<b/>\'>"> %p;]><a>&e;</a>',
+    b'<?xml version="1.0" standalone="yes"?><!DOCTYPE a [<!ENTITY % p "<!ENTITY e \'v\'>"> %p;]><a>&e;</a>',
+    b'<?xml version="1.0" standalone="yes"?><!DOCTYPE a [%p;]><a/>',
+    b'<?xml version="1.0" standalone="yes"?><!DOCTYPE a [<!ENTITY % p "v">]><a>&e;</a>',
+    b'<!DOCTYPE a [<!ENTITY % p "v">]><a>&e;</a>',
+    b'<!DOCTYPE a [<!ENTITY % p "v"> %p;]><a>&e;</a>',
+    b'<!DOCTYPE a [<!ENTITY % p "<!ATTLIST a x CDATA \'1\' y CDATA \'2\'>"> %p;]><a y="3"/>',
+    b'<!DOCTYPE a [<!ENTITY % p "<!ATTLIST a x CDATA \'1\'>"> <!ATTLIST a x CDATA \'2\'> %p;]><a/>',
+    b'<!DOCTYPE a [<!ENTITY % p "<!NOTATION n SYSTEM \'x\'>"> %p;]><a/>',
+    b'<!DOCTYPE a [<!ENTITY % p "<!ENTITY u SYSTEM \'x\' NDATA n>"> %p; <!NOTATION n SYSTEM \'x\'>]><a/>',
+    b'<!DOCTYPE a [<!ENTITY % p "%"> %p;]><a/>',
+    b'<!DOCTYPE a [<!ENTITY % p "<!ENTITY % q \'<!ENTITY e 1>\'>"> %p;]><a/>',
+    b'<!DOCTYPE a [<!ENTITY % pe.1 "<!ENTITY e \'v\'>"> %pe.1;]><a>&e;</a>',
+    b'<!DOCTYPE a [<!ENTITY % p:q "<!ENTITY e \'v\'>"> %p:q;]><a>&e;</a>',
+    b'<!DOCTYPE a [<!ENTITY % p "<!ENTITY e \'v\'>"> %p ]><a/>',
+    b'<!DOCTYPE a [<!ENTITY % p "<!ENTITY e \'v\'>"> % p;]><a/>',
+    b'<!DOCTYPE a [<!ENTITY % p "<!ENTITY e \'v\'>"> %p; %p;]><a>&e;</a>',
+    b'<!DOCTYPE a [<!ENTITY % p "<!ENTITY e \'v\'>"> <!ELEMENT a ANY> %p; <!ATTLIST a x CDATA \'1\'>]><a/>',
+    b'<!DOCTYPE a [<!ENTITY % p "]><a/>"> %p;',
+    b'<!DOCTYPE a [<!ENTITY % p "<!ENTITY e \'v\'>]"> %p;]><a/>',
 ]
 
 
@@ -338,17 +384,6 @@ def skip(d):
         v = m.group(1) if m.group(1) is not None else m.group(2)
         if re.search(rb'[\s]', v) or b'&' in v:
             return True
-    # past a parameter entity reference that is not read the declarations are skipped (XML 1.0 5.1),
-    # and expat does not check a character reference in what it skips; XML 1.0 4.1 (Legal Character) does
-    if re.search(rb'%[\w.:-]+;', d) and re.search(rb'&#(?:0+|x0+|x?110000|[xX][dD][89a-fA-F][0-9a-fA-F]{2}|[xX][fF]{3}[eEfF])[0-9]*;', d):
-        return True
-    # the same: expat does not check a declared default value for < when it skips the declaration
-    pe = re.search(rb'%[\w.:-]+;', d)
-    if pe and re.search(rb'<!ATTLIST[^"\']*(?:"[^"]*<[^"]*"|\'[^\']*<[^\']*\')', d[pe.end():]):
-        return True
-    # and for a reference in a literal that is no reference
-    if pe and re.search(rb'<!(?:ATTLIST|ENTITY)[^"\']*["\'][^"\']*&(?![#\w][\w.:-]*;)', d[pe.end():]):
-        return True
     # a character above U+FFFF in a name: expat refuses it, the Fifth Edition allows it
     if b'<!ENTITY' in d and re.search(rb'&#(?:[xX]0*(?:[1-9a-eA-E][0-9a-fA-F]{4}|10[0-9a-fA-F]{4})|0*[0-9]{5,});', d):
         return True
