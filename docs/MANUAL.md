@@ -12480,7 +12480,12 @@ for i := 0 to d.WarningCount - 1 do WriteLn(d.WarningAt(i));   { what was read r
   choice field that has no appearance gives its value (a list box its options, a
   password a star for each character), its entries inherited from its parents.
   Rotated text comes after the lines, in the order of the
-  stream. What is not read: images and scans (there is no recognition), and
+  stream. A run of text ends where its last glyph does (1.2.339, P522): the number
+  that closes a TJ array moves the pen and is not part of the run, so a layout
+  program that sets each letter of a turned line by itself and takes the last glyph
+  back as far as it advanced (QuarkXPress 8.5 does) keeps that letter in its line;
+  a run with no length, a glyph with no width, goes the way its text is set. What
+  is not read: images and scans (there is no recognition), and
   a font program that says nothing: a CID-keyed CFF with no cmap (a bare CIDFontType0C) has no names to give,
   a TrueType subset that kept no cmap and no names (the CID subsets of cairo) has none, and a symbolic
   font whose subset has nothing but the codes (LibreOffice's) is only its codes; they give U+FFFD, or the

@@ -12,7 +12,11 @@ the gap between two glyphs moved a step at a time):
     gap, and a space where a gap is more than 1.3 times that, at least 0.15 of
     the size, and never more than 0.4 of the size;
   the same for the pieces of a TJ array, in thousandths;
-  no space is put after a space (a space glyph beside a wide gap).
+  no space is put after a space (a space glyph beside a wide gap);
+  a string whose glyphs the TJ array takes back as far as they advanced ends
+    where it began (P522): it is a point, and the text it is in goes on, along
+    the line it is set in (a layout program that sets each letter of a turned
+    line by itself ends the line so).
 
 The expected text is made here from that rule, and --verify compares it with
 pdftotext's, line by line, word by word: the files in KNOWN_DIFFERENT differ on
@@ -143,7 +147,94 @@ case('gap_turned_uniform', 'text', doc(rot % (W + 0.2 * SIZE, W + 0.2 * SIZE, W 
 case('gap_two_lines', 'text', doc(gaps_line('ABCD', [0.2] * 3, 700) + gaps_line('EFGH', [0.0, 0.3, 0.0], 680)),
      txt('ABCD\nEF GH'))
 
-KNOWN_DIFFERENT = ('gap_words_012', 'gap_tj_words_120', 'gap_turned_uniform')
+# 7. a string that ends where it began (P522): the TJ number takes the glyph back as
+# far as it advanced (600 thousandths of the size is the width of a glyph here)
+def turn(a, b, c, d):
+    return 'BT /F 12 Tf %s %s %s %s 300 300 Tm ' % (a, b, c, d)
+
+
+ZL = '(A) Tj 7.2 0 Td (B) Tj 7.2 0 Td (C) Tj 7.2 0 Td [(D) 600] TJ ET\n'
+ZM = '(A) Tj 7.2 0 Td [(B) 600] TJ 7.2 0 Td (C) Tj 7.2 0 Td (D) Tj ET\n'
+ZG = '(A) Tj 7.2 0 Td [(B) 600] TJ 14.4 0 Td (C) Tj ET\n'
+case('gap_zero_last_turned_90', 'text', doc(turn(0, 1, -1, 0) + ZL), txt('ABCD'))
+case('gap_zero_last_turned_270', 'text', doc(turn(0, -1, 1, 0) + ZL), txt('ABCD'))
+case('gap_zero_last_tilted', 'text', doc(turn(0.7071, 0.7071, -0.7071, 0.7071) + ZL), txt('ABCD'), cmp=False)
+case('gap_zero_mid_turned_90', 'text', doc(turn(0, 1, -1, 0) + ZM), txt('ABCD'))
+case('gap_zero_mid_turned_270', 'text', doc(turn(0, -1, 1, 0) + ZM), txt('ABCD'))
+case('gap_zero_gap_turned_90', 'text', doc(turn(0, 1, -1, 0) + ZG), txt('AB C'))
+case('gap_zero_gap_turned_270', 'text', doc(turn(0, -1, 1, 0) + ZG), txt('AB C'))
+case('gap_zero_alone_turned', 'text', doc(turn(0, 1, -1, 0) + '[(A) 600] TJ ET\n'), txt('A'))
+case('gap_zero_mid_horizontal', 'text', doc('BT /F 12 Tf 72 700 Td ' + ZM), txt('ABCD'))
+case('gap_zero_gap_horizontal', 'text', doc('BT /F 12 Tf 72 700 Td ' + ZG), txt('AB C'))
+
+# a glyph with no width (the Widths array says 0 for Z) is a point as well: the direction
+# the text is set in says which way the line goes, and the next string is not set apart
+def doc0(content):
+    p = G.Pdf()
+    ws = ' '.join(['0' if c == ord('Z') else '600' for c in range(32, 256)])
+    f = p.add('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding /FirstChar 32 /LastChar 255 /Widths [%s] >>' % ws)
+    p, root = G.one_page(content, {'F': f}, p=p)
+    return p.build(root)
+
+
+ZW = '(A) Tj 7.2 0 Td (B) Tj 7.2 0 Td (C) Tj 7.2 0 Td (Z) Tj ET\n'
+ZX = '(A) Tj 7.2 0 Td (B) Tj 7.2 0 Td (Z) Tj 0 0 Td (C) Tj 7.2 0 Td (D) Tj ET\n'
+case('gap_nowidth_last_turned_90', 'text', doc0(turn(0, 1, -1, 0) + ZW), txt('ABCZ'))
+case('gap_nowidth_last_turned_270', 'text', doc0(turn(0, -1, 1, 0) + ZW), txt('ABCZ'))
+case('gap_nowidth_mid_turned_90', 'text', doc0(turn(0, 1, -1, 0) + ZX), txt('ABZCD'))
+case('gap_nowidth_mid_turned_270', 'text', doc0(turn(0, -1, 1, 0) + ZX), txt('ABZCD'))
+case('gap_nowidth_mid_horizontal', 'text', doc0('BT /F 12 Tf 72 700 Td ' + ZX), txt('ABZCD'))
+# a point followed by a string set apart from it: the gap is measured along the line
+ZY = '(A) Tj 7.2 0 Td (Z) Tj 7.2 0 Td (C) Tj ET\n'
+case('gap_nowidth_gap_turned_90', 'text', doc0(turn(0, 1, -1, 0) + ZY), txt('AZ C'))
+case('gap_nowidth_gap_turned_270', 'text', doc0(turn(0, -1, 1, 0) + ZY), txt('AZ C'))
+case('gap_nowidth_gap_horizontal', 'text', doc0('BT /F 12 Tf 72 700 Td ' + ZY), txt('AZ C'))
+
+# the footer of a contract template, as a layout program (QuarkXPress 8.5) wrote it, turned
+# a quarter: every glyph is a TJ array with its own number and a Td from the start of the
+# line before, the last one 's' taken back by its whole width. The operators and the widths
+# are the program's, the text a telephone number and a web address (given by the portal,
+# 2026-10-31); the codes are read by the Differences array of the font.
+URL_CODES = [0x17, 0x28, 0x1f, 0x29, 0x23, 0, 0x1f, 0x28, 0, 0x0e, 7, 7, 0, 13, 11, 0, 11, 8, 0, 9, 10, 0, 0, 0, 0x33, 0, 0, 0, 0x2b, 0x2a, 0x2b, 5, 0x23, 0x2f]
+URL_TD = [0.48787, 0.26497, 0.50691, 0.80697, 0.53987, 0.26802, 0.50691, 0.26497, 0.26802, 0.58187, 0.58187, 0.58187, 0.26802,
+          0.58187, 0.58187, 0.26802, 0.58187, 0.53182, 0.26802, 0.58187, 0.58187, 0.26802, 0.26802, 0.26802, 0.27498, 0.26802,
+          0.26802, 0.26802, 0.55794, 0.54891, 0.55794, 0.2679, 0.53987]
+URL_W = [260, 360, 509, 278, 442, 286, 402, 600, 550, 600, 600, 600, 600, 600, 600, 318, 666, 583, 644, 672, 540, 658, 281, 506,
+         664, 700, 578, 589, 534, 651, 646, 525, 573, 537, 573, 558, 352, 569, 300, 283, 283, 825, 567, 576, 576, 573, 378, 445,
+         381, 567, 513, 293, 525, 558, 292, 576, 567, 360]
+URL_NAMES = ('space parenright asterisk comma hyphen period slash zero one two three five six eight nine colon A B C D E H I L N O P '
+             'R S U V a b c d e f g i j l m n o p q r s t u v bar aacute eacute iacute oacute uacute parenleft').split()
+URL_CHAR = {'space': ' ', 'period': '.', 'bar': '|', 'zero': '0', 'one': '1', 'two': '2', 'three': '3', 'five': '5', 'six': '6',
+            'eight': '8', 'nine': '9'}
+assert len(URL_W) == 58 and len(URL_NAMES) == 58 and len(URL_CODES) == len(URL_TD) + 1
+
+
+def url_line():
+    ops = 'BT\n/F1 1 Tf\n0 12.646 -12.646 0 591.4733 342.133 Tm\n1 scn\n'
+    for i, c in enumerate(URL_CODES):
+        last = i == len(URL_CODES) - 1
+        adj = 445 if last else (-8 if c == 0 else 18)
+        ops += '[<%02x>%d]TJ\n' % (c, adj)
+        if not last:
+            ops += '%s 0 TD\n' % URL_TD[i]
+    ops += 'ET\n'
+    p = G.Pdf()
+    f = p.add('<< /Type /Font /Subtype /Type1 /BaseFont /YHWCLH+Depot-Bold /FirstChar 0 /LastChar 57 /Widths [%s] '
+              '/FontDescriptor << /Type /FontDescriptor /FontName /YHWCLH+Depot-Bold /Flags 262178 /Ascent 686 /Descent -209 '
+              '/CapHeight 686 /StemV 145 /FontBBox [-101 -215 1237 991] >> '
+              '/Encoding << /Type /Encoding /BaseEncoding /MacRomanEncoding /Differences [0 %s] >> >>'
+              % (' '.join(map(str, URL_W)), ' '.join('/' + n for n in URL_NAMES)))
+    p, root = G.one_page(ops, {'F1': f}, mediabox='[0 0 623.62 870.24]', p=p)
+    text = ''.join(URL_CHAR.get(URL_NAMES[c], URL_NAMES[c]) for c in URL_CODES)
+    return p.build(root), text
+
+
+url_pdf, url_text = url_line()
+assert url_text == 'Llame al 900 85 51 23   |   ono.es', url_text
+case('gap_zero_url_footer', 'text', url_pdf, txt(url_text))
+
+# gap_zero_last_tilted: pdftotext puts a space in a line turned 45 degrees (AB CD) where the glyphs touch
+KNOWN_DIFFERENT = ('gap_words_012', 'gap_tj_words_120', 'gap_turned_uniform', 'gap_zero_last_tilted')
 
 
 def write_corpus():

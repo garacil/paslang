@@ -158,6 +158,11 @@ type
     FS: Double;
     { how many glyphs it shows (P518) }
     Glyphs: Integer;
+    { the way the text is set, in device space (the x axis of the text space, the
+      y axis down in a font set vertically): what a run with no length is told
+      by (P522) }
+    DX: Double;
+    DY: Double;
     Text: string;
   end;
 
@@ -4216,6 +4221,8 @@ type
     RunOpen: Boolean;
     RunsFull: Boolean;
     RunX0, RunY0, RunFS: Double;
+    { where the last glyph of the run ends, and the way its text goes (P522) }
+    RunX1, RunY1, RunDX, RunDY: Double;
     { the strings shown on the page so far, for a string drawn twice in one
       place (P514): where each starts, its size, font and bytes, in a hash of
       the cell it falls in }
@@ -4605,7 +4612,6 @@ end;
 
 procedure TPdfExtractor.EndRun;
 var
-  m: TPdfMat;
   r: TPdfRun;
 begin
   if not RunOpen then
@@ -4618,16 +4624,17 @@ begin
     SBGap := False;
     Exit;
   end;
-  m := MatMul(Tm, GS.Ctm);
   r.X0 := RunX0;
   r.Y0 := RunY0;
-  r.X1 := m.E - GS.Ts * m.C;
-  r.Y1 := m.F - GS.Ts * m.D;
-  { the rise moves the baseline along the font's up }
-  r.X1 := m.E + GS.Ts * m.C;
-  r.Y1 := m.F + GS.Ts * m.D;
+  { a run ends where its last glyph does: the number that follows the last
+    string of a TJ array moves the pen on (or back) and is not part of the
+    run, or a glyph taken back as far as it advanced was a point (P522) }
+  r.X1 := RunX1;
+  r.Y1 := RunY1;
   r.FS := RunFS;
   r.Glyphs := RunGlyphs;
+  r.DX := RunDX;
+  r.DY := RunDY;
   RunGlyphs := 0;
   SBSpace := False;
   SBGap := False;
@@ -4664,6 +4671,20 @@ begin
     RunOpen := True;
     RunX0 := m.E + GS.Ts * m.C;
     RunY0 := m.F + GS.Ts * m.D;
+    RunX1 := RunX0;
+    RunY1 := RunY0;
+    { the glyphs go along the x axis of the text space, down the y axis in a
+      font set vertically (P522) }
+    if GS.Font.Vertical then
+    begin
+      RunDX := -m.C;
+      RunDY := -m.D;
+    end
+    else
+    begin
+      RunDX := m.A;
+      RunDY := m.B;
+    end;
     RunFS := Abs(GS.Tfs) * Sqrt(m.C * m.C + m.D * m.D);
     if RunFS < 0.001 then
       RunFS := Abs(GS.Tfs) * Sqrt(m.A * m.A + m.B * m.B);
@@ -4739,6 +4760,10 @@ begin
       Tm := MatMul(MatTrans(adv, 0), Tm);
     end;
   end;
+  { the baseline moves along the font's up by the rise }
+  m := MatMul(Tm, GS.Ctm);
+  RunX1 := m.E + GS.Ts * m.C;
+  RunY1 := m.F + GS.Ts * m.D;
 end;
 
 { a marked-content sequence begins (BMC, BDC): a Span with ActualText (14.9.4)
@@ -5818,6 +5843,8 @@ begin
   r.Y1 := Y;
   r.FS := FS;
   r.Glyphs := Glyphs;
+  r.DX := 1;
+  r.DY := 0;
   r.Text := Text;
   PutRun(r);
 end;
@@ -6000,6 +6027,30 @@ end;
 
 { ---- from runs to text ---- }
 
+{ a run that goes less than a hundredth of its size says nothing by its two ends:
+  a glyph the TJ array after it takes back as far as it advanced (a layout program
+  that sets each letter by itself ends a line so) is a point, and the direction of
+  the text tells which way the line goes (P522) }
+function RunNoLength(const R: TPdfRun): Boolean;
+var
+  lim: Double;
+begin
+  lim := 0.01 * R.FS;
+  if lim < 0.0001 then
+    lim := 0.0001;
+  Result := Abs(R.X1 - R.X0) + Abs(R.Y1 - R.Y0) < lim;
+end;
+
+{ the run goes along the page: its ends rise or fall by less than a fifth of what
+  they go across, or the text is set that way when they say nothing }
+function RunHorizontal(const R: TPdfRun): Boolean;
+begin
+  if RunNoLength(R) then
+    Result := Abs(R.DY) <= 0.2 * Abs(R.DX) + 0.0001
+  else
+    Result := Abs(R.Y1 - R.Y0) <= 0.2 * Abs(R.X1 - R.X0) + 0.0001;
+end;
+
 { the text of the runs in the order they were shown }
 function RenderRaw(var L: TPdfRunList): string;
 var
@@ -6021,6 +6072,12 @@ begin
         dx := p.X1 - p.X0;
         dy := p.Y1 - p.Y0;
         len := Sqrt(dx * dx + dy * dy);
+        if RunNoLength(p) then
+        begin
+          dx := p.DX;
+          dy := p.DY;
+          len := Sqrt(dx * dx + dy * dy);
+        end;
         if len < 0.0001 then
         begin
           dx := 1;
@@ -6084,7 +6141,7 @@ begin
   for i := 0 to n - 1 do
   begin
     r := L.Items[i];
-    if Abs(r.Y1 - r.Y0) <= 0.2 * Abs(r.X1 - r.X0) + 0.0001 then
+    if RunHorizontal(r) then
     begin
       hidx[nh] := i;
       nh := nh + 1;
