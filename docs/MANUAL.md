@@ -7775,7 +7775,7 @@ program takes their names.
 | `HmacMd5(key, msg)`, `HmacSha1`, `HmacSha224`, `HmacSha256`, `HmacSha384`, `HmacSha512` | HMAC, RFC 2104, over that hash | as long as its hash | two strings | as its hash | authenticating a message with a shared secret |
 | `Crc32(s)`, `Crc32(s, sofar)` | CRC-32 of IEEE 802.3, polynomial `$EDB88320` reflected; zlib, gzip, PNG | 0 to 2³²-1 | a string, the value so far | PCLMULQDQ folding from 64 bytes (`pclmul` and `sse41`); FEAT_CRC32 | detecting errors; the formats that use it |
 | `Crc32c(s)`, `Crc32c(s, sofar)` | CRC-32C of Castagnoli, RFC 3720, polynomial `$82F63B78` reflected; iSCSI, ext4, the store's log | 0 to 2³²-1 | the same | SSE4.2 `crc32`, three chains at once (`sse42`); FEAT_CRC32 | detecting errors, fastest of the checksums (33 GB/s on a Ryzen 9 5950X) |
-| `Adler32(s)`, `Adler32(s, sofar)` | Adler-32, RFC 1950 | 0 to 2³²-1 | the same, from 1 | the Pascal loop | zlib streams |
+| `Adler32(s)`, `Adler32(s, sofar)` | Adler-32, RFC 1950 | 0 to 2³²-1 | the same, from 1 | eight bytes a step in 64-bit lanes, no instruction set (1.2.347) | zlib streams |
 | `Fnv1a32(s)`, `Fnv1a64(s)` | FNV-1a, 32 and 64 bits | an `Integer`, all its bits | a string | the Pascal loop | small tables, short keys, no seed |
 | `Murmur3(s)`, `Murmur3(s, seed)` | MurmurHash3, x86 variant, 32 bits | 0 to 2³²-1 | a string, a seed | the Pascal rounds | hashing that other systems must reproduce |
 | `SipHash(s, k0, k1)` | SipHash-2-4, a 128-bit key in two words | 64 bits in an `Integer` | a string, the key | the Pascal rounds | hash tables that an attacker must not flood |

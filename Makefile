@@ -156,6 +156,8 @@ GOLDEN += flatelen
 GOLDEN_A64 += flatelen
 GOLDEN += dloop
 GOLDEN_A64 += dloop
+GOLDEN += adler
+GOLDEN_A64 += adler
 GOLDEN += syshelpers sysguid
 GOLDEN_A64 += syshelpers sysguid
 GOLDEN += sysfamilies
@@ -2982,6 +2984,13 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	sed -n '/^p_noloop:/,/cfi_endproc/p' $(BUILDDIR)/dloop_s.s > $(BUILDDIR)/dloop_n.s; \
 	test $$(grep -c 'pushq %rbp' $(BUILDDIR)/dloop_n.s) -eq 0; \
 	echo ok dloop
+	@set -e; \
+	: P532: Adler-32 takes eight bytes a step with the sums of 64 bits and one modulo a mebibyte, testdata/adler is what scripts/gen_adler.py writes and its expected output is zlib.adler32 of the same data, the linked routine holds the multiplication that adds the four lanes; \
+	python3 -I scripts/gen_adler.py --check; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/adler testdata/adler.paslang; \
+	$(BUILDDIR)/adler | diff -u testdata/adler.out -; \
+	objdump -d --no-show-raw-insn $(BUILDDIR)/adler | awk '/<p_pashash_pasadler32>:/,/ret/' | grep -q 'movabs \$$0x1000100010001'; \
+	echo ok adler
 	@set -e; \
 	: the kept scripts of testdata/sqllogic are what scripts/gen_sqllogic.py writes while the system SQLite is the one that made them, P412; \
 	python3 -I scripts/gen_sqllogic.py --check
