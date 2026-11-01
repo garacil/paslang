@@ -154,6 +154,8 @@ GOLDEN += regs
 GOLDEN_A64 += regs
 GOLDEN += flatelen
 GOLDEN_A64 += flatelen
+GOLDEN += dloop
+GOLDEN_A64 += dloop
 GOLDEN += syshelpers sysguid
 GOLDEN_A64 += syshelpers sysguid
 GOLDEN += sysfamilies
@@ -2967,6 +2969,19 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/flatelen_s testdata/flatelen.paslang; \
 	$(BUILDDIR)/flatelen_s | cmp - testdata/flatelen.out; \
 	echo ok flatelen
+	@set -e; \
+	: P531: a small routine with a Double a loop works on has a frame and the Double in an xmm register and no move between it and a general one, one without a loop keeps its frame off, testdata/dloop is what scripts/gen_dloop.py writes; \
+	python3 -I scripts/gen_dloop.py --check; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/dloop_s testdata/dloop.paslang; \
+	for r in hornerplain hornerfma resultloop sumloop doublecount; do \
+	  sed -n "/^p_$$r:/,/cfi_endproc/p" $(BUILDDIR)/dloop_s.s > $(BUILDDIR)/dloop_r.s; \
+	  test $$(grep -c 'movq %r[a-z0-9]*, %xmm' $(BUILDDIR)/dloop_r.s) -eq 0; \
+	  test $$(grep -c 'movq %xmm[0-9]*, %r' $(BUILDDIR)/dloop_r.s) -eq 0; \
+	  grep -q 'pushq %rbp' $(BUILDDIR)/dloop_r.s; \
+	done; \
+	sed -n '/^p_noloop:/,/cfi_endproc/p' $(BUILDDIR)/dloop_s.s > $(BUILDDIR)/dloop_n.s; \
+	test $$(grep -c 'pushq %rbp' $(BUILDDIR)/dloop_n.s) -eq 0; \
+	echo ok dloop
 	@set -e; \
 	: the kept scripts of testdata/sqllogic are what scripts/gen_sqllogic.py writes while the system SQLite is the one that made them, P412; \
 	python3 -I scripts/gen_sqllogic.py --check
