@@ -1198,7 +1198,8 @@ type
     procedure WordLoad(const M: string; T: LongInt; const R: string);
     procedure WordStore(const M: string; Sz: LongInt; const R: string);
     function DivConstOK(E: PExpr): Boolean;
-    procedure EmitDivConst(const X, Dst: string; C: Int64; IsMod: Boolean);
+    function DivHi(E: PExpr): Int64;
+    procedure EmitDivConst(const X, Dst: string; C: Int64; IsMod: Boolean; Hi: Int64);
     function DivOut(E: PExpr; D: LongInt): string;
     function DivInRax(E: PExpr): Boolean;
     function QuietOp(E: PExpr): Boolean;
@@ -28533,7 +28534,7 @@ else if (E^.Name = 'rt_high') and LenPlace(E^.Args[0]) then
           else if DivConstOK(E) then
           begin
             EmitExpr(E^.L);
-            EmitDivConst('x0', 'x0', E^.R^.Num, E^.Bin = boMod);
+            EmitDivConst('x0', 'x0', E^.R^.Num, E^.Bin = boMod, DivHi(E));
           end
           else
           begin
@@ -29612,7 +29613,7 @@ else if (E^.Name = 'rt_high') and LenPlace(E^.Args[0]) then
         else if DivConstOK(E) then
         begin
           EmitExpr(E^.L);
-          EmitDivConst('%rax', '%rax', E^.R^.Num, E^.Bin = boMod);
+          EmitDivConst('%rax', '%rax', E^.R^.Num, E^.Bin = boMod, DivHi(E));
         end
         else
         begin
@@ -35591,7 +35592,7 @@ begin
       end;
     boDiv, boMod:
       if DivConstOK(E) then
-        EmitDivConst(r, '%' + DivOut(E, D), E^.R^.Num, E^.Bin = boMod)
+        EmitDivConst(r, '%' + DivOut(E, D), E^.R^.Num, E^.Bin = boMod, DivHi(E))
       else
       begin
         op := OrdOperand(E^.R, D);
@@ -35711,7 +35712,7 @@ begin
       end;
     boDiv, boMod:
       if DivConstOK(E) then
-        EmitDivConst(r, DivOut(E, D), E^.R^.Num, E^.Bin = boMod)
+        EmitDivConst(r, DivOut(E, D), E^.R^.Num, E^.Bin = boMod, DivHi(E))
       else
       begin
         { the check, sdiv and msub on the operands' own registers, as
@@ -35832,6 +35833,49 @@ begin
   Sh := s;
 end;
 
+{ x div C for 0 <= x <= Hi as one multiplication and a shift (P536, the
+  unsigned form Go's rules give a uint32: divmod.rules, magic.go): with
+  M = ceil(2^K / C) and E = M * C - 2^K, floor(x * M / 2^K) is x div C for
+  every x with x * E < 2^K, and the product fits a signed word when
+  x * M < 2^63. The least K that holds for Hi gives the least M. False
+  when no K up to 62 does (a power of two is shifted, not asked). }
+function SmallMagic(C, Hi: Int64; out M: Int64; out K: LongInt): Boolean;
+var
+  e: Int64;
+  b, j: LongInt;
+begin
+  Result := False;
+  M := 0;
+  K := 0;
+  b := 0;
+  while (b < 62) and ((Int64(1) shl b) < C) do
+    Inc(b);
+  for j := b to 62 do
+  begin
+    M := ((Int64(1) shl j) - 1) div C + 1;
+    e := M * C - (Int64(1) shl j);
+    if e = 0 then
+      Continue;
+    if (Hi <= ((Int64(1) shl j) - 1) div e) and (Hi <= High(Int64) div M) then
+    begin
+      K := j;
+      Result := True;
+      Exit;
+    end;
+  end;
+end;
+
+{ The dividend of a division or modulo lies in 0..result, as IntRange
+  proves, or -1 when it may be negative or is not bounded. }
+function TEmitter.DivHi(E: PExpr): Int64;
+var
+  lo, hi: Int64;
+begin
+  Result := -1;
+  if (E <> nil) and (E^.L <> nil) and IntRange(E^.L, lo, hi) and (lo >= 0) then
+    Result := hi;
+end;
+
 function TEmitter.DivConstOK(E: PExpr): Boolean;
 begin
   Result := (E <> nil) and (E^.Kind = ekBin) and
@@ -35842,7 +35886,7 @@ end;
 
 { X (a register, '%rsi' or 'x9' style, rax or x0 allowed) := X div C or
   X mod C, for C >= 1. amd64 uses rax, rcx and rdx; arm64 x16 and x17. }
-procedure TEmitter.EmitDivConst(const X, Dst: string; C: Int64; IsMod: Boolean);
+procedure TEmitter.EmitDivConst(const X, Dst: string; C: Int64; IsMod: Boolean; Hi: Int64);
 var
   k, sh, f, i, o: LongInt;
   m: Int64;
@@ -35858,6 +35902,33 @@ begin
       else if Dst <> X then
         Line('  mov ' + Dst + ', ' + X);
       Exit;
+    end;
+    { a dividend IntRange proves not negative (P536): a shift or a mask
+      for a power of two, otherwise one multiplication and a shift when a
+      magic number holds for its range }
+    if Hi >= 0 then
+    begin
+      if k > 0 then
+      begin
+        if IsMod then
+          Line('  and ' + Dst + ', ' + X + ', #' + HexWord((Int64(1) shl k) - 1))
+        else
+          Line('  lsr ' + Dst + ', ' + X + ', #' + IntToStr(k));
+        Exit;
+      end;
+      if SmallMagic(C, Hi, m, sh) then
+      begin
+        Imm('x17', m);
+        Line('  mul x16, ' + X + ', x17');
+        if IsMod then
+        begin
+          Line('  lsr x16, x16, #' + IntToStr(sh));
+          ScaleSubArm(Dst, X, 'x16', C, 'x17');
+        end
+        else
+          Line('  lsr ' + Dst + ', x16, #' + IntToStr(sh));
+        Exit;
+      end;
     end;
     { the last step writes Dst, where a mov from x16 followed (P356) }
     if k > 0 then
@@ -35901,11 +35972,14 @@ begin
     end;
     if IsMod then
     begin
-      Line('  sub x16, x16, ' + X + ', asr #63');
+      if Hi < 0 then
+        Line('  sub x16, x16, ' + X + ', asr #63');
       ScaleSubArm(Dst, X, 'x16', C, 'x17');
     end
+    else if Hi < 0 then
+      Line('  sub ' + Dst + ', x16, ' + X + ', asr #63')
     else
-      Line('  sub ' + Dst + ', x16, ' + X + ', asr #63');
+      Line('  mov ' + Dst + ', x16');
     Exit;
   end;
   if C = 1 then
@@ -35915,6 +35989,68 @@ begin
     else if Dst <> X then
       Line('  movq ' + X + ', ' + Dst);
     Exit;
+  end;
+  { a dividend IntRange proves not negative (P536): a shift or a mask for
+    a power of two, otherwise one multiplication and a shift when a magic
+    number holds for its range, in rdx }
+  if Hi >= 0 then
+  begin
+    if k > 0 then
+    begin
+      if X <> Dst then
+        Line('  movq ' + X + ', ' + Dst);
+      if not IsMod then
+        Line('  shrq $' + IntToStr(k) + ', ' + Dst)
+      else if k <= 31 then
+        Line('  andq $' + IntToStr((Int64(1) shl k) - 1) + ', ' + Dst)
+      else
+      begin
+        { a scratch that is neither the dividend nor the destination: the
+          destination may be rdx, where the third argument of a call is
+          built }
+        src := '%rdx';
+        if (X = src) or (Dst = src) then
+          src := '%rcx';
+        if (X = src) or (Dst = src) then
+          src := '%rax';
+        Line('  movabsq $' + IntToStr((Int64(1) shl k) - 1) + ', ' + src);
+        Line('  andq ' + src + ', ' + Dst);
+      end;
+      Exit;
+    end;
+    if SmallMagic(C, Hi, m, sh) then
+    begin
+      src := X;
+      if IsMod and (X = '%rax') then
+      begin
+        Line('  movq %rax, %rcx');
+        src := '%rcx';
+      end;
+      if Fits32(m) then
+        Line('  imulq $' + IntToStr(m) + ', ' + src + ', %rdx')
+      else
+      begin
+        Line('  movabsq $' + IntToStr(m) + ', %rdx');
+        Line('  imulq ' + src + ', %rdx');
+      end;
+      Line('  shrq $' + IntToStr(sh) + ', %rdx');
+      if not IsMod then
+      begin
+        Line('  movq %rdx, ' + Dst);
+        Exit;
+      end;
+      if Fits32(C) or MulRecipe(C, f, i, o) then
+        ScaleTo('%rdx', '%rdx', C, '%rax')
+      else
+      begin
+        Line('  movabsq $' + IntToStr(C) + ', %rax');
+        Line('  imulq %rax, %rdx');
+      end;
+      Line('  subq %rdx, ' + src);
+      if src <> Dst then
+        Line('  movq ' + src + ', ' + Dst);
+      Exit;
+    end;
   end;
   { the dividend read where it is, rcx for rax alone, which imulq takes
     (P356) }
@@ -35968,9 +36104,12 @@ begin
     if sh > 0 then
       Line('  sarq $' + IntToStr(sh) + ', %rdx');
   end;
-  Line('  movq ' + src + ', %rax');
-  Line('  sarq $63, %rax');
-  Line('  subq %rax, %rdx');
+  if Hi < 0 then
+  begin
+    Line('  movq ' + src + ', %rax');
+    Line('  sarq $63, %rax');
+    Line('  subq %rax, %rdx');
+  end;
   if IsMod then
   begin
     { x - q * C with q * C the recipe ScaleTo gives it where that costs

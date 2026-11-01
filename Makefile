@@ -162,6 +162,8 @@ GOLDEN += civil
 GOLDEN_A64 += civil
 GOLDEN += outw
 GOLDEN_A64 += outw
+GOLDEN += divnn
+GOLDEN_A64 += divnn
 GOLDEN += syshelpers sysguid
 GOLDEN_A64 += syshelpers sysguid
 GOLDEN += sysfamilies
@@ -3017,6 +3019,26 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  test $$(grep -c 'pushq %rax\|popq %rcx' $(BUILDDIR)/outw_r.s) -eq 0 || { echo "loop$$t writes through the stack"; exit 1; }; \
 	done; \
 	echo ok outw
+	@set -e; \
+	: P536: a division or modulo by a constant of a value that cannot be negative is a shift or a mask or one multiplication and a shift with no sign correction, testdata/divnn is what scripts/gen_divnn.py writes and its expected output is worked out by Python integers; \
+	python3 -I scripts/gen_divnn.py --check; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/divnn_s testdata/divnn.paslang; \
+	$(BUILDDIR)/divnn_s | diff -u testdata/divnn.out -; \
+	for r in dsmall rsmall dpow rpow dwide rwide dbyte; do \
+	  sed -n "/^p_$$r:/,/cfi_endproc/p" $(BUILDDIR)/divnn_s.s > $(BUILDDIR)/divnn_r.s; \
+	  test -s $(BUILDDIR)/divnn_r.s; \
+	  test $$(grep -c 'sarq $$63' $(BUILDDIR)/divnn_r.s) -eq 0 || { echo "$$r keeps the sign correction"; exit 1; }; \
+	done; \
+	for r in dneg rneg; do \
+	  sed -n "/^p_$$r:/,/cfi_endproc/p" $(BUILDDIR)/divnn_s.s > $(BUILDDIR)/divnn_r.s; \
+	  test $$(grep -c 'sarq $$63' $(BUILDDIR)/divnn_r.s) -ge 1 || { echo "$$r lost its sign correction"; exit 1; }; \
+	done; \
+	sed -n '/^p_dsmall:/,/cfi_endproc/p' $(BUILDDIR)/divnn_s.s > $(BUILDDIR)/divnn_r.s; \
+	test $$(grep -c 'imulq' $(BUILDDIR)/divnn_r.s) -eq 1; \
+	test $$(grep -c 'sarq' $(BUILDDIR)/divnn_r.s) -eq 0; \
+	sed -n '/^p_dpow:/,/cfi_endproc/p' $(BUILDDIR)/divnn_s.s > $(BUILDDIR)/divnn_r.s; \
+	test $$(grep -c 'imulq' $(BUILDDIR)/divnn_r.s) -eq 0; \
+	echo ok divnn
 	@set -e; \
 	: the kept scripts of testdata/sqllogic are what scripts/gen_sqllogic.py writes while the system SQLite is the one that made them, P412; \
 	python3 -I scripts/gen_sqllogic.py --check
