@@ -152,6 +152,8 @@ GOLDEN += slots
 GOLDEN_A64 += slots
 GOLDEN += regs
 GOLDEN_A64 += regs
+GOLDEN += flatelen
+GOLDEN_A64 += flatelen
 GOLDEN += syshelpers sysguid
 GOLDEN_A64 += syshelpers sysguid
 GOLDEN += sysfamilies
@@ -2959,6 +2961,12 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	sed -n '/^p_selloop:/,/cfi_endproc/p' $(BUILDDIR)/regs_s.s > $(BUILDDIR)/regs_c.s; \
 	test $$(grep -c cmov $(BUILDDIR)/regs_c.s) -ge 2; \
 	echo ok regs
+	@set -e; \
+	: P530: the Huffman codes of the deflater are whole for every table of frequencies, within their limit and with a length for each symbol, testdata/flatelen is what scripts/gen_flatelen.py writes; \
+	python3 -I scripts/gen_flatelen.py --check; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/flatelen_s testdata/flatelen.paslang; \
+	$(BUILDDIR)/flatelen_s | cmp - testdata/flatelen.out; \
+	echo ok flatelen
 	@set -e; \
 	: the kept scripts of testdata/sqllogic are what scripts/gen_sqllogic.py writes while the system SQLite is the one that made them, P412; \
 	python3 -I scripts/gen_sqllogic.py --check
