@@ -146,6 +146,8 @@ GOLDEN += ult
 GOLDEN_A64 += ult
 GOLDEN += carry
 GOLDEN_A64 += carry
+GOLDEN += funnel
+GOLDEN_A64 += funnel
 GOLDEN += syshelpers sysguid
 GOLDEN_A64 += syshelpers sysguid
 GOLDEN += sysfamilies
@@ -2897,6 +2899,42 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	test $$(grep -c 'str x0, .sp, #-16' $(BUILDDIR)/carry_ad.s) -eq 0; \
 	test $$(grep -c 'str x0, .sp, #-16' $(BUILDDIR)/carry_af.s) -eq 0; \
 	echo ok carry
+	@set -e; \
+	: P509: FunnelLeft and FunnelRight with operands the registers take are worked out without the stack, and a count the compiler proves to lie in 0 to 63 needs no test on both machines, testdata/funnel is what scripts/gen_funnel.py writes; \
+	python3 -I scripts/gen_funnel.py --check; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/funnel_s testdata/funnel.paslang; \
+	sed -n '/^p_s_safel:/,/cfi_endproc/p' $(BUILDDIR)/funnel_s.s > $(BUILDDIR)/funnel_l.s; \
+	grep -q 'shldq %cl, %rdx, %rax' $(BUILDDIR)/funnel_l.s; \
+	test $$(grep -c 'cmpq $$64, %rcx' $(BUILDDIR)/funnel_l.s) -eq 0; \
+	test $$(grep -c 'testq %rcx, %rcx' $(BUILDDIR)/funnel_l.s) -eq 0; \
+	test $$(grep -c 'pushq %rax' $(BUILDDIR)/funnel_l.s) -eq 0; \
+	sed -n '/^p_s_safer:/,/cfi_endproc/p' $(BUILDDIR)/funnel_s.s > $(BUILDDIR)/funnel_r.s; \
+	grep -q 'shrdq %cl, %rax, %rdx' $(BUILDDIR)/funnel_r.s; \
+	test $$(grep -c 'cmpq $$64, %rcx' $(BUILDDIR)/funnel_r.s) -eq 0; \
+	test $$(grep -c 'pushq %rax' $(BUILDDIR)/funnel_r.s) -eq 0; \
+	sed -n '/^p_s_widel:/,/cfi_endproc/p' $(BUILDDIR)/funnel_s.s > $(BUILDDIR)/funnel_w.s; \
+	grep -q 'cmpq $$64, %rcx' $(BUILDDIR)/funnel_w.s; \
+	sed -n '/^p_s_byter:/,/cfi_endproc/p' $(BUILDDIR)/funnel_s.s > $(BUILDDIR)/funnel_b.s; \
+	test $$(grep -c 'cmpq $$64, %rcx' $(BUILDDIR)/funnel_b.s) -eq 0; \
+	test $$(grep -c 'testq %rcx, %rcx' $(BUILDDIR)/funnel_b.s) -eq 0; \
+	sed -n '/^p_s_byteu:/,/cfi_endproc/p' $(BUILDDIR)/funnel_s.s > $(BUILDDIR)/funnel_u.s; \
+	grep -q 'cmpq $$64, %rcx' $(BUILDDIR)/funnel_u.s; \
+	$(OUTDIR)/paslangc -target arm64 -inline 0 -o $(BUILDDIR)/funnel_x testdata/funnel.paslang; \
+	sed -n '/^p_s_safel:/,/cfi_endproc/p' $(BUILDDIR)/funnel_x.s > $(BUILDDIR)/funnel_xl.s; \
+	grep -q 'mvn x10, x1' $(BUILDDIR)/funnel_xl.s; \
+	test $$(grep -c 'cmp x1, #64' $(BUILDDIR)/funnel_xl.s) -eq 0; \
+	test $$(grep -c 'str x0, .sp, #-16' $(BUILDDIR)/funnel_xl.s) -eq 0; \
+	sed -n '/^p_s_safer:/,/cfi_endproc/p' $(BUILDDIR)/funnel_x.s > $(BUILDDIR)/funnel_xr.s; \
+	grep -q 'mvn x10, x1' $(BUILDDIR)/funnel_xr.s; \
+	test $$(grep -c 'cmp x1, #64' $(BUILDDIR)/funnel_xr.s) -eq 0; \
+	sed -n '/^p_s_widel:/,/cfi_endproc/p' $(BUILDDIR)/funnel_x.s > $(BUILDDIR)/funnel_xw.s; \
+	grep -q 'cmp x1, #64' $(BUILDDIR)/funnel_xw.s; \
+	sed -n '/^p_s_byter:/,/cfi_endproc/p' $(BUILDDIR)/funnel_x.s > $(BUILDDIR)/funnel_xb.s; \
+	test $$(grep -c 'cmp x1, #64' $(BUILDDIR)/funnel_xb.s) -eq 0; \
+	test $$(grep -c 'cmp x1, #0' $(BUILDDIR)/funnel_xb.s) -eq 0; \
+	sed -n '/^p_s_byteu:/,/cfi_endproc/p' $(BUILDDIR)/funnel_x.s > $(BUILDDIR)/funnel_xu.s; \
+	grep -q 'cmp x1, #64' $(BUILDDIR)/funnel_xu.s; \
+	echo ok funnel
 	@set -e; \
 	: the kept scripts of testdata/sqllogic are what scripts/gen_sqllogic.py writes while the system SQLite is the one that made them, P412; \
 	python3 -I scripts/gen_sqllogic.py --check

@@ -1201,7 +1201,13 @@ RotateLeftThroughCarry(x)` is `btl` (Carry into the flag), `rclb $1` on
 the width is one turn the other way (`rcrq $1`); `ShiftLeftToCarry(x,
 3)` is two shifts and a `setc`; `FunnelLeft(hi, lo, 5)` one `shldq` or
 one `extr`. A count that varies adds a compare for 0 or less and one for
-past the width; through Carry, a division by the width + 1 only when the
+past the width, unless the compiler can show that it lies in 0 to 63
+(`n and 63`, `(n and 255) mod 64`, `n shr 58`, the counter of a `for` from
+0 to 63, a `Byte` masked by 63): `FunnelLeft(hi, lo, n and 63)` is then
+one `shldq %cl` (on arm64 two shifts, the complement of the count and an
+`orr`). The values of a funnel that are variables, constants or sums of
+them go to its registers from where they are, none pushed (1.2.342);
+through Carry, a division by the width + 1 only when the
 count is larger than the width. arm64 has no rotation through a flag: a
 ring of up to 33 bits is two shifts and an `orr` in one register, one of
 65 bits five instructions. An element, a field or `p^` turns in place

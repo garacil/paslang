@@ -690,6 +690,8 @@ type
     function EmitWideFn(E: PExpr): Boolean;
     function WideCarryOK(E: PExpr): Boolean;
     procedure WideCarryEmit(E: PExpr);
+    function FunnelPoolOK(E: PExpr): Boolean;
+    procedure FunnelLoad(E: PExpr; D: LongInt; const R: string);
     function OrdAssign0(S: PStmt): Boolean;
     function EmitInlineStmt(S: PStmt): Boolean;
     function EmitAtomicFn(E: PExpr): Boolean;
@@ -703,9 +705,9 @@ type
     procedure RingArm(N: LongInt; Kl: Int64);
     procedure RotArmK(Kind, N: LongInt; Cn: Int64);
     procedure RotArmV(Kind, N: LongInt);
-    procedure FunnelX86(Kind, N: LongInt; Known: Boolean; Cn: Int64);
+    procedure FunnelX86(Kind, N: LongInt; Known: Boolean; Cn: Int64; CntOk: Boolean);
     procedure RotZExtX86(const R: string; N: LongInt);
-    procedure FunnelArm(Kind, N: LongInt; Known: Boolean; Cn: Int64);
+    procedure FunnelArm(Kind, N: LongInt; Known: Boolean; Cn: Int64; CntOk: Boolean);
     procedure RotTail(T, N: LongInt);
     function EmitRotFn(E: PExpr): Boolean;
     function CarryReg: string;
@@ -24708,13 +24710,53 @@ begin
   Line(done + ':');
 end;
 
+{ FunnelLeft and FunnelRight whose operands the pool takes (P509): hi,
+  lo and a count that is not a constant are worked out in pool registers
+  0, 1 and 2 and none goes on the stack. EmitRotFn then moves each to the
+  register the funnel reads, FunnelLoad taking a constant or a word
+  variable from where it is. The pool is free wherever a general
+  expression is worked out. }
+function TEmitter.FunnelPoolOK(E: PExpr): Boolean;
+begin
+  Result := OrdSimple(E^.Args[0], 0) and OrdSimple(E^.Args[1], 1) and
+    ((E^.Args[2]^.Kind = ekInt) or OrdSimple(E^.Args[2], 2));
+end;
+
+procedure TEmitter.FunnelLoad(E: PExpr; D: LongInt; const R: string);
+var
+  s: TSym;
+begin
+  if E^.Kind = ekInt then
+    LoadImmR(R, E^.Num)
+  else if (E^.Kind = ekVar) and WordVar(E, s) then
+    LoadWordVar(s, R)
+  else if FArm then
+    Line('  mov ' + R + ', ' + OrdPool(D))
+  else
+    Line('  movq %' + OrdPool(D) + ', %' + R);
+end;
+
 { The funnels on amd64: hi in rax, lo in rdx, the count in rcx unless
-  Known (then Cn). }
-procedure TEmitter.FunnelX86(Kind, N: LongInt; Known: Boolean; Cn: Int64);
+  Known (then Cn). CntOk: the count is a register's and lies in 0..63
+  (IntRange), so shld and shrd, which take it modulo 64 and leave the
+  operand as it is for 0, are the whole of the work: no test for 0 or
+  less, none for 64 or more. }
+procedure TEmitter.FunnelX86(Kind, N: LongInt; Known: Boolean; Cn: Int64; CntOk: Boolean);
 var
   done, big, l1: string;
 begin
   done := Lab;
+  if CntOk and (N = 64) then
+  begin
+    if Kind = 20 then
+      Line('  shldq %cl, %rdx, %rax')
+    else
+    begin
+      Line('  shrdq %cl, %rax, %rdx');
+      Line('  movq %rdx, %rax');
+    end;
+    Exit;
+  end;
   if N = 64 then
   begin
     if Known then
@@ -24811,22 +24853,26 @@ begin
     end;
     Exit;
   end;
-  Line('  testq %rcx, %rcx');
-  if Kind = 20 then
-    Line('  jle ' + done)
-  else
+  if not CntOk then
   begin
-    l1 := Lab;
-    Line('  jg ' + l1);
-    Line('  movq %rdx, %rax');
-    Line('  jmp ' + done);
-    Line(l1 + ':');
+    Line('  testq %rcx, %rcx');
+    if Kind = 20 then
+      Line('  jle ' + done)
+    else
+    begin
+      l1 := Lab;
+      Line('  jg ' + l1);
+      Line('  movq %rdx, %rax');
+      Line('  jmp ' + done);
+      Line(l1 + ':');
+    end;
   end;
   RotZExtX86('rax', N);
   RotZExtX86('rdx', N);
   Line('  shlq $' + IntToStr(N) + ', %rax');
   Line('  orq %rdx, %rax');
-  Line('  xorl %edx, %edx');
+  if not CntOk then
+    Line('  xorl %edx, %edx');
   if Kind = 20 then
   begin
     Line('  shlq %cl, %rax');
@@ -24834,6 +24880,8 @@ begin
   end
   else
     Line('  shrq %cl, %rax');
+  if CntOk then
+    Exit;
   Line('  cmpq $64, %rcx');
   Line('  cmovaeq %rdx, %rax');
   Line(done + ':');
@@ -24850,12 +24898,34 @@ begin
 end;
 
 { The funnels on arm64: hi in x0, lo in x2, the count in x1 unless
-  Known. }
-procedure TEmitter.FunnelArm(Kind, N: LongInt; Known: Boolean; Cn: Int64);
+  Known. CntOk: the count lies in 0..63: the shifts take it modulo 64,
+  and a shift of lo by 64 - n, which is by 0 where n is 0, is made of
+  two (lo shr 1 by 63 - n, the complement of n modulo 64), so no test
+  for 0 or less and none for 64 or more. }
+procedure TEmitter.FunnelArm(Kind, N: LongInt; Known: Boolean; Cn: Int64; CntOk: Boolean);
 var
   done, big, l1: string;
 begin
   done := Lab;
+  if CntOk and (N = 64) then
+  begin
+    if Kind = 20 then
+    begin
+      Line('  lsl x0, x0, x1');
+      Line('  lsr x9, x2, #1');
+      Line('  mvn x10, x1');
+      Line('  lsr x9, x9, x10');
+    end
+    else
+    begin
+      Line('  lsr x9, x2, x1');
+      Line('  lsl x0, x0, #1');
+      Line('  mvn x10, x1');
+      Line('  lsl x0, x0, x10');
+    end;
+    Line('  orr x0, x0, x9');
+    Exit;
+  end;
   if N = 64 then
   begin
     if Known then
@@ -24946,16 +25016,19 @@ begin
     end;
     Exit;
   end;
-  Line('  cmp x1, #0');
-  if Kind = 20 then
-    Line('  b.le ' + done)
-  else
+  if not CntOk then
   begin
-    l1 := Lab;
-    Line('  b.gt ' + l1);
-    Line('  mov x0, x2');
-    Line('  b ' + done);
-    Line(l1 + ':');
+    Line('  cmp x1, #0');
+    if Kind = 20 then
+      Line('  b.le ' + done)
+    else
+    begin
+      l1 := Lab;
+      Line('  b.gt ' + l1);
+      Line('  mov x0, x2');
+      Line('  b ' + done);
+      Line(l1 + ':');
+    end;
   end;
   RotExtArm('x0', N, False);
   RotExtArm('x2', N, False);
@@ -24967,6 +25040,8 @@ begin
   end
   else
     Line('  lsr x0, x0, x1');
+  if CntOk then
+    Exit;
   Line('  cmp x1, #64');
   Line('  csel x0, x0, xzr, lo');
   Line(done + ':');
@@ -24999,10 +25074,11 @@ end;
 
 function TEmitter.EmitRotFn(E: PExpr): Boolean;
 var
-  kind, n: LongInt;
-  cn: Int64;
-  known: Boolean;
+  kind, n, ai: LongInt;
+  cn, rlo, rhi: Int64;
+  known, cntok: Boolean;
   c: PExpr;
+  vs: TSym;
 begin
   Result := False;
   if (E^.Name <> 'rt_rot') and (E^.Name <> 'rt_funnel') and (E^.Name <> 'rt_carry') and
@@ -25078,28 +25154,57 @@ begin
     n := LongInt(E^.Args[4]^.Num);
     known := c^.Kind = ekInt;
     cn := c^.Num;
-    if not known then
+    cntok := (not known) and IntRange(c, rlo, rhi) and (rlo >= 0) and (rhi <= 63);
+    if FunnelPoolOK(E) then
     begin
-      EmitExpr(c);
-      if FArm then PshK('x0', 0) else PushK('rax', 0);
-    end;
-    EmitExpr(E^.Args[1]);
-    if FArm then PshK('x0', 0) else PushK('rax', 0);
-    EmitExpr(E^.Args[0]);
-    if FArm then
-    begin
-      Ppop('x2');
-      if not known then
-        Ppop('x1');
-      FunnelArm(kind, n, known, cn);
+      { whatever is not a constant or a variable is worked out first,
+        since its steps may use rax, rcx and rdx }
+      for ai := 0 to 2 do
+        if not ((E^.Args[ai]^.Kind = ekInt) or
+          ((E^.Args[ai]^.Kind = ekVar) and WordVar(E^.Args[ai], vs))) then
+          EmitOrdTo(E^.Args[ai], ai);
+      if FArm then
+      begin
+        FunnelLoad(E^.Args[0], 0, 'x0');
+        FunnelLoad(E^.Args[1], 1, 'x2');
+        if not known then
+          FunnelLoad(c, 2, 'x1');
+      end
+      else
+      begin
+        FunnelLoad(E^.Args[0], 0, 'rax');
+        FunnelLoad(E^.Args[1], 1, 'rdx');
+        if not known then
+          FunnelLoad(c, 2, 'rcx');
+      end;
     end
     else
     begin
-      Line('  popq %rdx');
       if not known then
-        Line('  popq %rcx');
-      FunnelX86(kind, n, known, cn);
+      begin
+        EmitExpr(c);
+        if FArm then PshK('x0', 0) else PushK('rax', 0);
+      end;
+      EmitExpr(E^.Args[1]);
+      if FArm then PshK('x0', 0) else PushK('rax', 0);
+      EmitExpr(E^.Args[0]);
+      if FArm then
+      begin
+        Ppop('x2');
+        if not known then
+          Ppop('x1');
+      end
+      else
+      begin
+        Line('  popq %rdx');
+        if not known then
+          Line('  popq %rcx');
+      end;
     end;
+    if FArm then
+      FunnelArm(kind, n, known, cn, cntok)
+    else
+      FunnelX86(kind, n, known, cn, cntok);
     RotTail(E^.Typ, n);
     Exit;
   end;
