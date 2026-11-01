@@ -160,6 +160,8 @@ GOLDEN += adler
 GOLDEN_A64 += adler
 GOLDEN += civil
 GOLDEN_A64 += civil
+GOLDEN += outw
+GOLDEN_A64 += outw
 GOLDEN += syshelpers sysguid
 GOLDEN_A64 += syshelpers sysguid
 GOLDEN += sysfamilies
@@ -2999,6 +3001,22 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/civil testdata/civil.paslang; \
 	$(BUILDDIR)/civil | diff -u testdata/civil.out -; \
 	echo ok civil
+	@set -e; \
+	: P535: a write to a var or out parameter of a word type goes through the address its slot holds with no push and pop and no move through r11, testdata/outw is what scripts/gen_outw.py writes and its expected output is worked out by Python integers wrapped to each width; \
+	python3 -I scripts/gen_outw.py --check; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/outw_s testdata/outw.paslang; \
+	$(BUILDDIR)/outw_s | diff -u testdata/outw.out -; \
+	for t in byte int16 uint32 integer; do \
+	  for r in set inc two; do \
+	    sed -n "/^p_$$r$$t:/,/cfi_endproc/p" $(BUILDDIR)/outw_s.s > $(BUILDDIR)/outw_r.s; \
+	    test -s $(BUILDDIR)/outw_r.s; \
+	    test $$(grep -c 'pushq %rax\|popq %rcx\|r11\|movq %rsi, %rax' $(BUILDDIR)/outw_r.s) -eq 0 || { echo "$$r$$t writes through the stack, r11 or rax"; exit 1; }; \
+	  done; \
+	  sed -n "/^p_loop$$t:/,/cfi_endproc/p" $(BUILDDIR)/outw_s.s > $(BUILDDIR)/outw_r.s; \
+	  test -s $(BUILDDIR)/outw_r.s; \
+	  test $$(grep -c 'pushq %rax\|popq %rcx' $(BUILDDIR)/outw_r.s) -eq 0 || { echo "loop$$t writes through the stack"; exit 1; }; \
+	done; \
+	echo ok outw
 	@set -e; \
 	: the kept scripts of testdata/sqllogic are what scripts/gen_sqllogic.py writes while the system SQLite is the one that made them, P412; \
 	python3 -I scripts/gen_sqllogic.py --check
