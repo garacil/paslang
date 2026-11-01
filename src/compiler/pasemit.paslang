@@ -1167,6 +1167,9 @@ type
     procedure HidScanS(S: PStmt; var Ix: LongInt; LoopA: LongInt);
     function HidAddrE(E: PExpr; const N: string): Boolean;
     function HidAddrS(S: PStmt; const N: string): Boolean;
+    function RdiLent: Boolean;
+    function ShallowE(E: PExpr): Boolean;
+    function ShallowS(S: PStmt): Boolean;
     function LeafE(E: PExpr): Boolean;
     function LeafS(S: PStmt): Boolean;
     function ShareLocal(const Pr: TProc; I: SizeInt; Src: Boolean): Boolean;
@@ -7854,6 +7857,78 @@ begin
         HidAddrS(S^.Sels[i].Body, N);
 end;
 
+{ A variable of the region being emitted is kept in rdi (P230): the pool
+  is rsi alone. Read from the variables themselves, so that no flag can
+  outlive the region or reach a routine of another kind. }
+function TEmitter.RdiLent: Boolean;
+var
+  i: SizeInt;
+begin
+  Result := False;
+  for i := 0 to High(FPromo) do
+    if FPromo[i].Reg = 'rdi' then
+    begin
+      Result := True;
+      Exit;
+    end;
+end;
+
+{ P230: E is worked out in the pool's first register alone: a constant, a
+  variable, or an operation whose right side is a constant or a variable
+  (OrdLeaf), however deep its left, the way the pool does it (EmitOrdTo0
+  works the left out in register D and takes the right as an operand). }
+function TEmitter.ShallowE(E: PExpr): Boolean;
+begin
+  Result := False;
+  if E = nil then
+    Exit;
+  case E^.Kind of
+    ekInt, ekVar:
+      Result := True;
+    ekUn:
+      Result := ShallowE(E^.L);
+    ekBin:
+      Result := ShallowE(E^.L) and OrdLeaf(E^.R);
+  end;
+end;
+
+{ S, and everything in it, has expressions ShallowE takes: the statements
+  PureIntS takes, their conditions and bounds one compare of a shallow
+  left side and a leaf. }
+function TEmitter.ShallowS(S: PStmt): Boolean;
+var
+  i: SizeInt;
+  sx: TSym;
+  se: PExpr;
+begin
+  Result := True;
+  if S = nil then
+    Exit;
+  case S^.Kind of
+    skBlock:
+      for i := 0 to High(S^.Stmts) do
+        if not ShallowS(S^.Stmts[i]) then
+          Result := False;
+    skAssign:
+      Result := ShallowE(S^.E);
+    skIf:
+      begin
+        Result := ShallowE(S^.E) and ShallowS(S^.ThenSt) and ShallowS(S^.ElseSt);
+        { an if of single assignments may be a conditional move, which
+          works its values out in the pool's second register: a region
+          with one keeps the pool it has }
+        if Result and SelTarget(S^.ThenSt, sx, se) then
+          Result := False;
+      end;
+    skWhile, skRepeat:
+      Result := ShallowE(S^.E) and ShallowS(S^.Body);
+    skFor:
+      Result := ShallowE(S^.E) and ShallowE(S^.E2) and ShallowS(S^.Body);
+  else
+    Result := False;
+  end;
+end;
+
 { P510: E is worked out with no call: constants, variables, arithmetic,
   an element or a field, and the words the emitter writes in line (the
   ones PromoExprOK takes in a run, MulHi and the carry words too). }
@@ -12489,7 +12564,7 @@ begin
       LoadImmR('rsi', S^.E2^.Num)
     else
       LoadPlain(FindSym(S^.E2^.Name), 'rsi');
-    ForChunk(S, 'rcx', 'rdx', 'rsi', 'rdi');
+    ForChunk(S, 'rcx', 'rdx', 'rsi', '');
   end;
   JumpCC('', bodyL);
   Line(brk + ':');
@@ -12880,6 +12955,29 @@ begin
     end;
     Line('  cmp ' + T + ', #1023');
     Line('  csel ' + CH + ', ' + L + ', ' + CH + ', lo');
+  end
+  else if T = '' then
+  begin
+    { the run's end in CH alone, with no second scratch register (P230:
+      the accumulating for runs in a region that may keep a variable in
+      rdi, which this took as T): the difference of the limit and the
+      counter, compared with 1023, and the counter plus 1023 by lea,
+      which leaves the flags the compare made for the cmov }
+    if S^.Down then
+    begin
+      Line('  movq %' + R + ', %' + CH);
+      Line('  subq %' + L + ', %' + CH);
+      Line('  cmpq $1023, %' + CH);
+      Line('  leaq -1023(%' + R + '), %' + CH);
+    end
+    else
+    begin
+      Line('  movq %' + L + ', %' + CH);
+      Line('  subq %' + R + ', %' + CH);
+      Line('  cmpq $1023, %' + CH);
+      Line('  leaq 1023(%' + R + '), %' + CH);
+    end;
+    Line('  cmovbq %' + L + ', %' + CH);
   end
   else
   begin
@@ -34415,8 +34513,8 @@ end;
   not pay for its loads and stores. }
 function TEmitter.EmitRegion(const L: TStmtArray; A, Z: SizeInt): Boolean;
 var
-  i, j, n, nf, nk, nr, base, need, nfMax, nkMax, kind: LongInt;
-  noReal: Boolean;
+  i, j, n, nf, nk, nr, base, need, nfMax, nkMax, kind, k8: LongInt;
+  noReal, shallow: Boolean;
   k: SizeInt;
   t: TPromo;
   b, e, b2: string;
@@ -34559,7 +34657,20 @@ begin
       pure := False;
   if pure then
     Inc(nfMax);
+  { and rdi too where no expression of the region needs the pool's second
+    register (P230): the pool is then rsi alone }
+  shallow := pure;
+  for k := A to Z do
+    if shallow and (not ShallowS(L[k])) then
+      shallow := False;
+  if shallow then
+    Inc(nfMax);
   FR8Lent := False;
+  { the free registers in the order they are lent: r9, r10, r11 unless it
+    keeps a for's run end, r8, rdi }
+  k8 := 3;
+  if FChunkReg <> '' then
+    k8 := 2;
   for i := 0 to n - 1 do
   begin
     j := Length(chosen);
@@ -34636,11 +34747,16 @@ begin
         chosen[j].Reg := 'r11';
         chosen[j].Dw := 11;
       end
-      else
+      else if nf = k8 then
       begin
         chosen[j].Reg := 'r8';
         chosen[j].Dw := 8;
         FR8Lent := True;
+      end
+      else
+      begin
+        chosen[j].Reg := 'rdi';
+        chosen[j].Dw := 5;
       end;
       chosen[j].Keep := False;
       chosen[j].Save := 0;
@@ -36858,7 +36974,9 @@ begin
     Result := 7
   else if FPromoOn then
   begin
-    if FR8Lent then
+    if RdiLent then
+      Result := 1
+    else if FR8Lent then
       Result := 2
     else
       Result := 3;

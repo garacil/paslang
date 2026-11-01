@@ -150,6 +150,8 @@ GOLDEN += funnel
 GOLDEN_A64 += funnel
 GOLDEN += slots
 GOLDEN_A64 += slots
+GOLDEN += regs
+GOLDEN_A64 += regs
 GOLDEN += syshelpers sysguid
 GOLDEN_A64 += syshelpers sysguid
 GOLDEN += sysfamilies
@@ -2946,6 +2948,17 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	test $$(sed -n 's/^\.set \.Lfrp_r11, //p' $(BUILDDIR)/slots_s.s) -ge 96; \
 	test $$(sed -n 's/^\.set \.Lfrp_r17, //p' $(BUILDDIR)/slots_s.s) -ge 128; \
 	echo ok slots
+	@set -e; \
+	: P230: a loop of integer arithmetic alone whose expressions need the pool one register deep keeps a variable in rdi too, and one whose expressions need two, or that holds a conditional move, keeps the pool it had, testdata/regs is what scripts/gen_regs.py writes; \
+	python3 -I scripts/gen_regs.py --check; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/regs_s testdata/regs.paslang; \
+	sed -n '/^p_mixer:/,/cfi_endproc/p' $(BUILDDIR)/regs_s.s > $(BUILDDIR)/regs_m.s; \
+	test $$(grep -c '%rdi' $(BUILDDIR)/regs_m.s) -ge 4; \
+	sed -n '/^p_deeploop:/,/cfi_endproc/p' $(BUILDDIR)/regs_s.s > $(BUILDDIR)/regs_p.s; \
+	test $$(grep -c 'movq %rsi, %rax' $(BUILDDIR)/regs_p.s) -eq 0; \
+	sed -n '/^p_selloop:/,/cfi_endproc/p' $(BUILDDIR)/regs_s.s > $(BUILDDIR)/regs_c.s; \
+	test $$(grep -c cmov $(BUILDDIR)/regs_c.s) -ge 2; \
+	echo ok regs
 	@set -e; \
 	: the kept scripts of testdata/sqllogic are what scripts/gen_sqllogic.py writes while the system SQLite is the one that made them, P412; \
 	python3 -I scripts/gen_sqllogic.py --check

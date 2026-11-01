@@ -2419,7 +2419,12 @@ across the call unless the statement assigns it; what the loop wrote
 of the others is stored before the call and they are loaded after it.
 A `try` keeps those registers too, so a routine that catches a raise
 from one of the routines it calls still returns them as its caller
-left them. A routine's straight code keeps its variables in registers
+left them. A loop of integer arithmetic alone lends one more register, `r8`,
+and one whose expressions need the pool's first register alone (an
+operation takes a variable or a constant as its right side) lends `rdi`
+too (1.2.344, P230): the mixer of `scripts/bench/b10rot`, eight live
+values, keeps all of them in registers. A routine's straight code keeps
+its variables in registers
 the same way (1.1.285, P396), its statements that call left as they
 are: a variable takes a register where its uses outweigh what the
 register costs the run of statements, its load at the start where a
