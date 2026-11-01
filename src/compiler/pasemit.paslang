@@ -36,6 +36,11 @@ uses
   paslib;
 
 const
+  { A routine's own variables share slots (P510) only when it has at
+    least this many that a register could hold: with fewer, a run lends
+    each its own (amd64 four free registers and four kept, arm64 eight). }
+  ShareMinLocals = 9;
+
   { Texts of the fatal runtime errors (P86). The runtime writes them to
     standard error with raw system calls, adds " at line N" when the
     faulting or calling pc is inside the program, and exits 1 as every
@@ -1162,6 +1167,9 @@ type
     procedure HidScanS(S: PStmt; var Ix: LongInt; LoopA: LongInt);
     function HidAddrE(E: PExpr; const N: string): Boolean;
     function HidAddrS(S: PStmt; const N: string): Boolean;
+    function LeafE(E: PExpr): Boolean;
+    function LeafS(S: PStmt): Boolean;
+    function ShareLocal(const Pr: TProc; I: SizeInt; Src: Boolean): Boolean;
     function LayoutLocals(const Pr: TProc; Loc0: SizeInt): SizeInt;
     procedure AddrInto(E: PExpr; const R: string);
     procedure ScaleAtIntoX86(const Disp, B, X: string; K: Int64; const D: string);
@@ -7724,7 +7732,7 @@ var
   h: LongInt;
   t: LongInt;
 begin
-  if (Length(N) < 5) or (Copy(N, 1, 4) <> 'inl.') then
+  if N = '' then
     Exit;
   h := HidFind(N);
   if h < 0 then
@@ -7846,14 +7854,97 @@ begin
         HidAddrS(S^.Sels[i].Body, N);
 end;
 
+{ P510: E is worked out with no call: constants, variables, arithmetic,
+  an element or a field, and the words the emitter writes in line (the
+  ones PromoExprOK takes in a run, MulHi and the carry words too). }
+function TEmitter.LeafE(E: PExpr): Boolean;
+var
+  i: SizeInt;
+begin
+  Result := False;
+  if E = nil then
+  begin
+    Result := True;
+    Exit;
+  end;
+  case E^.Kind of
+    ekInt, ekNil, ekVar, ekReal:
+      Result := True;
+    ekBin, ekIndex, ekField:
+      Result := LeafE(E^.L) and LeafE(E^.R);
+    ekUn, ekDeref:
+      Result := LeafE(E^.L);
+    ekCall:
+      begin
+        Result := (E^.Name = 'rt_length') or (E^.Name = 'rt_high') or (E^.Name = 'rt_low') or
+          (E^.Name = 'rt_odd') or (E^.Name = 'rt_absint') or (E^.Name = 'rt_bitchk') or
+          (E^.Name = 'rt_rot') or (E^.Name = 'rt_funnel') or (E^.Name = 'rt_carry') or
+          (E^.Name = 'rt_addc') or (E^.Name = 'rt_subb') or (E^.Name = 'rt_mulhi') or
+          (E^.Name = 'rt_mulhis');
+        for i := 0 to High(E^.Args) do
+          if Result and not LeafE(E^.Args[i]) then
+            Result := False;
+      end;
+    ekAddr:
+      Result := LeafE(E^.L);
+  end;
+end;
+
+{ P510: S, and everything in it, is worked out with no call:
+  assignments, ifs, cases, loops and exits over such expressions. A
+  routine of that kind is a numeric kernel, one run of statements where
+  the variables compete for the registers all the time; a routine that
+  calls splits into runs and islands, where a shared place costs loads
+  (the compiler itself, with the sharing on for every routine of nine
+  locals, ran 0.6 % more instructions compiling SysUtils). }
+function TEmitter.LeafS(S: PStmt): Boolean;
+var
+  i: SizeInt;
+begin
+  Result := True;
+  if S = nil then
+    Exit;
+  case S^.Kind of
+    skAssign, skInc, skDec, skExit, skBreak, skContinue, skIf, skWhile, skRepeat, skFor,
+      skBlock, skCase:
+      begin
+        Result := LeafE(S^.E) and LeafE(S^.E2) and LeafE(S^.Dest) and
+          LeafS(S^.ThenSt) and LeafS(S^.ElseSt) and LeafS(S^.Body);
+        for i := 0 to High(S^.Stmts) do
+          if Result and not LeafS(S^.Stmts[i]) then
+            Result := False;
+        for i := 0 to High(S^.Arms) do
+          if Result and not LeafS(S^.Arms[i].Body) then
+            Result := False;
+      end;
+  else
+    Result := False;
+  end;
+end;
+
+{ A local that may share its slot with another whose life is over
+  (LayoutLocals): a hidden one of a body put in place (P378), or, when
+  Src says the routine is a kernel with variables enough, a variable of
+  its own that a register can hold, but Result. }
+function TEmitter.ShareLocal(const Pr: TProc; I: SizeInt; Src: Boolean): Boolean;
+var
+  n: string;
+begin
+  n := Pr.Locals[I].Name;
+  Result := (Copy(n, 1, 4) = 'inl.') or
+    (Src and (ToLower(n) <> 'result') and (ToLower(n) <> ToLower(Pr.Name)) and
+    PromoScalar(Pr.Locals[I].Typ));
+end;
+
 { The locals' offsets into FLayOff from Loc0 on, a slot each but for
-  the hidden ones that share; the frame's end. }
+  the locals that share (P378; P510 for a kernel's own variables); the
+  frame's end. }
 function TEmitter.LayoutLocals(const Pr: TProc; Loc0: SizeInt): SizeInt;
 var
   i, j, m, h, nc, ncol, k: SizeInt;
   v: Int64;
   c: Char;
-  share: Boolean;
+  share, src: Boolean;
   root, order, tmp: array of LongInt;
   colTyp, colRoot, colEnd: array of LongInt;
   slot: SizeInt;
@@ -7868,13 +7959,20 @@ begin
   for i := 0 to High(root) do
     root[i] := LongInt(i);
   share := (not FDebug) and (Pr.Body <> nil) and (not Pr.Boxing) and (Length(Pr.Shared) = 0) and
-    (not HasChildren(Pr));
+    (not HasChildren(Pr)) and (not HasAsm(Pr.Body));
   if share then
   begin
     { the candidates' table }
+    { the routine's own variables only in a kernel that has more than the
+      registers a run lends (P510) }
     nc := 0;
     for i := 0 to High(Pr.Locals) do
-      if Copy(Pr.Locals[i].Name, 1, 4) = 'inl.' then
+      if ShareLocal(Pr, i, True) and (Copy(Pr.Locals[i].Name, 1, 4) <> 'inl.') then
+        Inc(nc);
+    src := (nc >= ShareMinLocals) and LeafS(Pr.Body);
+    nc := 0;
+    for i := 0 to High(Pr.Locals) do
+      if ShareLocal(Pr, i, src) then
         Inc(nc);
     share := nc > 1;
   end;
@@ -7903,7 +8001,7 @@ begin
     for i := 0 to High(Pr.Locals) do
     begin
       nm := Pr.Locals[i].Name;
-      if Copy(nm, 1, 4) <> 'inl.' then
+      if not ShareLocal(Pr, i, src) then
         Continue;
       if HidAddrS(Pr.Body, nm) then
         Continue;

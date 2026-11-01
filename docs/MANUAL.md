@@ -2429,7 +2429,11 @@ halts counts as less likely to run, as Go's `likelyadjust` ranks a
 branch. A `Move` is no call there: its copy keeps every register a
 loop or a run keeps a variable in. A local that every path writes
 before anything reads it, a `try`'s handler and its `finally` part
-among the readers, is not zeroed at the routine's start. A word field
+among the readers, is not zeroed at the routine's start, and two such
+locals whose lives do not meet share one slot, so one register: the
+hidden variables of the bodies put in place (P378) and, in a routine
+with no call and more than eight variables of its own, those (1.2.343,
+P510). A word field
 of an object a register holds, of a record in such an object too, and
 `Pointer(S)` of a string field of one are one load at an offset from
 that register (1.1.287, P397): on amd64 `+`, `*`, `and`, `or` and `xor`

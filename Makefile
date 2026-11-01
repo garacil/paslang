@@ -148,6 +148,8 @@ GOLDEN += carry
 GOLDEN_A64 += carry
 GOLDEN += funnel
 GOLDEN_A64 += funnel
+GOLDEN += slots
+GOLDEN_A64 += slots
 GOLDEN += syshelpers sysguid
 GOLDEN_A64 += syshelpers sysguid
 GOLDEN += sysfamilies
@@ -2935,6 +2937,15 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	sed -n '/^p_s_byteu:/,/cfi_endproc/p' $(BUILDDIR)/funnel_x.s > $(BUILDDIR)/funnel_xu.s; \
 	grep -q 'cmp x1, #64' $(BUILDDIR)/funnel_xu.s; \
 	echo ok funnel
+	@set -e; \
+	: P510: the variables of a routine with no call and more than eight of them whose lives do not meet share a slot, and so does a routine that calls or has few keep one each, testdata/slots is what scripts/gen_slots.py writes; \
+	python3 -I scripts/gen_slots.py --check; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/slots_s testdata/slots.paslang; \
+	test $$(sed -n 's/^\.set \.Lfrp_rwide, //p' $(BUILDDIR)/slots_s.s) -le 128; \
+	test $$(sed -n 's/^\.set \.Lfrp_r08, //p' $(BUILDDIR)/slots_s.s) -ge 200; \
+	test $$(sed -n 's/^\.set \.Lfrp_r11, //p' $(BUILDDIR)/slots_s.s) -ge 96; \
+	test $$(sed -n 's/^\.set \.Lfrp_r17, //p' $(BUILDDIR)/slots_s.s) -ge 128; \
+	echo ok slots
 	@set -e; \
 	: the kept scripts of testdata/sqllogic are what scripts/gen_sqllogic.py writes while the system SQLite is the one that made them, P412; \
 	python3 -I scripts/gen_sqllogic.py --check
