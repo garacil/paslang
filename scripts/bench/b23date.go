@@ -41,8 +41,15 @@ func main() {
 			y, m, d := time.Unix(1767225600+int64(i)*7919, 0).UTC().Date()
 			t += y + int(m) + d
 		}
+	case "full":
+		for i := 1; i <= 20000000; i++ {
+			tm := time.Unix(1767225600+int64(i)*7919, 0).UTC()
+			y, m, d := tm.Date()
+			h, mi, s := tm.Clock()
+			t += y + int(m) + d + h + mi + s + int(tm.Weekday()) + tm.YearDay()
+		}
 	default:
-		fmt.Println("b23date: stamp or date")
+		fmt.Println("b23date: stamp, date or full")
 		os.Exit(2)
 	}
 	fmt.Println(t)

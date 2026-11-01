@@ -12953,7 +12953,8 @@ paslang over `Syscall`, not part of the language: name them in `uses`.
 when somebody sets it. `Monotonic` and `Since` read the clock that only
 goes forward, which is the one to measure with. `UnixToDate` takes a
 moment apart into a `TDate` (year, month, day, hour, minute, second,
-weekday, day of the year) and `DateToUnix(y, m, d, hh, mm, ss)` gives
+weekday, day of the year), `UnixToYMD(t, y, m, d)` gives the year, month
+and day alone (Go's `Date`, in about two thirds of the time) and `DateToUnix(y, m, d, hh, mm, ss)` gives
 the moment of a date; `DateStr`, `TimeStr` and `StampStr` write a
 moment, and `DateOf`, `TimeOf` and `StampOf` a `TDate`, the way an ISO
 date is written, `WeekdayName` and `MonthName` name its day and month,

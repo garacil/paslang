@@ -158,6 +158,8 @@ GOLDEN += dloop
 GOLDEN_A64 += dloop
 GOLDEN += adler
 GOLDEN_A64 += adler
+GOLDEN += civil
+GOLDEN_A64 += civil
 GOLDEN += syshelpers sysguid
 GOLDEN_A64 += syshelpers sysguid
 GOLDEN += sysfamilies
@@ -2991,6 +2993,12 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(BUILDDIR)/adler | diff -u testdata/adler.out -; \
 	objdump -d --no-show-raw-insn $(BUILDDIR)/adler | awk '/<p_pashash_pasadler32>:/,/ret/' | grep -q 'movabs \$$0x1000100010001'; \
 	echo ok adler
+	@set -e; \
+	: P534: dates are split by the 400-year cycle of the Go time package and the ISO forms are written in one string, testdata/civil is what scripts/gen_civil.py writes and its expected output is worked out by Python integers with the days from civil algorithm of Howard Hinnant after a check against datetime; \
+	python3 -I scripts/gen_civil.py --check; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/civil testdata/civil.paslang; \
+	$(BUILDDIR)/civil | diff -u testdata/civil.out -; \
+	echo ok civil
 	@set -e; \
 	: the kept scripts of testdata/sqllogic are what scripts/gen_sqllogic.py writes while the system SQLite is the one that made them, P412; \
 	python3 -I scripts/gen_sqllogic.py --check

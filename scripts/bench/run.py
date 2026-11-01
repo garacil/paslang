@@ -112,7 +112,7 @@ SECTIONS = {
     "b20hash": ["md5", "sha1", "sha512", "sha3", "hmac", "hmacp", "sha3p", "crc32", "adler32", "fnv"],
     "b21text": ["hex", "runes"],
     "b22rand": ["own", "below", "real", "global", "globalpar"],
-    "b23date": ["stamp", "date"],
+    "b23date": ["stamp", "date", "full"],
     "b24math": ["sin", "exp", "ln", "sqrt", "pow", "atan"],
     "b25exec": ["serial", "par"],
     "b26slice": ["ints", "strings"],
