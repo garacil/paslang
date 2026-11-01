@@ -368,6 +368,7 @@ type
     FFrameSym: string;      { the .set symbol that carries the frame size, defined after the body }
     FFrameMarked: Boolean;  { arm64: the prologue wrote the mark SetFrame fills (P308) }
     FSkipCanon: Boolean;    { EmitOrdTo's top node feeds a store of its own width: no cleanup (P100) }
+    FWideTop: PExpr;        { the AddCarry or SubBorrow a statement's assignment works out in the pool (P508) }
     FUnsCmp: Boolean;       { the comparison EmitOrdBinAmd or EmitOrdBinArm is given is an unsigned one (P507) }
     FLeftIn: Boolean;       { a binary operation's left side is in rcx or x1, not pushed (P297) }
     FLeftReg: string;       { a division's left side waits in this register, not pushed (P360) }
@@ -687,6 +688,9 @@ type
     function NarrowInPlace(S: PStmt): Boolean;
     procedure EmitBitChk(const R: string; Hi: Int64);
     function EmitWideFn(E: PExpr): Boolean;
+    function WideCarryOK(E: PExpr): Boolean;
+    procedure WideCarryEmit(E: PExpr);
+    function OrdAssign0(S: PStmt): Boolean;
     function EmitInlineStmt(S: PStmt): Boolean;
     function EmitAtomicFn(E: PExpr): Boolean;
     function EmitCpuFn(E: PExpr): Boolean;
@@ -26129,6 +26133,124 @@ begin
   CanonReg('rax', t);
 end;
 
+{ AddCarry and SubBorrow whose carry out goes to a word variable and whose
+  operands the pool works out (P508): the first in pool register 0, the
+  second an operand of the instruction or pool register 1, the carry in
+  pool register 2 put into the flag (neg on amd64, a compare with 1 on
+  arm64: a carry in that is not 0 is a carry, as it was), then add and
+  adc, sub and sbb, on pool register 0; the carry out is read from the
+  flag into the variable at its width and the sum stays in pool register
+  0. The general path pushed each operand and took it back, and loaded
+  the variable's address. The pool is free wherever a general expression
+  is worked out. WideCarryOK says the operands are ones the pool takes
+  and writes nothing. }
+function TEmitter.WideCarryOK(E: PExpr): Boolean;
+var
+  p: PExpr;
+  s: TSym;
+begin
+  Result := False;
+  if (E = nil) or (E^.Kind <> ekCall) or ((E^.Name <> 'rt_addc') and (E^.Name <> 'rt_subb')) or
+    (Length(E^.Args) <> 5) or (E^.Args[3] = nil) or (E^.Args[3]^.Kind <> ekAddr) then
+    Exit;
+  p := E^.Args[3]^.L;
+  if (p = nil) or (p^.Kind <> ekVar) or not WordVar(p, s) then
+    Exit;
+  if not (OrdSimple(E^.Args[0], 0) and OrdSimple(E^.Args[1], 1)) then
+    Exit;
+  if not ((E^.Args[2]^.Kind = ekInt) and (E^.Args[2]^.Num = 0)) and
+    not OrdSimple(E^.Args[2], 2) then
+    Exit;
+  Result := True;
+end;
+
+procedure TEmitter.WideCarryEmit(E: PExpr);
+var
+  s, bs: TSym;
+  sub, zero: Boolean;
+  op, r0, c: string;
+begin
+  WordVar(E^.Args[3]^.L, s);
+  zero := (E^.Args[2]^.Kind = ekInt) and (E^.Args[2]^.Num = 0);
+  sub := E^.Name = 'rt_subb';
+  r0 := OrdPool(0);
+  EmitOrdTo(E^.Args[0], 0);
+  { the second operand in the instruction itself when it is a word
+    variable or a constant amd64 takes, where the carry in's work cannot
+    spoil it; else in pool register 1 }
+  if (E^.Args[1]^.Kind = ekVar) and WordVar(E^.Args[1], bs) and (TSize(bs.Typ) = 8) and
+    ((not FArm) or (bs.Reg <> '')) then
+  begin
+    if FArm then
+      op := bs.Reg
+    else
+      op := MemA(bs);
+  end
+  else if (not FArm) and (E^.Args[1]^.Kind = ekInt) and Fits32(E^.Args[1]^.Num) then
+    op := '$' + IntToStr(E^.Args[1]^.Num)
+  else
+  begin
+    EmitOrdTo(E^.Args[1], 1);
+    op := OrdPool(1);
+    if not FArm then
+      op := '%' + op;
+  end;
+  if not zero then
+  begin
+    EmitOrdTo(E^.Args[2], 2);
+    c := OrdPool(2);
+    if FArm then
+    begin
+      if sub then
+        Line('  cmp xzr, ' + c)
+      else
+        Line('  cmp ' + c + ', #1');
+    end
+    else
+      Line('  negq %' + c);
+  end;
+  if FArm then
+  begin
+    if sub then
+    begin
+      if zero then
+        Line('  subs ' + r0 + ', ' + r0 + ', ' + op)
+      else
+        Line('  sbcs ' + r0 + ', ' + r0 + ', ' + op);
+      Line('  cset x1, cc');
+    end
+    else
+    begin
+      if zero then
+        Line('  adds ' + r0 + ', ' + r0 + ', ' + op)
+      else
+        Line('  adcs ' + r0 + ', ' + r0 + ', ' + op);
+      Line('  cset x1, cs');
+    end;
+    StoreWordVar(s, 'x1');
+  end
+  else
+  begin
+    if sub then
+    begin
+      if zero then
+        Line('  subq ' + op + ', %' + r0)
+      else
+        Line('  sbbq ' + op + ', %' + r0);
+    end
+    else if zero then
+      Line('  addq ' + op + ', %' + r0)
+    else
+      Line('  adcq ' + op + ', %' + r0);
+    Line('  setc %cl');
+    { a byte variable in memory takes the low byte of rcx, as it is; a
+      wider one, or one in a register, the whole of it }
+    if (TSize(s.Typ) <> 1) or (s.Reg <> '') then
+      Line('  movzbl %cl, %ecx');
+    StoreWordVar(s, 'rcx');
+  end;
+end;
+
 { The words of P106 put in line (1.0.121): AddCarry and SubBorrow with
   the carry in the flag (adc/sbb after neg sets it; adcs/sbcs after a
   compare), the carry out stored at the width of its variable; the
@@ -26151,6 +26273,15 @@ begin
   Result := True;
   if (E^.Name = 'rt_addc') or (E^.Name = 'rt_subb') then
   begin
+    if WideCarryOK(E) then
+    begin
+      WideCarryEmit(E);
+      if FArm then
+        Line('  mov x0, ' + OrdPool(0))
+      else
+        Line('  movq %' + OrdPool(0) + ', %rax');
+      Exit;
+    end;
     EmitExpr(E^.Args[0]);
     if FArm then PshK('x0', 0) else PushK('rax', 0);
     EmitExpr(E^.Args[1]);
@@ -34603,7 +34734,9 @@ begin
         (E^.Args[0] <> nil) and (IsStr(E^.Args[0]^.Typ) or IsDyn(E^.Args[0]^.Typ)) then
         Result := FatPtrOK(E^.Args[0], D)
       else if (E^.Name = 'rt_bitchk') and (Length(E^.Args) = 2) then
-        Result := OrdSimple(E^.Args[0], D);
+        Result := OrdSimple(E^.Args[0], D)
+      else if (E = FWideTop) and (D = 0) then
+        Result := True;
     ekUn:
       if (E^.L <> nil) and (TKind(E^.Typ) <> tykReal) and
         (TKind(E^.L^.Typ) <> tykReal) and (TKind(E^.Typ) <> tykSet) then
@@ -34760,6 +34893,8 @@ begin
         EmitOrdTo(E^.Args[0], D);
         EmitBitChk(r, E^.Args[1]^.Num);
       end
+      else if E = FWideTop then
+        WideCarryEmit(E)
       else
         EmitFatWord(E^.Args[0], D, True);
     ekUn:
@@ -38426,6 +38561,19 @@ end;
   the pool and stored once. When e is d op x, x is worked out first and
   d changes in place, in its register or in memory. }
 function TEmitter.OrdAssign(S: PStmt): Boolean;
+begin
+  { x := AddCarry(a, b, c, k) whose operands the pool works out is a
+    pool expression for this statement alone (P508): the sum lands in
+    pool register 0 and goes where the assignment sends it, where the
+    general path left it in rax first }
+  FWideTop := nil;
+  if (S <> nil) and WideCarryOK(S^.E) then
+    FWideTop := S^.E;
+  Result := OrdAssign0(S);
+  FWideTop := nil;
+end;
+
+function TEmitter.OrdAssign0(S: PStmt): Boolean;
 var
   dst, ls: TSym;
   e: PExpr;
@@ -38443,7 +38591,7 @@ begin
     Exit;
   end;
   if (e^.Kind <> ekBin) and (e^.Kind <> ekUn) and (e^.Kind <> ekIndex) and
-    (e^.Kind <> ekField) and (e^.Kind <> ekDeref) then
+    (e^.Kind <> ekField) and (e^.Kind <> ekDeref) and (e <> FWideTop) then
     Exit;
   if not OrdSimple(e, 0) then
     Exit;

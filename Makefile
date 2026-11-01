@@ -144,6 +144,8 @@ GOLDEN += textcasts
 GOLDEN_A64 += textcasts
 GOLDEN += ult
 GOLDEN_A64 += ult
+GOLDEN += carry
+GOLDEN_A64 += carry
 GOLDEN += syshelpers sysguid
 GOLDEN_A64 += syshelpers sysguid
 GOLDEN += sysfamilies
@@ -2872,6 +2874,29 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'cset x[0-9]*, hs$$' $(BUILDDIR)/ult_avars.s; \
 	test $$(grep -c ' eor ' $(BUILDDIR)/ult_avars.s) -eq 0; \
 	echo ok ult
+	@set -e; \
+	: P508: AddCarry and SubBorrow with operands the registers take are an adc or sbb on the pool with the carry in the flag and no push of an operand on both machines, testdata/carry is what scripts/gen_carry.py writes; \
+	python3 -I scripts/gen_carry.py --check; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/carry_s testdata/carry.paslang; \
+	sed -n '/^p_f_local_0:/,/cfi_endproc/p' $(BUILDDIR)/carry_s.s > $(BUILDDIR)/carry_f.s; \
+	grep -q 'adcq ' $(BUILDDIR)/carry_f.s; \
+	grep -q 'negq ' $(BUILDDIR)/carry_f.s; \
+	sed -n '/^p_f_word_0:/,/cfi_endproc/p' $(BUILDDIR)/carry_s.s > $(BUILDDIR)/carry_w.s; \
+	test $$(grep -c 'setc %cl' $(BUILDDIR)/carry_w.s) -eq $$(grep -c 'movzbl %cl, %ecx' $(BUILDDIR)/carry_w.s); \
+	sed -n '/^p_m_drop:/,/cfi_endproc/p' $(BUILDDIR)/carry_s.s > $(BUILDDIR)/carry_d.s; \
+	grep -q 'adcq ' $(BUILDDIR)/carry_d.s; \
+	test $$(grep -c 'pushq %rax' $(BUILDDIR)/carry_d.s) -eq 0; \
+	test $$(grep -c 'pushq %rax' $(BUILDDIR)/carry_f.s) -eq 0; \
+	test $$(grep -c 'movq %rsi, %rax' $(BUILDDIR)/carry_f.s) -eq 0; \
+	$(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/carry_a testdata/carry.paslang; \
+	sed -n '/^p_f_local_0:/,/cfi_endproc/p' $(BUILDDIR)/carry_a.s > $(BUILDDIR)/carry_af.s; \
+	grep -q 'adcs x' $(BUILDDIR)/carry_af.s; \
+	grep -q 'cset x1, cs' $(BUILDDIR)/carry_af.s; \
+	sed -n '/^p_m_drop:/,/cfi_endproc/p' $(BUILDDIR)/carry_a.s > $(BUILDDIR)/carry_ad.s; \
+	grep -q 'adcs x' $(BUILDDIR)/carry_ad.s; \
+	test $$(grep -c 'str x0, .sp, #-16' $(BUILDDIR)/carry_ad.s) -eq 0; \
+	test $$(grep -c 'str x0, .sp, #-16' $(BUILDDIR)/carry_af.s) -eq 0; \
+	echo ok carry
 	@set -e; \
 	: the kept scripts of testdata/sqllogic are what scripts/gen_sqllogic.py writes while the system SQLite is the one that made them, P412; \
 	python3 -I scripts/gen_sqllogic.py --check
