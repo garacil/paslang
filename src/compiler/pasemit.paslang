@@ -368,6 +368,7 @@ type
     FFrameSym: string;      { the .set symbol that carries the frame size, defined after the body }
     FFrameMarked: Boolean;  { arm64: the prologue wrote the mark SetFrame fills (P308) }
     FSkipCanon: Boolean;    { EmitOrdTo's top node feeds a store of its own width: no cleanup (P100) }
+    FUnsCmp: Boolean;       { the comparison EmitOrdBinAmd or EmitOrdBinArm is given is an unsigned one (P507) }
     FLeftIn: Boolean;       { a binary operation's left side is in rcx or x1, not pushed (P297) }
     FLeftReg: string;       { a division's left side waits in this register, not pushed (P360) }
     FLeftOp: string;        { with FLeftIn on amd64: the left side as an operand, its home or a constant, '' for rcx (P297) }
@@ -1065,6 +1066,8 @@ type
     function OrdPool(D: LongInt): string;
     function OrdLeaf(E: PExpr): Boolean;
     function OrdBinOp(E: PExpr): Boolean;
+    function SignFlipped(E: PExpr): PExpr;
+    function UnsCmp(E: PExpr; D: LongInt; out U: PExpr): Boolean;
     function OrdSimple(E: PExpr; D: LongInt): Boolean;
     function OrdOperand(E: PExpr; D: LongInt): string;
     procedure EmitOrdTo(E: PExpr; D: LongInt);
@@ -10178,6 +10181,29 @@ begin
     end;
 end;
 
+{ The unsigned ones, for a comparison UnsCmp found (P507): lo, ls, hi
+  and hs are arm64's names for below, below or equal, above, above or
+  equal; X86Jcc gives jb, jbe, ja and jae. }
+function CondCCU(Op: TBinOp; WhenTrue: Boolean): string;
+begin
+  if WhenTrue then
+    case Op of
+      boLt: Result := 'lo';
+      boLe: Result := 'ls';
+      boGt: Result := 'hi';
+    else
+      Result := 'hs';
+    end
+  else
+    case Op of
+      boLt: Result := 'hs';
+      boLe: Result := 'hi';
+      boGt: Result := 'ls';
+    else
+      Result := 'lo';
+    end;
+end;
+
 function X86Jcc(const CC: string): string;
 begin
   if CC = 'eq' then
@@ -10190,6 +10216,14 @@ begin
     Result := 'jle'
   else if CC = 'gt' then
     Result := 'jg'
+  else if CC = 'lo' then
+    Result := 'jb'
+  else if CC = 'ls' then
+    Result := 'jbe'
+  else if CC = 'hi' then
+    Result := 'ja'
+  else if CC = 'hs' then
+    Result := 'jae'
   else
     Result := 'jge';
 end;
@@ -11226,9 +11260,9 @@ end;
 function TEmitter.EmitSelectIf(S: PStmt): Boolean;
 var
   x, x2, s2: TSym;
-  e, f, a, fa, pref: PExpr;
-  xc, src, ev, dst, l: string;
-  two, one, onef, fop, same: Boolean;
+  e, f, a, fa, pref, ce, u: PExpr;
+  xc, src, ev, dst, l, ccT, ccF: string;
+  two, one, onef, fop, same, uns: Boolean;
   op: TBinOp;
   k: Int64;
   d, n: LongInt;
@@ -11278,7 +11312,13 @@ begin
     if not OrdSimple(f, 1) then
       Exit;
   end;
-  if not CondFlagsOK(S^.E, d, pref) then
+  { an unsigned comparison written with the sign flipped sets the flags
+    from its two plain sides (P507) }
+  ce := S^.E;
+  uns := (pref = nil) and UnsCmp(ce, d, u) and CondFlagsOK(u, d, nil);
+  if uns then
+    ce := u
+  else if not CondFlagsOK(ce, d, pref) then
     Exit;
   Result := True;
   if one then
@@ -11302,7 +11342,17 @@ begin
   end;
   if fop then
     EmitOrdTo(f, 1);
-  op := CondFlags(S^.E, d, pref, l);
+  op := CondFlags(ce, d, pref, l);
+  if uns then
+  begin
+    ccT := CondCCU(op, True);
+    ccF := CondCCU(op, False);
+  end
+  else
+  begin
+    ccT := CondCC(op, True);
+    ccF := CondCC(op, False);
+  end;
   if same then
     src := l;
   if FArm then
@@ -11327,18 +11377,18 @@ begin
       ev := 'x17';
     end;
     if onef then
-      Line('  csinc ' + dst + ', ' + src + ', ' + ev + ', ' + CondCC(op, True))
+      Line('  csinc ' + dst + ', ' + src + ', ' + ev + ', ' + ccT)
     else if not one then
-      Line('  csel ' + dst + ', ' + src + ', ' + ev + ', ' + CondCC(op, True))
+      Line('  csel ' + dst + ', ' + src + ', ' + ev + ', ' + ccT)
     else if ev = src then
-      Line('  cinc ' + dst + ', ' + src + ', ' + CondCC(op, True))
+      Line('  cinc ' + dst + ', ' + src + ', ' + ccT)
     else
-      Line('  csinc ' + dst + ', ' + ev + ', ' + src + ', ' + CondCC(op, False));
+      Line('  csinc ' + dst + ', ' + ev + ', ' + src + ', ' + ccF);
     if x.Reg = '' then
       StoreWordVar(x, 'x17');
     Exit;
   end;
-  xc := Copy(X86Jcc(CondCC(op, True)), 2, 3);
+  xc := Copy(X86Jcc(ccT), 2, 3);
   { a BT's carry is the bit: the and is 0 when it is clear (P322) }
   if FCondCarry then
   begin
@@ -34769,6 +34819,18 @@ begin
           E^.L := E^.R;
           E^.R := t;
         end;
+        { an unsigned comparison written with the sign flipped: one CMP
+          and an unsigned set (P507) }
+        if (E^.Typ = TyBoolean) and UnsCmp(E, D, t) then
+        begin
+          EmitOrdTo(t^.L, D);
+          FUnsCmp := True;
+          if FArm then
+            EmitOrdBinArm(t, D)
+          else
+            EmitOrdBinAmd(t, D);
+          Exit;
+        end;
         { the value of (x and c) = 0 or <> 0: one TEST or TST, or a BT,
           and the set (P322) }
         if (E^.Typ = TyBoolean) and AndZero(E, t) then
@@ -34986,7 +35048,10 @@ procedure TEmitter.EmitOrdBinAmd(E: PExpr; D: LongInt);
 var
   r, op, cc, dst: string;
   w: LongInt;
+  uns: Boolean;
 begin
+  uns := FUnsCmp;
+  FUnsCmp := False;
   r := '%' + OrdPool(D);
   case E^.Bin of
     boSar, boRol, boRor:
@@ -35102,15 +35167,24 @@ begin
     begin
       op := OrdOperand(E^.R, D);
       Line('  cmpq ' + op + ', ' + r);
-      case E^.Bin of
-        boEq: cc := 'sete';
-        boNe: cc := 'setne';
-        boLt: cc := 'setl';
-        boLe: cc := 'setle';
-        boGt: cc := 'setg';
+      if uns then
+        case E^.Bin of
+          boLt: cc := 'setb';
+          boLe: cc := 'setbe';
+          boGt: cc := 'seta';
+        else
+          cc := 'setae';
+        end
       else
-        cc := 'setge';
-      end;
+        case E^.Bin of
+          boEq: cc := 'sete';
+          boNe: cc := 'setne';
+          boLt: cc := 'setl';
+          boLe: cc := 'setle';
+          boGt: cc := 'setg';
+        else
+          cc := 'setge';
+        end;
       Line('  ' + cc + ' %al');
       Line('  movzbq %al, ' + r);
     end;
@@ -35120,9 +35194,11 @@ end;
 procedure TEmitter.EmitOrdBinArm(E: PExpr; D: LongInt);
 var
   r, op, cc: string;
-  small, addop: Boolean;
+  small, addop, uns: Boolean;
   k: Int64;
 begin
+  uns := FUnsCmp;
+  FUnsCmp := False;
   r := OrdPool(D);
   small := (E^.R^.Kind = ekInt) and (E^.R^.Num >= 0) and (E^.R^.Num <= 4095);
   case E^.Bin of
@@ -35234,15 +35310,18 @@ begin
         CmpImmArm(r, k, 'x17')
       else
         Line('  cmp ' + r + ', ' + OrdOperand(E^.R, D));
-      case E^.Bin of
-        boEq: cc := 'eq';
-        boNe: cc := 'ne';
-        boLt: cc := 'lt';
-        boLe: cc := 'le';
-        boGt: cc := 'gt';
+      if uns then
+        cc := CondCCU(E^.Bin, True)
       else
-        cc := 'ge';
-      end;
+        case E^.Bin of
+          boEq: cc := 'eq';
+          boNe: cc := 'ne';
+          boLt: cc := 'lt';
+          boLe: cc := 'le';
+          boGt: cc := 'gt';
+        else
+          cc := 'ge';
+        end;
       Line('  cset ' + r + ', ' + cc);
     end;
   end;
@@ -38584,6 +38663,77 @@ begin
   end;
 end;
 
+{ x xor Low(Int64), the sign of a word flipped, in either order: x. }
+function TEmitter.SignFlipped(E: PExpr): PExpr;
+begin
+  Result := nil;
+  if (E = nil) or (E^.Kind <> ekBin) or (E^.Bin <> boXor) or (E^.L = nil) or
+    (E^.R = nil) or (TSize(E^.Typ) <> 8) or (TKind(E^.Typ) = tykReal) or
+    (TKind(E^.Typ) = tykSet) then
+    Exit;
+  if (E^.R^.Kind = ekInt) and (E^.R^.Num = Low(Int64)) then
+    Result := E^.L
+  else if (E^.L^.Kind = ekInt) and (E^.L^.Num = Low(Int64)) then
+    Result := E^.R;
+end;
+
+{ (x xor Low(Int64)) < (y xor Low(Int64)) is x below y as words of 64
+  bits without a sign: one CMP and an unsigned condition (jb, jbe, ja,
+  jae; lo, ls, hi, hs), where the xors were two loads of the constant,
+  two xors, the compare and a signed set (P507). ULt of pasnum and
+  pasquad, arrived at by the inliner, is this pattern. A constant side
+  holds its bound xored once already (the folded form), so it is xored
+  back and, as the CMP takes an immediate on the right, goes there with
+  the operator mirrored. U is a copy of E with the sides x and y; E is
+  not changed, so a caller that does not use U emits what it did.
+  The sides are checked to be simple at D, as the caller's were. }
+function TEmitter.UnsCmp(E: PExpr; D: LongInt; out U: PExpr): Boolean;
+var
+  x, y, c: PExpr;
+  op: TBinOp;
+begin
+  Result := False;
+  U := nil;
+  if (E = nil) or (E^.Kind <> ekBin) or (E^.L = nil) or (E^.R = nil) then
+    Exit;
+  op := E^.Bin;
+  if (op <> boLt) and (op <> boLe) and (op <> boGt) and (op <> boGe) then
+    Exit;
+  x := SignFlipped(E^.L);
+  y := SignFlipped(E^.R);
+  if (x <> nil) and (y <> nil) then
+  begin
+  end
+  else if (x <> nil) and (E^.R^.Kind = ekInt) then
+    y := NewInt(E^.R^.Num xor Low(Int64))
+  else if (y <> nil) and (E^.L^.Kind = ekInt) then
+  begin
+    { K below y is y above K }
+    c := NewInt(E^.L^.Num xor Low(Int64));
+    x := y;
+    y := c;
+    case op of
+      boLt: op := boGt;
+      boLe: op := boGe;
+      boGt: op := boLt;
+    else
+      op := boLe;
+    end;
+  end
+  else
+    Exit;
+  if not OrdSimple(x, D) then
+    Exit;
+  if not (OrdLeaf(y) or OrdSimple(y, D + 1)) then
+    Exit;
+  New(U);
+  U^ := E^;
+  U^.Bin := op;
+  U^.L := x;
+  U^.R := y;
+  Result := True;
+end;
+
 { A comparison with an expression on either side: both sides in the
   pool, one compare, one branch to Target (taken when the comparison
   holds if WhenTrue, when it fails otherwise). }
@@ -38591,6 +38741,8 @@ function TEmitter.OrdJcc(E: PExpr; const Target: string; WhenTrue: Boolean): Boo
 var
   op, cc: string;
   k: Int64;
+  u: PExpr;
+  uns: Boolean;
 begin
   Result := False;
   if (E = nil) or (E^.Kind <> ekBin) then
@@ -38607,12 +38759,20 @@ begin
     Exit;
   if not (OrdLeaf(E^.R) or OrdSimple(E^.R, 1)) then
     Exit;
+  uns := UnsCmp(E, 0, u);
+  if uns then
+    E := u;
   Result := True;
   EmitOrdTo(E^.L, 0);
-  cc := CondCC(E^.Bin, WhenTrue);
+  if uns then
+    cc := CondCCU(E^.Bin, WhenTrue)
+  else
+    cc := CondCC(E^.Bin, WhenTrue);
   if FArm then
   begin
-    { a constant CMP or CMN takes, a character's and nil's too (P306) }
+    { a constant CMP or CMN takes, a character's and nil's too (P306);
+      CMN's flags give the unsigned conditions too: C is x >= -k as
+      words, Z is x = -k (P507) }
     if ConstOf(E^.R, k) and ((ArmAddImm(k) <> '') or
       ((k < 0) and (k > Low(Int64)) and (ArmAddImm(-k) <> ''))) then
       CmpImmArm(OrdPool(0), k, 'x17')

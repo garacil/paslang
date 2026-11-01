@@ -142,6 +142,8 @@ GOLDEN += forkguard forksignals
 GOLDEN_A64 += forkguard forksignals
 GOLDEN += textcasts
 GOLDEN_A64 += textcasts
+GOLDEN += ult
+GOLDEN_A64 += ult
 GOLDEN += syshelpers sysguid
 GOLDEN_A64 += syshelpers sysguid
 GOLDEN += sysfamilies
@@ -2856,6 +2858,20 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  if $(OUTDIR)/paslangc -target $$target -o $(BUILDDIR)/ctorconst-$$target testdata/varbad/ctorconst.paslang >$(BUILDDIR)/ctorconst-$$target.err 2>&1; then echo "ctorconst should fail"; exit 1; fi; \
 	  grep -qF 'a var or out parameter needs a variable, not a value at 19:23' $(BUILDDIR)/ctorconst-$$target.err; \
 	done
+	@set -e; \
+	: P507: the order of unsigned words written with the sign flipped is one compare and an unsigned condition on both machines, no constant loaded and no xor; \
+	python3 -I scripts/gen_ult.py --check; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/ult_s testdata/ult.paslang; \
+	sed -n '/^p_vars:/,/cfi_endproc/p' $(BUILDDIR)/ult_s.s > $(BUILDDIR)/ult_vars.s; \
+	grep -q 'cmovbq ' $(BUILDDIR)/ult_vars.s; \
+	grep -q 'setb %al' $(BUILDDIR)/ult_vars.s; \
+	test $$(grep -c 'movabsq' $(BUILDDIR)/ult_vars.s) -eq 0; \
+	$(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/ult_a testdata/ult.paslang; \
+	sed -n '/^p_vars:/,/cfi_endproc/p' $(BUILDDIR)/ult_a.s > $(BUILDDIR)/ult_avars.s; \
+	grep -q 'csel x[0-9]*, x[0-9]*, x[0-9]*, lo$$' $(BUILDDIR)/ult_avars.s; \
+	grep -q 'cset x[0-9]*, hs$$' $(BUILDDIR)/ult_avars.s; \
+	test $$(grep -c ' eor ' $(BUILDDIR)/ult_avars.s) -eq 0; \
+	echo ok ult
 	@set -e; \
 	: the kept scripts of testdata/sqllogic are what scripts/gen_sqllogic.py writes while the system SQLite is the one that made them, P412; \
 	python3 -I scripts/gen_sqllogic.py --check
