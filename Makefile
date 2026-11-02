@@ -707,6 +707,8 @@ GOLDEN += crclens
 GOLDEN_A64 += crclens
 GOLDEN += sha3lens
 GOLDEN_A64 += sha3lens
+GOLDEN += sha512lens
+GOLDEN_A64 += sha512lens
 # P436: XLSX templates filled, the entries not written kept as they were.
 GOLDEN += xlsx
 GOLDEN_A64 += xlsx
@@ -3146,6 +3148,20 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	n=$$(objdump -d --no-show-raw-insn $(BUILDDIR)/sha3lens | awk '/<p_pashash_keccakf>:/,/ret/' | grep -cE '[[:space:]]rol[qdl]?[[:space:]]') || true; \
 	[ "$$n" -ge 50 ] || { echo "sha3lens: KeccakF has $$n rotates"; exit 1; }; \
 	echo ok sha3lens
+	@set -e; \
+	: P551: SHA-384 and SHA-512 on amd64 with AVX2 and BMI2 run the rounds on RORX with the message schedule in XMM registers spread between them, testdata/sha512lens is what scripts/gen_sha512lens.py writes and its expected output is hashlib sha384 and sha512 and the hmac of both for the same data, and a program for the x86-64-v3 level has the RORX of the 80 rounds where one for the base level has none; \
+	python3 -I scripts/gen_sha512lens.py --check; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/sha512lens testdata/sha512lens.paslang; \
+	$(BUILDDIR)/sha512lens | diff -u testdata/sha512lens.out -; \
+	$(OUTDIR)/paslangc -cpu v3 -o $(BUILDDIR)/sha512lens_v testdata/sha512lens.paslang; \
+	$(BUILDDIR)/sha512lens_v | diff -u testdata/sha512lens.out -; \
+	$(OUTDIR)/paslangc -cpu base -o $(BUILDDIR)/sha512lens_b testdata/sha512lens.paslang; \
+	$(BUILDDIR)/sha512lens_b | diff -u testdata/sha512lens.out -; \
+	n=$$(objdump -d --no-show-raw-insn $(BUILDDIR)/sha512lens_v | grep -c 'rorx') || true; \
+	[ "$$n" -ge 400 ] || { echo "sha512lens: $$n rorx at the v3 level"; exit 1; }; \
+	m=$$(objdump -d --no-show-raw-insn $(BUILDDIR)/sha512lens_b | grep -c 'rorx') || true; \
+	[ "$$m" -eq 0 ] || { echo "sha512lens: $$m rorx at the base level"; exit 1; }; \
+	echo ok sha512lens
 	@set -e; \
 	: the kept scripts of testdata/sqllogic are what scripts/gen_sqllogic.py writes while the system SQLite is the one that made them, P412; \
 	python3 -I scripts/gen_sqllogic.py --check

@@ -345,6 +345,98 @@ def sha1_plain():
     return '\n'.join(L)
 
 
+def sha512_avx2():
+    """The lines of the amd64 body of SHA-512 (P551): the 80 rounds on the general registers with
+    RORX (BMI2), the message schedule two words at a time in XMM registers (AVX), the schedule of
+    each pair of rounds spread between their instructions; the words with their constants go to
+    the 80 words of the routine's local array, the register rax holding its address, the state's
+    address and the end of the data after them. a to h are rbx rcx rdx rdi r8 r9 r10 r11, the
+    three temporaries r12 r13 r15, the data in rsi. The constants are quadwords after a jump at
+    the head of the block, read relative to the instruction pointer."""
+    L = []
+    a = L.append
+    st = ['%rbx', '%rcx', '%rdx', '%rdi', '%r8', '%r9', '%r10', '%r11']
+    t1, t2, t3 = '%r12', '%r13', '%r15'
+    a('    testq %rdx, %rdx')
+    a('    jz 9f')
+    a('    movq %rdi, 640(%rax)')
+    a('    shlq $7, %rdx')
+    a('    addq %rsi, %rdx')
+    a('    movq %rdx, 648(%rax)')
+    a('    jmp 7f')
+    a('    .p2align 4')
+    a('    6:')
+    for i in range(0, 80, 2):
+        a('    .quad 0x%016x, 0x%016x' % (K512[i] & (2 ** 64 - 1), K512[i + 1] & (2 ** 64 - 1)))
+    a('    7:')
+    # xmm8 reverses the bytes of each quadword (VPSHUFB), xmm9 rotates each quadword right by a byte
+    for reg, lo, hi in (('%xmm8', '0x0001020304050607', '0x08090a0b0c0d0e0f'), ('%xmm9', '0x0007060504030201', '0x080f0e0d0c0b0a09')):
+        a('    movabsq $%s, %%r12' % lo)
+        a('    vmovq %%r12, %s' % reg)
+        a('    movabsq $%s, %%r12' % hi)
+        a('    vpinsrq $1, %%r12, %s, %s' % (reg, reg))
+    a('    .p2align 5')
+    a('    1:')
+    a('    movq 640(%rax), %r12')
+    for i, r in enumerate(st):
+        a('    movq %d(%%r12), %s' % (8 * i, r))
+    for i in range(8):
+        a('    vmovdqu %d(%%rsi), %%xmm%d' % (16 * i, i))
+        a('    vpshufb %%xmm8, %%xmm%d, %%xmm%d' % (i, i))
+        a('    vpaddq 6b+%d(%%rip), %%xmm%d, %%xmm10' % (16 * i, i))
+        a('    vmovdqu %%xmm10, %d(%%rax)' % (16 * i))
+    r = list(st)
+    W = lambda k: '%%xmm%d' % (k % 8)
+    for t in range(0, 80, 2):
+        # the schedule of the pair of words 16 ahead of this pair of rounds
+        V = []
+        if t < 64:
+            j = (t + 16) // 2
+            A_, B_, C_, D_, E_ = W(j - 8), W(j - 7), W(j - 4), W(j - 3), W(j - 1)
+            V += ['vpalignr $8, %s, %s, %%xmm10' % (A_, B_),
+                  'vpsrlq $1, %xmm10, %xmm11', 'vpsllq $63, %xmm10, %xmm12', 'vpxor %xmm12, %xmm11, %xmm11',
+                  'vpshufb %xmm9, %xmm10, %xmm12', 'vpxor %xmm12, %xmm11, %xmm11',
+                  'vpsrlq $7, %xmm10, %xmm12', 'vpxor %xmm12, %xmm11, %xmm11',
+                  'vpalignr $8, %s, %s, %%xmm12' % (C_, D_),
+                  'vpaddq %xmm12, %xmm11, %xmm11', 'vpaddq %s, %%xmm11, %%xmm11' % A_,
+                  'vpsrlq $19, %s, %%xmm12' % E_, 'vpsllq $45, %s, %%xmm13' % E_, 'vpxor %xmm13, %xmm12, %xmm12',
+                  'vpsrlq $61, %s, %%xmm13' % E_, 'vpxor %xmm13, %xmm12, %xmm12',
+                  'vpsllq $3, %s, %%xmm13' % E_, 'vpxor %xmm13, %xmm12, %xmm12',
+                  'vpsrlq $6, %s, %%xmm13' % E_, 'vpxor %xmm13, %xmm12, %xmm12',
+                  'vpaddq %%xmm12, %%xmm11, %s' % A_,
+                  'vpaddq 6b+%d(%%rip), %s, %%xmm13' % (8 * 2 * j, A_), 'vmovdqu %%xmm13, %d(%%rax)' % (8 * 2 * j)]
+        S = []
+        for u in (t, t + 1):
+            A, B, C, D, E, F, G, H = r
+            S += ['rorxq $14, %s, %s' % (E, t1), 'rorxq $18, %s, %s' % (E, t2), 'xorq %s, %s' % (t2, t1),
+                  'rorxq $41, %s, %s' % (E, t2), 'xorq %s, %s' % (t2, t1),
+                  'movq %s, %s' % (F, t2), 'xorq %s, %s' % (G, t2), 'andq %s, %s' % (E, t2), 'xorq %s, %s' % (G, t2),
+                  'addq %d(%%rax), %s' % (8 * u, H), 'addq %s, %s' % (t1, H), 'addq %s, %s' % (t2, H), 'addq %s, %s' % (H, D),
+                  'rorxq $28, %s, %s' % (A, t1), 'rorxq $34, %s, %s' % (A, t2), 'xorq %s, %s' % (t2, t1),
+                  'rorxq $39, %s, %s' % (A, t2), 'xorq %s, %s' % (t2, t1),
+                  'movq %s, %s' % (A, t2), 'orq %s, %s' % (C, t2), 'andq %s, %s' % (B, t2),
+                  'movq %s, %s' % (A, t3), 'andq %s, %s' % (C, t3), 'orq %s, %s' % (t3, t2),
+                  'addq %s, %s' % (t1, H), 'addq %s, %s' % (t2, H)]
+            r = [r[7]] + r[:7]
+        # one schedule instruction after every so many of the rounds', each list in its own order
+        vi = 0
+        for si, ins in enumerate(S):
+            a('    ' + ins)
+            if V and vi < len(V) and (si + 1) * len(V) >= (vi + 1) * len(S) - len(S) // 3:
+                a('    ' + V[vi])
+                vi += 1
+        for ins in V[vi:]:
+            a('    ' + ins)
+    a('    movq 640(%rax), %r12')
+    for i, rg in enumerate(r):
+        a('    addq %s, %d(%%r12)' % (rg, 8 * i))
+    a('    addq $128, %rsi')
+    a('    cmpq 648(%rax), %rsi')
+    a('    jb 1b')
+    a('    9:')
+    return '\n'.join(L)
+
+
 def sha512_plain():
     L = []
     a = L.append
@@ -2333,11 +2425,13 @@ end;
 ''')
     out.append(sha512_plain())
     out.append('''
-{ arm64 after Go's sha512block_arm64.s: SHA512H, SHA512H2, SHA512SU0,
-  SHA512SU1 (Arm ARM C7.2.293-296), the state in v8-v11, the message
-  in v12-v19, the constants streamed through v20-v31. On amd64 the
-  SHA512 extension has no processor here to answer for it: the Pascal
-  rounds serve both bodies. }
+{ amd64: the 80 rounds on the general registers with RORX (BMI2), the message
+  schedule two words at a time in XMM registers (AVX: PALIGNR, PSHUFB, shifts),
+  its instructions spread between those of the rounds, the words with their
+  constants in a local array of 80 words (P551); arm64 after Go's
+  sha512block_arm64.s: SHA512H, SHA512H2, SHA512SU0, SHA512SU1 (Arm ARM
+  C7.2.293-296), the state in v8-v11, the message in v12-v19, the constants
+  streamed through v20-v31. }
 procedure Sha512BlocksCpu(State, Data: Pointer; N: Integer);
 {$ifdef CPUAARCH64}
 var
@@ -2351,8 +2445,12 @@ begin
   end;
 end;
 {$else}
+var
+  wk: array[0..87] of Int64;
 begin
-  Sha512BlocksPlain(State, Data, N);
+  asm amd64 (State: in rdi; Data: in rsi; N: in rdx; @wk[0]: in rax)
+''' + sha512_avx2() + '''
+  end;
 end;
 {$endif}
 ''')
