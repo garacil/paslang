@@ -709,6 +709,8 @@ GOLDEN += sha3lens
 GOLDEN_A64 += sha3lens
 GOLDEN += sha512lens
 GOLDEN_A64 += sha512lens
+GOLDEN += realdest
+GOLDEN_A64 += realdest
 # P436: XLSX templates filled, the entries not written kept as they were.
 GOLDEN += xlsx
 GOLDEN_A64 += xlsx
@@ -3162,6 +3164,26 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	m=$$(objdump -d --no-show-raw-insn $(BUILDDIR)/sha512lens_b | grep -c 'rorx') || true; \
 	[ "$$m" -eq 0 ] || { echo "sha512lens: $$m rorx at the base level"; exit 1; }; \
 	echo ok sha512lens
+	@set -e; \
+	: P541: a Double assigned to a variable that lives in an xmm register is worked out in that register or in place, with the three operand VEX forms where the processor has AVX, and the move that copies a register straight back is not written, testdata/realdest is what scripts/gen_realdest.py writes and its expected output is worked out in Python floats, and the routines of it hold fewer moves and instructions than the compiler before wrote; \
+	python3 -I scripts/gen_realdest.py --check; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/realdest testdata/realdest.paslang; \
+	$(BUILDDIR)/realdest | diff -u testdata/realdest.out -; \
+	$(OUTDIR)/paslangc -cpu base -o $(BUILDDIR)/realdest_b testdata/realdest.paslang; \
+	$(BUILDDIR)/realdest_b | diff -u testdata/realdest.out -; \
+	$(OUTDIR)/paslangc -cpu v3 -o $(BUILDDIR)/realdest_v testdata/realdest.paslang; \
+	for b in realdest_b realdest_v; do \
+	  objdump -d --no-show-raw-insn $(BUILDDIR)/$$b | awk '/^[0-9a-f]+ <[^>]*>:/{ on = ($$2 ~ /^<p_f[0-9]+>:$$/) } on' > $(BUILDDIR)/$$b.fn; \
+	done; \
+	n=$$(grep -c movapd $(BUILDDIR)/realdest_v.fn) || true; \
+	[ "$$n" -le 400 ] || { echo "realdest: $$n movapd at the v3 level"; exit 1; }; \
+	n=$$(grep -c '^ ' $(BUILDDIR)/realdest_v.fn) || true; \
+	[ "$$n" -le 12000 ] || { echo "realdest: $$n instructions at the v3 level"; exit 1; }; \
+	n=$$(grep -c movapd $(BUILDDIR)/realdest_b.fn) || true; \
+	[ "$$n" -le 540 ] || { echo "realdest: $$n movapd at the base level"; exit 1; }; \
+	n=$$(grep -c '^ ' $(BUILDDIR)/realdest_b.fn) || true; \
+	[ "$$n" -le 20000 ] || { echo "realdest: $$n instructions at the base level"; exit 1; }; \
+	echo ok realdest
 	@set -e; \
 	: the kept scripts of testdata/sqllogic are what scripts/gen_sqllogic.py writes while the system SQLite is the one that made them, P412; \
 	python3 -I scripts/gen_sqllogic.py --check
