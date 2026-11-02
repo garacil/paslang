@@ -713,6 +713,8 @@ GOLDEN += realdest
 GOLDEN_A64 += realdest
 GOLDEN += mathacc
 GOLDEN_A64 += mathacc
+GOLDEN += bitview
+GOLDEN_A64 += bitview
 # P436: XLSX templates filled, the entries not written kept as they were.
 GOLDEN += xlsx
 GOLDEN_A64 += xlsx
@@ -3196,6 +3198,13 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  grep -q "jmp p_pasmath_$$f$$" $(BUILDDIR)/mathacc.s; \
 	done; \
 	echo ok mathacc
+	@set -e; \
+	: P553: the bits of an integer seen as a Double are an operand of Double arithmetic in a register and a movq, where a push and a pop carried it, testdata/bitview works each shape out with the view and with the Double the bytes make and compares the bits, and the functions of it hold no more than four push instructions; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/bitview testdata/bitview.paslang; \
+	$(BUILDDIR)/bitview | diff -u testdata/bitview.out -; \
+	n=$$(objdump -d --no-show-raw-insn $(BUILDDIR)/bitview | awk '/^[0-9a-f]+ <[^>]*>:/{ on = ($$2 ~ /^<p_f[0-9]+>:$$/) } on' | grep -c push) || true; \
+	[ "$$n" -le 4 ] || { echo "bitview: $$n push in its functions"; exit 1; }; \
+	echo ok bitview
 	@set -e; \
 	: the kept scripts of testdata/sqllogic are what scripts/gen_sqllogic.py writes while the system SQLite is the one that made them, P412; \
 	python3 -I scripts/gen_sqllogic.py --check
