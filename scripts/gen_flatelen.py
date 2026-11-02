@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""Writes testdata/flatelen.paslang and testdata/flatelen.out (P530): the Huffman
-codes the deflater builds for 4000 tables of frequencies of every shape (a few
-frequencies of 1 beside one of 100000, spread over 22 powers of two, growing by half
-at each symbol), for the three alphabets of a block (the 19 code lengths limited to
-7 bits, the 30 distances and the 286 literals and lengths limited to 15). Each code
-must be whole (the sum of 2^-length is exactly 1), no longer than its limit, and
-every symbol with a frequency must have a length; the program says how many cases
-fail that and the sum of frequency * length over all of them, which is worked out
-here by the same algorithm in Python (the nodes made in order of weight, the leaves
-past the limit brought back as zlib's trees.c does) and not by the compiler.
+"""Writes testdata/flatelen.paslang and testdata/flatelen.out (P530, P449): the
+Huffman codes the deflater builds (TFlateHuff, the code of Go's
+compress/flate) for 4000 tables of frequencies of every shape (a few
+frequencies of 1 beside one of 60000, spread over 16 powers of two, growing by
+half at each symbol), for the three alphabets of a block (the 19 code lengths
+limited to 7 bits, the 30 distances and the 286 literals and lengths limited
+to 15). Each code must be whole (the sum of 2^-length is exactly 1), no longer
+than its limit, and every symbol with a frequency must have a length; the
+program says how many cases fail that and the sum of frequency * length over
+all of them, which must be the least any code within the limit can have: it is
+worked out here by the package-merge algorithm (Larmore and Hirschberg), not by
+the compiler.
 
 usage: gen_flatelen.py [--check]    --check writes nothing and fails when the two
 files in testdata are not what this script writes
@@ -44,7 +46,7 @@ class Rng:
         return ((self.s & MASK) >> 33) % m
 
 
-TABLE = [0, 0, 1, 1, 2, 3, 5, 100000]
+TABLE = [0, 0, 1, 1, 2, 3, 5, 60000]
 
 
 def tables(rng):
@@ -56,103 +58,60 @@ def tables(rng):
         if kind == 0:
             f = 0 if rng.below(5) == 0 else TABLE[rng.below(8)]
         elif kind == 1:
-            f = 0 if rng.below(10) == 0 else 1 << rng.below(22)
+            f = 0 if rng.below(10) == 0 else 1 << rng.below(16)
         else:
             f = 0 if rng.below(20) == 0 else a
-            a = min(a + a // 2 + 1, 1000000000)
+            a = min(a + a // 2 + 1, 65535)
         freq.append(f)
     return n, freq
 
 
-def lengths(freq, mb):
-    """the code BuildCodes makes: None if fewer than two symbols have a frequency"""
-    syms = sorted((f, i) for i, f in enumerate(freq) if f > 0)
-    cnt = len(syms)
-    if cnt < 2:
+def least_cost(freq, mb):
+    """the least sum of frequency * length of a code of lengths up to mb for the
+    symbols with a frequency (package-merge): None if fewer than two have one"""
+    w = sorted(f for f in freq if f > 0)
+    n = len(w)
+    if n < 2:
         return None
-    w = [s[0] for s in syms] + [0] * cnt
-    par = [0] * (2 * cnt)
-    a, b, ni = 0, cnt, cnt
-    for _ in range(cnt - 1):
-        if a < cnt and (b >= ni or w[a] <= w[b]):
-            x = a
-            a += 1
-        else:
-            x = b
-            b += 1
-        if a < cnt and (b >= ni or w[a] <= w[b]):
-            y = a
-            a += 1
-        else:
-            y = b
-            b += 1
-        par[x] = ni
-        par[y] = ni
-        w[ni] = w[x] + w[y]
-        ni += 1
-    depth = [0] * (2 * cnt)
-    for x in range(ni - 2, -1, -1):
-        depth[x] = depth[par[x]] + 1
-    bl = [0] * 17
-    overflow = 0
-    for i in range(cnt):
-        d = depth[i]
-        if d > mb:
-            d = mb
-            overflow += 1
-        bl[d] += 1
-    for x in range(cnt, ni - 1):
-        if depth[x] > mb:
-            overflow += 1
-    while overflow > 0:
-        bits = mb - 1
-        while bl[bits] == 0:
-            bits -= 1
-        bl[bits] -= 1
-        bl[bits + 1] += 2
-        bl[mb] -= 1
-        overflow -= 2
-    ln = [0] * len(freq)
-    pos = 0
-    for bits in range(mb, 0, -1):
-        for _ in range(bl[bits]):
-            ln[syms[pos][1]] = bits
-            pos += 1
-    return ln
+    cur = list(w)
+    for _ in range(mb - 1):
+        packages = [cur[i] + cur[i + 1] for i in range(0, len(cur) - 1, 2)]
+        cur = sorted(w + packages)
+    return sum(cur[:2 * n - 2])
 
 
 def expected():
     rng = Rng(530)
-    done = skipped = bad = 0
-    cost = 0
+    done = skipped = cost = 0
     for _ in range(CASES):
         n, freq = tables(rng)
         mb = 7 if n == 19 else 15
-        ln = lengths(freq, mb)
-        if ln is None:
+        c = least_cost(freq, mb)
+        if c is None:
             skipped += 1
             continue
         done += 1
-        kraft = sum(1 << (mb - l) for l in ln if l > 0)
-        if kraft != 1 << mb or any(l > mb for l in ln) or any(f > 0 and l == 0 for f, l in zip(freq, ln)):
-            bad += 1
-        cost += sum(f * l for f, l in zip(freq, ln))
-    return 'cases %d skipped %d bad %d cost %d\n' % (done, skipped, bad, cost)
+        cost += c
+    return 'cases %d skipped %d bad %d cost %d\n' % (done, skipped, 0, cost)
 
 
 PROGRAM = '''program flatelen;
 
-{ The Huffman codes of the deflater (P530) for 4000 tables of frequencies of
-  every shape, for the alphabets of a block: each code whole, within its
-  limit, a length for every symbol that has a frequency; the counts and the
-  sum of frequency * length are the ones scripts/gen_flatelen.py works out. }
+{ The Huffman codes of the deflater (P530, P449) for 4000 tables of
+  frequencies of every shape, for the alphabets of a block: each code
+  whole, within its limit, a length for every symbol that has a frequency;
+  the counts and the sum of frequency * length are the ones
+  scripts/gen_flatelen.py works out, the least a code within the limit can
+  have. }
 
 uses
   pasflate;
 
 var
-  d: TDeflater;
-  freq, f2, lng, code: array[0..299] of Integer;
+  d: TFlateHuff;
+  freq: array[0..299] of Integer;
+  f2: array[0..299] of UInt16;
+  lng: array[0..299] of Integer;
   tab: array[0..7] of Integer;
   seed: Int64;
   c, i, n, mb, kind, nz, a, f, done, skipped, bad: Integer;
@@ -167,8 +126,8 @@ end;
 
 begin
   tab[0] := 0; tab[1] := 0; tab[2] := 1; tab[3] := 1;
-  tab[4] := 2; tab[5] := 3; tab[6] := 5; tab[7] := 100000;
-  d := TDeflater.Create(0, 6);
+  tab[4] := 2; tab[5] := 3; tab[6] := 5; tab[7] := 60000;
+  d := TFlateHuff.Create(286);
   seed := 530;
   done := 0;
   skipped := 0;
@@ -197,7 +156,7 @@ begin
           if Rnd(10) = 0 then
             f := 0
           else
-            f := 1 shl Rnd(22);
+            f := 1 shl Rnd(16);
       else
         begin
           if Rnd(20) = 0 then
@@ -205,8 +164,8 @@ begin
           else
             f := a;
           a := a + a div 2 + 1;
-          if a > 1000000000 then
-            a := 1000000000;
+          if a > 65535 then
+            a := 65535;
         end;
       end;
       freq[i] := f;
@@ -224,8 +183,10 @@ begin
     else
       mb := 15;
     for i := 0 to n - 1 do
-      f2[i] := freq[i];
-    d.BuildCodes(@f2[0], n, mb, @lng[0], @code[0]);
+      f2[i] := UInt16(freq[i]);
+    d.Generate(PUInt16(@f2[0]), n, mb);
+    for i := 0 to n - 1 do
+      lng[i] := Integer(d.Codes[i] and 255);
     kraft := 0;
     fail := False;
     for i := 0 to n - 1 do

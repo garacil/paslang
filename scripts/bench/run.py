@@ -81,7 +81,7 @@ PAIRS = ["b1loop", "b2str", "b3spawn", "b4chan", "b5map", "b6smap", "b7narrow", 
          "b37json",
          # P426: XML read token by token (TXmlReader.Next against Decoder.Token)
          "b38xml",
-         # P427: DEFLATE at level 6 and inflate against compress/flate
+         # P427, P449: DEFLATE at level 6, inflate and many small gzip files against compress/flate
          "b39flate",
          # P433: mail (messages read into a tree, address lists, the composer, encoded words)
          "b40mail",
@@ -132,7 +132,7 @@ SECTIONS = {
                 for f in ["canada_geometry", "citm_catalog", "golang_source", "string_escaped",
                           "string_unicode", "synthea_fhir", "twitter_status"]],
     "b38xml": ["tokens"],
-    "b39flate": ["deflate", "inflate"],
+    "b39flate": ["deflate", "inflate", "small"],
     "b40mail": ["message", "addr", "build", "words"],
     "b41base64": ["roundtrip"],
     "b42http": ["requests"],

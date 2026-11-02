@@ -3,15 +3,17 @@
 // paslang is free software under the GNU General Public License,
 // version 3 or (at your option) any later version; see the file COPYING.
 
-// P427: DEFLATE against compress/flate, the Go side of
+// P427, P449: DEFLATE against compress/flate, the Go side of
 // scripts/bench/b39flate.paslang: the same worksheet compressed at level 6
 // four times and read back once (deflate), or compressed at level 1 once
-// and read back twenty times (inflate).
+// and read back twenty times (inflate), or 4000 pages of about 2 KB each
+// written as a gzip file at level 6 by a new writer (small).
 package main
 
 import (
 	"bytes"
 	"compress/flate"
+	"compress/gzip"
 	"fmt"
 	"io"
 	"os"
@@ -83,7 +85,20 @@ func main() {
 			comp = compress(text, 6)
 		}
 		back := inflate(comp)
-		fmt.Println(len(text), sum(back))
+		fmt.Println(len(text), sum(back), len(comp))
+		return
+	}
+	if section == "small" {
+		page := text[:2000]
+		total := 0
+		for i := 1; i <= 4000; i++ {
+			var b bytes.Buffer
+			w, _ := gzip.NewWriterLevel(&b, 6)
+			w.Write(append([]byte(strconv.Itoa(i)), page...))
+			w.Close()
+			total += b.Len()
+		}
+		fmt.Println(len(page), total)
 		return
 	}
 	comp := compress(text, 1)

@@ -3105,6 +3105,16 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	if grep -q 'rt_nslock' $(BUILDDIR)/stackpool_a.s; then echo "stackpool: the adjust of a stack is under a lock on arm64"; exit 1; fi; \
 	echo ok stackpool
 	@set -e; \
+	: P449: the deflater writes the bytes of the compress/flate package of Go at every level, a text in one write and in pieces with flushes between and cuts at the limits of the windows and the blocks, scripts/flate_gocheck.py compares what testdata/flatec writes with Go when go is there, and a writer fed a few bytes holds a few thousand of memory; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/flatec_go testdata/flatec.paslang; \
+	if command -v go > /dev/null 2>&1; then \
+	  GOCACHE=$$PWD/$(BUILDDIR)/gocache python3 -I scripts/flate_gocheck.py $(BUILDDIR)/flatec_go; \
+	else \
+	  echo "no go: the streams are not compared with Go's"; \
+	fi; \
+	$(BUILDDIR)/flatec_go | tail -1 | grep -qx 'bad 0'; \
+	echo ok flatego
+	@set -e; \
 	: the kept scripts of testdata/sqllogic are what scripts/gen_sqllogic.py writes while the system SQLite is the one that made them, P412; \
 	python3 -I scripts/gen_sqllogic.py --check
 	@set -e; \
@@ -5060,10 +5070,11 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	  b=$$(basename $$u .paslang); \
 	  $(OUTDIR)/paslangc -target arm64 -c -Fu $(A64DIR) -o $(A64DIR)/$$b $$u; \
 	done; \
+	: flatec takes 70 s of qemu on a machine half loaded and 240 lets a loaded one finish it, P449; \
 	for t in $(GOLDEN_A64); do \
 	  echo "==== $$t arm64 ===="; \
 	  $(OUTDIR)/paslangc -target arm64 -cpu max -o $(BUILDDIR)/$$t-arm testdata/$$t.paslang; \
-	  timeout 60 $(QEMU_A64) $(BUILDDIR)/$$t-arm > $(BUILDDIR)/$$t-arm.got; \
+	  timeout 240 $(QEMU_A64) $(BUILDDIR)/$$t-arm > $(BUILDDIR)/$$t-arm.got; \
 	  diff -u testdata/$$t.out $(BUILDDIR)/$$t-arm.got; \
 	  echo ok $$t-arm; \
 	done; \

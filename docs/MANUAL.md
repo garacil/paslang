@@ -12268,14 +12268,15 @@ gzip (RFC 1952) streams, and `uses paszip` ZIP archives (PKWARE's APPNOTE
 6.3.10), in paslang (1.1.264, P427). They are made for a workbook or a
 package taken apart, one part edited and the file written back with every
 other part as it was, and they are checked against zlib and Go on 1,893
-streams read whole and in pieces (`testdata/flate`), a writer round trip
-of twelve shapes of data at the ten levels (`testdata/flatec`, its output
-read by zlib, gzip and Go through `scripts/flate_verify.py`) and 189
-archives against Python's zipfile and Go's archive/zip (`testdata/zip`).
+streams read whole and in pieces (`testdata/flate`), a writer of
+twelve shapes of data at the eleven levels, round trip and byte for byte
+against Go's compress/flate (`testdata/flatec`, `scripts/flate_gocheck.py`;
+its output read by zlib, gzip and Go through `scripts/flate_verify.py`) and
+189 archives against Python's zipfile and Go's archive/zip (`testdata/zip`).
 
 ```pascal
 Text := ZlibDecode(Bytes);                 { EFlateError (Offset, Message) when the stream is wrong }
-Bytes := GzipEncode(Text, 6);              { levels 0 (stored) to 9; -1 is 6 }
+Bytes := GzipEncode(Text, 6);              { levels 0 (stored) to 9; -1 is 6, -2 codes the bytes alone }
 z := TInflater.Create(flGzip);             { or flRaw, flZlib }
 z.MaxOutput := 64 shl 20;                  { more than this is an error, before it is made }
 while Read(piece) do begin z.Feed(piece); Out := Out + z.Take; end;
@@ -12300,9 +12301,15 @@ Archive := w.Finish;
   `Feed`, `Take`, `Flush` (ends the block so what was fed can be read;
   zlib's Z_SYNC_FLUSH) and `Finish`, and the gzip header's name, comment
   and time; `FlateDeflate`, `ZlibEncode`, `GzipEncode` in one call. The
-  writer is zlib's algorithm with zlib's table of levels, and its streams
-  are within 0.1 % of zlib's size; what it writes is deterministic, the
-  same bytes on both machines. Refused: a preset dictionary, a method that
+  writer is the compressor of Go's `compress/flate` (1.2.355, P449): at
+  every level, -2 (the bytes coded alone) and 0 to 9, it writes the bytes
+  that package writes, for one write and for pieces with flushes between
+  (`scripts/flate_gocheck.py` compares them with Go's; levels 1 to 6 are
+  Go's fast encoders and 7 to 9 its lazy matching on hash chains), 1 %
+  more than zlib's streams on large data at level 6 and up to 14 % more
+  on a file of a few kilobytes; what it writes is deterministic, the same
+  bytes on both machines. Its memory follows its input: a stream of a few
+  hundred bytes holds 4 KB. Refused: a preset dictionary, a method that
   is not deflate, a reserved flag, a bad checksum or length, a code table
   that is not a prefix code, a distance before the start. An error says the
   byte of the input it was found at.
@@ -12325,9 +12332,12 @@ Archive := w.Finish;
   Go reads them) and `ZipNameIsSafe(name)` (no `..`, not absolute, no drive,
   no NUL) stand alone.
 - **Speed.** On an 11 MB worksheet inflate takes 18 ms against zlib's 30
-  and Go's 40; deflate at level 6 takes 190 ms against zlib's 105 and Go's
-  53 (Go's levels 1 to 6 are another algorithm that writes 1 to 2 % more;
-  P449 is the gap). `scripts/bench/b39flate` measures both.
+  and Go's 40; deflate at level 6 takes 56 ms against zlib's 105 and Go's
+  48 (it took 190 before P449), and a gzip file of 2 KB from a new writer
+  135 us against Go's 290, since the writer holds only what its input
+  needs. What is left of the gap to Go is the compiler's spills in the
+  loops of the encoders (P546). `scripts/bench/b39flate` measures all
+  three.
 - **Routines.** A reader or a writer belongs to the routine that uses it;
   any number of routines may each have one, and an archive's bytes may be
   read by any number of readers at once.

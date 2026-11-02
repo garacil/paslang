@@ -41,7 +41,10 @@ for kind, name, level, crc, length, hx in rows:
         continue
     n += 1
     if kind == "raw":
-        c = zlib.compressobj(level, zlib.DEFLATED, -15)
+        if level < 0:
+            c = zlib.compressobj(6, zlib.DEFLATED, -15, 8, zlib.Z_HUFFMAN_ONLY)
+        else:
+            c = zlib.compressobj(level, zlib.DEFLATED, -15)
         ref = len(c.compress(data) + c.flush())
         if ref:
             ratios.setdefault(level, []).append((len(blob) / ref, name, len(blob), ref))
