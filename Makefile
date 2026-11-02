@@ -701,6 +701,8 @@ GOLDEN_A64 += xmlkeep
 # P427: DEFLATE, zlib and gzip read against zlib and Go on 1893 streams, the writer round trip, ZIP against zipfile and Go.
 GOLDEN += flate flatec zip
 GOLDEN_A64 += flate flatec zip
+GOLDEN += md5lens
+GOLDEN_A64 += md5lens
 # P436: XLSX templates filled, the entries not written kept as they were.
 GOLDEN += xlsx
 GOLDEN_A64 += xlsx
@@ -3114,6 +3116,14 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	fi; \
 	$(BUILDDIR)/flatec_go | tail -1 | grep -qx 'bad 0'; \
 	echo ok flatego
+	@set -e; \
+	: P547: the steps of Md5Blocks are written with what depends on the previous result last and the functions in the fewest operations, testdata/md5lens is what scripts/gen_md5lens.py writes and its expected output is hashlib.md5 of the same data for every length to 140 and some longer, and the linked routine has 32 not instructions where the old form had 48; \
+	python3 -I scripts/gen_md5lens.py --check; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/md5lens testdata/md5lens.paslang; \
+	$(BUILDDIR)/md5lens | diff -u testdata/md5lens.out -; \
+	n=$$(objdump -d --no-show-raw-insn $(BUILDDIR)/md5lens | awk '/<p_pashash_md5blocks>:/,/ret/' | grep -cE '[[:space:]]not[[:space:]]') || true; \
+	[ "$$n" -le 32 ] || { echo "md5lens: Md5Blocks has $$n not instructions"; exit 1; }; \
+	echo ok md5lens
 	@set -e; \
 	: the kept scripts of testdata/sqllogic are what scripts/gen_sqllogic.py writes while the system SQLite is the one that made them, P412; \
 	python3 -I scripts/gen_sqllogic.py --check

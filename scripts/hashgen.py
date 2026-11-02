@@ -405,19 +405,30 @@ def md5_blocks():
     r = list('abcd')
     for i in range(64):
         A, B, C, D = r
+        # a := b + RotateLeft(a + K + m + F(b, c, d), s), in the order that puts what
+        # depends on b, the previous step's result, last: a + K + m is ready long before
+        # b is, and each function is written in the form of the fewest operations after b
+        # (P547). F = d xor (b and (c xor d)); G = (c and not d) + (d and b), the two
+        # terms never both set; H = (c xor d) xor b; I = c xor (b or not d)
+        a('    %s := %s + %s;' % (A, A, hex32(MDK[i])))
         if i < 16:
-            f = '((%s and %s) or ((not %s) and %s))' % (B, C, B, D)
             g = i
+            a('    %s := %s + m%d;' % (A, A, g))
+            a('    %s := %s + (%s xor (%s and (%s xor %s)));' % (A, A, D, B, C, D))
         elif i < 32:
-            f = '((%s and %s) or ((not %s) and %s))' % (D, B, D, C)
             g = (5 * i + 1) % 16
+            a('    %s := %s + m%d;' % (A, A, g))
+            a('    %s := %s + (%s and (not %s));' % (A, A, C, D))
+            a('    %s := %s + (%s and %s);' % (A, A, D, B))
         elif i < 48:
-            f = '(%s xor %s xor %s)' % (B, C, D)
             g = (3 * i + 5) % 16
+            a('    %s := %s + m%d;' % (A, A, g))
+            a('    %s := %s + (%s xor %s xor %s);' % (A, A, C, D, B))
         else:
-            f = '(%s xor (%s or (not %s)))' % (C, B, D)
             g = (7 * i) % 16
-        a('    %s := %s + RotateLeft(%s + %s + %s + m%d, %d);' % (A, B, A, f, hex32(MDK[i]), g, MDS[i]))
+            a('    %s := %s + m%d;' % (A, A, g))
+            a('    %s := %s + (%s xor (%s or (not %s)));' % (A, A, C, B, D))
+        a('    %s := %s + RotateLeft(%s, %d);' % (A, B, A, MDS[i]))
         r = [r[3], r[0], r[1], r[2]]
     for i, n in enumerate('abcd'):
         a('    StoreLE32(%s, LoadLE32(%s) + %s);' % (addr('State', 4 * i), addr('State', 4 * i), n))
