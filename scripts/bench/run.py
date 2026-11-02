@@ -113,7 +113,7 @@ SECTIONS = {
     "b21text": ["hex", "runes"],
     "b22rand": ["own", "below", "real", "global", "globalpar"],
     "b23date": ["stamp", "date", "full"],
-    "b24math": ["sin", "exp", "ln", "sqrt", "pow", "atan"],
+    "b24math": ["sin", "exp", "ln", "sqrt", "pow", "atan", "tan", "sinh", "tanh", "asinh", "log1p"],
     "b25exec": ["serial", "par"],
     "b26slice": ["ints", "strings"],
     "b27call": ["iface", "closure", "proc"],

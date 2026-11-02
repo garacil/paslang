@@ -711,6 +711,8 @@ GOLDEN += sha512lens
 GOLDEN_A64 += sha512lens
 GOLDEN += realdest
 GOLDEN_A64 += realdest
+GOLDEN += mathacc
+GOLDEN_A64 += mathacc
 # P436: XLSX templates filled, the entries not written kept as they were.
 GOLDEN += xlsx
 GOLDEN_A64 += xlsx
@@ -3184,6 +3186,16 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	n=$$(grep -c '^ ' $(BUILDDIR)/realdest_b.fn) || true; \
 	[ "$$n" -le 20000 ] || { echo "realdest: $$n instructions at the base level"; exit 1; }; \
 	echo ok realdest
+	@set -e; \
+	: P539: Tan Sinh Cosh Tanh ArcSinh ArcCosh ArcTanh LnXP1 and Power are Go algorithms in the core unit pasmath and the runtime entries jump into it, testdata/mathacc is what scripts/gen_mathacc.py writes and its expected output says that each result is within the units in the last place of the correctly rounded value that Go has and has the bits of the model of Go code; \
+	python3 -I scripts/gen_mathacc.py --check; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/mathacc testdata/mathacc.paslang; \
+	$(BUILDDIR)/mathacc | diff -u testdata/mathacc.out -; \
+	grep -q "jb p_pasmath_pastan$$" $(BUILDDIR)/mathacc.s; \
+	for f in pastanbig passinh pascosh pastanh pasasinh pasacosh pasatanh paslog1p paspow; do \
+	  grep -q "jmp p_pasmath_$$f$$" $(BUILDDIR)/mathacc.s; \
+	done; \
+	echo ok mathacc
 	@set -e; \
 	: the kept scripts of testdata/sqllogic are what scripts/gen_sqllogic.py writes while the system SQLite is the one that made them, P412; \
 	python3 -I scripts/gen_sqllogic.py --check

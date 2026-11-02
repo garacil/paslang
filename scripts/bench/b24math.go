@@ -56,8 +56,30 @@ func main() {
 		for i := 1; i <= 10000000; i++ {
 			t += math.Atan(float64(i) / 997)
 		}
+	case "tan":
+		for i := 1; i <= 10000000; i++ {
+			t += math.Tan(float64(i) / 997)
+		}
+	case "sinh":
+		for i := 1; i <= 10000000; i++ {
+			x := float64(i%2000)/100 - 10
+			t += math.Sinh(x)
+		}
+	case "tanh":
+		for i := 1; i <= 10000000; i++ {
+			x := float64(i%2000)/500 - 2
+			t += math.Tanh(x)
+		}
+	case "asinh":
+		for i := 1; i <= 10000000; i++ {
+			t += math.Asinh(float64(i) / 997)
+		}
+	case "log1p":
+		for i := 1; i <= 10000000; i++ {
+			t += math.Log1p(float64(i) / 997)
+		}
 	default:
-		fmt.Println("b24math: sin, exp, ln, sqrt, pow or atan")
+		fmt.Println("b24math: sin, exp, ln, sqrt, pow, atan, tan, sinh, tanh, asinh or log1p")
 		os.Exit(2)
 	}
 	fmt.Println(int64(t * 1000))

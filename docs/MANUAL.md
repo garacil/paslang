@@ -7998,6 +7998,19 @@ cosines tried, by 701 units for `Exp(-689)`, by fifteen million for
 `Ln(0.99994)`, and `Ln` of a number below 2.2e-308 stopped with
 `ln domain`.
 
+`Tan`, `Sinh`, `Cosh`, `Tanh`, `ArcSinh`, `ArcCosh`, `ArcTanh`, `LnXP1` and `Power` are Go's
+algorithms too (P539: `tan.go`, `sinh.go`, `tanh.go`, `asinh.go`, `acosh.go`, `atanh.go`,
+`log1p.go` and `pow.go`). `Tan`, `ArcSinh`, `ArcCosh`, `ArcTanh` and `LnXP1` give Go's bits; `Sinh`,
+`Cosh`, `Tanh` and `Power` call `Exp`, and Go's `Exp` on amd64 is assembly, so they are within
+a unit in the last place of Go's, and the bits of Go's on arm64. Each is within one unit of the
+correctly rounded value on every argument tried (`Power`: within seven, as Go's is; `Tan` near
+a pole of the tangent is off by what Go's is). What they replaced lost the digits of a small
+argument: `Sinh(1e-10)` and `LnXP1(1e-10)` had eight digits right, `ArcTanh(1e-5)` ten, and
+`Power(2, 0.5)` and its kin were off by up to 149 units. The arguments for which these stop
+(`ArcCosh` below 1, `ArcTanh` of magnitude 1 or more, `LnXP1` of -1 or less, `Power` of a
+base not above zero with an exponent that is not an integer) are the same, and
+`Power(-0.0, 3)` is `-0.0`, as in Go.
+
 | Routine | Gives | Stops on (message) |
 |---|---|---|
 | `Abs(x)`, `Sqr(x)` | the absolute value, the square: of an integer an `Integer`, which wraps (`Abs` of the lowest `Integer` is itself), of a real a real of its type | |
