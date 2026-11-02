@@ -705,6 +705,8 @@ GOLDEN += md5lens
 GOLDEN_A64 += md5lens
 GOLDEN += crclens
 GOLDEN_A64 += crclens
+GOLDEN += sha3lens
+GOLDEN_A64 += sha3lens
 # P436: XLSX templates filled, the entries not written kept as they were.
 GOLDEN += xlsx
 GOLDEN_A64 += xlsx
@@ -3136,6 +3138,14 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	n=$$(objdump -d --no-show-raw-insn $(BUILDDIR)/crclens_b | awk '/<p_pashash_crc32plain>:/,/ret/' | grep -c 'shr') || true; \
 	[ "$$n" -ge 14 ] || { echo "crclens: Crc32Plain has $$n shifts"; exit 1; }; \
 	echo ok crclens
+	@set -e; \
+	: P550: Keccak-f runs two rounds a step of its loop with theta taken into rho and pi, a plane of chi at a time and the column parities taken as the lanes are made, testdata/sha3lens is what scripts/gen_sha3lens.py writes and its expected output is hashlib sha3_224 to sha3_512 of the same data, and the linked routine has the rotates of two rounds; \
+	python3 -I scripts/gen_sha3lens.py --check; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/sha3lens testdata/sha3lens.paslang; \
+	$(BUILDDIR)/sha3lens | diff -u testdata/sha3lens.out -; \
+	n=$$(objdump -d --no-show-raw-insn $(BUILDDIR)/sha3lens | awk '/<p_pashash_keccakf>:/,/ret/' | grep -cE '[[:space:]]rol[qdl]?[[:space:]]') || true; \
+	[ "$$n" -ge 50 ] || { echo "sha3lens: KeccakF has $$n rotates"; exit 1; }; \
+	echo ok sha3lens
 	@set -e; \
 	: the kept scripts of testdata/sqllogic are what scripts/gen_sqllogic.py writes while the system SQLite is the one that made them, P412; \
 	python3 -I scripts/gen_sqllogic.py --check

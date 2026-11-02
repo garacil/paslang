@@ -441,38 +441,46 @@ def keccak():
     L = []
     a = L.append
     a('{ Keccak-f[1600] (FIPS 202, 3.2 and 3.3): the 25 lanes in variables, each')
-    a('  step written out, the 24 rounds in a loop, the round constants and')
-    a('  the rotations of Table 2 in place. }')
+    a('  step written out, two rounds in the loop (the lanes of the second are the first')
+    a('  round\'s output and its own go back to the first\'s names, so nothing is copied),')
+    a('  the round constants and the rotations of Table 2 in place; theta is taken into rho')
+    a('  and pi, the five lanes of a plane of chi are made one plane at a time, and the')
+    a('  column parities of the next round are taken as the lanes are made (P550). }')
     a('procedure KeccakF(A: Pointer);')
     a('var')
     a('  ' + ', '.join('a%d' % i for i in range(25)) + ': Integer;')
-    a('  ' + ', '.join('b%d' % i for i in range(25)) + ': Integer;')
+    a('  ' + ', '.join('e%d' % i for i in range(25)) + ': Integer;')
+    a('  b0, b1, b2, b3, b4: Integer;')
     a('  c0, c1, c2, c3, c4, d0, d1, d2, d3, d4: Integer;')
     a('  r: Integer;')
     a('begin')
     for i in range(25):
         a('  a%d := LoadLE64(%s);' % (i, addr('A', 8 * i)))
-    a('  for r := 0 to 23 do')
+    for x in range(5):
+        a('  c%d := a%d xor a%d xor a%d xor a%d xor a%d;' % (x, x, x + 5, x + 10, x + 15, x + 20))
+    a('  for r := 0 to 11 do')
     a('  begin')
-    for x in range(5):
-        a('    c%d := a%d xor a%d xor a%d xor a%d xor a%d;' % (x, x, x + 5, x + 10, x + 15, x + 20))
-    for x in range(5):
-        a('    d%d := c%d xor RotateLeft(c%d, 1);' % (x, (x + 4) % 5, (x + 1) % 5))
-    for y in range(5):
+    for half, (src, dst) in enumerate((('a', 'e'), ('e', 'a'))):
         for x in range(5):
-            a('    a%d := a%d xor d%d;' % (x + 5 * y, x + 5 * y, x))
-    for y in range(5):
+            a('    d%d := c%d xor RotateLeft(c%d, 1);' % (x, (x + 4) % 5, (x + 1) % 5))
+        for yo in range(5):
+            for xo in range(5):
+                sx = (3 * (yo - 3 * xo)) % 5
+                sy = xo
+                si = sx + 5 * sy
+                if KROT[si] == 0:
+                    a('    b%d := %s%d xor d%d;' % (xo, src, si, sx))
+                else:
+                    a('    b%d := RotateLeft(%s%d xor d%d, %d);' % (xo, src, si, sx, KROT[si]))
+            for xo in range(5):
+                i = xo + 5 * yo
+                e = '(b%d xor ((not b%d) and b%d))' % (xo, (xo + 1) % 5, (xo + 2) % 5)
+                if i == 0:
+                    a('    %s0 := %s xor KeccakRC[r * 2 + %d];' % (dst, e, half))
+                else:
+                    a('    %s%d := %s;' % (dst, i, e))
         for x in range(5):
-            src = x + 5 * y
-            dst = y + 5 * ((2 * x + 3 * y) % 5)
-            if KROT[src] == 0:
-                a('    b%d := a%d;' % (dst, src))
-            else:
-                a('    b%d := RotateLeft(a%d, %d);' % (dst, src, KROT[src]))
-    for y in range(5):
-        for x in range(5):
-            a('    a%d := b%d xor ((not b%d) and b%d);' % (x + 5 * y, x + 5 * y, (x + 1) % 5 + 5 * y, (x + 2) % 5 + 5 * y))
-    a('    a0 := a0 xor KeccakRC[r];')
+            a('    c%d := %s%d xor %s%d xor %s%d xor %s%d xor %s%d;' % (x, dst, x, dst, x + 5, dst, x + 10, dst, x + 15, dst, x + 20))
     a('  end;')
     for i in range(25):
         a('  StoreLE64(%s, a%d);' % (addr('A', 8 * i), i))
