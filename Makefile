@@ -170,6 +170,8 @@ GOLDEN += dflat
 GOLDEN_A64 += dflat
 GOLDEN += signs
 GOLDEN_A64 += signs
+GOLDEN += stackpool
+GOLDEN_A64 += stackpool
 GOLDEN += syshelpers sysguid
 GOLDEN_A64 += syshelpers sysguid
 GOLDEN += sysfamilies
@@ -3091,6 +3093,17 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/signs_a testdata/signs.paslang; \
 	python3 -I scripts/check_signs.py $(BUILDDIR)/signs_s.s $(BUILDDIR)/signs_a.s $(BUILDDIR)/pasmath.s; \
 	echo ok signs
+	@set -e; \
+	: P256: the stacks of routines that finish or move are kept for the next growth, each size in a list of its own with a lock of its own, a routine that finished has its first stack again, and the stacks of two routines are adjusted at the same time with no lock, testdata/stackpool is what scripts/gen_stackpool.py writes and its expected output is worked out in Python; \
+	python3 -I scripts/gen_stackpool.py --check; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/stackpool_s testdata/stackpool.paslang; \
+	$(BUILDDIR)/stackpool_s | diff -u testdata/stackpool.out -; \
+	grep -q '^rt_stackfree:' $(BUILDDIR)/stackpool_s.s; \
+	if grep -q 'rt_nslock' $(BUILDDIR)/stackpool_s.s; then echo "stackpool: the adjust of a stack is under a lock"; exit 1; fi; \
+	$(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/stackpool_a testdata/stackpool.paslang; \
+	grep -q '^rt_stackfree:' $(BUILDDIR)/stackpool_a.s; \
+	if grep -q 'rt_nslock' $(BUILDDIR)/stackpool_a.s; then echo "stackpool: the adjust of a stack is under a lock on arm64"; exit 1; fi; \
+	echo ok stackpool
 	@set -e; \
 	: the kept scripts of testdata/sqllogic are what scripts/gen_sqllogic.py writes while the system SQLite is the one that made them, P412; \
 	python3 -I scripts/gen_sqllogic.py --check
