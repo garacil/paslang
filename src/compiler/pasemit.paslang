@@ -19317,6 +19317,13 @@ begin
     Result := True;
     Exit;
   end;
+  { Double(n) of an integer leaf (P540): cvtsi2sd into the register itself }
+  if (E^.Kind = ekCall) and (E^.Name = 'rt_int2real') and (Length(E^.Args) = 1) and
+    (E^.Args[0] <> nil) and (TKind(E^.Args[0]^.Typ) <> tykReal) and RealLeaf(E^.Args[0]) then
+  begin
+    Result := True;
+    Exit;
+  end;
   { Fma (P425) of three operands that are Doubles' or integers': in K, K + 1 and
     K + 2, the instruction at the end }
   if (E^.Kind = ekCall) and (E^.Name = 'rt_fma') and (Length(E^.Args) = 3) and (K <= 5) then
@@ -19566,6 +19573,12 @@ begin
       Line('  xorpd ' + r + ', ' + r)
     else
       Line('  movsd ' + InternReal(E^.Num) + '(%rip), ' + r);
+    Exit;
+  end;
+  if (E^.Kind = ekCall) and (E^.Name = 'rt_int2real') and (Length(E^.Args) = 1) and
+    (E^.Args[0] <> nil) and (TKind(E^.Args[0]^.Typ) <> tykReal) and RealLeaf(E^.Args[0]) then
+  begin
+    RealTo(E^.Args[0], K);
     Exit;
   end;
   if RealLeaf(E) then
@@ -20396,7 +20409,7 @@ end;
 function TEmitter.EmitRealFn(E: PExpr): Boolean;
 var
   a, b: string;
-  isreal, sg: Boolean;
+  isreal, sg, viaReal: Boolean;
   k: LongInt;
   i: SizeInt;
 begin
@@ -20966,7 +20979,15 @@ begin
   Result := True;
   if Length(E^.Args) < 1 then
     Refuse('isreal builtin');
-  EmitExpr(E^.Args[0]);
+  { Trunc, Round, Floor and Ceil of a Double (P540): amd64 works the argument out in xmm0
+    itself, with no trip through rax and back }
+  viaReal := (not FArm) and ((E^.Name = 'rt_trunc') or (E^.Name = 'rt_round') or
+    (E^.Name = 'rt_floor') or (E^.Name = 'rt_ceil')) and (TKind(E^.Args[0]^.Typ) = tykReal) and
+    RealOperand(E^.Args[0], 0);
+  if viaReal then
+    RealTo(E^.Args[0], 0)
+  else
+    EmitExpr(E^.Args[0]);
   { A Single argument of a Double routine widens exactly (P101). }
   if E^.Args[0]^.Typ = TySingle then
     ArgToDouble(TySingle);
@@ -20983,7 +21004,8 @@ begin
       end
       else
       begin
-        Line('  movq %rax, %xmm0');
+        if not viaReal then
+          Line('  movq %rax, %xmm0');
         Line('  cvttsd2siq %xmm0, %rax');
         RealIntCheck;
       end;
@@ -21001,7 +21023,8 @@ begin
       end
       else
       begin
-        Line('  movq %rax, %xmm0');
+        if not viaReal then
+          Line('  movq %rax, %xmm0');
         Line('  cvtsd2siq %xmm0, %rax');
         RealIntCheck;
       end;
@@ -21020,7 +21043,8 @@ begin
       else
       begin
         a := Lab;
-        Line('  movq %rax, %xmm0');
+        if not viaReal then
+          Line('  movq %rax, %xmm0');
         Line('  cvttsd2siq %xmm0, %rax');
         RealIntCheck;
         Line('  cvtsi2sdq %rax, %xmm1');
@@ -21044,7 +21068,8 @@ begin
       else
       begin
         a := Lab;
-        Line('  movq %rax, %xmm0');
+        if not viaReal then
+          Line('  movq %rax, %xmm0');
         Line('  cvttsd2siq %xmm0, %rax');
         RealIntCheck;
         Line('  cvtsi2sdq %rax, %xmm1');
@@ -32188,7 +32213,9 @@ begin
         (E^.Name = 'rt_absint') or (E^.Name = 'rt_bitchk') or (E^.Name = 'rt_rot') or
         (E^.Name = 'rt_funnel') or (E^.Name = 'rt_carry') or
         (E^.Name = 'rt_sqrt') or (E^.Name = 'rt_sqrreal') or (E^.Name = 'rt_int2real') or
-        (E^.Name = 'rt_absreal') or (E^.Name = 'rt_fma') or (E^.Name = 'rt_fmas') then
+        (E^.Name = 'rt_absreal') or (E^.Name = 'rt_fma') or (E^.Name = 'rt_fmas') or
+        (E^.Name = 'rt_trunc') or (E^.Name = 'rt_round') or (E^.Name = 'rt_floor') or
+        (E^.Name = 'rt_ceil') then
       begin
         for i := 0 to High(E^.Args) do
           if not PromoExprOK(E^.Args[i]) then
@@ -40403,14 +40430,20 @@ begin
   k := i1;
   if (not FArm) and (lines[i1] = '  movq %' + Tgt + ', %' + Res) then
   begin
-    { the value is in rax already: the move alone goes }
+    { the value is in rax already: the move alone goes, when nothing after it names Res or
+      works in Tgt (a split Result's second word does, P540: DateTimeToTimeStamp) }
     for i := i1 + 1 to n - 1 do
-      if (Copy(lines[i], 1, 3) <> '  .') and RegNamed(lines[i], Res) then
+      if (Copy(lines[i], 1, 3) <> '  .') and (RegNamed(lines[i], Res) or RegNamed(lines[i], Tgt)) then
         Exit;
     lines[i1] := '';
   end
   else
   begin
+    { an xmm Result is taken out of the epilogue only when its last write is the move from
+      rax, as there is no renaming of an xmm register into rax for an instruction that reads
+      it as a Double (P540) }
+    if Copy(Res, 1, 3) = 'xmm' then
+      Exit;
     if not PureWrite(lines[i1], Res) then
       Exit;
     { the write may read Tgt: one instruction reads before it writes }
@@ -40559,6 +40592,8 @@ var
   b0: SizeInt;
   changed: Boolean;
   arrive: TStrArray;
+  isr: array of Boolean;
+  nreal, nint: SizeInt;
 
   function StrToIntSafe(const T: string): LongInt;
   var
@@ -40574,6 +40609,8 @@ var
   begin
     if FArm then
       Result := StrToIntSafe(Copy(R, 2, 3))
+    else if Copy(R, 1, 3) = 'xmm' then
+      Result := 17 + StrToIntSafe(Copy(R, 4, 2))
     else if R = 'rax' then
       Result := 0
     else if R = 'rdx' then
@@ -40677,7 +40714,21 @@ begin
       SetLength(own, Length(own) + 1);
       own[High(own)] := i;
     end;
-  if Length(own) > Length(avail) then
+  { a Double of its own on amd64 lives in one of the eight registers xmm8 to xmm15, which
+    nothing saves (P540); the others in the registers above }
+  isr := nil;
+  SetLength(isr, Length(own));
+  nreal := 0;
+  nint := 0;
+  for j := 0 to High(own) do
+  begin
+    isr[j] := (not FArm) and (TKind(FSym[own[j]].Typ) = tykReal);
+    if isr[j] then
+      Inc(nreal)
+    else
+      Inc(nint);
+  end;
+  if (nint > Length(avail)) or (nreal > 8) then
     Exit;
   { where each came in: '' for a local or Result }
   arrive := nil;
@@ -40709,13 +40760,23 @@ begin
   { a parameter that came in one of the registers keeps it, and one that
     the second emission sets elsewhere (FFlatForce) }
   for j := 0 to High(own) do
-    if (arrive[j] <> '') and (InFree(arrive[j]) >= 0) then
+    if isr[j] then
+      Continue
+    else if (arrive[j] <> '') and (InFree(arrive[j]) >= 0) then
     begin
       dregs[j] := arrive[j];
       avail[InFree(arrive[j])] := '';
     end
     else if (FFlatTry = 1) and (FFlatForce[j] <> '') then
       dregs[j] := FFlatForce[j];
+  { the Doubles into the xmm registers, in the order of the symbols }
+  ai := 0;
+  for j := 0 to High(own) do
+    if isr[j] then
+    begin
+      dregs[j] := 'xmm' + IntToStr(8 + ai);
+      Inc(ai);
+    end;
   { the second emission's choices for the others (FFlatForce) }
   if FFlatTry = 1 then
     for j := 0 to High(own) do
@@ -40894,6 +40955,8 @@ begin
       Continue;
     if FArm then
       Line('  mov ' + dregs[j] + ', xzr')
+    else if isr[j] then
+      Line('  xorps %' + dregs[j] + ', %' + dregs[j])
     else
       Line('  xorl %' + X86Sub(dregs[j], 4) + ', %' + X86Sub(dregs[j], 4));
   end;
@@ -41108,15 +41171,15 @@ begin
       force[j] := '';
     { a parameter into its own arrival register }
     for j := 0 to High(own) do
-      if (arrive0[j] <> '') and (arrive0[j] <> dregs[j]) and not RegNamed(body, arrive0[j]) and
-        not RegTaken(dregs, arrive0[j]) then
+      if (not isr[j]) and (arrive0[j] <> '') and (arrive0[j] <> dregs[j]) and
+        not RegNamed(body, arrive0[j]) and not RegTaken(dregs, arrive0[j]) then
       begin
         force[j] := arrive0[j];
         changed := True;
       end;
     { Result into rax or x0 }
     for j := 0 to High(own) do
-      if FHasRes and (FSym[own[j]].Off = FResOff) and (force[j] = '') then
+      if FHasRes and (FSym[own[j]].Off = FResOff) and (force[j] = '') and (not isr[j]) then
       begin
         if FArm then
           r := 'x0'
@@ -42636,9 +42699,19 @@ begin
               locs[nl + 6] := b + ':';
               locs[nl + 7] := '  .quad ' + FLocRanges[r].B;
               locs[nl + 8] := '  .quad ' + FLocRanges[r].E;
-              locs[nl + 9] := '  .short 1';
-              locs[nl + 10] := '  .byte ' + IntToStr($50 + FLocRanges[r].Dw);
-              locs[nl + 11] := '';
+              { DW_OP_reg0 to reg31 are one byte; xmm15 is 32 (P540) and d8 to d15 are 72 to 79: DW_OP_regx }
+              if FLocRanges[r].Dw < 32 then
+              begin
+                locs[nl + 9] := '  .short 1';
+                locs[nl + 10] := '  .byte ' + IntToStr($50 + FLocRanges[r].Dw);
+                locs[nl + 11] := '';
+              end
+              else
+              begin
+                locs[nl + 9] := '  .short 2';
+                locs[nl + 10] := '  .byte 0x90';
+                locs[nl + 11] := '  .uleb128 ' + IntToStr(FLocRanges[r].Dw);
+              end;
               cur := FLocRanges[r].E;
             end;
           a := Lab;

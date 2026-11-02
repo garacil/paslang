@@ -166,6 +166,8 @@ GOLDEN += divnn
 GOLDEN_A64 += divnn
 GOLDEN += mathgo
 GOLDEN_A64 += mathgo
+GOLDEN += dflat
+GOLDEN_A64 += dflat
 GOLDEN += syshelpers sysguid
 GOLDEN_A64 += syshelpers sysguid
 GOLDEN += sysfamilies
@@ -3051,6 +3053,34 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  grep -q "jmp p_pasmath_$$f" $(BUILDDIR)/mathgo.s; \
 	done; \
 	echo ok mathgo
+	@set -e; \
+	: P540: a function of Doubles that calls nothing and has no loop keeps them in xmm8 and up with no frame, testdata/dflat is what scripts/gen_dflat.py writes and its expected output is worked out in Python floats; \
+	python3 -I scripts/gen_dflat.py --check; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/dflat_s testdata/dflat.paslang; \
+	$(BUILDDIR)/dflat_s | diff -u testdata/dflat.out -; \
+	for r in hu hp he ht hf hz hx hq hy hi hk hc hj hb hl hn hv f0 f1 f2 f3 f4 f5 f6 f7 f8 f9 f10 f11 f12 f13 f14 f15 f16 f17 f18 f19 f20 f21 f22 f23 f24 f25 f26 f27 f28 f29; do \
+	  sed -n "/^p_$$r:/,/cfi_endproc/p" $(BUILDDIR)/dflat_s.s > $(BUILDDIR)/dflat_r.s; \
+	  test -s $(BUILDDIR)/dflat_r.s; \
+	  test $$(grep -c '(%rbp)' $(BUILDDIR)/dflat_r.s) -eq 0 || { echo "$$r has a frame"; exit 1; }; \
+	  grep -q '%xmm8' $(BUILDDIR)/dflat_r.s || { echo "$$r keeps no Double in xmm8"; exit 1; }; \
+	done; \
+	for r in hv ht hf; do \
+	  sed -n "/^p_$$r:/,/cfi_endproc/p" $(BUILDDIR)/dflat_s.s > $(BUILDDIR)/dflat_r.s; \
+	  test $$(grep -c 'movq %rax, %xmm0' $(BUILDDIR)/dflat_r.s) -eq 0 || { echo "$$r carries a Double through rax into xmm0"; exit 1; }; \
+	  test $$(grep -c 'movq %xmm0, %rax' $(BUILDDIR)/dflat_r.s) -eq 0 || { echo "$$r carries a Double through rax out of xmm0"; exit 1; }; \
+	done; \
+	sed -n '/^p_hb:/,/cfi_endproc/p' $(BUILDDIR)/dflat_s.s > $(BUILDDIR)/dflat_r.s; \
+	test $$(grep -c '%xmm' $(BUILDDIR)/dflat_r.s) -eq 2 || { echo "hb takes its result through an xmm register"; exit 1; }; \
+	sed -n '/^p_hq:/,/cfi_endproc/p' $(BUILDDIR)/dflat_s.s > $(BUILDDIR)/dflat_r.s; \
+	grep -q '%xmm15' $(BUILDDIR)/dflat_r.s || { echo "hq with eight Doubles does not use xmm15"; exit 1; }; \
+	sed -n '/^p_hm:/,/cfi_endproc/p' $(BUILDDIR)/dflat_s.s > $(BUILDDIR)/dflat_r.s; \
+	test $$(grep -c '(%rbp)' $(BUILDDIR)/dflat_r.s) -ge 1 || { echo "hm with nine Doubles has no frame"; exit 1; }; \
+	python3 -I scripts/check_dflat_loc.py $(BUILDDIR)/dflat_s; \
+	$(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/dflat_a testdata/dflat.paslang; \
+	readelf --debug-dump=loc $(BUILDDIR)/dflat_a > $(BUILDDIR)/dflat_aloc.txt 2>&1; \
+	grep -q 'DW_OP_regx: 72 (' $(BUILDDIR)/dflat_aloc.txt || { echo "dflat arm64: d8 is not DW_OP_regx 72 in the location lists"; exit 1; }; \
+	if grep -q 'end of data' $(BUILDDIR)/dflat_aloc.txt; then echo "dflat arm64: a location list readelf cannot read"; exit 1; fi; \
+	echo ok dflat
 	@set -e; \
 	: the kept scripts of testdata/sqllogic are what scripts/gen_sqllogic.py writes while the system SQLite is the one that made them, P412; \
 	python3 -I scripts/gen_sqllogic.py --check
