@@ -164,6 +164,8 @@ GOLDEN += outw
 GOLDEN_A64 += outw
 GOLDEN += divnn
 GOLDEN_A64 += divnn
+GOLDEN += mathgo
+GOLDEN_A64 += mathgo
 GOLDEN += syshelpers sysguid
 GOLDEN_A64 += syshelpers sysguid
 GOLDEN += sysfamilies
@@ -804,7 +806,8 @@ CORE_UNITS := \
 	src/lib/pasfmt.paslang \
 	src/lib/passtr.paslang \
 	src/lib/pasquad.paslang \
-	src/lib/pasjson.paslang
+	src/lib/pasjson.paslang \
+	src/lib/pasmath.paslang
 
 # The library units a program reaches with a uses clause. They are not
 # part of the language, but they are part of the installation, so a
@@ -3039,6 +3042,15 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	sed -n '/^p_dpow:/,/cfi_endproc/p' $(BUILDDIR)/divnn_s.s > $(BUILDDIR)/divnn_r.s; \
 	test $$(grep -c 'imulq' $(BUILDDIR)/divnn_r.s) -eq 0; \
 	echo ok divnn
+	@set -e; \
+	: P538: Sin Cos Exp Ln and ArcTan are the functions of the Go math package in the core unit pasmath and the runtime entries jump into it, testdata/mathgo is what scripts/gen_mathgo.py writes and its expected output is those algorithms worked out in Python floats operation for operation; \
+	python3 -I scripts/gen_mathgo.py --check; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/mathgo testdata/mathgo.paslang; \
+	$(BUILDDIR)/mathgo | diff -u testdata/mathgo.out -; \
+	for f in passin pascos pasexp pasln pasatan; do \
+	  grep -q "jmp p_pasmath_$$f" $(BUILDDIR)/mathgo.s; \
+	done; \
+	echo ok mathgo
 	@set -e; \
 	: the kept scripts of testdata/sqllogic are what scripts/gen_sqllogic.py writes while the system SQLite is the one that made them, P412; \
 	python3 -I scripts/gen_sqllogic.py --check

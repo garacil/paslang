@@ -1,0 +1,484 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+
+  paslang is free software: you can redistribute it and/or modify it
+  under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+
+  paslang is distributed in the hope that it will be useful, but
+  WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+  General Public License for more details.
+
+  Under Section 7 of GPL version 3, you are granted additional
+  permissions described in the paslang Runtime Library Exception,
+  version 1.0, in the file COPYING.RUNTIME.
+
+  You should have received a copy of the GNU General Public License
+  along with paslang.  If not, see <https://www.gnu.org/licenses/>. }
+
+unit pasmath;
+
+{ The real functions Sin, Cos, Exp, Ln and ArcTan, a core unit (P538).
+
+  They are Go's: math.Sin and math.Cos (sin.go, trig_reduce.go), math.Exp
+  (exp.go), math.Log (log.go) and math.Atan (atan.go), written out in
+  Pascal in the same order of operations, so that the results are the
+  bits Go's pure code gives and are within one ulp of the correctly
+  rounded value (Exp within one on the test sets of the manual; Go's own
+  amd64 Exp, written in assembly, is within two). The argument comes in
+  and the result goes out as the Double it is; the entry points of the
+  runtime (rt_sin, rt_cos, rt_exp, rt_ln, rt_atan) check the domain and
+  jump here.
+
+  Sin and Cos reduce an argument below 2^29 by Pi/4 in three parts (the
+  Cody and Waite reduction of Cephes) and a larger one by Payne and
+  Hanek's, with the 1.2 kilobytes of 2/Pi that Go carries (MPi4). Exp
+  and Ln are the FreeBSD kernels: an argument reduction by ln 2 in two
+  parts, a polynomial in r*r. ArcTan is Cephes's rational function after
+  the reduction of the argument to [0, tan(Pi/8)].
+
+  The notices that came with the sources:
+
+  from Go's math package: Copyright 2009, 2011 The Go Authors. All rights
+  reserved. Use of this source code is governed by a BSD-style license
+  (the file LICENSE-GO).
+
+  from FreeBSD's /usr/src/lib/msun/src/e_exp.c and e_log.c: Copyright (C)
+  2004 (e_exp.c) and (C) 1993 (e_log.c) by Sun Microsystems, Inc. All
+  rights reserved. Developed at SunPro, a Sun Microsystems, Inc. business.
+  Permission to use, copy, modify, and distribute this software is freely
+  granted, provided that this notice is preserved.
+
+  from the Cephes Math Library Release 2.8: June, 2000. Copyright 1984,
+  1987, 1989, 1992, 2000 by Stephen L. Moshier. What you see here may be
+  used freely but it comes with no support or guarantee. }
+
+interface
+
+function PasSin(X: Double): Double;
+function PasCos(X: Double): Double;
+function PasSinBig(X: Double): Double;
+function PasCosBig(X: Double): Double;
+function PasExp(X: Double): Double;
+function PasLn(X: Double): Double;
+function PasAtan(X: Double): Double;
+
+implementation
+
+const
+  { Pi/4 in three parts (Go's sin.go: PI4A, PI4B, PI4C) }
+  Pi4A = 7.85398125648498535156e-1;
+  Pi4B = 3.77489470793079817668e-8;
+  Pi4C = 2.69515142907905952645e-15;
+  ReduceThreshold = 536870912.0;
+  FourOverPi = 1.2732395447351628;
+  Pi4 = 0.78539816339744830961566084581987572104929234984378;
+
+  { the coefficients of the sine and cosine kernels on [-Pi/4, Pi/4] (Go's sin.go, after Cephes) }
+  S0 = 1.58962301576546568060e-10;
+  S1 = -2.50507477628578072866e-8;
+  S2 = 2.75573136213857245213e-6;
+  S3 = -1.98412698295895385996e-4;
+  S4 = 8.33333333332211858878e-3;
+  S5 = -1.66666666666666307295e-1;
+  C0 = -1.13585365213876817300e-11;
+  C1 = 2.08757008419747316778e-9;
+  C2 = -2.75573141792967388112e-7;
+  C3 = 2.48015872888517045348e-5;
+  C4 = -1.38888888888730564116e-3;
+  C5 = 4.16666666666665929218e-2;
+
+var
+  MPi4: array[0..19] of Int64;
+  MPi4Ready: Boolean;
+
+procedure InitMPi4;
+begin
+  MPi4[0] := $0000000000000001;
+  MPi4[1] := $45f306dc9c882a53;
+  MPi4[2] := $f84eafa3ea69bb81;
+  MPi4[3] := $b6c52b3278872083;
+  MPi4[4] := $fca2c757bd778ac3;
+  MPi4[5] := $6e48dc74849ba5c0;
+  MPi4[6] := $0c925dd413a32439;
+  MPi4[7] := $fc3bd63962534e7d;
+  MPi4[8] := $d1046bea5d768909;
+  MPi4[9] := $d338e04d68befc82;
+  MPi4[10] := $7323ac7306a673e9;
+  MPi4[11] := $3908bf177bf25076;
+  MPi4[12] := $3ff12fffbc0b301f;
+  MPi4[13] := $de5e2316b414da3e;
+  MPi4[14] := $da6cfd9e4f96136e;
+  MPi4[15] := $9e8c7ecd3cbfd45a;
+  MPi4[16] := $ea4f758fd7cbe2f6;
+  MPi4[17] := $7a0e73ef14a525d4;
+  MPi4[18] := $d7f6bf623f1aba10;
+  MPi4[19] := $ac06608df8f6d757;
+  MPi4Ready := True;
+end;
+
+{ Payne and Hanek's reduction of a large argument (Go's trig_reduce.go): J is the octant
+  and Z the remainder times Pi/4. }
+procedure TrigReduce(X: Double; out J: Int64; out Z: Double);
+var
+  ix, ex, digit, bsh, z0, z1, z2, z2hi, z1hi, z1lo, z0lo, lo, hi, e: Int64;
+  lz: Integer;
+  c: Int64;
+begin
+  if not MPi4Ready then
+    InitMPi4;
+  if X < Pi4 then
+  begin
+    J := 0;
+    Z := X;
+    Exit;
+  end;
+  ix := X as Int64;
+  ex := ((ix shr 52) and 2047) - 1023 - 52;
+  ix := (ix and $000FFFFFFFFFFFFF) or $0010000000000000;
+  digit := (ex + 61) div 64;
+  bsh := (ex + 61) mod 64;
+  if bsh = 0 then
+  begin
+    z0 := MPi4[digit];
+    z1 := MPi4[digit + 1];
+    z2 := MPi4[digit + 2];
+  end
+  else
+  begin
+    z0 := (MPi4[digit] shl bsh) or (MPi4[digit + 1] shr (64 - bsh));
+    z1 := (MPi4[digit + 1] shl bsh) or (MPi4[digit + 2] shr (64 - bsh));
+    z2 := (MPi4[digit + 2] shl bsh) or (MPi4[digit + 3] shr (64 - bsh));
+  end;
+  z2hi := MulHi(z2, ix);
+  z1hi := MulHi(z1, ix);
+  z1lo := z1 * ix;
+  z0lo := z0 * ix;
+  lo := AddCarry(z1lo, z2hi, 0, c);
+  hi := AddCarry(z0lo, z1hi, c, c);
+  J := hi shr 61;
+  hi := (hi shl 3) or (lo shr 61);
+  lz := LeadingZeros(hi);
+  e := 1023 - (lz + 1);
+  hi := (hi shl (lz + 1)) or (lo shr (64 - (lz + 1)));
+  hi := hi shr 12;
+  hi := hi or (e shl 52);
+  Z := hi as Double;
+  if (J and 1) = 1 then
+  begin
+    J := (J + 1) and 7;
+    Z := Z - 1.0;
+  end;
+  Z := Z * Pi4;
+end;
+
+{ The sine of X, 0 <= |X| < 2^29 (a zero, a denormal or a number the reduction by Pi/4 in
+  three parts takes): the runtime's rt_sin sends the other arguments, an infinity, a NaN
+  and the large, to PasSinBig. No call: the routine is a leaf. }
+function PasSin(X: Double): Double;
+var
+  b, j, sg: Int64;
+  y, z, zz: Double;
+begin
+  b := X as Int64;
+  sg := b and $8000000000000000;
+  X := (b and $7FFFFFFFFFFFFFFF) as Double;
+  j := Trunc(X * FourOverPi);
+  y := j + (j and 1);
+  j := (j + (j and 1)) and 7;
+  z := ((X - y * Pi4A) - y * Pi4B) - y * Pi4C;
+  if j > 3 then
+  begin
+    sg := sg xor $8000000000000000;
+    j := j - 4;
+  end;
+  zz := z * z;
+  if (j = 1) or (j = 2) then
+    y := 1.0 - 0.5 * zz + zz * zz * ((((((C0 * zz) + C1) * zz + C2) * zz + C3) * zz + C4) * zz + C5)
+  else
+    y := z + z * zz * ((((((S0 * zz) + S1) * zz + S2) * zz + S3) * zz + S4) * zz + S5);
+  Result := ((y as Int64) xor sg) as Double;
+end;
+
+{ The cosine of X, 0 <= |X| < 2^29, as PasSin. }
+function PasCos(X: Double): Double;
+var
+  b, j, sg: Int64;
+  y, z, zz: Double;
+begin
+  b := X as Int64;
+  sg := 0;
+  X := (b and $7FFFFFFFFFFFFFFF) as Double;
+  j := Trunc(X * FourOverPi);
+  y := j + (j and 1);
+  j := (j + (j and 1)) and 7;
+  z := ((X - y * Pi4A) - y * Pi4B) - y * Pi4C;
+  if j > 3 then
+  begin
+    j := j - 4;
+    sg := sg xor $8000000000000000;
+  end;
+  if j > 1 then
+    sg := sg xor $8000000000000000;
+  zz := z * z;
+  if (j = 1) or (j = 2) then
+    y := z + z * zz * ((((((S0 * zz) + S1) * zz + S2) * zz + S3) * zz + S4) * zz + S5)
+  else
+    y := 1.0 - 0.5 * zz + zz * zz * ((((((C0 * zz) + C1) * zz + C2) * zz + C3) * zz + C4) * zz + C5);
+  Result := ((y as Int64) xor sg) as Double;
+end;
+
+{ Any argument: a NaN or an infinity has no sine, a small one is PasSin's, a large one
+  is reduced by Payne and Hanek's method (TrigReduce). }
+function PasSinBig(X: Double): Double;
+var
+  b, j, sg: Int64;
+  y, z, zz: Double;
+begin
+  b := X as Int64;
+  if ((b shr 52) and 2047) = 2047 then
+  begin
+    Result := $7FF8000000000000 as Double;
+    Exit;
+  end;
+  if (b and $7FFFFFFFFFFFFFFF) < $41C0000000000000 then
+  begin
+    Result := PasSin(X);
+    Exit;
+  end;
+  sg := b and $8000000000000000;
+  TrigReduce((b and $7FFFFFFFFFFFFFFF) as Double, j, z);
+  if j > 3 then
+  begin
+    sg := sg xor $8000000000000000;
+    j := j - 4;
+  end;
+  zz := z * z;
+  if (j = 1) or (j = 2) then
+    y := 1.0 - 0.5 * zz + zz * zz * ((((((C0 * zz) + C1) * zz + C2) * zz + C3) * zz + C4) * zz + C5)
+  else
+    y := z + z * zz * ((((((S0 * zz) + S1) * zz + S2) * zz + S3) * zz + S4) * zz + S5);
+  Result := ((y as Int64) xor sg) as Double;
+end;
+
+function PasCosBig(X: Double): Double;
+var
+  b, j, sg: Int64;
+  y, z, zz: Double;
+begin
+  b := X as Int64;
+  if ((b shr 52) and 2047) = 2047 then
+  begin
+    Result := $7FF8000000000000 as Double;
+    Exit;
+  end;
+  if (b and $7FFFFFFFFFFFFFFF) < $41C0000000000000 then
+  begin
+    Result := PasCos(X);
+    Exit;
+  end;
+  sg := 0;
+  TrigReduce((b and $7FFFFFFFFFFFFFFF) as Double, j, z);
+  if j > 3 then
+  begin
+    j := j - 4;
+    sg := sg xor $8000000000000000;
+  end;
+  if j > 1 then
+    sg := sg xor $8000000000000000;
+  zz := z * z;
+  if (j = 1) or (j = 2) then
+    y := z + z * zz * ((((((S0 * zz) + S1) * zz + S2) * zz + S3) * zz + S4) * zz + S5)
+  else
+    y := 1.0 - 0.5 * zz + zz * zz * ((((((C0 * zz) + C1) * zz + C2) * zz + C3) * zz + C4) * zz + C5);
+  Result := ((y as Int64) xor sg) as Double;
+end;
+
+{ Go's math.Exp, the FreeBSD e_exp.c (exp.go, expmulti); the scaling by 2^k (Go's Ldexp) is
+  written out, so that the routine calls nothing. }
+function PasExp(X: Double): Double;
+const
+  Ln2Hi = 6.93147180369123816490e-01;
+  Ln2Lo = 1.90821492927058770002e-10;
+  Log2e = 1.44269504088896338700e+00;
+  Overflow = 7.09782712893383973096e+02;
+  Underflow = -7.45133219101941108420e+02;
+  NearZero = 3.7252902984619140625e-09;
+  P1 = 1.66666666666666657415e-01;
+  P2 = -2.77777777770155933842e-03;
+  P3 = 6.61375632143793436117e-05;
+  P4 = -1.65339022054652515390e-06;
+  P5 = 4.13813679705723846039e-08;
+var
+  k, b, e: Int64;
+  hi, lo, r, t, c, y, m: Double;
+begin
+  if X <> X then
+  begin
+    Result := X;
+    Exit;
+  end;
+  if X > Overflow then
+  begin
+    Result := $7FF0000000000000 as Double;
+    Exit;
+  end;
+  if X < Underflow then
+  begin
+    Result := 0.0;
+    Exit;
+  end;
+  if (X > -NearZero) and (X < NearZero) then
+  begin
+    Result := 1.0 + X;
+    Exit;
+  end;
+  if X < 0 then
+    k := Trunc(Log2e * X - 0.5)
+  else
+    k := Trunc(Log2e * X + 0.5);
+  hi := X - k * Ln2Hi;
+  lo := k * Ln2Lo;
+  r := hi - lo;
+  t := r * r;
+  c := r - t * (P1 + t * (P2 + t * (P3 + t * (P4 + t * P5))));
+  y := 1.0 - ((lo - (r * c) / (2.0 - c)) - hi);
+  { Ldexp(y, k): y is between 0.5 and 2 }
+  b := y as Int64;
+  e := ((b shr 52) and 2047) - 1023 + k;
+  if e < -1075 then
+  begin
+    Result := 0.0;
+    Exit;
+  end;
+  if e > 1023 then
+  begin
+    Result := $7FF0000000000000 as Double;
+    Exit;
+  end;
+  m := 1.0;
+  if e < -1022 then
+  begin
+    e := e + 53;
+    m := 1.1102230246251565404e-16;
+  end;
+  b := (b and $800FFFFFFFFFFFFF) or ((e + 1023) shl 52);
+  Result := m * (b as Double);
+end;
+
+{ Go's math.Log, the FreeBSD e_log.c (log.go); X is positive (the caller's domain check) }
+function PasLn(X: Double): Double;
+const
+  Ln2Hi = 6.93147180369123816490e-01;
+  Ln2Lo = 1.90821492927058770002e-10;
+  L1 = 6.666666666666735130e-01;
+  L2 = 3.999999999940941908e-01;
+  L3 = 2.857142874366239149e-01;
+  L4 = 2.222219843214978396e-01;
+  L5 = 1.818357216161805012e-01;
+  L6 = 1.531383769920937332e-01;
+  L7 = 1.479819860511658591e-01;
+  HalfSqrt2 = 0.70710678118654752440;
+var
+  b, ki: Int64;
+  f1, f, k, s, s2, s4, t1, t2, rr, hfsq: Double;
+begin
+  b := X as Int64;
+  if ((b shr 52) and 2047) = 2047 then
+  begin
+    Result := X;
+    Exit;
+  end;
+  if X <= 0 then
+  begin
+    if X = 0 then
+      Result := $FFF0000000000000 as Double
+    else
+      Result := $7FF8000000000000 as Double;
+    Exit;
+  end;
+  ki := 0;
+  if (b shr 52) = 0 then
+  begin
+    X := X * 4503599627370496.0;
+    b := X as Int64;
+    ki := -52;
+  end;
+  ki := ki + ((b shr 52) and 2047) - 1023 + 1;
+  b := (b and $800FFFFFFFFFFFFF) or $3FE0000000000000;
+  f1 := b as Double;
+  if f1 < HalfSqrt2 then
+  begin
+    f1 := f1 * 2.0;
+    ki := ki - 1;
+  end;
+  f := f1 - 1.0;
+  k := ki;
+  s := f / (2.0 + f);
+  s2 := s * s;
+  s4 := s2 * s2;
+  t1 := s2 * (L1 + s4 * (L3 + s4 * (L5 + s4 * L7)));
+  t2 := s4 * (L2 + s4 * (L4 + s4 * L6));
+  rr := t1 + t2;
+  hfsq := 0.5 * f * f;
+  Result := k * Ln2Hi - ((hfsq - (s * (hfsq + rr) + k * Ln2Lo)) - f);
+end;
+
+{ Go's math.Atan (atan.go, after Cephes): the reduction of the argument to [0, tan(Pi/8)]
+  and the rational function, in one routine that calls nothing }
+function PasAtan(X: Double): Double;
+const
+  P0 = -8.750608600031904122785e-01;
+  P1 = -1.615753718733365076637e+01;
+  P2 = -7.500855792314704667340e+01;
+  P3 = -1.228866684490136173410e+02;
+  P4 = -6.485021904942025371773e+01;
+  Q0 = 2.485846490142306297962e+01;
+  Q1 = 1.650270098316988542046e+02;
+  Q2 = 4.328810604912902668951e+02;
+  Q3 = 4.853903996359136964868e+02;
+  Q4 = 1.945506571482613964425e+02;
+  Morebits = 6.123233995736765886130e-17;
+  Tan3pio8 = 2.41421356237309504880;
+  PiO2 = 1.57079632679489661923132169163975144209858469968755;
+  PiO4 = 0.78539816339744830961566084581987572104929234984378;
+var
+  b: Int64;
+  a, z, w: Double;
+  mode: Integer;
+begin
+  b := X as Int64;
+  if (b and $7FFFFFFFFFFFFFFF) = 0 then
+  begin
+    Result := X;
+    Exit;
+  end;
+  a := (b and $7FFFFFFFFFFFFFFF) as Double;
+  if a <= 0.66 then
+  begin
+    w := a;
+    mode := 0;
+  end
+  else if a > Tan3pio8 then
+  begin
+    w := 1.0 / a;
+    mode := 1;
+  end
+  else
+  begin
+    w := (a - 1.0) / (a + 1.0);
+    mode := 2;
+  end;
+  z := w * w;
+  z := z * ((((P0 * z + P1) * z + P2) * z + P3) * z + P4) / (((((z + Q0) * z + Q1) * z + Q2) * z + Q3) * z + Q4);
+  z := w * z + w;
+  if mode = 1 then
+    z := PiO2 - z + Morebits
+  else if mode = 2 then
+    z := PiO4 + z + 0.5 * Morebits;
+  Result := ((z as Int64) or (b and $8000000000000000)) as Double;
+end;
+
+end.

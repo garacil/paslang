@@ -7984,6 +7984,20 @@ the last column names the message. A result too big for a `Double` is
 an infinity (`Exp(1000)` is `+Inf`), not a stop. There is no `Random`;
 `pasrand` has random numbers (§17).
 
+`Sin`, `Cos`, `Exp`, `Ln` and `ArcTan` are computed as Go's `math` package
+computes them (the core unit `pasmath`, P538): `Exp`, `Ln` and `ArcTan`
+come within one unit in the last place of the correctly rounded value on
+every argument tried (50,000 to 60,000 of each, against Python's `math`),
+and so do `Sin` and `Cos` for an argument of magnitude below 2^29, about
+5.4e8 (90,000 sines and 70,000 cosines tried below it). Past 2^29 the
+reduction is
+Go's Payne and Hanek, and a result near a zero of the function can be some
+hundreds of units off (the worst seen is 1813). The series these
+replaced were off by sixteen units or more for half of the sines and
+cosines tried, by 701 units for `Exp(-689)`, by fifteen million for
+`Ln(0.99994)`, and `Ln` of a number below 2.2e-308 stopped with
+`ln domain`.
+
 | Routine | Gives | Stops on (message) |
 |---|---|---|
 | `Abs(x)`, `Sqr(x)` | the absolute value, the square: of an integer an `Integer`, which wraps (`Abs` of the lowest `Integer` is itself), of a real a real of its type | |
