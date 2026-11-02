@@ -703,6 +703,8 @@ GOLDEN += flate flatec zip
 GOLDEN_A64 += flate flatec zip
 GOLDEN += md5lens
 GOLDEN_A64 += md5lens
+GOLDEN += crclens
+GOLDEN_A64 += crclens
 # P436: XLSX templates filled, the entries not written kept as they were.
 GOLDEN += xlsx
 GOLDEN_A64 += xlsx
@@ -3124,6 +3126,16 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	n=$$(objdump -d --no-show-raw-insn $(BUILDDIR)/md5lens | awk '/<p_pashash_md5blocks>:/,/ret/' | grep -cE '[[:space:]]not[[:space:]]') || true; \
 	[ "$$n" -le 32 ] || { echo "md5lens: Md5Blocks has $$n not instructions"; exit 1; }; \
 	echo ok md5lens
+	@set -e; \
+	: P549: Crc32 and Crc32c on the base processor take eight bytes a step with eight tables each, testdata/crclens is what scripts/gen_crclens.py writes and its expected output is zlib.crc32 and the CRC-32C of RFC 3720 bit by bit, and the routine linked into a program for the base processor has the shifts of its eight lookups; \
+	python3 -I scripts/gen_crclens.py --check; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/crclens testdata/crclens.paslang; \
+	$(BUILDDIR)/crclens | diff -u testdata/crclens.out -; \
+	$(OUTDIR)/paslangc -cpu base -o $(BUILDDIR)/crclens_b testdata/crclens.paslang; \
+	$(BUILDDIR)/crclens_b | diff -u testdata/crclens.out -; \
+	n=$$(objdump -d --no-show-raw-insn $(BUILDDIR)/crclens_b | awk '/<p_pashash_crc32plain>:/,/ret/' | grep -c 'shr') || true; \
+	[ "$$n" -ge 14 ] || { echo "crclens: Crc32Plain has $$n shifts"; exit 1; }; \
+	echo ok crclens
 	@set -e; \
 	: the kept scripts of testdata/sqllogic are what scripts/gen_sqllogic.py writes while the system SQLite is the one that made them, P412; \
 	python3 -I scripts/gen_sqllogic.py --check

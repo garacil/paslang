@@ -1420,8 +1420,9 @@ MID1 = r'''
 
 TAIL_HELPERS = r'''
 var
-  Crc32Tab: array[0..255] of UInt32;
-  Crc32cTab: array[0..255] of UInt32;
+  { slicing by eight (P549): table k is the CRC of a byte followed by k zero bytes }
+  Crc32T0, Crc32T1, Crc32T2, Crc32T3, Crc32T4, Crc32T5, Crc32T6, Crc32T7: array[0..255] of UInt32;
+  Crc32cT0, Crc32cT1, Crc32cT2, Crc32cT3, Crc32cT4, Crc32cT5, Crc32cT6, Crc32cT7: array[0..255] of UInt32;
   TabsReady: Integer;   { 1 once the tables are built, released after them }
 
 function PasHex(const S: string): string;
@@ -1740,30 +1741,105 @@ begin
       else
         cc := cc shr 1;
     end;
-    Crc32Tab[i] := c;
-    Crc32cTab[i] := cc;
+    Crc32T0[i] := c;
+    Crc32cT0[i] := cc;
+  end;
+  for i := 0 to 255 do
+  begin
+    c := Crc32T0[i];
+    Crc32T1[i] := (c shr 8) xor Crc32T0[c and 255];
+    cc := Crc32cT0[i];
+    Crc32cT1[i] := (cc shr 8) xor Crc32cT0[cc and 255];
+  end;
+  for i := 0 to 255 do
+  begin
+    c := Crc32T1[i];
+    Crc32T2[i] := (c shr 8) xor Crc32T0[c and 255];
+    cc := Crc32cT1[i];
+    Crc32cT2[i] := (cc shr 8) xor Crc32cT0[cc and 255];
+  end;
+  for i := 0 to 255 do
+  begin
+    c := Crc32T2[i];
+    Crc32T3[i] := (c shr 8) xor Crc32T0[c and 255];
+    cc := Crc32cT2[i];
+    Crc32cT3[i] := (cc shr 8) xor Crc32cT0[cc and 255];
+  end;
+  for i := 0 to 255 do
+  begin
+    c := Crc32T3[i];
+    Crc32T4[i] := (c shr 8) xor Crc32T0[c and 255];
+    cc := Crc32cT3[i];
+    Crc32cT4[i] := (cc shr 8) xor Crc32cT0[cc and 255];
+  end;
+  for i := 0 to 255 do
+  begin
+    c := Crc32T4[i];
+    Crc32T5[i] := (c shr 8) xor Crc32T0[c and 255];
+    cc := Crc32cT4[i];
+    Crc32cT5[i] := (cc shr 8) xor Crc32cT0[cc and 255];
+  end;
+  for i := 0 to 255 do
+  begin
+    c := Crc32T5[i];
+    Crc32T6[i] := (c shr 8) xor Crc32T0[c and 255];
+    cc := Crc32cT5[i];
+    Crc32cT6[i] := (cc shr 8) xor Crc32cT0[cc and 255];
+  end;
+  for i := 0 to 255 do
+  begin
+    c := Crc32T6[i];
+    Crc32T7[i] := (c shr 8) xor Crc32T0[c and 255];
+    cc := Crc32cT6[i];
+    Crc32cT7[i] := (cc shr 8) xor Crc32cT0[cc and 255];
   end;
   AtomicStore(TabsReady, 1);
 end;
 
+{ Eight bytes a step, the eight tables of BuildTabs (slicing by eight, Kounavis and
+  Berry, Intel 2005; Go's hash/crc32 slicing8): the word is xored with the CRC and each
+  of its eight bytes is looked up in the table of its distance from the end. The bytes
+  left over go one at a time. Each table is a variable of its own, so a lookup is a
+  load from a fixed address and an index. }
 function Crc32Plain(Crc: UInt32; P: Pointer; N: Integer; Castagnoli: Boolean): UInt32;
 var
-  i: Integer;
-  b: Integer;
+  i, c, w: Integer;
 begin
-  Result := Crc;
+  c := Crc;
+  i := 0;
   if Castagnoli then
-    for i := 0 to N - 1 do
+  begin
+    while N - i >= 8 do
     begin
-      b := PByte(P)[i];
-      Result := Crc32cTab[(Result xor b) and 255] xor (Result shr 8);
-    end
-  else
-    for i := 0 to N - 1 do
-    begin
-      b := PByte(P)[i];
-      Result := Crc32Tab[(Result xor b) and 255] xor (Result shr 8);
+      w := PInt64(Pointer(Integer(P) + i))^ xor c;
+      c := Crc32cT7[w and 255] xor Crc32cT6[(w shr 8) and 255] xor Crc32cT5[(w shr 16) and 255] xor
+        Crc32cT4[(w shr 24) and 255] xor Crc32cT3[(w shr 32) and 255] xor Crc32cT2[(w shr 40) and 255] xor
+        Crc32cT1[(w shr 48) and 255] xor Crc32cT0[w shr 56];
+      i := i + 8;
     end;
+    while i < N do
+    begin
+      c := Crc32cT0[(c xor PByte(P)[i]) and 255] xor (c shr 8);
+      i := i + 1;
+    end;
+  end
+  else
+  begin
+    while N - i >= 8 do
+    begin
+      w := PInt64(Pointer(Integer(P) + i))^ xor c;
+      c := Crc32T7[w and 255] xor Crc32T6[(w shr 8) and 255] xor Crc32T5[(w shr 16) and 255] xor
+        Crc32T4[(w shr 24) and 255] xor Crc32T3[(w shr 32) and 255] xor Crc32T2[(w shr 40) and 255] xor
+        Crc32T1[(w shr 48) and 255] xor Crc32T0[w shr 56];
+      i := i + 8;
+    end;
+    while i < N do
+    begin
+      c := Crc32T0[(c xor PByte(P)[i]) and 255] xor (c shr 8);
+      i := i + 1;
+    end;
+  end;
+  Result := UInt32(c);
 end;
 
 { CRC32C on the processor: SSE4.2's crc32 eight bytes a step (SDM vol.
