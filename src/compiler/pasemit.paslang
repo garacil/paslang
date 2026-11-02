@@ -305,6 +305,7 @@ type
     FFrame: LongInt;
     FStrs: array of string;
     FRealC: array of Int64;   { the Double constants .Lrc<n> in .rodata (P486) }
+    FAbsMask, FNegMask: Boolean;   { .Lrabs and .Lrneg, the masks of andpd and xorpd are wanted (P542) }
     FTypes: TTypeDefArray;
     FResName: string;
     FResOff: LongInt;
@@ -860,6 +861,7 @@ type
     procedure EmitRealBin(E: PExpr);
     function RealPure(E: PExpr): Boolean;
     function RealLeaf(E: PExpr): Boolean;
+    function RealSign(E: PExpr): Boolean;
     function RealOperand(E: PExpr; K: LongInt): Boolean;
     procedure RealTo(E: PExpr; K: LongInt);
     function RealAssign(S: PStmt): Boolean;
@@ -1234,6 +1236,7 @@ type
     function UpOperand(E: PExpr): Boolean;
     function PureWriteAny(const L, R: string): Boolean;
     function TailToRet(B0: SizeInt; const Res, Tgt: string; out Cut: string): Boolean;
+    function LabelRef(const T, L: string): Boolean;
     function FlatProc(const Pr: TProc): Boolean;
     function NamesReg(const T, R: string): Boolean;
     function RegNamed(const T, R: string): Boolean;
@@ -19307,6 +19310,24 @@ begin
   Result := RealPure(E);
 end;
 
+{ E is Abs or the negation of a Double (P542): its type and its operand's are Double. }
+function TEmitter.RealSign(E: PExpr): Boolean;
+var
+  a: PExpr;
+begin
+  Result := False;
+  if E = nil then
+    Exit;
+  if (E^.Kind = ekCall) and (E^.Name = 'rt_absreal') and (Length(E^.Args) = 1) then
+    a := E^.Args[0]
+  else if (E^.Kind = ekUn) and (E^.Un = uoNeg) then
+    a := E^.L
+  else
+    Exit;
+  Result := (a <> nil) and (TKind(E^.Typ) = tykReal) and (E^.Typ <> TySingle) and
+    (TSize(E^.Typ) = 8) and (a^.Typ = E^.Typ);
+end;
+
 function TEmitter.RealOperand(E: PExpr; K: LongInt): Boolean;
 begin
   Result := False;
@@ -19315,6 +19336,16 @@ begin
   if RealLeaf(E) then
   begin
     Result := True;
+    Exit;
+  end;
+  { Abs and the negation of a Double operand (P542): the sign bit cleared or flipped in the
+    register itself, andpd and xorpd on amd64, fabs and fneg on arm64 }
+  if RealSign(E) then
+  begin
+    if E^.Kind = ekCall then
+      Result := RealOperand(E^.Args[0], K)
+    else
+      Result := RealOperand(E^.L, K);
     Exit;
   end;
   { Double(n) of an integer leaf (P540): cvtsi2sd into the register itself }
@@ -19341,7 +19372,13 @@ begin
   { Double arithmetic: a Single's, a Quad's and a mixed one's rounding differ }
   if (TKind(E^.Typ) <> tykReal) or (E^.Typ = TySingle) then
     Exit;
-  Result := RealOperand(E^.L, K) and RealOperand(E^.R, K + 1);
+  { an operand that is the instruction's own (a constant, a register, a place) needs no register of
+    its own (P542): a sum or a product with one on the left is worked out in K from its right
+    operand, so a Horner chain of any depth takes two registers, not one for each level }
+  if ((E^.Bin = boAdd) or (E^.Bin = boMul)) and (RealRhs(E^.L) <> '') and (RealRhs(E^.R) = '') then
+    Result := RealOperand(E^.R, K)
+  else
+    Result := RealOperand(E^.L, K) and RealOperand(E^.R, K + 1);
 end;
 
 function TEmitter.InternReal(Bits: Int64): string;
@@ -19581,6 +19618,32 @@ begin
     RealTo(E^.Args[0], K);
     Exit;
   end;
+  if RealSign(E) then
+  begin
+    if E^.Kind = ekCall then
+    begin
+      RealTo(E^.Args[0], K);
+      if FArm then
+        Line('  fabs ' + r + ', ' + r)
+      else
+      begin
+        FAbsMask := True;
+        Line('  andpd .Lrabs(%rip), ' + r);
+      end;
+    end
+    else
+    begin
+      RealTo(E^.L, K);
+      if FArm then
+        Line('  fneg ' + r + ', ' + r)
+      else
+      begin
+        FNegMask := True;
+        Line('  xorpd .Lrneg(%rip), ' + r);
+      end;
+    end;
+    Exit;
+  end;
   if RealLeaf(E) then
   begin
     if (E^.Kind = ekVar) and (TKind(E^.Typ) = tykReal) and RealHome(E^.Name, sy, w) then
@@ -19631,15 +19694,25 @@ begin
       Line('  vfmadd213sd ' + rhs + ', %xmm' + IntToStr(K + 1) + ', ' + r);
     Exit;
   end;
-  RealTo(E^.L, K);
-  rhs := RealRhs(E^.R);
-  if rhs = '' then
+  if ((E^.Bin = boAdd) or (E^.Bin = boMul)) and (RealRhs(E^.L) <> '') and (RealRhs(E^.R) = '') then
   begin
-    RealTo(E^.R, K + 1);
-    if FArm then
-      rhs := 'd' + IntToStr(K + 1)
-    else
-      rhs := '%xmm' + IntToStr(K + 1);
+    { the left operand is the instruction's own: the right one is worked out in the register,
+      and a sum or a product has the same bits either way round (P542) }
+    RealTo(E^.R, K);
+    rhs := RealRhs(E^.L);
+  end
+  else
+  begin
+    RealTo(E^.L, K);
+    rhs := RealRhs(E^.R);
+    if rhs = '' then
+    begin
+      RealTo(E^.R, K + 1);
+      if FArm then
+        rhs := 'd' + IntToStr(K + 1)
+      else
+        rhs := '%xmm' + IntToStr(K + 1);
+    end;
   end;
   if FArm then
   begin
@@ -40381,6 +40454,34 @@ end;
   put before them, where Result's DWARF range ends: past it the debugger
   says the value is gone rather than read the register it left. True
   when done. }
+{ The text T names the label L (.L12) and not a longer one that begins with it (.L123): Pos
+  would find .L1 in every .L1x (P542: the epilogue of the first routines of a unit never
+  took its tail in rax for that). }
+function TEmitter.LabelRef(const T, L: string): Boolean;
+var
+  i, j, n, m: SizeInt;
+begin
+  Result := False;
+  n := Length(L);
+  m := Length(T);
+  i := 1;
+  while i + n - 1 <= m do
+  begin
+    if T[i] = L[1] then
+    begin
+      j := 2;
+      while (j <= n) and (T[i + j - 1] = L[j]) do
+        Inc(j);
+      if (j > n) and ((i + n > m) or not (T[i + n] in ['0'..'9'])) then
+      begin
+        Result := True;
+        Exit;
+      end;
+    end;
+    Inc(i);
+  end;
+end;
+
 function TEmitter.TailToRet(B0: SizeInt; const Res, Tgt: string; out Cut: string): Boolean;
 var
   lines: TStrArray;
@@ -41024,7 +41125,7 @@ begin
   else
     r := 'rax';
   tailin := Pr.IsFunc and (FResReg <> '') and (FResReg <> r) and
-    (Pos(FEpi, Copy(FOut, b0 + 1, FLen - b0)) = 0) and (Pos(FEpi, FCold) = 0) and
+    (not LabelRef(Copy(FOut, b0 + 1, FLen - b0), FEpi)) and (not LabelRef(FCold, FEpi)) and
     TailToRet(b0, FResReg, r, txt);
   if tailin then
     for i := nlr to High(FLocRanges) do
@@ -41035,8 +41136,8 @@ begin
     (P366) }
   FSplitDone := nil;
   SetLength(FSplitDone, Length(FSplitNow));
-  if (Length(FSplitNow) > 0) and (Pos(FEpi, Copy(FOut, b0 + 1, FLen - b0)) = 0) and
-    (Pos(FEpi, FCold) = 0) then
+  if (Length(FSplitNow) > 0) and (not LabelRef(Copy(FOut, b0 + 1, FLen - b0), FEpi)) and
+    (not LabelRef(FCold, FEpi)) then
     for j := 0 to High(FSplitNow) do
     begin
       if FArm and (j = 0) then
@@ -53022,6 +53123,8 @@ begin
   FLastIns := '';
   FStrs := nil;
   FRealC := nil;
+  FAbsMask := False;
+  FNegMask := False;
   FGcTypes := nil;
   FGcInst := nil;
   FRootWords := nil;
@@ -53941,6 +54044,23 @@ begin
     Line('.balign 8');
     Line('.Lrc' + IntToStr(i) + ':');
     Line('  .quad ' + IntToStr(FRealC[i]));
+  end;
+  { the masks of Abs and the negation, two lanes for andpd and xorpd (P542) }
+  if FAbsMask then
+  begin
+    RoSec('rabs');
+    Line('.balign 16');
+    Line('.Lrabs:');
+    Line('  .quad 9223372036854775807');
+    Line('  .quad 9223372036854775807');
+  end;
+  if FNegMask then
+  begin
+    RoSec('rneg');
+    Line('.balign 16');
+    Line('.Lrneg:');
+    Line('  .quad -9223372036854775808');
+    Line('  .quad -9223372036854775808');
   end;
   { the vector constants (1.0.128): each lane's low bits, 32 bytes }
   for i := 0 to High(FVecCLane) do

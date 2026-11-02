@@ -168,6 +168,8 @@ GOLDEN += mathgo
 GOLDEN_A64 += mathgo
 GOLDEN += dflat
 GOLDEN_A64 += dflat
+GOLDEN += signs
+GOLDEN_A64 += signs
 GOLDEN += syshelpers sysguid
 GOLDEN_A64 += syshelpers sysguid
 GOLDEN += sysfamilies
@@ -3081,6 +3083,14 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'DW_OP_regx: 72 (' $(BUILDDIR)/dflat_aloc.txt || { echo "dflat arm64: d8 is not DW_OP_regx 72 in the location lists"; exit 1; }; \
 	if grep -q 'end of data' $(BUILDDIR)/dflat_aloc.txt; then echo "dflat arm64: a location list readelf cannot read"; exit 1; fi; \
 	echo ok dflat
+	@set -e; \
+	: P542: Abs and the negation of a Double are one andpd or xorpd on the register and a sum or a product with a constant or a variable on its left takes two registers however deep it is, testdata/signs is what scripts/gen_signs.py writes and its expected output is worked out in Python floats; \
+	python3 -I scripts/gen_signs.py --check; \
+	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/signs_s testdata/signs.paslang; \
+	$(BUILDDIR)/signs_s | diff -u testdata/signs.out -; \
+	$(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/signs_a testdata/signs.paslang; \
+	python3 -I scripts/check_signs.py $(BUILDDIR)/signs_s.s $(BUILDDIR)/signs_a.s $(BUILDDIR)/pasmath.s; \
+	echo ok signs
 	@set -e; \
 	: the kept scripts of testdata/sqllogic are what scripts/gen_sqllogic.py writes while the system SQLite is the one that made them, P412; \
 	python3 -I scripts/gen_sqllogic.py --check
