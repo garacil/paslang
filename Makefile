@@ -715,6 +715,8 @@ GOLDEN += mathacc
 GOLDEN_A64 += mathacc
 GOLDEN += bitview
 GOLDEN_A64 += bitview
+GOLDEN += arrparam
+GOLDEN_A64 += arrparam
 # P436: XLSX templates filled, the entries not written kept as they were.
 GOLDEN += xlsx
 GOLDEN_A64 += xlsx
@@ -3205,6 +3207,16 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	n=$$(objdump -d --no-show-raw-insn $(BUILDDIR)/bitview | awk '/^[0-9a-f]+ <[^>]*>:/{ on = ($$2 ~ /^<p_f[0-9]+>:$$/) } on' | grep -c push) || true; \
 	[ "$$n" -le 4 ] || { echo "bitview: $$n push in its functions"; exit 1; }; \
 	echo ok bitview
+	@set -e; \
+	: P554: an element of an open array that arrives by reference is reached through the address of its descriptor with nothing pushed and a Double element is loaded by movsd, testdata/arrparam reads and writes the elements of eight types in each form of index and checks them against the same formulas on static arrays, and its routines hold fewer than 100 push and pop instructions and 2000 instructions in the linked program; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/arrparam testdata/arrparam.paslang; \
+	$(BUILDDIR)/arrparam | diff -u testdata/arrparam.out -; \
+	objdump -d --no-show-raw-insn $(BUILDDIR)/arrparam | awk '/^[0-9a-f]+ <[^>]*>:/{ on = ($$2 ~ /^<p_(filli|filld|fillb|fillw|filll|fillr|fills|sumi|dotd|maxd|sumb|sumw|suml|sumr|cats|swapd|revd|bubblei)>:$$/) } on' > $(BUILDDIR)/arrparam.fn; \
+	n=$$(grep -c 'push\|pop' $(BUILDDIR)/arrparam.fn) || true; \
+	[ "$$n" -lt 100 ] || { echo "arrparam: $$n push and pop in its routines"; exit 1; }; \
+	n=$$(grep -c '^ ' $(BUILDDIR)/arrparam.fn) || true; \
+	[ "$$n" -lt 2000 ] || { echo "arrparam: $$n instructions in its routines"; exit 1; }; \
+	echo ok arrparam
 	@set -e; \
 	: the kept scripts of testdata/sqllogic are what scripts/gen_sqllogic.py writes while the system SQLite is the one that made them, P412; \
 	python3 -I scripts/gen_sqllogic.py --check

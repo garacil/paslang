@@ -965,6 +965,7 @@ type
     function MoveLeaf(E: PExpr; const R: string; Put: Boolean; out Reads: string): Boolean;
     function EmitMoveRegs(S: PStmt): Boolean;
     function SliceOps(B: PExpr; out P, L: string): Boolean;
+    function SliceRefOps(B: PExpr; out Pre, P, L: string): Boolean;
     function IncDirect(S: PStmt): Boolean;
     procedure ArgInto(E: PExpr; const R: string);
     function CallFree(E: PExpr; Depth: LongInt): Boolean;
@@ -6845,7 +6846,7 @@ var
   esz: LongInt;
   i, sh: LongInt;
   off: LongInt;
-  into, pw, xr, dr, sp, sl: string;
+  into, pw, xr, dr, sp, sl, pre: string;
   ok, ix: string;
   wr, late: Boolean;
 begin
@@ -7351,6 +7352,33 @@ begin
             (cmd/compile/internal/ssa/_gen/AMD64.rules, CMPQload) }
           esz := TSize(FTypes[E^.L^.Typ].Elem);
           EmitExpr(E^.R);
+          if not SliceProven(E) then
+          begin
+            ok := Lab;
+            Line('  cmpq ' + sl + ', %rax');
+            ColdBegin('  jae');
+            BoundsFailX86('%rax', 0, sl, 0, -1);
+            ColdEnd;
+            Line(ok + ':');
+          end;
+          Line('  movq ' + sp + ', %rcx');
+          dr := '%rax';
+          if into <> '' then
+          begin
+            dr := '%' + into;
+            FAddrDone := True;
+          end;
+          ScaleAddX86(dr, '%rcx', '%rax', esz, '%rdx');
+        end
+        else if IsDyn(E^.L^.Typ) and SliceRefOps(E^.L, pre, sp, sl) then
+        begin
+          { an open array or slice by reference: the index into rax, then the descriptor's address
+            (the frame slot into rdx, or the region's register), its length compared and its
+            pointer loaded where they lie, nothing pushed (P554) }
+          esz := TSize(FTypes[E^.L^.Typ].Elem);
+          EmitExpr(E^.R);
+          if pre <> '' then
+            Line(pre);
           if not SliceProven(E) then
           begin
             ok := Lab;
@@ -17219,6 +17247,44 @@ begin
   Result := True;
 end;
 
+{ B is an open array or a slice passed by reference (a var or const parameter of the type
+  array of T): its words are behind the address of its descriptor, which a frame slot holds
+  (loaded into rdx by Pre) or a region keeps in a register (P554). P and L are the pointer and
+  the length. amd64 only. }
+function TEmitter.SliceRefOps(B: PExpr; out Pre, P, L: string): Boolean;
+var
+  sy: TSym;
+  r: string;
+begin
+  Result := False;
+  Pre := '';
+  P := '';
+  L := '';
+  if FArm or (B = nil) or (B^.Kind <> ekVar) or not IsDyn(B^.Typ) then
+    Exit;
+  if not TryFindSym(B^.Name, sy) then
+    Exit;
+  if (not sy.ByRef) or sy.Boxed or (sy.Up > 0) or sy.Global then
+    Exit;
+  r := ByRefReg(B);
+  if r <> '' then
+  begin
+    if (r = 'rax') or (r = 'rcx') or (r = 'rdx') then
+      Exit;
+    P := '(%' + r + ')';
+    L := '8(%' + r + ')';
+  end
+  else if sy.Reg = '' then
+  begin
+    Pre := '  movq ' + MemA(sy) + ', %rdx';
+    P := '(%rdx)';
+    L := '8(%rdx)';
+  end
+  else
+    Exit;
+  Result := True;
+end;
+
 { E is one load at an offset from a register that holds an object
   (P397): a word field of an object a variable in a register holds, of
   a record in such an object too, or
@@ -19751,6 +19817,17 @@ begin
         Line('  movq ' + w + ', ' + r)
       else
         Line('  movsd ' + w + ', ' + r);
+      Exit;
+    end;
+    { a Double element, field or pointed-to: movsd from the operand the address came from (P554),
+      where the word went into rax and from rax into the register }
+    if (not FArm) and ((E^.Kind = ekIndex) or (E^.Kind = ekField) or (E^.Kind = ekDeref)) and
+      (TKind(E^.Typ) = tykReal) and (E^.Typ <> TySingle) and (TSize(E^.Typ) = 8) and
+      not IsBlob(E^.Typ) and not IsFat(E^.Typ) then
+    begin
+      EmitAddr(E);
+      Line('  movsd ' + AddrOp('') + ', ' + r);
+      BufFree(E);
       Exit;
     end;
     EmitExpr(E);
