@@ -25,14 +25,17 @@ import (
 
 func main() {
 	m := make(map[int]int)
-	for i := 1; i <= 1000000; i++ {
-		m[i*7919] = i
-	}
-	t := 0
+	d := make(map[int]float64)
 	arg := ""
 	if len(os.Args) > 1 {
 		arg = os.Args[1]
 	}
+	if arg != "sums" && arg != "bits" {
+		for i := 1; i <= 1000000; i++ {
+			m[i*7919] = i
+		}
+	}
+	t := 0
 	switch arg {
 	case "iter":
 		for r := 1; r <= 20; r++ {
@@ -52,8 +55,22 @@ func main() {
 			}
 		}
 		t = m[7919] + m[7919*1000000]
+	case "sums":
+		for r := 1; r <= 10; r++ {
+			for i := 1; i <= 1000000; i++ {
+				d[i*7919] += 0.5
+			}
+		}
+		t = int(d[7919]+d[7919*1000000]) + len(d)
+	case "bits":
+		for r := 1; r <= 10; r++ {
+			for i := 1; i <= 1000000; i++ {
+				m[i*7919] ^= r
+			}
+		}
+		t = m[7919] + m[7919*1000000]
 	default:
-		fmt.Println("b31map: iter, delete or update")
+		fmt.Println("b31map: iter, delete, update, sums or bits")
 		os.Exit(2)
 	}
 	fmt.Println(t, len(m))

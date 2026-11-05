@@ -120,7 +120,7 @@ SECTIONS = {
     "b28stack": ["deep", "many"],
     "b29exc": ["raise"],
     "b30gc": ["trees"],
-    "b31map": ["iter", "delete", "update"],
+    "b31map": ["iter", "delete", "update", "sums", "bits"],
     "b32fs": ["stat", "list"],
     "b33utf8": ["ascii", "mixed"],
     "b34json": ["parse", "parse1", "compact", "compact1", "pretty", "pretty1", "canonical"],

@@ -725,6 +725,8 @@ GOLDEN += descparts
 GOLDEN_A64 += descparts
 GOLDEN += descproof
 GOLDEN_A64 += descproof
+GOLDEN += maprmw2
+GOLDEN_A64 += maprmw2
 # P436: XLSX templates filled, the entries not written kept as they were.
 GOLDEN += xlsx
 GOLDEN_A64 += xlsx
@@ -3305,6 +3307,27 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	if $(BUILDDIR)/descproofoob 12 > /dev/null 2> $(BUILDDIR)/descproofoob.err; then echo "descproofoob 12 ran past the end of a loop that has one register left"; exit 1; fi; \
 	grep -q 'index 3000 out of range \[0..2999\] at line 114' $(BUILDDIR)/descproofoob.err; \
 	echo ok descproof
+	@set -e; \
+	: P557: m[K] := m[K] and E, or, xor and times of a word-sized integer entry and plus, minus and times of a Double entry look the key up once on amd64 and on arm64, testdata/maprmw2 checks what the two lookups gave, a key that is not there made with zero, E that is an integer or a Single, the entry on the right of a difference, keys that are expressions fields pointers elements and strings, a call in the key or in E, the wrap of a product, entries of other sizes and sorts, the growth of the map under the statement and random operations against a model, and its routines Mixi and Mixd of five updates each hold five puts and no read in the linked program of each machine; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/maprmw2 testdata/maprmw2.paslang; \
+	$(BUILDDIR)/maprmw2 | diff -u testdata/maprmw2.out -; \
+	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 $(BUILDDIR)/maprmw2 | diff -u testdata/maprmw2.out -; \
+	for f in mixi mixd; do \
+		objdump -d --no-show-raw-insn $(BUILDDIR)/maprmw2 | awk -v f="<p_$$f>:" '/^[0-9a-f]+ <[^>]*>:/{ on = ($$2 == f) } on' > $(BUILDDIR)/maprmw2.fn; \
+		n=$$(grep -c 'call.*pasmapputint' $(BUILDDIR)/maprmw2.fn) || true; \
+		[ "$$n" -eq 5 ] || { echo "maprmw2: $$n puts in $$f"; exit 1; }; \
+		n=$$(grep -c 'call.*pasmapgetint' $(BUILDDIR)/maprmw2.fn) || true; \
+		[ "$$n" -eq 0 ] || { echo "maprmw2: $$n reads in $$f"; exit 1; }; \
+	done; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -Fu $(BUILDDIR)/a64 -o $(BUILDDIR)/maprmw2-arm testdata/maprmw2.paslang; \
+	for f in mixi mixd; do \
+		awk -v f="p_$$f:" '$$1 == f { on = 1 } on { print } on && /^\.globl/ { on = 0 }' $(BUILDDIR)/maprmw2-arm.s > $(BUILDDIR)/maprmw2-arm.fn; \
+		n=$$(grep -c 'bl p_pasmap_pasmapputint' $(BUILDDIR)/maprmw2-arm.fn) || true; \
+		[ "$$n" -eq 5 ] || { echo "maprmw2-arm: $$n puts in $$f"; exit 1; }; \
+		n=$$(grep -c 'bl p_pasmap_pasmapgetint' $(BUILDDIR)/maprmw2-arm.fn) || true; \
+		[ "$$n" -eq 0 ] || { echo "maprmw2-arm: $$n reads in $$f"; exit 1; }; \
+	done; \
+	echo ok maprmw2
 	@set -e; \
 	: the kept scripts of testdata/sqllogic are what scripts/gen_sqllogic.py writes while the system SQLite is the one that made them, P412; \
 	python3 -I scripts/gen_sqllogic.py --check

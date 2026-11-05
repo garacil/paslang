@@ -292,7 +292,8 @@ type
     FLab: LongInt;
     FAddrWrite: Boolean;  { the next EmitAddr is for a write: a string's characters become its own (1.0.82) }
     FStoreSrc: PExpr;     { the value StoreTo stores, when the statement knows it (1.0.82) }
-    FMapRmw: LongInt;     { 1 or 2 while a map entry is stored by adding or subtracting the value (P555) }
+    FMapRmw: LongInt;     { while a map entry is stored by changing it where it lies (P555, P557): 1 add, 2 subtract, 3 and, 4 or, 5 xor, 6 multiply }
+    FMapRmwL: Boolean;    { the value is the left operand of the operation (P557) }
     FAddrInto: string;    { P373: the register an element's address goes to, '' rax or x0 ... }
     FLayOff: array of LongInt;   { P378: each local's offset in the frame, as the layout gave it }
     FHidKeys: TStrArray;         { P378: the hidden variables that may share, by name ... }
@@ -15416,7 +15417,7 @@ end;
 procedure TEmitter.EmitMapStore(Dest: PExpr);
 var
   off: LongInt;
-  smap, desc: string;
+  smap, desc, f: string;
 begin
   if IsBlob(Dest^.Typ) then
     FreezeCollectionBlob(Dest^.Typ);
@@ -15517,7 +15518,46 @@ begin
     else
     begin
       Ppop('x1');
-      Line('  str x1, [x0]');
+      if FMapRmw = 0 then
+        Line('  str x1, [x0]')
+      else if TKind(Dest^.Typ) = tykReal then
+      begin
+        { the entry in d2, the value in d1; the left operand first as the source has it (P557) }
+        Line('  ldr d2, [x0]');
+        Line('  fmov d1, x1');
+        case FMapRmw of
+          1:
+            f := 'fadd';
+          2:
+            f := 'fsub';
+        else
+          f := 'fmul';
+        end;
+        if FMapRmwL then
+          Line('  ' + f + ' d2, d1, d2')
+        else
+          Line('  ' + f + ' d2, d2, d1');
+        Line('  str d2, [x0]');
+      end
+      else
+      begin
+        Line('  ldr x2, [x0]');
+        case FMapRmw of
+          1:
+            Line('  add x2, x2, x1');
+          2:
+            Line('  sub x2, x2, x1');
+          3:
+            Line('  and x2, x2, x1');
+          4:
+            Line('  orr x2, x2, x1');
+          5:
+            Line('  eor x2, x2, x1');
+        else
+          Line('  mul x2, x2, x1');
+        end;
+        Line('  str x2, [x0]');
+      end;
     end;
   end
   else
@@ -15618,14 +15658,51 @@ begin
     else
     begin
       Line('  popq %rcx');
-      case FMapRmw of
-        1:
-          Line('  addq %rcx, (%rax)');
-        2:
-          Line('  subq %rcx, (%rax)');
+      if (FMapRmw <> 0) and (TKind(Dest^.Typ) = tykReal) then
+      begin
+        { a Double entry: the entry and the value in xmm1 and xmm2, the operation with the left
+          operand first as the source has it (P557) }
+        Line('  movsd (%rax), %xmm1');
+        Line('  movq %rcx, %xmm2');
+        case FMapRmw of
+          1:
+            f := 'addsd';
+          2:
+            f := 'subsd';
+        else
+          f := 'mulsd';
+        end;
+        if FMapRmwL then
+        begin
+          Line('  ' + f + ' %xmm1, %xmm2');
+          Line('  movsd %xmm2, (%rax)');
+        end
+        else
+        begin
+          Line('  ' + f + ' %xmm2, %xmm1');
+          Line('  movsd %xmm1, (%rax)');
+        end;
+      end
       else
-        Line('  movq %rcx, (%rax)');
-      end;
+        case FMapRmw of
+          1:
+            Line('  addq %rcx, (%rax)');
+          2:
+            Line('  subq %rcx, (%rax)');
+          3:
+            Line('  andq %rcx, (%rax)');
+          4:
+            Line('  orq %rcx, (%rax)');
+          5:
+            Line('  xorq %rcx, (%rax)');
+          6:
+            begin
+              Line('  imulq (%rax), %rcx');
+              Line('  movq %rcx, (%rax)');
+            end;
+        else
+          Line('  movq %rcx, (%rax)');
+        end;
     end;
   end;
 end;
@@ -28099,39 +28176,69 @@ end;
   these) of a word-sized integer, with a map, a key and an E that call nothing: E is worked
   out first, then the put gives the entry (a key that was not there is made with 0, as the
   read of it gave) and the entry is changed where it lies: one lookup and not two. Go's m[k]++
-  is one mapassign. amd64. }
+  is one mapassign. P557: the same for the operators and, or, xor and * of such an integer
+  (E on either side), for a Double entry with +, - and * (the entry on the left of a
+  difference), and on arm64. }
 function TEmitter.MapRmw(S: PStmt): Boolean;
 var
   d, e, r: PExpr;
+  op: LongInt;
+  isReal, eLeft: Boolean;
 begin
   Result := False;
-  if FArm or (S^.Dest = nil) or (S^.E = nil) then
+  if (S^.Dest = nil) or (S^.E = nil) then
     Exit;
   d := S^.Dest;
   e := S^.E;
   if (d^.Kind <> ekCall) or (d^.Name <> 'rt_mapget') or (Length(d^.Args) <> 2) then
     Exit;
-  if (e^.Kind <> ekBin) or ((e^.Bin <> boAdd) and (e^.Bin <> boSub)) or (e^.L = nil) or
-    (e^.R = nil) then
+  if (e^.Kind <> ekBin) or (e^.L = nil) or (e^.R = nil) then
     Exit;
-  if (TKind(d^.Typ) <> tykInteger) or (TSize(d^.Typ) <> 8) then
+  case e^.Bin of
+    boAdd:
+      op := 1;
+    boSub:
+      op := 2;
+    boAnd:
+      op := 3;
+    boOr:
+      op := 4;
+    boXor:
+      op := 5;
+    boMul:
+      op := 6;
+  else
     Exit;
+  end;
+  isReal := (TKind(d^.Typ) = tykReal) and (d^.Typ <> TySingle) and (TSize(d^.Typ) = 8);
+  if isReal then
+  begin
+    if (op > 2) and (op <> 6) then
+      Exit;
+  end
+  else if (TKind(d^.Typ) <> tykInteger) or (TSize(d^.Typ) <> 8) then
+    Exit;
+  eLeft := False;
   if SameMapRef(e^.L, d) then
     r := e^.R
-  else if (e^.Bin = boAdd) and SameMapRef(e^.R, d) then
-    r := e^.L
+  else if (op <> 2) and SameMapRef(e^.R, d) then
+  begin
+    r := e^.L;
+    eLeft := True;
+  end
   else
     Exit;
   if EHasCall(r) then
     Exit;
   EmitExpr(r);
-  if e^.Bin = boAdd then
-    FMapRmw := 1
-  else
-    FMapRmw := 2;
+  if isReal then
+    ArgToDouble(r^.Typ);
+  FMapRmw := op;
+  FMapRmwL := eLeft;
   FStoreSrc := nil;
   StoreTo(d);
   FMapRmw := 0;
+  FMapRmwL := False;
   Result := True;
 end;
 
@@ -30865,6 +30972,7 @@ begin
       skAssign:
         begin
           if not VecAssign(S) then
+          if not MapRmw(S) then
           if not RealAssign(S) then
           if not FastAssign(S) then
           if not OrdAssign(S) then
