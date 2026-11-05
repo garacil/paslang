@@ -8363,6 +8363,42 @@ stream socket as they serve TCP: `NetAccept`, `NetRead`, `NetWrite`,
 `termd -unix path` serves the terminal on a Unix socket, its client
 connecting with `termd -connect path`.
 
+**Telling systemd (1.2.370, P560).** `uses passystemd` is `sd_notify(3)`
+and `sd_watchdog_enabled(3)` over the datagram words above: a service
+of `Type=notify` says when it is ready, one with `WatchdogSec=` says
+that it is alive, and systemd restarts it when the pings stop.
+
+| Word | What it does |
+|---|---|
+| `SdNotify(state)` | one datagram with `state`, a list of assignments one to a line (`READY=1`, `WATCHDOG=1`, `STATUS=text`, `STOPPING=1`, `MAINPID=n`; a last line feed is implied), to the socket `$NOTIFY_SOCKET` names, a path or `@name` for an abstract one: `True` when it was sent, `False` when the variable is unset or starts with anything else (`vsock:` is not served), when `state` is empty or when nobody listens |
+| `SdNotifyTo(address, state)` | the same to the socket `address` |
+| `SdWatchdogUsec` | the microseconds of `$WATCHDOG_USEC` when they are for this process (`$WATCHDOG_PID` unset or this process's number), else 0: unset, zero, not decimal digits, above `Int64`, or for another process |
+| `SdWatchdogOf(usec, havepid, pid, self)` | the same from the two texts and this process's number |
+
+A service that waits for work pings from the loop that does the work,
+at least every half of the time `SdWatchdogUsec` gives, so that a worker
+that hangs is not reported alive by a routine of its own:
+
+```pascal
+  half := SdWatchdogUsec div 2000;      { milliseconds; 0: no watchdog }
+  SdNotify('READY=1' + #10 + 'STATUS=waiting');
+  while Working do
+  begin
+    WaitForWork(half);                  { at most half of the watchdog time }
+    SdNotify('WATCHDOG=1' + #10 + 'STATUS=' + Status);
+  end;
+  SdNotify('STOPPING=1');
+```
+
+The send is a socket with no name, three system calls and no wait, as
+libsystemd's is; the kernel gives systemd the process behind it, so
+`NotifyAccess=main` (the default of `Type=notify`) takes it from the
+main process. The environment is read once, at the start, so there is
+no `unset_environment`; file descriptors (`FDSTORE=1`) and
+`sd_notify_barrier` are not here. `testdata/sdnotify` sends to an
+abstract name and to a path it listens at, and `make check` runs it with
+chosen `NOTIFY_SOCKET`, `WATCHDOG_USEC` and `WATCHDOG_PID` on both machines.
+
 Eight servers show them, each with a `-selftest n` that runs `n`
 client routines in the same process and checks every answer (`make
 check` runs them with 2000 on amd64 and 300 under qemu): `examples/httpd`

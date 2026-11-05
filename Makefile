@@ -727,6 +727,8 @@ GOLDEN += descproof
 GOLDEN_A64 += descproof
 GOLDEN += maprmw2
 GOLDEN_A64 += maprmw2
+GOLDEN += sdnotify
+GOLDEN_A64 += sdnotify
 # P436: XLSX templates filled, the entries not written kept as they were.
 GOLDEN += xlsx
 GOLDEN_A64 += xlsx
@@ -856,6 +858,7 @@ LIB_UNITS := \
 	src/lib/pastime.paslang \
 	src/lib/pasx11.paslang \
 	src/rtl/sysutils.paslang \
+	src/lib/passystemd.paslang \
 	src/lib/argon2.paslang \
 	src/lib/pascipher.paslang \
 	src/lib/pasx25519.paslang \
@@ -3351,6 +3354,21 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q -F 'syntax error at 17:3 [else] in testdata/stmtbad/unitelse.paslang' $(BUILDDIR)/stmtbad_unitelse.err; \
 	grep -q -F 'syntax error at 17:3 [until] in testdata/stmtbad/unituntil.paslang' $(BUILDDIR)/stmtbad_unituntil.err; \
 	echo ok stmtbad
+	@set -e; \
+	: P560: SdNotify and SdWatchdogUsec read NOTIFY_SOCKET and WATCHDOG_USEC and WATCHDOG_PID from the environment and testdata/sdnotify run four times with chosen values on both machines sends its datagram only to a socket it listens at and gives the watchdog time only for this process or for none named; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/sdnotify testdata/sdnotify.paslang; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -Fu $(BUILDDIR)/a64 -o $(BUILDDIR)/sdnotify-arm testdata/sdnotify.paslang; \
+	for run in "$(BUILDDIR)/sdnotify" "$(BUILDDIR)/qemu-aarch64 $(BUILDDIR)/sdnotify-arm"; do \
+		r=$$(env -u NOTIFY_SOCKET -u WATCHDOG_USEC -u WATCHDOG_PID $$run env); \
+		[ "$$r" = "notify=refused got=[-] watchdog=0" ] || { echo "sdnotify unset: $$r"; exit 1; }; \
+		r=$$(env -u WATCHDOG_PID NOTIFY_SOCKET=@paslang-sdenv-$$$$ WATCHDOG_USEC=2500000 $$run env); \
+		[ "$$r" = "notify=sent got=[READY=1|STATUS=env] watchdog=2500000" ] || { echo "sdnotify no pid: $$r"; exit 1; }; \
+		r=$$(sh -c 'WATCHDOG_USEC=2500000 WATCHDOG_PID=$$$$ NOTIFY_SOCKET=@paslang-sdenv-$$$$ exec "$$@" env' sh $$run); \
+		[ "$$r" = "notify=sent got=[READY=1|STATUS=env] watchdog=2500000" ] || { echo "sdnotify own pid: $$r"; exit 1; }; \
+		r=$$(env WATCHDOG_USEC=2500000 WATCHDOG_PID=1 NOTIFY_SOCKET=/nonexistent/paslang-sdenv $$run env); \
+		[ "$$r" = "notify=refused got=[-] watchdog=0" ] || { echo "sdnotify other pid: $$r"; exit 1; }; \
+	done; \
+	echo ok sdnotify
 	@set -e; \
 	: the kept scripts of testdata/sqllogic are what scripts/gen_sqllogic.py writes while the system SQLite is the one that made them, P412; \
 	python3 -I scripts/gen_sqllogic.py --check

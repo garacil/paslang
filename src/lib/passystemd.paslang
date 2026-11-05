@@ -1,0 +1,145 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+
+  paslang is free software: you can redistribute it and/or modify it
+  under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+
+  paslang is distributed in the hope that it will be useful, but
+  WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+  General Public License for more details.
+
+  Under Section 7 of GPL version 3, you are granted additional
+  permissions described in the paslang Runtime Library Exception,
+  version 1.0, in the file COPYING.RUNTIME.
+
+  You should have received a copy of the GNU General Public License
+  along with paslang.  If not, see <https://www.gnu.org/licenses/>. }
+
+{ Service notifications for systemd (P560, 1.2.370): sd_notify(3) and
+  sd_watchdog_enabled(3) as libsystemd's sd-daemon.c does them, in pure
+  paslang over the datagram words of pasnet. A service of Type=notify says
+  READY=1 when it serves, one of WatchdogSec= says WATCHDOG=1 at least
+  every half of that time (systemd restarts it when the pings stop), and
+  STATUS=text and STOPPING=1 tell what it is doing. Nothing here changes
+  the environment: paslang reads it once at the start, so there is no
+  unset_environment, and file descriptors (FDSTORE=1) and
+  sd_notify_barrier are not here. }
+unit passystemd;
+
+interface
+
+{ One datagram with State, a newline-separated list of assignments as
+  sd_notify takes it (READY=1, WATCHDOG=1, STATUS=text, STOPPING=1,
+  MAINPID=n; a trailing newline is implied), to the socket $NOTIFY_SOCKET
+  names. True when the datagram was sent; False when the variable is unset,
+  is not a path starting with / or @ (@ is an abstract name; vsock: is not
+  served), State is empty, or nobody listens. }
+function SdNotify(const State: string): Boolean;
+
+{ SdNotify to the socket Address instead of $NOTIFY_SOCKET. }
+function SdNotifyTo(const Address, State: string): Boolean;
+
+{ The watchdog time in microseconds that $WATCHDOG_USEC says, when it is for
+  this process: $WATCHDOG_PID unset or this process's number. 0 when the
+  watchdog is not on: $WATCHDOG_USEC unset, zero, not decimal digits or
+  above Int64, or $WATCHDOG_PID another process's (or not a number). Ping
+  with SdNotify('WATCHDOG=1') at least every half of this time. }
+function SdWatchdogUsec: Int64;
+
+{ The same from the two texts: HavePid says $WATCHDOG_PID was set, PidText is
+  its value and Pid this process's number. }
+function SdWatchdogOf(const UsecText: string; HavePid: Boolean;
+  const PidText: string; Pid: Integer): Int64;
+
+implementation
+
+uses
+  sysutils, pasnet, paslib;
+
+{ Decimal digits only, no sign and no blank, the value inside Int64. }
+function SdDecimal(const S: string; out V: Int64): Boolean;
+var
+  i, d: Integer;
+begin
+  Result := False;
+  V := 0;
+  if S = '' then
+    Exit;
+  for i := 1 to Length(S) do
+  begin
+    if (S[i] < '0') or (S[i] > '9') then
+    begin
+      V := 0;
+      Exit;
+    end;
+    d := Ord(S[i]) - 48;
+    if V > (9223372036854775807 - d) div 10 then
+    begin
+      V := 0;
+      Exit;
+    end;
+    V := V * 10 + d;
+  end;
+  Result := True;
+end;
+
+{ getpid(2): 39 on amd64, 172 on arm64 }
+function SdSelfPid: Integer;
+begin
+  if Amd64 = 0 then
+    Result := Syscall(172)
+  else
+    Result := Syscall(39);
+end;
+
+function SdNotifyTo(const Address, State: string): Boolean;
+var
+  fd, n: Integer;
+begin
+  Result := False;
+  if (State = '') or (Address = '') then
+    Exit;
+  if (Address[1] <> '/') and (Address[1] <> '@') then
+    Exit;
+  { a socket with no name, as libsystemd makes it: the sender is known by
+    its process credentials }
+  fd := UnixBind('');
+  if fd < 0 then
+    Exit;
+  n := UnixSendTo(fd, Address, State);
+  UnixClose(fd);
+  Result := n = Length(State);
+end;
+
+function SdNotify(const State: string): Boolean;
+begin
+  Result := SdNotifyTo(GetEnvironmentVariable('NOTIFY_SOCKET'), State);
+end;
+
+function SdWatchdogOf(const UsecText: string; HavePid: Boolean;
+  const PidText: string; Pid: Integer): Int64;
+var
+  u, p: Int64;
+begin
+  Result := 0;
+  if not SdDecimal(UsecText, u) or (u = 0) then
+    Exit;
+  if HavePid then
+    if not SdDecimal(PidText, p) or (p <> Pid) then
+      Exit;
+  Result := u;
+end;
+
+function SdWatchdogUsec: Int64;
+var
+  pidText: string;
+  havePid: Boolean;
+begin
+  havePid := TryGetEnvironmentVariable('WATCHDOG_PID', pidText);
+  Result := SdWatchdogOf(GetEnvironmentVariable('WATCHDOG_USEC'), havePid, pidText, SdSelfPid);
+end;
+
+end.
