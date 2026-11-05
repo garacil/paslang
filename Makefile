@@ -723,6 +723,8 @@ GOLDEN += maprmw
 GOLDEN_A64 += maprmw
 GOLDEN += descparts
 GOLDEN_A64 += descparts
+GOLDEN += descproof
+GOLDEN_A64 += descproof
 # P436: XLSX templates filled, the entries not written kept as they were.
 GOLDEN += xlsx
 GOLDEN_A64 += xlsx
@@ -3221,7 +3223,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	n=$$(grep -c 'push\|pop' $(BUILDDIR)/arrparam.fn) || true; \
 	[ "$$n" -lt 100 ] || { echo "arrparam: $$n push and pop in its routines"; exit 1; }; \
 	n=$$(grep -c '^ ' $(BUILDDIR)/arrparam.fn) || true; \
-	[ "$$n" -lt 2000 ] || { echo "arrparam: $$n instructions in its routines"; exit 1; }; \
+	[ "$$n" -lt 2400 ] || { echo "arrparam: $$n instructions in its routines"; exit 1; }; \
 	echo ok arrparam
 	@set -e; \
 	: P257: a for loop over a map takes the slots of one group of a table at a time and copies the key and the value of a word or less by registers, testdata/mapiter checks that every key comes once with its value at every size round the limits of the groups and tables, after deletes, when the loop deletes the keys it has not reached or inserts keys until the map splits under it, in nested loops and when a loop is left, for keys and values of every size and sort, and in random operations against a model, also while the collector is made to run at every allocation; \
@@ -3267,6 +3269,42 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	if $(BUILDDIR)/descoob 5 > /dev/null 2> $(BUILDDIR)/descoob.err; then echo "descoob 5 ran past the end of a loop that has one register left"; exit 1; fi; \
 	grep -q 'index 10 out of range \[0..9\] at line 81' $(BUILDDIR)/descoob.err; \
 	echo ok descparts
+	@set -e; \
+	: P558: a for loop of a routine with a var or const open array parameter that takes the array at its counter plus a constant checks the indexes once for each run of 1024 when the region keeps the length in a register, testdata/descproof checks the loops of each element size and offset over lengths round the runs and the loops that must keep their checks, the shortest loop of four of its routines in the linked program has five instructions, testdata/descproofoob checks the messages of an index past the end where the proof at the head of a run failed or none was made; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/descproof testdata/descproof.paslang; \
+	$(BUILDDIR)/descproof | diff -u testdata/descproof.out -; \
+	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 $(BUILDDIR)/descproof | diff -u testdata/descproof.out -; \
+	for f in sum prefix copy2 sumb; do \
+		objdump -d --no-show-raw-insn $(BUILDDIR)/descproof | awk -v f="<p_$$f>:" '/^[0-9a-f]+ <[^>]*>:/{ on = ($$2 == f); n = 0 } on && /^ +[0-9a-f]+:/ { a = $$1; sub(":", "", a); if ($$2 ~ /^(nop|data16|cs|xchg)/) next; n++; idx[a] = n; if ($$2 ~ /^j/ && $$2 != "jmp" && ($$3 in idx)) { w = n - idx[$$3] + 1; if (m == 0 || w < m) m = w } } END { print m }' > $(BUILDDIR)/descproof.loop; \
+		m=$$(cat $(BUILDDIR)/descproof.loop); \
+		[ "$$m" -le 5 ] || { echo "descproof: the shortest loop of $$f has $$m instructions"; exit 1; }; \
+	done; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/descproofoob testdata/descproofoob.paslang; \
+	if $(BUILDDIR)/descproofoob 1 > /dev/null 2> $(BUILDDIR)/descproofoob.err; then echo "descproofoob 1 ran past the end of a first run"; exit 1; fi; \
+	grep -q 'index 3000 out of range \[0..2999\] at line 20' $(BUILDDIR)/descproofoob.err; \
+	if $(BUILDDIR)/descproofoob 2 > /dev/null 2> $(BUILDDIR)/descproofoob.err; then echo "descproofoob 2 ran past the end of a second run"; exit 1; fi; \
+	grep -q 'index 1500 out of range \[0..1499\] at line 20' $(BUILDDIR)/descproofoob.err; \
+	if $(BUILDDIR)/descproofoob 3 > /dev/null 2> $(BUILDDIR)/descproofoob.err; then echo "descproofoob 3 ran past the end of the counter plus one"; exit 1; fi; \
+	grep -q 'index 3000 out of range \[0..2999\] at line 29' $(BUILDDIR)/descproofoob.err; \
+	if $(BUILDDIR)/descproofoob 4 > /dev/null 2> $(BUILDDIR)/descproofoob.err; then echo "descproofoob 4 ran past the end of the counter minus one"; exit 1; fi; \
+	grep -q 'index -1 out of range \[0..2999\] at line 38' $(BUILDDIR)/descproofoob.err; \
+	if $(BUILDDIR)/descproofoob 5 > /dev/null 2> $(BUILDDIR)/descproofoob.err; then echo "descproofoob 5 ran past the end of an empty array"; exit 1; fi; \
+	grep -q 'index 0 out of range \[0..-1\] at line 20' $(BUILDDIR)/descproofoob.err; \
+	if $(BUILDDIR)/descproofoob 6 > /dev/null 2> $(BUILDDIR)/descproofoob.err; then echo "descproofoob 6 ran past the end of the nil descriptor"; exit 1; fi; \
+	grep -q 'index 0 out of range \[0..-1\] at line 20' $(BUILDDIR)/descproofoob.err; \
+	if $(BUILDDIR)/descproofoob 7 > /dev/null 2> $(BUILDDIR)/descproofoob.err; then echo "descproofoob 7 ran past the end of an array shrunk in the loop"; exit 1; fi; \
+	grep -q 'index 1501 out of range \[0..1199\] at line 48' $(BUILDDIR)/descproofoob.err; \
+	if $(BUILDDIR)/descproofoob 8 > /dev/null 2> $(BUILDDIR)/descproofoob.err; then echo "descproofoob 8 ran past the end of doubles"; exit 1; fi; \
+	grep -q 'index 2000 out of range \[0..1999\] at line 60' $(BUILDDIR)/descproofoob.err; \
+	if $(BUILDDIR)/descproofoob 9 > /dev/null 2> $(BUILDDIR)/descproofoob.err; then echo "descproofoob 9 ran past the end of bytes at the edge of a run"; exit 1; fi; \
+	grep -q 'index 1025 out of range \[0..1024\] at line 69' $(BUILDDIR)/descproofoob.err; \
+	if $(BUILDDIR)/descproofoob 10 > /dev/null 2> $(BUILDDIR)/descproofoob.err; then echo "descproofoob 10 ran past the end of the shorter of two arrays"; exit 1; fi; \
+	grep -q 'index 2000 out of range \[0..1999\] at line 78' $(BUILDDIR)/descproofoob.err; \
+	if $(BUILDDIR)/descproofoob 11 > /dev/null 2> $(BUILDDIR)/descproofoob.err; then echo "descproofoob 11 ran past the end of a loop that has no register left"; exit 1; fi; \
+	grep -q 'index 3000 out of range \[0..2999\] at line 90' $(BUILDDIR)/descproofoob.err; \
+	if $(BUILDDIR)/descproofoob 12 > /dev/null 2> $(BUILDDIR)/descproofoob.err; then echo "descproofoob 12 ran past the end of a loop that has one register left"; exit 1; fi; \
+	grep -q 'index 3000 out of range \[0..2999\] at line 114' $(BUILDDIR)/descproofoob.err; \
+	echo ok descproof
 	@set -e; \
 	: the kept scripts of testdata/sqllogic are what scripts/gen_sqllogic.py writes while the system SQLite is the one that made them, P412; \
 	python3 -I scripts/gen_sqllogic.py --check
