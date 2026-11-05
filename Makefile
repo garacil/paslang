@@ -717,6 +717,8 @@ GOLDEN += bitview
 GOLDEN_A64 += bitview
 GOLDEN += arrparam
 GOLDEN_A64 += arrparam
+GOLDEN += mapiter
+GOLDEN_A64 += mapiter
 # P436: XLSX templates filled, the entries not written kept as they were.
 GOLDEN += xlsx
 GOLDEN_A64 += xlsx
@@ -3217,6 +3219,18 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	n=$$(grep -c '^ ' $(BUILDDIR)/arrparam.fn) || true; \
 	[ "$$n" -lt 2000 ] || { echo "arrparam: $$n instructions in its routines"; exit 1; }; \
 	echo ok arrparam
+	@set -e; \
+	: P257: a for loop over a map takes the slots of one group of a table at a time and copies the key and the value of a word or less by registers, testdata/mapiter checks that every key comes once with its value at every size round the limits of the groups and tables, after deletes, when the loop deletes the keys it has not reached or inserts keys until the map splits under it, in nested loops and when a loop is left, for keys and values of every size and sort, and in random operations against a model, also while the collector is made to run at every allocation; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/mapiter testdata/mapiter.paslang; \
+	$(BUILDDIR)/mapiter | diff -u testdata/mapiter.out -; \
+	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 $(BUILDDIR)/mapiter | diff -u testdata/mapiter.out -; \
+	objdump -d --no-show-raw-insn $(BUILDDIR)/mapiter | awk '/^[0-9a-f]+ <[^>]*>:/{ on = ($$2 ~ /^<p_whole>:$$/) } on' > $(BUILDDIR)/mapiter.fn; \
+	n=$$(grep -c '^ ' $(BUILDDIR)/mapiter.fn) || true; \
+	[ "$$n" -gt 50 ] || { echo "mapiter: Whole has $$n instructions"; exit 1; }; \
+	n=$$(grep -c 'rt_memcpy' $(BUILDDIR)/mapiter.fn) || true; \
+	[ "$$n" -eq 0 ] || { echo "mapiter: $$n calls of rt_memcpy in the loop of Whole"; exit 1; }; \
+	python3 scripts/gen_mapiter.py | diff -u testdata/mapiter.out -; \
+	echo ok mapiter
 	@set -e; \
 	: the kept scripts of testdata/sqllogic are what scripts/gen_sqllogic.py writes while the system SQLite is the one that made them, P412; \
 	python3 -I scripts/gen_sqllogic.py --check

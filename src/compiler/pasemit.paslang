@@ -592,6 +592,8 @@ type
     procedure PushK(const Reg: string; K: Byte);
     procedure PshK(const Reg: string; K: Byte);
     procedure MapHint4(K0, K1, K2, K3: Byte);
+    procedure MapSlotCopy(Size, Off: LongInt);
+    procedure MapSlotCopyA(Size, Off: LongInt);
     function HasFeat(Bit: LongInt): Boolean;
     function Bsf(const Sfx: string): string;
     procedure CpuNote(const Sym: string; ASet: Int64; ATune: LongInt);
@@ -2460,6 +2462,109 @@ begin
     Line('  b.ne ' + MissLabel);
     Line('  stlxr w4, w2, [x9]');
     Line('  cbnz w4, ' + RetryLabel);
+  end;
+end;
+
+{ The bytes of a map's key or value at the slot on top of the stack (the key slot
+  plus Off) to the address in rax: a word, a half, a byte or two words by
+  registers, any other size by rt_memcpy (P257: a call of 18 instructions
+  for a copy of 8 bytes). }
+procedure TEmitter.MapSlotCopy(Size, Off: LongInt);
+var
+  o: string;
+begin
+  if (Size = 1) or (Size = 2) or (Size = 4) or (Size = 8) or (Size = 16) then
+  begin
+    Line('  movq (%rsp), %rsi');
+    if Off <> 0 then
+      o := IntToStr(Off)
+    else
+      o := '';
+    case Size of
+      1:
+        begin
+          Line('  movb ' + o + '(%rsi), %cl');
+          Line('  movb %cl, (%rax)');
+        end;
+      2:
+        begin
+          Line('  movw ' + o + '(%rsi), %cx');
+          Line('  movw %cx, (%rax)');
+        end;
+      4:
+        begin
+          Line('  movl ' + o + '(%rsi), %ecx');
+          Line('  movl %ecx, (%rax)');
+        end;
+      8:
+        begin
+          Line('  movq ' + o + '(%rsi), %rcx');
+          Line('  movq %rcx, (%rax)');
+        end;
+    else
+      begin
+        Line('  movq ' + o + '(%rsi), %rcx');
+        Line('  movq ' + IntToStr(Off + 8) + '(%rsi), %rdi');
+        Line('  movq %rcx, (%rax)');
+        Line('  movq %rdi, 8(%rax)');
+      end;
+    end;
+  end
+  else
+  begin
+    Line('  movq %rax, %rdi');
+    Line('  movq (%rsp), %rsi');
+    if Off <> 0 then
+      Line('  addq $' + IntToStr(Off) + ', %rsi');
+    Line('  movq $' + IntToStr(Size) + ', %rcx');
+    Line('  call rt_memcpy');
+  end;
+end;
+
+{ MapSlotCopy for arm64: the address is in x0, the slot on top of the stack. }
+procedure TEmitter.MapSlotCopyA(Size, Off: LongInt);
+var
+  o: string;
+begin
+  if (Size = 1) or (Size = 2) or (Size = 4) or (Size = 8) or (Size = 16) then
+  begin
+    Line('  ldr x1, [sp]');
+    o := ', #' + IntToStr(Off);
+    case Size of
+      1:
+        begin
+          Line('  ldrb w2, [x1' + o + ']');
+          Line('  strb w2, [x0]');
+        end;
+      2:
+        begin
+          Line('  ldrh w2, [x1' + o + ']');
+          Line('  strh w2, [x0]');
+        end;
+      4:
+        begin
+          Line('  ldr w2, [x1' + o + ']');
+          Line('  str w2, [x0]');
+        end;
+      8:
+        begin
+          Line('  ldr x2, [x1' + o + ']');
+          Line('  str x2, [x0]');
+        end;
+    else
+      begin
+        Line('  ldp x2, x3, [x1' + o + ']');
+        Line('  stp x2, x3, [x0]');
+      end;
+    end;
+  end
+  else
+  begin
+    Line('  ldr x1, [sp]');
+    if Off <> 0 then
+      Line('  add x1, x1, #' + IntToStr(Off));
+    Imm('x2', Size);
+    Line('  bl rt_memcpy');
   end;
 end;
 
@@ -31176,14 +31281,19 @@ begin
             a := Lab;
             b := Lab;
             PushLoop(b, a);
-            { The iterator lives in 32 bytes below the frame. Each step
+            { The iterator lives in 48 bytes below the frame. Each step
               returns the key slot; the value follows the key. }
             MapHint4(1, 0, 0, 0);
-            Line('  sub sp, sp, #32');
+            SetLength(FPushHint, 6);
+            FPushHint[4] := 2;
+            FPushHint[5] := 0;
+            Line('  sub sp, sp, #48');
             Line('  str xzr, [sp]');
             Line('  str xzr, [sp, #8]');
             Line('  str xzr, [sp, #16]');
             Line('  str xzr, [sp, #24]');
+            Line('  str xzr, [sp, #32]');
+            Line('  str xzr, [sp, #40]');
             Line(a + ':');
             EmitExpr(S^.E);
             Line('  mov x1, sp');
@@ -31193,9 +31303,7 @@ begin
             PshK('x0', 1);
             vs := FindSym(S^.Name);
             EmitAddr(NewVar(S^.Name, FTypes[S^.E^.Typ].Elem));
-            Line('  ldr x1, [sp]');
-            Imm('x2', TSize(vs.Typ));
-            Line('  bl rt_memcpy');
+            MapSlotCopyA(TSize(vs.Typ), 0);
             { The loop's key and value share the map's strings (1.0.82). }
             smap := StrMap(FTypes[S^.E^.Typ].Elem);
             if smap <> '' then
@@ -31207,13 +31315,10 @@ begin
             if S^.Dest <> nil then
             begin
               EmitAddr(S^.Dest);
-              Line('  ldr x1, [sp]');
               if IsStr(FTypes[S^.E^.Typ].Elem) then
-                Line('  add x1, x1, #16')
+                MapSlotCopyA(TSize(FTypes[S^.E^.Typ].Elem2), 16)
               else
-                Line('  add x1, x1, #8');
-              Imm('x2', TSize(FTypes[S^.E^.Typ].Elem2));
-              Line('  bl rt_memcpy');
+                MapSlotCopyA(TSize(FTypes[S^.E^.Typ].Elem2), 8);
               smap := StrMap(FTypes[S^.E^.Typ].Elem2);
               if smap <> '' then
               begin
@@ -31226,7 +31331,7 @@ begin
             EmitStmt(S^.Body);
             Line('  b ' + a);
             Line(b + ':');
-            Line('  add sp, sp, #32');
+            Line('  add sp, sp, #48');
             PopLoop;
           end
           else
@@ -31916,15 +32021,20 @@ begin
           a := Lab;
           b := Lab;
           PushLoop(b, a);
-          { The iterator lives in 32 bytes below the frame. Each step
+          { The iterator lives in 48 bytes below the frame. Each step
             returns the key slot; the value follows the key. }
           { Its first word is the copy of the directory (P96). }
           MapHint4(1, 0, 0, 0);
-          Line('  subq $32, %rsp');
+          SetLength(FPushHint, 6);
+          FPushHint[4] := 2;
+          FPushHint[5] := 0;
+          Line('  subq $48, %rsp');
           Line('  movq $0, (%rsp)');
           Line('  movq $0, 8(%rsp)');
           Line('  movq $0, 16(%rsp)');
           Line('  movq $0, 24(%rsp)');
+          Line('  movq $0, 32(%rsp)');
+          Line('  movq $0, 40(%rsp)');
           Line(a + ':');
           EmitExpr(S^.E);
           Line('  movq %rax, %rdi');
@@ -31936,10 +32046,7 @@ begin
           PushK('rax', 1);
           vs := FindSym(S^.Name);
           EmitAddr(NewVar(S^.Name, FTypes[S^.E^.Typ].Elem));
-          Line('  movq %rax, %rdi');
-          Line('  movq (%rsp), %rsi');
-          Line('  movq $' + IntToStr(TSize(vs.Typ)) + ', %rcx');
-          Line('  call rt_memcpy');
+          MapSlotCopy(TSize(vs.Typ), 0);
           { The loop's key and value share the map's strings (1.0.82). }
           smap := StrMap(FTypes[S^.E^.Typ].Elem);
           if smap <> '' then
@@ -31952,14 +32059,10 @@ begin
           if S^.Dest <> nil then
           begin
             EmitAddr(S^.Dest);
-            Line('  movq %rax, %rdi');
-            Line('  movq (%rsp), %rsi');
             if IsStr(FTypes[S^.E^.Typ].Elem) then
-              Line('  addq $16, %rsi')
+              MapSlotCopy(TSize(FTypes[S^.E^.Typ].Elem2), 16)
             else
-              Line('  addq $8, %rsi');
-            Line('  movq $' + IntToStr(TSize(FTypes[S^.E^.Typ].Elem2)) + ', %rcx');
-            Line('  call rt_memcpy');
+              MapSlotCopy(TSize(FTypes[S^.E^.Typ].Elem2), 8);
             smap := StrMap(FTypes[S^.E^.Typ].Elem2);
             if smap <> '' then
             begin
@@ -31973,7 +32076,7 @@ begin
           EmitStmt(S^.Body);
           Line('  jmp ' + a);
           Line(b + ':');
-          Line('  addq $32, %rsp');
+          Line('  addq $48, %rsp');
           PopLoop;
         end
         else

@@ -183,6 +183,22 @@ type
 {$endif}
   PMap = ^TMap;
 
+{$if PASLANG_FULLVERSION >= 1002364}
+  { The 48 bytes a for loop keeps on its own stack: a copy of the
+    directory it started on (the table itself when there was one), its
+    place (entry * MaxTableCap + groups of that table taken), a random
+    start, the map's Gen then, times 256, plus the depth + 1 (0 before the
+    first call), the group it is at and the slots of it not yet returned
+    (G and F, P257). }
+  TIter = record
+    Dir: Pointer;
+    Probe: Integer;
+    Start: Integer;
+    Live: Integer;
+    G: Pointer;
+    F: Integer;
+  end;
+{$else}
   { The 32 bytes a for loop keeps on its own stack: a copy of the
     directory it started on (the table itself when there was one), its
     place (entry * MaxTableCap + slot), a random start, and the map's Gen
@@ -193,6 +209,7 @@ type
     Start: Integer;
     Live: Integer;
   end;
+{$endif}
   PIter = ^TIter;
 
 const
@@ -1421,6 +1438,227 @@ begin
   mp^.Writing := mp^.Writing xor 1;
 end;
 
+{$if PASLANG_FULLVERSION >= 1002364}
+{ The next of the slots of the group G of a loop that were full when the group was
+  taken, in F, in the order of the walk (the group rotated by Start and 7 slots,
+  so the lowest bit is next), and are still full: its key slot, nil when there is
+  none. }
+function PopSlot(ip: PIter; SS: Integer): Pointer;
+var
+  f, b, w, j: Integer;
+  g: Pointer;
+begin
+  Result := nil;
+  g := ip^.G;
+  if g = nil then
+    Exit;
+  f := ip^.F;
+  w := PInt(g)^;
+  while f <> 0 do
+  begin
+    b := f and (-f);
+    f := f xor b;
+    j := (((((b shr 7) * SlotIndex) shr 56)) + ip^.Start) and 7;
+    if ((w shr (8 * j)) and 128) = 0 then
+    begin
+      ip^.F := f;
+      Result := Pointer(Integer(g) + 8 + j * SS);
+      Exit;
+    end;
+  end;
+  ip^.F := 0;
+end;
+
+{ The loop goes on to the next group with a full slot, of the tables it started on: the
+  groups of a table in turn from a random one (Start shr 3), each table once, at its
+  first entry (the one below 2^LocalDepth), from a random entry. G and F are the group
+  and its full slots rotated by Start and 7 slots; False at the end. }
+function FindGroup(ip: PIter; SS: Integer): Boolean;
+var
+  pr, lim, de, dd, mk, dm, st, f, r, s: Integer;
+  t: PTable;
+  g: Pointer;
+begin
+  Result := False;
+  st := ip^.Start;
+  dm := (1 shl ((ip^.Live and 255) - 1)) - 1;
+  lim := MaxTableCap * (dm + 1);
+  pr := ip^.Probe;
+  while pr < lim do
+  begin
+    de := pr shr 10;
+    if dm = 0 then
+    begin
+      dd := 0;
+      t := PTable(ip^.Dir);
+    end
+    else
+    begin
+      dd := (de + (st shr 10)) and dm;
+      t := PTable(PInt(Integer(ip^.Dir) + dd * 8)^ - TableHdr);
+    end;
+    mk := t^.Mask;
+    s := pr and (MaxTableCap - 1);
+    if ((dd shr t^.LocalDepth) <> 0) or (s > mk) then
+    begin
+      pr := (de + 1) shl 10;
+      Continue;
+    end;
+    pr := pr + 1;
+    g := Pointer(Integer(t) + TableHdr + ((s + (st shr 3)) and mk) * ((SS + 1) shl 3));
+    f := (PInt(g)^ xor (-1)) and MSB;
+    if f <> 0 then
+    begin
+      r := 8 * (st and 7);
+      ip^.G := g;
+      ip^.F := (f shr r) or ((f shl 1) shl (63 - r));
+      ip^.Probe := pr;
+      Result := True;
+      Exit;
+    end;
+  end;
+  ip^.Probe := pr;
+  ip^.G := nil;
+end;
+
+{ The next key slot for a for loop, or nil at the end, when the loop is not on the
+  fast road of PasMapNext: its first call, a small map, a table replaced since
+  (Gen moved), or a write meanwhile. The loop walks a copy of the directory it
+  started on (so a table that grows or splits meanwhile does not move under it),
+  each table once, at its first entry (the one below 2^LocalDepth), from a random
+  entry, and the groups of a table from a random one (FindGroup), the slots of a
+  group from a random one (PopSlot). When a table has been replaced since (Gen
+  moved), a key is looked up again in the map, so an entry deleted during the loop
+  is not returned, an updated value is the current one, and no key comes twice. A
+  loop over a small map walks its group (Live 255) from a random slot; when the map
+  is no longer that group (it grew into a table), a key is looked up again in the
+  same way. }
+function NextSlow(M, It, Desc: Pointer): Pointer;
+var
+  mp: PMap;
+  d: PMapDesc;
+  ip: PIter;
+  i, h, n, ss: Integer;
+  g, k, p: Pointer;
+begin
+  Result := nil;
+  if M = nil then
+    Exit;
+  mp := PMap(M);
+  d := PMapDesc(Desc);
+  ip := PIter(It);
+  ss := mp^.SlotSize;
+  if ip^.Live = 0 then
+  begin
+    if mp^.Used = 0 then
+      Exit;
+    if mp^.TabMask = 0 then
+    begin
+      ip^.Dir := mp^.Dir;
+      ip^.Live := 255;
+    end
+    else
+    begin
+      if mp^.Depth = 0 then
+        ip^.Dir := Pointer(PInt(Integer(mp^.Dir) + DirEnt)^ - TableHdr)
+      else
+      begin
+        n := 1 shl mp^.Depth;
+        GetMem(p, n * 8);
+        Move(Pointer(Integer(mp^.Dir) + DirEnt)^, p^, n * 8);
+        ip^.Dir := p;
+      end;
+      ip^.Live := GenAt(mp)^ * 256 + mp^.Depth + 1;
+    end;
+    ip^.Probe := 0;
+    ip^.Start := (mp^.Seed shr 13) and 1073741823;
+  end;
+  if mp^.Writing <> 0 then
+    Fatal('paslang: concurrent map iteration and map write');
+  if ip^.Live = 255 then
+  begin
+    while ip^.Probe < SmallMax do
+    begin
+      i := (ip^.Probe + ip^.Start) and 7;
+      ip^.Probe := ip^.Probe + 1;
+      g := ip^.Dir;
+      if ((PInt(g)^ shr (8 * i)) and 128) = 0 then
+      begin
+        k := SlotAt(g, i, ss);
+        if mp^.Dir <> ip^.Dir then
+          k := FindAny(mp, k, d);
+        if k <> nil then
+        begin
+          Result := k;
+          Exit;
+        end;
+      end;
+    end;
+    Exit;
+  end;
+  while True do
+  begin
+    k := PopSlot(ip, ss);
+    if k <> nil then
+    begin
+      if GenAt(mp)^ <> (ip^.Live shr 8) then
+      begin
+        h := HashOf(mp, k, d);
+        k := FindSlot(TableFor(mp, h), k, d, h, ss);
+      end;
+      if k <> nil then
+      begin
+        Result := k;
+        Exit;
+      end;
+      Continue;
+    end;
+    if not FindGroup(ip, ss) then
+      Exit;
+  end;
+end;
+
+{ The next key slot for a for loop, or nil at the end. The slots of the group the loop
+  is at that are still full and not yet returned come back one by one with nothing
+  else to look at (the tables are the loop's and nothing writes), then the next
+  group with a full slot; the rest is NextSlow. }
+function PasMapNext(M, It, Desc: Pointer): Pointer;
+var
+  mp: PMap;
+  ip: PIter;
+  g: Pointer;
+  f, b, j: Integer;
+begin
+  ip := PIter(It);
+  g := ip^.G;
+  if g <> nil then
+  begin
+    mp := PMap(M);
+    if (mp^.Writing = 0) and (GenAt(mp)^ = (ip^.Live shr 8)) then
+    begin
+      f := ip^.F;
+      if f <> 0 then
+      begin
+        b := f and (-f);
+        j := ((((b shr 7) * SlotIndex) shr 56) + ip^.Start) and 7;
+        if ((PInt(g)^ shr (8 * j)) and 128) = 0 then
+        begin
+          ip^.F := f xor b;
+          Result := Pointer(Integer(g) + 8 + j * mp^.SlotSize);
+          Exit;
+        end;
+      end;
+      Result := PopSlot(ip, mp^.SlotSize);
+      if Result = nil then
+        if FindGroup(ip, mp^.SlotSize) then
+          Result := PopSlot(ip, mp^.SlotSize);
+      Exit;
+    end;
+  end;
+  Result := NextSlow(M, It, Desc);
+end;
+
+{$else}
 { The next key slot for a for loop, or nil at the end. The loop walks
   a copy of the directory it started on (so a table that grows or splits
   meanwhile does not move under it), each table once, at its first entry
@@ -1548,6 +1786,8 @@ begin
   end;
   ip^.Probe := pr;
 end;
+
+{$endif}
 
 { Empty the map in place, every table kept at its size (as Go's clear
   keeps them), a small map's group too, and draw a new seed. The slots
