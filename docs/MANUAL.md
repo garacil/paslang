@@ -12460,6 +12460,29 @@ Out := b.Save;                           { the workbook as an archive }
   is its runs', a phonetic run is left out); `Date1904`. The workbook is
   found through the package's relationships, as the Open Packaging
   Conventions say, so a sheet at any path or an absolute target is found.
+- **Numbers and dates (1.2.371, P563).** `GetNumber(ref, out v)` is the
+  number of a numeric cell (no `t`, or `t="n"`): `False` for text, a
+  Boolean, an error, a cell that is not there or a value that is not a
+  finite number. `GetDate(ref, out y, m, d)`, `GetDateTime(ref, out y, m,
+  d, h, mi, s)`, `DateText(ref)` (`YYYY-MM-DD`) and `DateTimeText(ref)`
+  (`YYYY-MM-DD HH:MM:SS`) read the date a cell holds: a numeric cell as a
+  serial of the book's date system (ECMA-376 Part 1, 18.17.4.1 and
+  L.2.16.9.1): in the 1900 system the days of Excel's compatibility count,
+  where 1 is 1 January 1900 and 60 the 29 February 1900 that never was,
+  the count `SetDate` writes (the standard's own 1900 base, 30 December
+  1899 as 0, differs from it only before 1 March 1900); with `Date1904`,
+  the days since 1 January 1904; the fraction of the day is the time,
+  rounded to the second; or a
+  `t="d"` cell as the ISO 8601 text it has (`2024-10-24`,
+  `2024-10-24T13:45:30`; a fraction of a second is dropped, a `Z` or an
+  offset is read and left alone). `False`, and `''`, for a cell that is
+  neither, for a serial below 0, for 60 in the 1900 system and for a day
+  past 9999-12-31. A date is not told from a number by its style, so any
+  number reads as a date when asked. `XlsxSerialToDate(serial, date1904,
+  out y, m, d, h, mi, s)` and `XlsxParseIsoDate(text, out y, m, d, h, mi,
+  s)` are the same from the values. `testdata/xlsxdate` reads both
+  templates and is checked line by line against Python's `datetime` by
+  `scripts/xlsxdate_check.py`.
 - **The package.** `HasPart`, `ReadPart(name)` and `SetPart(name, data)`
   reach any part (a part set is written in its place in the archive with the
   times and attributes it had, or added at the end). `XlsxParseRef`,

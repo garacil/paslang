@@ -735,6 +735,9 @@ GOLDEN_A64 += xlsx
 # P454: shared strings written, rows given a model row's attributes.
 GOLDEN += xlsxsst
 GOLDEN_A64 += xlsxsst
+# P563: the date a numeric cell holds, in the 1900 and the 1904 date systems, and the text of a t="d" cell.
+GOLDEN += xlsxdate
+GOLDEN_A64 += xlsxdate
 # P432: URLs and HTTP messages against Go, and the HTTP client over loopback.
 GOLDEN += url httpmsg httpcli
 GOLDEN_A64 += url httpmsg httpcli
@@ -3369,6 +3372,13 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 		[ "$$r" = "notify=refused got=[-] watchdog=0" ] || { echo "sdnotify other pid: $$r"; exit 1; }; \
 	done; \
 	echo ok sdnotify
+	@set -e; \
+	: P563: the date a cell holds is read from its serial in the 1900 or the 1904 date system or from the ISO text of a t=d cell and scripts/xlsxdate_check.py works every serial and iso line of testdata/xlsxdate out again with the datetime of Python; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/xlsxdate testdata/xlsxdate.paslang; \
+	$(BUILDDIR)/xlsxdate > $(BUILDDIR)/xlsxdate.got; \
+	diff -u testdata/xlsxdate.out $(BUILDDIR)/xlsxdate.got; \
+	python3 -I scripts/xlsxdate_check.py $(BUILDDIR)/xlsxdate.got; \
+	echo ok xlsxdate
 	@set -e; \
 	: the kept scripts of testdata/sqllogic are what scripts/gen_sqllogic.py writes while the system SQLite is the one that made them, P412; \
 	python3 -I scripts/gen_sqllogic.py --check
