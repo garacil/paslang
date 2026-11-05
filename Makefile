@@ -721,6 +721,8 @@ GOLDEN += mapiter
 GOLDEN_A64 += mapiter
 GOLDEN += maprmw
 GOLDEN_A64 += maprmw
+GOLDEN += descparts
+GOLDEN_A64 += descparts
 # P436: XLSX templates filled, the entries not written kept as they were.
 GOLDEN += xlsx
 GOLDEN_A64 += xlsx
@@ -3245,6 +3247,26 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	[ "$$n" -eq 0 ] || { echo "maprmw: $$n reads in Upd"; exit 1; }; \
 	python3 scripts/gen_maprmw.py | diff -u testdata/maprmw.out -; \
 	echo ok maprmw
+	@set -e; \
+	: P556: a loop of a routine with a var or const open array parameter keeps the pointer and the length of the array in registers, testdata/descparts checks the loops of each form and element size, a sort, empty arrays and the nil descriptor, and what changes the descriptor under a loop: a call that grows or shrinks the array, an assignment through the parameter or through a global or a second parameter that is the same variable, a record copied over it in line and one moved over it, and the sort Quick in the linked program tests no descriptor in its loops, testdata/descoob checks the messages of an index past the end after the descriptor changed; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/descparts testdata/descparts.paslang; \
+	$(BUILDDIR)/descparts | diff -u testdata/descparts.out -; \
+	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 $(BUILDDIR)/descparts | diff -u testdata/descparts.out -; \
+	objdump -d --no-show-raw-insn $(BUILDDIR)/descparts | awk '/^[0-9a-f]+ <[^>]*>:/{ on = ($$2 ~ /^<p_quick>:$$/) } on' > $(BUILDDIR)/descparts.fn; \
+	n=$$(grep -c 'xor .*%eax,%eax' $(BUILDDIR)/descparts.fn) || true; \
+	[ "$$n" -le 2 ] || { echo "descparts: $$n tests of the descriptor in Quick"; exit 1; }; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/descoob testdata/descoob.paslang; \
+	if $(BUILDDIR)/descoob 1 > /dev/null 2> $(BUILDDIR)/descoob.err; then echo "descoob 1 ran past the end of an empty array"; exit 1; fi; \
+	grep -q 'index 0 out of range \[0..-1\] at line 30' $(BUILDDIR)/descoob.err; \
+	if $(BUILDDIR)/descoob 2 > /dev/null 2> $(BUILDDIR)/descoob.err; then echo "descoob 2 ran past the end of an array shrunk by a call in the loop"; exit 1; fi; \
+	grep -q 'index 4 out of range \[0..1\] at line 40' $(BUILDDIR)/descoob.err; \
+	if $(BUILDDIR)/descoob 3 > /dev/null 2> $(BUILDDIR)/descoob.err; then echo "descoob 3 ran past the end of an array replaced by an assignment with no call"; exit 1; fi; \
+	grep -q 'index 4 out of range \[0..2\] at line 53' $(BUILDDIR)/descoob.err; \
+	if $(BUILDDIR)/descoob 4 > /dev/null 2> $(BUILDDIR)/descoob.err; then echo "descoob 4 ran past the end of an array zeroed with its record"; exit 1; fi; \
+	grep -q 'index 4 out of range \[0..-1\] at line 100' $(BUILDDIR)/descoob.err; \
+	if $(BUILDDIR)/descoob 5 > /dev/null 2> $(BUILDDIR)/descoob.err; then echo "descoob 5 ran past the end of a loop that has one register left"; exit 1; fi; \
+	grep -q 'index 10 out of range \[0..9\] at line 81' $(BUILDDIR)/descoob.err; \
+	echo ok descparts
 	@set -e; \
 	: the kept scripts of testdata/sqllogic are what scripts/gen_sqllogic.py writes while the system SQLite is the one that made them, P412; \
 	python3 -I scripts/gen_sqllogic.py --check

@@ -444,6 +444,7 @@ type
     FWmSh: LongInt;
     FWmOff: Int64;
     FFatWritten: TStrArray; { the slices a region being scanned assigns (P100) }
+    FDescStore: Boolean;    { the region being scanned has a statement that may write a slice's descriptor: a call that is no island, an assignment of more than a scalar (P556) }
     FPinned: LongInt;       { scratch bytes a promoted loop keeps for the registers it saves (P93) }
     FPromoOn: Boolean;      { a loop is being emitted with variables in registers (P93) }
     FPromo: array of TPromo;
@@ -17369,7 +17370,7 @@ end;
 function TEmitter.SliceRefOps(B: PExpr; out Pre, P, L: string): Boolean;
 var
   sy: TSym;
-  r: string;
+  r, pr, lr: string;
 begin
   Result := False;
   Pre := '';
@@ -17382,7 +17383,18 @@ begin
   if (not sy.ByRef) or sy.Boxed or (sy.Up > 0) or sy.Global then
     Exit;
   r := ByRefReg(B);
-  if r <> '' then
+  pr := PartReg(sy, 1);
+  lr := PartReg(sy, 2);
+  if (pr <> '') and (lr <> '') then
+  begin
+    { the region keeps the pointer and the length (P556) }
+    if (pr = 'rax') or (pr = 'rcx') or (pr = 'rdx') or (lr = 'rax') or (lr = 'rcx') or
+      (lr = 'rdx') then
+      Exit;
+    P := '%' + pr;
+    L := '%' + lr;
+  end
+  else if r <> '' then
   begin
     if (r = 'rax') or (r = 'rcx') or (r = 'rdx') then
       Exit;
@@ -33088,7 +33100,15 @@ begin
     if (not s.ByRef) or (s.Up <> 0) or s.Global or s.Boxed then
       Exit;
   end
-  else if s.ByRef or (s.Up <> 0) then
+  else if s.ByRef then
+  begin
+    { a var or const open array's pointer and length (P556): behind the
+      address of its descriptor, which does not change in a region that
+      writes no descriptor (FDescStore); amd64 }
+    if FArm or (Part > 2) or (s.Up <> 0) or s.Global or s.Boxed or not IsDyn(s.Typ) then
+      Exit;
+  end
+  else if s.Up <> 0 then
     Exit;
   { arm64 forms a static array's address in two or three instructions
     (adrp and add, or the frame offset and an add); a loop keeps it. }
@@ -33098,7 +33118,7 @@ begin
       Exit;
   end
   else if Part = 4 then
-  else if (not IsDyn(s.Typ)) or AddrKept(s.Name) then
+  else if (not IsDyn(s.Typ)) or (AddrKept(s.Name) and not s.ByRef) then
     Exit;
   if s.Global and (FIsUnit or ExtGlobal(s.Name)) then
     Exit;
@@ -33139,7 +33159,21 @@ end;
 procedure TEmitter.LoadHomePart(const S: TSym; Part: LongInt; const Reg: string);
 var
   d: LongInt;
+  ok: string;
 begin
+  if S.ByRef and (Part <= 2) then
+  begin
+    { a var or const open array's pointer (Part 1) or length (Part 2),
+      from the descriptor the slot holds the address of, which may be nil:
+      then it is empty and both words are zero (P556) }
+    ok := Lab;
+    Line('  movq ' + IntToStr(S.Off) + '(%rbp), %' + Reg);
+    Line('  testq %' + Reg + ', %' + Reg);
+    Line('  je ' + ok);
+    Line('  movq ' + IntToStr(8 * (Part - 1)) + '(%' + Reg + '), %' + Reg);
+    Line(ok + ':');
+    Exit;
+  end;
   if Part = 9 then
   begin
     if FArm then
@@ -33242,12 +33276,34 @@ end;
 procedure TEmitter.PromoScanS(S: PStmt; Weight: LongInt);
 var
   i, k: SizeInt;
+  ty: LongInt;
+  sy: TSym;
   w, lo: LongInt;
   w1, w2: Int64;
   outer: Boolean;
 begin
   if S = nil then
     Exit;
+  { a call that is no island (FillChar, Move) or an assignment of more than
+    a scalar may write the words of a slice's descriptor, which a region keeps
+    for a var or const open array only where nothing does; an island's call
+    may too, and the island loads the registers again after it (P556) }
+  if S^.Kind = skCall then
+  begin
+    if (Length(FIsles) = 0) or (IsleAt(S) < 0) then
+      FDescStore := True;
+  end
+  else if (S^.Kind = skAssign) or (S^.Kind = skInc) or (S^.Kind = skDec) then
+  begin
+    if S^.Dest <> nil then
+      ty := S^.Dest^.Typ
+    else if TryFindSym(S^.Name, sy) then
+      ty := sy.Typ
+    else
+      ty := TyNone;
+    if not (PromoScalar(ty) or ((TKind(ty) = tykReal) and (TSize(ty) <= 8))) then
+      FDescStore := True;
+  end;
   { a straight run's statements are its places, in the order they are
     emitted (P396) }
   if FStraight then
@@ -35198,6 +35254,7 @@ begin
   FStraight := False;
   FPromo := nil;
   FFatWritten := nil;
+  FDescStore := False;
   if run then
   begin
     { a straight run's places and weights (P396) }
@@ -35246,7 +35303,8 @@ begin
   chosen := nil;
   for i := 0 to High(FPromo) do
     if (FPromo[i].Part = 0) or
-      (not InNames(FFatWritten, NormName(FPromo[i].Place.Name))) then
+      ((not InNames(FFatWritten, NormName(FPromo[i].Place.Name))) and
+      not (FDescStore and FPromo[i].Place.ByRef and (FPromo[i].Part <= 2))) then
     begin
       j := Length(chosen);
       SetLength(chosen, j + 1);
@@ -38928,9 +38986,11 @@ begin
             lenk := Length(E^.L^.Txt);
             lenop := '$' + IntToStr(lenk);
           end
-          else if (E^.L^.Kind = ekVar) and TryFindSym(E^.L^.Name, s) and (not s.ByRef) then
+          else if (E^.L^.Kind = ekVar) and TryFindSym(E^.L^.Name, s) and
+            ((not s.ByRef) or ((PartReg(s, 1) <> '') and (PartReg(s, 2) <> ''))) then
           begin
-            { A slice a loop keeps in registers (P100). }
+            { A slice a loop keeps in registers (P100), or a var or const
+              open array's pointer and length (P556). }
             preg := PartReg(s, 1);
             lreg := PartReg(s, 2);
             if preg <> '' then
