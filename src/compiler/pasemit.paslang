@@ -292,6 +292,7 @@ type
     FLab: LongInt;
     FAddrWrite: Boolean;  { the next EmitAddr is for a write: a string's characters become its own (1.0.82) }
     FStoreSrc: PExpr;     { the value StoreTo stores, when the statement knows it (1.0.82) }
+    FMapRmw: LongInt;     { 1 or 2 while a map entry is stored by adding or subtracting the value (P555) }
     FAddrInto: string;    { P373: the register an element's address goes to, '' rax or x0 ... }
     FLayOff: array of LongInt;   { P378: each local's offset in the frame, as the layout gave it }
     FHidKeys: TStrArray;         { P378: the hidden variables that may share, by name ... }
@@ -808,6 +809,8 @@ type
     function FrameField(E: PExpr; out Off: Int64; out Global: Boolean; out GLab: string): Boolean;
     function IndexInRange(E: PExpr; Lo, Hi: Int64): Boolean;
     function SameExpr(A, B: PExpr): Boolean;
+    function SameMapRef(A, D: PExpr): Boolean;
+    function MapRmw(S: PStmt): Boolean;
     function InPlaceMem(Dest, E: PExpr): Boolean;
     function ContainsSame(E, X: PExpr): Boolean;
     procedure PromoAddPart(const N: string; Part, Weight: LongInt);
@@ -15611,7 +15614,14 @@ begin
     else
     begin
       Line('  popq %rcx');
-      Line('  movq %rcx, (%rax)');
+      case FMapRmw of
+        1:
+          Line('  addq %rcx, (%rax)');
+        2:
+          Line('  subq %rcx, (%rax)');
+      else
+        Line('  movq %rcx, (%rax)');
+      end;
     end;
   end;
 end;
@@ -28053,6 +28063,63 @@ begin
   end;
 end;
 
+{ A reads the map entry D is (P555): the same call of rt_mapget on the same map and the same
+  key (SameExpr is False for a call, so neither calls anything). }
+function TEmitter.SameMapRef(A, D: PExpr): Boolean;
+begin
+  Result := False;
+  if (A = nil) or (D = nil) or (A^.Kind <> ekCall) or (A^.Name <> 'rt_mapget') or
+    (Length(A^.Args) <> 2) or (Length(D^.Args) <> 2) then
+    Exit;
+  if not SameExpr(A^.Args[0], D^.Args[0]) then
+    Exit;
+  if (A^.Args[1] <> nil) and (D^.Args[1] <> nil) and (A^.Args[1]^.Kind = ekStr) and
+    (D^.Args[1]^.Kind = ekStr) then
+    Result := A^.Args[1]^.Txt = D^.Args[1]^.Txt
+  else
+    Result := SameExpr(A^.Args[1], D^.Args[1]);
+end;
+
+{ P555: m[K] := m[K] + E, m[K] := E + m[K] and m[K] := m[K] - E (Inc and Dec of an entry are
+  these) of a word-sized integer, with a map, a key and an E that call nothing: E is worked
+  out first, then the put gives the entry (a key that was not there is made with 0, as the
+  read of it gave) and the entry is changed where it lies: one lookup and not two. Go's m[k]++
+  is one mapassign. amd64. }
+function TEmitter.MapRmw(S: PStmt): Boolean;
+var
+  d, e, r: PExpr;
+begin
+  Result := False;
+  if FArm or (S^.Dest = nil) or (S^.E = nil) then
+    Exit;
+  d := S^.Dest;
+  e := S^.E;
+  if (d^.Kind <> ekCall) or (d^.Name <> 'rt_mapget') or (Length(d^.Args) <> 2) then
+    Exit;
+  if (e^.Kind <> ekBin) or ((e^.Bin <> boAdd) and (e^.Bin <> boSub)) or (e^.L = nil) or
+    (e^.R = nil) then
+    Exit;
+  if (TKind(d^.Typ) <> tykInteger) or (TSize(d^.Typ) <> 8) then
+    Exit;
+  if SameMapRef(e^.L, d) then
+    r := e^.R
+  else if (e^.Bin = boAdd) and SameMapRef(e^.R, d) then
+    r := e^.L
+  else
+    Exit;
+  if EHasCall(r) then
+    Exit;
+  EmitExpr(r);
+  if e^.Bin = boAdd then
+    FMapRmw := 1
+  else
+    FMapRmw := 2;
+  FStoreSrc := nil;
+  StoreTo(d);
+  FMapRmw := 0;
+  Result := True;
+end;
+
 { X, the same place, is read somewhere in E (P100). }
 function TEmitter.ContainsSame(E, X: PExpr): Boolean;
 var
@@ -31489,6 +31556,7 @@ begin
     skAssign:
       begin
         if not VecAssign(S) then
+        if not MapRmw(S) then
         if not RealAssign(S) then
         if not FastAssign(S) then
         if not OrdAssign(S) then

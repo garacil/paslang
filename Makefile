@@ -719,6 +719,8 @@ GOLDEN += arrparam
 GOLDEN_A64 += arrparam
 GOLDEN += mapiter
 GOLDEN_A64 += mapiter
+GOLDEN += maprmw
+GOLDEN_A64 += maprmw
 # P436: XLSX templates filled, the entries not written kept as they were.
 GOLDEN += xlsx
 GOLDEN_A64 += xlsx
@@ -3231,6 +3233,18 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	[ "$$n" -eq 0 ] || { echo "mapiter: $$n calls of rt_memcpy in the loop of Whole"; exit 1; }; \
 	python3 scripts/gen_mapiter.py | diff -u testdata/mapiter.out -; \
 	echo ok mapiter
+	@set -e; \
+	: P555: m[K] := m[K] + E and the forms like it of a map entry of a word-sized integer look the key up once, testdata/maprmw checks what the two lookups gave, a key that is not there made with zero, the swapped sum and the difference with the entry on the right, keys that are expressions fields pointers elements and strings, a call in the key or in E, E that reads the entry, the wrap of the largest number, other sorts of entries, the growth of the map under the statement and random operations against a model, and its routine Upd of five updates holds no call of the read; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/maprmw testdata/maprmw.paslang; \
+	$(BUILDDIR)/maprmw | diff -u testdata/maprmw.out -; \
+	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 $(BUILDDIR)/maprmw | diff -u testdata/maprmw.out -; \
+	objdump -d --no-show-raw-insn $(BUILDDIR)/maprmw | awk '/^[0-9a-f]+ <[^>]*>:/{ on = ($$2 ~ /^<p_upd>:$$/) } on' > $(BUILDDIR)/maprmw.fn; \
+	n=$$(grep -c 'call.*pasmapputint' $(BUILDDIR)/maprmw.fn) || true; \
+	[ "$$n" -eq 5 ] || { echo "maprmw: $$n puts in Upd"; exit 1; }; \
+	n=$$(grep -c 'call.*pasmapgetint' $(BUILDDIR)/maprmw.fn) || true; \
+	[ "$$n" -eq 0 ] || { echo "maprmw: $$n reads in Upd"; exit 1; }; \
+	python3 scripts/gen_maprmw.py | diff -u testdata/maprmw.out -; \
+	echo ok maprmw
 	@set -e; \
 	: the kept scripts of testdata/sqllogic are what scripts/gen_sqllogic.py writes while the system SQLite is the one that made them, P412; \
 	python3 -I scripts/gen_sqllogic.py --check
