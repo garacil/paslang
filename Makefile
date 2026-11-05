@@ -3329,6 +3329,29 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	done; \
 	echo ok maprmw2
 	@set -e; \
+	: P559: an else, an until or a stray end where the statements of a try, a finally or an except part, of a repeat or of the initialization or finalization part of a unit cannot take it is a syntax error at that word and the compile ends at once under a limit of one gigabyte and twenty seconds, where the parser took it for an empty statement and read on without end until the memory was gone; \
+	for n in tryelse tryuntil exceptelse exceptuntil finallyelse finallyuntil repeatelse repeatend; do \
+		if ( ulimit -v 1048576; timeout 20 $(OUTDIR)/paslangc -o $(BUILDDIR)/stmtbad_$$n testdata/stmtbad/$$n.paslang ) >$(BUILDDIR)/stmtbad_$$n.err 2>&1; then \
+			echo "$$n should fail"; exit 1; \
+		fi; \
+	done; \
+	for n in unitelse unituntil; do \
+		if ( ulimit -v 1048576; timeout 20 $(OUTDIR)/paslangc -c -o $(BUILDDIR)/stmtbad_$$n testdata/stmtbad/$$n.paslang ) >$(BUILDDIR)/stmtbad_$$n.err 2>&1; then \
+			echo "$$n should fail"; exit 1; \
+		fi; \
+	done; \
+	grep -q -F 'syntax error at 7:3 [else] in testdata/stmtbad/tryelse.paslang' $(BUILDDIR)/stmtbad_tryelse.err; \
+	grep -q -F 'syntax error at 7:3 [until] in testdata/stmtbad/tryuntil.paslang' $(BUILDDIR)/stmtbad_tryuntil.err; \
+	grep -q -F 'syntax error at 8:3 [else] in testdata/stmtbad/exceptelse.paslang' $(BUILDDIR)/stmtbad_exceptelse.err; \
+	grep -q -F 'syntax error at 9:3 [until] in testdata/stmtbad/exceptuntil.paslang' $(BUILDDIR)/stmtbad_exceptuntil.err; \
+	grep -q -F 'syntax error at 9:3 [else] in testdata/stmtbad/finallyelse.paslang' $(BUILDDIR)/stmtbad_finallyelse.err; \
+	grep -q -F 'syntax error at 9:3 [until] in testdata/stmtbad/finallyuntil.paslang' $(BUILDDIR)/stmtbad_finallyuntil.err; \
+	grep -q -F 'syntax error at 11:3 [else] in testdata/stmtbad/repeatelse.paslang' $(BUILDDIR)/stmtbad_repeatelse.err; \
+	grep -q -F 'syntax error at 11:3 [end] in testdata/stmtbad/repeatend.paslang' $(BUILDDIR)/stmtbad_repeatend.err; \
+	grep -q -F 'syntax error at 17:3 [else] in testdata/stmtbad/unitelse.paslang' $(BUILDDIR)/stmtbad_unitelse.err; \
+	grep -q -F 'syntax error at 17:3 [until] in testdata/stmtbad/unituntil.paslang' $(BUILDDIR)/stmtbad_unituntil.err; \
+	echo ok stmtbad
+	@set -e; \
 	: the kept scripts of testdata/sqllogic are what scripts/gen_sqllogic.py writes while the system SQLite is the one that made them, P412; \
 	python3 -I scripts/gen_sqllogic.py --check
 	@set -e; \
