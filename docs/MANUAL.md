@@ -4558,6 +4558,13 @@ says, its class's name unless the class says more:
 `paslang: uncaught raise in the main routine: EOops`
 (`testdata/fatal/raiseobj`, 1.1.3).
 
+A failure of the runtime (an index out of range, a division by zero and
+the others of §19) is raised the same way when SysUtils is in the program
+and a `try` is on the routine's way (1.2.378), as an object of
+`ERangeError`, `EDivByZero` and their kin; unlike a `raise` of the
+program's, one that no handler takes ends the program from any routine,
+with the runtime's line (`testdata/fatal/faultpas`).
+
 ### Exception objects
 
 `raise X` raises the object `X`, of any class (1.1.3). An `except`
@@ -11852,8 +11859,11 @@ handler names it.
 An exception the handler raises answers that request alone, and every
 other routine and connection goes on: an `EHttpError` answers its
 `Status` with its message as text; any other exception answers 500 and
-writes a line on the error output. A runtime fault (a nil pointer, an
-index out of range) still ends the program, as everywhere (§19). When
+writes a line on the error output. A checked failure of the runtime in
+the handler (an index out of range, a division by zero: §19) is such an
+exception since 1.2.378, so it answers 500 too and the server goes on,
+as Go's `net/http` recovers a handler's panic (`testdata/httpfault`); a
+nil pointer still ends the program. When
 the head has already gone, the connection is closed instead.
 `ConstantTimeEqual(a, b)` compares two strings in a time that depends
 on their length alone, as Go's `crypto/subtle`, for tokens and MACs.
@@ -14334,6 +14344,56 @@ paslang: all routines are asleep: deadlock
 
 The last one names no line: every routine is asleep and none is at
 fault (§10).
+
+**A failure the program takes (1.2.378, P567).** With `uses sysutils`
+anywhere in the program the checked failures are exceptions where a
+handler may take them, of the classes Free Pascal gives them (§18), whose
+SysUtils is what turns run-time errors into exceptions there too:
+
+| The failure | Its class |
+|---|---|
+| an index, a set's element or a bit out of range; logic or a funnel on two lengths | `ERangeError` |
+| an integer division or remainder by zero, the 128-bit one too | `EDivByZero` |
+| a 128-bit quotient past 64 bits | `EIntOverflow` |
+| a real out of `Integer`'s range; `sqrt`, `ln` and the other domains | `EInvalidOp` |
+| `as` of an object that is not of the class | `EInvalidCast` |
+
+`E.Message` is the runtime's line without `paslang: `
+(`index 10 out of range [0..4] at line 12`) and `ExceptAddr` the code that
+failed. The rule is the running routine's: inside a `try` of its own or
+of a routine that called it (a `finally` and a `lock` block count) the
+failure is raised and unwinds as any `raise` does (§9), the `finally`
+parts and the locks on the way included, and the handler that takes it
+reads its variables as they were at the failure. One that no handler
+takes still ends the program with its line and status 1, and from any
+routine, where an object the program raised and nobody took ends its own
+routine alone: a failure is never lost. With no `try` on the routine's
+way nothing is raised and the program stops at once, as it always did.
+Outside a `try` the checked path is what it was. Inside one a variable
+takes its new value only when the whole value is worked out, so a failure
+half way through `b := (b - x) + a[i]` leaves `b` as it was.
+
+```
+try
+  for i := 0 to n do
+    total := total + a[i];
+except
+  on E: ERangeError do
+    WriteLn('stopped at ', i, ': ', E.Message);   { stopped at 5: index 5 out of range [0..4] at line 3 }
+end;
+```
+
+What stays fatal everywhere: a nil pointer and the other faults the
+processor reports, a stack overflow, memory that runs out, the channel and
+map failures and the deadlock; a failure inside the runtime's own units
+or in a routine with `asm` (`testdata/fatal/faultasm`); one that comes
+while the routine holds a `SpinLock` (*Runtime words*), which an exception would
+leave held, as Go throws on a panic holding locks
+(`testdata/fatal/faultspin`); and every failure
+in a program without SysUtils, where a `try` does not take it
+(`testdata/fatal/faultbare`).
+`testdata/faults` takes every kind, and `testdata/httpfault` shows a
+server whose handlers fail (§16).
 
 Every index is checked, on every read and write, as in Go: a static
 array's against its bounds, a slice's against `0..Length - 1`, a

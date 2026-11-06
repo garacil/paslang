@@ -113,6 +113,7 @@ type
   private
     FMessage: string;
     FHelpContext: Integer;
+    FFault: Boolean;   { a failure of the runtime raised by SysFault (P567) }
   public
     constructor Create(const Msg: string);
     constructor CreateFmt(const Msg: string; const Args: array of const);
@@ -636,6 +637,9 @@ var
 { ---- exceptions ---- }
 function ExceptObject: TObject;
 function ExceptAddr: Pointer;
+{ the runtime's failures as exceptions (P567): the runtime calls these two, a program does not }
+procedure SysFault(A, B, C: Int64; Txt: Pointer; Info: Int64; Pc: Pointer);
+function SysFaultUncaught(Obj: TObject): Boolean;
 procedure Abort;
 procedure OutOfMemoryError;
 
@@ -1207,6 +1211,138 @@ begin
   asm arm64 (Result: out x0)
     ldr x0, [x28, #280]
   end;
+end;
+
+{ ---- the runtime's failures as exceptions (P567) ----
+
+  An index out of range, a division by zero, a real out of Integer's
+  range and the other checked failures stop a program with a line,
+  paslang: index 7 out of range [0..4] at line 12, and status 1. With
+  SysUtils in the program and a try on the routine's way the runtime
+  calls SysFault instead (rt_canraise in the emitter says when), as Free
+  Pascal's SysUtils turns run-time errors into exceptions: it raises the
+  class Free Pascal gives the failure, its Message the line without
+  paslang: and raised at the code that failed. A fault no handler takes
+  still ends the program with its line and status 1, from any routine:
+  rt_uncaught asks SysFaultUncaught. }
+
+{ The line of the program's code at Pc, 0 for none: the runtime's table. }
+function FaultLine(Pc: Pointer): Int64;
+begin
+  asm amd64 (Pc: in rdi; Result: out rax)
+    call rt_pcline
+  end;
+  asm arm64 (Pc: in x0; Result: out x0)
+    str x30, [sp, #-16]!
+    bl rt_pcline
+    ldr x30, [sp], #16
+  end;
+end;
+
+{ N bytes at Txt, the runtime's own words. }
+function FaultWords(Txt: Pointer; N: Int64): string;
+var
+  i: Int64;
+begin
+  Result := '';
+  SetLength(Result, N);
+  for i := 1 to N do
+    Result[i] := Char(PByte(Int64(Txt) + i - 1)^);
+end;
+
+{ V in hexadecimal as the runtime writes an address: small letters, no
+  zeros in front. }
+function FaultHex(V: Int64): string;
+const
+  Digits = '0123456789abcdef';
+var
+  k: Integer;
+  d: Int64;
+begin
+  Result := '';
+  for k := 15 downto 0 do
+  begin
+    d := (V shr (4 * k)) and 15;
+    if (d <> 0) or (Result <> '') or (k = 0) then
+      Result := Result + Digits[d + 1];
+  end;
+end;
+
+{ Where, as the runtime's rt_fatalline says it: the line of the program's
+  code, the pc itself for code with no line, nothing for no pc. }
+function FaultWhere(Pc: Pointer): string;
+var
+  n: Int64;
+begin
+  Result := '';
+  n := FaultLine(Pc);
+  if n <> 0 then
+    Result := ' at line ' + IntToStr(n)
+  else if Pc <> nil then
+    Result := ' at pc 0x' + FaultHex(Int64(Pc));
+end;
+
+{ The runtime's entry: the failure's numbers, its text (Txt, the length in
+  Info's low byte), its kind (Info shr 8: 1 index, 2 set element, 3 bit,
+  4 division by zero, 5 128-bit quotient, 6 real out of Integer's range,
+  7 a function's domain, 8 as, 9 abstract method, 10 logic on two lengths,
+  11 funnel) and the pc of the code that failed. A, B and C are the
+  number and its two bounds for kinds 1 to 3, A and B the two lengths for
+  10 and 11, and nothing the runtime set for the others, which read none.
+  It does not come back. }
+procedure SysFault(A, B, C: Int64; Txt: Pointer; Info: Int64; Pc: Pointer);
+var
+  kind: Int64;
+  msg: string;
+  e: Exception;
+begin
+  kind := Info shr 8;
+  { the runtime's text after its paslang: (nine bytes) and, where the
+    text ends its own line, without the line feed }
+  msg := FaultWords(Pointer(Int64(Txt) + 9), (Info and 255) - 9);
+  if (msg <> '') and (msg[Length(msg)] = #10) then
+    SetLength(msg, Length(msg) - 1);
+  case kind of
+    1, 2, 3:
+      msg := msg + IntToStr(A) + ' out of range [' + IntToStr(B) + '..' + IntToStr(C) + ']';
+    10, 11:
+      msg := msg + IntToStr(A) + ' and ' + IntToStr(B) + ' bytes';
+  end;
+  { as and an abstract method say no line }
+  if (kind <> 8) and (kind <> 9) then
+    msg := msg + FaultWhere(Pc);
+  case kind of
+    1, 2, 3, 10, 11:
+      e := ERangeError.Create(msg);
+    4:
+      e := EDivByZero.Create(msg);
+    5:
+      e := EIntOverflow.Create(msg);
+    6, 7:
+      e := EInvalidOp.Create(msg);
+    8:
+      e := EInvalidCast.Create(msg);
+    9:
+      e := EAbstractError.Create(msg);
+  else
+    e := EExternal.Create(msg);
+  end;
+  e.FFault := True;
+  raise e at Pc;
+end;
+
+{ Obj, raised and taken by no handler, is a fault of the runtime: its line
+  goes to the error output as the runtime writes it, and the runtime ends
+  the program with status 1. }
+function SysFaultUncaught(Obj: TObject): Boolean;
+begin
+  Result := False;
+  if Obj is Exception then
+    if Exception(Obj).FFault then
+    begin
+      WriteLn(ErrOutput, 'paslang: ', Exception(Obj).FMessage);
+      Result := True;
+    end;
 end;
 
 procedure Abort;

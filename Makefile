@@ -750,6 +750,9 @@ GOLDEN_A64 += mailtext
 # P564: the cookie jar of httpclient, against Go's cookiejar, and through a login on the loopback.
 GOLDEN += cookiejar cookiehttp
 GOLDEN_A64 += cookiejar cookiehttp
+# P567: the runtime's checked failures as exceptions, and a server whose handlers fail.
+GOLDEN += faults httpfault
+GOLDEN_A64 += faults httpfault
 # P573: a server stops whatever became of its sockets.
 GOLDEN += httpstop
 GOLDEN_A64 += httpstop
@@ -3442,6 +3445,27 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'rel@' $(BUILDDIR)/mutunit_list2.txt; \
 	echo ok unitaudit
 	@set -e; \
+	: P567: with sysutils in the program a checked failure inside a try is an exception whose Message is the line the runtime writes and testdata/faults takes every kind and then dies of each kind three ways with no try and with a finally alone and in a routine started with pas and each time the line on the error output must be the Message it printed and scripts/fuzz_faults.py compares eight random programs of try blocks with its model of what each handler reads and testdata/httpfault has handlers that fail and the server answers 500 and serves the next request; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/faults testdata/faults.paslang; \
+	$(BUILDDIR)/faults > $(BUILDDIR)/faults.got; \
+	diff -u testdata/faults.out $(BUILDDIR)/faults.got; \
+	grep '^paslang: ' $(BUILDDIR)/faults.got > $(BUILDDIR)/faults.lines; \
+	for m in die fin pas; do \
+	  rm -f $(BUILDDIR)/faults.$$m; \
+	  for k in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17; do \
+	    set +e; timeout 60 $(BUILDDIR)/faults $$m $$k > $(BUILDDIR)/faults.$$m.out 2>> $(BUILDDIR)/faults.$$m; rc=$$?; set -e; \
+	    test $$rc -eq 1; \
+	  done; \
+	  diff -u $(BUILDDIR)/faults.lines $(BUILDDIR)/faults.$$m; \
+	done; \
+	python3 -I scripts/fuzz_faults.py --paslangc $(OUTDIR)/paslangc --units $(BUILDDIR) --work $(BUILDDIR)/fuzz_faults --variants native,base 100 8; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/httpfault testdata/httpfault.paslang; \
+	timeout 120 $(BUILDDIR)/httpfault > $(BUILDDIR)/httpfault.got 2> $(BUILDDIR)/httpfault.err; \
+	diff -u testdata/httpfault.out $(BUILDDIR)/httpfault.got; \
+	grep -q '^httpserver: GET /index: ERangeError: index 9 out of range \[0..4\] at line ' $(BUILDDIR)/httpfault.err; \
+	grep -q '^httpserver: GET /div: EDivByZero: integer divide by zero at line ' $(BUILDDIR)/httpfault.err; \
+	echo ok faults
+	@set -e; \
 	: P573: Shutdown wakes the acceptors of httpserver through the poller and testdata/httpstop stops servers on a Unix socket with its file there and with it removed and on TCP and on both and by SIGTERM and scripts/httpstop_check.py plays the part of systemd with a socket it keeps which must still listen after the server stops and looks at what an idle server and one out of descriptors cost on both machines; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/httpstop testdata/httpstop.paslang; \
 	timeout 60 $(BUILDDIR)/httpstop > $(BUILDDIR)/httpstop.got; \
@@ -5188,7 +5212,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'paslang: unlock of an unlocked mutex' $(BUILDDIR)/unlockfree.err; \
 	echo ok unlockfree; \
 	echo "==== fatal ===="; \
-	for t in divzero nilptr deep oom oomlimit closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg leafnil bmaskwide bmodneg bmaskone bforpast bvarctr bnestctr bsumstat bsumdyn bsumneg bkeepfirst bkeepmoved bkeepstat bkeepshrunk brunlen brunloc divfirst idxline nilline bflatidx bflatpush nilblk nilbig nilzero nildest nilmeth elemidx jsonbusy jsonrbusy jsonwbusy divcall; do \
+	for t in divzero nilptr deep oom oomlimit closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg leafnil bmaskwide bmodneg bmaskone bforpast bvarctr bnestctr bsumstat bsumdyn bsumneg bkeepfirst bkeepmoved bkeepstat bkeepshrunk brunlen brunloc divfirst idxline nilline bflatidx bflatpush nilblk nilbig nilzero nildest nilmeth elemidx jsonbusy jsonrbusy jsonwbusy divcall faultbare faultfin faultpas faultasm faultspin; do \
 	  $(OUTDIR)/paslangc -o $(BUILDDIR)/fatal_$$t testdata/fatal/$$t.paslang; \
 	  set +e; \
 	  if [ $$t = oomlimit ]; then \
@@ -5294,6 +5318,13 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q '^paslang: string view of nil with length 3$$' $(BUILDDIR)/fatal_svnil.err; \
 	grep -q '^paslang: string view over bytes not marked shared$$' $(BUILDDIR)/fatal_svmark.err; \
 	grep -q '^paslang: string view length 16 out of range$$' $(BUILDDIR)/fatal_svwrap.err; \
+	grep -q '^paslang: index 5 out of range \[0..4\] at line 13$$' $(BUILDDIR)/fatal_faultbare.err; \
+	grep -q '^finally ran$$' $(BUILDDIR)/fatal_faultfin.err; \
+	grep -q '^paslang: index 5 out of range \[0..4\] at line 17$$' $(BUILDDIR)/fatal_faultfin.err; \
+	grep -q '^finally ran$$' $(BUILDDIR)/fatal_faultpas.err; \
+	grep -q '^paslang: integer divide by zero at line 21$$' $(BUILDDIR)/fatal_faultpas.err; \
+	grep -q '^paslang: index 5 out of range \[0..4\] at line 23$$' $(BUILDDIR)/fatal_faultasm.err; \
+	grep -q '^paslang: index 5 out of range \[0..4\] at line 21$$' $(BUILDDIR)/fatal_faultspin.err; \
 	echo ok fatal; \
 	: P382 a broken standard output or error ends the program by SIGPIPE, 141, as in Go; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/brokenpipe_die testdata/brokenpipe.paslang; \
@@ -6228,7 +6259,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	grep -q 'paslang: unlock of an unlocked mutex' $(BUILDDIR)/unlockfree-arm.err; \
 	echo ok unlockfree-arm; \
 	echo "==== fatal arm64 ===="; \
-	for t in divzero nilptr deep oom closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg leafnil bmaskwide bmodneg bmaskone bforpast bvarctr bnestctr bsumstat bsumdyn bsumneg bkeepfirst bkeepmoved bkeepstat bkeepshrunk brunlen brunloc divfirst idxline nilline bflatidx bflatpush nilblk nilbig nilzero nildest nilmeth elemidx jsonbusy jsonrbusy jsonwbusy divcall; do \
+	for t in divzero nilptr deep oom closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg leafnil bmaskwide bmodneg bmaskone bforpast bvarctr bnestctr bsumstat bsumdyn bsumneg bkeepfirst bkeepmoved bkeepstat bkeepshrunk brunlen brunloc divfirst idxline nilline bflatidx bflatpush nilblk nilbig nilzero nildest nilmeth elemidx jsonbusy jsonrbusy jsonwbusy divcall faultbare faultfin faultpas faultasm faultspin; do \
 	  $(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/fatal_$$t-arm testdata/fatal/$$t.paslang; \
 	  set +e; timeout 60 $(QEMU_A64) $(BUILDDIR)/fatal_$$t-arm > $(BUILDDIR)/fatal_$$t-arm.got 2> $(BUILDDIR)/fatal_$$t-arm.err; rc=$$?; set -e; \
 	  test $$rc -eq 1; \
@@ -6314,6 +6345,13 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	grep -q '^paslang: string view of nil with length 3$$' $(BUILDDIR)/fatal_svnil-arm.err; \
 	grep -q '^paslang: string view over bytes not marked shared$$' $(BUILDDIR)/fatal_svmark-arm.err; \
 	grep -q '^paslang: string view length 16 out of range$$' $(BUILDDIR)/fatal_svwrap-arm.err; \
+	grep -q '^paslang: index 5 out of range \[0..4\] at line 13$$' $(BUILDDIR)/fatal_faultbare-arm.err; \
+	grep -q '^finally ran$$' $(BUILDDIR)/fatal_faultfin-arm.err; \
+	grep -q '^paslang: index 5 out of range \[0..4\] at line 17$$' $(BUILDDIR)/fatal_faultfin-arm.err; \
+	grep -q '^finally ran$$' $(BUILDDIR)/fatal_faultpas-arm.err; \
+	grep -q '^paslang: integer divide by zero at line 21$$' $(BUILDDIR)/fatal_faultpas-arm.err; \
+	grep -q '^paslang: index 5 out of range \[0..4\] at line 23$$' $(BUILDDIR)/fatal_faultasm-arm.err; \
+	grep -q '^paslang: index 5 out of range \[0..4\] at line 21$$' $(BUILDDIR)/fatal_faultspin-arm.err; \
 	echo ok fatal-arm; \
 	$(OUTDIR)/paslangc -target arm64 -cpu max -Fu $(A64DIR) -o $(BUILDDIR)/brokenpipe_die-arm testdata/brokenpipe.paslang; \
 	(set +e; $(QEMU_A64) $(BUILDDIR)/brokenpipe_die-arm out; echo $$? > $(BUILDDIR)/brokenpipe_out-arm.rc) | head -c 1 > /dev/null; \

@@ -1,0 +1,145 @@
+{ P567: a handler of httpserver that fails answers 500 to its request and
+  the server goes on, as Go's net/http recovers a handler's panic. A
+  server on the loopback has a handler that indexes past its array, one
+  that divides by zero, one that fails after part of its answer has gone
+  (the connection ends, as nothing else can be said on it) and one that
+  fails in a routine it calls three levels down; between them /ok is
+  asked on the same client and answers, and at the end the counter the
+  handlers share says how many ran. The server's line on the error output
+  for each failure names the class and the runtime's text; the recipe
+  reads it. }
+program httpfault;
+
+uses
+  sysutils, pasnet, pashttp, pasurl, httpclient, httpserver;
+
+var
+  five: array[0..4] of Int64;
+  zero, big, served: Int64;
+  mu: mutex;
+
+procedure Count;
+begin
+  lock mu do
+    served := served + 1;
+end;
+
+procedure HOk(Req: THttpRequest; Resp: THttpResponse);
+begin
+  Count;
+  Resp.ReplyText(200, 'ok' + #10);
+end;
+
+procedure HIndex(Req: THttpRequest; Resp: THttpResponse);
+begin
+  Count;
+  five[big] := 1;
+  Resp.ReplyText(200, 'not reached' + #10);
+end;
+
+procedure HDiv(Req: THttpRequest; Resp: THttpResponse);
+begin
+  Count;
+  Resp.ReplyText(200, IntToStr(7 div zero) + #10);
+end;
+
+function Level(N: Int64): Int64;
+begin
+  if N = 0 then
+    Result := five[big]
+  else
+    Result := Level(N - 1) + 1;
+end;
+
+procedure HDeep(Req: THttpRequest; Resp: THttpResponse);
+begin
+  Count;
+  { under the lock too: the failure leaves it free for the next request }
+  lock mu do
+    served := served + Level(3);
+  Resp.ReplyText(200, 'not reached' + #10);
+end;
+
+procedure HLate(Req: THttpRequest; Resp: THttpResponse);
+var
+  i: Int64;
+  piece: string;
+begin
+  Count;
+  { more than the server holds back, so the head and a piece have gone
+    when the failure comes }
+  piece := '';
+  for i := 1 to 2000 do
+    piece := piece + '0123456789';
+  Resp.WriteData(piece);
+  Resp.WriteData(piece);
+  five[big] := 1;
+  Resp.WriteData('not reached');
+end;
+
+procedure RunServer(S: THttpServer);
+begin
+  S.Serve;
+end;
+
+procedure Ask(C: THttpClient; const Base, Path: string);
+var
+  r: THttpClientResponse;
+  body: string;
+begin
+  try
+    r := C.Get(Base + Path);
+    body := r.ReadAll(0);
+    if Length(body) > 40 then
+      body := IntToStr(Length(body)) + ' bytes';
+    if (body <> '') and (body[Length(body)] = #10) then
+      SetLength(body, Length(body) - 1);
+    WriteLn(Path, ': ', r.Status, ' [', body, ']');
+  except
+    on E: Exception do
+      WriteLn(Path, ': the connection ended');
+  end;
+end;
+
+var
+  Router: THttpRouter;
+  Srv: THttpServer;
+  c: THttpClient;
+  base: string;
+begin
+  zero := Ord(ParamCount > 99);
+  big := 9 + zero;
+  Router := THttpRouter.Create;
+  Router.Handle('GET', '/ok', @HOk);
+  Router.Handle('GET', '/index', @HIndex);
+  Router.Handle('GET', '/div', @HDiv);
+  Router.Handle('GET', '/deep', @HDeep);
+  Router.Handle('GET', '/late', @HLate);
+  Srv := THttpServer.Create(Router);
+  Srv.AccessLog := False;
+  if not Srv.ListenTcp('127.0.0.1', 0) then
+    Halt(1);
+  pas RunServer(Srv);
+  base := 'http://127.0.0.1:' + IntToStr(Srv.Port);
+  c := THttpClient.Create;
+  c.TimeoutMs := 20000;
+  Ask(c, base, '/ok');
+  Ask(c, base, '/index');
+  Ask(c, base, '/ok');
+  Ask(c, base, '/div');
+  Ask(c, base, '/ok');
+  Ask(c, base, '/deep');
+  Ask(c, base, '/ok');
+  Ask(c, base, '/late');
+  Ask(c, base, '/ok');
+  lock mu do
+    WriteLn('handlers run: ', served);
+  Srv.Shutdown;
+  Halt(0);
+end.
+
+{ This file is part of paslang's tests.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+  paslang is free software under the GNU General Public License,
+  version 3 or (at your option) any later version; see the file
+  COPYING. It comes with ABSOLUTELY NO WARRANTY. }
