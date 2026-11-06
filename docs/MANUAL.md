@@ -12934,6 +12934,7 @@ begin
   WriteLn(e.HeaderText('Subject'));                         { encoded words decoded }
   t := MailFindText(e, False);                               { the plain text part, nil if none }
   if t <> nil then Body := t.Text(True);                     { in UTF-8, by the charset (True: also windows-1252, ISO-8859-15) }
+  Body := MailTextOf(e, True);                               { the same, or the HTML part as text when there is no plain one }
   atts := MailAttachments(e);                                { FileName, MediaType, Body (decoded), ContentId }
 end;
 MailParseAddressList('"Garc' + ... + '" <g@x.y>, =?UTF-8?Q?Mar=C3=ADa?= <m@x.z>', True, list, err);
@@ -12961,7 +12962,11 @@ c.UidStore('12', '+FLAGS', '(\Seen)');  c.UidMove('12', 'Archivo');  c.Logout;
   them, bytes that do not belong passed over and `BodyErr` set), `Kid(i)` for a multipart's parts and for the message
   inside a `message/rfc822`, `Text(Extra)`, `FileName` (the disposition's, else the type's `name`, an encoded word
   decoded), `ContentId`, `IsAttachment`, `HeaderText(key)`. `MailFindText(e, Html)` and `MailAttachments(e)` find
-  the body and the files. The reading is the lenient one a mail reader needs (a message that Go's `ReadMessage`
+  the body and the files. `MailTextOf(e, Extra)` (1.2.374, P566) is the text a reader shows: the first
+  text/plain body that is not an attachment as it is, else the first text/html one through `HtmlToText` of
+  `pashtml` (blocks as lines, a tab between cells, scripts and styles gone), in UTF-8 by its charset; `''` when
+  there is neither. `MailHtmlOf(e, Extra)` is the HTML body alone as text. `testdata/mailtext` shows a message of
+  every shape the portal receives, Outlook's included. The reading is the lenient one a mail reader needs (a message that Go's `ReadMessage`
   refuses is refused here too, the parts of a broken multipart are kept, a part with no Content-Type is text/plain,
   the parts of `multipart/digest` are messages); at most 24 levels and 4,000 parts.
 - **Addresses and dates.** `MailParseAddress` and `MailParseAddressList` are `net/mail`'s parser (groups, comments,

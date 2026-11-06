@@ -744,6 +744,9 @@ GOLDEN_A64 += codec1252
 # P565: the HTML tokenizer, the character references and HtmlToText against Python's html.parser.
 GOLDEN += htmltok
 GOLDEN_A64 += htmltok
+# P566: the text of a message, plain or through HtmlToText.
+GOLDEN += mailtext
+GOLDEN_A64 += mailtext
 # P432: URLs and HTTP messages against Go, and the HTTP client over loopback.
 GOLDEN += url httpmsg httpcli
 GOLDEN_A64 += url httpmsg httpcli
@@ -3401,6 +3404,12 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	python3 -I scripts/html_oracle.py $(BUILDDIR)/htmltok.got; \
 	python3 -I scripts/gen_htmlent.py --check src/lib/pashtml.paslang; \
 	echo ok htmltok
+	@set -e; \
+	: P566: MailTextOf gives the plain text of a message or its HTML through HtmlToText and testdata/mailtext shows it for a message of every shape the portal receives; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/mailtext testdata/mailtext.paslang; \
+	$(BUILDDIR)/mailtext > $(BUILDDIR)/mailtext.got; \
+	diff -u testdata/mailtext.out $(BUILDDIR)/mailtext.got; \
+	echo ok mailtext
 	@set -e; \
 	: the kept scripts of testdata/sqllogic are what scripts/gen_sqllogic.py writes while the system SQLite is the one that made them, P412; \
 	python3 -I scripts/gen_sqllogic.py --check
