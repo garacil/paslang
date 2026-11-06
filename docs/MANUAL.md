@@ -12139,6 +12139,22 @@ Go's packages give them, checked against Go's own output
   points U+0000 to U+017F as Go's `strings.ToUpper` and `ToLower` do
   (`ñ` to `Ñ`, `ÿ` to `Ÿ`; `ß` stays). Other code points, and bytes that
   are not UTF-8, pass as they are.
+- **Windows-1252 and UTF-8 (1.2.372, P562).** `Windows1252ToUtf8(s)` turns
+  the bytes of a Windows-1252 text (the CSV Excel exports, the mail of
+  Windows programs) into UTF-8 by the index of the WHATWG Encoding
+  Standard: the 123 bytes above 127 that Microsoft's `CP1252.TXT`
+  defines, and the five it leaves undefined (81 8D 8F 90 9D) as the C1
+  controls of the same number, as browsers and mail readers take them.
+  `Utf8ToWindows1252(s, out r)` is the way back, `False` when a code
+  point has no byte or a sequence is not UTF-8, with `r` holding the
+  bytes written up to there. `Utf8Valid(s)` says whether `s` is UTF-8
+  throughout (no overlong form, no surrogate, nothing past U+10FFFF, no
+  sequence the end cuts) and `Utf8BadAt(s)` is the index of the first byte
+  that breaks it, 0 when none does; both are passtr's kernel, the one
+  `json` validates with. `pasmime` decodes `windows-1252` and `pasx509`
+  and `paszip` validate UTF-8 through these words. `testdata/codec1252`
+  is checked line by line against Python's codecs by
+  `scripts/cp1252_check.py`.
 
 `LoadZone(name)` of `uses pastime` (1.1.260) gives a `TZone` for a zone of
 the system's zoneinfo, whatever `TZ` is: `LoadZone('Europe/Madrid')`.

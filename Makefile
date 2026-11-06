@@ -738,6 +738,9 @@ GOLDEN_A64 += xlsxsst
 # P563: the date a numeric cell holds, in the 1900 and the 1904 date systems, and the text of a t="d" cell.
 GOLDEN += xlsxdate
 GOLDEN_A64 += xlsxdate
+# P562: Windows-1252 there and back, and UTF-8 told from what is not, against Python's codecs.
+GOLDEN += codec1252
+GOLDEN_A64 += codec1252
 # P432: URLs and HTTP messages against Go, and the HTTP client over loopback.
 GOLDEN += url httpmsg httpcli
 GOLDEN_A64 += url httpmsg httpcli
@@ -3379,6 +3382,13 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/xlsxdate.out $(BUILDDIR)/xlsxdate.got; \
 	python3 -I scripts/xlsxdate_check.py $(BUILDDIR)/xlsxdate.got; \
 	echo ok xlsxdate
+	@set -e; \
+	: P562: Windows1252ToUtf8 and Utf8ToWindows1252 follow the index of the WHATWG Encoding Standard and Utf8Valid and Utf8BadAt are the kernel of passtr for strings and scripts/cp1252_check.py reads every byte back and utf8 line of testdata/codec1252 again with the codecs of Python; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/codec1252 testdata/codec1252.paslang; \
+	$(BUILDDIR)/codec1252 > $(BUILDDIR)/codec1252.got; \
+	diff -u testdata/codec1252.out $(BUILDDIR)/codec1252.got; \
+	python3 -I scripts/cp1252_check.py $(BUILDDIR)/codec1252.got; \
+	echo ok codec1252
 	@set -e; \
 	: the kept scripts of testdata/sqllogic are what scripts/gen_sqllogic.py writes while the system SQLite is the one that made them, P412; \
 	python3 -I scripts/gen_sqllogic.py --check
