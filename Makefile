@@ -753,6 +753,9 @@ GOLDEN_A64 += cookiejar cookiehttp
 # P567: the runtime's checked failures as exceptions, and a server whose handlers fail.
 GOLDEN += faults httpfault
 GOLDEN_A64 += faults httpfault
+# P571: a constant index outside its array beside a call's value or an operand that waits in a register.
+GOLDEN += constidx
+GOLDEN_A64 += constidx
 # P573: a server stops whatever became of its sockets.
 GOLDEN += httpstop
 GOLDEN_A64 += httpstop
@@ -3466,6 +3469,16 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q '^httpserver: GET /div: EDivByZero: integer divide by zero at line ' $(BUILDDIR)/httpfault.err; \
 	echo ok faults
 	@set -e; \
+	: P571: a constant index outside its array beside the value of a call or an operand that waits in a register compiles and fails at run time with its line on both machines and the fuzzer of the failures makes such indexes again where four of these nine seeds made the compiler stop; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/constidx testdata/constidx.paslang; \
+	timeout 60 $(BUILDDIR)/constidx > $(BUILDDIR)/constidx.got; \
+	diff -u testdata/constidx.out $(BUILDDIR)/constidx.got; \
+	$(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/constidx-arm testdata/constidx.paslang; \
+	timeout 120 $(QEMU_A64) $(BUILDDIR)/constidx-arm > $(BUILDDIR)/constidx-arm.got; \
+	diff -u testdata/constidx.out $(BUILDDIR)/constidx-arm.got; \
+	python3 -I scripts/fuzz_faults.py --paslangc $(OUTDIR)/paslangc --units $(BUILDDIR) --work $(BUILDDIR)/fuzz_constidx --variants native,base 321 9; \
+	echo ok constidx
+	@set -e; \
 	: P573: Shutdown wakes the acceptors of httpserver through the poller and testdata/httpstop stops servers on a Unix socket with its file there and with it removed and on TCP and on both and by SIGTERM and scripts/httpstop_check.py plays the part of systemd with a socket it keeps which must still listen after the server stops and looks at what an idle server and one out of descriptors cost on both machines; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/httpstop testdata/httpstop.paslang; \
 	timeout 60 $(BUILDDIR)/httpstop > $(BUILDDIR)/httpstop.got; \
@@ -5212,7 +5225,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'paslang: unlock of an unlocked mutex' $(BUILDDIR)/unlockfree.err; \
 	echo ok unlockfree; \
 	echo "==== fatal ===="; \
-	for t in divzero nilptr deep oom oomlimit closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg leafnil bmaskwide bmodneg bmaskone bforpast bvarctr bnestctr bsumstat bsumdyn bsumneg bkeepfirst bkeepmoved bkeepstat bkeepshrunk brunlen brunloc divfirst idxline nilline bflatidx bflatpush nilblk nilbig nilzero nildest nilmeth elemidx jsonbusy jsonrbusy jsonwbusy divcall faultbare faultfin faultpas faultasm faultspin; do \
+	for t in divzero nilptr deep oom oomlimit closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg leafnil bmaskwide bmodneg bmaskone bforpast bvarctr bnestctr bsumstat bsumdyn bsumneg bkeepfirst bkeepmoved bkeepstat bkeepshrunk brunlen brunloc divfirst idxline nilline bflatidx bflatpush nilblk nilbig nilzero nildest nilmeth elemidx jsonbusy jsonrbusy jsonwbusy divcall faultbare faultfin faultpas faultasm faultspin bconstleft; do \
 	  $(OUTDIR)/paslangc -o $(BUILDDIR)/fatal_$$t testdata/fatal/$$t.paslang; \
 	  set +e; \
 	  if [ $$t = oomlimit ]; then \
@@ -5325,6 +5338,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q '^paslang: integer divide by zero at line 21$$' $(BUILDDIR)/fatal_faultpas.err; \
 	grep -q '^paslang: index 5 out of range \[0..4\] at line 23$$' $(BUILDDIR)/fatal_faultasm.err; \
 	grep -q '^paslang: index 5 out of range \[0..4\] at line 21$$' $(BUILDDIR)/fatal_faultspin.err; \
+	grep -q '^paslang: index 8 out of range \[0..4\] at line 21$$' $(BUILDDIR)/fatal_bconstleft.err; \
 	echo ok fatal; \
 	: P382 a broken standard output or error ends the program by SIGPIPE, 141, as in Go; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/brokenpipe_die testdata/brokenpipe.paslang; \
@@ -6259,7 +6273,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	grep -q 'paslang: unlock of an unlocked mutex' $(BUILDDIR)/unlockfree-arm.err; \
 	echo ok unlockfree-arm; \
 	echo "==== fatal arm64 ===="; \
-	for t in divzero nilptr deep oom closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg leafnil bmaskwide bmodneg bmaskone bforpast bvarctr bnestctr bsumstat bsumdyn bsumneg bkeepfirst bkeepmoved bkeepstat bkeepshrunk brunlen brunloc divfirst idxline nilline bflatidx bflatpush nilblk nilbig nilzero nildest nilmeth elemidx jsonbusy jsonrbusy jsonwbusy divcall faultbare faultfin faultpas faultasm faultspin; do \
+	for t in divzero nilptr deep oom closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg leafnil bmaskwide bmodneg bmaskone bforpast bvarctr bnestctr bsumstat bsumdyn bsumneg bkeepfirst bkeepmoved bkeepstat bkeepshrunk brunlen brunloc divfirst idxline nilline bflatidx bflatpush nilblk nilbig nilzero nildest nilmeth elemidx jsonbusy jsonrbusy jsonwbusy divcall faultbare faultfin faultpas faultasm faultspin bconstleft; do \
 	  $(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/fatal_$$t-arm testdata/fatal/$$t.paslang; \
 	  set +e; timeout 60 $(QEMU_A64) $(BUILDDIR)/fatal_$$t-arm > $(BUILDDIR)/fatal_$$t-arm.got 2> $(BUILDDIR)/fatal_$$t-arm.err; rc=$$?; set -e; \
 	  test $$rc -eq 1; \
@@ -6352,6 +6366,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	grep -q '^paslang: integer divide by zero at line 21$$' $(BUILDDIR)/fatal_faultpas-arm.err; \
 	grep -q '^paslang: index 5 out of range \[0..4\] at line 23$$' $(BUILDDIR)/fatal_faultasm-arm.err; \
 	grep -q '^paslang: index 5 out of range \[0..4\] at line 21$$' $(BUILDDIR)/fatal_faultspin-arm.err; \
+	grep -q '^paslang: index 8 out of range \[0..4\] at line 21$$' $(BUILDDIR)/fatal_bconstleft-arm.err; \
 	echo ok fatal-arm; \
 	$(OUTDIR)/paslangc -target arm64 -cpu max -Fu $(A64DIR) -o $(BUILDDIR)/brokenpipe_die-arm testdata/brokenpipe.paslang; \
 	(set +e; $(QEMU_A64) $(BUILDDIR)/brokenpipe_die-arm out; echo $$? > $(BUILDDIR)/brokenpipe_out-arm.rc) | head -c 1 > /dev/null; \

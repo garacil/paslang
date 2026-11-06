@@ -98,10 +98,9 @@ class Gen:
             m = r.choice([3, 7, 7, 15])
             return '(%s and %d)' % (v, m), '(%s & %d)' % (v, m)
         if f < 0.9:
-            # a constant index stays inside the two static arrays: one out of them is a failure written in place,
-            # which the compiler refuses beside a waiting operand (an internal error, P571); a dynamic array still
-            # fails on it at run time
-            k = r.randint(0, NB - 1)
+            # a constant index, inside the arrays or past their end: one outside a static array is a failure the
+            # compiler writes in place (P571)
+            k = r.randint(0, 9)
             return str(k), str(k)
         return self.N, self.N
 
