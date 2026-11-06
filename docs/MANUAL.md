@@ -12841,9 +12841,39 @@ u: TUrl;  UrlParse('http://u:p@h:81/a%20b?q=1#f', u, err);  UrlString(u);  UrlRe
   seven modes of Go's `shouldEscape`; `TUrlValues` and `UrlParseQuery` are
   `url.Values` and `ParseQuery` (`Encode` sorts the keys). `pascodec` has
   `UrlQueryEscape` and `UrlPathEscape` for whole strings.
-- **Left out.** Proxies, cookies (`Cookie` is a field the program sets),
-  authentication beyond `HttpBasicAuth`, HTTP/2, `Expect: 100-continue` and
-  a request body that is not a string. `httpserver` still reads requests
+- **Cookies (1.2.375, P564).** `c.Jar := TCookieJar.Create` gives the client a
+  jar: the `Set-Cookie` fields of every response (the redirects' too) are
+  kept and the `Cookie` header of every request is written, unless the
+  caller gave one. The jar is RFC 6265 section 5 as Go's
+  `net/http/cookiejar` keeps it without a public suffix list: a cookie
+  with no `Domain` is the host's alone, one with a `Domain` the host ends
+  in goes to that domain and its subdomains (a leading dot ignored, a
+  domain of one label, an address other than the host's, a trailing dot
+  or a domain the host is not in refused); `Path` is the attribute's or
+  the request path's default (5.1.4); `Max-Age` wins over `Expires`, zero
+  or below deletes, a date is read as 5.1.1 reads every form servers send
+  and an unreadable one is ignored; `Secure` cookies go over https only,
+  or to `localhost` and the loopback addresses as Go sends them; a new
+  cookie of the same name, domain and path takes the old one's creation
+  time; at most 50 for a domain and 3000 in all, the least recently used
+  going first (6.1). The header lists the longest paths first, then the
+  oldest, as `name=value; name2=value2`, a value with a space or a comma
+  or one that came in quotes written in quotes. `SetCookie(url, header)`,
+  `SetCookies(url, fields)`, `CookieHeader(url)`, `CookiesFor(url)`,
+  `Count`, `Reset`, `All` and `Clock` (Unix seconds, 0 for the real one)
+  work the jar by hand; `CookieParse(header, out c)` reads a `Set-Cookie`
+  as Go's `http.ParseSetCookie` (a token name, value bytes 0x20 to 0x7E
+  but quote, semicolon and backslash, a pair of quotes stripped and
+  remembered), `CookieParseDate` the dates, `CookieDefaultPath` the
+  default path. `testdata/cookiejar` runs the script
+  `testdata/cookiejar.txt` (Go's jar tests adapted: hosts, paths,
+  domains, addresses, secure, expiry, every form of header, the order)
+  and `scripts/cookie_oracle.go` runs it through Go's jar: the same
+  headers; `testdata/cookiehttp` logs into a server on the loopback and
+  follows the redirect with the cookies.
+- **Left out.** Proxies, authentication beyond `HttpBasicAuth`, HTTP/2,
+  `Expect: 100-continue`, a request body that is not a string and a public
+  suffix list for the jar. `httpserver` still reads requests
   with its own code (P450 moves it onto `pashttp`).
 - **Routines.** A client may be used by any number of routines (its pool is
   guarded); a response, a reader and a `TUrlValues` belong to the routine

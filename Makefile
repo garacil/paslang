@@ -747,6 +747,9 @@ GOLDEN_A64 += htmltok
 # P566: the text of a message, plain or through HtmlToText.
 GOLDEN += mailtext
 GOLDEN_A64 += mailtext
+# P564: the cookie jar of httpclient, against Go's cookiejar, and through a login on the loopback.
+GOLDEN += cookiejar cookiehttp
+GOLDEN_A64 += cookiejar cookiehttp
 # P432: URLs and HTTP messages against Go, and the HTTP client over loopback.
 GOLDEN += url httpmsg httpcli
 GOLDEN_A64 += url httpmsg httpcli
@@ -3410,6 +3413,22 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(BUILDDIR)/mailtext > $(BUILDDIR)/mailtext.got; \
 	diff -u testdata/mailtext.out $(BUILDDIR)/mailtext.got; \
 	echo ok mailtext
+	@set -e; \
+	: P564: the cookie jar of httpclient keeps and sends cookies as RFC 6265 and the cookiejar of Go say and testdata/cookiejar runs the script testdata/cookiejar.txt whose get lines the same script through net/http/cookiejar must repeat when go is there and testdata/cookiehttp carries them through a login with a redirect on the loopback; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/cookiejar testdata/cookiejar.paslang; \
+	$(BUILDDIR)/cookiejar > $(BUILDDIR)/cookiejar.got; \
+	diff -u testdata/cookiejar.out $(BUILDDIR)/cookiejar.got; \
+	python3 -I scripts/cookie_date_check.py $(BUILDDIR)/cookiejar.got; \
+	if command -v go > /dev/null 2>&1; then \
+	  GOCACHE=$$PWD/$(BUILDDIR)/gocache GOFLAGS=-mod=mod go run scripts/cookie_oracle.go testdata/cookiejar.txt > $(BUILDDIR)/cookiejar.go.txt; \
+	  grep -a -E '^(get|clear)' $(BUILDDIR)/cookiejar.got > $(BUILDDIR)/cookiejar.gets.txt; \
+	  diff -u $(BUILDDIR)/cookiejar.go.txt $(BUILDDIR)/cookiejar.gets.txt; \
+	  echo ok cookiejar-go; \
+	fi; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/cookiehttp testdata/cookiehttp.paslang; \
+	timeout 120 $(BUILDDIR)/cookiehttp > $(BUILDDIR)/cookiehttp.got; \
+	diff -u testdata/cookiehttp.out $(BUILDDIR)/cookiehttp.got; \
+	echo ok cookiejar
 	@set -e; \
 	: the kept scripts of testdata/sqllogic are what scripts/gen_sqllogic.py writes while the system SQLite is the one that made them, P412; \
 	python3 -I scripts/gen_sqllogic.py --check

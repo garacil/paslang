@@ -39,7 +39,7 @@ unit httpclient;
 interface
 
 uses
-  sysutils, pasnet, pasconn, pasurl, pashttp, pasflate;
+  sysutils, pastime, pasnet, pasconn, pasurl, pashttp, pasflate;
 
 type
   { what went wrong: Kind says which of them, Timeout that a deadline passed }
@@ -61,6 +61,58 @@ const
   ceTls = 8;
 
 type
+  { One cookie as the jar keeps it (RFC 6265, 5.3): Expires is Unix seconds, 0
+    for a session cookie; HostOnly says the Domain attribute was absent;
+    Quoted that the value came in double quotes (sent back in them). }
+  TCookie = record
+    Name, Value, Domain, Path: string;
+    Expires, Creation, LastAccess, Seq: Int64;
+    Secure, HttpOnly, HostOnly, Quoted: Boolean;
+  end;
+  TCookieArray = array of TCookie;
+
+  { A Set-Cookie header read as Go's http.ParseSetCookie reads it (P564) }
+  TSetCookie = record
+    Name, Value, Domain, Path: string;
+    Quoted, Secure, HttpOnly, HasExpires, HasMaxAge: Boolean;
+    { Unix seconds of a readable Expires }
+    Expires: Int64;
+    { MaxDigits-Age in seconds; 0 and below mean the cookie is deleted now }
+    MaxAge: Int64;
+  end;
+
+  { A client's cookies (RFC 6265, section 5, as Go's net/http/cookiejar keeps
+    them without a public suffix list): host-only and domain cookies, the
+    default path, MaxDigits-Age over Expires, the newest of a name, domain and path
+    taking the creation time of the old, at most 50 for a domain and 3000 in
+    all (the least recently used go first), the Cookie header with the longest
+    paths first and the oldest before. A mutex guards it (Regla 11). }
+  TCookieJar = class
+  private
+    FMu: mutex;
+    FEntries: TCookieArray;
+    FSeq: Int64;
+    FClock: Int64;
+    function NowUnixOf: Int64;
+    procedure Evict(const Domain: string; T: Int64);
+  public
+    constructor Create;
+    { every Set-Cookie field of a response to U stored }
+    procedure SetCookies(const U: TUrl; Fields: THttpFields);
+    { one Set-Cookie header stored; False when it is not one }
+    function SetCookie(const U: TUrl; const Header: string): Boolean;
+    { the cookies a request to U carries, in the order of the header }
+    function CookiesFor(const U: TUrl): TCookieArray;
+    { the Cookie header for a request to U, '' when there is none }
+    function CookieHeader(const U: TUrl): string;
+    function Count: Integer;
+    procedure Reset;
+    { every cookie kept, for a program that saves them }
+    function All: TCookieArray;
+    { the clock the jar reads, Unix seconds; 0 is the real one (a test sets it) }
+    property Clock: Int64 read FClock write FClock;
+  end;
+
   THttpClient = class;
 
   THttpClientResponse = class
@@ -138,6 +190,10 @@ type
     MaxBodyBytes: Int64;
     { every request goes to this Unix socket, whatever its host }
     UnixPath: string;
+    { the cookies: set, the Set-Cookie of every response (the redirects' too) is
+      kept and the Cookie header of every request written, unless the caller
+      gave one; nil, as made, for a client with no cookies }
+    Jar: TCookieJar;
     constructor Create;
     function Perform(const Method, Url: string; Fields: THttpFields; const Body: string): THttpClientResponse;
     { Perform and the body read to its end }
@@ -150,6 +206,16 @@ type
 
 { Authorization: Basic ... for a user and a password }
 function HttpBasicAuth(const User, Password: string): string;
+
+{ a Set-Cookie header read: False for no name=value, a name that is not a
+  token or a value with a byte outside 0x20..0x7E or a quote, semicolon or
+  backslash inside; an attribute that cannot be read is passed over }
+function CookieParse(const Header: string; out C: TSetCookie): Boolean;
+{ a date as RFC 6265 5.1.1 reads one (every form servers send), to Unix
+  seconds; False for what is no date }
+function CookieParseDate(const S: string; out T: Int64): Boolean;
+{ the default path of a request path (5.1.4) }
+function CookieDefaultPath(const Path: string): string;
 
 implementation
 
@@ -552,7 +618,7 @@ end;
 function THttpClient.Exchange(const Method: string; const U: TUrl; Fields: THttpFields; const Body: string;
   Deadline: Integer; Redirects: Integer): THttpClientResponse;
 var
-  key, req, hostHdr, target: string;
+  key, req, hostHdr, target, ck: string;
   stream: TNetStream;
   reused, retried, gz, sent, gotAny: Boolean;
   order: array of Integer;
@@ -607,6 +673,12 @@ begin
       req := req + 'Accept-Encoding: gzip' + #13#10;
     if DisableKeepAlives then
       req := req + 'Connection: close' + #13#10;
+    if (Jar <> nil) and ((Fields = nil) or (not Fields.Has('Cookie'))) then
+    begin
+      ck := Jar.CookieHeader(U);
+      if ck <> '' then
+        req := req + 'Cookie: ' + ck + #13#10;
+    end;
     req := req + #13#10 + Body;
     dl := Deadline;
     if HeaderTimeoutMs > 0 then
@@ -684,6 +756,8 @@ begin
       raise EHttpClientError.CreateKind(ceClosed, 'http: could not write the request to ' + hostHdr);
     end;
     h := r.Head;
+    if Jar <> nil then
+      Jar.SetCookies(U, h.Fields);
     resp := THttpClientResponse.Create;
     resp.FClient := Self;
     resp.FStream := stream;
@@ -851,6 +925,670 @@ begin
   if ContentType <> '' then
     f.Add('Content-Type', ContentType);
   Result := Perform('POST', Url, f, Body);
+end;
+
+{ ---- cookies, RFC 6265 ---- }
+
+function CookieTrim(const S: string): string;
+var
+  a, b: Integer;
+begin
+  a := 1;
+  b := Length(S);
+  while (a <= b) and ((S[a] = ' ') or (S[a] = #9) or (S[a] = #13) or (S[a] = #10)) do
+    a := a + 1;
+  while (b >= a) and ((S[b] = ' ') or (S[b] = #9) or (S[b] = #13) or (S[b] = #10)) do
+    b := b - 1;
+  Result := Copy(S, a, b - a + 1);
+end;
+
+{ a cookie value's byte, as Go's validCookieValueByte: 0x20..0x7E but the quote, the semicolon and the backslash }
+function CookieValueByte(C: Char): Boolean;
+begin
+  Result := (C >= ' ') and (C < #127) and (C <> '"') and (C <> ';') and (C <> '\');
+end;
+
+function CookieValueOk(const V: string): Boolean;
+var
+  i: Integer;
+begin
+  Result := False;
+  for i := 1 to Length(V) do
+    if not CookieValueByte(V[i]) then
+      Exit;
+  Result := True;
+end;
+
+function CookieLower(const S: string): string;
+var
+  i: Integer;
+begin
+  Result := S;
+  for i := 1 to Length(Result) do
+    if (Result[i] >= 'A') and (Result[i] <= 'Z') then
+      Result[i] := Chr(Ord(Result[i]) + 32);
+end;
+
+{ digits only, up to 18 of them }
+function CookieDigits(const S: string; out V: Int64): Boolean;
+var
+  i: Integer;
+begin
+  Result := False;
+  V := 0;
+  if (S = '') or (Length(S) > 18) then
+    Exit;
+  for i := 1 to Length(S) do
+  begin
+    if (S[i] < '0') or (S[i] > '9') then
+      Exit;
+    V := V * 10 + (Ord(S[i]) - 48);
+  end;
+  Result := True;
+end;
+
+function CookieParseDate(const S: string; out T: Int64): Boolean;
+const
+  Months: string = 'janfebmaraprmayjunjulaugsepoctnovdec';
+var
+  i, n, a, k, hh, mm, ss, day, month, year: Integer;
+  hasTime, hasDay, hasMonth, hasYear: Boolean;
+  tok, lw: string;
+  v: Int64;
+
+  { the digits at the start of tok, 1 to MaxDigits of them; -1 when not so }
+  function Num(const Tk: string; MaxDigits: Integer; out Used: Integer): Integer;
+  var
+    j: Integer;
+  begin
+    Result := 0;
+    Used := 0;
+    j := 1;
+    while (j <= Length(Tk)) and (j <= MaxDigits) and (Tk[j] >= '0') and (Tk[j] <= '9') do
+    begin
+      Result := Result * 10 + (Ord(Tk[j]) - 48);
+      j := j + 1;
+    end;
+    Used := j - 1;
+    if Used = 0 then
+      Result := -1;
+  end;
+
+begin
+  Result := False;
+  T := 0;
+  hasTime := False;
+  hasDay := False;
+  hasMonth := False;
+  hasYear := False;
+  hh := 0;
+  mm := 0;
+  ss := 0;
+  day := 0;
+  month := 0;
+  year := 0;
+  n := Length(S);
+  i := 1;
+  while i <= n do
+  begin
+    { a delimiter: %x09, %x20-2F, %x3B-40, %x5B-60, %x7B-7E }
+    if (S[i] = #9) or ((S[i] >= ' ') and (S[i] <= '/')) or ((S[i] >= ';') and (S[i] <= '@')) or
+      ((S[i] >= '[') and (S[i] <= '`')) or ((S[i] >= '{') and (S[i] <= '~')) then
+    begin
+      i := i + 1;
+      Continue;
+    end;
+    a := i;
+    while (i <= n) and not ((S[i] = #9) or ((S[i] >= ' ') and (S[i] <= '/')) or ((S[i] >= ';') and (S[i] <= '@')) or
+      ((S[i] >= '[') and (S[i] <= '`')) or ((S[i] >= '{') and (S[i] <= '~'))) do
+      i := i + 1;
+    tok := Copy(S, a, i - a);
+    { the time: hh:mm:ss, one or two digits each, anything but a digit may follow }
+    if not hasTime then
+    begin
+      hh := Num(tok, 2, k);
+      if (hh >= 0) and (k < Length(tok)) and (tok[k + 1] = ':') then
+      begin
+        lw := Copy(tok, k + 2, Length(tok) - k - 1);
+        mm := Num(lw, 2, k);
+        if (mm >= 0) and (k < Length(lw)) and (lw[k + 1] = ':') then
+        begin
+          lw := Copy(lw, k + 2, Length(lw) - k - 1);
+          ss := Num(lw, 2, k);
+          if (ss >= 0) and ((k = Length(lw)) or (lw[k + 1] < '0') or (lw[k + 1] > '9')) then
+          begin
+            hasTime := True;
+            Continue;
+          end;
+        end;
+      end;
+    end;
+    if not hasDay then
+    begin
+      day := Num(tok, 2, k);
+      if (day >= 0) and ((k = Length(tok)) or (tok[k + 1] < '0') or (tok[k + 1] > '9')) then
+      begin
+        hasDay := True;
+        Continue;
+      end;
+    end;
+    if not hasMonth and (Length(tok) >= 3) then
+    begin
+      lw := CookieLower(Copy(tok, 1, 3));
+      k := Pos(lw, Months);
+      if (k > 0) and ((k - 1) mod 3 = 0) then
+      begin
+        month := (k - 1) div 3 + 1;
+        hasMonth := True;
+        Continue;
+      end;
+    end;
+    if not hasYear then
+    begin
+      year := Num(tok, 4, k);
+      if (year >= 0) and (k >= 2) and ((k = Length(tok)) or (tok[k + 1] < '0') or (tok[k + 1] > '9')) then
+      begin
+        hasYear := True;
+        Continue;
+      end;
+    end;
+  end;
+  if not (hasTime and hasDay and hasMonth and hasYear) then
+    Exit;
+  if (year >= 70) and (year <= 99) then
+    year := year + 1900
+  else if year <= 69 then
+    year := year + 2000;
+  if (day < 1) or (day > 31) or (year < 1601) or (hh > 23) or (mm > 59) or (ss > 59) then
+    Exit;
+  if day > DaysInMonth(year, month) then
+    Exit;
+  v := DateToUnix(year, month, day, hh, mm, ss);
+  T := v;
+  Result := True;
+end;
+
+function CookieDefaultPath(const Path: string): string;
+var
+  i: Integer;
+begin
+  if (Path = '') or (Path[1] <> '/') then
+  begin
+    Result := '/';
+    Exit;
+  end;
+  i := Length(Path);
+  while (i > 1) and (Path[i] <> '/') do
+    i := i - 1;
+  if i <= 1 then
+    Result := '/'
+  else
+    Result := Copy(Path, 1, i - 1);
+end;
+
+function CookieParse(const Header: string; out C: TSetCookie): Boolean;
+var
+  rest, part, nm, v, attr, lw: string;
+  p, eq: Integer;
+  neg: Boolean;
+  secs: Int64;
+begin
+  Result := False;
+  C := Default(TSetCookie);
+  rest := CookieTrim(Header);
+  if rest = '' then
+    Exit;
+  p := Pos(';', rest);
+  if p = 0 then
+  begin
+    part := rest;
+    rest := '';
+  end
+  else
+  begin
+    part := Copy(rest, 1, p - 1);
+    rest := Copy(rest, p + 1, Length(rest) - p);
+  end;
+  part := CookieTrim(part);
+  eq := Pos('=', part);
+  if eq = 0 then
+    Exit;
+  nm := CookieTrim(Copy(part, 1, eq - 1));
+  v := Copy(part, eq + 1, Length(part) - eq);
+  if (nm = '') or (not HttpIsToken(nm)) then
+    Exit;
+  if (Length(v) > 1) and (v[1] = '"') and (v[Length(v)] = '"') then
+  begin
+    v := Copy(v, 2, Length(v) - 2);
+    C.Quoted := True;
+  end;
+  if not CookieValueOk(v) then
+    Exit;
+  C.Name := nm;
+  C.Value := v;
+  while rest <> '' do
+  begin
+    p := Pos(';', rest);
+    if p = 0 then
+    begin
+      part := rest;
+      rest := '';
+    end
+    else
+    begin
+      part := Copy(rest, 1, p - 1);
+      rest := Copy(rest, p + 1, Length(rest) - p);
+    end;
+    part := CookieTrim(part);
+    if part = '' then
+      Continue;
+    eq := Pos('=', part);
+    if eq = 0 then
+    begin
+      attr := part;
+      v := '';
+    end
+    else
+    begin
+      attr := Copy(part, 1, eq - 1);
+      v := Copy(part, eq + 1, Length(part) - eq);
+    end;
+    lw := CookieLower(attr);
+    { a quote in an attribute's value makes it unreadable, as Go's parseCookieValue(v, false) }
+    if (Pos('"', v) > 0) or (not CookieValueOk(v)) then
+      Continue;
+    if lw = 'secure' then
+      C.Secure := True
+    else if lw = 'httponly' then
+      C.HttpOnly := True
+    else if lw = 'domain' then
+      C.Domain := v
+    else if lw = 'path' then
+      C.Path := v
+    else if lw = 'max-age' then
+    begin
+      { an integer, a sign allowed; a number that is not 0 and starts with 0 is passed over, as Go does }
+      neg := (v <> '') and (v[1] = '-');
+      if (v <> '') and ((v[1] = '-') or (v[1] = '+')) then
+        v := Copy(v, 2, Length(v) - 1);
+      if CookieDigits(v, secs) and not ((secs <> 0) and (v[1] = '0')) then
+      begin
+        C.HasMaxAge := True;
+        if neg or (secs = 0) then
+          C.MaxAge := 0
+        else
+          C.MaxAge := secs;
+      end;
+    end
+    else if lw = 'expires' then
+    begin
+      if CookieParseDate(v, secs) then
+      begin
+        C.HasExpires := True;
+        C.Expires := secs;
+      end;
+    end;
+  end;
+  Result := True;
+end;
+
+{ the host of a URL as the jar names it: lower case, no port, no last dot }
+function CookieHost(const U: TUrl): string;
+begin
+  Result := CookieLower(UrlHostname(U));
+  if (Result <> '') and (Result[Length(Result)] = '.') then
+    Result := Copy(Result, 1, Length(Result) - 1);
+end;
+
+{ an IP address: digits and dots, or a colon in it }
+function CookieIsIp(const H: string): Boolean;
+var
+  i: Integer;
+begin
+  Result := False;
+  if H = '' then
+    Exit;
+  if Pos(':', H) > 0 then
+  begin
+    Result := True;
+    Exit;
+  end;
+  for i := 1 to Length(H) do
+    if not (((H[i] >= '0') and (H[i] <= '9')) or (H[i] = '.')) then
+      Exit;
+  Result := True;
+end;
+
+{ S ends with .Suffix }
+function CookieDotSuffix(const S, Suffix: string): Boolean;
+begin
+  Result := (Length(S) > Length(Suffix)) and (S[Length(S) - Length(Suffix)] = '.') and
+    (Copy(S, Length(S) - Length(Suffix) + 1, Length(Suffix)) = Suffix);
+end;
+
+{ 5.1.4: Path is the request path, or a prefix that ends in / or before a / }
+function CookiePathMatch(const RequestPath, CookiePath: string): Boolean;
+begin
+  Result := True;
+  if RequestPath = CookiePath then
+    Exit;
+  if (Length(RequestPath) > Length(CookiePath)) and (Copy(RequestPath, 1, Length(CookiePath)) = CookiePath) then
+    if (CookiePath[Length(CookiePath)] = '/') or (RequestPath[Length(CookiePath) + 1] = '/') then
+      Exit;
+  Result := False;
+end;
+
+{ Go's secureMatch: a Secure cookie goes over https, or to localhost and the loopback addresses }
+function CookieSecureOk(const Host: string; Https: Boolean): Boolean;
+begin
+  Result := Https or (Host = 'localhost') or CookieDotSuffix(Host, 'localhost') or (Copy(Host, 1, 4) = '127.') or
+    (Host = '::1');
+end;
+
+constructor TCookieJar.Create;
+begin
+  inherited Create;
+  SetLength(FEntries, 0);
+  FSeq := 0;
+  FClock := 0;
+end;
+
+function TCookieJar.NowUnixOf: Int64;
+begin
+  if FClock <> 0 then
+    Result := FClock
+  else
+    Result := NowUnix;
+end;
+
+function TCookieJar.Count: Integer;
+begin
+  FMu.Lock;
+  try
+    Result := Length(FEntries);
+  finally
+    FMu.Unlock;
+  end;
+end;
+
+procedure TCookieJar.Reset;
+begin
+  FMu.Lock;
+  try
+    SetLength(FEntries, 0);
+  finally
+    FMu.Unlock;
+  end;
+end;
+
+function TCookieJar.All: TCookieArray;
+var
+  i: Integer;
+begin
+  FMu.Lock;
+  try
+    SetLength(Result, Length(FEntries));
+    for i := 0 to Length(FEntries) - 1 do
+      Result[i] := FEntries[i];
+  finally
+    FMu.Unlock;
+  end;
+end;
+
+{ 5.3, steps 12 and 13: the expired go, then the least recently used of a
+  domain past 50, then the least recently used of all past 3000 }
+procedure TCookieJar.Evict(const Domain: string; T: Int64);
+var
+  i, j, n, cnt, oldest: Integer;
+begin
+  n := 0;
+  for i := 0 to Length(FEntries) - 1 do
+    if (FEntries[i].Expires = 0) or (FEntries[i].Expires > T) then
+    begin
+      FEntries[n] := FEntries[i];
+      n := n + 1;
+    end;
+  SetLength(FEntries, n);
+  repeat
+    cnt := 0;
+    oldest := -1;
+    for i := 0 to Length(FEntries) - 1 do
+      if FEntries[i].Domain = Domain then
+      begin
+        cnt := cnt + 1;
+        if (oldest < 0) or (FEntries[i].LastAccess < FEntries[oldest].LastAccess) or
+          ((FEntries[i].LastAccess = FEntries[oldest].LastAccess) and (FEntries[i].Seq < FEntries[oldest].Seq)) then
+          oldest := i;
+      end;
+    if cnt > 50 then
+    begin
+      for j := oldest to Length(FEntries) - 2 do
+        FEntries[j] := FEntries[j + 1];
+      SetLength(FEntries, Length(FEntries) - 1);
+    end;
+  until cnt <= 50;
+  while Length(FEntries) > 3000 do
+  begin
+    oldest := 0;
+    for i := 1 to Length(FEntries) - 1 do
+      if (FEntries[i].LastAccess < FEntries[oldest].LastAccess) or
+        ((FEntries[i].LastAccess = FEntries[oldest].LastAccess) and (FEntries[i].Seq < FEntries[oldest].Seq)) then
+        oldest := i;
+    for j := oldest to Length(FEntries) - 2 do
+      FEntries[j] := FEntries[j + 1];
+    SetLength(FEntries, Length(FEntries) - 1);
+  end;
+end;
+
+function TCookieJar.SetCookie(const U: TUrl; const Header: string): Boolean;
+var
+  c: TSetCookie;
+  e: TCookie;
+  host, domain: string;
+  t: Int64;
+  i, j, found: Integer;
+  remove: Boolean;
+begin
+  Result := False;
+  if (U.Scheme <> 'http') and (U.Scheme <> 'https') then
+    Exit;
+  if not CookieParse(Header, c) then
+    Exit;
+  host := CookieHost(U);
+  if host = '' then
+    Exit;
+  e := Default(TCookie);
+  e.Name := c.Name;
+  e.Value := c.Value;
+  e.Quoted := c.Quoted;
+  e.Secure := c.Secure;
+  e.HttpOnly := c.HttpOnly;
+  if (c.Path = '') or (c.Path[1] <> '/') then
+    e.Path := CookieDefaultPath(U.Path)
+  else
+    e.Path := c.Path;
+  { 5.2.3 and 5.3 steps 4 to 6: the domain }
+  domain := c.Domain;
+  if domain = '' then
+  begin
+    e.Domain := host;
+    e.HostOnly := True;
+  end
+  else if CookieIsIp(host) then
+  begin
+    { an address cookie must name the address itself, and is host-only }
+    if CookieLower(domain) <> host then
+      Exit;
+    e.Domain := host;
+    e.HostOnly := True;
+  end
+  else
+  begin
+    if domain[1] = '.' then
+      domain := Copy(domain, 2, Length(domain) - 1);
+    domain := CookieLower(domain);
+    if (domain = '') or (domain[1] = '.') or (domain[Length(domain)] = '.') then
+      Exit;
+    { a domain of one label is a public suffix (com, test, localhost): 5.3 step 5 rejects it, as a browser does with its
+      public suffix list; Go without a list stores it under a key no other host reaches }
+    if Pos('.', domain) = 0 then
+      Exit;
+    if (host <> domain) and (not CookieDotSuffix(host, domain)) then
+      Exit;
+    e.Domain := domain;
+    e.HostOnly := False;
+  end;
+  t := NowUnixOf;
+  { 5.3 step 3: MaxDigits-Age over Expires; a time gone means the cookie is removed }
+  remove := False;
+  if c.HasMaxAge then
+  begin
+    if c.MaxAge <= 0 then
+      remove := True
+    else
+      e.Expires := t + c.MaxAge;
+  end
+  else if c.HasExpires then
+  begin
+    if c.Expires <= t then
+      remove := True
+    else
+      e.Expires := c.Expires;
+  end;
+  FMu.Lock;
+  try
+    found := -1;
+    for i := 0 to Length(FEntries) - 1 do
+      if (FEntries[i].Name = e.Name) and (FEntries[i].Domain = e.Domain) and (FEntries[i].Path = e.Path) then
+        found := i;
+    if remove then
+    begin
+      if found >= 0 then
+      begin
+        for j := found to Length(FEntries) - 2 do
+          FEntries[j] := FEntries[j + 1];
+        SetLength(FEntries, Length(FEntries) - 1);
+      end;
+    end
+    else
+    begin
+      if found >= 0 then
+      begin
+        { 5.3 step 11.3: the creation time of the old cookie is kept }
+        e.Creation := FEntries[found].Creation;
+        e.Seq := FEntries[found].Seq;
+        e.LastAccess := t;
+        FEntries[found] := e;
+      end
+      else
+      begin
+        e.Creation := t;
+        e.LastAccess := t;
+        FSeq := FSeq + 1;
+        e.Seq := FSeq;
+        SetLength(FEntries, Length(FEntries) + 1);
+        FEntries[Length(FEntries) - 1] := e;
+      end;
+      Evict(e.Domain, t);
+    end;
+  finally
+    FMu.Unlock;
+  end;
+  Result := True;
+end;
+
+procedure TCookieJar.SetCookies(const U: TUrl; Fields: THttpFields);
+var
+  vals: TStringArray;
+  i: Integer;
+begin
+  if Fields = nil then
+    Exit;
+  vals := Fields.ValuesOf('Set-Cookie');
+  for i := 0 to Length(vals) - 1 do
+    SetCookie(U, vals[i]);
+end;
+
+function TCookieJar.CookiesFor(const U: TUrl): TCookieArray;
+var
+  host, path: string;
+  https: Boolean;
+  t: Int64;
+  i, j, n: Integer;
+  e: TCookie;
+begin
+  SetLength(Result, 0);
+  if (U.Scheme <> 'http') and (U.Scheme <> 'https') then
+    Exit;
+  host := CookieHost(U);
+  if host = '' then
+    Exit;
+  https := U.Scheme = 'https';
+  path := U.Path;
+  if path = '' then
+    path := '/';
+  t := NowUnixOf;
+  FMu.Lock;
+  try
+    { the expired go (5.3) }
+    n := 0;
+    for i := 0 to Length(FEntries) - 1 do
+      if (FEntries[i].Expires = 0) or (FEntries[i].Expires > t) then
+      begin
+        FEntries[n] := FEntries[i];
+        n := n + 1;
+      end;
+    SetLength(FEntries, n);
+    for i := 0 to Length(FEntries) - 1 do
+    begin
+      if FEntries[i].HostOnly then
+      begin
+        if FEntries[i].Domain <> host then
+          Continue;
+      end
+      else if (FEntries[i].Domain <> host) and (not CookieDotSuffix(host, FEntries[i].Domain)) then
+        Continue;
+      if not CookiePathMatch(path, FEntries[i].Path) then
+        Continue;
+      if FEntries[i].Secure and (not CookieSecureOk(host, https)) then
+        Continue;
+      FEntries[i].LastAccess := t;
+      { 5.4 step 2: longer paths first, then the earlier creation, then the order of arrival }
+      e := FEntries[i];
+      j := Length(Result);
+      SetLength(Result, j + 1);
+      while (j > 0) and ((Length(Result[j - 1].Path) < Length(e.Path)) or
+        ((Length(Result[j - 1].Path) = Length(e.Path)) and ((Result[j - 1].Creation > e.Creation) or
+        ((Result[j - 1].Creation = e.Creation) and (Result[j - 1].Seq > e.Seq))))) do
+      begin
+        Result[j] := Result[j - 1];
+        j := j - 1;
+      end;
+      Result[j] := e;
+    end;
+  finally
+    FMu.Unlock;
+  end;
+end;
+
+function TCookieJar.CookieHeader(const U: TUrl): string;
+var
+  cs: TCookieArray;
+  i: Integer;
+  v: string;
+begin
+  Result := '';
+  cs := CookiesFor(U);
+  for i := 0 to Length(cs) - 1 do
+  begin
+    v := cs[i].Value;
+    { a value with a space or a comma, or one that came quoted, goes in quotes, as Go sends it }
+    if cs[i].Quoted or (Pos(' ', v) > 0) or (Pos(',', v) > 0) then
+      v := '"' + v + '"';
+    if Result <> '' then
+      Result := Result + '; ';
+    Result := Result + cs[i].Name + '=' + v;
+  end;
 end;
 
 end.
