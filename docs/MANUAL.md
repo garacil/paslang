@@ -15265,6 +15265,32 @@ in `testdata/`, the examples of this manual, the network tests, the
 stage-2 rebuild of the compiler by itself, and the arm64 build under
 qemu.
 
+**Auditing a unit (1.2.376, P561).** Two scripts measure a unit from the
+tree, never from memory. `python3 -I scripts/unit_audit.py --gaps` prints,
+for every unit of `CORE_UNITS` and `LIB_UNITS`, its lines, the words of its
+interface and how many the manual names (`--missing` lists the rest), the
+golden programs that use it directly and through other units and on which
+machines `make check` runs them, the recipe blocks that exercise it, the
+oracle, corpus and model scripts written for it, its bench pairs against
+Go, whether a golden program runs it from several routines, its fuzzers
+and (with `--registry docs/seed_milestones.py`) its open milestones, then
+the units worst first with what each lacks. `python3 -I scripts/mutunit.py
+UNIT` is mutation testing of any unit: each mutant (a relation turned, an
+operator swapped, a constant off by one, a condition negated, a statement
+deleted, a loop bound shortened, a `not` dropped, a Boolean flipped) is
+compiled as a unit of its own with the units that depend on it, the golden
+programs that use the unit are compiled against them and run, and the
+first whose output differs, or that does not compile or end in time,
+catches the mutant; the survivors are written with their lines in
+`build/mut/UNIT/survivors.txt`, each a hole in the tests or an equivalent
+change, which `--live FILE` names with its reason. `--sample N --seed S`
+takes that many mutants evenly over the operators, `--routine A,B` the
+lines of those routines, `--tests a,b` the programs to run, `--arm64` each
+mutant on arm64 too, `--jobs K` that many at once. Run them in the tree as
+its owner; every compile runs capped at 4 GB and 120 s. The opening
+stores of `Result` and of locals are not mutated (the language clears
+them); those of `out` and `var` parameters are, since the caller sees them.
+
 ---
 
 Copyright (C) 2026 Germán Luis Aracil Boned.

@@ -3430,6 +3430,15 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/cookiehttp.out $(BUILDDIR)/cookiehttp.got; \
 	echo ok cookiejar
 	@set -e; \
+	: P561: scripts/unit_audit.py reports what every unit of CORE_UNITS and LIB_UNITS stands on and scripts/mutunit.py lists the mutants of any unit and both must run on this tree and name every unit; \
+	python3 -I scripts/unit_audit.py --tree . > $(BUILDDIR)/unit_audit.txt; \
+	for u in $(CORE_UNITS) $(LIB_UNITS); do b=$$(basename $$u .paslang); grep -q "^$$b " $(BUILDDIR)/unit_audit.txt || { echo "unit_audit.py says nothing of $$b"; exit 1; }; done; \
+	python3 -I scripts/mutunit.py pascodec --list > $(BUILDDIR)/mutunit_list.txt; \
+	n=$$(tail -1 $(BUILDDIR)/mutunit_list.txt | cut -d' ' -f1); [ "$$n" -gt 1000 ] || { echo "mutunit.py lists only $$n mutants of pascodec"; exit 1; }; \
+	python3 -I scripts/mutunit.py pashtml --routine EntityIndex --list > $(BUILDDIR)/mutunit_list2.txt; \
+	grep -q 'rel@' $(BUILDDIR)/mutunit_list2.txt; \
+	echo ok unitaudit
+	@set -e; \
 	: the kept scripts of testdata/sqllogic are what scripts/gen_sqllogic.py writes while the system SQLite is the one that made them, P412; \
 	python3 -I scripts/gen_sqllogic.py --check
 	@set -e; \
