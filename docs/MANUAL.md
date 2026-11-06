@@ -14361,7 +14361,8 @@ SysUtils is what turns run-time errors into exceptions there too:
 | `as` of an object that is not of the class | `EInvalidCast` |
 
 `E.Message` is the runtime's line without `paslang: `
-(`index 10 out of range [0..4] at line 12`) and `ExceptAddr` the code that
+(`index 10 out of range [0..4] at line 12`, and `at line 12 of unit U`
+for a failure inside a unit, P572) and `ExceptAddr` the code that
 failed. The rule is the running routine's: inside a `try` of its own or
 of a routine that called it (a `finally` and a `lock` block count) the
 failure is raised and unwinds as any `raise` does (§9), the `finally`
@@ -14436,10 +14437,26 @@ read like `sqrt domain`. The others include `invalid memory address
 range`, `concurrent map writes` (and `concurrent map read and map
 write`, `concurrent map iteration and map write`), `bit N out of
 range`, `128-bit division overflow`, `out of stack memory`,
-`allocation too large` and `mmap failed`. A fault inside a unit or
-inside the runtime names no line but the address instead, as Go's
-signal report does: `paslang: nil pointer dereference at pc 0x4086e7`. There is no core dump to read first
+`allocation too large` and `mmap failed`. A failure inside a unit names
+its line and the unit (1.2.381, P572): `paslang: index 9 out of range
+[0..2] at line 29 of unit PlaceV`, where the program's own code says `at
+line 12` and no more; the unit is named as its source declares it. A
+fault inside the runtime's own code, which has no lines, names the
+address instead, as Go's signal report does: `paslang: nil pointer
+dereference at pc 0x4086e7`. There is no core dump to read first
 and no signal to catch: the program has said what happened.
+
+The place comes from tables every object file carries, for its
+routines, a program's main block and a unit's initialization and
+finalization: a record of sixteen bytes a routine, which the linker
+lays in the order of the code and drops with a routine the program
+does not reach, and the routine's lines as steps of address and of
+line, a little over two bytes a line. They are read only when a
+failure is reported, by halving the records and reading one routine's
+lines, and cost a program some 8 to 10 % beside its code
+(`scripts/check_paslines.py --sizes`, which also compares every line
+with the table the assembler wrote for the debugger; `testdata/units/placeuse`
+and the four programs beside it that end on a failure of a unit).
 
 ### Runtime words
 

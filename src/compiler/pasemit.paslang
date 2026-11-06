@@ -78,6 +78,7 @@ const
   MsgBus = 'paslang: bus error';
   MsgDeadlock = 'paslang: all routines are asleep: deadlock';
   MsgAtLine = ' at line ';
+  MsgOfUnit = ' of unit ';
   MsgAtPc = ' at pc 0x';
   MsgOomStack = 'paslang: out of stack memory: ';
   MsgChanCap = 'paslang: channel capacity ';
@@ -350,6 +351,11 @@ type
     FOpLine: LongInt;       { the line of the innermost operation being emitted that may stop the program (P341) }
     FLineLabs: array of string;
     FLineNums: array of LongInt;
+    FLineCold: array of Boolean;  { the line label stands in a block after the routine's ret (P572); every new label sets its length }
+    FPlOut: array of string;  { the lines' records and tables of this object file (P572) }
+    FPlOutN: SizeInt;
+    FPlN: LongInt;          { how many tables have been written: their labels }
+    FPlUnit: string;        { the unit whose code this is, '' for a program's (P572) }
     FBrk: array of string;
     FCont: array of string;
     FTryFin: array of PStmt;
@@ -622,6 +628,8 @@ type
     function DirectJump(S: PStmt; out Target: string): Boolean;
     procedure AppendLine(const S: string);
     procedure EmitLoc(LineNo: LongInt);
+    procedure PlLine(const S: string);
+    procedure LinesOut(const Piece, Link, Start, Stop: string; From: SizeInt);
     procedure Imm(const Reg: string; V: Int64);
     procedure LeaS(const Sym, Reg: string);
     procedure LdS(const Sym, Reg: string);
@@ -2991,8 +2999,108 @@ begin
   n := Length(FLineLabs);
   SetLength(FLineLabs, n + 1);
   SetLength(FLineNums, n + 1);
+  SetLength(FLineCold, n + 1);
   FLineLabs[n] := locn;
   FLineNums[n] := LineNo;
+  FLineCold[n] := FColdAt >= 0;
+end;
+
+{ ---- the lines of the code, for a failure's place (P572) ----
+
+  A fatal message and the Message of a failure taken as an exception
+  (P567) say where: at line N for the program's own code, at line N of
+  unit U for a unit's. Every object file gives the runtime the lines of
+  each of its routines, of a program's main block and of a unit's
+  initialization and finalization:
+
+  - a record of sixteen bytes in a section paslines.NAME linked to the
+    code (SHF_LINK_ORDER, as the stack maps of P388): where the code
+    starts, from the record; how long it is; where its table is, from
+    that word; where the unit's name is, from that word, 0 for a
+    program's. The driver's script gathers the records between
+    __start_paslines and __stop_paslines; the linker lays them in the
+    order of the code they are linked to (ld/ldelfgen.c,
+    fixup_link_order) and keeps one when it keeps its code
+    (bfd/elflink.c, _bfd_elf_gc_mark_extra_sections), and the table and
+    the name with it, which the record points at;
+  - the table, in a .rodata section of its own: the count of line
+    labels and, for each, how far it stands past the one before (the
+    first past the start) and its line less the one before's, each an
+    unsigned LEB128 (DWARF 5, 7.6); the step of line, which goes back
+    at a loop's test, is folded as Go folds a step of value, 2d for d
+    not below zero and -2d - 1 below (runtime/symtab.go, step:
+    -(uvdelta & 1) ^ (uvdelta >> 1)). The assembler works the steps of
+    address out from the labels. The labels of the body come first and
+    those of the blocks after the ret (ColdBeginAt) second, each in the
+    order written, which is the order of their addresses, so every step
+    goes forward and most take a byte; a step back, if code were ever
+    laid otherwise, would be the ten bytes of its two's complement,
+    which the reader's 64 bits add as they are. An unsigned LEB128, not
+    a signed one: GNU as writes a difference of two labels of different
+    frags, now and then, as a negative number of 65 bits where a signed
+    one is asked (gas/read.c, emit_leb128_expr: X_extrabit says the
+    difference went below zero on its way), ten bytes for a step of
+    forty-two.
+
+  Go's linker writes a function table in the order of the text and a
+  pc-value table of varint deltas for the lines of each function
+  (cmd/link/internal/ld/pcln.go, runtime/symtab.go pcvalue); rt_pcline
+  reads these the same way. The table before held the program file's
+  labels alone, sixteen bytes each, read whole: a pc in a unit took the
+  line of whatever label of the program stood below it, or none. }
+procedure TEmitter.PlLine(const S: string);
+begin
+  if FPlOutN >= Length(FPlOut) then
+    SetLength(FPlOut, 2 * FPlOutN + 256);
+  FPlOut[FPlOutN] := S;
+  Inc(FPlOutN);
+end;
+
+{ The record and the table of the code from Start to Stop, whose line
+  labels are FLineLabs[From] and after: Piece names the record's section
+  and Link the code it is linked to. Code with no line label has none. }
+procedure TEmitter.LinesOut(const Piece, Link, Start, Stop: string; From: SizeInt);
+var
+  i: SizeInt;
+  pass, pl: LongInt;
+  d: Int64;
+  prev, tab, bits: string;
+begin
+  if From > High(FLineLabs) then
+    Exit;
+  if FArm then
+    bits := '%progbits'
+  else
+    bits := '@progbits';
+  tab := '.Lpl' + IntToStr(FPlN);
+  PlLine('.section .rodata.pl' + IntToStr(FPlN) + ',"a"');
+  Inc(FPlN);
+  PlLine(tab + ':');
+  PlLine('  .uleb128 ' + IntToStr(Length(FLineLabs) - From));
+  prev := Start;
+  pl := 0;
+  for pass := 0 to 1 do
+    for i := From to High(FLineLabs) do
+      if FLineCold[i] = (pass = 1) then
+      begin
+        d := Int64(FLineNums[i]) - pl;
+        if d < 0 then
+          d := -2 * d - 1
+        else
+          d := 2 * d;
+        PlLine('  .uleb128 ' + FLineLabs[i] + '-' + prev + ', ' + IntToStr(d));
+        prev := FLineLabs[i];
+        pl := FLineNums[i];
+      end;
+  PlLine('.section paslines.' + Piece + ',"ao",' + bits + ',' + Link);
+  PlLine('.balign 4');
+  PlLine('  .long ' + Start + '-.');
+  PlLine('  .long ' + Stop + '-' + Start);
+  PlLine('  .long ' + tab + '-.');
+  if FPlUnit <> '' then
+    PlLine('  .long .Lplunit-.')
+  else
+    PlLine('  .long 0');
 end;
 
 { A constant into Reg: a mov (movz or movn) when it takes one, else a
@@ -40538,7 +40646,7 @@ end;
   then decided where the next fetch began, and b13strw's concat, one
   instruction shorter under P294, ran 10% slower when it fell 4 bytes
   before the end of a 32-byte block on Zen 2. The failure starts with a
-  line label of the statement (rt_linetab and the debugger take the
+  line label of the statement (rt_pcline and the debugger take the
   greatest label at or below a pc), its text leaves FOut at ColdEnd for
   FCold, and ColdFlush places it after the routine's ret. A captured
   failure keeps no position in FOut past its own statement. Since P300
@@ -40575,8 +40683,10 @@ begin
     n := Length(FLineLabs);
     SetLength(FLineLabs, n + 1);
     SetLength(FLineNums, n + 1);
+    SetLength(FLineCold, n + 1);
     FLineLabs[n] := locn;
     FLineNums[n] := cl;
+    FLineCold[n] := True;
   end;
   { no frame (P296): the CFA is rsp's offset as the body left it, and an
     even count of pushes leaves rsp 8 off 16, which the failure's call
@@ -42780,7 +42890,7 @@ end;
 
 procedure TEmitter.EmitProcAt(const Pr: TProc);
 var
-  i, j, n, nargs, slot, parentN, own, nlim, k: SizeInt;
+  i, j, n, nargs, slot, parentN, own, nlim, k, pl0: SizeInt;
   pinUp: LongInt;
   savedAddr: array of string;
   ps, q: string;
@@ -43065,6 +43175,7 @@ begin
     Line('.globl ' + Pr.Sym);
   Line(Pr.Sym + ':');
   ck0 := FLen;
+  pl0 := Length(FLineLabs);
   ms0 := Length(FMapSites);
   FAsyncFrom := '';
   { a routine that calls nothing, every variable in a register and no
@@ -43275,6 +43386,8 @@ begin
   end;
   dend := Lab;
   Line(dend + ':');
+  { the routine's lines, for a failure's place (P572) }
+  LinesOut(Pr.Sym, Pr.Sym, Pr.Sym, dend, pl0);
   { the routine's code for rt_sigurg (P293): a signal may stop it at any
     instruction after its stack check (FAsyncFrom), the collector reading
     the frame it stopped in word by word; not a body with asm, whose text
@@ -48342,36 +48455,130 @@ begin
   Line('  call rt_rawwrite');
   Line('  leave');
   Line('  ret');
-  { The line of pc rdi: the entry with the greatest address not above
-    it. The table is in the order the code was written, which since the
-    routines sit in sections of their own (1.1.1) is not the order of
-    the addresses: the whole table is read. }
+  { The line of the code at pc rdi, in rax, 0 for none, and with a line
+    in rdx the name of its unit, its length in the byte before the
+    letters, 0 for a program's own code; rdx says nothing when there is
+    no line (P572, LinesOut). The records of paslines are in
+    the order of the code, so the routine is found by halving: the last
+    whose start is not above the pc, none when there is no record (the
+    two bounds are the driver's script's, both 0 without it). A pc at or past its end has no
+    line, so a table the linker left in another order can lose a line
+    and never give another routine's. Then the routine's table is read
+    whole: the label with the greatest offset not above the pc's gives
+    the line, the later of two at one offset; a step of line is
+    unfolded as Go unfolds a step of value (runtime/symtab.go, step).
+    MOVSXD reads the words that say how far (SDM vol. 2B,
+    MOVSX/MOVSXD: REX.W + 63 /r, a doubleword sign-extended to 64 bits,
+    no flag); rbx, r12 and r13 come back as they were. }
   Line('rt_pcline:');
-  Line('  leaq rt_linetab(%rip), %rsi');
-  Line('  xorq %rcx, %rcx');
-  Line('  xorq %rdx, %rdx');
+  Line('  movabsq $__start_paslines, %rsi');
+  Line('  movabsq $__stop_paslines, %rcx');
+  Line('  xorl %eax, %eax');
+  Line('  subq %rsi, %rcx');
+  Line('  shrq $4, %rcx');
+  Line('  xorl %r8d, %r8d');
+  Line('.pl_half:');
+  Line('  cmpq %rcx, %r8');
+  Line('  jae .pl_rec');
+  Line('  leaq (%r8,%rcx), %r9');
+  Line('  shrq $1, %r9');
+  Line('  movq %r9, %r10');
+  Line('  shlq $4, %r10');
+  Line('  addq %rsi, %r10');
+  Line('  movslq (%r10), %r11');
+  Line('  addq %r10, %r11');
+  Line('  cmpq %rdi, %r11');
+  Line('  ja .pl_below');
+  Line('  leaq 1(%r9), %r8');
+  Line('  jmp .pl_half');
+  Line('.pl_below:');
+  Line('  movq %r9, %rcx');
+  Line('  jmp .pl_half');
+  Line('.pl_rec:');
+  Line('  testq %r8, %r8');
+  Line('  jz .pl_ret');
+  Line('  decq %r8');
+  Line('  shlq $4, %r8');
+  Line('  addq %r8, %rsi');
+  Line('  movslq (%rsi), %r11');
+  Line('  addq %rsi, %r11');
+  Line('  subq %r11, %rdi');
+  Line('  movl 4(%rsi), %ecx');
+  Line('  cmpq %rcx, %rdi');
+  Line('  jae .pl_ret');
+  Line('  movslq 12(%rsi), %rdx');
+  Line('  testq %rdx, %rdx');
+  Line('  jz .pl_tab');
+  Line('  leaq 12(%rsi,%rdx), %rdx');
+  Line('.pl_tab:');
+  Line('  movslq 8(%rsi), %rcx');
+  Line('  leaq 8(%rsi,%rcx), %rsi');
+  Line('  pushq %rbx');
+  Line('  pushq %r12');
+  Line('  pushq %r13');
+  Line('  call .pl_num');
+  Line('  movq %r9, %r8');
+  Line('  xorl %ebx, %ebx');
+  Line('  xorl %r12d, %r12d');
+  Line('  xorl %r13d, %r13d');
   Line('.pl_scan:');
-  Line('  movq (%rsi), %rax');
-  Line('  testq %rax, %rax');
+  Line('  testq %r8, %r8');
   Line('  jz .pl_done');
-  Line('  cmpq %rdi, %rax');
-  Line('  ja .pl_next');
-  Line('  cmpq %rdx, %rax');
-  Line('  jb .pl_next');
-  Line('  movq %rax, %rdx');
-  Line('  movq 8(%rsi), %rcx');
-  Line('.pl_next:');
-  Line('  addq $16, %rsi');
+  Line('  decq %r8');
+  Line('  call .pl_num');
+  Line('  addq %r9, %rbx');
+  Line('  call .pl_num');
+  Line('  movq %r9, %r10');
+  Line('  shrq $1, %r9');
+  Line('  andl $1, %r10d');
+  Line('  negq %r10');
+  Line('  xorq %r10, %r9');
+  Line('  addq %r9, %r12');
+  Line('  cmpq %rdi, %rbx');
+  Line('  ja .pl_scan');
+  Line('  cmpq %r13, %rbx');
+  Line('  jb .pl_scan');
+  Line('  movq %rbx, %r13');
+  Line('  movq %r12, %rax');
   Line('  jmp .pl_scan');
   Line('.pl_done:');
-  Line('  movq %rcx, %rax');
+  Line('  popq %r13');
+  Line('  popq %r12');
+  Line('  popq %rbx');
+  Line('.pl_ret:');
   Line('  ret');
-  { No line for the pc (the runtime, or a unit): print the pc itself in
-    hex, as Go's signal report does, so a fault can still be placed. }
+  { The unsigned LEB128 at rsi in r9, rsi past it (DWARF 5, 7.6 and
+    figure C.3: seven bits a byte from the low end, the top bit of a
+    byte says another follows); rcx, r10 and r11 are lost. A number is
+    ten bytes at most, the two's complement of a step back, so a byte
+    is shifted by 63 at most, which SHL takes whole (SDM vol. 2B,
+    SAL/SAR/SHL/SHR: the count is masked to 6 bits with a 64-bit
+    operand), the bits past the 64th falling off. }
+  Line('.pl_num:');
+  Line('  xorl %r9d, %r9d');
+  Line('  xorl %ecx, %ecx');
+  Line('.pl_n1:');
+  Line('  movzbl (%rsi), %r10d');
+  Line('  incq %rsi');
+  Line('  movl %r10d, %r11d');
+  Line('  andl $127, %r11d');
+  Line('  shlq %cl, %r11');
+  Line('  orq %r11, %r9');
+  Line('  addl $7, %ecx');
+  Line('  testl $128, %r10d');
+  Line('  jnz .pl_n1');
+  Line('  ret');
+  { Where pc rdi is, as a fatal line ends: at line N, at line N of unit
+    U for a unit's code (P572), or the pc itself in hex for code with no
+    line (the runtime's), as Go's signal report does, so a fault can
+    still be placed; nothing for no pc. The unit's name waits on the
+    stack, which stays on 16 bytes at each call as before. }
   Line('rt_fatalline:');
   Line('  pushq %rbx');
+  Line('  subq $16, %rsp');
   Line('  movq %rdi, %rbx');
   Line('  call rt_pcline');
+  Line('  movq %rdx, (%rsp)');
   Line('  testq %rax, %rax');
   Line('  jnz .fl_line');
   Line('  testq %rbx, %rbx');
@@ -48391,7 +48598,17 @@ begin
   Line('  movq %rbx, %rdi');
   Line('  movq $10, %rsi');
   Line('  call rt_fatalnum');
+  Line('  movq (%rsp), %rbx');
+  Line('  testq %rbx, %rbx');
+  Line('  jz .fl_none');
+  Line('  leaq .Lofunit(%rip), %rsi');
+  Line('  movq $' + IntToStr(Length(MsgOfUnit)) + ', %rdx');
+  Line('  call rt_rawwrite');
+  Line('  movzbl (%rbx), %edx');
+  Line('  leaq 1(%rbx), %rsi');
+  Line('  call rt_rawwrite');
   Line('.fl_none:');
+  Line('  addq $16, %rsp');
   Line('  popq %rbx');
   Line('  ret');
   Line('rt_diemsg:');
@@ -53963,7 +54180,7 @@ end;
 
 function TEmitter.Emit(const Prog: TProgram): string;
 var
-  i, j, k, mi, mb0, ph, ps: SizeInt;
+  i, j, k, mi, mb0, ph, ps, pl0: SizeInt;
   sz, rp, slot: LongInt;
   big: Int64;
   sruns: TInt64Arr;
@@ -54102,6 +54319,13 @@ begin
   FCurLine := 0;
   FLineLabs := nil;
   FLineNums := nil;
+  FLineCold := nil;
+  FPlOut := nil;
+  FPlOutN := 0;
+  FPlN := 0;
+  FPlUnit := '';
+  if Prog.IsUnit then
+    FPlUnit := Copy(Prog.Name, 1, 255);
   FOwnNames := nil;
   FOwnEnds := nil;
   FOwnPas := nil;
@@ -54254,20 +54478,29 @@ begin
       SetFrame(FFrameSym, 0);
     end;
   end;
+  { the main block's lines, up to where the runtime's code starts, which
+    has none (P572) }
+  if not Prog.IsUnit then
+    LinesOut('.text', '.Ltext0', 'pas_main', '.Lprogend', 0);
   for j := 0 to 8 do
     for i := 0 to High(Prog.Procs) do
       if (Prog.Procs[i].Nest = j) and (not Prog.Procs[i].IsExt) and
         (Prog.Procs[i].Body <> nil) then
         EmitProc(Prog.Procs[i]);
   if Prog.IsUnit then
+  begin
+    pl0 := Length(FLineLabs);
     EmitUnitLife(Prog);
+    { the lines of the unit's initialization and finalization (P572) }
+    LinesOut('.text', '.Ltext0', 'u_' + ToLower(Prog.Name) + '_init', '.Lcodeend', pl0);
+  end;
   { the runtime is the command line's processor's (P261) }
   FCpuSet := FProgCpu;
   FTune := FProgTune;
   if not Prog.IsUnit then
   begin
-    { Every pc from here on is the runtime: the line table ends with this
-      label and line 0, so a fault there reports no line (P86). }
+    { Every pc from here on is the runtime: the main block's lines end
+      at this label, so a fault there reports no line (P86, P572). }
     Line('.Lprogend:');
     if FArm then
       EmitRuntimeArm
@@ -54293,6 +54526,8 @@ begin
     Line('.weak __stop_pasgcmaps');
     Line('.weak __start_pasasync');
     Line('.weak __stop_pasasync');
+    Line('.weak __start_paslines');
+    Line('.weak __stop_paslines');
     Line('.weak __stop_pasgcroots');
     { Go's size classes (internal/runtime/gc/sizeclasses.go), P95a. }
     Line('.balign 8');
@@ -54612,6 +54847,8 @@ begin
     Line('  .ascii "' + MsgBus + '"');
     Line('.Latline:');
     Line('  .ascii "' + MsgAtLine + '"');
+    Line('.Lofunit:');
+    Line('  .ascii "' + MsgOfUnit + '"');
     Line('.Latpc:');
     Line('  .ascii "' + MsgAtPc + '"');
     Line('.Laddr:');
@@ -55085,21 +55322,6 @@ begin
           end;
       end;
     end;
-  if not Prog.IsUnit then
-  begin
-    Line('.section .rodata');
-    Line('.balign 8');
-    Line('rt_linetab:');
-    for i := 0 to High(FLineLabs) do
-    begin
-      Line('  .quad ' + FLineLabs[i]);
-      Line('  .quad ' + IntToStr(FLineNums[i]));
-    end;
-    Line('  .quad .Lprogend');
-    Line('  .quad 0');
-    Line('  .quad 0');
-    Line('  .quad 0');
-  end;
   Line('');
   Line('.bss');
   if Prog.IsUnit then
@@ -55406,6 +55628,20 @@ begin
       Line('.balign 8');
       Line('.Lgd' + IntToStr(i) + ':');
       Line(FDescOut[i]);
+    end;
+  end;
+  { The lines of the code (P572, LinesOut): the records, the tables and,
+    for a unit, its name, which every record of it points at. }
+  if FPlOutN > 0 then
+  begin
+    for i := 0 to FPlOutN - 1 do
+      Line(FPlOut[i]);
+    if FPlUnit <> '' then
+    begin
+      RoSec('plunit');
+      Line('.Lplunit:');
+      Line('  .byte ' + IntToStr(Length(FPlUnit)));
+      Line('  .ascii "' + GasEscape(FPlUnit) + '"');
     end;
   end;
   { the constant sets of 32 bytes (P126), aligned for a vector load }
@@ -59149,30 +59385,105 @@ begin
   Line('  mov sp, x29');
   Line('  ldp x29, x30, [sp], #16');
   Line('  ret');
+  { The line of the code at pc x0, in x0, 0 for none, and with a line
+    in x1 the name of its unit, 0 for a program's own code, as on amd64
+    (P572).
+    LDRSW reads the words that say how far (ARM DDI 0487 M.c C6.2.228:
+    a word sign-extended to 64 bits, its offset a multiple of 4); x2 to
+    x7 and x9 to x15 are lost, x15 keeping the link over the calls of
+    .pl_num. EOR takes its second register shifted (C6.2.156, EOR
+    (shifted register)): the step of line unfolded in three. }
   Line('rt_pcline:');
-  Line('  mov x1, x0');
-  LeaS('rt_linetab', 'x2');
+  Line('  mov x9, x0');
   Line('  mov x0, xzr');
+  LeaS('__start_paslines', 'x2');
+  LeaS('__stop_paslines', 'x3');
+  Line('  sub x3, x3, x2');
+  Line('  lsr x3, x3, #4');
   Line('  mov x4, xzr');
+  Line('.pl_half:');
+  Line('  cmp x4, x3');
+  Line('  b.hs .pl_rec');
+  Line('  add x5, x4, x3');
+  Line('  lsr x5, x5, #1');
+  Line('  add x6, x2, x5, lsl #4');
+  Line('  ldrsw x7, [x6]');
+  Line('  add x7, x7, x6');
+  Line('  cmp x7, x9');
+  Line('  b.hi .pl_below');
+  Line('  add x4, x5, #1');
+  Line('  b .pl_half');
+  Line('.pl_below:');
+  Line('  mov x3, x5');
+  Line('  b .pl_half');
+  Line('.pl_rec:');
+  Line('  cbz x4, .pl_ret');
+  Line('  sub x4, x4, #1');
+  Line('  add x2, x2, x4, lsl #4');
+  Line('  ldrsw x7, [x2]');
+  Line('  add x7, x7, x2');
+  Line('  sub x9, x9, x7');
+  Line('  ldr w3, [x2, #4]');
+  Line('  cmp x9, x3');
+  Line('  b.hs .pl_ret');
+  Line('  ldrsw x1, [x2, #12]');
+  Line('  cbz x1, .pl_tab');
+  Line('  add x1, x1, x2');
+  Line('  add x1, x1, #12');
+  Line('.pl_tab:');
+  Line('  ldrsw x3, [x2, #8]');
+  Line('  add x2, x2, x3');
+  Line('  add x2, x2, #8');
+  Line('  mov x15, x30');
+  Line('  bl .pl_num');
+  Line('  mov x4, x10');
+  Line('  mov x5, xzr');
+  Line('  mov x6, xzr');
+  Line('  mov x7, xzr');
   Line('.pl_scan:');
-  Line('  ldr x3, [x2]');
-  Line('  cbz x3, .pl_done');
-  Line('  cmp x3, x1');
-  Line('  b.hi .pl_next');
-  Line('  cmp x3, x4');
-  Line('  b.lo .pl_next');
-  Line('  mov x4, x3');
-  Line('  ldr x0, [x2, #8]');
-  Line('.pl_next:');
-  Line('  add x2, x2, #16');
+  Line('  cbz x4, .pl_done');
+  Line('  sub x4, x4, #1');
+  Line('  bl .pl_num');
+  Line('  add x5, x5, x10');
+  Line('  bl .pl_num');
+  Line('  and x11, x10, #1');
+  Line('  neg x11, x11');
+  Line('  eor x10, x11, x10, lsr #1');
+  Line('  add x6, x6, x10');
+  Line('  cmp x5, x9');
+  Line('  b.hi .pl_scan');
+  Line('  cmp x5, x7');
+  Line('  b.lo .pl_scan');
+  Line('  mov x7, x5');
+  Line('  mov x0, x6');
   Line('  b .pl_scan');
   Line('.pl_done:');
+  Line('  mov x30, x15');
+  Line('.pl_ret:');
   Line('  ret');
+  { The unsigned LEB128 at x2 in x10, x2 past it, as on amd64; x11, x12
+    and x13 are lost. LSLV shifts by its count modulo 64 (C6.2.271),
+    and a byte of the ten is shifted by 63 at most. }
+  Line('.pl_num:');
+  Line('  mov x10, xzr');
+  Line('  mov x11, xzr');
+  Line('.pl_n1:');
+  Line('  ldrb w12, [x2], #1');
+  Line('  and x13, x12, #127');
+  Line('  lsl x13, x13, x11');
+  Line('  orr x10, x10, x13');
+  Line('  add x11, x11, #7');
+  Line('  tbnz w12, #7, .pl_n1');
+  Line('  ret');
+  { where pc x0 is, as on amd64: the unit's name waits in the second
+    word of the pair that keeps x19 (STP takes the zero register as a
+    source, ARM DDI 0487 M.c C6.2.414) }
   Line('rt_fatalline:');
   Line('  stp x29, x30, [sp, #-16]!');
-  Line('  str x19, [sp, #-16]!');
+  Line('  stp x19, xzr, [sp, #-16]!');
   Line('  mov x19, x0');
   Line('  bl rt_pcline');
+  Line('  str x1, [sp, #8]');
   Line('  cbnz x0, .fl_line');
   Line('  cbz x19, .fl_none');
   LeaS('.Latpc', 'x1');
@@ -59190,6 +59501,14 @@ begin
   Line('  mov x0, x19');
   Line('  mov x1, #10');
   Line('  bl rt_fatalnum');
+  Line('  ldr x19, [sp, #8]');
+  Line('  cbz x19, .fl_none');
+  LeaS('.Lofunit', 'x1');
+  Line('  mov x2, #' + IntToStr(Length(MsgOfUnit)));
+  Line('  bl rt_rawwrite');
+  Line('  ldrb w2, [x19]');
+  Line('  add x1, x19, #1');
+  Line('  bl rt_rawwrite');
   Line('.fl_none:');
   Line('  ldr x19, [sp], #16');
   Line('  ldp x29, x30, [sp], #16');

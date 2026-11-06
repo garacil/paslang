@@ -3486,6 +3486,49 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'inherited Area: TMid.Area is abstract, it has no body to call at 24:' $(BUILDDIR)/classbad_inhabstractmid.err; \
 	echo ok inhabstract
 	@set -e; \
+	: P572: a failure inside a unit names its line and the unit, taken as an exception or ending the program, from a routine, a method, a nested routine, a loop, a routine put in line, a second unit, a pasroutine and a finalization, with and without inlining and on both machines, each routine with a table of its own that goes when the routine does, the tables give the lines of the assembler, and the runtime asked about every address of them answers as they say; \
+	for v in "" "-cpu base -inline 0"; do \
+	  $(OUTDIR)/paslangc $$v testdata/units/placev.paslang; \
+	  $(OUTDIR)/paslangc $$v testdata/units/placeu.paslang; \
+	  test $$(grep -c '^[.]section paslines[.]' $(BUILDDIR)/placeu.s) -ge 9; \
+	  test $$(grep -c '^[.]section [.]rodata[.]pl[0-9][0-9]*,' $(BUILDDIR)/placeu.s) -eq $$(grep -c '^[.]section paslines[.]' $(BUILDDIR)/placeu.s); \
+	  $(OUTDIR)/paslangc $$v -Fu $(BUILDDIR) -o $(BUILDDIR)/placeuse testdata/units/placeuse.paslang; \
+	  timeout 60 $(BUILDDIR)/placeuse > $(BUILDDIR)/placeuse.got; \
+	  diff -u testdata/units/placeuse.out $(BUILDDIR)/placeuse.got; \
+	  for t in placedie placenil placefin placeun; do \
+	    $(OUTDIR)/paslangc $$v -Fu $(BUILDDIR) -o $(BUILDDIR)/$$t testdata/units/$$t.paslang; \
+	    set +e; timeout 60 $(BUILDDIR)/$$t > $(BUILDDIR)/$$t.got 2> $(BUILDDIR)/$$t.err; rc=$$?; set -e; \
+	    test $$rc -eq 1; \
+	    if [ $$t = placeun ]; then diff -u testdata/units/placeun.out $(BUILDDIR)/$$t.got; else diff -u testdata/fatal/expected.out $(BUILDDIR)/$$t.got; fi; \
+	  done; \
+	  grep -q '^paslang: index 9 out of range \[0..2\] at line 29 of unit PlaceV$$' $(BUILDDIR)/placedie.err; \
+	  grep -q '^paslang: nil pointer dereference at line 34 of unit PlaceV$$' $(BUILDDIR)/placenil.err; \
+	  grep -q '^paslang: integer divide by zero at line 39 of unit PlaceV$$' $(BUILDDIR)/placefin.err; \
+	  grep -q '^paslang: index 11 out of range \[0..2\] at line 46 of unit PlaceU$$' $(BUILDDIR)/placeun.err; \
+	  python3 -I scripts/check_paslines.py $(BUILDDIR)/placeuse $(BUILDDIR)/placedie $(BUILDDIR)/placenil $(BUILDDIR)/placefin $(BUILDDIR)/placeun; \
+	  $(OUTDIR)/paslangc $$v -Fu $(BUILDDIR) -o $(BUILDDIR)/placeask testdata/units/placeask.paslang; \
+	  python3 -I scripts/check_paslines.py --ask $(BUILDDIR)/placeask; \
+	done; \
+	$(OUTDIR)/paslangc -target arm64 testdata/units/placev.paslang; \
+	$(OUTDIR)/paslangc -target arm64 testdata/units/placeu.paslang; \
+	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/placeuse-arm testdata/units/placeuse.paslang; \
+	timeout 120 $(QEMU_A64) $(BUILDDIR)/placeuse-arm > $(BUILDDIR)/placeuse-arm.got; \
+	diff -u testdata/units/placeuse.out $(BUILDDIR)/placeuse-arm.got; \
+	for t in placedie placenil placefin placeun; do \
+	  $(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/$$t-arm testdata/units/$$t.paslang; \
+	  set +e; timeout 120 $(QEMU_A64) $(BUILDDIR)/$$t-arm > $(BUILDDIR)/$$t-arm.got 2> $(BUILDDIR)/$$t-arm.err; rc=$$?; set -e; \
+	  test $$rc -eq 1; \
+	  if [ $$t = placeun ]; then diff -u testdata/units/placeun.out $(BUILDDIR)/$$t-arm.got; else diff -u testdata/fatal/expected.out $(BUILDDIR)/$$t-arm.got; fi; \
+	done; \
+	grep -q '^paslang: index 9 out of range \[0..2\] at line 29 of unit PlaceV$$' $(BUILDDIR)/placedie-arm.err; \
+	grep -q '^paslang: nil pointer dereference at line 34 of unit PlaceV$$' $(BUILDDIR)/placenil-arm.err; \
+	grep -q '^paslang: integer divide by zero at line 39 of unit PlaceV$$' $(BUILDDIR)/placefin-arm.err; \
+	grep -q '^paslang: index 11 out of range \[0..2\] at line 46 of unit PlaceU$$' $(BUILDDIR)/placeun-arm.err; \
+	python3 -I scripts/check_paslines.py $(BUILDDIR)/placeuse-arm $(BUILDDIR)/placedie-arm $(BUILDDIR)/placenil-arm $(BUILDDIR)/placefin-arm $(BUILDDIR)/placeun-arm; \
+	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/placeask-arm testdata/units/placeask.paslang; \
+	python3 -I scripts/check_paslines.py --ask $(BUILDDIR)/placeask-arm $(QEMU_A64); \
+	echo ok placeuse
+	@set -e; \
 	: P573: Shutdown wakes the acceptors of httpserver through the poller and testdata/httpstop stops servers on a Unix socket with its file there and with it removed and on TCP and on both and by SIGTERM and scripts/httpstop_check.py plays the part of systemd with a socket it keeps which must still listen after the server stops and looks at what an idle server and one out of descriptors cost on both machines; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/httpstop testdata/httpstop.paslang; \
 	timeout 60 $(BUILDDIR)/httpstop > $(BUILDDIR)/httpstop.got; \
@@ -4282,6 +4325,9 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	: the stack maps and the table of stops of every golden program and of the compiler in the order of their code as linked, as the Go linker writes its function table, P388; \
 	python3 -I scripts/check_maporder.py $(foreach t,$(GOLDEN),$(BUILDDIR)/$(t)) $(OUTDIR)/paslangc; \
 	echo ok map-order; \
+	: the lines of every golden program and of the compiler, read as the runtime reads them, are those of the line table the assembler wrote, P572; \
+	python3 -I scripts/check_paslines.py $(foreach t,$(GOLDEN),$(BUILDDIR)/$(t)) $(OUTDIR)/paslangc; \
+	echo ok line-tables; \
 	: a sleeping routine takes its record and first stack, P342; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/sleepers testdata/sleepers.paslang; \
 	python3 -I scripts/check_routinemem.py $(BUILDDIR)/sleepers --limit=1440; \
@@ -5410,6 +5456,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  echo ok servers-$$t; \
 	done; \
 	python3 -I scripts/check_maporder.py $$(ls $(BUILDDIR)/ex_* | grep -v '[.][a-z]*$$'); \
+	python3 -I scripts/check_paslines.py $$(ls $(BUILDDIR)/ex_* | grep -v '[.][a-z]*$$'); \
 	echo ok examples; \
 	echo "==== intel64 ===="; \
 	$(OUTDIR)/paslangc -target intel64 -o $(BUILDDIR)/hello-i64 testdata/hello.paslang; \
@@ -6020,6 +6067,9 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	: the same order in every golden program of arm64, P388; \
 	python3 -I scripts/check_maporder.py $(foreach t,$(GOLDEN_A64),$(BUILDDIR)/$(t)-arm); \
 	echo ok map-order-arm; \
+	: and their lines, P572; \
+	python3 -I scripts/check_paslines.py $(foreach t,$(GOLDEN_A64),$(BUILDDIR)/$(t)-arm); \
+	echo ok line-tables-arm; \
 	: P342 on arm64: a sleeping routine takes its record and first stack; \
 	$(OUTDIR)/paslangc -target arm64 -cpu max -Fu $(A64DIR) -o $(BUILDDIR)/sleepers-arm testdata/sleepers.paslang; \
 	python3 -I scripts/check_routinemem.py $(BUILDDIR)/sleepers-arm --limit=2560 --qemu=$(QEMU_A64); \
@@ -6415,6 +6465,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	timeout 60 $(QEMU_A64) $(BUILDDIR)/ex_usegeom-arm > $(BUILDDIR)/ex_usegeom-arm.got; \
 	diff -u examples/units/usegeom.out $(BUILDDIR)/ex_usegeom-arm.got; \
 	python3 -I scripts/check_maporder.py $$(ls $(BUILDDIR)/ex_*-arm); \
+	python3 -I scripts/check_paslines.py $$(ls $(BUILDDIR)/ex_*-arm); \
 	echo ok examples-arm; \
 	echo "==== compiler arch ===="; \
 	file $(OUTDIR)/paslangc | grep -q 'x86-64'; \
