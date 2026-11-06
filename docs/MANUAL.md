@@ -12849,6 +12849,64 @@ u: TUrl;  UrlParse('http://u:p@h:81/a%20b?q=1#f', u, err);  UrlString(u);  UrlRe
   guarded); a response, a reader and a `TUrlValues` belong to the routine
   that uses them.
 
+`uses pashtml` reads HTML as the HTML Standard of the WHATWG tokenizes it
+(1.2.373, P565), for the mail that comes as HTML and the pages a program
+scrapes: no tree is built, a program reads the tokens itself.
+- **The tokenizer.** `t := THtmlTokenizer.Create(text)` then `while t.Next do`:
+  `Kind` is `hkText`, `hkStartTag`, `hkEndTag`, `hkComment` or `hkDoctype`;
+  `Name` the tag's name in lower case (or the doctype's); `Data` the text with
+  its character references decoded, the comment's data or what follows the
+  doctype's name; `Attrs[i].Name` and `.Value` (names in lower case, values
+  decoded as in an attribute, a repeated name keeping its first value;
+  `Attr(name)`, `HasAttr(name)`, `AttrCount`); `SelfClosing` for `<br/>`;
+  `Start` and `Stop` the token's bytes in `Source`, the text with its line
+  ends normalized (CR LF and CR become LF, as the standard's input stream).
+  The states of 13.2.5 are followed: `<3` and `< a` are text, `</>` is
+  nothing, `</3>` and `<!ELEMENT ...>` and `<?xml ...?>` and `<![CDATA[`
+  are bogus comments to the first `>`, a comment ends at `-->` or `--!>`
+  (`<!-->` and `<!--->` are empty), a doctype at the first `>`, a tag the
+  text ends inside is dropped; the contents of `script`, `style`, `xmp`,
+  `iframe`, `noembed` and `noframes` are raw text and those of `title` and
+  `textarea` escapable raw text, both ending at their own end tag only
+  (`</script foo>`, `</SCRIPT >` end it; `</scri` does not), `plaintext`
+  runs to the end; a U+0000 is dropped in text and U+FFFD elsewhere.
+- **References.** `HtmlUnescape(s)` decodes as in text: the 2231 names of
+  the standard with their semicolon (`&nLt;` and `&fjlig;` give two code
+  points), the 106 legacy names without it by the longest match (`&notit;`
+  is `¬it;`, `&copy2` is `©2`, `&ampx;` is `&x;`), decimal and hex numbers
+  with or without the semicolon (`&#65`, `&#x41g` is `Ag`; 0, surrogates
+  and what is past U+10FFFF become U+FFFD; `&#x80;` to `&#x9F;` the
+  characters Windows-1252 has there; other control characters and
+  noncharacters stay, where Python drops them); `&#`, `&#x` with no digit
+  and an ampersand that starts no reference stay. `HtmlUnescapeAttr(s)`
+  decodes as inside an attribute value: a legacy name without its semicolon
+  stays when `=`, a letter or a digit follows it (`&copy=x`, `&notit;`),
+  and there is no prefix match. `HtmlEscape(s)` writes `& < > " '` as
+  `&amp; &lt; &gt; &#34; &#39;`, Go's `html.EscapeString`. The table is
+  written by `scripts/gen_htmlent.py` from the list Python ships
+  (`html.entities.html5`, the standard's), which make check compares it
+  with; Go's table lacks `&nLt;` and `&nGt;`, which its in-place decoder
+  cannot hold.
+- **The text.** `HtmlToText(s)` is what a reader shows: references decoded;
+  `br` and the block elements (`div`, `tr`, `li`, `dd`, `dt`, `section`,
+  `article`, `header`, `footer`, `nav`, `aside`, `main`, `form`, `fieldset`,
+  `address`, `figure`, `details`, `center`, `tbody`, `thead`, `tfoot`,
+  `caption`, `option`, `dl` and the like) as line breaks, a blank line
+  around `p`, the headings, `table`, `ul`, `ol`, `blockquote`, `pre` and
+  `hr`, never two; a tab between the cells of a row; the contents of
+  `script`, `style`, `head` and `template` dropped; white space runs made
+  one space and lines trimmed outside `pre`, a no-break space a space; the
+  line feed after `<pre>` or `<textarea>` dropped; no line break at either
+  end. `testdata/htmltok` runs the 222 cases of `testdata/htmltok.txt`
+  (the standard's own examples, Go's vectors, every state, Outlook's
+  conditional comments) and `scripts/html_oracle.py` works them out again
+  with Python's `html.parser` and `html.unescape` where the two agree by
+  design (193 of them; the other 16 are the standard's alone: a reference to
+  a control character, a tag the text ends inside, `plaintext`, a U+0000 in
+  a tag).
+- **Routines.** A tokenizer belongs to the routine that reads it; the
+  functions keep no state.
+
 `uses pasmime`, `uses passmtp` and `uses pasimap` are mail (1.1.267, P433): `pasmime`
 reads and writes Internet messages as Go's `mime`, `mime/multipart`, `mime/quotedprintable`
 and `net/mail` do (quoted-printable, encoded words, media types with RFC 2231 parameters,

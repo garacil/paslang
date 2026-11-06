@@ -741,6 +741,9 @@ GOLDEN_A64 += xlsxdate
 # P562: Windows-1252 there and back, and UTF-8 told from what is not, against Python's codecs.
 GOLDEN += codec1252
 GOLDEN_A64 += codec1252
+# P565: the HTML tokenizer, the character references and HtmlToText against Python's html.parser.
+GOLDEN += htmltok
+GOLDEN_A64 += htmltok
 # P432: URLs and HTTP messages against Go, and the HTTP client over loopback.
 GOLDEN += url httpmsg httpcli
 GOLDEN_A64 += url httpmsg httpcli
@@ -865,6 +868,7 @@ LIB_UNITS := \
 	src/lib/pasx11.paslang \
 	src/rtl/sysutils.paslang \
 	src/lib/passystemd.paslang \
+	src/lib/pashtml.paslang \
 	src/lib/argon2.paslang \
 	src/lib/pascipher.paslang \
 	src/lib/pasx25519.paslang \
@@ -3389,6 +3393,14 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/codec1252.out $(BUILDDIR)/codec1252.got; \
 	python3 -I scripts/cp1252_check.py $(BUILDDIR)/codec1252.got; \
 	echo ok codec1252
+	@set -e; \
+	: P565: pashtml tokenizes as the HTML Standard says and testdata/htmltok prints the tokens the text and the decoded references of every case of testdata/htmltok.txt and scripts/html_oracle.py works them out again with the html.parser and html.unescape of Python where the two agree by design and scripts/gen_htmlent.py checks the table of named references against the list Python ships; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/htmltok testdata/htmltok.paslang; \
+	$(BUILDDIR)/htmltok > $(BUILDDIR)/htmltok.got; \
+	diff -u testdata/htmltok.out $(BUILDDIR)/htmltok.got; \
+	python3 -I scripts/html_oracle.py $(BUILDDIR)/htmltok.got; \
+	python3 -I scripts/gen_htmlent.py --check src/lib/pashtml.paslang; \
+	echo ok htmltok
 	@set -e; \
 	: the kept scripts of testdata/sqllogic are what scripts/gen_sqllogic.py writes while the system SQLite is the one that made them, P412; \
 	python3 -I scripts/gen_sqllogic.py --check

@@ -1,0 +1,1545 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+
+  paslang is free software: you can redistribute it and/or modify it
+  under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+
+  paslang is distributed in the hope that it will be useful, but
+  WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+  General Public License for more details.
+
+  Under Section 7 of GPL version 3, you are granted additional
+  permissions described in the paslang Runtime Library Exception,
+  version 1.0, in the file COPYING.RUNTIME.
+
+  You should have received a copy of the GNU General Public License
+  along with paslang.  If not, see <https://www.gnu.org/licenses/>. }
+
+{ HTML as the HTML Standard of the WHATWG tokenizes it (P565): a tokenizer
+  that gives start tags with their attributes decoded, end tags, text with
+  its character references decoded, comments and the doctype, one at a
+  time, with the elements whose content is raw text (script, style, xmp,
+  iframe, noembed, noframes), escapable raw text (title, textarea) and
+  plain text (plaintext) read as the standard says; the character
+  references of the standard, all 2231 names (the 106 legacy ones without
+  their semicolon too, matched by the longest prefix in text and left alone
+  before = or a letter in an attribute, as 13.2.5.78 says), and the numeric
+  ones with the replacements of 0x80 to 0x9F; HtmlEscape as Go's
+  html.EscapeString; and HtmlToText, the text a reader shows: tags gone,
+  the block elements and br as line breaks, a tab between cells, the
+  contents of script, style, head and template dropped, white space
+  collapsed outside pre. No tree is built: a program that wants a DOM reads
+  the tokens itself. Free of state (Regla 11); a tokenizer belongs to the
+  routine that reads it. }
+unit pashtml;
+
+interface
+
+uses
+  sysutils;
+
+type
+  THtmlKind = (hkText, hkStartTag, hkEndTag, hkComment, hkDoctype);
+
+  THtmlAttr = record
+    Name: string;
+    Value: string;
+  end;
+
+  { The tokenizer. Create it on the text (its line ends are normalized as
+    the standard's input stream is: CR LF and CR become LF), then Next until
+    it says False; after each True the fields say what the token is. }
+  THtmlTokenizer = class
+  private
+    FText: string;
+    FPos: Integer;
+    FRaw: Integer;
+    FRawName: string;
+    procedure SetText(const Value: string);
+    procedure ReadAttributes(Keep: Boolean);
+    function ReadTag: Boolean;
+    function ReadMarkupDeclaration: Boolean;
+    procedure BogusComment(From: Integer);
+    function RawTextToken: Boolean;
+    function TextRun: Boolean;
+  public
+    { what the last Next gave }
+    Kind: THtmlKind;
+    { the tag's name in lower case, or the doctype's; '' for text and comments }
+    Name: string;
+    { the text with its references decoded, the comment's data, or what
+      follows the doctype's name }
+    Data: string;
+    { a start tag written <br/> }
+    SelfClosing: Boolean;
+    { the attributes in order, names in lower case, values decoded; a
+      repeated name keeps its first value }
+    Attrs: array of THtmlAttr;
+    { the token's bytes in Source, from Start to Stop - 1 }
+    Start, Stop: Integer;
+    constructor Create(const AText: string);
+    function Next: Boolean;
+    function AttrCount: Integer;
+    { the value of the attribute, '' when it is not there; HasAttr tells the two apart }
+    function Attr(const AName: string): string;
+    function HasAttr(const AName: string): Boolean;
+    { the text as the tokenizer reads it, line ends normalized }
+    property Source: string read FText;
+  end;
+
+{ The character references of S decoded as in text (13.2.5.72 to 13.2.5.80):
+  a named reference with its semicolon, a legacy name without it by the
+  longest match (&notit; is ¬it;), a numeric one in decimal or hex with or
+  without the semicolon (0 and what is past U+10FFFF or a surrogate become
+  U+FFFD, 0x80 to 0x9F the characters Windows-1252 has there); an ampersand
+  that starts no reference stays. HtmlUnescapeAttr decodes as inside an
+  attribute value: a legacy name without its semicolon is left alone when =
+  or a letter or digit follows it, and there is no prefix match. }
+function HtmlUnescape(const S: string): string;
+function HtmlUnescapeAttr(const S: string): string;
+{ & < > " ' written &amp; &lt; &gt; &#34; &#39;, as Go's html.EscapeString }
+function HtmlEscape(const S: string): string;
+{ The text a reader shows for the HTML S: the references decoded; br and the
+  block elements (p, div, tr, li, headings, table, ul, ol, pre, blockquote,
+  hr, address, section and the rest) as line breaks, a blank line around
+  paragraphs, headings, tables and lists, never more than one; a tab between
+  the cells of a row; the contents of script, style, head and template
+  dropped; white space runs made one space and lines trimmed outside pre, a
+  no-break space a space; the line feed that follows <pre> or <textarea>
+  dropped. No line break at the start or the end. }
+function HtmlToText(const S: string): string;
+{ the input stream's normalization: CR LF and CR become LF }
+function HtmlNormalizeNewlines(const S: string): string;
+
+implementation
+
+{ ---- entities: written by scripts/gen_htmlent.py ---- }
+const
+  HtmlEntCount = 2231;
+  { the names in byte order, each with its semicolon; the 106 legacy names come without it too }
+  HtmlEntName: array[0..2230] of string = ('AElig', 'AElig;', 'AMP', 'AMP;', 'Aacute', 'Aacute;', 'Abreve;',
+    'Acirc', 'Acirc;', 'Acy;', 'Afr;', 'Agrave', 'Agrave;', 'Alpha;', 'Amacr;', 'And;', 'Aogon;', 'Aopf;',
+    'ApplyFunction;', 'Aring', 'Aring;', 'Ascr;', 'Assign;', 'Atilde', 'Atilde;', 'Auml', 'Auml;', 'Backslash;',
+    'Barv;', 'Barwed;', 'Bcy;', 'Because;', 'Bernoullis;', 'Beta;', 'Bfr;', 'Bopf;', 'Breve;', 'Bscr;', 'Bumpeq;',
+    'CHcy;', 'COPY', 'COPY;', 'Cacute;', 'Cap;', 'CapitalDifferentialD;', 'Cayleys;', 'Ccaron;', 'Ccedil',
+    'Ccedil;', 'Ccirc;', 'Cconint;', 'Cdot;', 'Cedilla;', 'CenterDot;', 'Cfr;', 'Chi;', 'CircleDot;',
+    'CircleMinus;', 'CirclePlus;', 'CircleTimes;', 'ClockwiseContourIntegral;', 'CloseCurlyDoubleQuote;',
+    'CloseCurlyQuote;', 'Colon;', 'Colone;', 'Congruent;', 'Conint;', 'ContourIntegral;', 'Copf;', 'Coproduct;',
+    'CounterClockwiseContourIntegral;', 'Cross;', 'Cscr;', 'Cup;', 'CupCap;', 'DD;', 'DDotrahd;', 'DJcy;', 'DScy;',
+    'DZcy;', 'Dagger;', 'Darr;', 'Dashv;', 'Dcaron;', 'Dcy;', 'Del;', 'Delta;', 'Dfr;', 'DiacriticalAcute;',
+    'DiacriticalDot;', 'DiacriticalDoubleAcute;', 'DiacriticalGrave;', 'DiacriticalTilde;', 'Diamond;',
+    'DifferentialD;', 'Dopf;', 'Dot;', 'DotDot;', 'DotEqual;', 'DoubleContourIntegral;', 'DoubleDot;',
+    'DoubleDownArrow;', 'DoubleLeftArrow;', 'DoubleLeftRightArrow;', 'DoubleLeftTee;', 'DoubleLongLeftArrow;',
+    'DoubleLongLeftRightArrow;', 'DoubleLongRightArrow;', 'DoubleRightArrow;', 'DoubleRightTee;', 'DoubleUpArrow;',
+    'DoubleUpDownArrow;', 'DoubleVerticalBar;', 'DownArrow;', 'DownArrowBar;', 'DownArrowUpArrow;', 'DownBreve;',
+    'DownLeftRightVector;', 'DownLeftTeeVector;', 'DownLeftVector;', 'DownLeftVectorBar;', 'DownRightTeeVector;',
+    'DownRightVector;', 'DownRightVectorBar;', 'DownTee;', 'DownTeeArrow;', 'Downarrow;', 'Dscr;', 'Dstrok;',
+    'ENG;', 'ETH', 'ETH;', 'Eacute', 'Eacute;', 'Ecaron;', 'Ecirc', 'Ecirc;', 'Ecy;', 'Edot;', 'Efr;', 'Egrave',
+    'Egrave;', 'Element;', 'Emacr;', 'EmptySmallSquare;', 'EmptyVerySmallSquare;', 'Eogon;', 'Eopf;', 'Epsilon;',
+    'Equal;', 'EqualTilde;', 'Equilibrium;', 'Escr;', 'Esim;', 'Eta;', 'Euml', 'Euml;', 'Exists;', 'ExponentialE;',
+    'Fcy;', 'Ffr;', 'FilledSmallSquare;', 'FilledVerySmallSquare;', 'Fopf;', 'ForAll;', 'Fouriertrf;', 'Fscr;',
+    'GJcy;', 'GT', 'GT;', 'Gamma;', 'Gammad;', 'Gbreve;', 'Gcedil;', 'Gcirc;', 'Gcy;', 'Gdot;', 'Gfr;', 'Gg;',
+    'Gopf;', 'GreaterEqual;', 'GreaterEqualLess;', 'GreaterFullEqual;', 'GreaterGreater;', 'GreaterLess;',
+    'GreaterSlantEqual;', 'GreaterTilde;', 'Gscr;', 'Gt;', 'HARDcy;', 'Hacek;', 'Hat;', 'Hcirc;', 'Hfr;',
+    'HilbertSpace;', 'Hopf;', 'HorizontalLine;', 'Hscr;', 'Hstrok;', 'HumpDownHump;', 'HumpEqual;', 'IEcy;',
+    'IJlig;', 'IOcy;', 'Iacute', 'Iacute;', 'Icirc', 'Icirc;', 'Icy;', 'Idot;', 'Ifr;', 'Igrave', 'Igrave;', 'Im;',
+    'Imacr;', 'ImaginaryI;', 'Implies;', 'Int;', 'Integral;', 'Intersection;', 'InvisibleComma;', 'InvisibleTimes;',
+    'Iogon;', 'Iopf;', 'Iota;', 'Iscr;', 'Itilde;', 'Iukcy;', 'Iuml', 'Iuml;', 'Jcirc;', 'Jcy;', 'Jfr;', 'Jopf;',
+    'Jscr;', 'Jsercy;', 'Jukcy;', 'KHcy;', 'KJcy;', 'Kappa;', 'Kcedil;', 'Kcy;', 'Kfr;', 'Kopf;', 'Kscr;', 'LJcy;',
+    'LT', 'LT;', 'Lacute;', 'Lambda;', 'Lang;', 'Laplacetrf;', 'Larr;', 'Lcaron;', 'Lcedil;', 'Lcy;',
+    'LeftAngleBracket;', 'LeftArrow;', 'LeftArrowBar;', 'LeftArrowRightArrow;', 'LeftCeiling;',
+    'LeftDoubleBracket;', 'LeftDownTeeVector;', 'LeftDownVector;', 'LeftDownVectorBar;', 'LeftFloor;',
+    'LeftRightArrow;', 'LeftRightVector;', 'LeftTee;', 'LeftTeeArrow;', 'LeftTeeVector;', 'LeftTriangle;',
+    'LeftTriangleBar;', 'LeftTriangleEqual;', 'LeftUpDownVector;', 'LeftUpTeeVector;', 'LeftUpVector;',
+    'LeftUpVectorBar;', 'LeftVector;', 'LeftVectorBar;', 'Leftarrow;', 'Leftrightarrow;', 'LessEqualGreater;',
+    'LessFullEqual;', 'LessGreater;', 'LessLess;', 'LessSlantEqual;', 'LessTilde;', 'Lfr;', 'Ll;', 'Lleftarrow;',
+    'Lmidot;', 'LongLeftArrow;', 'LongLeftRightArrow;', 'LongRightArrow;', 'Longleftarrow;', 'Longleftrightarrow;',
+    'Longrightarrow;', 'Lopf;', 'LowerLeftArrow;', 'LowerRightArrow;', 'Lscr;', 'Lsh;', 'Lstrok;', 'Lt;', 'Map;',
+    'Mcy;', 'MediumSpace;', 'Mellintrf;', 'Mfr;', 'MinusPlus;', 'Mopf;', 'Mscr;', 'Mu;', 'NJcy;', 'Nacute;',
+    'Ncaron;', 'Ncedil;', 'Ncy;', 'NegativeMediumSpace;', 'NegativeThickSpace;', 'NegativeThinSpace;',
+    'NegativeVeryThinSpace;', 'NestedGreaterGreater;', 'NestedLessLess;', 'NewLine;', 'Nfr;', 'NoBreak;',
+    'NonBreakingSpace;', 'Nopf;', 'Not;', 'NotCongruent;', 'NotCupCap;', 'NotDoubleVerticalBar;', 'NotElement;',
+    'NotEqual;', 'NotEqualTilde;', 'NotExists;', 'NotGreater;', 'NotGreaterEqual;', 'NotGreaterFullEqual;',
+    'NotGreaterGreater;', 'NotGreaterLess;', 'NotGreaterSlantEqual;', 'NotGreaterTilde;', 'NotHumpDownHump;',
+    'NotHumpEqual;', 'NotLeftTriangle;', 'NotLeftTriangleBar;', 'NotLeftTriangleEqual;', 'NotLess;',
+    'NotLessEqual;', 'NotLessGreater;', 'NotLessLess;', 'NotLessSlantEqual;', 'NotLessTilde;',
+    'NotNestedGreaterGreater;', 'NotNestedLessLess;', 'NotPrecedes;', 'NotPrecedesEqual;', 'NotPrecedesSlantEqual;',
+    'NotReverseElement;', 'NotRightTriangle;', 'NotRightTriangleBar;', 'NotRightTriangleEqual;', 'NotSquareSubset;',
+    'NotSquareSubsetEqual;', 'NotSquareSuperset;', 'NotSquareSupersetEqual;', 'NotSubset;', 'NotSubsetEqual;',
+    'NotSucceeds;', 'NotSucceedsEqual;', 'NotSucceedsSlantEqual;', 'NotSucceedsTilde;', 'NotSuperset;',
+    'NotSupersetEqual;', 'NotTilde;', 'NotTildeEqual;', 'NotTildeFullEqual;', 'NotTildeTilde;', 'NotVerticalBar;',
+    'Nscr;', 'Ntilde', 'Ntilde;', 'Nu;', 'OElig;', 'Oacute', 'Oacute;', 'Ocirc', 'Ocirc;', 'Ocy;', 'Odblac;',
+    'Ofr;', 'Ograve', 'Ograve;', 'Omacr;', 'Omega;', 'Omicron;', 'Oopf;', 'OpenCurlyDoubleQuote;',
+    'OpenCurlyQuote;', 'Or;', 'Oscr;', 'Oslash', 'Oslash;', 'Otilde', 'Otilde;', 'Otimes;', 'Ouml', 'Ouml;',
+    'OverBar;', 'OverBrace;', 'OverBracket;', 'OverParenthesis;', 'PartialD;', 'Pcy;', 'Pfr;', 'Phi;', 'Pi;',
+    'PlusMinus;', 'Poincareplane;', 'Popf;', 'Pr;', 'Precedes;', 'PrecedesEqual;', 'PrecedesSlantEqual;',
+    'PrecedesTilde;', 'Prime;', 'Product;', 'Proportion;', 'Proportional;', 'Pscr;', 'Psi;', 'QUOT', 'QUOT;',
+    'Qfr;', 'Qopf;', 'Qscr;', 'RBarr;', 'REG', 'REG;', 'Racute;', 'Rang;', 'Rarr;', 'Rarrtl;', 'Rcaron;', 'Rcedil;',
+    'Rcy;', 'Re;', 'ReverseElement;', 'ReverseEquilibrium;', 'ReverseUpEquilibrium;', 'Rfr;', 'Rho;',
+    'RightAngleBracket;', 'RightArrow;', 'RightArrowBar;', 'RightArrowLeftArrow;', 'RightCeiling;',
+    'RightDoubleBracket;', 'RightDownTeeVector;', 'RightDownVector;', 'RightDownVectorBar;', 'RightFloor;',
+    'RightTee;', 'RightTeeArrow;', 'RightTeeVector;', 'RightTriangle;', 'RightTriangleBar;', 'RightTriangleEqual;',
+    'RightUpDownVector;', 'RightUpTeeVector;', 'RightUpVector;', 'RightUpVectorBar;', 'RightVector;',
+    'RightVectorBar;', 'Rightarrow;', 'Ropf;', 'RoundImplies;', 'Rrightarrow;', 'Rscr;', 'Rsh;', 'RuleDelayed;',
+    'SHCHcy;', 'SHcy;', 'SOFTcy;', 'Sacute;', 'Sc;', 'Scaron;', 'Scedil;', 'Scirc;', 'Scy;', 'Sfr;',
+    'ShortDownArrow;', 'ShortLeftArrow;', 'ShortRightArrow;', 'ShortUpArrow;', 'Sigma;', 'SmallCircle;', 'Sopf;',
+    'Sqrt;', 'Square;', 'SquareIntersection;', 'SquareSubset;', 'SquareSubsetEqual;', 'SquareSuperset;',
+    'SquareSupersetEqual;', 'SquareUnion;', 'Sscr;', 'Star;', 'Sub;', 'Subset;', 'SubsetEqual;', 'Succeeds;',
+    'SucceedsEqual;', 'SucceedsSlantEqual;', 'SucceedsTilde;', 'SuchThat;', 'Sum;', 'Sup;', 'Superset;',
+    'SupersetEqual;', 'Supset;', 'THORN', 'THORN;', 'TRADE;', 'TSHcy;', 'TScy;', 'Tab;', 'Tau;', 'Tcaron;',
+    'Tcedil;', 'Tcy;', 'Tfr;', 'Therefore;', 'Theta;', 'ThickSpace;', 'ThinSpace;', 'Tilde;', 'TildeEqual;',
+    'TildeFullEqual;', 'TildeTilde;', 'Topf;', 'TripleDot;', 'Tscr;', 'Tstrok;', 'Uacute', 'Uacute;', 'Uarr;',
+    'Uarrocir;', 'Ubrcy;', 'Ubreve;', 'Ucirc', 'Ucirc;', 'Ucy;', 'Udblac;', 'Ufr;', 'Ugrave', 'Ugrave;', 'Umacr;',
+    'UnderBar;', 'UnderBrace;', 'UnderBracket;', 'UnderParenthesis;', 'Union;', 'UnionPlus;', 'Uogon;', 'Uopf;',
+    'UpArrow;', 'UpArrowBar;', 'UpArrowDownArrow;', 'UpDownArrow;', 'UpEquilibrium;', 'UpTee;', 'UpTeeArrow;',
+    'Uparrow;', 'Updownarrow;', 'UpperLeftArrow;', 'UpperRightArrow;', 'Upsi;', 'Upsilon;', 'Uring;', 'Uscr;',
+    'Utilde;', 'Uuml', 'Uuml;', 'VDash;', 'Vbar;', 'Vcy;', 'Vdash;', 'Vdashl;', 'Vee;', 'Verbar;', 'Vert;',
+    'VerticalBar;', 'VerticalLine;', 'VerticalSeparator;', 'VerticalTilde;', 'VeryThinSpace;', 'Vfr;', 'Vopf;',
+    'Vscr;', 'Vvdash;', 'Wcirc;', 'Wedge;', 'Wfr;', 'Wopf;', 'Wscr;', 'Xfr;', 'Xi;', 'Xopf;', 'Xscr;', 'YAcy;',
+    'YIcy;', 'YUcy;', 'Yacute', 'Yacute;', 'Ycirc;', 'Ycy;', 'Yfr;', 'Yopf;', 'Yscr;', 'Yuml;', 'ZHcy;', 'Zacute;',
+    'Zcaron;', 'Zcy;', 'Zdot;', 'ZeroWidthSpace;', 'Zeta;', 'Zfr;', 'Zopf;', 'Zscr;', 'aacute', 'aacute;',
+    'abreve;', 'ac;', 'acE;', 'acd;', 'acirc', 'acirc;', 'acute', 'acute;', 'acy;', 'aelig', 'aelig;', 'af;',
+    'afr;', 'agrave', 'agrave;', 'alefsym;', 'aleph;', 'alpha;', 'amacr;', 'amalg;', 'amp', 'amp;', 'and;',
+    'andand;', 'andd;', 'andslope;', 'andv;', 'ang;', 'ange;', 'angle;', 'angmsd;', 'angmsdaa;', 'angmsdab;',
+    'angmsdac;', 'angmsdad;', 'angmsdae;', 'angmsdaf;', 'angmsdag;', 'angmsdah;', 'angrt;', 'angrtvb;', 'angrtvbd;',
+    'angsph;', 'angst;', 'angzarr;', 'aogon;', 'aopf;', 'ap;', 'apE;', 'apacir;', 'ape;', 'apid;', 'apos;',
+    'approx;', 'approxeq;', 'aring', 'aring;', 'ascr;', 'ast;', 'asymp;', 'asympeq;', 'atilde', 'atilde;', 'auml',
+    'auml;', 'awconint;', 'awint;', 'bNot;', 'backcong;', 'backepsilon;', 'backprime;', 'backsim;', 'backsimeq;',
+    'barvee;', 'barwed;', 'barwedge;', 'bbrk;', 'bbrktbrk;', 'bcong;', 'bcy;', 'bdquo;', 'becaus;', 'because;',
+    'bemptyv;', 'bepsi;', 'bernou;', 'beta;', 'beth;', 'between;', 'bfr;', 'bigcap;', 'bigcirc;', 'bigcup;',
+    'bigodot;', 'bigoplus;', 'bigotimes;', 'bigsqcup;', 'bigstar;', 'bigtriangledown;', 'bigtriangleup;',
+    'biguplus;', 'bigvee;', 'bigwedge;', 'bkarow;', 'blacklozenge;', 'blacksquare;', 'blacktriangle;',
+    'blacktriangledown;', 'blacktriangleleft;', 'blacktriangleright;', 'blank;', 'blk12;', 'blk14;', 'blk34;',
+    'block;', 'bne;', 'bnequiv;', 'bnot;', 'bopf;', 'bot;', 'bottom;', 'bowtie;', 'boxDL;', 'boxDR;', 'boxDl;',
+    'boxDr;', 'boxH;', 'boxHD;', 'boxHU;', 'boxHd;', 'boxHu;', 'boxUL;', 'boxUR;', 'boxUl;', 'boxUr;', 'boxV;',
+    'boxVH;', 'boxVL;', 'boxVR;', 'boxVh;', 'boxVl;', 'boxVr;', 'boxbox;', 'boxdL;', 'boxdR;', 'boxdl;', 'boxdr;',
+    'boxh;', 'boxhD;', 'boxhU;', 'boxhd;', 'boxhu;', 'boxminus;', 'boxplus;', 'boxtimes;', 'boxuL;', 'boxuR;',
+    'boxul;', 'boxur;', 'boxv;', 'boxvH;', 'boxvL;', 'boxvR;', 'boxvh;', 'boxvl;', 'boxvr;', 'bprime;', 'breve;',
+    'brvbar', 'brvbar;', 'bscr;', 'bsemi;', 'bsim;', 'bsime;', 'bsol;', 'bsolb;', 'bsolhsub;', 'bull;', 'bullet;',
+    'bump;', 'bumpE;', 'bumpe;', 'bumpeq;', 'cacute;', 'cap;', 'capand;', 'capbrcup;', 'capcap;', 'capcup;',
+    'capdot;', 'caps;', 'caret;', 'caron;', 'ccaps;', 'ccaron;', 'ccedil', 'ccedil;', 'ccirc;', 'ccups;',
+    'ccupssm;', 'cdot;', 'cedil', 'cedil;', 'cemptyv;', 'cent', 'cent;', 'centerdot;', 'cfr;', 'chcy;', 'check;',
+    'checkmark;', 'chi;', 'cir;', 'cirE;', 'circ;', 'circeq;', 'circlearrowleft;', 'circlearrowright;', 'circledR;',
+    'circledS;', 'circledast;', 'circledcirc;', 'circleddash;', 'cire;', 'cirfnint;', 'cirmid;', 'cirscir;',
+    'clubs;', 'clubsuit;', 'colon;', 'colone;', 'coloneq;', 'comma;', 'commat;', 'comp;', 'compfn;', 'complement;',
+    'complexes;', 'cong;', 'congdot;', 'conint;', 'copf;', 'coprod;', 'copy', 'copy;', 'copysr;', 'crarr;',
+    'cross;', 'cscr;', 'csub;', 'csube;', 'csup;', 'csupe;', 'ctdot;', 'cudarrl;', 'cudarrr;', 'cuepr;', 'cuesc;',
+    'cularr;', 'cularrp;', 'cup;', 'cupbrcap;', 'cupcap;', 'cupcup;', 'cupdot;', 'cupor;', 'cups;', 'curarr;',
+    'curarrm;', 'curlyeqprec;', 'curlyeqsucc;', 'curlyvee;', 'curlywedge;', 'curren', 'curren;', 'curvearrowleft;',
+    'curvearrowright;', 'cuvee;', 'cuwed;', 'cwconint;', 'cwint;', 'cylcty;', 'dArr;', 'dHar;', 'dagger;',
+    'daleth;', 'darr;', 'dash;', 'dashv;', 'dbkarow;', 'dblac;', 'dcaron;', 'dcy;', 'dd;', 'ddagger;', 'ddarr;',
+    'ddotseq;', 'deg', 'deg;', 'delta;', 'demptyv;', 'dfisht;', 'dfr;', 'dharl;', 'dharr;', 'diam;', 'diamond;',
+    'diamondsuit;', 'diams;', 'die;', 'digamma;', 'disin;', 'div;', 'divide', 'divide;', 'divideontimes;',
+    'divonx;', 'djcy;', 'dlcorn;', 'dlcrop;', 'dollar;', 'dopf;', 'dot;', 'doteq;', 'doteqdot;', 'dotminus;',
+    'dotplus;', 'dotsquare;', 'doublebarwedge;', 'downarrow;', 'downdownarrows;', 'downharpoonleft;',
+    'downharpoonright;', 'drbkarow;', 'drcorn;', 'drcrop;', 'dscr;', 'dscy;', 'dsol;', 'dstrok;', 'dtdot;', 'dtri;',
+    'dtrif;', 'duarr;', 'duhar;', 'dwangle;', 'dzcy;', 'dzigrarr;', 'eDDot;', 'eDot;', 'eacute', 'eacute;',
+    'easter;', 'ecaron;', 'ecir;', 'ecirc', 'ecirc;', 'ecolon;', 'ecy;', 'edot;', 'ee;', 'efDot;', 'efr;', 'eg;',
+    'egrave', 'egrave;', 'egs;', 'egsdot;', 'el;', 'elinters;', 'ell;', 'els;', 'elsdot;', 'emacr;', 'empty;',
+    'emptyset;', 'emptyv;', 'emsp13;', 'emsp14;', 'emsp;', 'eng;', 'ensp;', 'eogon;', 'eopf;', 'epar;', 'eparsl;',
+    'eplus;', 'epsi;', 'epsilon;', 'epsiv;', 'eqcirc;', 'eqcolon;', 'eqsim;', 'eqslantgtr;', 'eqslantless;',
+    'equals;', 'equest;', 'equiv;', 'equivDD;', 'eqvparsl;', 'erDot;', 'erarr;', 'escr;', 'esdot;', 'esim;', 'eta;',
+    'eth', 'eth;', 'euml', 'euml;', 'euro;', 'excl;', 'exist;', 'expectation;', 'exponentiale;', 'fallingdotseq;',
+    'fcy;', 'female;', 'ffilig;', 'fflig;', 'ffllig;', 'ffr;', 'filig;', 'fjlig;', 'flat;', 'fllig;', 'fltns;',
+    'fnof;', 'fopf;', 'forall;', 'fork;', 'forkv;', 'fpartint;', 'frac12', 'frac12;', 'frac13;', 'frac14',
+    'frac14;', 'frac15;', 'frac16;', 'frac18;', 'frac23;', 'frac25;', 'frac34', 'frac34;', 'frac35;', 'frac38;',
+    'frac45;', 'frac56;', 'frac58;', 'frac78;', 'frasl;', 'frown;', 'fscr;', 'gE;', 'gEl;', 'gacute;', 'gamma;',
+    'gammad;', 'gap;', 'gbreve;', 'gcirc;', 'gcy;', 'gdot;', 'ge;', 'gel;', 'geq;', 'geqq;', 'geqslant;', 'ges;',
+    'gescc;', 'gesdot;', 'gesdoto;', 'gesdotol;', 'gesl;', 'gesles;', 'gfr;', 'gg;', 'ggg;', 'gimel;', 'gjcy;',
+    'gl;', 'glE;', 'gla;', 'glj;', 'gnE;', 'gnap;', 'gnapprox;', 'gne;', 'gneq;', 'gneqq;', 'gnsim;', 'gopf;',
+    'grave;', 'gscr;', 'gsim;', 'gsime;', 'gsiml;', 'gt', 'gt;', 'gtcc;', 'gtcir;', 'gtdot;', 'gtlPar;', 'gtquest;',
+    'gtrapprox;', 'gtrarr;', 'gtrdot;', 'gtreqless;', 'gtreqqless;', 'gtrless;', 'gtrsim;', 'gvertneqq;', 'gvnE;',
+    'hArr;', 'hairsp;', 'half;', 'hamilt;', 'hardcy;', 'harr;', 'harrcir;', 'harrw;', 'hbar;', 'hcirc;', 'hearts;',
+    'heartsuit;', 'hellip;', 'hercon;', 'hfr;', 'hksearow;', 'hkswarow;', 'hoarr;', 'homtht;', 'hookleftarrow;',
+    'hookrightarrow;', 'hopf;', 'horbar;', 'hscr;', 'hslash;', 'hstrok;', 'hybull;', 'hyphen;', 'iacute', 'iacute;',
+    'ic;', 'icirc', 'icirc;', 'icy;', 'iecy;', 'iexcl', 'iexcl;', 'iff;', 'ifr;', 'igrave', 'igrave;', 'ii;',
+    'iiiint;', 'iiint;', 'iinfin;', 'iiota;', 'ijlig;', 'imacr;', 'image;', 'imagline;', 'imagpart;', 'imath;',
+    'imof;', 'imped;', 'in;', 'incare;', 'infin;', 'infintie;', 'inodot;', 'int;', 'intcal;', 'integers;',
+    'intercal;', 'intlarhk;', 'intprod;', 'iocy;', 'iogon;', 'iopf;', 'iota;', 'iprod;', 'iquest', 'iquest;',
+    'iscr;', 'isin;', 'isinE;', 'isindot;', 'isins;', 'isinsv;', 'isinv;', 'it;', 'itilde;', 'iukcy;', 'iuml',
+    'iuml;', 'jcirc;', 'jcy;', 'jfr;', 'jmath;', 'jopf;', 'jscr;', 'jsercy;', 'jukcy;', 'kappa;', 'kappav;',
+    'kcedil;', 'kcy;', 'kfr;', 'kgreen;', 'khcy;', 'kjcy;', 'kopf;', 'kscr;', 'lAarr;', 'lArr;', 'lAtail;',
+    'lBarr;', 'lE;', 'lEg;', 'lHar;', 'lacute;', 'laemptyv;', 'lagran;', 'lambda;', 'lang;', 'langd;', 'langle;',
+    'lap;', 'laquo', 'laquo;', 'larr;', 'larrb;', 'larrbfs;', 'larrfs;', 'larrhk;', 'larrlp;', 'larrpl;',
+    'larrsim;', 'larrtl;', 'lat;', 'latail;', 'late;', 'lates;', 'lbarr;', 'lbbrk;', 'lbrace;', 'lbrack;', 'lbrke;',
+    'lbrksld;', 'lbrkslu;', 'lcaron;', 'lcedil;', 'lceil;', 'lcub;', 'lcy;', 'ldca;', 'ldquo;', 'ldquor;',
+    'ldrdhar;', 'ldrushar;', 'ldsh;', 'le;', 'leftarrow;', 'leftarrowtail;', 'leftharpoondown;', 'leftharpoonup;',
+    'leftleftarrows;', 'leftrightarrow;', 'leftrightarrows;', 'leftrightharpoons;', 'leftrightsquigarrow;',
+    'leftthreetimes;', 'leg;', 'leq;', 'leqq;', 'leqslant;', 'les;', 'lescc;', 'lesdot;', 'lesdoto;', 'lesdotor;',
+    'lesg;', 'lesges;', 'lessapprox;', 'lessdot;', 'lesseqgtr;', 'lesseqqgtr;', 'lessgtr;', 'lesssim;', 'lfisht;',
+    'lfloor;', 'lfr;', 'lg;', 'lgE;', 'lhard;', 'lharu;', 'lharul;', 'lhblk;', 'ljcy;', 'll;', 'llarr;',
+    'llcorner;', 'llhard;', 'lltri;', 'lmidot;', 'lmoust;', 'lmoustache;', 'lnE;', 'lnap;', 'lnapprox;', 'lne;',
+    'lneq;', 'lneqq;', 'lnsim;', 'loang;', 'loarr;', 'lobrk;', 'longleftarrow;', 'longleftrightarrow;',
+    'longmapsto;', 'longrightarrow;', 'looparrowleft;', 'looparrowright;', 'lopar;', 'lopf;', 'loplus;', 'lotimes;',
+    'lowast;', 'lowbar;', 'loz;', 'lozenge;', 'lozf;', 'lpar;', 'lparlt;', 'lrarr;', 'lrcorner;', 'lrhar;',
+    'lrhard;', 'lrm;', 'lrtri;', 'lsaquo;', 'lscr;', 'lsh;', 'lsim;', 'lsime;', 'lsimg;', 'lsqb;', 'lsquo;',
+    'lsquor;', 'lstrok;', 'lt', 'lt;', 'ltcc;', 'ltcir;', 'ltdot;', 'lthree;', 'ltimes;', 'ltlarr;', 'ltquest;',
+    'ltrPar;', 'ltri;', 'ltrie;', 'ltrif;', 'lurdshar;', 'luruhar;', 'lvertneqq;', 'lvnE;', 'mDDot;', 'macr',
+    'macr;', 'male;', 'malt;', 'maltese;', 'map;', 'mapsto;', 'mapstodown;', 'mapstoleft;', 'mapstoup;', 'marker;',
+    'mcomma;', 'mcy;', 'mdash;', 'measuredangle;', 'mfr;', 'mho;', 'micro', 'micro;', 'mid;', 'midast;', 'midcir;',
+    'middot', 'middot;', 'minus;', 'minusb;', 'minusd;', 'minusdu;', 'mlcp;', 'mldr;', 'mnplus;', 'models;',
+    'mopf;', 'mp;', 'mscr;', 'mstpos;', 'mu;', 'multimap;', 'mumap;', 'nGg;', 'nGt;', 'nGtv;', 'nLeftarrow;',
+    'nLeftrightarrow;', 'nLl;', 'nLt;', 'nLtv;', 'nRightarrow;', 'nVDash;', 'nVdash;', 'nabla;', 'nacute;', 'nang;',
+    'nap;', 'napE;', 'napid;', 'napos;', 'napprox;', 'natur;', 'natural;', 'naturals;', 'nbsp', 'nbsp;', 'nbump;',
+    'nbumpe;', 'ncap;', 'ncaron;', 'ncedil;', 'ncong;', 'ncongdot;', 'ncup;', 'ncy;', 'ndash;', 'ne;', 'neArr;',
+    'nearhk;', 'nearr;', 'nearrow;', 'nedot;', 'nequiv;', 'nesear;', 'nesim;', 'nexist;', 'nexists;', 'nfr;',
+    'ngE;', 'nge;', 'ngeq;', 'ngeqq;', 'ngeqslant;', 'nges;', 'ngsim;', 'ngt;', 'ngtr;', 'nhArr;', 'nharr;',
+    'nhpar;', 'ni;', 'nis;', 'nisd;', 'niv;', 'njcy;', 'nlArr;', 'nlE;', 'nlarr;', 'nldr;', 'nle;', 'nleftarrow;',
+    'nleftrightarrow;', 'nleq;', 'nleqq;', 'nleqslant;', 'nles;', 'nless;', 'nlsim;', 'nlt;', 'nltri;', 'nltrie;',
+    'nmid;', 'nopf;', 'not', 'not;', 'notin;', 'notinE;', 'notindot;', 'notinva;', 'notinvb;', 'notinvc;', 'notni;',
+    'notniva;', 'notnivb;', 'notnivc;', 'npar;', 'nparallel;', 'nparsl;', 'npart;', 'npolint;', 'npr;', 'nprcue;',
+    'npre;', 'nprec;', 'npreceq;', 'nrArr;', 'nrarr;', 'nrarrc;', 'nrarrw;', 'nrightarrow;', 'nrtri;', 'nrtrie;',
+    'nsc;', 'nsccue;', 'nsce;', 'nscr;', 'nshortmid;', 'nshortparallel;', 'nsim;', 'nsime;', 'nsimeq;', 'nsmid;',
+    'nspar;', 'nsqsube;', 'nsqsupe;', 'nsub;', 'nsubE;', 'nsube;', 'nsubset;', 'nsubseteq;', 'nsubseteqq;',
+    'nsucc;', 'nsucceq;', 'nsup;', 'nsupE;', 'nsupe;', 'nsupset;', 'nsupseteq;', 'nsupseteqq;', 'ntgl;', 'ntilde',
+    'ntilde;', 'ntlg;', 'ntriangleleft;', 'ntrianglelefteq;', 'ntriangleright;', 'ntrianglerighteq;', 'nu;', 'num;',
+    'numero;', 'numsp;', 'nvDash;', 'nvHarr;', 'nvap;', 'nvdash;', 'nvge;', 'nvgt;', 'nvinfin;', 'nvlArr;', 'nvle;',
+    'nvlt;', 'nvltrie;', 'nvrArr;', 'nvrtrie;', 'nvsim;', 'nwArr;', 'nwarhk;', 'nwarr;', 'nwarrow;', 'nwnear;',
+    'oS;', 'oacute', 'oacute;', 'oast;', 'ocir;', 'ocirc', 'ocirc;', 'ocy;', 'odash;', 'odblac;', 'odiv;', 'odot;',
+    'odsold;', 'oelig;', 'ofcir;', 'ofr;', 'ogon;', 'ograve', 'ograve;', 'ogt;', 'ohbar;', 'ohm;', 'oint;',
+    'olarr;', 'olcir;', 'olcross;', 'oline;', 'olt;', 'omacr;', 'omega;', 'omicron;', 'omid;', 'ominus;', 'oopf;',
+    'opar;', 'operp;', 'oplus;', 'or;', 'orarr;', 'ord;', 'order;', 'orderof;', 'ordf', 'ordf;', 'ordm', 'ordm;',
+    'origof;', 'oror;', 'orslope;', 'orv;', 'oscr;', 'oslash', 'oslash;', 'osol;', 'otilde', 'otilde;', 'otimes;',
+    'otimesas;', 'ouml', 'ouml;', 'ovbar;', 'par;', 'para', 'para;', 'parallel;', 'parsim;', 'parsl;', 'part;',
+    'pcy;', 'percnt;', 'period;', 'permil;', 'perp;', 'pertenk;', 'pfr;', 'phi;', 'phiv;', 'phmmat;', 'phone;',
+    'pi;', 'pitchfork;', 'piv;', 'planck;', 'planckh;', 'plankv;', 'plus;', 'plusacir;', 'plusb;', 'pluscir;',
+    'plusdo;', 'plusdu;', 'pluse;', 'plusmn', 'plusmn;', 'plussim;', 'plustwo;', 'pm;', 'pointint;', 'popf;',
+    'pound', 'pound;', 'pr;', 'prE;', 'prap;', 'prcue;', 'pre;', 'prec;', 'precapprox;', 'preccurlyeq;', 'preceq;',
+    'precnapprox;', 'precneqq;', 'precnsim;', 'precsim;', 'prime;', 'primes;', 'prnE;', 'prnap;', 'prnsim;',
+    'prod;', 'profalar;', 'profline;', 'profsurf;', 'prop;', 'propto;', 'prsim;', 'prurel;', 'pscr;', 'psi;',
+    'puncsp;', 'qfr;', 'qint;', 'qopf;', 'qprime;', 'qscr;', 'quaternions;', 'quatint;', 'quest;', 'questeq;',
+    'quot', 'quot;', 'rAarr;', 'rArr;', 'rAtail;', 'rBarr;', 'rHar;', 'race;', 'racute;', 'radic;', 'raemptyv;',
+    'rang;', 'rangd;', 'range;', 'rangle;', 'raquo', 'raquo;', 'rarr;', 'rarrap;', 'rarrb;', 'rarrbfs;', 'rarrc;',
+    'rarrfs;', 'rarrhk;', 'rarrlp;', 'rarrpl;', 'rarrsim;', 'rarrtl;', 'rarrw;', 'ratail;', 'ratio;', 'rationals;',
+    'rbarr;', 'rbbrk;', 'rbrace;', 'rbrack;', 'rbrke;', 'rbrksld;', 'rbrkslu;', 'rcaron;', 'rcedil;', 'rceil;',
+    'rcub;', 'rcy;', 'rdca;', 'rdldhar;', 'rdquo;', 'rdquor;', 'rdsh;', 'real;', 'realine;', 'realpart;', 'reals;',
+    'rect;', 'reg', 'reg;', 'rfisht;', 'rfloor;', 'rfr;', 'rhard;', 'rharu;', 'rharul;', 'rho;', 'rhov;',
+    'rightarrow;', 'rightarrowtail;', 'rightharpoondown;', 'rightharpoonup;', 'rightleftarrows;',
+    'rightleftharpoons;', 'rightrightarrows;', 'rightsquigarrow;', 'rightthreetimes;', 'ring;', 'risingdotseq;',
+    'rlarr;', 'rlhar;', 'rlm;', 'rmoust;', 'rmoustache;', 'rnmid;', 'roang;', 'roarr;', 'robrk;', 'ropar;', 'ropf;',
+    'roplus;', 'rotimes;', 'rpar;', 'rpargt;', 'rppolint;', 'rrarr;', 'rsaquo;', 'rscr;', 'rsh;', 'rsqb;', 'rsquo;',
+    'rsquor;', 'rthree;', 'rtimes;', 'rtri;', 'rtrie;', 'rtrif;', 'rtriltri;', 'ruluhar;', 'rx;', 'sacute;',
+    'sbquo;', 'sc;', 'scE;', 'scap;', 'scaron;', 'sccue;', 'sce;', 'scedil;', 'scirc;', 'scnE;', 'scnap;',
+    'scnsim;', 'scpolint;', 'scsim;', 'scy;', 'sdot;', 'sdotb;', 'sdote;', 'seArr;', 'searhk;', 'searr;',
+    'searrow;', 'sect', 'sect;', 'semi;', 'seswar;', 'setminus;', 'setmn;', 'sext;', 'sfr;', 'sfrown;', 'sharp;',
+    'shchcy;', 'shcy;', 'shortmid;', 'shortparallel;', 'shy', 'shy;', 'sigma;', 'sigmaf;', 'sigmav;', 'sim;',
+    'simdot;', 'sime;', 'simeq;', 'simg;', 'simgE;', 'siml;', 'simlE;', 'simne;', 'simplus;', 'simrarr;', 'slarr;',
+    'smallsetminus;', 'smashp;', 'smeparsl;', 'smid;', 'smile;', 'smt;', 'smte;', 'smtes;', 'softcy;', 'sol;',
+    'solb;', 'solbar;', 'sopf;', 'spades;', 'spadesuit;', 'spar;', 'sqcap;', 'sqcaps;', 'sqcup;', 'sqcups;',
+    'sqsub;', 'sqsube;', 'sqsubset;', 'sqsubseteq;', 'sqsup;', 'sqsupe;', 'sqsupset;', 'sqsupseteq;', 'squ;',
+    'square;', 'squarf;', 'squf;', 'srarr;', 'sscr;', 'ssetmn;', 'ssmile;', 'sstarf;', 'star;', 'starf;',
+    'straightepsilon;', 'straightphi;', 'strns;', 'sub;', 'subE;', 'subdot;', 'sube;', 'subedot;', 'submult;',
+    'subnE;', 'subne;', 'subplus;', 'subrarr;', 'subset;', 'subseteq;', 'subseteqq;', 'subsetneq;', 'subsetneqq;',
+    'subsim;', 'subsub;', 'subsup;', 'succ;', 'succapprox;', 'succcurlyeq;', 'succeq;', 'succnapprox;', 'succneqq;',
+    'succnsim;', 'succsim;', 'sum;', 'sung;', 'sup1', 'sup1;', 'sup2', 'sup2;', 'sup3', 'sup3;', 'sup;', 'supE;',
+    'supdot;', 'supdsub;', 'supe;', 'supedot;', 'suphsol;', 'suphsub;', 'suplarr;', 'supmult;', 'supnE;', 'supne;',
+    'supplus;', 'supset;', 'supseteq;', 'supseteqq;', 'supsetneq;', 'supsetneqq;', 'supsim;', 'supsub;', 'supsup;',
+    'swArr;', 'swarhk;', 'swarr;', 'swarrow;', 'swnwar;', 'szlig', 'szlig;', 'target;', 'tau;', 'tbrk;', 'tcaron;',
+    'tcedil;', 'tcy;', 'tdot;', 'telrec;', 'tfr;', 'there4;', 'therefore;', 'theta;', 'thetasym;', 'thetav;',
+    'thickapprox;', 'thicksim;', 'thinsp;', 'thkap;', 'thksim;', 'thorn', 'thorn;', 'tilde;', 'times', 'times;',
+    'timesb;', 'timesbar;', 'timesd;', 'tint;', 'toea;', 'top;', 'topbot;', 'topcir;', 'topf;', 'topfork;', 'tosa;',
+    'tprime;', 'trade;', 'triangle;', 'triangledown;', 'triangleleft;', 'trianglelefteq;', 'triangleq;',
+    'triangleright;', 'trianglerighteq;', 'tridot;', 'trie;', 'triminus;', 'triplus;', 'trisb;', 'tritime;',
+    'trpezium;', 'tscr;', 'tscy;', 'tshcy;', 'tstrok;', 'twixt;', 'twoheadleftarrow;', 'twoheadrightarrow;',
+    'uArr;', 'uHar;', 'uacute', 'uacute;', 'uarr;', 'ubrcy;', 'ubreve;', 'ucirc', 'ucirc;', 'ucy;', 'udarr;',
+    'udblac;', 'udhar;', 'ufisht;', 'ufr;', 'ugrave', 'ugrave;', 'uharl;', 'uharr;', 'uhblk;', 'ulcorn;',
+    'ulcorner;', 'ulcrop;', 'ultri;', 'umacr;', 'uml', 'uml;', 'uogon;', 'uopf;', 'uparrow;', 'updownarrow;',
+    'upharpoonleft;', 'upharpoonright;', 'uplus;', 'upsi;', 'upsih;', 'upsilon;', 'upuparrows;', 'urcorn;',
+    'urcorner;', 'urcrop;', 'uring;', 'urtri;', 'uscr;', 'utdot;', 'utilde;', 'utri;', 'utrif;', 'uuarr;', 'uuml',
+    'uuml;', 'uwangle;', 'vArr;', 'vBar;', 'vBarv;', 'vDash;', 'vangrt;', 'varepsilon;', 'varkappa;', 'varnothing;',
+    'varphi;', 'varpi;', 'varpropto;', 'varr;', 'varrho;', 'varsigma;', 'varsubsetneq;', 'varsubsetneqq;',
+    'varsupsetneq;', 'varsupsetneqq;', 'vartheta;', 'vartriangleleft;', 'vartriangleright;', 'vcy;', 'vdash;',
+    'vee;', 'veebar;', 'veeeq;', 'vellip;', 'verbar;', 'vert;', 'vfr;', 'vltri;', 'vnsub;', 'vnsup;', 'vopf;',
+    'vprop;', 'vrtri;', 'vscr;', 'vsubnE;', 'vsubne;', 'vsupnE;', 'vsupne;', 'vzigzag;', 'wcirc;', 'wedbar;',
+    'wedge;', 'wedgeq;', 'weierp;', 'wfr;', 'wopf;', 'wp;', 'wr;', 'wreath;', 'wscr;', 'xcap;', 'xcirc;', 'xcup;',
+    'xdtri;', 'xfr;', 'xhArr;', 'xharr;', 'xi;', 'xlArr;', 'xlarr;', 'xmap;', 'xnis;', 'xodot;', 'xopf;', 'xoplus;',
+    'xotime;', 'xrArr;', 'xrarr;', 'xscr;', 'xsqcup;', 'xuplus;', 'xutri;', 'xvee;', 'xwedge;', 'yacute', 'yacute;',
+    'yacy;', 'ycirc;', 'ycy;', 'yen', 'yen;', 'yfr;', 'yicy;', 'yopf;', 'yscr;', 'yucy;', 'yuml', 'yuml;',
+    'zacute;', 'zcaron;', 'zcy;', 'zdot;', 'zeetrf;', 'zeta;', 'zfr;', 'zhcy;', 'zigrarr;', 'zopf;', 'zscr;',
+    'zwj;', 'zwnj;');
+  { the code point of each name }
+  HtmlEntCode: array[0..2230] of Integer = ($C6, $C6, $26, $26, $C1, $C1, $102, $C2, $C2, $410, $1D504, $C0, $C0,
+    $391, $100, $2A53, $104, $1D538, $2061, $C5, $C5, $1D49C, $2254, $C3, $C3, $C4, $C4, $2216, $2AE7, $2306, $411,
+    $2235, $212C, $392, $1D505, $1D539, $2D8, $212C, $224E, $427, $A9, $A9, $106, $22D2, $2145, $212D, $10C, $C7,
+    $C7, $108, $2230, $10A, $B8, $B7, $212D, $3A7, $2299, $2296, $2295, $2297, $2232, $201D, $2019, $2237, $2A74,
+    $2261, $222F, $222E, $2102, $2210, $2233, $2A2F, $1D49E, $22D3, $224D, $2145, $2911, $402, $405, $40F, $2021,
+    $21A1, $2AE4, $10E, $414, $2207, $394, $1D507, $B4, $2D9, $2DD, $60, $2DC, $22C4, $2146, $1D53B, $A8, $20DC,
+    $2250, $222F, $A8, $21D3, $21D0, $21D4, $2AE4, $27F8, $27FA, $27F9, $21D2, $22A8, $21D1, $21D5, $2225, $2193,
+    $2913, $21F5, $311, $2950, $295E, $21BD, $2956, $295F, $21C1, $2957, $22A4, $21A7, $21D3, $1D49F, $110, $14A,
+    $D0, $D0, $C9, $C9, $11A, $CA, $CA, $42D, $116, $1D508, $C8, $C8, $2208, $112, $25FB, $25AB, $118, $1D53C, $395,
+    $2A75, $2242, $21CC, $2130, $2A73, $397, $CB, $CB, $2203, $2147, $424, $1D509, $25FC, $25AA, $1D53D, $2200,
+    $2131, $2131, $403, $3E, $3E, $393, $3DC, $11E, $122, $11C, $413, $120, $1D50A, $22D9, $1D53E, $2265, $22DB,
+    $2267, $2AA2, $2277, $2A7E, $2273, $1D4A2, $226B, $42A, $2C7, $5E, $124, $210C, $210B, $210D, $2500, $210B,
+    $126, $224E, $224F, $415, $132, $401, $CD, $CD, $CE, $CE, $418, $130, $2111, $CC, $CC, $2111, $12A, $2148,
+    $21D2, $222C, $222B, $22C2, $2063, $2062, $12E, $1D540, $399, $2110, $128, $406, $CF, $CF, $134, $419, $1D50D,
+    $1D541, $1D4A5, $408, $404, $425, $40C, $39A, $136, $41A, $1D50E, $1D542, $1D4A6, $409, $3C, $3C, $139, $39B,
+    $27EA, $2112, $219E, $13D, $13B, $41B, $27E8, $2190, $21E4, $21C6, $2308, $27E6, $2961, $21C3, $2959, $230A,
+    $2194, $294E, $22A3, $21A4, $295A, $22B2, $29CF, $22B4, $2951, $2960, $21BF, $2958, $21BC, $2952, $21D0, $21D4,
+    $22DA, $2266, $2276, $2AA1, $2A7D, $2272, $1D50F, $22D8, $21DA, $13F, $27F5, $27F7, $27F6, $27F8, $27FA, $27F9,
+    $1D543, $2199, $2198, $2112, $21B0, $141, $226A, $2905, $41C, $205F, $2133, $1D510, $2213, $1D544, $2133, $39C,
+    $40A, $143, $147, $145, $41D, $200B, $200B, $200B, $200B, $226B, $226A, $A, $1D511, $2060, $A0, $2115, $2AEC,
+    $2262, $226D, $2226, $2209, $2260, $2242, $2204, $226F, $2271, $2267, $226B, $2279, $2A7E, $2275, $224E, $224F,
+    $22EA, $29CF, $22EC, $226E, $2270, $2278, $226A, $2A7D, $2274, $2AA2, $2AA1, $2280, $2AAF, $22E0, $220C, $22EB,
+    $29D0, $22ED, $228F, $22E2, $2290, $22E3, $2282, $2288, $2281, $2AB0, $22E1, $227F, $2283, $2289, $2241, $2244,
+    $2247, $2249, $2224, $1D4A9, $D1, $D1, $39D, $152, $D3, $D3, $D4, $D4, $41E, $150, $1D512, $D2, $D2, $14C, $3A9,
+    $39F, $1D546, $201C, $2018, $2A54, $1D4AA, $D8, $D8, $D5, $D5, $2A37, $D6, $D6, $203E, $23DE, $23B4, $23DC,
+    $2202, $41F, $1D513, $3A6, $3A0, $B1, $210C, $2119, $2ABB, $227A, $2AAF, $227C, $227E, $2033, $220F, $2237,
+    $221D, $1D4AB, $3A8, $22, $22, $1D514, $211A, $1D4AC, $2910, $AE, $AE, $154, $27EB, $21A0, $2916, $158, $156,
+    $420, $211C, $220B, $21CB, $296F, $211C, $3A1, $27E9, $2192, $21E5, $21C4, $2309, $27E7, $295D, $21C2, $2955,
+    $230B, $22A2, $21A6, $295B, $22B3, $29D0, $22B5, $294F, $295C, $21BE, $2954, $21C0, $2953, $21D2, $211D, $2970,
+    $21DB, $211B, $21B1, $29F4, $429, $428, $42C, $15A, $2ABC, $160, $15E, $15C, $421, $1D516, $2193, $2190, $2192,
+    $2191, $3A3, $2218, $1D54A, $221A, $25A1, $2293, $228F, $2291, $2290, $2292, $2294, $1D4AE, $22C6, $22D0, $22D0,
+    $2286, $227B, $2AB0, $227D, $227F, $220B, $2211, $22D1, $2283, $2287, $22D1, $DE, $DE, $2122, $40B, $426, $9,
+    $3A4, $164, $162, $422, $1D517, $2234, $398, $205F, $2009, $223C, $2243, $2245, $2248, $1D54B, $20DB, $1D4AF,
+    $166, $DA, $DA, $219F, $2949, $40E, $16C, $DB, $DB, $423, $170, $1D518, $D9, $D9, $16A, $5F, $23DF, $23B5,
+    $23DD, $22C3, $228E, $172, $1D54C, $2191, $2912, $21C5, $2195, $296E, $22A5, $21A5, $21D1, $21D5, $2196, $2197,
+    $3D2, $3A5, $16E, $1D4B0, $168, $DC, $DC, $22AB, $2AEB, $412, $22A9, $2AE6, $22C1, $2016, $2016, $2223, $7C,
+    $2758, $2240, $200A, $1D519, $1D54D, $1D4B1, $22AA, $174, $22C0, $1D51A, $1D54E, $1D4B2, $1D51B, $39E, $1D54F,
+    $1D4B3, $42F, $407, $42E, $DD, $DD, $176, $42B, $1D51C, $1D550, $1D4B4, $178, $416, $179, $17D, $417, $17B,
+    $200B, $396, $2128, $2124, $1D4B5, $E1, $E1, $103, $223E, $223E, $223F, $E2, $E2, $B4, $B4, $430, $E6, $E6,
+    $2061, $1D51E, $E0, $E0, $2135, $2135, $3B1, $101, $2A3F, $26, $26, $2227, $2A55, $2A5C, $2A58, $2A5A, $2220,
+    $29A4, $2220, $2221, $29A8, $29A9, $29AA, $29AB, $29AC, $29AD, $29AE, $29AF, $221F, $22BE, $299D, $2222, $C5,
+    $237C, $105, $1D552, $2248, $2A70, $2A6F, $224A, $224B, $27, $2248, $224A, $E5, $E5, $1D4B6, $2A, $2248, $224D,
+    $E3, $E3, $E4, $E4, $2233, $2A11, $2AED, $224C, $3F6, $2035, $223D, $22CD, $22BD, $2305, $2305, $23B5, $23B6,
+    $224C, $431, $201E, $2235, $2235, $29B0, $3F6, $212C, $3B2, $2136, $226C, $1D51F, $22C2, $25EF, $22C3, $2A00,
+    $2A01, $2A02, $2A06, $2605, $25BD, $25B3, $2A04, $22C1, $22C0, $290D, $29EB, $25AA, $25B4, $25BE, $25C2, $25B8,
+    $2423, $2592, $2591, $2593, $2588, $3D, $2261, $2310, $1D553, $22A5, $22A5, $22C8, $2557, $2554, $2556, $2553,
+    $2550, $2566, $2569, $2564, $2567, $255D, $255A, $255C, $2559, $2551, $256C, $2563, $2560, $256B, $2562, $255F,
+    $29C9, $2555, $2552, $2510, $250C, $2500, $2565, $2568, $252C, $2534, $229F, $229E, $22A0, $255B, $2558, $2518,
+    $2514, $2502, $256A, $2561, $255E, $253C, $2524, $251C, $2035, $2D8, $A6, $A6, $1D4B7, $204F, $223D, $22CD, $5C,
+    $29C5, $27C8, $2022, $2022, $224E, $2AAE, $224F, $224F, $107, $2229, $2A44, $2A49, $2A4B, $2A47, $2A40, $2229,
+    $2041, $2C7, $2A4D, $10D, $E7, $E7, $109, $2A4C, $2A50, $10B, $B8, $B8, $29B2, $A2, $A2, $B7, $1D520, $447,
+    $2713, $2713, $3C7, $25CB, $29C3, $2C6, $2257, $21BA, $21BB, $AE, $24C8, $229B, $229A, $229D, $2257, $2A10,
+    $2AEF, $29C2, $2663, $2663, $3A, $2254, $2254, $2C, $40, $2201, $2218, $2201, $2102, $2245, $2A6D, $222E,
+    $1D554, $2210, $A9, $A9, $2117, $21B5, $2717, $1D4B8, $2ACF, $2AD1, $2AD0, $2AD2, $22EF, $2938, $2935, $22DE,
+    $22DF, $21B6, $293D, $222A, $2A48, $2A46, $2A4A, $228D, $2A45, $222A, $21B7, $293C, $22DE, $22DF, $22CE, $22CF,
+    $A4, $A4, $21B6, $21B7, $22CE, $22CF, $2232, $2231, $232D, $21D3, $2965, $2020, $2138, $2193, $2010, $22A3,
+    $290F, $2DD, $10F, $434, $2146, $2021, $21CA, $2A77, $B0, $B0, $3B4, $29B1, $297F, $1D521, $21C3, $21C2, $22C4,
+    $22C4, $2666, $2666, $A8, $3DD, $22F2, $F7, $F7, $F7, $22C7, $22C7, $452, $231E, $230D, $24, $1D555, $2D9,
+    $2250, $2251, $2238, $2214, $22A1, $2306, $2193, $21CA, $21C3, $21C2, $2910, $231F, $230C, $1D4B9, $455, $29F6,
+    $111, $22F1, $25BF, $25BE, $21F5, $296F, $29A6, $45F, $27FF, $2A77, $2251, $E9, $E9, $2A6E, $11B, $2256, $EA,
+    $EA, $2255, $44D, $117, $2147, $2252, $1D522, $2A9A, $E8, $E8, $2A96, $2A98, $2A99, $23E7, $2113, $2A95, $2A97,
+    $113, $2205, $2205, $2205, $2004, $2005, $2003, $14B, $2002, $119, $1D556, $22D5, $29E3, $2A71, $3B5, $3B5,
+    $3F5, $2256, $2255, $2242, $2A96, $2A95, $3D, $225F, $2261, $2A78, $29E5, $2253, $2971, $212F, $2250, $2242,
+    $3B7, $F0, $F0, $EB, $EB, $20AC, $21, $2203, $2130, $2147, $2252, $444, $2640, $FB03, $FB00, $FB04, $1D523,
+    $FB01, $66, $266D, $FB02, $25B1, $192, $1D557, $2200, $22D4, $2AD9, $2A0D, $BD, $BD, $2153, $BC, $BC, $2155,
+    $2159, $215B, $2154, $2156, $BE, $BE, $2157, $215C, $2158, $215A, $215D, $215E, $2044, $2322, $1D4BB, $2267,
+    $2A8C, $1F5, $3B3, $3DD, $2A86, $11F, $11D, $433, $121, $2265, $22DB, $2265, $2267, $2A7E, $2A7E, $2AA9, $2A80,
+    $2A82, $2A84, $22DB, $2A94, $1D524, $226B, $22D9, $2137, $453, $2277, $2A92, $2AA5, $2AA4, $2269, $2A8A, $2A8A,
+    $2A88, $2A88, $2269, $22E7, $1D558, $60, $210A, $2273, $2A8E, $2A90, $3E, $3E, $2AA7, $2A7A, $22D7, $2995,
+    $2A7C, $2A86, $2978, $22D7, $22DB, $2A8C, $2277, $2273, $2269, $2269, $21D4, $200A, $BD, $210B, $44A, $2194,
+    $2948, $21AD, $210F, $125, $2665, $2665, $2026, $22B9, $1D525, $2925, $2926, $21FF, $223B, $21A9, $21AA, $1D559,
+    $2015, $1D4BD, $210F, $127, $2043, $2010, $ED, $ED, $2063, $EE, $EE, $438, $435, $A1, $A1, $21D4, $1D526, $EC,
+    $EC, $2148, $2A0C, $222D, $29DC, $2129, $133, $12B, $2111, $2110, $2111, $131, $22B7, $1B5, $2208, $2105, $221E,
+    $29DD, $131, $222B, $22BA, $2124, $22BA, $2A17, $2A3C, $451, $12F, $1D55A, $3B9, $2A3C, $BF, $BF, $1D4BE, $2208,
+    $22F9, $22F5, $22F4, $22F3, $2208, $2062, $129, $456, $EF, $EF, $135, $439, $1D527, $237, $1D55B, $1D4BF, $458,
+    $454, $3BA, $3F0, $137, $43A, $1D528, $138, $445, $45C, $1D55C, $1D4C0, $21DA, $21D0, $291B, $290E, $2266,
+    $2A8B, $2962, $13A, $29B4, $2112, $3BB, $27E8, $2991, $27E8, $2A85, $AB, $AB, $2190, $21E4, $291F, $291D, $21A9,
+    $21AB, $2939, $2973, $21A2, $2AAB, $2919, $2AAD, $2AAD, $290C, $2772, $7B, $5B, $298B, $298F, $298D, $13E, $13C,
+    $2308, $7B, $43B, $2936, $201C, $201E, $2967, $294B, $21B2, $2264, $2190, $21A2, $21BD, $21BC, $21C7, $2194,
+    $21C6, $21CB, $21AD, $22CB, $22DA, $2264, $2266, $2A7D, $2A7D, $2AA8, $2A7F, $2A81, $2A83, $22DA, $2A93, $2A85,
+    $22D6, $22DA, $2A8B, $2276, $2272, $297C, $230A, $1D529, $2276, $2A91, $21BD, $21BC, $296A, $2584, $459, $226A,
+    $21C7, $231E, $296B, $25FA, $140, $23B0, $23B0, $2268, $2A89, $2A89, $2A87, $2A87, $2268, $22E6, $27EC, $21FD,
+    $27E6, $27F5, $27F7, $27FC, $27F6, $21AB, $21AC, $2985, $1D55D, $2A2D, $2A34, $2217, $5F, $25CA, $25CA, $29EB,
+    $28, $2993, $21C6, $231F, $21CB, $296D, $200E, $22BF, $2039, $1D4C1, $21B0, $2272, $2A8D, $2A8F, $5B, $2018,
+    $201A, $142, $3C, $3C, $2AA6, $2A79, $22D6, $22CB, $22C9, $2976, $2A7B, $2996, $25C3, $22B4, $25C2, $294A,
+    $2966, $2268, $2268, $223A, $AF, $AF, $2642, $2720, $2720, $21A6, $21A6, $21A7, $21A4, $21A5, $25AE, $2A29,
+    $43C, $2014, $2221, $1D52A, $2127, $B5, $B5, $2223, $2A, $2AF0, $B7, $B7, $2212, $229F, $2238, $2A2A, $2ADB,
+    $2026, $2213, $22A7, $1D55E, $2213, $1D4C2, $223E, $3BC, $22B8, $22B8, $22D9, $226B, $226B, $21CD, $21CE, $22D8,
+    $226A, $226A, $21CF, $22AF, $22AE, $2207, $144, $2220, $2249, $2A70, $224B, $149, $2249, $266E, $266E, $2115,
+    $A0, $A0, $224E, $224F, $2A43, $148, $146, $2247, $2A6D, $2A42, $43D, $2013, $2260, $21D7, $2924, $2197, $2197,
+    $2250, $2262, $2928, $2242, $2204, $2204, $1D52B, $2267, $2271, $2271, $2267, $2A7E, $2A7E, $2275, $226F, $226F,
+    $21CE, $21AE, $2AF2, $220B, $22FC, $22FA, $220B, $45A, $21CD, $2266, $219A, $2025, $2270, $219A, $21AE, $2270,
+    $2266, $2A7D, $2A7D, $226E, $2274, $226E, $22EA, $22EC, $2224, $1D55F, $AC, $AC, $2209, $22F9, $22F5, $2209,
+    $22F7, $22F6, $220C, $220C, $22FE, $22FD, $2226, $2226, $2AFD, $2202, $2A14, $2280, $22E0, $2AAF, $2280, $2AAF,
+    $21CF, $219B, $2933, $219D, $219B, $22EB, $22ED, $2281, $22E1, $2AB0, $1D4C3, $2224, $2226, $2241, $2244, $2244,
+    $2224, $2226, $22E2, $22E3, $2284, $2AC5, $2288, $2282, $2288, $2AC5, $2281, $2AB0, $2285, $2AC6, $2289, $2283,
+    $2289, $2AC6, $2279, $F1, $F1, $2278, $22EA, $22EC, $22EB, $22ED, $3BD, $23, $2116, $2007, $22AD, $2904, $224D,
+    $22AC, $2265, $3E, $29DE, $2902, $2264, $3C, $22B4, $2903, $22B5, $223C, $21D6, $2923, $2196, $2196, $2927,
+    $24C8, $F3, $F3, $229B, $229A, $F4, $F4, $43E, $229D, $151, $2A38, $2299, $29BC, $153, $29BF, $1D52C, $2DB, $F2,
+    $F2, $29C1, $29B5, $3A9, $222E, $21BA, $29BE, $29BB, $203E, $29C0, $14D, $3C9, $3BF, $29B6, $2296, $1D560,
+    $29B7, $29B9, $2295, $2228, $21BB, $2A5D, $2134, $2134, $AA, $AA, $BA, $BA, $22B6, $2A56, $2A57, $2A5B, $2134,
+    $F8, $F8, $2298, $F5, $F5, $2297, $2A36, $F6, $F6, $233D, $2225, $B6, $B6, $2225, $2AF3, $2AFD, $2202, $43F,
+    $25, $2E, $2030, $22A5, $2031, $1D52D, $3C6, $3D5, $2133, $260E, $3C0, $22D4, $3D6, $210F, $210E, $210F, $2B,
+    $2A23, $229E, $2A22, $2214, $2A25, $2A72, $B1, $B1, $2A26, $2A27, $B1, $2A15, $1D561, $A3, $A3, $227A, $2AB3,
+    $2AB7, $227C, $2AAF, $227A, $2AB7, $227C, $2AAF, $2AB9, $2AB5, $22E8, $227E, $2032, $2119, $2AB5, $2AB9, $22E8,
+    $220F, $232E, $2312, $2313, $221D, $221D, $227E, $22B0, $1D4C5, $3C8, $2008, $1D52E, $2A0C, $1D562, $2057,
+    $1D4C6, $210D, $2A16, $3F, $225F, $22, $22, $21DB, $21D2, $291C, $290F, $2964, $223D, $155, $221A, $29B3, $27E9,
+    $2992, $29A5, $27E9, $BB, $BB, $2192, $2975, $21E5, $2920, $2933, $291E, $21AA, $21AC, $2945, $2974, $21A3,
+    $219D, $291A, $2236, $211A, $290D, $2773, $7D, $5D, $298C, $298E, $2990, $159, $157, $2309, $7D, $440, $2937,
+    $2969, $201D, $201D, $21B3, $211C, $211B, $211C, $211D, $25AD, $AE, $AE, $297D, $230B, $1D52F, $21C1, $21C0,
+    $296C, $3C1, $3F1, $2192, $21A3, $21C1, $21C0, $21C4, $21CC, $21C9, $219D, $22CC, $2DA, $2253, $21C4, $21CC,
+    $200F, $23B1, $23B1, $2AEE, $27ED, $21FE, $27E7, $2986, $1D563, $2A2E, $2A35, $29, $2994, $2A12, $21C9, $203A,
+    $1D4C7, $21B1, $5D, $2019, $2019, $22CC, $22CA, $25B9, $22B5, $25B8, $29CE, $2968, $211E, $15B, $201A, $227B,
+    $2AB4, $2AB8, $161, $227D, $2AB0, $15F, $15D, $2AB6, $2ABA, $22E9, $2A13, $227F, $441, $22C5, $22A1, $2A66,
+    $21D8, $2925, $2198, $2198, $A7, $A7, $3B, $2929, $2216, $2216, $2736, $1D530, $2322, $266F, $449, $448, $2223,
+    $2225, $AD, $AD, $3C3, $3C2, $3C2, $223C, $2A6A, $2243, $2243, $2A9E, $2AA0, $2A9D, $2A9F, $2246, $2A24, $2972,
+    $2190, $2216, $2A33, $29E4, $2223, $2323, $2AAA, $2AAC, $2AAC, $44C, $2F, $29C4, $233F, $1D564, $2660, $2660,
+    $2225, $2293, $2293, $2294, $2294, $228F, $2291, $228F, $2291, $2290, $2292, $2290, $2292, $25A1, $25A1, $25AA,
+    $25AA, $2192, $1D4C8, $2216, $2323, $22C6, $2606, $2605, $3F5, $3D5, $AF, $2282, $2AC5, $2ABD, $2286, $2AC3,
+    $2AC1, $2ACB, $228A, $2ABF, $2979, $2282, $2286, $2AC5, $228A, $2ACB, $2AC7, $2AD5, $2AD3, $227B, $2AB8, $227D,
+    $2AB0, $2ABA, $2AB6, $22E9, $227F, $2211, $266A, $B9, $B9, $B2, $B2, $B3, $B3, $2283, $2AC6, $2ABE, $2AD8,
+    $2287, $2AC4, $27C9, $2AD7, $297B, $2AC2, $2ACC, $228B, $2AC0, $2283, $2287, $2AC6, $228B, $2ACC, $2AC8, $2AD4,
+    $2AD6, $21D9, $2926, $2199, $2199, $292A, $DF, $DF, $2316, $3C4, $23B4, $165, $163, $442, $20DB, $2315, $1D531,
+    $2234, $2234, $3B8, $3D1, $3D1, $2248, $223C, $2009, $2248, $223C, $FE, $FE, $2DC, $D7, $D7, $22A0, $2A31,
+    $2A30, $222D, $2928, $22A4, $2336, $2AF1, $1D565, $2ADA, $2929, $2034, $2122, $25B5, $25BF, $25C3, $22B4, $225C,
+    $25B9, $22B5, $25EC, $225C, $2A3A, $2A39, $29CD, $2A3B, $23E2, $1D4C9, $446, $45B, $167, $226C, $219E, $21A0,
+    $21D1, $2963, $FA, $FA, $2191, $45E, $16D, $FB, $FB, $443, $21C5, $171, $296E, $297E, $1D532, $F9, $F9, $21BF,
+    $21BE, $2580, $231C, $231C, $230F, $25F8, $16B, $A8, $A8, $173, $1D566, $2191, $2195, $21BF, $21BE, $228E, $3C5,
+    $3D2, $3C5, $21C8, $231D, $231D, $230E, $16F, $25F9, $1D4CA, $22F0, $169, $25B5, $25B4, $21C8, $FC, $FC, $29A7,
+    $21D5, $2AE8, $2AE9, $22A8, $299C, $3F5, $3F0, $2205, $3D5, $3D6, $221D, $2195, $3F1, $3C2, $228A, $2ACB, $228B,
+    $2ACC, $3D1, $22B2, $22B3, $432, $22A2, $2228, $22BB, $225A, $22EE, $7C, $7C, $1D533, $22B2, $2282, $2283,
+    $1D567, $221D, $22B3, $1D4CB, $2ACB, $228A, $2ACC, $228B, $299A, $175, $2A5F, $2227, $2259, $2118, $1D534,
+    $1D568, $2118, $2240, $2240, $1D4CC, $22C2, $25EF, $22C3, $25BD, $1D535, $27FA, $27F7, $3BE, $27F8, $27F5,
+    $27FC, $22FB, $2A00, $1D569, $2A01, $2A02, $27F9, $27F6, $1D4CD, $2A06, $2A04, $25B3, $22C1, $22C0, $FD, $FD,
+    $44F, $177, $44B, $A5, $A5, $1D536, $457, $1D56A, $1D4CE, $44E, $FF, $FF, $17A, $17E, $437, $17C, $2128, $3B6,
+    $1D537, $436, $21DD, $1D56B, $1D4CF, $200D, $200C);
+  { the second code point of the 93 names that have two, 0 for the rest }
+  HtmlEntCode2: array[0..2230] of Integer = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, $338, 0, 0, 0, $338, $338, 0, $338, 0, $338, $338, 0, $338, 0,
+    0, 0, 0, $338, $338, 0, $338, $338, 0, $338, 0, 0, 0, $338, 0, $338, 0, $338, 0, $20D2, 0, 0, $338, 0, $338,
+    $20D2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, $200A, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, $333, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, $20E5, $20E5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, $FE00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, $FE00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, $6A, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, $FE00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, $FE00, $FE00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, $FE00, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, $FE00, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, $FE00, $FE00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, $338, $20D2, $338, 0, 0, $338, $20D2, $338, 0, 0, 0, 0, 0, $20D2, 0, $338,
+    $338, 0, 0, 0, 0, 0, 0, 0, $338, $338, 0, 0, 0, 0, $338, 0, 0, 0, 0, 0, 0, 0, 0, $338, 0, 0, $338, 0, 0, 0,
+    $338, 0, 0, $338, $338, $338, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, $338, 0, 0, 0, 0, 0, 0, $338, $338, $338, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, $338, $338, 0, 0, 0, 0, 0, 0, 0, 0, 0, $20E5, $338, 0, 0, 0, $338, 0, $338, 0, 0,
+    $338, $338, 0, 0, 0, 0, 0, $338, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, $338, 0, $20D2, 0, $338, 0, $338, 0, $338, 0,
+    $20D2, 0, $338, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, $20D2, 0, $20D2, $20D2, 0, 0, $20D2, $20D2, $20D2, 0,
+    $20D2, $20D2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, $331, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, $FE00, 0, 0, 0, 0, 0, 0, 0, 0, 0, $FE00, 0, $FE00,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, $FE00, $FE00, $FE00, $FE00, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, $20D2, $20D2, 0, 0, 0, 0, $FE00, $FE00, $FE00, $FE00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+{ ---- end of the entities ---- }
+
+const
+  { the code points of &#x80; to &#x9F; (13.2.5.80): what Windows-1252 has
+    there, the five undefined ones themselves }
+  NumRef80: array[0..31] of Integer = ($20AC, $81, $201A, $0192, $201E, $2026, $2020, $2021, $02C6, $2030, $0160, $2039, $0152,
+    $8D, $017D, $8F, $90, $2018, $2019, $201C, $201D, $2022, $2013, $2014, $02DC, $2122, $0161, $203A, $0153, $9D, $017E, $0178);
+  { no legacy name is longer than this (13.2.5.78's table) }
+  LongestLegacy = 6;
+
+function IsAlpha(C: Char): Boolean;
+begin
+  Result := ((C >= 'a') and (C <= 'z')) or ((C >= 'A') and (C <= 'Z'));
+end;
+
+function IsDigit(C: Char): Boolean;
+begin
+  Result := (C >= '0') and (C <= '9');
+end;
+
+function IsAlnum(C: Char): Boolean;
+begin
+  Result := IsAlpha(C) or IsDigit(C);
+end;
+
+{ the ASCII whitespace of the standard: TAB, LF, FF and SPACE (CR is gone
+  after the normalization) }
+function IsSpace(C: Char): Boolean;
+begin
+  Result := (C = ' ') or (C = #9) or (C = #10) or (C = #12);
+end;
+
+function Lower(C: Char): Char;
+begin
+  if (C >= 'A') and (C <= 'Z') then
+    Result := Chr(Ord(C) + 32)
+  else
+    Result := C;
+end;
+
+function LowerAscii(const S: string): string;
+var
+  i: Integer;
+begin
+  Result := S;
+  for i := 1 to Length(Result) do
+    Result[i] := Lower(Result[i]);
+end;
+
+procedure AddRune(B: TStringBuilder; R: Integer);
+begin
+  if R < $80 then
+    B.AddChar(Chr(R))
+  else if R < $800 then
+  begin
+    B.AddChar(Chr($C0 or (R shr 6)));
+    B.AddChar(Chr($80 or (R and $3F)));
+  end
+  else if R < $10000 then
+  begin
+    B.AddChar(Chr($E0 or (R shr 12)));
+    B.AddChar(Chr($80 or ((R shr 6) and $3F)));
+    B.AddChar(Chr($80 or (R and $3F)));
+  end
+  else
+  begin
+    B.AddChar(Chr($F0 or (R shr 18)));
+    B.AddChar(Chr($80 or ((R shr 12) and $3F)));
+    B.AddChar(Chr($80 or ((R shr 6) and $3F)));
+    B.AddChar(Chr($80 or (R and $3F)));
+  end;
+end;
+
+{ the index of the name in the table, -1 when it is not there }
+function EntityIndex(const Nm: string): Integer;
+var
+  lo, hi, mid, c: Integer;
+begin
+  Result := -1;
+  lo := 0;
+  hi := HtmlEntCount - 1;
+  while lo <= hi do
+  begin
+    mid := (lo + hi) div 2;
+    c := CompareStr(HtmlEntName[mid], Nm);
+    if c = 0 then
+    begin
+      Result := mid;
+      Exit;
+    end;
+    if c < 0 then
+      lo := mid + 1
+    else
+      hi := mid - 1;
+  end;
+end;
+
+procedure AddEntity(B: TStringBuilder; Idx: Integer);
+begin
+  AddRune(B, HtmlEntCode[Idx]);
+  if HtmlEntCode2[Idx] <> 0 then
+    AddRune(B, HtmlEntCode2[Idx]);
+end;
+
+{ the reference at S[I] (an ampersand) written to B as the standard decodes
+  it; I moves past what was consumed. InAttr: the rules of an attribute
+  value. NulToFffd: a U+0000 in the text itself becomes U+FFFD (the states
+  that say so) instead of being dropped. }
+procedure Unescape(const S: string; InAttr: Boolean; B: TStringBuilder);
+var
+  i, j, k, n, code, d, L, idx: Integer;
+  isHex, semi: Boolean;
+  nm: string;
+begin
+  n := Length(S);
+  i := 1;
+  while i <= n do
+  begin
+    if S[i] <> '&' then
+    begin
+      B.AddChar(S[i]);
+      i := i + 1;
+      Continue;
+    end;
+    j := i + 1;
+    if (j <= n) and (S[j] = '#') then
+    begin
+      k := j + 1;
+      isHex := (k <= n) and ((S[k] = 'x') or (S[k] = 'X'));
+      if isHex then
+        k := k + 1;
+      code := 0;
+      d := k;
+      while k <= n do
+      begin
+        if IsDigit(S[k]) then
+          L := Ord(S[k]) - 48
+        else if isHex and (S[k] >= 'a') and (S[k] <= 'f') then
+          L := Ord(S[k]) - 87
+        else if isHex and (S[k] >= 'A') and (S[k] <= 'F') then
+          L := Ord(S[k]) - 55
+        else
+          Break;
+        if code < $110000 then
+          if isHex then
+            code := code * 16 + L
+          else
+            code := code * 10 + L;
+        k := k + 1;
+      end;
+      if k = d then
+      begin
+        { no digits: &# or &#x stay as they are }
+        B.AddText(Copy(S, i, k - i));
+        i := k;
+        Continue;
+      end;
+      if (k <= n) and (S[k] = ';') then
+        k := k + 1;
+      if (code = 0) or (code > $10FFFF) or ((code >= $D800) and (code <= $DFFF)) then
+        code := $FFFD
+      else if (code >= $80) and (code <= $9F) then
+        code := NumRef80[code - $80];
+      AddRune(B, code);
+      i := k;
+      Continue;
+    end;
+    if (j <= n) and IsAlnum(S[j]) then
+    begin
+      k := j;
+      while (k <= n) and IsAlnum(S[k]) do
+        k := k + 1;
+      nm := Copy(S, j, k - j);
+      semi := (k <= n) and (S[k] = ';');
+      if semi then
+      begin
+        idx := EntityIndex(nm + ';');
+        if idx >= 0 then
+        begin
+          AddEntity(B, idx);
+          i := k + 1;
+          Continue;
+        end;
+      end;
+      { a legacy name without its semicolon: the whole run, or in text its longest prefix }
+      idx := EntityIndex(nm);
+      if (idx >= 0) and InAttr and (k <= n) and (S[k] = '=') then
+        idx := -1;
+      if idx >= 0 then
+      begin
+        AddEntity(B, idx);
+        i := k;
+        Continue;
+      end;
+      if not InAttr then
+      begin
+        L := Length(nm);
+        if L > LongestLegacy then
+          L := LongestLegacy;
+        while L >= 2 do
+        begin
+          idx := EntityIndex(Copy(nm, 1, L));
+          if idx >= 0 then
+            Break;
+          L := L - 1;
+        end;
+        if idx >= 0 then
+        begin
+          AddEntity(B, idx);
+          i := j + L;
+          Continue;
+        end;
+      end;
+    end;
+    { an ampersand that starts no reference }
+    B.AddChar('&');
+    i := j;
+  end;
+end;
+
+function HtmlUnescape(const S: string): string;
+var
+  b: TStringBuilder;
+begin
+  if Pos('&', S) = 0 then
+  begin
+    Result := S;
+    Exit;
+  end;
+  b := TStringBuilder.Create(Length(S));
+  Unescape(S, False, b);
+  Result := b.ToString;
+end;
+
+function HtmlUnescapeAttr(const S: string): string;
+var
+  b: TStringBuilder;
+begin
+  if Pos('&', S) = 0 then
+  begin
+    Result := S;
+    Exit;
+  end;
+  b := TStringBuilder.Create(Length(S));
+  Unescape(S, True, b);
+  Result := b.ToString;
+end;
+
+function HtmlEscape(const S: string): string;
+var
+  b: TStringBuilder;
+  i: Integer;
+begin
+  b := TStringBuilder.Create(Length(S) + 16);
+  for i := 1 to Length(S) do
+    case S[i] of
+      '&': b.AddText('&amp;');
+      '<': b.AddText('&lt;');
+      '>': b.AddText('&gt;');
+      '"': b.AddText('&#34;');
+      '''': b.AddText('&#39;');
+    else
+      b.AddChar(S[i]);
+    end;
+  Result := b.ToString;
+end;
+
+function HtmlNormalizeNewlines(const S: string): string;
+var
+  b: TStringBuilder;
+  i, n: Integer;
+begin
+  if Pos(#13, S) = 0 then
+  begin
+    Result := S;
+    Exit;
+  end;
+  n := Length(S);
+  b := TStringBuilder.Create(n);
+  i := 1;
+  while i <= n do
+  begin
+    if S[i] = #13 then
+    begin
+      b.AddChar(#10);
+      if (i < n) and (S[i + 1] = #10) then
+        i := i + 1;
+    end
+    else
+      b.AddChar(S[i]);
+    i := i + 1;
+  end;
+  Result := b.ToString;
+end;
+
+{ a U+0000 of a tag name, an attribute, a comment or raw text is U+FFFD }
+function NulToFffd(const S: string): string;
+var
+  b: TStringBuilder;
+  i: Integer;
+begin
+  if Pos(#0, S) = 0 then
+  begin
+    Result := S;
+    Exit;
+  end;
+  b := TStringBuilder.Create(Length(S) + 8);
+  for i := 1 to Length(S) do
+    if S[i] = #0 then
+      AddRune(b, $FFFD)
+    else
+      b.AddChar(S[i]);
+  Result := b.ToString;
+end;
+
+{ a U+0000 of the data state is dropped (the tree builder ignores it) }
+function DropNul(const S: string): string;
+var
+  b: TStringBuilder;
+  i: Integer;
+begin
+  if Pos(#0, S) = 0 then
+  begin
+    Result := S;
+    Exit;
+  end;
+  b := TStringBuilder.Create(Length(S));
+  for i := 1 to Length(S) do
+    if S[i] <> #0 then
+      b.AddChar(S[i]);
+  Result := b.ToString;
+end;
+
+{ ---- the tokenizer ---- }
+
+constructor THtmlTokenizer.Create(const AText: string);
+begin
+  inherited Create;
+  SetText(AText);
+end;
+
+procedure THtmlTokenizer.SetText(const Value: string);
+begin
+  FText := HtmlNormalizeNewlines(Value);
+  FPos := 1;
+  FRaw := 0;
+  FRawName := '';
+end;
+
+function THtmlTokenizer.AttrCount: Integer;
+begin
+  Result := Length(Attrs);
+end;
+
+function THtmlTokenizer.Attr(const AName: string): string;
+var
+  i: Integer;
+  lname: string;
+begin
+  Result := '';
+  lname := LowerAscii(AName);
+  for i := 0 to Length(Attrs) - 1 do
+    if Attrs[i].Name = lname then
+    begin
+      Result := Attrs[i].Value;
+      Exit;
+    end;
+end;
+
+function THtmlTokenizer.HasAttr(const AName: string): Boolean;
+var
+  i: Integer;
+  lname: string;
+begin
+  Result := False;
+  lname := LowerAscii(AName);
+  for i := 0 to Length(Attrs) - 1 do
+    if Attrs[i].Name = lname then
+    begin
+      Result := True;
+      Exit;
+    end;
+end;
+
+{ whether a < at I opens a tag, a comment, a declaration or an end tag }
+function TagOpens(const S: string; I: Integer): Boolean;
+var
+  c: Char;
+begin
+  Result := False;
+  if (I >= Length(S)) or (S[I] <> '<') then
+    Exit;
+  c := S[I + 1];
+  Result := IsAlpha(c) or (c = '!') or (c = '/') or (c = '?');
+end;
+
+{ a run of text up to the next tag or the end }
+function THtmlTokenizer.TextRun: Boolean;
+var
+  n, i: Integer;
+begin
+  n := Length(FText);
+  i := FPos;
+  repeat
+    i := i + 1;
+  until (i > n) or ((FText[i] = '<') and TagOpens(FText, i));
+  Kind := hkText;
+  Name := '';
+  SetLength(Attrs, 0);
+  SelfClosing := False;
+  Start := FPos;
+  Stop := i;
+  Data := HtmlUnescape(DropNul(Copy(FText, FPos, i - FPos)));
+  FPos := i;
+  Result := True;
+end;
+
+{ inside a raw text element: the text up to the appropriate end tag, then
+  the end tag itself }
+function THtmlTokenizer.RawTextToken: Boolean;
+var
+  n, i, k, m: Integer;
+  found: Boolean;
+  c: Char;
+begin
+  n := Length(FText);
+  if FRaw = 3 then
+  begin
+    { plaintext: everything to the end }
+    Kind := hkText;
+    Name := '';
+    SetLength(Attrs, 0);
+    SelfClosing := False;
+    Start := FPos;
+    Stop := n + 1;
+    Data := NulToFffd(Copy(FText, FPos, n - FPos + 1));
+    FPos := n + 1;
+    Result := True;
+    Exit;
+  end;
+  m := Length(FRawName);
+  i := FPos;
+  found := False;
+  while i <= n do
+  begin
+    if (FText[i] = '<') and (i + 1 <= n) and (FText[i + 1] = '/') and (i + 1 + m <= n) and
+      (LowerAscii(Copy(FText, i + 2, m)) = FRawName) then
+    begin
+      { the appropriate end tag: its name and then white space, / or >; at the end of the text it is text, as
+        13.2.5.14's anything-else says (Python reads it so too) }
+      k := i + 2 + m;
+      if k <= n then
+      begin
+        c := FText[k];
+        if IsSpace(c) or (c = '/') or (c = '>') then
+        begin
+          found := True;
+          Break;
+        end;
+      end;
+    end;
+    i := i + 1;
+  end;
+  if not found then
+    i := n + 1;
+  if i > FPos then
+  begin
+    Kind := hkText;
+    Name := '';
+    SetLength(Attrs, 0);
+    SelfClosing := False;
+    Start := FPos;
+    Stop := i;
+    Data := NulToFffd(Copy(FText, FPos, i - FPos));
+    if FRaw = 1 then
+      Data := HtmlUnescape(Data);
+    FPos := i;
+    Result := True;
+    Exit;
+  end;
+  { at the end tag (i = FPos <= n, since the loop above stopped on it) }
+  FRaw := 0;
+  FRawName := '';
+  Result := ReadTag;
+end;
+
+{ the attributes of a tag, from FPos (after the name) to past its >; Keep
+  False for an end tag, whose attributes are read and dropped. False when
+  the end of the text comes first (the tag is dropped). }
+procedure THtmlTokenizer.ReadAttributes(Keep: Boolean);
+var
+  n, i, k: Integer;
+  nm, v: string;
+  q: Char;
+  dup: Boolean;
+begin
+  n := Length(FText);
+  while True do
+  begin
+    while (FPos <= n) and IsSpace(FText[FPos]) do
+      FPos := FPos + 1;
+    if FPos > n then
+      Exit;
+    if FText[FPos] = '>' then
+    begin
+      FPos := FPos + 1;
+      Exit;
+    end;
+    if FText[FPos] = '/' then
+    begin
+      if (FPos < n) and (FText[FPos + 1] = '>') then
+      begin
+        SelfClosing := Keep;
+        FPos := FPos + 2;
+        Exit;
+      end;
+      FPos := FPos + 1;
+      Continue;
+    end;
+    { the name: an = first is part of it (13.2.5.32) }
+    i := FPos;
+    if FText[i] = '=' then
+      i := i + 1;
+    while (i <= n) and not (IsSpace(FText[i]) or (FText[i] = '/') or (FText[i] = '>') or (FText[i] = '=')) do
+      i := i + 1;
+    nm := LowerAscii(NulToFffd(Copy(FText, FPos, i - FPos)));
+    FPos := i;
+    while (FPos <= n) and IsSpace(FText[FPos]) do
+      FPos := FPos + 1;
+    v := '';
+    if (FPos <= n) and (FText[FPos] = '=') then
+    begin
+      FPos := FPos + 1;
+      while (FPos <= n) and IsSpace(FText[FPos]) do
+        FPos := FPos + 1;
+      if FPos > n then
+        Exit;
+      if (FText[FPos] = '"') or (FText[FPos] = '''') then
+      begin
+        q := FText[FPos];
+        k := FPos + 1;
+        while (k <= n) and (FText[k] <> q) do
+          k := k + 1;
+        if k > n then
+        begin
+          FPos := k;
+          Exit;
+        end;
+        v := HtmlUnescapeAttr(NulToFffd(Copy(FText, FPos + 1, k - FPos - 1)));
+        FPos := k + 1;
+      end
+      else
+      begin
+        k := FPos;
+        while (k <= n) and not (IsSpace(FText[k]) or (FText[k] = '>')) do
+          k := k + 1;
+        v := HtmlUnescapeAttr(NulToFffd(Copy(FText, FPos, k - FPos)));
+        FPos := k;
+      end;
+    end;
+    if Keep then
+    begin
+      dup := False;
+      for k := 0 to Length(Attrs) - 1 do
+        if Attrs[k].Name = nm then
+          dup := True;
+      if not dup then
+      begin
+        SetLength(Attrs, Length(Attrs) + 1);
+        Attrs[Length(Attrs) - 1].Name := nm;
+        Attrs[Length(Attrs) - 1].Value := v;
+      end;
+    end;
+  end;
+end;
+
+{ a start or an end tag at FPos (a < then a letter, or </ then a letter);
+  False when the text ends inside it }
+function THtmlTokenizer.ReadTag: Boolean;
+var
+  n, i, at0: Integer;
+  ending: Boolean;
+begin
+  n := Length(FText);
+  at0 := FPos;
+  ending := FText[FPos + 1] = '/';
+  if ending then
+    FPos := FPos + 2
+  else
+    FPos := FPos + 1;
+  i := FPos;
+  while (i <= n) and not (IsSpace(FText[i]) or (FText[i] = '/') or (FText[i] = '>')) do
+    i := i + 1;
+  Name := LowerAscii(NulToFffd(Copy(FText, FPos, i - FPos)));
+  FPos := i;
+  SetLength(Attrs, 0);
+  SelfClosing := False;
+  Data := '';
+  ReadAttributes(not ending);
+  if (FPos > n) and ((n = 0) or (FText[n] <> '>')) then
+  begin
+    { the text ended inside the tag: the tag is dropped, as 13.2.5.8 says (eof-in-tag) }
+    Result := False;
+    Exit;
+  end;
+  if ending then
+    Kind := hkEndTag
+  else
+    Kind := hkStartTag;
+  Start := at0;
+  Stop := FPos;
+  if not ending then
+  begin
+    if (Name = 'title') or (Name = 'textarea') then
+    begin
+      FRaw := 1;
+      FRawName := Name;
+    end
+    else if (Name = 'script') or (Name = 'style') or (Name = 'xmp') or (Name = 'iframe') or (Name = 'noembed') or
+      (Name = 'noframes') then
+    begin
+      FRaw := 2;
+      FRawName := Name;
+    end
+    else if Name = 'plaintext' then
+      FRaw := 3;
+  end;
+  Result := True;
+end;
+
+{ a bogus comment: the data from From to the first >, or to the end }
+procedure THtmlTokenizer.BogusComment(From: Integer);
+var
+  n, i: Integer;
+begin
+  n := Length(FText);
+  i := From;
+  while (i <= n) and (FText[i] <> '>') do
+    i := i + 1;
+  Kind := hkComment;
+  Name := '';
+  SetLength(Attrs, 0);
+  SelfClosing := False;
+  Data := NulToFffd(Copy(FText, From, i - From));
+  Stop := i + 1;
+  if i > n then
+    Stop := n + 1;
+  FPos := Stop;
+end;
+
+{ <! at FPos: a comment, a doctype, or a bogus comment }
+function THtmlTokenizer.ReadMarkupDeclaration: Boolean;
+var
+  n, i, k, from: Integer;
+  w: string;
+begin
+  n := Length(FText);
+  Start := FPos;
+  Result := True;
+  if Copy(FText, FPos + 2, 2) = '--' then
+  begin
+    from := FPos + 4;
+    Kind := hkComment;
+    Name := '';
+    SetLength(Attrs, 0);
+    SelfClosing := False;
+    { <!--> and <!---> are empty comments (abrupt-closing-of-empty-comment) }
+    if (from <= n) and (FText[from] = '>') then
+    begin
+      Data := '';
+      FPos := from + 1;
+      Stop := FPos;
+      Exit;
+    end;
+    if (from < n) and (FText[from] = '-') and (FText[from + 1] = '>') then
+    begin
+      Data := '';
+      FPos := from + 2;
+      Stop := FPos;
+      Exit;
+    end;
+    i := from;
+    while i <= n do
+    begin
+      if (FText[i] = '-') and (i + 2 <= n) and (FText[i + 1] = '-') then
+      begin
+        if FText[i + 2] = '>' then
+        begin
+          k := i + 3;
+          Break;
+        end;
+        if (FText[i + 2] = '!') and (i + 3 <= n) and (FText[i + 3] = '>') then
+        begin
+          k := i + 4;
+          Break;
+        end;
+      end;
+      i := i + 1;
+    end;
+    if i > n then
+    begin
+      i := n + 1;
+      k := n + 1;
+    end;
+    Data := NulToFffd(Copy(FText, from, i - from));
+    FPos := k;
+    Stop := k;
+    Exit;
+  end;
+  w := LowerAscii(Copy(FText, FPos + 2, 7));
+  if w = 'doctype' then
+  begin
+    Kind := hkDoctype;
+    SetLength(Attrs, 0);
+    SelfClosing := False;
+    i := FPos + 9;
+    while (i <= n) and IsSpace(FText[i]) do
+      i := i + 1;
+    k := i;
+    while (k <= n) and not (IsSpace(FText[k]) or (FText[k] = '>')) do
+      k := k + 1;
+    Name := LowerAscii(NulToFffd(Copy(FText, i, k - i)));
+    i := k;
+    while (i <= n) and (FText[i] <> '>') do
+      i := i + 1;
+    Data := Trim(NulToFffd(Copy(FText, k, i - k)));
+    if i > n then
+      FPos := n + 1
+    else
+      FPos := i + 1;
+    Stop := FPos;
+    Exit;
+  end;
+  { [CDATA[ in HTML content, and anything else: a bogus comment from after the <! }
+  BogusComment(FPos + 2);
+  Start := Start;
+end;
+
+function THtmlTokenizer.Next: Boolean;
+var
+  n: Integer;
+  c: Char;
+begin
+  Result := False;
+  n := Length(FText);
+  while FPos <= n do
+  begin
+    if FRaw <> 0 then
+    begin
+      Result := RawTextToken;
+      Exit;
+    end;
+    if (FText[FPos] <> '<') or not TagOpens(FText, FPos) then
+    begin
+      Result := TextRun;
+      Exit;
+    end;
+    c := FText[FPos + 1];
+    if c = '!' then
+    begin
+      Result := ReadMarkupDeclaration;
+      Exit;
+    end;
+    if c = '?' then
+    begin
+      Start := FPos;
+      BogusComment(FPos + 1);
+      Result := True;
+      Exit;
+    end;
+    if c = '/' then
+    begin
+      if FPos + 2 > n then
+      begin
+        { </ at the very end is text }
+        Kind := hkText;
+        Name := '';
+        SetLength(Attrs, 0);
+        SelfClosing := False;
+        Start := FPos;
+        Stop := n + 1;
+        Data := Copy(FText, FPos, n - FPos + 1);
+        FPos := n + 1;
+        Result := True;
+        Exit;
+      end;
+      if IsAlpha(FText[FPos + 2]) then
+      begin
+        Result := ReadTag;
+        Exit;
+      end;
+      if FText[FPos + 2] = '>' then
+      begin
+        { </> is nothing (missing-end-tag-name) }
+        FPos := FPos + 3;
+        Continue;
+      end;
+      Start := FPos;
+      BogusComment(FPos + 2);
+      Result := True;
+      Exit;
+    end;
+    { a letter: a start tag }
+    Result := ReadTag;
+    Exit;
+  end;
+end;
+
+{ ---- the text of an HTML document ---- }
+
+{ the elements a reader lays out as blocks: a line break before and after }
+function IsBlock(const Nm: string): Boolean;
+begin
+  Result := (Nm = 'div') or (Nm = 'tr') or (Nm = 'li') or (Nm = 'dd') or (Nm = 'dt') or (Nm = 'section') or (Nm = 'article') or
+    (Nm = 'header') or (Nm = 'footer') or (Nm = 'nav') or (Nm = 'aside') or (Nm = 'main') or (Nm = 'form') or
+    (Nm = 'fieldset') or (Nm = 'address') or (Nm = 'figure') or (Nm = 'figcaption') or (Nm = 'details') or
+    (Nm = 'summary') or (Nm = 'center') or (Nm = 'dir') or (Nm = 'menu') or (Nm = 'tbody') or (Nm = 'thead') or
+    (Nm = 'tfoot') or (Nm = 'caption') or (Nm = 'legend') or (Nm = 'option') or (Nm = 'body') or (Nm = 'html') or
+    (Nm = 'dl') or (Nm = 'colgroup');
+end;
+
+{ the blocks a blank line surrounds }
+function IsParagraph(const Nm: string): Boolean;
+begin
+  Result := (Nm = 'p') or (Nm = 'h1') or (Nm = 'h2') or (Nm = 'h3') or (Nm = 'h4') or (Nm = 'h5') or (Nm = 'h6') or
+    (Nm = 'table') or (Nm = 'ul') or (Nm = 'ol') or (Nm = 'blockquote') or (Nm = 'pre') or (Nm = 'hr');
+end;
+
+function HtmlToText(const S: string): string;
+var
+  tk: THtmlTokenizer;
+  b: TStringBuilder;
+  i, n, pre, skip, lineStart, blank, lf: Integer;
+  pending, inHead, dropLf: Boolean;
+  d, r: string;
+
+  { a line break, when something is on the line; Two asks for a blank line too }
+  procedure LineBreak(Two: Boolean);
+  begin
+    if b.ByteLength = 0 then
+      Exit;
+    if lf = 0 then
+    begin
+      b.AddChar(#10);
+      lf := 1;
+    end;
+    if Two and (lf = 1) then
+    begin
+      b.AddChar(#10);
+      lf := 2;
+    end;
+    pending := False;
+  end;
+
+begin
+  tk := THtmlTokenizer.Create(S);
+  b := TStringBuilder.Create(Length(S));
+  pre := 0;
+  skip := 0;
+  lf := 0;
+  pending := False;
+  inHead := False;
+  dropLf := False;
+  while tk.Next do
+  begin
+    case tk.Kind of
+      hkText:
+        begin
+          if inHead or (skip > 0) then
+            Continue;
+          d := tk.Data;
+          if dropLf then
+          begin
+            dropLf := False;
+            if (d <> '') and (d[1] = #10) then
+              d := Copy(d, 2, Length(d) - 1);
+          end;
+          n := Length(d);
+          i := 1;
+          while i <= n do
+          begin
+            if (d[i] = #194) and (i < n) and (d[i + 1] = #160) then
+            begin
+              { a no-break space is a space }
+              d[i] := ' ';
+              d[i + 1] := ' ';
+              i := i + 1;
+              if pre > 0 then
+                b.AddChar(' ')
+              else
+                pending := True;
+            end
+            else if pre > 0 then
+            begin
+              b.AddChar(d[i]);
+              if d[i] = #10 then
+                lf := 1
+              else
+                lf := 0;
+            end
+            else if IsSpace(d[i]) then
+              pending := True
+            else
+            begin
+              if pending and (lf = 0) and (b.ByteLength > 0) then
+                b.AddChar(' ');
+              pending := False;
+              b.AddChar(d[i]);
+              lf := 0;
+            end;
+            i := i + 1;
+          end;
+        end;
+      hkStartTag:
+        begin
+          d := tk.Name;
+          if d = 'head' then
+            inHead := True
+          else if d = 'body' then
+            inHead := False
+          else if d = 'template' then
+            skip := skip + 1
+          else if d = 'br' then
+          begin
+            if b.ByteLength > 0 then
+            begin
+              b.AddChar(#10);
+              lf := lf + 1;
+              pending := False;
+            end;
+          end
+          else if (d = 'td') or (d = 'th') then
+          begin
+            if (lf = 0) and (b.ByteLength > 0) then
+              b.AddChar(#9);
+            pending := False;
+          end
+          else if IsParagraph(d) then
+          begin
+            LineBreak(True);
+            if d = 'pre' then
+            begin
+              pre := pre + 1;
+              dropLf := True;
+            end;
+          end
+          else if IsBlock(d) then
+            LineBreak(False)
+          else if d = 'textarea' then
+            dropLf := True;
+        end;
+      hkEndTag:
+        begin
+          d := tk.Name;
+          if d = 'head' then
+            inHead := False
+          else if d = 'template' then
+          begin
+            if skip > 0 then
+              skip := skip - 1;
+          end
+          else if IsParagraph(d) then
+          begin
+            if (d = 'pre') and (pre > 0) then
+              pre := pre - 1;
+            LineBreak(True);
+          end
+          else if IsBlock(d) then
+            LineBreak(False);
+        end;
+    end;
+  end;
+  r := b.ToString;
+  { no line break at the end }
+  n := Length(r);
+  while (n > 0) and ((r[n] = #10) or (r[n] = ' ') or (r[n] = #9)) do
+    n := n - 1;
+  Result := Copy(r, 1, n);
+end;
+
+end.
