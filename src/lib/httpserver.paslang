@@ -290,6 +290,9 @@ type
     FServing: waitgroup;
     FDone: chan of Integer;
     FSignal: Integer;
+    { the descriptor Shutdown writes to wake every acceptor, an eventfd; -1
+      until Serve makes it (P573) }
+    FWake: Integer;
     FLogMu: mutex;
     FPort: Integer;
     { CLOCK_REALTIME less Nanotime, and when it was taken (DateNow) }
@@ -2969,6 +2972,7 @@ begin
   ShutdownTimeoutMs := HttpShutdownTimeoutMs;
   AccessLog := True;
   FDone := MakeChan(1);
+  FWake := -1;
   FWallOffset := NowNanos - Nanotime;
   FCalibrated := Nanotime;
 end;
@@ -3201,35 +3205,98 @@ begin
     r := Syscall(208, Fd, 6, 1, @one, 4);
 end;
 
+{ A system call's number: amd64's (asm/unistd_64.h), else arm64's
+  (asm-generic/unistd.h) }
+function SysNr(OnAmd64, OnArm64: Integer): Integer;
+begin
+  if Amd64 = 1 then
+    Result := OnAmd64
+  else
+    Result := OnArm64;
+end;
+
+{ epoll_ctl(2) EPOLL_CTL_ADD of Fd to Ep, for reading, level-triggered;
+  whether the poller took it. struct epoll_event is the events (4 bytes,
+  EPOLLIN 1) and 8 of data, packed on amd64 and with a pad between on
+  arm64; the data is not read. }
+function PollerAdd(Ep, Fd: Integer): Boolean;
+var
+  evt: array[0..1] of Integer;
+begin
+  evt[0] := 1;
+  Result := Syscall(SysNr(233, 21), Ep, 1, Fd, @evt) = 0;
+end;
+
+{ One listener's acceptor (P573). It tries accept4(2) without waiting and,
+  when no connection is there (EAGAIN), parks on a poller of its own that
+  holds the listener and the server's wake descriptor: Shutdown writes
+  that one and every acceptor wakes, sees FClosing and ends, as Go's
+  listener Close wakes its Accept through the poller (internal/poll's
+  FD.Close and pollDesc.evict) and touches no socket.
+
+  NetAccept slept until a connection came, so Shutdown had to make one:
+  shutdown(2) on a TCP listener, which answers accept with EINVAL but
+  also makes the socket stop listening for every holder of it, a socket
+  unit of systemd among them, which then refuses connections until the
+  unit is restarted; and on a Unix listener, where shutdown(2) wakes the
+  poller but leaves accept answering EAGAIN, a connection to the socket's
+  path, which fails when the file is gone, so the acceptor slept on and
+  the server did not stop on SIGTERM (found by the portal, 2026-11-05). }
 procedure AcceptLoop(S: THttpServer; K: Integer);
 var
-  fd: Integer;
+  fd, ep, r: Integer;
   l: THttpListener;
 begin
   l := S.FListeners[K];
+  { epoll_create1(2) with EPOLL_CLOEXEC }
+  ep := Syscall(SysNr(291, 20), 524288);
+  { a poller that does not hold both would sleep through a connection or
+    through Shutdown (no wake descriptor to be had, or the user's watches
+    all taken: ENOSPC): without one the acceptor tries again every few
+    milliseconds }
+  if (ep >= 0) and not (PollerAdd(ep, l.Fd) and PollerAdd(ep, S.FWake)) then
+  begin
+    r := Syscall(SysNr(3, 57), ep);
+    ep := -1;
+  end;
   while True do
   begin
-    fd := NetAccept(l.Fd);
+    { accept4(2): the connection nonblocking and closed on exec }
+    fd := Syscall(SysNr(288, 242), l.Fd, 0, 0, 526336);
     if AtomicLoad(S.FClosing) <> 0 then
     begin
       if fd >= 0 then
         TcpClose(fd);
       Break;
     end;
-    if fd < 0 then
+    if fd >= 0 then
     begin
-      { out of descriptors: wait a little, as Go's Serve backs off }
-      if (fd = -24) or (fd = -23) or (fd = -12) or (fd = -105) then
-        Sleep(5)
-      else if fd = -22 then
-        Break;
-      Continue;
-    end;
-    if not l.IsUnix then
-      SetNoDelayFd(fd);
-    S.FServing.Add(1);
-    pas ConnMain(S, fd);
+      if not l.IsUnix then
+        SetNoDelayFd(fd);
+      S.FServing.Add(1);
+      pas ConnMain(S, fd);
+    end
+    else if fd = -11 then
+    begin
+      { nothing waits (EAGAIN): until a connection or Shutdown's word;
+        with no poller, or one the runtime's would not take, a short
+        sleep }
+      if (ep < 0) or (WaitFd(ep) < 0) then
+        Sleep(5);
+    end
+    { no connection will ever come from it: it does not listen (EINVAL),
+      is closed (EBADF), is no socket (ENOTSOCK) or not one that takes
+      connections (EOPNOTSUPP) }
+    else if (fd = -22) or (fd = -9) or (fd = -88) or (fd = -95) then
+      Break
+    { anything else, out of descriptors or of memory, a connection gone
+      before it was taken, a signal: wait a little and try again, as Go's
+      Serve backs off. No answer of accept4 makes the acceptor spin. }
+    else
+      Sleep(5);
   end;
+  if ep >= 0 then
+    r := Syscall(SysNr(3, 57), ep);
   NetClose(l.Fd);
   { a socket file Listen made goes with it, as Go's UnixListener does }
   if l.IsUnix and (l.Path <> '') and (l.Path[1] <> '@') and (l.Path[1] <> '=') then
@@ -3242,49 +3309,48 @@ var
   i: Integer;
 begin
   WrapRoutes(FRouter);
+  { eventfd2(2), nonblocking and closed on exec: readable from Shutdown's
+    write on, for every acceptor at once. Serve makes it and closes it,
+    and Shutdown writes it, all under FMu: a write never meets a
+    descriptor that is closed, or its number given to something else. }
+  FMu.Lock;
+  if FWake < 0 then
+    FWake := Syscall(SysNr(290, 19), 0, 526336);
+  FMu.Unlock;
   for i := 0 to High(FListeners) do
   begin
     FAccepting.Add(1);
     pas AcceptLoop(Self, i);
   end;
   FAccepting.Wait;
-end;
-
-{ The routine parked in accept woken: a TCP listener by shutdown(2),
-  which makes accept answer EINVAL; a Unix one by a connection to it,
-  which shutdown does not wake (P441) }
-procedure WakeAcceptor(const L: THttpListener);
-var
-  r, c: Integer;
-  path: string;
-begin
-  if not L.IsUnix then
+  { the acceptors are gone, whoever stopped them, and the wake descriptor
+    with them: after a Shutdown that came before Serve too }
+  FMu.Lock;
+  if FWake >= 0 then
   begin
-    if Amd64 = 1 then
-      r := Syscall(48, L.Fd, 2)
-    else
-      r := Syscall(210, L.Fd, 2);
-  end
-  else
-  begin
-    path := L.Path;
-    if (path <> '') and (path[1] = '=') then
-      path := Copy(path, 2, Length(path) - 1);
-    c := UnixConnect(path);
-    if c >= 0 then
-      UnixClose(c);
+    i := Syscall(SysNr(3, 57), FWake);
+    FWake := -1;
   end;
+  FMu.Unlock;
 end;
 
 procedure THttpServer.Shutdown;
 var
   i, k, n, t, hard: Integer;
   cut: array of Integer;
+  one: Int64;
 begin
   if AtomicExchange(FClosing, 1) <> 0 then
     Exit;
-  for i := 0 to High(FListeners) do
-    WakeAcceptor(FListeners[i]);
+  { every acceptor parked on its poller wakes: the wake descriptor is
+    readable from this write on (eventfd(2): a write adds its 8 bytes'
+    number to the counter), and one that has not parked yet reads
+    FClosing after its next try (P573) }
+  one := 1;
+  FMu.Lock;
+  if FWake >= 0 then
+    k := Syscall(SysNr(1, 64), FWake, @one, 8);
+  FMu.Unlock;
   { idle connections end now (shutdown(2) wakes their read); the others
     after the answer in flight, within ShutdownTimeoutMs, then are cut;
     a handler that still runs a second after is left to end on its own

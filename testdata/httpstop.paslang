@@ -1,0 +1,333 @@
+{ P573: Shutdown stops a server whatever became of its sockets. The
+  acceptors are woken through the poller, so nothing depends on the
+  socket's file or on what shutdown(2) does to a listening socket:
+
+  - a server on a Unix socket stops with its file there, and with the
+    file removed by someone else while it served (the portal's case: its
+    server did not stop on SIGTERM once the file was gone);
+  - a TCP server stops, and its port can be listened on again at once;
+  - a server with a Unix and a TCP listener stops both;
+  - Shutdown before Serve: Serve returns at once;
+  - a server with nothing to listen on: Serve returns at once, and a
+    Shutdown after it writes to no descriptor (the server's wake
+    descriptor is closed by then and its number is another's);
+  - a connection that comes in the instant of Shutdown is closed, taken
+    or not;
+  - ServeUntilSignal returns SIGTERM, the file removed first;
+  - and every server closed what it opened: the process has as many
+    descriptors open after them all as before them (the runtime's own
+    and the signal unit's are opened first, by a server and a watch).
+
+  With an argument it serves until a signal, for scripts/httpstop_check.py,
+  which plays systemd's part: unix PATH listens there itself, systemd takes
+  the sockets passed as sd_listen_fds(3) says. }
+program httpstop;
+
+uses
+  sysutils, pasnet, pashttp, pasurl, passignal, httpclient, httpserver;
+
+var
+  wg: waitgroup;
+  pid, mark: Integer;
+
+{ The descriptors the process has open among the first 256: fcntl(2)
+  F_GETFD answers for one that is. }
+function OpenCount: Integer;
+var
+  fd, nr: Integer;
+begin
+  if Amd64 = 1 then
+    nr := 72
+  else
+    nr := 25;
+  Result := 0;
+  for fd := 0 to 255 do
+    if Syscall(nr, fd, 1, 0) >= 0 then
+      Result := Result + 1;
+end;
+
+procedure Hola(Req: THttpRequest; Resp: THttpResponse);
+begin
+  Resp.ReplyText(200, 'hola' + #10);
+end;
+
+function NewServer: THttpServer;
+var
+  router: THttpRouter;
+begin
+  router := THttpRouter.Create;
+  router.Handle('GET', '/hola', @Hola);
+  Result := THttpServer.Create(router);
+  Result.AccessLog := False;
+end;
+
+procedure RunServer(S: THttpServer);
+begin
+  S.Serve;
+  wg.Done;
+end;
+
+function SockPath(N: Integer): string;
+begin
+  Result := '/tmp/httpstop-' + IntToStr(pid) + '-' + IntToStr(N) + '.sock';
+end;
+
+{ GET /hola over the Unix socket at Path, or over TCP at Port }
+function Ask(const Path: string; Port: Integer): string;
+var
+  c: THttpClient;
+  r: THttpClientResponse;
+begin
+  c := THttpClient.Create;
+  c.TimeoutMs := 20000;
+  c.DisableKeepAlives := True;
+  if Path <> '' then
+  begin
+    c.UnixPath := Path;
+    r := c.Get('http://unix/hola');
+  end
+  else
+    r := c.Get('http://127.0.0.1:' + IntToStr(Port) + '/hola');
+  Result := IntToStr(r.Status) + ' ' + Trim(r.ReadAll(0));
+end;
+
+{ The signal unit opens its descriptor at the first watch and keeps it. }
+procedure FirstWatch;
+var
+  c: chan of Integer;
+begin
+  c := MakeChan(1);
+  SignalNotify(c, [SIGTERM]);
+  SignalStop(c);
+end;
+
+procedure UnixCase(N: Integer; Remove: Boolean; const What: string);
+var
+  s: THttpServer;
+  p: string;
+begin
+  p := SockPath(N);
+  s := NewServer;
+  if not s.ListenUnix(p, 0, '') then
+  begin
+    WriteLn(What, ': cannot listen');
+    Exit;
+  end;
+  wg.Add(1);
+  pas RunServer(s);
+  Write(What, ': ', Ask(p, 0));
+  if Remove then
+    DeleteFile(p);
+  { the acceptor is parked again by now, or will find FClosing set }
+  Sleep(50);
+  s.Shutdown;
+  wg.Wait;
+  WriteLn(', stopped, file there after: ', FileExists(p));
+end;
+
+procedure TcpCase;
+var
+  s, again: THttpServer;
+  port: Integer;
+begin
+  s := NewServer;
+  if not s.ListenTcp('127.0.0.1', 0) then
+  begin
+    WriteLn('tcp: cannot listen');
+    Exit;
+  end;
+  port := s.Port;
+  wg.Add(1);
+  pas RunServer(s);
+  Write('tcp: ', Ask('', port));
+  Sleep(50);
+  s.Shutdown;
+  wg.Wait;
+  Write(', stopped');
+  again := NewServer;
+  if again.ListenTcp('127.0.0.1', port) then
+  begin
+    wg.Add(1);
+    pas RunServer(again);
+    Write('; the port again: ', Ask('', port));
+    again.Shutdown;
+    wg.Wait;
+    WriteLn(', stopped');
+  end
+  else
+    WriteLn('; the port cannot be listened on again');
+end;
+
+procedure BothCase;
+var
+  s: THttpServer;
+  p: string;
+begin
+  p := SockPath(3);
+  s := NewServer;
+  if not (s.ListenUnix(p, 0, '') and s.ListenTcp('127.0.0.1', 0)) then
+  begin
+    WriteLn('both: cannot listen');
+    Exit;
+  end;
+  wg.Add(1);
+  pas RunServer(s);
+  Write('both: unix ', Ask(p, 0), ', tcp ', Ask('', s.Port));
+  DeleteFile(p);
+  Sleep(50);
+  s.Shutdown;
+  wg.Wait;
+  WriteLn(', stopped');
+end;
+
+procedure BeforeCase;
+var
+  s: THttpServer;
+begin
+  s := NewServer;
+  if not s.ListenTcp('127.0.0.1', 0) then
+  begin
+    WriteLn('before: cannot listen');
+    Exit;
+  end;
+  s.Shutdown;
+  s.Serve;
+  WriteLn('shut down before serving: Serve returned');
+end;
+
+{ Serve with no listener returns at once and closes the wake descriptor it
+  made. The descriptor made next takes its number: an eventfd here, which
+  a read finds empty (EAGAIN) unless a late Shutdown wrote the number it
+  remembered. }
+procedure NothingCase;
+var
+  s: THttpServer;
+  e, r: Integer;
+  v: Int64;
+begin
+  s := NewServer;
+  s.Serve;
+  if Amd64 = 1 then
+    e := Syscall(290, 0, 526336)
+  else
+    e := Syscall(19, 0, 526336);
+  s.Shutdown;
+  v := 0;
+  if Amd64 = 1 then
+  begin
+    r := Syscall(0, e, @v, 8);
+    e := Syscall(3, e);
+  end
+  else
+  begin
+    r := Syscall(63, e, @v, 8);
+    e := Syscall(57, e);
+  end;
+  WriteLn('nothing to listen on: Serve returned; Shutdown after it wrote nothing: ', r = -11);
+end;
+
+{ The connection is in the listener's queue when Shutdown says to stop:
+  the acceptor takes it and closes it, or had taken it and Shutdown ends
+  it as an idle one. Either way its descriptor is not left open, which
+  the count at the end tells. }
+procedure LastCase;
+var
+  s: THttpServer;
+  p: string;
+  c: Integer;
+begin
+  p := SockPath(5);
+  s := NewServer;
+  if not s.ListenUnix(p, 0, '') then
+  begin
+    WriteLn('last: cannot listen');
+    Exit;
+  end;
+  wg.Add(1);
+  pas RunServer(s);
+  Write('a connection in the instant of Shutdown: ', Ask(p, 0));
+  Sleep(50);
+  c := UnixConnect(p);
+  s.Shutdown;
+  wg.Wait;
+  if c >= 0 then
+    UnixClose(c);
+  WriteLn(', stopped');
+end;
+
+{ the file goes and SIGTERM comes to the process, as a stop from outside }
+procedure StopFromOutside(const Path: string);
+var
+  r: Integer;
+begin
+  Sleep(200);
+  DeleteFile(Path);
+  if Amd64 = 1 then
+    r := Syscall(62, pid, 15)
+  else
+    r := Syscall(129, pid, 15);
+end;
+
+procedure SignalCase;
+var
+  s: THttpServer;
+  p: string;
+begin
+  p := SockPath(4);
+  s := NewServer;
+  if not s.ListenUnix(p, 0, '') then
+  begin
+    WriteLn('signal: cannot listen');
+    Exit;
+  end;
+  pas StopFromOutside(p);
+  WriteLn('signal, the file removed: stopped by ', SignalName(s.ServeUntilSignal));
+end;
+
+var
+  srv: THttpServer;
+begin
+  if Amd64 = 1 then
+    pid := Syscall(39)
+  else
+    pid := Syscall(172);
+  if ParamCount >= 1 then
+  begin
+    srv := NewServer;
+    if ParamStr(1) = 'systemd' then
+    begin
+      if not srv.ListenSystemd then
+      begin
+        WriteLn('no sockets passed');
+        Halt(2);
+      end;
+    end
+    else if not srv.ListenUnix(ParamStr(2), 0, '') then
+    begin
+      WriteLn('cannot listen on ', ParamStr(2));
+      Halt(2);
+    end;
+    WriteLn('listening');
+    WriteLn('stopped by ', SignalName(srv.ServeUntilSignal));
+    Halt(0);
+  end;
+  UnixCase(0, False, 'unix, the first');
+  FirstWatch;
+  mark := OpenCount;
+  UnixCase(1, False, 'unix, the file there');
+  UnixCase(2, True, 'unix, the file removed');
+  TcpCase;
+  BothCase;
+  BeforeCase;
+  NothingCase;
+  LastCase;
+  SignalCase;
+  Sleep(50);
+  WriteLn('descriptors left open: ', OpenCount - mark);
+end.
+
+{ This file is part of paslang's tests.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+  paslang is free software under the GNU General Public License,
+  version 3 or (at your option) any later version; see the file
+  COPYING. It comes with ABSOLUTELY NO WARRANTY. }

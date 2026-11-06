@@ -750,6 +750,9 @@ GOLDEN_A64 += mailtext
 # P564: the cookie jar of httpclient, against Go's cookiejar, and through a login on the loopback.
 GOLDEN += cookiejar cookiehttp
 GOLDEN_A64 += cookiejar cookiehttp
+# P573: a server stops whatever became of its sockets.
+GOLDEN += httpstop
+GOLDEN_A64 += httpstop
 # P432: URLs and HTTP messages against Go, and the HTTP client over loopback.
 GOLDEN += url httpmsg httpcli
 GOLDEN_A64 += url httpmsg httpcli
@@ -3438,6 +3441,15 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	python3 -I scripts/mutunit.py pashtml --routine EntityIndex --list > $(BUILDDIR)/mutunit_list2.txt; \
 	grep -q 'rel@' $(BUILDDIR)/mutunit_list2.txt; \
 	echo ok unitaudit
+	@set -e; \
+	: P573: Shutdown wakes the acceptors of httpserver through the poller and testdata/httpstop stops servers on a Unix socket with its file there and with it removed and on TCP and on both and by SIGTERM and scripts/httpstop_check.py plays the part of systemd with a socket it keeps which must still listen after the server stops and looks at what an idle server and one out of descriptors cost on both machines; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/httpstop testdata/httpstop.paslang; \
+	timeout 60 $(BUILDDIR)/httpstop > $(BUILDDIR)/httpstop.got; \
+	diff -u testdata/httpstop.out $(BUILDDIR)/httpstop.got; \
+	timeout 300 python3 -I scripts/httpstop_check.py $(BUILDDIR)/httpstop; \
+	$(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/httpstop-arm testdata/httpstop.paslang; \
+	timeout 600 python3 -I scripts/httpstop_check.py $(BUILDDIR)/httpstop-arm $(QEMU_A64); \
+	echo ok httpstop
 	@set -e; \
 	: the kept scripts of testdata/sqllogic are what scripts/gen_sqllogic.py writes while the system SQLite is the one that made them, P412; \
 	python3 -I scripts/gen_sqllogic.py --check

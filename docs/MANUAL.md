@@ -11767,7 +11767,10 @@ listens on TCP, port 0 asking the kernel for one (`Port`).
 `ListenSystemd` takes the sockets systemd passes for socket activation
 (`LISTEN_PID`, `LISTEN_FDS`, from descriptor 3). `Serve` serves until
 `Shutdown`, which:
-- stops accepting;
+- stops accepting, waking its acceptors through the poller (1.2.377): a
+  listening socket is only closed, never shut down, so one systemd passed
+  goes on listening for the next start, and a Unix socket whose file
+  someone removed stops like any other (`testdata/httpstop`);
 - ends the idle connections at once;
 - lets the requests in flight finish, with `Connection: close`, within
   `ShutdownTimeoutMs`, and then cuts what is left.
