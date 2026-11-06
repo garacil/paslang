@@ -3746,7 +3746,9 @@ argument count and types, most derived first, so a descendant may give
 `Create` another signature than its parent. A class without a
 constructor still has `Create`. `virtual` and `override` dispatch through
 the table; `virtual; abstract;` leaves the body to a descendant, and
-creating a class that still has an abstract method is an error.
+creating a class that still has an abstract method is an error. So is
+`inherited` of a method that is abstract in the parent, which has no
+body to call (1.2.380, `testdata/classbad/inhabstract`).
 `inherited Name(args)` calls the parent's version. A `property` reads
 and writes a field or a method and may be indexed. `is` tests and `as`
 casts. A method value, `procedure of object` or `function ... of

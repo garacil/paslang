@@ -3479,6 +3479,13 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	python3 -I scripts/fuzz_faults.py --paslangc $(OUTDIR)/paslangc --units $(BUILDDIR) --work $(BUILDDIR)/fuzz_constidx --variants native,base 321 9; \
 	echo ok constidx
 	@set -e; \
+	: P570: inherited of a method that is abstract in the parent is refused by the compiler with its place where the linker refused the program before; \
+	if $(OUTDIR)/paslangc -o $(BUILDDIR)/classbad_inhabstract testdata/classbad/inhabstract.paslang >$(BUILDDIR)/classbad_inhabstract.err 2>&1; then echo 'inherited of an abstract method should fail'; exit 1; fi; \
+	grep -q 'inherited Area: TShape.Area is abstract, it has no body to call at 16:' $(BUILDDIR)/classbad_inhabstract.err; \
+	if $(OUTDIR)/paslangc -o $(BUILDDIR)/classbad_inhabstractmid testdata/classbad/inhabstractmid.paslang >$(BUILDDIR)/classbad_inhabstractmid.err 2>&1; then echo 'inherited of an abstract method through a class in between should fail'; exit 1; fi; \
+	grep -q 'inherited Area: TMid.Area is abstract, it has no body to call at 24:' $(BUILDDIR)/classbad_inhabstractmid.err; \
+	echo ok inhabstract
+	@set -e; \
 	: P573: Shutdown wakes the acceptors of httpserver through the poller and testdata/httpstop stops servers on a Unix socket with its file there and with it removed and on TCP and on both and by SIGTERM and scripts/httpstop_check.py plays the part of systemd with a socket it keeps which must still listen after the server stops and looks at what an idle server and one out of descriptors cost on both machines; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/httpstop testdata/httpstop.paslang; \
 	timeout 60 $(BUILDDIR)/httpstop > $(BUILDDIR)/httpstop.got; \
