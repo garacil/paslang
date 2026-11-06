@@ -4558,7 +4558,14 @@ before, the scheduler was left with nothing to run and said
 carried an object, the line goes on with what the object's `ToString`
 says, its class's name unless the class says more:
 `paslang: uncaught raise in the main routine: EOops`
-(`testdata/fatal/raiseobj`, 1.1.3).
+(`testdata/fatal/raiseobj`, 1.1.3). The line ends with where the raise
+was (1.2.382, P578), as a failure of the runtime says its place:
+`paslang: uncaught raise in the main routine: EOops, raised at line 30`,
+and `raised at line 43 of unit RaiseU` when the raise is in a unit's
+code. The place is the one the routine keeps for `ExceptAddr`: a
+`raise;` in a handler, a handler of another class that lets the object
+by and the `finally` parts on the way leave it the first raise's, and
+`raise X at A` sets it to `A` (`testdata/units/raiseun`).
 
 A failure of the runtime (an index out of range, a division by zero and
 the others of §19) is raised the same way when SysUtils is in the program
@@ -14147,8 +14154,8 @@ change the ASCII letters of UTF-8 text and leave the other bytes;
 list of the exceptions being handled; `StringReplace` with a count,
 `EInOutArgumentException`, `GetBaseException` and Format's `%b` and `%o`
 come from Free Pascal's sources after 3.2.2; an exception nobody catches
-prints `paslang: uncaught raise in the main routine: EConvertError: ...`
-and the program stops with status 1. A real is written with its own
+prints `paslang: uncaught raise in the main routine: EConvertError: ...`,
+then where it was raised (§9), and the program stops with status 1. A real is written with its own
 digits rounded once, every digit asked for, a precision of 1 as one
 digit, NaN as `NaN`; FormatFloat's empty section and a value that rounds
 to 0, and Format's letters it does not know, as §20 says. The local

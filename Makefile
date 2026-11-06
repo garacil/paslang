@@ -3529,6 +3529,29 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	python3 -I scripts/check_paslines.py --ask $(BUILDDIR)/placeask-arm $(QEMU_A64); \
 	echo ok placeuse
 	@set -e; \
+	: P578: an uncaught raise says where it was raised, in the own code of the program and in a unit, with an object and without, from a method and a nested routine, a raise again in a handler and one through a finally naming the first raise, and a fault of the runtime nobody takes says its line once, with and without inlining and on both machines; \
+	for v in "" "-cpu base -inline 0"; do \
+	  $(OUTDIR)/paslangc $$v testdata/units/raiseu.paslang; \
+	  $(OUTDIR)/paslangc $$v -Fu $(BUILDDIR) -o $(BUILDDIR)/raiseun testdata/units/raiseun.paslang; \
+	  printf '' > $(BUILDDIR)/raiseun.got; printf '' > $(BUILDDIR)/raiseun.err; \
+	  for k in 1 2 3 4 5 6 7 8 9 10 11; do \
+	    set +e; timeout 60 $(BUILDDIR)/raiseun $$k >> $(BUILDDIR)/raiseun.got 2>> $(BUILDDIR)/raiseun.err; rc=$$?; set -e; \
+	    test $$rc -eq 1; \
+	  done; \
+	  diff -u testdata/units/raiseun.out $(BUILDDIR)/raiseun.got; \
+	  diff -u testdata/units/raiseun.err $(BUILDDIR)/raiseun.err; \
+	done; \
+	$(OUTDIR)/paslangc -target arm64 testdata/units/raiseu.paslang; \
+	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/raiseun-arm testdata/units/raiseun.paslang; \
+	printf '' > $(BUILDDIR)/raiseun-arm.got; printf '' > $(BUILDDIR)/raiseun-arm.err; \
+	for k in 1 2 3 4 5 6 7 8 9 10 11; do \
+	  set +e; timeout 120 $(QEMU_A64) $(BUILDDIR)/raiseun-arm $$k >> $(BUILDDIR)/raiseun-arm.got 2>> $(BUILDDIR)/raiseun-arm.err; rc=$$?; set -e; \
+	  test $$rc -eq 1; \
+	done; \
+	diff -u testdata/units/raiseun.out $(BUILDDIR)/raiseun-arm.got; \
+	diff -u testdata/units/raiseun.err $(BUILDDIR)/raiseun-arm.err; \
+	echo ok raiseun
+	@set -e; \
 	: P573: Shutdown wakes the acceptors of httpserver through the poller and testdata/httpstop stops servers on a Unix socket with its file there and with it removed and on TCP and on both and by SIGTERM and scripts/httpstop_check.py plays the part of systemd with a socket it keeps which must still listen after the server stops and looks at what an idle server and one out of descriptors cost on both machines; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/httpstop testdata/httpstop.paslang; \
 	timeout 60 $(BUILDDIR)/httpstop > $(BUILDDIR)/httpstop.got; \
@@ -5337,8 +5360,8 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'paslang: out of memory: [0-9][0-9]* MiB mapped' $(BUILDDIR)/fatal_oom.err; \
 	grep -q 'paslang: out of memory: [0-9][0-9]* MiB mapped' $(BUILDDIR)/fatal_oomlimit.err; \
 	grep -q 'paslang: send on closed channel at line 11' $(BUILDDIR)/fatal_closed.err; \
-	grep -q 'paslang: uncaught raise in the main routine' $(BUILDDIR)/fatal_mainraise.err; \
-	grep -q 'paslang: uncaught raise in the main routine: EOops' $(BUILDDIR)/fatal_raiseobj.err; \
+	grep -q '^paslang: uncaught raise in the main routine, raised at line 24$$' $(BUILDDIR)/fatal_mainraise.err; \
+	grep -q '^paslang: uncaught raise in the main routine: EOops, raised at line 30$$' $(BUILDDIR)/fatal_raiseobj.err; \
 	grep -q 'paslang: set element 300 out of range \[0..255\] at line 16' $(BUILDDIR)/fatal_setelem.err; \
 	grep -q 'paslang: set element 1 out of range \[2..7\] at line 16' $(BUILDDIR)/fatal_setincl.err; \
 	grep -q 'paslang: integer divide by zero at line 13' $(BUILDDIR)/fatal_divloop.err; \
@@ -6369,8 +6392,8 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	grep -q 'paslang: stack overflow at line 12' $(BUILDDIR)/fatal_deep-arm.err; \
 	grep -q 'paslang: out of memory: [0-9][0-9]* MiB mapped' $(BUILDDIR)/fatal_oom-arm.err; \
 	grep -q 'paslang: send on closed channel at line 11' $(BUILDDIR)/fatal_closed-arm.err; \
-	grep -q 'paslang: uncaught raise in the main routine' $(BUILDDIR)/fatal_mainraise-arm.err; \
-	grep -q 'paslang: uncaught raise in the main routine: EOops' $(BUILDDIR)/fatal_raiseobj-arm.err; \
+	grep -q '^paslang: uncaught raise in the main routine, raised at line 24$$' $(BUILDDIR)/fatal_mainraise-arm.err; \
+	grep -q '^paslang: uncaught raise in the main routine: EOops, raised at line 30$$' $(BUILDDIR)/fatal_raiseobj-arm.err; \
 	grep -q 'paslang: set element 300 out of range \[0..255\] at line 16' $(BUILDDIR)/fatal_setelem-arm.err; \
 	grep -q 'paslang: set element 1 out of range \[2..7\] at line 16' $(BUILDDIR)/fatal_setincl-arm.err; \
 	grep -q 'paslang: integer divide by zero at line 13' $(BUILDDIR)/fatal_divloop-arm.err; \
