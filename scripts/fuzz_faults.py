@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """A differential fuzzer for the runtime's failures taken by handlers (P567): random routines and main blocks whose
-statements read and write arrays at indexes that may be out of range and divide by values that may be zero, inside
-try/except and try/finally blocks, nested, in loops, with handlers that print every variable and go on.  A Python
-model of the language (64-bit wrapping integers, an index outside its array and a zero divisor raise) gives the
-output: what each handler sees of the variables at the failure (a region may have kept them in registers), which
+statements read and write arrays at indexes that may be out of range, divide by values that may be zero and read
+and write through pointers that may be nil or point nowhere and call through function variables that may be nil
+(P568), inside try/except and try/finally blocks, nested, in loops, with handlers that print every variable and
+go on.  A Python model of the language (64-bit wrapping integers; an index outside its array, a zero divisor, a
+pointer that is none and a function variable that is none raise) gives the output: what each handler sees of the variables at the failure (a region may have kept them in registers), which
 handler takes it, what the finally parts did, and the state at the end.  Every variant must agree with the model.
 
 usage: fuzz_faults.py --paslangc BIN --units DIR --work DIR [--variants LIST] [--units-arm64 DIR] [--qemu BIN]
@@ -32,6 +33,24 @@ class OOB(Exception):
 
 class DivZ(Exception):
     pass
+
+
+class NilP(Exception):
+    pass
+
+
+def dr(p):
+    """what p points at: a cell, a list of its two words; a nil pointer and one that points nowhere are None"""
+    if p is None:
+        raise NilP()
+    return p
+
+
+def cf(f):
+    """the function a function variable holds; one that is nil is None, and calling it is a call of nothing"""
+    if f is None:
+        raise NilP()
+    return f
 
 
 def tdiv(a, b):
@@ -63,9 +82,13 @@ CONSTS = [0, 1, 2, 3, 5, 7, 9, 255, 1000, -1, -4, 1 << 40, -(1 << 33)]
 class Gen:
     """One body: Pascal lines and the model's lines side by side.  S the scalars, C the counters, N the read-only one."""
 
-    def __init__(self, rnd, S, C, N, tag):
+    def __init__(self, rnd, S, C, N, tag, L):
         self.r = rnd
         self.S, self.C, self.N, self.tag = S, C, N, tag
+        # the pointers: L the body's own, then the program's (pa a cell, pb nil, pc a cell or nil by the case, pw
+        # an address where nothing is); its own and pa are picked more often, or no body would get far
+        self.L = L
+        self.P = L * 3 + ['pa', 'pa', 'pc', 'pb', 'pw']
         self.busy = []      # counters of the loops around
         self.tid = 0
         self.budget = 40    # statements left
@@ -149,6 +172,42 @@ class Gen:
         ep, ey = self.expr(1, reads=False)
         return [ind + '%s := %s;' % (v, ep)], [pind + '%s = %s' % (v, ey)]
 
+    def ptr(self, ind, pind):
+        """a statement through a pointer: it reads no array and divides nothing, so a pointer that is none is all
+        that can fail in it, and what it assigns is assigned only when the whole value is worked out"""
+        r = self.r
+        g = r.random()
+        p = r.choice(self.P)
+        f, k = r.choice([('V', 0), ('W', 1)])
+        if g < 0.35:
+            v = r.choice(self.S)
+            ep, ey = self.expr(1, reads=False)
+            op = r.choice(['+', '-', 'xor'])
+            pyop = {'+': 'w(%s + dr(%s)[%d])', '-': 'w(%s - dr(%s)[%d])', 'xor': '(%s ^ dr(%s)[%d])'}[op]
+            return [ind + '%s := %s %s %s^.%s;' % (v, ep, op, p, f)], [pind + '%s = %s' % (v, pyop % (ey, p, k))]
+        if g < 0.5:
+            # through a routine called: the fault is the routine's, in its own code, and the handler the caller's,
+            # whose registers the call kept
+            v = r.choice(self.S)
+            u = r.choice(self.S + self.busy)
+            ep, ey = self.expr(1, reads=False)
+            return [ind + '%s := %s + Pd(%s);' % (v, ep, u)], [pind + '%s = w(%s + pd(%s))' % (v, ey, u)]
+        if g < 0.6:
+            # through a function variable: fa holds a function, fb is nil, fc one or the other by the case; a call
+            # of nothing is the call's fault, with the caller's variables as the call found them
+            v = r.choice(self.S)
+            u = r.choice(self.S + self.busy)
+            fv = r.choice(['fa', 'fa', 'fb', 'fc'])
+            ep, ey = self.expr(1, reads=False)
+            return [ind + '%s := %s + %s(%s);' % (v, ep, fv, u)], [pind + '%s = w(%s + cf(%s)(%s))' % (v, ey, fv, u)]
+        if g < 0.8:
+            ep, ey = self.expr(1, reads=False)
+            return [ind + '%s^.%s := %s;' % (p, f, ep)], [pind + '_v = %s' % ey, pind + 'dr(%s)[%d] = _v' % (p, k)]
+        # a pointer of the body's own takes another's value, or nil
+        l = r.choice(self.L)
+        q = r.choice(self.P + ['nil'])
+        return [ind + '%s := %s;' % (l, q)], [pind + '%s = %s' % (l, 'None' if q == 'nil' else q)]
+
     def block(self, depth, ind, pind, inloop, n):
         pas, py = [], []
         for _ in range(n):
@@ -166,6 +225,8 @@ class Gen:
         free = [c for c in self.C if c not in self.busy]
         if depth <= 0 or self.budget <= 0 or f < 0.30:
             g = r.random()
+            if g < 0.2:
+                return self.ptr(ind, pind)
             if g < 0.5:
                 v = r.choice(self.S)
                 ep, ey = self.expr(2)
@@ -241,7 +302,7 @@ class Gen:
             bp, by = self.block(depth - 1, ind + '  ', pind + '    ', inloop, r.randint(1, 3))
             pas = [ind + 'try'] + bp + [ind + 'except']
             py = [pind + 'try:'] + by
-            for cls, exc, mark in (('ERangeError', 'OOB', 'R'), ('EDivByZero', 'DivZ', 'Z')):
+            for cls, exc, mark in (('ERangeError', 'OOB', 'R'), ('EDivByZero', 'DivZ', 'Z'), ('EAccessViolation', 'NilP', 'A')):
                 if r.random() < 0.15:
                     continue    # no handler of this class here: the failure goes on out
                 sp, sy = self.say('%s%s%d' % (self.tag, mark, t), ind + '    ', pind + '    ')
@@ -260,7 +321,7 @@ class Gen:
                 # no handler at all was chosen: a bare one
                 sp, sy = self.say('%sB%d' % (self.tag, t), ind + '  ', pind + '    ')
                 pas += sp
-                py += [pind + 'except (OOB, DivZ):'] + sy
+                py += [pind + 'except (OOB, DivZ, NilP):'] + sy
             pas += [ind + 'end;']
             return pas, py
         if f < 0.97:
@@ -288,55 +349,74 @@ def build(seed):
     nfun = 2
     funs = []
     for f in range(nfun):
-        g = Gen(rnd, FS, FC, 'n', 'F%d' % f)
+        g = Gen(rnd, FS, FC, 'n', 'F%d' % f, ['p1', 'p2'])
         bp, by = g.block(3, '    ', '        ', '', rnd.randint(3, 6))
         funs.append((g, bp, by))
-    gm = Gen(rnd, MS, MC, 'mn', 'M')
+    gm = Gen(rnd, MS, MC, 'mn', 'M', ['mp1', 'mp2'])
     mp, my = gm.block(3, '    ', '        ', '', rnd.randint(3, 6))
     cases = [(rnd.choice([0, 1, 2, 3, 5, 7, 8, 12]), rnd.choice([0, 3, 6, 10])) for _ in range(6)]
     src = ['program ft;', '', 'uses', '  sysutils;', '', 'type', '  TA = array[0..%d] of Int64;' % (NA - 1),
-           '  TB = array[0..%d] of Int64;' % (NB - 1), '', 'var', '  ga: TA;', '  gb: TB;', '  gd: array of Int64;',
+           '  TB = array[0..%d] of Int64;' % (NB - 1), '  PCell = ^TCell;', '  TCell = record', '    V, W: Int64;', '  end;',
+           '  TFn = function(S: Int64): Int64;',
+           '', 'var', '  ga: TA;', '  gb: TB;', '  gd: array of Int64;', '  pa, pb, pc, pw, mp1, mp2: PCell;',
+           '  fa, fb, fc: TFn;',
            '  ' + ', '.join(MS + MC + ['mn', 'cs', 'dl', 'q']) + ': Int64;', '',
            'function Rd(I: Int64): Int64;', 'begin', '  Result := ga[I];', 'end;', '',
            'procedure Wr(I, V: Int64);', 'begin', '  gb[I] := V;', 'end;', '',
+           'function Pd(S: Int64): Int64;', 'var', '  p: PCell;', 'begin', '  case S and 7 of', '    0, 1, 2, 3: p := pa;',
+           '    4: p := pb;', '    5, 6: p := pc;', '  else', '    p := pw;', '  end;', '  Result := p^.V + S;', 'end;', '',
+           'function Seven(S: Int64): Int64;', 'begin', '  Result := S + 7;', 'end;', '',
            'function Chk: Int64;', 'var', '  t, u: Int64;', 'begin', '  t := 0;',
            '  for u := 0 to %d do' % (NA - 1), '    t := t * 31 + ga[u];',
            '  for u := 0 to %d do' % (NB - 1), '    t := t * 31 + gb[u];',
-           '  for u := 0 to Length(gd) - 1 do', '    t := t * 31 + gd[u];', '  Result := t;', 'end;', '']
+           '  for u := 0 to Length(gd) - 1 do', '    t := t * 31 + gd[u];',
+           '  t := (t * 31 + pa^.V) * 31 + pa^.W;', '  if pc <> nil then', '    t := (t * 31 + pc^.V) * 31 + pc^.W;',
+           '  Result := t;', 'end;', '']
     for f, (g, bp, by) in enumerate(funs):
         sp, sy = g.say('F%dRT' % f, '      ', '')
         zp, zy = g.say('F%dZT' % f, '      ', '')
         ep, ey = g.say('F%dend' % f, '  ', '')
-        src += ['procedure F%d(N: Int64);' % f, 'var', '  ' + ', '.join(FS + FC) + ': Int64;', 'begin',
-                '  a := N; b := 1; c := N * 3; d := 0; e := -N; i := 0; j := 0; k := 0; l := 0;',
-                '  try'] + bp + ['  except', '    on Ex: ERangeError do'] + sp + ['    on Ex: EDivByZero do'] + zp + ['  end;'] + ep + ['end;', '']
+        ap, ay = g.say('F%dAT' % f, '      ', '')
+        src += ['procedure F%d(N: Int64);' % f, 'var', '  ' + ', '.join(FS + FC) + ': Int64;', '  p1, p2: PCell;', 'begin',
+                '  a := N; b := 1; c := N * 3; d := 0; e := -N; i := 0; j := 0; k := 0; l := 0; p1 := pa; p2 := pc;',
+                '  try'] + bp + ['  except', '    on Ex: ERangeError do'] + sp + ['    on Ex: EDivByZero do'] + zp + [
+                    '    on Ex: EAccessViolation do'] + ap + ['  end;'] + ep + ['end;', '']
     sp, sy = gm.say('MRT', '      ', '')
     zp, zy = gm.say('MZT', '      ', '')
     ep, ey = gm.say('Mend', '  ', '')
+    ap, ay = gm.say('MAT', '      ', '')
     src += ['begin', '  cs := StrToInt(ParamStr(1));', '  case cs of']
     for c, (n, ln) in enumerate(cases):
         src.append('    %d: begin mn := %d; dl := %d; end;' % (c, n, ln))
     src += ['  else', '    Halt(3);', '  end;', '  SetLength(gd, dl);',
             '  for q := 0 to %d do' % (NA - 1), '    ga[q] := q * 7 - 3;',
             '  for q := 0 to %d do' % (NB - 1), '    gb[q] := 100 - q * 9;',
-            '  for q := 0 to dl - 1 do', '    gd[q] := q * q + 1;']
+            '  for q := 0 to dl - 1 do', '    gd[q] := q * q + 1;',
+            '  New(pa); pa^.V := 11; pa^.W := 22; pb := nil; pc := nil;',
+            '  if (mn and 1) = 1 then', '  begin', '    New(pc); pc^.V := 33; pc^.W := 44;', '  end;',
+            '  pw := PCell(Pointer(123456789012));', '  mp1 := pa; mp2 := pb;',
+            '  fa := @Seven; fb := nil; fc := nil;', '  if (mn and 2) = 2 then', '    fc := @Seven;']
     for f in range(nfun):
         src.append('  F%d(mn);' % f)
     src += ['  ma := mn; mb := 1; mc := mn * 3; md := 0; me := -mn; mi := 0; mj := 0; mk := 0; ml := 0;',
-            '  try'] + mp + ['  except', '    on Ex: ERangeError do'] + sp + ['    on Ex: EDivByZero do'] + zp + ['  end;'] + ep
+            '  try'] + mp + ['  except', '    on Ex: ERangeError do'] + sp + ['    on Ex: EDivByZero do'] + zp + [
+                '    on Ex: EAccessViolation do'] + ap + ['  end;'] + ep
     src += ["  WriteLn('chk ', Chk);", 'end.']
     # the model
-    py = ['def rd(i): return ga[ix(ga, i)]', 'def wr(i, v):', '    gb[ix(gb, i)] = v']
+    py = ['def rd(i): return ga[ix(ga, i)]', 'def wr(i, v):', '    gb[ix(gb, i)] = v',
+          'def pd(s): return w(dr([pa, pa, pa, pa, pb, pc, pc, pw][s & 7])[0] + s)']
     for f, (g, bp, by) in enumerate(funs):
         names = ', '.join(FS + FC)
-        py += ['def f%d(n):' % f, '    a = n; b = 1; c = w(n * 3); d = 0; e = -n; i = j = k = l = 0',
+        py += ['def f%d(n):' % f, '    a = n; b = 1; c = w(n * 3); d = 0; e = -n; i = j = k = l = 0; p1 = pa; p2 = pc',
                '    try:', '        pass'] + by + ['    except OOB:', "        P('F%dRT', %s)" % (f, names),
                                                    '    except DivZ:', "        P('F%dZT', %s)" % (f, names),
+                                                   '    except NilP:', "        P('F%dAT', %s)" % (f, names),
                                                    "    P('F%dend', %s)" % (f, names)]
     names = ', '.join(MS + MC)
-    py += ['def main(mn):', '    ma = mn; mb = 1; mc = w(mn * 3); md = 0; me = -mn; mi = mj = mk = ml = 0',
+    py += ['def main(mn):', '    ma = mn; mb = 1; mc = w(mn * 3); md = 0; me = -mn; mi = mj = mk = ml = 0; mp1 = pa; mp2 = pb',
            '    try:', '        pass'] + my + ['    except OOB:', "        P('MRT', %s)" % names,
                                                '    except DivZ:', "        P('MZT', %s)" % names,
+                                               '    except NilP:', "        P('MAT', %s)" % names,
                                                "    P('Mend', %s)" % names]
     return '\n'.join(src) + '\n', '\n'.join(py) + '\n', cases, nfun
 
@@ -348,14 +428,19 @@ def model(py, cases, nfun):
         ga = [q * 7 - 3 for q in range(NA)]
         gb = [100 - q * 9 for q in range(NB)]
         gd = [q * q + 1 for q in range(ln)]
+        ca = [11, 22]
+        cc = [33, 44] if n & 1 else None
+        seven = lambda s: w(s + 7)
         ns = {'w': w, 'ix': ix, 'tdiv': tdiv, 'tmod': tmod, 'OOB': OOB, 'DivZ': DivZ, 'ga': ga, 'gb': gb, 'gd': gd,
+              'NilP': NilP, 'dr': dr, 'pa': ca, 'pb': None, 'pc': cc, 'pw': None,
+              'cf': cf, 'fa': seven, 'fb': None, 'fc': seven if n & 2 else None,
               'P': lambda *a: out.append(' '.join(str(x) for x in a))}
         exec(compile(py, 'model', 'exec'), ns)
         for f in range(nfun):
             ns['f%d' % f](n)
         ns['main'](n)
         t = 0
-        for v in ga + gb + gd:
+        for v in ga + gb + gd + ca + (cc or []):
             t = w(t * 31 + v)
         out.append('chk %d' % t)
         outs.append('\n'.join(out) + '\n')

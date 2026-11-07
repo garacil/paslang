@@ -71,6 +71,7 @@ const
   MsgOutOfRange = ' out of range [';
   MsgNil = 'paslang: nil pointer dereference';
   MsgBadAddr = 'paslang: invalid memory address 0x';
+  MsgNoAddr = 'paslang: invalid memory address';  { the processor refused it and the kernel tells none (P568) }
   MsgDivZero = 'paslang: integer divide by zero';
   MsgPtrOut = 'paslang: pointer outside its object';
   MsgRealRange = 'paslang: real out of integer range';
@@ -470,6 +471,8 @@ type
     FIsleCall: array of LongInt;     { a call alone (CallIsleOK, P400): 1 a statement, 2 assigned to FIsleDst }
     FIsleDst: array of TSym;
     FIsleTry: Boolean;      { the region is in a try of its routine: a handler may read any home }
+    FPadOn: Boolean;        { ... and its routine has a frame: a fault of the processor in it goes through a pad (P568) }
+    FPadCuts: TStrArray;    { the labels between which the region keeps its variables in registers: from, to, from, to }
     FRunToEnd: Boolean;     { the region ends the routine's body: its locals die there (P396) }
     FStraight: Boolean;     { a straight run is being looked at for a region (P396) }
     FRunOn: Boolean;        { the region being emitted is a straight run's (P396) }
@@ -1049,6 +1052,8 @@ type
     procedure PromoMark(On: Boolean);
     procedure PromoSpill;
     procedure FaultSpill;
+    procedure PadCut(const L: string);
+    procedure PadOut;
     function TryAround: Boolean;
     function FailsIn(E: PExpr): Boolean;
     function SpineStops(E: PExpr): Boolean;
@@ -33811,6 +33816,94 @@ begin
   VecStoreAll(True);
 end;
 
+{ ---- the pad of a region inside a try (P568) ----
+
+  A fault of the processor (a nil pointer, another bad address) is raised
+  by the routine that made it: the signal handler makes it call
+  rt_sigfault from the instruction that faulted, and SysFault raises. No
+  call was written there, so nothing stored the variables the region
+  keeps in registers, and a handler of this routine reads them at home.
+  The region has a pad, after the routine's ret: the stores FaultSpill
+  writes before a checked failure, then a jump to rt_sigfault; and the
+  signal handler, which finds the pc of the fault in the table of
+  section pasfault, enters through the pad. The table has an entry for
+  each stretch of the region's code where the registers hold the
+  variables: from its start to the first island's, from an island's end
+  (after it has loaded back what it loads) to the next one's start, to
+  the region's end. Inside an island the variables are at home (in a try
+  an island stores every one the region wrote, IsleStores) and the
+  handler needs no pad; a region of an island has its own. An entry is
+  twelve bytes: where the stretch starts, from the entry; how long it
+  is; where the pad is, from that word. The pieces are linked to their
+  code (SHF_LINK_ORDER), so a routine the program does not reach leaves
+  none, and the driver's script gathers them between __start_pasfault
+  and __stop_pasfault. rax and rdx (x0 and x1), which the signal handler
+  sets for rt_sigfault, keep no variable and no store uses them (x9 and
+  x16 are the stores' own on arm64). A region that wrote nothing it
+  keeps has no pad: its homes are as they were. }
+procedure TEmitter.PadCut(const L: string);
+var
+  n: SizeInt;
+begin
+  if not FPadOn then
+    Exit;
+  n := Length(FPadCuts);
+  SetLength(FPadCuts, n + 1);
+  FPadCuts[n] := L;
+end;
+
+procedure TEmitter.PadOut;
+var
+  i: SizeInt;
+  pad, bits, link, piece: string;
+  any: Boolean;
+begin
+  if not FPadOn then
+    Exit;
+  any := False;
+  for i := 0 to High(FPromo) do
+    if FPromo[i].Written then
+      any := True;
+  for i := 0 to High(FVPromo) do
+    if FVPromo[i].Written then
+      any := True;
+  if not any then
+    Exit;
+  pad := Lab;
+  ColdBeginAt('', pad);
+  for i := 0 to High(FPromo) do
+    if FPromo[i].Written then
+      StoreHome(FPromo[i].Place, FPromo[i].Reg);
+  VecStoreAll(True);
+  if FArm then
+    Line('  b rt_sigfault')
+  else
+    Line('  jmp rt_sigfault');
+  ColdEnd;
+  if FArm then
+    bits := '%progbits'
+  else
+    bits := '@progbits';
+  if FOwnSec <> '' then
+  begin
+    piece := FOwnSec;
+    link := FOwnSec;
+  end
+  else
+  begin
+    piece := '.text';
+    link := '.Ltext0';
+  end;
+  PlLine('.section pasfault.' + piece + ',"ao",' + bits + ',' + link);
+  PlLine('.balign 4');
+  i := 0;
+  while i + 1 <= High(FPadCuts) do
+  begin
+    PlLine('  .long ' + FPadCuts[i] + '-., ' + FPadCuts[i + 1] + '-' + FPadCuts[i] + ', ' + pad + '-.');
+    i := i + 2;
+  end;
+end;
+
 function TEmitter.EmitPromoted(S: PStmt): Boolean;
 var
   one: TStmtArray;
@@ -35032,6 +35125,7 @@ begin
       StoreHome(FPromo[i].Place, FPromo[i].Reg);
   s1 := Lab;
   Line(s1 + ':');
+  PadCut(s1);
   IsleRanges(s1, K, loopy);
   back := nil;
   if not leaving then
@@ -35124,6 +35218,7 @@ begin
   IsleLoad(back);
   e1 := Lab;
   Line(e1 + ':');
+  PadCut(e1);
   for i := 0 to High(FPromo) do
     if FRunOn and (RunDead(FPromo[i], K) or RunKilled(FPromo[i], K)) then
       FIsleFroms[i] := ''
@@ -35265,6 +35360,7 @@ begin
       StoreHome(FPromo[i].Place, FPromo[i].Reg);
   s1 := Lab;
   Line(s1 + ':');
+  PadCut(s1);
   IsleRanges(s1, K, False);
   back := nil;
   for i := 0 to High(FPromo) do
@@ -35331,6 +35427,7 @@ begin
   IsleLoad(back);
   e1 := Lab;
   Line(e1 + ':');
+  PadCut(e1);
   for i := 0 to High(FPromo) do
     if FRunOn and (RunDead(FPromo[i], K) or RunKilled(FPromo[i], K)) then
       FIsleFroms[i] := ''
@@ -35515,10 +35612,10 @@ var
   t: TPromo;
   b, e, b2: string;
   chosen: array of TPromo;
-  fw, froms: TStrArray;
+  fw, froms, svCuts: TStrArray;
   pure: Boolean;
   inner: Boolean;
-  toEnd, run: Boolean;
+  toEnd, run, svPadOn: Boolean;
 begin
   Result := False;
   { inside a try of this routine (P567), whoever asks for the region: its
@@ -35888,6 +35985,13 @@ begin
       LoadHome(FPromo[i].Place, FPromo[i].Reg);
   b := Lab;
   Line(b + ':');
+  { the stretches of its code a fault's pad stores for (P568): an island
+    cuts them, a region inside one has its own }
+  svCuts := FPadCuts;
+  svPadOn := FPadOn;
+  FPadCuts := nil;
+  FPadOn := FIsleTry and not FFlat;
+  PadCut(b);
   froms := FIsleFroms;
   FIsleFroms := nil;
   SetLength(FIsleFroms, n);
@@ -35915,6 +36019,10 @@ begin
       StoreHome(FPromo[i].Place, FPromo[i].Reg);
   e := Lab;
   Line(e + ':');
+  PadCut(e);
+  PadOut;
+  FPadCuts := svCuts;
+  FPadOn := svPadOn;
   IsleRanges(e, -1, False);
   FIsleFroms := froms;
   for i := 0 to n - 1 do
@@ -48968,7 +49076,225 @@ begin
     address and the code from the siginfo (16 and 8). An address below
     4096 is a nil pointer; one within 64 KB below the sp is the guard
     page of a stack; anything else is printed in hex. }
+  { rt_sigfault (P568): entered from the instruction that faulted as by
+    a call of it, the pc on the stack, rax the kind and rdx the address.
+    It calls SysFault(A, B, C, Txt, Info, Pc) as the runtime's checked
+    failures do: A the address, the runtime's own words for the kind
+    and their length + 256 * the kind, and the pc, which is the
+    instruction itself and has its line as it stands. The stack may be
+    anywhere, in the middle of an expression: SysFault is entered with
+    it on 16 bytes less the return address (System V psABI 3.2.2), the
+    pc pushed again a word lower when it is not. SysFault raises and
+    never comes back. It stands before rt_sighandler, whose code runs
+    on into the program's end: a routine is read from its label to the
+    next (scripts/check_calleesaved.py), and this one writes no
+    register a routine keeps. }
+  Line('rt_sigfault:');
+  Line('  movq %rdx, %rdi');
+  Line('  movq (%rsp), %r9');
+  Line('  leaq .Lnilptr(%rip), %rcx');
+  Line('  movl $' + IntToStr(Length(MsgNil) + 256 * 12) + ', %r8d');
+  Line('  cmpl $12, %eax');
+  Line('  je .sf_go');
+  Line('  leaq .Lbadaddr(%rip), %rcx');
+  Line('  movl $' + IntToStr(Length(MsgBadAddr) + 256 * 13) + ', %r8d');
+  Line('  cmpl $13, %eax');
+  Line('  je .sf_go');
+  Line('  leaq .Lnoaddr(%rip), %rcx');
+  Line('  movl $' + IntToStr(Length(MsgNoAddr) + 256 * 15) + ', %r8d');
+  Line('  cmpl $15, %eax');
+  Line('  je .sf_go');
+  Line('  leaq .Lbuserr(%rip), %rcx');
+  Line('  movl $' + IntToStr(Length(MsgBus) + 256 * 14) + ', %r8d');
+  Line('.sf_go:');
+  Line('  movq %rsp, %rax');
+  Line('  andl $15, %eax');
+  Line('  cmpl $8, %eax');
+  Line('  je .sf_call');
+  Line('  pushq %r9');
+  Line('.sf_call:');
+  Line('  movabsq $p_sysutils_sysfault, %rax');
+  Line('  jmpq *%rax');
+  { A fault that a handler may take is raised in the routine that made
+    it (P568), as Go's sighandler arranges a call of sigpanic and returns
+    (runtime/signal_unix.go; signal_amd64.go preparePanic and pushCall),
+    and as rt_sigurg arranges one of rt_asyncpreempt. Four questions,
+    before the lock and everything else.
+    Is the signal a fault of the program? Its code says (sigaction(2);
+    Linux 7.2 include/uapi/asm-generic/siginfo.h): 1 and 2, which come
+    with the address (SEGV_MAPERR and SEGV_ACCERR, arch/x86/mm/fault.c,
+    __bad_area_nosemaphore; BUS_ADRALN and BUS_ADRERR, the page of a
+    mapped file that is past its end), and 128 (SI_KERNEL), which is all
+    the kernel says of a general-protection fault
+    (arch/x86/kernel/traps.c, gp_user_force_sig_segv: force_sig, with no
+    address): in compiled code that is an address not in canonical form
+    (SDM vol. 1, 3.3.7.1: such a reference raises #GP, or #SS through
+    the stack's registers, which the kernel sends as SIGBUS the same
+    way), and reading the address field there would call it a nil
+    pointer. No other code: not a machine check (BUS_MCEERR, 4 and 5),
+    and not a signal that someone sent, kill(2) or tgkill(2), whose
+    code is 0 or less (SI_USER, SI_TKILL, SI_QUEUE) and which is no
+    fault of the code it lands on: Go asks the same of its context,
+    sigFromUser. SIGFPE stays fatal: a division is checked before its
+    instruction and no integer operation of compiled code traps, so one
+    would not be the program's.
+    Where? The pc is in code paslangc compiled outside the runtime's
+    units and with no asm (the pasasync table, read from end to end as
+    rt_canraise reads it; only there is r14 the routine). Or it is no
+    code of the table and the fault is the reading of its instruction
+    (the address is the pc): a call of nothing, a procedure variable
+    that is nil or points where no code is. The call has pushed its
+    return address, and the fault is the call's: the pc asked for from
+    here on, r9, is the call's own, a byte under the return address,
+    as if the call instruction had faulted. Go does the same
+    (runtime/panic.go, shouldPushSigpanic: "this was a bad call, but
+    the LR is good", and signal_amd64.go reads the word at the stack
+    pointer for it). A call from code that raises nothing (a routine
+    with asm, the runtime's units) ends the program, at the call's line
+    when it has one (.sh_own; rbx, r12, r13 and r15 are free: the
+    handler returns through the kernel, which gives every register
+    back).
+    May the routine raise? It runs (G+152 0), holds no runtime lock
+    (G+184), has a try record (G+224) and SysUtils is in the program
+    (P567's rule); its stack pointer is inside its stack with the room
+    of a stop above the guard (P342), which the pc pushed and
+    rt_sigfault's word fit in, and SysFault checks its own.
+    What kind? SysFault's: 14 a bus error, 15 an address the kernel
+    does not tell, 12 a nil pointer (an address under 4096), 13 another
+    address; the guard of a stack (within 64 KiB under the stack
+    pointer or a page over it) stays fatal.
+    Then the context is rewritten: the pc pushed as a return address,
+    rax the kind and rdx the address (no region keeps a variable in
+    either), and rip rt_sigfault or the region's pad; the handler
+    returns and the routine goes on there. }
+  Line('.weak p_sysutils_sysfault');
   Line('rt_sighandler:');
+  Line('  movq 168(%rdx), %r9');
+  Line('  cmpq $8, %rdi');
+  Line('  je .sh_die');
+  Line('  movl 8(%rsi), %eax');
+  Line('  decl %eax');
+  Line('  cmpl $1, %eax');
+  Line('  jbe .sh_tab');
+  Line('  cmpl $127, %eax');
+  Line('  jne .sh_die');
+  Line('.sh_tab:');
+  Line('  movq rt_asynclo(%rip), %r8');
+  Line('  testq %r8, %r8');
+  Line('  jz .sh_die');
+  Line('  movq rt_asynchi(%rip), %r11');
+  Line('.sh_scan:');
+  Line('  cmpq %r11, %r8');
+  Line('  jae .sh_out');
+  Line('  cmpq (%r8), %r9');
+  Line('  jb .sh_next');
+  Line('  cmpq 8(%r8), %r9');
+  Line('  jb .sh_in');
+  Line('.sh_next:');
+  Line('  addq $16, %r8');
+  Line('  jmp .sh_scan');
+  Line('.sh_out:');
+  Line('  cmpq 16(%rsi), %r9');
+  Line('  jne .sh_die');
+  Line('  movq 160(%rdx), %rax');
+  Line('  movq (%rax), %r9');
+  Line('  decq %r9');
+  Line('  movq rt_asynclo(%rip), %r8');
+  Line('.sh_scan2:');
+  Line('  cmpq %r11, %r8');
+  Line('  jae .sh_own');
+  Line('  cmpq (%r8), %r9');
+  Line('  jb .sh_next2');
+  Line('  cmpq 8(%r8), %r9');
+  Line('  jb .sh_in');
+  Line('.sh_next2:');
+  Line('  addq $16, %r8');
+  Line('  jmp .sh_scan2');
+  Line('.sh_own:');
+  Line('  movq %rdi, %rbx');
+  Line('  movq %rsi, %r12');
+  Line('  movq %rdx, %r13');
+  Line('  movq %r9, %r15');
+  Line('  movq %r9, %rdi');
+  Line('  call rt_pcline');
+  Line('  movq %rbx, %rdi');
+  Line('  movq %r12, %rsi');
+  Line('  movq %r13, %rdx');
+  Line('  movq %r15, %r9');
+  Line('  testq %rax, %rax');
+  Line('  jnz .sh_die');
+  Line('  movq 168(%rdx), %r9');
+  Line('  jmp .sh_die');
+  Line('.sh_in:');
+  Line('  movq 88(%rdx), %rax');
+  Line('  testq %rax, %rax');
+  Line('  jz .sh_die');
+  Line('  cmpl $0, 152(%rax)');
+  Line('  jne .sh_die');
+  Line('  cmpl $0, 184(%rax)');
+  Line('  jne .sh_die');
+  Line('  cmpq $0, 224(%rax)');
+  Line('  je .sh_die');
+  Line('  movabsq $p_sysutils_sysfault, %rcx');
+  Line('  testq %rcx, %rcx');
+  Line('  jz .sh_die');
+  Line('  movq 160(%rdx), %rcx');
+  Line('  cmpq 8(%rax), %rcx');
+  Line('  ja .sh_die');
+  Line('  movq 24(%rax), %r8');
+  Line('  addq $' + IntToStr(AsyncRoom) + ', %r8');
+  Line('  cmpq %r8, %rcx');
+  Line('  jb .sh_die');
+  Line('  movq 16(%rsi), %r11');
+  Line('  movl $14, %r10d');
+  Line('  cmpq $7, %rdi');
+  Line('  je .sh_inj');
+  Line('  movl $15, %r10d');
+  Line('  cmpl $128, 8(%rsi)');
+  Line('  je .sh_inj');
+  Line('  movl $12, %r10d');
+  Line('  cmpq $4096, %r11');
+  Line('  jb .sh_inj');
+  Line('  leaq -65536(%rcx), %r8');
+  Line('  cmpq %r8, %r11');
+  Line('  jb .sh_kbad');
+  Line('  leaq 4096(%rcx), %r8');
+  Line('  cmpq %r8, %r11');
+  Line('  jb .sh_die');
+  Line('.sh_kbad:');
+  Line('  movl $13, %r10d');
+  Line('.sh_inj:');
+  Line('  subq $8, %rcx');
+  Line('  movq %r9, (%rcx)');
+  Line('  movq %rcx, 160(%rdx)');
+  Line('  movq %r10, 144(%rdx)');
+  Line('  movq %r11, 136(%rdx)');
+  { through the pad of its region when it is in one that keeps
+    variables in registers (PadOut): the table of section pasfault, read
+    from end to end. A call is in no stretch: its statement is an
+    island, with the variables at home. }
+  Line('  leaq rt_sigfault(%rip), %r8');
+  Line('  movabsq $__start_pasfault, %rax');
+  Line('  movabsq $__stop_pasfault, %rcx');
+  Line('.sh_pad:');
+  Line('  cmpq %rcx, %rax');
+  Line('  jae .sh_set');
+  Line('  movslq (%rax), %rdi');
+  Line('  addq %rax, %rdi');
+  Line('  movq %r9, %rsi');
+  Line('  subq %rdi, %rsi');
+  Line('  movl 4(%rax), %edi');
+  Line('  cmpq %rdi, %rsi');
+  Line('  jb .sh_hit');
+  Line('  addq $12, %rax');
+  Line('  jmp .sh_pad');
+  Line('.sh_hit:');
+  Line('  movslq 8(%rax), %r8');
+  Line('  leaq 8(%rax,%r8), %r8');
+  Line('.sh_set:');
+  Line('  movq %r8, 168(%rdx)');
+  Line('  ret');
+  Line('.sh_die:');
   Line('  movl $1, %eax');
   Line('  xchgl %eax, rt_siglock(%rip)');
   Line('  testl %eax, %eax');
@@ -48976,8 +49302,12 @@ begin
   Line('.sh_spin:');
   Line('  pause');
   Line('  jmp .sh_spin');
+  { the place is the pc the questions above asked for: the call's own
+    when the fault is a call of nothing, whose pc has no line (P568). A
+    general-protection fault comes with no address: the words say so,
+    where the address field, zero, would say a nil pointer. }
   Line('.sh_first:');
-  Line('  movq 168(%rdx), %rbx');
+  Line('  movq %r9, %rbx');
   Line('  movq 160(%rdx), %r15');
   Line('  movq 16(%rsi), %r12');
   Line('  movl 8(%rsi), %r13d');
@@ -48985,6 +49315,8 @@ begin
   Line('  je .sh_fpe');
   Line('  cmpq $7, %rdi');
   Line('  je .sh_bus');
+  Line('  cmpl $128, %r13d');
+  Line('  je .sh_gp');
   Line('  cmpq $4096, %r12');
   Line('  jb .sh_nil');
   Line('  movq %r15, %rax');
@@ -49027,6 +49359,11 @@ begin
   Line('  movq %rbx, %rdi');
   Line('  leaq .Lnilptr(%rip), %rsi');
   Line('  movq $' + IntToStr(Length(MsgNil)) + ', %rdx');
+  Line('  jmp rt_diemsg');
+  Line('.sh_gp:');
+  Line('  movq %rbx, %rdi');
+  Line('  leaq .Lnoaddr(%rip), %rsi');
+  Line('  movq $' + IntToStr(Length(MsgNoAddr)) + ', %rdx');
   Line('  jmp rt_diemsg');
   Line('.sh_fpe:');
   Line('  cmpl $2, %r13d');
@@ -54600,6 +54937,8 @@ begin
     Line('.weak __stop_pasasync');
     Line('.weak __start_paslines');
     Line('.weak __stop_paslines');
+    Line('.weak __start_pasfault');
+    Line('.weak __stop_pasfault');
     Line('.weak __stop_pasgcroots');
     { Go's size classes (internal/runtime/gc/sizeclasses.go), P95a. }
     Line('.balign 8');
@@ -54915,6 +55254,11 @@ begin
     Line('  .ascii "' + MsgNil + '"');
     Line('.Lbadaddr:');
     Line('  .ascii "' + MsgBadAddr + '"');
+    if not FArm then
+    begin
+      Line('.Lnoaddr:');
+      Line('  .ascii "' + MsgNoAddr + '"');
+    end;
     Line('.Ldivzero:');
     Line('  .ascii "' + MsgDivZero + '"');
     Line('.Lptrout:');
@@ -59877,7 +60221,164 @@ begin
   { The signal handler: pc at 440 and sp at 432 of the ucontext (176 to
     the sigcontext, fault_address, 31 registers, sp, pc); address at 16
     and code at 8 of the siginfo. }
+  { rt_sigfault, as on amd64: x30 the pc of the fault, x0 the kind and
+    x1 the address; SysFault takes x0 the address, x3 the words, x4
+    their length + 256 * the kind and x5 the pc, as .aflt_plain gives
+    them; before rt_sighandler, as on amd64 }
+  Line('rt_sigfault:');
+  Line('  mov x9, x0');
+  Line('  mov x0, x1');
+  Line('  mov x5, x30');
+  LeaS('.Lnilptr', 'x3');
+  Line('  mov x4, #' + IntToStr(Length(MsgNil) + 256 * 12));
+  Line('  cmp x9, #12');
+  Line('  b.eq .sf_go');
+  LeaS('.Lbadaddr', 'x3');
+  Line('  mov x4, #' + IntToStr(Length(MsgBadAddr) + 256 * 13));
+  Line('  cmp x9, #13');
+  Line('  b.eq .sf_go');
+  LeaS('.Lbuserr', 'x3');
+  Line('  mov x4, #' + IntToStr(Length(MsgBus) + 256 * 14));
+  Line('.sf_go:');
+  Line('  movz x10, #:abs_g1:p_sysutils_sysfault');
+  Line('  movk x10, #:abs_g0_nc:p_sysutils_sysfault');
+  Line('  br x10');
+  { A fault that a handler may take is raised in the routine that made
+    it, as on amd64 (P568), by the same four questions. The codes are
+    1 and 2 alone: this kernel sends every fault of an address with
+    the address (Linux 7.2 arch/arm64/mm/fault.c, do_bad_area), and
+    what it cannot tell kills the program. A call of nothing has its
+    return address in the link register, and the call is the
+    instruction before it (Go's signal_arm64.go gives the link register
+    to shouldPushSigpanic); x13 is the pc that is asked for, and the
+    place of the program's end (.sh_own: x19 to x23 are free there and
+    rt_pcline keeps them; the link register is lost, and the program
+    ends without it). The context: the pc becomes the link
+    register, so that the routine called looks called from there, and
+    nothing goes to the stack. Go's preparePanic keeps the old link
+    there for its traceback of a routine with no frame; nothing here
+    reads it: the raise goes to a try record, which has its own
+    registers, and the collector reads the frame of a fault word by
+    word. x0 the kind and x1 the address, which no region keeps a
+    variable in. }
   Line('rt_sighandler:');
+  Line('  ldr x13, [x2, #440]');
+  Line('  cmp x0, #8');
+  Line('  b.eq .sh_die');
+  Line('  ldr w14, [x1, #8]');
+  Line('  sub w14, w14, #1');
+  Line('  cmp w14, #1');
+  Line('  b.hi .sh_die');
+  LdS('rt_asynclo', 'x14');
+  Line('  cbz x14, .sh_die');
+  LdS('rt_asynchi', 'x15');
+  Line('.sh_scan:');
+  Line('  cmp x14, x15');
+  Line('  b.hs .sh_out');
+  Line('  ldr x10, [x14]');
+  Line('  cmp x13, x10');
+  Line('  b.lo .sh_next');
+  Line('  ldr x10, [x14, #8]');
+  Line('  cmp x13, x10');
+  Line('  b.lo .sh_in');
+  Line('.sh_next:');
+  Line('  add x14, x14, #16');
+  Line('  b .sh_scan');
+  Line('.sh_out:');
+  Line('  ldr x14, [x1, #16]');
+  Line('  cmp x13, x14');
+  Line('  b.ne .sh_die');
+  Line('  ldr x13, [x2, #424]');
+  Line('  sub x13, x13, #4');
+  LdS('rt_asynclo', 'x14');
+  Line('.sh_scan2:');
+  Line('  cmp x14, x15');
+  Line('  b.hs .sh_own');
+  Line('  ldr x10, [x14]');
+  Line('  cmp x13, x10');
+  Line('  b.lo .sh_next2');
+  Line('  ldr x10, [x14, #8]');
+  Line('  cmp x13, x10');
+  Line('  b.lo .sh_in');
+  Line('.sh_next2:');
+  Line('  add x14, x14, #16');
+  Line('  b .sh_scan2');
+  Line('.sh_own:');
+  Line('  mov x19, x0');
+  Line('  mov x20, x1');
+  Line('  mov x21, x2');
+  Line('  mov x23, x13');
+  Line('  mov x0, x13');
+  Line('  bl rt_pcline');
+  Line('  mov x9, x0');
+  Line('  mov x0, x19');
+  Line('  mov x1, x20');
+  Line('  mov x2, x21');
+  Line('  mov x13, x23');
+  Line('  cbnz x9, .sh_die');
+  Line('  ldr x13, [x2, #440]');
+  Line('  b .sh_die');
+  Line('.sh_in:');
+  Line('  ldr x9, [x2, #408]');
+  Line('  cbz x9, .sh_die');
+  Line('  ldr w10, [x9, #152]');
+  Line('  cbnz w10, .sh_die');
+  Line('  ldr w10, [x9, #184]');
+  Line('  cbnz w10, .sh_die');
+  Line('  ldr x10, [x9, #224]');
+  Line('  cbz x10, .sh_die');
+  Line('  movz x10, #:abs_g1:p_sysutils_sysfault');
+  Line('  movk x10, #:abs_g0_nc:p_sysutils_sysfault');
+  Line('  cbz x10, .sh_die');
+  Line('  ldr x12, [x2, #432]');
+  Line('  ldr x10, [x9, #8]');
+  Line('  cmp x12, x10');
+  Line('  b.hi .sh_die');
+  Line('  ldr x10, [x9, #24]');
+  Line('  add x10, x10, #' + IntToStr(AsyncRoom));
+  Line('  cmp x12, x10');
+  Line('  b.lo .sh_die');
+  Line('  ldr x11, [x1, #16]');
+  Line('  mov x10, #14');
+  Line('  cmp x0, #7');
+  Line('  b.eq .sh_inj');
+  Line('  mov x10, #12');
+  Line('  cmp x11, #4096');
+  Line('  b.lo .sh_inj');
+  Line('  sub x14, x12, #16, lsl #12');
+  Line('  cmp x11, x14');
+  Line('  b.lo .sh_kbad');
+  Line('  add x14, x12, #1, lsl #12');
+  Line('  cmp x11, x14');
+  Line('  b.lo .sh_die');
+  Line('.sh_kbad:');
+  Line('  mov x10, #13');
+  Line('.sh_inj:');
+  Line('  str x13, [x2, #424]');
+  Line('  str x10, [x2, #184]');
+  Line('  str x11, [x2, #192]');
+  LeaS('rt_sigfault', 'x14');
+  LeaS('__start_pasfault', 'x10');
+  LeaS('__stop_pasfault', 'x11');
+  Line('.sh_pad:');
+  Line('  cmp x10, x11');
+  Line('  b.hs .sh_set');
+  Line('  ldrsw x15, [x10]');
+  Line('  add x15, x15, x10');
+  Line('  sub x15, x13, x15');
+  Line('  ldr w16, [x10, #4]');
+  Line('  cmp x15, x16');
+  Line('  b.lo .sh_hit');
+  Line('  add x10, x10, #12');
+  Line('  b .sh_pad');
+  Line('.sh_hit:');
+  Line('  ldrsw x14, [x10, #8]');
+  Line('  add x14, x14, x10');
+  Line('  add x14, x14, #8');
+  Line('.sh_set:');
+  Line('  str x14, [x2, #440]');
+  Line('  ret');
+  Line('.sh_die:');
   LeaS('rt_siglock', 'x9');
   Line('.sh_lk:');
   Line('  ldaxr x10, [x9]');
@@ -59890,8 +60391,9 @@ begin
   Line('  clrex');
   Line('  wfe');
   Line('  b .sh_spin');
+  { the pc the questions above asked for, as on amd64 }
   Line('.sh_first:');
-  Line('  ldr x19, [x2, #440]');
+  Line('  mov x19, x13');
   Line('  ldr x22, [x2, #432]');
   Line('  ldr x20, [x1, #16]');
   Line('  ldr w21, [x1, #8]');

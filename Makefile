@@ -756,6 +756,10 @@ GOLDEN_A64 += faults httpfault
 # P571: a constant index outside its array beside a call's value or an operand that waits in a register.
 GOLDEN += constidx
 GOLDEN_A64 += constidx
+# P568: a nil pointer and the processor's other faults of memory as exceptions a handler takes; nilnative
+# has the two that only a run on the processor itself shows.
+GOLDEN += nilfault nilnative
+GOLDEN_A64 += nilfault
 # P573: a server stops whatever became of its sockets.
 GOLDEN += httpstop
 GOLDEN_A64 += httpstop
@@ -3585,6 +3589,53 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	done; \
 	echo ok callun
 	@set -e; \
+	: P568: with sysutils in the program a nil pointer or another fault of memory inside a try is an exception raised in the routine that made it and testdata/nilfault takes every shape and then dies of each three ways and each time the line on the error output must be the Message, on both machines, testdata/nilnative does the same on amd64 for an address that is not in canonical form and for a call of a page of code whose file was cut short, the fuzzer of the failures has pointers, a signal that someone sent raises nothing and a handler of httpserver that reads through nil answers 500; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/nilfault testdata/nilfault.paslang; \
+	timeout 60 $(BUILDDIR)/nilfault > $(BUILDDIR)/nilfault.got; \
+	diff -u testdata/nilfault.out $(BUILDDIR)/nilfault.got; \
+	grep '^paslang: ' $(BUILDDIR)/nilfault.got > $(BUILDDIR)/nilfault.lines; \
+	test $$(grep -c '' $(BUILDDIR)/nilfault.lines) -eq 16; \
+	for m in die fin pas; do \
+	  rm -f $(BUILDDIR)/nilfault.$$m; \
+	  for k in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do \
+	    set +e; timeout 60 $(BUILDDIR)/nilfault $$m $$k > $(BUILDDIR)/nilfault.$$m.out 2>> $(BUILDDIR)/nilfault.$$m; rc=$$?; set -e; \
+	    test $$rc -eq 1; \
+	  done; \
+	  diff -u $(BUILDDIR)/nilfault.lines $(BUILDDIR)/nilfault.$$m; \
+	done; \
+	$(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/nilfault-arm testdata/nilfault.paslang; \
+	timeout 120 $(QEMU_A64) $(BUILDDIR)/nilfault-arm > $(BUILDDIR)/nilfault-arm.got; \
+	diff -u testdata/nilfault.out $(BUILDDIR)/nilfault-arm.got; \
+	for m in die fin pas; do \
+	  rm -f $(BUILDDIR)/nilfault-arm.$$m; \
+	  for k in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do \
+	    set +e; timeout 120 $(QEMU_A64) $(BUILDDIR)/nilfault-arm $$m $$k > $(BUILDDIR)/nilfault-arm.$$m.out 2>> $(BUILDDIR)/nilfault-arm.$$m; rc=$$?; set -e; \
+	    test $$rc -eq 1; \
+	  done; \
+	  diff -u $(BUILDDIR)/nilfault.lines $(BUILDDIR)/nilfault-arm.$$m; \
+	done; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/nilnative testdata/nilnative.paslang; \
+	timeout 60 $(BUILDDIR)/nilnative > $(BUILDDIR)/nilnative.got; \
+	diff -u testdata/nilnative.out $(BUILDDIR)/nilnative.got; \
+	grep '^paslang: ' $(BUILDDIR)/nilnative.got > $(BUILDDIR)/nilnative.lines; \
+	test $$(grep -c '' $(BUILDDIR)/nilnative.lines) -eq 4; \
+	rm -f $(BUILDDIR)/nilnative.die; \
+	for k in 1 2 3 4; do \
+	  set +e; timeout 60 $(BUILDDIR)/nilnative $$k > $(BUILDDIR)/nilnative.die.out 2>> $(BUILDDIR)/nilnative.die; rc=$$?; set -e; \
+	  test $$rc -eq 1; \
+	done; \
+	diff -u $(BUILDDIR)/nilnative.lines $(BUILDDIR)/nilnative.die; \
+	python3 -I scripts/fuzz_faults.py --paslangc $(OUTDIR)/paslangc --units $(BUILDDIR) --work $(BUILDDIR)/fuzz_nil --variants native,base 500 8; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/sigsent testdata/sigsent.paslang; \
+	python3 -I scripts/sigsent_check.py $(BUILDDIR)/sigsent; \
+	$(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/sigsent-arm testdata/sigsent.paslang; \
+	python3 -I scripts/sigsent_check.py $(BUILDDIR)/sigsent-arm $(QEMU_A64); \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/httpfault testdata/httpfault.paslang; \
+	timeout 120 $(BUILDDIR)/httpfault > $(BUILDDIR)/httpfault.got 2> $(BUILDDIR)/httpfault.err; \
+	diff -u testdata/httpfault.out $(BUILDDIR)/httpfault.got; \
+	grep -q '^httpserver: GET /nil: EAccessViolation: nil pointer dereference at line ' $(BUILDDIR)/httpfault.err; \
+	echo ok nilfault
+	@set -e; \
 	: P573: Shutdown wakes the acceptors of httpserver through the poller and testdata/httpstop stops servers on a Unix socket with its file there and with it removed and on TCP and on both and by SIGTERM and scripts/httpstop_check.py plays the part of systemd with a socket it keeps which must still listen after the server stops and looks at what an idle server and one out of descriptors cost on both machines; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/httpstop testdata/httpstop.paslang; \
 	timeout 60 $(BUILDDIR)/httpstop > $(BUILDDIR)/httpstop.got; \
@@ -5334,7 +5385,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'paslang: unlock of an unlocked mutex' $(BUILDDIR)/unlockfree.err; \
 	echo ok unlockfree; \
 	echo "==== fatal ===="; \
-	for t in divzero nilptr deep oom oomlimit closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg leafnil bmaskwide bmodneg bmaskone bforpast bvarctr bnestctr bsumstat bsumdyn bsumneg bkeepfirst bkeepmoved bkeepstat bkeepshrunk brunlen brunloc divfirst idxline nilline bflatidx bflatpush nilblk nilbig nilzero nildest nilmeth elemidx jsonbusy jsonrbusy jsonwbusy divcall faultbare faultfin faultpas faultasm faultspin bconstleft; do \
+	for t in divzero nilptr deep oom oomlimit closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg leafnil bmaskwide bmodneg bmaskone bforpast bvarctr bnestctr bsumstat bsumdyn bsumneg bkeepfirst bkeepmoved bkeepstat bkeepshrunk brunlen brunloc divfirst idxline nilline bflatidx bflatpush nilblk nilbig nilzero nildest nilmeth elemidx jsonbusy jsonrbusy jsonwbusy divcall faultbare faultfin faultpas faultasm faultspin bconstleft nilbare nilasm nilspin nilcall nilasmtop niljump; do \
 	  $(OUTDIR)/paslangc -o $(BUILDDIR)/fatal_$$t testdata/fatal/$$t.paslang; \
 	  set +e; \
 	  if [ $$t = oomlimit ]; then \
@@ -5448,6 +5499,12 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q '^paslang: index 5 out of range \[0..4\] at line 23$$' $(BUILDDIR)/fatal_faultasm.err; \
 	grep -q '^paslang: index 5 out of range \[0..4\] at line 21$$' $(BUILDDIR)/fatal_faultspin.err; \
 	grep -q '^paslang: index 8 out of range \[0..4\] at line 21$$' $(BUILDDIR)/fatal_bconstleft.err; \
+	grep -q '^paslang: nil pointer dereference at line 19$$' $(BUILDDIR)/fatal_nilbare.err; \
+	grep -q '^paslang: nil pointer dereference at line 23$$' $(BUILDDIR)/fatal_nilasm.err; \
+	grep -q '^paslang: nil pointer dereference at line 25$$' $(BUILDDIR)/fatal_nilspin.err; \
+	grep -q '^paslang: nil pointer dereference at line 20$$' $(BUILDDIR)/fatal_nilcall.err; \
+	grep -q '^paslang: nil pointer dereference at line 28$$' $(BUILDDIR)/fatal_nilasmtop.err; \
+	grep -q '^paslang: nil pointer dereference$$' $(BUILDDIR)/fatal_niljump.err; \
 	echo ok fatal; \
 	: P382 a broken standard output or error ends the program by SIGPIPE, 141, as in Go; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/brokenpipe_die testdata/brokenpipe.paslang; \
@@ -6386,7 +6443,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	grep -q 'paslang: unlock of an unlocked mutex' $(BUILDDIR)/unlockfree-arm.err; \
 	echo ok unlockfree-arm; \
 	echo "==== fatal arm64 ===="; \
-	for t in divzero nilptr deep oom closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg leafnil bmaskwide bmodneg bmaskone bforpast bvarctr bnestctr bsumstat bsumdyn bsumneg bkeepfirst bkeepmoved bkeepstat bkeepshrunk brunlen brunloc divfirst idxline nilline bflatidx bflatpush nilblk nilbig nilzero nildest nilmeth elemidx jsonbusy jsonrbusy jsonwbusy divcall faultbare faultfin faultpas faultasm faultspin bconstleft; do \
+	for t in divzero nilptr deep oom closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg leafnil bmaskwide bmodneg bmaskone bforpast bvarctr bnestctr bsumstat bsumdyn bsumneg bkeepfirst bkeepmoved bkeepstat bkeepshrunk brunlen brunloc divfirst idxline nilline bflatidx bflatpush nilblk nilbig nilzero nildest nilmeth elemidx jsonbusy jsonrbusy jsonwbusy divcall faultbare faultfin faultpas faultasm faultspin bconstleft nilbare nilasm nilspin nilcall nilasmtop niljump; do \
 	  $(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/fatal_$$t-arm testdata/fatal/$$t.paslang; \
 	  set +e; timeout 60 $(QEMU_A64) $(BUILDDIR)/fatal_$$t-arm > $(BUILDDIR)/fatal_$$t-arm.got 2> $(BUILDDIR)/fatal_$$t-arm.err; rc=$$?; set -e; \
 	  test $$rc -eq 1; \
@@ -6480,6 +6537,12 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	grep -q '^paslang: index 5 out of range \[0..4\] at line 23$$' $(BUILDDIR)/fatal_faultasm-arm.err; \
 	grep -q '^paslang: index 5 out of range \[0..4\] at line 21$$' $(BUILDDIR)/fatal_faultspin-arm.err; \
 	grep -q '^paslang: index 8 out of range \[0..4\] at line 21$$' $(BUILDDIR)/fatal_bconstleft-arm.err; \
+	grep -q '^paslang: nil pointer dereference at line 19$$' $(BUILDDIR)/fatal_nilbare-arm.err; \
+	grep -q '^paslang: nil pointer dereference at line 23$$' $(BUILDDIR)/fatal_nilasm-arm.err; \
+	grep -q '^paslang: nil pointer dereference at line 25$$' $(BUILDDIR)/fatal_nilspin-arm.err; \
+	grep -q '^paslang: nil pointer dereference at line 20$$' $(BUILDDIR)/fatal_nilcall-arm.err; \
+	grep -q '^paslang: nil pointer dereference at line 28$$' $(BUILDDIR)/fatal_nilasmtop-arm.err; \
+	grep -q '^paslang: nil pointer dereference$$' $(BUILDDIR)/fatal_niljump-arm.err; \
 	echo ok fatal-arm; \
 	$(OUTDIR)/paslangc -target arm64 -cpu max -Fu $(A64DIR) -o $(BUILDDIR)/brokenpipe_die-arm testdata/brokenpipe.paslang; \
 	(set +e; $(QEMU_A64) $(BUILDDIR)/brokenpipe_die-arm out; echo $$? > $(BUILDDIR)/brokenpipe_out-arm.rc) | head -c 1 > /dev/null; \

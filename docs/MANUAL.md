@@ -14385,6 +14385,8 @@ SysUtils is what turns run-time errors into exceptions there too:
 | a 128-bit quotient past 64 bits | `EIntOverflow` |
 | a real out of `Integer`'s range; `sqrt`, `ln` and the other domains | `EInvalidOp` |
 | `as` of an object that is not of the class | `EInvalidCast` |
+| a nil pointer; an address that is not the program's (1.2.384) | `EAccessViolation` |
+| memory whose file has ended, a bus error (1.2.384) | `EBusError` |
 
 `E.Message` is the runtime's line without `paslang: `
 (`index 10 out of range [0..4] at line 12`, and `at line 12 of unit U`
@@ -14412,17 +14414,56 @@ except
 end;
 ```
 
-What stays fatal everywhere: a nil pointer and the other faults the
-processor reports, a stack overflow, memory that runs out, the channel and
-map failures and the deadlock; a failure inside the runtime's own units
-or in a routine with `asm` (`testdata/fatal/faultasm`); one that comes
-while the routine holds a `SpinLock` (*Runtime words*), which an exception would
-leave held, as Go throws on a panic holding locks
-(`testdata/fatal/faultspin`); and every failure
-in a program without SysUtils, where a `try` does not take it
-(`testdata/fatal/faultbare`).
-`testdata/faults` takes every kind, and `testdata/httpfault` shows a
-server whose handlers fail (§16).
+**A nil pointer (1.2.384, P568).** The faults of memory the processor
+reports are exceptions by the same rule: a nil pointer read or written,
+a field or a method of a nil object, a procedure, function or method
+variable that is nil, called, an address where nothing is, a page of a
+mapped file that was cut short. No check is written for them; the
+signal's handler makes the routine that faulted call SysUtils from the
+instruction it was at, as Go's turns a fault into a panic of the
+goroutine, and SysUtils raises `EAccessViolation`, or `EBusError`, its
+child, with the runtime's line as its Message (`nil pointer dereference
+at line 12`, `invalid memory address 0x1cbe991a14 at line 14`, `bus
+error at line 9`). A call of nothing has the line of the call. On amd64
+an address that is not in canonical form (bits 63 to 47 not all the
+same: text where a pointer was) is refused by the processor with no
+address told, and the Message is `invalid memory address at line 14`;
+arm64 tells the address of every one. The handler reads its variables
+as they were at the fault, the ones a loop kept in registers too: such
+a region has a pad that stores them before the raise. So a request
+whose handler follows a nil pointer answers 500 and the server goes on
+(§16).
+
+```
+try
+  total := 0;
+  while n <> nil do
+  begin
+    total := total + n^.V;
+    n := n^.Next;        { the last one points nowhere }
+  end;
+except
+  on E: EAccessViolation do
+    WriteLn(total, ': ', E.Message);   { 150: invalid memory address 0x1cbe991a14 at line 5 }
+end;
+```
+
+What stays fatal everywhere: a stack overflow, memory that runs out, the
+channel and map failures and the deadlock; a fault of the processor's
+arithmetic (SIGFPE: a division is checked before its instruction, so
+one would not be the program's); a signal that someone sent, which is no
+fault of the code it lands on; a failure inside the runtime's own units
+or in a routine with `asm` (`testdata/fatal/faultasm`, `nilasm`,
+`nilcall`, `nilasmtop`, `niljump`); one
+that comes while the routine holds a `SpinLock` (*Runtime words*), which
+an exception would leave held, as Go throws on a panic holding locks
+(`testdata/fatal/faultspin`, `nilspin`); and every failure in a program
+without SysUtils, where a `try` does not take it
+(`testdata/fatal/faultbare`, `nilbare`).
+`testdata/faults` takes every checked kind and `testdata/nilfault` every
+fault of memory (`testdata/nilnative` the two that only a run on the
+processor itself shows), and
+`testdata/httpfault` shows a server whose handlers fail (§16).
 
 Every index is checked, on every read and write, as in Go: a static
 array's against its bounds, a slice's against `0..Length - 1`, a
