@@ -55,7 +55,7 @@ const
   MsgStack = 'paslang: stack overflow';
   MsgSendClosed = 'paslang: send on closed channel';
   MsgCloseClosed = 'paslang: close of closed channel';
-  MsgCloseSender = 'paslang: close of a channel with a waiting sender';
+  MsgNilChan = 'paslang: nil channel';
   MsgMapRW = 'paslang: concurrent map read and map write';
   MsgClone = 'paslang: clone failed, errno ';
   MsgSignalMask = 'paslang: cannot restore runtime signal mask';
@@ -47948,7 +47948,22 @@ begin
   Line('  call rt_globput');
   Line('  jmp rt_mloop');
   Line('');
+  { P583: the failures of a channel are the routine's that made them, as
+    Go panics there (runtime/chan.go: send on closed channel, in a
+    sender that found it closed and in one that waited when it closed;
+    close of closed channel). Each gives the channel's lock back, takes
+    its registers from the stack and leaves it as the call found it,
+    the return address on top, and goes to .flt_plain with the pc of
+    the call (a byte under its return address: the call may be the last
+    instruction of its line, P86), the text and kind 20: raised there
+    when the routine may take it (rt_canraise), the program's end with
+    the statement's line else. A nil channel is kind 16, a nil thing
+    written through, with the place it never had: the fault of its
+    first read was the runtime's own code's (nil pointer dereference at
+    pc). }
   Line('rt_chansend:');
+  Line('  testq %rdi, %rdi');
+  Line('  jz .ch_nil');
   Line('  pushq %rbx');
   Line('  pushq %r12');
   Line('  movq %rdi, %rbx');
@@ -47980,23 +47995,41 @@ begin
   Line('  popq %r12');
   Line('  popq %rbx');
   Line('  ret');
+  { A sender that waits may be woken by the channel's close, which
+    writes 1 at 40 of its waiter (P583): its value went nowhere, and the
+    send fails as one that found the channel closed. }
   Line('.cs_park:');
   Line('  subq $48, %rsp');
   Line('  movq %r14, 8(%rsp)');
   Line('  movq %r12, 16(%rsp)');
   Line('  movq $0, 24(%rsp)');
+  Line('  movq $0, 40(%rsp)');
   Line('  movl $1, 152(%r14)');
   Line('  leaq 32(%rbx), %rdi');
   Line('  movq %rsp, %rsi');
   Line('  call rt_cqenq');
   Line('  movl $0, (%rbx)');
   Line('  call rt_parkmarked');
+  Line('  cmpq $0, 40(%rsp)');
+  Line('  jne .cs_woke');
   Line('  addq $48, %rsp');
   Line('  popq %r12');
   Line('  popq %rbx');
   Line('  ret');
+  Line('.cs_woke:');
+  Line('  addq $48, %rsp');
+  Line('  popq %r12');
+  Line('  popq %rbx');
+  Line('  jmp .ch_sendclosed');
+  Line('.cs_closed:');
+  Line('  movl $0, (%rbx)');
+  Line('  popq %r12');
+  Line('  popq %rbx');
+  Line('  jmp .ch_sendclosed');
   Line('');
   Line('rt_chanrecv:');
+  Line('  testq %rdi, %rdi');
+  Line('  jz .ch_nil');
   Line('  pushq %rbx');
   Line('  movq %rdi, %rbx');
   Line('.cr_lock:');
@@ -48055,6 +48088,8 @@ begin
   Line('  ret');
   Line('');
   Line('rt_chanclose:');
+  Line('  testq %rdi, %rdi');
+  Line('  jz .ch_nil');
   Line('  pushq %rbx');
   Line('  movq %rdi, %rbx');
   Line('.cc_lock:');
@@ -48074,40 +48109,48 @@ begin
   Line('  movq 8(%rax), %rdi');
   Line('  call rt_ready');
   Line('  jmp .cc_r');
+  { The senders that wait are woken with the mark of a closed channel,
+    as Go's closechan wakes them to panic (P583): the close is the
+    closer's right, the send on a channel that closed the sender's
+    failure. It ended the program at the close before, with a line of
+    the closer. }
   Line('.cc_s:');
   Line('  leaq 32(%rbx), %rdi');
   Line('  call rt_cqtake');
   Line('  testq %rax, %rax');
   Line('  jz .cc_done');
-  Line('  jmp .cc_sender');
+  Line('  movq $1, 40(%rax)');
+  Line('  movq 8(%rax), %rdi');
+  Line('  call rt_ready');
+  Line('  jmp .cc_s');
   Line('.cc_done:');
   Line('  movl $0, (%rbx)');
   Line('  popq %rbx');
   Line('  ret');
-  Line('');
-  { The line of the statement is the return address of the runtime call,
-    above the registers each routine pushed, less one: when the call is
-    the last instruction of its statement the return address already
-    belongs to the next line (P86). }
-  Line('.cs_closed:');
-  Line('  movq 16(%rsp), %rdi');
-  Line('  decq %rdi');
-  Line('  jmp rt_diesendclosed');
-  Line('.ts_closed:');
-  Line('  movq 16(%rsp), %rdi');
-  Line('  decq %rdi');
-  Line('  jmp rt_diesendclosed');
-  Line('.sx_closed:');
-  Line('  xorq %rdi, %rdi');
-  Line('  jmp rt_diesendclosed');
   Line('.cc_closed:');
-  Line('  movq 8(%rsp), %rdi');
+  Line('  movl $0, (%rbx)');
+  Line('  popq %rbx');
+  Line('  movq (%rsp), %rdi');
   Line('  decq %rdi');
-  Line('  jmp rt_diecloseclosed');
-  Line('.cc_sender:');
-  Line('  movq 8(%rsp), %rdi');
+  Line('  leaq .Lcloseclosed(%rip), %rsi');
+  Line('  movq $' + IntToStr(Length(MsgCloseClosed)) + ', %rdx');
+  Line('  movl $20, %ecx');
+  Line('  jmp .flt_plain');
+  { the return address of the runtime call on top of the stack }
+  Line('.ch_sendclosed:');
+  Line('  movq (%rsp), %rdi');
   Line('  decq %rdi');
-  Line('  jmp rt_dieclosesender');
+  Line('  leaq .Lsendclosed(%rip), %rsi');
+  Line('  movq $' + IntToStr(Length(MsgSendClosed)) + ', %rdx');
+  Line('  movl $20, %ecx');
+  Line('  jmp .flt_plain');
+  Line('.ch_nil:');
+  Line('  movq (%rsp), %rdi');
+  Line('  decq %rdi');
+  Line('  leaq .Lnilchan(%rip), %rsi');
+  Line('  movq $' + IntToStr(Length(MsgNilChan)) + ', %rdx');
+  Line('  movl $16, %ecx');
+  Line('  jmp .flt_plain');
   Line('');
   Line('rt_trysend:');
   Line('  pushq %rbx');
@@ -48150,6 +48193,16 @@ begin
   Line('  popq %r12');
   Line('  popq %rbx');
   Line('  ret');
+  { rt_select alone calls rt_trysend: the failure is the select's, so
+    the return address into rt_select goes too and rt_select's own
+    registers come back there (P583; the line was a pc of the runtime
+    before). }
+  Line('.ts_closed:');
+  Line('  movl $0, (%rbx)');
+  Line('  popq %r12');
+  Line('  popq %rbx');
+  Line('  addq $8, %rsp');
+  Line('  jmp .sx_fail');
   Line('');
   Line('rt_tryrecv:');
   Line('  pushq %rbx');
@@ -48238,6 +48291,8 @@ begin
   Line('  je .sx_next');
   Line('  movq 8(%rax), %rdi');
   Line('  movq 16(%rax), %rsi');
+  Line('  testq %rdi, %rdi');
+  Line('  jz .sx_nil');
   Line('  testq %rcx, %rcx');
   Line('  jnz .sx_tr');
   Line('  call rt_trysend');
@@ -48408,6 +48463,7 @@ begin
   Line('  leaq 144(%r13, %rax), %rsi');
   Line('  movq %r14, 8(%rsi)');
   Line('  movq %r13, 24(%rsi)');
+  Line('  movq $0, 40(%rsi)');
   Line('  movq 16(%r13, %r12, 8), %rcx');
   Line('  movq %rcx, 32(%rsi)');
   Line('  shlq $5, %rcx');
@@ -48460,11 +48516,34 @@ begin
   Line('  shlq $5, %rcx');
   Line('  addq %rbx, %rcx');
   Line('  cmpq $1, (%rcx)');
-  Line('  jne .sx_ret');
+  Line('  je .sx_rv');
+  { a send arm that won: by a receiver, or by its channel's close }
+  Line('  cmpq $0, 40(%rsi)');
+  Line('  je .sx_ret');
+  Line('  jmp .sx_fail');
+  Line('.sx_rv:');
   Line('  movq 16(%rcx), %rdx');
   Line('  movq 16(%rsi), %rcx');
   Line('  movq %rcx, (%rdx)');
   Line('  jmp .sx_ret');
+  { P583: a send arm whose channel is closed, found under every
+    channel's lock (.sx_closed), by rt_trysend or after the wait
+    (.sx_fail, no lock held), and an arm with a nil channel: the
+    registers come back and the failure is the select statement's. }
+  Line('.sx_closed:');
+  Line('  call .sx_unlockall');
+  Line('.sx_fail:');
+  Line('  popq %r15');
+  Line('  popq %r13');
+  Line('  popq %r12');
+  Line('  popq %rbx');
+  Line('  jmp .ch_sendclosed');
+  Line('.sx_nil:');
+  Line('  popq %r15');
+  Line('  popq %r13');
+  Line('  popq %r12');
+  Line('  popq %rbx');
+  Line('  jmp .ch_nil');
   Line('.sx_forever:');
   Line('  call rt_park');
   Line('  jmp .sx_forever');
@@ -48855,21 +48934,9 @@ begin
   Line('  leaq .Lstackovf(%rip), %rsi');
   Line('  movq $' + IntToStr(Length(MsgStack)) + ', %rdx');
   Line('  jmp rt_diemsg');
-  Line('rt_diesendclosed:');
-  Line('  leaq .Lsendclosed(%rip), %rsi');
-  Line('  movq $' + IntToStr(Length(MsgSendClosed)) + ', %rdx');
-  Line('  jmp rt_diemsg');
   Line('rt_diemaprw:');
   Line('  leaq .Lmaprw(%rip), %rsi');
   Line('  movq $' + IntToStr(Length(MsgMapRW)) + ', %rdx');
-  Line('  jmp rt_diemsg');
-  Line('rt_diecloseclosed:');
-  Line('  leaq .Lcloseclosed(%rip), %rsi');
-  Line('  movq $' + IntToStr(Length(MsgCloseClosed)) + ', %rdx');
-  Line('  jmp rt_diemsg');
-  Line('rt_dieclosesender:');
-  Line('  leaq .Lclosesender(%rip), %rsi');
-  Line('  movq $' + IntToStr(Length(MsgCloseSender)) + ', %rdx');
   Line('  jmp rt_diemsg');
   { No line: every routine is asleep, none is at fault (1.0.139). }
   Line('rt_diedeadlock:');
@@ -49135,8 +49202,20 @@ begin
   Line('  call rt_fatalline');
   Line('  jmp rt_dieend');
   { rt_diechancap (1.0.136): paslang: channel capacity N out of range
-    at line L, rdi the capacity, the return address the line. }
+    at line L, rdi the capacity, the return address the line. Raised
+    where the routine may take it, kind 21 with the capacity as its
+    number (P583; Go's makechan panics). }
   Line('rt_diechancap:');
+  Line('  movq (%rsp), %r9');
+  Line('  decq %r9');
+  Line('  call rt_canraise');
+  Line('  testq %r8, %r8');
+  Line('  jz .cap_die');
+  Line('  leaq .Lchancap(%rip), %rax');
+  Line('  movq $' + IntToStr(Length(MsgChanCap)) + ', %rcx');
+  Line('  movl $21, %r10d');
+  Line('  jmp .bf_raise');
+  Line('.cap_die:');
   Line('  movq (%rsp), %r15');
   Line('  decq %r15');
   Line('  movq %rdi, %rbx');
@@ -55344,8 +55423,8 @@ begin
     Line('  .ascii "' + MsgSendClosed + '"');
     Line('.Lcloseclosed:');
     Line('  .ascii "' + MsgCloseClosed + '"');
-    Line('.Lclosesender:');
-    Line('  .ascii "' + MsgCloseSender + '"');
+    Line('.Lnilchan:');
+    Line('  .ascii "' + MsgNilChan + '"');
     Line('.Lmaprw:');
     Line('  .ascii "' + MsgMapRW + '"');
     Line('.Ldeadlock:');
@@ -60150,21 +60229,9 @@ begin
   LeaS('.Lstackovf', 'x1');
   Line('  mov x2, #' + IntToStr(Length(MsgStack)));
   Line('  b rt_diemsg');
-  Line('rt_diesendclosed:');
-  LeaS('.Lsendclosed', 'x1');
-  Line('  mov x2, #' + IntToStr(Length(MsgSendClosed)));
-  Line('  b rt_diemsg');
-  Line('rt_diecloseclosed:');
-  LeaS('.Lcloseclosed', 'x1');
-  Line('  mov x2, #' + IntToStr(Length(MsgCloseClosed)));
-  Line('  b rt_diemsg');
   Line('rt_diemaprw:');
   LeaS('.Lmaprw', 'x1');
   Line('  mov x2, #' + IntToStr(Length(MsgMapRW)));
-  Line('  b rt_diemsg');
-  Line('rt_dieclosesender:');
-  LeaS('.Lclosesender', 'x1');
-  Line('  mov x2, #' + IntToStr(Length(MsgCloseSender)));
   Line('  b rt_diemsg');
   Line('rt_diedeadlock:');
   Line('  mov x0, xzr');
@@ -60395,8 +60462,19 @@ begin
   Line('  mov x0, x22');
   Line('  bl rt_fatalline');
   Line('  b rt_dieend');
-  { rt_diechancap as on amd64 (1.0.136): x0 the capacity, x30 the line. }
+  { rt_diechancap as on amd64 (1.0.136): x0 the capacity, x30 the line;
+    raised where the routine may take it (P583). }
   Line('rt_diechancap:');
+  Line('  sub x9, x30, #1');
+  Line('  mov x17, x30');
+  Line('  bl rt_canraise');
+  Line('  mov x30, x17');
+  Line('  cbz x8, .acap_die');
+  LeaS('.Lchancap', 'x14');
+  Line('  mov x15, #' + IntToStr(Length(MsgChanCap)));
+  Line('  mov x13, #21');
+  Line('  b .abf_raise');
+  Line('.acap_die:');
   Line('  sub x22, x30, #1');
   Line('  mov x19, x0');
   LeaS('.Lchancap', 'x1');
@@ -67994,7 +68072,12 @@ begin
   Line('  str x9, [x0, #8]');
   Line('.aqr_ret:');
   Line('  ret');
+  { P583, as on amd64: a failure of a channel gives the lock back,
+    takes its registers and x30, the return address of the runtime
+    call, from the stack and goes to .aflt_plain with the pc of the
+    call, the text and the kind in x13. }
   Line('rt_chansend:');
+  Line('  cbz x0, .ach_nil');
   Line('  str x30, [sp, #-16]!');
   Line('  stp x19, x20, [sp, #-16]!');
   Line('  mov x19, x0');
@@ -68031,6 +68114,7 @@ begin
   Line('  str x28, [sp, #8]');
   Line('  str x20, [sp, #16]');
   Line('  str xzr, [sp, #24]');
+  Line('  str xzr, [sp, #40]');
   Line('  mov w9, #1');
   Line('  str w9, [x28, #152]');
   Line('  add x0, x19, #32');
@@ -68038,15 +68122,30 @@ begin
   Line('  bl rt_cqenq');
   Line('  stlr wzr, [x19]');
   Line('  bl rt_parkmarked');
+  Line('  ldr x9, [sp, #40]');
   Line('  add sp, sp, #48');
   Line('  ldp x19, x20, [sp], #16');
   Line('  ldr x30, [sp], #16');
+  Line('  cbnz x9, .ach_sendclosed');
   Line('  ret');
   Line('.acs_die:');
-  Line('  ldr x0, [sp, #16]');
-  Line('  sub x0, x0, #1');
-  Line('  b rt_diesendclosed');
+  Line('  stlr wzr, [x19]');
+  Line('  ldp x19, x20, [sp], #16');
+  Line('  ldr x30, [sp], #16');
+  Line('.ach_sendclosed:');
+  Line('  sub x0, x30, #1');
+  LeaS('.Lsendclosed', 'x1');
+  Line('  mov x2, #' + IntToStr(Length(MsgSendClosed)));
+  Line('  mov x13, #20');
+  Line('  b .aflt_plain');
+  Line('.ach_nil:');
+  Line('  sub x0, x30, #1');
+  LeaS('.Lnilchan', 'x1');
+  Line('  mov x2, #' + IntToStr(Length(MsgNilChan)));
+  Line('  mov x13, #16');
+  Line('  b .aflt_plain');
   Line('rt_chanrecv:');
+  Line('  cbz x0, .ach_nil');
   Line('  str x30, [sp, #-16]!');
   Line('  stp x19, x20, [sp, #-16]!');
   Line('  mov x19, x0');
@@ -68107,6 +68206,7 @@ begin
   Line('  ldr x30, [sp], #16');
   Line('  ret');
   Line('rt_chanclose:');
+  Line('  cbz x0, .ach_nil');
   Line('  str x30, [sp, #-16]!');
   Line('  stp x19, x20, [sp, #-16]!');
   Line('  mov x19, x0');
@@ -68128,22 +68228,30 @@ begin
   Line('  ldr x0, [x0, #8]');
   Line('  bl rt_ready');
   Line('  b .acc_r');
+  { the senders that wait are woken with the mark, as on amd64 }
   Line('.acc_s:');
   Line('  add x0, x19, #32');
   Line('  bl rt_cqtake');
-  Line('  cbnz x0, .acc_die');
+  Line('  cbz x0, .acc_done');
+  Line('  mov x9, #1');
+  Line('  str x9, [x0, #40]');
+  Line('  ldr x0, [x0, #8]');
+  Line('  bl rt_ready');
+  Line('  b .acc_s');
+  Line('.acc_done:');
   Line('  stlr wzr, [x19]');
   Line('  ldp x19, x20, [sp], #16');
   Line('  ldr x30, [sp], #16');
   Line('  ret');
-  Line('.acc_die:');
-  Line('  ldr x0, [sp, #16]');
-  Line('  sub x0, x0, #1');
-  Line('  b rt_dieclosesender');
   Line('.acc_closed:');
-  Line('  ldr x0, [sp, #16]');
-  Line('  sub x0, x0, #1');
-  Line('  b rt_diecloseclosed');
+  Line('  stlr wzr, [x19]');
+  Line('  ldp x19, x20, [sp], #16');
+  Line('  ldr x30, [sp], #16');
+  Line('  sub x0, x30, #1');
+  LeaS('.Lcloseclosed', 'x1');
+  Line('  mov x2, #' + IntToStr(Length(MsgCloseClosed)));
+  Line('  mov x13, #20');
+  Line('  b .aflt_plain');
   Line('rt_trysend:');
   Line('  str x30, [sp, #-16]!');
   Line('  stp x19, x20, [sp, #-16]!');
@@ -68184,10 +68292,12 @@ begin
   Line('  ldp x19, x20, [sp], #16');
   Line('  ldr x30, [sp], #16');
   Line('  ret');
+  { rt_select alone calls rt_trysend: the failure is the select's }
   Line('.axs_die:');
-  Line('  ldr x0, [sp, #16]');
-  Line('  sub x0, x0, #1');
-  Line('  b rt_diesendclosed');
+  Line('  stlr wzr, [x19]');
+  Line('  ldp x19, x20, [sp], #16');
+  Line('  add sp, sp, #16');
+  Line('  b .asx_fail');
   Line('rt_tryrecv:');
   Line('  str x30, [sp, #-16]!');
   Line('  stp x19, x20, [sp, #-16]!');
@@ -68264,6 +68374,7 @@ begin
   Line('  b.eq .asx_next');
   Line('  ldr x0, [x9, #8]');
   Line('  ldr x1, [x9, #16]');
+  Line('  cbz x0, .asx_nil');
   Line('  cbnz x10, .asx_tr');
   Line('  bl rt_trysend');
   Line('  b .asx_chk');
@@ -68413,6 +68524,7 @@ begin
   Line('  add x1, x1, #144');
   Line('  str x28, [x1, #8]');
   Line('  str x22, [x1, #24]');
+  Line('  str xzr, [x1, #40]');
   Line('  add x9, x22, x20, lsl #3');
   Line('  ldr x9, [x9, #16]');
   Line('  str x9, [x1, #32]');
@@ -68467,14 +68579,31 @@ begin
   Line('  add x9, x19, x9');
   Line('  ldr x10, [x9]');
   Line('  cmp x10, #1');
-  Line('  b.ne .asx_ret');
+  Line('  b.eq .asx_rv');
+  { a send arm that won: by a receiver, or by its channel's close }
+  Line('  ldr x10, [x1, #40]');
+  Line('  cbz x10, .asx_ret');
+  Line('  b .asx_fail');
+  Line('.asx_rv:');
   Line('  ldr x10, [x9, #16]');
   Line('  ldr x11, [x1, #16]');
   Line('  str x11, [x10]');
   Line('  b .asx_ret');
+  { P583, as on amd64: under the locks, with none, and a nil channel }
   Line('.asx_die:');
-  Line('  mov x0, xzr');
-  Line('  b rt_diesendclosed');
+  Line('  bl .asx_unlockall');
+  Line('.asx_fail:');
+  Line('  ldp x24, x25, [sp], #16');
+  Line('  ldp x22, x23, [sp], #16');
+  Line('  ldp x19, x20, [sp], #16');
+  Line('  ldr x30, [sp], #16');
+  Line('  b .ach_sendclosed');
+  Line('.asx_nil:');
+  Line('  ldp x24, x25, [sp], #16');
+  Line('  ldp x22, x23, [sp], #16');
+  Line('  ldp x19, x20, [sp], #16');
+  Line('  ldr x30, [sp], #16');
+  Line('  b .ach_nil');
   Line('.asx_forever:');
   Line('  bl rt_park');
   Line('  b .asx_forever');

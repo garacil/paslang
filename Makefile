@@ -766,6 +766,9 @@ GOLDEN_A64 += libfault
 # P585: a waitgroup used again.
 GOLDEN += wgagain
 GOLDEN_A64 += wgagain
+# P583: the failures of a channel as exceptions.
+GOLDEN += chanfault chanshut
+GOLDEN_A64 += chanfault chanshut
 # P573: a server stops whatever became of its sockets.
 GOLDEN += httpstop
 GOLDEN_A64 += httpstop
@@ -3686,6 +3689,47 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	python3 -I scripts/check_wgreuse.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64); \
 	echo ok wgagain
 	@set -e; \
+	: P583: the failures of a channel are exceptions where Go panics, raised in the routine that made them, and testdata/chanfault takes every one by its class and then dies of each three ways with the same line, on both machines, while testdata/chanshut closes three thousand channels under their senders and loses no value and no sender; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/chanfault testdata/chanfault.paslang; \
+	timeout 60 $(BUILDDIR)/chanfault > $(BUILDDIR)/chanfault.got; \
+	diff -u testdata/chanfault.out $(BUILDDIR)/chanfault.got; \
+	grep '^paslang: ' $(BUILDDIR)/chanfault.got > $(BUILDDIR)/chanfault.lines; \
+	test $$(grep -c '' $(BUILDDIR)/chanfault.lines) -eq 15; \
+	for m in die fin pas; do \
+	  rm -f $(BUILDDIR)/chanfault.$$m; \
+	  for k in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do \
+	    set +e; timeout 60 $(BUILDDIR)/chanfault $$m $$k > $(BUILDDIR)/chanfault.$$m.out 2>> $(BUILDDIR)/chanfault.$$m; rc=$$?; set -e; \
+	    test $$rc -eq 1; \
+	  done; \
+	  diff -u $(BUILDDIR)/chanfault.lines $(BUILDDIR)/chanfault.$$m; \
+	done; \
+	$(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/chanfault-arm testdata/chanfault.paslang; \
+	timeout 120 $(QEMU_A64) $(BUILDDIR)/chanfault-arm > $(BUILDDIR)/chanfault-arm.got; \
+	diff -u testdata/chanfault.out $(BUILDDIR)/chanfault-arm.got; \
+	for m in die fin pas; do \
+	  rm -f $(BUILDDIR)/chanfault-arm.$$m; \
+	  for k in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do \
+	    set +e; timeout 120 $(QEMU_A64) $(BUILDDIR)/chanfault-arm $$m $$k > $(BUILDDIR)/chanfault-arm.$$m.out 2>> $(BUILDDIR)/chanfault-arm.$$m; rc=$$?; set -e; \
+	    test $$rc -eq 1; \
+	  done; \
+	  diff -u $(BUILDDIR)/chanfault.lines $(BUILDDIR)/chanfault-arm.$$m; \
+	done; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/chanshut testdata/chanshut.paslang; \
+	for n in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do \
+	  timeout 60 $(BUILDDIR)/chanshut > $(BUILDDIR)/chanshut.got; \
+	  diff -u testdata/chanshut.out $(BUILDDIR)/chanshut.got; \
+	done; \
+	timeout 120 taskset -c 0 $(BUILDDIR)/chanshut > $(BUILDDIR)/chanshut.got; \
+	diff -u testdata/chanshut.out $(BUILDDIR)/chanshut.got; \
+	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 timeout 300 $(BUILDDIR)/chanshut > $(BUILDDIR)/chanshut.got; \
+	diff -u testdata/chanshut.out $(BUILDDIR)/chanshut.got; \
+	$(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/chanshut-arm testdata/chanshut.paslang; \
+	for n in 1 2 3 4 5; do \
+	  timeout 300 $(QEMU_A64) $(BUILDDIR)/chanshut-arm > $(BUILDDIR)/chanshut-arm.got; \
+	  diff -u testdata/chanshut.out $(BUILDDIR)/chanshut-arm.got; \
+	done; \
+	echo ok chanfault
+	@set -e; \
 	: P573: Shutdown wakes the acceptors of httpserver through the poller and testdata/httpstop stops servers on a Unix socket with its file there and with it removed and on TCP and on both and by SIGTERM and scripts/httpstop_check.py plays the part of systemd with a socket it keeps which must still listen after the server stops and looks at what an idle server and one out of descriptors cost on both machines; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/httpstop testdata/httpstop.paslang; \
 	timeout 60 $(BUILDDIR)/httpstop > $(BUILDDIR)/httpstop.got; \
@@ -5435,7 +5479,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'paslang: unlock of an unlocked mutex' $(BUILDDIR)/unlockfree.err; \
 	echo ok unlockfree; \
 	echo "==== fatal ===="; \
-	for t in divzero nilptr deep oom oomlimit closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg leafnil bmaskwide bmodneg bmaskone bforpast bvarctr bnestctr bsumstat bsumdyn bsumneg bkeepfirst bkeepmoved bkeepstat bkeepshrunk brunlen brunloc divfirst idxline nilline bflatidx bflatpush nilblk nilbig nilzero nildest nilmeth elemidx jsonbusy jsonrbusy jsonwbusy divcall faultbare faultfin faultpas faultasm faultspin bconstleft nilbare nilasm nilspin nilcall nilasmtop niljump libstay libcut; do \
+	for t in divzero nilptr deep oom oomlimit closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg leafnil bmaskwide bmodneg bmaskone bforpast bvarctr bnestctr bsumstat bsumdyn bsumneg bkeepfirst bkeepmoved bkeepstat bkeepshrunk brunlen brunloc divfirst idxline nilline bflatidx bflatpush nilblk nilbig nilzero nildest nilmeth elemidx jsonbusy jsonrbusy jsonwbusy divcall faultbare faultfin faultpas faultasm faultspin bconstleft nilbare nilasm nilspin nilcall nilasmtop niljump libstay libcut chselect chwaited chtwice chnil chcap chbare; do \
 	  $(OUTDIR)/paslangc -o $(BUILDDIR)/fatal_$$t testdata/fatal/$$t.paslang; \
 	  set +e; \
 	  if [ $$t = oomlimit ]; then \
@@ -5556,6 +5600,13 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q '^paslang: nil pointer dereference at line 28$$' $(BUILDDIR)/fatal_nilasmtop.err; \
 	grep -q '^paslang: nil pointer dereference$$' $(BUILDDIR)/fatal_niljump.err; \
 	grep -q '^paslang: unlock of an unlocked mutex at line 18$$' $(BUILDDIR)/fatal_libstay.err; \
+	: P583: the failures of a channel with no SysUtils, each with the line of its statement; \
+	grep -q '^paslang: send on closed channel at line 14$$' $(BUILDDIR)/fatal_chselect.err; \
+	grep -q '^paslang: send on closed channel at line 19$$' $(BUILDDIR)/fatal_chwaited.err; \
+	grep -q '^paslang: close of closed channel at line 11$$' $(BUILDDIR)/fatal_chtwice.err; \
+	grep -q '^paslang: nil channel at line 10$$' $(BUILDDIR)/fatal_chnil.err; \
+	grep -q '^paslang: channel capacity -3 out of range at line 12$$' $(BUILDDIR)/fatal_chcap.err; \
+	grep -q '^paslang: send on closed channel at line 13$$' $(BUILDDIR)/fatal_chbare.err; \
 	grep -q '^paslang: store open /nonexistent-paslang-dir/\(0123456789\)\{21\} at line 24$$' $(BUILDDIR)/fatal_libcut.err; \
 	echo ok fatal; \
 	: P382 a broken standard output or error ends the program by SIGPIPE, 141, as in Go; \
@@ -6497,7 +6548,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	grep -q 'paslang: unlock of an unlocked mutex' $(BUILDDIR)/unlockfree-arm.err; \
 	echo ok unlockfree-arm; \
 	echo "==== fatal arm64 ===="; \
-	for t in divzero nilptr deep oom closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg leafnil bmaskwide bmodneg bmaskone bforpast bvarctr bnestctr bsumstat bsumdyn bsumneg bkeepfirst bkeepmoved bkeepstat bkeepshrunk brunlen brunloc divfirst idxline nilline bflatidx bflatpush nilblk nilbig nilzero nildest nilmeth elemidx jsonbusy jsonrbusy jsonwbusy divcall faultbare faultfin faultpas faultasm faultspin bconstleft nilbare nilasm nilspin nilcall nilasmtop niljump libstay libcut; do \
+	for t in divzero nilptr deep oom closed divloop bstatic bslice bstring bneg bempty bloop bref bnested bconst bstrcall bsame bslicereg bversion bslicehi bviewneg rrtrunc rrround rrfloor rrceil qtrunc qsqrt bitchk bitneg bitpool bitfield bitstr bitempty bitrec bitcall bitslice viewstr blkstr divover divzero128 funnelstr funnelslice mainraise raiseobj setelem setincl svneg svnil svmark svwrap exprarg leafnil bmaskwide bmodneg bmaskone bforpast bvarctr bnestctr bsumstat bsumdyn bsumneg bkeepfirst bkeepmoved bkeepstat bkeepshrunk brunlen brunloc divfirst idxline nilline bflatidx bflatpush nilblk nilbig nilzero nildest nilmeth elemidx jsonbusy jsonrbusy jsonwbusy divcall faultbare faultfin faultpas faultasm faultspin bconstleft nilbare nilasm nilspin nilcall nilasmtop niljump libstay libcut chselect chwaited chtwice chnil chcap chbare; do \
 	  $(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/fatal_$$t-arm testdata/fatal/$$t.paslang; \
 	  set +e; timeout 60 $(QEMU_A64) $(BUILDDIR)/fatal_$$t-arm > $(BUILDDIR)/fatal_$$t-arm.got 2> $(BUILDDIR)/fatal_$$t-arm.err; rc=$$?; set -e; \
 	  test $$rc -eq 1; \
@@ -6598,6 +6649,13 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	grep -q '^paslang: nil pointer dereference at line 28$$' $(BUILDDIR)/fatal_nilasmtop-arm.err; \
 	grep -q '^paslang: nil pointer dereference$$' $(BUILDDIR)/fatal_niljump-arm.err; \
 	grep -q '^paslang: unlock of an unlocked mutex at line 18$$' $(BUILDDIR)/fatal_libstay-arm.err; \
+	: P583: the failures of a channel with no SysUtils, each with the line of its statement; \
+	grep -q '^paslang: send on closed channel at line 14$$' $(BUILDDIR)/fatal_chselect-arm.err; \
+	grep -q '^paslang: send on closed channel at line 19$$' $(BUILDDIR)/fatal_chwaited-arm.err; \
+	grep -q '^paslang: close of closed channel at line 11$$' $(BUILDDIR)/fatal_chtwice-arm.err; \
+	grep -q '^paslang: nil channel at line 10$$' $(BUILDDIR)/fatal_chnil-arm.err; \
+	grep -q '^paslang: channel capacity -3 out of range at line 12$$' $(BUILDDIR)/fatal_chcap-arm.err; \
+	grep -q '^paslang: send on closed channel at line 13$$' $(BUILDDIR)/fatal_chbare-arm.err; \
 	grep -q '^paslang: store open /nonexistent-paslang-dir/\(0123456789\)\{21\} at line 24$$' $(BUILDDIR)/fatal_libcut-arm.err; \
 	echo ok fatal-arm; \
 	$(OUTDIR)/paslangc -target arm64 -cpu max -Fu $(A64DIR) -o $(BUILDDIR)/brokenpipe_die-arm testdata/brokenpipe.paslang; \

@@ -5005,7 +5005,8 @@ owns), is created with `MakeChan()`; `Send(c, v)` parks until a receiver takes t
 value and `Recv(c)` parks until one arrives, so the channel is also the
 synchronisation. `MakeChan(n)` (with `n` from 0 to 67108864, 2^26;
 a constant outside is a compile error and a value outside stops the
-program with `channel capacity N out of range`, 1.0.136) makes a
+program with `channel capacity N out of range at line 9`, 1.0.136, or
+is an `ERangeError` where a `try` stands, §19) makes a
 buffered channel, as Go's
 `make(chan T, n)`: it keeps up to `n` values, a send parks only when the
 buffer is full and a receive takes the oldest value first. `Close(c)`
@@ -5064,10 +5065,19 @@ send meets a receiver already parked on the channel directly, without
 passing through the buffer, and a receive takes the oldest value of
 the buffer before it serves a parked sender, so a buffered channel
 never reorders what went through it. `Close(c)` wakes every receiver
-parked on `c`, each with the zero value; a `Send` on a closed channel,
-plain or as an arm of a `select`, stops the program with `paslang:
-send on closed channel`, and a second `Close` with `paslang: close of
-closed channel` (§19). The zero value is the only sign of a closed
+parked on `c`, each with the zero value, and every sender parked on it,
+whose send fails; what the buffer held stays to be read. A `Send` on a
+closed channel, plain or as an arm of a `select`, found closed or
+closed while it waited, is a failure of the sender (`paslang: send on
+closed channel at line 9`), and so is a second `Close` (`paslang: close
+of closed channel at line 9`): each stops the program, or is an
+`EInvalidOpException` where a `try` stands (§19), as Go panics on both.
+Before 1.2.389 a `Close` with a sender waiting stopped the program at
+the close. A channel that was never made is `nil`, and a `Send`, a
+`Recv`, a `Close` or an arm of a `select` on it is `paslang: nil
+channel at line 9`, an `EAccessViolation` where a `try` stands (Go
+parks for ever on a nil channel and panics on its close). The zero value
+is the only sign of a closed
 channel a receiver gets, so a stream that ends by a `Close` must not
 carry the zero value as data: `pipeline` below sends job numbers from 1.
 
@@ -14400,6 +14410,9 @@ SysUtils is what turns run-time errors into exceptions there too:
 | a waitgroup counted below zero; a string view's length, the key or the index asked of a tree, the least of an empty heap, an index outside a Merkle tree's leaves (1.2.387) | `ERangeError` |
 | a string view of nil with a length (1.2.387) | `EArgumentNilException` |
 | a string view over bytes not marked shared; a size SHA-3 has not (1.2.387) | `EArgumentException` |
+| a send on a closed channel, plain or in a `select`, found closed or closed while it waited; a second close (1.2.389) | `EInvalidOpException` |
+| a channel's capacity out of range (1.2.389) | `ERangeError` |
+| a send, a receive, a close or an arm of a `select` on a nil channel (1.2.389) | `EAccessViolation` |
 | memory whose file has ended, a bus error (1.2.384) | `EBusError` |
 
 `E.Message` is the runtime's line without `paslang: `
@@ -14475,8 +14488,19 @@ called it, so the place in the line, raised or fatal, is that call's:
 `nil map at line 12`, where the line said `paslang: nil map` and no
 place before 1.2.387. `testdata/libfault` takes every one.
 
-What stays fatal everywhere: a stack overflow, memory that runs out, the
-channel failures, the races and the misuse of a mutex just named and the
+**The failures of a channel (1.2.389, P583).** A send on a closed
+channel, a second close, a capacity out of range and a nil channel are
+the routine's that made them, and raised there by the same rule, with
+the line of the statement, a `select`'s own line for one of its arms.
+The channel is as it was: its lock given back, what its buffer held
+still to be read, and the value that could not be sent sent nowhere.
+A routine that closes a channel on which senders wait goes on, and
+each of them takes its own exception, as in Go; `testdata/chanfault`
+takes every one, and `testdata/chanshut` closes three thousand
+channels under their senders and counts what arrived.
+
+What stays fatal everywhere: a stack overflow, memory that runs out,
+the races and the misuse of a mutex just named and the
 deadlock; a fault of the processor's
 arithmetic (SIGFPE: a division is checked before its instruction, so
 one would not be the program's); a signal that someone sent, which is no
@@ -14530,7 +14554,7 @@ The domain errors of the calculation set (`ln`, `log`, `power`,
 `arcsin`, `arccos`, `arcsec`, `arccsc`, `arccosh`, `arctanh`, `lnxp1`)
 read like `sqrt domain`. The others include `invalid memory address
 0x...`, `bus error`, `integer overflow`, `close of closed channel`,
-`close of a channel with a waiting sender`, `channel capacity N out of
+`nil channel`, `channel capacity N out of
 range`, `concurrent map writes` (and `concurrent map read and map
 write`, `concurrent map iteration and map write`), `bit N out of
 range`, `128-bit division overflow`, `out of stack memory`,

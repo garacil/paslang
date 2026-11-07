@@ -1,0 +1,164 @@
+{ P583: channels closed under their senders, three thousand times. In each
+  round six routines send five values each on one channel, three of them
+  plainly and three as an arm of a select, while the main routine takes
+  some of the values and closes the channel, and another routine closes
+  it too. Whatever the order they run in:
+  - a value whose send came back has arrived, once, and the values of a
+    sender arrive in the order it sent them: what the buffer held at the
+    close is still read after it;
+  - a send that did not come back raised, once, and its value and the
+    sender's later ones arrived nowhere: a sender that found the channel
+    closed and one that waited when it closed fail alike;
+  - of the two closes one closes and the other fails;
+  - nobody is left asleep: the round ends.
+  The channel has no buffer, or one of one, two or three values, by the
+  round. }
+program chanshut;
+
+uses
+  sysutils;
+
+const
+  Rounds = 3000;
+  Senders = 6;
+  Each = 5;
+
+var
+  ch, never: chan of Integer;
+  okc, rose: array[0..Senders - 1] of Int64;
+  seen: array[0..Senders * Each - 1] of Int64;
+  order: array[0..Senders - 1] of Int64;
+  swg, cwg: waitgroup;
+  closeFails, bad: Int64;
+  mu: mutex;
+
+procedure Wrong(const What: string; A, B: Int64);
+begin
+  bad := bad + 1;
+  if bad <= 5 then
+    WriteLn('wrong: ', What, ' ', A, ' ', B);
+end;
+
+procedure Sender(Id: Int64; BySelect: Boolean);
+var
+  k, x: Int64;
+begin
+  x := 0;
+  try
+    for k := 1 to Each do
+    begin
+      if BySelect then
+        select
+          Recv(never, x): x := x + 1;
+          Send(ch, Id * Each + k): x := x + 0;
+        end
+      else
+        Send(ch, Id * Each + k);
+      okc[Id] := okc[Id] + 1;
+    end;
+  except
+    on e: EInvalidOpException do
+      rose[Id] := rose[Id] + 1;
+  end;
+  if x <> 0 then
+    Wrong('a receive on a channel nobody sends on', Id, x);
+  swg.Done;
+end;
+
+procedure CloseIt;
+begin
+  try
+    Close(ch);
+  except
+    on e: EInvalidOpException do
+      lock mu do
+        closeFails := closeFails + 1;
+  end;
+end;
+
+procedure Other(Turns: Int64);
+var
+  k: Int64;
+begin
+  for k := 1 to Turns do
+    Yield;
+  CloseIt;
+  cwg.Done;
+end;
+
+{ a value that arrived: once, and after the one its sender sent before }
+procedure Arrived(V: Int64);
+var
+  id, k: Int64;
+begin
+  if (V < 1) or (V > Senders * Each) then
+  begin
+    Wrong('a value nobody sent', V, 0);
+    Exit;
+  end;
+  seen[V - 1] := seen[V - 1] + 1;
+  id := (V - 1) div Each;
+  k := (V - 1) mod Each + 1;
+  if k <> order[id] + 1 then
+    Wrong('out of its order', V, order[id]);
+  order[id] := k;
+end;
+
+var
+  r, s, k, take, v: Int64;
+begin
+  never := MakeChan();
+  bad := 0;
+  for r := 1 to Rounds do
+  begin
+    ch := MakeChan(r mod 4);
+    for s := 0 to Senders - 1 do
+    begin
+      okc[s] := 0;
+      rose[s] := 0;
+      order[s] := 0;
+    end;
+    for k := 0 to Senders * Each - 1 do
+      seen[k] := 0;
+    closeFails := 0;
+    swg.Add(Senders);
+    for s := 0 to Senders - 1 do
+      pas Sender(s, s mod 2 = 1);
+    take := (r * 7) mod (Senders * Each + 1);
+    for k := 1 to take do
+      Arrived(Recv(ch));
+    cwg.Add(1);
+    pas Other(r mod 5);
+    CloseIt;
+    cwg.Wait;
+    swg.Wait;
+    repeat
+      v := Recv(ch);
+      if v <> 0 then
+        Arrived(v);
+    until v = 0;
+    if closeFails <> 1 then
+      Wrong('closes that failed, of two', closeFails, r);
+    for s := 0 to Senders - 1 do
+    begin
+      if (okc[s] < Each) <> (rose[s] = 1) then
+        Wrong('a sender that did not finish and its exceptions', okc[s], rose[s]);
+      if rose[s] > 1 then
+        Wrong('exceptions of one sender', s, rose[s]);
+      for k := 1 to Each do
+        if seen[s * Each + k - 1] <> Ord(k <= okc[s]) then
+          Wrong('arrivals of a value', s * Each + k, seen[s * Each + k - 1]);
+    end;
+  end;
+  if bad = 0 then
+    WriteLn(Rounds, ' rounds: every send that came back arrived once and in its order, every other raised once, one close of two failed')
+  else
+    WriteLn(bad, ' wrong');
+  WriteLn('done');
+end.
+
+{ This file is part of paslang's tests.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+  paslang is free software under the GNU General Public License,
+  version 3 or (at your option) any later version; see the file
+  COPYING. It comes with ABSOLUTELY NO WARRANTY. }

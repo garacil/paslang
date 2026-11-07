@@ -27,7 +27,7 @@ KEPTA = {f'{p}{n}': f'x{n}' for n in range(19, 27) for p in ('x', 'w')}
 AWAY = {
     # a fatal stop: the message, then the process ends
     'rt_boundsfail': 'stops the program', 'rt_funnelfail': 'stops the program',
-    'rt_blockfail': 'stops the program', 'rt_diechancap': 'stops the program',
+    'rt_blockfail': 'stops the program', 'rt_diechancap': 'stops the program or raises',
     'rt_diepipe': 'dies of SIGPIPE', 'rt_diemsg': 'stops the program',
     'rt_fatalint': 'stops the program',
     # the process's start, an M's own loop and the scheduler on the M's
