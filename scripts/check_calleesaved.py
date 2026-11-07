@@ -39,6 +39,9 @@ AWAY = {
     # a raise nobody takes: the main routine's ends the program, after it has read the calls on its stack
     # with three of these registers (P579); any other routine's goes to rt_goexit
     'rt_uncaught': "a raise nobody takes: the program ends, or the routine does",
+    # a failure a unit of the library reports (P569): raised, and a raise gives a routine's registers back from
+    # its try record, or the program's end
+    'rt_libfault': "a failure of the library: it is raised or the program ends",
     # the kernel gives the interrupted registers back at its sigreturn
     'rt_sighandler': 'a signal handler: sigreturn gives the registers back',
     # the routine's registers go to .pk_res before the switch to the M's

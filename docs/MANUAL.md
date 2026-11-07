@@ -5492,9 +5492,9 @@ bo is here
 creates the map; the hint is the number of entries to make room for.
 The key is an ordinal, a string, a pointer or a class, and the value is
 any type, records included. A read of a missing key, or of a `nil` map,
-gives the zero value; a write to a `nil` map stops the program with
-`paslang: nil map` on standard error and exit status 1, as every
-runtime error does. `k in m` tests, `TryGet(m, k, v)` reads with a
+gives the zero value; a write to a `nil` map is a failure of the
+runtime, `paslang: nil map at line 12` on standard error and exit status
+1, or an `EAccessViolation` where a `try` stands (§19). `k in m` tests, `TryGet(m, k, v)` reads with a
 Boolean into a `v` of type `V`, `Delete(m, k)` removes, `Clear(m)`
 empties, `Length(m)` counts. `for k in m do` and `for k, v in m do` walk
 the entries in no particular order; deleting the current key or
@@ -5651,7 +5651,8 @@ The order words: `Low(t)` and `High(t)` are the first and the last
 key; `Succ(t, k)` and `Pred(t, k)` the key after and before `k`
 (`k` need not be in the tree); `Floor(t, k)` the greatest key not above
 `k` and `Ceil(t, k)` the least not below. When there is none the
-program stops (`paslang: empty tree`, `paslang: tree succ`, …), so ask
+program stops (`paslang: empty tree at line 9`, `paslang: tree succ at
+line 9`, …) or, where a `try` stands, takes an `ERangeError` (§19); ask
 `Length`, `in` or `Rank` first. `Rank(t, k)` is how many keys lie
 below `k`, `KeyAt(t, i)` the key of rank `i` (from 0), both counted
 from the nodes, not walked. `PopLow(t, k, v)` and `PopHigh(t, k, v)`
@@ -5675,7 +5676,8 @@ writing at once, or a walk during a write, stop it too.
 `heap of T` is a binary min-heap (Go's `container/heap` on an array):
 `New(h)`, `Push(h, x)`, `Pop(h, x)` takes the least element into `x`
 and says whether there was one, `Pop(h)` gives it and `Low(h)` shows it
-(an empty heap stops the program with `paslang: empty heap`), and
+(an empty heap stops the program with `paslang: empty heap at line 9`,
+an `ERangeError` where a `try` stands, §19), and
 `Length(h)` counts. `T` is an ordinal, a `string`, a `Double` or a
 `Single` (a `Quad` is refused).
 
@@ -5686,7 +5688,8 @@ push or a pop moves one element up or down the tree of the array,
 about `Log2(n)` compares; the array starts with room for 16 elements
 and doubles when it is full. `Length(h)` of a `nil` heap is 0 and
 `Pop(h, x)` of one is `False`, but `Push` on a `nil` heap stops the
-program with `paslang: nil heap`: `New(h)` first. A heap kept at `k`
+program with `paslang: nil heap at line 9` (an `EAccessViolation` where
+a `try` stands): `New(h)` first. A heap kept at `k`
 elements, one `Pop` after every `Push` past `k`, holds the `k` largest
 seen so far, the least of them at `Low(h)`; `examples/sorting.paslang`
 (§17) uses one as a priority queue of strings and one as a top three.
@@ -5821,7 +5824,8 @@ An empty value is a value: `'empty' in db` is `True` while `StoreGet`
 gives `''` for it and for a missing key alike. The store takes no lock
 of its own; two routines that use one at once must hold a mutex
 (§13). `StorePut` and `StoreDelete` on a `store` that was never
-opened stop the program with `paslang: nil store` (a `StoreGet` gives
+opened stop the program with `paslang: nil store at line 9`, an
+`EAccessViolation` where a `try` stands (a `StoreGet` gives
 `''` and `k in db` `False`); a path that cannot be made stops it with
 `paslang: store open <path>`, and a file that is not a table with
 `paslang: store magic <path>`, leaving it as it was (an empty file is
@@ -7338,8 +7342,9 @@ routines. `rwmutex` lets any number of readers in together and one
 writer alone, and a waiting writer stops new readers. `waitgroup`
 counts routines: `Add` before starting them, `Done` in each, `Wait`
 parks until the count is zero. A `Done` that takes the count below
-zero, or an `Unlock` of a mutex nobody holds, stops the program with a
-`paslang:` message and exit status 1. `cond.Wait(mu)` releases the mutex,
+zero stops the program with a `paslang:` message and exit status 1, or
+is an `ERangeError` where a `try` stands (§19); an `Unlock` of a mutex
+nobody holds always stops it, as in Go. `cond.Wait(mu)` releases the mutex,
 parks until `Signal` wakes one waiter or `Broadcast` wakes all, and
 takes the mutex again before returning, so always test the condition in
 a loop. `once o do stmt` runs the statement the first time and never
@@ -7354,8 +7359,9 @@ parks otherwise. The call that brings the count to zero wakes every
 routine parked in `Wait`, so several may wait on one waitgroup, and a
 waitgroup whose count came back to zero is reused with a new `Add`.
 The count going below zero, one `Done` too many, stops the program
-with `paslang: negative waitgroup counter`; the same for a mutex is
-`paslang: unlock of an unlocked mutex`. A `mutex` is not reentrant:
+with `paslang: negative waitgroup counter at line 9` (an `ERangeError`
+where a `try` stands); the same for a mutex is `paslang: unlock of an
+unlocked mutex at line 9`, which no `try` takes. A `mutex` is not reentrant:
 `lock mu do` inside `lock mu do` parks the routine on itself, and with
 nothing else to run the program stops with the deadlock message
 (§10). `TryLock` never parks: it takes the mutex when it is free and
@@ -7775,7 +7781,8 @@ of leaves below the count, and the tree of no leaves is `Sha256('')`.
 The leaves are a slice of strings. `MerkleProof(leaves, i)` is the
 proof of leaf `i`: the hashes of the siblings from the leaf up, 32
 bytes each, in one string (the proof of the only leaf is `''`); an `i`
-outside the leaves stops the program with `paslang: merkle index`.
+outside the leaves stops the program with `paslang: merkle index at
+line 9` (an `ERangeError` where a `try` stands, §19).
 `MerkleCheck(leaf, i, n, proof, root)` walks the proof up from the leaf
 (RFC 9162, 2.1.3.2) and is `False` for an `i` outside `0..n-1`, a proof
 whose length is not a multiple of 32, or one that does not reach
@@ -14386,6 +14393,10 @@ SysUtils is what turns run-time errors into exceptions there too:
 | a real out of `Integer`'s range; `sqrt`, `ln` and the other domains | `EInvalidOp` |
 | `as` of an object that is not of the class | `EInvalidCast` |
 | a nil pointer; an address that is not the program's (1.2.384) | `EAccessViolation` |
+| a write to a nil map, tree, heap or store (1.2.387) | `EAccessViolation` |
+| a waitgroup counted below zero; a string view's length, the key or the index asked of a tree, the least of an empty heap, an index outside a Merkle tree's leaves (1.2.387) | `ERangeError` |
+| a string view of nil with a length (1.2.387) | `EArgumentNilException` |
+| a string view over bytes not marked shared; a size SHA-3 has not (1.2.387) | `EArgumentException` |
 | memory whose file has ended, a bus error (1.2.384) | `EBusError` |
 
 `E.Message` is the runtime's line without `paslang: `
@@ -14448,8 +14459,22 @@ except
 end;
 ```
 
+**The library's own failures (1.2.387, P569).** The units of the
+library report some failures themselves, where the runtime's checks and
+the processor report the others: a write to a nil map, a waitgroup
+counted below zero, a string view that cannot be, the first key of an
+empty tree. Where Go panics on the same, these are exceptions by the
+same rule, of the classes above, and where Go's runtime throws they end
+the program whatever stands around: two routines that write one map or
+one tree at once, a json value used by two, a mutex unlocked when
+nobody holds it. The failure is not the library's but the code's that
+called it, so the place in the line, raised or fatal, is that call's:
+`nil map at line 12`, where the line said `paslang: nil map` and no
+place before 1.2.387. `testdata/libfault` takes every one.
+
 What stays fatal everywhere: a stack overflow, memory that runs out, the
-channel and map failures and the deadlock; a fault of the processor's
+channel failures, the races and the misuse of a mutex just named and the
+deadlock; a fault of the processor's
 arithmetic (SIGFPE: a division is checked before its instruction, so
 one would not be the program's); a signal that someone sent, which is no
 fault of the code it lands on, and whose line says so since 1.2.385
