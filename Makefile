@@ -3589,7 +3589,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	done; \
 	echo ok callun
 	@set -e; \
-	: P568: with sysutils in the program a nil pointer or another fault of memory inside a try is an exception raised in the routine that made it and testdata/nilfault takes every shape and then dies of each three ways and each time the line on the error output must be the Message, on both machines, testdata/nilnative does the same on amd64 for an address that is not in canonical form and for a call of a page of code whose file was cut short, the fuzzer of the failures has pointers, a signal that someone sent raises nothing and a handler of httpserver that reads through nil answers 500; \
+	: P568: with sysutils in the program a nil pointer or another fault of memory inside a try is an exception raised in the routine that made it and testdata/nilfault takes every shape and then dies of each three ways and each time the line on the error output must be the Message, on both machines, testdata/nilnative does the same on amd64 for an address that is not in canonical form and for a call of a page of code whose file was cut short, the fuzzer of the failures has pointers and a handler of httpserver that reads through nil answers 500; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/nilfault testdata/nilfault.paslang; \
 	timeout 60 $(BUILDDIR)/nilfault > $(BUILDDIR)/nilfault.got; \
 	diff -u testdata/nilfault.out $(BUILDDIR)/nilfault.got; \
@@ -3626,15 +3626,18 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	done; \
 	diff -u $(BUILDDIR)/nilnative.lines $(BUILDDIR)/nilnative.die; \
 	python3 -I scripts/fuzz_faults.py --paslangc $(OUTDIR)/paslangc --units $(BUILDDIR) --work $(BUILDDIR)/fuzz_nil --variants native,base 500 8; \
-	$(OUTDIR)/paslangc -o $(BUILDDIR)/sigsent testdata/sigsent.paslang; \
-	python3 -I scripts/sigsent_check.py $(BUILDDIR)/sigsent; \
-	$(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/sigsent-arm testdata/sigsent.paslang; \
-	python3 -I scripts/sigsent_check.py $(BUILDDIR)/sigsent-arm $(QEMU_A64); \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/httpfault testdata/httpfault.paslang; \
 	timeout 120 $(BUILDDIR)/httpfault > $(BUILDDIR)/httpfault.got 2> $(BUILDDIR)/httpfault.err; \
 	diff -u testdata/httpfault.out $(BUILDDIR)/httpfault.got; \
 	grep -q '^httpserver: GET /nil: EAccessViolation: nil pointer dereference at line ' $(BUILDDIR)/httpfault.err; \
 	echo ok nilfault
+	@set -e; \
+	: P581: a signal that someone sent ends the program with a line that says the signal, that it was sent, the process that sent it when its code tells one and the place, and scripts/sigsent_check.py sends SIGSEGV, SIGBUS and SIGFPE four ways each on both machines; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/sigsent testdata/sigsent.paslang; \
+	python3 -I scripts/sigsent_check.py $(BUILDDIR)/sigsent; \
+	$(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/sigsent-arm testdata/sigsent.paslang; \
+	python3 -I scripts/sigsent_check.py $(BUILDDIR)/sigsent-arm $(QEMU_A64); \
+	echo ok sigsent
 	@set -e; \
 	: P573: Shutdown wakes the acceptors of httpserver through the poller and testdata/httpstop stops servers on a Unix socket with its file there and with it removed and on TCP and on both and by SIGTERM and scripts/httpstop_check.py plays the part of systemd with a socket it keeps which must still listen after the server stops and looks at what an idle server and one out of descriptors cost on both machines; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/httpstop testdata/httpstop.paslang; \

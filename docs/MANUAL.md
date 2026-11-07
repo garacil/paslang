@@ -14452,7 +14452,9 @@ What stays fatal everywhere: a stack overflow, memory that runs out, the
 channel and map failures and the deadlock; a fault of the processor's
 arithmetic (SIGFPE: a division is checked before its instruction, so
 one would not be the program's); a signal that someone sent, which is no
-fault of the code it lands on; a failure inside the runtime's own units
+fault of the code it lands on, and whose line says so since 1.2.385
+(`paslang: SIGSEGV sent by process 4242 at line 31`, the process when
+kill, sigqueue or tgkill sent it); a failure inside the runtime's own units
 or in a routine with `asm` (`testdata/fatal/faultasm`, `nilasm`,
 `nilcall`, `nilasmtop`, `niljump`); one
 that comes while the routine holds a `SpinLock` (*Runtime words*), which
