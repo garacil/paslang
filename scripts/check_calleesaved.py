@@ -36,6 +36,9 @@ AWAY = {
     'rt_mloop': "an M's own loop, on its stack",
     'rt_findrunnable': "the scheduler, called by rt_mloop and rt_idlepoll on the M's stack",
     'rt_sysmon': "sysmon's own thread", 'rt_goexit': "a routine's end",
+    # a raise nobody takes: the main routine's ends the program, after it has read the calls on its stack
+    # with three of these registers (P579); any other routine's goes to rt_goexit
+    'rt_uncaught': "a raise nobody takes: the program ends, or the routine does",
     # the kernel gives the interrupted registers back at its sigreturn
     'rt_sighandler': 'a signal handler: sigreturn gives the registers back',
     # the routine's registers go to .pk_res before the switch to the M's

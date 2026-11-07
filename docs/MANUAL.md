@@ -4567,6 +4567,25 @@ code. The place is the one the routine keeps for `ExceptAddr`: a
 by and the `finally` parts on the way leave it the first raise's, and
 `raise X at A` sets it to `A` (`testdata/units/raiseun`).
 
+Then come the calls that led to the raise, a line each (1.2.383, P579):
+
+```
+paslang: uncaught raise in the main routine: EDeep, raised at line 33 of unit CallV
+  called at line 29 of unit CallU
+  called at line 49
+```
+
+They are the calls still on the stack when the program ends. With no
+`try` on the way that is every call down to the raise. Where `finally`
+parts, or a handler that let the object by, have run, the frames below
+the outermost of them are gone, and the calls are those of its routine
+upward: in a program with no `try` of its own, the program's call into
+the library that raised and the calls above it. Sixteen are said at
+most, then `  ...`; the runtime's own code is passed by, and so is a
+routine put in line, which has no call. Nothing is kept when an object
+is raised, so a raise that is taken costs what it did
+(`testdata/units/callun`, and `callbad` for a frame that is none).
+
 A failure of the runtime (an index out of range, a division by zero and
 the others of §19) is raised the same way when SysUtils is in the program
 and a `try` is on the routine's way (1.2.378), as an object of

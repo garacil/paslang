@@ -3552,6 +3552,39 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/units/raiseun.err $(BUILDDIR)/raiseun-arm.err; \
 	echo ok raiseun
 	@set -e; \
+	: P579: an uncaught raise names the calls still on the stack, a line each, through a second unit, a method, a procedure variable and a nested routine, those above a finally that ran, sixteen of a deeper recursion and then the dots, none for a raise in the main block or a fault of the runtime, and a frame pointer that is none ends the walk, with and without inlining and on both machines; \
+	for v in "" "-cpu base -inline 0"; do \
+	  $(OUTDIR)/paslangc $$v testdata/units/callv.paslang; \
+	  $(OUTDIR)/paslangc $$v testdata/units/callu.paslang; \
+	  $(OUTDIR)/paslangc $$v -Fu $(BUILDDIR) -o $(BUILDDIR)/callun testdata/units/callun.paslang; \
+	  $(OUTDIR)/paslangc $$v -o $(BUILDDIR)/callbad testdata/units/callbad.paslang; \
+	  for t in callun callbad; do \
+	    printf '' > $(BUILDDIR)/$$t.got; printf '' > $(BUILDDIR)/$$t.err; \
+	    for k in 1 2 3 4 5 6 7 8 9; do \
+	      if [ $$t = callbad ] && [ $$k -gt 3 ]; then continue; fi; \
+	      set +e; timeout 60 $(BUILDDIR)/$$t $$k >> $(BUILDDIR)/$$t.got 2>> $(BUILDDIR)/$$t.err; rc=$$?; set -e; \
+	      test $$rc -eq 1; \
+	    done; \
+	    diff -u testdata/units/$$t.out $(BUILDDIR)/$$t.got; \
+	    diff -u testdata/units/$$t.err $(BUILDDIR)/$$t.err; \
+	  done; \
+	done; \
+	$(OUTDIR)/paslangc -target arm64 testdata/units/callv.paslang; \
+	$(OUTDIR)/paslangc -target arm64 testdata/units/callu.paslang; \
+	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/callun-arm testdata/units/callun.paslang; \
+	$(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/callbad-arm testdata/units/callbad.paslang; \
+	for t in callun callbad; do \
+	  printf '' > $(BUILDDIR)/$$t-arm.got; printf '' > $(BUILDDIR)/$$t-arm.err; \
+	  for k in 1 2 3 4 5 6 7 8 9; do \
+	    if [ $$t = callbad ] && [ $$k -gt 3 ]; then continue; fi; \
+	    set +e; timeout 120 $(QEMU_A64) $(BUILDDIR)/$$t-arm $$k >> $(BUILDDIR)/$$t-arm.got 2>> $(BUILDDIR)/$$t-arm.err; rc=$$?; set -e; \
+	    test $$rc -eq 1; \
+	  done; \
+	  diff -u testdata/units/$$t.out $(BUILDDIR)/$$t-arm.got; \
+	  diff -u testdata/units/$$t.err $(BUILDDIR)/$$t-arm.err; \
+	done; \
+	echo ok callun
+	@set -e; \
 	: P573: Shutdown wakes the acceptors of httpserver through the poller and testdata/httpstop stops servers on a Unix socket with its file there and with it removed and on TCP and on both and by SIGTERM and scripts/httpstop_check.py plays the part of systemd with a socket it keeps which must still listen after the server stops and looks at what an idle server and one out of descriptors cost on both machines; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/httpstop testdata/httpstop.paslang; \
 	timeout 60 $(BUILDDIR)/httpstop > $(BUILDDIR)/httpstop.got; \
