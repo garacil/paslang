@@ -11,8 +11,11 @@ CEAC C9E1 5534 EBAB B82D 3FA0 3353 C9CE F108 B584), with the patches of
 scripts/qemu applied in order: QEMU 11.1.1 deadlocks a guest that forks
 while another of its threads makes a system call with a pointer,
 answers EINVAL to MADV_GUARD_INSTALL, starts a thread with every host
-signal blocked (P302), and changes gdb's breakpoints while the other
-threads walk them, dying of its own SIGSEGV (P349). Only the tests need
+signal blocked (P302), changes gdb's breakpoints while the other
+threads walk them, dying of its own SIGSEGV (P349), and lets the other
+threads run, start and end while one is stopped under gdb, which lost
+gdb's breakpoint and corrupted the stub's own memory (P582;
+scripts/check_gdbstub_threads.py is the case alone). Only the tests need
 it; it needs a C compiler, Python, meson, ninja and glib's headers, as
 QEMU does.
 usage: build_qemu.py BUILDDIR TARBALL

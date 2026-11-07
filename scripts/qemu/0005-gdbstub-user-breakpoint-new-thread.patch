@@ -1,0 +1,210 @@
+QEMU 11.1.1 gdbstub, user mode: a stop holds the other threads, and no thread is made or ended under it.
+
+paslang's debugger check runs a program under QEMU's gdb stub with a
+breakpoint that is false at every stop but one
+(scripts/check_debug_growth.py, scripts/inject_debug_growth.py), so gdb
+removes the breakpoint, steps and inserts it again at each of the
+others, while the program's runtime starts its threads. Once, in a make
+check on a busy machine (paslang P582), the program ran past the stop
+that was true to its end, and gdb said
+
+  warning: error removing breakpoint -1 at 0x4142c4
+  [Inferior 1 (process 53619) exited normally]
+
+In user mode the thread that stops talks to gdb while the others run on
+(gdb_handlesig() waits in the stopping thread alone), and three things
+the stub does for every CPU of the list went wrong under a thread that
+was being made or ended. scripts/check_gdbstub_threads.py is the case
+alone, a guest whose one thread calls a routine two thousand times
+while another makes threads that end at once, under gdb with a
+breakpoint at the routine that is true at the last call; what it
+showed, each read in the sources and seen under a host gdb:
+
+- The breakpoint lost, in every session within a second. cpu_copy()
+  (linux-user/main.c) makes a new thread's CPU with cpu_create(), whose
+  realize puts it in the list of CPUs (cpu_list_add(), cpu-common.c),
+  and only then gives it its creator's breakpoints; it runs on the
+  creator's thread, in a system call and out of cpu_exec, which the
+  stub's exclusive section (the patch before this one) does not wait
+  for. gdb_breakpoint_remove() (gdbstub/user.c) asks every CPU of the
+  list and stops at the first that answers -ENOENT: the new CPU,
+  between the two steps. The breakpoint is then gone from every CPU
+  before it, the stopped one among them, and gdb is told of an error;
+  gdb (18.1, breakpoint.c) keeps the location as inserted
+  (remove_breakpoint_1() returns before it clears bl->inserted; the
+  warning is update_global_location_list()'s, "This is just about all
+  we can do") and never inserts it again.
+- QEMU dead of its own SIGSEGV, one session in fifteen: the new CPU's
+  reset (arm_cpu_reset_hold(), hw_breakpoint_update_all(),
+  cpu_breakpoint_remove_all()) walking its list of breakpoints inside
+  cpu_create() while the stub inserted one in it.
+- "double free or corruption" at the end of gdb_handle_vcont()
+  (gdbstub/gdbstub.c), one session in twelve: it sizes a table by the
+  CPUs there are (gdb_get_max_cpus()) and then writes an entry for
+  every CPU of the list, one made since among them; and a CPU
+  unrealized and freed by its thread's exit (linux-user/syscall.c,
+  TARGET_NR_exit) while the stub went through the list.
+
+Three changes. With them the guest's two thousand stops, about two
+thousand threads made and ended between them, pass in sixty sessions
+of sixty, and paslang's own checks under the stub pass as before
+(check_debug_growth, check_syscalls). Without the first, seven sessions
+of sixty end with the emulator dead (double free or corruption);
+without the second, all sixty lose the breakpoint; without the third,
+one of sixty ends with the emulator dead the same way: a thread in its
+exit is out of cpu_exec like one in cpu_copy(), and a stop does not
+wait for it.
+
+The two sections of a thread's making and of its exit start before
+clone_lock is taken, not under it. fork_start() (linux-user/main.c)
+takes them in that order, start_exclusive() and then
+clone_fork_start(); a first form of this patch started them under
+clone_lock, and a guest that forked while another of its threads was
+being made stood for ever, the thread in do_fork() with clone_lock
+waiting for the section and the thread in fork_start() with the
+section waiting for clone_lock: paslang's testdata/sysprocesses, which
+starts sixty-four processes from as many routines, one run in three
+(the stacks of the two threads read under a host gdb). As they are,
+that program ends thirty times of thirty.
+scripts/check_gdbstub_threads.py runs that case alone too, a guest
+(scripts/qemu/forkthreads.s) that forks while another thread makes
+threads, with no gdb.
+
+- gdb_handlesig(): the stop is an exclusive section (start_exclusive(),
+  cpu-common.c) from its report to gdb until gdb resumes the program,
+  as gdb's all-stop means it: every other CPU out of cpu_exec, and two
+  threads that stop at once answer one after the other. The first stop,
+  from main() before any CPU runs, has current_cpu NULL and takes none.
+- do_fork(), a thread: the making of the new CPU, cpu_copy() from
+  cpu_create() to the copy of its creator's breakpoints, is an
+  exclusive section started before clone_lock, so the stub sees the
+  new CPU whole or not at all.
+- A thread's exit (TARGET_NR_exit) takes its CPU out of the list in an
+  exclusive section started before clone_lock, with a reference of its
+  own until the section is over (end_exclusive() reads current_cpu);
+  what frees the CPU comes after.
+
+--- a/gdbstub/user.c
++++ b/gdbstub/user.c
+@@ -199,13 +199,43 @@
+     exit(code);
+ }
+ 
++static int gdb_handlesig_stopped(CPUState *cpu, int sig, const char *reason,
++                                 void *siginfo, int siginfo_len);
++
++/*
++ * A stop is an exclusive section, from its report to gdb until gdb
++ * resumes the program: every other CPU out of cpu_exec meanwhile, and no
++ * thread made or ended, since cpu_copy() and a thread's exit are
++ * exclusive sections too. In user mode the other threads ran on while
++ * this one talked to gdb, and what the stub reads and writes for every
++ * CPU changed under it: gdb_handle_vcont() sized its table by the CPUs
++ * there were and wrote past it for one made since (double free or
++ * corruption at its end), a breakpoint was removed from a CPU that was
++ * being made or freed, and two threads that stopped at once answered gdb
++ * together. The first stop, from main() before any CPU runs, has
++ * current_cpu NULL and no other thread, and takes no section.
++ */
+ int gdb_handlesig(CPUState *cpu, int sig, const char *reason, void *siginfo,
+                   int siginfo_len)
+ {
+     if (!gdbserver_state.init || gdbserver_user_state.fd < 0) {
+         return sig;
+     }
++    if (current_cpu) {
++        start_exclusive();
++        /* another thread's stop may have ended the session meanwhile */
++        if (gdbserver_user_state.fd >= 0) {
++            sig = gdb_handlesig_stopped(cpu, sig, reason, siginfo, siginfo_len);
++        }
++        end_exclusive();
++        return sig;
++    }
++    return gdb_handlesig_stopped(cpu, sig, reason, siginfo, siginfo_len);
++}
+ 
++static int gdb_handlesig_stopped(CPUState *cpu, int sig, const char *reason,
++                                 void *siginfo, int siginfo_len)
++{
+     if (siginfo) {
+         /*
+          * Save target-specific siginfo.
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -7023,6 +7023,25 @@
+         }
+ #endif
+ 
++        /*
++         * The new CPU is in the list of CPUs from cpu_create() on (its
++         * realize adds it), before it is reset and before cpu_copy() has
++         * given it its creator's breakpoints, and gdb's stub changes the
++         * breakpoints of every CPU of the list from the thread of the CPU
++         * that stopped, in an exclusive section that does not wait for
++         * this thread: it is in a system call, out of cpu_exec. The stub
++         * then found a CPU with no breakpoint to remove, or changed a
++         * list that the new CPU's reset was walking
++         * (hw_breakpoint_update_all) or that the copy was reading. The
++         * making is an exclusive section, so the stub sees the new CPU
++         * with its creator's breakpoints or not at all. The section
++         * starts before clone_lock is taken, which is the order of
++         * fork_start(): started under clone_lock, it waited for the
++         * section of a thread in fork_start() that waited for
++         * clone_lock, for ever.
++         */
++        start_exclusive();
++
+         /* Grab a mutex so that thread setup appears atomic.  */
+         pthread_mutex_lock(&clone_lock);
+ 
+@@ -7035,6 +7054,7 @@
+ 
+         /* we create a new CPU instance. */
+         new_env = cpu_copy(env);
++        end_exclusive();
+         /* Init regs that differ from the parent.  */
+         cpu_clone_regs_child(new_env, newsp, flags);
+         cpu_clone_regs_parent(env, flags);
+@@ -9790,6 +9810,16 @@
+             return -QEMU_ERESTARTSYS;
+         }
+ 
++        /*
++         * A thread's CPU leaves the list of CPUs in an exclusive section:
++         * gdb's stub changes the breakpoints of every CPU of the list
++         * from the thread of the CPU that stopped, in an exclusive
++         * section of its own that does not wait for this thread, and a
++         * CPU unrealized and freed under it was a list read after its
++         * end and a breakpoint freed twice. The section starts before
++         * clone_lock is taken, the order of fork_start() (see do_fork()).
++         */
++        start_exclusive();
+         pthread_mutex_lock(&clone_lock);
+ 
+         if (CPU_NEXT(first_cpu)) {
+@@ -9807,8 +9837,16 @@
+             }
+ #endif
+ 
++            /*
++             * A reference of its own keeps the CPU until the exclusive
++             * section is over (end_exclusive() reads current_cpu); what
++             * frees it comes after, when the stub can no longer find it.
++             */
++            object_ref(OBJECT(cpu));
+             object_unparent(OBJECT(cpu));
+             object_unref(OBJECT(cpu));
++            end_exclusive();
++            object_unref(OBJECT(cpu));
+             /*
+              * At this point the CPU should be unrealized and removed
+              * from cpu lists. We can clean-up the rest of the thread
+@@ -9823,6 +9861,7 @@
+             pthread_exit(NULL);
+         }
+ 
++        end_exclusive();
+         pthread_mutex_unlock(&clone_lock);
+         preexit_cleanup(cpu_env, arg1);
+         _exit(arg1);

@@ -1248,6 +1248,10 @@ bench-servers: $(OUTDIR)/paslangc core libs
 
 check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch64
 	@python3 scripts/check_recipes.py
+	@set -e; \
+	: P582: the gdb stub of QEMU keeps a breakpoint that gdb removes and inserts again at two thousand stops while the guest makes threads, in twenty sessions, and the emulator does not die of it, and a guest that forks three hundred times while another of its threads makes threads comes to its end, five times of five; \
+	python3 -I scripts/check_gdbstub_threads.py $(BUILDDIR) $(QEMU_A64) 20; \
+	echo ok gdbstub-threads
 	@python3 scripts/check_debug_growth.py "$(OUTDIR)/paslangc" "$(BUILDDIR)" $(QEMU_A64)
 	@sh scripts/check_bootstrap.sh "$(BUILDDIR)" $(QEMU_A64) $(CORE_UNITS)
 	@sh scripts/check_cpufeat.sh "$(OUTDIR)/paslangc" "$(BUILDDIR)" $(QEMU_A64)
@@ -5607,8 +5611,10 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 # with the patches of scripts/qemu: QEMU 11.1.1 deadlocks a program that
 # forks while another of its threads makes a system call (P226), fails
 # MADV_GUARD_INSTALL, starts a thread with every host signal blocked
-# (P302), and changes gdb's breakpoints while the other threads walk
-# them (P349). The tests alone need it.
+# (P302), changes gdb's breakpoints while the other threads walk them
+# (P349), and lets threads run, start and end while one of them is
+# stopped under gdb, which lost a breakpoint and killed the emulator
+# (P582). The tests alone need it.
 QEMU_A64 := $(BUILDDIR)/qemu-aarch64
 
 $(BUILDDIR)/qemu-aarch64: scripts/build_qemu.py $(wildcard scripts/qemu/*.patch) | $(BUILDDIR)
