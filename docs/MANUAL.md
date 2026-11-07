@@ -7357,7 +7357,10 @@ started (an `Add` inside the routine could run after the `Wait`);
 `Done` is `Add(-1)`; `Wait` returns at once when the count is zero and
 parks otherwise. The call that brings the count to zero wakes every
 routine parked in `Wait`, so several may wait on one waitgroup, and a
-waitgroup whose count came back to zero is reused with a new `Add`.
+waitgroup whose count came back to zero is reused with a new `Add`,
+once every `Wait` of the use before has come back, as Go's. Before
+1.2.388 a `Wait` of the new use could come back early, woken by the
+last `Done` of the use before (P585).
 The count going below zero, one `Done` too many, stops the program
 with `paslang: negative waitgroup counter at line 9` (an `ERangeError`
 where a `try` stands); the same for a mutex is `paslang: unlock of an

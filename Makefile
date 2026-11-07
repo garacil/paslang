@@ -763,6 +763,9 @@ GOLDEN_A64 += nilfault
 # P569: the library's own failures as exceptions.
 GOLDEN += libfault
 GOLDEN_A64 += libfault
+# P585: a waitgroup used again.
+GOLDEN += wgagain
+GOLDEN_A64 += wgagain
 # P573: a server stops whatever became of its sockets.
 GOLDEN += httpstop
 GOLDEN_A64 += httpstop
@@ -3672,6 +3675,16 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  diff -u $(BUILDDIR)/libfault.lines $(BUILDDIR)/libfault-arm.$$m; \
 	done; \
 	echo ok libfault
+	@set -e; \
+	: P585: a waitgroup used again wakes nobody early, and testdata/wgagain says so on both machines with the unit as it is and against a copy whose call that reaches zero sleeps before its lock, where the unit as it was fails every round; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/wgagain testdata/wgagain.paslang; \
+	timeout 60 $(BUILDDIR)/wgagain > $(BUILDDIR)/wgagain.got; \
+	diff -u testdata/wgagain.out $(BUILDDIR)/wgagain.got; \
+	$(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/wgagain-arm testdata/wgagain.paslang; \
+	timeout 120 $(QEMU_A64) $(BUILDDIR)/wgagain-arm > $(BUILDDIR)/wgagain-arm.got; \
+	diff -u testdata/wgagain.out $(BUILDDIR)/wgagain-arm.got; \
+	python3 -I scripts/check_wgreuse.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64); \
+	echo ok wgagain
 	@set -e; \
 	: P573: Shutdown wakes the acceptors of httpserver through the poller and testdata/httpstop stops servers on a Unix socket with its file there and with it removed and on TCP and on both and by SIGTERM and scripts/httpstop_check.py plays the part of systemd with a socket it keeps which must still listen after the server stops and looks at what an idle server and one out of descriptors cost on both machines; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/httpstop testdata/httpstop.paslang; \
