@@ -127,6 +127,10 @@ GOLDEN_A64 := map1 map2 sync1 sync2 finexit zerolocal pchar pingpong sel chclose
 GOLDEN += safenew
 GOLDEN_A64 += safenew
 
+# P584: actual string views retain their zero, nil, length and mark checks.
+GOLDEN += strviewrange
+GOLDEN_A64 += strviewrange
+
 # P166: record operands bind once, including a with inside recursion.
 GOLDEN += withonce withcapture withmap
 GOLDEN_A64 += withonce withcapture withmap
@@ -1261,6 +1265,10 @@ bench-servers: $(OUTDIR)/paslangc core libs
 
 check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch64
 	@python3 scripts/check_recipes.py
+	@set -e; \
+	: P584: the production range predicate accepts the last address and rejects a wrap and the removed generic map put has no exported entry; \
+	python3 -I scripts/check_strview_range.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64); \
+	echo ok strview-range
 	@set -e; \
 	: P523: safe code refuses raw allocation and the manual free word in every scope on both targets; \
 	python3 -I scripts/check_safe_memory.py $(OUTDIR)/paslangc $(BUILDDIR); \

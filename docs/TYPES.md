@@ -361,6 +361,9 @@ characters. That is **not** our default.
   whole block alive. `n = 0` gives the empty string, never a view; a
   length below 0 or past the end of the address space, a nil `p` with
   `n` above 0 and a byte before `p` without the mark stop the program.
+  A range ending at the address space's last byte is within that range
+  check; a range beyond it is not. This does not establish that those
+  addresses are mapped or that the required shared mark exists.
   `s as T` is the other direction: a view of the characters of `s`,
   which it first makes its own.
 - Length: `Length(s)` is the byte count; **no 255 cap**. Limited by
@@ -608,7 +611,7 @@ runs and two maps made at once by two routines never share a seed. A
 `Writing` flag catches two routines writing at once (`paslang:
 concurrent map writes`). The compiler passes a descriptor
 (`.LdescMap_<type>`: key kind, key size, value size, whether a slot
-holds a pointer) to `PasMapNew`, `PasMapGet`, `PasMapPut`,
+holds a pointer) to `PasMapNew`, `PasMapGet`,
 `PasMapNext`, `PasMapDelete` and `PasMapClear` (the last two zero the
 slots they empty, 1.0.140, so what a dropped entry held is freed); an
 eight-byte key goes

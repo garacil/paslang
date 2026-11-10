@@ -3600,9 +3600,13 @@ document). The byte before `p` must be in the same block and have bit 0
 set, the mark of characters another string shares: no store writes it,
 any number of routines read the view at once, a write through the view
 copies the characters first, and the view keeps its whole block alive.
-`n = 0` gives `''`; a length below 0, a nil `p` with a length, and a
-byte before `p` without the mark stop the program
-(`paslang: string view over bytes not marked shared`). Nothing checks
+`n = 0` gives `''`; a length below 0, a nil `p` with a length, a range
+past the end of the address space, and a byte before `p` without the mark
+stop the program
+(`paslang: string view over bytes not marked shared`). A range whose
+last byte is the address space's last address passes the range check; the
+bytes and their preceding shared mark must still lie in the promised
+block. Nothing checks
 that the bytes are not changed later through a pointer; that is the
 program's promise, as in Go.
 
