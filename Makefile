@@ -135,6 +135,10 @@ GOLDEN_A64 += strviewrange
 GOLDEN += loopmaporder
 GOLDEN_A64 += loopmaporder
 
+# P457: a field reader keeps every byte when a property has a method setter.
+GOLDEN += propfield
+GOLDEN_A64 += propfield
+
 # P166: record operands bind once, including a with inside recursion.
 GOLDEN += withonce withcapture withmap
 GOLDEN_A64 += withonce withcapture withmap
@@ -1269,6 +1273,10 @@ bench-servers: $(OUTDIR)/paslangc core libs
 
 check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch64
 	@python3 scripts/check_recipes.py
+	@set -e; \
+	: P457: mixed accessor properties pass the backing block address on both targets with inlining disabled; \
+	python3 -I scripts/check_propfield.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64); \
+	echo ok propfield-address
 	@python3 -I scripts/check_httpstop_pipe.py --evidence-parent $(BUILDDIR)
 	@set -e; \
 	: P588: runtime units have no async entries and retain cooperative frames while user code stays eligible; \

@@ -3756,8 +3756,17 @@ creating a class that still has an abstract method is an error. So is
 `inherited` of a method that is abstract in the parent, which has no
 body to call (1.2.380, `testdata/classbad/inhabstract`).
 `inherited Name(args)` calls the parent's version. A `property` reads
-and writes a field or a method and may be indexed. `is` tests and `as`
-casts. A method value, `procedure of object` or `function ... of
+and writes a field or a method and may be indexed. The two accessors
+are independent: `property Pair: TPair read FPair write SetPair;` reads
+the whole field and calls `SetPair` only for an assignment. A record,
+static array or 32-byte set keeps every byte when copied, passed by
+value or passed as `const`; a following field or array index reads that
+value. `box.Values[2]` may index an array-valued plain property. A
+bracket-parameter property such as `Items[I: Integer]` instead uses
+accessor methods. `testdata/propfield.paslang` covers the mixed field
+reader and method writer, including one-word records on both targets.
+`is` tests and `as` casts. A method value, `procedure of object` or
+`function ... of
 object`, carries the code and `Self` (§5). A call through an interface
 takes its arguments as every other call does: a string, a record, a
 slice, a real, and more than five of them (1.0.135; it passed one word
