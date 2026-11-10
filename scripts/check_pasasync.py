@@ -13,13 +13,23 @@ the runtime would let a signal stop a routine inside the allocator or
 the scheduler. No entry may hold a call to rt_morestack: a routine
 stopped between its load of the guard word and that call would come
 back with the request cleared and double its stack for nothing (Go's
-issue 35470). Reads the ELF itself, so it checks an arm64 executable on
+issue 35470). P588 also rejects overlap with code whose paslines unit
+name is exactly pasheap, pasroutines or pasdebug (case-insensitive), not
+by a mangled symbol prefix. Line-less code is covered by the dedicated
+runtime-unit assembly check. Reads the ELF itself, so it checks an arm64 executable on
 any machine.
 """
 
 import bisect
+import importlib.util
+from pathlib import Path
 import struct
 import sys
+
+# Importing the shared line-table decoder leaves no cache beside sources.
+sys.dont_write_bytecode = True
+
+RUNTIME_UNITS = frozenset(("pasheap", "pasroutines", "pasdebug"))
 
 
 def sections(data):
@@ -36,6 +46,24 @@ def sections(data):
         e = data.index(b"\0", stroff + n)
         return data[stroff + n:e].decode()
     return {nm(h[0]): h for h in heads}, heads
+
+
+
+def unit_code(data, path):
+    # Reuse P572's actual decoder, including relative <iIii> records,
+    # shortstring unit names, image addressing and metadata validation.
+    # No paslines predates P572: the dedicated runtime-unit checker
+    # remains exhaustive even when a routine has no line record.
+    decoder = Path(__file__).with_name('check_paslines.py')
+    spec = importlib.util.spec_from_file_location('paslines_async_ownership', decoder)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    secs = module.sections(data, path)
+    if 'paslines' not in secs:
+        return []
+    records, _ = module.records(data, secs, module.Image(data, secs), path)
+    return [(start, start + length, name.casefold() if name else None)
+            for start, length, lines, name, size in records]
 
 
 def calls(data, heads, start, end, target, arm):
@@ -94,8 +122,13 @@ def main():
     syms = sorted(names)
     if not entries:
         raise SystemExit(f"{sys.argv[1]}: the pasasync table is empty")
+    units = [(lo, hi, unit) for lo, hi, unit in unit_code(data, sys.argv[1])
+             if unit in RUNTIME_UNITS]
     after = 0
     for start, end in entries:
+        for lo, hi, unit in units:
+            if start < hi and lo < end:
+                raise SystemExit(f"{sys.argv[1]}: entry {start:#x}-{end:#x} overlaps runtime unit {unit} ({lo:#x}-{hi:#x})")
         k = bisect.bisect_right(syms, start)
         base = syms[k - 1] if k else 0
         own = names.get(base, [])
@@ -116,4 +149,5 @@ def main():
     print(f"check_pasasync: {len(entries)} routines ({after} from after their stack check), none spans the runtime or calls rt_morestack")
 
 
-main()
+if __name__ == '__main__':
+    main()

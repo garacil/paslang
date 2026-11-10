@@ -1269,6 +1269,11 @@ bench-servers: $(OUTDIR)/paslangc core libs
 
 check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch64
 	@python3 scripts/check_recipes.py
+	@python3 -I scripts/check_httpstop_pipe.py --evidence-parent $(BUILDDIR)
+	@set -e; \
+	: P588: runtime units have no async entries and retain cooperative frames while user code stays eligible; \
+	python3 -I scripts/check_runtime_units.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64); \
+	echo ok runtime-units
 	@python3 -I scripts/check_sqlapi_process.py scripts/check_sqlapi.py $(BUILDDIR)
 	@set -e; \
 	: P591: cooperative promoted loop maps cover every call and stay paired and ordered on both targets; \

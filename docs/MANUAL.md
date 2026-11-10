@@ -14521,7 +14521,8 @@ one would not be the program's); a signal that someone sent, which is no
 fault of the code it lands on, and whose line says so since 1.2.385
 (`paslang: SIGSEGV sent by process 4242 at line 31`, the process when
 kill, sigqueue or tgkill sent it); a failure inside the runtime's own units
-or in a routine with `asm` (`testdata/fatal/faultasm`, `nilasm`,
+(pasheap, pasroutines and pasdebug), whose code signals never stop
+and whose loops keep cooperative stack-guard checks (P588); or in a routine with `asm` (`testdata/fatal/faultasm`, `nilasm`,
 `nilcall`, `nilasmtop`, `niljump`); one
 that comes while the routine holds a `SpinLock` (*Runtime words*), which
 an exception would leave held, as Go throws on a panic holding locks

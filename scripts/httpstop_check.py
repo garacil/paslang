@@ -30,6 +30,7 @@ RUNNER is what runs the binary when it is not this machine's (an emulator and it
 Exit status 1 at the first that fails."""
 import os
 import resource
+import select
 import signal
 import socket
 import subprocess
@@ -69,18 +70,49 @@ def start(args, sock=None, files=0):
         limit = lambda: resource.setrlimit(resource.RLIMIT_NOFILE, (files, resource.getrlimit(resource.RLIMIT_NOFILE)[1]))
     if sock is None:
         return subprocess.Popen(RUN + [BIN] + args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, preexec_fn=limit)
+                                stderr=subprocess.STDOUT, preexec_fn=limit, bufsize=0)
     # the shell puts the socket at 3 and names its own pid, which exec keeps
     sh = 'exec 3<&%d; LISTEN_FDS=1 LISTEN_PID=$$ exec "$@"' % sock.fileno()
     return subprocess.Popen(['sh', '-c', sh, 'sh'] + RUN + [BIN] + args, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, pass_fds=(sock.fileno(),))
+                            stderr=subprocess.STDOUT, pass_fds=(sock.fileno(),), bufsize=0)
+
+
+def kill_and_collect(p):
+    """Kill and reap within one cleanup deadline; retain available pipe bytes."""
+    deadline = time.monotonic() + WAIT
+    p.kill()
+    try:
+        return p.communicate(timeout=max(0, deadline - time.monotonic()))[0], ''
+    except subprocess.TimeoutExpired as error:
+        output = error.output or b''
+        p.stdout.close()
+        try:
+            p.wait(timeout=max(0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            return output, '; could not reap within cleanup deadline'
+        return output, '; pipe did not close within cleanup deadline'
+
+
+def abort(p, what, why, received=b''):
+    remaining, cleanup = kill_and_collect(p)
+    fail(what, why + cleanup + '; said %r' % (received + remaining).decode(errors='backslashreplace'))
 
 
 def until_listening(p, what):
-    line = p.stdout.readline().decode()
-    if line != 'listening\n':
-        p.kill()
-        fail(what, 'it said %r, not listening' % line)
+    # One owner reads the raw pipe. Buffered readline can read ahead into
+    # the final line, which timed POSIX communicate reads through os.read.
+    deadline = time.monotonic() + WAIT
+    line = bytearray()
+    while not line.endswith(b'\n'):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not select.select([p.stdout], [], [], remaining)[0]:
+            abort(p, what, 'not listening after %d seconds' % WAIT, bytes(line))
+        byte = os.read(p.stdout.fileno(), 1)
+        if not byte:
+            break
+        line.extend(byte)
+    if line != b'listening\n':
+        abort(p, what, 'it said %r, not listening' % bytes(line).decode(errors='backslashreplace'), bytes(line))
 
 
 def stop(p, what):
@@ -88,8 +120,7 @@ def stop(p, what):
     try:
         rest = p.communicate(timeout=WAIT)[0].decode()
     except subprocess.TimeoutExpired:
-        p.kill()
-        fail(what, 'still alive %d seconds after SIGTERM' % WAIT)
+        abort(p, what, 'still alive %d seconds after SIGTERM' % WAIT)
     if p.returncode != 0 or rest != 'stopped by SIGTERM\n':
         fail(what, 'exit status %d, said %r' % (p.returncode, rest))
 
@@ -102,12 +133,10 @@ def ask(p, family, addr, what):
     try:
         c.connect(addr)
     except OSError as e:
-        p.kill()
-        fail(what, 'a connection: %s' % e)
+        abort(p, what, 'a connection: %s' % e)
     r = get(c)
     if not r.startswith(b'HTTP/1.1 200') or b'hola' not in r:
-        p.kill()
-        fail(what, 'it answered %r' % r[:60])
+        abort(p, what, 'it answered %r' % r[:60])
 
 
 def get(c):
@@ -169,8 +198,7 @@ def passed(family, remove, what):
         until_listening(p, what)
         r = get(c)
         if not r.startswith(b'HTTP/1.1 200') or b'hola' not in r:
-            p.kill()
-            fail(what, 'the second run answered %r' % r[:60])
+            abort(p, what, 'the second run answered %r' % r[:60])
         stop(p, what)
         if family == socket.AF_UNIX:
             os.unlink(path)
@@ -204,8 +232,7 @@ def quiet(p, what, switches):
         seen.append((b[0] - a[0], b[1] - a[1]))
         if (switches is None or seen[-1][0] <= switches) and seen[-1][1] <= TICKS:
             return
-    p.kill()
-    fail(what, 'a second cost %s (context switches, ticks of CPU); at most %s and %d'
+    abort(p, what, 'a second cost %s (context switches, ticks of CPU); at most %s and %d'
          % (' '.join('%d,%d' % x for x in seen), 'any number' if switches is None else switches, TICKS))
 
 
@@ -241,8 +268,7 @@ def exhausted(what):
             break
         held.append(c)
     if len(held) < FILES:
-        p.kill()
-        fail(what, 'only %d connections were taken into the queue' % len(held))
+        abort(p, what, 'only %d connections were taken into the queue' % len(held))
     time.sleep(0.5)
     # it tries again every few milliseconds (any number of switches) and must not spin
     quiet(p, what, None)
@@ -278,8 +304,7 @@ def nopoller(what):
     ask(p, socket.AF_UNIX, path, what)
     time.sleep(0.3)
     if max(int(x) for x in os.listdir('/proc/%d/fd' % p.pid)) >= top:
-        p.kill()
-        fail(what, 'the server has its descriptor %d all the same' % top)
+        abort(p, what, 'the server has its descriptor %d all the same' % top)
     quiet(p, what, None)
     stop(p, what)
     os.rmdir(d)
@@ -300,8 +325,7 @@ def quick(what):
         ask(p, socket.AF_UNIX, path, what)
     t = time.monotonic() - t
     if t > QUICKTIME:
-        p.kill()
-        fail(what, '%d connections took %.2f s; at most %.2f' % (QUICK, t, QUICKTIME))
+        abort(p, what, '%d connections took %.2f s; at most %.2f' % (QUICK, t, QUICKTIME))
     stop(p, what)
     os.rmdir(d)
     print('ok', what)
@@ -314,30 +338,34 @@ def ends(sock, what):
     try:
         rest = p.communicate(timeout=WAIT)[0].decode()
     except subprocess.TimeoutExpired:
-        p.kill()
-        fail(what, 'still alive after %d seconds' % WAIT)
+        abort(p, what, 'still alive after %d seconds' % WAIT)
     if p.returncode != 0 or not rest.startswith('stopped by'):
         fail(what, 'exit status %d, said %r' % (p.returncode, rest))
     print('ok', what)
 
 
-by_path(False, 'unix, the file there')
-by_path(True, 'unix, the file removed')
-passed(socket.AF_INET, False, 'systemd, tcp')
-passed(socket.AF_UNIX, False, 'systemd, unix')
-passed(socket.AF_UNIX, True, 'systemd, unix, the file removed')
-idle('idle')
-exhausted('out of descriptors')
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.bind(('127.0.0.1', 0))
-ends(s, 'systemd, not listening')
-s.close()
-f = open('/dev/null')
-ends(f, 'systemd, not a socket')
-f.close()
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-s.bind(('127.0.0.1', 0))
-ends(s, 'systemd, a datagram one')
-s.close()
-nopoller('no poller')
-quick('one after another')
+def main():
+    by_path(False, 'unix, the file there')
+    by_path(True, 'unix, the file removed')
+    passed(socket.AF_INET, False, 'systemd, tcp')
+    passed(socket.AF_UNIX, False, 'systemd, unix')
+    passed(socket.AF_UNIX, True, 'systemd, unix, the file removed')
+    idle('idle')
+    exhausted('out of descriptors')
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(('127.0.0.1', 0))
+    ends(s, 'systemd, not listening')
+    s.close()
+    f = open('/dev/null')
+    ends(f, 'systemd, not a socket')
+    f.close()
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(('127.0.0.1', 0))
+    ends(s, 'systemd, a datagram one')
+    s.close()
+    nopoller('no poller')
+    quick('one after another')
+
+
+if __name__ == '__main__':
+    main()
