@@ -14,9 +14,10 @@ brackets, from the sqlite.org documentation of 3.54.1) is where it comes from; t
 answers in these programs were checked against the `sqlite3` program and Python's
 `sqlite3` module, which are the system's SQLite 3.54.0.
 
-The chapter is not a course on SQL. SQLite's own pages are that, and the unit
-speaks SQLite's SQL to the letter: every statement, pragma, function, window,
-JSON and date function, virtual table, `ATTACH` and `VACUUM INTO` of 3.54.1.
+SQLite's SQL reference covers the grammar. The unit includes transactions,
+window functions, JSON and date functions, application-defined virtual
+tables, `ATTACH` and `VACUUM INTO`. Section 11 lists build options and
+extension coverage.
 
 ## 1. A first database
 

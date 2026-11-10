@@ -1,11 +1,14 @@
 # paslang
 
-A **new Pascal** on a Go-shaped engine. The syntax and the essence stay
-Pascal; underneath, thousands of lightweight routines run on a few OS
-threads, stacks grow on demand, and I/O parks a routine instead of
-blocking a thread. The compiler, the runtime and the library are written
-here, in paslang itself, and emit native code for amd64 and arm64 on
-GNU/Linux. No libc, no C runtime.
+A **new Pascal** on a Go-shaped engine. Lightweight pasroutines share OS
+threads, grow their stacks on demand and park while waiting for pollable
+I/O. Blocking kernel calls release scheduler capacity so other pasroutines
+can run. The self-hosted compiler emits native Linux executables for amd64
+and arm64, with a garbage collector and direct system calls.
+
+[Download the latest release](https://github.com/garacil/paslang/releases/latest) ·
+[Installation](https://github.com/garacil/paslang/wiki/Installation) ·
+[Programmer's manual](docs/MANUAL.md)
 
 ```paslang
 program hello;
@@ -35,10 +38,16 @@ Source files use the `.paslang` extension.
   documents are built and transformed (RFC 6902, RFC 7396); streams,
   NDJSON and RFC 7464 sequences, are read and written on parked
   routines; and a constant's text is checked when the program compiles.
-- **The network.** TCP and UDP over both address families,
-  Unix-domain sockets, a resolver and DNS messages, all on parked
-  routines: a server of tens of thousands of connections is that many
-  small stacks.
+- **Networking and mail.** TCP and UDP over IPv4 and IPv6, Unix-domain
+  sockets and DNS. The libraries include an HTTP server with graceful
+  shutdown, an HTTP client with a cookie jar, TLS 1.2 and 1.3 clients,
+  SMTP submission, IMAP and MIME message handling.
+  [Core library and network](docs/MANUAL.md#16-the-core-library-and-pasnet)
+- **SQLite and document formats.** `uses sqlite` opens SQLite databases
+  from paslang, including rollback journals and WAL, with a `TSqlite`
+  class and a low-level API under the `sqlite3_*` names. Libraries also
+  cover XML, HTML tokenization, ZIP, XLSX and PDF.
+  [SQLite guide](docs/SQLITE_GUIDE.md)
 - **The processor chosen at compile time.** `-cpu` picks the
   instructions; a word with a kernel (SHA-1, SHA-256, SHA-512, the CRCs,
   XXH3, `PopCount`, the vectors) has a body for the processor's
@@ -65,8 +74,8 @@ Source files use the `.paslang` extension.
   environments, owned child processes/deadlines, secure temporary resources
   and XDG configuration paths, owned builders, strict UTF-8/UTF-16/ASCII
   encoding, checked byte helpers and secure random/time-prefixed UUIDs.
-  Compatibility is a reference, not a requirement to reproduce unsafe or obsolete APIs;
-  the [manual](docs/MANUAL.md#17-sysutils) specifies supported contracts.
+  The manual describes ownership, error handling and compatibility for each
+  family. [SysUtils](docs/MANUAL.md#18-sysutils)
 - **A debugger inside the executable.** A program compiled with `-debug`
   carries its own debugger: `./prog --debug-mode` runs it into a console
   on its terminal, stopped before its first statement, with gdb's short
@@ -79,12 +88,12 @@ Source files use the `.paslang` extension.
 `examples/` has HTTP, DNS, FTP, NTP, WebSocket, chat, terminal and proxy
 servers, each with a self-test of thousands of clients in one process.
 
-## Speed
+## Benchmarks
 
-Every benchmark is one program in paslang and its twin in Go doing the
-same work, run on the same machine (a Ryzen 9 5950X). paslang's time
-over Go's, the median of forty rounds that alternate the two
-(`make bench-rounds`):
+These September 2026 measurements compare paslangc 1.0.147 and Go 1.27.1
+on a Ryzen 9 5950X. Each pair does the same work. The table gives the
+median ratio of paslang time to Go time over forty alternating rounds.
+These results describe that toolchain and machine.
 
 | Benchmark | What it does | paslang over Go |
 |---|---|---|
@@ -100,81 +109,75 @@ over Go's, the median of forty rounds that alternate the two
 | b10rot | bit rotations, xoshiro256** | 1.01 |
 | b9hash | SHA-256 and CRC-32C over 1 MiB | 1.01 |
 
-The servers against Go's `net/http` and `net`, with the clients in the
-same process: httpd and termd with 10,000 clients take 0.57 and 0.55 of
-Go's time, and the other pairs between 0.82 and 1.01. Memory is at or
-under Go's almost everywhere. The programs are in `scripts/bench/`:
-`make bench` builds and runs the pairs (the median of seven runs each),
-`make bench-rounds` runs them again in alternating rounds, and
-`make bench-servers` runs the servers.
+In the same historical suite, the HTTP and terminal servers with 10,000
+in-process clients took 0.57 and 0.55 of their Go counterparts' time.
+The wiki records timings, memory and workloads.
+[Benchmark results](https://github.com/garacil/paslang/wiki/Benchmarks)
+
+The goal is to beat Go and Rust on equal workloads while preserving
+correctness and safety. The Go comparisons in `scripts/bench/` check
+output, time and peak memory. With Go installed, run `make bench`,
+`make bench-rounds` and `make bench-servers` to measure a checkout.
 
 ## Building
 
 paslang runs on GNU/Linux, kernel 6.13 or newer, on amd64 or arm64.
-Building and installing it from source needs only:
+Build with GNU Make and GNU binutils (`/usr/bin/as` and `/usr/bin/ld`).
+`make` starts with a compatible paslangc in the configured `bindir` or
+`bin/`. The Makefile's `BOOT_MIN` currently requires 1.1.156 or later.
+On a fresh machine, Python 3 unpacks the assembly seed for that
+architecture from `bootstrap/`. GNU `as` and `ld` turn it into a
+bootstrap compiler. That compiler builds the current sources, then the
+result rebuilds itself.
 
-- GNU binutils (`as`, `ld`) in `/usr/bin`, where `paslangc` runs them,
-- for the first build alone, when no `paslangc` 1.1.110 or later is
-  installed yet, Python 3, which unpacks the seed in `bootstrap/`: the
-  assembly paslangc writes for itself, for amd64 and for arm64, which
-  `as` and `ld` build into the first compiler; paslang then compiles
-  itself. No other compiler is needed or used, on either machine, as Go
-  builds itself with an earlier Go. A released `paslangc` (the archives
-  and packages of each release) works as the first compiler too.
-
-Go and a C compiler are not needed to build or install. `./configure`
-finds the machine it runs on, and `make` builds and `make install`
-installs that machine's units. On amd64, `./configure --enable-arm64`
-adds the arm64 units, for `paslangc -target arm64`; they need
+`./configure` selects the host's units. On amd64,
+`./configure --enable-arm64` adds the arm64 units for
+`paslangc -target arm64`. Cross-compilation needs
 `aarch64-linux-gnu-as` and `aarch64-linux-gnu-ld` in `/usr/bin`
 (`binutils-aarch64-linux-gnu` on Debian, `aarch64-linux-gnu-binutils` on
 Arch).
 
-The tests need more, and only the tests: `make check`, on amd64, needs
-`./configure --enable-arm64` and the arm64 binutils, Python 3, `gdb`, a
-C compiler (`cc`) and Go, which build helper programs and
-oracles of the tests, `meson`, `ninja` and glib's headers, with which
-`make` builds the `qemu-aarch64` the arm64 tests run under from QEMU
-11.1.1's signed release (fetched once into `docs/ref/qemu` and checked
-by its SHA-256) and the patches in `scripts/qemu`: a deadlock of a
-program that forks while its other threads make system calls, and
-`MADV_GUARD_INSTALL`, which 11.1.1 refuses; and `Xvfb` if present for
-the X11 tests.
-The benchmarks need Go.
-
-```
+```sh
 ./configure
-make
-make install
+make all
+sudo make -o all install
+make installcheck
 ```
 
-and for the tests:
+`make all` builds `bin/paslangc`, `bin/pasdbg` and the selected units.
+After that build, `-o all` lets the install step reuse its outputs.
+The default prefix is `/usr/local`. Use `./configure --prefix=...`
+to choose another prefix. A prefix you can write to needs no `sudo`.
 
-```
+For the full two-target checks on amd64, install the cross binutils,
+Python 3, `gdb`, `cc` and Go for the test helpers and oracles.
+QEMU's build also uses `meson`, `ninja` and GLib development headers.
+`make check` fetches the pinned QEMU source archive, verifies its
+SHA-256 and applies the patches in `scripts/qemu/`. It uses `Xvfb`
+for X11 tests when available.
+
+```sh
 ./configure --enable-arm64
-make
+make all
 make check
 ```
 
-`make` builds `bin/paslangc`, `bin/pasdbg`, and the core and library
-units of the machine (and the arm64 ones too with `--enable-arm64`).
-`make check` runs every test program, every example of
-the manual, the servers' self-tests and the arm64 build under qemu.
-`make install` puts `paslangc` and `pasdbg` in `$(prefix)/bin` and the
-units in `$(prefix)/lib/paslang` (the arm64 ones in
-`lib/paslang/aarch64`); `./configure --prefix=...` chooses the prefix.
-`make package` writes the two release archives under `build/pkg`, and
-`make distpkg` the packages of the distributions under `build/pkg/dist`;
-both carry the two machines, so they need `./configure --enable-arm64`.
+`make check` runs the golden programs, manual examples, server self-tests,
+compiler self-reproduction and arm64 checks under QEMU.
 
 ## Binary packages
 
-Each release carries, for amd64 and arm64, a package for each family of
-distributions and a relocatable archive; `SHA256SUMS` lists them all.
-Each installs `paslangc` and `pasdbg` in `/usr/bin`, the units in
-`/usr/lib/paslang`, the manual in `/usr/share/doc/paslang` and the
-examples in `/usr/share/paslang/examples`, and pulls in GNU binutils,
-which the compiler needs for `as` and `ld`.
+The release page provides four distribution packages and a relocatable
+archive for each architecture, with compilers and debuggers built for
+`-cpu base`. Download `SHA256SUMS` alongside your package and run
+`sha256sum -c SHA256SUMS --ignore-missing` in the download directory.
+[Latest release](https://github.com/garacil/paslang/releases/latest)
+
+Distribution packages install `paslangc` and `pasdbg` in `/usr/bin`, the
+units in `/usr/lib/paslang`, the manual in `/usr/share/doc/paslang` and
+the examples in `/usr/share/paslang/examples`. The compiler uses GNU
+binutils for `as` and `ld`. On Slackware and with the relocatable archive,
+install binutils separately if needed.
 
 | Distribution | amd64 | arm64 | Install |
 |---|---|---|---|
@@ -198,14 +201,14 @@ compiles for arm64 once the cross binutils are installed
 (`binutils-aarch64-linux-gnu` on Debian, `aarch64-linux-gnu-binutils` on
 Arch).
 
-`make release-assets` builds all of them into `build/pkg/release`, with
-`SHA256SUMS`; it needs `dpkg-deb`, `rpmbuild` and `makepkg`.
-`make check-release` also validates every package format, the exact binaries
-and manual, and both relocated compilers running the SysUtils examples.
-It independently rebuilds both debuggers for the base CPU and compares every
-byte, then tests the packaged debugger protocol against an instrumented
-program. The arm64 tools also run on Cortex-A53, without LSE.
-It additionally needs `bsdtar` and `rpm2cpio`.
+On an amd64 release build with `--enable-arm64`, run `make manual` and
+`make check-release` after `make check` has built the patched QEMU.
+`make check-release` builds all ten packages and archives plus `SHA256SUMS`
+in `build/pkg/release`. It verifies their contents, recompiles and runs
+examples with both relocated compilers, and exercises the packaged
+debuggers, including Cortex-A53 emulation. The packaging and validation
+tools include `dpkg-deb`, `rpmbuild`, `makepkg`, `fakeroot`, `bsdtar`
+and `rpm2cpio`.
 
 ## Documentation
 
@@ -215,7 +218,8 @@ chapter, with the installation, the examples and the benchmarks.
 | File | What |
 |---|---|
 | [docs/MANUAL.md](docs/MANUAL.md) | The programmer's manual; every program in it lives in `examples/` and runs under `make check` |
-| [docs/manual/index.html](docs/manual/index.html) | The manual with TYPES, QUAD, GC, KERNELS and VISION as one page (`make manual`) |
+| [docs/SQLITE_GUIDE.md](docs/SQLITE_GUIDE.md) | SQLite connections, transactions, WAL, callbacks and concurrent access |
+| [docs/manual/index.html](docs/manual/index.html) | The manual, SQLite guide and design chapters as one page (`make manual`) |
 | [docs/HELP.md](docs/HELP.md) | `paslangc --help`: the manual inside the compiler |
 | [docs/TYPES.md](docs/TYPES.md) | The types: unbounded strings, slices, 64-bit integers, the modern ABI |
 | [docs/GC.md](docs/GC.md) | The heap and the collector |

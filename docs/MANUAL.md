@@ -39,17 +39,27 @@ Contents
 
 ## 1. Getting started
 
-Build the compiler once from the source tree:
+Install a binary package or unpack a release archive to get `paslangc`
+and its units. [Latest release](https://github.com/garacil/paslang/releases/latest)
 
-```
-make            # builds bin/paslangc, bin/pasdbg and the units for both machines
-make install    # optional: puts paslangc, pasdbg and lib/paslang under /usr/local
+To build from source, run these commands from the checkout. See the
+[build requirements](../README.md#building) for the bootstrap and tools.
+
+```sh
+./configure
+make all
+sudo make -o all install    # optional, for the default prefix /usr/local
 ```
 
-`make` builds paslangc for the processor of the machine that builds it,
-as paslangc compiles every program (`-cpu`, §22; 1.1.115):
-`make SELF_CPU=base` builds one that runs on any machine of its kind,
-and the archives of a release carry compilers built for `base`.
+The build produces `bin/paslangc`, `bin/pasdbg` and the host's core
+and library units. On amd64, configure with `--enable-arm64` to build
+the arm64 units as well. Use `bin/paslangc` from the checkout if you
+skip installation.
+
+By default, `make` builds paslangc for the processor of the machine
+that builds it. Use `make SELF_CPU=base` in a clean build to make a
+compiler that runs on the architecture's baseline CPU. Release packages
+carry compilers built for `base`. See `-cpu` in §22.
 
 The smallest program is a name, a body and one line of output
 (`examples/hello.paslang`):
@@ -13131,11 +13141,11 @@ writes, in rollback-journal or WAL mode, is one the `sqlite3` program
 reads, and the other way, at the same time, with SQLite's own POSIX
 locks; a program killed in the middle of a commit leaves a file either
 side brings back to the state before the transaction or after it. Its
-SQL is SQLite's (every statement, pragma, function, window, JSON and
-date function, virtual table, `ATTACH`, `VACUUM INTO`), and so are its
-answers: the same rows, the same types, the same result codes and the
-same messages, which `testdata/sqlapi` compares with SQLite's own on
-UTF-8 and UTF-16 databases.
+SQL includes windows, JSON and date functions, application-defined
+virtual tables, `ATTACH` and `VACUUM INTO`. The `testdata/sqlapi` tests
+compare rows, types, result codes and messages with SQLite on UTF-8 and
+UTF-16 databases. See the [SQLite guide](SQLITE_GUIDE.md) for examples
+and the library's build options and extension coverage.
 
 SQL's math functions are there as the `sqlite3` program and the
 distributions build SQLite, with `SQLITE_ENABLE_MATH_FUNCTIONS` (1.1.255,
@@ -13220,9 +13230,9 @@ keeps no count of its memory, which is the collector's
 a statement (`.treetrace 0x10000`), then `ok`, or `error: ` and the
 message (1.1.248, P404).
 
-The book has a chapter for using it, SQLite in paslang (docs/SQLITE_GUIDE.md, 1.2.325, P414):
-values and types, transactions, the file and the memory, the write-ahead log, functions of
-the program, routines, with seven programs that make check runs.
+The [SQLite guide](SQLITE_GUIDE.md) covers values, transactions, database
+files, memory, WAL, callbacks and concurrent access. Its seven example
+programs run under `make check`.
 
 ## 17. The clock, chance and order
 

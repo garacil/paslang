@@ -1,11 +1,8 @@
 # paslangc manual
 
-The manual is inside the compiler so a checkout is not required to read it.
-`--help types` includes checked four-place decimal Currency and its explicit
-binary/decimal conversions. `--help lib` lists the modern SysUtils families:
-bounded resources, explicit system errors, environments/processes, builders,
-strict encodings, bounded C-string buffers, helpers and secure identifiers.
-The full API contracts and executable examples remain in the main manual.
+Run `paslangc --help` to read the compiler's built-in reference. The
+programmer's manual covers library contracts, executable examples and
+the runtime model. [Programmer's manual](MANUAL.md)
 
 ```bash
 paslangc
@@ -15,8 +12,8 @@ paslangc --version
 
 The version is the one `paslangc -v` prints; it lives only in
 `PaslangVersion` (`src/compiler/pashelp.paslang`) and rises with every
-change. With no arguments, `-v`, or `--version`, paslangc
-prints a card:
+compiler, runtime, core or language change. With no arguments, `-v`,
+or `--version`, paslangc prints a card.
 
 ```
   ╭────────────────────────────────────────────────────────────╮
@@ -58,19 +55,21 @@ form prints the card first and exits 0. The source of that text is
 the ones the compiler implements. A form that is not listed under
 `limits` or `lang` is not a promise.
 
-Topics:
-
 | Topic | What it answers |
 |---|---|
 | flags | `-h`, `-v`/`--version`, `--help`, `-o`, `-c`, `-checkptr`, `-Fu` and the unit search order, `-install`, `-cpu` and `-tune`, `-inline` and `-inline-trace`, `-debug`, `-target`, `--lex`, exit status |
-| types | sizes: `Integer` 64, the narrow integers 8/16/32, `Char` 1 byte, `string` pointer+length, `Real` binary64, `Single` binary32, `Quad` binary128, slices, records, sets, channels, maps, `json` (its reads, encoders and decoders, building and transforming, streams and constants), the sync types, method and interface values, pointers and views |
+| types | Integer and real widths, checked four-place `Currency`, strings, slices, records, sets, channels, maps, JSON, method and interface values, and the pointer operations allowed by `safe` |
 | lang | statements, units, classes, channels, a hello program |
-| runtime | G/M, preemption, the collector, the fatal errors, `Syscall`, and the builtins: the calculation set, hashing, `GetMem`, the debugging words, RTTI, the atomics and the scheduler's words |
-| lib | the eleven core units (`pasnum`, `pasobject`, `pasroutines`, `pasmap`, `pashash`, `pastree`, `pasfmt`, `passtr`, `pasheap`, `pasquad`, `pasjson`), the installed units `pastime`, `pasrand`, `passort`, `paslib`, `pasnet`, `pasdebug` (written by `-debug`) and `pasx11`, and the `Net` builtins under `pasnet` |
+| runtime | pasroutines, stack growth, asynchronous and cooperative preemption, the collector, checked failures, `Syscall`, atomics, RTTI and scheduler operations |
+| lib | the eleven core units and installed libraries for SysUtils, time, networking, TLS, cryptography, text codecs, HTML and XML |
 | limits | forms the compiler does not accept or treats otherwise than another Pascal, and the reserved words |
 | examples | commands that compile and run |
 | all | every section above, after the index |
 | index, short | the index alone |
+
+The [core and library chapter](MANUAL.md#16-the-core-library-and-pasnet)
+covers additional libraries, and the [SQLite guide](SQLITE_GUIDE.md)
+walks through the database API.
 
 ---
 

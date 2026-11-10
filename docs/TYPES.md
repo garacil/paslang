@@ -142,8 +142,8 @@ not a binary floating-point alias. Its range is
 −922337203685477.5808..922337203685477.5807; alignment is 8 and zero is the
 default. It is a scalar with no GC pointer words, including inside records,
 arrays, channels, maps and interfaces of separately compiled units.
-`PASLANGI25` distinguishes it from ordinary integers and records its type
-in constants, defaults, fields, parameters and results.
+The interface format records its distinct type in constants, defaults,
+fields, parameters and results. Currency was introduced in `PASLANGI25`.
 
 The exact decimal input and wide multiplication/division kernels round once,
 nearest with ties to even. All arithmetic and whole-integer conversions

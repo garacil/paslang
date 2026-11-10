@@ -36,12 +36,10 @@ exponent of 1); 32767 is an infinity (fraction 0) or a NaN (bit 47 of
 
 ## The core unit `pasquad` (`src/lib/pasquad.paslang`)
 
-Every routine takes the words of its operands by value and gives the
-result's words through `out` parameters: `PasQAdd(ALo, AHi, BLo, BHi,
-RLo, RHi)` is six integer registers, the most amd64 passes in registers.
-The unit has no `Quad` type of its own, so any paslang compiles it, and
-so does FPC (the bootstrap compiles the compiler, which folds `Quad`
-constants with it, 1.0.115).
+The arithmetic routines take the operands as pairs of integer words.
+`PasQAdd(ALo, AHi, BLo, BHi, RLo, RHi)` uses four value parameters and
+two `out` parameters, all passed in registers on amd64. The compiler
+uses this same unit to fold `Quad` constants during compilation.
 
 | Routine | What |
 |---|---|
@@ -58,9 +56,9 @@ How it works:
 - **128-bit integers in pairs of `Int64`.** paslang has no unsigned
   64-bit type (`QWord` is `Integer`), so an unsigned compare flips the
   sign bits (`ULt`), and `shr` is logical on `Integer`, as FPC's is.
-  `Add128`, `Sub128`, `Shl128`, `Shr128` (the bits that fall off set a
-  sticky flag), `Clz64`, and `Mul64`, a 64 × 64 → 128-bit product from
-  four products of 32-bit halves.
+  `Add128` and `Sub128` use `AddCarry` and `SubBorrow`. `Clz64` uses
+  `LeadingZeros`. `Mul64` combines `MulHi` and the low word of the
+  product. `Shr128` can retain the discarded bits as a sticky flag.
 - **`Unpack`** gives a class (zero, finite, infinite, NaN), the sign and
   a finite value as a 128-bit integer times a power of two, its top bit
   always at 112: a subnormal is normalized here, so every operation
@@ -116,8 +114,8 @@ digits) and `FmtExact` (the writing) are shared by `Double`, `Single` and
 `Quad` is builtin type id 14 (`TyQuad`), a kind of its own (`tykQuad`),
 so no path written for `Double` or `Single` takes it by mistake: a rule
 that does not know it refuses it at compile time. The `.pi` format went
-to `PASLANGI10`, since every type after the builtins moved by one
-(`PASLANGI13` since 1.0.137).
+to `PASLANGI10` when `Quad` was introduced, since every type after the
+builtins moved by one.
 
 **Typing (pasparse).** `QuadOf(E)` is the one entry for a place that
 wants a `Quad`, as `RStamp` is for the other reals: it takes an
@@ -174,16 +172,16 @@ both machines.
 
 ## Constants, layout and debugging (1.0.115)
 
-- **Constants folded in binary128.** The compiler links `pasquad` (FPC's
-  build of it gives the same bits). `QFold` works an expression of
+- **Constants folded in binary128.** The compiler links `pasquad`.
+  `QFold` works an expression of
   constants out in binary128 with the routines the program runs: a
   literal from its digits, an integer exactly, a named constant from its
   own binary128 value, `+ - * /` and unary minus. `ParseConstValue` keeps
   that value beside the `Double` one for every real constant, a node
   carries it (`Flags` bit 1, `QLo` and `Hi`), and `QuadOf` takes it, so a
   `Quad` gets `1 / 3` to 113 bits while a `Double` still gets 53. A
-  unit's `.pi` writes `CONST name bits r lo hi`; an older reader stops at
-  `r`, so the format stays `PASLANGI10`.
+  unit's `.pi` records the two binary128 words alongside the binary64
+  value of the constant.
 - **Typed constants and defaults.** `ParseTypedInit` folds a `Quad`
   constant into the variable's 16 bytes. A `Quad` default is kept as its
   16 bytes in the parameter's default text, which the `.pi` writes in
@@ -202,13 +200,11 @@ both machines.
 
 ## Fast paths (1.0.122)
 
-With the words of P106 (`MulHi`, `AddCarry`, `SubBorrow`,
-`LeadingZeros`, `DivMod128`), taken behind `{$ifdef PASLANG}` so FPC
-still builds the unit its old way, `pasquad` works two normal operands
-with no call: the significands 10 bits up, the bits that fall off one
-jammed into its lowest bit (an inexact result is odd there, so it is
-never a false tie), one step of normalization, round to nearest even at
-bit 10, pack. A sum or a difference goes so unless the exponents are one
+Using `MulHi`, `AddCarry`, `SubBorrow`, `LeadingZeros` and `DivMod128`,
+`pasquad` works two normal operands with no call. It leaves ten extra
+bits below the significand and folds discarded bits into the low bit.
+After one normalization step it rounds to nearest even and packs the
+result. A sum or a difference uses this path unless the exponents are one
 apart or less with opposite signs (the result may cancel) or the result
 may be subnormal; a product is four `MulHi` and a chain of carries; a
 quotient on amd64 is Knuth's algorithm D in base 2^64, each digit
@@ -256,9 +252,9 @@ hex; `testdata/quadcore.out` and `testdata/quadfmt.out` are what the C
 program printed, and `make check` compares the paslang program's output
 with them on both machines. During the build of 1.0.113 the comparison
 ran on 200,000 random cases × 17 results each (every operation,
-comparison, rounding and conversion), 30,000 of them under qemu on
-arm64, the unit compiled by FPC too, and on 3,000 values written with
-five precisions and 3,000 decimal strings read: no bit differed.
+comparison, rounding and conversion), 30,000 of them under QEMU on
+arm64. It also covered 3,000 values written with five precisions and
+3,000 decimal strings read. The results matched bit for bit.
 
 The drawing covers every exponent, the neighbourhood of 1, subnormals,
 the top of the range, the smallest normals, integers, and pairs of

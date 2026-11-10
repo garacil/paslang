@@ -159,12 +159,12 @@ def inline(text):
 
 
 def link(url):
-    """A link to another document of the book goes to its part."""
+    """Link book chapters locally and repository files to their source."""
     for part, name, _ in PARTS:
-        if url == name or url.endswith('/' + name):
+        if url == name:
             return '#' + part
-    if url.endswith('.md'):
-        return 'https://github.com/' if False else url
+    if url.startswith(('../README.md', '../examples/')):
+        return 'https://github.com/garacil/paslang/blob/main/' + url[3:]
     return url
 
 
