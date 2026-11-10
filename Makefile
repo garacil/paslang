@@ -131,6 +131,10 @@ GOLDEN_A64 += safenew
 GOLDEN += strviewrange
 GOLDEN_A64 += strviewrange
 
+# P591: deferred cooperative checks keep every map with its code.
+GOLDEN += loopmaporder
+GOLDEN_A64 += loopmaporder
+
 # P166: record operands bind once, including a with inside recursion.
 GOLDEN += withonce withcapture withmap
 GOLDEN_A64 += withonce withcapture withmap
@@ -1265,6 +1269,11 @@ bench-servers: $(OUTDIR)/paslangc core libs
 
 check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch64
 	@python3 scripts/check_recipes.py
+	@python3 -I scripts/check_sqlapi_process.py scripts/check_sqlapi.py $(BUILDDIR)
+	@set -e; \
+	: P591: cooperative promoted loop maps cover every call and stay paired and ordered on both targets; \
+	python3 -I scripts/check_loopmaps.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64); \
+	echo ok loop-map-order
 	@set -e; \
 	: P584: the production range predicate accepts the last address and rejects a wrap and the removed generic map put has no exported entry; \
 	python3 -I scripts/check_strview_range.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64); \

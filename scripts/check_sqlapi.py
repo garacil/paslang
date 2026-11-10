@@ -15,14 +15,62 @@ QEMU runs PROG when it is an arm64 program; --only runs the groups whose
 first script is named."""
 
 import hashlib
+import json
 import os
 import subprocess
 import sys
 import tarfile
+import tempfile
+import time
 
 GROUPS = ('a1 c1 d1 d2 p2a p3 p4 p5 p6+p6b r1+r2+r3 an1+an2 v2 w1 w2 dt1 j1 vac1 bk1 md1 coll1 fn1 params fpd'
           ' m1').split()
 SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'testdata', 'sqlite')
+
+
+def run_checked(arguments, directory, evidence, number, label):
+    """Record process evidence before any expected-byte/hash comparison.
+
+    Python subprocess.run returns status separately from its output;
+    TimeoutExpired carries captured partial bytes (subprocess.py run and
+    CompletedProcess.check_returncode). The SQL stdout contract is unchanged.
+    """
+    folder = os.path.join(evidence, '%04d' % number)
+    os.mkdir(folder)
+    command = {'argv': arguments, 'cwd': directory, 'timeout_seconds': 900,
+               'label': label}
+    with open(os.path.join(folder, 'command.json'), 'w') as f:
+        json.dump(command, f, indent=2)
+        f.write('\n')
+    started = time.monotonic()
+    status = {'returncode': None, 'timed_out': False, 'launch_error': None}
+    output, errors = b'', b''
+    try:
+        result = subprocess.run(arguments, cwd=directory, capture_output=True, timeout=900)
+        output, errors = result.stdout, result.stderr
+        status['returncode'] = result.returncode
+    except subprocess.TimeoutExpired as error:
+        output, errors = error.stdout or b'', error.stderr or b''
+        status['timed_out'] = True
+    except OSError as error:
+        status['launch_error'] = str(error)
+    status['elapsed_seconds'] = time.monotonic() - started
+    for name, data in (('stdout', output), ('stderr', errors)):
+        with open(os.path.join(folder, name), 'wb') as f:
+            f.write(data)
+    with open(os.path.join(folder, 'status.json'), 'w') as f:
+        json.dump(status, f, indent=2)
+        f.write('\n')
+    if status['timed_out']:
+        sys.exit('check_sqlapi: %s timed out after 900 seconds; process evidence: %s' %
+                 (label, folder))
+    if status['launch_error'] is not None:
+        sys.exit('check_sqlapi: %s could not start: %s; process evidence: %s' %
+                 (label, status['launch_error'], folder))
+    if status['returncode'] != 0:
+        sys.exit('check_sqlapi: %s exited %s; process evidence: %s' %
+                 (label, status['returncode'], folder))
+    return output
 
 
 def main():
@@ -38,6 +86,7 @@ def main():
     prog, d = os.path.abspath(args[0]), os.path.abspath(args[1])
     run = [os.path.abspath(q) for q in args[2:3]]
     os.makedirs(d, exist_ok=True)
+    evidence = tempfile.mkdtemp(prefix='process-', dir=d)
     n = 0
     for g in groups:
         for enc, tag in (('', ''), ('UTF-16le', '.le'), ('UTF-16be', '.be')):
@@ -51,7 +100,7 @@ def main():
                 args = run + [prog, 't.db', os.path.abspath(os.path.join(SRC, x + '.sql'))]
                 if enc and k == 0:
                     args.append(enc)
-                got = subprocess.run(args, cwd=d, capture_output=True, timeout=900).stdout
+                got = run_checked(args, d, evidence, n + 1, x + tag)
                 want = os.path.join(SRC, x + tag + '.out')
                 if not os.path.exists(want):
                     want = os.path.join(SRC, x + '.out')
@@ -72,8 +121,8 @@ def main():
             for f in ('t.db', 't.db-journal', 't.db-wal', 't.db-shm', 'vac_into.db', 'bk_dest.db', 'bk_dest.db-journal'):
                 if os.path.exists(os.path.join(d, f)):
                     os.remove(os.path.join(d, f))
-            got = subprocess.run(run + [prog, 't.db', os.path.join(cd, name + '.sql')], cwd=d, capture_output=True,
-                                 timeout=900).stdout
+            got = run_checked(run + [prog, 't.db', os.path.join(cd, name + '.sql')],
+                              d, evidence, n + 1, name)
             if hashlib.sha256(got).hexdigest() != want:
                 open(os.path.join(d, name + '.got'), 'wb').write(got)
                 sys.exit('check_sqlapi: corpus %s differs from SQLite (%s; SQLite\'s answer is '

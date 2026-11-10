@@ -14249,6 +14249,14 @@ every register on its stack as Go's asynchronous preemption does; a
 large block is invisible to the collector until it is clear (1.1.121,
 P271).
 
+Every compiled call has a stack-map descriptor for its return address:
+the pointer words, pushed values and temporary storage the collector must
+read or adjust if the stack moves. A cooperative loop check whose slow
+path is placed outside the loop keeps its complete descriptor with that
+code, including inside an inlined island or a nested promoted region.
+The linked map table is in code-address order; the runtime retains its
+defensive startup sorting for compatible objects that need it.
+
 A routine that waits, on a channel, a mutex, a condition, `Sleep`, a
 socket or standard input, parks: its registers and stack pointer are
 saved in the G and the thread picks the next runnable routine. A
