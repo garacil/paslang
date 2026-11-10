@@ -538,7 +538,7 @@ is seen through (`examples/pointers.paslang`).
   need one view. `=`, `<>`, `<`, `>` compare addresses.
 - **`safe`** before `program`, `unit` or a routine refuses arithmetic,
   views, conversions between pointer types, `Pointer(n)`, `p[i]`,
-  `View` and an untyped `p^`; `New`, a typed `p^`, `@x`, `nil`, arrays,
+  `View`, an untyped `p^`, `GetMem` and `FreeMem`; `New`, a typed `p^`, `@x`, `nil`, arrays,
   strings, classes and slices stay. Free at run time; the `.pi` says
   `SAFE`.
 - **`MemBase(p)`, `MemSize(p)`, `MemEnd(p)`** (1.0.109): the object `p`
@@ -783,7 +783,9 @@ methods `Lock`, `Unlock`, `TryLock`, `BeginRead`, `EndRead`, `Add`,
 procedures. `GetMem(p, n)` gives n bytes the collector will scan
 word by word; `GetMem(p, n, 0)` gives n bytes that hold no pointer;
 `GetMem(n)` and `GetMem(n, 0)` are the same as functions, giving the
-block as a `^Integer`.
+block as a `^Integer`. These raw allocation forms and the no-op `FreeMem`
+are refused in `safe` code; typed `New` chooses the size and pointer map
+from its type, and the collector owns its lifetime.
 A waiter parks the G, so the M stays free: the mutex is
 Go's `sync.Mutex` and parks without a lock (`WaitPush`, `WaitTake`,
 `WaitFront`, `ParkMarked`); the others park on the record's queue under

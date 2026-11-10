@@ -3160,7 +3160,9 @@ pointed-to type and `GetMem(p, n)` allocates `n` bytes (`GetMem(p, n, 0)`
 for bytes that hold no pointer). As a function, `GetMem(n)` and
 `GetMem(n, 0)` give the new block as a `^Integer`, to be seen through
 any view: `q := PByte(GetMem(64, 0))`. `FreeMem(p)` does nothing, the
-collector gives back what nothing reaches. `Move(a, b, n)` copies `n` bytes
+collector gives back what nothing reaches. `safe` code refuses `GetMem`
+and `FreeMem`: use typed `New`, whose size and pointer map come from the
+pointed-to type. `Move(a, b, n)` copies `n` bytes
 between two variables; to copy through pointers write `Move(p^, q^, n)`.
 `FillChar(x, n, v)` writes the byte (or `Char`) `v` `n` times from `x`
 on, by `rep stosb` on amd64 and 32 bytes a store on arm64 (1.1.122,
@@ -15415,7 +15417,11 @@ installed libraries must be rebuilt when this format changes.
 too) forbids raw pointer work in that code: pointer arithmetic, `Inc`
 and `Dec` of a pointer, `p[i]`, views (`PT(q)` of another pointer
 type, `^T(q)`, `T(q^)`, `TRec(q)`), `View(p, n)`, `Pointer(n)` and `p^`
-of an untyped `Pointer`. `New`, `p^` of a typed pointer, `@x`, `nil`, comparisons,
+of an untyped `Pointer`. It also refuses every form of `GetMem` and
+`FreeMem`: raw allocation lets its caller choose a byte count and whether
+the collector scans the block. `New` derives both from the pointed-to
+type and stays available. `FreeMem` remains a no-op outside `safe` code;
+the collector owns the memory. Typed `p^`, `@x`, `nil`, comparisons,
 arrays, strings, classes and slices stay. A routine declared inside a
 safe one is safe too; a safe unit's `.pi` says so. It costs nothing at
 run time.
