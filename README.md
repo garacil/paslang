@@ -156,11 +156,22 @@ QEMU's build also uses `meson`, `ninja` and GLib development headers.
 SHA-256 and applies the patches in `scripts/qemu/`. It uses `Xvfb`
 for X11 tests when available.
 
+The power-of-ten oracle also needs Go's source Git checkout at `golang/`.
+In a fresh checkout, fetch the reference revision before running checks:
+
 ```sh
+git init golang
+git -C golang fetch --depth 1 https://go.googlesource.com/go f043823a99a4118989a34afec015d23b5d54d01e
+git -C golang checkout --detach FETCH_HEAD
+python3 scripts/pow10gen.py --check
 ./configure --enable-arm64
 make all
 make check
 ```
+
+An isolated checkout can link `golang/` to an existing copy of that
+reference tree. The source is used by the test oracle; building and
+installing the compiler does not require it.
 
 `make check` runs the golden programs, manual examples, server self-tests,
 compiler self-reproduction and arm64 checks under QEMU.
