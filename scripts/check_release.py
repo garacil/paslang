@@ -113,7 +113,7 @@ for record in records:
 fixtures = ('systemerrors', 'blockedio', 'boundedfiles', 'filemetadata', 'directories',
             'paths', 'environments', 'processes', 'temporaryresources', 'systempaths',
             'textbuilding', 'textencoding', 'textbuffers', 'valuehelpers', 'identifiers',
-            'money', 'scopedtypes')
+            'money', 'scopedtypes', 'signatures')
 for target in ('amd64', 'arm64'):
     package = work / f'paslang-{version}-linux-{target}.tar.gz.extracted' / f'paslang-{version}-linux-{target}'
     launch = [qemu, '-cpu', 'max'] if target == 'arm64' else []

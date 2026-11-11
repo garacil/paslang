@@ -12062,6 +12062,28 @@ P429), each following Go's code routine by routine:
   point off the curve, and `NistEcdsaVerify(curve, pub, hash, r, s)` and
   `NistEcdsaVerifyAsn1(curve, pub, hash, der)` ECDSA verification as
   Go's `crypto/ecdsa` checks it, the DER parsed as strictly.
+  `NistEcdsaSign(curve, priv, hash, out r, out s)` signs a precomputed
+  SHA-256 digest with P-256 or a SHA-384 digest with P-384. The private
+  scalar and digest must be exactly 32 or 48 bytes respectively, and
+  the scalar must be in [1, n-1]. Nonces follow RFC 6979, with HMAC
+  over the private scalar and reduced digest, and rejection of
+  out-of-range candidates. Secret order arithmetic uses fixed public
+  loop bounds and mask-based reduction. Each call has its own nonce
+  state and returns the same signature for the same inputs.
+  On success, `r` and `s` are exactly 32 or 48 big-endian bytes,
+  including leading zeros. Their concatenation is the raw ES256 or
+  ES384 signature of RFC 7518 §3.4; there is no DER encoding or low-S
+  rewriting. `False` clears both outputs. Inputs may alias outputs,
+  but `r` and `s` must name distinct variables.
+  `NistGenerateKey(curve)` obtains a private scalar from Linux's
+  kernel CSPRNG with rejection sampling. It returns `''` on an
+  unsupported curve or entropy error, and never falls back to a weak
+  generator. Entropy waits use the shared syscall scheduler.
+  For VAPID, hash the JWS signing input with SHA-256 and base64url
+  encode `r + s`; the signing key must differ from the payload's ECDH
+  key (RFC 8292 §3). The application constructs the JWT claims and
+  HTTP request. [`signatures`](../examples/signatures.paslang) shows
+  key generation, signing and verification.
 - `uses pasrsa` is RSA verification (RFC 8017; Go's `bigmod` and
   `fips140/rsa`): `RsaVerifyPkcs1v15(n, e, hash, hashed, sig)` and
   `RsaVerifyPss(n, e, hash, hashed, sig, saltLen)` (`-1` finds the salt
@@ -12072,10 +12094,23 @@ P429), each following Go's code routine by routine:
   exponentiations, for what comes later.
 
 What touches a secret (the X25519 ladder, the scalar products of ECDH,
-the field inversions) is constant time; verification works on public
-values and may not be, as Go's. `testdata/x25519kat` checks RFC 7748's
+the field inversions and signing's order arithmetic) uses constant-time
+algorithms. Input validity, unbiased nonce rejection and degenerate
+signature checks remain explicit. Verification works on public values
+and may not be constant time, as Go's. `testdata/nistsign` checks the
+literal RFC 6979 P-256/SHA-256 and P-384/SHA-384 signatures, strict
+inputs, aliases, scalar boundaries, key generation and concurrent
+calls through collection and stack growth. `testdata/x25519kat` checks RFC 7748's
 vectors, and `x25519wyche`, `nistwyche` and `rsawyche` Wycheproof's
 (518 X25519, 1,530 ECDSA, 1,145 ECDH, 1,394 RSA), on both machines.
+
+The signing gates in `make check` also compare 90 deterministic signatures
+with Go's recorded results, model order arithmetic with Python integers,
+force nonce/entropy rejection and error paths, and analyze the production
+parser's scalar-arithmetic AST for secret-dependent control and addressing.
+Compiled arithmetic and nonce mutants must be detected. These checks and
+emitted-code review support the constant-time implementation; they are not
+a formal proof or cryptographic certification.
 
 `uses pasx509` reads and checks certificates as Go's `crypto/x509` does
 (1.1.293, P430), routine by routine:

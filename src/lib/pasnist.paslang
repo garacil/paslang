@@ -37,12 +37,13 @@
   check fips140/ecdsa/ecdsa.go verifyGeneric with crypto/ecdsa's
   VerifyASN1 and the DER rules of golang.org/x/crypto/cryptobyte.
 
-  Nothing that touches a private scalar branches on it or indexes
-  memory with it: the windows are read from every entry of a table,
+  The valid-scalar multiplication and arithmetic kernels do not branch
+  on scalar values or index memory with them: windows read every table entry,
   the inversion is an addition chain, and a selection is a mask. The
-  arithmetic modulo the order n, which the signature check alone uses
-  on public values, is a plain Montgomery multiplication in variable
-  time with Fermat's inverse, where Go uses bigmod.
+  arithmetic modulo the order n uses fixed-size Montgomery products,
+  mask-based reduction and Fermat's inverse with the public exponent
+  n-2, following Go's bigmod. Deterministic ECDSA signing follows
+  RFC 6979 with HMAC-SHA256 or HMAC-SHA384 and rejection sampling.
 
   Keys, points, hashes and signatures are strings of their bytes. A
   point is SEC 1's encoding (2.3.3): 04 x y, or 02 x / 03 x compressed;
@@ -59,6 +60,19 @@ const
   as Go's ecdh.NewPrivateKey: '' when Priv is not 32 (P-256) or 48
   (P-384) bytes or not in [1, n-1] }
 function NistPublicKey(Curve: Integer; const Priv: string): string;
+
+{ a uniformly sampled private scalar from Linux's kernel CSPRNG,
+  32 bytes for P-256 or 48 for P-384, in [1, n-1]. Returns '' for an
+  unsupported curve or an entropy error; no weak randomness fallback. }
+function NistGenerateKey(Curve: Integer): string;
+
+{ deterministic ECDSA (RFC 6979). P-256 takes a 32-byte private scalar
+  and SHA-256 digest; P-384 takes a 48-byte scalar and SHA-384 digest.
+  R and S are exactly 32 or 48 big-endian bytes, including leading
+  zeros: R + S is the raw ES256/ES384 signature, not DER. False clears
+  both outputs. Inputs may alias outputs; R and S must be distinct.
+  The caller hashes its message before calling; no low-S rewriting. }
+function NistEcdsaSign(Curve: Integer; const Priv, Hash: string; out R, S: string): Boolean;
 
 { the shared secret of ECDH (SP 800-56A 5.7.1.2), the x-coordinate of
   Priv times PeerPublic, as Go's ecdh.ECDH: False, Shared '', for a
@@ -4613,7 +4627,7 @@ begin
   end;
 end;
 
-{ ---- arithmetic modulo the order n (public values only) ---- }
+{ ---- fixed-size arithmetic modulo the public curve order n ---- }
 
 { C for the order whose big-endian bytes are NBytes (8 L of them):
   -1/n mod 2^64 by Newton's iteration, R^2 mod n by doubling }
@@ -4654,13 +4668,30 @@ begin
   C.RR := t;
 end;
 
+{ Reduce an L-word value with an extra high word, known below 2n.
+  Go bigmod/nat.go maybeSubtractModulus keeps the subtraction when it
+  did not underflow or the input overflowed its announced width. The
+  choice is a mask; neither scalar words nor carries control a branch. }
+procedure OrderReduce(const C: TOrder; var Z: TNat; Overflow: Integer);
+var
+  d: TNat;
+  j, borrow, mask: Integer;
+begin
+  borrow := 0;
+  for j := 0 to C.L - 1 do
+    d[j] := SubBorrow(Z[j], C.N[j], borrow, borrow);
+  mask := -(((Overflow or (-Overflow)) shr 63) or (borrow xor 1));
+  for j := 0 to C.L - 1 do
+    Z[j] := Z[j] xor ((Z[j] xor d[j]) and mask);
+end;
+
 { Z = A B / R mod n, for A, B below n: the Montgomery product, word by
-  word (CIOS), and one subtraction of n when the result reaches it }
+  word (CIOS), with a constant-time final reduction. Loop bounds and
+  addresses depend only on the public curve size. Z may alias A or B. }
 procedure OrderMontMul(const C: TOrder; var Z: TNat; const A, B: TNat);
 var
   t: TNatWide;
-  d: TNat;
-  i, j, L, cc, hi, lo, m, k, bw: Integer;
+  i, j, L, cc, hi, lo, m, k: Integer;
 begin
   L := C.L;
   for j := 0 to L + 1 do
@@ -4699,17 +4730,11 @@ begin
     t[L - 1] := AddCarry(t[L], cc, 0, k);
     t[L] := t[L + 1] + k;
   end;
-  bw := 0;
-  for j := 0 to L - 1 do
-    d[j] := SubBorrow(t[j], C.N[j], bw, bw);
   for j := 0 to 5 do
     Z[j] := 0;
-  if (t[L] <> 0) or (bw = 0) then
-    for j := 0 to L - 1 do
-      Z[j] := d[j]
-  else
-    for j := 0 to L - 1 do
-      Z[j] := t[j];
+  for j := 0 to L - 1 do
+    Z[j] := t[j];
+  OrderReduce(C, Z, t[L]);
 end;
 
 { Z = A B mod n }
@@ -4721,8 +4746,27 @@ begin
   OrderMontMul(C, Z, t, C.RR);
 end;
 
+{ Z = A + B mod n for reduced operands; Go bigmod/nat.go Add.
+  Preserve the high carry when selecting the subtraction. A temporary
+  keeps every input intact even when Z is A or B. }
+procedure OrderAdd(const C: TOrder; var Z: TNat; const A, B: TNat);
+var
+  sum: TNat;
+  j, cy: Integer;
+begin
+  for j := 0 to 5 do
+    sum[j] := 0;
+  cy := 0;
+  for j := 0 to C.L - 1 do
+    sum[j] := AddCarry(A[j], B[j], cy, cy);
+  OrderReduce(C, sum, cy);
+  Z := sum;
+end;
+
 { Z = A^(n-2) = 1/A mod n by Fermat's little theorem, as Go's ecdsa.go
-  inverse does with bigmod's Exp when it has no special routine }
+  inverse does with bigmod's Exp when it has no special routine. The
+  exponent bits and loop bounds are public and identical for every
+  scalar on a given curve; Montgomery products use masked reduction. }
 procedure OrderInverse(const C: TOrder; var Z: TNat; const A: TNat);
 var
   am, acc, one: TNat;
@@ -4772,16 +4816,6 @@ begin
   Result := b = 0;
 end;
 
-{ Z = Z - n }
-procedure OrderSubN(const C: TOrder; var Z: TNat);
-var
-  i, b: Integer;
-begin
-  b := 0;
-  for i := 0 to C.L - 1 do
-    Z[i] := SubBorrow(Z[i], C.N[i], b, b);
-end;
-
 { bigmod's SetBytes: Z from B, False when B overflows the limbs or is
   n or more }
 function OrderSetBytes(const C: TOrder; var Z: TNat; const B: string): Boolean;
@@ -4798,8 +4832,7 @@ function OrderSetOverflowingBytes(const C: TOrder; var Z: TNat; const B: string)
 begin
   if not OrderSetRaw(C, Z, B) then
     Exit(False);
-  if OrderGeq(C, Z) then
-    OrderSubN(C, Z);
+  OrderReduce(C, Z, 0);
   Result := True;
 end;
 
@@ -5071,6 +5104,140 @@ begin
   { the infinity's single byte cannot come from a scalar in [1, n-1] }
   if Length(Result) = 1 then
     Result := '';
+end;
+
+function NistGenerateKey(Curve: Integer): string;
+var
+  size, nr, used, count: Integer;
+begin
+  Result := '';
+  if Curve = NistP256 then
+    size := P256Len
+  else if Curve = NistP384 then
+    size := P384Len
+  else
+    Exit;
+  if Amd64 = 0 then nr := 278 else nr := 318;
+  SetLength(Result, size);
+  repeat
+    used := 0;
+    while used < size do
+    begin
+      { Go sysrand/rand_getrandom.go: retry EINTR and short reads.
+        The shared Syscall dispatcher releases scheduler capacity if
+        entropy must be awaited. Our kernel floor needs no fallback. }
+      repeat
+        count := Syscall(nr, Integer(@Result[used + 1]), size - used, 0);
+      until count <> -4;
+      if (count <= 0) or (count > size - used) then
+      begin
+        FillChar(Result[1], size, 0);
+        Result := '';
+        Exit;
+      end;
+      used := used + count;
+    end;
+    { FIPS 186-5 A.2.2 and Go ecdsa.randomPoint: reject outside
+      [1, n-1], never reduce an equal-width random candidate modulo n. }
+  until PrivValid(Curve, Result);
+end;
+
+{ RFC 6979 uses the same hash for HMAC and the supplied message digest.
+  This dispatch depends only on the public curve, never on a key byte. }
+function NistSignHmac(Curve: Integer; const Key, Data: string): string;
+begin
+  if Curve = NistP256 then
+    Result := HmacSha256(Key, Data)
+  else
+    Result := HmacSha384(Key, Data);
+end;
+
+function NistEcdsaSign(Curve: Integer; const Priv, Hash: string; out R, S: string): Boolean;
+var
+  c: TOrder;
+  d, e, nonce, inverse, rn, sn, product: TNat;
+  p256: TP256Point;
+  p384: TP384Point;
+  privateBytes, hashBytes, key, value, seed, x: string;
+  size, i: Integer;
+  ok: Boolean;
+begin
+  { A const parameter aliases its caller. Preserve both descriptors
+    before clearing an out argument that may name that same variable. }
+  privateBytes := Priv;
+  hashBytes := Hash;
+  R := '';
+  S := '';
+  Result := False;
+  if @R = @S then
+    Exit;
+  if Curve = NistP256 then
+    c := Ord256
+  else if Curve = NistP384 then
+    c := Ord384
+  else
+    Exit;
+  size := 8 * c.L;
+  if (Length(privateBytes) <> size) or (Length(hashBytes) <> size) then
+    Exit;
+  if not PrivValid(Curve, privateBytes) then
+    Exit;
+  ok := OrderSetRaw(c, d, privateBytes);
+  OrderHashToNat(c, e, hashBytes);
+  seed := privateBytes + OrderBytes(c, e);  { int2octets(d) || bits2octets(h) }
+  SetLength(key, size);
+  SetLength(value, size);
+  for i := 1 to size do
+  begin
+    key[i] := #0;
+    value[i] := #1;
+  end;
+  { RFC 6979 3.2 b-g; Go ecdsa/hmacdrbg.go newDRBG. State is local
+    to this signature, including concurrent calls with different keys. }
+  key := NistSignHmac(Curve, key, value + #0 + seed);
+  value := NistSignHmac(Curve, key, value);
+  key := NistSignHmac(Curve, key, value + #1 + seed);
+  value := NistSignHmac(Curve, key, value);
+  repeat
+    { Here hlen = qlen = 256 or 384, so one HMAC fills T exactly.
+      Compare the candidate to n: reducing it would bias the nonce. }
+    value := NistSignHmac(Curve, key, value);
+    if OrderSetBytes(c, nonce, value) then
+      if not OrderIsZero(c, nonce) then
+      begin
+        if Curve = NistP256 then
+        begin
+          P256ScalarBaseMult(p256, value);
+          ok := P256PointBytesX(p256, x);
+        end
+        else
+        begin
+          P384ScalarBaseMult(p384, value);
+          ok := P384PointBytesX(p384, x);
+        end;
+        if ok then
+        begin
+          ok := OrderSetOverflowingBytes(c, rn, x);
+          if not OrderIsZero(c, rn) then
+          begin
+            OrderInverse(c, inverse, nonce);
+            OrderMul(c, product, rn, d);
+            OrderAdd(c, product, product, e);
+            OrderMul(c, sn, product, inverse);
+            if not OrderIsZero(c, sn) then
+            begin
+              R := OrderBytes(c, rn);
+              S := OrderBytes(c, sn);
+              Exit(True);
+            end;
+          end;
+        end;
+      end;
+    { RFC 6979 3.2 h and 3.4: advance K/V for an out-of-range or
+      unsuitable candidate, including a zero signature component. }
+    key := NistSignHmac(Curve, key, value + #0);
+    value := NistSignHmac(Curve, key, value);
+  until False;
 end;
 
 function NistEcdh(Curve: Integer; const Priv, PeerPublic: string; out Shared: string): Boolean;

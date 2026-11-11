@@ -143,6 +143,10 @@ GOLDEN_A64 += propfield
 GOLDEN += callprovenance
 GOLDEN_A64 += callprovenance
 
+# P594: RFC6979 signing, fixed-width ES256/ES384 and secure key generation.
+GOLDEN += nistsign
+GOLDEN_A64 += nistsign
+
 # P166: record operands bind once, including a with inside recursion.
 GOLDEN += withonce withcapture withmap
 GOLDEN_A64 += withonce withcapture withmap
@@ -1278,6 +1282,13 @@ bench-servers: $(OUTDIR)/paslangc core libs
 check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch64
 	@python3 scripts/check_recipes.py
 	@set -e; \
+	: P594: deterministic ECDSA raw signatures and key generation across CPU, inline and GC modes; \
+	python3 -I scripts/check_nist_sign.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64); \
+	python3 -I scripts/check_nist_order.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64); \
+	python3 -I scripts/check_nist_faults.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64); \
+	python3 -I scripts/check_nist_ct.py $(OUTDIR)/paslangc $(BUILDDIR); \
+	echo ok nist-sign
+	@set -e; \
 	: P576: lifecycle faults, independent eligibility, metadata and real stop-room ownership; \
 	python3 -I scripts/check_unit_life.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64); \
 	echo ok unit-life
@@ -1488,7 +1499,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/stackmap.out $(BUILDDIR)/stackmap.vgot; \
 	echo ok stackmaps; \
 	echo "==== the base processor (-cpu base) ===="; \
-	for t in vectors vecmore vecpool bitwords xxh3 inlineasm hash1 tree1 store1 mapsplit set256 strwords strkern strcmpk cmpwords sysutils1 utf8kern jsonkern longslice rtlong fillkern json1 jsoncanon hmacstream hashpieces hashpieces2 cipherkat cipherwyche x25519kat nistwyche rsawyche fmafused; do \
+	for t in vectors vecmore vecpool bitwords xxh3 inlineasm hash1 tree1 store1 mapsplit set256 strwords strkern strcmpk cmpwords sysutils1 utf8kern jsonkern longslice rtlong fillkern json1 jsoncanon hmacstream hashpieces hashpieces2 cipherkat cipherwyche x25519kat nistwyche nistsign rsawyche fmafused; do \
 	  $(OUTDIR)/paslangc -cpu base -o $(BUILDDIR)/$$t-base testdata/$$t.paslang; \
 	  $(BUILDDIR)/$$t-base > $(BUILDDIR)/$$t.bgot; \
 	  diff -u testdata/$$t.out $(BUILDDIR)/$$t.bgot; \
@@ -1563,7 +1574,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -qw 'ptest' $(BUILDDIR)/set256-v2.s; \
 	if grep -qw 'vptest' $(BUILDDIR)/set256-v2.s; then echo "set256-v2.s carries AVX2"; exit 1; fi; \
 	: a program for the base processor links no instruction past it, P268: inlineasm writes AVX2 itself and strkern calls the AVX2 kernels to test them; \
-	for t in vectors vecmore vecpool bitwords xxh3 hash1 tree1 store1 mapsplit set256 strwords strcmpk cmpwords sysutils1 utf8kern jsonkern longslice rtlong fillkern json1 jsoncanon hmacstream cipherkat cipherwyche x25519kat nistwyche rsawyche; do \
+	for t in vectors vecmore vecpool bitwords xxh3 hash1 tree1 store1 mapsplit set256 strwords strcmpk cmpwords sysutils1 utf8kern jsonkern longslice rtlong fillkern json1 jsoncanon hmacstream cipherkat cipherwyche x25519kat nistwyche nistsign rsawyche; do \
 	  python3 -I scripts/check_cpubin.py base $(BUILDDIR)/$$t-base > /dev/null || { python3 -I scripts/check_cpubin.py base $(BUILDDIR)/$$t-base; exit 1; }; \
 	done; \
 	: the UTF-8 kernels against the strict decoder of Python, P201: the expected output is the model output; \
@@ -5689,7 +5700,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	test "$$ticks" -lt 20; \
 	echo "ok idlecpu ($$ticks user ticks after one second)"; \
 	echo "==== examples ===="; \
-	for t in hello values control routines varargs records scopedtypes classes registry helpers convert report money systemerrors boundedfiles filemetadata directories paths environments processes temporaryresources systempaths textbuilding textencoding textbuffers valuehelpers identifiers generics errors excobjects bank concurrent blockedio fanin maps sync wordcount strings maths narrow pointers single quad bits rotations carry bigrot bitfields wide atomics views vectors machine assembly hashes closures slices properties cleanup pipeline kvstore sorting timeout digest bitmap trees dates jsonread jsonwrite jsonlang jsonbind jsonunbind jsonstream; do \
+	for t in hello values control routines varargs records scopedtypes classes registry helpers convert report money signatures systemerrors boundedfiles filemetadata directories paths environments processes temporaryresources systempaths textbuilding textencoding textbuffers valuehelpers identifiers generics errors excobjects bank concurrent blockedio fanin maps sync wordcount strings maths narrow pointers single quad bits rotations carry bigrot bitfields wide atomics views vectors machine assembly hashes closures slices properties cleanup pipeline kvstore sorting timeout digest bitmap trees dates jsonread jsonwrite jsonlang jsonbind jsonunbind jsonstream; do \
 	  $(OUTDIR)/paslangc -o $(BUILDDIR)/ex_$$t examples/$$t.paslang; \
 	  $(BUILDDIR)/ex_$$t > $(BUILDDIR)/ex_$$t.got; \
 	  diff -u examples/$$t.out $(BUILDDIR)/ex_$$t.got; \
@@ -6381,7 +6392,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	diff -u testdata/cputuse.out $(BUILDDIR)/cputuse-arm.got
 	@set -e; \
 	echo "==== the base processor arm64 ===="; \
-	for t in hash1 tree1 store1 vectors bitwords set256 strwords strkern strcmpk cmpwords sysutils1 utf8kern jsonkern longslice rtlong fillkern json1 jsoncanon hmacstream hashpieces hashpieces2 cipherkat cipherwyche x25519kat nistwyche rsawyche; do \
+	for t in hash1 tree1 store1 vectors bitwords set256 strwords strkern strcmpk cmpwords sysutils1 utf8kern jsonkern longslice rtlong fillkern json1 jsoncanon hmacstream hashpieces hashpieces2 cipherkat cipherwyche x25519kat nistwyche nistsign rsawyche; do \
 	  $(OUTDIR)/paslangc -target arm64 -cpu base -o $(BUILDDIR)/$$t-arm-base testdata/$$t.paslang; \
 	  timeout 120 $(QEMU_A64) $(BUILDDIR)/$$t-arm-base > $(BUILDDIR)/$$t-arm.bgot; \
 	  diff -u testdata/$$t.out $(BUILDDIR)/$$t-arm.bgot; \
@@ -6727,7 +6738,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	done; \
 	echo ok deadlock-arm; \
 	echo "==== examples arm64 ===="; \
-	for t in hello values control routines varargs records scopedtypes classes registry helpers convert report money systemerrors boundedfiles filemetadata directories paths environments processes temporaryresources systempaths textbuilding textencoding textbuffers valuehelpers identifiers generics errors excobjects bank concurrent blockedio fanin maps sync wordcount strings maths narrow pointers single quad bits rotations carry bigrot bitfields wide atomics views vectors machine assembly hashes closures slices properties cleanup pipeline kvstore sorting timeout digest bitmap trees dates jsonread jsonwrite jsonlang jsonbind jsonunbind jsonstream; do \
+	for t in hello values control routines varargs records scopedtypes classes registry helpers convert report money signatures systemerrors boundedfiles filemetadata directories paths environments processes temporaryresources systempaths textbuilding textencoding textbuffers valuehelpers identifiers generics errors excobjects bank concurrent blockedio fanin maps sync wordcount strings maths narrow pointers single quad bits rotations carry bigrot bitfields wide atomics views vectors machine assembly hashes closures slices properties cleanup pipeline kvstore sorting timeout digest bitmap trees dates jsonread jsonwrite jsonlang jsonbind jsonunbind jsonstream; do \
 	  $(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/ex_$$t-arm examples/$$t.paslang; \
 	  timeout 60 $(QEMU_A64) $(BUILDDIR)/ex_$$t-arm > $(BUILDDIR)/ex_$$t-arm.got; \
 	  diff -u examples/$$t.out $(BUILDDIR)/ex_$$t-arm.got; \
