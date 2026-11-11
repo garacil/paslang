@@ -14453,7 +14453,13 @@ SysUtils is what turns run-time errors into exceptions there too:
 `E.Message` is the runtime's line without `paslang: `
 (`index 10 out of range [0..4] at line 12`, and `at line 12 of unit U`
 for a failure inside a unit, P572) and `ExceptAddr` the code that
-failed. The rule is the running routine's: inside a `try` of its own or
+failed. Initialization and finalization blocks of ordinary units follow
+this rule too (P576): each block with no `asm` can take its own checked
+or memory failure, run its `finally` cleanup and continue. Eligibility
+is decided for each block separately; `asm` in initialization does not
+exclude an ordinary finalization, nor the reverse. The runtime units
+pasheap, pasroutines and pasdebug stay excluded (P588). The rule is the
+running routine's: inside a `try` of its own or
 of a routine that called it (a `finally` and a `lock` block count) the
 failure is raised and unwinds as any `raise` does (§9), the `finally`
 parts and the locks on the way included, and the handler that takes it

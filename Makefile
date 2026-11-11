@@ -1278,6 +1278,10 @@ bench-servers: $(OUTDIR)/paslangc core libs
 check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch64
 	@python3 scripts/check_recipes.py
 	@set -e; \
+	: P576: lifecycle faults, independent eligibility, metadata and real stop-room ownership; \
+	python3 -I scripts/check_unit_life.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64); \
+	echo ok unit-life
+	@set -e; \
 	: P589: exact declaration provenance preserves value snapshots and the existing core borrowing contract; \
 	python3 -I scripts/check_call_provenance.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64) $(STAGE_DIR); \
 	echo ok call-provenance

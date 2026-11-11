@@ -25,7 +25,7 @@ rt_morestack and the M's stack: the call of rt_morestack and the words
 and rt_asyncpreempt, which rt_sigurg enters only with room) is named
 with --room=NAME, or NAME:BYTES when it writes BYTES before it counts.
 
-A routine of the pasasync table (its .section pasasync.NAME) may be
+A routine or block of the pasasync table (its actual start label) may be
 stopped by rt_sigurg at any instruction, and the stop writes --async=N
 bytes below its stack pointer (the runtime's AsyncRoom: rt_sigurg asks
 for them above the real guard, as Go's isAsyncSafePoint asks for
@@ -59,12 +59,35 @@ def routines(lines):
 
 
 def asyncs(lines):
-    """the routines of the pasasync table"""
-    out = set()
-    for l in lines:
-        m = re.match(r"^\.section pasasync\.([\w.]+),", l.strip())
-        if m:
-            out.add(m.group(1))
+    """Resolve each actual table start label to its containing function.
+
+    A plain .text piece holds main or several lifecycle ranges; its
+    section suffix is not a function name (P576). Keep the table's
+    first label, including a label past an entry's stack check.
+    """
+    owners, name = {}, None
+    for line in lines:
+        text = line.strip()
+        global_label = re.fullmatch(r"([A-Za-z_][\w.]*):", text)
+        if global_label:
+            name = global_label.group(1)
+        label = re.fullmatch(r"([.\w]+):", text)
+        if label and name is not None:
+            owners[label.group(1)] = name
+    out, table = set(), False
+    for line in lines:
+        text = line.strip()
+        if text.startswith('.section '):
+            table = re.match(r'^\.section pasasync(?:[.,\s])', text) is not None
+        if not table or not text.startswith('.quad '):
+            continue
+        words = [word.strip() for word in text[6:].split(',')]
+        if len(words) % 2:
+            raise SystemExit('check_stack: async range is not a pair: ' + text)
+        for start in words[::2]:
+            if start not in owners:
+                raise SystemExit('check_stack: async start ' + start + ' has no owning routine')
+            out.add(owners[start])
     return out
 
 

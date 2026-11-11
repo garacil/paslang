@@ -4,9 +4,9 @@
 # paslang is free software under the GNU General Public License,
 # version 3 or (at your option) any later version; see the file COPYING.
 """The pasasync table of an executable (P293): every entry is the code of
-one routine paslangc compiled, so rt_sigurg stops a routine only there.
+one routine or lifecycle block paslangc compiled, so rt_sigurg stops a routine only there.
 
-Each (start, end) pair must start in a routine (p_... or pas_main), at
+Each (start, end) pair must start in a routine (p_..., pas_main or u_..._init/fini), at
 its symbol or after the stack check of its prologue, end after it, and
 hold no symbol of the runtime (rt_...) or _start: an entry that spans
 the runtime would let a signal stop a routine inside the allocator or
@@ -21,6 +21,7 @@ any machine.
 """
 
 import bisect
+import re
 import importlib.util
 from pathlib import Path
 import struct
@@ -132,7 +133,7 @@ def main():
         k = bisect.bisect_right(syms, start)
         base = syms[k - 1] if k else 0
         own = names.get(base, [])
-        if not any(x.startswith("p_") or x == "pas_main" for x in own):
+        if not any(x.startswith("p_") or x == "pas_main" or re.fullmatch(r"u_[\w.]+_(?:init|fini)", x) for x in own):
             raise SystemExit(f"{sys.argv[1]}: entry {start:#x}-{end:#x} starts in no routine ({own})")
         if start - base > 64:
             raise SystemExit(f"{sys.argv[1]}: entry {start:#x}-{end:#x} starts {start - base} bytes into {own[0]}, past a stack check")

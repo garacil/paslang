@@ -1293,7 +1293,7 @@ type
     function NormLabels(const T: string): string;
     function EmitFlat(const Pr: TProc): Boolean;
     function HasAsm(S: PStmt): Boolean;
-    procedure MainAsync;
+    procedure PlainAsync(const Entry: string);
     procedure NoteName(const N: string);
     function RoutNamed(const N: string): Boolean;
     procedure NameScanE(E: PExpr);
@@ -3332,7 +3332,45 @@ end;
 procedure TEmitter.EmitUnitLife(const Prog: TProgram);
 var
   uname, onceSym, initSym, finiSym, ret: string;
-  i: SizeInt;
+  i, line0: SizeInt;
+
+  { The combined lifecycle record is laid out init hot/cold, then fini
+    hot/cold. Once init is complete, preserve that slice in actual code
+    order and mark it complete, before LinesOut's two passes for fini.
+    No change to the record format or to its DWARF sequence boundaries. }
+  procedure FinishInitLines;
+  var
+    j, k, n: SizeInt;
+    pass: LongInt;
+    cold: Boolean;
+    labs: array of string;
+    nums: array of LongInt;
+  begin
+    cold := False;
+    for j := line0 to High(FLineCold) do
+      if FLineCold[j] then
+        cold := True;
+    if not cold then
+      Exit;
+    n := Length(FLineLabs) - line0;
+    SetLength(labs, n);
+    SetLength(nums, n);
+    k := 0;
+    for pass := 0 to 1 do
+      for j := line0 to High(FLineLabs) do
+        if FLineCold[j] = (pass = 1) then
+        begin
+          labs[k] := FLineLabs[j];
+          nums[k] := FLineNums[j];
+          Inc(k);
+        end;
+    for j := 0 to n - 1 do
+    begin
+      FLineLabs[line0 + j] := labs[j];
+      FLineNums[line0 + j] := nums[j];
+      FLineCold[line0 + j] := False;
+    end;
+  end;
 begin
   uname := ToLower(Prog.Name);
   onceSym := 'u_' + uname + '_once';
@@ -3347,6 +3385,11 @@ begin
   FScratchOff := 0;
   FScratchCur := 0;
   FScratchMax := 0;
+  { Each life block decides eligibility from its own body (P576).
+    Keep P588's runtime-unit exclusion. No runtime or signal rule changes. }
+  FAsyncOK := (not FRtUnit) and not HasAsm(Prog.InitBody);
+  FAsyncFrom := '';
+  line0 := Length(FLineLabs);
   FFrameSym := '.Lfr' + initSym;
   CpuNote(initSym, Prog.MainCpu, Prog.MainTune);
   Line('.globl ' + initSym);
@@ -3377,9 +3420,13 @@ begin
     Line('  ldp x29, x30, [sp], #16');
     Line('  ret');
     ColdFlush(False);
+    PlainAsync(initSym);
+    FinishInitLines;
     SetFrame(FFrameSym, 0);
     Line('.globl ' + finiSym);
     Line(finiSym + ':');
+    FAsyncOK := (Prog.FiniBody <> nil) and (not FRtUnit) and not HasAsm(Prog.FiniBody);
+    FAsyncFrom := '';
     if Prog.FiniBody <> nil then
     begin
       FScratchMax := 0;
@@ -3396,6 +3443,7 @@ begin
       Line('  ldp x29, x30, [sp], #16');
       Line('  ret');
       ColdFlush(False);
+      PlainAsync(finiSym);
       SetFrame(FFrameSym, 0);
     end
     else
@@ -3425,9 +3473,13 @@ begin
     Line('  leave');
     Line('  ret');
     ColdFlush(False);
+    PlainAsync(initSym);
+    FinishInitLines;
     SetFrame(FFrameSym, 0);
     Line('.globl ' + finiSym);
     Line(finiSym + ':');
+    FAsyncOK := (Prog.FiniBody <> nil) and (not FRtUnit) and not HasAsm(Prog.FiniBody);
+    FAsyncFrom := '';
     if Prog.FiniBody <> nil then
     begin
       FScratchMax := 0;
@@ -3443,6 +3495,7 @@ begin
       Line('  leave');
       Line('  ret');
       ColdFlush(False);
+      PlainAsync(finiSym);
       SetFrame(FFrameSym, 0);
     end
     else
@@ -40666,7 +40719,7 @@ begin
   { A loop of a routine in the pasasync table tests nothing at its
     passes (P293): rt_sigurg stops the routine wherever it runs, as Go's
     loops test nothing and its signals preempt them. A routine with asm,
-    or a unit's life block, keeps its loops' tests. }
+    or a life block excluded by the same policy, keeps its loops' tests. }
   if FAsyncOK and (Frame = '16') then
     Exit;
   { A loop head inside a promoted loop: nothing in the loop calls, so the
@@ -41128,10 +41181,12 @@ begin
   FFailHere := False;
 end;
 
-{ The main block's code for rt_sigurg (P293), as EmitProc gives each
-  routine's: in the piece of the plain .text, since the main block sits
-  there with the runtime (P388). }
-procedure TEmitter.MainAsync;
+{ Plain .text code for rt_sigurg (P293), as EmitProc gives each
+  routine's: the main block and each unit life block have their own
+  range, past its own prologue check and through its cold failures.
+  Go calls init functions as ordinary functions (runtime/proc.go doInit1)
+  and excludes runtime/asm from unsafe preemption (preempt.go, P588). }
+procedure TEmitter.PlainAsync(const Entry: string);
 var
   e: string;
 begin
@@ -41143,9 +41198,9 @@ begin
     MapOutLine('.balign 8');
     { from after the prologue's stack check, as a routine's }
     if FAsyncFrom = '' then
-      FAsyncFrom := 'pas_main';
+      FAsyncFrom := Entry;
     MapOutLine('  .quad ' + FAsyncFrom + ', ' + e);
-    { the main block's call sites follow, in the plain .text's piece }
+    { this block's call sites follow in the plain .text's piece }
     MapOutLine(PlainMapSec('pasgcmaps'));
   end;
   FAsyncOK := False;
@@ -55087,7 +55142,7 @@ begin
       Line('  .cfi_endproc');
       if FDebug then
         Line('.Lmainend:');
-      MainAsync;
+      PlainAsync('pas_main');
       SetFrame(FFrameSym, 0);
     end
     else
@@ -55132,7 +55187,7 @@ begin
       Line('  .cfi_endproc');
       if FDebug then
         Line('.Lmainend:');
-      MainAsync;
+      PlainAsync('pas_main');
       SetFrame(FFrameSym, 0);
     end;
   end;
