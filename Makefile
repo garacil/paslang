@@ -139,6 +139,10 @@ GOLDEN_A64 += loopmaporder
 GOLDEN += propfield
 GOLDEN_A64 += propfield
 
+# P577: a debugger can still stop around calls put in as expressions.
+GOLDEN += inlinebreak
+GOLDEN_A64 += inlinebreak
+
 # P589: value snapshots do not depend on a routine or unit name prefix.
 GOLDEN += callprovenance
 GOLDEN_A64 += callprovenance
@@ -1323,6 +1327,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	python3 -I scripts/check_gdbstub_threads.py $(BUILDDIR) $(QEMU_A64) 20; \
 	echo ok gdbstub-threads
 	@python3 scripts/check_debug_growth.py "$(OUTDIR)/paslangc" "$(BUILDDIR)" $(QEMU_A64)
+	@python3 -I scripts/check_inline_place.py "$(OUTDIR)/paslangc" "$(BUILDDIR)" $(QEMU_A64)
 	@sh scripts/check_bootstrap.sh "$(BUILDDIR)" $(QEMU_A64) $(CORE_UNITS)
 	@sh scripts/check_cpufeat.sh "$(OUTDIR)/paslangc" "$(BUILDDIR)" $(QEMU_A64)
 	@set -e; \
@@ -4214,7 +4219,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/sliceoob testdata/sliceoob.paslang; \
 	if $(BUILDDIR)/sliceoob > $(BUILDDIR)/sliceoob.got 2> $(BUILDDIR)/sliceoob.err; then echo "sliceoob ran past the end of its slice"; exit 1; fi; \
 	diff -u testdata/sliceoob.out $(BUILDDIR)/sliceoob.got; \
-	grep -q 'index 2 out of range \[0..1\] at line 25' $(BUILDDIR)/sliceoob.err; \
+	grep -q 'index 2 out of range \[0..1\] at line 13' $(BUILDDIR)/sliceoob.err; \
 	echo ok sliceat-asm; \
 	: Move whose arguments call nothing sets its three registers with no push, P399; \
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/moveregs0 testdata/moveregs.paslang; \
@@ -5568,8 +5573,8 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'paslang: nil pointer dereference at line 19' $(BUILDDIR)/fatal_nilbig.err; \
 	grep -q 'paslang: nil pointer dereference at line 17' $(BUILDDIR)/fatal_nilzero.err; \
 	grep -q 'paslang: nil pointer dereference at line 19' $(BUILDDIR)/fatal_nildest.err; \
-	: P369: a method put in place on a nil object stops at the line of its call; \
-	grep -q 'paslang: nil pointer dereference at line 24' $(BUILDDIR)/fatal_nilmeth.err; \
+	: P577: a method put in place on a nil object stops at the line of its field access; \
+	grep -q 'paslang: nil pointer dereference at line 13' $(BUILDDIR)/fatal_nilmeth.err; \
 	: P373: an index kept in the pool register that worked it out reports its value; \
 	grep -q 'paslang: index 9 out of range \[0..7\] at line 20' $(BUILDDIR)/fatal_elemidx.err; \
 	grep -q 'paslang: nil pointer dereference at line 16' $(BUILDDIR)/fatal_nilptr.err; \
@@ -5994,7 +5999,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	$(OUTDIR)/paslangc -target arm64 -cpu max -Fu $(A64DIR) -o $(BUILDDIR)/sliceoob-arm testdata/sliceoob.paslang; \
 	if timeout 300 $(QEMU_A64) $(BUILDDIR)/sliceoob-arm > $(BUILDDIR)/sliceoob-arm.got 2> $(BUILDDIR)/sliceoob-arm.err; then echo "sliceoob-arm ran past the end of its slice"; exit 1; fi; \
 	diff -u testdata/sliceoob.out $(BUILDDIR)/sliceoob-arm.got; \
-	grep -q 'index 2 out of range \[0..1\] at line 25' $(BUILDDIR)/sliceoob-arm.err; \
+	grep -q 'index 2 out of range \[0..1\] at line 13' $(BUILDDIR)/sliceoob-arm.err; \
 	echo ok sliceat-arm-asm; \
 	: P399 on arm64: Move sets x1, x0 and x2 with no push; \
 	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/moveregs0-arm testdata/moveregs.paslang; \
@@ -6624,7 +6629,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	grep -q 'paslang: nil pointer dereference at line 19' $(BUILDDIR)/fatal_nilbig-arm.err; \
 	grep -q 'paslang: nil pointer dereference at line 17' $(BUILDDIR)/fatal_nilzero-arm.err; \
 	grep -q 'paslang: nil pointer dereference at line 19' $(BUILDDIR)/fatal_nildest-arm.err; \
-	grep -q 'paslang: nil pointer dereference at line 24' $(BUILDDIR)/fatal_nilmeth-arm.err; \
+	grep -q 'paslang: nil pointer dereference at line 13' $(BUILDDIR)/fatal_nilmeth-arm.err; \
 	grep -q 'paslang: index 9 out of range \[0..7\] at line 20' $(BUILDDIR)/fatal_elemidx-arm.err; \
 	grep -q 'paslang: nil pointer dereference at line 16' $(BUILDDIR)/fatal_nilptr-arm.err; \
 	grep -q 'paslang: nil pointer dereference at line 14' $(BUILDDIR)/fatal_leafnil-arm.err; \

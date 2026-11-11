@@ -2727,9 +2727,12 @@ makes no call goes in as that expression wherever it is used (1.1.112),
 in a condition or an operand as well, each argument standing for its
 parameter when it is a constant or cannot fail, and a `var` parameter
 given a variable being that variable (1.1.126), and a method's object
-being its `Self` when it is a variable (1.1.221); a stop in such an
-expression, a nil object's field, names the line of the call, where at
-`-inline 0` it names the routine's. The
+being its `Self` when it is a variable (1.1.221). A failure inside the
+copied expression names the operation's own source line, including
+constant and variable indexes, a division or a nil object's field, with
+the same line at
+`-inline 0`. An argument that fails names its own line at the call.
+The
 output of a program is the same at every level: `testdata/inline1`
 runs under `make check` both ways. `-inline-trace` says on the error
 output why a routine called in one of those places stays a call; a

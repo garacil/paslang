@@ -64,6 +64,8 @@ Source files use the `.paslang` extension.
   `TObject`; `raise` carries an object of any class, and an `except`
   part picks it by class with `on E: T do` handlers. The object belongs
   to the routine that raised it, and the collector takes it back.
+  Runtime failures report the operation's source line, including inside
+  an inlined expression; changing the inlining level preserves that line.
   Class methods and class references, `array of const`, default
   parameters on methods, sets of `Char` and of `Byte`, subranges of
   `Char` and of an enumeration, and helpers (`type helper for string`)
