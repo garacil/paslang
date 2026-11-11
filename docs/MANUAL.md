@@ -2662,8 +2662,10 @@ taken, and the routine wrote one type's bytes into a variable of
 another).
 A parameter without them is a copy: a routine that changes its string,
 record or array parameter changes its own copy, and the caller's
-variable keeps its value (a routine that only reads it pays nothing for
-the copy). The elements of a dynamic array are shared, as the array is
+variable keeps its value. A routine may avoid the copy only when
+neither its body nor a routine it calls can change that caller storage;
+the spelling of a routine's name changes no value-parameter guarantee
+(P589). The elements of a dynamic array are shared, as the array is
 a reference. A `const` parameter is the caller's value itself (1.1.1):
 nothing is copied or marked on the way in, so a hash of a megabyte
 passed as `const` costs the hash alone, and the caller's next write to
