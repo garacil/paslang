@@ -28,7 +28,7 @@ def body(lines, name):
         raise SystemExit(f'no routine {name}')
     out = []
     for line in lines[k + 1:]:
-        if re.match(r'^p_[a-z0-9_]+:$', line):
+        if re.match(r'^p_[a-z0-9_.]+:$', line):
             break
         if line.lstrip().startswith('.') or re.match(r'^\.L[A-Za-z0-9_]*:$', line):
             continue
@@ -77,7 +77,7 @@ def main():
             return False
         return bool(valmove.match(after))
 
-    for name, callee, n in (('p_loopcalls', 'p_step', 2), ('p_chain', 'p_mknode', 2)):
+    for name, callee, n in (('p_f.0_9_loopcalls', 'p_f.0_4_step', 2), ('p_f.0_5_chain', 'p_f.0_6_mknode', 2)):
         cs = calls(body(lines, name), callee, arm)
         if len(cs) != 1:
             raise SystemExit(f'{path}: {name} calls {callee} {len(cs)} times, once expected')
@@ -87,8 +87,8 @@ def main():
                              f'{before} / {after}')
     ok = 0
     total = 0
-    for callee in ('p_twice', 'p_tag'):
-        for before, after in calls(body(lines, 'p_sums'), callee, arm):
+    for callee in ('p_f.0_5_twice', 'p_f.0_3_tag'):
+        for before, after in calls(body(lines, 'p_f.0_4_sums'), callee, arm):
             total += 1
             first = [l for l in before if argmove(0).match(l)]
             if first and valmove.match(after) and not any(frame.search(l) for l in first):

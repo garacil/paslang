@@ -30,8 +30,8 @@ on arm64, or the adrp of a global destination, or the add of a far
 frame word's address into x16), and each one --short
 names is at most N instructions, ret and labels not counted.
 
-usage: check_resbuf.py file.s [--arm] --routines=p_a,p_b --dest=N
-       check_resbuf.py file.s [--arm] --regs=p_a,p_b [--short=p_a:2]
+usage: check_resbuf.py file.s [--arm] --routines=p_f.0_1_a,p_f.0_1_b --dest=N
+       check_resbuf.py file.s [--arm] --regs=p_f.0_1_a,p_f.0_1_b [--short=p_f.0_1_a:2]
        check_resbuf.py --all dir...
 """
 

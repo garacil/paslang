@@ -24,9 +24,14 @@ import subprocess
 import sys
 import tempfile
 from typing import NamedTuple
+import runpy
+
+_symbols = runpy.run_path(str(Path(__file__).with_name('asm_symbols.py')))
+procedure_symbol = _symbols['procedure_symbol']
 
 
-ROUTINES = tuple('p_' + name for name in
+
+ROUTINES = tuple(procedure_symbol('', name) for name in
                  ('workrepeat', 'workpost', 'worknested', 'workregions',
                   'workislands', 'coldread'))
 EXPECTED = 'loopmaporder ok\n'
@@ -313,9 +318,9 @@ def object_maps(elf, calls, ordered, inline):
             require(descriptors[pc][0] & 255 == kind,
                     name + ': descriptor kind mismatch at ' + hex(pc) + '; expected ' + str(kind))
         result[name] = descriptors
-    island_calls = [target for _, target in calls['p_workislands']]
-    require(('p_addisland591' in island_calls) == (inline == 0),
-            'p_workislands: AddIsland591 must remain at inline 0 and actually inline at 40')
+    island_calls = [target for _, target in calls['p_f.0_11_workislands']]
+    require(('p_f.0_12_addisland591' in island_calls) == (inline == 0),
+            'p_f.0_11_workislands: AddIsland591 must remain at inline 0 and actually inline at 40')
     return result
 
 
@@ -334,7 +339,7 @@ def object_link_pairing(obj, executable, object_descriptors, descriptors):
 
 def negative_controls(descriptors):
     """Mutate decoded metadata only; no forged binary is written or executed."""
-    expected = dict(descriptors['p_workrepeat'])
+    expected = dict(descriptors['p_f.0_10_workrepeat'])
     pcs = sorted(expected)
 
     def rejected(action, diagnostic):

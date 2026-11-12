@@ -10,7 +10,7 @@ word (pushq on amd64, str ... [sp, #-16]! on arm64 with --arm) and pops
 none, the frame's own aside. The routines are testdata/manyargs's
 ByDirect, ByMethod and ByValue unless --routines names others.
 
-usage: check_argpush.py file.s [--arm] [--routines=p_a,p_b,...]
+usage: check_argpush.py file.s [--arm] [--routines=p_f.0_1_a,p_f.0_1_b,...]
 """
 
 import re
@@ -20,7 +20,7 @@ import sys
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     arm = "--arm" in sys.argv[1:]
-    routines = ["p_bydirect", "p_bymethod", "p_byvalue"]
+    routines = ["p_f.0_8_bydirect", "p_f.0_8_bymethod", "p_f.0_7_byvalue"]
     for a in sys.argv[1:]:
         if a.startswith("--routines="):
             routines = a.split("=", 1)[1].split(",")

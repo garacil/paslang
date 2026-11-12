@@ -32,11 +32,11 @@ def main():
     bad = []
     push = re.compile(r'^str x0, \[sp, #-16\]!|^stp x0, ') if arm else re.compile(r'^pushq ')
     want = {
-        'p_globals': ['addq $1, v_g(%rip)', 'addq $7, v_g(%rip)', 'subq $1, v_g(%rip)',
+        'p_f.0_7_globals': ['addq $1, v_g(%rip)', 'addq $7, v_g(%rip)', 'subq $1, v_g(%rip)',
                       'addw $30000, v_g16(%rip)', 'addb $100, v_g8(%rip)',
                       'addl $-1, v_gu(%rip)', 'addq $-2147483648, v_g(%rip)'],
-        'p_tc_bump': ['addq $1, 8(%rdi)', 'addq $5, 8(%rdi)', 'subq $2, 8(%rdi)'],
-        'p_tc_other': ['subw $1, 16(%rsi)', 'addq $1000, 24(%rsi)'],
+        'p_m.10_t_u.0_2_tc4_bump': ['addq $1, 8(%rdi)', 'addq $5, 8(%rdi)', 'subq $2, 8(%rdi)'],
+        'p_m.10_t_u.0_2_tc5_other': ['subw $1, 16(%rsi)', 'addq $1000, 24(%rsi)'],
     }
     for r, ins in want.items():
         b = body(lines, r)

@@ -29,9 +29,9 @@ def main():
     bad, seen = [], set()
     fn, inloop = "", False
     for n, line in enumerate(lines):
-        m = re.match(r"^(p_[A-Za-z0-9_]+|rt_[A-Za-z0-9_]+|pas_main):$", line)
+        m = re.match(r"^(p_[A-Za-z0-9_.]+|rt_[A-Za-z0-9_]+|pas_main):$", line)
         if m:
-            fn = m.group(1) if m.group(1).startswith("p_mix") else ""
+            fn = m.group(1) if re.match(r"^p_f[.]0_[0-9]+_mix", m.group(1)) else ""
             inloop = False
             continue
         if not fn:

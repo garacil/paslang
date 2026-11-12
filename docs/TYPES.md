@@ -476,6 +476,13 @@ are worked out. The callee cannot keep it (MANUAL §5).
   instances are identified by their originating declaration and actual
   argument type, never by a generated spelling (`testdata/nestednames.paslang`,
   `testdata/units/genericprobe.paslang`, `testdata/units/aliasuse.paslang`).
+- Scoped symbols retain their defining unit, type or lexical routine.
+  Components are length-framed, so underscores inside names cannot merge
+  two different scopes. Classes, interfaces and helpers keep these opaque
+  stems across imports; aliases keep the original identity. `PASLANGI35`
+  requires rebuilding older compiled units and their objects. Runtime
+  layouts and Pascal case-insensitive lookup keep their existing contracts
+  (`testdata/symbols/`, `scripts/check_symbols.py`).
 - `operator` defines `+ - * / div mod = <> < <= > >=` as a function.
   Integer, string, and set operations stay builtin when no operator is
   declared. A record without one is an error. `testdata/opadd.paslang`,

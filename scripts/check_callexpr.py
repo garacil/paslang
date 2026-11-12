@@ -110,16 +110,16 @@ def main():
             bad.append(f"{name}: no {what}")
 
     if not arm:
-        loops("p_run", [r"^  movq v_fns\(,%r\w+,8\), %r11$", r"^  movq v_fns\+8\(,%r\w+,8\), %r10$",
+        loops("p_f.0_3_run", [r"^  movq v_fns\(,%r\w+,8\), %r11$", r"^  movq v_fns\+8\(,%r\w+,8\), %r10$",
                         r"^  call \*%r11$"])
         # Self straight into rdi since P332: the argument, a chain, is
         # worked out in its own register and leaves rdi alone
-        loops("p_areas", [r"^  movq v_shapes\(,%r\w+,8\), %rdi$", r"^  movq v_shapes\+8\(,%r\w+,8\), %r11$",
+        loops("p_f.0_5_areas", [r"^  movq v_shapes\(,%r\w+,8\), %rdi$", r"^  movq v_shapes\+8\(,%r\w+,8\), %r11$",
                           r"^  movq 0\(%r11\), %r11$"])
-        loops("p_gets", [r"^  movq %rax, %rdi$", r"^  call \*\d+\(%rax\)$"])
-        loops("p_six", [r"^  call \*%r11$"])
-        has("p_run", r"^  call \*%r11\n(\.Lgm\d+:\n)?  addq -\d+\(%rbp\), %rax$", "t added from its home after the call")
-        has("p_gets", r"^  movq (-\d+)\(%rbp\), %r11\n  movq -\d+\(%rbp\), %rdi\n  movl \$5, %esi\n  call \*%r11$",
+        loops("p_f.0_4_gets", [r"^  movq %rax, %rdi$", r"^  call \*\d+\(%rax\)$"])
+        loops("p_f.0_3_six", [r"^  call \*%r11$"])
+        has("p_f.0_3_run", r"^  call \*%r11\n(\.Lgm\d+:\n)?  addq -\d+\(%rbp\), %rax$", "t added from its home after the call")
+        has("p_f.0_4_gets", r"^  movq (-\d+)\(%rbp\), %r11\n  movq -\d+\(%rbp\), %rdi\n  movl \$5, %esi\n  call \*%r11$",
             "method value's code and Self from its home")
         has("pas_main", r"^  addq v_mt\(%rip\), %rax$", "mt added from its home after the call")
         has("pas_main", r"^  call \*%r11\n(\.Lgm\d+:\n)?  (imulq \$7, %rax|leaq \(%rax,%rax,2\), %rcx\n  leaq \(%rax,%rcx,2\), %rax)$",
@@ -127,32 +127,32 @@ def main():
         has("pas_main", r"^  xorq v_mt\(%rip\), %rax$", "mt xor a call from its home")
         has("pas_main", r"^  andq v_mt\(%rip\), %rax$", "mt and a call from its home")
         has("pas_main", r"^  orq v_mt\(%rip\), %rax$", "mt or a call from its home")
-        has("p_locarr", r"^  call p_deep\n(\.Lgm\d+:\n)?  addq \$3, %rax$", "Deep(N) + 3 as addq $3")
-        has("p_locarr", r"^  imulq \$1000, %rax, %rax$", "a product by 1000 in the instruction")
-        has("p_locarr", r"^  addq \$3, %rax\n  cmpq \$9, %rax\n  ja \.L\d+\n\.L\d+:\n  leaq \(%rax,%rax,2\), %rax\n"
+        has("p_f.0_6_locarr", r"^  call p_f\.0_4_deep\n(\.Lgm\d+:\n)?  addq \$3, %rax$", "Deep(N) + 3 as addq $3")
+        has("p_f.0_6_locarr", r"^  imulq \$1000, %rax, %rax$", "a product by 1000 in the instruction")
+        has("p_f.0_6_locarr", r"^  addq \$3, %rax\n  cmpq \$9, %rax\n  ja \.L\d+\n\.L\d+:\n  leaq \(%rax,%rax,2\), %rax\n"
             r"  movq -\d+\(%rbp,%rax,8\), %rax$", "the element read at its index after the check")
-        before("pas_main", r"^  call p_bumpg$")
-        before("pas_main", r"^  call p_bumpvar$")
-        before("p_locvar", r"^  call \*%r11$")
-        before("p_boxed", r"^  call \*%r11$")
-        before("p_outer", r"^  call p_outer_inner$")
+        before("pas_main", r"^  call p_f\.0_5_bumpg$")
+        before("pas_main", r"^  call p_f\.0_7_bumpvar$")
+        before("p_f.0_6_locvar", r"^  call \*%r11$")
+        before("p_f.0_5_boxed", r"^  call \*%r11$")
+        before("p_f.0_5_outer", r"^  call p_n\.13_p_f\.0_5_outer5_inner$")
     else:
-        loops("p_run", [r"^  ldp x8, x27, \[x0\]$", r"^  blr x8$"])
-        loops("p_areas", [r"^  ldp x0, x8, \[x0\]$", r"^  ldr x8, \[x8, #0\]$"])
-        loops("p_gets", [r"^  ldr x0, \[x9, x10, lsl #3\]$", r"^  ldr x16, \[x0\]\n  ldr x16, \[x16, #\d+\]\n  blr x16$"])
-        loops("p_six", [r"^  blr x8$"])
-        has("p_run", r"^  blr x8\n(\.Lgm\d+:\n)?  ldr x1, \[x29, #-\d+\]\n  add x0, x1, x0$", "t read after the call")
-        has("p_gets", r"^  ldp x8, x0, \[x29, #-\d+\]\n  mov x1, #5\n  blr x8$", "method value's code and Self in one ldp")
+        loops("p_f.0_3_run", [r"^  ldp x8, x27, \[x0\]$", r"^  blr x8$"])
+        loops("p_f.0_5_areas", [r"^  ldp x0, x8, \[x0\]$", r"^  ldr x8, \[x8, #0\]$"])
+        loops("p_f.0_4_gets", [r"^  ldr x0, \[x9, x10, lsl #3\]$", r"^  ldr x16, \[x0\]\n  ldr x16, \[x16, #\d+\]\n  blr x16$"])
+        loops("p_f.0_3_six", [r"^  blr x8$"])
+        has("p_f.0_3_run", r"^  blr x8\n(\.Lgm\d+:\n)?  ldr x1, \[x29, #-\d+\]\n  add x0, x1, x0$", "t read after the call")
+        has("p_f.0_4_gets", r"^  ldp x8, x0, \[x29, #-\d+\]\n  mov x1, #5\n  blr x8$", "method value's code and Self in one ldp")
         # folded since P328: WriteLn's operands are stored at sp's offset
         # and no longer take x16, so P331's fold takes the read
         has("pas_main", r"^  blr x8\n(\.Lgm\d+:\n)?  adrp x16, v_mt\n  ldr x1, \[x16, :lo12:v_mt\]$",
             "mt read after the call")
-        has("p_locarr", r"^  bl p_deep\n(\.Lgm\d+:\n)?  add x0, x0, #3\n  cmp x0, #9$", "Deep(N) + 3 as add #3")
-        before("pas_main", r"^  bl p_bumpg$")
-        before("pas_main", r"^  bl p_bumpvar$")
-        before("p_locvar", r"^  blr x8$")
-        before("p_boxed", r"^  blr x8$")
-        before("p_outer", r"^  bl p_outer_inner$")
+        has("p_f.0_6_locarr", r"^  bl p_f\.0_4_deep\n(\.Lgm\d+:\n)?  add x0, x0, #3\n  cmp x0, #9$", "Deep(N) + 3 as add #3")
+        before("pas_main", r"^  bl p_f\.0_5_bumpg$")
+        before("pas_main", r"^  bl p_f\.0_7_bumpvar$")
+        before("p_f.0_6_locvar", r"^  blr x8$")
+        before("p_f.0_5_boxed", r"^  blr x8$")
+        before("p_f.0_5_outer", r"^  bl p_n\.13_p_f\.0_5_outer5_inner$")
         for k, body in rs.items():
             if k.startswith("rt_"):
                 continue

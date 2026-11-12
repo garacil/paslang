@@ -11,7 +11,7 @@ it wrote, labels no jump reaches skipped, a label one reaches a join
 where the move belongs; and each routine --short names is at most N
 instructions, ret and labels not counted.
 
-usage: check_retreg.py file.s [--arm] --routines=p_a,p_b [--short=p_c:2,p_d:3]
+usage: check_retreg.py file.s [--arm] --routines=p_f.0_1_a,p_f.0_1_b [--short=p_f.0_1_c:2,p_f.0_1_d:3]
 """
 
 import re

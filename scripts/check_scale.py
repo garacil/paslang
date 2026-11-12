@@ -12,6 +12,11 @@ included, multiplies by a power of two (imulq $2, $4, ... on amd64).
 
 import re
 import sys
+from pathlib import Path
+import runpy
+
+_symbols = runpy.run_path(str(Path(__file__).with_name('asm_symbols.py')))
+program_name = _symbols['program_name']
 
 
 def main():
@@ -26,17 +31,17 @@ def main():
     mul = re.compile(r"^  (mul|madd) " if arm else r"^  imulq ")
     for n, line in enumerate(open(path), 1):
         line = line.rstrip("\n")
-        m = re.match(r"^(p_[A-Za-z0-9_]+|rt_[A-Za-z0-9_]+|pas_main):$", line)
+        m = re.match(r"^(p_[A-Za-z0-9_.]+|rt_[A-Za-z0-9_]+|pas_main):$", line)
         if m:
             fn = m.group(1)
-            if fn[2:] in names:
-                seen.add(fn[2:])
+            if program_name(fn) in names:
+                seen.add(program_name(fn))
             continue
         if not arm:
             k = re.match(r"^  imulq \$(\d+),", line)
             if k and int(k.group(1)) > 1 and (int(k.group(1)) & (int(k.group(1)) - 1)) == 0:
                 pow2.append(f"{n}: {fn}: {line.strip()}")
-        if fn.startswith("p_") and fn[2:] in names and mul.match(line):
+        if fn.startswith("p_") and program_name(fn) in names and mul.match(line):
             bad.append(f"{n}: {fn}: {line.strip()}")
     missing = names - seen
     if missing:

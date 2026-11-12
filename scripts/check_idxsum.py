@@ -17,6 +17,11 @@ takes.
 
 import re
 import sys
+from pathlib import Path
+import runpy
+
+_symbols = runpy.run_path(str(Path(__file__).with_name('asm_symbols.py')))
+program_name = _symbols['program_name']
 
 
 def main():
@@ -29,9 +34,9 @@ def main():
     prev = None
     for n, line in enumerate(open(path), 1):
         line = line.rstrip("\n")
-        m = re.match(r"^(p_[A-Za-z0-9_]+|rt_[A-Za-z0-9_]+|pas_main):$", line)
+        m = re.match(r"^(p_[A-Za-z0-9_.]+|rt_[A-Za-z0-9_]+|pas_main):$", line)
         if m:
-            fn = m.group(1)[2:] if m.group(1).startswith("p_") else ""
+            fn = program_name(m.group(1)) if m.group(1).startswith("p_") else ""
             if fn in names:
                 seen.add(fn)
             prev = None

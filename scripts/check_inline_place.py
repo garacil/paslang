@@ -13,6 +13,12 @@ import subprocess
 import sys
 import tempfile
 import time
+import runpy
+
+_symbols = runpy.run_path(str(Path(__file__).with_name('asm_symbols.py')))
+program_name = _symbols['program_name']
+procedure_symbol = _symbols['procedure_symbol']
+
 
 repo = Path(__file__).resolve().parents[1]
 compiler, build, qemu = (Path(s).resolve() for s in sys.argv[1:])
@@ -78,7 +84,7 @@ try:
                                repo / 'testdata/units/inlineplaceu.paslang'])
             assembly = (directory / 'inlineplaceu.s').read_text()
             for helper in ('cell', 'half', 'load', 'letter'):
-                calls = re.search(r'\b(?:callq?|bl)\s+p_inlineplaceu_' + helper + r'\b', assembly)
+                calls = re.search(r'\b(?:callq?|bl)\s+' + re.escape(procedure_symbol('inlineplaceu', helper)) + r'\b', assembly)
                 assert bool(calls) == (inline == 0), (tag, helper, 'inlining control failed')
             binary = directory / 'inlineplace'
             run(tag + '-compile', [compiler, *flags, '-Fu', directory, '-Fu', core,

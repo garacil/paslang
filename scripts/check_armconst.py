@@ -75,7 +75,7 @@ def main():
     seen = 0
     fn = None
     for n, l in enumerate(lines, 1):
-        m = re.match(r"^p_k(\d+):$", l)
+        m = re.match(r"^p_f[.]0_[0-9]+_k(\d+):$", l)
         if m:
             fn = int(m.group(1))
             continue

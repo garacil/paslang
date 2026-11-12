@@ -11,7 +11,7 @@ section of their own, with their roots for the collector linked to
 them, so it carries no class table of it (vmt_, rtti_), none of its
 methods, routines or variables, only the unit's start (u_sqlite_).
 sqluses, which opens a database, carries TSqlite's (a library unit's
-names carry the unit's: vmt_sqlite_tsqlite) and the engine under it,
+names carry the unit's: vmt_t_u.6_sqlite7_tsqlite) and the engine under it,
 sqlite3_open_v2 and the tables of SQL's parser (P405: a connection runs
 SQL). It prints hello's loaded
 bytes (all its sections but the debug ones) and its .data, and refuses
@@ -64,10 +64,10 @@ def main():
     if not unit:
         raise SystemExit('check_gcsections: sqlnone carries not even the start of sqlite')
     u = syms(uses, arm)
-    for s in ('vmt_sqlite_tsqlite', 'p_sqlite_tsqlite_open', 'vmt_sqlite_esqliteerror'):
+    for s in ('vmt_t_u.6_sqlite7_tsqlite', 'p_m.21_t_u.6_sqlite7_tsqlite4_open', 'vmt_t_u.6_sqlite12_esqliteerror'):
         if not any(x.startswith(s) for x in u):
             raise SystemExit('check_gcsections: sqluses carries no %s' % s)
-    if not any(x.startswith('p_sqlite_sqlite3_open_v2') for x in u):
+    if not any(x.startswith('p_f.6_sqlite15_sqlite3_open_v2') for x in u):
         raise SystemExit('check_gcsections: sqluses carries no sqlite3_open_v2')
     secs = sections(hello, arm)
     n = loaded(secs)

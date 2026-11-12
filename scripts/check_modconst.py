@@ -103,11 +103,11 @@ def main():
         raise SystemExit("usage: check_modconst.py file.s [--arm [--tune=n1]]")
     mul, c = combos("arm64" if arm else "amd64", tune)
     fn, bad, seen, last = "", [], set(), {}
-    want = re.compile(r"^p_(m|loop|glob)(n?)(\d+):$")
+    want = re.compile(r"^p_f[.]0_[0-9]+_(m|loop|glob)(n?)(\d+):$")
     k = 0
     for n, line in enumerate(open(args[0]), 1):
         line = line.rstrip("\n")
-        m = re.match(r"^(p_[A-Za-z0-9_]+|rt_[A-Za-z0-9_]+|pas_main):$", line)
+        m = re.match(r"^(p_[A-Za-z0-9_.]+|rt_[A-Za-z0-9_]+|pas_main):$", line)
         if m:
             w = want.match(line)
             fn = line[:-1] if w else ""

@@ -10,7 +10,7 @@ first (P358), read in the assembly of testdata/nestzero built with
 --arm, one word each, as ZeroFrame writes up to 16 words) are as many
 as --expect says, routine:words separated by commas.
 
-usage: check_nestzero.py file.s [--arm] --expect=p_a:0,p_b:2
+usage: check_nestzero.py file.s [--arm] --expect=p_f.0_1_a:0,p_f.0_1_b:2
 """
 
 import re

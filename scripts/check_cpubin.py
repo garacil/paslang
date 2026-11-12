@@ -26,7 +26,7 @@ PAST = re.compile(r'\b(lzcnt|tzcnt|popcnt|andn|blsr|blsi|blsmsk|bzhi|shlx|shrx|s
 # is not zero, or whose result is not read when it is, where the two
 # agree: pasjson's base kernels (P211), whose TZCNT is 2 ops on AMD's
 # Family 17h where BSF is 6, one each two cycles (56305's latency sheet).
-AS_BSF = {'p_pasjson_pasjsonindexbase', 'p_pasjson_pasjsonescindexbase'}
+AS_BSF = {'p_f.7_pasjson16_pasjsonindexbase', 'p_f.7_pasjson19_pasjsonescindexbase'}
 
 
 def scan(exe):

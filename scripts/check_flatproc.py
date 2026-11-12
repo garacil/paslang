@@ -13,6 +13,12 @@ variables than registers, keeps its frame. --arm reads arm64's.
 
 import re
 import sys
+from pathlib import Path
+import runpy
+
+_symbols = runpy.run_path(str(Path(__file__).with_name('asm_symbols.py')))
+procedure_symbol = _symbols['procedure_symbol']
+
 
 
 def main():
@@ -27,7 +33,7 @@ def main():
     lines = open(args[0]).read().splitlines()
     bodies, fn = {}, ""
     for l in lines:
-        m = re.match(r"^(p_[A-Za-z0-9_]+|rt_[A-Za-z0-9_]+|pas_main):$", l)
+        m = re.match(r"^(p_[A-Za-z0-9_.]+|rt_[A-Za-z0-9_]+|pas_main):$", l)
         if m:
             fn = m.group(1)
             bodies[fn] = []
@@ -35,16 +41,18 @@ def main():
         if fn:
             bodies[fn].append(l)
     frame = re.compile(r"stp x29, x30|\bx29\b|x28, #16" if arm else r"pushq %rbp|\(%rbp\)|cmpq 16\(%r14\)")
-    flat = [f for f in bodies if re.match(r"^p_(tbox_)?flat", f)]
+    flat = [f for f in bodies if (_symbols['program_name'](f).startswith('flat') or
+             (f.startswith('p_m.') and _symbols['decode'](f)[1][1].startswith('flat') and
+              _symbols['decode'](_symbols['decode'](f)[1][0]) == ('t_u', ('', 'tbox'), '')))]
     bad = []
     for f in flat:
         body = [l for l in bodies[f] if not l.startswith("  .") and not re.match(r"^\.L", l)]
         if any(frame.search(l) for l in body):
             bad.append(f"{f} has a frame or a stack check")
-    c = [l for l in bodies.get("p_flatclamp3", []) if l.startswith("  ") and not l.startswith("  .")]
+    c = [l for l in bodies.get("p_f.0_10_flatclamp3", []) if l.startswith("  ") and not l.startswith("  .")]
     if len(c) > clamp:
         bad.append(f"flatclamp3 is {len(c)} instructions where {clamp} at most")
-    if not any(frame.search(l) for l in bodies.get("p_many", [])):
+    if not any(frame.search(l) for l in bodies.get("p_f.0_4_many", [])):
         bad.append("many has no frame, though its variables outnumber the registers")
     if len(flat) < 8:
         bad.append(f"only {len(flat)} flat routines")

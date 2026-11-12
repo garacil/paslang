@@ -25,10 +25,10 @@ def main():
     lines = open(args[0]).read().splitlines()
     fn, bad, ext = "", [], {}
     for n, line in enumerate(lines):
-        m = re.match(r"^(p_[A-Za-z0-9_]+|rt_[A-Za-z0-9_]+|pas_main):$", line)
+        m = re.match(r"^(p_[A-Za-z0-9_.]+|rt_[A-Za-z0-9_]+|pas_main):$", line)
         if m:
             name = m.group(1)
-            fn = name if name.startswith("p_reg") or name.startswith("p_home") else ""
+            fn = name if re.match(r"^p_f[.]0_[0-9]+_(reg|home)", name) else ""
             if fn:
                 ext.setdefault(fn, 0)
             continue

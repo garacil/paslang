@@ -36,7 +36,7 @@ def main():
     inprog = False
     for line in open(path):
         line = line.rstrip("\n")
-        if re.match(r"^p_[A-Za-z0-9_]+:$", line):
+        if re.match(r"^p_[A-Za-z0-9_.]+:$", line):
             inprog = True
             cur = None
             continue

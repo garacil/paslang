@@ -11,7 +11,7 @@ x28's guard), reaches its outer variables through the link register it
 came in (r10 or x27) and never stores that link; each --framed names
 keeps its frame.
 
-usage: check_nestflat.py file.s [--arm] --flat=p_a,p_b --framed=p_c
+usage: check_nestflat.py file.s [--arm] --flat=p_f.0_1_a,p_f.0_1_b --framed=p_f.0_1_c
 """
 
 import re

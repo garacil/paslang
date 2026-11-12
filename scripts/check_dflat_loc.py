@@ -23,12 +23,12 @@ for line in subprocess.run(['nm', '-n', exe], capture_output=True, text=True, ch
         syms.append((int(f[0], 16), f[2]))
 start = end = None
 for i, (a, n) in enumerate(syms):
-    if n == 'p_hq':
+    if n == 'p_f.0_2_hq':
         start = a
         end = next(b for b, m in syms[i + 1:] if b > a)
         break
 if start is None:
-    sys.exit('check_dflat_loc: no p_hq in ' + exe)
+    sys.exit('check_dflat_loc: no p_f.0_2_hq in ' + exe)
 out = subprocess.run(['readelf', '--debug-dump=loc', exe], capture_output=True, text=True)
 text = out.stdout + out.stderr
 if 'end of data' in text:

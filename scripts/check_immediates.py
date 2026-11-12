@@ -16,6 +16,11 @@ paslangc compiled and prints the count, failing on none.
 
 import re
 import sys
+from pathlib import Path
+import runpy
+
+_symbols = runpy.run_path(str(Path(__file__).with_name('asm_symbols.py')))
+program_name = _symbols['program_name']
 
 
 def logimm(v):
@@ -75,14 +80,14 @@ def main():
     fn = ""
     for i in range(len(lines) - 1):
         l = lines[i]
-        m = re.match(r"^(p_[A-Za-z0-9_]+|pas_main):$", l)
+        m = re.match(r"^(p_[A-Za-z0-9_.]+|pas_main):$", l)
         if m:
             fn = m.group(1)
             continue
         if re.match(r"^rt_[A-Za-z0-9_]+:$", l):
             fn = ""
             continue
-        if not fn or (names is not None and fn[2:] not in names):
+        if not fn or (names is not None and program_name(fn) not in names):
             continue
         nx = lines[i + 1]
         m = re.match(r"^  (?:mov|ldr) (x\d+), [#=](-?\d+)$", l)

@@ -34,7 +34,7 @@ def check(path, arm):
     lines = open(path).read().split('\n')
     bad = []
     kept = [f'x{n}' for n in range(19, 27)] if arm else ['rbx', 'r12', 'r13', 'r15']
-    call = 'bl p_twice' if arm else 'call p_twice'
+    call = 'bl p_f.0_5_twice' if arm else 'call p_f.0_5_twice'
 
     def frame_load(ins, r):
         if arm:
@@ -51,7 +51,7 @@ def check(path, arm):
         return '%' + r in src or ('%' + r + ',' not in ops and '%' + r in ops and
                                     not ins.startswith('mov'))
 
-    ev = routine(lines, 'p_everypass')
+    ev = routine(lines, 'p_f.0_9_everypass')
     saved = set()
     for ins in ev:
         m = re.match(r'\.cfi_offset %?(\w+)', ins)
@@ -77,7 +77,7 @@ def check(path, arm):
                        not any(frame_load(ins, r) for ins in span)]
         if not kept_across:
             bad.append(f'everypass: no variable stays in {"/".join(kept)} across the call of Twice')
-    ca = routine(lines, 'p_catcher')
+    ca = routine(lines, 'p_f.0_7_catcher')
     for r in kept:
         if arm:
             # one register's str or ldr, or two's stp or ldp (P384's pairs)
@@ -92,7 +92,7 @@ def check(path, arm):
             ld = sum(1 for ins in ca if frame_load(ins, r))
         if st < 1 or ld < 1:
             bad.append(f'catcher: its try does not keep {r} for its handler')
-    ft = routine(lines, 'p_findtwice')
+    ft = routine(lines, 'p_f.0_9_findtwice')
     slots = {}
     for i, ins in enumerate(ft):
         m = re.match(r'\.cfi_offset %?(\w+)', ins)

@@ -45,7 +45,7 @@ def main():
                 body[name].append(s)
     bad, divs = [], 0
     for r, ls in body.items():
-        if not r.startswith("p_by"):
+        if not re.match(r"^p_f[.]0_[0-9]+_by", r):
             continue
         for i, l in enumerate(ls):
             nxt = ls[i + 1] if i + 1 < len(ls) else ""

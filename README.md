@@ -182,6 +182,12 @@ installing the compiler does not require it.
 `make check` runs the golden programs, manual examples, server self-tests,
 compiler self-reproduction and arm64 checks under QEMU.
 
+Compiled units use `PASLANGI35`. Rebuild application and library `.pi`/`.o`
+files made with an earlier format; the compiler names the unit to rebuild.
+Update direct inline-assembly references to generated linker names as well.
+Scoped routine, class and helper names remain distinct even where their
+underscores would otherwise join, with no additional runtime dependency.
+
 ## Binary packages
 
 The release page provides four distribution packages and a relocatable

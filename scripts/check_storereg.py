@@ -42,19 +42,19 @@ def main():
     R = r'%r\w+'
     if arm:
         want = {
-            'p_fill': [r'^str x\d+, \[x\d+, x\d+, lsl #3\]$'],
-            'p_narrow': [r'^strb w\d+, \[x\d+, x\d+(, lsl #0)?\]$', r'^strh w\d+, \[x\d+, x\d+, lsl #1\]$',
+            'p_f.0_4_fill': [r'^str x\d+, \[x\d+, x\d+, lsl #3\]$'],
+            'p_f.0_6_narrow': [r'^strb w\d+, \[x\d+, x\d+(, lsl #0)?\]$', r'^strh w\d+, \[x\d+, x\d+, lsl #1\]$',
                          r'^str w\d+, \[x\d+, x\d+, lsl #2\]$'],
-            'p_views': [r'^str w\d+, \[x\d+, x\d+\]$', r'^strh w\d+, \[x16\]$'],
-            'p_target': [r'^str x\d+, \[x\d+\]$', r'^str x\d+, \[x\d+, #8\]$'],
+            'p_f.0_5_views': [r'^str w\d+, \[x\d+, x\d+\]$', r'^strh w\d+, \[x16\]$'],
+            'p_f.0_6_target': [r'^str x\d+, \[x\d+\]$', r'^str x\d+, \[x\d+, #8\]$'],
         }
     else:
         want = {
-            'p_fill': [rf'^movq {R}, \({R},{R},8\)$'],
-            'p_narrow': [rf'^movb %\w+, \({R},{R},1\)$', rf'^movw %\w+, \({R},{R},2\)$',
+            'p_f.0_4_fill': [rf'^movq {R}, \({R},{R},8\)$'],
+            'p_f.0_6_narrow': [rf'^movb %\w+, \({R},{R},1\)$', rf'^movw %\w+, \({R},{R},2\)$',
                          rf'^movl %\w+, \({R},{R},4\)$'],
-            'p_views': [rf'^movl %\w+, \({R},{R},1\)$', rf'^movw %\w+, \({R},{R},4\)$'],
-            'p_target': [rf'^movq {R}, 8\({R}\)$'],
+            'p_f.0_5_views': [rf'^movl %\w+, \({R},{R},1\)$', rf'^movw %\w+, \({R},{R},4\)$'],
+            'p_f.0_6_target': [rf'^movq {R}, 8\({R}\)$'],
         }
     bad = []
     for name, pats in want.items():
@@ -73,8 +73,8 @@ def main():
                     for j in range(i + 1, min(i + 4, len(body) - 1)))
             if pushed:
                 bad.append(f'{name}: a value pushed and popped for its store at line {i + 1}')
-    if not arm and any(ins.startswith('pushq') for ins in routine(lines, 'p_fill')):
-        bad.append('p_fill: a push in a routine with no frame')
+    if not arm and any(ins.startswith('pushq') for ins in routine(lines, 'p_f.0_4_fill')):
+        bad.append('p_f.0_4_fill: a push in a routine with no frame')
     for b in bad:
         print(b)
     if bad:

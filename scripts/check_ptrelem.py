@@ -40,17 +40,17 @@ def main():
     R = r'%r\w+'
     if arm:
         want = {
-            'p_copywords': [r'^ldr x\d+, \[x\d+, x\d+\]$', r'^str x\d+, \[x\d+, x\d+\]$'],
-            'p_sumwords': [r'^ldrh w\d+, \[x\d+, x\d+, lsl #1\]$'],
-            'p_runints': [r'\[x\d+, x\d+, lsl #2\]$'],
-            'p_runlongs': [r'\[x\d+, x\d+, lsl #3\]$'],
+            'p_f.0_9_copywords': [r'^ldr x\d+, \[x\d+, x\d+\]$', r'^str x\d+, \[x\d+, x\d+\]$'],
+            'p_f.0_8_sumwords': [r'^ldrh w\d+, \[x\d+, x\d+, lsl #1\]$'],
+            'p_f.0_7_runints': [r'\[x\d+, x\d+, lsl #2\]$'],
+            'p_f.0_8_runlongs': [r'\[x\d+, x\d+, lsl #3\]$'],
         }
     else:
         want = {
-            'p_copywords': [rf'^movq \({R},{R},1\), {R}$', rf'^movq {R}, \({R},{R},1\)$'],
-            'p_sumwords': [rf'\({R},{R},2\)'],
-            'p_runints': [rf'\({R},{R},4\)'],
-            'p_runlongs': [rf'\({R},{R},8\)'],
+            'p_f.0_9_copywords': [rf'^movq \({R},{R},1\), {R}$', rf'^movq {R}, \({R},{R},1\)$'],
+            'p_f.0_8_sumwords': [rf'\({R},{R},2\)'],
+            'p_f.0_7_runints': [rf'\({R},{R},4\)'],
+            'p_f.0_8_runlongs': [rf'\({R},{R},8\)'],
         }
     bad = []
     for name, pats in want.items():

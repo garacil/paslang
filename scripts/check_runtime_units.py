@@ -20,6 +20,12 @@ import struct
 import subprocess
 import sys
 import tempfile
+import runpy
+
+_symbols = runpy.run_path(str(Path(__file__).with_name('asm_symbols.py')))
+program_name = _symbols['program_name']
+procedure_symbol = _symbols['procedure_symbol']
+
 
 # Loading the checker below must not leave caches beside project sources.
 sys.dont_write_bytecode = True
@@ -73,7 +79,7 @@ def built_units(build):
             if not path.is_file():
                 fail(str(path) + ': actual built unit assembly is missing')
             assembly = path.read_text()
-            if not re.search(r'^p_' + unit + r'_[\w.]+:', assembly, re.M):
+            if not re.search(r'^' + re.escape('p_f.' + _symbols['component'](unit)) + r'[0-9]+_[\w.]+:', assembly, re.M):
                 fail(str(path) + ': no routine of the expected unit')
             no_async(assembly, variant + ' production ' + unit)
         path = directory / 'passtr.s'
@@ -187,19 +193,19 @@ def body(assembly, symbol):
 
 
 def frame_policy(assembly, unit, arm, runtime):
-    prefix = 'p_' + unit + '_'
+    prefix = 'p_f.' + _symbols['component'](unit)
     frame = re.compile(r'\bstp x29, x30\b|\bmov x29, sp\b' if arm
                        else r'pushq %rbp|movq %rsp, %rbp')
     guard = re.compile(r'\[x28, #16\]' if arm else r'16\(%r14\)')
-    leaf = body(assembly, prefix + 'identityleaf')
+    leaf = body(assembly, prefix + _symbols['component']('identityleaf'))
     if frame.search(leaf) or 'rt_morestack' in leaf:
         fail(unit + ': the separate straight-line LeafProc control gained a frame/check')
-    loop = body(assembly, prefix + 'sumticks')
+    loop = body(assembly, prefix + _symbols['component']('sumticks'))
     if runtime:
         no_async(assembly, unit + ' fixture')
         if not frame.search(loop) or len(guard.findall(loop)) < 2:
             fail(unit + ': runtime loop lacks its frame or cooperative guard check')
-        spin = body(assembly, prefix + 'spinuntil')
+        spin = body(assembly, prefix + _symbols['component']('spinuntil'))
         if not frame.search(spin) or len(guard.findall(spin)) < 2 or 'rt_morestack' not in spin:
             fail(unit + ': waiting runtime loop lacks a cooperative slow path')
     else:
@@ -281,7 +287,7 @@ def prefix_program(compiler, machine, target, units, launch, checker):
                 '-Fu', str(units), '-o', str(executable), str(source)], folder)
     assembly = (folder / 'prefixprobe.s').read_text()
     for prefix in RUNTIME_UNITS:
-        if '.section pasasync.p_' + prefix + '_probe,' not in assembly:
+        if '.section pasasync.' + procedure_symbol('', prefix + '_probe') + ',' not in assembly:
             fail(target + ': legitimate program name ' + prefix + '_probe lost eligibility')
     successful([sys.executable, '-I', str(checker), str(executable)], folder)
     require_run([*launch, str(executable)], folder, '6\n',
@@ -334,7 +340,7 @@ def main():
                             '-Fu', str(units), '-o', str(executable),
                             str(source)], folder)
                 assembly = (folder / 'unitprobe.s').read_text()
-                if '.section pasasync.p_userplus,' not in assembly:
+                if '.section pasasync.p_f.0_8_userplus,' not in assembly:
                     fail(target + ' ' + unit + ': user-routine positive control is missing')
                 if '.section pasasync..text,' not in assembly:
                     fail(target + ' ' + unit + ': main positive control is missing')

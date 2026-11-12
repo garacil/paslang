@@ -18,7 +18,7 @@ right before an ldp or stp from [x0] that could take it.
 import re
 import sys
 
-ROUTINES = ("p_sumfns", "p_local", "p_strs", "p_boxes", "p_slices", "p_fields")
+ROUTINES = ("p_f.0_6_sumfns", "p_f.0_5_local", "p_f.0_4_strs", "p_f.0_5_boxes", "p_f.0_6_slices", "p_f.0_6_fields")
 
 
 def body(lines, name):

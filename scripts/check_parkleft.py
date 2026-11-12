@@ -18,7 +18,7 @@ usage: check_parkleft.py file.s [--arm]
 import re
 import sys
 
-LIMITS = {'p_parkhex': 0, 'p_parkmany': 2, 'p_parkwords': 1}
+LIMITS = {'p_f.0_7_parkhex': 0, 'p_f.0_8_parkmany': 2, 'p_f.0_9_parkwords': 1}
 
 
 def main():

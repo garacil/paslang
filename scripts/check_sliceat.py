@@ -36,7 +36,7 @@ def main():
     else:
         push = re.compile(r'^pushq ')
         niltest = re.compile(r'^testq %(\w+), %\1$')
-    for r in ('p_tc_at', 'p_tc_addr', 'p_tc_lvat'):
+    for r in ('p_m.10_t_u.0_2_tc2_at', 'p_m.10_t_u.0_2_tc4_addr', 'p_m.10_t_u.0_2_tc4_lvat'):
         b = body(lines, r)
         if not b:
             bad.append(r + ': not found')

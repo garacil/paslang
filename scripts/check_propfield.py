@@ -10,7 +10,7 @@ Usage: check_propfield.py COMPILER BUILDDIR QEMU [--baseline COMPILER]
 The normal golden loops exercise optimized native/base and arm64 code.
 This bounded check also runs the same source at inline 0 on both targets
 and inspects the one-word record's address passed to a const parameter.
-An optional older compiler must fail the amd64 regression; its scalar,
+An optional compiler with the current compiled-unit format must fail the amd64 regression; its scalar,
 fat, field/field and getter control routines must emit the same code as
 the candidate on both targets. No FPC executable supplies the answers.
 """
@@ -20,6 +20,11 @@ import resource
 import subprocess
 import sys
 import tempfile
+import runpy
+
+_symbols = runpy.run_path(str(Path(__file__).with_name('asm_symbols.py')))
+procedure_symbol = _symbols['procedure_symbol']
+
 
 
 CONTROLS = ('controlinteger', 'controlbyte', 'controlstring', 'controlslice',
@@ -36,8 +41,8 @@ def command(args):
 
 
 def routine(assembly, name):
-    match = re.search(r'^p_' + re.escape(name) +
-                      r'(?:_o_[A-Za-z0-9_]+)?:\n(.*?)^\s*\.cfi_endproc',
+    match = re.search(r'^' + re.escape(procedure_symbol('', name)) +
+                      r'(?:_o(?:_[vr][0-9]+)*)?:\n(.*?)^\s*\.cfi_endproc',
                       assembly, re.M | re.S)
     if not match:
         raise SystemExit('propfield: no emitted routine ' + name)

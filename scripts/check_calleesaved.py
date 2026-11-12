@@ -63,7 +63,7 @@ def routines(lines):
                 yield cur, body
             cur, body = m.group(1), []
             continue
-        if cur and re.match(r'^(p_|vmt_|\.globl p_)[A-Za-z0-9_]*', ln) and ln.endswith(':'):
+        if cur and re.match(r'^(p_|vmt_|\.globl p_)[A-Za-z0-9_.]*', ln) and ln.endswith(':'):
             yield cur, body
             cur, body = None, []
             continue

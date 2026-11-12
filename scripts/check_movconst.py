@@ -45,7 +45,7 @@ def main():
     wide, badzero, missed, zeros = [], [], [], 0
     compiled = False
     for n, l in enumerate(lines):
-        r = re.match(r"^(p_[A-Za-z0-9_]+|rt_[A-Za-z0-9_]+|pas_main):$", l)
+        r = re.match(r"^(p_[A-Za-z0-9_.]+|rt_[A-Za-z0-9_]+|pas_main):$", l)
         if r:
             compiled = not r.group(1).startswith("rt_")
         m = re.match(r"^  (movq|movabsq) \$(\d+), %r\w+$", l)

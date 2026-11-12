@@ -368,6 +368,8 @@ def check(path, sizes, made=None):
 
 def ask(path, runner):
     """the program's own answers against pcline's"""
+    # Made embeds this literal GAS symbol and a hand-written table.
+    # It is independent of the compiler-generated Pascal routine name.
     made = symbol(path, "p_placeask_made")
     if made is None:
         raise SystemExit(f"{path}: no routine p_placeask_made: it is not testdata/units/placeask")

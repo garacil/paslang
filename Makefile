@@ -1295,6 +1295,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	@set -e; \
 	: P576: lifecycle faults, independent eligibility, metadata and real stop-room ownership; \
 	python3 -I scripts/check_unit_life.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64); \
+	python3 -I scripts/check_symbols.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64); \
 	echo ok unit-life
 	@set -e; \
 	: P589: exact declaration provenance preserves value snapshots and the existing core borrowing contract; \
@@ -1398,12 +1399,12 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(BUILDDIR)/inline0 > $(BUILDDIR)/inline0.got; \
 	diff -u testdata/inline1.out $(BUILDDIR)/inline0.got; \
 	for f in tally swap clamp sq twice huge; do \
-	  if grep -q "call p_$$f$$" $(BUILDDIR)/inline1.s; then echo "inline1.s still calls $$f, which should be in place"; exit 1; fi; \
+	  if grep -q "call p_f[.]0_$${#f}_$$f$$" $(BUILDDIR)/inline1.s; then echo "inline1.s still calls $$f, which should be in place"; exit 1; fi; \
 	done; \
 	for f in count fact len2 big; do \
-	  grep -q "call p_$$f$$" $(BUILDDIR)/inline1.s || { echo "inline1.s does not call $$f, which should stay a call"; exit 1; }; \
+	  grep -q "call p_f[.]0_$${#f}_$$f$$" $(BUILDDIR)/inline1.s || { echo "inline1.s does not call $$f, which should stay a call"; exit 1; }; \
 	done; \
-	grep -q "call p_sq$$" $(BUILDDIR)/inline0.s || { echo "inline0.s (-inline 0) does not call Sq"; exit 1; }; \
+	grep -q "call p_f[.]0_2_sq$$" $(BUILDDIR)/inline0.s || { echo "inline0.s (-inline 0) does not call Sq"; exit 1; }; \
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/jsonbind10 testdata/jsonbind1.paslang; \
 	$(BUILDDIR)/jsonbind10 > $(BUILDDIR)/jsonbind10.got; \
 	diff -u testdata/jsonbind1.out $(BUILDDIR)/jsonbind10.got; \
@@ -1418,10 +1419,10 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/inlinevar.out $(BUILDDIR)/inlinevar0.got; \
 	: a var or out parameter of a record goes in place P275, and a place found through a variable another var parameter is given stays a call; \
 	for f in step sum wipe tag shift inner; do \
-	  if grep -q "call p_$$f$$" $(BUILDDIR)/inlinevar.s; then echo "inlinevar.s still calls $$f, which should be in place"; exit 1; fi; \
+	  if grep -q "call p_f[.]0_$${#f}_$$f$$" $(BUILDDIR)/inlinevar.s; then echo "inlinevar.s still calls $$f, which should be in place"; exit 1; fi; \
 	done; \
 	for f in bump bumppos repoint; do \
-	  grep -q "call p_$$f$$" $(BUILDDIR)/inlinevar.s || { echo "inlinevar.s does not call $$f, which should stay a call"; exit 1; }; \
+	  grep -q "call p_f[.]0_$${#f}_$$f$$" $(BUILDDIR)/inlinevar.s || { echo "inlinevar.s does not call $$f, which should stay a call"; exit 1; }; \
 	done; \
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/trygetshare0 testdata/trygetshare.paslang; \
 	$(BUILDDIR)/trygetshare0 > $(BUILDDIR)/trygetshare0.got; \
@@ -1441,8 +1442,8 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	echo "==== dead code ===="; \
 	sz=$$(size $(BUILDDIR)/hello | awk 'NR==2 {print $$1}'); \
 	[ "$$sz" -lt 160000 ] || { echo "hello's text is $$sz bytes: the core routines it does not use were linked"; exit 1; }; \
-	grep -q '^\.section \.text\.p_pastree_pastreeget,' $(BUILDDIR)/pastree.s || { echo "pastree.s has no section per routine"; exit 1; }; \
-	grep -q '^\.section pasgcmaps\.p_pastree_pastreeget,"awo"' $(BUILDDIR)/pastree.s || { echo "pastree.s has no map section per routine"; exit 1; }; \
+	grep -q '^\.section \.text\.p_f[.]7_pastree10_pastreeget,' $(BUILDDIR)/pastree.s || { echo "pastree.s has no section per routine"; exit 1; }; \
+	grep -q '^\.section pasgcmaps\.p_f[.]7_pastree10_pastreeget,"awo"' $(BUILDDIR)/pastree.s || { echo "pastree.s has no map section per routine"; exit 1; }; \
 	echo ok deadcode; \
 	echo "==== gctypes descriptors ===="; \
 	grep -q 'gctype TNode size 32 words 1 mask 0x0000000000000009' $(BUILDDIR)/gctypes.s; \
@@ -1511,20 +1512,20 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  PASLANG_CPU=base $(BUILDDIR)/$$t-base > $(BUILDDIR)/$$t.bgot; \
 	  diff -u testdata/$$t.out $(BUILDDIR)/$$t.bgot; \
 	done; \
-	grep -q 'p_pashash_passha256cpu' $(BUILDDIR)/hash1.s; \
+	grep -q 'p_f[.]7_pashash12_passha256cpu' $(BUILDDIR)/hash1.s; \
 	$(OUTDIR)/paslangc -cpu v3 -o $(BUILDDIR)/fmafused-v3 testdata/fmafused.paslang; \
 	grep -q 'vfmadd213sd' $(BUILDDIR)/fmafused-v3.s; \
-	grep -q 'call p_pasnum_pasfma' $(BUILDDIR)/fmafused-base.s; \
+	grep -q 'call p_f[.]6_pasnum6_pasfma' $(BUILDDIR)/fmafused-base.s; \
 	if grep -q 'vfmadd213sd' $(BUILDDIR)/fmafused-base.s; then echo "fmafused-base.s carries vfmadd213sd"; exit 1; fi; \
-	grep -q 'p_pashash_passha256base' $(BUILDDIR)/hash1-base.s; \
-	grep -q 'p_pashash_passha256updatecpu' $(BUILDDIR)/hashpieces.s; \
-	grep -q 'p_pashash_passha256updatebase' $(BUILDDIR)/hashpieces-base.s; \
-	if grep -q 'p_pashash_passha256updatecpu' $(BUILDDIR)/hashpieces-base.s; then echo "hashpieces-base.s calls the SHA-NI body"; exit 1; fi; \
+	grep -q 'p_f[.]7_pashash13_passha256base' $(BUILDDIR)/hash1-base.s; \
+	grep -q 'p_f[.]7_pashash18_passha256updatecpu' $(BUILDDIR)/hashpieces.s; \
+	grep -q 'p_f[.]7_pashash19_passha256updatebase' $(BUILDDIR)/hashpieces-base.s; \
+	if grep -q 'p_f[.]7_pashash18_passha256updatecpu' $(BUILDDIR)/hashpieces-base.s; then echo "hashpieces-base.s calls the SHA-NI body"; exit 1; fi; \
 	: the HMAC in pieces calls the Cpu or the Base body of its hash by the processor, P443; \
-	grep -q 'p_pashash_pashmacupdatecpu' $(BUILDDIR)/hashpieces2.s; \
-	grep -q 'p_pashash_pashmacupdatebase' $(BUILDDIR)/hashpieces2-base.s; \
-	if grep -q 'p_pashash_pashmacupdatecpu' $(BUILDDIR)/hashpieces2-base.s; then echo "hashpieces2-base.s calls the SHA-NI body"; exit 1; fi; \
-	if grep -q 'p_pashash_passha256cpu' $(BUILDDIR)/hash1-base.s; then echo "hash1-base.s calls the SHA-NI body"; exit 1; fi; \
+	grep -q 'p_f[.]7_pashash16_pashmacupdatecpu' $(BUILDDIR)/hashpieces2.s; \
+	grep -q 'p_f[.]7_pashash17_pashmacupdatebase' $(BUILDDIR)/hashpieces2-base.s; \
+	if grep -q 'p_f[.]7_pashash16_pashmacupdatecpu' $(BUILDDIR)/hashpieces2-base.s; then echo "hashpieces2-base.s calls the SHA-NI body"; exit 1; fi; \
+	if grep -q 'p_f[.]7_pashash12_passha256cpu' $(BUILDDIR)/hash1-base.s; then echo "hash1-base.s calls the SHA-NI body"; exit 1; fi; \
 	if grep -q 'popcntq' $(BUILDDIR)/bitwords-base.s; then echo "bitwords-base.s carries popcnt"; exit 1; fi; \
 	: pastls against Go crypto/tls and openssl s_server, each case a server on 127.0.0.1, P431; \
 	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/tlsinterop testdata/tlsinterop.paslang; \
@@ -1567,14 +1568,14 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	if grep -qw 'ptest' $(BUILDDIR)/set256-base.s; then echo "set256-base.s carries SSE4.1"; exit 1; fi; \
 	if grep -qw 'tzcntq' $(BUILDDIR)/set256-base.s; then echo "set256-base.s carries BMI1"; exit 1; fi; \
 	grep -qw 'vptest' $(BUILDDIR)/set256.s; \
-	grep -q 'p_passtr_pasposcpu' $(BUILDDIR)/strwords.s; \
+	grep -q 'p_f[.]6_passtr9_pasposcpu' $(BUILDDIR)/strwords.s; \
 	$(OUTDIR)/paslangc -cpu v2 -o $(BUILDDIR)/strcmpk-v2 testdata/strcmpk.paslang; \
 	$(BUILDDIR)/strcmpk-v2 > $(BUILDDIR)/strcmpk.v2got; \
 	diff -u testdata/strcmpk.out $(BUILDDIR)/strcmpk.v2got; \
 	grep -q 'vpcmpeqb %ymm1, %ymm0, %ymm4' $(BUILDDIR)/strcmpk.s; \
 	if grep -q 'vpcmpeqb' $(BUILDDIR)/strcmpk-base.s; then echo "strcmpk-base.s carries AVX2"; exit 1; fi; \
-	grep -q 'p_passtr_pasupperbase' $(BUILDDIR)/strwords-base.s; \
-	if grep -q 'p_passtr_pasposcpu' $(BUILDDIR)/strwords-base.s; then echo "strwords-base.s calls the AVX2 search"; exit 1; fi; \
+	grep -q 'p_f[.]6_passtr12_pasupperbase' $(BUILDDIR)/strwords-base.s; \
+	if grep -q 'p_f[.]6_passtr9_pasposcpu' $(BUILDDIR)/strwords-base.s; then echo "strwords-base.s calls the AVX2 search"; exit 1; fi; \
 	grep -qw 'tzcntq' $(BUILDDIR)/set256.s; \
 	grep -qw 'ptest' $(BUILDDIR)/set256-v2.s; \
 	if grep -qw 'vptest' $(BUILDDIR)/set256-v2.s; then echo "set256-v2.s carries AVX2"; exit 1; fi; \
@@ -1612,18 +1613,18 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	python3 -I scripts/gen_pdfwork.py --check; \
 	: testdata/pdfannot.txt is what scripts/gen_pdfannot.py writes, P521; \
 	python3 -I scripts/gen_pdfannot.py --check; \
-	grep -q 'call p_passtr_pasfindbytecpu$$' $(BUILDDIR)/longslice.s || { echo "longslice.s does not call the AVX2 front of IndexByte"; exit 1; }; \
-	grep -q 'call p_passtr_pascomparebytecpu$$' $(BUILDDIR)/longslice.s || { echo "longslice.s does not call the AVX2 front of CompareByte"; exit 1; }; \
-	grep -q 'call p_passtr_pasfindbytebase$$' $(BUILDDIR)/longslice-base.s || { echo "longslice-base.s does not call the base front of IndexByte"; exit 1; }; \
-	if grep -q 'call p_passtr_pas[a-z]*cpu$$' $(BUILDDIR)/longslice-base.s; then echo "longslice-base.s calls an AVX2 front"; exit 1; fi; \
-	grep -q 'call p_passtr_pasutf8blockscpu$$' $(BUILDDIR)/$(LVL_X64)/passtr.s || { echo "passtr's v3 build does not call the AVX2 UTF-8 kernel"; exit 1; }; \
-	if grep -q 'call p_passtr_pasutf8blockscpu$$' $(BUILDDIR)/passtr.s; then echo "passtr's base build calls the AVX2 UTF-8 kernel"; exit 1; fi; \
+	grep -q 'call p_f[.]6_passtr14_pasfindbytecpu$$' $(BUILDDIR)/longslice.s || { echo "longslice.s does not call the AVX2 front of IndexByte"; exit 1; }; \
+	grep -q 'call p_f[.]6_passtr17_pascomparebytecpu$$' $(BUILDDIR)/longslice.s || { echo "longslice.s does not call the AVX2 front of CompareByte"; exit 1; }; \
+	grep -q 'call p_f[.]6_passtr15_pasfindbytebase$$' $(BUILDDIR)/longslice-base.s || { echo "longslice-base.s does not call the base front of IndexByte"; exit 1; }; \
+	if grep -q 'call p_f[.]6_passtr[0-9]*_pas[a-z]*cpu$$' $(BUILDDIR)/longslice-base.s; then echo "longslice-base.s calls an AVX2 front"; exit 1; fi; \
+	grep -q 'call p_f[.]6_passtr16_pasutf8blockscpu$$' $(BUILDDIR)/$(LVL_X64)/passtr.s || { echo "passtr's v3 build does not call the AVX2 UTF-8 kernel"; exit 1; }; \
+	if grep -q 'call p_f[.]6_passtr16_pasutf8blockscpu$$' $(BUILDDIR)/passtr.s; then echo "passtr's base build calls the AVX2 UTF-8 kernel"; exit 1; fi; \
 	: the scans of JSON against their definitions, P202: the expected output is the model output, the v3 build calls the AVX2 kernels and the base build the SSE2 ones; \
 	python3 -I scripts/jsonkern_model.py testdata/jsonkern.paslang | diff -u testdata/jsonkern.out -; \
 	for k in pasjsonindex pasjsonescindex; do \
-	  grep -q "call p_pasjson_$${k}cpu$$" $(BUILDDIR)/$(LVL_X64)/pasjson.s || { echo "pasjson's v3 build does not call $${k}cpu"; exit 1; }; \
-	  grep -q "call p_pasjson_$${k}base$$" $(BUILDDIR)/pasjson.s || { echo "pasjson's base build does not call $${k}base"; exit 1; }; \
-	  if grep -q "call p_pasjson_$${k}cpu$$" $(BUILDDIR)/pasjson.s; then echo "pasjson's base build calls $${k}cpu"; exit 1; fi; \
+	  grep -q "call p_f[.]7_pasjson$$(( $${#k} + 3 ))_$${k}cpu$$" $(BUILDDIR)/$(LVL_X64)/pasjson.s || { echo "pasjson's v3 build does not call $${k}cpu"; exit 1; }; \
+	  grep -q "call p_f[.]7_pasjson$$(( $${#k} + 4 ))_$${k}base$$" $(BUILDDIR)/pasjson.s || { echo "pasjson's base build does not call $${k}base"; exit 1; }; \
+	  if grep -q "call p_f[.]7_pasjson$$(( $${#k} + 3 ))_$${k}cpu$$" $(BUILDDIR)/pasjson.s; then echo "pasjson's base build calls $${k}cpu"; exit 1; fi; \
 	done; \
 	echo ok cpu-base; \
 	echo "==== the json type (P203) ===="; \
@@ -1901,7 +1902,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/debug1.out $(BUILDDIR)/debug1.got; \
 	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/debug1-plain testdata/debug1.paslang; \
 	if nm $(BUILDDIR)/debug1-plain | grep -q pasdebug; then echo "a program compiled without -debug carries the debugger"; exit 1; fi; \
-	if ! nm $(BUILDDIR)/debug1 | grep -q p_pasdebug_pasdebugline; then echo "the -debug program has no debugger"; exit 1; fi; \
+	if ! nm $(BUILDDIR)/debug1 | grep -q p_f[.]8_pasdebug12_pasdebugline; then echo "the -debug program has no debugger"; exit 1; fi; \
 	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(OUTDIR)/pasdbg cmd/pasdbg/pasdbg.paslang; \
 	echo ok debug; \
 	echo "==== debug console ===="; \
@@ -2828,21 +2829,21 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	python3 -I scripts/cputune_out.py testdata/cputune.paslang | diff -u testdata/cputune.out - ; \
 	: under -cpu base, the routines after the CPU haswell directive take lzcnt and tzcnt and say so, the base ones bsr and bsf, and One stays a call from the main block; \
 	$(OUTDIR)/paslangc -cpu base -o $(BUILDDIR)/cputune-b testdata/cputune.paslang; \
-	awk '/^p_lzfast:/,/^\.section/' $(BUILDDIR)/cputune-b.s > $(BUILDDIR)/cputune-lzfast.s; \
-	awk '/^p_tzfast:/,/^\.section/' $(BUILDDIR)/cputune-b.s > $(BUILDDIR)/cputune-tzfast.s; \
-	awk '/^p_lzbase:/,/^\.section/' $(BUILDDIR)/cputune-b.s > $(BUILDDIR)/cputune-lzbase.s; \
-	awk '/^p_tzbase:/,/^\.section/' $(BUILDDIR)/cputune-b.s > $(BUILDDIR)/cputune-tzbase.s; \
+	awk '/^p_f[.]0_6_lzfast:/,/^\.section/' $(BUILDDIR)/cputune-b.s > $(BUILDDIR)/cputune-lzfast.s; \
+	awk '/^p_f[.]0_6_tzfast:/,/^\.section/' $(BUILDDIR)/cputune-b.s > $(BUILDDIR)/cputune-tzfast.s; \
+	awk '/^p_f[.]0_6_lzbase:/,/^\.section/' $(BUILDDIR)/cputune-b.s > $(BUILDDIR)/cputune-lzbase.s; \
+	awk '/^p_f[.]0_6_tzbase:/,/^\.section/' $(BUILDDIR)/cputune-b.s > $(BUILDDIR)/cputune-tzbase.s; \
 	awk '/^pas_main:/,/^\.section/' $(BUILDDIR)/cputune-b.s > $(BUILDDIR)/cputune-main.s; \
 	test $$(grep -c 'lzcnt[lq] ' $(BUILDDIR)/cputune-lzfast.s) = 7 || { echo "cputune.s: LzFast has not seven lzcnt"; exit 1; }; \
 	test $$(grep -c 'tzcnt[lq] ' $(BUILDDIR)/cputune-tzfast.s) = 7 || { echo "cputune.s: TzFast has not seven tzcnt"; exit 1; }; \
 	if grep -q 'bsr\|bsf' $(BUILDDIR)/cputune-lzfast.s $(BUILDDIR)/cputune-tzfast.s; then echo "cputune.s: a haswell routine has bsr or bsf"; exit 1; fi; \
 	test $$(grep -c 'bsrq ' $(BUILDDIR)/cputune-lzbase.s) = 7 && test $$(grep -c 'bsfq ' $(BUILDDIR)/cputune-tzbase.s) = 7 || { echo "cputune.s: the base routines are not bsr and bsf"; exit 1; }; \
 	if grep -q 'lzcnt\|tzcnt' $(BUILDDIR)/cputune-lzbase.s $(BUILDDIR)/cputune-tzbase.s $(BUILDDIR)/cputune-main.s; then echo "cputune.s: a base routine has lzcnt or tzcnt"; exit 1; fi; \
-	grep -qF '/* p_lzfast: cpu ' $(BUILDDIR)/cputune-b.s && grep -F '/* p_lzfast: cpu ' $(BUILDDIR)/cputune-b.s | grep -q 'bmi1.* lzcnt.*; tune haswell \*/' || { echo "cputune.s: LzFast does not say its processor"; exit 1; }; \
+	grep -qF '/* p_f.0_6_lzfast: cpu ' $(BUILDDIR)/cputune-b.s && grep -F '/* p_f.0_6_lzfast: cpu ' $(BUILDDIR)/cputune-b.s | grep -q 'bmi1.* lzcnt.*; tune haswell \*/' || { echo "cputune.s: LzFast does not say its processor"; exit 1; }; \
 	grep -qF '; tune zen1 */' $(BUILDDIR)/cputune-b.s || { echo "cputune.s: Tuned does not say its tune"; exit 1; }; \
-	if grep -qF '/* p_lzbase' $(BUILDDIR)/cputune-b.s; then echo "cputune.s: a routine of the command line's processor says one"; exit 1; fi; \
-	grep -q 'call p_one$$' $(BUILDDIR)/cputune-main.s || { echo "cputune.s: One, of another processor, went into the main block"; exit 1; }; \
-	if grep -q 'call p_two$$' $(BUILDDIR)/cputune-main.s; then echo "cputune.s: Two, of the main block's processor, stayed a call"; exit 1; fi; \
+	if grep -qF '/* p_f.0_6_lzbase' $(BUILDDIR)/cputune-b.s; then echo "cputune.s: a routine of the command line's processor says one"; exit 1; fi; \
+	grep -q 'call p_f[.]0_3_one$$' $(BUILDDIR)/cputune-main.s || { echo "cputune.s: One, of another processor, went into the main block"; exit 1; }; \
+	if grep -q 'call p_f[.]0_3_two$$' $(BUILDDIR)/cputune-main.s; then echo "cputune.s: Two, of the main block's processor, stayed a call"; exit 1; fi; \
 	: the runtime by -tune: the highest bit of the last word that differs is 63 - lzcnt on zen2, bsr on zen5 and haswell; \
 	$(OUTDIR)/paslangc -cpu haswell -tune zen2 -o $(BUILDDIR)/cputune-hz2 testdata/cputune.paslang; \
 	$(OUTDIR)/paslangc -cpu haswell -tune zen5 -o $(BUILDDIR)/cputune-hz5 testdata/cputune.paslang; \
@@ -2855,8 +2856,8 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	done; \
 	: a unit compiled for base whose routine and initialization are for haswell; \
 	$(OUTDIR)/paslangc -cpu base testdata/units/cpuu.paslang; \
-	grep -qF '/* p_cpuu_uhigh: cpu ' $(BUILDDIR)/cpuu.s && grep -qF '/* u_cpuu_init: cpu ' $(BUILDDIR)/cpuu.s || { echo "cpuu.s: the unit's routine or initialization does not say its processor"; exit 1; }; \
-	awk '/^p_cpuu_uhigh:/,/^\.section/' $(BUILDDIR)/cpuu.s | grep -q 'lzcnt' || { echo "cpuu.s: UHigh has no lzcnt"; exit 1; }; \
+	grep -qF '/* p_f.4_cpuu5_uhigh: cpu ' $(BUILDDIR)/cpuu.s && grep -qF '/* u_cpuu_init: cpu ' $(BUILDDIR)/cpuu.s || { echo "cpuu.s: the unit's routine or initialization does not say its processor"; exit 1; }; \
+	awk '/^p_f[.]4_cpuu5_uhigh:/,/^\.section/' $(BUILDDIR)/cpuu.s | grep -q 'lzcnt' || { echo "cpuu.s: UHigh has no lzcnt"; exit 1; }; \
 	$(OUTDIR)/paslangc -cpu base -Fu $(BUILDDIR) -o $(BUILDDIR)/cputuse testdata/cputuse.paslang; \
 	$(BUILDDIR)/cputuse > $(BUILDDIR)/cputuse.got; \
 	diff -u testdata/cputuse.out $(BUILDDIR)/cputuse.got; \
@@ -3028,12 +3029,12 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	: P507: the order of unsigned words written with the sign flipped is one compare and an unsigned condition on both machines, no constant loaded and no xor; \
 	python3 -I scripts/gen_ult.py --check; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/ult_s testdata/ult.paslang; \
-	sed -n '/^p_vars:/,/cfi_endproc/p' $(BUILDDIR)/ult_s.s > $(BUILDDIR)/ult_vars.s; \
+	sed -n '/^p_f[.]0_4_vars:/,/cfi_endproc/p' $(BUILDDIR)/ult_s.s > $(BUILDDIR)/ult_vars.s; \
 	grep -q 'cmovbq ' $(BUILDDIR)/ult_vars.s; \
 	grep -q 'setb %al' $(BUILDDIR)/ult_vars.s; \
 	test $$(grep -c 'movabsq' $(BUILDDIR)/ult_vars.s) -eq 0; \
 	$(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/ult_a testdata/ult.paslang; \
-	sed -n '/^p_vars:/,/cfi_endproc/p' $(BUILDDIR)/ult_a.s > $(BUILDDIR)/ult_avars.s; \
+	sed -n '/^p_f[.]0_4_vars:/,/cfi_endproc/p' $(BUILDDIR)/ult_a.s > $(BUILDDIR)/ult_avars.s; \
 	grep -q 'csel x[0-9]*, x[0-9]*, x[0-9]*, lo$$' $(BUILDDIR)/ult_avars.s; \
 	grep -q 'cset x[0-9]*, hs$$' $(BUILDDIR)/ult_avars.s; \
 	test $$(grep -c ' eor ' $(BUILDDIR)/ult_avars.s) -eq 0; \
@@ -3042,21 +3043,21 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	: P508: AddCarry and SubBorrow with operands the registers take are an adc or sbb on the pool with the carry in the flag and no push of an operand on both machines, testdata/carry is what scripts/gen_carry.py writes; \
 	python3 -I scripts/gen_carry.py --check; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/carry_s testdata/carry.paslang; \
-	sed -n '/^p_f_local_0:/,/cfi_endproc/p' $(BUILDDIR)/carry_s.s > $(BUILDDIR)/carry_f.s; \
+	sed -n '/^p_f[.]0_9_f_local_0:/,/cfi_endproc/p' $(BUILDDIR)/carry_s.s > $(BUILDDIR)/carry_f.s; \
 	grep -q 'adcq ' $(BUILDDIR)/carry_f.s; \
 	grep -q 'negq ' $(BUILDDIR)/carry_f.s; \
-	sed -n '/^p_f_word_0:/,/cfi_endproc/p' $(BUILDDIR)/carry_s.s > $(BUILDDIR)/carry_w.s; \
+	sed -n '/^p_f[.]0_8_f_word_0:/,/cfi_endproc/p' $(BUILDDIR)/carry_s.s > $(BUILDDIR)/carry_w.s; \
 	test $$(grep -c 'setc %cl' $(BUILDDIR)/carry_w.s) -eq $$(grep -c 'movzbl %cl, %ecx' $(BUILDDIR)/carry_w.s); \
-	sed -n '/^p_m_drop:/,/cfi_endproc/p' $(BUILDDIR)/carry_s.s > $(BUILDDIR)/carry_d.s; \
+	sed -n '/^p_f[.]0_6_m_drop:/,/cfi_endproc/p' $(BUILDDIR)/carry_s.s > $(BUILDDIR)/carry_d.s; \
 	grep -q 'adcq ' $(BUILDDIR)/carry_d.s; \
 	test $$(grep -c 'pushq %rax' $(BUILDDIR)/carry_d.s) -eq 0; \
 	test $$(grep -c 'pushq %rax' $(BUILDDIR)/carry_f.s) -eq 0; \
 	test $$(grep -c 'movq %rsi, %rax' $(BUILDDIR)/carry_f.s) -eq 0; \
 	$(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/carry_a testdata/carry.paslang; \
-	sed -n '/^p_f_local_0:/,/cfi_endproc/p' $(BUILDDIR)/carry_a.s > $(BUILDDIR)/carry_af.s; \
+	sed -n '/^p_f[.]0_9_f_local_0:/,/cfi_endproc/p' $(BUILDDIR)/carry_a.s > $(BUILDDIR)/carry_af.s; \
 	grep -q 'adcs x' $(BUILDDIR)/carry_af.s; \
 	grep -q 'cset x1, cs' $(BUILDDIR)/carry_af.s; \
-	sed -n '/^p_m_drop:/,/cfi_endproc/p' $(BUILDDIR)/carry_a.s > $(BUILDDIR)/carry_ad.s; \
+	sed -n '/^p_f[.]0_6_m_drop:/,/cfi_endproc/p' $(BUILDDIR)/carry_a.s > $(BUILDDIR)/carry_ad.s; \
 	grep -q 'adcs x' $(BUILDDIR)/carry_ad.s; \
 	test $$(grep -c 'str x0, .sp, #-16' $(BUILDDIR)/carry_ad.s) -eq 0; \
 	test $$(grep -c 'str x0, .sp, #-16' $(BUILDDIR)/carry_af.s) -eq 0; \
@@ -3065,56 +3066,56 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	: P509: FunnelLeft and FunnelRight with operands the registers take are worked out without the stack, and a count the compiler proves to lie in 0 to 63 needs no test on both machines, testdata/funnel is what scripts/gen_funnel.py writes; \
 	python3 -I scripts/gen_funnel.py --check; \
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/funnel_s testdata/funnel.paslang; \
-	sed -n '/^p_s_safel:/,/cfi_endproc/p' $(BUILDDIR)/funnel_s.s > $(BUILDDIR)/funnel_l.s; \
+	sed -n '/^p_f[.]0_7_s_safel:/,/cfi_endproc/p' $(BUILDDIR)/funnel_s.s > $(BUILDDIR)/funnel_l.s; \
 	grep -q 'shldq %cl, %rdx, %rax' $(BUILDDIR)/funnel_l.s; \
 	test $$(grep -c 'cmpq $$64, %rcx' $(BUILDDIR)/funnel_l.s) -eq 0; \
 	test $$(grep -c 'testq %rcx, %rcx' $(BUILDDIR)/funnel_l.s) -eq 0; \
 	test $$(grep -c 'pushq %rax' $(BUILDDIR)/funnel_l.s) -eq 0; \
-	sed -n '/^p_s_safer:/,/cfi_endproc/p' $(BUILDDIR)/funnel_s.s > $(BUILDDIR)/funnel_r.s; \
+	sed -n '/^p_f[.]0_7_s_safer:/,/cfi_endproc/p' $(BUILDDIR)/funnel_s.s > $(BUILDDIR)/funnel_r.s; \
 	grep -q 'shrdq %cl, %rax, %rdx' $(BUILDDIR)/funnel_r.s; \
 	test $$(grep -c 'cmpq $$64, %rcx' $(BUILDDIR)/funnel_r.s) -eq 0; \
 	test $$(grep -c 'pushq %rax' $(BUILDDIR)/funnel_r.s) -eq 0; \
-	sed -n '/^p_s_widel:/,/cfi_endproc/p' $(BUILDDIR)/funnel_s.s > $(BUILDDIR)/funnel_w.s; \
+	sed -n '/^p_f[.]0_7_s_widel:/,/cfi_endproc/p' $(BUILDDIR)/funnel_s.s > $(BUILDDIR)/funnel_w.s; \
 	grep -q 'cmpq $$64, %rcx' $(BUILDDIR)/funnel_w.s; \
-	sed -n '/^p_s_byter:/,/cfi_endproc/p' $(BUILDDIR)/funnel_s.s > $(BUILDDIR)/funnel_b.s; \
+	sed -n '/^p_f[.]0_7_s_byter:/,/cfi_endproc/p' $(BUILDDIR)/funnel_s.s > $(BUILDDIR)/funnel_b.s; \
 	test $$(grep -c 'cmpq $$64, %rcx' $(BUILDDIR)/funnel_b.s) -eq 0; \
 	test $$(grep -c 'testq %rcx, %rcx' $(BUILDDIR)/funnel_b.s) -eq 0; \
-	sed -n '/^p_s_byteu:/,/cfi_endproc/p' $(BUILDDIR)/funnel_s.s > $(BUILDDIR)/funnel_u.s; \
+	sed -n '/^p_f[.]0_7_s_byteu:/,/cfi_endproc/p' $(BUILDDIR)/funnel_s.s > $(BUILDDIR)/funnel_u.s; \
 	grep -q 'cmpq $$64, %rcx' $(BUILDDIR)/funnel_u.s; \
 	$(OUTDIR)/paslangc -target arm64 -inline 0 -o $(BUILDDIR)/funnel_x testdata/funnel.paslang; \
-	sed -n '/^p_s_safel:/,/cfi_endproc/p' $(BUILDDIR)/funnel_x.s > $(BUILDDIR)/funnel_xl.s; \
+	sed -n '/^p_f[.]0_7_s_safel:/,/cfi_endproc/p' $(BUILDDIR)/funnel_x.s > $(BUILDDIR)/funnel_xl.s; \
 	grep -q 'mvn x10, x1' $(BUILDDIR)/funnel_xl.s; \
 	test $$(grep -c 'cmp x1, #64' $(BUILDDIR)/funnel_xl.s) -eq 0; \
 	test $$(grep -c 'str x0, .sp, #-16' $(BUILDDIR)/funnel_xl.s) -eq 0; \
-	sed -n '/^p_s_safer:/,/cfi_endproc/p' $(BUILDDIR)/funnel_x.s > $(BUILDDIR)/funnel_xr.s; \
+	sed -n '/^p_f[.]0_7_s_safer:/,/cfi_endproc/p' $(BUILDDIR)/funnel_x.s > $(BUILDDIR)/funnel_xr.s; \
 	grep -q 'mvn x10, x1' $(BUILDDIR)/funnel_xr.s; \
 	test $$(grep -c 'cmp x1, #64' $(BUILDDIR)/funnel_xr.s) -eq 0; \
-	sed -n '/^p_s_widel:/,/cfi_endproc/p' $(BUILDDIR)/funnel_x.s > $(BUILDDIR)/funnel_xw.s; \
+	sed -n '/^p_f[.]0_7_s_widel:/,/cfi_endproc/p' $(BUILDDIR)/funnel_x.s > $(BUILDDIR)/funnel_xw.s; \
 	grep -q 'cmp x1, #64' $(BUILDDIR)/funnel_xw.s; \
-	sed -n '/^p_s_byter:/,/cfi_endproc/p' $(BUILDDIR)/funnel_x.s > $(BUILDDIR)/funnel_xb.s; \
+	sed -n '/^p_f[.]0_7_s_byter:/,/cfi_endproc/p' $(BUILDDIR)/funnel_x.s > $(BUILDDIR)/funnel_xb.s; \
 	test $$(grep -c 'cmp x1, #64' $(BUILDDIR)/funnel_xb.s) -eq 0; \
 	test $$(grep -c 'cmp x1, #0' $(BUILDDIR)/funnel_xb.s) -eq 0; \
-	sed -n '/^p_s_byteu:/,/cfi_endproc/p' $(BUILDDIR)/funnel_x.s > $(BUILDDIR)/funnel_xu.s; \
+	sed -n '/^p_f[.]0_7_s_byteu:/,/cfi_endproc/p' $(BUILDDIR)/funnel_x.s > $(BUILDDIR)/funnel_xu.s; \
 	grep -q 'cmp x1, #64' $(BUILDDIR)/funnel_xu.s; \
 	echo ok funnel
 	@set -e; \
 	: P510: the variables of a routine with no call and more than eight of them whose lives do not meet share a slot, and so does a routine that calls or has few keep one each, testdata/slots is what scripts/gen_slots.py writes; \
 	python3 -I scripts/gen_slots.py --check; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/slots_s testdata/slots.paslang; \
-	test $$(sed -n 's/^\.set \.Lfrp_rwide, //p' $(BUILDDIR)/slots_s.s) -le 128; \
-	test $$(sed -n 's/^\.set \.Lfrp_r08, //p' $(BUILDDIR)/slots_s.s) -ge 200; \
-	test $$(sed -n 's/^\.set \.Lfrp_r11, //p' $(BUILDDIR)/slots_s.s) -ge 96; \
-	test $$(sed -n 's/^\.set \.Lfrp_r17, //p' $(BUILDDIR)/slots_s.s) -ge 128; \
+	test $$(sed -n 's/^\.set \.Lfrp_f[.]0_5_rwide, //p' $(BUILDDIR)/slots_s.s) -le 128; \
+	test $$(sed -n 's/^\.set \.Lfrp_f[.]0_3_r08, //p' $(BUILDDIR)/slots_s.s) -ge 200; \
+	test $$(sed -n 's/^\.set \.Lfrp_f[.]0_3_r11, //p' $(BUILDDIR)/slots_s.s) -ge 96; \
+	test $$(sed -n 's/^\.set \.Lfrp_f[.]0_3_r17, //p' $(BUILDDIR)/slots_s.s) -ge 128; \
 	echo ok slots
 	@set -e; \
 	: P230: a loop of integer arithmetic alone whose expressions need the pool one register deep keeps a variable in rdi too, and one whose expressions need two, or that holds a conditional move, keeps the pool it had, testdata/regs is what scripts/gen_regs.py writes; \
 	python3 -I scripts/gen_regs.py --check; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/regs_s testdata/regs.paslang; \
-	sed -n '/^p_mixer:/,/cfi_endproc/p' $(BUILDDIR)/regs_s.s > $(BUILDDIR)/regs_m.s; \
+	sed -n '/^p_f[.]0_5_mixer:/,/cfi_endproc/p' $(BUILDDIR)/regs_s.s > $(BUILDDIR)/regs_m.s; \
 	test $$(grep -c '%rdi' $(BUILDDIR)/regs_m.s) -ge 4; \
-	sed -n '/^p_deeploop:/,/cfi_endproc/p' $(BUILDDIR)/regs_s.s > $(BUILDDIR)/regs_p.s; \
+	sed -n '/^p_f[.]0_8_deeploop:/,/cfi_endproc/p' $(BUILDDIR)/regs_s.s > $(BUILDDIR)/regs_p.s; \
 	test $$(grep -c 'movq %rsi, %rax' $(BUILDDIR)/regs_p.s) -eq 0; \
-	sed -n '/^p_selloop:/,/cfi_endproc/p' $(BUILDDIR)/regs_s.s > $(BUILDDIR)/regs_c.s; \
+	sed -n '/^p_f[.]0_7_selloop:/,/cfi_endproc/p' $(BUILDDIR)/regs_s.s > $(BUILDDIR)/regs_c.s; \
 	test $$(grep -c cmov $(BUILDDIR)/regs_c.s) -ge 2; \
 	echo ok regs
 	@set -e; \
@@ -3128,12 +3129,12 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	python3 -I scripts/gen_dloop.py --check; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/dloop_s testdata/dloop.paslang; \
 	for r in hornerplain hornerfma resultloop sumloop doublecount; do \
-	  sed -n "/^p_$$r:/,/cfi_endproc/p" $(BUILDDIR)/dloop_s.s > $(BUILDDIR)/dloop_r.s; \
+	  sed -n "/^p_f[.]0_$${#r}_$$r:/,/cfi_endproc/p" $(BUILDDIR)/dloop_s.s > $(BUILDDIR)/dloop_r.s; \
 	  test $$(grep -c 'movq %r[a-z0-9]*, %xmm' $(BUILDDIR)/dloop_r.s) -eq 0; \
 	  test $$(grep -c 'movq %xmm[0-9]*, %r' $(BUILDDIR)/dloop_r.s) -eq 0; \
 	  grep -q 'pushq %rbp' $(BUILDDIR)/dloop_r.s; \
 	done; \
-	sed -n '/^p_noloop:/,/cfi_endproc/p' $(BUILDDIR)/dloop_s.s > $(BUILDDIR)/dloop_n.s; \
+	sed -n '/^p_f[.]0_6_noloop:/,/cfi_endproc/p' $(BUILDDIR)/dloop_s.s > $(BUILDDIR)/dloop_n.s; \
 	test $$(grep -c 'pushq %rbp' $(BUILDDIR)/dloop_n.s) -eq 0; \
 	echo ok dloop
 	@set -e; \
@@ -3141,7 +3142,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	python3 -I scripts/gen_adler.py --check; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/adler testdata/adler.paslang; \
 	$(BUILDDIR)/adler | diff -u testdata/adler.out -; \
-	objdump -d --no-show-raw-insn $(BUILDDIR)/adler | awk '/<p_pashash_pasadler32>:/,/ret/' | grep -q 'movabs \$$0x1000100010001'; \
+	objdump -d --no-show-raw-insn $(BUILDDIR)/adler | awk '/<p_f[.]7_pashash10_pasadler32>:/,/ret/' | grep -q 'movabs \$$0x1000100010001'; \
 	echo ok adler
 	@set -e; \
 	: P534: dates are split by the 400-year cycle of the Go time package and the ISO forms are written in one string, testdata/civil is what scripts/gen_civil.py writes and its expected output is worked out by Python integers with the days from civil algorithm of Howard Hinnant after a check against datetime; \
@@ -3156,11 +3157,11 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(BUILDDIR)/outw_s | diff -u testdata/outw.out -; \
 	for t in byte int16 uint32 integer; do \
 	  for r in set inc two; do \
-	    sed -n "/^p_$$r$$t:/,/cfi_endproc/p" $(BUILDDIR)/outw_s.s > $(BUILDDIR)/outw_r.s; \
+	    sed -n "/^p_f[.]0_$$(( $${#r} + $${#t} ))_$$r$$t:/,/cfi_endproc/p" $(BUILDDIR)/outw_s.s > $(BUILDDIR)/outw_r.s; \
 	    test -s $(BUILDDIR)/outw_r.s; \
 	    test $$(grep -c 'pushq %rax\|popq %rcx\|r11\|movq %rsi, %rax' $(BUILDDIR)/outw_r.s) -eq 0 || { echo "$$r$$t writes through the stack, r11 or rax"; exit 1; }; \
 	  done; \
-	  sed -n "/^p_loop$$t:/,/cfi_endproc/p" $(BUILDDIR)/outw_s.s > $(BUILDDIR)/outw_r.s; \
+	  sed -n "/^p_f[.]0_$$(( 4 + $${#t} ))_loop$$t:/,/cfi_endproc/p" $(BUILDDIR)/outw_s.s > $(BUILDDIR)/outw_r.s; \
 	  test -s $(BUILDDIR)/outw_r.s; \
 	  test $$(grep -c 'pushq %rax\|popq %rcx' $(BUILDDIR)/outw_r.s) -eq 0 || { echo "loop$$t writes through the stack"; exit 1; }; \
 	done; \
@@ -3171,18 +3172,18 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/divnn_s testdata/divnn.paslang; \
 	$(BUILDDIR)/divnn_s | diff -u testdata/divnn.out -; \
 	for r in dsmall rsmall dpow rpow dwide rwide dbyte; do \
-	  sed -n "/^p_$$r:/,/cfi_endproc/p" $(BUILDDIR)/divnn_s.s > $(BUILDDIR)/divnn_r.s; \
+	  sed -n "/^p_f[.]0_$${#r}_$$r:/,/cfi_endproc/p" $(BUILDDIR)/divnn_s.s > $(BUILDDIR)/divnn_r.s; \
 	  test -s $(BUILDDIR)/divnn_r.s; \
 	  test $$(grep -c 'sarq $$63' $(BUILDDIR)/divnn_r.s) -eq 0 || { echo "$$r keeps the sign correction"; exit 1; }; \
 	done; \
 	for r in dneg rneg; do \
-	  sed -n "/^p_$$r:/,/cfi_endproc/p" $(BUILDDIR)/divnn_s.s > $(BUILDDIR)/divnn_r.s; \
+	  sed -n "/^p_f[.]0_$${#r}_$$r:/,/cfi_endproc/p" $(BUILDDIR)/divnn_s.s > $(BUILDDIR)/divnn_r.s; \
 	  test $$(grep -c 'sarq $$63' $(BUILDDIR)/divnn_r.s) -ge 1 || { echo "$$r lost its sign correction"; exit 1; }; \
 	done; \
-	sed -n '/^p_dsmall:/,/cfi_endproc/p' $(BUILDDIR)/divnn_s.s > $(BUILDDIR)/divnn_r.s; \
+	sed -n '/^p_f[.]0_6_dsmall:/,/cfi_endproc/p' $(BUILDDIR)/divnn_s.s > $(BUILDDIR)/divnn_r.s; \
 	test $$(grep -c 'imulq' $(BUILDDIR)/divnn_r.s) -eq 1; \
 	test $$(grep -c 'sarq' $(BUILDDIR)/divnn_r.s) -eq 0; \
-	sed -n '/^p_dpow:/,/cfi_endproc/p' $(BUILDDIR)/divnn_s.s > $(BUILDDIR)/divnn_r.s; \
+	sed -n '/^p_f[.]0_4_dpow:/,/cfi_endproc/p' $(BUILDDIR)/divnn_s.s > $(BUILDDIR)/divnn_r.s; \
 	test $$(grep -c 'imulq' $(BUILDDIR)/divnn_r.s) -eq 0; \
 	echo ok divnn
 	@set -e; \
@@ -3191,7 +3192,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/mathgo testdata/mathgo.paslang; \
 	$(BUILDDIR)/mathgo | diff -u testdata/mathgo.out -; \
 	for f in passin pascos pasexp pasln pasatan; do \
-	  grep -q "jmp p_pasmath_$$f" $(BUILDDIR)/mathgo.s; \
+	  grep -qE "(jb|jmp) p_f[.]7_pasmath$${#f}_$$f$$" $(BUILDDIR)/mathgo.s; \
 	done; \
 	echo ok mathgo
 	@set -e; \
@@ -3200,21 +3201,21 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/dflat_s testdata/dflat.paslang; \
 	$(BUILDDIR)/dflat_s | diff -u testdata/dflat.out -; \
 	for r in hu hp he ht hf hz hx hq hy hi hk hc hj hb hl hn hv f0 f1 f2 f3 f4 f5 f6 f7 f8 f9 f10 f11 f12 f13 f14 f15 f16 f17 f18 f19 f20 f21 f22 f23 f24 f25 f26 f27 f28 f29; do \
-	  sed -n "/^p_$$r:/,/cfi_endproc/p" $(BUILDDIR)/dflat_s.s > $(BUILDDIR)/dflat_r.s; \
+	  sed -n "/^p_f[.]0_$${#r}_$$r:/,/cfi_endproc/p" $(BUILDDIR)/dflat_s.s > $(BUILDDIR)/dflat_r.s; \
 	  test -s $(BUILDDIR)/dflat_r.s; \
 	  test $$(grep -c '(%rbp)' $(BUILDDIR)/dflat_r.s) -eq 0 || { echo "$$r has a frame"; exit 1; }; \
 	  grep -q '%xmm8' $(BUILDDIR)/dflat_r.s || { echo "$$r keeps no Double in xmm8"; exit 1; }; \
 	done; \
 	for r in hv ht hf; do \
-	  sed -n "/^p_$$r:/,/cfi_endproc/p" $(BUILDDIR)/dflat_s.s > $(BUILDDIR)/dflat_r.s; \
+	  sed -n "/^p_f[.]0_$${#r}_$$r:/,/cfi_endproc/p" $(BUILDDIR)/dflat_s.s > $(BUILDDIR)/dflat_r.s; \
 	  test $$(grep -c 'movq %rax, %xmm0' $(BUILDDIR)/dflat_r.s) -eq 0 || { echo "$$r carries a Double through rax into xmm0"; exit 1; }; \
 	  test $$(grep -c 'movq %xmm0, %rax' $(BUILDDIR)/dflat_r.s) -eq 0 || { echo "$$r carries a Double through rax out of xmm0"; exit 1; }; \
 	done; \
-	sed -n '/^p_hb:/,/cfi_endproc/p' $(BUILDDIR)/dflat_s.s > $(BUILDDIR)/dflat_r.s; \
+	sed -n '/^p_f[.]0_2_hb:/,/cfi_endproc/p' $(BUILDDIR)/dflat_s.s > $(BUILDDIR)/dflat_r.s; \
 	test $$(grep -c '%xmm' $(BUILDDIR)/dflat_r.s) -eq 2 || { echo "hb takes its result through an xmm register"; exit 1; }; \
-	sed -n '/^p_hq:/,/cfi_endproc/p' $(BUILDDIR)/dflat_s.s > $(BUILDDIR)/dflat_r.s; \
+	sed -n '/^p_f[.]0_2_hq:/,/cfi_endproc/p' $(BUILDDIR)/dflat_s.s > $(BUILDDIR)/dflat_r.s; \
 	grep -q '%xmm15' $(BUILDDIR)/dflat_r.s || { echo "hq with eight Doubles does not use xmm15"; exit 1; }; \
-	sed -n '/^p_hm:/,/cfi_endproc/p' $(BUILDDIR)/dflat_s.s > $(BUILDDIR)/dflat_r.s; \
+	sed -n '/^p_f[.]0_2_hm:/,/cfi_endproc/p' $(BUILDDIR)/dflat_s.s > $(BUILDDIR)/dflat_r.s; \
 	test $$(grep -c '(%rbp)' $(BUILDDIR)/dflat_r.s) -ge 1 || { echo "hm with nine Doubles has no frame"; exit 1; }; \
 	python3 -I scripts/check_dflat_loc.py $(BUILDDIR)/dflat_s; \
 	$(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/dflat_a testdata/dflat.paslang; \
@@ -3256,7 +3257,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	python3 -I scripts/gen_md5lens.py --check; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/md5lens testdata/md5lens.paslang; \
 	$(BUILDDIR)/md5lens | diff -u testdata/md5lens.out -; \
-	n=$$(objdump -d --no-show-raw-insn $(BUILDDIR)/md5lens | awk '/<p_pashash_md5blocks>:/,/ret/' | grep -cE '[[:space:]]not[[:space:]]') || true; \
+	n=$$(objdump -d --no-show-raw-insn $(BUILDDIR)/md5lens | awk '/<p_f[.]7_pashash9_md5blocks>:/,/ret/' | grep -cE '[[:space:]]not[[:space:]]') || true; \
 	[ "$$n" -le 32 ] || { echo "md5lens: Md5Blocks has $$n not instructions"; exit 1; }; \
 	echo ok md5lens
 	@set -e; \
@@ -3266,7 +3267,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(BUILDDIR)/crclens | diff -u testdata/crclens.out -; \
 	$(OUTDIR)/paslangc -cpu base -o $(BUILDDIR)/crclens_b testdata/crclens.paslang; \
 	$(BUILDDIR)/crclens_b | diff -u testdata/crclens.out -; \
-	n=$$(objdump -d --no-show-raw-insn $(BUILDDIR)/crclens_b | awk '/<p_pashash_crc32plain>:/,/ret/' | grep -c 'shr') || true; \
+	n=$$(objdump -d --no-show-raw-insn $(BUILDDIR)/crclens_b | awk '/<p_f[.]7_pashash10_crc32plain>:/,/ret/' | grep -c 'shr') || true; \
 	[ "$$n" -ge 14 ] || { echo "crclens: Crc32Plain has $$n shifts"; exit 1; }; \
 	echo ok crclens
 	@set -e; \
@@ -3274,7 +3275,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	python3 -I scripts/gen_sha3lens.py --check; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/sha3lens testdata/sha3lens.paslang; \
 	$(BUILDDIR)/sha3lens | diff -u testdata/sha3lens.out -; \
-	n=$$(objdump -d --no-show-raw-insn $(BUILDDIR)/sha3lens | awk '/<p_pashash_keccakf>:/,/ret/' | grep -cE '[[:space:]]rol[qdl]?[[:space:]]') || true; \
+	n=$$(objdump -d --no-show-raw-insn $(BUILDDIR)/sha3lens | awk '/<p_f[.]7_pashash7_keccakf>:/,/ret/' | grep -cE '[[:space:]]rol[qdl]?[[:space:]]') || true; \
 	[ "$$n" -ge 50 ] || { echo "sha3lens: KeccakF has $$n rotates"; exit 1; }; \
 	echo ok sha3lens
 	@set -e; \
@@ -3300,7 +3301,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(BUILDDIR)/realdest_b | diff -u testdata/realdest.out -; \
 	$(OUTDIR)/paslangc -cpu v3 -o $(BUILDDIR)/realdest_v testdata/realdest.paslang; \
 	for b in realdest_b realdest_v; do \
-	  objdump -d --no-show-raw-insn $(BUILDDIR)/$$b | awk '/^[0-9a-f]+ <[^>]*>:/{ on = ($$2 ~ /^<p_f[0-9]+>:$$/) } on' > $(BUILDDIR)/$$b.fn; \
+	  objdump -d --no-show-raw-insn $(BUILDDIR)/$$b | awk '/^[0-9a-f]+ <[^>]*>:/{ on = ($$2 ~ /^<p_f[.]0_[0-9]+_f[0-9]+>:$$/) } on' > $(BUILDDIR)/$$b.fn; \
 	done; \
 	n=$$(grep -c movapd $(BUILDDIR)/realdest_v.fn) || true; \
 	[ "$$n" -le 400 ] || { echo "realdest: $$n movapd at the v3 level"; exit 1; }; \
@@ -3316,23 +3317,23 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	python3 -I scripts/gen_mathacc.py --check; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/mathacc testdata/mathacc.paslang; \
 	$(BUILDDIR)/mathacc | diff -u testdata/mathacc.out -; \
-	grep -q "jb p_pasmath_pastan$$" $(BUILDDIR)/mathacc.s; \
+	grep -q "jb p_f[.]7_pasmath6_pastan$$" $(BUILDDIR)/mathacc.s; \
 	for f in pastanbig passinh pascosh pastanh pasasinh pasacosh pasatanh paslog1p paspow; do \
-	  grep -q "jmp p_pasmath_$$f$$" $(BUILDDIR)/mathacc.s; \
+	  grep -q "jmp p_f[.]7_pasmath$${#f}_$$f$$" $(BUILDDIR)/mathacc.s; \
 	done; \
 	echo ok mathacc
 	@set -e; \
 	: P553: the bits of an integer seen as a Double are an operand of Double arithmetic in a register and a movq, where a push and a pop carried it, testdata/bitview works each shape out with the view and with the Double the bytes make and compares the bits, and the functions of it hold no more than four push instructions; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/bitview testdata/bitview.paslang; \
 	$(BUILDDIR)/bitview | diff -u testdata/bitview.out -; \
-	n=$$(objdump -d --no-show-raw-insn $(BUILDDIR)/bitview | awk '/^[0-9a-f]+ <[^>]*>:/{ on = ($$2 ~ /^<p_f[0-9]+>:$$/) } on' | grep -c push) || true; \
+	n=$$(objdump -d --no-show-raw-insn $(BUILDDIR)/bitview | awk '/^[0-9a-f]+ <[^>]*>:/{ on = ($$2 ~ /^<p_f[.]0_[0-9]+_f[0-9]+>:$$/) } on' | grep -c push) || true; \
 	[ "$$n" -le 4 ] || { echo "bitview: $$n push in its functions"; exit 1; }; \
 	echo ok bitview
 	@set -e; \
 	: P554: an element of an open array that arrives by reference is reached through the address of its descriptor with nothing pushed and a Double element is loaded by movsd, testdata/arrparam reads and writes the elements of eight types in each form of index and checks them against the same formulas on static arrays, and its routines hold fewer than 100 push and pop instructions and 2000 instructions in the linked program; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/arrparam testdata/arrparam.paslang; \
 	$(BUILDDIR)/arrparam | diff -u testdata/arrparam.out -; \
-	objdump -d --no-show-raw-insn $(BUILDDIR)/arrparam | awk '/^[0-9a-f]+ <[^>]*>:/{ on = ($$2 ~ /^<p_(filli|filld|fillb|fillw|filll|fillr|fills|sumi|dotd|maxd|sumb|sumw|suml|sumr|cats|swapd|revd|bubblei)>:$$/) } on' > $(BUILDDIR)/arrparam.fn; \
+	objdump -d --no-show-raw-insn $(BUILDDIR)/arrparam | awk '/^[0-9a-f]+ <[^>]*>:/{ on = ($$2 ~ /^<p_f[.]0_[0-9]+_(filli|filld|fillb|fillw|filll|fillr|fills|sumi|dotd|maxd|sumb|sumw|suml|sumr|cats|swapd|revd|bubblei)>:$$/) } on' > $(BUILDDIR)/arrparam.fn; \
 	n=$$(grep -c 'push\|pop' $(BUILDDIR)/arrparam.fn) || true; \
 	[ "$$n" -lt 100 ] || { echo "arrparam: $$n push and pop in its routines"; exit 1; }; \
 	n=$$(grep -c '^ ' $(BUILDDIR)/arrparam.fn) || true; \
@@ -3343,7 +3344,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/mapiter testdata/mapiter.paslang; \
 	$(BUILDDIR)/mapiter | diff -u testdata/mapiter.out -; \
 	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 $(BUILDDIR)/mapiter | diff -u testdata/mapiter.out -; \
-	objdump -d --no-show-raw-insn $(BUILDDIR)/mapiter | awk '/^[0-9a-f]+ <[^>]*>:/{ on = ($$2 ~ /^<p_whole>:$$/) } on' > $(BUILDDIR)/mapiter.fn; \
+	objdump -d --no-show-raw-insn $(BUILDDIR)/mapiter | awk '/^[0-9a-f]+ <[^>]*>:/{ on = ($$2 ~ /^<p_f[.]0_5_whole>:$$/) } on' > $(BUILDDIR)/mapiter.fn; \
 	n=$$(grep -c '^ ' $(BUILDDIR)/mapiter.fn) || true; \
 	[ "$$n" -gt 50 ] || { echo "mapiter: Whole has $$n instructions"; exit 1; }; \
 	n=$$(grep -c 'rt_memcpy' $(BUILDDIR)/mapiter.fn) || true; \
@@ -3355,7 +3356,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/maprmw testdata/maprmw.paslang; \
 	$(BUILDDIR)/maprmw | diff -u testdata/maprmw.out -; \
 	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 $(BUILDDIR)/maprmw | diff -u testdata/maprmw.out -; \
-	objdump -d --no-show-raw-insn $(BUILDDIR)/maprmw | awk '/^[0-9a-f]+ <[^>]*>:/{ on = ($$2 ~ /^<p_upd>:$$/) } on' > $(BUILDDIR)/maprmw.fn; \
+	objdump -d --no-show-raw-insn $(BUILDDIR)/maprmw | awk '/^[0-9a-f]+ <[^>]*>:/{ on = ($$2 ~ /^<p_f[.]0_3_upd>:$$/) } on' > $(BUILDDIR)/maprmw.fn; \
 	n=$$(grep -c 'call.*pasmapputint' $(BUILDDIR)/maprmw.fn) || true; \
 	[ "$$n" -eq 5 ] || { echo "maprmw: $$n puts in Upd"; exit 1; }; \
 	n=$$(grep -c 'call.*pasmapgetint' $(BUILDDIR)/maprmw.fn) || true; \
@@ -3367,7 +3368,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/descparts testdata/descparts.paslang; \
 	$(BUILDDIR)/descparts | diff -u testdata/descparts.out -; \
 	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 $(BUILDDIR)/descparts | diff -u testdata/descparts.out -; \
-	objdump -d --no-show-raw-insn $(BUILDDIR)/descparts | awk '/^[0-9a-f]+ <[^>]*>:/{ on = ($$2 ~ /^<p_quick>:$$/) } on' > $(BUILDDIR)/descparts.fn; \
+	objdump -d --no-show-raw-insn $(BUILDDIR)/descparts | awk '/^[0-9a-f]+ <[^>]*>:/{ on = ($$2 ~ /^<p_f[.]0_5_quick>:$$/) } on' > $(BUILDDIR)/descparts.fn; \
 	n=$$(grep -c 'xor .*%eax,%eax' $(BUILDDIR)/descparts.fn) || true; \
 	[ "$$n" -le 2 ] || { echo "descparts: $$n tests of the descriptor in Quick"; exit 1; }; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/descoob testdata/descoob.paslang; \
@@ -3388,7 +3389,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(BUILDDIR)/descproof | diff -u testdata/descproof.out -; \
 	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 $(BUILDDIR)/descproof | diff -u testdata/descproof.out -; \
 	for f in sum prefix copy2 sumb; do \
-		objdump -d --no-show-raw-insn $(BUILDDIR)/descproof | awk -v f="<p_$$f>:" '/^[0-9a-f]+ <[^>]*>:/{ on = ($$2 == f); n = 0 } on && /^ +[0-9a-f]+:/ { a = $$1; sub(":", "", a); if ($$2 ~ /^(nop|data16|cs|xchg)/) next; n++; idx[a] = n; if ($$2 ~ /^j/ && $$2 != "jmp" && ($$3 in idx)) { w = n - idx[$$3] + 1; if (m == 0 || w < m) m = w } } END { print m }' > $(BUILDDIR)/descproof.loop; \
+		objdump -d --no-show-raw-insn $(BUILDDIR)/descproof | awk -v f="<p_f.0_$${#f}_$$f>:" '/^[0-9a-f]+ <[^>]*>:/{ on = ($$2 == f); n = 0 } on && /^ +[0-9a-f]+:/ { a = $$1; sub(":", "", a); if ($$2 ~ /^(nop|data16|cs|xchg)/) next; n++; idx[a] = n; if ($$2 ~ /^j/ && $$2 != "jmp" && ($$3 in idx)) { w = n - idx[$$3] + 1; if (m == 0 || w < m) m = w } } END { print m }' > $(BUILDDIR)/descproof.loop; \
 		m=$$(cat $(BUILDDIR)/descproof.loop); \
 		[ "$$m" -le 5 ] || { echo "descproof: the shortest loop of $$f has $$m instructions"; exit 1; }; \
 	done; \
@@ -3424,7 +3425,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(BUILDDIR)/maprmw2 | diff -u testdata/maprmw2.out -; \
 	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 $(BUILDDIR)/maprmw2 | diff -u testdata/maprmw2.out -; \
 	for f in mixi mixd; do \
-		objdump -d --no-show-raw-insn $(BUILDDIR)/maprmw2 | awk -v f="<p_$$f>:" '/^[0-9a-f]+ <[^>]*>:/{ on = ($$2 == f) } on' > $(BUILDDIR)/maprmw2.fn; \
+		objdump -d --no-show-raw-insn $(BUILDDIR)/maprmw2 | awk -v f="<p_f.0_$${#f}_$$f>:" '/^[0-9a-f]+ <[^>]*>:/{ on = ($$2 == f) } on' > $(BUILDDIR)/maprmw2.fn; \
 		n=$$(grep -c 'call.*pasmapputint' $(BUILDDIR)/maprmw2.fn) || true; \
 		[ "$$n" -eq 5 ] || { echo "maprmw2: $$n puts in $$f"; exit 1; }; \
 		n=$$(grep -c 'call.*pasmapgetint' $(BUILDDIR)/maprmw2.fn) || true; \
@@ -3432,10 +3433,10 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	done; \
 	$(OUTDIR)/paslangc -target arm64 -cpu max -Fu $(BUILDDIR)/a64 -o $(BUILDDIR)/maprmw2-arm testdata/maprmw2.paslang; \
 	for f in mixi mixd; do \
-		awk -v f="p_$$f:" '$$1 == f { on = 1 } on { print } on && /^\.globl/ { on = 0 }' $(BUILDDIR)/maprmw2-arm.s > $(BUILDDIR)/maprmw2-arm.fn; \
-		n=$$(grep -c 'bl p_pasmap_pasmapputint' $(BUILDDIR)/maprmw2-arm.fn) || true; \
+		awk -v f="p_f.0_$${#f}_$$f:" '$$1 == f { on = 1 } on { print } on && /^\.globl/ { on = 0 }' $(BUILDDIR)/maprmw2-arm.s > $(BUILDDIR)/maprmw2-arm.fn; \
+		n=$$(grep -c 'bl p_f[.]6_pasmap12_pasmapputint' $(BUILDDIR)/maprmw2-arm.fn) || true; \
 		[ "$$n" -eq 5 ] || { echo "maprmw2-arm: $$n puts in $$f"; exit 1; }; \
-		n=$$(grep -c 'bl p_pasmap_pasmapgetint' $(BUILDDIR)/maprmw2-arm.fn) || true; \
+		n=$$(grep -c 'bl p_f[.]6_pasmap12_pasmapgetint' $(BUILDDIR)/maprmw2-arm.fn) || true; \
 		[ "$$n" -eq 0 ] || { echo "maprmw2-arm: $$n reads in $$f"; exit 1; }; \
 	done; \
 	echo ok maprmw2
@@ -3824,7 +3825,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	@set -e; \
 	echo "==== index checks ===="; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/bce_s testdata/bce.paslang; \
-	if sed -n '/^p_table:/,/cfi_endproc/p' $(BUILDDIR)/bce_s.s | grep -q 'call rt_boundsfail'; then echo "bce: p_table kept a bounds check the loop does not need"; exit 1; fi; \
+	if sed -n '/^p_f[.]0_5_table:/,/cfi_endproc/p' $(BUILDDIR)/bce_s.s | grep -q 'call rt_boundsfail'; then echo "bce: p_f[.]0_5_table kept a bounds check the loop does not need"; exit 1; fi; \
 	sed -n '/^pas_main:/,/cfi_endproc/p' $(BUILDDIR)/bce_s.s | grep -q 'call rt_boundsfail'; \
 	echo ok bce; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/inplace_s testdata/inplace.paslang; \
@@ -3832,31 +3833,31 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	sed -n '/^pas_main:/,/cfi_endproc/p' $(BUILDDIR)/inplace_s.s | grep -q 'orw $$5, '; \
 	echo ok inplace; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/narrowasm_s testdata/narrowasm.paslang; \
-	test $$(sed -n '/^p_noclean:/,/cfi_endproc/p' $(BUILDDIR)/narrowasm_s.s | grep -c movzbl) -eq 0; \
-	test $$(sed -n '/^p_clean:/,/cfi_endproc/p' $(BUILDDIR)/narrowasm_s.s | grep -c movzbl) -eq 1; \
-	sed -n '/^p_bump:/,/cfi_endproc/p' $(BUILDDIR)/narrowasm_s.s | grep -q 'addb $$1, '; \
+	test $$(sed -n '/^p_f[.]0_7_noclean:/,/cfi_endproc/p' $(BUILDDIR)/narrowasm_s.s | grep -c movzbl) -eq 0; \
+	test $$(sed -n '/^p_f[.]0_5_clean:/,/cfi_endproc/p' $(BUILDDIR)/narrowasm_s.s | grep -c movzbl) -eq 1; \
+	sed -n '/^p_f[.]0_4_bump:/,/cfi_endproc/p' $(BUILDDIR)/narrowasm_s.s | grep -q 'addb $$1, '; \
 	echo ok narrowasm; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/bitops_s testdata/bitops.paslang; \
-	sed -n '/^p_pool:/,/cfi_endproc/p' $(BUILDDIR)/bitops_s.s > $(BUILDDIR)/bitops_pool.s; \
+	sed -n '/^p_f[.]0_4_pool:/,/cfi_endproc/p' $(BUILDDIR)/bitops_s.s > $(BUILDDIR)/bitops_pool.s; \
 	grep -q 'rolq $$13, %r' $(BUILDDIR)/bitops_pool.s; \
 	grep -q 'rolb %cl, %' $(BUILDDIR)/bitops_pool.s; \
 	grep -q 'rorw %cl, %' $(BUILDDIR)/bitops_pool.s; \
 	test $$(grep -A1 'sarq $$2, %r' $(BUILDDIR)/bitops_pool.s | grep -c movsbq) -eq 0; \
 	$(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/bitops_a testdata/bitops.paslang; \
-	sed -n '/^p_pool:/,/cfi_endproc/p' $(BUILDDIR)/bitops_a.s > $(BUILDDIR)/bitops_apool.s; \
+	sed -n '/^p_f[.]0_4_pool:/,/cfi_endproc/p' $(BUILDDIR)/bitops_a.s > $(BUILDDIR)/bitops_apool.s; \
 	grep -q 'ror x[0-9]*, x[0-9]*, #51$$' $(BUILDDIR)/bitops_apool.s; \
 	grep -q 'ror w[0-9]*, w[0-9]*, w16$$' $(BUILDDIR)/bitops_apool.s; \
 	test $$(grep -A1 'asr x[0-9]*, x[0-9]*, #2$$' $(BUILDDIR)/bitops_apool.s | grep -c sxtb) -eq 0; \
 	: the bit words on a pool register, P261: popcnt, lzcnt and tzcnt for x86-64-v3, and for the base the SWAR count, bsr and bsf; \
 	$(OUTDIR)/paslangc -cpu v3 -o $(BUILDDIR)/bitwords_s testdata/bitwords.paslang; \
-	sed -n '/^p_pool:/,/cfi_endproc/p' $(BUILDDIR)/bitwords_s.s > $(BUILDDIR)/bitwords_pool.s; \
+	sed -n '/^p_f[.]0_4_pool:/,/cfi_endproc/p' $(BUILDDIR)/bitwords_s.s > $(BUILDDIR)/bitwords_pool.s; \
 	for i in 'popcntq %r' 'lzcntq %r' 'tzcntq %r' 'lzcntl %e' 'tzcntl %e' 'bswapq %r' 'rolw $$8, %'; do \
 	  grep -qF -e "$$i" $(BUILDDIR)/bitwords_pool.s || { echo "bitwords pool lacks $$i"; exit 1; }; \
 	done; \
 	if grep -q 'bsf\|bsr' $(BUILDDIR)/bitwords_pool.s; then echo "bitwords pool for v3 has bsf or bsr"; exit 1; fi; \
 	test $$(grep -c rt_haspopcnt $(BUILDDIR)/bitwords_s.s) -eq 0; \
 	$(OUTDIR)/paslangc -cpu base -o $(BUILDDIR)/bitwords_b testdata/bitwords.paslang; \
-	sed -n '/^p_pool:/,/cfi_endproc/p' $(BUILDDIR)/bitwords_b.s > $(BUILDDIR)/bitwords_bpool.s; \
+	sed -n '/^p_f[.]0_4_pool:/,/cfi_endproc/p' $(BUILDDIR)/bitwords_b.s > $(BUILDDIR)/bitwords_bpool.s; \
 	test $$(grep -c popcnt $(BUILDDIR)/bitwords_bpool.s) -eq 0; \
 	grep -qF -e 'movabsq $$6148914691236517205, %' $(BUILDDIR)/bitwords_bpool.s; \
 	for i in 'bsfq %r' 'bsrq %r'; do \
@@ -3864,7 +3865,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	done; \
 	if grep -q 'lzcnt\|tzcnt' $(BUILDDIR)/bitwords_bpool.s; then echo "bitwords pool for base has lzcnt or tzcnt"; exit 1; fi; \
 	$(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/bitwords_a testdata/bitwords.paslang; \
-	sed -n '/^p_pool:/,/cfi_endproc/p' $(BUILDDIR)/bitwords_a.s > $(BUILDDIR)/bitwords_apool.s; \
+	sed -n '/^p_f[.]0_4_pool:/,/cfi_endproc/p' $(BUILDDIR)/bitwords_a.s > $(BUILDDIR)/bitwords_apool.s; \
 	for i in 'cnt v16.8b, v16.8b' 'rbit x' 'clz x' 'rev x' 'rev16 w'; do \
 	  grep -qF -e "$$i" $(BUILDDIR)/bitwords_apool.s || { echo "bitwords arm pool lacks $$i"; exit 1; }; \
 	done; \
@@ -3873,11 +3874,11 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'andl $$-3, v_s32(%rip)' $(BUILDDIR)/bitmem_s.s; \
 	grep -q 'subb $$10, v_b(%rip)' $(BUILDDIR)/bitmem_s.s; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/wide_s testdata/wide.paslang; \
-	sed -n '/^p_pool:/,/cfi_endproc/p' $(BUILDDIR)/wide_s.s | grep -q 'mulq %rcx'; \
-	sed -n '/^p_pool:/,/cfi_endproc/p' $(BUILDDIR)/wide_s.s | grep -q 'imulq %rcx'; \
+	sed -n '/^p_f[.]0_4_pool:/,/cfi_endproc/p' $(BUILDDIR)/wide_s.s | grep -q 'mulq %rcx'; \
+	sed -n '/^p_f[.]0_4_pool:/,/cfi_endproc/p' $(BUILDDIR)/wide_s.s | grep -q 'imulq %rcx'; \
 	$(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/wide_a testdata/wide.paslang; \
-	sed -n '/^p_pool:/,/cfi_endproc/p' $(BUILDDIR)/wide_a.s | grep -q 'umulh x'; \
-	sed -n '/^p_pool:/,/cfi_endproc/p' $(BUILDDIR)/wide_a.s | grep -q 'smulh x'; \
+	sed -n '/^p_f[.]0_4_pool:/,/cfi_endproc/p' $(BUILDDIR)/wide_a.s | grep -q 'umulh x'; \
+	sed -n '/^p_f[.]0_4_pool:/,/cfi_endproc/p' $(BUILDDIR)/wide_a.s | grep -q 'smulh x'; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/memwords_s testdata/memwords.paslang; \
 	for i in mfence lfence sfence prefetcht0 prefetchw 'xchgq' 'lock cmpxchgl' movnti; do \
 	  grep -qF -e "$$i" $(BUILDDIR)/memwords_s.s || { echo "memwords lacks $$i"; exit 1; }; \
@@ -3937,29 +3938,29 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	done; \
 	if grep -qF 'addq %rcx, %rax' $(BUILDDIR)/inlineasm_a.s; then echo "inlineasm arm took the amd64 block"; exit 1; fi; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/vecpool_s testdata/vecpool.paslang; \
-	sed -n '/^p_dot:/,/cfi_endproc/p' $(BUILDDIR)/vecpool_s.s > $(BUILDDIR)/vecpool_dot.s; \
+	sed -n '/^p_f[.]0_3_dot:/,/cfi_endproc/p' $(BUILDDIR)/vecpool_s.s > $(BUILDDIR)/vecpool_dot.s; \
 	for i in '%xmm13' '%xmm14' '%xmm15' 'vpmulld %xmm1'; do \
 	  grep -qF -e "$$i" $(BUILDDIR)/vecpool_dot.s || { echo "vecpool Dot lacks $$i"; exit 1; }; \
 	done; \
-	sed -n '/^p_worker:/,/cfi_endproc/p' $(BUILDDIR)/vecpool_s.s | grep -qF '%ymm14'; \
+	sed -n '/^p_f.0_6_worker:/,/cfi_endproc/p' $(BUILDDIR)/vecpool_s.s | grep -qF '%ymm14'; \
 	$(OUTDIR)/paslangc -cpu base -o $(BUILDDIR)/vecpool_b testdata/vecpool.paslang; \
-	sed -n '/^p_worker:/,/cfi_endproc/p' $(BUILDDIR)/vecpool_b.s | grep -qF '%xmm14'; \
+	sed -n '/^p_f.0_6_worker:/,/cfi_endproc/p' $(BUILDDIR)/vecpool_b.s | grep -qF '%xmm14'; \
 	test $$(grep -c '%ymm' $(BUILDDIR)/vecpool_b.s) -eq 0; \
-	if sed -n '/^p_declined:/,/cfi_endproc/p' $(BUILDDIR)/vecpool_s.s | grep -qF '%xmm15'; then echo "vecpool Declined kept a viewed vector in a register"; exit 1; fi; \
+	if sed -n '/^p_f.0_8_declined:/,/cfi_endproc/p' $(BUILDDIR)/vecpool_s.s | grep -qF '%xmm15'; then echo "vecpool Declined kept a viewed vector in a register"; exit 1; fi; \
 	$(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/vecpool_a testdata/vecpool.paslang; \
-	sed -n '/^p_worker:/,/cfi_endproc/p' $(BUILDDIR)/vecpool_a.s | grep -qF 'v8.'; \
-	sed -n '/^p_dot:/,/cfi_endproc/p' $(BUILDDIR)/vecpool_a.s | grep -qF 'v10.'; \
+	sed -n '/^p_f.0_6_worker:/,/cfi_endproc/p' $(BUILDDIR)/vecpool_a.s | grep -qF 'v8.'; \
+	sed -n '/^p_f.0_3_dot:/,/cfi_endproc/p' $(BUILDDIR)/vecpool_a.s | grep -qF 'v10.'; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/addrlocal_s testdata/addrlocal.paslang; \
-	if sed -n '/^p_mix:/,/cfi_endproc/p' $(BUILDDIR)/addrlocal_s.s | grep -q 'movq %rsi, -[0-9]*(%rbp)'; then echo "addrlocal Mix kept n in memory"; exit 1; fi; \
+	if sed -n '/^p_f[.]0_3_mix:/,/cfi_endproc/p' $(BUILDDIR)/addrlocal_s.s | grep -q 'movq %rsi, -[0-9]*(%rbp)'; then echo "addrlocal Mix kept n in memory"; exit 1; fi; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/rotwords_s testdata/rotwords.paslang; \
 	for i in 'rclb $$1, %r' 'setc %r' 'btl $$0, %r'; do \
-	  sed -n '/^p_ring9:/,/cfi_endproc/p' $(BUILDDIR)/rotwords_s.s | grep -qF -e "$$i" || { echo "rotwords Ring9 lacks $$i"; exit 1; }; \
+	  sed -n '/^p_f.0_5_ring9:/,/cfi_endproc/p' $(BUILDDIR)/rotwords_s.s | grep -qF -e "$$i" || { echo "rotwords Ring9 lacks $$i"; exit 1; }; \
 	done; \
 	for i in 'rclq $$1, -' 'setc %r'; do \
-	  sed -n '/^p_wide256:/,/cfi_endproc/p' $(BUILDDIR)/rotwords_s.s | grep -qF -e "$$i" || { echo "rotwords Wide256 lacks $$i"; exit 1; }; \
+	  sed -n '/^p_f.0_7_wide256:/,/cfi_endproc/p' $(BUILDDIR)/rotwords_s.s | grep -qF -e "$$i" || { echo "rotwords Wide256 lacks $$i"; exit 1; }; \
 	done; \
 	for i in 'rclb $$1, -' 'rcrb $$1, -' 'shlb $$1, -' 'testb $$128, -'; do \
-	  sed -n '/^p_mbyte:/,/cfi_endproc/p' $(BUILDDIR)/rotwords_s.s | grep -qF -e "$$i" || { echo "rotwords MByte lacks $$i"; exit 1; }; \
+	  sed -n '/^p_f.0_5_mbyte:/,/cfi_endproc/p' $(BUILDDIR)/rotwords_s.s | grep -qF -e "$$i" || { echo "rotwords MByte lacks $$i"; exit 1; }; \
 	done; \
 	for i in 'rcrq $$1, ' 'shldq $$63, %rdx, %rax' 'divq %rsi'; do \
 	  grep -qF -e "$$i" $(BUILDDIR)/rotwords_s.s || { echo "rotwords lacks $$i"; exit 1; }; \
@@ -3968,15 +3969,15 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	for i in 'extr x0, x0, x2, #63' 'strb w9, [x28, #256]' 'udiv x10, x1, x9'; do \
 	  grep -qF -e "$$i" $(BUILDDIR)/rotwords_a.s || { echo "rotwords arm lacks $$i"; exit 1; }; \
 	done; \
-	if sed -n '/^p_ring9:/,/cfi_endproc/p' $(BUILDDIR)/rotwords_a.s | grep -qF 'ldrb w9, [x28, #256]'; then echo "rotwords arm Ring9 reads Carry from memory"; exit 1; fi; \
+	if sed -n '/^p_f.0_5_ring9:/,/cfi_endproc/p' $(BUILDDIR)/rotwords_a.s | grep -qF 'ldrb w9, [x28, #256]'; then echo "rotwords arm Ring9 reads Carry from memory"; exit 1; fi; \
 	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/ctxwords_a testdata/ctxwords.paslang; \
 	for i in 'bic x' 'eon x' 'orn x'; do \
 	  grep -qF -e "$$i" $(BUILDDIR)/ctxwords_a.s || { echo "ctxwords arm lacks $$i"; exit 1; }; \
 	done; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/rotmem_s testdata/rotmem.paslang; \
-	grep -qF 'call p_pasheap_pasrotmem' $(BUILDDIR)/rotmem_s.s || { echo "rotmem does not call PasRotMem"; exit 1; }; \
+	grep -qF 'call p_f.7_pasheap9_pasrotmem' $(BUILDDIR)/rotmem_s.s || { echo "rotmem does not call PasRotMem"; exit 1; }; \
 	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/rotmem_a testdata/rotmem.paslang; \
-	grep -qF 'bl p_pasheap_pasrotmem' $(BUILDDIR)/rotmem_a.s || { echo "rotmem arm does not call PasRotMem"; exit 1; }; \
+	grep -qF 'bl p_f.7_pasheap9_pasrotmem' $(BUILDDIR)/rotmem_a.s || { echo "rotmem arm does not call PasRotMem"; exit 1; }; \
 	echo ok bitasm; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/addrform_s testdata/addrform.paslang; \
 	grep -q 'v_w5-10(,%' $(BUILDDIR)/addrform_s.s; \
@@ -3991,7 +3992,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/condjump0 testdata/condjump.paslang; \
 	$(BUILDDIR)/condjump0 > $(BUILDDIR)/condjump0.got; \
 	diff -u testdata/condjump.out $(BUILDDIR)/condjump0.got; \
-	awk '/^p_digit:/,/ret$$/' $(BUILDDIR)/condjump.s > $(BUILDDIR)/condjump-digit.s; \
+	awk '/^p_f[.]0_5_digit:/,/ret$$/' $(BUILDDIR)/condjump.s > $(BUILDDIR)/condjump-digit.s; \
 	grep -qE 'subq [$$]48, |leaq -48[(]' $(BUILDDIR)/condjump-digit.s && grep -q 'cmpq $$9, ' $(BUILDDIR)/condjump-digit.s && test $$(grep -cE '^  j(l|g|le|ge|a|be) ' $(BUILDDIR)/condjump-digit.s) -eq 1 || { echo "condjump.s: Digit's range is not one subtraction, one compare without sign and one jump (P292)"; exit 1; }; \
 	if grep -q '^  set' $(BUILDDIR)/condjump-digit.s; then echo "condjump.s: Digit's condition makes a Boolean"; exit 1; fi; \
 	echo ok condjump; \
@@ -3999,24 +4000,24 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=3 PASLANG_GCPOISON=1 $(BUILDDIR)/varparts > $(BUILDDIR)/varparts-gc.got; \
 	diff -u testdata/varparts.out $(BUILDDIR)/varparts-gc.got; \
 	for f in sum sumwhile sumconst bump; do \
-	  awk "/^p_$$f:/,/ret\$$/" $(BUILDDIR)/varparts.s > $(BUILDDIR)/varparts-$$f.s; \
+	  awk "/^p_f[.]0_$${#f}_$$f:/,/ret\$$/" $(BUILDDIR)/varparts.s > $(BUILDDIR)/varparts-$$f.s; \
 	  grep -qE '[0-9]\(%r(bx|9|1[0-5])\)' $(BUILDDIR)/varparts-$$f.s || { echo "varparts.s: $$f reads no field from a kept register"; exit 1; }; \
 	  if grep -qE '[0-9]\(%r(si|di)\)' $(BUILDDIR)/varparts-$$f.s; then echo "varparts.s: $$f reads a field through a pool register"; exit 1; fi; \
 	done; \
 	echo ok varparts-asm; \
 	: a while or a repeat that counts runs in runs, P283: Spin and Spin2 work out a run end of 1023 passes with a cmov, Spin3 and Others, which do not count, work out none and test at every pass, a cmov of theirs being an if made a select by P307; \
 	for f in spin spin2; do \
-	  awk "/^p_$$f:/,/ret\$$/" $(BUILDDIR)/whilerun.s | grep -A3 'leaq 1023(' | grep -q 'cmovgq' || { echo "whilerun.s: $$f does not run in runs"; exit 1; }; \
+	  awk "/^p_f[.]0_$${#f}_$$f:/,/ret\$$/" $(BUILDDIR)/whilerun.s | grep -A3 'leaq 1023(' | grep -q 'cmovgq' || { echo "whilerun.s: $$f does not run in runs"; exit 1; }; \
 	done; \
 	for f in spin3 others; do \
-	  if awk "/^p_$$f:/,/ret\$$/" $(BUILDDIR)/whilerun.s | grep -q 'leaq 1023('; then echo "whilerun.s: $$f runs in runs"; exit 1; fi; \
+	  if awk "/^p_f[.]0_$${#f}_$$f:/,/ret\$$/" $(BUILDDIR)/whilerun.s | grep -q 'leaq 1023('; then echo "whilerun.s: $$f runs in runs"; exit 1; fi; \
 	done; \
 	echo ok whilerun-asm; \
 	: a local or a Result written first starts as it is, P284: lazyzero under the stress and verify of the collector, and BothArms, CaseArms, ForBody and EarlyExit clear no slot of their frames; \
 	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 $(BUILDDIR)/lazyzero > $(BUILDDIR)/lazyzero-gc.got; \
 	diff -u testdata/lazyzero.out $(BUILDDIR)/lazyzero-gc.got; \
 	for f in botharms casearms forbody earlyexit; do \
-	  if awk "/^p_$$f:/,/^\.set/" $(BUILDDIR)/lazyzero.s | grep -q 'movq \$$0, -'; then echo "lazyzero.s: $$f clears a slot"; exit 1; fi; \
+	  if awk "/^p_f[.]0_$${#f}_$$f:/,/^\.set/" $(BUILDDIR)/lazyzero.s | grep -q 'movq \$$0, -'; then echo "lazyzero.s: $$f clears a slot"; exit 1; fi; \
 	done; \
 	echo ok lazyzero-gc; \
 	: a small map under the stress and verify of the collector, P285, its counts of memory left out; \
@@ -4033,26 +4034,26 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	echo ok slicefront-gc; \
 	: a leaf has no stack check and no frame, P288, nor a routine that calls nothing, P296, one that calls keeps both; \
 	for f in twice thrice mix rot big three same konst tshape_area tshape_areak tshape_link; do \
-	  if awk "/^p_$$f:/,/cfi_endproc/" $(BUILDDIR)/leafcall.s | grep -q 'cmpq 16(%r14)\|pushq %rbp'; then echo "leafcall.s: $$f has a stack check or a frame"; exit 1; fi; \
+	  if awk "/^p_f[.]0_$${#f}_$$f:/,/cfi_endproc/" $(BUILDDIR)/leafcall.s | grep -q 'cmpq 16(%r14)\|pushq %rbp'; then echo "leafcall.s: $$f has a stack check or a frame"; exit 1; fi; \
 	done; \
-	if awk '/^p_clamp:/,/cfi_endproc/' $(BUILDDIR)/leafcall.s | grep -q 'pushq %rbp'; then echo "leafcall.s: Clamp has a frame"; exit 1; fi; \
-	if awk '/^p_clamp:/,/cfi_endproc/' $(BUILDDIR)/leafcall.s | grep -q 'cmpq 16(%r14)'; then echo "leafcall.s: Clamp has a stack check"; exit 1; fi; \
-	awk '/^p_worker:/,/cfi_endproc/' $(BUILDDIR)/leafcall.s | grep -q 'cmpq 16(%r14)' || { echo "leafcall.s: Worker has no stack check"; exit 1; }; \
+	if awk '/^p_f[.]0_5_clamp:/,/cfi_endproc/' $(BUILDDIR)/leafcall.s | grep -q 'pushq %rbp'; then echo "leafcall.s: Clamp has a frame"; exit 1; fi; \
+	if awk '/^p_f[.]0_5_clamp:/,/cfi_endproc/' $(BUILDDIR)/leafcall.s | grep -q 'cmpq 16(%r14)'; then echo "leafcall.s: Clamp has a stack check"; exit 1; fi; \
+	awk '/^p_f[.]0_6_worker:/,/cfi_endproc/' $(BUILDDIR)/leafcall.s | grep -q 'cmpq 16(%r14)' || { echo "leafcall.s: Worker has no stack check"; exit 1; }; \
 	echo ok leafcall-asm; \
 	: an index its range proves in the array has no check, P289; \
 	for f in masked modpos shifted onebased byteidx sumfor callmasked pairat tripleat; do \
-	  if awk "/^p_$$f:/,/cfi_endproc/" $(BUILDDIR)/bceprove.s | grep -q rt_boundsfail; then echo "bceprove.s: $$f checks an index it proved"; exit 1; fi; \
+	  if awk "/^p_f[.]0_$${#f}_$$f:/,/cfi_endproc/" $(BUILDDIR)/bceprove.s | grep -q rt_boundsfail; then echo "bceprove.s: $$f checks an index it proved"; exit 1; fi; \
 	done; \
 	echo ok bceprove-asm; \
 	: a field of a record in the frame is its load or store operand from rbp, the record not formed again, P291; \
-	test $$(awk '/^p_near:/,/cfi_endproc/' $(BUILDDIR)/framefield.s | grep -c 'leaq -[0-9]*(%rbp)') -le 1 || { echo "framefield.s: Near forms its record's address for its fields"; exit 1; }; \
+	test $$(awk '/^p_f[.]0_4_near:/,/cfi_endproc/' $(BUILDDIR)/framefield.s | grep -c 'leaq -[0-9]*(%rbp)') -le 1 || { echo "framefield.s: Near forms its record's address for its fields"; exit 1; }; \
 	echo ok framefield-asm; \
 	: a test of both ends of a range is one compare without sign, two ranges whose span overflows keep their compares, P292; \
-	test $$(awk '/^p_bits:/,/cfi_endproc/' $(BUILDDIR)/rangetest.s | grep -cE '^  (ja|jbe|seta|setbe) ') -eq 13 || { echo "rangetest.s: Bits has not 13 ranges in one compare"; exit 1; }; \
-	test $$(awk '/^p_narrow:/,/cfi_endproc/' $(BUILDDIR)/rangetest.s | grep -cE '^  (ja|jbe) ') -eq 8 || { echo "rangetest.s: Narrow has not 8 ranges in one compare"; exit 1; }; \
+	test $$(awk '/^p_f[.]0_4_bits:/,/cfi_endproc/' $(BUILDDIR)/rangetest.s | grep -cE '^  (ja|jbe|seta|setbe) ') -eq 13 || { echo "rangetest.s: Bits has not 13 ranges in one compare"; exit 1; }; \
+	test $$(awk '/^p_f[.]0_6_narrow:/,/cfi_endproc/' $(BUILDDIR)/rangetest.s | grep -cE '^  (ja|jbe) ') -eq 8 || { echo "rangetest.s: Narrow has not 8 ranges in one compare"; exit 1; }; \
 	echo ok rangetest-asm; \
 	: a loop tests nothing at its passes, one CPU still runs the other routines, the collector stops a loop by a signal and reads its registers, and the pasasync table holds routines only, each past its stack check, P293; \
-	test $$(awk '/^p_spin:/,/cfi_endproc/' $(BUILDDIR)/asyncspin.s | grep -c 'cmpq 16(%r14)') -le 1 || { echo "asyncspin.s: Spin tests the guard in its loop"; exit 1; }; \
+	test $$(awk '/^p_f[.]0_4_spin:/,/cfi_endproc/' $(BUILDDIR)/asyncspin.s | grep -c 'cmpq 16(%r14)') -le 1 || { echo "asyncspin.s: Spin tests the guard in its loop"; exit 1; }; \
 	taskset -c 0 timeout 60 $(BUILDDIR)/asyncspin > $(BUILDDIR)/asyncspin-1.got; \
 	diff -u testdata/asyncspin.out $(BUILDDIR)/asyncspin-1.got; \
 	for w in "" "taskset -c 0"; do \
@@ -4065,8 +4066,8 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	rc=0; PASLANG_ASYNCPREEMPTOFF=1 PASLANG_GCSTRESS=1 timeout 5 $(BUILDDIR)/asyncgc > /dev/null 2>&1 || rc=$$?; \
 	test $$rc -eq 124 || { echo "asyncgc: PASLANG_ASYNCPREEMPTOFF=1 still stops Walker (exit $$rc)"; exit 1; }; \
 	: a leaf without a check of its own, a frame of 192 bytes or more, is stopped by a signal at every depth with its vector registers in a block of their own, P342; \
-	test $$(awk '/^p_spin:/,/cfi_endproc/' $(BUILDDIR)/asyncleaf.s | grep -c 'cmpq 16(%r14)') -eq 0 || { echo "asyncleaf.s: Spin checks its stack"; exit 1; }; \
-	test $$(sed -n 's/^\.set \.Lfrp_spin, //p' $(BUILDDIR)/asyncleaf.s) -ge 192 || { echo "asyncleaf.s: Spin's frame is under 192 bytes"; exit 1; }; \
+	test $$(awk '/^p_f[.]0_4_spin:/,/cfi_endproc/' $(BUILDDIR)/asyncleaf.s | grep -c 'cmpq 16(%r14)') -eq 0 || { echo "asyncleaf.s: Spin checks its stack"; exit 1; }; \
+	test $$(sed -n 's/^\.set \.Lfrp_f[.]0_4_spin, //p' $(BUILDDIR)/asyncleaf.s) -ge 192 || { echo "asyncleaf.s: Spin's frame is under 192 bytes"; exit 1; }; \
 	for w in "" "taskset -c 0"; do \
 	  PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 $$w timeout 120 $(BUILDDIR)/asyncleaf > $(BUILDDIR)/asyncleaf-gc.got; \
 	  diff -u testdata/asyncleaf.out $(BUILDDIR)/asyncleaf-gc.got; \
@@ -4095,7 +4096,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/heldargs0 testdata/heldargs.paslang; \
 	$(BUILDDIR)/heldargs0 > $(BUILDDIR)/heldargs0.got; \
 	diff -u testdata/heldargs.out $(BUILDDIR)/heldargs0.got; \
-	python3 -I scripts/check_argpush.py $(BUILDDIR)/heldargs0.s --routines=p_bydirect,p_bydirect5,p_bymethod,p_bymethode,p_byvalue,p_byvalue5,p_bymethval,p_byiface,p_bynested; \
+	python3 -I scripts/check_argpush.py $(BUILDDIR)/heldargs0.s --routines=p_f.0_8_bydirect,p_f.0_9_bydirect5,p_f.0_8_bymethod,p_f.0_9_bymethode,p_f.0_7_byvalue,p_f.0_8_byvalue5,p_f.0_9_bymethval,p_f.0_7_byiface,p_f.0_8_bynested; \
 	echo ok heldargs-asm; \
 	: the value of a division lands in the register that reads it, its dividend in rax, P356; \
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/divreg0 testdata/divreg.paslang; \
@@ -4107,7 +4108,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/uplevel0 testdata/uplevel.paslang; \
 	$(BUILDDIR)/uplevel0 > $(BUILDDIR)/uplevel0.got; \
 	diff -u testdata/uplevel.out $(BUILDDIR)/uplevel0.got; \
-	python3 -I scripts/check_argpush.py $(BUILDDIR)/uplevel0.s --routines=p_outer_mid_deep; \
+	python3 -I scripts/check_argpush.py $(BUILDDIR)/uplevel0.s --routines=p_n.25_p_n.13_p_f.0_5_outer3_mid4_deep; \
 	echo ok uplevel-asm; \
 	: a loop that calls keeps its variables in registers across the calls, P384, at -inline 0 and under the verify and stress modes of the collector; \
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/isles0 testdata/isles.paslang; \
@@ -4251,7 +4252,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/nestzero0 testdata/nestzero.paslang; \
 	$(BUILDDIR)/nestzero0 > $(BUILDDIR)/nestzero0.got; \
 	diff -u testdata/nestzero.out $(BUILDDIR)/nestzero0.got; \
-	python3 -I scripts/check_nestzero.py $(BUILDDIR)/nestzero0.s --expect=p_early:2,p_late:0,p_branch:2,p_writeback:1; \
+	python3 -I scripts/check_nestzero.py $(BUILDDIR)/nestzero0.s --expect=p_f.0_5_early:2,p_f.0_4_late:0,p_f.0_6_branch:2,p_f.0_9_writeback:1; \
 	echo ok nestzero-asm
 	@set -e; \
 	: the asm checks go on in a recipe of their own, each under 64 KiB, P397; \
@@ -4259,99 +4260,99 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/keepleft0 testdata/keepleft.paslang; \
 	$(BUILDDIR)/keepleft0 > $(BUILDDIR)/keepleft0.got; \
 	diff -u testdata/keepleft.out $(BUILDDIR)/keepleft0.got; \
-	python3 -I scripts/check_argpush.py $(BUILDDIR)/keepleft0.s --routines=p_bysum,p_bysub,p_bymul,p_byless,p_byatleast,p_bydiv,p_bymod,p_byouter_in1; \
+	python3 -I scripts/check_argpush.py $(BUILDDIR)/keepleft0.s --routines=p_f.0_5_bysum,p_f.0_5_bysub,p_f.0_5_bymul,p_f.0_6_byless,p_f.0_9_byatleast,p_f.0_5_bydiv,p_f.0_5_bymod,p_n.15_p_f.0_7_byouter3_in1; \
 	echo ok keepleft-asm; \
 	: a closure or nested routine that calls nothing has no frame, its link kept in r10, P334; \
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/nestflat0 testdata/nestflat.paslang; \
 	$(BUILDDIR)/nestflat0 > $(BUILDDIR)/nestflat0.got; \
 	diff -u testdata/nestflat.out $(BUILDDIR)/nestflat0.got; \
-	python3 -I scripts/check_nestflat.py $(BUILDDIR)/nestflat0.s --flat=p_outer_flatadd,p_outer_flatlocal,p_outer_flatbump,p_outer_mid_flatdeep,p_adder_anon.1 --framed=p_outer_mid,p_outer; \
+	python3 -I scripts/check_nestflat.py $(BUILDDIR)/nestflat0.s --flat=p_n.13_p_f.0_5_outer7_flatadd,p_n.13_p_f.0_5_outer9_flatlocal,p_n.13_p_f.0_5_outer8_flatbump,p_n.25_p_n.13_p_f.0_5_outer3_mid8_flatdeep,p_a.13_p_f.0_5_adder1_1 --framed=p_n.13_p_f.0_5_outer3_mid,p_f.0_5_outer; \
 	echo ok nestflat-asm; \
 	: a routine with no frame works its value out in rax, P361; \
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/retreg0 testdata/retreg.paslang; \
 	$(BUILDDIR)/retreg0 > $(BUILDDIR)/retreg0.got; \
 	diff -u testdata/retreg.out $(BUILDDIR)/retreg0.got; \
-	python3 -I scripts/check_retreg.py $(BUILDDIR)/retreg0.s --routines=p_sum2,p_scale,p_half,p_addg,p_early,p_makeadd_anon.1 --short=p_makeadd_anon.1:2,p_sum2:1,p_addg:2; \
+	python3 -I scripts/check_retreg.py $(BUILDDIR)/retreg0.s --routines=p_f.0_4_sum2,p_f.0_5_scale,p_f.0_4_half,p_f.0_4_addg,p_f.0_5_early,p_a.15_p_f.0_7_makeadd1_1 --short=p_a.15_p_f.0_7_makeadd1_1:2,p_f.0_4_sum2:1,p_f.0_4_addg:2; \
 	echo ok retreg-asm; \
 	: a routine whose result is a block writes it into the buffer its caller gives in rax, P153; \
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/recres0 testdata/recres.paslang; \
 	$(BUILDDIR)/recres0 > $(BUILDDIR)/recres0.got; \
 	diff -u testdata/recres.out $(BUILDDIR)/recres0.got; \
-	python3 -I scripts/check_resbuf.py $(BUILDDIR)/recres0.s --routines=p_mkmid,p_mkbig,p_mkset,p_mkodd,p_tshape_twice,p_tboxer_boxed,p_climb,p_wrap,p_anon.1 --dest=7; \
-	python3 -I scripts/check_resbuf.py $(BUILDDIR)/recres0.s --regs=p_mkpair,p_swap,p_op_add_tpair_tpair,p_tshape_box,p_tshape_unit1,p_tshape_getcorner,p_tsquare_box,p_climb2,p_outer,p_risky,p_grow,p_outer_inner --short=p_mkpair:2; \
+	python3 -I scripts/check_resbuf.py $(BUILDDIR)/recres0.s --routines=p_f.0_5_mkmid,p_f.0_5_mkbig,p_f.0_5_mkset,p_f.0_5_mkodd,p_m.14_t_u.0_6_tshape5_twice,p_m.14_t_u.0_6_tboxer5_boxed,p_f.0_5_climb,p_f.0_4_wrap,p_a.8_p_f.0_0_1_1 --dest=7; \
+	python3 -I scripts/check_resbuf.py $(BUILDDIR)/recres0.s --regs=p_f.0_6_mkpair,p_f.0_4_swap,p_o.0_0_3_add5_tpair5_tpair,p_m.14_t_u.0_6_tshape3_box,p_m.14_t_u.0_6_tshape5_unit1,p_m.14_t_u.0_6_tshape9_getcorner,p_m.15_t_u.0_7_tsquare3_box,p_f.0_6_climb2,p_f.0_5_outer,p_f.0_5_risky,p_f.0_4_grow,p_n.13_p_f.0_5_outer5_inner --short=p_f.0_6_mkpair:2; \
 	echo ok recres-asm; \
 	: a block of one to three words comes back in rax, rdx and r8, a Result of whole-word fields kept word by word, P366; \
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/regres0 testdata/regres.paslang; \
 	$(BUILDDIR)/regres0 > $(BUILDDIR)/regres0.got; \
 	diff -u testdata/regres.out $(BUILDDIR)/regres0.got; \
-	python3 -I scripts/check_resbuf.py $(BUILDDIR)/regres0.s --regs=p_mkone,p_mkpair,p_rot,p_rot3,p_bump,p_pick,p_sum,p_twice,p_mknamed,p_mkpacked,p_mkreal,p_mkarr3,p_tcounter_pair,p_tcounter_tri --short=p_mkpair:2,p_rot:3,p_mkone:1; \
+	python3 -I scripts/check_resbuf.py $(BUILDDIR)/regres0.s --regs=p_f.0_5_mkone,p_f.0_6_mkpair,p_f.0_3_rot,p_f.0_4_rot3,p_f.0_4_bump,p_f.0_4_pick,p_f.0_3_sum,p_f.0_5_twice,p_f.0_7_mknamed,p_f.0_8_mkpacked,p_f.0_6_mkreal,p_f.0_6_mkarr3,p_m.16_t_u.0_8_tcounter4_pair,p_m.16_t_u.0_8_tcounter3_tri --short=p_f.0_6_mkpair:2,p_f.0_3_rot:3,p_f.0_5_mkone:1; \
 	echo ok regres-asm; \
 	: a record written field by field before it is read starts with no zero, P367; \
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/fieldfirst0 testdata/fieldfirst.paslang; \
 	$(BUILDDIR)/fieldfirst0 > $(BUILDDIR)/fieldfirst0.got; \
 	diff -u testdata/fieldfirst.out $(BUILDDIR)/fieldfirst0.got; \
-	python3 -I scripts/check_fieldfirst.py $(BUILDDIR)/fieldfirst0.s --zeros=p_full:0,p_both:0,p_part:2,p_readfirst:5,p_branch:5,p_early:5,p_gap:2,p_localsum:5; \
+	python3 -I scripts/check_fieldfirst.py $(BUILDDIR)/fieldfirst0.s --zeros=p_f.0_4_full:0,p_f.0_4_both:0,p_f.0_4_part:2,p_f.0_9_readfirst:5,p_f.0_6_branch:5,p_f.0_5_early:5,p_f.0_3_gap:2,p_f.0_8_localsum:5; \
 	echo ok fieldfirst-asm; \
 	: a block assigned is copied as Move copies and zeroed as FillChar zeroes, with no test of a zero address, in line up to 128 bytes, P370; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/blockcopy1 testdata/blockcopy.paslang; \
 	if grep -q 'stblob' $(BUILDDIR)/blockcopy1.s; then echo "blockcopy.s: a block store tests a zero address"; exit 1; fi; \
-	if awk '/^p_t40:/,/cfi_endproc/' $(BUILDDIR)/blockcopy1.s | grep -qE 'call rt_memcpy|rep stosb'; then echo "blockcopy.s: T40 copies or zeroes out of line"; exit 1; fi; \
-	if awk '/^p_t200:/,/cfi_endproc/' $(BUILDDIR)/blockcopy1.s | grep -q 'rep stosb'; then echo "blockcopy.s: T200 zeroes a variable with rep stosb"; exit 1; fi; \
-	awk '/^p_t300:/,/cfi_endproc/' $(BUILDDIR)/blockcopy1.s | grep -q 'call rt_memcpy' || { echo "blockcopy.s: T300 copies no block with rt_memcpy"; exit 1; }; \
+	if awk '/^p_f[.]0_3_t40:/,/cfi_endproc/' $(BUILDDIR)/blockcopy1.s | grep -qE 'call rt_memcpy|rep stosb'; then echo "blockcopy.s: T40 copies or zeroes out of line"; exit 1; fi; \
+	if awk '/^p_f[.]0_4_t200:/,/cfi_endproc/' $(BUILDDIR)/blockcopy1.s | grep -q 'rep stosb'; then echo "blockcopy.s: T200 zeroes a variable with rep stosb"; exit 1; fi; \
+	awk '/^p_f[.]0_4_t300:/,/cfi_endproc/' $(BUILDDIR)/blockcopy1.s | grep -q 'call rt_memcpy' || { echo "blockcopy.s: T300 copies no block with rt_memcpy"; exit 1; }; \
 	echo ok blockcopy-asm; \
 	: a routine whose result is a block goes in where it is called, a field of it read where Result came from, P368; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/blockinl1 testdata/blockinl.paslang; \
 	grep -q 'movq v_g+120+16(%rip), %r' $(BUILDDIR)/blockinl1.s || { echo "blockinl.s: Get(4).C is not one load of G[4].C"; exit 1; }; \
-	if awk '/^p_fresh:/,/cfi_endproc/' $(BUILDDIR)/blockinl1.s | grep -q 'call'; then echo "blockinl.s: Fresh calls"; exit 1; fi; \
-	test $$(awk '/^pas_main:/,/cfi_endproc/' $(BUILDDIR)/blockinl1.s | grep -c 'call p_get$$') -eq 1 || { echo "blockinl.s: the main block does not call Get once"; exit 1; }; \
-	if awk '/^pas_main:/,/cfi_endproc/' $(BUILDDIR)/blockinl1.s | grep -q 'call p_mkpair$$'; then echo "blockinl.s: the main block calls MkPair"; exit 1; fi; \
+	if awk '/^p_f[.]0_5_fresh:/,/cfi_endproc/' $(BUILDDIR)/blockinl1.s | grep -q 'call'; then echo "blockinl.s: Fresh calls"; exit 1; fi; \
+	test $$(awk '/^pas_main:/,/cfi_endproc/' $(BUILDDIR)/blockinl1.s | grep -c 'call p_f[.]0_3_get$$') -eq 1 || { echo "blockinl.s: the main block does not call Get once"; exit 1; }; \
+	if awk '/^pas_main:/,/cfi_endproc/' $(BUILDDIR)/blockinl1.s | grep -q 'call p_f[.]0_6_mkpair$$'; then echo "blockinl.s: the main block calls MkPair"; exit 1; fi; \
 	echo ok blockinl-asm; \
 	: a method called with the dispatch the compiler fixes goes in where it is called, its Self the object, a virtual one keeping its dispatch, P369; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/methinl1 testdata/methinl.paslang; \
-	if awk '/^pas_main:/,/cfi_endproc/' $(BUILDDIR)/methinl1.s | grep -qE 'call p_tbox_(bump|add|twice)$$'; then echo "methinl.s: the main block calls Bump, Add or Twice"; exit 1; fi; \
+	if awk '/^pas_main:/,/cfi_endproc/' $(BUILDDIR)/methinl1.s | grep -qE 'call p_m[.]12_t_u[.]0_4_tbox(4_bump|3_add|5_twice)$$'; then echo "methinl.s: the main block calls Bump, Add or Twice"; exit 1; fi; \
 	test $$(awk '/^pas_main:/,/cfi_endproc/' $(BUILDDIR)/methinl1.s | grep -c 'call \*') -eq 4 || { echo "methinl.s: the main block does not make its four virtual calls"; exit 1; }; \
 	: the compiler, TypeOf put in place: IsStrTyp reads the Kind of the element of FTypes with no call; \
-	if awk '/^p_pasparse_tparser_isstrtyp:/,/cfi_endproc/' $(BUILDDIR)/stage/pasparse.s | grep -q 'call p_pasparse_tparser_typeof'; then echo "pasparse.s: IsStrTyp calls TypeOf"; exit 1; fi; \
+	if awk '/^p_m[.]23_t_u[.]8_pasparse7_tparser8_isstrtyp:/,/cfi_endproc/' $(BUILDDIR)/stage/pasparse.s | grep -q 'call p_m[.]23_t_u[.]8_pasparse7_tparser6_typeof'; then echo "pasparse.s: IsStrTyp calls TypeOf"; exit 1; fi; \
 	echo ok methinl-asm; \
 	: Result and the main block globals no routine names are operands a call put in place cannot change, so the call to their right goes in, and a global a routine writes or whose address is taken keeps its place, P371; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/aheadres1 testdata/aheadres.paslang; \
-	if awk '/^pas_main:/,/cfi_endproc/' $(BUILDDIR)/aheadres1.s | grep -q 'call p_tri$$'; then echo "aheadres.s: the main block calls Tri"; exit 1; fi; \
-	if awk '/^p_sumtri:/,/cfi_endproc/' $(BUILDDIR)/aheadres1.s | grep -q 'call p_'; then echo "aheadres.s: SumTri calls"; exit 1; fi; \
-	if awk '/^p_acc:/,/cfi_endproc/' $(BUILDDIR)/aheadres1.s | grep -q 'call p_'; then echo "aheadres.s: Acc calls"; exit 1; fi; \
-	awk '/^p_nested:/,/cfi_endproc/' $(BUILDDIR)/aheadres1.s | grep -q 'call p_tri$$' || { echo "aheadres.s: Nested, whose Result a nested routine names, put Tri ahead"; exit 1; }; \
-	awk '/^pas_main:/,/cfi_endproc/' $(BUILDDIR)/aheadres1.s | grep -q 'call p_bump$$' || { echo "aheadres.s: g + Bump put Bump ahead"; exit 1; }; \
-	awk '/^pas_main:/,/cfi_endproc/' $(BUILDDIR)/aheadres1.s | grep -q 'call p_incvia$$' || { echo "aheadres.s: w + IncVia put IncVia ahead"; exit 1; }; \
+	if awk '/^pas_main:/,/cfi_endproc/' $(BUILDDIR)/aheadres1.s | grep -q 'call p_f[.]0_3_tri$$'; then echo "aheadres.s: the main block calls Tri"; exit 1; fi; \
+	if awk '/^p_f[.]0_6_sumtri:/,/cfi_endproc/' $(BUILDDIR)/aheadres1.s | grep -q 'call p_'; then echo "aheadres.s: SumTri calls"; exit 1; fi; \
+	if awk '/^p_f[.]0_3_acc:/,/cfi_endproc/' $(BUILDDIR)/aheadres1.s | grep -q 'call p_'; then echo "aheadres.s: Acc calls"; exit 1; fi; \
+	awk '/^p_f[.]0_6_nested:/,/cfi_endproc/' $(BUILDDIR)/aheadres1.s | grep -q 'call p_f[.]0_3_tri$$' || { echo "aheadres.s: Nested, whose Result a nested routine names, put Tri ahead"; exit 1; }; \
+	awk '/^pas_main:/,/cfi_endproc/' $(BUILDDIR)/aheadres1.s | grep -q 'call p_f[.]0_4_bump$$' || { echo "aheadres.s: g + Bump put Bump ahead"; exit 1; }; \
+	awk '/^pas_main:/,/cfi_endproc/' $(BUILDDIR)/aheadres1.s | grep -q 'call p_f[.]0_6_incvia$$' || { echo "aheadres.s: w + IncVia put IncVia ahead"; exit 1; }; \
 	echo ok aheadres-asm; \
 	: the address of an element goes straight into the register that reads it, its index in the pool register that worked it out, P373; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/elemaddr1 testdata/elemaddr.paslang; \
 	grep -q 'leaq v_g0(,%rsi,8), %rsi' $(BUILDDIR)/elemaddr1.s || { echo "elemaddr.s: an element of g0 is not worked out in rsi"; exit 1; }; \
-	awk '/^p_runlocal:/,/cfi_endproc/' $(BUILDDIR)/elemaddr1.s | grep -qE 'leaq -[0-9]+\(%rbp,%rsi,8\), %rsi' || { echo "elemaddr.s: RunLocal works out no element in rsi"; exit 1; }; \
+	awk '/^p_f[.]0_8_runlocal:/,/cfi_endproc/' $(BUILDDIR)/elemaddr1.s | grep -qE 'leaq -[0-9]+\(%rbp,%rsi,8\), %rsi' || { echo "elemaddr.s: RunLocal works out no element in rsi"; exit 1; }; \
 	echo ok elemaddr-asm; \
 	: an index tested against both ends of a slice is one compare without sign and one branch, its length the word at 8 alone, P377; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/boundsidiom1 testdata/boundsidiom.paslang; \
 	for f in ina outa inr inp zero; do \
-	  awk "/^p_$$f:/,/cfi_endproc/" $(BUILDDIR)/boundsidiom1.s > $(BUILDDIR)/boundsidiom-$$f.s; \
+	  awk "/^p_f[.]0_$${#f}_$$f:/,/cfi_endproc/" $(BUILDDIR)/boundsidiom1.s > $(BUILDDIR)/boundsidiom-$$f.s; \
 	  test $$(grep -cE '^  (jb|jae) ' $(BUILDDIR)/boundsidiom-$$f.s) -eq 1 || { echo "boundsidiom.s: $$f is not one branch without sign"; exit 1; }; \
 	  if grep -q 'set' $(BUILDDIR)/boundsidiom-$$f.s; then echo "boundsidiom.s: $$f makes a Boolean"; exit 1; fi; \
 	done; \
 	: the compiler, TypeOf put in place: its check in IsStrTyp makes no Boolean of its index against High, its own result the one setcc; \
-	if awk '/^p_pasparse_tparser_isstrtyp:/,/cfi_endproc/' $(BUILDDIR)/stage/pasparse.s | grep -q 'setg %al'; then echo "pasparse.s: the check in IsStrTyp makes a Boolean"; exit 1; fi; \
+	if awk '/^p_m[.]23_t_u[.]8_pasparse7_tparser8_isstrtyp:/,/cfi_endproc/' $(BUILDDIR)/stage/pasparse.s | grep -q 'setg %al'; then echo "pasparse.s: the check in IsStrTyp makes a Boolean"; exit 1; fi; \
 	echo ok boundsidiom-asm; \
 	: the hidden variables of bodies put in place share the frame slots their lives do not meet, a pointer slot with pointers only, P378; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/hidshare1 testdata/hidshare.paslang; \
 	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 $(BUILDDIR)/hidshare1 > $(BUILDDIR)/hidshare1.got; \
 	diff -u testdata/hidshare.out $(BUILDDIR)/hidshare1.got; \
-	f=$$(grep -o '\.set \.Lfrp_many, [0-9]*' $(BUILDDIR)/hidshare1.s | grep -o '[0-9]*$$'); \
+	f=$$(grep -o '\.set \.Lfrp_f[.]0_4_many, [0-9]*' $(BUILDDIR)/hidshare1.s | grep -o '[0-9]*$$'); \
 	test "$$f" -le 128 || { echo "hidshare.s: Many takes $$f bytes of frame"; exit 1; }; \
 	echo ok hidshare-asm; \
 	: c + k * x and y + k * x are one lea, x := x + k * y one lea on the register of x, r13 and rbp are never the base of a lea with an index, and a load at p - k takes the offset, P294; \
-	awk '/^p_off8:/,/cfi_endproc/' $(BUILDDIR)/leaform.s > $(BUILDDIR)/leaform-off8.s; \
+	awk '/^p_f[.]0_4_off8:/,/cfi_endproc/' $(BUILDDIR)/leaform.s > $(BUILDDIR)/leaform-off8.s; \
 	grep -q 'leaq 8(,%r[a-z0-9]*,8), ' $(BUILDDIR)/leaform-off8.s || { echo "leaform.s: Off8 is not one lea"; exit 1; }; \
 	if grep -qE 'imulq|shlq|addq' $(BUILDDIR)/leaform-off8.s; then echo "leaform.s: Off8 multiplies, shifts or adds"; exit 1; fi; \
-	awk '/^p_base:/,/cfi_endproc/' $(BUILDDIR)/leaform.s | grep -qE 'leaq \(%[a-z0-9]+,%[a-z0-9]+,4\)' || { echo "leaform.s: Base is not one lea"; exit 1; }; \
-	test $$(awk '/^p_loop:/,/cfi_endproc/' $(BUILDDIR)/leaform.s | grep -cE 'leaq \(%[a-z0-9]+,%[a-z0-9]+,[248]\), ') -eq 4 || { echo "leaform.s: the loop of Loop has not four leas"; exit 1; }; \
+	awk '/^p_f[.]0_4_base:/,/cfi_endproc/' $(BUILDDIR)/leaform.s | grep -qE 'leaq \(%[a-z0-9]+,%[a-z0-9]+,4\)' || { echo "leaform.s: Base is not one lea"; exit 1; }; \
+	test $$(awk '/^p_f[.]0_4_loop:/,/cfi_endproc/' $(BUILDDIR)/leaform.s | grep -cE 'leaq \(%[a-z0-9]+,%[a-z0-9]+,[248]\), ') -eq 4 || { echo "leaform.s: the loop of Loop has not four leas"; exit 1; }; \
 	if grep -qE 'leaq [-0-9]*\(%(r13|rbp),%' $(BUILDDIR)/leaform.s; then echo "leaform.s: r13 or rbp is the base of a lea with an index"; exit 1; fi; \
-	awk '/^p_back:/,/cfi_endproc/' $(BUILDDIR)/leaform.s > $(BUILDDIR)/leaform-back.s; \
+	awk '/^p_f[.]0_4_back:/,/cfi_endproc/' $(BUILDDIR)/leaform.s > $(BUILDDIR)/leaform-back.s; \
 	test $$(grep -cE 'movq -(8|16)\(%r(si|di|[0-9]+)\), ' $(BUILDDIR)/leaform-back.s) -eq 2 || { echo "leaform.s: Back does not load at p - 8 and p - 16"; exit 1; }; \
 	if grep -qE 'subq \$$(8|16), ' $(BUILDDIR)/leaform-back.s; then echo "leaform.s: Back subtracts before it loads"; exit 1; fi; \
 	echo ok leaform-asm; \
@@ -4367,7 +4368,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 $(BUILDDIR)/ptrwalk > $(BUILDDIR)/ptrwalk-gc.got; \
 	diff -u testdata/ptrwalk.out $(BUILDDIR)/ptrwalk-gc.got; \
 	for f in widths last zeros spell; do \
-	  awk "/^p_$$f:/,/cfi_endproc/" $(BUILDDIR)/ptrwalk.s > $(BUILDDIR)/ptrwalk-$$f.s; \
+	  awk "/^p_f[.]0_$${#f}_$$f:/,/cfi_endproc/" $(BUILDDIR)/ptrwalk.s > $(BUILDDIR)/ptrwalk-$$f.s; \
 	  grep -qE '^  testq %([a-z0-9]+), %\1$$' $(BUILDDIR)/ptrwalk-$$f.s || { echo "ptrwalk.s: $$f does not test its pointer in its register"; exit 1; }; \
 	  if grep -qE 'cmpq \$$0, %' $(BUILDDIR)/ptrwalk-$$f.s; then echo "ptrwalk.s: $$f compares a register with 0"; exit 1; fi; \
 	done; \
@@ -4379,29 +4380,29 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 $(BUILDDIR)/movefill > $(BUILDDIR)/movefill-gc.got; \
 	diff -u testdata/movefill.out $(BUILDDIR)/movefill-gc.got; \
 	for f in c1 c3 c8 c16 c17 c100 c128 whole; do \
-	  if awk "/^p_$$f:/,/cfi_endproc/" $(BUILDDIR)/movefill.s | grep -qE 'call rt_memcpy|rep stosb'; then echo "movefill.s: $$f calls rt_memcpy or fills with rep stosb"; exit 1; fi; \
+	  if awk "/^p_f[.]0_$${#f}_$$f:/,/cfi_endproc/" $(BUILDDIR)/movefill.s | grep -qE 'call rt_memcpy|rep stosb'; then echo "movefill.s: $$f calls rt_memcpy or fills with rep stosb"; exit 1; fi; \
 	done; \
 	: the processor decides past 128 bytes, P372, for the base one Move of 129 bytes calls rt_memcpy and no ymm register is named, with AVX, v3, up to 256 bytes are 32-byte words in line and vzeroupper, from 257 rt_memcpy; \
 	$(OUTDIR)/paslangc -cpu base -o $(BUILDDIR)/movefill-base testdata/movefill.paslang; \
 	$(BUILDDIR)/movefill-base > $(BUILDDIR)/movefill-base.got; \
 	diff -u testdata/movefill.out $(BUILDDIR)/movefill-base.got; \
-	awk '/^p_c129:/,/cfi_endproc/' $(BUILDDIR)/movefill-base.s | grep -q 'call rt_memcpy' || { echo "movefill-base.s: c129 does not call rt_memcpy"; exit 1; }; \
+	awk '/^p_f[.]0_4_c129:/,/cfi_endproc/' $(BUILDDIR)/movefill-base.s | grep -q 'call rt_memcpy' || { echo "movefill-base.s: c129 does not call rt_memcpy"; exit 1; }; \
 	if grep -q 'ymm' $(BUILDDIR)/movefill-base.s; then echo "movefill-base.s: a ymm register on the base processor"; exit 1; fi; \
 	$(OUTDIR)/paslangc -cpu v3 -o $(BUILDDIR)/movefill-v3 testdata/movefill.paslang; \
 	$(BUILDDIR)/movefill-v3 > $(BUILDDIR)/movefill-v3.got; \
 	diff -u testdata/movefill.out $(BUILDDIR)/movefill-v3.got; \
 	for f in c129 c200 c256; do \
-	  if awk "/^p_$$f:/,/cfi_endproc/" $(BUILDDIR)/movefill-v3.s | grep -q 'call rt_memcpy'; then echo "movefill-v3.s: $$f calls rt_memcpy"; exit 1; fi; \
-	  awk "/^p_$$f:/,/cfi_endproc/" $(BUILDDIR)/movefill-v3.s | grep -q 'vzeroupper' || { echo "movefill-v3.s: $$f leaves the upper halves dirty"; exit 1; }; \
+	  if awk "/^p_f[.]0_$${#f}_$$f:/,/cfi_endproc/" $(BUILDDIR)/movefill-v3.s | grep -q 'call rt_memcpy'; then echo "movefill-v3.s: $$f calls rt_memcpy"; exit 1; fi; \
+	  awk "/^p_f[.]0_$${#f}_$$f:/,/cfi_endproc/" $(BUILDDIR)/movefill-v3.s | grep -q 'vzeroupper' || { echo "movefill-v3.s: $$f leaves the upper halves dirty"; exit 1; }; \
 	done; \
-	awk '/^p_c257:/,/cfi_endproc/' $(BUILDDIR)/movefill-v3.s | grep -q 'call rt_memcpy' || { echo "movefill-v3.s: c257 does not call rt_memcpy"; exit 1; }; \
+	awk '/^p_f[.]0_4_c257:/,/cfi_endproc/' $(BUILDDIR)/movefill-v3.s | grep -q 'call rt_memcpy' || { echo "movefill-v3.s: c257 does not call rt_memcpy"; exit 1; }; \
 	echo ok movefill-asm; \
 	: a constant an instruction can take is its immediate, P306: the routines of immconst load no such constant into a register first; \
 	python3 -I scripts/check_immediates.py $(BUILDDIR)/immconst.s adds,logic,steps,cmps,chars,kind,arrays; \
 	echo ok immconst-asm; \
 	: a product by a constant is one or two shifts, adds or leas where that costs less than a multiply, P295: Ten multiplies nothing and Large still does; \
-	if awk '/^p_ten:/,/cfi_endproc/' $(BUILDDIR)/mulconst.s | grep -q 'imulq'; then echo "mulconst.s: Ten multiplies"; exit 1; fi; \
-	awk '/^p_large:/,/cfi_endproc/' $(BUILDDIR)/mulconst.s | grep -q 'imulq' || { echo "mulconst.s: Large does not multiply"; exit 1; }; \
+	if awk '/^p_f[.]0_3_ten:/,/cfi_endproc/' $(BUILDDIR)/mulconst.s | grep -q 'imulq'; then echo "mulconst.s: Ten multiplies"; exit 1; fi; \
+	awk '/^p_f[.]0_5_large:/,/cfi_endproc/' $(BUILDDIR)/mulconst.s | grep -q 'imulq' || { echo "mulconst.s: Large does not multiply"; exit 1; }; \
 	echo ok mulconst-asm; \
 	: an if whose arms only assign a word is a compare and a CMOVcc as the branchelim of Go makes it, P307: selectif under the stress of the collector and without inlining, every if it marks select a CMOVcc and no jump, every one it marks branch a jump; \
 	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 $(BUILDDIR)/selectif > $(BUILDDIR)/selectif-gc.got; \
@@ -4603,9 +4604,9 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(OUTDIR)/paslangc -inline 0 -o $(BUILDDIR)/exprinline0 testdata/exprinline.paslang; \
 	$(BUILDDIR)/exprinline0 > $(BUILDDIR)/exprinline0.got; \
 	diff -u testdata/exprinline.out $(BUILDDIR)/exprinline0.got; \
-	awk '/^p_branchy:/,/ret$$/' $(BUILDDIR)/exprinline.s > $(BUILDDIR)/exprinline-branchy.s; \
+	awk '/^p_f[.]0_7_branchy:/,/ret$$/' $(BUILDDIR)/exprinline.s > $(BUILDDIR)/exprinline-branchy.s; \
 	grep -q '^  cmovlq ' $(BUILDDIR)/exprinline-branchy.s || { echo "exprinline.s: Branchy is not a select on Less's compare"; exit 1; }; \
-	if grep -q 'call p_less\|^  set' $(BUILDDIR)/exprinline-branchy.s; then echo "exprinline.s: Branchy calls Less or makes a Boolean"; exit 1; fi; \
+	if grep -q 'call p_f[.]0_4_less\|^  set' $(BUILDDIR)/exprinline-branchy.s; then echo "exprinline.s: Branchy calls Less or makes a Boolean"; exit 1; fi; \
 	echo ok exprinline; \
 	echo "==== narrow Go twin ===="; \
 	if command -v go > /dev/null 2>&1; then \
@@ -4712,7 +4713,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(OUTDIR)/paslangc testdata/units/dbl.paslang; \
 	test -f $(BUILDDIR)/adder.pi; \
 	test -f $(BUILDDIR)/dbl.pi; \
-	grep -q PASLANGI34 $(BUILDDIR)/adder.pi; \
+	grep -q PASLANGI35 $(BUILDDIR)/adder.pi; \
 	$(OUTDIR)/paslangc testdata/units/quadimpl.paslang; \
 	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/quadimplmain testdata/quadimpl.paslang; \
 	$(BUILDDIR)/quadimplmain > $(BUILDDIR)/quadimpl.got; \
@@ -4790,7 +4791,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	: class members across a unit, P123: the class variable is a global of the unit, named by the .pi; \
 	$(OUTDIR)/paslangc testdata/units/clsu.paslang; \
 	grep -q '^CVAR FMade 1 clsu.TNode.FMade 2$$' $(BUILDDIR)/clsu.pi; \
-	grep -q '^METH Label p_clsu_tnode_label 4 0 1 -1 2 3 0 3 4 0 0 0 0 s64666c74 1 58$$' $(BUILDDIR)/clsu.pi; \
+	grep -q '^METH Label p_m[.]17_t_u[.]4_clsu5_tnode5_label 4 0 1 -1 2 3 0 3 4 0 0 0 0 s64666c74 1 58$$' $(BUILDDIR)/clsu.pi; \
 	grep -q '^VAR TNode.FMade 1 clsu.TNode.FMade$$' $(BUILDDIR)/clsu.pi; \
 	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/clsuse testdata/units/clsuse.paslang; \
 	$(BUILDDIR)/clsuse > $(BUILDDIR)/clsuse.got; \
@@ -5060,7 +5061,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	: two units that declare the same class, interface, record and helper names, P154; \
 	$(OUTDIR)/paslangc testdata/units/twina.paslang; \
 	$(OUTDIR)/paslangc testdata/units/twinb.paslang; \
-	grep -q '^CSYM twina_tshape$$' $(BUILDDIR)/twina.pi; \
+	grep -q '^CSYM t_u[.]5_twina6_tshape$$' $(BUILDDIR)/twina.pi; \
 	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/twinuse testdata/units/twinuse.paslang; \
 	$(BUILDDIR)/twinuse > $(BUILDDIR)/twinuse.got; \
 	diff -u testdata/units/twinuse.out $(BUILDDIR)/twinuse.got; \
@@ -5099,11 +5100,11 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  $(BUILDDIR)/lvluse-$$c > $(BUILDDIR)/lvluse-$$c.got; \
 	  diff -u testdata/units/lvluse.out $(BUILDDIR)/lvluse-$$c.got; \
 	done; \
-	objdump -d --no-show-raw-insn $(BUILDDIR)/lvluse-base | awk '/<p_lvlu_check>:/,/ret/' | grep -q pascrc32cbase; \
-	objdump -d --no-show-raw-insn $(BUILDDIR)/lvluse-$(LVL_X64_CPU) | awk '/<p_lvlu_check>:/,/ret/' | grep -q pascrc32ccpu; \
+	objdump -d --no-show-raw-insn $(BUILDDIR)/lvluse-base | awk '/<p_f[.]4_lvlu5_check>:/,/ret/' | grep -q pascrc32cbase; \
+	objdump -d --no-show-raw-insn $(BUILDDIR)/lvluse-$(LVL_X64_CPU) | awk '/<p_f[.]4_lvlu5_check>:/,/ret/' | grep -q pascrc32ccpu; \
 	: a program for plain v3 lacks the level and links the base build, P465; \
 	$(OUTDIR)/paslangc -cpu v3 -Fu $(BUILDDIR) -o $(BUILDDIR)/lvluse-v3plain testdata/units/lvluse.paslang; \
-	objdump -d --no-show-raw-insn $(BUILDDIR)/lvluse-v3plain | awk '/<p_lvlu_check>:/,/ret/' | grep -q pascrc32cbase; \
+	objdump -d --no-show-raw-insn $(BUILDDIR)/lvluse-v3plain | awk '/<p_f[.]4_lvlu5_check>:/,/ret/' | grep -q pascrc32cbase; \
 	: pascipher at the amd64 level seals through AES-NI and PCLMULQDQ, P465; \
 	grep -q 'aesenc %xmm1, %xmm0' $(BUILDDIR)/$(LVL_X64)/pascipher.s; \
 	grep -q 'pclmulqdq' $(BUILDDIR)/$(LVL_X64)/pascipher.s; \
@@ -5112,8 +5113,8 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  $(BUILDDIR)/sysutils1-$$c > $(BUILDDIR)/sysutils1-$$c.got; \
 	  diff -u testdata/sysutils1.out $(BUILDDIR)/sysutils1-$$c.got; \
 	done; \
-	objdump -d --no-show-raw-insn $(BUILDDIR)/sysutils1-base | awk '/<p_sysutils_uppercase>:/,/ret/' | grep -q pasupperbase; \
-	objdump -d --no-show-raw-insn $(BUILDDIR)/sysutils1-$(LVL_X64_CPU) | awk '/<p_sysutils_uppercase>:/,/ret/' | grep -q pasuppercpu; \
+	objdump -d --no-show-raw-insn $(BUILDDIR)/sysutils1-base | awk '/<p_f[.]8_sysutils9_uppercase>:/,/ret/' | grep -q pasupperbase; \
+	objdump -d --no-show-raw-insn $(BUILDDIR)/sysutils1-$(LVL_X64_CPU) | awk '/<p_f[.]8_sysutils9_uppercase>:/,/ret/' | grep -q pasuppercpu; \
 	$(OUTDIR)/paslangc -target arm64 -cpu base testdata/units/lvlu.paslang; \
 	$(OUTDIR)/paslangc -target arm64 -cpu $(LVL_A64) -c -Fu $(A64DIR) -o '$(A64DIR)/$(LVL_A64)/lvlu' testdata/units/lvlu.paslang; \
 	for c in base max; do \
@@ -5121,8 +5122,8 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  timeout 60 $(QEMU_A64) $(BUILDDIR)/lvluse-arm-$$c > $(BUILDDIR)/lvluse-arm-$$c.got; \
 	  diff -u testdata/units/lvluse.out $(BUILDDIR)/lvluse-arm-$$c.got; \
 	done; \
-	$(A64_OBJDUMP) -d --no-show-raw-insn $(BUILDDIR)/lvluse-arm-base | awk '/<p_lvlu_check>:/,/ret/' | grep -q pascrc32cbase; \
-	$(A64_OBJDUMP) -d --no-show-raw-insn $(BUILDDIR)/lvluse-arm-max | awk '/<p_lvlu_check>:/,/ret/' | grep -q pascrc32ccpu; \
+	$(A64_OBJDUMP) -d --no-show-raw-insn $(BUILDDIR)/lvluse-arm-base | awk '/<p_f[.]4_lvlu5_check>:/,/ret/' | grep -q pascrc32cbase; \
+	$(A64_OBJDUMP) -d --no-show-raw-insn $(BUILDDIR)/lvluse-arm-max | awk '/<p_f[.]4_lvlu5_check>:/,/ret/' | grep -q pascrc32ccpu; \
 	: the ifdef words of -cpu, P148: one CPU_ word for each feature; \
 	for c in base $(LVL_X64); do \
 	  $(OUTDIR)/paslangc -cpu $$c -o $(BUILDDIR)/cpudefs-$$c testdata/cpudefs.paslang; \
@@ -5160,177 +5161,180 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(BUILDDIR)/twiceuse > $(BUILDDIR)/twiceuse.got; \
 	diff -u testdata/units/twiceuse.out $(BUILDDIR)/twiceuse.got; \
 	rm -rf $(BUILDDIR)/oldpi; mkdir -p $(BUILDDIR)/oldpi; \
-	sed '1s/PASLANGI34/PASLANGI1/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI35/PASLANGI1/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	cp $(BUILDDIR)/dbl.o $(BUILDDIR)/oldpi/; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.0.49 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.0.49; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI34/PASLANGI2/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI35/PASLANGI2/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.0.55 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.0.55; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI34/PASLANGI3/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI35/PASLANGI3/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.0.58 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.0.58; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI34/PASLANGI4/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI35/PASLANGI4/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.0.87 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.0.87; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI34/PASLANGI5/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI35/PASLANGI5/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.0.91 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.0.91; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI34/PASLANGI6/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI35/PASLANGI6/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.0.104 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.0.104; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI34/PASLANGI7/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI35/PASLANGI7/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.0.108 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.0.108; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI34/PASLANGI8/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI35/PASLANGI8/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.0.110 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.0.110; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI34/PASLANGI9/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI35/PASLANGI9/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.0.114 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.0.114; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI34/PASLANGI10/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI35/PASLANGI10/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.0.125 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.0.125; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI34/PASLANGI11/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI35/PASLANGI11/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.0.133 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.0.133; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI34/PASLANGI12/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI35/PASLANGI12/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.0.137 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.0.137; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI34/PASLANGI13/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI35/PASLANGI13/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.1.2 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.1.2; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI34/PASLANGI14/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI35/PASLANGI14/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.1.4 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.1.4; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI34/PASLANGI15/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI35/PASLANGI15/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.1.6 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.1.6; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI34/PASLANGI16/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI35/PASLANGI16/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.1.7 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.1.7; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI34/PASLANGI17/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI35/PASLANGI17/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.1.8 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.1.8; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI34/PASLANGI18/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI35/PASLANGI18/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.1.9 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.1.9; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI34/PASLANGI19/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI35/PASLANGI19/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.1.28 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.1.28; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI34/PASLANGI20/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI35/PASLANGI20/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.1.37 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.1.37; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI34/PASLANGI21/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI35/PASLANGI21/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface without nested namespaces should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.1.44; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI34/PASLANGI22/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI35/PASLANGI22/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface without generic instance identity should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.1.47; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI34/PASLANGI23/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI35/PASLANGI23/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface without all type aliases should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.1.48; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI34/PASLANGI24/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI35/PASLANGI24/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface without Currency builtin identity should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.1.79; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI34/PASLANGI25/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI35/PASLANGI25/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface without the json type should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.1.124; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI34/PASLANGI26/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI35/PASLANGI26/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface without json directives should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.1.131; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI34/PASLANGI27/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI35/PASLANGI27/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface whose routines return blocks without a buffer should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.1.213; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI34/PASLANGI28/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI35/PASLANGI28/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface whose small blocks come back through a buffer should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.1.217; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI34/PASLANGI29/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI35/PASLANGI29/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface that does not carry its operators should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.1.230; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI34/PASLANGI30/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI35/PASLANGI30/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface that does not carry its records conversions should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.1.233; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI34/PASLANGI31/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI35/PASLANGI31/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface that does not carry its operators of one operand should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.1.234; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI34/PASLANGI32/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI35/PASLANGI32/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface whose object keeps its plain code maps in plain sections should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.1.244; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI34/PASLANGI33/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI35/PASLANGI33/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface whose types come again in each unit that reads it should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.1.274; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI34/PASLANGI35/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI35/PASLANGI36/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from a later paslang should be refused'; exit 1; \
 	fi; \
-	grep -q 'was compiled by a newer paslang (PASLANGI35); compile dbl again with this one' $(BUILDDIR)/oldpi.err; \
+	grep -q 'was compiled by a newer paslang (PASLANGI36); compile dbl again with this one' $(BUILDDIR)/oldpi.err; \
+	sed '1s/PASLANGI35/PASLANGI34/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then echo 'old pi 34 accepted'; exit 1; fi; \
+	grep -q 'was compiled by a paslang older than 1.2.400; compile dbl again' $(BUILDDIR)/oldpi.err; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/pisum testdata/units/pisum.paslang; \
 	sed 's/^TYPE Byte 6 1 1 /TYPE Byte 6 1 4 /' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	$(BUILDDIR)/pisum $(BUILDDIR)/oldpi/dbl.pi; \
@@ -5426,7 +5430,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/units/opvecuse.out $(BUILDDIR)/opvecuse.got; \
 	test $$(grep -c '^OPER ' $(BUILDDIR)/opvecu.pi) -eq 5 || { echo "opvecu.pi does not carry its five operators"; exit 1; }; \
 	if grep -q '^OPER div ' $(BUILDDIR)/opvecu.pi; then echo "opvecu.pi carries the div of its implementation"; exit 1; fi; \
-	awk '/^pas_main:/,/cfi_endproc/' $(BUILDDIR)/opvecuse.s | grep -q 'call p_opcolu_op_lt_tvec_tvec$$' || { echo "opvecuse.s: the main block's < is not opcolu's"; exit 1; }; \
+	awk '/^pas_main:/,/cfi_endproc/' $(BUILDDIR)/opvecuse.s | grep -q 'call p_o[.]6_opcolu0_2_lt18_t_u[.]6_opvecu4_tvec18_t_u[.]6_opvecu4_tvec$$' || { echo "opvecuse.s: the main block's < is not opcolu's"; exit 1; }; \
 	echo ok opvecuse; \
 	echo "==== a unit's class helper constructor (P170) ===="; \
 	$(OUTDIR)/paslangc testdata/units/helpctoru.paslang; \
@@ -5802,26 +5806,26 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	$(OUTDIR)/paslangc -target arm64 -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/condjump0-arm testdata/condjump.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/condjump0-arm > $(BUILDDIR)/condjump0-arm.got; \
 	diff -u testdata/condjump.out $(BUILDDIR)/condjump0-arm.got; \
-	awk '/^p_digit:/,/ret$$/' $(BUILDDIR)/condjump-arm.s > $(BUILDDIR)/condjump-digit-arm.s; \
+	awk '/^p_f[.]0_5_digit:/,/ret$$/' $(BUILDDIR)/condjump-arm.s > $(BUILDDIR)/condjump-digit-arm.s; \
 	grep -qE 'sub x[0-9]+, x[0-9]+, #48' $(BUILDDIR)/condjump-digit-arm.s && grep -qE 'cmp x[0-9]+, #9$$' $(BUILDDIR)/condjump-digit-arm.s && test $$(grep -cE 'b[.](lt|gt|le|ge|hi|ls) ' $(BUILDDIR)/condjump-digit-arm.s) -eq 1 || { echo "condjump-arm.s: Digit's range is not one subtraction, one compare without sign and one branch (P292)"; exit 1; }; \
 	if grep -q 'cset' $(BUILDDIR)/condjump-digit-arm.s; then echo "condjump-arm.s: Digit's condition makes a Boolean"; exit 1; fi; \
 	for f in sum sumwhile sumconst bump; do \
-	  awk "/^p_$$f:/,/ret\$$/" $(BUILDDIR)/varparts-arm.s > $(BUILDDIR)/varparts-$$f-arm.s; \
+	  awk "/^p_f[.]0_$${#f}_$$f:/,/ret\$$/" $(BUILDDIR)/varparts-arm.s > $(BUILDDIR)/varparts-$$f-arm.s; \
 	  grep -qE '\[x(19|2[0-8])(, #[0-9]+)?\]' $(BUILDDIR)/varparts-$$f-arm.s || { echo "varparts-arm.s: $$f reads no field from a kept register"; exit 1; }; \
 	  if grep -qE '\[x(9|1[0-7])(, #[0-9]+)?\]' $(BUILDDIR)/varparts-$$f-arm.s; then echo "varparts-arm.s: $$f reads a field through a pool register"; exit 1; fi; \
 	done; \
 	echo ok varparts-arm-asm; \
 	for f in spin spin2; do \
-	  awk "/^p_$$f:/,/ret\$$/" $(BUILDDIR)/whilerun-arm.s | grep -q 'csel x26' || { echo "whilerun-arm.s: $$f does not run in runs"; exit 1; }; \
+	  awk "/^p_f[.]0_$${#f}_$$f:/,/ret\$$/" $(BUILDDIR)/whilerun-arm.s | grep -q 'csel x26' || { echo "whilerun-arm.s: $$f does not run in runs"; exit 1; }; \
 	done; \
 	for f in spin3 others; do \
-	  if awk "/^p_$$f:/,/ret\$$/" $(BUILDDIR)/whilerun-arm.s | grep -qE '^  add x26, x[0-9]+, #1023$$'; then echo "whilerun-arm.s: $$f runs in runs"; exit 1; fi; \
+	  if awk "/^p_f[.]0_$${#f}_$$f:/,/ret\$$/" $(BUILDDIR)/whilerun-arm.s | grep -qE '^  add x26, x[0-9]+, #1023$$'; then echo "whilerun-arm.s: $$f runs in runs"; exit 1; fi; \
 	done; \
 	echo ok whilerun-arm-asm; \
 	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 timeout 300 $(QEMU_A64) $(BUILDDIR)/lazyzero-arm > $(BUILDDIR)/lazyzero-arm-gc.got; \
 	diff -u testdata/lazyzero.out $(BUILDDIR)/lazyzero-arm-gc.got; \
 	for f in botharms casearms forbody earlyexit; do \
-	  if awk "/^p_$$f:/,/cfi_endproc/" $(BUILDDIR)/lazyzero-arm.s | grep -q 'xzr, \[x29'; then echo "lazyzero-arm.s: $$f clears a slot"; exit 1; fi; \
+	  if awk "/^p_f[.]0_$${#f}_$$f:/,/cfi_endproc/" $(BUILDDIR)/lazyzero-arm.s | grep -q 'xzr, \[x29'; then echo "lazyzero-arm.s: $$f clears a slot"; exit 1; fi; \
 	done; \
 	echo ok lazyzero-arm-gc; \
 	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 timeout 300 $(QEMU_A64) $(BUILDDIR)/mapsmall-arm nomem > $(BUILDDIR)/mapsmall-arm-gc.got; \
@@ -5834,33 +5838,33 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	grep -v '20000 slices' testdata/slicefront.out | diff -u - $(BUILDDIR)/slicefront-arm-gc.got; \
 	echo ok slicefront-arm-gc; \
 	for f in twice thrice mix rot big three same konst tshape_area tshape_areak tshape_link; do \
-	  if awk "/^p_$$f:/,/cfi_endproc/" $(BUILDDIR)/leafcall-arm.s | grep -q 'x28, #16\|stp x29, x30'; then echo "leafcall-arm.s: $$f has a stack check or a frame"; exit 1; fi; \
+	  if awk "/^p_f[.]0_$${#f}_$$f:/,/cfi_endproc/" $(BUILDDIR)/leafcall-arm.s | grep -q 'x28, #16\|stp x29, x30'; then echo "leafcall-arm.s: $$f has a stack check or a frame"; exit 1; fi; \
 	done; \
-	if awk '/^p_clamp:/,/cfi_endproc/' $(BUILDDIR)/leafcall-arm.s | grep -q 'stp x29, x30'; then echo "leafcall-arm.s: Clamp has a frame"; exit 1; fi; \
-	if awk '/^p_clamp:/,/cfi_endproc/' $(BUILDDIR)/leafcall-arm.s | grep -q 'x28, #16'; then echo "leafcall-arm.s: Clamp has a stack check"; exit 1; fi; \
-	awk '/^p_worker:/,/cfi_endproc/' $(BUILDDIR)/leafcall-arm.s | grep -q 'x28, #16' || { echo "leafcall-arm.s: Worker has no stack check"; exit 1; }; \
+	if awk '/^p_f[.]0_5_clamp:/,/cfi_endproc/' $(BUILDDIR)/leafcall-arm.s | grep -q 'stp x29, x30'; then echo "leafcall-arm.s: Clamp has a frame"; exit 1; fi; \
+	if awk '/^p_f[.]0_5_clamp:/,/cfi_endproc/' $(BUILDDIR)/leafcall-arm.s | grep -q 'x28, #16'; then echo "leafcall-arm.s: Clamp has a stack check"; exit 1; fi; \
+	awk '/^p_f[.]0_6_worker:/,/cfi_endproc/' $(BUILDDIR)/leafcall-arm.s | grep -q 'x28, #16' || { echo "leafcall-arm.s: Worker has no stack check"; exit 1; }; \
 	echo ok leafcall-arm-asm; \
 	for f in masked modpos shifted onebased byteidx sumfor callmasked pairat tripleat; do \
-	  if awk "/^p_$$f:/,/cfi_endproc/" $(BUILDDIR)/bceprove-arm.s | grep -q rt_boundsfail; then echo "bceprove-arm.s: $$f checks an index it proved"; exit 1; fi; \
+	  if awk "/^p_f[.]0_$${#f}_$$f:/,/cfi_endproc/" $(BUILDDIR)/bceprove-arm.s | grep -q rt_boundsfail; then echo "bceprove-arm.s: $$f checks an index it proved"; exit 1; fi; \
 	done; \
 	echo ok bceprove-arm-asm; \
 	: a variable a register keeps is loaded, compared, stepped and masked where it lives, with the immediates arm64 takes, P290; \
-	awk '/^p_digits:/,/cfi_endproc/' $(BUILDDIR)/armregs-arm.s > $(BUILDDIR)/armregs-digits-arm.s; \
+	awk '/^p_f[.]0_6_digits:/,/cfi_endproc/' $(BUILDDIR)/armregs-arm.s > $(BUILDDIR)/armregs-digits-arm.s; \
 	grep -qE 'ldrb w(19|2[0-8]), \[x(19|2[0-8]), x(19|2[0-8])' $(BUILDDIR)/armregs-digits-arm.s || { echo "armregs-arm.s: Digits does not load into its variable"; exit 1; }; \
 	grep -qE 'sub x[0-9]+, x(19|2[0-8]), #48$$' $(BUILDDIR)/armregs-digits-arm.s || { echo "armregs-arm.s: Digits copies b before its range test (P290, P292)"; exit 1; }; \
 	grep -qE 'add (x[0-9]+), \1, #1$$' $(BUILDDIR)/armregs-digits-arm.s || { echo "armregs-arm.s: Digits does not step k in place"; exit 1; }; \
 	if awk '/p2align 5/{l=1} l{print} l&&/csel x26/{exit}' $(BUILDDIR)/armregs-digits-arm.s | grep -qE 'mov x[01], x(19|2[0-8])$$'; then echo "armregs-arm.s: the loop of Digits copies a kept register into x0 or x1"; exit 1; fi; \
 	if awk '/p2align 5/{l=1} l{print} l&&/csel x26/{exit}' $(BUILDDIR)/armregs-digits-arm.s | grep -q 'x28, #16'; then echo "armregs-arm.s: the loop of Digits tests the guard (P293)"; exit 1; fi; \
-	awk '/^p_imms:/,/cfi_endproc/' $(BUILDDIR)/armregs-arm.s | grep -qE 'sub x[0-9]+, x[0-9]+, #1, lsl #12' || { echo "armregs-arm.s: Imms does not take 4096 as an immediate"; exit 1; }; \
-	awk '/^p_cmps:/,/cfi_endproc/' $(BUILDDIR)/armregs-arm.s | grep -qE 'cmn x[0-9]+, #4095' || { echo "armregs-arm.s: Cmps does not compare -4095 with cmn"; exit 1; }; \
-	awk '/^p_loads:/,/cfi_endproc/' $(BUILDDIR)/armregs-arm.s | grep -qE 'and x[0-9]+, x[0-9]+, #0x0*3f' || { echo "armregs-arm.s: Loads does not mask i where it lives"; exit 1; }; \
+	awk '/^p_f[.]0_4_imms:/,/cfi_endproc/' $(BUILDDIR)/armregs-arm.s | grep -qE 'sub x[0-9]+, x[0-9]+, #1, lsl #12' || { echo "armregs-arm.s: Imms does not take 4096 as an immediate"; exit 1; }; \
+	awk '/^p_f[.]0_4_cmps:/,/cfi_endproc/' $(BUILDDIR)/armregs-arm.s | grep -qE 'cmn x[0-9]+, #4095' || { echo "armregs-arm.s: Cmps does not compare -4095 with cmn"; exit 1; }; \
+	awk '/^p_f[.]0_5_loads:/,/cfi_endproc/' $(BUILDDIR)/armregs-arm.s | grep -qE 'and x[0-9]+, x[0-9]+, #0x0*3f' || { echo "armregs-arm.s: Loads does not mask i where it lives"; exit 1; }; \
 	echo ok armregs-arm-asm; \
-	if awk '/^p_near:/,/cfi_endproc/' $(BUILDDIR)/framefield-arm.s | grep -qE 'sub x(9|1[0-7]), x29'; then echo "framefield-arm.s: Near forms its record's address for its fields"; exit 1; fi; \
+	if awk '/^p_f[.]0_4_near:/,/cfi_endproc/' $(BUILDDIR)/framefield-arm.s | grep -qE 'sub x(9|1[0-7]), x29'; then echo "framefield-arm.s: Near forms its record's address for its fields"; exit 1; fi; \
 	echo ok framefield-arm-asm; \
-	test $$(awk '/^p_bits:/,/cfi_endproc/' $(BUILDDIR)/rangetest-arm.s | grep -cE 'b[.](hi|ls) |cset x0, (hi|ls)') -eq 13 || { echo "rangetest-arm.s: Bits has not 13 ranges in one compare"; exit 1; }; \
-	test $$(awk '/^p_narrow:/,/cfi_endproc/' $(BUILDDIR)/rangetest-arm.s | grep -cE 'b[.](hi|ls) ') -eq 8 || { echo "rangetest-arm.s: Narrow has not 8 ranges in one compare"; exit 1; }; \
+	test $$(awk '/^p_f[.]0_4_bits:/,/cfi_endproc/' $(BUILDDIR)/rangetest-arm.s | grep -cE 'b[.](hi|ls) |cset x0, (hi|ls)') -eq 13 || { echo "rangetest-arm.s: Bits has not 13 ranges in one compare"; exit 1; }; \
+	test $$(awk '/^p_f[.]0_6_narrow:/,/cfi_endproc/' $(BUILDDIR)/rangetest-arm.s | grep -cE 'b[.](hi|ls) ') -eq 8 || { echo "rangetest-arm.s: Narrow has not 8 ranges in one compare"; exit 1; }; \
 	echo ok rangetest-arm-asm; \
-	test $$(awk '/^p_spin:/,/cfi_endproc/' $(BUILDDIR)/asyncspin-arm.s | grep -c 'x28, #16') -le 1 || { echo "asyncspin-arm.s: Spin tests the guard in its loop"; exit 1; }; \
+	test $$(awk '/^p_f[.]0_4_spin:/,/cfi_endproc/' $(BUILDDIR)/asyncspin-arm.s | grep -c 'x28, #16') -le 1 || { echo "asyncspin-arm.s: Spin tests the guard in its loop"; exit 1; }; \
 	taskset -c 0 timeout 120 $(QEMU_A64) $(BUILDDIR)/asyncspin-arm > $(BUILDDIR)/asyncspin-arm-1.got; \
 	diff -u testdata/asyncspin.out $(BUILDDIR)/asyncspin-arm-1.got; \
 	for w in "" "taskset -c 0"; do \
@@ -5870,8 +5874,8 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	python3 -I scripts/check_pasasync.py $(BUILDDIR)/asyncgc-arm; \
 	rc=0; PASLANG_ASYNCPREEMPTOFF=1 PASLANG_GCSTRESS=1 timeout 15 $(QEMU_A64) $(BUILDDIR)/asyncgc-arm > /dev/null 2>&1 || rc=$$?; \
 	test $$rc -eq 124 || { echo "asyncgc-arm: PASLANG_ASYNCPREEMPTOFF=1 still stops Walker (exit $$rc)"; exit 1; }; \
-	test $$(awk '/^p_spin:/,/cfi_endproc/' $(BUILDDIR)/asyncleaf-arm.s | grep -c 'x28, #16') -eq 0 || { echo "asyncleaf-arm.s: Spin checks its stack"; exit 1; }; \
-	test $$(awk '/^p_spin:/,/cfi_endproc/' $(BUILDDIR)/asyncleaf-arm.s | sed -n 's/^  sub sp, sp, #//p' | head -1) -ge 192 || { echo "asyncleaf-arm.s: Spin's frame is under 192 bytes"; exit 1; }; \
+	test $$(awk '/^p_f[.]0_4_spin:/,/cfi_endproc/' $(BUILDDIR)/asyncleaf-arm.s | grep -c 'x28, #16') -eq 0 || { echo "asyncleaf-arm.s: Spin checks its stack"; exit 1; }; \
+	test $$(awk '/^p_f[.]0_4_spin:/,/cfi_endproc/' $(BUILDDIR)/asyncleaf-arm.s | sed -n 's/^  sub sp, sp, #//p' | head -1) -ge 192 || { echo "asyncleaf-arm.s: Spin's frame is under 192 bytes"; exit 1; }; \
 	for w in "" "taskset -c 0"; do \
 	  PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 $$w timeout 300 $(QEMU_A64) $(BUILDDIR)/asyncleaf-arm > $(BUILDDIR)/asyncleaf-arm-gc.got; \
 	  diff -u testdata/asyncleaf.out $(BUILDDIR)/asyncleaf-arm-gc.got; \
@@ -5893,7 +5897,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/heldargs0-arm testdata/heldargs.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/heldargs0-arm > $(BUILDDIR)/heldargs0-arm.got; \
 	diff -u testdata/heldargs.out $(BUILDDIR)/heldargs0-arm.got; \
-	python3 -I scripts/check_argpush.py $(BUILDDIR)/heldargs0-arm.s --arm --routines=p_bydirect,p_bydirect5,p_bymethod,p_bymethode,p_byvalue,p_byvalue5,p_bymethval,p_byiface,p_bynested; \
+	python3 -I scripts/check_argpush.py $(BUILDDIR)/heldargs0-arm.s --arm --routines=p_f.0_8_bydirect,p_f.0_9_bydirect5,p_f.0_8_bymethod,p_f.0_9_bymethode,p_f.0_7_byvalue,p_f.0_8_byvalue5,p_f.0_9_bymethval,p_f.0_7_byiface,p_f.0_8_bynested; \
 	echo ok heldargs-arm-asm; \
 	: P356 on arm64: a division on the registers of its operands, its value where it is read; \
 	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/divreg0-arm testdata/divreg.paslang; \
@@ -5905,7 +5909,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/uplevel0-arm testdata/uplevel.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/uplevel0-arm > $(BUILDDIR)/uplevel0-arm.got; \
 	diff -u testdata/uplevel.out $(BUILDDIR)/uplevel0-arm.got; \
-	python3 -I scripts/check_argpush.py $(BUILDDIR)/uplevel0-arm.s --arm --routines=p_outer_mid_deep; \
+	python3 -I scripts/check_argpush.py $(BUILDDIR)/uplevel0-arm.s --arm --routines=p_n.25_p_n.13_p_f.0_5_outer3_mid4_deep; \
 	echo ok uplevel-arm-asm; \
 	: P384 on arm64: a loop that calls keeps its variables in x19 to x26, a try keeps them for its handler, and the runtime keeps them on both machines; \
 	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/isles0-arm testdata/isles.paslang; \
@@ -6026,25 +6030,25 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/nestzero0-arm testdata/nestzero.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/nestzero0-arm > $(BUILDDIR)/nestzero0-arm.got; \
 	diff -u testdata/nestzero.out $(BUILDDIR)/nestzero0-arm.got; \
-	python3 -I scripts/check_nestzero.py $(BUILDDIR)/nestzero0-arm.s --arm --expect=p_early:2,p_late:0,p_branch:2,p_writeback:1; \
+	python3 -I scripts/check_nestzero.py $(BUILDDIR)/nestzero0-arm.s --arm --expect=p_f.0_5_early:2,p_f.0_4_late:0,p_f.0_6_branch:2,p_f.0_9_writeback:1; \
 	echo ok nestzero-arm-asm; \
 	: P360 on arm64: the left side waits in x8; \
 	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/keepleft0-arm testdata/keepleft.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/keepleft0-arm > $(BUILDDIR)/keepleft0-arm.got; \
 	diff -u testdata/keepleft.out $(BUILDDIR)/keepleft0-arm.got; \
-	python3 -I scripts/check_argpush.py $(BUILDDIR)/keepleft0-arm.s --arm --routines=p_bysum,p_bysub,p_bymul,p_byless,p_byatleast,p_bydiv,p_bymod,p_byouter_in1; \
+	python3 -I scripts/check_argpush.py $(BUILDDIR)/keepleft0-arm.s --arm --routines=p_f.0_5_bysum,p_f.0_5_bysub,p_f.0_5_bymul,p_f.0_6_byless,p_f.0_9_byatleast,p_f.0_5_bydiv,p_f.0_5_bymod,p_n.15_p_f.0_7_byouter3_in1; \
 	echo ok keepleft-arm-asm; \
 	: P334 on arm64: no frame, the link kept in x27; \
 	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/nestflat0-arm testdata/nestflat.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/nestflat0-arm > $(BUILDDIR)/nestflat0-arm.got; \
 	diff -u testdata/nestflat.out $(BUILDDIR)/nestflat0-arm.got; \
-	python3 -I scripts/check_nestflat.py $(BUILDDIR)/nestflat0-arm.s --arm --flat=p_outer_flatadd,p_outer_flatlocal,p_outer_flatbump,p_outer_mid_flatdeep,p_adder_anon.1 --framed=p_outer_mid,p_outer; \
+	python3 -I scripts/check_nestflat.py $(BUILDDIR)/nestflat0-arm.s --arm --flat=p_n.13_p_f.0_5_outer7_flatadd,p_n.13_p_f.0_5_outer9_flatlocal,p_n.13_p_f.0_5_outer8_flatbump,p_n.25_p_n.13_p_f.0_5_outer3_mid8_flatdeep,p_a.13_p_f.0_5_adder1_1 --framed=p_n.13_p_f.0_5_outer3_mid,p_f.0_5_outer; \
 	echo ok nestflat-arm-asm; \
 	: P361 on arm64: the value worked out in x0; \
 	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/retreg0-arm testdata/retreg.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/retreg0-arm > $(BUILDDIR)/retreg0-arm.got; \
 	diff -u testdata/retreg.out $(BUILDDIR)/retreg0-arm.got; \
-	python3 -I scripts/check_retreg.py $(BUILDDIR)/retreg0-arm.s --arm --routines=p_sum2,p_scale,p_half,p_addg,p_early,p_makeadd_anon.1 --short=p_makeadd_anon.1:2,p_sum2:1,p_addg:4; \
+	python3 -I scripts/check_retreg.py $(BUILDDIR)/retreg0-arm.s --arm --routines=p_f.0_4_sum2,p_f.0_5_scale,p_f.0_4_half,p_f.0_4_addg,p_f.0_5_early,p_a.15_p_f.0_7_makeadd1_1 --short=p_a.15_p_f.0_7_makeadd1_1:2,p_f.0_4_sum2:1,p_f.0_4_addg:4; \
 	echo ok retreg-arm-asm; \
 	: P362 on arm64: the add of a global read last before a return goes into the load, past a label no jump reaches; \
 	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/adrplast0-arm testdata/adrplast.paslang; \
@@ -6056,54 +6060,54 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/recres0-arm testdata/recres.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/recres0-arm > $(BUILDDIR)/recres0-arm.got; \
 	diff -u testdata/recres.out $(BUILDDIR)/recres0-arm.got; \
-	python3 -I scripts/check_resbuf.py $(BUILDDIR)/recres0-arm.s --arm --routines=p_mkmid,p_mkbig,p_mkset,p_mkodd,p_tshape_twice,p_tboxer_boxed,p_climb,p_wrap,p_anon.1 --dest=8; \
-	python3 -I scripts/check_resbuf.py $(BUILDDIR)/recres0-arm.s --arm --regs=p_mkpair,p_swap,p_op_add_tpair_tpair,p_tshape_box,p_tshape_unit1,p_tshape_getcorner,p_tsquare_box,p_climb2,p_outer,p_risky,p_grow,p_outer_inner --short=p_mkpair:1; \
+	python3 -I scripts/check_resbuf.py $(BUILDDIR)/recres0-arm.s --arm --routines=p_f.0_5_mkmid,p_f.0_5_mkbig,p_f.0_5_mkset,p_f.0_5_mkodd,p_m.14_t_u.0_6_tshape5_twice,p_m.14_t_u.0_6_tboxer5_boxed,p_f.0_5_climb,p_f.0_4_wrap,p_a.8_p_f.0_0_1_1 --dest=8; \
+	python3 -I scripts/check_resbuf.py $(BUILDDIR)/recres0-arm.s --arm --regs=p_f.0_6_mkpair,p_f.0_4_swap,p_o.0_0_3_add5_tpair5_tpair,p_m.14_t_u.0_6_tshape3_box,p_m.14_t_u.0_6_tshape5_unit1,p_m.14_t_u.0_6_tshape9_getcorner,p_m.15_t_u.0_7_tsquare3_box,p_f.0_6_climb2,p_f.0_5_outer,p_f.0_5_risky,p_f.0_4_grow,p_n.13_p_f.0_5_outer5_inner --short=p_f.0_6_mkpair:1; \
 	echo ok recres-arm-asm; \
 	: P366 on arm64: in x0, x2 and x3; \
 	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/regres0-arm testdata/regres.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/regres0-arm > $(BUILDDIR)/regres0-arm.got; \
 	diff -u testdata/regres.out $(BUILDDIR)/regres0-arm.got; \
-	python3 -I scripts/check_resbuf.py $(BUILDDIR)/regres0-arm.s --arm --regs=p_mkone,p_mkpair,p_rot,p_rot3,p_bump,p_pick,p_sum,p_twice,p_mknamed,p_mkpacked,p_mkreal,p_mkarr3,p_tcounter_pair,p_tcounter_tri --short=p_mkpair:1,p_rot:4; \
+	python3 -I scripts/check_resbuf.py $(BUILDDIR)/regres0-arm.s --arm --regs=p_f.0_5_mkone,p_f.0_6_mkpair,p_f.0_3_rot,p_f.0_4_rot3,p_f.0_4_bump,p_f.0_4_pick,p_f.0_3_sum,p_f.0_5_twice,p_f.0_7_mknamed,p_f.0_8_mkpacked,p_f.0_6_mkreal,p_f.0_6_mkarr3,p_m.16_t_u.0_8_tcounter4_pair,p_m.16_t_u.0_8_tcounter3_tri --short=p_f.0_6_mkpair:1,p_f.0_3_rot:4; \
 	echo ok regres-arm-asm; \
 	: P367 on arm64; \
 	$(OUTDIR)/paslangc -target arm64 -cpu max -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/fieldfirst0-arm testdata/fieldfirst.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/fieldfirst0-arm > $(BUILDDIR)/fieldfirst0-arm.got; \
 	diff -u testdata/fieldfirst.out $(BUILDDIR)/fieldfirst0-arm.got; \
-	python3 -I scripts/check_fieldfirst.py $(BUILDDIR)/fieldfirst0-arm.s --arm --zeros=p_full:0,p_both:0,p_part:2,p_readfirst:5,p_branch:5,p_early:5,p_gap:2,p_localsum:5; \
+	python3 -I scripts/check_fieldfirst.py $(BUILDDIR)/fieldfirst0-arm.s --arm --zeros=p_f.0_4_full:0,p_f.0_4_both:0,p_f.0_4_part:2,p_f.0_9_readfirst:5,p_f.0_6_branch:5,p_f.0_5_early:5,p_f.0_3_gap:2,p_f.0_8_localsum:5; \
 	echo ok fieldfirst-arm-asm; \
 	: P370 on arm64; \
 	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/blockcopy1-arm testdata/blockcopy.paslang; \
 	if grep -q 'azero' $(BUILDDIR)/blockcopy1-arm.s; then echo "blockcopy-arm.s: a block store tests a zero address"; exit 1; fi; \
-	if awk '/^p_t40:/,/cfi_endproc/' $(BUILDDIR)/blockcopy1-arm.s | grep -qE 'bl rt_memcpy|bl rt_fill'; then echo "blockcopy-arm.s: T40 copies or zeroes out of line"; exit 1; fi; \
-	if awk '/^p_t200:/,/cfi_endproc/' $(BUILDDIR)/blockcopy1-arm.s | grep -q 'bl rt_fill'; then echo "blockcopy-arm.s: T200 zeroes a variable with rt_fill"; exit 1; fi; \
-	awk '/^p_t300:/,/cfi_endproc/' $(BUILDDIR)/blockcopy1-arm.s | grep -q 'bl rt_memcpy' || { echo "blockcopy-arm.s: T300 copies no block with rt_memcpy"; exit 1; }; \
+	if awk '/^p_f[.]0_3_t40:/,/cfi_endproc/' $(BUILDDIR)/blockcopy1-arm.s | grep -qE 'bl rt_memcpy|bl rt_fill'; then echo "blockcopy-arm.s: T40 copies or zeroes out of line"; exit 1; fi; \
+	if awk '/^p_f[.]0_4_t200:/,/cfi_endproc/' $(BUILDDIR)/blockcopy1-arm.s | grep -q 'bl rt_fill'; then echo "blockcopy-arm.s: T200 zeroes a variable with rt_fill"; exit 1; fi; \
+	awk '/^p_f[.]0_4_t300:/,/cfi_endproc/' $(BUILDDIR)/blockcopy1-arm.s | grep -q 'bl rt_memcpy' || { echo "blockcopy-arm.s: T300 copies no block with rt_memcpy"; exit 1; }; \
 	echo ok blockcopy-arm-asm; \
 	: P368 on arm64; \
 	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/blockinl1-arm testdata/blockinl.paslang; \
-	if awk '/^p_fresh:/,/cfi_endproc/' $(BUILDDIR)/blockinl1-arm.s | grep -q 'bl '; then echo "blockinl-arm.s: Fresh calls"; exit 1; fi; \
-	test $$(awk '/^pas_main:/,/cfi_endproc/' $(BUILDDIR)/blockinl1-arm.s | grep -c 'bl p_get$$') -eq 1 || { echo "blockinl-arm.s: the main block does not call Get once"; exit 1; }; \
-	if awk '/^pas_main:/,/cfi_endproc/' $(BUILDDIR)/blockinl1-arm.s | grep -q 'bl p_mkpair$$'; then echo "blockinl-arm.s: the main block calls MkPair"; exit 1; fi; \
+	if awk '/^p_f[.]0_5_fresh:/,/cfi_endproc/' $(BUILDDIR)/blockinl1-arm.s | grep -q 'bl '; then echo "blockinl-arm.s: Fresh calls"; exit 1; fi; \
+	test $$(awk '/^pas_main:/,/cfi_endproc/' $(BUILDDIR)/blockinl1-arm.s | grep -c 'bl p_f[.]0_3_get$$') -eq 1 || { echo "blockinl-arm.s: the main block does not call Get once"; exit 1; }; \
+	if awk '/^pas_main:/,/cfi_endproc/' $(BUILDDIR)/blockinl1-arm.s | grep -q 'bl p_f[.]0_6_mkpair$$'; then echo "blockinl-arm.s: the main block calls MkPair"; exit 1; fi; \
 	echo ok blockinl-arm-asm; \
 	: P369 on arm64; \
 	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/methinl1-arm testdata/methinl.paslang; \
-	if awk '/^pas_main:/,/cfi_endproc/' $(BUILDDIR)/methinl1-arm.s | grep -qE 'bl p_tbox_(bump|add|twice)$$'; then echo "methinl-arm.s: the main block calls Bump, Add or Twice"; exit 1; fi; \
+	if awk '/^pas_main:/,/cfi_endproc/' $(BUILDDIR)/methinl1-arm.s | grep -qE 'bl p_m[.]12_t_u[.]0_4_tbox(4_bump|3_add|5_twice)$$'; then echo "methinl-arm.s: the main block calls Bump, Add or Twice"; exit 1; fi; \
 	test $$(awk '/^pas_main:/,/cfi_endproc/' $(BUILDDIR)/methinl1-arm.s | grep -c 'blr ') -eq 4 || { echo "methinl-arm.s: the main block does not make its four virtual calls"; exit 1; }; \
 	echo ok methinl-arm-asm; \
 	: P371 on arm64; \
 	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/aheadres1-arm testdata/aheadres.paslang; \
-	if awk '/^pas_main:/,/cfi_endproc/' $(BUILDDIR)/aheadres1-arm.s | grep -q 'bl p_tri$$'; then echo "aheadres-arm.s: the main block calls Tri"; exit 1; fi; \
-	if awk '/^p_sumtri:/,/cfi_endproc/' $(BUILDDIR)/aheadres1-arm.s | grep -q 'bl p_'; then echo "aheadres-arm.s: SumTri calls"; exit 1; fi; \
-	awk '/^p_nested:/,/cfi_endproc/' $(BUILDDIR)/aheadres1-arm.s | grep -q 'bl p_tri$$' || { echo "aheadres-arm.s: Nested put Tri ahead"; exit 1; }; \
-	awk '/^pas_main:/,/cfi_endproc/' $(BUILDDIR)/aheadres1-arm.s | grep -q 'bl p_bump$$' || { echo "aheadres-arm.s: g + Bump put Bump ahead"; exit 1; }; \
+	if awk '/^pas_main:/,/cfi_endproc/' $(BUILDDIR)/aheadres1-arm.s | grep -q 'bl p_f[.]0_3_tri$$'; then echo "aheadres-arm.s: the main block calls Tri"; exit 1; fi; \
+	if awk '/^p_f[.]0_6_sumtri:/,/cfi_endproc/' $(BUILDDIR)/aheadres1-arm.s | grep -q 'bl p_'; then echo "aheadres-arm.s: SumTri calls"; exit 1; fi; \
+	awk '/^p_f[.]0_6_nested:/,/cfi_endproc/' $(BUILDDIR)/aheadres1-arm.s | grep -q 'bl p_f[.]0_3_tri$$' || { echo "aheadres-arm.s: Nested put Tri ahead"; exit 1; }; \
+	awk '/^pas_main:/,/cfi_endproc/' $(BUILDDIR)/aheadres1-arm.s | grep -q 'bl p_f[.]0_4_bump$$' || { echo "aheadres-arm.s: g + Bump put Bump ahead"; exit 1; }; \
 	echo ok aheadres-arm-asm; \
 	: P373 on arm64; \
 	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/elemaddr1-arm testdata/elemaddr.paslang; \
-	awk '/^p_runlocal:/,/cfi_endproc/' $(BUILDDIR)/elemaddr1-arm.s | grep -qE '^  (madd|add) x10, ' || { echo "elemaddr-arm.s: RunLocal works out no element in x10"; exit 1; }; \
+	awk '/^p_f[.]0_8_runlocal:/,/cfi_endproc/' $(BUILDDIR)/elemaddr1-arm.s | grep -qE '^  (madd|add) x10, ' || { echo "elemaddr-arm.s: RunLocal works out no element in x10"; exit 1; }; \
 	echo ok elemaddr-arm-asm; \
 	: P377 on arm64; \
 	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/boundsidiom1-arm testdata/boundsidiom.paslang; \
 	for f in ina outa inr inp zero; do \
-	  test $$(awk "/^p_$$f:/,/cfi_endproc/" $(BUILDDIR)/boundsidiom1-arm.s | grep -cE '^  b\.(lo|hs) ') -eq 1 || { echo "boundsidiom-arm.s: $$f is not one branch without sign"; exit 1; }; \
+	  test $$(awk "/^p_f[.]0_$${#f}_$$f:/,/cfi_endproc/" $(BUILDDIR)/boundsidiom1-arm.s | grep -cE '^  b\.(lo|hs) ') -eq 1 || { echo "boundsidiom-arm.s: $$f is not one branch without sign"; exit 1; }; \
 	done; \
 	echo ok boundsidiom-arm-asm; \
 	: a global field or element at a constant offset is one adrp and one access with the offset in its lo12, a field of a record in an element of an array as well, P374; \
@@ -6120,19 +6124,19 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	python3 -I scripts/check_resbuf.py --all $(BUILDDIR) $(BUILDDIR)/$(LVL_X64) $(A64DIR) '$(A64DIR)/$(LVL_A64)'; \
 	echo ok resbuf-all; \
 	: P294 on arm64: c + k * x a move and one add with the shift, y + k * x and x := x + k * y one add, and loads at p - k, p + k and p + i shl s in the load, within the offsets of LDUR and LDR; \
-	awk '/^p_off8:/,/cfi_endproc/' $(BUILDDIR)/leaform-arm.s > $(BUILDDIR)/leaform-off8-arm.s; \
+	awk '/^p_f[.]0_4_off8:/,/cfi_endproc/' $(BUILDDIR)/leaform-arm.s > $(BUILDDIR)/leaform-off8-arm.s; \
 	grep -qE 'add x[0-9]+, x17, x[0-9]+, lsl #3' $(BUILDDIR)/leaform-off8-arm.s || { echo "leaform-arm.s: Off8 is not a move and one add"; exit 1; }; \
 	if grep -q 'mul ' $(BUILDDIR)/leaform-off8-arm.s; then echo "leaform-arm.s: Off8 multiplies"; exit 1; fi; \
-	awk '/^p_base:/,/cfi_endproc/' $(BUILDDIR)/leaform-arm.s | grep -qE 'add x[0-9]+, x[0-9]+, x[0-9]+, lsl #2' || { echo "leaform-arm.s: Base is not one add"; exit 1; }; \
-	test $$(awk '/^p_loop:/,/cfi_endproc/' $(BUILDDIR)/leaform-arm.s | grep -cE 'add x(19|2[0-6]), x(19|2[0-6]), x(19|2[0-6]), lsl #[123]') -eq 4 || { echo "leaform-arm.s: the loop of Loop has not four adds with a shift"; exit 1; }; \
-	if awk '/^p_loop:/,/cfi_endproc/' $(BUILDDIR)/leaform-arm.s | grep -q 'mul '; then echo "leaform-arm.s: Loop multiplies"; exit 1; fi; \
-	awk '/^p_back:/,/cfi_endproc/' $(BUILDDIR)/leaform-arm.s > $(BUILDDIR)/leaform-back-arm.s; \
+	awk '/^p_f[.]0_4_base:/,/cfi_endproc/' $(BUILDDIR)/leaform-arm.s | grep -qE 'add x[0-9]+, x[0-9]+, x[0-9]+, lsl #2' || { echo "leaform-arm.s: Base is not one add"; exit 1; }; \
+	test $$(awk '/^p_f[.]0_4_loop:/,/cfi_endproc/' $(BUILDDIR)/leaform-arm.s | grep -cE 'add x(19|2[0-6]), x(19|2[0-6]), x(19|2[0-6]), lsl #[123]') -eq 4 || { echo "leaform-arm.s: the loop of Loop has not four adds with a shift"; exit 1; }; \
+	if awk '/^p_f[.]0_4_loop:/,/cfi_endproc/' $(BUILDDIR)/leaform-arm.s | grep -q 'mul '; then echo "leaform-arm.s: Loop multiplies"; exit 1; fi; \
+	awk '/^p_f[.]0_4_back:/,/cfi_endproc/' $(BUILDDIR)/leaform-arm.s > $(BUILDDIR)/leaform-back-arm.s; \
 	test $$(grep -cE 'ldr x[0-9]+, \[x[0-9]+, #-(8|16)\]' $(BUILDDIR)/leaform-back-arm.s) -eq 2 || { echo "leaform-arm.s: Back does not load at p - 8 and p - 16"; exit 1; }; \
 	if grep -qE 'sub x[0-9]+, x[0-9]+, #(8|16)$$' $(BUILDDIR)/leaform-back-arm.s; then echo "leaform-arm.s: Back subtracts before it loads"; exit 1; fi; \
-	awk '/^p_far:/,/cfi_endproc/' $(BUILDDIR)/leaform-arm.s > $(BUILDDIR)/leaform-far-arm.s; \
+	awk '/^p_f[.]0_3_far:/,/cfi_endproc/' $(BUILDDIR)/leaform-arm.s > $(BUILDDIR)/leaform-far-arm.s; \
 	grep -qE '\[x[0-9]+, #-256\]' $(BUILDDIR)/leaform-far-arm.s || { echo "leaform-arm.s: Far does not load at p - 256"; exit 1; }; \
 	grep -qE 'sub x[0-9]+, x[0-9]+, #264$$' $(BUILDDIR)/leaform-far-arm.s || { echo "leaform-arm.s: Far folds p - 264, past LDUR"; exit 1; }; \
-	awk '/^p_idx:/,/cfi_endproc/' $(BUILDDIR)/leaform-arm.s | grep -qE 'ldr x[0-9]+, \[x[0-9]+, x[0-9]+, lsl #3\]' || { echo "leaform-arm.s: Idx does not index the load"; exit 1; }; \
+	awk '/^p_f[.]0_3_idx:/,/cfi_endproc/' $(BUILDDIR)/leaform-arm.s | grep -qE 'ldr x[0-9]+, \[x[0-9]+, x[0-9]+, lsl #3\]' || { echo "leaform-arm.s: Idx does not index the load"; exit 1; }; \
 	echo ok leaform-arm-asm; \
 	python3 -I scripts/check_cold.py $(BUILDDIR)/coldfail-arm.s 40 boundsfail,divzero,sqrtneg,realrange,bitfail,setfail,funnelfail,asfail,strappendc,strunique,fillbig; \
 	echo ok coldfail-arm-asm; \
@@ -6143,7 +6147,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 timeout 300 $(QEMU_A64) $(BUILDDIR)/ptrwalk-arm > $(BUILDDIR)/ptrwalk-arm-gc.got; \
 	diff -u testdata/ptrwalk.out $(BUILDDIR)/ptrwalk-arm-gc.got; \
 	for f in widths last zeros spell; do \
-	  awk "/^p_$$f:/,/cfi_endproc/" $(BUILDDIR)/ptrwalk-arm.s > $(BUILDDIR)/ptrwalk-$$f-arm.s; \
+	  awk "/^p_f[.]0_$${#f}_$$f:/,/cfi_endproc/" $(BUILDDIR)/ptrwalk-arm.s > $(BUILDDIR)/ptrwalk-$$f-arm.s; \
 	  grep -qE '^  cbnz x[0-9]+, ' $(BUILDDIR)/ptrwalk-$$f-arm.s || { echo "ptrwalk-arm.s: $$f does not test its pointer with cbnz"; exit 1; }; \
 	  if grep -qE '^  mov x(9|1[0-5]), x(19|2[0-6])$$' $(BUILDDIR)/ptrwalk-$$f-arm.s; then echo "ptrwalk-arm.s: $$f copies a register variable into the pool"; exit 1; fi; \
 	  if grep -q 'mov x17, #0$$' $(BUILDDIR)/ptrwalk-$$f-arm.s; then echo "ptrwalk-arm.s: $$f compares with a register of zero"; exit 1; fi; \
@@ -6154,30 +6158,30 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 timeout 300 $(QEMU_A64) $(BUILDDIR)/movefill-arm > $(BUILDDIR)/movefill-arm-gc.got; \
 	diff -u testdata/movefill.out $(BUILDDIR)/movefill-arm-gc.got; \
 	for f in c1 c3 c8 c16 c17 c100 c128 whole; do \
-	  if awk "/^p_$$f:/,/cfi_endproc/" $(BUILDDIR)/movefill-arm.s | grep -qE 'bl rt_memcpy|bl rt_fill$$'; then echo "movefill-arm.s: $$f calls rt_memcpy or rt_fill"; exit 1; fi; \
+	  if awk "/^p_f[.]0_$${#f}_$$f:/,/cfi_endproc/" $(BUILDDIR)/movefill-arm.s | grep -qE 'bl rt_memcpy|bl rt_fill$$'; then echo "movefill-arm.s: $$f calls rt_memcpy or rt_fill"; exit 1; fi; \
 	done; \
-	awk '/^p_c129:/,/cfi_endproc/' $(BUILDDIR)/movefill-arm.s | grep -q 'bl rt_memcpy' || { echo "movefill-arm.s: c129 does not call rt_memcpy"; exit 1; }; \
+	awk '/^p_f[.]0_4_c129:/,/cfi_endproc/' $(BUILDDIR)/movefill-arm.s | grep -q 'bl rt_memcpy' || { echo "movefill-arm.s: c129 does not call rt_memcpy"; exit 1; }; \
 	: two 16-byte words side by side are one LDP or STP of Q registers, P372; \
-	awk '/^p_c128:/,/cfi_endproc/' $(BUILDDIR)/movefill-arm.s | grep -q 'ldp q' || { echo "movefill-arm.s: c128 loads no pair of Q registers"; exit 1; }; \
-	awk '/^p_c128:/,/cfi_endproc/' $(BUILDDIR)/movefill-arm.s | grep -q 'stp q' || { echo "movefill-arm.s: c128 stores no pair of Q registers"; exit 1; }; \
+	awk '/^p_f[.]0_4_c128:/,/cfi_endproc/' $(BUILDDIR)/movefill-arm.s | grep -q 'ldp q' || { echo "movefill-arm.s: c128 loads no pair of Q registers"; exit 1; }; \
+	awk '/^p_f[.]0_4_c128:/,/cfi_endproc/' $(BUILDDIR)/movefill-arm.s | grep -q 'stp q' || { echo "movefill-arm.s: c128 stores no pair of Q registers"; exit 1; }; \
 	echo ok movefill-arm-asm; \
 	python3 -I scripts/check_immediates.py $(BUILDDIR)/immconst-arm.s adds,logic,steps,cmps,chars,kind,arrays; \
 	echo ok immconst-arm-asm; \
 	: P295 on arm64: Ten multiplies nothing, SixFortyOne multiplies only where the multiply is fast and not tuned for Neoverse N1, whose takes 4 cycles; \
-	if awk '/^p_ten:/,/cfi_endproc/' $(BUILDDIR)/mulconst-arm.s | grep -q '^  mul '; then echo "mulconst-arm.s: Ten multiplies"; exit 1; fi; \
+	if awk '/^p_f[.]0_3_ten:/,/cfi_endproc/' $(BUILDDIR)/mulconst-arm.s | grep -q '^  mul '; then echo "mulconst-arm.s: Ten multiplies"; exit 1; fi; \
 	$(OUTDIR)/paslangc -target arm64 -cpu max -tune neoverse-n1 -Fu $(A64DIR) -o $(BUILDDIR)/mulconst-n1-arm testdata/mulconst.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/mulconst-n1-arm > $(BUILDDIR)/mulconst-n1-arm.got; \
 	diff -u testdata/mulconst.out $(BUILDDIR)/mulconst-n1-arm.got; \
-	if awk '/^p_sixfortyone:/,/cfi_endproc/' $(BUILDDIR)/mulconst-n1-arm.s | grep -q '^  mul '; then echo "mulconst-n1-arm.s: SixFortyOne multiplies on Neoverse N1"; exit 1; fi; \
-	awk '/^p_large:/,/cfi_endproc/' $(BUILDDIR)/mulconst-n1-arm.s | grep -q '^  mul ' || { echo "mulconst-n1-arm.s: Large does not multiply"; exit 1; }; \
+	if awk '/^p_f[.]0_11_sixfortyone:/,/cfi_endproc/' $(BUILDDIR)/mulconst-n1-arm.s | grep -q '^  mul '; then echo "mulconst-n1-arm.s: SixFortyOne multiplies on Neoverse N1"; exit 1; fi; \
+	awk '/^p_f[.]0_5_large:/,/cfi_endproc/' $(BUILDDIR)/mulconst-n1-arm.s | grep -q '^  mul ' || { echo "mulconst-n1-arm.s: Large does not multiply"; exit 1; }; \
 	echo ok mulconst-arm-asm; \
 	: an arm64 prologue and stack check take the frame size as SUB immediates with no load of a word after the body, P308: one SUB for Small, two for Big, the literal past 16 MiB for Huge, no mark left; \
 	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 timeout 300 $(QEMU_A64) $(BUILDDIR)/framesize-arm > $(BUILDDIR)/framesize-arm-gc.got; \
 	diff -u testdata/framesize.out $(BUILDDIR)/framesize-arm-gc.got; \
 	if grep -qE 'ldr x(9|16), \.Lf|/\* (frame|check) ' $(BUILDDIR)/framesize-arm.s; then echo "framesize-arm.s: a frame size loaded from a word, or a mark left"; exit 1; fi; \
-	awk '/^p_small:/,/cfi_endproc/' $(BUILDDIR)/framesize-arm.s | grep -qE '^  sub sp, sp, #[0-9]+$$' || { echo "framesize-arm.s: Small's frame is not one SUB"; exit 1; }; \
-	awk '/^p_big:/,/cfi_endproc/' $(BUILDDIR)/framesize-arm.s | grep -qE '^  sub sp, sp, #[0-9]+, lsl #12$$' || { echo "framesize-arm.s: Big's frame is not two SUBs"; exit 1; }; \
-	awk '/^p_huge:/,/cfi_endproc/' $(BUILDDIR)/framesize-arm.s | grep -q '^  sub sp, sp, x16$$' || { echo "framesize-arm.s: Huge's frame past 16 MiB is not through x16"; exit 1; }; \
+	awk '/^p_f[.]0_5_small:/,/cfi_endproc/' $(BUILDDIR)/framesize-arm.s | grep -qE '^  sub sp, sp, #[0-9]+$$' || { echo "framesize-arm.s: Small's frame is not one SUB"; exit 1; }; \
+	awk '/^p_f[.]0_3_big:/,/cfi_endproc/' $(BUILDDIR)/framesize-arm.s | grep -qE '^  sub sp, sp, #[0-9]+, lsl #12$$' || { echo "framesize-arm.s: Big's frame is not two SUBs"; exit 1; }; \
+	awk '/^p_f[.]0_4_huge:/,/cfi_endproc/' $(BUILDDIR)/framesize-arm.s | grep -q '^  sub sp, sp, x16$$' || { echo "framesize-arm.s: Huge's frame past 16 MiB is not through x16"; exit 1; }; \
 	echo ok framesize-arm-asm; \
 	: P307 on arm64: selectif under the stress of the collector and without inlining, every if it marks select a CSEL, CSINC or CINC and no branch, every one it marks branch a branch; \
 	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 timeout 300 $(QEMU_A64) $(BUILDDIR)/selectif-arm > $(BUILDDIR)/selectif-arm-gc.got; \
@@ -6379,15 +6383,15 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	$(OUTDIR)/paslangc -target arm64 -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/exprinline0-arm testdata/exprinline.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/exprinline0-arm > $(BUILDDIR)/exprinline0-arm.got; \
 	diff -u testdata/exprinline.out $(BUILDDIR)/exprinline0-arm.got; \
-	awk '/^p_branchy:/,/ret$$/' $(BUILDDIR)/exprinline-arm.s > $(BUILDDIR)/exprinline-branchy-arm.s; \
+	awk '/^p_f[.]0_7_branchy:/,/ret$$/' $(BUILDDIR)/exprinline-arm.s > $(BUILDDIR)/exprinline-branchy-arm.s; \
 	grep -qE '^  csel x[0-9]+, x[0-9]+, x[0-9]+, lt$$' $(BUILDDIR)/exprinline-branchy-arm.s || { echo "exprinline-arm.s: Branchy is not a select on Less's compare"; exit 1; }; \
-	if grep -q 'bl p_less\|cset' $(BUILDDIR)/exprinline-branchy-arm.s; then echo "exprinline-arm.s: Branchy calls Less or makes a Boolean"; exit 1; fi; \
+	if grep -q 'bl p_f[.]0_4_less\|cset' $(BUILDDIR)/exprinline-branchy-arm.s; then echo "exprinline-arm.s: Branchy calls Less or makes a Boolean"; exit 1; fi; \
 	: the processor in the code on arm64, P261: the routines after the CPU neoverse-n1 directive say it, LSE is on for them, and the unit runs; \
 	$(OUTDIR)/paslangc -target arm64 -cpu base -Fu $(A64DIR) -o $(BUILDDIR)/cputune-ab testdata/cputune.paslang; \
 	grep -q '^.arch_extension lse$$' $(BUILDDIR)/cputune-ab.s || { echo "cputune-ab.s: no LSE for the neoverse-n1 routines"; exit 1; }; \
-	grep -F '/* p_lzfast: cpu ' $(BUILDDIR)/cputune-ab.s | grep -q 'atomics.*; tune neoverse-n1 \*/' || { echo "cputune-ab.s: LzFast does not say its processor"; exit 1; }; \
+	grep -F '/* p_f.0_6_lzfast: cpu ' $(BUILDDIR)/cputune-ab.s | grep -q 'atomics.*; tune neoverse-n1 \*/' || { echo "cputune-ab.s: LzFast does not say its processor"; exit 1; }; \
 	grep -qF '; tune neoverse-v1 */' $(BUILDDIR)/cputune-ab.s || { echo "cputune-ab.s: Tuned does not say its tune"; exit 1; }; \
-	awk '/^pas_main:/,/^\.section/' $(BUILDDIR)/cputune-ab.s | grep -q 'bl p_one$$' || { echo "cputune-ab.s: One, of another processor, went into the main block"; exit 1; }; \
+	awk '/^pas_main:/,/^\.section/' $(BUILDDIR)/cputune-ab.s | grep -q 'bl p_f[.]0_3_one$$' || { echo "cputune-ab.s: One, of another processor, went into the main block"; exit 1; }; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/cputune-ab > $(BUILDDIR)/cputune-ab.got; \
 	diff -u testdata/cputune.out $(BUILDDIR)/cputune-ab.got; \
 	$(OUTDIR)/paslangc -target arm64 -cpu base testdata/units/cpuu.paslang; \
@@ -6402,13 +6406,13 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	  timeout 120 $(QEMU_A64) $(BUILDDIR)/$$t-arm-base > $(BUILDDIR)/$$t-arm.bgot; \
 	  diff -u testdata/$$t.out $(BUILDDIR)/$$t-arm.bgot; \
 	done; \
-	grep -q 'p_pashash_passha256cpu' $(BUILDDIR)/hash1-arm.s; \
-	grep -q 'p_pashash_passha512cpu' $(BUILDDIR)/hash1-arm.s; \
-	grep -q 'p_pashash_passha256updatecpu' $(BUILDDIR)/hashpieces-arm.s; \
-	if grep -q 'p_pashash_passha256updatecpu' $(BUILDDIR)/hashpieces-arm-base.s; then echo "hashpieces-arm-base.s calls the SHA-256 body"; exit 1; fi; \
-	grep -q 'p_pashash_pashmacupdatecpu' $(BUILDDIR)/hashpieces2-arm.s; \
-	if grep -q 'p_pashash_pashmacupdatecpu' $(BUILDDIR)/hashpieces2-arm-base.s; then echo "hashpieces2-arm-base.s calls the SHA-256 body"; exit 1; fi; \
-	if grep -q 'p_pashash_passha256cpu' $(BUILDDIR)/hash1-arm-base.s; then echo "hash1-arm-base.s calls the SHA-256 body"; exit 1; fi; \
+	grep -q 'p_f[.]7_pashash12_passha256cpu' $(BUILDDIR)/hash1-arm.s; \
+	grep -q 'p_f[.]7_pashash12_passha512cpu' $(BUILDDIR)/hash1-arm.s; \
+	grep -q 'p_f[.]7_pashash18_passha256updatecpu' $(BUILDDIR)/hashpieces-arm.s; \
+	if grep -q 'p_f[.]7_pashash18_passha256updatecpu' $(BUILDDIR)/hashpieces-arm-base.s; then echo "hashpieces-arm-base.s calls the SHA-256 body"; exit 1; fi; \
+	grep -q 'p_f[.]7_pashash16_pashmacupdatecpu' $(BUILDDIR)/hashpieces2-arm.s; \
+	if grep -q 'p_f[.]7_pashash16_pashmacupdatecpu' $(BUILDDIR)/hashpieces2-arm-base.s; then echo "hashpieces2-arm-base.s calls the SHA-256 body"; exit 1; fi; \
+	if grep -q 'p_f[.]7_pashash12_passha256cpu' $(BUILDDIR)/hash1-arm-base.s; then echo "hash1-arm-base.s calls the SHA-256 body"; exit 1; fi; \
 	: pastls for the base arm64 on qemu against Go crypto/tls and openssl s_server on the host, ChaCha20 first, P431; \
 	$(OUTDIR)/paslangc -target arm64 -cpu base -Fu $(A64DIR) -o $(BUILDDIR)/tlsinterop-arm testdata/tlsinterop.paslang; \
 	$(OUTDIR)/paslangc -target arm64 -cpu base -Fu $(A64DIR) -o $(BUILDDIR)/tlsdoc-arm testdata/tlsdoc.paslang; \

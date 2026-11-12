@@ -20,8 +20,8 @@ compiler = Path(sys.argv[1]).resolve()
 build = Path(sys.argv[2]).resolve()
 root = Path(tempfile.mkdtemp(prefix='nist-ct-', dir=build))
 parser = build / 'stage'
-helpers = {'p_pasnist_orderreduce', 'p_pasnist_ordermontmul',
-           'p_pasnist_ordermul', 'p_pasnist_orderadd', 'p_pasnist_orderinverse'}
+helpers = {'p_f.7_pasnist11_orderreduce', 'p_f.7_pasnist12_ordermontmul',
+           'p_f.7_pasnist8_ordermul', 'p_f.7_pasnist8_orderadd', 'p_f.7_pasnist12_orderinverse'}
 
 
 class Unsafe(Exception):
@@ -84,7 +84,7 @@ def check(functions):
                 if expr(args[0]):
                     fail('secret curve-order parameter', node)
                 secret = any([expr(x) for x in args[2:]])
-                if symbol == 'p_pasnist_orderreduce':
+                if symbol == 'p_f.7_pasnist11_orderreduce':
                     secret = state.get(variable(args[1]), False) or secret
                 assign(args[1]['l'], secret)
                 return secret

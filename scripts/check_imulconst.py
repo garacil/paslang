@@ -26,7 +26,7 @@ def main():
     lines = open(args[0]).read().splitlines()
     compiled, bad, n3, mem = False, [], 0, 0
     for i, l in enumerate(lines):
-        m = re.match(r"^(p_[A-Za-z0-9_]+|rt_[A-Za-z0-9_]+|pas_main):$", l)
+        m = re.match(r"^(p_[A-Za-z0-9_.]+|rt_[A-Za-z0-9_]+|pas_main):$", l)
         if m:
             compiled = not m.group(1).startswith("rt_")
             continue

@@ -25,7 +25,7 @@ def main():
     lines = open(args[0]).read().splitlines()
     bad = re.compile(r'^\s+cset\s' if arm else r'^\s+set[a-z]+\s')
     found = 0
-    for name in ('p_deeploop', 'p_deepflat', 'p_deeploops'):
+    for name in ('p_f.0_8_deeploop', 'p_f.0_8_deepflat', 'p_f.0_9_deeploops'):
         try:
             k = lines.index(name + ':')
         except ValueError:

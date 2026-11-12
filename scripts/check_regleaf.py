@@ -33,7 +33,7 @@ def main():
     lines = open(path).read().split('\n')
     bad = []
     push = re.compile(r'^str x0, \[sp, #-16\]!|^stp x0, ') if arm else re.compile(r'^pushq ')
-    for r in ('p_tr_same', 'p_tr_moved'):
+    for r in ('p_m.10_t_u.0_2_tr4_same', 'p_m.10_t_u.0_2_tr5_moved'):
         b = body(lines, r)
         if not b:
             bad.append(r + ': not found')
@@ -46,16 +46,16 @@ def main():
                 bad.append(r + ': the two fields are not loads at an offset: ' + '; '.join(b))
         elif not any(re.match(r'^cmpq -?\d+\(%r\w+\), %rax$', i) for i in b):
             bad.append(r + ': no cmpq of a field where it lies: ' + '; '.join(b))
-    for r in ('p_tr_addr', 'p_tr_bit'):
+    for r in ('p_m.10_t_u.0_2_tr4_addr', 'p_m.10_t_u.0_2_tr3_bit'):
         b = body(lines, r)
         if not b:
             bad.append(r + ': not found')
             continue
         if any(push.search(i) for i in b):
             bad.append(r + ': a push: ' + '; '.join(b))
-    b = body(lines, 'p_tr_addr')
+    b = body(lines, 'p_m.10_t_u.0_2_tr4_addr')
     if b and not arm and not any(i.startswith('leaq (') for i in b):
-        bad.append('p_tr_addr: no lea of the pointer and the index: ' + '; '.join(b))
+        bad.append('p_m.10_t_u.0_2_tr4_addr: no lea of the pointer and the index: ' + '; '.join(b))
     if bad:
         for m in bad:
             print('check_regleaf:', m)

@@ -20,19 +20,25 @@ alike.
 
 import re
 import sys
+from pathlib import Path
+import runpy
+
+_symbols = runpy.run_path(str(Path(__file__).with_name('asm_symbols.py')))
+procedure_symbol = _symbols['procedure_symbol']
+
 
 
 def loop_of(lines, name):
     start = None
     for i, line in enumerate(lines):
-        if line == f"p_{name}:":
+        if line == procedure_symbol('', name) + ':':
             start = i
             break
     if start is None:
         raise SystemExit(f"no routine p_{name}")
     head = None
     for i in range(start + 1, len(lines)):
-        if lines[i] == "  ret" or re.match(r"^p_[A-Za-z0-9_]+:$", lines[i]):
+        if lines[i] == "  ret" or re.match(r"^p_[A-Za-z0-9_.]+:$", lines[i]):
             break
         if lines[i] == "  .p2align 5":
             head = i

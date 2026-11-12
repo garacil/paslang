@@ -9,7 +9,7 @@
 (movq $0 or movl $0 to the frame on amd64; stur, str or stp of xzr to
 the frame on arm64 with --arm), 0 where every field is written first.
 
-usage: check_fieldfirst.py file.s [--arm] --zeros=p_a:0,p_b:2
+usage: check_fieldfirst.py file.s [--arm] --zeros=p_f.0_1_a:0,p_f.0_1_b:2
 """
 
 import re

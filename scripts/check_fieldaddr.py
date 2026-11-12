@@ -13,6 +13,11 @@ immediate makes the address the next load or store takes with none
 
 import re
 import sys
+from pathlib import Path
+import runpy
+
+_symbols = runpy.run_path(str(Path(__file__).with_name('asm_symbols.py')))
+program_name = _symbols['program_name']
 
 
 def main():
@@ -25,18 +30,18 @@ def main():
     bad, seen = [], set()
     for n, line in enumerate(open(path), 1):
         line = line.rstrip("\n")
-        m = re.match(r"^(p_[A-Za-z0-9_]+|rt_[A-Za-z0-9_]+|pas_main):$", line)
+        m = re.match(r"^(p_[A-Za-z0-9_.]+|rt_[A-Za-z0-9_]+|pas_main):$", line)
         if m:
             fn = m.group(1)
-            if fn[2:] in names:
-                seen.add(fn[2:])
+            if program_name(fn) in names:
+                seen.add(program_name(fn))
             prev = ""
             continue
         if not line.startswith("  ") or line.startswith("  ."):
             if re.match(r"^\.L[0-9A-Za-z_]*:$", line) and not line.startswith(".LL"):
                 prev = ""
             continue
-        if fn.startswith("p_") and fn[2:] in names and prev:
+        if fn.startswith("p_") and program_name(fn) in names and prev:
             if arm:
                 p = re.match(r"^  add (x\d+), \1, #\d+$", prev)
                 if p and re.search(r"\[" + p.group(1) + r"\]", line) and re.match(r"^  (ldr|str|ldrb|strb|ldrh|strh|ldrsw|ldrsb|ldrsh) ", line):

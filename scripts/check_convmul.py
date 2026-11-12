@@ -26,9 +26,9 @@ def main():
     lines = open(args[0]).read().splitlines()
     fn, bad, seen = "", [], set()
     for n, line in enumerate(lines):
-        m = re.match(r"^(p_[A-Za-z0-9_]+|rt_[A-Za-z0-9_]+|pas_main):$", line)
+        m = re.match(r"^(p_[A-Za-z0-9_.]+|rt_[A-Za-z0-9_]+|pas_main):$", line)
         if m:
-            fn = m.group(1) if m.group(1).startswith("p_conv") else ""
+            fn = m.group(1) if re.match(r"^p_f[.]0_[0-9]+_conv", m.group(1)) else ""
             if fn:
                 seen.add(fn)
             continue

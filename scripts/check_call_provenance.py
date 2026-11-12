@@ -52,6 +52,11 @@ import re
 import subprocess
 import sys
 import tempfile
+import runpy
+
+_symbols = runpy.run_path(str(Path(__file__).with_name('asm_symbols.py')))
+procedure_symbol = _symbols['procedure_symbol']
+
 
 CORES = ('pasmap', 'pasfmt', 'pasheap', 'pasquad')
 MODES = ('value', 'expr', 'const', 'var')
@@ -460,7 +465,7 @@ def parser_controls(compiler, build, parser_units, work):
     for target, units in (('amd64', build), ('arm64', build / 'a64')):
         cases = [('pure', probe_source('  Result := v.N;'), 'v', '')]
         for prefix in ('ordinary', *CORES):
-            symbol = 'p_' + prefix + '_change'
+            symbol = procedure_symbol('', prefix + '_change')
             declarations = 'procedure ' + prefix + '_change;\nbegin end;\n'
             cases.append(('local-' + prefix,
                           probe_source('  ' + prefix + '_change;\n  Result := v.N;', declarations=declarations),

@@ -12,6 +12,11 @@ its ret, where P299 puts the checks' failures, is a check.
 
 import re
 import sys
+from pathlib import Path
+import runpy
+
+_symbols = runpy.run_path(str(Path(__file__).with_name('asm_symbols.py')))
+program_name = _symbols['program_name']
 
 
 def main():
@@ -24,10 +29,10 @@ def main():
         want[n] = int(c)
     lines = open(args[0]).read().splitlines()
     starts = [(i, m.group(1)) for i, l in enumerate(lines)
-              for m in [re.match(r"^(p_[A-Za-z0-9_]+|rt_[A-Za-z0-9_]+|pas_main):$", l)] if m]
+              for m in [re.match(r"^(p_[A-Za-z0-9_.]+|rt_[A-Za-z0-9_]+|pas_main):$", l)] if m]
     got = {}
     for j, (i, name) in enumerate(starts):
-        if not name.startswith("p_") or name[2:] not in want:
+        if not name.startswith("p_") or program_name(name) not in want:
             continue
         end = starts[j + 1][0] if j + 1 < len(starts) else len(lines)
         body = lines[i:end]
@@ -38,7 +43,7 @@ def main():
             m = re.match(r"^  (?:j\w+|b\.\w+|cbn?z \w+,|tbn?z \w+, #\d+,) (\.L\d+)$", l)
             if m and m.group(1) in cold:
                 n += 1
-        got[name[2:]] = n
+        got[program_name(name)] = n
     missing = set(want) - set(got)
     if missing:
         raise SystemExit(f"check_chkcse: no routine {', '.join(sorted(missing))} in {args[0]}")

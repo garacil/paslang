@@ -15,7 +15,7 @@ usage: check_bytesetin.py file.s [--arm]
 import re
 import sys
 
-ROUTINES = ('p_injson', 'p_inlow', 'p_inword', 'p_inmasked', 'p_insmall', 'p_innone', 'p_incount')
+ROUTINES = ('p_f.0_6_injson', 'p_f.0_5_inlow', 'p_f.0_6_inword', 'p_f.0_8_inmasked', 'p_f.0_7_insmall', 'p_f.0_6_innone', 'p_f.0_7_incount')
 
 
 def body(lines, name, path):
@@ -50,7 +50,7 @@ def main():
             raise SystemExit(f'{path}: {name}: {bad[0]}, where a set constant is one bit test')
         if not test:
             raise SystemExit(f'{path}: {name} tests no bit of a set word')
-    b = body(lines, 'p_incount', path)
+    b = body(lines, 'p_f.0_7_incount', path)
     if arm:
         if any(re.match(r'^\s+and x0, x2, #1$', l) for l in b) or \
                 len([l for l in b if re.match(r'^\s+b\.(eq|ne) ', l)]) < 2:

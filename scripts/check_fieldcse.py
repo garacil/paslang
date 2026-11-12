@@ -14,6 +14,11 @@ load or store takes as its base).
 
 import re
 import sys
+from pathlib import Path
+import runpy
+
+_symbols = runpy.run_path(str(Path(__file__).with_name('asm_symbols.py')))
+program_name = _symbols['program_name']
 
 
 def main():
@@ -26,11 +31,13 @@ def main():
         n, c = item.split(":")
         want[n] = int(c)
     lines = open(args[0]).read().splitlines()
-    fn, got, starts = "", {}, []
+    fn, got, seen = "", {}, set()
     for n, line in enumerate(lines):
-        m = re.match(r"^(p_[A-Za-z0-9_]+|rt_[A-Za-z0-9_]+|pas_main):$", line)
+        m = re.match(r"^(p_[A-Za-z0-9_.]+|rt_[A-Za-z0-9_]+|pas_main):$", line)
         if m:
-            fn = m.group(1)[2:] if m.group(1).startswith("p_") and m.group(1)[2:] in want else ""
+            fn = program_name(m.group(1)) if m.group(1).startswith("p_") and program_name(m.group(1)) in want else ""
+            if fn:
+                seen.add(fn)
             continue
         if not fn:
             continue
@@ -50,6 +57,9 @@ def main():
                     if re.search(r"\(%\w*,%" + reg[1:] + r",\d\)|\(,%" + reg[1:] + r",\d\)", nxt):
                         got[fn] = got.get(fn, 0) + 1
                         break
+    missing = set(want) - seen
+    if missing:
+        raise SystemExit("check_fieldcse: no routine " + ", ".join(sorted(missing)))
     bad = [f"{f}: {got.get(f, 0)} where {c} at most" for f, c in want.items() if got.get(f, 0) > c]
     if bad:
         raise SystemExit("check_fieldcse: " + "; ".join(bad) + f" in {args[0]}")

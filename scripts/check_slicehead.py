@@ -38,14 +38,14 @@ def main():
         raise SystemExit(__doc__.strip().splitlines()[-1])
     lines = open(args[0]).read().splitlines()
     if arm:
-        for name in ('p_addrfield', 'p_addrvar', 'p_headglobal'):
+        for name in ('p_f.0_9_addrfield', 'p_f.0_7_addrvar', 'p_f.0_10_headglobal'):
             b = body(lines, name, args[0])
             if any(re.search(r'\bx3\b', l) for l in b):
                 raise SystemExit(f'{args[0]}: {name} names x3, a slice capacity loaded')
             if not any(re.match(r'^\s+ldp x0, x2, \[', l) for l in b):
                 raise SystemExit(f'{args[0]}: {name} has no ldp x0, x2 of a slice pointer and length')
     else:
-        for name in ('p_addrfield', 'p_addrvar'):
+        for name in ('p_f.0_9_addrfield', 'p_f.0_7_addrvar'):
             b = body(lines, name, args[0])
             bad = [l.strip() for l in b if '%r8' in l]
             if bad:

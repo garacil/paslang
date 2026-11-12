@@ -50,7 +50,7 @@ def main():
         raise SystemExit("usage: check_twostore.py file.s [--arm]")
     lines = open(args[0]).read().splitlines()
     bad = []
-    for name, want in (("p_fillfns", 2), ("p_fillrecs", 7)):
+    for name, want in (("p_f.0_7_fillfns", 2), ("p_f.0_8_fillrecs", 7)):
         b = body(lines, name)
         if arm:
             kept = sum(1 for l in b if re.match(r"^  stp x8, x27, \[(x\d+|sp)(, #-?\d+)?\]$", l))

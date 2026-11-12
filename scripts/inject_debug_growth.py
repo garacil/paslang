@@ -37,7 +37,7 @@ lines = Path('src/lib/pasdebug.paslang').read_text().splitlines()
 first = next(i for i, text in enumerate(lines) if text.startswith('procedure PasDebugLine(')
              and i > 100)
 unlock = next(i + 1 for i in range(first, len(lines)) if lines[i].strip() == 'Guard.Unlock;')
-entry = gdb.Breakpoint('p_pasdebug_pasdebugline', internal=True)
+entry = gdb.Breakpoint('p_f.8_pasdebug12_pasdebugline', internal=True)
 entry.condition = f'{"$x0" if arm else "$rdi"} == {value("$debug_line")}'
 gdb.execute('continue' if arm else 'run --debug-mode < ' + gdb.convenience_variable('debug_input').string())
 if entry.hit_count != 1:
@@ -56,7 +56,7 @@ preempt = gdb.convenience_variable('debug_preempt')
 if preempt is not None and int(preempt):
     gdb.selected_inferior().write_memory(victim + 16, struct.pack('<Q', PREEMPT))
 saved.delete()
-inspection = gdb.Breakpoint('p_pasdebug_frames', internal=True)
+inspection = gdb.Breakpoint('p_f.8_pasdebug6_frames', internal=True)
 gdb.execute('continue')
 if inspection.hit_count != 1:
     raise gdb.GdbError('debugger did not inspect a stopped frame')

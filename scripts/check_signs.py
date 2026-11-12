@@ -15,10 +15,16 @@ assembly of the unit pasmath, whose first routine is PasSin."""
 
 import re
 import sys
+from pathlib import Path
+import runpy
+
+_symbols = runpy.run_path(str(Path(__file__).with_name('asm_symbols.py')))
+procedure_symbol = _symbols['procedure_symbol']
 
 
-def routine(text, name):
-    m = re.search(r'^p_%s:\n(.*?)^\s+\.cfi_endproc' % re.escape(name), text, re.M | re.S)
+
+def routine(text, name, unit=''):
+    m = re.search(r'^%s:\n(.*?)^\s+\.cfi_endproc' % re.escape(procedure_symbol(unit, name)), text, re.M | re.S)
     if not m:
         sys.exit('check_signs: no routine p_%s' % name)
     return m.group(1)
@@ -59,8 +65,8 @@ for r in ('hr', 'hl', 'hs', 'hx', 'cm'):
     need('pushq' not in b and 'popq' not in b, '%s pushes: its expression left the registers' % r)
     need('movq %xmm0, %rax' not in b and 'movq %rax, %xmm0' not in b, '%s crosses to rax inside its expression' % r)
 need('xmm' not in last_before_ret(routine(amd, 'sg')), 'sg ends with a move out of an xmm register: %s' % last_before_ret(routine(amd, 'sg')))
-need('xmm' not in last_before_ret(routine(pm, 'pasmath_passin')),
-     'PasSin ends with a move out of an xmm register: %s' % last_before_ret(routine(pm, 'pasmath_passin')))
+need('xmm' not in last_before_ret(routine(pm, 'passin', 'pasmath')),
+     'PasSin ends with a move out of an xmm register: %s' % last_before_ret(routine(pm, 'passin', 'pasmath')))
 need(re.search(r'fabs d\d+, d\d+', routine(arm, 'ab')) is not None, 'Abs is not fabs on arm64')
 need(re.search(r'fneg d\d+, d\d+', routine(arm, 'ng')) is not None, 'the negation is not fneg on arm64')
 print('check_signs: ok')

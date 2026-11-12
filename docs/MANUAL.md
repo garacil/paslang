@@ -189,6 +189,26 @@ a unit's `.pi` in each `-Fu` directory in the order given, then in
 only), in `build`, in
 `.`, and beside the source file, and reads the first one it finds.
 
+Separate declarations retain their scopes: a program's `a_b`, unit `a`'s
+`b`, and a nested `a.b` are independent routines. The same applies to
+unit, type, helper and method names with underscores. Case remains
+insignificant within a Pascal scope, so `Same` and `sAME` cannot declare
+two routines with the same parameters there.
+
+The compiled interface format is `PASLANGI35`. Its symbol identities keep
+length-framed scope components and separate namespaces for ordinary,
+member, nested, anonymous and operator routines. These names are resolved
+when compiling and linking; programs need no name registry or decoder.
+Aliases and generic instances retain their existing declaration identity.
+Direct assembler references to generated symbols must use the scoped names:
+for example, a program routine `Bait` is `p_f.0_4_bait`. Literal labels written
+inside an `asm` block keep exactly the spelling in that block.
+Rebuild every application and library `.pi` and `.o` from older formats,
+including the matching CPU variants. The loader rejects older interfaces
+and names the unit to compile again; dependency checksums also reject a
+unit built against another interface. Rebuilding an unchanged interface
+with different implementation code keeps its interface checksum stable.
+
 Units may use units that use others, to any depth, and a program may
 name them in any order: a record of a unit, `TSysError` of `SysUtils`
 or one of your own with methods, is one type however many units' `.pi`
@@ -15473,7 +15493,7 @@ method, a property or an enumeration member of one of these names is a
 compile error that names it, at the name: `Length is a reserved word,
 not a name at 5:3`. A unit's `.pi` is not checked for these names when
 it loads. The compiler loads only a `.pi` of the format it writes,
-`PASLANGI34`, and refuses an older one with the minimum compiler needed to
+`PASLANGI35`, and refuses an older one with the minimum compiler needed to
 rebuild it. A type is once in a compilation and in the `.pi` it writes,
 however many units' `.pi` bring it in: a type another unit made says that
 unit and its number there (1.1.274; a unit's `.pi` held a copy of every

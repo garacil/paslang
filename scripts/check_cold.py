@@ -28,7 +28,7 @@ def main():
     count = 0
     for line in open(path):
         line = line.rstrip("\n")
-        if re.match(r"^(p_[A-Za-z0-9_]+|pas_main):$", line):
+        if re.match(r"^(p_[A-Za-z0-9_.]+|pas_main):$", line):
             fn, after = line[:-1], False
         elif re.match(r"^rt_[A-Za-z0-9_]+:$", line) or line.startswith(".section"):
             fn = ""

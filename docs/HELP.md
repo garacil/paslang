@@ -71,6 +71,13 @@ The [core and library chapter](MANUAL.md#16-the-core-library-and-pasnet)
 covers additional libraries, and the [SQLite guide](SQLITE_GUIDE.md)
 walks through the database API.
 
+Compiled interfaces currently use `PASLANGI35`, as `--help lang` reports.
+Rebuild older `.pi` and `.o` files together, including library CPU variants.
+The loader rejects an older format or a changed dependency checksum and
+names the unit to compile again. Scope components keep underscored unit,
+routine, class and helper names distinct; Pascal lookup remains insensitive
+to letter case. See [units](MANUAL.md#2-programs-and-units).
+
 ---
 
 Copyright (C) 2026 Germán Luis Aracil Boned.

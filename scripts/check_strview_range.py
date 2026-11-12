@@ -98,9 +98,9 @@ def main():
         for target, units, launch in [('amd64', build, []),
                                       ('arm64', build / 'a64', [qemu])]:
             assembly = (units / 'passtr.s').read_text()
-            if not re.search(r'^p_passtr_passtrview:', assembly, re.M):
+            if not re.search(r'^p_f\.6_passtr10_passtrview:', assembly, re.M):
                 raise SystemExit(target + ': production PasStrView is absent from its assembly')
-            if re.search(r'^\s*(?:call|bl)\s+p_passtr_strviewpastend\b', assembly, re.M):
+            if re.search(r'^\s*(?:call|bl)\s+p_f\.6_passtr14_strviewpastend\b', assembly, re.M):
                 raise SystemExit(target + ': the optimized production guard calls its inline predicate')
             for inline in ('0', '40'):
                 for label, code in [('guard', helper), ('old-endpoint', mutant)]:

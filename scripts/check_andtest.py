@@ -15,6 +15,11 @@ branches.
 
 import re
 import sys
+from pathlib import Path
+import runpy
+
+_symbols = runpy.run_path(str(Path(__file__).with_name('asm_symbols.py')))
+program_name = _symbols['program_name']
 
 
 def main():
@@ -34,11 +39,11 @@ def main():
     lines = open(args[0]).read().splitlines()
     fn, got, compiled, nt = "", {}, False, 0
     for i, l in enumerate(lines):
-        m = re.match(r"^(p_[A-Za-z0-9_]+|rt_[A-Za-z0-9_]+|pas_main):$", l)
+        m = re.match(r"^(p_[A-Za-z0-9_.]+|rt_[A-Za-z0-9_]+|pas_main):$", l)
         if m:
             name = m.group(1)
             compiled = not name.startswith("rt_")
-            fn = name[2:] if re.match(r"^p_(reg|home|narrow)", name) else ""
+            fn = program_name(name) if re.match(r"^(reg|home|narrow)", program_name(name)) else ""
             if fn:
                 got.setdefault(fn, 0)
             continue

@@ -16,8 +16,8 @@ usage: check_bitnz.py file.s [--arm]
 import re
 import sys
 
-NZ = ('p_nztz64', 'p_nzlz64', 'p_nztz32', 'p_nzlz16', 'p_nztz8', 'p_nzbits')
-KEEP = ('p_keepwritten', 'p_keepvar', 'p_keepglobal')
+NZ = ('p_f.0_6_nztz64', 'p_f.0_6_nzlz64', 'p_f.0_6_nztz32', 'p_f.0_6_nzlz16', 'p_f.0_5_nztz8', 'p_f.0_6_nzbits')
+KEEP = ('p_f.0_11_keepwritten', 'p_f.0_7_keepvar', 'p_f.0_10_keepglobal')
 
 
 def body(lines, name, path):
@@ -41,7 +41,7 @@ def main():
     path = args[0]
     lines = open(path).read().splitlines()
     if arm:
-        for name in ('p_nztz32', 'p_nztz8'):
+        for name in ('p_f.0_6_nztz32', 'p_f.0_5_nztz8'):
             b = body(lines, name, path)
             bad = [l.strip() for l in b if re.match(r'^\s+orr x\d+, x\d+, #', l)]
             if bad:
