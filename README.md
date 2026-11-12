@@ -61,7 +61,9 @@ Source files use the `.paslang` extension.
   by the manufacturer's latency tables; `{$CPU}` and `{$TUNE}` in the
   code prevail over the command line.
 - **Classes and exceptions with objects.** Every class descends from
-  `TObject`; `raise` carries an object of any class, and an `except`
+  `TObject`. Implicit class values widen to ancestors; unrelated classes,
+  implicit narrowing and object/scalar mismatches are compile errors.
+  `raise` carries an object of any class, and an `except`
   part picks it by class with `on E: T do` handlers. The object belongs
   to the routine that raised it, and the collector takes it back.
   Runtime failures report the operation's source line, including inside

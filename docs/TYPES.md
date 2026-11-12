@@ -501,6 +501,13 @@ are worked out. The callee cannot keep it (MANUAL §5).
   an instance, and the length and the address of the class's name,
   which lies as a string literal does. Inside a method `Self` is that
   pointer. A plain `record` has no VMT.
+  Implicit class values accept `nil`, aliases of the same class, and
+  descendants converted to ancestors. Unrelated classes, implicit
+  narrowing and object/scalar mismatches are refused while compiling,
+  including arguments, results and collection elements. `var`/`out`
+  require the exact variable type. Interfaces, declared conversions,
+  explicit views and class-to-`Pointer` keep their contracts; checked
+  narrowing uses `as`. Valid upcasts emit no runtime check.
 - `class of T` (1.1.4) is one word: the address of a class's method
   table, T's or a descendant's; `TClass` is `class of TObject`. The
   table's word at -48 is an instance's GC descriptor, so an object made

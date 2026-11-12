@@ -3779,6 +3779,24 @@ box
 25
 ```
 
+An implicit class value conversion accepts `nil`, the same class (including
+an alias), or a descendant where an ancestor is required. This applies to
+assignments, fields, collection elements, value and `const` arguments,
+and function results. Unrelated classes, implicit narrowing from an
+ancestor to a descendant, and implicit object/scalar conversions are
+compile errors. `var` and `out` retain their exact variable type contract.
+A forward class is checked after its complete declaration supplies its
+ancestry, retaining the original conversion's source position.
+
+`x as TChild` performs a checked class cast. Explicit byte views and
+casts follow their existing rules (§6); an object can still be passed
+or assigned to untyped `Pointer`. Declared implicit operators and
+implemented interfaces retain their conversion rules. Valid upcasts
+add no runtime check. Recompile earlier application and library sources
+to apply these static checks; existing compiled bodies are not checked
+again when imported. `testdata/classvalues/` covers these contexts on
+both targets, with GC stress and one scheduler CPU.
+
 A class value is one pointer to an instance whose first word points to
 the method table. `class`, `class(Parent)` and `class(Parent, IFace)`
 declare one; a class with no parent may list interfaces directly.

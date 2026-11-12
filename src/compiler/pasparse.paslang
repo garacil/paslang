@@ -72,6 +72,12 @@ type
     Own: Boolean;
   end;
 
+  { P595: a forward class is checked after its ancestry is complete. }
+  TClassAssign = record
+    SourceTyp, TargetTyp: LongInt;
+    At: string;
+  end;
+
   TProcEnt = record
     Name: string;
     Sym: string;
@@ -178,6 +184,7 @@ type
     FImporting: LongInt;      { LoadUnit is bringing a unit's names in: they are not the program's own (P158) }
     FDeclAt: string;          { ' at L:C' of the name being declared, where a duplicate is told (P151) }
     FFwdTypes: array of LongInt;  { the classes and interfaces declared forward and not whole yet (P139) }
+    FClassAssigns: array of TClassAssign;
     FFwdAt: TStrArray;        { where each of them was declared forward }
     FFwdScope: SizeInt;       { where the routine being read begins its forward types (P139) }
     FModNoAddr: Boolean;      { ExprMod: an address taken is not a change (the const check, 1.1.1) }
@@ -292,6 +299,7 @@ type
     procedure CheckMemberName(const AName: string);
     function MemberOwner(Cls, Kind: LongInt; Idx: SizeInt): LongInt;
     function ClassUnder(A, B: LongInt): Boolean;
+    procedure CheckClassAssign(A, B: LongInt; const At: string);
     procedure CheckVis(Cls, Kind: LongInt; Idx: SizeInt; ALine, ACol: LongInt);
     function IsLocalName(const AName: string): Boolean;
     function NameVar(const AName: string; ALine, ACol: LongInt): PExpr;
@@ -3809,10 +3817,30 @@ end;
 
 { At the end of the declarations every forward type of theirs is whole. }
 procedure TParser.CheckFwdTypes;
+var
+  i, keep: SizeInt;
+  a: TClassAssign;
 begin
   if Length(FFwdTypes) > FFwdScope then
     Refuse('forward type ' + FTypes[FFwdTypes[FFwdScope]].Name + ' not resolved at ' +
       FFwdAt[FFwdScope]);
+  { An enclosing declaration may still have a forward class. Keep its
+    checks until that declaration is complete, retaining the source
+    position. Go go/types/check.go likewise delays checks whose types
+    are incomplete; no application code is emitted for this check. }
+  keep := 0;
+  for i := 0 to High(FClassAssigns) do
+  begin
+    a := FClassAssigns[i];
+    if IsFwdType(a.SourceTyp) or IsFwdType(a.TargetTyp) then
+    begin
+      FClassAssigns[keep] := a;
+      Inc(keep);
+    end
+    else
+      CheckClassAssign(a.SourceTyp, a.TargetTyp, a.At);
+  end;
+  SetLength(FClassAssigns, keep);
 end;
 
 function TParser.InternArray(Elem: LongInt; Lo, Hi: Int64): LongInt;
@@ -4965,7 +4993,7 @@ end;
 
 function TParser.ValArg(Want: LongInt; E: PExpr): PExpr;
 var
-  k: TTypeKind;
+  k, wantedKind: TTypeKind;
   nl, cv: PExpr;
 begin
   Result := StrArg(Want, E);
@@ -5100,20 +5128,39 @@ begin
       Refuse(TypName(E^.Typ) + ' does not go into ' + TypName(Want) + '; x as T sees its bytes' +
         PosOf(E));
   end;
+  k := TypeOf(E^.Typ).Kind;
+  wantedKind := TypeOf(Want).Kind;
   { A class reference goes where a reference to its class or to an
     ancestor goes, and only there (P123): TClass takes any. }
-  if (TypeOf(Want).Kind = tykClassRef) and (E^.Kind <> ekNil) then
+  if (wantedKind = tykClassRef) and (E^.Kind <> ekNil) then
   begin
-    if TypeOf(E^.Typ).Kind <> tykClassRef then
+    if k <> tykClassRef then
       Refuse(TypName(E^.Typ) + ' does not go into ' + TypName(Want) + PosOf(E));
     if not ClassUnder(TypeOf(E^.Typ).Elem, TypeOf(Want).Elem) then
       Refuse(TypName(E^.Typ) + ' does not go into ' + TypName(Want) + ': ' +
         TypeOf(TypeOf(E^.Typ).Elem).Name + ' does not descend from ' +
         TypeOf(TypeOf(Want).Elem).Name + PosOf(E));
   end;
-  if (TypeOf(E^.Typ).Kind = tykClassRef) and (Want <> TyNone) and
-    (TypeOf(Want).Kind <> tykClassRef) and (TypeOf(Want).Kind <> tykParam) and
-    (TypeOf(Want).Kind <> tykGeneric) then
+  if (k = tykClassRef) and (Want <> TyNone) and
+    (wantedKind <> tykClassRef) and (wantedKind <> tykParam) and
+    (wantedKind <> tykGeneric) then
+    Refuse(TypName(E^.Typ) + ' does not go into ' + TypName(Want) + PosOf(E));
+  { P595: value conversion follows ConvCost's existing class policy.
+    Go go/types/operand.go assignableTo rejects unrelated named types;
+    FPC defcmp.pas objectdef_is_related walks the source's ancestors.
+    Interface binding and declared conversions returned above. The
+    untyped Pointer conversion remains the existing raw-word view. }
+  if (wantedKind = tykClass) and (E^.Kind <> ekNil) and
+    (k <> tykParam) and (k <> tykGeneric) then
+  begin
+    if k <> tykClass then
+      Refuse(TypName(E^.Typ) + ' does not go into ' + TypName(Want) + PosOf(E));
+    if not ClassUnder(E^.Typ, Want) then
+      CheckClassAssign(E^.Typ, Want, PosOf(E));
+  end;
+  if (k = tykClass) and (Want <> TyNone) and (Want <> TyPointer) and
+    (wantedKind <> tykClass) and (wantedKind <> tykParam) and
+    (wantedKind <> tykGeneric) then
     Refuse(TypName(E^.Typ) + ' does not go into ' + TypName(Want) + PosOf(E));
   { a list in brackets where a set goes is of that set's type, and a set
     goes where a set of its elements goes (P126) }
@@ -5129,22 +5176,21 @@ begin
   end;
   { A set goes only where a set goes (1.0.136): i := [1, 2] stored its
     bitmask, 6, and P([3]) passed 8. }
-  if (TypeOf(E^.Typ).Kind = tykSet) and (Want <> TyNone) and
-    (TypeOf(Want).Kind <> tykSet) and (TypeOf(Want).Kind <> tykParam) and
-    (TypeOf(Want).Kind <> tykGeneric) and (not IsDynTyp(Want)) then
+  if (k = tykSet) and (Want <> TyNone) and
+    (wantedKind <> tykSet) and (wantedKind <> tykParam) and
+    (wantedKind <> tykGeneric) and (not IsDynTyp(Want)) then
     Refuse('a set does not go into ' + TypName(Want) + PosOf(E));
   { A map goes only where its own map type goes (1.0.140): a map[string]
     of Integer went into a map[Integer] of string parameter, and an
     integer into a map variable, in silence. }
-  if ((TypeOf(Want).Kind = tykMap) or (TypeOf(Want).Kind = tykTree) or
-    (TypeOf(Want).Kind = tykHeap)) and (E^.Kind <> ekNil) and (E^.Typ <> TyNone) and
-    (TypeOf(E^.Typ).Kind <> tykParam) and (TypeOf(E^.Typ).Kind <> tykGeneric) and
+  if ((wantedKind = tykMap) or (wantedKind = tykTree) or
+    (wantedKind = tykHeap)) and (E^.Kind <> ekNil) and (E^.Typ <> TyNone) and
+    (k <> tykParam) and (k <> tykGeneric) and
     (not SameTyp(Want, Result^.Typ)) then
     Refuse(TypName(E^.Typ) + ' does not go into ' + TypName(Want) + PosOf(E));
   { Only a Boolean goes into a Boolean (1.0.116): t := i and t := t + t
     stored 5 or 2, printed as such, and t = True was then False. }
-  k := TypeOf(E^.Typ).Kind;
-  if (TypeOf(Want).Kind = tykBoolean) and (k <> tykBoolean) and (k <> tykNone) and
+  if (wantedKind = tykBoolean) and (k <> tykBoolean) and (k <> tykNone) and
     (k <> tykParam) and (k <> tykGeneric) then
   begin
     if (k = tykInteger) or (k = tykSubrange) or (k = tykEnum) or (k = tykPointer) then
@@ -5161,9 +5207,8 @@ begin
     Result := CoerceInt(Result, Want);
     Exit;
   end;
-  if TypeOf(Want).Kind <> tykReal then
+  if wantedKind <> tykReal then
     Exit;
-  k := TypeOf(E^.Typ).Kind;
   { A real is worked out in the real type wanted (P101). }
   if k = tykReal then
   begin
@@ -6549,6 +6594,26 @@ begin
     k := FTypes[k].Parent;
     Inc(n);
   end;
+end;
+
+{ Valid class values widen to ancestors. A forward declaration has no
+  parent yet, so its check waits until CheckFwdTypes completes it. }
+procedure TParser.CheckClassAssign(A, B: LongInt; const At: string);
+var
+  n: SizeInt;
+begin
+  if ClassUnder(A, B) then Exit;
+  if IsFwdType(A) or IsFwdType(B) then
+  begin
+    n := Length(FClassAssigns);
+    SetLength(FClassAssigns, n + 1);
+    FClassAssigns[n].SourceTyp := A;
+    FClassAssigns[n].TargetTyp := B;
+    FClassAssigns[n].At := At;
+    Exit;
+  end;
+  Refuse(TypName(A) + ' does not go into ' + TypName(B) +
+    ': x as ' + TypName(B) + ' is a checked class cast' + At);
 end;
 
 { May the code being read use member Idx of class Cls (Kind as for
