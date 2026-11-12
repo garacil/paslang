@@ -12135,6 +12135,15 @@ P429), each following Go's code routine by routine:
   kernel CSPRNG with rejection sampling. It returns `''` on an
   unsupported curve or entropy error, and never falls back to a weak
   generator. Entropy waits use the shared syscall scheduler.
+  Generator multiples are compiled constants: the first operation
+  performs no table construction or initialization lock. P-256 keeps
+  43 affine windows; P-384 keeps 96 affine windows and reconstructs
+  the selected point's Z with a mask, reading every entry. Its table
+  occupies 138,240 bytes instead of 207,360 bytes of projective points.
+  `scripts/nist_tables.py --check` regenerates all constants from
+  SEC 1's group law. `make check` independently recomputes every
+  point with the library's point operations, checks every P-384
+  selection, and detects corrupted limbs and selector defects.
   For VAPID, hash the JWS signing input with SHA-256 and base64url
   encode `r + s`; the signing key must differ from the payload's ECDH
   key (RFC 8292 §3). The application constructs the JWT claims and

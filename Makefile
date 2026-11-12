@@ -1285,6 +1285,7 @@ bench-servers: $(OUTDIR)/paslangc core libs
 
 check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch64
 	@python3 scripts/check_recipes.py
+	@python3 -I scripts/check_nist_tables.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64)
 	@set -e; \
 	: P594: deterministic ECDSA raw signatures and key generation across CPU, inline and GC modes; \
 	python3 -I scripts/check_nist_sign.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64); \

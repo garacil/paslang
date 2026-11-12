@@ -46,7 +46,8 @@ Source files use the `.paslang` extension.
 - **Public-key cryptography.** `pasnist` supports P-256/P-384 ECDH,
   ECDSA verification and deterministic RFC 6979 signing. Fixed-width
   raw signature components support ES256/ES384, and private scalars
-  can be generated from the kernel CSPRNG.
+  can be generated from the kernel CSPRNG. Verified generator tables
+  are compiled constants, so the first operation does not build them.
 - **SQLite and document formats.** `uses sqlite` opens SQLite databases
   from paslang, including rollback journals and WAL, with a `TSqlite`
   class and a low-level API under the `sqlite3_*` names. Libraries also
