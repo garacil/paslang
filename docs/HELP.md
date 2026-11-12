@@ -10,50 +10,62 @@ paslangc -v
 paslangc --version
 ```
 
-The version is the one `paslangc -v` prints; it lives only in
-`PaslangVersion` (`src/compiler/pashelp.paslang`) and rises with every
-compiler, runtime, core or language change. With no arguments, `-v`,
-or `--version`, paslangc prints a card.
+With no arguments, `paslangc` prints concise usage and exits 0. The same
+summary is available with `-h`, `--help index` or `--help short`.
+The output is plain text with stable headings and no terminal-dependent
+framing or escape sequences. On an amd64 compiler it reads:
 
+```text
+paslangc - modern Pascal compiler
+Compile .paslang source into native Linux programs and units.
+Default target: linux/amd64
+
+Usage:
+  paslangc [options] source.paslang
+
+Build and run:
+  paslangc -o app source.paslang
+  ./app
+
+Common options:
+  -o <path>          Output executable (default: a.out)
+  -c                 Compile an object without linking
+  -Fu <dir>          Add a compiled-unit search directory
+  -target <arch>     amd64 (also intel64) or arm64
+  -cpu <processor>   Instruction set: native, base, max or a processor
+  -debug             Include the interactive debugger
+
+Help:
+  paslangc -h                 Short usage summary
+  paslangc -v                 Version, target, processor and license
+  paslangc --help             Complete built-in reference
+  paslangc --help <topic>     Read one topic
+  Topics: flags, types, lang, runtime, lib, limits, examples
+
+Documentation:
+  https://github.com/garacil/paslang/wiki
 ```
-  ╭────────────────────────────────────────────────────────────╮
-  │  paslangc  x.y.z                                           │
-  │  living modern pascal                                      │
-  │                                                            │
-  │  Pascal spelling. 64-bit Integer. UTF-8 string.            │
-  │  / divides reals. div divides integers.                    │
-  │  A routine is a G. It parks; the thread stays free.        │
-  │  GNU/Linux amd64. The program does not link libc.          │
-  ╰────────────────────────────────────────────────────────────╯
-```
 
-`paslangc` and `paslangc -h` then print the topic index in the same kind of frame.
-`paslangc --help` prints that index and every section.
-`paslangc --help types` prints one section: the word after `--help` is
-the topic when it does not start with `-`.
+The ARM compiler reports `linux/arm64` as its default target. The example
+uses an explicit output name; without `-o`, a program is written to
+`a.out`. Unit output defaults to `build/<name>.pi` and
+`build/<name>.o` (`build/a64/` for ARM).
 
-```bash
-paslangc
-paslangc -h
-paslangc --help
-paslangc --help flags
-paslangc --help types
-paslangc --help lang
-paslangc --help runtime
-paslangc --help lib
-paslangc --help limits
-paslangc --help examples
-paslangc --help all
-paslangc --help index
-```
+`paslangc -v` and `paslangc --version` print a first line of
+`paslangc x.y.z`, then `target:` and `processor:` metadata and the
+copyright and license. The version lives in `PaslangVersion`
+(`src/compiler/pashelp.paslang`).
 
-`--help` with no topic, or with `all`, prints the index and every
-section; `index` (also `short`) prints the index alone, as `-h` does. An
-unknown topic prints `unknown help topic: <topic>` and the index. Every
-form prints the card first and exits 0. The source of that text is
-`src/compiler/pashelp.paslang`. Spellings, sizes, and examples there are
-the ones the compiler implements. A form that is not listed under
-`limits` or `lang` is not a promise.
+`paslangc --help` or `paslangc --help all` prints the summary followed
+by every reference section. `paslangc --help types` prints only that
+section. Topic names are case-insensitive. Successful help and version
+commands write to standard output and exit 0. An unknown topic writes
+`paslangc: unknown help topic: <topic>; use paslangc --help index`
+to standard error and exits 1. Build options without a source file also
+report an error and exit 1.
+
+The built-in reference comes from `src/compiler/pashelp.paslang`.
+Spellings, sizes and examples describe the compiler's implemented contract.
 
 | Topic | What it answers |
 |---|---|

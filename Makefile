@@ -5752,14 +5752,9 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(BUILDDIR)/hello-i64 > $(BUILDDIR)/hello-i64.got; \
 	diff -u testdata/hello.out $(BUILDDIR)/hello-i64.got; \
 	echo ok intel64; \
-	echo "==== helpbox ===="; \
-	$(OUTDIR)/paslangc > $(BUILDDIR)/paslangc.card; \
-	test $$(grep -c . $(BUILDDIR)/paslangc.card) -ge 20; \
-	test $$(awk 'NF{print length($$0)}' $(BUILDDIR)/paslangc.card | sort -u | wc -l) -eq 1; \
-	grep -q 'core sync, maps, pasnet   ' $(BUILDDIR)/paslangc.card; \
-	$(OUTDIR)/paslangc --help > $(BUILDDIR)/paslangc.help; \
-	test $$(grep -c '^## ' $(BUILDDIR)/paslangc.help) -eq 7; \
-	echo ok helpbox; \
+	echo "==== compiler help ===="; \
+	python3 -I scripts/check_cli_help.py "$(OUTDIR)/paslangc" "$(BUILDDIR)"; \
+	echo ok compiler-help; \
 	if [ -f $(BUILDDIR)/xvfb.pid ]; then \
 	  kill $$(cat $(BUILDDIR)/xvfb.pid) 2> /dev/null || true; \
 	  rm -f $(BUILDDIR)/xvfb.pid $(BUILDDIR)/xvfb.display; \
@@ -5790,6 +5785,7 @@ $(BUILDDIR)/qemu-aarch64: scripts/build_qemu.py $(wildcard scripts/qemu/*.patch)
 
 check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/qemu-aarch64
 	@set -e; \
+	python3 -I scripts/check_cli_help.py "$(OUTDIR)/paslangc-arm64" "$(BUILDDIR)" "$(QEMU_A64)"; \
 	echo "==== lib units arm64 ===="; \
 	for u in $(LIB_UNITS); do \
 	  b=$$(basename $$u .paslang); \
@@ -6777,7 +6773,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	file $(OUTDIR)/paslangc-arm64 | grep -q 'ARM aarch64'; \
 	$(QEMU_A64) $(OUTDIR)/paslangc-arm64 -h > $(BUILDDIR)/paslangc-arm.help; \
 	grep -q intel64 $(BUILDDIR)/paslangc-arm.help; \
-	test $$(awk 'NF{print length($$0)}' $(BUILDDIR)/paslangc-arm.help | sort -u | wc -l) -eq 1; \
+	grep -q '^Default target: linux/arm64$$' $(BUILDDIR)/paslangc-arm.help; \
 	echo ok compiler-help; \
 	echo "==== compiler lex arm64 ===="; \
 	$(QEMU_A64) $(OUTDIR)/paslangc-arm64 --lex testdata/hello.paslang > $(BUILDDIR)/hello-lex-arm.got; \
