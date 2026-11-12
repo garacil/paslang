@@ -1299,6 +1299,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	python3 -I scripts/check_symbols.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64); \
 	python3 -I scripts/check_class_values.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64); \
 	python3 -I scripts/check_unit_cycles.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64); \
+	python3 -I scripts/check_import_diagnostics.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64); \
 	echo ok unit-life
 	@set -e; \
 	: P589: exact declaration provenance preserves value snapshots and the existing core borrowing contract; \
@@ -5791,6 +5792,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	  b=$$(basename $$u .paslang); \
 	  $(OUTDIR)/paslangc -target arm64 -c -Fu $(A64DIR) -o $(A64DIR)/$$b $$u; \
 	done; \
+	python3 -I scripts/check_import_diagnostics.py "$(OUTDIR)/paslangc-arm64" "$(BUILDDIR)" "$(QEMU_A64)" --host-arm64; \
 	: flatec takes 70 s of qemu on a machine half loaded and 240 lets a loaded one finish it, P449; \
 	for t in $(GOLDEN_A64); do \
 	  echo "==== $$t arm64 ===="; \

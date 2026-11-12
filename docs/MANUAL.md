@@ -224,6 +224,45 @@ dependencies, including private and transitive ones used by the body.
 Mutually dependent sources need existing compatible compiled interfaces;
 the loader reads `.pi` files and never includes another unit's source.
 
+### Import migration and call ownership
+
+P462 introduced private import isolation in 1.2.402. If an upgrade reports
+`unknown identifier NowUnix`, add `pastime` to the affected source's
+`uses` clause. Importing `sqlite` does not expose its private time
+dependency. The same rule applies to `Monotonic` from `pastime` and to
+application helpers: import their declaring unit directly.
+When an unknown identifier, procedure or type is exported by an already
+linked private unit, the error names that unit and suggests adding it to
+`uses`. It still refuses the inaccessible name. More than one possible
+unit is listed without choosing one automatically.
+
+Later units in `uses` retain priority, including names exposed through a
+public interface import. Earlier compilers applied this inconsistently to
+SysUtils and paslib routines. Their shared names are `FileClose`,
+`FileCreate`, `FileExists`, `FileOpen`, `FileRead`, `FileSeek`,
+`FileWrite`, `IntToStr` and `StrToInt64`. `ToLower` is a SysUtils
+string/character helper method and a paslib global, rather than a shared
+global routine.
+Their contracts can differ: `sysutils.FileExists` excludes directories
+and accepts the optional link-following argument, while `paslib.FileExists`
+also accepts directories. Use `sysutils.FileExists(path, False)` or
+`sysutils.IntToStr(value)` when those are the intended declarations.
+
+The compiler's optional `-warn-import-shadow` flag reports an unqualified
+routine call that selects a unit imported through another unit while the
+source directly imports another unit exporting the same routine name. It
+names the selected declaration, the source import through which it arrived
+and the directly imported alternative; qualify the call to choose explicitly.
+Warnings use standard error and successful compilation still exits 0.
+Default compilation, explicitly qualified calls and deliberate direct imports
+of both units remain quiet. Wrong-arity errors name the selected imported
+routine and relevant alternative even without the warning flag.
+
+`pasx509` keeps its `paslib` dependency in implementation imports, so
+using `pasx509` or `pastls` does not expose compiler file/string helpers.
+Rebuild the affected units and their dependants after this dependency change,
+including CPU variants; the interface format remains `PASLANGI36`.
+
 Units may use units that use others, to any depth, and a program may
 name them in any order: a record of a unit, `TSysError` of `SysUtils`
 or one of your own with methods, is one type however many units' `.pi`
@@ -15579,6 +15618,7 @@ paslangc [options] file.paslang
 |--------|---------|
 | `-o <path>` | output file; a program defaults to `a.out`, a unit to `build/<name>` (`build/a64/<name>` with `-target arm64`) |
 | `-c` | compile and assemble only, no link |
+| `-warn-import-shadow` | warn when an unqualified routine call selects an indirect import over a name from a directly imported unit; names declaration ownership and qualification. Default and explicitly qualified compilation stay quiet; warnings go to standard error with successful exit status |
 | `-checkptr` | check every pointer step and access against its object while the program runs (§6) |
 | `-inline <n>` | inline by measure (§5): a plain routine of the unit whose body counts `n` statements and expression nodes or fewer goes in place where it is called; a routine declared `inline` goes in whatever its size; `-inline 0` keeps one copy of every routine and every loop; 40 by default |
 | `-inline-trace` | say on the error output why each routine of the unit stays a call |

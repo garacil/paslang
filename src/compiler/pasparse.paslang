@@ -24,6 +24,7 @@ uses
 
 var
   DebugMode: Boolean;   { -debug (P118): a program gets uses pasdebug, the debugger inside it }
+  WarnImportShadow: Boolean;  { -warn-import-shadow: unqualified indirect routine bindings (P598) }
 
 function ParseSource(const Src: string; const UPath: array of string;
   Arm: Boolean; CpuSet: Int64; CpuTune: LongInt): TProgram;
@@ -223,6 +224,8 @@ type
     FCallUnits: TNameHead;  { P589: complete call symbol to proven core unit, 0 unknown/conflicting }
     FUPath: TStrArray;
     FLoaded: TStrArray;
+    FLoadedVia: array of SizeInt;  { index of each unit's exposing source import, -1 for core (P598) }
+    FUseRoot: SizeInt;
     FLoadedSum: TStrArray;
     FLinkOnly: TStrArray;   { units loaded to be linked, their names not read (1.0.114) }  { the interface checksum of each loaded unit }
     FLoading: TStrArray;
@@ -259,6 +262,12 @@ type
     function VarTyp(const AName: string): LongInt;
     function VarSym(const AName: string): string;
     function FindProc(const AName: string; out P: TProcEnt): Boolean;
+    function ImportVia(const Owner: string): string;
+    function DirectProcAlternative(const AName, Owner: string): string;
+    function ProcBindingDetail(const AName: string; const P: TProcEnt): string;
+    procedure WarnProcBinding(const AName, At: string; const P: TProcEnt);
+    function PrivateNameHint(const AName: string): string;
+    function ImportError(const Msg: string): string;
     function SameProc(const AName: string; const Params: TParamArray): Boolean;
     function ResolveProc(const AName: string; const Args: TExprArray;
       out P: TProcEnt): Boolean;
@@ -840,6 +849,8 @@ begin
   FIsUnit := False;
   FInImpl := False;
   FLoaded := nil;
+  FLoadedVia := nil;
+  FUseRoot := -1;
   FLoadedSum := nil;
   FLinkOnly := nil;
   FLoading := nil;
@@ -2004,7 +2015,7 @@ end;
 
 procedure TParser.Fail(const Msg: string);
 begin
-  Die(Msg + ' at ' + IntToStr(FTok.Line) + ':' + IntToStr(FTok.Col) +
+  Die(ImportError(Msg) + ' at ' + IntToStr(FTok.Line) + ':' + IntToStr(FTok.Col) +
     ' [' + FTok.Lexeme + ']');
 end;
 
@@ -2015,9 +2026,9 @@ end;
 procedure TParser.Refuse(const Msg: string);
 begin
   if HasPlace(Msg) then
-    Die(Msg)
+    Die(ImportError(Msg))
   else
-    Die(Msg + HerePos);
+    Die(ImportError(Msg) + HerePos);
 end;
 
 { The token at hand where What goes (P383): a reserved word says it is
@@ -6111,6 +6122,8 @@ begin
   if nmatch = 1 then
   begin
     P := hit;
+    if WarnImportShadow then
+      WarnProcBinding(AName, at, P);
     Result := True;
     Exit;
   end;
@@ -6121,6 +6134,13 @@ begin
       Refuse('no matching overload for ' + AName + at);
     Fail('no matching overload for ' + AName);
   end;
+  { One visible routine failed only its arity. Preserve the lookup
+    decision and name its unit, rather than guessing another overload. }
+  if nseen = 1 then
+    for i := 0 to High(FProcs) do
+      if cand[i] and (FProcs[i].Owner <> '') then
+        Refuse('wrong number of arguments for ' + AName + at +
+          ProcBindingDetail(AName, FProcs[i]));
 end;
 
 { How far in a routine's scope is (P160): a routine of the program's or
@@ -6237,6 +6257,78 @@ begin
   for i := 1 to Length(S) do
     if S[i] = '.' then
       Result := True;
+end;
+
+{ Import diagnostics keep declaration ownership, like Go's go/types
+  resolver.go dotImportMap and errsupport.go, and Rust's resolve/imports.rs
+  origin-aware shadow lints. Pascal keeps its documented later-unit rule. }
+function TParser.ImportVia(const Owner: string): string;
+var
+  i, sourceIndex: SizeInt;
+begin
+  Result := '';
+  for i := 0 to High(FLoaded) do
+    if SameId(FLoaded[i], Owner) then
+    begin
+      if i <= High(FLoadedVia) then
+      begin
+        sourceIndex := FLoadedVia[i];
+        if (sourceIndex >= 0) and (sourceIndex <= High(FUsesNames)) then
+          Result := ToLower(FUsesNames[sourceIndex]);
+      end;
+      Exit;
+    end;
+end;
+
+function TParser.DirectProcAlternative(const AName, Owner: string): string;
+var
+  i, k: SizeInt;
+  q: string;
+begin
+  Result := '';
+  if HasDotName(AName) or (Owner = '') or HasStr(FUsesNames, Owner) then
+    Exit;
+  for i := High(FUsesNames) downto 0 do
+  begin
+    q := ToLower(FUsesNames[i]) + '.' + AName;
+    k := NameGet(FProcHead, q);
+    if (k >= 0) and not SameId(FProcs[k].Owner, Owner) then
+    begin
+      Result := q;
+      Exit;
+    end;
+  end;
+end;
+
+function TParser.ProcBindingDetail(const AName: string; const P: TProcEnt): string;
+var
+  via, other: string;
+begin
+  Result := '';
+  if (P.Owner = '') or HasDotName(AName) then
+    Exit;
+  Result := '; selected ' + P.Owner + '.' + AName;
+  via := ImportVia(P.Owner);
+  if (via <> '') and not SameId(via, P.Owner) then
+    Result := Result + ' (through ' + via + ')';
+  other := DirectProcAlternative(AName, P.Owner);
+  if other <> '' then
+    Result := Result + '; directly imported ' + other + '; qualify the call';
+end;
+
+procedure TParser.WarnProcBinding(const AName, At: string; const P: TProcEnt);
+var
+  where: string;
+begin
+  if FGenMode or (DirectProcAlternative(AName, P.Owner) = '') then
+    Exit;
+  where := At;
+  if where = '' then
+    where := HerePos;
+  if DieWhere <> '' then
+    where := where + ' in ' + DieWhere;
+  WriteLn(ErrOutput, 'paslangc: warning: import shadow for ', AName,
+    ProcBindingDetail(AName, P), where);
 end;
 
 { A type of this program's or unit's own (or the language's, a core
@@ -19971,6 +20063,9 @@ begin
     if LinkOnly or not HasStr(FLinkOnly, AName) then
       Exit;
     again := True;
+    for i := 0 to High(FLoaded) do
+      if SameId(FLoaded[i], AName) and (i <= High(FLoadedVia)) then
+        FLoadedVia[i] := FUseRoot;
     DelStr(FLinkOnly, AName);
   end;
   { A unit stays in FLoading once it began: one read again for its names
@@ -20142,6 +20237,8 @@ begin
   begin
     { The object is linked; nothing is imported into the name space. }
     AppendStr(FLoaded, AName);
+    SetLength(FLoadedVia, Length(FLoaded));
+    FLoadedVia[High(FLoadedVia)] := FUseRoot;
     AppendStr(FLoadedSum, iface.Checksum);
     AppendStr(FLinkObjs, UnitObj(path));
     AppendStr(FLinkOnly, AName);
@@ -20318,10 +20415,86 @@ begin
   if not again then
   begin
     AppendStr(FLoaded, AName);
+    SetLength(FLoadedVia, Length(FLoaded));
+    FLoadedVia[High(FLoadedVia)] := FUseRoot;
     AppendStr(FLoadedSum, iface.Checksum);
     AppendStr(FLinkObjs, UnitObj(path));
   end;
   QueueUnitDeps(iface, AName, path);
+end;
+
+{ Look up suggestions only on an error path. The normal compilation
+  does not import or retain any extra private declarations. These files
+  were already linked and validated by LoadUnitBody. }
+function TParser.PrivateNameHint(const AName: string): string;
+var
+  i, j: SizeInt;
+  path, data, units, only: string;
+  iface: TUnitIface;
+  found: Boolean;
+  count: LongInt;
+begin
+  Result := '';
+  if (AName = '') or HasDotName(AName) then
+    Exit;
+  count := 0;
+  units := '';
+  only := '';
+  for i := 0 to High(FLinkOnly) do
+  begin
+    if IsCoreUnit(FLinkOnly[i]) or SameId(FLinkOnly[i], FUnitName) then
+      Continue;
+    path := FindPi(FLinkOnly[i]);
+    if (path = '') or not ReadFile(path, data) then
+      Continue;
+    if not ParseIface(data, iface) or not SameId(iface.Name, FLinkOnly[i]) then
+      Continue;
+    found := False;
+    for j := 0 to High(iface.Procs) do
+      if SameId(iface.Procs[j].Name, AName) then
+        found := True;
+    for j := 0 to High(iface.Consts) do
+      if SameId(iface.Consts[j].Name, AName) then
+        found := True;
+    for j := 0 to High(iface.Vars) do
+      if SameId(iface.Vars[j].Name, AName) then
+        found := True;
+    for j := 0 to High(iface.TypeNames) do
+      if SameId(iface.TypeNames[j], AName) then
+        found := True;
+    if found then
+    begin
+      Inc(count);
+      only := ToLower(iface.Name);
+      if units <> '' then
+        units := units + ', ';
+      units := units + only;
+    end;
+  end;
+  if count = 1 then
+    Result := '; unit ' + only + ' declares ' + AName + '; add ' + only + ' to uses'
+  else if count > 1 then
+    Result := '; units ' + units + ' export ' + AName + '; add the intended unit to uses';
+end;
+
+function TParser.ImportError(const Msg: string): string;
+var
+  first, last: SizeInt;
+begin
+  Result := Msg;
+  first := 0;
+  if Copy(Msg, 1, 19) = 'unknown identifier ' then
+    first := 20
+  else if Copy(Msg, 1, 18) = 'unknown procedure ' then
+    first := 19
+  else if Copy(Msg, 1, 13) = 'unknown type ' then
+    first := 14;
+  if first = 0 then
+    Exit;
+  last := first;
+  while (last <= Length(Msg)) and (Msg[last] <> ' ') do
+    Inc(last);
+  Result := Msg + PrivateNameHint(Copy(Msg, first, last - first));
 end;
 
 { Pascal Reference16.4 permits any cycle with an implementation edge.
@@ -21652,7 +21825,9 @@ begin
     if FTok.Kind <> tkIdent then
       Expected('a unit''s name');
     AppendStr(FUsesNames, FTok.Lexeme);
+    FUseRoot := High(FUsesNames);
     LoadUnit(FTok.Lexeme, False);
+    FUseRoot := -1;
     FTok := FLex.Next;
     if FTok.Kind <> tkComma then
       Break;

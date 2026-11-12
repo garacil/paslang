@@ -64,12 +64,17 @@ commands write to standard output and exit 0. An unknown topic writes
 to standard error and exits 1. Build options without a source file also
 report an error and exit 1.
 
+Use `-warn-import-shadow` while reviewing an upgrade to see unqualified
+routine calls that select an indirect import over a directly imported name.
+Warnings name both declarations and use standard error; qualifying the call
+makes the choice explicit. See [import migration and call ownership](MANUAL.md#import-migration-and-call-ownership).
+
 The built-in reference comes from `src/compiler/pashelp.paslang`.
 Spellings, sizes and examples describe the compiler's implemented contract.
 
 | Topic | What it answers |
 |---|---|
-| flags | `-h`, `-v`/`--version`, `--help`, `-o`, `-c`, `-checkptr`, `-Fu` and the unit search order, `-install`, `-cpu` and `-tune`, `-inline` and `-inline-trace`, `-debug`, `-target`, `--lex`, exit status |
+| flags | `-h`, `-v`/`--version`, `--help`, `-o`, `-c`, `-checkptr`, `-warn-import-shadow`, `-Fu` and the unit search order, `-install`, `-cpu` and `-tune`, `-inline` and `-inline-trace`, `-debug`, `-target`, `--lex`, exit status |
 | types | Integer and real widths, checked four-place `Currency`, strings, slices, records, sets, channels, maps, JSON, method and interface values, and the pointer operations allowed by `safe` |
 | lang | statements, units, classes, channels, a hello program |
 | runtime | pasroutines, stack growth, asynchronous and cooperative preemption, the collector, checked failures, `Syscall`, atomics, RTTI and scheduler operations |

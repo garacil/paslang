@@ -204,6 +204,13 @@ dependencies are linked and initialized without importing their names.
 Each unit records its direct and implicit core dependency checksums;
 transitive dependencies remain checked through their defining units.
 
+When upgrading, `unknown identifier NowUnix` means the affected source needs
+`pastime` in its own `uses` clause. Qualify shared names such as
+`sysutils.FileExists` and `sysutils.IntToStr` to select their contracts
+explicitly. `-warn-import-shadow` can reveal routine calls bound through an
+indirect public import; default successful compilation stays quiet.
+[Import migration and call ownership](docs/MANUAL.md#import-migration-and-call-ownership)
+
 ## Binary packages
 
 The release page provides four distribution packages and a relocatable
