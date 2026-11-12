@@ -479,10 +479,17 @@ are worked out. The callee cannot keep it (MANUAL §5).
 - Scoped symbols retain their defining unit, type or lexical routine.
   Components are length-framed, so underscores inside names cannot merge
   two different scopes. Classes, interfaces and helpers keep these opaque
-  stems across imports; aliases keep the original identity. `PASLANGI35`
+  stems across imports; aliases keep the original identity. `PASLANGI36`
   requires rebuilding older compiled units and their objects. Runtime
   layouts and Pascal case-insensitive lookup keep their existing contracts
   (`testdata/symbols/`, `scripts/check_symbols.py`).
+- Compiled interfaces separate public `USE` edges from private `LINK` edges.
+  Interface-only cycles are errors; a cycle containing an implementation
+  dependency is allowed. Private links do not import names and preserve
+  initialization/finalization. The public type graph keeps every referenced
+  type edge and excludes unreferenced private body metadata from its checksum.
+  Checksums record direct imports and implicit core units, with private and
+  transitive checks enforced recursively by each imported unit.
 - `operator` defines `+ - * / div mod = <> < <= > >=` as a function.
   Integer, string, and set operations stay builtin when no operator is
   declared. A record without one is an error. `testdata/opadd.paslang`,

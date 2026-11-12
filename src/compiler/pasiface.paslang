@@ -79,6 +79,7 @@ type
     Name: string;
     Checksum: string;
     UsesNames: TStrArray;
+    LinkNames: TStrArray;   { implementation-only dependencies, outside the public SUM (P462) }
     DepNames: TStrArray;
     DepSums: TStrArray;
     Procs: array of TIfaceProc;
@@ -260,13 +261,130 @@ begin
   end;
 end;
 
+type
+  TIfaceTypeIds = array of LongInt;
+
+{ Go's current noder/writer.go typIdx gives each exported type one graph
+  index. Keep Pascal's interface declarations, then their complete closure;
+  private imports and local body types cannot move public ids (P462).
+  Two bounded arrays are allocated once; no recursive walk or AST mutation. }
+procedure MarkIfaceType(Id: LongInt; var Ids, Order: TIfaceTypeIds;
+  var Count: SizeInt);
+begin
+  if Id < 0 then
+    Exit;
+  if Id > High(Ids) then
+    Die('internal compiled interface type outside its table');
+  if Ids[Id] >= 0 then
+    Exit;
+  Ids[Id] := LongInt(Count);
+  Order[Count] := Id;
+  Count := Count + 1;
+end;
+
+procedure IfaceTypeGraph(const Prog: TProgram; out Ids, Order: TIfaceTypeIds);
+var
+  i, j, k, at, count, limit: SizeInt;
+  td: TTypeDef;
+begin
+  SetLength(Ids, Length(Prog.Types));
+  SetLength(Order, Length(Prog.Types));
+  for i := 0 to High(Ids) do
+    Ids[i] := -1;
+  count := 0;
+  limit := Prog.IfaceTypes;
+  if limit <= 0 then
+    limit := Length(Prog.Types);
+  if limit > Length(Prog.Types) then
+    Die('internal compiled interface boundary outside its table');
+  for i := 0 to limit - 1 do
+    MarkIfaceType(LongInt(i), Ids, Order, count);
+  for i := 0 to High(Prog.TypeIds) do
+    MarkIfaceType(Prog.TypeIds[i], Ids, Order, count);
+  for i := 0 to High(Prog.Consts) do
+    MarkIfaceType(Prog.Consts[i].Typ, Ids, Order, count);
+  for i := 0 to High(Prog.Vars) do
+    if Prog.Vars[i].Pub and ((not Prog.Vars[i].Ext) or Prog.Vars[i].Alias) and
+      (Prog.Vars[i].Sym <> '') then
+      MarkIfaceType(Prog.Vars[i].Typ, Ids, Order, count);
+  for i := 0 to High(Prog.Procs) do
+    if Prog.Procs[i].InIface then
+    begin
+      MarkIfaceType(Prog.Procs[i].RetTyp, Ids, Order, count);
+      for j := 0 to High(Prog.Procs[i].Params) do
+        MarkIfaceType(Prog.Procs[i].Params[j].Typ, Ids, Order, count);
+    end;
+  for i := 0 to High(Prog.Ops) do
+  begin
+    MarkIfaceType(Prog.Ops[i].LTyp, Ids, Order, count);
+    MarkIfaceType(Prog.Ops[i].RTyp, Ids, Order, count);
+    MarkIfaceType(Prog.Ops[i].Ret, Ids, Order, count);
+  end;
+  for i := 0 to High(Prog.Convs) do
+  begin
+    MarkIfaceType(Prog.Convs[i].FromTyp, Ids, Order, count);
+    MarkIfaceType(Prog.Convs[i].ToTyp, Ids, Order, count);
+  end;
+  for i := 0 to High(Prog.UnOps) do
+  begin
+    MarkIfaceType(Prog.UnOps[i].Typ, Ids, Order, count);
+    MarkIfaceType(Prog.UnOps[i].Ret, Ids, Order, count);
+  end;
+  at := 0;
+  while at < count do
+  begin
+    td := Prog.Types[Order[at]];
+    MarkIfaceType(td.Elem, Ids, Order, count);
+    MarkIfaceType(td.Elem2, Ids, Order, count);
+    MarkIfaceType(td.Parent, Ids, Order, count);
+    MarkIfaceType(td.ScopeOwner, Ids, Order, count);
+    if td.SpecOrigin > 0 then
+    begin
+      MarkIfaceType(td.SpecOrigin, Ids, Order, count);
+      MarkIfaceType(td.SpecArg, Ids, Order, count);
+    end;
+    for j := 0 to High(td.Ifaces) do
+      MarkIfaceType(td.Ifaces[j], Ids, Order, count);
+    for j := 0 to High(td.Fields) do
+      MarkIfaceType(td.Fields[j].Typ, Ids, Order, count);
+    for j := 0 to High(td.CVars) do
+      MarkIfaceType(td.CVars[j].Typ, Ids, Order, count);
+    for j := 0 to High(td.Props) do
+      MarkIfaceType(td.Props[j].Typ, Ids, Order, count);
+    for j := 0 to High(td.Nested) do
+      MarkIfaceType(td.Nested[j].Typ, Ids, Order, count);
+    for j := 0 to High(td.Meths) do
+    begin
+      MarkIfaceType(td.Meths[j].RetTyp, Ids, Order, count);
+      for k := 0 to High(td.Meths[j].ParamTyps) do
+        MarkIfaceType(td.Meths[j].ParamTyps[k], Ids, Order, count);
+    end;
+    at := at + 1;
+  end;
+  SetLength(Order, count);
+end;
+
+function IfaceId(const Ids: TIfaceTypeIds; Id: LongInt): string;
+begin
+  if Id < 0 then
+  begin
+    Result := IntToStr(Id);
+    Exit;
+  end;
+  if (Id > High(Ids)) or (Ids[Id] < 0) then
+    Die('internal compiled interface type missing from its graph');
+  Result := IntToStr(Ids[Id]);
+end;
+
 function IfaceBody(const Prog: TProgram): string;
 var
-  i, j, k, tid: SizeInt;
+  i, j, k, tid, row: SizeInt;
+  ids, order: TIfaceTypeIds;
   line, kind, tname, mname, msym: string;
   td: TTypeDef;
   mkind: LongInt;
 begin
+  IfaceTypeGraph(Prog, ids, order);
   Result := 'UNIT ' + ToLower(Prog.Name) + #10;
   { SAFE: a safe unit, which does no raw pointer work (P102). }
   if Prog.Safe then
@@ -274,7 +392,7 @@ begin
   { CHECKPTR: compiled with -checkptr (P104). }
   if Prog.CheckPtr then
     Result := Result + 'CHECKPTR' + #10;
-  for i := 0 to High(Prog.UsesNames) do
+  for i := 0 to Prog.IfaceUses - 1 do
     Result := Result + 'USE ' + ToLower(Prog.UsesNames[i]) + #10;
   { CONST name value [kind [hex]]: no kind is an integer, as it always
     was; s is a string with its bytes in hex, r a real (value = bits),
@@ -301,28 +419,29 @@ begin
     begin
       { a set constant (P126): its type, and a set of 32 bytes its bytes }
       if Prog.Types[Prog.Consts[i].Typ].Size = 32 then
-        line := line + ' w ' + IntToStr(Prog.Consts[i].Typ) + ' ' + HexOf(Prog.Consts[i].Txt)
+        line := line + ' w ' + IfaceId(ids, Prog.Consts[i].Typ) + ' ' + HexOf(Prog.Consts[i].Txt)
       else
-        line := line + ' v ' + IntToStr(Prog.Consts[i].Typ);
+        line := line + ' v ' + IfaceId(ids, Prog.Consts[i].Typ);
     end
     else if (Prog.Consts[i].Typ > TyLastBuiltin) and (Prog.Consts[i].Typ <= High(Prog.Types)) and
       ((Prog.Types[Prog.Consts[i].Typ].Kind = tykEnum) or
       (Prog.Types[Prog.Consts[i].Typ].Kind = tykSubrange)) then
       { an enumeration's member and a subrange's constant say their type
         (P135): Thu is a TDay where the unit is used, not an Integer }
-      line := line + ' v ' + IntToStr(Prog.Consts[i].Typ);
+      line := line + ' v ' + IfaceId(ids, Prog.Consts[i].Typ);
     Result := Result + line + #10;
   end;
-  for tid := 0 to High(Prog.Types) do
+  for row := 0 to High(order) do
   begin
+    tid := order[row];
     td := Prog.Types[tid];
     if (td.Kind = tykNone) and (td.Name = '') and (Length(td.Fields) = 0) then
       Continue;
     tname := TypeNameOf(Prog, tid);
-    Result := Result + 'TYPE ' + tname + ' ' + IntToStr(tid) + ' ' +
+    Result := Result + 'TYPE ' + tname + ' ' + IfaceId(ids, tid) + ' ' +
       IntToStr(Ord(td.Kind)) + ' ' + IntToStr(td.Size) + ' ' +
-      IntToStr(td.Elem) + ' ' + IntToStr(td.Lo) + ' ' + IntToStr(td.Hi) + ' ' +
-      IntToStr(Length(td.Fields)) + ' ' + IntToStr(td.Elem2) + #10;
+      IfaceId(ids, td.Elem) + ' ' + IntToStr(td.Lo) + ' ' + IntToStr(td.Hi) + ' ' +
+      IntToStr(Length(td.Fields)) + ' ' + IfaceId(ids, td.Elem2) + #10;
     { ORIG unit id: the unit a type another unit's .pi brought in was made
       in, and its id there (P460); a reader that has that type already
       takes it, so a type is once in a compilation and in the .pi it
@@ -336,9 +455,9 @@ begin
     if (td.Kind = tykClass) or (td.Kind = tykInterface) or (td.Kind = tykHelper) then
     begin
       { a helper's parent helper too (P127) }
-      line := 'CLASS ' + IntToStr(td.Parent) + ' ' + IntToStr(td.VmtN);
+      line := 'CLASS ' + IfaceId(ids, td.Parent) + ' ' + IntToStr(td.VmtN);
       for j := 0 to High(td.Ifaces) do
-        line := line + ' ' + IntToStr(td.Ifaces[j]);
+        line := line + ' ' + IfaceId(ids, td.Ifaces[j]);
       Result := Result + line + #10;
     end;
     { CSYM stem: its unit's and its name (P154), the stem of a class's
@@ -346,15 +465,15 @@ begin
     if td.Sym <> '' then
       Result := Result + 'CSYM ' + td.Sym + #10;
     if td.SpecOrigin > 0 then
-      Result := Result + 'SPEC ' + IntToStr(td.SpecOrigin) + ' ' + IntToStr(td.SpecArg) + #10;
+      Result := Result + 'SPEC ' + IfaceId(ids, td.SpecOrigin) + ' ' + IfaceId(ids, td.SpecArg) + #10;
     if td.ScopeOwner > 0 then
-      Result := Result + 'SCOPE ' + IntToStr(td.ScopeOwner) + #10;
+      Result := Result + 'SCOPE ' + IfaceId(ids, td.ScopeOwner) + #10;
     for j := 0 to High(td.Nested) do
     begin
       msym := td.Nested[j].Ref;
       if msym = '' then msym := '_';
       Result := Result + 'NEST ' + td.Nested[j].Name + ' ' +
-        IntToStr(td.Nested[j].Kind) + ' ' + IntToStr(td.Nested[j].Typ) + ' ' +
+        IntToStr(td.Nested[j].Kind) + ' ' + IfaceId(ids, td.Nested[j].Typ) + ' ' +
         IntToStr(td.Nested[j].Vis) + ' ' + msym + #10;
     end;
     { FLD name off typ vis: vis is the member's visibility (1.0.137);
@@ -363,7 +482,7 @@ begin
     for j := 0 to High(td.Fields) do
     begin
       Result := Result + 'FLD ' + td.Fields[j].Name + ' ' +
-        IntToStr(td.Fields[j].Off) + ' ' + IntToStr(td.Fields[j].Typ) + ' ' +
+        IntToStr(td.Fields[j].Off) + ' ' + IfaceId(ids, td.Fields[j].Typ) + ' ' +
         IntToStr(td.Fields[j].Vis);
       if td.Fields[j].JFlags <> 0 then
         Result := Result + ' ' + IntToStr(td.Fields[j].JFlags) + ' ' + JsonNameHex(td.Fields[j].JName);
@@ -371,7 +490,7 @@ begin
     end;
     { CVAR name typ sym vis: a class variable (P123), the global sym }
     for j := 0 to High(td.CVars) do
-      Result := Result + 'CVAR ' + td.CVars[j].Name + ' ' + IntToStr(td.CVars[j].Typ) + ' ' +
+      Result := Result + 'CVAR ' + td.CVars[j].Name + ' ' + IfaceId(ids, td.CVars[j].Typ) + ' ' +
         td.CVars[j].Sym + ' ' + IntToStr(td.CVars[j].Vis) + #10;
     for j := 0 to High(td.Meths) do
     begin
@@ -408,10 +527,10 @@ begin
         line := line + '0 ';
       { the visibility after the result type (1.0.137) }
       line := line + IntToStr(td.Meths[j].Slot) + ' ' +
-        IntToStr(td.Meths[j].NParams) + ' ' + IntToStr(td.Meths[j].RetTyp) + ' ' +
+        IntToStr(td.Meths[j].NParams) + ' ' + IfaceId(ids, td.Meths[j].RetTyp) + ' ' +
         IntToStr(td.Meths[j].Vis);
       for k := 0 to High(td.Meths[j].ParamTyps) do
-        line := line + ' ' + IntToStr(td.Meths[j].ParamTyps[k]);
+        line := line + ' ' + IfaceId(ids, td.Meths[j].ParamTyps[k]);
       for k := 0 to High(td.Meths[j].ByRef) do
         if td.Meths[j].ByRef[k] then
           line := line + ' 1'
@@ -448,7 +567,7 @@ begin
       msym := td.Props[j].WriteName;
       if msym = '' then
         msym := '_';
-      line := 'PROP ' + td.Props[j].Name + ' ' + IntToStr(td.Props[j].Typ) + ' ' +
+      line := 'PROP ' + td.Props[j].Name + ' ' + IfaceId(ids, td.Props[j].Typ) + ' ' +
         mname + ' ' + msym + ' ' + IntToStr(td.Props[j].ReadOff) + ' ' +
         IntToStr(td.Props[j].WriteOff) + ' ' + IntToStr(td.Props[j].NIndex);
       if td.Props[j].IsPublished then
@@ -473,14 +592,14 @@ begin
   for i := 0 to High(Prog.TypeNames) do
     if (i <= High(Prog.TypeIds)) and
       (Prog.TypeNames[i] <> TypeNameOf(Prog, Prog.TypeIds[i])) then
-      Result := Result + 'ALIAS ' + Prog.TypeNames[i] + ' ' + IntToStr(Prog.TypeIds[i]) + #10;
+      Result := Result + 'ALIAS ' + Prog.TypeNames[i] + ' ' + IfaceId(ids, Prog.TypeIds[i]) + #10;
   { VAR name type symbol: a global of the interface (1.0.76). An old
     loader skips the line. A name absolute gives another global goes
     with that one's symbol (P144). }
   for i := 0 to High(Prog.Vars) do
     if Prog.Vars[i].Pub and ((not Prog.Vars[i].Ext) or Prog.Vars[i].Alias) and
       (Prog.Vars[i].Sym <> '') then
-      Result := Result + 'VAR ' + Prog.Vars[i].Name + ' ' + IntToStr(Prog.Vars[i].Typ) +
+      Result := Result + 'VAR ' + Prog.Vars[i].Name + ' ' + IfaceId(ids, Prog.Vars[i].Typ) +
         ' ' + Prog.Vars[i].Sym + #10;
   for i := 0 to High(Prog.Procs) do
   begin
@@ -491,10 +610,10 @@ begin
     else
       kind := 'P';
     line := 'FUNC ' + Prog.Procs[i].Name + ' ' + Prog.Procs[i].Sym + ' ' +
-      kind + ' ' + IntToStr(Prog.Procs[i].RetTyp) + ' ' +
+      kind + ' ' + IfaceId(ids, Prog.Procs[i].RetTyp) + ' ' +
       IntToStr(Length(Prog.Procs[i].Params));
     for j := 0 to High(Prog.Procs[i].Params) do
-      line := line + ' ' + IntToStr(Prog.Procs[i].Params[j].Typ);
+      line := line + ' ' + IfaceId(ids, Prog.Procs[i].Params[j].Typ);
     for j := 0 to High(Prog.Procs[i].Params) do
       if Prog.Procs[i].Params[j].ByRef then
         line := line + ' 1'
@@ -521,8 +640,8 @@ begin
   { OPER word left right result symbol: an operator the interface
     declares (P157) }
   for i := 0 to High(Prog.Ops) do
-    Result := Result + 'OPER ' + OpWord(Prog.Ops[i].Op) + ' ' + IntToStr(Prog.Ops[i].LTyp) + ' ' +
-      IntToStr(Prog.Ops[i].RTyp) + ' ' + IntToStr(Prog.Ops[i].Ret) + ' ' + Prog.Ops[i].Sym + #10;
+    Result := Result + 'OPER ' + OpWord(Prog.Ops[i].Op) + ' ' + IfaceId(ids, Prog.Ops[i].LTyp) + ' ' +
+      IfaceId(ids, Prog.Ops[i].RTyp) + ' ' + IfaceId(ids, Prog.Ops[i].Ret) + ' ' + Prog.Ops[i].Sym + #10;
   { CONV implicit|explicit from to symbol: a conversion the interface
     declares (P171) }
   for i := 0 to High(Prog.Convs) do
@@ -531,17 +650,23 @@ begin
       Result := Result + 'CONV explicit '
     else
       Result := Result + 'CONV implicit ';
-    Result := Result + IntToStr(Prog.Convs[i].FromTyp) + ' ' + IntToStr(Prog.Convs[i].ToTyp) + ' ' +
+    Result := Result + IfaceId(ids, Prog.Convs[i].FromTyp) + ' ' + IfaceId(ids, Prog.Convs[i].ToTyp) + ' ' +
       Prog.Convs[i].Sym + #10;
   end;
   { UNOP word type result symbol: an operator of one operand the
     interface declares (P381) }
   for i := 0 to High(Prog.UnOps) do
-    Result := Result + 'UNOP ' + Prog.UnOps[i].OpW + ' ' + IntToStr(Prog.UnOps[i].Typ) + ' ' +
-      IntToStr(Prog.UnOps[i].Ret) + ' ' + Prog.UnOps[i].Sym + #10;
+    Result := Result + 'UNOP ' + Prog.UnOps[i].OpW + ' ' + IfaceId(ids, Prog.UnOps[i].Typ) + ' ' +
+      IfaceId(ids, Prog.UnOps[i].Ret) + ' ' + Prog.UnOps[i].Sym + #10;
 end;
 
-{ PASLANGI35 (1.2.400, P590): tagged, framed scoped symbols replace
+{ PASLANGI36 (1.2.402, P462): USE records only interface dependencies;
+  private LINK records follow the body, outside SUM, and public type ids
+  cover the interface graph, excluding private imports and body locals.
+  Public bindings complete before private links. DEP records direct source
+  and implicit core dependencies, never the compiling unit; each imported
+  interface validates its own dependencies after the private walk drains.
+  PASLANGI35 (1.2.400, P590): tagged, framed scoped symbols replace
   underscore joins. Fields remain opaque; every earlier .pi/.o must be
   rebuilt, including core and library units.
   PASLANGI34 (1.1.274, P460): a type another unit's .pi brought in has an
@@ -648,7 +773,9 @@ begin
   for i := 0 to High(Prog.DepNames) do
     if i <= High(Prog.DepSums) then
       deps := deps + 'DEP ' + ToLower(Prog.DepNames[i]) + ' ' + Prog.DepSums[i] + #10;
-  Result := 'PASLANGI35' + #10 + 'SUM ' + HashHex(body) + #10 + body + deps;
+  for i := Prog.IfaceUses to High(Prog.UsesNames) do
+    deps := deps + 'LINK ' + ToLower(Prog.UsesNames[i]) + #10;
+  Result := 'PASLANGI36' + #10 + 'SUM ' + HashHex(body) + #10 + body + deps;
 end;
 
 function ParseIface(const Data: string; out Iface: TUnitIface): Boolean;
@@ -673,16 +800,17 @@ begin
   parts := nil;
   p := 1;
   line := LineOf(Data, p);
-  if line <> 'PASLANGI35' then
+  if line <> 'PASLANGI36' then
     Exit;
   line := LineOf(Data, p);
   SplitWs(line, parts);
   if (Length(parts) <> 2) or (parts[0] <> 'SUM') then
     Exit;
   Iface.Checksum := parts[1];
-  { The body ends where the DEP lines start. }
+  { The body ends where the DEP or private LINK records start. }
   dp := p;
-  while (dp <= Length(Data)) and (Copy(Data, dp, 4) <> 'DEP ') do
+  while (dp <= Length(Data)) and (Copy(Data, dp, 4) <> 'DEP ') and
+    (Copy(Data, dp, 5) <> 'LINK ') do
   begin
     while (dp <= Length(Data)) and (Data[dp] <> #10) do
       Inc(dp);
@@ -1019,6 +1147,12 @@ begin
       n := Length(Iface.UsesNames);
       SetLength(Iface.UsesNames, n + 1);
       Iface.UsesNames[n] := parts[1];
+    end
+    else if (parts[0] = 'LINK') and (Length(parts) = 2) then
+    begin
+      n := Length(Iface.LinkNames);
+      SetLength(Iface.LinkNames, n + 1);
+      Iface.LinkNames[n] := parts[1];
     end
     else if (parts[0] = 'VAR') and (Length(parts) = 4) then
     begin

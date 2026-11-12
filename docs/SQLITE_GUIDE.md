@@ -476,7 +476,7 @@ you: `PageSize`, `PageCount`, `Encoding`, `UserVersion` and `SchemaCookie`.
   into a file, and a database as a string of bytes. }
 program sqlfile;
 
-uses sqlite, sysutils;
+uses paslib, sqlite, sysutils;
 
 var
   dir, path, second: string;
@@ -785,7 +785,7 @@ mark of a reader, so a reader that keeps a transaction open holds the log back.
   the file, and what the log leaves on the disk. }
 program sqlwal;
 
-uses sqlite, sysutils;
+uses paslib, sqlite, sysutils;
 
 var
   dir, path: string;
@@ -966,7 +966,7 @@ reads the value so far with `xValue`.
   collation, the order of a text. }
 program sqlfunc;
 
-uses sqlite;
+uses paslib, sqlite;
 
 type
   { an aggregate's state: SQLite keeps one for each group, as an object }

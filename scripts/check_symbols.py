@@ -94,7 +94,7 @@ def constructors(output):
 save()
 try:
     out, _ = run('help-format', [compiler, '--help', 'lang'], work)
-    assert b'only PASLANGI35 loads' in out and b'only PASLANGI13' not in out
+    assert b'only PASLANGI36 loads' in out and b'only PASLANGI13' not in out
     for target, cpu in [('amd64', 'base'), ('amd64', 'native'),
                         ('arm64', 'base'), ('arm64', 'max')]:
         core = build / ('a64' if target == 'arm64' else '')
@@ -107,7 +107,7 @@ try:
             for unit in ('a', 'a_b', 'types_a', 'types_a_b', 'bridge', 'p_owner', 'classns'):
                 run(tag + '-' + unit, [compiler, *flags, '-c', '-o', folder / unit,
                                       fixtures / (unit + '.paslang')], folder)
-            assert (folder / 'a.pi').read_bytes().startswith(b'PASLANGI35\n')
+            assert (folder / 'a.pi').read_bytes().startswith(b'PASLANGI36\n')
             # A raw assembler reference is a consumer of the generated ABI.
             # This fixture forges a source PC while faulting inside assembly.
             raw = folder / 'raw-asm'
@@ -138,11 +138,12 @@ try:
                 _, err = run(tag + '-' + name + '-reject', [compiler, *flags, '-c', '-o', folder / name,
                                                            fixtures / (name + '.paslang')], folder, code=1)
                 assert message in err.lower(), (name, err)
-            for generation, message in [(34, b'older than 1.2.400'), (36, b'newer paslang (PASLANGI36)')]:
+            for generation, message in [(34, b'older than 1.2.400'), (35, b'older than 1.2.402'),
+                                        (37, b'newer paslang (PASLANGI37)')]:
                 stale = folder / ('format-' + str(generation))
                 stale.mkdir()
                 data = (folder / 'a.pi').read_bytes()
-                (stale / 'a.pi').write_bytes(data.replace(b'PASLANGI35\n', f'PASLANGI{generation}\n'.encode(), 1))
+                (stale / 'a.pi').write_bytes(data.replace(b'PASLANGI36\n', f'PASLANGI{generation}\n'.encode(), 1))
                 (stale / 'a.o').write_bytes((folder / 'a.o').read_bytes())
                 _, err = run(tag + '-format-' + str(generation), [compiler, '-target', target, '-cpu', cpu,
                     '-Fu', stale, '-Fu', core, '-o', stale / 'probe', fixtures / 'programsplit.paslang'],

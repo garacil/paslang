@@ -111,6 +111,13 @@ type
     Nest: LongInt;     { the depth of the routine that names it, 0 at the top (P159) }
   end;
 
+  { Only dependency names/sums survive the public import, not the parsed
+    interface's complete type table (P462). }
+  TUnitCheck = record
+    Name, Path: string;
+    Names, Sums: TStrArray;
+  end;
+
   TParser = class
   private
     FSafe: Boolean;         { the code being read is safe: no raw pointer work (P102) }
@@ -219,6 +226,12 @@ type
     FLoadedSum: TStrArray;
     FLinkOnly: TStrArray;   { units loaded to be linked, their names not read (1.0.114) }  { the interface checksum of each loaded unit }
     FLoading: TStrArray;
+    FLoadDepth: SizeInt;
+    FDrainingLinks: Boolean;
+    FPrivateUnits: TStrArray;
+    FPrivateN: SizeInt;
+    FUnitChecks: array of TUnitCheck;
+    FUnitCheckN: SizeInt;
     FLinkObjs: TStrArray;
     FUsesNames: TStrArray;
     FCoreMap: Boolean;
@@ -336,6 +349,8 @@ type
     function UnitSum(const AName: string): string;
     procedure LoadUnit(const AName: string; LinkOnly: Boolean);
     procedure LoadUnitBody(const AName: string; LinkOnly: Boolean);
+    procedure QueueUnitDeps(const Iface: TUnitIface; const AName, Path: string);
+    procedure DrainUnitDeps;
     procedure AddReserved(const Words: string);
     function CmpName(const A, B: string): LongInt;
     procedure InitReserved;
@@ -828,6 +843,12 @@ begin
   FLoadedSum := nil;
   FLinkOnly := nil;
   FLoading := nil;
+  FLoadDepth := 0;
+  FDrainingLinks := False;
+  FPrivateUnits := nil;
+  FPrivateN := 0;
+  FUnitChecks := nil;
+  FUnitCheckN := 0;
   FLinkObjs := nil;
   FUsesNames := nil;
   FCoreNames := nil;
@@ -19915,16 +19936,20 @@ var
 begin
   was := FNameCheck;
   FNameCheck := False;
+  FLoadDepth := FLoadDepth + 1;
   try
     LoadUnitBody(AName, LinkOnly);
   finally
+    FLoadDepth := FLoadDepth - 1;
     FNameCheck := was;
   end;
+  if (FLoadDepth = 0) and not FDrainingLinks then
+    DrainUnitDeps;
 end;
 
 procedure TParser.LoadUnitBody(const AName: string; LinkOnly: Boolean);
 var
-  path, data, sum: string;
+  path, data: string;
   iface: TUnitIface;
   i, j, n, k: SizeInt;
   pr: TProc;
@@ -19932,6 +19957,11 @@ var
   own: Char;
   callUnit: LongInt;
 begin
+  { Source interfaces are part of the public import walk too. A prior
+    compiled copy of this unit must not hide a new all-public cycle.
+    A private queue walk has already crossed an implementation edge. }
+  if FIsUnit and not FInImpl and not FDrainingLinks and SameId(AName, FUnitName) then
+    Refuse('circular uses in interface: ' + AName);
   { A unit linked before without its names (LoadCore links pasquad into
     everything) that a uses clause now asks for is read again for its
     names; its object is linked once (1.0.114). }
@@ -19946,11 +19976,7 @@ begin
   { A unit stays in FLoading once it began: one read again for its names
     is no circle. }
   if (not again) and HasStr(FLoading, AName) then
-  begin
-    if not FInImpl then
-      Refuse('circular uses in interface: ' + AName);
-    Exit;
-  end;
+    Refuse('circular uses in interface: ' + AName);
   path := FindPi(AName);
   if path = '' then
     Refuse('unit not compiled: ' + AName + ' (need ' + ToLower(AName) + '.pi)');
@@ -20093,23 +20119,17 @@ begin
   { P590: scoped symbols require a complete rebuild of earlier units. }
   if Copy(data, 1, 11) = 'PASLANGI34' + #10 then
     Refuse(path + ' was compiled by a paslang older than 1.2.400; compile ' + AName + ' again');
-  if (Copy(data, 1, 8) = 'PASLANGI') and (Copy(data, 1, 11) <> 'PASLANGI35' + #10) then
+  { P462 separates public USE and private LINK dependencies. }
+  if Copy(data, 1, 11) = 'PASLANGI35' + #10 then
+    Refuse(path + ' was compiled by a paslang older than 1.2.402; compile ' + AName + ' again');
+  if (Copy(data, 1, 8) = 'PASLANGI') and (Copy(data, 1, 11) <> 'PASLANGI36' + #10) then
     Refuse(path + ' was compiled by a newer paslang (' + FirstLine(data) +
       '); compile ' + AName + ' again with this one');
   if not ParseIface(data, iface) then
     Refuse('bad compiled interface ' + path);
   AppendStr(FLoading, AName);
   for i := 0 to High(iface.UsesNames) do
-    LoadUnit(iface.UsesNames[i], False);
-  { A unit compiled against another version of a unit it saw would bring
-    that version's types (1.0.49). }
-  for i := 0 to High(iface.DepNames) do
-  begin
-    sum := UnitSum(iface.DepNames[i]);
-    if (sum <> '') and (i <= High(iface.DepSums)) and (sum <> iface.DepSums[i]) then
-      Refuse(path + ' was compiled against another ' + iface.DepNames[i] +
-        '.pi; compile ' + AName + ' again');
-  end;
+    LoadUnit(iface.UsesNames[i], LinkOnly);
   { Complete symbols of the interface, even when no source names are
     imported (pasmap, pasheap and pasquad are linked that way).
     A file found under another unit's name establishes no trust. }
@@ -20125,6 +20145,7 @@ begin
     AppendStr(FLoadedSum, iface.Checksum);
     AppendStr(FLinkObjs, UnitObj(path));
     AppendStr(FLinkOnly, AName);
+    QueueUnitDeps(iface, AName, path);
     Exit;
   end;
   FImporting := FImporting + 1;
@@ -20299,6 +20320,70 @@ begin
     AppendStr(FLoaded, AName);
     AppendStr(FLoadedSum, iface.Checksum);
     AppendStr(FLinkObjs, UnitObj(path));
+  end;
+  QueueUnitDeps(iface, AName, path);
+end;
+
+{ Pascal Reference16.4 permits any cycle with an implementation edge.
+  Complete the entire public import stack before traversing private links:
+  A USE B, B LINK C, C USE A must not visit C while A is still importing.
+  Go's srcimporter.go and go/types/package.go scope distinction is
+  the state reference; Pascal's implementation-cycle policy is our own. }
+procedure TParser.QueueUnitDeps(const Iface: TUnitIface; const AName, Path: string);
+var
+  i: SizeInt;
+begin
+  for i := 0 to High(Iface.LinkNames) do
+  begin
+    if FPrivateN = Length(FPrivateUnits) then
+      SetLength(FPrivateUnits, FPrivateN * 2 + 8);
+    FPrivateUnits[FPrivateN] := Iface.LinkNames[i];
+    FPrivateN := FPrivateN + 1;
+  end;
+  if FUnitCheckN = Length(FUnitChecks) then
+    SetLength(FUnitChecks, FUnitCheckN * 2 + 8);
+  FUnitChecks[FUnitCheckN].Name := AName;
+  FUnitChecks[FUnitCheckN].Path := Path;
+  FUnitChecks[FUnitCheckN].Names := Iface.DepNames;
+  FUnitChecks[FUnitCheckN].Sums := Iface.DepSums;
+  FUnitCheckN := FUnitCheckN + 1;
+end;
+
+procedure TParser.DrainUnitDeps;
+var
+  i, j: SizeInt;
+  name, sum: string;
+begin
+  if (FPrivateN = 0) and (FUnitCheckN = 0) then
+    Exit;
+  FDrainingLinks := True;
+  try
+    i := 0;
+    while i < FPrivateN do
+    begin
+      { Loading another interface may grow the queue. Keep a value, not
+        a reference into the array that SetLength can move. }
+      name := FPrivateUnits[i];
+      LoadUnit(name, True);
+      i := i + 1;
+    end;
+    { Every private object is now present too: a missing dependency must
+      not disappear behind UnitSum's empty result. }
+    for i := 0 to FUnitCheckN - 1 do
+      for j := 0 to High(FUnitChecks[i].Names) do
+      begin
+        sum := UnitSum(FUnitChecks[i].Names[j]);
+        if (sum = '') or (j > High(FUnitChecks[i].Sums)) or
+          (sum <> FUnitChecks[i].Sums[j]) then
+          Refuse(FUnitChecks[i].Path + ' was compiled against another ' +
+            FUnitChecks[i].Names[j] + '.pi; compile ' + FUnitChecks[i].Name + ' again');
+      end;
+    FPrivateUnits := nil;
+    FPrivateN := 0;
+    FUnitChecks := nil;
+    FUnitCheckN := 0;
+  finally
+    FDrainingLinks := False;
   end;
 end;
 
@@ -28034,6 +28119,7 @@ begin
   Eat(tkImplementation);
   FInImpl := True;
   FProg.IfaceTypes := LongInt(Length(FTypes));
+  FProg.IfaceUses := Length(FUsesNames);
   if FTok.Kind = tkUses then
     ParseUses;
   ParseDecls(True);
@@ -28135,6 +28221,7 @@ var
   lex: TLexer;
   p: TParser;
   m: TProgram;
+  i: SizeInt;
 begin
   lex := TLexer.Create(Src);
   lex.SetTarget(Arm);
@@ -28168,8 +28255,31 @@ begin
     m.CpuSet := CpuSet;
     m.CpuTune := CpuTune;
     m.LinkObjs := p.FLinkObjs;
-    m.DepNames := p.FLoaded;
-    m.DepSums := p.FLoadedSum;
+    if m.IsUnit then
+    begin
+      { Record this source's edges, plus its implicit core dependencies.
+        Each imported unit validates its own edges after the private walk
+        drains. Go go/types/package.go SetImports and noder/writer.go
+        pkgIdx likewise retain per-package import edges. Recording an old
+        copy of ourselves and all its private dependencies here made a
+        removed private import persist through a legal unit cycle. }
+      m.DepNames := nil;
+      m.DepSums := nil;
+      for i := 0 to High(p.FLoaded) do
+        if not p.SameId(p.FLoaded[i], m.Name) and
+          (p.HasStr(m.UsesNames, p.FLoaded[i]) or p.IsCoreUnit(p.FLoaded[i])) then
+        begin
+          if i > High(p.FLoadedSum) then
+            p.Refuse('missing interface checksum for ' + p.FLoaded[i]);
+          p.AppendStr(m.DepNames, p.FLoaded[i]);
+          p.AppendStr(m.DepSums, p.FLoadedSum[i]);
+        end;
+    end
+    else
+    begin
+      m.DepNames := p.FLoaded;
+      m.DepSums := p.FLoadedSum;
+    end;
     m.Safe := p.FSafeAll;
     Result := m;
   finally

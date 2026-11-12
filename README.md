@@ -184,11 +184,18 @@ installing the compiler does not require it.
 `make check` runs the golden programs, manual examples, server self-tests,
 compiler self-reproduction and arm64 checks under QEMU.
 
-Compiled units use `PASLANGI35`. Rebuild application and library `.pi`/`.o`
+Compiled units use `PASLANGI36`. Rebuild application and library `.pi`/`.o`
 files made with an earlier format; the compiler names the unit to rebuild.
 Update direct inline-assembly references to generated linker names as well.
 Scoped routine, class and helper names remain distinct even where their
 underscores would otherwise join, with no additional runtime dependency.
+
+Compiled interfaces distinguish interface imports from private implementation
+dependencies. A unit cycle is permitted when it includes an implementation
+edge; a cycle made entirely of interface imports is a compile error. Private
+dependencies are linked and initialized without importing their names.
+Each unit records its direct and implicit core dependency checksums;
+transitive dependencies remain checked through their defining units.
 
 ## Binary packages
 

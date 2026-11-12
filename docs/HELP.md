@@ -61,7 +61,7 @@ the ones the compiler implements. A form that is not listed under
 | types | Integer and real widths, checked four-place `Currency`, strings, slices, records, sets, channels, maps, JSON, method and interface values, and the pointer operations allowed by `safe` |
 | lang | statements, units, classes, channels, a hello program |
 | runtime | pasroutines, stack growth, asynchronous and cooperative preemption, the collector, checked failures, `Syscall`, atomics, RTTI and scheduler operations |
-| lib | the eleven core units and installed libraries for SysUtils, time, networking, TLS, cryptography, text codecs, HTML and XML |
+| lib | the core units and installed libraries for SysUtils, time, networking, TLS, cryptography, text codecs, HTML and XML |
 | limits | forms the compiler does not accept or treats otherwise than another Pascal, and the reserved words |
 | examples | commands that compile and run |
 | all | every section above, after the index |
@@ -71,7 +71,7 @@ The [core and library chapter](MANUAL.md#16-the-core-library-and-pasnet)
 covers additional libraries, and the [SQLite guide](SQLITE_GUIDE.md)
 walks through the database API.
 
-Compiled interfaces currently use `PASLANGI35`, as `--help lang` reports.
+Compiled interfaces currently use `PASLANGI36`, as `--help lang` reports.
 Rebuild older `.pi` and `.o` files together, including library CPU variants.
 The loader rejects an older format or a changed dependency checksum and
 names the unit to compile again. Scope components keep underscored unit,

@@ -1297,6 +1297,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	python3 -I scripts/check_unit_life.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64); \
 	python3 -I scripts/check_symbols.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64); \
 	python3 -I scripts/check_class_values.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64); \
+	python3 -I scripts/check_unit_cycles.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64); \
 	echo ok unit-life
 	@set -e; \
 	: P589: exact declaration provenance preserves value snapshots and the existing core borrowing contract; \
@@ -4714,7 +4715,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(OUTDIR)/paslangc testdata/units/dbl.paslang; \
 	test -f $(BUILDDIR)/adder.pi; \
 	test -f $(BUILDDIR)/dbl.pi; \
-	grep -q PASLANGI35 $(BUILDDIR)/adder.pi; \
+	grep -q PASLANGI36 $(BUILDDIR)/adder.pi; \
 	$(OUTDIR)/paslangc testdata/units/quadimpl.paslang; \
 	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/quadimplmain testdata/quadimpl.paslang; \
 	$(BUILDDIR)/quadimplmain > $(BUILDDIR)/quadimpl.got; \
@@ -4886,16 +4887,12 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/hideab-arm testdata/units/hideab.paslang; \
 	timeout 60 $(QEMU_A64) $(BUILDDIR)/hideab-arm > $(BUILDDIR)/hideab-arm.got; \
 	diff -u testdata/units/hideab.out $(BUILDDIR)/hideab-arm.got; \
-	: a unit .pi holds each type once, however long the chain of units before it: the eighth of a chain under twice the first, where it was 132 times, P460; \
+	: public types and origins occur once in a unit chain and private SysUtils stays excluded, P460 P462; \
 	for i in 1 2 3 4 5 6 7 8; do \
 	  $(OUTDIR)/paslangc -Fu $(BUILDDIR) testdata/units/pichain$$i.paslang; \
 	  $(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) testdata/units/pichain$$i.paslang; \
 	done; \
-	for d in $(BUILDDIR) $(A64DIR); do \
-	  a=$$(wc -c < $$d/pichain1.pi); z=$$(wc -c < $$d/pichain8.pi); \
-	  if [ $$z -ge $$((2 * a)) ]; then echo "$$d/pichain8.pi has $$z bytes, pichain1.pi $$a: a .pi grows along a chain of units"; exit 1; fi; \
-	  if [ $$(grep -c '^TYPE TSysError ' $$d/pichain8.pi) -ne 1 ]; then echo "$$d/pichain8.pi holds TSysError more than once"; exit 1; fi; \
-	done; \
+	python3 -I scripts/check_pi_chain.py $(BUILDDIR) $(A64DIR); \
 	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/pichainuse testdata/units/pichainuse.paslang; \
 	$(BUILDDIR)/pichainuse > $(BUILDDIR)/pichainuse.got; \
 	diff -u testdata/units/pichainuse.out $(BUILDDIR)/pichainuse.got; \
@@ -5162,180 +5159,183 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(BUILDDIR)/twiceuse > $(BUILDDIR)/twiceuse.got; \
 	diff -u testdata/units/twiceuse.out $(BUILDDIR)/twiceuse.got; \
 	rm -rf $(BUILDDIR)/oldpi; mkdir -p $(BUILDDIR)/oldpi; \
-	sed '1s/PASLANGI35/PASLANGI1/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI36/PASLANGI1/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	cp $(BUILDDIR)/dbl.o $(BUILDDIR)/oldpi/; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.0.49 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.0.49; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI35/PASLANGI2/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI36/PASLANGI2/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.0.55 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.0.55; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI35/PASLANGI3/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI36/PASLANGI3/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.0.58 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.0.58; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI35/PASLANGI4/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI36/PASLANGI4/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.0.87 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.0.87; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI35/PASLANGI5/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI36/PASLANGI5/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.0.91 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.0.91; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI35/PASLANGI6/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI36/PASLANGI6/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.0.104 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.0.104; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI35/PASLANGI7/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI36/PASLANGI7/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.0.108 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.0.108; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI35/PASLANGI8/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI36/PASLANGI8/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.0.110 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.0.110; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI35/PASLANGI9/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI36/PASLANGI9/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.0.114 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.0.114; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI35/PASLANGI10/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI36/PASLANGI10/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.0.125 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.0.125; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI35/PASLANGI11/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI36/PASLANGI11/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.0.133 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.0.133; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI35/PASLANGI12/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI36/PASLANGI12/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.0.137 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.0.137; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI35/PASLANGI13/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI36/PASLANGI13/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.1.2 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.1.2; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI35/PASLANGI14/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI36/PASLANGI14/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.1.4 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.1.4; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI35/PASLANGI15/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI36/PASLANGI15/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.1.6 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.1.6; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI35/PASLANGI16/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI36/PASLANGI16/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.1.7 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.1.7; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI35/PASLANGI17/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI36/PASLANGI17/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.1.8 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.1.8; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI35/PASLANGI18/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI36/PASLANGI18/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.1.9 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.1.9; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI35/PASLANGI19/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI36/PASLANGI19/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.1.28 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.1.28; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI35/PASLANGI20/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI36/PASLANGI20/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from before 1.1.37 should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.1.37; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI35/PASLANGI21/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI36/PASLANGI21/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface without nested namespaces should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.1.44; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI35/PASLANGI22/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI36/PASLANGI22/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface without generic instance identity should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.1.47; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI35/PASLANGI23/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI36/PASLANGI23/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface without all type aliases should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.1.48; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI35/PASLANGI24/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI36/PASLANGI24/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface without Currency builtin identity should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.1.79; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI35/PASLANGI25/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI36/PASLANGI25/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface without the json type should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.1.124; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI35/PASLANGI26/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI36/PASLANGI26/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface without json directives should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.1.131; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI35/PASLANGI27/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI36/PASLANGI27/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface whose routines return blocks without a buffer should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.1.213; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI35/PASLANGI28/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI36/PASLANGI28/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface whose small blocks come back through a buffer should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.1.217; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI35/PASLANGI29/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI36/PASLANGI29/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface that does not carry its operators should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.1.230; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI35/PASLANGI30/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI36/PASLANGI30/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface that does not carry its records conversions should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.1.233; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI35/PASLANGI31/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI36/PASLANGI31/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface that does not carry its operators of one operand should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.1.234; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI35/PASLANGI32/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI36/PASLANGI32/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface whose object keeps its plain code maps in plain sections should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.1.244; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI35/PASLANGI33/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI36/PASLANGI33/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface whose types come again in each unit that reads it should be refused'; exit 1; \
 	fi; \
 	grep -q 'compiled by a paslang older than 1.1.274; compile dbl again' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI35/PASLANGI36/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	sed '1s/PASLANGI36/PASLANGI37/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then \
 	  echo 'an interface from a later paslang should be refused'; exit 1; \
 	fi; \
-	grep -q 'was compiled by a newer paslang (PASLANGI36); compile dbl again with this one' $(BUILDDIR)/oldpi.err; \
-	sed '1s/PASLANGI35/PASLANGI34/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	grep -q 'was compiled by a newer paslang (PASLANGI37); compile dbl again with this one' $(BUILDDIR)/oldpi.err; \
+	sed '1s/PASLANGI36/PASLANGI34/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then echo 'old pi 34 accepted'; exit 1; fi; \
 	grep -q 'was compiled by a paslang older than 1.2.400; compile dbl again' $(BUILDDIR)/oldpi.err; \
+	sed '1s/PASLANGI36/PASLANGI35/' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
+	if $(OUTDIR)/paslangc -Fu $(BUILDDIR)/oldpi -o $(BUILDDIR)/oldpiuse testdata/units/main.paslang > $(BUILDDIR)/oldpi.err 2>&1; then echo 'old pi 35 accepted'; exit 1; fi; \
+	grep -q 'was compiled by a paslang older than 1.2.402; compile dbl again' $(BUILDDIR)/oldpi.err; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/pisum testdata/units/pisum.paslang; \
 	sed 's/^TYPE Byte 6 1 1 /TYPE Byte 6 1 4 /' $(BUILDDIR)/dbl.pi > $(BUILDDIR)/oldpi/dbl.pi; \
 	$(BUILDDIR)/pisum $(BUILDDIR)/oldpi/dbl.pi; \
