@@ -19,27 +19,38 @@ def main():
     if len(sys.argv) < 2:
         raise SystemExit("usage: check_nextjump.py file.s...")
     bad = []
+    bad_count = 0
     jumps = 0
+    jump = re.compile(r"^  (jmp|b) (\.L[0-9A-Za-z_]+)$")
+    label = re.compile(r"^\.L[0-9A-Za-z_]+:$")
     for path in sys.argv[1:]:
-        lines = [l.rstrip("\n") for l in open(path)]
-        for i, line in enumerate(lines):
-            m = re.match(r"^  (jmp|b) (\.L[0-9A-Za-z_]+)$", line)
-            if not m:
-                continue
-            jumps += 1
-            target = m.group(2)
-            for x in lines[i + 1:]:
-                if re.match(r"^\.L[0-9A-Za-z_]+:$", x):
-                    if x[:-1] == target:
-                        bad.append(f"{path}:{i + 1}: {line.strip()}")
-                        break
-                    continue
-                if x.startswith("  .loc ") or x.startswith("  .cfi_") or x == "":
-                    continue
-                break
+        # A real instruction ends the previous jump's lookahead. Keep
+        # only that jump while streaming labels and metadata, and at
+        # most the first 20 diagnostics. No file or tail list is needed.
+        target = None
+        with open(path) as source:
+            for line_no, line in enumerate(source, 1):
+                line = line.rstrip("\n")
+                if target is not None:
+                    if label.match(line):
+                        if line[:-1] == target:
+                            bad_count += 1
+                            if len(bad) < 20:
+                                bad.append(f"{path}:{pending_no}: {pending_line.strip()}")
+                            target = None
+                        continue
+                    if line.startswith("  .loc ") or line.startswith("  .cfi_") or line == "":
+                        continue
+                    target = None
+                match = jump.match(line)
+                if match:
+                    jumps += 1
+                    target = match.group(2)
+                    pending_no = line_no
+                    pending_line = line
     if bad:
-        raise SystemExit("a jump to the next instruction: " + "; ".join(bad[:20]) +
-                         (f"; and {len(bad) - 20} more" if len(bad) > 20 else ""))
+        raise SystemExit("a jump to the next instruction: " + "; ".join(bad) +
+                         (f"; and {bad_count - 20} more" if bad_count > 20 else ""))
     print(f"check_nextjump: {jumps} jumps in {len(sys.argv) - 1} files, none to the next instruction")
 
 
