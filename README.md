@@ -215,7 +215,14 @@ before replacing a partial reference directory. These files are test
 inputs; building and installing the compiler does not require them.
 
 `make check` runs the golden programs, manual examples, server self-tests,
-compiler self-reproduction and arm64 checks under QEMU.
+compiler self-reproduction and arm64 checks under QEMU. The check targets
+preserve the prepared SDK's base objects and optimized CPU-level variants;
+they verify their contents and variant freshness before returning.
+
+`make installcheck` also compiles a base-target client outside the source
+tree and checks long environment-variable names through the installed SDK.
+It clears inherited `PASLANG_LIB` overrides and verifies the linked unit
+paths. Release checks apply the same test to every packaged SDK.
 
 Compiled units use `PASLANGI36`. Rebuild application and library `.pi`/`.o`
 files made with an earlier format; the compiler names the unit to rebuild.
@@ -276,8 +283,9 @@ Arch).
 On an amd64 release build with `--enable-arm64`, run `make manual` and
 `make check-release` after `make check` has built the patched QEMU.
 `make check-release` builds all ten packages and archives plus `SHA256SUMS`
-in `build/pkg/release`. It verifies their contents, recompiles and runs
-examples with both relocated compilers, and exercises the packaged
+in `build/pkg/release`. It verifies their contents and SDK resolution,
+checks base-target environment lookups in every package, recompiles and
+runs examples with both relocated compilers, and exercises the packaged
 debuggers, including Cortex-A53 emulation. The packaging and validation
 tools include `dpkg-deb`, `rpmbuild`, `makepkg`, `fakeroot`, `bsdtar`
 and `rpm2cpio`.

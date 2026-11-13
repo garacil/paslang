@@ -106,7 +106,7 @@ def control(name,target,work):
         "while not Path("+repr(str(marker))+").exists() and time.monotonic()<limit:time.sleep(.001)\n"
         "print('ready',flush=True)\n")
     sender=None;old=None
-    if name=='success':
+    if name in ('success','shutdown-signals'):
         program="import sys;sys.stdout.buffer.write(b'complete\\n\\xff\\n')"
     elif name=='nonzero':
         program="import sys;sys.stderr.write('diagnostic\\n');raise SystemExit(7)"
@@ -116,6 +116,16 @@ def control(name,target,work):
         program=spawn
     else:raise ValueError(name)
     module=target
+    if name=='shutdown-signals':
+        content=Path(target).read_text()
+        anchor=' return 0\n\n\ndef unfinished_scope(folder):'
+        injected=(' os.kill(os.getpid(),signal.SIGINT)\n'
+                  ' os.kill(os.getpid(),signal.SIGTERM)\n'
+                  ' assert {signal.SIGINT,signal.SIGTERM} <= signal.sigpending()\n'
+                  +anchor)
+        require(content.count(anchor)==1,'actual worker return anchor changed')
+        module=work/'worker_shutdown_control.py';module.write_text(content.replace(anchor,injected))
+        scope=load(module)
     if name in ('unresponsive','failed-cleanup','raised-cleanup'):
         content=Path(target).read_text()
         anchor="    cleanup=_drain_owned(request['cleanup_timeout'])"
@@ -137,17 +147,22 @@ def control(name,target,work):
                      " os.kill("+str(os.getpid())+",signal.SIGINT);time.sleep(.005)\n")
         sender=subprocess.Popen([sys.executable,'-c',sender_code])
     unrelated=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'])
+    caller_mask=signal.pthread_sigmask(signal.SIG_BLOCK,[])
+    caller_handlers={sig:signal.getsignal(sig) for sig in (signal.SIGINT,signal.SIGTERM)}
     started=time.monotonic()
     try:
         result=scope.invoke([sys.executable,'-c',program],work/'invocation',work,environment,
-                            .25 if name not in ('success','nonzero') else 3,
+                            .25 if name not in ('success','nonzero','shutdown-signals') else 3,
                             grace=.1,cleanup_timeout=1)
         if sender is not None:sender.wait(timeout=3)
+        require(signal.pthread_sigmask(signal.SIG_BLOCK,[])==caller_mask
+                and all(signal.getsignal(sig)==handler for sig,handler in caller_handlers.items()),
+                'invocation changed caller signal mask or handlers')
         require(unrelated.poll() is None,'unrelated caller child was consumed or killed')
         require(time.monotonic()-started<8,'real metadata command exceeded cleanup bound')
         require(not (work/'invocation'/'supervisor-stderr').read_bytes(),
                 'scope supervisor emitted unexpected diagnostics')
-        if name=='success':
+        if name in ('success','shutdown-signals'):
             require(result['status']==0 and result['cleanup']['ok'],'successful command failed')
             require((work/'invocation'/'stdout').read_bytes()==b'complete\n\xff\n',
                     'full byte output was not preserved')
@@ -187,7 +202,7 @@ def main():
         print(json.dumps(result));return
     guard=load(HERE/'metadata_scope.py')
     source=(HERE/'metadata_scope.py').read_text()
-    modes=('ready-stream','child-stream','no-children','success','nonzero','timeout','signals',
+    modes=('ready-stream','child-stream','no-children','success','nonzero','timeout','signals','shutdown-signals',
            'unresponsive','failed-cleanup','raised-cleanup','root-gone','cache-env','finite-cleanup')
     with tempfile.TemporaryDirectory(prefix='paslang-metadata-scope-') as scratch:
         root=Path(scratch)
@@ -205,6 +220,9 @@ def main():
             result,error=invoke(name,HERE/'metadata_scope.py','positive-'+name)
             require(result['program_status']==0,'positive '+name+' failed: '+json.dumps(result)+' '+error)
         mutations=(
+            ('shutdown-mask','shutdown-signals',
+             "  signal.pthread_sigmask(signal.SIG_BLOCK,{signal.SIGINT,signal.SIGTERM})\n",
+             ""),
             ('ready-deadline','ready-stream',
              "  while True:\n   if expired():return incomplete()\n   try:pid,status=os.waitpid(-1,os.WNOHANG)",
              "  while True:\n   try:pid,status=os.waitpid(-1,os.WNOHANG)"),
@@ -234,7 +252,7 @@ def main():
             result,error=invoke(mode,path,'mutant-'+name)
             require(result['program_status']!=0 and 'metadata scope control:' in error,
                     'actual-source mutant was not caught by its intended oracle: '+name+' '+json.dumps(result)+' '+error)
-    print('check_metadata_scope: thirteen compiler-free groups; seven actual-source mutants; '
+    print('check_metadata_scope: fourteen compiler-free groups; eight actual-source mutants; '
           'full byte output/status; bounded ready streams; detached timeout/signal/forced cleanup; '
           'supervisor reap, caller signals and unrelated children')
 

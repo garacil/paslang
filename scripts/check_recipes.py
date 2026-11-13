@@ -8,8 +8,46 @@ import subprocess
 from pathlib import Path
 
 
+def sdk_units(lines):
+    units = set()
+    for index, line in enumerate(lines):
+        if re.match(r'^(?:CORE_UNITS|LIB_UNITS)\s*:?=', line):
+            block = line
+            while line.endswith('\\'):
+                index += 1
+                line = lines[index]
+                block += ' ' + line
+            units.update(re.findall(r'src/(?:lib|rtl)/(\w+)\.paslang', block))
+    if not units:
+        raise SystemExit('SDK unit lists are missing')
+    return units
+
+
+def sdk_writes(body, units, target):
+    compiler = re.search(r'\$\(OUTDIR\)/paslangc(?:-(?:base|arm64))?(?=\s)', body)
+    if compiler is None:
+        return
+    command = body[compiler.start():]
+    output = re.search(r'(?:^|\s)-o\s+("[^"]+"|\'[^\']+\'|\S+)', command)
+    if output is None:
+        if re.search(r'src/(?:lib|rtl)/\w+\.paslang', command):
+            raise SystemExit(target + ': a test must give SDK unit compilation a private output: ' + body)
+        return
+    path = output[1].strip('"\'').rstrip(';').replace('$(A64DIR)', '$(BUILDDIR)/a64')
+    if path == '$(OUTDIR)/pasdbg':
+        raise SystemExit(target + ': use the production base debugger target, not a test rewrite')
+    if '/' not in path:
+        return
+    directory, name = path.rsplit('/', 1)
+    canonical = {'$(BUILDDIR)', '$(BUILDDIR)/a64', '$(BUILDDIR)/$(LVL_X64)',
+                 '$(BUILDDIR)/a64/$(LVL_A64)'}
+    if directory in canonical and Path(name).stem in units | {'$$b', '$$u'}:
+        raise SystemExit(target + ': a test must not rewrite a canonical SDK unit: ' + body)
+
+
 def main():
     lines = Path(__file__).resolve().parents[1].joinpath("Makefile").read_text().splitlines()
+    units = sdk_units(lines)
     target = None
     command = ""
     checked = 0
@@ -27,6 +65,7 @@ def main():
         # found"). So a ':' line holds no quote and no ';' but the one
         # that closes it at its end.
         body = line[1:].strip()
+        sdk_writes(body, units, target)
         if body.startswith(": "):
             words = body[:-1].rstrip() if body.endswith("\\") else body
             if any(q in words for q in "'\"`") or ";" in words[:-1] or not words.endswith(";"):
@@ -54,7 +93,7 @@ def main():
         command = ""
     if checked < 4 or command:
         raise SystemExit("test recipes were not parsed completely")
-    print(f"check_recipes: {checked} bounded, valid test recipes")
+    print(f"check_recipes: {checked} bounded, valid test recipes; no canonical SDK rewrites")
 
 
 if __name__ == "__main__":

@@ -186,6 +186,10 @@ def _worker(request_path):
     hold=time.monotonic()+max(30,4*request['cleanup_timeout'])
     while time.monotonic()<hold and os.getppid()==request['parent_pid']:
      time.sleep(0.01)
+  # The private worker is exiting after its receipt and cleanup. Block
+  # cancellation before restoring handlers, through interpreter shutdown;
+  # the separate caller still restores its own signal state normally.
+  signal.pthread_sigmask(signal.SIG_BLOCK,{signal.SIGINT,signal.SIGTERM})
  return 0
 
 

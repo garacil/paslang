@@ -15,7 +15,9 @@ import time
 
 repo = Path(__file__).resolve().parents[1]
 assets = repo / 'build/pkg/release'
-base = {key: value for key, value in os.environ.items() if not key.startswith('PASLANG_GC')}
+# A relocated compiler must resolve its own SDK, never the caller's build tree.
+base = {key: value for key, value in os.environ.items()
+        if not key.startswith('PASLANG_GC') and key != 'PASLANG_LIB'}
 stress = dict(base, PASLANG_GCVERIFY='1', PASLANG_GCSTRESS='1', PASLANG_GCPOISON='1')
 # The shared temporary directory cannot hold a fixed name for the last run,
 # as build/ does, so the extracted packages go away on exit, pass or fail.
@@ -108,6 +110,19 @@ for record in records:
                    'docs/VISION.md', 'docs/CONSTRAINTS.md', 'docs/SQLITE_GUIDE.md'):
         if digest(documentation / Path(source).name) != digest(repo / source):
             raise RuntimeError(f'package documentation is not current: {name}/{source}')
+    # AMD64 packages also carry the cross-ARM SDK. Test each directory
+    # through this package's actual compiler and default library lookup.
+    for sdk_target in (('amd64', 'arm64') if target == 'amd64' else ('arm64',)):
+        library = compiler.parents[1] / 'lib/paslang'
+        if sdk_target == 'arm64':
+            library /= 'aarch64'
+        environment_check = ['python3', '-I', repo / 'scripts/check_environment_names.py',
+                             '--compiler', compiler, '--library', library,
+                             '--target', sdk_target, '--installed']
+        if sdk_target == 'arm64':
+            environment_check += ['--qemu', qemu]
+        run(environment_check, env=stress)
+        print(f'ok packaged base SDK {name}: {sdk_target}', flush=True)
     print(f'ok package format and contents {name}', flush=True)
 
 fixtures = ('systemerrors', 'blockedio', 'boundedfiles', 'filemetadata', 'directories',

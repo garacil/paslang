@@ -1063,15 +1063,17 @@ $(OUTDIR)/paslangc-base: $(OUTDIR)/paslangc core $(SELF_UNITS) cmd/paslangc/pasl
 	done; \
 	$(OUTDIR)/paslangc -cpu base -Fu $(BUILDDIR)/ccbase -o $@ cmd/paslangc/paslangc.paslang
 
+# Compiler units have their own directory, as ccbase does. Rebuilding the
+# compiler must not age or replace the SDK's base/level library objects.
 $(OUTDIR)/paslangc-arm64: $(OUTDIR)/paslangc core-arm64 $(SELF_UNITS) cmd/paslangc/paslangc.paslang | $(OUTDIR) $(BUILDDIR)
-	mkdir -p $(A64DIR)
+	mkdir -p $(BUILDDIR)/ccarm64
 	@set -e; ulimit -v 2097152; \
 	for u in $(SELF_UNITS); do \
 	  b=$$(basename $$u .paslang); \
 	  echo "arm64 $$b"; \
-	  $(OUTDIR)/paslangc -target arm64 -cpu base -c -Fu $(A64DIR) -o $(A64DIR)/$$b $$u; \
+	  $(OUTDIR)/paslangc -target arm64 -cpu base -c -Fu $(BUILDDIR)/ccarm64 -Fu $(A64DIR) -o $(BUILDDIR)/ccarm64/$$b $$u; \
 	done; \
-	$(OUTDIR)/paslangc -target arm64 -cpu base -Fu $(A64DIR) -o $@ cmd/paslangc/paslangc.paslang
+	$(OUTDIR)/paslangc -target arm64 -cpu base -Fu $(BUILDDIR)/ccarm64 -Fu $(A64DIR) -o $@ cmd/paslangc/paslangc.paslang
 
 $(OUTDIR) $(BUILDDIR):
 	mkdir -p $@
@@ -1307,7 +1309,8 @@ bench-stages: $(OUTDIR)/paslangc core libs
 bench-servers: $(OUTDIR)/paslangc core libs
 	PATH=$(OUTDIR):$$PATH python3 scripts/bench/servers.py -n 3 --json $(BUILDDIR)/bench/servers.json
 
-check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch64
+check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch64 $(OUTDIR)/pasdbg
+	@python3 -I scripts/check_sdk_state.py capture --manifest $(BUILDDIR)/sdk-state-check.json --profile amd64 $(BUILDDIR) $(LVL_X64) --profile arm64 $(A64DIR) $(LVL_A64) --debugger amd64 $(OUTDIR)/pasdbg -- $(CORE_UNITS) $(LIB_UNITS)
 	@python3 scripts/check_recipes.py
 	@python3 -I scripts/bench/check_harness.py
 	@python3 -I scripts/bench/check_peak.py
@@ -1937,7 +1940,6 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/debug1-plain testdata/debug1.paslang; \
 	if nm $(BUILDDIR)/debug1-plain | grep -q pasdebug; then echo "a program compiled without -debug carries the debugger"; exit 1; fi; \
 	if ! nm $(BUILDDIR)/debug1 | grep -q p_f[.]8_pasdebug12_pasdebugline; then echo "the -debug program has no debugger"; exit 1; fi; \
-	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(OUTDIR)/pasdbg cmd/pasdbg/pasdbg.paslang; \
 	echo ok debug; \
 	echo "==== debug console ===="; \
 	$(OUTDIR)/paslangc -debug -Fu $(BUILDDIR) -o $(BUILDDIR)/debug2 testdata/debug2.paslang; \
@@ -1967,31 +1969,26 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/jsondbgattach.out $(BUILDDIR)/jsondbgattach.got; \
 	echo ok debug-console; \
 	echo "==== tcppark ===="; \
-	$(OUTDIR)/paslangc -c src/lib/pasnet.paslang; \
 	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/tcppark testdata/tcppark.paslang; \
 	timeout 15 $(BUILDDIR)/tcppark > $(BUILDDIR)/tcppark.got; \
 	diff -u testdata/tcppark.out $(BUILDDIR)/tcppark.got; \
 	echo ok tcppark; \
 	echo "==== udppark ===="; \
-	$(OUTDIR)/paslangc -c src/lib/pasnet.paslang; \
 	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/udppark testdata/udppark.paslang; \
 	timeout 15 $(BUILDDIR)/udppark > $(BUILDDIR)/udppark.got; \
 	diff -u testdata/udppark.out $(BUILDDIR)/udppark.got; \
 	echo ok udppark; \
 	echo "==== ip6park ===="; \
-	$(OUTDIR)/paslangc -c src/lib/pasnet.paslang; \
 	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/ip6park testdata/ip6park.paslang; \
 	timeout 15 $(BUILDDIR)/ip6park > $(BUILDDIR)/ip6park.got; \
 	diff -u testdata/ip6park.out $(BUILDDIR)/ip6park.got; \
 	echo ok ip6park; \
 	echo "==== deadln ===="; \
-	$(OUTDIR)/paslangc -c src/lib/pasnet.paslang; \
 	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/deadln testdata/deadln.paslang; \
 	timeout 15 $(BUILDDIR)/deadln > $(BUILDDIR)/deadln.got; \
 	diff -u testdata/deadln.out $(BUILDDIR)/deadln.got; \
 	echo ok deadln; \
 	echo "==== edgeacc ===="; \
-	$(OUTDIR)/paslangc -c src/lib/pasnet.paslang; \
 	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/edgeacc testdata/edgeacc.paslang; \
 	timeout 15 $(BUILDDIR)/edgeacc > $(BUILDDIR)/edgeacc.got; \
 	diff -u testdata/edgeacc.out $(BUILDDIR)/edgeacc.got; \
@@ -5504,9 +5501,6 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/pkg/useit.out $(BUILDDIR)/pkgmain.got; \
 	echo ok pkg; \
 	echo "==== xcanvas ===="; \
-	$(OUTDIR)/paslangc -c -Fu $(BUILDDIR) src/lib/paslinux.paslang; \
-	$(OUTDIR)/paslangc -c -Fu $(BUILDDIR) src/lib/paslib.paslang; \
-	$(OUTDIR)/paslangc -c -Fu $(BUILDDIR) src/lib/pasx11.paslang; \
 	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/xcanvas testdata/xcanvas.paslang; \
 	$$xrun $(BUILDDIR)/xcanvas > $(BUILDDIR)/xcanvas.got; \
 	diff -u testdata/xcanvas.out $(BUILDDIR)/xcanvas.got; \
@@ -5517,8 +5511,6 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/xcanvas.out $(BUILDDIR)/xcanvas-arm.got; \
 	echo ok xcanvas-arm; \
 	echo "==== dirlist ===="; \
-	$(OUTDIR)/paslangc -c -Fu $(BUILDDIR) src/lib/paslinux.paslang; \
-	$(OUTDIR)/paslangc -c -Fu $(BUILDDIR) src/lib/paslib.paslang; \
 	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/dirlist testdata/dirlist.paslang; \
 	$(BUILDDIR)/dirlist > $(BUILDDIR)/dirlist.got; \
 	diff -u testdata/dirlist.out $(BUILDDIR)/dirlist.got; \
@@ -5799,6 +5791,8 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	echo "==== self ===="; \
 	$(MAKE) self; \
 	$(MAKE) check-arm64
+	@python3 -I scripts/check_environment_names.py --compiler $(OUTDIR)/paslangc --library $(BUILDDIR) --target amd64
+	@python3 -I scripts/check_sdk_state.py verify --manifest $(BUILDDIR)/sdk-state-check.json --profile amd64 $(BUILDDIR) $(LVL_X64) --profile arm64 $(A64DIR) $(LVL_A64) --debugger amd64 $(OUTDIR)/pasdbg -- $(CORE_UNITS) $(LIB_UNITS)
 
 # The arm64 tests run under QEMU's user mode built here, from the signed
 # 11.1.1 release in docs/ref/qemu (fetched once, checked by its SHA-256)
@@ -5814,14 +5808,10 @@ QEMU_A64 := $(BUILDDIR)/qemu-aarch64
 $(BUILDDIR)/qemu-aarch64: scripts/build_qemu.py $(wildcard scripts/qemu/*.patch) | $(BUILDDIR)
 	python3 scripts/build_qemu.py $(BUILDDIR) docs/ref/qemu/qemu-11.1.1.tar.xz
 
-check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/qemu-aarch64
+check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/qemu-aarch64 libs-arm64
+	@python3 -I scripts/check_sdk_state.py capture --manifest $(BUILDDIR)/sdk-state-check-arm64.json --profile arm64 $(A64DIR) $(LVL_A64) -- $(CORE_UNITS) $(LIB_UNITS)
 	@set -e; \
 	python3 -I scripts/check_cli_help.py "$(OUTDIR)/paslangc-arm64" "$(BUILDDIR)" "$(QEMU_A64)"; \
-	echo "==== lib units arm64 ===="; \
-	for u in $(LIB_UNITS); do \
-	  b=$$(basename $$u .paslang); \
-	  $(OUTDIR)/paslangc -target arm64 -c -Fu $(A64DIR) -o $(A64DIR)/$$b $$u; \
-	done; \
 	python3 -I scripts/check_import_diagnostics.py "$(OUTDIR)/paslangc-arm64" "$(BUILDDIR)" "$(QEMU_A64)" --host-arm64; \
 	: flatec takes 70 s of qemu on a machine half loaded and 240 lets a loaded one finish it, P449; \
 	for t in $(GOLDEN_A64); do \
@@ -7039,20 +7029,16 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	tail -n 1 $(BUILDDIR)/wrout-arm.got | grep -q '^done$$'; \
 	echo ok wrout-arm; \
 	echo "==== tcppark arm64 ===="; \
-	$(OUTDIR)/paslangc -target arm64 -c src/lib/pasnet.paslang; \
 	$(OUTDIR)/paslangc -target arm64 -Fu $(BUILDDIR)/a64 -o $(BUILDDIR)/tcppark-arm testdata/tcppark.paslang; \
 	timeout 25 $(QEMU_A64) $(BUILDDIR)/tcppark-arm > $(BUILDDIR)/tcppark-arm.got; \
 	diff -u testdata/tcppark.out $(BUILDDIR)/tcppark-arm.got; \
 	echo ok tcppark-arm; \
 	echo "==== udppark arm64 ===="; \
-	$(OUTDIR)/paslangc -target arm64 -c src/lib/pasnet.paslang; \
 	$(OUTDIR)/paslangc -target arm64 -Fu $(BUILDDIR)/a64 -o $(BUILDDIR)/udppark-arm testdata/udppark.paslang; \
 	timeout 25 $(QEMU_A64) $(BUILDDIR)/udppark-arm > $(BUILDDIR)/udppark-arm.got; \
 	diff -u testdata/udppark.out $(BUILDDIR)/udppark-arm.got; \
 	echo ok udppark-arm; \
 	echo "==== debug arm64 ===="; \
-	$(OUTDIR)/paslangc -target arm64 -c src/lib/pasnet.paslang; \
-	$(OUTDIR)/paslangc -target arm64 -c -Fu $(BUILDDIR)/a64 src/lib/pasdebug.paslang; \
 	$(OUTDIR)/paslangc -target arm64 -debug -Fu $(BUILDDIR)/a64 -o $(BUILDDIR)/debug1-arm testdata/debug1.paslang; \
 	PASLANG_DEBUG=@paslang-debug1-arm-$$$$ timeout 120 $(QEMU_A64) $(BUILDDIR)/debug1-arm @paslang-debug1-arm-$$$$ > $(BUILDDIR)/debug1-arm.got; \
 	diff -u testdata/debug1.out $(BUILDDIR)/debug1-arm.got; \
@@ -7073,7 +7059,6 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	diff -u testdata/jsondbg.out $(BUILDDIR)/jsondbg-arm.got; \
 	echo ok debug-console-arm; \
 	echo "==== network servers arm64 ===="; \
-	$(OUTDIR)/paslangc -target arm64 -c src/lib/pasnet.paslang; \
 	for t in httpd dnsd termd ftpd ntpd wsd chat proxy apisrv; do \
 	  $(OUTDIR)/paslangc -target arm64 -Fu $(BUILDDIR)/a64 -o $(BUILDDIR)/ex_$$t-arm examples/$$t.paslang; \
 	  timeout 120 $(QEMU_A64) $(BUILDDIR)/ex_$$t-arm -selftest 300 > $(BUILDDIR)/ex_$$t-arm.got; \
@@ -7093,19 +7078,16 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	diff -u examples/jsonrpc.out $(BUILDDIR)/ex_jsonrpc-arm.got; \
 	echo ok network-servers-arm; \
 	echo "==== ip6park arm64 ===="; \
-	$(OUTDIR)/paslangc -target arm64 -c src/lib/pasnet.paslang; \
 	$(OUTDIR)/paslangc -target arm64 -Fu $(BUILDDIR)/a64 -o $(BUILDDIR)/ip6park-arm testdata/ip6park.paslang; \
 	timeout 25 $(QEMU_A64) $(BUILDDIR)/ip6park-arm > $(BUILDDIR)/ip6park-arm.got; \
 	diff -u testdata/ip6park.out $(BUILDDIR)/ip6park-arm.got; \
 	echo ok ip6park-arm; \
 	echo "==== deadln arm64 ===="; \
-	$(OUTDIR)/paslangc -target arm64 -c src/lib/pasnet.paslang; \
 	$(OUTDIR)/paslangc -target arm64 -Fu $(BUILDDIR)/a64 -o $(BUILDDIR)/deadln-arm testdata/deadln.paslang; \
 	timeout 25 $(QEMU_A64) $(BUILDDIR)/deadln-arm > $(BUILDDIR)/deadln-arm.got; \
 	diff -u testdata/deadln.out $(BUILDDIR)/deadln-arm.got; \
 	echo ok deadln-arm; \
 	echo "==== edgeacc arm64 ===="; \
-	$(OUTDIR)/paslangc -target arm64 -c src/lib/pasnet.paslang; \
 	$(OUTDIR)/paslangc -target arm64 -Fu $(BUILDDIR)/a64 -o $(BUILDDIR)/edgeacc-arm testdata/edgeacc.paslang; \
 	timeout 25 $(QEMU_A64) $(BUILDDIR)/edgeacc-arm > $(BUILDDIR)/edgeacc-arm.got; \
 	diff -u testdata/edgeacc.out $(BUILDDIR)/edgeacc-arm.got; \
@@ -7253,6 +7235,8 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	$(OUTDIR)/paslangc -target arm64 -cpu max -Fu $(A64DIR) -o $(BUILDDIR)/httpsrv-sd-arm testdata/httpsrv.paslang; \
 	timeout 600 python3 -I scripts/check_httpsystemd.py $(BUILDDIR)/httpsrv-sd-arm $(QEMU_A64); \
 	echo ok httpsrv-arm
+	@python3 -I scripts/check_environment_names.py --compiler $(OUTDIR)/paslangc --library $(A64DIR) --target arm64 --qemu $(QEMU_A64)
+	@python3 -I scripts/check_sdk_state.py verify --manifest $(BUILDDIR)/sdk-state-check-arm64.json --profile arm64 $(A64DIR) $(LVL_A64) -- $(CORE_UNITS) $(LIB_UNITS)
 
 install: all installdirs
 	$(NORMAL_INSTALL)
@@ -7385,10 +7369,23 @@ installdirs:
 	fi
 
 installcheck:
-	$(DESTDIR)$(bindir)/paslangc -o $(BUILDDIR)/paslang-installcheck $(srcdir)/testdata/hello.paslang
+	@set -e; \
+	if [ -n '$(AMD64)' ]; then \
+	  python3 -I scripts/check_environment_names.py --installed --compiler "$(DESTDIR)$(bindir)/paslangc" --library "$(DESTDIR)$(libdir)/paslang" --target amd64; \
+	fi; \
+	if [ -n '$(ARM64)' ]; then \
+	  if [ -z '$(AMD64)' ]; then \
+	    python3 -I scripts/check_environment_names.py --installed --compiler "$(DESTDIR)$(bindir)/paslangc" --library "$(DESTDIR)$(libdir)/paslang/aarch64" --target arm64; \
+	  elif [ -x "$(QEMU_A64)" ]; then \
+	    python3 -I scripts/check_environment_names.py --installed --compiler "$(DESTDIR)$(bindir)/paslangc" --library "$(DESTDIR)$(libdir)/paslang/aarch64" --target arm64 --qemu "$(QEMU_A64)"; \
+	  else \
+	    echo 'check_environment_names: installed arm64 execution skipped, QEMU is not built'; \
+	  fi; \
+	fi
+	env -u PASLANG_LIB $(DESTDIR)$(bindir)/paslangc -cpu base -o $(BUILDDIR)/paslang-installcheck $(srcdir)/testdata/hello.paslang
 	$(BUILDDIR)/paslang-installcheck
 	rm -f $(BUILDDIR)/paslang-installcheck $(BUILDDIR)/paslang-installcheck.s $(BUILDDIR)/paslang-installcheck.o $(BUILDDIR)/paslang-installcheck.ld $(BUILDDIR)/paslang-installcheck.link
-	$(DESTDIR)$(bindir)/paslangc -o $(BUILDDIR)/paslang-installcheck-who $(srcdir)/examples/pasroutines/who.paslang
+	env -u PASLANG_LIB $(DESTDIR)$(bindir)/paslangc -cpu base -o $(BUILDDIR)/paslang-installcheck-who $(srcdir)/examples/pasroutines/who.paslang
 	$(BUILDDIR)/paslang-installcheck-who
 	rm -f $(BUILDDIR)/paslang-installcheck-who $(BUILDDIR)/paslang-installcheck-who.s $(BUILDDIR)/paslang-installcheck-who.o $(BUILDDIR)/paslang-installcheck-who.ld $(BUILDDIR)/paslang-installcheck-who.link
 
