@@ -20,9 +20,10 @@ end.
 
 Source files use the `.paslang` extension.
 
-Run `paslangc` or `paslangc -h` for a concise usage summary and build
-example. Use `paslangc --help <topic>` for a focused reference and
-`paslangc -v` for version, target and processor metadata. Help is plain
+Run `paslangc` or `paslangc -h` to see the compiler release, concise
+usage summary and build example. Use `paslangc --help <topic>` for a
+focused reference and `paslangc -v` for version, target and processor
+metadata. Help is plain
 text; errors go to standard error with a failing exit status.
 [Compiler help](docs/HELP.md)
 

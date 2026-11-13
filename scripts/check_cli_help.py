@@ -50,7 +50,8 @@ save()
 try:
     short = run('default',[]).stdout
     assert short.isascii() and b'\x1b' not in short
-    assert short.startswith(b'paslangc - ') and len(short.splitlines()) <= 35
+    short_version = re.fullmatch(rb'paslangc ([0-9]+\.[0-9]+\.[0-9]+) - modern Pascal compiler', short.splitlines()[0])
+    assert short_version and len(short.splitlines()) <= 35
     for line in (b'Usage:',b'  paslangc [options] source.paslang',b'Build and run:',
                  b'  paslangc -o app source.paslang',b'  ./app',b'Common options:',b'Help:',b'Documentation:'):
         assert line in short.splitlines(),line
@@ -67,11 +68,13 @@ try:
     assert 'Copyright (C) 2026 Germán Luis Aracil Boned'.encode() in version
     assert b'License GPLv3+' in version and b'NO WARRANTY' in version
     assert b'\x1b' not in version
+    assert short_version[1] == match[1], 'default help and -v release differ'
     state['version'] = match[1].decode()
     run('long-version',['--version'],expected=version)
 
     topics = ['flags','types','lang','runtime','lib','limits','examples']
     all_text = run('all',['--help']).stdout
+    assert all_text.startswith(short + b'\n'), 'full help lost the release overview'
     assert re.findall(rb'^## ([a-z]+)$',all_text,re.M) == [t.encode() for t in topics]
     run('all-topic',['--help','all'],expected=all_text)
     for topic in topics:
@@ -88,12 +91,12 @@ try:
 
     hello = work/'source.paslang'
     hello.write_text("program hello; begin WriteLn('hello'); end.\n")
-    run('compile-example',['-o','app','source.paslang'],readonly=False)
+    run('compile-example',['-o','app','source.paslang'],expected=b'',readonly=False)
     run('run-example',[*qemu,work/'app'],expected=b'hello\n',compiler_call=False)
-    run('compile-default',['source.paslang'],readonly=False)
+    run('compile-default',['source.paslang'],expected=b'',readonly=False)
     run('run-default',[*qemu,work/'a.out'],expected=b'hello\n',compiler_call=False)
     object_base = work/'object/hello'
-    run('compile-object',['-c','-o',object_base,'source.paslang'],readonly=False)
+    run('compile-object',['-c','-o',object_base,'source.paslang'],expected=b'',readonly=False)
     obj = object_base.with_suffix('.o')
     assert obj.is_file() and not object_base.exists()
     data = obj.read_bytes()
@@ -101,11 +104,11 @@ try:
     assert int.from_bytes(data[18:20],'little') == (183 if qemu else 62)
 
     (work/'greet.paslang').write_text("unit greet; interface function Greeting: string; implementation function Greeting: string; begin Result := 'hello from unit'; end; end.\n")
-    run('compile-unit',['-c','greet.paslang'],readonly=False)
+    run('compile-unit',['-c','greet.paslang'],expected=b'',readonly=False)
     local_units = work/('build/a64' if qemu else 'build')
     assert (local_units/'greet.pi').is_file() and (local_units/'greet.o').is_file()
     (work/'usegreet.paslang').write_text('program usegreet; uses greet; begin WriteLn(Greeting); end.\n')
-    run('compile-unit-client',['-Fu',local_units,'-o','unit-app','usegreet.paslang'],readonly=False)
+    run('compile-unit-client',['-Fu',local_units,'-o','unit-app','usegreet.paslang'],expected=b'',readonly=False)
     run('run-unit-client',[*qemu,work/'unit-app'],expected=b'hello from unit\n',compiler_call=False)
     assert hashlib.sha256(compiler.read_bytes()).hexdigest() == state['compiler_sha256']
     state['ok'] = True

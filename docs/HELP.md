@@ -10,13 +10,13 @@ paslangc -v
 paslangc --version
 ```
 
-With no arguments, `paslangc` prints concise usage and exits 0. The same
-summary is available with `-h`, `--help index` or `--help short`.
+With no arguments, `paslangc` prints its full release identifier and
+concise usage, then exits 0. The same summary is available with `-h`, `--help index` or `--help short`.
 The output is plain text with stable headings and no terminal-dependent
 framing or escape sequences. On an amd64 compiler it reads:
 
 ```text
-paslangc - modern Pascal compiler
+paslangc x.y.z - modern Pascal compiler
 Compile .paslang source into native Linux programs and units.
 Default target: linux/amd64
 
@@ -46,8 +46,9 @@ Documentation:
   https://github.com/garacil/paslang/wiki
 ```
 
-The ARM compiler reports `linux/arm64` as its default target. The example
-uses an explicit output name; without `-o`, a program is written to
+The `x.y.z` placeholder is the actual compiler release from the same
+`PaslangVersion` used by `-v`. The ARM compiler reports `linux/arm64` as
+its default target. The example uses an explicit output name; without `-o`, a program is written to
 `a.out`. Unit output defaults to `build/<name>.pi` and
 `build/<name>.o` (`build/a64/` for ARM).
 
