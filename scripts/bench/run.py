@@ -15,7 +15,7 @@
 # You should have received a copy of the GNU General Public License
 # along with paslang.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Measure paslang against Go, the reference for what is good.
+"""Measure paslang against Go and Rust.
 
   scripts/bench/run.py            build and run the pairs, print the table, then the probes
   scripts/bench/run.py probes     run the robustness probes only, print status and message
@@ -24,6 +24,15 @@
   scripts/bench/run.py --json P   write every number and the machine's details to P
   scripts/bench/run.py --cpu base build the paslang side for these processors only
                                   (comma-separated; default native,base: Regla 12)
+  scripts/bench/run.py --reference go,rust --pairs b1loop,b6smap --go-native-level v3
+                                  select the audited twins and separate reference series
+
+The selected-reference mode builds Go separately for base/native and Rust
+with opt-level=3. Native Go needs the highest host/OS ISA level reviewed
+explicitly. Missing requested tools fail; ordinary project checks use stubs.
+Its --json record retains every full timed/memory output and failure. Use
+--reference go,rust --help for all selected-mode options. The default command
+retains the legacy full Go suite and the CPU policy documented below.
 
 After the table, the pairs in CHECKPTR run again built with paslangc -checkptr
 (P104): the line gives that build's time as a multiple of the plain one, held
@@ -37,8 +46,9 @@ with the paslangc on the PATH, once with -cpu native and once with -cpu base
 build/gocache); each build is held to the same budgets. The native build
 runs against Go as it ships (GOAMD64=v1, its libraries choosing the
 processor's extensions when they run); the base build against the same Go
-binary run with GODEBUG=cpu.all=off, which turns every optional extension
-off (internal/cpu processOptions), so both run on the base processor.
+binary with a source-bound capability probe and a silent, reviewed CPU
+policy. Baseline refuses unsupported REP preferences or uncontrolled
+optional ISA fields (reference_policy.py).
 The two programs of a pair run in rounds, alternating which runs first. The
 table prints each side's median wall time, the median of the rounds' ratios
 paslang / Go (the time verdict), the median peak resident memory (VmHWM as
@@ -53,14 +63,20 @@ or ties fails, and has its hito; a pair that wins keeps what it won,
 rounded up. The numbers come from a run, never from memory.
 """
 import os
+import math
 import select
+import signal
 import subprocess
 import sys
+import tempfile
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from peak import peak_kib  # noqa: E402
+from reference_policy import (go_runtime_environment, go_build_environment,
+                              prepare_go_capabilities, go_binary_metadata,
+                              require_go_artifact_capabilities)  # noqa: E402
 ROOT = os.path.dirname(os.path.dirname(HERE))
 OUT = os.path.join(ROOT, "build", "bench")
 PAIRS = ["b1loop", "b2str", "b3spawn", "b4chan", "b5map", "b6smap", "b7narrow", "b8ptr",
@@ -291,9 +307,8 @@ def build(name, go=True, cpu="native"):
     # paslangc makes a build/ under its cwd, so it runs from the root, where one belongs.
     sh(["paslangc", "-cpu", cpu, "-o", pl_path(name, cpu), os.path.join(HERE, name + ".paslang")])
     if go:
-        env = dict(os.environ)
+        env = go_build_environment(OUT, "base", None)
         env.setdefault("HOME", OUT)
-        env["GOCACHE"] = os.path.join(OUT, "gocache")
         env["GOFLAGS"] = "-mod=mod"
         d = os.path.join(OUT, "go_" + name)
         os.makedirs(d, exist_ok=True)
@@ -307,23 +322,113 @@ def build(name, go=True, cpu="native"):
             sys.exit(p.stderr)
 
 
+GO_CAPABILITIES = None
+
+
 def go_env(cpu):
-    """The environment Go runs in for a paslang build of cpu: the base
-    processor turns off every extension Go would choose when it runs."""
-    if cpu == "base":
-        return dict(os.environ, GODEBUG="cpu.all=off")
-    return None
+    """Legacy runtime selector; capability preparation stays outside samples."""
+    global GO_CAPABILITIES
+    if cpu == "base" and GO_CAPABILITIES is None:
+        import shutil
+        compiler = shutil.which("go")
+        if compiler is None:
+            raise RuntimeError("Go capability preparation requires go on PATH")
+        GO_CAPABILITIES = prepare_go_capabilities(compiler, os.path.join(OUT, "go-capabilities"))
+    return go_runtime_environment(cpu, capabilities=GO_CAPABILITIES)
+
+
+def go_artifact_evidence(executable, cpu, record):
+    """Retain actual linkage and fail closed before legacy baseline timing."""
+    artifacts = record.setdefault("go_artifacts", {})
+    if executable not in artifacts:
+        artifacts[executable] = go_binary_metadata(executable)
+    observation = {"executable": executable, "cpu": cpu, "ok": False}
+    record.setdefault("go_artifact_evidence", []).append(observation)
+    try:
+        observation["capability_evidence"] = require_go_artifact_capabilities(cpu, artifacts[executable])
+    except ValueError as error:
+        observation["refusal"] = str(error)
+        raise
+    observation["ok"] = True
+    return observation
+
+
+def fail_legacy_record(record, destination, error):
+    """A refused old-style invocation must replace any prior success JSON."""
+    record.update(ok=False, error=str(error))
+    if destination:
+        import json
+        os.makedirs(os.path.dirname(os.path.abspath(destination)), exist_ok=True)
+        with open(destination, "w") as target:
+            json.dump(json_values(record), target, indent=1, allow_nan=False)
+    raise SystemExit(str(error))
 
 
 def peak_mb(exe, env=None, runs=MEM_RUNS, args=()):
-    """Median peak resident MB of runs traced runs (peak.py), and all of them."""
-    peaks = []
-    with open(os.devnull, "w") as null:
-        for _ in range(runs):
-            kib, _ = peak_kib([exe, *args], env=env, stdout=null.fileno(), stderr=null.fileno())
-            peaks.append(kib / 1024)
-    peaks.sort()
-    return peaks[len(peaks) // 2], peaks
+    """Compatibility API; retain and validate every complete memory output."""
+    rows = []
+    expected = None
+    for index in range(runs):
+        row = memory_once(exe, env, args, expected)
+        row["round"] = index + 1
+        rows.append(row)
+        if expected is None:
+            expected = row["stdout"]
+    LAST_MEMORY[(exe, tuple(args))] = rows
+    if not all(row["ok"] for row in rows):
+        raise RuntimeError(f"memory run failed: {exe} {args}; see LAST_MEMORY")
+    peaks = sorted(row["peak_kib"] / 1024 for row in rows)
+    return median(peaks), peaks
+
+
+def memory_once(exe, env=None, args=(), expected=None):
+    with tempfile.TemporaryFile() as so, tempfile.TemporaryFile() as se:
+        kib, status, problem = -1, "measurement-error", None
+        try:
+            kib, status = peak_kib([exe, *args], env=env, stdout=so.fileno(),
+                                   stderr=se.fileno(), timeout=TIMEOUT)
+        except (OSError, RuntimeError) as error:
+            problem = str(error)
+        so.seek(0)
+        se.seek(0)
+        answer = so.read().decode("utf-8", "surrogateescape")
+        error = se.read().decode("utf-8", "surrogateescape")
+    return {"peak_kib": kib, "status": status, "stdout": answer, "stderr": error,
+            "measurement_error": problem,
+            "ok": status == 0 and kib > 0 and not error and (expected is None or answer == expected)}
+
+
+def memory_pair(a, b, n, env_a, env_b, args, expected_a, expected_b, *, rows_a=None, rows_b=None):
+    """Independent traced samples, alternating order as in timed rounds."""
+    if n < 1:
+        raise ValueError("memory rounds must be positive")
+    rows_a = [] if rows_a is None else rows_a
+    rows_b = [] if rows_b is None else rows_b
+    LAST_MEMORY[(a, tuple(args))] = rows_a
+    LAST_MEMORY[(b, tuple(args))] = rows_b
+    def observe(exe, env, expected, rows, index):
+        row = {"round": index + 1, "first": "a" if index % 2 == 0 else "b",
+               "status": "interrupted", "ok": False}
+        rows.append(row)
+        try:
+            row.update(memory_once(exe, env, args, expected))
+        except BaseException as error:
+            row["measurement_error"] = type(error).__name__ + ": " + str(error)
+            raise
+        return row
+    for index in range(n):
+        if index % 2 == 0:
+            ra = observe(a, env_a, expected_a, rows_a, index)
+            rb = observe(b, env_b, expected_b, rows_b, index)
+        else:
+            rb = observe(b, env_b, expected_b, rows_b, index)
+            ra = observe(a, env_a, expected_a, rows_a, index)
+        if ra["status"] == "timeout" or rb["status"] == "timeout":
+            break
+    valid = len(rows_a) == n and all(row["ok"] for row in rows_a + rows_b)
+    ma = median([row["peak_kib"] / 1024 for row in rows_a]) if valid else None
+    mb = median([row["peak_kib"] / 1024 for row in rows_b]) if valid else None
+    return ma, mb, rows_a, rows_b
 
 
 def units(names=None):
@@ -337,64 +442,117 @@ def unit_name(b, sec):
 
 
 def once(exe, env=None, args=()):
-    """Wall seconds, exit status and first output line of one run."""
-    so = open(os.path.join(OUT, "stdout"), "w+")
-    se = open(os.path.join(OUT, "stderr"), "w+")
-    t = time.perf_counter()
-    p = subprocess.Popen([exe, *args], stdout=so, stderr=se, env=env)
-    # The end is waited for on a pidfd: poll wakes when the program ends.
-    # Popen.wait(timeout) sleeps in steps of up to 50 ms and rounded every
-    # time up to them.
-    fd = os.pidfd_open(p.pid)
-    poller = select.poll()
-    poller.register(fd, select.POLLIN)
-    ended = poller.poll(TIMEOUT * 1000)
-    os.close(fd)
-    if not ended:
-        p.kill()
-        p.wait()
-        so.close(); se.close()
-        return float("inf"), "timeout", "did not end in %d s" % TIMEOUT
-    _, st = os.waitpid(p.pid, 0)
-    wall = time.perf_counter() - t
-    p.returncode = status = os.waitstatus_to_exitcode(st)
-    so.seek(0); se.seek(0)
-    out = so.read().strip().splitlines()
-    err = se.read().strip().splitlines()
-    so.close(); se.close()
-    return wall, status, (out[0] if out else "") + ((" | " + err[0]) if err else "")
+    """Wall seconds, exit status and complete stdout, including final newlines.
+
+    Decode with surrogateescape so comparison preserves even non-UTF-8 bytes.
+    stderr is retained separately in LAST_ONCE, not merged with the answer.
+    """
+    with tempfile.TemporaryFile() as so, tempfile.TemporaryFile() as se:
+        t = time.perf_counter()
+        p = subprocess.Popen([exe, *args], stdout=so, stderr=se, env=env,
+                             start_new_session=True)
+        fd = None
+        try:
+            # pidfd polling avoids Popen.wait(timeout)'s sleep granularity.
+            fd = os.pidfd_open(p.pid)
+            poller = select.poll()
+            poller.register(fd, select.POLLIN)
+            deadline = time.monotonic() + TIMEOUT
+            ended = []
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                # poll(2) accepts signed-int milliseconds. Keep the absolute
+                # deadline while bounding each individual kernel wait.
+                ended = poller.poll(max(1, math.ceil(min(remaining, 2_147_483) * 1000)))
+                if ended:
+                    break
+            if not ended or time.monotonic() >= deadline:
+                wall, status = float("inf"), "timeout"
+            else:
+                _, st = os.waitpid(p.pid, 0)
+                wall = time.perf_counter() - t
+                p.returncode = status = os.waitstatus_to_exitcode(st)
+        finally:
+            if fd is not None:
+                os.close(fd)
+            if p.returncode is None:
+                try:
+                    os.killpg(p.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                p.wait()
+        so.seek(0); se.seek(0)
+        out = so.read().decode("utf-8", "surrogateescape")
+        err = se.read().decode("utf-8", "surrogateescape")
+    LAST_ONCE[(exe, tuple(args))] = {"wall_s": wall, "status": status,
+                                    "stdout": out, "stderr": err}
+    return wall, status, out
 
 
-def alternate(a, b, n, env_a=None, env_b=None, args=()):
+def alternate(a, b, n, env_a=None, env_b=None, args=(), *, rows=None):
     """n rounds of the programs a and b, alternating which runs first.
-    Gives each side's median wall seconds, exit status and first line
-    (the first line that differs from the first run's, or a status that
-    is not 0, when one does), and the median of the rounds' ratios, b's
+    Gives each side's median wall seconds, accumulated status and complete
+    stdout, and the median of the rounds' ratios, b's
     time over a's. On a machine that runs anything else a median of
     separate runs moved by up to 30 % from one batch to the next; a
     round's two programs share the machine's state of that moment."""
+    if n < 1:
+        raise ValueError("timed rounds must be positive")
     wa, wb, ratios = [], [], []
+    rows = [] if rows is None else rows
+    LAST_ROUNDS[(a, b, tuple(args))] = rows
+    LAST_RATIOS[(a, b, tuple(args))] = ratios
+    LAST_WALLS[(a, tuple(args))] = wa
+    LAST_WALLS[(b, tuple(args))] = wb
     sa, oa, sb, ob = 0, None, 0, None
+    def observe(exe, env, side, row):
+        row[side] = {"status": "interrupted"}
+        try:
+            result = once(exe, env, args)
+        except BaseException as error:
+            row["errors"].append(type(error).__name__ + ": " + str(error))
+            raise
+        row[side] = dict(LAST_ONCE[(exe, tuple(args))])
+        return result
     for r in range(n):
+        row = {"round": r + 1, "first": "a" if r % 2 == 0 else "b",
+               "completed": False, "errors": []}
+        rows.append(row)
         if r % 2 == 0:
-            ta, xa, ya = once(a, env_a, args)
-            tb, xb, yb = once(b, env_b, args)
+            ta, xa, ya = observe(a, env_a, "a", row)
+            tb, xb, yb = observe(b, env_b, "b", row)
         else:
-            tb, xb, yb = once(b, env_b, args)
-            ta, xa, ya = once(a, env_a, args)
+            tb, xb, yb = observe(b, env_b, "b", row)
+            ta, xa, ya = observe(a, env_a, "a", row)
         wa.append(ta)
         wb.append(tb)
-        ratios.append(tb / ta if ta > 0 else float("inf"))
+        ratios.append(tb / ta if ta > 0 and xa != "timeout" and xb != "timeout" else float("inf"))
         sa = sa or xa
         sb = sb or xb
+        reasons = row["errors"]
+        if xa != 0 or xb != 0:
+            reasons.append("nonzero status or timeout")
+        if row["a"]["stderr"] or row["b"]["stderr"]:
+            reasons.append("unexpected stderr")
+        if ya != yb:
+            reasons.append("complete stdout differs")
+        if oa is not None and ya != oa:
+            reasons.append("first program stdout changed between rounds")
+        if ob is not None and yb != ob:
+            reasons.append("second program stdout changed between rounds")
+        row["completed"] = True
+        if oa is None:
+            oa = ya
+        if ob is None:
+            ob = yb
         if xa == "timeout" or xb == "timeout":
-            oa, ob = ya, yb
             break
-        oa = ya if oa is None or ya != oa else oa
-        ob = yb if ob is None or yb != ob else ob
     LAST_WALLS[(a, tuple(args))] = sorted(wa)
     LAST_WALLS[(b, tuple(args))] = sorted(wb)
     LAST_RATIOS[(a, b, tuple(args))] = list(ratios)
+    LAST_ROUNDS[(a, b, tuple(args))] = rows
     return (median(wa), sa, oa), (median(wb), sb, ob), median(ratios)
 
 
@@ -403,17 +561,32 @@ def median(xs):
     return xs[len(xs) // 2] if len(xs) % 2 else (xs[len(xs) // 2 - 1] + xs[len(xs) // 2]) / 2
 
 
+def json_values(value):
+    """Keep missing/non-finite measurements valid JSON, with status evidence."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, dict):
+        return {key: json_values(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_values(item) for item in value]
+    return value
+
+
 LAST_RATIOS = {}
 LAST_WALLS = {}
 LAST_PEAKS = {}
+LAST_MEMORY = {}
+LAST_ONCE = {}
+LAST_ROUNDS = {}
+LAST_CHECKPTR = []
 
 
 def machine():
     """The hardware, kernel and toolchain a run happened on, for the record."""
-    def out(cmd):
+    def out(cmd, env=None):
         try:
-            return subprocess.run(cmd, capture_output=True, text=True).stdout.strip()
-        except OSError:
+            return subprocess.run(cmd, capture_output=True, text=True, errors='surrogateescape', timeout=15, env=env).stdout.strip()
+        except (OSError, subprocess.TimeoutExpired):
             return ""
     def read(path):
         try:
@@ -446,7 +619,7 @@ def machine():
             k, v = line.split(":", 1)
             info["memory"][k] = v.strip()
     info["toolchain"] = {"paslangc": [l.strip(" │") for l in out(["paslangc", "-v"]).splitlines() if "paslangc" in l][:1],
-                         "go": out(["go", "version"]), "as": out(["as", "--version"]).splitlines()[:1],
+                         "go": out(["go", "version"], env=go_build_environment(OUT, "base", None)), "as": out(["as", "--version"]).splitlines()[:1],
                          "ld": out(["ld", "--version"]).splitlines()[:1]}
     return info
 
@@ -459,9 +632,14 @@ def checkptr(n, scale, cpu):
         (pw, ps, pl_out), (cw, cs, cp_out), ratio = alternate(pl_path(b, cpu), pl_path(b, cpu, ".cp"), n)
         LAST_RATIOS.pop((pl_path(b, cpu), pl_path(b, cpu, ".cp"), ()), None)
         budget = CHECKPTR_BUDGET[b] * scale
-        same = "yes" if (cp_out == pl_out and cs == 0 and ps == 0) else f"NO ({cp_out!r} vs {pl_out!r})"
+        rounds = LAST_ROUNDS[(pl_path(b, cpu), pl_path(b, cpu, ".cp"), ())]
+        same = "yes" if (len(rounds) == n and not any(r["errors"] for r in rounds)
+                         and cp_out == pl_out and cs == 0 and ps == 0) else "NO (see round errors)"
         flag = "  OVER BUDGET" if ratio > budget else ""
         bad += bool(flag) or same != "yes"
+        LAST_CHECKPTR.append({"pair": b, "cpu": cpu, "ratio": ratio,
+                              "budget": budget, "same_output": same == "yes",
+                              "rounds": rounds, "over": flag.strip()})
         print(f"{b:10s} {cpu:6s} -checkptr {cw:7.3f} s, {ratio:5.1f} times the plain build (budget {budget:.1f})  same output: {same}{flag}")
     return bad
 
@@ -470,8 +648,11 @@ def probes():
     print(f"{'probe':12s} {'status':>7s}  message")
     for p in PROBES:
         build(p, go=False)
-        w, st, first = once(os.path.join(OUT, p + ".pl"))
-        print(f"{p:12s} {st:7d}  {first}")
+        exe = os.path.join(OUT, p + ".pl")
+        w, st, output = once(exe)
+        message = output or LAST_ONCE[(exe, ())]["stderr"]
+        first = message.splitlines()[0] if message else ""
+        print(f"{p:12s} {str(st):>7s}  {first}")
 
 
 def stages(cpus):
@@ -488,6 +669,15 @@ def stages(cpus):
 
 
 def main():
+    if sys.argv[1:] in (["--help"], ["-h"]):
+        print(__doc__)
+        return 0
+    if any(option.split("=", 1)[0] in
+           ("--reference", "--pairs", "--memory-runs", "--go-native-level", "--no-build", "--timeout",
+            "--rust-target", "--rust-sysroot", "--rust-provider", "--rust-capability-proof")
+           for option in sys.argv[1:]):
+        from run_refs import main as reference_main
+        return reference_main(sys.argv[1:])
     # One line as each pair is measured, also into a file (make bench > log).
     sys.stdout.reconfigure(line_buffering=True)
     n = 3
@@ -505,6 +695,12 @@ def main():
         else:
             scale = float(args[1])
         args = args[2:]
+    if not math.isfinite(scale) or not 0 < scale <= 1:
+        raise SystemExit("--scale must be positive and at most 1; budgets cannot be relaxed")
+    if n < 1 or not cpus or set(cpus) - {"native", "base"}:
+        raise SystemExit("positive rounds and --cpu native,base are required")
+    if args not in ([], ["probes"], ["stages"]):
+        raise SystemExit("unknown arguments: " + " ".join(args))
     record = {"machine": machine(), "runs_per_program": n, "scale": scale, "cpus": cpus, "pairs": [], "checkptr": []}
     if args == ["probes"]:
         probes()
@@ -513,6 +709,9 @@ def main():
         stages(cpus)
         return
     bad = 0
+    if "base" in cpus:
+        go_env("base")
+        record["go_capabilities"] = GO_CAPABILITIES
     prepare()
     print(f"{'pair':14s} {'cpu':6s} {'go s':>7s} {'paslang s':>10s} {'ratio':>6s} {'budget':>7s} "
           f"{'go MB':>6s} {'pl MB':>6s} {'mem':>5s}  same output")
@@ -524,18 +723,30 @@ def main():
                 built.add(b)
             name, args = unit_name(b, sec), (() if sec is None else (sec,))
             gexe, pexe = os.path.join(OUT, b + ".go.bin"), pl_path(b, cpu)
+            try:
+                go_artifact_evidence(gexe, cpu, record)
+            except ValueError as error:
+                fail_legacy_record(record, json_path, error)
             (gw, gs, go_out), (pw, ps, pl_out), ratio = alternate(gexe, pexe, n, go_env(cpu), None, args)
-            # A unit that did not end has no memory to compare: none is
-            # measured (0 in the record), and its time fails it.
-            ended = gs != "timeout" and ps != "timeout"
+            round_rows = LAST_ROUNDS[(gexe, pexe, args)]
+            # Failed/incomplete timed rounds have no memory verdict. Keep
+            # their full diagnostics instead of rerunning them as valid peaks.
+            ended = (gs == 0 and ps == 0 and len(round_rows) == n
+                     and not any(r["errors"] for r in round_rows))
             if ended:
-                gr, gpeaks = peak_mb(gexe, go_env(cpu), args=args)
-                pr, ppeaks = peak_mb(pexe, args=args)
-                mem = pr / gr if gr > 0 else float("inf")
+                gr, pr, gm, pm = memory_pair(gexe, pexe, MEM_RUNS, go_env(cpu), None,
+                                             args, go_out, pl_out)
+                memory_ok = gr is not None and pr is not None
+                gpeaks = [r["peak_kib"] / 1024 for r in gm]
+                ppeaks = [r["peak_kib"] / 1024 for r in pm]
+                mem = pr / gr if memory_ok and gr > 0 else float("inf")
+                gr, pr = gr or 0.0, pr or 0.0
             else:
                 gr, gpeaks, pr, ppeaks, mem = 0.0, [], 0.0, [], 0.0
+                gm, pm, memory_ok = [], [], False
             budget = BUDGET[name] * scale
-            same = "yes" if (go_out == pl_out and gs == 0 and ps == 0) else f"NO ({pl_out!r} vs {go_out!r})"
+            same = "yes" if (len(round_rows) == n and not any(r["errors"] for r in round_rows)
+                             and memory_ok and go_out == pl_out and gs == 0 and ps == 0) else "NO (see round errors)"
             flag = ""
             if ratio > budget:
                 flag += "  OVER BUDGET"
@@ -549,21 +760,26 @@ def main():
                                     "paslang": {"median_s": pw, "walls_s": LAST_WALLS.get((pexe, args), []),
                                                 "peak_rss_mb": pr, "peaks_mb": ppeaks, "status": ps, "output": pl_out},
                                     "round_ratios": LAST_RATIOS.get((gexe, pexe, args), []),
+                                    "rounds": round_rows,
+                                    "go_memory": gm, "paslang_memory": pm,
                                     "ratio_time": ratio, "ratio_mem": mem, "budget": budget, "same_output": same == "yes",
                                     "over": flag.strip()})
     print()
     for cpu in cpus:
         bad += checkptr(n, scale, cpu)
+    record["checkptr"] = list(LAST_CHECKPTR)
     print()
     probes()
     if json_path:
         import json
         record["machine"]["load_after"] = open("/proc/loadavg").read().strip()
         with open(json_path, "w") as f:
-            json.dump(record, f, indent=1)
+            json.dump(json_values(record), f, indent=1, allow_nan=False)
         print(f"record written to {json_path}")
     sys.exit(1 if bad else 0)
 
 
 if __name__ == "__main__":
-    main()
+    # The shared reference driver imports this module for the same state.
+    sys.modules.setdefault("run", sys.modules[__name__])
+    sys.exit(main())

@@ -131,9 +131,20 @@ The wiki records timings, memory and workloads.
 [Benchmark results](https://github.com/garacil/paslang/wiki/Benchmarks)
 
 The goal is to beat Go and Rust on equal workloads while preserving
-correctness and safety. The Go comparisons in `scripts/bench/` check
-output, time and peak memory. With Go installed, run `make bench`,
-`make bench-rounds` and `make bench-servers` to measure a checkout.
+correctness and safety. The benchmark harness checks complete output,
+time and peak memory against strict budgets. The ordinary Go suite keeps
+all 45 programs; Rust comparisons cover 11 programs and their 28 sections.
+After reviewing the host's Go CPU level, run
+`make bench BENCH_GO_NATIVE_LEVEL=v3` and
+`make bench-rounds BENCH_GO_NATIVE_LEVEL=v3`, replacing `v3` with the
+reviewed level for that host. Rust targets are `make bench-rust` and
+`make bench-rust-rounds`; target, standard library and C provider are
+recorded, and baseline timing requires linked-program ISA evidence.
+Go baseline timing also requires the pinned toolchain, a fresh CPU probe
+and a static linked program; other configurations fail before measurement.
+See the [benchmark instructions](scripts/bench/README.md) for configuration
+and the limits of each comparison. Normal `make check` tests the harness
+without requiring Go or Rust.
 
 ## Building
 
@@ -172,22 +183,36 @@ QEMU's build also uses `meson`, `ninja` and GLib development headers.
 SHA-256 and applies the patches in `scripts/qemu/`. It uses `Xvfb`
 for X11 tests when available.
 
-The power-of-ten oracle also needs Go's source Git checkout at `golang/`.
-In a fresh checkout, fetch the reference revision before running checks:
+The power-of-ten oracle needs Go's source Git checkout at `golang/`.
+The hash-template check also reads three pinned Go ARM assembly sources.
+Fetch and verify these test references before starting the full checks:
 
 ```sh
 git init golang
 git -C golang fetch --depth 1 https://go.googlesource.com/go f043823a99a4118989a34afec015d23b5d54d01e
 git -C golang checkout --detach FETCH_HEAD
 python3 scripts/pow10gen.py --check
+for ref_hash in sha1 sha256 sha512; do
+  mkdir -p "docs/ref/go1.23/crypto/$ref_hash"
+  curl --fail --location \
+    "https://raw.githubusercontent.com/golang/go/go1.23.0/src/crypto/$ref_hash/${ref_hash}block_arm64.s" \
+    --output "docs/ref/go1.23/crypto/$ref_hash/${ref_hash}block_arm64.s"
+done
+sha256sum -c <<'SHA256'
+4d91b79721d14d956c8a9b0fe0b343d8edde2ff955f00b38dd91d4df46d95010  docs/ref/go1.23/crypto/sha1/sha1block_arm64.s
+93fbac4fdcd22cf318637337aca6b139da43b4037b10ae6c81d8f7946abb63b1  docs/ref/go1.23/crypto/sha256/sha256block_arm64.s
+9d9198a1ca957bc8dea48655d0711d6f829e9c21cc0082c153d8b45a5842f6e3  docs/ref/go1.23/crypto/sha512/sha512block_arm64.s
+SHA256
+python3 -I scripts/hashgen.py --check
 ./configure --enable-arm64
 make all
 make check
 ```
 
-An isolated checkout can link `golang/` to an existing copy of that
-reference tree. The source is used by the test oracle; building and
-installing the compiler does not require it.
+An isolated maintainer checkout can link `golang/` and `docs/ref/` to
+existing verified reference trees. Preserve any existing QEMU archive
+before replacing a partial reference directory. These files are test
+inputs; building and installing the compiler does not require them.
 
 `make check` runs the golden programs, manual examples, server self-tests,
 compiler self-reproduction and arm64 checks under QEMU.

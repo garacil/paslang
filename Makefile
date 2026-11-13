@@ -55,6 +55,20 @@ SEED_DIR := bootstrap
 # machines, bin/paslangc-base and bin/paslangc-arm64, is built for base.
 SELF_CPU ?= native
 
+# The ordinary comparison retains the complete Go suite under the reviewed
+# CPU policy. Select the host/OS Go level explicitly; Rust is opt-in.
+BENCH_REFERENCE ?= go
+BENCH_PAIRS ?=
+BENCH_CPU ?=
+BENCH_GO_NATIVE_LEVEL ?=
+BENCH_RUST_TARGET ?=
+BENCH_RUST_SYSROOT ?=
+BENCH_RUST_PROVIDER ?=
+BENCH_RUST_CAPABILITY_PROOF ?=
+BENCH_REF_ARGS = $(if $(BENCH_REFERENCE),--reference "$(BENCH_REFERENCE)") $(if $(BENCH_CPU),--cpu "$(BENCH_CPU)") $(if $(BENCH_GO_NATIVE_LEVEL),--go-native-level "$(BENCH_GO_NATIVE_LEVEL)") $(if $(BENCH_RUST_TARGET),--rust-target "$(BENCH_RUST_TARGET)") $(if $(BENCH_RUST_SYSROOT),--rust-sysroot "$(BENCH_RUST_SYSROOT)") $(if $(BENCH_RUST_PROVIDER),--rust-provider "$(BENCH_RUST_PROVIDER)") $(if $(BENCH_RUST_CAPABILITY_PROOF),--rust-capability-proof "$(BENCH_RUST_CAPABILITY_PROOF)")
+BENCH_PAIR_ARGS = $(if $(BENCH_PAIRS),--pairs "$(BENCH_PAIRS)")
+BENCH_RUST_PAIRS := b1loop,b2str,b5map,b6smap,b7narrow,b8ptr,b10rot,b14sort,b24math,b26slice,b31map
+
 PASLANG_SRC := \
 	src/compiler/pasast.paslang \
 	src/compiler/paslex.paslang \
@@ -67,7 +81,7 @@ PASLANG_SRC := \
 	src/lib/paslinux.paslang \
 	cmd/paslangc/paslangc.paslang
 
-.PHONY: package distpkg release-assets check-release bench-rounds all hello check check-arm64 clean bootstrap-seed self self-arm64 stage compilers core core-arm64 libs libs-arm64 bench manual \
+.PHONY: package distpkg release-assets check-release bench-rust bench-rust-rounds bench-rounds all hello check check-arm64 clean bootstrap-seed self self-arm64 stage compilers core core-arm64 libs libs-arm64 bench manual \
 	install install-strip uninstall installdirs installcheck \
 	mostlyclean distclean maintainer-clean
 
@@ -1258,21 +1272,31 @@ hello: $(OUTDIR)/paslangc $(if $(AMD64),core,core-arm64) testdata/hello.paslang 
 # make check does not run this.
 bench: $(OUTDIR)/paslangc core libs
 	@mkdir -p $(BUILDDIR)/bench; rc=0; \
-	PATH="$(abspath $(OUTDIR)):$$PATH" python3 scripts/bench/run.py -n 7 --json $(BUILDDIR)/bench/last.json || rc=1; \
-	PATH="$(abspath $(OUTDIR)):$$PATH" python3 scripts/bench/build.py -n 8 --json $(BUILDDIR)/bench/build.json || rc=1; \
+	PATH="$(abspath $(OUTDIR)):$$PATH" python3 scripts/bench/run.py $(BENCH_REF_ARGS) $(BENCH_PAIR_ARGS) -n 7 --json $(BUILDDIR)/bench/last.json || rc=1; \
+	PATH="$(abspath $(OUTDIR)):$$PATH" python3 scripts/bench/build.py $(BENCH_REF_ARGS) -n 8 --json $(BUILDDIR)/bench/build.json || rc=1; \
 	exit $$rc
+
+# Rust has eleven audited twins, covering all twenty-eight sections of
+# those programs. Keep all other Go pairs in the ordinary bench target.
+# Native/base provider identity and baseline proof are explicit; failures
+# remain failures against the same strict time and memory budgets.
+bench-rust:
+	$(MAKE) bench BENCH_REFERENCE=rust BENCH_PAIRS="$(BENCH_RUST_PAIRS)"
+
+bench-rust-rounds:
+	$(MAKE) bench-rounds BENCH_REFERENCE=rust BENCH_PAIRS="$(BENCH_RUST_PAIRS)"
 
 # The debugger's terminal (P118): pasdbg <socket> speaks to a program
 # compiled with -debug and run with PASLANG_DEBUG=<socket>.
 $(OUTDIR)/pasdbg: $(OUTDIR)/paslangc $(if $(AMD64),libs,libs-arm64) cmd/pasdbg/pasdbg.paslang
 	$(OUTDIR)/paslangc -cpu base -Fu $(if $(AMD64),$(BUILDDIR),$(A64DIR)) -o $(OUTDIR)/pasdbg cmd/pasdbg/pasdbg.paslang
 
-# The three servers against their Go twins (P115): scripts/bench/servers.py.
+# The four servers against their Go twins: scripts/bench/servers.py.
 # The pairs again in alternating rounds (scripts/bench/rounds.py), the
 # median of each round's ratio: steadier than a median of runs on a
 # machine that runs anything else. After make bench, which builds them.
 bench-rounds:
-	python3 scripts/bench/rounds.py -n 40 --json $(BUILDDIR)/bench/rounds.json
+	PATH="$(abspath $(OUTDIR)):$$PATH" python3 scripts/bench/rounds.py $(BENCH_REF_ARGS) $(BENCH_PAIR_ARGS) -n 40 --json $(BUILDDIR)/bench/rounds.json
 
 # JSON's stages one at a time, GB/s and the time stamp counter's ticks a
 # byte, for this processor and the base one (P211): scripts/bench/k12json.
@@ -1285,6 +1309,12 @@ bench-servers: $(OUTDIR)/paslangc core libs
 
 check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch64
 	@python3 scripts/check_recipes.py
+	@python3 -I scripts/bench/check_harness.py
+	@python3 -I scripts/bench/check_peak.py
+	@python3 -I scripts/bench/check_reference_caps.py
+	@python3 -I scripts/bench/check_reference_policy.py
+	@python3 -I scripts/bench/check_metadata_scope.py
+	@python3 -I scripts/bench/check_build_report.py
 	@python3 -I scripts/check_nist_tables.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64)
 	@set -e; \
 	: P594: deterministic ECDSA raw signatures and key generation across CPU, inline and GC modes; \
