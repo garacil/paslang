@@ -182,6 +182,11 @@ BUDGET = {"b1loop": 0.99, "b2str": 0.99, "b3spawn": 0.90, "b4chan": 0.30, "b5map
 # 0.941/0.942, pipe 0.574/0.710, fanin 0.436/0.426, mutex 0.666/0.618,
 # cond 0.497/0.472, pow 0.946/0.897, b26slice:strings 0.787/0.858, deep
 # 0.862/0.857, raise 0.069/0.071, trees 0.919/0.906).
+# P254 Go acceptance, frozen 1.2.405 (2026-11-13): b26slice:ints takes
+# 0.712877/0.681668 of Go time (native/base), Q3 0.750116/0.703000,
+# peak RSS 0.574234/0.574465, forty alternating rounds and five RSS runs.
+# P287 already supplies the class/frontier fix. Preserve both 0.99 budgets;
+# these Go results do not resolve the separate Rust integer-append P608.
 for _b in PAIRS[11:]:
     for _sec in SECTIONS[_b]:
         BUDGET.setdefault(_b + ":" + _sec, 0.99)

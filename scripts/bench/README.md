@@ -10,6 +10,28 @@ b1loop, b2str, b5map, b6smap, b7narrow, b8ptr, b10rot, b14sort, b24math,
 b26slice and b31map. An explicitly requested unsupported Rust section is
 refused before building. It is never counted as a win.
 
+## Recorded integer-append comparison
+
+The [frozen 1.2.405 measurements](https://github.com/garacil/paslang/wiki/Benchmark-Results-P525-405)
+recorded on 2026-11-13 meet P254's original Go acceptance. Each side appends
+twenty million integers individually and reads every element for the sum;
+each timed sample covers the complete program process, including setup,
+allocation and any collection during execution.
+Ratios below are paslang / Go on the recorded Ryzen 7 4800H host.
+
+| CPU | Median paired time ratio | Time Q3 | Peak-RSS ratio | Time / memory budgets |
+|---|---:|---:|---:|---|
+| native | 0.712877 | 0.750116 | 0.574234 | 0.99 / 0.99 |
+| base | 0.681668 | 0.703000 | 0.574465 | 0.99 / 0.99 |
+
+Both profiles retain forty alternating rounds and five traced memory samples
+per side, with exact output and clean statuses and diagnostics. P287's
+existing class/frontier allocation fix is present in both the measured and
+current runtime; current 1.2.406 correctness, self-reproduction, SDK and
+installation checks pass with that implementation unchanged. This records
+existing performance evidence, not a new 1.2.406 timing run. The budgets are
+unchanged. Rust integer-append losses remain open under P608.
+
 ## Go
 
 Review the host and operating-system CPU capabilities, then set the highest

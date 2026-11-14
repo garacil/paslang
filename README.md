@@ -146,6 +146,12 @@ See the [benchmark instructions](scripts/bench/README.md) for configuration
 and the limits of each comparison. Normal `make check` tests the harness
 without requiring Go or Rust.
 
+The [latest recorded runtime results](https://github.com/garacil/paslang/wiki/Benchmark-Results-P525-405)
+include twenty million integer appends in about 29% less elapsed time with
+`-cpu native` and 32% less with `-cpu base`, using about 43% less peak memory
+than Go. These frozen 1.2.405 measurements meet P254's original Go targets;
+the separate Rust integer-append target remains open.
+
 ## Building
 
 paslang runs on GNU/Linux, kernel 6.13 or newer, on amd64 or arm64.
