@@ -165,6 +165,18 @@ begin
     Result := '#' + IntToStr(K shr 12) + ', lsl #12';
 end;
 
+{ UInt32 operations emitted with an intrinsically canonical destination
+  (P548). The result context, not an operand's width, selects this path.
+  SHL/SHR/SAR retain their modulo64 contract; division and rotations keep
+  their existing paths and cleanup. }
+function UInt32ALU(E: PExpr): Boolean;
+begin
+  Result := (E <> nil) and (E^.Typ = TyUInt32) and
+    (((E^.Kind = ekUn) and ((E^.Un = uoNeg) or (E^.Un = uoNot))) or
+    ((E^.Kind = ekBin) and ((E^.Bin = boAdd) or (E^.Bin = boSub) or
+    (E^.Bin = boMul) or (E^.Bin = boAnd) or (E^.Bin = boOr) or (E^.Bin = boXor))));
+end;
+
 function VarLabel(const N: string): string;
 begin
   Result := 'v_' + ToLower(N);
@@ -284,6 +296,14 @@ type
     Cost, Kind, Sh: LongInt;
   end;
   TMulComboArr = array of TMulCombo;
+  { One recipe bank per arithmetic width (P548). Switching between
+    address products and UInt32 arithmetic does not discard either
+    constant cache. A bank is rebuilt when its tuning processor changes. }
+  TMulRecipeCache = record
+    C: TMulComboArr;
+    Tune, Cost: LongInt;
+    Ks, Form, Inner, Outer: TInt64Arr;
+  end;
 
   TMapSite = record
     Lab: string;
@@ -431,6 +451,8 @@ type
     FR8Lent: Boolean;   { a region of integer arithmetic keeps a variable in r8 (1.1.1) }
     FMulC: TMulComboArr;   { the one-instruction combinations of P295's recipes }
     FMulCTune: LongInt;    { the processor FMulC was made for, -1 for none yet }
+    FMulWidth: LongInt;    { 32 or 64 for the active combinations and keys }
+    FMulBank: array[0..1] of TMulRecipeCache;
     FMulCost: LongInt;     { a multiply's cost there }
     FMulKs: TInt64Arr;     { the constants a recipe was looked for, and what was found }
     FMulForm, FMulIn, FMulOut: TInt64Arr;
@@ -1127,6 +1149,16 @@ type
     function SignFlipped(E: PExpr): PExpr;
     function UnsCmp(E: PExpr; D: LongInt; out U: PExpr): Boolean;
     function OrdSimple(E: PExpr; D: LongInt): Boolean;
+    function EmitBitExtractArm(E: PExpr; D: LongInt): Boolean;
+    function UInt32Reg(const R: string): string;
+    procedure UInt32Imm(const R: string; K: Int64);
+    function UInt32Operand(E: PExpr; D: LongInt): string;
+    function UInt32HeldShift(E: PExpr; out R: string; out N: LongInt): Boolean;
+    procedure UInt32Const(Op: TBinOp; const D, S: string; K: Int64);
+    function UInt32MulTo(const D, S: string; K: Int64): Boolean;
+    procedure EmitUInt32Ord(E: PExpr; D: LongInt);
+    procedure EmitUInt32RawValue(E: PExpr);
+    procedure EmitUInt32Raw(E: PExpr);
     function OrdOperand(E: PExpr; D: LongInt): string;
     procedure EmitOrdTo(E: PExpr; D: LongInt);
     procedure EmitOrdTo0(E: PExpr; D: LongInt);
@@ -1144,16 +1176,16 @@ type
     function WordScalar(E: PExpr): Boolean;
     function PoolSize: LongInt;
     procedure MulImm(const Op, R: string);
-    procedure MulCombos;
-    function MulRecipe(K: Int64; out Form, Inner, Outer: LongInt): Boolean;
-    procedure MulRecipeVia(const D, S: string; F, I, O: LongInt; const T: string);
+    procedure MulCombos(Width: LongInt = 64);
+    function MulRecipe(K: Int64; out Form, Inner, Outer: LongInt; Width: LongInt = 64): Boolean;
+    procedure MulRecipeVia(const D, S: string; F, I, O: LongInt; const T: string; Width: LongInt = 64);
     procedure ScaleTo(const D, S: string; K: Int64; const Tmp: string);
     procedure ScaleAddArm(const D, B, X: string; K: Int64; const T1, T2: string);
     procedure ScaleSubArm(const D, B, X: string; K: Int64; const T: string);
     procedure ScaleAddX86(const D, B, X: string; K: Int64; const Tmp: string);
     procedure ScaleAddDispX86(const D, B, X: string; K, Disp: Int64; const Tmp: string);
-    procedure MulComboArm(const C: TMulCombo; const D, X, Y: string);
-    procedure MulComboX86(const C: TMulCombo; const D, X, Y: string);
+    procedure MulComboArm(const C: TMulCombo; const D, X, Y: string; Width: LongInt = 64);
+    procedure MulComboX86(const C: TMulCombo; const D, X, Y: string; Width: LongInt = 64);
     function MulByK(const R: string; K: Int64): Boolean;
     function MulByKTo(const D, S: string; K: Int64): Boolean;
     function MulByKVia(const D, S: string; K: Int64; const T1, T2: string): Boolean;
@@ -3766,6 +3798,15 @@ begin
       Exit;
     end;
   end;
+end;
+
+{ ARM DDI0487M.c C6.2.14, J1.2.3.19: W logical immediates have
+  element sizes2..32 and exclude zero/all-ones. Repeating the low word
+  selects that subset of the existing DecodeBitMasks test (P548). }
+function ArmLogImm32(V: Int64): Boolean;
+begin
+  V := V and $FFFFFFFF;
+  Result := (V <> 0) and (V <> $FFFFFFFF) and ArmLogImm(V or (V shl 32));
 end;
 
 { arm64: the lines that put V in Reg as Go's assembler does
@@ -10481,6 +10522,14 @@ begin
   k := WrapInt(e^.R^.Num, d.Typ);
   if d.Reg <> '' then
   begin
+    if d.Typ = TyUInt32 then
+    begin
+      { SDM ADD/SUB/AND/OR/XOR r32, imm32 and AMD APM3.1.2.3:
+        every selected form writes the canonical whole register (P548). }
+      Line('  ' + op + 'l $' + IntToStr(k) + ', %' + X86Sub(d.Reg, 4));
+      Result := True;
+      Exit;
+    end;
     if Fits32(k) then
       Line('  ' + op + 'q $' + IntToStr(k) + ', %' + d.Reg)
     else
@@ -22310,8 +22359,8 @@ end;
   was cleaned again after the shift. }
 function TEmitter.KeepsClean(E: PExpr): Boolean;
 begin
-  Result := False;
-  if E = nil then
+  Result := UInt32ALU(E);
+  if Result or (E = nil) then
     Exit;
   if E^.Kind = ekBin then
     Result := (E^.Bin = boShr) or ((E^.Bin = boSar) and
@@ -28210,11 +28259,14 @@ begin
     tl := 0;
     th := 255;
   end;
-  { the operation's, in 64 bits: a narrow one wraps in its width, which
-    the type's range already bounds }
+  { The arithmetic rules below require 64 bits: narrow add/sub may
+    wrap, so their mathematical interval cannot be intersected with the
+    type. UInt32 AND is also bounded by either nonnegative operand:
+    the result is its low32-bit intersection, never above that bound. }
   ok := False;
-  if (TSize(E^.Typ) = 8) and (TKind(E^.Typ) = tykInteger) and (E^.Kind = ekBin) and
-    (E^.L <> nil) and (E^.R <> nil) then
+  if (TKind(E^.Typ) = tykInteger) and (E^.Kind = ekBin) and
+    (E^.L <> nil) and (E^.R <> nil) and
+    ((TSize(E^.Typ) = 8) or ((E^.Typ = TyUInt32) and (E^.Bin = boAnd))) then
     case E^.Bin of
       boAnd:
         begin
@@ -28704,6 +28756,13 @@ begin
       Line('  mov x0, ' + OrdPool(0))
     else
       Line('  movq %' + OrdPool(0) + ', %rax');
+    Exit;
+  end;
+  { Every selected raw UInt32 ALU node is canonical too (P548).
+    This is after the pool, before call-containing64-bit fallbacks. }
+  if UInt32ALU(E) then
+  begin
+    EmitUInt32Raw(E);
     Exit;
   end;
   { a word field of an object a register holds: one load from that
@@ -36272,6 +36331,490 @@ end;
   immediate or a memory operand when amd64 can take one, else a
   register (pool D+1 for a subtree; rax on amd64 or x17 on arm64 for a
   constant or a variable that needs loading). }
+{ UInt32 arithmetic (P548): AMD APM vol1 3.1.2.3, Intel SDM ADD,
+  SUB, AND, OR, XOR, NEG, NOT, IMUL and LEA; ARM DDI 0487 M.c C6.2.5,
+  C6.2.14/15, C6.2.275/293, C6.2.282-285, C6.2.295 and the logical
+  shifted-register forms. Go AMD64.rules lowers uint32 ALU to L forms;
+  ARM64.rules uses MULW. Paslang additionally keeps the whole register
+  canonical at each use. Register arguments below retain their 64-bit
+  names so addresses and physical-register identity do not change. }
+{ ARM DDI0487M.c C6.2.487/488: UBFX copies the selected field and
+  zeroes the rest. Go ARM64.rules folds (x shr K) and (2^W-1) the same
+  way. The source still has its original typed load and the language's
+  effective shift is modulo64; fields crossing bit63 keep the old path. }
+function TEmitter.EmitBitExtractArm(E: PExpr; D: LongInt): Boolean;
+var
+  shifted, mask: PExpr;
+  m: Int64;
+  lsb, bits: LongInt;
+  src: string;
+begin
+  Result := False;
+  if (not FArm) or (E = nil) or (E^.Kind <> ekBin) or
+    (E^.Bin <> boAnd) or (not IsIntId(E^.Typ)) then
+    Exit;
+  shifted := E^.L;
+  mask := E^.R;
+  if (shifted <> nil) and (shifted^.Kind = ekInt) then
+  begin
+    shifted := E^.R;
+    mask := E^.L;
+  end;
+  if (shifted = nil) or (mask = nil) or (mask^.Kind <> ekInt) or
+    (shifted^.Kind <> ekBin) or (shifted^.Bin <> boShr) or
+    (shifted^.R = nil) or (shifted^.R^.Kind <> ekInt) then
+    Exit;
+  m := mask^.Num;
+  if E^.Typ = TyUInt32 then m := m and $FFFFFFFF;
+  if (m <= 0) or ((m and (m + 1)) <> 0) then
+    Exit;
+  lsb := LongInt(shifted^.R^.Num and 63);
+  bits := 64 - LeadingZeros(m);
+  if (lsb = 0) or (bits > 64 - lsb) then
+    Exit;
+  FSkipCanon := False;
+  src := WordReg(shifted^.L);
+  if src = '' then
+  begin
+    EmitOrdTo(shifted^.L, D);
+    src := OrdPool(D);
+  end;
+  Line('  ubfx ' + OrdPool(D) + ', ' + src + ', #' + IntToStr(lsb) + ', #' + IntToStr(bits));
+  Result := True;
+end;
+
+function TEmitter.UInt32Reg(const R: string): string;
+begin
+  if FArm then
+    Result := WReg(R)
+  else
+    Result := '%' + X86Sub(R, 4);
+end;
+
+procedure TEmitter.UInt32Imm(const R: string; K: Int64);
+var
+  lo, hi: Int64;
+  w: string;
+begin
+  K := K and $FFFFFFFF;
+  w := UInt32Reg(R);
+  if not FArm then
+  begin
+    Line('  movl $' + IntToStr(K) + ', ' + w);
+    Exit;
+  end;
+  lo := K and $FFFF;
+  hi := K shr 16;
+  { W MOVZ/MOVN/MOVK allow only shifts 0/16. Prefer one instruction
+    whenever a wide immediate or logical immediate represents K. }
+  if hi = 0 then
+    Line('  movz ' + w + ', #' + IntToStr(lo))
+  else if lo = 0 then
+    Line('  movz ' + w + ', #' + IntToStr(hi) + ', lsl #16')
+  else if hi = $FFFF then
+    Line('  movn ' + w + ', #' + IntToStr(lo xor $FFFF))
+  else if lo = $FFFF then
+    Line('  movn ' + w + ', #' + IntToStr(hi xor $FFFF) + ', lsl #16')
+  else if ArmLogImm32(K) then
+    Line('  orr ' + w + ', wzr, #' + HexWord(K))
+  else
+  begin
+    Line('  movz ' + w + ', #' + IntToStr(lo));
+    Line('  movk ' + w + ', #' + IntToStr(hi) + ', lsl #16');
+  end;
+end;
+
+{ An ALU operand, without widening a typed load. Only actual 4-byte
+  storage can fold into an amd64 memory operand; Byte/Word and 8-byte
+  reads use their original typed loads before their low 32 bits are used. }
+function TEmitter.UInt32Operand(E: PExpr; D: LongInt): string;
+var
+  s: TSym;
+  k: Int64;
+begin
+  if E^.Kind = ekInt then
+  begin
+    k := E^.Num and $FFFFFFFF;
+    if FArm then
+    begin
+      UInt32Imm('x17', k);
+      Result := 'w17';
+    end
+    else
+      Result := '$' + IntToStr(k);
+    Exit;
+  end;
+  if (E^.Kind = ekVar) and WordVar(E, s) then
+  begin
+    if s.Reg <> '' then
+      Result := UInt32Reg(s.Reg)
+    else if (not FArm) and (TSize(s.Typ) = 4) then
+      Result := MemA(s)
+    else if FArm then
+    begin
+      LoadWordVar(s, 'x17');
+      Result := 'w17';
+    end
+    else
+    begin
+      LoadWordVar(s, 'rax');
+      Result := '%eax';
+    end;
+    Exit;
+  end;
+  if (not FArm) and LoadKind(E) and (TSize(LoadTyp(E)) = 4) and
+    WordMemOK(E, D + 1) then
+  begin
+    Result := EmitWordMem(E, D + 1);
+    Exit;
+  end;
+  EmitOrdTo(E, D + 1);
+  Result := UInt32Reg(OrdPool(D + 1));
+end;
+
+{ A held UInt32 source is already zero-extended. For a constant
+  logical shift by0..31 its W shifted-register form equals the language's
+  64-bit shift. No source load, call, count evaluation or side effect is
+  omitted by using it (P548; ARM DDI0487M.c C6.2.156, Go XORshiftRL). }
+function TEmitter.UInt32HeldShift(E: PExpr; out R: string; out N: LongInt): Boolean;
+var
+  s: TSym;
+begin
+  Result := False;
+  R := '';
+  N := 0;
+  if (E = nil) or (E^.Kind <> ekBin) or (E^.Bin <> boShr) or
+    (E^.Typ <> TyUInt32) or (E^.L = nil) or (E^.R = nil) or
+    (E^.L^.Kind <> ekVar) or (E^.R^.Kind <> ekInt) then
+    Exit;
+  if not WordVar(E^.L, s) then
+    Exit;
+  if (s.Typ <> TyUInt32) or (s.Reg = '') then
+    Exit;
+  N := LongInt(E^.R^.Num and 63);
+  if N > 31 then
+    Exit;
+  R := s.Reg;
+  Result := True;
+end;
+
+{ The existing cost-selected multiplication combination, written at
+  32 bits. LEA retains 64-bit address registers and truncates only its
+ destination (SDM vol 2A table 1-52). No memory is read by LEA. }
+function TEmitter.UInt32MulTo(const D, S: string; K: Int64): Boolean;
+var
+  f, i, o: LongInt;
+  dst, src, tmp: string;
+begin
+  Result := True;
+  K := K and $FFFFFFFF;
+  if K = 0 then
+  begin
+    UInt32Imm(D, 0);
+    Exit;
+  end;
+  if K = 1 then
+  begin
+    { WordReg may hold a signed or wider stored value. Even D=S must
+      write the low word unless that source has a separate clean proof. }
+    if FArm then
+      Line('  mov ' + UInt32Reg(D) + ', ' + UInt32Reg(S))
+    else
+      Line('  movl ' + UInt32Reg(S) + ', ' + UInt32Reg(D));
+    Exit;
+  end;
+  Result := False;
+  if (not FArm) and ((S = 'r13') or (S = 'rbp') or (D = 'r13') or (D = 'rbp')) then
+    Exit;
+  if not MulRecipe(K, f, i, o, 32) then
+    Exit;
+  dst := D;
+  src := S;
+  if FArm then
+    tmp := 'x17'
+  else
+  begin
+    dst := '%' + D;
+    src := '%' + S;
+    if (D <> 'rax') and (S <> 'rax') then tmp := '%rax'
+    else if (D <> 'rcx') and (S <> 'rcx') then tmp := '%rcx'
+    else tmp := '%rdx';
+  end;
+  MulRecipeVia(dst, src, f, i, o, tmp, 32);
+  Result := True;
+end;
+
+{ D := S op K, including a high-bit imm32. Register names remain whole
+  until the final instruction. Arithmetic is modulo 2^32 throughout. }
+procedure TEmitter.UInt32Const(Op: TBinOp; const D, S: string; K: Int64);
+var
+  cc, rhs, kd: string;
+  signedk: Int64;
+begin
+  K := K and $FFFFFFFF;
+  if (Op = boMul) and UInt32MulTo(D, S, K) then
+    Exit;
+  case Op of
+    boAdd: cc := 'add';
+    boSub: cc := 'sub';
+    boMul: cc := 'mul';
+    boAnd: cc := 'and';
+    boOr: cc := 'orr';
+  else
+    cc := 'eor';
+  end;
+  if FArm then
+  begin
+    kd := '';
+    if (Op = boAdd) or (Op = boSub) then
+    begin
+      signedk := K;
+      if signedk > $7FFFFFFF then
+        signedk := signedk - 4294967296;
+      kd := ArmAddImm(K);
+      if (kd = '') and (signedk < 0) and (ArmAddImm(-signedk) <> '') then
+      begin
+        kd := ArmAddImm(-signedk);
+        if Op = boAdd then cc := 'sub' else cc := 'add';
+      end;
+    end
+    else if (Op <> boMul) and ArmLogImm32(K) then
+      kd := '#' + HexWord(K);
+    if kd = '' then
+    begin
+      UInt32Imm('x17', K);
+      kd := 'w17';
+    end;
+    Line('  ' + cc + ' ' + UInt32Reg(D) + ', ' + UInt32Reg(S) + ', ' + kd);
+    Exit;
+  end;
+  rhs := '$' + IntToStr(K);
+  if Op = boMul then
+  begin
+    Line('  imull ' + rhs + ', ' + UInt32Reg(S) + ', ' + UInt32Reg(D));
+    Exit;
+  end;
+  if D <> S then
+    Line('  movl ' + UInt32Reg(S) + ', ' + UInt32Reg(D));
+  if Op = boOr then cc := 'or' else if Op = boXor then cc := 'xor';
+  Line('  ' + cc + 'l ' + rhs + ', ' + UInt32Reg(D));
+end;
+
+procedure TEmitter.EmitUInt32Ord(E: PExpr; D: LongInt);
+var
+  r, src, op, cc: string;
+  t: PExpr;
+  shift, was: LongInt;
+begin
+  r := OrdPool(D);
+  if E^.Kind = ekUn then
+  begin
+    if FArm and (E^.Un = uoNot) and (E^.L^.Kind = ekBin) and
+      (E^.L^.Bin = boXor) and (E^.L^.Typ = TyUInt32) then
+    begin
+      EmitOrdTo(E^.L^.L, D);
+      op := UInt32Operand(E^.L^.R, D);
+      Line('  eon ' + UInt32Reg(r) + ', ' + UInt32Reg(r) + ', ' + op);
+      Exit;
+    end;
+    src := WordReg(E^.L);
+    if (not FArm) or (src = '') then
+    begin
+      EmitOrdTo(E^.L, D);
+      src := r;
+    end;
+    if E^.Un = uoNeg then cc := 'neg' else cc := 'mvn';
+    if FArm then
+      Line('  ' + cc + ' ' + UInt32Reg(r) + ', ' + UInt32Reg(src))
+    else if E^.Un = uoNeg then
+      Line('  negl ' + UInt32Reg(r))
+    else
+      Line('  notl ' + UInt32Reg(r));
+    Exit;
+  end;
+  { Form the original left address with its original pool budget and
+    evaluation order. When that address does not use destination D, a
+    pure held UInt32 shift can fill D without changing any address
+    register. XORL then consumes the original four-byte memory operand.
+    If D is part of the address, load it first and keep the ordinary
+    right-operand route. Neither path evaluates the address twice. }
+  if (not FArm) and (E^.Bin = boXor) and LoadKind(E^.L) and
+    (TSize(LoadTyp(E^.L)) = 4) and WordMemOK(E^.L, D) and
+    UInt32HeldShift(E^.R, src, shift) and (src <> r) then
+  begin
+    op := EmitWordMem(E^.L, D);
+    if Pos('%' + r, op) = 0 then
+    begin
+      Line('  movl ' + UInt32Reg(src) + ', ' + UInt32Reg(r));
+      if shift <> 0 then
+        Line('  shrl $' + IntToStr(shift) + ', ' + UInt32Reg(r));
+      OpLineIn(E^.L, was);
+      Line('  xorl ' + op + ', ' + UInt32Reg(r));
+      FOpLine := was;
+    end
+    else
+    begin
+      OpLineIn(E^.L, was);
+      WordLoad(op, LoadTyp(E^.L), r);
+      FOpLine := was;
+      op := UInt32Operand(E^.R, D);
+      Line('  xorl ' + op + ', ' + UInt32Reg(r));
+    end;
+    Exit;
+  end;
+  { AArch64 EOR of a W shifted register (C6.2.156) combines the pure
+    shift and XOR, including count0. The held source's actual storage,
+    rather than its contextual expression label, proves the upper bits. }
+  if FArm and (E^.Bin = boXor) and UInt32HeldShift(E^.R, src, shift) and
+    (src <> r) then
+  begin
+    EmitOrdTo(E^.L, D);
+    Line('  eor ' + UInt32Reg(r) + ', ' + UInt32Reg(r) + ', ' +
+      UInt32Reg(src) + ', lsr #' + IntToStr(shift));
+    Exit;
+  end;
+  if (E^.L^.Kind = ekInt) and (E^.R^.Kind <> ekInt) and (E^.Bin <> boSub) then
+  begin
+    t := E^.L; E^.L := E^.R; E^.R := t;
+  end;
+  src := WordReg(E^.L);
+  if (E^.R^.Kind = ekInt) and (src <> '') then
+  begin
+    UInt32Const(E^.Bin, r, src, E^.R^.Num);
+    Exit;
+  end;
+  if (not FArm) or (src = '') then
+  begin
+    EmitOrdTo(E^.L, D);
+    src := r;
+  end;
+  if E^.R^.Kind = ekInt then
+  begin
+    UInt32Const(E^.Bin, r, src, E^.R^.Num);
+    Exit;
+  end;
+  if FArm and (E^.R^.Kind = ekUn) and (E^.R^.Un = uoNot) and
+    (E^.R^.Typ = TyUInt32) and
+    ((E^.Bin = boAnd) or (E^.Bin = boOr) or (E^.Bin = boXor)) then
+  begin
+    op := UInt32Operand(E^.R^.L, D);
+    if E^.Bin = boAnd then cc := 'bic'
+    else if E^.Bin = boOr then cc := 'orn' else cc := 'eon';
+  end
+  else
+  begin
+    op := UInt32Operand(E^.R, D);
+    case E^.Bin of
+      boAdd: cc := 'add';
+      boSub: cc := 'sub';
+      boMul: cc := 'mul';
+      boAnd: cc := 'and';
+      boOr: cc := 'orr';
+    else cc := 'eor';
+    end;
+  end;
+  if FArm then
+    Line('  ' + cc + ' ' + UInt32Reg(r) + ', ' + UInt32Reg(src) + ', ' + op)
+  else
+  begin
+    if E^.Bin = boMul then cc := 'imul'
+    else if E^.Bin = boOr then cc := 'or'
+    else if E^.Bin = boXor then cc := 'xor';
+    Line('  ' + cc + 'l ' + op + ', ' + UInt32Reg(r));
+  end;
+end;
+
+{ The raw binary emitter treats a one-character literal as its ordinal,
+  rather than the string pointer returned by ordinary EmitExpr. }
+procedure TEmitter.EmitUInt32RawValue(E: PExpr);
+begin
+  if (E^.Kind = ekStr) and (Length(E^.Txt) = 1) then
+  begin
+    if FArm then UInt32Imm('x0', Ord(E^.Txt[1]))
+    else UInt32Imm('rax', Ord(E^.Txt[1]));
+  end
+  else
+    EmitExpr(E);
+end;
+
+procedure TEmitter.EmitUInt32Raw(E: PExpr);
+var
+  r, lhs, op, cc: string;
+begin
+  if FArm then r := 'x0' else r := 'rax';
+  if E^.Kind = ekUn then
+  begin
+    EmitUInt32RawValue(E^.L);
+    if FArm then
+    begin
+      if E^.Un = uoNeg then cc := 'neg' else cc := 'mvn';
+      Line('  ' + cc + ' w0, w0');
+    end
+    else if E^.Un = uoNeg then Line('  negl %eax')
+    else Line('  notl %eax');
+    Exit;
+  end;
+  if E^.R^.Kind = ekInt then
+  begin
+    EmitUInt32RawValue(E^.L);
+    UInt32Const(E^.Bin, r, r, E^.R^.Num);
+    Exit;
+  end;
+  if (E^.L^.Kind = ekInt) and (E^.Bin <> boSub) then
+  begin
+    EmitUInt32RawValue(E^.R);
+    UInt32Const(E^.Bin, r, r, E^.L^.Num);
+    Exit;
+  end;
+  { Retain existing call-order proofs, parking and typed leaf loads. }
+  if not LeftFirst(E) then
+  begin
+    EmitUInt32RawValue(E^.L);
+    if FArm then PshK('x0', VCls(E^.L^.Typ, 0))
+    else PushK('rax', VCls(E^.L^.Typ, 0));
+    EmitUInt32RawValue(E^.R);
+  end;
+  PopLeft;
+  if FRightOn then
+  begin
+    FRightOn := False;
+    UInt32Const(E^.Bin, r, r, FRightK);
+    Exit;
+  end;
+  case E^.Bin of
+    boAdd: cc := 'add';
+    boSub: cc := 'sub';
+    boMul: cc := 'mul';
+    boAnd: cc := 'and';
+    boOr: cc := 'orr';
+  else cc := 'eor';
+  end;
+  if FArm then
+    Line('  ' + cc + ' w0, w1, w0')
+  else if E^.Bin = boSub then
+  begin
+    Line('  subl %eax, %ecx');
+    Line('  movl %ecx, %eax');
+  end
+  else
+  begin
+    lhs := LeftSrc;
+    if (lhs <> '') and (lhs[1] = '%') then
+      op := UInt32Reg(Copy(lhs, 2, Length(lhs) - 1))
+    else
+    begin
+      { LeftFirst folds memory only for an actual 8-byte typed leaf.
+        Preserve that read before taking the low word, never shrink it. }
+      Line('  movq ' + lhs + ', %rcx');
+      op := '%ecx';
+    end;
+    if E^.Bin = boMul then cc := 'imul'
+    else if E^.Bin = boOr then cc := 'or'
+    else if E^.Bin = boXor then cc := 'xor';
+    Line('  ' + cc + 'l ' + op + ', %eax');
+  end;
+end;
+
 function TEmitter.OrdOperand(E: PExpr; D: LongInt): string;
 var
   s: TSym;
@@ -36371,6 +36914,16 @@ var
   t: PExpr;
   zt, fz, oz, was: LongInt;
 begin
+  if EmitBitExtractArm(E, D) then
+    Exit;
+  { Intercept before the old64-bit constant recipes and early exits.
+    A store may skip canonicalization, but this route always produces it. }
+  if UInt32ALU(E) then
+  begin
+    FSkipCanon := False;
+    EmitUInt32Ord(E, D);
+    Exit;
+  end;
   r := OrdPool(D);
   skip := FSkipCanon;
   FSkipCanon := False;
@@ -37531,9 +38084,9 @@ end;
   result twice (A), on x and the first's result (B), or on the first's
   result and x (C), the cheapest under a multiply. }
 
-procedure TEmitter.MulCombos;
+procedure TEmitter.MulCombos(Width: LongInt);
 var
-  i: LongInt;
+  i, bank: LongInt;
 
   procedure R(A, B: Int64; Cost, Kind, Sh: LongInt);
   var
@@ -37549,18 +38102,32 @@ var
   end;
 
 begin
-  if FArm then
+  if FMulWidth <> Width then
   begin
-    if FMulCTune = FTune then
-      Exit;
-    FMulCTune := FTune;
-  end
-  else
-  begin
-    if FMulCTune = 0 then
-      Exit;
-    FMulCTune := 0;
+    if FMulWidth <> 0 then
+    begin
+      if FMulWidth = 32 then bank := 0 else bank := 1;
+      FMulBank[bank].C := FMulC;
+      FMulBank[bank].Tune := FMulCTune;
+      FMulBank[bank].Cost := FMulCost;
+      FMulBank[bank].Ks := FMulKs;
+      FMulBank[bank].Form := FMulForm;
+      FMulBank[bank].Inner := FMulIn;
+      FMulBank[bank].Outer := FMulOut;
+    end;
+    if Width = 32 then bank := 0 else bank := 1;
+    FMulC := FMulBank[bank].C;
+    FMulCTune := FMulBank[bank].Tune;
+    FMulCost := FMulBank[bank].Cost;
+    FMulKs := FMulBank[bank].Ks;
+    FMulForm := FMulBank[bank].Form;
+    FMulIn := FMulBank[bank].Inner;
+    FMulOut := FMulBank[bank].Outer;
+    FMulWidth := Width;
   end;
+  if (FMulCTune = FTune) and (Length(FMulC) <> 0) then
+    Exit;
+  FMulCTune := FTune;
   FMulC := nil;
   FMulKs := nil;
   FMulForm := nil;
@@ -37568,19 +38135,27 @@ begin
   FMulOut := nil;
   if FArm then
   begin
-    FMulCost := CpuMulCostArm(FTune);
+    FMulCost := CpuMulCostArm(FTune, Width);
     R(1, 1, 10, 1, 0);
     R(-1, 0, 10, 2, 0);
     R(1, -1, 10, 3, 0);
-    for i := 1 to 63 do
+    for i := 1 to Width - 1 do
     begin
+      { Prefer the plain modular shift for bit31, before an equivalent
+        shifted NEG. The 64-bit recipe order stays unchanged. }
+      if Width = 32 then
+      begin
+        if i = 1 then R(Int64(1) shl i, 0, 9, 7, i)
+        else R(Int64(1) shl i, 0, 10, 7, i);
+      end;
       R(1, Int64(1) shl i, CpuShiftAddCostArm(FTune, i), 4, i);
       R(-(Int64(1) shl i), 0, CpuShiftAddCostArm(FTune, i), 5, i);
       R(1, -(Int64(1) shl i), CpuShiftAddCostArm(FTune, i), 6, i);
-      if i = 1 then
-        R(Int64(1) shl i, 0, 9, 7, i)
-      else
-        R(Int64(1) shl i, 0, 10, 7, i);
+      if Width = 64 then
+      begin
+        if i = 1 then R(Int64(1) shl i, 0, 9, 7, i)
+        else R(Int64(1) shl i, 0, 10, 7, i);
+      end;
     end;
   end
   else
@@ -37592,7 +38167,7 @@ begin
     R(1, 2, 10, 8, 1);
     R(1, 4, 10, 8, 2);
     R(1, 8, 10, 8, 3);
-    for i := 2 to 63 do
+    for i := 2 to Width - 1 do
       R(Int64(1) shl i, 0, 11, 7, i);
   end;
 end;
@@ -37600,13 +38175,23 @@ end;
 { The recipe for x * K: Form 1 one combination (Inner), 2 to 4 two (A, B,
   C above), the cheapest under a multiply, as Go builds its table; False
   when a multiply costs no more. Found once a constant. }
-function TEmitter.MulRecipe(K: Int64; out Form, Inner, Outer: LongInt): Boolean;
+function TEmitter.MulRecipe(K: Int64; out Form, Inner, Outer: LongInt; Width: LongInt): Boolean;
 var
   i, o, n: SizeInt;
   best, c: LongInt;
   vi: Int64;
+
+  function Same(A, B: Int64): Boolean;
+  begin
+    if Width = 32 then
+      Result := (A and $FFFFFFFF) = (B and $FFFFFFFF)
+    else
+      Result := A = B;
+  end;
+
 begin
-  MulCombos;
+  if Width = 32 then K := K and $FFFFFFFF;
+  MulCombos(Width);
   for i := 0 to High(FMulKs) do
     if FMulKs[i] = K then
     begin
@@ -37621,7 +38206,7 @@ begin
   Outer := 0;
   best := FMulCost;
   for i := 0 to High(FMulC) do
-    if (FMulC[i].A + FMulC[i].B = K) and (FMulC[i].Cost < best) then
+    if Same(FMulC[i].A + FMulC[i].B, K) and (FMulC[i].Cost < best) then
     begin
       best := FMulC[i].Cost;
       Form := 1;
@@ -37635,21 +38220,21 @@ begin
       c := FMulC[i].Cost + FMulC[o].Cost;
       if c >= best then
         Continue;
-      if vi * (FMulC[o].A + FMulC[o].B) = K then
+      if Same(vi * (FMulC[o].A + FMulC[o].B), K) then
       begin
         best := c;
         Form := 2;
         Inner := LongInt(i);
         Outer := LongInt(o);
       end
-      else if (FMulC[o].B <> 0) and (FMulC[o].A + FMulC[o].B * vi = K) then
+      else if (FMulC[o].B <> 0) and Same(FMulC[o].A + FMulC[o].B * vi, K) then
       begin
         best := c;
         Form := 3;
         Inner := LongInt(i);
         Outer := LongInt(o);
       end
-      else if (FMulC[o].B <> 0) and (FMulC[o].A * vi + FMulC[o].B = K) then
+      else if (FMulC[o].B <> 0) and Same(FMulC[o].A * vi + FMulC[o].B, K) then
       begin
         best := c;
         Form := 4;
@@ -37673,20 +38258,25 @@ end;
 { arm64: D := a*X + b*Y of the combination C (ARM DDI 0487 M.c: ADD,
   SUB and NEG of a shifted register, C6.2.6, C6.2.458, C6.2.295; LSL
   immediate, C6.2.270). }
-procedure TEmitter.MulComboArm(const C: TMulCombo; const D, X, Y: string);
+procedure TEmitter.MulComboArm(const C: TMulCombo; const D, X, Y: string; Width: LongInt);
 var
-  sh: string;
+  sh, dr, xr, yr: string;
 begin
   sh := IntToStr(C.Sh);
+  dr := D; xr := X; yr := Y;
+  if Width = 32 then
+  begin
+    dr := WReg(D); xr := WReg(X); yr := WReg(Y);
+  end;
   case C.Kind of
-    1: Line('  add ' + D + ', ' + X + ', ' + Y);
-    2: Line('  neg ' + D + ', ' + X);
-    3: Line('  sub ' + D + ', ' + X + ', ' + Y);
-    4: Line('  add ' + D + ', ' + X + ', ' + Y + ', lsl #' + sh);
-    5: Line('  neg ' + D + ', ' + X + ', lsl #' + sh);
-    6: Line('  sub ' + D + ', ' + X + ', ' + Y + ', lsl #' + sh);
+    1: Line('  add ' + dr + ', ' + xr + ', ' + yr);
+    2: Line('  neg ' + dr + ', ' + xr);
+    3: Line('  sub ' + dr + ', ' + xr + ', ' + yr);
+    4: Line('  add ' + dr + ', ' + xr + ', ' + yr + ', lsl #' + sh);
+    5: Line('  neg ' + dr + ', ' + xr + ', lsl #' + sh);
+    6: Line('  sub ' + dr + ', ' + xr + ', ' + yr + ', lsl #' + sh);
   else
-    Line('  lsl ' + D + ', ' + X + ', #' + sh);
+    Line('  lsl ' + dr + ', ' + xr + ', #' + sh);
   end;
 end;
 
@@ -37694,41 +38284,51 @@ end;
   an add, sub, neg or shift works on D in place, a move first when D is
   not X; a lea of two parts with no displacement (SDM vol. 2A 3-547
   LEA). }
-procedure TEmitter.MulComboX86(const C: TMulCombo; const D, X, Y: string);
+procedure TEmitter.MulComboX86(const C: TMulCombo; const D, X, Y: string; Width: LongInt);
+var
+  dr, xr, yr, sfx: string;
 begin
+  dr := D; xr := X; yr := Y; sfx := 'q';
+  if Width = 32 then
+  begin
+    dr := '%' + X86Sub(Copy(D, 2, Length(D) - 1), 4);
+    xr := '%' + X86Sub(Copy(X, 2, Length(X) - 1), 4);
+    yr := '%' + X86Sub(Copy(Y, 2, Length(Y) - 1), 4);
+    sfx := 'l';
+  end;
   case C.Kind of
     1:
       if D = X then
-        Line('  addq ' + Y + ', ' + D)
+        Line('  add' + sfx + ' ' + yr + ', ' + dr)
       else if D = Y then
-        Line('  addq ' + X + ', ' + D)
+        Line('  add' + sfx + ' ' + xr + ', ' + dr)
       else
-        Line('  leaq (' + X + ',' + Y + '), ' + D);
+        Line('  lea' + sfx + ' (' + X + ',' + Y + '), ' + dr);
     2:
       begin
         if D <> X then
-          Line('  movq ' + X + ', ' + D);
-        Line('  negq ' + D);
+          Line('  mov' + sfx + ' ' + xr + ', ' + dr);
+        Line('  neg' + sfx + ' ' + dr);
       end;
     3:
       if D = X then
-        Line('  subq ' + Y + ', ' + D)
+        Line('  sub' + sfx + ' ' + yr + ', ' + dr)
       else if D = Y then
       begin
-        Line('  negq ' + D);
-        Line('  addq ' + X + ', ' + D);
+        Line('  neg' + sfx + ' ' + dr);
+        Line('  add' + sfx + ' ' + xr + ', ' + dr);
       end
       else
       begin
-        Line('  movq ' + X + ', ' + D);
-        Line('  subq ' + Y + ', ' + D);
+        Line('  mov' + sfx + ' ' + xr + ', ' + dr);
+        Line('  sub' + sfx + ' ' + yr + ', ' + dr);
       end;
-    8: Line('  leaq (' + X + ',' + Y + ',' + IntToStr(Int64(1) shl C.Sh) + '), ' + D);
+    8: Line('  lea' + sfx + ' (' + X + ',' + Y + ',' + IntToStr(Int64(1) shl C.Sh) + '), ' + dr);
   else
     begin
       if D <> X then
-        Line('  movq ' + X + ', ' + D);
-      Line('  shlq $' + IntToStr(C.Sh) + ', ' + D);
+        Line('  mov' + sfx + ' ' + xr + ', ' + dr);
+      Line('  shl' + sfx + ' $' + IntToStr(C.Sh) + ', ' + dr);
     end;
   end;
 end;
@@ -37895,16 +38495,23 @@ end;
 
 { D := S * K by the recipe F, I, O of MulRecipe, the second value of a
   form 3 or 4 through T (P295, P310). }
-procedure TEmitter.MulRecipeVia(const D, S: string; F, I, O: LongInt; const T: string);
+procedure TEmitter.MulRecipeVia(const D, S: string; F, I, O: LongInt; const T: string; Width: LongInt);
+var
+  dr, sr: string;
 begin
+  dr := D; sr := S;
+  if FArm and (Width = 32) then
+  begin
+    dr := WReg(D); sr := WReg(S);
+  end;
   if FArm then
   begin
     case F of
-      1: MulComboArm(FMulC[I], D, S, S);
+      1: MulComboArm(FMulC[I], D, S, S, Width);
       2:
         begin
-          MulComboArm(FMulC[I], D, S, S);
-          MulComboArm(FMulC[O], D, D, D);
+          MulComboArm(FMulC[I], D, S, S, Width);
+          MulComboArm(FMulC[O], D, D, D, Width);
         end;
       3:
         { S + (S << n) and S - (S << n) are one ADD or SUB of a shifted
@@ -37912,27 +38519,27 @@ begin
           SUBshiftLL after the recipe (ARM64.rules; go1.27.2 writes x * 3
           as ADD R0<<1, R0, R0): one instruction where two were (P312) }
         if (FMulC[I].Kind = 7) and (FMulC[O].Kind = 1) then
-          Line('  add ' + D + ', ' + S + ', ' + S + ', lsl #' + IntToStr(FMulC[I].Sh))
+          Line('  add ' + dr + ', ' + sr + ', ' + sr + ', lsl #' + IntToStr(FMulC[I].Sh))
         else if (FMulC[I].Kind = 7) and (FMulC[O].Kind = 3) then
-          Line('  sub ' + D + ', ' + S + ', ' + S + ', lsl #' + IntToStr(FMulC[I].Sh))
+          Line('  sub ' + dr + ', ' + sr + ', ' + sr + ', lsl #' + IntToStr(FMulC[I].Sh))
         else
         begin
-          MulComboArm(FMulC[I], T, S, S);
-          MulComboArm(FMulC[O], D, S, T);
+          MulComboArm(FMulC[I], T, S, S, Width);
+          MulComboArm(FMulC[O], D, S, T, Width);
         end;
     else
       if (FMulC[I].Kind = 7) and (FMulC[O].Kind = 1) then
-        Line('  add ' + D + ', ' + S + ', ' + S + ', lsl #' + IntToStr(FMulC[I].Sh))
+        Line('  add ' + dr + ', ' + sr + ', ' + sr + ', lsl #' + IntToStr(FMulC[I].Sh))
       else
       begin
-        MulComboArm(FMulC[I], T, S, S);
-        MulComboArm(FMulC[O], D, T, S);
+        MulComboArm(FMulC[I], T, S, S, Width);
+        MulComboArm(FMulC[O], D, T, S, Width);
       end;
     end;
     Exit;
   end;
   case F of
-    1: MulComboX86(FMulC[I], D, S, S);
+    1: MulComboX86(FMulC[I], D, S, S, Width);
     2:
       { the two steps on the value before twice multiply, so either goes
         first: a neg or a shift, which work in place, would move S into
@@ -37943,23 +38550,23 @@ begin
       if (D <> S) and ((FMulC[I].Kind = 2) or (FMulC[I].Kind = 7)) and
         ((FMulC[O].Kind = 1) or (FMulC[O].Kind = 8)) and (S <> '%r13') and (S <> '%rbp') then
       begin
-        MulComboX86(FMulC[O], D, S, S);
-        MulComboX86(FMulC[I], D, D, D);
+        MulComboX86(FMulC[O], D, S, S, Width);
+        MulComboX86(FMulC[I], D, D, D, Width);
       end
       else
       begin
-        MulComboX86(FMulC[I], D, S, S);
-        MulComboX86(FMulC[O], D, D, D);
+        MulComboX86(FMulC[I], D, S, S, Width);
+        MulComboX86(FMulC[O], D, D, D, Width);
       end;
     3:
       begin
-        MulComboX86(FMulC[I], T, S, S);
-        MulComboX86(FMulC[O], D, S, T);
+        MulComboX86(FMulC[I], T, S, S, Width);
+        MulComboX86(FMulC[O], D, S, T, Width);
       end;
   else
     begin
-      MulComboX86(FMulC[I], T, S, S);
-      MulComboX86(FMulC[O], D, T, S);
+      MulComboX86(FMulC[I], T, S, S, Width);
+      MulComboX86(FMulC[O], D, T, S, Width);
     end;
   end;
 end;

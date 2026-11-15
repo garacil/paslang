@@ -905,6 +905,10 @@ GOLDEN_A64 += sqllogic
 GOLDEN += sqlclosed
 GOLDEN_A64 += sqlclosed
 
+# P548: typed arithmetic, bounds, protected memory reads and width/tune switches.
+GOLDEN += uint32legacy uint32rotate crc32width uint32bounds uint32memxor uint32tune
+GOLDEN_A64 += uint32legacy uint32rotate crc32width uint32bounds uint32memxor uint32tune
+
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
 # uses clause. They are compiled by paslangc itself, once per target.
@@ -1312,6 +1316,8 @@ bench-servers: $(OUTDIR)/paslangc core libs
 check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch64 $(OUTDIR)/pasdbg
 	@python3 -I scripts/check_sdk_state.py capture --manifest $(BUILDDIR)/sdk-state-check.json --profile amd64 $(BUILDDIR) $(LVL_X64) --profile arm64 $(A64DIR) $(LVL_A64) --debugger amd64 $(OUTDIR)/pasdbg -- $(CORE_UNITS) $(LIB_UNITS)
 	@python3 scripts/check_recipes.py
+	@python3 -B scripts/check_uint32.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64)
+	@python3 -B scripts/check_uint32_focus.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64)
 	@python3 -I scripts/bench/check_harness.py
 	@python3 -I scripts/bench/check_peak.py
 	@python3 -I scripts/bench/check_reference_caps.py

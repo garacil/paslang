@@ -1,0 +1,163 @@
+{ This file is part of paslang's tests.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+  GPL version 3 or later; see COPYING. No warranty. }
+
+{ P548: real base CRC entry points against an independent bit-at-a-time
+  model. Every length through 129, all eight alignments, high-bit seeds,
+  page and 64 KiB boundaries, and both reflected polynomials are covered.
+  A protected page catches any read past the exact requested bytes.
+  The borrowed mapped descriptor is confined to this low-level fixture;
+  it remains immutable and mapped throughout each call, then is discarded. }
+program crc32width;
+
+uses pashash, sysutils;
+
+type
+  TWords = record
+    P: Pointer;
+    N: Integer;
+  end;
+
+const
+  Seeds: array[0..3] of Integer = (0, 1, 2147483648, 4294967295);
+  Edges: array[0..5] of Integer = (255, 256, 257, 4095, 4096, 4097);
+  Longs: array[0..2] of Integer = (65535, 65536, 65537);
+
+var
+  cases, bad: Integer;
+
+function Borrow(P: Pointer; N: Integer): string;
+var
+  w: TWords;
+begin
+  Result := '';
+  if N = 0 then Exit;
+  w.P := P;
+  w.N := N;
+  Result := w as string;
+end;
+
+{ These Integer operations never use a table, a wide data load or a
+  UInt32 expression. Each iteration shifts a nonnegative 32-bit value
+  by one and conditionally XORs the reflected polynomial. }
+function Reference(const S: string; Start, Polynomial: Integer): Integer;
+var
+  c, i, bitno: Integer;
+begin
+  c := (Start and $FFFFFFFF) xor $FFFFFFFF;
+  for i := 1 to Length(S) do
+  begin
+    c := c xor Ord(S[i]);
+    for bitno := 0 to 7 do
+      if (c and 1) <> 0 then
+        c := (c shr 1) xor Polynomial
+      else
+        c := c shr 1;
+  end;
+  Result := c xor $FFFFFFFF;
+end;
+
+procedure Check(P: PByte; N: Integer);
+var
+  s: string;
+  si, kind, Polynomial, got, want, joined, half: Integer;
+begin
+  s := Borrow(Pointer(P), N);
+  if (N > 0) and (Pointer(s) <> Pointer(P)) then Halt(80);
+  half := N div 2;
+  for si := 0 to High(Seeds) do
+    for kind := 0 to 1 do
+    begin
+      if kind = 0 then Polynomial := $EDB88320 else Polynomial := $82F63B78;
+      want := Reference(s, Seeds[si], Polynomial);
+      if kind = 0 then
+      begin
+        got := PasCrc32Base(s, Seeds[si]);
+        joined := PasCrc32Base(Copy(s, half + 1, N - half),
+          PasCrc32Base(Copy(s, 1, half), Seeds[si]));
+      end
+      else
+      begin
+        got := PasCrc32cBase(s, Seeds[si]);
+        joined := PasCrc32cBase(Copy(s, half + 1, N - half),
+          PasCrc32cBase(Copy(s, 1, half), Seeds[si]));
+      end;
+      if (got <> want) or (joined <> want) then
+      begin
+        bad := bad + 1;
+        if bad <= 8 then
+          WriteLn('crc mismatch ', N, ' ', si, ' ', kind, ' ', got,
+            ' ', joined, ' ', want);
+      end;
+      cases := cases + 1;
+    end;
+  s := '';
+end;
+
+procedure Fill(P: PByte; N, Salt: Integer);
+var
+  i: Integer;
+begin
+  PByte(Pointer(Integer(P) - 1))^ := 1;
+  for i := 0 to N - 1 do
+    P[i] := Byte((i * 73 + N * 19 + Salt * 31 + (i shr 3)) and 255);
+end;
+
+var
+  storage, p: PByte;
+  n, alignment, e, page, status: Integer;
+  guarded: Boolean;
+begin
+  if Reference('123456789', 0, $EDB88320) <> 3421780262 then Halt(81);
+  if Reference('123456789', 0, $82F63B78) <> 3808858755 then Halt(82);
+  cases := 0;
+  bad := 0;
+  storage := PByte(GetMem(65560, 0));
+  for n := 0 to 129 do
+    for alignment := 0 to 7 do
+    begin
+      p := storage + 8 + alignment;
+      Fill(p, n, alignment);
+      Check(p, n);
+    end;
+  for e := 0 to High(Edges) do
+    for alignment := 0 to 7 do
+    begin
+      p := storage + 8 + alignment;
+      Fill(p, Edges[e], alignment);
+      Check(p, Edges[e]);
+    end;
+  for e := 0 to High(Longs) do
+  begin
+    p := storage + 8;
+    Fill(p, Longs[e], 17);
+    Check(p, Longs[e]);
+  end;
+
+  { Linux syscall numbers and flags from Go's generated Linux amd64 and
+    arm64 syscall definitions, as used by utf8kern's existing guard. }
+  if Amd64 = 1 then page := Syscall(9, 0, 8192, 3, 34, -1, 0)
+  else page := Syscall(222, 0, 8192, 3, 34, -1, 0);
+  if page < 0 then Halt(83);
+  if Amd64 = 1 then status := Syscall(10, page + 4096, 4096, 0)
+  else status := Syscall(226, page + 4096, 4096, 0);
+  if status <> 0 then Halt(84);
+  guarded := False;
+  try
+    if PInt64(Pointer(page + 4092))^ = 0 then Halt(85);
+  except
+    on err: EAccessViolation do guarded := True;
+  end;
+  if not guarded then Halt(86);
+  for n := 0 to 65 do
+  begin
+    p := PByte(Pointer(page + 4096 - n));
+    Fill(p, n, 29);
+    Check(p, n);
+  end;
+  if Amd64 = 1 then status := Syscall(11, page, 8192)
+  else status := Syscall(215, page, 8192);
+  if status <> 0 then Halt(87);
+  WriteLn('crc32-width ', cases, ' ', bad);
+  if bad <> 0 then Halt(88);
+end.

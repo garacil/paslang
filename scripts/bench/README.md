@@ -27,10 +27,53 @@ Ratios below are paslang / Go on the recorded Ryzen 7 4800H host.
 Both profiles retain forty alternating rounds and five traced memory samples
 per side, with exact output and clean statuses and diagnostics. P287's
 existing class/frontier allocation fix is present in both the measured and
-current runtime; current 1.2.406 correctness, self-reproduction, SDK and
+current runtime; the 1.2.406 baseline correctness, self-reproduction, SDK and
 installation checks pass with that implementation unchanged. This records
 existing performance evidence, not a new 1.2.406 timing run. The budgets are
 unchanged. Rust integer-append losses remain open under P608.
+
+## Recorded UInt32 hash comparison
+
+The P548 measurements compare paslangc 1.2.407 with 1.2.406 and the reviewed
+Go toolchain on a Ryzen 7 4800H. Each comparison has forty alternating
+full-process pairs and five separate traced memory samples per side.
+Native uses the host instructions and Go v3; base uses the existing
+verified Go v1 capability policy. Sources, compilers, actual linked SDK
+variants, executables and complete outputs remained unchanged.
+
+Ratios below are candidate / previous release, or candidate / Go.
+Q3 is the exclusive upper quartile of the forty paired time ratios.
+The Go gate requires time and RSS ratios at most 0.99 and time Q3 below 1;
+its seven failures remain failures under P232 and P248.
+
+| CPU | Workload | New/old time | Q3 | New/old RSS | New/Go time | Q3 | New/Go RSS | Go gate |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| native | b9hash | 0.999627 | 1.005602 | 1.000000 | 1.003698 | 1.011885 | 0.371591 | FAIL |
+| native | b20hash:md5 | 0.947292 | 0.951054 | 1.000000 | 1.024166 | 1.028459 | 0.389450 | FAIL |
+| native | b20hash:sha1 | 1.000453 | 1.003005 | 1.000000 | 0.993448 | 0.996649 | 0.390572 | FAIL |
+| native | b20hash:crc32 | 1.000366 | 1.004663 | 1.000000 | 1.001705 | 1.006118 | 0.385475 | FAIL |
+| native | b20hash:adler32 | 1.000216 | 1.003817 | 1.000000 | 0.716076 | 0.722898 | 0.392817 | PASS |
+| base | b9hash | 0.917264 | 0.919200 | 1.002994 | 1.208625 | 1.211196 | 0.373884 | FAIL |
+| base | b20hash:md5 | 0.948561 | 0.950913 | 0.997183 | 1.025452 | 1.029601 | 0.395531 | FAIL |
+| base | b20hash:sha1 | 0.837102 | 0.839450 | 0.997191 | 0.753035 | 0.754810 | 0.390110 | PASS |
+| base | b20hash:crc32 | 1.003396 | 1.006669 | 0.997167 | 1.386537 | 1.388617 | 0.383442 | FAIL |
+| base | b20hash:adler32 | 0.998655 | 1.003920 | 0.997207 | 0.717701 | 0.723832 | 0.392308 | PASS |
+
+The base SHA-1 workload takes about 16% less time than the previous release;
+the combined b9hash workload takes about 8% less, and MD5 about 5% less
+on both CPU profiles. b9hash includes 64 SHA-256 and 256 CRC-32C passes
+over 1 MiB; its improvement cannot be attributed to SHA-256 alone.
+The IEEE CRC workload shows no runtime improvement here despite fewer
+loop instructions. Base b9hash retains about 0.3% more peak RSS; the
+other base workloads retain slightly less and native RSS is unchanged.
+The unchanged Adler-32 control and native hardware paths remain visible.
+These results do not establish an overall advantage over Go or Rust;
+there is no audited Rust twin for these hash programs.
+
+[Full results and protocol](https://github.com/garacil/paslang/wiki/Benchmark-Results-P548-407)
+include every round, output, memory sample and strict verdict.
+The [raw record](https://raw.githubusercontent.com/wiki/garacil/paslang/benchmark-results-p548-407.json)
+has SHA-256 `c178141c3dea28251fb0fed57e574ecbca12c828334db25f6668a8927a4d36d5`.
 
 ## Go
 

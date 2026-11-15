@@ -11,6 +11,17 @@ for a processor the machine is not dies with an illegal instruction, as
 with `-march=native`. `-cpu base` compiles the base paths and `make check`
 runs the tests both ways on both machines.
 
+The portable MD5, SHA-1 and SHA-256 rounds use the compiler's `UInt32`
+arithmetic directly. `Crc32Plain`, shared by IEEE and Castagnoli, keeps
+its accumulator in `UInt32` while its length, index and eight-byte input
+word remain `Integer`. The compiler can combine a shift and low mask
+into ARM `UBFX`, and a shifted accumulator with a four-byte table read
+into an amd64 memory `XOR` or an ARM shifted-register `EOR`. These forms
+preserve the original read width, evaluation order and fault location.
+`uint32legacy`, `uint32rotate`, `crc32width`, `uint32bounds`,
+`uint32memxor` and `uint32tune`, plus the independent integer model and
+ELF checks, exercise both architectures and CPU paths in `make check`.
+
 A unit chooses its kernels where it is compiled. So every installed unit
 is built twice (P143): for the base processor, and for one level of each
 machine, x86-64-v3 with AES-NI and PCLMULQDQ (`v3+aes+pclmul`, in the

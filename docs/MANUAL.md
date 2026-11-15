@@ -551,6 +551,14 @@ operand (`addq $1, v_g(%rip)`, `addb $100, 18(%rdi)`), whose stored
 bits are those the wrap leaves, and on arm64 its load, add and store
 (1.1.288, P402).
 
+Arithmetic whose result is `UInt32` uses 32-bit add, subtract, multiply,
+bitwise and negation instructions on amd64 and arm64. Their register
+results are zero-extended directly. Constant products use the selected
+processor's costs at that width. A wider result context still computes
+at its wider width, and a pointer read keeps its declared memory width
+even when an explicit conversion keeps only its low 32 bits. Shift counts
+keep the language's modulo-64 rule; rotations use the operand width.
+
 `examples/narrow.paslang`:
 
 ```pascal

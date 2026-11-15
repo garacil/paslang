@@ -68,6 +68,11 @@ text; errors go to standard error with a failing exit status.
   `icelake`, `neoverse-v2`...), and `-tune` chooses between equal forms
   by the manufacturer's latency tables; `{$CPU}` and `{$TUNE}` in the
   code prevail over the command line.
+- **Integer widths in the generated code.** `UInt32` arithmetic uses
+  32-bit add, subtract, multiply and bitwise instructions on amd64 and
+  arm64. The requested result type
+  still decides whether an expression wraps or works in 64 bits;
+  pointer reads keep the width of the value they point to.
 - **Classes and exceptions with objects.** Every class descends from
   `TObject`. Implicit class values widen to ancestors; unrelated classes,
   implicit narrowing and object/scalar mismatches are compile errors.
@@ -146,11 +151,17 @@ See the [benchmark instructions](scripts/bench/README.md) for configuration
 and the limits of each comparison. Normal `make check` tests the harness
 without requiring Go or Rust.
 
-The [latest recorded runtime results](https://github.com/garacil/paslang/wiki/Benchmark-Results-P525-405)
+The [recorded integer-append results](https://github.com/garacil/paslang/wiki/Benchmark-Results-P525-405)
 include twenty million integer appends in about 29% less elapsed time with
 `-cpu native` and 32% less with `-cpu base`, using about 43% less peak memory
 than Go. These frozen 1.2.405 measurements meet P254's original Go targets;
 the separate Rust integer-append target remains open.
+
+The [UInt32 hash comparison](scripts/bench/README.md#recorded-uint32-hash-comparison)
+records about 16% less time for base SHA-1, 8% less for the combined
+SHA-256/CRC-32C workload and 5% less for MD5 than the previous release.
+Seven of ten Go comparisons still fail their strict budgets; those gaps
+remain open. The full table retains CPU profiles, quartiles and memory.
 
 ## Building
 

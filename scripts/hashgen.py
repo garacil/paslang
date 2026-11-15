@@ -1932,7 +1932,10 @@ end;
   load from a fixed address and an index. }
 function Crc32Plain(Crc: UInt32; P: Pointer; N: Integer; Castagnoli: Boolean): UInt32;
 var
-  i, c, w: Integer;
+  { XORs of UInt32 table entries and a logical right shift keep the CRC
+    in 32 bits. The input word, pointer arithmetic and offsets stay 64-bit. }
+  c: UInt32;
+  i, w: Integer;
 begin
   c := Crc;
   i := 0;
