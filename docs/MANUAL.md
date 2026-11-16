@@ -12203,11 +12203,38 @@ P429), each following Go's code routine by routine:
   Go's checks of the key (1024 bits or more, e odd and below 2^31);
   `RsaPublicKeyInit` makes a key ready once for many checks. `TNat` and
   `TModulus` are Go's `bigmod`, its Montgomery products and
-  exponentiations, for what comes later.
+  exponentiations.
+- `pasrsa` signs too (1.3.0, P616). A `TRsaPrivateKey` is made by
+  `RsaPrivateKeyInit(key, n, e, d, p, q, err)` or, with the three
+  Chinese remainder values a key file holds,
+  `RsaPrivateKeyInitCrt(key, n, e, d, p, q, dp, dq, qinv, err)`, and is
+  refused with its reason in `err` when its parts disagree: `p * q` is
+  not `n` (the whole product is compared, where Go takes a multiple),
+  a remainder value that does not match, a `d` that disagrees with
+  them, primes closer than Fermat's method allows, a modulus under
+  1024 bits. `RsaSignPkcs1v15(key, hash, hashed, sig)` is
+  RSASSA-PKCS1-v1_5, one signature for a key and a message: JWT's RS256
+  is `RsaSignPkcs1v15(key, RsaSha256, Sha256(signingInput), sig)`.
+  `RsaSignPss(key, hash, hashed, saltLen, sig)` is RSASSA-PSS with a
+  salt from the kernel's generator: `RsaPssSaltEqualsHash` is the
+  digest's size (TLS 1.3, JWT's PS256), `RsaPssSaltAuto` the longest the
+  key takes, a number that many bytes; `RsaSignPssSalt` takes the salt
+  itself, for test vectors. Each gives `False` and an empty signature
+  when the key was never made, the digest is not the hash's or the key
+  is too short. The private operation is the Chinese remainder form on
+  the constant-time arithmetic above, and its result is raised to `e`
+  and compared with what was signed before it leaves, so a fault in
+  the computation never gives the key's factors away; there is no
+  blinding, as there is none in Go's, since nothing in it takes a time
+  that depends on the key. A key once made is only read, and any number
+  of routines sign with it at once. A key that is refused holds nothing
+  afterwards; `RsaPrivateKeyClear(key)` zeroes the secret numbers of a
+  key that is no longer needed (a copy made with `:=` shares them and
+  is zeroed with it). Keys of more than two primes are not taken.
 
 What touches a secret (the X25519 ladder, the scalar products of ECDH,
-the field inversions and signing's order arithmetic) uses constant-time
-algorithms. Input validity, unbiased nonce rejection and degenerate
+the field inversions, signing's order arithmetic and RSA's private
+operation) uses constant-time algorithms. Input validity, unbiased nonce rejection and degenerate
 signature checks remain explicit. Verification works on public values
 and may not be constant time, as Go's. `testdata/nistsign` checks the
 literal RFC 6979 P-256/SHA-256 and P-384/SHA-384 signatures, strict
@@ -12223,6 +12250,27 @@ parser's scalar-arithmetic AST for secret-dependent control and addressing.
 Compiled arithmetic and nonce mutants must be detected. These checks and
 emitted-code review support the constant-time implementation; they are not
 a formal proof or cryptographic certification.
+
+RSA's signing is checked in `make check` by `testdata/rsasign` and
+`testdata/rsasigwyche` on both machines: with fixed keys of 2048, 3072
+and 4096 bits, and two of 2049 and 2050 whose moduli are not whole
+octets, its 44 PKCS #1 v1.5 signatures are OpenSSL's byte for byte and
+its 44 PSS ones those of an independent model with their salts written
+down (`scripts/rsasign_vectors.py`, which works every vector out again);
+NIST CAVP's 160 signature generation vectors (FIPS 186-4) and
+Wycheproof's 158 come out equal; 54 defective key files are each
+refused for their own reason and leave nothing in the key, among them
+primes and a private exponent just at their limits, beside good keys
+just past them; salts are read back from signatures, whole and
+different; eight routines sign with one key at once.
+`scripts/check_rsa_faults.py` writes a fault into each half of the
+private operation and finds no signature leaving, and with the last
+comparison taken out, a signature that factors the modulus; it also
+answers for the kernel's generator (an interrupted call, short reads,
+an error) and finds the salt whole or no signature at all. The
+compiler's code for the private operation was read on both machines for
+a branch or an index that depends on the key, and none was found; that
+reading is not yet repeated by `make check`.
 
 `uses pasx509` reads and checks certificates as Go's `crypto/x509` does
 (1.1.293, P430), routine by routine:
@@ -12243,6 +12291,18 @@ a formal proof or cryptographic certification.
   `SystemCertPool` (`SSL_CERT_FILE`, `SSL_CERT_DIR`, the first of Go's
   files for Linux, then its directories), and routines may share a pool
   they only read. `PemDecode` and `PemDecodeAll` are `encoding/pem`'s.
+- `X509ParsePemRsaKey(pem, out key, out err)` reads an RSA private key
+  (1.3.0, P616) from the first block of `pem` that is a private key:
+  `PRIVATE KEY`, which is PKCS #8, what OpenSSL writes and what a Google
+  service account's JSON holds, or `RSA PRIVATE KEY`, which is PKCS #1.
+  `X509ParsePkcs8RsaKey(der, ...)` and `X509ParsePkcs1RsaKey(der, ...)`
+  take the DER. They read as Go's `ParsePKCS8PrivateKey` and
+  `ParsePKCS1PrivateKey` and are stricter: nothing may follow the key,
+  inside its structure or after it, the versions are checked, and the
+  three Chinese remainder values come together or not at all (a key
+  without them has them worked out). An encrypted key and a key that is
+  not RSA are refused by name. The key is then checked whole by
+  `pasrsa`, whose reason `err` carries.
 
 Signatures are checked by `pasnist` (ECDSA on P-256 and P-384) and
 `pasrsa` (PKCS #1 v1.5 and PSS on SHA-256, SHA-384, SHA-512); SHA-1 and

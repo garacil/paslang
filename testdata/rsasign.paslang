@@ -1,0 +1,713 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+
+  paslang is free software: you can redistribute it and/or modify it
+  under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+
+  paslang is distributed in the hope that it will be useful, but
+  WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+  General Public License for more details.
+
+  Under Section 7 of GPL version 3, you are granted additional
+  permissions described in the paslang Runtime Library Exception,
+  version 1.0, in the file COPYING.RUNTIME.
+
+  You should have received a copy of the GNU General Public License
+  along with paslang.  If not, see <https://www.gnu.org/licenses/>. }
+
+program rsasign;
+{ P616: RSA private keys and signatures (pasrsa, and the key files
+  pasx509 reads), against testdata/rsasign, which
+  scripts/rsasign_vectors.py wrote and checks again with its own
+  arithmetic:
+  - keys.txt: every key file loads or is refused with the words written
+    there; one that is the first key in another form signs as it does,
+    another key (the largest exponent, a prime of one limb, primes and
+    a private exponent just past their limits) signs what its own
+    public half verifies, and a refused key signs and verifies nothing;
+  - vectors.txt: RSASSA-PKCS1-v1_5 signatures, each equal to OpenSSL's
+    byte for byte, and RSASSA-PSS signatures with their salts written
+    down; every one is also verified;
+  - cavp.txt: NIST CAVP's signature generation vectors (FIPS 186-4,
+    186-3rsatestvectors.zip), 80 PKCS #1 v1.5 and 80 PSS with SHA-224
+    to SHA-512; NIST gives n, e and d, the script found p and q, and
+    the key is made from the five, its other values worked out here;
+  - PSS with a salt from the kernel: two signatures differ and both
+    verify, with the salt's length given and found; the salts are read
+    back from sixteen signatures and are whole and different;
+  - what must be refused: a digest of another length, a hash there is
+    no word for, a salt the key has no room for, a key that was never
+    made;
+  - eight routines signing with one key at once. }
+uses pasrsa, pasx509, paslib;
+
+var
+  keys: array[0..4] of TRsaPrivateKey;
+  refSig: string;
+  refMsg: string;
+
+function UnHex(const h: string): string;
+var
+  i, d, v: Integer;
+  c: Char;
+begin
+  Result := '';
+  if h = '-' then
+    Exit;
+  SetLength(Result, Length(h) div 2);
+  v := 0;
+  for i := 1 to Length(h) do
+  begin
+    c := h[i];
+    if (c >= '0') and (c <= '9') then d := Ord(c) - 48
+    else d := Ord(c) - 87;
+    if Odd(i) then v := d shl 4
+    else Result[i div 2] := Chr(v or d);
+  end;
+end;
+
+{ the N-th field of S between spaces, from 1; from the N-th to the end
+  when ToEnd }
+function Field(const S: string; N: Integer; ToEnd: Boolean): string;
+var
+  i, start, k: Integer;
+begin
+  Result := '';
+  i := 1;
+  k := 0;
+  while i <= Length(S) do
+  begin
+    while (i <= Length(S)) and (S[i] = ' ') do
+      Inc(i);
+    if i > Length(S) then
+      Exit;
+    start := i;
+    while (i <= Length(S)) and (S[i] <> ' ') do
+      Inc(i);
+    Inc(k);
+    if k = N then
+    begin
+      if ToEnd then
+        Result := Copy(S, start, Length(S) - start + 1)
+      else
+        Result := Copy(S, start, i - start);
+      Exit;
+    end;
+  end;
+end;
+
+function HashOf(const Name: string): Integer;
+begin
+  if Name = 'SHA-224' then Result := RsaSha224
+  else if Name = 'SHA-256' then Result := RsaSha256
+  else if Name = 'SHA-384' then Result := RsaSha384
+  else if Name = 'SHA-512' then Result := RsaSha512
+  else Result := -1;
+end;
+
+function KeyIndex(const Name: string): Integer;
+begin
+  if Name = 'k2048' then Result := 0
+  else if Name = 'k3072' then Result := 1
+  else if Name = 'k4096' then Result := 2
+  else if Name = 'k2049' then Result := 3
+  else if Name = 'k2050' then Result := 4
+  else Result := -1;
+end;
+
+function StartsWith(const S, Prefix: string): Boolean;
+begin
+  Result := Copy(S, 1, Length(Prefix)) = Prefix;
+end;
+
+function EndsWith(const S, Suffix: string): Boolean;
+begin
+  Result := (Length(S) >= Length(Suffix)) and
+    (Copy(S, Length(S) - Length(Suffix) + 1, Length(Suffix)) = Suffix);
+end;
+
+{ one line of Data from Start, without its end of line; Start moves on }
+function NextLine(const Data: string; var Start: Integer): string;
+var
+  i: Integer;
+begin
+  i := Start;
+  while (i <= Length(Data)) and (Data[i] <> #10) do
+    Inc(i);
+  Result := Copy(Data, Start, i - Start);
+  Start := i + 1;
+end;
+
+procedure LoadKeys;
+var
+  i: Integer;
+  data, err: string;
+  names: array[0..4] of string;
+begin
+  names[0] := 'k2048';
+  names[1] := 'k3072';
+  names[2] := 'k4096';
+  names[3] := 'k2049';
+  names[4] := 'k2050';
+  for i := 0 to 4 do
+  begin
+    if not ReadFile('testdata/rsasign/' + names[i] + '.pem', data) then
+    begin
+      WriteLn('cannot read ', names[i]);
+      Halt(1);
+    end;
+    if not X509ParsePemRsaKey(data, keys[i], err) then
+    begin
+      WriteLn(names[i], ' refused: ', err);
+      Halt(1);
+    end;
+  end;
+  refMsg := 'paslang signs with RSA';
+  if not RsaSignPkcs1v15(keys[0], RsaSha256, Sha256(refMsg), refSig) then
+  begin
+    WriteLn('the first key does not sign');
+    Halt(1);
+  end;
+  WriteLn('keys: ', ModulusBitLen(keys[0].Pub.N), ' ', ModulusBitLen(keys[1].Pub.N), ' ',
+    ModulusBitLen(keys[2].Pub.N), ' ', ModulusBitLen(keys[3].Pub.N), ' ', ModulusBitLen(keys[4].Pub.N), ' bits');
+end;
+
+{ a key that was refused holds none of the parts it was given }
+function Emptied(const K: TRsaPrivateKey): Boolean;
+begin
+  Result := (not K.Ready) and (K.Pub.E = 0) and (Length(K.D.Limbs) = 0) and (K.DP = '') and (K.DQ = '') and
+    (Length(K.QInv.Limbs) = 0) and (Length(K.P.Nat.Limbs) = 0) and (Length(K.P.RR.Limbs) = 0) and
+    (Length(K.Q.Nat.Limbs) = 0) and (Length(K.Q.RR.Limbs) = 0) and (Length(K.Pub.N.Nat.Limbs) = 0);
+end;
+
+procedure KeyFiles;
+var
+  list, line, name, fname, verdict, words, data, err, sig: string;
+  start, good, own, bad, wrong: Integer;
+  k: TRsaPrivateKey;
+  ok: Boolean;
+begin
+  if not ReadFile('testdata/rsasign/keys.txt', list) then
+  begin
+    WriteLn('cannot read keys.txt');
+    Halt(1);
+  end;
+  start := 1;
+  good := 0;
+  own := 0;
+  bad := 0;
+  wrong := 0;
+  while start <= Length(list) do
+  begin
+    line := NextLine(list, start);
+    if (line = '') or (line[1] = '#') then
+      Continue;
+    name := Field(line, 1, False);
+    fname := Field(line, 2, False);
+    verdict := Field(line, 3, False);
+    words := Field(line, 4, True);
+    if not ReadFile('testdata/rsasign/' + fname, data) then
+      data := '';
+    err := '';
+    if EndsWith(fname, '.pem') then
+      ok := X509ParsePemRsaKey(data, k, err)
+    else if StartsWith(name, 'pkcs8') then
+      ok := X509ParsePkcs8RsaKey(data, k, err)
+    else
+      ok := X509ParsePkcs1RsaKey(data, k, err);
+    if verdict = 'ok' then
+    begin
+      if ok and k.Ready and RsaSignPkcs1v15(k, RsaSha256, Sha256(refMsg), sig) and (sig = refSig) then
+        Inc(good)
+      else
+      begin
+        Inc(wrong);
+        WriteLn('WRONG ', name, ': a good key did not load or sign as the first: ', err);
+      end;
+    end
+    else if verdict = 'own' then
+    begin
+      { another key: its signature is not the first key's, and its own
+        public half verifies it, PKCS #1 v1.5 and PSS }
+      if ok and k.Ready and (Length(k.DP) = ModulusSize(k.P)) and (Length(k.DQ) = ModulusSize(k.Q)) and
+        RsaSignPkcs1v15(k, RsaSha256, Sha256(refMsg), sig) and (sig <> refSig) and
+        RsaKeyVerifyPkcs1v15(k.Pub, RsaSha256, Sha256(refMsg), sig) and
+        RsaSignPss(k, RsaSha256, Sha256(refMsg), RsaPssSaltEqualsHash, sig) and
+        RsaKeyVerifyPss(k.Pub, RsaSha256, Sha256(refMsg), sig, 32) then
+        Inc(own)
+      else
+      begin
+        Inc(wrong);
+        WriteLn('WRONG ', name, ': a good key did not load or its signature does not verify: ', err);
+      end;
+    end
+    else if ok or k.Ready or (words = '') or (Pos(words, err) = 0) then
+    begin
+      Inc(wrong);
+      WriteLn('WRONG ', name, ': wanted a refusal with "', words, '", got ', ok, ' "', err, '"');
+    end
+    else
+    begin
+      { a refused key signs nothing, and its public half is no key either }
+      if RsaSignPkcs1v15(k, RsaSha256, Sha256(refMsg), sig) or (sig <> '') or (k.Pub.E <> 0) or
+        RsaPublicOp(k.Pub, refSig, sig) or not Emptied(k) then
+      begin
+        Inc(wrong);
+        WriteLn('WRONG ', name, ': a refused key signed');
+      end
+      else
+        Inc(bad);
+    end;
+  end;
+  WriteLn('key files: ', good, ' load and sign alike, ', own, ' other keys sign and verify, ', bad,
+    ' refused for their reason, ', wrong, ' wrong');
+end;
+
+procedure Vectors;
+var
+  list, line, kind, msg, want, sig, salt, digest: string;
+  start, ki, h, nv15, npss, wrong: Integer;
+begin
+  if not ReadFile('testdata/rsasign/vectors.txt', list) then
+  begin
+    WriteLn('cannot read vectors.txt');
+    Halt(1);
+  end;
+  start := 1;
+  nv15 := 0;
+  npss := 0;
+  wrong := 0;
+  while start <= Length(list) do
+  begin
+    line := NextLine(list, start);
+    if (line = '') or (line[1] = '#') then
+      Continue;
+    kind := Field(line, 1, False);
+    ki := KeyIndex(Field(line, 2, False));
+    h := HashOf(Field(line, 3, False));
+    if (ki < 0) or (h < 0) then
+    begin
+      Inc(wrong);
+      WriteLn('WRONG line: ', Copy(line, 1, 40));
+      Continue;
+    end;
+    if kind = 'v15' then
+    begin
+      msg := UnHex(Field(line, 4, False));
+      want := UnHex(Field(line, 5, False));
+      digest := RsaHash(h, msg);
+      if RsaSignPkcs1v15(keys[ki], h, digest, sig) and (sig = want) and
+        RsaKeyVerifyPkcs1v15(keys[ki].Pub, h, digest, sig) then
+        Inc(nv15)
+      else
+      begin
+        Inc(wrong);
+        WriteLn('WRONG v15 ', Copy(line, 1, 40));
+      end;
+    end
+    else
+    begin
+      salt := UnHex(Field(line, 4, False));
+      msg := UnHex(Field(line, 5, False));
+      want := UnHex(Field(line, 6, False));
+      digest := RsaHash(h, msg);
+      if RsaSignPssSalt(keys[ki], h, digest, salt, sig) and (sig = want) and
+        RsaKeyVerifyPss(keys[ki].Pub, h, digest, sig, Length(salt)) and
+        RsaKeyVerifyPss(keys[ki].Pub, h, digest, sig, RsaPssSaltAuto) then
+        Inc(npss)
+      else
+      begin
+        Inc(wrong);
+        WriteLn('WRONG pss ', Copy(line, 1, 40));
+      end;
+    end;
+  end;
+  WriteLn('vectors: ', nv15, ' PKCS #1 v1.5 equal to OpenSSL, ', npss, ' PSS equal with their salts, ', wrong, ' wrong');
+end;
+
+function HexValue(const H: string): Integer;
+var
+  i, d: Integer;
+begin
+  Result := 0;
+  for i := 1 to Length(H) do
+  begin
+    if (H[i] >= '0') and (H[i] <= '9') then d := Ord(H[i]) - 48
+    else d := Ord(H[i]) - 87;
+    Result := Result * 16 + d;
+  end;
+end;
+
+{ a hexadecimal number of any number of digits as bytes }
+function UnHexNumber(const H: string): string;
+begin
+  if Odd(Length(H)) then
+    Result := UnHex('0' + H)
+  else
+    Result := UnHex(H);
+end;
+
+procedure Cavp;
+var
+  list, line, kind, kname, msg, want, sig, salt, digest, err: string;
+  start, h, nkeys, nv15, npss, wrong, i, ki: Integer;
+  ck: array[0..3] of TRsaPrivateKey;
+  cn: array[0..3] of string;
+begin
+  if not ReadFile('testdata/rsasign/cavp.txt', list) then
+  begin
+    WriteLn('cannot read cavp.txt');
+    Halt(1);
+  end;
+  start := 1;
+  nkeys := 0;
+  nv15 := 0;
+  npss := 0;
+  wrong := 0;
+  while start <= Length(list) do
+  begin
+    line := NextLine(list, start);
+    if (line = '') or (line[1] = '#') then
+      Continue;
+    kind := Field(line, 1, False);
+    kname := Field(line, 2, False);
+    if kind = 'key' then
+    begin
+      if (nkeys > 3) or not RsaPrivateKeyInit(ck[nkeys], UnHexNumber(Field(line, 3, False)),
+        HexValue(Field(line, 4, False)), UnHexNumber(Field(line, 5, False)),
+        UnHexNumber(Field(line, 6, False)), UnHexNumber(Field(line, 7, False)), err) then
+      begin
+        Inc(wrong);
+        WriteLn('WRONG key ', kname, ': ', err);
+        Continue;
+      end;
+      cn[nkeys] := kname;
+      Inc(nkeys);
+      Continue;
+    end;
+    ki := -1;
+    for i := 0 to nkeys - 1 do
+      if cn[i] = kname then
+        ki := i;
+    h := HashOf(Field(line, 3, False));
+    if (ki < 0) or (h < 0) then
+    begin
+      Inc(wrong);
+      WriteLn('WRONG line: ', Copy(line, 1, 40));
+      Continue;
+    end;
+    if kind = 'v15' then
+    begin
+      msg := UnHex(Field(line, 4, False));
+      want := UnHex(Field(line, 5, False));
+      digest := RsaHash(h, msg);
+      if RsaSignPkcs1v15(ck[ki], h, digest, sig) and (sig = want) then
+        Inc(nv15)
+      else
+      begin
+        Inc(wrong);
+        WriteLn('WRONG v15 ', Copy(line, 1, 40));
+      end;
+    end
+    else
+    begin
+      salt := UnHex(Field(line, 4, False));
+      msg := UnHex(Field(line, 5, False));
+      want := UnHex(Field(line, 6, False));
+      digest := RsaHash(h, msg);
+      if RsaSignPssSalt(ck[ki], h, digest, salt, sig) and (sig = want) and
+        RsaKeyVerifyPss(ck[ki].Pub, h, digest, sig, Length(salt)) then
+        Inc(npss)
+      else
+      begin
+        Inc(wrong);
+        WriteLn('WRONG pss ', Copy(line, 1, 40));
+      end;
+    end;
+  end;
+  WriteLn('NIST CAVP: ', nkeys, ' keys from n, e, d, p and q, ', nv15, ' PKCS #1 v1.5 and ', npss,
+    ' PSS signatures equal, ', wrong, ' wrong');
+end;
+
+{ the salt of a PSS signature read back with the public key: EM is
+  the signature raised to e, DB its first octets with MGF1's mask
+  taken off (RFC 8017 9.1.2 steps 5 to 11) }
+function SaltOf(const Pub: TRsaPublicKey; H: Integer; const Sig: string; SaltLen: Integer): string;
+var
+  em, hh, mask: string;
+  emLen, hLen, dbLen, i, counter: Integer;
+begin
+  Result := '';
+  if not RsaPublicOp(Pub, Sig, em) then
+    Exit;
+  emLen := (ModulusBitLen(Pub.N) - 1 + 7) div 8;
+  em := Copy(em, Length(em) - emLen + 1, emLen);
+  hLen := RsaHashSize(H);
+  dbLen := emLen - hLen - 1;
+  hh := Copy(em, dbLen + 1, hLen);
+  mask := '';
+  counter := 0;
+  while Length(mask) < dbLen do
+  begin
+    mask := mask + RsaHash(H, hh + Chr((counter shr 24) and 255) + Chr((counter shr 16) and 255) +
+      Chr((counter shr 8) and 255) + Chr(counter and 255));
+    Inc(counter);
+  end;
+  for i := dbLen - SaltLen + 1 to dbLen do
+    Result := Result + Chr(Ord(em[i]) xor Ord(mask[i]));
+end;
+
+{ sixteen salts of 32 bytes from sixteen signatures: each whole, no two
+  the same, and no place where all sixteen hold a zero }
+function SaltsAreRandom: Boolean;
+var
+  salts: array[0..15] of string;
+  i, j, place: Integer;
+  sig, digest: string;
+  nonzero: Boolean;
+begin
+  Result := False;
+  digest := Sha256(refMsg);
+  for i := 0 to 15 do
+  begin
+    if not RsaSignPss(keys[0], RsaSha256, digest, RsaPssSaltEqualsHash, sig) then
+      Exit;
+    salts[i] := SaltOf(keys[0].Pub, RsaSha256, sig, 32);
+    if Length(salts[i]) <> 32 then
+      Exit;
+    for j := 0 to i - 1 do
+      if salts[j] = salts[i] then
+        Exit;
+  end;
+  for place := 1 to 32 do
+  begin
+    nonzero := False;
+    for i := 0 to 15 do
+      if salts[i][place] <> #0 then
+        nonzero := True;
+    if not nonzero then
+      Exit;
+  end;
+  { and a salt that was given is the salt read back }
+  if not RsaSignPssSalt(keys[0], RsaSha256, digest, 'the salt that was given', sig) then
+    Exit;
+  Result := SaltOf(keys[0].Pub, RsaSha256, sig, 23) = 'the salt that was given';
+end;
+
+procedure RandomSalts;
+var
+  i, h, okCount: Integer;
+  a, b, digest: string;
+  hs: array[0..2] of Integer;
+begin
+  hs[0] := RsaSha256;
+  hs[1] := RsaSha384;
+  hs[2] := RsaSha512;
+  okCount := 0;
+  for i := 0 to 4 do
+    for h := 0 to 2 do
+    begin
+      digest := RsaHash(hs[h], refMsg);
+      { the salt as long as the digest: two signatures, never the same }
+      if RsaSignPss(keys[i], hs[h], digest, RsaPssSaltEqualsHash, a) and
+        RsaSignPss(keys[i], hs[h], digest, RsaPssSaltEqualsHash, b) and (a <> b) and
+        (Length(a) = RsaPrivateKeySize(keys[i])) and
+        RsaKeyVerifyPss(keys[i].Pub, hs[h], digest, a, RsaPssSaltEqualsHash) and
+        RsaKeyVerifyPss(keys[i].Pub, hs[h], digest, b, RsaHashSize(hs[h])) and
+        RsaKeyVerifyPss(keys[i].Pub, hs[h], digest, a, RsaPssSaltAuto) and
+        not RsaKeyVerifyPss(keys[i].Pub, hs[h], digest, a, RsaHashSize(hs[h]) - 1) then
+        Inc(okCount);
+      { the longest salt the key takes }
+      if RsaSignPss(keys[i], hs[h], digest, RsaPssSaltAuto, a) and
+        RsaKeyVerifyPss(keys[i].Pub, hs[h], digest, a, RsaPssSaltAuto) and
+        RsaKeyVerifyPss(keys[i].Pub, hs[h], digest, a,
+          (ModulusBitLen(keys[i].Pub.N) - 1 + 7) div 8 - 2 - RsaHashSize(hs[h])) then
+        Inc(okCount);
+      { a salt of one byte }
+      if RsaSignPss(keys[i], hs[h], digest, 1, a) and RsaKeyVerifyPss(keys[i].Pub, hs[h], digest, a, 1) and
+        not RsaKeyVerifyPss(keys[i].Pub, hs[h], digest, a, 0) then
+        Inc(okCount);
+      { no salt: the same signature each time }
+      if RsaSignPss(keys[i], hs[h], digest, 0, a) and RsaSignPss(keys[i], hs[h], digest, 0, b) and
+        (a = b) and RsaKeyVerifyPss(keys[i].Pub, hs[h], digest, a, 0) then
+        Inc(okCount);
+    end;
+  WriteLn('salts from the kernel: ', okCount, ' of 60; read back whole and different: ', SaltsAreRandom);
+end;
+
+procedure Refusals;
+var
+  sig, digest, modulus, em: string;
+  never: TRsaPrivateKey;
+  pub: TRsaPublicKey;
+  n: Integer;
+begin
+  n := 0;
+  digest := Sha256(refMsg);
+  { a public key that is refused is no key: nothing verifies with it,
+    not even the encoded message itself, which a key with e = 1 would
+    take }
+  modulus := NatBytes(keys[0].Pub.N.Nat, keys[0].Pub.N);
+  em := Chr(0) + Chr(1) + StringOfChar(Chr(255), 256 - 3 - 32) + Chr(0) + digest;
+  if RsaPublicKeyInit(pub, modulus, 65537) and (pub.E = 65537) and
+    RsaKeyVerifyPkcs1v15(pub, RsaSha256, digest, refSig) then Inc(n);
+  if not RsaPublicKeyInit(pub, modulus, 65536) and (pub.E = 0) and
+    not RsaKeyVerifyPkcs1v15(pub, RsaHashNone, digest, em) and not RsaPublicOp(pub, em, sig) then Inc(n);
+  if not RsaPublicKeyInit(pub, modulus, 1) and (pub.E = 0) then Inc(n);
+  if not RsaPublicKeyInit(pub, Copy(modulus, 130, 127), 65537) and (pub.E = 0) then Inc(n);
+  if RsaPublicKeyInit(pub, modulus, 2147483647) and (pub.E = 2147483647) then Inc(n);
+  if not RsaPublicKeyInit(pub, modulus, 2147483649) and (pub.E = 0) then Inc(n);
+  { a digest of another length; what the variable held before is gone }
+  sig := 'before';
+  if not RsaSignPkcs1v15(keys[0], RsaSha384, digest, sig) and (sig = '') then Inc(n);
+  sig := 'before';
+  if not RsaSignPss(keys[0], RsaSha512, digest, RsaPssSaltEqualsHash, sig) and (sig = '') then Inc(n);
+  { a hash there is no word for }
+  sig := 'before';
+  if not RsaSignPkcs1v15(keys[0], 99, digest, sig) and (sig = '') then Inc(n);
+  sig := 'before';
+  if not RsaSignPss(keys[0], 99, digest, 0, sig) and (sig = '') then Inc(n);
+  { PSS has no form without a hash }
+  sig := 'before';
+  if not RsaSignPss(keys[0], RsaHashNone, digest, 0, sig) and (sig = '') then Inc(n);
+  { a salt the key has no room for: 256 - 2 - 64 is 190 at most }
+  if RsaSignPssSalt(keys[0], RsaSha512, Sha512(refMsg), StringOfChar('s', 190), sig) then Inc(n);
+  if not RsaSignPssSalt(keys[0], RsaSha512, Sha512(refMsg), StringOfChar('s', 191), sig) and (sig = '') then Inc(n);
+  if not RsaSignPss(keys[0], RsaSha512, Sha512(refMsg), 191, sig) and (sig = '') then Inc(n);
+  { a salt length that means nothing }
+  if not RsaSignPss(keys[0], RsaSha256, digest, -3, sig) and (sig = '') then Inc(n);
+  { a key that was never made }
+  never := Default(TRsaPrivateKey);
+  sig := 'before';
+  if not RsaSignPkcs1v15(never, RsaSha256, digest, sig) and (sig = '') then Inc(n);
+  sig := 'before';
+  if not RsaSignPss(never, RsaSha256, digest, 0, sig) and (sig = '') then Inc(n);
+  sig := 'before';
+  if not RsaSignPssSalt(never, RsaSha256, digest, 'salt', sig) and (sig = '') then Inc(n);
+  { the digest signed as it is, with no DigestInfo: another signature,
+    which the same form verifies and the hashed form does not }
+  if RsaSignPkcs1v15(keys[0], RsaHashNone, digest, sig) and (sig <> refSig) and
+    RsaKeyVerifyPkcs1v15(keys[0].Pub, RsaHashNone, digest, sig) and
+    not RsaKeyVerifyPkcs1v15(keys[0].Pub, RsaSha256, digest, sig) then Inc(n);
+  { a signature is the key's size, and a changed bit is no signature }
+  if RsaSignPkcs1v15(keys[2], RsaSha512, Sha512(refMsg), sig) and (Length(sig) = 512) then
+  begin
+    sig[100] := Chr(Ord(sig[100]) xor 1);
+    if not RsaKeyVerifyPkcs1v15(keys[2].Pub, RsaSha512, Sha512(refMsg), sig) then Inc(n);
+  end;
+  WriteLn('refusals and edges: ', n, ' of 20');
+end;
+
+{ one variable used again: a key that is refused leaves nothing of the
+  key before it, and a key that is taken leaves no reason behind }
+procedure Reused;
+var
+  list, line, err, sig, first, n, d, p, q: string;
+  start, e, okCount, i: Integer;
+  k, shared: TRsaPrivateKey;
+  zeros: Boolean;
+begin
+  if not ReadFile('testdata/rsasign/cavp.txt', list) then
+    Halt(1);
+  start := 1;
+  repeat
+    line := NextLine(list, start);
+  until Field(line, 1, False) = 'key';
+  n := UnHexNumber(Field(line, 3, False));
+  e := HexValue(Field(line, 4, False));
+  d := UnHexNumber(Field(line, 5, False));
+  p := UnHexNumber(Field(line, 6, False));
+  q := UnHexNumber(Field(line, 7, False));
+  okCount := 0;
+  if RsaPrivateKeyInit(k, n, e, d, p, q, err) and (err = '') and k.Ready and
+    RsaSignPkcs1v15(k, RsaSha256, Sha256(refMsg), first) then Inc(okCount);
+  { refused before anything is looked at: an even exponent }
+  if not RsaPrivateKeyInit(k, n, e + 1, d, p, q, err) and (err <> '') and Emptied(k) and
+    not RsaSignPkcs1v15(k, RsaSha256, Sha256(refMsg), sig) then Inc(okCount);
+  if RsaPrivateKeyInit(k, n, e, d, p, q, err) and (err = '') then Inc(okCount);
+  { refused by the key's own relations: d with a bit changed, so that
+    the d mod (p - 1) worked out from it no longer undoes e }
+  d[Length(d)] := Chr(Ord(d[Length(d)]) xor 2);
+  if not RsaPrivateKeyInit(k, n, e, d, p, q, err) and (Pos('invalid CRT exponent', err) > 0) and Emptied(k) and
+    not RsaSignPss(k, RsaSha256, Sha256(refMsg), 0, sig) then Inc(okCount);
+  d[Length(d)] := Chr(Ord(d[Length(d)]) xor 2);
+  { refused in its parts: no modulus, a prime that is one }
+  if not RsaPrivateKeyInit(k, '', e, d, p, q, err) and (Pos('invalid modulus', err) > 0) and Emptied(k) then Inc(okCount);
+  if not RsaPrivateKeyInit(k, n, e, d, Chr(1), q, err) and (Pos('invalid prime', err) > 0) and Emptied(k) then Inc(okCount);
+  if not RsaPrivateKeyInitCrt(k, n, e, d, p, q, Chr(1), Chr(1), Chr(1), err) and
+    (Pos('invalid CRT', err) > 0) and Emptied(k) then Inc(okCount);
+  { and taken again, it signs as it did }
+  if RsaPrivateKeyInit(k, n, e, d, p, q, err) and (err = '') and k.Ready and
+    RsaSignPkcs1v15(k, RsaSha256, Sha256(refMsg), sig) and (sig = first) then Inc(okCount);
+  { a key that is cleared holds nothing and signs nothing; a copy made
+    before shares its numbers, which are now zeros, and signs nothing
+    either. A key refused while the copy lives leaves the copy whole }
+  shared := k;
+  if not RsaPrivateKeyInit(k, n, e + 1, d, p, q, err) and Emptied(k) and
+    RsaSignPkcs1v15(shared, RsaSha256, Sha256(refMsg), sig) and (sig = first) then Inc(okCount);
+  k := shared;
+  RsaPrivateKeyClear(k);
+  if Emptied(k) and not RsaSignPkcs1v15(k, RsaSha256, Sha256(refMsg), sig) and (sig = '') then Inc(okCount);
+  zeros := (Length(shared.D.Limbs) > 0) and (Length(shared.DP) > 0);
+  for i := 0 to Length(shared.D.Limbs) - 1 do
+    if shared.D.Limbs[i] <> 0 then zeros := False;
+  for i := 0 to Length(shared.P.Nat.Limbs) - 1 do
+    if (shared.P.Nat.Limbs[i] <> 0) or (shared.Q.Nat.Limbs[i] <> 0) or (shared.QInv.Limbs[i] <> 0) or
+      (shared.P.RR.Limbs[i] <> 0) or (shared.Q.RR.Limbs[i] <> 0) then zeros := False;
+  for i := 1 to Length(shared.DP) do
+    if (shared.DP[i] <> #0) or (shared.DQ[i] <> #0) then zeros := False;
+  if zeros and not RsaSignPkcs1v15(shared, RsaSha256, Sha256(refMsg), sig) and (sig = '') then Inc(okCount);
+  WriteLn('one variable, keys taken and refused in turn: ', okCount, ' of 11');
+end;
+
+var
+  results: chan of Integer;
+
+procedure Signer(Id: Integer);
+var
+  i, bad: Integer;
+  sig, msg, again: string;
+begin
+  bad := 0;
+  for i := 1 to 4 do
+  begin
+    if not (RsaSignPkcs1v15(keys[0], RsaSha256, Sha256(refMsg), sig) and (sig = refSig)) then
+      Inc(bad);
+    msg := refMsg + Chr(48 + Id) + Chr(48 + i);
+    if not (RsaSignPkcs1v15(keys[Id mod 3], RsaSha256, Sha256(msg), sig) and
+      RsaSignPkcs1v15(keys[Id mod 3], RsaSha256, Sha256(msg), again) and (sig = again) and
+      RsaKeyVerifyPkcs1v15(keys[Id mod 3].Pub, RsaSha256, Sha256(msg), sig)) then
+      Inc(bad);
+    if not (RsaSignPss(keys[Id mod 3], RsaSha256, Sha256(msg), RsaPssSaltEqualsHash, sig) and
+      RsaKeyVerifyPss(keys[Id mod 3].Pub, RsaSha256, Sha256(msg), sig, 32)) then
+      Inc(bad);
+  end;
+  Send(results, bad);
+end;
+
+procedure Together;
+var
+  i, bad: Integer;
+begin
+  results := MakeChan(8);
+  for i := 1 to 8 do
+    pas Signer(i);
+  bad := 0;
+  for i := 1 to 8 do
+    bad := bad + Recv(results);
+  WriteLn('eight routines, one key: ', bad, ' wrong');
+end;
+
+begin
+  LoadKeys;
+  KeyFiles;
+  Vectors;
+  Cavp;
+  RandomSalts;
+  Refusals;
+  Reused;
+  Together;
+end.

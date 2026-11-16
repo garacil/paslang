@@ -42,7 +42,23 @@
   (EMSA-PSS-VERIFY), 9.2 (EMSA-PKCS1-v1_5) and B.2.1 (MGF1).
   Verification works on public data only, so it may take variable
   time, as Go's does. A modulus, a signature and a digest are strings
-  of bytes; integers are big-endian. }
+  of bytes; integers are big-endian.
+
+  The third part is the private key and its signatures (P616), as the
+  same Go package at commit f043823 (rsa.go NewPrivateKey,
+  NewPrivateKeyWithPrecomputation, checkPrivateKey and decrypt;
+  pkcs1v15.go signPKCS1v15; pkcs1v22.go SignPSS and emsaPSSEncode) and
+  crypto/rsa (fips.go SignPKCS1v15 and SignPSS, the salt lengths): RFC
+  8017 5.2.1 (RSASP1), 8.1.1 (RSASSA-PSS-SIGN), 8.2.1
+  (RSASSA-PKCS1-V1_5-SIGN) and 9.1.1 (EMSA-PSS-ENCODE). The private
+  operation is the Chinese remainder form on the constant-time
+  routines of the first half, so its time depends on the key's
+  announced lengths alone, and its result is raised to e and compared
+  with what was signed before it leaves: a fault in one half would
+  otherwise give the factors away. There is no blinding, as there is
+  none in Go's: blinding hides a variable-time exponentiation, and
+  this one is not variable. Keys of more than two primes, which Go
+  keeps only as deprecated, are not taken. }
 unit pasrsa;
 
 interface
@@ -64,6 +80,10 @@ const
   { the salt length that EMSA-PSS-VERIFY reads from the encoded message,
     Go's pssSaltLengthAutodetect (crypto/rsa's PSSSaltLengthAuto) }
   RsaPssSaltAuto = -1;
+  { a salt as long as the hash's digest, signing and verifying (Go's
+    PSSSaltLengthEqualsHash). When signing, RsaPssSaltAuto is the
+    longest salt the key takes (Go's PSSSaltLengthAuto) }
+  RsaPssSaltEqualsHash = -2;
 
 type
   { a natural number: Limbs[0] is the least significant 64 bits, and
@@ -90,6 +110,22 @@ type
   TRsaPublicKey = record
     N: TModulus;
     E: Integer;
+  end;
+
+  { an RSA private key of two primes that passed Go's checks
+    (fips140/rsa checkPrivateKey), made ready once for many signatures:
+    the primes as moduli, the exponents d mod (p-1) and d mod (q-1) as
+    big-endian bytes of the size of p-1 and q-1, and q^-1 mod p.
+    Everything but Pub is secret. A key that is Ready is only read, so
+    any number of routines may sign with it at once; make one with
+    RsaPrivateKeyInit or RsaPrivateKeyInitCrt, never field by field }
+  TRsaPrivateKey = record
+    Pub: TRsaPublicKey;
+    D: TNat;
+    P, Q: TModulus;
+    DP, DQ: string;
+    QInv: TNat;
+    Ready: Boolean;
   end;
 
 { ---- bigmod: natural numbers modulo m (Go's nat.go) ---- }
@@ -175,6 +211,51 @@ function RsaKeyVerifyPss(const Key: TRsaPublicKey; Hash: Integer; const Hashed, 
 { the same from the modulus N and exponent E at once }
 function RsaVerifyPkcs1v15(const N: string; E: Integer; Hash: Integer; const Hashed, Sig: string): Boolean;
 function RsaVerifyPss(const N: string; E: Integer; Hash: Integer; const Hashed, Sig: string; SaltLen: Integer): Boolean;
+
+{ ---- RSA private keys and signatures ---- }
+
+{ Key from the big-endian modulus N, the exponents E and D and the
+  primes P and Q, the Chinese remainder values worked out in constant
+  time (Go's NewPrivateKey). False with the reason in Err, Go's text
+  where Go has one, when the key is refused: the public half as RsaPublicKeyInit refuses
+  it; a prime that is even or not above one; D not below N; P * Q not
+  N (the whole product is compared, where Go asks for a multiple of N);
+  E * dP not 1 mod P-1 or E * dQ not 1 mod Q-1; qInv * Q not 1 mod P;
+  D that disagrees with dP or dQ; P and Q equal or closer than
+  2^(bits/2 - 100), which Fermat's method factors; D not above
+  2^(bits/2). Leading zero bytes are dropped }
+function RsaPrivateKeyInit(var Key: TRsaPrivateKey; const N: string; E: Integer;
+  const D, P, Q: string; out Err: string): Boolean;
+{ the same with dP = D mod (P-1), dQ = D mod (Q-1) and qInv = Q^-1 mod P
+  given, as a key file holds them, and checked against the rest (Go's
+  NewPrivateKeyWithPrecomputation) }
+function RsaPrivateKeyInitCrt(var Key: TRsaPrivateKey; const N: string; E: Integer;
+  const D, P, Q, DP, DQ, QInv: string; out Err: string): Boolean;
+{ the size of Key's modulus in bytes, the size of its signatures }
+function RsaPrivateKeySize(const Key: TRsaPrivateKey): Integer;
+{ for a key that is no longer needed: its secret numbers are zeroed
+  where they lie, then Key holds nothing and is not Ready. A copy of
+  the key made with := shares those numbers and is zeroed with it (it
+  then signs nothing: its result fails the check). The memory itself
+  goes back to the collector, which may have moved nothing: the heap
+  never moves, so no other copy of the numbers is left by it }
+procedure RsaPrivateKeyClear(var Key: TRsaPrivateKey);
+
+{ RSASSA-PKCS1-V1_5-SIGN (RFC 8017 8.2.1) of the digest Hashed, as Go's
+  SignPKCS1v15: the same signature every time. Hash RsaHashNone signs
+  Hashed as given, with no DigestInfo, for old protocols only. False
+  when Key is not Ready, Hashed is not a digest of Hash, the key is too
+  short for it, or the result failed its check }
+function RsaSignPkcs1v15(const Key: TRsaPrivateKey; Hash: Integer; const Hashed: string; out Sig: string): Boolean;
+{ RSASSA-PSS-SIGN (RFC 8017 8.1.1) with MGF1 on the same hash, as Go's
+  SignPSS: a salt of SaltLen bytes from the kernel's generator
+  (getrandom), RsaPssSaltEqualsHash for the digest's size (what TLS 1.3
+  and JWT's PS256 ask) or RsaPssSaltAuto for the longest the key takes.
+  Hash not RsaHashNone }
+function RsaSignPss(const Key: TRsaPrivateKey; Hash: Integer; const Hashed: string; SaltLen: Integer; out Sig: string): Boolean;
+{ the same with the salt given: for test vectors, whose salts are
+  written down. A salt must not be used twice with a secret message }
+function RsaSignPssSalt(const Key: TRsaPrivateKey; Hash: Integer; const Hashed, Salt: string; out Sig: string): Boolean;
 
 implementation
 
@@ -896,31 +977,61 @@ end;
 
 { ---- RSA (fips140/rsa rsa.go) ---- }
 
-function RsaPublicKeyInit(var Key: TRsaPublicKey; const N: string; E: Integer): Boolean;
+{ the checks of RsaPublicKeyInit with the reason of a refusal, Go's
+  text, for a private key's loader to give }
+function PublicKeyInitErr(var Key: TRsaPublicKey; const N: string; E: Integer; out Err: string): Boolean;
 var
   bits: Integer;
+  digits: string;
 begin
   Result := False;
+  Err := '';
   Key.E := 0;
   { crypto/rsa fipsPublicKey: bigmod.NewModulus, the value above one }
   if not NewModulus(Key.N, N) then
+  begin
+    Err := 'crypto/rsa: invalid modulus';
     Exit;
+  end;
   bits := ModulusBitLen(Key.N);
   { crypto/rsa checkKeySize: 1024 bits at least }
   if bits < 1024 then
+  begin
+    Str(bits, digits);
+    Err := 'crypto/rsa: ' + digits + '-bit keys are insecure';
     Exit;
+  end;
   { checkPublicKey: the modulus odd }
   if not Key.N.OddModulus then
+  begin
+    Err := 'crypto/rsa: public modulus is even';
     Exit;
+  end;
   { e at least 2, odd (coprime with p - 1 and q - 1), at most 2^31 - 1 }
   if E < 2 then
+  begin
+    Err := 'crypto/rsa: public exponent too small or negative';
     Exit;
+  end;
   if (E and 1) = 0 then
+  begin
+    Err := 'crypto/rsa: public exponent is even';
     Exit;
+  end;
   if E > $7FFFFFFF then
+  begin
+    Err := 'crypto/rsa: public exponent too large';
     Exit;
+  end;
   Key.E := E;
   Result := True;
+end;
+
+function RsaPublicKeyInit(var Key: TRsaPublicKey; const N: string; E: Integer): Boolean;
+var
+  why: string;
+begin
+  Result := PublicKeyInitErr(Key, N, E, why);
 end;
 
 function RsaPublicKeySize(const Key: TRsaPublicKey): Integer;
@@ -1102,6 +1213,9 @@ begin
     Exit;
   if RsaHashSize(Hash) < 0 then
     Exit;
+  { crypto/rsa VerifyPSS: PSSSaltLengthEqualsHash is the digest's size }
+  if SaltLen = RsaPssSaltEqualsHash then
+    SaltLen := RsaHashSize(Hash);
   { VerifyPSSWithSaltLength: the salt length cannot be negative }
   if SaltLen < RsaPssSaltAuto then
     Exit;
@@ -1145,6 +1259,500 @@ begin
   if not RsaPublicKeyInit(key, N, E) then
     Exit;
   Result := RsaKeyVerifyPss(key, Hash, Hashed, Sig, SaltLen);
+end;
+
+{ ---- the private key (fips140/rsa rsa.go) ---- }
+
+{ SubOne: X := X - 1 mod M, X of M's length. Sub asks for a reduced X
+  and SubOne is given M itself; with Y = 1 it works, as Go notes }
+procedure NatSubOne(var X: TNat; const M: TModulus);
+var
+  one: TNat;
+begin
+  NatResetFor(one, M);
+  one.Limbs[0] := 1;
+  NatSub(X, one, M);
+end;
+
+{ 1 when A * B = C as whole numbers, else 0, in constant time: the
+  product worked out a row at a time and compared limb by limb. A, B
+  and C carry no leading zero limbs (they are moduli) }
+function NatProductIs(const A, B, C: TNat): Integer;
+var
+  t: TNat;
+  la, lb, lc, i, eq: Integer;
+begin
+  la := Length(A.Limbs);
+  lb := Length(B.Limbs);
+  lc := Length(C.Limbs);
+  if (la = 0) or (lb = 0) or (lc > la + lb) then
+    Exit(0);
+  NatReset(t, la + lb);
+  for i := 0 to lb - 1 do
+    t.Limbs[la + i] := AddMulVVW(@t.Limbs[i], @A.Limbs[0], la, B.Limbs[i]);
+  eq := 1;
+  for i := 0 to lc - 1 do
+    eq := eq and CtEq(t.Limbs[i], C.Limbs[i]);
+  for i := lc to la + lb - 1 do
+    eq := eq and CtEq(t.Limbs[i], 0);
+  Result := eq;
+end;
+
+{ B without its leading zero bytes: a key file's integers carry one
+  when their top bit is set, and setBytes refuses bytes past the limbs.
+  How long a number is, a key's file already says }
+function DropZeros(const B: string): string;
+var
+  i: Integer;
+begin
+  i := 1;
+  while (i < Length(B)) and (B[i] = #0) do
+    Inc(i);
+  Result := Copy(B, i, Length(B) - i + 1);
+end;
+
+{ Key holds nothing: what it held is let go, not written over, since a
+  copy of the key may share it, and the two exponents may still be the
+  strings the caller gave. A key that is refused is left so }
+procedure KeyDrop(var Key: TRsaPrivateKey);
+begin
+  Key := Default(TRsaPrivateKey);
+end;
+
+{ X zeroed where it lies }
+procedure NatWipe(var X: TNat);
+var
+  i: Integer;
+begin
+  for i := 0 to Length(X.Limbs) - 1 do
+    X.Limbs[i] := 0;
+end;
+
+{ the bytes of S zeroed where they lie. Only for a string this unit
+  made itself (NatBytes): a string is otherwise not written through }
+procedure StrWipe(var S: string);
+var
+  b: PByte;
+begin
+  if S <> '' then
+  begin
+    b := PByte(Pointer(S));
+    FillChar(b^, Length(S), 0);
+  end;
+end;
+
+procedure RsaPrivateKeyClear(var Key: TRsaPrivateKey);
+begin
+  { a key that is Ready holds only numbers made here: CheckPrivateKey
+    left the two exponents as NatBytes wrote them }
+  if Key.Ready then
+  begin
+    NatWipe(Key.D);
+    NatWipe(Key.QInv);
+    NatWipe(Key.P.Nat);
+    NatWipe(Key.P.RR);
+    NatWipe(Key.Q.Nat);
+    NatWipe(Key.Q.RR);
+    StrWipe(Key.DP);
+    StrWipe(Key.DQ);
+  end;
+  KeyDrop(Key);
+end;
+
+{ the modulus M - 1 of an odd modulus M above two }
+function ModulusLessOne(var Res: TModulus; const M: TModulus): Boolean;
+var
+  t: TNat;
+begin
+  ModulusNat(t, M);
+  NatSubOne(t, M);
+  Result := NewModulus(Res, NatBytes(t, M));
+end;
+
+{ checkPrivateKey: every relation between the parts of a key of two
+  primes, each compared in constant time; only which check failed, and
+  the sizes of p - q and of d, are let out, as Go lets them. The two
+  exponents are left at the sizes of p - 1 and q - 1 }
+function CheckPrivateKey(var Key: TRsaPrivateKey; out Err: string): Boolean;
+var
+  pm1, qm1: TModulus;
+  t, cp, cq, de, qp, diff: TNat;
+begin
+  Result := False;
+  { bigmod's Exp asks for an odd modulus, and a prime above two is odd:
+    Go refuses an even p in newPrivateKey }
+  if not (Key.P.OddModulus and Key.Q.OddModulus) then
+  begin
+    Err := 'crypto/rsa: invalid prime';
+    Exit;
+  end;
+  { p * q = n. Go compares modulo n, which also takes a p * q of twice
+    or three times n and leaves it to the check of each result }
+  if NatProductIs(Key.P.Nat, Key.Q.Nat, Key.Pub.N.Nat) <> 1 then
+  begin
+    Err := 'crypto/rsa: p * q != n';
+    Exit;
+  end;
+  { d * e = 1 mod p - 1 and mod q - 1: e is then coprime to both, and
+    a^(d * e) = a mod n for every a coprime to n. This checks dP, dQ
+    and e }
+  if not (ModulusLessOne(pm1, Key.P) and ModulusLessOne(qm1, Key.Q)) then
+  begin
+    Err := 'crypto/rsa: invalid prime';
+    Exit;
+  end;
+  if not (NatSetBytes(cp, Key.DP, pm1) and NatSetBytes(cq, Key.DQ, qm1)) then
+  begin
+    Err := 'crypto/rsa: invalid CRT exponent';
+    Exit;
+  end;
+  NatSetUint(de, Key.Pub.E);
+  if not NatExpandFor(de, pm1) then
+    Exit;
+  NatMul(de, cp, pm1);
+  if NatIsOne(de) <> 1 then
+  begin
+    Err := 'crypto/rsa: invalid CRT exponent';
+    Exit;
+  end;
+  NatSetUint(de, Key.Pub.E);
+  if not NatExpandFor(de, qm1) then
+    Exit;
+  NatMul(de, cq, qm1);
+  if NatIsOne(de) <> 1 then
+  begin
+    Err := 'crypto/rsa: invalid CRT exponent';
+    Exit;
+  end;
+  { qInv * q = 1 mod p }
+  NatMod(qp, Key.Q.Nat, Key.P);
+  NatMul(qp, Key.QInv, Key.P);
+  if NatIsOne(qp) <> 1 then
+  begin
+    Err := 'crypto/rsa: invalid CRT coefficient';
+    Exit;
+  end;
+  { d against dP and dQ: d is never used, but the key must agree with
+    itself }
+  NatMod(t, Key.D, pm1);
+  if NatEqual(t, cp) <> 1 then
+  begin
+    Err := 'crypto/rsa: d does not match dP';
+    Exit;
+  end;
+  NatMod(t, Key.D, qm1);
+  if NatEqual(t, cq) <> 1 then
+  begin
+    Err := 'crypto/rsa: d does not match dQ';
+    Exit;
+  end;
+  { |p - q| > 2^(nlen / 2 - 100): closer primes fall to Fermat's method
+    (Böck, Fermat Factorization in the Wild, eprint 2023/026). 0 - x
+    mod m is m - x }
+  if NatSetBytes(qp, NatBytes(Key.Q.Nat, Key.Q), Key.P) then
+  begin
+    NatResetFor(diff, Key.P);
+    NatSub(diff, qp, Key.P);
+  end
+  else if NatSetBytes(qp, NatBytes(Key.P.Nat, Key.P), Key.Q) then
+  begin
+    NatResetFor(diff, Key.Q);
+    NatSub(diff, qp, Key.Q);
+  end
+  else
+  begin
+    Err := 'crypto/rsa: p == q';
+    Exit;
+  end;
+  if NatBitLenVarTime(diff) <= ModulusBitLen(Key.Pub.N) div 2 - 100 then
+  begin
+    Err := 'crypto/rsa: |p - q| too small';
+    Exit;
+  end;
+  { d > 2^(nlen / 2): a small d is found from n and e (Boneh, Twenty
+    Years of Attacks on the RSA Cryptosystem, section 3) }
+  if NatBitLenVarTime(Key.D) <= ModulusBitLen(Key.Pub.N) div 2 then
+  begin
+    Err := 'crypto/rsa: d too small';
+    Exit;
+  end;
+  Key.DP := NatBytes(cp, pm1);
+  Key.DQ := NatBytes(cq, qm1);
+  Result := True;
+end;
+
+{ the parts every private key has: the public half, the primes and d }
+function KeyParts(var Key: TRsaPrivateKey; const N: string; E: Integer;
+  const D, P, Q: string; out Err: string): Boolean;
+begin
+  Result := False;
+  KeyDrop(Key);
+  if not PublicKeyInitErr(Key.Pub, N, E, Err) then
+  begin
+    KeyDrop(Key);
+    Exit;
+  end;
+  if not (NewModulus(Key.P, P) and NewModulus(Key.Q, Q)) then
+  begin
+    Err := 'crypto/rsa: invalid prime';
+    KeyDrop(Key);
+    Exit;
+  end;
+  if not NatSetBytes(Key.D, DropZeros(D), Key.Pub.N) then
+  begin
+    Err := 'crypto/rsa: invalid private exponent';
+    KeyDrop(Key);
+    Exit;
+  end;
+  Result := True;
+end;
+
+{ newPrivateKey: dP = d mod (p - 1), dQ = d mod (q - 1), and qInv by
+  Fermat's little theorem, q^(p - 2) mod p, an inversion in constant
+  time for a prime p }
+function RsaPrivateKeyInit(var Key: TRsaPrivateKey; const N: string; E: Integer;
+  const D, P, Q: string; out Err: string): Boolean;
+var
+  pm1, qm1: TModulus;
+  t, qp: TNat;
+begin
+  Result := False;
+  if not KeyParts(Key, N, E, D, P, Q, Err) then
+    Exit;
+  if not (Key.P.OddModulus and Key.Q.OddModulus and ModulusLessOne(pm1, Key.P) and
+    ModulusLessOne(qm1, Key.Q)) then
+  begin
+    Err := 'crypto/rsa: invalid prime';
+    KeyDrop(Key);
+    Exit;
+  end;
+  NatMod(t, Key.D, pm1);
+  Key.DP := NatBytes(t, pm1);
+  NatMod(t, Key.D, qm1);
+  Key.DQ := NatBytes(t, qm1);
+  ModulusNat(t, Key.P);
+  NatSubOne(t, Key.P);
+  NatSubOne(t, Key.P);
+  NatMod(qp, Key.Q.Nat, Key.P);
+  NatExp(Key.QInv, qp, NatBytes(t, Key.P), Key.P);
+  if not CheckPrivateKey(Key, Err) then
+  begin
+    KeyDrop(Key);
+    Exit;
+  end;
+  Key.Ready := True;
+  Result := True;
+end;
+
+function RsaPrivateKeyInitCrt(var Key: TRsaPrivateKey; const N: string; E: Integer;
+  const D, P, Q, DP, DQ, QInv: string; out Err: string): Boolean;
+begin
+  Result := False;
+  if not KeyParts(Key, N, E, D, P, Q, Err) then
+    Exit;
+  Key.DP := DropZeros(DP);
+  Key.DQ := DropZeros(DQ);
+  if not NatSetBytes(Key.QInv, DropZeros(QInv), Key.P) then
+  begin
+    Err := 'crypto/rsa: invalid CRT coefficient';
+    KeyDrop(Key);
+    Exit;
+  end;
+  if not CheckPrivateKey(Key, Err) then
+  begin
+    KeyDrop(Key);
+    Exit;
+  end;
+  Key.Ready := True;
+  Result := True;
+end;
+
+function RsaPrivateKeySize(const Key: TRsaPrivateKey): Integer;
+begin
+  Result := ModulusSize(Key.Pub.N);
+end;
+
+{ decrypt with its check: RSASP1 (RFC 8017 5.2.1) of the k bytes C by
+  the Chinese remainder theorem, every step on the constant-time
+  routines above; then the result raised to e and compared with C, so
+  that a fault in either half never leaves as a signature (a wrong
+  half and the right one give a factor of n: Boneh, DeMillo and
+  Lipton). False when C is not below n or the check fails }
+function PrivateOp(const Key: TRsaPrivateKey; const C: string; out M: string): Boolean;
+var
+  cn, m1, m2, t0, check: TNat;
+begin
+  M := '';
+  Result := False;
+  if not NatSetBytes(cn, C, Key.Pub.N) then
+    Exit;
+  { m1 = c^dP mod p }
+  NatMod(t0, cn, Key.P);
+  NatExp(m1, t0, Key.DP, Key.P);
+  { m2 = c^dQ mod q }
+  NatMod(t0, cn, Key.Q);
+  NatExp(m2, t0, Key.DQ, Key.Q);
+  { m1 = (m1 - m2) * qInv mod p }
+  NatMod(t0, m2, Key.P);
+  NatSub(m1, t0, Key.P);
+  NatMul(m1, Key.QInv, Key.P);
+  { m1 = m1 * q + m2 mod n }
+  if not NatExpandFor(m1, Key.Pub.N) then
+    Exit;
+  NatMod(t0, Key.Q.Nat, Key.Pub.N);
+  NatMul(m1, t0, Key.Pub.N);
+  if not NatExpandFor(m2, Key.Pub.N) then
+    Exit;
+  NatAdd(m1, m2, Key.Pub.N);
+  { the check: m1^e = c. NatEqual compares as many limbs as its first
+    number has, so the two lengths are compared first: a result that
+    was never worked out is no match }
+  NatExpShortVarTime(check, m1, Key.Pub.E, Key.Pub.N);
+  if Length(check.Limbs) <> Length(cn.Limbs) then
+    Exit;
+  if NatEqual(check, cn) <> 1 then
+    Exit;
+  M := NatBytes(m1, Key.Pub.N);
+  Result := M <> '';
+end;
+
+{ signPKCS1v15 }
+function RsaSignPkcs1v15(const Key: TRsaPrivateKey; Hash: Integer; const Hashed: string; out Sig: string): Boolean;
+var
+  em: string;
+begin
+  Sig := '';
+  Result := False;
+  if not Key.Ready then
+    Exit;
+  { crypto/rsa SignPKCS1v15: the input must be a digest of the hash }
+  if (Hash <> RsaHashNone) and (Length(Hashed) <> RsaHashSize(Hash)) then
+    Exit;
+  { RFC 8017 8.2.1 step 1: EMSA-PKCS1-v1_5 encoding of the digest }
+  if not Pkcs1v15ConstructEM(RsaPublicKeySize(Key.Pub), Hash, Hashed, em) then
+    Exit;
+  { steps 2 to 4: RSASP1 and its k bytes }
+  Result := PrivateOp(Key, em, Sig);
+end;
+
+{ ---- PSS signatures (pkcs1v22.go) ---- }
+
+{ emsaPSSEncode (RFC 8017 9.1.1): EM of EmBits bits from the digest
+  MHash and Salt; False when MHash is not a digest of Hash or the key
+  is too short for the hash and the salt }
+function EmsaPssEncode(const MHash, Salt: string; EmBits: Integer; Hash: Integer; out Em: string): Boolean;
+var
+  hLen, sLen, emLen, psLen, dbLen, i: Integer;
+  h: string;
+begin
+  Em := '';
+  Result := False;
+  hLen := RsaHashSize(Hash);
+  sLen := Length(Salt);
+  emLen := (EmBits + 7) div 8;
+  { steps 1 and 2: mHash of hLen octets }
+  if (hLen < 0) or (Length(MHash) <> hLen) then
+    Exit;
+  { step 3 }
+  if emLen < hLen + sLen + 2 then
+    Exit;
+  psLen := emLen - sLen - hLen - 2;
+  dbLen := psLen + 1 + sLen;
+  { steps 5 and 6: H = Hash(8 zero octets || mHash || salt) }
+  h := RsaHash(Hash, StringOfChar(#0, 8) + MHash + Salt);
+  { steps 7 and 8: DB = PS || 0x01 || salt, PS psLen zero octets }
+  SetLength(Em, emLen);
+  Em[psLen + 1] := #1;
+  for i := 1 to sLen do
+    Em[psLen + 1 + i] := Salt[i];
+  { steps 9 and 10: maskedDB = DB xor MGF(H, emLen - hLen - 1) }
+  Mgf1Xor(Em, 1, dbLen, Hash, h);
+  { step 11: the leftmost 8 emLen - emBits bits zero }
+  Em[1] := Chr(Ord(Em[1]) and ($ff shr (8 * emLen - EmBits)));
+  { step 12: EM = maskedDB || H || 0xbc }
+  for i := 1 to hLen do
+    Em[dbLen + i] := h[i];
+  Em[emLen] := Chr($bc);
+  Result := True;
+end;
+
+{ N bytes of the kernel's generator, '' when it fails: getrandom with
+  no flags, an interrupted call and a short read tried again, as Go's
+  sysrand (rand_getrandom.go) and pasnist's key generation. The system
+  call gives up its P while it waits for entropy }
+function KernelRandom(N: Integer): string;
+var
+  nr, used, count: Integer;
+begin
+  Result := '';
+  if N <= 0 then
+    Exit;
+  if Amd64 = 0 then nr := 278 else nr := 318;
+  SetLength(Result, N);
+  used := 0;
+  while used < N do
+  begin
+    repeat
+      count := Syscall(nr, Integer(@Result[used + 1]), N - used, 0);
+    until count <> -4;
+    if (count <= 0) or (count > N - used) then
+    begin
+      Result := '';
+      Exit;
+    end;
+    used := used + count;
+  end;
+end;
+
+function RsaSignPssSalt(const Key: TRsaPrivateKey; Hash: Integer; const Hashed, Salt: string; out Sig: string): Boolean;
+var
+  em: string;
+begin
+  Sig := '';
+  Result := False;
+  if not Key.Ready then
+    Exit;
+  { RFC 8017 8.1.1 step 1: EM of modBits - 1 bits }
+  if not EmsaPssEncode(Hashed, Salt, ModulusBitLen(Key.Pub.N) - 1, Hash, em) then
+    Exit;
+  { step 2: RSASP1. EM is one octet shorter than k when modBits - 1 is
+    a multiple of 8; Go puts a zero octet in front, and here the
+    number is the same without it }
+  Result := PrivateOp(Key, em, Sig);
+end;
+
+function RsaSignPss(const Key: TRsaPrivateKey; Hash: Integer; const Hashed: string; SaltLen: Integer; out Sig: string): Boolean;
+var
+  hLen, sLen: Integer;
+  salt: string;
+begin
+  Sig := '';
+  Result := False;
+  if not Key.Ready then
+    Exit;
+  hLen := RsaHashSize(Hash);
+  if hLen < 0 then
+    Exit;
+  sLen := SaltLen;
+  if SaltLen = RsaPssSaltAuto then
+  begin
+    { PSSMaxSaltLength }
+    sLen := (ModulusBitLen(Key.Pub.N) - 1 + 7) div 8 - 2 - hLen;
+    if sLen < 0 then
+      Exit;
+  end
+  else if SaltLen = RsaPssSaltEqualsHash then
+    sLen := hLen
+  else if SaltLen < 0 then
+    Exit;
+  salt := '';
+  if sLen > 0 then
+  begin
+    salt := KernelRandom(sLen);
+    if Length(salt) <> sLen then
+      Exit;
+  end;
+  Result := RsaSignPssSalt(Key, Hash, Hashed, salt, Sig);
 end;
 
 end.

@@ -245,6 +245,33 @@ function PemDecode(const Data: string; out Block: TPemBlock; out Rest: string): 
 { every block of Data, in order }
 function PemDecodeAll(const Data: string): TPemBlocks;
 
+{ An RSA private key from its files (P616), read as Go's crypto/x509
+  reads them (pkcs1.go ParsePKCS1PrivateKey, pkcs8.go
+  ParsePKCS8PrivateKey) with the strict DER reader of this unit, and
+  then checked whole by pasrsa (RsaPrivateKeyInitCrt): False with the
+  reason in Err.
+
+  PKCS #1 is RSAPrivateKey of RFC 8017 A.1.2, the DER inside a PEM
+  block RSA PRIVATE KEY: version 0, n, e, d, p, q and the three Chinese
+  remainder values, which are checked against the rest; a key without
+  the three (Go takes one) has them worked out. Nothing may follow, in
+  the sequence or after it. A key of more than two primes (version 1)
+  is refused.
+
+  PKCS #8 is PrivateKeyInfo of RFC 5208 (OneAsymmetricKey of RFC 5958,
+  version 0 or 1), the DER inside a PEM block PRIVATE KEY and the form
+  inside a Google service account's JSON: its algorithm must be
+  rsaEncryption with NULL or no parameters, and its key the PKCS #1
+  above. An encrypted key (ENCRYPTED PRIVATE KEY, or a block with
+  headers) is refused, not guessed at.
+
+  X509ParsePemRsaKey takes the first block of Pem whose type is PRIVATE
+  KEY or ends in PRIVATE KEY, as Go's tls.X509KeyPair looks for it, so
+  a file of certificates and a key gives its key. }
+function X509ParsePkcs1RsaKey(const Der: string; out Key: TRsaPrivateKey; out Err: string): Boolean;
+function X509ParsePkcs8RsaKey(const Der: string; out Key: TRsaPrivateKey; out Err: string): Boolean;
+function X509ParsePemRsaKey(const Pem: string; out Key: TRsaPrivateKey; out Err: string): Boolean;
+
 { Go's ParseCertificate: one DER certificate and nothing after it.
   False with Go's error text. }
 function X509Parse(const Der: string; out Cert: TX509Cert; out Err: string): Boolean;
@@ -4174,6 +4201,163 @@ begin
       Break;
     Result := Append(Result, b);
     at := nat;
+  end;
+end;
+
+{ ---- RSA private keys (crypto/x509 pkcs1.go and pkcs8.go) ---- }
+
+{ ParsePKCS1PrivateKey. Go reads the structure with encoding/asn1,
+  which lets bytes follow the last field of a SEQUENCE and takes each
+  of the three Chinese remainder values or leaves it out; here nothing
+  may follow and the three come together or not at all. The key's own
+  relations are pasrsa's to check, as rsa.PrivateKey.Validate is
+  called there }
+function X509ParsePkcs1RsaKey(const Der: string; out Key: TRsaPrivateKey; out Err: string): Boolean;
+var
+  inp, seq: TDer;
+  ver, ex: Integer;
+  nn, dd, pp, qq, dp, dq, qi: string;
+begin
+  Result := False;
+  Key := Default(TRsaPrivateKey);
+  Err := 'x509: failed to parse RSA private key';
+  inp := DerOf(Der);
+  if not DerRead(inp, seq, TagSequence) then
+    Exit;
+  if not DerEmpty(inp) then
+  begin
+    Err := 'x509: trailing data after RSA private key';
+    Exit;
+  end;
+  if not DerReadInt64(seq, ver) then
+    Exit;
+  if ver = 1 then
+  begin
+    Err := 'x509: RSA private keys of more than two primes are not supported';
+    Exit;
+  end;
+  if ver <> 0 then
+  begin
+    Err := 'x509: unsupported private key version';
+    Exit;
+  end;
+  if not (DerReadBigInt(seq, nn) and DerReadInt64(seq, ex) and DerReadBigInt(seq, dd) and
+    DerReadBigInt(seq, pp) and DerReadBigInt(seq, qq)) then
+    Exit;
+  if (BigSign(nn) <= 0) or (BigSign(dd) <= 0) or (BigSign(pp) <= 0) or (BigSign(qq) <= 0) then
+  begin
+    Err := 'x509: private key contains zero or negative value';
+    Exit;
+  end;
+  if DerEmpty(seq) then
+  begin
+    Result := RsaPrivateKeyInit(Key, StripZeros(nn), ex, StripZeros(dd), StripZeros(pp), StripZeros(qq), Err);
+    Exit;
+  end;
+  if not (DerReadBigInt(seq, dp) and DerReadBigInt(seq, dq) and DerReadBigInt(seq, qi)) then
+    Exit;
+  if not DerEmpty(seq) then
+  begin
+    Err := 'x509: trailing data in RSA private key';
+    Exit;
+  end;
+  if (BigSign(dp) <= 0) or (BigSign(dq) <= 0) or (BigSign(qi) <= 0) then
+  begin
+    Err := 'x509: private key contains zero or negative value';
+    Exit;
+  end;
+  Result := RsaPrivateKeyInitCrt(Key, StripZeros(nn), ex, StripZeros(dd), StripZeros(pp), StripZeros(qq),
+    StripZeros(dp), StripZeros(dq), StripZeros(qi), Err);
+end;
+
+{ ParsePKCS8PrivateKey for an RSA key. Go checks neither the version
+  nor the algorithm's parameters and lets bytes follow; here the
+  version is 0 or 1 (RFC 5958), the parameters NULL or absent (RFC 8017
+  A.1), the attributes [0] and the public key [1] are read past only
+  when well formed, and nothing follows }
+function X509ParsePkcs8RsaKey(const Der: string; out Key: TRsaPrivateKey; out Err: string): Boolean;
+var
+  inp, seq, alg, par, oct: TDer;
+  ver: Integer;
+  oid, why: string;
+begin
+  Result := False;
+  Key := Default(TRsaPrivateKey);
+  Err := 'x509: failed to parse PKCS #8 private key';
+  inp := DerOf(Der);
+  if not DerRead(inp, seq, TagSequence) then
+    Exit;
+  if not DerEmpty(inp) then
+  begin
+    Err := 'x509: trailing data after PKCS #8 private key';
+    Exit;
+  end;
+  if not DerReadInt64(seq, ver) then
+    Exit;
+  if (ver <> 0) and (ver <> 1) then
+  begin
+    Err := 'x509: unsupported PKCS #8 version';
+    Exit;
+  end;
+  if not (DerRead(seq, alg, TagSequence) and DerReadOid(alg, oid)) then
+    Exit;
+  if oid <> OidPkRSA then
+  begin
+    Err := 'x509: PKCS #8 private key is not an RSA key (algorithm ' + X509OidString(oid) + ')';
+    Exit;
+  end;
+  if not DerEmpty(alg) then
+    if not (DerRead(alg, par, TagNull) and DerEmpty(par) and DerEmpty(alg)) then
+    begin
+      Err := 'x509: invalid RSA private key parameters';
+      Exit;
+    end;
+  if not DerRead(seq, oct, TagOctetString) then
+    Exit;
+  if not (DerSkipOptional(seq, $A0) and DerSkipOptional(seq, $81)) then
+    Exit;
+  if not DerEmpty(seq) then
+  begin
+    Err := 'x509: trailing data in PKCS #8 private key';
+    Exit;
+  end;
+  if not X509ParsePkcs1RsaKey(DerStr(oct), Key, why) then
+  begin
+    Err := 'x509: failed to parse RSA private key embedded in PKCS#8: ' + why;
+    Exit;
+  end;
+  Err := '';
+  Result := True;
+end;
+
+function X509ParsePemRsaKey(const Pem: string; out Key: TRsaPrivateKey; out Err: string): Boolean;
+var
+  cur, nxt, n: Integer;
+  b: TPemBlock;
+  kind: string;
+begin
+  Result := False;
+  Key := Default(TRsaPrivateKey);
+  Err := 'x509: no private key PEM block';
+  cur := 1;
+  while cur <= Length(Pem) do
+  begin
+    if not PemDecodeAt(Pem, cur, b, nxt) then
+      Break;
+    cur := nxt;
+    kind := b.BlockType;
+    n := Length(kind);
+    if (kind <> 'PRIVATE KEY') and ((n < 12) or (Copy(kind, n - 11, 12) <> ' PRIVATE KEY')) then
+      Continue;
+    if (kind = 'ENCRYPTED PRIVATE KEY') or (Length(b.Headers) <> 0) then
+      Err := 'x509: encrypted private keys are not read'
+    else if kind = 'PRIVATE KEY' then
+      Result := X509ParsePkcs8RsaKey(b.Bytes, Key, Err)
+    else if kind = 'RSA PRIVATE KEY' then
+      Result := X509ParsePkcs1RsaKey(b.Bytes, Key, Err)
+    else
+      Err := 'x509: PEM block ' + kind + ' is not an RSA private key';
+    Exit;
   end;
 end;
 

@@ -721,6 +721,9 @@ GOLDEN_A64 += cipherkat cipherwyche
 # P429: X25519, P-256 and P-384, RSA against RFC 7748 and Wycheproof.
 GOLDEN += x25519kat x25519wyche nistwyche rsawyche
 GOLDEN_A64 += x25519kat x25519wyche nistwyche rsawyche
+# P616: RSA private keys and signatures against OpenSSL, PSS with its salts, the key files and their refusals.
+GOLDEN += rsasign rsasigwyche
+GOLDEN_A64 += rsasign rsasigwyche
 # P430: X.509 against Go's crypto/x509, PEM, routines sharing roots.
 GOLDEN += x509verify x509pem x509conc
 GOLDEN_A64 += x509verify x509pem x509conc
@@ -1342,6 +1345,11 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	python3 -I scripts/check_nist_ct.py $(OUTDIR)/paslangc $(BUILDDIR); \
 	echo ok nist-sign
 	@set -e; \
+	: P616: the vectors of RSA signing worked out again from their keys, and faults written into the private operation; \
+	python3 -I scripts/rsasign_vectors.py --check; \
+	python3 -I scripts/check_rsa_faults.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64); \
+	echo ok rsa-sign
+	@set -e; \
 	: P576: lifecycle faults, independent eligibility, metadata and real stop-room ownership; \
 	python3 -I scripts/check_unit_life.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64); \
 	python3 -I scripts/check_symbols.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64); \
@@ -1557,7 +1565,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/stackmap.out $(BUILDDIR)/stackmap.vgot; \
 	echo ok stackmaps; \
 	echo "==== the base processor (-cpu base) ===="; \
-	for t in vectors vecmore vecpool bitwords xxh3 inlineasm hash1 tree1 store1 mapsplit set256 strwords strkern strcmpk cmpwords sysutils1 utf8kern jsonkern longslice rtlong fillkern json1 jsoncanon hmacstream hashpieces hashpieces2 cipherkat cipherwyche x25519kat nistwyche nistsign rsawyche fmafused; do \
+	for t in vectors vecmore vecpool bitwords xxh3 inlineasm hash1 tree1 store1 mapsplit set256 strwords strkern strcmpk cmpwords sysutils1 utf8kern jsonkern longslice rtlong fillkern json1 jsoncanon hmacstream hashpieces hashpieces2 cipherkat cipherwyche x25519kat nistwyche nistsign rsawyche rsasign rsasigwyche fmafused; do \
 	  $(OUTDIR)/paslangc -cpu base -o $(BUILDDIR)/$$t-base testdata/$$t.paslang; \
 	  $(BUILDDIR)/$$t-base > $(BUILDDIR)/$$t.bgot; \
 	  diff -u testdata/$$t.out $(BUILDDIR)/$$t.bgot; \
@@ -1632,7 +1640,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -qw 'ptest' $(BUILDDIR)/set256-v2.s; \
 	if grep -qw 'vptest' $(BUILDDIR)/set256-v2.s; then echo "set256-v2.s carries AVX2"; exit 1; fi; \
 	: a program for the base processor links no instruction past it, P268: inlineasm writes AVX2 itself and strkern calls the AVX2 kernels to test them; \
-	for t in vectors vecmore vecpool bitwords xxh3 hash1 tree1 store1 mapsplit set256 strwords strcmpk cmpwords sysutils1 utf8kern jsonkern longslice rtlong fillkern json1 jsoncanon hmacstream cipherkat cipherwyche x25519kat nistwyche nistsign rsawyche; do \
+	for t in vectors vecmore vecpool bitwords xxh3 hash1 tree1 store1 mapsplit set256 strwords strcmpk cmpwords sysutils1 utf8kern jsonkern longslice rtlong fillkern json1 jsoncanon hmacstream cipherkat cipherwyche x25519kat nistwyche nistsign rsawyche rsasign rsasigwyche; do \
 	  python3 -I scripts/check_cpubin.py base $(BUILDDIR)/$$t-base > /dev/null || { python3 -I scripts/check_cpubin.py base $(BUILDDIR)/$$t-base; exit 1; }; \
 	done; \
 	: the UTF-8 kernels against the strict decoder of Python, P201: the expected output is the model output; \
@@ -6436,7 +6444,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	diff -u testdata/cputuse.out $(BUILDDIR)/cputuse-arm.got
 	@set -e; \
 	echo "==== the base processor arm64 ===="; \
-	for t in hash1 tree1 store1 vectors bitwords set256 strwords strkern strcmpk cmpwords sysutils1 utf8kern jsonkern longslice rtlong fillkern json1 jsoncanon hmacstream hashpieces hashpieces2 cipherkat cipherwyche x25519kat nistwyche nistsign rsawyche; do \
+	for t in hash1 tree1 store1 vectors bitwords set256 strwords strkern strcmpk cmpwords sysutils1 utf8kern jsonkern longslice rtlong fillkern json1 jsoncanon hmacstream hashpieces hashpieces2 cipherkat cipherwyche x25519kat nistwyche nistsign rsawyche rsasign rsasigwyche; do \
 	  $(OUTDIR)/paslangc -target arm64 -cpu base -o $(BUILDDIR)/$$t-arm-base testdata/$$t.paslang; \
 	  timeout 120 $(QEMU_A64) $(BUILDDIR)/$$t-arm-base > $(BUILDDIR)/$$t-arm.bgot; \
 	  diff -u testdata/$$t.out $(BUILDDIR)/$$t-arm.bgot; \
