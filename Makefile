@@ -38,6 +38,15 @@ NORMAL_INSTALL = :
 PRE_INSTALL = :
 POST_INSTALL = :
 
+# Every tool a recipe runs writes its messages in one language and compares
+# text one way, whatever the locale of who types make: the checks read what
+# objdump, readelf and others print (P653; started with LANG=es_ES.UTF-8,
+# objdump wrote "Desensamblado de la sección" and scripts/check_loopmaps.py
+# reported a routine without its calls). LANGUAGE is what GNU gettext reads
+# before the locale's own messages.
+export LC_ALL := C.UTF-8
+unexport LANGUAGE
+
 OUTDIR   := ./bin
 BUILDDIR := ./build
 # paslang is built by paslangc alone (P262, Reglas 9 and 15). The oldest
