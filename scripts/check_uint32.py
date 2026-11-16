@@ -505,7 +505,10 @@ def main():
                 program = out / tag
                 argv = [compiler, "-target", arch, "-cpu", cpu, "-inline", str(inline),
                         "-Fu", units, "-o", program, out / (name + ".paslang")]
-                row, build_stdout, build_stderr = command(argv, tag + "-build", "build", env=base_env)
+                # extensions at -inline 40 takes 171 s here with nothing else running:
+                # a limit of 180 s failed the check on a machine doing a second thing (P654)
+                row, build_stdout, build_stderr = command(argv, tag + "-build", "build", env=base_env,
+                                                          timeout=900)
                 row["clean_diagnostics"] = row["status"] == 0 and build_stdout == b"" and build_stderr == b""
                 if row["status"] != 0:
                     record["errors"].append(tag + ": build failed")
