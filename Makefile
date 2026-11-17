@@ -824,8 +824,8 @@ GOLDEN_A64 += libfault
 GOLDEN += wgagain
 GOLDEN_A64 += wgagain
 # P583: the failures of a channel as exceptions.
-GOLDEN += chanfault chanshut chanoff eofname
-GOLDEN_A64 += chanfault chanshut chanoff eofname
+GOLDEN += chanfault chanshut chanoff eofname hexchar
+GOLDEN_A64 += chanfault chanshut chanoff eofname hexchar
 # P573: a server stops whatever became of its sockets.
 GOLDEN += httpstop
 GOLDEN_A64 += httpstop
@@ -2241,6 +2241,31 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'break not in loop at line 7' $(BUILDDIR)/placebad_breakouta.err; \
 	python3 -I scripts/check_dieplace.py src/compiler/pasparse.paslang src/compiler/pasemit.paslang; \
 	echo ok placebad; \
+	echo "==== comments that end early, characters by hex codes, names in another case (P647) ===="; \
+	for n in nestline nestlines nestdecl nestassign farerror strayclose hexbig; do \
+	  if $(OUTDIR)/paslangc -o $(BUILDDIR)/cmtbad_$$n testdata/cmtbad/$$n.paslang >$(BUILDDIR)/cmtbad_$$n.err 2>&1; then \
+	    echo "$$n should fail"; exit 1; \
+	  fi; \
+	done; \
+	grep -q 'a } with no comment open at 3:30; the { comment opened at 3:15 ended at its first } (3:23): comments do not nest, so the { at 3:21 inside it opened nothing and what follows that } is read as code' $(BUILDDIR)/cmtbad_nestline.err; \
+	grep -q 'unknown identifier more at 5:5; the { comment opened at 3:3 ended at its first } (4:13)' $(BUILDDIR)/cmtbad_nestlines.err; \
+	grep -q 'a } with no comment open at 3:37; the { comment opened at 3:15 ended at its first } (3:30)' $(BUILDDIR)/cmtbad_nestdecl.err; \
+	grep -q 'statement at 5:17; the { comment opened at 5:3 ended at its first } (5:15)' $(BUILDDIR)/cmtbad_nestassign.err; \
+	grep -q 'unknown identifier nosuchname at 12:8 in' $(BUILDDIR)/cmtbad_farerror.err; \
+	if grep -q 'comments do not nest' $(BUILDDIR)/cmtbad_farerror.err $(BUILDDIR)/cmtbad_strayclose.err; then echo 'a comment hint where no comment ended early'; exit 1; fi; \
+	grep -q 'a } with no comment open at 4:3 in' $(BUILDDIR)/cmtbad_strayclose.err; \
+	grep -q 'char code at 3:13' $(BUILDDIR)/cmtbad_hexbig.err; \
+	for n in globals params fields samecase; do \
+	  if $(OUTDIR)/paslangc -o $(BUILDDIR)/casedup_$$n testdata/casedup/$$n.paslang >$(BUILDDIR)/casedup_$$n.err 2>&1; then \
+	    echo "$$n should fail"; exit 1; \
+	  fi; \
+	done; \
+	grep -q 'duplicate identifier total (written Total before: the case of letters does not tell names apart) (a variable of the name) at 5:11' $(BUILDDIR)/casedup_globals.err; \
+	grep -q 'duplicate identifier count (written Count before: the case of letters does not tell names apart) (it is a parameter) at 5:3' $(BUILDDIR)/casedup_params.err; \
+	grep -q 'duplicate identifier width (written Width before: the case of letters does not tell names apart) (it is a field of TBox) at 10:21' $(BUILDDIR)/casedup_fields.err; \
+	grep -q 'duplicate identifier Total (a variable of the name) at 5:11 in' $(BUILDDIR)/casedup_samecase.err; \
+	$(OUTDIR)/paslangc --lex testdata/hexchar.paslang | grep -q '\[#\$$e2\]'; \
+	echo ok cmtbad; \
 	echo "==== record operator rejects (P171) ===="; \
 	for n in nobody badname notbool norec twice bodytypes cast explicitonly; do \
 	  if $(OUTDIR)/paslangc -o $(BUILDDIR)/recopbad_$$n testdata/recopbad/$$n.paslang >$(BUILDDIR)/recopbad_$$n.err 2>&1; then \

@@ -172,6 +172,11 @@ type
     FCpuGen: LongInt;
     FCpuLine: LongInt;
     FGen: Boolean;
+    { the last brace comment that held an opening brace (P647): where it
+      opened, that brace inside it, the closing brace that ended it, and
+      the tokens read since }
+    FCmtLine, FCmtCol, FNestLine, FNestCol, FCmtEndLine, FCmtEndCol: LongInt;
+    FAfterCmt: LongInt;
     procedure Advance;
     procedure SkipSpace;
     function Defined(const N: string): Boolean;
@@ -189,6 +194,11 @@ type
     function Number: TToken;
     function StrLit: TToken;
   public
+    { what to say after an error met just after a brace comment that
+      held an opening brace: the comment ended at its first closing
+      brace, as Pascal's comments do not nest, and the rest was read as
+      code; '' otherwise (P647) }
+    function CommentHint(Line, Within: LongInt): string;
     function NextSolid: Char;
     function PeekDotName: string;
     function PeekDots: string;
@@ -967,6 +977,15 @@ begin
   look.FLine := FLine;
   look.FCol := FCol;
   look.FCh := FCh;
+  { a stray closing brace the lookahead meets after a comment that ended
+    early is told as the real lexer tells it (P647) }
+  look.FCmtLine := FCmtLine;
+  look.FCmtCol := FCmtCol;
+  look.FNestLine := FNestLine;
+  look.FNestCol := FNestCol;
+  look.FCmtEndLine := FCmtEndLine;
+  look.FCmtEndCol := FCmtEndCol;
+  look.FAfterCmt := FAfterCmt;
   SetLength(look.FDefs, Length(FDefs));
   for i := 0 to High(FDefs) do look.FDefs[i] := FDefs[i];
   while True do
@@ -983,6 +1002,7 @@ end;
 procedure TLexer.SkipSpace;
 var
   d, arg: string;
+  ol, oc, nl, nc: LongInt;
 begin
   while True do
   begin
@@ -1027,15 +1047,54 @@ begin
     end;
     if FCh = '{' then
     begin
+      ol := FLine;
+      oc := FCol;
+      nl := 0;
+      nc := 0;
       Advance;
       while (FCh <> #0) and (FCh <> '}') do
+      begin
+        if (FCh = '{') and (nl = 0) then
+        begin
+          nl := FLine;
+          nc := FCol;
+        end;
         Advance;
+      end;
       if FCh = '}' then
+      begin
+        if nl > 0 then
+        begin
+          FCmtLine := ol;
+          FCmtCol := oc;
+          FNestLine := nl;
+          FNestCol := nc;
+          FCmtEndLine := FLine;
+          FCmtEndCol := FCol;
+          FAfterCmt := 0;
+        end;
         Advance;
+      end;
       Continue;
     end;
     Break;
   end;
+end;
+
+{ The text after a comment that ended early reads as code, and the first
+  token that cannot be is met a few tokens after it: the hint is given
+  for an error at Line within Within tokens of such a comment's end, or
+  on the line where it ended within twelve. }
+function TLexer.CommentHint(Line, Within: LongInt): string;
+begin
+  Result := '';
+  if FCmtEndLine = 0 then
+    Exit;
+  if (FAfterCmt > Within) and ((Line <> FCmtEndLine) or (FAfterCmt > 12)) then
+    Exit;
+  Result := '; the { comment opened at ' + IntToStr(FCmtLine) + ':' + IntToStr(FCmtCol) + ' ended at its first } (' +
+    IntToStr(FCmtEndLine) + ':' + IntToStr(FCmtEndCol) + '): comments do not nest, so the { at ' + IntToStr(FNestLine) +
+    ':' + IntToStr(FNestCol) + ' inside it opened nothing and what follows that } is read as code';
 end;
 
 function Keyword(const S: string): TTokKind;
@@ -1357,6 +1416,7 @@ var
   v, d: Int64;
   nd: LongInt;
   txt: string;
+  hashHex: Boolean;
   function Punct(K: TTokKind): TToken;
   begin
     Result := Default(TToken);
@@ -1368,6 +1428,9 @@ var
   end;
 begin
   SkipSpace;
+  if FAfterCmt < 1000000 then
+    Inc(FAfterCmt);
+  hashHex := False;
   Result := Default(TToken);
   Result.Line := FLine;
   Result.Col := FCol;
@@ -1398,7 +1461,14 @@ begin
     Result.Kind := tkChar;
     Exit;
   end;
-  if FGen and (FCh = '$') and (Peek = 'j') then
+  { #$41, a character by its hexadecimal code as Free Pascal and Delphi
+    take it (P647): the $ number below, then a character }
+  if (FCh = '#') and (Peek = '$') then
+  begin
+    hashHex := True;
+    Advance;
+  end;
+  if FGen and (FCh = '$') and (Peek = 'j') and not hashHex then
   begin
     startCol := FCol;
     Advance;
@@ -1448,6 +1518,11 @@ begin
     Result.Kind := tkInt;
     Result.IntVal := v;
     Result.Lexeme := '$';
+    if hashHex then
+    begin
+      Result.Kind := tkChar;
+      Result.Lexeme := '#' + txt;
+    end;
     Result.Line := FLine;
     Result.Col := startCol;
     Exit;
@@ -1527,7 +1602,10 @@ begin
     '<': Result := Punct(tkLt);
     '>': Result := Punct(tkGt);
   else
-    Die('unexpected character at ' + IntToStr(FLine) + ':' + IntToStr(FCol));
+    if FCh = '}' then
+      Die('a } with no comment open at ' + IntToStr(FLine) + ':' + IntToStr(FCol) + CommentHint(FLine, 12))
+    else
+      Die('unexpected character at ' + IntToStr(FLine) + ':' + IntToStr(FCol) + CommentHint(FLine, 3));
   end;
 end;
 

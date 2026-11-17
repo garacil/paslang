@@ -86,8 +86,15 @@ hello world
 ```
 
 A source file ends in `.paslang` and is one program, one unit, or one
-package. Comments are `{ braces }` and `// to the end of the line`.
-Identifiers and keywords are case-insensitive, as in every Pascal.
+package. Comments are `{ braces }` and `// to the end of the line`. A
+brace comment ends at its first `}` and does not nest, as in every
+Pascal: in `{ see {x} here }` the comment ends after `x` and ` here }` is
+read as code, which the compiler says with the place of the comment,
+the brace inside it and the `}` that ended it (1.3.15, P647).
+Identifiers and keywords are case-insensitive, as in every Pascal:
+`Total` and `total` are one name, and a second declaration of it says
+so, `duplicate identifier total (written Total before: the case of
+letters does not tell names apart)`.
 
 ## 2. Programs and units
 
@@ -403,7 +410,10 @@ directive writes it without braces (`$CPU`).
 ## 3. Values and types
 
 A `const` section names a value of any of these kinds: `N = 3`,
-`Ratio = -1.5`, `Name = 'paslang'`, `Nl = #10` (a `Char`), `Yes = True`,
+`Ratio = -1.5`, `Name = 'paslang'`, `Nl = #10` (a `Char`, by its code
+in decimal, or in hexadecimal as `#$0A` since 1.3.15, as Free Pascal
+and Delphi write it; codes join with strings and with each other, so
+`#$e2#$82#$ac` is the euro sign's three octets in UTF-8), `Yes = True`,
 and `Alias = Name` for another constant. A unit exports the constants of
 its interface and keeps those of its implementation. A constant is any
 expression of constants: `Size = N * 4 + 1`, `Mask = not 0 shr 1`,
