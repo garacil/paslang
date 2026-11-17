@@ -480,7 +480,7 @@ begin
   WriteLn(s);
   WriteLn(Copy(s, 6, 5));           { Copy(s, from, count), 1-based: nuevo }
   b := (j > 3) and (s <> '');       { and, or, not on booleans short-circuit }
-  WriteLn(b);                       { booleans print as 1 or 0 }
+  WriteLn(b);                       { a Boolean prints as True or False }
   r := 1.5 + j;                     { an integer promotes to real }
   WriteLn(r);                       { 8.5 }
   WriteLn(Round(2.5), ' ', Trunc(-2.7), ' ', Sqrt(16));   { 2 -2 4.0 }
@@ -499,7 +499,7 @@ a
 97
 año nuevo
 nuevo
-1
+True
 8.5
 2 -2 4.0
 ```
@@ -891,7 +891,7 @@ prints
 145 100 228 100
 145 100 145 140
 400 145 400
-13330 13330 1
+13330 13330 True
 3 3221225472 3221225472 1073741824
 -6 -5 7
 ......##
@@ -1041,7 +1041,7 @@ prints
 
 ```
 5 0 254
-1 1 2
+True True 2
 8684170628557668569
 16920 6210 63554 2114
 -5 -7 -15
@@ -1406,7 +1406,7 @@ prints
 244 f4
 123456789abcdeff 0000000000000010
 00123456789abcde ff00000000000000
-1 1
+1 True
 ```
 
 `HexInt` there is `GetBits` four bits at a time; `$F4` is the check
@@ -1479,7 +1479,7 @@ prints
 1 2 4 128
 0 1 2 4
 gpaslan ngpasla aslangp paslang
-1 1 1
+True True True
 40 10 20 30
 4 1 2 3
 2 3 4 1
@@ -1627,12 +1627,12 @@ prints
 ```
 1 2 2814749767106560
 6.5
-1 1 1.0
+True 1 1.0
 1.5
 4
 8 33 442
 80 33 1 44
-0 300 1
+0 300 True
 PASLANG aB
 ```
 
@@ -1747,7 +1747,7 @@ prints
 1 6
 86 99
 20 2432902008176640000
-1 -8715136041002991616 9223372036854775807
+True -8715136041002991616 9223372036854775807
 255 0 44 206
 ```
 
@@ -2188,11 +2188,11 @@ end.
 prints
 
 ```
-1 1
-1
+True True
+True
 4
-1 1
-1 1 1
+1 True
+True True True
 written by a system call
 25
 ```
@@ -2328,7 +2328,7 @@ end.
 prints
 
 ```
-578437695752307201 1
+578437695752307201 True
 0 1
 0 0
 1535 120
@@ -2994,7 +2994,7 @@ prints
 
 ```
 [info] started 42 jobs, 0.75 load
-[info] <TJob> class TJob x 1 pointer
+[info] <TJob> class TJob x True pointer
 [warn] disk at 91 %
 [empty]
 ```
@@ -3568,7 +3568,7 @@ prints
 20 5
 6 9
 70
-0 -1 1
+0 -1 True
 20 6 5
 ```
 
@@ -3679,11 +3679,11 @@ prints
 1 513 67305985
 2 1027 2055
 1027 134678021
-1 1
+1 True
 4 1
 8 36
 3 99 40
-1 1
+True True
 ```
 
 `View(p, n)` is the `n` elements `p` points at as a slice (`array of T`,
@@ -5645,7 +5645,7 @@ prints
 0
 bo is here
 42
-1 0
+1 False
 92
 2
 44
@@ -5806,12 +5806,12 @@ jon luis
 jon luis 
 maria luis jon ana 
 ana 31 3
-1 0 1 2
+True False True 2
 10 10 20 1
 ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
 900150983cd24fb0d6963f7d28e17f72 891568578 910901175
 f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8
-hello 0 1
+hello False True
 ```
 
 The order words: `Low(t)` and `High(t)` are the first and the last
@@ -5952,11 +5952,11 @@ end.
 prints
 
 ```
-three 1 0
-1 1
-value 1 three 0
-value 6 1 0
-0 value 4
+three True False
+True True
+value 1 three False
+value 6 True False
+False value 4
 27cb2199c3cb261001e8560a8d7b4c4d25daf66481fd0271c60c618aadd57bc4
 27cb2199c3cb261001e8560a8d7b4c4d25daf66481fd0271c60c618aadd57bc4
 {"a":"x","b":[1,2.5],"c":{"y":true,"z":null}}
@@ -6661,7 +6661,7 @@ end.
 prints
 
 ```
-7 Ana 1 3001 2026-10-14 09:30 1234.5 {"team":"blue"}
+7 Ana True 3001 2026-10-14 09:30 1234.5 {"team":"blue"}
 json: cannot decode "Owner" into TRole: no such member at 1:21 (byte 20) within "/roles/0"
 7
 8 Ana 99.99
@@ -7487,7 +7487,7 @@ prints
 
 ```
 400
-1 1
+1 True
 30
 2
 ```
@@ -7765,8 +7765,8 @@ lacsaP
 Pas-cal
 5
 4
-852579327 1
-abc 1
+852579327 True
+abc True
 ```
 
 A string is a pointer and a 64-bit byte length: no 255 limit, no length
@@ -7913,13 +7913,13 @@ d7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf37c9e592
 64 64 96
 54cd5b827c0ec938fa072a29b177469c843317b095591dc846767aa338bac600
 1095738169 576848900 1541148634
-1 1
+True True
 5919806912997584868
 76545936 880582914
 7caa345dbd892a66454d6c6512ea3c3ea3f0d3ec21be3fc2e2375705fd38f672
 3
-1 0 0
-1
+True False False
+True
 ```
 
 A digest is as long as its standard says: `Md5` 16 bytes, `Sha1` 20,
@@ -8117,14 +8117,14 @@ prints
 
 ```
 ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
-d41d8cd98f00b204e9800998ecf8427e 1
-01020304 1
+d41d8cd98f00b204e9800998ecf8427e True
+01020304 True
 8 504c535006000000 ac351f88495f7ba75c401072992ff57efcad618790b0a30ac0a0e788bc2fa3af
 43 2fd4e1c67a2d28fced849ee1bb76e7391b93eb12
-1 1
+True True
 f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8
 -3567667132247329947 -5430228705035387610 880582914 76545936
-1 64
+True 64
 ```
 
 The numbers printed are the published vectors: `Sha256('abc')` and
@@ -8371,7 +8371,7 @@ prints
 3.1415926535897932384626433832795028
 9223372036854775808
 0.33333333333333331483
-33 2 1
+33 2 True
 16
 ```
 
@@ -13898,12 +13898,12 @@ end.
 prints
 
 ```
-slept at least 30ms: 1
+slept at least 30ms: True
 2009-02-13 23:31:30 Friday
 2009 February 13 day 44
-1
+True
 54 56 9 93 97 68 86 19 65 66 
-9 19 54 56 65 66 68 86 93 97 1
+9 19 54 56 65 66 68 86 93 97 True
 50 would go at 2
 ```
 
@@ -15581,8 +15581,9 @@ the commands on standard input, under `--debug-mode` and under
   3.2.2 runs these record destructors in declaration order instead.
   `recstatic` tests paslang's explicit reverse-order contract;
   `recsuse` also checks their position after unit finalization.
-- `Write` prints no set, as Free Pascal; it prints a `Boolean` as 1 or
-  0, where Free Pascal writes TRUE and FALSE.
+- `Write` prints no set, as Free Pascal; it prints a `Boolean` as
+  `True` or `False` (1.3.11, P635: it printed 1 or 0), where Free Pascal
+  writes TRUE and FALSE and Go true and false; `Str` writes the same.
 - SysUtils writes a real with the digits of the value itself, rounded
   once, a tie to even, and with no precision asked the fewest that read
   back, as Go's `strconv` does (P129). Free Pascal rounds an
