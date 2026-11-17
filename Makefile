@@ -1749,7 +1749,8 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  grep -q "call p_f[.]7_pasjson$$(( $${#k} + 4 ))_$${k}base$$" $(BUILDDIR)/pasjson.s || { echo "pasjson's base build does not call $${k}base"; exit 1; }; \
 	  if grep -q "call p_f[.]7_pasjson$$(( $${#k} + 3 ))_$${k}cpu$$" $(BUILDDIR)/pasjson.s; then echo "pasjson's base build calls $${k}cpu"; exit 1; fi; \
 	done; \
-	echo ok cpu-base; \
+	echo ok cpu-base
+	@set -e; \
 	echo "==== the json type (P203) ===="; \
 	: the parser and the writer held to the encoding json v2 of Go when Go is there and to expect.txt always, the index and a byte at a time alike on every document, for this processor and the base one; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/jsoncheck testdata/jsoncheck.paslang; \
