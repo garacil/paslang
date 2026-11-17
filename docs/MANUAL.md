@@ -4702,7 +4702,12 @@ parts between; `raise;` there hands on the object the handler took. A
 routine (a `pas` routine, or the main one) still runs the `finally`
 parts of the frames it leaves, then ends the routine where it is
 (`rt_raise` goes to `rt_goexit`), so a `wg.Done` in plain code after
-the call is never reached, and one in a `finally` is. In the main
+the call is never reached, and one in a `finally` is. A `pas` routine so
+ended says so on the error output and the program goes on (1.3.10,
+P580): `paslang: uncaught raise in a routine, which ends alone: EOops,
+raised at line 18`, the object's `ToString` and the raise's place, as
+below, without the calls; before, it ended in silence and a dead worker
+of a service left no trace. In the main
 routine an uncaught `raise` ends the program: `paslang: uncaught raise
 in the main routine` on the error output and exit status 1 (1.0.147;
 before, the scheduler was left with nothing to run and said
@@ -4875,7 +4880,7 @@ named; nothing is copied and nothing is allocated but the object.
 exception object, a descendant that adds a rule before deferring to
 the inherited method,
 a class that catches and counts, and a routine whose uncaught raise
-ends only itself. In the main routine an uncaught `raise` ends the
+ends only itself, with its line on the error output. In the main routine an uncaught `raise` ends the
 program instead, with `paslang: uncaught raise in the main routine` on
 the error output and exit status 1 (1.0.147):
 
@@ -14878,7 +14883,7 @@ parts and the locks on the way included, and the handler that takes it
 reads its variables as they were at the failure. One that no handler
 takes still ends the program with its line and status 1, and from any
 routine, where an object the program raised and nobody took ends its own
-routine alone: a failure is never lost. With no `try` on the routine's
+routine alone with its line: a failure is never lost. With no `try` on the routine's
 way nothing is raised and the program stops at once, as it always did.
 Outside a `try` the checked path is what it was. Inside one a variable
 takes its new value only when the whole value is worked out, so a failure

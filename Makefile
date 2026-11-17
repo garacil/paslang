@@ -5712,6 +5712,9 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'paslang: out of memory: [0-9][0-9]* MiB mapped' $(BUILDDIR)/fatal_oomlimit.err; \
 	grep -q 'paslang: send on closed channel at line 11' $(BUILDDIR)/fatal_closed.err; \
 	grep -q '^paslang: uncaught raise in the main routine, raised at line 24$$' $(BUILDDIR)/fatal_mainraise.err; \
+	: P580: a pas routine that a raise ends says so on one line, and the program goes on; \
+	grep -q '^paslang: uncaught raise in a routine, which ends alone, raised at line 12$$' $(BUILDDIR)/fatal_mainraise.err; \
+	grep -q '^paslang: uncaught raise in a routine, which ends alone: EOops, raised at line 18$$' $(BUILDDIR)/fatal_raiseobj.err; \
 	grep -q '^paslang: uncaught raise in the main routine: EOops, raised at line 30$$' $(BUILDDIR)/fatal_raiseobj.err; \
 	grep -q 'paslang: set element 300 out of range \[0..255\] at line 16' $(BUILDDIR)/fatal_setelem.err; \
 	grep -q 'paslang: set element 1 out of range \[2..7\] at line 16' $(BUILDDIR)/fatal_setincl.err; \
@@ -6768,6 +6771,8 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	grep -q 'paslang: out of memory: [0-9][0-9]* MiB mapped' $(BUILDDIR)/fatal_oom-arm.err; \
 	grep -q 'paslang: send on closed channel at line 11' $(BUILDDIR)/fatal_closed-arm.err; \
 	grep -q '^paslang: uncaught raise in the main routine, raised at line 24$$' $(BUILDDIR)/fatal_mainraise-arm.err; \
+	grep -q '^paslang: uncaught raise in a routine, which ends alone, raised at line 12$$' $(BUILDDIR)/fatal_mainraise-arm.err; \
+	grep -q '^paslang: uncaught raise in a routine, which ends alone: EOops, raised at line 18$$' $(BUILDDIR)/fatal_raiseobj-arm.err; \
 	grep -q '^paslang: uncaught raise in the main routine: EOops, raised at line 30$$' $(BUILDDIR)/fatal_raiseobj-arm.err; \
 	grep -q 'paslang: set element 300 out of range \[0..255\] at line 16' $(BUILDDIR)/fatal_setelem-arm.err; \
 	grep -q 'paslang: set element 1 out of range \[2..7\] at line 16' $(BUILDDIR)/fatal_setincl-arm.err; \
