@@ -938,6 +938,9 @@ GOLDEN_A64 += selclosure
 # P660: Exception is the root of every error class: SQLite's, JSON's and Currency's too.
 GOLDEN += excroot excown
 GOLDEN_A64 += excroot excown
+# P629: TcpRead and TcpReadDeadline give up to MaxN bytes, no hidden 512 or 65536.
+GOLDEN += tcpreadmax
+GOLDEN_A64 += tcpreadmax
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a

@@ -8508,8 +8508,11 @@ Port 0 asks the kernel for a free port and `TcpPort` tells which one.
 `UdpSendTo` do, a dotted quad, an IPv6 literal or a name, and answer -1
 for one they cannot use (1.1.300); they ended the program on anything
 but digits and dots.
-`TcpReadDeadline` returns an empty string when the timer fires first,
-and reads at most 512 bytes a call. A
+`TcpReadDeadline` returns an empty string when the timer fires first.
+`TcpRead` and `TcpReadDeadline` give up to `max` bytes in one call, all
+that have come when fewer have, into the string's own block (1.3.8, P629:
+they stopped at 65536 and 512, bounds they did not say); 1 GiB at most,
+as every read. `UdpRecv` gives one datagram, 65536 bytes at most. A
 routine that waits on a socket parks; the thread serves other routines.
 The bytes `TcpRead` gives are an ordinary string, which the collector
 gives back when nothing holds it.
