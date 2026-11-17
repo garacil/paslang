@@ -1,0 +1,231 @@
+{ P586: a nil channel is Go's. A send or a receive on it parks for ever,
+  an arm of a select on it is never ready, and only its close fails, as
+  runtime/chan.go and runtime/select.go have it; since P583 each of the
+  four was a failure with its line. An arm is turned off by setting its
+  channel to nil, Go's idiom for a loop that reads several channels
+  until each has closed; the routines parked on a nil channel stay
+  parked through collections while the program goes on. }
+program chanoff;
+
+uses
+  sysutils;
+
+const
+  Rounds = 1000;
+  Count = 3000;
+
+var
+  nilc: chan of Integer;
+  started: waitgroup;
+  good, bad: Integer;
+
+procedure Check(Holds: Boolean; const Words: string);
+begin
+  if Holds then
+    Inc(good)
+  else
+  begin
+    Inc(bad);
+    WriteLn('  wrong: ', Words);
+  end;
+end;
+
+procedure Group(const Name: string);
+begin
+  WriteLn(Name, ': ', good, ' of ', good + bad);
+  good := 0;
+  bad := 0;
+end;
+
+{ Count values from From, then the close }
+procedure Produce(c: chan of Integer; From: Integer);
+var
+  i: Integer;
+begin
+  for i := From to From + Count - 1 do
+    Send(c, i);
+  Close(c);
+end;
+
+procedure SendLater(c: chan of Integer; V: Integer);
+begin
+  Sleep(20);
+  Send(c, V);
+end;
+
+procedure RecvLater(c: chan of Integer);
+var
+  v: Integer;
+begin
+  Sleep(20);
+  v := Recv(c);
+  if v <> 77 then
+    WriteLn('  wrong: the late receiver got ', v);
+end;
+
+{ the three that park for ever }
+procedure SendNil;
+begin
+  started.Done;
+  Send(nilc, 1);
+  WriteLn('  wrong: a send on a nil channel went on');
+end;
+
+procedure RecvNil;
+var
+  v: Integer;
+begin
+  started.Done;
+  v := Recv(nilc);
+  WriteLn('  wrong: a receive on a nil channel went on with ', v);
+end;
+
+procedure SelectNil;
+var
+  v: Integer;
+begin
+  started.Done;
+  select
+    Recv(nilc, v): WriteLn('  wrong: a nil arm was ready');
+    Send(nilc, 2): WriteLn('  wrong: a nil send arm was ready');
+  end;
+  WriteLn('  wrong: a select of nil arms went on');
+end;
+
+{ Go's merge: the arm of a channel that closed is turned off by setting
+  the channel to nil, and the loop ends when both are off. The zero value
+  is the sign of a close, so the producers send from 1. }
+procedure Merge(a, b: chan of Integer; var Sum, FromA, FromB: Integer);
+var
+  v: Integer;
+begin
+  Sum := 0;
+  FromA := 0;
+  FromB := 0;
+  while (a <> nil) or (b <> nil) do
+    select
+      Recv(a, v):
+        if v = 0 then
+          a := nil
+        else
+        begin
+          Sum := Sum + v;
+          Inc(FromA);
+        end;
+      Recv(b, v):
+        if v = 0 then
+          b := nil
+        else
+        begin
+          Sum := Sum + v;
+          Inc(FromB);
+        end;
+    end;
+end;
+
+var
+  ready, w, a, b: chan of Integer;
+  i, v, hits, sum, froma, fromb, total: Integer;
+  s: string;
+  dflt: Boolean;
+
+begin
+  { an arm on nil beside a ready one: the ready one, every time }
+  ready := MakeChan(1);
+  hits := 0;
+  for i := 1 to Rounds do
+  begin
+    Send(ready, i);
+    select
+      Recv(nilc, v): WriteLn('  wrong: a nil arm was ready');
+      Recv(ready, v): if v = i then Inc(hits);
+      Send(nilc, i): WriteLn('  wrong: a nil send arm was ready');
+    end;
+  end;
+  Check(hits = Rounds, 'the ready arm beside nil ones: ' + IntToStr(hits));
+  { nil arms alone and a default: the default }
+  dflt := False;
+  select
+    Recv(nilc, v): WriteLn('  wrong: a nil arm was ready');
+    Send(nilc, 1): WriteLn('  wrong: a nil send arm was ready');
+  else
+    dflt := True;
+  end;
+  Check(dflt, 'nil arms and a default');
+  { a select that waits, with a nil arm left out of its wait: a send and
+    then a receive arrive on the other arm }
+  w := MakeChan();
+  pas SendLater(w, 55);
+  v := 0;
+  select
+    Send(nilc, 9): WriteLn('  wrong: a nil send arm was ready');
+    Recv(w, v): Check(v = 55, 'the arm that waited got ' + IntToStr(v));
+    Recv(nilc, v): WriteLn('  wrong: a nil arm was ready');
+  end;
+  pas RecvLater(w);
+  select
+    Recv(nilc, v): WriteLn('  wrong: a nil arm was ready');
+    Send(w, 77): Inc(good);
+  end;
+  Group('an arm on a nil channel is never ready');
+
+  { Go's idiom: two producers merged, each arm off when its channel
+    closes }
+  for i := 1 to 3 do
+  begin
+    a := MakeChan();
+    if i = 2 then
+      b := MakeChan(16)
+    else
+      b := MakeChan();
+    pas Produce(a, 1);
+    pas Produce(b, 1000001);
+    Merge(a, b, sum, froma, fromb);
+    total := Count * (Count + 1) div 2 + Count * 1000000 + Count * (Count + 1) div 2;
+    Check((sum = total) and (froma = Count) and (fromb = Count), 'the merge got ' + IntToStr(sum) + ' of ' +
+      IntToStr(froma) + ' and ' + IntToStr(fromb) + ' values');
+  end;
+  Group('two channels merged, each arm turned off by nil');
+
+  { routines that park on a nil channel for ever, while the program goes
+    on and collects: their stacks are walked and kept }
+  started.Add(9);
+  for i := 1 to 3 do
+  begin
+    pas SendNil;
+    pas RecvNil;
+    pas SelectNil;
+  end;
+  started.Wait;
+  Sleep(30);
+  total := 0;
+  for i := 1 to 200000 do
+  begin
+    s := IntToStr(i) + ' ' + IntToStr(i * 7);
+    total := total + Length(s);
+  end;
+  Check(total > 0, 'the program goes on beside them');
+  Group('nine routines parked on a nil channel');
+
+  { only the close fails, as a second close does }
+  try
+    Close(nilc);
+    WriteLn('  wrong: the close of a nil channel went on');
+  except
+    on e: EInvalidOpException do
+      Check(e.Message = 'close of nil channel at line 212', e.ClassName + ': ' + e.Message);
+  end;
+  Group('the close of a nil channel');
+  WriteLn('done');
+  { the nine never wake, and a program waits for its routines at the end
+    of its main one (the manual, section 10): that end would be the
+    deadlock message, the one testdata/fatal/dlnil checks, so the test
+    ends here }
+  Halt(0);
+end.
+
+{ This file is part of paslang's tests.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+  paslang is free software under the GNU General Public License,
+  version 3 or (at your option) any later version; see the file
+  COPYING. It comes with ABSOLUTELY NO WARRANTY. }

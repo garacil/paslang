@@ -283,7 +283,7 @@ end;
 ''')
 call.append('  Kinds;\n')
 for i in range(1, 5):
-    exp.append('%s\n' % ('1' if i > 2 else '0'))
+    exp.append('%s\n' % ('True' if i > 2 else 'False'))
     exp.append('%s\n' % chr(65 + i))
     exp.append('%s\n' % repr(i * 1.5))
     exp.append('%s\n' % repr(i * 0.5))

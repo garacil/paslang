@@ -5184,7 +5184,7 @@ paslang: all routines are asleep: deadlock
 ```
 
 on standard error, exit status 1. That is a `Recv` or a `Send` nobody
-will serve, a `wg.Wait` whose count never reaches zero, a mutex locked
+will serve (one on a nil channel included), a `wg.Wait` whose count never reaches zero, a mutex locked
 twice, a `select` without `else` whose arms can never be ready, two
 routines each waiting for the other, or, after the main routine has
 ended, the routines left waiting on each other. A routine counts as
@@ -5230,10 +5230,15 @@ closed channel at line 9`), and so is a second `Close` (`paslang: close
 of closed channel at line 9`): each stops the program, or is an
 `EInvalidOpException` where a `try` stands (§19), as Go panics on both.
 Before 1.2.389 a `Close` with a sender waiting stopped the program at
-the close. A channel that was never made is `nil`, and a `Send`, a
-`Recv`, a `Close` or an arm of a `select` on it is `paslang: nil
-channel at line 9`, an `EAccessViolation` where a `try` stands (Go
-parks for ever on a nil channel and panics on its close). The zero value
+the close. A channel that was never made is `nil`, and it is Go's nil
+channel (1.3.12, P586): it is never ready. A `Send` or a `Recv` on it
+parks for ever, so with nothing else that can run the program ends with
+the deadlock message; an arm of a `select` on it is left out, as if it
+were not written, so a `select` of nil arms alone runs its `else` or,
+with none, parks for ever; and only its `Close` fails, `paslang: close
+of nil channel at line 9`, an `EInvalidOpException` where a `try`
+stands, as Go's `closechan` panics. Before 1.3.12 all four were
+`paslang: nil channel at line 9`, an `EAccessViolation`. The zero value
 is the only sign of a closed
 channel a receiver gets, so a stream that ends by a `Close` must not
 carry the zero value as data: `pipeline` below sends job numbers from 1.
@@ -5380,7 +5385,11 @@ one that pairs, whichever arm it is; exactly one arm fires. Two
 routines may select on the same channels from opposite sides and still
 meet. A select has at most 16 arms. A blocking select with a single
 send arm is the way to hand a value to a routine that may not be
-waiting yet.
+waiting yet. An arm whose channel is `nil` is never ready (1.3.12,
+P586), and setting a channel variable to `nil` is the way to turn its
+arm off, as in Go: a loop that reads two channels until both have
+closed sets each to `nil` when its close arrives and ends when both are
+(`testdata/chanoff`).
 
 ### A timeout, and two arms ready at once
 
@@ -14862,9 +14871,8 @@ SysUtils is what turns run-time errors into exceptions there too:
 | a waitgroup counted below zero; a string view's length, the key or the index asked of a tree, the least of an empty heap, an index outside a Merkle tree's leaves (1.2.387) | `ERangeError` |
 | a string view of nil with a length (1.2.387) | `EArgumentNilException` |
 | a string view over bytes not marked shared; a size SHA-3 has not (1.2.387) | `EArgumentException` |
-| a send on a closed channel, plain or in a `select`, found closed or closed while it waited; a second close (1.2.389) | `EInvalidOpException` |
+| a send on a closed channel, plain or in a `select`, found closed or closed while it waited; a second close (1.2.389); the close of a nil channel (1.3.12) | `EInvalidOpException` |
 | a channel's capacity out of range (1.2.389) | `ERangeError` |
-| a send, a receive, a close or an arm of a `select` on a nil channel (1.2.389) | `EAccessViolation` |
 | memory whose file has ended, a bus error (1.2.384) | `EBusError` |
 
 `E.Message` is the runtime's line without `paslang: `
@@ -14947,8 +14955,9 @@ called it, so the place in the line, raised or fatal, is that call's:
 place before 1.2.387. `testdata/libfault` takes every one.
 
 **The failures of a channel (1.2.389, P583).** A send on a closed
-channel, a second close, a capacity out of range and a nil channel are
-the routine's that made them, and raised there by the same rule, with
+channel, a second close, a capacity out of range and the close of a nil
+channel (1.3.12, P586: a send, a receive or an arm of a `select` on one
+is never ready, as in Go) are the routine's that made them, and raised there by the same rule, with
 the line of the statement, a `select`'s own line for one of its arms.
 The channel is as it was: its lock given back, what its buffer held
 still to be read, and the value that could not be sent sent nowhere.
@@ -15013,7 +15022,7 @@ The domain errors of the calculation set (`ln`, `log`, `power`,
 `arcsin`, `arccos`, `arcsec`, `arccsc`, `arccosh`, `arctanh`, `lnxp1`)
 read like `sqrt domain`. The others include `invalid memory address
 0x...`, `bus error`, `integer overflow`, `close of closed channel`,
-`nil channel`, `channel capacity N out of
+`close of nil channel`, `channel capacity N out of
 range`, `concurrent map writes` (and `concurrent map read and map
 write`, `concurrent map iteration and map write`), `bit N out of
 range`, `128-bit division overflow`, `out of stack memory`,

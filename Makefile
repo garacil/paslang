@@ -824,8 +824,8 @@ GOLDEN_A64 += libfault
 GOLDEN += wgagain
 GOLDEN_A64 += wgagain
 # P583: the failures of a channel as exceptions.
-GOLDEN += chanfault chanshut
-GOLDEN_A64 += chanfault chanshut
+GOLDEN += chanfault chanshut chanoff
+GOLDEN_A64 += chanfault chanshut chanoff
 # P573: a server stops whatever became of its sockets.
 GOLDEN += httpstop
 GOLDEN_A64 += httpstop
@@ -3870,10 +3870,10 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	timeout 60 $(BUILDDIR)/chanfault > $(BUILDDIR)/chanfault.got; \
 	diff -u testdata/chanfault.out $(BUILDDIR)/chanfault.got; \
 	grep '^paslang: ' $(BUILDDIR)/chanfault.got > $(BUILDDIR)/chanfault.lines; \
-	test $$(grep -c '' $(BUILDDIR)/chanfault.lines) -eq 15; \
+	test $$(grep -c '' $(BUILDDIR)/chanfault.lines) -eq 11; \
 	for m in die fin pas; do \
 	  rm -f $(BUILDDIR)/chanfault.$$m; \
-	  for k in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do \
+	  for k in 1 2 3 4 5 6 7 8 9 10 11; do \
 	    set +e; timeout 60 $(BUILDDIR)/chanfault $$m $$k > $(BUILDDIR)/chanfault.$$m.out 2>> $(BUILDDIR)/chanfault.$$m; rc=$$?; set -e; \
 	    test $$rc -eq 1; \
 	  done; \
@@ -3884,7 +3884,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/chanfault.out $(BUILDDIR)/chanfault-arm.got; \
 	for m in die fin pas; do \
 	  rm -f $(BUILDDIR)/chanfault-arm.$$m; \
-	  for k in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do \
+	  for k in 1 2 3 4 5 6 7 8 9 10 11; do \
 	    set +e; timeout 120 $(QEMU_A64) $(BUILDDIR)/chanfault-arm $$m $$k > $(BUILDDIR)/chanfault-arm.$$m.out 2>> $(BUILDDIR)/chanfault-arm.$$m; rc=$$?; set -e; \
 	    test $$rc -eq 1; \
 	  done; \
@@ -5780,7 +5780,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q '^paslang: send on closed channel at line 14$$' $(BUILDDIR)/fatal_chselect.err; \
 	grep -q '^paslang: send on closed channel at line 19$$' $(BUILDDIR)/fatal_chwaited.err; \
 	grep -q '^paslang: close of closed channel at line 11$$' $(BUILDDIR)/fatal_chtwice.err; \
-	grep -q '^paslang: nil channel at line 10$$' $(BUILDDIR)/fatal_chnil.err; \
+	grep -q '^paslang: close of nil channel at line 10$$' $(BUILDDIR)/fatal_chnil.err; \
 	grep -q '^paslang: channel capacity -3 out of range at line 12$$' $(BUILDDIR)/fatal_chcap.err; \
 	grep -q '^paslang: send on closed channel at line 13$$' $(BUILDDIR)/fatal_chbare.err; \
 	grep -q '^paslang: store open /nonexistent-paslang-dir/\(0123456789\)\{21\} at line 24$$' $(BUILDDIR)/fatal_libcut.err; \
@@ -5799,7 +5799,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/jsonpark.out $(BUILDDIR)/jsonpark1.got; \
 	echo ok jsonpark; \
 	echo "==== deadlock ===="; \
-	for t in dlrecv dlsend dlcycle dlmutex dlmain dlselect; do \
+	for t in dlrecv dlsend dlcycle dlmutex dlmain dlselect dlnil dlnilsel; do \
 	  $(OUTDIR)/paslangc -o $(BUILDDIR)/fatal_$$t testdata/fatal/$$t.paslang; \
 	  set +e; timeout 60 $(BUILDDIR)/fatal_$$t > $(BUILDDIR)/fatal_$$t.got 2> $(BUILDDIR)/fatal_$$t.err; rc=$$?; set -e; \
 	  test $$rc -eq 1; \
@@ -6838,7 +6838,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	grep -q '^paslang: send on closed channel at line 14$$' $(BUILDDIR)/fatal_chselect-arm.err; \
 	grep -q '^paslang: send on closed channel at line 19$$' $(BUILDDIR)/fatal_chwaited-arm.err; \
 	grep -q '^paslang: close of closed channel at line 11$$' $(BUILDDIR)/fatal_chtwice-arm.err; \
-	grep -q '^paslang: nil channel at line 10$$' $(BUILDDIR)/fatal_chnil-arm.err; \
+	grep -q '^paslang: close of nil channel at line 10$$' $(BUILDDIR)/fatal_chnil-arm.err; \
 	grep -q '^paslang: channel capacity -3 out of range at line 12$$' $(BUILDDIR)/fatal_chcap-arm.err; \
 	grep -q '^paslang: send on closed channel at line 13$$' $(BUILDDIR)/fatal_chbare-arm.err; \
 	grep -q '^paslang: store open /nonexistent-paslang-dir/\(0123456789\)\{21\} at line 24$$' $(BUILDDIR)/fatal_libcut-arm.err; \
@@ -6853,7 +6853,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	diff -u testdata/jsonpark.out $(BUILDDIR)/jsonpark1-arm.got; \
 	echo ok jsonpark-arm; \
 	echo "==== deadlock arm64 ===="; \
-	for t in dlrecv dlsend dlcycle dlmutex dlmain dlselect; do \
+	for t in dlrecv dlsend dlcycle dlmutex dlmain dlselect dlnil dlnilsel; do \
 	  $(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/fatal_$$t-arm testdata/fatal/$$t.paslang; \
 	  set +e; timeout 60 $(QEMU_A64) $(BUILDDIR)/fatal_$$t-arm > $(BUILDDIR)/fatal_$$t-arm.got 2> $(BUILDDIR)/fatal_$$t-arm.err; rc=$$?; set -e; \
 	  test $$rc -eq 1; \
