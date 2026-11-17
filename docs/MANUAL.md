@@ -635,8 +635,8 @@ through any holder copies them (copy on write); writing into a literal
 writes into a copy. A pointer taken with `@s[i]` points into characters
 of `s` alone.
 
-`WriteLn` and `Write` print integers, reals, strings, booleans (as 1
-or 0) and characters. A `Char` prints as the character, its byte;
+`WriteLn` and `Write` print integers, reals, strings, booleans (as
+`True` or `False`) and characters. A `Char` prints as the character, its byte;
 `Ord(c)` prints the code. A `Rune` is an integer and prints as one.
 
 `/` always divides as reals, even `10 / 4`. `div` and `mod` stay integer.

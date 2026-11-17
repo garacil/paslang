@@ -1429,15 +1429,6 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	@sh scripts/check_bootstrap.sh "$(BUILDDIR)" $(QEMU_A64) $(CORE_UNITS)
 	@sh scripts/check_cpufeat.sh "$(OUTDIR)/paslangc" "$(BUILDDIR)" $(QEMU_A64)
 	@set -e; \
-	xrun=""; \
-	: each run its own X server on a display it picks and writes, -displayfd, so two runs keep apart, P156; \
-	if command -v Xvfb > /dev/null 2>&1; then \
-	  rm -f $(BUILDDIR)/xvfb.display; \
-	  Xvfb -displayfd 3 -screen 0 1024x768x24 -ac 3> $(BUILDDIR)/xvfb.display > /dev/null 2>&1 & \
-	  echo $$! > $(BUILDDIR)/xvfb.pid; \
-	  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s $(BUILDDIR)/xvfb.display ] && break; sleep 1; done; \
-	  xrun="env DISPLAY=:$$(cat $(BUILDDIR)/xvfb.display)"; \
-	fi; \
 	rm -f $(BUILDDIR)/fh.txt; \
 	echo "==== spawnrace ===="; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/spawnrace testdata/spawnrace.paslang; \
@@ -4898,7 +4889,6 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	echo ok forward-rejects; \
 	:
 	@set -e; \
-	xrun=""; if [ -s $(BUILDDIR)/xvfb.display ]; then xrun="env DISPLAY=:$$(cat $(BUILDDIR)/xvfb.display)"; fi; \
 	echo "==== units ===="; \
 	$(OUTDIR)/paslangc testdata/units/adder.paslang; \
 	$(OUTDIR)/paslangc testdata/units/dbl.paslang; \
@@ -5605,7 +5595,6 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/units/reguse.out $(BUILDDIR)/reguse.got; \
 	echo ok reguse
 	@set -e; \
-	xrun=""; if [ -s $(BUILDDIR)/xvfb.display ]; then xrun="env DISPLAY=:$$(cat $(BUILDDIR)/xvfb.display)"; fi; \
 	echo "==== unit block results (P153) ===="; \
 	$(OUTDIR)/paslangc testdata/units/blobu.paslang; \
 	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/blobuse testdata/units/blobuse.paslang; \
@@ -5662,14 +5651,9 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	echo ok pkg; \
 	echo "==== xcanvas ===="; \
 	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/xcanvas testdata/xcanvas.paslang; \
-	$$xrun $(BUILDDIR)/xcanvas > $(BUILDDIR)/xcanvas.got; \
-	diff -u testdata/xcanvas.out $(BUILDDIR)/xcanvas.got; \
-	echo ok xcanvas; \
 	: the same client on arm64 under qemu against the same server, P278: it made amd64 system calls there; \
 	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/xcanvas-arm testdata/xcanvas.paslang; \
-	$$xrun timeout 120 $(QEMU_A64) $(BUILDDIR)/xcanvas-arm > $(BUILDDIR)/xcanvas-arm.got; \
-	diff -u testdata/xcanvas.out $(BUILDDIR)/xcanvas-arm.got; \
-	echo ok xcanvas-arm; \
+	python3 -I scripts/check_xcanvas.py testdata/xcanvas.out "$(BUILDDIR)" -- $(QEMU_A64); \
 	echo "==== dirlist ===="; \
 	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/dirlist testdata/dirlist.paslang; \
 	$(BUILDDIR)/dirlist > $(BUILDDIR)/dirlist.got; \
@@ -5952,10 +5936,6 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	echo "==== compiler help ===="; \
 	python3 -I scripts/check_cli_help.py "$(OUTDIR)/paslangc" "$(BUILDDIR)"; \
 	echo ok compiler-help; \
-	if [ -f $(BUILDDIR)/xvfb.pid ]; then \
-	  kill $$(cat $(BUILDDIR)/xvfb.pid) 2> /dev/null || true; \
-	  rm -f $(BUILDDIR)/xvfb.pid $(BUILDDIR)/xvfb.display; \
-	fi; \
 	echo "==== stage ===="; \
 	: the installed paslangc builds the sources when it is BOOT_MIN or later, as for bin/paslangc, else the one in bin/ does; \
 	host="$(bindir)/paslangc"; v=""; \
