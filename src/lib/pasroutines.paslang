@@ -265,8 +265,12 @@ end;
 
 { The slow path of Unlock, Go's unlockSlow: wake one waiter, unless none
   is parked or one is already awake or the mutex was taken meanwhile; in
-  starvation mode hand it to the first waiter. }
-procedure MutexUnlockSlow(var M: TPasMutex; nw: Integer);
+  starvation mode hand it to the first waiter, and yield to it when
+  MayYield says the caller holds no runtime lock (a cond's Wait holds
+  its queue's while it lets the mutex go, and a routine that yielded
+  with it left every other M that wanted it asleep on it, out of the
+  reach of a cycle's stop: P672). }
+procedure MutexUnlockSlow(var M: TPasMutex; nw: Integer; MayYield: Boolean);
 var
   old, g: Integer;
   starve: Boolean;
@@ -295,8 +299,10 @@ begin
   end;
   ReadyG(g);
   { Starving: the waiter owns the mutex now and runs next, on this M,
-    while this routine waits at the tail of the queue (Go's handoff). }
-  if starve then
+    while this routine waits at the tail of the queue (Go's handoff).
+    One that does not yield parks at once, and the waiter readied on
+    this P runs next all the same. }
+  if starve and MayYield then
     Goyield;
 end;
 
@@ -306,7 +312,7 @@ var
 begin
   nw := AtomicAdd(@M.State, -1);
   if nw <> 0 then
-    MutexUnlockSlow(M, nw);
+    MutexUnlockSlow(M, nw, True);
 end;
 
 { Go's TryLock: a free mutex is taken even with waiters parked, unless
@@ -485,12 +491,19 @@ end;
 { ---- cond ---- }
 
 procedure PasCondWait(var C: TPasCond; var M: TPasMutex);
+var
+  nw: Integer;
 begin
   { Queue first, then release the mutex, then park: a Signal that lands
-    between the release and the park still finds this routine queued. }
+    between the release and the park still finds this routine queued.
+    The mutex is let go without a yield, for the queue's lock is held
+    (P672; Go's Wait takes a ticket and holds no lock while it unlocks,
+    sync/cond.go and runtime/sema.go notifyListAdd and notifyListWait) }
   SpinLock(@C.Spin);
   QWait(@C.Head);
-  PasMutexUnlock(M);
+  nw := AtomicAdd(@M.State, -1);
+  if nw <> 0 then
+    MutexUnlockSlow(M, nw, False);
   ParkUnlock(@C.Spin);
   PasMutexLock(M);
 end;

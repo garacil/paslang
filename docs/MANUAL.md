@@ -7487,7 +7487,10 @@ is an `ERangeError` where a `try` stands (§19); an `Unlock` of a mutex
 nobody holds always stops it, as in Go. `cond.Wait(mu)` releases the mutex,
 parks until `Signal` wakes one waiter or `Broadcast` wakes all, and
 takes the mutex again before returning, so always test the condition in
-a loop. `once o do stmt` runs the statement the first time and never
+a loop. `Wait` queues the routine and lets the mutex go under the cond's own
+lock, and never leaves the processor before it parks (1.3.2, P672:
+with the mutex starving it once did, and a collection could then wait
+for ever for a thread asleep on that lock; `testdata/condstarve`). `once o do stmt` runs the statement the first time and never
 again; routines that arrive while it runs wait for it to finish, and
 `o.Done` tells whether it has run.
 

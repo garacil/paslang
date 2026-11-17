@@ -925,6 +925,10 @@ GOLDEN_A64 += uint32legacy uint32rotate crc32width uint32bounds uint32memxor uin
 # woken. Both orders, with deadlines, both ways at once, TCP, numbers used again.
 GOLDEN += twowait
 GOLDEN_A64 += twowait
+# P672: a cond's Wait lets a starving mutex go without a yield, for it holds the
+# cond's lock; the yield froze the program when a cycle wanted the world stopped.
+GOLDEN += condstarve
+GOLDEN_A64 += condstarve
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a

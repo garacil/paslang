@@ -1,0 +1,142 @@
+{ P672: a cond's Wait lets its mutex go while it holds the lock of its
+  queue. When the mutex was starving (a routine had waited for it more
+  than a millisecond) the unlock handed it over and yielded, and the
+  routine went back to a run queue with the queue's lock still held: an
+  M that then wanted that lock slept on it, with its P, out of the reach
+  of the scheduler and of a cycle's stop. On one processor that is the
+  only M with a P; on more, the program stopped for good when a cycle
+  wanted the world stopped meanwhile, which routines that allocate make
+  happen at once. On 1.3.0 this program never ends.
+
+  Rounds of: a routine takes the mutex and keeps it past a millisecond
+  while another waits for it, which makes it starving; the first then
+  waits on the cond, which hands the mutex over; the second, holding it,
+  broadcasts, while three routines allocate without a pause. A routine
+  of the test ends the program with its reason when no round ends for
+  thirty seconds and the runtime still runs; a runtime that froze is
+  ended by make's time limit. }
+program condstarve;
+
+uses
+  sysutils;
+
+var
+  mu: mutex;
+  cv: cond;
+  turn, rounds, done: Integer;
+  fin: waitgroup;
+  over: Boolean;
+  watchMu: mutex;
+
+procedure Holder;
+var
+  r: Integer;
+begin
+  for r := 1 to rounds do
+  begin
+    mu.Lock;
+    { the taker parks waiting for the mutex }
+    Sleep(3);
+    { let it go and take it again before the taker runs: the taker,
+      woken, finds it taken after more than a millisecond and turns it
+      starving }
+    mu.Unlock;
+    mu.Lock;
+    Sleep(2);
+    turn := 1;
+    { a starving mutex let go by Wait: handed to the taker }
+    while turn = 1 do
+      cv.Wait(mu);
+    mu.Unlock;
+    Sleep(1);
+  end;
+  fin.Done;
+end;
+
+procedure Taker;
+var
+  r: Integer;
+begin
+  r := 0;
+  while r < rounds do
+  begin
+    mu.Lock;
+    if turn = 1 then
+    begin
+      turn := 0;
+      cv.Broadcast;
+      Inc(r);
+      lock watchMu do
+        Inc(done);
+    end;
+    mu.Unlock;
+  end;
+  fin.Done;
+end;
+
+{ allocates without a pause, so that under the collector's stress a cycle
+  wants the world stopped at any moment, the moment a taker sleeps on the
+  queue's lock among them }
+procedure Churn;
+var
+  t: string;
+  k: Integer;
+  stop: Boolean;
+begin
+  k := 0;
+  repeat
+    t := IntToStr(k) + 'x';
+    if Length(t) = 0 then
+      WriteLn('?');
+    Inc(k);
+    if (k and 1023) = 0 then
+      lock watchMu do
+        stop := over
+    else
+      stop := False;
+  until stop;
+end;
+
+procedure Watch;
+var
+  last, now, idle: Integer;
+  stop: Boolean;
+begin
+  last := -1;
+  idle := 0;
+  repeat
+    Sleep(100);
+    lock watchMu do
+    begin
+      now := done;
+      stop := over;
+    end;
+    if now = last then
+      Inc(idle)
+    else
+      idle := 0;
+    last := now;
+    if idle >= 300 then
+    begin
+      WriteLn('lost: no round ended in 30 s, ', now, ' of ', rounds, ' done');
+      Halt(2);
+    end;
+  until stop;
+end;
+
+begin
+  rounds := 200;
+  turn := 0;
+  pas Watch;
+  pas Churn;
+  pas Churn;
+  pas Churn;
+  fin.Add(2);
+  pas Holder;
+  Sleep(1);
+  pas Taker;
+  fin.Wait;
+  lock watchMu do
+    over := True;
+  WriteLn('a cond''s Wait with its mutex starving: ', done, ' of ', rounds, ' rounds');
+end.
