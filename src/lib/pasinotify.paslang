@@ -1,0 +1,322 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+  paslang is free software under the GNU General Public License,
+  version 3 or (at your option) any later version; see the file
+  COPYING. It comes with ABSOLUTELY NO WARRANTY. }
+
+{ The files of a directory watched from a routine (P663): Linux's inotify
+  (inotify(7)) as an object, the numbers of both machines inside it.
+
+    w := TInotify.Create;
+    wd := w.Add('/srv/in', [ikCreate, ikCloseWrite, ikMovedTo]);
+    while w.Next(ev, -1) do
+      ... ev.Name, ev.Kinds ...
+
+  Next parks the routine on the poller until an event comes, its time
+  passes or another routine calls Dispose, which wakes it at once: the
+  watcher's descriptor and an eventfd sit in an epoll set of its own,
+  and the routine waits on that set, so either wakes it (as passignal's
+  routine waits on an eventfd). An event is the watch it came from, its
+  kinds as a set, the cookie that pairs a rename's two halves and the
+  name of the entry in the watched directory ('' for the directory
+  itself). A queue that overflowed is an event of kind ikOverflow, never
+  hidden: events were lost and the program must look again, as Go's
+  fsnotify says ErrEventOverflow. A watch removed, by Remove or because
+  its file went, gives ikIgnored. A watcher is one routine's for Next;
+  Add, Remove and Dispose may come from others (Regla 11). The records
+  of inotify_event are the same on amd64 and arm64 (uapi
+  linux/inotify.h): wd, mask, cookie and len, 16 bytes, then the name,
+  NUL padded. }
+unit pasinotify;
+
+interface
+
+type
+  { inotify's events, IN_ACCESS (bit 0) to IN_MOVE_SELF (bit 11), and
+    those the kernel adds: IN_UNMOUNT, IN_Q_OVERFLOW, IN_IGNORED and
+    IN_ISDIR (bits 13 to 15 and 30) }
+  TInotifyKind = (ikAccess, ikModify, ikAttrib, ikCloseWrite, ikCloseNoWrite, ikOpen, ikMovedFrom, ikMovedTo,
+    ikCreate, ikDelete, ikDeleteSelf, ikMoveSelf, ikUnmount, ikOverflow, ikIgnored, ikIsDir);
+  TInotifyKinds = set of TInotifyKind;
+
+  TInotifyEvent = record
+    Watch: Integer;
+    Kinds: TInotifyKinds;
+    Cookie: Integer;
+    Name: string;
+  end;
+
+  TInotify = class
+  private
+    FFd, FEp, FWake: Integer;
+    FDisposed: Integer;
+    { the descriptors were made and joined: what Valid says }
+    FReady: Boolean;
+    FBuf: array of Byte;
+    FPos, FLen: Integer;
+    FError: Integer;
+    function Take(out Ev: TInotifyEvent): Boolean;
+  public
+    { inotify_init1 with IN_NONBLOCK and IN_CLOEXEC; when Valid is False
+      Error says why }
+    constructor Create;
+    destructor Destroy; override;
+    function Valid: Boolean;
+    { the errno of the last call that failed, 0 after one that did not }
+    function Error: Integer;
+    { watches Path for Kinds (ikOverflow, ikIgnored and ikIsDir are the
+      kernel's to give, and are ignored here): the watch's number, or -1
+      with Error set; a path watched again takes the new kinds }
+    function Add(const Path: string; Kinds: TInotifyKinds): Integer;
+    function Remove(Watch: Integer): Boolean;
+    { the next event, parking until one comes, TimeoutMs passes (below 0
+      for no limit) or Dispose is called; False on a time out, after
+      Dispose and on an error (Error) }
+    function Next(out Ev: TInotifyEvent; TimeoutMs: Integer): Boolean;
+    { ends the watcher: a routine in Next comes back with False, and
+      every later Next too; the descriptors close with the object }
+    procedure Dispose;
+  end;
+
+{ the names of the kinds of a set, joined by '|', for a log }
+function InotifyKindsText(K: TInotifyKinds): string;
+
+implementation
+
+function Nr(Amd, Arm: Integer): Integer;
+begin
+  {$ifdef CPUX86_64}
+  Result := Amd;
+  {$else}
+  Result := Arm;
+  {$endif}
+end;
+
+const
+  { IN_NONBLOCK and IN_CLOEXEC are O_NONBLOCK and O_CLOEXEC, the same on
+    both machines (asm-generic/fcntl.h); EFD_ likewise; EPOLL_CLOEXEC }
+  InNonblock = 2048;
+  InCloexec = 524288;
+  KindNames: array[TInotifyKind] of string = ('access', 'modify', 'attrib', 'close_write', 'close_nowrite',
+    'open', 'moved_from', 'moved_to', 'create', 'delete', 'delete_self', 'move_self', 'unmount', 'overflow',
+    'ignored', 'isdir');
+
+{ a kind's bit in inotify's mask }
+function KindBit(K: TInotifyKind): Integer;
+begin
+  case K of
+    ikUnmount: Result := 8192;
+    ikOverflow: Result := 16384;
+    ikIgnored: Result := 32768;
+    ikIsDir: Result := 1073741824;
+  else
+    Result := 1 shl Ord(K);
+  end;
+end;
+
+function InotifyKindsText(K: TInotifyKinds): string;
+var
+  i: TInotifyKind;
+begin
+  Result := '';
+  for i := Low(TInotifyKind) to High(TInotifyKind) do
+    if i in K then
+    begin
+      if Result <> '' then
+        Result := Result + '|';
+      Result := Result + KindNames[i];
+    end;
+end;
+
+constructor TInotify.Create;
+var
+  ev: array[0..15] of Byte;
+  r: Integer;
+begin
+  FFd := -1;
+  FEp := -1;
+  FWake := -1;
+  SetLength(FBuf, 65536);
+  FFd := Syscall(Nr(294, 26), InNonblock or InCloexec);
+  if FFd < 0 then
+  begin
+    FError := -FFd;
+    FFd := -1;
+    Exit;
+  end;
+  FWake := Syscall(Nr(290, 19), 0, InNonblock or InCloexec);
+  FEp := Syscall(Nr(291, 20), InCloexec);
+  if (FWake < 0) or (FEp < 0) then
+  begin
+    if FWake < 0 then
+      FError := -FWake
+    else
+      FError := -FEp;
+    Exit;
+  end;
+  { EPOLLIN on each; the set is only waited on as a whole, so the data
+    word, whose place differs between the machines (packed on amd64),
+    is not read }
+  FillChar(ev, SizeOf(ev), 0);
+  ev[0] := 1;
+  r := Syscall(Nr(233, 21), FEp, 1, FFd, Integer(@ev[0]));
+  if r = 0 then
+    r := Syscall(Nr(233, 21), FEp, 1, FWake, Integer(@ev[0]));
+  if r < 0 then
+    FError := -r
+  else
+    FReady := True;
+end;
+
+destructor TInotify.Destroy;
+begin
+  Dispose;
+  if FEp >= 0 then
+    Syscall(Nr(3, 57), FEp);
+  if FWake >= 0 then
+    Syscall(Nr(3, 57), FWake);
+  if FFd >= 0 then
+    Syscall(Nr(3, 57), FFd);
+  FEp := -1;
+  FWake := -1;
+  FFd := -1;
+  inherited Destroy;
+end;
+
+function TInotify.Valid: Boolean;
+begin
+  Result := FReady;
+end;
+
+function TInotify.Error: Integer;
+begin
+  Result := FError;
+end;
+
+function TInotify.Add(const Path: string; Kinds: TInotifyKinds): Integer;
+var
+  mask: Integer;
+  k: TInotifyKind;
+  p: string;
+begin
+  mask := 0;
+  for k := Low(TInotifyKind) to High(TInotifyKind) do
+    if (k in Kinds) and not (k in [ikOverflow, ikIgnored, ikIsDir]) then
+      mask := mask or KindBit(k);
+  p := Path + #0;
+  Result := Syscall(Nr(254, 27), FFd, Integer(@p[1]), mask);
+  if Result < 0 then
+  begin
+    FError := -Result;
+    Result := -1;
+  end
+  else
+    FError := 0;
+end;
+
+function TInotify.Remove(Watch: Integer): Boolean;
+var
+  r: Integer;
+begin
+  r := Syscall(Nr(255, 28), FFd, Watch);
+  Result := r = 0;
+  if r < 0 then
+    FError := -r
+  else
+    FError := 0;
+end;
+
+{ the next record of the buffer, when one is whole there }
+function TInotify.Take(out Ev: TInotifyEvent): Boolean;
+var
+  mask, n, k: Integer;
+  b: TInotifyKind;
+begin
+  Ev := Default(TInotifyEvent);
+  Result := False;
+  if FLen - FPos < 16 then
+    Exit;
+  { inotify_event: wd (signed, -1 for an overflow), mask, cookie and
+    len, 32 bits each in the machine's order, little-endian on both }
+  Ev.Watch := PInt32(@FBuf[FPos])^;
+  mask := PUInt32(@FBuf[FPos + 4])^;
+  Ev.Cookie := PUInt32(@FBuf[FPos + 8])^;
+  n := PUInt32(@FBuf[FPos + 12])^;
+  if FLen - FPos < 16 + n then
+    Exit;
+  for b := Low(TInotifyKind) to High(TInotifyKind) do
+    if (mask and KindBit(b)) <> 0 then
+      Include(Ev.Kinds, b);
+  k := 0;
+  while (k < n) and (FBuf[FPos + 16 + k] <> 0) do
+    Inc(k);
+  SetLength(Ev.Name, k);
+  if k > 0 then
+    Move(FBuf[FPos + 16], Ev.Name[1], k);
+  FPos := FPos + 16 + n;
+  Result := True;
+end;
+
+function TInotify.Next(out Ev: TInotifyEvent; TimeoutMs: Integer): Boolean;
+var
+  due, left, r: Integer;
+begin
+  Ev := Default(TInotifyEvent);
+  Result := False;
+  if not Valid then
+    Exit;
+  due := 0;
+  if TimeoutMs >= 0 then
+    due := Nanotime + TimeoutMs * 1000000;
+  while True do
+  begin
+    if AtomicLoad(FDisposed) <> 0 then
+      Exit;
+    if Take(Ev) then
+      Exit(True);
+    FPos := 0;
+    FLen := 0;
+    repeat
+      r := Syscall(Nr(0, 63), FFd, Integer(@FBuf[0]), Length(FBuf));
+    until r <> -4;
+    if r > 0 then
+    begin
+      FLen := r;
+      Continue;
+    end;
+    if r <> -11 then
+    begin
+      FError := -r;
+      Exit;
+    end;
+    { nothing yet: park on the set until the watcher's descriptor or the
+      eventfd of Dispose is ready, or the time comes }
+    if due = 0 then
+      r := WaitIo(FEp, 1)
+    else
+    begin
+      left := due - Nanotime;
+      if left <= 0 then
+        Exit;
+      r := WaitMs(FEp, 1, left div 1000000 + 1);
+    end;
+    if r < 0 then
+    begin
+      FError := -r;
+      Exit;
+    end;
+  end;
+end;
+
+procedure TInotify.Dispose;
+var
+  one: Int64;
+begin
+  if AtomicExchange(FDisposed, 1) <> 0 then
+    Exit;
+  one := 1;
+  if FWake >= 0 then
+    Syscall(Nr(1, 64), FWake, Integer(@one), 8);
+end;
+
+end.

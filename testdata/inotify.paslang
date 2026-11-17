@@ -1,0 +1,178 @@
+{ P663: pasinotify watches a directory from a routine. Files made,
+  written, renamed and removed are read as events, each with its name,
+  its kinds and the cookie that pairs a rename's halves; a queue made to
+  overflow says so; Dispose from another routine ends a wait at once; a
+  wait with a time out comes back when it passes; a watch removed says
+  ikIgnored; eight routines watch directories of their own at once. }
+program inotify;
+
+uses
+  pasinotify, sysutils;
+
+var
+  root: string;
+  w: TInotify;
+  ev: TInotifyEvent;
+  done: waitgroup;
+  mu: mutex;
+  agreed, waitedMs: Integer;
+  waitAnswer: Boolean;
+
+function Nr(Amd, Arm: Integer): Integer;
+begin
+  {$ifdef CPUX86_64}
+  Result := Amd;
+  {$else}
+  Result := Arm;
+  {$endif}
+end;
+
+procedure MakeFile(const Path, Text: string);
+var
+  h: THandle;
+  b: TBytes;
+  i: Integer;
+begin
+  h := FileCreate(Path);
+  SetLength(b, Length(Text));
+  for i := 1 to Length(Text) do
+    b[i - 1] := Byte(Ord(Text[i]));
+  if Length(b) > 0 then
+    FileWrite(h, b, Length(b));
+  FileClose(h);
+end;
+
+{ the kernel's limit of queued events, /proc/sys/fs/inotify's
+  max_queued_events, 16384 by default }
+function QueueLimit: Integer;
+var
+  b: TBytes;
+  e: TSysError;
+  i: Integer;
+begin
+  Result := 16384;
+  if not TryReadFileAt(CurrentDirectoryHandle, '/proc/sys/fs/inotify/max_queued_events', 64, b, e) then
+    Exit;
+  Result := 0;
+  for i := 0 to High(b) do
+    if (b[i] >= 48) and (b[i] <= 57) then
+      Result := Result * 10 + b[i] - 48;
+end;
+
+function Shown(const E: TInotifyEvent): string;
+begin
+  Result := InotifyKindsText(E.Kinds) + ' ' + E.Name;
+end;
+
+procedure Waiter;
+var
+  e: TInotifyEvent;
+  t0: Integer;
+begin
+  t0 := Nanotime;
+  waitAnswer := w.Next(e, -1);
+  waitedMs := (Nanotime - t0) div 1000000;
+  done.Done;
+end;
+
+procedure Own(Id: Integer);
+var
+  x: TInotify;
+  d: string;
+  e: TInotifyEvent;
+  ok: Boolean;
+begin
+  d := root + '/own' + IntToStr(Id);
+  ForceDirectories(d);
+  x := TInotify.Create;
+  x.Add(d, [ikCreate]);
+  MakeFile(d + '/f' + IntToStr(Id), '');
+  ok := x.Next(e, 10000) and (e.Kinds = [ikCreate]) and (e.Name = 'f' + IntToStr(Id));
+  x.Free;
+  lock mu do
+    if ok then
+      Inc(agreed);
+  done.Done;
+end;
+
+var
+  wd, i, cookie, n, k: Integer;
+  t: string;
+  over, again: Boolean;
+  e: TSysError;
+
+begin
+  root := '/tmp/paslang-inotify-' + IntToStr(Syscall(Nr(39, 172)));
+  RemoveAll(root);
+  ForceDirectories(root + '/watched');
+
+  w := TInotify.Create;
+  WriteLn('a watcher: ', w.Valid);
+  wd := w.Add(root + '/watched', [ikCreate, ikModify, ikCloseWrite, ikMovedFrom, ikMovedTo, ikDelete]);
+  WriteLn('a watch: ', wd > 0);
+  WriteLn('a watch of a path that is not there: ', w.Add(root + '/nothing', [ikCreate]), ' errno ', w.Error);
+
+  MakeFile(root + '/watched/a', 'hello');
+  TryRenameFileAt(CurrentDirectoryHandle, root + '/watched/a', CurrentDirectoryHandle, root + '/watched/b', True, e);
+  DeleteFile(root + '/watched/b');
+  ForceDirectories(root + '/watched/sub');
+  WriteLn('the events, in order:');
+  cookie := 0;
+  for i := 1 to 7 do
+    if w.Next(ev, 5000) then
+    begin
+      t := Shown(ev);
+      if ikMovedFrom in ev.Kinds then
+        cookie := ev.Cookie;
+      if ikMovedTo in ev.Kinds then
+        t := t + ', its cookie the moved_from''s ' + BoolToStr((ev.Cookie = cookie) and (cookie <> 0), True);
+      WriteLn('  ', t, ', from the watch ', ev.Watch = wd);
+    end
+    else
+      WriteLn('  no event');
+  WriteLn('a time out of 100 ms: ', w.Next(ev, 100));
+
+  { the queue: more entries made with nothing read than the kernel
+    queues events for (QueueLimit, 16,384 by default) }
+  k := QueueLimit + 1000;
+  for i := 1 to k do
+    MakeFile(root + '/watched/q' + IntToStr(i), '');
+  over := False;
+  n := 0;
+  while w.Next(ev, 200) do
+  begin
+    Inc(n);
+    if ikOverflow in ev.Kinds then
+      over := True;
+  end;
+  WriteLn('more entries than the queue holds, unread: the overflow said ', over, ', fewer events than made ',
+    n < 3 * k);
+
+  WriteLn('a watch removed: ', w.Remove(wd));
+  again := w.Next(ev, 2000);
+  WriteLn('  says ', again and (ev.Kinds = [ikIgnored]) and (ev.Watch = wd));
+
+  { Dispose from another routine ends a wait without an event }
+  done.Add(1);
+  pas Waiter;
+  Sleep(100);
+  w.Dispose;
+  done.Wait;
+  WriteLn('Dispose ended the wait: ', not waitAnswer, ' within a second ', waitedMs < 1000, ', and Next after it ',
+    w.Next(ev, 0));
+  w.Free;
+
+  agreed := 0;
+  done.Add(8);
+  for k := 1 to 8 do
+    pas Own(k);
+  done.Wait;
+  WriteLn('eight routines, a watcher each: ', agreed, ' saw their file');
+  RemoveAll(root);
+end.
+
+{ This file is part of paslang's tests.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+  paslang is free software under the GNU General Public License,
+  version 3 or (at your option) any later version; see the file
+  COPYING. It comes with ABSOLUTELY NO WARRANTY. }

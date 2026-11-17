@@ -12002,6 +12002,25 @@ signal's default action and keeps each ignored one ignored, as the
 runtime resets caught handlers before `exec`. `testdata/signals` checks
 all of it on both machines.
 
+`uses pasinotify` watches the files of a directory from a routine
+(1.3.22, P663), Linux's inotify as an object, with the system call
+numbers of both machines inside it: `w := TInotify.Create` (`Valid`,
+`Error`), `w.Add(path, kinds)` gives a watch's number (-1 and `Error`
+when it fails), `w.Remove(watch)`, and `w.Next(ev, ms)` parks the routine
+until an event comes, `ms` passes (below 0 for no limit) or another
+routine calls `w.Dispose`, which ends the wait at once and every `Next`
+after it. An event (`TInotifyEvent`) is its `Watch`, its `Kinds` as a set
+of `TInotifyKind` (`ikCreate`, `ikModify`, `ikCloseWrite`, `ikMovedFrom`,
+`ikMovedTo`, `ikDelete`, `ikIsDir` and the rest of inotify's), the
+`Cookie` that pairs a rename's two halves and the entry's `Name`. A queue
+that overflowed is an event of kind `ikOverflow`, never hidden: events
+were lost and the program must look again, as Go's fsnotify says; a
+watch removed, by `Remove` or because its file went, gives `ikIgnored`.
+The waiting routine parks on an epoll set of the watcher's own that
+holds its descriptor and an eventfd, so `Dispose` wakes it as a signal
+wakes passignal's routine. `InotifyKindsText(kinds)` names a set for a
+log. `testdata/inotify` checks it on both machines.
+
 ```pascal
 { a service that stops cleanly when systemd sends SIGTERM }
 stop := MakeChan(1);
