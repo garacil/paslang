@@ -935,6 +935,9 @@ GOLDEN_A64 += condstarve
 # P618: a closure shares a variable a select names only as an arm's channel or value.
 GOLDEN += selclosure
 GOLDEN_A64 += selclosure
+# P660: Exception is the root of every error class: SQLite's, JSON's and Currency's too.
+GOLDEN += excroot excown
+GOLDEN_A64 += excroot excown
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
@@ -3562,6 +3565,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q -F 'the value of Copy is not used: as a statement it does nothing at 7:3 in testdata/stmtbad/copystmt.paslang' $(BUILDDIR)/stmtbad_copystmt.err; \
 	grep -q -F 'the value of Copy is not used: as a statement it does nothing at 7:3 in testdata/stmtbad/copystrstmt.paslang' $(BUILDDIR)/stmtbad_copystrstmt.err; \
 	echo ok stmtbad
+	@python3 -I scripts/check_error_roots.py
 	@set -e; \
 	: P560: SdNotify and SdWatchdogUsec read NOTIFY_SOCKET and WATCHDOG_USEC and WATCHDOG_PID from the environment and testdata/sdnotify run four times with chosen values on both machines sends its datagram only to a socket it listens at and gives the watchdog time only for this process or for none named; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/sdnotify testdata/sdnotify.paslang; \

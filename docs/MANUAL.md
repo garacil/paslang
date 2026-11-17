@@ -3994,6 +3994,14 @@ counting.
 
 ### TObject, the root of every class
 
+`Exception`, the root of every error class of the library, is the
+core's, beside `TObject` (1.3.7, P660): its `Message`, `HelpContext`,
+`Create(msg)` and `CreateHelp`, with SysUtils adding `CreateFmt` and
+`CreateFmtHelp` by a helper; SysUtils' families, `ESqliteError`,
+`EJsonError`, `ECurrencyError` and every unit's errors descend from it, so
+`on E: Exception` takes any of them (`testdata/excroot`,
+`scripts/check_error_roots.py`).
+
 A class declared with no parent descends from `TObject`, which the
 core unit `pasobject` declares (§16): every object has what it has.
 
@@ -14501,8 +14509,8 @@ whole decimal values with range checking; an untyped decimal literal takes
 the decimal type of its other operand. Every multiply/divide uses its exact
 wide intermediate and rounds once. Overflow and division by zero raise the
 core `ECurrencyError`, with `Kind` `cfOverflow`, `cfDivideByZero` or
-`cfInvalidValue`. This class descends from `TObject`, not from the optional
-SysUtils `Exception`; catch it explicitly. Constant failures are compile
+`cfInvalidValue`. It is an `Exception` (1.3.7, P660), so `on E: Exception`
+takes it with its `Message`. Constant failures are compile
 errors. A failed arithmetic assignment leaves its destination unchanged.
 
 `Currency(d)` converts the actual binary `Single`/`Double`/`Quad` value,
