@@ -623,6 +623,9 @@ GOLDEN_A64 += inlineorder
 # P336: an unrolled loop keeps its counter where what it calls reads it.
 GOLDEN += unrollctr
 GOLDEN_A64 += unrollctr
+# P614: empty ranges and bounded distances at both Integer limits.
+GOLDEN += unrollrange
+GOLDEN_A64 += unrollrange
 # P325: a var parameter through a routine value or a method value.
 GOLDEN += varvalue
 GOLDEN_A64 += varvalue
@@ -1369,6 +1372,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	python3 -I scripts/check_nist_sign.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64); \
 	python3 -I scripts/check_nist_order.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64); \
 	python3 -I scripts/check_nist_faults.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64); \
+	python3 -I scripts/check_nist_retry.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64); \
 	python3 -I scripts/check_nist_ct.py $(OUTDIR)/paslangc $(BUILDDIR); \
 	echo ok nist-sign
 	@set -e; \
@@ -3619,15 +3623,24 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q -F 'syntax error at 17:3 [else] in testdata/stmtbad/unitelse.paslang' $(BUILDDIR)/stmtbad_unitelse.err; \
 	grep -q -F 'syntax error at 17:3 [until] in testdata/stmtbad/unituntil.paslang' $(BUILDDIR)/stmtbad_unituntil.err; \
 	: P655: a builtin that only gives a value is refused as a statement, Append with its correction; \
-	for n in appendstmt capstmt copystmt copystrstmt; do \
-		if ( ulimit -v 1048576; timeout 20 $(OUTDIR)/paslangc -o $(BUILDDIR)/stmtbad_$$n testdata/stmtbad/$$n.paslang ) >$(BUILDDIR)/stmtbad_$$n.err 2>&1; then \
-			echo "$$n should fail"; exit 1; \
-		fi; \
+	for target in amd64 arm64; do \
+		fu="$(BUILDDIR)"; \
+		if [ "$$target" = arm64 ]; then fu="$(A64DIR)"; fi; \
+		for n in appendstmt capstmt copystmt copystrstmt lengthstmt defaultstmt; do \
+			if ( ulimit -v 1048576; timeout 20 $(OUTDIR)/paslangc -target "$$target" -cpu base -Fu "$$fu" -o $(BUILDDIR)/stmtbad_$${n}_$$target testdata/stmtbad/$$n.paslang ) >$(BUILDDIR)/stmtbad_$${n}_$$target.err 2>&1; then \
+				echo "$$n ($$target) should fail"; exit 1; \
+			else \
+				status=$$?; \
+				[ "$$status" -eq 1 ] || { echo "$$n ($$target) exited $$status, expected 1"; cat $(BUILDDIR)/stmtbad_$${n}_$$target.err; exit 1; }; \
+			fi; \
+		done; \
+		grep -q -x -F 'paslangc: the value of Append is not used: it gives the longer slice back, write s := Append(s, ...) at 6:3 in testdata/stmtbad/appendstmt.paslang' $(BUILDDIR)/stmtbad_appendstmt_$$target.err; \
+		grep -q -x -F 'paslangc: the value of Cap is not used: as a statement it does nothing at 7:3 in testdata/stmtbad/capstmt.paslang' $(BUILDDIR)/stmtbad_capstmt_$$target.err; \
+		grep -q -x -F 'paslangc: the value of Copy is not used: as a statement it does nothing at 7:3 in testdata/stmtbad/copystmt.paslang' $(BUILDDIR)/stmtbad_copystmt_$$target.err; \
+		grep -q -x -F 'paslangc: the value of Copy is not used: as a statement it does nothing at 7:3 in testdata/stmtbad/copystrstmt.paslang' $(BUILDDIR)/stmtbad_copystrstmt_$$target.err; \
+		grep -q -x -F 'paslangc: the value of Length is not used: as a statement it does nothing at 7:3 in testdata/stmtbad/lengthstmt.paslang' $(BUILDDIR)/stmtbad_lengthstmt_$$target.err; \
+		grep -q -x -F 'paslangc: the value of Default is not used: as a statement it does nothing at 4:3 in testdata/stmtbad/defaultstmt.paslang' $(BUILDDIR)/stmtbad_defaultstmt_$$target.err; \
 	done; \
-	grep -q -F 'the value of Append is not used: it gives the longer slice back, write s := Append(s, ...) at 6:3 in testdata/stmtbad/appendstmt.paslang' $(BUILDDIR)/stmtbad_appendstmt.err; \
-	grep -q -F 'the value of Cap is not used: as a statement it does nothing at 7:3 in testdata/stmtbad/capstmt.paslang' $(BUILDDIR)/stmtbad_capstmt.err; \
-	grep -q -F 'the value of Copy is not used: as a statement it does nothing at 7:3 in testdata/stmtbad/copystmt.paslang' $(BUILDDIR)/stmtbad_copystmt.err; \
-	grep -q -F 'the value of Copy is not used: as a statement it does nothing at 7:3 in testdata/stmtbad/copystrstmt.paslang' $(BUILDDIR)/stmtbad_copystrstmt.err; \
 	echo ok stmtbad
 	@python3 -I scripts/check_error_roots.py
 	@set -e; \
@@ -4751,6 +4764,15 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  diff -u testdata/unrollctr.out $(BUILDDIR)/unrollctr$$n.got; \
 	done; \
 	echo ok unrollctr-inline; \
+	: P614: bounded range unrolling, disabled and enabled on both CPU profiles; \
+	for cpu in base native; do for n in 0 40; do \
+	  p=$(BUILDDIR)/unrollrange-$$cpu-$$n; \
+	  $(OUTDIR)/paslangc -cpu $$cpu -inline $$n -o $$p testdata/unrollrange.paslang; \
+	  timeout 20 $$p > $$p.got; diff -u testdata/unrollrange.out $$p.got; \
+	  range_got=$$(timeout 20 $$p huge-up); test "$$range_got" = "-9223372036854775808"; \
+	  range_got=$$(timeout 20 $$p huge-down); test "$$range_got" = "9223372036854775807"; \
+	done; done; \
+	echo ok unrollrange-inline; \
 	: every loop of an asm kernel of the units starts aligned, as the loops paslangc compiles, P302; \
 	python3 -I scripts/check_kernel_align.py src/lib/*.paslang src/rtl/*.paslang; \
 	echo ok kernel-align; \
@@ -6550,6 +6572,16 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	  diff -u testdata/unrollctr.out $(BUILDDIR)/unrollctr$$n-arm.got; \
 	done; \
 	echo ok unrollctr-arm-inline; \
+	: P614 on arm64: baseline and optimized ranges under both inline policies; \
+	for cpu in base max; do for n in 0 40; do \
+	  p=$(BUILDDIR)/unrollrange-$$cpu-$$n-arm; \
+	  model=max; if [ "$$cpu" = base ]; then model=cortex-a53; fi; \
+	  $(OUTDIR)/paslangc -target arm64 -cpu $$cpu -inline $$n -Fu $(A64DIR) -o $$p testdata/unrollrange.paslang; \
+	  timeout 20 $(QEMU_A64) -cpu $$model $$p > $$p.got; diff -u testdata/unrollrange.out $$p.got; \
+	  range_got=$$(timeout 20 $(QEMU_A64) -cpu $$model $$p huge-up); test "$$range_got" = "-9223372036854775808"; \
+	  range_got=$$(timeout 20 $(QEMU_A64) -cpu $$model $$p huge-down); test "$$range_got" = "9223372036854775807"; \
+	done; done; \
+	echo ok unrollrange-arm-inline; \
 	$(OUTDIR)/paslangc -target arm64 -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/exprinline0-arm testdata/exprinline.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/exprinline0-arm > $(BUILDDIR)/exprinline0-arm.got; \
 	diff -u testdata/exprinline.out $(BUILDDIR)/exprinline0-arm.got; \
