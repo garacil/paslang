@@ -932,6 +932,9 @@ GOLDEN_A64 += twowait
 # cond's lock; the yield froze the program when a cycle wanted the world stopped.
 GOLDEN += condstarve
 GOLDEN_A64 += condstarve
+# P618: a closure shares a variable a select names only as an arm's channel or value.
+GOLDEN += selclosure
+GOLDEN_A64 += selclosure
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
