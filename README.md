@@ -47,14 +47,17 @@ text; errors go to standard error with a failing exit status.
   routines; and a constant's text is checked when the program compiles.
 - **Networking and mail.** TCP and UDP over IPv4 and IPv6, Unix-domain
   sockets and DNS. The libraries include an HTTP server with graceful
-  shutdown, an HTTP client with a cookie jar, TLS 1.2 and 1.3 clients,
-  SMTP submission, IMAP and MIME message handling.
+  shutdown, an HTTP client with a cookie jar, an HTTP/2 client that
+  keeps one connection for the requests of many routines, TLS 1.2 and
+  1.3 clients, SMTP submission, IMAP and MIME message handling.
   [Core library and network](docs/MANUAL.md#16-the-core-library-and-pasnet)
 - **Public-key cryptography.** `pasnist` supports P-256/P-384 ECDH,
   ECDSA verification and deterministic RFC 6979 signing. Fixed-width
   raw signature components support ES256/ES384, and private scalars
   can be generated from the kernel CSPRNG. Verified generator tables
   are compiled constants, so the first operation does not build them.
+  `pasrsa` verifies and makes RSA signatures, PKCS #1 v1.5 and PSS,
+  with keys read from PKCS #8 and PKCS #1.
 - **SQLite and document formats.** `uses sqlite` opens SQLite databases
   from paslang, including rollback journals and WAL, with a `TSqlite`
   class and a low-level API under the `sqlite3_*` names. Libraries also

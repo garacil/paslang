@@ -110,7 +110,9 @@ PAIRS = ["b1loop", "b2str", "b3spawn", "b4chan", "b5map", "b6smap", "b7narrow", 
          # P425: the fused multiply-add (Fma against math.FMA)
          "b44fma",
          # P471: first NIST public-key derivation in a fresh process.
-         "b45nist"]
+         "b45nist",
+         # P617: an HTTP/2 client (pashttp2's THttp2Conn against net/http's, a scripted server on a socket pair)
+         "b46http2"]
 # The longest one run may take, in seconds: a run past it is killed, its
 # unit stops being measured and fails (Go's side of every pair takes
 # under 1 s; paslang's append of a character, quadratic until its hito,
@@ -157,6 +159,7 @@ SECTIONS = {
     "b43real": ["mandel"],
     "b44fma": ["horner"],
     "b45nist": ["p256", "p384"],
+    "b46http2": ["seq", "conc", "big"],
 }
 CHECKPTR = ["b8ptr"]
 PROBES = ["p1alloccap", "p2deeprec", "p3divzero", "p4nil", "p5bounds", "p6strbounds", "p7parked"]
@@ -268,6 +271,14 @@ for _op in _B37:
 # native and 0.66 base of net/http's ReadRequest (it was 1.80 and 1.75); the
 # larger plus 0.075 rounded up to 0.05.
 BUDGET["b42http:requests"] = 0.80
+# P617 (1.3.3): b46http2, pashttp2's client against net/http's over a pair of
+# sockets, the server scripted alike in both: seq 0.37, conc 0.26 and big 0.53
+# of Go's time on native, 0.36, 0.27 and 0.56 on base (2026-11-16, three
+# rounds with the release chain running beside them); each with room for a
+# loaded machine.
+BUDGET["b46http2:seq"] = 0.60
+BUDGET["b46http2:conc"] = 0.50
+BUDGET["b46http2:big"] = 0.80
 # paslangc -checkptr / the plain build, per pair in CHECKPTR (P104).
 CHECKPTR_BUDGET = {"b8ptr": 10.0}
 # Peak resident memory, paslang / Go, the medians of MEM_RUNS traced runs:

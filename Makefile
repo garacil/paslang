@@ -724,6 +724,9 @@ GOLDEN_A64 += x25519kat x25519wyche nistwyche rsawyche
 # P616: RSA private keys and signatures against OpenSSL, PSS with its salts, the key files and their refusals.
 GOLDEN += rsasign rsasigwyche
 GOLDEN_A64 += rsasign rsasigwyche
+# P617: HPACK against RFC 7541's examples, and an HTTP/2 connection against a peer the test plays frame by frame.
+GOLDEN += hpack http2fake
+GOLDEN_A64 += hpack http2fake
 # P430: X.509 against Go's crypto/x509, PEM, routines sharing roots.
 GOLDEN += x509verify x509pem x509conc
 GOLDEN_A64 += x509verify x509pem x509conc
@@ -986,6 +989,7 @@ LIB_UNITS := \
 	src/lib/pasurl.paslang \
 	src/lib/pasx509.paslang \
 	src/lib/pastls.paslang \
+	src/lib/pashttp2.paslang \
 	src/lib/pastextproto.paslang \
 	src/lib/pashttp.paslang \
 	src/lib/httpclient.paslang \
@@ -1359,6 +1363,11 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	python3 -I scripts/check_rsa_faults.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64); \
 	echo ok rsa-sign
 	@set -e; \
+	: P617: the tables of HPACK in pashttp2 are those kept from RFC 7541, and the unit at limits its own constants keep out of reach; \
+	python3 -I scripts/hpack_tables.py --check; \
+	python3 -I scripts/check_http2_variants.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64); \
+	echo ok http2
+	@set -e; \
 	: P576: lifecycle faults, independent eligibility, metadata and real stop-room ownership; \
 	python3 -I scripts/check_unit_life.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64); \
 	python3 -I scripts/check_symbols.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64); \
@@ -1609,6 +1618,20 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	if command -v openssl > /dev/null 2>&1; then \
 	  sh scripts/tls_interop.sh openssl - $(BUILDDIR)/tlsinterop > $(BUILDDIR)/tlsinterop-openssl.got; \
 	  diff -u testdata/tlsinterop-openssl.out $(BUILDDIR)/tlsinterop-openssl.got; \
+	fi; \
+	: pashttp2 against Go net/http, a server a case on 127.0.0.1, over TLS with h2 by ALPN and in the clear, P617; \
+	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/http2go testdata/http2go.paslang; \
+	: the manual shows the program that makes a connection and a request and make check runs it against Go, P617; \
+	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/http2doc testdata/http2doc.paslang; \
+	python3 scripts/check_tlsdoc.py docs/MANUAL.md testdata/http2doc.paslang; \
+	if command -v go > /dev/null 2>&1; then \
+	  (cd scripts/h2oracle && GOCACHE=$(abspath $(BUILDDIR))/gocache GOFLAGS=-mod=mod go build -o $(abspath $(BUILDDIR))/h2oracle .); \
+	  sh scripts/http2_interop.sh $(BUILDDIR)/h2oracle $(BUILDDIR)/http2go '' $(BUILDDIR)/http2doc > $(BUILDDIR)/http2go.got; \
+	  diff -u testdata/http2go.out $(BUILDDIR)/http2go.got; \
+	fi; \
+	if command -v nginx > /dev/null 2>&1; then \
+	  sh scripts/http2_interop.sh nginx $(BUILDDIR)/http2go > $(BUILDDIR)/http2nginx.got; \
+	  diff -u testdata/http2nginx.out $(BUILDDIR)/http2nginx.got; \
 	fi; \
 	: the system roots pasx509 loads are those Go loads, in the same order, P430; \
 	if command -v go > /dev/null 2>&1; then \
@@ -6476,6 +6499,18 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	if command -v openssl > /dev/null 2>&1; then \
 	  sh scripts/tls_interop.sh openssl - $(BUILDDIR)/tlsinterop-arm $(QEMU_A64) > $(BUILDDIR)/tlsinterop-openssl-arm.got; \
 	  diff -u testdata/tlsinterop-openssl-base.out $(BUILDDIR)/tlsinterop-openssl-arm.got; \
+	fi; \
+	: pashttp2 for the base arm64 on qemu against Go net/http on the host, P617; \
+	$(OUTDIR)/paslangc -target arm64 -cpu base -Fu $(A64DIR) -o $(BUILDDIR)/http2go-arm testdata/http2go.paslang; \
+	$(OUTDIR)/paslangc -target arm64 -cpu base -Fu $(A64DIR) -o $(BUILDDIR)/http2doc-arm testdata/http2doc.paslang; \
+	if command -v go > /dev/null 2>&1; then \
+	  (cd scripts/h2oracle && GOCACHE=$(abspath $(BUILDDIR))/gocache GOFLAGS=-mod=mod go build -o $(abspath $(BUILDDIR))/h2oracle .); \
+	  sh scripts/http2_interop.sh $(BUILDDIR)/h2oracle $(BUILDDIR)/http2go-arm $(QEMU_A64) $(BUILDDIR)/http2doc-arm > $(BUILDDIR)/http2go-arm.got; \
+	  diff -u testdata/http2go.out $(BUILDDIR)/http2go-arm.got; \
+	fi; \
+	if command -v nginx > /dev/null 2>&1; then \
+	  sh scripts/http2_interop.sh nginx $(BUILDDIR)/http2go-arm $(QEMU_A64) > $(BUILDDIR)/http2nginx-arm.got; \
+	  diff -u testdata/http2nginx.out $(BUILDDIR)/http2nginx-arm.got; \
 	fi; \
 	: pascipher at the arm64 level seals through aese and pmull, its base build through neither, P428; \
 	grep -q 'aese v0.16b, v1.16b' '$(A64DIR)/$(LVL_A64)/pascipher.s'; \

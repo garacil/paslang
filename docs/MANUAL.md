@@ -12424,6 +12424,162 @@ HelloRetryRequest, ALPN, a certificate request, a MiB each way, wrong
 names refused, eight routines at once) and `openssl s_server` (17
 cases), on both machines, in make check when Go and openssl are there.
 
+`uses pashttp2` is an HTTP/2 client (1.3.3, P617): RFC 9113 over a TLS
+connection whose ALPN chose `h2`, or over TCP for a server known to
+speak it there, and HPACK (RFC 7541) whole, following Go's client
+(`net/http/internal/http2` and its `hpack`) where it does not say
+otherwise. It is made for the service that keeps one connection open
+and sends it many requests, as Apple's and Google's push services ask.
+
+- `Http2Dial(host, port, connectMs, config, options, out err)` makes the
+  TLS connection, asks for `h2` and gives a `THttp2Conn`, or `nil` with
+  the reason: a server that chooses another protocol is an error, never
+  a connection in HTTP/1.1. `Http2DialPlain(host, port, connectMs,
+  options, out err)` is the same on TCP alone (prior knowledge, RFC 9113
+  3.3), and `THttp2Conn.Create(stream, scheme, authority, options)` takes
+  any `TNetStream`. `config` is `pastls`'s `TTlsConfig` or `nil`. The
+  two calls write `:authority` as `Http2Authority(host, port, tls)`
+  gives it: the port left out when it is the scheme's own, 443 with TLS
+  and 80 without, and an IPv6 address in its brackets.
+- `c.Request(method, path, headers, body, timeoutMs, maxBody, out resp,
+  out err)` sends one request and parks until its response is whole.
+  Any number of routines call it at once on one connection: each request
+  is a stream of its own and none waits for another's write. `headers`
+  are the fields after the four pseudo-header fields the call writes,
+  their names in lower case; `content-length` is written from `body`; a
+  field of an HTTP/1.1 connection (`connection`, `host`,
+  `transfer-encoding`, `upgrade`, `keep-alive`) is refused with its
+  reason, for HTTP/2 has no place for it. `True` is a response whatever
+  its status (a redirect is not followed): `resp.Status`, `resp.Fields`
+  (without `:status`; `Http2Get(resp.Fields, 'name')` reads one),
+  `resp.Body` whole and `resp.Trailers`.
+- Everything has a limit. `timeoutMs` is the deadline of the whole
+  exchange (0 is none) and `maxBody` the octets its content may take (0
+  is the connection's `MaxBodyBytes`); `THttp2Options` sets
+  `MaxHeaderBytes` (1 MiB), `MaxBodyBytes` (64 MiB), `WriteTimeoutMs`
+  (30000), `PingTimeoutMs` (15000) and `ReadIdleMs` (0, never: with a
+  value, a PING asks whether the peer is there when nothing came for
+  that long, and the connection ends when no answer comes; set it on a
+  connection kept for hours). `Default(THttp2Options)` is all of them at
+  their defaults.
+- A request that fails says what can be done about it:
+  `resp.NotProcessed` when it never reached the server's handling (the
+  connection ended or was going away before it, or the server refused
+  the stream), so that it can be sent again whatever its method (RFC
+  9113 8.7); `resp.TimedOut` at its deadline; `resp.ErrorCode` with the
+  code of the server's `RST_STREAM` or `GOAWAY` (`Http2ErrorName(code)`
+  names it), -1 when it sent neither. `err` is the reason in words, and
+  carries what a server wrote in its `GOAWAY` (`c.GoAwayData`), where
+  APNs says why it ends a connection.
+- `Http2Field(name, value)` is a field; a credential (`authorization`,
+  `proxy-authorization`, `cookie`, `set-cookie`) is kept out of the
+  compression's table and marked never to enter one (RFC 7541 7.1.3).
+  `Http2FieldIndexed` puts any field in the table: a token sent with
+  every request on a connection all of whose requests are one's own is
+  then one octet from the second request on. `Http2FieldOnce` is for a
+  value that is not said again (an identifier made for one request),
+  which would only push out of the table what is.
+- `c.Ping(timeoutMs)` is a PING and its answer; `c.Alive` says whether
+  the connection takes new requests; `c.Streams` and `c.PeerMaxStreams`
+  the requests on their way and how many the server lets be at once (a
+  request past that number waits its turn, within its deadline);
+  `c.LastError` why the connection ended. `c.Dispose` sends GOAWAY, ends
+  the connection and waits for its two routines: a program that is done
+  with a connection calls it, and a connection that ended by itself has
+  given its descriptors back already.
+- `THttp2Client.Create(host, port, config, options)` keeps one
+  connection to a server and makes another when that one has ended or is
+  going away; its `Request` takes the same arguments and sends a request
+  the server did not act on once more. `Plain` set makes it TCP without
+  TLS; `Dials` counts the connections it has made.
+
+This program is `testdata/http2doc`, which make check runs against Go's
+`net/http` on both machines (`scripts/check_tlsdoc.py` has the manual
+show it word for word):
+
+```
+program http2doc;
+
+uses
+  sysutils, paslib, pastls, pashttp2;
+
+var
+  cfg: TTlsConfig;
+  c: THttp2Conn;
+  resp: THttp2Response;
+  headers: THpackFields;
+  roots, err: string;
+
+begin
+  { the server's certificate is checked against the roots of a file, as
+    testdata/tlsdoc does; nil in cfg's place asks for the system's }
+  cfg := TTlsConfig.Create;
+  cfg.ServerName := 'localhost';
+  if not ReadFile(ParamStr(3), roots) then
+    Halt(1);
+  cfg.RootsPem := roots;
+  { one connection, to keep: h2 is asked for by ALPN, and a server that
+    does not choose it is an error here, not an HTTP/1.1 connection }
+  c := Http2Dial(ParamStr(1), StrToInt(ParamStr(2)), 10000, cfg, Default(THttp2Options), err);
+  if c = nil then
+  begin
+    WriteLn('no connection: ', err);
+    Halt(1);
+  end;
+  { a field that says the same on every request enters the compression's
+    table and is one octet from then on; one made for this request alone
+    stays out of it; Http2Field keeps a credential out and marks it so }
+  SetLength(headers, 3);
+  headers[0] := Http2FieldIndexed('authorization', 'bearer a-token-that-lasts-an-hour');
+  headers[1] := Http2Field('content-type', 'application/json');
+  headers[2] := Http2FieldOnce('x-request-id', '7f1c2a');
+  { five seconds for the whole exchange, 64 KiB of answer at most }
+  if c.Request('POST', '/echo', headers, '{"aps":{"alert":"hello"}}', 5000, 65536, resp, err) then
+    WriteLn(resp.Status, ' ', Http2Get(resp.Fields, 'x-proto'), ' ', Http2Get(resp.Fields, 'content-type'))
+  else if resp.NotProcessed then
+    WriteLn('not taken, it can be sent again: ', err)
+  else
+    WriteLn('failed: ', err);
+  c.Dispose;
+end.
+```
+
+The client sends what a server may rely on and refuses what a server
+must not send: a malformed response (RFC 9113 8.1, 8.2: a field name in
+upper case, a field of an HTTP/1.1 connection, a `content-length` that
+is not the content's length) ends its request with `RST_STREAM` and the
+connection goes on; a fault of the connection (a frame out of place, a
+window overrun, a block that is not HPACK) sends `GOAWAY` with the
+RFC's code and ends it. `testdata/http2fake` plays the peer frame by
+frame over a pair of sockets, 575 checks on both machines (among them
+a field block of 600 KiB whose write waits for the peer while eight
+other routines send, each frame whole and the streams in order, and a
+client that makes its connection again, over TCP with the test as its
+server), and
+`scripts/check_http2_variants.py` builds the unit with other constants
+to reach the last stream number and the windows' edges;
+`scripts/http2_interop.sh` runs `testdata/http2go` against Go's server
+over TLS and in the clear: every size of request and response, two
+thousand requests of fifty routines on one connection, a limit of four
+streams, a server that goes away and a client that makes its connection
+again, and six thousand requests ended, given up at their deadlines and
+cut by `Dispose` at once. Against Go's own client on the same server,
+small requests take about two thirds to three quarters of its time,
+a large download without TLS two thirds and a large upload nine tenths
+(a request alone on its connection sends frames as large as Go's, 512
+KiB, and frames of 64 KiB when others share it); over TLS large
+transfers are behind it by what `pascipher`'s AES-GCM is behind Go's.
+
+`pasconn`'s `TNetStream` has three methods more for it, which any
+connection may use (1.3.3): `ReadInto(p, maxN, deadline)` and
+`WriteFrom(p, n, deadline)` read and write memory of the caller's with
+nothing copied on the way, and `Shutdown(how)` ends the reading (0), the
+writing (1) or both (2) of a connection without giving it back, which
+brings back a routine parked on it in `ReadSome` or `WriteAll`, as
+`Dispose` from another routine does not. A `TTlsStream` may now be read
+by one routine while others write: every record written, the alerts and
+key updates of the reading side among them, goes in turn.
+
 `uses pascodec` has the text codecs a service needs (1.1.260, P435), as
 Go's packages give them, checked against Go's own output
 (`testdata/codec`, with `scripts/codec_oracle.go`):

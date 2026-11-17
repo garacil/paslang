@@ -1,0 +1,2539 @@
+{ P617: pashttp2's connection against a peer the test plays itself over a
+  pair of sockets, frame by frame (RFC 9113): the preface, requests and
+  responses in every shape, flow control both ways, each fault of a peer
+  with the error the client must answer it with, GOAWAY, deadlines,
+  pings, the places among the streams, and the end of a connection. No
+  server and no network: the same on amd64 and on arm64.
+
+  With an argument it runs the cases of a build of the unit whose
+  constants were changed (scripts/check_http2_variants.py). }
+program http2fake;
+
+uses
+  sysutils, pasnet, pasconn, pastls, pashttp2;
+
+const
+  { how long the peer waits for a frame that must come: a failure when
+    it passes, never a pace }
+  LongMs = 30000;
+  FData = 0;
+  FHeaders = 1;
+  FPriority = 2;
+  FRst = 3;
+  FSettings = 4;
+  FPush = 5;
+  FPing = 6;
+  FGoAway = 7;
+  FWindow = 8;
+  FCont = 9;
+
+type
+  { the peer of a connection under test }
+  TPeer = class
+  public
+    Fd: Integer;
+    Conn: THttp2Conn;
+    Buf: string;
+    AtEof: Boolean;
+    HEnc: THpackEncoder;
+    HDec: THpackDecoder;
+    { the frame Next read }
+    Typ, Flags, Id: Integer;
+    Payload: string;
+    function Take(N, Ms: Integer; out S: string): Boolean;
+    function Next(Ms: Integer): Boolean;
+    function NextOf(T: Integer): Boolean;
+    function Head: Boolean;
+    function Sync: Boolean;
+    procedure Put(const S: string);
+    function Request(out Fields: THpackFields; out Body: string): Boolean;
+    function Quiet(Ms: Integer): Boolean;
+    function Gone: Boolean;
+    procedure Drop;
+  end;
+
+  { a request on its way, in a routine of its own }
+  TCall = class
+  public
+    Conn: THttp2Conn;
+    Method, Path, Body: string;
+    Headers: THpackFields;
+    TimeoutMs, MaxBody: Integer;
+    Ok: Boolean;
+    Resp: THttp2Response;
+    Err: string;
+    Fin: waitgroup;
+    procedure Run;
+  end;
+  TCalls = array of TCall;
+
+var
+  good, bad: Integer;
+  { the connection's socket takes 64 KiB and no more: for the cases
+    whose write must wait for the peer whatever the system's default is }
+  tight: Boolean;
+
+procedure Check(Holds: Boolean; const What: string);
+begin
+  if Holds then
+    Inc(good)
+  else
+  begin
+    Inc(bad);
+    WriteLn('  wrong: ', What);
+  end;
+end;
+
+procedure Group(const Name: string);
+begin
+  WriteLn(Name, ': ', good, ' of ', good + bad);
+  good := 0;
+  bad := 0;
+end;
+
+function B32(V: Integer): string;
+begin
+  Result := Chr((V shr 24) and 255) + Chr((V shr 16) and 255) + Chr((V shr 8) and 255) + Chr(V and 255);
+end;
+
+function U32(const S: string; P: Integer): Integer;
+begin
+  Result := 0;
+  if Length(S) >= P + 3 then
+    Result := (Ord(S[P]) shl 24) or (Ord(S[P + 1]) shl 16) or (Ord(S[P + 2]) shl 8) or Ord(S[P + 3]);
+end;
+
+{ a frame; and one whose length says N whatever its payload is }
+function FrN(N, Typ, Flags, Id: Integer; const Payload: string): string;
+begin
+  Result := Chr((N shr 16) and 255) + Chr((N shr 8) and 255) + Chr(N and 255) + Chr(Typ) + Chr(Flags) + B32(Id) +
+    Payload;
+end;
+
+function Fr(Typ, Flags, Id: Integer; const Payload: string): string;
+begin
+  Result := FrN(Length(Payload), Typ, Flags, Id, Payload);
+end;
+
+{ the payload of SETTINGS: identifiers and values, two by two }
+function Sets(const Pairs: array of Integer): string;
+var
+  i: Integer;
+begin
+  Result := '';
+  i := 0;
+  while i < High(Pairs) do
+  begin
+    Result := Result + Chr((Pairs[i] shr 8) and 255) + Chr(Pairs[i] and 255) + B32(Pairs[i + 1]);
+    i := i + 2;
+  end;
+end;
+
+{ a field as a literal that touches no table, its strings plain (RFC
+  7541 6.2.2): what a block of them says does not depend on the blocks
+  before it }
+function Lit(const Name, Value: string): string;
+begin
+  Result := #0 + Chr(Length(Name)) + Name + Chr(Length(Value)) + Value;
+end;
+
+{ a response of status 200 whole: its fields and its content }
+function Ok200(Sid: Integer; const Body: string): string;
+begin
+  Result := Fr(FHeaders, 4, Sid, Lit(':status', '200')) + Fr(FData, 1, Sid, Body);
+end;
+
+function Fill(N: Integer): string;
+var
+  i: Integer;
+begin
+  SetLength(Result, N);
+  for i := 1 to N do
+    Result[i] := Chr(32 + (i * 7 + i div 95) mod 95);
+end;
+
+{ ---- the peer ---- }
+
+function TPeer.Take(N, Ms: Integer; out S: string): Boolean;
+var
+  chunk: string;
+  k, due: Integer;
+begin
+  Result := False;
+  S := '';
+  due := PasIoDeadline(Ms);
+  while Length(Buf) < N do
+  begin
+    if AtEof then
+      Exit;
+    SetLength(chunk, 65536);
+    k := PasIoRead(Fd, @chunk[1], 65536, due);
+    if k = 0 then
+      AtEof := True;
+    if k <= 0 then
+      Exit;
+    Buf := Buf + Copy(chunk, 1, k);
+  end;
+  S := Copy(Buf, 1, N);
+  Delete(Buf, 1, N);
+  Result := True;
+end;
+
+function TPeer.Next(Ms: Integer): Boolean;
+var
+  h: string;
+  n: Integer;
+begin
+  Result := False;
+  Typ := -1;
+  Flags := 0;
+  Id := 0;
+  Payload := '';
+  { a whole frame or none: the nine octets are taken only when they came }
+  if not Take(9, Ms, h) then
+    Exit;
+  n := (Ord(h[1]) shl 16) or (Ord(h[2]) shl 8) or Ord(h[3]);
+  Typ := Ord(h[4]);
+  Flags := Ord(h[5]);
+  Id := U32(h, 6);
+  Result := Take(n, LongMs, Payload);
+end;
+
+{ the next frame of type T, those of other types let by }
+function TPeer.NextOf(T: Integer): Boolean;
+begin
+  Result := False;
+  while Next(LongMs) do
+    if Typ = T then
+    begin
+      Result := True;
+      Exit;
+    end;
+end;
+
+{ the next HEADERS frame, a whole field block, which the peer's table
+  takes in: every block goes through it, read or not }
+function TPeer.Head: Boolean;
+var
+  got: THpackFields;
+  over: Boolean;
+  e: string;
+begin
+  Result := NextOf(FHeaders) and ((Flags and 4) <> 0) and HpackDecode(HDec, Payload, 1 shl 30, got, over, e);
+end;
+
+{ a PING and its answer: the client has taken every frame sent before it }
+function TPeer.Sync: Boolean;
+begin
+  Put(Fr(FPing, 0, 0, 'in step.'));
+  Result := False;
+  while NextOf(FPing) do
+    if ((Flags and 1) <> 0) and (Payload = 'in step.') then
+    begin
+      Result := True;
+      Exit;
+    end;
+end;
+
+procedure TPeer.Put(const S: string);
+var
+  p, k: Integer;
+begin
+  p := 1;
+  while p <= Length(S) do
+  begin
+    k := PasIoWrite(Fd, @S[p], Length(S) - p + 1, PasIoDeadline(LongMs));
+    if k <= 0 then
+      Exit;
+    p := p + k;
+  end;
+end;
+
+{ a whole request: its field block, in HEADERS and the CONTINUATION
+  frames after it, and its content to END_STREAM. Its stream is in Id.
+  Frames that are not of a request are let by }
+function TPeer.Request(out Fields: THpackFields; out Body: string): Boolean;
+var
+  block, err: string;
+  sid: Integer;
+  ended, big: Boolean;
+begin
+  Result := False;
+  Fields := nil;
+  Body := '';
+  if not NextOf(FHeaders) then
+    Exit;
+  sid := Id;
+  ended := (Flags and 1) <> 0;
+  block := Payload;
+  while (Flags and 4) = 0 do
+  begin
+    if (not Next(LongMs)) or (Typ <> FCont) or (Id <> sid) then
+      Exit;
+    block := block + Payload;
+  end;
+  if not HpackDecode(HDec, block, 1 shl 30, Fields, big, err) then
+    Exit;
+  while not ended do
+  begin
+    if not Next(LongMs) then
+      Exit;
+    if (Typ = FData) and (Id = sid) then
+    begin
+      Body := Body + Payload;
+      ended := (Flags and 1) <> 0;
+    end;
+  end;
+  Id := sid;
+  Result := True;
+end;
+
+{ nothing comes from the client for Ms }
+function TPeer.Quiet(Ms: Integer): Boolean;
+var
+  chunk: string;
+  k: Integer;
+begin
+  Result := Buf = '';
+  if not Result then
+    Exit;
+  SetLength(chunk, 4096);
+  k := PasIoRead(Fd, @chunk[1], 4096, PasIoDeadline(Ms));
+  if k > 0 then
+    Buf := Copy(chunk, 1, k);
+  if k = 0 then
+    AtEof := True;
+  Result := k = -110;
+end;
+
+{ the client ends the connection: nothing more but the end of the stream }
+function TPeer.Gone: Boolean;
+begin
+  while Next(LongMs) do
+    ;
+  Result := AtEof and (Buf = '');
+end;
+
+procedure TPeer.Drop;
+begin
+  if Fd >= 0 then
+    TcpClose(Fd);
+  Fd := -1;
+end;
+
+procedure TCall.Run;
+begin
+  if Method = 'PING' then
+    Ok := Conn.Ping(TimeoutMs)
+  else
+    Ok := Conn.Request(Method, Path, Headers, Body, TimeoutMs, MaxBody, Resp, Err);
+  Fin.Done;
+end;
+
+function Ask(C: THttp2Conn; const Method, Path: string; const Headers: THpackFields; const Body: string;
+  TimeoutMs, MaxBody: Integer): TCall;
+begin
+  Result := TCall.Create;
+  Result.Conn := C;
+  Result.Method := Method;
+  Result.Path := Path;
+  Result.Headers := Headers;
+  Result.Body := Body;
+  Result.TimeoutMs := TimeoutMs;
+  Result.MaxBody := MaxBody;
+  Result.Fin.Add(1);
+  pas Result.Run;
+end;
+
+{ a pair of sockets, the connection on one and the peer on the other;
+  nothing said yet }
+function Pair(const Opt: THttp2Options): TPeer;
+var
+  a, b: Integer;
+begin
+  Result := TPeer.Create;
+  if not UnixPair(a, b) then
+  begin
+    WriteLn('no pair of sockets');
+    Halt(1);
+  end;
+  Result.Fd := b;
+  if tight then
+    SockBuffers(a, 0, 65536);
+  HpackEncoderInit(Result.HEnc);
+  HpackDecoderInit(Result.HDec, 4096);
+  Result.Conn := THttp2Conn.Create(TTcpStream.Create(a), 'http', 'test', Opt);
+end;
+
+{ the same with the prefaces of both ends done: the client's read, the
+  peer's SETTINGS of Settings sent and acknowledged }
+function Fresh(const Settings: string; const Opt: THttp2Options): TPeer;
+var
+  s: string;
+  acked: Boolean;
+begin
+  Result := Pair(Opt);
+  if (not Result.Take(24, LongMs, s)) or (not Result.Next(LongMs)) or (Result.Typ <> FSettings) or
+    (not Result.Next(LongMs)) or (Result.Typ <> FWindow) then
+  begin
+    WriteLn('no preface from the client');
+    Halt(1);
+  end;
+  Result.Put(Fr(FSettings, 0, 0, Settings) + Fr(FSettings, 1, 0, ''));
+  acked := Result.NextOf(FSettings) and ((Result.Flags and 1) <> 0);
+  if not acked then
+  begin
+    WriteLn('the client did not acknowledge SETTINGS');
+    Halt(1);
+  end;
+end;
+
+function Defaults: THttp2Options;
+begin
+  Result := Default(THttp2Options);
+end;
+
+function FieldOf(const F: THpackFields; const Name: string): string;
+begin
+  Result := Http2Get(F, Name);
+end;
+
+{ how many fields of F are called Name }
+function Count(const F: THpackFields; const Name: string): Integer;
+var
+  i: Integer;
+begin
+  Result := 0;
+  for i := 0 to High(F) do
+    if F[i].Name = Name then
+      Inc(Result);
+end;
+
+procedure Finish(P: TPeer);
+begin
+  P.Conn.Dispose;
+  P.Drop;
+end;
+
+{ ---- the preface and requests in every shape ---- }
+
+procedure Shapes;
+var
+  p: TPeer;
+  c, c2: TCall;
+  f, h: THpackFields;
+  s, body, big, e: string;
+  i, n: Integer;
+  ok, over: Boolean;
+  opt: THttp2Options;
+  conn: THttp2Conn;
+begin
+  { 3.4: the 24 octets, SETTINGS, and the connection's window }
+  p := Pair(Defaults);
+  Check(p.Take(24, LongMs, s) and (s = 'PRI * HTTP/2.0'#13#10#13#10'SM'#13#10#13#10), 'the preface');
+  Check(p.Next(LongMs) and (p.Typ = FSettings) and (p.Flags = 0) and (p.Id = 0) and
+    (p.Payload = Sets([2, 0, 4, 4194304, 5, 1048576, 6, 1048576])), 'the client''s SETTINGS');
+  Check(p.Next(LongMs) and (p.Typ = FWindow) and (p.Id = 0) and (U32(p.Payload, 1) = 1073741824),
+    'the connection''s window');
+  { before the peer's SETTINGS nothing of it is acknowledged; after, once }
+  p.Put(Fr(FSettings, 0, 0, Sets([$99, 7])) + Fr(FSettings, 1, 0, ''));
+  Check(p.Next(LongMs) and (p.Typ = FSettings) and (p.Flags = 1) and (p.Payload = ''), 'the acknowledgement');
+  Check(p.Conn.Alive and (p.Conn.PeerMaxStreams = 1000), 'alive, and Go''s limit of streams for a peer that says none');
+  { GET: one HEADERS frame that ends the stream }
+  SetLength(h, 2);
+  h[0] := Http2Field('accept', 'text/plain');
+  h[1] := Http2Field('x-one', 'a b');
+  c := Ask(p.Conn, 'GET', '/a?b=c', h, '', 0, 0);
+  ok := p.Request(f, body);
+  Check(ok and (p.Id = 1) and (p.Flags = 5) and (body = ''), 'GET is HEADERS with END_STREAM and END_HEADERS on stream 1');
+  Check((Length(f) = 6) and (f[0].Name = ':authority') and (f[0].Value = 'test') and (f[1].Name = ':method') and
+    (f[1].Value = 'GET') and (f[2].Name = ':path') and (f[2].Value = '/a?b=c') and (f[3].Name = ':scheme') and
+    (f[3].Value = 'http') and (f[4].Name = 'accept') and (f[5].Value = 'a b'), 'the request''s fields in order');
+  p.Put(Fr(FHeaders, 4, 1, Lit(':status', '200') + Lit('content-type', 'text/plain') + Lit('x-two', 'v')) +
+    Fr(FData, 1, 1, 'hello'));
+  c.Fin.Wait;
+  Check(c.Ok and (c.Resp.Status = 200) and (c.Resp.Body = 'hello') and (Length(c.Resp.Fields) = 2) and
+    (FieldOf(c.Resp.Fields, 'content-type') = 'text/plain') and (c.Resp.ErrorCode = -1) and (c.Err = ''),
+    'the response: ' + c.Err);
+  { the next streams are 3 and 5 }
+  c := Ask(p.Conn, 'POST', '/post', nil, 'the content', 0, 0);
+  ok := p.Request(f, body);
+  Check(ok and (p.Id = 3) and (body = 'the content') and (FieldOf(f, 'content-length') = '11') and
+    (FieldOf(f, ':method') = 'POST'), 'POST: content-length and the content, on stream 3');
+  p.Put(Fr(FHeaders, 5, 3, Lit(':status', '204')));
+  c.Fin.Wait;
+  Check(c.Ok and (c.Resp.Status = 204) and (c.Resp.Body = ''), 'a response that is its fields alone');
+  { a POST of nothing says content-length 0; a GET says none }
+  c := Ask(p.Conn, 'POST', '/empty', nil, '', 0, 0);
+  ok := p.Request(f, body);
+  Check(ok and (p.Id = 5) and (FieldOf(f, 'content-length') = '0') and (Count(f, 'content-length') = 1),
+    'an empty POST says its length');
+  p.Put(Ok200(5, ''));
+  c.Fin.Wait;
+  Check(c.Ok and (c.Resp.Body = ''), 'an empty DATA frame ends a response');
+  { HEAD: a length and no content }
+  c := Ask(p.Conn, 'HEAD', '/h', nil, '', 0, 0);
+  ok := p.Request(f, body);
+  p.Put(Fr(FHeaders, 5, 7, Lit(':status', '200') + Lit('content-length', '1234')));
+  c.Fin.Wait;
+  Check(c.Ok and (c.Resp.Body = '') and (FieldOf(c.Resp.Fields, 'content-length') = '1234'), 'HEAD: ' + c.Err);
+  { a 304 says a length too }
+  c := Ask(p.Conn, 'GET', '/n', nil, '', 0, 0);
+  ok := p.Request(f, body);
+  p.Put(Fr(FHeaders, 5, 9, Lit(':status', '304') + Lit('content-length', '77')));
+  c.Fin.Wait;
+  Check(c.Ok and (c.Resp.Status = 304), '304 with a length: ' + c.Err);
+  { content in several frames, some empty, with the length said }
+  c := Ask(p.Conn, 'GET', '/parts', nil, '', 0, 0);
+  ok := p.Request(f, body);
+  p.Put(Fr(FHeaders, 4, 11, Lit(':status', '200') + Lit('content-length', '9')) + Fr(FData, 0, 11, 'abc') +
+    Fr(FData, 0, 11, '') + Fr(FData, 0, 11, 'def') + Fr(FData, 1, 11, 'ghi'));
+  c.Fin.Wait;
+  Check(c.Ok and (c.Resp.Body = 'abcdefghi'), 'content in several frames: ' + c.Err);
+  { trailers }
+  c := Ask(p.Conn, 'GET', '/t', nil, '', 0, 0);
+  ok := p.Request(f, body);
+  p.Put(Fr(FHeaders, 4, 13, Lit(':status', '200')) + Fr(FData, 0, 13, 'body') +
+    Fr(FHeaders, 5, 13, Lit('x-sum', '99') + Lit('x-more', 'yes')));
+  c.Fin.Wait;
+  Check(c.Ok and (c.Resp.Body = 'body') and (Length(c.Resp.Trailers) = 2) and
+    (FieldOf(c.Resp.Trailers, 'x-sum') = '99'), 'trailers: ' + c.Err);
+  { interim responses before the response }
+  c := Ask(p.Conn, 'GET', '/i', nil, '', 0, 0);
+  ok := p.Request(f, body);
+  p.Put(Fr(FHeaders, 4, 15, Lit(':status', '103') + Lit('link', '</a>')) + Fr(FHeaders, 4, 15, Lit(':status', '100')) +
+    Ok200(15, 'final'));
+  c.Fin.Wait;
+  Check(c.Ok and (c.Resp.Status = 200) and (c.Resp.Body = 'final') and (Length(c.Resp.Fields) = 0),
+    'interim responses are let by: ' + c.Err);
+  { padding and RFC 7540's priority; a field block in three frames }
+  c := Ask(p.Conn, 'GET', '/pad', nil, '', 0, 0);
+  ok := p.Request(f, body);
+  s := Lit(':status', '200') + Lit('x-long', Fill(100));
+  p.Put(Fr(FHeaders, 8 + 32, 17, #3 + B32(0) + #16 + Copy(s, 1, 10) + #0#0#0) + Fr(FCont, 0, 17, Copy(s, 11, 50)) +
+    Fr(FCont, 0, 17, '') + Fr(FCont, 4, 17, Copy(s, 61, 1000)) + Fr(FData, 8, 17, #5'pad' + #0#0#0#0#0) +
+    Fr(FData, 9, 17, #0'ded'));
+  c.Fin.Wait;
+  Check(c.Ok and (c.Resp.Body = 'padded') and (FieldOf(c.Resp.Fields, 'x-long') = Fill(100)),
+    'padding, priority and CONTINUATION: ' + c.Err);
+  { frames of a type nobody knows, and PRIORITY, change nothing }
+  c := Ask(p.Conn, 'GET', '/u', nil, '', 0, 0);
+  ok := p.Request(f, body);
+  p.Put(Fr(200, 255, 0, 'what') + Fr(200, 0, 19, '') + Fr(FPriority, 0, 19, B32(0) + #9) + Fr(FPriority, 0, 91, B32(3) + #1) +
+    Ok200(19, 'known'));
+  c.Fin.Wait;
+  Check(c.Ok and (c.Resp.Body = 'known'), 'unknown frames and PRIORITY: ' + c.Err);
+  { a request the call refuses is never written: the peer sees the next
+    request on the next stream }
+  SetLength(h, 1);
+  n := 0;
+  h[0] := Http2Field('X-Upper', 'v');
+  if (not p.Conn.Request('GET', '/', h, '', 0, 0, c.Resp, s)) and (Pos('lower case', s) > 0) then
+    Inc(n);
+  h[0] := Http2Field('connection', 'close');
+  if (not p.Conn.Request('GET', '/', h, '', 0, 0, c.Resp, s)) and (Pos('HTTP/1.1 connection', s) > 0) then
+    Inc(n);
+  h[0] := Http2Field('transfer-encoding', 'chunked');
+  if (not p.Conn.Request('GET', '/', h, '', 0, 0, c.Resp, s)) and (Pos('transfer-encoding', s) > 0) then
+    Inc(n);
+  h[0] := Http2Field('host', 'x');
+  if (not p.Conn.Request('GET', '/', h, '', 0, 0, c.Resp, s)) and (Pos('authority', s) > 0) then
+    Inc(n);
+  h[0] := Http2Field('content-length', '3');
+  if (not p.Conn.Request('POST', '/', h, 'abc', 0, 0, c.Resp, s)) and (Pos('written from the content', s) > 0) then
+    Inc(n);
+  h[0] := Http2Field('te', 'gzip');
+  if (not p.Conn.Request('GET', '/', h, '', 0, 0, c.Resp, s)) and (Pos('trailers', s) > 0) then
+    Inc(n);
+  h[0] := Http2Field(':path', '/x');
+  if (not p.Conn.Request('GET', '/', h, '', 0, 0, c.Resp, s)) and (Pos('pseudo-header', s) > 0) then
+    Inc(n);
+  h[0] := Http2Field('x-v', 'a'#13#10'b');
+  if (not p.Conn.Request('GET', '/', h, '', 0, 0, c.Resp, s)) and (Pos('field value does not hold', s) > 0) then
+    Inc(n);
+  h[0] := Http2Field('x-v', ' a');
+  if (not p.Conn.Request('GET', '/', h, '', 0, 0, c.Resp, s)) and (Pos('space at an end', s) > 0) then
+    Inc(n);
+  h[0] := Http2Field('x-v', 'a'#10);
+  if (not p.Conn.Request('GET', '/', h, '', 0, 0, c.Resp, s)) and (Pos('field value does not hold', s) > 0) then
+    Inc(n);
+  h[0] := Http2Field('x-v', 'a'#9);
+  if (not p.Conn.Request('GET', '/', h, '', 0, 0, c.Resp, s)) and (Pos('space at an end', s) > 0) then
+    Inc(n);
+  h[0] := Http2Field('', 'a');
+  if (not p.Conn.Request('GET', '/', h, '', 0, 0, c.Resp, s)) and (Pos('token', s) > 0) then
+    Inc(n);
+  h[0] := Http2Field('x y', 'a');
+  if (not p.Conn.Request('GET', '/', h, '', 0, 0, c.Resp, s)) and (Pos('token', s) > 0) then
+    Inc(n);
+  if (not p.Conn.Request('GET', 'nopath', nil, '', 0, 0, c.Resp, s)) and (Pos('begins with /', s) > 0) then
+    Inc(n);
+  if (not p.Conn.Request('GET', '', nil, '', 0, 0, c.Resp, s)) and (Pos('begins with /', s) > 0) then
+    Inc(n);
+  if (not p.Conn.Request('GET', '/a b', nil, '', 0, 0, c.Resp, s)) and (Pos('percent-encoded', s) > 0) then
+    Inc(n);
+  if (not p.Conn.Request('GET', '/a'#200, nil, '', 0, 0, c.Resp, s)) and (Pos('percent-encoded', s) > 0) then
+    Inc(n);
+  if (not p.Conn.Request('G T', '/', nil, '', 0, 0, c.Resp, s)) and (Pos('method', s) > 0) then
+    Inc(n);
+  if (not p.Conn.Request('', '/', nil, '', 0, 0, c.Resp, s)) and (Pos('method', s) > 0) then
+    Inc(n);
+  if (not p.Conn.Request('CONNECT', '/', nil, '', 0, 0, c.Resp, s)) and (Pos('CONNECT', s) > 0) then
+    Inc(n);
+  Check((n = 20) and (not c.Resp.NotProcessed) and (c.Resp.ErrorCode = -1), 'requests that are refused before they leave: ' +
+    IntToStr(n) + ' of 20');
+  { te: trailers is the one thing te says; OPTIONS * is a path; a cookie
+    goes crumb by crumb }
+  SetLength(h, 3);
+  h[0] := Http2Field('te', 'trailers');
+  h[1] := Http2Field('cookie', 'a=1; b=2;c=3');
+  h[2] := Http2Field('x-tab', 'a'#9'b');
+  c := Ask(p.Conn, 'OPTIONS', '*', h, '', 0, 0);
+  ok := p.Request(f, body);
+  Check(ok and (p.Id = 21) and (FieldOf(f, ':path') = '*') and (FieldOf(f, 'te') = 'trailers') and
+    (Count(f, 'cookie') = 3) and (Length(f) = 9) and (f[5].Value = 'a=1') and (f[6].Value = 'b=2') and
+    (f[7].Value = 'c=3') and (f[8].Value = 'a'#9'b'), 'te, OPTIONS * and the crumbs of a cookie, on stream 21');
+  p.Put(Ok200(21, ''));
+  c.Fin.Wait;
+  Check(c.Ok, 'OPTIONS *: ' + c.Err);
+  { a field block past the peer's largest frame goes on in CONTINUATION
+    frames, nothing in between }
+  SetLength(h, 1);
+  big := '';
+  for i := 1 to 5000 do
+    big := big + Chr(1 + (i * 131) mod 250);
+  for i := 1 to Length(big) do
+    if (big[i] = #10) or (big[i] = #13) or (big[i] = #127) or (Ord(big[i]) < 32) then
+      big[i] := 'x';
+  big := big + big + big + big + big + big + big + big;
+  h[0] := Http2FieldOnce('x-big', big);
+  c := Ask(p.Conn, 'GET', '/big-block', h, '', 0, 0);
+  ok := p.NextOf(FHeaders) and (p.Flags = 1) and (Length(p.Payload) = 16384);
+  s := p.Payload;
+  n := 0;
+  while ok and ((p.Flags and 4) = 0) do
+  begin
+    ok := p.Next(LongMs) and (p.Typ = FCont) and (p.Id = 23) and (Length(p.Payload) <= 16384);
+    s := s + p.Payload;
+    Inc(n);
+  end;
+  f := nil;
+  ok := ok and HpackDecode(p.HDec, s, 1 shl 30, f, over, e) and (FieldOf(f, 'x-big') = big);
+  Check(ok and (n >= 2), 'a field block in HEADERS and ' + IntToStr(n) + ' CONTINUATION frames');
+  p.Put(Ok200(23, 'ok'));
+  c.Fin.Wait;
+  Check(c.Ok, 'the response to it: ' + c.Err);
+  { several at once, answered in another order }
+  c := Ask(p.Conn, 'GET', '/first', nil, '', 0, 0);
+  ok := p.Request(f, body);
+  c2 := Ask(p.Conn, 'GET', '/second', nil, '', 0, 0);
+  ok := ok and p.Request(f, body) and (p.Id = 27);
+  Check(ok and (p.Conn.Streams = 2), 'two streams open');
+  p.Put(Fr(FHeaders, 4, 27, Lit(':status', '200')) + Fr(FHeaders, 4, 25, Lit(':status', '201')) + Fr(FData, 0, 27, 'se') +
+    Fr(FData, 1, 25, 'first') + Fr(FData, 1, 27, 'cond'));
+  c.Fin.Wait;
+  c2.Fin.Wait;
+  Check(c.Ok and c2.Ok and (c.Resp.Status = 201) and (c.Resp.Body = 'first') and (c2.Resp.Body = 'second') and
+    (p.Conn.Streams = 0), 'two responses interleaved');
+  { a padded HEADERS frame that holds its padding's length and no more,
+    the block all in CONTINUATION }
+  c := Ask(p.Conn, 'GET', '/pad0', nil, '', 0, 0);
+  ok := p.Request(f, body);
+  p.Put(Fr(FHeaders, 8 + 1, p.Id, #0) + Fr(FCont, 4, p.Id, Lit(':status', '200') + Lit('x-n', 'v')));
+  c.Fin.Wait;
+  Check(ok and c.Ok and (c.Resp.Status = 200) and (FieldOf(c.Resp.Fields, 'x-n') = 'v'), 'a HEADERS frame of its padding''s length alone: ' +
+    c.Err);
+  { a token is a token to its last octet and to the ends of its ranges:
+    the digits from 0 to 9, a method's letters to Z, a name's to z; and
+    the octets beside those ranges, and one wrong octet at the end, are
+    refused }
+  SetLength(h, 2);
+  h[0] := Http2Field('x-0189-az', 'v');
+  h[1] := Http2Field('cookie', 'k=v; z');
+  c := Ask(p.Conn, 'FUZZ', '/token', h, '', 0, 0);
+  ok := p.Request(f, body);
+  Check(ok and (FieldOf(f, ':method') = 'FUZZ') and (FieldOf(f, 'x-0189-az') = 'v'),
+    'digits and letters at the ends of their ranges');
+  Check(ok and (Count(f, 'cookie') = 2) and (Length(f) = 7) and (f[6].Value = 'z'), 'a last crumb of one octet');
+  SetLength(h, 1);
+  p.Put(Ok200(p.Id, ''));
+  c.Fin.Wait;
+  n := 0;
+  h[0] := Http2Field('x-a(', 'v');
+  if (not p.Conn.Request('GET', '/', h, '', 0, 0, c.Resp, s)) and (Pos('token', s) > 0) then
+    Inc(n);
+  h[0] := Http2Field('x{', 'v');
+  if (not p.Conn.Request('GET', '/', h, '', 0, 0, c.Resp, s)) and (Pos('token', s) > 0) then
+    Inc(n);
+  h[0] := Http2Field('x/y', 'v');
+  if (not p.Conn.Request('GET', '/', h, '', 0, 0, c.Resp, s)) and (Pos('token', s) > 0) then
+    Inc(n);
+  h[0] := Http2Field('x:y', 'v');
+  if (not p.Conn.Request('GET', '/', h, '', 0, 0, c.Resp, s)) and (Pos('token', s) > 0) then
+    Inc(n);
+  h[0] := Http2Field('x-ok', 'a'#127'b');
+  if (not p.Conn.Request('GET', '/', h, '', 0, 0, c.Resp, s)) and (Pos('field value does not hold', s) > 0) then
+    Inc(n);
+  h[0] := Http2Field('x-ok', 'a'#31'b');
+  if (not p.Conn.Request('GET', '/', h, '', 0, 0, c.Resp, s)) and (Pos('field value does not hold', s) > 0) then
+    Inc(n);
+  h[0] := Http2Field('x-ok', #9'a');
+  if (not p.Conn.Request('GET', '/', h, '', 0, 0, c.Resp, s)) and (Pos('space at an end', s) > 0) then
+    Inc(n);
+  h[0] := Http2Field('x-ok', 'a ');
+  if (not p.Conn.Request('GET', '/', h, '', 0, 0, c.Resp, s)) and (Pos('space at an end', s) > 0) then
+    Inc(n);
+  if (not p.Conn.Request('GET(', '/', nil, '', 0, 0, c.Resp, s)) and (Pos('method', s) > 0) then
+    Inc(n);
+  if (not p.Conn.Request('G@T', '/', nil, '', 0, 0, c.Resp, s)) and (Pos('method', s) > 0) then
+    Inc(n);
+  if (not p.Conn.Request('G[T', '/', nil, '', 0, 0, c.Resp, s)) and (Pos('method', s) > 0) then
+    Inc(n);
+  if (not p.Conn.Request('GET', '/a'#127, nil, '', 0, 0, c.Resp, s)) and (Pos('percent-encoded', s) > 0) then
+    Inc(n);
+  if (not p.Conn.Request('GET', '/a'#32, nil, '', 0, 0, c.Resp, s)) and (Pos('percent-encoded', s) > 0) then
+    Inc(n);
+  Check(n = 13, 'octets beside a token''s, a value''s and a path''s: ' + IntToStr(n) + ' of 13');
+  { of two faults the first is the one said: the method's before the
+    path's, the path's before a field's, a field's before the next field's }
+  n := 0;
+  SetLength(h, 2);
+  h[1] := Http2Field('connection', 'close');
+  if (not p.Conn.Request('G T', 'nopath', h, '', 0, 0, c.Resp, s)) and (Pos('method', s) > 0) then
+    Inc(n);
+  if (not p.Conn.Request('CONNECT', 'nopath', h, '', 0, 0, c.Resp, s)) and (Pos('CONNECT', s) > 0) then
+    Inc(n);
+  if (not p.Conn.Request('GET', 'a b', h, '', 0, 0, c.Resp, s)) and (Pos('begins with /', s) > 0) then
+    Inc(n);
+  if (not p.Conn.Request('GET', '/a b', h, '', 0, 0, c.Resp, s)) and (Pos('percent-encoded', s) > 0) then
+    Inc(n);
+  h[0] := Http2Field(':path', '/x');
+  if (not p.Conn.Request('GET', '/', h, '', 0, 0, c.Resp, s)) and (Pos('pseudo-header', s) > 0) then
+    Inc(n);
+  h[0] := Http2Field('X-Upper', 'v');
+  if (not p.Conn.Request('GET', '/', h, '', 0, 0, c.Resp, s)) and (Pos('lower case', s) > 0) then
+    Inc(n);
+  h[0] := Http2Field('host', 'x');
+  if (not p.Conn.Request('GET', '/', h, '', 0, 0, c.Resp, s)) and (Pos('authority', s) > 0) then
+    Inc(n);
+  h[0] := Http2Field('content-length', '3');
+  if (not p.Conn.Request('POST', '/', h, 'abc', 0, 0, c.Resp, s)) and (Pos('written from the content', s) > 0) then
+    Inc(n);
+  h[0] := Http2Field('te', 'gzip');
+  if (not p.Conn.Request('GET', '/', h, '', 0, 0, c.Resp, s)) and (Pos('trailers', s) > 0) then
+    Inc(n);
+  h[0] := Http2Field('x-v', 'a'#10);
+  if (not p.Conn.Request('GET', '/', h, '', 0, 0, c.Resp, s)) and (Pos('field value does not hold', s) > 0) then
+    Inc(n);
+  h[0] := Http2Field('upgrade', 'h2c');
+  h[1] := Http2Field('host', 'x');
+  if (not p.Conn.Request('GET', '/', h, '', 0, 0, c.Resp, s)) and (Pos('HTTP/1.1 connection', s) > 0) then
+    Inc(n);
+  Check(n = 11, 'of two faults the first is said: ' + IntToStr(n) + ' of 11');
+  { and what is just inside: a path of every octet from ! to ~ }
+  s := '/';
+  for i := 33 to 126 do
+    s := s + Chr(i);
+  c := Ask(p.Conn, 'GET', s, nil, '', 0, 0);
+  ok := p.Request(f, body);
+  Check(ok and (FieldOf(f, ':path') = s), 'a path of every octet a path holds');
+  p.Put(Ok200(p.Id, ''));
+  c.Fin.Wait;
+  { padded DATA at its edges: a frame that is its padding's length and
+    no more, one that is all padding, and content before its padding }
+  c := Ask(p.Conn, 'GET', '/pad1', nil, '', 0, 0);
+  ok := p.Request(f, body);
+  p.Put(Fr(FHeaders, 4, p.Id, Lit(':status', '200')) + Fr(FData, 8, p.Id, #0) + Fr(FData, 8, p.Id, #3#0#0#0) +
+    Fr(FData, 9, p.Id, #2'ab'#0#0));
+  c.Fin.Wait;
+  Check(ok and c.Ok and (c.Resp.Body = 'ab'), 'padded DATA at its edges: ' + c.Err);
+  { a budget of ten octets: a 304 and a response to HEAD say a longer
+    length and carry nothing, which is within it }
+  c := Ask(p.Conn, 'GET', '/n10', nil, '', 0, 10);
+  ok := p.Request(f, body);
+  p.Put(Fr(FHeaders, 5, p.Id, Lit(':status', '304') + Lit('content-length', '77')));
+  c.Fin.Wait;
+  Check(ok and c.Ok and (c.Resp.Status = 304), 'a 304 that says a length past the budget: ' + c.Err);
+  c := Ask(p.Conn, 'HEAD', '/h10', nil, '', 0, 10);
+  ok := p.Request(f, body);
+  p.Put(Fr(FHeaders, 5, p.Id, Lit(':status', '200') + Lit('content-length', '1234')));
+  c.Fin.Wait;
+  Check(ok and c.Ok and (c.Resp.Status = 200), 'a response to HEAD that says a length past the budget: ' + c.Err);
+  { a response that comes an octet at a time }
+  c := Ask(p.Conn, 'GET', '/slowly', nil, '', 0, 0);
+  ok := p.Request(f, body);
+  s := Fr(FHeaders, 4, p.Id, Lit(':status', '200') + Lit('x-n', 'v')) + Fr(FData, 1, p.Id, 'one by one');
+  for i := 1 to Length(s) do
+  begin
+    p.Put(s[i]);
+    Sleep(1);
+  end;
+  c.Fin.Wait;
+  Check(ok and c.Ok and (c.Resp.Body = 'one by one') and (FieldOf(c.Resp.Fields, 'x-n') = 'v'), 'a response an octet at a time: ' +
+    c.Err);
+  { the ends of the range of SETTINGS_MAX_FRAME_SIZE are taken (6.5.2) }
+  p.Put(Fr(FSettings, 0, 0, Sets([5, 16777215])) + Fr(FSettings, 0, 0, Sets([5, 16384])));
+  Check(p.NextOf(FSettings) and (p.Flags = 1) and p.NextOf(FSettings) and (p.Flags = 1) and p.Sync and p.Conn.Alive,
+    'a largest frame of 2^24 - 1 and of 16384');
+  { the peer's PING is answered with its octets; the client's Ping waits
+    for its own }
+  p.Put(Fr(FPing, 0, 0, 'abcdefgh'));
+  Check(p.NextOf(FPing) and (p.Flags = 1) and (p.Payload = 'abcdefgh') and (p.Id = 0), 'a PING answered');
+  Check(not p.Conn.Ping(60), 'a Ping nobody answers');
+  Check(p.NextOf(FPing) and (p.Flags = 0) and (Length(p.Payload) = 8), 'the Ping''s frame');
+  p.Put(Fr(FPing, 1, 0, 'nobody..') + Fr(FPing, 1, 0, p.Payload));
+  Check(p.Conn.Alive, 'answers to no PING are let by');
+  { Dispose: GOAWAY that names no stream of the peer's, and the end }
+  p.Conn.Dispose;
+  Check(p.NextOf(FGoAway) and (p.Id = 0) and (U32(p.Payload, 1) = 0) and (U32(p.Payload, 5) = 0) and
+    (Length(p.Payload) = 8), 'GOAWAY at Dispose');
+  Check(p.Gone, 'the end of the stream after it');
+  Check((not p.Conn.Alive) and (Pos('disposed', p.Conn.LastError) > 0), 'not alive after Dispose');
+  Check((not p.Conn.Request('GET', '/', nil, '', 0, 0, c.Resp, s)) and c.Resp.NotProcessed and (Pos('disposed', s) > 0),
+    'a request after Dispose');
+  Check(not p.Conn.Ping(1000), 'a Ping after Dispose');
+  p.Conn.Dispose;
+  p.Drop;
+  { the limit a caller sets is the one said, every octet of its number }
+  opt := Defaults;
+  opt.MaxHeaderBytes := 19088743;
+  p := Pair(opt);
+  Check(p.Take(24, LongMs, s) and p.Next(LongMs) and (p.Typ = FSettings) and
+    (p.Payload = Sets([2, 0, 4, 4194304, 5, 1048576, 6, 19088743])), 'a budget of the caller''s in SETTINGS');
+  Finish(p);
+  { a connection that could not begin: no stream to speak on, and a
+    stream whose peer is gone already. Neither is alive, each says why,
+    takes no request and gives back what it had opened }
+  conn := THttp2Conn.Create(nil, 'http', 'test', Defaults);
+  Check((not conn.Alive) and (conn.LastError = 'http2: no stream to speak on') and
+    (not conn.Request('GET', '/', nil, '', 0, 0, c.Resp, s)) and c.Resp.NotProcessed and (s = conn.LastError) and
+    (not conn.Ping(100)), 'a connection with no stream: ' + s);
+  conn.Dispose;
+  if not UnixPair(i, n) then
+    Halt(1);
+  TcpClose(n);
+  conn := THttp2Conn.Create(TTcpStream.Create(i), 'http', 'test', Defaults);
+  Check((not conn.Alive) and (conn.LastError = 'http2: the connection preface could not be written') and
+    (not conn.Request('GET', '/', nil, '', 0, 0, c.Resp, s)) and c.Resp.NotProcessed, 'a connection whose peer is gone: ' +
+    conn.LastError);
+  conn.Dispose;
+  { SETTINGS_MAX_HEADER_LIST_SIZE (6.5.2): a request whose fields take
+    what the peer said and no more goes; one octet more and it does not
+    leave, which is no reason to send it again. The four fields every
+    request has take 169 octets here, and x: y 34 }
+  p := Fresh(Sets([6, 203]), Defaults);
+  SetLength(h, 1);
+  h[0] := Http2Field('x', 'y');
+  c := Ask(p.Conn, 'GET', '/', h, '', 0, 0);
+  ok := p.Request(f, body);
+  p.Put(Ok200(p.Id, ''));
+  c.Fin.Wait;
+  Check(ok and c.Ok and (p.Id = 1), 'fields of exactly the size the peer takes: ' + c.Err);
+  h[0] := Http2Field('x', 'yz');
+  Check((not p.Conn.Request('GET', '/', h, '', 0, 0, c.Resp, s)) and (Pos('take 204 octets and the server takes 203', s) > 0) and
+    (not c.Resp.NotProcessed) and (not c.Resp.TimedOut), 'fields one octet past it: ' + s);
+  c := Ask(p.Conn, 'GET', '/', nil, '', 0, 0);
+  ok := p.Request(f, body);
+  p.Put(Ok200(p.Id, ''));
+  c.Fin.Wait;
+  Check(ok and c.Ok and (p.Id = 3) and p.Conn.Alive, 'the request that did not leave took no stream');
+  Finish(p);
+  Group('the preface and requests in every shape');
+end;
+
+{ ---- the compression's table across requests ---- }
+
+procedure Tables;
+var
+  p: TPeer;
+  c: TCall;
+  f, h: THpackFields;
+  body, path, s, e: string;
+  i: Integer;
+  sizes: array[1..6] of Integer;
+  ok, over: Boolean;
+begin
+  p := Fresh('', Defaults);
+  path := '/a/path/that/is/long/enough/to/be/worth/a/place/in/the/table/of/the/compression/0123456789';
+  SetLength(h, 2);
+  h[0] := Http2FieldIndexed('authorization', 'bearer ' + Fill(200));
+  h[1] := Http2FieldOnce('x-id', Fill(40));
+  ok := True;
+  for i := 1 to 6 do
+  begin
+    s := path;
+    if i = 4 then
+      s := path + '/other';
+    c := Ask(p.Conn, 'GET', s, h, '', 0, 0);
+    ok := ok and p.NextOf(FHeaders);
+    sizes[i] := Length(p.Payload);
+    f := nil;
+    ok := ok and HpackDecode(p.HDec, p.Payload, 1 shl 30, f, over, e) and (FieldOf(f, ':path') = s) and
+      (FieldOf(f, 'x-id') = Fill(40)) and (FieldOf(f, 'authorization') = 'bearer ' + Fill(200));
+    p.Put(Ok200(p.Id, ''));
+    c.Fin.Wait;
+    ok := ok and c.Ok;
+  end;
+  Check(ok, 'six requests decode');
+  { the first writes everything out; the second has the token as an
+    index and puts its path, said twice now, in the table; the third is
+    indexes and the field that is never kept; a new path does not push
+    the old one out, which the fifth finds }
+  Check((sizes[2] < sizes[1] - 100) and (sizes[3] < sizes[2] - 50) and (sizes[4] > sizes[3] + 50) and
+    (sizes[5] = sizes[3]) and (sizes[6] = sizes[3]), 'a path said twice enters the table, one said once does not: ' +
+    IntToStr(sizes[1]) + ' ' + IntToStr(sizes[2]) + ' ' + IntToStr(sizes[3]) + ' ' + IntToStr(sizes[4]) + ' ' +
+    IntToStr(sizes[5]) + ' ' + IntToStr(sizes[6]));
+  { SETTINGS_HEADER_TABLE_SIZE 0: the next block says so first (RFC 7541
+    4.2) and names nothing of the table }
+  p.Put(Fr(FSettings, 0, 0, Sets([1, 0])));
+  ok := p.NextOf(FSettings) and (p.Flags = 1);
+  HpackDecoderInit(p.HDec, 0);
+  c := Ask(p.Conn, 'GET', path, h, '', 0, 0);
+  ok := ok and p.NextOf(FHeaders) and (Ord(p.Payload[1]) = $20);
+  f := nil;
+  ok := ok and HpackDecode(p.HDec, p.Payload, 1 shl 30, f, over, e) and (FieldOf(f, ':path') = path);
+  Check(ok and (Length(p.Payload) > sizes[1] - 20), 'a table of size 0: the update, then every field written out');
+  p.Put(Ok200(p.Id, ''));
+  c.Fin.Wait;
+  { the peer's own table, through the connection's decoder }
+  SetLength(f, 3);
+  f[0] := Http2FieldIndexed(':status', '200');
+  f[1] := Http2FieldIndexed('x-kept', Fill(300));
+  f[2] := Http2FieldIndexed('x-kept', Fill(300));
+  ok := True;
+  for i := 1 to 3 do
+  begin
+    c := Ask(p.Conn, 'GET', '/', nil, '', 0, 0);
+    ok := ok and p.NextOf(FHeaders);
+    s := HpackEncode(p.HEnc, f);
+    if i > 1 then
+      ok := ok and (Length(s) = 3);
+    p.Put(Fr(FHeaders, 5, p.Id, s));
+    c.Fin.Wait;
+    ok := ok and c.Ok and (Length(c.Resp.Fields) = 2) and (c.Resp.Fields[1].Value = Fill(300));
+  end;
+  Check(ok, 'responses whose fields are indexes into the table of the block before');
+  Finish(p);
+  Group('the compression''s table across requests');
+end;
+
+{ ---- flow control ---- }
+
+procedure Flow;
+var
+  p: TPeer;
+  c: TCall;
+  f: THpackFields;
+  body, sent, s: string;
+  calls: TCalls;
+  bodies: array of string;
+  i, n, total, largest: Integer;
+  ok: Boolean;
+begin
+  { a stream window of 10: the content goes ten octets at a time, as
+    the window opens (6.9) }
+  p := Fresh(Sets([4, 10]), Defaults);
+  sent := Fill(25);
+  c := Ask(p.Conn, 'POST', '/w', nil, sent, 0, 0);
+  ok := p.Head and (p.Flags = 4);
+  ok := ok and p.Next(LongMs) and (p.Typ = FData) and (p.Flags = 0) and (p.Payload = Copy(sent, 1, 10));
+  Check(ok and p.Quiet(100), 'ten octets and no more while the window is shut');
+  p.Put(Fr(FWindow, 0, 1, B32(10)));
+  ok := p.Next(LongMs) and (p.Typ = FData) and (p.Flags = 0) and (p.Payload = Copy(sent, 11, 10));
+  p.Put(Fr(FWindow, 0, 1, B32(100)));
+  ok := ok and p.Next(LongMs) and (p.Typ = FData) and (p.Flags = 1) and (p.Payload = Copy(sent, 21, 5));
+  Check(ok, 'the rest as the window opens, END_STREAM on the last');
+  p.Put(Ok200(1, ''));
+  c.Fin.Wait;
+  Check(c.Ok, 'its response: ' + c.Err);
+  { 6.9.2: SETTINGS that lower the initial window take an open stream's
+    below zero, and nothing goes until it is above it again }
+  c := Ask(p.Conn, 'POST', '/neg', nil, Fill(50), 0, 0);
+  ok := p.Head and p.Next(LongMs) and (p.Typ = FData) and (Length(p.Payload) = 10);
+  p.Put(Fr(FSettings, 0, 0, Sets([4, 2])) + Fr(FWindow, 0, 3, B32(5)));
+  ok := ok and p.NextOf(FSettings) and (p.Flags = 1);
+  Check(ok and p.Quiet(100), 'a window below zero sends nothing');
+  p.Put(Fr(FWindow, 0, 3, B32(13)));
+  ok := p.Next(LongMs) and (p.Typ = FData) and (Length(p.Payload) = 10) and (p.Flags = 0);
+  Check(ok and p.Quiet(100), 'above zero again by ten: ten octets');
+  p.Put(Fr(FSettings, 0, 0, Sets([4, 1000])));
+  ok := p.NextOf(FData) and (Length(p.Payload) = 30) and (p.Flags = 1);
+  Check(ok, 'SETTINGS that raise the initial window open it');
+  p.Put(Ok200(3, ''));
+  c.Fin.Wait;
+  Finish(p);
+  { the connection's window: 65535 whatever the streams' are, in frames
+    of the peer's size }
+  p := Fresh(Sets([4, 1000000]), Defaults);
+  sent := Fill(100000);
+  c := Ask(p.Conn, 'POST', '/c', nil, sent, 0, 0);
+  ok := p.Head;
+  total := 0;
+  largest := 0;
+  body := '';
+  while ok and (total < 65535) do
+  begin
+    ok := p.Next(LongMs) and (p.Typ = FData) and (p.Flags = 0);
+    total := total + Length(p.Payload);
+    if Length(p.Payload) > largest then
+      largest := Length(p.Payload);
+    body := body + p.Payload;
+  end;
+  Check(ok and (total = 65535) and (largest = 16384) and p.Quiet(100), 'the connection''s window: 65535 octets in frames of 16384');
+  { a larger frame size, and the window of the connection opened }
+  p.Put(Fr(FSettings, 0, 0, Sets([5, 32768])) + Fr(FWindow, 0, 0, B32(1000000)));
+  largest := 0;
+  while ok and (total < 100000) do
+  begin
+    ok := p.NextOf(FData);
+    total := total + Length(p.Payload);
+    if Length(p.Payload) > largest then
+      largest := Length(p.Payload);
+    body := body + p.Payload;
+  end;
+  Check(ok and (body = sent) and ((p.Flags and 1) <> 0) and (largest > 16384) and (largest <= 32768),
+    'the rest in frames of the new size: ' + IntToStr(largest));
+  p.Put(Ok200(1, ''));
+  c.Fin.Wait;
+  Check(c.Ok, 'its response: ' + c.Err);
+  { content received: the stream's window is given back when half of
+    it is used up, in one update, and nothing is asked of the
+    connection's, of which a 512th is used }
+  c := Ask(p.Conn, 'GET', '/down', nil, '', 0, 0);
+  ok := p.Request(f, body);
+  s := Fill(16384);
+  p.Put(Fr(FHeaders, 4, 3, Lit(':status', '200')));
+  for i := 1 to 127 do
+    p.Put(Fr(FData, 0, 3, s));
+  Check(ok and p.Quiet(100), 'no update before half the window');
+  p.Put(Fr(FData, 0, 3, s));
+  Check(p.Next(LongMs) and (p.Typ = FWindow) and (p.Id = 3) and (U32(p.Payload, 1) = 2097152) and p.Quiet(50),
+    'half the window given back at once, to the stream alone');
+  p.Put(Fr(FData, 1, 3, 'end'));
+  c.Fin.Wait;
+  Check(c.Ok and (Length(c.Resp.Body) = 2097155) and (Copy(c.Resp.Body, 2097153 - 16384, 16384) = s) and
+    (Copy(c.Resp.Body, 2097153, 3) = 'end'), 'two MiB of content: ' + c.Err);
+  { a response whole before the request's content has gone ends the
+    request too (8.1): RST_STREAM NO_ERROR for what is not sent }
+  Finish(p);
+  p := Fresh(Sets([4, 10]), Defaults);
+  c := Ask(p.Conn, 'POST', '/early', nil, Fill(100), 0, 0);
+  ok := p.Head and p.Next(LongMs) and (p.Typ = FData);
+  p.Put(Fr(FHeaders, 5, 1, Lit(':status', '413')));
+  c.Fin.Wait;
+  Check(ok and c.Ok and (c.Resp.Status = 413), 'a response before the content had gone: ' + c.Err);
+  Check(p.NextOf(FRst) and (p.Id = 1) and (U32(p.Payload, 1) = 0), 'RST_STREAM NO_ERROR for the rest');
+  { the windows of streams that ended are still the peer's to open, and
+    late frames of theirs are let by, the connection's window given back }
+  p.Put(Fr(FWindow, 0, 1, B32(5)) + Fr(FData, 0, 1, 'late') + Fr(FHeaders, 5, 1, Lit('x-late', '1')) + Fr(FRst, 0, 1, B32(8)));
+  c := Ask(p.Conn, 'GET', '/after', nil, '', 0, 0);
+  ok := p.Request(f, body);
+  p.Put(Ok200(3, 'fine'));
+  c.Fin.Wait;
+  Check(ok and c.Ok and (c.Resp.Body = 'fine') and p.Conn.Alive, 'late frames of a closed stream are let by: ' + c.Err);
+  Finish(p);
+  { content of several frames with the windows open: every frame after
+    the first is written from where the content is, the last of them
+    too when it is a whole frame, and each ends the stream once }
+  p := Fresh(Sets([4, 1048576]), Defaults);
+  p.Put(Fr(FWindow, 0, 0, B32(1048576)));
+  ok := p.Sync;
+  for i := 1 to 2 do
+  begin
+    if i = 1 then
+      sent := Fill(81920)
+    else
+      sent := Fill(100000);
+    c := Ask(p.Conn, 'POST', '/whole', nil, sent, 0, 0);
+    ok := ok and p.Request(f, body) and (body = sent) and (p.Id = 2 * i - 1);
+    p.Put(Ok200(p.Id, ''));
+    c.Fin.Wait;
+    ok := ok and c.Ok;
+  end;
+  Check(ok, 'content of five whole frames, and of six and a part');
+  Finish(p);
+  { the size of a frame of content: a request that is alone on its
+    connection sends frames as large as the peer takes, 512 KiB at most;
+    with another request on its way the frames are 64 KiB at most, so
+    that others get in between }
+  p := Fresh(Sets([4, 4194304, 5, 1048576]), Defaults);
+  p.Put(Fr(FWindow, 0, 0, B32(4194304)));
+  ok := p.Sync;
+  sent := Fill(1048581);
+  c := Ask(p.Conn, 'POST', '/alone', nil, sent, 0, 0);
+  ok := ok and p.Head;
+  body := '';
+  n := 0;
+  largest := 0;
+  while ok and ((p.Typ <> FData) or ((p.Flags and 1) = 0)) do
+  begin
+    ok := p.Next(LongMs) and (p.Typ = FData) and (p.Id = 1);
+    body := body + p.Payload;
+    Inc(n);
+    if Length(p.Payload) > largest then
+      largest := Length(p.Payload);
+  end;
+  p.Put(Ok200(1, ''));
+  c.Fin.Wait;
+  Check(ok and c.Ok and (body = sent) and (n = 3) and (largest = 524288), 'alone: a mebibyte in two frames of 512 KiB and the rest: ' +
+    IntToStr(n) + ' frames, the largest ' + IntToStr(largest));
+  c := Ask(p.Conn, 'GET', '/held', nil, '', 0, 0);
+  ok := p.Request(f, body) and (p.Id = 3);
+  sent := Fill(300000);
+  calls := nil;
+  SetLength(calls, 1);
+  calls[0] := Ask(p.Conn, 'POST', '/beside', nil, sent, 0, 0);
+  ok := ok and p.Head and (p.Id = 5);
+  body := '';
+  largest := 0;
+  while ok and ((p.Typ <> FData) or ((p.Flags and 1) = 0)) do
+  begin
+    ok := p.Next(LongMs) and (p.Typ = FData) and (p.Id = 5);
+    body := body + p.Payload;
+    if Length(p.Payload) > largest then
+      largest := Length(p.Payload);
+  end;
+  p.Put(Ok200(5, '') + Ok200(3, ''));
+  c.Fin.Wait;
+  calls[0].Fin.Wait;
+  Check(ok and c.Ok and calls[0].Ok and (body = sent) and (largest = 65536), 'beside another request: frames of 64 KiB: ' +
+    IntToStr(largest));
+  Finish(p);
+  { many streams share the connection's window: twenty requests from
+    twenty routines, their frames mixed, each whole at the peer }
+  p := Fresh(Sets([4, 1000000]), Defaults);
+  SetLength(calls, 20);
+  SetLength(bodies, 20);
+  for i := 0 to 19 do
+    calls[i] := Ask(p.Conn, 'POST', '/many', nil, 'k=' + IntToStr(10 + i) + ';' + Fill(20000 + i), 0, 0);
+  n := 0;
+  ok := True;
+  while ok and (n < 20) do
+  begin
+    ok := p.Next(LongMs);
+    if ok and (p.Typ = FData) then
+    begin
+      i := (p.Id - 1) div 2;
+      ok := (i >= 0) and (i < 20);
+      if not ok then
+        Break;
+      bodies[i] := bodies[i] + p.Payload;
+      if Length(p.Payload) > 0 then
+        p.Put(Fr(FWindow, 0, 0, B32(Length(p.Payload))));
+      if (p.Flags and 1) <> 0 then
+      begin
+        Inc(n);
+        p.Put(Ok200(p.Id, Copy(bodies[i], 1, 4)));
+      end;
+    end;
+  end;
+  for i := 0 to 19 do
+  begin
+    calls[i].Fin.Wait;
+    ok := ok and calls[i].Ok and (calls[i].Resp.Body = Copy(calls[i].Body, 1, 4));
+  end;
+  for i := 0 to 19 do
+  begin
+    { which request got which stream is the routines' race: each
+      content is found whole on one stream }
+    n := StrToIntDef(Copy(bodies[i], 3, 2), 0) - 10;
+    ok := ok and (n >= 0) and (n < 20) and (bodies[i] = calls[n].Body);
+  end;
+  Check(ok and (p.Conn.Streams = 0), 'twenty requests through one window of 65535');
+  Finish(p);
+  Group('flow control');
+end;
+
+{ ---- the turn to write ---- }
+
+{ While one routine's write waits for the peer, what the others post is
+  left for it: the peer gets every frame whole, a field block's frames
+  with nothing in between (RFC 9113 4.3, 6.10) and the streams in the
+  order of their numbers (5.1.1), however many routines send at once }
+procedure Turns;
+var
+  p: TPeer;
+  first: TCall;
+  calls: TCalls;
+  f, h: THpackFields;
+  block, body, big, e: string;
+  i, k, n, due, heads, t0: Integer;
+  ok, over: Boolean;
+  seen: array[0..7] of Boolean;
+  bodies, paths: array of string;
+  opt: THttp2Options;
+  r: THttp2Response;
+begin
+  tight := True;
+  p := Fresh(Sets([4, 1048576]), Defaults);
+  p.Put(Fr(FWindow, 0, 0, B32(1048576)));
+  ok := p.Sync;
+  { a field block of 600 KiB is more than the socket holds: its write
+    waits for the peer, which reads nothing yet }
+  SetLength(h, 1);
+  big := 'v' + Fill(600000) + 'v';
+  h[0] := Http2FieldOnce('x-big', big);
+  first := Ask(p.Conn, 'GET', '/first', h, '', 0, 0);
+  due := PasIoDeadline(LongMs);
+  while (p.Conn.Streams < 1) and (Nanotime < due) do
+    Sleep(1);
+  { eight more, each with 100 KiB of content and the windows open: what
+    they post waits its turn, and past 256 KiB of it they wait too }
+  SetLength(calls, 8);
+  for i := 0 to 7 do
+    calls[i] := Ask(p.Conn, 'POST', '/later/' + IntToStr(i), nil, IntToStr(i) + Fill(102400 + i), 0, 0);
+  while (p.Conn.Streams < 9) and (Nanotime < due) do
+    Sleep(1);
+  Sleep(50);
+  ok := ok and p.Next(LongMs) and (p.Typ = FHeaders) and (p.Id = 1) and ((p.Flags and 4) = 0);
+  block := p.Payload;
+  n := 0;
+  while ok and ((p.Flags and 4) = 0) do
+  begin
+    ok := p.Next(LongMs) and (p.Typ = FCont) and (p.Id = 1);
+    block := block + p.Payload;
+    Inc(n);
+  end;
+  f := nil;
+  ok := ok and HpackDecode(p.HDec, block, 1 shl 30, f, over, e) and (FieldOf(f, 'x-big') = big);
+  Check(ok and (n >= 30), 'a field block of ' + IntToStr(n + 1) + ' frames, whole, while eight requests wait their turn');
+  { the eight: their field blocks in the order of their streams, their
+    content in frames of any of them, each content whole on its stream }
+  SetLength(bodies, 8);
+  SetLength(paths, 8);
+  heads := 0;
+  n := 0;
+  while ok and (n < 8) do
+  begin
+    ok := p.Next(LongMs);
+    if not ok then
+      Break;
+    i := (p.Id - 3) div 2;
+    if (p.Typ = FHeaders) or (p.Typ = FData) then
+      ok := (p.Id >= 3) and (p.Id <= 17) and ((p.Id and 1) = 1);
+    if ok and (p.Typ = FHeaders) then
+    begin
+      f := nil;
+      ok := (p.Flags = 4) and (i = heads) and HpackDecode(p.HDec, p.Payload, 1 shl 30, f, over, e);
+      paths[i] := FieldOf(f, ':path');
+      Inc(heads);
+    end
+    else if ok and (p.Typ = FData) then
+    begin
+      bodies[i] := bodies[i] + p.Payload;
+      if (p.Flags and 1) <> 0 then
+        Inc(n);
+    end;
+  end;
+  for i := 0 to 7 do
+    seen[i] := False;
+  for i := 0 to 7 do
+    if ok and (Length(paths[i]) = 8) and (Copy(paths[i], 1, 7) = '/later/') and (paths[i][8] >= '0') and
+      (paths[i][8] <= '7') then
+    begin
+      k := Ord(paths[i][8]) - 48;
+      if bodies[i] = IntToStr(k) + Fill(102400 + k) then
+        seen[k] := True;
+    end;
+  n := 0;
+  for i := 0 to 7 do
+    if seen[i] then
+      Inc(n);
+  Check(ok and (heads = 8) and (n = 8), 'the eight after it, their streams in order and each content whole: ' + IntToStr(n));
+  for i := 0 to 8 do
+    p.Put(Ok200(2 * i + 1, ''));
+  first.Fin.Wait;
+  ok := first.Ok;
+  for i := 0 to 7 do
+  begin
+    calls[i].Fin.Wait;
+    ok := ok and calls[i].Ok;
+  end;
+  Check(ok, 'and all nine are answered');
+  Finish(p);
+  { A fault of the connection found while a routine's write waits for
+    the peer: the GOAWAY is left for that routine and goes after what it
+    was writing, whole, before the connection is cut }
+  p := Fresh('', Defaults);
+  first := Ask(p.Conn, 'GET', '/first', h, '', 0, 0);
+  due := PasIoDeadline(LongMs);
+  while (p.Conn.Streams < 1) and (Nanotime < due) do
+    Sleep(1);
+  p.Put(Fr(FPing, 0, 1, '12345678'));
+  ok := p.Next(LongMs) and (p.Typ = FHeaders) and (p.Id = 1);
+  n := 0;
+  while ok and ((p.Flags and 4) = 0) do
+  begin
+    ok := p.Next(LongMs) and (p.Typ = FCont) and (p.Id = 1);
+    Inc(n);
+  end;
+  Check(ok and (n >= 30) and p.Next(LongMs) and (p.Typ = FGoAway) and (U32(p.Payload, 5) = H2ProtocolError) and p.Gone,
+    'a fault while a write waits: the block whole, then GOAWAY, then the end');
+  first.Fin.Wait;
+  Check((not first.Ok) and (Pos('PING on a stream (PROTOCOL_ERROR)', first.Err) > 0), 'and the request''s reason: ' +
+    first.Err);
+  Finish(p);
+  { the same with a peer that takes nothing: the request does not wait
+    for the write to give up, half a minute on, but a second }
+  p := Fresh('', Defaults);
+  due := Nanotime;
+  first := Ask(p.Conn, 'GET', '/first', h, '', 0, 0);
+  while (p.Conn.Streams < 1) and (Nanotime < due + LongMs * 1000000) do
+    Sleep(1);
+  p.Put(Fr(FPing, 0, 1, '12345678'));
+  first.Fin.Wait;
+  n := (Nanotime - due) div 1000000;
+  Check((not first.Ok) and (Pos('PING on a stream (PROTOCOL_ERROR)', first.Err) > 0) and (n >= 900) and (n < 15000) and
+    (p.Conn.LastError = first.Err), 'a fault while a write waits and the peer takes nothing: ' + first.Err + ' after ' +
+    IntToStr(n) + ' ms');
+  SetLength(block, 65536);
+  repeat
+    n := PasIoRead(p.Fd, @block[1], 65536, PasIoDeadline(LongMs));
+  until n <= 0;
+  Check(n = 0, 'and the stream is shut');
+  Finish(p);
+  { A write the peer does not take: it fails when WriteTimeoutMs has
+    passed, and a second later, nothing having come from the peer to say
+    why, the connection ends for that reason and its stream is shut }
+  opt := Defaults;
+  opt.WriteTimeoutMs := 150;
+  p := Fresh('', opt);
+  t0 := Nanotime;
+  first := Ask(p.Conn, 'GET', '/first', h, '', 0, 0);
+  { from the moment the write fails the connection takes no request,
+    though it ends a second later }
+  due := PasIoDeadline(LongMs);
+  while p.Conn.Alive and (Nanotime < due) do
+    Sleep(2);
+  n := (Nanotime - t0) div 1000000;
+  ok := (not p.Conn.Request('GET', '/', nil, '', 0, 0, r, e)) and r.NotProcessed and
+    (e = 'http2: a write to the peer failed: it is gone, or took nothing for 150 ms');
+  Check(ok and (n >= 100) and (n < 900), 'a write fails: no more requests from then on (' + IntToStr(n) + ' ms): ' + e);
+  first.Fin.Wait;
+  Check((not first.Ok) and (first.Err = 'http2: a write to the peer failed: it is gone, or took nothing for 150 ms') and
+    (not p.Conn.Alive) and (p.Conn.LastError = first.Err), 'a write the peer does not take: ' + first.Err);
+  SetLength(block, 65536);
+  repeat
+    n := PasIoRead(p.Fd, @block[1], 65536, PasIoDeadline(LongMs));
+  until n <= 0;
+  Check(n = 0, 'and the stream is shut: the peer finds its end');
+  Finish(p);
+  { Six routines send 300 KiB each through a socket that takes 64: a
+    frame's write stops in its middle time after time, and no frame of
+    another routine goes inside it }
+  p := Fresh(Sets([4, 1048576]), Defaults);
+  SetLength(calls, 6);
+  for i := 0 to 5 do
+    calls[i] := Ask(p.Conn, 'POST', '/up', nil, IntToStr(i) + Fill(307200 + i), 0, 0);
+  SetLength(bodies, 0);
+  SetLength(bodies, 6);
+  n := 0;
+  ok := True;
+  while ok and (n < 6) do
+  begin
+    ok := p.Next(LongMs);
+    if ok and (p.Typ = FData) then
+    begin
+      i := (p.Id - 1) div 2;
+      ok := (i >= 0) and (i < 6) and ((p.Id and 1) = 1);
+      if not ok then
+        Break;
+      bodies[i] := bodies[i] + p.Payload;
+      if Length(p.Payload) > 0 then
+        p.Put(Fr(FWindow, 0, 0, B32(Length(p.Payload))));
+      if (p.Flags and 1) <> 0 then
+      begin
+        Inc(n);
+        p.Put(Ok200(p.Id, ''));
+      end;
+    end
+    else if ok then
+      ok := (p.Typ = FHeaders) and (p.Flags = 4) and HpackDecode(p.HDec, p.Payload, 1 shl 30, f, over, e);
+  end;
+  for i := 0 to 5 do
+  begin
+    calls[i].Fin.Wait;
+    ok := ok and calls[i].Ok;
+  end;
+  for i := 0 to 5 do
+  begin
+    k := -1;
+    if bodies[i] <> '' then
+      k := Ord(bodies[i][1]) - 48;
+    ok := ok and (k >= 0) and (k < 6) and (bodies[i] = calls[k].Body);
+  end;
+  Check(ok, 'six routines send 300 KiB each through a socket of 64: every frame whole');
+  Finish(p);
+  tight := False;
+  Group('the turn to write');
+end;
+
+{ ---- the table of deadlines ---- }
+
+var
+  kept: TPeer;
+  keptCall: TCall;
+  keptAt: Integer;
+  keptOk: Boolean;
+
+{ Three requests with deadlines, the first and the last answered at
+  once: the last took the first's place in the connection's table of
+  deadlines, and then left it. When those deadlines pass, three seconds
+  on, the connection must be answering as before: KeptEnd looks, at
+  the end of the program, and the request left open is answered then }
+procedure KeptBegin;
+var
+  a, c: TCall;
+  f: THpackFields;
+  body: string;
+begin
+  kept := Fresh('', Defaults);
+  keptAt := Nanotime;
+  a := Ask(kept.Conn, 'GET', '/a', nil, '', 3000, 0);
+  keptOk := kept.Request(f, body);
+  keptCall := Ask(kept.Conn, 'GET', '/b', nil, '', 8 * LongMs, 0);
+  keptOk := keptOk and kept.Request(f, body);
+  c := Ask(kept.Conn, 'GET', '/c', nil, '', 3000, 0);
+  keptOk := keptOk and kept.Request(f, body);
+  kept.Put(Ok200(1, 'a'));
+  a.Fin.Wait;
+  kept.Put(Ok200(5, 'c'));
+  c.Fin.Wait;
+  keptOk := keptOk and a.Ok and c.Ok and (kept.Conn.Streams = 1);
+end;
+
+procedure KeptEnd;
+var
+  left: Integer;
+begin
+  Check(keptOk, 'three requests with deadlines, the first and the last answered');
+  left := (keptAt + 3300 * 1000000 - Nanotime) div 1000000;
+  if left > 0 then
+    Sleep(left);
+  Check(kept.Sync and kept.Conn.Alive and (kept.Conn.Streams = 1), 'their deadlines pass and the connection answers as before');
+  kept.Put(Ok200(3, 'b'));
+  keptCall.Fin.Wait;
+  Check(keptCall.Ok and (keptCall.Resp.Body = 'b'), 'and so does the request that was left open: ' + keptCall.Err);
+  Finish(kept);
+  Group('a table of deadlines kept right');
+end;
+
+{ ---- what a peer does wrong, and what the client answers ---- }
+
+{ a request, then the peer sends Frames: the connection ends with
+  GOAWAY of Code, and the request fails for a reason with Part in it }
+procedure ConnCaseOf(const Name, Frames: string; Code: Integer; const Part: string; const Opt: THttp2Options);
+var
+  p: TPeer;
+  c: TCall;
+  f: THpackFields;
+  body: string;
+  found: Boolean;
+begin
+  p := Fresh('', Opt);
+  c := Ask(p.Conn, 'GET', '/x', nil, '', 0, 0);
+  if not p.Request(f, body) then
+    Check(False, Name + ': no request');
+  p.Put(Frames);
+  c.Fin.Wait;
+  Check((not c.Ok) and (Pos(Part, c.Err) > 0) and (Pos(Http2ErrorName(Code), c.Err) > 0) and (not c.Resp.NotProcessed) and
+    (not c.Resp.TimedOut), Name + ': the request''s reason: ' + c.Err);
+  { GOAWAY, and no stream reset on the way to it: the fault is the connection's }
+  found := False;
+  while p.Next(LongMs) do
+  begin
+    if p.Typ = FRst then
+      Break;
+    if p.Typ = FGoAway then
+    begin
+      found := (p.Id = 0) and (U32(p.Payload, 1) = 0) and (U32(p.Payload, 5) = Code);
+      Break;
+    end;
+  end;
+  Check(found, Name + ': GOAWAY ' + Http2ErrorName(Code));
+  Check(p.Gone, Name + ': the connection ends');
+  Check((not p.Conn.Alive) and (p.Conn.LastError = c.Err), Name + ': not alive, for the same reason');
+  Finish(p);
+end;
+
+procedure ConnCase(const Name, Frames: string; Code: Integer; const Part: string);
+begin
+  ConnCaseOf(Name, Frames, Code, Part, Defaults);
+end;
+
+{ a request, then the peer sends Frames: the request fails for a reason
+  with Part in it and the client resets the stream with Code (none is
+  sent for -1); the connection goes on, and a second request on it is
+  answered }
+procedure StreamCase(const Name, Frames: string; Code: Integer; const Part: string);
+var
+  p: TPeer;
+  c: TCall;
+  f: THpackFields;
+  body: string;
+  opt: THttp2Options;
+  gotRst, rstRight, gotReq, over: Boolean;
+begin
+  opt := Defaults;
+  opt.MaxHeaderBytes := 1000;
+  p := Fresh('', opt);
+  c := Ask(p.Conn, 'GET', '/x', nil, '', 0, 40);
+  if not p.Request(f, body) then
+    Check(False, Name + ': no request');
+  p.Put(Frames);
+  c.Fin.Wait;
+  Check((not c.Ok) and (Pos(Part, c.Err) > 0) and (not c.Resp.TimedOut), Name + ': the request''s reason: ' + c.Err);
+  c := Ask(p.Conn, 'GET', '/y', nil, '', 0, 0);
+  { the reset of the first stream and the next request come in either
+    order: one is the reading routine's to send, the other the caller's }
+  gotRst := Code < 0;
+  rstRight := True;
+  gotReq := False;
+  while (not gotRst) or not gotReq do
+  begin
+    if not p.Next(LongMs) then
+      Break;
+    if p.Typ = FRst then
+    begin
+      rstRight := rstRight and (not gotRst) and (p.Id = 1) and (U32(p.Payload, 1) = Code);
+      gotRst := True;
+    end
+    else if p.Typ = FHeaders then
+    begin
+      f := nil;
+      gotReq := (p.Flags = 5) and (p.Id = 3) and HpackDecode(p.HDec, p.Payload, 1 shl 30, f, over, body) and
+        (FieldOf(f, ':path') = '/y');
+      if not gotReq then
+        Break;
+    end;
+  end;
+  if Code >= 0 then
+    Check(gotRst and rstRight, Name + ': RST_STREAM ' + Http2ErrorName(Code));
+  Check(gotReq, Name + ': the next request');
+  p.Put(Ok200(3, 'after'));
+  c.Fin.Wait;
+  Check(c.Ok and (c.Resp.Body = 'after') and p.Conn.Alive, Name + ': the connection goes on: ' + c.Err);
+  p.Conn.Dispose;
+  Check(p.NextOf(FGoAway) and (U32(p.Payload, 5) = 0), Name + ': and ends in order');
+  p.Drop;
+end;
+
+procedure Faults;
+var
+  h200, s: string;
+  opt: THttp2Options;
+  i: Integer;
+begin
+  h200 := Lit(':status', '200');
+  { 5.4.1: errors of the connection }
+  ConnCase('DATA on stream 0', Fr(FData, 0, 0, 'x'), H2ProtocolError, 'DATA on stream 0');
+  ConnCase('HEADERS on stream 0', Fr(FHeaders, 4, 0, h200), H2ProtocolError, 'HEADERS on stream 0');
+  ConnCase('HEADERS on a stream never opened', Fr(FHeaders, 4, 99, h200), H2ProtocolError, 'never opened');
+  ConnCase('HEADERS on a stream of the server''s', Fr(FHeaders, 4, 2, h200), H2ProtocolError, 'never opened');
+  ConnCase('DATA on a stream never opened', Fr(FData, 0, 3, 'x'), H2ProtocolError, 'never opened');
+  ConnCase('HEADERS on the next stream', Fr(FHeaders, 4, 3, h200), H2ProtocolError, 'never opened');
+  ConnCase('RST_STREAM of the next stream', Fr(FRst, 0, 3, B32(0)), H2ProtocolError, 'never opened');
+  ConnCase('WINDOW_UPDATE of the next stream', Fr(FWindow, 0, 3, B32(1)), H2ProtocolError, 'never opened');
+  ConnCase('PRIORITY of four octets on the next stream', Fr(FPriority, 0, 3, B32(0)), H2FrameSizeError,
+    'PRIORITY that is not five');
+  ConnCase('DATA on a stream of the server''s', Fr(FData, 0, 2, 'x'), H2ProtocolError, 'never opened');
+  ConnCase('RST_STREAM of a stream of the server''s', Fr(FRst, 0, 2, B32(0)), H2ProtocolError, 'never opened');
+  ConnCase('WINDOW_UPDATE of a stream of the server''s', Fr(FWindow, 0, 2, B32(1)), H2ProtocolError, 'never opened');
+  ConnCase('PRIORITY of four octets on a stream of the server''s', Fr(FPriority, 0, 2, B32(0)), H2FrameSizeError,
+    'PRIORITY that is not five');
+  ConnCase('a frame past the largest', FrN(1048577, FData, 0, 1, ''), H2FrameSizeError, 'a frame of 1048577 octets');
+  { the nine octets of an HTTP/1.1 status line are a frame like any other
+    once the server has spoken HTTP/2: one of 4740180 octets }
+  ConnCase('a status line in the middle', 'HTTP/1.1 ', H2FrameSizeError, 'a frame of 4740180 octets');
+  ConnCase('CONTINUATION alone', Fr(FCont, 4, 1, h200), H2ProtocolError, 'no field block open');
+  ConnCase('a frame inside a field block', Fr(FHeaders, 0, 1, h200) + Fr(FData, 0, 1, 'x'), H2ProtocolError,
+    'in the middle of a field block');
+  ConnCase('PING inside a field block', Fr(FHeaders, 0, 1, h200) + Fr(FPing, 0, 0, '12345678'), H2ProtocolError,
+    'in the middle of a field block');
+  ConnCase('CONTINUATION of another stream', Fr(FHeaders, 0, 1, h200) + Fr(FCont, 4, 3, ''), H2ProtocolError,
+    'in the middle of a field block');
+  ConnCase('a field block that is not HPACK', Fr(FHeaders, 4, 1, #128), H2CompressionError, 'not HPACK');
+  ConnCase('a field block cut short', Fr(FHeaders, 4, 1, Copy(Lit('x-a', 'bcdef'), 1, 7)), H2CompressionError, 'not HPACK');
+  ConnCase('an index past the tables', Fr(FHeaders, 4, 1, #255#127), H2CompressionError, 'not HPACK');
+  ConnCase('PUSH_PROMISE', Fr(FPush, 4, 1, B32(2) + h200), H2ProtocolError, 'PUSH_PROMISE');
+  ConnCase('PING of seven octets', Fr(FPing, 0, 0, '1234567'), H2FrameSizeError, 'PING that is not eight octets');
+  ConnCase('PING on a stream', Fr(FPing, 0, 1, '12345678'), H2ProtocolError, 'PING on a stream');
+  ConnCase('SETTINGS on a stream', Fr(FSettings, 0, 1, ''), H2ProtocolError, 'SETTINGS on a stream');
+  ConnCase('SETTINGS of five octets', Fr(FSettings, 0, 0, '12345'), H2FrameSizeError, 'not a number of settings');
+  ConnCase('a SETTINGS acknowledgement with content', Fr(FSettings, 1, 0, Sets([3, 5])), H2FrameSizeError,
+    'acknowledgement with content');
+  ConnCase('a second SETTINGS acknowledgement', Fr(FSettings, 1, 0, ''), H2ProtocolError, 'nobody asked for');
+  ConnCase('server push turned on', Fr(FSettings, 0, 0, Sets([2, 1])), H2ProtocolError, 'server push');
+  ConnCase('a frame size below 16384', Fr(FSettings, 0, 0, Sets([5, 16383])), H2ProtocolError, 'out of its range');
+  ConnCase('a frame size above 2^24 - 1', Fr(FSettings, 0, 0, Sets([5, 16777216])), H2ProtocolError, 'out of its range');
+  ConnCase('an initial window above 2^31 - 1', Fr(FSettings, 0, 0, Sets([4, 2147483648])), H2FlowControlError,
+    'an initial window past');
+  ConnCase('an initial window that overflows a stream''s', Fr(FWindow, 0, 1, B32(2147400000)) +
+    Fr(FSettings, 0, 0, Sets([4, 1000000])), H2FlowControlError, 'takes a stream''s past');
+  ConnCase('RST_STREAM of three octets', Fr(FRst, 0, 1, '123'), H2FrameSizeError, 'RST_STREAM that is not four');
+  ConnCase('RST_STREAM on stream 0', Fr(FRst, 0, 0, B32(0)), H2ProtocolError, 'never opened');
+  ConnCase('RST_STREAM of a stream never opened', Fr(FRst, 0, 5, B32(0)), H2ProtocolError, 'never opened');
+  ConnCase('GOAWAY on a stream', Fr(FGoAway, 0, 1, B32(0) + B32(0)), H2ProtocolError, 'GOAWAY on a stream');
+  ConnCase('GOAWAY of seven octets', Fr(FGoAway, 0, 0, '1234567'), H2FrameSizeError, 'GOAWAY shorter');
+  ConnCase('WINDOW_UPDATE of three octets', Fr(FWindow, 0, 1, '123'), H2FrameSizeError, 'WINDOW_UPDATE that is not four');
+  ConnCase('WINDOW_UPDATE of a stream never opened', Fr(FWindow, 0, 7, B32(1)), H2ProtocolError, 'never opened');
+  ConnCase('a window update of nothing', Fr(FWindow, 0, 0, B32(0)), H2ProtocolError, 'update of nothing');
+  ConnCase('a connection window past 2^31 - 1', Fr(FWindow, 0, 0, B32(2147483647)), H2FlowControlError,
+    'a connection window past');
+  ConnCase('PRIORITY on stream 0', Fr(FPriority, 0, 0, B32(0) + #1), H2ProtocolError, 'PRIORITY on stream 0');
+  ConnCase('PRIORITY of four octets on a stream never opened', Fr(FPriority, 0, 9, B32(0)), H2FrameSizeError,
+    'PRIORITY that is not five');
+  ConnCase('padded DATA on stream 0', Fr(FData, 8, 0, #9'ab'), H2ProtocolError, 'DATA on stream 0');
+  ConnCase('padding longer than DATA', Fr(FData, 8, 1, #4'abc'), H2ProtocolError, 'padding longer');
+  ConnCase('padded DATA with nothing in it', Fr(FData, 8, 1, ''), H2FrameSizeError, 'no room for its padding');
+  ConnCase('padding longer than HEADERS', Fr(FHeaders, 12, 1, #200 + h200), H2ProtocolError, 'padding longer');
+  ConnCase('padded HEADERS with nothing in it', Fr(FHeaders, 12, 1, ''), H2FrameSizeError, 'no room for its padding');
+  ConnCase('HEADERS too short for its priority', Fr(FHeaders, 36, 1, '1234'), H2FrameSizeError, 'no room for its priority');
+  s := '';
+  for i := 1 to 300 do
+    s := s + Lit('x-field-' + IntToStr(i), Fill(100));
+  opt := Defaults;
+  opt.MaxHeaderBytes := 1000;
+  ConnCaseOf('a field block past twice the budget', Fr(FHeaders, 0, 1, Copy(s, 1, 1500)) + Fr(FCont, 0, 1, Copy(s, 1501, 501)),
+    H2EnhanceYourCalm, 'a field block of more than 2000 octets', opt);
+  ConnCaseOf('a HEADERS frame past twice the budget', Fr(FHeaders, 4, 1, Copy(s, 1, 2001)), H2EnhanceYourCalm,
+    'a field block of more than 2000 octets', opt);
+  Group('faults of the connection');
+end;
+
+{ the stream faults: each ends its request and no more (5.4.2) }
+procedure StreamFaults;
+var
+  p: TPeer;
+  c: TCall;
+  h200, s: string;
+  f: THpackFields;
+  body: string;
+  i: Integer;
+begin
+  h200 := Lit(':status', '200');
+  StreamCase('no :status', Fr(FHeaders, 5, 1, Lit('x-a', 'b')), H2ProtocolError, 'no :status field');
+  StreamCase('a status of two digits', Fr(FHeaders, 5, 1, Lit(':status', '20')), H2ProtocolError, 'not three digits');
+  StreamCase('a status of four digits', Fr(FHeaders, 5, 1, Lit(':status', '2000')), H2ProtocolError, 'not three digits');
+  StreamCase('a status of letters', Fr(FHeaders, 5, 1, Lit(':status', '2oo')), H2ProtocolError, 'not three digits');
+  StreamCase('a field name in upper case', Fr(FHeaders, 5, 1, h200 + Lit('X-A', 'b')), H2ProtocolError, 'not a token in lower case');
+  StreamCase('an empty field name', Fr(FHeaders, 5, 1, h200 + Lit('', 'b')), H2ProtocolError, 'not a token in lower case');
+  StreamCase('a field of an HTTP/1.1 connection', Fr(FHeaders, 5, 1, h200 + Lit('connection', 'close')), H2ProtocolError,
+    'the field connection, which belongs');
+  StreamCase('transfer-encoding', Fr(FHeaders, 5, 1, h200 + Lit('transfer-encoding', 'chunked')), H2ProtocolError,
+    'the field transfer-encoding');
+  StreamCase('a pseudo-header field after a field', Fr(FHeaders, 5, 1, Lit('x-a', 'b') + h200), H2ProtocolError,
+    'a pseudo-header field after a field');
+  StreamCase('a pseudo-header field of requests', Fr(FHeaders, 5, 1, h200 + Lit(':path', '/')), H2ProtocolError,
+    'a response does not have');
+  StreamCase('two :status fields', Fr(FHeaders, 5, 1, h200 + h200), H2ProtocolError, 'two :status fields');
+  StreamCase('a line feed in a value', Fr(FHeaders, 5, 1, h200 + Lit('x-a', 'b'#10'c')), H2ProtocolError, 'does not hold');
+  StreamCase('a NUL in a value', Fr(FHeaders, 5, 1, h200 + Lit('x-a', 'b'#0'c')), H2ProtocolError, 'does not hold');
+  StreamCase('a line feed at the end of a value', Fr(FHeaders, 5, 1, h200 + Lit('x-a', 'b'#10)), H2ProtocolError, 'does not hold');
+  StreamCase('a DEL at the end of a value', Fr(FHeaders, 5, 1, h200 + Lit('x-a', 'b'#127)), H2ProtocolError, 'does not hold');
+  StreamCase('a space before a value', Fr(FHeaders, 5, 1, h200 + Lit('x-a', ' b')), H2ProtocolError, 'a space at an end');
+  StreamCase('a tab after a value', Fr(FHeaders, 5, 1, h200 + Lit('x-a', 'b'#9)), H2ProtocolError, 'a space at an end');
+  StreamCase('less content than content-length', Fr(FHeaders, 4, 1, h200 + Lit('content-length', '5')) + Fr(FData, 1, 1, 'abc'),
+    H2ProtocolError, 'content of 3 octets and a content-length of 5');
+  StreamCase('no content and a content-length', Fr(FHeaders, 5, 1, h200 + Lit('content-length', '5')), H2ProtocolError,
+    'content of 0 octets and a content-length of 5');
+  StreamCase('more content than content-length', Fr(FHeaders, 4, 1, h200 + Lit('content-length', '2')) + Fr(FData, 0, 1, 'abcde'),
+    H2ProtocolError, 'more content than its content-length of 2');
+  StreamCase('two content-length fields that differ', Fr(FHeaders, 5, 1, h200 + Lit('content-length', '0') +
+    Lit('content-length', '1')), H2ProtocolError, 'two content-length fields that differ');
+  StreamCase('a content-length of letters', Fr(FHeaders, 5, 1, h200 + Lit('content-length', '1x')), H2ProtocolError, 'not a number');
+  StreamCase('an empty content-length', Fr(FHeaders, 5, 1, h200 + Lit('content-length', '')), H2ProtocolError, 'not a number');
+  StreamCase('a content-length of nineteen digits', Fr(FHeaders, 5, 1, h200 + Lit('content-length', '1000000000000000000')),
+    H2ProtocolError, 'not a number');
+  StreamCase('content before the header fields', Fr(FData, 1, 1, 'x'), H2ProtocolError, 'content before its header fields');
+  StreamCase('a second field block that ends nothing', Fr(FHeaders, 4, 1, h200) + Fr(FHeaders, 4, 1, Lit('x-t', '1')),
+    H2ProtocolError, 'a second field block that does not end it');
+  StreamCase('a pseudo-header field among the trailers', Fr(FHeaders, 4, 1, h200) + Fr(FHeaders, 5, 1, h200), H2ProtocolError,
+    'among the trailers');
+  StreamCase('an interim response that ends the stream', Fr(FHeaders, 5, 1, Lit(':status', '103')), H2ProtocolError,
+    'an interim response of status 103');
+  StreamCase('status 101', Fr(FHeaders, 4, 1, Lit(':status', '101')), H2ProtocolError, 'an interim response of status 101');
+  StreamCase('content past its budget', Fr(FHeaders, 4, 1, h200) + Fr(FData, 0, 1, Fill(41)), H2Cancel,
+    'content is past its budget of 40 octets');
+  StreamCase('content past its budget by what its content-length says', Fr(FHeaders, 4, 1, h200 + Lit('content-length', '41')),
+    H2Cancel, 'content is past its budget of 40 octets');
+  StreamCase('content past its budget in two frames', Fr(FHeaders, 4, 1, h200) + Fr(FData, 0, 1, Fill(40)) + Fr(FData, 0, 1, 'x'),
+    H2Cancel, 'content is past its budget of 40 octets');
+  s := h200;
+  for i := 1 to 12 do
+    s := s + Lit('x-f', Fill(100));
+  StreamCase('header fields past their budget', Fr(FHeaders, 5, 1, s), H2Cancel, 'header fields are past their budget of 1000 octets');
+  s := '';
+  for i := 1 to 7 do
+    s := s + Fr(FHeaders, 4, 1, Lit(':status', '103') + Lit('link', Fill(100)));
+  StreamCase('interim responses past the budget', s, H2Cancel, 'interim responses are past the budget of 1000 octets');
+  StreamCase('a window update of nothing', Fr(FWindow, 0, 1, B32(0)), H2ProtocolError, 'a window update of nothing');
+  StreamCase('a stream window past 2^31 - 1', Fr(FWindow, 0, 1, B32(2147483647)), H2FlowControlError, 'window past 2^31 - 1');
+  StreamCase('PRIORITY of six octets', Fr(FPriority, 0, 1, B32(0) + #1#2), H2FrameSizeError, 'PRIORITY that is not five octets');
+  StreamCase('reset by the server', Fr(FRst, 0, 1, B32(2)), -1, 'the server reset the stream (INTERNAL_ERROR)');
+  StreamCase('reset with a code nobody knows', Fr(FRst, 0, 1, B32(1000)), -1, 'the server reset the stream (error 1000)');
+  { what a failed request still says }
+  p := Fresh('', Defaults);
+  c := Ask(p.Conn, 'GET', '/x', nil, '', 0, 0);
+  p.Request(f, body);
+  p.Put(Fr(FRst, 0, 1, B32(7)));
+  c.Fin.Wait;
+  Check((not c.Ok) and c.Resp.NotProcessed and (c.Resp.ErrorCode = 7) and (not c.Resp.TimedOut) and (c.Resp.Status = 0),
+    'REFUSED_STREAM: not processed, and its code');
+  c := Ask(p.Conn, 'GET', '/x', nil, '', 0, 0);
+  p.Request(f, body);
+  p.Put(Fr(FHeaders, 4, 3, Lit(':status', '500') + Lit('x-why', 'broke')) + Fr(FData, 0, 3, 'half') + Fr(FRst, 0, 3, B32(2)));
+  c.Fin.Wait;
+  Check((not c.Ok) and (not c.Resp.NotProcessed) and (c.Resp.ErrorCode = 2) and (c.Resp.Status = 500) and
+    (FieldOf(c.Resp.Fields, 'x-why') = 'broke') and (c.Resp.Body = ''), 'a reset after the header fields: they are given');
+  { HEAD takes no content }
+  c := Ask(p.Conn, 'HEAD', '/x', nil, '', 0, 0);
+  p.Request(f, body);
+  p.Put(Fr(FHeaders, 4, 5, h200) + Fr(FData, 1, 5, 'x'));
+  c.Fin.Wait;
+  Check((not c.Ok) and (Pos('content in answer to HEAD', c.Err) > 0) and p.NextOf(FRst) and (p.Id = 5) and
+    (U32(p.Payload, 1) = H2ProtocolError), 'content in answer to HEAD');
+  { the same content-length said twice is one; a response to HEAD may
+    end with an empty DATA frame }
+  c := Ask(p.Conn, 'GET', '/x', nil, '', 0, 0);
+  p.Request(f, body);
+  p.Put(Fr(FHeaders, 4, 7, h200 + Lit('content-length', '3') + Lit('content-length', '3')) + Fr(FData, 1, 7, 'abc'));
+  c.Fin.Wait;
+  Check(c.Ok and (c.Resp.Body = 'abc'), 'content-length said twice alike: ' + c.Err);
+  c := Ask(p.Conn, 'HEAD', '/x', nil, '', 0, 0);
+  p.Request(f, body);
+  p.Put(Fr(FHeaders, 4, 9, h200 + Lit('content-length', '3')) + Fr(FData, 1, 9, ''));
+  c.Fin.Wait;
+  Check(c.Ok, 'HEAD ended by an empty DATA frame: ' + c.Err);
+  { a budget of its own: exactly the budget is taken }
+  c := Ask(p.Conn, 'GET', '/x', nil, '', 0, 5);
+  p.Request(f, body);
+  p.Put(Ok200(11, 'abcde'));
+  c.Fin.Wait;
+  Check(c.Ok and (c.Resp.Body = 'abcde'), 'content of exactly its budget: ' + c.Err);
+  Finish(p);
+  Group('faults of a stream');
+end;
+
+{ before any request: what the peer says first }
+procedure PrefaceCase(const Name, Bytes: string; Code: Integer; const Part: string);
+var
+  p: TPeer;
+  s, e: string;
+  r: THttp2Response;
+begin
+  p := Pair(Defaults);
+  if (not p.Take(24, LongMs, s)) or (not p.Next(LongMs)) or (not p.Next(LongMs)) then
+    Check(False, Name + ': no preface');
+  if Bytes = '' then
+    TcpShutdown(p.Fd, 1)
+  else
+    p.Put(Bytes);
+  if Code >= 0 then
+    Check(p.NextOf(FGoAway) and (U32(p.Payload, 5) = Code), Name + ': GOAWAY ' + Http2ErrorName(Code));
+  Check(p.Gone, Name + ': the connection ends');
+  Check((not p.Conn.Request('GET', '/', nil, '', 0, 0, r, e)) and r.NotProcessed and (Pos(Part, e) > 0) and
+    (not p.Conn.Alive) and (p.Conn.LastError = e), Name + ': a request then: ' + e);
+  Finish(p);
+end;
+
+procedure Ends;
+var
+  p: TPeer;
+  c, c2, c3: TCall;
+  calls: TCalls;
+  f: THpackFields;
+  body, e: string;
+  r: THttp2Response;
+  opt: THttp2Options;
+  i, n: Integer;
+  ok: Boolean;
+begin
+  PrefaceCase('PING before SETTINGS', Fr(FPing, 0, 0, '12345678'), H2ProtocolError, 'did not begin with SETTINGS');
+  PrefaceCase('an acknowledgement before SETTINGS', Fr(FSettings, 1, 0, ''), H2ProtocolError, 'did not begin with SETTINGS');
+  PrefaceCase('an answer in HTTP/1.1', 'HTTP/1.1 400 Bad Request'#13#10'Connection: close'#13#10#13#10, H2ProtocolError,
+    'answered in HTTP/1');
+  PrefaceCase('the end of the stream', '', -1, 'the server closed the connection');
+  { GOAWAY (6.8): the stream above the one it names was not taken and
+    can be sent again; the one below goes on, and the connection ends
+    with it }
+  p := Fresh('', Defaults);
+  c := Ask(p.Conn, 'GET', '/one', nil, '', 0, 0);
+  ok := p.Request(f, body);
+  c3 := Ask(p.Conn, 'GET', '/two', nil, '', 0, 0);
+  ok := ok and p.Request(f, body);
+  p.Put(Fr(FGoAway, 0, 0, B32(1) + B32(0) + 'bye'#1));
+  c3.Fin.Wait;
+  Check(ok and (not c3.Ok) and c3.Resp.NotProcessed and (c3.Resp.ErrorCode = 0) and
+    (c3.Err = 'http2: the server is going away (NO_ERROR): bye., before it took the request'), 'GOAWAY: the stream it did not take: ' +
+    c3.Err);
+  Check((not p.Conn.Alive) and (p.Conn.GoAwayData = 'bye'#1) and (p.Conn.LastError = '') and (p.Conn.Streams = 1),
+    'going away: no more requests, one still open');
+  Check((not p.Conn.Request('GET', '/', nil, '', 0, 0, r, e)) and r.NotProcessed and
+    (e = 'http2: the server is going away (NO_ERROR): bye.'), 'a request to a connection that is going away: ' + e);
+  p.Put(Ok200(1, 'done'));
+  c.Fin.Wait;
+  Check(c.Ok and (c.Resp.Body = 'done'), 'the stream it took ends well: ' + c.Err);
+  Check(p.Gone and (Pos('going away', p.Conn.LastError) > 0), 'the connection ends with its last stream');
+  Finish(p);
+  { a second GOAWAY lowers the stream; the first error is the one kept }
+  p := Fresh('', Defaults);
+  c := Ask(p.Conn, 'GET', '/one', nil, '', 0, 0);
+  ok := p.Request(f, body);
+  c3 := Ask(p.Conn, 'GET', '/two', nil, '', 0, 0);
+  ok := ok and p.Request(f, body);
+  p.Put(Fr(FGoAway, 0, 0, B32(2147483647) + B32(11)));
+  Check(ok and p.Sync and p.Quiet(100) and (p.Conn.Streams = 2) and not p.Conn.Alive, 'GOAWAY that takes every stream');
+  p.Put(Fr(FGoAway, 0, 0, B32(1) + B32(0) + 'second'));
+  c3.Fin.Wait;
+  Check((not c3.Ok) and c3.Resp.NotProcessed and (c3.Resp.ErrorCode = 11) and (Pos('ENHANCE_YOUR_CALM', c3.Err) > 0),
+    'a second GOAWAY lowers the stream: ' + c3.Err);
+  { the peer goes without answering the stream it took }
+  p.Drop;
+  c.Fin.Wait;
+  Check((not c.Ok) and (not c.Resp.NotProcessed) and (Pos('going away (ENHANCE_YOUR_CALM)', c.Err) > 0),
+    'the end of the stream after GOAWAY: ' + c.Err);
+  Finish(p);
+  { GOAWAY with nothing open ends the connection at once; so does one
+    that takes none of the streams, with its reason (as APNs says one) }
+  p := Fresh('', Defaults);
+  p.Put(Fr(FGoAway, 0, 0, B32(0) + B32(0)));
+  Check(p.Gone and not p.Conn.Alive, 'GOAWAY with nothing open');
+  Finish(p);
+  p := Fresh('', Defaults);
+  c := Ask(p.Conn, 'POST', '/3/device/x', nil, '{}', 0, 0);
+  ok := p.Request(f, body);
+  p.Put(Fr(FGoAway, 0, 0, B32(0) + B32(0) + '{"reason":"BadCertificateEnvironment"}'));
+  c.Fin.Wait;
+  Check(ok and (not c.Ok) and c.Resp.NotProcessed and (Pos('{"reason":"BadCertificateEnvironment"}', c.Err) > 0) and p.Gone and
+    (p.Conn.GoAwayData = '{"reason":"BadCertificateEnvironment"}'), 'GOAWAY with its reason: ' + c.Err);
+  Finish(p);
+  { what the reason shows of data that is no text: a dot for each octet
+    below the space and from DEL up, the first 200 of it; GoAwayData
+    keeps the first 1024 as they came }
+  p := Fresh('', Defaults);
+  c := Ask(p.Conn, 'GET', '/x', nil, '', 0, 0);
+  ok := p.Request(f, body);
+  e := ' ~'#127#31#128 + Fill(2000);
+  p.Put(Fr(FGoAway, 0, 0, B32(0) + B32(2) + e));
+  c.Fin.Wait;
+  Check(ok and (not c.Ok) and (c.Resp.ErrorCode = 2) and
+    (c.Err = 'http2: the server is going away (INTERNAL_ERROR):  ~...' + Copy(Fill(2000), 1, 195) + ', before it took the request') and
+    (p.Conn.GoAwayData = Copy(e, 1, 1024)), 'GOAWAY whose reason is long and not all text: ' + c.Err);
+  Finish(p);
+  { the peer is gone in the middle of a request }
+  p := Fresh('', Defaults);
+  c := Ask(p.Conn, 'GET', '/x', nil, '', 0, 0);
+  ok := p.Request(f, body);
+  p.Put(Fr(FHeaders, 4, 1, Lit(':status', '200')));
+  p.Drop;
+  c.Fin.Wait;
+  Check(ok and (not c.Ok) and (not c.Resp.NotProcessed) and (c.Resp.Status = 200) and (c.Resp.ErrorCode = -1) and
+    (c.Err = 'http2: the server closed the connection') and not p.Conn.Alive, 'the peer gone in the middle: ' + c.Err);
+  Finish(p);
+  { the peer closes with the request unread: a reset, and the reading's
+    own error is the reason }
+  p := Fresh('', Defaults);
+  c := Ask(p.Conn, 'GET', '/unread', nil, '', 0, 0);
+  SetLength(e, 1);
+  i := PasIoRead(p.Fd, @e[1], 1, PasIoDeadline(LongMs));
+  p.Drop;
+  c.Fin.Wait;
+  Check((i = 1) and (not c.Ok) and (c.Err = 'http2: reading from the server failed: error 104') and
+    (c.Resp.ErrorCode = -1) and not p.Conn.Alive, 'a reset: ' + c.Err);
+  Finish(p);
+  { ...in the middle of a frame: of content that is read into its place,
+    of another frame's payload, of a frame's nine octets }
+  for i := 1 to 3 do
+  begin
+    p := Fresh('', Defaults);
+    c := Ask(p.Conn, 'GET', '/x', nil, '', 0, 0);
+    ok := p.Request(f, body);
+    e := Fr(FHeaders, 4, 1, Lit(':status', '200'));
+    if i = 1 then
+      e := e + Copy(Fr(FData, 1, 1, Fill(1000)), 1, 9 + 10)
+    else if i = 2 then
+      e := e + Copy(Fr(FHeaders, 5, 1, Lit('x-trailer', Fill(100))), 1, 9 + 10)
+    else
+      e := e + Copy(Fr(FData, 1, 1, 'whole'), 1, 4);
+    p.Put(e);
+    TcpShutdown(p.Fd, 1);
+    c.Fin.Wait;
+    Check(ok and (not c.Ok) and (c.Resp.Status = 200) and (c.Resp.Body = '') and
+      (c.Err = 'http2: the server closed the connection') and p.Gone, 'the peer gone in the middle of a frame, ' + IntToStr(i) +
+      ': ' + c.Err);
+    Finish(p);
+  end;
+  { ...and before a request's content is all written }
+  p := Fresh(Sets([4, 4000000]), Defaults);
+  p.Put(Fr(FWindow, 0, 0, B32(4000000)));
+  p.Drop;
+  c := Ask(p.Conn, 'POST', '/x', nil, Fill(3000000), 0, 0);
+  c.Fin.Wait;
+  Check((not c.Ok) and not p.Conn.Alive, 'the peer gone while content is written: ' + c.Err);
+  Finish(p);
+  Group('GOAWAY and the end of a connection');
+
+  { a deadline: the request fails at it, the peer is told, and since
+    nothing came from the peer after the request went, a PING asks
+    whether it is there, the request's place kept until it answers }
+  opt := Defaults;
+  opt.PingTimeoutMs := 60000;
+  p := Fresh(Sets([3, 1]), opt);
+  c := Ask(p.Conn, 'GET', '/slow', nil, '', 80, 0);
+  ok := p.Request(f, body);
+  c.Fin.Wait;
+  Check(ok and (not c.Ok) and c.Resp.TimedOut and (not c.Resp.NotProcessed) and (c.Err = 'http2: no response within 80 ms') and
+    (c.Resp.ErrorCode = -1), 'a deadline: ' + c.Err);
+  Check(p.Next(LongMs) and (p.Typ = FRst) and (p.Id = 1) and (U32(p.Payload, 1) = H2Cancel), 'RST_STREAM CANCEL at the deadline');
+  ok := p.Next(LongMs) and (p.Typ = FPing) and (p.Flags = 0);
+  e := p.Payload;
+  c2 := Ask(p.Conn, 'GET', '/next', nil, '', 0, 0);
+  Check(ok and p.Quiet(150) and (p.Conn.Streams = 0), 'a PING, and the place kept while the peer is silent');
+  p.Put(Fr(FPing, 1, 0, e));
+  Check(p.Request(f, body) and (p.Id = 3), 'the next request goes when the peer answers');
+  { a late answer to the request that was given up is let by }
+  p.Put(Ok200(1, 'late') + Ok200(3, 'in time'));
+  c2.Fin.Wait;
+  Check(c2.Ok and (c2.Resp.Body = 'in time') and p.Conn.Alive, 'and is answered: ' + c2.Err);
+  { when frames came since the request went the peer is there: no PING }
+  c := Ask(p.Conn, 'GET', '/half', nil, '', 600, 0);
+  ok := p.Request(f, body);
+  p.Put(Fr(FHeaders, 4, 5, Lit(':status', '200')) + Fr(FData, 0, 5, 'some'));
+  c.Fin.Wait;
+  Check(ok and (not c.Ok) and c.Resp.TimedOut and (c.Resp.Status = 200) and (c.Resp.Body = ''), 'a deadline in the middle of a response');
+  Check(p.Next(LongMs) and (p.Typ = FRst) and (p.Id = 5) and p.Quiet(100), 'RST_STREAM and no PING');
+  { a deadline while waiting for a place: the request never leaves }
+  c := Ask(p.Conn, 'GET', '/holds', nil, '', 0, 0);
+  ok := p.Request(f, body);
+  c2 := Ask(p.Conn, 'GET', '/waits', nil, '', 80, 0);
+  c2.Fin.Wait;
+  Check(ok and (not c2.Ok) and c2.Resp.TimedOut and c2.Resp.NotProcessed and (c2.Err = 'http2: no response within 80 ms') and
+    p.Quiet(100), 'a deadline while waiting for a place: nothing was written: ' + c2.Err);
+  p.Put(Ok200(7, 'held'));
+  c.Fin.Wait;
+  Check(c.Ok, 'the request that held the place: ' + c.Err);
+  { a deadline while the window is shut }
+  p.Put(Fr(FSettings, 0, 0, Sets([4, 10])));
+  ok := p.NextOf(FSettings);
+  c := Ask(p.Conn, 'POST', '/shut', nil, Fill(100), 80, 0);
+  ok := ok and p.Head and p.Next(LongMs) and (p.Typ = FData) and (Length(p.Payload) = 10);
+  c.Fin.Wait;
+  Check(ok and (not c.Ok) and c.Resp.TimedOut and p.NextOf(FRst) and (p.Id = 9) and (U32(p.Payload, 1) = H2Cancel),
+    'a deadline while the window is shut');
+  Finish(p);
+  { a peer that does not answer the PING is lost, and so is the connection }
+  opt.PingTimeoutMs := 120;
+  p := Fresh(Sets([3, 1]), opt);
+  c := Ask(p.Conn, 'GET', '/slow', nil, '', 50, 0);
+  ok := p.Request(f, body);
+  c.Fin.Wait;
+  c2 := Ask(p.Conn, 'GET', '/next', nil, '', 0, 0);
+  c2.Fin.Wait;
+  Check(ok and (not c2.Ok) and c2.Resp.NotProcessed and
+    (c2.Err = 'http2: the peer did not answer a PING within 120 ms: the connection is lost') and
+    (p.Conn.LastError = c2.Err) and not p.Conn.Alive, 'a peer that does not answer is lost: ' + c2.Err);
+  Check(p.Gone, 'and the connection ends');
+  Finish(p);
+  { ReadIdleMs: a PING whenever nothing came for that long }
+  opt := Defaults;
+  opt.ReadIdleMs := 60;
+  opt.PingTimeoutMs := 60000;
+  p := Fresh('', opt);
+  ok := p.Next(LongMs) and (p.Typ = FPing) and (p.Flags = 0);
+  e := p.Payload;
+  Check(ok and p.Quiet(150), 'idle: one PING, and no other before its answer');
+  p.Put(Fr(FPing, 1, 0, e));
+  ok := p.Next(LongMs) and (p.Typ = FPing) and (p.Flags = 0) and (p.Payload <> e);
+  Check(ok and p.Conn.Alive, 'idle again: another');
+  Finish(p);
+  opt.PingTimeoutMs := 100;
+  p := Fresh('', opt);
+  Check(p.NextOf(FPing) and p.Gone and (Pos('did not answer a PING within 100 ms', p.Conn.LastError) > 0),
+    'idle and no answer: lost');
+  Finish(p);
+  { and not before its time: a second of silence, and none in the first fifth of it }
+  opt := Defaults;
+  opt.ReadIdleMs := 1000;
+  p := Fresh('', opt);
+  Check(p.Quiet(200), 'idle for a second: no PING in its first fifth');
+  Check(p.Next(LongMs) and (p.Typ = FPing) and (p.Flags = 0), 'and one when it has passed');
+  Finish(p);
+  { Ping, answered: with a deadline and without one }
+  p := Fresh('', Defaults);
+  c := Ask(p.Conn, 'PING', '', nil, '', 20000, 0);
+  ok := p.NextOf(FPing);
+  p.Put(Fr(FPing, 1, 0, p.Payload));
+  c.Fin.Wait;
+  Check(ok and c.Ok, 'a Ping answered');
+  c := Ask(p.Conn, 'PING', '', nil, '', 0, 0);
+  ok := p.NextOf(FPing);
+  e := p.Payload;
+  ok := ok and p.Sync;
+  p.Put(Fr(FPing, 1, 0, e));
+  c.Fin.Wait;
+  Check(ok and c.Ok, 'a Ping without a deadline answered');
+  Finish(p);
+  { Pings on their way when the connection ends: each comes back unanswered }
+  p := Fresh('', Defaults);
+  c := Ask(p.Conn, 'PING', '', nil, '', 0, 0);
+  c2 := Ask(p.Conn, 'PING', '', nil, '', 20000, 0);
+  ok := p.NextOf(FPing) and p.NextOf(FPing);
+  p.Drop;
+  c.Fin.Wait;
+  c2.Fin.Wait;
+  Check(ok and (not c.Ok) and (not c2.Ok) and not p.Conn.Alive, 'two Pings and the end of the connection');
+  Finish(p);
+  p := Fresh('', Defaults);
+  c := Ask(p.Conn, 'PING', '', nil, '', 0, 0);
+  ok := p.NextOf(FPing);
+  p.Put(Fr(FPing, 0, 0, '12345678') + Fr(FPing, 0, 1, '12345678'));
+  c.Fin.Wait;
+  Check(ok and (not c.Ok) and p.NextOf(FGoAway) and (U32(p.Payload, 5) = H2ProtocolError),
+    'one Ping and a fault of the connection');
+  Finish(p);
+  Group('deadlines and pings');
+
+  { 5.1.2: no more streams at once than the peer lets be }
+  p := Fresh(Sets([3, 2]), Defaults);
+  SetLength(calls, 5);
+  for i := 0 to 4 do
+    calls[i] := Ask(p.Conn, 'GET', '/slot', nil, '', 0, 0);
+  ok := p.Request(f, body) and p.Request(f, body);
+  Check(ok and p.Quiet(100) and (p.Conn.Streams = 2) and (p.Conn.PeerMaxStreams = 2), 'two streams of five, three wait');
+  n := 0;
+  for i := 0 to 4 do
+  begin
+    p.Put(Ok200(2 * i + 1, 'slot'));
+    if i < 3 then
+      if p.Request(f, body) and (p.Id = 2 * i + 5) then
+        Inc(n);
+  end;
+  for i := 0 to 4 do
+  begin
+    calls[i].Fin.Wait;
+    ok := ok and calls[i].Ok;
+  end;
+  Check(ok and (n = 3), 'each goes as a place frees');
+  { the limit moves: to none, and back }
+  p.Put(Fr(FSettings, 0, 0, Sets([3, 0])));
+  ok := p.NextOf(FSettings);
+  c := Ask(p.Conn, 'GET', '/none', nil, '', 0, 0);
+  Check(ok and p.Quiet(100), 'no streams let be: the request waits');
+  p.Put(Fr(FSettings, 0, 0, Sets([3, 1])));
+  ok := p.Request(f, body);
+  p.Put(Ok200(p.Id, ''));
+  c.Fin.Wait;
+  Check(ok and c.Ok, 'and goes when one is');
+  { Dispose with one request on its way and one waiting }
+  c := Ask(p.Conn, 'GET', '/on-its-way', nil, '', 0, 0);
+  ok := p.Request(f, body);
+  c2 := Ask(p.Conn, 'GET', '/waiting', nil, '', 0, 0);
+  ok := ok and p.Quiet(50);
+  p.Conn.Dispose;
+  c.Fin.Wait;
+  c2.Fin.Wait;
+  Check(ok and (not c.Ok) and (not c.Resp.NotProcessed) and (Pos('disposed', c.Err) > 0) and (not c2.Ok) and
+    c2.Resp.NotProcessed, 'Dispose: the request on its way fails, the one waiting did not leave');
+  Check(p.NextOf(FGoAway) and p.Gone, 'GOAWAY and the end');
+  p.Drop;
+  Group('the places among the streams');
+end;
+
+{ ---- builds of the unit with other constants (scripts/check_http2_variants.py) ---- }
+
+{ FNextId begins at 2^31 - 3: the connection has two stream numbers left }
+procedure Numbers;
+var
+  p: TPeer;
+  c, c2: TCall;
+  f: THpackFields;
+  body, e: string;
+  r: THttp2Response;
+  ok: Boolean;
+begin
+  p := Fresh('', Defaults);
+  c := Ask(p.Conn, 'GET', '/a', nil, '', 0, 0);
+  ok := p.Request(f, body) and (p.Id = 2147483645);
+  Check(ok and p.Conn.Alive, 'the last stream number but one');
+  c2 := Ask(p.Conn, 'GET', '/b', nil, '', 0, 0);
+  ok := p.Request(f, body) and (p.Id = 2147483647);
+  Check(ok and not p.Conn.Alive, 'the last one: no more requests are taken');
+  Check((not p.Conn.Request('GET', '/c', nil, '', 0, 0, r, e)) and r.NotProcessed and
+    (e = 'http2: the connection has used all its stream numbers') and p.Quiet(50), 'a request then is not written: ' + e);
+  p.Put(Ok200(2147483647, 'b') + Ok200(2147483645, 'a'));
+  c.Fin.Wait;
+  c2.Fin.Wait;
+  Check(c.Ok and c2.Ok and (c.Resp.Body = 'a') and (c2.Resp.Body = 'b'), 'those on their way are answered');
+  Check(p.Gone and (p.Conn.LastError = 'http2: the connection has used all its stream numbers'),
+    'and the connection ends with the last of them');
+  Finish(p);
+  Group('the stream numbers run out');
+end;
+
+{ a connection window of 65536, a stream window of 20000, frames of 16384 }
+procedure Windows;
+var
+  p: TPeer;
+  c: TCall;
+  f: THpackFields;
+  body, s: string;
+  i: Integer;
+  ok: Boolean;
+begin
+  p := Pair(Defaults);
+  ok := p.Take(24, LongMs, s) and p.Next(LongMs) and (p.Payload = Sets([2, 0, 4, 20000, 5, 16384, 6, 1048576]));
+  ok := ok and p.Next(LongMs) and (p.Typ = FWindow) and (U32(p.Payload, 1) = 65536);
+  p.Put(Fr(FSettings, 0, 0, '') + Fr(FSettings, 1, 0, ''));
+  Check(ok and p.NextOf(FSettings), 'the windows and the frame size said at the start');
+  c := Ask(p.Conn, 'GET', '/d', nil, '', 0, 0);
+  ok := p.Request(f, body);
+  p.Put(Fr(FHeaders, 4, 1, Lit(':status', '200')));
+  s := Fill(10000);
+  for i := 1 to 3 do
+  begin
+    p.Put(Fr(FData, 0, 1, s));
+    ok := ok and p.Next(LongMs) and (p.Typ = FWindow) and (p.Id = 1) and (U32(p.Payload, 1) = 10000) and p.Quiet(30);
+  end;
+  Check(ok, 'half a stream window used: given back, three times');
+  p.Put(Fr(FData, 0, 1, s));
+  ok := p.Next(LongMs) and (p.Typ = FWindow) and (p.Id = 0) and (U32(p.Payload, 1) = 40000);
+  ok := ok and p.Next(LongMs) and (p.Typ = FWindow) and (p.Id = 1) and (U32(p.Payload, 1) = 10000) and p.Quiet(30);
+  Check(ok, 'half the connection''s window used: given back, the stream''s after it');
+  p.Put(Fr(FData, 1, 1, ''));
+  c.Fin.Wait;
+  Check(c.Ok and (Length(c.Resp.Body) = 40000), 'the content: ' + c.Err);
+  { ten responses of 15000 octets more: over twice the connection's
+    window in all, taken because what is given back counts again }
+  ok := True;
+  for i := 1 to 10 do
+  begin
+    c := Ask(p.Conn, 'GET', '/more', nil, '', 0, 0);
+    ok := ok and p.Request(f, body);
+    p.Put(Fr(FHeaders, 4, p.Id, Lit(':status', '200')) + Fr(FData, 1, p.Id, Fill(15000)));
+    c.Fin.Wait;
+    ok := ok and c.Ok and (Length(c.Resp.Body) = 15000);
+  end;
+  Check(ok and p.Sync and p.Conn.Alive, 'over twice the connection''s window in ten responses');
+  { a frame within the largest, past what the stream's window has left }
+  c := Ask(p.Conn, 'GET', '/e', nil, '', 0, 0);
+  ok := p.Request(f, body);
+  i := p.Id;
+  p.Put(Fr(FHeaders, 4, i, Lit(':status', '200')) + Fr(FData, 0, i, Fill(9999)));
+  Check(ok and p.Quiet(50), 'one octet short of half the window: nothing given back');
+  p.Put(Fr(FData, 0, i, Fill(16384)));
+  c.Fin.Wait;
+  Check((not c.Ok) and (Pos('more content than the stream''s window let (FLOW_CONTROL_ERROR)', c.Err) > 0),
+    'more than the stream''s window: ' + c.Err);
+  Check(p.NextOf(FGoAway) and (U32(p.Payload, 5) = H2FlowControlError) and p.Gone, 'GOAWAY FLOW_CONTROL_ERROR');
+  Finish(p);
+  p := Fresh('', Defaults);
+  c := Ask(p.Conn, 'GET', '/f', nil, '', 0, 0);
+  ok := p.Request(f, body);
+  p.Put(FrN(16385, FData, 0, 1, ''));
+  c.Fin.Wait;
+  Check(ok and (not c.Ok) and (Pos('a frame of 16385 octets, past the 16384 this end takes', c.Err) > 0) and
+    p.NextOf(FGoAway) and (U32(p.Payload, 5) = H2FrameSizeError), 'a frame past the largest: ' + c.Err);
+  Finish(p);
+  Group('windows of another size');
+end;
+
+{ a connection window of 16 more than the 65535 it begins with }
+procedure ConnWindow;
+var
+  p: TPeer;
+  c: TCall;
+  f: THpackFields;
+  body: string;
+  ok: Boolean;
+begin
+  p := Fresh('', Defaults);
+  c := Ask(p.Conn, 'GET', '/g', nil, '', 0, 0);
+  ok := p.Request(f, body);
+  p.Put(Fr(FHeaders, 4, 1, Lit(':status', '200')) + Fr(FData, 0, 1, Fill(65551)));
+  ok := ok and p.Next(LongMs) and (p.Typ = FWindow) and (p.Id = 0) and (U32(p.Payload, 1) = 65551) and p.Quiet(50);
+  Check(ok, 'the whole of the connection''s window in one frame: given back');
+  p.Put(Fr(FData, 0, 1, Fill(65552)));
+  c.Fin.Wait;
+  Check((not c.Ok) and (Pos('more content than the connection''s window let (FLOW_CONTROL_ERROR)', c.Err) > 0),
+    'one octet more than the connection''s window: ' + c.Err);
+  Check(p.NextOf(FGoAway) and (U32(p.Payload, 5) = H2FlowControlError) and p.Gone, 'GOAWAY FLOW_CONTROL_ERROR');
+  Finish(p);
+  Group('a connection window of 16');
+end;
+
+{ ---- frames nobody would send ---- }
+
+var
+  seed: Integer;
+
+function Rand(N: Integer): Integer;
+begin
+  seed := seed xor (seed shl 13);
+  seed := seed xor (seed shr 7);
+  seed := seed xor (seed shl 17);
+  Result := (seed shr 11) mod N;
+end;
+
+{ After a request the peer writes frames of any type, flags, stream and
+  payload, then a response, and writes no more. Whatever the client
+  makes of them, its request ends, it ends the connection, and nothing
+  of it is left: four hundred connections, the same every run }
+procedure Noise;
+var
+  p: TPeer;
+  c: TCall;
+  f: THpackFields;
+  body, junk: string;
+  i, j, k, n, id, ended, answered, failed: Integer;
+begin
+  seed := 521288629;
+  ended := 0;
+  answered := 0;
+  failed := 0;
+  for i := 1 to 400 do
+  begin
+    p := Fresh('', Defaults);
+    c := Ask(p.Conn, 'GET', '/noise', nil, '', 0, 100000);
+    if not p.Request(f, body) then
+      Break;
+    junk := '';
+    for k := 1 to Rand(5) do
+    begin
+      n := Rand(40);
+      SetLength(body, n);
+      for j := 1 to n do
+        body[j] := Chr(Rand(256));
+      id := 0;
+      case Rand(4) of
+        1: id := 1;
+        2: id := 3;
+        3: id := Rand(2147483647);
+      end;
+      junk := junk + Fr(Rand(11), Rand(256), id, body);
+    end;
+    p.Put(junk + Ok200(1, 'after the noise'));
+    TcpShutdown(p.Fd, 1);
+    c.Fin.Wait;
+    if c.Ok then
+      Inc(answered)
+    else if c.Err <> '' then
+      Inc(failed);
+    if p.Gone and not p.Conn.Alive then
+      Inc(ended);
+    Finish(p);
+  end;
+  Check((ended = 400) and (answered + failed = 400), 'frames nobody would send: ' + IntToStr(ended) + ' of 400 connections ended, ' +
+    IntToStr(answered + failed) + ' requests answered or failed with a reason');
+  Check((answered > 20) and (failed > 20), 'some requests were answered and some failed: ' + IntToStr(answered) + ' and ' +
+    IntToStr(failed));
+  Group('frames nobody would send');
+end;
+
+{ Three thousand frames in one write, of every length from 9 octets to
+  309, a PING after each frame of a type nobody knows: the reader's
+  buffer ends in the middle of a frame's nine octets time after time,
+  and every PING is answered in order with its own octets }
+procedure Burst;
+var
+  p: TPeer;
+  all, pay, want: string;
+  i, k, n, got: Integer;
+  ok: Boolean;
+begin
+  seed := 88172645;
+  p := Fresh('', Defaults);
+  all := '';
+  for i := 1 to 1500 do
+  begin
+    n := Rand(301);
+    SetLength(pay, n);
+    for k := 1 to n do
+      pay[k] := Chr(Rand(256));
+    all := all + Fr(200 + Rand(50), Rand(256), 0, pay) + Fr(FPing, 0, 0, 'ping' + B32(i));
+  end;
+  p.Put(all);
+  got := 0;
+  ok := True;
+  while ok and (got < 1500) do
+  begin
+    ok := p.NextOf(FPing) and (p.Flags = 1);
+    want := 'ping' + B32(got + 1);
+    if ok and (p.Payload = want) then
+      Inc(got)
+    else
+      ok := False;
+  end;
+  Check(ok and (got = 1500) and p.Conn.Alive, 'three thousand frames in one write: ' + IntToStr(got) + ' PINGs answered in order');
+  Finish(p);
+  Group('a burst of frames');
+end;
+
+{ ---- the client that makes its connection again ---- }
+
+type
+  TWait = class
+  public
+    Client: THttp2Client;
+    TimeoutMs, TookMs: Integer;
+    Ok: Boolean;
+    Resp: THttp2Response;
+    Err: string;
+    Fin: waitgroup;
+    procedure Run;
+  end;
+
+procedure TWait.Run;
+var
+  t0: Integer;
+begin
+  t0 := Nanotime;
+  Ok := Client.Request('GET', '/', nil, '', TimeoutMs, 0, Resp, Err);
+  TookMs := (Nanotime - t0) div 1000000;
+  Fin.Done;
+end;
+
+function Waiter(C: THttp2Client; TimeoutMs: Integer): TWait;
+begin
+  Result := TWait.Create;
+  Result.Client := C;
+  Result.TimeoutMs := TimeoutMs;
+  Result.Fin.Add(1);
+  pas Result.Run;
+end;
+
+{ A server that takes the connection and says nothing: the TLS
+  handshake waits until the client's ConnectTimeoutMs. Ten requests
+  with deadlines of their own do not wait past them for the connection
+  one routine is making for all, and one request without a deadline
+  gets what came of it; none makes a connection of its own }
+procedure Silent;
+var
+  cl: THttp2Client;
+  w: array[0..10] of TWait;
+  l, i, n: Integer;
+begin
+  l := TcpListen(0);
+  cl := THttp2Client.Create('127.0.0.1', TcpPort(l), nil, Defaults);
+  cl.ConnectTimeoutMs := 800;
+  for i := 0 to 9 do
+    w[i] := Waiter(cl, 100);
+  w[10] := Waiter(cl, 0);
+  n := 0;
+  for i := 0 to 10 do
+    w[i].Fin.Wait;
+  for i := 0 to 9 do
+    if (not w[i].Ok) and w[i].Resp.TimedOut and w[i].Resp.NotProcessed and (w[i].TookMs >= 100) and (w[i].TookMs < 700) and
+      (w[i].Err = 'http2: no connection within the request''s deadline') then
+      Inc(n);
+  Check(n = 10, 'ten requests end at their own deadlines while the connection is being made: ' + IntToStr(n));
+  Check((not w[10].Ok) and (not w[10].Resp.TimedOut) and w[10].Resp.NotProcessed and (w[10].TookMs >= 700) and
+    (w[10].TookMs < 6000) and (w[10].Err <> ''), 'a request without a deadline gets what came of the connection: ' +
+    w[10].Err + ' after ' + IntToStr(w[10].TookMs) + ' ms');
+  Check(cl.Dials = 0, 'no connection was made');
+  cl.Dispose;
+  TcpClose(l);
+  Group('a client whose server does not answer');
+end;
+
+{ ---- the connections the unit makes itself, over TCP ---- }
+
+{ the peer of a connection the unit dialed: the client's preface read, the
+  server's sent }
+function Adopt(Fd: Integer): TPeer;
+var
+  s: string;
+begin
+  Result := TPeer.Create;
+  Result.Fd := Fd;
+  HpackEncoderInit(Result.HEnc);
+  HpackDecoderInit(Result.HDec, 4096);
+  if (Fd < 0) or (not Result.Take(24, LongMs, s)) or (not Result.Next(LongMs)) or (Result.Typ <> FSettings) or
+    (not Result.Next(LongMs)) or (Result.Typ <> FWindow) then
+  begin
+    WriteLn('no preface from a connection the unit made');
+    Halt(1);
+  end;
+  { the acknowledgement of these is not waited for: a request of the
+    client's may be on its way before it, and no frame may be let by
+    unread, for the field blocks are decoded in their order }
+  Result.Put(Fr(FSettings, 0, 0, '') + Fr(FSettings, 1, 0, ''));
+end;
+
+{ Http2DialPlain and what it says of the server; THttp2Client: one
+  connection for its requests, another when the server goes away, a
+  request the server did not take sent once more and no more, a
+  deadline shorter than the way to the connection, Dispose }
+procedure Dials;
+var
+  l, port, n: Integer;
+  conn: THttp2Conn;
+  cl: THttp2Client;
+  p, p2: TPeer;
+  c: TCall;
+  w: TWait;
+  f: THpackFields;
+  body, err: string;
+  r: THttp2Response;
+  ok: Boolean;
+begin
+  Check((Http2Authority('example.com', 443, True) = 'example.com') and
+    (Http2Authority('example.com', 8443, True) = 'example.com:8443') and
+    (Http2Authority('example.com', 80, True) = 'example.com:80') and
+    (Http2Authority('example.com', 80, False) = 'example.com') and
+    (Http2Authority('example.com', 443, False) = 'example.com:443') and
+    (Http2Authority('::1', 443, True) = '[::1]') and (Http2Authority('::1', 8080, False) = '[::1]:8080') and
+    (Http2Authority('[::1]', 80, False) = '[::1]') and (Http2Authority('2001:db8::7', 80, True) = '[2001:db8::7]:80') and
+    (Http2Authority('10.0.0.7', 444, True) = '10.0.0.7:444') and (Http2Authority('10.0.0.7', 81, False) = '10.0.0.7:81'),
+    'what :authority says of a host and a port');
+  l := TcpListen(0);
+  port := TcpPort(l);
+  conn := Http2DialPlain('127.0.0.1', port, 5000, Defaults, err);
+  Check((conn <> nil) and (err = ''), 'a connection made over TCP: ' + err);
+  if conn = nil then
+    Halt(1);
+  p := Adopt(TcpAccept(l));
+  p.Conn := conn;
+  c := Ask(conn, 'GET', '/dialed', nil, '', 0, 0);
+  ok := p.Request(f, body);
+  p.Put(Ok200(p.Id, 'yes'));
+  c.Fin.Wait;
+  Check(ok and c.Ok and (FieldOf(f, ':authority') = '127.0.0.1:' + IntToStr(port)) and (FieldOf(f, ':scheme') = 'http') and
+    (c.Resp.Body = 'yes'), 'its authority and its scheme: ' + FieldOf(f, ':authority'));
+  Finish(p);
+  { nobody listens there }
+  n := TcpListen(0);
+  ok := n >= 0;
+  port := TcpPort(n);
+  TcpClose(n);
+  conn := Http2DialPlain('127.0.0.1', port, 2000, Defaults, err);
+  Check(ok and (conn = nil) and (err = 'dial tcp 127.0.0.1:' + IntToStr(port) + ': connection failed'), 'nobody listens: ' + err);
+  { the client }
+  port := TcpPort(l);
+  cl := THttp2Client.Create('127.0.0.1', port, nil, Defaults);
+  cl.Plain := True;
+  w := Waiter(cl, 0);
+  p := Adopt(TcpAccept(l));
+  ok := p.Request(f, body);
+  p.Put(Ok200(p.Id, 'one'));
+  w.Fin.Wait;
+  Check(ok and w.Ok and (w.Resp.Body = 'one') and (cl.Dials = 1), 'the client makes its connection at its first request: ' + w.Err);
+  w := Waiter(cl, 0);
+  ok := p.Request(f, body) and (p.Id = 3);
+  p.Put(Ok200(3, 'two'));
+  w.Fin.Wait;
+  Check(ok and w.Ok and (w.Resp.Body = 'two') and (cl.Dials = 1), 'and keeps it for the next');
+  { a deadline of a millisecond is over before the request can leave }
+  Check((not cl.Request('GET', '/', nil, '', 1, 0, r, err)) and r.TimedOut and r.NotProcessed and
+    (err = 'http2: no response within 1 ms') and p.Quiet(50), 'a deadline that is over on the way: ' + err);
+  { the server goes away without taking a request on its way: the
+    client sends it again on a connection it makes for it }
+  w := Waiter(cl, 0);
+  ok := p.Request(f, body) and (p.Id = 5);
+  p.Put(Fr(FGoAway, 0, 0, B32(3) + B32(0)));
+  p2 := Adopt(TcpAccept(l));
+  ok := ok and p2.Request(f, body) and (p2.Id = 1);
+  p2.Put(Ok200(1, 'again'));
+  w.Fin.Wait;
+  Check(ok and w.Ok and (w.Resp.Body = 'again') and (cl.Dials = 2), 'a request the server did not take, sent again: ' +
+    w.Err);
+  Check(p.Gone, 'and the connection that was going away ends');
+  p.Drop;
+  { refused twice: sent twice and no more, the second failure the answer }
+  w := Waiter(cl, 0);
+  ok := p2.Request(f, body) and (p2.Id = 3);
+  p2.Put(Fr(FRst, 0, 3, B32(7)));
+  ok := ok and p2.Request(f, body) and (p2.Id = 5);
+  p2.Put(Fr(FRst, 0, 5, B32(7)));
+  w.Fin.Wait;
+  Check(ok and (not w.Ok) and w.Resp.NotProcessed and (w.Resp.ErrorCode = 7) and (not w.Resp.TimedOut) and p2.Quiet(50) and
+    (cl.Dials = 2), 'a request refused twice is sent twice: ' + w.Err);
+  { Dispose ends the connection held; a request after it makes another }
+  cl.Dispose;
+  Check(p2.NextOf(FGoAway) and p2.Gone, 'Dispose ends the connection the client holds');
+  p2.Drop;
+  w := Waiter(cl, 0);
+  p := Adopt(TcpAccept(l));
+  ok := p.Request(f, body);
+  p.Put(Ok200(p.Id, 'new'));
+  w.Fin.Wait;
+  Check(ok and w.Ok and (w.Resp.Body = 'new') and (cl.Dials = 3), 'and a request after it makes a new one: ' + w.Err);
+  cl.Dispose;
+  ok := p.NextOf(FGoAway);
+  p.Drop;
+  TcpClose(l);
+  Group('connections the unit makes');
+end;
+
+{ the lowest descriptor that is free: a pair of sockets takes it. It
+  is the same after every connection of the test as before the first
+  when each gave back what it had opened }
+function LowestFree: Integer;
+var
+  a, b: Integer;
+begin
+  Result := -1;
+  if not UnixPair(a, b) then
+    Exit;
+  Result := a;
+  if b < a then
+    Result := b;
+  TcpClose(a);
+  TcpClose(b);
+end;
+
+{ how many descriptors are open among the first 4096: fcntl(2) with
+  F_GETFD answers for one that is and EBADF for one that is not (72 on
+  amd64, 25 on arm64). The lowest free number alone does not see a
+  descriptor left open above others that were closed since }
+function OpenCount: Integer;
+var
+  fd, nr: Integer;
+begin
+  nr := 25;
+  if Amd64 = 1 then
+    nr := 72;
+  Result := 0;
+  for fd := 0 to 4095 do
+    if Syscall(nr, fd, 1) >= 0 then
+      Inc(Result);
+end;
+
+var
+  before, opened: Integer;
+
+begin
+  if ParamCount = 0 then
+  begin
+    before := LowestFree;
+    opened := OpenCount;
+    KeptBegin;
+    Shapes;
+    Tables;
+    Flow;
+    Turns;
+    Faults;
+    StreamFaults;
+    Ends;
+    Noise;
+    Burst;
+    Silent;
+    Dials;
+    KeptEnd;
+    { every routine of a connection that was disposed of has ended, or
+      Dispose had not come back; its descriptors are given back too }
+    Check((before >= 0) and (LowestFree = before), 'a descriptor was left open: the lowest free was ' + IntToStr(before) +
+      ' and is ' + IntToStr(LowestFree));
+    Check(OpenCount = opened, 'descriptors were left open: ' + IntToStr(opened) + ' were open at the start and ' +
+      IntToStr(OpenCount) + ' are now');
+    Group('nothing left behind');
+  end
+  else if ParamStr(1) = 'numbers' then
+    Numbers
+  else if ParamStr(1) = 'windows' then
+    Windows
+  else if ParamStr(1) = 'connwindow' then
+    ConnWindow
+  else
+    WriteLn('unknown case ', ParamStr(1));
+end.

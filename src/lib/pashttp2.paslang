@@ -1,0 +1,4079 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+
+  paslang is free software: you can redistribute it and/or modify it
+  under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+
+  paslang is distributed in the hope that it will be useful, but
+  WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+  General Public License for more details.
+
+  Under Section 7 of GPL version 3, you are granted additional
+  permissions described in the paslang Runtime Library Exception,
+  version 1.0, in the file COPYING.RUNTIME.
+
+  You should have received a copy of the GNU General Public License
+  along with paslang.  If not, see <https://www.gnu.org/licenses/>. }
+
+{ An HTTP/2 client (P617): RFC 9113 over a TLS connection whose ALPN
+  chose h2, or over TCP for a server known to speak it there, and HPACK,
+  RFC 7541, whole: the static table, literals, the Huffman code both
+  ways and the dynamic table both ways.
+
+  One connection carries many requests at once, from any number of
+  routines: THttp2Conn.Request sends one and parks until its response
+  is whole, its deadline passes or the connection ends. The shape
+  follows Go's client (net/http/internal/http2 of Go 1.27.4:
+  transport.go's ClientConn, its readLoop and process routines, flow.go's
+  windows, frame.go's checks) and its hpack package
+  (golang.org/x/net/http2/hpack as that Go vendors it); what differs is
+  said where it does, and these are the larger differences:
+
+  - One mutex guards a connection, where Go has two. Frames reach the
+    peer in the order they are posted, which is the order the stream
+    numbers and the compression's state need (RFC 9113 5.1.1 and 4.3),
+    but nobody waits for another's write: while one routine writes, what
+    the others post is left for it, and a routine of the connection's
+    carries on when there is more.
+  - One routine reads every frame and hands each to its stream; the
+    content of a response is read from the connection straight into the
+    string the caller gets, and the windows are given back at half
+    (5.2, 6.9), since what is read is kept within its budget and never
+    waits for a reader.
+  - One routine keeps every deadline, parked on an eventfd; it writes
+    nothing itself, so a peer that takes nothing cannot hold a deadline
+    back. It also asks a silent peer whether it is there (PING).
+  - A response is checked as RFC 9113 8.1 and 8.2 say a recipient must
+    (Go lets some of it by): what is malformed ends its request.
+
+  The unit's limits are all set: a response's header fields and its
+  content have a budget in octets, a request a deadline, a field block
+  and a frame a largest size, a write a longest time. A redirect is an
+  answer like any other: nothing is followed. Server push is refused
+  (SETTINGS_ENABLE_PUSH 0). A connection is one object for any number of
+  routines; nothing of it is global (Regla 11). }
+unit pashttp2;
+
+interface
+
+uses
+  sysutils, pasconn, pastls;
+
+const
+  { the error codes of RFC 9113 section 7 }
+  H2NoError = 0;
+  H2ProtocolError = 1;
+  H2InternalError = 2;
+  H2FlowControlError = 3;
+  H2SettingsTimeout = 4;
+  H2StreamClosed = 5;
+  H2FrameSizeError = 6;
+  H2RefusedStream = 7;
+  H2Cancel = 8;
+  H2CompressionError = 9;
+  H2ConnectError = 10;
+  H2EnhanceYourCalm = 11;
+  H2InadequateSecurity = 12;
+  H2Http11Required = 13;
+
+type
+  { one header field. Sensitive is HPACK's never-indexed literal (RFC
+    7541 6.2.3 and 7.1.3): the value is sent as it is every time and
+    never enters the compression's table }
+  THpackField = record
+    Name, Value: string;
+    Sensitive: Boolean;
+    { a literal that does not enter the table and is no secret (RFC
+      7541 6.2.2): for a value that is not said again, which would only
+      push out of the table what is }
+    Once: Boolean;
+  end;
+  THpackFields = array of THpackField;
+
+  { a dynamic table (RFC 7541 2.3.2 and 4): the entries, the oldest
+    first; Size is the sum of their sizes (name, value and 32), MaxSize
+    what it may reach now and Allowed what a size update may ask for }
+  THpackTable = record
+    Ents: THpackFields;
+    First: Integer;
+    Size, MaxSize, Allowed: Integer;
+  end;
+
+  { the decoding half of a connection's compression: one for all the
+    header blocks received, in the order they came }
+  THpackDecoder = record
+    Tab: THpackTable;
+  end;
+
+  { the encoding half: one for all the header blocks sent, in order }
+  THpackEncoder = record
+    Tab: THpackTable;
+    { the smallest size the table was set to since the last block, and
+      whether a size update is owed at the start of the next (4.2) }
+    MinSize: Integer;
+    Update: Boolean;
+    { no string is Huffman coded: for the examples of RFC 7541 C.3 and
+      C.5, and for whoever wants the octets plain }
+    NoHuffman: Boolean;
+  end;
+
+{ ---- HPACK (RFC 7541) ---- }
+
+{ the Huffman code of S (appendix B), padded with ones to an octet;
+  how many octets that is; and S back from its code: False for padding
+  of eight bits or more, padding that is not ones, or EOS inside }
+function HuffmanEncode(const S: string): string;
+function HuffmanLength(const S: string): Integer;
+function HuffmanDecode(const S: string; out Res: string): Boolean;
+
+{ a decoder whose table may hold Allowed octets, what this end said in
+  SETTINGS_HEADER_TABLE_SIZE (4096 when it said nothing) }
+procedure HpackDecoderInit(var D: THpackDecoder; Allowed: Integer);
+{ the fields of one whole header block, added to Fields while their
+  sizes (name, value and 32 each) fit in Budget octets; the rest are
+  decoded, for the table must follow, and dropped, and TooLarge says
+  so. False with the reason in Err for a block that is not HPACK: the
+  connection's compression is then lost (RFC 9113 4.3) }
+function HpackDecode(var D: THpackDecoder; const Block: string; Budget: Integer; var Fields: THpackFields;
+  out TooLarge: Boolean; out Err: string): Boolean;
+
+procedure HpackEncoderInit(var E: THpackEncoder);
+{ the peer's SETTINGS_HEADER_TABLE_SIZE: the table uses at most 4096
+  octets of it, and the next block says its new size }
+procedure HpackEncoderLimit(var E: THpackEncoder; PeerSize: Integer);
+{ one header block for Fields, in order: a field the tables hold is an
+  index, another a literal that enters the table unless it is Sensitive
+  or larger than the table, its strings Huffman coded when shorter }
+function HpackEncode(var E: THpackEncoder; const Fields: THpackFields): string;
+
+{ a field; Http2Field marks authorization, proxy-authorization, cookie
+  and set-cookie Sensitive, as RFC 7541 7.1.3 advises for values an
+  attacker who can add fields to the same connection could guess a
+  piece at a time. Http2FieldIndexed never does: for a connection all
+  of whose fields are one's own, where a token sent with every request
+  is then sent once }
+function Http2Field(const Name, Value: string): THpackField;
+function Http2FieldIndexed(const Name, Value: string): THpackField;
+{ a field whose value is not said again, as an identifier made for one
+  request: it is written out and stays out of the table }
+function Http2FieldOnce(const Name, Value: string): THpackField;
+{ the value of the first field of that name (in lower case), '' when
+  there is none }
+function Http2Get(const Fields: THpackFields; const Name: string): string;
+
+{ ---- the connection (RFC 9113) ---- }
+
+type
+  { what a connection is given when it is made; a field left at 0 takes
+    the value said beside it }
+  THttp2Options = record
+    { a response's header fields may take this many octets, their names,
+      their values and 32 for each: 1 MiB. The peer is told
+      (SETTINGS_MAX_HEADER_LIST_SIZE) }
+    MaxHeaderBytes: Integer;
+    { a response's content may take this many octets when its request
+      gives no budget of its own: 64 MiB }
+    MaxBodyBytes: Integer;
+    { how long one write to the peer may wait, in milliseconds: 30000.
+      A peer that takes nothing for that long has lost the connection }
+    WriteTimeoutMs: Integer;
+    { how long the answer to a PING may take: 15000 (Go's PingTimeout) }
+    PingTimeoutMs: Integer;
+    { when nothing has come from the peer for this long a PING asks
+      whether it is there, and the connection ends when no answer comes
+      in PingTimeoutMs. 0 never asks (Go's ReadIdleTimeout, 0 too): set
+      it on a connection that is kept for hours, which a network may
+      drop without a word }
+    ReadIdleMs: Integer;
+  end;
+
+  { A response: its status, its header fields without :status, its
+    content whole, and its trailer fields when it sent some.
+
+    When the request failed: NotProcessed says it never reached the
+    server's handling, for the connection ended or was going away
+    before it, or the server refused the stream (REFUSED_STREAM); it
+    may then be sent again on another connection whatever its method
+    (RFC 9113 8.7). TimedOut says its deadline passed. ErrorCode is the
+    code of the server's RST_STREAM or GOAWAY, -1 when it sent neither.
+    Status and Fields are there when the header fields came before the
+    failure }
+  THttp2Response = record
+    Status: Integer;
+    Fields: THpackFields;
+    Body: string;
+    Trailers: THpackFields;
+    NotProcessed: Boolean;
+    TimedOut: Boolean;
+    ErrorCode: Integer;
+  end;
+
+  { one request and its response on their way: the connection's own }
+  TH2Stream = class
+  public
+    Id: Integer;
+    SendWindow, RecvWindow, RecvUnacked: Integer;
+    Deadline, TimeoutMs, TimedAt: Integer;
+    MaxBody, WantLength, Received, InterimBytes, ReadMark: Integer;
+    Status: Integer;
+    Fields, Trailers: THpackFields;
+    { the content received: the first Received octets of Buf }
+    Buf: string;
+    HasSlot, IsHead, GotHeaders, Ended, Ok, TimedOut, Refused, AskPeer: Boolean;
+    ErrorCode: Integer;
+    Err: string;
+    PingData: string;
+    Wake: cond;
+  end;
+  TH2Streams = array of TH2Stream;
+
+  { A connection. Http2Dial makes one over TLS; Create makes one over a
+    stream that already speaks HTTP/2, as a TCP connection to a server
+    known to (prior knowledge, RFC 9113 3.3).
+
+    Any number of routines call Request at once: each parks until its
+    response is whole. The connection keeps routines of its own, one
+    that reads and one that keeps the deadlines, until Dispose or until
+    the connection ends: a program that is done with a connection calls
+    Dispose, which also gives its descriptors back; a connection that
+    ended by itself has given them back already. }
+  THttp2Conn = class
+  private
+    FStream: TNetStream;
+    FScheme, FAuthority: string;
+    FOpt: THttp2Options;
+    { FMu guards every field below but those the reading routine keeps
+      for itself, which are said }
+    FMu: mutex;
+    { parked here: who waits for a place among the streams, for a window
+      to open, for what is pending to be written }
+    FCond: cond;
+    FStreams: map[Integer] of TH2Stream;
+    FTimed: TH2Streams;
+    FTimedN: Integer;
+    FPings: TH2Streams;
+    FNextId, FActive, FPendingResets: Integer;
+    FEnc: THpackEncoder;
+    FLastPath: string;
+    FSendWindow, FRecvWindow, FRecvUnacked: Integer;
+    FPeerInitialWindow, FPeerMaxFrame, FPeerMaxStreams, FPeerMaxHeaderList: Integer;
+    FClosed, FBroken, FTornDown, FUserClosed: Boolean;
+    { a write failed: nothing more is written, and the connection ends at
+      FFailDue for FFailWhy unless the reading routine ends it before }
+    FWriteBroken: Boolean;
+    FFailDue: Integer;
+    FFailWhy: string;
+    FGotSettings, FSettingsAcked: Boolean;
+    FGoAway: Boolean;
+    { the last stream number there is was given out (5.1.1) }
+    FSpent: Boolean;
+    FGoAwayLast, FGoAwayCode: Integer;
+    FGoAwayDebug: string;
+    FErr: string;
+    { what is to be written while another routine writes, and whether
+      one does }
+    FOut: TStringBuilder;
+    FWBusy: Boolean;
+    { the routine of the deadlines: its eventfd, what it is parked until }
+    FTimerFd, FTimerNext: Integer;
+    FHealthDue: Integer;
+    FHealthData: string;
+    FPingSeq: Integer;
+    FReadCount, FLastRead: Integer;
+    FConnErr: Integer;
+    FWhy: string;
+    FWg: waitgroup;
+    { the reading routine's own: what it has read and not yet parsed
+      (FIn from FInPos to before FInEnd), the field block it is in the
+      middle of, the frames it owes the peer }
+    FIn: string;
+    FInPos, FInEnd: Integer;
+    FGotFrame: Boolean;
+    FDec: THpackDecoder;
+    FContId, FContFlags: Integer;
+    FContFirst: string;
+    FContMore: TStringBuilder;
+    FOwed: string;
+    function Raw(const Frames: string): Boolean;
+    procedure WriteFailed;
+    procedure WriteNow(const Frames: string);
+    procedure WriteContent(S: TH2Stream; const Body: string; Offset, N: Integer; Last: Boolean);
+    procedure WriteDone;
+    procedure Flusher;
+    procedure Post(const Frames: string; Direct: Boolean);
+    procedure Owe;
+    procedure Fail(const Why: string; Broken: Boolean);
+    procedure Finish(S: TH2Stream);
+    procedure Watch(S: TH2Stream);
+    procedure Unwatch(S: TH2Stream);
+    procedure Arm(Due: Integer);
+    procedure Poke;
+    procedure HealthPing;
+    function Credit(S: TH2Stream; Want: Integer): Integer;
+    function GoAwayText: string;
+    function ReadWhy(R: Integer): string;
+    function Fill(Need: Integer): Integer;
+    function ReadBytes(N: Integer; out Data: string): Integer;
+    function ReadTo(var Dest: string; Offset, N: Integer): Integer;
+    function Skip(N: Integer): Integer;
+    function ReadHead(out Typ, Flags, Id, N: Integer): Integer;
+    function Before(Typ, Flags, Id: Integer; const Payload: string; out Data: string; out Whole: Boolean;
+      out All: THpackFields; out TooLarge: Boolean): Integer;
+    procedure ConnError(Code: Integer; const Why: string);
+    procedure StreamError(S: TH2Stream; Id, Code: Integer; const Why: string);
+    procedure GiveBack(S: TH2Stream; N: Integer);
+    procedure EndOfStream(S: TH2Stream);
+    procedure OnHeaders(Id: Integer; EndStream: Boolean; const All: THpackFields; TooLarge: Boolean);
+    function DataBegin(Id, N, Counted: Integer): TH2Stream;
+    procedure DataEnd(S: TH2Stream; N, Counted: Integer; EndStream: Boolean);
+    procedure OnData(Id: Integer; EndStream: Boolean; const Data: string; Counted: Integer);
+    procedure OnSettings(Flags, Id: Integer; const Payload: string);
+    procedure OnRst(Id: Integer; const Payload: string);
+    procedure OnPing(Flags, Id: Integer; const Payload: string);
+    procedure OnGoAway(Id: Integer; const Payload: string);
+    procedure OnWindowUpdate(Id: Integer; const Payload: string);
+    procedure OnPriority(Id: Integer; const Payload: string);
+    function Settle: Boolean;
+    function Step: Boolean;
+    procedure ReadLoop;
+    procedure TimerLoop;
+  public
+    { the connection begins on Stream, which is the connection's from
+      now on: the preface and SETTINGS are written (3.4). AScheme and
+      AAuthority are what every request's :scheme and :authority say.
+      A connection that could not begin is ended at once: Alive says
+      so and LastError why }
+    constructor Create(Stream: TNetStream; const AScheme, AAuthority: string; const Options: THttp2Options);
+    { One request and its response. Headers are the fields after the
+      pseudo-header fields, their names in lower case; content-length
+      is written from Body, and a field that belongs to an HTTP/1.1
+      connection (connection, host, transfer-encoding and their like) is
+      refused with its reason, for HTTP/2 has no place for it (8.2.2).
+
+      The call parks until the response is whole and gives True, or
+      gives False with the reason in Err: the request is not well
+      formed; TimeoutMs milliseconds passed (0 is no deadline); the
+      response's content is past MaxBody octets (0 is the connection's
+      budget); the stream or the connection ended; the response was
+      malformed. A response is a response whatever its status, and a
+      redirect is not followed. A request whose own write the peer
+      does not take can run past its deadline, by the connection's
+      WriteTimeoutMs at most }
+    function Request(const Method, Path: string; const Headers: THpackFields; const Body: string;
+      TimeoutMs, MaxBody: Integer; out Resp: THttp2Response; out Err: string): Boolean;
+    { a PING and its answer within TimeoutMs (0 waits as long as the
+      connection lasts): the peer is there }
+    function Ping(TimeoutMs: Integer): Boolean;
+    { GOAWAY to the peer, the requests on their way fail, and the
+      connection ends: its routines are waited for and its descriptors
+      given back. More than once does no harm }
+    procedure Dispose;
+    { it takes new requests: it has not ended, the peer has not said
+      GOAWAY, and it has stream numbers left }
+    function Alive: Boolean;
+    { why it ended, '' while it has not }
+    function LastError: string;
+    { the additional data of the peer's GOAWAY, where a server says its
+      reason (APNs writes one in JSON); '' when it sent none }
+    function GoAwayData: string;
+    { the requests on their way, and how many the peer lets be at once }
+    function Streams: Integer;
+    function PeerMaxStreams: Integer;
+  end;
+
+  { a connection being made, and what came of it: the client's own }
+  TH2Dial = class
+  public
+    Finished: chan of Integer;
+    Conn: THttp2Conn;
+    Err: string;
+  end;
+
+  { A client of one server that keeps one connection and makes another
+    when that one has ended or is going away: for a long-lived
+    connection that carries many requests, as a push service asks. A
+    request the server did not act on (NotProcessed) is sent once more,
+    on a new connection when the first has ended. Any number of
+    routines use one client at once.
+
+    A connection is made by a routine of the client's, once for all the
+    requests that wait for it: each waits within its own deadline, and
+    what comes of the connection, made or not, is the answer for all of
+    them }
+  THttp2Client = class
+  private
+    FMu: mutex;
+    FConn: THttp2Conn;
+    FHost: string;
+    FPort: Integer;
+    FConfig: TTlsConfig;
+    FOptions: THttp2Options;
+    FDials: Integer;
+    { the connection being made, nil when none is; FEpoch is raised by
+      Dispose, and a connection begun before it is not kept }
+    FDial: TH2Dial;
+    FEpoch: Integer;
+    procedure Dialer(D: TH2Dial; Epoch: Integer);
+    function Conn(Due: Integer; out Err: string; out Late: Boolean): THttp2Conn;
+  public
+    { how long making a connection may take, in milliseconds (10000) }
+    ConnectTimeoutMs: Integer;
+    { no TLS: HTTP/2 straight on TCP, for a server known to take it
+      (prior knowledge, RFC 9113 3.3). Set before the first request }
+    Plain: Boolean;
+    { Config may be nil; what it says of ALPN is not looked at }
+    constructor Create(const Host: string; Port: Integer; Config: TTlsConfig; const Options: THttp2Options);
+    { as THttp2Conn.Request. TimeoutMs covers the wait for a connection
+      too: a request does not wait for one past its own deadline, and
+      the connection goes on being made for the requests that can wait }
+    function Request(const Method, Path: string; const Headers: THpackFields; const Body: string;
+      TimeoutMs, MaxBody: Integer; out Resp: THttp2Response; out Err: string): Boolean;
+    { how many connections it has made }
+    function Dials: Integer;
+    { the connection it holds is disposed of, and one that is being made
+      is not kept; a later request makes another }
+    procedure Dispose;
+  end;
+
+{ a TLS connection to Host:Port that offers h2 by ALPN (RFC 9113 3.2),
+  made within ConnectMs milliseconds; nil with Err when it cannot be
+  made or the server does not choose h2. Config may be nil, and what it
+  says of ALPN is not looked at }
+function Http2Dial(const Host: string; Port, ConnectMs: Integer; Config: TTlsConfig; const Options: THttp2Options;
+  out Err: string): THttp2Conn;
+{ the same on TCP without TLS, for a server known to speak HTTP/2 there
+  (prior knowledge, RFC 9113 3.3) }
+function Http2DialPlain(const Host: string; Port, ConnectMs: Integer; const Options: THttp2Options;
+  out Err: string): THttp2Conn;
+{ the name of an error code of RFC 9113 section 7 }
+function Http2ErrorName(Code: Integer): string;
+{ what :authority says of Host and Port, as the two calls above write
+  it: the port left out when it is the scheme's own, 443 with TLS and 80
+  without, and an IPv6 address in its brackets (RFC 3986 3.2) }
+function Http2Authority(const Host: string; Port: Integer; Tls: Boolean): string;
+
+implementation
+
+{ hpack tables: written by scripts/hpack_tables.py from RFC 7541, appendices A and B }
+const
+  { the static table (appendix A): names and values, from 1 }
+  HpackStaticLen = 61;
+  HpackStaticName: array[1..61] of string = (
+    ':authority', ':method', ':method', ':path',
+    ':path', ':scheme', ':scheme', ':status',
+    ':status', ':status', ':status', ':status',
+    ':status', ':status', 'accept-charset', 'accept-encoding',
+    'accept-language', 'accept-ranges', 'accept', 'access-control-allow-origin',
+    'age', 'allow', 'authorization', 'cache-control',
+    'content-disposition', 'content-encoding', 'content-language', 'content-length',
+    'content-location', 'content-range', 'content-type', 'cookie',
+    'date', 'etag', 'expect', 'expires',
+    'from', 'host', 'if-match', 'if-modified-since',
+    'if-none-match', 'if-range', 'if-unmodified-since', 'last-modified',
+    'link', 'location', 'max-forwards', 'proxy-authenticate',
+    'proxy-authorization', 'range', 'referer', 'refresh',
+    'retry-after', 'server', 'set-cookie', 'strict-transport-security',
+    'transfer-encoding', 'user-agent', 'vary', 'via',
+    'www-authenticate');
+  HpackStaticValue: array[1..61] of string = (
+    '', 'GET', 'POST', '/',
+    '/index.html', 'http', 'https', '200',
+    '204', '206', '304', '400',
+    '404', '500', '', 'gzip, deflate',
+    '', '', '', '',
+    '', '', '', '',
+    '', '', '', '',
+    '', '', '', '',
+    '', '', '', '',
+    '', '', '', '',
+    '', '', '', '',
+    '', '', '', '',
+    '', '', '', '',
+    '', '', '', '',
+    '', '', '', '',
+    '');
+  { the Huffman code (appendix B): each octet's code, its last bit the
+    lowest, and its length in bits; EOS is thirty ones }
+  HuffCode: array[0..255] of Integer = (
+    $1ff8, $7fffd8, $fffffe2, $fffffe3, $fffffe4, $fffffe5, $fffffe6, $fffffe7,
+    $fffffe8, $ffffea, $3ffffffc, $fffffe9, $fffffea, $3ffffffd, $fffffeb, $fffffec,
+    $fffffed, $fffffee, $fffffef, $ffffff0, $ffffff1, $ffffff2, $3ffffffe, $ffffff3,
+    $ffffff4, $ffffff5, $ffffff6, $ffffff7, $ffffff8, $ffffff9, $ffffffa, $ffffffb,
+    $14, $3f8, $3f9, $ffa, $1ff9, $15, $f8, $7fa,
+    $3fa, $3fb, $f9, $7fb, $fa, $16, $17, $18,
+    $0, $1, $2, $19, $1a, $1b, $1c, $1d,
+    $1e, $1f, $5c, $fb, $7ffc, $20, $ffb, $3fc,
+    $1ffa, $21, $5d, $5e, $5f, $60, $61, $62,
+    $63, $64, $65, $66, $67, $68, $69, $6a,
+    $6b, $6c, $6d, $6e, $6f, $70, $71, $72,
+    $fc, $73, $fd, $1ffb, $7fff0, $1ffc, $3ffc, $22,
+    $7ffd, $3, $23, $4, $24, $5, $25, $26,
+    $27, $6, $74, $75, $28, $29, $2a, $7,
+    $2b, $76, $2c, $8, $9, $2d, $77, $78,
+    $79, $7a, $7b, $7ffe, $7fc, $3ffd, $1ffd, $ffffffc,
+    $fffe6, $3fffd2, $fffe7, $fffe8, $3fffd3, $3fffd4, $3fffd5, $7fffd9,
+    $3fffd6, $7fffda, $7fffdb, $7fffdc, $7fffdd, $7fffde, $ffffeb, $7fffdf,
+    $ffffec, $ffffed, $3fffd7, $7fffe0, $ffffee, $7fffe1, $7fffe2, $7fffe3,
+    $7fffe4, $1fffdc, $3fffd8, $7fffe5, $3fffd9, $7fffe6, $7fffe7, $ffffef,
+    $3fffda, $1fffdd, $fffe9, $3fffdb, $3fffdc, $7fffe8, $7fffe9, $1fffde,
+    $7fffea, $3fffdd, $3fffde, $fffff0, $1fffdf, $3fffdf, $7fffeb, $7fffec,
+    $1fffe0, $1fffe1, $3fffe0, $1fffe2, $7fffed, $3fffe1, $7fffee, $7fffef,
+    $fffea, $3fffe2, $3fffe3, $3fffe4, $7ffff0, $3fffe5, $3fffe6, $7ffff1,
+    $3ffffe0, $3ffffe1, $fffeb, $7fff1, $3fffe7, $7ffff2, $3fffe8, $1ffffec,
+    $3ffffe2, $3ffffe3, $3ffffe4, $7ffffde, $7ffffdf, $3ffffe5, $fffff1, $1ffffed,
+    $7fff2, $1fffe3, $3ffffe6, $7ffffe0, $7ffffe1, $3ffffe7, $7ffffe2, $fffff2,
+    $1fffe4, $1fffe5, $3ffffe8, $3ffffe9, $ffffffd, $7ffffe3, $7ffffe4, $7ffffe5,
+    $fffec, $fffff3, $fffed, $1fffe6, $3fffe9, $1fffe7, $1fffe8, $7ffff3,
+    $3fffea, $3fffeb, $1ffffee, $1ffffef, $fffff4, $fffff5, $3ffffea, $7ffff4,
+    $3ffffeb, $7ffffe6, $3ffffec, $3ffffed, $7ffffe7, $7ffffe8, $7ffffe9, $7ffffea,
+    $7ffffeb, $ffffffe, $7ffffec, $7ffffed, $7ffffee, $7ffffef, $7fffff0, $3ffffee);
+  HuffBits: array[0..255] of Integer = (
+    13, 23, 28, 28, 28, 28, 28, 28, 28, 24, 30, 28, 28, 30, 28, 28,
+    28, 28, 28, 28, 28, 28, 30, 28, 28, 28, 28, 28, 28, 28, 28, 28,
+    6, 10, 10, 12, 13, 6, 8, 11, 10, 10, 8, 11, 8, 6, 6, 6,
+    5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 7, 8, 15, 6, 12, 10,
+    13, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 8, 7, 8, 13, 19, 13, 14, 6,
+    15, 5, 6, 5, 6, 5, 6, 6, 6, 5, 7, 7, 6, 6, 6, 5,
+    6, 7, 6, 5, 5, 6, 7, 7, 7, 7, 7, 15, 11, 14, 13, 28,
+    20, 22, 20, 20, 22, 22, 22, 23, 22, 23, 23, 23, 23, 23, 24, 23,
+    24, 24, 22, 23, 24, 23, 23, 23, 23, 21, 22, 23, 22, 23, 23, 24,
+    22, 21, 20, 22, 22, 23, 23, 21, 23, 22, 22, 24, 21, 22, 23, 23,
+    21, 21, 22, 21, 23, 22, 23, 23, 20, 22, 22, 22, 23, 22, 22, 23,
+    26, 26, 20, 19, 22, 23, 22, 25, 26, 26, 26, 27, 27, 26, 24, 25,
+    19, 21, 26, 27, 27, 26, 27, 24, 21, 21, 26, 26, 28, 27, 27, 27,
+    20, 24, 20, 21, 22, 21, 21, 23, 22, 22, 25, 25, 24, 24, 26, 23,
+    26, 27, 26, 26, 27, 27, 27, 27, 27, 28, 27, 27, 27, 27, 27, 26);
+  { the decoder: for a state (an inner node of the code's tree, 0 the
+    root) and four bits of input, at state * 16 + bits: the state that
+    follows in bits 0 to 7, the octet that is complete in bits 8 to 15
+    when bit 16 is set, bit 17 when a string may end there, bit 18 when
+    the bits are no string (EOS) }
+  HuffStep: array[0..4095] of Integer = (
+    $57, $58, $83, $87, $8f, $45, $53, $5a,
+    $64, $84, $8a, $5f, $69, $70, $77, $20004,
+    $65, $81, $85, $86, $8b, $8c, $8e, $60,
+    $6a, $6d, $71, $74, $78, $88, $90, $20005,
+    $6b, $6c, $6e, $6f, $72, $73, $75, $76,
+    $79, $7a, $89, $8d, $91, $92, $4b, $20006,
+    $35500, $35600, $35700, $35900, $36a00, $36b00, $37100, $37600,
+    $37700, $37800, $37900, $37a00, $4c, $50, $7b, $20007,
+    $17742, $37701, $17842, $37801, $17942, $37901, $17a42, $37a01,
+    $32600, $32a00, $32c00, $33b00, $35800, $35a00, $47, $8,
+    $12642, $32601, $12a42, $32a01, $12c42, $32c01, $13b42, $33b01,
+    $15842, $35801, $15a42, $35a01, $48, $4f, $4d, $9,
+    $15855, $15843, $1585d, $35802, $15a55, $15a43, $15a5d, $35a02,
+    $32100, $32200, $32800, $32900, $33f00, $4e, $49, $a,
+    $12142, $32101, $12242, $32201, $12842, $32801, $12942, $32901,
+    $13f42, $33f01, $32700, $32b00, $37c00, $4a, $b, $d,
+    $13f55, $13f43, $13f5d, $33f02, $12742, $32701, $12b42, $32b01,
+    $17c42, $37c01, $32300, $33e00, $c, $66, $7f, $e,
+    $17c55, $17c43, $17c5d, $37c02, $12342, $32301, $13e42, $33e01,
+    $30000, $32400, $34000, $35b00, $35d00, $37e00, $80, $f,
+    $10042, $30001, $12442, $32401, $14042, $34001, $15b42, $35b01,
+    $15d42, $35d01, $17e42, $37e01, $35e00, $37d00, $62, $10,
+    $10055, $10043, $1005d, $30002, $12455, $12443, $1245d, $32402,
+    $14055, $14043, $1405d, $34002, $15b55, $15b43, $15b5d, $35b02,
+    $10056, $10082, $10044, $10052, $10063, $1005e, $10068, $30003,
+    $12456, $12482, $12444, $12452, $12463, $1245e, $12468, $32403,
+    $15d55, $15d43, $15d5d, $35d02, $17e55, $17e43, $17e5d, $37e02,
+    $15e42, $35e01, $17d42, $37d01, $33c00, $36000, $37b00, $11,
+    $15e55, $15e43, $15e5d, $35e02, $17d55, $17d43, $17d5d, $37d02,
+    $13c42, $33c01, $16042, $36001, $17b42, $37b01, $7c, $12,
+    $13c55, $13c43, $13c5d, $33c02, $16055, $16043, $1605d, $36002,
+    $17b55, $17b43, $17b5d, $37b02, $7d, $9b, $96, $13,
+    $17b56, $17b82, $17b44, $17b52, $17b63, $17b5e, $17b68, $37b03,
+    $7e, $94, $9c, $af, $c4, $97, $14, $19,
+    $35c00, $3c300, $3d000, $95, $9d, $cc, $f1, $b0,
+    $c5, $eb, $98, $b2, $c7, $15, $a7, $1a,
+    $c6, $ca, $ec, $f2, $99, $9e, $b3, $b7,
+    $c8, $ce, $d8, $16, $a8, $b9, $29, $1b,
+    $c9, $cd, $cf, $d2, $d9, $f3, $17, $a2,
+    $a9, $ad, $ba, $c2, $d0, $2a, $bf, $1c,
+    $3b200, $3b500, $3b900, $3ba00, $3bb00, $3bd00, $3be00, $3c400,
+    $3c600, $3e400, $3e800, $3e900, $18, $a1, $a3, $a4,
+    $1c642, $3c601, $1e442, $3e401, $1e842, $3e801, $1e942, $3e901,
+    $30100, $38700, $38900, $38a00, $38b00, $38c00, $38d00, $38f00,
+    $10142, $30101, $18742, $38701, $18942, $38901, $18a42, $38a01,
+    $18b42, $38b01, $18c42, $38c01, $18d42, $38d01, $18f42, $38f01,
+    $10155, $10143, $1015d, $30102, $18755, $18743, $1875d, $38702,
+    $18955, $18943, $1895d, $38902, $18a55, $18a43, $18a5d, $38a02,
+    $10156, $10182, $10144, $10152, $10163, $1015e, $10168, $30103,
+    $18756, $18782, $18744, $18752, $18763, $1875e, $18768, $38703,
+    $aa, $ac, $ae, $b5, $bb, $bd, $c3, $cb,
+    $d1, $d7, $2b, $a5, $c0, $da, $d3, $1d,
+    $3bc00, $3bf00, $3c500, $3e700, $3ef00, $2c, $a6, $ab,
+    $c1, $ea, $f5, $db, $d4, $e0, $e5, $1e,
+    $3ab00, $3ce00, $3d700, $3e100, $3ec00, $3ed00, $dc, $f4,
+    $d5, $de, $ed, $e1, $e6, $f9, $1f, $2d,
+    $d6, $dd, $df, $e4, $ee, $f6, $f8, $e2,
+    $e7, $ef, $fa, $fd, $20, $26, $37, $2e,
+    $e8, $e9, $f0, $f7, $fb, $fc, $fe, $ff,
+    $21, $23, $27, $34, $38, $3c, $3f, $2f,
+    $3fe00, $22, $24, $25, $28, $33, $35, $36,
+    $39, $3a, $3d, $3e, $40, $41, $93, $30,
+    $1fe42, $3fe01, $30200, $30300, $30400, $30500, $30600, $30700,
+    $30800, $30b00, $30c00, $30e00, $30f00, $31000, $31100, $31200,
+    $1fe55, $1fe43, $1fe5d, $3fe02, $10242, $30201, $10342, $30301,
+    $10442, $30401, $10542, $30501, $10642, $30601, $10742, $30701,
+    $1fe56, $1fe82, $1fe44, $1fe52, $1fe63, $1fe5e, $1fe68, $3fe03,
+    $10255, $10243, $1025d, $30202, $10355, $10343, $1035d, $30302,
+    $10256, $10282, $10244, $10252, $10263, $1025e, $10268, $30203,
+    $10356, $10382, $10344, $10352, $10363, $1035e, $10368, $30303,
+    $10455, $10443, $1045d, $30402, $10555, $10543, $1055d, $30502,
+    $10655, $10643, $1065d, $30602, $10755, $10743, $1075d, $30702,
+    $10456, $10482, $10444, $10452, $10463, $1045e, $10468, $30403,
+    $10556, $10582, $10544, $10552, $10563, $1055e, $10568, $30503,
+    $10656, $10682, $10644, $10652, $10663, $1065e, $10668, $30603,
+    $10756, $10782, $10744, $10752, $10763, $1075e, $10768, $30703,
+    $10842, $30801, $10b42, $30b01, $10c42, $30c01, $10e42, $30e01,
+    $10f42, $30f01, $11042, $31001, $11142, $31101, $11242, $31201,
+    $10855, $10843, $1085d, $30802, $10b55, $10b43, $10b5d, $30b02,
+    $10c55, $10c43, $10c5d, $30c02, $10e55, $10e43, $10e5d, $30e02,
+    $10856, $10882, $10844, $10852, $10863, $1085e, $10868, $30803,
+    $10b56, $10b82, $10b44, $10b52, $10b63, $10b5e, $10b68, $30b03,
+    $1bc42, $3bc01, $1bf42, $3bf01, $1c542, $3c501, $1e742, $3e701,
+    $1ef42, $3ef01, $30900, $38e00, $39000, $39100, $39400, $39f00,
+    $1ef55, $1ef43, $1ef5d, $3ef02, $10942, $30901, $18e42, $38e01,
+    $19042, $39001, $19142, $39101, $19442, $39401, $19f42, $39f01,
+    $1ef56, $1ef82, $1ef44, $1ef52, $1ef63, $1ef5e, $1ef68, $3ef03,
+    $10955, $10943, $1095d, $30902, $18e55, $18e43, $18e5d, $38e02,
+    $10956, $10982, $10944, $10952, $10963, $1095e, $10968, $30903,
+    $18e56, $18e82, $18e44, $18e52, $18e63, $18e5e, $18e68, $38e03,
+    $31300, $31400, $31500, $31700, $31800, $31900, $31a00, $31b00,
+    $31c00, $31d00, $31e00, $31f00, $37f00, $3dc00, $3f900, $31,
+    $11c42, $31c01, $11d42, $31d01, $11e42, $31e01, $11f42, $31f01,
+    $17f42, $37f01, $1dc42, $3dc01, $1f942, $3f901, $32, $3b,
+    $17f55, $17f43, $17f5d, $37f02, $1dc55, $1dc43, $1dc5d, $3dc02,
+    $1f955, $1f943, $1f95d, $3f902, $30a00, $30d00, $31600, $40000,
+    $1f956, $1f982, $1f944, $1f952, $1f963, $1f95e, $1f968, $3f903,
+    $10a42, $30a01, $10d42, $30d01, $11642, $31601, $40042, $40001,
+    $10a55, $10a43, $10a5d, $30a02, $10d55, $10d43, $10d5d, $30d02,
+    $11655, $11643, $1165d, $31602, $40055, $40043, $4005d, $40002,
+    $10a56, $10a82, $10a44, $10a52, $10a63, $10a5e, $10a68, $30a03,
+    $10d56, $10d82, $10d44, $10d52, $10d63, $10d5e, $10d68, $30d03,
+    $10c56, $10c82, $10c44, $10c52, $10c63, $10c5e, $10c68, $30c03,
+    $10e56, $10e82, $10e44, $10e52, $10e63, $10e5e, $10e68, $30e03,
+    $10f55, $10f43, $10f5d, $30f02, $11055, $11043, $1105d, $31002,
+    $11155, $11143, $1115d, $31102, $11255, $11243, $1125d, $31202,
+    $10f56, $10f82, $10f44, $10f52, $10f63, $10f5e, $10f68, $30f03,
+    $11056, $11082, $11044, $11052, $11063, $1105e, $11068, $31003,
+    $11156, $11182, $11144, $11152, $11163, $1115e, $11168, $31103,
+    $11256, $11282, $11244, $11252, $11263, $1125e, $11268, $31203,
+    $11342, $31301, $11442, $31401, $11542, $31501, $11742, $31701,
+    $11842, $31801, $11942, $31901, $11a42, $31a01, $11b42, $31b01,
+    $11355, $11343, $1135d, $31302, $11455, $11443, $1145d, $31402,
+    $11555, $11543, $1155d, $31502, $11755, $11743, $1175d, $31702,
+    $11356, $11382, $11344, $11352, $11363, $1135e, $11368, $31303,
+    $11456, $11482, $11444, $11452, $11463, $1145e, $11468, $31403,
+    $11556, $11582, $11544, $11552, $11563, $1155e, $11568, $31503,
+    $11756, $11782, $11744, $11752, $11763, $1175e, $11768, $31703,
+    $11656, $11682, $11644, $11652, $11663, $1165e, $11668, $31603,
+    $40056, $40082, $40044, $40052, $40063, $4005e, $40068, $40003,
+    $11855, $11843, $1185d, $31802, $11955, $11943, $1195d, $31902,
+    $11a55, $11a43, $11a5d, $31a02, $11b55, $11b43, $11b5d, $31b02,
+    $11856, $11882, $11844, $11852, $11863, $1185e, $11868, $31803,
+    $11956, $11982, $11944, $11952, $11963, $1195e, $11968, $31903,
+    $11a56, $11a82, $11a44, $11a52, $11a63, $11a5e, $11a68, $31a03,
+    $11b56, $11b82, $11b44, $11b52, $11b63, $11b5e, $11b68, $31b03,
+    $11c55, $11c43, $11c5d, $31c02, $11d55, $11d43, $11d5d, $31d02,
+    $11e55, $11e43, $11e5d, $31e02, $11f55, $11f43, $11f5d, $31f02,
+    $11c56, $11c82, $11c44, $11c52, $11c63, $11c5e, $11c68, $31c03,
+    $11d56, $11d82, $11d44, $11d52, $11d63, $11d5e, $11d68, $31d03,
+    $11e56, $11e82, $11e44, $11e52, $11e63, $11e5e, $11e68, $31e03,
+    $11f56, $11f82, $11f44, $11f52, $11f63, $11f5e, $11f68, $31f03,
+    $33000, $33100, $33200, $36100, $36300, $36500, $36900, $36f00,
+    $37300, $37400, $46, $51, $54, $59, $5b, $5c,
+    $17342, $37301, $17442, $37401, $32000, $32500, $32d00, $32e00,
+    $32f00, $33300, $33400, $33500, $33600, $33700, $33800, $33900,
+    $17355, $17343, $1735d, $37302, $17455, $17443, $1745d, $37402,
+    $12042, $32001, $12542, $32501, $12d42, $32d01, $12e42, $32e01,
+    $12055, $12043, $1205d, $32002, $12555, $12543, $1255d, $32502,
+    $12d55, $12d43, $12d5d, $32d02, $12e55, $12e43, $12e5d, $32e02,
+    $12056, $12082, $12044, $12052, $12063, $1205e, $12068, $32003,
+    $12556, $12582, $12544, $12552, $12563, $1255e, $12568, $32503,
+    $12155, $12143, $1215d, $32102, $12255, $12243, $1225d, $32202,
+    $12855, $12843, $1285d, $32802, $12955, $12943, $1295d, $32902,
+    $12156, $12182, $12144, $12152, $12163, $1215e, $12168, $32103,
+    $12256, $12282, $12244, $12252, $12263, $1225e, $12268, $32203,
+    $17c56, $17c82, $17c44, $17c52, $17c63, $17c5e, $17c68, $37c03,
+    $12355, $12343, $1235d, $32302, $13e55, $13e43, $13e5d, $33e02,
+    $12356, $12382, $12344, $12352, $12363, $1235e, $12368, $32303,
+    $13e56, $13e82, $13e44, $13e52, $13e63, $13e5e, $13e68, $33e03,
+    $12655, $12643, $1265d, $32602, $12a55, $12a43, $12a5d, $32a02,
+    $12c55, $12c43, $12c5d, $32c02, $13b55, $13b43, $13b5d, $33b02,
+    $12656, $12682, $12644, $12652, $12663, $1265e, $12668, $32603,
+    $12a56, $12a82, $12a44, $12a52, $12a63, $12a5e, $12a68, $32a03,
+    $13f56, $13f82, $13f44, $13f52, $13f63, $13f5e, $13f68, $33f03,
+    $12755, $12743, $1275d, $32702, $12b55, $12b43, $12b5d, $32b02,
+    $12756, $12782, $12744, $12752, $12763, $1275e, $12768, $32703,
+    $12b56, $12b82, $12b44, $12b52, $12b63, $12b5e, $12b68, $32b03,
+    $12856, $12882, $12844, $12852, $12863, $1285e, $12868, $32803,
+    $12956, $12982, $12944, $12952, $12963, $1295e, $12968, $32903,
+    $12c56, $12c82, $12c44, $12c52, $12c63, $12c5e, $12c68, $32c03,
+    $13b56, $13b82, $13b44, $13b52, $13b63, $13b5e, $13b68, $33b03,
+    $12d56, $12d82, $12d44, $12d52, $12d63, $12d5e, $12d68, $32d03,
+    $12e56, $12e82, $12e44, $12e52, $12e63, $12e5e, $12e68, $32e03,
+    $12f42, $32f01, $13342, $33301, $13442, $33401, $13542, $33501,
+    $13642, $33601, $13742, $33701, $13842, $33801, $13942, $33901,
+    $12f55, $12f43, $12f5d, $32f02, $13355, $13343, $1335d, $33302,
+    $13455, $13443, $1345d, $33402, $13555, $13543, $1355d, $33502,
+    $12f56, $12f82, $12f44, $12f52, $12f63, $12f5e, $12f68, $32f03,
+    $13356, $13382, $13344, $13352, $13363, $1335e, $13368, $33303,
+    $13042, $33001, $13142, $33101, $13242, $33201, $16142, $36101,
+    $16342, $36301, $16542, $36501, $16942, $36901, $16f42, $36f01,
+    $13055, $13043, $1305d, $33002, $13155, $13143, $1315d, $33102,
+    $13255, $13243, $1325d, $33202, $16155, $16143, $1615d, $36102,
+    $13056, $13082, $13044, $13052, $13063, $1305e, $13068, $33003,
+    $13156, $13182, $13144, $13152, $13163, $1315e, $13168, $33103,
+    $13256, $13282, $13244, $13252, $13263, $1325e, $13268, $33203,
+    $16156, $16182, $16144, $16152, $16163, $1615e, $16168, $36103,
+    $13456, $13482, $13444, $13452, $13463, $1345e, $13468, $33403,
+    $13556, $13582, $13544, $13552, $13563, $1355e, $13568, $33503,
+    $13655, $13643, $1365d, $33602, $13755, $13743, $1375d, $33702,
+    $13855, $13843, $1385d, $33802, $13955, $13943, $1395d, $33902,
+    $13656, $13682, $13644, $13652, $13663, $1365e, $13668, $33603,
+    $13756, $13782, $13744, $13752, $13763, $1375e, $13768, $33703,
+    $13856, $13882, $13844, $13852, $13863, $1385e, $13868, $33803,
+    $13956, $13982, $13944, $13952, $13963, $1395e, $13968, $33903,
+    $33d00, $34100, $35f00, $36200, $36400, $36600, $36700, $36800,
+    $36c00, $36d00, $36e00, $37000, $37200, $37500, $61, $67,
+    $16c42, $36c01, $16d42, $36d01, $16e42, $36e01, $17042, $37001,
+    $17242, $37201, $17542, $37501, $33a00, $34200, $34300, $34400,
+    $17255, $17243, $1725d, $37202, $17555, $17543, $1755d, $37502,
+    $13a42, $33a01, $14242, $34201, $14342, $34301, $14442, $34401,
+    $13a55, $13a43, $13a5d, $33a02, $14255, $14243, $1425d, $34202,
+    $14355, $14343, $1435d, $34302, $14455, $14443, $1445d, $34402,
+    $13a56, $13a82, $13a44, $13a52, $13a63, $13a5e, $13a68, $33a03,
+    $14256, $14282, $14244, $14252, $14263, $1425e, $14268, $34203,
+    $13c56, $13c82, $13c44, $13c52, $13c63, $13c5e, $13c68, $33c03,
+    $16056, $16082, $16044, $16052, $16063, $1605e, $16068, $36003,
+    $13d42, $33d01, $14142, $34101, $15f42, $35f01, $16242, $36201,
+    $16442, $36401, $16642, $36601, $16742, $36701, $16842, $36801,
+    $13d55, $13d43, $13d5d, $33d02, $14155, $14143, $1415d, $34102,
+    $15f55, $15f43, $15f5d, $35f02, $16255, $16243, $1625d, $36202,
+    $13d56, $13d82, $13d44, $13d52, $13d63, $13d5e, $13d68, $33d03,
+    $14156, $14182, $14144, $14152, $14163, $1415e, $14168, $34103,
+    $14056, $14082, $14044, $14052, $14063, $1405e, $14068, $34003,
+    $15b56, $15b82, $15b44, $15b52, $15b63, $15b5e, $15b68, $35b03,
+    $14356, $14382, $14344, $14352, $14363, $1435e, $14368, $34303,
+    $14456, $14482, $14444, $14452, $14463, $1445e, $14468, $34403,
+    $34500, $34600, $34700, $34800, $34900, $34a00, $34b00, $34c00,
+    $34d00, $34e00, $34f00, $35000, $35100, $35200, $35300, $35400,
+    $14542, $34501, $14642, $34601, $14742, $34701, $14842, $34801,
+    $14942, $34901, $14a42, $34a01, $14b42, $34b01, $14c42, $34c01,
+    $14555, $14543, $1455d, $34502, $14655, $14643, $1465d, $34602,
+    $14755, $14743, $1475d, $34702, $14855, $14843, $1485d, $34802,
+    $14556, $14582, $14544, $14552, $14563, $1455e, $14568, $34503,
+    $14656, $14682, $14644, $14652, $14663, $1465e, $14668, $34603,
+    $14756, $14782, $14744, $14752, $14763, $1475e, $14768, $34703,
+    $14856, $14882, $14844, $14852, $14863, $1485e, $14868, $34803,
+    $14955, $14943, $1495d, $34902, $14a55, $14a43, $14a5d, $34a02,
+    $14b55, $14b43, $14b5d, $34b02, $14c55, $14c43, $14c5d, $34c02,
+    $14956, $14982, $14944, $14952, $14963, $1495e, $14968, $34903,
+    $14a56, $14a82, $14a44, $14a52, $14a63, $14a5e, $14a68, $34a03,
+    $14b56, $14b82, $14b44, $14b52, $14b63, $14b5e, $14b68, $34b03,
+    $14c56, $14c82, $14c44, $14c52, $14c63, $14c5e, $14c68, $34c03,
+    $14d42, $34d01, $14e42, $34e01, $14f42, $34f01, $15042, $35001,
+    $15142, $35101, $15242, $35201, $15342, $35301, $15442, $35401,
+    $14d55, $14d43, $14d5d, $34d02, $14e55, $14e43, $14e5d, $34e02,
+    $14f55, $14f43, $14f5d, $34f02, $15055, $15043, $1505d, $35002,
+    $14d56, $14d82, $14d44, $14d52, $14d63, $14d5e, $14d68, $34d03,
+    $14e56, $14e82, $14e44, $14e52, $14e63, $14e5e, $14e68, $34e03,
+    $14f56, $14f82, $14f44, $14f52, $14f63, $14f5e, $14f68, $34f03,
+    $15056, $15082, $15044, $15052, $15063, $1505e, $15068, $35003,
+    $15155, $15143, $1515d, $35102, $15255, $15243, $1525d, $35202,
+    $15355, $15343, $1535d, $35302, $15455, $15443, $1545d, $35402,
+    $15156, $15182, $15144, $15152, $15163, $1515e, $15168, $35103,
+    $15256, $15282, $15244, $15252, $15263, $1525e, $15268, $35203,
+    $15356, $15382, $15344, $15352, $15363, $1535e, $15368, $35303,
+    $15456, $15482, $15444, $15452, $15463, $1545e, $15468, $35403,
+    $15542, $35501, $15642, $35601, $15742, $35701, $15942, $35901,
+    $16a42, $36a01, $16b42, $36b01, $17142, $37101, $17642, $37601,
+    $15555, $15543, $1555d, $35502, $15655, $15643, $1565d, $35602,
+    $15755, $15743, $1575d, $35702, $15955, $15943, $1595d, $35902,
+    $15556, $15582, $15544, $15552, $15563, $1555e, $15568, $35503,
+    $15656, $15682, $15644, $15652, $15663, $1565e, $15668, $35603,
+    $15756, $15782, $15744, $15752, $15763, $1575e, $15768, $35703,
+    $15956, $15982, $15944, $15952, $15963, $1595e, $15968, $35903,
+    $15856, $15882, $15844, $15852, $15863, $1585e, $15868, $35803,
+    $15a56, $15a82, $15a44, $15a52, $15a63, $15a5e, $15a68, $35a03,
+    $15c42, $35c01, $1c342, $3c301, $1d042, $3d001, $38000, $38200,
+    $38300, $3a200, $3b800, $3c200, $3e000, $3e200, $b1, $bc,
+    $15c55, $15c43, $15c5d, $35c02, $1c355, $1c343, $1c35d, $3c302,
+    $1d055, $1d043, $1d05d, $3d002, $18042, $38001, $18242, $38201,
+    $15c56, $15c82, $15c44, $15c52, $15c63, $15c5e, $15c68, $35c03,
+    $1c356, $1c382, $1c344, $1c352, $1c363, $1c35e, $1c368, $3c303,
+    $15d56, $15d82, $15d44, $15d52, $15d63, $15d5e, $15d68, $35d03,
+    $17e56, $17e82, $17e44, $17e52, $17e63, $17e5e, $17e68, $37e03,
+    $15e56, $15e82, $15e44, $15e52, $15e63, $15e5e, $15e68, $35e03,
+    $17d56, $17d82, $17d44, $17d52, $17d63, $17d5e, $17d68, $37d03,
+    $15f56, $15f82, $15f44, $15f52, $15f63, $15f5e, $15f68, $35f03,
+    $16256, $16282, $16244, $16252, $16263, $1625e, $16268, $36203,
+    $16355, $16343, $1635d, $36302, $16555, $16543, $1655d, $36502,
+    $16955, $16943, $1695d, $36902, $16f55, $16f43, $16f5d, $36f02,
+    $16356, $16382, $16344, $16352, $16363, $1635e, $16368, $36303,
+    $16556, $16582, $16544, $16552, $16563, $1655e, $16568, $36503,
+    $16455, $16443, $1645d, $36402, $16655, $16643, $1665d, $36602,
+    $16755, $16743, $1675d, $36702, $16855, $16843, $1685d, $36802,
+    $16456, $16482, $16444, $16452, $16463, $1645e, $16468, $36403,
+    $16656, $16682, $16644, $16652, $16663, $1665e, $16668, $36603,
+    $16756, $16782, $16744, $16752, $16763, $1675e, $16768, $36703,
+    $16856, $16882, $16844, $16852, $16863, $1685e, $16868, $36803,
+    $16956, $16982, $16944, $16952, $16963, $1695e, $16968, $36903,
+    $16f56, $16f82, $16f44, $16f52, $16f63, $16f5e, $16f68, $36f03,
+    $16a55, $16a43, $16a5d, $36a02, $16b55, $16b43, $16b5d, $36b02,
+    $17155, $17143, $1715d, $37102, $17655, $17643, $1765d, $37602,
+    $16a56, $16a82, $16a44, $16a52, $16a63, $16a5e, $16a68, $36a03,
+    $16b56, $16b82, $16b44, $16b52, $16b63, $16b5e, $16b68, $36b03,
+    $16c55, $16c43, $16c5d, $36c02, $16d55, $16d43, $16d5d, $36d02,
+    $16e55, $16e43, $16e5d, $36e02, $17055, $17043, $1705d, $37002,
+    $16c56, $16c82, $16c44, $16c52, $16c63, $16c5e, $16c68, $36c03,
+    $16d56, $16d82, $16d44, $16d52, $16d63, $16d5e, $16d68, $36d03,
+    $16e56, $16e82, $16e44, $16e52, $16e63, $16e5e, $16e68, $36e03,
+    $17056, $17082, $17044, $17052, $17063, $1705e, $17068, $37003,
+    $17156, $17182, $17144, $17152, $17163, $1715e, $17168, $37103,
+    $17656, $17682, $17644, $17652, $17663, $1765e, $17668, $37603,
+    $17256, $17282, $17244, $17252, $17263, $1725e, $17268, $37203,
+    $17556, $17582, $17544, $17552, $17563, $1755e, $17568, $37503,
+    $17356, $17382, $17344, $17352, $17363, $1735e, $17368, $37303,
+    $17456, $17482, $17444, $17452, $17463, $1745e, $17468, $37403,
+    $17755, $17743, $1775d, $37702, $17855, $17843, $1785d, $37802,
+    $17955, $17943, $1795d, $37902, $17a55, $17a43, $17a5d, $37a02,
+    $17756, $17782, $17744, $17752, $17763, $1775e, $17768, $37703,
+    $17856, $17882, $17844, $17852, $17863, $1785e, $17868, $37803,
+    $17956, $17982, $17944, $17952, $17963, $1795e, $17968, $37903,
+    $17a56, $17a82, $17a44, $17a52, $17a63, $17a5e, $17a68, $37a03,
+    $17f56, $17f82, $17f44, $17f52, $17f63, $17f5e, $17f68, $37f03,
+    $1dc56, $1dc82, $1dc44, $1dc52, $1dc63, $1dc5e, $1dc68, $3dc03,
+    $1d056, $1d082, $1d044, $1d052, $1d063, $1d05e, $1d068, $3d003,
+    $18055, $18043, $1805d, $38002, $18255, $18243, $1825d, $38202,
+    $18056, $18082, $18044, $18052, $18063, $1805e, $18068, $38003,
+    $18256, $18282, $18244, $18252, $18263, $1825e, $18268, $38203,
+    $3b000, $3b100, $3b300, $3d100, $3d800, $3d900, $3e300, $3e500,
+    $3e600, $9a, $9f, $a0, $b4, $b6, $b8, $be,
+    $1e642, $3e601, $38100, $38400, $38500, $38600, $38800, $39200,
+    $39a00, $39c00, $3a000, $3a300, $3a400, $3a900, $3aa00, $3ad00,
+    $1e655, $1e643, $1e65d, $3e602, $18142, $38101, $18442, $38401,
+    $18542, $38501, $18642, $38601, $18842, $38801, $19242, $39201,
+    $1e656, $1e682, $1e644, $1e652, $1e663, $1e65e, $1e668, $3e603,
+    $18155, $18143, $1815d, $38102, $18455, $18443, $1845d, $38402,
+    $18156, $18182, $18144, $18152, $18163, $1815e, $18168, $38103,
+    $18456, $18482, $18444, $18452, $18463, $1845e, $18468, $38403,
+    $18342, $38301, $1a242, $3a201, $1b842, $3b801, $1c242, $3c201,
+    $1e042, $3e001, $1e242, $3e201, $39900, $3a100, $3a700, $3ac00,
+    $18355, $18343, $1835d, $38302, $1a255, $1a243, $1a25d, $3a202,
+    $1b855, $1b843, $1b85d, $3b802, $1c255, $1c243, $1c25d, $3c202,
+    $18356, $18382, $18344, $18352, $18363, $1835e, $18368, $38303,
+    $1a256, $1a282, $1a244, $1a252, $1a263, $1a25e, $1a268, $3a203,
+    $18555, $18543, $1855d, $38502, $18655, $18643, $1865d, $38602,
+    $18855, $18843, $1885d, $38802, $19255, $19243, $1925d, $39202,
+    $18556, $18582, $18544, $18552, $18563, $1855e, $18568, $38503,
+    $18656, $18682, $18644, $18652, $18663, $1865e, $18668, $38603,
+    $18856, $18882, $18844, $18852, $18863, $1885e, $18868, $38803,
+    $19256, $19282, $19244, $19252, $19263, $1925e, $19268, $39203,
+    $18956, $18982, $18944, $18952, $18963, $1895e, $18968, $38903,
+    $18a56, $18a82, $18a44, $18a52, $18a63, $18a5e, $18a68, $38a03,
+    $18b55, $18b43, $18b5d, $38b02, $18c55, $18c43, $18c5d, $38c02,
+    $18d55, $18d43, $18d5d, $38d02, $18f55, $18f43, $18f5d, $38f02,
+    $18b56, $18b82, $18b44, $18b52, $18b63, $18b5e, $18b68, $38b03,
+    $18c56, $18c82, $18c44, $18c52, $18c63, $18c5e, $18c68, $38c03,
+    $18d56, $18d82, $18d44, $18d52, $18d63, $18d5e, $18d68, $38d03,
+    $18f56, $18f82, $18f44, $18f52, $18f63, $18f5e, $18f68, $38f03,
+    $19055, $19043, $1905d, $39002, $19155, $19143, $1915d, $39102,
+    $19455, $19443, $1945d, $39402, $19f55, $19f43, $19f5d, $39f02,
+    $19056, $19082, $19044, $19052, $19063, $1905e, $19068, $39003,
+    $19156, $19182, $19144, $19152, $19163, $1915e, $19168, $39103,
+    $39300, $39500, $39600, $39700, $39800, $39b00, $39d00, $39e00,
+    $3a500, $3a600, $3a800, $3ae00, $3af00, $3b400, $3b600, $3b700,
+    $19342, $39301, $19542, $39501, $19642, $39601, $19742, $39701,
+    $19842, $39801, $19b42, $39b01, $19d42, $39d01, $19e42, $39e01,
+    $19355, $19343, $1935d, $39302, $19555, $19543, $1955d, $39502,
+    $19655, $19643, $1965d, $39602, $19755, $19743, $1975d, $39702,
+    $19356, $19382, $19344, $19352, $19363, $1935e, $19368, $39303,
+    $19556, $19582, $19544, $19552, $19563, $1955e, $19568, $39503,
+    $19456, $19482, $19444, $19452, $19463, $1945e, $19468, $39403,
+    $19f56, $19f82, $19f44, $19f52, $19f63, $19f5e, $19f68, $39f03,
+    $19656, $19682, $19644, $19652, $19663, $1965e, $19668, $39603,
+    $19756, $19782, $19744, $19752, $19763, $1975e, $19768, $39703,
+    $19855, $19843, $1985d, $39802, $19b55, $19b43, $19b5d, $39b02,
+    $19d55, $19d43, $19d5d, $39d02, $19e55, $19e43, $19e5d, $39e02,
+    $19856, $19882, $19844, $19852, $19863, $1985e, $19868, $39803,
+    $19b56, $19b82, $19b44, $19b52, $19b63, $19b5e, $19b68, $39b03,
+    $1e055, $1e043, $1e05d, $3e002, $1e255, $1e243, $1e25d, $3e202,
+    $19942, $39901, $1a142, $3a101, $1a742, $3a701, $1ac42, $3ac01,
+    $19955, $19943, $1995d, $39902, $1a155, $1a143, $1a15d, $3a102,
+    $1a755, $1a743, $1a75d, $3a702, $1ac55, $1ac43, $1ac5d, $3ac02,
+    $19956, $19982, $19944, $19952, $19963, $1995e, $19968, $39903,
+    $1a156, $1a182, $1a144, $1a152, $1a163, $1a15e, $1a168, $3a103,
+    $19a42, $39a01, $19c42, $39c01, $1a042, $3a001, $1a342, $3a301,
+    $1a442, $3a401, $1a942, $3a901, $1aa42, $3aa01, $1ad42, $3ad01,
+    $19a55, $19a43, $19a5d, $39a02, $19c55, $19c43, $19c5d, $39c02,
+    $1a055, $1a043, $1a05d, $3a002, $1a355, $1a343, $1a35d, $3a302,
+    $19a56, $19a82, $19a44, $19a52, $19a63, $19a5e, $19a68, $39a03,
+    $19c56, $19c82, $19c44, $19c52, $19c63, $19c5e, $19c68, $39c03,
+    $19d56, $19d82, $19d44, $19d52, $19d63, $19d5e, $19d68, $39d03,
+    $19e56, $19e82, $19e44, $19e52, $19e63, $19e5e, $19e68, $39e03,
+    $1a056, $1a082, $1a044, $1a052, $1a063, $1a05e, $1a068, $3a003,
+    $1a356, $1a382, $1a344, $1a352, $1a363, $1a35e, $1a368, $3a303,
+    $1a455, $1a443, $1a45d, $3a402, $1a955, $1a943, $1a95d, $3a902,
+    $1aa55, $1aa43, $1aa5d, $3aa02, $1ad55, $1ad43, $1ad5d, $3ad02,
+    $1a456, $1a482, $1a444, $1a452, $1a463, $1a45e, $1a468, $3a403,
+    $1a956, $1a982, $1a944, $1a952, $1a963, $1a95e, $1a968, $3a903,
+    $1a542, $3a501, $1a642, $3a601, $1a842, $3a801, $1ae42, $3ae01,
+    $1af42, $3af01, $1b442, $3b401, $1b642, $3b601, $1b742, $3b701,
+    $1a555, $1a543, $1a55d, $3a502, $1a655, $1a643, $1a65d, $3a602,
+    $1a855, $1a843, $1a85d, $3a802, $1ae55, $1ae43, $1ae5d, $3ae02,
+    $1a556, $1a582, $1a544, $1a552, $1a563, $1a55e, $1a568, $3a503,
+    $1a656, $1a682, $1a644, $1a652, $1a663, $1a65e, $1a668, $3a603,
+    $1a756, $1a782, $1a744, $1a752, $1a763, $1a75e, $1a768, $3a703,
+    $1ac56, $1ac82, $1ac44, $1ac52, $1ac63, $1ac5e, $1ac68, $3ac03,
+    $1a856, $1a882, $1a844, $1a852, $1a863, $1a85e, $1a868, $3a803,
+    $1ae56, $1ae82, $1ae44, $1ae52, $1ae63, $1ae5e, $1ae68, $3ae03,
+    $1aa56, $1aa82, $1aa44, $1aa52, $1aa63, $1aa5e, $1aa68, $3aa03,
+    $1ad56, $1ad82, $1ad44, $1ad52, $1ad63, $1ad5e, $1ad68, $3ad03,
+    $1ab42, $3ab01, $1ce42, $3ce01, $1d742, $3d701, $1e142, $3e101,
+    $1ec42, $3ec01, $1ed42, $3ed01, $3c700, $3cf00, $3ea00, $3eb00,
+    $1ab55, $1ab43, $1ab5d, $3ab02, $1ce55, $1ce43, $1ce5d, $3ce02,
+    $1d755, $1d743, $1d75d, $3d702, $1e155, $1e143, $1e15d, $3e102,
+    $1ab56, $1ab82, $1ab44, $1ab52, $1ab63, $1ab5e, $1ab68, $3ab03,
+    $1ce56, $1ce82, $1ce44, $1ce52, $1ce63, $1ce5e, $1ce68, $3ce03,
+    $1af55, $1af43, $1af5d, $3af02, $1b455, $1b443, $1b45d, $3b402,
+    $1b655, $1b643, $1b65d, $3b602, $1b755, $1b743, $1b75d, $3b702,
+    $1af56, $1af82, $1af44, $1af52, $1af63, $1af5e, $1af68, $3af03,
+    $1b456, $1b482, $1b444, $1b452, $1b463, $1b45e, $1b468, $3b403,
+    $1b042, $3b001, $1b142, $3b101, $1b342, $3b301, $1d142, $3d101,
+    $1d842, $3d801, $1d942, $3d901, $1e342, $3e301, $1e542, $3e501,
+    $1b055, $1b043, $1b05d, $3b002, $1b155, $1b143, $1b15d, $3b102,
+    $1b355, $1b343, $1b35d, $3b302, $1d155, $1d143, $1d15d, $3d102,
+    $1b056, $1b082, $1b044, $1b052, $1b063, $1b05e, $1b068, $3b003,
+    $1b156, $1b182, $1b144, $1b152, $1b163, $1b15e, $1b168, $3b103,
+    $1b242, $3b201, $1b542, $3b501, $1b942, $3b901, $1ba42, $3ba01,
+    $1bb42, $3bb01, $1bd42, $3bd01, $1be42, $3be01, $1c442, $3c401,
+    $1b255, $1b243, $1b25d, $3b202, $1b555, $1b543, $1b55d, $3b502,
+    $1b955, $1b943, $1b95d, $3b902, $1ba55, $1ba43, $1ba5d, $3ba02,
+    $1b256, $1b282, $1b244, $1b252, $1b263, $1b25e, $1b268, $3b203,
+    $1b556, $1b582, $1b544, $1b552, $1b563, $1b55e, $1b568, $3b503,
+    $1b356, $1b382, $1b344, $1b352, $1b363, $1b35e, $1b368, $3b303,
+    $1d156, $1d182, $1d144, $1d152, $1d163, $1d15e, $1d168, $3d103,
+    $1b656, $1b682, $1b644, $1b652, $1b663, $1b65e, $1b668, $3b603,
+    $1b756, $1b782, $1b744, $1b752, $1b763, $1b75e, $1b768, $3b703,
+    $1b856, $1b882, $1b844, $1b852, $1b863, $1b85e, $1b868, $3b803,
+    $1c256, $1c282, $1c244, $1c252, $1c263, $1c25e, $1c268, $3c203,
+    $1b956, $1b982, $1b944, $1b952, $1b963, $1b95e, $1b968, $3b903,
+    $1ba56, $1ba82, $1ba44, $1ba52, $1ba63, $1ba5e, $1ba68, $3ba03,
+    $1bb55, $1bb43, $1bb5d, $3bb02, $1bd55, $1bd43, $1bd5d, $3bd02,
+    $1be55, $1be43, $1be5d, $3be02, $1c455, $1c443, $1c45d, $3c402,
+    $1bb56, $1bb82, $1bb44, $1bb52, $1bb63, $1bb5e, $1bb68, $3bb03,
+    $1bd56, $1bd82, $1bd44, $1bd52, $1bd63, $1bd5e, $1bd68, $3bd03,
+    $1bc55, $1bc43, $1bc5d, $3bc02, $1bf55, $1bf43, $1bf5d, $3bf02,
+    $1c555, $1c543, $1c55d, $3c502, $1e755, $1e743, $1e75d, $3e702,
+    $1bc56, $1bc82, $1bc44, $1bc52, $1bc63, $1bc5e, $1bc68, $3bc03,
+    $1bf56, $1bf82, $1bf44, $1bf52, $1bf63, $1bf5e, $1bf68, $3bf03,
+    $1be56, $1be82, $1be44, $1be52, $1be63, $1be5e, $1be68, $3be03,
+    $1c456, $1c482, $1c444, $1c452, $1c463, $1c45e, $1c468, $3c403,
+    $3c000, $3c100, $3c800, $3c900, $3ca00, $3cd00, $3d200, $3d500,
+    $3da00, $3db00, $3ee00, $3f000, $3f200, $3f300, $3ff00, $e3,
+    $1c042, $3c001, $1c142, $3c101, $1c842, $3c801, $1c942, $3c901,
+    $1ca42, $3ca01, $1cd42, $3cd01, $1d242, $3d201, $1d542, $3d501,
+    $1c055, $1c043, $1c05d, $3c002, $1c155, $1c143, $1c15d, $3c102,
+    $1c855, $1c843, $1c85d, $3c802, $1c955, $1c943, $1c95d, $3c902,
+    $1c056, $1c082, $1c044, $1c052, $1c063, $1c05e, $1c068, $3c003,
+    $1c156, $1c182, $1c144, $1c152, $1c163, $1c15e, $1c168, $3c103,
+    $1c556, $1c582, $1c544, $1c552, $1c563, $1c55e, $1c568, $3c503,
+    $1e756, $1e782, $1e744, $1e752, $1e763, $1e75e, $1e768, $3e703,
+    $1c655, $1c643, $1c65d, $3c602, $1e455, $1e443, $1e45d, $3e402,
+    $1e855, $1e843, $1e85d, $3e802, $1e955, $1e943, $1e95d, $3e902,
+    $1c656, $1c682, $1c644, $1c652, $1c663, $1c65e, $1c668, $3c603,
+    $1e456, $1e482, $1e444, $1e452, $1e463, $1e45e, $1e468, $3e403,
+    $1ec55, $1ec43, $1ec5d, $3ec02, $1ed55, $1ed43, $1ed5d, $3ed02,
+    $1c742, $3c701, $1cf42, $3cf01, $1ea42, $3ea01, $1eb42, $3eb01,
+    $1c755, $1c743, $1c75d, $3c702, $1cf55, $1cf43, $1cf5d, $3cf02,
+    $1ea55, $1ea43, $1ea5d, $3ea02, $1eb55, $1eb43, $1eb5d, $3eb02,
+    $1c756, $1c782, $1c744, $1c752, $1c763, $1c75e, $1c768, $3c703,
+    $1cf56, $1cf82, $1cf44, $1cf52, $1cf63, $1cf5e, $1cf68, $3cf03,
+    $1c856, $1c882, $1c844, $1c852, $1c863, $1c85e, $1c868, $3c803,
+    $1c956, $1c982, $1c944, $1c952, $1c963, $1c95e, $1c968, $3c903,
+    $1ca55, $1ca43, $1ca5d, $3ca02, $1cd55, $1cd43, $1cd5d, $3cd02,
+    $1d255, $1d243, $1d25d, $3d202, $1d555, $1d543, $1d55d, $3d502,
+    $1ca56, $1ca82, $1ca44, $1ca52, $1ca63, $1ca5e, $1ca68, $3ca03,
+    $1cd56, $1cd82, $1cd44, $1cd52, $1cd63, $1cd5e, $1cd68, $3cd03,
+    $1da42, $3da01, $1db42, $3db01, $1ee42, $3ee01, $1f042, $3f001,
+    $1f242, $3f201, $1f342, $3f301, $1ff42, $3ff01, $3cb00, $3cc00,
+    $1f255, $1f243, $1f25d, $3f202, $1f355, $1f343, $1f35d, $3f302,
+    $1ff55, $1ff43, $1ff5d, $3ff02, $1cb42, $3cb01, $1cc42, $3cc01,
+    $1ff56, $1ff82, $1ff44, $1ff52, $1ff63, $1ff5e, $1ff68, $3ff03,
+    $1cb55, $1cb43, $1cb5d, $3cb02, $1cc55, $1cc43, $1cc5d, $3cc02,
+    $1cb56, $1cb82, $1cb44, $1cb52, $1cb63, $1cb5e, $1cb68, $3cb03,
+    $1cc56, $1cc82, $1cc44, $1cc52, $1cc63, $1cc5e, $1cc68, $3cc03,
+    $1d256, $1d282, $1d244, $1d252, $1d263, $1d25e, $1d268, $3d203,
+    $1d556, $1d582, $1d544, $1d552, $1d563, $1d55e, $1d568, $3d503,
+    $3d300, $3d400, $3d600, $3dd00, $3de00, $3df00, $3f100, $3f400,
+    $3f500, $3f600, $3f700, $3f800, $3fa00, $3fb00, $3fc00, $3fd00,
+    $1d342, $3d301, $1d442, $3d401, $1d642, $3d601, $1dd42, $3dd01,
+    $1de42, $3de01, $1df42, $3df01, $1f142, $3f101, $1f442, $3f401,
+    $1d355, $1d343, $1d35d, $3d302, $1d455, $1d443, $1d45d, $3d402,
+    $1d655, $1d643, $1d65d, $3d602, $1dd55, $1dd43, $1dd5d, $3dd02,
+    $1d356, $1d382, $1d344, $1d352, $1d363, $1d35e, $1d368, $3d303,
+    $1d456, $1d482, $1d444, $1d452, $1d463, $1d45e, $1d468, $3d403,
+    $1d656, $1d682, $1d644, $1d652, $1d663, $1d65e, $1d668, $3d603,
+    $1dd56, $1dd82, $1dd44, $1dd52, $1dd63, $1dd5e, $1dd68, $3dd03,
+    $1d756, $1d782, $1d744, $1d752, $1d763, $1d75e, $1d768, $3d703,
+    $1e156, $1e182, $1e144, $1e152, $1e163, $1e15e, $1e168, $3e103,
+    $1d855, $1d843, $1d85d, $3d802, $1d955, $1d943, $1d95d, $3d902,
+    $1e355, $1e343, $1e35d, $3e302, $1e555, $1e543, $1e55d, $3e502,
+    $1d856, $1d882, $1d844, $1d852, $1d863, $1d85e, $1d868, $3d803,
+    $1d956, $1d982, $1d944, $1d952, $1d963, $1d95e, $1d968, $3d903,
+    $1da55, $1da43, $1da5d, $3da02, $1db55, $1db43, $1db5d, $3db02,
+    $1ee55, $1ee43, $1ee5d, $3ee02, $1f055, $1f043, $1f05d, $3f002,
+    $1da56, $1da82, $1da44, $1da52, $1da63, $1da5e, $1da68, $3da03,
+    $1db56, $1db82, $1db44, $1db52, $1db63, $1db5e, $1db68, $3db03,
+    $1de55, $1de43, $1de5d, $3de02, $1df55, $1df43, $1df5d, $3df02,
+    $1f155, $1f143, $1f15d, $3f102, $1f455, $1f443, $1f45d, $3f402,
+    $1de56, $1de82, $1de44, $1de52, $1de63, $1de5e, $1de68, $3de03,
+    $1df56, $1df82, $1df44, $1df52, $1df63, $1df5e, $1df68, $3df03,
+    $1e056, $1e082, $1e044, $1e052, $1e063, $1e05e, $1e068, $3e003,
+    $1e256, $1e282, $1e244, $1e252, $1e263, $1e25e, $1e268, $3e203,
+    $1e356, $1e382, $1e344, $1e352, $1e363, $1e35e, $1e368, $3e303,
+    $1e556, $1e582, $1e544, $1e552, $1e563, $1e55e, $1e568, $3e503,
+    $1e856, $1e882, $1e844, $1e852, $1e863, $1e85e, $1e868, $3e803,
+    $1e956, $1e982, $1e944, $1e952, $1e963, $1e95e, $1e968, $3e903,
+    $1ea56, $1ea82, $1ea44, $1ea52, $1ea63, $1ea5e, $1ea68, $3ea03,
+    $1eb56, $1eb82, $1eb44, $1eb52, $1eb63, $1eb5e, $1eb68, $3eb03,
+    $1ec56, $1ec82, $1ec44, $1ec52, $1ec63, $1ec5e, $1ec68, $3ec03,
+    $1ed56, $1ed82, $1ed44, $1ed52, $1ed63, $1ed5e, $1ed68, $3ed03,
+    $1ee56, $1ee82, $1ee44, $1ee52, $1ee63, $1ee5e, $1ee68, $3ee03,
+    $1f056, $1f082, $1f044, $1f052, $1f063, $1f05e, $1f068, $3f003,
+    $1f156, $1f182, $1f144, $1f152, $1f163, $1f15e, $1f168, $3f103,
+    $1f456, $1f482, $1f444, $1f452, $1f463, $1f45e, $1f468, $3f403,
+    $1f256, $1f282, $1f244, $1f252, $1f263, $1f25e, $1f268, $3f203,
+    $1f356, $1f382, $1f344, $1f352, $1f363, $1f35e, $1f368, $3f303,
+    $1f542, $3f501, $1f642, $3f601, $1f742, $3f701, $1f842, $3f801,
+    $1fa42, $3fa01, $1fb42, $3fb01, $1fc42, $3fc01, $1fd42, $3fd01,
+    $1f555, $1f543, $1f55d, $3f502, $1f655, $1f643, $1f65d, $3f602,
+    $1f755, $1f743, $1f75d, $3f702, $1f855, $1f843, $1f85d, $3f802,
+    $1f556, $1f582, $1f544, $1f552, $1f563, $1f55e, $1f568, $3f503,
+    $1f656, $1f682, $1f644, $1f652, $1f663, $1f65e, $1f668, $3f603,
+    $1f756, $1f782, $1f744, $1f752, $1f763, $1f75e, $1f768, $3f703,
+    $1f856, $1f882, $1f844, $1f852, $1f863, $1f85e, $1f868, $3f803,
+    $1fa55, $1fa43, $1fa5d, $3fa02, $1fb55, $1fb43, $1fb5d, $3fb02,
+    $1fc55, $1fc43, $1fc5d, $3fc02, $1fd55, $1fd43, $1fd5d, $3fd02,
+    $1fa56, $1fa82, $1fa44, $1fa52, $1fa63, $1fa5e, $1fa68, $3fa03,
+    $1fb56, $1fb82, $1fb44, $1fb52, $1fb63, $1fb5e, $1fb68, $3fb03,
+    $1fc56, $1fc82, $1fc44, $1fc52, $1fc63, $1fc5e, $1fc68, $3fc03,
+    $1fd56, $1fd82, $1fd44, $1fd52, $1fd63, $1fd5e, $1fd68, $3fd03);
+{ end of the hpack tables }
+
+{ ---- Huffman (RFC 7541 5.2 and appendix B) ---- }
+
+function HuffmanLength(const S: string): Integer;
+var
+  i, bits: Integer;
+begin
+  bits := 0;
+  for i := 1 to Length(S) do
+    bits := bits + HuffBits[Ord(S[i])];
+  Result := (bits + 7) div 8;
+end;
+
+function HuffmanEncode(const S: string): string;
+var
+  i, n, acc, have, code, width, p: Integer;
+begin
+  Result := '';
+  n := HuffmanLength(S);
+  if n = 0 then
+    Exit;
+  SetLength(Result, n);
+  acc := 0;
+  have := 0;
+  p := 1;
+  for i := 1 to Length(S) do
+  begin
+    code := HuffCode[Ord(S[i])];
+    width := HuffBits[Ord(S[i])];
+    { a code is 30 bits at most and at most 7 wait: 37 bits in a word }
+    acc := (acc shl width) or code;
+    have := have + width;
+    while have >= 8 do
+    begin
+      have := have - 8;
+      Result[p] := Chr((acc shr have) and 255);
+      Inc(p);
+    end;
+    acc := acc and ((1 shl have) - 1);
+  end;
+  { the bits left over, then ones: the first bits of EOS }
+  if have > 0 then
+    Result[p] := Chr(((acc shl (8 - have)) or ((1 shl (8 - have)) - 1)) and 255);
+end;
+
+function HuffmanDecode(const S: string; out Res: string): Boolean;
+var
+  i, state, step, b, n: Integer;
+  mayEnd: Boolean;
+begin
+  Res := '';
+  Result := False;
+  { a code is five bits at least: eight octets give at most twelve }
+  SetLength(Res, (Length(S) * 8) div 5 + 1);
+  n := 0;
+  state := 0;
+  mayEnd := True;
+  for i := 1 to Length(S) do
+  begin
+    b := Ord(S[i]);
+    step := HuffStep[state * 16 + (b shr 4)];
+    if (step and $40000) <> 0 then
+    begin
+      Res := '';
+      Exit;
+    end;
+    if (step and $10000) <> 0 then
+    begin
+      Inc(n);
+      Res[n] := Chr((step shr 8) and 255);
+    end;
+    state := step and 255;
+    step := HuffStep[state * 16 + (b and 15)];
+    if (step and $40000) <> 0 then
+    begin
+      Res := '';
+      Exit;
+    end;
+    if (step and $10000) <> 0 then
+    begin
+      Inc(n);
+      Res[n] := Chr((step shr 8) and 255);
+    end;
+    state := step and 255;
+    mayEnd := (step and $20000) <> 0;
+  end;
+  if not mayEnd then
+  begin
+    Res := '';
+    Exit;
+  end;
+  SetLength(Res, n);
+  Result := True;
+end;
+
+{ ---- the dynamic table (RFC 7541 2.3.2 and 4) ---- }
+
+function FieldSize(const F: THpackField): Integer;
+begin
+  Result := Length(F.Name) + Length(F.Value) + 32;
+end;
+
+function TableLen(const T: THpackTable): Integer;
+begin
+  Result := Length(T.Ents) - T.First;
+end;
+
+{ 4.3 and 4.4: the oldest entries go until the table fits }
+procedure TableEvict(var T: THpackTable);
+var
+  i, n: Integer;
+begin
+  while (T.Size > T.MaxSize) and (T.First < Length(T.Ents)) do
+  begin
+    T.Size := T.Size - FieldSize(T.Ents[T.First]);
+    T.Ents[T.First].Name := '';
+    T.Ents[T.First].Value := '';
+    Inc(T.First);
+  end;
+  { the room the evicted ones held, given back when it is half the array }
+  if (T.First > 32) and (T.First * 2 > Length(T.Ents)) then
+  begin
+    n := Length(T.Ents) - T.First;
+    for i := 0 to n - 1 do
+      T.Ents[i] := T.Ents[T.First + i];
+    SetLength(T.Ents, n);
+    T.First := 0;
+  end;
+end;
+
+procedure TableSetMax(var T: THpackTable; V: Integer);
+begin
+  T.MaxSize := V;
+  TableEvict(T);
+end;
+
+{ 4.4: an entry larger than the table empties it and is not kept }
+procedure TableAdd(var T: THpackTable; const F: THpackField);
+var
+  kept: THpackField;
+begin
+  kept.Name := F.Name;
+  kept.Value := F.Value;
+  kept.Sensitive := False;
+  T.Ents := Append(T.Ents, kept);
+  T.Size := T.Size + FieldSize(kept);
+  TableEvict(T);
+end;
+
+{ the entry of index I, from 1: the static table's 61, then the
+  dynamic table's from its newest (2.3.3); False past both }
+function TableAt(const T: THpackTable; I: Integer; out F: THpackField): Boolean;
+var
+  k: Integer;
+begin
+  Result := False;
+  F.Name := '';
+  F.Value := '';
+  F.Sensitive := False;
+  if I < 1 then
+    Exit;
+  if I <= HpackStaticLen then
+  begin
+    F.Name := HpackStaticName[I];
+    F.Value := HpackStaticValue[I];
+    Result := True;
+    Exit;
+  end;
+  k := I - HpackStaticLen;
+  if k > TableLen(T) then
+    Exit;
+  F := T.Ents[Length(T.Ents) - k];
+  Result := True;
+end;
+
+{ ---- the decoder (RFC 7541 3, 5 and 6) ---- }
+
+procedure HpackDecoderInit(var D: THpackDecoder; Allowed: Integer);
+begin
+  D.Tab.Ents := nil;
+  D.Tab.First := 0;
+  D.Tab.Size := 0;
+  D.Tab.Allowed := Allowed;
+  D.Tab.MaxSize := Allowed;
+  if D.Tab.MaxSize > 4096 then
+    D.Tab.MaxSize := 4096;
+end;
+
+{ 5.1: an integer whose prefix is the low N bits of the octet at P; P
+  moves past it. False when the block ends inside it or it is past
+  2^31, which no index and no length of this unit reaches }
+function ReadInt(const B: string; var P: Integer; N: Integer; out V: Integer): Boolean;
+var
+  mask, shift, octet: Integer;
+begin
+  Result := False;
+  V := 0;
+  if P > Length(B) then
+    Exit;
+  mask := (1 shl N) - 1;
+  V := Ord(B[P]) and mask;
+  Inc(P);
+  if V < mask then
+  begin
+    Result := True;
+    Exit;
+  end;
+  shift := 0;
+  while P <= Length(B) do
+  begin
+    octet := Ord(B[P]);
+    Inc(P);
+    V := V + ((octet and 127) shl shift);
+    if V > $7FFFFFFF then
+      Exit;
+    if (octet and 128) = 0 then
+    begin
+      Result := True;
+      Exit;
+    end;
+    shift := shift + 7;
+    if shift > 28 then
+      Exit;
+  end;
+end;
+
+{ 5.2: a string literal at P }
+function ReadString(const B: string; var P: Integer; out S: string): Boolean;
+var
+  huff: Boolean;
+  n: Integer;
+begin
+  Result := False;
+  S := '';
+  if P > Length(B) then
+    Exit;
+  huff := (Ord(B[P]) and 128) <> 0;
+  if not ReadInt(B, P, 7, n) then
+    Exit;
+  if n > Length(B) - P + 1 then
+    Exit;
+  if huff then
+    Result := HuffmanDecode(Copy(B, P, n), S)
+  else
+  begin
+    S := Copy(B, P, n);
+    Result := True;
+  end;
+  P := P + n;
+end;
+
+function HpackDecode(var D: THpackDecoder; const Block: string; Budget: Integer; var Fields: THpackFields;
+  out TooLarge: Boolean; out Err: string): Boolean;
+var
+  p, b, idx, size, used: Integer;
+  f, named: THpackField;
+  index, started: Boolean;
+begin
+  Result := False;
+  TooLarge := False;
+  Err := '';
+  p := 1;
+  used := 0;
+  started := False;
+  while p <= Length(Block) do
+  begin
+    b := Ord(Block[p]);
+    if (b and $E0) = $20 then
+    begin
+      { 6.3: a size update, at the beginning of a block alone (4.2) }
+      if started then
+      begin
+        Err := 'hpack: a table size update after a header field';
+        Exit;
+      end;
+      if not ReadInt(Block, p, 5, size) then
+      begin
+        Err := 'hpack: truncated table size update';
+        Exit;
+      end;
+      if size > D.Tab.Allowed then
+      begin
+        Err := 'hpack: table size update past the size allowed';
+        Exit;
+      end;
+      TableSetMax(D.Tab, size);
+      Continue;
+    end;
+    started := True;
+    if (b and $80) <> 0 then
+    begin
+      { 6.1: an indexed field }
+      if not ReadInt(Block, p, 7, idx) then
+      begin
+        Err := 'hpack: truncated index';
+        Exit;
+      end;
+      if not TableAt(D.Tab, idx, f) then
+      begin
+        Err := 'hpack: no header field has that index';
+        Exit;
+      end;
+    end
+    else
+    begin
+      { 6.2: a literal, with indexing (01), without (0000) or never
+        indexed (0001) }
+      index := (b and $C0) = $40;
+      if index then
+      begin
+        if not ReadInt(Block, p, 6, idx) then
+          idx := -1;
+      end
+      else if not ReadInt(Block, p, 4, idx) then
+        idx := -1;
+      if idx < 0 then
+      begin
+        Err := 'hpack: truncated literal';
+        Exit;
+      end;
+      f.Sensitive := (b and $F0) = $10;
+      if idx > 0 then
+      begin
+        if not TableAt(D.Tab, idx, named) then
+        begin
+          Err := 'hpack: no header field has that index';
+          Exit;
+        end;
+        f.Name := named.Name;
+      end
+      else if not ReadString(Block, p, f.Name) then
+      begin
+        Err := 'hpack: a name that is no string';
+        Exit;
+      end;
+      if not ReadString(Block, p, f.Value) then
+      begin
+        Err := 'hpack: a value that is no string';
+        Exit;
+      end;
+      if index then
+        TableAdd(D.Tab, f);
+    end;
+    used := used + FieldSize(f);
+    if used > Budget then
+      TooLarge := True
+    else
+      Fields := Append(Fields, f);
+  end;
+  Result := True;
+end;
+
+{ ---- the encoder (RFC 7541 2.4 and 6; Go's hpack encode.go) ---- }
+
+procedure HpackEncoderInit(var E: THpackEncoder);
+begin
+  E.Tab.Ents := nil;
+  E.Tab.First := 0;
+  E.Tab.Size := 0;
+  E.Tab.Allowed := 4096;
+  E.Tab.MaxSize := 4096;
+  E.MinSize := -1;
+  E.Update := False;
+  E.NoHuffman := False;
+end;
+
+procedure HpackEncoderLimit(var E: THpackEncoder; PeerSize: Integer);
+var
+  v: Integer;
+begin
+  { SetMaxDynamicTableSizeLimit and SetMaxDynamicTableSize of Go's
+    encoder in one: the table never grows past the 4096 octets it
+    began with, as Go's client keeps it, and a smaller size the peer
+    asks for is taken and said in the next block }
+  v := PeerSize;
+  if v > 4096 then
+    v := 4096;
+  if v < 0 then
+    v := 0;
+  if v = E.Tab.MaxSize then
+    Exit;
+  if (E.MinSize < 0) or (v < E.MinSize) then
+    E.MinSize := v;
+  E.Update := True;
+  E.Tab.Allowed := v;
+  TableSetMax(E.Tab, v);
+end;
+
+procedure PutInt(var Res: TStringBuilder; N, First, V: Integer);
+var
+  mask, rest: Integer;
+begin
+  mask := (1 shl N) - 1;
+  if V < mask then
+  begin
+    Res.AddChar(Chr(First or V));
+    Exit;
+  end;
+  Res.AddChar(Chr(First or mask));
+  rest := V - mask;
+  while rest >= 128 do
+  begin
+    Res.AddChar(Chr((rest and 127) or 128));
+    rest := rest shr 7;
+  end;
+  Res.AddChar(Chr(rest));
+end;
+
+procedure PutString(var Res: TStringBuilder; const S: string; NoHuffman: Boolean);
+var
+  n: Integer;
+begin
+  n := HuffmanLength(S);
+  if (not NoHuffman) and (n < Length(S)) then
+  begin
+    PutInt(Res, 7, 128, n);
+    Res.AddText(HuffmanEncode(S));
+  end
+  else
+  begin
+    PutInt(Res, 7, 0, Length(S));
+    Res.AddText(S);
+  end;
+end;
+
+{ searchTable: the index of a field of this name and value and True,
+  or of one of this name and False, or 0: the static table first, then
+  the dynamic one from its newest }
+function TableSearch(const T: THpackTable; const F: THpackField; out Whole: Boolean): Integer;
+var
+  i, byName: Integer;
+begin
+  Whole := False;
+  byName := 0;
+  for i := 1 to HpackStaticLen do
+    if HpackStaticName[i] = F.Name then
+    begin
+      if HpackStaticValue[i] = F.Value then
+      begin
+        Whole := True;
+        Result := i;
+        Exit;
+      end;
+      if byName = 0 then
+        byName := i;
+    end;
+  for i := Length(T.Ents) - 1 downto T.First do
+    if T.Ents[i].Name = F.Name then
+    begin
+      if T.Ents[i].Value = F.Value then
+      begin
+        Whole := True;
+        Result := HpackStaticLen + Length(T.Ents) - i;
+        Exit;
+      end;
+      if byName = 0 then
+        byName := HpackStaticLen + Length(T.Ents) - i;
+    end;
+  Result := byName;
+end;
+
+function HpackEncode(var E: THpackEncoder; const Fields: THpackFields): string;
+var
+  res: TStringBuilder;
+  i, idx: Integer;
+  whole, index: Boolean;
+begin
+  res := TStringBuilder.Create(256);
+  if E.Update then
+  begin
+    { 4.2: the smallest size since the last block, when it was smaller
+      than the size now, then the size now }
+    E.Update := False;
+    if (E.MinSize >= 0) and (E.MinSize < E.Tab.MaxSize) then
+      PutInt(res, 5, $20, E.MinSize);
+    E.MinSize := -1;
+    PutInt(res, 5, $20, E.Tab.MaxSize);
+  end;
+  for i := 0 to High(Fields) do
+  begin
+    idx := TableSearch(E.Tab, Fields[i], whole);
+    if whole and not Fields[i].Sensitive then
+    begin
+      PutInt(res, 7, $80, idx);
+      Continue;
+    end;
+    index := (not Fields[i].Sensitive) and (not Fields[i].Once) and (FieldSize(Fields[i]) <= E.Tab.MaxSize);
+    if Fields[i].Sensitive then
+      PutInt(res, 4, $10, idx)
+    else if index then
+      PutInt(res, 6, $40, idx)
+    else
+      PutInt(res, 4, 0, idx);
+    if idx = 0 then
+      PutString(res, Fields[i].Name, E.NoHuffman);
+    PutString(res, Fields[i].Value, E.NoHuffman);
+    if index then
+      TableAdd(E.Tab, Fields[i]);
+  end;
+  Result := res.ToString;
+end;
+
+function Http2FieldIndexed(const Name, Value: string): THpackField;
+begin
+  Result.Name := Name;
+  Result.Value := Value;
+  Result.Sensitive := False;
+  Result.Once := False;
+end;
+
+function Http2FieldOnce(const Name, Value: string): THpackField;
+begin
+  Result.Name := Name;
+  Result.Value := Value;
+  Result.Sensitive := False;
+  Result.Once := True;
+end;
+
+function Http2Field(const Name, Value: string): THpackField;
+begin
+  Result.Name := Name;
+  Result.Value := Value;
+  Result.Sensitive := (Name = 'authorization') or (Name = 'proxy-authorization') or (Name = 'cookie') or
+    (Name = 'set-cookie');
+  Result.Once := False;
+end;
+
+function Http2Get(const Fields: THpackFields; const Name: string): string;
+var
+  i: Integer;
+begin
+  Result := '';
+  for i := 0 to High(Fields) do
+    if Fields[i].Name = Name then
+    begin
+      Result := Fields[i].Value;
+      Exit;
+    end;
+end;
+
+{ ---- the connection (RFC 9113) ---- }
+
+const
+  { the client's connection preface (3.4) }
+  H2Preface = 'PRI * HTTP/2.0'#13#10#13#10'SM'#13#10#13#10;
+  { the frame types (6) and their flags }
+  FrData = 0;
+  FrHeaders = 1;
+  FrPriority = 2;
+  FrRstStream = 3;
+  FrSettings = 4;
+  FrPushPromise = 5;
+  FrPing = 6;
+  FrGoAway = 7;
+  FrWindowUpdate = 8;
+  FrContinuation = 9;
+  FlEndStream = 1;
+  FlAck = 1;
+  FlEndHeaders = 4;
+  FlPadded = 8;
+  FlPriority = 32;
+  { a window before SETTINGS say otherwise, and the largest there is
+    (6.9.1, 6.9.2); it is the largest stream number too (5.1.1) }
+  H2InitialWindow = 65535;
+  H2MaxWindow = 2147483647;
+  { what this end lets the peer send: on the whole connection and on a
+    stream (Go's transportDefaultConnFlow and transportDefaultStreamFlow),
+    and in one frame (its defaultMaxReadFrameSize) }
+  H2ConnWindow = 1073741824;
+  H2StreamWindow = 4194304;
+  H2ReadFrame = 1048576;
+  { the content of a request goes in frames of this size at most, so
+    that the requests of other routines get in between; a request that
+    is alone on its connection has nobody to let in, and its frames are
+    as large as Go's (transport.go frameScratchBufferLen: the peer's
+    largest frame, 512 KiB at most): 50 MB to Go's server went in 763
+    frames and twice as many writes where Go's client made 107, in the
+    time Go's takes; in frames of Go's size it takes 0.88 of it }
+  H2DataChunk = 65536;
+  H2DataAlone = 524288;
+  { content of this much or more in one frame is written from where it
+    is, in a write of its own after its frame's nine octets; less is
+    copied behind them and goes in one write }
+  H2Unframed = 16384;
+  { content waits for its turn while this much is pending to be written }
+  H2OutMax = 262144;
+  { what the reading routine reads ahead: a frame's nine octets and, of
+    a small frame, the rest with them; the content of a larger one is
+    read where it is kept, past what came with its head }
+  H2InBuf = 16384;
+  { the end of the stream, as the reading routines say it }
+  H2Eof = -1000000;
+
+function Be32(V: Integer): string;
+begin
+  SetLength(Result, 4);
+  Result[1] := Chr((V shr 24) and 255);
+  Result[2] := Chr((V shr 16) and 255);
+  Result[3] := Chr((V shr 8) and 255);
+  Result[4] := Chr(V and 255);
+end;
+
+function U32At(const S: string; P: Integer): Integer;
+begin
+  Result := (Ord(S[P]) shl 24) or (Ord(S[P + 1]) shl 16) or (Ord(S[P + 2]) shl 8) or Ord(S[P + 3]);
+end;
+
+{ the nine octets before a frame's payload (4.1) }
+procedure FrameHead(var F: string; N, Typ, Flags, Id: Integer);
+begin
+  F[1] := Chr((N shr 16) and 255);
+  F[2] := Chr((N shr 8) and 255);
+  F[3] := Chr(N and 255);
+  F[4] := Chr(Typ);
+  F[5] := Chr(Flags);
+  F[6] := Chr((Id shr 24) and 127);
+  F[7] := Chr((Id shr 16) and 255);
+  F[8] := Chr((Id shr 8) and 255);
+  F[9] := Chr(Id and 255);
+end;
+
+function Frame(Typ, Flags, Id: Integer; const Payload: string): string;
+var
+  n: Integer;
+begin
+  n := Length(Payload);
+  SetLength(Result, 9 + n);
+  FrameHead(Result, n, Typ, Flags, Id);
+  if n > 0 then
+    Move(Payload[1], Result[10], n);
+end;
+
+{ a DATA frame of the N octets of Body from P (6.1) }
+function DataFrame(Id: Integer; Last: Boolean; const Body: string; P, N: Integer): string;
+var
+  flags: Integer;
+begin
+  flags := 0;
+  if Last then
+    flags := FlEndStream;
+  SetLength(Result, 9 + N);
+  FrameHead(Result, N, FrData, flags, Id);
+  if N > 0 then
+    Move(Body[P], Result[10], N);
+end;
+
+function Setting(Id, V: Integer): string;
+begin
+  Result := Chr((Id shr 8) and 255) + Chr(Id and 255) + Be32(V);
+end;
+
+{ GOAWAY (6.8). The last stream of the peer's that this end took is 0:
+  a server opens none, for push is off }
+function GoAwayFrame(Code: Integer): string;
+begin
+  Result := Frame(FrGoAway, 0, 0, Be32(0) + Be32(Code));
+end;
+
+function RstFrame(Id, Code: Integer): string;
+begin
+  Result := Frame(FrRstStream, 0, Id, Be32(Code));
+end;
+
+{ a field block as HEADERS and, past the peer's largest frame, as the
+  CONTINUATION frames that follow it at once (6.2, 6.10; Go's
+  ClientConn.writeHeaders) }
+function HeaderFrames(Id: Integer; const Block: string; EndStream: Boolean; MaxFrame: Integer): string;
+var
+  flags, p, n: Integer;
+  res: TStringBuilder;
+begin
+  flags := 0;
+  if EndStream then
+    flags := FlEndStream;
+  if Length(Block) <= MaxFrame then
+  begin
+    Result := Frame(FrHeaders, flags or FlEndHeaders, Id, Block);
+    Exit;
+  end;
+  res := TStringBuilder.Create(Length(Block) + 9 * (Length(Block) div MaxFrame + 1));
+  res.AddText(Frame(FrHeaders, flags, Id, Copy(Block, 1, MaxFrame)));
+  p := MaxFrame + 1;
+  while p <= Length(Block) do
+  begin
+    n := Length(Block) - p + 1;
+    flags := FlEndHeaders;
+    if n > MaxFrame then
+    begin
+      n := MaxFrame;
+      flags := 0;
+    end;
+    res.AddText(Frame(FrContinuation, flags, Id, Copy(Block, p, n)));
+    p := p + n;
+  end;
+  Result := res.ToString;
+end;
+
+function Http2ErrorName(Code: Integer): string;
+begin
+  case Code of
+    0: Result := 'NO_ERROR';
+    1: Result := 'PROTOCOL_ERROR';
+    2: Result := 'INTERNAL_ERROR';
+    3: Result := 'FLOW_CONTROL_ERROR';
+    4: Result := 'SETTINGS_TIMEOUT';
+    5: Result := 'STREAM_CLOSED';
+    6: Result := 'FRAME_SIZE_ERROR';
+    7: Result := 'REFUSED_STREAM';
+    8: Result := 'CANCEL';
+    9: Result := 'COMPRESSION_ERROR';
+    10: Result := 'CONNECT_ERROR';
+    11: Result := 'ENHANCE_YOUR_CALM';
+    12: Result := 'INADEQUATE_SECURITY';
+    13: Result := 'HTTP_1_1_REQUIRED';
+  else
+    Result := 'error ' + IntToStr(Code);
+  end;
+end;
+
+{ a token of RFC 9110 5.6.2. Lower refuses A to Z too: a field name is
+  written in lower case (RFC 9113 8.2.1) }
+function IsToken(const S: string; Lower: Boolean): Boolean;
+var
+  i, c: Integer;
+begin
+  Result := False;
+  if S = '' then
+    Exit;
+  for i := 1 to Length(S) do
+  begin
+    c := Ord(S[i]);
+    if ((c >= 97) and (c <= 122)) or ((c >= 48) and (c <= 57)) then
+      Continue;
+    if (c >= 65) and (c <= 90) then
+    begin
+      if Lower then
+        Exit;
+      Continue;
+    end;
+    { ! # $ % & ' * + - . ^ _ ` | ~ }
+    case c of
+      33, 35, 36, 37, 38, 39, 42, 43, 45, 46, 94, 95, 96, 124, 126:
+        Continue;
+    else
+      Exit;
+    end;
+  end;
+  Result := True;
+end;
+
+{ a field value (RFC 9113 8.2.1): no octet below the space but the
+  tab, no DEL, and neither a space nor a tab at its ends }
+function IsFieldValue(const S: string): Boolean;
+var
+  i, c, n: Integer;
+begin
+  Result := False;
+  n := Length(S);
+  for i := 1 to n do
+  begin
+    c := Ord(S[i]);
+    if ((c < 32) and (c <> 9)) or (c = 127) then
+      Exit;
+  end;
+  if n > 0 then
+    if (S[1] = ' ') or (S[1] = #9) or (S[n] = ' ') or (S[n] = #9) then
+      Exit;
+  Result := True;
+end;
+
+{ the fields of an HTTP/1.1 connection, which a message of HTTP/2 does
+  not carry (8.2.2) }
+function IsConnField(const Name: string): Boolean;
+begin
+  Result := (Name = 'connection') or (Name = 'proxy-connection') or (Name = 'keep-alive') or
+    (Name = 'transfer-encoding') or (Name = 'upgrade');
+end;
+
+{ The fields of a request, the pseudo-header fields first (8.3.1) in
+  the order Go writes them, and their size as a peer counts it; or why
+  the request is not well formed. The third is :path }
+function RequestFields(const Scheme, Authority, Method, Path: string; const Headers: THpackFields;
+  BodyLen: Integer; out Fields: THpackFields; out Size: Integer): string;
+var
+  i, c, p, q: Integer;
+  f, piece: THpackField;
+begin
+  Result := '';
+  Fields := nil;
+  Size := 0;
+  if not IsToken(Method, False) then
+  begin
+    Result := 'http2: the method is not a token';
+    Exit;
+  end;
+  if Method = 'CONNECT' then
+  begin
+    Result := 'http2: CONNECT is not offered';
+    Exit;
+  end;
+  if not ((Path = '*') or ((Path <> '') and (Path[1] = '/'))) then
+  begin
+    Result := 'http2: a path begins with / (or is * for OPTIONS)';
+    Exit;
+  end;
+  for i := 1 to Length(Path) do
+  begin
+    c := Ord(Path[i]);
+    if (c <= 32) or (c >= 127) then
+    begin
+      Result := 'http2: the path has an octet that goes percent-encoded';
+      Exit;
+    end;
+  end;
+  Fields := Append(Fields, Http2FieldIndexed(':authority', Authority));
+  Fields := Append(Fields, Http2FieldIndexed(':method', Method));
+  Fields := Append(Fields, Http2FieldIndexed(':path', Path));
+  Fields := Append(Fields, Http2FieldIndexed(':scheme', Scheme));
+  for i := 0 to High(Headers) do
+  begin
+    f := Headers[i];
+    if (f.Name <> '') and (f.Name[1] = ':') then
+    begin
+      Result := 'http2: ' + f.Name + ' is a pseudo-header field: the call writes a request''s';
+      Exit;
+    end;
+    if not IsToken(f.Name, True) then
+    begin
+      Result := 'http2: a field name is a token in lower case, and one given is not';
+      Exit;
+    end;
+    if IsConnField(f.Name) then
+    begin
+      Result := 'http2: ' + f.Name + ' belongs to an HTTP/1.1 connection and has no place in HTTP/2 (RFC 9113 8.2.2)';
+      Exit;
+    end;
+    if f.Name = 'host' then
+    begin
+      Result := 'http2: the host is the connection''s authority, not a field';
+      Exit;
+    end;
+    if f.Name = 'content-length' then
+    begin
+      Result := 'http2: content-length is written from the content';
+      Exit;
+    end;
+    if (f.Name = 'te') and (f.Value <> 'trailers') then
+    begin
+      Result := 'http2: te says trailers or is not sent (RFC 9113 8.2.2)';
+      Exit;
+    end;
+    if not IsFieldValue(f.Value) then
+    begin
+      Result := 'http2: the value of ' + f.Name + ' has an octet a field value does not hold, or a space at an end';
+      Exit;
+    end;
+    if f.Name <> 'cookie' then
+    begin
+      Fields := Append(Fields, f);
+      Continue;
+    end;
+    { a cookie field goes crumb by crumb, which compresses better (8.2.3) }
+    piece := f;
+    p := 1;
+    while p <= Length(f.Value) do
+    begin
+      q := p;
+      while (q <= Length(f.Value)) and (f.Value[q] <> ';') do
+        Inc(q);
+      piece.Value := Copy(f.Value, p, q - p);
+      if piece.Value <> '' then
+        Fields := Append(Fields, piece);
+      p := q + 1;
+      while (p <= Length(f.Value)) and (f.Value[p] = ' ') do
+        Inc(p);
+    end;
+  end;
+  { as Go's shouldSendReqContentLength: when there is content, and for
+    the methods that are expected to carry some }
+  if (BodyLen > 0) or (Method = 'POST') or (Method = 'PUT') or (Method = 'PATCH') then
+    Fields := Append(Fields, Http2FieldOnce('content-length', IntToStr(BodyLen)));
+  for i := 0 to High(Fields) do
+    Size := Size + FieldSize(Fields[i]);
+end;
+
+{ The fields of a response's block (8.1, 8.2, 8.3.2): its status and
+  its fields without it, their size, and what content-length says (-1
+  when it says nothing); or why the block is malformed. Trailers have
+  no pseudo-header field at all }
+function ResponseFields(const All: THpackFields; Trailers: Boolean; out Status: Integer;
+  out Fields: THpackFields; out Size, ContentLength: Integer): string;
+var
+  i, j, n, c, v: Integer;
+  regular, haveStatus: Boolean;
+  s: string;
+begin
+  Result := '';
+  Status := 0;
+  Size := 0;
+  ContentLength := -1;
+  regular := False;
+  haveStatus := False;
+  SetLength(Fields, Length(All));
+  n := 0;
+  for i := 0 to High(All) do
+  begin
+    Size := Size + FieldSize(All[i]);
+    s := All[i].Name;
+    if (s <> '') and (s[1] = ':') then
+    begin
+      if Trailers then
+      begin
+        Result := 'a pseudo-header field among the trailers';
+        Exit;
+      end;
+      if regular then
+      begin
+        Result := 'a pseudo-header field after a field';
+        Exit;
+      end;
+      if s <> ':status' then
+      begin
+        Result := 'a pseudo-header field a response does not have';
+        Exit;
+      end;
+      if haveStatus then
+      begin
+        Result := 'two :status fields';
+        Exit;
+      end;
+      haveStatus := True;
+      s := All[i].Value;
+      if Length(s) <> 3 then
+      begin
+        Result := 'a status that is not three digits';
+        Exit;
+      end;
+      for j := 1 to 3 do
+      begin
+        c := Ord(s[j]);
+        if (c < 48) or (c > 57) then
+        begin
+          Result := 'a status that is not three digits';
+          Exit;
+        end;
+        Status := Status * 10 + c - 48;
+      end;
+      Continue;
+    end;
+    regular := True;
+    if not IsToken(s, True) then
+    begin
+      Result := 'a field name that is not a token in lower case';
+      Exit;
+    end;
+    if IsConnField(s) then
+    begin
+      Result := 'the field ' + s + ', which belongs to an HTTP/1.1 connection';
+      Exit;
+    end;
+    if not IsFieldValue(All[i].Value) then
+    begin
+      Result := 'a value of ' + s + ' with an octet a field value does not hold, or a space at an end';
+      Exit;
+    end;
+    if s = 'content-length' then
+    begin
+      { RFC 9110 8.6: digits, and the same every time it is said }
+      s := All[i].Value;
+      if (s = '') or (Length(s) > 18) then
+      begin
+        Result := 'a content-length that is not a number';
+        Exit;
+      end;
+      v := 0;
+      for j := 1 to Length(s) do
+      begin
+        c := Ord(s[j]);
+        if (c < 48) or (c > 57) then
+        begin
+          Result := 'a content-length that is not a number';
+          Exit;
+        end;
+        v := v * 10 + c - 48;
+      end;
+      if (ContentLength >= 0) and (ContentLength <> v) then
+      begin
+        Result := 'two content-length fields that differ';
+        Exit;
+      end;
+      ContentLength := v;
+    end;
+    Fields[n] := All[i];
+    Inc(n);
+  end;
+  SetLength(Fields, n);
+  if (not Trailers) and not haveStatus then
+    Result := 'no :status field';
+end;
+
+{ ---- writing ---- }
+
+{ one write to the peer, with no lock held }
+function THttp2Conn.Raw(const Frames: string): Boolean;
+begin
+  Result := FStream.WriteAll(Frames, PasIoDeadline(FOpt.WriteTimeoutMs));
+end;
+
+{ A write failed, and nothing more can be written. What the peer sent
+  before it went may say why it went (its GOAWAY and reason, an answer
+  in another protocol), so the reading routine is given a second to
+  come to the end of what there is and say so; after it the connection
+  ends for the write's own reason. Under FMu }
+procedure THttp2Conn.WriteFailed;
+begin
+  if FBroken or FWriteBroken then
+    Exit;
+  FWriteBroken := True;
+  FOut.Reset;
+  FFailWhy := 'http2: a write to the peer failed: it is gone, or took nothing for ' + IntToStr(FOpt.WriteTimeoutMs) +
+    ' ms';
+  FFailDue := PasIoDeadline(1000);
+  Arm(FFailDue);
+  FCond.Broadcast;
+end;
+
+{ The routine that holds the turn to write (FWBusy) has written: what
+  other routines left meanwhile goes on a routine of the connection's,
+  to which the turn passes; with nothing left the turn is free. Under
+  FMu }
+procedure THttp2Conn.WriteDone;
+begin
+  if (FOut.ByteLength > 0) and (not FBroken) and not FWriteBroken then
+  begin
+    FWg.Add(1);
+    pas Self.Flusher;
+    Exit;
+  end;
+  FOut.Reset;
+  FWBusy := False;
+  FCond.Broadcast;
+end;
+
+{ Frames, written by the routine that holds the turn. Under FMu, which
+  is let go while the peer takes them }
+procedure THttp2Conn.WriteNow(const Frames: string);
+var
+  ok: Boolean;
+begin
+  FMu.Unlock;
+  ok := Raw(Frames);
+  FMu.Lock;
+  if not ok then
+    WriteFailed;
+  WriteDone;
+end;
+
+{ A DATA frame of the N octets of Body after its first Offset, written
+  by the routine that holds the turn: its nine octets, then the content
+  from where it is, which is not copied to be framed. Under FMu, which
+  is let go while the peer takes them }
+procedure THttp2Conn.WriteContent(S: TH2Stream; const Body: string; Offset, N: Integer; Last: Boolean);
+var
+  head: string;
+  flags, due: Integer;
+  ok: Boolean;
+begin
+  flags := 0;
+  if Last then
+    flags := FlEndStream;
+  SetLength(head, 9);
+  FrameHead(head, N, FrData, flags, S.Id);
+  FMu.Unlock;
+  due := PasIoDeadline(FOpt.WriteTimeoutMs);
+  ok := FStream.WriteAll(head, due) and FStream.WriteFrom(@Body[Offset + 1], N, due);
+  FMu.Lock;
+  if not ok then
+    WriteFailed;
+  WriteDone;
+end;
+
+{ the routine that writes what is pending, until nothing is }
+procedure THttp2Conn.Flusher;
+var
+  pending: string;
+  ok: Boolean;
+begin
+  FMu.Lock;
+  while (FOut.ByteLength > 0) and (not FBroken) and not FWriteBroken do
+  begin
+    pending := FOut.ToString;
+    FOut.Reset;
+    FCond.Broadcast;
+    FMu.Unlock;
+    ok := Raw(pending);
+    FMu.Lock;
+    if not ok then
+      WriteFailed;
+  end;
+  FOut.Reset;
+  FWBusy := False;
+  FCond.Broadcast;
+  FMu.Unlock;
+  FWg.Done;
+end;
+
+{ Frames go to the peer, in the order of the calls: that is the order
+  of the stream numbers and of the compression's state (5.1.1, 4.3),
+  so a field block is encoded and posted without letting FMu go in
+  between. Nobody waits for another's write: while a routine writes,
+  the frames are left for it; otherwise the caller writes them itself
+  when Direct says it may wait for the peer, and a routine of the
+  connection's does when it may not. Under FMu, which a Direct call
+  lets go while it writes }
+procedure THttp2Conn.Post(const Frames: string; Direct: Boolean);
+begin
+  if FBroken or FWriteBroken or (Frames = '') then
+    Exit;
+  if FWBusy then
+  begin
+    FOut.AddText(Frames);
+    Exit;
+  end;
+  FWBusy := True;
+  if Direct then
+  begin
+    WriteNow(Frames);
+    Exit;
+  end;
+  FOut.AddText(Frames);
+  FWg.Add(1);
+  pas Self.Flusher;
+end;
+
+{ the reading routine pays what it owes the peer (acknowledgements,
+  windows, resets) before it waits for more from it }
+procedure THttp2Conn.Owe;
+var
+  frames: string;
+begin
+  frames := FOwed;
+  FOwed := '';
+  FMu.Lock;
+  Post(frames, True);
+  FMu.Unlock;
+end;
+
+{ ---- the end of a stream and of the connection ---- }
+
+function THttp2Conn.GoAwayText: string;
+var
+  i, c: Integer;
+  shown: string;
+begin
+  Result := 'http2: the server is going away (' + Http2ErrorName(FGoAwayCode) + ')';
+  if FGoAwayDebug = '' then
+    Exit;
+  { what it says of its reason, as far as it is text }
+  shown := '';
+  for i := 1 to Length(FGoAwayDebug) do
+  begin
+    if i > 200 then
+      Break;
+    c := Ord(FGoAwayDebug[i]);
+    if (c >= 32) and (c < 127) then
+      shown := shown + FGoAwayDebug[i]
+    else
+      shown := shown + '.';
+  end;
+  Result := Result + ': ' + shown;
+end;
+
+{ A request or a ping is over, whatever its outcome, which its fields
+  say: it leaves the tables, its place among the streams is free, and
+  its routine wakes. Under FMu }
+procedure THttp2Conn.Finish(S: TH2Stream);
+var
+  i, last: Integer;
+begin
+  if S.Ended then
+    Exit;
+  S.Ended := True;
+  if S.Id <> 0 then
+    Delete(FStreams, S.Id);
+  Unwatch(S);
+  if S.PingData <> '' then
+  begin
+    last := High(FPings);
+    for i := 0 to last do
+      if FPings[i] = S then
+      begin
+        FPings[i] := FPings[last];
+        SetLength(FPings, last);
+        Break;
+      end;
+  end;
+  if S.HasSlot then
+  begin
+    S.HasSlot := False;
+    if S.TimedOut and (S.Id <> 0) and (S.ReadMark = FReadCount) and not FClosed then
+    begin
+      { Nothing has come from the peer since this request went, and the
+        peer may be gone: the request's place stays taken until a PING
+        shows the peer is there, so that a dead connection is not given
+        request after request (Go's pendingResets) }
+      Inc(FPendingResets);
+      S.AskPeer := True;
+    end
+    else
+      Dec(FActive);
+  end;
+  S.Wake.Signal;
+  FCond.Broadcast;
+  { a connection that is going away, or has no stream numbers left,
+    ends with its last stream }
+  if (not FClosed) and (Length(FStreams) = 0) then
+  begin
+    if FGoAway then
+      Fail(GoAwayText, True)
+    else if FSpent then
+      Fail('http2: the connection has used all its stream numbers', True);
+  end;
+end;
+
+{ The connection is over for Why: its requests fail and no new one
+  begins. Broken says that nothing more is written either; the stream
+  under the connection is then shut, which brings the reading routine
+  back. Under FMu }
+procedure THttp2Conn.Fail(const Why: string; Broken: Boolean);
+var
+  id: Integer;
+  s: TH2Stream;
+begin
+  if not FClosed then
+  begin
+    FClosed := True;
+    FErr := Why;
+    for id, s in FStreams do
+    begin
+      if s.Err = '' then
+        s.Err := Why;
+      Finish(s);
+    end;
+    while Length(FPings) > 0 do
+      Finish(FPings[0]);
+    FCond.Broadcast;
+  end;
+  if Broken and not FBroken then
+  begin
+    FBroken := True;
+    FOut.Reset;
+    if (not FTornDown) and not FUserClosed then
+      FStream.Shutdown(2);
+  end;
+  Poke;
+end;
+
+{ ---- deadlines ---- }
+
+procedure THttp2Conn.Poke;
+var
+  one, n: Integer;
+begin
+  if FTimerFd < 0 then
+    Exit;
+  one := 1;
+  n := PasIoWrite(FTimerFd, @one, 8, 0);
+end;
+
+{ the routine of the deadlines is to wake at Due at the latest }
+procedure THttp2Conn.Arm(Due: Integer);
+begin
+  if (FTimerNext = 0) or (Due < FTimerNext) then
+  begin
+    FTimerNext := Due;
+    Poke;
+  end;
+end;
+
+procedure THttp2Conn.Watch(S: TH2Stream);
+begin
+  if FTimedN = Length(FTimed) then
+    SetLength(FTimed, 2 * FTimedN + 8);
+  FTimed[FTimedN] := S;
+  S.TimedAt := FTimedN;
+  Inc(FTimedN);
+  Arm(S.Deadline);
+end;
+
+procedure THttp2Conn.Unwatch(S: TH2Stream);
+var
+  k: Integer;
+begin
+  k := S.TimedAt;
+  if (k < 0) or (k >= FTimedN) or (FTimed[k] <> S) then
+    Exit;
+  Dec(FTimedN);
+  FTimed[k] := FTimed[FTimedN];
+  FTimed[k].TimedAt := k;
+  FTimed[FTimedN] := nil;
+  S.TimedAt := -1;
+end;
+
+{ a PING of the connection's own: the peer answers it within
+  PingTimeoutMs or the connection is lost. It is never written by the
+  caller, which may be the routine of the deadlines }
+procedure THttp2Conn.HealthPing;
+begin
+  if (FHealthDue <> 0) or FClosed then
+    Exit;
+  Inc(FPingSeq);
+  FHealthData := Be32(0) + Be32(FPingSeq);
+  FHealthDue := PasIoDeadline(FOpt.PingTimeoutMs);
+  Arm(FHealthDue);
+  Post(Frame(FrPing, 0, 0, FHealthData), False);
+end;
+
+{ The routine that keeps the deadlines: it parks on its eventfd until
+  the nearest of them, or until a nearer one is set and it is poked.
+  It writes nothing to the peer itself, so a peer that takes nothing
+  cannot hold a deadline back }
+procedure THttp2Conn.TimerLoop;
+var
+  buf, n, tnow, next, idle, i, fd: Integer;
+  s: TH2Stream;
+begin
+  FMu.Lock;
+  while not FClosed do
+  begin
+    tnow := Nanotime;
+    next := 0;
+    i := 0;
+    while i < FTimedN do
+    begin
+      s := FTimed[i];
+      if s.Deadline <= tnow then
+      begin
+        { its place in the table is taken by another, looked at next }
+        s.TimedOut := True;
+        if s.PingData = '' then
+          s.Err := 'http2: no response within ' + IntToStr(s.TimeoutMs) + ' ms';
+        Finish(s);
+        Continue;
+      end;
+      if (next = 0) or (s.Deadline < next) then
+        next := s.Deadline;
+      Inc(i);
+    end;
+    if FClosed then
+      Break;
+    if FFailDue <> 0 then
+    begin
+      if FFailDue <= tnow then
+      begin
+        Fail(FFailWhy, True);
+        Break;
+      end;
+      if (next = 0) or (FFailDue < next) then
+        next := FFailDue;
+    end;
+    if FHealthDue <> 0 then
+    begin
+      if FHealthDue <= tnow then
+      begin
+        Fail('http2: the peer did not answer a PING within ' + IntToStr(FOpt.PingTimeoutMs) +
+          ' ms: the connection is lost', True);
+        Break;
+      end;
+      if (next = 0) or (FHealthDue < next) then
+        next := FHealthDue;
+    end
+    else if FOpt.ReadIdleMs > 0 then
+    begin
+      idle := FLastRead + FOpt.ReadIdleMs * 1000000;
+      if idle <= tnow then
+      begin
+        HealthPing;
+        idle := FHealthDue;
+      end;
+      if (next = 0) or (idle < next) then
+        next := idle;
+    end;
+    FTimerNext := next;
+    FMu.Unlock;
+    n := PasIoRead(FTimerFd, @buf, 8, next);
+    FMu.Lock;
+  end;
+  fd := FTimerFd;
+  FTimerFd := -1;
+  FMu.Unlock;
+  NetClose(fd);
+  FWg.Done;
+end;
+
+{ ---- reading ---- }
+
+{ at least Need octets are in FIn from FInPos, Need no more than FIn
+  holds: 0, or H2Eof at the end of the stream, or what the read
+  answered }
+function THttp2Conn.Fill(Need: Integer): Integer;
+var
+  n, have, i: Integer;
+begin
+  Result := 0;
+  have := FInEnd - FInPos;
+  if have >= Need then
+    Exit;
+  if FInPos > 1 then
+  begin
+    { what is left, less than a frame's head, goes to the front }
+    for i := 1 to have do
+      FIn[i] := FIn[FInPos + i - 1];
+    FInPos := 1;
+    FInEnd := 1 + have;
+  end;
+  while FInEnd - FInPos < Need do
+  begin
+    if FOwed <> '' then
+      Owe;
+    n := FStream.ReadInto(@FIn[FInEnd], Length(FIn) - FInEnd + 1, 0);
+    if n <= 0 then
+    begin
+      Result := n;
+      if n = 0 then
+        Result := H2Eof;
+      Exit;
+    end;
+    FInEnd := FInEnd + n;
+  end;
+end;
+
+{ the next N octets into Dest after its first Offset: what was read
+  ahead first, the rest read from the stream straight into their place }
+function THttp2Conn.ReadTo(var Dest: string; Offset, N: Integer): Integer;
+var
+  got, k: Integer;
+begin
+  Result := 0;
+  got := FInEnd - FInPos;
+  if got > N then
+    got := N;
+  if got > 0 then
+  begin
+    Move(FIn[FInPos], Dest[Offset + 1], got);
+    FInPos := FInPos + got;
+  end;
+  while got < N do
+  begin
+    if FOwed <> '' then
+      Owe;
+    k := FStream.ReadInto(@Dest[Offset + got + 1], N - got, 0);
+    if k <= 0 then
+    begin
+      Result := k;
+      if k = 0 then
+        Result := H2Eof;
+      Exit;
+    end;
+    got := got + k;
+  end;
+end;
+
+{ the next N octets, the payload of a frame that is not content to keep }
+function THttp2Conn.ReadBytes(N: Integer; out Data: string): Integer;
+begin
+  Result := 0;
+  Data := '';
+  if N = 0 then
+    Exit;
+  if FInEnd - FInPos >= N then
+  begin
+    Data := Copy(FIn, FInPos, N);
+    FInPos := FInPos + N;
+    Exit;
+  end;
+  SetLength(Data, N);
+  Result := ReadTo(Data, 0, N);
+  if Result <> 0 then
+    Data := '';
+end;
+
+{ the next N octets are read and let by }
+function THttp2Conn.Skip(N: Integer): Integer;
+var
+  k: Integer;
+begin
+  Result := 0;
+  while N > 0 do
+  begin
+    Result := Fill(1);
+    if Result <> 0 then
+      Exit;
+    k := FInEnd - FInPos;
+    if k > N then
+      k := N;
+    FInPos := FInPos + k;
+    N := N - k;
+  end;
+end;
+
+{ The nine octets before the next frame's payload (4.1): its type, its
+  flags, its stream and the payload's length. 0; or H2Eof, or what the
+  read answered; or, above 0, the code of a connection error, its
+  reason in FWhy }
+function THttp2Conn.ReadHead(out Typ, Flags, Id, N: Integer): Integer;
+begin
+  Typ := 0;
+  Flags := 0;
+  Id := 0;
+  N := 0;
+  Result := Fill(9);
+  if Result <> 0 then
+    Exit;
+  if (not FGotFrame) and (Copy(FIn, FInPos, 5) = 'HTTP/') then
+  begin
+    { as Go says it of a frame header that looks like HTTP/1.1's status line }
+    FWhy := 'the server answered in HTTP/1: it does not speak HTTP/2 here';
+    Result := H2ProtocolError;
+    Exit;
+  end;
+  FGotFrame := True;
+  N := (Ord(FIn[FInPos]) shl 16) or (Ord(FIn[FInPos + 1]) shl 8) or Ord(FIn[FInPos + 2]);
+  Typ := Ord(FIn[FInPos + 3]);
+  Flags := Ord(FIn[FInPos + 4]);
+  Id := U32At(FIn, FInPos + 5) and H2MaxWindow;
+  FInPos := FInPos + 9;
+  if N > H2ReadFrame then
+  begin
+    FWhy := 'a frame of ' + IntToStr(N) + ' octets, past the ' + IntToStr(H2ReadFrame) + ' this end takes';
+    Result := H2FrameSizeError;
+  end;
+end;
+
+{ What of a frame needs no lock, for it is the reading routine's own:
+  the order of the frames of a field block (6.10), the padding (6.1,
+  6.2), and the block itself, decoded when its last frame came (Whole,
+  with the stream and the flags of its HEADERS in FContId and
+  FContFlags). 0, or the code of a connection error, its reason in
+  FWhy }
+function THttp2Conn.Before(Typ, Flags, Id: Integer; const Payload: string; out Data: string; out Whole: Boolean;
+  out All: THpackFields; out TooLarge: Boolean): Integer;
+var
+  p, pad, n, size: Integer;
+  block, err: string;
+begin
+  Result := 0;
+  Data := '';
+  Whole := False;
+  All := nil;
+  TooLarge := False;
+  if FContId <> 0 then
+  begin
+    if (Typ <> FrContinuation) or (Id <> FContId) then
+    begin
+      FWhy := 'a frame in the middle of a field block (RFC 9113 6.10)';
+      Result := H2ProtocolError;
+      Exit;
+    end;
+  end
+  else if Typ = FrContinuation then
+  begin
+    FWhy := 'CONTINUATION with no field block open';
+    Result := H2ProtocolError;
+    Exit;
+  end;
+  n := Length(Payload);
+  if Typ = FrData then
+  begin
+    if Id = 0 then
+    begin
+      FWhy := 'DATA on stream 0';
+      Result := H2ProtocolError;
+      Exit;
+    end;
+    if (Flags and FlPadded) = 0 then
+    begin
+      Data := Payload;
+      Exit;
+    end;
+    if n < 1 then
+    begin
+      FWhy := 'a padded DATA frame with no room for its padding''s length';
+      Result := H2FrameSizeError;
+      Exit;
+    end;
+    pad := Ord(Payload[1]);
+    if pad > n - 1 then
+    begin
+      FWhy := 'padding longer than its frame';
+      Result := H2ProtocolError;
+      Exit;
+    end;
+    Data := Copy(Payload, 2, n - 1 - pad);
+    Exit;
+  end;
+  if (Typ <> FrHeaders) and (Typ <> FrContinuation) then
+    Exit;
+  if Typ = FrHeaders then
+  begin
+    if Id = 0 then
+    begin
+      FWhy := 'HEADERS on stream 0';
+      Result := H2ProtocolError;
+      Exit;
+    end;
+    p := 1;
+    pad := 0;
+    if (Flags and FlPadded) <> 0 then
+    begin
+      if n < 1 then
+      begin
+        FWhy := 'a padded HEADERS frame with no room for its padding''s length';
+        Result := H2FrameSizeError;
+        Exit;
+      end;
+      pad := Ord(Payload[1]);
+      p := 2;
+    end;
+    if (Flags and FlPriority) <> 0 then
+    begin
+      { the priority of RFC 7540, which RFC 9113 5.3.2 no longer uses: let by }
+      if n - p + 1 < 5 then
+      begin
+        FWhy := 'a HEADERS frame with no room for its priority';
+        Result := H2FrameSizeError;
+        Exit;
+      end;
+      p := p + 5;
+    end;
+    if pad > n - p + 1 then
+    begin
+      FWhy := 'padding longer than its frame';
+      Result := H2ProtocolError;
+      Exit;
+    end;
+    if (p = 1) and (pad = 0) then
+      FContFirst := Payload
+    else
+      FContFirst := Copy(Payload, p, n - p + 1 - pad);
+    FContId := Id;
+    FContFlags := Flags;
+    FContMore := nil;
+    size := Length(FContFirst);
+  end
+  else
+  begin
+    if FContMore = nil then
+    begin
+      FContMore := TStringBuilder.Create(2 * Length(FContFirst) + n + 64);
+      FContMore.AddText(FContFirst);
+      FContFirst := '';
+    end;
+    FContMore.AddText(Payload);
+    size := FContMore.ByteLength;
+  end;
+  { A block is kept until its last frame, so it has a bound of its own,
+    twice what its fields may take: a list within the budget is not
+    longer than that written out. Go bounds it the same (readMetaFrame) }
+  if size > 2 * FOpt.MaxHeaderBytes then
+  begin
+    FWhy := 'a field block of more than ' + IntToStr(2 * FOpt.MaxHeaderBytes) + ' octets';
+    Result := H2EnhanceYourCalm;
+    Exit;
+  end;
+  if (Flags and FlEndHeaders) = 0 then
+    Exit;
+  if FContMore = nil then
+    block := FContFirst
+  else
+    block := FContMore.ToString;
+  FContFirst := '';
+  FContMore := nil;
+  { the id stays in FContId for the caller, which ends the block }
+  if not HpackDecode(FDec, block, FOpt.MaxHeaderBytes, All, TooLarge, err) then
+  begin
+    FWhy := 'a field block that is not HPACK: ' + err;
+    Result := H2CompressionError;
+    Exit;
+  end;
+  Whole := True;
+end;
+
+{ a connection error (5.4.1), found by the reading routine under FMu:
+  its loop sends GOAWAY and ends the connection }
+procedure THttp2Conn.ConnError(Code: Integer; const Why: string);
+begin
+  if FConnErr <> 0 then
+    Exit;
+  FConnErr := Code;
+  FWhy := Why;
+end;
+
+{ a stream error (5.4.2): RST_STREAM to the peer, and the request, when
+  there is one, fails for Why }
+procedure THttp2Conn.StreamError(S: TH2Stream; Id, Code: Integer; const Why: string);
+begin
+  FOwed := FOwed + RstFrame(Id, Code);
+  if S = nil then
+    Exit;
+  if S.Err = '' then
+    S.Err := Why;
+  Finish(S);
+end;
+
+{ N octets of content were taken (6.9): the peer is told, of the
+  connection and of S unless it is nil, once half a window is used up.
+  Go's rule sends an update for every 4 KiB taken as well, a write for
+  nearly every frame; half the window keeps the peer sending without a
+  pause just the same, since what is taken here is kept, within its
+  budget, and never waits for a reader }
+procedure THttp2Conn.GiveBack(S: TH2Stream; N: Integer);
+begin
+  FRecvUnacked := FRecvUnacked + N;
+  if FRecvUnacked >= H2ConnWindow div 2 then
+  begin
+    FOwed := FOwed + Frame(FrWindowUpdate, 0, 0, Be32(FRecvUnacked));
+    FRecvWindow := FRecvWindow + FRecvUnacked;
+    FRecvUnacked := 0;
+  end;
+  if S = nil then
+    Exit;
+  S.RecvUnacked := S.RecvUnacked + N;
+  if S.RecvUnacked >= H2StreamWindow div 2 then
+  begin
+    FOwed := FOwed + Frame(FrWindowUpdate, 0, S.Id, Be32(S.RecvUnacked));
+    S.RecvWindow := S.RecvWindow + S.RecvUnacked;
+    S.RecvUnacked := 0;
+  end;
+end;
+
+{ the peer ended the stream: the response is whole, when its content
+  is as long as its content-length said (8.1.1); a response to HEAD
+  and a 304 say a length and carry nothing (RFC 9110 8.6) }
+procedure THttp2Conn.EndOfStream(S: TH2Stream);
+begin
+  if (S.WantLength >= 0) and (not S.IsHead) and (S.Status <> 304) and (S.Received <> S.WantLength) then
+  begin
+    StreamError(S, S.Id, H2ProtocolError, 'http2: malformed response: content of ' + IntToStr(S.Received) +
+      ' octets and a content-length of ' + IntToStr(S.WantLength));
+    Exit;
+  end;
+  S.Ok := True;
+  Finish(S);
+end;
+
+{ a field block: a response's header fields, an interim response's, or
+  the trailers (8.1) }
+procedure THttp2Conn.OnHeaders(Id: Integer; EndStream: Boolean; const All: THpackFields; TooLarge: Boolean);
+var
+  s: TH2Stream;
+  status, size, clen: Integer;
+  fields: THpackFields;
+  why: string;
+begin
+  if not TryGet(FStreams, Id, s) then
+  begin
+    { a stream this end gave up is closed, and what was on its way is
+      let by (5.1); one that was never opened is the peer's error }
+    if ((Id and 1) = 0) or (Id >= FNextId) then
+      ConnError(H2ProtocolError, 'a field block on a stream that was never opened');
+    Exit;
+  end;
+  if TooLarge then
+  begin
+    { not a fault of the protocol's, for the limit is advice (6.5.2):
+      this end gives the request up, which CANCEL says, where Go says
+      PROTOCOL_ERROR }
+    StreamError(s, Id, H2Cancel, 'http2: the response''s header fields are past their budget of ' +
+      IntToStr(FOpt.MaxHeaderBytes) + ' octets');
+    Exit;
+  end;
+  why := ResponseFields(All, s.GotHeaders, status, fields, size, clen);
+  if why <> '' then
+  begin
+    StreamError(s, Id, H2ProtocolError, 'http2: malformed response: ' + why);
+    Exit;
+  end;
+  if s.GotHeaders then
+  begin
+    if not EndStream then
+    begin
+      StreamError(s, Id, H2ProtocolError, 'http2: malformed response: a second field block that does not end it');
+      Exit;
+    end;
+    s.Trailers := fields;
+    EndOfStream(s);
+    Exit;
+  end;
+  if (status >= 100) and (status <= 199) then
+  begin
+    { an interim response: let by, its size counted so that there is
+      an end to them. 101 is not of HTTP/2 (8.6) }
+    if EndStream or (status = 101) then
+    begin
+      StreamError(s, Id, H2ProtocolError, 'http2: malformed response: an interim response of status ' +
+        IntToStr(status) + ' that HTTP/2 does not have, or that ends the stream');
+      Exit;
+    end;
+    s.InterimBytes := s.InterimBytes + size;
+    if s.InterimBytes > FOpt.MaxHeaderBytes then
+      StreamError(s, Id, H2Cancel, 'http2: the interim responses are past the budget of ' +
+        IntToStr(FOpt.MaxHeaderBytes) + ' octets');
+    Exit;
+  end;
+  s.GotHeaders := True;
+  s.Status := status;
+  s.Fields := fields;
+  s.WantLength := clen;
+  { content that its own content-length puts past the budget is not
+    waited for; a response to HEAD and a 304 say a length and carry none }
+  if (clen > s.MaxBody) and (not s.IsHead) and (status <> 304) then
+  begin
+    StreamError(s, Id, H2Cancel, 'http2: the response''s content is past its budget of ' + IntToStr(s.MaxBody) +
+      ' octets');
+    Exit;
+  end;
+  if EndStream then
+    EndOfStream(s);
+end;
+
+{ Content of N octets comes on stream Id, in a frame of Counted with
+  its padding, which is what the windows count (6.1, 6.9.1). All that
+  does not depend on the content itself is settled here: the windows,
+  the state of the stream, its budget and what content-length said.
+  The stream, with room made in its Buf, when the content is to be
+  kept; nil when it is to be let by, the connection's window given
+  back and the fault, when it is one, answered. Under FMu }
+function THttp2Conn.DataBegin(Id, N, Counted: Integer): TH2Stream;
+var
+  s: TH2Stream;
+  need, room: Integer;
+begin
+  Result := nil;
+  { Neither window can be overrun while a frame is no larger than half
+    of each (H2ReadFrame, H2StreamWindow, H2ConnWindow): the windows are
+    given back at half. The two checks stand for when those constants
+    change, and scripts/check_http2_variants.py changes them }
+  if Counted > FRecvWindow then
+  begin
+    ConnError(H2FlowControlError, 'more content than the connection''s window let');
+    Exit;
+  end;
+  FRecvWindow := FRecvWindow - Counted;
+  if not TryGet(FStreams, Id, s) then
+  begin
+    if ((Id and 1) = 0) or (Id >= FNextId) then
+      ConnError(H2ProtocolError, 'content on a stream that was never opened')
+    else
+      GiveBack(nil, Counted);
+    Exit;
+  end;
+  if Counted > s.RecvWindow then
+  begin
+    ConnError(H2FlowControlError, 'more content than the stream''s window let');
+    Exit;
+  end;
+  s.RecvWindow := s.RecvWindow - Counted;
+  if not s.GotHeaders then
+  begin
+    GiveBack(nil, Counted);
+    StreamError(s, Id, H2ProtocolError, 'http2: malformed response: content before its header fields');
+    Exit;
+  end;
+  if s.IsHead and (N > 0) then
+  begin
+    GiveBack(nil, Counted);
+    StreamError(s, Id, H2ProtocolError, 'http2: malformed response: content in answer to HEAD');
+    Exit;
+  end;
+  need := s.Received + N;
+  if need > s.MaxBody then
+  begin
+    GiveBack(nil, Counted);
+    StreamError(s, Id, H2Cancel, 'http2: the response''s content is past its budget of ' + IntToStr(s.MaxBody) +
+      ' octets');
+    Exit;
+  end;
+  if (s.WantLength >= 0) and (need > s.WantLength) then
+  begin
+    GiveBack(nil, Counted);
+    StreamError(s, Id, H2ProtocolError, 'http2: malformed response: more content than its content-length of ' +
+      IntToStr(s.WantLength));
+    Exit;
+  end;
+  if Length(s.Buf) < need then
+  begin
+    { room: what content-length promises, once; without it twice what
+      there is, the budget at most. A response of one frame gets its size }
+    room := need;
+    if (s.WantLength >= need) and (s.WantLength <= s.MaxBody) then
+      room := s.WantLength
+    else if s.Received > 0 then
+    begin
+      room := 2 * Length(s.Buf);
+      if room < need then
+        room := need;
+      if room > s.MaxBody then
+        room := s.MaxBody;
+    end;
+    SetLength(s.Buf, room);
+  end;
+  Result := s;
+end;
+
+{ the N octets DataBegin made room for are in S.Buf: they count, the
+  windows are given back, and the response ends when the frame said so.
+  A request that was given up while its content was read has only the
+  connection's window given back. Under FMu }
+procedure THttp2Conn.DataEnd(S: TH2Stream; N, Counted: Integer; EndStream: Boolean);
+begin
+  if S.Ended then
+  begin
+    GiveBack(nil, Counted);
+    Exit;
+  end;
+  S.Received := S.Received + N;
+  if EndStream then
+  begin
+    GiveBack(nil, Counted);
+    EndOfStream(S);
+  end
+  else
+    GiveBack(S, Counted);
+end;
+
+{ content that was read with its frame: padded, empty, or come in the
+  middle of what the read loop does not take the short way for }
+procedure THttp2Conn.OnData(Id: Integer; EndStream: Boolean; const Data: string; Counted: Integer);
+var
+  s: TH2Stream;
+  n: Integer;
+begin
+  n := Length(Data);
+  s := DataBegin(Id, n, Counted);
+  if s = nil then
+    Exit;
+  if n > 0 then
+    Move(Data[1], s.Buf[s.Received + 1], n);
+  DataEnd(s, n, Counted, EndStream);
+end;
+
+{ SETTINGS (6.5): the peer's limits, taken in the order they come, and
+  acknowledged }
+procedure THttp2Conn.OnSettings(Flags, Id: Integer; const Payload: string);
+var
+  p, sid, v, delta, k: Integer;
+  s: TH2Stream;
+  sawStreams: Boolean;
+begin
+  if Id <> 0 then
+  begin
+    ConnError(H2ProtocolError, 'SETTINGS on a stream');
+    Exit;
+  end;
+  if (Flags and FlAck) <> 0 then
+  begin
+    if Payload <> '' then
+      ConnError(H2FrameSizeError, 'a SETTINGS acknowledgement with content')
+    else if FSettingsAcked then
+      ConnError(H2ProtocolError, 'a SETTINGS acknowledgement nobody asked for')
+    else
+      FSettingsAcked := True;
+    Exit;
+  end;
+  if Length(Payload) mod 6 <> 0 then
+  begin
+    ConnError(H2FrameSizeError, 'SETTINGS whose size is not a number of settings');
+    Exit;
+  end;
+  sawStreams := False;
+  p := 1;
+  while p <= Length(Payload) do
+  begin
+    sid := (Ord(Payload[p]) shl 8) or Ord(Payload[p + 1]);
+    v := U32At(Payload, p + 2);
+    p := p + 6;
+    case sid of
+      1:
+        { the table the peer decodes with: this end's encoder follows,
+          and says so at the head of its next block (RFC 7541 4.2). To
+          follow before the acknowledgement is written is right too: the
+          encoder never uses more than the smaller of the old size and
+          the new }
+        HpackEncoderLimit(FEnc, v);
+      2:
+        if v <> 0 then
+        begin
+          ConnError(H2ProtocolError, 'a server that turns server push on (RFC 9113 6.5.2)');
+          Exit;
+        end;
+      3:
+        begin
+          FPeerMaxStreams := v;
+          sawStreams := True;
+        end;
+      4:
+        begin
+          if v > H2MaxWindow then
+          begin
+            ConnError(H2FlowControlError, 'an initial window past 2^31 - 1');
+            Exit;
+          end;
+          { every open stream's window moves by the difference (6.9.2) }
+          delta := v - FPeerInitialWindow;
+          FPeerInitialWindow := v;
+          for k, s in FStreams do
+          begin
+            s.SendWindow := s.SendWindow + delta;
+            if s.SendWindow > H2MaxWindow then
+            begin
+              ConnError(H2FlowControlError, 'an initial window that takes a stream''s past 2^31 - 1');
+              Exit;
+            end;
+          end;
+        end;
+      5:
+        begin
+          if (v < 16384) or (v > 16777215) then
+          begin
+            ConnError(H2ProtocolError, 'a largest frame size out of its range');
+            Exit;
+          end;
+          FPeerMaxFrame := v;
+        end;
+      6:
+        FPeerMaxHeaderList := v;
+    end;
+  end;
+  if not FGotSettings then
+  begin
+    FGotSettings := True;
+    { a peer that sets no limit to its streams gets Go's
+      (defaultMaxConcurrentStreams) }
+    if not sawStreams then
+      FPeerMaxStreams := 1000;
+  end;
+  FOwed := FOwed + Frame(FrSettings, FlAck, 0, '');
+  FCond.Broadcast;
+end;
+
+{ RST_STREAM (6.4): the peer ended the stream }
+procedure THttp2Conn.OnRst(Id: Integer; const Payload: string);
+var
+  s: TH2Stream;
+  code: Integer;
+begin
+  if Length(Payload) <> 4 then
+  begin
+    ConnError(H2FrameSizeError, 'RST_STREAM that is not four octets');
+    Exit;
+  end;
+  if (Id = 0) or ((Id and 1) = 0) or (Id >= FNextId) then
+  begin
+    ConnError(H2ProtocolError, 'RST_STREAM for a stream that was never opened');
+    Exit;
+  end;
+  if not TryGet(FStreams, Id, s) then
+    Exit;
+  code := U32At(Payload, 1);
+  s.ErrorCode := code;
+  { REFUSED_STREAM says that nothing was done with the request (8.7) }
+  s.Refused := code = H2RefusedStream;
+  s.Err := 'http2: the server reset the stream (' + Http2ErrorName(code) + ')';
+  Finish(s);
+end;
+
+{ PING (6.7): the peer's is answered; an answer ends the ping it is to }
+procedure THttp2Conn.OnPing(Flags, Id: Integer; const Payload: string);
+var
+  i: Integer;
+  s: TH2Stream;
+begin
+  if Length(Payload) <> 8 then
+  begin
+    ConnError(H2FrameSizeError, 'PING that is not eight octets');
+    Exit;
+  end;
+  if Id <> 0 then
+  begin
+    ConnError(H2ProtocolError, 'PING on a stream');
+    Exit;
+  end;
+  if (Flags and FlAck) = 0 then
+  begin
+    FOwed := FOwed + Frame(FrPing, FlAck, 0, Payload);
+    Exit;
+  end;
+  if (FHealthDue <> 0) and (Payload = FHealthData) then
+  begin
+    { the peer is there: the places kept for requests it had not
+      answered are free again }
+    FHealthDue := 0;
+    FHealthData := '';
+    FActive := FActive - FPendingResets;
+    FPendingResets := 0;
+    FCond.Broadcast;
+    { the routine of the deadlines is parked until this PING's; the next
+      idle time comes sooner }
+    if FOpt.ReadIdleMs > 0 then
+      Arm(FLastRead + FOpt.ReadIdleMs * 1000000);
+    Exit;
+  end;
+  for i := 0 to High(FPings) do
+    if FPings[i].PingData = Payload then
+    begin
+      s := FPings[i];
+      s.Ok := True;
+      Finish(s);
+      Exit;
+    end;
+end;
+
+{ GOAWAY (6.8): the peer takes no stream above the one it names. Those
+  it did not take fail as not processed and can be sent again (8.7);
+  the others go on, and the connection ends with the last of them }
+procedure THttp2Conn.OnGoAway(Id: Integer; const Payload: string);
+var
+  last, code, k: Integer;
+  s: TH2Stream;
+begin
+  if Id <> 0 then
+  begin
+    ConnError(H2ProtocolError, 'GOAWAY on a stream');
+    Exit;
+  end;
+  if Length(Payload) < 8 then
+  begin
+    ConnError(H2FrameSizeError, 'GOAWAY shorter than eight octets');
+    Exit;
+  end;
+  last := U32At(Payload, 1) and H2MaxWindow;
+  code := U32At(Payload, 5);
+  { a second one may only lower the stream; the first error and the
+    first reason are kept, as Go keeps them }
+  if (not FGoAway) or (last < FGoAwayLast) then
+    FGoAwayLast := last;
+  if (not FGoAway) or (FGoAwayCode = H2NoError) then
+    FGoAwayCode := code;
+  if FGoAwayDebug = '' then
+    FGoAwayDebug := Copy(Payload, 9, 1024);
+  FGoAway := True;
+  for k, s in FStreams do
+    if s.Id > FGoAwayLast then
+    begin
+      s.Refused := True;
+      s.ErrorCode := FGoAwayCode;
+      s.Err := GoAwayText + ', before it took the request';
+      Finish(s);
+    end;
+  FCond.Broadcast;
+  if (not FClosed) and (Length(FStreams) = 0) then
+    Fail(GoAwayText, True);
+end;
+
+{ WINDOW_UPDATE (6.9): the peer takes more content }
+procedure THttp2Conn.OnWindowUpdate(Id: Integer; const Payload: string);
+var
+  s: TH2Stream;
+  more: Integer;
+begin
+  if Length(Payload) <> 4 then
+  begin
+    ConnError(H2FrameSizeError, 'WINDOW_UPDATE that is not four octets');
+    Exit;
+  end;
+  more := U32At(Payload, 1) and H2MaxWindow;
+  if Id = 0 then
+  begin
+    if more = 0 then
+      ConnError(H2ProtocolError, 'a window update of nothing')
+    else if FSendWindow + more > H2MaxWindow then
+      ConnError(H2FlowControlError, 'a connection window past 2^31 - 1')
+    else
+    begin
+      FSendWindow := FSendWindow + more;
+      FCond.Broadcast;
+    end;
+    Exit;
+  end;
+  if ((Id and 1) = 0) or (Id >= FNextId) then
+  begin
+    ConnError(H2ProtocolError, 'WINDOW_UPDATE for a stream that was never opened');
+    Exit;
+  end;
+  if not TryGet(FStreams, Id, s) then
+    Exit;
+  if more = 0 then
+  begin
+    StreamError(s, Id, H2ProtocolError, 'http2: the server sent a window update of nothing');
+    Exit;
+  end;
+  if s.SendWindow + more > H2MaxWindow then
+  begin
+    StreamError(s, Id, H2FlowControlError, 'http2: the server opened the stream''s window past 2^31 - 1');
+    Exit;
+  end;
+  s.SendWindow := s.SendWindow + more;
+  FCond.Broadcast;
+end;
+
+{ PRIORITY (6.3): of RFC 7540's priorities, which RFC 9113 no longer
+  uses, only the frame's shape is still checked }
+procedure THttp2Conn.OnPriority(Id: Integer; const Payload: string);
+var
+  s: TH2Stream;
+begin
+  if Id = 0 then
+  begin
+    ConnError(H2ProtocolError, 'PRIORITY on stream 0');
+    Exit;
+  end;
+  if Length(Payload) = 5 then
+    Exit;
+  { 6.3: a stream error; of the connection when the stream is not one
+    this end opened, for RST_STREAM is not sent for an idle stream (6.4) }
+  if ((Id and 1) = 0) or (Id >= FNextId) then
+  begin
+    ConnError(H2FrameSizeError, 'PRIORITY that is not five octets');
+    Exit;
+  end;
+  s := nil;
+  if not TryGet(FStreams, Id, s) then
+    s := nil;
+  StreamError(s, Id, H2FrameSizeError, 'http2: the server sent PRIORITY that is not five octets');
+end;
+
+function THttp2Conn.ReadWhy(R: Integer): string;
+var
+  why: string;
+begin
+  if FGoAway then
+  begin
+    Result := GoAwayText;
+    Exit;
+  end;
+  if R = H2Eof then
+  begin
+    Result := 'http2: the server closed the connection';
+    Exit;
+  end;
+  why := '';
+  if FStream is TTlsStream then
+    why := (FStream as TTlsStream).LastError;
+  if why = '' then
+    why := 'error ' + IntToStr(-R);
+  Result := 'http2: reading from the server failed: ' + why;
+end;
+
+{ what a frame brought is settled: a connection error it showed sends
+  GOAWAY with its code and ends the connection (5.4.1). False when the
+  connection is over. Under FMu }
+function THttp2Conn.Settle: Boolean;
+var
+  frames: string;
+begin
+  if FConnErr <> 0 then
+  begin
+    frames := FOwed + GoAwayFrame(FConnErr);
+    FOwed := '';
+    Post(frames, True);
+    if FWBusy and (not FBroken) and not FWriteBroken then
+    begin
+      { Another routine was writing and the frames were left for it:
+        they are waited for, since what is pending is dropped when the
+        connection is cut. For a second and no longer: a peer that sent
+        what it should not and takes nothing either does not hold the
+        requests until a write gives up. The routine of the deadlines
+        cuts the connection then, for this reason }
+      if FFailDue = 0 then
+      begin
+        FFailWhy := 'http2: ' + FWhy + ' (' + Http2ErrorName(FConnErr) + ')';
+        FFailDue := PasIoDeadline(1000);
+        Arm(FFailDue);
+      end;
+      while FWBusy and (not FBroken) and not FWriteBroken do
+        FCond.Wait(FMu);
+    end;
+    Fail('http2: ' + FWhy + ' (' + Http2ErrorName(FConnErr) + ')', True);
+  end;
+  Result := not FBroken;
+end;
+
+{ One frame, read and handed to its stream under FMu. False when the
+  connection is over, FMu then held }
+function THttp2Conn.Step: Boolean;
+var
+  typ, flags, id, n, r: Integer;
+  payload, data: string;
+  whole, tooLarge: Boolean;
+  all: THpackFields;
+  s: TH2Stream;
+begin
+  Result := False;
+  r := ReadHead(typ, flags, id, n);
+  if (r = 0) and (typ = FrData) and (n > 0) and (id <> 0) and (FContId = 0) and ((flags and FlPadded) = 0) then
+  begin
+    { Content, the short way: where it goes is settled before it is
+      read, and it is read into its place, FMu let go meanwhile. Only
+      this routine touches a stream's Buf until the stream has ended }
+    FMu.Lock;
+    if FBroken then
+      Exit;
+    s := nil;
+    if not FGotSettings then
+      ConnError(H2ProtocolError, 'the server did not begin with SETTINGS')
+    else
+    begin
+      Inc(FReadCount);
+      if FOpt.ReadIdleMs > 0 then
+        FLastRead := Nanotime;
+      s := DataBegin(id, n, n);
+    end;
+    if FConnErr <> 0 then
+    begin
+      { A connection error at the head of a frame: its content is let by
+        before the connection ends, as a frame read whole has been (Go's
+        framer reads every frame whole). A socket closed with octets
+        unread answers its peer with a reset, not the end of the stream,
+        and on TCP a reset can take the GOAWAY with it before the peer
+        has read it }
+      FMu.Unlock;
+      r := Skip(n);
+      FMu.Lock;
+      if FBroken then
+        Exit;
+    end;
+    if not Settle then
+      Exit;
+    FMu.Unlock;
+    if s <> nil then
+      r := ReadTo(s.Buf, s.Received, n)
+    else
+      r := Skip(n);
+    FMu.Lock;
+    if FBroken then
+      Exit;
+    if r <> 0 then
+      Fail(ReadWhy(r), True)
+    else if s <> nil then
+      DataEnd(s, n, n, (flags and FlEndStream) <> 0);
+    Result := Settle;
+    if Result then
+      FMu.Unlock;
+    Exit;
+  end;
+  payload := '';
+  whole := False;
+  if r = 0 then
+    r := ReadBytes(n, payload);
+  if r = 0 then
+    r := Before(typ, flags, id, payload, data, whole, all, tooLarge);
+  FMu.Lock;
+  if FBroken then
+    Exit;
+  if r > 0 then
+    FConnErr := r
+  else if r < 0 then
+    Fail(ReadWhy(r), True)
+  else if (not FGotSettings) and ((typ <> FrSettings) or ((flags and FlAck) <> 0)) then
+    { 3.4: the server's preface is a SETTINGS frame, its first }
+    ConnError(H2ProtocolError, 'the server did not begin with SETTINGS')
+  else
+  begin
+    Inc(FReadCount);
+    if FOpt.ReadIdleMs > 0 then
+      FLastRead := Nanotime;
+    case typ of
+      FrData:
+        OnData(id, (flags and FlEndStream) <> 0, data, Length(payload));
+      FrHeaders, FrContinuation:
+        if whole then
+        begin
+          id := FContId;
+          flags := FContFlags;
+          FContId := 0;
+          OnHeaders(id, (flags and FlEndStream) <> 0, all, tooLarge);
+        end;
+      FrPriority:
+        OnPriority(id, payload);
+      FrRstStream:
+        OnRst(id, payload);
+      FrSettings:
+        OnSettings(flags, id, payload);
+      FrPushPromise:
+        ConnError(H2ProtocolError, 'PUSH_PROMISE, which this end turned off (6.6)');
+      FrPing:
+        OnPing(flags, id, payload);
+      FrGoAway:
+        OnGoAway(id, payload);
+      FrWindowUpdate:
+        OnWindowUpdate(id, payload);
+    end;
+    { a frame of a type this end does not know is let by (4.1) }
+  end;
+  Result := Settle;
+  if Result then
+    FMu.Unlock;
+end;
+
+{ The routine that reads (Go's clientConnReadLoop.run): frame after
+  frame. When the connection is over it waits for the last write, gives
+  the stream back and ends }
+procedure THttp2Conn.ReadLoop;
+begin
+  while Step do
+    ;
+  while FWBusy do
+    FCond.Wait(FMu);
+  FTornDown := True;
+  FMu.Unlock;
+  FStream.Dispose;
+  FWg.Done;
+end;
+
+{ ---- the calls ---- }
+
+constructor THttp2Conn.Create(Stream: TNetStream; const AScheme, AAuthority: string; const Options: THttp2Options);
+var
+  hello: string;
+begin
+  inherited Create;
+  FStream := Stream;
+  FScheme := AScheme;
+  FAuthority := AAuthority;
+  FOpt := Options;
+  if FOpt.MaxHeaderBytes <= 0 then
+    FOpt.MaxHeaderBytes := 1048576;
+  if FOpt.MaxBodyBytes <= 0 then
+    FOpt.MaxBodyBytes := 67108864;
+  if FOpt.WriteTimeoutMs <= 0 then
+    FOpt.WriteTimeoutMs := 30000;
+  if FOpt.PingTimeoutMs <= 0 then
+    FOpt.PingTimeoutMs := 15000;
+  if FOpt.ReadIdleMs < 0 then
+    FOpt.ReadIdleMs := 0;
+  New(FStreams);
+  FOut := TStringBuilder.Create(1024);
+  SetLength(FIn, H2InBuf);
+  FInPos := 1;
+  FInEnd := 1;
+  FNextId := 1;
+  FSendWindow := H2InitialWindow;
+  FPeerInitialWindow := H2InitialWindow;
+  FPeerMaxFrame := 16384;
+  { before the peer's SETTINGS, Go's initialMaxConcurrentStreams }
+  FPeerMaxStreams := 100;
+  FPeerMaxHeaderList := -1;
+  FRecvWindow := H2InitialWindow + H2ConnWindow;
+  FGoAwayLast := H2MaxWindow;
+  FGoAwayCode := -1;
+  FTimerFd := -1;
+  HpackEncoderInit(FEnc);
+  HpackDecoderInit(FDec, 4096);
+  if Stream = nil then
+    FErr := 'http2: no stream to speak on'
+  else
+  begin
+    { eventfd2(2): 290 on amd64, 19 on arm64; EFD_CLOEXEC and
+      EFD_NONBLOCK, as passignal makes its own }
+    if Amd64 = 1 then
+      FTimerFd := Syscall(290, 0, 526336)
+    else
+      FTimerFd := Syscall(19, 0, 526336);
+    { 3.4: the preface, then SETTINGS; and the connection's window, which
+      SETTINGS cannot say (6.9.2). Push is off, the rest are the limits
+      of this end }
+    hello := H2Preface + Frame(FrSettings, 0, 0, Setting(2, 0) + Setting(4, H2StreamWindow) +
+      Setting(5, H2ReadFrame) + Setting(6, FOpt.MaxHeaderBytes)) + Frame(FrWindowUpdate, 0, 0, Be32(H2ConnWindow));
+    if FTimerFd < 0 then
+      FErr := 'http2: no descriptor for the connection''s deadlines'
+    else if not FStream.WriteAll(hello, PasIoDeadline(FOpt.WriteTimeoutMs)) then
+      FErr := 'http2: the connection preface could not be written';
+  end;
+  if FErr <> '' then
+  begin
+    FClosed := True;
+    FBroken := True;
+    FTornDown := True;
+    if FTimerFd >= 0 then
+      NetClose(FTimerFd);
+    FTimerFd := -1;
+    if FStream <> nil then
+      FStream.Dispose;
+    Exit;
+  end;
+  FLastRead := Nanotime;
+  FWg.Add(2);
+  pas Self.ReadLoop;
+  pas Self.TimerLoop;
+end;
+
+{ as much of Want octets of content as the windows and the peer's
+  frame size let go now, taken from the windows (6.9.1; Go's
+  awaitFlowControl) }
+function THttp2Conn.Credit(S: TH2Stream; Want: Integer): Integer;
+begin
+  Result := Want;
+  if Result > S.SendWindow then
+    Result := S.SendWindow;
+  if Result > FSendWindow then
+    Result := FSendWindow;
+  if Result > FPeerMaxFrame then
+    Result := FPeerMaxFrame;
+  if FActive > 1 then
+  begin
+    if Result > H2DataChunk then
+      Result := H2DataChunk;
+  end
+  else if Result > H2DataAlone then
+    Result := H2DataAlone;
+  if Result <= 0 then
+  begin
+    Result := 0;
+    Exit;
+  end;
+  S.SendWindow := S.SendWindow - Result;
+  FSendWindow := FSendWindow - Result;
+end;
+
+function THttp2Conn.Request(const Method, Path: string; const Headers: THpackFields; const Body: string;
+  TimeoutMs, MaxBody: Integer; out Resp: THttp2Response; out Err: string): Boolean;
+var
+  s: TH2Stream;
+  fields: THpackFields;
+  size, n, sent, take: Integer;
+  frames: string;
+begin
+  Result := False;
+  Resp := Default(THttp2Response);
+  Resp.ErrorCode := -1;
+  Err := RequestFields(FScheme, FAuthority, Method, Path, Headers, Length(Body), fields, size);
+  if Err <> '' then
+    Exit;
+  s := TH2Stream.Create;
+  s.IsHead := Method = 'HEAD';
+  s.MaxBody := MaxBody;
+  if s.MaxBody <= 0 then
+    s.MaxBody := FOpt.MaxBodyBytes;
+  s.WantLength := -1;
+  s.ErrorCode := -1;
+  s.TimedAt := -1;
+  s.TimeoutMs := TimeoutMs;
+  n := Length(Body);
+  FMu.Lock;
+  if TimeoutMs > 0 then
+  begin
+    s.Deadline := PasIoDeadline(TimeoutMs);
+    Watch(s);
+  end;
+  { a place among the streams the peer lets be open at once (5.1.2) }
+  while (not s.Ended) and (not FClosed) and (not FGoAway) and (not FWriteBroken) and (FActive >= FPeerMaxStreams) do
+    FCond.Wait(FMu);
+  if s.Ended or FClosed or FGoAway or FWriteBroken or (FNextId > H2MaxWindow) or
+    ((FPeerMaxHeaderList >= 0) and (size > FPeerMaxHeaderList)) then
+  begin
+    { the request does not leave }
+    Resp.NotProcessed := True;
+    if s.Ended then
+    begin
+      Err := s.Err;
+      Resp.TimedOut := True;
+    end
+    else if FClosed then
+      Err := FErr
+    else if FGoAway then
+      Err := GoAwayText
+    else if FWriteBroken then
+      Err := FFailWhy
+    else if FNextId > H2MaxWindow then
+      Err := 'http2: the connection has used all its stream numbers'
+    else
+    begin
+      Err := 'http2: the request''s header fields take ' + IntToStr(size) + ' octets and the server takes ' +
+        IntToStr(FPeerMaxHeaderList);
+      Resp.NotProcessed := False;
+    end;
+    Finish(s);
+    FMu.Unlock;
+    Exit;
+  end;
+  Inc(FActive);
+  s.HasSlot := True;
+  s.Id := FNextId;
+  FNextId := FNextId + 2;
+  { 5.1.1: a connection that has used its stream numbers takes no more
+    requests; those on their way go on, and it ends with the last }
+  if FNextId > H2MaxWindow then
+    FSpent := True;
+  FStreams[s.Id] := s;
+  s.SendWindow := FPeerInitialWindow;
+  s.RecvWindow := H2StreamWindow;
+  s.ReadMark := FReadCount;
+  { A path enters the compression's table when the request before it
+    had the same one, as with an API of one address, and not when each
+    request has its own, as with a push to a device, which would only
+    push the fields worth keeping out of the table. Go's encoder puts
+    every path in; nghttp2's none }
+  fields[2].Once := Path <> FLastPath;
+  FLastPath := Path;
+  { the first of the content goes with the field block, in one write,
+    when the windows let it }
+  take := Credit(s, n);
+  frames := HeaderFrames(s.Id, HpackEncode(FEnc, fields), n = 0, FPeerMaxFrame);
+  if take > 0 then
+    frames := frames + DataFrame(s.Id, take = n, Body, 1, take);
+  sent := take;
+  Post(frames, True);
+  { the rest as the windows open (6.9) }
+  while (sent < n) and (not s.Ended) and not FWriteBroken do
+  begin
+    if FOut.ByteLength > H2OutMax then
+    begin
+      FCond.Wait(FMu);
+      Continue;
+    end;
+    take := Credit(s, n - sent);
+    if take = 0 then
+    begin
+      FCond.Wait(FMu);
+      Continue;
+    end;
+    if (take >= H2Unframed) and (not FWBusy) and (not FBroken) and not FWriteBroken then
+    begin
+      { much content and nobody writing: it goes from where it is }
+      FWBusy := True;
+      WriteContent(s, Body, sent, take, sent + take = n);
+    end
+    else
+      Post(DataFrame(s.Id, sent + take = n, Body, sent + 1, take), True);
+    sent := sent + take;
+  end;
+  while not s.Ended do
+    s.Wake.Wait(FMu);
+  if s.Ok then
+  begin
+    { 8.1: a response that came whole before the request's content had
+      all gone ends the request too; the peer is told to expect no more }
+    if sent < n then
+      Post(RstFrame(s.Id, H2NoError), False);
+    Resp.Status := s.Status;
+    Resp.Fields := s.Fields;
+    Resp.Trailers := s.Trailers;
+    if Length(s.Buf) <> s.Received then
+      SetLength(s.Buf, s.Received);
+    Resp.Body := s.Buf;
+    Result := True;
+  end
+  else
+  begin
+    Err := s.Err;
+    Resp.NotProcessed := s.Refused;
+    Resp.TimedOut := s.TimedOut;
+    Resp.ErrorCode := s.ErrorCode;
+    if s.GotHeaders then
+    begin
+      Resp.Status := s.Status;
+      Resp.Fields := s.Fields;
+    end;
+    if s.TimedOut then
+    begin
+      { the peer is told that the request was given up; neither frame
+        is waited for, the deadline has passed }
+      Post(RstFrame(s.Id, H2Cancel), False);
+      if s.AskPeer then
+        HealthPing;
+    end;
+  end;
+  FMu.Unlock;
+end;
+
+function THttp2Conn.Ping(TimeoutMs: Integer): Boolean;
+var
+  s: TH2Stream;
+begin
+  Result := False;
+  s := TH2Stream.Create;
+  s.TimedAt := -1;
+  s.ErrorCode := -1;
+  FMu.Lock;
+  if FClosed or FWriteBroken then
+  begin
+    FMu.Unlock;
+    Exit;
+  end;
+  Inc(FPingSeq);
+  s.PingData := Be32(0) + Be32(FPingSeq);
+  if TimeoutMs > 0 then
+  begin
+    s.Deadline := PasIoDeadline(TimeoutMs);
+    Watch(s);
+  end;
+  FPings := Append(FPings, s);
+  Post(Frame(FrPing, 0, 0, s.PingData), True);
+  while not s.Ended do
+    s.Wake.Wait(FMu);
+  Result := s.Ok;
+  FMu.Unlock;
+end;
+
+procedure THttp2Conn.Dispose;
+begin
+  FMu.Lock;
+  if not FClosed then
+  begin
+    FUserClosed := True;
+    Fail('http2: the connection was disposed of', False);
+    Post(GoAwayFrame(H2NoError), True);
+    while FWBusy and not FBroken do
+      FCond.Wait(FMu);
+    { no more is read: the reading routine comes back, and ends the
+      connection in order }
+    if not FTornDown then
+      FStream.Shutdown(0);
+  end;
+  FMu.Unlock;
+  FWg.Wait;
+end;
+
+function THttp2Conn.Alive: Boolean;
+begin
+  FMu.Lock;
+  Result := (not FClosed) and (not FGoAway) and (not FSpent) and not FWriteBroken;
+  FMu.Unlock;
+end;
+
+function THttp2Conn.LastError: string;
+begin
+  FMu.Lock;
+  Result := FErr;
+  FMu.Unlock;
+end;
+
+function THttp2Conn.GoAwayData: string;
+begin
+  FMu.Lock;
+  Result := FGoAwayDebug;
+  FMu.Unlock;
+end;
+
+function THttp2Conn.Streams: Integer;
+begin
+  FMu.Lock;
+  Result := Length(FStreams);
+  FMu.Unlock;
+end;
+
+function THttp2Conn.PeerMaxStreams: Integer;
+begin
+  FMu.Lock;
+  Result := FPeerMaxStreams;
+  FMu.Unlock;
+end;
+
+{ ---- making a connection ---- }
+
+function Http2Authority(const Host: string; Port: Integer; Tls: Boolean): string;
+var
+  i, own: Integer;
+  v6: Boolean;
+begin
+  own := 80;
+  if Tls then
+    own := 443;
+  v6 := False;
+  for i := 1 to Length(Host) do
+    if Host[i] = ':' then
+      v6 := True;
+  Result := Host;
+  if v6 and (Host[1] <> '[') then
+    Result := '[' + Host + ']';
+  if Port <> own then
+    Result := Result + ':' + IntToStr(Port);
+end;
+
+function Http2Dial(const Host: string; Port, ConnectMs: Integer; Config: TTlsConfig; const Options: THttp2Options;
+  out Err: string): THttp2Conn;
+var
+  cfg: TTlsConfig;
+  tls: TTlsStream;
+  chosen: string;
+begin
+  Result := nil;
+  Err := '';
+  { the caller's configuration with h2 as the one protocol offered
+    (3.2); its own is left as it was }
+  cfg := TTlsConfig.Create;
+  if Config <> nil then
+  begin
+    cfg.ServerName := Config.ServerName;
+    cfg.MinVersion := Config.MinVersion;
+    cfg.MaxVersion := Config.MaxVersion;
+    cfg.RootsPem := Config.RootsPem;
+    cfg.InsecureSkipVerify := Config.InsecureSkipVerify;
+    cfg.NowUnix := Config.NowUnix;
+  end;
+  SetLength(cfg.Alpn, 1);
+  cfg.Alpn[0] := 'h2';
+  tls := TlsDial(Host, Port, ConnectMs, cfg, Err);
+  if tls = nil then
+    Exit;
+  chosen := tls.Protocol;
+  if chosen <> 'h2' then
+  begin
+    if chosen = '' then
+      Err := 'http2: the server chose no protocol: it does not speak HTTP/2 here'
+    else
+      Err := 'http2: the server chose ' + chosen + ', not h2';
+    tls.Dispose;
+    Exit;
+  end;
+  Result := THttp2Conn.Create(tls, 'https', Http2Authority(Host, Port, True), Options);
+  if not Result.Alive then
+  begin
+    Err := Result.LastError;
+    Result := nil;
+  end;
+end;
+
+function Http2DialPlain(const Host: string; Port, ConnectMs: Integer; const Options: THttp2Options;
+  out Err: string): THttp2Conn;
+var
+  raw: TNetStream;
+begin
+  Result := nil;
+  Err := '';
+  raw := DialTcp(Host, Port, ConnectMs);
+  if raw = nil then
+  begin
+    Err := 'dial tcp ' + Host + ':' + IntToStr(Port) + ': connection failed';
+    Exit;
+  end;
+  Result := THttp2Conn.Create(raw, 'http', Http2Authority(Host, Port, False), Options);
+  if not Result.Alive then
+  begin
+    Err := Result.LastError;
+    Result := nil;
+  end;
+end;
+
+constructor THttp2Client.Create(const Host: string; Port: Integer; Config: TTlsConfig; const Options: THttp2Options);
+begin
+  inherited Create;
+  FHost := Host;
+  FPort := Port;
+  FConfig := Config;
+  FOptions := Options;
+  ConnectTimeoutMs := 10000;
+end;
+
+{ the routine that makes a connection: what comes of it is in D for
+  every request that waits for it, and in the client when the client
+  was not disposed of meanwhile }
+procedure THttp2Client.Dialer(D: TH2Dial; Epoch: Integer);
+var
+  c, stale: THttp2Conn;
+  err: string;
+begin
+  if Plain then
+    c := Http2DialPlain(FHost, FPort, ConnectTimeoutMs, FOptions, err)
+  else
+    c := Http2Dial(FHost, FPort, ConnectTimeoutMs, FConfig, FOptions, err);
+  stale := nil;
+  FMu.Lock;
+  if FDial = D then
+    FDial := nil;
+  if c <> nil then
+  begin
+    if Epoch = FEpoch then
+    begin
+      FConn := c;
+      Inc(FDials);
+    end
+    else
+    begin
+      stale := c;
+      c := nil;
+      err := 'http2: the client was disposed of while its connection was being made';
+    end;
+  end;
+  D.Conn := c;
+  D.Err := err;
+  Close(D.Finished);
+  FMu.Unlock;
+  if stale <> nil then
+    stale.Dispose;
+end;
+
+{ The connection to use: the one held while it takes requests, else
+  the one a routine of the client's is making, waited for until Due (a
+  Nanotime, 0 none); Late says the wait ended at Due. A connection that
+  is going away is let go and not disposed of: the requests it still
+  carries end on it, and it ends itself with the last of them }
+function THttp2Client.Conn(Due: Integer; out Err: string; out Late: Boolean): THttp2Conn;
+var
+  d: TH2Dial;
+  fin: chan of Integer;
+  v: Integer;
+  got: Boolean;
+begin
+  Result := nil;
+  Err := '';
+  Late := False;
+  FMu.Lock;
+  if (FConn <> nil) and not FConn.Alive then
+    FConn := nil;
+  if FConn <> nil then
+  begin
+    Result := FConn;
+    FMu.Unlock;
+    Exit;
+  end;
+  if FDial = nil then
+  begin
+    d := TH2Dial.Create;
+    d.Finished := MakeChan();
+    FDial := d;
+    pas Self.Dialer(d, FEpoch);
+  end;
+  d := FDial;
+  FMu.Unlock;
+  fin := d.Finished;
+  if Due = 0 then
+    v := Recv(fin)
+  else
+  begin
+    { no wait on a channel has a deadline of its own: the channel is
+      looked at every two milliseconds until it is closed or Due passes }
+    got := False;
+    while (not got) and not Late do
+    begin
+      select
+        Recv(fin, v): got := True;
+      else
+        Late := Nanotime >= Due;
+      end;
+      if (not got) and not Late then
+        Sleep(2);
+    end;
+    if Late then
+    begin
+      Err := 'http2: no connection within the request''s deadline';
+      Exit;
+    end;
+  end;
+  Result := d.Conn;
+  Err := d.Err;
+end;
+
+function THttp2Client.Request(const Method, Path: string; const Headers: THpackFields; const Body: string;
+  TimeoutMs, MaxBody: Integer; out Resp: THttp2Response; out Err: string): Boolean;
+var
+  c: THttp2Conn;
+  attempt, due, left: Integer;
+  late: Boolean;
+begin
+  Result := False;
+  due := 0;
+  if TimeoutMs > 0 then
+    due := PasIoDeadline(TimeoutMs);
+  for attempt := 1 to 2 do
+  begin
+    c := Conn(due, Err, late);
+    left := 0;
+    if due <> 0 then
+    begin
+      left := (due - Nanotime) div 1000000;
+      if (left <= 0) and (c <> nil) then
+      begin
+        c := nil;
+        late := True;
+        Err := 'http2: no response within ' + IntToStr(TimeoutMs) + ' ms';
+      end;
+    end;
+    if c = nil then
+    begin
+      { the request did not leave }
+      Resp := Default(THttp2Response);
+      Resp.ErrorCode := -1;
+      Resp.NotProcessed := True;
+      Resp.TimedOut := late;
+      Exit;
+    end;
+    Result := c.Request(Method, Path, Headers, Body, left, MaxBody, Resp, Err);
+    { 8.7: what the server did not act on is sent again, once }
+    if Result or (not Resp.NotProcessed) or Resp.TimedOut then
+      Exit;
+  end;
+end;
+
+function THttp2Client.Dials: Integer;
+begin
+  FMu.Lock;
+  Result := FDials;
+  FMu.Unlock;
+end;
+
+procedure THttp2Client.Dispose;
+var
+  c: THttp2Conn;
+begin
+  FMu.Lock;
+  Inc(FEpoch);
+  FDial := nil;
+  c := FConn;
+  FConn := nil;
+  FMu.Unlock;
+  if c <> nil then
+    c.Dispose;
+end;
+
+end.

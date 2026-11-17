@@ -1,0 +1,522 @@
+{ P617: pashttp2 against Go's net/http server (scripts/http2_interop.sh
+  starts scripts/h2oracle for each case, over TLS with h2 by ALPN or in
+  the clear with prior knowledge): requests and responses of every
+  size, many routines on one connection, a limit of streams, a server
+  that goes away and a client that makes its connection again, a
+  server that speaks no HTTP/2, and requests that end, are given up
+  and are disposed of all at once. Arguments: tls|h2c port case
+  roots.pem. }
+program http2go;
+
+uses
+  sysutils, paslib, pasconn, pastls, pashttp2;
+
+var
+  kind, mode: string;
+  port: Integer;
+  cfg: TTlsConfig;
+  opt: THttp2Options;
+  wg: waitgroup;
+  mu: mutex;
+  conn: THttp2Conn;
+  client: THttp2Client;
+  nOk, nTimeout, nGone, nOther, nBad: Integer;
+
+function Dial(out Err: string): THttp2Conn;
+begin
+  if kind = 'h2c' then
+    Result := Http2DialPlain('127.0.0.1', port, 20000, opt, Err)
+  else
+    Result := Http2Dial('127.0.0.1', port, 20000, cfg, opt, Err);
+end;
+
+{ the octets the oracle sends for /big }
+function Pattern(N: Integer): string;
+var
+  i: Integer;
+begin
+  SetLength(Result, N);
+  for i := 0 to N - 1 do
+    Result[i + 1] := Chr((i * 7 + (i shr 8)) and 255);
+end;
+
+{ the port, which is another at every run, out of what the server says }
+function NoPort(const S: string): string;
+var
+  p: Integer;
+  mark: string;
+begin
+  Result := S;
+  mark := ':' + IntToStr(port);
+  p := Pos(mark, Result);
+  while p > 0 do
+  begin
+    Result := Copy(Result, 1, p - 1) + ':PORT' + Copy(Result, p + Length(mark), Length(Result));
+    p := Pos(mark, Result);
+  end;
+end;
+
+procedure Show(const What: string; Ok: Boolean; const R: THttp2Response; const Err: string);
+begin
+  if Ok then
+    WriteLn(What, ': ', R.Status, ' ', Length(R.Body), ' octets')
+  else
+    WriteLn(What, ': failed: ', Err);
+end;
+
+procedure Basic;
+var
+  c: THttp2Conn;
+  r: THttp2Response;
+  h: THpackFields;
+  err, body, want: string;
+  ok: Boolean;
+  i: Integer;
+begin
+  c := Dial(err);
+  if c = nil then
+  begin
+    WriteLn('dial: ', err);
+    Exit;
+  end;
+  SetLength(h, 3);
+  h[0] := Http2Field('user-agent', 'paslang-test');
+  h[1] := Http2Field('cookie', 'a=1; b=2');
+  h[2] := Http2Field('x-note', 'one two');
+  ok := c.Request('GET', '/echo?q=1', h, '', 20000, 0, r, err);
+  Show('GET', ok, r, err);
+  Write(NoPort(r.Body));
+  WriteLn('content-type: ', Http2Get(r.Fields, 'content-type'), '; x-proto: ', Http2Get(r.Fields, 'x-proto'));
+  body := Pattern(300000);
+  ok := c.Request('POST', '/echo', h, body, 20000, 0, r, err);
+  Show('POST of 300000', ok, r, err);
+  Write(NoPort(r.Body));
+  ok := c.Request('PUT', '/echo', nil, '', 20000, 0, r, err);
+  Show('PUT of nothing', ok, r, err);
+  Write(NoPort(r.Body));
+  ok := c.Request('GET', '/big?n=5000000', nil, '', 60000, 0, r, err);
+  Show('5000000 octets', ok, r, err);
+  WriteLn('  as sent: ', r.Body = Pattern(5000000));
+  ok := c.Request('GET', '/big?n=200000&chunk=777&len=no', nil, '', 60000, 0, r, err);
+  Show('200000 octets in pieces, no length said', ok, r, err);
+  WriteLn('  as sent: ', r.Body = Pattern(200000), '; content-length: [', Http2Get(r.Fields, 'content-length'), ']');
+  ok := c.Request('GET', '/big?n=70000', nil, '', 20000, 69999, r, err);
+  Show('70000 octets with a budget of 69999', ok, r, err);
+  ok := c.Request('GET', '/big?n=70000', nil, '', 20000, 70000, r, err);
+  Show('70000 octets with a budget of 70000', ok, r, err);
+  want := Pattern(3000000);
+  ok := c.Request('POST', '/pipe', nil, want, 60000, 0, r, err);
+  Show('3000000 octets there and back at once', ok, r, err);
+  WriteLn('  as sent: ', r.Body = want);
+  ok := c.Request('POST', '/refuse', nil, want, 60000, 0, r, err);
+  Show('an answer before the content was read', ok, r, err);
+  ok := c.Request('GET', '/trailers', nil, '', 20000, 0, r, err);
+  Show('trailers', ok, r, err);
+  for i := 0 to High(r.Trailers) do
+    WriteLn('  ', r.Trailers[i].Name, ': ', r.Trailers[i].Value);
+  ok := c.Request('GET', '/early', nil, '', 20000, 0, r, err);
+  Show('103 and then 200', ok, r, err);
+  Write('  ', r.Body);
+  ok := c.Request('GET', '/status?code=204', nil, '', 20000, 0, r, err);
+  Show('204', ok, r, err);
+  ok := c.Request('GET', '/status?code=304', nil, '', 20000, 0, r, err);
+  Show('304', ok, r, err);
+  ok := c.Request('GET', '/status?code=404', nil, '', 20000, 0, r, err);
+  Show('404', ok, r, err);
+  ok := c.Request('GET', '/status?code=301&to=/echo', nil, '', 20000, 0, r, err);
+  Show('301, not followed', ok, r, err);
+  WriteLn('  location: ', Http2Get(r.Fields, 'location'));
+  ok := c.Request('HEAD', '/big?n=1234', nil, '', 20000, 0, r, err);
+  Show('HEAD', ok, r, err);
+  WriteLn('  content-length: ', Http2Get(r.Fields, 'content-length'));
+  ok := c.Request('GET', '/cookies', h, '', 20000, 0, r, err);
+  Show('cookies', ok, r, err);
+  Write('  ', r.Body);
+  i := 0;
+  while i <= High(r.Fields) do
+  begin
+    if r.Fields[i].Name = 'set-cookie' then
+      WriteLn('  set-cookie: ', r.Fields[i].Value);
+    Inc(i);
+  end;
+  ok := c.Request('GET', '/nowhere', nil, '', 20000, 0, r, err);
+  Show('no handler', ok, r, err);
+  ok := c.Request('GET', '/slow?ms=20000', nil, '', 100, 0, r, err);
+  WriteLn('a deadline: ', ok, ' ', r.TimedOut, ' ', err);
+  WriteLn('ping: ', c.Ping(20000));
+  ok := c.Request('GET', '/count', nil, '', 20000, 0, r, err);
+  Write('the server counted: ', r.Body);
+  WriteLn('streams: ', c.Streams, '; alive: ', c.Alive);
+  c.Dispose;
+  WriteLn('disposed: ', c.LastError);
+end;
+
+{ twenty requests of one routine on the connection every routine shares }
+procedure ManyWorker(K: Integer);
+var
+  r: THttp2Response;
+  h: THpackFields;
+  err, body, want: string;
+  i, good, wrong: Integer;
+  ok: Boolean;
+begin
+  good := 0;
+  wrong := 0;
+  SetLength(h, 1);
+  for i := 1 to 20 do
+  begin
+    h[0] := Http2Field('x-who', 'k' + IntToStr(K) + 'i' + IntToStr(i));
+    if i mod 4 = 0 then
+    begin
+      body := Pattern(1000 + 37 * K + i);
+      ok := conn.Request('POST', '/pipe', h, body, 60000, 0, r, err);
+      ok := ok and (r.Status = 200) and (r.Body = body);
+    end
+    else if i mod 4 = 1 then
+    begin
+      ok := conn.Request('GET', '/big?n=' + IntToStr(20000 + 100 * K + i), nil, '', 60000, 0, r, err);
+      ok := ok and (r.Body = Pattern(20000 + 100 * K + i));
+    end
+    else
+    begin
+      want := 'x-who: k' + IntToStr(K) + 'i' + IntToStr(i) + #10;
+      ok := conn.Request('GET', '/echo?k=' + IntToStr(K) + '&i=' + IntToStr(i), h, '', 60000, 0, r, err);
+      ok := ok and (Pos(want, r.Body) > 0) and (Pos('/echo?k=' + IntToStr(K) + '&i=' + IntToStr(i) + ' ', r.Body) > 0);
+    end;
+    if ok then
+      Inc(good)
+    else
+      Inc(wrong);
+  end;
+  lock mu do
+  begin
+    nOk := nOk + good;
+    nBad := nBad + wrong;
+  end;
+  wg.Done;
+end;
+
+procedure Many;
+var
+  r: THttp2Response;
+  err: string;
+  k: Integer;
+  ok: Boolean;
+begin
+  conn := Dial(err);
+  if conn = nil then
+  begin
+    WriteLn('dial: ', err);
+    Exit;
+  end;
+  wg.Add(100);
+  for k := 1 to 100 do
+    pas ManyWorker(k);
+  wg.Wait;
+  WriteLn('a hundred routines, twenty requests each on one connection: ', nOk, ' right, ', nBad, ' wrong');
+  ok := conn.Request('GET', '/count', nil, '', 20000, 0, r, err);
+  WriteLn('connections the server saw: ', Copy(r.Body, Pos('conns=', r.Body), 7));
+  conn.Dispose;
+end;
+
+procedure LimitWorker(K: Integer);
+var
+  r: THttp2Response;
+  err: string;
+  ok: Boolean;
+begin
+  ok := conn.Request('GET', '/slow?ms=60', nil, '', 60000, 0, r, err) and (r.Body = 'slow done'#10);
+  lock mu do
+    if ok then
+      Inc(nOk)
+    else
+      Inc(nBad);
+  wg.Done;
+end;
+
+{ a server that lets four streams be: forty requests at once are never
+  more than four at the server }
+procedure Limit;
+var
+  r: THttp2Response;
+  err: string;
+  k: Integer;
+  ok: Boolean;
+begin
+  conn := Dial(err);
+  if conn = nil then
+  begin
+    WriteLn('dial: ', err);
+    Exit;
+  end;
+  ok := conn.Request('GET', '/echo', nil, '', 20000, 0, r, err);
+  WriteLn('the server lets ', conn.PeerMaxStreams, ' streams be');
+  wg.Add(40);
+  for k := 1 to 40 do
+    pas LimitWorker(k);
+  wg.Wait;
+  WriteLn('forty slow requests at once: ', nOk, ' right, ', nBad, ' wrong');
+  ok := conn.Request('GET', '/count', nil, '', 20000, 0, r, err);
+  WriteLn('at once at the server, at most: ', Copy(r.Body, Pos('most=', r.Body), 6));
+  conn.Dispose;
+end;
+
+procedure SlowOne(K: Integer);
+var
+  r: THttp2Response;
+  err: string;
+  ok: Boolean;
+begin
+  ok := client.Request('GET', '/slow?ms=700', nil, '', 60000, 0, r, err) and (r.Body = 'slow done'#10);
+  lock mu do
+    if ok then
+      Inc(nOk)
+    else
+      Inc(nBad);
+  wg.Done;
+end;
+
+{ the server goes away in order: the request on its way ends on the
+  connection that is going away, and the next ones make another }
+procedure GoAway;
+var
+  r: THttp2Response;
+  err: string;
+  ok: Boolean;
+  i: Integer;
+begin
+  client := THttp2Client.Create('127.0.0.1', port, cfg, opt);
+  client.Plain := kind = 'h2c';
+  ok := client.Request('GET', '/echo', nil, '', 20000, 0, r, err);
+  Show('first', ok, r, err);
+  WriteLn('connections made: ', client.Dials);
+  wg.Add(1);
+  pas SlowOne(1);
+  Sleep(100);
+  ok := client.Request('GET', '/goaway', nil, '', 20000, 0, r, err);
+  Show('the server is told to go away', ok, r, err);
+  { GOAWAY comes a moment after the answer }
+  Sleep(400);
+  for i := 1 to 3 do
+  begin
+    ok := client.Request('POST', '/echo', nil, 'again', 20000, 0, r, err);
+    Show('after', ok, r, err);
+  end;
+  WriteLn('connections made: ', client.Dials);
+  wg.Wait;
+  WriteLn('the request that was on its way: ', nOk, ' right, ', nBad, ' wrong');
+  ok := client.Request('GET', '/count', nil, '', 20000, 0, r, err);
+  WriteLn('posted, as the server counted: ', Copy(r.Body, Pos('posted=', r.Body), 8));
+  client.Dispose;
+  ok := client.Request('GET', '/echo', nil, '', 20000, 0, r, err);
+  Show('after Dispose, on a new connection', ok, r, err);
+  WriteLn('connections made: ', client.Dials);
+  client.Dispose;
+end;
+
+{ nginx (scripts/http2_interop.sh writes its configuration and its
+  files): another server's HTTP/2, with windows of 65535 and frames of
+  16384, which says GOAWAY after a thousand requests on a connection }
+procedure NginxWorker(K: Integer);
+var
+  r: THttp2Response;
+  err: string;
+  i, good, wrong: Integer;
+  ok: Boolean;
+begin
+  good := 0;
+  wrong := 0;
+  for i := 1 to 30 do
+  begin
+    if i mod 3 = 0 then
+      ok := client.Request('GET', '/medium.bin', nil, '', 60000, 0, r, err) and (r.Status = 200) and (r.Body = Pattern(70000))
+    else if i mod 3 = 1 then
+      ok := client.Request('GET', '/hello?k=' + IntToStr(K) + '&i=' + IntToStr(i), nil, '', 60000, 0, r, err) and
+        (r.Status = 200) and (r.Body = 'hello from nginx'#10)
+    else
+      ok := client.Request('POST', '/post', nil, Pattern(3000 + K), 60000, 0, r, err) and (r.Status = 204);
+    if ok then
+      Inc(good)
+    else
+      Inc(wrong);
+  end;
+  lock mu do
+  begin
+    nOk := nOk + good;
+    nBad := nBad + wrong;
+  end;
+  wg.Done;
+end;
+
+procedure Nginx;
+var
+  c: THttp2Conn;
+  r: THttp2Response;
+  err, want: string;
+  ok: Boolean;
+  k: Integer;
+begin
+  c := Dial(err);
+  if c = nil then
+  begin
+    WriteLn('dial: ', err);
+    Exit;
+  end;
+  ok := c.Request('GET', '/hello', nil, '', 20000, 0, r, err);
+  Show('GET', ok, r, err);
+  Write('  ', r.Body);
+  WriteLn('  content-type: ', Http2Get(r.Fields, 'content-type'), '; the server lets ', c.PeerMaxStreams, ' streams be');
+  ok := c.Request('GET', '/big.bin', nil, '', 60000, 0, r, err);
+  Show('a file of 5000000 octets', ok, r, err);
+  WriteLn('  as written: ', r.Body = Pattern(5000000), '; content-length: ', Http2Get(r.Fields, 'content-length'));
+  ok := c.Request('HEAD', '/big.bin', nil, '', 20000, 0, r, err);
+  Show('HEAD of it', ok, r, err);
+  ok := c.Request('GET', '/nothing-here', nil, '', 20000, 0, r, err);
+  WriteLn('no such file: ', ok, ' ', r.Status, ' ', err);
+  want := Pattern(2000000);
+  ok := c.Request('POST', '/post', nil, want, 60000, 0, r, err);
+  Show('2000000 octets posted', ok, r, err);
+  ok := c.Request('GET', '/empty.txt', nil, '', 20000, 0, r, err);
+  Show('an empty file', ok, r, err);
+  WriteLn('ping: ', c.Ping(20000));
+  c.Dispose;
+  { three thousand requests of a hundred routines: nginx ends each
+    connection after a thousand, in order, and the client makes another }
+  client := THttp2Client.Create('127.0.0.1', port, cfg, opt);
+  client.Plain := kind = 'h2c';
+  wg.Add(100);
+  for k := 1 to 100 do
+    pas NginxWorker(k);
+  wg.Wait;
+  WriteLn('a hundred routines, thirty requests each: ', nOk, ' right, ', nBad, ' wrong');
+  WriteLn('connections made, three or more: ', client.Dials >= 3);
+  client.Dispose;
+end;
+
+{ a server that speaks no HTTP/2 }
+procedure NoH2;
+var
+  c: THttp2Conn;
+  r: THttp2Response;
+  err: string;
+  ok: Boolean;
+begin
+  c := Dial(err);
+  if c = nil then
+  begin
+    WriteLn('dial: ', err);
+    Exit;
+  end;
+  ok := c.Request('GET', '/echo', nil, '', 20000, 0, r, err);
+  WriteLn('request: ', ok, ' ', err);
+  WriteLn('alive: ', c.Alive);
+  c.Dispose;
+end;
+
+{ requests that end, requests given up at their deadline and a
+  connection disposed of, all at once: every call comes back, with one
+  of the outcomes there are }
+procedure RaceWorker(K: Integer);
+var
+  r: THttp2Response;
+  err: string;
+  i, ms, a, b, c, d: Integer;
+  ok: Boolean;
+begin
+  a := 0;
+  b := 0;
+  c := 0;
+  d := 0;
+  for i := 1 to 30 do
+  begin
+    ms := 0;
+    case (K + i) mod 4 of
+      0: ms := 3;
+      1: ms := 15;
+      2: ms := 40;
+    end;
+    ok := conn.Request('GET', '/slow?ms=15', nil, '', ms, 0, r, err);
+    if ok and (r.Status = 200) and (r.Body = 'slow done'#10) then
+      Inc(a)
+    else if (not ok) and r.TimedOut and (Pos('no response within', err) > 0) then
+      Inc(b)
+    else if (not ok) and (Pos('disposed', err) > 0) then
+      Inc(c)
+    else
+      Inc(d);
+  end;
+  lock mu do
+  begin
+    nOk := nOk + a;
+    nTimeout := nTimeout + b;
+    nGone := nGone + c;
+    nOther := nOther + d;
+  end;
+  wg.Done;
+end;
+
+procedure Disposer(K: Integer);
+begin
+  Sleep(200);
+  conn.Dispose;
+  wg.Done;
+end;
+
+procedure Race;
+var
+  err: string;
+  k: Integer;
+begin
+  conn := Dial(err);
+  if conn = nil then
+  begin
+    WriteLn('dial: ', err);
+    Exit;
+  end;
+  wg.Add(203);
+  for k := 1 to 200 do
+    pas RaceWorker(k);
+  for k := 1 to 3 do
+    pas Disposer(k);
+  wg.Wait;
+  WriteLn('two hundred routines, thirty requests each, the connection disposed of meanwhile: ',
+    nOk + nTimeout + nGone, ' ended as they may, ', nOther, ' otherwise');
+  WriteLn('some were answered, some given up, some cut: ', (nOk > 0) and (nTimeout > 0) and (nGone > 0));
+  WriteLn('alive: ', conn.Alive, '; streams: ', conn.Streams);
+end;
+
+var
+  roots: string;
+begin
+  kind := ParamStr(1);
+  port := StrToInt(ParamStr(2));
+  mode := ParamStr(3);
+  opt := Default(THttp2Options);
+  cfg := TTlsConfig.Create;
+  if kind <> 'h2c' then
+  begin
+    if not ReadFile(ParamStr(4), roots) then
+    begin
+      WriteLn('no roots');
+      Halt(2);
+    end;
+    cfg.RootsPem := roots;
+    cfg.ServerName := 'localhost';
+  end;
+  if mode = 'basic' then
+    Basic
+  else if mode = 'many' then
+    Many
+  else if mode = 'limit' then
+    Limit
+  else if mode = 'goaway' then
+    GoAway
+  else if mode = 'nginx' then
+    Nginx
+  else if mode = 'noh2' then
+    NoH2
+  else if mode = 'race' then
+    Race
+  else
+    WriteLn('unknown case ', mode);
+end.

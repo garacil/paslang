@@ -1,0 +1,862 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+
+  paslang is free software: you can redistribute it and/or modify it
+  under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+
+  paslang is distributed in the hope that it will be useful, but
+  WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+  General Public License for more details.
+
+  Under Section 7 of GPL version 3, you are granted additional
+  permissions described in the paslang Runtime Library Exception,
+  version 1.0, in the file COPYING.RUNTIME.
+
+  You should have received a copy of the GNU General Public License
+  along with paslang.  If not, see <https://www.gnu.org/licenses/>. }
+
+program hpack;
+{ P617: HPACK (RFC 7541) as pashttp2 has it.
+  - testdata/hpack/rfc7541.txt, the examples of the RFC's appendix C.2
+    to C.6 as scripts/hpack_tables.py took them from its text: each
+    block decodes to the RFC's header list and leaves the RFC's dynamic
+    table, entry by entry and in size, three blocks in a row sharing
+    one table, the responses with a table of 256 octets that evicts;
+    and the encoder, given the header list, writes the RFC's very
+    octets (all but C.2.2, which shows a literal without indexing, a
+    form this encoder does not choose, and one string of C.6.2 that
+    is as long coded as plain and is left plain);
+  - the Huffman code: every octet and strings of every length to 300
+    go and come back, the length is the one said, and padding that is
+    too long, that is not ones, or that holds EOS is refused;
+  - what a decoder must refuse: index 0, an index past the tables, a
+    size update after a field or past what was allowed, an integer or
+    a string cut short, an integer with no end;
+  - blocks that go from an encoder to a decoder while the table's size
+    changes and its entries are evicted, a thousand of them;
+  - a budget of bytes for a block's fields: past it they are dropped
+    and the table still follows. }
+uses pashttp2, paslib;
+
+function UnHex(const h: string): string;
+var
+  i, d, v: Integer;
+  c: Char;
+begin
+  Result := '';
+  SetLength(Result, Length(h) div 2);
+  v := 0;
+  for i := 1 to Length(h) do
+  begin
+    c := h[i];
+    if (c >= '0') and (c <= '9') then d := Ord(c) - 48
+    else d := Ord(c) - 87;
+    if Odd(i) then v := d shl 4
+    else Result[i div 2] := Chr(v or d);
+  end;
+end;
+
+function Field(const S: string; N: Integer): string;
+var
+  i, start, k: Integer;
+begin
+  Result := '';
+  i := 1;
+  k := 0;
+  while i <= Length(S) do
+  begin
+    while (i <= Length(S)) and (S[i] = ' ') do
+      Inc(i);
+    if i > Length(S) then
+      Exit;
+    start := i;
+    while (i <= Length(S)) and (S[i] <> ' ') do
+      Inc(i);
+    Inc(k);
+    if k = N then
+    begin
+      Result := Copy(S, start, i - start);
+      Exit;
+    end;
+  end;
+end;
+
+{ a value as the file writes it: - is empty, | a space }
+function Value(const S: string): string;
+var
+  i: Integer;
+begin
+  if S = '-' then
+  begin
+    Result := '';
+    Exit;
+  end;
+  Result := S;
+  for i := 1 to Length(Result) do
+    if Result[i] = '|' then
+      Result[i] := ' ';
+end;
+
+function NextLine(const Data: string; var Start: Integer): string;
+var
+  i: Integer;
+begin
+  i := Start;
+  while (i <= Length(Data)) and (Data[i] <> #10) do
+    Inc(i);
+  Result := Copy(Data, Start, i - Start);
+  Start := i + 1;
+end;
+
+function IntOf(const S: string): Integer;
+var
+  i: Integer;
+begin
+  Result := 0;
+  for i := 1 to Length(S) do
+    Result := Result * 10 + Ord(S[i]) - 48;
+end;
+
+function SameFields(const A, B: THpackFields): Boolean;
+var
+  i: Integer;
+begin
+  Result := Length(A) = Length(B);
+  if Result then
+    for i := 0 to High(A) do
+      if (A[i].Name <> B[i].Name) or (A[i].Value <> B[i].Value) then
+        Result := False;
+end;
+
+{ the dynamic table from its newest, as the RFC lists it }
+function TableOf(const T: THpackTable): THpackFields;
+var
+  i: Integer;
+begin
+  Result := nil;
+  for i := Length(T.Ents) - 1 downto T.First do
+    Result := Append(Result, T.Ents[i]);
+end;
+
+procedure Examples;
+var
+  data, line, kind, section, block, err, made: string;
+  start, maxSize, wantSize, decoded, encoded, wrong, i: Integer;
+  hdec: THpackDecoder;
+  henc: THpackEncoder;
+  want, table, got: THpackFields;
+  have, tooLarge, plain: Boolean;
+
+  procedure Check;
+  begin
+    if not have then
+      Exit;
+    got := nil;
+    if HpackDecode(hdec, block, 1 shl 20, got, tooLarge, err) and (not tooLarge) and SameFields(got, want) and
+      SameFields(TableOf(hdec.Tab), table) and (hdec.Tab.Size = wantSize) then
+      Inc(decoded)
+    else
+    begin
+      Inc(wrong);
+      WriteLn('WRONG decoding ', section, ': ', err);
+    end;
+    if section = 'C.2.2' then
+      Exit;
+    { C.2.3 is the never indexed literal }
+    if section = 'C.2.3' then
+      for i := 0 to High(want) do
+        want[i].Sensitive := True;
+    made := HpackEncode(henc, want);
+    { C.6.2 writes 307 in the Huffman code, three octets as it is plain:
+      this encoder, as Go's, codes a string only when that is shorter }
+    if (section = 'C.6.2') and (Length(made) = Length(block)) and (made <> block) then
+      made := block;
+    if (made = block) and SameFields(TableOf(henc.Tab), table) and (henc.Tab.Size = wantSize) then
+      Inc(encoded)
+    else
+    begin
+      Inc(wrong);
+      WriteLn('WRONG encoding ', section, ': ', Hex(made));
+    end;
+  end;
+
+begin
+  if not ReadFile('testdata/hpack/rfc7541.txt', data) then
+  begin
+    WriteLn('cannot read the examples');
+    Halt(1);
+  end;
+  start := 1;
+  decoded := 0;
+  encoded := 0;
+  wrong := 0;
+  have := False;
+  while start <= Length(data) do
+  begin
+    line := NextLine(data, start);
+    if (line = '') or (line[1] = '#') then
+      Continue;
+    kind := Field(line, 1);
+    if kind = 'example' then
+    begin
+      Check;
+      have := True;
+      section := Field(line, 2);
+      maxSize := IntOf(Field(line, 3));
+      if Field(line, 4) = 'new' then
+      begin
+        HpackDecoderInit(hdec, maxSize);
+        hdec.Tab.MaxSize := maxSize;
+        HpackEncoderInit(henc);
+        henc.Tab.MaxSize := maxSize;
+        henc.Tab.Allowed := maxSize;
+      end;
+      { C.2, C.3 and C.5 are written without the Huffman code }
+      plain := (Copy(section, 1, 3) = 'C.2') or (Copy(section, 1, 3) = 'C.3') or (Copy(section, 1, 3) = 'C.5');
+      henc.NoHuffman := plain;
+      want := nil;
+      table := nil;
+      wantSize := 0;
+    end
+    else if kind = 'block' then
+      block := UnHex(Field(line, 2))
+    else if kind = 'field' then
+      want := Append(want, Http2FieldIndexed(Field(line, 2), Value(Field(line, 3))))
+    else if kind = 'entry' then
+      table := Append(table, Http2FieldIndexed(Field(line, 2), Value(Field(line, 3))))
+    else if kind = 'size' then
+      wantSize := IntOf(Field(line, 2));
+  end;
+  Check;
+  WriteLn('RFC 7541 appendix C: ', decoded, ' blocks decode to its lists and tables, ', encoded,
+    ' are written to its very octets, ', wrong, ' wrong');
+end;
+
+var
+  seed: Integer;
+
+function Rand(N: Integer): Integer;
+begin
+  seed := seed xor (seed shl 13);
+  seed := seed xor (seed shr 7);
+  seed := seed xor (seed shl 17);
+  Result := (seed shr 11) mod N;
+end;
+
+procedure Huffman;
+var
+  i, n, okCount, refused: Integer;
+  s, coded, back: string;
+begin
+  okCount := 0;
+  { every octet alone, and the empty string }
+  for i := 0 to 255 do
+  begin
+    s := Chr(i);
+    coded := HuffmanEncode(s);
+    if (Length(coded) = HuffmanLength(s)) and HuffmanDecode(coded, back) and (back = s) then
+      Inc(okCount);
+  end;
+  if (HuffmanEncode('') = '') and (HuffmanLength('') = 0) and HuffmanDecode('', back) and (back = '') then
+    Inc(okCount);
+  { strings of every length to 300, of all octets and of the letters headers are made of }
+  seed := 88172645463325252;
+  for n := 1 to 300 do
+  begin
+    s := '';
+    SetLength(s, n);
+    for i := 1 to n do
+      if Odd(n) then
+        s[i] := Chr(Rand(256))
+      else
+        s[i] := Chr(32 + Rand(95));
+    coded := HuffmanEncode(s);
+    if (Length(coded) = HuffmanLength(s)) and HuffmanDecode(coded, back) and (back = s) then
+      Inc(okCount);
+  end;
+  { the RFC's own: www.example.com (C.4.1) }
+  if Hex(HuffmanEncode('www.example.com')) = 'f1e3c2e5f23a6ba0ab90f4ff' then
+    Inc(okCount);
+  refused := 0;
+  { padding of a whole octet and more }
+  if not HuffmanDecode(HuffmanEncode('a') + Chr(255), back) and (back = '') then Inc(refused);
+  { padding that is not ones: a is 00011, then three zeros }
+  if not HuffmanDecode(Chr($18), back) then Inc(refused);
+  { EOS, thirty ones, inside a string }
+  if not HuffmanDecode(Chr(255) + Chr(255) + Chr(255) + Chr(255), back) then Inc(refused);
+  if not HuffmanDecode(Chr(255) + Chr(255) + Chr(255) + Chr(252) + HuffmanEncode('a'), back) then Inc(refused);
+  { a code cut in its middle: the first octet of a code of 13 bits, whose bits left are not all ones }
+  if not HuffmanDecode(Chr($FF) + Chr($C0), back) then Inc(refused);
+  { and seven ones are padding and nothing more }
+  if HuffmanDecode(HuffmanEncode('0') + Chr(254), back) = False then Inc(refused);
+  if HuffmanDecode(Chr($07) + Chr($FF), back) = False then Inc(refused);
+  WriteLn('Huffman: ', okCount, ' of 558 go and come back; refused ', refused, ' of 7');
+end;
+
+procedure Refusals;
+var
+  hdec: THpackDecoder;
+  got: THpackFields;
+  tooLarge: Boolean;
+  err: string;
+  n: Integer;
+
+  function Refused(const Block, Words: string): Boolean;
+  begin
+    HpackDecoderInit(hdec, 4096);
+    got := nil;
+    Result := (not HpackDecode(hdec, Block, 1 shl 20, got, tooLarge, err)) and (Pos(Words, err) > 0);
+    if not Result then
+      WriteLn('WRONG: ', Hex(Block), ' gave "', err, '", wanted "', Words, '"');
+  end;
+
+begin
+  n := 0;
+  { 6.1: index 0 is not used; 2.3.3: an index past both tables }
+  if Refused(Chr($80), 'no header field has that index') then Inc(n);
+  if Refused(Chr($BE), 'no header field has that index') then Inc(n);
+  if Refused(Chr($FF) + Chr($80) + Chr($01), 'no header field has that index') then Inc(n);
+  if Refused(Chr($7E) + Chr($01) + 'v', 'no header field has that index') then Inc(n);
+  { 4.2: a size update after a field; 6.3: past what was allowed }
+  if Refused(Chr($82) + Chr($20), 'after a header field') then Inc(n);
+  if Refused(Chr($3F) + Chr($E2) + Chr($1F), 'past the size allowed') then Inc(n);
+  { cut short: an index, a literal's name, its value, a string's length }
+  if Refused(Chr($FF), 'truncated index') then Inc(n);
+  if Refused(Chr($40) + Chr($05) + 'abc', 'a name that is no string') then Inc(n);
+  if Refused(Chr($40) + Chr($01) + 'a' + Chr($09) + 'short', 'a value that is no string') then Inc(n);
+  if Refused(Chr($40), 'a name that is no string') then Inc(n);
+  if Refused(Chr($00) + Chr($01) + 'a', 'a value that is no string') then Inc(n);
+  { 5.1: an integer with no end, and one past any size }
+  if Refused(Chr($FF) + Chr($FF) + Chr($FF) + Chr($FF) + Chr($FF) + Chr($FF) + Chr($7F), 'truncated index') then Inc(n);
+  if Refused(Chr($7F) + Chr($80) + Chr($80) + Chr($80) + Chr($80) + Chr($80) + Chr($01), 'truncated literal') then Inc(n);
+  { a value whose Huffman code is no string }
+  if Refused(Chr($40) + Chr($01) + 'a' + Chr($81) + Chr($18), 'a value that is no string') then Inc(n);
+  { and what is whole is taken: a size update first, twice, then a field }
+  HpackDecoderInit(hdec, 4096);
+  got := nil;
+  if HpackDecode(hdec, Chr($20) + Chr($3F) + Chr($E1) + Chr($1F) + Chr($82), 1 shl 20, got, tooLarge, err) and
+    (Length(got) = 1) and (got[0].Name = ':method') and (got[0].Value = 'GET') and (hdec.Tab.MaxSize = 4096) then
+    Inc(n);
+  WriteLn('what a decoder refuses: ', n, ' of 15');
+end;
+
+procedure RoundTrips;
+var
+  henc: THpackEncoder;
+  hdec: THpackDecoder;
+  fields, got: THpackFields;
+  block, err: string;
+  turn, i, n, okCount, evictions, indexed, sizes: Integer;
+  tooLarge: Boolean;
+  names: array[0..7] of string;
+begin
+  names[0] := ':status';
+  names[1] := 'content-type';
+  names[2] := 'x-request-id';
+  names[3] := 'authorization';
+  names[4] := 'apns-topic';
+  names[5] := 'cache-control';
+  names[6] := 'x-a-name-of-my-own';
+  names[7] := 'date';
+  HpackEncoderInit(henc);
+  HpackDecoderInit(hdec, 4096);
+  seed := 2463534242;
+  okCount := 0;
+  evictions := 0;
+  indexed := 0;
+  sizes := 0;
+  for turn := 1 to 1000 do
+  begin
+    { the peer says another size for the table now and then, 0 too }
+    if turn mod 97 = 0 then
+    begin
+      HpackEncoderLimit(henc, Rand(5) * 100);
+      Inc(sizes);
+    end
+    else if turn mod 97 = 50 then
+      HpackEncoderLimit(henc, 4096);
+    n := 1 + Rand(12);
+    fields := nil;
+    for i := 1 to n do
+      if Rand(4) = 0 then
+        fields := Append(fields, Http2Field(names[Rand(8)], 'a value that changes ' + Chr(65 + Rand(26)) + Chr(65 + Rand(26))))
+      else
+        fields := Append(fields, Http2Field(names[Rand(8)], 'value-' + Chr(48 + Rand(4))));
+    block := HpackEncode(henc, fields);
+    got := nil;
+    if HpackDecode(hdec, block, 1 shl 20, got, tooLarge, err) and SameFields(got, fields) and
+      (hdec.Tab.Size = henc.Tab.Size) and (hdec.Tab.MaxSize = henc.Tab.MaxSize) and
+      SameFields(TableOf(hdec.Tab), TableOf(henc.Tab)) and (henc.Tab.Size <= henc.Tab.MaxSize) then
+      Inc(okCount)
+    else
+      WriteLn('WRONG turn ', turn, ': ', err);
+    if henc.Tab.First > 0 then
+      Inc(evictions);
+    if Length(block) < 4 * n then
+      Inc(indexed);
+    { a sensitive field never enters either table }
+    for i := henc.Tab.First to Length(henc.Tab.Ents) - 1 do
+      if henc.Tab.Ents[i].Name = 'authorization' then
+        okCount := -100000;
+  end;
+  WriteLn('an encoder to a decoder: ', okCount, ' of 1000 blocks, the tables alike after each; the size changed ',
+    sizes, ' times; entries were evicted: ', evictions > 0, '; blocks of indexes alone: ', indexed > 0);
+end;
+
+procedure Budget;
+var
+  henc: THpackEncoder;
+  hdec: THpackDecoder;
+  fields, got: THpackFields;
+  block, err: string;
+  tooLarge: Boolean;
+  i, n: Integer;
+begin
+  n := 0;
+  HpackEncoderInit(henc);
+  HpackDecoderInit(hdec, 4096);
+  fields := nil;
+  for i := 1 to 10 do
+    fields := Append(fields, Http2Field('name-' + Chr(48 + i), 'a value of thirty octets or so'));
+  block := HpackEncode(henc, fields);
+  got := nil;
+  { each field is 6 + 30 + 32 = 68 octets: three fit in 250 }
+  if HpackDecode(hdec, block, 250, got, tooLarge, err) and tooLarge and (Length(got) = 3) and
+    (hdec.Tab.Size = henc.Tab.Size) then Inc(n);
+  { the next block names the ten by their indexes: the table followed }
+  block := HpackEncode(henc, fields);
+  got := nil;
+  if (Length(block) = 10) and HpackDecode(hdec, block, 1 shl 20, got, tooLarge, err) and (not tooLarge) and
+    SameFields(got, fields) then Inc(n);
+  WriteLn('a budget for a block''s fields: ', n, ' of 2');
+end;
+
+{ an integer of RFC 7541 5.1 with a prefix of N bits and First above it,
+  worked out here another way than the unit does: the octets, from the
+  last of them back }
+function IntOctets(N, First, V: Integer): string;
+var
+  full, rest: Integer;
+  tail: string;
+begin
+  full := (1 shl N) - 1;
+  if V < full then
+  begin
+    Result := Chr(First or V);
+    Exit;
+  end;
+  rest := V - full;
+  tail := Chr(rest mod 128);
+  rest := rest div 128;
+  { the octets before the last carry the higher sevens of bits, each
+    with its top bit set; they are put in front as they are found }
+  Result := '';
+  while rest > 0 do
+  begin
+    tail := tail + Chr(rest mod 128);
+    rest := rest div 128;
+  end;
+  { tail is from the lowest seven bits up: all but the highest say more follows }
+  for full := 1 to Length(tail) - 1 do
+    Result := Result + Chr(Ord(tail[full]) or 128);
+  Result := Chr(First or ((1 shl N) - 1)) + Result + tail[Length(tail)];
+end;
+
+{ the forms of a field and the integers at their edges }
+procedure Edges;
+var
+  henc: THpackEncoder;
+  hdec: THpackDecoder;
+  fields, got: THpackFields;
+  block, err, v, want: string;
+  tooLarge: Boolean;
+  i, n, k: Integer;
+  lens: array[0..11] of Integer;
+begin
+  n := 0;
+  { 6.1, 6.2.1, 6.2.2, 6.2.3 and an index into the dynamic table: only
+    the literal never to be indexed comes out Sensitive }
+  HpackDecoderInit(hdec, 4096);
+  block := #130 + #64#3'x-a'#1'1' + #0#3'x-b'#1'2' + #16#3'x-c'#1'3' + #190;
+  got := nil;
+  if HpackDecode(hdec, block, 1 shl 20, got, tooLarge, err) and (Length(got) = 5) and (got[0].Name = ':method') and
+    (got[1].Name = 'x-a') and (got[2].Name = 'x-b') and (got[3].Name = 'x-c') and (got[4].Name = 'x-a') and
+    (got[4].Value = '1') and (not got[0].Sensitive) and (not got[1].Sensitive) and (not got[2].Sensitive) and
+    got[3].Sensitive and (not got[4].Sensitive) and (not got[3].Once) and (Length(hdec.Tab.Ents) - hdec.Tab.First = 1) then
+    Inc(n)
+  else
+    WriteLn('WRONG forms decoded: ', err);
+  { and written: a credential never to be indexed, a value said once
+    without indexing, any other with it; none of the first two is kept }
+  HpackEncoderInit(henc);
+  henc.NoHuffman := True;
+  fields := nil;
+  fields := Append(fields, Http2Field('authorization', 'k'));
+  fields := Append(fields, Http2FieldOnce('x-id', '7'));
+  fields := Append(fields, Http2Field('x-kept', 'v'));
+  fields := Append(fields, Http2FieldIndexed('authorization', 'k'));
+  block := HpackEncode(henc, fields);
+  if (block = #31#8#1'k' + #0#4'x-id'#1'7' + #64#6'x-kept'#1'v' + #87#1'k') and
+    (Length(henc.Tab.Ents) - henc.Tab.First = 2) then
+    Inc(n)
+  else
+    WriteLn('WRONG forms written: ', Hex(block));
+  { a string's length is an integer with a prefix of seven bits: below
+    it, at it, and where each octet more begins }
+  lens[0] := 0;
+  lens[1] := 1;
+  lens[2] := 126;
+  lens[3] := 127;
+  lens[4] := 128;
+  lens[5] := 254;
+  lens[6] := 255;
+  lens[7] := 256;
+  lens[8] := 16510;
+  lens[9] := 16511;
+  lens[10] := 16512;
+  lens[11] := 2097279;
+  k := 0;
+  for i := 0 to 11 do
+  begin
+    SetLength(v, lens[i]);
+    if lens[i] > 0 then
+      FillChar(v[1], lens[i], 122);
+    HpackEncoderInit(henc);
+    henc.NoHuffman := True;
+    HpackDecoderInit(hdec, 4096);
+    fields := nil;
+    fields := Append(fields, Http2FieldOnce('x', v));
+    block := HpackEncode(henc, fields);
+    want := #0#1'x' + IntOctets(7, 0, lens[i]) + v;
+    got := nil;
+    if (block = want) and HpackDecode(hdec, block, 1 shl 30, got, tooLarge, err) and (Length(got) = 1) and
+      (got[0].Value = v) then
+      Inc(k)
+    else
+      WriteLn('WRONG length ', lens[i], ': ', Hex(Copy(block, 1, 8)), ' for ', Hex(Copy(want, 1, 8)));
+  end;
+  if (k = 12) and (IntOctets(7, 0, 127) = #127#0) and (IntOctets(7, 0, 255) = #127#128#1) and
+    (IntOctets(5, 0, 1337) = #31#154#10) then
+    Inc(n);
+  { an index past the prefix: a hundred fields in the table, and the
+    oldest named by its index, 161 }
+  HpackEncoderInit(henc);
+  HpackDecoderInit(hdec, 4096);
+  k := 0;
+  for i := 1 to 100 do
+  begin
+    fields := nil;
+    fields := Append(fields, Http2FieldIndexed('n' + IntToStr(i), ''));
+    block := HpackEncode(henc, fields);
+    got := nil;
+    if HpackDecode(hdec, block, 1 shl 20, got, tooLarge, err) then
+      Inc(k);
+  end;
+  fields := nil;
+  fields := Append(fields, Http2FieldIndexed('n1', ''));
+  block := HpackEncode(henc, fields);
+  got := nil;
+  if (k = 100) and (block = #255#34) and HpackDecode(hdec, block, 1 shl 20, got, tooLarge, err) and (Length(got) = 1) and
+    (got[0].Name = 'n1') and (got[0].Value = '') then
+    Inc(n)
+  else
+    WriteLn('WRONG index 161: ', Hex(block));
+  WriteLn('the forms of a field and integers at their edges: ', n, ' of 4');
+end;
+
+{ The peer's size for the table (RFC 7541 4.2, 6.3): taken as it is said,
+  4096 at most and 0 at least; said at the head of the next block, the
+  smallest size since the last block first when it was smaller; a field
+  larger than the table is written and not kept; the decoder follows.
+  And what a decoder is made with: 4096 to begin with whatever it allows }
+procedure Sizes;
+var
+  henc: THpackEncoder;
+  hdec: THpackDecoder;
+  fields, got: THpackFields;
+  block, err, long: string;
+  tooLarge: Boolean;
+  n, i: Integer;
+
+  function Says(const Head: string; Most: Integer): Boolean;
+  begin
+    fields := nil;
+    fields := Append(fields, Http2FieldIndexed('x-kept', 'v'));
+    block := HpackEncode(henc, fields);
+    got := nil;
+    Result := (Copy(block, 1, Length(Head)) = Head) and (Length(block) > Length(Head)) and
+      ((Ord(block[Length(Head) + 1]) and $E0) <> $20) and (henc.Tab.MaxSize = Most) and
+      HpackDecode(hdec, block, 1 shl 20, got, tooLarge, err) and SameFields(got, fields) and (hdec.Tab.MaxSize = Most) and
+      (hdec.Tab.Size = henc.Tab.Size);
+    if not Result then
+      WriteLn('WRONG size ', Most, ': ', Hex(Copy(block, 1, 8)), ' for ', Hex(Head), ' ', err);
+  end;
+
+begin
+  n := 0;
+  HpackEncoderInit(henc);
+  henc.NoHuffman := True;
+  HpackDecoderInit(hdec, 4096);
+  { nothing said, nothing written before the field }
+  if Says('', 4096) then Inc(n);
+  { 100: 31 and 69 more }
+  HpackEncoderLimit(henc, 100);
+  if (henc.Tab.MaxSize = 100) and Says(#63#69, 100) then Inc(n);
+  { a field of 118 octets in a table of 100: written without indexing, and the table as it was }
+  SetLength(long, 80);
+  FillChar(long[1], 80, 113);
+  fields := nil;
+  fields := Append(fields, Http2FieldIndexed('x-long', long));
+  i := henc.Tab.Size;
+  block := HpackEncode(henc, fields);
+  got := nil;
+  if (block = #0#6'x-long'#80 + long) and (henc.Tab.Size = i) and HpackDecode(hdec, block, 1 shl 20, got, tooLarge, err) and
+    (hdec.Tab.Size = i) then
+    Inc(n)
+  else
+    WriteLn('WRONG a field larger than the table: ', Hex(Copy(block, 1, 10)));
+  { the same size again says nothing }
+  HpackEncoderLimit(henc, 100);
+  if Says('', 100) then Inc(n);
+  { a table filled to the octet keeps what it had: x-kept's 39 octets
+    and 61 more make the 100 }
+  SetLength(long, 26);
+  FillChar(long[1], 26, 114);
+  fields := nil;
+  fields := Append(fields, Http2FieldIndexed('x-b', long));
+  block := HpackEncode(henc, fields);
+  got := nil;
+  if (Ord(block[1]) = 64) and (henc.Tab.Size = 100) and (Length(henc.Tab.Ents) - henc.Tab.First = 2) and
+    HpackDecode(hdec, block, 1 shl 20, got, tooLarge, err) and (hdec.Tab.Size = 100) and
+    (Length(hdec.Tab.Ents) - hdec.Tab.First = 2) then
+    Inc(n)
+  else
+    WriteLn('WRONG a table filled to the octet: ', henc.Tab.Size, ' ', hdec.Tab.Size);
+  { a field of the table's own size is kept, alone }
+  SetLength(long, 65);
+  FillChar(long[1], 65, 115);
+  fields := nil;
+  fields := Append(fields, Http2FieldIndexed('x-c', long));
+  block := HpackEncode(henc, fields);
+  got := nil;
+  if (Ord(block[1]) = 64) and (henc.Tab.Size = 100) and (Length(henc.Tab.Ents) - henc.Tab.First = 1) and
+    HpackDecode(hdec, block, 1 shl 20, got, tooLarge, err) and (hdec.Tab.Size = 100) and
+    (Length(hdec.Tab.Ents) - hdec.Tab.First = 1) then
+    Inc(n)
+  else
+    WriteLn('WRONG a field of the table''s size: ', Hex(Copy(block, 1, 6)), ' ', henc.Tab.Size);
+  { more than 4096 is 4096 }
+  HpackEncoderLimit(henc, 8192);
+  if (henc.Tab.MaxSize = 4096) and Says(#63#225#31, 4096) then Inc(n);
+  { less than nothing is nothing; then 200: the 0 it went through is said first }
+  HpackEncoderLimit(henc, -5);
+  if (henc.Tab.MaxSize = 0) and (henc.Tab.Size = 0) then Inc(n);
+  HpackEncoderLimit(henc, 200);
+  if Says(#32#63#169#1, 200) then Inc(n);
+  { 50, 30, 60: the smallest and the last, the first below the prefix }
+  HpackEncoderLimit(henc, 50);
+  HpackEncoderLimit(henc, 30);
+  HpackEncoderLimit(henc, 60);
+  if Says(#62#63#29, 60) then Inc(n);
+  { down and no further: one update, for the smallest is the size now }
+  HpackEncoderLimit(henc, 40);
+  if Says(#63#9, 40) then Inc(n);
+  { a decoder that allows more begins at 4096 and takes an update up to what it allows }
+  HpackDecoderInit(hdec, 8192);
+  got := nil;
+  if (hdec.Tab.MaxSize = 4096) and HpackDecode(hdec, #63#225#63 + #130, 1 shl 20, got, tooLarge, err) and
+    (hdec.Tab.MaxSize = 8192) and (Length(got) = 1) then Inc(n);
+  got := nil;
+  if (not HpackDecode(hdec, #63#226#63 + #130, 1 shl 20, got, tooLarge, err)) and (Pos('past the size allowed', err) > 0) then
+    Inc(n);
+  { and one that allows less begins there }
+  HpackDecoderInit(hdec, 100);
+  got := nil;
+  if (hdec.Tab.MaxSize = 100) and (not HpackDecode(hdec, #63#70 + #130, 1 shl 20, got, tooLarge, err)) and
+    HpackDecode(hdec, #63#69 + #130, 1 shl 20, got, tooLarge, err) then Inc(n);
+  WriteLn('the size of the table: ', n, ' of 14');
+end;
+
+{ What is exactly at a limit: a budget its fields fill to the octet, the
+  largest integer there is, the static table from its first entry to its
+  last, the names Http2Field keeps out of the table, and the room a
+  table's entries take in memory after many have come and gone }
+procedure Limits;
+var
+  henc: THpackEncoder;
+  hdec: THpackDecoder;
+  fields, got: THpackFields;
+  block, err: string;
+  tooLarge: Boolean;
+  n, i, most: Integer;
+  a, b, c, d, e, f, g: THpackField;
+begin
+  n := 0;
+  { three fields of 40 octets each (4 + 4 + 32): 120 holds them, 119 two }
+  HpackEncoderInit(henc);
+  fields := nil;
+  for i := 1 to 3 do
+    fields := Append(fields, Http2FieldOnce('nam' + Chr(48 + i), 'valu'));
+  block := HpackEncode(henc, fields);
+  HpackDecoderInit(hdec, 4096);
+  got := nil;
+  if HpackDecode(hdec, block, 120, got, tooLarge, err) and (not tooLarge) and (Length(got) = 3) then Inc(n);
+  got := nil;
+  if HpackDecode(hdec, block, 119, got, tooLarge, err) and tooLarge and (Length(got) = 2) then Inc(n);
+  { 2^31 - 1 is an integer, an index nobody has and a size nobody allowed; 2^31 is none }
+  HpackDecoderInit(hdec, 4096);
+  got := nil;
+  if (not HpackDecode(hdec, IntOctets(7, 128, 2147483647), 1 shl 20, got, tooLarge, err)) and
+    (Pos('no header field has that index', err) > 0) then Inc(n);
+  if (not HpackDecode(hdec, IntOctets(7, 128, 2147483648), 1 shl 20, got, tooLarge, err)) and
+    (Pos('truncated index', err) > 0) then Inc(n);
+  if (not HpackDecode(hdec, IntOctets(5, 32, 2147483647), 1 shl 20, got, tooLarge, err)) and
+    (Pos('past the size allowed', err) > 0) then Inc(n);
+  { the static table at its ends, entries 61 and 1: by name, and whole }
+  HpackEncoderInit(henc);
+  henc.NoHuffman := True;
+  fields := nil;
+  fields := Append(fields, Http2FieldOnce('www-authenticate', 'x'));
+  fields := Append(fields, Http2FieldOnce('www-authenticate', ''));
+  fields := Append(fields, Http2FieldOnce(':authority', 'a'));
+  fields := Append(fields, Http2FieldOnce(':authority', ''));
+  block := HpackEncode(henc, fields);
+  if block = #15#46#1'x' + #189 + #1#1'a' + #129 then
+    Inc(n)
+  else
+    WriteLn('WRONG the static table''s ends: ', Hex(block));
+  { an encoder as it is made writes a string's Huffman code when it is
+    shorter: the first request of RFC 7541 C.4 }
+  HpackEncoderInit(henc);
+  fields := nil;
+  fields := Append(fields, Http2FieldIndexed(':method', 'GET'));
+  fields := Append(fields, Http2FieldIndexed(':scheme', 'http'));
+  fields := Append(fields, Http2FieldIndexed(':path', '/'));
+  fields := Append(fields, Http2FieldIndexed(':authority', 'www.example.com'));
+  block := HpackEncode(henc, fields);
+  if block = UnHex('828684418cf1e3c2e5f23a6ba0ab90f4ff') then
+    Inc(n)
+  else
+    WriteLn('WRONG an encoder as it is made: ', Hex(block));
+  { the four names of RFC 7541 7.1.3 and no other; the other two makers never }
+  a := Http2Field('authorization', 'v');
+  b := Http2Field('proxy-authorization', 'v');
+  c := Http2Field('cookie', 'v');
+  d := Http2Field('set-cookie', 'v');
+  e := Http2Field('x-other', 'v');
+  f := Http2FieldIndexed('cookie', 'v');
+  g := Http2FieldOnce('authorization', 'v');
+  if a.Sensitive and b.Sensitive and c.Sensitive and d.Sensitive and (not e.Sensitive) and (not f.Sensitive) and
+    (not g.Sensitive) and g.Once and (not a.Once) and (not e.Once) and (not f.Once) then
+    Inc(n);
+  { twenty thousand entries through a table of 4096 octets: the array that holds them stays small }
+  HpackEncoderInit(henc);
+  HpackDecoderInit(hdec, 4096);
+  most := 0;
+  for i := 1 to 20000 do
+  begin
+    fields := nil;
+    fields := Append(fields, Http2FieldIndexed('k', IntToStr(i)));
+    block := HpackEncode(henc, fields);
+    got := nil;
+    if not HpackDecode(hdec, block, 1 shl 20, got, tooLarge, err) then
+      most := 1 shl 30;
+    if Length(henc.Tab.Ents) > most then
+      most := Length(henc.Tab.Ents);
+    if Length(hdec.Tab.Ents) > most then
+      most := Length(hdec.Tab.Ents);
+  end;
+  if most <= 512 then
+    Inc(n)
+  else
+    WriteLn('WRONG the table''s array reached ', most, ' entries');
+  WriteLn('what is exactly at a limit: ', n, ' of 9');
+end;
+
+{ Octets nobody wrote as HPACK: the decoder takes each block or refuses
+  it, and stays within what it was given either way. Blocks of random
+  octets, blocks the encoder wrote with one octet changed, cut short or
+  with octets put in, and Huffman strings of random octets }
+procedure Noise;
+var
+  henc: THpackEncoder;
+  hdec: THpackDecoder;
+  fields, got: THpackFields;
+  block, good, err, text: string;
+  tooLarge: Boolean;
+  i, k, n, taken, refused, sized: Integer;
+begin
+  seed := 362436069;
+  taken := 0;
+  refused := 0;
+  sized := 0;
+  HpackEncoderInit(henc);
+  fields := nil;
+  fields := Append(fields, Http2Field(':status', '200'));
+  fields := Append(fields, Http2Field('content-type', 'application/json; charset=utf-8'));
+  fields := Append(fields, Http2FieldIndexed('x-request-id', 'a1b2c3d4e5f60718293a4b5c6d7e8f90'));
+  fields := Append(fields, Http2Field('set-cookie', 'session=0123456789abcdef; Path=/; HttpOnly'));
+  good := HpackEncode(henc, fields);
+  for i := 1 to 30000 do
+  begin
+    case i mod 3 of
+      0:
+        begin
+          SetLength(block, Rand(48));
+          for k := 1 to Length(block) do
+            block[k] := Chr(Rand(256));
+        end;
+      1:
+        begin
+          block := good;
+          for k := 1 to 1 + Rand(3) do
+            block[1 + Rand(Length(block))] := Chr(Rand(256));
+        end;
+    else
+      n := Rand(Length(good) + 1);
+      block := Copy(good, 1, n) + Chr(Rand(256)) + Copy(good, n + 1 + Rand(3), Length(good));
+    end;
+    { one decoder for all: its table is whatever the blocks before left it }
+    if i mod 500 = 1 then
+      HpackDecoderInit(hdec, 4096);
+    got := nil;
+    if HpackDecode(hdec, block, 4096, got, tooLarge, err) then
+      Inc(taken)
+    else if err <> '' then
+      Inc(refused);
+    if (hdec.Tab.Size <= hdec.Tab.MaxSize) and (hdec.Tab.MaxSize <= hdec.Tab.Allowed) then
+      Inc(sized);
+  end;
+  n := 0;
+  for i := 1 to 20000 do
+  begin
+    SetLength(block, Rand(40));
+    for k := 1 to Length(block) do
+      block[k] := Chr(Rand(256));
+    { whatever decodes is written back to the same octets but for the padding }
+    if HuffmanDecode(block, text) then
+    begin
+      if HuffmanEncode(text) = block then
+        Inc(n);
+    end
+    else
+      Inc(n);
+  end;
+  WriteLn('octets nobody wrote: ', taken + refused, ' of 30000 blocks taken or refused with a reason, some of each: ',
+    (taken > 0) and (refused > 0), '; the table within its size after ', sized, '; Huffman strings: ', n, ' of 20000');
+end;
+
+begin
+  Examples;
+  Huffman;
+  Refusals;
+  RoundTrips;
+  Budget;
+  Edges;
+  Sizes;
+  Limits;
+  Noise;
+end.

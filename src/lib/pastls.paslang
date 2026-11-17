@@ -73,9 +73,14 @@ type
   TTlsStream = class(TNetStream)
   private
     FRaw: TNetStream;
+    { what was read ahead of the connection under this one: FInBuf from
+      FInPos to before FInEnd }
     FInBuf: string;
+    FInPos, FInEnd: Integer;
     FHand: string;
+    { application data opened and not yet taken: FPlain from FPlainPos }
     FPlain: string;
+    FPlainPos: Integer;
     FVers: Integer;
     FSuite: Integer;
     FAlpn: string;
@@ -93,8 +98,16 @@ type
     FRdSeq, FWrSeq: Integer;
     FRdSecret, FWrSecret: string;
     FHashAlg: Integer;
+    { whoever writes a record holds it (Go's Conn.out lock): the routine
+      in WriteAll, and the reading side when it answers a KeyUpdate or
+      sends an alert }
+    FWMu: mutex;
+    function TakeHead(Deadline: Integer; out Hdr: string; out Err: Integer): Boolean;
+    function TakeBody(N, Deadline: Integer; out Data: string; out Err: Integer): Boolean;
     function ReadRecord(Deadline: Integer; ExpectCcs: Boolean; out Typ: Integer; out Data: string): Boolean;
+    function RecordOf(Typ: Integer; const Data: string): string;
     function WriteRecord(Typ: Integer; const Data: string; Deadline: Integer): Boolean;
+    function WritePlain(P: Pointer; N, Deadline: Integer): Boolean;
     function ReadMsg(Deadline: Integer; out Typ: Integer; out Body, Raw: string): Boolean;
     procedure Fail(Alert: Integer; const Msg: string; Deadline: Integer);
     procedure SetRead(Aead: Integer; const Key, Iv: string);
@@ -108,13 +121,18 @@ type
     function CheckChain(Config: TTlsConfig; const Host: string): Boolean;
     function VerifySig(Scheme: Integer; const Signed, Sig: string; Tls13: Boolean): Boolean;
     function PostHandshake(Typ: Integer; const Body: string; Deadline: Integer): Boolean;
+    function Await(Deadline: Integer): Integer;
   public
     constructor Create(Raw: TNetStream);
     { up to MaxN bytes of application data before Deadline (a Nanotime, 0
       none): the count, 0 at close_notify or the end of the stream, -110
       at the deadline, -71 (EPROTO) for a TLS error (LastError says it) }
     function ReadSome(MaxN, Deadline: Integer; out Data: string): Integer; override;
+    function ReadInto(P: Pointer; MaxN, Deadline: Integer): Integer; override;
     function WriteAll(const Data: string; Deadline: Integer): Boolean; override;
+    function WriteFrom(P: Pointer; N, Deadline: Integer): Boolean; override;
+    { the connection under it is shut (pasconn); no close_notify is sent }
+    procedure Shutdown(How: Integer); override;
     { close_notify, then the connection under it }
     procedure Dispose; override;
     { TlsVersion12 or TlsVersion13 }
@@ -206,6 +224,10 @@ const
   HrrRandomHex = 'cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c';
 
   MaxPlaintext = 16384;
+  { what TakeHead reads ahead of a record's head }
+  RawAhead = 4096;
+  { how many records of application data go in one write }
+  RecordsAWrite = 4;
   MaxUselessRecords = 16;
 
 { ---- bytes in and out ---- }
@@ -690,7 +712,9 @@ begin
       Exit;
     end;
     PlainTyp := Ord(body[i]);
-    Plain := Copy(body, 1, i - 1);
+    { the content is what stands before its type: the same string, shorter }
+    SetLength(body, i - 1);
+    Plain := body;
   end
   else
   begin
@@ -727,14 +751,18 @@ begin
   if (not FBroken) and (Alert >= 0) then
   begin
     FBroken := True;
-    WriteRecord(RecAlert, U8(2) + U8(Alert), Deadline);
+    lock FWMu do
+      WriteRecord(RecAlert, U8(2) + U8(Alert), Deadline);
   end;
   FBroken := True;
 end;
 
-function TTlsStream.WriteRecord(Typ: Integer; const Data: string; Deadline: Integer): Boolean;
+{ the octets of one record: the five before its payload, and the
+  payload sealed (RFC 8446 5.1 and 5.2) }
+function TTlsStream.RecordOf(Typ: Integer; const Data: string): string;
 var
-  vers, outer: Integer;
+  vers, outer, n: Integer;
+  body: string;
 begin
   vers := $0303;
   if FVers = 0 then
@@ -743,13 +771,154 @@ begin
   outer := Typ;
   if (FVers = TlsVersion13) and (FWrAead <> 0) then
     outer := RecData;
-  Result := FRaw.WriteAll(U8(outer) + U16(vers) + Vec16(Seal(Typ, Data)), Deadline);
+  body := Seal(Typ, Data);
+  n := Length(body);
+  SetLength(Result, 5 + n);
+  Result[1] := Chr(outer);
+  Result[2] := Chr(vers shr 8);
+  Result[3] := Chr(vers and 255);
+  Result[4] := Chr(n shr 8);
+  Result[5] := Chr(n and 255);
+  if n > 0 then
+    Move(body[1], Result[6], n);
+end;
+
+function TTlsStream.WriteRecord(Typ: Integer; const Data: string; Deadline: Integer): Boolean;
+begin
+  Result := FRaw.WriteAll(RecordOf(Typ, Data), Deadline);
   if not Result then
   begin
     FBroken := True;
     if FErr = '' then
       FErr := 'tls: write failed';
   end;
+end;
+
+{ N octets of application data at P, in records of MaxPlaintext at
+  most, up to RecordsAWrite of them in one write to the connection
+  under this one. The caller holds FWMu }
+function TTlsStream.WritePlain(P: Pointer; N, Deadline: Integer): Boolean;
+var
+  done, n1, held, used: Integer;
+  chunk, rec, batch: string;
+begin
+  Result := False;
+  done := 0;
+  while done < N do
+  begin
+    held := 0;
+    used := 0;
+    batch := '';
+    while (done < N) and (held < RecordsAWrite) do
+    begin
+      n1 := N - done;
+      if n1 > MaxPlaintext then
+        n1 := MaxPlaintext;
+      SetLength(chunk, n1);
+      Move(PByte(P + done)^, chunk[1], n1);
+      rec := RecordOf(RecData, chunk);
+      done := done + n1;
+      Inc(held);
+      if (held = 1) and (done = N) then
+        batch := rec
+      else
+      begin
+        if batch = '' then
+          SetLength(batch, RecordsAWrite * (MaxPlaintext + 64));
+        Move(rec[1], batch[used + 1], Length(rec));
+      end;
+      used := used + Length(rec);
+    end;
+    if Length(batch) <> used then
+      SetLength(batch, used);
+    if not FRaw.WriteAll(batch, Deadline) then
+    begin
+      FBroken := True;
+      if FErr = '' then
+        FErr := 'tls: write failed';
+      Exit;
+    end;
+  end;
+  Result := True;
+end;
+
+{ The five octets before a record's payload. They are read with what
+  comes after them, up to RawAhead octets at once: a small record is
+  then whole in one read. False with Err 0 at the end of the stream,
+  -110 at the deadline, else -errno; what had come stays for the next
+  call }
+function TTlsStream.TakeHead(Deadline: Integer; out Hdr: string; out Err: Integer): Boolean;
+var
+  have, k, i: Integer;
+begin
+  Result := False;
+  Err := 0;
+  Hdr := '';
+  if FInBuf = '' then
+  begin
+    SetLength(FInBuf, RawAhead);
+    FInPos := 1;
+    FInEnd := 1;
+  end;
+  have := FInEnd - FInPos;
+  if have < 5 then
+  begin
+    for i := 1 to have do
+      FInBuf[i] := FInBuf[FInPos + i - 1];
+    FInPos := 1;
+    FInEnd := 1 + have;
+    while have < 5 do
+    begin
+      k := FRaw.ReadInto(@FInBuf[FInEnd], Length(FInBuf) - FInEnd + 1, Deadline);
+      if k <= 0 then
+      begin
+        Err := k;
+        Exit;
+      end;
+      FInEnd := FInEnd + k;
+      have := have + k;
+    end;
+  end;
+  Hdr := Copy(FInBuf, FInPos, 5);
+  FInPos := FInPos + 5;
+  Result := True;
+end;
+
+{ a record's payload of N octets: what came with its head, and the rest
+  read from the connection straight into it }
+function TTlsStream.TakeBody(N, Deadline: Integer; out Data: string; out Err: Integer): Boolean;
+var
+  have, got, k: Integer;
+begin
+  Result := False;
+  Err := 0;
+  Data := '';
+  have := FInEnd - FInPos;
+  if have >= N then
+  begin
+    Data := Copy(FInBuf, FInPos, N);
+    FInPos := FInPos + N;
+    Result := True;
+    Exit;
+  end;
+  SetLength(Data, N);
+  if have > 0 then
+    Move(FInBuf[FInPos], Data[1], have);
+  FInPos := 1;
+  FInEnd := 1;
+  got := have;
+  while got < N do
+  begin
+    k := FRaw.ReadInto(@Data[got + 1], N - got, Deadline);
+    if k <= 0 then
+    begin
+      Err := k;
+      Data := '';
+      Exit;
+    end;
+    got := got + k;
+  end;
+  Result := True;
 end;
 
 { one record, opened (Go's readRecordOrCCS): handshake bytes go to FHand,
@@ -765,7 +934,7 @@ begin
   Typ := 0;
   while True do
   begin
-    if not ReadExactFrom(FRaw, FInBuf, 5, hdr, Deadline, err) then
+    if not TakeHead(Deadline, hdr, err) then
     begin
       if err = -110 then
         FErr := 'tls: read timeout'
@@ -795,7 +964,7 @@ begin
       Fail(AlertRecordOverflow, 'tls: oversized record received with length ' + IntToStr(n), Deadline);
       Exit;
     end;
-    if not ReadExactFrom(FRaw, FInBuf, n, payload, Deadline, err) then
+    if not TakeBody(n, Deadline, payload, err) then
     begin
       FErr := 'unexpected EOF';
       FBroken := True;
@@ -1888,12 +2057,16 @@ begin
         next := ExpandLabel(FHashAlg, FRdSecret, 'traffic upd', '', CipherHashSize(FHashAlg));
         SetTraffic13(True, next);
         if Body[1] = #1 then
-        begin
-          if not WriteRecord(RecHandshake, U8(HsKeyUpdate) + Vec24(#0), Deadline) then
-            Exit;
-          next := ExpandLabel(FHashAlg, FWrSecret, 'traffic upd', '', CipherHashSize(FHashAlg));
-          SetTraffic13(False, next);
-        end;
+          { the answer and the next write secret under the write lock,
+            as Go's handleKeyUpdate: no record of another routine's goes
+            between them }
+          lock FWMu do
+          begin
+            if not WriteRecord(RecHandshake, U8(HsKeyUpdate) + Vec24(#0), Deadline) then
+              Exit;
+            next := ExpandLabel(FHashAlg, FWrSecret, 'traffic upd', '', CipherHashSize(FHashAlg));
+            SetTraffic13(False, next);
+          end;
         Result := True;
       end;
   else
@@ -1901,17 +2074,13 @@ begin
   end;
 end;
 
-function TTlsStream.ReadSome(MaxN, Deadline: Integer; out Data: string): Integer;
+{ application data is there to take, FPlain from FPlainPos: 1; or what
+  ReadSome answers when none comes }
+function TTlsStream.Await(Deadline: Integer): Integer;
 var
   typ: Integer;
   plain, body, raw: string;
 begin
-  Data := '';
-  if MaxN <= 0 then
-  begin
-    Result := 0;
-    Exit;
-  end;
   while FPlain = '' do
   begin
     if FClosed then
@@ -1961,46 +2130,102 @@ begin
       Exit;
     end;
     if typ = RecData then
+    begin
       FPlain := plain;
+      FPlainPos := 1;
+    end;
   end;
-  if Length(FPlain) <= MaxN then
-  begin
-    Data := FPlain;
-    FPlain := '';
-  end
+  Result := 1;
+end;
+
+function TTlsStream.ReadSome(MaxN, Deadline: Integer; out Data: string): Integer;
+var
+  k: Integer;
+begin
+  Data := '';
+  Result := 0;
+  if MaxN <= 0 then
+    Exit;
+  Result := Await(Deadline);
+  if Result <= 0 then
+    Exit;
+  k := Length(FPlain) - FPlainPos + 1;
+  if k > MaxN then
+    k := MaxN;
+  if k = Length(FPlain) then
+    Data := FPlain
   else
-  begin
-    Data := Copy(FPlain, 1, MaxN);
-    Delete(FPlain, 1, MaxN);
-  end;
-  Result := Length(Data);
+    Data := Copy(FPlain, FPlainPos, k);
+  FPlainPos := FPlainPos + k;
+  if FPlainPos > Length(FPlain) then
+    FPlain := '';
+  Result := k;
+end;
+
+function TTlsStream.ReadInto(P: Pointer; MaxN, Deadline: Integer): Integer;
+var
+  k: Integer;
+begin
+  Result := 0;
+  if MaxN <= 0 then
+    Exit;
+  Result := Await(Deadline);
+  if Result <= 0 then
+    Exit;
+  k := Length(FPlain) - FPlainPos + 1;
+  if k > MaxN then
+    k := MaxN;
+  Move(FPlain[FPlainPos], PByte(P)^, k);
+  FPlainPos := FPlainPos + k;
+  if FPlainPos > Length(FPlain) then
+    FPlain := '';
+  Result := k;
 end;
 
 function TTlsStream.WriteAll(const Data: string; Deadline: Integer): Boolean;
-var
-  p, n: Integer;
 begin
   Result := False;
-  if FBroken or FClosed or not FDone then
-    Exit;
-  p := 1;
-  while p <= Length(Data) do
+  lock FWMu do
   begin
-    n := Length(Data) - p + 1;
-    if n > MaxPlaintext then
-      n := MaxPlaintext;
-    if not WriteRecord(RecData, Copy(Data, p, n), Deadline) then
+    if FBroken or FClosed or not FDone then
       Exit;
-    p := p + n;
+    { what fits one record goes as it is; more goes record by record
+      from where it is }
+    if Length(Data) <= MaxPlaintext then
+    begin
+      if Data <> '' then
+        Result := WriteRecord(RecData, Data, Deadline)
+      else
+        Result := True;
+    end
+    else
+      Result := WritePlain(@Data[1], Length(Data), Deadline);
   end;
-  Result := True;
+end;
+
+function TTlsStream.WriteFrom(P: Pointer; N, Deadline: Integer): Boolean;
+begin
+  Result := False;
+  lock FWMu do
+  begin
+    if FBroken or FClosed or not FDone then
+      Exit;
+    Result := WritePlain(P, N, Deadline);
+  end;
+end;
+
+procedure TTlsStream.Shutdown(How: Integer);
+begin
+  if FRaw <> nil then
+    FRaw.Shutdown(How);
 end;
 
 procedure TTlsStream.Dispose;
 begin
   if FDone and not FBroken then
   begin
-    WriteRecord(RecAlert, U8(1) + U8(AlertCloseNotify), Nanotime + 1000000000);
+    lock FWMu do
+      WriteRecord(RecAlert, U8(1) + U8(AlertCloseNotify), Nanotime + 1000000000);
     FBroken := True;
   end;
   if FRaw <> nil then

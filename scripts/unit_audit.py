@@ -39,7 +39,7 @@ ALIAS = {
     'pasflate': ['flate', 'deflate', 'gzip', 'zlib'], 'paszip': ['zip'], 'pasxml': ['xml'], 'pasjson': ['json'],
     'pasurl': ['url'], 'pasmime': ['mime', 'mail'], 'passmtp': ['smtp', 'mail'], 'pasimap': ['imap', 'mail'],
     'pashttp': ['http'], 'httpclient': ['http_client', 'httpcli'], 'httpserver': ['http_gosrv', 'httpsystemd', 'servers', 'apisrv'],
-    'pastls': ['tls'], 'pasx509': ['x509'], 'pascipher': ['cipher', 'wyche', 'aes', 'chacha', 'gcm'],
+    'pastls': ['tls'], 'pashttp2': ['http2', 'hpack', 'h2oracle'], 'pasx509': ['x509'], 'pascipher': ['cipher', 'wyche', 'aes', 'chacha', 'gcm'],
     'pascodec': ['codec', 'base64'], 'sqlite': ['sql', 'sqlite', 'sqlite3'], 'paspdf': ['pdf'], 'paspdfenc': ['pdfenc', 'pdf'],
     'paspdfafm': ['pdfafm', 'pdf'], 'paspdfform': ['pdf_forms', 'pdfform', 'pdf'], 'paspdfcrypt': ['pdfcrypt', 'pdf'],
     'pasfontcff': ['fontcff', 'cff'], 'pasfonttt': ['fonttt', 'truetype'], 'pasfontnames': ['fontnames'],

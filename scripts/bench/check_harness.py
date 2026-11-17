@@ -80,7 +80,7 @@ def policy_checks():
             pass
         else:
             require(False, "unreviewed Go version accepted the pinned policy")
-    require(len(bench.PAIRS) == 45 and len(bench.units()) == 218 and "b45nist" in bench.PAIRS and
+    require(len(bench.PAIRS) == 46 and len(bench.units()) == 221 and "b45nist" in bench.PAIRS and
             run_refs.selected_units(None, ["go"]) == bench.units() and
             run_refs.selected_units(["b45nist"], ["go"]) == [("b45nist", "p256"), ("b45nist", "p384")],
             "selected Go mode lost the current full suite or NIST pair")
