@@ -941,6 +941,9 @@ GOLDEN_A64 += excroot excown
 # P629: TcpRead and TcpReadDeadline give up to MaxN bytes, no hidden 512 or 65536.
 GOLDEN += tcpreadmax
 GOLDEN_A64 += tcpreadmax
+# P666: paslib's CString for a system call, nil for a string with a NUL inside.
+GOLDEN += cstring
+GOLDEN_A64 += cstring
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
