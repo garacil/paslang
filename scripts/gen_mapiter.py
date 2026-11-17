@@ -34,10 +34,10 @@ for n in (0, 1, 2, 9, 100, 1001, 5000):
 for n in (0, 7, 8, 9, 1000, 5000):
     out.append('eaten n=%d visited=%d left=0' % (n, n))
 for n in (1, 5, 8, 9, 100, 1000, 3000):
-    out.append('grows n=%d original=%d dups=0 bad=0 lenok=1' % (n, n))
+    out.append('grows n=%d original=%d dups=0 bad=0 lenok=True' % (n, n))
 for n in (0, 8, 9, 1000, 3000):
     out.append('rewrites n=%d visited=%d bad=0' % (n, n))
-out.append('fuzz rounds=300 stale=0 dups=0 wrong=0 missing=0 1')
+out.append('fuzz rounds=300 stale=0 dups=0 wrong=0 missing=0 True')
 out.append('nested visited=%d' % (200 * 200))
 out.append('nested3 matches=%d' % (200 * 2))
 for r in (1, 2, 3):

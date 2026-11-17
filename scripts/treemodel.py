@@ -17,7 +17,7 @@
 
 """The exact model of testdata/tree2.paslang (P110): an ordered map with
 the words of tree[K] of V and a binary min-heap, run over the same
-steps, printing what the program must print. Booleans print as 1 and 0,
+steps, printing what the program must print. Booleans print as True and False,
 as WriteLn prints them."""
 import bisect
 import heapq
@@ -117,7 +117,7 @@ class Tree:
 
 
 def b(x):
-    return '1' if x else '0'
+    return 'True' if x else 'False'
 
 
 def main():

@@ -148,6 +148,10 @@ def f32bits(f):
     return struct.unpack('<I', struct.pack('<f', f))[0]
 
 
+def bool_text(value):
+    return 'True' if value else 'False'
+
+
 def main():
     src = []
     out = []
@@ -217,7 +221,7 @@ def main():
                     w('  Carry := %s;' % ('True' if c else 'False'))
                     w("  Write('%s %s %d: ', %s(x, %d), ' ', Carry);" % (word, t, k, word, k))
                     r, rc = rot(word, n, v, c, k)
-                    line = '%s %s %d: %s %s' % (word, t, k, show(r, n, s), rc)
+                    line = '%s %s %d: %s %s' % (word, t, k, show(r, n, s), bool_text(rc))
                     # in place: a local, or the global on odd counts
                     place = 'x' if ki % 2 == 0 else 'g' + t
                     w('  %s := %s;' % (place, lit(v, n, s)))
@@ -225,7 +229,7 @@ def main():
                     w('  %s := %s(%s, %d);' % (place, word, place, k))
                     w("  WriteLn(' ', %s, ' ', Carry);" % place)
                     r2, rc2 = rot(word, n, v, 1 - c, k)
-                    out_line = '%s %s %s' % (line, show(r2, n, s), rc2)
+                    out_line = '%s %s %s' % (line, show(r2, n, s), bool_text(rc2))
                     KOUT.append(out_line)
             # the count left out is 1
             v = values(n)[0]
@@ -234,7 +238,7 @@ def main():
             w('  x := %s(x);' % word)
             w("  WriteLn('%s %s default ', x, ' ', Carry);" % (word, t))
             r, rc = rot(word, n, v, 1, 1)
-            KOUT.append('%s %s default %s %s' % (word, t, show(r, n, s), rc))
+            KOUT.append('%s %s default %s %s' % (word, t, show(r, n, s), bool_text(rc)))
         w('end;')
         w('')
     # in place in memory: a local whose address is taken stays in its slot
@@ -256,7 +260,7 @@ def main():
                     r, rc = rot(word, n, v, c, k)
                     if 'Carry' in word:
                         c = rc
-                    MOUT.append('memory %s %s %d %s %d' % (word, t, k, show(r, n, s), c))
+                    MOUT.append('memory %s %s %d %s %s' % (word, t, k, show(r, n, s), bool_text(c)))
         w('end;')
         w('')
     # a signed value a loop keeps in a register, used there: its upper
@@ -290,7 +294,7 @@ def main():
                 sm += sgn(x, n) + sgn(y, n)
                 if sgn(x, n) < 0:
                     sm += 1000
-            SOUT.append('sign %s %s %d %d %d %d' % (word, t, sgn(x, n), sgn(y, n), sm, c))
+            SOUT.append('sign %s %s %d %d %d %s' % (word, t, sgn(x, n), sgn(y, n), sm, bool_text(c)))
         w('end;')
         w('')
     w('procedure SetOn;')
@@ -375,7 +379,7 @@ def main():
         top = (x >> 255) & 1
         x = (x << 1) & (2**256 - 1)
     parts = [sgn((x >> (64 * i)) & (2**64 - 1), 64) for i in range(4)]
-    WOUT = 'wide256 %d %d %d %d %d' % (parts[0], parts[1], parts[2], parts[3], top)
+    WOUT = 'wide256 %d %d %d %d %s' % (parts[0], parts[1], parts[2], parts[3], bool_text(top))
     # a Byte a loop keeps in a register, through Carry: a ring of 9
     w('procedure Ring9;')
     w('var')
@@ -401,7 +405,7 @@ def main():
         b, c = rot('RotateLeftThroughCarry', 8, b, c, 1)
         s_ += b
         ones += c
-    ROUT = 'ring9 %d %d %d %d' % (b, c, s_, ones)
+    ROUT = 'ring9 %d %s %d %d' % (b, bool_text(c), s_, ones)
     # CRC-8 (polynomial 7) with ShiftLeftToCarry
     w('function Crc8(const s: string): Byte;')
     w('var')
@@ -452,7 +456,7 @@ def main():
                     items = []
                     for k in COUNTS:
                         r, rc = rot(word, n, v, c, k)
-                        items.append('%s/%d' % (show(r, n, s), rc))
+                        items.append('%s/%s' % (show(r, n, s), bool_text(rc)))
                     out.append('%s %s %s %d: %s' % (word, t, lit(v, n, s), c, ' '.join(items)))
         vals = values(n)
         for hi, lo in ((vals[0], vals[2]), (vals[1], vals[0])):
@@ -485,48 +489,48 @@ def main():
                             'RotateRightThroughCarry', 'ShiftLeftToCarry', 'ShiftRightToCarry',
                             'ShiftRightSignedToCarry'):
                     CARRY[0] = rc
-                out.append('global %s %s %d %s %d' % (word, t, k, show(r, n, s), CARRY[0]))
+                out.append('global %s %s %d %s %s' % (word, t, k, show(r, n, s), bool_text(CARRY[0])))
     # the reals and Char: the bits of their whole width
     w('  d := -2.5;')
     w('  d := RotateLeftToCarry(d, 12);')
     w("  WriteLn('double ', d as UInt64, ' ', Carry);")
     r, rc = rot('RotateLeftToCarry', 64, f64bits(-2.5), 0, 12)
-    out.append('double %d %d' % (sgn(r, 64), rc))
+    out.append('double %d %s' % (sgn(r, 64), bool_text(rc)))
     w('  sg := 1.5;')
     w('  CarryOff;')
     w('  sg := RotateRightThroughCarry(sg, 3);')
     w("  WriteLn('single ', sg as UInt32, ' ', Carry);")
     r, rc = rot('RotateRightThroughCarry', 32, f32bits(1.5), 0, 3)
-    out.append('single %d %d' % (r, rc))
+    out.append('single %d %s' % (r, bool_text(rc)))
     w("  ch := 'A';")
     w('  ch := RotateLeftToCarry(ch, 3);')
     w("  WriteLn('char ', Ord(ch), ' ', Carry);")
     r, rc = rot('RotateLeftToCarry', 8, 65, 0, 3)
-    out.append('char %d %d' % (r, rc))
+    out.append('char %d %s' % (r, bool_text(rc)))
     w("  ch := 'a';")
     w('  CarryOn;')
     w('  ch := RotateLeftThroughCarry(ch);')
     w("  WriteLn('char in place ', Ord(ch), ' ', Carry);")
     r, rc = rot('RotateLeftThroughCarry', 8, 97, 1, 1)
-    out.append('char in place %d %d' % (r, rc))
+    out.append('char in place %d %s' % (r, bool_text(rc)))
     # an untyped constant takes the width of where it goes
     w('  b := RotateLeftToCarry($81);')
     w("  WriteLn('const byte ', b, ' ', Carry);")
-    out.append('const byte 3 1')
+    out.append('const byte 3 True')
     w('  w := RotateRightToCarry(1);')
     w("  WriteLn('const word ', w, ' ', Carry);")
-    out.append('const word 32768 1')
+    out.append('const word 32768 True')
     w('  i := RotateRightToCarry(1);')
     w("  WriteLn('const integer ', i, ' ', Carry);")
-    out.append('const integer %d 1' % -(1 << 63))
+    out.append('const integer %d True' % -(1 << 63))
     w('  s8 := ShiftRightSigned(-128, 3);')
     w("  WriteLn('const int8 ', s8);")
     out.append('const int8 -16')
     w('  u := ShiftLeftToCarry($80000001);')
     w("  WriteLn('const uint32 ', u, ' ', Carry);")
-    out.append('const uint32 2 1')
+    out.append('const uint32 2 True')
     w("  WriteLn('const alone ', ShiftLeftToCarry($80), ' ', Carry);")
-    out.append('const alone 256 0')
+    out.append('const alone 256 False')
     w("  WriteLn('const count ', RotateLeftToCarry(b, 2 + 3), ' ', FunnelLeft(1, 2, 60));")
     r, _ = rot('RotateLeftToCarry', 8, 3, 0, 5)
     out.append('const count %d %d' % (r, funnel(True, 64, 1, 2, 60)))
@@ -541,30 +545,30 @@ def main():
     w('  i := 48;')
     w('  ShiftRightToCarry(i, 5);')
     w("  WriteLn('statement ', i, ' ', Carry);")
-    out.append('statement 48 1')
+    out.append('statement 48 True')
     # the operators never touch Carry
     w('  CarryOn;')
     w('  i := (i rol 70) shl 3;')
     w('  i := i shr 1;')
     w("  WriteLn('operators ', i, ' ', Carry);")
     v = ((((48 << 6) | (48 >> 58)) & (2**64 - 1)) << 3) & (2**64 - 1)
-    out.append('operators %d 1' % sgn(v >> 1, 64))
+    out.append('operators %d True' % sgn(v >> 1, 64))
     # Carry is the routine's: kept across calls and recursion, 0 in a new routine
     w('  CarryOff;')
     w('  SetOn;')
     w("  WriteLn('after a call ', Carry, ' ', Peek);")
-    out.append('after a call 1 1')
+    out.append('after a call True True')
     w('  CarryOff;')
     w('  Deep(3000);')
     w("  WriteLn('after deep recursion ', Carry);")
-    out.append('after deep recursion 1')
+    out.append('after deep recursion True')
     w('  CarryOn;')
     w('  done := MakeChan(1);')
     w('  pas Child(7);')
     w('  hid := Recv(done);')
     w('  CarryFlip;')
     w("  WriteLn('a new routine starts with ', childSaw, '; this one kept ', Carry, ' ', hid);")
-    out.append('a new routine starts with 0; this one kept 0 7')
+    out.append('a new routine starts with False; this one kept False 7')
     w('  done := MakeChan(4);')
     w('  for hid := 0 to 3 do')
     w('    pas Flipper(hid);')
@@ -818,7 +822,7 @@ def main_mem():
                     items = []
                     for k in cs:
                         r, rc = rot_bytes(word, b, c, k)
-                        items.append('%s/%d' % (hexb(r), rc))
+                        items.append('%s/%s' % (hexb(r), bool_text(rc)))
                     out.append('%s %s %d %d: %s' % (word, name, seed, c, ' '.join(items)))
             w('  F%s(%d);' % (name, seed))
             z = lcg(seed + 1, size)
@@ -837,7 +841,7 @@ def main_mem():
                 items = []
                 for k in cs:
                     r, rc = rot_bytes(word, sv, c, k)
-                    items.append('%s/%d' % (hexb(r), rc))
+                    items.append('%s/%s' % (hexb(r), bool_text(rc)))
                 out.append('%s string %d %d: %s' % (word, len(sv), c, ' '.join(items)))
         for wv in words:
             w('  SetLength(d, %d);' % len(wv))
@@ -850,7 +854,7 @@ def main_mem():
                 items = []
                 for k in cs:
                     r, rc = rot_bytes(word, b, c, k)
-                    items.append('%d.%s/%d' % (len(wv), hexb(r), rc))
+                    items.append('%d.%s/%s' % (len(wv), hexb(r), bool_text(rc)))
                 out.append('%s words %d %d: %s' % (word, len(wv), c, ' '.join(items)))
     # a literal, a constant count, in place, a record's fields
     w('  CarryOff;')
@@ -859,7 +863,7 @@ def main_mem():
     w('  HexOut(PByte(s), Length(s));')
     w("  WriteLn(' ', Carry);")
     r, rc = rot_bytes('RotateLeftToCarry', b'paslang', 0, 3)
-    out.append('literal %s %d' % (hexb(r), rc))
+    out.append('literal %s %s' % (hexb(r), bool_text(rc)))
     w("  WriteLn('literal right ', RotateRight('paslang', 8));")
     out.append('literal right ' + rot_bytes('RotateRight', b'paslang', 0, 8)[0].decode('ascii'))
     w('  Fill(PByte(@big), 33, 11);')
@@ -872,14 +876,14 @@ def main_mem():
     b, c = lcg(11, 33), 1
     for _ in range(70):
         b, c = rot_bytes('RotateLeftThroughCarry', b, c, 1)
-    out.append('in place %s/%d' % (hexb(b), c))
+    out.append('in place %s/%s' % (hexb(b), bool_text(c)))
     w('  Fill(PByte(@big), 33, 12);')
     w('  big := ShiftRightSignedToCarry(big, 100);')
     w("  Write('constant ');")
     w('  HexOut(PByte(@big), 33);')
     w("  WriteLn('/', Carry);")
     b, c = rot_bytes('ShiftRightSignedToCarry', lcg(12, 33), 1, 100)
-    out.append('constant %s/%d' % (hexb(b), c))
+    out.append('constant %s/%s' % (hexb(b), bool_text(c)))
     w('  r.A := $8001;')
     w('  r.B := 3;')
     w('  r.C := -1;')
@@ -889,9 +893,9 @@ def main_mem():
     w("  WriteLn('record ', r.A, ' ', r.B, ' ', r.C, ' ', r.D, ' ', Carry);")
     rb = (0x8001).to_bytes(2, 'little') + bytes([3, 0]) + (0xFFFFFFFF).to_bytes(4, 'little') + (5).to_bytes(4, 'little')
     rr, rc = rot_bytes('RotateLeftToCarry', rb, 0, 17)
-    out.append('record %d %d %d %d %d' % (int.from_bytes(rr[0:2], 'little'), rr[2],
+    out.append('record %d %d %d %d %s' % (int.from_bytes(rr[0:2], 'little'), rr[2],
                                           int.from_bytes(rr[4:8], 'little', signed=True),
-                                          int.from_bytes(rr[8:12], 'little', signed=True), rc))
+                                          int.from_bytes(rr[8:12], 'little', signed=True), bool_text(rc)))
     w("  WriteLn('field ', RotateLeft(r, 16).A);")
     rr2, _ = rot_bytes('RotateLeft', rr, 0, 16)
     out.append('field %d' % int.from_bytes(rr2[0:2], 'little'))
@@ -901,16 +905,16 @@ def main_mem():
     w('  s := ShiftLeftToCarry(s, 9);')
     w("  WriteLn('copy ', Ord(s[1]), ' ', Ord(s[2]), ' ', s2, ' ', Carry);")
     r, rc = rot_bytes('ShiftLeftToCarry', b'AB', 0, 9)
-    out.append('copy %d %d AB %d' % (r[0], r[1], rc))
+    out.append('copy %d %d AB %s' % (r[0], r[1], bool_text(rc)))
     w("  ShiftRightToCarry('A', 1);")
     w("  Write('statement ', Carry);")
     w("  ShiftRightToCarry('AB', 9);")
     w("  Write(' ', Carry);")
     w("  ShiftRightToCarry('AB', 10);")
     w("  WriteLn(' ', Carry);")
-    out.append('statement %d %d %d' % (rot('ShiftRightToCarry', 8, 65, 0, 1)[1],
-                                       rot_bytes('ShiftRightToCarry', b'AB', 0, 9)[1],
-                                       rot_bytes('ShiftRightToCarry', b'AB', 0, 10)[1]))
+    out.append('statement %s %s %s' % (bool_text(rot('ShiftRightToCarry', 8, 65, 0, 1)[1]),
+                                       bool_text(rot_bytes('ShiftRightToCarry', b'AB', 0, 9)[1]),
+                                       bool_text(rot_bytes('ShiftRightToCarry', b'AB', 0, 10)[1])))
     # funnels of strings, of slices, and of reals
     w("  WriteLn('funnel strings ', FunnelLeft('ab', 'cd', 8), ' ', FunnelRight('ab', 'cd', 12));")
     out.append('funnel strings %s %s' % (funnel_bytes(True, b'ab', b'cd', 8).decode('ascii'),
@@ -937,7 +941,7 @@ def main_mem():
     w('  SetLength(bb, 0);')
     w('  bb := ShiftLeftToCarry(bb, 1);')
     w("  WriteLn('empty ', Length(bb), ' ', Carry);")
-    out.append('empty 0 0')
+    out.append('empty 0 False')
     w('end.')
     base = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'testdata')
     with open(os.path.join(base, 'rotmem.paslang'), 'w') as f:

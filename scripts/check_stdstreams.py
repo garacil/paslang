@@ -165,7 +165,7 @@ for target in ("amd64", "arm64"):
             os.write(child.stdin_w, b"late\n")
             code, out, err, _ = child.finish()
             expect(f"read ({name})", (code, out, err), (0, flags_line(given) +
-                   b"read late, 10 ticks and a collection before it came 1\n", b""))
+                   b"read late, 10 ticks and a collection before it came True\n", b""))
             # WriteLn waits for a reader a second late; main goes on.
             child = Child([*program, "write"], given, environment, affinity)
             time.sleep(LATE)
@@ -173,7 +173,7 @@ for target in ("amd64", "arm64"):
             code, out, err, _ = child.finish()
             expect(f"write ({name})", (code, lines + out, err),
                    (0, (b"w" * WIDTH + b"\n") * LINES, flags_line(given) +
-                    b"10 ticks and a collection while the writer was stuck 1, 200 lines written\n"))
+                    b"10 ticks and a collection while the writer was stuck True, 200 lines written\n"))
         # A head after the program on the same standard output writes all
         # of its MiB, though nobody reads it for a second.
         given = (False, False, False)

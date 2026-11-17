@@ -216,7 +216,7 @@ def main():
     ok1 = crc32(s) == crc32(s[300:], crc32(s[:300]))
     ok2 = crc32c(s) == crc32c(s[300:], crc32c(s[:300]))
     ok3 = adler32(s) == adler32(s[300:], adler32(s[:300]))
-    w(f"{int(ok1)} {int(ok2)} {int(ok3)}")
+    w(f"{ok1} {ok2} {ok3}")
     print('\n'.join(out))
 
 

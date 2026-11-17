@@ -40,12 +40,12 @@ for v in vals:
     out.append(line + str(lz(v, 64) + tz(v, 64)))
 out.append('disagree 0')
 # BaseHasMore, FastHasMore (BMI1 or LSE), One(Two(39)); a Boolean is
-# written 1 or 0 (manual, 19)
-out.append('0 1 42')
+# written True or False (manual, 19)
+out.append('False True 42')
 # the string comparisons, byte by byte as Python's bytes compare
 pairs = [(b'abcdefgh', b'abcdefgi'), (b'abcdefgi', b'abcdefgh'), (b'abc', b'abd'), (b'ab', b'a'),
          (b'abcdefghijklmnopq', b'abcdefghijklmnopr')]
-out.append(' '.join('1' if a < b else '0' for a, b in pairs))
+out.append(' '.join('True' if a < b else 'False' for a, b in pairs))
 # the counts of a whole string: its bytes one number, the first byte the
 # lowest, the highest bit bit 7 of the last byte (manual, bit words)
 words = []

@@ -122,9 +122,12 @@ em = int.from_bytes(b'\x00\x01' + b'\xff' * (size - len(t) - 3) + b'\x00' + t, '
 right = pow(em, d, n).to_bytes(size, 'big').hex()
 
 
-def run(args, timeout=60):
+def run(args, timeout=60, *, quiet=False):
     done = subprocess.run(list(map(str, args)), cwd=root, capture_output=True, timeout=timeout)
     assert done.returncode == 0, (args, done.stderr[-400:], done.stdout[-400:])
+    assert done.stderr == b'', (args, done.stderr[-400:], done.stdout[-400:])
+    if quiet:
+        assert done.stdout == b'', (args, done.stdout[-400:])
     return done.stdout.decode()
 
 
@@ -136,28 +139,28 @@ for target in ('amd64', 'arm64'):
         directory = root / (label + '-' + target)
         directory.mkdir()
         (directory / 'pasrsa.paslang').write_text(text)
-        run([compiler, *flags, '-c', '-Fu', core, '-o', directory / 'pasrsa', directory / 'pasrsa.paslang'])
+        run([compiler, *flags, '-c', '-Fu', core, '-o', directory / 'pasrsa', directory / 'pasrsa.paslang'], quiet=True)
         binary = directory / 'rsafault'
         run([compiler, *flags, '-Fu', directory, '-Fu', core, '-o', binary,
-             tree / 'scripts/fixtures/rsa_fault.paslang'])
+             tree / 'scripts/fixtures/rsa_fault.paslang'], quiet=True)
         out = dict(line.split(' ', 1) for line in run([*launch, binary, *key]).splitlines())
-        assert out['made'].startswith('1'), (label, target, out)
+        assert out['made'] == 'True ', (label, target, out)
         sig = out['sig'].strip()
         if label in ('production', 'unchecked', 'entropy-interrupted', 'entropy-short'):
-            assert out['signed'] == '1' and sig == right and out['verifies'] == '1', (label, target, out)
-            assert out['pss'] == '1 %d' % size, (label, target, out)
-            assert out['rnd'] == '1 %d 1' % size, (label, target, out)
+            assert out['signed'] == 'True' and sig == right and out['verifies'] == 'True', (label, target, out)
+            assert out['pss'] == 'True %d' % size, (label, target, out)
+            assert out['rnd'] == 'True %d True' % size, (label, target, out)
         elif label.startswith('entropy-'):
             # the kernel gave no salt: the other two signatures need none
-            assert out['signed'] == '1' and sig == right and out['pss'] == '1 %d' % size, (label, target, out)
-            assert out['rnd'] == '0 0 0', (label, target, out)
+            assert out['signed'] == 'True' and sig == right and out['pss'] == 'True %d' % size, (label, target, out)
+            assert out['rnd'] == 'False 0 False', (label, target, out)
         elif label == 'fault-p-half-unchecked':
-            assert out['signed'] == '1' and sig != right and out['verifies'] == '0', (label, target, out)
+            assert out['signed'] == 'True' and sig != right and out['verifies'] == 'False', (label, target, out)
             factor = math.gcd(pow(int(sig, 16), e, n) - em, n)
             assert factor in (p, q), (label, target, 'the faulted signature does not give a factor')
         else:
-            assert out['signed'] == '0' and sig == '' and out['verifies'] == '0', (label, target, out)
-            assert out['pss'] == '0 0' and out['rnd'] == '0 0 0', (label, target, out)
+            assert out['signed'] == 'False' and sig == '' and out['verifies'] == 'False', (label, target, out)
+            assert out['pss'] == 'False 0' and out['rnd'] == 'False 0 False', (label, target, out)
         print(label, target, 'as expected', flush=True)
 assert hashlib.sha256(unit.read_bytes()).hexdigest() == hashlib.sha256(source.encode()).hexdigest()
 print('ok rsa faults: %d variants on two machines' % len(variants))

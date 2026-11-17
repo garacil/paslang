@@ -108,7 +108,7 @@ try:
             program('facade-own','program p; uses di_a,di_own; begin WriteLn(Value(5)); end.','305\n',warn=True)
             program('public-type','program p; uses di_api; var S: SecretType; begin S := GetSecret; WriteLn(S.N); end.','73\n',warn=True)
             program('direct-fix','program p; uses di_priv,di_secret; begin WriteLn(SecretValue(1)); end.','72\n',warn=True)
-            program('x509','program p; uses sysutils,pasx509; begin WriteLn(IntToStr(5)); WriteLn(FileExists(\'.\',False)); WriteLn(StrToInt64(\'7\')); end.','5\n0\n7\n',warn=True)
+            program('x509','program p; uses sysutils,pasx509; begin WriteLn(IntToStr(5)); WriteLn(FileExists(\'.\',False)); WriteLn(StrToInt64(\'7\')); end.','5\nFalse\n7\n',warn=True)
             program('tls','program p; uses sysutils,pastls; begin WriteLn(IntToStr(5)); end.','5\n',warn=True)
 
             negatives = [
