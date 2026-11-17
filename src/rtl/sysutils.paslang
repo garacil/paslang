@@ -704,6 +704,22 @@ function DeleteFile(const FileName: string): Boolean;
 function RenameFile(const OldName, NewName: string): Boolean;
 function CreateDir(const Directory: string): Boolean;
 function RemoveDir(const Directory: string): Boolean;
+{ Path and everything under it (P631), as Go's os.RemoveAll and Rust's
+  remove_dir_all: a file or a link is unlinked, a directory emptied and
+  removed. The tree is walked by descriptors (openat with O_DIRECTORY
+  and O_NOFOLLOW, unlinkat), so a symbolic link is removed and never
+  followed, and a directory swapped for a link while the walk runs
+  changes nothing outside the tree: each step back up is checked to be
+  the directory the walk came down from. A path that is not there is
+  success. The walk keeps its place in memory, not on the stack, and
+  holds the descriptors of 64 levels at most whatever the depth: past
+  them it goes back up through '..', checked. An entry that
+  cannot be removed gives the first error, with its path, after the
+  rest was tried. DirectoryHandle is the base of a relative Path
+  (CurrentDirectoryHandle for the current directory). }
+function TryRemoveAllAt(DirectoryHandle: THandle; const Path: string;
+  out Error: TSysError): Boolean;
+function RemoveAll(const Path: string): Boolean;
 function TryOpenDirectoryAt(DirectoryHandle: THandle; const Path: string;
   out Reader: TDirectoryReader; out Error: TSysError): Boolean;
 { False + Code=0 means EOF. Dot/parent entries are never yielded. }
@@ -6464,6 +6480,388 @@ function RemoveDir(const Directory: string): Boolean;
 var error: TSysError;
 begin
   TryDeleteFileAt(CurrentDirectoryHandle, Directory, True, error);
+  Result := CompatibilityResult(error.Code);
+end;
+
+{ ==== RemoveAll (P631) ==== }
+
+type
+  { a directory the walk went down into: its name in its parent, its
+    descriptor (-1 once let go, past RemoveHeld levels, with its inode
+    and device to check the way back up), the directories found in it
+    that are still to be removed, the names that could not be, and
+    whether its listing was read to the end }
+  TRemoveFrame = record
+    Name: string;
+    Fd: THandle;
+    Inode, Major, Minor: Int64;
+    Pending, Failed: array of string;
+    Listed: Boolean;
+  end;
+
+const
+  { O_NOFOLLOW in the amd64 vocabulary the open calls use (paslinux's
+    OsOpenAt turns it into arm64's 0100000) }
+  RemoveNoFollow = 131072;
+  { the descriptors held down the tree: past this depth a parent's is
+    let go, and the walk goes back up through '..', checked }
+  RemoveHeld = 64;
+  { getdents64's d_type of a directory, and of an unknown kind }
+  RemoveDtDir = 4;
+  RemoveDtUnknown = 0;
+
+function RemoveFailed(const Frame: TRemoveFrame; const Name: string): Boolean;
+var
+  i: Integer;
+begin
+  Result := False;
+  for i := 0 to High(Frame.Failed) do
+    if Frame.Failed[i] = Name then
+      Exit(True);
+end;
+
+procedure RemoveNote(var Frame: TRemoveFrame; const Name: string);
+var
+  n: Integer;
+begin
+  n := Length(Frame.Failed);
+  SetLength(Frame.Failed, n + 1);
+  Frame.Failed[n] := Name;
+end;
+
+procedure RemovePend(var Frame: TRemoveFrame; const Name: string);
+var
+  n: Integer;
+begin
+  n := Length(Frame.Pending);
+  SetLength(Frame.Pending, n + 1);
+  Frame.Pending[n] := Name;
+end;
+
+{ the path of Name in the walk, for an error }
+function RemovePathOf(const Frames: array of TRemoveFrame; Depth: Integer; const Shown, Name: string): string;
+var
+  i: Integer;
+begin
+  Result := Shown;
+  for i := 1 to Depth do
+    Result := Result + '/' + Frames[i].Name;
+  if Name <> '' then
+    Result := Result + '/' + Name;
+end;
+
+{ The walk from Base in Parent (not closed here): Rust's
+  remove_dir_all_recursive and Go's removeAllFrom without their
+  recursion, which holds a descriptor a level and fails past the
+  process's limit on a deep tree. A directory is listed once, to its
+  end: its files and links are unlinked as they come, by the kind its
+  entry gives (one unlinkat each, as Rust's; an unknown kind tries the
+  unlink first), and its directories are kept by name and removed one
+  after the other after the listing. Only a directory whose rmdir finds
+  it not empty (an entry made meanwhile, or one a listing passed over
+  as entries went, Go's issue 20841) is listed again. The descriptors
+  of the first RemoveHeld levels are held; past them a parent's is let
+  go with its inode and device noted, and the way back up opens '..' of
+  the directory just emptied and removes nothing until it is checked to
+  be that parent. So a directory swapped for a link while the walk runs
+  changes nothing outside the tree, at any depth. }
+function RemoveTreeFrom(Parent: THandle; const Base, Shown: string; const UnlinkError: TSysError;
+  out Error: TSysError): Boolean;
+var
+  frames: array of TRemoveFrame;
+  depth, n, p, reclen, start, finish, k, again, rc: Integer;
+  dtype: Integer;
+  cur, sub, up, below: THandle;
+  buf: TBytes;
+  name: string;
+  e, first, ignored, ue: TSysError;
+  info: TFileInfo;
+  done: Boolean;
+
+  procedure Fail(const At: string; const Err: TSysError);
+  begin
+    if first.Code = 0 then
+    begin
+      first := Err;
+      first.Path := At;
+    end;
+  end;
+
+begin
+  first := Default(TSysError);
+  SystemError(Error, 0, 'remove', Shown);
+  if not TryOpenFileAt(Parent, Base, ODirectory or RemoveNoFollow, 0, cur, e) then
+  begin
+    { gone meanwhile: success; no directory (a file we may not unlink,
+      or a link): the unlink's error }
+    if e.Code = 2 then
+      Exit(True);
+    if (e.Code = 20) or (e.Code = 40) then
+      Error := UnlinkError
+    else
+    begin
+      Error := e;
+      Error.Path := Shown;
+    end;
+    Exit(False);
+  end;
+  SetLength(buf, 32768);
+  SetLength(frames, 16);
+  frames[0].Name := Base;
+  frames[0].Fd := cur;
+  depth := 0;
+  again := 0;
+  while depth >= 0 do
+  begin
+    cur := frames[depth].Fd;
+    { the listing, once, to its end }
+    if not frames[depth].Listed then
+    begin
+      frames[depth].Listed := True;
+      done := False;
+      while not done do
+      begin
+        repeat
+          n := OsGetdents(cur, Integer(@buf[0]), Length(buf));
+        until n <> -4;
+        if n <= 0 then
+        begin
+          if n < 0 then
+          begin
+            SystemError(e, -n, 'read directory', '');
+            Fail(RemovePathOf(frames, depth, Shown, ''), e);
+          end;
+          done := True;
+          Continue;
+        end;
+        p := 0;
+        while p + 19 < n do
+        begin
+          reclen := Integer(buf[p + 16]) or (Integer(buf[p + 17]) shl 8);
+          if (reclen < 20) or (p + reclen > n) then
+            Break;
+          dtype := buf[p + 18];
+          start := p + 19;
+          finish := start;
+          while (finish < p + reclen) and (buf[finish] <> 0) do
+            Inc(finish);
+          p := p + reclen;
+          k := finish - start;
+          if (k = 0) or (finish = p) or
+            ((buf[start] = 46) and ((k = 1) or ((k = 2) and (buf[start + 1] = 46)))) then
+            Continue;
+          { a file or a link, unlinked from the listing's own bytes, whose
+            name ends in its NUL there: nothing is made for it, as Rust
+            passes the dirent's name (the names that failed are never
+            listed again but in a second listing, which only an rmdir
+            that finds entries left asks for) }
+          if (dtype <> RemoveDtDir) and (Length(frames[depth].Failed) = 0) then
+          begin
+            repeat
+              rc := Syscall(SystemNumber(263, 35), cur, Integer(@buf[start]), 0);
+            until rc <> -4;
+            if (rc = 0) or (rc = -2) then
+              Continue;
+            SetLength(name, k);
+            Move(buf[start], name[1], k);
+            SystemError(e, -rc, 'remove', name);
+          end
+          else
+          begin
+            SetLength(name, k);
+            Move(buf[start], name[1], k);
+            if RemoveFailed(frames[depth], name) then
+              Continue;
+            if dtype = RemoveDtDir then
+            begin
+              RemovePend(frames[depth], name);
+              Continue;
+            end;
+            if TryDeleteFileAt(cur, name, False, e) or (e.Code = 2) then
+              Continue;
+          end;
+          { a directory of an unknown kind, or an entry we may not unlink
+            (EPERM, EACCES), which may be a directory whose entries we
+            may remove: down into it later }
+          if (e.Code = 21) or (e.Code = 1) or (e.Code = 13) then
+          begin
+            if e.Code <> 21 then
+              RemoveNote(frames[depth], name);
+            RemovePend(frames[depth], name + #0 + Chr(e.Code));
+            Continue;
+          end;
+          Fail(RemovePathOf(frames, depth, Shown, name), e);
+          RemoveNote(frames[depth], name);
+        end;
+      end;
+    end;
+    { the next directory of this one }
+    if Length(frames[depth].Pending) > 0 then
+    begin
+      name := frames[depth].Pending[High(frames[depth].Pending)];
+      SetLength(frames[depth].Pending, Length(frames[depth].Pending) - 1);
+      ue := Default(TSysError);
+      k := Pos(#0, name);
+      if k > 0 then
+      begin
+        SystemError(ue, Ord(name[k + 1]), 'remove', '');
+        SetLength(name, k - 1);
+      end;
+      if not TryOpenFileAt(cur, name, ODirectory or RemoveNoFollow, 0, sub, e) then
+      begin
+        if e.Code = 2 then
+          Continue;
+        { no directory (ENOTDIR, or ELOOP for a link): a file we may not
+          unlink, or a link put in its place meanwhile, which is unlinked
+          and never followed; the unlink's error if it still fails }
+        if (e.Code = 20) or (e.Code = 40) then
+        begin
+          if TryDeleteFileAt(cur, name, False, e) or (e.Code = 2) then
+            Continue;
+          if ue.Code <> 0 then
+            e := ue;
+        end;
+        Fail(RemovePathOf(frames, depth, Shown, name), e);
+        RemoveNote(frames[depth], name);
+        Continue;
+      end;
+      Inc(depth);
+      if depth > High(frames) then
+        SetLength(frames, depth + 16);
+      frames[depth] := Default(TRemoveFrame);
+      frames[depth].Name := name;
+      frames[depth].Fd := sub;
+      { deep enough: the parent's descriptor goes, its inode stays }
+      if (depth > RemoveHeld) and (frames[depth - 1].Fd >= 0) and (depth - 1 > 0) then
+      begin
+        if TryHandleInfo(frames[depth - 1].Fd, info, e) then
+        begin
+          frames[depth - 1].Inode := info.Inode;
+          frames[depth - 1].Major := info.DeviceMajor;
+          frames[depth - 1].Minor := info.DeviceMinor;
+          TryFileClose(frames[depth - 1].Fd, ignored);
+          frames[depth - 1].Fd := -1;
+        end;
+      end;
+      Continue;
+    end;
+    { emptied: removed from its parent, which takes the walk again }
+    if depth = 0 then
+    begin
+      TryFileClose(cur, ignored);
+      if not TryDeleteFileAt(Parent, Base, True, e) and (e.Code <> 2) then
+      begin
+        { not empty: something came, or a listing passed over an entry;
+          once more, from the start }
+        if (e.Code = 39) and (again < 8) and (first.Code = 0) and
+          TryOpenFileAt(Parent, Base, ODirectory or RemoveNoFollow, 0, cur, ignored) then
+        begin
+          Inc(again);
+          frames[0].Fd := cur;
+          frames[0].Listed := False;
+          Continue;
+        end;
+        Fail(Shown, e);
+      end;
+      Break;
+    end;
+    below := cur;
+    if frames[depth - 1].Fd < 0 then
+    begin
+      if not TryOpenFileAt(below, '..', ODirectory, 0, up, e) or not TryHandleInfo(up, info, e) or
+        (info.Inode <> frames[depth - 1].Inode) or (info.DeviceMajor <> frames[depth - 1].Major) or
+        (info.DeviceMinor <> frames[depth - 1].Minor) then
+      begin
+        { the tree moved under the walk: stop, touching nothing more }
+        if up >= 0 then
+          TryFileClose(up, ignored);
+        if e.Code = 0 then
+          SystemError(e, 16, 'remove', '');
+        first := e;
+        first.Path := RemovePathOf(frames, depth, Shown, '');
+        for k := depth downto 0 do
+          if frames[k].Fd >= 0 then
+            TryFileClose(frames[k].Fd, ignored);
+        Break;
+      end;
+      frames[depth - 1].Fd := up;
+    end;
+    TryFileClose(below, ignored);
+    up := frames[depth - 1].Fd;
+    if not TryDeleteFileAt(up, frames[depth].Name, True, e) and (e.Code <> 2) then
+    begin
+      if (e.Code = 39) and (again < 8) and (first.Code = 0) and
+        TryOpenFileAt(up, frames[depth].Name, ODirectory or RemoveNoFollow, 0, cur, ignored) then
+      begin
+        Inc(again);
+        frames[depth].Fd := cur;
+        frames[depth].Listed := False;
+        frames[depth].Failed := nil;
+        Continue;
+      end;
+      Fail(RemovePathOf(frames, depth, Shown, ''), e);
+      RemoveNote(frames[depth - 1], frames[depth].Name);
+    end;
+    frames[depth] := Default(TRemoveFrame);
+    Dec(depth);
+  end;
+  Error := first;
+  if Error.Code <> 0 then
+    Error.Operation := 'remove';
+  Result := Error.Code = 0;
+end;
+
+function TryRemoveAllAt(DirectoryHandle: THandle; const Path: string;
+  out Error: TSysError): Boolean;
+var
+  e, ignored: TSysError;
+  parentPath, base: string;
+  parent: THandle;
+  k: Integer;
+begin
+  SystemError(Error, 0, 'remove', Path);
+  { Go's RemoveAll: nothing to do for '', and rmdir cannot remove '.' }
+  if Path = '' then
+    Exit(True);
+  base := Path;
+  while (Length(base) > 1) and (base[Length(base)] = '/') do
+    SetLength(base, Length(base) - 1);
+  k := Length(base);
+  while (k > 0) and (base[k] <> '/') do
+    Dec(k);
+  parentPath := Copy(base, 1, k);
+  base := Copy(base, k + 1, Length(base) - k);
+  if (base = '.') or (base = '..') or (base = '') then
+  begin
+    Error.Code := 22;
+    Exit(False);
+  end;
+  { the simple case: a file, a link or an empty directory }
+  if TryDeleteFileAt(DirectoryHandle, Path, False, e) or (e.Code = 2) then
+    Exit(True);
+  if (e.Code <> 21) and (e.Code <> 1) and (e.Code <> 13) then
+  begin
+    Error := e;
+    Exit(False);
+  end;
+  if parentPath = '' then
+    parent := DirectoryHandle
+  else if not TryOpenFileAt(DirectoryHandle, parentPath, ODirectory, 0, parent, Error) then
+  begin
+    if Error.Code = 2 then
+      Exit(True);
+    Exit(False);
+  end;
+  Result := RemoveTreeFrom(parent, base, Path, e, Error);
+  if parentPath <> '' then
+    TryFileClose(parent, ignored);
+end;
+
+function RemoveAll(const Path: string): Boolean;
+var
+  error: TSysError;
+begin
+  TryRemoveAllAt(CurrentDirectoryHandle, Path, error);
   Result := CompatibilityResult(error.Code);
 end;
 

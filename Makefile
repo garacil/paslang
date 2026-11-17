@@ -824,8 +824,8 @@ GOLDEN_A64 += libfault
 GOLDEN += wgagain
 GOLDEN_A64 += wgagain
 # P583: the failures of a channel as exceptions.
-GOLDEN += chanfault chanshut chanoff eofname hexchar openarr bgroutine bgfirst jsoncanonrange sqlcols sqltx
-GOLDEN_A64 += chanfault chanshut chanoff eofname hexchar openarr bgroutine bgfirst jsoncanonrange sqlcols sqltx
+GOLDEN += chanfault chanshut chanoff eofname hexchar openarr bgroutine bgfirst jsoncanonrange sqlcols sqltx rmall
+GOLDEN_A64 += chanfault chanshut chanoff eofname hexchar openarr bgroutine bgfirst jsoncanonrange sqlcols sqltx rmall
 # P573: a server stops whatever became of its sockets.
 GOLDEN += httpstop
 GOLDEN_A64 += httpstop

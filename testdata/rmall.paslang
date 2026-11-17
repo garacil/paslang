@@ -1,0 +1,245 @@
+{ P631: RemoveAll removes a tree by descriptors and never follows a
+  link. Here: a path that is not there, a file, a tree with links to a
+  file and to a directory outside it (which stay whole), a read-only
+  directory (its entries refused, the rest removed, the first error
+  with its path; root may remove them), a depth of 10,000 (past the
+  process's limit of descriptors, which a walk holding one a level
+  meets), a directory of 20,000 entries, a directory swapped for a link
+  to the outside while the walk runs, again and again, and eight
+  routines removing trees at once. Everything is made under a scratch
+  directory of /tmp named by the process. }
+program rmall;
+
+uses
+  sysutils;
+
+var
+  root, outside: string;
+  done: waitgroup;
+  mu: mutex;
+  agreed: Integer;
+  stop: Boolean;
+
+{ a system call's number on this machine: amd64's or arm64's }
+function Nr(Amd, Arm: Integer): Integer;
+begin
+  {$ifdef CPUX86_64}
+  Result := Amd;
+  {$else}
+  Result := Arm;
+  {$endif}
+end;
+
+function Pid: Integer;
+begin
+  Result := Syscall(Nr(39, 172));
+end;
+
+procedure MakeFile(const Path, Text: string);
+var
+  h: THandle;
+  b: TBytes;
+  i: Integer;
+begin
+  h := FileCreate(Path);
+  if Text <> '' then
+  begin
+    SetLength(b, Length(Text));
+    for i := 1 to Length(Text) do
+      b[i - 1] := Byte(Ord(Text[i]));
+    FileWrite(h, b, Length(b));
+  end;
+  FileClose(h);
+end;
+
+function SymLink(const Target, Path: string): Boolean;
+var
+  t, p: string;
+begin
+  t := Target + #0;
+  p := Path + #0;
+  Result := Syscall(Nr(266, 36), Integer(@t[1]), -100, Integer(@p[1])) = 0;
+end;
+
+function Chmod(const Path: string; Mode: Integer): Boolean;
+var
+  p: string;
+begin
+  p := Path + #0;
+  Result := Syscall(Nr(268, 53), -100, Integer(@p[1]), Mode) = 0;
+end;
+
+function Euid: Integer;
+begin
+  Result := Syscall(Nr(107, 175));
+end;
+
+{ the outside, which no removal may touch }
+function OutsideWhole: Boolean;
+begin
+  Result := FileExists(outside + '/keep.txt') and FileExists(outside + '/sub/deep.txt') and
+    DirectoryExists(outside + '/sub');
+end;
+
+procedure MakeTree(const Dir: string);
+begin
+  ForceDirectories(Dir + '/a/b/c');
+  ForceDirectories(Dir + '/d');
+  MakeFile(Dir + '/top.txt', 'top');
+  MakeFile(Dir + '/a/one.txt', '1');
+  MakeFile(Dir + '/a/b/two.txt', '2');
+  MakeFile(Dir + '/a/b/c/three.txt', '3');
+  SymLink(outside + '/keep.txt', Dir + '/a/tofile');
+  SymLink(outside, Dir + '/a/b/todir');
+  SymLink(outside + '/sub', Dir + '/d/tosub');
+end;
+
+{ a chain of Depth directories made by descriptors: the path is far
+  longer than PATH_MAX }
+function Deep(const Dir: string; Depth: Integer): Boolean;
+var
+  h, next: THandle;
+  e: TSysError;
+  i: Integer;
+begin
+  Result := False;
+  ForceDirectories(Dir);
+  if not TryOpenFileAt(CurrentDirectoryHandle, Dir, 65536, 0, h, e) then
+    Exit;
+  for i := 1 to Depth do
+  begin
+    if not TryCreateDirectoryAt(h, 'd', 448, e) or not TryOpenFileAt(h, 'd', 65536, 0, next, e) then
+    begin
+      TryFileClose(h, e);
+      Exit;
+    end;
+    TryFileClose(h, e);
+    h := next;
+  end;
+  MakeFile('/proc/self/fd/' + IntToStr(h) + '/bottom.txt', 'bottom');
+  TryFileClose(h, e);
+  Result := True;
+end;
+
+procedure Swapper(const Victim: string);
+var
+  n: Integer;
+  e: TSysError;
+begin
+  n := 0;
+  repeat
+    { the victim, a directory of the tree, becomes a link to the
+      outside and back }
+    if TryRenameFileAt(CurrentDirectoryHandle, Victim, CurrentDirectoryHandle, Victim + '.moved', True, e) then
+    begin
+      SymLink(outside, Victim);
+      Inc(n);
+      Yield;
+      DeleteFile(Victim);
+      TryRenameFileAt(CurrentDirectoryHandle, Victim + '.moved', CurrentDirectoryHandle, Victim, True, e);
+    end;
+    Yield;
+  until stop;
+  done.Done;
+end;
+
+procedure Remover(Id: Integer);
+var
+  d: string;
+  ok: Boolean;
+begin
+  d := root + '/many' + IntToStr(Id);
+  MakeTree(d);
+  ok := RemoveAll(d) and not DirectoryExists(d) and OutsideWhole;
+  lock mu do
+    if ok then
+      Inc(agreed);
+  done.Done;
+end;
+
+var
+  e: TSysError;
+  i, k, turn, lost: Integer;
+  ok: Boolean;
+
+begin
+  root := '/tmp/paslang-rmall-' + IntToStr(Pid);
+  outside := root + '/outside';
+  RemoveAll(root);
+  ForceDirectories(outside + '/sub');
+  MakeFile(outside + '/keep.txt', 'keep');
+  MakeFile(outside + '/sub/deep.txt', 'deep');
+
+  WriteLn('a path that is not there: ', RemoveAll(root + '/nothing'), '; an empty one: ', RemoveAll(''));
+  WriteLn('''.'' is refused: ', TryRemoveAllAt(CurrentDirectoryHandle, root + '/.', e), ' ', e.Code);
+  MakeFile(root + '/file.txt', 'x');
+  WriteLn('a file: ', RemoveAll(root + '/file.txt'), ' ', FileExists(root + '/file.txt'));
+  SymLink(outside, root + '/link');
+  WriteLn('a link to a directory: ', RemoveAll(root + '/link'), ', the outside whole ', OutsideWhole);
+
+  MakeTree(root + '/tree');
+  WriteLn('a tree with links out: ', RemoveAll(root + '/tree/'), ' ', DirectoryExists(root + '/tree'),
+    ', the outside whole ', OutsideWhole);
+
+  MakeTree(root + '/ro');
+  Chmod(root + '/ro/a/b', 365);
+  ok := TryRemoveAllAt(CurrentDirectoryHandle, root + '/ro', e);
+  if Euid = 0 then
+    WriteLn('a read-only directory: as root it goes ', ok)
+  else
+    { the entry named first is the listing's first, which the
+      filesystem orders: its directory is said }
+    WriteLn('a read-only directory: ', ok, ', the first error ', e.Code, ' in ',
+      StringReplace(ExtractFilePath(e.Path), root, '$ROOT', []), ', the rest removed ',
+      not FileExists(root + '/ro/top.txt') and not DirectoryExists(root + '/ro/d'));
+  Chmod(root + '/ro/a/b', 448);
+  WriteLn('  then made writable: ', RemoveAll(root + '/ro'), ' ', DirectoryExists(root + '/ro'));
+
+  ok := Deep(root + '/deep', 10000);
+  WriteLn('a depth of 10,000: made ', ok, ', removed ', RemoveAll(root + '/deep'), ' ', DirectoryExists(root + '/deep'));
+
+  ForceDirectories(root + '/wide');
+  for i := 1 to 20000 do
+    MakeFile(root + '/wide/f' + IntToStr(i), '');
+  WriteLn('20,000 entries: ', RemoveAll(root + '/wide'), ' ', DirectoryExists(root + '/wide'));
+
+  { a directory swapped for a link to the outside while the walk runs }
+  lost := 0;
+  for turn := 1 to 40 do
+  begin
+    MakeTree(root + '/race');
+    for k := 1 to 30 do
+    begin
+      ForceDirectories(root + '/race/victim/x' + IntToStr(k));
+      MakeFile(root + '/race/victim/x' + IntToStr(k) + '/f', 'f');
+    end;
+    stop := False;
+    done.Add(1);
+    pas Swapper(root + '/race/victim');
+    for k := 1 to 5 do
+      RemoveAll(root + '/race');
+    lock mu do
+      stop := True;
+    done.Wait;
+    RemoveAll(root + '/race');
+    if not OutsideWhole then
+      Inc(lost);
+  end;
+  WriteLn('40 races with a link swapped in: the outside lost something ', lost, ' times; the tree is gone ',
+    not DirectoryExists(root + '/race'));
+
+  agreed := 0;
+  done.Add(8);
+  for i := 1 to 8 do
+    pas Remover(i);
+  done.Wait;
+  WriteLn('eight routines at once: ', agreed, ' removed their trees');
+
+  WriteLn('the scratch directory: ', RemoveAll(root), ' ', DirectoryExists(root));
+end.
+
+{ This file is part of paslang's tests.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+  paslang is free software under the GNU General Public License,
+  version 3 or (at your option) any later version; see the file
+  COPYING. It comes with ABSOLUTELY NO WARRANTY. }

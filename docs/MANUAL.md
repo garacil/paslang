@@ -14211,6 +14211,26 @@ components without lexical cleaning: symlink/`..` has filesystem
 meaning. It verifies that an existing component really is a directory
 and supports paths longer than one kernel pathname argument.
 
+`RemoveAll(path)` and `TryRemoveAllAt(base, path, out error)` remove a
+path and everything under it (1.3.21, P631), as Go's `os.RemoveAll` and
+Rust's `remove_dir_all`: a file or a link is unlinked, a directory
+emptied and removed, and a path that is not there is success. The tree
+is walked by descriptors (`openat` with `O_DIRECTORY` and `O_NOFOLLOW`,
+`unlinkat`): a symbolic link is removed and never followed, and a
+directory swapped for a link while the walk runs changes nothing outside
+the tree: the walk acts through the descriptors of the directories it
+came down through, and past the 64 it holds each step back up is
+checked, by inode and device, to be the directory it came down from. A directory is listed once, its
+files unlinked by the kind its entry gives, as Rust's walk does; the
+walk keeps its place in memory and holds the descriptors of 64 levels
+at most, going back up past them through a checked `..`, so a tree
+deeper than the process's limit of descriptors goes too (Go's and
+Rust's walks hold one a level). An entry that cannot be removed gives the first
+error with its path, after the rest was tried; `.` is refused, as
+`rmdir` refuses it. `testdata/rmall` removes trees with links out, a
+read-only directory, a depth of 10,000 and 20,000 entries, races a link
+swapped in, and runs eight removals at once.
+
 `TryOpenDirectoryAt` creates an owned `TDirectoryReader`. `Next(out
 name, out error)` returns false with code zero at EOF, or a nonzero error
 on failure; names are copied out of a bounds-checked 8192-byte buffer.
