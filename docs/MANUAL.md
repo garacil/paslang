@@ -5199,7 +5199,20 @@ the routine for that many milliseconds. `Yield` (also `Gosched`) lets
 other routines run. `Goid` (also `GId`) is the number of the current
 routine, 1 for the main one, and `NumGoroutine` (also `GCount`) counts
 the live ones. When the main routine reaches its `end.`, the program
-waits for every other routine to end and then exits with status 0.
+waits for every other routine to end and then exits with status 0, so
+no routine is cut in the middle of what it does (Go and Rust cut every
+other one when main returns). A routine started with `pas background
+F(a)` is left out of that wait (1.3.17, P639): a loop that serves, ticks
+or listens for ever does not keep the program alive, as a daemon thread
+of Java or a background thread of .NET does not, and the program ends
+when its main routine and every other routine have ended, with the
+background ones where they are. A routine a background one starts is a
+background one too, as a daemon thread's threads are in Java, so a
+server run in the background takes its accept loops and connections
+with it. `background` is no reserved word: it is that word only when a
+routine's name follows it, and `pas background(5)` starts a routine
+called `background`. `Halt(n)` ends the program at once, background or
+not. `testdata/bgroutine` and `examples/twoservers` show both.
 When every routine is asleep and nothing can wake any of them, the
 program stops instead of waiting for ever (1.0.139, as Go does):
 
@@ -12052,6 +12065,24 @@ listens on TCP, port 0 asking the kernel for one (`Port`).
 then shuts down and gives the signal, so a service under systemd
 stops cleanly. `Active` counts the connections open.
 
+What keeps a service alive is every routine it started with `pas`: the
+program ends when its main routine has ended and they have (§10). A
+second server, or any loop that runs for ever, started with plain `pas`
+keeps the program running after `ServeUntilSignal` has returned, and a
+service that wrote that it stopped stays, where systemd waits for it to
+end. Start such a loop with `pas background` (1.3.17), and main's end
+after `ServeUntilSignal` ends the program; or stop it yourself (its
+server's `Shutdown`, a channel it watches) before main ends; `Halt(0)`
+ends at once and cuts what is in flight. `examples/twoservers` serves a
+public and an admin server, the admin one in the background, and ends
+on SIGTERM within its shutdown time (`scripts/check_twoservers.py`, both
+machines):
+
+```pascal
+  pas background RunAdmin(admin);
+  WriteLn('stopped on ', SignalName(pub.ServeUntilSignal));
+```
+
 A request (RFC 9110, 9112):
 - comes on HTTP/1.1, kept alive unless it says `Connection: close`, or
   on HTTP/1.0, kept alive when it says `Connection: keep-alive`;
@@ -15780,8 +15811,9 @@ the commands on standard input, under `--debug-mode` and under
 - `send` is a keyword, so a routine cannot be named `Send`; the builtin
   `Send(c, v)` is the channel send.
 - When the main routine ends, the program waits for every routine it
-  started; when all of them are asleep and nothing can wake one, it
-  stops with `paslang: all routines are asleep: deadlock` (§10).
+  started but the background ones (`pas background`, 1.3.17); when all
+  of them are asleep and nothing can wake one, it stops with
+  `paslang: all routines are asleep: deadlock` (§10).
 - The target is GNU/Linux only, kernel 6.13 or newer, amd64 and arm64.
 
 ## 21. Reserved words

@@ -824,8 +824,8 @@ GOLDEN_A64 += libfault
 GOLDEN += wgagain
 GOLDEN_A64 += wgagain
 # P583: the failures of a channel as exceptions.
-GOLDEN += chanfault chanshut chanoff eofname hexchar openarr
-GOLDEN_A64 += chanfault chanshut chanoff eofname hexchar openarr
+GOLDEN += chanfault chanshut chanoff eofname hexchar openarr bgroutine bgfirst
+GOLDEN_A64 += chanfault chanshut chanoff eofname hexchar openarr bgroutine bgfirst
 # P573: a server stops whatever became of its sockets.
 GOLDEN += httpstop
 GOLDEN_A64 += httpstop
@@ -5849,7 +5849,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/jsonpark.out $(BUILDDIR)/jsonpark1.got; \
 	echo ok jsonpark; \
 	echo "==== deadlock ===="; \
-	for t in dlrecv dlsend dlcycle dlmutex dlmain dlselect dlnil dlnilsel; do \
+	for t in dlrecv dlsend dlcycle dlmutex dlmain dlselect dlnil dlnilsel dlbg; do \
 	  $(OUTDIR)/paslangc -o $(BUILDDIR)/fatal_$$t testdata/fatal/$$t.paslang; \
 	  set +e; timeout 60 $(BUILDDIR)/fatal_$$t > $(BUILDDIR)/fatal_$$t.got 2> $(BUILDDIR)/fatal_$$t.err; rc=$$?; set -e; \
 	  test $$rc -eq 1; \
@@ -5897,6 +5897,9 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  diff -u examples/$$t.out $(BUILDDIR)/ex_$$t.got; \
 	  echo ok servers-$$t; \
 	done; \
+	: a service of two servers, the admin one a background routine, ends on SIGTERM, P639; \
+	$(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/ex_twoservers examples/twoservers.paslang; \
+	python3 -I scripts/check_twoservers.py examples/twoservers.out $(BUILDDIR)/ex_twoservers; \
 	python3 -I scripts/check_maporder.py $$(ls $(BUILDDIR)/ex_* | grep -v '[.][a-z]*$$'); \
 	python3 -I scripts/check_paslines.py $$(ls $(BUILDDIR)/ex_* | grep -v '[.][a-z]*$$'); \
 	echo ok examples; \
@@ -6913,7 +6916,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	diff -u testdata/jsonpark.out $(BUILDDIR)/jsonpark1-arm.got; \
 	echo ok jsonpark-arm; \
 	echo "==== deadlock arm64 ===="; \
-	for t in dlrecv dlsend dlcycle dlmutex dlmain dlselect dlnil dlnilsel; do \
+	for t in dlrecv dlsend dlcycle dlmutex dlmain dlselect dlnil dlnilsel dlbg; do \
 	  $(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/fatal_$$t-arm testdata/fatal/$$t.paslang; \
 	  set +e; timeout 60 $(QEMU_A64) $(BUILDDIR)/fatal_$$t-arm > $(BUILDDIR)/fatal_$$t-arm.got 2> $(BUILDDIR)/fatal_$$t-arm.err; rc=$$?; set -e; \
 	  test $$rc -eq 1; \
@@ -7225,6 +7228,8 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	echo "300 queries, 300 answered, 0 missed, 0 bad" | diff -u - $(BUILDDIR)/ex_ntpd-arm.got; \
 	echo "300 clients, 900 frames, 900 echoed, 0 bad" | diff -u - $(BUILDDIR)/ex_wsd-arm.got; \
 	echo "300 clients, 300 said, 2700 delivered of 2700, 0 bad" | diff -u - $(BUILDDIR)/ex_chat-arm.got; \
+	$(OUTDIR)/paslangc -target arm64 -Fu $(BUILDDIR)/a64 -o $(BUILDDIR)/ex_twoservers-arm examples/twoservers.paslang; \
+	python3 -I scripts/check_twoservers.py examples/twoservers.out $(BUILDDIR)/ex_twoservers-arm $(QEMU_A64); \
 	echo "300 clients, 300 forwarded, 900 requests, 900 served, 0 bad" | diff -u - $(BUILDDIR)/ex_proxy-arm.got; \
 	echo "300 clients, 900 requests, 900 served, 0 bad" | diff -u - $(BUILDDIR)/ex_apisrv-arm.got; \
 	: P210 JSON-RPC over NDJSON, its 2000 clients under qemu too; \
