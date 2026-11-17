@@ -33,7 +33,7 @@ def word(address):
     return struct.unpack('<Q', gdb.selected_inferior().read_memory(address, 8))[0]
 
 
-lines = Path('src/lib/pasdebug.paslang').read_text().splitlines()
+lines = Path('src/lib/pasdebug.paslang').read_text(encoding='utf-8').splitlines()
 first = next(i for i, text in enumerate(lines) if text.startswith('procedure PasDebugLine(')
              and i > 100)
 unlock = next(i + 1 for i in range(first, len(lines)) if lines[i].strip() == 'Guard.Unlock;')

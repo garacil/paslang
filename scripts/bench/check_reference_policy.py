@@ -25,7 +25,7 @@ def require(value,message):
 
 def synthetic_capabilities(erms=False,fsrm=False,active=None,module=policy):
     """Labeled fixture; real metadata discovery is tested separately."""
-    native = {"internal":{n:False for n in module.GO_FIELDS},"version":"go1.27.3-X:nodwarf5",
+    native = {"internal":{n:False for n in module.GO_FIELDS},"version":"go1.27.4-X:nodwarf5",
         "goarch":"amd64","goos":"linux","cpuid":{"0":[7,0,0,0],"1":[0,0,0,1<<26],"7_0":[0,(1<<9) if erms else 0,0,(1<<4) if fsrm else 0],"80000000":[0x80000000,0,0,0]}}
     native["internal"].update(HasERMS=erms,HasFSRM=fsrm,HasOSXSAVE=True,HasRDTSCP=True,HasSHA=True,HasAES=True,HasAVX=True,HasAVX2=True)
     if active: native["internal"][active]=True
@@ -36,7 +36,7 @@ def synthetic_capabilities(erms=False,fsrm=False,active=None,module=policy):
         base["internal"]["HasERMS"]=erms
         base["internal"]["HasAVX512"]=False
     driver={"path":"/synthetic/go","sha256":module.GO_DRIVER_SHA256}
-    environment={"GOROOT":"/synthetic/goroot","GOVERSION":"go1.27.3-X:nodwarf5","GOEXPERIMENT":"nodwarf5","GOTOOLDIR":"/synthetic/tools","GOHOSTARCH":"amd64","GOHOSTOS":"linux"}
+    environment={"GOROOT":"/synthetic/goroot","GOVERSION":"go1.27.4-X:nodwarf5","GOEXPERIMENT":"nodwarf5","GOTOOLDIR":"/synthetic/tools","GOHOSTARCH":"amd64","GOHOSTOS":"linux"}
     def observation(command,stdout,controls=""):
         return {"command":command,"cwd":"/synthetic/probe","environment":{"GODEBUG":controls,"GOAMD64":"v1"},"status":0,"stdout":stdout,"stderr":"","supervision":{"program_status":0,"cleanup":{"ok":True},"receipt":"/synthetic/receipt"}}
     observations=[observation([driver["path"],"env"],json.dumps(environment)),observation([driver["path"],"build"],""),observation(["/synthetic/probe"],json.dumps(native))]
@@ -88,6 +88,17 @@ def policy_controls(module=policy):
     p=synthetic_capabilities(module=module)
     mutations=[lambda q:q.update(identity_sha256="f"*64),
         lambda q:q["compiler"]["driver"].update(sha256="f"*64),
+        lambda q:q.update(policy_id="go1.27.3-amd64-v1-dual-parser-capabilities-v2"),
+        lambda q:(q["go_environment"].update(GOVERSION="go1.27.3-X:nodwarf5"),
+                  q["observations"][0].update(stdout=json.dumps(q["go_environment"]))),
+        lambda q:(q["native_state"].update(version="go1.27.3-X:nodwarf5"),
+                  q["base_state"].update(version="go1.27.3-X:nodwarf5"),
+                  q["observations"][2].update(stdout=json.dumps(q["native_state"])),
+                  q["observations"][3].update(stdout=json.dumps(q["base_state"]))),
+        lambda q:q["sources"]["internal/buildcfg/zbootstrap.go"].update(sha256='5fb530ddd25775785f71bcf4a566101f3b7506f78200a1d69a6a0dc898cd84b1'),
+        lambda q:q["compiler"]["tools"]["compile"].update(sha256='9e7c2f2d98036e47ecba57b7dc3556cd82bcf24e1f8c8bba5a9881b20951b6c5'),
+        lambda q:q["compiler"]["tools"]["asm"].update(sha256='2d6ce7f1c728010cee15427f36f8b5d9bbac83bce91faa8997498c08e208099d'),
+        lambda q:q["compiler"]["tools"]["link"].update(sha256='97df419b7cf8f4bb8e76c3623b8a1d371c6818533c4be04f0a3563ff6169843d'),
         lambda q:q["sources"]["internal/cpu/cpu.go"].update(sha256="f"*64),
         lambda q:q["go_environment"].update(GOEXPERIMENT="simd"),
         lambda q:q["probe_sources"].update({"go_cpu_probe.go":"f"*64}),
@@ -118,8 +129,9 @@ def policy_controls(module=policy):
     changed=copy.deepcopy(apic);changed["base_state"]["cpuid"]["1"][2] ^= 1
     reseal(changed,module)
     refuses(lambda:module.validate_go_capabilities(changed),"feature-bit change mistaken for topology")
-    module.validate_go_version("go version go1.27.3-X:nodwarf5 linux/amd64")
-    for text in ("go1.27.3","go1.27.2","go1.27.3-X:simd"):
+    module.validate_go_version("go version go1.27.4-X:nodwarf5 linux/amd64")
+    for text in ("go1.27.4","go1.27.3-X:nodwarf5","go1.27.5-X:nodwarf5",
+                 "go1.27.2","go1.27.4-X:simd"):
         refuses(lambda:module.validate_go_version(text),"unreviewed version accepted")
     with patch.object(module,"_file",side_effect=ValueError("changed actual tool")):
         refuses(lambda:module.validate_go_capabilities(p,"/changed/go"),"actual compiler recheck omitted")
@@ -189,7 +201,10 @@ def mutant_controls():
         ("host-mask",'if p and not p.startswith("cpu.")','if p'),
         ("effective-state",'if base!=expected:', 'if False:'),
         ("stderr",'or row["stderr"]!=""','or False'),
-        ("source-pin",'sources[k].get("sha256")!=v','False')]
+        ("source-pin",'sources[k].get("sha256")!=v','False'),
+        ("runtime-version",'state["version"] != "go1.27.4-X:nodwarf5" or ',''),
+        ("metadata-version",'environment.get("GOVERSION")!="go1.27.4-X:nodwarf5" or ',''),
+        ("tool-pin",'any(compiler["tools"][k].get("sha256")!=v for k,v in GO_TOOL_SHA256.items())','False')]
     names=[]
     for name,old,new in changes:
         require(old in source,"mutant anchor absent: "+name)

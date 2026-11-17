@@ -24,10 +24,11 @@ import run as bench
 from reference_policy import (go_level, go_build_environment, go_runtime_environment,
                               go_policy_description, validate_go_version,
                               prepare_go_capabilities, validate_go_capabilities,
-                              go_binary_metadata, require_go_artifact_capabilities)
+                              go_binary_metadata, require_go_artifact_capabilities,
+                              require_go_fma_capabilities)
 
 
-# The eleven std-only twins cover every current section of these programs.
+# The twelve std-only twins cover every current section of these programs.
 # Unsupported pairs and sections still fail explicitly.
 RUST_SECTIONS = {
     "b1loop": (None,), "b2str": (None,), "b5map": (None,),
@@ -35,6 +36,7 @@ RUST_SECTIONS = {
     "b10rot": (None,), "b14sort": ("ints", "strings", "reals"),
     "b24math": ("sin", "exp", "ln", "sqrt", "pow", "atan", "tan", "sinh", "tanh", "asinh", "log1p"),
     "b26slice": ("ints", "strings"), "b31map": ("iter", "delete", "update", "sums", "bits"),
+    "b44fma": ("horner",),
 }
 
 
@@ -267,6 +269,35 @@ def reference_environment(reference, cpu, native_level=None, capabilities=None):
     return rust_runtime_environment(cpu)
 
 
+
+def go_tool_environment(out):
+    """Private telemetry-off configuration for Go tools, never timed programs.
+
+    Reviewed Go1.27.4 os.UserConfigDir and telemetry.Dir.Mode/Start return
+    before starting the sidecar when this private mode file contains off.
+    """
+    root = Path(out).resolve()
+    config = root / "reference-tool-config"
+    directory = config
+    for part in (None, "go", "telemetry"):
+        if part is not None:
+            directory /= part
+        if directory.is_symlink():
+            raise RuntimeError("private Go configuration directory is a symlink")
+        directory.mkdir(exist_ok=True)
+    mode = directory / "mode"
+    if mode.is_symlink():
+        raise RuntimeError("private Go telemetry mode is a symlink")
+    if mode.exists():
+        if mode.read_bytes() != b"off\n":
+            raise RuntimeError("private Go telemetry mode changed")
+    else:
+        with mode.open("xb") as stream:
+            stream.write(b"off\n")
+    env = dict(os.environ, XDG_CONFIG_HOME=str(config))
+    return env, {"path": str(mode), "sha256": hashlib.sha256(mode.read_bytes()).hexdigest()}
+
+
 def main(argv=None, *, rounds_only=False):
     argv = list(sys.argv[1:] if argv is None else argv)
     destination = None
@@ -324,8 +355,13 @@ def main(argv=None, *, rounds_only=False):
         units = selected_units(csv(options.pairs) if options.pairs is not None else None, references)
     except ValueError as error:
         reject(str(error))
+    fma_requested = any(name == "b44fma" for name, section in units)
+    probe_go = "go" in references or fma_requested and "native" in cpus
     tools = {}
-    for name in ["paslangc", *["rustc" if ref == "rust" else "go" for ref in references]]:
+    required_tools = ["paslangc", *["rustc" if ref == "rust" else "go" for ref in references]]
+    if probe_go and "go" not in required_tools:
+        required_tools.append("go")
+    for name in required_tools:
         tools[name] = shutil.which(name)
         if tools[name] is None:
             reject("explicitly requested reference/tool is unavailable on PATH: " + name)
@@ -344,7 +380,7 @@ def main(argv=None, *, rounds_only=False):
               "requested_rounds": options.n, "memory_runs": options.memory_runs, "timeout_s": options.timeout,
               "go_levels": {cpu: go_level(cpu, options.go_native_level) for cpu in cpus} if "go" in references else {},
               "capability_review": "explicit Go ISA policy and Rust per-binary capability gate",
-              "go_policy": go_policy_description() if "go" in references else None,
+              "go_policy": go_policy_description() if probe_go else None,
               "source_sha256": {}, "build_observations": [], "pairs": [],
               "coverage": {"requested_sections": len(units), "go_programs": len(bench.PAIRS),
                            "audited_rust_programs": len(RUST_SECTIONS),
@@ -357,7 +393,12 @@ def main(argv=None, *, rounds_only=False):
                   "Build observations are not an alternating compiler-build benchmark or a cold-cache claim.",
                   "Rust target-cpu affects this crate; the installed standard library remains precompiled.",
                   "Rust base timings require retained binary-bound capability evidence for prebuilt std/provider paths.",
-                  "Go base is built separately at v1; native uses an explicitly selected reviewed level, not the base binary."]}
+                  "Go base is built separately at v1; native uses an explicitly selected reviewed level, not the base binary.",
+                  "b44 FMA selection is checked for every executable, including Paslang, against the source-bound Go CPU probe and actual provider code.",
+                  "Rust-only native b44 also requires Go for its untimed independent CPU observation; base-only Rust does not."]}
+    for helper in (Path(__file__), Path(__file__).with_name("reference_caps.py"),
+                   Path(__file__).with_name("reference_policy.py")):
+        record["source_sha256"][str(helper)] = hashlib.sha256(helper.read_bytes()).hexdigest()
     expected_by_unit, built, failed = {}, set(), False
     try:
         record["paslangc"] = metadata([tools["paslangc"], "-v"])
@@ -372,16 +413,18 @@ def main(argv=None, *, rounds_only=False):
                                                 if options.rust_capability_proof else None)
             record["rust_capability_proof_path"] = (str(Path(options.rust_capability_proof).resolve())
                                                     if options.rust_capability_proof else None)
-        if "go" in references:
+        if probe_go:
+            go_tools_env, record["go_tool_config"] = go_tool_environment(out)
             record["go_version"] = metadata([tools["go"], "version"],
-                env=go_build_environment(out, "base", options.go_native_level))
+                env=go_build_environment(out, "base", options.go_native_level, go_tools_env))
             validate_go_version(record["go_version"]["stdout"])
-            record["go_capabilities"] = prepare_go_capabilities(tools["go"], out / "go-capabilities")
+            record["go_capabilities"] = prepare_go_capabilities(
+                tools["go"], out / "go-capabilities", environment=go_tools_env)
             validate_go_capabilities(record["go_capabilities"], tools["go"])
             record["go_environment"] = {
                 cpu: metadata([tools["go"], "env", "-json", "GOAMD64", "GOARCH", "GOOS", "GOEXPERIMENT", "GOENV", "CGO_ENABLED"],
-                              env=go_build_environment(out, cpu, options.go_native_level))
-                for cpu in cpus}
+                              env=go_build_environment(out, cpu, options.go_native_level, go_tools_env))
+                for cpu in cpus} if "go" in references else {}
         record["libc"] = metadata(["ldd", "--version"]) if shutil.which("ldd") else None
         if any(name in ("b34json", "b37json") for name, _ in units):
             bench.prepare()
@@ -394,6 +437,15 @@ def main(argv=None, *, rounds_only=False):
                     record["source_sha256"][str(source)] = hashlib.sha256(source.read_bytes()).hexdigest()
                     build([tools["paslangc"], "-cpu", cpu, "-o", pl, source], pl, record, reuse=options.no_build)
                     built.add(key)
+                if name == "b44fma":
+                    from reference_caps import fma_binary_metadata, require_fma_path
+                    expected_fma = (record["go_capabilities"]["native_state"]["internal"]["HasFMA"]
+                                    if cpu == "native" else False)
+                    fma_artifacts = record.setdefault("fma_artifacts", {})
+                    if str(pl) not in fma_artifacts:
+                        fma_artifacts[str(pl)] = fma_binary_metadata("paslang", pl, out / "fma-capabilities")
+                    record.setdefault("paslang_fma_evidence", {})[str(pl)] = require_fma_path(
+                        "paslang", cpu, fma_artifacts[str(pl)], effective_has_fma=expected_fma)
                 for reference in references:
                     ref_cpu = (cpu + "." + go_level(cpu, options.go_native_level) if reference == "go"
                                else cpu + "." + record["rust_configuration"]["target"])
@@ -403,7 +455,7 @@ def main(argv=None, *, rounds_only=False):
                         source = Path(bench.HERE) / ((name + ".go") if reference == "go" else ("rust/" + name + ".rs"))
                         record["source_sha256"][str(source)] = hashlib.sha256(source.read_bytes()).hexdigest()
                         if reference == "go":
-                            env = go_build_environment(out, cpu, options.go_native_level)
+                            env = go_build_environment(out, cpu, options.go_native_level, go_tools_env)
                             build([tools["go"], "build", "-o", ref, source], ref, record, env=env, reuse=options.no_build)
                         else:
                             flags = rust_build_args(record["rust_configuration"], cpu)
@@ -451,6 +503,21 @@ def main(argv=None, *, rounds_only=False):
                         except ValueError as error:
                             row["capability_refusal"] = str(error)
                             raise
+                    if name == "b44fma":
+                        from reference_caps import fma_binary_metadata, require_fma_path
+                        fma_artifacts = record.setdefault("fma_artifacts", {})
+                        if artifact_key not in fma_artifacts:
+                            fma_artifacts[artifact_key] = fma_binary_metadata(
+                                reference, ref, out / "fma-capabilities")
+                        if reference == "go":
+                            row["fma_capability_evidence"] = require_go_fma_capabilities(
+                                cpu, fma_artifacts[artifact_key], capability, env,
+                                options.go_native_level)
+                        else:
+                            row["fma_capability_evidence"] = require_fma_path(
+                                reference, cpu, fma_artifacts[artifact_key],
+                                effective_has_fma=expected_fma, capability_evidence=row["capability_evidence"],
+                                provider=record["rust_configuration"]["provider"])
                     try:
                         (rw, rs, ro), (pw, ps, po), ratio = bench.alternate(
                             str(ref), str(pl), options.n, env, None, args, rows=rounds)
@@ -488,6 +555,15 @@ def main(argv=None, *, rounds_only=False):
         failed = True
         raise
     finally:
+        if "go_tool_config" in record:
+            retained = record["go_tool_config"]
+            try:
+                observed = hashlib.sha256(Path(retained["path"]).read_bytes()).hexdigest()
+            except OSError:
+                observed = None
+            if observed != retained["sha256"]:
+                record["error"] = "private Go tool configuration changed"
+                failed = True
         record["requested_comparisons"] = len(units) * len(cpus) * len(references)
         record["attempted_comparisons"] = len(record["pairs"])
         record["completed_comparisons"] = sum(row['completed'] for row in record['pairs'])

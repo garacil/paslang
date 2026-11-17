@@ -65,7 +65,7 @@ text; errors go to standard error with a failing exit status.
   [SQLite guide](docs/SQLITE_GUIDE.md)
 - **The processor chosen at compile time.** `-cpu` picks the
   instructions; a word with a kernel (SHA-1, SHA-256, SHA-512, the CRCs,
-  XXH3, `PopCount`, the vectors) has a body for the processor's
+  XXH3, `Fma`, `PopCount`, the vectors) has a body for the processor's
   extensions and a plain one, and nothing is tested at run time. The
   compiler knows the machine it runs on and processors by name (`zen2`,
   `icelake`, `neoverse-v2`...), and `-tune` chooses between equal forms
@@ -141,7 +141,7 @@ The wiki records timings, memory and workloads.
 The goal is to beat Go and Rust on equal workloads while preserving
 correctness and safety. The benchmark harness checks complete output,
 time and peak memory against strict budgets. The ordinary Go suite keeps
-all 45 programs; Rust comparisons cover 11 programs and their 28 sections.
+all 46 programs; Rust comparisons cover 12 programs and their 29 sections.
 After reviewing the host's Go CPU level, run
 `make bench BENCH_GO_NATIVE_LEVEL=v3` and
 `make bench-rounds BENCH_GO_NATIVE_LEVEL=v3`, replacing `v3` with the
@@ -165,6 +165,12 @@ records about 16% less time for base SHA-1, 8% less for the combined
 SHA-256/CRC-32C workload and 5% less for MD5 than the previous release.
 Seven of ten Go comparisons still fail their strict budgets; those gaps
 remain open. The full table retains CPU profiles, quartiles and memory.
+
+The [historical FMA comparison](scripts/bench/README.md#recorded-fma-comparison)
+uses an unpublished 1.2.408 candidate. Its two Go profiles pass and its three
+Rust time/quartile comparisons fail; those losses remain open under P613.
+These are retained measurements of that candidate, not a timing run of the
+current release.
 
 ## Building
 

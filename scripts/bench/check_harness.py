@@ -67,13 +67,14 @@ def policy_checks():
     require(native["GODEBUG"] == "gctrace=0" and native["GOAMD64"] == "v3" and
             inherited["GOAMD64"] == "v4" and "cpu.erms=off" in inherited["GODEBUG"],
             "native CPU overrides survived or input environment was mutated")
-    policy.validate_go_version("go version go1.27.3-X:nodwarf5 linux/amd64")
+    policy.validate_go_version("go version go1.27.4-X:nodwarf5 linux/amd64")
     with patch.dict(os.environ, {"GOEXPERIMENT": "none", "GOENV": "/synthetic/user-overrides"}):
         build_env = policy.go_build_environment("/synthetic/output", "native", "v3")
     require(build_env["GOEXPERIMENT"] == "" and build_env["GOENV"] == "off",
             "inherited Go experiments or user environment altered the ordinary reference")
-    for version in ("go version go1.27.3 linux/amd64", "go version go1.27.4 linux/amd64", "go version go1.27.30 linux/amd64",
-                    "go version go1.27.3-X:unknownexperiment linux/amd64"):
+    for version in ("go version go1.27.4 linux/amd64", "go version go1.27.3-X:nodwarf5 linux/amd64", "go version go1.27.5-X:nodwarf5 linux/amd64",
+                    "go version go1.27.30 linux/amd64",
+                    "go version go1.27.4-X:unknownexperiment linux/amd64"):
         try:
             policy.validate_go_version(version)
         except ValueError:
@@ -84,8 +85,29 @@ def policy_checks():
             run_refs.selected_units(None, ["go"]) == bench.units() and
             run_refs.selected_units(["b45nist"], ["go"]) == [("b45nist", "p256"), ("b45nist", "p384")],
             "selected Go mode lost the current full suite or NIST pair")
-    require(len(run_refs.selected_units(None, ["rust"])) == 28,
+    require(len(run_refs.selected_units(None, ["rust"])) == 29,
             "Rust default no longer includes every audited section")
+    rust_default = run_refs.selected_units(None, ["rust"])
+    for name, sections in run_refs.RUST_SECTIONS.items():
+        expected = [unit for unit in bench.units() if unit[0] == name]
+        require(tuple(section for _, section in expected) == sections and
+                run_refs.selected_units([name], ["rust"]) == expected and
+                all(unit in rust_default for unit in expected),
+                "Rust default/bare selection differs from actual sections: " + name)
+        for unit in expected:
+            require(run_refs.selected_units([bench.unit_name(*unit)], ["rust"]) == [unit],
+                    "explicit Rust section differs from its bare/default workload")
+    for references in (["go"], ["rust"], ["go", "rust"]):
+        require(run_refs.selected_units(["b44fma"], references) == [("b44fma", "horner")] and
+                run_refs.selected_units(["b44fma:horner"], references) == [("b44fma", "horner")],
+                "FMA bare/explicit selection lost the real Horner section")
+        for selector in ("b44fma:unknown", "b44fma:None", "b44fma:"):
+            try:
+                run_refs.selected_units([selector], references)
+            except ValueError:
+                pass
+            else:
+                require(False, "invalid FMA section was silently accepted")
     for selectors in (["b45nist"], ["b3spawn"], ["b45nist:p256"], []):
         try:
             run_refs.selected_units(selectors, ["rust"])
@@ -352,7 +374,7 @@ log=Path(os.environ['BENCH_STUB_LOG'])
 with log.open('a') as f:
     f.write(json.dumps({'tool':kind,'args':args,'env':{k:os.environ.get(k) for k in ('GOAMD64','GOARCH','GOOS','GODEBUG')}})+'\n')
 if kind=='paslangc' and args==['-v']: print('paslangc stub');sys.exit()
-if kind=='go' and args==['version']: print('go version go1.27.3-X:nodwarf5 linux/amd64');sys.exit()
+if kind=='go' and args==['version']: print('go version go1.27.4-X:nodwarf5 linux/amd64');sys.exit()
 if kind=='go' and args[:2]==['env','-json']: print(json.dumps({'GOAMD64':os.environ.get('GOAMD64'),'GOARCH':'amd64','GOOS':'linux'}));sys.exit()
 if kind=='rustc' and args==['-Vv']: print('rustc stub\nrelease: stub');sys.exit()
 if kind=='rustc' and args[:2]==['--print','sysroot']: print('/synthetic/sysroot');sys.exit()

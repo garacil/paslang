@@ -19,16 +19,16 @@ import tempfile
 import struct
 from metadata_scope import invoke as scoped_invoke
 
-GO_POLICY = "go1.27.3-amd64-v1-dual-parser-capabilities-v2"
-GO_REVIEWED_VERSION = "go1.27.3"
-GO_REVIEWED_VERSION_TOKENS = ("go1.27.3-X:nodwarf5",)
-GO_DRIVER_SHA256 = "21401c8d2dae2e6db0d756f7b9ae5a885ac6c14882cbbe521c6f49b184da8402"
+GO_POLICY = "go1.27.4-amd64-v1-dual-parser-capabilities-v2"
+GO_REVIEWED_VERSION = "go1.27.4"
+GO_REVIEWED_VERSION_TOKENS = ("go1.27.4-X:nodwarf5",)
+GO_DRIVER_SHA256 = "2ffad463dade83f99b9c601073826e6d8efd47e1a56b36927b1314e74d6d7fdd"
 GO_TOOL_SHA256 = {
-    "compile":"9e7c2f2d98036e47ecba57b7dc3556cd82bcf24e1f8c8bba5a9881b20951b6c5",
-    "asm":"2d6ce7f1c728010cee15427f36f8b5d9bbac83bce91faa8997498c08e208099d",
-    "link":"97df419b7cf8f4bb8e76c3623b8a1d371c6818533c4be04f0a3563ff6169843d",
+    "compile":"05f5449fc6c322227efa6ab96378071c7eb5437842f5636e44d8844a869073b3",
+    "asm":"ebfb662ab832708d98cf2fd2ffd8e8de430d1d1470c38100d035f254374c47f3",
+    "link":"205a9fad5e14ee6398ddbd0c2fd82e42a8cc35ae28da03ab4812405ff2a3fd4f",
 }
-GO_SOURCE_SHA256 = {'internal/cpu/cpu.go': '9af4310772f84d92f2a98e9f16e6553fdbefc4ce6286e0f508121e6c8819faf7', 'internal/cpu/cpu_x86.go': '395ce0d3004df63df376585519bc1b46303b206415c1915ab80b7bead155e26a', 'internal/cpu/cpu_x86.s': 'ee4dca9916b29475e600d85f71f0dfd134496d153c77d20a643b139cc6e18fed', 'vendor/golang.org/x/sys/cpu/cpu.go': 'b56854737e8d803d582232f9790f7dda2d8ff69e5982f6cdbdd2a150be540922', 'vendor/golang.org/x/sys/cpu/cpu_x86.go': '6a9cdf0eca762b62d0e49e1f3bc9b5c68f23fecbdb888d12ef27bc32bc3893b9', 'runtime/proc.go': '40d15ce858cf058cff92606001a29ee1689db88c121a2f0c283163a0d64a7375', 'runtime/cpuflags_amd64.go': 'b9aa3542d35b84d5279030a603acfade2563c67b970e99d5d89ebf64742383f6', 'runtime/asm_amd64.s': '71da1bf81ac9a5972ab4ddaccb0f2bab4c9272a888991a34721e520513f458bd', 'internal/buildcfg/exp.go': '5825d40b47471bca28a00c0c19215930efef22b758120b6d972da1a955f21fa0', 'internal/buildcfg/zbootstrap.go': '5fb530ddd25775785f71bcf4a566101f3b7506f78200a1d69a6a0dc898cd84b1'}
+GO_SOURCE_SHA256 = {'internal/cpu/cpu.go': '9af4310772f84d92f2a98e9f16e6553fdbefc4ce6286e0f508121e6c8819faf7', 'internal/cpu/cpu_x86.go': '395ce0d3004df63df376585519bc1b46303b206415c1915ab80b7bead155e26a', 'internal/cpu/cpu_x86.s': 'ee4dca9916b29475e600d85f71f0dfd134496d153c77d20a643b139cc6e18fed', 'vendor/golang.org/x/sys/cpu/cpu.go': 'b56854737e8d803d582232f9790f7dda2d8ff69e5982f6cdbdd2a150be540922', 'vendor/golang.org/x/sys/cpu/cpu_x86.go': '6a9cdf0eca762b62d0e49e1f3bc9b5c68f23fecbdb888d12ef27bc32bc3893b9', 'runtime/proc.go': '40d15ce858cf058cff92606001a29ee1689db88c121a2f0c283163a0d64a7375', 'runtime/cpuflags_amd64.go': 'b9aa3542d35b84d5279030a603acfade2563c67b970e99d5d89ebf64742383f6', 'runtime/asm_amd64.s': '71da1bf81ac9a5972ab4ddaccb0f2bab4c9272a888991a34721e520513f458bd', 'internal/buildcfg/exp.go': '5825d40b47471bca28a00c0c19215930efef22b758120b6d972da1a955f21fa0', 'internal/buildcfg/zbootstrap.go': '80257717aa2ec5d57e226173a71745903af28f2ec9b75596dd089548b08142c6'}
 GO_OPTION_FIELDS = {
     "adx":"HasADX", "aes":"HasAES", "erms":"HasERMS", "fsrm":"HasFSRM",
     "pclmulqdq":"HasPCLMULQDQ", "rdtscp":"HasRDTSCP", "sha":"HasSHA",
@@ -67,7 +67,7 @@ def go_level(cpu, native_level):
 
 def validate_go_version(version):
     if not isinstance(version, str) or not set(GO_REVIEWED_VERSION_TOKENS).intersection(version.split()):
-        raise ValueError("Go CPU policy needs the exact reviewed go1.27.3-X:nodwarf5 toolchain")
+        raise ValueError("Go CPU policy needs the exact reviewed go1.27.4-X:nodwarf5 toolchain")
 
 
 def _clean(environment=None):
@@ -106,7 +106,7 @@ def _state(state):
     flags, leaves = state["internal"], state["cpuid"]
     if not isinstance(flags,dict) or set(flags) != set(GO_FIELDS) or any(type(v) is not bool for v in flags.values()):
         raise ValueError("malformed Go CPU boolean layout")
-    if state["version"] != "go1.27.3-X:nodwarf5" or state["goarch"] != "amd64" or state["goos"] != "linux":
+    if state["version"] != "go1.27.4-X:nodwarf5" or state["goarch"] != "amd64" or state["goos"] != "linux":
         raise ValueError("Go probe version/architecture mismatch")
     if not isinstance(leaves,dict) or not {"0","1","80000000"}.issubset(leaves):
         raise ValueError("missing raw CPUID evidence")
@@ -169,7 +169,7 @@ def _validate_go_capabilities(capabilities, go_executable=None):
         raise ValueError("Go compiler identity is not reviewed")
     if not isinstance(sources,dict) or set(sources)!=set(GO_SOURCE_SHA256) or any(sources[k].get("sha256")!=v for k,v in GO_SOURCE_SHA256.items()):
         raise ValueError("Go CPU/default-experiment sources are not reviewed")
-    if not isinstance(environment,dict) or environment.get("GOVERSION")!="go1.27.3-X:nodwarf5" or environment.get("GOEXPERIMENT")!="nodwarf5" or environment.get("GOHOSTARCH")!="amd64" or environment.get("GOHOSTOS")!="linux":
+    if not isinstance(environment,dict) or environment.get("GOVERSION")!="go1.27.4-X:nodwarf5" or environment.get("GOEXPERIMENT")!="nodwarf5" or environment.get("GOHOSTARCH")!="amd64" or environment.get("GOHOSTOS")!="linux":
         raise ValueError("unreviewed Go defaults/experiments")
     actual_probe = {name:hashlib.sha256((Path(__file__).parent/name).read_bytes()).hexdigest() for name in PROBE_INPUTS}
     if p["probe_sources"] != actual_probe:
@@ -294,7 +294,7 @@ def prepare_go_capabilities(go_executable, outdir, environment=None):
             shutil.copyfile(Path(__file__).parent/name,out/name)
             if hashlib.sha256((out/name).read_bytes()).hexdigest()!=probe_sources[name]:
                 raise ValueError("Go probe source changed while copying build inputs")
-        (out/"go.mod").write_text("module paslang-cpu-metadata\n\ngo 1.27.3\n")
+        (out/"go.mod").write_text("module paslang-cpu-metadata\n\ngo 1.27.4\n")
         binary = out/"go-cpu-probe"
         _capture([driver["path"],"build","-o",binary,"."],env,out,observations)
         artifact = _file(binary)
@@ -408,3 +408,24 @@ def require_go_artifact_capabilities(cpu,metadata):
                 "provider_policy":"ordinary native linkage" if cpu=="native" else "no dynamic/interpreter/provider segment"}
     except (KeyError,TypeError,AttributeError) as error:
         raise ValueError("malformed Go artifact metadata") from error
+
+
+def require_go_fma_capabilities(cpu, metadata, capabilities, environment, native_level=None):
+    """Bind b44's actual guarded/hardware code to measured effective HasFMA.
+
+    runtime/proc.go cpuinit copies internal/cpu.X86.HasFMA after the
+    reviewed startup parser has applied the recorded GODEBUG controls.
+    The artifact gate checks the actual branch and pure fallback too.
+    """
+    proof = validate_go_capabilities(capabilities)
+    expected = go_runtime_environment(cpu, native_level, {}, capabilities=proof)
+    controls = lambda value: [part for part in value.get("GODEBUG", "").split(",")
+                              if part.startswith("cpu.")]
+    if (controls(environment) != controls(expected)
+            or environment.get("GOAMD64") != go_level(cpu, native_level)):
+        raise ValueError("Go FMA runtime controls differ from the effective-state evidence")
+    effective = proof["base_state" if cpu == "base" else "native_state"]["internal"]["HasFMA"]
+    from reference_caps import require_fma_path
+    result = require_fma_path("go", cpu, metadata, effective_has_fma=effective)
+    result["go_capability_identity_sha256"] = proof["identity_sha256"]
+    return result

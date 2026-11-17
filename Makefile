@@ -76,7 +76,7 @@ BENCH_RUST_PROVIDER ?=
 BENCH_RUST_CAPABILITY_PROOF ?=
 BENCH_REF_ARGS = $(if $(BENCH_REFERENCE),--reference "$(BENCH_REFERENCE)") $(if $(BENCH_CPU),--cpu "$(BENCH_CPU)") $(if $(BENCH_GO_NATIVE_LEVEL),--go-native-level "$(BENCH_GO_NATIVE_LEVEL)") $(if $(BENCH_RUST_TARGET),--rust-target "$(BENCH_RUST_TARGET)") $(if $(BENCH_RUST_SYSROOT),--rust-sysroot "$(BENCH_RUST_SYSROOT)") $(if $(BENCH_RUST_PROVIDER),--rust-provider "$(BENCH_RUST_PROVIDER)") $(if $(BENCH_RUST_CAPABILITY_PROOF),--rust-capability-proof "$(BENCH_RUST_CAPABILITY_PROOF)")
 BENCH_PAIR_ARGS = $(if $(BENCH_PAIRS),--pairs "$(BENCH_PAIRS)")
-BENCH_RUST_PAIRS := b1loop,b2str,b5map,b6smap,b7narrow,b8ptr,b10rot,b14sort,b24math,b26slice,b31map
+BENCH_RUST_PAIRS := b1loop,b2str,b5map,b6smap,b7narrow,b8ptr,b10rot,b14sort,b24math,b26slice,b31map,b44fma
 
 PASLANG_SRC := \
 	src/compiler/pasast.paslang \
@@ -872,8 +872,8 @@ GOLDEN_A64 += randfast
 GOLDEN += heapfast
 GOLDEN_A64 += heapfast
 # P425: Fma against Python's math.fma and the exact rational, by every way to write it.
-GOLDEN += fmafused
-GOLDEN_A64 += fmafused
+GOLDEN += fmafused fmatarget
+GOLDEN_A64 += fmafused fmatarget
 # P476: PDF files read, their text, and the same bytes bent.
 GOLDEN += pdftext
 GOLDEN_A64 += pdftext
@@ -1320,7 +1320,7 @@ bench: $(OUTDIR)/paslangc core libs
 	PATH="$(abspath $(OUTDIR)):$$PATH" python3 scripts/bench/build.py $(BENCH_REF_ARGS) -n 8 --json $(BUILDDIR)/bench/build.json || rc=1; \
 	exit $$rc
 
-# Rust has eleven audited twins, covering all twenty-eight sections of
+# Rust has twelve audited twins, covering all twenty-nine sections of
 # those programs. Keep all other Go pairs in the ordinary bench target.
 # Native/base provider identity and baseline proof are explicit; failures
 # remain failures against the same strict time and memory budgets.
@@ -1356,6 +1356,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	@python3 scripts/check_recipes.py
 	@python3 -B scripts/check_uint32.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64)
 	@python3 -B scripts/check_uint32_focus.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64)
+	@python3 -B scripts/check_fma_target.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64)
 	@python3 -I scripts/bench/check_harness.py
 	@python3 -I scripts/bench/check_peak.py
 	@python3 -I scripts/bench/check_reference_caps.py
@@ -1611,7 +1612,8 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'p_f[.]7_pashash12_passha256cpu' $(BUILDDIR)/hash1.s; \
 	$(OUTDIR)/paslangc -cpu v3 -o $(BUILDDIR)/fmafused-v3 testdata/fmafused.paslang; \
 	grep -q 'vfmadd213sd' $(BUILDDIR)/fmafused-v3.s; \
-	grep -q 'call p_f[.]6_pasnum6_pasfma' $(BUILDDIR)/fmafused-base.s; \
+	grep -q 'call p_f[.]6_pasnum10_pasfmasoft' $(BUILDDIR)/fmafused-base.s; \
+	grep -q 'call p_f[.]6_pasnum11_pasfmasofts' $(BUILDDIR)/fmafused-base.s; \
 	if grep -q 'vfmadd213sd' $(BUILDDIR)/fmafused-base.s; then echo "fmafused-base.s carries vfmadd213sd"; exit 1; fi; \
 	grep -q 'p_f[.]7_pashash13_passha256base' $(BUILDDIR)/hash1-base.s; \
 	grep -q 'p_f[.]7_pashash18_passha256updatecpu' $(BUILDDIR)/hashpieces.s; \
@@ -1697,7 +1699,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -qw 'ptest' $(BUILDDIR)/set256-v2.s; \
 	if grep -qw 'vptest' $(BUILDDIR)/set256-v2.s; then echo "set256-v2.s carries AVX2"; exit 1; fi; \
 	: a program for the base processor links no instruction past it, P268: inlineasm writes AVX2 itself and strkern calls the AVX2 kernels to test them; \
-	for t in vectors vecmore vecpool bitwords xxh3 hash1 tree1 store1 mapsplit set256 strwords strcmpk cmpwords sysutils1 utf8kern jsonkern longslice rtlong fillkern json1 jsoncanon hmacstream cipherkat cipherwyche x25519kat nistwyche nistsign rsawyche rsasign rsasigwyche; do \
+	for t in vectors vecmore vecpool bitwords xxh3 hash1 tree1 store1 mapsplit set256 strwords strcmpk cmpwords sysutils1 utf8kern jsonkern longslice rtlong fillkern json1 jsoncanon hmacstream cipherkat cipherwyche x25519kat nistwyche nistsign rsawyche rsasign rsasigwyche fmafused; do \
 	  python3 -I scripts/check_cpubin.py base $(BUILDDIR)/$$t-base > /dev/null || { python3 -I scripts/check_cpubin.py base $(BUILDDIR)/$$t-base; exit 1; }; \
 	done; \
 	: the UTF-8 kernels against the strict decoder of Python, P201: the expected output is the model output; \

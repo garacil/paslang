@@ -2151,7 +2151,7 @@ else
 `PASLANG_CPU=base` in the environment makes `CpuHas` and `CpuFeatures`
 see the baseline processor, SSE2 on amd64 and NEON on arm64 and nothing
 more. The language's own words do not ask them: the vectors, `PopCount`,
-the maps' hash and the hash words are chosen when the program is
+the maps' hash, `Fma` and the hash words are chosen when the program is
 compiled (`-cpu`, §22), and `-cpu base` compiles their base paths.
 
 `CpuFeatures` holds, on amd64, bit 0 `sse2`, 1 `sse3`, 2 `ssse3`, 3
@@ -8299,7 +8299,7 @@ base not above zero with an exponent that is not an integer) are the same, and
 | `Exp(x)` | e to the `x` | |
 | `Power(base, e)` | `base` to the `e`; `Power(x, 0)` is 1, `Power(0, -1)` +Inf, and a negative base with a whole exponent works (`Power(-2, 3)` is -8) | a negative base with an exponent that is not whole (`power domain`) |
 | `Hypot(x, y)` | √(x² + y²) | |
-| `Fma(a, b, c)` | `a * b + c` rounded once (IEEE 754-2008's fusedMultiplyAdd), where `a * b + c` rounds the product and then the sum: `Fma(0.1, 10, -1)` is 2⁻⁵⁴ and `0.1 * 10 - 1` is 0. Three `Single`s give a `Single`, anything else a `Double` (an integer converts). One instruction (`VFMADD213SD`, `FMADD`) where the processor has it, which is every arm64 and `-cpu v3` or more; under `-cpu base` the processor is tested at each call and Go's `math.FMA` arithmetic on integers stands in where it has no such instruction: the same bits | |
+| `Fma(a, b, c)` | `a * b + c` rounded once (IEEE 754 fusedMultiplyAdd), where `a * b + c` rounds the product and then the sum: `Fma(0.1, 10, -1)` is 2⁻⁵⁴ and `0.1 * 10 - 1` is 0. Three `Single`s give a `Single`, anything else a `Double` (an integer converts). One instruction (`VFMADD213SD` or `VFMADD213SS`, `FMADD`) where the compiled CPU target has it, which is every arm64 and amd64 with FMA; otherwise the exact portable kernel is selected while compiling, without a runtime feature test | |
 | `Ldexp(x, p)` | x × 2^p; `p` is an `Integer`, a real is a compile error | |
 | `Poly(x, a)` | a[0] + a[1]·x + a[2]·x² + …, by Horner; `a` is an `array of Real` | |
 | `Int(x)`, `Frac(x)` | the whole part toward zero, and the rest with x's sign: `Int(-2.75)` is -2.0, `Frac(-2.75)` -0.75 | |
@@ -8308,6 +8308,15 @@ base not above zero with an exponent that is not an integer) are the same, and
 | `Odd(n)` | a `Boolean`, the low bit of an integer; a real is a compile error | |
 | `IsNan(x)`, `IsInfinite(x)` | a `Boolean`: x is a NaN; x is +Inf or -Inf | |
 | `Pi` | π, written `Pi` or `Pi()`; a constant that takes the real type it meets, all 113 bits in a `Quad` | |
+
+`Fma` follows the CPU target at its source location, including `{$CPU}`
+overrides. A local amd64 base call selects `PasFmaSoft` or `PasFmaSoftS`
+even when other routines link an optimized core object. With `uses pasnum`,
+ordinary calls and routine values of `PasFma` or `PasFmaS` follow the target
+of the selected separately compiled unit object. Explicit `PasFmaSoft` and
+`PasFmaSoftS` remain portable. The exact software and hardware paths preserve
+round-to-nearest, ties-to-even fused results, including signed zero and
+subnormal cases.
 
 `Single` is IEEE binary32, 4 bytes, worked out in 32 bits like Go's
 `float32`. A `Single` with a `Single` stays `Single`; with a `Double` it

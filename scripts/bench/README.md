@@ -4,10 +4,11 @@ The goal is lower time and peak memory than each reference on equal work.
 A failing comparison exits nonzero. Matching output, a single fast sample
 or an old result does not establish an overall advantage.
 
-The ordinary Go suite has 45 programs and 218 sections. Rust has 11 audited standard-library
-twins covering 28 sections:
+The ordinary Go suite has 46 programs and 221 sections. Rust has 12 audited standard-library
+twins covering 29 sections:
 b1loop, b2str, b5map, b6smap, b7narrow, b8ptr, b10rot, b14sort, b24math,
-b26slice and b31map. An explicitly requested unsupported Rust section is
+b26slice, b31map and b44fma. The other 34 programs and 192 sections still
+need audited Rust twins. An explicitly requested unsupported Rust section is
 refused before building. It is never counted as a win.
 
 ## Recorded integer-append comparison
@@ -75,6 +76,50 @@ include every round, output, memory sample and strict verdict.
 The [raw record](https://raw.githubusercontent.com/wiki/garacil/paslang/benchmark-results-p548-407.json)
 has SHA-256 `c178141c3dea28251fb0fed57e574ecbca12c828334db25f6668a8927a4d36d5`.
 
+## Recorded FMA comparison
+
+The historical P602 measurements use an unpublished paslangc 1.2.408 candidate, Go 1.27.3-X:nodwarf5 and Rust
+1.99.1 on the Ryzen 7 4800H. Every row evaluates sixteen fused Horner steps
+at thirty million points and accumulates the results in order. Every complete
+output is `4737506260561199801` followed by a newline. Forty alternating
+process pairs and five separate traced RSS samples per side give 400 timed
+executions and 50 memory executions across these five comparisons.
+
+Ratios are paslang / reference; Q3 is the exclusive upper quartile of the
+forty paired time ratios. The gates remain time and RSS at most 0.99, with
+Q3 below 1. Both Go rows pass. All three Rust rows fail time and Q3 while
+passing memory; those gaps remain open under P613.
+
+| Reference/provider | CPU | Time ratio | Q3 | Peak-RSS ratio | Gate |
+|---|---|---:|---:|---:|---|
+| Go | native | 0.987872 | 0.997571 | 0.121377 | PASS |
+| Go | base | 0.914949 | 0.919747 | 0.107584 | PASS |
+| Rust musl | native | 2.693034 | 2.716505 | 0.720430 | FAIL |
+| Rust musl | base | 1.378774 | 1.384112 | 0.559633 | FAIL |
+| Rust GNU | native | 2.667997 | 2.685876 | 0.112605 | FAIL |
+
+Native uses the host's FMA instructions and Go v3. Base pairs the compiled
+Paslang software path with the reviewed Go v1 software path or the proved
+static musl software provider. GNU keeps its ordinary native provider;
+GNU base FMA remains outside the reviewed baseline evidence. These are
+focused FMA results, with the other benchmark workloads retaining their
+own measurements and pending targets.
+
+The original comparison coordinator stopped after its two valid Go rows
+because its post-run validator used the wrong section budget key. The
+separate retained-data proof preserves that failed record and certifies the
+Go rows against unchanged measured inputs, binaries and every Go selection.
+A fresh corrected coordinator measured all three Rust rows. The complete
+records preserve both intervals, all raw outputs and strict verdicts.
+
+[Full results and protocol](https://github.com/garacil/paslang/wiki/Benchmark-Results-P602-408)
+include every paired round and memory sample. The
+[raw record](https://raw.githubusercontent.com/wiki/garacil/paslang/benchmark-results-p602-408.json)
+has SHA-256 `ff712e6ba0915b270020ca28fdd0b6a3c406a7da46d692db439f258d482e8b92`.
+
+These are retained prototype measurements, not a new run of the current
+release. They do not establish an overall runtime advantage.
+
 ## Go
 
 Review the host and operating-system CPU capabilities, then set the highest
@@ -96,8 +141,8 @@ only when that program executes. Build and execution environments are recorded
 separately, so targeting a baseline CPU does not throttle the Go compiler.
 
 The reviewed Go reference is the exact Linux/amd64
-`go1.27.3-X:nodwarf5` toolchain identified in reference_policy.py. Other
-builds, including plain go1.27.3, require a new source and identity review.
+`go1.27.4-X:nodwarf5` toolchain identified in reference_policy.py. Other
+builds, including plain go1.27.4, require a new source and identity review.
 The full Go source, assembly headers and compiler tools enter the reuse
 fingerprint. GOENV is disabled, inherited CPU overrides are removed and
 GOEXPERIMENT is cleared while retaining the reviewed embedded defaults.
@@ -118,7 +163,7 @@ PT_DYNAMIC. External loaders and C libraries require separate reviewed
 startup/IFUNC evidence. Native keeps ordinary linkage, and CGO defaults
 stay unchanged. Refused comparisons retain artifact metadata and their
 reason in JSON; they are missing evidence, never speed wins. There is no
-assertion file that overrides this gate. The eleven audited Go peers used
+assertion file that overrides this gate. The twelve audited Go peers used
 for the Rust comparison are static; this does not certify every program
 in the full Go suite.
 
@@ -190,6 +235,36 @@ destruction. String-map keys borrow stable prebuilt strings; inserts do not
 clone String values. Pointer workloads use safe ownership and iterative
 list destruction, whose work remains timed.
 
+## Fused multiply-add capabilities
+
+The b44fma pair evaluates the same sixteen-term Horner polynomial at thirty
+million points and accumulates the results in order. Paslang uses `Fma`, Go
+uses `math.FMA`, and Rust uses `f64::mul_add`; the complete output must match.
+A multiply followed by an add is insufficient because it rounds twice.
+
+Every b44 executable receives a linked-code check before timing. Paslang
+base must contain no optional FMA instruction; native must select the path
+supported by the observed host. The Go base CPU mask must select its pure
+software fallback, while a native FMA host must reach hardware FMA. Rust
+musl base requires both the fixed linked-program ISA proof and proved calls
+to its static software FMA provider. Native Rust must reach hardware FMA
+on an FMA host. A GNU base executable with an optional dispatch path is
+refused before measurement. Provider identity and retained disassembly
+remain bound to the actual executable.
+
+A Rust-only b44 native run also requires the reviewed Go toolchain for an
+untimed CPU probe. This supplies an independent host capability observation;
+it does not run Go as a timed reference. A Rust-only base run does not need
+that probe. The usual Go native-level option is required when Go itself is
+a selected native reference. Probe setup and code inspection stay outside
+all workload timing samples.
+
+The compiled-target FMA policy applies even on a host with FMA. It was first
+validated in the held 1.2.408 candidate; earlier implementations could dispatch
+to hardware. Comparing those binaries directly does not compare equal CPU
+capabilities. This suite checks the actual selected path rather than accepting
+a target flag as evidence.
+
 ## Evidence and tests
 
 run.py and rounds.py retain every requested round, full stdout including trailing
@@ -217,7 +292,7 @@ and preserves legacy records without inventing missing Rust observations.
 Normal make check runs deterministic compiler-free harness, tracer, Go
 policy/process-scope, Rust capability and compiler-report checks. Their stubs use synthetic timing values only to
 test verdicts and failure accounting; they are never performance evidence.
-Real correctness comparisons run all 28 sections on amd64 native/base and
+Real correctness comparisons run all 29 sections on amd64 native/base and
 arm64 under QEMU. QEMU results establish correctness, not native ARM speed.
 
 Equal output does not prove equal memory-safety or HashDoS guarantees.

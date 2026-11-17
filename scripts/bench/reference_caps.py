@@ -604,6 +604,289 @@ def prepare_rust_proof(configuration, binary, evidence):
     return proof
 
 
+
+_FMA_PREFIXES = ("vfmadd", "vfmsub", "vfnmadd", "vfnmsub")
+_FMA_ROOTS = {"go": ("main.main", "main.horner"),
+              "rust": ("b44fma::main", "b44fma::horner"), "paslang": ("pas_main",)}
+
+
+def _fma_disassembly(text):
+    """Keep exact instruction addresses and distinct duplicate symbol bodies."""
+    if len(text) > 64 * 1024 * 1024:
+        raise CapabilityError("FMA disassembly exceeds its byte bound")
+    functions, sites, current, count = {}, [], None, 0
+    for line in text.splitlines():
+        label = re.fullmatch(r"([0-9a-f]+) <(.*)>:", line)
+        if label:
+            current = {"address": int(label[1], 16), "instructions": []}
+            functions.setdefault(label[2], []).append(current)
+            symbol = label[2]
+            continue
+        if not re.match(r"^\s*[0-9a-f]+:", line):
+            if line.strip() == "...":
+                raise CapabilityError("FMA disassembler omitted executable bytes")
+            continue
+        item = re.fullmatch(r"\s*([0-9a-f]+):\s+((?:[0-9a-f]{2}\s+)+)(\S+)\s*(.*)", line)
+        if item is None or current is None or "(bad)" in line:
+            raise CapabilityError("undecoded FMA executable bytes: " + line.strip())
+        address, encoding, mnemonic, operands = item.groups()
+        # The runtime keeps NUL-terminated CPU-name strings in executable text.
+        # A lone00 byte cannot encode FMA; keep it as data, never a hot-path op.
+        if mnemonic.startswith(".") and not (mnemonic == ".byte" and
+                encoding.strip() == "00" and operands.strip() in ("0", "0x0", "0x00")):
+            raise CapabilityError("undecoded FMA executable bytes: " + line.strip())
+        row = {"address": int(address, 16), "encoding": " ".join(encoding.split()),
+               "mnemonic": mnemonic, "operands": operands}
+        current["instructions"].append(row)
+        count += 1
+        if mnemonic.startswith(_FMA_PREFIXES):
+            sites.append({"symbol": symbol, **row})
+    if not count:
+        raise CapabilityError("empty FMA executable inspection")
+    return functions, sites, count
+
+
+def fma_binary_metadata(reference, binary, evidence_directory):
+    """Retain actual b44 machine code; flags never certify its FMA provider.
+
+    Intel SDM Vol2C5-226--228 and AMD26568 Vol4pp1049--1051 describe
+    the scalar fused instructions. Go1.27.3 ssagen/intrinsics779--814 guards
+    lower-level FMA with runtime.x86HasFMA and calls pure math.FMA otherwise.
+    Rust1.99.1 std/core mul_add lowers through llvm.fma; an unsupported
+    target may reach compiler-builtins dispatch or a bundled C provider.
+    """
+    if reference not in _FMA_ROOTS:
+        raise CapabilityError("unsupported FMA reference")
+    before = file_identity(binary)
+    inspector = shutil.which("objdump")
+    if inspector is None:
+        raise CapabilityError("objdump is required for FMA provider inspection")
+    tool = file_identity(inspector)
+    inspected = _capture([inspector, "-d", "-C", "--insn-width=16", "--disassemble-zeroes", binary])
+    if inspected["stderr"]:
+        raise CapabilityError("FMA disassembler emitted diagnostics")
+    functions, sites, count = _fma_disassembly(inspected["stdout"])
+    roots = _FMA_ROOTS[reference]
+    selected = {}
+    program_functions = tuple(name for name in functions if reference == "paslang"
+                              and re.fullmatch(r"p_f[.]0_6_horner(?:_.*)?", name))
+    for name in (*roots, *program_functions, "math.FMA", "fma"):
+        rows = functions.get(name, [])
+        if len(rows) > 1:
+            raise CapabilityError("ambiguous FMA provider/workload symbol: " + name)
+        if rows:
+            selected[name] = rows[0]
+    if roots[0] not in selected:
+        raise CapabilityError("FMA workload entry is missing")
+    after = file_identity(binary)
+    if before != after or file_identity(inspector) != tool:
+        raise CapabilityError("FMA binary/inspector changed during inspection")
+    directory = Path(evidence_directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    dump = directory / (Path(binary).name + "." + after["sha256"] + ".objdump")
+    raw = inspected["stdout"].encode()
+    if dump.exists():
+        if dump.read_bytes() != raw:
+            raise CapabilityError("retained FMA disassembly changed")
+    else:
+        dump.write_bytes(raw)
+    value = {"format": "paslang-fma-linked-program-v1", "reference": reference,
+             "binary": after, "inspector": tool, "policy_source": file_identity(__file__),
+             "inspection": {key: item for key, item in inspected.items() if key != "stdout"},
+             "disassembly": file_identity(dump), "instruction_count": count,
+             "functions": selected, "fma_sites": sites}
+    value["identity_sha256"] = _digest(value)
+    return value
+
+
+def _fma_walk(function, forced, *, start=None, blocked=()):
+    rows = function["instructions"]
+    positions = {row["address"]: index for index, row in enumerate(rows)}
+    if len(positions) != len(rows) or not rows:
+        raise CapabilityError("ambiguous/empty FMA instruction body")
+    todo, seen = [0 if start is None else positions[start]], set()
+    while todo:
+        index = todo.pop()
+        if index in seen or index >= len(rows) or rows[index]["address"] in blocked:
+            continue
+        seen.add(index)
+        row = rows[index]
+        mnemonic = row["mnemonic"]
+        if mnemonic.startswith("."):
+            raise CapabilityError("FMA workload reaches executable-text data")
+        branch = re.match(r"([0-9a-f]+)\s+<", row["operands"])
+        destination = positions.get(int(branch[1], 16)) if branch else None
+        if mnemonic in ("ret", "retq", "ud2", "hlt", "int3"):
+            continue
+        if mnemonic in ("jmp", "jmpq"):
+            if destination is not None:
+                todo.append(destination)
+            continue
+        if mnemonic.startswith("j"):
+            if row["address"] in forced:
+                if forced[row["address"]]:
+                    if destination is None:
+                        raise CapabilityError("FMA feature branch leaves its workload")
+                    todo.append(destination)
+                else:
+                    todo.append(index + 1)
+            else:
+                if destination is not None:
+                    todo.append(destination)
+                todo.append(index + 1)
+        else:
+            todo.append(index + 1)
+    return [rows[index] for index in sorted(seen)]
+
+
+
+def _fma_static_calls(functions, reached, forced):
+    """Prove LLVM's static C fma pointer, including its CFG/register lifetime.
+
+    AMD64 psABI3.2.1 preserves rbx/rbp/r12--r15 across the C provider call.
+    A mere address occurrence or an uncalled provider symbol is insufficient.
+    """
+    calls = []
+    aliases = {"%rbx": {"%rbx", "%ebx", "%bx", "%bl", "%bh"},
+               "%rbp": {"%rbp", "%ebp", "%bp", "%bpl"}}
+    aliases.update({"%r" + str(n): {"%r" + str(n) + suffix for suffix in ("", "d", "w", "b")}
+                    for n in range(12, 16)})
+    saved = set(aliases)
+    for name in reached:
+        function = functions[name]
+        body = _fma_walk(function, forced)
+        for seed in body:
+            reg = seed["operands"].split("#", 1)[0].rsplit(",", 1)[-1].strip()
+            if seed["mnemonic"] not in ("lea", "leaq") or "<fma>" not in seed["operands"] or reg not in saved:
+                continue
+            without_seed = {row["address"] for row in _fma_walk(function, forced, blocked={seed["address"]})}
+            for call in body:
+                if call["mnemonic"] not in ("call", "callq") or call["operands"].strip() != "*" + reg:
+                    continue
+                if call["address"] in without_seed:
+                    continue
+                valid = True
+                for row in body:
+                    if row is seed:
+                        continue
+                    mnemonic = row["mnemonic"]
+                    destination = row["operands"].split("#", 1)[0].rsplit(",", 1)[-1].strip()
+                    readonly = mnemonic in ("cmp", "cmpb", "cmpw", "cmpl", "cmpq",
+                                            "test", "testb", "testw", "testl", "testq")
+                    writes = (destination in aliases[reg] and not readonly
+                              and not mnemonic.startswith(("push", "call", "j")))
+                    writes |= mnemonic == "cpuid" and reg == "%rbx"
+                    writes |= mnemonic in ("leave", "leaveq", "enter") and reg == "%rbp"
+                    writes |= mnemonic.startswith(("xchg", "xadd")) and any(
+                        part.strip() in aliases[reg] for part in row["operands"].split(","))
+                    if writes and call["address"] in {part["address"] for part in _fma_walk(
+                            function, forced, start=row["address"], blocked={seed["address"]})}:
+                        valid = False
+                        break
+                if valid:
+                    calls.append({"symbol": name, "seed": seed["address"],
+                                  "call": call["address"], "register": reg, "callee": "fma"})
+    return calls
+
+
+def require_fma_path(reference, cpu, metadata, *, effective_has_fma=None,
+                     capability_evidence=None, provider=None):
+    """Prove the actual selected FMA path, after the driver's CPU/provider gate."""
+    if reference not in _FMA_ROOTS or cpu not in ("base", "native"):
+        raise CapabilityError("unsupported FMA reference/mode")
+    if metadata.get("format") != "paslang-fma-linked-program-v1" or metadata.get("reference") != reference:
+        raise CapabilityError("missing FMA linked-program evidence")
+    value = {key: item for key, item in metadata.items() if key != "identity_sha256"}
+    if metadata.get("identity_sha256") != _digest(value):
+        raise CapabilityError("FMA inspection identity differs")
+    for key in ("binary", "inspector", "policy_source", "disassembly"):
+        if file_identity(metadata[key]["path"]) != metadata[key]:
+            raise CapabilityError("FMA retained input changed: " + key)
+    if type(effective_has_fma) is not bool or cpu == "base" and effective_has_fma:
+        raise CapabilityError("FMA selection needs the independent effective CPU observation")
+    functions, roots = metadata["functions"], _FMA_ROOTS[reference]
+    if reference == "paslang":
+        roots += tuple(name for name in functions if re.fullmatch(r"p_f[.]0_6_horner(?:_.*)?", name))
+    forced, guards = {}, []
+    if reference == "go":
+        if type(effective_has_fma) is not bool or cpu == "base" and effective_has_fma:
+            raise CapabilityError("Go FMA needs the validated effective CPU observation")
+        for name in roots:
+            rows = functions.get(name, {}).get("instructions", [])
+            for index, row in enumerate(rows):
+                if not row["mnemonic"].startswith(_FMA_PREFIXES) or index < 3:
+                    continue
+                load, test, jump = rows[index - 3:index]
+                register = re.search(r",(%[a-z0-9]+)$", load["operands"].split("#", 1)[0].strip())
+                if (load["mnemonic"] == "movzbl" and "<runtime.x86HasFMA>" in load["operands"]
+                        and register and test["mnemonic"] in ("test", "testl", "testb")
+                        and test["operands"].replace(" ", "") == register[1] + "," + register[1]
+                        and jump["mnemonic"] in ("je", "jz")):
+                    forced[jump["address"]] = not effective_has_fma
+                    guards.append({"symbol": name, "feature_load": load["address"],
+                                   "branch": jump["address"], "hardware": row["address"]})
+    todo, reached, live = [roots[0]], set(), []
+    while todo:
+        name = todo.pop()
+        if name in reached:
+            continue
+        reached.add(name)
+        if name not in functions:
+            raise CapabilityError("FMA workload body is absent: " + name)
+        body = _fma_walk(functions[name], forced)
+        live.extend((name, row) for row in body)
+        for row in body:
+            target = re.search(r"<([^>]+)>", row["operands"])
+            if row["mnemonic"] in ("call", "callq") and target and target[1] in roots:
+                todo.append(target[1])
+    hardware = [row for name, row in live if row["mnemonic"].startswith(_FMA_PREFIXES)]
+    software = [row for name, row in live if row["mnemonic"] in ("call", "callq")
+                and re.search(r"<(?:math[.]FMA|fma)(?:@[^>]*)?>", row["operands"])]
+    static_calls = _fma_static_calls(functions, reached, forced) if reference == "rust" else []
+    software.extend(static_calls)
+    if reference == "go":
+        if effective_has_fma:
+            if not hardware or software:
+                raise CapabilityError("Go's selected FMA workload path is not hardware-only")
+            selected = "hardware-fma"
+        else:
+            if hardware or not software or "math.FMA" not in functions or not guards:
+                raise CapabilityError("Go's selected FMA workload path is not the pure fallback")
+            if any(site["symbol"] not in roots for site in metadata["fma_sites"]):
+                raise CapabilityError("unproved FMA outside Go's guarded workload")
+            selected = "pure-go-fma"
+    elif reference == "paslang":
+        if effective_has_fma:
+            if not hardware or any(re.search(r"rt_cpufeat|_cpuhas", row["operands"], re.I)
+                                   for name, row in live):
+                raise CapabilityError("Paslang native FMA is not directly selected in the workload")
+            selected = "hardware-fma"
+        else:
+            if metadata["fma_sites"]:
+                raise CapabilityError("Paslang's software-target ELF retains optional FMA")
+            selected = "compiled-software-fma"
+    elif cpu == "base":
+        if (provider != "musl" or not isinstance(capability_evidence, dict)
+                or capability_evidence.get("status") != "retained-evidence-matches"
+                or capability_evidence.get("linked_text", {}).get("binary") != metadata["binary"]):
+            raise CapabilityError("Rust FMA base needs the actual static-provider linked-text proof")
+        if metadata["fma_sites"] or "fma" not in functions or not software:
+            raise CapabilityError("Rust FMA base reaches an optional or unproved implementation")
+        selected = "static-software-fma"
+    elif effective_has_fma and hardware and not software:
+        selected = "hardware-fma"
+    elif not effective_has_fma and provider == "musl" and not metadata["fma_sites"] and "fma" in functions and software:
+        selected = "static-software-fma"
+    else:
+        raise CapabilityError("Rust native FMA provider is not proved by the linked workload")
+    return {"cpu": cpu, "reference": reference, "selected": selected,
+            "artifact_identity_sha256": metadata["identity_sha256"],
+            "binary_sha256": metadata["binary"]["sha256"], "workload_functions": sorted(reached),
+            "effective_has_fma": effective_has_fma, "feature_guards": guards,
+            "reachable_fma_instructions": len(hardware), "static_provider_calls": static_calls,
+            "scope": "b44 fused-operation selection; generic reference ISA/provider gates remain mandatory"}
+
+
 def main():
     import argparse
     import sys

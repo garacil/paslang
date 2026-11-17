@@ -81,7 +81,7 @@ def _stub_tool_main():
     arguments = sys.argv[1:]
     language = {'paslangc': 'paslang', 'go': 'go', 'rustc': 'rust'}[Path(sys.argv[0]).name]
     if arguments in (['-v'], ['-Vv'], ['version']):
-        print('go version go1.27.3-X:nodwarf5 linux/amd64' if language == 'go' else language + ' synthetic test tool')
+        print('go version go1.27.4-X:nodwarf5 linux/amd64' if language == 'go' else language + ' synthetic test tool')
         if language == 'go' and os.environ.get('P525_STUB_METADATA_STDERR') == 'version':
             print('GODEBUG: unknown cpu feature "sha"',file=sys.stderr)
         return

@@ -46,7 +46,7 @@ else:
 def line_of(path, header, statement, heads=2):
     """The line of statement in the body that follows header, which the
     unit declares and defines (heads 2) or defines alone (1)."""
-    lines = Path(path).read_text().splitlines()
+    lines = Path(path).read_text(encoding='utf-8').splitlines()
     start = [i for i, text in enumerate(lines) if text == header]
     if len(start) != heads:
         raise gdb.GdbError(f"{header} is not written {heads} times in {path}")

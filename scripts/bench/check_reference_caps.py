@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright (C) 2026 Germán Luis Aracil Boned.
 # GPL version 3 or later; see COPYING. No warranty.
-"""Compiler-free regressions for Rust component identities and ISA refusal."""
+"""Compiler-free reference identities, ISA and actual FMA selection controls."""
 import copy
 import importlib.util
 import json
@@ -163,6 +163,159 @@ class ReferenceCapabilities(unittest.TestCase):
         with mock.patch.object(caps, "_capture", return_value={"stdout": "release: unknown\n"}):
             with self.assertRaises(caps.CapabilityError):
                 caps.rust_configuration(compiler, sysroot=root)
+
+
+
+class FmaReferenceSelection(unittest.TestCase):
+    # These are compiler-free wrong-selection/dataflow controls. Actual ELF,
+    # provider and workload checks are retained separately by the driver.
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="paslang-fma-reference-")
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.binary = self.root / "b44fixture"
+        self.inspector = self.root / "objdump"
+        self.inspector.write_bytes(b"fixture inspector")
+        self.nonce = 0
+
+    def metadata(self, reference, text):
+        self.nonce += 1
+        self.binary.write_bytes(b"fixture binary " + str(self.nonce).encode())
+        with mock.patch.object(caps.shutil, "which", return_value=str(self.inspector)), \
+                mock.patch.object(caps, "_capture", return_value={
+                    "command": [str(self.inspector), "-d", "fixture"], "status": 0,
+                    "stdout": text, "stderr": ""}):
+            return caps.fma_binary_metadata(reference, self.binary, self.root / "evidence")
+
+    def require(self, reference, cpu, text, has_fma, provider="musl", certified=True):
+        metadata = self.metadata(reference, text)
+        evidence = {"status": "retained-evidence-matches" if certified else "ordinary-unmasked",
+                    "linked_text": {"binary": metadata["binary"]}}
+        return caps.require_fma_path(reference, cpu, metadata, effective_has_fma=has_fma,
+                                     capability_evidence=evidence, provider=provider)
+
+    GO = """0000 <main.main>:
+  0: 0f b6 15 00 00 00 00 movzbl 0x0(%rip),%edx # 100 <runtime.x86HasFMA>
+  7: 85 d2 test %edx,%edx
+  9: 74 07 je 12 <main.main+0x12>
+  b: c4 e2 c9 b9 d1 vfmadd231sd %xmm1,%xmm6,%xmm2
+ 10: eb 05 jmp 17 <main.main+0x17>
+ 12: e8 09 00 00 00 call 20 <math.FMA>
+ 17: c3 ret
+0020 <math.FMA>:
+ 20: f2 0f 59 c1 mulsd %xmm1,%xmm0
+ 24: c3 ret
+"""
+    RUST_SOFT = """0000 <b44fma::main>:
+ 0: 4c 8d 25 19 00 00 00 lea 0x19(%rip),%r12 # 20 <fma>
+ 7: 41 ff d4 call *%r12
+ a: c3 ret
+0020 <fma>:
+ 20: f2 0f 59 c1 mulsd %xmm1,%xmm0
+ 24: c3 ret
+"""
+    RUST_HARD = """0000 <b44fma::main>:
+ 0: c4 e2 d9 a9 ea vfmadd213sd %xmm2,%xmm4,%xmm5
+ 5: c3 ret
+"""
+
+    def test_go_effective_state_selects_the_actual_branch(self):
+        self.assertEqual(self.require("go", "base", self.GO, False)["selected"], "pure-go-fma")
+        self.assertEqual(self.require("go", "native", self.GO, True)["selected"], "hardware-fma")
+        self.assertEqual(self.require("go", "native", self.GO, False)["selected"], "pure-go-fma")
+
+    def test_wrong_feature_and_inverted_go_branch_are_rejected(self):
+        for text in (self.GO.replace("runtime.x86HasFMA", "runtime.otherFeature"),
+                     self.GO.replace("74 07 je", "75 07 jne")):
+            with self.subTest(text=text), self.assertRaises(caps.CapabilityError):
+                self.require("go", "base", text, False)
+
+    def test_unproved_optional_go_provider_is_rejected(self):
+        outside = "0030 <other>:\n 30: c4 e2 d9 a9 ea vfmadd213sd %xmm2,%xmm4,%xmm5\n 35: c3 ret\n"
+        with self.assertRaises(caps.CapabilityError):
+            self.require("go", "base", self.GO + outside, False)
+        with self.assertRaises(caps.CapabilityError):
+            self.require("go", "base", self.GO, True)
+
+    def test_native_software_on_fma_host_cannot_manufacture_a_win(self):
+        with self.assertRaises(caps.CapabilityError):
+            self.require("rust", "native", self.RUST_SOFT, True)
+        self.assertEqual(self.require("rust", "native", self.RUST_HARD, True)["selected"], "hardware-fma")
+        self.assertEqual(self.require("rust", "native", self.RUST_SOFT, False)["selected"], "static-software-fma")
+
+    def test_rust_base_needs_actual_static_provider_isa_evidence(self):
+        self.assertEqual(self.require("rust", "base", self.RUST_SOFT, False)["selected"], "static-software-fma")
+        for options in ({"provider": "gnu"}, {"certified": False}):
+            with self.subTest(options=options), self.assertRaises(caps.CapabilityError):
+                self.require("rust", "base", self.RUST_SOFT, False, **options)
+
+    def test_unused_or_unreached_provider_pointer_is_not_evidence(self):
+        for text in (self.RUST_SOFT.replace("# 20 <fma>", "# 20 <other>"),
+                     self.RUST_SOFT.replace("call *%r12", "call *%r13"),
+                     self.RUST_SOFT.replace(" 0: 4c", " 0: eb 07 jmp 9 <b44fma::main+0x9>\n 2: 4c").replace(" 7: 41", " 9: 41")):
+            with self.subTest(text=text), self.assertRaises(caps.CapabilityError):
+                self.require("rust", "base", text, False)
+
+    def test_all_pointer_register_alias_writes_invalidate_the_call(self):
+        for reg, opcode in (("%r12", "4d 31 e4"), ("%r12d", "45 31 e4"),
+                            ("%r12w", "66 45 31 e4"), ("%r12b", "45 30 e4")):
+            changed = self.RUST_SOFT.replace(" 7: 41 ff d4 call *%r12\n a: c3 ret",
+                " 7: " + opcode + " xor " + reg + "," + reg + "\n b: 41 ff d4 call *%r12\n e: c3 ret")
+            with self.subTest(reg=reg), self.assertRaises(caps.CapabilityError):
+                self.require("rust", "base", changed, False)
+        for reg, accumulator, opcode in (("%rbx", "%rax", "48 93"), ("%ebx", "%eax", "93"),
+                                         ("%bx", "%ax", "66 93"), ("%bl", "%al", "86 d8"),
+                                         ("%bh", "%ah", "86 fc")):
+            changed = self.RUST_SOFT.replace("%r12", "%rbx").replace(" 7: 41 ff d4 call *%rbx\n a: c3 ret",
+                " 7: " + opcode + " xchg " + reg + "," + accumulator + "\n a: ff d3 call *%rbx\n c: c3 ret")
+            with self.subTest(reg=reg), self.assertRaises(caps.CapabilityError):
+                self.require("rust", "base", changed, False)
+
+    def test_cmpxchg_is_a_possible_pointer_write_not_a_comparison(self):
+        changed = self.RUST_SOFT.replace("%r12", "%rbx").replace(
+            " 7: 41 ff d4 call *%rbx\n a: c3 ret",
+            " 7: 48 0f b1 cb cmpxchg %rcx,%rbx\n b: ff d3 call *%rbx\n d: c3 ret")
+        with self.assertRaises(caps.CapabilityError):
+            self.require("rust", "base", changed, False)
+
+    def test_epilogue_restore_after_the_last_call_is_legal(self):
+        text = self.RUST_SOFT.replace(" a: c3 ret", " a: 41 5c pop %r12\n c: c3 ret")
+        self.require("rust", "base", text, False)
+
+    def test_dead_native_hardware_does_not_prove_selection(self):
+        dead = self.RUST_HARD.replace(" 0: c4", " 0: eb 06 jmp 8 <b44fma::main+0x8>\n 2: c4").replace(" 5: c3 ret", " 8: c3 ret")
+        with self.assertRaises(caps.CapabilityError):
+            self.require("rust", "native", dead, True)
+
+    def test_paslang_linked_gate_rejects_historical_base_dispatch(self):
+        current = "0000 <pas_main>:\n 0: e8 0b 00 00 00 call 10 <p_f.0_6_horner>\n 5: c3 ret\n0010 <p_f.0_6_horner>:\n 10: c3 ret\n"
+        self.require("paslang", "base", current, False)
+        native = current.replace(" 10: c3 ret", " 10: c4 e2 d9 a9 ea vfmadd213sd %xmm2,%xmm4,%xmm5\n 15: c3 ret")
+        self.require("paslang", "native", native, True)
+        old = current + "0020 <p_f.6_pasnum6_pasfma>:\n 20: c4 e2 d9 a9 ea vfmadd213sd %xmm2,%xmm4,%xmm5\n 25: c3 ret\n"
+        with self.assertRaises(caps.CapabilityError):
+            self.require("paslang", "base", old, False)
+        with self.assertRaises(caps.CapabilityError):
+            self.require("paslang", "native", current, True)
+
+    def test_only_unreached_lone_zero_text_data_is_accepted(self):
+        text = self.RUST_HARD + "0020 <cpu_name_data>:\n 20: 00 .byte 0\n"
+        self.require("rust", "native", text, True)
+        with self.assertRaises(caps.CapabilityError):
+            self.require("rust", "native", text.replace(" 5: c3 ret", " 5: 00 .byte 0"), True)
+        with self.assertRaises(caps.CapabilityError):
+            self.require("rust", "native", text.replace("20: 00 .byte 0", "20: c4 .byte 0xc4"), True)
+
+    def test_changed_binary_dump_and_duplicate_roots_fail_closed(self):
+        metadata = self.metadata("rust", self.RUST_HARD)
+        self.binary.write_bytes(b"changed")
+        with self.assertRaises(caps.CapabilityError):
+            caps.require_fma_path("rust", "native", metadata, effective_has_fma=True)
+        with self.assertRaises(caps.CapabilityError):
+            self.metadata("rust", self.RUST_HARD + self.RUST_HARD)
+        for text in ("0000 <b44fma::main>:\n ...\n", "0000 <b44fma::main>:\n 0: ff .byte 0xff\n"):
+            with self.subTest(text=text), self.assertRaises(caps.CapabilityError):
+                self.metadata("rust", text)
 
 
 if __name__ == "__main__":
