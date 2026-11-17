@@ -2590,7 +2590,19 @@ string is compared. Two labels that meet are a compile error.
 to `w` columns on the left, and `x:w:d` prints a real with exactly `d`
 decimals: `WriteLn(i:5, ' ', x:10:3, ' ', s:8)`; `w` and `d` are any
 integer expressions, `x:0:0` rounds to a whole number. `ReadLn(s)` reads a
-line into a string. `Inc(v)`, `Inc(v, n)`, `Dec(v)`, `Dec(v, n)` count;
+line of standard input into a string, without its line feed, and
+`ReadLn(s, fed)` sets the Boolean `fed` to whether a line feed ended it,
+False for a last line that had none. `Eof`, also written `Eof(Input)`
+or `Eof()`, is True when standard input has nothing left (1.3.13,
+P665): ReadLn gives `''` for an empty line and at the end alike, and
+Eof tells them apart. It waits for the next octet or the end, as Free
+Pascal's `Eof` does on a pipe or a terminal, parking its routine as
+ReadLn does, and what it saw is the next ReadLn's. A copy that gives
+back exactly what it read, empty lines and a missing last line feed
+included, is `while not Eof do begin ReadLn(s, fed); if fed then
+WriteLn(s) else Write(s); end` (`testdata/eofcopy`). `Eof` is not a
+reserved word: a variable, a parameter, a field or a routine called
+Eof is what the name means where it is declared. `Inc(v)`, `Inc(v, n)`, `Dec(v)`, `Dec(v, n)` count;
 on a real they add or take away the step, `1.0` unless one is given.
 On `Currency` they use checked decimal arithmetic (§18). Their destination
 is bound once as for compound assignment, including a calling index.
@@ -8450,7 +8462,7 @@ routines are there for the compiler, and a program may call them too:
 | `pasroutines` | `PasWaitGroupAdd(w, n)`, `PasWaitGroupDone(w)`, `PasWaitGroupWait(w)` | those of a `waitgroup` (`TPasWaitGroup`) |
 | `pasroutines` | `PasCondWait(c, m)`, `PasCondSignal(c)`, `PasCondBroadcast(c)` | those of a `cond` (`TPasCond`) |
 | `pasroutines` | `PasOnceBegin(o): Boolean`, `PasOnceEnd(o)`, `PasOnceDone(o): Boolean` | `once o do stmt` is `if PasOnceBegin(o) then` the statement, then `PasOnceEnd(o)`; `PasOnceDone` is `o.Done` (`TPasOnce`) |
-| `pasroutines` | `PasReadLn(Dest: Pointer)` | `ReadLn(s)`: one line of standard input into the string at `Dest` |
+| `pasroutines` | `PasReadLn(Dest: Pointer)`, `PasReadLnFed(line, fed)`, `PasEof: Boolean` | `ReadLn(s)`: one line of standard input into the string at `Dest`; `ReadLn(s, fed)`; `Eof` |
 | `pasroutines` | `PasIoRetry(answer, fd, ev, deadline): Boolean`, `PasIoDeadline(ms)`, `PasIoRead(fd, buf, n, deadline)`, `PasIoWrite(fd, buf, n, deadline)` | the one loop of I/O that parks: whether to make a system call again after its answer (EINTR at once, EAGAIN after parking until `fd` is ready or the deadline passes), a deadline `ms` from now, one read and one write through it |
 | `pasroutines` | `PasNetRead(fd, max, dest)`, `PasNetWrite(fd, p, n)` | `NetRead(fd, max, s)` and `NetWrite(fd, s)` |
 | `pasfmt` | `PasFmtReal(x, w, d): string` | `x:w:d` as text, `d` decimals padded to `w` columns; a `d` below 0 is `WriteLn`'s own form, up to six decimals |
@@ -9447,9 +9459,10 @@ begin
   pas Down(c);
   while True do
   begin
-    ReadLn(line);
-    if line = '' then             { an empty line, or the end of the input }
-      line := 'quit';
+    if Eof then                   { the end of the input, never an empty line }
+      line := 'quit'
+    else
+      ReadLn(line);
     if TcpWrite(c, line + #10) < 0 then
       Break;
     if line = 'quit' then
@@ -11376,9 +11389,10 @@ begin
   pas Down(c);
   while True do
   begin
-    ReadLn(line);
-    if line = '' then             { an empty line, or the end of the input }
-      line := 'quit';
+    if Eof then                   { the end of the input, never an empty line }
+      line := 'quit'
+    else
+      ReadLn(line);
     if TcpWrite(c, line + #10) < 0 then
       Break;
     if line = 'quit' then
@@ -15831,7 +15845,7 @@ its place:
   PWord PUInt16 PInt16 PSmallInt PDWord PLongWord PUInt32 PInt32
   PInteger PInt64 PSingle PDouble PQuad PBoolean PPointer`;
 - what the core units export (§16), predefined in every program and
-  unit: `Goid NumGoroutine Yield PasReadLn PasIoRetry PasIoDeadline
+  unit: `Goid NumGoroutine Yield PasReadLn PasReadLnFed PasEof PasIoRetry PasIoDeadline
   PasIoRead PasIoWrite PasNetRead PasNetWrite`, the sync types `TPasMutex
   TPasRWMutex TPasWaitGroup TPasCond TPasOnce` with their `PasMutexLock`
   … `PasOnceDone` routines, pasfmt's `PasFmtReal` … `PasFmtQuad`,

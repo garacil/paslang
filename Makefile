@@ -824,8 +824,8 @@ GOLDEN_A64 += libfault
 GOLDEN += wgagain
 GOLDEN_A64 += wgagain
 # P583: the failures of a channel as exceptions.
-GOLDEN += chanfault chanshut chanoff
-GOLDEN_A64 += chanfault chanshut chanoff
+GOLDEN += chanfault chanshut chanoff eofname
+GOLDEN_A64 += chanfault chanshut chanoff eofname
 # P573: a server stops whatever became of its sockets.
 GOLDEN += httpstop
 GOLDEN_A64 += httpstop
@@ -1559,6 +1559,11 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/spurwake.out $(BUILDDIR)/spurwake.got; \
 	(sleep 0.2; printf 'x\n'; head -c 100000 /dev/zero | tr '\0' y) | timeout 20 python3 scripts/nonblocking.py $(BUILDDIR)/spurwake > $(BUILDDIR)/spurwake.got; \
 	diff -u testdata/spurwake.out $(BUILDDIR)/spurwake.got; \
+	: P665 Eof tells the end of standard input from an empty line and ReadLn with a second argument says whether a line feed ended the line: eofcopy gives back eight inputs byte for byte, empty lines, a last line without a line feed, an empty input, a megabyte of lines with and without the last line feed, from a file, a pipe and a nonblocking pipe, with each spelling of Eof, and eofpark waits in Eof while another routine runs; \
+	mkdir -p $(BUILDDIR)/p665; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/p665/eofcopy testdata/eofcopy.paslang; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/p665/eofpark testdata/eofpark.paslang; \
+	sh scripts/eofinputs.sh $(BUILDDIR)/p665 "" ""; \
 	echo ok stdin; \
 	echo "==== collector ===="; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/gcoff testdata/gcoff.paslang; \
@@ -6563,6 +6568,10 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	diff -u testdata/spurwake.out $(BUILDDIR)/spurwake-arm.got; \
 	(sleep 0.5; printf 'x\n'; head -c 100000 /dev/zero | tr '\0' y) | timeout 60 python3 scripts/nonblocking.py $(QEMU_A64) $(BUILDDIR)/spurwake-arm > $(BUILDDIR)/spurwake-arm.got; \
 	diff -u testdata/spurwake.out $(BUILDDIR)/spurwake-arm.got; \
+	mkdir -p $(BUILDDIR)/p665; \
+	$(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/p665/eofcopy-arm testdata/eofcopy.paslang; \
+	$(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/p665/eofpark-arm testdata/eofpark.paslang; \
+	sh scripts/eofinputs.sh $(BUILDDIR)/p665 $(QEMU_A64) -arm; \
 	echo ok stdin-arm; \
 	echo "==== collector arm64 ===="; \
 	$(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/gcoff-arm testdata/gcoff.paslang; \
