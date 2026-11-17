@@ -824,8 +824,8 @@ GOLDEN_A64 += libfault
 GOLDEN += wgagain
 GOLDEN_A64 += wgagain
 # P583: the failures of a channel as exceptions.
-GOLDEN += chanfault chanshut chanoff eofname hexchar openarr bgroutine bgfirst jsoncanonrange
-GOLDEN_A64 += chanfault chanshut chanoff eofname hexchar openarr bgroutine bgfirst jsoncanonrange
+GOLDEN += chanfault chanshut chanoff eofname hexchar openarr bgroutine bgfirst jsoncanonrange sqlcols
+GOLDEN_A64 += chanfault chanshut chanoff eofname hexchar openarr bgroutine bgfirst jsoncanonrange sqlcols
 # P573: a server stops whatever became of its sockets.
 GOLDEN += httpstop
 GOLDEN_A64 += httpstop
@@ -5893,6 +5893,12 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	python3 scripts/check_examples.py; \
 	: every limit and default the help and the manual both state is the same in both, P646; \
 	python3 -I scripts/check_helpdoc.py $(OUTDIR)/paslangc docs/MANUAL.md; \
+	: a value of sqlite reads as the C interface converts it, which the sqlite3 program gives with CAST, P622; \
+	if command -v sqlite3 > /dev/null 2>&1; then \
+	  $(OUTDIR)/paslangc -o $(BUILDDIR)/sqlcols testdata/sqlcols.paslang; \
+	  $(BUILDDIR)/sqlcols > $(BUILDDIR)/sqlcols.got; \
+	  python3 -I scripts/check_sqlcasts.py $(BUILDDIR)/sqlcols.got; \
+	fi; \
 	for t in httpd dnsd termd ftpd ntpd wsd chat proxy jsonrpc apisrv; do \
 	  $(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/ex_$$t examples/$$t.paslang; \
 	  timeout 120 $(BUILDDIR)/ex_$$t -selftest 2000 > $(BUILDDIR)/ex_$$t.got; \

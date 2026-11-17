@@ -601,6 +601,20 @@ type
   end;
   TSqliteValues = array of TSqliteValue;
 
+  { A value as the C interface reads it (P622): IsNull is
+    sqlite3_column_type's SQLITE_NULL, AsText, AsInteger and AsReal are
+    sqlite3_column_text, _int64 and _double with SQLite's own conversions:
+    a number made text as the sqlite3 program writes it, a text or a blob
+    read as a number by its longest prefix that is one ('0123' is 123,
+    'abc' 0), a real made an integer toward zero within Int64, NULL ''
+    and 0. The fields I, R and S hold only the value of its Kind. }
+  TSqliteValueHelper = record helper for TSqliteValue
+    function IsNull: Boolean;
+    function AsText: string;
+    function AsInteger: Int64;
+    function AsReal: Double;
+  end;
+
   { A row of sqlite_schema: 'table', 'index', 'view' or 'trigger', its
     name, its table's, its root page (0 for a view or a trigger) and the
     SQL that made it (empty for an index a constraint made). }
@@ -833,18 +847,33 @@ type
     FVals: TSqliteValues;
     FRowId: Int64;
     FStarted, FOpen, FIndex, FQuery, FOwnTxn: Boolean;
+    { a query's columns as its preparation gives them (P622), kept past
+      its last row and its Finish }
+    FNames, FDecls: TSqlite3StrArray;
   public
     function Next: Boolean;
     procedure Finish;
     function RowId: Int64;
+    { a query's columns from its preparation on, with rows or without,
+      during them and after the last one or Finish (P622); a table's
+      or an index's rows (Rows, RowsAt) have the current record's }
     function ColumnCount: Integer;
-    function Column(I: Integer): TSqliteValue;
+    function Column(I: Integer): TSqliteValue; overload;
+    { the value of the column called Name, as ColumnIndex finds it }
+    function Column(const Name: string): TSqliteValue; overload;
     function Values: TSqliteValues;
     { the rows are an index b-tree's keys: an index's or a WITHOUT ROWID
       table's, with no rowid }
     function IsIndex: Boolean;
-    { a query's column names }
+    { a query's column names, sqlite3_column_name's, '' past the last }
     function ColumnName(I: Integer): string;
+    { the column called Name, compared as SQLite compares names (ASCII
+      letters in either case), the first of that name; ESqliteError
+      SQLITE_RANGE for a name the query does not have (P622) }
+    function ColumnIndex(const Name: string): Integer;
+    { the type the column of a table was declared with,
+      sqlite3_column_decltype's, '' for an expression }
+    function ColumnDeclType(I: Integer): string;
   end;
 
   { A connection to a database file, or to one in memory (':memory:',
@@ -105774,6 +105803,7 @@ end;
 function TSqlite.Query(const Sql: string; const Args: array of const): TSqliteRows;
 var
   st: TSqlite3Stmt;
+  i: Integer;
 begin
   Live;
   Check(sqlite3_prepare_v2(FDb, Sql, st));
@@ -105784,6 +105814,18 @@ begin
   Result.FStmt := st;
   Result.FQuery := True;
   Result.FOpen := st <> nil;
+  { the columns as the preparation gives them, which the rows keep past
+    their end, when the statement is gone (P622) }
+  if st <> nil then
+  begin
+    SetLength(Result.FNames, sqlite3_column_count(st));
+    SetLength(Result.FDecls, Length(Result.FNames));
+    for i := 0 to High(Result.FNames) do
+    begin
+      Result.FNames[i] := sqlite3_column_name(st, i);
+      Result.FDecls[i] := sqlite3_column_decltype(st, i);
+    end;
+  end;
 end;
 
 function TSqlite.QueryValue(const Sql: string; const Args: array of const): TSqliteValue;
@@ -106054,7 +106096,10 @@ end;
 
 function TSqliteRows.ColumnCount: Integer;
 begin
-  Result := Length(FVals);
+  if FQuery then
+    Result := Length(FNames)
+  else
+    Result := Length(FVals);
 end;
 
 function TSqliteRows.Column(I: Integer): TSqliteValue;
@@ -106082,10 +106127,87 @@ end;
 
 function TSqliteRows.ColumnName(I: Integer): string;
 begin
-  if FQuery and (FStmt <> nil) then
-    Result := sqlite3_column_name(FStmt, I)
+  if FQuery and (I >= 0) and (I < Length(FNames)) then
+    Result := FNames[I]
   else
     Result := '';
+end;
+
+function TSqliteRows.ColumnIndex(const Name: string): Integer;
+var
+  i: Integer;
+begin
+  if FQuery then
+    for i := 0 to High(FNames) do
+      if SqlStrIEq(FNames[i], Name) then
+        Exit(i);
+  raise ESqliteError.Create(SQLITE_RANGE, 'no column named ' + Name + ' in the result');
+end;
+
+function TSqliteRows.Column(const Name: string): TSqliteValue;
+begin
+  Result := Column(ColumnIndex(Name));
+end;
+
+function TSqliteRows.ColumnDeclType(I: Integer): string;
+begin
+  if FQuery and (I >= 0) and (I < Length(FDecls)) then
+    Result := FDecls[I]
+  else
+    Result := '';
+end;
+
+{ The value in a Mem of its own, for the engine's conversions: those of
+  sqlite3_value_text, _int64 and _double (P622) }
+procedure SqlMemOfValue(const V: TSqliteValue; var M: TSqlMem);
+begin
+  case V.Kind of
+    SQLITE_INTEGER:
+      SqlMemSetInt(M, V.I);
+    SQLITE_FLOAT:
+      SqlMemSetReal(M, V.R);
+    SQLITE_TEXT:
+      SqlMemSetText(M, V.S);
+    SQLITE_BLOB:
+      SqlMemSetBlob(M, V.S);
+  else
+    SqlMemSetNull(M);
+  end;
+end;
+
+function TSqliteValueHelper.IsNull: Boolean;
+begin
+  Result := Self.Kind = SQLITE_NULL;
+end;
+
+{ sqlite3_column_text's: a real with the connection's default of 17
+  digits, as a value of no statement takes (SqlRegDigits) }
+function TSqliteValueHelper.AsText: string;
+var
+  m: TSqlMem;
+begin
+  m := Default(TSqlMem);
+  SqlMemOfValue(Self, m);
+  if not SqlValueTextEnc(m, SQLITE_UTF8, Result, 17) then
+    Result := '';
+end;
+
+function TSqliteValueHelper.AsInteger: Int64;
+var
+  m: TSqlMem;
+begin
+  m := Default(TSqlMem);
+  SqlMemOfValue(Self, m);
+  Result := SqlMemInt(m);
+end;
+
+function TSqliteValueHelper.AsReal: Double;
+var
+  m: TSqlMem;
+begin
+  m := Default(TSqlMem);
+  SqlMemOfValue(Self, m);
+  Result := SqlMemReal(m);
 end;
 
 { ---- the rest of the C interface: complete.c, table.c, vdbeblob.c,

@@ -104,8 +104,17 @@ Four things in it are the rules of the unit.
   `SqliteBlob(bytes)` is a blob (section 2).
 - **`Query` gives a `TSqliteRows`.** `Next` moves to the next row and says whether
   there was one; `Column(i)` is the value as a `TSqliteValue` (its `Kind`, and
-  `I`, `R` or `S`), `ColumnCount` and `ColumnName(i)` describe the row, and
-  `Values` is the whole row. A query lasts until its last row has been read or
+  `I`, `R` or `S`), and `Values` is the whole row. `ColumnCount`, `ColumnName(i)`
+  and `ColumnDeclType(i)` describe the columns from the query's preparation on,
+  with rows or without and after the last one (1.3.19, P622; they were 0 and empty
+  before the first row and after the last), so the head of a result is there even
+  when it has no row. `ColumnIndex(name)` and `Column(name)` find a column by its
+  name as SQLite compares names, and a name the query does not have is an
+  `ESqliteError` (`SQLITE_RANGE`). A value reads as the C interface converts it:
+  `v.AsText`, `v.AsInteger`, `v.AsReal` and `v.IsNull` are `sqlite3_column_text`,
+  `_int64`, `_double` and `_type`'s NULL, with SQLite's conversions (`'0123'` is
+  123, `'abc'` 0, 4.5 the text `4.5`, a NULL `''` and 0), where the field of
+  another kind (`v.S` of an integer) is empty. A query lasts until its last row has been read or
   `Finish` is called; a connection that is closed with a query open does not
   complain. `QueryValue(sql, args)` is the first column of the first row, and a
   NULL when there is no row.
@@ -115,6 +124,31 @@ Four things in it are the rules of the unit.
   of a code, and the codes and flags of `sqlite3.h` are all there under their own
   names (`SQLITE_CONSTRAINT_UNIQUE`, `SQLITE_OPEN_READONLY`, ...). A statement
   that fails changes nothing: the unique violation above leaves the three rows.
+
+A routine that writes any query as a table, with its head when it has no row
+(`testdata/sqlcols` runs it):
+
+```pascal
+procedure Table(Db: TSqlite; const Sql: string);
+var
+  r: TSqliteRows;
+  i: Integer;
+  s: string;
+begin
+  r := Db.Query(Sql);
+  s := '';
+  for i := 0 to r.ColumnCount - 1 do
+    s := s + r.ColumnName(i) + #9;
+  WriteLn(s);
+  while r.Next do
+  begin
+    s := '';
+    for i := 0 to r.ColumnCount - 1 do
+      s := s + r.Column(i).AsText + #9;
+    WriteLn(s);
+  end;
+end;
+```
 
 `TSqlite.Open(path, flags)` takes `sqlite3_open_v2`'s flags. `SQLITE_OPEN_READONLY`
 opens a file that must be there and refuses to write it; `SQLITE_OPEN_URI` makes the

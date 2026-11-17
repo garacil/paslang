@@ -13679,7 +13679,11 @@ gives the rows changed. `Query(sql, [args])` gives the rows of a query,
 a `TSqliteRows` walked with `Next`, each row's `Column(i)` a
 `TSqliteValue` (its `Kind` `SQLITE_INTEGER`, `SQLITE_FLOAT`,
 `SQLITE_TEXT`, `SQLITE_BLOB` or `SQLITE_NULL`, its value in `I`, `R` or
-`S`) and `ColumnName(i)` its name; `QueryValue(sql, [args])` the first
+`S`) and `ColumnName(i)` its name, from the query's preparation on and
+after its last row (1.3.19); `ColumnIndex(name)`, `Column(name)` and
+`ColumnDeclType(i)`; a value's `AsText`, `AsInteger`, `AsReal` and
+`IsNull` read it with SQLite's own conversions, as `sqlite3_column_text`,
+`_int64` and `_double` do (P622); `QueryValue(sql, [args])` the first
 column of the first row. `LastInsertRowId` and `Changes` are
 `sqlite3_last_insert_rowid` and `sqlite3_changes64`. An error raises
 `ESqliteError` with SQLite's extended code (`ExtendedCode`), its primary

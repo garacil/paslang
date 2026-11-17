@@ -1,0 +1,182 @@
+{ P622: a query's columns from its preparation, a value read as SQLite's
+  C interface converts it, a column by its name. ColumnCount was 0 until
+  the first Next and again after the last, and an empty result had no
+  names, so a routine could not write the head of a table or a JSON of
+  any query; a value read through the field of another kind gave 0 or ''
+  without a word. The conversions printed here are those the sqlite3
+  program gives the same values with CAST, which
+  scripts/check_sqlcasts.py compares in make check where the program
+  is installed (a NULL reads as '' and 0, as sqlite3_column_text and
+  _int64 give it, where CAST gives NULL). }
+program sqlcols;
+
+uses
+  sqlite, sysutils;
+
+var
+  db: TSqlite;
+  rows: TSqliteRows;
+  i, n: Integer;
+  line: string;
+  done: waitgroup;
+  mu: mutex;
+  agreed: Integer;
+
+function Head(R: TSqliteRows): string;
+var
+  i: Integer;
+begin
+  Result := IntToStr(R.ColumnCount) + ' [';
+  for i := 0 to R.ColumnCount - 1 do
+  begin
+    if i > 0 then
+      Result := Result + ',';
+    Result := Result + R.ColumnName(i);
+  end;
+  Result := Result + ']';
+end;
+
+{ a query written as a table with its head, which an empty result has
+  too: the routine the guide shows }
+procedure Table(Db: TSqlite; const Sql: string);
+var
+  r: TSqliteRows;
+  i: Integer;
+  s: string;
+begin
+  r := Db.Query(Sql);
+  s := '';
+  for i := 0 to r.ColumnCount - 1 do
+    s := s + r.ColumnName(i) + #9;
+  WriteLn('  ', s);
+  while r.Next do
+  begin
+    s := '';
+    for i := 0 to r.ColumnCount - 1 do
+      s := s + r.Column(i).AsText + #9;
+    WriteLn('  ', s);
+  end;
+  WriteLn('  (', r.ColumnCount, ' columns after the last row)');
+end;
+
+function RealText(D: Double): string;
+var
+  v: TSqliteValue;
+begin
+  v := Default(TSqliteValue);
+  v.Kind := SQLITE_FLOAT;
+  v.R := D;
+  Result := v.AsText;
+end;
+
+{ each routine its own connection, the same queries }
+procedure Again(Id: Integer);
+var
+  d: TSqlite;
+  r: TSqliteRows;
+  ok: Boolean;
+begin
+  d := TSqlite.Open(':memory:');
+  d.Exec('CREATE TABLE t(a INTEGER, b TEXT)');
+  d.Exec('INSERT INTO t VALUES (?, ?)', [Id, '0' + IntToStr(Id)]);
+  r := d.Query('SELECT a, b FROM t WHERE 0');
+  ok := (r.ColumnCount = 2) and (r.ColumnName(1) = 'b') and not r.Next and (r.ColumnCount = 2);
+  r := d.Query('SELECT b AS B FROM t');
+  ok := ok and r.Next and (r.Column('b').AsInteger = Id) and (r.Column('B').AsText = '0' + IntToStr(Id));
+  r.Finish;
+  d.Disconnect;
+  lock mu do
+    if ok then
+      Inc(agreed);
+  done.Done;
+end;
+
+begin
+  db := TSqlite.Open(':memory:');
+
+  WriteLn('the columns from the preparation on:');
+  rows := db.Query('SELECT 1 AS a, 2 AS b');
+  line := Head(rows);
+  rows.Next;
+  line := line + ', ' + Head(rows);
+  rows.Next;
+  line := line + ', after the last ' + Head(rows);
+  rows.Finish;
+  WriteLn('  ', line, ', after Finish ', Head(rows));
+  rows := db.Query('SELECT 1 AS a WHERE 0');
+  line := Head(rows);
+  WriteLn('  an empty result: ', line, ', a row: ', rows.Next, ', then ', Head(rows));
+
+  WriteLn('a column by its name:');
+  rows := db.Query('SELECT 7 AS Total, ''x'' AS name, 3 AS total');
+  rows.Next;
+  WriteLn('  ColumnIndex(''TOTAL'') ', rows.ColumnIndex('TOTAL'), ', the first of the name; Column(''Name'') ',
+    rows.Column('Name').AsText);
+  try
+    rows.Column('missing');
+    WriteLn('  wrong: a missing name read');
+  except
+    on e: ESqliteError do
+      WriteLn('  a missing name: ', e.ClassName, ' ', e.Code, ': ', e.Message);
+  end;
+  rows.Finish;
+
+  WriteLn('the declared types:');
+  db.Exec('CREATE TABLE d(i INTEGER, r REAL, s TEXT, b BLOB, n, v VARCHAR(20))');
+  rows := db.Query('SELECT i, r, s, b, n, v, i + 1 AS e FROM d');
+  line := '';
+  for i := 0 to rows.ColumnCount - 1 do
+    line := line + rows.ColumnName(i) + '=' + rows.ColumnDeclType(i) + ' ';
+  WriteLn('  ', line);
+  rows.Finish;
+
+  WriteLn('the conversions of the C interface (text | integer | real):');
+  db.Exec('CREATE TABLE v(x)');
+  db.Exec('INSERT INTO v VALUES (42),(4.5),(-0.0),(1e100),(0.1),(''0123''),(''12abc''),(''abc''),(''1e3''),' +
+    '('' 42 ''),(x''313233''),(NULL),(9.9e18),(-9.9e18),(''9223372036854775808''),(1.0),' +
+    '(123456789012345678),(2.5e-7)');
+  rows := db.Query('SELECT x, typeof(x) FROM v');
+  n := 0;
+  while rows.Next do
+  begin
+    Inc(n);
+    WriteLn('  ', rows.Column(1).S, ' ', rows.Column(0).IsNull, ': ', rows.Column(0).AsText, ' | ',
+      rows.Column(0).AsInteger, ' | ', RealText(rows.Column(0).AsReal));
+  end;
+  WriteLn('  ', n, ' values');
+
+  WriteLn('past the columns, and a table''s rows:');
+  rows := db.Query('SELECT 1 AS a');
+  rows.Next;
+  WriteLn('  Column(-1) ', rows.Column(-1).Kind, ' ', rows.Column(-1).I, ' ', RealText(rows.Column(-1).R), ' [',
+    rows.Column(-1).S, '], Column(1) ', rows.Column(1).Kind, ' ', rows.Column(1).I, ' ', RealText(rows.Column(1).R),
+    ', ColumnName(-1) [', rows.ColumnName(-1), '] (1) [', rows.ColumnName(1), '], ColumnDeclType(-1) [',
+    rows.ColumnDeclType(-1), '] (1) [', rows.ColumnDeclType(1), ']');
+  rows.Finish;
+  db.Exec('CREATE TABLE w(a, b, c)');
+  db.Exec('INSERT INTO w VALUES (1, ''x'', 2.5)');
+  rows := db.Rows('w');
+  WriteLn('  a table''s record: ', rows.Next, ', ', rows.ColumnCount, ' columns, name [', rows.ColumnName(0),
+    '], declared [', rows.ColumnDeclType(0), '], ', rows.Column(1).AsText);
+  rows.Finish;
+
+  WriteLn('a query as a table, with rows and without:');
+  db.Exec('CREATE TABLE p(id INTEGER, name TEXT)');
+  db.Exec('INSERT INTO p VALUES (1, ''ann''), (2, NULL)');
+  Table(db, 'SELECT id, name FROM p');
+  Table(db, 'SELECT id, name FROM p WHERE id > 5');
+
+  agreed := 0;
+  done.Add(8);
+  for i := 1 to 8 do
+    pas Again(i);
+  done.Wait;
+  WriteLn('eight routines, each its own connection: ', agreed, ' agreed');
+  db.Disconnect;
+end.
+
+{ This file is part of paslang's tests.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+  paslang is free software under the GNU General Public License,
+  version 3 or (at your option) any later version; see the file
+  COPYING. It comes with ABSOLUTELY NO WARRANTY. }
