@@ -6301,7 +6301,11 @@ and the control characters, `\b`, `\f`, `\n`, `\r`, `\t` where they have one and
 `\u00xx` the others. A number is written as its text, but in the
 canonical form as ECMAScript writes its `Double` (RFC 8785 3.2.2.3), as
 Go's `jsonwire` does: an integer of fewer than 16 digits as it is, `-0`
-as `0`, one past the largest `Double` as the largest; the names of an
+as `0`; one past the largest `Double` (`1e400`) is an `EJsonError` of
+kind `jeRange` (1.3.18, P646), since its `Double` is an infinity, which
+RFC 8785 says must end the canonicalization with an error (Go saturates
+it at the largest, and so did paslang before, which signed two texts as
+one; `testdata/jsoncanonrange`); the names of an
 object in the order of their UTF-16 code units (3.2.3). The examples of
 RFC 8785, its sample, its names and Appendix B's numbers, are
 `testdata/jsoncanon`.

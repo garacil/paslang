@@ -824,8 +824,8 @@ GOLDEN_A64 += libfault
 GOLDEN += wgagain
 GOLDEN_A64 += wgagain
 # P583: the failures of a channel as exceptions.
-GOLDEN += chanfault chanshut chanoff eofname hexchar openarr bgroutine bgfirst
-GOLDEN_A64 += chanfault chanshut chanoff eofname hexchar openarr bgroutine bgfirst
+GOLDEN += chanfault chanshut chanoff eofname hexchar openarr bgroutine bgfirst jsoncanonrange
+GOLDEN_A64 += chanfault chanshut chanoff eofname hexchar openarr bgroutine bgfirst jsoncanonrange
 # P573: a server stops whatever became of its sockets.
 GOLDEN += httpstop
 GOLDEN_A64 += httpstop
@@ -5891,6 +5891,8 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  diff -u examples/$$t.out $(BUILDDIR)/ex_$$t.got; \
 	done; \
 	python3 scripts/check_examples.py; \
+	: every limit and default the help and the manual both state is the same in both, P646; \
+	python3 -I scripts/check_helpdoc.py $(OUTDIR)/paslangc docs/MANUAL.md; \
 	for t in httpd dnsd termd ftpd ntpd wsd chat proxy jsonrpc apisrv; do \
 	  $(OUTDIR)/paslangc -Fu $(BUILDDIR) -o $(BUILDDIR)/ex_$$t examples/$$t.paslang; \
 	  timeout 120 $(BUILDDIR)/ex_$$t -selftest 2000 > $(BUILDDIR)/ex_$$t.got; \
