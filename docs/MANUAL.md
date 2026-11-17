@@ -3841,6 +3841,14 @@ box
 25
 ```
 
+A type made from its shape, `array of T`, a static array, a map, a
+channel, a pointer, a set or a routine type, is one type in every unit:
+`array of Integer` written in two units, or a unit's alias of it, is the
+same type, whatever aliases the units use (1.3.4, P619: an override in
+another unit with such a parameter took no slot when the base class's
+unit used a unit of aliases). A message calls it by its shape unless an
+alias of the compilation's own names it.
+
 An implicit class value conversion accepts `nil`, the same class (including
 an alias), or a descendant where an ancestor is required. This applies to
 assignments, fields, collection elements, value and `const` arguments,

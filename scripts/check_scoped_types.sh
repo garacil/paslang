@@ -2,7 +2,8 @@
 # This file is part of paslang.
 # Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
 # GPL version 3 or later; see COPYING. No warranty.
-# P169/P176/P177: scopes, generic identities and exported aliases.
+# P169/P176/P177: scopes, generic identities and exported aliases; P619: an
+# anonymous shape is one type in every unit, whatever aliases a unit used.
 set -eu
 
 compiler=$1
@@ -30,13 +31,14 @@ for target in amd64 arm64; do
     if test "$target" = arm64; then core_dir="$build_dir/a64"; fi
     mkdir -p "$work_dir"
     for level in 0 40; do
-        for unit in nestedu nestedwrap nestedgu genericu generica genericb genericwrap aliasu aliaswrap; do
+        for unit in nestedu nestedwrap nestedgu genericu generica genericb genericwrap aliasu aliaswrap \
+            shapealias shapebase shapederived shapevbase shapevderived; do
             "$compiler" -target "$target" -inline "$level" -c \
                 -Fu "$work_dir" -Fu "$core_dir" -o "$work_dir/$unit.o" \
                 "testdata/units/$unit.paslang"
         done
         for source in nestednames nestedmore nestedgeneric genericlocal gen \
-            units/nesteduse units/nestedguse units/genericprobe units/genericuse units/aliasuse; do
+            units/nesteduse units/nestedguse units/genericprobe units/genericuse units/aliasuse units/shapeuse; do
             name=${source##*/}
             binary="$work_dir/$name-$level"
             "$compiler" -target "$target" -inline "$level" -Fu "$work_dir" \
