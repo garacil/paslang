@@ -3498,7 +3498,9 @@ slice of the block keeps what it saw (`t` above), where Go's `append`
 would have written over its `t[3]`. The elements are evaluated first, in
 order, and stored as `:=` stores them (a string is shared, a record
 copied); `Append`'s result is a value like any other, for an argument
-or an element too.
+or an element too. `Append(s, x);` alone is refused, as Go refuses
+`append(s, x)` alone: it would leave `s` as it was (1.3.6, P655); so are
+`Cap`, `Copy`, `Length` and `Default` used as statements.
 
 `examples/slices.paslang` shows what a slice shares and what it does
 not:

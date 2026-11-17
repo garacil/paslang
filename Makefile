@@ -3551,6 +3551,16 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q -F 'syntax error at 11:3 [end] in testdata/stmtbad/repeatend.paslang' $(BUILDDIR)/stmtbad_repeatend.err; \
 	grep -q -F 'syntax error at 17:3 [else] in testdata/stmtbad/unitelse.paslang' $(BUILDDIR)/stmtbad_unitelse.err; \
 	grep -q -F 'syntax error at 17:3 [until] in testdata/stmtbad/unituntil.paslang' $(BUILDDIR)/stmtbad_unituntil.err; \
+	: P655: a builtin that only gives a value is refused as a statement, Append with its correction; \
+	for n in appendstmt capstmt copystmt copystrstmt; do \
+		if ( ulimit -v 1048576; timeout 20 $(OUTDIR)/paslangc -o $(BUILDDIR)/stmtbad_$$n testdata/stmtbad/$$n.paslang ) >$(BUILDDIR)/stmtbad_$$n.err 2>&1; then \
+			echo "$$n should fail"; exit 1; \
+		fi; \
+	done; \
+	grep -q -F 'the value of Append is not used: it gives the longer slice back, write s := Append(s, ...) at 6:3 in testdata/stmtbad/appendstmt.paslang' $(BUILDDIR)/stmtbad_appendstmt.err; \
+	grep -q -F 'the value of Cap is not used: as a statement it does nothing at 7:3 in testdata/stmtbad/capstmt.paslang' $(BUILDDIR)/stmtbad_capstmt.err; \
+	grep -q -F 'the value of Copy is not used: as a statement it does nothing at 7:3 in testdata/stmtbad/copystmt.paslang' $(BUILDDIR)/stmtbad_copystmt.err; \
+	grep -q -F 'the value of Copy is not used: as a statement it does nothing at 7:3 in testdata/stmtbad/copystrstmt.paslang' $(BUILDDIR)/stmtbad_copystrstmt.err; \
 	echo ok stmtbad
 	@set -e; \
 	: P560: SdNotify and SdWatchdogUsec read NOTIFY_SOCKET and WATCHDOG_USEC and WATCHDOG_PID from the environment and testdata/sdnotify run four times with chosen values on both machines sends its datagram only to a socket it listens at and gives the watchdog time only for this process or for none named; \
