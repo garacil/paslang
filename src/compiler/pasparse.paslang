@@ -291,6 +291,8 @@ type
     function IfaceBind(E: PExpr; Want: LongInt): PExpr;
     function PtrName(const AName: string; out Id: LongInt): Boolean;
     function SliceOf(E, Lo, Hi: PExpr): PExpr;
+    function StaticToOpen(A, P: LongInt): Boolean;
+    function WholeSlice(E: PExpr): PExpr;
     procedure NotSafe(const What: string);
     procedure NotSafeAt(const What, At: string);
     function PtrStep(T: LongInt): Int64;
@@ -1219,6 +1221,14 @@ begin
   end;
   if ByRef then
     Exit;
+  { a static array where an open array of its element type goes is its
+    whole slice (P633), priced above every other conversion: a call that
+    found an overload before finds the same one }
+  if StaticToOpen(E^.Typ, T) then
+  begin
+    Result := 1000;
+    Exit;
+  end;
   if TypeOf(T).Kind = tykCurrency then
   begin
     if IntOperand(E) and not IsCharT(E^.Typ) then Result := 120
@@ -5207,8 +5217,15 @@ begin
       not ((E^.Kind = ekNil) and IsDynTyp(Want)) and
       not ((TypeOf(Want).Kind = tykString) and (TypeOf(Result^.Typ).Kind = tykString)) and
       not SameTyp(Want, Result^.Typ) then
+    begin
+      { a static array where a slice of its element type goes: the slice
+        of it is the answer, not a view of its bytes (P633) }
+      if StaticToOpen(E^.Typ, Want) then
+        Refuse(TypName(E^.Typ) + ' does not go into ' + TypName(Want) + ': its slice a[' +
+          IntToStr(TypeOf(E^.Typ).Lo) + '..' + IntToStr(TypeOf(E^.Typ).Hi) + '] does' + PosOf(E));
       Refuse(TypName(E^.Typ) + ' does not go into ' + TypName(Want) + '; x as T sees its bytes' +
         PosOf(E));
+    end;
   end;
   k := TypeOf(E^.Typ).Kind;
   wantedKind := TypeOf(Want).Kind;
@@ -5886,11 +5903,15 @@ begin
         { A static array is not a slice (1.0.144): one given for a var
           array of T arrived as an empty slice, and a slice for a var
           static array as its three words. }
+        if (Args[i] <> nil) and (Args[i]^.Typ <> TyNone) and IsDynTyp(Typs[i]) and
+          (TypeOf(Args[i]^.Typ).Kind = tykArray) and (not IsDynTyp(Args[i]^.Typ)) then
+          Refuse(TypName(Args[i]^.Typ) + ' does not go into a var ' + TypName(Typs[i]) +
+            ' parameter: SetLength through it would have to change a static array; a const or value ' +
+            'parameter takes the array, and a slice variable, s := a[' + IntToStr(TypeOf(Args[i]^.Typ).Lo) + '..' +
+            IntToStr(TypeOf(Args[i]^.Typ).Hi) + '], goes to a var one' + PosOf(Args[i]));
         if (Args[i] <> nil) and (Args[i]^.Typ <> TyNone) and
-          ((IsDynTyp(Typs[i]) and (TypeOf(Args[i]^.Typ).Kind = tykArray) and
-          (not IsDynTyp(Args[i]^.Typ))) or
-          ((TypeOf(Typs[i]).Kind = tykArray) and (not IsDynTyp(Typs[i])) and
-          IsDynTyp(Args[i]^.Typ))) then
+          (TypeOf(Typs[i]).Kind = tykArray) and (not IsDynTyp(Typs[i])) and
+          IsDynTyp(Args[i]^.Typ) then
           Refuse(TypName(Args[i]^.Typ) + ' does not go into a var ' + TypName(Typs[i]) +
             ' parameter: a slice does' + PosOf(Args[i]));
         { P422: a var or out parameter takes a variable of its own type
@@ -5909,6 +5930,9 @@ begin
           the key was missing (1.0.140) }
         Args[i] := MapPutPlace(StrArg(Typs[i], Args[i]));
       end
+      else if (Args[i] <> nil) and StaticToOpen(Args[i]^.Typ, Typs[i]) then
+        { a static array for a const or value open array (P633) }
+        Args[i] := WholeSlice(Args[i])
       else
         Args[i] := ValArg(Typs[i], Args[i]);
     end;
@@ -11540,6 +11564,27 @@ begin
     Result := NewCall('rt_aslice', a, InternArray(st.Elem, 0, -1))
   else
     Refuse('a slice [i..j] of an array, a slice or a string' + HerePos);
+end;
+
+{ A static array A where a const or value open array P of its element
+  type goes (P633), as Pascal's open array parameter takes it: Delphi
+  and Free Pascal pass the whole array, Rust takes an array where a
+  slice is asked, Go writes a[:]. Not an array of const. }
+function TParser.StaticToOpen(A, P: LongInt): Boolean;
+begin
+  Result := (A > TyNone) and (P > TyNone) and IsDynTyp(P) and (not IsConstArr(P)) and
+    (TypeOf(A).Kind = tykArray) and (not IsDynTyp(A)) and SameTyp(TypeOf(A).Elem, TypeOf(P).Elem);
+end;
+
+{ E, a static array, as the slice of all of it, E[Low(E)..High(E)]: the
+  routine sees its elements from 0 to its length less one and may change
+  what it may through the written slice, the array's own elements }
+function TParser.WholeSlice(E: PExpr): PExpr;
+var
+  st: TTypeDef;
+begin
+  st := TypeOf(E^.Typ);
+  Result := SliceOf(E, NewInt(st.Lo), NewInt(st.Hi));
 end;
 
 { E.P, property I of E's class (moved out of ParsePostfix in 1.0.137,

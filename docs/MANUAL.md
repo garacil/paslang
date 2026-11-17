@@ -1567,7 +1567,9 @@ s := s xor '      ';             { flips the case of six letters }
 A record, a static array, a string and a slice go only where their own
 type goes: `i := r`, `s := r` and `r := r2` of another record are compile
 errors (they compiled, and moved words that did not belong). `x as T`
-(views, above) sees one as another.
+(views, above) sees one as another. The one exception is Pascal's open
+array parameter: a static array goes into a `const` or a value
+`array of T` parameter of its element type as its whole slice (§20).
 
 `examples/views.paslang`:
 
@@ -15578,10 +15580,17 @@ the commands on standard input, under `--debug-mode` and under
   strict and explicit, not mutable process-locale singleton objects.
   Boolean default text reads are pure; mutable compatibility tables and
   default settings are process-wide, not local to a pasroutine.
-- A static array does not go into an `array of T` parameter, `var`,
-  `const` or plain: pass `a[Low(a)..High(a)]`, a slice that shares its
-  elements. `var a: array of T` passes a slice by reference, so a
-  `SetLength` inside changes the caller's.
+- A static array goes into a `const` or a value `array of T` parameter
+  as Pascal's open array parameter takes it (1.3.16, P633; it was
+  refused before): the routine is given its whole slice,
+  `a[Low(a)..High(a)]`, which shares its elements, and sees them from 0
+  to its length less one whatever the array's index type; an element it
+  writes is the array's, as through the written slice, and a `SetLength`
+  gives it a block of its own. A call that found an overload before
+  finds the same one, since the slice is the dearest conversion. A
+  `var a: array of T` passes a slice by reference, so a `SetLength`
+  inside changes the caller's: a static array is refused there, and a
+  slice variable goes.
 - No default value on `var` or `out`, or in a record.
 - `cdecl` and `nostackframe` are skipped; `inline` after a routine's
   head puts it in place wherever it is called, whatever its size (§5;

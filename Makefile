@@ -824,8 +824,8 @@ GOLDEN_A64 += libfault
 GOLDEN += wgagain
 GOLDEN_A64 += wgagain
 # P583: the failures of a channel as exceptions.
-GOLDEN += chanfault chanshut chanoff eofname hexchar
-GOLDEN_A64 += chanfault chanshut chanoff eofname hexchar
+GOLDEN += chanfault chanshut chanoff eofname hexchar openarr
+GOLDEN_A64 += chanfault chanshut chanoff eofname hexchar openarr
 # P573: a server stops whatever became of its sockets.
 GOLDEN += httpstop
 GOLDEN_A64 += httpstop
@@ -2266,6 +2266,19 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'duplicate identifier Total (a variable of the name) at 5:11 in' $(BUILDDIR)/casedup_samecase.err; \
 	$(OUTDIR)/paslangc --lex testdata/hexchar.paslang | grep -q '\[#\$$e2\]'; \
 	echo ok cmtbad; \
+	: a static array goes into a const or value array of T parameter as its whole slice, and a var one refuses it with the reason, P633; \
+	for n in varstatic assignstatic; do \
+	  if $(OUTDIR)/paslangc -o $(BUILDDIR)/openbad_$$n testdata/openbad/$$n.paslang >$(BUILDDIR)/openbad_$$n.err 2>&1; then \
+	    echo "$$n should fail"; exit 1; \
+	  fi; \
+	done; \
+	grep -q 'array\[0..2\] of Integer does not go into array of Integer: its slice a\[0..2\] does at 8:8' $(BUILDDIR)/openbad_assignstatic.err; \
+	grep -q 'array\[0..2\] of Integer does not go into a var array of Integer parameter: SetLength through it would have to change a static array; a const or value parameter takes the array, and a slice variable, s := a\[0..2\], goes to a var one at 12:8' $(BUILDDIR)/openbad_varstatic.err; \
+	for o in 0 40; do \
+	  $(OUTDIR)/paslangc -inline $$o -o $(BUILDDIR)/openarr_$$o testdata/openarr.paslang; \
+	  $(BUILDDIR)/openarr_$$o | diff -u testdata/openarr.out -; \
+	done; \
+	echo ok openarr; \
 	echo "==== record operator rejects (P171) ===="; \
 	for n in nobody badname notbool norec twice bodytypes cast explicitonly; do \
 	  if $(OUTDIR)/paslangc -o $(BUILDDIR)/recopbad_$$n testdata/recopbad/$$n.paslang >$(BUILDDIR)/recopbad_$$n.err 2>&1; then \
