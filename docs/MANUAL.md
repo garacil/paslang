@@ -11821,6 +11821,25 @@ until not PasIoRetry(n, fd, 1, 0);       { parks until fd can be read }
 n := PasIoRead(fd, @buf, 512, PasIoDeadline(100));   { the same, or -110 after 100 ms }
 ```
 
+One routine may wait to read a descriptor while another waits to write
+it (1.3.1, P667): they are two waits, and each is woken by its own
+event, as Go's poller keeps a reader and a writer for a descriptor.
+It is the shape of a connection with a routine that reads and others
+that write, and of a proxy's two routines. Before, a descriptor had one
+registration in the epoll set: the second wait took the place of the
+first, and a reader stayed parked for ever once a writer's bytes did
+not fit the socket, unless its read had a deadline.
+`testdata/twowait` holds both orders,
+with deadlines and without, both ends reading and writing at once over
+a pair of sockets and over TCP, and descriptors closed and their
+numbers used again, on both machines. The waits for writing have an
+epoll set of their own, which is a member of the first, so a wait
+makes the same system call as before. Two routines that wait for the
+same direction of one descriptor are still one wait, and the last to
+park is the one woken: a descriptor read by several routines is given
+to them in turn, with a mutex, as Go's `internal/poll` does for its
+own.
+
 `uses paslib` gives files and processes: `ReadFile`, `WriteFile`,
 `FileExists`, `ListDir`, `GetEnv`, `Run(exe, args)`, `RunCapture`,
 `IntToStr`, `StrToInt64` and string helpers. `uses paslinux` gives the

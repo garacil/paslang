@@ -1,0 +1,367 @@
+{ P667: a routine parked in a read of a descriptor and another parked in
+  a write to the same descriptor are two waits, and each is woken by its
+  own event. Before, the poller kept one registration a descriptor: the
+  second wait took the place of the first, and a reader was deaf from
+  the moment a writer's octets did not fit the socket.
+
+  A wait that the runtime lost would park for ever, so a routine of the
+  test watches the time and ends the program with its reason. }
+program twowait;
+
+uses
+  sysutils, pasnet;
+
+const
+  Mega = 1048576;
+  { how long anything may take before the test says it is lost }
+  LostMs = 60000;
+
+type
+  { one end of a connection: a routine that reads and one that writes }
+  TEnd = class
+  public
+    Fd: Integer;
+    { what to write and what is expected to come: octets of a sequence
+      that starts at Seed }
+    ToWrite, ToRead, Seed, PeerSeed: Integer;
+    ReadDl, WriteDl: Integer;
+    Got, Wrote, ReadAns, WriteAns: Integer;
+    Bad: Boolean;
+    Fin: waitgroup;
+    procedure ReadAll;
+    procedure WriteAll;
+  end;
+
+var
+  good, bad: Integer;
+  finished: Boolean;
+  what: string;
+  mu: mutex;
+
+procedure Check(Holds: Boolean; const Words: string);
+begin
+  if Holds then
+    Inc(good)
+  else
+  begin
+    Inc(bad);
+    WriteLn('  wrong: ', Words);
+  end;
+end;
+
+procedure Group(const Name: string);
+begin
+  WriteLn(Name, ': ', good, ' of ', good + bad);
+  good := 0;
+  bad := 0;
+end;
+
+procedure Doing(const Words: string);
+begin
+  lock mu do
+    what := Words;
+end;
+
+{ the routine that watches: a wait the runtime lost never ends, and the
+  program must }
+procedure Watch;
+var
+  due: Integer;
+  over: Boolean;
+  w: string;
+begin
+  due := PasIoDeadline(LostMs);
+  repeat
+    Sleep(20);
+    lock mu do
+    begin
+      over := finished;
+      w := what;
+    end;
+  until over or (Nanotime > due);
+  if not over then
+  begin
+    WriteLn('  lost: a wait never ended in ', w);
+    Halt(2);
+  end;
+end;
+
+function Octet(Seed, I: Integer): Integer;
+begin
+  Result := (Seed + I * 7 + I div 251) and 255;
+end;
+
+{ ToRead octets of the peer's sequence, each looked at; with a deadline
+  when ReadDl says one }
+procedure TEnd.ReadAll;
+var
+  buf: string;
+  n, i, dl: Integer;
+begin
+  SetLength(buf, 65536);
+  while Got < ToRead do
+  begin
+    dl := 0;
+    if ReadDl > 0 then
+      dl := PasIoDeadline(ReadDl);
+    n := PasIoRead(Fd, @buf[1], 65536, dl);
+    ReadAns := n;
+    if n <= 0 then
+      Break;
+    for i := 1 to n do
+      if Ord(buf[i]) <> Octet(PeerSeed, Got + i - 1) then
+        Bad := True;
+    Got := Got + n;
+  end;
+  Fin.Done;
+end;
+
+procedure TEnd.WriteAll;
+var
+  buf: string;
+  n, i, k, dl: Integer;
+begin
+  SetLength(buf, 65536);
+  while Wrote < ToWrite do
+  begin
+    k := ToWrite - Wrote;
+    if k > 65536 then
+      k := 65536;
+    for i := 1 to k do
+      buf[i] := Chr(Octet(Seed, Wrote + i - 1));
+    i := 0;
+    while i < k do
+    begin
+      dl := 0;
+      if WriteDl > 0 then
+        dl := PasIoDeadline(WriteDl);
+      n := PasIoWrite(Fd, @buf[i + 1], k - i, dl);
+      WriteAns := n;
+      if n <= 0 then
+      begin
+        Fin.Done;
+        Exit;
+      end;
+      i := i + n;
+      Wrote := Wrote + n;
+    end;
+  end;
+  Fin.Done;
+end;
+
+function NewEnd(Fd, Seed, PeerSeed: Integer): TEnd;
+begin
+  Result := TEnd.Create;
+  Result.Fd := Fd;
+  Result.Seed := Seed;
+  Result.PeerSeed := PeerSeed;
+end;
+
+{ One routine parks first and the other after it, on the same
+  descriptor A; then the other end B takes the megabyte the writer could
+  not place, and only then writes the eight octets the reader waits for.
+  DlMs is the deadline of both waits, 0 for none }
+procedure Wake(A, B: Integer; ReaderFirst: Boolean; DlMs: Integer; const Name: string);
+var
+  e: TEnd;
+  sink, eight: string;
+  total, n, i: Integer;
+  ok: Boolean;
+begin
+  Doing(Name);
+  { a megabyte does not fit the socket whatever the system's default is }
+  SockBuffers(A, 0, 65536);
+  e := NewEnd(A, 11, 0);
+  e.ToRead := 8;
+  e.ToWrite := Mega;
+  e.ReadDl := DlMs;
+  e.WriteDl := DlMs;
+  e.PeerSeed := 200;
+  e.Fin.Add(2);
+  if ReaderFirst then
+  begin
+    pas e.ReadAll;
+    Sleep(30);
+    pas e.WriteAll;
+  end
+  else
+  begin
+    pas e.WriteAll;
+    Sleep(30);
+    pas e.ReadAll;
+  end;
+  Sleep(30);
+  { both are parked: the megabyte does not fit a socket, and nothing has
+    come for the reader }
+  SetLength(sink, 65536);
+  total := 0;
+  ok := True;
+  while total < Mega do
+  begin
+    n := PasIoRead(B, @sink[1], 65536, PasIoDeadline(LostMs));
+    if n <= 0 then
+      Break;
+    for i := 1 to n do
+      if Ord(sink[i]) <> Octet(11, total + i - 1) then
+        ok := False;
+    total := total + n;
+  end;
+  SetLength(eight, 8);
+  for i := 1 to 8 do
+    eight[i] := Chr(Octet(200, i - 1));
+  n := PasIoWrite(B, @eight[1], 8, PasIoDeadline(LostMs));
+  e.Fin.Wait;
+  Check(ok and (total = Mega) and (e.Wrote = Mega) and (n = 8) and (e.Got = 8) and not e.Bad, Name + ': the writer placed ' +
+    IntToStr(e.Wrote) + ', the other end took ' + IntToStr(total) + ', the reader got ' + IntToStr(e.Got));
+end;
+
+{ Both ends read and write at once, N octets each way: four routines on
+  two descriptors, every octet looked at }
+function Duplex(A, B, N: Integer): Boolean;
+var
+  x, y: TEnd;
+begin
+  x := NewEnd(A, 3, 90);
+  y := NewEnd(B, 90, 3);
+  x.ToRead := N;
+  x.ToWrite := N;
+  y.ToRead := N;
+  y.ToWrite := N;
+  x.Fin.Add(2);
+  y.Fin.Add(2);
+  pas x.ReadAll;
+  pas y.ReadAll;
+  pas x.WriteAll;
+  pas y.WriteAll;
+  x.Fin.Wait;
+  y.Fin.Wait;
+  Result := (x.Got = N) and (y.Got = N) and (x.Wrote = N) and (y.Wrote = N) and (not x.Bad) and not y.Bad;
+end;
+
+{ A deadline of one direction passes while the other direction's routine
+  stays parked, and that one is woken by its own event afterwards }
+procedure Deadlines;
+var
+  a, b, n, i, total: Integer;
+  e: TEnd;
+  sink, eight: string;
+begin
+  { the reader's deadline passes; the writer, parked meanwhile, places
+    its megabyte when the other end takes it }
+  Doing('a reader''s deadline beside a parked writer');
+  if not UnixPair(a, b) then
+    Halt(1);
+  SockBuffers(a, 0, 65536);
+  e := NewEnd(a, 11, 200);
+  e.ToRead := 8;
+  e.ToWrite := Mega;
+  e.ReadDl := 80;
+  e.Fin.Add(2);
+  pas e.WriteAll;
+  Sleep(30);
+  pas e.ReadAll;
+  Sleep(200);
+  SetLength(sink, 65536);
+  total := 0;
+  while total < Mega do
+  begin
+    n := PasIoRead(b, @sink[1], 65536, PasIoDeadline(LostMs));
+    if n <= 0 then
+      Break;
+    total := total + n;
+  end;
+  e.Fin.Wait;
+  Check((e.ReadAns = -110) and (e.Got = 0) and (e.Wrote = Mega) and (total = Mega),
+    'the reader''s deadline passed (' + IntToStr(e.ReadAns) + ') and the writer placed ' + IntToStr(e.Wrote));
+  TcpClose(a);
+  TcpClose(b);
+  { the writer's deadline passes; the reader, parked meanwhile, gets its
+    eight octets }
+  Doing('a writer''s deadline beside a parked reader');
+  if not UnixPair(a, b) then
+    Halt(1);
+  SockBuffers(a, 0, 65536);
+  e := NewEnd(a, 11, 200);
+  e.ToRead := 8;
+  e.ToWrite := 16 * Mega;
+  e.WriteDl := 80;
+  e.Fin.Add(2);
+  pas e.ReadAll;
+  Sleep(30);
+  pas e.WriteAll;
+  Sleep(200);
+  SetLength(eight, 8);
+  for i := 1 to 8 do
+    eight[i] := Chr(Octet(200, i - 1));
+  n := PasIoWrite(b, @eight[1], 8, PasIoDeadline(LostMs));
+  e.Fin.Wait;
+  Check((e.WriteAns = -110) and (e.Wrote < 16 * Mega) and (e.Got = 8) and not e.Bad,
+    'the writer''s deadline passed (' + IntToStr(e.WriteAns) + ') and the reader got ' + IntToStr(e.Got));
+  TcpClose(a);
+  TcpClose(b);
+end;
+
+var
+  a, b, l, i, n, first: Integer;
+  ok: Boolean;
+begin
+  pas Watch;
+  { a pair of sockets: each order, without deadlines and with them }
+  if not UnixPair(a, b) then
+    Halt(1);
+  first := a;
+  Wake(a, b, True, 0, 'the reader first');
+  Wake(a, b, False, 0, 'the writer first');
+  Wake(a, b, True, LostMs, 'the reader first, both with deadlines');
+  Wake(a, b, False, LostMs, 'the writer first, both with deadlines');
+  { and the other end's turn on the same pair }
+  Wake(b, a, True, 0, 'the other end, the reader first');
+  TcpClose(a);
+  TcpClose(b);
+  Group('a reader and a writer parked on one descriptor');
+
+  Deadlines;
+  Group('a deadline of one beside the wait of the other');
+
+  { both ends at once, four megabytes each way }
+  Doing('both ways at once over a pair of sockets');
+  if not UnixPair(a, b) then
+    Halt(1);
+  Check(Duplex(a, b, 4 * Mega), 'a pair of sockets, four megabytes each way');
+  TcpClose(a);
+  TcpClose(b);
+  { the same over TCP }
+  Doing('both ways at once over TCP');
+  l := TcpListen(0);
+  a := TcpConnect('127.0.0.1', TcpPort(l));
+  b := TcpAccept(l);
+  Check((a >= 0) and (b >= 0) and Duplex(a, b, 4 * Mega), 'TCP, four megabytes each way');
+  TcpClose(a);
+  TcpClose(b);
+  TcpClose(l);
+  Group('both ways at once');
+
+  { A descriptor closed and its number given out again: four hundred
+    pairs one after another, each used both ways by four routines and
+    closed. The numbers come back, so every turn after the first waits
+    on numbers that were in the poller's sets before }
+  Doing('four hundred pairs, one after another');
+  n := 0;
+  ok := True;
+  for i := 1 to 400 do
+  begin
+    if not UnixPair(a, b) then
+      Halt(1);
+    if a <> first then
+      ok := False;
+    if Duplex(a, b, 300000) then
+      Inc(n);
+    TcpClose(a);
+    TcpClose(b);
+  end;
+  Check((n = 400) and ok, IntToStr(n) + ' of 400 pairs carried their octets both ways; the numbers came back: ' +
+    IntToStr(Ord(ok)));
+  Group('numbers closed and given out again');
+  lock mu do
+    finished := True;
+end.

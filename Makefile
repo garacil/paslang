@@ -920,6 +920,11 @@ GOLDEN_A64 += sqlclosed
 # P548: typed arithmetic, bounds, protected memory reads and width/tune switches.
 GOLDEN += uint32legacy uint32rotate crc32width uint32bounds uint32memxor uint32tune
 GOLDEN_A64 += uint32legacy uint32rotate crc32width uint32bounds uint32memxor uint32tune
+# P667: a routine parked reading a descriptor and one parked writing it are two
+# waits; before, the second took the place of the first and the reader was never
+# woken. Both orders, with deadlines, both ways at once, TCP, numbers used again.
+GOLDEN += twowait
+GOLDEN_A64 += twowait
 
 # The core units are part of the language: every program links pasmap
 # (map[K] of V) and sees pasroutines (mutex, waitgroup, ...) without a
