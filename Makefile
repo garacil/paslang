@@ -936,8 +936,8 @@ GOLDEN_A64 += twowait
 GOLDEN += condstarve
 GOLDEN_A64 += condstarve
 # P618: a closure shares a variable a select names only as an arm's channel or value.
-GOLDEN += selclosure
-GOLDEN_A64 += selclosure
+GOLDEN += selclosure selcounterflow
+GOLDEN_A64 += selclosure selcounterflow
 # P660: Exception is the root of every error class: SQLite's, JSON's and Currency's too.
 GOLDEN += excroot excown
 GOLDEN_A64 += excroot excown

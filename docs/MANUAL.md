@@ -3091,7 +3091,8 @@ WriteLn(g(), ' ', g());          { 11 12: n lives on after Counter }
 - A counter a closure made in the loop uses is that pass's own, as in
   Go 1.22: `for i := 0 to 3 do fs[i] := function: Integer begin Result
   := i end` gives 0, 1, 2, 3, not four times 3. A change the body makes
-  to it still steers the loop. It holds for `for x in` too.
+  to it still steers the loop, including a `break` or `continue` inside
+  a `select` arm (1.3.26, P618). It holds for `for x in` too.
 - A closure shares every variable it names, also one it names only as
   the channel of a `select` arm or as the value a send arm sends (1.3.5,
   P618: such a channel read nil, and such a counter came from a frame
