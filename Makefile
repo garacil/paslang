@@ -710,8 +710,8 @@ GOLDEN_A64 += gcdeadreg
 # its own block, whose children run under qemu.
 GOLDEN += signals
 # P434: the HTTP server, every limit, deadline, error and feature.
-GOLDEN += httpsrv
-GOLDEN_A64 += httpsrv
+GOLDEN += httpsrv httpflush
+GOLDEN_A64 += httpsrv httpflush
 # P438: Argon2 and BLAKE2b against their published vectors, the PHC string.
 GOLDEN += argon2kat
 GOLDEN_A64 += argon2kat
@@ -1649,6 +1649,13 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	if command -v nginx > /dev/null 2>&1; then \
 	  sh scripts/http2_interop.sh nginx $(BUILDDIR)/http2go > $(BUILDDIR)/http2nginx.got; \
 	  diff -u testdata/http2nginx.out $(BUILDDIR)/http2nginx.got; \
+	fi; \
+	: httpserver streams: Flush sends each event as it is written, and Go net/http and curl -N read them 300 ms apart, P661; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/httpflush testdata/httpflush.paslang; \
+	if command -v go > /dev/null 2>&1 && command -v curl > /dev/null 2>&1; then \
+	  (cd scripts/flushoracle && GOCACHE=$(abspath $(BUILDDIR))/gocache GOFLAGS=-mod=mod go build -o $(abspath $(BUILDDIR))/flushoracle .); \
+	  sh scripts/flush_interop.sh $(BUILDDIR)/httpflush $(BUILDDIR)/flushoracle > $(BUILDDIR)/httpflushgo.got; \
+	  diff -u testdata/httpflushgo.out $(BUILDDIR)/httpflushgo.got; \
 	fi; \
 	: the system roots pasx509 loads are those Go loads, in the same order, P430; \
 	if command -v go > /dev/null 2>&1; then \
@@ -6542,6 +6549,12 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	if command -v nginx > /dev/null 2>&1; then \
 	  sh scripts/http2_interop.sh nginx $(BUILDDIR)/http2go-arm $(QEMU_A64) > $(BUILDDIR)/http2nginx-arm.got; \
 	  diff -u testdata/http2nginx.out $(BUILDDIR)/http2nginx-arm.got; \
+	fi; \
+	$(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/httpflush-arm testdata/httpflush.paslang; \
+	if command -v go > /dev/null 2>&1 && command -v curl > /dev/null 2>&1; then \
+	  (cd scripts/flushoracle && GOCACHE=$(abspath $(BUILDDIR))/gocache GOFLAGS=-mod=mod go build -o $(abspath $(BUILDDIR))/flushoracle .); \
+	  sh scripts/flush_interop.sh $(BUILDDIR)/httpflush-arm $(BUILDDIR)/flushoracle $(QEMU_A64) > $(BUILDDIR)/httpflushgo-arm.got; \
+	  diff -u testdata/httpflushgo.out $(BUILDDIR)/httpflushgo-arm.got; \
 	fi; \
 	: pascipher at the arm64 level seals through aese and pmull, its base build through neither, P428; \
 	grep -q 'aese v0.16b, v1.16b' '$(A64DIR)/$(LVL_A64)/pascipher.s'; \

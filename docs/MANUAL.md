@@ -12096,6 +12096,19 @@ A read past the route's limit raises `EHttpError` with 413, past
   answer goes whole with its `Content-Length` in one write; past that
   the head goes first, chunked unless the handler put a
   `Content-Length`;
+- `Flush` (1.3.14, P661): what was written goes out now, so a response
+  can be a stream, server-sent events or a long answer in pieces: the
+  head first when it has not gone, chunked on HTTP/1.1 unless the
+  handler put a `Content-Length`, then the bytes held. The write
+  deadline starts again at each flush (`WriteTimeoutMs`), so a stream
+  lives as long as it flushes, and `Flush` gives `False` when the
+  client is no longer there (a write failed; later writes are dropped),
+  as Go's `http.Flusher` and `ResponseController.Flush` do; a handler
+  that streams stops at that `False`. `SetWriteDeadline(ms)` sets the
+  answer's write deadline to `ms` from now, 0 for none, as Go's
+  `ResponseController.SetWriteDeadline`, and a flush keeps it from then
+  on. `testdata/httpflush` reads
+  each event of a stream while its handler still waits;
 - `Reply(code, contentType, body)`; `ReplyText` (text/plain;
   charset=utf-8); `ReplyJson(code, j)` (application/json;
   charset=utf-8); `ReplyError(code, message)`, as Go's `http.Error`;
@@ -12126,7 +12139,9 @@ on their length alone, as Go's `crypto/subtle`, for tokens and MACs.
 helpers it uses.
 
 There is no HTTP/2, no TLS, no compression and no `Range`: the proxy in
-front gives them. `testdata/httpsrv` checks every limit, deadline,
+front gives them (a proxy that buffers answers, as nginx does by
+default, holds a stream back unless it is told not to:
+`X-Accel-Buffering: no` from the handler, or `proxy_buffering off`). `testdata/httpsrv` checks every limit, deadline,
 error and feature above on both machines, the sockets systemd passes
 included (`scripts/check_httpsystemd.py`).
 `examples/apisrv` is a JSON API with a self-test, and

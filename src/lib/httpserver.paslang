@@ -215,6 +215,20 @@ type
       handler put one, chunked otherwise (HTTP/1.1); a small answer is
       held and sent whole with its length when the handler ends }
     procedure WriteData(const Data: string);
+    { what was written goes out now, for a response that is a stream
+      (server-sent events, a long answer in pieces): the head first when
+      it has not gone, chunked on HTTP/1.1 when the handler put no
+      Content-Length, then the bytes held. The write deadline starts
+      again from here, the server's WriteTimeoutMs, so a stream lives as
+      long as it flushes, unless the handler set its own deadline with
+      SetWriteDeadline, which stays. False when the client is no longer there: a
+      write failed, and every later one is dropped (Go's
+      http.Flusher and ResponseController.Flush, P661) }
+    function Flush: Boolean;
+    { the answer's writes must end within Ms from now, 0 for no limit,
+      and Flush no longer moves the deadline (Go's
+      ResponseController.SetWriteDeadline) }
+    procedure SetWriteDeadline(Ms: Integer);
     { Code with this Content-Type and this whole body }
     procedure Reply(Code: Integer; const ContentType, Body: string);
     procedure ReplyText(Code: Integer; const Body: string);
@@ -380,6 +394,9 @@ type
     { the path of the request being served, its segments }
     PathV: TSegView;
     WriteDeadline: Integer;
+    { the handler set its own write deadline (SetWriteDeadline), which
+      a Flush keeps }
+    OwnDeadline: Boolean;
     Broken: Boolean;
     DateSec: Int64;
     DateText: string;
@@ -1975,6 +1992,35 @@ begin
   Emit(c, Data);
 end;
 
+function THttpResponse.Flush: Boolean;
+var
+  c: THttpConn;
+  held: string;
+begin
+  c := FConn;
+  if not c.OwnDeadline then
+    c.WriteDeadline := PasIoDeadline(c.Server.WriteTimeoutMs);
+  if not c.Sent then
+  begin
+    held := c.Held;
+    c.Held := '';
+    MakeHead(c, c.KnownLen);
+    Emit(c, held);
+  end
+  else
+    FlushOut(c);
+  Result := not c.Broken;
+end;
+
+procedure THttpResponse.SetWriteDeadline(Ms: Integer);
+begin
+  FConn.OwnDeadline := True;
+  if Ms <= 0 then
+    FConn.WriteDeadline := 0
+  else
+    FConn.WriteDeadline := PasIoDeadline(Ms);
+end;
+
 procedure THttpResponse.Reply(Code: Integer; const ContentType, Body: string);
 begin
   SetStatus(Code);
@@ -2549,6 +2595,7 @@ begin
   C.BodyRead := 0;
   C.BodyEnded := True;
   C.WriteDeadline := PasIoDeadline(S.WriteTimeoutMs);
+  C.OwnDeadline := False;
   { the head, within MaxHeaderBytes and HeaderTimeoutMs }
   e := HeadEnd(C);
   while e < 0 do

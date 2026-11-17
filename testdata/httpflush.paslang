@@ -1,0 +1,298 @@
+{ P661: THttpResponse.Flush sends what a handler wrote before it ends,
+  so a response can be a stream. The events handler writes an event,
+  flushes and then waits for the client's word before the next one: an
+  event the client reads was sent by the flush, since the handler has
+  not ended. A client that goes away is told to the handler by Flush's
+  False. A small answer still goes whole with its length, a length the
+  handler put still frames the stream, HTTP/1.0 ends by the close, HEAD
+  sends the head alone, and SetWriteDeadline ends the writes to a
+  client that does not read.
+
+  With the argument serve it is the server of scripts/flush_interop.sh:
+  it writes its port and answers /tick with four events 300 ms apart,
+  each flushed, until SIGTERM; Go's client and curl -N read them. }
+program httpflush;
+
+uses
+  httpserver, pasnet, sysutils;
+
+const
+  H = #13#10;
+
+var
+  Srv: THttpServer;
+  Router: THttpRouter;
+  Port: Integer;
+  Acks: chan of Integer;
+  GoneDone, StuckDone: chan of Integer;
+  GoneFlushes, StuckBytes: Integer;
+  GoneSaw, StuckSaw: Boolean;
+
+{ ---- handlers ---- }
+
+{ three events, each sent at its flush, the next one after the client's
+  word }
+procedure HEvents(Req: THttpRequest; Resp: THttpResponse);
+var
+  i, a: Integer;
+begin
+  Resp.Header.Put('Content-Type', 'text/event-stream');
+  Resp.Header.Put('Cache-Control', 'no-cache');
+  for i := 1 to 3 do
+  begin
+    Resp.WriteData('data: event ' + IntToStr(i) + #10#10);
+    if not Resp.Flush then
+      Exit;
+    a := Recv(Acks);
+    if a <> i then
+      Exit;
+  end;
+end;
+
+{ events until the client is gone, then the count of flushes }
+procedure HGone(Req: THttpRequest; Resp: THttpResponse);
+var
+  i: Integer;
+begin
+  GoneSaw := False;
+  GoneFlushes := 0;
+  for i := 1 to 3000 do
+  begin
+    Resp.WriteData('data: tick ' + IntToStr(i) + #10#10);
+    if not Resp.Flush then
+    begin
+      GoneSaw := True;
+      Break;
+    end;
+    GoneFlushes := i;
+    Sleep(5);
+  end;
+  Send(GoneDone, 1);
+end;
+
+procedure HSmall(Req: THttpRequest; Resp: THttpResponse);
+begin
+  Resp.Header.Put('Content-Type', 'text/plain');
+  Resp.WriteData('small');
+end;
+
+{ a length the handler put: the stream is not chunked }
+procedure HLen(Req: THttpRequest; Resp: THttpResponse);
+begin
+  Resp.Header.Put('Content-Length', '10');
+  Resp.WriteData('12345');
+  Resp.Flush;
+  Resp.WriteData('67890');
+end;
+
+{ the head alone at the first flush, the body after it }
+procedure HEarly(Req: THttpRequest; Resp: THttpResponse);
+begin
+  Resp.Header.Put('Content-Type', 'text/plain');
+  Resp.Flush;
+  Resp.WriteData('late');
+end;
+
+{ megabytes to a client that reads nothing, within 300 ms }
+procedure HStuck(Req: THttpRequest; Resp: THttpResponse);
+var
+  piece: string;
+  i: Integer;
+begin
+  StuckSaw := False;
+  StuckBytes := 0;
+  SetLength(piece, 65536);
+  for i := 1 to 65536 do
+    piece[i] := 'x';
+  Resp.SetWriteDeadline(300);
+  for i := 1 to 1024 do
+  begin
+    Resp.WriteData(piece);
+    if not Resp.Flush then
+    begin
+      StuckSaw := True;
+      Break;
+    end;
+    StuckBytes := StuckBytes + 65536;
+  end;
+  Send(StuckDone, 1);
+end;
+
+{ the interop's events, 300 ms apart }
+procedure HTick(Req: THttpRequest; Resp: THttpResponse);
+var
+  i: Integer;
+begin
+  Resp.Header.Put('Content-Type', 'text/event-stream');
+  for i := 1 to 4 do
+  begin
+    if i > 1 then
+      Sleep(300);
+    Resp.WriteData('data: tick ' + IntToStr(i) + #10#10);
+    if not Resp.Flush then
+      Exit;
+  end;
+end;
+
+{ ---- the client side ---- }
+
+{ what C sends until Buf holds Want, within 10 s }
+function ReadUntil(C: Integer; var Buf: string; const Want: string): Boolean;
+var
+  s: string;
+begin
+  while Pos(Want, Buf) = 0 do
+  begin
+    s := TcpReadDeadline(C, 4096, 10000);
+    if s = '' then
+    begin
+      Result := False;
+      Exit;
+    end;
+    Buf := Buf + s;
+  end;
+  Result := True;
+end;
+
+function ReadToEnd(C: Integer): string;
+var
+  s: string;
+begin
+  Result := '';
+  while True do
+  begin
+    s := TcpReadDeadline(C, 4096, 10000);
+    if s = '' then
+      Break;
+    Result := Result + s;
+  end;
+end;
+
+{ an answer as printed: the Date line out, CR LF shown as a line end }
+function Shown(const A: string): string;
+var
+  rest, line: string;
+  j: Integer;
+begin
+  Result := '';
+  rest := A;
+  while rest <> '' do
+  begin
+    j := Pos(H, rest);
+    if j = 0 then
+    begin
+      line := rest;
+      rest := '';
+    end
+    else
+    begin
+      line := Copy(rest, 1, j - 1);
+      rest := Copy(rest, j + 2, Length(rest) - j - 1);
+    end;
+    if Copy(line, 1, 6) <> 'Date: ' then
+      Result := Result + '  ' + StringReplace(line, #10, '\n', [rfReplaceAll]) + #10;
+  end;
+end;
+
+function Ask(const Req: string): string;
+var
+  c: Integer;
+begin
+  c := TcpConnectTo('127.0.0.1', Port);
+  TcpWrite(c, Req);
+  Result := ReadToEnd(c);
+  TcpClose(c);
+end;
+
+procedure RunServer(S: THttpServer);
+begin
+  S.Serve;
+end;
+
+var
+  c, i, v: Integer;
+  buf: string;
+  ok: Boolean;
+
+begin
+  Acks := MakeChan();
+  GoneDone := MakeChan();
+  StuckDone := MakeChan();
+  Router := THttpRouter.Create;
+  Router.Handle('GET', '/events', @HEvents);
+  Router.Handle('GET', '/gone', @HGone);
+  Router.Handle('GET', '/small', @HSmall);
+  Router.Handle('GET', '/len', @HLen);
+  Router.Handle('GET', '/early', @HEarly);
+  Router.Handle('GET', '/stuck', @HStuck);
+  Router.Handle('GET', '/tick', @HTick);
+  Srv := THttpServer.Create(Router);
+  Srv.AccessLog := False;
+  if not Srv.ListenTcp('127.0.0.1', 0) then
+    Halt(1);
+  Port := Srv.Port;
+  if ParamStr(1) = 'serve' then
+  begin
+    WriteLn('port ', Port);
+    Srv.ServeUntilSignal;
+    Exit;
+  end;
+  pas RunServer(Srv);
+
+  { each event arrives while its handler waits for the word to go on }
+  c := TcpConnectTo('127.0.0.1', Port);
+  TcpWrite(c, 'GET /events HTTP/1.1' + H + 'Host: x' + H + H);
+  buf := '';
+  ok := True;
+  for i := 1 to 3 do
+  begin
+    if not ReadUntil(c, buf, 'data: event ' + IntToStr(i) + #10#10) then
+    begin
+      WriteLn('event ', i, ' did not come while the handler waited');
+      ok := False;
+      Break;
+    end;
+    WriteLn('event ', i, ' came while the handler waited');
+    Send(Acks, i);
+  end;
+  if ok and ReadUntil(c, buf, '0' + H + H) then
+    WriteLn('and the stream ended with its last chunk:');
+  Write(Shown(buf));
+  TcpClose(c);
+
+  { a client that goes away: the handler's flush says so }
+  c := TcpConnectTo('127.0.0.1', Port);
+  TcpWrite(c, 'GET /gone HTTP/1.1' + H + 'Host: x' + H + H);
+  buf := '';
+  ReadUntil(c, buf, 'data: tick 2' + #10#10);
+  TcpClose(c);
+  v := Recv(GoneDone);
+  WriteLn('a client gone: Flush said so ', GoneSaw, ', after its first events ', (GoneFlushes >= 2) and (GoneFlushes < 3000));
+
+  WriteLn('a small answer goes whole with its length:');
+  Write(Shown(Ask('GET /small HTTP/1.1' + H + 'Host: x' + H + 'Connection: close' + H + H)));
+  WriteLn('a length the handler put frames a flushed answer:');
+  Write(Shown(Ask('GET /len HTTP/1.1' + H + 'Host: x' + H + 'Connection: close' + H + H)));
+  WriteLn('the head at the first flush, chunked:');
+  Write(Shown(Ask('GET /early HTTP/1.1' + H + 'Host: x' + H + 'Connection: close' + H + H)));
+  WriteLn('HTTP/1.0, ended by the close:');
+  Write(Shown(Ask('GET /early HTTP/1.0' + H + H)));
+  WriteLn('HEAD, the head alone:');
+  Write(Shown(Ask('HEAD /early HTTP/1.1' + H + 'Host: x' + H + 'Connection: close' + H + H)));
+
+  { a client that reads nothing: SetWriteDeadline ends the writes }
+  c := TcpConnectTo('127.0.0.1', Port);
+  SockBuffers(c, 65536, 0);
+  TcpWrite(c, 'GET /stuck HTTP/1.1' + H + 'Host: x' + H + H);
+  v := Recv(StuckDone);
+  WriteLn('a client that reads nothing: the deadline ended the writes ', StuckSaw, ', before 64 MiB ',
+    StuckBytes < 67108864);
+  TcpClose(c);
+  Srv.Shutdown;
+end.
+
+{ This file is part of paslang's tests.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+  paslang is free software under the GNU General Public License,
+  version 3 or (at your option) any later version; see the file
+  COPYING. It comes with ABSOLUTELY NO WARRANTY. }
