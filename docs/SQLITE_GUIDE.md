@@ -489,6 +489,38 @@ error on. The savepoints at the end show `ROLLBACK TO`, which undoes what came
 after a savepoint and leaves the savepoint, and `RELEASE`, which on the outermost
 savepoint commits.
 
+The shape of `Transfer` is the unit's own since 1.3.20 (P623), as Go's `sql.Tx` and
+rusqlite's `Transaction`: `db.BeginTx` (Go's name, since `begin` is Pascal's
+word), `db.BeginImmediate` and `db.BeginExclusive` give a `TSqliteTx`;
+`tx.Commit` and `tx.Rollback` end it, and after either both raise
+`ESqliteError` `SQLITE_MISUSE`, as Go's `ErrTxDone`. `tx.Done`, in a `finally`,
+rolls back what neither ended and raises nothing, so the exception of the work is
+the one that goes on and a `ROLLBACK` that fails after it (one an `OR ROLLBACK`
+already did, say) does not hide it:
+
+```pascal
+  tx := db.BeginImmediate;
+  try
+    db.Exec('UPDATE account SET balance = balance + ? WHERE id = ?', [Amount, Dst]);
+    db.Exec('UPDATE account SET balance = balance - ? WHERE id = ?', [Amount, Src]);
+    tx.Commit;
+  finally
+    tx.Done;
+  end;
+```
+
+`tx.Savepoint` gives a savepoint inside the transaction (or inside another
+savepoint), a `TSqliteTx` whose `Commit` is `RELEASE` and whose `Rollback` is
+`ROLLBACK TO` and `RELEASE`; the savepoints inside one end with it, and a commit
+of the transaction ends every savepoint still open. A transaction belongs to its
+connection: a second `BeginTx` while one is open, or while a `BEGIN` of `Exec` is,
+is an `ESqliteError` that names it, and a connection and its transaction are one
+routine's at a time, since the statements of another routine on the connection go
+into the open transaction. A `COMMIT` that fails with SQLITE_BUSY leaves the
+transaction open, as SQLite does, for another `Commit` or a `Rollback`.
+`testdata/sqltx` takes every end of a transaction and the locks of two
+connections on a file.
+
 Keep a write transaction short. There is one writer at a time on a file, and
 readers in the rollback modes keep it from committing (section 9).
 

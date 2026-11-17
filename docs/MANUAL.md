@@ -13684,7 +13684,10 @@ after its last row (1.3.19); `ColumnIndex(name)`, `Column(name)` and
 `ColumnDeclType(i)`; a value's `AsText`, `AsInteger`, `AsReal` and
 `IsNull` read it with SQLite's own conversions, as `sqlite3_column_text`,
 `_int64` and `_double` do (P622); `QueryValue(sql, [args])` the first
-column of the first row. `LastInsertRowId` and `Changes` are
+column of the first row. `BeginTx`, `BeginImmediate` and `BeginExclusive`
+give a transaction, a `TSqliteTx` with `Commit`, `Rollback`, `Done` for a
+`finally` (it rolls back what was not ended and raises nothing) and
+`Savepoint` (1.3.20, P623; the SQLite chapter, section 3). `LastInsertRowId` and `Changes` are
 `sqlite3_last_insert_rowid` and `sqlite3_changes64`. An error raises
 `ESqliteError` with SQLite's extended code (`ExtendedCode`), its primary
 code (`Code`) and SQLite's words (`Message`). `Schema` gives

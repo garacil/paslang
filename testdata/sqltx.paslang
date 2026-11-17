@@ -1,0 +1,245 @@
+{ P623: a transaction of sqlite as an object, and savepoints. The
+  hand-written form (BEGIN, try, the work, COMMIT, except, a ROLLBACK in
+  a try of its own so that it never hides the first exception, raise)
+  was fifteen lines a transaction in a portal that has 46. Here every
+  end of one: a commit, a rollback, an exception of the work, a
+  rollback that fails after it; Commit and Rollback after the end; a
+  second BeginTx and one beside a BEGIN of Exec, refused by name;
+  savepoints nested, released and rolled back to; two routines on one
+  connection, whose statements share the open transaction. With a path
+  for argument it also takes the locks of two connections on a file: a
+  BeginImmediate that another's write lock refuses and a COMMIT that a
+  reader keeps from writing, SQLITE_BUSY, the transaction left open. }
+program sqltx;
+
+uses
+  sqlite, sysutils;
+
+var
+  db: TSqlite;
+  tx, sp, sp2, sp3: TSqliteTx;
+  mu: mutex;
+  started, inserted, decided: waitgroup;
+
+function Ids(D: TSqlite): string;
+var
+  r: TSqliteRows;
+begin
+  Result := '';
+  r := D.Query('SELECT id FROM t ORDER BY id');
+  while r.Next do
+    Result := Result + IntToStr(r.Column(0).I) + ' ';
+  if Result = '' then
+    Result := 'none';
+end;
+
+procedure Says(const What: string);
+begin
+  WriteLn('  ', What);
+end;
+
+procedure Other(D: TSqlite);
+begin
+  started.Done;
+  inserted.Wait;
+  { the open transaction is the connection's: this goes into it }
+  D.Exec('INSERT INTO t VALUES (21)');
+  decided.Done;
+end;
+
+procedure Locks(const Path: string);
+var
+  a, b: TSqlite;
+  ta, tb: TSqliteTx;
+begin
+  WriteLn('two connections on a file:');
+  a := TSqlite.Open(Path);
+  b := TSqlite.Open(Path);
+  a.Exec('CREATE TABLE IF NOT EXISTS f(x)');
+  ta := a.BeginImmediate;
+  a.Exec('INSERT INTO f VALUES (1)');
+  try
+    tb := b.BeginImmediate;
+    Says('wrong: two write locks');
+  except
+    on e: ESqliteError do
+      Says('a second BeginImmediate: ' + IntToStr(e.Code) + ' ' + e.Message);
+  end;
+  ta.Commit;
+  { a reader's shared lock keeps the writer's COMMIT from writing }
+  ta := a.BeginTx;
+  a.QueryValue('SELECT count(*) FROM f', []);
+  tb := b.BeginImmediate;
+  b.Exec('INSERT INTO f VALUES (2)');
+  try
+    tb.Commit;
+    Says('wrong: committed under a reader');
+  except
+    on e: ESqliteError do
+      Says('a COMMIT under a reader: ' + IntToStr(e.Code) + ' ' + e.Message + ', ended ' + BoolToStr(tb.Ended, True));
+  end;
+  ta.Commit;
+  tb.Commit;
+  Says('then it commits: ' + IntToStr(a.QueryValue('SELECT count(*) FROM f', []).I) + ' rows, ended ' +
+    BoolToStr(tb.Ended, True));
+  a.Disconnect;
+  b.Disconnect;
+end;
+
+begin
+  db := TSqlite.Open(':memory:');
+  db.Exec('CREATE TABLE t(id INTEGER PRIMARY KEY)');
+
+  WriteLn('the ends of a transaction:');
+  tx := db.BeginTx;
+  try
+    db.Exec('INSERT INTO t VALUES (1)');
+    tx.Commit;
+  finally
+    tx.Done;
+  end;
+  Says('committed: ' + Ids(db) + ', ended ' + BoolToStr(tx.Ended, True));
+  try
+    tx.Commit;
+  except
+    on e: ESqliteError do
+      Says('Commit after the end: ' + IntToStr(e.Code) + ' ' + e.Message);
+  end;
+  try
+    tx.Rollback;
+  except
+    on e: ESqliteError do
+      Says('Rollback after the end: ' + IntToStr(e.Code) + ' ' + e.Message);
+  end;
+  tx := db.BeginImmediate;
+  db.Exec('INSERT INTO t VALUES (2)');
+  tx.Rollback;
+  tx.Done;
+  Says('rolled back: ' + Ids(db));
+  try
+    tx := db.BeginExclusive;
+    try
+      db.Exec('INSERT INTO t VALUES (3)');
+      raise Exception.Create('the work failed');
+      tx.Commit;
+    finally
+      tx.Done;
+    end;
+  except
+    on e: Exception do
+      Says('an exception of the work: ' + e.Message + ', left ' + Ids(db));
+  end;
+  { INSERT OR ROLLBACK ends the transaction itself on a conflict: the
+    rollback of Done then fails, and the conflict is the exception }
+  try
+    tx := db.BeginTx;
+    try
+      db.Exec('INSERT INTO t VALUES (4)');
+      db.Exec('INSERT OR ROLLBACK INTO t VALUES (1)');
+      tx.Commit;
+    finally
+      tx.Done;
+    end;
+  except
+    on e: ESqliteError do
+      Says('a rollback that fails after the work''s exception: ' + IntToStr(e.Code) + ' ' + e.Message + ', left ' +
+        Ids(db));
+  end;
+
+  WriteLn('one transaction at a time:');
+  tx := db.BeginTx;
+  try
+    db.BeginImmediate;
+  except
+    on e: ESqliteError do
+      Says(e.Message);
+  end;
+  tx.Rollback;
+  db.Exec('BEGIN');
+  try
+    db.BeginTx;
+  except
+    on e: ESqliteError do
+      Says(e.Message);
+  end;
+  db.Exec('ROLLBACK');
+
+  WriteLn('savepoints:');
+  tx := db.BeginTx;
+  db.Exec('INSERT INTO t VALUES (10)');
+  sp := tx.Savepoint;
+  db.Exec('INSERT INTO t VALUES (11)');
+  sp.Rollback;
+  Says('rolled back to: ' + Ids(db));
+  sp := tx.Savepoint;
+  db.Exec('INSERT INTO t VALUES (12)');
+  sp2 := sp.Savepoint;
+  db.Exec('INSERT INTO t VALUES (13)');
+  try
+    sp.Savepoint;
+  except
+    on e: ESqliteError do
+      Says(e.Message);
+  end;
+  sp2.Commit;
+  Says('released inside: ' + Ids(db));
+  sp.Rollback;
+  Says('the outer one rolled back takes the released one: ' + Ids(db) + ', the inner ended ' +
+    BoolToStr(sp2.Ended, True));
+  { an outer savepoint rolled back with an inner one open: both go, and
+    so does what came between them; each is released, no more SQL's }
+  sp := tx.Savepoint;
+  db.Exec('INSERT INTO t VALUES (16)');
+  sp3 := sp.Savepoint;
+  db.Exec('INSERT INTO t VALUES (17)');
+  sp.Rollback;
+  Says('rolled back with one open inside: ' + Ids(db) + ', the inner ended ' + BoolToStr(sp3.Ended, True));
+  try
+    db.Exec('RELEASE ' + sp.Name);
+  except
+    on e: ESqliteError do
+      Says('its name is released: ' + e.Message);
+  end;
+  sp := tx.Savepoint;
+  db.Exec('INSERT INTO t VALUES (14)');
+  sp3 := sp.Savepoint;
+  db.Exec('INSERT INTO t VALUES (15)');
+  tx.Commit;
+  Says('a commit with savepoints open: ' + Ids(db) + ', they ended ' + BoolToStr(sp.Ended and sp3.Ended, True));
+  sp3.Done;
+  try
+    sp.Savepoint;
+  except
+    on e: ESqliteError do
+      Says('a savepoint of an ended one: ' + IntToStr(e.Code) + ' ' + e.Message);
+  end;
+
+  WriteLn('two routines on one connection:');
+  started.Add(1);
+  inserted.Add(1);
+  decided.Add(1);
+  pas Other(db);
+  started.Wait;
+  tx := db.BeginTx;
+  db.Exec('INSERT INTO t VALUES (20)');
+  inserted.Done;
+  decided.Wait;
+  tx.Rollback;
+  Says('the other routine''s row went with the rollback: ' + Ids(db));
+
+  if ParamCount = 1 then
+    Locks(ParamStr(1));
+  db.Disconnect;
+  try
+    db.BeginTx;
+  except
+    on e: ESqliteError do
+      Says('a closed connection: ' + IntToStr(e.Code) + ' ' + e.Message);
+  end;
+end.
+
+{ This file is part of paslang's tests.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+  paslang is free software under the GNU General Public License,
+  version 3 or (at your option) any later version; see the file
+  COPYING. It comes with ABSOLUTELY NO WARRANTY. }

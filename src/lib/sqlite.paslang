@@ -876,6 +876,54 @@ type
     function ColumnDeclType(I: Integer): string;
   end;
 
+  { A transaction of a connection, or a savepoint inside one (P623), as
+    Go's sql.Tx and rusqlite's Transaction and Savepoint: Db.BeginTx (Go's name: begin is Pascal's word),
+    BeginImmediate and BeginExclusive start one (BEGIN DEFERRED,
+    IMMEDIATE, EXCLUSIVE), tx.Savepoint one inside it (SAVEPOINT, which
+    nest). Commit ends it with its work (COMMIT; RELEASE for a
+    savepoint) and Rollback without (ROLLBACK; ROLLBACK TO and RELEASE);
+    after either, both raise ESqliteError SQLITE_MISUSE, as Go's
+    ErrTxDone. Done, for a finally, rolls back what neither ended and
+    raises nothing, so an exception of the work is the one that goes on
+    and a rollback that fails after it does not hide it, which the
+    hand-written form needed a try of its own for:
+
+      tx := db.BeginImmediate;
+      try
+        ... the work ...
+        tx.Commit;
+      finally
+        tx.Done;
+      end;
+
+    A transaction belongs to its connection: another BeginTx while one is
+    open, or while one a BEGIN of Exec started is, is refused and names
+    it; a savepoint is ended before the one around it starts another.
+    A connection and its transaction are one routine's at a time: the
+    statements of another routine on that connection go into the open
+    transaction (Regla 11). A COMMIT that fails, as SQLITE_BUSY, leaves
+    the transaction open, as SQLite does, for another Commit or a
+    Rollback. }
+  TSqliteTx = class
+  private
+    FDb: TSqlite;
+    FName, FHow: string;
+    FInner: TSqliteTx;
+    FEnded: Boolean;
+    procedure Live;
+  public
+    procedure Commit;
+    procedure Rollback;
+    procedure Done;
+    { a savepoint inside this transaction or savepoint }
+    function Savepoint: TSqliteTx;
+    { Commit or Rollback has ended it }
+    function Ended: Boolean;
+    { a savepoint's name in SQL, for SQL of the program's own; '' for a
+      transaction }
+    function Name: string;
+  end;
+
   { A connection to a database file, or to one in memory (':memory:',
     or SQLITE_OPEN_MEMORY): sqlite3_open_v2's flags, READWRITE and
     CREATE when none are given. Every error raises ESqliteError. }
@@ -884,6 +932,11 @@ type
     FDb: TSqlite3;
     FPath: string;
     FFlags: Integer;
+    { the transaction BeginTx started and not yet ended, and the number of
+      the next savepoint's name (P623) }
+    FTx: TSqliteTx;
+    FSpSeq: Integer;
+    function StartTx(const How, Sql: string): TSqliteTx;
     procedure Check(Rc: Integer);
     { ESqliteError SQLITE_MISUSE when the connection was closed (Disconnect) }
     procedure Live;
@@ -899,6 +952,11 @@ type
       @name, $name): an Integer, a Boolean (0 or 1), a real, a string
       (text), nil (NULL); the rows it changed }
     function Exec(const Sql: string; const Args: array of const): Integer; overload;
+    { a transaction (P623): BEGIN DEFERRED, IMMEDIATE (the write lock now,
+      SQLITE_BUSY when another connection holds it) or EXCLUSIVE }
+    function BeginTx: TSqliteTx;
+    function BeginImmediate: TSqliteTx;
+    function BeginExclusive: TSqliteTx;
     { the rows of a query, with its parameters as Exec binds them }
     function Query(const Sql: string): TSqliteRows; overload;
     function Query(const Sql: string; const Args: array of const): TSqliteRows; overload;
@@ -105826,6 +105884,121 @@ begin
       Result.FDecls[i] := sqlite3_column_decltype(st, i);
     end;
   end;
+end;
+
+function TSqlite.StartTx(const How, Sql: string): TSqliteTx;
+begin
+  Live;
+  if (FTx <> nil) and not FTx.FEnded then
+    raise ESqliteError.Create(SQLITE_ERROR, 'a transaction begun by ' + FTx.FHow +
+      ' is open on this connection: commit it or roll it back before ' + How);
+  if sqlite3_get_autocommit(FDb) = 0 then
+    raise ESqliteError.Create(SQLITE_ERROR, 'a transaction that a BEGIN of Exec started is open on this connection: ' +
+      'end it before ' + How);
+  Exec(Sql);
+  Result := TSqliteTx.Create;
+  Result.FDb := Self;
+  Result.FHow := How;
+  FTx := Result;
+end;
+
+function TSqlite.BeginTx: TSqliteTx;
+begin
+  Result := StartTx('BeginTx', 'BEGIN DEFERRED');
+end;
+
+function TSqlite.BeginImmediate: TSqliteTx;
+begin
+  Result := StartTx('BeginImmediate', 'BEGIN IMMEDIATE');
+end;
+
+function TSqlite.BeginExclusive: TSqliteTx;
+begin
+  Result := StartTx('BeginExclusive', 'BEGIN EXCLUSIVE');
+end;
+
+procedure TSqliteTx.Live;
+begin
+  if FEnded then
+    raise ESqliteError.Create(SQLITE_MISUSE, 'the transaction has already been committed or rolled back');
+end;
+
+function TSqliteTx.Ended: Boolean;
+begin
+  Result := FEnded;
+end;
+
+function TSqliteTx.Name: string;
+begin
+  Result := FName;
+end;
+
+{ a savepoint's inner ones end with it, as SQLite's RELEASE and ROLLBACK
+  TO end every savepoint after the one they name }
+procedure SqlTxEndInner(T: TSqliteTx);
+var
+  t2: TSqliteTx;
+begin
+  t2 := T.FInner;
+  while t2 <> nil do
+  begin
+    t2.FEnded := True;
+    t2 := t2.FInner;
+  end;
+  T.FInner := nil;
+end;
+
+procedure TSqliteTx.Commit;
+begin
+  Live;
+  if FName = '' then
+    FDb.Exec('COMMIT')
+  else
+    FDb.Exec('RELEASE ' + FName);
+  FEnded := True;
+  SqlTxEndInner(Self);
+end;
+
+procedure TSqliteTx.Rollback;
+begin
+  Live;
+  { ended before the statement: a rollback that fails leaves nothing for
+    Done to do again }
+  FEnded := True;
+  SqlTxEndInner(Self);
+  if FName = '' then
+    FDb.Exec('ROLLBACK')
+  else
+  begin
+    FDb.Exec('ROLLBACK TO ' + FName);
+    FDb.Exec('RELEASE ' + FName);
+  end;
+end;
+
+procedure TSqliteTx.Done;
+begin
+  if FEnded then
+    Exit;
+  try
+    Rollback;
+  except
+    { the exception in flight, if any, is the one that goes on; with
+      none, SQLite has rolled the transaction back already (an I/O error
+      or a full disk ends it) or the connection is gone }
+  end;
+end;
+
+function TSqliteTx.Savepoint: TSqliteTx;
+begin
+  Live;
+  if (FInner <> nil) and not FInner.FEnded then
+    raise ESqliteError.Create(SQLITE_ERROR, 'a savepoint is open inside this transaction: end it before another');
+  Inc(FDb.FSpSeq);
+  Result := TSqliteTx.Create;
+  Result.FDb := FDb;
+  Result.FName := 'paslang_sp' + IntToStr(FDb.FSpSeq);
+  FDb.Exec('SAVEPOINT ' + Result.FName);
+  FInner := Result;
 end;
 
 function TSqlite.QueryValue(const Sql: string; const Args: array of const): TSqliteValue;

@@ -824,8 +824,8 @@ GOLDEN_A64 += libfault
 GOLDEN += wgagain
 GOLDEN_A64 += wgagain
 # P583: the failures of a channel as exceptions.
-GOLDEN += chanfault chanshut chanoff eofname hexchar openarr bgroutine bgfirst jsoncanonrange sqlcols
-GOLDEN_A64 += chanfault chanshut chanoff eofname hexchar openarr bgroutine bgfirst jsoncanonrange sqlcols
+GOLDEN += chanfault chanshut chanoff eofname hexchar openarr bgroutine bgfirst jsoncanonrange sqlcols sqltx
+GOLDEN_A64 += chanfault chanshut chanoff eofname hexchar openarr bgroutine bgfirst jsoncanonrange sqlcols sqltx
 # P573: a server stops whatever became of its sockets.
 GOLDEN += httpstop
 GOLDEN_A64 += httpstop
@@ -3166,6 +3166,11 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	rm -f $(BUILDDIR)/sqlroutines.db $(BUILDDIR)/sqlroutines.db-wal $(BUILDDIR)/sqlroutines.db-shm; \
 	$(BUILDDIR)/sqlroutines $(BUILDDIR)/sqlroutines.db > $(BUILDDIR)/sqlroutines.got; \
 	cmp testdata/sqlroutines.out $(BUILDDIR)/sqlroutines.got; \
+	: sqlite transactions on a file of two connections, a second write lock and a COMMIT under a reader, SQLITE_BUSY, P623; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/sqltx testdata/sqltx.paslang; \
+	rm -f $(BUILDDIR)/sqltx.db $(BUILDDIR)/sqltx.db-journal; \
+	$(BUILDDIR)/sqltx $(BUILDDIR)/sqltx.db > $(BUILDDIR)/sqltxfile.got; \
+	cmp testdata/sqltxfile.out $(BUILDDIR)/sqltxfile.got; \
 	echo ok sqlapi
 	@set -e; \
 	: P498: a constant for a constructor var parameter is refused with its line, on both machines; \
@@ -7383,6 +7388,10 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	rm -f $(BUILDDIR)/sqlroutines-arm.db $(BUILDDIR)/sqlroutines-arm.db-wal $(BUILDDIR)/sqlroutines-arm.db-shm; \
 	timeout 600 $(QEMU_A64) $(BUILDDIR)/sqlroutines-arm $(BUILDDIR)/sqlroutines-arm.db > $(BUILDDIR)/sqlroutines-arm.got; \
 	cmp testdata/sqlroutines.out $(BUILDDIR)/sqlroutines-arm.got; \
+	$(OUTDIR)/paslangc -target arm64 -cpu max -Fu $(A64DIR) -o $(BUILDDIR)/sqltx-arm testdata/sqltx.paslang; \
+	rm -f $(BUILDDIR)/sqltx-arm.db $(BUILDDIR)/sqltx-arm.db-journal; \
+	timeout 600 $(QEMU_A64) $(BUILDDIR)/sqltx-arm $(BUILDDIR)/sqltx-arm.db > $(BUILDDIR)/sqltxfile-arm.got; \
+	cmp testdata/sqltxfile.out $(BUILDDIR)/sqltxfile-arm.got; \
 	echo ok sqlapi-arm
 	@set -e; \
 	: P439 on arm64: signals, each child the program again under qemu, given as the first argument, and under the collector stress; \
