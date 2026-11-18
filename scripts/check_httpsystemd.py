@@ -59,7 +59,7 @@ b = ask(s)
 os.kill(p.pid, signal.SIGTERM)
 lines.append(p.stdout.readline().strip())
 code = p.wait(timeout=60)
-ok = (lines == ['systemd sockets: 1', 'ready', 'stopped on SIGTERM'] and code == 0 and
+ok = (lines == ['systemd sockets: True', 'ready', 'stopped on SIGTERM'] and code == 0 and
       a.startswith(b'HTTP/1.1 200 OK\r\n') and a.endswith(b'\r\n\r\nhello\n') and
       b.startswith(b'HTTP/1.1 200 OK\r\n') and b.endswith(b'\r\n\r\nhello\n'))
 if os.path.exists(path):
