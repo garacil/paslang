@@ -936,8 +936,8 @@ GOLDEN_A64 += twowait
 GOLDEN += condstarve
 GOLDEN_A64 += condstarve
 # P618: a closure shares a variable a select names only as an arm's channel or value.
-GOLDEN += selclosure selcounterflow
-GOLDEN_A64 += selclosure selcounterflow
+GOLDEN += selclosure selcounterflow selchannelindex selwalkerflow selvaluecapture selboundedwrite
+GOLDEN_A64 += selclosure selcounterflow selchannelindex selwalkerflow selvaluecapture selboundedwrite
 # P660: Exception is the root of every error class: SQLite's, JSON's and Currency's too.
 GOLDEN += excroot excown
 GOLDEN_A64 += excroot excown
@@ -1357,6 +1357,8 @@ bench-servers: $(OUTDIR)/paslangc core libs
 check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch64 $(OUTDIR)/pasdbg
 	@python3 -I scripts/check_sdk_state.py capture --manifest $(BUILDDIR)/sdk-state-check.json --profile amd64 $(BUILDDIR) $(LVL_X64) --profile arm64 $(A64DIR) $(LVL_A64) --debugger amd64 $(OUTDIR)/pasdbg -- $(CORE_UNITS) $(LIB_UNITS)
 	@python3 scripts/check_recipes.py
+	@python3 -I -B scripts/select_walkers.py --self-test
+	@python3 -I -B scripts/check_select_diagnostics.py "$(OUTDIR)/paslangc" "$(BUILDDIR)"
 	@python3 -I scripts/check_model_outputs.py $(BUILDDIR)
 	@python3 -B scripts/check_uint32.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64)
 	@python3 -B scripts/check_uint32_focus.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64)
@@ -1598,7 +1600,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/stackmap.out $(BUILDDIR)/stackmap.vgot; \
 	echo ok stackmaps; \
 	echo "==== the base processor (-cpu base) ===="; \
-	for t in inotifylimits vectors vecmore vecpool bitwords xxh3 inlineasm hash1 tree1 store1 mapsplit set256 strwords strkern strcmpk cmpwords sysutils1 utf8kern jsonkern longslice rtlong fillkern json1 jsoncanon hmacstream hashpieces hashpieces2 cipherkat cipherwyche x25519kat nistwyche nistsign rsawyche rsasign rsasigwyche fmafused; do \
+	for t in inotifylimits selchannelindex selwalkerflow selvaluecapture selboundedwrite vectors vecmore vecpool bitwords xxh3 inlineasm hash1 tree1 store1 mapsplit set256 strwords strkern strcmpk cmpwords sysutils1 utf8kern jsonkern longslice rtlong fillkern json1 jsoncanon hmacstream hashpieces hashpieces2 cipherkat cipherwyche x25519kat nistwyche nistsign rsawyche rsasign rsasigwyche fmafused; do \
 	  $(OUTDIR)/paslangc -cpu base -o $(BUILDDIR)/$$t-base testdata/$$t.paslang; \
 	  $(BUILDDIR)/$$t-base > $(BUILDDIR)/$$t.bgot; \
 	  diff -u testdata/$$t.out $(BUILDDIR)/$$t.bgot; \
@@ -5964,6 +5966,8 @@ $(BUILDDIR)/qemu-aarch64: scripts/build_qemu.py $(wildcard scripts/qemu/*.patch)
 
 check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/qemu-aarch64 libs-arm64
 	@python3 -I scripts/check_sdk_state.py capture --manifest $(BUILDDIR)/sdk-state-check-arm64.json --profile arm64 $(A64DIR) $(LVL_A64) -- $(CORE_UNITS) $(LIB_UNITS)
+	@python3 -I -B scripts/select_walkers.py --self-test
+	@python3 -I -B scripts/check_select_diagnostics.py "$(OUTDIR)/paslangc-arm64" "$(BUILDDIR)" "$(QEMU_A64)" --host-arm64
 	@set -e; \
 	python3 -I scripts/check_cli_help.py "$(OUTDIR)/paslangc-arm64" "$(BUILDDIR)" "$(QEMU_A64)"; \
 	python3 -I scripts/check_import_diagnostics.py "$(OUTDIR)/paslangc-arm64" "$(BUILDDIR)" "$(QEMU_A64)" --host-arm64; \
@@ -6585,7 +6589,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	diff -u testdata/cputuse.out $(BUILDDIR)/cputuse-arm.got
 	@set -e; \
 	echo "==== the base processor arm64 ===="; \
-	for t in inotifylimits hash1 tree1 store1 vectors bitwords set256 strwords strkern strcmpk cmpwords sysutils1 utf8kern jsonkern longslice rtlong fillkern json1 jsoncanon hmacstream hashpieces hashpieces2 cipherkat cipherwyche x25519kat nistwyche nistsign rsawyche rsasign rsasigwyche; do \
+	for t in inotifylimits selchannelindex selwalkerflow selvaluecapture selboundedwrite hash1 tree1 store1 vectors bitwords set256 strwords strkern strcmpk cmpwords sysutils1 utf8kern jsonkern longslice rtlong fillkern json1 jsoncanon hmacstream hashpieces hashpieces2 cipherkat cipherwyche x25519kat nistwyche nistsign rsawyche rsasign rsasigwyche; do \
 	  $(OUTDIR)/paslangc -target arm64 -cpu base -o $(BUILDDIR)/$$t-arm-base testdata/$$t.paslang; \
 	  timeout 120 $(QEMU_A64) $(BUILDDIR)/$$t-arm-base > $(BUILDDIR)/$$t-arm.bgot; \
 	  diff -u testdata/$$t.out $(BUILDDIR)/$$t-arm.bgot; \

@@ -3096,7 +3096,10 @@ WriteLn(g(), ' ', g());          { 11 12: n lives on after Counter }
 - A closure shares every variable it names, also one it names only as
   the channel of a `select` arm or as the value a send arm sends (1.3.5,
   P618: such a channel read nil, and such a counter came from a frame
-  that was gone; `testdata/selclosure`).
+  that was gone; `testdata/selclosure`). A counter used only inside a
+  channel index also reads that pass's counter (`testdata/selchannelindex`).
+  A receive destination counts as a write for const-parameter and captured-
+  counter checks, just as an ordinary assignment does.
 - A routine nested two deep reaches its grandparent's variables (it said
   unknown identifier before 1.0.134).
 - A `var` parameter cannot be kept (a closure may outlive the variable
