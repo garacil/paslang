@@ -30,6 +30,15 @@ noncharacter, raw or escaped, as this script finds it, and Go must take
 the text or fail at that byte or after it.
 --update writes expect.txt from Go's output so checked.
 
+Canonical mode additionally reports "canonerr 7 POINTER REASON" for a
+finite-Double range refusal. The Go test oracle independently models this
+P646 contract: it orders raw objects by UTF-16, preserves numeric lexemes,
+then checks numeric Token.Float overflow before finite canonical formatting.
+Plain/pretty preserve their raw numeric text. A parse refusal, including
+paslang's deliberate noncharacter policy, precedes any writer refusal.
+Snapshot updates require the checked Go/model reference and unchanged old
+plain/pretty rows/digests; candidate output alone cannot update canonical rows.
+
 usage: check_json.py [--qemu=QEMU] build/jsoncheck [build/json/oracle | -] [--update]
 (--qemu runs an arm64 jsoncheck under that QEMU.)"""
 import glob
@@ -65,6 +74,27 @@ CASES = [
     b'[' * 10000 + b']' * 10000, b'[' * 10001 + b']' * 10001,
     b'{"<&>":"\xe2\x80\xa8\xe2\x80\xa9","\\u2028":"\\u003c"}',
     b'[1e-7,1e21,1e20,-1.5e-7,0.000001,123e-2,5e-324,1.7976931348623157e308,1e309]',
+]
+
+
+# Separate controls leave CASES and the original 20,000 mutation inputs unchanged.
+CANON_CASES = [
+    b'{"z":1e400,"a":-1e400}',
+    b'{"\\ue000":1e400,"\\ud83d\\ude00":-1e400}',
+    b'{"a~/b":[0,{"x":1E400}]}',
+    b'[0,{"x":-1e400},1e400]',
+    b'["1e400","Infinity","NaN",0e400,-1e-400,-0.0]',
+    b'[1.7976931348623157e308,1.7976931348623158e308,1e-400,2.4703282292062328e-324]',
+    b'{"a":1e400,"b":"\\uFDD0"}',
+    b'{"a":"\\uFDD0","b":1e400}',
+    b'{"a":1e400,"b":"\\uFDD0",}',
+    b'{"a":1e400,,"b":"\\uFDD0"}',
+    b'{"a":1e400,"a":1,"b":"\\uFDD0"}',
+    b'{"a":1e400,"b":"\\ud800"}',
+    b'{"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx":[0,1e400]}',
+    b'{"a":1e400,"b":NaN}',
+    b'{"a":1e400,"b":[Infinity]}',
+    b'["\\\\uFDD0","1e400"]',
 ]
 
 
@@ -104,14 +134,16 @@ def documents():
     corpus = [compression.zstd.decompress(open(f, 'rb').read())
               for f in sorted(glob.glob(os.path.join(TD, 'corpus', '*.json.zst')))]
     muts = mutations(CASES + suite, 20000, 1)
-    return [('case', CASES), ('suite', suite), ('corpus', corpus), ('mutation', muts)]
+    return [('case', CASES), ('suite', suite), ('corpus', corpus), ('mutation', muts),
+            ('canonical', CANON_CASES)]
 
 
 def run(prog, mode, docs):
     data = ''.join((d.hex() if d else '-') + '\n' for d in docs).encode()
     r = subprocess.run(prog + [mode], input=data, capture_output=True, timeout=1800)
-    if r.returncode != 0:
-        sys.exit('%s %s exited %d: %s' % (prog[0], mode, r.returncode, r.stderr.decode()[-2000:]))
+    if r.returncode != 0 or r.stderr:
+        sys.exit('%s %s exited %d or wrote stderr: %s' %
+                 (prog[0], mode, r.returncode, r.stderr.decode()[-2000:]))
     lines = r.stdout.decode('utf-8', 'surrogateescape').split('\n')
     if lines and lines[-1] == '':
         lines.pop()
@@ -126,6 +158,10 @@ def nonchar_at(d):
     i = 0
     while i < len(d):
         b = d[i]
+        # An escaped backslash names literal text, not a Unicode escape.
+        if b == 0x5c and d[i + 1:i + 2] != b'u':
+            i += 2
+            continue
         if b == 0x5c and d[i + 1:i + 2] == b'u':
             h = d[i + 2:i + 6]
             try:
@@ -215,7 +251,7 @@ def squeeze(groups, lines):
     for name, docs in groups:
         part = lines[k:k + len(docs)]
         k += len(docs)
-        if name in ('case', 'suite'):
+        if name in ('case', 'suite', 'canonical'):
             out += ['%s %s' % (name, l) for l in part]
         else:
             out.append('%s sha256 %s' % (name, hashlib.sha256('\n'.join(part).encode(
@@ -275,15 +311,41 @@ def main():
         if bad < 20:
             print('Python (strict) %s %r, paslang: %s' % ('takes' if pv else 'refuses', d[:120],
                                                        g[:200]))
+    # Canonicalization starts only after successful parsing. A noncharacter
+    # parse refusal must win over an otherwise valid document's numeric range.
+    for d, parsed, canonical in zip(docs, got['p'], got['c']):
+        if parsed.startswith('err ') and canonical != parsed:
+            bad += 1
+            if bad < 20:
+                print('canonical changed a parse error on %r: %s / %s' %
+                      (d[:120], parsed[:200], canonical[:200]))
+    reference = {}
     if gobin:
+        go_lines = {mode: run([gobin], mode, docs) for mode in 'pic'}
+        # Python and Go accept noncharacters. Independently require the
+        # deliberate I-JSON parse refusal before accepting any matching c row.
+        for d, parsed, go_parsed in zip(docs, got['p'], go_lines['p']):
+            at = nonchar_at(d)
+            if go_parsed.startswith('ok ') and at >= 0 and not (
+                    parsed.startswith('err %d ' % at) and 'noncharacter' in parsed):
+                bad += 1
+                if bad < 20:
+                    print('missing noncharacter parse refusal on %r: %s' %
+                          (d[:120], parsed[:200]))
         for mode in 'pic':
-            want = run([gobin], mode, docs)
+            want = go_lines[mode]
+            reference[mode] = list(want)
             for i, (d, g, w) in enumerate(zip(docs, got[mode], want)):
                 if g == w:
                     continue
                 at = nonchar_at(d)
+                # Noncharacter is an intentional PARSE difference. Go's c
+                # record can now be canonerr; never parse that as an offset.
+                parse_ref = go_lines['p'][i]
                 if at >= 0 and g.startswith('err %d ' % at) and 'noncharacter' in g and \
-                        (w.startswith('ok ') or int(w.split()[1]) >= at):
+                        (parse_ref.startswith('ok ') or
+                         (parse_ref.startswith('err ') and int(parse_ref.split()[1]) >= at)):
+                    reference[mode][i] = got['p'][i] if mode == 'c' else g
                     continue
                 bad += 1
                 if bad < 20:
@@ -291,9 +353,23 @@ def main():
                           (mode, d[:120], w[:300], g[:300]))
     exp = []
     for mode in 'pic':
-        exp += ['%s %s' % (mode, l) for l in squeeze(groups, got[mode])]
+        exp += ['%s %s' % (mode, l) for l in squeeze(groups, reference.get(mode, got[mode]))]
     path = os.path.join(TD, 'expect.txt')
+    old = open(path, encoding='utf-8', errors='surrogateescape').read().split('\n')[:-1]
     if update:
+        # Only canonical rows change. Every existing plain/pretty row and
+        # corpus/mutation digest stays frozen before a checked-reference update.
+        for mode in 'pi':
+            previous = [line for line in old if line.startswith(mode + ' ') and
+                        not line.startswith(mode + ' canonical ')]
+            current = [line for line in exp if line.startswith(mode + ' ') and
+                       not line.startswith(mode + ' canonical ')]
+            if previous != current:
+                sys.exit('plain/pretty frozen baseline changed: expect.txt not written')
+            old_controls = [line for line in old if line.startswith(mode + ' canonical ')]
+            new_controls = [line for line in exp if line.startswith(mode + ' canonical ')]
+            if old_controls and old_controls != new_controls:
+                sys.exit('plain/pretty canonical controls changed: expect.txt not written')
         if not gobin:
             sys.exit('--update needs Go\'s oracle')
         if bad:
@@ -301,7 +377,6 @@ def main():
         open(path, 'w', encoding='utf-8', errors='surrogateescape').write('\n'.join(exp) + '\n')
         print('wrote', path)
         return
-    old = open(path, encoding='utf-8', errors='surrogateescape').read().split('\n')[:-1]
     if old != exp:
         for i, (a, b) in enumerate(zip(old, exp)):
             if a != b:

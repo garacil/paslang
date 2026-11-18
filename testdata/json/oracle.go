@@ -13,7 +13,9 @@
 //	   the hex of its SHA-256) and the reason, as Go's
 //	   jsontext.SyntacticError holds them
 //	i  the same, the document a value a line, two spaces a level
-//	c  the same, the document in RFC 8785's form (Value.Canonicalize)
+//	c  RFC 8785 form with the P646 finite-Double model before Value.Canonicalize;
+//	   "canonerr 7 POINTER REASON" for numeric overflow, with raw token and
+//	   canonical UTF-16 first-error pointer; strings and underflow stay valid.
 //
 // A written document longer than 200 bytes, and every one a value a
 // line, is given as "sha256" and the hex of its SHA-256, so the
@@ -29,13 +31,63 @@ import (
 	"encoding/json/v2"
 	"errors"
 	"fmt"
+	"io"
+	"math"
 	"os"
+	"strconv"
 	"strings"
 )
+
+// Canonical range is a semantic writer error, never a syntax error.
+// Go's ordinary Canonicalize saturates overflow; paslang deliberately follows
+// RFC 8785's finite-Double requirement instead (P646).
+type canonicalRangeError struct {
+	number  string
+	pointer string
+}
+
+func (e *canonicalRangeError) Error() string {
+	return e.number + " is out of Double's range: RFC 8785 has no canonical form for it"
+}
+
+func pointerHex(pointer string) string {
+	if pointer == "" {
+		return "-"
+	}
+	if len(pointer) > 100 {
+		sum := sha256.Sum256([]byte(pointer))
+		return "sha256:" + hex.EncodeToString(sum[:])
+	}
+	return hex.EncodeToString([]byte(pointer))
+}
 
 func write(b []byte, mode string) (string, error) {
 	if mode == "c" {
 		v := jsontext.Value(append([]byte(nil), b...))
+		// Sort every object by UTF-16 while preserving all numeric lexemes.
+		// Thus the first range error has the canonical writer's actual path.
+		if err := v.Canonicalize(jsontext.CanonicalizeRawInts(false), jsontext.CanonicalizeRawFloats(false)); err != nil {
+			return "", err
+		}
+		d := jsontext.NewDecoder(bytes.NewReader(v))
+		for {
+			tok, err := d.ReadToken()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return "", err
+			}
+			if tok.Kind() == '0' {
+				value, err := tok.Float()
+				if math.IsInf(value, 0) && errors.Is(err, strconv.ErrRange) {
+					return "", &canonicalRangeError{tok.String(), string(d.StackPointer())}
+				}
+				if err != nil {
+					return "", err
+				}
+			}
+		}
 		if err := v.Canonicalize(); err != nil {
 			return "", err
 		}
@@ -50,8 +102,11 @@ func write(b []byte, mode string) (string, error) {
 	e := jsontext.NewEncoder(&out, opts...)
 	for {
 		tok, err := d.ReadToken()
-		if err != nil {
+		if err == io.EOF {
 			break
+		}
+		if err != nil {
+			return "", err
 		}
 		if tok.Kind() == '"' {
 			tok = jsontext.String(tok.String())
@@ -82,6 +137,11 @@ func main() {
 		err := json.Unmarshal(b, &v)
 		if err == nil {
 			t, err := write(b, mode)
+			var rangeError *canonicalRangeError
+			if errors.As(err, &rangeError) {
+				fmt.Fprintf(w, "canonerr 7 %s %s\n", pointerHex(rangeError.pointer), rangeError.Error())
+				continue
+			}
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "oracle: cannot write a valid document:", err)
 				os.Exit(2)
@@ -98,13 +158,6 @@ func main() {
 			fmt.Fprintln(os.Stderr, "oracle: not a syntactic error:", err)
 			os.Exit(2)
 		}
-		p := hex.EncodeToString([]byte(se.JSONPointer))
-		if p == "" {
-			p = "-"
-		} else if len(se.JSONPointer) > 100 {
-			sum := sha256.Sum256([]byte(se.JSONPointer))
-			p = "sha256:" + hex.EncodeToString(sum[:])
-		}
-		fmt.Fprintf(w, "err %d %s %v\n", se.ByteOffset, p, se.Err)
+		fmt.Fprintf(w, "err %d %s %v\n", se.ByteOffset, pointerHex(string(se.JSONPointer)), se.Err)
 	}
 }
