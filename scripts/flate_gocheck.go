@@ -245,7 +245,8 @@ func main() {
 			}
 			g.Write(data)
 			g.Close()
-			fmt.Fprintf(out, "%s %d level %d: %d %016x %016x 1\n", f[0], len(data), level, rw.Len(), hash(rw.Bytes()), hash(gz.Bytes()))
+			// The final field is flatec's Boolean round-trip verdict: True on success.
+			fmt.Fprintf(out, "%s %d level %d: %d %016x %016x True\n", f[0], len(data), level, rw.Len(), hash(rw.Bytes()), hash(gz.Bytes()))
 			c := chunked(f[0], data, level)
 			fmt.Fprintf(out, "%s %d pieces %d: %d %016x\n", f[0], len(data), level, len(c), hash(c))
 		}

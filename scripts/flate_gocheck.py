@@ -16,16 +16,29 @@ import shutil
 import subprocess
 import sys
 
+def run_output(args, *, input=None):
+    result = subprocess.run(args, input=None if input is None else input.encode("utf-8"),
+                            capture_output=True, check=False)
+    if result.returncode != 0 or result.stderr:
+        print("flate_gocheck: child status %d, stderr %d bytes: %r" %
+              (result.returncode, len(result.stderr), args), file=sys.stderr, flush=True)
+        sys.stderr.buffer.write(result.stdout)
+        sys.stderr.buffer.write(result.stderr)
+        sys.stderr.buffer.flush()
+        sys.exit(1)
+    return result.stdout.decode("utf-8")
+
+
 here = os.path.dirname(os.path.abspath(__file__))
 flatec = sys.argv[1]
 if shutil.which("go") is None:
     print("no go: flate_gocheck skipped")
     sys.exit(2)
-shapes = subprocess.run([flatec, "data"], capture_output=True, text=True, check=True).stdout
-mine = subprocess.run([flatec], capture_output=True, text=True, check=True).stdout.splitlines()
+shapes = run_output([flatec, "data"])
+mine = run_output([flatec]).splitlines()
 names = set(l.split()[0] for l in shapes.splitlines()) - {"text400k", "soup200k"}
 mine = [ln for ln in mine if ln.split()[0] in names or ln.startswith("sweep ")]
-go = subprocess.run(["go", "run", os.path.join(here, "flate_gocheck.go")], input=shapes, capture_output=True, text=True, check=True).stdout.splitlines()
+go = run_output(["go", "run", os.path.join(here, "flate_gocheck.go")], input=shapes).splitlines()
 bad = 0
 for a, b in zip(mine, go):
     if a != b:
