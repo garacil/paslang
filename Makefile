@@ -2901,7 +2901,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  'mapaddr:the address of a map element is not taken: the table moves when the map grows at 10:9' \
 	  'mapinto:map[string] of Integer does not go into map[Integer] of string at 10:8' \
 	  'incstr:Inc takes a number, an ordinal or a pointer, not string at 9:7' \
-	  'vararr:array[0..3] of Byte does not go into a var array of Byte parameter: a slice does at 13:8' \
+	  'vararr:array[0..3] of Byte does not go into a var array of Byte parameter: SetLength through it would have to change a static array; a const or value parameter takes the array, and a slice variable, s := a[0..3], goes to a var one at 13:8' \
 	  'varelem:var parameter of type array of TRec given a array of TObj at 21:8' \
 	  'outelem:var parameter of type array of Byte given a array of Word at 10:8' \
 	  'varreal:var parameter of type Real given a Single at 12:8' \
