@@ -199,6 +199,13 @@ var
   k: TInotifyKind;
   p: string;
 begin
+  { Go syscall.BytePtrFromString and SysUtils paths reject embedded NUL:
+    never watch a silently truncated prefix. }
+  if Pos(#0, Path) <> 0 then
+  begin
+    FError := 22;
+    Exit(-1);
+  end;
   mask := 0;
   for k := Low(TInotifyKind) to High(TInotifyKind) do
     if (k in Kinds) and not (k in [ikOverflow, ikIgnored, ikIsDir]) then
@@ -259,15 +266,24 @@ end;
 
 function TInotify.Next(out Ev: TInotifyEvent; TimeoutMs: Integer): Boolean;
 var
-  due, left, r: Integer;
+  due, left, r, stamp, wait: Integer;
 begin
   Ev := Default(TInotifyEvent);
   Result := False;
   if not Valid then
     Exit;
+  FError := 0;
   due := 0;
   if TimeoutMs >= 0 then
-    due := Nanotime + TimeoutMs * 1000000;
+  begin
+    { Go runtime.poll_runtime_pollSetDeadline and time.when saturate a
+      future deadline at MaxInt64. Check before multiplying milliseconds. }
+    stamp := Nanotime;
+    if TimeoutMs > (High(Integer) - stamp) div 1000000 then
+      due := High(Integer)
+    else
+      due := stamp + TimeoutMs * 1000000;
+  end;
   while True do
   begin
     if AtomicLoad(FDisposed) <> 0 then
@@ -291,14 +307,20 @@ begin
     end;
     { nothing yet: park on the set until the watcher's descriptor or the
       eventfd of Dispose is ready, or the time comes }
-    if due = 0 then
+    if TimeoutMs < 0 then
       r := WaitIo(FEp, 1)
     else
     begin
       left := due - Nanotime;
       if left <= 0 then
         Exit;
-      r := WaitMs(FEp, 1, left div 1000000 + 1);
+      { WaitMs accepts at most 2^40 milliseconds (pasroutines). A very
+        long deadline waits in bounded pieces and checks the full deadline
+        again after each piece, or wakes immediately on an event/Dispose. }
+      wait := left div 1000000 + 1;
+      if wait > 1099511627776 then
+        wait := 1099511627776;
+      r := WaitMs(FEp, 1, wait);
     end;
     if r < 0 then
     begin

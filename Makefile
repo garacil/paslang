@@ -827,8 +827,8 @@ GOLDEN_A64 += libfault
 GOLDEN += wgagain
 GOLDEN_A64 += wgagain
 # P583: the failures of a channel as exceptions.
-GOLDEN += chanfault chanshut chanoff eofname hexchar openarr bgroutine bgfirst jsoncanonrange sqlcols sqltx rmall inotify
-GOLDEN_A64 += chanfault chanshut chanoff eofname hexchar openarr bgroutine bgfirst jsoncanonrange sqlcols sqltx rmall inotify
+GOLDEN += chanfault chanshut chanoff eofname hexchar openarr bgroutine bgfirst jsoncanonrange sqlcols sqltx rmall inotify inotifylimits
+GOLDEN_A64 += chanfault chanshut chanoff eofname hexchar openarr bgroutine bgfirst jsoncanonrange sqlcols sqltx rmall inotify inotifylimits
 # P573: a server stops whatever became of its sockets.
 GOLDEN += httpstop
 GOLDEN_A64 += httpstop
@@ -1598,7 +1598,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	diff -u testdata/stackmap.out $(BUILDDIR)/stackmap.vgot; \
 	echo ok stackmaps; \
 	echo "==== the base processor (-cpu base) ===="; \
-	for t in vectors vecmore vecpool bitwords xxh3 inlineasm hash1 tree1 store1 mapsplit set256 strwords strkern strcmpk cmpwords sysutils1 utf8kern jsonkern longslice rtlong fillkern json1 jsoncanon hmacstream hashpieces hashpieces2 cipherkat cipherwyche x25519kat nistwyche nistsign rsawyche rsasign rsasigwyche fmafused; do \
+	for t in inotifylimits vectors vecmore vecpool bitwords xxh3 inlineasm hash1 tree1 store1 mapsplit set256 strwords strkern strcmpk cmpwords sysutils1 utf8kern jsonkern longslice rtlong fillkern json1 jsoncanon hmacstream hashpieces hashpieces2 cipherkat cipherwyche x25519kat nistwyche nistsign rsawyche rsasign rsasigwyche fmafused; do \
 	  $(OUTDIR)/paslangc -cpu base -o $(BUILDDIR)/$$t-base testdata/$$t.paslang; \
 	  $(BUILDDIR)/$$t-base > $(BUILDDIR)/$$t.bgot; \
 	  diff -u testdata/$$t.out $(BUILDDIR)/$$t.bgot; \
@@ -6585,7 +6585,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	diff -u testdata/cputuse.out $(BUILDDIR)/cputuse-arm.got
 	@set -e; \
 	echo "==== the base processor arm64 ===="; \
-	for t in hash1 tree1 store1 vectors bitwords set256 strwords strkern strcmpk cmpwords sysutils1 utf8kern jsonkern longslice rtlong fillkern json1 jsoncanon hmacstream hashpieces hashpieces2 cipherkat cipherwyche x25519kat nistwyche nistsign rsawyche rsasign rsasigwyche; do \
+	for t in inotifylimits hash1 tree1 store1 vectors bitwords set256 strwords strkern strcmpk cmpwords sysutils1 utf8kern jsonkern longslice rtlong fillkern json1 jsoncanon hmacstream hashpieces hashpieces2 cipherkat cipherwyche x25519kat nistwyche nistsign rsawyche rsasign rsasigwyche; do \
 	  $(OUTDIR)/paslangc -target arm64 -cpu base -o $(BUILDDIR)/$$t-arm-base testdata/$$t.paslang; \
 	  timeout 120 $(QEMU_A64) $(BUILDDIR)/$$t-arm-base > $(BUILDDIR)/$$t-arm.bgot; \
 	  diff -u testdata/$$t.out $(BUILDDIR)/$$t-arm.bgot; \

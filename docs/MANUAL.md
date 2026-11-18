@@ -12029,7 +12029,12 @@ watch removed, by `Remove` or because its file went, gives `ikIgnored`.
 The waiting routine parks on an epoll set of the watcher's own that
 holds its descriptor and an eventfd, so `Dispose` wakes it as a signal
 wakes passignal's routine. `InotifyKindsText(kinds)` names a set for a
-log. `testdata/inotify` checks it on both machines.
+log. `Add` rejects an embedded NUL with error 22 (EINVAL), without
+watching a truncated path. Large positive timeouts saturate at the latest
+representable deadline; events and `Dispose` still wake the routine.
+On a valid watcher, `Next` clears a previous error even when it times out;
+an invalid watcher preserves its construction error. `testdata/inotify`
+and `testdata/inotifylimits` check these contracts on both machines.
 
 ```pascal
 { a service that stops cleanly when systemd sends SIGTERM }
