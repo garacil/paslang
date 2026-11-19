@@ -832,6 +832,9 @@ GOLDEN_A64 += chanfault chanshut chanoff eofname hexchar openarr bgroutine bgfir
 # P179/P639: per-G errno, Carry and background state occupy separate fields.
 GOLDEN += syserrorstate
 GOLDEN_A64 += syserrorstate
+# Typed FP constants retain their semantic types through folding.
+GOLDEN += fpbaselinedirectsingle fpbaselinedirectdouble fpbaselinenilarysingle fpbaselinenilarydouble fpconstant constfoldtypes
+GOLDEN_A64 += fpbaselinedirectsingle fpbaselinedirectdouble fpbaselinenilarysingle fpbaselinenilarydouble fpconstant constfoldtypes
 # P573: a server stops whatever became of its sockets.
 GOLDEN += httpstop
 GOLDEN_A64 += httpstop
@@ -4771,6 +4774,25 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  range_got=$$(timeout 20 $$p huge-down); test "$$range_got" = "9223372036854775807"; \
 	done; done; \
 	echo ok unrollrange-inline; \
+	: typed FP constants and unchanged ordinal folds under both inline policies; \
+	for fp_cpu in base native; do for fp_inl in 0 40; do \
+	  for fp_case in fpbaselinedirectsingle fpbaselinedirectdouble fpbaselinenilarysingle fpbaselinenilarydouble fpconstant constfoldtypes; do \
+	    fp_bin=$(BUILDDIR)/$$fp_case-root-$$fp_cpu-$$fp_inl; \
+	    $(OUTDIR)/paslangc -cpu $$fp_cpu -inline $$fp_inl -Fu $(BUILDDIR) -o $$fp_bin testdata/$$fp_case.paslang >$$fp_bin.compile.out 2>$$fp_bin.compile.err || { fp_status=$$?; cat $$fp_bin.compile.out; cat $$fp_bin.compile.err >&2; exit $$fp_status; }; \
+	    test ! -s $$fp_bin.compile.out || { cat $$fp_bin.compile.out; exit 1; }; \
+	    test ! -s $$fp_bin.compile.err || { cat $$fp_bin.compile.err >&2; exit 1; }; \
+	    timeout 20 $$fp_bin >$$fp_bin.got 2>$$fp_bin.err || { fp_status=$$?; cat $$fp_bin.got; cat $$fp_bin.err >&2; exit $$fp_status; }; \
+	    test ! -s $$fp_bin.err || { cat $$fp_bin.err >&2; exit 1; }; \
+	    diff -u testdata/$$fp_case.out $$fp_bin.got; \
+	  done; \
+	  for fp_case in fpbaselinenilarysingle fpbaselinenilarydouble; do \
+	    fp_bin=$(BUILDDIR)/$$fp_case-root-$$fp_cpu-$$fp_inl; \
+	    timeout 20 $$fp_bin nested >$$fp_bin.nested.got 2>$$fp_bin.nested.err || { fp_status=$$?; cat $$fp_bin.nested.got; cat $$fp_bin.nested.err >&2; exit $$fp_status; }; \
+	    test ! -s $$fp_bin.nested.err || { cat $$fp_bin.nested.err >&2; exit 1; }; \
+	    diff -u testdata/$$fp_case.out $$fp_bin.nested.got; \
+	  done; \
+	done; done; \
+	echo ok typed-fp-constants; \
 	: every loop of an asm kernel of the units starts aligned, as the loops paslangc compiles, P302; \
 	python3 -I scripts/check_kernel_align.py src/lib/*.paslang src/rtl/*.paslang; \
 	echo ok kernel-align; \
@@ -6571,6 +6593,26 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	  range_got=$$(timeout 20 $(QEMU_A64) -cpu $$model $$p huge-down); test "$$range_got" = "9223372036854775807"; \
 	done; done; \
 	echo ok unrollrange-arm-inline; \
+	: typed FP constants and unchanged ordinal folds under both inline policies; \
+	for fp_cpu in base max; do for fp_inl in 0 40; do \
+	  fp_model=max; if [ "$$fp_cpu" = base ]; then fp_model=cortex-a53; fi; \
+	  for fp_case in fpbaselinedirectsingle fpbaselinedirectdouble fpbaselinenilarysingle fpbaselinenilarydouble fpconstant constfoldtypes; do \
+	    fp_bin=$(BUILDDIR)/$$fp_case-root-$$fp_cpu-$$fp_inl-arm; \
+	    $(OUTDIR)/paslangc -target arm64 -cpu $$fp_cpu -inline $$fp_inl -Fu $(A64DIR) -o $$fp_bin testdata/$$fp_case.paslang >$$fp_bin.compile.out 2>$$fp_bin.compile.err || { fp_status=$$?; cat $$fp_bin.compile.out; cat $$fp_bin.compile.err >&2; exit $$fp_status; }; \
+	    test ! -s $$fp_bin.compile.out || { cat $$fp_bin.compile.out; exit 1; }; \
+	    test ! -s $$fp_bin.compile.err || { cat $$fp_bin.compile.err >&2; exit 1; }; \
+	    timeout 20 $(QEMU_A64) -cpu $$fp_model $$fp_bin >$$fp_bin.got 2>$$fp_bin.err || { fp_status=$$?; cat $$fp_bin.got; cat $$fp_bin.err >&2; exit $$fp_status; }; \
+	    test ! -s $$fp_bin.err || { cat $$fp_bin.err >&2; exit 1; }; \
+	    diff -u testdata/$$fp_case.out $$fp_bin.got; \
+	  done; \
+	  for fp_case in fpbaselinenilarysingle fpbaselinenilarydouble; do \
+	    fp_bin=$(BUILDDIR)/$$fp_case-root-$$fp_cpu-$$fp_inl-arm; \
+	    timeout 20 $(QEMU_A64) -cpu $$fp_model $$fp_bin nested >$$fp_bin.nested.got 2>$$fp_bin.nested.err || { fp_status=$$?; cat $$fp_bin.nested.got; cat $$fp_bin.nested.err >&2; exit $$fp_status; }; \
+	    test ! -s $$fp_bin.nested.err || { cat $$fp_bin.nested.err >&2; exit 1; }; \
+	    diff -u testdata/$$fp_case.out $$fp_bin.nested.got; \
+	  done; \
+	done; done; \
+	echo ok typed-fp-constants-arm; \
 	$(OUTDIR)/paslangc -target arm64 -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/exprinline0-arm testdata/exprinline.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/exprinline0-arm > $(BUILDDIR)/exprinline0-arm.got; \
 	diff -u testdata/exprinline.out $(BUILDDIR)/exprinline0-arm.got; \

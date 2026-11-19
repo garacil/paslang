@@ -1539,6 +1539,13 @@ Inc(i as Byte, 10);                       { the low byte of i wraps alone }
   TPair).Hi`, `(d as UInt64) + 1`. A statement may begin with the
   parenthesis: `(d as UInt64) := 0`.
 
+Constant folding and a constant function's replacement preserve the type
+and width of a scalar view. `($3F800000 as Single) + ($3F800000 as Single)`
+is Single arithmetic and gives `2.0`; it does not add the encoded integers.
+A function returning a scalar view keeps that same type in an assignment or
+an argument. Integer work inside a later view remains integer work:
+`($3F800000 + $3F800000) as Single` sees the bits of that integer sum.
+
 ### Logic on whole blocks
 
 `and`, `or`, `xor`, `not`, `nand`, `nor`, `xnor` and `andnot` take whole
