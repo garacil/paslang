@@ -56,7 +56,7 @@ rejects = {
     'literal-overflow': ('c := 922337203685477.58075', 'constant does not fit Currency'),
     'folded-overflow': ('c := High(Currency) + 0.0001', 'Currency overflow in a constant'),
     'anonymous-array-name': ('items := items and d', 'and of array[0..1] of Integer'),
-    'named-array-name': ('pair := pair and d', 'and of TCurrencyQuadWords'),
+    'named-array-name': ('pair := pair and d', 'and of array[0..1] of Integer takes a block of its size, or an integer for an array of integers'),
 }
 for target in ('amd64', 'arm64'):
     core = build / 'a64' if target == 'arm64' else build
