@@ -272,7 +272,7 @@ for target in ("amd64", "arm64"):
             if not result.returncode or message not in result.stdout:
                 raise RuntimeError(f'missing rejection {family}/{name} {target}: {result.stdout!r}')
     for level in (0, 40):
-        for name in ("syserrors", "syserrcatalog", "pollerrors", "sysfiles", "syspipes",
+        for name in ("syserrors", "syserrorstate", "syserrcatalog", "pollerrors", "sysfiles", "syspipes",
                      "sysmetadata", "sysdirectories", "syscontents", "syscwd", "sysstatmodel",
                      "sysenvironment", "sysprocesses", "sysprocessfds", "syswidth", "systemresources", "sysosmodel",
                      "sysbuilder", "textcasts", "sysencoding", "sysencodingmodel", "syscstring",
@@ -310,6 +310,9 @@ for target in ("amd64", "arm64"):
                                   guid_input if name == 'sysguidmodel' else None)
                     cases = stat_cases if name == 'sysstatmodel' else [(arguments, expected)]
                     for arguments, expected_output in cases:
+                        if name == 'syserrorstate' and affinity:
+                            arguments = ['require-reuse']
+                            expected_output += b'recycled G: True\n'
                         if name == 'sysstatmodel':
                             # Directory enumeration and following a symlink
                             # can change atime. Take the independent snapshot

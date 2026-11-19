@@ -14143,7 +14143,9 @@ The messages do not depend on process-global locale settings.
 
 `GetLastOSError` and `SetLastOSError` are the Pascal compatibility API.
 The slot belongs to the pasroutine (G), survives yielding, collection
-and migration to another M, and starts at zero when a G is reused.
+and migration to another M, and starts at zero in every new or reused G,
+including background routines. Changing this error code or `Carry` does
+not change whether a routine or its descendants run in the background.
 It accepts a nonnegative Int32 code; an invalid assignment raises
 `EArgumentOutOfRangeException` and leaves the old value intact.
 Raw `Syscall`/`Sys*` calls return negative errno directly and do not
@@ -14154,8 +14156,10 @@ use `TSysError.RaiseError`.
 
 [`examples/systemerrors.paslang`](../examples/systemerrors.paslang)
 demonstrates contextual explicit errors and two independent pasroutine
-error slots. `syserrors`, `syserrcatalog` and the syscall-migration
-tests check reuse, ownership, all Linux codes and GC on both targets.
+error slots. `syserrors`, `syserrorstate`, `syserrcatalog` and the
+syscall-migration tests check reuse, ownership, all Linux codes and GC
+on both targets. `syserrorstate` also checks independence from `Carry`
+and background inheritance.
 
 **Files and owned handles.** `THandle` is a descriptor, `-1` on failed
 open. `FileOpen(path, fmOpenRead/fmOpenWrite/fmOpenReadWrite)` and

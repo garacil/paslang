@@ -829,6 +829,9 @@ GOLDEN_A64 += wgagain
 # P583: the failures of a channel as exceptions.
 GOLDEN += chanfault chanshut chanoff eofname hexchar openarr bgroutine bgfirst jsoncanonrange sqlcols sqltx rmall inotify inotifylimits
 GOLDEN_A64 += chanfault chanshut chanoff eofname hexchar openarr bgroutine bgfirst jsoncanonrange sqlcols sqltx rmall inotify inotifylimits
+# P179/P639: per-G errno, Carry and background state occupy separate fields.
+GOLDEN += syserrorstate
+GOLDEN_A64 += syserrorstate
 # P573: a server stops whatever became of its sockets.
 GOLDEN += httpstop
 GOLDEN_A64 += httpstop

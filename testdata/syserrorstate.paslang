@@ -1,0 +1,235 @@
+{ This file is part of paslang's tests.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacil@tucall.com>
+  GPL version 3 or later; see COPYING. No warranty. }
+program syserrorstate;
+uses sysutils;
+
+const
+  Batch = 32;
+  Rounds = 5;
+  Total = Batch * Rounds * 2;
+  Codes: array[0..4] of Integer = (0, 1, 13, 256, 2147483647);
+
+var
+  joined: waitgroup;
+  addresses, identities: array[0..Total - 1] of Integer;
+  completed: Integer;
+
+{ Read-only observations of this runtime's reviewed 288-byte G header.
+  No address is dereferenced outside that header and no raw field is written. }
+function GAddress: Integer;
+begin
+  asm amd64 (Result: out rax)
+    movq %r14, %rax
+  end;
+  asm arm64 (Result: out x0)
+    mov x0, x28
+  end;
+end;
+
+function GIdentity: Integer;
+begin
+  asm amd64 (Result: out rax)
+    movq 176(%r14), %rax
+  end;
+  asm arm64 (Result: out x0)
+    ldr x0, [x28, #176]
+  end;
+end;
+
+function BackgroundFlag: Integer;
+begin
+  asm amd64 (Result: out rax)
+    movzbl 257(%r14), %eax
+  end;
+  asm arm64 (Result: out x0)
+    ldrb w0, [x28, #257]
+  end;
+end;
+
+procedure Equal(Stage, Actual, Expected: Integer);
+begin
+  if Actual <> Expected then
+  begin
+    WriteLn('state ', Stage, ': ', Actual, ' <> ', Expected);
+    Halt(71);
+  end;
+end;
+
+procedure State(Code, Bg: Integer; ExpectedCarry: Boolean);
+begin
+  Equal(10, GetLastOSError, Code);
+  Equal(11, BackgroundFlag, Bg);
+  Equal(12, Ord(Carry), Ord(ExpectedCarry));
+end;
+
+procedure Entry(Row, Bg: Integer);
+var firstCode, firstFlag: Integer; firstCarry: Boolean;
+begin
+  { Capture before setting an error, changing Carry or collecting. }
+  firstCode := GetLastOSError;
+  firstCarry := Carry;
+  firstFlag := BackgroundFlag;
+  Equal(1, firstCode, 0);
+  Equal(2, Ord(firstCarry), 0);
+  Equal(3, firstFlag, Bg);
+  addresses[Row] := GAddress;
+  identities[Row] := GIdentity;
+end;
+
+{ The array stays live across the recursive call, forcing bounded stack use.
+  Its sum is checked, so neither the caller nor its frames can be dropped. }
+function Grow(Depth, Seed: Integer): Integer;
+var pad: array[0..63] of Integer; j, value: Integer;
+begin
+  for j := 0 to 63 do pad[j] := Seed + j;
+  if Depth > 0 then value := Grow(Depth - 1, Seed + 1)
+  else value := 0;
+  for j := 0 to 63 do value := value + pad[j];
+  Result := value;
+end;
+
+procedure Exercise(Row, Code, Bg: Integer);
+var value: Byte; value32: UInt32; value64: UInt64; count, sum: Integer;
+begin
+  SetLastOSError(Code);
+  Carry := False;
+  State(Code, Bg, False);
+  { A false Carry in a background G distinguishes bit0 from the adjacent
+    flag. These words must keep errno and background state unchanged. }
+  value := 128;
+  value := RotateLeftThroughCarry(value, 1);
+  Equal(20, value, 0);
+  State(Code, Bg, True);
+  value := RotateRightThroughCarry(value, 1);
+  Equal(21, value, 128);
+  State(Code, Bg, False);
+  { Nonconstant counts reach the variable-count paths. A separately
+    calculated result catches two wrong inverse operations that cancel. }
+  count := 1 + (Row mod 7);
+  value := 128;
+  value := RotateLeftThroughCarry(value, count);
+  if count = 1 then Equal(23, value, 0)
+  else Equal(23, value, 1 shl (count - 2));
+  State(Code, Bg, count = 1);
+  value := RotateRightThroughCarry(value, count);
+  Equal(24, value, 128);
+  State(Code, Bg, False);
+  value32 := 1;
+  value32 := RotateLeftThroughCarry(value32, count);
+  Equal(25, Integer(value32), 1 shl count);
+  State(Code, Bg, False);
+  value32 := RotateRightThroughCarry(value32, count);
+  Equal(26, Integer(value32), 1);
+  State(Code, Bg, False);
+  value64 := 1;
+  value64 := RotateLeftThroughCarry(value64, count);
+  Equal(27, Integer(value64), 1 shl count);
+  State(Code, Bg, False);
+  value64 := RotateRightThroughCarry(value64, count);
+  Equal(28, Integer(value64), 1);
+  State(Code, Bg, False);
+  { The width-sized constants have dedicated 32/64-bit carry paths. }
+  value32 := RotateLeftThroughCarry(value32, 32);
+  Equal(31, Integer(value32), 0);
+  State(Code, Bg, True);
+  value32 := RotateRightThroughCarry(value32, 32);
+  Equal(32, Integer(value32), 1);
+  State(Code, Bg, False);
+  value64 := RotateLeftThroughCarry(value64, 64);
+  Equal(33, Integer(value64), 0);
+  State(Code, Bg, True);
+  value64 := RotateRightThroughCarry(value64, 64);
+  Equal(34, Integer(value64), 1);
+  State(Code, Bg, False);
+  { Variable counts at the width and one complete carry ring reach
+    branches that the corresponding constants do not exercise. }
+  count := 32 + (Row mod 2);
+  value32 := 1;
+  value32 := RotateLeftThroughCarry(value32, count);
+  if Odd(Row) then Equal(35, Integer(value32), 1) else Equal(35, Integer(value32), 0);
+  State(Code, Bg, not Odd(Row));
+  value32 := RotateRightThroughCarry(value32, count);
+  Equal(36, Integer(value32), 1);
+  State(Code, Bg, False);
+  count := 64 + (Row mod 2);
+  value64 := 1;
+  value64 := RotateLeftThroughCarry(value64, count);
+  if Odd(Row) then Equal(37, Integer(value64), 1) else Equal(37, Integer(value64), 0);
+  State(Code, Bg, not Odd(Row));
+  value64 := RotateRightThroughCarry(value64, count);
+  Equal(38, Integer(value64), 1);
+  State(Code, Bg, False);
+  Yield;
+  GcCollect;
+  sum := Grow(8, Row + 1);
+  Equal(22, sum, 576 * (Row + 1) + 20448);
+  State(Code, Bg, False);
+end;
+
+procedure Child(Row, Code: Integer);
+var bg: Integer;
+begin
+  bg := (Row div 2) mod 2;
+  Entry(Row, bg);
+  Exercise(Row, Code, bg);
+  AtomicAdd(@completed, 1);
+  joined.Done;
+end;
+
+procedure Parent(Row, Code: Integer);
+var bg: Integer;
+begin
+  bg := (Row div 2) mod 2;
+  Entry(Row, bg);
+  Exercise(Row, Code, bg);
+  { Plain pas must inherit only the parent's background state, including
+    after SetLastOSError(0), (256) and (High(Int32)). }
+  pas Child(Row + 1, Code);
+  State(Code, bg, False);
+  AtomicAdd(@completed, 1);
+  joined.Done;
+end;
+
+var phase, i, j, row, code: Integer; recycled: Boolean;
+begin
+  for phase := 0 to Rounds - 1 do
+  begin
+    SetLastOSError(Codes[phase]);
+    Carry := False;
+    joined.Add(Batch * 2);
+    for i := 0 to Batch - 1 do
+    begin
+      row := (phase * Batch + i) * 2;
+      code := Codes[(i div 2) mod 5];
+      if Odd(i) then pas background Parent(row, code)
+      else pas Parent(row, code);
+    end;
+    joined.Wait;
+    State(Codes[phase], 0, False);
+  end;
+  Equal(30, completed, Total);
+  recycled := False;
+  for i := 0 to Total - 1 do
+  begin
+    if (addresses[i] = 0) or (identities[i] <= 0) then Halt(72);
+    for j := 0 to i - 1 do
+      if addresses[i] = addresses[j] then
+      begin
+        if identities[i] = identities[j] then Halt(73);
+        recycled := True;
+      end;
+  end;
+  { Different incarnation ids at one G address prove actual record reuse;
+    repeated yields of the same live routine do not satisfy this check. }
+  WriteLn('independent state ', completed);
+  { An all-CPU run checks incarnation ids when reuse occurs, without
+    imposing a scheduling policy. The focused one-CPU helper asks for
+    an actual reuse witness; taskset still leaves the runtime's minimum2 Ps. }
+  if (ParamCount > 1) or ((ParamCount = 1) and (ParamStr(1) <> 'require-reuse')) then Halt(75);
+  if ParamCount = 1 then
+  begin
+    if not recycled then Halt(74);
+    WriteLn('recycled G: ', recycled);
+  end;
+end.
