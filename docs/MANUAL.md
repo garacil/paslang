@@ -13008,8 +13008,12 @@ Archive := w.Finish;
   `Consumed`, `Total`, `MaxOutput` (0 is no limit) and, for gzip,
   `Multistream` (on: a file of several members is read on, as gzip(1) does)
   and the header's `HeaderName`, `HeaderComment`, `HeaderMTime`,
-  `HeaderOS`, `HeaderExtra`. A piece may end anywhere, even inside a
-  symbol. `FlateInflate(s, start, used)`, `ZlibDecode(s)` and
+  `HeaderOS`, `HeaderExtra`. Set a positive `MaxOutput` before feeding
+  input to bound cumulative decoded bytes, including across `Take` calls
+  and gzip members. An over-budget operation raises before making the
+  excess bytes; an error may leave a shorter prefix instead of filling
+  the budget. The bound does not cap reserved buffers or process memory.
+  A piece may end anywhere, even inside a symbol. `FlateInflate(s, start, used)`, `ZlibDecode(s)` and
   `GzipDecode(s)` do it in one call. `TDeflater.Create(kind, level)` with
   `Feed`, `Take`, `Flush` (ends the block so what was fed can be read;
   zlib's Z_SYNC_FLUSH) and `Finish`, and the gzip header's name, comment
