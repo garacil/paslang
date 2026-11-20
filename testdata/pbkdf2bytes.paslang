@@ -1,0 +1,113 @@
+program pbkdf2bytes;
+
+{ Independent, intentionally simple PBKDF2 recurrence built from the
+  existing public whole-message HMAC API. It does not use the new
+  prepared states, word XOR, direct block kernels or padding layout. }
+function Mac(Alg: Integer; const Key, Msg: string): string;
+begin
+  if Alg = 1 then Result := HmacSha1(Key, Msg)
+  else Result := HmacSha256(Key, Msg);
+end;
+
+function Reference(Alg: Integer; const Key, Salt: string; C, N: Integer): string;
+var B, R, I: Integer; Counter, U, T: string;
+begin
+  Result := '';
+  B := 1;
+  while Length(Result) < N do
+  begin
+    Counter := Char((B shr 24) and 255) + Char((B shr 16) and 255) +
+      Char((B shr 8) and 255) + Char(B and 255);
+    U := Mac(Alg, Key, Salt + Counter);
+    T := U;
+    for R := 2 to C do
+    begin
+      U := Mac(Alg, Key, U);
+      for I := 1 to Length(T) do T[I] := Char(Ord(T[I]) xor Ord(U[I]));
+    end;
+    Result := Result + T;
+    Inc(B);
+  end;
+  Result := Copy(Result, 1, N);
+end;
+
+function Bytes(N, Seed: Integer): string;
+var I: Integer;
+begin
+  SetLength(Result, N);
+  for I := 1 to N do Result[I] := Char((I * 131 + Seed) and 255);
+end;
+
+procedure Compare(Alg, Stage: Integer; const P, S: string; C, N: Integer);
+var Actual, Expected: string;
+begin
+  Expected := Reference(Alg, P, S, C, N);
+  if Alg = 1 then Actual := Pbkdf2HmacSha1(P, S, C, N)
+  else Actual := Pbkdf2HmacSha256(P, S, C, N);
+  if (Length(Actual) <> N) or (Actual <> Expected) then
+  begin WriteLn('PBKDF2 bytes ', Alg, ' stage ', Stage); Halt(121); end;
+end;
+
+procedure Empty(const D: string; Stage: Integer);
+begin
+  if D <> '' then begin WriteLn('PBKDF2 invalid ', Stage); Halt(122); end;
+end;
+
+const
+  Lens: array[0..12] of Integer = (1, 19, 20, 21, 31, 32, 33, 39, 40, 41, 63, 64, 65);
+  SaltLens: array[0..13] of Integer = (0, 1, 51, 52, 55, 56, 59, 60, 63, 64, 65, 127, 128, 129);
+  PassLens: array[0..4] of Integer = (0, 63, 64, 65, 129);
+var
+  A, Alg, I, CountedLen: Integer;
+  P, S, SavedP, SavedS: string;
+begin
+  for A := 0 to 1 do
+  begin
+    if A = 0 then Alg := 1 else Alg := 256;
+    for I := 0 to High(Lens) do
+      Compare(Alg, I, '', '', 1 + I mod 3, Lens[I]);
+    for I := 0 to High(SaltLens) do
+      Compare(Alg, 20 + I, 'pass'#0'word', Bytes(SaltLens[I], 255), 2, 65);
+    for I := 0 to High(PassLens) do
+      Compare(Alg, 40 + I, Bytes(PassLens[I], 128), #0#255#128'raw', 7, 41);
+    { Block index 256 must not collapse to one byte or use little endian. }
+    if Alg = 1 then CountedLen := 5137 else CountedLen := 8193;
+    Compare(Alg, 50, 'key', 'salt', 2, CountedLen);
+    { Whole-message feeds cross the shared 64-KiB kernel chunk bound. }
+    for I := 65535 to 65537 do
+      Compare(Alg, I, 'key', Bytes(I, 17), 2, 65);
+    Compare(Alg, 52, Bytes(65537, 42), 'salt', 2, 65);
+    P := Bytes(129, 42);
+    S := Bytes(129, 17);
+    { Separate allocations: ordinary assignments would share the input
+      backing bytes and hide a faulty const-pointer write. }
+    SavedP := Bytes(129, 42);
+    SavedS := Bytes(129, 17);
+    Compare(Alg, 51, P, S, 3, 65);
+    if (P <> SavedP) or (S <> SavedS) then Halt(123);
+  end;
+  Empty(Pbkdf2HmacSha1('', '', 0, 1), 1);
+  Empty(Pbkdf2HmacSha256('', '', 0, 1), 2);
+  Empty(Pbkdf2HmacSha1('p', 's', -1, 20), 3);
+  Empty(Pbkdf2HmacSha256('p', 's', Low(Integer), 32), 4);
+  Empty(Pbkdf2HmacSha1('p', 's', 1, 0), 5);
+  Empty(Pbkdf2HmacSha256('p', 's', 1, -1), 6);
+  Empty(Pbkdf2HmacSha1('p', 's', 1, 85899345901), 7);
+  Empty(Pbkdf2HmacSha256('p', 's', 1, 137438953441), 8);
+  Empty(Pbkdf2HmacSha1('p', 's', 1, High(Integer)), 9);
+  Empty(Pbkdf2HmacSha256('p', 's', High(Integer), High(Integer)), 10);
+  P := 'password';
+  P := Pbkdf2HmacSha1(P, 'salt', 2, 20);
+  if Hex(P) <> 'ea6c014dc72d6f8ccd1ed92ace1d41f0d8de8957' then Halt(124);
+  P := 'previous key';
+  P := Pbkdf2HmacSha256(P, 'salt', 0, 32);
+  Empty(P, 11);
+  S := 'salt';
+  S := Pbkdf2HmacSha1('password', S, 2, 20);
+  if Hex(S) <> 'ea6c014dc72d6f8ccd1ed92ace1d41f0d8de8957' then Halt(124);
+  WriteLn('ok PBKDF2 byte boundaries');
+end.
+
+{ This file is part of paslang's tests.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacil@tucall.com>
+  GPL version 3 or later; see COPYING. No warranty. }

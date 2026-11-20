@@ -71,7 +71,7 @@ runs_here() {
     return 0
 }
 
-sha='sha1 sha256 sha224 hmac merkleroot'
+sha='sha1 sha256 sha224 hmac pbkdf2hmacsha1 pbkdf2hmacsha256 merkleroot'
 each() {
     body=$1
     shift

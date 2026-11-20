@@ -180,6 +180,9 @@ GOLDEN_A64 += withonce withcapture withmap
 # P343: HMAC with its pad in the hash state, no copy of the message.
 GOLDEN += hmacstream
 GOLDEN_A64 += hmacstream
+# P678: RFC vectors, exact-byte boundaries and per-routine roots.
+GOLDEN += pbkdf2 pbkdf2bytes pbkdf2routines pbkdf2args
+GOLDEN_A64 += pbkdf2 pbkdf2bytes pbkdf2routines pbkdf2args
 # P172: with on an object.
 GOLDEN += withobj
 GOLDEN_A64 += withobj
@@ -4784,6 +4787,39 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  range_got=$$(timeout 20 $$p huge-down); test "$$range_got" = "9223372036854775807"; \
 	done; done; \
 	echo ok unrollrange-inline; \
+	: P678 PBKDF2 independent bytes, CPU/inline selection and runtime roots; \
+	python3 -I -B scripts/pbkdf2_model.py >$(BUILDDIR)/pbkdf2-oracle.expected 2>$(BUILDDIR)/pbkdf2-oracle.model.err; \
+	test ! -s $(BUILDDIR)/pbkdf2-oracle.model.err || { cat $(BUILDDIR)/pbkdf2-oracle.model.err >&2; exit 1; }; \
+	for pk_cpu in base native; do for pk_inl in 0 40; do \
+	  for pk_case in pbkdf2 pbkdf2bytes pbkdf2routines pbkdf2args pbkdf2oracle; do \
+	    pk_bin=$(BUILDDIR)/$$pk_case-$$pk_cpu-$$pk_inl; \
+	    $(OUTDIR)/paslangc -cpu $$pk_cpu -inline $$pk_inl -Fu $(BUILDDIR) -o $$pk_bin testdata/$$pk_case.paslang >$$pk_bin.compile.out 2>$$pk_bin.compile.err || { pk_status=$$?; cat $$pk_bin.compile.out; cat $$pk_bin.compile.err >&2; exit $$pk_status; }; \
+	    test ! -s $$pk_bin.compile.out && test ! -s $$pk_bin.compile.err || { cat $$pk_bin.compile.out; cat $$pk_bin.compile.err >&2; exit 1; }; \
+	    pk_expected=testdata/$$pk_case.out; if [ "$$pk_case" = pbkdf2oracle ]; then pk_expected=$(BUILDDIR)/pbkdf2-oracle.expected; fi; \
+	    timeout 600 $$pk_bin >$$pk_bin.got 2>$$pk_bin.err || { pk_status=$$?; cat $$pk_bin.got; cat $$pk_bin.err >&2; exit $$pk_status; }; \
+	    test ! -s $$pk_bin.err || { cat $$pk_bin.err >&2; exit 1; }; diff -u $$pk_expected $$pk_bin.got; \
+	    PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=3 PASLANG_GCPOISON=1 timeout 600 $$pk_bin >$$pk_bin.gc.got 2>$$pk_bin.gc.err || { pk_status=$$?; cat $$pk_bin.gc.got; cat $$pk_bin.gc.err >&2; exit $$pk_status; }; \
+	    test ! -s $$pk_bin.gc.err || { cat $$pk_bin.gc.err >&2; exit 1; }; diff -u $$pk_expected $$pk_bin.gc.got; \
+	  done; \
+	done; done; \
+	: P678 invalid calls and reserved names are compile-only controls; \
+	for pk_inl in 0 40; do for pk_case in missing extra password salt iterations keylen reservedsha1 reservedsha256; do \
+	  pk_bin=$(BUILDDIR)/pbkdf2bad-$$pk_case-$$pk_inl; rm -f "$$pk_bin"; pk_status=0; \
+	  $(OUTDIR)/paslangc -cpu base -inline $$pk_inl -Fu $(BUILDDIR) -o "$$pk_bin" "$(CURDIR)/testdata/pbkdf2bad/$$pk_case.paslang" >"$$pk_bin.out" 2>"$$pk_bin.err" || pk_status=$$?; \
+	  test "$$pk_status" -eq 1 || { cat "$$pk_bin.out"; cat "$$pk_bin.err" >&2; exit 1; }; \
+	  test ! -s "$$pk_bin.out" || { cat "$$pk_bin.out"; exit 1; }; \
+	  test ! -e "$$pk_bin" && test ! -L "$$pk_bin" || { echo "$$pk_case: rejected source left an executable"; exit 1; }; \
+	  printf 'paslangc: %s in %s\n' "$$(cat testdata/pbkdf2bad/$$pk_case.err)" "$(CURDIR)/testdata/pbkdf2bad/$$pk_case.paslang" >"$$pk_bin.expected.err"; \
+	  diff -u "$$pk_bin.expected.err" "$$pk_bin.err"; \
+	done; done; \
+	: RFC 6070 long count once per CPU backend, separate from the short inline/GC matrix; \
+	for pk_cpu in base native; do \
+	  pk_bin=$(BUILDDIR)/pbkdf2slow-$$pk_cpu; \
+	  $(OUTDIR)/paslangc -cpu $$pk_cpu -inline 40 -Fu $(BUILDDIR) -o $$pk_bin testdata/pbkdf2slow.paslang >$$pk_bin.compile.out 2>$$pk_bin.compile.err || { pk_status=$$?; cat $$pk_bin.compile.out; cat $$pk_bin.compile.err >&2; exit $$pk_status; }; \
+	  test ! -s $$pk_bin.compile.out && test ! -s $$pk_bin.compile.err || { cat $$pk_bin.compile.out; cat $$pk_bin.compile.err >&2; exit 1; }; \
+	  timeout 600 $$pk_bin >$$pk_bin.got 2>$$pk_bin.err || { pk_status=$$?; cat $$pk_bin.got; cat $$pk_bin.err >&2; exit $$pk_status; }; \
+	  test ! -s $$pk_bin.err || { cat $$pk_bin.err >&2; exit 1; }; diff -u testdata/pbkdf2slow.out $$pk_bin.got; \
+	done; \
 	: typed FP constants and ordinal conversion boundaries under both inline policies; \
 	for fp_cpu in base native; do for fp_inl in 0 40; do \
 	  for fp_case in fpbaselinedirectsingle fpbaselinedirectdouble fpbaselinenilarysingle fpbaselinenilarydouble fpconstant constfoldtypes chrboundary chrsideeffects charliteralconst typeargcore typeargdirectives typeargkeywords; do \
@@ -6646,7 +6682,43 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	  range_got=$$(timeout 20 $(QEMU_A64) -cpu $$model $$p huge-up); test "$$range_got" = "-9223372036854775808"; \
 	  range_got=$$(timeout 20 $(QEMU_A64) -cpu $$model $$p huge-down); test "$$range_got" = "9223372036854775807"; \
 	done; done; \
-	echo ok unrollrange-arm-inline; \
+	echo ok unrollrange-arm-inline
+	@set -e; \
+	: P678 PBKDF2 independent bytes, CPU/inline selection and runtime roots; \
+	python3 -I -B scripts/pbkdf2_model.py >$(BUILDDIR)/pbkdf2-oracle-arm.expected 2>$(BUILDDIR)/pbkdf2-oracle-arm.model.err; \
+	test ! -s $(BUILDDIR)/pbkdf2-oracle-arm.model.err || { cat $(BUILDDIR)/pbkdf2-oracle-arm.model.err >&2; exit 1; }; \
+	for pk_cpu in base max; do for pk_inl in 0 40; do \
+	  pk_model=max; if [ "$$pk_cpu" = base ]; then pk_model=cortex-a53; fi; \
+	  for pk_case in pbkdf2 pbkdf2bytes pbkdf2routines pbkdf2args pbkdf2oracle; do \
+	    pk_bin=$(BUILDDIR)/$$pk_case-$$pk_cpu-$$pk_inl-arm; \
+	    $(OUTDIR)/paslangc -target arm64 -cpu $$pk_cpu -inline $$pk_inl -Fu $(A64DIR) -o $$pk_bin testdata/$$pk_case.paslang >$$pk_bin.compile.out 2>$$pk_bin.compile.err || { pk_status=$$?; cat $$pk_bin.compile.out; cat $$pk_bin.compile.err >&2; exit $$pk_status; }; \
+	    test ! -s $$pk_bin.compile.out && test ! -s $$pk_bin.compile.err || { cat $$pk_bin.compile.out; cat $$pk_bin.compile.err >&2; exit 1; }; \
+	    pk_expected=testdata/$$pk_case.out; if [ "$$pk_case" = pbkdf2oracle ]; then pk_expected=$(BUILDDIR)/pbkdf2-oracle-arm.expected; fi; \
+	    timeout 1800 $(QEMU_A64) -cpu $$pk_model $$pk_bin >$$pk_bin.got 2>$$pk_bin.err || { pk_status=$$?; cat $$pk_bin.got; cat $$pk_bin.err >&2; exit $$pk_status; }; \
+	    test ! -s $$pk_bin.err || { cat $$pk_bin.err >&2; exit 1; }; diff -u $$pk_expected $$pk_bin.got; \
+	    PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=3 PASLANG_GCPOISON=1 timeout 1800 $(QEMU_A64) -cpu $$pk_model $$pk_bin >$$pk_bin.gc.got 2>$$pk_bin.gc.err || { pk_status=$$?; cat $$pk_bin.gc.got; cat $$pk_bin.gc.err >&2; exit $$pk_status; }; \
+	    test ! -s $$pk_bin.gc.err || { cat $$pk_bin.gc.err >&2; exit 1; }; diff -u $$pk_expected $$pk_bin.gc.got; \
+	  done; \
+	done; done; \
+	: P678 invalid calls and reserved names are compile-only controls; \
+	for pk_inl in 0 40; do for pk_case in missing extra password salt iterations keylen reservedsha1 reservedsha256; do \
+	  pk_bin=$(BUILDDIR)/pbkdf2bad-$$pk_case-$$pk_inl-arm; rm -f "$$pk_bin"; pk_status=0; \
+	  $(OUTDIR)/paslangc -target arm64 -cpu base -inline $$pk_inl -Fu $(A64DIR) -o "$$pk_bin" "$(CURDIR)/testdata/pbkdf2bad/$$pk_case.paslang" >"$$pk_bin.out" 2>"$$pk_bin.err" || pk_status=$$?; \
+	  test "$$pk_status" -eq 1 || { cat "$$pk_bin.out"; cat "$$pk_bin.err" >&2; exit 1; }; \
+	  test ! -s "$$pk_bin.out" || { cat "$$pk_bin.out"; exit 1; }; \
+	  test ! -e "$$pk_bin" && test ! -L "$$pk_bin" || { echo "$$pk_case: rejected source left an executable"; exit 1; }; \
+	  printf 'paslangc: %s in %s\n' "$$(cat testdata/pbkdf2bad/$$pk_case.err)" "$(CURDIR)/testdata/pbkdf2bad/$$pk_case.paslang" >"$$pk_bin.expected.err"; \
+	  diff -u "$$pk_bin.expected.err" "$$pk_bin.err"; \
+	done; done; \
+	: RFC 6070 long count once per CPU backend, separate from the short inline/GC matrix; \
+	for pk_cpu in base max; do \
+	  pk_model=max; if [ "$$pk_cpu" = base ]; then pk_model=cortex-a53; fi; \
+	  pk_bin=$(BUILDDIR)/pbkdf2slow-$$pk_cpu-arm; \
+	  $(OUTDIR)/paslangc -target arm64 -cpu $$pk_cpu -inline 40 -Fu $(A64DIR) -o $$pk_bin testdata/pbkdf2slow.paslang >$$pk_bin.compile.out 2>$$pk_bin.compile.err || { pk_status=$$?; cat $$pk_bin.compile.out; cat $$pk_bin.compile.err >&2; exit $$pk_status; }; \
+	  test ! -s $$pk_bin.compile.out && test ! -s $$pk_bin.compile.err || { cat $$pk_bin.compile.out; cat $$pk_bin.compile.err >&2; exit 1; }; \
+	  timeout 1800 $(QEMU_A64) -cpu $$pk_model $$pk_bin >$$pk_bin.got 2>$$pk_bin.err || { pk_status=$$?; cat $$pk_bin.got; cat $$pk_bin.err >&2; exit $$pk_status; }; \
+	  test ! -s $$pk_bin.err || { cat $$pk_bin.err >&2; exit 1; }; diff -u testdata/pbkdf2slow.out $$pk_bin.got; \
+	done; \
 	: typed FP constants and ordinal conversion boundaries under both inline policies; \
 	for fp_cpu in base max; do for fp_inl in 0 40; do \
 	  fp_model=max; if [ "$$fp_cpu" = base ]; then fp_model=cortex-a53; fi; \

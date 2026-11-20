@@ -899,6 +899,104 @@ end;
     return t.replace('{V}', v)
 
 
+
+def pbkdf2(v, family):
+    """RFC 8018: prepared HMAC states and fixed digest-size U rounds."""
+    hlen = 20 if family == 'Sha1' else 32
+    nw = hlen // 4
+    block = family + 'Blocks' + ('Cpu' if v == 'Cpu' else 'Plain')
+    t = r"""
+{ RFC 8018 5.2: HMAC's normalized key and both pad states are prepared
+  once, as Go crypto/internal/fips140/hmac.Reset does. The salt prefix
+  is also retained. Subsequent U values have a fixed digest length:
+  two existing SHA block calls, with no per-round string allocation. }
+function PasPbkdf2Hmac{F}{V}(const Password, Salt: string;
+  Iterations, KeyLen: Integer): string;
+var
+  keyed: THmacState;
+  salted, outer, cur: THashState;
+  innerWords, outerWords, u, t, w: array[0..7] of UInt32;
+  ibuf, obuf: array[0..63] of Byte;
+  opad, counter, d: string;
+  i, j, blocks, bidx, remain, take, done: Integer;
+begin
+  Result := '';
+  { Positive counts and the RFC's 32-bit block index, before any
+    allocation. This form cannot overflow as KeyLen + hLen could. }
+  if (Iterations < 1) or (KeyLen < 1) then Exit;
+  blocks := (KeyLen - 1) div {HL} + 1;
+  if blocks > 4294967295 then Exit;
+  { SHA-1/256 encode a message length below 2^64 bits. The salt's
+    inner message also contains the 64-byte ipad and 4-byte index. }
+  if Length(Password) > 2305843009213693951 then Exit;
+  if Length(Salt) > 2305843009213693883 then Exit;
+
+  PasHmacBegin{V}(keyed, {ALG}, Password);
+  for i := 0 to 7 do innerWords[i] := UInt32(keyed.Inner.W[i]);
+  SetLength(opad, 64);
+  for i := 0 to 63 do opad[i + 1] := Char(keyed.Opad[i]);
+  PasHashBegin(outer, {ALG});
+  Pas{F}Update{V}(outer, opad);
+  for i := 0 to 7 do outerWords[i] := UInt32(outer.W[i]);
+  salted := keyed.Inner;
+  Pas{F}Update{V}(salted, Salt);
+
+  for i := 0 to 63 do begin ibuf[i] := 0; obuf[i] := 0; end;
+  ibuf[{HL}] := 128;
+  obuf[{HL}] := 128;
+  StoreBE64(@ibuf[56], {BITS});
+  StoreBE64(@obuf[56], {BITS});
+  SetLength(counter, 4);
+  SetLength(Result, KeyLen);
+  done := 0;
+  for bidx := 1 to blocks do
+  begin
+    { U1 = PRF(password, salt || INT_BE32(block)). Final hashes a copy. }
+    StoreBE32(@counter[1], bidx);
+    cur := salted;
+    Pas{F}Update{V}(cur, counter);
+    d := Pas{F}Final{V}(cur);
+    cur := outer;
+    Pas{F}Update{V}(cur, d);
+    d := Pas{F}Final{V}(cur);
+    for i := 0 to {NWLAST} do
+    begin
+      u[i] := UInt32(LoadBE32(@d[4 * i + 1]));
+      t[i] := u[i];
+    end;
+    remain := Iterations - 1;
+    while remain > 0 do
+    begin
+{INNER_SERIALIZE}
+      w := innerWords;
+      {BLK}(@w[0], @ibuf[0], 1);
+{OUTER_SERIALIZE}
+      u := outerWords;
+      {BLK}(@u[0], @obuf[0], 1);
+{XOR_WORDS}
+      Dec(remain);
+    end;
+{T_SERIALIZE}
+    take := KeyLen - done;
+    if take > {HL} then take := {HL};
+    for j := 0 to take - 1 do Result[done + j + 1] := Char(obuf[j]);
+    done := done + take;
+  end;
+end;
+"""
+    values = {
+        'F': family, 'V': v, 'HL': str(hlen),
+        'ALG': '1' if family == 'Sha1' else '3',
+        'BITS': str((64 + hlen) * 8), 'NWLAST': str(nw - 1), 'BLK': block,
+        'INNER_SERIALIZE': '\n'.join('      StoreBE32(@ibuf[%d], u[%d]);' % (4*i, i) for i in range(nw)),
+        'OUTER_SERIALIZE': '\n'.join('      StoreBE32(@obuf[%d], w[%d]);' % (4*i, i) for i in range(nw)),
+        'XOR_WORDS': '\n'.join('      t[%d] := t[%d] xor u[%d];' % (i, i, i) for i in range(nw)),
+        'T_SERIALIZE': '\n'.join('    StoreBE32(@obuf[%d], t[%d]);' % (4*i, i) for i in range(nw)),
+    }
+    for key, value in values.items():
+        t = t.replace('{' + key + '}', value)
+    return t
+
 MD5_INC = r"""
 { MD5 in pieces: the same buffering on Md5Blocks, which has one body; the
   length is the little-endian count of bits (RFC 1321 3.2 and 3.4) }
@@ -1372,7 +1470,8 @@ HEAD = r'''{ This file is part of paslang.
 { The hash words of the language (P111): Md5, Sha1, Sha224, Sha256,
   Sha384, Sha512, Sha3_224, Sha3_256, Sha3_384, Sha3_512, the HMAC of
   each of the first six, Crc32, Crc32c, Adler32, Fnv1a32, Fnv1a64,
-  Murmur3, SipHash, Hex, and the Merkle words on Sha256. Each algorithm
+  Murmur3, SipHash, Hex, the Merkle words on Sha256,
+  and PBKDF2-HMAC-SHA1/SHA256 (RFC 8018). Each algorithm
   is written here as its standard writes it (RFC 1321, FIPS 180-4,
   FIPS 202, RFC 2104, RFC 1952, RFC 3720, RFC 1950, MurmurHash3 and
   SipHash-2-4 as their authors published them, RFC 9162), in Pascal
@@ -1471,6 +1570,17 @@ function PasSha512Base(const S: string): string;
 function PasSha3(const S: string; Bits: Integer): string;
 function PasHmacCpu(Alg: Integer; const Key, Msg: string): string;
 function PasHmacBase(Alg: Integer; const Key, Msg: string): string;
+{ PBKDF2-HMAC, RFC 8018 5.2: raw password/salt bytes, including NUL.
+  A nonempty KeyLen-byte result, or '' for invalid counts/lengths.
+  The language selects Cpu/Base using the same features as SHA. }
+function PasPbkdf2HmacSha1Cpu(const Password, Salt: string;
+  Iterations, KeyLen: Integer): string;
+function PasPbkdf2HmacSha256Cpu(const Password, Salt: string;
+  Iterations, KeyLen: Integer): string;
+function PasPbkdf2HmacSha1Base(const Password, Salt: string;
+  Iterations, KeyLen: Integer): string;
+function PasPbkdf2HmacSha256Base(const Password, Salt: string;
+  Iterations, KeyLen: Integer): string;
 function PasCrc32Cpu(const S: string; Crc: Integer): Integer;
 function PasCrc32Base(const S: string; Crc: Integer): Integer;
 function PasCrc32cCpu(const S: string; Crc: Integer): Integer;
@@ -2499,6 +2609,9 @@ end;
     out.append(SHA3_INC)
     out.append(hmac_inc('Cpu'))
     out.append(hmac_inc('Base'))
+    for v in ('Cpu', 'Base'):
+        for family in ('Sha1', 'Sha256'):
+            out.append(pbkdf2(v, family))
     out.append('\nend.\n')
     text = align_loops('\n'.join(out))
     path = os.path.join(ROOT, 'src', 'lib', 'pashash.paslang')

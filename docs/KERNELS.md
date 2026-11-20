@@ -68,6 +68,15 @@ for each machine (its license is in `LICENSE-GO`);
 | `AesEncCpu`, `AesDecCpu`, `AesXorBlocksCpu` | AES-128/192/256 (FIPS 197): one block each way, and counter mode's blocks encrypted and xored, at most 64 a call from `CtrXor` (P428) | amd64 AES-NI (`aes`): `aesenc`, `aesenclast`, `aesdec`, `aesdeclast` (SDM vol. 2A); arm64 FEAT_AES (`aes`): `aese`, `aesmc`, `aesd`, `aesimc` (Arm ARM C7.2) | `AesEncryptPlain`, `AesDecryptPlain`: the S-box as the inverse in GF(2^8) and the affine map, eight bytes of a word at once, no table | `testdata/cipherkat` (FIPS 197, Go's GCM table, SP 800-38A F.5.1) and `testdata/cipherwyche` (Wycheproof), native, base, arm64 max and base | `src/lib/pascipher.paslang`, after Go's `crypto/internal/fips140/aes` |
 | `GhashBlocksCpu` | GHASH (SP 800-38D 6.4), N blocks, at most 1024 a call from `GhashUpdate` (P428) | amd64 PCLMULQDQ with SSSE3's `pshufb` (`pclmul`, `ssse3`); arm64 FEAT_PMULL (`pmull`): four carry-less products, the shift by one of GCM's reflected bits and the reduction of Gueron and Kounavis' white paper on PCLMULQDQ and GCM | `GhashMulPlain`: BearSSL's `ghash_ctmul64`, integer products whose carries fall in holes four bits apart, no table | `cipherkat`, `cipherwyche` | `pascipher` |
 
+PBKDF2-HMAC-SHA1/SHA256 adapt the existing SHA-1/SHA-256 kernels above,
+without another compression implementation. `PasPbkdf2HmacSha1Cpu/Base`
+and `PasPbkdf2HmacSha256Cpu/Base` retain prepared HMAC pad states; each
+subsequent U round calls the chosen existing block kernel twice with one
+64-byte block. The parser uses the same SHA feature gates, checked by
+`cpufeat`; RFC 6070/7914 and the independent hashlib byte oracle accompany
+`pbkdf2`, `pbkdf2bytes`, `pbkdf2oracle`, `pbkdf2slow` and
+`pbkdf2routines`. The template lives in `scripts/hashgen.py`.
+
 Currency's checked arithmetic reuses `pasfmt`'s existing `Mul128` and
 `DivMod128` pair: exact signed magnitudes, one scale adjustment and one
 nearest-even rounding. Decimal parse/format and binary64/binary128 conversion

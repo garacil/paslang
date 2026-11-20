@@ -22,7 +22,8 @@
 { The hash words of the language (P111): Md5, Sha1, Sha224, Sha256,
   Sha384, Sha512, Sha3_224, Sha3_256, Sha3_384, Sha3_512, the HMAC of
   each of the first six, Crc32, Crc32c, Adler32, Fnv1a32, Fnv1a64,
-  Murmur3, SipHash, Hex, and the Merkle words on Sha256. Each algorithm
+  Murmur3, SipHash, Hex, the Merkle words on Sha256,
+  and PBKDF2-HMAC-SHA1/SHA256 (RFC 8018). Each algorithm
   is written here as its standard writes it (RFC 1321, FIPS 180-4,
   FIPS 202, RFC 2104, RFC 1952, RFC 3720, RFC 1950, MurmurHash3 and
   SipHash-2-4 as their authors published them, RFC 9162), in Pascal
@@ -121,6 +122,17 @@ function PasSha512Base(const S: string): string;
 function PasSha3(const S: string; Bits: Integer): string;
 function PasHmacCpu(Alg: Integer; const Key, Msg: string): string;
 function PasHmacBase(Alg: Integer; const Key, Msg: string): string;
+{ PBKDF2-HMAC, RFC 8018 5.2: raw password/salt bytes, including NUL.
+  A nonempty KeyLen-byte result, or '' for invalid counts/lengths.
+  The language selects Cpu/Base using the same features as SHA. }
+function PasPbkdf2HmacSha1Cpu(const Password, Salt: string;
+  Iterations, KeyLen: Integer): string;
+function PasPbkdf2HmacSha256Cpu(const Password, Salt: string;
+  Iterations, KeyLen: Integer): string;
+function PasPbkdf2HmacSha1Base(const Password, Salt: string;
+  Iterations, KeyLen: Integer): string;
+function PasPbkdf2HmacSha256Base(const Password, Salt: string;
+  Iterations, KeyLen: Integer): string;
 function PasCrc32Cpu(const S: string; Crc: Integer): Integer;
 function PasCrc32Base(const S: string; Crc: Integer): Integer;
 function PasCrc32cCpu(const S: string; Crc: Integer): Integer;
@@ -8525,6 +8537,410 @@ begin
   HmacFeedBase(o, opad);
   HmacFeedBase(o, d);
   Result := HmacEndBase(o);
+end;
+
+
+{ RFC 8018 5.2: HMAC's normalized key and both pad states are prepared
+  once, as Go crypto/internal/fips140/hmac.Reset does. The salt prefix
+  is also retained. Subsequent U values have a fixed digest length:
+  two existing SHA block calls, with no per-round string allocation. }
+function PasPbkdf2HmacSha1Cpu(const Password, Salt: string;
+  Iterations, KeyLen: Integer): string;
+var
+  keyed: THmacState;
+  salted, outer, cur: THashState;
+  innerWords, outerWords, u, t, w: array[0..7] of UInt32;
+  ibuf, obuf: array[0..63] of Byte;
+  opad, counter, d: string;
+  i, j, blocks, bidx, remain, take, done: Integer;
+begin
+  Result := '';
+  { Positive counts and the RFC's 32-bit block index, before any
+    allocation. This form cannot overflow as KeyLen + hLen could. }
+  if (Iterations < 1) or (KeyLen < 1) then Exit;
+  blocks := (KeyLen - 1) div 20 + 1;
+  if blocks > 4294967295 then Exit;
+  { SHA-1/256 encode a message length below 2^64 bits. The salt's
+    inner message also contains the 64-byte ipad and 4-byte index. }
+  if Length(Password) > 2305843009213693951 then Exit;
+  if Length(Salt) > 2305843009213693883 then Exit;
+
+  PasHmacBeginCpu(keyed, 1, Password);
+  for i := 0 to 7 do innerWords[i] := UInt32(keyed.Inner.W[i]);
+  SetLength(opad, 64);
+  for i := 0 to 63 do opad[i + 1] := Char(keyed.Opad[i]);
+  PasHashBegin(outer, 1);
+  PasSha1UpdateCpu(outer, opad);
+  for i := 0 to 7 do outerWords[i] := UInt32(outer.W[i]);
+  salted := keyed.Inner;
+  PasSha1UpdateCpu(salted, Salt);
+
+  for i := 0 to 63 do begin ibuf[i] := 0; obuf[i] := 0; end;
+  ibuf[20] := 128;
+  obuf[20] := 128;
+  StoreBE64(@ibuf[56], 672);
+  StoreBE64(@obuf[56], 672);
+  SetLength(counter, 4);
+  SetLength(Result, KeyLen);
+  done := 0;
+  for bidx := 1 to blocks do
+  begin
+    { U1 = PRF(password, salt || INT_BE32(block)). Final hashes a copy. }
+    StoreBE32(@counter[1], bidx);
+    cur := salted;
+    PasSha1UpdateCpu(cur, counter);
+    d := PasSha1FinalCpu(cur);
+    cur := outer;
+    PasSha1UpdateCpu(cur, d);
+    d := PasSha1FinalCpu(cur);
+    for i := 0 to 4 do
+    begin
+      u[i] := UInt32(LoadBE32(@d[4 * i + 1]));
+      t[i] := u[i];
+    end;
+    remain := Iterations - 1;
+    while remain > 0 do
+    begin
+      StoreBE32(@ibuf[0], u[0]);
+      StoreBE32(@ibuf[4], u[1]);
+      StoreBE32(@ibuf[8], u[2]);
+      StoreBE32(@ibuf[12], u[3]);
+      StoreBE32(@ibuf[16], u[4]);
+      w := innerWords;
+      Sha1BlocksCpu(@w[0], @ibuf[0], 1);
+      StoreBE32(@obuf[0], w[0]);
+      StoreBE32(@obuf[4], w[1]);
+      StoreBE32(@obuf[8], w[2]);
+      StoreBE32(@obuf[12], w[3]);
+      StoreBE32(@obuf[16], w[4]);
+      u := outerWords;
+      Sha1BlocksCpu(@u[0], @obuf[0], 1);
+      t[0] := t[0] xor u[0];
+      t[1] := t[1] xor u[1];
+      t[2] := t[2] xor u[2];
+      t[3] := t[3] xor u[3];
+      t[4] := t[4] xor u[4];
+      Dec(remain);
+    end;
+    StoreBE32(@obuf[0], t[0]);
+    StoreBE32(@obuf[4], t[1]);
+    StoreBE32(@obuf[8], t[2]);
+    StoreBE32(@obuf[12], t[3]);
+    StoreBE32(@obuf[16], t[4]);
+    take := KeyLen - done;
+    if take > 20 then take := 20;
+    for j := 0 to take - 1 do Result[done + j + 1] := Char(obuf[j]);
+    done := done + take;
+  end;
+end;
+
+
+{ RFC 8018 5.2: HMAC's normalized key and both pad states are prepared
+  once, as Go crypto/internal/fips140/hmac.Reset does. The salt prefix
+  is also retained. Subsequent U values have a fixed digest length:
+  two existing SHA block calls, with no per-round string allocation. }
+function PasPbkdf2HmacSha256Cpu(const Password, Salt: string;
+  Iterations, KeyLen: Integer): string;
+var
+  keyed: THmacState;
+  salted, outer, cur: THashState;
+  innerWords, outerWords, u, t, w: array[0..7] of UInt32;
+  ibuf, obuf: array[0..63] of Byte;
+  opad, counter, d: string;
+  i, j, blocks, bidx, remain, take, done: Integer;
+begin
+  Result := '';
+  { Positive counts and the RFC's 32-bit block index, before any
+    allocation. This form cannot overflow as KeyLen + hLen could. }
+  if (Iterations < 1) or (KeyLen < 1) then Exit;
+  blocks := (KeyLen - 1) div 32 + 1;
+  if blocks > 4294967295 then Exit;
+  { SHA-1/256 encode a message length below 2^64 bits. The salt's
+    inner message also contains the 64-byte ipad and 4-byte index. }
+  if Length(Password) > 2305843009213693951 then Exit;
+  if Length(Salt) > 2305843009213693883 then Exit;
+
+  PasHmacBeginCpu(keyed, 3, Password);
+  for i := 0 to 7 do innerWords[i] := UInt32(keyed.Inner.W[i]);
+  SetLength(opad, 64);
+  for i := 0 to 63 do opad[i + 1] := Char(keyed.Opad[i]);
+  PasHashBegin(outer, 3);
+  PasSha256UpdateCpu(outer, opad);
+  for i := 0 to 7 do outerWords[i] := UInt32(outer.W[i]);
+  salted := keyed.Inner;
+  PasSha256UpdateCpu(salted, Salt);
+
+  for i := 0 to 63 do begin ibuf[i] := 0; obuf[i] := 0; end;
+  ibuf[32] := 128;
+  obuf[32] := 128;
+  StoreBE64(@ibuf[56], 768);
+  StoreBE64(@obuf[56], 768);
+  SetLength(counter, 4);
+  SetLength(Result, KeyLen);
+  done := 0;
+  for bidx := 1 to blocks do
+  begin
+    { U1 = PRF(password, salt || INT_BE32(block)). Final hashes a copy. }
+    StoreBE32(@counter[1], bidx);
+    cur := salted;
+    PasSha256UpdateCpu(cur, counter);
+    d := PasSha256FinalCpu(cur);
+    cur := outer;
+    PasSha256UpdateCpu(cur, d);
+    d := PasSha256FinalCpu(cur);
+    for i := 0 to 7 do
+    begin
+      u[i] := UInt32(LoadBE32(@d[4 * i + 1]));
+      t[i] := u[i];
+    end;
+    remain := Iterations - 1;
+    while remain > 0 do
+    begin
+      StoreBE32(@ibuf[0], u[0]);
+      StoreBE32(@ibuf[4], u[1]);
+      StoreBE32(@ibuf[8], u[2]);
+      StoreBE32(@ibuf[12], u[3]);
+      StoreBE32(@ibuf[16], u[4]);
+      StoreBE32(@ibuf[20], u[5]);
+      StoreBE32(@ibuf[24], u[6]);
+      StoreBE32(@ibuf[28], u[7]);
+      w := innerWords;
+      Sha256BlocksCpu(@w[0], @ibuf[0], 1);
+      StoreBE32(@obuf[0], w[0]);
+      StoreBE32(@obuf[4], w[1]);
+      StoreBE32(@obuf[8], w[2]);
+      StoreBE32(@obuf[12], w[3]);
+      StoreBE32(@obuf[16], w[4]);
+      StoreBE32(@obuf[20], w[5]);
+      StoreBE32(@obuf[24], w[6]);
+      StoreBE32(@obuf[28], w[7]);
+      u := outerWords;
+      Sha256BlocksCpu(@u[0], @obuf[0], 1);
+      t[0] := t[0] xor u[0];
+      t[1] := t[1] xor u[1];
+      t[2] := t[2] xor u[2];
+      t[3] := t[3] xor u[3];
+      t[4] := t[4] xor u[4];
+      t[5] := t[5] xor u[5];
+      t[6] := t[6] xor u[6];
+      t[7] := t[7] xor u[7];
+      Dec(remain);
+    end;
+    StoreBE32(@obuf[0], t[0]);
+    StoreBE32(@obuf[4], t[1]);
+    StoreBE32(@obuf[8], t[2]);
+    StoreBE32(@obuf[12], t[3]);
+    StoreBE32(@obuf[16], t[4]);
+    StoreBE32(@obuf[20], t[5]);
+    StoreBE32(@obuf[24], t[6]);
+    StoreBE32(@obuf[28], t[7]);
+    take := KeyLen - done;
+    if take > 32 then take := 32;
+    for j := 0 to take - 1 do Result[done + j + 1] := Char(obuf[j]);
+    done := done + take;
+  end;
+end;
+
+
+{ RFC 8018 5.2: HMAC's normalized key and both pad states are prepared
+  once, as Go crypto/internal/fips140/hmac.Reset does. The salt prefix
+  is also retained. Subsequent U values have a fixed digest length:
+  two existing SHA block calls, with no per-round string allocation. }
+function PasPbkdf2HmacSha1Base(const Password, Salt: string;
+  Iterations, KeyLen: Integer): string;
+var
+  keyed: THmacState;
+  salted, outer, cur: THashState;
+  innerWords, outerWords, u, t, w: array[0..7] of UInt32;
+  ibuf, obuf: array[0..63] of Byte;
+  opad, counter, d: string;
+  i, j, blocks, bidx, remain, take, done: Integer;
+begin
+  Result := '';
+  { Positive counts and the RFC's 32-bit block index, before any
+    allocation. This form cannot overflow as KeyLen + hLen could. }
+  if (Iterations < 1) or (KeyLen < 1) then Exit;
+  blocks := (KeyLen - 1) div 20 + 1;
+  if blocks > 4294967295 then Exit;
+  { SHA-1/256 encode a message length below 2^64 bits. The salt's
+    inner message also contains the 64-byte ipad and 4-byte index. }
+  if Length(Password) > 2305843009213693951 then Exit;
+  if Length(Salt) > 2305843009213693883 then Exit;
+
+  PasHmacBeginBase(keyed, 1, Password);
+  for i := 0 to 7 do innerWords[i] := UInt32(keyed.Inner.W[i]);
+  SetLength(opad, 64);
+  for i := 0 to 63 do opad[i + 1] := Char(keyed.Opad[i]);
+  PasHashBegin(outer, 1);
+  PasSha1UpdateBase(outer, opad);
+  for i := 0 to 7 do outerWords[i] := UInt32(outer.W[i]);
+  salted := keyed.Inner;
+  PasSha1UpdateBase(salted, Salt);
+
+  for i := 0 to 63 do begin ibuf[i] := 0; obuf[i] := 0; end;
+  ibuf[20] := 128;
+  obuf[20] := 128;
+  StoreBE64(@ibuf[56], 672);
+  StoreBE64(@obuf[56], 672);
+  SetLength(counter, 4);
+  SetLength(Result, KeyLen);
+  done := 0;
+  for bidx := 1 to blocks do
+  begin
+    { U1 = PRF(password, salt || INT_BE32(block)). Final hashes a copy. }
+    StoreBE32(@counter[1], bidx);
+    cur := salted;
+    PasSha1UpdateBase(cur, counter);
+    d := PasSha1FinalBase(cur);
+    cur := outer;
+    PasSha1UpdateBase(cur, d);
+    d := PasSha1FinalBase(cur);
+    for i := 0 to 4 do
+    begin
+      u[i] := UInt32(LoadBE32(@d[4 * i + 1]));
+      t[i] := u[i];
+    end;
+    remain := Iterations - 1;
+    while remain > 0 do
+    begin
+      StoreBE32(@ibuf[0], u[0]);
+      StoreBE32(@ibuf[4], u[1]);
+      StoreBE32(@ibuf[8], u[2]);
+      StoreBE32(@ibuf[12], u[3]);
+      StoreBE32(@ibuf[16], u[4]);
+      w := innerWords;
+      Sha1BlocksPlain(@w[0], @ibuf[0], 1);
+      StoreBE32(@obuf[0], w[0]);
+      StoreBE32(@obuf[4], w[1]);
+      StoreBE32(@obuf[8], w[2]);
+      StoreBE32(@obuf[12], w[3]);
+      StoreBE32(@obuf[16], w[4]);
+      u := outerWords;
+      Sha1BlocksPlain(@u[0], @obuf[0], 1);
+      t[0] := t[0] xor u[0];
+      t[1] := t[1] xor u[1];
+      t[2] := t[2] xor u[2];
+      t[3] := t[3] xor u[3];
+      t[4] := t[4] xor u[4];
+      Dec(remain);
+    end;
+    StoreBE32(@obuf[0], t[0]);
+    StoreBE32(@obuf[4], t[1]);
+    StoreBE32(@obuf[8], t[2]);
+    StoreBE32(@obuf[12], t[3]);
+    StoreBE32(@obuf[16], t[4]);
+    take := KeyLen - done;
+    if take > 20 then take := 20;
+    for j := 0 to take - 1 do Result[done + j + 1] := Char(obuf[j]);
+    done := done + take;
+  end;
+end;
+
+
+{ RFC 8018 5.2: HMAC's normalized key and both pad states are prepared
+  once, as Go crypto/internal/fips140/hmac.Reset does. The salt prefix
+  is also retained. Subsequent U values have a fixed digest length:
+  two existing SHA block calls, with no per-round string allocation. }
+function PasPbkdf2HmacSha256Base(const Password, Salt: string;
+  Iterations, KeyLen: Integer): string;
+var
+  keyed: THmacState;
+  salted, outer, cur: THashState;
+  innerWords, outerWords, u, t, w: array[0..7] of UInt32;
+  ibuf, obuf: array[0..63] of Byte;
+  opad, counter, d: string;
+  i, j, blocks, bidx, remain, take, done: Integer;
+begin
+  Result := '';
+  { Positive counts and the RFC's 32-bit block index, before any
+    allocation. This form cannot overflow as KeyLen + hLen could. }
+  if (Iterations < 1) or (KeyLen < 1) then Exit;
+  blocks := (KeyLen - 1) div 32 + 1;
+  if blocks > 4294967295 then Exit;
+  { SHA-1/256 encode a message length below 2^64 bits. The salt's
+    inner message also contains the 64-byte ipad and 4-byte index. }
+  if Length(Password) > 2305843009213693951 then Exit;
+  if Length(Salt) > 2305843009213693883 then Exit;
+
+  PasHmacBeginBase(keyed, 3, Password);
+  for i := 0 to 7 do innerWords[i] := UInt32(keyed.Inner.W[i]);
+  SetLength(opad, 64);
+  for i := 0 to 63 do opad[i + 1] := Char(keyed.Opad[i]);
+  PasHashBegin(outer, 3);
+  PasSha256UpdateBase(outer, opad);
+  for i := 0 to 7 do outerWords[i] := UInt32(outer.W[i]);
+  salted := keyed.Inner;
+  PasSha256UpdateBase(salted, Salt);
+
+  for i := 0 to 63 do begin ibuf[i] := 0; obuf[i] := 0; end;
+  ibuf[32] := 128;
+  obuf[32] := 128;
+  StoreBE64(@ibuf[56], 768);
+  StoreBE64(@obuf[56], 768);
+  SetLength(counter, 4);
+  SetLength(Result, KeyLen);
+  done := 0;
+  for bidx := 1 to blocks do
+  begin
+    { U1 = PRF(password, salt || INT_BE32(block)). Final hashes a copy. }
+    StoreBE32(@counter[1], bidx);
+    cur := salted;
+    PasSha256UpdateBase(cur, counter);
+    d := PasSha256FinalBase(cur);
+    cur := outer;
+    PasSha256UpdateBase(cur, d);
+    d := PasSha256FinalBase(cur);
+    for i := 0 to 7 do
+    begin
+      u[i] := UInt32(LoadBE32(@d[4 * i + 1]));
+      t[i] := u[i];
+    end;
+    remain := Iterations - 1;
+    while remain > 0 do
+    begin
+      StoreBE32(@ibuf[0], u[0]);
+      StoreBE32(@ibuf[4], u[1]);
+      StoreBE32(@ibuf[8], u[2]);
+      StoreBE32(@ibuf[12], u[3]);
+      StoreBE32(@ibuf[16], u[4]);
+      StoreBE32(@ibuf[20], u[5]);
+      StoreBE32(@ibuf[24], u[6]);
+      StoreBE32(@ibuf[28], u[7]);
+      w := innerWords;
+      Sha256BlocksPlain(@w[0], @ibuf[0], 1);
+      StoreBE32(@obuf[0], w[0]);
+      StoreBE32(@obuf[4], w[1]);
+      StoreBE32(@obuf[8], w[2]);
+      StoreBE32(@obuf[12], w[3]);
+      StoreBE32(@obuf[16], w[4]);
+      StoreBE32(@obuf[20], w[5]);
+      StoreBE32(@obuf[24], w[6]);
+      StoreBE32(@obuf[28], w[7]);
+      u := outerWords;
+      Sha256BlocksPlain(@u[0], @obuf[0], 1);
+      t[0] := t[0] xor u[0];
+      t[1] := t[1] xor u[1];
+      t[2] := t[2] xor u[2];
+      t[3] := t[3] xor u[3];
+      t[4] := t[4] xor u[4];
+      t[5] := t[5] xor u[5];
+      t[6] := t[6] xor u[6];
+      t[7] := t[7] xor u[7];
+      Dec(remain);
+    end;
+    StoreBE32(@obuf[0], t[0]);
+    StoreBE32(@obuf[4], t[1]);
+    StoreBE32(@obuf[8], t[2]);
+    StoreBE32(@obuf[12], t[3]);
+    StoreBE32(@obuf[16], t[4]);
+    StoreBE32(@obuf[20], t[5]);
+    StoreBE32(@obuf[24], t[6]);
+    StoreBE32(@obuf[28], t[7]);
+    take := KeyLen - done;
+    if take > 32 then take := 32;
+    for j := 0 to take - 1 do Result[done + j + 1] := Char(obuf[j]);
+    done := done + take;
+  end;
 end;
 
 

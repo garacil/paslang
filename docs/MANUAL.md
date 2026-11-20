@@ -8065,6 +8065,7 @@ program takes their names.
 | `Sha384(s)`, `Sha512(s)` | SHA-2, FIPS 180-4: 128-byte blocks, 80 rounds of 64-bit words | 48, 64 bytes | a string | FEAT_SHA512 (`sha512`, arm64); Pascal on amd64 | the same, faster on long messages in software |
 | `Sha3_224(s)` … `Sha3_512(s)` | SHA-3, FIPS 202: Keccak-f[1600], 24 rounds of a 200-byte sponge | 28 to 64 bytes | a string | the Pascal rounds | when a second family beside SHA-2 is wanted |
 | `HmacMd5(key, msg)`, `HmacSha1`, `HmacSha224`, `HmacSha256`, `HmacSha384`, `HmacSha512` | HMAC, RFC 2104, over that hash | as long as its hash | two strings | as its hash | authenticating a message with a shared secret |
+| `Pbkdf2HmacSha1(password, salt, iterations, keyLen)`, `Pbkdf2HmacSha256(...)` | PBKDF2, RFC 8018 §5.2, with explicit HMAC-SHA1 or HMAC-SHA256 | `keyLen` raw bytes, or an empty invalid result | two byte strings and two positive integers | as its hash | interoperable password-based key derivation |
 | `Crc32(s)`, `Crc32(s, sofar)` | CRC-32 of IEEE 802.3, polynomial `$EDB88320` reflected; zlib, gzip, PNG | 0 to 2³²-1 | a string, the value so far | PCLMULQDQ folding from 64 bytes (`pclmul` and `sse41`); FEAT_CRC32 | detecting errors; the formats that use it |
 | `Crc32c(s)`, `Crc32c(s, sofar)` | CRC-32C of Castagnoli, RFC 3720, polynomial `$82F63B78` reflected; iSCSI, ext4, the store's log | 0 to 2³²-1 | the same | SSE4.2 `crc32`, three chains at once (`sse42`); FEAT_CRC32 | detecting errors, fastest of the checksums (33 GB/s on a Ryzen 9 5950X) |
 | `Adler32(s)`, `Adler32(s, sofar)` | Adler-32, RFC 1950 | 0 to 2³²-1 | the same, from 1 | eight bytes a step in 64-bit lanes, no instruction set (1.2.347) | zlib streams |
@@ -8085,6 +8086,34 @@ table's hash while its key is secret. A word with a body on the
 processor's instructions and one in Pascal gives the same bytes from
 both (`make check` runs `testdata/hash1` both ways on both machines);
 the choice is made when the program is compiled (`-cpu`, §22).
+
+### Password-based derived keys
+
+`Pbkdf2HmacSha1(password, salt, iterations, keyLen)` and
+`Pbkdf2HmacSha256(password, salt, iterations, keyLen)` implement RFC 8018
+§5.2 and return exactly `keyLen` raw bytes. Both inputs are byte strings:
+empty strings, NUL and bytes outside UTF-8 are preserved, with no text
+normalization or trailing-NUL convention. `Hex` displays a derived key.
+
+An invalid parameter returns `''`, with no partial key: `iterations` and
+`keyLen` must be positive, and the derived length cannot exceed
+`(2^32-1)*20` for SHA-1 or `(2^32-1)*32` for SHA-256. These checks precede
+allocation. The SHA message-length bounds also apply: the password may
+have at most `2^61-1` bytes, and the salt at most `2^61-69`, accounting for
+the 64-byte inner pad and four-byte block counter. Allocation failure
+follows the runtime's allocation contract; it is not an invalid-parameter
+result. The function does not change either input.
+
+The iteration count has no additional policy ceiling within positive
+`Integer`. It controls CPU work and is not a deadline or cancellation
+argument. Applications select acceptable costs before accepting untrusted
+parameters. The normalized HMAC key and both pad states are prepared once;
+the derivation retains a salted inner state and uses bounded U/T storage.
+Its SHA backend is selected at compile time using the same `-cpu` features
+as `Sha1` or `Sha256`, including their base paths. No external runtime
+library, global scratch state or extra scheduler is used. Returned keys
+and temporary buffers are ordinary managed memory; secure erasure is not
+promised.
 
 ### Hashing anything
 
@@ -15960,7 +15989,8 @@ its place:
   `store` are keywords;
 - the hash words (§14): `Hex Md5 Sha1 Sha224 Sha256 Sha384 Sha512
   Sha3_224 Sha3_256 Sha3_384 Sha3_512 HmacMd5 HmacSha1 HmacSha224
-  HmacSha256 HmacSha384 HmacSha512 Crc32 Crc32c Adler32 Fnv1a32 Fnv1a64
+  HmacSha256 HmacSha384 HmacSha512 Pbkdf2HmacSha1 Pbkdf2HmacSha256
+  Crc32 Crc32c Adler32 Fnv1a32 Fnv1a64
   Murmur3 SipHash MerkleRoot MerkleProof MerkleCheck` (the table in §14,
   The algorithms, says what each computes and what it is for), and the
   pieces of a digest (1.1.259): `Md5Begin Md5Update Md5Final` and the
