@@ -77,6 +77,17 @@ subsequent U round calls the chosen existing block kernel twice with one
 `pbkdf2`, `pbkdf2bytes`, `pbkdf2oracle`, `pbkdf2slow` and
 `pbkdf2routines`. The template lives in `scripts/hashgen.py`.
 
+Encrypted ZIP reuses these same kernels. `paszip`'s WinZip adapter counts
+LE128 blocks from one over `pascipher.AesEncryptBlock`; it does not change
+`AesCtr`'s BE counter or implement AES again. `CipherEqual` is the narrow
+public wrapper around the existing tag comparison. `pashash.PasCrc32Byte`
+updates one raw IEEE CRC state without checksum complements, reusing the
+existing scalar tail after table readiness, or the existing ARM CRC32 byte
+kernel when `CPU_CRC32` is compiled in. It never uses AMD64's Castagnoli
+instruction or calls the IEEE CLMUL kernel with fewer than 64 bytes. No
+mutable table or new assembly primitive is exported. ZIP AES uses explicit
+PBKDF2-HMAC-SHA1 and HMAC-SHA1, selected through existing SHA feature gates.
+
 Currency's checked arithmetic reuses `pasfmt`'s existing `Mul128` and
 `DivMod128` pair: exact signed magnitudes, one scale adjustment and one
 nearest-even rounding. Decimal parse/format and binary64/binary128 conversion

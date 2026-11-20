@@ -13060,23 +13060,63 @@ Archive := w.Finish;
   that is not a prefix code, a distance before the start. An error says the
   byte of the input it was found at.
 - **Archives.** `TZipReader.Create(bytes)`: `Count`, `Entry(i)` (a
-  `TZipEntry`: `Name`, `Comment`, `Method` 0 stored or 8 deflated, `Flags`,
-  `DosTime`, `DosDate`, `Crc`, `CompSize`, `Size`, `ExternalAttr`, `Extra`,
-  `LocalExtra`, `HeaderOffset`), `Find(name)`, `Extract(i)`, `Raw(i)`,
-  `IsDir(i)`, `Comment`, `MaxEntrySize`. The directory is what is read, as
-  Go does, so an archive written to a stream (sizes after the data) and one
-  with bytes in front of it (a self-extractor) read. **Refused**, with
-  `EZipError`: ZIP64, encryption, a method other than stored and deflated,
-  a wrong signature, size, CRC or offset. `TZipWriter`: `Add(name, data)`
-  (deflated at `Level`, stored when that is not smaller, the UTF-8 flag
-  when the name needs it), `AddRaw(entry, raw)`, `Replace(entry, data)` (an
-  entry of another archive with new data: name, times, flags, attributes and
-  extra fields as it had them), `Comment`, `DosDate` and
-  `DosTime` (1980-01-01 00:00 unless set, so an archive is the same each
-  time), `Finish`; the local headers hold the sizes, no descriptors.
-  `ZipDosFromUnix(secs, date, time)`, `ZipUnixFromDos(date, time)` (UTC, as
-  Go reads them) and `ZipNameIsSafe(name)` (no `..`, not absolute, no drive,
-  no NUL) stand alone.
+  `TZipEntry`: `Name`, `Comment`, wire `Method` 0 stored, 8 deflated or
+  99 WinZip AES, `Flags`, `DosTime`, `DosDate`, `Crc`, `CompSize`, `Size`,
+  `ExternalAttr`, `Extra`, `LocalExtra`, `HeaderOffset`), `Find(name)`,
+  `Extract(i)`, `Extract(i, password)`, `Raw(i)`, `IsDir(i)`, `Comment`,
+  `MaxEntrySize`. The directory is authoritative, as Go's is, so archives
+  written to a stream (sizes after the data) and self-extractors read.
+  Passwords are explicit raw byte strings, including empty, NUL and bytes
+  outside UTF-8. Omitting the password differs from supplying `''`.
+  A plain entry ignores the supplied password; mixed archives can use a
+  different password for each entry. No password is remembered by a reader.
+  Pasroutines may share a reader while its archive bytes and
+  `MaxEntrySize` stay fixed. A writer belongs to one caller at a time.
+- **Encrypted entries.** WinZip AES AE-1 and AE-2 support 128-, 192- and
+  256-bit keys, and traditional ZipCrypto supports its modern one-byte
+  header check. Stored and deflated payloads are read, including empty
+  encrypted files and directories. AES checks its verifier and complete
+  ciphertext authentication code before decryption or inflation; AE-1
+  also checks the final CRC, while AE-2 requires CRC zero. Local/directory
+  metadata, bounded extra fields, descriptor CRC and both sizes, complete
+  deflate consumption and exact decoded length are checked. Unknown AES
+  extension tails are retained. A required version of 51 is not imposed
+  on WinZip AES. ZIP64, PKWARE strong/masked encryption, other compression
+  methods and contradictory/duplicate AES metadata are refused. Physical
+  local-header/data overlaps, including shared local offsets, are refused;
+  duplicate names with separate entries remain allowed and `Find` takes
+  the first directory entry. Creation/listing/`Raw` needs no password.
+- **Errors and limits.** `EZipError` retains its message and `Offset`
+  (zero-based archive byte, or -1), and adds `EntryIndex` (-1 when absent)
+  and `Stage: TZipErrorStage`: `zesStructure`, `zesUnsupported`,
+  `zesPasswordRequired`, `zesPasswordCheck`, `zesAuthentication`,
+  `zesInflate`, `zesSize`, `zesCrc`, `zesLimit`, `zesWriter`, `zesInternal`.
+  `CreateAt` remains available; `CreateStageAt` sets the explicit stage.
+  A verifier/header or authentication failure does not distinguish a bad
+  password from damaged bytes; callers may retry either. ZipCrypto has no
+  cryptographic authentication, and a wrong password that passes a header
+  collision can even pass all checks for an empty entry. CRC alone does
+  not prove a password. No partial plaintext is returned on an exception;
+  archive bytes and wire entry metadata remain unchanged. A positive
+  `MaxEntrySize` rejects an excessive declared size before password work,
+  and decoded output is bounded and checked independently of its CRC.
+  This is a logical output bound, rather than an RSS or reserved-capacity cap.
+- **Writing.** `TZipWriter`: `Add(name, data)` (deflated at `Level`,
+  stored when that is not smaller, UTF-8 flag when the name needs it),
+  `AddRaw(entry, raw)`, `Replace(entry, data)`, `Comment`, `DosDate`,
+  `DosTime` (1980-01-01 00:00 unless set) and `Finish`. Plain archive
+  bytes retain their deterministic filled-local-header format. Encrypted
+  `AddRaw` preserves the opaque raw body, method, flags, times and extras;
+  it neither checks a password nor authenticates those bytes. If bit3 was
+  set, the copy retains it, writes zero local CRC/sizes and appends one
+  signed descriptor. `CompSize` and `Raw` always include encryption
+  overhead and exclude the descriptor. Encrypted `Replace` is refused
+  before writer mutation; `Add` explicitly creates a new plain entry.
+  Encrypted creation/password changes are not provided. Raw length,
+  field widths and complete entry/archive bounds are checked before an
+  entry changes writer state. `ZipDosFromUnix(secs, date, time)`,
+  `ZipUnixFromDos(date, time)` (UTC) and `ZipNameIsSafe(name)` (no `..`,
+  not absolute, no drive, no NUL) stand alone.
 - **Speed.** On an 11 MB worksheet inflate takes 18 ms against zlib's 30
   and Go's 40; deflate at level 6 takes 56 ms against zlib's 105 and Go's
   48 (it took 190 before P449), and a gzip file of 2 KB from a new writer

@@ -27,9 +27,11 @@
   sizes follow the data), and gives an entry's bytes inflated and checked
   against its CRC-32 and its size, or as they are stored. An archive
   with something in front of its first entry (a self-extractor) is read
-  from where its directory says, shifted by what is in front. ZIP64,
-  encryption and a method other than stored and
-  deflated are refused with an EZipError that says which. The disk
+  from where its directory says, shifted by what is in front. ZIP64
+  and methods other than stored and deflated are refused with EZipError.
+  Extract(i,password) reads traditional ZipCrypto and WinZip AES AE-1/AE-2.
+  AES authenticates before decrypting; ZipCrypto has only header/CRC checks.
+  The disk
   numbers of the end record are not looked at, as Go and zipfile do not
   look at them.
 
@@ -38,8 +40,9 @@
   archive as it is, its compressed bytes, method, CRC-32, times, flags,
   attributes and extra fields untouched, so a workbook with one part
   edited is written back compressing only that part and keeping the
-  order of the rest. The archive has no data descriptors: every local
-  header holds the sizes and the CRC-32. Free of state (Regla 11). }
+  order of the rest. Plain entries use filled local headers; opaque
+  encrypted bit3 copies retain that flag and get a signed descriptor.
+  Passwords and cipher scratch belong to each extraction (Regla 11). }
 unit paszip;
 
 interface
@@ -48,18 +51,27 @@ uses
   sysutils, pasflate, pascodec;
 
 type
+  { The observed failure stage, not proof of a wrong password. }
+  TZipErrorStage = (zesStructure, zesUnsupported, zesPasswordRequired,
+    zesPasswordCheck, zesAuthentication, zesInflate, zesSize, zesCrc,
+    zesLimit, zesWriter, zesInternal);
+
   { Offset is the byte of the archive the fault was found at, or -1 }
   EZipError = class(Exception)
   public
     Offset: Integer;
+    Stage: TZipErrorStage;
+    EntryIndex: Integer;
     constructor CreateAt(AOffset: Integer; const AReason: string);
+    constructor CreateStageAt(AOffset, AEntryIndex: Integer;
+      AStage: TZipErrorStage; const AReason: string);
   end;
 
   { one entry as the central directory has it }
   TZipEntry = record
     Name: string;
     Comment: string;
-    { 0 stored, 8 deflated }
+    { the wire method: 0 stored, 8 deflated, 99 WinZip AES }
     Method: Integer;
     { the general purpose bit flag as it is in the archive: bit 0 is
       encryption, bit 3 a data descriptor, bit 11 a name in UTF-8 }
@@ -84,29 +96,36 @@ type
   private
     FData: string;
     FBase: Integer;
+    FDirStart: Integer;
+    FPhysicalEnd: array of Integer;
     FEntries: array of TZipEntry;
     FComment: string;
     FLimit: Integer;
     function U16(At: Integer): Integer;
     function U32(At: Integer): Integer;
     procedure Fail(At: Integer; const Why: string);
+    procedure BuildExtents;
     function BodyStart(I: Integer): Integer;
+    function ExtractPlain(I: Integer): string;
+    function ExtractEntry(I: Integer; HavePassword: Boolean; const Password: string): string;
   public
     constructor Create(const AData: string);
     function Count: Integer;
     function Entry(I: Integer): TZipEntry;
     { the first entry of that name, or -1 }
     function Find(const AName: string): Integer;
-    { the entry's bytes: inflated if it is deflated, and checked against
-      its size and CRC-32 }
-    function Extract(I: Integer): string;
+    { the entry's decoded bytes, after exact size and the applicable
+      CRC check. Explicit password bytes may be empty; omission is distinct.
+      AES authentication precedes decryption. Plain entries ignore a password. }
+    function Extract(I: Integer): string; overload;
+    function Extract(I: Integer; const Password: string): string; overload;
     { the entry's bytes as the archive holds them, to AddRaw }
     function Raw(I: Integer): string;
     { whether the entry is a directory (its name ends in /) }
     function IsDir(I: Integer): Boolean;
     property Comment: string read FComment;
     { an entry that would make more than this many bytes is refused
-      before it is inflated (0 is no limit) }
+      before password work or decoding (0 is no limit) }
     property MaxEntrySize: Integer read FLimit write FLimit;
   end;
 
@@ -126,11 +145,13 @@ type
       its time is the writer's }
     procedure Add(const AName, AData: string);
     { an entry as it is in another archive: E from its directory, Comp
-      what TZipReader.Raw gave }
+      what TZipReader.Raw gave. Encrypted bodies are copied opaquely;
+      their descriptor flag is retained and a signed descriptor rebuilt. }
     procedure AddRaw(const E: TZipEntry; const Comp: string);
     { an entry of another archive with new bytes: its name, times, flags
       (but for the data descriptor and the deflate level bits), attributes
-      and extra fields as E has them, the data deflated at Level or stored }
+      and extra fields as E has them, the data deflated at Level or stored.
+      Encrypted entries/markers are refused before writer mutation. }
     procedure Replace(const E: TZipEntry; const AData: string);
     { the archive }
     function Finish: string;
@@ -154,11 +175,15 @@ function ZipNameIsSafe(const AName: string): Boolean;
 
 implementation
 
+uses pascipher;
+
 const
   SigLocal = $04034B50;
   SigDir = $02014B50;
   SigEnd = $06054B50;
   SigEnd64Loc = $07064B50;
+  SigDescriptor = $08074B50;
+  ZipWriterMax = $7FFFFFF0;
 
 constructor EZipError.CreateAt(AOffset: Integer; const AReason: string);
 begin
@@ -167,6 +192,153 @@ begin
   else
     inherited Create('zip: ' + AReason);
   Offset := AOffset;
+  Stage := zesStructure;
+  EntryIndex := -1;
+end;
+
+constructor EZipError.CreateStageAt(AOffset, AEntryIndex: Integer;
+  AStage: TZipErrorStage; const AReason: string);
+begin
+  if AOffset >= 0 then
+    inherited Create('zip: ' + AReason + ' at byte ' + IntToStr(AOffset))
+  else
+    inherited Create('zip: ' + AReason);
+  Offset := AOffset;
+  Stage := AStage;
+  EntryIndex := AEntryIndex;
+end;
+
+procedure ZipRaise(I, At: Integer; Stage: TZipErrorStage; const Why: string);
+begin
+  raise EZipError.CreateStageAt(At, I, Stage, Why);
+end;
+
+type
+  TZipAesInfo = record
+    Present: Boolean;
+    Version, Strength, Method: Integer;
+    KeyBytes, SaltBytes, Overhead: Integer;
+  end;
+
+function ZipLe16(const S: string; At: Integer): Integer;
+begin
+  Result := Ord(S[At + 1]) or (Ord(S[At + 2]) shl 8);
+end;
+
+function ZipExtraAt(Base, Delta: Integer): Integer;
+begin
+  if Base < 0 then Result := -1 else Result := Base + Delta;
+end;
+
+procedure ZipProfileFail(I, At: Integer; Stage: TZipErrorStage;
+  Writer: Boolean; const Why: string);
+begin
+  if Writer then Stage := zesWriter;
+  ZipRaise(I, At, Stage, Why);
+end;
+
+{ PKWARE TLVs are bounded before any known or unknown payload is read. }
+function ZipAesInfo(const Extra: string; I, At: Integer; Writer: Boolean): TZipAesInfo;
+var
+  p, n, id: Integer;
+begin
+  Result := Default(TZipAesInfo);
+  p := 0;
+  while p < Length(Extra) do
+  begin
+    if Length(Extra) - p < 4 then
+      ZipProfileFail(I, ZipExtraAt(At, p), zesStructure, Writer, 'an extra field header is truncated');
+    id := ZipLe16(Extra, p);
+    n := ZipLe16(Extra, p + 2);
+    if n > Length(Extra) - p - 4 then
+      ZipProfileFail(I, ZipExtraAt(At, p), zesStructure, Writer, 'an extra field payload is truncated');
+    if id = 1 then
+      ZipProfileFail(I, ZipExtraAt(At, p), zesUnsupported, Writer, 'zip64 extra fields are not supported');
+    if id = $0017 then
+      ZipProfileFail(I, ZipExtraAt(At, p), zesUnsupported, Writer, 'PKWARE strong encryption is not supported');
+    if id = $9901 then
+    begin
+      if Result.Present then
+        ZipProfileFail(I, ZipExtraAt(At, p), zesStructure, Writer, 'an AES extra field is repeated');
+      if n < 7 then
+        ZipProfileFail(I, ZipExtraAt(At, p), zesStructure, Writer, 'an AES extra field has fewer than seven bytes');
+      Result.Present := True;
+      Result.Version := ZipLe16(Extra, p + 4);
+      if (Extra[p + 7] <> 'A') or (Extra[p + 8] <> 'E') then
+        ZipProfileFail(I, ZipExtraAt(At, p), zesUnsupported, Writer, 'an AES vendor is not supported');
+      Result.Strength := Ord(Extra[p + 9]);
+      Result.Method := ZipLe16(Extra, p + 9);
+      if (Result.Version <> 1) and (Result.Version <> 2) then
+        ZipProfileFail(I, ZipExtraAt(At, p), zesUnsupported, Writer, 'an AES version is not supported');
+      if (Result.Strength < 1) or (Result.Strength > 3) then
+        ZipProfileFail(I, ZipExtraAt(At, p), zesUnsupported, Writer, 'an AES strength is not supported');
+      if (Result.Method <> 0) and (Result.Method <> 8) then
+        ZipProfileFail(I, ZipExtraAt(At, p), zesUnsupported, Writer, 'an AES compression method is not supported');
+      Result.KeyBytes := (Result.Strength + 1) * 8;
+      Result.SaltBytes := Result.KeyBytes div 2;
+      Result.Overhead := Result.SaltBytes + 12;
+    end;
+    p := p + 4 + n;
+  end;
+end;
+
+{ A stale encryption marker must not be silently rewritten as plain data.
+  Unknown malformed plain extras remain opaque to the existing plain writer. }
+function ZipHasCryptoExtra(const Extra: string): Boolean;
+var p, n, id: Integer;
+begin
+  Result := False;
+  p := 0;
+  while Length(Extra) - p >= 4 do
+  begin
+    id := ZipLe16(Extra, p);
+    if (id = $9901) or (id = $0017) then Exit(True);
+    n := ZipLe16(Extra, p + 2);
+    if n > Length(Extra) - p - 4 then Exit;
+    p := p + 4 + n;
+  end;
+end;
+
+function ZipEncryptedMarker(const E: TZipEntry): Boolean;
+begin
+  Result := ((E.Flags and $2041) <> 0) or (E.Method = 99) or
+    ZipHasCryptoExtra(E.Extra) or ZipHasCryptoExtra(E.LocalExtra);
+end;
+
+function ZipCryptoProfile(const E: TZipEntry; I, At: Integer; Writer: Boolean): TZipAesInfo;
+var local: TZipAesInfo;
+begin
+  if (E.Flags and 1) = 0 then
+    ZipProfileFail(I, At, zesStructure, Writer, 'encryption metadata has no encryption flag');
+  if (E.Flags and (not $080F)) <> 0 then
+    ZipProfileFail(I, At, zesUnsupported, Writer, 'encryption flags are not supported');
+  Result := ZipAesInfo(E.Extra, I, -1, Writer);
+  local := ZipAesInfo(E.LocalExtra, I, At, Writer);
+  if E.Method = 99 then
+  begin
+    if (not Result.Present) or (not local.Present) then
+      ZipProfileFail(I, At, zesStructure, Writer, 'WinZip AES needs an extra field in both headers');
+    if (Result.Version <> local.Version) or (Result.Strength <> local.Strength) or
+      (Result.Method <> local.Method) then
+      ZipProfileFail(I, At, zesStructure, Writer, 'local and directory AES fields differ');
+    if (Result.Version = 2) and (E.Crc <> 0) then
+      ZipProfileFail(I, At, zesStructure, Writer, 'AE-2 requires a zero CRC');
+  end
+  else
+  begin
+    if Result.Present or local.Present then
+      ZipProfileFail(I, At, zesStructure, Writer, 'an AES field has another wire method');
+    if (E.Method <> 0) and (E.Method <> 8) then
+      ZipProfileFail(I, At, zesUnsupported, Writer, 'an encrypted compression method is not supported');
+    Result.Method := E.Method;
+    Result.Overhead := 12;
+  end;
+  if E.CompSize < Result.Overhead then
+    ZipProfileFail(I, At, zesStructure, Writer, 'an encrypted body is shorter than its framing');
+  if (Result.Method = 0) and (E.CompSize - Result.Overhead <> E.Size) then
+    ZipProfileFail(I, At, zesSize, Writer, 'the decrypted stored size differs from the directory');
+  if (E.CompSize = Result.Overhead) and (E.Size <> 0) then
+    ZipProfileFail(I, At, zesSize, Writer, 'an empty encrypted payload has a nonzero declared size');
 end;
 
 { ---- dates ---- }
@@ -329,7 +501,7 @@ begin
     if (U32(i) = SigEnd) then
     begin
       commentLen := U16(i + 20);
-      if i + 22 + commentLen <= n then
+      if commentLen <= n - i - 22 then
       begin
         endAt := i;
         found := True;
@@ -346,9 +518,9 @@ begin
   commentLen := U16(endAt + 20);
   FComment := Copy(FData, endAt + 23, commentLen);
   if (endAt >= 20) and (U32(endAt - 20) = SigEnd64Loc) then
-    Fail(endAt - 20, 'zip64 archives are not supported');
+    ZipRaise(-1, endAt - 20, zesUnsupported, 'zip64 archives are not supported');
   if (nEnt = $FFFF) or (dirSize = $FFFFFFFF) or (dirOffset = $FFFFFFFF) then
-    Fail(endAt, 'zip64 archives are not supported');
+    ZipRaise(-1, endAt, zesUnsupported, 'zip64 archives are not supported');
   if dirSize > endAt then
     Fail(endAt, 'the central directory is larger than the archive');
   { data in front of the archive moves everything by the same amount }
@@ -356,10 +528,11 @@ begin
   if FBase < 0 then
     Fail(endAt, 'the central directory offset is past the end of the archive');
   p := FBase + dirOffset;
+  FDirStart := p;
   SetLength(FEntries, nEnt);
   for i := 0 to nEnt - 1 do
   begin
-    if p + 46 > endAt then
+    if (p > endAt) or (endAt - p < 46) then
       Fail(p, 'the central directory ends inside an entry');
     if U32(p) <> SigDir then
       Fail(p, 'bad signature in the central directory');
@@ -378,20 +551,99 @@ begin
     FEntries[i].ExternalAttr := U32(p + 38);
     localAt := U32(p + 42);
     if (FEntries[i].CompSize = $FFFFFFFF) or (FEntries[i].Size = $FFFFFFFF) or (localAt = $FFFFFFFF) then
-      Fail(p, 'zip64 archives are not supported');
+      ZipRaise(i, p, zesUnsupported, 'zip64 archives are not supported');
     FEntries[i].HeaderOffset := localAt;
-    if p + 46 + nameLen + extraLen + cmtLen > endAt then
+    if nameLen + extraLen + cmtLen > endAt - p - 46 then
       Fail(p, 'the central directory ends inside an entry');
     FEntries[i].Name := Copy(FData, p + 47, nameLen);
     FEntries[i].Extra := Copy(FData, p + 47 + nameLen, extraLen);
     FEntries[i].Comment := Copy(FData, p + 47 + nameLen + extraLen, cmtLen);
     p := p + 46 + nameLen + extraLen + cmtLen;
     { the local header's extra field, which may differ from the directory's }
-    k := FBase + localAt;
-    if (k >= 0) and (k + 30 <= n) and (U32(k) = SigLocal) then
+    if (localAt >= 0) and (localAt <= n - FBase) then
     begin
-      if k + 30 + U16(k + 26) + U16(k + 28) <= n then
-        FEntries[i].LocalExtra := Copy(FData, k + 31 + U16(k + 26), U16(k + 28));
+      k := FBase + localAt;
+      if (n - k >= 30) and (U32(k) = SigLocal) then
+        if U16(k + 26) + U16(k + 28) <= n - k - 30 then
+          FEntries[i].LocalExtra := Copy(FData, k + 31 + U16(k + 26), U16(k + 28));
+    end;
+  end;
+  BuildExtents;
+end;
+
+{ Sort physical offsets once, without changing public directory order.
+  Heapsort gives O(n log n) even for untrusted ordering: Go sort's
+  heapSort/siftDown and Rust core slice sort/unstable/heapsort.rs. }
+procedure TZipReader.BuildExtents;
+var
+  order: array of Integer;
+  n, i, t, nextAt, off, at, body, fields: Integer;
+  procedure Sift(Root, HeapSize: Integer);
+  var child, swap: Integer;
+  begin
+    while Root < HeapSize do
+    begin
+      child := 2 * Root + 1;
+      if child >= HeapSize then Exit;
+      if (child + 1 < HeapSize) and
+        (FEntries[order[child]].HeaderOffset < FEntries[order[child + 1]].HeaderOffset) then
+        child := child + 1;
+      if FEntries[order[Root]].HeaderOffset >= FEntries[order[child]].HeaderOffset then Exit;
+      swap := order[Root]; order[Root] := order[child]; order[child] := swap;
+      Root := child;
+    end;
+  end;
+begin
+  n := Length(FEntries);
+  SetLength(FPhysicalEnd, n);
+  SetLength(order, n);
+  if n = 0 then Exit;
+  for i := 0 to n - 1 do order[i] := i;
+  if n > 1 then
+  begin
+    for i := n div 2 - 1 downto 0 do Sift(i, n);
+    for i := n - 1 downto 1 do
+    begin
+      t := order[0]; order[0] := order[i]; order[i] := t;
+      Sift(0, i);
+    end;
+  end;
+  for i := 0 to n - 1 do
+  begin
+    nextAt := FDirStart;
+    if i + 1 < n then
+    begin
+      off := FEntries[order[i + 1]].HeaderOffset;
+      if (off >= 0) and (off <= FDirStart - FBase) then nextAt := FBase + off;
+    end;
+    { Every member of a shared-offset group is invalid, not just one. }
+    if (i > 0) and (FEntries[order[i - 1]].HeaderOffset = FEntries[order[i]].HeaderOffset) then
+    begin
+      off := FEntries[order[i]].HeaderOffset;
+      if (off >= 0) and (off <= FDirStart - FBase) then nextAt := FBase + off;
+    end;
+    FPhysicalEnd[order[i]] := nextAt;
+  end;
+  { Verify complete physical extents once, including every side of an
+    overlap. These are structural checks, not password interpretation. }
+  for i := 0 to n - 1 do
+  begin
+    off := FEntries[i].HeaderOffset;
+    if (off >= 0) and (off <= FDirStart - FBase) then
+    begin
+      at := FBase + off;
+      if (FDirStart - at >= 30) and (U32(at) = SigLocal) then
+      begin
+        fields := U16(at + 26) + U16(at + 28);
+        if (FPhysicalEnd[i] - at < 30) or (fields > FPhysicalEnd[i] - at - 30) then
+          ZipRaise(i, at, zesStructure, 'local headers overlap or cross the central directory');
+        body := at + 30 + fields;
+        if FEntries[i].CompSize > FPhysicalEnd[i] - body then
+          ZipRaise(i, body, zesStructure, 'local data overlaps another header or the central directory');
+        if ((FEntries[i].Flags and 9) = 9) and
+          (FPhysicalEnd[i] - body - FEntries[i].CompSize < 12) then
+          ZipRaise(i, body + FEntries[i].CompSize, zesStructure, 'an encrypted descriptor crosses its physical extent');
+      end;
     end;
   end;
 end;
@@ -431,11 +683,16 @@ function TZipReader.BodyStart(I: Integer): Integer;
 var
   k: Integer;
 begin
-  k := FBase + FEntries[I].HeaderOffset;
-  if (k < 0) or (k + 30 > Length(FData)) then
-    Fail(k, 'the local header of "' + FEntries[I].Name + '" is outside the archive');
+  k := FEntries[I].HeaderOffset;
+  if (k < 0) or (k > FDirStart - FBase) then
+    ZipRaise(I, -1, zesStructure, 'the local header of "' + FEntries[I].Name + '" is outside the archive');
+  k := FBase + k;
+  if (k > FPhysicalEnd[I]) or (FPhysicalEnd[I] - k < 30) then
+    ZipRaise(I, k, zesStructure, 'the local header of "' + FEntries[I].Name + '" is outside its physical extent');
   if U32(k) <> SigLocal then
-    Fail(k, 'bad signature in the local header of "' + FEntries[I].Name + '"');
+    ZipRaise(I, k, zesStructure, 'bad signature in the local header of "' + FEntries[I].Name + '"');
+  if U16(k + 26) + U16(k + 28) > FPhysicalEnd[I] - k - 30 then
+    ZipRaise(I, k, zesStructure, 'the name or extra of "' + FEntries[I].Name + '" crosses its physical extent');
   Result := k + 30 + U16(k + 26) + U16(k + 28);
 end;
 
@@ -446,29 +703,27 @@ begin
   if (I < 0) or (I >= Length(FEntries)) then
     raise EZipError.CreateAt(-1, 'no entry ' + IntToStr(I));
   at := BodyStart(I);
-  if at + FEntries[I].CompSize > Length(FData) then
-    Fail(at, 'the data of "' + FEntries[I].Name + '" goes past the end of the archive');
+  if (FEntries[I].CompSize < 0) or (FEntries[I].CompSize > FPhysicalEnd[I] - at) then
+    ZipRaise(I, at, zesStructure, 'the data of "' + FEntries[I].Name + '" goes past its physical extent');
   Result := Copy(FData, at + 1, FEntries[I].CompSize);
 end;
 
-function TZipReader.Extract(I: Integer): string;
+function TZipReader.ExtractPlain(I: Integer): string;
 var
   e: TZipEntry;
   comp: string;
   z: TInflater;
 begin
   e := Entry(I);
-  if (e.Flags and 1) <> 0 then
-    Fail(-1, '"' + e.Name + '" is encrypted, which is not supported');
   if (e.Method <> 0) and (e.Method <> 8) then
-    Fail(-1, '"' + e.Name + '" uses compression method ' + IntToStr(e.Method) + ', which is not supported');
+    ZipRaise(I, -1, zesUnsupported, '"' + e.Name + '" uses compression method ' + IntToStr(e.Method) + ', which is not supported');
   if (FLimit > 0) and (e.Size > FLimit) then
-    Fail(-1, '"' + e.Name + '" is larger than the limit');
+    ZipRaise(I, -1, zesLimit, '"' + e.Name + '" is larger than the limit');
   comp := Raw(I);
   if e.Method = 0 then
   begin
     if e.CompSize <> e.Size then
-      Fail(-1, '"' + e.Name + '" is stored but its two sizes differ');
+      ZipRaise(I, -1, zesSize, '"' + e.Name + '" is stored but its two sizes differ');
     Result := comp;
   end
   else
@@ -483,13 +738,220 @@ begin
       Result := z.Finish;
     except
       on E1: EFlateError do
-        Fail(-1, '"' + e.Name + '": ' + E1.Message);
+        if Pos('the output is larger than the limit', E1.Message) <> 0 then
+          ZipRaise(I, -1, zesLimit, '"' + e.Name + '": ' + E1.Message)
+        else ZipRaise(I, -1, zesInflate, '"' + e.Name + '": ' + E1.Message);
     end;
   end;
   if Length(Result) <> e.Size then
-    Fail(-1, '"' + e.Name + '" is ' + IntToStr(Length(Result)) + ' bytes, not the ' + IntToStr(e.Size) + ' its directory says');
+    ZipRaise(I, -1, zesSize, '"' + e.Name + '" is ' + IntToStr(Length(Result)) + ' bytes, not the ' + IntToStr(e.Size) + ' its directory says');
   if Crc32(Result) <> e.Crc then
-    Fail(-1, 'the checksum of "' + e.Name + '" does not match');
+    ZipRaise(I, -1, zesCrc, 'the checksum of "' + e.Name + '" does not match');
+end;
+
+{ WinZip's counter is little-endian from one, unlike AesCtr's
+  big-endian counter. Only this format adapter is new: AES is shared. }
+function ZipAesCrypt(const A: TAes; const Input: string): string;
+var
+  counter, stream: array[0..15] of Byte;
+  off, i, n, carryByte: Integer;
+begin
+  for i := 0 to 15 do counter[i] := 0;
+  counter[0] := 1;
+  SetLength(Result, Length(Input));
+  off := 0;
+  while off < Length(Input) do
+  begin
+    AesEncryptBlock(A, @counter[0], @stream[0]);
+    n := Length(Input) - off;
+    if n > 16 then n := 16;
+    for i := 0 to n - 1 do
+      Result[off + i + 1] := Char(Ord(Input[off + i + 1]) xor stream[i]);
+    carryByte := 1;
+    for i := 0 to 15 do
+    begin
+      carryByte := counter[i] + carryByte;
+      counter[i] := Byte(carryByte);
+      carryByte := carryByte shr 8;
+      if carryByte = 0 then Break;
+    end;
+    off := off + n;
+  end;
+end;
+
+{ APPNOTE 6.1: update the raw IEEE states with DECRYPTED bytes,
+  including the twelve-byte header. No authentication is supplied by
+  this legacy format; a header match alone does not prove a password. }
+function ZipLegacyDecrypt(const Input, Password: string; Check: Byte;
+  I, At: Integer): string;
+var
+  keys: array[0..2] of UInt32;
+  j: Integer;
+  b: Byte;
+  procedure UpdateKeys(Value: Byte);
+  begin
+    keys[0] := PasCrc32Byte(keys[0], Value);
+    keys[1] := UInt32((Integer(keys[1]) + (keys[0] and 255)) * 134775813 + 1);
+    keys[2] := PasCrc32Byte(keys[2], Byte(keys[1] shr 24));
+  end;
+  function NextByte: Byte;
+  var temp: Integer;
+  begin
+    temp := (Integer(keys[2]) or 2) and 65535;
+    Result := Byte((temp * (temp xor 1)) shr 8);
+  end;
+begin
+  keys[0] := $12345678;
+  keys[1] := $23456789;
+  keys[2] := $34567890;
+  for j := 1 to Length(Password) do UpdateKeys(Byte(Ord(Password[j])));
+  for j := 1 to 12 do
+  begin
+    b := Byte(Ord(Input[j]) xor NextByte);
+    UpdateKeys(b);
+  end;
+  if b <> Check then
+    ZipRaise(I, At + 11, zesPasswordCheck, 'the ZipCrypto header check does not match');
+  SetLength(Result, Length(Input) - 12);
+  for j := 13 to Length(Input) do
+  begin
+    b := Byte(Ord(Input[j]) xor NextByte);
+    UpdateKeys(b);
+    Result[j - 12] := Char(b);
+  end;
+end;
+
+function TZipReader.Extract(I: Integer): string;
+begin
+  Result := ExtractEntry(I, False, '');
+end;
+
+function TZipReader.Extract(I: Integer; const Password: string): string;
+begin
+  Result := ExtractEntry(I, True, Password);
+end;
+
+function TZipReader.ExtractEntry(I: Integer; HavePassword: Boolean;
+  const Password: string): string;
+var
+  e: TZipEntry;
+  info: TZipAesInfo;
+  at, k, tail, bound, localCrc, localComp, localSize, payloadLen, payloadAt, errAt: Integer;
+  check: Byte;
+  signedOk, unsignedOk: Boolean;
+  body, compressed, plain, derived, payload, tag: string;
+  aes: TAes;
+  z: TInflater;
+begin
+  e := Entry(I);
+  if not ZipEncryptedMarker(e) then
+  begin
+    Result := ExtractPlain(I);
+    Exit;
+  end;
+  at := BodyStart(I);
+  bound := FPhysicalEnd[I];
+  if (e.CompSize < 0) or (e.CompSize > bound - at) then
+    ZipRaise(I, at, zesStructure, 'the encrypted body crosses its physical extent');
+  k := FBase + e.HeaderOffset;
+  if (U16(k + 6) <> e.Flags) or (U16(k + 8) <> e.Method) then
+    ZipRaise(I, k + 6, zesStructure, 'local and directory encryption flags or methods differ');
+  if (U16(k + 10) <> e.DosTime) or (U16(k + 12) <> e.DosDate) then
+    ZipRaise(I, k + 10, zesStructure, 'local and directory timestamps differ');
+  if (U16(k + 26) <> Length(e.Name)) or
+    (Copy(FData, k + 31, U16(k + 26)) <> e.Name) then
+    ZipRaise(I, k + 30, zesStructure, 'local and directory names differ');
+  info := ZipCryptoProfile(e, I, at - Length(e.LocalExtra), False);
+  localCrc := U32(k + 14);
+  localComp := U32(k + 18);
+  localSize := U32(k + 22);
+  if (localComp = $FFFFFFFF) or (localSize = $FFFFFFFF) then
+    ZipRaise(I, k + 18, zesUnsupported, 'zip64 local sizes are not supported');
+  if (e.Flags and 8) = 0 then
+  begin
+    if (localCrc <> e.Crc) or (localComp <> e.CompSize) or (localSize <> e.Size) then
+      ZipRaise(I, k + 14, zesStructure, 'local and directory CRC or sizes differ');
+  end
+  else
+  begin
+    if ((localCrc <> 0) and (localCrc <> e.Crc)) or
+      ((localComp <> 0) and (localComp <> e.CompSize)) or
+      ((localSize <> 0) and (localSize <> e.Size)) then
+      ZipRaise(I, k + 14, zesStructure, 'filled local descriptor fields contradict the directory');
+    tail := at + e.CompSize;
+    signedOk := False;
+    unsignedOk := False;
+    if bound - tail >= 16 then
+      signedOk := (U32(tail) = SigDescriptor) and (U32(tail + 4) = e.Crc) and
+        (U32(tail + 8) = e.CompSize) and (U32(tail + 12) = e.Size);
+    if bound - tail >= 12 then
+      unsignedOk := (U32(tail) = e.Crc) and (U32(tail + 4) = e.CompSize) and
+        (U32(tail + 8) = e.Size);
+    { A CRC equal to the optional signature is not itself a signature.
+      Both bounded layouts are tested against all authoritative fields. }
+    if (not signedOk) and (not unsignedOk) then
+      ZipRaise(I, tail, zesStructure, 'the data descriptor is missing or contradicts the directory');
+  end;
+  if (FLimit > 0) and (e.Size > FLimit) then
+    ZipRaise(I, -1, zesLimit, '"' + e.Name + '" is larger than the limit');
+  if not HavePassword then
+    ZipRaise(I, -1, zesPasswordRequired, '"' + e.Name + '" requires a password argument');
+
+  body := Raw(I);
+  payloadAt := at + info.Overhead;
+  if info.Present then
+  begin
+    derived := Pbkdf2HmacSha1(Password, Copy(body, 1, info.SaltBytes), 1000, 2 * info.KeyBytes + 2);
+    if Length(derived) <> 2 * info.KeyBytes + 2 then
+      ZipRaise(I, -1, zesInternal, 'the AES derived key has an invalid length');
+    if not CipherEqual(Copy(derived, 2 * info.KeyBytes + 1, 2), Copy(body, info.SaltBytes + 1, 2)) then
+      ZipRaise(I, at + info.SaltBytes, zesPasswordCheck, 'the AES password verifier does not match');
+    payloadLen := Length(body) - info.Overhead;
+    payload := Copy(body, info.SaltBytes + 3, payloadLen);
+    tag := Copy(HmacSha1(Copy(derived, info.KeyBytes + 1, info.KeyBytes), payload), 1, 10);
+    if not CipherEqual(tag, Copy(body, Length(body) - 9, 10)) then
+      ZipRaise(I, at + Length(body) - 10, zesAuthentication, 'the AES authentication code does not match');
+    { No AES operation or inflater construction precedes authentication. }
+    if not AesInit(aes, Copy(derived, 1, info.KeyBytes)) then
+      ZipRaise(I, -1, zesInternal, 'the AES key schedule has an invalid length');
+    compressed := ZipAesCrypt(aes, payload);
+    payloadAt := at + info.SaltBytes + 2;
+  end
+  else
+  begin
+    if (e.Flags and 8) <> 0 then check := Byte((e.DosTime shr 8) and 255)
+    else check := Byte((e.Crc shr 24) and 255);
+    compressed := ZipLegacyDecrypt(body, Password, check, I, at);
+  end;
+  { Empty encrypted payloads still passed all framing/password/MAC checks. }
+  if (Length(compressed) = 0) and (e.Size = 0) then plain := ''
+  else if info.Method = 0 then plain := compressed
+  else
+  begin
+    z := TInflater.Create(flRaw);
+    if e.Size > 0 then z.MaxOutput := e.Size else z.MaxOutput := 1;
+    try
+      z.Feed(compressed);
+      plain := z.Finish;
+    except
+      on E1: EFlateError do
+      begin
+        errAt := -1;
+        if (E1.Offset >= 0) and (E1.Offset <= Length(compressed)) then errAt := payloadAt + E1.Offset;
+        if Pos('the output is larger than the limit', E1.Message) <> 0 then
+          ZipRaise(I, errAt, zesLimit, '"' + e.Name + '": ' + E1.Message)
+        else
+          ZipRaise(I, errAt, zesInflate, '"' + e.Name + '": ' + E1.Message);
+      end;
+    end;
+    if (not z.Done) or (z.Unused <> '') or (z.Consumed <> Length(compressed)) then
+      ZipRaise(I, payloadAt, zesInflate, 'the encrypted deflate stream is incomplete or has trailing bytes');
+  end;
+  if Length(plain) <> e.Size then
+    ZipRaise(I, -1, zesSize, '"' + e.Name + '" has a different decoded size than its directory');
+  if ((not info.Present) or (info.Version = 1)) and (Crc32(plain) <> e.Crc) then
+    ZipRaise(I, -1, zesCrc, 'the checksum of "' + e.Name + '" does not match');
+  Result := plain;
 end;
 
 { ---- the writer ---- }
@@ -514,47 +976,111 @@ end;
 
 { the entry's local header and data go in the body, its record in the
   directory }
+procedure ZipWriterNeed(var Left: Integer; N: Integer);
+begin
+  if (N < 0) or (N > Left) then
+    ZipRaise(-1, -1, zesWriter, 'too many or too large entries (zip64 is not supported)');
+  Left := Left - N;
+end;
+
+procedure ZipWriterField(Value, Maximum: Integer; const Name: string);
+begin
+  if (Value < 0) or (Value > Maximum) then
+    ZipRaise(-1, -1, zesWriter, 'the ' + Name + ' field is out of range');
+end;
+
 procedure TZipWriter.Put(const E: TZipEntry; const Comp: string);
 var
-  flags, at: Integer;
+  flags, at, left: Integer;
+  encrypted, descriptor: Boolean;
+  body, dir: string;
 begin
-  if (FCount >= 65534) or (Length(FBody) + Length(Comp) > $7FFFFFF0) then
-    raise EZipError.CreateAt(-1, 'too many or too large entries (zip64 is not supported)');
-  if Length(E.Name) > 65535 then
-    raise EZipError.CreateAt(-1, 'a name longer than 65535 bytes');
-  { no data descriptor follows: the sizes are in the header }
-  flags := E.Flags and (not 8);
+  if FCount >= 65534 then
+    ZipRaise(-1, -1, zesWriter, 'too many or too large entries (zip64 is not supported)');
+  ZipWriterField(E.VersionMade, 65535, 'version made');
+  ZipWriterField(E.VersionNeeded, 65535, 'version needed');
+  ZipWriterField(E.Flags, 65535, 'flags');
+  ZipWriterField(E.Method, 65535, 'method');
+  ZipWriterField(E.DosDate, 65535, 'DOS date');
+  ZipWriterField(E.DosTime, 65535, 'DOS time');
+  ZipWriterField(E.Crc, $FFFFFFFF, 'CRC');
+  ZipWriterField(E.ExternalAttr, $FFFFFFFF, 'external attributes');
+  ZipWriterField(E.CompSize, $FFFFFFFE, 'compressed size');
+  ZipWriterField(E.Size, $FFFFFFFE, 'uncompressed size');
+  ZipWriterField(Length(E.Name), 65535, 'name length');
+  ZipWriterField(Length(E.Extra), 65535, 'directory extra length');
+  ZipWriterField(Length(E.LocalExtra), 65535, 'local extra length');
+  ZipWriterField(Length(E.Comment), 65535, 'entry comment length');
+  ZipWriterField(Length(FComment), 65535, 'archive comment length');
+  if Length(Comp) <> E.CompSize then
+    ZipRaise(-1, -1, zesWriter, 'the raw body length differs from the record');
+  encrypted := ZipEncryptedMarker(E);
+  if encrypted then ZipCryptoProfile(E, -1, -1, True);
+  if encrypted then flags := E.Flags else flags := E.Flags and (not 8);
+  descriptor := encrypted and ((flags and 8) <> 0);
+  { All bounds and profile refusals precede writer mutation. Count
+    headers, extras and the descriptor in the same existing size ceiling. }
+  left := ZipWriterMax;
+  ZipWriterNeed(left, Length(FBody));
+  ZipWriterNeed(left, Length(FDir));
+  ZipWriterNeed(left, 22);
+  ZipWriterNeed(left, Length(FComment));
+  ZipWriterNeed(left, 30);
+  ZipWriterNeed(left, Length(E.Name));
+  ZipWriterNeed(left, Length(E.LocalExtra));
+  ZipWriterNeed(left, Length(Comp));
+  if descriptor then ZipWriterNeed(left, 16);
+  ZipWriterNeed(left, 46);
+  ZipWriterNeed(left, Length(E.Name));
+  ZipWriterNeed(left, Length(E.Extra));
+  ZipWriterNeed(left, Length(E.Comment));
   at := Length(FBody);
-  PutLe32(FBody, SigLocal);
-  PutLe16(FBody, E.VersionNeeded);
-  PutLe16(FBody, flags);
-  PutLe16(FBody, E.Method);
-  PutLe16(FBody, E.DosTime);
-  PutLe16(FBody, E.DosDate);
-  PutLe32(FBody, E.Crc);
-  PutLe32(FBody, E.CompSize);
-  PutLe32(FBody, E.Size);
-  PutLe16(FBody, Length(E.Name));
-  PutLe16(FBody, Length(E.LocalExtra));
-  FBody := FBody + E.Name + E.LocalExtra + Comp;
-  PutLe32(FDir, SigDir);
-  PutLe16(FDir, E.VersionMade);
-  PutLe16(FDir, E.VersionNeeded);
-  PutLe16(FDir, flags);
-  PutLe16(FDir, E.Method);
-  PutLe16(FDir, E.DosTime);
-  PutLe16(FDir, E.DosDate);
-  PutLe32(FDir, E.Crc);
-  PutLe32(FDir, E.CompSize);
-  PutLe32(FDir, E.Size);
-  PutLe16(FDir, Length(E.Name));
-  PutLe16(FDir, Length(E.Extra));
-  PutLe16(FDir, Length(E.Comment));
-  PutLe16(FDir, 0);
-  PutLe16(FDir, 0);
-  PutLe32(FDir, E.ExternalAttr);
-  PutLe32(FDir, at);
-  FDir := FDir + E.Name + E.Extra + E.Comment;
+  body := '';
+  dir := '';
+  PutLe32(body, SigLocal);
+  PutLe16(body, E.VersionNeeded);
+  PutLe16(body, flags);
+  PutLe16(body, E.Method);
+  PutLe16(body, E.DosTime);
+  PutLe16(body, E.DosDate);
+  if descriptor then
+  begin
+    PutLe32(body, 0); PutLe32(body, 0); PutLe32(body, 0);
+  end
+  else
+  begin
+    PutLe32(body, E.Crc); PutLe32(body, E.CompSize); PutLe32(body, E.Size);
+  end;
+  PutLe16(body, Length(E.Name));
+  PutLe16(body, Length(E.LocalExtra));
+  body := body + E.Name + E.LocalExtra + Comp;
+  if descriptor then
+  begin
+    PutLe32(body, SigDescriptor);
+    PutLe32(body, E.Crc);
+    PutLe32(body, E.CompSize);
+    PutLe32(body, E.Size);
+  end;
+  PutLe32(dir, SigDir);
+  PutLe16(dir, E.VersionMade);
+  PutLe16(dir, E.VersionNeeded);
+  PutLe16(dir, flags);
+  PutLe16(dir, E.Method);
+  PutLe16(dir, E.DosTime);
+  PutLe16(dir, E.DosDate);
+  PutLe32(dir, E.Crc);
+  PutLe32(dir, E.CompSize);
+  PutLe32(dir, E.Size);
+  PutLe16(dir, Length(E.Name));
+  PutLe16(dir, Length(E.Extra));
+  PutLe16(dir, Length(E.Comment));
+  PutLe16(dir, 0);
+  PutLe16(dir, 0);
+  PutLe32(dir, E.ExternalAttr);
+  PutLe32(dir, at);
+  dir := dir + E.Name + E.Extra + E.Comment;
+  FBody := FBody + body;
+  FDir := FDir + dir;
   FCount := FCount + 1;
 end;
 
@@ -597,7 +1123,7 @@ end;
 procedure TZipWriter.AddRaw(const E: TZipEntry; const Comp: string);
 begin
   if Length(Comp) <> E.CompSize then
-    raise EZipError.CreateAt(-1, 'the compressed bytes of "' + E.Name + '" are not the ' + IntToStr(E.CompSize) + ' its record says');
+    raise EZipError.CreateStageAt(-1, -1, zesWriter, 'the compressed bytes of "' + E.Name + '" are not the ' + IntToStr(E.CompSize) + ' its record says');
   Put(E, Comp);
 end;
 
@@ -606,6 +1132,8 @@ var
   n: TZipEntry;
   comp: string;
 begin
+  if ZipEncryptedMarker(E) then
+    ZipRaise(-1, -1, zesWriter, 'encrypted entries cannot be replaced; Add makes an explicit new plain entry');
   n := E;
   n.Crc := Crc32(AData);
   n.Size := Length(AData);
@@ -632,7 +1160,14 @@ end;
 function TZipWriter.Finish: string;
 var
   tail: string;
+  left: Integer;
 begin
+  ZipWriterField(Length(FComment), 65535, 'archive comment length');
+  left := ZipWriterMax;
+  ZipWriterNeed(left, Length(FBody));
+  ZipWriterNeed(left, Length(FDir));
+  ZipWriterNeed(left, 22);
+  ZipWriterNeed(left, Length(FComment));
   tail := '';
   PutLe32(tail, SigEnd);
   PutLe16(tail, 0);

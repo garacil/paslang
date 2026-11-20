@@ -764,6 +764,9 @@ GOLDEN_A64 += xmlkeep
 # P427: DEFLATE, zlib and gzip read against zlib and Go on 1893 streams, the writer round trip, ZIP against zipfile and Go.
 GOLDEN += flate flatec zip
 GOLDEN_A64 += flate flatec zip
+# P679: password and structure contracts against checked ZIP fixtures.
+GOLDEN += zippassword
+GOLDEN_A64 += zippassword
 GOLDEN += md5lens
 GOLDEN_A64 += md5lens
 GOLDEN += crclens
@@ -6062,6 +6065,16 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	echo "==== self ===="; \
 	$(MAKE) self; \
 	$(MAKE) check-arm64
+	@set -e; \
+	for zip_cpu in base native; do for zip_inl in 0 40; do \
+	  zip_bin=$(BUILDDIR)/zippassword-$$zip_cpu-$$zip_inl; \
+	  $(OUTDIR)/paslangc -cpu $$zip_cpu -inline $$zip_inl -Fu $(BUILDDIR) -o $$zip_bin testdata/zippassword.paslang; \
+	  timeout 240 $$zip_bin > $$zip_bin.got; \
+	  diff -u testdata/zippassword.out $$zip_bin.got; \
+	  PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=3 PASLANG_GCPOISON=1 timeout 600 $$zip_bin > $$zip_bin.vgot; \
+	  diff -u testdata/zippassword.out $$zip_bin.vgot; \
+	done; done; \
+	echo ok zippassword
 	@python3 -I scripts/check_environment_names.py --compiler $(OUTDIR)/paslangc --library $(BUILDDIR) --target amd64
 	@python3 -I scripts/check_sdk_state.py verify --manifest $(BUILDDIR)/sdk-state-check.json --profile amd64 $(BUILDDIR) $(LVL_X64) --profile arm64 $(A64DIR) $(LVL_A64) --debugger amd64 $(OUTDIR)/pasdbg -- $(CORE_UNITS) $(LIB_UNITS)
 
@@ -7649,6 +7662,17 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	$(OUTDIR)/paslangc -target arm64 -cpu max -Fu $(A64DIR) -o $(BUILDDIR)/httpsrv-sd-arm testdata/httpsrv.paslang; \
 	timeout 600 python3 -I scripts/check_httpsystemd.py $(BUILDDIR)/httpsrv-sd-arm $(QEMU_A64); \
 	echo ok httpsrv-arm
+	@set -e; \
+	for zip_cpu in base max; do for zip_inl in 0 40; do \
+	  zip_model=max; if [ "$$zip_cpu" = base ]; then zip_model=cortex-a53; fi; \
+	  zip_bin=$(BUILDDIR)/zippassword-$$zip_cpu-$$zip_inl-arm; \
+	  $(OUTDIR)/paslangc -target arm64 -cpu $$zip_cpu -inline $$zip_inl -Fu $(A64DIR) -o $$zip_bin testdata/zippassword.paslang; \
+	  timeout 240 $(QEMU_A64) -cpu $$zip_model $$zip_bin > $$zip_bin.got; \
+	  diff -u testdata/zippassword.out $$zip_bin.got; \
+	  PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=3 PASLANG_GCPOISON=1 timeout 1800 $(QEMU_A64) -cpu $$zip_model $$zip_bin > $$zip_bin.vgot; \
+	  diff -u testdata/zippassword.out $$zip_bin.vgot; \
+	done; done; \
+	echo ok zippassword-arm
 	@python3 -I scripts/check_environment_names.py --compiler $(OUTDIR)/paslangc --library $(A64DIR) --target arm64 --qemu $(QEMU_A64)
 	@python3 -I scripts/check_sdk_state.py verify --manifest $(BUILDDIR)/sdk-state-check-arm64.json --profile arm64 $(A64DIR) $(LVL_A64) -- $(CORE_UNITS) $(LIB_UNITS)
 
