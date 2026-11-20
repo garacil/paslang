@@ -793,7 +793,7 @@ routine's at a time.
 
 ## Sync types
 
-`mutex` (32 bytes), `rwmutex` (48), `waitgroup` (24), `cond` (16), and
+`mutex` (32 bytes), `rwmutex` (88), `waitgroup` (24), `cond` (16), and
 `once` (32) are reserved words for the records of the core unit
 `pasroutines` (`TPasMutex`, `TPasRWMutex`, `TPasWaitGroup`, `TPasCond`,
 `TPasOnce`). Their zero value is ready, so they live where declared:

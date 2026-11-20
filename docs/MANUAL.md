@@ -689,9 +689,11 @@ are checked are in §6.
 stopped on them with `Default type`). A record's, a static array's or a
 set's `Default(T)` is a value wherever one stands, an argument by value or
 `const` among them (1.1.272: until then the routine read it through nil).
-`SizeOf(T)` and `SizeOf(expr)` give sizes. The expression is checked
-but not evaluated: `SizeOf(Char('A'))` is 1, and an invalid conversion
-such as `SizeOf(Integer(1.5))` is refused just as it is outside `SizeOf`.
+`SizeOf(T)` and `SizeOf(expr)` give sizes. A bare type name, including
+`json`, is a type operand; a quoted name is a string expression, so
+`SizeOf('Byte')` is 16. The expression is checked but not evaluated:
+`SizeOf(Char('A'))` is 1, and an invalid conversion such as
+`SizeOf(Integer(1.5))` is refused just as it is outside `SizeOf`.
 A cast inside `High` or `Low` is also a complete expression:
 `Ord(High(Char('A')))` is 255 and `Ord(Low(Char('A')))` is 0.
 
@@ -7572,7 +7574,7 @@ never create it.
 | Type | Size | Methods | Statement |
 |------|------|---------|-----------|
 | `mutex` | 32 | `Lock`, `Unlock`, `TryLock` | `lock mu do stmt` |
-| `rwmutex` | 48 | `Lock`, `Unlock`, `BeginRead`, `EndRead` | `lock rw do stmt`, `lock rw read do stmt` |
+| `rwmutex` | 88 | `Lock`, `Unlock`, `BeginRead`, `EndRead` | `lock rw do stmt`, `lock rw read do stmt` |
 | `waitgroup` | 24 | `Add(n)`, `Done`, `Wait` | |
 | `cond` | 16 | `Wait(mu)`, `Signal`, `Broadcast` | |
 | `once` | 32 | `Done` | `once o do stmt` |

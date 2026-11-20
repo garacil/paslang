@@ -840,8 +840,8 @@ GOLDEN_A64 += chrboundary chrsideeffects
 GOLDEN += charliteralconst
 GOLDEN_A64 += charliteralconst
 # P681: whole type operands and ordinary expressions share validation.
-GOLDEN += typeargcore typeargdirectives
-GOLDEN_A64 += typeargcore typeargdirectives
+GOLDEN += typeargcore typeargdirectives typeargkeywords
+GOLDEN_A64 += typeargcore typeargdirectives typeargkeywords
 # P573: a server stops whatever became of its sockets.
 GOLDEN += httpstop
 GOLDEN_A64 += httpstop
@@ -4783,7 +4783,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	echo ok unrollrange-inline; \
 	: typed FP constants and ordinal conversion boundaries under both inline policies; \
 	for fp_cpu in base native; do for fp_inl in 0 40; do \
-	  for fp_case in fpbaselinedirectsingle fpbaselinedirectdouble fpbaselinenilarysingle fpbaselinenilarydouble fpconstant constfoldtypes chrboundary chrsideeffects charliteralconst typeargcore typeargdirectives; do \
+	  for fp_case in fpbaselinedirectsingle fpbaselinedirectdouble fpbaselinenilarysingle fpbaselinenilarydouble fpconstant constfoldtypes chrboundary chrsideeffects charliteralconst typeargcore typeargdirectives typeargkeywords; do \
 	    fp_bin=$(BUILDDIR)/$$fp_case-root-$$fp_cpu-$$fp_inl; \
 	    $(OUTDIR)/paslangc -cpu $$fp_cpu -inline $$fp_inl -Fu $(BUILDDIR) -o $$fp_bin testdata/$$fp_case.paslang >$$fp_bin.compile.out 2>$$fp_bin.compile.err || { fp_status=$$?; cat $$fp_bin.compile.out; cat $$fp_bin.compile.err >&2; exit $$fp_status; }; \
 	    test ! -s $$fp_bin.compile.out || { cat $$fp_bin.compile.out; exit 1; }; \
@@ -4834,7 +4834,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  diff -u testdata/typeargwarning.out $$ta_bin.got; \
 	done; done; \
 	: P681 invalid casts retain their ordinary conversion diagnostics; \
-	for ta_inl in 0 40; do for ta_case in sizeofchar sizeofbyte sizeofinteger highchar highbyte highinteger lowchar lowbyte lowinteger; do \
+	for ta_inl in 0 40; do for ta_case in sizeofchar sizeofbyte sizeofinteger highchar highbyte highinteger lowchar lowbyte lowinteger highjson lowjson; do \
 	  ta_bin=$(BUILDDIR)/typearg-$$ta_case-amd-$$ta_inl; rm -f $$ta_bin; ta_status=0; \
 	  $(OUTDIR)/paslangc -cpu base -inline $$ta_inl -Fu $(BUILDDIR) -o $$ta_bin "$(CURDIR)/testdata/typeargbad/$$ta_case.paslang" >$$ta_bin.out 2>$$ta_bin.err || ta_status=$$?; \
 	  test "$$ta_status" -eq 1 || { cat $$ta_bin.out; cat $$ta_bin.err >&2; echo "$$ta_case: expected compiler status 1, got $$ta_status"; exit 1; }; \
@@ -6647,7 +6647,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	: typed FP constants and ordinal conversion boundaries under both inline policies; \
 	for fp_cpu in base max; do for fp_inl in 0 40; do \
 	  fp_model=max; if [ "$$fp_cpu" = base ]; then fp_model=cortex-a53; fi; \
-	  for fp_case in fpbaselinedirectsingle fpbaselinedirectdouble fpbaselinenilarysingle fpbaselinenilarydouble fpconstant constfoldtypes chrboundary chrsideeffects charliteralconst typeargcore typeargdirectives; do \
+	  for fp_case in fpbaselinedirectsingle fpbaselinedirectdouble fpbaselinenilarysingle fpbaselinenilarydouble fpconstant constfoldtypes chrboundary chrsideeffects charliteralconst typeargcore typeargdirectives typeargkeywords; do \
 	    fp_bin=$(BUILDDIR)/$$fp_case-root-$$fp_cpu-$$fp_inl-arm; \
 	    $(OUTDIR)/paslangc -target arm64 -cpu $$fp_cpu -inline $$fp_inl -Fu $(A64DIR) -o $$fp_bin testdata/$$fp_case.paslang >$$fp_bin.compile.out 2>$$fp_bin.compile.err || { fp_status=$$?; cat $$fp_bin.compile.out; cat $$fp_bin.compile.err >&2; exit $$fp_status; }; \
 	    test ! -s $$fp_bin.compile.out || { cat $$fp_bin.compile.out; exit 1; }; \
@@ -6699,7 +6699,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	  diff -u testdata/typeargwarning.out $$ta_bin.got; \
 	done; done; \
 	: P681 invalid casts retain their ordinary conversion diagnostics; \
-	for ta_inl in 0 40; do for ta_case in sizeofchar sizeofbyte sizeofinteger highchar highbyte highinteger lowchar lowbyte lowinteger; do \
+	for ta_inl in 0 40; do for ta_case in sizeofchar sizeofbyte sizeofinteger highchar highbyte highinteger lowchar lowbyte lowinteger highjson lowjson; do \
 	  ta_bin=$(BUILDDIR)/typearg-$$ta_case-arm-$$ta_inl; rm -f $$ta_bin; ta_status=0; \
 	  $(OUTDIR)/paslangc -target arm64 -cpu base -inline $$ta_inl -Fu $(A64DIR) -o $$ta_bin "$(CURDIR)/testdata/typeargbad/$$ta_case.paslang" >$$ta_bin.out 2>$$ta_bin.err || ta_status=$$?; \
 	  test "$$ta_status" -eq 1 || { cat $$ta_bin.out; cat $$ta_bin.err >&2; echo "$$ta_case: expected compiler status 1, got $$ta_status"; exit 1; }; \
