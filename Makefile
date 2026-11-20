@@ -835,6 +835,13 @@ GOLDEN_A64 += syserrorstate
 # Typed FP constants retain their semantic types through folding.
 GOLDEN += fpbaselinedirectsingle fpbaselinedirectdouble fpbaselinenilarysingle fpbaselinenilarydouble fpconstant constfoldtypes
 GOLDEN_A64 += fpbaselinedirectsingle fpbaselinedirectdouble fpbaselinenilarysingle fpbaselinenilarydouble fpconstant constfoldtypes
+GOLDEN += chrboundary chrsideeffects
+GOLDEN_A64 += chrboundary chrsideeffects
+GOLDEN += charliteralconst
+GOLDEN_A64 += charliteralconst
+# P681: whole type operands and ordinary expressions share validation.
+GOLDEN += typeargcore typeargdirectives
+GOLDEN_A64 += typeargcore typeargdirectives
 # P573: a server stops whatever became of its sockets.
 GOLDEN += httpstop
 GOLDEN_A64 += httpstop
@@ -4774,9 +4781,9 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  range_got=$$(timeout 20 $$p huge-down); test "$$range_got" = "9223372036854775807"; \
 	done; done; \
 	echo ok unrollrange-inline; \
-	: typed FP constants and unchanged ordinal folds under both inline policies; \
+	: typed FP constants and ordinal conversion boundaries under both inline policies; \
 	for fp_cpu in base native; do for fp_inl in 0 40; do \
-	  for fp_case in fpbaselinedirectsingle fpbaselinedirectdouble fpbaselinenilarysingle fpbaselinenilarydouble fpconstant constfoldtypes; do \
+	  for fp_case in fpbaselinedirectsingle fpbaselinedirectdouble fpbaselinenilarysingle fpbaselinenilarydouble fpconstant constfoldtypes chrboundary chrsideeffects charliteralconst typeargcore typeargdirectives; do \
 	    fp_bin=$(BUILDDIR)/$$fp_case-root-$$fp_cpu-$$fp_inl; \
 	    $(OUTDIR)/paslangc -cpu $$fp_cpu -inline $$fp_inl -Fu $(BUILDDIR) -o $$fp_bin testdata/$$fp_case.paslang >$$fp_bin.compile.out 2>$$fp_bin.compile.err || { fp_status=$$?; cat $$fp_bin.compile.out; cat $$fp_bin.compile.err >&2; exit $$fp_status; }; \
 	    test ! -s $$fp_bin.compile.out || { cat $$fp_bin.compile.out; exit 1; }; \
@@ -4793,6 +4800,50 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  done; \
 	done; done; \
 	echo ok typed-fp-constants; \
+	: Char constants keep their range refusals before the runtime byte boundary; \
+	for chr_inl in 0 40; do \
+	  for chr_case in chr256 chrnegative chrexpression char256 integerchr ordchr chrtyped bodywritechr bodynestedchr bodynestedchar bodynegative bodyboolean bodyunreachable bodyordchr bodysucc bodycurrency bodysize bodyhigh bodyassignchr bodymakechan bodybitpos bodystaleord; do \
+	    chr_bin=$(BUILDDIR)/$$chr_case-boundary-$$chr_inl; \
+	    chr_status=0; \
+	    $(OUTDIR)/paslangc -cpu base -inline $$chr_inl -Fu $(BUILDDIR) -o $$chr_bin testdata/chrbad/$$chr_case.paslang >$$chr_bin.out 2>$$chr_bin.err || chr_status=$$?; \
+	    test "$$chr_status" -eq 1 || { cat $$chr_bin.out; cat $$chr_bin.err >&2; echo "$$chr_case: expected compiler status 1, got $$chr_status"; exit 1; }; \
+	    test ! -s $$chr_bin.out || { cat $$chr_bin.out; exit 1; }; \
+	    grep -qF "$$(cat testdata/chrbad/$$chr_case.err)" $$chr_bin.err || { cat $$chr_bin.err >&2; exit 1; }; \
+	  done; \
+	done; \
+	echo ok char-boundary-rejects; \
+	: P681 unit ownership and exactly one warning through lookahead; \
+	for ta_cpu in base native; do for ta_inl in 0 40; do \
+	  ta_dir=$(BUILDDIR)/typearg-unit-amd-$$ta_cpu-$$ta_inl; mkdir -p $$ta_dir; \
+	  $(OUTDIR)/paslangc -cpu $$ta_cpu -inline $$ta_inl -Fu $(BUILDDIR) -c -o $$ta_dir/typeargtypes "$(CURDIR)/testdata/units/typeargtypes.paslang" >$$ta_dir/compile.out 2>$$ta_dir/compile.err || { ta_status=$$?; cat $$ta_dir/compile.out; cat $$ta_dir/compile.err >&2; exit $$ta_status; }; \
+	  test ! -s $$ta_dir/compile.out && test ! -s $$ta_dir/compile.err || { cat $$ta_dir/compile.out; cat $$ta_dir/compile.err >&2; exit 1; }; \
+	  test -s $$ta_dir/typeargtypes.pi && test -s $$ta_dir/typeargtypes.o && test -s $$ta_dir/typeargtypes.s; \
+	  ta_bin=$$ta_dir/typearguse; \
+	  $(OUTDIR)/paslangc -cpu $$ta_cpu -inline $$ta_inl -Fu $$ta_dir -Fu $(BUILDDIR) -o $$ta_bin "$(CURDIR)/testdata/units/typearguse.paslang" >$$ta_bin.compile.out 2>$$ta_bin.compile.err || { ta_status=$$?; cat $$ta_bin.compile.out; cat $$ta_bin.compile.err >&2; exit $$ta_status; }; \
+	  test ! -s $$ta_bin.compile.out && test ! -s $$ta_bin.compile.err || { cat $$ta_bin.compile.out; cat $$ta_bin.compile.err >&2; exit 1; }; \
+	  timeout 20 $$ta_bin >$$ta_bin.got 2>$$ta_bin.err || { ta_status=$$?; cat $$ta_bin.got; cat $$ta_bin.err >&2; exit $$ta_status; }; \
+	  test ! -s $$ta_bin.err || { cat $$ta_bin.err >&2; exit 1; }; \
+	  diff -u testdata/units/typearguse.out $$ta_bin.got; \
+	  ta_bin=$(BUILDDIR)/typeargwarning-amd-$$ta_cpu-$$ta_inl; \
+	  $(OUTDIR)/paslangc -cpu $$ta_cpu -inline $$ta_inl -Fu $(BUILDDIR) -o $$ta_bin "$(CURDIR)/testdata/typeargwarning.paslang" >$$ta_bin.compile.out 2>$$ta_bin.compile.err || { ta_status=$$?; cat $$ta_bin.compile.out; cat $$ta_bin.compile.err >&2; exit $$ta_status; }; \
+	  test ! -s $$ta_bin.compile.out || { cat $$ta_bin.compile.out; exit 1; }; \
+	  printf 'paslangc: warning: type argument lookahead once at 9 in %s\n' "$(CURDIR)/testdata/typeargwarning.paslang" >$$ta_bin.expected.err; \
+	  diff -u $$ta_bin.expected.err $$ta_bin.compile.err; \
+	  timeout 20 $$ta_bin >$$ta_bin.got 2>$$ta_bin.err || { ta_status=$$?; cat $$ta_bin.got; cat $$ta_bin.err >&2; exit $$ta_status; }; \
+	  test ! -s $$ta_bin.err || { cat $$ta_bin.err >&2; exit 1; }; \
+	  diff -u testdata/typeargwarning.out $$ta_bin.got; \
+	done; done; \
+	: P681 invalid casts retain their ordinary conversion diagnostics; \
+	for ta_inl in 0 40; do for ta_case in sizeofchar sizeofbyte sizeofinteger highchar highbyte highinteger lowchar lowbyte lowinteger; do \
+	  ta_bin=$(BUILDDIR)/typearg-$$ta_case-amd-$$ta_inl; rm -f $$ta_bin; ta_status=0; \
+	  $(OUTDIR)/paslangc -cpu base -inline $$ta_inl -Fu $(BUILDDIR) -o $$ta_bin "$(CURDIR)/testdata/typeargbad/$$ta_case.paslang" >$$ta_bin.out 2>$$ta_bin.err || ta_status=$$?; \
+	  test "$$ta_status" -eq 1 || { cat $$ta_bin.out; cat $$ta_bin.err >&2; echo "$$ta_case: expected compiler status 1, got $$ta_status"; exit 1; }; \
+	  test ! -s $$ta_bin.out || { cat $$ta_bin.out; exit 1; }; \
+	  test ! -e $$ta_bin || { echo "$$ta_case: rejected source left an executable"; exit 1; }; \
+	  printf 'paslangc: %s in %s\n' "$$(cat testdata/typeargbad/$$ta_case.err)" "$(CURDIR)/testdata/typeargbad/$$ta_case.paslang" >$$ta_bin.expected.err; \
+	  diff -u $$ta_bin.expected.err $$ta_bin.err; \
+	done; done; \
+	echo ok type-arguments-amd; \
 	: every loop of an asm kernel of the units starts aligned, as the loops paslangc compiles, P302; \
 	python3 -I scripts/check_kernel_align.py src/lib/*.paslang src/rtl/*.paslang; \
 	echo ok kernel-align; \
@@ -6593,10 +6644,10 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	  range_got=$$(timeout 20 $(QEMU_A64) -cpu $$model $$p huge-down); test "$$range_got" = "9223372036854775807"; \
 	done; done; \
 	echo ok unrollrange-arm-inline; \
-	: typed FP constants and unchanged ordinal folds under both inline policies; \
+	: typed FP constants and ordinal conversion boundaries under both inline policies; \
 	for fp_cpu in base max; do for fp_inl in 0 40; do \
 	  fp_model=max; if [ "$$fp_cpu" = base ]; then fp_model=cortex-a53; fi; \
-	  for fp_case in fpbaselinedirectsingle fpbaselinedirectdouble fpbaselinenilarysingle fpbaselinenilarydouble fpconstant constfoldtypes; do \
+	  for fp_case in fpbaselinedirectsingle fpbaselinedirectdouble fpbaselinenilarysingle fpbaselinenilarydouble fpconstant constfoldtypes chrboundary chrsideeffects charliteralconst typeargcore typeargdirectives; do \
 	    fp_bin=$(BUILDDIR)/$$fp_case-root-$$fp_cpu-$$fp_inl-arm; \
 	    $(OUTDIR)/paslangc -target arm64 -cpu $$fp_cpu -inline $$fp_inl -Fu $(A64DIR) -o $$fp_bin testdata/$$fp_case.paslang >$$fp_bin.compile.out 2>$$fp_bin.compile.err || { fp_status=$$?; cat $$fp_bin.compile.out; cat $$fp_bin.compile.err >&2; exit $$fp_status; }; \
 	    test ! -s $$fp_bin.compile.out || { cat $$fp_bin.compile.out; exit 1; }; \
@@ -6613,6 +6664,51 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	  done; \
 	done; done; \
 	echo ok typed-fp-constants-arm; \
+	: Char constants keep their range refusals before the runtime byte boundary; \
+	for chr_inl in 0 40; do \
+	  for chr_case in chr256 chrnegative chrexpression char256 integerchr ordchr chrtyped bodywritechr bodynestedchr bodynestedchar bodynegative bodyboolean bodyunreachable bodyordchr bodysucc bodycurrency bodysize bodyhigh bodyassignchr bodymakechan bodybitpos bodystaleord; do \
+	    chr_bin=$(BUILDDIR)/$$chr_case-boundary-$$chr_inl-arm; \
+	    chr_status=0; \
+	    $(OUTDIR)/paslangc -target arm64 -cpu base -inline $$chr_inl -Fu $(A64DIR) -o $$chr_bin testdata/chrbad/$$chr_case.paslang >$$chr_bin.out 2>$$chr_bin.err || chr_status=$$?; \
+	    test "$$chr_status" -eq 1 || { cat $$chr_bin.out; cat $$chr_bin.err >&2; echo "$$chr_case: expected compiler status 1, got $$chr_status"; exit 1; }; \
+	    test ! -s $$chr_bin.out || { cat $$chr_bin.out; exit 1; }; \
+	    grep -qF "$$(cat testdata/chrbad/$$chr_case.err)" $$chr_bin.err || { cat $$chr_bin.err >&2; exit 1; }; \
+	  done; \
+	done; \
+	echo ok char-boundary-rejects-arm; \
+	: P681 unit ownership and exactly one warning through lookahead; \
+	for ta_cpu in base max; do for ta_inl in 0 40; do \
+	  ta_model=max; if [ "$$ta_cpu" = base ]; then ta_model=cortex-a53; fi; \
+	  ta_dir=$(BUILDDIR)/typearg-unit-arm-$$ta_cpu-$$ta_inl; mkdir -p $$ta_dir; \
+	  $(OUTDIR)/paslangc -target arm64 -cpu $$ta_cpu -inline $$ta_inl -Fu $(A64DIR) -c -o $$ta_dir/typeargtypes "$(CURDIR)/testdata/units/typeargtypes.paslang" >$$ta_dir/compile.out 2>$$ta_dir/compile.err || { ta_status=$$?; cat $$ta_dir/compile.out; cat $$ta_dir/compile.err >&2; exit $$ta_status; }; \
+	  test ! -s $$ta_dir/compile.out && test ! -s $$ta_dir/compile.err || { cat $$ta_dir/compile.out; cat $$ta_dir/compile.err >&2; exit 1; }; \
+	  test -s $$ta_dir/typeargtypes.pi && test -s $$ta_dir/typeargtypes.o && test -s $$ta_dir/typeargtypes.s; \
+	  ta_bin=$$ta_dir/typearguse; \
+	  $(OUTDIR)/paslangc -target arm64 -cpu $$ta_cpu -inline $$ta_inl -Fu $$ta_dir -Fu $(A64DIR) -o $$ta_bin "$(CURDIR)/testdata/units/typearguse.paslang" >$$ta_bin.compile.out 2>$$ta_bin.compile.err || { ta_status=$$?; cat $$ta_bin.compile.out; cat $$ta_bin.compile.err >&2; exit $$ta_status; }; \
+	  test ! -s $$ta_bin.compile.out && test ! -s $$ta_bin.compile.err || { cat $$ta_bin.compile.out; cat $$ta_bin.compile.err >&2; exit 1; }; \
+	  timeout 20 $(QEMU_A64) -cpu $$ta_model $$ta_bin >$$ta_bin.got 2>$$ta_bin.err || { ta_status=$$?; cat $$ta_bin.got; cat $$ta_bin.err >&2; exit $$ta_status; }; \
+	  test ! -s $$ta_bin.err || { cat $$ta_bin.err >&2; exit 1; }; \
+	  diff -u testdata/units/typearguse.out $$ta_bin.got; \
+	  ta_bin=$(BUILDDIR)/typeargwarning-arm-$$ta_cpu-$$ta_inl; \
+	  $(OUTDIR)/paslangc -target arm64 -cpu $$ta_cpu -inline $$ta_inl -Fu $(A64DIR) -o $$ta_bin "$(CURDIR)/testdata/typeargwarning.paslang" >$$ta_bin.compile.out 2>$$ta_bin.compile.err || { ta_status=$$?; cat $$ta_bin.compile.out; cat $$ta_bin.compile.err >&2; exit $$ta_status; }; \
+	  test ! -s $$ta_bin.compile.out || { cat $$ta_bin.compile.out; exit 1; }; \
+	  printf 'paslangc: warning: type argument lookahead once at 9 in %s\n' "$(CURDIR)/testdata/typeargwarning.paslang" >$$ta_bin.expected.err; \
+	  diff -u $$ta_bin.expected.err $$ta_bin.compile.err; \
+	  timeout 20 $(QEMU_A64) -cpu $$ta_model $$ta_bin >$$ta_bin.got 2>$$ta_bin.err || { ta_status=$$?; cat $$ta_bin.got; cat $$ta_bin.err >&2; exit $$ta_status; }; \
+	  test ! -s $$ta_bin.err || { cat $$ta_bin.err >&2; exit 1; }; \
+	  diff -u testdata/typeargwarning.out $$ta_bin.got; \
+	done; done; \
+	: P681 invalid casts retain their ordinary conversion diagnostics; \
+	for ta_inl in 0 40; do for ta_case in sizeofchar sizeofbyte sizeofinteger highchar highbyte highinteger lowchar lowbyte lowinteger; do \
+	  ta_bin=$(BUILDDIR)/typearg-$$ta_case-arm-$$ta_inl; rm -f $$ta_bin; ta_status=0; \
+	  $(OUTDIR)/paslangc -target arm64 -cpu base -inline $$ta_inl -Fu $(A64DIR) -o $$ta_bin "$(CURDIR)/testdata/typeargbad/$$ta_case.paslang" >$$ta_bin.out 2>$$ta_bin.err || ta_status=$$?; \
+	  test "$$ta_status" -eq 1 || { cat $$ta_bin.out; cat $$ta_bin.err >&2; echo "$$ta_case: expected compiler status 1, got $$ta_status"; exit 1; }; \
+	  test ! -s $$ta_bin.out || { cat $$ta_bin.out; exit 1; }; \
+	  test ! -e $$ta_bin || { echo "$$ta_case: rejected source left an executable"; exit 1; }; \
+	  printf 'paslangc: %s in %s\n' "$$(cat testdata/typeargbad/$$ta_case.err)" "$(CURDIR)/testdata/typeargbad/$$ta_case.paslang" >$$ta_bin.expected.err; \
+	  diff -u $$ta_bin.expected.err $$ta_bin.err; \
+	done; done; \
+	echo ok type-arguments-arm; \
 	$(OUTDIR)/paslangc -target arm64 -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/exprinline0-arm testdata/exprinline.paslang; \
 	timeout 300 $(QEMU_A64) $(BUILDDIR)/exprinline0-arm > $(BUILDDIR)/exprinline0-arm.got; \
 	diff -u testdata/exprinline.out $(BUILDDIR)/exprinline0-arm.got; \

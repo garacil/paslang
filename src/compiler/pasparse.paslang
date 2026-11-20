@@ -460,6 +460,7 @@ type
     function BinWord(Op: TBinOp): string;
     function BoolOf(E: PExpr): PExpr;
     function AsInt(E: PExpr; T: LongInt): PExpr;
+    function CharOf(E: PExpr; ALine, ACol: LongInt): PExpr;
     function TypName(T: LongInt): string;
     procedure NoReal(E: PExpr; const Into: string);
     procedure NoRealCond(E: PExpr);
@@ -606,6 +607,7 @@ type
     function ScopeLevel(S: SizeInt): LongInt;
     function OwnLocalName(const AName: string): Boolean;
     function TypeAhead(out Id: LongInt): Boolean;
+    function WholeTypeArg(out Id: LongInt): Boolean;
     function AheadName: string;
     procedure SkipTypeName;
     function FwdIdx(const AName: string): SizeInt;
@@ -1628,6 +1630,31 @@ begin
   else
     Result := E;
   Result^.Typ := T;
+end;
+
+{ A character conversion keeps its argument's operations and call type.
+  Validate constants at this constructor before an eager fold or SizeOf
+  can consume the expression, then keep the runtime byte boundary even
+  when Integer or Ord relabels the outer Char. Go walkConv and ssagen.conv
+  likewise retain narrowing as a distinct node. }
+function TParser.CharOf(E: PExpr; ALine, ACol: LongInt): PExpr;
+var
+  v: Int64;
+  vt: LongInt;
+  vs, was: string;
+begin
+  was := FConstAt;
+  FConstAt := IntToStr(ALine) + ':' + IntToStr(ACol);
+  try
+    if ConstFold(E, v, vt, vs) and ((v < 0) or (v > 255)) then
+      Refuse('char code ' + IntToStr(v) + ' out of range at ' + FConstAt);
+  finally
+    FConstAt := was;
+  end;
+  Result := NewUn(uoConv, E);
+  Result^.Typ := TyByte;
+  Result := NewUn(uoConv, Result);
+  Result^.Typ := TyChar;
 end;
 
 { The type two integer operands are worked out in (P99): a constant with
@@ -6651,6 +6678,35 @@ begin
   Id := TyNone;
   nm := ReadTypePath;
   Result := NamedType(nm, Id);
+end;
+
+{ SizeOf, High and Low accept a type only when it is the entire operand.
+  Do not consume a type prefix of a cast or member: ParseExpr must perform
+  its normal conversions and checks, from the original current token. }
+function TParser.WholeTypeArg(out Id: LongInt): Boolean;
+var
+  nm, dots: string;
+  after: TTokKind;
+  cv: Int64;
+begin
+  Result := False;
+  Id := TyNone;
+  if not IsName then Exit;
+  dots := FLex.PeekDotsAfter(after);
+  if after <> tkRParen then Exit;
+  if (dots = '') and (FTok.Kind = tkInteger) then
+    Id := TyInteger
+  else if (dots = '') and (FTok.Kind = tkStringKw) then
+    Id := TyString
+  else if (dots = '') and (FTok.Kind = tkBoolean) then
+    Id := TyBoolean
+  else
+  begin
+    if IsVarName(FTok.Lexeme) or FindConst(FTok.Lexeme, cv) then Exit;
+    nm := FTok.Lexeme + dots;
+    if not NamedType(nm, Id) then Exit;
+  end;
+  Result := True;
 end;
 
 { The longest token prefix that names a type, not its subsequent
@@ -12893,8 +12949,7 @@ begin
             Refuse('Chr takes 1 argument' + MethAt(nline, ncol));
           if TypeOf(args[0]^.Typ).Kind = tykReal then
             Refuse('Chr takes an integer' + MethAt(nline, ncol));
-          Result := args[0];
-          Result^.Typ := TyChar;
+          Result := CharOf(args[0], nline, ncol);
         end
         else if SameId(name, 'HeapCheck') and (not IsVarName(name)) then
         begin
@@ -14036,21 +14091,7 @@ begin
             enumeration's, a subrange's and a static array's bounds; of a
             value, what they were. }
           FTok := FLex.Next;
-          have := False;
-          if FTok.Kind = tkInteger then
-          begin
-            id := TyInteger;
-            have := True;
-          end
-          else if FTok.Kind = tkBoolean then
-          begin
-            id := TyBoolean;
-            have := True;
-          end
-          else if IsName and (not IsVarName(FTok.Lexeme)) and
-            (not FindConst(FTok.Lexeme, cv)) and TypeAhead(id) then
-            have := True;
-          if have then
+          if WholeTypeArg(id) then
           begin
             { T, or ua.T (P158) }
             if FTok.Kind = tkIdent then
@@ -14112,34 +14153,14 @@ begin
         else if SameId(name, 'SizeOf') then
         begin
           Eat(tkLParen);
-          { Integer, string and Boolean are keywords: SizeOf(Integer) was a
-            syntax error (1.0.74). Integer(x) has the size of Integer. }
-          if (FTok.Kind = tkInteger) or (FTok.Kind = tkStringKw) or
-            (FTok.Kind = tkBoolean) then
+          if WholeTypeArg(id) then
           begin
-            id := Self.ParseType;
-            if FTok.Kind = tkLParen then
-            begin
-              FTok := FLex.Next;
-              e := ParseExpr;
-              Eat(tkRParen);
-            end;
-            Result := NewInt(TypeOf(id).Size);
-          end
-          else if TypeAhead(id) then
-          begin
-            { T, or ua.T (P158) }
-            name := FTok.Lexeme;
-            SkipTypeName;
-            if FTok.Kind = tkRParen then
-              Result := NewInt(TypeOf(id).Size)
-            else if IsVarName(name) then
-            begin
-              e := ParsePostfix(NewVar(VarSym(name), VarTyp(name)));
-              Result := NewInt(TypeOf(e^.Typ).Size);
-            end
+            { T, ua.T, or the keyword types Integer, string and Boolean. }
+            if FTok.Kind = tkIdent then
+              SkipTypeName
             else
-              Result := NewInt(TypeOf(id).Size);
+              FTok := FLex.Next;
+            Result := NewInt(TypeOf(id).Size);
           end
           else
           begin
@@ -14611,7 +14632,9 @@ begin
                 Refuse(TypName(args[0]^.Typ) + ' does not go into ' + TypName(id) +
                   ': a class operator Explicit or Implicit makes one, x as T sees its bytes' +
                   PosOf(args[0]));
-              if (TypeOf(args[0]^.Typ).Kind = tykBoolean) and (TypeOf(id).Kind <> tykBoolean) then
+              if id = TyChar then
+                Result := CharOf(StrArg(TyChar, args[0]), nline, ncol)
+              else if (TypeOf(args[0]^.Typ).Kind = tykBoolean) and (TypeOf(id).Kind <> tykBoolean) then
                 Result := AsInt(args[0], id)
               else
               begin

@@ -670,8 +670,16 @@ a compile error (`constant #120 does not fit TDigit`).
 `Succ(x)` and `Pred(x)` are the next and the previous value, of the same
 type. `Chr(n)` is the `Char` whose code is `n`: a constant past 255 is a
 compile error, and a value that varies keeps its low byte (`Chr(i)` of
-an `i` of 300 is `Chr(44)`). `not` of a Boolean negates it and `not` of
-an integer flips its bits: `not 5` is -6.
+an `i` of 300 is `Chr(44)`). `Char(n)` and aliases of `Char` have the
+same conversion rule. A one-byte literal stays a character constant:
+`Char('A')` and `Char(#255)` can appear in constant declarations and
+default arguments. The byte boundary remains inside an enclosing
+conversion: `Integer(Chr(i))` and `Ord(Char(i))` both read 44 for an
+`i` of 300. The argument is evaluated once. A constant outside 0..255
+is refused at its character constructor, including in an ordinary
+expression such as `WriteLn(Integer(Chr(256)))`.
+`not` of a Boolean negates it and `not` of an integer flips its bits:
+`not 5` is -6.
 `Integer(p)` reads a pointer, class, map, chan or ordinal as a number;
 `Pointer(n)` is the way back. `@x` is the address of `x`, and `%x` is
 the same, a second spelling. Pointers, views over memory and how they
@@ -681,7 +689,11 @@ are checked are in §6.
 stopped on them with `Default type`). A record's, a static array's or a
 set's `Default(T)` is a value wherever one stands, an argument by value or
 `const` among them (1.1.272: until then the routine read it through nil).
-`SizeOf(T)` and `SizeOf(expr)` give sizes.
+`SizeOf(T)` and `SizeOf(expr)` give sizes. The expression is checked
+but not evaluated: `SizeOf(Char('A'))` is 1, and an invalid conversion
+such as `SizeOf(Integer(1.5))` is refused just as it is outside `SizeOf`.
+A cast inside `High` or `Low` is also a complete expression:
+`Ord(High(Char('A')))` is 255 and `Ord(Low(Char('A')))` is 0.
 
 A set, `set of T`, is a bitset for a `T` whose values lie in 0..255:
 `Char`, `Byte`, a `Boolean`, an enumeration or a subrange. Up to
