@@ -842,6 +842,9 @@ GOLDEN_A64 += charliteralconst
 # P681: whole type operands and ordinary expressions share validation.
 GOLDEN += typeargcore typeargdirectives typeargkeywords
 GOLDEN_A64 += typeargcore typeargdirectives typeargkeywords
+
+GOLDEN += paslineszero
+GOLDEN_A64 += paslineszero
 # P573: a server stops whatever became of its sockets.
 GOLDEN += httpstop
 GOLDEN_A64 += httpstop

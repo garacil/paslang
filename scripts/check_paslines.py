@@ -94,26 +94,41 @@ class Image:
     def __init__(self, data, secs):
         self.data = data
         # the sections that are in memory and in the file (not .bss, type 8)
-        self.spans = sorted((h[2], h[2] + h[4], h[3]) for h in secs.values() if h[2] and h[1] != 8 and h[4])
+        self.spans = sorted((h[2], h[2] + h[4], h[3], h[5])
+                            for h in secs.values() if h[2] and h[1] != 8 and h[4])
 
-    def off(self, addr):
-        for lo, hi, o in self.spans:
+    def span(self, addr):
+        """file offset, one-past-end file offset and flags of the containing section"""
+        for lo, hi, o, flags in self.spans:
             if lo <= addr < hi:
-                return o + addr - lo
+                at, end = o + addr - lo, o + hi - lo
+                if not 0 <= at < end <= len(self.data):
+                    raise SystemExit(f"section of address {addr:#x} runs outside the file")
+                return at, end, flags
         raise SystemExit(f"address {addr:#x} is in no section of the file")
 
+    def off(self, addr):
+        return self.span(addr)[0]
 
-def uleb(data, o):
-    """the unsigned LEB128 at o (DWARF 5, 7.6, figure C.3), read into 64 bits as rt_pcline reads it (the bits
-    past the 64th fall off), and where the next starts"""
-    v = shift = 0
-    while True:
+
+def uleb(data, o, end):
+    """Unsigned LEB128 inside its section, read into 64 bits as rt_pcline reads it.
+
+    Ten bytes also accommodate GAS's 65-bit label differences: retain the low
+    64 bits, including all payload bits of the tenth byte before masking.
+    """
+    if not 0 <= o <= end <= len(data):
+        raise ValueError("invalid line-table section bounds")
+    v = 0
+    for shift in range(0, 70, 7):
+        if o >= end:
+            raise ValueError("truncated unsigned LEB128 at the end of its section")
         b = data[o]
         o += 1
         v |= ((b & 127) << shift) & M64
-        shift += 7
         if not b & 128:
             return v, o
+    raise ValueError("unsigned LEB128 has more than ten bytes")
 
 
 def records(data, secs, img, path):
@@ -133,21 +148,35 @@ def records(data, secs, img, path):
         w0, w1, w2, w3 = struct.unpack_from("<iIii", data, off + i)
         rec = addr + i
         start = rec + w0
-        t0 = img.off(rec + 8 + w2)
-        n, o = uleb(data, t0)
-        if n == 0 or n > w1 + 1:
-            raise SystemExit(f"{path}: the table of the routine at {start:#x} counts {n} line labels in {w1} bytes")
+        table_addr = rec + 8 + w2
+        t0, table_end, table_flags = img.span(table_addr)
+        # The table is data in a real read-only file-backed section. Its encoded
+        # bytes bound the count; several source labels may share one code byte.
+        if table_flags & 7 != 2 or writable(data, table_addr):
+            raise SystemExit(f"{path}: the line table of the routine at {start:#x} is not read-only data")
+
+        def number(at):
+            try:
+                return uleb(data, at, table_end)
+            except ValueError as error:
+                raise SystemExit(f"{path}: the line table of the routine at {start:#x}: {error}") from None
+
+        n, o = number(t0)
+        # Every label requires at least one byte for each of its two ULEBs.
+        if n == 0 or n > (table_end - o) // 2:
+            raise SystemExit(f"{path}: the table of the routine at {start:#x} counts {n} line labels "
+                             f"in {table_end - o} available encoded bytes")
         entries = []
         at = line = 0
         for _ in range(n):
-            d, o = uleb(data, o)
+            d, o = number(o)
             # the labels are written in the order of their addresses, the body's and then those of the blocks
             # after the ret: a step back is read right (the 64 bits wrap) and costs ten bytes; check says where
             # one is found
             if d >> 63:
                 backs.add(start)
             at = (at + d) & M64
-            d, o = uleb(data, o)
+            d, o = number(o)
             # a step of line folded as Go folds a step of value (runtime/symtab.go, step)
             line += (d >> 1) ^ -(d & 1)
             if at >= w1:
