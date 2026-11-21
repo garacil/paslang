@@ -14964,8 +14964,10 @@ the dates too.
 
 A running program is a set of routines, Gs, on OS threads, Ms. A P is
 the right to execute Pascal code, its run queue and allocation cache.
-The number of Ps follows the affinity mask, with a floor of two and
-a ceiling of 32; each P belongs to at most one M. Only the first M
+The number of Ps counts every CPU in the kernel's affinity mask,
+with a floor of two and a ceiling of 32. If the syscall fails, the
+runtime starts with two Ps (P686). Each P belongs to at most one M.
+Only the first M
 starts with the program; others start as work requires them. The current
 G is in a register (`r14` on amd64, `x28` on arm64) and every routine
 has its own stack that grows on demand: each routine entry checks the
