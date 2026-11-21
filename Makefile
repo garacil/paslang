@@ -3759,8 +3759,8 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/httpfault testdata/httpfault.paslang; \
 	timeout 120 $(BUILDDIR)/httpfault > $(BUILDDIR)/httpfault.got 2> $(BUILDDIR)/httpfault.err; \
 	diff -u testdata/httpfault.out $(BUILDDIR)/httpfault.got; \
-	grep -q '^httpserver: GET /index: ERangeError: index 9 out of range \[0..4\] at line ' $(BUILDDIR)/httpfault.err; \
-	grep -q '^httpserver: GET /div: EDivByZero: integer divide by zero at line ' $(BUILDDIR)/httpfault.err; \
+	grep -q -x -F 'httpserver: GET /index: ERangeError' $(BUILDDIR)/httpfault.err; \
+	grep -q -x -F 'httpserver: GET /div: EDivByZero' $(BUILDDIR)/httpfault.err; \
 	echo ok faults
 	@set -e; \
 	: P571: a constant index outside its array beside the value of a call or an operand that waits in a register compiles and fails at run time with its line on both machines and the fuzzer of the failures makes such indexes again where four of these nine seeds made the compiler stop; \
@@ -3919,7 +3919,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/httpfault testdata/httpfault.paslang; \
 	timeout 120 $(BUILDDIR)/httpfault > $(BUILDDIR)/httpfault.got 2> $(BUILDDIR)/httpfault.err; \
 	diff -u testdata/httpfault.out $(BUILDDIR)/httpfault.got; \
-	grep -q '^httpserver: GET /nil: EAccessViolation: nil pointer dereference at line ' $(BUILDDIR)/httpfault.err; \
+	grep -q -x -F 'httpserver: GET /nil: EAccessViolation' $(BUILDDIR)/httpfault.err; \
 	echo ok nilfault
 	@set -e; \
 	: P581: a signal that someone sent ends the program with a line that says the signal, that it was sent, the process that sent it when its code tells one and the place, and scripts/sigsent_check.py sends SIGSEGV, SIGBUS and SIGFPE four ways each on both machines; \
@@ -4035,6 +4035,11 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	$(OUTDIR)/paslangc -cpu base -inline 0 -o $(BUILDDIR)/httpsrv0 testdata/httpsrv.paslang; \
 	timeout 300 $(BUILDDIR)/httpsrv0 > $(BUILDDIR)/httpsrv0.got; \
 	diff -u testdata/httpsrv.out $(BUILDDIR)/httpsrv0.got; \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/httplogs-amd64 testdata/httplogs.paslang; \
+	timeout 120 $(BUILDDIR)/httplogs-amd64 > $(BUILDDIR)/httplogs-amd64.got 2> $(BUILDDIR)/httplogs-amd64.err; \
+	sed -E 's/[0-9]+ms$$/<ms>/' $(BUILDDIR)/httplogs-amd64.got > $(BUILDDIR)/httplogs-amd64.normalized; \
+	diff -u testdata/httplogs.out $(BUILDDIR)/httplogs-amd64.normalized; \
+	printf "%s\n" "httpserver: GET /:token/items: Exception" | diff -u - $(BUILDDIR)/httplogs-amd64.err; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/httpsrv-sd testdata/httpsrv.paslang; \
 	timeout 300 python3 -I scripts/check_httpsystemd.py $(BUILDDIR)/httpsrv-sd; \
 	echo ok httpsrv0
@@ -7697,6 +7702,11 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	$(OUTDIR)/paslangc -target arm64 -cpu base -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/httpsrv0-arm testdata/httpsrv.paslang; \
 	timeout 600 $(QEMU_A64) $(BUILDDIR)/httpsrv0-arm > $(BUILDDIR)/httpsrv0-arm.got; \
 	diff -u testdata/httpsrv.out $(BUILDDIR)/httpsrv0-arm.got; \
+	$(OUTDIR)/paslangc -target arm64 -o $(BUILDDIR)/httplogs-arm64 testdata/httplogs.paslang; \
+	timeout 120 $(QEMU_A64) $(BUILDDIR)/httplogs-arm64 > $(BUILDDIR)/httplogs-arm64.got 2> $(BUILDDIR)/httplogs-arm64.err; \
+	sed -E 's/[0-9]+ms$$/<ms>/' $(BUILDDIR)/httplogs-arm64.got > $(BUILDDIR)/httplogs-arm64.normalized; \
+	diff -u testdata/httplogs.out $(BUILDDIR)/httplogs-arm64.normalized; \
+	printf "%s\n" "httpserver: GET /:token/items: Exception" | diff -u - $(BUILDDIR)/httplogs-arm64.err; \
 	$(OUTDIR)/paslangc -target arm64 -cpu max -Fu $(A64DIR) -o $(BUILDDIR)/httpsrv-sd-arm testdata/httpsrv.paslang; \
 	timeout 600 python3 -I scripts/check_httpsystemd.py $(BUILDDIR)/httpsrv-sd-arm $(QEMU_A64); \
 	echo ok httpsrv-arm

@@ -169,7 +169,7 @@ type
     Header: THttpHeaders;
     { the body's length, -1 when chunked, 0 when there is none }
     ContentLength: Int64;
-    { X-Real-IP, the client's address the proxy sets }
+    { A valid X-Real-IP from a configured trusted proxy, or ''. }
     RealIP: string;
     { the peer as the socket names it (getpeername(2), asked when called) }
     function RemoteAddr: string;
@@ -248,9 +248,17 @@ type
   { a handler made of another, around it: a check before, a header after }
   THttpMiddleware = function(Next: THttpHandler): THttpHandler;
   THttpLog = procedure(const Line: string);
+  THttpErrorLog = procedure(const Method, Pattern: string; Error: Exception);
+
+  THttpAccessEntry = record
+    Method, Pattern, Path: string;
+    Status, Bytes, Milliseconds: Integer;
+    Peer, Forwarded: string;
+  end;
+  THttpAccessLog = procedure(const Entry: THttpAccessEntry);
 
   THttpRoute = record
-    Method: string;
+    Method, Pattern: string;
     Segs: array of string;
     Handler: THttpHandler;
     { Handler inside every middleware, made when Serve begins }
@@ -307,6 +315,7 @@ type
       until Serve makes it (P573) }
     FWake: Integer;
     FLogMu: mutex;
+    FTrustedProxies: TStringArray;
     FPort: Integer;
     { CLOCK_REALTIME less Nanotime, and when it was taken (DateNow) }
     FWallOffset: Int64;
@@ -322,11 +331,19 @@ type
     BodyTimeoutMs: Integer;
     WriteTimeoutMs: Integer;
     ShutdownTimeoutMs: Integer;
-    { one line a request, 'ip method path status bytes Nms' (ip from
-      X-Real-IP, '-' without it; the path without its query): to LogTo
-      when it is set, else to standard output }
+    { One access entry per served request. AccessLogTo receives the entry
+      when assigned. Otherwise LogTo or standard output receives
+      'ip method route status bytes Nms'. }
     AccessLog: Boolean;
     LogTo: THttpLog;
+    AccessLogTo: THttpAccessLog;
+    { Handler exceptions go to ErrorLog when assigned. Error is borrowed
+      for the call. The default line includes the route and class. }
+    ErrorLog: THttpErrorLog;
+    { Set before Serve. Trust one X-Real-IP literal from a socket peer
+      whose address is in TrustedProxies. }
+    TrustProxy: Boolean;
+    TrustedProxies: TStringArray;
     constructor Create(ARouter: THttpRouter);
     { a Unix stream socket at Path ('@name' an abstract one), the file
       there removed first, then given Mode (0660 is 432) and Group (a
@@ -361,7 +378,7 @@ type
   private
     Server: THttpServer;
     Fd: Integer;
-    Peer: string;
+    Peer, PeerHost: string;
     PeerKnown: Boolean;
     { its place in the server's FConns }
     Slot: Integer;
@@ -1238,13 +1255,24 @@ begin
     end;
 end;
 
+{ TcpPeer renders IPv4 as host:port and IPv6 as [host]:port. }
+procedure ReadPeer(C: THttpConn);
+begin
+  if C.PeerKnown then
+    Exit;
+  C.Peer := TcpPeer(C.Fd);
+  C.PeerKnown := True;
+  if C.Peer = '' then
+    Exit;
+  if C.Peer[1] = '[' then
+    C.PeerHost := Copy(C.Peer, 2, Pos(']', C.Peer) - 2)
+  else
+    C.PeerHost := Copy(C.Peer, 1, Pos(':', C.Peer) - 1);
+end;
+
 function THttpRequest.RemoteAddr: string;
 begin
-  if not FConn.PeerKnown then
-  begin
-    FConn.Peer := TcpPeer(FConn.Fd);
-    FConn.PeerKnown := True;
-  end;
+  ReadPeer(FConn);
   Result := FConn.Peer;
 end;
 
@@ -2316,6 +2344,7 @@ begin
   n := Length(FRoutes);
   SetLength(FRoutes, n + 1);
   FRoutes[n].Method := Method;
+  FRoutes[n].Pattern := Pattern;
   FRoutes[n].Segs := SplitPath(Pattern);
   FRoutes[n].Handler := Handler;
   FRoutes[n].Run := Handler;
@@ -2470,14 +2499,103 @@ end;
 
 { ---- one connection ---- }
 
-procedure LogLine(S: THttpServer; const Line: string);
+function IPLiteral(const Value: string): string;
+var
+  v4, first, last: Integer;
+  v6: array[0..15] of Byte;
+begin
+  Result := '';
+  last := Length(Value);
+  { At most 45 address characters plus optional IPv6 brackets. }
+  if (last = 0) or (last > 47) then
+    Exit;
+  if HostToV4(Value, v4) then
+    Exit(V4ToStr(v4));
+  first := 1;
+  if (Value[1] = '[') and (Value[last] = ']') then
+  begin
+    first := 2;
+    Dec(last);
+  end;
+  if last - first < 1 then
+    Exit;
+  if ((Value[first] = ':') and (Value[first + 1] <> ':')) or
+     ((Value[last] = ':') and (Value[last - 1] <> ':')) then
+    Exit;
+  if HostToV6(Value, v6) then
+    Result := V6ToStr(v6);
+end;
+
+{ The connected peer must match a trusted address, as in nginx's
+  set_real_ip_from. RFC 7239 section 8.1 explains why claims from
+  earlier hops cannot be trusted. }
+function ForwardedIP(C: THttpConn; Header: THttpHeaders): string;
+var
+  i: Integer;
+begin
+  Result := '';
+  if not C.Server.TrustProxy or (CountOf(Header, 'X-Real-IP') <> 1) then
+    Exit;
+  ReadPeer(C);
+  if C.PeerHost = '' then
+    Exit;
+  for i := 0 to High(C.Server.FTrustedProxies) do
+    if C.Server.FTrustedProxies[i] = C.PeerHost then
+      Exit(IPLiteral(Header.Get('X-Real-IP')));
+end;
+
+procedure LogAccess(C: THttpConn; const Method, Pattern, Path, Forwarded: string; Started: Integer);
+var
+  S: THttpServer;
+  entry: THttpAccessEntry;
+  address, route, line: string;
+begin
+  S := C.Server;
+  ReadPeer(C);
+  entry.Milliseconds := (Nanotime - Started) div 1000000;
+  S.FLogMu.Lock;
+  try
+    if Assigned(S.AccessLogTo) then
+    begin
+      entry.Method := Method;
+      entry.Pattern := Pattern;
+      entry.Path := Path;
+      entry.Status := C.StatusCode;
+      entry.Bytes := C.OutBody;
+      entry.Peer := C.Peer;
+      entry.Forwarded := Forwarded;
+      S.AccessLogTo(entry);
+    end
+    else
+    begin
+      address := Forwarded;
+      if address = '' then
+        address := C.PeerHost;
+      if address = '' then
+        address := '-';
+      route := Pattern;
+      if route = '' then
+        route := '-';
+      line := address + ' ' + Method + ' ' + route + ' ' + IntToStr(C.StatusCode) + ' ' +
+        IntToStr(C.OutBody) + ' ' + IntToStr(entry.Milliseconds) + 'ms';
+      if Assigned(S.LogTo) then
+        S.LogTo(line)
+      else
+        WriteLn(line);
+    end;
+  finally
+    S.FLogMu.Unlock;
+  end;
+end;
+
+procedure LogHandlerError(S: THttpServer; const Method, Pattern: string; Error: Exception);
 begin
   S.FLogMu.Lock;
   try
-    if Assigned(S.LogTo) then
-      S.LogTo(Line)
+    if Assigned(S.ErrorLog) then
+      S.ErrorLog(Method, Pattern, Error)
     else
-      WriteLn(Line);
+      WriteLn(ErrOutput, 'httpserver: ', Method, ' ', Pattern, ': ', Error.ClassName);
   finally
     S.FLogMu.Unlock;
   end;
@@ -2543,7 +2661,7 @@ function ServeOne(C: THttpConn; First: Boolean): Boolean;
 var
   S: THttpServer;
   n, e, i, j, k, best, hp, q, le, la, vs, ve: Integer;
-  value, target, te, conn, expect, allow, method, path: string;
+  value, target, te, conn, expect, allow, method, path, rawPath, pattern, forwarded: string;
   score, bestScore: Int64;
   cl, v: Int64;
   t0: Integer;
@@ -2816,7 +2934,9 @@ begin
   end
   else
     req.RawPath := target;
-  req.RealIP := req.Header.Get('X-Real-IP');
+  rawPath := req.RawPath;
+  forwarded := ForwardedIP(C, req.Header);
+  req.RealIP := forwarded;
   C.IsHead := method = 'HEAD';
   { the body's deadline and the answer's from the end of the head, as Go
     sets them at the end of readRequest }
@@ -2904,6 +3024,7 @@ begin
   end;
   if not failed then
   begin
+    pattern := S.FRouter.FRoutes[best].Pattern;
     BindParams(req, S.FRouter.FRoutes[best], C.PathV);
     if S.FRouter.FRoutes[best].MaxBody >= 0 then
       C.BodyLimit := S.FRouter.FRoutes[best].MaxBody;
@@ -2945,7 +3066,7 @@ begin
       end;
       on E: Exception do
       begin
-        WriteLn(ErrOutput, 'httpserver: ', method, ' ', req.RawPath, ': ', E.ClassName, ': ', E.Message);
+        LogHandlerError(S, method, pattern, E);
         if not C.Sent then
         begin
           C.Held := '';
@@ -2977,13 +3098,7 @@ begin
     end;
   end;
   if S.AccessLog then
-  begin
-    value := req.RealIP;
-    if value = '' then
-      value := '-';
-    LogLine(S, value + ' ' + method + ' ' + req.RawPath + ' ' + IntToStr(C.StatusCode) + ' ' +
-      IntToStr(C.OutBody) + ' ' + IntToStr((Nanotime - t0) div 1000000) + 'ms');
-  end;
+    LogAccess(C, method, pattern, rawPath, forwarded, t0);
   Result := C.KeepAlive and not C.Broken and (AtomicLoad(S.FClosing) = 0);
 end;
 
@@ -3359,6 +3474,12 @@ var
   i: Integer;
 begin
   WrapRoutes(FRouter);
+  if TrustProxy then
+  begin
+    SetLength(FTrustedProxies, Length(TrustedProxies));
+    for i := 0 to High(TrustedProxies) do
+      FTrustedProxies[i] := IPLiteral(TrustedProxies[i]);
+  end;
   { eventfd2(2), nonblocking and closed on exec: readable from Shutdown's
     write on, for every acceptor at once. Serve makes it and closes it,
     and Shutdown writes it, all under FMu: a write never meets a

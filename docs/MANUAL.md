@@ -12135,11 +12135,25 @@ set before it serves:
 - `WriteTimeoutMs` (60 s) is the time from the end of the head to the
   end of the answer;
 - `ShutdownTimeoutMs` (10 s), below;
-- `AccessLog` (on) writes one line a request, `ip method path status
-  bytes Nms`: the address from `X-Real-IP` (`-` without it) and the
-  path without its query. It never writes a body, a cookie or a
-  credential. The line goes to `LogTo` when it is set, else to standard
-  output.
+- `AccessLog` (on) writes `ip method route status bytes Nms` for each
+  served request. The route column contains the registered pattern or
+  `-` when no route matched. The IP column uses the socket peer by
+  default and `-` when it has no IP address. The line goes to `LogTo`
+  when assigned, or to standard output.
+- `AccessLogTo` can handle an access entry in place of the formatted
+  line. Its `THttpAccessEntry` has `Method`, `Pattern`, `Path` (the raw
+  path without its query), `Status`, `Bytes`, `Milliseconds`, `Peer`
+  (the socket address with its port) and `Forwarded` (the accepted
+  address, or an empty string). It runs only when `AccessLog` is on.
+- A handler exception goes to `ErrorLog` if assigned. The hook receives
+  the method, the route pattern and the exception, borrowed for the call.
+  The default error line uses the method, route pattern and exception
+  class. Default logs omit request paths, queries and exception messages.
+- `TrustProxy` (off) enables `X-Real-IP` for socket peers in
+  `TrustedProxies`. Configure exact IPv4 or IPv6 address literals
+  before `Serve`. A single valid address from such a peer supplies
+  `Forwarded` and the formatted IP column. The proxy must replace the
+  incoming client header.
 
 `ListenUnix(path, mode, group)` listens on a Unix socket (a path, or an
 abstract `@name`): the file there is removed first, then given `mode`
@@ -12200,8 +12214,9 @@ the connection is kept; past that it is closed.
   `RawQuery` and `Proto`;
 - `Header` (a `THttpHeaders`: `Get`, `Values`, `Has`, `Count`, `NameAt`,
   `ValueAt`, names compared without case);
-- `ContentLength` (-1 when chunked), `RemoteAddr`, and `RealIP` (the
-  `X-Real-IP` the proxy sets);
+- `ContentLength` (-1 when chunked), `RemoteAddr` (the socket peer),
+  and `RealIP` (the accepted `X-Real-IP` from a trusted proxy, or an
+  empty string);
 - `Param(name)`, the route's `:name` or `*name`;
 - `Query(name)`, `QueryValues(name)` and `HasQuery(name)`, the query
   decoded as Go's `url.ParseQuery` decodes it (`+` a space, a pair with

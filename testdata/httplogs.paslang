@@ -1,0 +1,138 @@
+{ This file is part of paslang's tests.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+  GPL version 3 or later; see COPYING. No warranty. }
+program httplogs;
+
+uses sysutils, httpserver, pasnet;
+
+const
+  CRLF = #13#10;
+  Route = '/:token/items';
+  Target = '/private-token/items?secret=private-query';
+  Claim = 'X-Real-IP: 203.0.113.7' + CRLF;
+
+procedure Require(OK: Boolean; const What: string);
+begin
+  if not OK then
+  begin
+    WriteLn('HTTP logging assertion failed: ', What);
+    Halt(1);
+  end;
+end;
+
+procedure Broken(Req: THttpRequest; Resp: THttpResponse);
+begin
+  raise Exception.Create(Req.Target);
+end;
+
+procedure Report(Req: THttpRequest; Resp: THttpResponse);
+begin
+  Resp.ReplyText(200, 'address=' + Req.RealIP);
+end;
+
+procedure Run(Server: THttpServer);
+begin
+  Server.Serve;
+end;
+
+procedure ErrorHook(const Method, Pattern: string; Error: Exception);
+begin
+  Require((Method = 'GET') and (Pattern = Route), 'error method and route');
+  Require((Error.ClassName = 'Exception') and (Error.Message = Target), 'borrowed exception');
+  WriteLn('custom handler error');
+end;
+
+procedure AccessHook(const Entry: THttpAccessEntry);
+begin
+  Require(Entry.Method = 'GET', 'method');
+  Require(Entry.Milliseconds >= 0, 'elapsed time');
+  Require((Pos('127.0.0.1:', Entry.Peer) = 1) or (Pos('[::1]:', Entry.Peer) = 1), 'socket peer and port');
+  if Entry.Pattern = Route then
+  begin
+    Require((Entry.Path = '/private-token/items') and (Entry.Status = 500) and (Entry.Bytes = 22) and
+      (Entry.Forwarded = ''), 'failed request data');
+    WriteLn('custom failure access');
+  end
+  else
+  begin
+    Require((Entry.Pattern = '/ip') and (Entry.Path = '/ip') and (Entry.Status = 200) and
+      (Entry.Bytes = Length('address=') + Length(Entry.Forwarded)), 'successful request data');
+    WriteLn('custom access address=', Entry.Forwarded);
+  end;
+end;
+
+procedure LegacyLog(const Line: string);
+begin
+  Require(Pos('127.0.0.1 GET - 404 ', Line) = 1, 'unmatched default log');
+  WriteLn('custom formatted log');
+end;
+
+function ServerFor(const Host, Proxy: string; EnableTrust: Boolean): THttpServer;
+var
+  router: THttpRouter;
+begin
+  router := THttpRouter.Create;
+  router.Handle('GET', Route, @Broken);
+  router.Handle('GET', '/ip', @Report);
+  Result := THttpServer.Create(router);
+  Result.TrustProxy := EnableTrust;
+  Result.TrustedProxies := [Proxy];
+  Require(Result.ListenTcp(Host, 0), 'listen');
+end;
+
+procedure Ask(Server: THttpServer; const Host, Path, Headers, Status, Ending: string);
+var
+  socket: Integer;
+  request, reply, piece: string;
+begin
+  socket := TcpConnectToMs(Host, Server.Port, 5000);
+  Require(socket >= 0, 'connect');
+  request := 'GET ' + Path + ' HTTP/1.1' + CRLF + 'Host: x' + CRLF +
+    Headers + 'Connection: close' + CRLF + CRLF;
+  Require(TcpWrite(socket, request) = Length(request), 'write request');
+  repeat
+    piece := TcpReadDeadline(socket, 512, 5000);
+    reply := reply + piece;
+  until piece = '';
+  TcpClose(socket);
+  Require(Pos('HTTP/1.1 ' + Status, reply) = 1, 'response status');
+  Require(Copy(reply, Length(reply) - Length(Ending) + 1, Length(Ending)) = Ending, 'response body');
+end;
+
+var
+  server: THttpServer;
+begin
+  server := ServerFor('127.0.0.1', '127.0.0.1', False);
+  pas Run(server);
+  Ask(server, '127.0.0.1', Target, Claim, '500', 'Internal Server Error'#10);
+  server.Shutdown;
+
+  server := ServerFor('127.0.0.1', '127.0.0.1', False);
+  server.LogTo := @LegacyLog;
+  pas Run(server);
+  Ask(server, '127.0.0.1', '/private-unmatched?secret=private-query', Claim, '404', '404 page not found'#10);
+  server.Shutdown;
+
+  server := ServerFor('127.0.0.1', '127.0.0.2', True);
+  server.ErrorLog := @ErrorHook;
+  server.AccessLogTo := @AccessHook;
+  pas Run(server);
+  Ask(server, '127.0.0.1', Target, Claim, '500', 'Internal Server Error'#10);
+  Ask(server, '127.0.0.1', '/ip', Claim, '200', 'address=');
+  server.Shutdown;
+
+  server := ServerFor('127.0.0.1', '127.0.0.1', True);
+  server.AccessLogTo := @AccessHook;
+  pas Run(server);
+  Ask(server, '127.0.0.1', '/ip', Claim, '200', 'address=203.0.113.7');
+  Ask(server, '127.0.0.1', '/ip', Claim + Claim, '200', 'address=');
+  Ask(server, '127.0.0.1', '/ip', 'X-Real-IP: 203.0.113.7, 127.0.0.1' + CRLF, '200', 'address=');
+  Ask(server, '127.0.0.1', '/ip', 'X-Real-IP: 1:2:3:4:5:6:7:8:' + CRLF, '200', 'address=');
+  server.Shutdown;
+
+  server := ServerFor('::1', '0:0:0:0:0:0:0:1', True);
+  server.AccessLogTo := @AccessHook;
+  pas Run(server);
+  Ask(server, '::1', '/ip', 'X-Real-IP: [2001:0DB8::A]' + CRLF, '200', 'address=2001:db8::a');
+  server.Shutdown;
+end.
