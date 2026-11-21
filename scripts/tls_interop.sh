@@ -26,6 +26,7 @@ go_case() {
 }
 ossl_case() {
   label=$1; mode=$2; shift 2
+  : > "$T/srv"
   openssl s_server -accept 127.0.0.1:0 -rev -naccept 1 "$@" > $T/srv 2>&1 & pid=$!
   i=0; while ! grep -q '^ACCEPT' $T/srv && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done
   p=$(sed -n 's/^ACCEPT 127.0.0.1://p' $T/srv | head -1)
