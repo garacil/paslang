@@ -2860,8 +2860,12 @@ constant and variable indexes, a division or a nil object's field, with
 the same line at
 `-inline 0`. An argument that fails names its own line at the call.
 The
-output of a program is the same at every level: `testdata/inline1`
-runs under `make check` both ways. `-inline-trace` says on the error
+output of a program is the same at every level. `make check` runs
+`testdata/inline1` both ways and checks the compilation budget for the
+large UInt32 extensions program. The inliner skips repeated address
+walks in scopes that cannot expose any local. The emitter indexes large
+symbol lists and keeps the same register choices when it bounds the
+work of weighing each candidate. `-inline-trace` says on the error
 output why a routine called in one of those places stays a call; a
 routine called only elsewhere stays a call without a line. To debug a routine that goes in
 place, compile with `-inline 0`: a debugger then finds the routine and

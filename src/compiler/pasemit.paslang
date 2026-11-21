@@ -231,6 +231,7 @@ type
   end;
 
   TPromo = record
+    Symbols: array of SizeInt;
     Place: TSym;
     Reg: string;
     Dw: LongInt;
@@ -320,6 +321,9 @@ type
   end;
   TMapSites = array of TMapSite;
 
+  TSymIndex = map[string] of SizeInt;
+  TWrittenNames = map[string] of Boolean;
+
   TEmitter = class
   private
     FOut: string;
@@ -339,6 +343,7 @@ type
     FZeroMax: LongInt;    { the biggest record a closed channel gives as zero (.Lzeroblk, 1.0.83) }
     FSetImgs: TStrArray;  { the constant sets of 32 bytes (P126), .Lsetc<n> in .rodata, 64 hex digits each }
     FSym: array of TSym;
+    FSymIndex: TSymIndex;
     FFrame: LongInt;
     FStrs: array of string;
     FRealC: array of Int64;   { the Double constants .Lrc<n> in .rodata (P486) }
@@ -487,7 +492,7 @@ type
     FWmIdx: string;         { or [FWmBase, #FWmOff]; EmitWordBase adds them up (P100) }
     FWmSh: LongInt;
     FWmOff: Int64;
-    FFatWritten: TStrArray; { the slices a region being scanned assigns (P100) }
+    FFatWritten: TWrittenNames; { the slices a region being scanned assigns (P100) }
     FDescStore: Boolean;    { the region being scanned has a statement that may write a slice's descriptor: a call that is no island, an assignment of more than a scalar (P556) }
     FPinned: LongInt;       { scratch bytes a promoted loop keeps for the registers it saves (P93) }
     FPromoOn: Boolean;      { a loop is being emitted with variables in registers (P93) }
@@ -520,7 +525,9 @@ type
     FShNames: TStrArray;        { its own variables' names (NormName) }
     FPaProc: string;            { the routine PromoAdd's names were found for, with FPaLen symbols }
     FPaLen: SizeInt;
-    FPaNames: TStrArray;        { the names PromoAdd looked for there, as written }
+    FPromoGlobals: TSymIndex;
+    FPromoLocals: map[LongInt] of SizeInt;
+    FPaNames: TSymIndex;        { the names PromoAdd looked for there, as written }
     FPaSym: array of TSym;      { the symbol each is }
     FPaOK: array of Byte;       { 0 none, 1 no candidate, 2 a candidate (PromoCand) }
     FShNOffs: array of LongInt; { and their offsets }
@@ -1063,6 +1070,7 @@ type
     function ProcNest(const Sym: string): LongInt;
     function ProcSlot(const Sym: string): SizeInt;
     procedure EmitStackCheck(const Entry: string; const Frame: string);
+    procedure IndexSymbols;
     function TryFindSym(const N: string; out S: TSym): Boolean;
     function AddrTaken(const N: string): Boolean;
     function ExtGlobal(const N: string): Boolean;
@@ -1077,6 +1085,9 @@ type
     function PromoExprOK(E: PExpr): Boolean;
     function PromoLValOK(D: PExpr): Boolean;
     function PromoStmtOK(S: PStmt; InLoop: Boolean): Boolean;
+    procedure StartPromoScan;
+    function PromoPlaceIndex(const S: TSym): SizeInt;
+    procedure IndexPromoPlace(const S: TSym; I: SizeInt);
     procedure PromoAdd(const N: string; W: Boolean; Weight: LongInt);
     procedure PromoScanE(E: PExpr; Weight: LongInt);
     procedure PromoScanS(S: PStmt; Weight: LongInt);
@@ -1126,7 +1137,7 @@ type
     function TryAsmIn(S: PStmt): Boolean;
     procedure VecNeedOnly(const L: TStmtArray; A, Z: SizeInt);
     function RunLoads(const L: TStmtArray; A, Z: SizeInt; const P: TPromo; ToEnd: Boolean): Boolean;
-    function RunCost(const P: TPromo; Kept, Load, ToEnd: Boolean): Int64;
+    function RunCost(const P: TPromo; Kept, ToEnd: Boolean): Int64;
     function RunKind(const P: TPromo; const L: TStmtArray; A, Z: SizeInt; ToEnd, FreeOK, KeptOK: Boolean): LongInt;
     function VecInS(S: PStmt): Boolean;
     function LoopOwn(S: PStmt): Boolean;
@@ -7112,8 +7123,6 @@ begin
 end;
 
 function TEmitter.FindSym(const N: string): TSym;
-var
-  i: SizeInt;
 begin
   if FHasRes then
   begin
@@ -7131,18 +7140,8 @@ begin
       Exit;
     end;
   end;
-  for i := High(FSym) downto 0 do
-    if (not FSym[i].Global) and SameSym(FSym[i].Name, N) then
-    begin
-      Result := FSym[i];
-      Exit;
-    end;
-  for i := 0 to High(FSym) do
-    if SameSym(FSym[i].Name, N) then
-    begin
-      Result := FSym[i];
-      Exit;
-    end;
+  if TryFindSym(N, Result) then
+    Exit;
   Refuse('unknown identifier ' + N);
   Result.Name := N;
   Result.Off := 0;
@@ -7171,6 +7170,7 @@ begin
     FSym[i].Up := 0;
     FSym[i].Reg := '';
   end;
+  IndexSymbols;
 end;
 
 procedure TEmitter.EmitAddr(E: PExpr);
@@ -13683,7 +13683,7 @@ begin
           p.Len := lr;
         end
         else if (not sy.ByRef) and FPromoOn and (sy.Up = 0) and (not AddrKept(sy.Name)) and
-          (not InNames(FFatWritten, NormName(sy.Name))) and
+          (not (NormName(sy.Name) in FFatWritten)) and
           not (sy.Global and (FIsUnit or ExtGlobal(sy.Name))) then
         begin
           arr := NormName(E^.L^.Name);
@@ -32797,6 +32797,27 @@ end;
   routine reaches the loop within one sysmon tick (10 ms), without the
   loop writing it back. }
 
+{ Preserve the last local and first global of each spelling. Larger
+  symbol lists reuse the name index and read the live symbol's register
+  and type from its slot, like Go's SSA allocator indexes the current
+  entries by value ID (cmd/compile/internal/ssa/regalloc.go). }
+procedure TEmitter.IndexSymbols;
+var
+  i: SizeInt;
+begin
+  FSymIndex := nil;
+  { A short symbol list fits in a few cache lines. }
+  if Length(FSym) < 64 then
+    Exit;
+  New(FSymIndex);
+  for i := High(FSym) downto 0 do
+    if FSym[i].Global then
+      FSymIndex[ToLower(FSym[i].Name)] := i;
+  for i := 0 to High(FSym) do
+    if not FSym[i].Global then
+      FSymIndex[ToLower(FSym[i].Name)] := i;
+end;
+
 function TEmitter.TryFindSym(const N: string; out S: TSym): Boolean;
 var
   i: SizeInt;
@@ -32808,6 +32829,13 @@ begin
       S := FindSym(N);
       Exit;
     end;
+  if FSymIndex <> nil then
+  begin
+    Result := TryGet(FSymIndex, ToLower(N), i);
+    if Result then
+      S := FSym[i];
+    Exit;
+  end;
   for i := High(FSym) downto 0 do
     if (not FSym[i].Global) and SameSym(FSym[i].Name, N) then
     begin
@@ -33403,6 +33431,39 @@ begin
   end;
 end;
 
+procedure TEmitter.StartPromoScan;
+begin
+  FPromo := nil;
+  New(FFatWritten);
+  New(FPromoGlobals);
+  New(FPromoLocals);
+end;
+
+{ The first candidate for this storage, as SamePlace identifies it. }
+function TEmitter.PromoPlaceIndex(const S: TSym): SizeInt;
+var
+  i: SizeInt;
+begin
+  Result := -1;
+  if S.Global then
+  begin
+    if TryGet(FPromoGlobals, ToLower(S.Name), i) then
+      Result := i;
+  end
+  else if TryGet(FPromoLocals, S.Off, i) then
+    Result := i;
+end;
+
+procedure TEmitter.IndexPromoPlace(const S: TSym; I: SizeInt);
+begin
+  if PromoPlaceIndex(S) >= 0 then
+    Exit;
+  if S.Global then
+    FPromoGlobals[ToLower(S.Name)] := I
+  else
+    FPromoLocals[S.Off] := I;
+end;
+
 procedure TEmitter.PromoAdd(const N: string; W: Boolean; Weight: LongInt);
 var
   s: TSym;
@@ -33415,18 +33476,11 @@ begin
   begin
     FPaProc := FCurProc;
     FPaLen := Length(FSym);
-    FPaNames := nil;
+    New(FPaNames);
     FPaSym := nil;
     FPaOK := nil;
   end;
-  k := -1;
-  for i := 0 to High(FPaNames) do
-    if FPaNames[i] = N then
-    begin
-      k := i;
-      Break;
-    end;
-  if k < 0 then
+  if not TryGet(FPaNames, N, k) then
   begin
     ok := 0;
     if TryFindSym(N, s) then
@@ -33435,29 +33489,29 @@ begin
       if PromoCand(s) then
         ok := 2;
     end;
-    k := Length(FPaNames);
-    SetLength(FPaNames, k + 1);
+    k := Length(FPaOK);
     SetLength(FPaSym, k + 1);
     SetLength(FPaOK, k + 1);
-    FPaNames[k] := N;
+    FPaNames[N] := k;
     FPaSym[k] := s;
     FPaOK[k] := ok;
   end;
   if FPaOK[k] <> 2 then
     Exit;
   s := FPaSym[k];
-  for i := 0 to High(FPromo) do
-    if (FPromo[i].Place.Global = s.Global) and SamePlace(FPromo[i].Place, s) then
-    begin
-      FPromo[i].Refs := FPromo[i].Refs + Weight;
-      if W then
-        FPromo[i].Written := True;
-      PromoNote(FPromo[i], W);
-      Exit;
-    end;
+  i := PromoPlaceIndex(s);
+  if i >= 0 then
+  begin
+    FPromo[i].Refs := FPromo[i].Refs + Weight;
+    if W then
+      FPromo[i].Written := True;
+    PromoNote(FPromo[i], W);
+    Exit;
+  end;
   k := Length(FPromo);
   SetLength(FPromo, k + 1);
   FPromo[k].Place := s;
+  IndexPromoPlace(s, k);
   FPromo[k].Place.Reg := '';
   FPromo[k].Reg := '';
   FPromo[k].Dw := 0;
@@ -33497,6 +33551,7 @@ begin
   k := Length(FPromo);
   SetLength(FPromo, k + 1);
   FPromo[k].Place := FCarrySym;
+  IndexPromoPlace(FCarrySym, k);
   FPromo[k].Reg := '';
   FPromo[k].Dw := 0;
   FPromo[k].Written := W;
@@ -33568,6 +33623,7 @@ begin
   k := Length(FPromo);
   SetLength(FPromo, k + 1);
   FPromo[k].Place := s;
+  IndexPromoPlace(s, k);
   FPromo[k].Place.Reg := '';
   FPromo[k].Reg := '';
   FPromo[k].Dw := 0;
@@ -33782,12 +33838,12 @@ begin
     if S^.Dest = nil then
     begin
       PromoAdd(S^.Name, True, w);
-      AddName(FFatWritten, NormName(S^.Name));
+      FFatWritten[NormName(S^.Name)] := True;
     end
     else if S^.Dest^.Kind = ekVar then
     begin
       PromoAdd(S^.Dest^.Name, True, w);
-      AddName(FFatWritten, NormName(S^.Dest^.Name));
+      FFatWritten[NormName(S^.Dest^.Name)] := True;
     end
     else
       PromoScanE(S^.Dest, w);
@@ -33879,10 +33935,8 @@ begin
       r := FPromo[i].Reg
     else
       r := '';
-    for j := 0 to High(FSym) do
-      if (FSym[j].Global = FPromo[i].Place.Global) and (FSym[j].Up = 0) and
-        (not FSym[j].ByRef) and SamePlace(FSym[j], FPromo[i].Place) then
-        FSym[j].Reg := r;
+    for j := 0 to High(FPromo[i].Symbols) do
+      FSym[FPromo[i].Symbols[j]].Reg := r;
     if (not FPromo[i].Place.Global) and FHasRes and
       (FPromo[i].Place.Off = FResOff) then
       FResReg := r;
@@ -34777,7 +34831,15 @@ var
 begin
   if (not FStraight) or (not TryFindSym(N, s)) then
     Exit;
-  for i := 0 to High(FPromo) do
+  i := PromoPlaceIndex(s);
+  if i < 0 then
+    Exit;
+  if FPromo[i].Part = 0 then
+  begin
+    PromoNote(FPromo[i], False);
+    Exit;
+  end;
+  for i := i + 1 to High(FPromo) do
     if (FPromo[i].Part = 0) and (FPromo[i].Place.Global = s.Global) and
       SamePlace(FPromo[i].Place, s) then
     begin
@@ -35050,12 +35112,11 @@ begin
   WfIsles := old;
 end;
 
-{ What keeping P in a register costs a straight run, kept or free, in
-  PromoScanS's units: a kept register's save and restore, the load at
-  the start (Load), the store at the end, and at each island the load
-  after it, the store before it and, kept, the restore at an exit, by
-  the island's weight. }
-function TEmitter.RunCost(const P: TPromo; Kept, Load, ToEnd: Boolean): Int64;
+{ What keeping P in a register costs a straight run, in PromoScanS's
+  units: a kept register's save and restore, the store at the end and
+  each island's loads, stores and exit restores, weighed by its use.
+  RunKind adds the cost of the initial load when it is needed. }
+function TEmitter.RunCost(const P: TPromo; Kept, ToEnd: Boolean): Int64;
 var
   k: SizeInt;
   ka: LongInt;
@@ -35066,12 +35127,16 @@ begin
   Result := 0;
   if Kept then
     Result := 128;
-  if Load then
-    Result := Result + 64;
   if P.Written and ((not ToEnd) or Outlives(P)) then
     Result := Result + 64;
   for k := 0 to High(FIsles) do
   begin
+    { Each contribution is nonnegative. The register cannot pay once
+      the partial cost reaches the number of uses. }
+    if Result >= P.Refs then
+      Break;
+    if FIsleW[k] = 0 then
+      Continue;
     leaving := (FIsles[k]^.Kind = skExit) or (FIsles[k]^.Kind = skRaise) or
       (FIsles[k]^.Kind = skHalt);
     if (not leaving) and IsleBack(k, P) then
@@ -35097,25 +35162,35 @@ begin
   cf := -1;
   ck := -1;
   ka := FKeepAs;
-  { what each costs with no load at the start: where the uses do not
-    outweigh that, no walk for the load }
-  if FreeOK and (Int64(P.Refs) <= RunCost(P, False, False, ToEnd)) then
-    FreeOK := False;
-  if KeptOK and (Int64(P.Refs) <= RunCost(P, True, False, ToEnd)) then
-    KeptOK := False;
+  { Work out the island cost once. The initial load, if needed,
+    adds one reference. }
   if FreeOK then
   begin
-    FKeepAs := 0;
-    ld := RunLoads(L, A, Z, P, ToEnd);
-    FKeepAs := ka;
-    cf := RunCost(P, False, ld, ToEnd);
+    cf := RunCost(P, False, ToEnd);
+    if cf < P.Refs then
+    begin
+      FKeepAs := 0;
+      ld := RunLoads(L, A, Z, P, ToEnd);
+      FKeepAs := ka;
+      if ld then
+        cf := cf + 64;
+    end
+    else
+      cf := -1;
   end;
   if KeptOK then
   begin
-    FKeepAs := 1;
-    ld := RunLoads(L, A, Z, P, ToEnd);
-    FKeepAs := ka;
-    ck := RunCost(P, True, ld, ToEnd);
+    ck := RunCost(P, True, ToEnd);
+    if ck < P.Refs then
+    begin
+      FKeepAs := 1;
+      ld := RunLoads(L, A, Z, P, ToEnd);
+      FKeepAs := ka;
+      if ld then
+        ck := ck + 64;
+    end
+    else
+      ck := -1;
   end;
   if (cf >= 0) and (Int64(P.Refs) > cf) and ((ck < 0) or (cf <= ck)) then
     Result := 1
@@ -35287,7 +35362,8 @@ var
   svAll, svOdd: array of Boolean;
   svCall: array of LongInt;
   svDst: array of TSym;
-  svFat, svFroms: TStrArray;
+  svFat: TWrittenNames;
+  svFroms: TStrArray;
   svStubs, svChunk, s1, e1: string;
   svStubMaps: TMapSites;
   svBrk, svChunkSave, svChunkDw, svVTop, svVNeed, svVCopy: LongInt;
@@ -35818,8 +35894,7 @@ begin
   FRunToEnd := False;
   run := FStraight;
   FStraight := False;
-  FPromo := nil;
-  FFatWritten := nil;
+  StartPromoScan;
   FDescStore := False;
   if run then
   begin
@@ -35843,19 +35918,6 @@ begin
     for k := A to Z do
       PromoScanS(L[k], 64);
     FStraight := False;
-    { the islands that read each variable at home, once }
-    for i := 0 to High(FPromo) do
-    begin
-      FPromo[i].Hr := nil;
-      for k := 0 to High(FIsles) do
-        if IsleReads(k, FPromo[i]) then
-        begin
-          j := Length(FPromo[i].Hr);
-          SetLength(FPromo[i].Hr, j + 1);
-          FPromo[i].Hr[j] := LongInt(k);
-        end;
-      FPromo[i].HrOn := True;
-    end;
   end
   else
     for k := A to Z do
@@ -35869,7 +35931,7 @@ begin
   chosen := nil;
   for i := 0 to High(FPromo) do
     if (FPromo[i].Part = 0) or
-      ((not InNames(FFatWritten, NormName(FPromo[i].Place.Name))) and
+      ((not (NormName(FPromo[i].Place.Name) in FFatWritten)) and
       not (FDescStore and FPromo[i].Place.ByRef and (FPromo[i].Part <= 2))) then
     begin
       j := Length(chosen);
@@ -35973,8 +36035,26 @@ begin
         kind := 3;
     end
     else if run then
-      kind := RunKind(FPromo[i], L, A, Z, toEnd, (not FArm) and (nf < nfMax),
-        (FArm and (nk < nkMax)) or ((not FArm) and (nk < 4)))
+    begin
+      if ((not FArm) and (nf < nfMax)) or
+        ((FPromo[i].Refs > 128) and ((FArm and (nk < nkMax)) or ((not FArm) and (nk < 4)))) then
+      begin
+        { Cache reads when the candidate is considered for a register. }
+        if not FPromo[i].Place.Global then
+        begin
+          for k := 0 to High(FIsles) do
+            if IsleReads(k, FPromo[i]) then
+            begin
+              mapI := Length(FPromo[i].Hr);
+              SetLength(FPromo[i].Hr, mapI + 1);
+              FPromo[i].Hr[mapI] := LongInt(k);
+            end;
+          FPromo[i].HrOn := True;
+        end;
+        kind := RunKind(FPromo[i], L, A, Z, toEnd, (not FArm) and (nf < nfMax),
+          (FArm and (nk < nkMax)) or ((not FArm) and (nk < 4)));
+      end;
+    end
     else if FArm then
     begin
       if (nk < nkMax) and (FPromo[i].Refs >= 3) and IsleWorth(FPromo[i], True) then
@@ -36184,6 +36264,18 @@ begin
   SetLength(FIsleFroms, n);
   for i := 0 to n - 1 do
     FIsleFroms[i] := b;
+  { Every alias at a selected place follows its register when the region
+    suspends for an island. Find the aliases once for the whole region. }
+  for i := 0 to High(FPromo) do
+    if FPromo[i].Part = 0 then
+      for k := 0 to High(FSym) do
+        if (FSym[k].Global = FPromo[i].Place.Global) and (FSym[k].Up = 0) and
+          (not FSym[k].ByRef) and SamePlace(FSym[k], FPromo[i].Place) then
+        begin
+          mapI := Length(FPromo[i].Symbols);
+          SetLength(FPromo[i].Symbols, mapI + 1);
+          FPromo[i].Symbols[mapI] := k;
+        end;
   PromoMark(True);
   FPromoOn := True;
   FStubs := '';
@@ -42682,8 +42774,7 @@ begin
     eight times a loop level), the heaviest into the registers nothing
     saves }
   SetLength(wt, Length(own));
-  FPromo := nil;
-  FFatWritten := nil;
+  StartPromoScan;
   if Pr.Body^.Kind = skBlock then
   begin
     for i := 0 to High(Pr.Body^.Stmts) do
@@ -42707,7 +42798,7 @@ begin
   for i := 0 to High(FPromo) do
     if (FPromo[i].Part > 0) and (FPromo[i].Part <> 4) and (FPromo[i].Refs >= 2) and
       (FPromo[i].Place.Global or (FPromo[i].Part = 9)) and
-      ((FPromo[i].Part >= 3) or not InNames(FFatWritten, NormName(FPromo[i].Place.Name))) then
+      ((FPromo[i].Part >= 3) or not (NormName(FPromo[i].Place.Name) in FFatWritten)) then
     begin
       SetLength(parts, Length(parts) + 1);
       parts[High(parts)] := FPromo[i];
@@ -43774,6 +43865,7 @@ var
   savedAddr: array of string;
   ps, q: string;
   saved: array of TSym;
+  savedIndex: TSymIndex;
   dend, savedResName: string;
   savedResOff: LongInt;
   savedHas: Boolean;
@@ -43794,6 +43886,8 @@ var
   savedLoadAddr: TStrArray;
 begin
   saved := FSym;
+  savedIndex := FSymIndex;
+  FSymIndex := nil;
   savedSel := FSelBody;
   savedLoadDone := FLoadDone;
   savedLoadAddr := FLoadAddr;
@@ -43985,6 +44079,7 @@ begin
   FStubMaps := nil;
   FResReg := '';
   FCurProc := Pr.Sym;
+  IndexSymbols;
   FShProc := '';
   FPaProc := '';
   FKeepAs := -1;
@@ -44317,6 +44412,7 @@ begin
 
   FBoxSlot := 0;
   FSym := saved;
+  FSymIndex := savedIndex;
   FResName := savedResName;
   FResOff := savedResOff;
   FHasRes := savedHas;

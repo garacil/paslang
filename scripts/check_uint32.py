@@ -498,6 +498,7 @@ def main():
         record["expected_executions"] = 2 * record["expected_builds"]
         environments = (("normal", base_env), ("stress", dict(base_env,
             PASLANG_GCSTRESS="1", PASLANG_GCVERIFY="1", PASLANG_GCPOISON="1")))
+        extensions_without_inline = {}
         for arch, cpu, inline in profiles:
             units = Path(options.units_amd64 if arch == "amd64" else options.units_arm64).resolve()
             for name, source, expected, fault in cases:
@@ -505,10 +506,19 @@ def main():
                 program = out / tag
                 argv = [compiler, "-target", arch, "-cpu", cpu, "-inline", str(inline),
                         "-Fu", units, "-o", program, out / (name + ".paslang")]
-                # extensions at -inline 40 takes 171 s here with nothing else running:
-                # a limit of 180 s failed the check on a machine doing a second thing (P654)
+                build_limit = 900
+                reference = extensions_without_inline.get((arch, cpu))
+                if name == "extensions" and inline == 40 and reference is not None and options.role == "candidate":
+                    # Allow extra work for the larger emitted program and concurrent checks.
+                    build_limit = min(build_limit, max(45, 12 * reference))
                 row, build_stdout, build_stderr = command(argv, tag + "-build", "build", env=base_env,
-                                                          timeout=900)
+                                                          timeout=build_limit)
+                if name == "extensions":
+                    row["build_limit_s"] = build_limit
+                    if inline == 0 and row["status"] == 0:
+                        extensions_without_inline[arch, cpu] = row["elapsed_s"]
+                    elif inline == 40 and reference is not None:
+                        row["extensions_without_inline_s"] = reference
                 row["clean_diagnostics"] = row["status"] == 0 and build_stdout == b"" and build_stderr == b""
                 if row["status"] != 0:
                     record["errors"].append(tag + ": build failed")
