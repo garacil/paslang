@@ -3970,6 +3970,12 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	done; \
 	echo ok libfault
 	@set -e; \
+	: P685: concurrently reporting foreground routines keep each complete stderr record, under GC stress too; \
+	$(OUTDIR)/paslangc -cpu base -o $(BUILDDIR)/reportparallel testdata/fatal/reportparallel.paslang; \
+	python3 -I scripts/check_uncaught_reports.py $(BUILDDIR)/reportparallel; \
+	$(OUTDIR)/paslangc -target arm64 -cpu base -o $(BUILDDIR)/reportparallel-arm testdata/fatal/reportparallel.paslang; \
+	python3 -I scripts/check_uncaught_reports.py $(QEMU_A64) $(BUILDDIR)/reportparallel-arm
+	@set -e; \
 	: P585: a waitgroup used again wakes nobody early, and testdata/wgagain says so on both machines with the unit as it is and against a copy whose call that reaches zero sleeps before its lock, where the unit as it was fails every round; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/wgagain testdata/wgagain.paslang; \
 	timeout 60 $(BUILDDIR)/wgagain > $(BUILDDIR)/wgagain.got; \
@@ -5935,11 +5941,15 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'paslang: out of memory: [0-9][0-9]* MiB mapped' $(BUILDDIR)/fatal_oom.err; \
 	grep -q 'paslang: out of memory: [0-9][0-9]* MiB mapped' $(BUILDDIR)/fatal_oomlimit.err; \
 	grep -q 'paslang: send on closed channel at line 11' $(BUILDDIR)/fatal_closed.err; \
-	grep -q '^paslang: uncaught raise in the main routine, raised at line 24$$' $(BUILDDIR)/fatal_mainraise.err; \
+	for t in mainraise raiseobj; do \
+	  timeout 60 $(BUILDDIR)/fatal_$$t worker > $(BUILDDIR)/fatal_$$t.worker.got 2> $(BUILDDIR)/fatal_$$t.worker.err; \
+	  diff -u testdata/fatal/expected.out $(BUILDDIR)/fatal_$$t.worker.got; \
+	done; \
+	grep -q '^paslang: uncaught raise in the main routine, raised at line 23$$' $(BUILDDIR)/fatal_mainraise.err; \
 	: P580: a pas routine that a raise ends says so on one line, and the program goes on; \
-	grep -q '^paslang: uncaught raise in a routine, which ends alone, raised at line 12$$' $(BUILDDIR)/fatal_mainraise.err; \
-	grep -q '^paslang: uncaught raise in a routine, which ends alone: EOops, raised at line 18$$' $(BUILDDIR)/fatal_raiseobj.err; \
-	grep -q '^paslang: uncaught raise in the main routine: EOops, raised at line 30$$' $(BUILDDIR)/fatal_raiseobj.err; \
+	grep -q '^paslang: uncaught raise in a routine, which ends alone, raised at line 12$$' $(BUILDDIR)/fatal_mainraise.worker.err; \
+	grep -q '^paslang: uncaught raise in a routine, which ends alone: EOops, raised at line 18$$' $(BUILDDIR)/fatal_raiseobj.worker.err; \
+	grep -q '^paslang: uncaught raise in the main routine: EOops, raised at line 29$$' $(BUILDDIR)/fatal_raiseobj.err; \
 	grep -q 'paslang: set element 300 out of range \[0..255\] at line 16' $(BUILDDIR)/fatal_setelem.err; \
 	grep -q 'paslang: set element 1 out of range \[2..7\] at line 16' $(BUILDDIR)/fatal_setincl.err; \
 	grep -q 'paslang: integer divide by zero at line 13' $(BUILDDIR)/fatal_divloop.err; \
@@ -7148,10 +7158,14 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	grep -q 'paslang: stack overflow at line 12' $(BUILDDIR)/fatal_deep-arm.err; \
 	grep -q 'paslang: out of memory: [0-9][0-9]* MiB mapped' $(BUILDDIR)/fatal_oom-arm.err; \
 	grep -q 'paslang: send on closed channel at line 11' $(BUILDDIR)/fatal_closed-arm.err; \
-	grep -q '^paslang: uncaught raise in the main routine, raised at line 24$$' $(BUILDDIR)/fatal_mainraise-arm.err; \
-	grep -q '^paslang: uncaught raise in a routine, which ends alone, raised at line 12$$' $(BUILDDIR)/fatal_mainraise-arm.err; \
-	grep -q '^paslang: uncaught raise in a routine, which ends alone: EOops, raised at line 18$$' $(BUILDDIR)/fatal_raiseobj-arm.err; \
-	grep -q '^paslang: uncaught raise in the main routine: EOops, raised at line 30$$' $(BUILDDIR)/fatal_raiseobj-arm.err; \
+	for t in mainraise raiseobj; do \
+	  timeout 60 $(QEMU_A64) $(BUILDDIR)/fatal_$$t-arm worker > $(BUILDDIR)/fatal_$$t-arm.worker.got 2> $(BUILDDIR)/fatal_$$t-arm.worker.err; \
+	  diff -u testdata/fatal/expected.out $(BUILDDIR)/fatal_$$t-arm.worker.got; \
+	done; \
+	grep -q '^paslang: uncaught raise in the main routine, raised at line 23$$' $(BUILDDIR)/fatal_mainraise-arm.err; \
+	grep -q '^paslang: uncaught raise in a routine, which ends alone, raised at line 12$$' $(BUILDDIR)/fatal_mainraise-arm.worker.err; \
+	grep -q '^paslang: uncaught raise in a routine, which ends alone: EOops, raised at line 18$$' $(BUILDDIR)/fatal_raiseobj-arm.worker.err; \
+	grep -q '^paslang: uncaught raise in the main routine: EOops, raised at line 29$$' $(BUILDDIR)/fatal_raiseobj-arm.err; \
 	grep -q 'paslang: set element 300 out of range \[0..255\] at line 16' $(BUILDDIR)/fatal_setelem-arm.err; \
 	grep -q 'paslang: set element 1 out of range \[2..7\] at line 16' $(BUILDDIR)/fatal_setincl-arm.err; \
 	grep -q 'paslang: integer divide by zero at line 13' $(BUILDDIR)/fatal_divloop-arm.err; \

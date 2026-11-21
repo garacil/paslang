@@ -4766,8 +4766,9 @@ ended says so on the error output and the program goes on (1.3.10,
 P580): `paslang: uncaught raise in a routine, which ends alone: EOops,
 raised at line 18`, the object's `ToString` and the raise's place, as
 below, without the calls; before, it ended in silence and a dead worker
-of a service left no trace. In the main
-routine an uncaught `raise` ends the program: `paslang: uncaught raise
+of a service left no trace. Concurrent uncaught raises keep each report
+together on standard error, including its location and any traceback
+(P685). In the main routine an uncaught `raise` ends the program: `paslang: uncaught raise
 in the main routine` on the error output and exit status 1 (1.0.147;
 before, the scheduler was left with nothing to run and said
 `deadlock`). `testdata/fatal/mainraise` shows both. When the raise
@@ -4776,7 +4777,7 @@ says, its class's name unless the class says more:
 `paslang: uncaught raise in the main routine: EOops`
 (`testdata/fatal/raiseobj`, 1.1.3). The line ends with where the raise
 was (1.2.382, P578), as a failure of the runtime says its place:
-`paslang: uncaught raise in the main routine: EOops, raised at line 30`,
+`paslang: uncaught raise in the main routine: EOops, raised at line 29`,
 and `raised at line 43 of unit RaiseU` when the raise is in a unit's
 code. The place is the one the routine keeps for `ExceptAddr`: a
 `raise;` in a handler, a handler of another class that lets the object
