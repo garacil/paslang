@@ -3,10 +3,11 @@
 # Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
 # GPL version 3 or later. See COPYING.
 
-"""Check scheduler startup with real and synthetic Linux CPU affinity masks."""
+"""Check Linux CPU affinity and one-processor scheduler wakeups."""
 
 import os
 from pathlib import Path
+import runpy
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
@@ -52,6 +53,49 @@ def masked_syscall(cpu, words, result):
                    for i, word in enumerate(words)) + f'  mov x0, #{result}\n'
 
 
+def link_variant(program, candidate, cc_prefix, assembly):
+    asm = candidate.with_suffix('.s')
+    obj = candidate.with_suffix('.o')
+    asm.write_text(assembly)
+    run([cc_prefix + 'as', '-o', str(obj), str(asm)])
+    link = program.with_suffix('.link').read_text().splitlines()
+    replacements = {str(program): str(candidate), str(program.with_suffix('.o')): str(obj)}
+    run([cc_prefix + 'ld', *(replacements.get(arg, arg) for arg in link)])
+
+
+def check_one_p(compiler, units, working, cpu, launch, cc_prefix, allowed):
+    root = Path(__file__).resolve().parent.parent
+    check_blocked_writer = runpy.run_path(str(root / 'scripts/check_uncaught_reports.py'))['check_blocked_writer']
+    command = ['taskset', '-c', str(min(allowed)), *launch]
+    for name in ('reportparallel', 'dlrecv'):
+        program = working / f'{cpu}-{name}'
+        source = root / 'testdata' / 'fatal' / (name + '.paslang')
+        run([compiler, '-target', cpu, '-cpu', 'base', '-Fu', str(units),
+             '-o', str(program), str(source)])
+        assembly = program.with_suffix('.s').read_text()
+        start = assembly.index('rt_ncpu:\n')
+        end = assembly.index('\nrt_', start)
+        marker = '.nc_done:\n'
+        counter = assembly[start:end]
+        if counter.count(marker) != 1:
+            raise SystemExit(f'one-P fixture: {cpu} startup counter changed')
+        force_one = '  movl $1, %eax\n' if cpu == 'amd64' else '  mov x0, #1\n'
+        single_p = working / f'{cpu}-{name}-single-p'
+        changed = assembly[:start] + counter.replace(marker, marker + force_one) + assembly[end:]
+        link_variant(program, single_p, cc_prefix, changed)
+        if name == 'reportparallel':
+            for _ in range(8):
+                check_blocked_writer(command + [str(single_p)])
+        else:
+            deadlock = subprocess.run(command + [str(single_p)], capture_output=True, timeout=30)
+            expected = (root / 'testdata' / 'fatal' / 'expected.out').read_bytes()
+            if (deadlock.returncode, deadlock.stdout, deadlock.stderr) != (
+                1, expected, b'paslang: all routines are asleep: deadlock\n'
+            ):
+                raise SystemExit(f'one-P {cpu} deadlock: {deadlock.returncode}, '
+                                 f'{deadlock.stdout!r}, {deadlock.stderr!r}')
+
+
 def check_target(compiler, build, working, cpu, launch):
     native = cpu == 'amd64'
     cc_prefix = '' if native else 'aarch64-linux-gnu-'
@@ -67,7 +111,6 @@ def check_target(compiler, build, working, cpu, launch):
     expect(['taskset', '-c', str(min(allowed))] + launch + [str(program)], 2, f'{cpu} single CPU')
 
     assembly = program.with_suffix('.s').read_text()
-    link = program.with_suffix('.link').read_text().splitlines()
     syscall = '  syscall\n' if native else '  svc #0\n'
     start = assembly.index('rt_ncpu:\n')
     end = assembly.index('\nrt_', start)
@@ -82,13 +125,10 @@ def check_target(compiler, build, working, cpu, launch):
         ('empty', [-1], 0, 2),
     ):
         candidate = working / f'{cpu}-{name}'
-        asm = candidate.with_suffix('.s')
-        obj = candidate.with_suffix('.o')
-        asm.write_text(assembly[:raw] + masked_syscall(cpu, words, result) + assembly[raw + len(syscall):])
-        run([cc_prefix + 'as', '-o', str(obj), str(asm)])
-        replacements = {str(program): str(candidate), str(program.with_suffix('.o')): str(obj)}
-        run([cc_prefix + 'ld', *(replacements.get(arg, arg) for arg in link)])
+        changed = assembly[:raw] + masked_syscall(cpu, words, result) + assembly[raw + len(syscall):]
+        link_variant(program, candidate, cc_prefix, changed)
         expect(launch + [str(candidate)], expected, f'{cpu} {name}')
+    check_one_p(compiler, units, working, cpu, launch, cc_prefix, allowed)
 
 
 if __name__ == '__main__':
@@ -98,4 +138,4 @@ if __name__ == '__main__':
     with TemporaryDirectory(prefix='affinity-check-', dir=build) as temporary:
         for target, run_under in (('amd64', []), ('arm64', [str(qemu)])):
             check_target(str(compiler), build, Path(temporary), target, run_under)
-    print('CPU affinity masks and errors checked on amd64 and arm64')
+    print('CPU affinity, pending wakes and real deadlocks checked on amd64 and arm64')

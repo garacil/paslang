@@ -15029,10 +15029,10 @@ thousand entries and nothing else (1.1.1). A thread runs its own P's due
 timers whenever it looks for work and another P's before it takes work
 from it, and the thread in `epoll_wait` sleeps to the earliest timer of
 all, woken only by a new one earlier than that (1.1.197). The last thread to go to sleep checks whether anything can still
-happen: with no timer pending, no routine waiting on a descriptor, no
-thread in a system call or looking for work, and a routine still alive,
-it stops the program with `paslang: all routines are asleep: deadlock`
-(§10, 1.0.139).
+happen. A timer, a descriptor wait, a pending poller wake, a thread
+in a system call or a thread looking for work can still make progress.
+When none remains and a routine is alive, the runtime stops with
+`paslang: all routines are asleep: deadlock` (§10, P687).
 
 This model applies to every unit, including user-written units. A
 pollable wait parks its G. An unavoidable blocking system call keeps
