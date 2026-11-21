@@ -3,88 +3,136 @@
 # Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
 # paslang is free software under the GNU General Public License,
 # version 3 or (at your option) any later version; see the file COPYING.
-"""check_helpdoc.py PASLANGC MANUAL (P646): every limit and default that
-the compiler's help and the manual both state is the same in both.
+"""Generate shared manual defaults from source and check the compiled help.
 
-The help states the parameters of a routine and the arms of a select
-from the compiler's own constants (pasast's MaxParams and MaxSelectArms),
-so the help is the compiler's word; FACTS below says where each fact
-stands in the help and in the manual, and each must be found in both,
-with one value. A statement of the help that the manual contradicts is
-listed in CONTRADICTIONS: 7KSP found the help saying that a method takes
-no default, which it has taken since 1.1.6. Exit 1 on the first fact that
-differs, with both texts."""
+  scripts/check_helpdoc.py --sync TREE
+  scripts/check_helpdoc.py PASLANGC MANUAL [RUNNER ...]
+
+The compiler and runtime define the values. Their help prints the same
+constants and the generator updates the cited places in MANUAL.md.
+"""
 import re
 import subprocess
 import sys
+from pathlib import Path
 
-WORDS = {'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5, 'six': 6, 'seven': 7, 'eight': 8,
-         'nine': 9, 'ten': 10, 'sixteen': 16}
+COMPILER = 'src/compiler/pasast.paslang'
+HEAP = 'src/lib/pasheap.paslang'
+FORMAT = 'src/lib/pasfmt.paslang'
 
-# name, the help's patterns, the manual's patterns: the first group of each
-# is the value; every pattern of a list that matches must give that value,
-# and at least one of each list must match
+# Fact name, source file and constant, then help and manual capture patterns.
+# Each capture is the exact text of the value.
 FACTS = [
-    ('the parameters of a routine', [r'At most (\d+) parameters', r'up to (\d+) parameters'],
+    ('routine parameters', COMPILER, 'MaxParams',
+     [r'At most (\d+) parameters', r'up to (\d+) parameters'],
      [r'takes up to (\d+) parameters', r'takes at most (\d+) parameters']),
-    ('the arms of a select', [r'A select has at most (\d+) arms'], [r'A select has at most (\d+) arms']),
-    ('the oldest kernel', [r'kernel (\d+\.\d+) or newer'], [r'kernel (\d+\.\d+) or newer']),
-    ('-inline by default', [r'-inline 0 keeps one copy of every routine\. (\d+) by default'],
+    ('select arms', COMPILER, 'MaxSelectArms',
+     [r'A select has at most (\d+) arms'],
+     [r'A select has at most (\d+) arms']),
+    ('minimum kernel', COMPILER, 'MinLinuxKernel',
+     [r'kernel (\d+\.\d+) or newer'],
+     [r'kernel (\d+\.\d+) or newer']),
+    ('default output', COMPILER, 'DefaultProgramOutput',
+     [r'program with no -o is named ([\w.]+) in the current directory',
+      r'Output executable \(default: ([\w.]+)\)'],
+     [r'a program defaults to `([\w.]+)`']),
+    ('default -inline', COMPILER, 'DefaultInlineLimit',
+     [r'-inline 0 keeps one copy of every routine\. (\d+) by default'],
      [r'`-inline 0` keeps one copy of every routine and every loop; (\d+) by default']),
-    ('the collector\'s default', [r'PASLANG_GC=(\d+) \(the default\)'], [r'`PASLANG_GC=(\d+)` is the default']),
-    ('the most threads that mark', [r'at most (\d+), PASLANG_GCWORKERS'], [r'At most (\d+) of them mark']),
-    ('the decimals of a real WriteLn writes', [r'up to (\d+) fractional digits'],
-     [r'real prints up to (\w+) decimals']),
+    ('default PASLANG_GC', HEAP, 'PasDefaultGcPercent',
+     [r'PASLANG_GC=(\d+) \(the default\)'],
+     [r'`PASLANG_GC=(\d+)` is the default']),
+    ('default GC workers', HEAP, 'PasDefaultGcWorkers',
+     [r'By default at most (\d+) workers mark'],
+     [r'By default at most (\d+) workers mark']),
+    ('default real decimals', FORMAT, 'PasDefaultRealDecimals',
+     [r'up to (\d+) fractional digits'],
+     [r'real prints up to (\d+) decimals', r"`WriteLn`'s own form, up to (\d+) decimals"]),
 ]
 
-# what the help must not say when the manual says the other
-CONTRADICTIONS = [
-    ('a method takes defaults', r'take defaults as a routine does',
-     r'[Aa] method has no default|default value on a method'),
-]
+
+def matches(text, pattern):
+    """Match across a wrapped paragraph while preserving the source spans."""
+    return list(re.finditer(pattern.replace(' ', r'\s+'), text))
 
 
-def value(v):
-    v = v.strip()
-    return WORDS.get(v.lower(), v)
+def source_values(root):
+    sources = {}
+    for _, file, constant, _, _ in FACTS:
+        if file not in sources:
+            sources[file] = (root / file).read_text(encoding='utf-8')
+        values = re.findall(
+            rf"^  {constant} = ('[^'\n]+'|\d+);", sources[file], re.MULTILINE)
+        if len(values) != 1:
+            raise ValueError(f'{file}: expected one definition of {constant}')
+        yield values[0].strip("'")
 
 
-def found(text, patterns):
-    vals = []
-    for p in patterns:
-        for m in re.finditer(p, text):
-            vals.append((value(m.group(1)), m.group(0)))
-    return vals
+def update_manual(root, values):
+    path = root / 'docs/MANUAL.md'
+    manual = path.read_text(encoding='utf-8')
+    edits = {}
+    for (name, _, _, _, patterns), value in zip(FACTS, values, strict=True):
+        for pattern in patterns:
+            found = matches(manual, pattern)
+            if not found:
+                raise ValueError(f'{name}: missing manual entry for {pattern!r}')
+            for match in found:
+                if match[1] != value:
+                    edits[match.span(1)] = value
+    if edits:
+        for (start, end), value in sorted(edits.items(), reverse=True):
+            manual = manual[:start] + value + manual[end:]
+        path.write_text(manual, encoding='utf-8')
+        print(f'check_helpdoc: updated {len(edits)} manual values')
+
+
+def check(compiler, manual_path, runner):
+    root = Path(__file__).resolve().parent.parent
+    versions = []
+    for flag in ('--help', '-h'):
+        result = subprocess.run(
+            [*runner, compiler, flag], capture_output=True, text=True, check=True)
+        versions.append(result.stdout)
+    help_text = '\n'.join(versions)
+    manual = Path(manual_path).read_text(encoding='utf-8')
+    errors = []
+    for (name, _, _, help_patterns, manual_patterns), value in zip(
+            FACTS, source_values(root), strict=True):
+        for text, label, patterns in (
+                (help_text, 'help', help_patterns), (manual, 'manual', manual_patterns)):
+            for pattern in patterns:
+                found = matches(text, pattern)
+                if not found:
+                    errors.append(f'{name}: missing {label} entry for {pattern!r}')
+                for match in found:
+                    if match[1] != value:
+                        errors.append(f'{name}: {label} has {match[1]}, source has {value}')
+    if (not matches(help_text, r'take defaults as a routine does') or
+            matches(help_text, r'[Aa] method has no default|default value on a method')):
+        errors.append('the help must describe method default arguments')
+
+    for error in errors:
+        print(f'check_helpdoc: {error}')
+    if errors:
+        return 1
+    print(f'check_helpdoc: {len(FACTS)} source settings and method defaults checked')
+    return 0
 
 
 def main():
-    help_text = subprocess.run([sys.argv[1], '--help'], capture_output=True, text=True).stdout
-    help_text = re.sub(r'\n\s+', ' ', help_text)
-    manual = re.sub(r'\s+', ' ', open(sys.argv[2], encoding='utf-8').read())
-    bad = []
-    for name, hp, mp in FACTS:
-        h = found(help_text, hp)
-        m = found(manual, mp)
-        if not h:
-            bad.append('%s: the help does not state it' % name)
-            continue
-        if not m:
-            bad.append('%s: the manual does not state it' % name)
-            continue
-        vals = set(str(v) for v, _ in h + m)
-        if len(vals) > 1:
-            bad.append('%s: %s' % (name, ' / '.join(t for _, t in h + m)))
-    for name, manual_says, help_must_not in CONTRADICTIONS:
-        if re.search(manual_says, manual) and re.search(help_must_not, help_text):
-            bad.append('%s: the manual says it and the help says otherwise (%s)' %
-                       (name, re.search(help_must_not, help_text).group(0)))
-    for b in bad:
-        print('check_helpdoc:', b)
-    if bad:
-        return 1
-    print('check_helpdoc: %d facts and %d contradictions checked, the help and the manual agree' %
-          (len(FACTS), len(CONTRADICTIONS)))
-    return 0
+    args = sys.argv[1:]
+    if len(args) < 2 or (args[0] == '--sync' and len(args) != 2):
+        raise SystemExit(__doc__)
+    try:
+        if args[0] == '--sync':
+            root = Path(args[1])
+            update_manual(root, source_values(root))
+            return 0
+        compiler, manual, *runner = args
+        return check(compiler, manual, runner)
+    except (OSError, ValueError, subprocess.CalledProcessError) as error:
+        raise SystemExit(f'check_helpdoc: {error}') from error
 
 
 if __name__ == '__main__':

@@ -1042,6 +1042,7 @@ all: $(OUTDIR)/paslangc $(if $(AMD64),core libs) $(if $(ARM64),core-arm64 libs-a
 # The book in one page, docs/manual/index.html, from the canonical
 # Markdown (MANUAL.md, SQLITE_GUIDE.md, TYPES.md, QUAD.md, GC.md, KERNELS.md, VISION.md).
 manual:
+	python3 -I scripts/check_helpdoc.py --sync .
 	python3 scripts/manual_html.py
 
 libs: $(OUTDIR)/paslangc core $(LIB_UNITS) | $(BUILDDIR)
@@ -6143,6 +6144,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	done
 	@python3 -I -B scripts/select_walkers.py --self-test
 	@python3 -I -B scripts/check_select_diagnostics.py "$(OUTDIR)/paslangc-arm64" "$(BUILDDIR)" "$(QEMU_A64)" --host-arm64
+	@python3 -I scripts/check_helpdoc.py "$(OUTDIR)/paslangc-arm64" docs/MANUAL.md "$(QEMU_A64)" -cpu max
 	@set -e; \
 	python3 -I scripts/check_cli_help.py "$(OUTDIR)/paslangc-arm64" "$(BUILDDIR)" "$(QEMU_A64)"; \
 	python3 -I scripts/check_import_diagnostics.py "$(OUTDIR)/paslangc-arm64" "$(BUILDDIR)" "$(QEMU_A64)" --host-arm64; \

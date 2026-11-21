@@ -651,8 +651,8 @@ integer side. An integer where a real is expected becomes that real: in
 an assignment, an argument for a real parameter, `Result`, `Exit(n)` and
 `Send` on a channel of reals. A `var` parameter takes a variable of its
 own type. `Round` is round-to-nearest, ties to even. `WriteLn` of a
-real prints up to six decimals, always at least one: `4.0`, `2.5`. It is
-the exact value rounded once at the sixth decimal, a tie to the even
+real prints up to 6 decimals, always at least one: `4.0`, `2.5`. It is
+the exact value rounded once to that precision, a tie to the even
 digit, at any size: `1e20` is `100000000000000000000.0`, `2/3` is
 `0.666667`, `1/0` is `+Inf`, `-1/0` is `-Inf`, `0/0` is `NaN`. A real
 literal is the nearest double to what it says, subnormals too.
@@ -8269,8 +8269,7 @@ Adding an algorithm is the recipe in `docs/KERNELS.md`.
 `examples/maths.paslang`:
 
 ```pascal
-{ Reals and the calculation set. WriteLn prints a real with up to six
-  decimals and always at least one. }
+{ Real numbers and the calculation set. }
 program maths;
 
 var
@@ -8567,7 +8566,7 @@ routines are there for the compiler, and a program may call them too:
 | `pasroutines` | `PasReadLn(Dest: Pointer)`, `PasReadLnFed(line, fed)`, `PasEof: Boolean` | `ReadLn(s)`: one line of standard input into the string at `Dest`; `ReadLn(s, fed)`; `Eof` |
 | `pasroutines` | `PasIoRetry(answer, fd, ev, deadline): Boolean`, `PasIoDeadline(ms)`, `PasIoRead(fd, buf, n, deadline)`, `PasIoWrite(fd, buf, n, deadline)` | the one loop of I/O that parks: whether to make a system call again after its answer (EINTR at once, EAGAIN after parking until `fd` is ready or the deadline passes), a deadline `ms` from now, one read and one write through it |
 | `pasroutines` | `PasNetRead(fd, max, dest)`, `PasNetWrite(fd, p, n)` | `NetRead(fd, max, s)` and `NetWrite(fd, s)` |
-| `pasfmt` | `PasFmtReal(x, w, d): string` | `x:w:d` as text, `d` decimals padded to `w` columns; a `d` below 0 is `WriteLn`'s own form, up to six decimals |
+| `pasfmt` | `PasFmtReal(x, w, d): string` | `x:w:d` as text, `d` decimals padded to `w` columns; a `d` below 0 is `WriteLn`'s own form, up to 6 decimals |
 | `pasfmt` | `PasFmtInt(v, w): string`, `PasFmtStr(s, w): string` | an integer, a string, padded to `w` columns |
 | `pasfmt` | `PasParseReal(s, out bits): Boolean` | the double nearest the text `s`, its 64 bits into the `Int64` `bits`; `False` when `s` is not a number |
 | `pasfmt` | `PasParseSingle(s, out bits): Boolean` | the single nearest the text, its bits in the low 32 |
@@ -15060,8 +15059,8 @@ the cycle stopped and the idle ones take the roots in turn and give
 each other what they still have to scan. A cycle wakes one of them for
 every 32 KB the cycle before scanned, a thread that has more than it
 can scan soon asks for another, and one with nothing sleeps until there
-is some. At most 16 of them mark, since past that waking them costs
-more than they mark; `PASLANG_GCWORKERS=n` sets another limit, never
+is some. By default at most 16 workers mark. `PASLANG_GCWORKERS=n`
+sets another limit, never
 above the number of Ps, 0 one for each P, 1 the cycle's thread alone.
 `FreeMem` does nothing: a block goes
 when nothing points to it any more. An `Integer` holding an address
@@ -15401,14 +15400,14 @@ line is where it was written and every variable is in its slot. The
 program runs as it is until the environment names a socket:
 
 ```
-$ paslangc -debug prog.paslang
-$ PASLANG_DEBUG=/tmp/prog.sock ./a.out args...      # a path
-$ PASLANG_DEBUG=@prog ./a.out args...               # an abstract name
+$ paslangc -debug -o prog prog.paslang
+$ PASLANG_DEBUG=/tmp/prog.sock ./prog args...      # a path
+$ PASLANG_DEBUG=@prog ./prog args...               # an abstract name
 $ pasdbg /tmp/prog.sock                             # the console
 ```
 
 or the program's first argument asks for the console (below):
-`./a.out --debug-mode args...` runs it with a console on its own
+`./prog --debug-mode args...` runs it with a console on its own
 terminal.
 
 The listener and the local console run as background routines.
