@@ -171,6 +171,8 @@ type
     N: Integer;
   end;
 
+  TPdfTextRegion = (ptrAllText, ptrVisiblePage);
+
   TPdfDoc = class
   private
     FData: string;
@@ -194,6 +196,7 @@ type
     FExt: TObject;
     FStartXref: Integer;
     FFirstStream: Boolean;
+    FTextRegion: TPdfTextRegion;
     FCrypt: TPdfCrypt;
     FEncNum: Integer;
     procedure Warn(const Msg: string);
@@ -265,6 +268,8 @@ type
       1 GB a document); past them the rest is left out, with a warning }
     property PageWorkLimit: Int64 read FPageWork write FPageWork;
     property DocWorkLimit: Int64 read FDocWork write FDocWork;
+    { Text extraction can use the visible page box of each page. }
+    property TextRegion: TPdfTextRegion read FTextRegion write FTextRegion;
     { an entry of the document information dictionary (Title, Author,
       Subject, Keywords, Creator, Producer, CreationDate, ModDate) as
       UTF-8: a text string, in PDFDocEncoding or in UTF-16BE or UTF-8 with
@@ -294,7 +299,8 @@ type
 
 { the text of a file in memory: every page's, in reading order, a form feed
   after each page; EPdfError when the file is not a PDF it can read }
-function PdfText(const Data: string): string;
+function PdfText(const Data: string): string; overload;
+function PdfText(const Data: string; Region: TPdfTextRegion): string; overload;
 
 { objects made to be written: a null, a Boolean, an integer, a real, a string
   (its bytes), a name (without the slash), an empty array, an empty
@@ -2012,6 +2018,7 @@ var
 begin
   inherited Create;
   FData := AData;
+  FTextRegion := ptrAllText;
   FMaxStream := DefaultMaxStream;
   FPageWork := DefaultPageWork;
   FDocWork := DefaultDocWork;
@@ -4200,6 +4207,10 @@ type
     A, B, C, D, E, F: Double;
   end;
 
+  TPdfTextBox = record
+    Left, Bottom, Right, Top: Double;
+  end;
+
   TPdfGState = record
     Ctm: TPdfMat;
     Tc, Tw, Th, Tl, Ts, Tfs: Double;
@@ -4212,6 +4223,8 @@ type
     Doc: TPdfDoc;
     Fonts: array of TPdfFont;
     Runs: TPdfRunList;
+    ClipText: Boolean;
+    TextBox: TPdfTextBox;
     GS: TPdfGState;
     Stack: array of TPdfGState;
     NStack: Integer;
@@ -4275,6 +4288,10 @@ type
     PoolN: Integer;
     constructor Create(ADoc: TPdfDoc);
     procedure ResetPage;
+    procedure SetTextBox(Page: TPdfObj);
+    function GlyphVisible(X0, Y0, X1, Y1: Double): Boolean;
+    procedure OpenRun(const M: TPdfMat);
+    procedure ShowActualText;
     function FontFor(Res: TPdfObj; const AName: string): TPdfFont;
     procedure Show(const S: string; Start, Len: Integer);
     function Seen(Key: Int64; X, Y, FS, Ux, Uy: Double; Q8: Integer; ICell: Double): Boolean;
@@ -4653,46 +4670,132 @@ begin
   Runs.N := Runs.N + 1;
 end;
 
+{ Reject NaN and infinities from PDF reals and matrix multiplication.
+  Use the finite magnitude bound as Go math.IsInf and Rust f64::is_finite do. }
+function FiniteCoordinate(X: Double): Boolean;
+begin
+  Result := Abs(X) <= 1.7976931348623157e308;
+end;
+
+{ Restrict the segment parameter to where one coordinate is in the box. }
+function ClipTextAxis(A, B, Lo, Hi: Double; var First, Last: Double): Boolean;
+var
+  delta, t: Double;
+begin
+  Result := False;
+  if ((A < Lo) and (B < Lo)) or ((A > Hi) and (B > Hi)) then
+    Exit;
+  if (A >= Lo) and (A <= Hi) and (B >= Lo) and (B <= Hi) then
+    Exit(True);
+  delta := B - A;
+  if not FiniteCoordinate(delta) then
+  begin
+    { Halve first when opposite finite coordinates have an infinite difference. }
+    A := A * 0.5;
+    B := B * 0.5;
+    Lo := Lo * 0.5;
+    Hi := Hi * 0.5;
+    delta := B - A;
+  end;
+  if A < Lo then
+  begin
+    t := (Lo - A) / delta;
+    if t > First then
+      First := t;
+  end
+  else if A > Hi then
+  begin
+    t := (Hi - A) / delta;
+    if t > First then
+      First := t;
+  end;
+  if B < Lo then
+  begin
+    t := (Lo - A) / delta;
+    if t < Last then
+      Last := t;
+  end
+  else if B > Hi then
+  begin
+    t := (Hi - A) / delta;
+    if t < Last then
+      Last := t;
+  end;
+  Result := First <= Last;
+end;
+
+function TPdfExtractor.GlyphVisible(X0, Y0, X1, Y1: Double): Boolean;
+var
+  first, last: Double;
+begin
+  Result := False;
+  if (TextBox.Left >= TextBox.Right) or (TextBox.Bottom >= TextBox.Top) then
+    Exit;
+  if not (FiniteCoordinate(X0) and FiniteCoordinate(Y0) and
+    FiniteCoordinate(X1) and FiniteCoordinate(Y1)) then
+    Exit;
+  first := 0;
+  last := 1;
+  Result := ClipTextAxis(X0, X1, TextBox.Left, TextBox.Right, first, last) and
+    ClipTextAxis(Y0, Y1, TextBox.Bottom, TextBox.Top, first, last);
+end;
+
+procedure TPdfExtractor.OpenRun(const M: TPdfMat);
+begin
+  if RunOpen then
+    Exit;
+  RunOpen := True;
+  RunX0 := m.E + GS.Ts * m.C;
+  RunY0 := m.F + GS.Ts * m.D;
+  RunX1 := RunX0;
+  RunY1 := RunY0;
+  { the glyphs go along the x axis of the text space, down the y axis in a
+    font set vertically (P522) }
+  if GS.Font.Vertical then
+  begin
+    RunDX := -m.C;
+    RunDY := -m.D;
+  end
+  else
+  begin
+    RunDX := m.A;
+    RunDY := m.B;
+  end;
+  RunFS := Abs(GS.Tfs) * Sqrt(m.C * m.C + m.D * m.D);
+  if RunFS < 0.001 then
+    RunFS := Abs(GS.Tfs) * Sqrt(m.A * m.A + m.B * m.B);
+end;
+
+procedure TPdfExtractor.ShowActualText;
+begin
+  if MCShown then
+    Exit;
+  MCShown := True;
+  SB.AddText(MCText[MCActive]);
+  RunGlyphs := RunGlyphs + 1;
+  SBSpace := (MCText[MCActive] <> '') and (MCText[MCActive][Length(MCText[MCActive])] = ' ');
+end;
+
 { a string shown with the current font: its glyphs one after another }
 procedure TPdfExtractor.Show(const S: string; Start, Len: Integer);
 var
   i, q8, last: Integer;
   txt: string;
-  w, adv, fs, ul, ux, uy, px, py, icell: Double;
-  isSp, skip: Boolean;
+  w, adv, fs, ul, ux, uy, px, py, icell, x, y: Double;
+  isSp, skip, visible, remember: Boolean;
   key: Int64;
   m: TPdfMat;
 begin
   if GS.Font = nil then
     Exit;
   m := MatMul(Tm, GS.Ctm);
-  if not RunOpen then
-  begin
-    RunOpen := True;
-    RunX0 := m.E + GS.Ts * m.C;
-    RunY0 := m.F + GS.Ts * m.D;
-    RunX1 := RunX0;
-    RunY1 := RunY0;
-    { the glyphs go along the x axis of the text space, down the y axis in a
-      font set vertically (P522) }
-    if GS.Font.Vertical then
-    begin
-      RunDX := -m.C;
-      RunDY := -m.D;
-    end
-    else
-    begin
-      RunDX := m.A;
-      RunDY := m.B;
-    end;
-    RunFS := Abs(GS.Tfs) * Sqrt(m.C * m.C + m.D * m.D);
-    if RunFS < 0.001 then
-      RunFS := Abs(GS.Tfs) * Sqrt(m.A * m.A + m.B * m.B);
-  end;
+  if not ClipText then
+    OpenRun(m);
   { a string shown a second time in its place, a fake bold face or a drop
     shadow (P514), is read once, the pen moving as it would: the size and
     the direction of the glyphs are those of the matrix }
   skip := False;
+  remember := False;
   if (Len > 0) and not GS.Font.Vertical then
   begin
     fs := Abs(GS.Tfs) * Sqrt(m.C * m.C + m.D * m.D);
@@ -4710,20 +4813,20 @@ begin
       key := StringKey(S, Start, Len);
       skip := Seen(key, px, py, fs, ux, uy, q8, icell);
       if not skip then
-        Keep(key, px, py, q8, icell);
+      begin
+        if ClipText then
+          remember := True
+        else
+          Keep(key, px, py, q8, icell);
+      end;
     end;
   end;
   { inside a Span with ActualText the glyphs are not the text: the text the
     span says is written once, where its first string begins (P516) }
-  if (MCActive >= 0) and (Len > 0) then
+  if not ClipText and (MCActive >= 0) and (Len > 0) then
   begin
-    if not skip and not MCShown then
-    begin
-      MCShown := True;
-      SB.AddText(MCText[MCActive]);
-      RunGlyphs := RunGlyphs + 1;
-      SBSpace := (MCText[MCActive] <> '') and (MCText[MCActive][Length(MCText[MCActive])] = ' ');
-    end;
+    if not skip then
+      ShowActualText;
     skip := True;
   end;
   i := Start;
@@ -4731,13 +4834,49 @@ begin
   while i <= last do
   begin
     GS.Font.NextGlyph(S, i, last, txt, w, isSp);
-    if not skip then
+    visible := True;
+    if ClipText then
+    begin
+      { Compare the glyph baseline segment in default user space. The pen
+        advances for every glyph, including those completely off the page. }
+      x := m.E + GS.Ts * m.C;
+      y := m.F + GS.Ts * m.D;
+      if GS.Font.Vertical then
+        visible := GlyphVisible(x, y, x - GS.Tfs * m.C, y - GS.Tfs * m.D)
+      else
+      begin
+        adv := w / 1000.0 * GS.Tfs * GS.Th;
+        visible := GlyphVisible(x, y, x + adv * m.A, y + adv * m.B);
+      end;
+      if not visible then
+        EndRun
+      else if not skip then
+      begin
+        OpenRun(m);
+        if remember then
+        begin
+          Keep(key, px, py, q8, icell);
+          remember := False;
+        end;
+        if MCActive >= 0 then
+          ShowActualText;
+      end;
+    end;
+    if visible and not skip and (MCActive < 0) then
     begin
       if Length(txt) >= 3 then
         txt := ExpandLigatures(txt);
       { a space glyph right after the space of a gap is that space (P518) }
-      if SBGap and (txt <> '') and (txt[1] = ' ') then
-        txt := Copy(txt, 2, Length(txt));
+      if SBGap then
+      begin
+        if ClipText then
+        begin
+          SB.AddChar(' ');
+          SBSpace := True;
+        end;
+        if (txt <> '') and (txt[1] = ' ') then
+          txt := Copy(txt, 2, Length(txt));
+      end;
       SBGap := False;
       SB.AddText(txt);
       RunGlyphs := RunGlyphs + 1;
@@ -4759,11 +4898,23 @@ begin
       adv := adv * GS.Th;
       Tm := MatMul(MatTrans(adv, 0), Tm);
     end;
+    if ClipText then
+    begin
+      m := MatMul(Tm, GS.Ctm);
+      if visible and RunOpen then
+      begin
+        RunX1 := m.E + GS.Ts * m.C;
+        RunY1 := m.F + GS.Ts * m.D;
+      end;
+    end;
   end;
-  { the baseline moves along the font's up by the rise }
-  m := MatMul(Tm, GS.Ctm);
-  RunX1 := m.E + GS.Ts * m.C;
-  RunY1 := m.F + GS.Ts * m.D;
+  if not ClipText then
+  begin
+    { the baseline moves along the font's up by the rise }
+    m := MatMul(Tm, GS.Ctm);
+    RunX1 := m.E + GS.Ts * m.C;
+    RunY1 := m.F + GS.Ts * m.D;
+  end;
 end;
 
 { a marked-content sequence begins (BMC, BDC): a Span with ActualText (14.9.4)
@@ -5389,8 +5540,11 @@ begin
                 adj := ENum[k];
                 if (-adj >= tjlim) and RunOpen and (SB.ByteLength > 0) and not SBSpace then
                 begin
-                  SB.AddChar(' ');
-                  SBSpace := True;
+                  if not ClipText then
+                  begin
+                    SB.AddChar(' ');
+                    SBSpace := True;
+                  end;
                   SBGap := True;
                 end;
                 if (GS.Font <> nil) and GS.Font.Vertical then
@@ -5438,8 +5592,11 @@ begin
                 adj := NumOf(o);
                 if (-adj >= tjlim) and RunOpen and (SB.ByteLength > 0) and not SBSpace then
                 begin
-                  SB.AddChar(' ');
-                  SBSpace := True;
+                  if not ClipText then
+                  begin
+                    SB.AddChar(' ');
+                    SBSpace := True;
+                  end;
                   SBGap := True;
                 end;
                 if (GS.Font <> nil) and GS.Font.Vertical then
@@ -5836,6 +5993,8 @@ end;
 procedure TPdfExtractor.PutRunAt(X, Y, FS: Double; Glyphs: Integer; const Text: string);
 var
   r: TPdfRun;
+  i, start, first, kept: Integer;
+  width, endx: Double;
 begin
   r.X0 := X;
   r.Y0 := Y;
@@ -5845,8 +6004,48 @@ begin
   r.Glyphs := Glyphs;
   r.DX := 1;
   r.DY := 0;
-  r.Text := Text;
-  PutRun(r);
+  if not ClipText then
+  begin
+    r.Text := Text;
+    PutRun(r);
+    Exit;
+  end;
+  if not GlyphVisible(r.X0, Y, r.X1, Y) then
+    Exit;
+  { Widget fallback has no font program. Reuse its existing half-em advance
+    and keep UTF-8 sequences whole when clipping the estimated positions. }
+  width := FS * 0.5;
+  first := 0;
+  kept := 0;
+  i := 1;
+  while i <= Length(Text) do
+  begin
+    start := i;
+    PdfNextRune(Text, i);
+    endx := X + width;
+    if GlyphVisible(X, Y, endx, Y) then
+    begin
+      if first = 0 then
+      begin
+        first := start;
+        r.X0 := X;
+      end;
+      kept := kept + 1;
+      r.X1 := endx;
+    end
+    else if first <> 0 then
+    begin
+      i := start;
+      Break;
+    end;
+    X := endx;
+  end;
+  if first <> 0 then
+  begin
+    r.Glyphs := kept;
+    r.Text := Copy(Text, first, i - first);
+    PutRun(r);
+  end;
 end;
 
 { the entry Key of a field or the first of its parents that has one }
@@ -6258,9 +6457,70 @@ begin
   end;
 end;
 
+{ MediaBox and CropBox are inherited through the page tree. ISO 32000-1
+  7.7.3 and 14.11.2 define their units and intersection. }
+function ReadTextBox(Doc: TPdfDoc; Page: TPdfObj; const Name: string; out Box: TPdfTextBox): Boolean;
+var
+  i: Integer;
+  item, entry: TPdfObj;
+  values: array[0..3] of Double;
+begin
+  Result := False;
+  for i := 0 to MaxPageDepth do
+  begin
+    if (Page = nil) or (Page.Kind <> pdfDict) then
+      Exit;
+    entry := Page.Get(Name);
+    if entry <> nil then
+      Break;
+    Page := Doc.Dict(Page, 'Parent');
+  end;
+  entry := Doc.Resolve(entry);
+  if (entry = nil) or (entry.Kind <> pdfArray) or (Length(entry.Items) <> 4) then
+    Exit;
+  for i := 0 to 3 do
+  begin
+    item := Doc.Resolve(entry.Items[i]);
+    if (item = nil) or ((item.Kind <> pdfInt) and (item.Kind <> pdfReal)) then
+      Exit;
+    values[i] := NumOf(item);
+    if not FiniteCoordinate(values[i]) then
+      Exit;
+  end;
+  Box.Left := Min(values[0], values[2]);
+  Box.Bottom := Min(values[1], values[3]);
+  Box.Right := Max(values[0], values[2]);
+  Box.Top := Max(values[1], values[3]);
+  Result := True;
+end;
+
+procedure TPdfExtractor.SetTextBox(Page: TPdfObj);
+var
+  crop: TPdfTextBox;
+begin
+  ClipText := False;
+  if Doc.TextRegion <> ptrVisiblePage then
+    Exit;
+  ClipText := ReadTextBox(Doc, Page, 'MediaBox', TextBox);
+  if ReadTextBox(Doc, Page, 'CropBox', crop) then
+  begin
+    if ClipText then
+    begin
+      TextBox.Left := Max(TextBox.Left, crop.Left);
+      TextBox.Bottom := Max(TextBox.Bottom, crop.Bottom);
+      TextBox.Right := Min(TextBox.Right, crop.Right);
+      TextBox.Top := Min(TextBox.Top, crop.Top);
+    end
+    else
+      TextBox := crop;
+    ClipText := True;
+  end;
+end;
+
 procedure RunsOfPage(Doc: TPdfDoc; Ext: TPdfExtractor; Page: TPdfObj);
 begin
   Ext.ResetPage;
+  Ext.SetTextBox(Page);
   Ext.PageContent(Page);
   Ext.AnnotContent(Page);
 end;
@@ -6318,6 +6578,15 @@ var
   d: TPdfDoc;
 begin
   d := TPdfDoc.Create(Data);
+  Result := d.Text;
+end;
+
+function PdfText(const Data: string; Region: TPdfTextRegion): string;
+var
+  d: TPdfDoc;
+begin
+  d := TPdfDoc.Create(Data);
+  d.TextRegion := Region;
   Result := d.Text;
 end;
 

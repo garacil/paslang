@@ -685,6 +685,82 @@ case('empty', 'error', b'', 'not a PDF', valid=False)
 case('headeronly', 'error', b'%PDF-1.4\n%%EOF\n', 'catalog', valid=False)
 
 
+# P515: runs that cross the box, a nested inherited crop, a page override,
+# a crop outside the media, and a reused extractor across those pages.
+def region_case(name, pdf, all_text, visible, raw):
+    expected = tuple(text.encode('utf-8') for text in (all_text, visible, raw))
+    CASES.append((name, 'region', pdf, expected, True, False))
+
+
+p = Pdf()
+f = font_simple(p)
+c = ('BT /Helv 10 Tf 20 160 Td (Inside) Tj ET '
+     'BT /Helv 10 Tf -24 130 Td (LEFTEDGE) Tj ET '
+     'BT /Helv 10 Tf 180 100 Td (RIGHTEDGE) Tj ET '
+     'BT /Helv 10 Tf 20 230 Td (Above) Tj ET '
+     'BT /Helv 10 Tf 20 -20 Td (Below) Tj ET')
+p, root = one_page(c, {'Helv': f}, mediabox='[0 0 200 200]', p=p)
+region_case('page_region_edges', p.build(root),
+            txt('Above\nInside\nLEFTEDGE\nRIGHTEDGE\nBelow'),
+            txt('Inside\nTEDGE\nRIGH'), txt('Inside\nTEDGE\nRIGH'))
+
+p = Pdf()
+f = font_simple(p)
+pages = p.reserve()
+mid = p.reserve()
+media = p.add('[0 0 200 200]')
+crop = p.add('[175 150 20 30]')
+c = p.stream('', b'BT /Helv 10 Tf 44 110 Td (Inside) Tj ET '
+                 b'BT /Helv 10 Tf -22 80 Td (ENTERING) Tj ET '
+                 b'BT /Helv 10 Tf 6 70 Td (LEFTSIDE) Tj ET '
+                 b'BT /Helv 10 Tf 182 60 Td (MEETMEDIA) Tj ET ')
+a = p.add('<< /Type /Page /Parent %d 0 R /Rotate 90 /Contents %d 0 R >>' % (mid, c))
+b = p.add('<< /Type /Page /Parent %d 0 R /CropBox [-50 -50 250 250] /Contents %d 0 R >>' % (mid, c))
+d = p.add('<< /Type /Page /Parent %d 0 R /CropBox [210 210 250 250] /Contents %d 0 R >>' % (mid, c))
+p.put(mid, '<< /Type /Pages /Parent %d 0 R /CropBox %d 0 R /Kids [%d 0 R %d 0 R %d 0 R] /Count 3 >>' % (pages, crop, a, b, d))
+p.put(pages, '<< /Type /Pages /Kids [%d 0 R] /Count 3 /MediaBox %d 0 R /Resources << /Font << /Helv %d 0 R >> >> >>' % (mid, media, f))
+root = p.add('<< /Type /Catalog /Pages %d 0 R >>' % pages)
+all_pages = 'Inside\nENTERING\nLEFTSIDE\nMEETMEDIA'
+inherited = 'Inside\nNG\nFTSIDE'
+override = 'Inside\nERING\nLEFTSIDE\nMEET'
+region_case('page_region_inherited', p.build(root), txt(all_pages, all_pages, all_pages),
+            txt(inherited, override, ''), txt(inherited, override, ''))
+
+p = Pdf()
+f = font_simple(p)
+c = ('BT /Helv 10 Tf 1 0 0 1 20 90 Tm (Top) Tj ET '
+     'BT /Helv 10 Tf 2.5 -2.5 0 1 95 110 Tm (X) Tj ET '
+     'BT /Helv 10 Tf 2.5 -2.5 0 1 95 103 Tm (Y) Tj ET '
+     'BT /Helv 10 Tf -1 0 0 1 112 60 Tm (ABCD) Tj ET '
+     'BT /Helv 10 Tf 1 0 0 1 86 40 Tm [(A) -2000 (Z)] TJ ET '
+     '/Span << /ActualText (Replacement) >> BDC '
+     'BT /Helv 10 Tf 104 20 Td (Hidden) Tj  -35 0 Td (Shown) Tj ET EMC '
+     'BT /Helv 10 Tf 100.5 10 Td (Edge) Tj -1 0 Td (Edge) Tj ET')
+p, root = one_page(c, {'Helv': f}, mediabox='[0 0 100 100]', p=p)
+region_case('page_region_transformed', p.build(root),
+            txt('Top\nABCD\nA Z\nReplacement\nEdge Edge\nX Y'),
+            txt('Top\nBCD\nA\nReplacement\nE\nY'),
+            txt('Top\nY\nBCD\nA\nReplacement\nE'))
+
+
+p = Pdf()
+f = font_simple(p)
+pages = p.reserve()
+inside = p.add('<< /Type /Annot /Subtype /Widget /FT /Tx /T (inside) /V <FEFF00C900DF> '
+               '/DA (/Helv 12 Tf) /Rect [95 30 114 50] >>')
+outside = p.add('<< /Type /Annot /Subtype /Widget /FT /Tx /T (outside) /V (Outside) '
+                '/DA (/Helv 12 Tf) /Rect [101 10 120 30] >>')
+c = p.stream('', b'BT /Helv 12 Tf 20 80 Td (Body) Tj ET')
+page = p.add('<< /Type /Page /Parent %d 0 R /MediaBox [0 0 100 100] /Contents %d 0 R '
+             '/Annots [%d 0 R %d 0 R] /Resources << /Font << /Helv %d 0 R >> >> >>'
+             % (pages, c, inside, outside, f))
+p.put(pages, '<< /Type /Pages /Kids [%d 0 R] /Count 1 >>' % page)
+root = p.add('<< /Type /Catalog /Pages %d 0 R /AcroForm << /Fields [%d 0 R %d 0 R] >> >>'
+             % (pages, inside, outside))
+region_case('page_region_widget', p.build(root), txt('Body\nÉß\nOutside'),
+            txt('Body\nÉ'), txt('Body\nÉ'))
+
+
 def real_samples():
     """the files other programs made (cairo, Skia, LibreOffice, Ghostscript,
     groff, librsvg), kept as they are in testdata/pdfreal with the text each
@@ -703,7 +779,9 @@ def write_corpus():
     real_samples()
     lines = []
     for name, kind, pdf, expect, valid, cmp in CASES:
-        lines.append('%s\t%s\t%s\t%s' % (name, kind, base64.b64encode(pdf).decode(), base64.b64encode(expect).decode()))
+        expected = expect if isinstance(expect, tuple) else (expect,)
+        fields = [name, kind, *(base64.b64encode(item).decode() for item in (pdf, *expected))]
+        lines.append('\t'.join(fields))
     return '\n'.join(lines) + '\n'
 
 
@@ -714,11 +792,12 @@ def verify():
     for name, kind, pdf, expect, valid, cmp in CASES:
         fn = os.path.join(d, name + '.pdf')
         open(fn, 'wb').write(pdf)
-        if valid and kind == 'text':
+        if valid:
             q = subprocess.run(['qpdf', '--check', fn], capture_output=True, text=True)
             if q.returncode not in (0, 3):
                 print('qpdf --check', name, q.stdout[-300:], q.stderr[-300:])
                 bad += 1
+        if valid and kind == 'text':
             t = subprocess.run(['pdftotext', '-layout', fn, '-'], capture_output=True, text=True).stdout
             import unicodedata
             a = re.findall(r'\S+', unicodedata.normalize('NFKC', t))

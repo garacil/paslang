@@ -13301,6 +13301,17 @@ p := d.Info('Producer');           { the document information, as UTF-8 }
 s := PdfText(Data);                { one call for the text of a file }
 for i := 0 to d.WarningCount - 1 do WriteLn(d.WarningAt(i));   { what was read round }
 ```
+- **Page bounds (P515).** The default region is `ptrAllText`. Use
+  `PdfText(Data, ptrVisiblePage)` or set
+  `d.TextRegion := ptrVisiblePage` before calling `PageText`, `PageTextRaw`
+  or `Text`. A glyph is included when its baseline segment, after the text
+  and graphics transforms, meets the inherited `CropBox` within the
+  inherited `MediaBox` (ISO 32000-1 §§7.7.3 and 14.11.2). A glyph that
+  touches the edge is retained whole. A single valid box supplies the
+  bounds when the other is absent or invalid. With neither valid box, the
+  page's text is extracted in full. This option applies page bounds to
+  the extraction geometry, including form and widget text. Use
+  `ptrAllText` to extract text past the bounds.
 - **What it reads.** The cross-reference tables and streams of ISO 32000-1 7.5
   (a table, a stream, a hybrid of both, any number of incremental updates), the
   object streams of PDF 1.5, the filters of 7.4 (Flate and LZW with their TIFF
