@@ -12660,6 +12660,25 @@ HelloRetryRequest, ALPN, a certificate request, a MiB each way, wrong
 names refused, eight routines at once) and `openssl s_server` (17
 cases), on both machines, in make check when Go and openssl are there.
 
+`uses pasconn` gives TCP and Unix streams the same reads and writes used by
+the protocol clients. `ReadSome(MaxN, Deadline, out Data)` returns the
+bytes read, zero for a nonpositive limit or end of stream, and a negative
+errno on failure. `Data` contains its own bytes and can be kept across reads.
+`TTcpStream` reuses scratch space for reads up to 64 KiB and reads larger
+requests into the result's storage. `ReadInto` reads into a caller's buffer.
+
+Use a zero-initialized `TNetReadBuffer` with `ReadLineFrom` and
+`ReadExactFrom` to reuse storage and advance through pending bytes by
+position. `Reset` clears the buffer or gives it bytes already read.
+`Pending` gives the unread byte count and `TakePending` returns and
+consumes those bytes. Both functions still accept a string buffer.
+SMTP and IMAP use the positioned buffer across calls. HTTP/1.1 reads
+unframed response body data into the returned part's storage when the
+remaining framing permits it. `THttpClientResponse.ReadInto(P, MaxN)`
+uses the caller's storage and returns zero at body EOF. It can be mixed
+with `ReadChunk` and observes the same decoding, limits and deadlines
+(P656).
+
 `uses pashttp2` is an HTTP/2 client (1.3.3, P617): RFC 9113 over a TLS
 connection whose ALPN chose `h2`, or over TCP for a server known to
 speak it there, and HPACK (RFC 7541) whole, following Go's client

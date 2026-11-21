@@ -855,8 +855,8 @@ GOLDEN_A64 += paslineszero
 GOLDEN += httpstop
 GOLDEN_A64 += httpstop
 # P432: URLs and HTTP messages against Go, and the HTTP client over loopback.
-GOLDEN += url httpmsg httpcli
-GOLDEN_A64 += url httpmsg httpcli
+GOLDEN += url httpmsg httpcli connread
+GOLDEN_A64 += url httpmsg httpcli connread
 # P453: a head fed a byte at a time costs time linear in its size.
 GOLDEN += httpslow
 GOLDEN_A64 += httpslow

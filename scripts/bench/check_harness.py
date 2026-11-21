@@ -81,11 +81,12 @@ def policy_checks():
             pass
         else:
             require(False, "unreviewed Go version accepted the pinned policy")
-    require(len(bench.PAIRS) == 46 and len(bench.units()) == 222 and "b45nist" in bench.PAIRS and
+    require(len(bench.PAIRS) == 47 and len(bench.units()) == 224 and "b45nist" in bench.PAIRS and
             run_refs.selected_units(None, ["go"]) == bench.units() and
             run_refs.selected_units(["b45nist"], ["go"]) == [("b45nist", "p256"), ("b45nist", "p384")] and
-            run_refs.selected_units(["b18sync:condbroadcast"], ["go"]) == [("b18sync", "condbroadcast")],
-            "selected Go mode lost the full suite, NIST pair or condition broadcast")
+            run_refs.selected_units(["b18sync:condbroadcast"], ["go"]) == [("b18sync", "condbroadcast")] and
+            run_refs.selected_units(["b47streams"], ["go"]) == [("b47streams", "http"), ("b47streams", "lines")],
+            "selected Go mode lost the full suite, NIST pair, condition broadcast or stream workloads")
     require(len(run_refs.selected_units(None, ["rust"])) == 29,
             "Rust default no longer includes every audited section")
     rust_default = run_refs.selected_units(None, ["rust"])
@@ -373,10 +374,10 @@ kind=Path(sys.argv[0]).name
 args=sys.argv[1:]
 log=Path(os.environ['BENCH_STUB_LOG'])
 with log.open('a') as f:
-    f.write(json.dumps({'tool':kind,'args':args,'env':{k:os.environ.get(k) for k in ('GOAMD64','GOARCH','GOOS','GODEBUG')}})+'\n')
+    f.write(json.dumps({'tool':kind,'args':args,'env':{k:os.environ.get(k) for k in ('GOAMD64','GOARCH','GOOS','GODEBUG','CGO_ENABLED')}})+'\n')
 if kind=='paslangc' and args==['-v']: print('paslangc stub');sys.exit()
 if kind=='go' and args==['version']: print('go version go1.27.4-X:nodwarf5 linux/amd64');sys.exit()
-if kind=='go' and args[:2]==['env','-json']: print(json.dumps({'GOAMD64':os.environ.get('GOAMD64'),'GOARCH':'amd64','GOOS':'linux'}));sys.exit()
+if kind=='go' and args[:2]==['env','-json']: print(json.dumps({'GOAMD64':os.environ.get('GOAMD64'),'GOARCH':'amd64','GOOS':'linux','CGO_ENABLED':os.environ.get('CGO_ENABLED','1')}));sys.exit()
 if kind=='rustc' and args==['-Vv']: print('rustc stub\nrelease: stub');sys.exit()
 if kind=='rustc' and args[:2]==['--print','sysroot']: print('/synthetic/sysroot');sys.exit()
 if kind=='rustc' and args[:2]==['--print','cfg']: print('target_arch="x86_64"');sys.exit()
@@ -548,7 +549,7 @@ def cli_checks(folder):
     for extension in ('pi', 'o'):
         (paslang_units / ('fixture.' + extension)).write_text('synthetic Paslang library ' + extension)
     env = dict(os.environ, PATH=str(bindir), BENCH_STUB_LOG=str(log),
-               BENCH_STUB_SYSROOT=str(sysroot), PASLANG_LIB=str(paslang_units), GOAMD64='v4',
+               BENCH_STUB_SYSROOT=str(sysroot), PASLANG_LIB=str(paslang_units), GOAMD64='v4', CGO_ENABLED='0',
                GODEBUG='cpu.all=off,cpu.avx2=off,gctrace=0', GOPROXY='secret-proxy-marker',
                GOAUTH='secret-auth-marker', PASLANG_PRIVATE='secret-pascal-marker')
     report = root / 'result.json'
@@ -591,6 +592,13 @@ def cli_checks(folder):
     require(result.returncode == 0, 'normal rounds reuse failed: ' + result.stderr)
     commands = [json.loads(line) for line in log.read_text().splitlines()]
     require(len([r for r in commands if '-o' in r['args']]) == before, 'rounds rebuilt executables')
+    require(all(row['env']['CGO_ENABLED'] == '0' for row in go_builds),
+            'the selected Cgo mode was omitted from Go builds')
+    result = launch('rounds.py', common, {'CGO_ENABLED': '1'})
+    refused = strict_json(report)
+    require(result.returncode == 1 and not refused['ok'] and refused['completed_comparisons'] == 0 and
+            'stale executable' in refused['error'],
+            'executable was reused after the effective Go linkage setting changed')
     # A valid JSON scalar or list is still an invalid build manifest. It
     # must produce a failed current result, never a finally-written success.
     manifest = root / 'build/bench/b1loop.refs.native.paslang.build.json'

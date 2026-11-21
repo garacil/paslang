@@ -193,7 +193,7 @@ def build(arguments, executable, record, *, env=None, reuse=False):
                 "go_capability_identity": record["go_capabilities"]["identity_sha256"]
                     if Path(arguments[0]).name == "go" else None,
                 "environment": {key: env[key] for key in
-                    ("GODEBUG", "GOAMD64", "GOARCH", "GOOS", "GOFLAGS", "GOTOOLCHAIN", "GOEXPERIMENT", "GOENV",
+                    ("GODEBUG", "GOAMD64", "GOARCH", "GOOS", "GOFLAGS", "GOTOOLCHAIN", "GOEXPERIMENT", "GOENV", "CGO_ENABLED",
                      "GLIBC_TUNABLES", "LD_HWCAP_MASK", "RUST_STD_DETECT_UNSTABLE")
                     if env and key in env}}
     manifest = executable.with_name(executable.name + ".build.json")
@@ -214,7 +214,7 @@ def build(arguments, executable, record, *, env=None, reuse=False):
     result = capture(arguments, env=env, cwd=bench.ROOT)
     result["wall_s"] = time.perf_counter() - started
     result["environment"] = {key: env[key] for key in
-        ("GODEBUG", "GOAMD64", "GOARCH", "GOOS", "GOFLAGS", "GOCACHE", "GOTOOLCHAIN", "GOEXPERIMENT", "GOENV",
+        ("GODEBUG", "GOAMD64", "GOARCH", "GOOS", "GOFLAGS", "GOCACHE", "GOTOOLCHAIN", "GOEXPERIMENT", "GOENV", "CGO_ENABLED",
          "GLIBC_TUNABLES", "LD_HWCAP_MASK", "RUST_STD_DETECT_UNSTABLE")
         if env and key in env}
     record["build_observations"].append(result)
@@ -421,10 +421,23 @@ def main(argv=None, *, rounds_only=False):
             record["go_capabilities"] = prepare_go_capabilities(
                 tools["go"], out / "go-capabilities", environment=go_tools_env)
             validate_go_capabilities(record["go_capabilities"], tools["go"])
-            record["go_environment"] = {
-                cpu: metadata([tools["go"], "env", "-json", "GOAMD64", "GOARCH", "GOOS", "GOEXPERIMENT", "GOENV", "CGO_ENABLED"],
-                              env=go_build_environment(out, cpu, options.go_native_level, go_tools_env))
-                for cpu in cpus} if "go" in references else {}
+            record["go_environment"] = {}
+            go_environments = {}
+            if "go" in references:
+                for cpu in cpus:
+                    env = go_build_environment(out, cpu, options.go_native_level, go_tools_env)
+                    observed = metadata([tools["go"], "env", "-json", "GOAMD64", "GOARCH",
+                                         "GOOS", "GOEXPERIMENT", "GOENV", "CGO_ENABLED"], env=env)
+                    record["go_environment"][cpu] = observed
+                    if observed["status"] or observed["stderr"]:
+                        raise ValueError("Go build environment query failed for " + cpu)
+                    cgo = json.loads(observed["stdout"]).get("CGO_ENABLED")
+                    if cgo not in ("0", "1"):
+                        raise ValueError("Go returned an invalid CGO_ENABLED value for " + cpu)
+                    # Match the effective setting even when Go inferred it. It
+                    # changes the executable's resolver and provider linkage.
+                    env["CGO_ENABLED"] = cgo
+                    go_environments[cpu] = env
         record["libc"] = metadata(["ldd", "--version"]) if shutil.which("ldd") else None
         if any(name in ("b34json", "b37json") for name, _ in units):
             bench.prepare()
@@ -455,8 +468,8 @@ def main(argv=None, *, rounds_only=False):
                         source = Path(bench.HERE) / ((name + ".go") if reference == "go" else ("rust/" + name + ".rs"))
                         record["source_sha256"][str(source)] = hashlib.sha256(source.read_bytes()).hexdigest()
                         if reference == "go":
-                            env = go_build_environment(out, cpu, options.go_native_level, go_tools_env)
-                            build([tools["go"], "build", "-o", ref, source], ref, record, env=env, reuse=options.no_build)
+                            build([tools["go"], "build", "-o", ref, source], ref, record,
+                                  env=go_environments[cpu], reuse=options.no_build)
                         else:
                             flags = rust_build_args(record["rust_configuration"], cpu)
                             env = reference_environment(reference, cpu)

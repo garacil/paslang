@@ -63,6 +63,7 @@ type
   TTcpStream = class(TNetStream)
   private
     FFd: Integer;
+    FReadScratch: string;
   public
     constructor Create(AFd: Integer);
     function ReadSome(MaxN, Deadline: Integer; out Data: string): Integer; override;
@@ -71,6 +72,18 @@ type
     function WriteFrom(P: Pointer; N, Deadline: Integer): Boolean; override;
     procedure Shutdown(How: Integer); override;
     procedure Dispose; override;
+  end;
+
+  { A reader's owned buffer. Reads advance its position and only compact
+    storage when a refill needs room. A zero-initialized buffer is empty. }
+  TNetReadBuffer = record
+  private
+    FStorage: string;
+    FFirst, FEnd: Integer;
+  public
+    procedure Reset(const Data: string = '');
+    function Pending: Integer;
+    function TakePending: string;
   end;
 
   { dials a TLS connection to Host:Port within ConnectMs; the TLS unit sets
@@ -103,9 +116,11 @@ function DialUnix(const Path: string): TNetStream;
   stream, more read into Buf as needed; False at the end of the stream or the
   deadline (Err says which: 0 end, -110 deadline, else -errno), and for a
   line longer than MaxLine (Err is -90) }
-function ReadLineFrom(S: TNetStream; var Buf: string; out Line: string; MaxLine, Deadline: Integer; out Err: Integer): Boolean;
-{ N bytes from Buf and the stream }
-function ReadExactFrom(S: TNetStream; var Buf: string; N: Integer; out Data: string; Deadline: Integer; out Err: Integer): Boolean;
+function ReadLineFrom(S: TNetStream; var Buf: string; out Line: string; MaxLine, Deadline: Integer; out Err: Integer): Boolean; overload;
+function ReadLineFrom(S: TNetStream; var Buf: TNetReadBuffer; out Line: string; MaxLine, Deadline: Integer; out Err: Integer): Boolean; overload;
+{ N bytes from Buf and the stream. A failed read leaves pending bytes in Buf. }
+function ReadExactFrom(S: TNetStream; var Buf: string; N: Integer; out Data: string; Deadline: Integer; out Err: Integer): Boolean; overload;
+function ReadExactFrom(S: TNetStream; var Buf: TNetReadBuffer; N: Integer; out Data: string; Deadline: Integer; out Err: Integer): Boolean; overload;
 
 implementation
 
@@ -177,19 +192,36 @@ begin
 end;
 
 function TTcpStream.ReadSome(MaxN, Deadline: Integer; out Data: string): Integer;
-var
-  buf: string;
+const
+  MaxReadScratch = 65536;
 begin
   Data := '';
   if FFd < 0 then
+    Exit(-9);
+  if MaxN <= 0 then
+    Exit(0);
+  if MaxN > MaxReadScratch then
   begin
-    Result := -9;
+    { Keep unusually large reads out of the connection's retained scratch.
+      Read into the result itself as TcpRead does. }
+    SetLength(Data, MaxN);
+    Result := PasIoRead(FFd, @Data[1], MaxN, Deadline);
+    if Result > 0 then
+      SetLength(Data, Result)
+    else
+      Data := '';
     Exit;
   end;
-  SetLength(buf, MaxN);
-  Result := PasIoRead(FFd, @buf[1], MaxN, Deadline);
+  { Reuse private storage as in Go's bufio.Reader and Rust's BufReader.
+    The string that leaves this method owns only the bytes actually read. }
+  if Length(FReadScratch) < MaxN then
+  begin
+    FReadScratch := '';
+    SetLength(FReadScratch, MaxN);
+  end;
+  Result := PasIoRead(FFd, @FReadScratch[1], MaxN, Deadline);
   if Result > 0 then
-    Data := Copy(buf, 1, Result);
+    Data := Copy(FReadScratch, 1, Result);
 end;
 
 function TTcpStream.ReadInto(P: Pointer; MaxN, Deadline: Integer): Integer;
@@ -248,6 +280,7 @@ begin
   begin
     TcpClose(FFd);
     FFd := -1;
+    FReadScratch := '';
   end;
 end;
 
@@ -288,68 +321,150 @@ begin
   Result := TTcpStream.Create(fd);
 end;
 
-function ReadLineFrom(S: TNetStream; var Buf: string; out Line: string; MaxLine, Deadline: Integer; out Err: Integer): Boolean;
+procedure TNetReadBuffer.Reset(const Data: string);
+begin
+  FStorage := Data;
+  FFirst := 0;
+  FEnd := Length(Data);
+end;
+
+function TNetReadBuffer.Pending: Integer;
+begin
+  Result := FEnd - FFirst;
+end;
+
+procedure Consume(var Buf: TNetReadBuffer; N: Integer);
+begin
+  Buf.FFirst := Buf.FFirst + N;
+  if Buf.FFirst = Buf.FEnd then
+  begin
+    Buf.FFirst := 0;
+    Buf.FEnd := 0;
+    if Length(Buf.FStorage) > 65536 then
+      Buf.FStorage := '';
+  end;
+end;
+
+function TNetReadBuffer.TakePending: string;
+begin
+  Result := Copy(FStorage, FFirst + 1, FEnd - FFirst);
+  Consume(Self, FEnd - FFirst);
+end;
+
+{ Like Go bufio.Reader.fill, reuse free space or move the unconsumed bytes
+  down before admitting a new read. Rust BufReader also reads into its
+  spare capacity and advances the initialized length by the actual count. }
+function Refill(S: TNetStream; var Buf: TNetReadBuffer; Deadline: Integer): Integer;
+const
+  Chunk = 16384;
 var
-  p, n: Integer;
-  data: string;
+  pending, capacity: Integer;
+begin
+  capacity := Length(Buf.FStorage);
+  if capacity - Buf.FEnd < Chunk then
+  begin
+    pending := Buf.FEnd - Buf.FFirst;
+    if Buf.FFirst > 0 then
+    begin
+      if pending > 0 then
+        Move(Buf.FStorage[Buf.FFirst + 1], Buf.FStorage[1], pending);
+      Buf.FFirst := 0;
+      Buf.FEnd := pending;
+    end;
+    if capacity - pending < Chunk then
+      SetLength(Buf.FStorage, Max(2 * capacity, pending + Chunk));
+  end;
+  Result := S.ReadInto(@Buf.FStorage[Buf.FEnd + 1], Chunk, Deadline);
+  if Result > 0 then
+    Buf.FEnd := Buf.FEnd + Result;
+end;
+
+function ReadLineFrom(S: TNetStream; var Buf: TNetReadBuffer; out Line: string; MaxLine, Deadline: Integer; out Err: Integer): Boolean;
+var
+  scanned, pending, rest, lf, lineLen, n: Integer;
 begin
   Result := False;
   Err := 0;
   Line := '';
+  scanned := 0;
   while True do
   begin
-    p := Pos(#10, Buf);
-    if p > 0 then
+    pending := Buf.FEnd - Buf.FFirst;
+    rest := pending - scanned;
+    if rest > 0 then
     begin
-      if (p > 1) and (Buf[p - 1] = #13) then
-        Line := Copy(Buf, 1, p - 2)
-      else
-        Line := Copy(Buf, 1, p - 1);
-      Buf := Copy(Buf, p + 1, Length(Buf) - p);
-      if (MaxLine > 0) and (Length(Line) > MaxLine) then
+      lf := IndexByte(Buf.FStorage[Buf.FFirst + scanned + 1], rest, 10);
+      if lf >= 0 then
       begin
-        Err := -90;
-        Exit;
+        lf := lf + scanned;
+        lineLen := lf;
+        if (lf > 0) and (Buf.FStorage[Buf.FFirst + lf] = #13) then
+          lineLen := lineLen - 1;
+        Line := Copy(Buf.FStorage, Buf.FFirst + 1, lineLen);
+        Consume(Buf, lf + 1);
+        if (MaxLine > 0) and (lineLen > MaxLine) then
+        begin
+          Err := -90;
+          Exit;
+        end;
+        Exit(True);
       end;
-      Result := True;
-      Exit;
     end;
-    if (MaxLine > 0) and (Length(Buf) > MaxLine) then
+    if (MaxLine > 0) and (pending > MaxLine) and
+      ((pending - MaxLine > 1) or (Buf.FStorage[Buf.FEnd] <> #13)) then
     begin
       Err := -90;
       Exit;
     end;
-    n := S.ReadSome(16384, Deadline, data);
+    scanned := pending;
+    n := Refill(S, Buf, Deadline);
     if n <= 0 then
     begin
       Err := n;
       Exit;
     end;
-    Buf := Buf + data;
   end;
+end;
+
+function ReadExactFrom(S: TNetStream; var Buf: TNetReadBuffer; N: Integer; out Data: string; Deadline: Integer; out Err: Integer): Boolean;
+var
+  nread: Integer;
+begin
+  Err := 0;
+  Data := '';
+  if N <= 0 then
+    Exit(True);
+  while Buf.FEnd - Buf.FFirst < N do
+  begin
+    nread := Refill(S, Buf, Deadline);
+    if nread <= 0 then
+    begin
+      Err := nread;
+      Exit(False);
+    end;
+  end;
+  Data := Copy(Buf.FStorage, Buf.FFirst + 1, N);
+  Consume(Buf, N);
+  Result := True;
+end;
+
+{ The string overloads continue to return the unread bytes as a string. }
+function ReadLineFrom(S: TNetStream; var Buf: string; out Line: string; MaxLine, Deadline: Integer; out Err: Integer): Boolean;
+var
+  reader: TNetReadBuffer;
+begin
+  reader.Reset(Buf);
+  Result := ReadLineFrom(S, reader, Line, MaxLine, Deadline, Err);
+  Buf := reader.TakePending;
 end;
 
 function ReadExactFrom(S: TNetStream; var Buf: string; N: Integer; out Data: string; Deadline: Integer; out Err: Integer): Boolean;
 var
-  k: Integer;
-  more: string;
+  reader: TNetReadBuffer;
 begin
-  Result := False;
-  Err := 0;
-  Data := '';
-  while Length(Buf) < N do
-  begin
-    k := S.ReadSome(16384, Deadline, more);
-    if k <= 0 then
-    begin
-      Err := k;
-      Exit;
-    end;
-    Buf := Buf + more;
-  end;
-  Data := Copy(Buf, 1, N);
-  Buf := Copy(Buf, N + 1, Length(Buf) - N);
-  Result := True;
+  reader.Reset(Buf);
+  Result := ReadExactFrom(S, reader, N, Data, Deadline, Err);
+  Buf := reader.TakePending;
 end;
 
 end.

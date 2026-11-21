@@ -112,7 +112,9 @@ PAIRS = ["b1loop", "b2str", "b3spawn", "b4chan", "b5map", "b6smap", "b7narrow", 
          # P471: first NIST public-key derivation in a fresh process.
          "b45nist",
          # P617: an HTTP/2 client (pashttp2's THttp2Conn against net/http's, a scripted server on a socket pair)
-         "b46http2"]
+         "b46http2",
+         # P656: HTTP/1.1 downloads and owned lines from a loopback stream.
+         "b47streams"]
 # The longest one run may take, in seconds: a run past it is killed, its
 # unit stops being measured and fails (Go's side of every pair takes
 # under 1 s; paslang's append of a character, quadratic until its hito,
@@ -160,6 +162,7 @@ SECTIONS = {
     "b44fma": ["horner"],
     "b45nist": ["p256", "p384"],
     "b46http2": ["seq", "conc", "big"],
+    "b47streams": ["http", "lines"],
 }
 CHECKPTR = ["b8ptr"]
 PROBES = ["p1alloccap", "p2deeprec", "p3divzero", "p4nil", "p5bounds", "p6strbounds", "p7parked"]

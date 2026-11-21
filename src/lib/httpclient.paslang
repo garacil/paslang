@@ -126,9 +126,14 @@ type
     FReadMs: Integer;
     FMaxBody: Int64;
     FRead: Int64;
+    FCarry: string;
+    FCarryPos: Integer;
     FDone: Boolean;
     FReleased: Boolean;
     FKeep: Boolean;
+    function ReadDeadline: Integer;
+    function TransportResult(N: Integer): Boolean;
+    procedure CountBody(N: Integer);
     function Pull: Boolean;
     procedure Finish;
   public
@@ -148,6 +153,8 @@ type
     Uncompressed: Boolean;
     { the body that follows, a piece at a time: False at its end }
     function ReadChunk(out Piece: string): Boolean;
+    { Read up to MaxN bytes into the caller's buffer at P. Zero at body EOF. }
+    function ReadInto(P: Pointer; MaxN: Integer): Integer;
     { the whole body, EHttpClientError if it is longer than MaxBytes (0
       for the client's limit) }
     function ReadAll(MaxBytes: Int64): string;
@@ -253,27 +260,26 @@ end;
 
 { ---- the response ---- }
 
-{ more of the body from the stream into the reader; False when the stream
-  ended }
-function THttpClientResponse.Pull: Boolean;
+function THttpClientResponse.ReadDeadline: Integer;
 var
-  data: string;
-  n, dl: Integer;
+  dl: Integer;
 begin
-  Result := True;
-  dl := FDeadline;
+  Result := FDeadline;
   if FReadMs > 0 then
-    if (dl = 0) or (PasIoDeadline(FReadMs) < dl) then
-      dl := PasIoDeadline(FReadMs);
-  n := FStream.ReadSome(16384, dl, data);
-  if n > 0 then
   begin
-    FReader.Feed(data);
-    Exit;
+    dl := PasIoDeadline(FReadMs);
+    if (Result = 0) or (dl < Result) then
+      Result := dl;
   end;
-  if n = 0 then
+end;
+
+function THttpClientResponse.TransportResult(N: Integer): Boolean;
+begin
+  if N > 0 then
+    Exit(True);
+  Result := False;
+  if N = 0 then
   begin
-    Result := False;
     try
       FReader.AtEof;
     except
@@ -288,10 +294,44 @@ begin
   end;
   FStream.Dispose;
   FReleased := True;
-  if n = -110 then
+  if N = -110 then
     raise EHttpClientError.CreateKind(ceTimeout, 'http: timeout awaiting the response body')
   else
-    raise EHttpClientError.CreateKind(ceClosed, 'http: read: ' + ErrnoText(-n));
+    raise EHttpClientError.CreateKind(ceClosed, 'http: read: ' + ErrnoText(-N));
+end;
+
+procedure THttpClientResponse.CountBody(N: Integer);
+begin
+  FRead := FRead + N;
+  if (FMaxBody > 0) and (FRead > FMaxBody) then
+  begin
+    FStream.Dispose;
+    FReleased := True;
+    raise EHttpClientError.CreateKind(ceTooLarge, 'http: response body is larger than the limit');
+  end;
+end;
+
+{ More body data for the parser. Read a large unframed fragment into
+  its final string. The final short read also checks for surplus bytes. }
+function THttpClientResponse.Pull: Boolean;
+var
+  data: string;
+  n, dl: Integer;
+begin
+  dl := ReadDeadline;
+  n := FReader.DirectBodySize(65536);
+  if n = 65536 then
+  begin
+    SetLength(data, n);
+    n := FStream.ReadInto(@data[1], n, dl);
+    if n > 0 then
+      SetLength(data, n);
+  end
+  else
+    n := FStream.ReadSome(16384, dl, data);
+  Result := TransportResult(n);
+  if Result then
+    FReader.Feed(data);
 end;
 
 procedure THttpClientResponse.Finish;
@@ -312,6 +352,13 @@ function THttpClientResponse.ReadChunk(out Piece: string): Boolean;
 var
   data: string;
 begin
+  if FCarry <> '' then
+  begin
+    Piece := Copy(FCarry, FCarryPos + 1, Length(FCarry) - FCarryPos);
+    FCarry := '';
+    FCarryPos := 0;
+    Exit(True);
+  end;
   Piece := '';
   Result := False;
   while True do
@@ -321,13 +368,7 @@ begin
     data := FReader.TakeBody;
     if data <> '' then
     begin
-      FRead := FRead + Length(data);
-      if (FMaxBody > 0) and (FRead > FMaxBody) then
-      begin
-        FStream.Dispose;
-        FReleased := True;
-        raise EHttpClientError.CreateKind(ceTooLarge, 'http: response body is larger than the limit');
-      end;
+      CountBody(Length(data));
       if FInfl <> nil then
       begin
         try
@@ -377,6 +418,45 @@ begin
     if FReleased then
       Exit;
     Pull;
+  end;
+end;
+
+function THttpClientResponse.ReadInto(P: Pointer; MaxN: Integer): Integer;
+var
+  n, want: Integer;
+  part: string;
+begin
+  if MaxN <= 0 then
+    Exit(0);
+  want := Min(MaxN, 65536);
+  if (FCarry = '') and (FInfl = nil) and not FReleased and (want >= 16384) and
+    (FReader.BufferedBody = 0) and (FReader.DirectBodySize(want) = want) then
+  begin
+    n := FStream.ReadInto(P, want, ReadDeadline);
+    if TransportResult(n) then
+    begin
+      CountBody(n);
+      FReader.AcceptDirectBody(n);
+    end
+    else
+      Finish;
+    Exit(n);
+  end;
+  if FCarry = '' then
+  begin
+    if not ReadChunk(part) then
+      Exit(0);
+    FCarry := part;
+    FCarryPos := 0;
+  end;
+  Result := Min(MaxN, Length(FCarry) - FCarryPos);
+  if Result > 0 then
+    Move(FCarry[FCarryPos + 1], PByte(P)^, Result);
+  FCarryPos := FCarryPos + Result;
+  if FCarryPos = Length(FCarry) then
+  begin
+    FCarry := '';
+    FCarryPos := 0;
   end;
 end;
 

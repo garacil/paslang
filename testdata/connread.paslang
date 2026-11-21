@@ -1,0 +1,159 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+  paslang is free software under the GNU General Public License,
+  version 3 or (at your option) any later version; see COPYING. }
+
+program connread;
+
+uses
+  pasconn, pashttp, pasnet, pasroutines;
+
+type
+  TFragments = class(TNetStream)
+  public
+    First, Second: string;
+    LastError: Integer;
+    function ReadSome(MaxN, Deadline: Integer; out Data: string): Integer; override;
+  end;
+
+function TFragments.ReadSome(MaxN, Deadline: Integer; out Data: string): Integer;
+begin
+  Data := Copy(First, 1, MaxN);
+  if Length(First) > MaxN then
+    First := Copy(First, MaxN + 1, Length(First) - MaxN)
+  else
+  begin
+    First := Second;
+    Second := '';
+  end;
+  Result := Length(Data);
+  if Result = 0 then
+    Result := LastError;
+end;
+
+procedure Check(Condition: Boolean; Code: Integer);
+begin
+  if not Condition then
+    Halt(Code);
+end;
+
+procedure SocketReads;
+var
+  readFd, writeFd, count, received, before, cycles: Integer;
+  a, b: TTcpStream;
+  saved, data, payload: string;
+begin
+  Check(UnixPair(readFd, writeFd), 1);
+  a := TTcpStream.Create(readFd);
+  b := TTcpStream.Create(writeFd);
+  data := 'cleared';
+  Check((a.ReadSome(0, 0, data) = 0) and (data = ''), 2);
+  Check((a.ReadSome(-100, 0, data) = 0) and (data = ''), 3);
+  Check(b.WriteAll('saved'#0#255, 0), 4);
+  Check((a.ReadSome(65536, 0, saved) = 7) and (saved = 'saved'#0#255), 5);
+  cycles := HeapStat(0);
+  before := HeapStat(7);
+  for count := 1 to 7 do
+  begin
+    Check(b.WriteAll('OK'#0#254, 0), 6);
+    Check((a.ReadSome(65536, 0, data) = 4) and (data = 'OK'#0#254), 7);
+    Check(saved = 'saved'#0#255, 8);
+  end;
+  if (HeapStat(10) <> 0) and (HeapStat(0) = cycles) then
+    Check(HeapStat(7) - before < 8192, 9);
+  Check(b.WriteAll('abc', 0), 10);
+  Check((a.ReadSome(1, 0, data) = 1) and (data = 'a'), 11);
+  Check((a.ReadSome(131072, 0, data) = 2) and (data = 'bc'), 12);
+  Check((a.ReadSome(32, PasIoDeadline(5), data) = -110) and (data = ''), 13);
+  payload := StringOfChar('x', 70000);
+  Check(b.WriteAll(payload, PasIoDeadline(3000)), 14);
+  count := 0;
+  while count < Length(payload) do
+  begin
+    received := a.ReadSome(131072, PasIoDeadline(3000), data);
+    Check((received > 0) and (received = Length(data)), 15);
+    Check(data = Copy(payload, count + 1, received), 16);
+    count := count + received;
+  end;
+  b.Dispose;
+  Check((a.ReadSome(7, PasIoDeadline(3000), data) = 0) and (data = ''), 17);
+  a.Dispose;
+  Check((a.ReadSome(7, 0, data) = -9) and (data = ''), 18);
+end;
+
+procedure BufferedReads;
+var
+  s: TFragments;
+  b, forked: TNetReadBuffer;
+  data, old, long: string;
+  err: Integer;
+begin
+  s := TFragments.Create;
+  s.First := 'head'#13#10'ABCDEsecond'#10'last';
+  Check(ReadLineFrom(s, b, data, 4, 0, err) and (data = 'head'), 21);
+  Check(b.Pending = 16, 22);
+  forked := b;
+  Check(ReadExactFrom(s, b, 5, data, 0, err) and (data = 'ABCDE'), 23);
+  Check(b.Pending = 11, 24);
+  Check(ReadLineFrom(s, b, data, 32, 0, err) and (data = 'second'), 25);
+  Check(not ReadLineFrom(s, b, data, 32, 0, err) and (err = 0), 26);
+  Check(b.TakePending = 'last', 27);
+  Check(b.Pending = 0, 28);
+  Check(forked.TakePending = 'ABCDEsecond'#10'last', 29);
+  s.First := 'ABCD'#13;
+  s.Second := #10'NEXT';
+  Check(ReadLineFrom(s, b, data, 4, 0, err) and (data = 'ABCD'), 30);
+  Check(b.TakePending = 'NEXT', 31);
+  s.First := 'available';
+  s.LastError := -110;
+  Check(not ReadExactFrom(s, b, 10, data, 0, err) and (err = -110) and (data = ''), 32);
+  Check(b.Pending = 9, 33);
+  s.LastError := 0;
+  s.First := '!';
+  Check(ReadExactFrom(s, b, 10, data, 0, err) and (data = 'available!'), 34);
+  long := StringOfChar('x', 70000);
+  b.Reset('first'#10'prefix');
+  forked := b;
+  s.First := long;
+  s.Second := #10'after';
+  Check(ReadLineFrom(s, b, data, 8, 0, err) and (data = 'first'), 35);
+  Check(ReadLineFrom(s, b, data, 70006, 0, err) and (data = 'prefix' + long), 36);
+  Check(b.TakePending = 'after', 37);
+  Check(forked.TakePending = 'first'#10'prefix', 38);
+  old := 'first'#10'next!';
+  Check(ReadLineFrom(s, old, data, 12, 0, err) and (data = 'first') and (old = 'next!'), 39);
+  Check(ReadExactFrom(s, old, 4, data, 0, err) and (data = 'next') and (old = '!'), 40);
+end;
+
+procedure BodyReads;
+const
+  Start = 'HTTP/1.1 200 OK'#13#10;
+var
+  r: THttpMessageReader;
+begin
+  r := THttpMessageReader.Create(False, 'GET');
+  r.Feed(Start + 'Content-Length: 6'#13#10#13#10'ab');
+  Check((r.TakeBody = 'ab') and (r.DirectBodySize(100) = 4), 41);
+  r.Feed('cd');
+  Check((r.TakeBody = 'cd') and (r.DirectBodySize(100) = 2), 42);
+  r.Feed('efmore');
+  Check((r.State = msDone) and (r.TakeBody = 'ef') and (r.Unused = 'more'), 43);
+  r := THttpMessageReader.Create(False, 'GET');
+  r.Feed(Start + 'Connection: close'#13#10#13#10);
+  Check(r.DirectBodySize(25) = 25, 44);
+  r.Feed('whole');
+  r.AtEof;
+  Check((r.State = msDone) and (r.TakeBody = 'whole'), 45);
+  r := THttpMessageReader.Create(False, 'GET');
+  r.Feed(Start + 'Transfer-Encoding: chunked'#13#10#13#10);
+  Check(r.DirectBodySize(25) = 0, 46);
+  r.Feed('3'#13#10'yes'#13#10'0'#13#10#13#10);
+  Check((r.State = msDone) and (r.TakeBody = 'yes'), 47);
+end;
+
+begin
+  SocketReads;
+  BufferedReads;
+  BodyReads;
+  WriteLn('connection reads ok');
+end.

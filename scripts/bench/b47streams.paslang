@@ -1,0 +1,150 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+  paslang is free software under the GNU General Public License,
+  version 3 or (at your option) any later version; see COPYING. }
+
+{ P656: the same scripted loopback peer and client work as b47streams.go.
+  HTTP reads 32 fixed-length responses on one connection. The line run
+  returns owned strings from 200,000 or more CRLF-delimited records. }
+program b47streams;
+
+uses
+  pasconn, pasnet, pasroutines, httpclient, sysutils;
+
+const
+  HttpRequests = 32;
+  HttpBlocks = 128;
+  BlockBytes = 65536;
+  LinesPerBlock = 256;
+  LineBlocks = 800;
+  LineBytes = 111;
+  CRLF = #13#10;
+
+var
+  listener: Integer;
+  done: waitgroup;
+  http: Boolean;
+
+procedure Serve;
+var
+  fd, i, j, dl, err: Integer;
+  stream: TTcpStream;
+  pending: TNetReadBuffer;
+  line, header, payload: string;
+begin
+  fd := TcpAccept(listener);
+  if fd < 0 then
+    Halt(10);
+  stream := TTcpStream.Create(fd);
+  dl := PasIoDeadline(30000);
+  if http then
+  begin
+    header := 'HTTP/1.1 200 OK' + CRLF +
+      'Content-Length: ' + IntToStr(HttpBlocks * BlockBytes) + CRLF + CRLF;
+    payload := StringOfChar('x', BlockBytes);
+    for i := 1 to HttpRequests do
+    begin
+      repeat
+        if not ReadLineFrom(stream, pending, line, 4096, dl, err) then
+          Halt(11);
+      until line = '';
+      if not stream.WriteAll(header, dl) then
+        Halt(12);
+      for j := 1 to HttpBlocks do
+        if not stream.WriteAll(payload, dl) then
+          Halt(13);
+    end;
+  end
+  else
+  begin
+    for i := 0 to LinesPerBlock - 1 do
+      payload := payload + StringOfChar(Chr(97 + i mod 26), LineBytes) + CRLF;
+    for i := 1 to LineBlocks do
+      if not stream.WriteAll(payload, dl) then
+        Halt(14);
+  end;
+  stream.Dispose;
+  done.Done;
+end;
+
+procedure ReadHttp(Port: Integer);
+var
+  client: THttpClient;
+  response: THttpClientResponse;
+  url: string;
+  buffer: array of Byte;
+  i, total, count, n: Integer;
+begin
+  client := THttpClient.Create;
+  client.TimeoutMs := 30000;
+  client.DisableCompression := True;
+  url := 'http://127.0.0.1:' + IntToStr(Port) + '/';
+  SetLength(buffer, BlockBytes);
+  total := 0;
+  for i := 1 to HttpRequests do
+  begin
+    response := client.Get(url);
+    if response.Status <> 200 then
+      Halt(20);
+    count := 0;
+    while True do
+    begin
+      n := response.ReadInto(@buffer[0], Length(buffer));
+      if n = 0 then
+        Break;
+      if (buffer[0] <> Ord('x')) or (buffer[n - 1] <> Ord('x')) then
+        Halt(21);
+      count := count + n;
+    end;
+    if count <> HttpBlocks * BlockBytes then
+      Halt(22);
+    total := total + count;
+    response.Dispose;
+  end;
+  client.CloseIdle;
+  WriteLn('http ', HttpRequests, ' ', total);
+end;
+
+procedure ReadLines(Port: Integer);
+var
+  stream: TNetStream;
+  pending: TNetReadBuffer;
+  expected: Char;
+  line: string;
+  i, dl, err: Integer;
+begin
+  stream := DialTcp('127.0.0.1', Port, 30000);
+  if stream = nil then
+    Halt(30);
+  dl := PasIoDeadline(30000);
+  for i := 0 to LineBlocks * LinesPerBlock - 1 do
+  begin
+    if not ReadLineFrom(stream, pending, line, LineBytes, dl, err) then
+      Halt(31);
+    expected := Chr(97 + (i mod LinesPerBlock) mod 26);
+    if (Length(line) <> LineBytes) or (line[1] <> expected) or (line[LineBytes] <> expected) then
+      Halt(32);
+  end;
+  if ReadLineFrom(stream, pending, line, LineBytes, dl, err) or (err <> 0) or (pending.Pending <> 0) then
+    Halt(33);
+  stream.Dispose;
+  WriteLn('lines ', LineBlocks * LinesPerBlock, ' ', LineBlocks * LinesPerBlock * LineBytes);
+end;
+
+var
+  port: Integer;
+begin
+  http := ParamStr(1) = 'http';
+  listener := TcpListenAt('127.0.0.1', 0, 1);
+  if listener < 0 then
+    Halt(1);
+  port := TcpPort(listener);
+  done.Add(1);
+  pas Serve;
+  if http then
+    ReadHttp(port)
+  else
+    ReadLines(port);
+  done.Wait;
+  TcpClose(listener);
+end.
