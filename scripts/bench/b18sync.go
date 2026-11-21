@@ -25,15 +25,22 @@ import (
 	"sync/atomic"
 )
 
+const (
+	batchWaiters = 16
+	batchRounds  = 10000
+)
+
 var (
-	wg     sync.WaitGroup
-	mu     sync.Mutex
-	rw     sync.RWMutex
-	once   sync.Once
-	turn   = sync.NewCond(&mu)
-	count  int64
-	shared int64
-	whose  int
+	wg                  sync.WaitGroup
+	mu                  sync.Mutex
+	rw                  sync.RWMutex
+	once                sync.Once
+	turn                = sync.NewCond(&mu)
+	full                = sync.NewCond(&mu)
+	entered, generation int
+	count               int64
+	shared              int64
+	whose               int
 )
 
 func locker() {
@@ -75,6 +82,40 @@ func player(me int) {
 	wg.Done()
 }
 
+func batchWaiter() {
+	for round := 1; round <= batchRounds; round++ {
+		mu.Lock()
+		entered++
+		if entered == batchWaiters {
+			full.Signal()
+		}
+		for generation < round {
+			turn.Wait()
+		}
+		count++
+		mu.Unlock()
+	}
+	wg.Done()
+}
+
+func runBatches() {
+	wg.Add(batchWaiters)
+	for i := 1; i <= batchWaiters; i++ {
+		go batchWaiter()
+	}
+	for round := 1; round <= batchRounds; round++ {
+		mu.Lock()
+		for entered < batchWaiters {
+			full.Wait()
+		}
+		entered = 0
+		generation = round
+		turn.Broadcast()
+		mu.Unlock()
+	}
+	wg.Wait()
+}
+
 func adder() {
 	for k := 1; k <= 2000000; k++ {
 		atomic.AddInt64(&count, 1)
@@ -111,6 +152,8 @@ func main() {
 		go player(0)
 		go player(1)
 		wg.Wait()
+	case "condbroadcast":
+		runBatches()
 	case "atomic":
 		wg.Add(16)
 		for i := 1; i <= 16; i++ {
@@ -118,7 +161,7 @@ func main() {
 		}
 		wg.Wait()
 	default:
-		fmt.Println("b18sync: mutex, rwread, once, cond or atomic")
+		fmt.Println("b18sync: mutex, rwread, once, cond, condbroadcast or atomic")
 		os.Exit(2)
 	}
 	fmt.Println(count)

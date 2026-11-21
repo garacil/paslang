@@ -953,10 +953,9 @@ GOLDEN_A64 += uint32legacy uint32rotate crc32width uint32bounds uint32memxor uin
 # woken. Both orders, with deadlines, both ways at once, TCP, numbers used again.
 GOLDEN += twowait
 GOLDEN_A64 += twowait
-# P672: a cond's Wait lets a starving mutex go without a yield, for it holds the
-# cond's lock; the yield froze the program when a cycle wanted the world stopped.
-GOLDEN += condstarve
-GOLDEN_A64 += condstarve
+# P672/P673: starvation handoff during cond.Wait, and ticket order across wrap.
+GOLDEN += condstarve condtickets
+GOLDEN_A64 += condstarve condtickets
 # P618: a closure shares a variable a select names only as an arm's channel or value.
 GOLDEN += selclosure selcounterflow selchannelindex selwalkerflow selvaluecapture selboundedwrite
 GOLDEN_A64 += selclosure selcounterflow selchannelindex selwalkerflow selvaluecapture selboundedwrite

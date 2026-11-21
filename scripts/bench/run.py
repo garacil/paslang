@@ -127,7 +127,7 @@ SECTIONS = {
     "b15io": ["small", "smallread"],
     "b16net": ["tcp", "unix"],
     "b17conc": ["sleep", "timeout", "pipe", "fanin"],
-    "b18sync": ["mutex", "rwread", "once", "cond", "atomic"],
+    "b18sync": ["mutex", "rwread", "once", "cond", "condbroadcast", "atomic"],
     "b19heap": ["ints", "strings"],
     "b20hash": ["md5", "sha1", "sha512", "sha3", "hmac", "hmacp", "sha3p", "crc32", "adler32", "fnv"],
     "b21text": ["hex", "runes"],

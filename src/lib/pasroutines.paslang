@@ -69,8 +69,10 @@ type
   end;
 
   TPasCond = record
+    Waited: Integer;
+    Notified: Integer;
     Spin: Integer;
-    Head: Integer;
+    Head, Tail: Integer;
   end;
 
   { Fired, not Done: a field named Done hid the Boolean init.Done, so not
@@ -267,12 +269,8 @@ end;
 
 { The slow path of Unlock, Go's unlockSlow: wake one waiter, unless none
   is parked or one is already awake or the mutex was taken meanwhile; in
-  starvation mode hand it to the first waiter, and yield to it when
-  MayYield says the caller holds no runtime lock (a cond's Wait holds
-  its queue's while it lets the mutex go, and a routine that yielded
-  with it left every other M that wanted it asleep on it, out of the
-  reach of a cycle's stop: P672). }
-procedure MutexUnlockSlow(var M: TPasMutex; nw: Integer; MayYield: Boolean);
+  starvation mode hand it to the first waiter and yield (Go's handoff). }
+procedure MutexUnlockSlow(var M: TPasMutex; nw: Integer);
 var
   old, g: Integer;
   starve: Boolean;
@@ -301,10 +299,8 @@ begin
   end;
   ReadyG(g);
   { Starving: the waiter owns the mutex now and runs next, on this M,
-    while this routine waits at the tail of the queue (Go's handoff).
-    One that does not yield parks at once, and the waiter readied on
-    this P runs next all the same. }
-  if starve and MayYield then
+    while this routine waits at the tail of the queue (Go's handoff). }
+  if starve then
     Goyield;
 end;
 
@@ -314,7 +310,7 @@ var
 begin
   nw := AtomicAdd(@M.State, -1);
   if nw <> 0 then
-    MutexUnlockSlow(M, nw, True);
+    MutexUnlockSlow(M, nw);
 end;
 
 { Go's TryLock: a free mutex is taken even with waiters parked, unless
@@ -492,30 +488,74 @@ end;
 
 { ---- cond ---- }
 
+const
+  CondTicketMask = High(Integer);
+  CondTicketHalf = 4611686018427387904;
+  { A G can wait on a cond or in the poller. Poll generations at G+192
+    are positive and at most 65536. A cond ticket uses the sign bit, so
+    even a stale poll event cannot claim it. The sync queue links at
+    G+232 are the same ones QWaitBack and QWake1 use. }
+  GWaitToken = 192;
+  GSyncNext = 232;
+
+{ Go sync.Cond.Wait and runtime/sema.go's notifyList reserve a ticket
+  before dropping the caller's mutex. The queue lock is taken after
+  the unlock. An earlier notification advances the ticket and this
+  routine skips the park. The counters are modulo 2^63. A difference
+  with bit 62 set is behind the notification counter. }
 procedure PasCondWait(var C: TPasCond; var M: TPasMutex);
 var
-  nw: Integer;
+  ticket: Integer;
 begin
-  { Queue first, then release the mutex, then park: a Signal that lands
-    between the release and the park still finds this routine queued.
-    The mutex is let go without a yield, for the queue's lock is held
-    (P672; Go's Wait takes a ticket and holds no lock while it unlocks,
-    sync/cond.go and runtime/sema.go notifyListAdd and notifyListWait) }
+  ticket := ((AtomicAdd(@C.Waited, 1) and CondTicketMask) - 1) and CondTicketMask;
+  PasMutexUnlock(M);
   SpinLock(@C.Spin);
-  QWait(@C.Head);
-  nw := AtomicAdd(@M.State, -1);
-  if nw <> 0 then
-    MutexUnlockSlow(M, nw, False);
-  ParkUnlock(@C.Spin);
+  if ((ticket - C.Notified) and CondTicketHalf) <> 0 then
+    SpinUnlock(@C.Spin)
+  else
+  begin
+    QWaitBack(@C.Head);
+    AtomicStore(PInt64(Pointer(C.Tail + GWaitToken))^, ticket or Low(Integer));
+    ParkUnlock(@C.Spin);
+  end;
   PasMutexLock(M);
 end;
 
 procedure PasCondSignal(var C: TPasCond);
 var
-  g: Integer;
+  g, prev, ticket, tagged: Integer;
+  link: PInt64;
 begin
+  if (AtomicLoad(C.Waited) and CondTicketMask) = AtomicLoad(C.Notified) then
+    Exit;
   SpinLock(@C.Spin);
-  g := QWake1(@C.Head);
+  ticket := C.Notified;
+  if (AtomicLoad(C.Waited) and CondTicketMask) = ticket then
+  begin
+    SpinUnlock(@C.Spin);
+    Exit;
+  end;
+  { Modulo 2^63, subtracting the mask advances one without overflow. }
+  AtomicStore(C.Notified, (ticket - CondTicketMask) and CondTicketMask);
+  tagged := ticket or Low(Integer);
+  prev := 0;
+  link := @C.Head;
+  g := link^;
+  while g <> 0 do
+  begin
+    if AtomicLoad(PInt64(Pointer(g + GWaitToken))^) = tagged then
+    begin
+      link^ := PInt64(Pointer(g + GSyncNext))^;
+      if C.Tail = g then
+        C.Tail := prev;
+      PInt64(Pointer(g + GSyncNext))^ := 0;
+      AtomicStore(PInt64(Pointer(g + GWaitToken))^, 0);
+      Break;
+    end;
+    prev := g;
+    link := PInt64(Pointer(g + GSyncNext));
+    g := link^;
+  end;
   SpinUnlock(@C.Spin);
   if g <> 0 then
     ReadyG(g);
@@ -523,16 +563,23 @@ end;
 
 procedure PasCondBroadcast(var C: TPasCond);
 var
-  g: Integer;
+  head, g: Integer;
 begin
+  if (AtomicLoad(C.Waited) and CondTicketMask) = AtomicLoad(C.Notified) then
+    Exit;
   SpinLock(@C.Spin);
-  g := QWake1(@C.Head);
+  head := C.Head;
+  C.Head := 0;
+  C.Tail := 0;
+  AtomicStore(C.Notified, AtomicLoad(C.Waited) and CondTicketMask);
+  SpinUnlock(@C.Spin);
+  g := QWake1(@head);
   while g <> 0 do
   begin
+    AtomicStore(PInt64(Pointer(g + GWaitToken))^, 0);
     ReadyG(g);
-    g := QWake1(@C.Head);
+    g := QWake1(@head);
   end;
-  SpinUnlock(@C.Spin);
 end;
 
 { ---- once ---- }
