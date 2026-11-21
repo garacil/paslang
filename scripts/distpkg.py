@@ -60,7 +60,7 @@ LONG = [
     "-debug carries its own debugger, and pasdbg is its terminal.",
 ]
 LICENSE = ["GPL-3.0-or-later", "GPL-3.0-or-later WITH AdditionRef-paslang-Runtime-Library-exception-1.0",
-           "GFDL-1.3-no-invariants-or-later", "BSD-3-Clause"]
+           "GFDL-1.3-no-invariants-or-later", "BSD-3-Clause", "Unicode-3.0"]
 COPYRIGHT = """Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: paslang
 Upstream-Contact: Germán Luis Aracil Boned <garacilb@gmail.com>
@@ -82,6 +82,12 @@ Comment: the SHA-1, SHA-256, SHA-512 and CRC kernels follow the assembly
 Copyright: 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
  2009 The Go Authors
 License: GPL-3+ with paslang Runtime Library exception and BSD-3-clause
+
+Files: src/lib/paspdf.paslang
+Comment: the PDF bidirectional class ranges are derived from Unicode 18.0.0.
+Copyright: 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+ 1991-2026 Unicode, Inc.
+License: GPL-3+ with paslang Runtime Library exception and Unicode-3.0
 
 Files: docs/*
 Copyright: 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
@@ -112,6 +118,9 @@ License: GPL-3+ with paslang Runtime Library exception
 
 License: BSD-3-clause
  The complete text of Go's license is in /usr/share/doc/paslang/LICENSE-GO.
+
+License: Unicode-3.0
+ The complete Unicode license is in /usr/share/doc/paslang/LICENSE-UNICODE.
 
 License: GFDL-NIV-1.3+
  Permission is granted to copy, distribute and/or modify this document
@@ -247,7 +256,8 @@ options=('!strip' '!debug' '!emptydirs')
 package() {
   cp -a '%(root)s/usr' "$pkgdir/"
   install -Dm644 -t "$pkgdir/usr/share/licenses/paslang" \\
-    '%(root)s/usr/share/doc/paslang/COPYING.RUNTIME' '%(root)s/usr/share/doc/paslang/LICENSE-GO'
+    '%(root)s/usr/share/doc/paslang/COPYING.RUNTIME' '%(root)s/usr/share/doc/paslang/LICENSE-GO' \\
+    '%(root)s/usr/share/doc/paslang/LICENSE-UNICODE'
 }
 """ % {"v": v, "summary": SUMMARY, "url": URL, "root": root,
        "license": " ".join("'%s'" % l for l in LICENSE)}

@@ -761,6 +761,63 @@ region_case('page_region_widget', p.build(root), txt('Body\nÉß\nOutside'),
             txt('Body\nÉ'), txt('Body\nÉ'))
 
 
+# P519. Assign a character code to each visual glyph. A single glyph may
+# map to more than one Unicode character through ToUnicode.
+def bidi_case(name, visual, logical, cmp=True, individually=False):
+    p = Pdf()
+    glyphs = dict.fromkeys(visual)
+    codes = {glyph: i + 32 for i, glyph in enumerate(glyphs)}
+    cmap = ("/CIDInit /ProcSet findresource begin 12 dict begin begincmap\n"
+            "/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n"
+            "/CMapName /VisualText def /CMapType 2 def\n"
+            "1 begincodespacerange\n<00> <FF>\nendcodespacerange\n"
+            f"{len(glyphs)} beginbfchar\n")
+    for glyph, code in codes.items():
+        cmap += f"<{code:02X}> <{glyph.encode('utf-16be').hex().upper()}>\n"
+    cmap += "endbfchar\nendcmap CMapName currentdict /CMap defineresource pop end end"
+    mapping = p.stream('', cmap.encode('ascii'))
+    f = font_simple(p, extra=f'/ToUnicode {mapping} 0 R')
+    if individually:
+        shows = ' '.join(f'1 0 0 1 {20 + 6 * i} 100 Tm <{codes[g]:02X}> Tj'
+                         for i, g in reversed(list(enumerate(visual))))
+        content = 'BT /Helv 10 Tf ' + shows + ' ET'
+    else:
+        content = 'BT /Helv 10 Tf 20 100 Td <%s> Tj ET' % bytes(codes[g] for g in visual).hex()
+    p, root = one_page(content, {'Helv': f}, p=p)
+    case(name, 'text', p.build(root), txt(logical), cmp=cmp)
+
+
+bidi_case('bidi_hebrew', 'םולש', 'שלום')
+bidi_case('bidi_hebrew_positioned', 'םולש', 'שלום', individually=True)
+bidi_case('bidi_arabic', 'مالس', 'سلام')
+bidi_case('bidi_number', '123 مالس', 'سلام 123')
+bidi_case('bidi_indic_number', '١٢٣ مالس', 'سلام ١٢٣')
+bidi_case('bidi_latin_number', 'Invoice 45 مالس', 'Invoice 45 سلام')
+bidi_case('bidi_latin_in_rtl', 'ABC مالس', 'سلام ABC')
+bidi_case('bidi_brackets_rtl', '(םולש)', '(שלום)', cmp=False)
+bidi_case('bidi_brackets_ltr', 'Invoice (םולש)', 'Invoice (שלום)', cmp=False)
+bidi_case('bidi_decimal', '$45.30 مالس', 'سلام $45.30', cmp=False)
+bidi_case('bidi_glyph_cluster', ('ם', 'ו', 'ֹ', 'ל', 'שָ'), 'שָלוֹם', cmp=False)
+bidi_case('bidi_arabic_ligature', ('م', 'لا', 'س'), 'سلام', cmp=False)
+bidi_case('bidi_explicit_control', '\u202bسلام\u202c', '\u202bسلام\u202c', cmp=False)
+
+
+# A replacement keeps its given character order when moved around ordinary
+# visual text. Check the same document in all-text, visible and raw modes.
+p = Pdf()
+cmap = p.stream('', b'4 beginbfchar\n<61> <0645>\n<62> <0627>\n'
+                    b'<63> <0644>\n<64> <0633>\nendbfchar')
+f = font_simple(p, extra=f'/ToUnicode {cmap} 0 R')
+replacement = ('שלום'.encode('utf-16be')).hex()
+c = ('BT /Helv 10 Tf 20 90 Td (123 ) Tj '
+     f'/Span << /ActualText <FEFF{replacement}> >> BDC (??) Tj EMC ( abcd) Tj ET '
+     'BT /Helv 10 Tf 20 60 Td (abcd) Tj ET '
+     'BT /Helv 10 Tf -1 0 0 1 52 30 Tm (dcba) Tj ET')
+p, root = one_page(c, {'Helv': f}, mediabox='[0 0 68 100]', p=p)
+region_case('bidi_region', p.build(root), txt('سلام שלום 123\nسلام\nسلام'),
+            txt('ام שלום 123\nسلام\nسلام'), txt('123 שלום ما\nمالس\nسلام'))
+
+
 def real_samples():
     """the files other programs made (cairo, Skia, LibreOffice, Ghostscript,
     groff, librsvg), kept as they are in testdata/pdfreal with the text each
@@ -800,9 +857,14 @@ def verify():
         if valid and kind == 'text':
             t = subprocess.run(['pdftotext', '-layout', fn, '-'], capture_output=True, text=True).stdout
             import unicodedata
+            if name.startswith('bidi_'):
+                # Poppler emits explicit embedding delimiters around RTL text.
+                t = t.translate({0x202A: None, 0x202B: None, 0x202C: None})
             a = re.findall(r'\S+', unicodedata.normalize('NFKC', t))
             b = re.findall(r'\S+', unicodedata.normalize('NFKC', expect.decode('utf-8')))
             if cmp and a != b:
+                if name.startswith('bidi_'):
+                    bad += 1
                 print('pdftotext differs on', name)
                 print('  pdftotext:', ' '.join(a)[:160])
                 print('  expected :', ' '.join(b)[:160])

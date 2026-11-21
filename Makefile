@@ -1748,6 +1748,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	: paspdfenc is what scripts/gen_pdfenc.py writes and testdata/pdftext.txt what scripts/gen_pdf_tests.py writes, P476; \
 	python3 -I scripts/gen_pdfenc.py --check; \
 	python3 -I scripts/gen_pdf_tests.py --check; \
+	python3 -I scripts/gen_pdf_bidi.py --check; \
 	: paspdfafm is what scripts/gen_pdfafm.py writes and testdata/pdfform.txt what scripts/gen_pdf_forms.py writes, P437; \
 	python3 -I scripts/gen_pdfafm.py --check; \
 	python3 -I scripts/gen_pdf_forms.py --check; \
@@ -7815,7 +7816,7 @@ install-strip:
 # bin (lib/paslang/aarch64 for the arm64 target). The amd64 archive also
 # carries the arm64 units, so its compiler can compile for arm64 with the
 # cross binutils. build/pkg/paslang-<version>-linux-<machine>.tar.gz.
-PKGDOCS := README.md AUTHORS COPYING COPYING.RUNTIME COPYING.DOC LICENSE-GO docs/MANUAL.md docs/HELP.md docs/TYPES.md \
+PKGDOCS := README.md AUTHORS COPYING COPYING.RUNTIME COPYING.DOC LICENSE-GO LICENSE-UNICODE docs/MANUAL.md docs/HELP.md docs/TYPES.md \
 	docs/GC.md docs/QUAD.md docs/KERNELS.md docs/VISION.md docs/CONSTRAINTS.md docs/SQLITE_GUIDE.md
 package: all compilers $(OUTDIR)/pasdbg
 	@set -e; \

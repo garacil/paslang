@@ -48,8 +48,8 @@
   for Courier); with no Encoding they are in StandardEncoding, Symbol and
   ZapfDingbats in their own built-in encodings (P495).
 
-  Text: PageText gives a page in lines from the top down, each from left
-  to right, a space where the gap between two strings is wider than 0.15
+  Text: PageText gives a page in lines from the top down, in reading
+  order, with a space where the gap between two strings is wider than 0.15
   of the font's size (and inside a TJ array where an adjustment is 0.18 of
   it or more); PageTextRaw gives it in the order the content stream shows
   it, a line break where the baseline changes. Text drawn invisible (mode
@@ -148,6 +148,11 @@ type
     First: Integer;
   end;
 
+  TPdfTextSpan = record
+    First, Last: Integer;
+  end;
+  TPdfTextSpans = array of TPdfTextSpan;
+
   { one string shown on a page: where it starts and ends (device space,
     the point on the baseline), the font's size in device units, its text }
   TPdfRun = record
@@ -164,6 +169,7 @@ type
     DX: Double;
     DY: Double;
     Text: string;
+    LogicalSpans: TPdfTextSpans;
   end;
 
   TPdfRunList = record
@@ -281,9 +287,8 @@ type
     function PageCount: Integer;
     function PageObject(I: Integer): TPdfObj;
     { the text of page I (from 0): the text in lines, the lines from the
-      top of the page down, and the runs of a line from left to right,
-      with a space where the gap between two is wider than 0.15 of the
-      font's size. UTF-8. }
+      top of the page down, with horizontal text in reading order and
+      spaces inferred from the gaps between runs. UTF-8. }
     function PageText(I: Integer): string;
     { the same in the order the content stream shows it: a line break
       where the next run starts on another line }
@@ -4231,6 +4236,8 @@ type
     Tm: TPdfMat;
     Tlm: TPdfMat;
     SB: TStringBuilder;
+    RunLogicalSpans: TPdfTextSpans;
+    RunLogicalCount: Integer;
     RunOpen: Boolean;
     RunsFull: Boolean;
     RunX0, RunY0, RunFS: Double;
@@ -4291,6 +4298,7 @@ type
     procedure SetTextBox(Page: TPdfObj);
     function GlyphVisible(X0, Y0, X1, Y1: Double): Boolean;
     procedure OpenRun(const M: TPdfMat);
+    procedure AddLogicalText(const Text: string);
     procedure ShowActualText;
     function FontFor(Res: TPdfObj; const AName: string): TPdfFont;
     procedure Show(const S: string; Start, Len: Integer);
@@ -4441,6 +4449,8 @@ begin
   MCN := 0;
   MCActive := -1;
   MCShown := False;
+  RunLogicalSpans := nil;
+  RunLogicalCount := 0;
   MCOver := 0;
   MCBase := 0;
   PageWork := 0;
@@ -4656,6 +4666,13 @@ begin
   SBSpace := False;
   SBGap := False;
   r.Text := SB.ToString;
+  if RunLogicalCount > 0 then
+  begin
+    SetLength(RunLogicalSpans, RunLogicalCount);
+    r.LogicalSpans := RunLogicalSpans;
+    RunLogicalSpans := nil;
+    RunLogicalCount := 0;
+  end;
   SB.Reset;
   if Runs.N >= MaxRuns then
   begin
@@ -4766,12 +4783,31 @@ begin
     RunFS := Abs(GS.Tfs) * Sqrt(m.A * m.A + m.B * m.B);
 end;
 
+{ Replacement text and multi-character Unicode glyph mappings are already in
+  character order within the span. Keep that order when moving the span. }
+procedure TPdfExtractor.AddLogicalText(const Text: string);
+var
+  k, bytes: Integer;
+begin
+  bytes := Length(Text);
+  if bytes > 0 then
+  begin
+    k := RunLogicalCount;
+    if k = Length(RunLogicalSpans) then
+      SetLength(RunLogicalSpans, (k + 4) * 2);
+    RunLogicalCount := k + 1;
+    RunLogicalSpans[k].First := SB.ByteLength + 1;
+    RunLogicalSpans[k].Last := SB.ByteLength + bytes;
+  end;
+  SB.AddText(Text);
+end;
+
 procedure TPdfExtractor.ShowActualText;
 begin
   if MCShown then
     Exit;
   MCShown := True;
-  SB.AddText(MCText[MCActive]);
+  AddLogicalText(MCText[MCActive]);
   RunGlyphs := RunGlyphs + 1;
   SBSpace := (MCText[MCActive] <> '') and (MCText[MCActive][Length(MCText[MCActive])] = ' ');
 end;
@@ -4779,7 +4815,7 @@ end;
 { a string shown with the current font: its glyphs one after another }
 procedure TPdfExtractor.Show(const S: string; Start, Len: Integer);
 var
-  i, q8, last: Integer;
+  i, q8, last, runeEnd: Integer;
   txt: string;
   w, adv, fs, ul, ux, uy, px, py, icell, x, y: Double;
   isSp, skip, visible, remember: Boolean;
@@ -4878,7 +4914,15 @@ begin
           txt := Copy(txt, 2, Length(txt));
       end;
       SBGap := False;
-      SB.AddText(txt);
+      runeEnd := 1;
+      if (Length(txt) >= 3) and (Ord(txt[1]) >= 128) then
+        PdfNextRune(txt, runeEnd)
+      else
+        runeEnd := Length(txt) + 1;
+      if runeEnd <= Length(txt) then
+        AddLogicalText(txt)
+      else
+        SB.AddText(txt);
       RunGlyphs := RunGlyphs + 1;
       if txt <> '' then
         SBSpace := txt[Length(txt)] = ' ';
@@ -5995,6 +6039,15 @@ var
   r: TPdfRun;
   i, start, first, kept: Integer;
   width, endx: Double;
+
+  procedure PutWidgetText;
+  begin
+    SetLength(r.LogicalSpans, 1);
+    r.LogicalSpans[0].First := 1;
+    r.LogicalSpans[0].Last := Length(r.Text);
+    PutRun(r);
+  end;
+
 begin
   r.X0 := X;
   r.Y0 := Y;
@@ -6007,7 +6060,7 @@ begin
   if not ClipText then
   begin
     r.Text := Text;
-    PutRun(r);
+    PutWidgetText;
     Exit;
   end;
   if not GlyphVisible(r.X0, Y, r.X1, Y) then
@@ -6044,7 +6097,7 @@ begin
   begin
     r.Glyphs := kept;
     r.Text := Copy(Text, first, i - first);
-    PutRun(r);
+    PutWidgetText;
   end;
 end;
 
@@ -6316,20 +6369,452 @@ begin
   end;
 end;
 
-{ the text of the runs by lines: from the top of the page down, each line
-  from left to right }
+{ BEGIN GENERATED PDF BIDI PROPERTIES }
+{ Unicode 18.0.0 DerivedBidiClass and BidiBrackets, generated by scripts/gen_pdf_bidi.py.
+  Unicode data copyright 2026 Unicode, Inc.
+  See LICENSE-UNICODE for the Unicode license terms. }
+type
+  TPdfBidiClass = (bdNeutral, bdLeft, bdRight, bdEuropeanNumber, bdArabicNumber,
+    bdMark, bdEuropeanSeparator, bdCommonSeparator, bdTerminator, bdControl);
+
+const
+  PdfBidiRanges: array[0..1226] of UInt32 = (
+    $00000000, $00000238, $00000260, $000002B6, $000002C7, $000002D6, $000002E7, $00000303,
+    $000003A7, $000003B0, $00000411, $000005B0, $00000611, $000007B0, $00000A07, $00000A10,
+    $00000A28, $00000A60, $00000AA1, $00000AB0, $00000B08, $00000B23, $00000B40, $00000B51,
+    $00000B60, $00000B93, $00000BA1, $00000BB0, $00000C01, $00000D70, $00000D81, $00000F70,
+    $00000F81, $00002B90, $00002BB1, $00002C20, $00002D01, $00002D20, $00002E01, $00002E50,
+    $00002EE1, $00002EF0, $00003005, $00003701, $00003740, $00003761, $000037E0, $000037F1,
+    $00003840, $00003861, $00003870, $00003881, $00003F60, $00003F71, $00004835, $000048A1,
+    $000058A0, $000058B1, $000058D0, $000058F8, $00005902, $00005915, $00005BE2, $00005BF5,
+    $00005C02, $00005C15, $00005C32, $00005C45, $00005C62, $00005C75, $00005CA2, $00006004,
+    $00006060, $00006082, $00006098, $000060B2, $000060C7, $000060D2, $000060E0, $00006105,
+    $000061B2, $000064B5, $00006604, $000066A8, $000066B4, $000066D2, $00006705, $00006712,
+    $00006D65, $00006DD4, $00006DE0, $00006DF5, $00006E52, $00006E75, $00006E90, $00006EA5,
+    $00006EE2, $00006F03, $00006FA2, $00007115, $00007122, $00007305, $000074B2, $00007A65,
+    $00007B12, $00007EB5, $00007F42, $00007F60, $00007FA2, $00007FD5, $00007FE2, $00008165,
+    $000081A2, $000081B5, $00008242, $00008255, $00008282, $00008295, $000082E2, $00008595,
+    $000085C2, $00008904, $00008922, $00008975, $00008A02, $00008CA5, $00008E24, $00008E35,
+    $00009031, $000093A5, $000093B1, $000093C5, $000093D1, $00009415, $00009491, $000094D5,
+    $000094E1, $00009515, $00009581, $00009625, $00009641, $00009815, $00009821, $00009BC5,
+    $00009BD1, $00009C15, $00009C51, $00009CD5, $00009CE1, $00009E25, $00009E41, $00009F28,
+    $00009F41, $00009FB8, $00009FC1, $00009FE5, $00009FF1, $0000A015, $0000A031, $0000A3C5,
+    $0000A3D1, $0000A415, $0000A431, $0000A475, $0000A491, $0000A4B5, $0000A4E1, $0000A515,
+    $0000A521, $0000A705, $0000A721, $0000A755, $0000A761, $0000A815, $0000A831, $0000ABC5,
+    $0000ABD1, $0000AC15, $0000AC61, $0000AC75, $0000AC91, $0000ACD5, $0000ACE1, $0000AE25,
+    $0000AE41, $0000AF18, $0000AF21, $0000AFA5, $0000B001, $0000B015, $0000B021, $0000B3C5,
+    $0000B3D1, $0000B3F5, $0000B401, $0000B415, $0000B451, $0000B4D5, $0000B4E1, $0000B535,
+    $0000B571, $0000B625, $0000B641, $0000B825, $0000B831, $0000BC05, $0000BC11, $0000BCD5,
+    $0000BCE1, $0000BF30, $0000BF98, $0000BFA0, $0000BFB1, $0000C005, $0000C011, $0000C045,
+    $0000C051, $0000C3C5, $0000C3D1, $0000C3E5, $0000C411, $0000C465, $0000C491, $0000C4A5,
+    $0000C4E1, $0000C555, $0000C571, $0000C625, $0000C641, $0000C780, $0000C7F1, $0000C815,
+    $0000C821, $0000CBC5, $0000CBD1, $0000CCC5, $0000CCE1, $0000CE25, $0000CE41, $0000D005,
+    $0000D021, $0000D3B5, $0000D3D1, $0000D415, $0000D451, $0000D4D5, $0000D4E1, $0000D625,
+    $0000D641, $0000D815, $0000D821, $0000DCA5, $0000DCB1, $0000DD25, $0000DD51, $0000DD65,
+    $0000DD71, $0000E315, $0000E321, $0000E345, $0000E3B1, $0000E3F8, $0000E401, $0000E475,
+    $0000E4F1, $0000EB15, $0000EB21, $0000EB45, $0000EBD1, $0000EC85, $0000ECF1, $0000F185,
+    $0000F1A1, $0000F355, $0000F361, $0000F375, $0000F381, $0000F395, $0000F3A0, $0000F3E1,
+    $0000F715, $0000F7F1, $0000F805, $0000F851, $0000F865, $0000F881, $0000F8D5, $0000F981,
+    $0000F995, $0000FBD1, $0000FC65, $0000FC71, $000102D5, $00010311, $00010325, $00010381,
+    $00010395, $000103B1, $000103D5, $000103F1, $00010585, $000105A1, $000105E5, $00010611,
+    $00010715, $00010751, $00010825, $00010831, $00010855, $00010871, $000108D5, $000108E1,
+    $000109D5, $000109E1, $000135D5, $00013601, $00013900, $000139A1, $00014000, $00014011,
+    $00016800, $00016811, $000169B0, $000169D1, $00017125, $00017151, $00017325, $00017341,
+    $00017525, $00017541, $00017725, $00017741, $00017B45, $00017B61, $00017B75, $00017BE1,
+    $00017C65, $00017C71, $00017C95, $00017D41, $00017DB8, $00017DC1, $00017DD5, $00017DE1,
+    $00017F00, $00017FA1, $00018000, $000180B5, $000180E0, $000180F5, $00018101, $00018855,
+    $00018871, $00018A95, $00018AA1, $00019205, $00019231, $00019275, $00019291, $00019325,
+    $00019331, $00019395, $000193C1, $00019400, $00019411, $00019440, $00019461, $00019DE0,
+    $0001A001, $0001A175, $0001A191, $0001A1B5, $0001A1C1, $0001A565, $0001A571, $0001A585,
+    $0001A5F1, $0001A605, $0001A611, $0001A625, $0001A631, $0001A655, $0001A6D1, $0001A735,
+    $0001A7D1, $0001A7F5, $0001A801, $0001AB05, $0001AF11, $0001B005, $0001B041, $0001B345,
+    $0001B351, $0001B365, $0001B3A1, $0001B6B5, $0001B741, $0001B805, $0001B821, $0001BA25,
+    $0001BA61, $0001BA85, $0001BAA1, $0001BAB5, $0001BAE1, $0001BE65, $0001BE71, $0001BE85,
+    $0001BEA1, $0001BED5, $0001BEE1, $0001BEF5, $0001BF21, $0001C2C5, $0001C341, $0001C365,
+    $0001C381, $0001CD05, $0001CD31, $0001CD45, $0001CE11, $0001CE25, $0001CE91, $0001CED5,
+    $0001CEE1, $0001CF45, $0001CF51, $0001CF85, $0001CFA1, $0001DC05, $0001E001, $0001FBD0,
+    $0001FBE1, $0001FBF0, $0001FC21, $0001FCD0, $0001FD01, $0001FDD0, $0001FE01, $0001FED0,
+    $0001FF01, $0001FFD0, $0001FFF1, $00020000, $000200E1, $000200F2, $00020100, $000202A9,
+    $000202F7, $00020308, $00020350, $00020447, $00020450, $00020669, $000206A0, $00020703,
+    $00020711, $00020743, $000207A6, $000207C0, $000207F1, $00020803, $000208A6, $000208C0,
+    $00020901, $00020A08, $00020D05, $00020F11, $00021000, $00021021, $00021030, $00021071,
+    $00021080, $000210A1, $00021140, $00021151, $00021160, $00021191, $000211E0, $00021241,
+    $00021250, $00021261, $00021270, $00021281, $00021290, $000212A1, $000212E8, $000212F1,
+    $000213A0, $000213C1, $00021400, $00021451, $000214A0, $000214E1, $00021500, $00021601,
+    $00021890, $000218C1, $00021900, $00022126, $00022138, $00022140, $00023361, $000237B0,
+    $00023951, $00023960, $000242A1, $00024400, $000244B1, $00024600, $00024883, $000249C1,
+    $00024EA0, $00026AC1, $00026AD0, $00028001, $00029000, $0002B741, $0002B760, $0002C001,
+    $0002CE50, $0002CEB1, $0002CEF5, $0002CF21, $0002CF90, $0002D001, $0002D7F5, $0002D801,
+    $0002DE05, $0002E000, $0002E5E1, $0002E600, $0002E641, $0002E800, $0002E9A1, $0002E9B0,
+    $0002EF41, $0002F000, $0002FD61, $0002FF00, $00030051, $00030080, $00030211, $000302A5,
+    $000302E1, $00030300, $00030311, $00030360, $00030381, $000303D0, $00030401, $00030995,
+    $000309B0, $000309D1, $00030A00, $00030A11, $00030FB0, $00030FC1, $00031C00, $00031E61,
+    $00031EF0, $00031F01, $000321D0, $000321F1, $00032500, $00032601, $000327C0, $000327F1,
+    $00032B10, $00032C01, $00032CC0, $00032D01, $00033770, $000337B1, $00033DE0, $00033E01,
+    $00033FF0, $00034001, $0004DC00, $0004E001, $000A4900, $000A4C71, $000A60D0, $000A6101,
+    $000A66F5, $000A6730, $000A6745, $000A67E0, $000A6801, $000A69E5, $000A6A01, $000A6F05,
+    $000A6F21, $000A7000, $000A7221, $000A7880, $000A7891, $000A8025, $000A8031, $000A8065,
+    $000A8071, $000A80B5, $000A80C1, $000A8255, $000A8271, $000A8280, $000A82C5, $000A82D1,
+    $000A8388, $000A83A1, $000A8740, $000A8781, $000A8C45, $000A8C61, $000A8E05, $000A8F21,
+    $000A8FF5, $000A9001, $000A9265, $000A92E1, $000A9475, $000A9521, $000A9805, $000A9831,
+    $000A9B35, $000A9B41, $000A9B65, $000A9BA1, $000A9BC5, $000A9BE1, $000A9E55, $000A9E61,
+    $000AA295, $000AA2F1, $000AA315, $000AA331, $000AA355, $000AA371, $000AA435, $000AA441,
+    $000AA4C5, $000AA4D1, $000AA7C5, $000AA7D1, $000AAB05, $000AAB11, $000AAB25, $000AAB51,
+    $000AAB75, $000AAB91, $000AABE5, $000AAC01, $000AAC15, $000AAC21, $000AAEC5, $000AAEE1,
+    $000AAF65, $000AAF71, $000AB6A0, $000AB6C1, $000ABE55, $000ABE61, $000ABE85, $000ABE91,
+    $000ABED5, $000ABEE1, $000FB1D2, $000FB1E5, $000FB1F2, $000FB296, $000FB2A2, $000FBC30,
+    $000FBD32, $000FD3E0, $000FD502, $000FD900, $000FD922, $000FDC80, $000FDF02, $000FDFD0,
+    $000FE005, $000FE100, $000FE1A1, $000FE205, $000FE300, $000FE507, $000FE510, $000FE527,
+    $000FE531, $000FE540, $000FE557, $000FE560, $000FE5F8, $000FE600, $000FE626, $000FE640,
+    $000FE671, $000FE680, $000FE698, $000FE6B0, $000FE6C1, $000FE702, $000FEFF0, $000FF001,
+    $000FF010, $000FF038, $000FF060, $000FF0B6, $000FF0C7, $000FF0D6, $000FF0E7, $000FF103,
+    $000FF1A7, $000FF1B0, $000FF211, $000FF3B0, $000FF411, $000FF5B0, $000FF661, $000FFE08,
+    $000FFE20, $000FFE58, $000FFE71, $000FFE80, $000FFEF1, $000FFF00, $00100001, $00101010,
+    $00101021, $00101400, $001018D1, $00101900, $001019D1, $00101A00, $00101A11, $00101FD5,
+    $00101FE1, $00102E05, $00102E13, $00102FC1, $00103765, $001037B1, $00108002, $001091F0,
+    $00109202, $0010A015, $0010A042, $0010A055, $0010A072, $0010A0C5, $0010A102, $0010A385,
+    $0010A3B2, $0010A3F5, $0010A402, $0010AE55, $0010AE72, $0010B390, $0010B402, $0010D245,
+    $0010D282, $0010D304, $0010D3A2, $0010D404, $0010D4A2, $0010D695, $0010D6E0, $0010D6F2,
+    $0010E604, $0010E7F2, $0010EAB5, $0010EAD2, $0010ECB5, $0010ED00, $0010ED92, $0010EF05,
+    $0010F002, $0010F465, $0010F512, $0010F825, $0010F862, $00110001, $00110015, $00110021,
+    $00110385, $00110471, $00110520, $00110661, $00110705, $00110711, $00110735, $00110751,
+    $001107F5, $00110821, $00110B35, $00110B71, $00110B95, $00110BB1, $00110C25, $00110C31,
+    $00111005, $00111031, $00111275, $001112C1, $001112D5, $00111351, $00111735, $00111741,
+    $00111805, $00111821, $00111B65, $00111BF1, $00111C95, $00111CD1, $00111CF5, $00111D01,
+    $001122F5, $00112321, $00112345, $00112351, $00112365, $00112381, $001123E5, $001123F1,
+    $00112415, $00112421, $00112DF5, $00112E01, $00112E35, $00112EB1, $00113005, $00113021,
+    $001133B5, $001133D1, $00113405, $00113411, $00113665, $001136D1, $00113705, $00113751,
+    $00113BB5, $00113C11, $00113CE5, $00113CF1, $00113D05, $00113D11, $00113D25, $00113D31,
+    $00113E15, $00113E31, $00114385, $00114401, $00114425, $00114451, $00114465, $00114471,
+    $001145E5, $001145F1, $00114B35, $00114B91, $00114BA5, $00114BB1, $00114BF5, $00114C11,
+    $00114C25, $00114C41, $00115B25, $00115B61, $00115BC5, $00115BE1, $00115BF5, $00115C11,
+    $00115DC5, $00115DE1, $00116335, $001163B1, $001163D5, $001163E1, $001163F5, $00116411,
+    $00116600, $001166D1, $00116AB5, $00116AC1, $00116AD5, $00116AE1, $00116B05, $00116B61,
+    $00116B75, $00116B81, $001171D5, $001171E1, $001171F5, $00117201, $00117225, $00117261,
+    $00117275, $001172C1, $001182F5, $00118381, $00118395, $001183B1, $001193B5, $001193D1,
+    $001193E5, $001193F1, $00119435, $00119441, $00119D45, $00119D81, $00119DA5, $00119DC1,
+    $00119E05, $00119E11, $0011A015, $0011A071, $0011A095, $0011A0B1, $0011A335, $0011A391,
+    $0011A3B5, $0011A3F1, $0011A475, $0011A481, $0011A515, $0011A571, $0011A595, $0011A5C1,
+    $0011A8A5, $0011A971, $0011A985, $0011A9A1, $0011B605, $0011B611, $0011B625, $0011B651,
+    $0011B665, $0011B671, $0011C305, $0011C371, $0011C385, $0011C3E1, $0011C925, $0011CA81,
+    $0011CAA5, $0011CB11, $0011CB25, $0011CB41, $0011CB55, $0011CB71, $0011D315, $0011D371,
+    $0011D3A5, $0011D3B1, $0011D3C5, $0011D3E1, $0011D3F5, $0011D461, $0011D475, $0011D481,
+    $0011D905, $0011D921, $0011D955, $0011D961, $0011D975, $0011D981, $0011DF05, $0011DF11,
+    $0011EF35, $0011EF51, $0011F005, $0011F021, $0011F365, $0011F3B1, $0011F405, $0011F411,
+    $0011F425, $0011F431, $0011F5A5, $0011F5B1, $0011FD50, $0011FDD8, $0011FE10, $0011FF21,
+    $00134405, $00134411, $00134475, $00134561, $001611E5, $001612A1, $001612D5, $00161301,
+    $0016AF05, $0016AF51, $0016B305, $0016B371, $0016F4F5, $0016F501, $0016F8F5, $0016F931,
+    $0016FE20, $0016FE31, $0016FE45, $0016FE51, $001BC9D5, $001BC9F1, $001BCA00, $001BCA41,
+    $001CC000, $001CCD61, $001CCF03, $001CCFA0, $001CCFD1, $001CD000, $001CEB41, $001CEBA0,
+    $001CED11, $001CED20, $001CED51, $001CEDD0, $001CEFE1, $001CF005, $001CF2E1, $001CF305,
+    $001CF471, $001D1275, $001D1291, $001D1675, $001D16A1, $001D1730, $001D17B5, $001D1831,
+    $001D1855, $001D18C1, $001D1AA5, $001D1AE1, $001D1E90, $001D1EB1, $001D2000, $001D2425,
+    $001D2450, $001D2461, $001D25B5, $001D25D1, $001D3000, $001D3571, $001D6C10, $001D6C21,
+    $001D6DB0, $001D6DC1, $001D6FB0, $001D6FC1, $001D7150, $001D7161, $001D7350, $001D7361,
+    $001D74F0, $001D7501, $001D76F0, $001D7701, $001D7890, $001D78A1, $001D7A90, $001D7AA1,
+    $001D7C30, $001D7C41, $001D7CE3, $001D8001, $001DA005, $001DA371, $001DA3B5, $001DA6D1,
+    $001DA755, $001DA761, $001DA845, $001DA851, $001DA9B5, $001DAA01, $001DAA15, $001DAB01,
+    $001DB000, $001DB1D1, $001E0005, $001E0071, $001E0085, $001E0191, $001E01B5, $001E0221,
+    $001E0235, $001E0251, $001E0265, $001E02B1, $001E08F5, $001E0901, $001E1305, $001E1371,
+    $001E2AE5, $001E2AF1, $001E2EC5, $001E2F01, $001E2FF8, $001E3001, $001E4EC5, $001E4F01,
+    $001E5EE5, $001E5F01, $001E6E35, $001E6E41, $001E6E65, $001E6E71, $001E6EE5, $001E6F01,
+    $001E6F55, $001E6F61, $001E8002, $001E8D05, $001E8D72, $001E9445, $001E94B2, $001EEF00,
+    $001EEF22, $001F0000, $001F02C1, $001F0300, $001F0941, $001F0A00, $001F0AF1, $001F0B10,
+    $001F0C01, $001F0C10, $001F0D01, $001F0D10, $001F0F61, $001F1003, $001F10B0, $001F1101,
+    $001F12F0, $001F1301, $001F16A0, $001F1701, $001F1AD0, $001F1AE1, $001F2600, $001F2661,
+    $001F3000, $001F6DA1, $001F6DC0, $001F6ED1, $001F6F00, $001F6FD1, $001F7000, $001F7DA1,
+    $001F7DB0, $001F7DC1, $001F7E00, $001F7EC1, $001F7F00, $001F80C1, $001F8100, $001F8481,
+    $001F8500, $001F85A1, $001F8600, $001F8881, $001F8900, $001F8AE1, $001F8B00, $001F8BC1,
+    $001F8C00, $001F8C21, $001F8D00, $001F8D91, $001F9000, $001FA581, $001FA600, $001FA6E1,
+    $001FA700, $001FA7D1, $001FA800, $001FAC71, $001FAC80, $001FAC91, $001FACC0, $001FADE1,
+    $001FADF0, $001FAEC1, $001FAEF0, $001FAFB1, $001FB000, $001FB931, $001FB940, $001FBF03,
+    $001FBFA0, $001FBFB1, $001FFFE0, $00200001, $002FFFE0, $00300001, $003FFFE0, $00400001,
+    $004FFFE0, $00500001, $005FFFE0, $00600001, $006FFFE0, $00700001, $007FFFE0, $00800001,
+    $008FFFE0, $00900001, $009FFFE0, $00A00001, $00AFFFE0, $00B00001, $00BFFFE0, $00C00001,
+    $00CFFFE0, $00D00001, $00DFFFE0, $00E01005, $00E01F00, $00E10001, $00EFFFE0, $00F00001,
+    $00FFFFE0, $01000001, $010FFFE0);
+  PdfBidiBrackets: array[0..129] of UInt32 = (
+    $00280029, $00290028, $005B005D, $005D005B, $007B007D, $007D007B, $0F3A0F3B, $0F3B0F3A,
+    $0F3C0F3D, $0F3D0F3C, $169B169C, $169C169B, $20452046, $20462045, $207D207E, $207E207D,
+    $208D208E, $208E208D, $23082309, $23092308, $230A230B, $230B230A, $2329232A, $232A2329,
+    $27682769, $27692768, $276A276B, $276B276A, $276C276D, $276D276C, $276E276F, $276F276E,
+    $27702771, $27712770, $27722773, $27732772, $27742775, $27752774, $27C527C6, $27C627C5,
+    $27E627E7, $27E727E6, $27E827E9, $27E927E8, $27EA27EB, $27EB27EA, $27EC27ED, $27ED27EC,
+    $27EE27EF, $27EF27EE, $29832984, $29842983, $29852986, $29862985, $29872988, $29882987,
+    $2989298A, $298A2989, $298B298C, $298C298B, $298D2990, $298E298F, $298F298E, $2990298D,
+    $29912992, $29922991, $29932994, $29942993, $29952996, $29962995, $29972998, $29982997,
+    $29D829D9, $29D929D8, $29DA29DB, $29DB29DA, $29FC29FD, $29FD29FC, $2E222E23, $2E232E22,
+    $2E242E25, $2E252E24, $2E262E27, $2E272E26, $2E282E29, $2E292E28, $2E552E56, $2E562E55,
+    $2E572E58, $2E582E57, $2E592E5A, $2E5A2E59, $2E5B2E5C, $2E5C2E5B, $2E622E63, $2E632E62,
+    $30083009, $30093008, $300A300B, $300B300A, $300C300D, $300D300C, $300E300F, $300F300E,
+    $30103011, $30113010, $30143015, $30153014, $30163017, $30173016, $30183019, $30193018,
+    $301A301B, $301B301A, $FE59FE5A, $FE5AFE59, $FE5BFE5C, $FE5CFE5B, $FE5DFE5E, $FE5EFE5D,
+    $FF08FF09, $FF09FF08, $FF3BFF3D, $FF3DFF3B, $FF5BFF5D, $FF5DFF5B, $FF5FFF60, $FF60FF5F,
+    $FF62FF63, $FF63FF62);
+{ END GENERATED PDF BIDI PROPERTIES }
+
+type
+  TPdfBidiAtom = record
+    First, Last: Integer;
+    Bracket: UInt16;
+    Kind: TPdfBidiClass;
+  end;
+
+{ Each entry describes the range up to the next start. The low nibble
+  holds the class. }
+function PdfBidiKind(C: Integer): TPdfBidiClass;
+var
+  lo, hi, mid: Integer;
+begin
+  lo := 0;
+  hi := High(PdfBidiRanges) + 1;
+  while lo + 1 < hi do
+  begin
+    mid := (lo + hi) shr 1;
+    if Integer(PdfBidiRanges[mid] shr 4) <= C then
+      lo := mid
+    else
+      hi := mid;
+  end;
+  Result := TPdfBidiClass(PdfBidiRanges[lo] and 15);
+end;
+
+{ UAX #9 L4. For a bracket in a reversed span, recover the
+  character that would render as the PDF's painted bracket. }
+function PdfBidiBracket(C: Integer): UInt16;
+var
+  lo, hi, mid, key: Integer;
+  entry: UInt32;
+begin
+  lo := 0;
+  hi := High(PdfBidiBrackets) + 1;
+  while lo < hi do
+  begin
+    mid := (lo + hi) shr 1;
+    entry := PdfBidiBrackets[mid];
+    key := Integer(entry shr 16);
+    if key = C then
+      Exit(UInt16(entry and $FFFF));
+    if key < C then
+      lo := mid + 1
+    else
+      hi := mid;
+  end;
+  Result := 0;
+end;
+
+function PdfHasRtl(const S: string): Boolean;
+var
+  i: Integer;
+begin
+  i := 1;
+  while i <= Length(S) do
+    if Ord(S[i]) < 128 then
+      i := i + 1
+    else if PdfBidiKind(PdfNextRune(S, i)) = bdRight then
+      Exit(True);
+  Result := False;
+end;
+
+{ Recover reading order from the visual order of horizontal glyphs.
+  Use the line's strong characters to infer its direction. In a line
+  of visual text, keep number sequences and left-to-right words in
+  increasing X order, and traverse right-to-left text by decreasing X.
+  Unicode UAX #9 supplies character classes, numeric separators and
+  combining mark behavior. Explicit directional controls are already
+  suitable for Unicode consumers. }
+function PdfLogicalLine(const S: string; const Logical: TPdfTextSpans;
+  LogicalCount: Integer): string;
+var
+  atoms: array of TPdfBidiAtom;
+  n, i, j, a, k, fin, span, dest, leftCount, rightCount, cp: Integer;
+  original: Boolean;
+  kind, ch, primary, prev, side: TPdfBidiClass;
+
+  procedure Emit(first, last: Integer);
+  var
+    bytes: Integer;
+  begin
+    bytes := last - first + 1;
+    Move(S[first], Result[dest], bytes);
+    dest := dest + bytes;
+  end;
+
+  procedure EmitGroup(first, last: Integer);
+  var
+    t, byteStart: Integer;
+    bracketText: string;
+  begin
+    if atoms[first].Kind = bdRight then
+      for t := last downto first do
+      begin
+        byteStart := atoms[t].First;
+        if atoms[t].Bracket <> 0 then
+        begin
+          bracketText := PdfRuneToUtf8(atoms[t].Bracket);
+          Move(bracketText[1], Result[dest], Length(bracketText));
+          dest := dest + Length(bracketText);
+          byteStart := byteStart + Length(bracketText);
+        end;
+        if byteStart <= atoms[t].Last then
+          Emit(byteStart, atoms[t].Last);
+      end
+    else
+      Emit(atoms[first].First, atoms[last].Last);
+  end;
+
+begin
+  n := 0;
+  i := 1;
+  span := 0;
+  leftCount := 0;
+  rightCount := 0;
+  while i <= Length(S) do
+  begin
+    a := i;
+    fin := i;
+    original := (span >= LogicalCount) or (Logical[span].First <> i);
+    if not original then
+    begin
+      fin := Logical[span].Last;
+      span := span + 1;
+    end;
+    cp := PdfNextRune(S, i);
+    kind := PdfBidiKind(cp);
+    ch := kind;
+    repeat
+      case ch of
+        bdControl: Exit(S);
+        bdLeft: leftCount := leftCount + 1;
+        bdRight: rightCount := rightCount + 1;
+      end;
+      if i > fin then
+        Break;
+      ch := PdfBidiKind(PdfNextRune(S, i));
+      if (ch = bdLeft) or (ch = bdRight) then
+        if (kind <> bdLeft) and (kind <> bdRight) then
+          kind := ch;
+    until False;
+    if original and (kind = bdMark) and (n > 0) then
+      atoms[n - 1].Last := i - 1
+    else
+    begin
+      if n = Length(atoms) then
+        SetLength(atoms, (n + 16) * 2);
+      atoms[n].First := a;
+      atoms[n].Last := i - 1;
+      atoms[n].Kind := kind;
+      if original and (kind = bdNeutral) and (cp >= 40) and (cp <= $FFFF) then
+        atoms[n].Bracket := PdfBidiBracket(cp);
+      n := n + 1;
+    end;
+  end;
+  if (rightCount = 0) or (n < 2) then
+    Exit(S);
+  primary := bdLeft;
+  if rightCount > leftCount then
+    primary := bdRight;
+  { Keep decimal and grouping marks between digits and currency marks
+    adjacent to European digits with the number, following W4 and W5. }
+  for i := 1 to n - 2 do
+  begin
+    kind := atoms[i].Kind;
+    prev := atoms[i - 1].Kind;
+    if prev = atoms[i + 1].Kind then
+      if ((prev = bdEuropeanNumber) and
+          ((kind = bdEuropeanSeparator) or (kind = bdCommonSeparator))) or
+         ((prev = bdArabicNumber) and (kind = bdCommonSeparator)) then
+        atoms[i].Kind := prev;
+  end;
+  i := 0;
+  while i < n do
+  begin
+    if atoms[i].Kind <> bdTerminator then
+    begin
+      i := i + 1;
+      Continue;
+    end;
+    j := i + 1;
+    while (j < n) and (atoms[j].Kind = bdTerminator) do
+      j := j + 1;
+    if ((i > 0) and (atoms[i - 1].Kind = bdEuropeanNumber)) or
+       ((j < n) and (atoms[j].Kind = bdEuropeanNumber)) then
+      for k := i to j - 1 do
+        atoms[k].Kind := bdEuropeanNumber;
+    i := j;
+  end;
+  for i := 0 to n - 1 do
+    case atoms[i].Kind of
+      bdLeft, bdRight: ;
+      bdEuropeanNumber, bdArabicNumber: atoms[i].Kind := bdLeft;
+    else
+      atoms[i].Kind := bdNeutral;
+    end;
+  { Place spaces between different directions with the line's direction. }
+  prev := primary;
+  i := 0;
+  while i < n do
+  begin
+    if atoms[i].Kind <> bdNeutral then
+    begin
+      prev := atoms[i].Kind;
+      i := i + 1;
+      Continue;
+    end;
+    j := i + 1;
+    while (j < n) and (atoms[j].Kind = bdNeutral) do
+      j := j + 1;
+    side := primary;
+    if j < n then
+      side := atoms[j].Kind;
+    if side <> prev then
+      side := primary;
+    for k := i to j - 1 do
+      atoms[k].Kind := side;
+    i := j;
+  end;
+  SetLength(Result, Length(S));
+  dest := 1;
+  if primary = bdLeft then
+  begin
+    i := 0;
+    while i < n do
+    begin
+      j := i + 1;
+      while (j < n) and (atoms[j].Kind = atoms[i].Kind) do
+        j := j + 1;
+      EmitGroup(i, j - 1);
+      i := j;
+    end;
+  end
+  else
+  begin
+    i := n - 1;
+    while i >= 0 do
+    begin
+      j := i - 1;
+      while (j >= 0) and (atoms[j].Kind = atoms[i].Kind) do
+        j := j - 1;
+      EmitGroup(j + 1, i);
+      i := j;
+    end;
+  end;
+end;
+
+{ The text of the runs, in lines from the top of the page down. }
 function RenderLines(var L: TPdfRunList): string;
 var
-  sb: TStringBuilder;
+  sb, line, target: TStringBuilder;
   ky, kx: array of Integer;
-  n, i, j, g, a, k: Integer;
+  logical: TPdfTextSpans;
+  n, i, j, g, a, k, logicalCount, shift: Integer;
   ord1, ord2: array of Integer;
   r, p: TPdfRun;
   lineY, lineFS, fs, u, base, lim: Double;
   nh: Integer;
   hidx: array of Integer;
   rest: TPdfRunList;
-  allOne, lastSp: Boolean;
+  allOne, lastSp, rtl: Boolean;
 begin
   n := L.N;
   { the horizontal runs go by lines; the others keep the order of the
@@ -6353,6 +6838,7 @@ begin
       rest.N := rest.N + 1;
     end;
   end;
+  line := nil;
   sb := TStringBuilder.Create(1024);
   try
     if nh > 0 then
@@ -6382,14 +6868,37 @@ begin
             Break;
           j := j + 1;
         end;
-        { the runs i to j - 1 are one line; from left to right }
+        { Assemble this line from the left edge. Only a line containing
+          right-to-left text needs a separate builder and reordering. }
         k := j - i;
         SetLength(kx, k);
+        rtl := False;
         for g := 0 to k - 1 do
-          kx[g] := SafeTrunc(L.Items[hidx[ord1[i + g]]].X0 * 8);
+        begin
+          r := L.Items[hidx[ord1[i + g]]];
+          if not rtl then
+            rtl := PdfHasRtl(r.Text);
+          kx[g] := SafeTrunc(r.X0 * 8);
+        end;
+        if rtl then
+          for g := 0 to k - 1 do
+          begin
+            r := L.Items[hidx[ord1[i + g]]];
+            if r.X1 < r.X0 then
+              kx[g] := SafeTrunc(r.X1 * 8);
+          end;
         ord2 := SortedOrder(kx, k);
         if sb.ByteLength > 0 then
           sb.AddChar(#10);
+        target := sb;
+        logicalCount := 0;
+        if rtl then
+        begin
+          if line = nil then
+            line := TStringBuilder.Create(128);
+          line.Reset;
+          target := line;
+        end;
         { letter-spaced text (P518): where every run of the line is one glyph the
           least gap is the spacing of the letters, and a break is a gap well
           over it }
@@ -6405,7 +6914,12 @@ begin
             base := 1.0e30;
             for g := 1 to k - 1 do
             begin
-              u := L.Items[hidx[ord1[i + ord2[g]]]].X0 - L.Items[hidx[ord1[i + ord2[g - 1]]]].X1;
+              r := L.Items[hidx[ord1[i + ord2[g]]]];
+              p := L.Items[hidx[ord1[i + ord2[g - 1]]]];
+              if rtl then
+                u := Min(r.X0, r.X1) - Max(p.X0, p.X1)
+              else
+                u := r.X0 - p.X1;
               if u < 0 then
                 u := 0;
               if u < base then
@@ -6425,23 +6939,50 @@ begin
               fs := r.FS;
             if fs <= 0 then
               fs := 1;
-            u := r.X0 - p.X1;
+            if rtl then
+              u := Min(r.X0, r.X1) - Max(p.X0, p.X1)
+            else
+              u := r.X0 - p.X1;
             lim := SpaceGap * fs;
             if SpaceRatio * base > lim then
               lim := SpaceRatio * base;
             if lim > SpaceCap * fs then
               lim := SpaceCap * fs;
             if (u > lim) or (u < -fs) then
-              if (r.Text <> '') and (r.Text[1] <> ' ') and (sb.ByteLength > 0) and not lastSp then
+              if (r.Text <> '') and (r.Text[1] <> ' ') and not lastSp then
               begin
-                sb.AddChar(' ');
+                target.AddChar(' ');
                 lastSp := True;
               end;
           end;
-          sb.AddText(r.Text);
+          if rtl and (r.Text <> '') then
+          begin
+            shift := target.ByteLength;
+            if r.X1 < r.X0 then
+            begin
+              { The glyphs were written from right to left in this run. }
+              if logicalCount = Length(logical) then
+                SetLength(logical, (logicalCount + 8) * 2);
+              logical[logicalCount].First := shift + 1;
+              logical[logicalCount].Last := shift + Length(r.Text);
+              logicalCount := logicalCount + 1;
+            end
+            else
+              for a := 0 to Length(r.LogicalSpans) - 1 do
+              begin
+                if logicalCount = Length(logical) then
+                  SetLength(logical, (logicalCount + 8) * 2);
+                logical[logicalCount].First := shift + r.LogicalSpans[a].First;
+                logical[logicalCount].Last := shift + r.LogicalSpans[a].Last;
+                logicalCount := logicalCount + 1;
+              end;
+          end;
+          target.AddText(r.Text);
           if r.Text <> '' then
             lastSp := r.Text[Length(r.Text)] = ' ';
         end;
+        if rtl then
+          sb.AddText(PdfLogicalLine(line.ToString, logical, logicalCount));
         i := j;
       end;
     end;
@@ -6453,6 +6994,7 @@ begin
     end;
     Result := sb.ToString;
   finally
+    line.Free;
     sb.Free;
   end;
 end;

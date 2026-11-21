@@ -13294,13 +13294,20 @@ of this chapter take theirs, and what comes out is UTF-8.
 ```pascal
 d := TPdfDoc.Create(Data);         { EPdfError: not a PDF, encrypted, no catalog }
 n := d.PageCount;                  { the pages of the page tree }
-t := d.PageText(0);                { page 1 in lines, from the top down, each left to right }
+t := d.PageText(0);                { page 1 in lines, from the top down, in reading order }
 r := d.PageTextRaw(0);             { the same in the order the content stream shows it }
 all := d.Text;                     { every page, a form feed after each }
 p := d.Info('Producer');           { the document information, as UTF-8 }
 s := PdfText(Data);                { one call for the text of a file }
 for i := 0 to d.WarningCount - 1 do WriteLn(d.WarningAt(i));   { what was read round }
 ```
+- **Reading order (P519).** `PageText`, `Text` and `PdfText` infer the
+  reading order of horizontal right-to-left text from glyph placement
+  and Unicode bidirectional classes. Digits and left-to-right words keep
+  their internal order. A glyph's Unicode sequence and a marked span's
+  `ActualText` keep their internal character order. `PageTextRaw` follows
+  the content stream. Visual order can be ambiguous when the PDF omits
+  logical ordering information.
 - **Page bounds (P515).** The default region is `ptrAllText`. Use
   `PdfText(Data, ptrVisiblePage)` or set
   `d.TextRegion := ptrVisiblePage` before calling `PageText`, `PageTextRaw`
