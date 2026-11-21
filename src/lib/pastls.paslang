@@ -77,6 +77,9 @@ type
       FInPos to before FInEnd }
     FInBuf: string;
     FInPos, FInEnd: Integer;
+    { A deadline can suspend one validated record before it is opened. }
+    FPendingHeader, FPendingBody: string;
+    FPendingRead: Integer;
     FHand: string;
     { application data opened and not yet taken: FPlain from FPlainPos }
     FPlain: string;
@@ -226,6 +229,7 @@ const
   MaxPlaintext = 16384;
   { what TakeHead reads ahead of a record's head }
   RawAhead = 4096;
+  ReadTimeout = 'tls: read timeout';
   { how many records of application data go in one write }
   RecordsAWrite = 4;
   MaxUselessRecords = 16;
@@ -789,7 +793,7 @@ begin
   if not Result then
   begin
     FBroken := True;
-    if FErr = '' then
+    if (FErr = '') or (FErr = ReadTimeout) then
       FErr := 'tls: write failed';
   end;
 end;
@@ -834,7 +838,7 @@ begin
     if not FRaw.WriteAll(batch, Deadline) then
     begin
       FBroken := True;
-      if FErr = '' then
+      if (FErr = '') or (FErr = ReadTimeout) then
         FErr := 'tls: write failed';
       Exit;
     end;
@@ -884,8 +888,9 @@ begin
   Result := True;
 end;
 
-{ a record's payload of N octets: what came with its head, and the rest
-  read from the connection straight into it }
+{ A record's payload of N octets. Keep the bytes already read on a
+  deadline, as Go crypto/tls keeps them in rawInput (readFromUntil).
+  A record already in the read-ahead buffer still takes the short path. }
 function TTlsStream.TakeBody(N, Deadline: Integer; out Data: string; out Err: Integer): Boolean;
 var
   have, got, k: Integer;
@@ -893,26 +898,41 @@ begin
   Result := False;
   Err := 0;
   Data := '';
-  have := FInEnd - FInPos;
-  if have >= N then
+  if FPendingBody <> '' then
   begin
-    Data := Copy(FInBuf, FInPos, N);
-    FInPos := FInPos + N;
-    Result := True;
-    Exit;
+    Data := FPendingBody;
+    got := FPendingRead;
+    FPendingBody := '';
+    FPendingRead := 0;
+  end
+  else
+  begin
+    have := FInEnd - FInPos;
+    if have >= N then
+    begin
+      Data := Copy(FInBuf, FInPos, N);
+      FInPos := FInPos + N;
+      Result := True;
+      Exit;
+    end;
+    SetLength(Data, N);
+    if have > 0 then
+      Move(FInBuf[FInPos], Data[1], have);
+    FInPos := 1;
+    FInEnd := 1;
+    got := have;
   end;
-  SetLength(Data, N);
-  if have > 0 then
-    Move(FInBuf[FInPos], Data[1], have);
-  FInPos := 1;
-  FInEnd := 1;
-  got := have;
   while got < N do
   begin
     k := FRaw.ReadInto(@Data[got + 1], N - got, Deadline);
     if k <= 0 then
     begin
       Err := k;
+      if k = -110 then
+      begin
+        FPendingBody := Data;
+        FPendingRead := got;
+      end;
       Data := '';
       Exit;
     end;
@@ -934,18 +954,30 @@ begin
   Typ := 0;
   while True do
   begin
-    if not TakeHead(Deadline, hdr, err) then
+    if FPendingHeader <> '' then
     begin
-      if err = -110 then
-        FErr := 'tls: read timeout'
-      else if err = 0 then
-        FErr := 'EOF'
-      else
-        FErr := 'tls: read failed';
-      FBroken := err <> -110;
+      hdr := FPendingHeader;
+      FPendingHeader := '';
+    end
+    else if not TakeHead(Deadline, hdr, err) then
+    begin
       Typ := err;
+      if err = -110 then
+        FErr := ReadTimeout
+      else if err <> 0 then
+        FErr := 'tls: read failed'
+      else if FInPos < FInEnd then
+      begin
+        FErr := 'unexpected EOF';
+        Typ := -71;
+      end
+      else
+        FErr := 'EOF';
+      FBroken := err <> -110;
       Exit;
     end;
+    { A temporary read error must not hide a record diagnostic. }
+    if FErr = ReadTimeout then FErr := '';
     Typ := Ord(hdr[1]);
     vers := (Ord(hdr[2]) shl 8) or Ord(hdr[3]);
     n := (Ord(hdr[4]) shl 8) or Ord(hdr[5]);
@@ -966,8 +998,19 @@ begin
     end;
     if not TakeBody(n, Deadline, payload, err) then
     begin
-      FErr := 'unexpected EOF';
-      FBroken := True;
+      if err = -110 then
+      begin
+        FPendingHeader := hdr;
+        FErr := ReadTimeout;
+        Typ := err;
+      end
+      else
+      begin
+        if err = 0 then FErr := 'unexpected EOF'
+        else FErr := 'tls: read failed';
+        FBroken := True;
+        Typ := -71;
+      end;
       Exit;
     end;
     if (FVers = TlsVersion13) and (FRdAead <> 0) and (Typ <> RecData) and (Typ <> RecCcs) then
@@ -2233,6 +2276,9 @@ begin
     FRaw.Dispose;
     FRaw := nil;
   end;
+  FPendingHeader := '';
+  FPendingBody := '';
+  FPendingRead := 0;
 end;
 
 function TlsClient(Raw: TNetStream; Config: TTlsConfig; const Host: string; Deadline: Integer;

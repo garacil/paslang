@@ -12562,6 +12562,13 @@ tests only. Errors are Go's texts (`tls: failed to verify certificate:
 x509: ...`, `remote error: tls: handshake failure`). Every wait parks
 the routine until its deadline.
 
+A TLS application read that reaches its deadline returns `-110`. The
+next read resumes the same record with its own deadline, including when
+the first call received only part of the header or encrypted payload.
+Plaintext becomes available after the whole record is authenticated.
+A transport EOF inside a record or a connection error breaks the stream.
+A deadline during the initial handshake still fails that handshake.
+
 ```
 uses pasimap, pastls;
 c := ImapDial('correo.example.com', 993, ImapImplicit, 15000);   { IMAPS }

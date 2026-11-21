@@ -1378,6 +1378,12 @@ bench-servers: $(OUTDIR)/paslangc core libs
 
 check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch64 $(OUTDIR)/pasdbg
 	@python3 -I scripts/check_sdk_state.py capture --manifest $(BUILDDIR)/sdk-state-check.json --profile amd64 $(BUILDDIR) $(LVL_X64) --profile arm64 $(A64DIR) $(LVL_A64) --debugger amd64 $(OUTDIR)/pasdbg -- $(CORE_UNITS) $(LIB_UNITS)
+	@set -e; \
+	for cpu in base native; do \
+	  p=$(BUILDDIR)/tlsdeadline-$$cpu; \
+	  $(OUTDIR)/paslangc -cpu $$cpu -Fu $(BUILDDIR) -o $$p testdata/tlsdeadline.paslang; \
+	  python3 -I scripts/check_tls_deadlines.py $$p; \
+	done
 	@python3 scripts/check_recipes.py
 	@python3 -I -B scripts/select_walkers.py --self-test
 	@python3 -I -B scripts/check_select_diagnostics.py "$(OUTDIR)/paslangc" "$(BUILDDIR)"
@@ -6094,6 +6100,13 @@ $(BUILDDIR)/qemu-aarch64: scripts/build_qemu.py $(wildcard scripts/qemu/*.patch)
 
 check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/qemu-aarch64 libs-arm64
 	@python3 -I scripts/check_sdk_state.py capture --manifest $(BUILDDIR)/sdk-state-check-arm64.json --profile arm64 $(A64DIR) $(LVL_A64) -- $(CORE_UNITS) $(LIB_UNITS)
+	@set -e; \
+	for cpu in base max; do \
+	  p=$(BUILDDIR)/tlsdeadline-$$cpu-arm; \
+	  model=max; if [ "$$cpu" = base ]; then model=cortex-a53; fi; \
+	  $(OUTDIR)/paslangc -target arm64 -cpu $$cpu -Fu $(A64DIR) -o $$p testdata/tlsdeadline.paslang; \
+	  python3 -I scripts/check_tls_deadlines.py $(QEMU_A64) -cpu $$model $$p; \
+	done
 	@python3 -I -B scripts/select_walkers.py --self-test
 	@python3 -I -B scripts/check_select_diagnostics.py "$(OUTDIR)/paslangc-arm64" "$(BUILDDIR)" "$(QEMU_A64)" --host-arm64
 	@set -e; \

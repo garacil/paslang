@@ -1,0 +1,161 @@
+{ P670: a localhost TLS peer withholds later bytes until the client times out. }
+program tlsdeadline;
+
+uses sysutils, paslib, pasconn, pastls;
+
+type
+  TObservedStream = class(TNetStream)
+  private
+    FStream: TNetStream;
+    FExpected, FReceived: Integer;
+  public
+    constructor Create(Raw: TNetStream);
+    procedure ExpectBytes(N: Integer);
+    function ReadInto(P: Pointer; MaxN, Deadline: Integer): Integer; override;
+    function WriteAll(const Data: string; Deadline: Integer): Boolean; override;
+    procedure Dispose; override;
+    property Received: Integer read FReceived;
+  end;
+
+constructor TObservedStream.Create(Raw: TNetStream);
+begin
+  inherited Create;
+  FStream := Raw;
+end;
+
+procedure TObservedStream.ExpectBytes(N: Integer);
+begin
+  FExpected := N;
+  FReceived := 0;
+end;
+
+function TObservedStream.ReadInto(P: Pointer; MaxN, Deadline: Integer): Integer;
+begin
+  if FReceived < FExpected then
+  begin
+    if MaxN > FExpected - FReceived then
+      MaxN := FExpected - FReceived;
+    { Give the peer time to deliver the known fragment even under QEMU load.
+      Only the following read uses the short application deadline. }
+    Deadline := Nanotime + 10000000000;
+  end;
+  Result := FStream.ReadInto(P, MaxN, Deadline);
+  if Result > 0 then
+    Inc(FReceived, Result);
+end;
+
+function TObservedStream.WriteAll(const Data: string; Deadline: Integer): Boolean;
+begin
+  Result := FStream.WriteAll(Data, Deadline);
+end;
+
+procedure TObservedStream.Dispose;
+begin
+  FStream.Dispose;
+end;
+
+procedure Require(Ok: Boolean; const Msg: string);
+begin
+  if not Ok then
+  begin
+    WriteLn(Msg);
+    Halt(1);
+  end;
+end;
+
+var
+  Raw: TNetStream;
+  Observed: TObservedStream;
+  Config: TTlsConfig;
+  Conn: TTlsStream;
+  Roots, ErrorText, Mode, Data, Part: string;
+  Port, VersionWanted, N, Expected, I: Integer;
+  Sentinel: Byte;
+
+procedure ExpectTimeout(Index, Count: Integer);
+begin
+  Observed.ExpectBytes(Count);
+  Data := 'caller sentinel';
+  if Index = 3 then
+  begin
+    Sentinel := 107;
+    N := Conn.ReadInto(@Sentinel, 1, Nanotime + 200000000);
+    Require(Sentinel = 107, 'timeout modified the destination byte');
+    Data := '';
+  end
+  else
+    N := Conn.ReadSome(16384, Nanotime + 200000000, Data);
+  Require(Observed.Received = Count, 'peer fragment byte count differs');
+  Require(N = -110, 'timeout step ' + IntToStr(Index) + ': got ' +
+    IntToStr(N) + ', ' + Conn.LastError);
+  Require((Data = '') and (Conn.LastError = 'tls: read timeout'),
+    'timeout did not return an empty result and its error');
+  GcCollect;
+  Require(Conn.WriteAll('a', Nanotime + 10000000000), 'cannot acknowledge the timeout');
+end;
+
+begin
+  Port := StrToInt(ParamStr(1));
+  if ParamStr(2) = '12' then VersionWanted := TlsVersion12
+  else VersionWanted := TlsVersion13;
+  Mode := ParamStr(3);
+  Require(ReadFile(ParamStr(4), Roots), 'cannot read test roots');
+  Raw := DialTcp('127.0.0.1', Port, 10000);
+  Require(Raw <> nil, 'cannot dial test peer');
+  Observed := TObservedStream.Create(Raw);
+  Config := TTlsConfig.Create;
+  Config.RootsPem := Roots;
+  Config.ServerName := 'localhost';
+  Config.NowUnix := 1811808000;
+  Config.MinVersion := VersionWanted;
+  Config.MaxVersion := VersionWanted;
+
+  if Mode = 'handshake' then
+  begin
+    Observed.ExpectBytes(7);
+    Conn := TlsClient(Observed, Config, 'localhost', Nanotime + 500000000, ErrorText);
+    Require(Observed.Received = 7, 'first handshake fragment did not arrive');
+    Require((Conn = nil) and (ErrorText = 'tls: read timeout'),
+      'partial handshake timeout: ' + ErrorText);
+    WriteLn('ok handshake timeout');
+    Halt(0);
+  end;
+
+  Conn := TlsClient(Observed, Config, 'localhost', Nanotime + 10000000000, ErrorText);
+  Require(Conn <> nil, 'handshake failed: ' + ErrorText);
+  Require(Conn.Version = VersionWanted, 'wrong TLS version');
+  Require(Conn.WriteAll('s', Nanotime + 10000000000), 'cannot start the test peer');
+  if Mode = 'recover' then
+  begin
+    ExpectTimeout(1, 2);
+    ExpectTimeout(2, 20);
+    ExpectTimeout(3, 0);
+    ExpectTimeout(4, 4074);
+    N := Conn.ReadSome(16384, Nanotime + 10000000000, Data);
+    Require((N = 16384) and (Length(Data) = 16384), 'resumed record has the wrong length');
+    Require(Conn.LastError = '', 'completed record kept its timeout error');
+    for I := 1 to 16384 do
+      Require(Ord(Data[I]) = (((I - 1) * 131 + 17) and 255), 'resumed record byte differs');
+    N := Conn.ReadSome(64, Nanotime + 10000000000, Part);
+    Require((N = 4) and (Part = 'next'), 'next record did not survive the retry');
+    N := Conn.ReadSome(64, Nanotime + 10000000000, Part);
+    Require((N = 0) and (Part = ''), 'record-boundary EOF differs');
+    WriteLn('ok resumed record');
+  end
+  else
+  begin
+    Expected := 22;
+    if Mode = 'header-eof' then Expected := 2;
+    ExpectTimeout(1, Expected);
+    N := Conn.ReadSome(64, Nanotime + 10000000000, Data);
+    if Mode = 'reset' then ErrorText := 'tls: read failed'
+    else if Mode = 'bad-mac' then ErrorText := 'local error: tls: bad record MAC'
+    else ErrorText := 'unexpected EOF';
+    Require((N = -71) and (Data = '') and (Conn.LastError = ErrorText),
+      'terminal read: got ' + IntToStr(N) + ', ' + Conn.LastError);
+    Require(Conn.ReadSome(64, Nanotime + 10000000000, Data) = -71,
+      'a terminal error left the stream usable');
+    WriteLn('ok terminal read');
+  end;
+  Conn.Dispose;
+end.
