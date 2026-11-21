@@ -3984,6 +3984,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	timeout 120 $(QEMU_A64) $(BUILDDIR)/wgagain-arm > $(BUILDDIR)/wgagain-arm.got; \
 	diff -u testdata/wgagain.out $(BUILDDIR)/wgagain-arm.got; \
 	python3 -I scripts/check_wgreuse.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64); \
+	python3 -I scripts/check_argon2_barrier.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64); \
 	echo ok wgagain
 	@set -e; \
 	: P583: the failures of a channel are exceptions where Go panics, raised in the routine that made them, and testdata/chanfault takes every one by its class and then dies of each three ways with the same line, on both machines, while testdata/chanshut closes three thousand channels under their senders and loses no value and no sender; \

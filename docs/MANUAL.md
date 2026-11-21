@@ -12323,9 +12323,10 @@ srv.ServeUntilSignal;
 ```
 
 `uses argon2` hashes passwords with Argon2 (RFC 9106; 1.1.258, P438), on
-BLAKE2b (RFC 7693), as Go's `golang.org/x/crypto/argon2` computes it,
-each lane of each pass a routine of its own. `Argon2idHash(password)`
-gives the string a users table keeps,
+BLAKE2b (RFC 7693), as Go's `golang.org/x/crypto/argon2` computes it.
+Each lane runs in its own routine for a slice. Every lane finishes
+that slice before the next one starts (P455, P585).
+`Argon2idHash(password)` gives the string a users table keeps,
 `$argon2id$v=19$m=65536,t=3,p=4$<salt>$<tag>`: RFC 9106's second
 recommended option (64 MiB of memory, 3 passes, 4 lanes), a 16-byte
 salt from the kernel (`RandomBytes`) and a 32-byte tag, the salt and the
