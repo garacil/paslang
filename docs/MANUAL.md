@@ -4768,7 +4768,8 @@ raised at line 18`, the object's `ToString` and the raise's place, as
 below, without the calls; before, it ended in silence and a dead worker
 of a service left no trace. Concurrent uncaught raises keep each report
 together on standard error, including its location and any traceback
-(P685). In the main routine an uncaught `raise` ends the program: `paslang: uncaught raise
+(P685). The runtime owns that lock. A direct call to `PasUncaught` or
+`PasUncaughtRoutine` just writes the description. In the main routine an uncaught `raise` ends the program: `paslang: uncaught raise
 in the main routine` on the error output and exit status 1 (1.0.147;
 before, the scheduler was left with nothing to run and said
 `deadlock`). `testdata/fatal/mainraise` shows both. When the raise

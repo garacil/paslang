@@ -47,7 +47,17 @@ def check(command):
                     f'missing: {first_missing!r}\nunexpected: {first_unexpected!r}'
                 )
     check_blocked_writer(command)
-    print('ok 16 runs of 48 uncaught reports and main exit during a blocked worker report')
+    check_helpers(command)
+    print('ok uncaught reports, blocked worker, and direct reporting calls')
+
+
+def check_helpers(command):
+    run = subprocess.run(command + ['helpers'], capture_output=True, timeout=10)
+    expected = (b'paslang: uncaught raise in the main routine: EWorker: first\n'
+                b'paslang: uncaught raise in a routine, which ends alone: EWorker: second\n'
+                b'paslang: third\n')
+    if run.returncode or run.stdout or run.stderr != expected:
+        raise SystemExit(f'direct reporting calls: {run.returncode}, {run.stdout!r}, {run.stderr!r}')
 
 
 def read_ready(pipe):
@@ -76,7 +86,7 @@ def check_blocked_writer(command):
     worker = (b'paslang: uncaught raise in a routine, which ends alone: EWorker: '
               + b'x' * (1 << 20) + b', raised at line 57\n')
     main = (b'paslang: uncaught raise in the main routine: EMainFailure: main, raised at line 62\n'
-            b'  called at line 75\n')
+            b'  called at line 76\n')
     if proc.returncode != 1 or ready + out != b'main formatting\n' or prefix + err != worker + main:
         raise SystemExit(
             f'blocked report: status {proc.returncode}, stdout {ready + out!r}, '
