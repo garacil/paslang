@@ -14,10 +14,17 @@ test "$#" -gt 0
 assert_rejected() {
     rejected_source=$1
     expected_error=$2
-    if "$compiler" -target "$target" -Fu "$work_dir" -Fu "$core_dir" \
+    shift 2
+    if "$compiler" -target "$target" -Fu "$work_dir" -Fu "$core_dir" "$@" \
         -o "$work_dir/rejected" "$rejected_source" > "$work_dir/rejected.err" 2>&1; then
         echo "accepted invalid source: $rejected_source" >&2
         exit 1
+    else
+        status=$?
+        if test "$status" -ne 1; then
+            cat "$work_dir/rejected.err" >&2
+            exit "$status"
+        fi
     fi
     if ! grep -qF "$expected_error" "$work_dir/rejected.err"; then
         cat "$work_dir/rejected.err" >&2
@@ -32,13 +39,16 @@ for target in amd64 arm64; do
     mkdir -p "$work_dir"
     for level in 0 40; do
         for unit in nestedu nestedwrap nestedgu genericu generica genericb genericwrap aliasu aliaswrap \
-            shapealias shapebase shapederived shapevbase shapevderived; do
+            shapealias shapebase shapederived shapevbase shapevderived \
+            shapeextraorigin shapeextraaliasa shapeextraaliasb shapeextrabase shapeextraderived \
+            shapeheadsysutils shapeheadpassort shapeheadpasjson shapeheaduser; do
             "$compiler" -target "$target" -inline "$level" -c \
                 -Fu "$work_dir" -Fu "$core_dir" -o "$work_dir/$unit.o" \
                 "testdata/units/$unit.paslang"
         done
         for source in nestednames nestedmore nestedgeneric genericlocal gen \
-            units/nesteduse units/nestedguse units/genericprobe units/genericuse units/aliasuse units/shapeuse; do
+            units/nesteduse units/nestedguse units/genericprobe units/genericuse units/aliasuse units/shapeuse \
+            units/shapeextraab units/shapeextraba; do
             name=${source##*/}
             binary="$work_dir/$name-$level"
             "$compiler" -target "$target" -inline "$level" -Fu "$work_dir" \
@@ -51,6 +61,11 @@ for target in amd64 arm64; do
                     timeout 60 "$binary" > "$binary.got"
             fi
             diff -u "testdata/$source.out" "$binary.got"
+        done
+        for source in testdata/shapebad/*.paslang; do
+            diagnostics="${source%.paslang}.err"
+            assert_rejected "$source" "$(cat "$diagnostics")" -inline "$level"
+            diff -u "$diagnostics" "$work_dir/rejected.err"
         done
     done
     for spec in \
