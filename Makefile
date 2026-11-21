@@ -1623,10 +1623,14 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	done; \
 	echo ok stoprace; \
 	echo "==== stack maps ===="; \
-	for t in $(GOLDEN); do \
-	  PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=3 PASLANG_GCPOISON=1 timeout 300 $(BUILDDIR)/$$t > $(BUILDDIR)/$$t.vgot; \
-	  diff -u testdata/$$t.out $(BUILDDIR)/$$t.vgot; \
-	done; \
+	python3 -I scripts/check_gc_golden.py --arch amd64 --build "$(BUILDDIR)" $(GOLDEN); \
+	$(OUTDIR)/paslangc -o $(BUILDDIR)/gcwatchhang testdata/gcwatchhang.paslang; \
+	if timeout 15 python3 -I scripts/check_gc_golden.py --arch amd64 --build "$(BUILDDIR)" --limit 3 gcwatchhang > $(BUILDDIR)/gcwatchhang.log 2>&1; then \
+	  echo "the amd64 GC watchdog accepted its hanging fixture"; exit 1; \
+	else status=$$?; if [ "$$status" -ne 124 ]; then cat $(BUILDDIR)/gcwatchhang.log >&2; exit 1; fi; fi; \
+	grep -q -x -F "amd64/gcwatchhang timed out after 3 seconds" $(BUILDDIR)/gcwatchhang.log; \
+	grep -q -E "^thread [0-9]+: state .*wchan " $(BUILDDIR)/gcwatchhang.log; \
+	grep -q -x -F "GC watchdog fixture is waiting" $(BUILDDIR)/gcwatchhang.log; \
 	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 timeout 300 $(BUILDDIR)/stackmap > $(BUILDDIR)/stackmap.vgot; \
 	diff -u testdata/stackmap.out $(BUILDDIR)/stackmap.vgot; \
 	echo ok stackmaps; \
@@ -6921,11 +6925,14 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	diff -u testdata/mapsplit.out $(BUILDDIR)/mapsplit-arm.got; \
 	echo ok collector-arm; \
 	echo "==== stack maps arm64 ===="; \
-	: store1 under the stress of the collector takes 400 s of qemu on a machine half loaded and 1800 lets a loaded one finish it, P335; \
-	for t in $(GOLDEN_A64); do \
-	  PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=3 PASLANG_GCPOISON=1 timeout 1800 $(QEMU_A64) $(BUILDDIR)/$$t-arm > $(BUILDDIR)/$$t-arm.vgot; \
-	  diff -u testdata/$$t.out $(BUILDDIR)/$$t-arm.vgot; \
-	done; \
+	python3 -I scripts/check_gc_golden.py --arch arm64 --build "$(BUILDDIR)" --qemu "$(QEMU_A64)" $(GOLDEN_A64); \
+	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -o $(BUILDDIR)/gcwatchhang-arm testdata/gcwatchhang.paslang; \
+	if timeout 15 python3 -I scripts/check_gc_golden.py --arch arm64 --build "$(BUILDDIR)" --qemu "$(QEMU_A64)" --limit 3 gcwatchhang > $(BUILDDIR)/gcwatchhang-arm.log 2>&1; then \
+	  echo "the arm64 GC watchdog accepted its hanging fixture"; exit 1; \
+	else status=$$?; if [ "$$status" -ne 124 ]; then cat $(BUILDDIR)/gcwatchhang-arm.log >&2; exit 1; fi; fi; \
+	grep -q -x -F "arm64/gcwatchhang timed out after 3 seconds" $(BUILDDIR)/gcwatchhang-arm.log; \
+	grep -q -E "^thread [0-9]+: state .*wchan " $(BUILDDIR)/gcwatchhang-arm.log; \
+	grep -q -x -F "GC watchdog fixture is waiting" $(BUILDDIR)/gcwatchhang-arm.log; \
 	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=1 PASLANG_GCPOISON=1 timeout 600 $(QEMU_A64) $(BUILDDIR)/stackmap-arm > $(BUILDDIR)/stackmap-arm.vgot; \
 	diff -u testdata/stackmap.out $(BUILDDIR)/stackmap-arm.vgot; \
 	echo ok stackmaps-arm; \

@@ -16206,7 +16206,10 @@ code generator gives, the line it was compiling (`at line 7`, 1.1.283).
 The whole source tree is checked with `make check`: the golden programs
 in `testdata/`, the examples of this manual, the network tests, the
 stage-2 rebuild of the compiler by itself, and the arm64 build under
-qemu.
+qemu. The collector stress check gives each golden program a time
+limit, with separate limits for slower cases. If a program times out,
+the check logs its last standard output and the wait channel of each
+visible Linux thread before stopping the program.
 
 **Auditing a unit (1.2.376, P561).** Two scripts measure a unit from the
 tree, never from memory. `python3 -I scripts/unit_audit.py --gaps` prints,
