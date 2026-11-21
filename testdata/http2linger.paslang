@@ -1,0 +1,101 @@
+{ P669: a peer checks that GOAWAY and a write half-close precede teardown. }
+program http2linger;
+
+uses sysutils, paslib, pasconn, pastls, pashttp2;
+
+type
+  TObservedStream = class(TNetStream)
+    Raw: TNetStream;
+    HalfClosed: Boolean;
+    Drained: Integer;
+    function ReadInto(P: Pointer; MaxN, Deadline: Integer): Integer; override;
+    function WriteAll(const Data: string; Deadline: Integer): Boolean; override;
+    procedure Shutdown(How: Integer); override;
+    procedure Dispose; override;
+  end;
+
+function TObservedStream.ReadInto(P: Pointer; MaxN, Deadline: Integer): Integer;
+begin
+  Result := Raw.ReadInto(P, MaxN, Deadline);
+  if HalfClosed and (Result > 0) then
+    Inc(Drained, Result);
+end;
+
+function TObservedStream.WriteAll(const Data: string; Deadline: Integer): Boolean;
+begin
+  Result := Raw.WriteAll(Data, Deadline);
+end;
+
+procedure TObservedStream.Shutdown(How: Integer);
+begin
+  if How = 1 then
+    HalfClosed := True;
+  Raw.Shutdown(How);
+end;
+
+procedure TObservedStream.Dispose;
+begin
+  Raw.Dispose;
+end;
+
+procedure Require(Ok: Boolean; const Detail: string);
+begin
+  if not Ok then
+  begin
+    WriteLn(Detail);
+    Halt(1);
+  end;
+end;
+
+var
+  raw: TNetStream;
+  observed: TObservedStream;
+  config: TTlsConfig;
+  tls: TTlsStream;
+  conn: THttp2Conn;
+  response: THttp2Response;
+  mode, roots, why, requestError: string;
+
+begin
+  mode := ParamStr(1);
+  if mode = 'pair' then
+    raw := TTcpStream.Create(StrToInt(ParamStr(2)))
+  else
+    raw := DialTcp('127.0.0.1', StrToInt(ParamStr(2)), 10000);
+  Require(raw <> nil, 'could not open the transport');
+  observed := TObservedStream.Create;
+  observed.Raw := raw;
+  raw := observed;
+  if mode = 'tls' then
+  begin
+    Require(ReadFile(ParamStr(3), roots), 'could not read the test roots');
+    config := TTlsConfig.Create;
+    config.ServerName := 'localhost';
+    config.RootsPem := roots;
+    config.NowUnix := 1811808000;
+    SetLength(config.Alpn, 1);
+    config.Alpn[0] := 'h2';
+    tls := TlsClient(raw, config, 'localhost', Nanotime + 10000000000, why);
+    Require(tls <> nil, 'TLS handshake: ' + why);
+    Require(tls.Protocol = 'h2', 'the peer did not negotiate h2');
+    raw := tls;
+  end;
+  conn := THttp2Conn.Create(raw, 'https', 'localhost', Default(THttp2Options));
+  Require(conn.Alive, 'could not start HTTP/2');
+  Require(not conn.Request('GET', '/', nil, '', 2500, 0, response, why),
+    'the erroneous connection delivered a response');
+  Require((not response.TimedOut) and (not response.NotProcessed) and
+    (Pos('PROTOCOL_ERROR', why) > 0) and (why = conn.LastError),
+    'request failed for the wrong reason: ' + why);
+  WriteLn('request failed');
+  Require(not conn.Request('GET', '/again', nil, '', 0, 0, response, requestError) and
+    response.NotProcessed and (requestError = why), 'a new request was admitted');
+  conn.Dispose;
+  conn.Dispose;
+  Require(observed.HalfClosed, 'the transport was not half-closed');
+  if ParamStr(4) = 'budget' then
+    Require(observed.Drained = 65536, 'wrong drain count: ' + IntToStr(observed.Drained));
+  if (ParamStr(4) = 'late-body') and (mode <> 'tls') then
+    Require(observed.Drained = 32768, 'the peer body was not drained');
+  WriteLn('connection closed');
+end.

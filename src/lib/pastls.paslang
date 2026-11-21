@@ -89,7 +89,7 @@ type
     FAlpn: string;
     FPeerChain: TStringArray;
     FLeaf: TX509Cert;
-    FClosed: Boolean;
+    FClosed, FWriteClosed: Boolean;
     FBroken: Boolean;
     FErr: string;
     FDone: Boolean;
@@ -125,6 +125,7 @@ type
     function VerifySig(Scheme: Integer; const Signed, Sig: string; Tls13: Boolean): Boolean;
     function PostHandshake(Typ: Integer; const Body: string; Deadline: Integer): Boolean;
     function Await(Deadline: Integer): Integer;
+    procedure SendCloseNotify(Deadline: Integer);
   public
     constructor Create(Raw: TNetStream);
     { up to MaxN bytes of application data before Deadline (a Nanotime, 0
@@ -136,6 +137,8 @@ type
     function WriteFrom(P: Pointer; N, Deadline: Integer): Boolean; override;
     { the connection under it is shut (pasconn); no close_notify is sent }
     procedure Shutdown(How: Integer); override;
+    { Send close_notify before the transport's half-close and drain. }
+    procedure LingerClose(MaxBytes, Deadline: Integer); override;
     { close_notify, then the connection under it }
     procedure Dispose; override;
     { TlsVersion12 or TlsVersion13 }
@@ -756,7 +759,8 @@ begin
   begin
     FBroken := True;
     lock FWMu do
-      WriteRecord(RecAlert, U8(2) + U8(Alert), Deadline);
+      if not FWriteClosed then
+        WriteRecord(RecAlert, U8(2) + U8(Alert), Deadline);
   end;
   FBroken := True;
 end;
@@ -2105,6 +2109,11 @@ begin
             between them }
           lock FWMu do
           begin
+            if FWriteClosed then
+            begin
+              Result := True;
+              Exit;
+            end;
             if not WriteRecord(RecHandshake, U8(HsKeyUpdate) + Vec24(#0), Deadline) then
               Exit;
             next := ExpandLabel(FHashAlg, FWrSecret, 'traffic upd', '', CipherHashSize(FHashAlg));
@@ -2230,7 +2239,7 @@ begin
   Result := False;
   lock FWMu do
   begin
-    if FBroken or FClosed or not FDone then
+    if FBroken or FClosed or FWriteClosed or not FDone then
       Exit;
     { what fits one record goes as it is; more goes record by record
       from where it is }
@@ -2251,7 +2260,7 @@ begin
   Result := False;
   lock FWMu do
   begin
-    if FBroken or FClosed or not FDone then
+    if FBroken or FClosed or FWriteClosed or not FDone then
       Exit;
     Result := WritePlain(P, N, Deadline);
   end;
@@ -2263,14 +2272,37 @@ begin
     FRaw.Shutdown(How);
 end;
 
+{ As in Go crypto/tls closeNotify, remember the alert under the
+  write lock so the closing path can send it at most once. }
+procedure TTlsStream.SendCloseNotify(Deadline: Integer);
+begin
+  lock FWMu do
+  begin
+    if FWriteClosed then
+      Exit;
+    FWriteClosed := True;
+    if FDone and not FBroken and (Deadline > Nanotime) then
+      WriteRecord(RecAlert, U8(1) + U8(AlertCloseNotify), Deadline);
+  end;
+end;
+
+procedure TTlsStream.LingerClose(MaxBytes, Deadline: Integer);
+begin
+  SendCloseNotify(Deadline);
+  { The protocol above TLS is finished. Discard only transport bytes
+    so that control records cannot bypass either drain bound. }
+  if FRaw <> nil then
+  begin
+    FRaw.LingerClose(MaxBytes, Deadline);
+    FRaw := nil;
+  end;
+  Dispose;
+end;
+
 procedure TTlsStream.Dispose;
 begin
-  if FDone and not FBroken then
-  begin
-    lock FWMu do
-      WriteRecord(RecAlert, U8(1) + U8(AlertCloseNotify), Nanotime + 1000000000);
-    FBroken := True;
-  end;
+  SendCloseNotify(Nanotime + 1000000000);
+  FBroken := True;
   if FRaw <> nil then
   begin
     FRaw.Dispose;

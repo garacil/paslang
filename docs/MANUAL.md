@@ -12695,9 +12695,8 @@ and sends it many requests, as Apple's and Google's push services ask.
   the requests on their way and how many the server lets be at once (a
   request past that number waits its turn, within its deadline);
   `c.LastError` why the connection ended. `c.Dispose` sends GOAWAY, ends
-  the connection and waits for its two routines: a program that is done
-  with a connection calls it, and a connection that ended by itself has
-  given its descriptors back already.
+  the connection and waits for its routines to give back their descriptors.
+  It also waits for teardown when the connection has begun closing on its own.
 - `THttp2Client.Create(host, port, config, options)` keeps one
   connection to a server and makes another when that one has ended or is
   going away; its `Request` takes the same arguments and sends a request
@@ -12761,8 +12760,11 @@ upper case, a field of an HTTP/1.1 connection, a `content-length` that
 is not the content's length) ends its request with `RST_STREAM` and the
 connection goes on; a fault of the connection (a frame out of place, a
 window overrun, a block that is not HPACK) sends `GOAWAY` with the
-RFC's code and ends it. `testdata/http2fake` plays the peer frame by
-frame over a pair of sockets, 575 checks on both machines (among them
+RFC's code and fails its pending requests. The client allows up to one
+second to send the error GOAWAY. It then closes the writing side, sending
+TLS `close_notify` first over HTTPS, and discards at most 64 KiB of
+additional transport bytes. The drain ends at transport EOF or after one
+second. `testdata/http2fake` plays the peer frame by frame over a pair of sockets, 575 checks on both machines (among them
 a field block of 600 KiB whose write waits for the peer while eight
 other routines send, each frame whole and the streams in order, and a
 client that makes its connection again, over TCP with the test as its

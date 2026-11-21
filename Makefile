@@ -1383,6 +1383,9 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  p=$(BUILDDIR)/tlsdeadline-$$cpu; \
 	  $(OUTDIR)/paslangc -cpu $$cpu -Fu $(BUILDDIR) -o $$p testdata/tlsdeadline.paslang; \
 	  python3 -I scripts/check_tls_deadlines.py $$p; \
+	  p=$(BUILDDIR)/http2linger-$$cpu; \
+	  $(OUTDIR)/paslangc -cpu $$cpu -Fu $(BUILDDIR) -o $$p testdata/http2linger.paslang; \
+	  python3 -I scripts/check_http2_linger.py $$p; \
 	done
 	@python3 scripts/check_recipes.py
 	@python3 -I -B scripts/select_walkers.py --self-test
@@ -6106,6 +6109,9 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	  model=max; if [ "$$cpu" = base ]; then model=cortex-a53; fi; \
 	  $(OUTDIR)/paslangc -target arm64 -cpu $$cpu -Fu $(A64DIR) -o $$p testdata/tlsdeadline.paslang; \
 	  python3 -I scripts/check_tls_deadlines.py $(QEMU_A64) -cpu $$model $$p; \
+	  p=$(BUILDDIR)/http2linger-$$cpu-arm; \
+	  $(OUTDIR)/paslangc -target arm64 -cpu $$cpu -Fu $(A64DIR) -o $$p testdata/http2linger.paslang; \
+	  python3 -I scripts/check_http2_linger.py $(QEMU_A64) -cpu $$model $$p; \
 	done
 	@python3 -I -B scripts/select_walkers.py --self-test
 	@python3 -I -B scripts/check_select_diagnostics.py "$(OUTDIR)/paslangc-arm64" "$(BUILDDIR)" "$(QEMU_A64)" --host-arm64

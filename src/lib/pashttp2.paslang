@@ -336,7 +336,7 @@ type
     procedure OnGoAway(Id: Integer; const Payload: string);
     procedure OnWindowUpdate(Id: Integer; const Payload: string);
     procedure OnPriority(Id: Integer; const Payload: string);
-    function Settle: Boolean;
+    function SendErrorGoAway: Boolean;
     function Step: Boolean;
     procedure ReadLoop;
     procedure TimerLoop;
@@ -1656,6 +1656,11 @@ const
     a small frame, the rest with them; the content of a larger one is
     read where it is kept, past what came with its head }
   H2InBuf = 16384;
+  { A connection error gets one second to issue GOAWAY, as in Go
+    http2's goAwayTimeout, and a bounded drain after the write half-close
+    (RFC 9112 9.6). Count octets read from the transport while draining. }
+  H2CloseMs = 1000;
+  H2DrainBytes = 65536;
   { the end of the stream, as the reading routines say it }
   H2Eof = -1000000;
 
@@ -2393,7 +2398,7 @@ var
   s: TH2Stream;
 begin
   FMu.Lock;
-  while not FClosed do
+  while not FBroken do
   begin
     tnow := Nanotime;
     next := 0;
@@ -2414,7 +2419,7 @@ begin
         next := s.Deadline;
       Inc(i);
     end;
-    if FClosed then
+    if FBroken then
       Break;
     if FFailDue <> 0 then
     begin
@@ -2426,7 +2431,13 @@ begin
       if (next = 0) or (FFailDue < next) then
         next := FFailDue;
     end;
-    if FHealthDue <> 0 then
+    if FClosed then
+    begin
+      { Requests may be finished while the last GOAWAY is still writing. }
+      if FFailDue = 0 then
+        Break;
+    end
+    else if FHealthDue <> 0 then
     begin
       if FHealthDue <= tnow then
       begin
@@ -3314,38 +3325,39 @@ begin
   Result := 'http2: reading from the server failed: ' + why;
 end;
 
-{ what a frame brought is settled: a connection error it showed sends
-  GOAWAY with its code and ends the connection (5.4.1). False when the
-  connection is over. Under FMu }
-function THttp2Conn.Settle: Boolean;
+{ Finish requests, then send the connection error (RFC 9113 5.4.1).
+  Keep the timer active until the last write succeeds or must be
+  interrupted. True means the reader can half-close and drain. Under FMu. }
+function THttp2Conn.SendErrorGoAway: Boolean;
 var
-  frames: string;
+  frames, why: string;
 begin
-  if FConnErr <> 0 then
+  Result := False;
+  if (FConnErr = 0) or FBroken then
+    Exit;
+  why := 'http2: ' + FWhy + ' (' + Http2ErrorName(FConnErr) + ')';
+  if FWriteBroken then
   begin
-    frames := FOwed + GoAwayFrame(FConnErr);
-    FOwed := '';
-    Post(frames, True);
-    if FWBusy and (not FBroken) and not FWriteBroken then
-    begin
-      { Another routine was writing and the frames were left for it:
-        they are waited for, since what is pending is dropped when the
-        connection is cut. For a second and no longer: a peer that sent
-        what it should not and takes nothing either does not hold the
-        requests until a write gives up. The routine of the deadlines
-        cuts the connection then, for this reason }
-      if FFailDue = 0 then
-      begin
-        FFailWhy := 'http2: ' + FWhy + ' (' + Http2ErrorName(FConnErr) + ')';
-        FFailDue := PasIoDeadline(1000);
-        Arm(FFailDue);
-      end;
-      while FWBusy and (not FBroken) and not FWriteBroken do
-        FCond.Wait(FMu);
-    end;
-    Fail('http2: ' + FWhy + ' (' + Http2ErrorName(FConnErr) + ')', True);
+    Fail(why, True);
+    Exit;
   end;
-  Result := not FBroken;
+  FFailWhy := why;
+  FFailDue := PasIoDeadline(H2CloseMs);
+  Arm(FFailDue);
+  Fail(why, False);
+  frames := FOwed + GoAwayFrame(FConnErr);
+  FOwed := '';
+  Post(frames, True);
+  while FWBusy and not FBroken and not FWriteBroken do
+    FCond.Wait(FMu);
+  if FWriteBroken then
+    Fail(why, True);
+  if FBroken then
+    Exit;
+  { Writes are over. The reader closes the transport without aborting it. }
+  FBroken := True;
+  Poke;
+  Result := True;
 end;
 
 { One frame, read and handed to its stream under FMu. False when the
@@ -3379,20 +3391,6 @@ begin
       s := DataBegin(id, n, n);
     end;
     if FConnErr <> 0 then
-    begin
-      { A connection error at the head of a frame: its content is let by
-        before the connection ends, as a frame read whole has been (Go's
-        framer reads every frame whole). A socket closed with octets
-        unread answers its peer with a reset, not the end of the stream,
-        and on TCP a reset can take the GOAWAY with it before the peer
-        has read it }
-      FMu.Unlock;
-      r := Skip(n);
-      FMu.Lock;
-      if FBroken then
-        Exit;
-    end;
-    if not Settle then
       Exit;
     FMu.Unlock;
     if s <> nil then
@@ -3406,7 +3404,7 @@ begin
       Fail(ReadWhy(r), True)
     else if s <> nil then
       DataEnd(s, n, n, (flags and FlEndStream) <> 0);
-    Result := Settle;
+    Result := (FConnErr = 0) and not FBroken;
     if Result then
       FMu.Unlock;
     Exit;
@@ -3460,7 +3458,7 @@ begin
     end;
     { a frame of a type this end does not know is let by (4.1) }
   end;
-  Result := Settle;
+  Result := (FConnErr = 0) and not FBroken;
   if Result then
     FMu.Unlock;
 end;
@@ -3469,14 +3467,20 @@ end;
   frame. When the connection is over it waits for the last write, gives
   the stream back and ends }
 procedure THttp2Conn.ReadLoop;
+var
+  linger: Boolean;
 begin
   while Step do
     ;
+  linger := SendErrorGoAway;
   while FWBusy do
     FCond.Wait(FMu);
   FTornDown := True;
   FMu.Unlock;
-  FStream.Dispose;
+  if linger then
+    FStream.LingerClose(H2DrainBytes, PasIoDeadline(H2CloseMs))
+  else
+    FStream.Dispose;
   FWg.Done;
 end;
 
