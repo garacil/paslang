@@ -2302,6 +2302,19 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'duplicate identifier width (written Width before: the case of letters does not tell names apart) (it is a field of TBox) at 10:21' $(BUILDDIR)/casedup_fields.err; \
 	grep -q 'duplicate identifier Total (a variable of the name) at 5:11 in' $(BUILDDIR)/casedup_samecase.err; \
 	$(OUTDIR)/paslangc --lex testdata/hexchar.paslang | grep -q '\[#\$$e2\]'; \
+	for a in amd64 arm64; do \
+	  p=$(BUILDDIR)/caseshadow-$$a; \
+	  if $(OUTDIR)/paslangc -target $$a -cpu base -o $$p-brace testdata/cmtbad/earlylast.paslang >$$p-brace.err 2>&1; then exit 1; fi; \
+	  grep -q -x -F 'paslangc: a } with no comment open at 2:26. The preceding brace comment ended at 2:15 in testdata/cmtbad/earlylast.paslang' $$p-brace.err; \
+	  $(OUTDIR)/paslangc -target $$a -cpu base -o $$p-quiet testdata/casedup/shadow.paslang 2>$$p-quiet.err; \
+	  test ! -s $$p-quiet.err; \
+	  $(OUTDIR)/paslangc -target $$a -cpu base -warn-case-shadow -o $$p-warn testdata/casedup/shadow.paslang 2>$$p-warn.err; \
+	  diff -u testdata/casedup/shadow.err $$p-warn.err; \
+	  cmp $$p-quiet.s $$p-warn.s; \
+	  runner=; if [ "$$a" = arm64 ]; then runner=$(QEMU_A64); fi; \
+	  timeout 30 $$runner $$p-warn >$$p.got; \
+	  diff -u testdata/casedup/shadow.out $$p.got; \
+	done; \
 	echo ok cmtbad; \
 	: a static array goes into a const or value array of T parameter as its whole slice, and a var one refuses it with the reason, P633; \
 	for n in varstatic assignstatic; do \

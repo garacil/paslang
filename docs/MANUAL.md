@@ -91,10 +91,16 @@ brace comment ends at its first `}` and does not nest, as in every
 Pascal: in `{ see {x} here }` the comment ends after `x` and ` here }` is
 read as code, which the compiler says with the place of the comment,
 the brace inside it and the `}` that ended it (1.3.15, P647).
+A stray `}` also points to the end of a preceding brace comment on the
+same line.
 Identifiers and keywords are case-insensitive, as in every Pascal:
 `Total` and `total` are one name, and a second declaration of it says
 so, `duplicate identifier total (written Total before: the case of
-letters does not tell names apart)`.
+letters does not tell names apart)`. The optional `-warn-case-shadow` reports
+a local declaration that hides a name whose spelling differs only in
+case in an enclosing scope. The warning gives both spellings and the
+local declaration's position. Warnings go to standard error and
+successful compilation exits 0.
 
 ## 2. Programs and units
 
@@ -16183,6 +16189,7 @@ paslangc [options] file.paslang
 | `-o <path>` | output file; a program defaults to `a.out`, a unit to `build/<name>` (`build/a64/<name>` with `-target arm64`) |
 | `-c` | compile and assemble only, no link |
 | `-warn-import-shadow` | warn when an unqualified routine call selects an indirect import over a name from a directly imported unit; names declaration ownership and qualification. Default and explicitly qualified compilation stay quiet; warnings go to standard error with successful exit status |
+| `-warn-case-shadow` | report a local declaration whose spelling differs only in case from the name it hides in an enclosing scope |
 | `-checkptr` | check every pointer step and access against its object while the program runs (§6) |
 | `-inline <n>` | inline by measure (§5): a plain routine of the unit whose body counts `n` statements and expression nodes or fewer goes in place where it is called; a routine declared `inline` goes in whatever its size; `-inline 0` keeps one copy of every routine and every loop; 40 by default |
 | `-inline-trace` | say on the error output why each routine of the unit stays a call |
