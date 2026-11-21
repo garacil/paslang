@@ -833,8 +833,8 @@ GOLDEN_A64 += libfault
 GOLDEN += wgagain
 GOLDEN_A64 += wgagain
 # P583: the failures of a channel as exceptions.
-GOLDEN += chanfault chanshut chanoff eofname hexchar openarr bgroutine bgfirst jsoncanonrange sqlcols sqltx rmall inotify inotifylimits
-GOLDEN_A64 += chanfault chanshut chanoff eofname hexchar openarr bgroutine bgfirst jsoncanonrange sqlcols sqltx rmall inotify inotifylimits
+GOLDEN += chanfault chanshut chanoff eofname hexchar openarr bgroutine bgfirst bglibexit jsoncanonrange sqlcols sqltx rmall inotify inotifylimits
+GOLDEN_A64 += chanfault chanshut chanoff eofname hexchar openarr bgroutine bgfirst bglibexit jsoncanonrange sqlcols sqltx rmall inotify inotifylimits
 # P179/P639: per-G errno, Carry and background state occupy separate fields.
 GOLDEN += syserrorstate
 GOLDEN_A64 += syserrorstate
@@ -4024,6 +4024,12 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	timeout 300 $(BUILDDIR)/signals0 > $(BUILDDIR)/signals0.got; \
 	diff -u testdata/signals.out $(BUILDDIR)/signals0.got; \
 	echo ok signals0
+	@set -e; \
+	$(OUTDIR)/paslangc -cpu base -debug -o $(BUILDDIR)/bglibexit-debug testdata/bglibexit.paslang; \
+	dbgpath="@paslang-bglibexit-$$$$"; \
+	PASLANG_DEBUG="$$dbgpath" timeout 30 $(BUILDDIR)/bglibexit-debug "$$dbgpath" > $(BUILDDIR)/bglibexit-debug.got; \
+	diff -u testdata/bglibexit.out $(BUILDDIR)/bglibexit-debug.got; \
+	echo ok bglibexit-debug
 	@set -e; \
 	: P434: the HTTP server on the base processor with no inlining, and the sockets systemd passes as sd_listen_fds gives them; \
 	$(OUTDIR)/paslangc -cpu base -inline 0 -o $(BUILDDIR)/httpsrv0 testdata/httpsrv.paslang; \
@@ -7680,6 +7686,12 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	PASLANG_GCVERIFY=1 PASLANG_GCSTRESS=3 PASLANG_GCPOISON=1 timeout 1800 $(QEMU_A64) $(BUILDDIR)/signals0-arm $(QEMU_A64) > $(BUILDDIR)/signals0-arm.vgot; \
 	diff -u testdata/signals.out $(BUILDDIR)/signals0-arm.vgot; \
 	echo ok signals-arm
+	@set -e; \
+	$(OUTDIR)/paslangc -target arm64 -Fu $(A64DIR) -cpu base -debug -o $(BUILDDIR)/bglibexit-debug-arm testdata/bglibexit.paslang; \
+	dbgpath="@paslang-bglibexit-arm-$$$$"; \
+	PASLANG_DEBUG="$$dbgpath" timeout 30 $(QEMU_A64) $(BUILDDIR)/bglibexit-debug-arm "$$dbgpath" > $(BUILDDIR)/bglibexit-debug-arm.got; \
+	diff -u testdata/bglibexit.out $(BUILDDIR)/bglibexit-debug-arm.got; \
+	echo ok bglibexit-debug-arm
 	@set -e; \
 	: P434 on arm64: the HTTP server with no inlining under qemu, and the sockets systemd passes through it; \
 	$(OUTDIR)/paslangc -target arm64 -cpu base -inline 0 -Fu $(A64DIR) -o $(BUILDDIR)/httpsrv0-arm testdata/httpsrv.paslang; \

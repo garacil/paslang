@@ -12063,8 +12063,8 @@ one routine of the unit, parked on that eventfd, sends it on. So a
 routine that waits on the channel parks like any other wait, and while
 the unit's routine waits for a signal no program is reported as
 deadlocked, as in Go after `signal.Notify`: a signal may still come.
-That routine is not one the program waits for when its main routine
-ends. A program it starts (`ExecuteProcess`, `Run`) takes each caught
+The dispatcher starts as a background routine and can keep waiting
+for signals when the program ends. A program it starts (`ExecuteProcess`, `Run`) takes each caught
 signal's default action and keeps each ignored one ignored, as the
 runtime resets caught handlers before `exec`. `testdata/signals` checks
 all of it on both machines.
@@ -15390,7 +15390,8 @@ or the program's first argument asks for the console (below):
 `./a.out --debug-mode args...` runs it with a console on its own
 terminal.
 
-Then it listens there, one client at a time, and answers a text
+The listener and the local console run as background routines.
+The listener accepts one client at a time and answers a text
 protocol: one request a line, a reply of lines that ends in `ok` or
 `error: ...`. `pasdbg <socket>` is the console for it (`bin/pasdbg`,
 built from `cmd/pasdbg` by `make` and installed with the compiler); `pasdbg <socket> <request>` sends one request and prints
