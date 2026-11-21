@@ -339,7 +339,15 @@ def main():
                 try:peak.peak_kib(['/bin/true'],timeout=1)
                 except RuntimeError as error:require('single-threaded' in str(error),'wrong unsupported-thread error')
                 else:raise AssertionError('multithreaded caller accepted')
-        finally:held.set();other.join()
+        finally:
+            held.set()
+            other.join()
+            # pthread_join can return before Linux removes the task's TID.
+            task=Path('/proc/self/task')/str(other.native_id)
+            deadline=time.monotonic()+3
+            while task.exists():
+                require(time.monotonic()<deadline,'joined fixture thread still appears in /proc')
+                time.sleep(.001)
         action=peak._SignalAction()
         require(peak._libc.sigaction(signal.SIGCHLD,None,ctypes.byref(action))==0,'cannot inspect SIGCHLD fixture')
         changed=peak._SignalAction();ctypes.memmove(ctypes.byref(changed),ctypes.byref(action),ctypes.sizeof(action));changed.flags|=2
