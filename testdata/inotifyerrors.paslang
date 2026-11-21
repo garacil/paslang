@@ -1,0 +1,214 @@
+{ This file is part of paslang's tests.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+  GPL version 3 or later; see COPYING. No warranty. }
+program inotifyerrors;
+
+uses pasinotify, paslinux, paslib, sysutils;
+
+const
+  NoFile = 7;           { Linux RLIMIT_NOFILE, getrlimit(2) }
+  DupCloseOnExec = 1030; { Linux F_DUPFD_CLOEXEC, fcntl(2) }
+  GetDescriptorFlags = 1;
+  GetStatusFlags = 3;
+  CloseOnExec = 524288;
+  NonBlocking = 2048;
+  FdDirectory = '/proc/self/fd';
+
+type
+  TDescriptorSlots = array[0..2] of Integer;
+
+function Nr(Amd, Arm: Integer): Integer;
+begin
+  {$ifdef CPUX86_64}
+  Result := Amd;
+  {$else}
+  Result := Arm;
+  {$endif}
+end;
+
+procedure Require(OK: Boolean; const What: string);
+begin
+  if not OK then
+  begin
+    WriteLn('inotify error test: ', What);
+    Halt(1);
+  end;
+end;
+
+function Duplicate(Fd: Integer): Integer;
+begin
+  Result := Syscall(Nr(72, 25), Fd, DupCloseOnExec, 0);
+end;
+
+function Descriptors(out Fd: Integer): Integer;
+var
+  entries: TDirectoryReader;
+  error: TSysError;
+  name, target: string;
+begin
+  Result := 0;
+  Fd := -1;
+  Require(TryOpenDirectoryAt(CurrentDirectoryHandle, FdDirectory, entries, error), 'open descriptor list');
+  try
+    while entries.Next(name, error) do
+    begin
+      Inc(Result);
+      if ReadLink(FdDirectory + '/' + name, target) and (target = 'anon_inode:inotify') then
+      begin
+        Require(Fd < 0, 'only the test watcher has an inotify descriptor');
+        Fd := StrToInt(name);
+      end;
+    end;
+    Require(error.Code = 0, 'read descriptor list');
+  finally
+    entries.Free;
+  end;
+end;
+
+procedure ExhaustDescriptors;
+var
+  original, limited: array[0..1] of UInt64;
+  held: array[0..31] of Integer;
+  count, control, fd, available, stdinFlags: Integer;
+  watcher: TInotify;
+  event: TInotifyEvent;
+begin
+  stdinFlags := Syscall(Nr(72, 25), 0, GetDescriptorFlags);
+  control := FileOpen('/dev/null', fmOpenRead);
+  Require(control >= 0, 'open control descriptor');
+  Require(Syscall(Nr(302, 261), 0, NoFile, 0, @original[0]) = 0, 'read soft file limit');
+  limited := original;
+  if limited[0] > Length(held) then
+    limited[0] := Length(held);
+  Require(Syscall(Nr(302, 261), 0, NoFile, @limited[0], 0) = 0, 'lower soft file limit');
+  count := 0;
+  fd := Duplicate(control);
+  while fd >= 0 do
+  begin
+    held[count] := fd;
+    Inc(count);
+    fd := Duplicate(control);
+  end;
+  Require((fd = -24) and (count >= 2), 'reached descriptor limit');
+
+  { With 0, 1, or 2 slots left, inotify_init1, eventfd, or
+    epoll_create1 is the first allocation to fail, respectively. }
+  for available := 0 to 2 do
+  begin
+    watcher := TInotify.Create;
+    Require(not watcher.Valid, 'exhausted watcher is invalid');
+    Require(watcher.Error = 24, 'exhausted watcher reports EMFILE');
+    Require(not watcher.Next(event, 0) and (watcher.Error = 24), 'invalid Next preserves creation error');
+    watcher.Free;
+    if available < 2 then
+    begin
+      Dec(count);
+      Require(OsClose(held[count]) = 0, 'free one slot');
+    end;
+  end;
+
+  Require(Syscall(Nr(302, 261), 0, NoFile, @original[0], 0) = 0, 'restore soft file limit');
+  while count > 0 do
+  begin
+    Dec(count);
+    Require(OsClose(held[count]) = 0, 'close a filler descriptor');
+  end;
+  Require(OsClose(control) = 0, 'close control descriptor');
+  Require(Syscall(Nr(72, 25), 0, GetDescriptorFlags) = stdinFlags, 'creation failure preserves stdin');
+end;
+
+{ Find the next three descriptor numbers by borrowing them for /dev/null.
+  The test creates the watcher before opening any other descriptors. }
+procedure FindSlots(out Slots: TDescriptorSlots);
+var
+  i: Integer;
+begin
+  Slots[0] := FileOpen('/dev/null', fmOpenRead);
+  Require(Slots[0] >= 0, 'open descriptor probe');
+  for i := 1 to High(Slots) do
+  begin
+    Slots[i] := Duplicate(Slots[0]);
+    Require(Slots[i] >= 0, 'duplicate descriptor probe');
+  end;
+  for i := 0 to High(Slots) do
+    Require(OsClose(Slots[i]) = 0, 'release descriptor probe');
+end;
+
+function WatcherEpoll(const Slots: TDescriptorSlots): Integer;
+var
+  i, flags: Integer;
+  target: string;
+begin
+  Result := -1;
+  for i := 0 to High(Slots) do
+  begin
+    Require(ReadLink(FdDirectory + '/' + IntToStr(Slots[i]), target), 'read watcher descriptor target');
+    flags := Syscall(Nr(72, 25), Slots[i], GetDescriptorFlags);
+    Require(flags = 1, 'watcher descriptor is close-on-exec');
+    if target = 'anon_inode:[eventpoll]' then
+      Result := Slots[i]
+    else
+    begin
+      Require((target = 'anon_inode:inotify') or (target = 'anon_inode:[eventfd]'), 'watcher descriptor kind');
+      flags := Syscall(Nr(72, 25), Slots[i], GetStatusFlags);
+      Require((flags >= 0) and ((flags and NonBlocking) <> 0), 'watcher descriptor is nonblocking');
+    end;
+  end;
+  Require(Result >= 0, 'find the watcher epoll descriptor');
+end;
+
+{ Hold the open file description while faulting the original descriptor
+  number, then restore it before the watcher releases its descriptors. }
+procedure CheckClosed(Watcher: TInotify; Fd, Ms: Integer; const Action: string);
+var
+  backup: Integer;
+  event: TInotifyEvent;
+begin
+  backup := Duplicate(Fd);
+  Require(backup >= 0, 'duplicate ' + Action + ' descriptor');
+  Require(OsClose(Fd) = 0, 'close ' + Action + ' descriptor');
+  Require(not Watcher.Next(event, Ms) and (Watcher.Error = 9), 'Next reports ' + Action + ' EBADF');
+  Require(Syscall(Nr(292, 24), backup, Fd, CloseOnExec) = Fd, 'restore ' + Action + ' descriptor');
+  Require(OsClose(backup) = 0, 'close backup descriptor');
+end;
+
+procedure EmptyWait(Watcher: TInotify; Ms: Integer);
+var
+  event: TInotifyEvent;
+  started, elapsed: Integer;
+  answer: Boolean;
+begin
+  started := Nanotime;
+  answer := Watcher.Next(event, Ms);
+  elapsed := Nanotime - started;
+  Require(not answer and (Watcher.Error = 0), 'empty wait status');
+  Require((elapsed >= Ms * 1000000) and (elapsed < 5000000000), 'empty wait duration');
+end;
+
+var
+  beforeCount, fd, pollFd: Integer;
+  watcher: TInotify;
+  slots: TDescriptorSlots;
+begin
+  beforeCount := Descriptors(fd);
+  Require(fd < 0, 'no inherited inotify descriptor');
+  ExhaustDescriptors;
+  Require((Descriptors(fd) = beforeCount) and (fd < 0), 'failed creation releases descriptors');
+
+  FindSlots(slots);
+  watcher := TInotify.Create;
+  Require(watcher.Valid, 'create watcher');
+  Require((Descriptors(fd) = beforeCount + 3) and (fd >= 0), 'watcher owns three descriptors');
+  pollFd := WatcherEpoll(slots);
+  EmptyWait(watcher, 0);
+  EmptyWait(watcher, 1);
+  EmptyWait(watcher, 50);
+
+  CheckClosed(watcher, fd, 0, 'read');
+  CheckClosed(watcher, pollFd, 50, 'timed poll');
+  CheckClosed(watcher, pollFd, -1, 'untimed poll');
+  EmptyWait(watcher, 0);
+  watcher.Free;
+  Require((Descriptors(fd) = beforeCount) and (fd < 0), 'Free releases all watcher descriptors');
+  WriteLn('inotify error paths ok');
+end.
