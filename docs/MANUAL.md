@@ -11937,7 +11937,7 @@ program has without `uses`:
 |---|---|
 | `NetListen(port)` | a TCP socket bound to `port` on every IPv4 address and listening, non-blocking, with `SO_REUSEADDR` and `TCP_NODELAY`: its descriptor, or a negative number when that fails |
 | `NetPort(fd)` | the socket's local port; 0 when it cannot be read |
-| `NetAccept(fd)` | the descriptor of the next connection, parking until one comes; negative on an error |
+| `NetAccept(fd)` | the descriptor of the next connection, parking until one comes; a negative Linux error from accepting or from registering the wait |
 | `NetConnect(ip4, port)` | a connection to the IPv4 address given as one `Integer` (`127.0.0.1` is `$7F000001`), parking until it is made as Go's `connect` waits (a spurious wake or an interrupted call waits on, 1.1.102): its descriptor, or -1 |
 | `NetRead(fd, max, s)` | a procedure: parks until bytes come and puts up to `max` of them (1 to 65536) in the string variable `s`, which is empty at the end of the stream or on an error |
 | `NetWrite(fd, s)` | writes all of `s`, parking while the socket is full: the count written, negative on an error |
