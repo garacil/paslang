@@ -128,8 +128,11 @@ def input_resolution_checks(folder):
     compiler.parent.mkdir(parents=True)
     compiler.touch()
     interface, unit_object = unit_directory / "unit.pi", unit_directory / "unit.o"
-    interface.write_text("controlled compiled interface")
-    unit_object.write_text("controlled linked unit")
+    stored_interface, stored_object = folder / "revision.pi", folder / "revision.o"
+    stored_interface.write_text("controlled compiled interface")
+    stored_object.write_text("controlled linked unit")
+    interface.symlink_to(stored_interface.resolve())
+    unit_object.symlink_to(stored_object.resolve())
     program = work / "program"
     generated = work / "program.o"
     generated.write_text("generated program object version one")
@@ -138,9 +141,10 @@ def input_resolution_checks(folder):
     arguments = [str(compiler), "-cpu", "base", "-o", "program", "main.paslang"]
     original = run_refs.paslang_inputs(arguments, "program", env={}, cwd=work)
     unit = original["units"][0]
-    require(len(original["units"]) == 1 and unit["interface"]["path"] == str(interface.resolve()) and
-            unit["object"]["path"] == str(unit_object.resolve()),
-            "relative link/unit paths did not follow the actual compiler cwd")
+    require(len(original["units"]) == 1 and unit["name"] == "unit" and
+            unit["interface"]["path"] == str(stored_interface.resolve()) and
+            unit["object"]["path"] == str(stored_object.resolve()),
+            "relative SDK links lost the unit name or resolved input path")
     generated.write_text("changed generated program object")
     (unit_directory / "unrelated-benchmark.o").write_text("another benchmark's output")
     require(run_refs.paslang_inputs(arguments, "program", env={}, cwd=work) == original,
