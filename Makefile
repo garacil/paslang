@@ -1403,6 +1403,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	@python3 -B scripts/check_fma_target.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64)
 	@python3 -I scripts/check_cpu_affinity.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64)
 	@python3 -I scripts/check_accept_registration.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64)
+	@python3 -I scripts/check_inotify_failures.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64)
 	@python3 -I scripts/bench/check_harness.py
 	@python3 -I scripts/check_tls_interop_ready.py
 	@python3 -I scripts/bench/check_peak.py

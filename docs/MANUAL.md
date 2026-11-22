@@ -12126,8 +12126,17 @@ log. `Add` rejects an embedded NUL with error 22 (EINVAL), without
 watching a truncated path. Large positive timeouts saturate at the latest
 representable deadline; events and `Dispose` still wake the routine.
 On a valid watcher, `Next` clears a previous error even when it times out;
-an invalid watcher preserves its construction error. `testdata/inotify`
-and `testdata/inotifylimits` check these contracts on both machines.
+an invalid watcher preserves its construction error. A watcher freed
+while a routine waits in `Next` ends that wait as `Dispose` does, with
+`False` and no error (1.3.56): the close of its descriptors wakes the
+routine (1.3.55), and that is the watcher's end, not an error of the
+wait. After `Free` the watcher holds no descriptor: `Add` and `Remove`
+answer error 9 (EBADF), and a second `Free` closes nothing, though its
+numbers may be other files' by then. An error of the read or of the wait
+ends `Next` at once, whatever time it had left. `testdata/inotify`,
+`testdata/inotifylimits` and `testdata/inotifyerrors` check these
+contracts on both machines, and `scripts/check_inotify_failures.py` the
+failures of the watcher's creation and the arithmetic of its deadline.
 
 ```pascal
 { a service that stops cleanly when systemd sends SIGTERM }

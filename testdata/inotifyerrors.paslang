@@ -161,13 +161,16 @@ end;
   number, then restore it before the watcher releases its descriptors. }
 procedure CheckClosed(Watcher: TInotify; Fd, Ms: Integer; const Action: string);
 var
-  backup: Integer;
+  backup, started: Integer;
   event: TInotifyEvent;
 begin
   backup := Duplicate(Fd);
   Require(backup >= 0, 'duplicate ' + Action + ' descriptor');
   Require(OsClose(Fd) = 0, 'close ' + Action + ' descriptor');
+  started := Nanotime;
   Require(not Watcher.Next(event, Ms) and (Watcher.Error = 9), 'Next reports ' + Action + ' EBADF');
+  { an error ends the wait at once, whatever time it had left }
+  Require(Nanotime - started < 2000000000, 'Next reports ' + Action + ' EBADF at once');
   Require(Syscall(Nr(292, 24), backup, Fd, CloseOnExec) = Fd, 'restore ' + Action + ' descriptor');
   Require(OsClose(backup) = 0, 'close backup descriptor');
 end;
@@ -229,11 +232,193 @@ begin
   Require((elapsed >= Ms * 1000000) and (elapsed < 5000000000), 'empty wait duration');
 end;
 
+{ These cases use a build whose constructor reaches a real kernel setup
+  error or allocates a particular descriptor in the zero slot. }
+procedure CheckSetup(const CaseName: string);
+var
+  beforeCount, expectedCount, fd, expectedError: Integer;
+  counter: UInt64;
+  target: string;
+  watcher: TInotify;
+  event: TInotifyEvent;
+begin
+  beforeCount := Descriptors(fd);
+  Require((fd < 0) and (Syscall(Nr(72, 25), 0, GetDescriptorFlags) >= 0),
+    'setup test starts with open stdin and no watcher');
+  expectedCount := beforeCount;
+  if (CaseName <> 'reject') and (CaseName <> 'reject-init') then
+    Dec(expectedCount);
+  expectedError := 0;
+  if CaseName = 'reject' then
+    expectedError := 9
+  else if (CaseName = 'reject-zero-wake') or (CaseName = 'reject-init') then
+    expectedError := 22;
+  watcher := TInotify.Create;
+  if expectedError <> 0 then
+  begin
+    Require(not watcher.Valid and (watcher.Error = expectedError), 'setup reports kernel errno');
+    Require(not watcher.Next(event, 0) and (watcher.Error = expectedError), 'invalid wait preserves setup error');
+  end
+  else
+  begin
+    Require(watcher.Valid, 'zero descriptor watcher is valid');
+    Require(Syscall(Nr(72, 25), 0, GetDescriptorFlags) = 1, 'zero descriptor is close-on-exec');
+    Require(ReadLink(FdDirectory + '/0', target), 'read zero descriptor type');
+    if CaseName = 'zero-wake' then
+    begin
+      Require(target = 'anon_inode:[eventfd]', 'eventfd owns zero');
+      Require(OsRead(0, Int64(@counter), SizeOf(counter)) = -11, 'wake counter starts empty');
+      watcher.Dispose;
+      Require((OsRead(0, Int64(@counter), SizeOf(counter)) = 8) and (counter = 1),
+        'Dispose writes one notification to fd zero');
+      watcher.Dispose;
+      Require(OsRead(0, Int64(@counter), SizeOf(counter)) = -11, 'repeated Dispose does not write');
+      Require(not watcher.Next(event, 0) and (watcher.Error = 0), 'disposed wait returns cleanly');
+    end
+    else
+    begin
+      Require((CaseName = 'zero-poll') and (target = 'anon_inode:[eventpoll]'), 'epoll owns zero');
+      EmptyWait(watcher, 5);
+    end;
+  end;
+  watcher.Free;
+  Require((Descriptors(fd) = expectedCount) and (fd < 0), 'setup case frees owned descriptors');
+  if (CaseName <> 'reject') and (CaseName <> 'reject-init') then
+    Require(Syscall(Nr(72, 25), 0, GetDescriptorFlags) = -9, 'Free releases descriptor zero');
+end;
+
+{ Next on a watcher that is disposed gives the caller an empty event,
+  not the one its variable held. }
+procedure AfterDispose;
+var
+  watcher: TInotify;
+  event: TInotifyEvent;
+begin
+  watcher := TInotify.Create;
+  Require(watcher.Valid, 'create watcher to dispose');
+  event.Watch := 7;
+  event.Cookie := 9;
+  event.Name := 'stale';
+  event.Kinds := [ikCreate];
+  watcher.Dispose;
+  Require(not watcher.Next(event, 0) and (watcher.Error = 0), 'a disposed watcher gives no event and no error');
+  Require((event.Watch = 0) and (event.Kinds = []) and (event.Cookie = 0) and (event.Name = ''),
+    'a disposed watcher clears the event');
+  watcher.Free;
+end;
+
+procedure WaitNext(Watcher: TInotify; Ms: Integer; Answer: chan of Integer);
+var
+  event: TInotifyEvent;
+begin
+  if Watcher.Next(event, Ms) then
+    Send(Answer, -1)
+  else
+    Send(Answer, Watcher.Error);
+end;
+
+{ A watcher freed while another routine waits in Next: the wait ends,
+  as after Dispose, with no error, whether the eventfd or the close of
+  the set wakes it. }
+procedure FreeUnderWait(Ms: Integer; const Action: string);
+var
+  watcher: TInotify;
+  answer: chan of Integer;
+  value, due: Integer;
+  got: Boolean;
+begin
+  watcher := TInotify.Create;
+  Require(watcher.Valid, 'create watcher to free under a wait');
+  answer := MakeChan(1);
+  pas WaitNext(watcher, Ms, answer);
+  Sleep(100);
+  watcher.Free;
+  got := False;
+  value := 0;
+  due := Nanotime + 5000000000;
+  while (not got) and (Nanotime < due) do
+  begin
+    select
+      Recv(answer, value):
+        got := True;
+    else
+      Sleep(1);
+    end;
+  end;
+  Require(got, 'Free ends ' + Action + ' wait');
+  Require(value = 0, 'Free ends ' + Action + ' wait with no error');
+end;
+
+{ After Free the watcher holds no descriptor: its words answer EBADF
+  and a second Free closes nothing, though the numbers it had are other
+  descriptors of the process by then. }
+procedure AfterFree;
+var
+  watcher: TInotify;
+  event: TInotifyEvent;
+  held: array[0..3] of Integer;
+  i, zero: Integer;
+begin
+  { descriptor 0 open, whoever started the test }
+  zero := -1;
+  if Syscall(Nr(72, 25), 0, GetDescriptorFlags) < 0 then
+  begin
+    zero := Duplicate(1);
+    Require(zero = 0, 'open descriptor zero');
+  end;
+  watcher := TInotify.Create;
+  Require(watcher.Valid, 'create watcher to free');
+  watcher.Free;
+  { the lowest free numbers are the three it had }
+  for i := 0 to 3 do
+  begin
+    held[i] := Duplicate(1);
+    Require(held[i] > 1, 'take a freed number');
+  end;
+  Require((watcher.Add('.', [ikCreate]) = -1) and (watcher.Error = 9), 'Add after Free answers EBADF');
+  Require(not watcher.Remove(1) and (watcher.Error = 9), 'Remove after Free answers EBADF');
+  Require(not watcher.Next(event, 0) and (watcher.Error = 0), 'Next after Free gives no event');
+  watcher.Free;
+  for i := 0 to 3 do
+    Require(Syscall(Nr(72, 25), held[i], GetDescriptorFlags) >= 0, 'a second Free closes no descriptor it does not own');
+  Require(Syscall(Nr(72, 25), 1, GetDescriptorFlags) >= 0, 'a second Free leaves descriptor one');
+  Require(Syscall(Nr(72, 25), 0, GetDescriptorFlags) >= 0, 'a second Free leaves descriptor zero');
+  for i := 0 to 3 do
+    Require(OsClose(held[i]) = 0, 'release a taken number');
+  if zero = 0 then
+    Require(OsClose(0) = 0, 'release descriptor zero');
+end;
+
+procedure CheckDeadline;
+var
+  milliseconds: Integer;
+  watcher: TInotify;
+  event: TInotifyEvent;
+begin
+  Require(paslib.StrToInt64(ParamStr(2), milliseconds), 'parse test deadline');
+  watcher := TInotify.Create;
+  Require(watcher.Valid, 'create deadline watcher');
+  Require(not watcher.Next(event, milliseconds), 'empty deadline returns no event');
+  WriteLn('error ', watcher.Error);
+  watcher.Free;
+end;
+
 var
   beforeCount, fd, pollFd: Integer;
   watcher: TInotify;
   slots: TDescriptorSlots;
 begin
+  if ParamStr(1) = 'deadline' then
+  begin
+    CheckDeadline;
+    Halt(0);
+  end;
+  if ParamCount <> 0 then
+  begin
+    CheckSetup(ParamStr(1));
+    WriteLn('inotify setup path ok');
+    Halt(0);
+  end;
   beforeCount := Descriptors(fd);
   Require(fd < 0, 'no inherited inotify descriptor');
   ExhaustDescriptors;
@@ -249,11 +434,17 @@ begin
   EmptyWait(watcher, 50);
 
   CheckClosed(watcher, fd, 0, 'read');
+  CheckClosed(watcher, fd, 4000, 'read with time left');
   CheckClosed(watcher, pollFd, 50, 'timed poll');
   CheckClosed(watcher, pollFd, -1, 'untimed poll');
   EmptyWait(watcher, 0);
   watcher.Free;
   Require((Descriptors(fd) = beforeCount) and (fd < 0), 'Free releases all watcher descriptors');
+  AfterDispose;
+  FreeUnderWait(20000, 'a timed');
+  FreeUnderWait(-1, 'an untimed');
+  AfterFree;
+  Require((Descriptors(fd) = beforeCount) and (fd < 0), 'the later cases release their descriptors');
   DescriptorZero;
   WriteLn('inotify error paths ok');
 end.
