@@ -39,23 +39,49 @@ def check_target(compiler, build, work, target, prefix, launch, link_variant):
     start = assembly.index('\nrt_pollpark:\n')
     finish = assembly.index('\nrt_tcplisten:\n', start)
     wait = assembly[start:finish]
+    label = '.wi_ctl:' if native else '.awi_ctl:'
+    failed = '.wi_failed' if native else '.awi_failed'
     load_fd = '  movq %rbx, %rdx\n' if native else '  mov x2, x19\n'
     bad_fd = '  movq $-1, %rdx\n' if native else '  mov x2, #-1\n'
-    # Ask the real kernel for EBADF at either registration call. In
-    # the second case MOD is genuine and sees an absent entry (ENOENT).
-    if wait.count(load_fd) != 2:
+    force_mod = '  movl $3, %esi\n' if native else '  mov w1, #3\n'
+    test_add = '  cmpl $1, %esi\n  je 99f\n' if native else '  cmp w1, #1\n  b.eq 99f\n'
+    unexpected = (f'  movq $-22, %rax\n  jmp {failed}\n99:\n' if native else
+                  f'  mov x0, #-22\n  b {failed}\n99:\n')
+    retried = ('  testl %r12d, %r12d\n  jnz 98f\n' if native else '  cbnz w20, 98f\n')
+    resume = '  jmp 97f\n' if native else '  b 97f\n'
+    # Force real EBADF on the first ADD and on a MOD. The third case
+    # lets the kernel reject a missing entry before forcing EBADF on
+    # the retried ADD.
+    if wait.count(label) != 1 or wait.count(load_fd) != 1:
         raise SystemExit(f'{target}: accept registration fixture no longer matches')
-    for index, operation in enumerate(('MOD', 'ADD')):
-        offset = wait.index(load_fd) if index == 0 else wait.rindex(load_fd)
-        altered = wait[:offset] + bad_fd + wait[offset + len(load_fd):]
-        variant = work / f'{target}-{operation.lower()}-error'
+    variants = {
+        'first-add': test_add + unexpected + bad_fd,
+        'mod-error': force_mod + bad_fd,
+        'retry-add': retried + force_mod + load_fd + resume + '98:\n'
+                     + test_add + unexpected + bad_fd + '97:\n',
+    }
+    cases = {name: wait.replace(load_fd, code, 1) for name, code in variants.items()}
+    # Add the listener before the original ADD so the real kernel
+    # returns EEXIST. After the retry selects MOD, force EBADF there.
+    syscall = '  syscall\n' if native else '  svc #0\n'
+    reset = '  movl $233, %eax\n' if native else '  mov x0, x25\n'
+    test_result = ('  testq %rax, %rax\n' if native else '  cmp x0, #0\n')
+    check_result = (f'  jne {failed}\n' if native else f'  b.ne {failed}\n')
+    test_mod = '  cmpl $3, %esi\n  je 99f\n' if native else '  cmp w1, #3\n  b.eq 99f\n'
+    if wait.count(syscall) != 1:
+        raise SystemExit(f'{target}: expected one epoll_ctl instruction')
+    inject = (retried + syscall + test_result + check_result + reset + resume + '98:\n'
+              + test_mod + unexpected + bad_fd + '97:\n' + syscall)
+    cases['retry-mod'] = wait.replace(syscall, inject, 1)
+    for operation, altered in cases.items():
+        variant = work / f'{target}-{operation}'
         link_variant(binary, variant, prefix, assembly[:start] + altered + assembly[finish:])
         try:
             got = subprocess.run([*launch, variant], capture_output=True, timeout=10)
         except subprocess.TimeoutExpired:
-            raise SystemExit(f'{target}: accept parked after EPOLL_CTL_{operation} failed') from None
+            raise SystemExit(f'{target}: accept parked after {operation} failed') from None
         if (got.returncode, got.stdout, got.stderr) != (0, b'-9\n', b''):
-            raise SystemExit(f'{target}: EPOLL_CTL_{operation} expected -EBADF, '
+            raise SystemExit(f'{target}: {operation} expected -EBADF, '
                              f'got {got.returncode}, {got.stdout!r}, {got.stderr!r}')
 
 

@@ -47434,10 +47434,6 @@ begin
   Line('.wi_fd:');
   Line('  subq $16, %rsp');
   Line('  movq $0, 8(%rsp)');
-  { MOD first (P115, 1.1.1): after its first wait a descriptor stays
-    in the set, one-shot and disarmed, so ADD failed with EEXIST on
-    every later wait and MOD followed: two system calls a wait. MOD
-    re-arms it in one; ADD only when it is not in the set yet. }
   Line('  movl %r12d, (%rsp)');
   Line('  orl $0x40000000, (%rsp)');
   Line('  movq %r15, 4(%rsp)');
@@ -47463,47 +47459,57 @@ begin
   Line('  movq rt_epfdw(%rip), %r8');
   Line('  leaq rt_epsetw(%rip), %r9');
   Line('.wi_set:');
+  { Use the same membership table a close clears (P441). The first
+    wait adds the descriptor, as in Go runtime/netpoll_epoll.go. A
+    known entry can be rearmed with MOD. The kernel has the final say
+    if a descriptor was changed outside the runtime (epoll_ctl(2)). }
+  Line('  movl $3, %esi');
+  Line('  xorl %r12d, %r12d');
+  Line('  cmpq $65536, %rbx');
+  Line('  jae .wi_known');
+  Line('  addq %rbx, %r9');
+  Line('  cmpb $0, (%r9)');
+  Line('  jne .wi_known');
+  Line('  movl $1, %esi');
+  Line('  jmp .wi_ctl');
+  Line('.wi_known:');
+  Line('  xorl %r9d, %r9d');
+  Line('.wi_ctl:');
   Line('  movq %r8, %rdi');
-  Line('  movq $3, %rsi');
   Line('  movq %rbx, %rdx');
   Line('  movq %rsp, %r10');
-  Line('  movq $233, %rax');
+  Line('  movl $233, %eax');
   Line('  syscall');
   Line('  testq %rax, %rax');
   Line('  jns .wi_success');
-  { ENOENT (2) says the descriptor is not in the set yet; any other
-    answer is the wait's failure and is given back as it is, as the
-    accept's own wait gave it (P688) and as Go's netpollopen gives the
-    errno of its EpollCtl: a number that is not open (EBADF) or a file
-    epoll does not take (EPERM) would get the same answer from ADD }
+  { A mismatched entry permits one retry with the other operation.
+    Every other error is returned to the waiter (P688). }
+  Line('  testl %r12d, %r12d');
+  Line('  jnz .wi_failed');
+  Line('  cmpl $3, %esi');
+  Line('  jne .wi_exists');
   Line('  cmpq $-2, %rax');
   Line('  jne .wi_failed');
-  { not in the set yet: in it from here, so a close takes it out
-    first (P401) }
-  Line('  cmpq $65536, %rbx');
-  Line('  jae .wi_add');
-  Line('  movb $1, (%r9,%rbx)');
-  Line('.wi_add:');
-  Line('  movq %r8, %rdi');
-  Line('  movq $1, %rsi');
-  Line('  movq %rbx, %rdx');
-  Line('  movq %rsp, %r10');
-  Line('  movq $233, %rax');
-  Line('  syscall');
-  { P180: current Go netpoll_epoll.go netpollopen reports EpollCtl
-    errors. Never park on a registration that failed. Self-wake through
-    the SAME token/status protocol as an event or deadline; a deadline
-    racing this failure can win the token without queuing a running G.
-    A slot on G's saved stack keeps the result across park, stack
-    movement and timer cleanup; no live register survives a park. }
-  Line('  testq %rax, %rax');
-  Line('  jns .wi_success');
+  Line('  jmp .wi_retry');
+  Line('.wi_exists:');
+  Line('  cmpq $-17, %rax');
+  Line('  jne .wi_failed');
+  Line('.wi_retry:');
+  Line('  movl $1, %r12d');
+  Line('  xorl $2, %esi');
+  Line('  jmp .wi_ctl');
+  { Failed registration takes its own token through the normal wake
+    protocol, including any racing deadline (P180). }
   Line('.wi_failed:');
   Line('  movq %rax, 16(%rsp)');
   Line('  movq %r15, %rdi');
   Line('  call rt_pollwake');
   Line('  jmp .wi_cas');
   Line('.wi_success:');
+  Line('  testq %r9, %r9');
+  Line('  jz .wi_recorded');
+  Line('  movb $1, (%r9)');
+  Line('.wi_recorded:');
   Line('  movq $0, 16(%rsp)');
   Line('.wi_cas:');
   Line('  addq $16, %rsp');
@@ -70026,10 +70032,6 @@ begin
   Line('  sub sp, sp, #16');
   Line('  str xzr, [sp]');
   Line('  str xzr, [sp, #8]');
-  { MOD first (P115, 1.1.1): after its first wait a descriptor stays
-    in the set, one-shot and disarmed, so ADD failed with EEXIST on
-    every later wait and MOD followed: two system calls a wait. MOD
-    re-arms it in one; ADD only when it is not in the set yet. }
   Line('  orr w9, w20, #0x40000000');
   Line('  str w9, [sp]');
   Line('  str x24, [sp, #8]');
@@ -70043,41 +70045,52 @@ begin
   LdS('rt_epfdw', 'x25');
   LeaS('rt_epsetw', 'x26');
   Line('.awi_set:');
-  Line('  mov x0, x25');
-  Line('  mov x1, #3');
-  Line('  mov x2, x19');
-  Line('  mov x3, sp');
-  Line('  mov x8, #21');
-  Line('  svc #0');
-  Line('  cmp x0, #0');
-  Line('  b.ge .awi_success');
-  { ENOENT alone goes on to ADD, as on amd64 (P688): CMN adds, so it
-    sets the flags of x0 - (-2) (Arm ARM C6.2.93, CMN immediate) }
-  Line('  cmn x0, #2');
-  Line('  b.ne .awi_failed');
-  { in the set from here, as on amd64 (P401) }
+  { As on amd64. x26 is cleared if no membership byte needs updating. }
+  Line('  mov w1, #3');
+  Line('  mov w20, wzr');
   Line('  mov x9, #65536');
   Line('  cmp x19, x9');
-  Line('  b.hs .awi_add');
-  Line('  mov w10, #1');
-  Line('  strb w10, [x26, x19]');
-  Line('.awi_add:');
+  Line('  b.hs .awi_known');
+  Line('  add x26, x26, x19');
+  Line('  ldrb w9, [x26]');
+  Line('  cbnz w9, .awi_known');
+  Line('  mov w1, #1');
+  Line('  b .awi_ctl');
+  Line('.awi_known:');
+  Line('  mov x26, xzr');
+  Line('.awi_ctl:');
   Line('  mov x0, x25');
-  Line('  mov x1, #1');
   Line('  mov x2, x19');
   Line('  mov x3, sp');
   Line('  mov x8, #21');
   Line('  svc #0');
-  { P180: failed epoll registration takes its own token through the
-    normal wake protocol, including any racing deadline. }
   Line('  cmp x0, #0');
   Line('  b.ge .awi_success');
+  Line('  cbnz w20, .awi_failed');
+  Line('  cmp w1, #3');
+  Line('  b.ne .awi_exists');
+  Line('  cmn x0, #2');
+  Line('  b.ne .awi_failed');
+  Line('  b .awi_retry');
+  Line('.awi_exists:');
+  Line('  cmn x0, #17');
+  Line('  b.ne .awi_failed');
+  Line('.awi_retry:');
+  Line('  mov w20, #1');
+  Line('  eor w1, w1, #2');
+  Line('  b .awi_ctl');
+  { P180: failed epoll registration takes its own token through the
+    normal wake protocol, including any racing deadline. }
   Line('.awi_failed:');
   Line('  str x0, [sp, #16]');
   Line('  mov x0, x24');
   Line('  bl rt_pollwake');
   Line('  b .awi_cas');
   Line('.awi_success:');
+  Line('  cbz x26, .awi_recorded');
+  Line('  mov w9, #1');
+  Line('  strb w9, [x26]');
+  Line('.awi_recorded:');
   Line('  str xzr, [sp, #16]');
   Line('.awi_cas:');
   Line('  add sp, sp, #16');
