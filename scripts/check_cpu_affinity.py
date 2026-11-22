@@ -96,8 +96,17 @@ def check_target(compiler, build, working, cpu, launch):
          '-o', str(program), str(source)])
 
     allowed = os.sched_getaffinity(0)
-    expect(launch + [str(program)], min(32, max(1, len(allowed))), f'{cpu} current mask')
-    expect(['taskset', '-c', str(min(allowed))] + launch + [str(program)], 1, f'{cpu} single CPU')
+    pin = ['taskset', '-c', str(min(allowed))]
+    for value, expected in (('4', 4), ('+00065', 65), ('', 1), ('0', 1),
+                            ('-1', 1), (' 4', 1), ('4x', 1), ('10001', 1),
+                            ('999999999999999999999', 1)):
+        expect(pin + ['env', f'PASLANG_MAXPROCS={value}'] + launch + [str(program)],
+               expected, f'{cpu} PASLANG_MAXPROCS={value!r}')
+
+    # Tests of the mask must reach the syscall independently of the caller's environment.
+    launch = ['env', '-u', 'PASLANG_MAXPROCS'] + launch
+    expect(launch + [str(program)], min(10000, max(1, len(allowed))), f'{cpu} current mask')
+    expect(pin + launch + [str(program)], 1, f'{cpu} single CPU')
 
     assembly = program.with_suffix('.s').read_text()
     syscall = '  syscall\n' if native else '  svc #0\n'
@@ -109,7 +118,7 @@ def check_target(compiler, build, working, cpu, launch):
     for name, words, result, expected in (
         ('upper-word', [1, 15], 16, 5),
         ('single-high-cpu', [0, 1], 16, 1),
-        ('clamp', [-1], 8, 32),
+        ('wide-mask', [-1, 1], 16, 65),
         ('short-mask', [7, -1], 8, 3),
         ('failed', [-1], -1, 1),
         ('empty', [-1], 0, 1),

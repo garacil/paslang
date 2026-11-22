@@ -61,7 +61,7 @@ if pending < 1 or mark != 1:
 names = ("rt_msleep", "rt_nspinning", "rt_npollwait", "rt_maindone", "rt_nlive")
 snapshot = {name: word(name) for name in names}
 # the timers are each P's (P352): how many each holds, at P+2152
-timer_counts = [value("(unsigned long)&rt_allp") + index * 2176 + 2152
+timer_counts = [word("rt_allp") + index * 2176 + 2152
                 for index in range(word("rt_nproc"))]
 timer_snapshot = {address: value(f"*(unsigned long long*){address}") for address in timer_counts}
 register_names = ([f"x{index}" for index in range(31)] + ["sp", "pc", "cpsr"] if arm else

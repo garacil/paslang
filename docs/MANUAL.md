@@ -15008,10 +15008,12 @@ the dates too.
 
 A running program is a set of routines, Gs, on OS threads, Ms. A P is
 the right to execute Pascal code, its run queue and allocation cache.
-The number of Ps counts every CPU in the kernel's affinity mask,
-up to 32. A program restricted to one CPU starts with one P. If the
-affinity query fails or returns an empty mask, the runtime also uses
-one P. Each P belongs to at most one M.
+At startup, a positive decimal `PASLANG_MAXPROCS` overrides the
+number of Ps. It accepts the supported range from 1 to 10,000, the
+capacity of the scheduler's M table. With the variable unset or
+invalid, the runtime counts the CPUs in the kernel's affinity mask up
+to that capacity. A failed or empty query falls back to one P.
+Each P belongs to at most one M.
 Only the first M
 starts with the program; others start as work requires them. The current
 G is in a register (`r14` on amd64, `x28` on arm64) and every routine
