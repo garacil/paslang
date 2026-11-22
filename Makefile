@@ -953,6 +953,13 @@ GOLDEN_A64 += uint32legacy uint32rotate crc32width uint32bounds uint32memxor uin
 # woken. Both orders, with deadlines, both ways at once, TCP, numbers used again.
 GOLDEN += twowait
 GOLDEN_A64 += twowait
+# P441: a close wakes every routine parked on the descriptor, whatever the wait
+# (accept, read, write, connect, a datagram, WaitFd, WaitIo, WaitMs, WaitAny) and
+# whoever closes; a number given out again is the new file's; any number of
+# routines wait on one descriptor (P668's two readers, five accepting, forty
+# listeners); a close racing an octet, and accept loops under a close.
+GOLDEN += closewake
+GOLDEN_A64 += closewake
 # P672/P673: starvation handoff during cond.Wait, and ticket order across wrap.
 GOLDEN += condstarve condtickets
 GOLDEN_A64 += condstarve condtickets

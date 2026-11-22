@@ -8701,8 +8701,8 @@ stream socket as they serve TCP: `NetAccept`, `NetRead`, `NetWrite`,
 | `UnixPair(a, b)` | two stream sockets joined to each other in this process, a routine at each end |
 | `UnixPeer(fd, pid, uid, group)` | the process, user and group at the other end of a stream socket (`SO_PEERCRED`) |
 | `UnixSendFd(fd, passed, data)`, `UnixRecvFd(fd, max, passed)` | a descriptor along with a message (`SCM_RIGHTS`): the receiver gets its own descriptor for the same open file |
-| `UnixClose(fd)`, `UnixUnlink(path)` | the descriptor off the poller and closed; the socket file removed |
-| `WaitAny(fds, ev, ms)` | the first of the slice `fds` ready for `ev` (1 to read, 4 to write) within `ms` milliseconds, as an index, or -1; the routine parks |
+| `UnixClose(fd)`, `UnixUnlink(path)` | the descriptor closed as `NetClose` closes it, its waiters woken; the socket file removed |
+| `WaitAny(fds, ev, ms)` | the first of the slice `fds` ready for `ev` (1 to read, 4 to write) within `ms` milliseconds, as an index, or -1; the routine parks. -9 (`EBADF`) when one of them is closed while it waits (1.3.55): which one is not said, since its number may be another file's by then |
 
 `testdata/unixsock` runs every one of them on both machines, and
 `termd -unix path` serves the terminal on a Unix socket, its client
@@ -11937,14 +11937,14 @@ program has without `uses`:
 |---|---|
 | `NetListen(port)` | a TCP socket bound to `port` on every IPv4 address and listening, non-blocking, with `SO_REUSEADDR` and `TCP_NODELAY`: its descriptor, or a negative number when that fails |
 | `NetPort(fd)` | the socket's local port; 0 when it cannot be read |
-| `NetAccept(fd)` | the descriptor of the next connection, parking until one comes; a negative Linux error from accepting or from registering the wait |
+| `NetAccept(fd)` | the descriptor of the next connection, parking until one comes; a negative Linux error from accepting or from registering the wait, -9 (`EBADF`) when the listener is closed meanwhile; any number of routines may accept on one listener (1.3.55) |
 | `NetConnect(ip4, port)` | a connection to the IPv4 address given as one `Integer` (`127.0.0.1` is `$7F000001`), parking until it is made as Go's `connect` waits (a spurious wake or an interrupted call waits on, 1.1.102): its descriptor, or -1 |
 | `NetRead(fd, max, s)` | a procedure: parks until bytes come and puts up to `max` of them (1 to 65536) in the string variable `s`, which is empty at the end of the stream or on an error |
 | `NetWrite(fd, s)` | writes all of `s`, parking while the socket is full: the count written, negative on an error |
-| `NetClose(fd)` | a procedure: takes the descriptor off the poller and closes it |
-| `WaitFd(fd)` | parks until `fd` can be read; 0 on wake, negative errno if registration fails |
-| `WaitIo(fd, ev)` | parks until `fd` is ready for `ev`: 1 to read, 4 to write; 0 on wake, negative errno if registration fails |
-| `WaitMs(fd, ev, ms)` | `WaitIo`, which also wakes after `ms` milliseconds; 0 or less does not wait and answers 0, the answer of a deadline that came, as Go answers a deadline already past. Failed registration returns negative errno and removes its deadline |
+| `NetClose(fd)` | a procedure: wakes the routines waiting on the descriptor, takes it off the poller and closes it |
+| `WaitFd(fd)` | parks until `fd` can be read; 0 on wake, negative errno if registration fails, -9 (`EBADF`) when the descriptor is closed meanwhile |
+| `WaitIo(fd, ev)` | parks until `fd` is ready for `ev`: 1 to read, 4 to write; 0 on wake, negative errno if registration fails, -9 (`EBADF`) when the descriptor is closed meanwhile |
+| `WaitMs(fd, ev, ms)` | `WaitIo`, which also wakes after `ms` milliseconds; 0 or less does not wait and answers 0, the answer of a deadline that came, as Go answers a deadline already past. Failed registration returns negative errno and removes its deadline, and so does a close of the descriptor, with -9 |
 
 A descriptor a wait has put in the epoll set leaves it before it is
 closed, by `NetClose` and by any close made with `Syscall` (`OsClose`,
@@ -11954,6 +11954,34 @@ it closes it (1.1.241): left in, a socket closed while the thread in
 the kernel, and its peer waited for an end of the stream that did not
 come. A fork's child closes its copies without touching the set, which
 is its parent's.
+
+A close wakes every routine waiting on the descriptor (1.3.55): an
+accept, a read, a write, a connect on its way, a datagram, `WaitFd`,
+`WaitIo`, `WaitMs` and `WaitAny`, whoever closes it and with whichever
+word (`NetClose`, `TcpClose`, `UnixClose`, `UdpClose`, `FileClose`, a
+close made with `Syscall`). The wait answers -9 (`EBADF`), the transfer
+it belongs to gives that as its error (`NetRead` and `UdpRecvFrom` an
+empty string, `NetAccept`, `NetWrite` and `PasIoRead` -9), and the
+routine does not touch the descriptor again, whose number the next
+open may already have given to another file. Go's close does the same
+to the routines blocked on a file (`internal/poll`: "use of closed
+file"). So a server ends by closing its listeners and its connections:
+the routines parked on them come back and end. Before, they stayed
+parked for ever, and a program that waited for them never ended. A
+wait that begins while the close is under way waits for it to end, and
+then finds the number closed, or the file that has it now. What the
+runtime does not see is a close it does not make: `dup2` over a number
+or `close_range` wake nobody, though the next wait for that number
+finds the old one's registration gone and takes its place.
+
+Any number of routines may wait on one descriptor, for the same
+direction or for both (1.3.55): one at a time is registered with epoll
+and the others wait their turn, which comes when the first leaves,
+woken by the descriptor, by its deadline or by an error; epoll then
+looks at the descriptor again, so what one routine left is the next
+one's. Two routines reading one socket are both served, and so are five
+accepting on one listener. Before, the second wait for a direction took
+the first one's registration and the first was never woken.
 
 The three `Wait` words park the routine on the runtime's epoll, one wake
 per wait, and the thread goes on with other routines. After a wake the

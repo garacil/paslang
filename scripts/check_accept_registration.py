@@ -34,8 +34,10 @@ def check_target(compiler, build, work, target, prefix, launch, link_variant):
     subprocess.run([compiler, '-target', target, '-cpu', 'base', '-Fu', units,
                     '-o', binary, source], check=True, timeout=60)
     assembly = source.with_suffix('.s').read_text()
-    start = assembly.index('\nrt_acwait:\n')
-    finish = assembly.index('\nrt_tcpaccept:\n', start)
+    # NetAccept waits as every routine does (P441): the park of every
+    # wait, from its label to the next routine's.
+    start = assembly.index('\nrt_pollpark:\n')
+    finish = assembly.index('\nrt_tcplisten:\n', start)
     wait = assembly[start:finish]
     load_fd = '  movq %rbx, %rdx\n' if native else '  mov x2, x19\n'
     bad_fd = '  movq $-1, %rdx\n' if native else '  mov x2, #-1\n'

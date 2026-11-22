@@ -127,6 +127,27 @@ function PasNetWrite(Fd: Integer; P: Pointer; N: Integer): Integer;
 function PasConnect(Fd: Integer; Sa: Pointer; Size, Deadline: Integer): Integer;
 function PasNetConnect(Ip, Port: Integer): Integer;
 
+{$if PASLANG_FULLVERSION >= 1003055}
+{ The waits on a descriptor and its close (P441). WaitFd, WaitIo and
+  WaitMs are PasWaitIo and PasWaitMs, NetAccept is PasNetAccept: every
+  wait goes through the record of its descriptor. A close of the
+  descriptor, by NetClose or by Syscall, wakes every routine waiting on
+  it, which answers -9 (EBADF), and until that close has ended a wait on
+  it answers -9 at once; the runtime calls PasPollClosing before the
+  close and PasPollClosed after it. Any number of routines may wait on
+  one descriptor, for one direction or both: each is served.
+  PasWaitSet parks on Ep, an epoll set of the caller's that holds Fds,
+  until Ep can be read or Ms milliseconds pass (0 or less does not
+  wait): 0, a negative errno when the wait could not be registered, or
+  -9 when one of Fds was closed meanwhile; it is WaitAny's wait. }
+function PasWaitIo(Fd, Ev: Integer): Integer;
+function PasWaitMs(Fd, Ev, Ms: Integer): Integer;
+function PasNetAccept(Fd: Integer): Integer;
+procedure PasPollClosing(Fd: Integer);
+procedure PasPollClosed(Fd: Integer);
+function PasWaitSet(Ep: Integer; const Fds: array of Integer; Ms: Integer): Integer;
+{$endif}
+
 implementation
 
 { A failure the unit reports itself: a waitgroup counted below zero, as Go panics on a
@@ -1065,5 +1086,647 @@ begin
   end;
   Result := fd;
 end;
+
+{$if PASLANG_FULLVERSION >= 1003055}
+{ ---- the waits on a descriptor, and its close (P441) ---- }
+
+{ Go gives a descriptor one record for its life (runtime/netpoll.go
+  pollDesc) with a slot for the routine that reads and one for the
+  routine that writes, and its close evicts both before the descriptor
+  goes (internal/poll/fd_poll_runtime.go evict; poll_runtime_pollUnblock
+  sets closing and unblocks rg and wg), after fdMutex has refused every
+  new operation (fd_mutex.go increfAndClose). There the record belongs
+  to an object, poll.FD. A descriptor here is a number any routine may
+  hand to a wait or to a close, so the record is found by the number,
+  and its lock (Spin) orders the waits and the closes of that number:
+
+  - A wait names itself in the record and parks with rt_pollpark, which
+    lets the lock go only when the routine's token is armed and epoll
+    holds its registration. A close (PasPollClosing, called by the
+    runtime before every close it makes) takes the lock, adds one to
+    Gen and takes the token of every waiter the record names. So a
+    close comes whole before a wait or whole after its registration:
+    the waiter is always woken, sees Gen changed, and answers EBADF
+    without touching the descriptor again, whose number may be another
+    file's by then.
+  - Closing counts the closes of the number in flight, from the call
+    before the close to the call after it (PasPollClosed). A wait that
+    begins meanwhile waits for the close to end and then goes on: on a
+    number that is closed, where epoll answers EBADF, or on the file
+    that has the number now. Registered between the eviction and the
+    close itself, it would be parked on a file gone a moment later.
+  - Lead, for each direction (0 every wait but a wait to write alone,
+    1 that one: the two sets of rt_pollpark), is the token of the
+    routine registered with epoll, Ev0 the events of direction 0's, and
+    Head the routines waiting their turn behind it. A registration
+    holds one token, so a second wait for the same direction took the
+    first one's place and the first was never woken (P668's report: two
+    readers of one socket, two octets written, one read). The one that
+    leaves, woken by the descriptor, by its deadline or by an error,
+    wakes the first behind it, which registers itself: epoll_ctl reads
+    the descriptor's readiness again (EPOLL_CTL_MOD), so what the first
+    left is the second's. Go has one waiter a direction because
+    poll.FD's mutex lets one routine at a time read; with a number and
+    no object, the record is the queue.
+  - A routine that finds another registered first makes sure it still
+    is (PollProbe): a number closed where the runtime does not see it
+    (dup2 over it, close_range, a close in assembly) takes the
+    registration with it, and the routine named in the record would
+    keep every later wait of that number behind it for ever.
+  - Watch, the waits on several descriptors (PasWaitSet) this one is
+    part of.
+
+  The records are system pages that never go back (mmap), found through
+  three levels by the descriptor's number, a page each, 32 records a
+  page; the first 32 descriptors have theirs in the program's own data,
+  so a small program maps nothing. They are not the collector's: a
+  record names its waiters by token, and the nodes of Head and Watch
+  belong to routines parked in the calls below, whose frames keep them
+  alive until each has taken its node out, under the record's lock. No
+  node is reached from a record after its routine has gone on. }
+
+type
+  PPollCell = ^TPollCell;
+  TPollCell = record
+    V: Integer;
+  end;
+
+  PPollNode = ^TPollNode;
+  TPollNode = record
+    Next: PPollNode;
+    Token: Integer;
+    Cell: PPollCell;
+    Linked: Integer;
+  end;
+
+  PPollRec = ^TPollRec;
+  TPollRec = record
+    Spin: Integer;
+    Gen: Integer;
+    Closing: Integer;
+    Lead: array[0..1] of Integer;
+    Ev0: Integer;
+    Head: array[0..1] of PPollNode;
+    Watch: PPollNode;
+    Spare: array[0..6] of Integer;
+  end;
+
+const
+  { SizeOf(TPollRec): 32 of them a page }
+  PollRecSize = 128;
+
+var
+  PollLeaf0: array[0..31] of TPollRec;
+  PollTop: array[0..255] of Integer;
+  PollTabLock: Integer;
+
+{ The token this routine's next wait arms (rt_polltoken). }
+function PollToken: Integer;
+begin
+  asm amd64 (Result: out rax)
+    call rt_polltoken
+  end;
+  asm arm64 (Result: out x0)
+    str x30, [sp, #-16]!
+    bl rt_polltoken
+    ldr x30, [sp], #16
+  end;
+end;
+
+{ The routine of Token, when its wait is still armed, is made ready
+  (rt_pollwake); a token whose wait has ended wakes nobody. }
+procedure PollWake(Token: Integer);
+begin
+  asm amd64 (Token: in rdi)
+    call rt_pollwake
+  end;
+  asm arm64 (Token: in x0)
+    str x30, [sp, #-16]!
+    bl rt_pollwake
+    ldr x30, [sp], #16
+  end;
+end;
+
+{ The park (rt_pollpark): on Fd for Ev, or on the token alone when Fd is
+  negative, until Deadline, a Nanotime (-1 none), and not at all when
+  the word at Cancel (nil: none) is not Expect once the token is armed.
+  Held, a lock this routine holds (SpinLock) or nil, is let go once the
+  token is armed and registered. 0 on a wake, -9 for a changed word,
+  another negative errno when epoll refused the descriptor. }
+function PollPark(Fd, Ev, Deadline: Integer; Cancel: Pointer; Expect: Integer; Held: Pointer): Integer;
+begin
+  asm amd64 (Fd: in rdi; Ev: in rsi; Deadline: in rdx; Cancel: in rcx; Expect: in r8; Held: in r9; Result: out rax)
+    call rt_pollpark
+  end;
+  asm arm64 (Fd: in x0; Ev: in x1; Deadline: in x2; Cancel: in x3; Expect: in x4; Held: in x5; Result: out x0)
+    str x30, [sp, #-16]!
+    bl rt_pollpark
+    ldr x30, [sp], #16
+  end;
+end;
+
+{ The runtime's two epoll sets: the readers' and the writers'. }
+function PollSetR: Integer;
+begin
+  asm amd64 (Result: out rax)
+    movq rt_epfd(%rip), %rax
+  end;
+  asm arm64 (Result: out x0)
+    adrp x0, rt_epfd
+    ldr x0, [x0, :lo12:rt_epfd]
+  end;
+end;
+
+function PollSetW: Integer;
+begin
+  asm amd64 (Result: out rax)
+    movq rt_epfdw(%rip), %rax
+  end;
+  asm arm64 (Result: out x0)
+    adrp x0, rt_epfdw
+    ldr x0, [x0, :lo12:rt_epfdw]
+  end;
+end;
+
+{ A page of zeros from the system (mmap: PROT_READ and PROT_WRITE,
+  MAP_PRIVATE and MAP_ANONYMOUS), or 0. }
+function PollPage: Integer;
+begin
+  if Amd64 = 1 then
+    Result := Syscall(9, 0, 4096, 3, 34, -1, 0)
+  else
+    Result := Syscall(222, 0, 4096, 3, 34, -1, 0);
+  if (Result < 0) and (Result > -4096) then
+    Result := 0;
+end;
+
+{ The page the word at P names, mapped when it names none yet: 0 when
+  the system gives no page. A page is published once and never taken
+  back, and it is all zeros when its address is stored, so a reader
+  needs no lock. }
+function PollSlot(P: Integer): Integer;
+begin
+  Result := AtomicLoad(PInt64(Pointer(P))^);
+  if Result <> 0 then
+    Exit;
+  SpinLock(@PollTabLock);
+  Result := PInt64(Pointer(P))^;
+  if Result = 0 then
+  begin
+    Result := PollPage;
+    if Result <> 0 then
+      AtomicStore(PInt64(Pointer(P))^, Result);
+  end;
+  SpinUnlock(@PollTabLock);
+end;
+
+{ The descriptor as the kernel reads it: an int, the low 32 bits of the
+  word a system call is given (close(2) takes an unsigned int and
+  epoll_ctl an int, and neither has a descriptor above 2^31 - 1), so a
+  wait and a close of one number find one record whatever the word's
+  high half held. -1 for a number no descriptor has. }
+function PollFd(Fd: Integer): Integer;
+begin
+  Result := Fd and $FFFFFFFF;
+  if Result > 2147483647 then
+    Result := -1;
+end;
+
+{ The record of descriptor Fd, 0 to 2^31 - 1; nil when the system has
+  no page for it. }
+function PollRec(Fd: Integer): PPollRec;
+var
+  p: Integer;
+begin
+  if Fd < 32 then
+  begin
+    Result := @PollLeaf0[Fd];
+    Exit;
+  end;
+  Result := nil;
+  p := PollSlot(Integer(@PollTop[Fd shr 23]));
+  if p = 0 then
+    Exit;
+  p := PollSlot(p + ((Fd shr 14) and 511) * 8);
+  if p = 0 then
+    Exit;
+  p := PollSlot(p + ((Fd shr 5) and 511) * 8);
+  if p = 0 then
+    Exit;
+  Result := PPollRec(Pointer(p + (Fd and 31) * PollRecSize));
+end;
+
+{ A routine that finds a close of its descriptor under way, or its turn
+  not come, lets the others run: the first rounds by yielding, then by
+  sleeping a millisecond a round, since a close may take its time. }
+procedure PollYield(var Rounds: Integer);
+begin
+  Rounds := Rounds + 1;
+  if Rounds < 64 then
+    Gosched
+  else
+    Sleep(1);
+end;
+
+{ Node out of the list at Head, when it is in it. Under the record's
+  lock. }
+procedure PollUnlink(var Head: PPollNode; Node: PPollNode);
+var
+  q: PPollNode;
+begin
+  if Node^.Linked = 0 then
+    Exit;
+  Node^.Linked := 0;
+  if Head = Node then
+  begin
+    Head := Node^.Next;
+    Exit;
+  end;
+  q := Head;
+  while (q <> nil) and (q^.Next <> Node) do
+    q := q^.Next;
+  if q <> nil then
+    q^.Next := Node^.Next;
+end;
+
+{ The token of the first routine waiting its turn for direction D of R,
+  taken out of the queue, or 0. Under the record's lock; the caller
+  wakes it once the lock is dropped. }
+function PollNext(R: PPollRec; D: Integer): Integer;
+var
+  n: PPollNode;
+begin
+  Result := 0;
+  n := R^.Head[D];
+  if n = nil then
+    Exit;
+  R^.Head[D] := n^.Next;
+  n^.Linked := 0;
+  Result := n^.Token;
+end;
+
+{ Is the routine R names for direction D of Fd still registered? Its
+  registration is armed again as it was (EPOLL_CTL_MOD with its own
+  events and token, which changes nothing it could tell): 0 when epoll
+  still holds it, -2 (ENOENT) when the number is not in the set, so the
+  file it was registered for is gone and the number is another's, -9
+  when the number is not open at all. Under the record's lock; the
+  event is amd64's packed twelve octets or arm64's sixteen. }
+function PollProbe(R: PPollRec; Fd, D: Integer): Integer;
+var
+  evt: array[0..1] of Integer;
+  mask, tok: Integer;
+begin
+  tok := R^.Lead[D];
+  if D = 1 then
+    mask := 4
+  else
+    mask := R^.Ev0 and $FFFFFFFF;
+  mask := mask or $40000000;
+  if Amd64 = 1 then
+  begin
+    evt[0] := mask or (tok shl 32);
+    evt[1] := (tok shr 32) and $FFFFFFFF;
+    if D = 1 then
+      Result := Syscall(233, PollSetW, 3, Fd, @evt)
+    else
+      Result := Syscall(233, PollSetR, 3, Fd, @evt);
+  end
+  else
+  begin
+    evt[0] := mask;
+    evt[1] := tok;
+    if D = 1 then
+      Result := Syscall(21, PollSetW, 3, Fd, @evt)
+    else
+      Result := Syscall(21, PollSetR, 3, Fd, @evt);
+  end;
+end;
+
+{ One wait: Fd ready for Ev, Deadline (a Nanotime, -1 none) come, or
+  the descriptor closed. }
+function PollWait(Fd, Ev, Deadline: Integer): Integer;
+var
+  r: PPollRec;
+  d, expect, tok, wake, rounds, pr: Integer;
+  node, q: PPollNode;
+  turn: Boolean;
+begin
+  Fd := PollFd(Fd);
+  if Fd < 0 then
+  begin
+    Result := -9;
+    Exit;
+  end;
+  r := PollRec(Fd);
+  if r = nil then
+  begin
+    Result := -12;
+    Exit;
+  end;
+  if Ev = 4 then
+    d := 1
+  else
+    d := 0;
+  node := nil;
+  rounds := 0;
+  while True do
+  begin
+    SpinLock(@r^.Spin);
+    if r^.Closing <> 0 then
+    begin
+      SpinUnlock(@r^.Spin);
+      PollYield(rounds);
+      Continue;
+    end;
+    expect := r^.Gen;
+    tok := PollToken;
+    if r^.Lead[d] = 0 then
+    begin
+      { Nobody is registered for this direction: this routine is, and
+        the park lets the lock go once epoll has it. }
+      r^.Lead[d] := tok;
+      if d = 0 then
+        r^.Ev0 := Ev;
+      Result := PollPark(Fd, Ev, Deadline, nil, 0, @r^.Spin);
+      wake := 0;
+      SpinLock(@r^.Spin);
+      if r^.Gen <> expect then
+        Result := -9
+      else if r^.Lead[d] = tok then
+      begin
+        r^.Lead[d] := 0;
+        wake := PollNext(r, d);
+      end
+      else if Result = 0 then
+        { another routine found this one's registration gone
+          (PollProbe) and took its place: the file it waited on is no
+          more }
+        Result := -9;
+      SpinUnlock(@r^.Spin);
+      if wake <> 0 then
+        PollWake(wake);
+      Exit;
+    end;
+    { Another routine is: wait for the turn, on the token alone. The
+      node is made with no lock held, since making it may wait for the
+      collector. }
+    if node = nil then
+    begin
+      SpinUnlock(@r^.Spin);
+      New(node);
+      node^.Next := nil;
+      node^.Token := 0;
+      node^.Cell := nil;
+      node^.Linked := 0;
+      Continue;
+    end;
+    pr := PollProbe(r, Fd, d);
+    if pr < 0 then
+    begin
+      wake := r^.Lead[d];
+      r^.Lead[d] := 0;
+      SpinUnlock(@r^.Spin);
+      PollWake(wake);
+      if pr <> -2 then
+      begin
+        Result := pr;
+        Exit;
+      end;
+      Continue;
+    end;
+    node^.Token := tok;
+    node^.Next := nil;
+    node^.Linked := 1;
+    q := r^.Head[d];
+    if q = nil then
+      r^.Head[d] := node
+    else
+    begin
+      while q^.Next <> nil do
+        q := q^.Next;
+      q^.Next := node;
+    end;
+    Result := PollPark(-1, 0, Deadline, nil, 0, @r^.Spin);
+    SpinLock(@r^.Spin);
+    if r^.Gen <> expect then
+    begin
+      SpinUnlock(@r^.Spin);
+      Result := -9;
+      Exit;
+    end;
+    { Still in the queue: the deadline woke it. Out of it: the turn is
+      this routine's. }
+    turn := node^.Linked = 0;
+    PollUnlink(r^.Head[d], node);
+    SpinUnlock(@r^.Spin);
+    if (Deadline >= 0) and (Nanotime >= Deadline) then
+    begin
+      { The deadline came: 0, the answer of a wait that ran out. A turn
+        given to a routine that leaves goes on to the next. }
+      if turn then
+      begin
+        wake := 0;
+        SpinLock(@r^.Spin);
+        if (r^.Gen = expect) and (r^.Lead[d] = 0) then
+          wake := PollNext(r, d);
+        SpinUnlock(@r^.Spin);
+        if wake <> 0 then
+          PollWake(wake);
+      end;
+      Result := 0;
+      Exit;
+    end;
+  end;
+end;
+
+{ WaitFd and WaitIo: the runtime's rt_waitio jumps here. }
+function PasWaitIo(Fd, Ev: Integer): Integer;
+begin
+  Result := PollWait(Fd, Ev, -1);
+end;
+
+{ WaitMs: the runtime's rt_waitms jumps here. At most 2^40 ms, so the
+  deadline cannot overflow; 0 or less returns 0 at once, the answer of
+  a deadline that came, as Go answers pollErrTimeout at once for a
+  deadline already past (runtime/netpoll.go netpollcheckerr). }
+function PasWaitMs(Fd, Ev, Ms: Integer): Integer;
+begin
+  Result := 0;
+  if Ms <= 0 then
+    Exit;
+  if Ms > 1099511627776 then
+    Ms := 1099511627776;
+  Result := PollWait(Fd, Ev, Nanotime + Ms * 1000000);
+end;
+
+{ NetAccept: the runtime's rt_tcpaccept jumps here. The next connection
+  of the listening socket Fd, a socket that does not block and closes
+  on exec (accept4 with SOCK_NONBLOCK and SOCK_CLOEXEC), parking until
+  one comes: its descriptor, or a negative errno from accept4 or from
+  the wait, -9 when the listener was closed meanwhile. The loop is the
+  one of every transfer (PasIoRetry), as Go's FD.Accept is
+  (internal/poll/fd_unix.go). }
+function PasNetAccept(Fd: Integer): Integer;
+var
+  nr: Integer;
+begin
+  if Amd64 = 1 then
+    nr := 288
+  else
+    nr := 242;
+  repeat
+    Result := Syscall(nr, Fd, 0, 0, 526336);
+  until not PasIoRetry(Result, Fd, 1, 0);
+end;
+
+{ Before a close of Fd: every routine waiting on it is woken with EBADF
+  and no wait on it begins until PasPollClosed. The runtime calls it
+  (rt_closeout through rt_gocall) with preemption off, so it neither
+  parks nor makes anything: the tokens are taken under the record's
+  lock, which is safe since waking takes the scheduler's locks and none
+  of those is ever held while this one is taken. A watcher's cell is
+  stored atomically before its token is taken: on amd64 no read passes
+  a locked instruction (Intel SDM vol. 3A, 11.2.2) and on arm64 the
+  load with acquire of rt_pollwake cannot come before a store with
+  release (Arm ARM B2.6.10), while the watcher arms its token, with
+  rt_pollarm's barrier, and then reads the cell. }
+procedure PasPollClosing(Fd: Integer);
+var
+  r: PPollRec;
+  n, nx: PPollNode;
+  d, t: Integer;
+begin
+  Fd := PollFd(Fd);
+  if Fd < 0 then
+    Exit;
+  r := PollRec(Fd);
+  if r = nil then
+    Exit;
+  SpinLock(@r^.Spin);
+  r^.Gen := r^.Gen + 1;
+  r^.Closing := r^.Closing + 1;
+  for d := 0 to 1 do
+  begin
+    t := r^.Lead[d];
+    r^.Lead[d] := 0;
+    if t <> 0 then
+      PollWake(t);
+    n := r^.Head[d];
+    r^.Head[d] := nil;
+    while n <> nil do
+    begin
+      nx := n^.Next;
+      n^.Next := nil;
+      n^.Linked := 0;
+      PollWake(n^.Token);
+      n := nx;
+    end;
+  end;
+  n := r^.Watch;
+  r^.Watch := nil;
+  while n <> nil do
+  begin
+    nx := n^.Next;
+    n^.Next := nil;
+    n^.Linked := 0;
+    AtomicStore(n^.Cell^.V, 1);
+    PollWake(n^.Token);
+    n := nx;
+  end;
+  SpinUnlock(@r^.Spin);
+end;
+
+{ After the close of Fd that PasPollClosing announced. }
+procedure PasPollClosed(Fd: Integer);
+var
+  r: PPollRec;
+begin
+  Fd := PollFd(Fd);
+  if Fd < 0 then
+    Exit;
+  r := PollRec(Fd);
+  if r = nil then
+    Exit;
+  SpinLock(@r^.Spin);
+  if r^.Closing > 0 then
+    r^.Closing := r^.Closing - 1;
+  SpinUnlock(@r^.Spin);
+end;
+
+{ WaitAny's wait: see the interface. The routine is named in the record
+  of each of Fds, so a close of any of them takes its token; the cancel
+  word is a cell of the collector's that every node names, since a
+  routine's stack may move while it is parked. The set is the caller's
+  alone, so nobody closes it under this wait and it needs no record. }
+function PasWaitSet(Ep: Integer; const Fds: array of Integer; Ms: Integer): Integer;
+var
+  nodes: array of PPollNode;
+  cell: PPollCell;
+  r: PPollRec;
+  i, n, tok, deadline, rounds: Integer;
+  linked: Boolean;
+begin
+  Result := 0;
+  if Ms <= 0 then
+    Exit;
+  if Ms > 1099511627776 then
+    Ms := 1099511627776;
+  n := Length(Fds);
+  New(cell);
+  cell^.V := 0;
+  SetLength(nodes, n);
+  for i := 0 to n - 1 do
+  begin
+    New(nodes[i]);
+    nodes[i]^.Next := nil;
+    nodes[i]^.Token := 0;
+    nodes[i]^.Cell := cell;
+    nodes[i]^.Linked := 0;
+  end;
+  { every record there is before the token is read: finding one may map
+    a page, and nothing between the token and the park may arm another }
+  for i := 0 to n - 1 do
+    if (PollFd(Fds[i]) >= 0) and (PollRec(PollFd(Fds[i])) = nil) then
+    begin
+      Result := -12;
+      Exit;
+    end;
+  deadline := Nanotime + Ms * 1000000;
+  tok := PollToken;
+  rounds := 0;
+  for i := 0 to n - 1 do
+    if PollFd(Fds[i]) >= 0 then
+    begin
+      r := PollRec(PollFd(Fds[i]));
+      linked := False;
+      repeat
+        SpinLock(@r^.Spin);
+        if r^.Closing = 0 then
+        begin
+          nodes[i]^.Token := tok;
+          nodes[i]^.Next := r^.Watch;
+          nodes[i]^.Linked := 1;
+          r^.Watch := nodes[i];
+          linked := True;
+        end;
+        SpinUnlock(@r^.Spin);
+        if not linked then
+          PollYield(rounds);
+      until linked;
+    end;
+  Result := PollPark(Ep, 1, deadline, cell, 0, nil);
+  for i := 0 to n - 1 do
+    if nodes[i]^.Linked <> 0 then
+    begin
+      r := PollRec(PollFd(Fds[i]));
+      SpinLock(@r^.Spin);
+      PollUnlink(r^.Watch, nodes[i]);
+      SpinUnlock(@r^.Spin);
+    end;
+  if AtomicLoad(cell^.V) <> 0 then
+    Result := -9;
+end;
+{$endif}
 
 end.

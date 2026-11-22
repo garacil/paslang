@@ -1601,7 +1601,7 @@ begin
       16, cmd/internal/obj/arm64/asm7.go funcAlign). In code only: a
       label of the runtime in a data section stays where its data is;
       the padding of a code section is no-op instructions (as.info
-      7.75), so an entry the code before it falls into (rt_waitio2) runs
+      7.75), so an entry the code before it falls into (rt_waitio) runs
       them first. Not amd64: aligned to 32 as Go aligns them
       (cmd/link/internal/amd64/l.go funcAlign), entries moved the hot
       loops across 64-byte lines on this Zen 2 and pairs pinned to one
@@ -45694,7 +45694,7 @@ begin
     program is dead if nothing can wake anything: no M spinning or being
     woken (rt_nspinning; rt_wakep claims it before it pops an M), no
     routine asleep on a timer (rt_anytimer, P352), none parked on the poller
-    (rt_npollwait, kept by rt_waitio and rt_acwait), no pending signal
+    (rt_npollwait, kept by rt_pollpark), no pending signal
     for the idle poller (P687), and a routine still alive. The
     reads are consistent because the word is read again at the end:
     with the same value nobody woke meanwhile, so every M was asleep
@@ -46473,7 +46473,7 @@ begin
   Line('  movq %rsp, %r10');
   Line('  movq $233, %rax');
   Line('  syscall');
-  { the writers' set (P667, at rt_waitio2), a member of the first for
+  { the writers' set (P667, at rt_pollpark), a member of the first for
     reading, level-triggered: its event carries 2 where a wait's carries
     its token and the eventfd's 1 }
   Line('  movq $524288, %rdi');
@@ -47242,20 +47242,40 @@ begin
     a channel was woken by that descriptor again and took it for the
     channel's wake (1.0.57). A registration is one-shot, so a ready
     descriptor raises one event per wait instead of one per poll.
-    rt_pollarm: the token in rax; rcx clobbered. }
+    rt_pollarm: the token in rax; rcx clobbered. The number + 1 goes into
+    G+192 with xchg, whose memory operand takes the processor's lock
+    (Intel SDM vol. 2D, XCHG), and no read is reordered with a locked
+    instruction (vol. 3A, 11.2.2): rt_pollpark reads its cancel word
+    after it, so of a wait arming itself and a close changing that word
+    and then taking the token, one sees the other (P441), as Go's
+    netpollblock stores pdWait with a CAS before netpollcheckerr reads
+    the closing bit (runtime/netpoll.go). A plain store could wait in
+    this processor's store buffer while the read went ahead of it.
+    rt_polltoken: the token the routine's next rt_pollarm gives, for the
+    record of a descriptor to hold before the wait arms it (rax; no
+    other register changes). }
   Line('rt_pollarm:');
   Line('  movl 200(%r14), %eax');
   Line('  incl %eax');
   Line('  andl $65535, %eax');
   Line('  movl %eax, 200(%r14)');
   Line('  leal 1(%rax), %ecx');
-  Line('  movq %rcx, 192(%r14)');
+  Line('  xchgq %rcx, 192(%r14)');
+  Line('  shlq $48, %rax');
+  Line('  orq %r14, %rax');
+  Line('  ret');
+  Line('.globl rt_polltoken');
+  Line('rt_polltoken:');
+  Line('  movl 200(%r14), %eax');
+  Line('  incl %eax');
+  Line('  andl $65535, %eax');
   Line('  shlq $48, %rax');
   Line('  orq %r14, %rax');
   Line('  ret');
   Line('');
   { rt_pollwake: rdi a token from an event; its routine is readied only
     while that wait is still armed. }
+  Line('.globl rt_pollwake');
   Line('rt_pollwake:');
   Line('  movq %rdi, %rax');
   Line('  shrq $48, %rax');
@@ -47269,21 +47289,53 @@ begin
   Line('.pw_out:');
   Line('  ret');
   Line('');
+  { WaitFd, WaitIo and WaitMs are Pascal (PasWaitIo and PasWaitMs in
+    pasroutines, P441): a wait goes through the record of its
+    descriptor, where a close finds it and a second waiter of the same
+    direction takes its turn, and parks in rt_pollpark. rdi, rsi and rdx
+    are already the routine's arguments; a jmp leaves the caller's
+    return address for its ret (Intel SDM vol. 2A, JMP). }
+  Line('.weak p_f.11_pasroutines9_paswaitio');
+  Line('.weak p_f.11_pasroutines9_paswaitms');
   Line('.globl rt_waitfd');
   Line('rt_waitfd:');
   Line('  movq $1, %rsi');
-  { rdi fd, rsi events (EPOLLIN 1, EPOLLOUT 4); rt_waitio2 also rdx, a
-    deadline on the monotonic clock in nanoseconds, put on the runtime's
-    timers with the same token (rt_waitms), or -1. Status 1 before epoll_ctl, so a ready fd cannot lose the wake.
-    Callee-saved registers survive the park. }
   Line('rt_waitio:');
-  Line('  movq $-1, %rdx');
-  Line('rt_waitio2:');
+  Line('  jmp p_f.11_pasroutines9_paswaitio');
+  Line('.globl rt_waitms');
+  Line('rt_waitms:');
+  Line('  jmp p_f.11_pasroutines9_paswaitms');
+  Line('');
+  { rt_pollpark: the park of a wait on the poller. rdi a descriptor, or
+    a negative number for a wait on the token alone (a routine waiting
+    its turn behind the one registered for the descriptor, woken through
+    its token by rt_pollwake); rsi events (EPOLLIN 1, EPOLLOUT 4); rdx a
+    deadline on the monotonic clock in nanoseconds, put on the runtime's
+    timers with the same token, or -1; rcx the address of the wait's
+    cancel word, or 0, and r8 the value it has while the wait may go on;
+    r9 a runtime lock the caller holds, or 0. rax 0 on a wake, a
+    negative errno when the registration failed, and -9 (EBADF) when
+    the cancel word had changed: whoever changes it (a close of a
+    member of a WaitAny, PasPollClosing) takes the token afterwards, so
+    the change and the park cannot miss each other (rt_pollarm).
+    The lock is let go once the token is armed and the descriptor
+    registered, and before the park: the record of a descriptor
+    (pasroutines) is locked from the moment a wait names itself in it
+    until epoll holds its registration, so a close of the descriptor,
+    which takes the same lock, comes whole before the wait or whole
+    after its registration, never between the two, where the
+    registration of a number already closed and open again as another
+    file would have taken that file's own waiter's place.
+    Status 1 before epoll_ctl, so a ready fd cannot lose the wake.
+    Callee-saved registers survive the park. }
+  Line('rt_pollpark:');
   Line('  pushq %rbx');
   Line('  pushq %r12');
   Line('  pushq %r13');
   Line('  pushq %r15');
   Line('  subq $16, %rsp'); { result survives actual park/migration }
+  { the lock beside the result, until it is let go }
+  Line('  movq %r9, 8(%rsp)');
   Line('  movq %rdi, %rbx');
   Line('  movq %rsi, %r12');
   Line('  movq %rdx, %r13');
@@ -47292,10 +47344,12 @@ begin
   Line('  movq %rax, 48(%r14)');
   Line('  movq %rsp, 40(%r14)');
   Line('  movq %rbp, 56(%r14)');
+  { the cancel word's address and value wait on the stack: rt_pollarm
+    takes rcx, and rt_tadd the caller-saved registers }
+  Line('  pushq %r8');
+  Line('  pushq %rcx');
   Line('  call rt_pollarm');
   Line('  movq %rax, %r15');
-  Line('  subq $16, %rsp');
-  Line('  movq $0, 8(%rsp)');
   Line('  testq %r13, %r13');
   Line('  js .wi_one');
   Line('  movq %r13, 208(%r14)');
@@ -47305,6 +47359,29 @@ begin
   Line('  movq 8(%rax), %rsi');
   Line('  call rt_tadd');
   Line('.wi_one:');
+  Line('  popq %rcx');
+  Line('  popq %r8');
+  { The cancel word, read with the token armed (P441). Changed: the
+    wait ends with EBADF through the token's own protocol, as a failed
+    registration below, so a deadline or the closer racing it can win
+    the token without queuing a routine that runs. }
+  Line('  testq %rcx, %rcx');
+  Line('  jz .wi_live');
+  Line('  cmpq %r8, (%rcx)');
+  Line('  je .wi_live');
+  Line('  movq $-9, (%rsp)');
+  Line('  movq %r15, %rdi');
+  Line('  call rt_pollwake');
+  Line('  jmp .wi_cas0');
+  Line('.wi_live:');
+  { no descriptor: the token alone }
+  Line('  testq %rbx, %rbx');
+  Line('  jns .wi_fd');
+  Line('  movq $0, (%rsp)');
+  Line('  jmp .wi_cas0');
+  Line('.wi_fd:');
+  Line('  subq $16, %rsp');
+  Line('  movq $0, 8(%rsp)');
   { MOD first (P115, 1.1.1): after its first wait a descriptor stays
     in the set, one-shot and disarmed, so ADD failed with EEXIST on
     every later wait and MOD followed: two system calls a wait. MOD
@@ -47320,12 +47397,13 @@ begin
     testdata/twowait). Go keeps a slot for each direction in the
     descriptor's record (runtime/netpoll.go pollDesc.rg and wg, and
     netpoll_epoll.go maps an event to 'r', 'w' or both) under one
-    registration for the descriptor's life; here a descriptor is a number
-    with no record and a wait is armed one-shot, so the waits for writing
-    alone (EPOLLOUT, 4) go to a set of their own and every other to the
-    first: a registration and a token for each direction. Go's form is
-    P668. r8 the set and r9 its table: a system call keeps both (only
-    rax, rcx and r11 change, SDM vol. 2B SYSCALL). }
+    registration for the descriptor's life; here a wait is armed
+    one-shot, so the waits for writing alone (EPOLLOUT, 4) go to a set
+    of their own and every other to the first: a registration and a
+    token for each direction, and the record of the descriptor
+    (pasroutines, P441) lets one routine at a time arm each. Go's one
+    registration is P668. r8 the set and r9 its table: a system call
+    keeps both (only rax, rcx and r11 change, SDM vol. 2B SYSCALL). }
   Line('  movq rt_epfd(%rip), %r8');
   Line('  leaq rt_epset(%rip), %r9');
   Line('  cmpq $4, %r12');
@@ -47341,6 +47419,13 @@ begin
   Line('  syscall');
   Line('  testq %rax, %rax');
   Line('  jns .wi_success');
+  { ENOENT (2) says the descriptor is not in the set yet; any other
+    answer is the wait's failure and is given back as it is, as the
+    accept's own wait gave it (P688) and as Go's netpollopen gives the
+    errno of its EpollCtl: a number that is not open (EBADF) or a file
+    epoll does not take (EPERM) would get the same answer from ADD }
+  Line('  cmpq $-2, %rax');
+  Line('  jne .wi_failed');
   { not in the set yet: in it from here, so a close takes it out
     first (P401) }
   Line('  cmpq $65536, %rbx');
@@ -47361,6 +47446,7 @@ begin
     movement and timer cleanup; no live register survives a park. }
   Line('  testq %rax, %rax');
   Line('  jns .wi_success');
+  Line('.wi_failed:');
   Line('  movq %rax, 16(%rsp)');
   Line('  movq %r15, %rdi');
   Line('  call rt_pollwake');
@@ -47369,6 +47455,14 @@ begin
   Line('  movq $0, 16(%rsp)');
   Line('.wi_cas:');
   Line('  addq $16, %rsp');
+  Line('.wi_cas0:');
+  { the caller's lock, now that the token is armed and registered;
+    rt_unlock keeps every register but rax }
+  Line('  movq 8(%rsp), %rdi');
+  Line('  testq %rdi, %rdi');
+  Line('  jz .wi_unl');
+  Line('  call rt_unlock');
+  Line('.wi_unl:');
   Line('  lock incq rt_npollwait(%rip)');
   { The m is read before the CAS, never after. The moment the status
     becomes 2 this G can be taken off the epoll set by another thread,
@@ -47404,38 +47498,6 @@ begin
   Line('  popq %rbx');
   Line('  ret');
   Line('');
-  { rdi fd, rsi events, rdx milliseconds: rt_waitio2 with a deadline on
-    the runtime's timers (P115, 1.1.1). It made a timerfd, armed it, put
-    it on the epoll set and closed it, five system calls a wait where Go
-    uses a timer of its runtime; a client with a deadline on each answer
-    (dnsd's) paid 14% of the time. At most 2^40 ms, so the deadline
-    cannot overflow; 0 or less returns 0 at once, the answer of a
-    deadline that came, as Go answers pollErrTimeout at once for a
-    deadline already past (runtime/netpoll.go, netpollcheckerr). P213: a
-    bare ret gave back rax, the ms itself, so -7 read as an errno.
-    xorl zero-extends into rax (SDM vol. 1, 3.4.1.1). }
-  Line('.globl rt_waitms');
-  Line('rt_waitms:');
-  Line('  testq %rdx, %rdx');
-  Line('  jle .wm_ret');
-  Line('  movabsq $1099511627776, %rax');
-  Line('  cmpq %rax, %rdx');
-  Line('  jbe .wm_ms');
-  Line('  movq %rax, %rdx');
-  Line('.wm_ms:');
-  Line('  pushq %rdi');
-  Line('  pushq %rsi');
-  Line('  pushq %rdx');
-  Line('  call rt_now');
-  Line('  popq %rdx');
-  Line('  popq %rsi');
-  Line('  popq %rdi');
-  Line('  imulq $1000000, %rdx, %rdx');
-  Line('  addq %rax, %rdx');
-  Line('  jmp rt_waitio2');
-  Line('.wm_ret:');
-  Line('  xorl %eax, %eax');
-  Line('  ret');
   Line('rt_tcplisten:');
   Line('  pushq %rbx');
   Line('  pushq %r12');
@@ -47526,229 +47588,20 @@ begin
   Line('  popq %rbx');
   Line('  ret');
   Line('');
-  Line('rt_acslot:');
-  Line('  leaq rt_iotab(%rip), %r12');
-  Line('  xorq %r13, %r13');
-  Line('  xorq %r15, %r15');
-  Line('.as_n:');
-  Line('  cmpq $32, %r13');
-  Line('  jae .as_done');
-  Line('  movq %r13, %rax');
-  Line('  shlq $5, %rax');
-  Line('  leaq (%r12, %rax), %rax');
-  Line('  cmpq $0, (%rax)');
-  Line('  jne .as_cmp');
-  Line('  testq %r15, %r15');
-  Line('  jnz .as_nx');
-  Line('  movq %rax, %r15');
-  Line('  jmp .as_nx');
-  Line('.as_cmp:');
-  Line('  cmpq %rbx, (%rax)');
-  Line('  jne .as_nx');
-  Line('  movq %rax, %r15');
-  Line('  jmp .as_done');
-  Line('.as_nx:');
-  Line('  incq %r13');
-  Line('  jmp .as_n');
-  Line('.as_done:');
-  Line('  ret');
-  Line('');
-  { Wake the other accept waiter and point the edge registration at it.
-    If nobody else is waiting, the hot latch stays set so the next waiter
-    tries again instead of missing a connection already queued. }
-  Line('rt_acpoke:');
-  Line('  pushq %rbx');
-  Line('  pushq %r12');
-  Line('  pushq %r13');
-  Line('  pushq %r15');
-  Line('  movq %rdi, %rbx');
-  Line('  leaq rt_glock(%rip), %rdi');
-  Line('  call rt_lock');
-  Line('  call rt_acslot');
-  Line('  xorq %r12, %r12');
-  Line('  testq %r15, %r15');
-  Line('  jz .ap_unlock');
-  Line('  cmpq %r14, 8(%r15)');
-  Line('  jne .ap_s1');
-  Line('  movq $0, 8(%r15)');
-  Line('  movq 16(%r15), %r12');
-  Line('  jmp .ap_hot');
-  Line('.ap_s1:');
-  Line('  cmpq %r14, 16(%r15)');
-  Line('  jne .ap_unlock');
-  Line('  movq $0, 16(%r15)');
-  Line('  movq 8(%r15), %r12');
-  Line('.ap_hot:');
-  Line('  testq %r12, %r12');
-  Line('  jnz .ap_unlock');
-  Line('  movq $1, 24(%r15)');
-  Line('.ap_unlock:');
-  Line('  leaq rt_glock(%rip), %rdi');
-  Line('  call rt_unlock');
-  Line('  testq %r12, %r12');
-  Line('  jz .ap_out');
-  { The other waiter's token: its record and the number it armed. }
-  Line('  movl 200(%r12), %eax');
-  Line('  shlq $48, %rax');
-  Line('  orq %r12, %rax');
-  Line('  movq %rax, %r13');
-  Line('  subq $16, %rsp');
-  Line('  movq $0, 8(%rsp)');
-  Line('  movl $0x80000001, (%rsp)');
-  Line('  movq %r13, 4(%rsp)');
-  Line('  movq rt_epfd(%rip), %rdi');
-  Line('  movq $3, %rsi');
-  Line('  movq %rbx, %rdx');
-  Line('  movq %rsp, %r10');
-  Line('  movq $233, %rax');
-  Line('  syscall');
-  Line('  addq $16, %rsp');
-  Line('  movq %r13, %rdi');
-  Line('  call rt_pollwake');
-  Line('.ap_out:');
-  Line('  popq %r15');
-  Line('  popq %r13');
-  Line('  popq %r12');
-  Line('  popq %rbx');
-  Line('  ret');
-  Line('');
-  { r13: 0 park, 1 try accept again after arming, 2 try without arming.
-    A rejected registration must not leave a waiter asleep: return its
-    errno as Go's pollOpen and FD.Accept return wait errors (P688). }
-  Line('rt_acwait:');
-  Line('  pushq %rbx');
-  Line('  pushq %r12');
-  Line('  pushq %r13');
-  Line('  pushq %r15');
-  Line('  movq %rdi, %rbx');
-  Line('  leaq rt_glock(%rip), %rdi');
-  Line('  call rt_lock');
-  Line('  call rt_acslot');
-  Line('  xorq %r13, %r13');
-  Line('  testq %r15, %r15');
-  Line('  jz .aw_ul');
-  Line('  cmpq $0, (%r15)');
-  Line('  jne .aw_have');
-  Line('  movq %rbx, (%r15)');
-  Line('  movq %r14, 8(%r15)');
-  Line('  movq $0, 16(%r15)');
-  Line('  movq $0, 24(%r15)');
-  Line('  movq $1, %r13');
-  Line('  jmp .aw_ul');
-  Line('.aw_have:');
-  Line('  cmpq $0, 24(%r15)');
-  Line('  je .aw_mine');
-  Line('  movq $0, 24(%r15)');
-  Line('  movq $2, %r13');
-  Line('  jmp .aw_ul');
-  Line('.aw_mine:');
-  Line('  cmpq %r14, 8(%r15)');
-  Line('  je .aw_ul');
-  Line('  cmpq %r14, 16(%r15)');
-  Line('  je .aw_ul');
-  Line('  cmpq $0, 8(%r15)');
-  Line('  jne .aw_w1');
-  Line('  movq %r14, 8(%r15)');
-  Line('  movq $1, %r13');
-  Line('  jmp .aw_ul');
-  Line('.aw_w1:');
-  Line('  cmpq $0, 16(%r15)');
-  Line('  jne .aw_ul');
-  Line('  movq %r14, 16(%r15)');
-  Line('.aw_ul:');
-  Line('  leaq rt_glock(%rip), %rdi');
-  Line('  call rt_unlock');
-  Line('  cmpq $2, %r13');
-  Line('  je .aw_ok');
-  { Every wait arms a fresh token and points the edge registration at it
-    (MOD re-reads the socket, so a connection already queued raises the
-    event); 1 returns to try accept once more, 0 parks. }
-  Line('  call rt_pollarm');
-  Line('  subq $16, %rsp');
-  Line('  movq $0, 8(%rsp)');
-  Line('  movl $0x80000001, (%rsp)');
-  Line('  movq %rax, 4(%rsp)');
-  Line('  movq rt_epfd(%rip), %rdi');
-  Line('  movq $3, %rsi');
-  Line('  movq %rbx, %rdx');
-  Line('  movq %rsp, %r10');
-  Line('  movq $233, %rax');
-  Line('  syscall');
-  Line('  testq %rax, %rax');
-  Line('  jns .aw_added');
-  Line('  cmpq $-2, %rax'); { ENOENT: try adding an absent entry }
-  Line('  jne .aw_failed');
-  Line('  cmpq $65536, %rbx');
-  Line('  jae .aw_add');
-  Line('  leaq rt_epset(%rip), %rax');
-  Line('  movb $1, (%rax,%rbx)');
-  Line('.aw_add:');
-  Line('  movq rt_epfd(%rip), %rdi');
-  Line('  movq $1, %rsi');
-  Line('  movq %rbx, %rdx');
-  Line('  movq %rsp, %r10');
-  Line('  movq $233, %rax');
-  Line('  syscall');
-  Line('  testq %rax, %rax');
-  Line('  jns .aw_added');
-  { Another accept waiter added the entry between MOD and ADD. Retry
-    accept, which will MOD the existing entry if it still has to wait. }
-  Line('  cmpq $-17, %rax'); { EEXIST }
-  Line('  jne .aw_failed');
-  Line('  xorq %rax, %rax');
-  Line('.aw_failed:');
-  Line('  addq $16, %rsp');
-  Line('  movq $0, 192(%r14)');
-  Line('  jmp .aw_ret');
-  Line('.aw_added:');
-  Line('  addq $16, %rsp');
-  Line('  cmpq $1, %r13');
-  Line('  je .aw_ok');
-  Line('  lock incq rt_npollwait(%rip)');
-  Line('  call rt_parkmarked');
-  Line('  movq $0, 192(%r14)');
-  Line('  lock decq rt_npollwait(%rip)');
-  Line('.aw_ok:');
-  Line('  xorl %eax, %eax');
-  Line('.aw_ret:');
-  Line('  popq %r15');
-  Line('  popq %r13');
-  Line('  popq %r12');
-  Line('  popq %rbx');
-  Line('  ret');
-  Line('');
-  { The listening socket is registered edge-triggered, so a connection
-    raises one event. The G sets status 1 before each accept try; a wake
-    that lands between the try and the park then marks status 3 and
-    rt_parkmarked returns instead of sleeping. Marking after the try
-    would let that wake fall on status 0 and be lost for good. }
+  { NetAccept is Pascal (PasNetAccept in pasroutines, P441), on the one
+    loop of I/O that parks, as Go's FD.Accept is its read loop with
+    accept in it (internal/poll/fd_unix.go). A table of 32 listeners
+    here held two waiters each and an edge-triggered registration that
+    each wait pointed at itself: a third routine accepting on one socket
+    took the registration from the others, a thirty-third listener had
+    no slot, and a close found nobody to wake. The record of the
+    descriptor serves any number of routines, one registered at a time
+    and the next woken as it leaves, and a close wakes them all. rdi is
+    already the routine's argument; a jmp leaves the caller's return
+    address for its ret (Intel SDM vol. 2A, JMP). }
+  Line('.weak p_f.11_pasroutines12_pasnetaccept');
   Line('rt_tcpaccept:');
-  Line('  pushq %rbx');
-  Line('  movq %rdi, %rbx');
-  Line('.ta_loop:');
-  Line('  movl $1, 152(%r14)');
-  Line('  movq %rbx, %rdi');
-  Line('  xorq %rsi, %rsi');
-  Line('  xorq %rdx, %rdx');
-  Line('  movq $526336, %r10');
-  Line('  movq $288, %rax');
-  Line('  syscall');
-  Line('  testq %rax, %rax');
-  Line('  jns .ta_ok');
-  Line('  cmpq $-11, %rax');
-  Line('  jne .ta_ok');
-  Line('  movq %rbx, %rdi');
-  Line('  call rt_acwait');
-  Line('  testq %rax, %rax');
-  Line('  jns .ta_loop');
-  Line('.ta_ok:');
-  Line('  movl $0, 152(%r14)');
-  Line('  pushq %rax');
-  Line('  movq %rbx, %rdi');
-  Line('  call rt_acpoke');
-  Line('  popq %rax');
-  Line('  popq %rbx');
-  Line('  ret');
+  Line('  jmp p_f.11_pasroutines12_pasnetaccept');
   Line('');
   { NetConnect is Pascal (PasNetConnect in pasroutines, P216), on the
     wait Go's netFD.connect makes: this waited once, took SO_ERROR 0 for
@@ -47773,39 +47626,12 @@ begin
   Line('rt_tcpwrite:');
   Line('  jmp p_f.11_pasroutines11_pasnetwrite');
   Line('');
+  { NetClose is the close of the Syscall builtin: the routines that
+    wait on the descriptor are woken, it leaves the poller's sets and it
+    is closed (rt_closeout, P441). rdi is already the descriptor. }
   Line('rt_tcpclose:');
-  Line('  pushq %rbx');
-  Line('  movq %rdi, %rbx');
-  Line('  subq $16, %rsp');
-  Line('  movq rt_epfd(%rip), %rdi');
-  Line('  movq $2, %rsi');
-  Line('  movq %rbx, %rdx');
-  Line('  movq %rsp, %r10');
-  Line('  movq $233, %rax');
-  Line('  syscall');
-  { and out of the writers' set when it is in it (P667) }
-  Line('  cmpq $65536, %rbx');
-  Line('  jae .tc_w');
-  Line('  leaq rt_epset(%rip), %rax');
-  Line('  movb $0, (%rax,%rbx)');
-  Line('  leaq rt_epsetw(%rip), %rax');
-  Line('  cmpb $0, (%rax,%rbx)');
-  Line('  je .tc_cl');
-  Line('  movb $0, (%rax,%rbx)');
-  Line('.tc_w:');
-  Line('  movq rt_epfdw(%rip), %rdi');
-  Line('  movq $2, %rsi');
-  Line('  movq %rbx, %rdx');
-  Line('  movq %rsp, %r10');
-  Line('  movq $233, %rax');
-  Line('  syscall');
-  Line('.tc_cl:');
-  Line('  addq $16, %rsp');
-  Line('  movq %rbx, %rdi');
-  Line('  movq $3, %rax');
-  Line('  syscall');
-  Line('  popq %rbx');
-  Line('  ret');
+  Line('  movl $3, %eax');
+  Line('  jmp rt_syscall');
   Line('');
   Line('.globl rt_gcount');
   Line('rt_gcount:');
@@ -53377,11 +53203,31 @@ begin
     three hundred, P401). EPOLL_CTL_DEL takes ep->mtx, which
     ep_send_events holds while it polls, so once it returns no poll holds
     the file and the close is its last reference. rdi the descriptor;
-    every register kept but rcx and r11. }
+    every register kept but rcx and r11.
+    Before that, the routines that wait on it (P441): PasPollClosing of
+    pasroutines changes the cancel word of the descriptor's record and
+    takes every token it holds, so each waiter comes back with EBADF, as
+    Go's close evicts the poll descriptor before it closes (internal/
+    poll/fd_poll_runtime.go evict, runtime/netpoll.go
+    poll_runtime_pollUnblock: closing set, both directions unblocked),
+    and from there to the end of the close no routine begins a wait on
+    it: byte G+258 says the close is this routine's, and rt_syscall
+    calls PasPollClosed with the descriptor on its way out. Parked for
+    ever, a routine in UdpRecvFrom kept a service from ending, and the
+    descriptor's number, open again, was another file under the old
+    waiter. rt_gocall keeps every register but rax. }
+  Line('.weak p_f.11_pasroutines14_paspollclosing');
+  Line('.weak p_f.11_pasroutines13_paspollclosed');
   Line('rt_closeout:');
   Line('  cmpq $0, rt_epfd(%rip)');
   Line('  je .co_ret');
   Line('  pushq %rax');
+  Line('  leaq p_f.11_pasroutines14_paspollclosing(%rip), %rax');
+  Line('  testq %rax, %rax');
+  Line('  jz .co_set');
+  Line('  call rt_gocall');
+  Line('  movb $1, 258(%r14)');
+  Line('.co_set:');
   Line('  pushq %rdi');
   Line('  pushq %rsi');
   Line('  pushq %rdx');
@@ -53588,6 +53434,17 @@ begin
   Line('  popq %r12');
   Line('  popq %rbp');
   Line('  popq %rbx');
+  { a close whose waiters rt_closeout woke (P441): the descriptor, in
+    rdi again, takes waits from here on }
+  Line('  cmpb $0, 258(%r14)');
+  Line('  jne .sy_closed');
+  Line('  ret');
+  Line('.sy_closed:');
+  Line('  movb $0, 258(%r14)');
+  Line('  pushq %rax');
+  Line('  leaq p_f.11_pasroutines13_paspollclosed(%rip), %rax');
+  Line('  call rt_gocall');
+  Line('  popq %rax');
   Line('  ret');
   { P333: the execve of a routine's own process, out of the way of the
     paths that fall into .sy_invoke }
@@ -57097,7 +56954,7 @@ begin
     { The deadlock detector's words (1.0.139): the low half of rt_msleep
       counts the Ms asleep after their final look for work, the high half
       how many times one woke; rt_npollwait the routines parked on the
-      poller (rt_waitio, rt_acwait). }
+      poller (rt_pollpark). }
     Line('rt_msleep:');
     Line('  .quad 0');
     Line('rt_npollwait:');
@@ -57162,7 +57019,7 @@ begin
     Line('rt_epfd:');
     Line('  .quad 0');
     { The set of the waits for writing alone (P667), itself a member of
-      rt_epfd's: rt_waitio2 says why there are two. }
+      rt_epfd's: rt_pollpark says why there are two. }
     Line('rt_epfdw:');
     Line('  .quad 0');
     Line('rt_evfd:');
@@ -57177,11 +57034,8 @@ begin
       each P's. }
     Line('rt_polluntil:');
     Line('  .quad 0');
-    Line('rt_iotab:');
-    Line('  .zero 1024');
     { A byte a descriptor below 65,536 the runtime put in its epoll set
-      (rt_waitio, rt_acwait), 1 from its registration to its close
-      (P401). }
+      (rt_pollpark), 1 from its registration to its close (P401). }
     Line('rt_epset:');
     Line('  .zero 65536');
     { The same for the writers' set (P667): a table of its own, so that
@@ -63670,7 +63524,7 @@ begin
   Line('  stlxr w11, x10, [x9]');
   Line('  cbnz w11, .mso_l');
   Line('  ret');
-  { A routine parked on the poller, in or out (rt_waitio2, rt_acwait). }
+  { A routine parked on the poller, in or out (rt_pollpark). }
   Line('rt_pollwaitinc:');
   LeaS('rt_npollwait', 'x9');
   Line('.pwi_l:');
@@ -67826,6 +67680,18 @@ begin
   Line('  b.ne .asy_go');
   LdS('rt_epfd', 'x16');
   Line('  cbz x16, .asy_go');
+  { the routines that wait on it first, as amd64's rt_closeout says
+    (P441): PasPollClosing takes their tokens, byte G+258 marks the
+    close as this routine's, and PasPollClosed is called on the way out.
+    rt_gocall keeps every register but x0; x30 is this call's }
+  LeaS('p_f.11_pasroutines14_paspollclosing', 'x17');
+  Line('  cbz x17, .asy_ev');
+  Line('  stp x0, x30, [sp, #-16]!');
+  Line('  bl rt_gocall');
+  Line('  ldp x0, x30, [sp], #16');
+  Line('  mov w17, #1');
+  Line('  strb w17, [x28, #258]');
+  Line('.asy_ev:');
   Line('  mov x17, #65536');
   Line('  cmp x0, x17');
   Line('  b.hs .asy_del');
@@ -68015,6 +67881,16 @@ begin
   Line('  ldp x21, x22, [sp], #16');
   Line('  ldp x19, x20, [sp], #16');
   Line('  ldp x29, x30, [sp], #16');
+  { a close whose waiters were woken (P441): x0 is the descriptor again,
+    x16 the call's answer, which rt_gocall keeps }
+  Line('  ldrb w17, [x28, #258]');
+  Line('  cbz w17, .asy_done');
+  Line('  strb wzr, [x28, #258]');
+  Line('  str x30, [sp, #-16]!');
+  LeaS('p_f.11_pasroutines13_paspollclosed', 'x17');
+  Line('  bl rt_gocall');
+  Line('  ldr x30, [sp], #16');
+  Line('.asy_done:');
   Line('  mov x0, x16');
   Line('  ldp x16, x17, [sp], #16');
   Line('  ret');
@@ -69798,7 +69674,13 @@ begin
   { The poller's token, as on amd64 (1.0.57): the record in the low 48
     bits, a number of 16 bits in the top ones, G+192 that number + 1 while
     the routine waits. A cond ticket in that word has its sign bit set
-    (P673). rt_pollarm: the token in x0; x9, x10 clobbered. }
+    (P673). rt_pollarm: the token in x0; x9, x10 clobbered. The barrier
+    after the store (DMB ISH: every access before it in program order is
+    observed before any after it, Arm ARM B2.6.2) is what lets
+    rt_pollpark read its cancel word next: a close that changed the word
+    and then takes the token sees the token, or the wait sees the word
+    (P441), as on amd64. rt_polltoken: the token the next rt_pollarm of
+    this routine gives, in x0; no other register changes. }
   Line('rt_pollarm:');
   Line('  ldr w9, [x28, #200]');
   Line('  add w9, w9, #1');
@@ -69809,6 +69691,12 @@ begin
   Line('  dmb ish');
   Line('  lsl x0, x9, #48');
   Line('  orr x0, x0, x28');
+  Line('  ret');
+  Line('rt_polltoken:');
+  Line('  ldr w0, [x28, #200]');
+  Line('  add w0, w0, #1');
+  Line('  and w0, w0, #65535');
+  Line('  orr x0, x28, x0, lsl #48');
   Line('  ret');
   { rt_pollwake: x0 a token from an event; its routine is readied only
     while that wait is still armed. }
@@ -69827,12 +69715,27 @@ begin
   Line('.apw_out:');
   Line('  clrex');
   Line('  ret');
-  { x0 fd, x1 events; rt_waitio2 also x2, a deadline in nanoseconds on
-    the runtime's timers with the same token (rt_waitms), or -1.
-    One-shot registrations. }
+  { WaitFd, WaitIo and WaitMs are Pascal, as on amd64 (P441): x0, x1 and
+    x2 are the routine's arguments, and b leaves x30 for its ret (Arm
+    ARM C6.2.35: a branch that is not a call). }
+  Line('.weak p_f.11_pasroutines9_paswaitio');
+  Line('.weak p_f.11_pasroutines9_paswaitms');
   Line('rt_waitio:');
-  Line('  mov x2, #-1');
-  Line('rt_waitio2:');
+  Line('  b p_f.11_pasroutines9_paswaitio');
+  Line('.globl rt_waitms');
+  Line('rt_waitms:');
+  Line('  b p_f.11_pasroutines9_paswaitms');
+  { rt_pollpark as on amd64 (P441): x0 a descriptor, or a negative
+    number for a wait on the token alone; x1 events; x2 a deadline in
+    nanoseconds on the runtime's timers with the same token, or -1; x3
+    the address of the cancel word, or 0, and x4 the value it has while
+    the wait may go on; x5 a runtime lock the caller holds, or 0, let
+    go once the token is armed and the descriptor registered. x0 0 on a
+    wake, a negative errno when the registration failed, -9 when the
+    cancel word had changed. One-shot registrations. x25 and x26 keep
+    the cancel word's address and value over rt_pollarm and rt_tadd,
+    and are the set and its table after; x27 keeps the lock. }
+  Line('rt_pollpark:');
   Line('  str x30, [sp, #-16]!');
   Line('  stp x19, x20, [sp, #-16]!');
   Line('  stp x21, x22, [sp, #-16]!');
@@ -69843,6 +69746,9 @@ begin
   Line('  mov x19, x0');
   Line('  mov x20, x1');
   Line('  mov x23, x2');
+  Line('  mov x25, x3');
+  Line('  mov x26, x4');
+  Line('  mov x27, x5');
   Line('  mov w9, #1');
   Line('  str w9, [x28, #152]');
   Line('  adr x9, .awi_resume');
@@ -69852,9 +69758,6 @@ begin
   Line('  str x29, [x28, #56]');
   Line('  bl rt_pollarm');
   Line('  mov x24, x0');
-  Line('  sub sp, sp, #16');
-  Line('  str xzr, [sp]');
-  Line('  str xzr, [sp, #8]');
   Line('  cmp x23, #0');
   Line('  b.lt .awi_one');
   Line('  str x23, [x28, #208]');
@@ -69864,6 +69767,28 @@ begin
   Line('  ldr x1, [x9, #8]');
   Line('  bl rt_tadd');
   Line('.awi_one:');
+  { the cancel word, read with the token armed (P441): changed, the wait
+    ends with EBADF through the token's own protocol, as a failed
+    registration below }
+  Line('  cbz x25, .awi_live');
+  Line('  ldr x9, [x25]');
+  Line('  cmp x9, x26');
+  Line('  b.eq .awi_live');
+  Line('  mov x9, #-9');
+  Line('  str x9, [sp]');
+  Line('  mov x0, x24');
+  Line('  bl rt_pollwake');
+  Line('  b .awi_cas0');
+  Line('.awi_live:');
+  { no descriptor: the token alone (TBZ branches when the bit is 0, Arm
+    ARM C6.2.479; bit 63 is the sign) }
+  Line('  tbz x19, #63, .awi_fd');
+  Line('  str xzr, [sp]');
+  Line('  b .awi_cas0');
+  Line('.awi_fd:');
+  Line('  sub sp, sp, #16');
+  Line('  str xzr, [sp]');
+  Line('  str xzr, [sp, #8]');
   { MOD first (P115, 1.1.1): after its first wait a descriptor stays
     in the set, one-shot and disarmed, so ADD failed with EEXIST on
     every later wait and MOD followed: two system calls a wait. MOD
@@ -69873,7 +69798,7 @@ begin
   Line('  str x24, [sp, #8]');
   { two sets, as on amd64 (P667): a wait for writing alone (4) is armed
     in the writers', every other in the first. x25 the set and x26 its
-    table, both saved by the prologue and free until here }
+    table, both saved by the prologue }
   LdS('rt_epfd', 'x25');
   LeaS('rt_epset', 'x26');
   Line('  cmp x20, #4');
@@ -69889,6 +69814,10 @@ begin
   Line('  svc #0');
   Line('  cmp x0, #0');
   Line('  b.ge .awi_success');
+  { ENOENT alone goes on to ADD, as on amd64 (P688): CMN adds, so it
+    sets the flags of x0 - (-2) (Arm ARM C6.2.93, CMN immediate) }
+  Line('  cmn x0, #2');
+  Line('  b.ne .awi_failed');
   { in the set from here, as on amd64 (P401) }
   Line('  mov x9, #65536');
   Line('  cmp x19, x9');
@@ -69906,6 +69835,7 @@ begin
     normal wake protocol, including any racing deadline. }
   Line('  cmp x0, #0');
   Line('  b.ge .awi_success');
+  Line('.awi_failed:');
   Line('  str x0, [sp, #16]');
   Line('  mov x0, x24');
   Line('  bl rt_pollwake');
@@ -69914,6 +69844,12 @@ begin
   Line('  str xzr, [sp, #16]');
   Line('.awi_cas:');
   Line('  add sp, sp, #16');
+  Line('.awi_cas0:');
+  { the caller's lock, as on amd64 }
+  Line('  cbz x27, .awi_unl');
+  Line('  mov x0, x27');
+  Line('  bl rt_unlock');
+  Line('.awi_unl:');
   Line('  bl rt_pollwaitinc');
   { The m is read before the CAS, never after: see the note on the
     amd64 side. Once the status is 2 another thread may run this G and
@@ -69947,37 +69883,6 @@ begin
   Line('  ldp x21, x22, [sp], #16');
   Line('  ldp x19, x20, [sp], #16');
   Line('  ldr x30, [sp], #16');
-  Line('  ret');
-  { x0 fd, x1 events, x2 milliseconds, as amd64's: 0 or less answers 0
-    at once (P213: a bare ret gave back x0, the descriptor). mov x0, xzr
-    is ORR (shifted register) from the zero register (ARM ARM C6.2.282). }
-  Line('.globl rt_waitms');
-  Line('rt_waitms:');
-  Line('  cmp x2, #0');
-  Line('  b.le .awm_ret');
-  Line('  str x30, [sp, #-16]!');
-  Line('  stp x19, x20, [sp, #-16]!');
-  Line('  stp x21, x22, [sp, #-16]!');
-  Line('  mov x19, x0');
-  Line('  mov x20, x1');
-  Line('  mov x21, x2');
-  Imm('x9', 1099511627776);
-  Line('  cmp x21, x9');
-  Line('  b.ls .awm_ms');
-  Line('  mov x21, x9');
-  Line('.awm_ms:');
-  Line('  bl rt_now');
-  Imm('x9', 1000000);
-  Line('  mul x21, x21, x9');
-  Line('  add x2, x21, x0');
-  Line('  mov x0, x19');
-  Line('  mov x1, x20');
-  Line('  ldp x21, x22, [sp], #16');
-  Line('  ldp x19, x20, [sp], #16');
-  Line('  ldr x30, [sp], #16');
-  Line('  b rt_waitio2');
-  Line('.awm_ret:');
-  Line('  mov x0, xzr');
   Line('  ret');
   Line('rt_tcplisten:');
   Line('  str x30, [sp, #-16]!');
@@ -70061,223 +69966,11 @@ begin
   Line('.atp_out:');
   Line('  add sp, sp, #32');
   Line('  ret');
-  Line('rt_acslot:');
-  LeaS('rt_iotab', 'x21');
-  Line('  mov x20, xzr');
-  Line('  mov x22, xzr');
-  Line('.bs_n:');
-  Line('  cmp x20, #32');
-  Line('  b.hs .bs_done');
-  Line('  lsl x9, x20, #5');
-  Line('  add x9, x21, x9');
-  Line('  ldr x10, [x9]');
-  Line('  cbnz x10, .bs_cmp');
-  Line('  cbnz x22, .bs_nx');
-  Line('  mov x22, x9');
-  Line('  b .bs_nx');
-  Line('.bs_cmp:');
-  Line('  cmp x10, x19');
-  Line('  b.ne .bs_nx');
-  Line('  mov x22, x9');
-  Line('  b .bs_done');
-  Line('.bs_nx:');
-  Line('  add x20, x20, #1');
-  Line('  b .bs_n');
-  Line('.bs_done:');
-  Line('  ret');
-  Line('');
-  Line('rt_acpoke:');
-  Line('  str x30, [sp, #-16]!');
-  Line('  stp x19, x20, [sp, #-16]!');
-  Line('  stp x21, x22, [sp, #-16]!');
-  Line('  mov x19, x0');
-  LeaS('rt_glock', 'x0');
-  Line('  bl rt_lock');
-  Line('  bl rt_acslot');
-  Line('  mov x21, xzr');
-  Line('  cbz x22, .bp_ul');
-  Line('  ldr x9, [x22, #8]');
-  Line('  cmp x9, x28');
-  Line('  b.ne .bp_s1');
-  Line('  str xzr, [x22, #8]');
-  Line('  ldr x21, [x22, #16]');
-  Line('  b .bp_hot');
-  Line('.bp_s1:');
-  Line('  ldr x9, [x22, #16]');
-  Line('  cmp x9, x28');
-  Line('  b.ne .bp_ul');
-  Line('  str xzr, [x22, #16]');
-  Line('  ldr x21, [x22, #8]');
-  Line('.bp_hot:');
-  Line('  cbnz x21, .bp_ul');
-  Line('  mov x9, #1');
-  Line('  str x9, [x22, #24]');
-  Line('.bp_ul:');
-  LeaS('rt_glock', 'x0');
-  Line('  bl rt_unlock');
-  Line('  cbz x21, .bp_out');
-  { The other waiter's token: its record and the number it armed. }
-  Line('  ldr w9, [x21, #200]');
-  Line('  lsl x9, x9, #48');
-  Line('  orr x20, x9, x21');
-  Line('  sub sp, sp, #16');
-  Line('  str xzr, [sp]');
-  Line('  str xzr, [sp, #8]');
-  Imm('x9', 2147483649);
-  Line('  str w9, [sp]');
-  Line('  str x20, [sp, #8]');
-  LdS('rt_epfd', 'x0');
-  Line('  mov x1, #3');
-  Line('  mov x2, x19');
-  Line('  mov x3, sp');
-  Line('  mov x8, #21');
-  Line('  svc #0');
-  Line('  add sp, sp, #16');
-  Line('  mov x0, x20');
-  Line('  bl rt_pollwake');
-  Line('.bp_out:');
-  Line('  ldp x21, x22, [sp], #16');
-  Line('  ldp x19, x20, [sp], #16');
-  Line('  ldr x30, [sp], #16');
-  Line('  ret');
-  Line('');
-  Line('rt_acwait:');
-  Line('  str x30, [sp, #-16]!');
-  Line('  stp x19, x20, [sp, #-16]!');
-  Line('  stp x21, x22, [sp, #-16]!');
-  Line('  mov x19, x0');
-  LeaS('rt_glock', 'x0');
-  Line('  bl rt_lock');
-  Line('  bl rt_acslot');
-  Line('  mov x20, xzr');
-  Line('  cbz x22, .bw_ul');
-  Line('  ldr x9, [x22]');
-  Line('  cbnz x9, .bw_have');
-  Line('  str x19, [x22]');
-  Line('  str x28, [x22, #8]');
-  Line('  str xzr, [x22, #16]');
-  Line('  str xzr, [x22, #24]');
-  Line('  mov x20, #1');
-  Line('  b .bw_ul');
-  Line('.bw_have:');
-  Line('  ldr x9, [x22, #24]');
-  Line('  cbz x9, .bw_mine');
-  Line('  str xzr, [x22, #24]');
-  Line('  mov x20, #2');
-  Line('  b .bw_ul');
-  Line('.bw_mine:');
-  Line('  ldr x9, [x22, #8]');
-  Line('  cmp x9, x28');
-  Line('  b.eq .bw_ul');
-  Line('  ldr x9, [x22, #16]');
-  Line('  cmp x9, x28');
-  Line('  b.eq .bw_ul');
-  Line('  ldr x9, [x22, #8]');
-  Line('  cbnz x9, .bw_w1');
-  Line('  str x28, [x22, #8]');
-  Line('  mov x20, #1');
-  Line('  b .bw_ul');
-  Line('.bw_w1:');
-  Line('  ldr x9, [x22, #16]');
-  Line('  cbnz x9, .bw_ul');
-  Line('  str x28, [x22, #16]');
-  Line('.bw_ul:');
-  LeaS('rt_glock', 'x0');
-  Line('  bl rt_unlock');
-  Line('  cmp x20, #2');
-  Line('  b.eq .bw_ok');
-  { Every wait arms a fresh token and points the edge registration at it,
-    as on amd64; 1 returns to try accept once more, 0 parks. }
-  Line('  bl rt_pollarm');
-  Line('  sub sp, sp, #16');
-  Line('  str xzr, [sp]');
-  Line('  str xzr, [sp, #8]');
-  Imm('x9', 2147483649);
-  Line('  str w9, [sp]');
-  Line('  str x0, [sp, #8]');
-  LdS('rt_epfd', 'x0');
-  Line('  mov x1, #3');
-  Line('  mov x2, x19');
-  Line('  mov x3, sp');
-  Line('  mov x8, #21');
-  Line('  svc #0');
-  Line('  cmp x0, #0');
-  Line('  b.ge .bw_added');
-  Line('  cmn x0, #2'); { ENOENT: try adding an absent entry }
-  Line('  b.ne .bw_failed');
-  Line('  mov x9, #65536');
-  Line('  cmp x19, x9');
-  Line('  b.hs .bw_add');
-  LeaS('rt_epset', 'x9');
-  Line('  mov w10, #1');
-  Line('  strb w10, [x9, x19]');
-  Line('.bw_add:');
-  LdS('rt_epfd', 'x0');
-  Line('  mov x1, #1');
-  Line('  mov x2, x19');
-  Line('  mov x3, sp');
-  Line('  mov x8, #21');
-  Line('  svc #0');
-  Line('  cmp x0, #0');
-  Line('  b.ge .bw_added');
-  { EEXIST means another waiter added the listener. As on amd64,
-    retry accept so the next wait can MOD the entry. }
-  Line('  cmn x0, #17');
-  Line('  b.ne .bw_failed');
-  Line('  mov x0, xzr');
-  Line('.bw_failed:');
-  Line('  add sp, sp, #16');
-  Line('  str xzr, [x28, #192]');
-  Line('  b .bw_ret');
-  Line('.bw_added:');
-  Line('  add sp, sp, #16');
-  Line('  cmp x20, #1');
-  Line('  b.eq .bw_ok');
-  Line('  bl rt_pollwaitinc');
-  Line('  bl rt_parkmarked');
-  Line('  str xzr, [x28, #192]');
-  Line('  bl rt_pollwaitdec');
-  Line('.bw_ok:');
-  Line('  mov x0, xzr');
-  Line('.bw_ret:');
-  Line('  ldp x21, x22, [sp], #16');
-  Line('  ldp x19, x20, [sp], #16');
-  Line('  ldr x30, [sp], #16');
-  Line('  ret');
-  Line('');
-  { As on amd64: status 1 before each accept try, so a wake between the
-    try and the park is kept (see rt_parkmarked). }
+  { NetAccept is Pascal, as on amd64 (P441): x0 is the routine's
+    argument, and b leaves x30 for its ret (Arm ARM C6.2.35). }
+  Line('.weak p_f.11_pasroutines12_pasnetaccept');
   Line('rt_tcpaccept:');
-  Line('  str x30, [sp, #-16]!');
-  Line('  stp x19, x20, [sp, #-16]!');
-  Line('  mov x19, x0');
-  Line('.ata_loop:');
-  Line('  mov w9, #1');
-  Line('  str w9, [x28, #152]');
-  Line('  mov x0, x19');
-  Line('  mov x1, xzr');
-  Line('  mov x2, xzr');
-  Line('  movz x3, #2048');
-  Line('  movk x3, #8, lsl #16');
-  Line('  mov x8, #242');
-  Line('  svc #0');
-  Line('  cmp x0, #0');
-  Line('  b.ge .ata_out');
-  Line('  cmn x0, #11');
-  Line('  b.ne .ata_out');
-  Line('  mov x0, x19');
-  Line('  bl rt_acwait');
-  Line('  cmp x0, #0');
-  Line('  b.ge .ata_loop');
-  Line('.ata_out:');
-  Line('  str wzr, [x28, #152]');
-  Line('  str x0, [sp, #-16]!');
-  Line('  mov x0, x19');
-  Line('  bl rt_acpoke');
-  Line('  ldr x0, [sp], #16');
-  Line('  ldp x19, x20, [sp], #16');
-  Line('  ldr x30, [sp], #16');
-  Line('  ret');
+  Line('  b p_f.11_pasroutines12_pasnetaccept');
   { NetConnect is Pascal, as on amd64 (P216): x0 and x1 are the
     routine's arguments, and b leaves x30 for its ret (Arm ARM C6.2.35:
     a branch that is not a call). }
@@ -70293,42 +69986,11 @@ begin
   Line('.weak p_f.11_pasroutines11_pasnetwrite');
   Line('rt_tcpwrite:');
   Line('  b p_f.11_pasroutines11_pasnetwrite');
+  { NetClose is the close of rt_syscall, as on amd64 (P441): x0 is
+    already the descriptor. }
   Line('rt_tcpclose:');
-  Line('  str x30, [sp, #-16]!');
-  Line('  stp x19, x20, [sp, #-16]!');
-  Line('  mov x19, x0');
-  Line('  sub sp, sp, #16');
-  LdS('rt_epfd', 'x0');
-  Line('  mov x1, #2');
-  Line('  mov x2, x19');
-  Line('  mov x3, sp');
-  Line('  mov x8, #21');
-  Line('  svc #0');
-  { and out of the writers' set when it is in it, as on amd64 (P667) }
-  Line('  mov x9, #65536');
-  Line('  cmp x19, x9');
-  Line('  b.hs .atc_w');
-  LeaS('rt_epset', 'x9');
-  Line('  strb wzr, [x9, x19]');
-  LeaS('rt_epsetw', 'x9');
-  Line('  ldrb w10, [x9, x19]');
-  Line('  cbz w10, .atc_cl');
-  Line('  strb wzr, [x9, x19]');
-  Line('.atc_w:');
-  LdS('rt_epfdw', 'x0');
-  Line('  mov x1, #2');
-  Line('  mov x2, x19');
-  Line('  mov x3, sp');
-  Line('  mov x8, #21');
-  Line('  svc #0');
-  Line('.atc_cl:');
-  Line('  add sp, sp, #16');
-  Line('  mov x0, x19');
   Line('  mov x8, #57');
-  Line('  svc #0');
-  Line('  ldp x19, x20, [sp], #16');
-  Line('  ldr x30, [sp], #16');
-  Line('  ret');
+  Line('  b rt_syscall');
   { Published properties, as on amd64: the table at vmt-8 holds, per
     property, the name pointer, the name length, the kind (1 integer,
     2 string, 3 method) and the field offset, ended by a zero name; the

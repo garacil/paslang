@@ -49,8 +49,6 @@ AWAY = {
     'rt_morestack': 'keeps them in .pk_res before it leaves the stack',
     'rt_waitall': "parks through the M's stack, back through .pk_res",
     'rt_execwu': "waits on the M's stack, back through .pk_res",
-    # a helper whose callers keep them: rt_acpoke and rt_acwait push all four
-    'rt_acslot': 'called by rt_acpoke and rt_acwait, which push them',
 }
 
 

@@ -128,7 +128,9 @@ procedure UnixUnlink(const Path: string);
 
 { A wait on several descriptors at once (P117): the first of Fds that
   is ready for Ev (1 to read, 4 to write) within Ms milliseconds, as
-  an index into Fds, or -1 when the time runs out; the routine parks. }
+  an index into Fds, or -1 when the time runs out; the routine parks.
+  -9 (EBADF) when one of Fds was closed while it waited (P441): which
+  one is not said, since its number may already be another file's. }
 function WaitAny(const Fds: array of Integer; Ev, Ms: Integer): Integer;
 
 implementation
@@ -2080,7 +2082,62 @@ end;
 
 { An epoll set of this wait alone, level-triggered, and the routine
   parks on it as on any descriptor: the set is readable when a member
-  is. Then one look without waiting says which. }
+  is. Then one look without waiting says which. The park is PasWaitSet's
+  (P441), which names the routine in the record of every member, so a
+  close of one ends the wait: the kernel takes a closed descriptor out
+  of the set without a word, and the routine stayed parked until Ms. A
+  compiler before 1.3.55 has no such park and waits as it did. }
+{$if PASLANG_FULLVERSION >= 1003055}
+function WaitAny(const Fds: array of Integer; Ev, Ms: Integer): Integer;
+var
+  ep, i, n, k, w: Integer;
+  evt: array[0..1] of Integer;
+  evs: array[0..15] of Integer;
+begin
+  Result := -1;
+  ep := Syscall(SnEpollCreate1, 524288);
+  if ep < 0 then
+    Exit;
+  for i := 0 to High(Fds) do
+  begin
+    if Amd64 = 0 then
+    begin
+      { arm64's epoll_event is not packed: events, a pad, then the data }
+      evt[0] := Ev;
+      evt[1] := i;
+    end
+    else
+    begin
+      { amd64's is packed: events (4), data (8) }
+      evt[0] := Ev or (Int64(i) shl 32);
+      evt[1] := i shr 32;
+    end;
+    n := Syscall(SnEpollCtl, ep, 1, Fds[i], @evt);
+  end;
+  w := PasWaitSet(ep, Fds, Ms);
+  if w = -9 then
+    Result := -9
+  else
+  begin
+    for i := 0 to 15 do
+      evs[i] := 0;
+    if Amd64 = 0 then
+      n := Syscall(SnEpollWait, ep, @evs, 8, 0, 0, 0)
+    else
+      n := Syscall(SnEpollWait, ep, @evs, 8, 0);
+    if n > 0 then
+    begin
+      if Amd64 = 0 then
+        k := evs[1]
+      else
+        k := (evs[0] shr 32) or ((evs[1] and $FFFFFFFF) shl 32);
+      if (k >= 0) and (k <= High(Fds)) then
+        Result := k;
+    end;
+  end;
+  n := Syscall(SnClose, ep);
+end;
+{$else}
 function WaitAny(const Fds: array of Integer; Ev, Ms: Integer): Integer;
 var
   ep, i, n, k: Integer;
@@ -2125,5 +2182,7 @@ begin
   end;
   n := Syscall(SnClose, ep);
 end;
+
+{$endif}
 
 end.
