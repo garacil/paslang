@@ -138,8 +138,8 @@ def input_resolution_checks(folder):
     arguments = [str(compiler), "-cpu", "base", "-o", "program", "main.paslang"]
     original = run_refs.paslang_inputs(arguments, "program", env={}, cwd=work)
     unit = original["units"][0]
-    require(len(original["units"]) == 1 and unit["interface"]["path"] == str(interface) and
-            unit["object"]["path"] == str(unit_object),
+    require(len(original["units"]) == 1 and unit["interface"]["path"] == str(interface.resolve()) and
+            unit["object"]["path"] == str(unit_object.resolve()),
             "relative link/unit paths did not follow the actual compiler cwd")
     generated.write_text("changed generated program object")
     (unit_directory / "unrelated-benchmark.o").write_text("another benchmark's output")
@@ -845,7 +845,11 @@ def main():
     with tempfile.TemporaryDirectory(prefix='bench-harness-') as directory:
         folder = Path(directory)
         policy_checks()
-        input_resolution_checks(folder)
+        inputs = folder / "inputs"
+        inputs.mkdir()
+        alias = folder / "inputs-link"
+        alias.symlink_to(inputs.resolve(), target_is_directory=True)
+        input_resolution_checks(alias)
         timed_checks(folder)
         memory_checks()
         rounds_checks(folder)
