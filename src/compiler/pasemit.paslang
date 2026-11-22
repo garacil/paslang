@@ -98,6 +98,11 @@ const
   { An active P needs an M. Keep the startup bound and the M tables'
     capacity consistent. Only the selected P records are mapped. }
   RuntimeMaxMs = 10000;
+  { Active monitor policy from Go's runtime/proc.go sysmon. }
+  SysmonMinDelay = 20000;
+  SysmonMaxDelay = 10000000;
+  SysmonBackoffScans = 50;
+  SysmonPreemptInterval = 10000000;
   RuntimePBytes = 2176;
   { Main has the same moving stack on both targets. An 8 MiB initial
     mapping can fault a huge page for its first few stack words. }
@@ -46293,17 +46298,21 @@ begin
   Line('  jz .rk_wake');
   Line('  movq %r12, %rdi');
   Line('  call rt_newm');
-  Line('  jmp .rk_done');
+  Line('  jmp .rk_taken');
   Line('.rk_wake:');
   Line('  leaq 48(%r12), %rdi');
   Line('  movq $129, %rsi');
   Line('  movq $1, %rdx');
   Line('  movq $202, %rax');
   Line('  syscall');
-  Line('  jmp .rk_done');
+  Line('  jmp .rk_taken');
   Line('.rk_unlock:');
   Line('  leaq rt_heapstate+336(%rip), %rdi');
   Line('  call rt_unlock');
+  Line('  xorl %eax, %eax');
+  Line('  jmp .rk_done');
+  Line('.rk_taken:');
+  Line('  movl $1, %eax');
   Line('.rk_done:');
   Line('  popq %r15');
   Line('  popq %r12');
@@ -47169,7 +47178,11 @@ begin
   Line('rt_sysmon:');
   { no routine's record: rt_now stays on this stack (P342) }
   Line('  xorq %r14, %r14');
-  Line('  subq $16, %rsp');
+  { timespec, delay, consecutive scans, next preemption scan, preempt flag }
+  Line('  subq $48, %rsp');
+  Line('  movq $' + IntToStr(SysmonMinDelay) + ', 16(%rsp)');
+  Line('  movq $0, 24(%rsp)');
+  Line('  movq $0, 32(%rsp)');
   { Like Go's runtime/proc.go sysmon, sleep when all workers are
     idle. rt_msleep counts only Ms past their last look for work.
     Its high half detects a wake between observing idle and arming
@@ -47218,12 +47231,42 @@ begin
   Line('  movl $202, %eax');
   Line('  syscall');
   Line('  movl $0, rt_sysmonnote(%rip)');
+  Line('  cmpl $2, %r15d');
+  Line('  jne .sm_poll');
+  Line('  movq $' + IntToStr(SysmonMinDelay) + ', 16(%rsp)');
+  Line('  movq $0, 24(%rsp)');
   Line('  jmp .sm_poll');
   Line('.sm_disarm:');
   Line('  movl $0, rt_sysmonnote(%rip)');
   Line('.sm_tick:');
+  { A successful retake resets the short scans, as Go's sysmon does.
+    Fifty scans with no handoff precede the exponential backoff. }
+  Line('  movq 16(%rsp), %rax');
+  Line('  cmpq $' + IntToStr(SysmonBackoffScans) + ', 24(%rsp)');
+  Line('  jae .sm_double');
+  Line('  incq 24(%rsp)');
+  Line('  jmp .sm_nap');
+  Line('.sm_double:');
+  Line('  addq %rax, %rax');
+  Line('  cmpq $' + IntToStr(SysmonMaxDelay) + ', %rax');
+  Line('  jbe .sm_delay');
+  Line('  movq $' + IntToStr(SysmonMaxDelay) + ', %rax');
+  Line('.sm_delay:');
+  Line('  movq %rax, 16(%rsp)');
+  Line('.sm_nap:');
+  { The backoff must not sleep past the independent preemption scan. }
+  Line('  movq %rax, 8(%rsp)');
+  Line('  cmpq $0, 32(%rsp)');
+  Line('  je .sm_nanosleep');
+  Line('  call rt_now');
+  Line('  movq 32(%rsp), %rcx');
+  Line('  subq %rax, %rcx');
+  Line('  jbe .sm_poll');
+  Line('  cmpq 8(%rsp), %rcx');
+  Line('  jae .sm_nanosleep');
+  Line('  movq %rcx, 8(%rsp)');
+  Line('.sm_nanosleep:');
   Line('  movq $0, (%rsp)');
-  Line('  movq $10000000, 8(%rsp)');
   Line('  movq %rsp, %rdi');
   Line('  xorq %rsi, %rsi');
   Line('  movq $35, %rax');
@@ -47232,11 +47275,20 @@ begin
     looks, on a dummy M with no P so the routines go to the global
     queue and an M is woken for them. }
   Line('.sm_poll:');
+  { The short syscall scans must not shorten a running routine's
+    preemption interval. The standby poller also keeps its 10 ms age. }
+  Line('  call rt_now');
+  Line('  movq $0, 40(%rsp)');
+  Line('  cmpq 32(%rsp), %rax');
+  Line('  jb .sm_poll_io');
+  Line('  leaq ' + IntToStr(SysmonPreemptInterval) + '(%rax), %rcx');
+  Line('  movq %rcx, 32(%rsp)');
+  Line('  movq $1, 40(%rsp)');
+  Line('.sm_poll_io:');
   Line('  cmpq $0, rt_polluntil(%rip)');
   Line('  jne .sm_chk');
   Line('  cmpq $0, rt_epfd(%rip)');
   Line('  je .sm_chk');
-  Line('  call rt_now');
   Line('  subq rt_lastpoll(%rip), %rax');
   Line('  cmpq $10000000, %rax');
   Line('  jb .sm_chk');
@@ -47283,11 +47335,17 @@ begin
   Line('.sm_retake:');
   Line('  movq %rbx, %rdi');
   Line('  call rt_retake');
+  Line('  testq %rax, %rax');
+  Line('  jz .sm_preempt');
+  Line('  movq $' + IntToStr(SysmonMinDelay) + ', 16(%rsp)');
+  Line('  movq $0, 24(%rsp)');
   { A routine that still says Poisoned a tick after it was poisoned has
     reached no check in 10 ms: its M, while it runs, gets SIGURG, and
     rt_sigurg stops the routine where it is (P293, Go's preemptone and
     sysmon). }
   Line('.sm_preempt:');
+  Line('  cmpq $0, 40(%rsp)');
+  Line('  je .sm_next');
   Line('  movq 16(%rbx), %rax');
   Line('  testq %rax, %rax');
   Line('  jz .sm_next');
@@ -64295,20 +64353,24 @@ begin
   Line('  cbz x24, .rk_wake');
   Line('  mov x0, x23');
   Line('  bl rt_newm');
-  Line('  b .rk_done');
+  Line('  b .rk_taken');
   Line('.rk_wake:');
   Line('  add x0, x23, #48');
   Line('  mov x1, #129');
   Line('  mov x2, #1');
   Line('  mov x8, #98');
   Line('  svc #0');
-  Line('  b .rk_done');
+  Line('  b .rk_taken');
   Line('.rk_missed:');
   Line('  clrex');
   Line('.rk_unlock:');
   LeaS('rt_heapstate', 'x0');
   Line('  add x0, x0, #336');
   Line('  bl rt_unlock');
+  Line('  mov x0, xzr');
+  Line('  b .rk_done');
+  Line('.rk_taken:');
+  Line('  mov x0, #1');
   Line('.rk_done:');
   Line('  ldp x23, x24, [sp], #16');
   Line('  ldp x21, x22, [sp], #16');
@@ -65935,7 +65997,11 @@ begin
   Line('rt_sysmon:');
   { no routine's record: rt_now stays on this stack (P342) }
   Line('  mov x28, xzr');
-  Line('  sub sp, sp, #16');
+  { Same local layout as the amd64 monitor. }
+  Line('  sub sp, sp, #48');
+  Imm('x9', SysmonMinDelay);
+  Line('  str x9, [sp, #16]');
+  Line('  stp xzr, xzr, [sp, #24]');
   { As on amd64. STLR followed by LDAR orders publishing the note
     before sampling the wake generation (Arm ARM B2.6.10). }
   Line('.sm_sleep:');
@@ -65989,13 +66055,40 @@ begin
   Line('  svc #0');
   LeaS('rt_sysmonnote', 'x0');
   Line('  stlr wzr, [x0]');
+  Line('  cmp w23, #2');
+  Line('  b.ne .sm_poll');
+  Imm('x9', SysmonMinDelay);
+  Line('  str x9, [sp, #16]');
+  Line('  str xzr, [sp, #24]');
   Line('  b .sm_poll');
   Line('.sm_disarm:');
   Line('  stlr wzr, [x0]');
   Line('.sm_tick:');
-  Line('  str xzr, [sp]');
-  Imm('x9', 10000000);
+  Line('  ldp x9, x10, [sp, #16]');
+  Line('  cmp x10, #' + IntToStr(SysmonBackoffScans));
+  Line('  b.hs .sm_double');
+  Line('  add x10, x10, #1');
+  Line('  str x10, [sp, #24]');
+  Line('  b .sm_nap');
+  Line('.sm_double:');
+  Line('  add x9, x9, x9');
+  Imm('x10', SysmonMaxDelay);
+  Line('  cmp x9, x10');
+  Line('  csel x9, x9, x10, ls');
+  Line('  str x9, [sp, #16]');
+  Line('.sm_nap:');
+  Line('  stp xzr, x9, [sp]');
+  Line('  ldr x9, [sp, #32]');
+  Line('  cbz x9, .sm_nanosleep');
+  Line('  bl rt_now');
+  Line('  ldr x9, [sp, #32]');
+  Line('  subs x9, x9, x0');
+  Line('  b.ls .sm_poll');
+  Line('  ldr x10, [sp, #8]');
+  Line('  cmp x9, x10');
+  Line('  csel x9, x9, x10, lo');
   Line('  str x9, [sp, #8]');
+  Line('.sm_nanosleep:');
   Line('  mov x0, #1');
   Line('  mov x1, xzr');
   Line('  mov x2, sp');
@@ -66004,11 +66097,20 @@ begin
   Line('  svc #0');
   { the poller when no M waits in it and none has looked for 10 ms }
   Line('.sm_poll:');
+  Line('  bl rt_now');
+  Line('  ldr x9, [sp, #32]');
+  Line('  str xzr, [sp, #40]');
+  Line('  cmp x0, x9');
+  Line('  b.lo .sm_poll_io');
+  Imm('x9', SysmonPreemptInterval);
+  Line('  add x9, x0, x9');
+  Line('  mov x10, #1');
+  Line('  stp x9, x10, [sp, #32]');
+  Line('.sm_poll_io:');
   LdS('rt_polluntil', 'x9');
   Line('  cbnz x9, .sm_chk');
   LdS('rt_epfd', 'x9');
   Line('  cbz x9, .sm_chk');
-  Line('  bl rt_now');
   LdS('rt_lastpoll', 'x9');
   Line('  sub x0, x0, x9');
   Imm('x9', 10000000);
@@ -66056,11 +66158,18 @@ begin
   Line('.sm_retake:');
   Line('  mov x0, x1');
   Line('  bl rt_retake');
+  Line('  cbz x0, .sm_m');
+  Imm('x9', SysmonMinDelay);
+  Line('  str x9, [sp, #16]');
+  Line('  str xzr, [sp, #24]');
+  Line('.sm_m:');
   LeaS('rt_allm', 'x1');
   Line('  add x1, x1, x22, lsl #7');
   { a routine still poisoned since the last tick: SIGURG to its M,
     while it runs (P293) }
   Line('.sm_preempt:');
+  Line('  ldr x9, [sp, #40]');
+  Line('  cbz x9, .sm_next');
   Line('  ldr x0, [x1, #16]');
   Line('  cbz x0, .sm_next');
   Imm('x9', Int64($fffffffffffffade));

@@ -35,6 +35,7 @@ import resource
 import select
 import signal
 import socket
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -388,6 +389,27 @@ def ends(sock, what):
     print('ok', what)
 
 
+def syscall_handoff(what):
+    env = dict(os.environ, PASLANG_MAXPROCS='1')
+    try:
+        result = subprocess.run(RUN + [BIN, 'syscall-handoff'], env=env,
+                                capture_output=True, timeout=WAIT)
+    except subprocess.TimeoutExpired:
+        fail(what, 'a blocked syscall kept the P')
+    if result.returncode or result.stderr:
+        fail(what, 'status %d, stderr %r' % (result.returncode, result.stderr))
+    try:
+        durations = [int(line) for line in result.stdout.splitlines()]
+    except ValueError:
+        fail(what, 'unexpected output %r' % result.stdout)
+    if len(durations) != 64 or min(durations) <= 0:
+        fail(what, 'expected 64 positive handoff durations')
+    median = statistics.median(durations) / 1_000_000
+    if median >= 10:
+        fail(what, 'median handoff %.2f ms, want below 10 ms' % median)
+    print('ok %s (median %.2f ms)' % (what, median))
+
+
 def main():
     by_path(False, 'unix, the file there')
     by_path(True, 'unix, the file removed')
@@ -397,6 +419,7 @@ def main():
     idle('idle')
     idle_timer('idle with timer')
     idle_syscall('idle in a blocking call')
+    syscall_handoff('a blocked syscall hands off the only P')
     exhausted('out of descriptors')
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.bind(('127.0.0.1', 0))

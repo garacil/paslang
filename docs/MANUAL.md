@@ -15096,8 +15096,12 @@ When none remains and a routine is alive, the runtime stops with
 This model applies to every unit, including user-written units. A
 pollable wait parks its G. An unavoidable blocking system call keeps
 its P on the short-call path; sysmon retakes that P if the call is still
-blocked and hands it to another M. A returned G whose P was retaken
-rejoins the same scheduler and may resume on a different M. Its stack,
+blocked and hands it to another M. After a handoff the monitor scans
+at 20 µs intervals. If fifty short scans find no handoff, it doubles
+the interval up to 10 ms. Network polling and preemption keep their
+own 10 ms timing. When all workers are idle, the monitor sleeps until
+the scheduler wakes it. A returned G whose P was retaken rejoins the
+same scheduler and may resume on a different M. Its stack,
 GC roots, exception and per-G state move with it. Returned no-P Ms are
 reused, so the thread count follows simultaneous blocking demand, not
 the number of completed calls. The runtime limits allocated Ms to
