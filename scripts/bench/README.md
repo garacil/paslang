@@ -275,6 +275,13 @@ cannot disappear behind a later successful round. Forty-round comparisons
 also require the upper quartile below 1; all existing time/memory budgets
 remain strictly below 1.
 
+The server comparisons retain every timed run and separate traced sample.
+Both must produce the full expected self-test counts with empty stderr.
+The timed supervisor cleans up descendants and reports timeouts with partial
+output. Missing samples, failed cleanup and failed exit statuses invalidate
+the pair. The report recomputes verdicts from the individual samples.
+Server timing uses the supervisor's monotonic elapsed time.
+
 Peak memory is the process's VmHWM at its traced exit, with transparent
 huge pages disabled. A separate sampler consumes SIGCHLD through signalfd
 and promptly forwards delivery signals, including Go's preemption signals.

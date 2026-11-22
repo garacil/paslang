@@ -13,6 +13,7 @@ import argparse
 import html
 import json
 import math
+from pathlib import Path
 import statistics
 import sys
 
@@ -461,18 +462,45 @@ def build(w, path):
 
 
 def servers(w, path):
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from servers import FORMAT, PAIRS, summarize
+
     record = read(path)
+    current = record.get('format') == FORMAT
     w('## The servers')
     w('')
-    w('Record: ' + safe(path) + '; rounds: ' + safe(record.get('runs', '?')) + '.')
+    w('Record ' + safe(path) + ' with ' + safe(record.get('runs', '?')) + ' requested rounds per pair.')
+    expected = {(cpu, name, n) for cpu in record.get('cpus', []) for name, loads in PAIRS for n in loads}
+    seen = set()
+    valid = current and bool(expected) and record.get('ok') is True
     rows = []
     for row in record.get('pairs', []):
-        rows.append((row.get('pair'), row.get('cpu'), row.get('n'), num(middle(row.get('go_s'))), num(middle(row.get('paslang_s'))),
-                     num(row.get('ratio')), num(row.get('budget'), 2), num(middle(row.get('go_mb')), 1),
-                     num(middle(row.get('paslang_mb')), 1), num(row.get('ratio_mem')), 'yes' if row.get('same_output') else 'NO'))
-    table(w, ['Pair', 'cpu', 'n', 'Go s', 'paslang s', 'Time ratio', 'Budget', 'Go MiB', 'paslang MiB', 'Memory ratio', 'Same output'], rows)
+        key = (row.get('cpu'), row.get('pair'), row.get('n'))
+        if current:
+            try:
+                measured = summarize(row, record.get('runs'))
+            except (KeyError, TypeError, AttributeError, OverflowError, ValueError):
+                measured = {'verdict': 'INVALID'}
+            verdict = measured['verdict']
+            valid = valid and verdict == 'PASS' and key in expected and key not in seen
+            seen.add(key)
+        else:
+            measured = row
+            verdict = 'Legacy'
+        rows.append((row.get('pair'), row.get('cpu'), row.get('n'),
+                     num(middle(measured.get('go_s'))), num(middle(measured.get('paslang_s'))),
+                     num(measured.get('ratio')), num(measured.get('budget'), 2),
+                     num(middle(measured.get('go_mb')), 1), num(middle(measured.get('paslang_mb')), 1),
+                     num(measured.get('ratio_mem')), verdict))
+    table(w, ['Pair', 'cpu', 'n', 'Go s', 'paslang s', 'Time ratio', 'Budget',
+              'Go MiB', 'paslang MiB', 'Memory ratio', 'Verdict'], rows)
+    if current:
+        valid = valid and seen == expected and record.get('requested_pairs') == record.get('completed_pairs') == len(expected)
+        w('Aggregate server verdict ' + ('PASS' if valid else 'FAIL') + '.')
+    else:
+        w('Legacy record with summary measurements.')
+    w('')
     detail(w, 'Complete server evidence', record)
-
 
 def main(arguments):
     parser = argparse.ArgumentParser(description=__doc__)

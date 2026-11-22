@@ -1407,6 +1407,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	@python3 -I scripts/bench/check_harness.py
 	@python3 -I scripts/check_tls_interop_ready.py
 	@python3 -I scripts/bench/check_peak.py
+	@python3 -I scripts/bench/check_servers.py
 	@python3 -I scripts/bench/check_reference_caps.py
 	@python3 -I scripts/bench/check_reference_policy.py
 	@python3 -I scripts/bench/check_metadata_scope.py

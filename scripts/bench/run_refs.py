@@ -157,8 +157,11 @@ def paslang_inputs(arguments, executable, env=None, cwd=None):
     units = []
     cpu = arguments[arguments.index("-cpu") + 1] if "-cpu" in arguments else "native"
     for entry in lines[6:]:
-        obj = (Path(entry) if Path(entry).is_absolute() else root / entry).resolve()
-        name = obj.stem.lower()
+        # The linker argument names the unit. Its symlink target may have a
+        # different basename and is used only for the file's identity.
+        linked = root / entry
+        name = linked.stem.lower()
+        obj = linked.resolve()
         interface = next((directory / (name + ".pi") for directory in paths
                           if (directory / (name + ".pi")).is_file()), None)
         if interface is None:
@@ -175,7 +178,7 @@ def paslang_inputs(arguments, executable, env=None, cwd=None):
             selection = {"variant": str(variant), "available": variant.is_file(),
                          "not_older_than_base": (variant.is_file() and base.is_file() and
                                                  variant.stat().st_mtime_ns >= base.stat().st_mtime_ns)}
-        units.append({"name": name, "interface": identity(interface),
+        units.append({"name": name, "interface": identity(interface.resolve()),
                       "object": identity(obj), "cpu_object_selection": selection})
     return {"search_paths": list(map(str, paths)), "units": units}
 
