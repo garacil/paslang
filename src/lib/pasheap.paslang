@@ -47,6 +47,7 @@ const
   PasDefaultGcPercent = 100;
   PasDefaultGcWorkers = 16;
 
+function PasCpuLimit(NProc: Integer; CgroupFile, MountFile: PChar): Integer;
 function PasHeapInit(H: Pointer; NProc: Integer): Integer;
 function PasHeapRefill(H, MC: Pointer; SC: Integer): Integer;
 function PasHeapLarge(H: Pointer; Size, Typ: Integer): Integer;
@@ -556,6 +557,444 @@ begin
   X := (X and 3689348814741910323) + ((X shr 2) and 3689348814741910323);
   X := (X + (X shr 4)) and 1085102592571150095;
   Result := (X * 72340172838076673) shr 56;
+end;
+
+{ Startup CPU quotas. Before the heap is ready, use fixed storage and
+  raw Linux reads, as Go's internal/runtime/cgroup does. The process's
+  cgroup and the corresponding mount root come from procfs. Walk the
+  visible parents as Rust's std/sys/thread/unix.rs does: an unlimited
+  group can still be under a CPU bandwidth limit. }
+const
+  BootPathSize = 4096;
+  { Up to three escaped PATH_MAX fields, plus mount options. }
+  BootLineSize = 16 * BootPathSize;
+  BootDecimalMax = 9223372036854775807;
+
+type
+  TBootPath = array[0..BootPathSize - 1] of Byte;
+  TBootLine = array[0..BootLineSize - 1] of Byte;
+  TBootReader = record
+    Fd, Cursor, Count: Integer;
+    Data: TBootPath;
+  end;
+  TBootToken = record
+    Start, Count: Integer;
+  end;
+
+function BootCall(Nr, A, B, C: Integer): Integer;
+begin
+  asm amd64 (Nr: in rax; A: in rdi; B: in rsi; C: in rdx; Result: out rax)
+    syscall
+  end;
+  asm arm64 (Nr: in x8; A: in x0; B: in x1; C: in x2; Result: out x0)
+    svc #0
+  end;
+end;
+
+function BootOpen(Path: PChar): Integer;
+var
+  nr: Integer;
+begin
+  if Amd64 = 1 then
+    nr := 257
+  else
+    nr := 56;
+  repeat
+    Result := BootCall(nr, -100, Integer(Path), 524288);
+  until Result <> -4;
+end;
+
+function BootRead(Fd, Dest, Count: Integer): Integer;
+var
+  nr: Integer;
+begin
+  if Amd64 = 1 then
+    nr := 0
+  else
+    nr := 63;
+  repeat
+    Result := BootCall(nr, Fd, Dest, Count);
+  until Result <> -4;
+end;
+
+procedure BootClose(Fd: Integer);
+begin
+  { Linux closes the descriptor even when close returns EINTR. }
+  if Amd64 = 1 then
+    BootCall(3, Fd, 0, 0)
+  else
+    BootCall(57, Fd, 0, 0);
+end;
+
+{ -1 ends the input. -2 skips a line that did not fit without letting
+  its tail be interpreted as another line. }
+function BootNextLine(var R: TBootReader; var Line: TBootLine): Integer;
+var
+  byteValue: Byte;
+  n: Integer;
+  overflow: Boolean;
+begin
+  n := 0;
+  overflow := False;
+  while True do
+  begin
+    if R.Cursor = R.Count then
+    begin
+      R.Count := BootRead(R.Fd, Integer(@R.Data[0]), SizeOf(R.Data));
+      R.Cursor := 0;
+      if (R.Count < 0) or ((R.Count = 0) and (n = 0)) then
+        Exit(-1);
+      if R.Count = 0 then
+        Break;
+    end;
+    byteValue := R.Data[R.Cursor];
+    Inc(R.Cursor);
+    if byteValue = 10 then
+      Break;
+    if n = SizeOf(Line) then
+      overflow := True
+    else
+    begin
+      Line[n] := byteValue;
+      Inc(n);
+    end;
+  end;
+  if overflow then
+    Result := -2
+  else
+    Result := n;
+end;
+
+function BootToken(var Line: TBootLine; var Cursor: Integer;
+                   Count: Integer; Delimiter: Byte): TBootToken;
+begin
+  Result.Start := Cursor;
+  while (Cursor < Count) and (Line[Cursor] <> Delimiter) do
+    Inc(Cursor);
+  Result.Count := Cursor - Result.Start;
+  if Cursor < Count then
+    Inc(Cursor);
+end;
+
+function BootEquals(var Line: TBootLine; Token: TBootToken; const S: string): Boolean;
+var
+  i: Integer;
+begin
+  if Token.Count <> Length(S) then
+    Exit(False);
+  for i := 0 to Token.Count - 1 do
+    if Line[Token.Start + i] <> Ord(S[i + 1]) then
+      Exit(False);
+  Result := True;
+end;
+
+function BootHasCpu(var Line: TBootLine; Token: TBootToken): Boolean;
+var
+  part: TBootToken;
+  Cursor, stop: Integer;
+begin
+  Cursor := Token.Start;
+  stop := Cursor + Token.Count;
+  while Cursor < stop do
+  begin
+    part := BootToken(Line, Cursor, stop, 44);
+    if BootEquals(Line, part, 'cpu') then
+      Exit(True);
+  end;
+  Result := False;
+end;
+
+{ mountinfo writes escaped octal octets in path fields. Procfs cgroup
+  membership paths are read as given. Reject dot components so a path
+  outside the visible cgroup namespace cannot escape the mount. }
+function BootDecodePath(var Line: TBootLine; Token: TBootToken;
+                        EscapeOctal: Boolean; var Path: TBootPath): Integer;
+var
+  i, j, n, stop, b, part: Integer;
+begin
+  i := Token.Start;
+  stop := i + Token.Count;
+  n := 0;
+  part := 0;
+  while i < stop do
+  begin
+    b := Line[i];
+    Inc(i);
+    if EscapeOctal and (b = 92) then
+    begin
+      if i + 3 > stop then
+        Exit(0);
+      b := 0;
+      for j := 0 to 2 do
+      begin
+        if (Line[i] < 48) or (Line[i] > 55) then
+          Exit(0);
+        b := b * 8 + Line[i] - 48;
+        Inc(i);
+      end;
+    end;
+    if (n = High(Path)) or (b = 0) or (b > 255) then
+      Exit(0);
+    if b = 47 then
+    begin
+      if ((n - part = 1) and (Path[part] = 46)) or
+         ((n - part = 2) and (Path[part] = 46) and (Path[part + 1] = 46)) then
+        Exit(0);
+      part := n + 1;
+    end;
+    Path[n] := Byte(b);
+    Inc(n);
+  end;
+  if (n = 0) or (Path[0] <> 47) or
+     ((n - part = 1) and (Path[part] = 46)) or
+     ((n - part = 2) and (Path[part] = 46) and (Path[part + 1] = 46)) then
+    Exit(0);
+  Path[n] := 0;
+  Result := n;
+end;
+
+function BootCgroup(Path: PChar; var Group: TBootPath; out GroupLen: Integer): Integer;
+var
+  reader: TBootReader;
+  line: TBootLine;
+  candidate: TBootPath;
+  id, ctl, entry: TBootToken;
+  n, Cursor, decoded, i: Integer;
+begin
+  Result := 0;
+  GroupLen := 0;
+  reader.Fd := BootOpen(Path);
+  if reader.Fd < 0 then
+    Exit;
+  reader.Cursor := 0;
+  reader.Count := 0;
+  repeat
+    n := BootNextLine(reader, line);
+    if n > 0 then
+    begin
+      Cursor := 0;
+      id := BootToken(line, Cursor, n, 58);
+      ctl := BootToken(line, Cursor, n, 58);
+      entry.Start := Cursor;
+      entry.Count := n - Cursor;
+      if BootHasCpu(line, ctl) then
+      begin
+        decoded := BootDecodePath(line, entry, False, candidate);
+        if decoded > 0 then
+        begin
+          for i := 0 to decoded do
+            Group[i] := candidate[i];
+          GroupLen := decoded;
+          Result := 1;
+          Break;
+        end;
+      end
+      else if (ctl.Count = 0) and BootEquals(line, id, '0') then
+      begin
+        decoded := BootDecodePath(line, entry, False, candidate);
+        if decoded > 0 then
+        begin
+          for i := 0 to decoded do
+            Group[i] := candidate[i];
+          GroupLen := decoded;
+          Result := 2;
+        end;
+      end;
+    end;
+  until n = -1;
+  BootClose(reader.Fd);
+end;
+
+function BootMountTokens(var Line: TBootLine; Count, Version: Integer;
+                         out RootEntry, MountEntry: TBootToken): Boolean;
+var
+  t: TBootToken;
+  i, Cursor: Integer;
+begin
+  Cursor := 0;
+  for i := 1 to 3 do
+    t := BootToken(Line, Cursor, Count, 32);
+  RootEntry := BootToken(Line, Cursor, Count, 32);
+  MountEntry := BootToken(Line, Cursor, Count, 32);
+  repeat
+    t := BootToken(Line, Cursor, Count, 32);
+  until (t.Count = 0) or BootEquals(Line, t, '-');
+  if t.Count = 0 then
+    Exit(False);
+  t := BootToken(Line, Cursor, Count, 32);
+  if Version = 2 then
+    Exit(BootEquals(Line, t, 'cgroup2'));
+  if not BootEquals(Line, t, 'cgroup') then
+    Exit(False);
+  t := BootToken(Line, Cursor, Count, 32);
+  t := BootToken(Line, Cursor, Count, 32);
+  Result := BootHasCpu(Line, t);
+end;
+
+function BootUnderRoot(var Group, Root: TBootPath; GroupLen, RootLen: Integer): Boolean;
+var
+  i: Integer;
+begin
+  if RootLen = 1 then
+    Exit(True);
+  if (GroupLen < RootLen) or ((GroupLen > RootLen) and (Group[RootLen] <> 47)) then
+    Exit(False);
+  for i := 0 to RootLen - 1 do
+    if Group[i] <> Root[i] then
+      Exit(False);
+  Result := True;
+end;
+
+function BootReadNumber(Data: PChar; var Cursor: Integer; Count: Integer): Integer;
+var
+  d, n, start: Integer;
+  p: PCh;
+begin
+  start := Cursor;
+  n := 0;
+  while Cursor < Count do
+  begin
+    p := PCh(Integer(Data) + Cursor);
+    d := Ord(p^) - 48;
+    if (d < 0) or (d > 9) then
+      Break;
+    if n > (BootDecimalMax - d) div 10 then
+      Exit(-1);
+    n := n * 10 + d;
+    Inc(Cursor);
+  end;
+  if Cursor = start then
+    Exit(-1);
+  Result := n;
+end;
+
+function BootReadQuota(var Path: TBootPath; PathLen: Integer;
+                       const Name: string; WithPeriod: Boolean; out Period: Integer): Integer;
+var
+  fd, n, got, i, Cursor, limit: Integer;
+  data: array[0..63] of Char;
+begin
+  Result := -1;
+  Period := -1;
+  i := PathLen;
+  if Path[i - 1] <> 47 then
+    Inc(i);
+  if i + Length(Name) >= SizeOf(Path) then
+    Exit;
+  if i <> PathLen then
+    Path[PathLen] := 47;
+  for n := 1 to Length(Name) do
+  begin
+    Path[i] := Byte(Ord(Name[n]));
+    Inc(i);
+  end;
+  Path[i] := 0;
+  fd := BootOpen(PChar(@Path[0]));
+  Path[PathLen] := 0;
+  if fd < 0 then
+    Exit;
+  n := 0;
+  repeat
+    got := BootRead(fd, Integer(@data[n]), SizeOf(data) - n);
+    if got > 0 then
+      Inc(n, got);
+  until (got <= 0) or (n = SizeOf(data));
+  BootClose(fd);
+  if (got < 0) or (n < 2) or (n = SizeOf(data)) or (data[n - 1] <> Chr(10)) then
+    Exit;
+  Dec(n);
+  Cursor := 0;
+  limit := BootReadNumber(PChar(@data[0]), Cursor, n);
+  { The kernel prints either "quota period" or "max period" for v2,
+    and a single integer (-1 for unlimited quota) for v1. }
+  if limit < 0 then
+    Exit;
+  if WithPeriod then
+  begin
+    if (Cursor = n) or (data[Cursor] <> ' ') then
+      Exit;
+    Inc(Cursor);
+    Period := BootReadNumber(PChar(@data[0]), Cursor, n);
+  end;
+  if Cursor = n then
+    Result := limit;
+end;
+
+function BootQuotaTree(var Path: TBootPath; PathLen, MountLen, Version, Limit: Integer): Integer;
+var
+  q, period, ignored, count: Integer;
+begin
+  Result := Limit;
+  repeat
+    if Version = 2 then
+      q := BootReadQuota(Path, PathLen, 'cpu.max', True, period)
+    else
+    begin
+      q := BootReadQuota(Path, PathLen, 'cpu.cfs_quota_us', False, ignored);
+      period := BootReadQuota(Path, PathLen, 'cpu.cfs_period_us', False, ignored);
+    end;
+    if (q > 0) and (period > 0) then
+    begin
+      count := q div period;
+      if q mod period <> 0 then
+        Inc(count);
+      if count < Result then
+        Result := count;
+    end;
+    if (PathLen = MountLen) or (Result = 1) then
+      Exit;
+    repeat
+      Dec(PathLen);
+    until (PathLen = MountLen) or (Path[PathLen] = 47);
+    Path[PathLen] := 0;
+  until False;
+end;
+
+function PasCpuLimit(NProc: Integer; CgroupFile, MountFile: PChar): Integer;
+var
+  reader: TBootReader;
+  line: TBootLine;
+  group, root, path: TBootPath;
+  rootEntry, mountEntry: TBootToken;
+  version, groupLen, rootLen, mountLen, n, first, i, len: Integer;
+begin
+  Result := NProc;
+  if NProc <= 1 then
+    Exit;
+  version := BootCgroup(CgroupFile, group, groupLen);
+  if version = 0 then
+    Exit;
+  reader.Fd := BootOpen(MountFile);
+  if reader.Fd < 0 then
+    Exit;
+  reader.Cursor := 0;
+  reader.Count := 0;
+  repeat
+    n := BootNextLine(reader, line);
+    if (n > 0) and BootMountTokens(line, n, version, rootEntry, mountEntry) then
+    begin
+      rootLen := BootDecodePath(line, rootEntry, True, root);
+      mountLen := BootDecodePath(line, mountEntry, True, path);
+      if (rootLen > 0) and (mountLen > 0) and
+         BootUnderRoot(group, root, groupLen, rootLen) then
+      begin
+        first := rootLen;
+        if (rootLen = 1) and (groupLen > 1) then
+          first := 0;
+        if (mountLen = 1) and (first < groupLen) then
+          Inc(first);
+        len := mountLen + groupLen - first;
+        if len < SizeOf(path) then
+        begin
+          for i := first to groupLen - 1 do
+            path[mountLen + i - first] := group[i];
+          path[len] := 0;
+          Result := BootQuotaTree(path, len, mountLen, version, Result);
+        end;
+      end;
+    end;
+  until (n = -1) or (Result = 1);
+  BootClose(reader.Fd);
 end;
 
 { ---- the environment ---- }

@@ -3,8 +3,9 @@
 # Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
 # GPL version 3 or later. See COPYING.
 
-"""Check Linux CPU affinity and one-processor scheduler wakeups."""
+"""Check Linux scheduler sizing and one-processor wakeups."""
 
+import json
 import os
 from pathlib import Path
 import runpy
@@ -63,6 +64,64 @@ def link_variant(program, candidate, cc_prefix, assembly):
     run([cc_prefix + 'ld', *(replacements.get(arg, arg) for arg in link)])
 
 
+def with_cgroup_files(assembly, membership, mountinfo):
+    for path, fixture in (('/proc/self/cgroup', membership), ('/proc/self/mountinfo', mountinfo)):
+        original = f'.asciz "{path}"'
+        if assembly.count(original) != 1:
+            raise SystemExit(f'expected one startup path for {path}')
+        assembly = assembly.replace(original, '.asciz ' + json.dumps(str(fixture), ensure_ascii=False))
+    return assembly
+
+
+def check_cgroups(command, membership, mountinfo, working):
+    default = ['env', '-u', 'PASLANG_MAXPROCS', *command]
+    mount = working / 'cpu quotas'
+    group = mount / 'child'
+    group.mkdir(parents=True)
+    escaped = str(mount).replace(chr(92), r'\134').replace(' ', r'\040')
+    quota = group / 'cpu.max'
+    parent = mount / 'cpu.max'
+    membership.write_text('0::/team space/child\n')
+    identical_prefix = f'42 21 0:42 /team {escaped} rw - cgroup2 cgroup rw\n'
+    long_mount = '43 21 0:43 / /misc rw - overlay overlay ' + 'x' * 65536 + '\n'
+    v2 = f'44 21 0:44 /team\\040space {escaped} rw nsdelegate - cgroup2 cgroup rw\n'
+    mountinfo.write_text(long_mount + identical_prefix + v2)
+    for child, inherited, expected in (
+        ('125000 100000\n', 'max 100000\n', 2),
+        ('30000 100000\n', 'max 100000\n', 1),
+        ('max 100000\n', '175000 100000\n', 2),
+        ('900000 100000\n', '300000 100000\n', 3),
+        ('10 0\n', '200000 100000\n', 2),
+        ('100000 100000 extra\n', '200000 100000\n', 2),
+        ('100000 100000', '200000 100000\n', 2),
+        ('9223372036854775808 100000\n', '300000 100000\n', 3),
+        ('9223372036854775807 1\n', 'max 100000\n', 65),
+        ('max 100000\n', 'max 100000\n', 65),
+    ):
+        quota.write_text(child)
+        parent.write_text(inherited)
+        expect(default, expected, f'cgroup v2 {child!r}, parent {inherited!r}')
+
+    quota.write_text('100000 100000\n')
+    mountinfo.write_text(identical_prefix)
+    expect(default, 65, 'cgroup mount root must match at a path boundary')
+    membership.write_text('0::/team space/../team space/child\n')
+    mountinfo.write_text(v2)
+    expect(default, 65, 'cgroup outside the visible mount')
+
+    membership.write_text('0::/team space/child\n7:cpuacct,cpu:/legacy/child\n')
+    v1 = f'45 21 0:45 /legacy {escaped} rw - cgroup cgroup rw,cpuacct,cpu\n'
+    mountinfo.write_text(v2 + v1)
+    (group / 'cpu.cfs_quota_us').write_text('-1\n')
+    (mount / 'cpu.cfs_quota_us').write_text('225000\n')
+    (mount / 'cpu.cfs_period_us').write_text('100000\n')
+    expect(default, 3, 'cgroup v1 controller in a hybrid hierarchy and inherited limit')
+    (group / 'cpu.cfs_quota_us').write_text('75000\n')
+    (group / 'cpu.cfs_period_us').write_text('100000\n')
+    expect(default, 1, 'cgroup v1 local quota')
+    expect(['env', 'PASLANG_MAXPROCS=4', *command], 4, 'explicit override in a limited cgroup')
+
+
 def check_one_p(compiler, units, working, cpu, launch, allowed):
     root = Path(__file__).resolve().parent.parent
     check_blocked_writer = runpy.run_path(str(root / 'scripts/check_uncaught_reports.py'))['check_blocked_writer']
@@ -104,11 +163,17 @@ def check_target(compiler, build, working, cpu, launch):
                expected, f'{cpu} PASLANG_MAXPROCS={value!r}')
 
     # Tests of the mask must reach the syscall independently of the caller's environment.
-    launch = ['env', '-u', 'PASLANG_MAXPROCS'] + launch
-    expect(launch + [str(program)], min(10000, max(1, len(allowed))), f'{cpu} current mask')
-    expect(pin + launch + [str(program)], 1, f'{cpu} single CPU')
+    clean_launch = ['env', '-u', 'PASLANG_MAXPROCS'] + launch
+    expect(pin + clean_launch + [str(program)], 1, f'{cpu} single CPU')
 
-    assembly = program.with_suffix('.s').read_text()
+    fixtures = working / f'{cpu}-cgroups'
+    fixtures.mkdir()
+    membership = fixtures / 'cgroup'
+    mountinfo = fixtures / 'mountinfo'
+    assembly = with_cgroup_files(program.with_suffix('.s').read_text(), membership, mountinfo)
+    affinity_only = working / f'{cpu}-current-mask'
+    link_variant(program, affinity_only, cc_prefix, assembly)
+    expect(clean_launch + [str(affinity_only)], min(10000, max(1, len(allowed))), f'{cpu} current mask')
     syscall = '  syscall\n' if native else '  svc #0\n'
     start = assembly.index('rt_ncpu:\n')
     end = assembly.index('\nrt_', start)
@@ -126,8 +191,9 @@ def check_target(compiler, build, working, cpu, launch):
         candidate = working / f'{cpu}-{name}'
         changed = assembly[:raw] + masked_syscall(cpu, words, result) + assembly[raw + len(syscall):]
         link_variant(program, candidate, cc_prefix, changed)
-        expect(launch + [str(candidate)], expected, f'{cpu} {name}')
-    check_one_p(compiler, units, working, cpu, launch, allowed)
+        expect(clean_launch + [str(candidate)], expected, f'{cpu} {name}')
+    check_cgroups(launch + [str(working / f'{cpu}-wide-mask')], membership, mountinfo, fixtures)
+    check_one_p(compiler, units, working, cpu, clean_launch, allowed)
 
 
 if __name__ == '__main__':
@@ -137,4 +203,4 @@ if __name__ == '__main__':
     with TemporaryDirectory(prefix='affinity-check-', dir=build) as temporary:
         for target, run_under in (('amd64', []), ('arm64', [str(qemu)])):
             check_target(str(compiler), build, Path(temporary), target, run_under)
-    print('CPU affinity, pending wakes and real deadlocks checked on amd64 and arm64')
+    print('CPU affinity, cgroups, pending wakes and real deadlocks checked on amd64 and arm64')
