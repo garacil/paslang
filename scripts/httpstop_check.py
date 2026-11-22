@@ -12,6 +12,7 @@ and looks at what is left of its sockets (P573).
   idle                      a server nobody talks to sleeps: its acceptor is parked on the poller and neither tries
                             again every few milliseconds nor spins (the cost of a second of it is looked at)
   idle with timer           the workers and monitor sleep until the poller fires a timer
+  idle in a blocking call  the only routine waits for a byte in a blocking syscall
   out of descriptors        with more connections than it may hold open (EMFILE from accept4) the server waits a
                             little and tries again, as Go's Serve backs off: it does not spin, and when the
                             connections go it serves again and stops on SIGTERM
@@ -267,6 +268,32 @@ def idle_timer(what):
     print('ok', what)
 
 
+def idle_syscall(what):
+    read_fd, write_fd = os.pipe()
+    try:
+        with subprocess.Popen(RUN + [BIN, 'idle-syscall', str(read_fd)],
+                              pass_fds=(read_fd,), stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, bufsize=0) as p:
+            try:
+                until_listening(p, what, b'waiting\n')
+                time.sleep(0.3)
+                quiet(p, what, SWITCHES)
+                os.write(write_fd, b'q')
+                try:
+                    output, _ = p.communicate(timeout=WAIT)
+                except subprocess.TimeoutExpired:
+                    abort(p, what, 'the syscall did not return after data arrived')
+                if p.returncode != 0 or output != b'1 q\n':
+                    fail(what, 'syscall returned status %d and output %r' % (p.returncode, output))
+            finally:
+                if p.poll() is None:
+                    kill_and_collect(p)
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+    print('ok', what)
+
+
 def exhausted(what):
     d = tempfile.mkdtemp()
     path = d + '/s.sock'
@@ -369,6 +396,7 @@ def main():
     passed(socket.AF_UNIX, True, 'systemd, unix, the file removed')
     idle('idle')
     idle_timer('idle with timer')
+    idle_syscall('idle in a blocking call')
     exhausted('out of descriptors')
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.bind(('127.0.0.1', 0))

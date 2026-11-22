@@ -15020,8 +15020,10 @@ starts with the program; others start as work requires them. The current
 G is in a register (`r14` on amd64, `x28` on arm64) and every routine
 has its own stack that grows on demand: each routine entry checks the
 stack and calls the runtime when it needs more. A system monitor thread
-sleeps while all workers are idle. The worker that wakes for I/O or a
-timer also wakes the monitor. While there is work, the monitor
+sleeps while all workers are idle. When only one worker has started,
+the monitor also sleeps while its sole routine is blocked in a
+system call. A worker that resumes wakes the monitor. While there
+is work, the monitor
 marks a long-running routine every 10 ms, and the scheduler takes it
 off its M at its next routine entry; one still marked 10 ms later, a
 loop that calls nothing, gets the signal `SIGURG` on its thread, which
