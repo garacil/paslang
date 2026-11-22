@@ -11,6 +11,7 @@ and looks at what is left of its sockets (P573).
   systemd, unix, removed    with the socket's file removed the program still stops
   idle                      a server nobody talks to sleeps: its acceptor is parked on the poller and neither tries
                             again every few milliseconds nor spins (the cost of a second of it is looked at)
+  idle with timer           the workers and monitor sleep until the poller fires a timer
   out of descriptors        with more connections than it may hold open (EMFILE from accept4) the server waits a
                             little and tries again, as Go's Serve backs off: it does not spin, and when the
                             connections go it serves again and stops on SIGTERM
@@ -43,10 +44,8 @@ if len(sys.argv) < 2:
 BIN = os.path.abspath(sys.argv[1])
 RUN = sys.argv[2:]
 WAIT = 20
-# One idle second of the server (idle below): the runtime's monitor thread wakes a hundred times and nothing else
-# runs, here and under the emulator alike (99 or 100 context switches, 0 or 1 ticks of CPU). An acceptor that slept
-# 5 ms between tries cost 590 switches a second, and one that tried again at once 85 ticks of the 100 a second has.
-SWITCHES = 250
+# The poller and the monitor both sleep while every worker is idle.
+SWITCHES = 4
 TICKS = 20
 # the descriptors the program may have open when it is made to run out of them
 FILES = 40
@@ -98,7 +97,7 @@ def abort(p, what, why, received=b''):
     fail(what, why + cleanup + '; said %r' % (received + remaining).decode(errors='backslashreplace'))
 
 
-def until_listening(p, what):
+def until_listening(p, what, ready=b'listening\n'):
     # One owner reads the raw pipe. Buffered readline can read ahead into
     # the final line, which timed POSIX communicate reads through os.read.
     deadline = time.monotonic() + WAIT
@@ -111,7 +110,7 @@ def until_listening(p, what):
         if not byte:
             break
         line.extend(byte)
-    if line != b'listening\n':
+    if line != ready:
         abort(p, what, 'it said %r, not listening' % bytes(line).decode(errors='backslashreplace'), bytes(line))
 
 
@@ -250,6 +249,24 @@ def idle(what):
     print('ok', what)
 
 
+def idle_timer(what):
+    p = start(['idle-timer'])
+    try:
+        until_listening(p, what, b'waiting\n')
+        time.sleep(0.3)
+        quiet(p, what, SWITCHES)
+        try:
+            output, _ = p.communicate(timeout=WAIT)
+        except subprocess.TimeoutExpired:
+            abort(p, what, 'the timer did not wake the waiting routine')
+        if p.returncode != 0 or output != b'timer fired\n':
+            fail(what, 'the timer ended with status %d and output %r' % (p.returncode, output))
+    finally:
+        if p.poll() is None:
+            kill_and_collect(p)
+    print('ok', what)
+
+
 def exhausted(what):
     d = tempfile.mkdtemp()
     path = d + '/s.sock'
@@ -351,6 +368,7 @@ def main():
     passed(socket.AF_UNIX, False, 'systemd, unix')
     passed(socket.AF_UNIX, True, 'systemd, unix, the file removed')
     idle('idle')
+    idle_timer('idle with timer')
     exhausted('out of descriptors')
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.bind(('127.0.0.1', 0))

@@ -45742,9 +45742,25 @@ begin
   Line('  jmp rt_diedeadlock');
   Line('.msi_ret:');
   Line('  ret');
+  { As in Go's exitsyscallfast, a thread becoming active wakes a
+    sleeping monitor. The locked add precedes the note load
+    (Intel SDM 3A 11.2.3.9), so sysmon either sees the new count
+    or this M sees the armed note. Only its first taker wakes it. }
   Line('rt_msleepout:');
   Line('  movl $-1, %eax');
   Line('  lock xaddq %rax, rt_msleep(%rip)');
+  Line('  cmpl $0, rt_sysmonnote(%rip)');
+  Line('  je .mso_ret');
+  Line('  xorl %eax, %eax');
+  Line('  xchgl %eax, rt_sysmonnote(%rip)');
+  Line('  testl %eax, %eax');
+  Line('  je .mso_ret');
+  Line('  leaq rt_sysmonnote(%rip), %rdi');
+  Line('  movl $129, %esi');
+  Line('  movl $1, %edx');
+  Line('  movl $202, %eax');
+  Line('  syscall');
+  Line('.mso_ret:');
   Line('  ret');
   Line('');
   { The current M: on a routine it is g.m. On g0 (r14 = 0) it is the M
@@ -47139,7 +47155,32 @@ begin
   { no routine's record: rt_now stays on this stack (P342) }
   Line('  xorq %r14, %r14');
   Line('  subq $16, %rsp');
+  { Like Go's runtime/proc.go sysmon, sleep when all workers are
+    idle. rt_msleep counts only Ms past their last look for work.
+    Its high half detects a wake between observing idle and arming
+    the note. The idle poller owns the next timer deadline, so it
+    wakes sysmon through rt_msleepout on input or a due timer. }
   Line('.sm_sleep:');
+  Line('  movq rt_msleep(%rip), %rbx');
+  Line('  cmpl rt_mstarted(%rip), %ebx');
+  Line('  jne .sm_tick');
+  Line('  movl $1, %eax');
+  Line('  xchgl %eax, rt_sysmonnote(%rip)');
+  Line('  cmpq rt_msleep(%rip), %rbx');
+  Line('  jne .sm_disarm');
+  Line('  cmpl rt_mstarted(%rip), %ebx');
+  Line('  jne .sm_disarm');
+  Line('  leaq rt_sysmonnote(%rip), %rdi');
+  Line('  movl $128, %esi');
+  Line('  movl $1, %edx');
+  Line('  xorl %r10d, %r10d');
+  Line('  movl $202, %eax');
+  Line('  syscall');
+  Line('  movl $0, rt_sysmonnote(%rip)');
+  Line('  jmp .sm_poll');
+  Line('.sm_disarm:');
+  Line('  movl $0, rt_sysmonnote(%rip)');
+  Line('.sm_tick:');
   Line('  movq $0, (%rsp)');
   Line('  movq $10000000, 8(%rsp)');
   Line('  movq %rsp, %rdi');
@@ -47149,6 +47190,9 @@ begin
   { The poller when no M has looked at it for 10 ms (1.1.1): sysmon
     looks, on a dummy M with no P so the routines go to the global
     queue and an M is woken for them. }
+  Line('.sm_poll:');
+  Line('  cmpq $0, rt_polluntil(%rip)');
+  Line('  jne .sm_chk');
   Line('  cmpq $0, rt_epfd(%rip)');
   Line('  je .sm_chk');
   Line('  call rt_now');
@@ -57032,6 +57076,9 @@ begin
       poller (rt_pollpark). }
     Line('rt_msleep:');
     Line('  .quad 0');
+    { A private futex with one sleeper, the system monitor. }
+    Line('rt_sysmonnote:');
+    Line('  .quad 0');
     Line('rt_npollwait:');
     Line('  .quad 0');
     { rt_lastpoll: when an M last looked at the poller; rt_sysm: the M
@@ -63598,6 +63645,27 @@ begin
   Line('  add x10, x10, x12');
   Line('  stlxr w11, x10, [x9]');
   Line('  cbnz w11, .mso_l');
+  { The successful store-release of the count precedes the load-acquire
+    of the note (Arm ARM B2.6.10). The wake exchange is Go's Xchg. }
+  LeaS('rt_sysmonnote', 'x9');
+  Line('  ldar w10, [x9]');
+  Line('  cbz w10, .mso_ret');
+  if HasFeat(CpuFeatBit('atomics', True)) then
+    Line('  swpal wzr, w10, [x9]')
+  else
+  begin
+    Line('.mso_note:');
+    Line('  ldaxr w10, [x9]');
+    Line('  stlxr w11, wzr, [x9]');
+    Line('  cbnz w11, .mso_note');
+  end;
+  Line('  cbz w10, .mso_ret');
+  Line('  mov x0, x9');
+  Line('  mov x1, #129');
+  Line('  mov x2, #1');
+  Line('  mov x8, #98');
+  Line('  svc #0');
+  Line('.mso_ret:');
   Line('  ret');
   { A routine parked on the poller, in or out (rt_pollpark). }
   Line('rt_pollwaitinc:');
@@ -65809,7 +65877,34 @@ begin
   { no routine's record: rt_now stays on this stack (P342) }
   Line('  mov x28, xzr');
   Line('  sub sp, sp, #16');
+  { As on amd64. STLR followed by LDAR orders publishing the note
+    before sampling the wake generation (Arm ARM B2.6.10). }
   Line('.sm_sleep:');
+  LeaS('rt_msleep', 'x10');
+  Line('  ldar x19, [x10]');
+  LdS('rt_mstarted', 'x9');
+  Line('  cmp w19, w9');
+  Line('  b.ne .sm_tick');
+  LeaS('rt_sysmonnote', 'x0');
+  Line('  mov w9, #1');
+  Line('  stlr w9, [x0]');
+  Line('  ldar x9, [x10]');
+  Line('  cmp x19, x9');
+  Line('  b.ne .sm_disarm');
+  LdS('rt_mstarted', 'x9');
+  Line('  cmp w19, w9');
+  Line('  b.ne .sm_disarm');
+  Line('  mov x1, #128');
+  Line('  mov x2, #1');
+  Line('  mov x3, xzr');
+  Line('  mov x8, #98');
+  Line('  svc #0');
+  LeaS('rt_sysmonnote', 'x0');
+  Line('  stlr wzr, [x0]');
+  Line('  b .sm_poll');
+  Line('.sm_disarm:');
+  Line('  stlr wzr, [x0]');
+  Line('.sm_tick:');
   Line('  str xzr, [sp]');
   Imm('x9', 10000000);
   Line('  str x9, [sp, #8]');
@@ -65819,7 +65914,10 @@ begin
   Line('  mov x3, xzr');
   Line('  mov x8, #115');
   Line('  svc #0');
-  { the poller when no M has looked for 10 ms (1.1.1), on the dummy M }
+  { the poller when no M waits in it and none has looked for 10 ms }
+  Line('.sm_poll:');
+  LdS('rt_polluntil', 'x9');
+  Line('  cbnz x9, .sm_chk');
   LdS('rt_epfd', 'x9');
   Line('  cbz x9, .sm_chk');
   Line('  bl rt_now');
