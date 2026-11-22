@@ -28,12 +28,12 @@ var
   WarnCaseShadow: Boolean;    { -warn-case-shadow: declaration spelling in enclosing scopes (P647) }
 
 function ParseSource(const Src: string; const UPath: array of string;
-  Arm: Boolean; CpuSet: Int64; CpuTune: LongInt): TProgram;
+  Arm: Boolean; CpuSet: Int64; CpuTune: LongInt; CaptureInputs: Boolean = False): TProgram;
 
 implementation
 
 uses
-  paslib, pasiface, pasfmt, pasquad, pashelp, pasjson;
+  paslib, pasiface, pasfmt, pasquad, pashelp, pasjson, pashash;
 
 
 type
@@ -241,6 +241,8 @@ type
     FUnitChecks: array of TUnitCheck;
     FUnitCheckN: SizeInt;
     FLinkObjs: TStrArray;
+    FCaptureInputs: Boolean;
+    FBuildInputs: TBuildInputs;
     FUsesNames: TStrArray;
     FCoreMap: Boolean;
     FCoreTree: Boolean;
@@ -362,6 +364,7 @@ type
     procedure ParseUses;
     procedure ImportTypes(const Iface: TUnitIface);
     function MapImport(Id: LongInt): LongInt;
+    function ReadUnitInput(const Path: string; out Data: string): Boolean;
     function UnitSum(const AName: string): string;
     procedure LoadUnit(const AName: string; LinkOnly: Boolean);
     procedure LoadUnitBody(const AName: string; LinkOnly: Boolean);
@@ -20308,6 +20311,31 @@ begin
     Result := Id;
 end;
 
+{ Hash the interface bytes that the parser actually read. Go's build
+  action hashes likewise identify the selected inputs (cmd/go/internal/
+  work/buildid.go). Ordinary compiles do not hash files for reporting. }
+function TParser.ReadUnitInput(const Path: string; out Data: string): Boolean;
+var
+  i: SizeInt;
+  digest: string;
+begin
+  Result := ReadFile(Path, Data);
+  if not Result or not FCaptureInputs then
+    Exit;
+  digest := PasHex(PasSha256Base(Data));
+  for i := 0 to High(FBuildInputs) do
+    if FBuildInputs[i].Path = Path then
+    begin
+      if FBuildInputs[i].Digest <> digest then
+        Refuse('input changed during compilation: ' + Path);
+      Exit;
+    end;
+  i := Length(FBuildInputs);
+  SetLength(FBuildInputs, i + 1);
+  FBuildInputs[i].Path := Path;
+  FBuildInputs[i].Digest := digest;
+end;
+
 { The interface checksum of unit AName as this compilation sees it: the
   one loaded, or else the .pi the search path finds; '' when there is
   none. }
@@ -20328,7 +20356,7 @@ begin
   path := FindPi(AName);
   if path = '' then
     Exit;
-  if not ReadFile(path, data) then
+  if not ReadUnitInput(path, data) then
     Exit;
   if not ParseIface(data, iface) then
     Exit;
@@ -20401,7 +20429,7 @@ begin
   path := FindPi(AName);
   if path = '' then
     Refuse('unit not compiled: ' + AName + ' (need ' + ToLower(AName) + '.pi)');
-  if not ReadFile(path, data) then
+  if not ReadUnitInput(path, data) then
     Refuse('cannot read ' + path);
   if Copy(data, 1, 10) = 'PASLANGI1' + #10 then
     Refuse(path + ' was compiled by a paslang older than 1.0.49; compile ' +
@@ -20775,7 +20803,7 @@ begin
     if IsCoreUnit(FLinkOnly[i]) or SameId(FLinkOnly[i], FUnitName) then
       Continue;
     path := FindPi(FLinkOnly[i]);
-    if (path = '') or not ReadFile(path, data) then
+    if (path = '') or not ReadUnitInput(path, data) then
       Continue;
     if not ParseIface(data, iface) or not SameId(iface.Name, FLinkOnly[i]) then
       Continue;
@@ -28774,7 +28802,7 @@ begin
 end;
 
 function ParseSource(const Src: string; const UPath: array of string;
-  Arm: Boolean; CpuSet: Int64; CpuTune: LongInt): TProgram;
+  Arm: Boolean; CpuSet: Int64; CpuTune: LongInt; CaptureInputs: Boolean): TProgram;
 var
   lex: TLexer;
   p: TParser;
@@ -28794,6 +28822,7 @@ begin
   lex.SetCpu(Arm, CpuSet, CpuTune);
   p := TParser.Create(lex, UPath, Arm);
   p.CpuSet := CpuSet;
+  p.FCaptureInputs := CaptureInputs;
   try
     if p.FTok.Kind = tkSafe then
     begin
@@ -28813,6 +28842,7 @@ begin
     m.CpuSet := CpuSet;
     m.CpuTune := CpuTune;
     m.LinkObjs := p.FLinkObjs;
+    m.BuildInputs := p.FBuildInputs;
     if m.IsUnit then
     begin
       { Record this source's edges, plus its implicit core dependencies.

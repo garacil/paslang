@@ -16286,6 +16286,8 @@ paslangc [options] file.paslang
 |--------|---------|
 | `-o <path>` | output file; a program defaults to `a.out`, a unit to `build/<name>` (`build/a64/<name>` with `-target arm64`) |
 | `-c` | compile and assemble only, no link |
+| `-trimpath <dir>` | record source names relative to this directory in debug information and runtime diagnostic tables |
+| `-build-inputs` | print a SHA-256 checksum list for the build inputs on standard output after a successful build |
 | `-warn-import-shadow` | warn when an unqualified routine call selects an indirect import over a name from a directly imported unit; names declaration ownership and qualification. Default and explicitly qualified compilation stay quiet; warnings go to standard error with successful exit status |
 | `-warn-case-shadow` | report a local declaration whose spelling differs only in case from the name it hides in an enclosing scope |
 | `-checkptr` | check every pointer step and access against its object while the program runs (§6) |
@@ -16331,6 +16333,41 @@ qemu. The collector stress check gives each golden program a time
 limit, with separate limits for slower cases. If a program times out,
 the check logs its last standard output and the wait channel of each
 visible Linux thread before stopping the program.
+
+### Reproducible builds
+
+Use `-trimpath <dir>` when compiling a program and each unit from source.
+With identical inputs, the same relative source layout and the same
+compiler, GNU assembler, linker, target and code-generation options, the
+assembly, compiled interfaces, objects and executable are byte-identical
+across build directories, times, user IDs and hosts of the same target
+architecture. This includes builds with `-debug`. Use a fixed `-cpu`
+such as `base` and a fixed tune. `-cpu native` and `-tune native` select
+features or costs from the compiling host. Fix the compiled SDK and
+other units, including CPU variants. A change in the selected interface
+or object, or in a file read by inline assembly, changes the build inputs.
+
+The compiler resolves symlinks before computing the source name and
+requires each Pascal source it compiles to be inside the root. Runtime
+diagnostics and debug information record the relative name. For
+interactive debugging, start from the source root or configure the
+debugger's source lookup there. Compile errors still report the input
+path passed to the compiler. The generated `.link` recipe records the
+actual linker arguments for a local rebuild.
+
+```bash
+paslangc -target amd64 -cpu base -tune generic -trimpath . -build-inputs -o app src/main.paslang > app.sha256
+sha256sum --check --strict app.sha256
+```
+
+The checksum list names the compiler and tools used by the invocation,
+the Pascal source and interfaces it read, the objects passed to the
+linker and the assembler's tracked `.include` and `.incbin` files. Keep
+these files stable throughout the build. The list uses absolute paths
+to let `sha256sum` find the same files from any directory. File names
+that contain a newline in the assembler dependency rule cannot be
+reported, because GNU as writes those names without escaping the
+newline. The file names in a checksum list can differ across builds.
 
 **Auditing a unit (1.2.376, P561).** Two scripts measure a unit from the
 tree, never from memory. `python3 -I scripts/unit_audit.py --gaps` prints,

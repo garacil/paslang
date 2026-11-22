@@ -75,7 +75,7 @@ Spellings, sizes and examples describe the compiler's implemented contract.
 
 | Topic | What it answers |
 |---|---|
-| flags | `-h`, `-v`/`--version`, `--help`, `-o`, `-c`, `-checkptr`, `-warn-import-shadow`, `-Fu` and the unit search order, `-install`, `-cpu` and `-tune`, `-inline` and `-inline-trace`, `-debug`, `-target`, `--lex`, exit status |
+| flags | `-h`, `-v`/`--version`, `--help`, `-o`, `-c`, `-trimpath`, `-build-inputs`, `-checkptr`, `-warn-import-shadow`, `-Fu` and the unit search order, `-install`, `-cpu` and `-tune`, `-inline` and `-inline-trace`, `-debug`, `-target`, `--lex`, exit status |
 | types | Integer and real widths, checked four-place `Currency`, strings, slices, records, sets, channels, maps, JSON, method and interface values, and the pointer operations allowed by `safe` |
 | lang | statements, units, classes, channels, a hello program |
 | runtime | pasroutines, stack growth, asynchronous and cooperative preemption, the collector, checked failures, `Syscall`, atomics, RTTI and scheduler operations |
