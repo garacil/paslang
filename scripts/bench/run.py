@@ -400,12 +400,12 @@ def peak_mb(exe, env=None, runs=MEM_RUNS, args=()):
     return median(peaks), peaks
 
 
-def memory_once(exe, env=None, args=(), expected=None):
+def memory_once(exe, env=None, args=(), expected=None, *, timeout=None):
     with tempfile.TemporaryFile() as so, tempfile.TemporaryFile() as se:
         kib, status, problem = -1, "measurement-error", None
         try:
             kib, status = peak_kib([exe, *args], env=env, stdout=so.fileno(),
-                                   stderr=se.fileno(), timeout=TIMEOUT)
+                                   stderr=se.fileno(), timeout=TIMEOUT if timeout is None else timeout)
         except (OSError, RuntimeError) as error:
             problem = str(error)
         so.seek(0)
