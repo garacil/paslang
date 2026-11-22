@@ -7,6 +7,7 @@
 
 from pathlib import Path
 import re
+import os
 import select
 import subprocess
 import sys
@@ -32,6 +33,30 @@ begin
 end.
 """
 
+TIMER_PROGRAM = """program timerusage;
+var reply: string; p: Integer;
+function TimerMapping: Integer;
+begin
+  asm amd64 (Result: out rax)
+    movq rt_allp(%rip), %rax
+    movq 2144(%rax), %rax
+  end;
+  asm arm64 (Result: out x0)
+    adrp x0, rt_allp
+    ldr x0, [x0, :lo12:rt_allp]
+    ldr x0, [x0, #2144]
+  end;
+end;
+begin
+  Sleep(5);
+  p := TimerMapping;
+  if p = 0 then Halt(1);
+  WriteLn(p, ' ', p);
+  ReadLn(reply);
+end.
+"""
+
+
 MAPPING = re.compile(r'^([0-9a-f]+)-([0-9a-f]+) ', re.MULTILINE)
 
 
@@ -53,7 +78,8 @@ def vm_flags(pid, addresses):
 
 def check_image(argv, large):
     args = ['large'] if large else []
-    with subprocess.Popen(argv + args, stdin=subprocess.PIPE,
+    env = dict(os.environ, PASLANG_MAXPROCS='1')
+    with subprocess.Popen(argv + args, env=env, stdin=subprocess.PIPE,
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE) as p:
         try:
             ready, _, _ = select.select([p.stdout], [], [], 30)
@@ -75,12 +101,18 @@ def check_image(argv, large):
 def check(compiler, sdk, work, qemu, pmd):
     source = work / 'heapusage.paslang'
     source.write_text(PROGRAM.replace('PMD_BYTES', str(pmd)))
+    timer_source = work / 'timerusage.paslang'
+    timer_source.write_text(TIMER_PROGRAM)
     for target, units, launch in (('amd64', sdk, []), ('arm64', sdk / 'a64', [str(qemu)])):
         image = work / target
         subprocess.run([compiler, '-target', target, '-cpu', 'base', '-Fu', units,
                         '-o', image, source], check=True, timeout=90)
         for large in (False, True):
             check_image(launch + [str(image)], large)
+        timer = work / f'{target}-timer'
+        subprocess.run([compiler, '-target', target, '-cpu', 'base', '-Fu', units,
+                        '-o', timer, timer_source], check=True, timeout=90)
+        check_image(launch + [str(timer)], False)
 
 
 def main():
@@ -94,7 +126,7 @@ def main():
     pmd = int(pmd_file.read_text())
     with TemporaryDirectory(prefix='heap-hugepages-', dir=sdk) as folder:
         check(compiler, sdk, Path(folder), qemu, pmd)
-    print('THP eligibility of complete and partial heap chunks checked on amd64 and arm64')
+    print('THP policy of heap chunks and timer storage checked on amd64 and arm64')
 
 
 if __name__ == '__main__':

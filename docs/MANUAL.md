@@ -15075,8 +15075,9 @@ When nothing is runnable a thread looks for work for a short while and
 then sleeps: one thread waits in `epoll_wait` for events and timers,
 the others on a futex until they are needed; an idle program uses no
 CPU. The poller adds a new descriptor on its first wait and rearms
-a known entry for another wait. The timers are heaps of routines by wake time, one in each P (the
-right to run code a thread holds) under that P's own lock, as Go's:
+a known entry for another wait. The timers are heaps of routines by
+wake time, one in each P under that P's own lock. These heaps use base
+pages so a single timer uses one page of the reserved space.
 `Sleep` and a wait with a deadline (`WaitMs`, `TcpReadDeadline`,
 `UdpRecvFromMs`) go into the heap of the P they run on and out of it in
 O(log n) and cost no system call, whichever of the descriptor and the
