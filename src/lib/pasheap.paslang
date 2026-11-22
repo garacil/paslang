@@ -82,6 +82,9 @@ const
   MapNoReplace = 1048610;
   { The heap is mapped in steps of this much. }
   MapStep = 4194304;
+  { Linux madvise(2), as in Go runtime/mem_linux.go. }
+  AdviseHugePage = 14;
+  AdviseNoHugePage = 15;
   { Span records are carved from mappings of this much, bitmaps from
     mappings of BitsStep. }
   PoolStep = 1048576;
@@ -388,6 +391,8 @@ var
   { The last cycle's parts in nanoseconds: stopping the world and
     taking the mcaches back, marking, sweeping (HeapStat 16 to 18). }
   MStopNs, MMarkNs, MSweepNs: Integer;
+  { Mask for the PMD page size discovered when the heap is initialized. }
+  MHugePageMask: Integer;
 
 function RdW(A: Integer): Integer;
 begin
@@ -868,6 +873,32 @@ begin
   Result := n;
 end;
 
+{ Linux Documentation/admin-guide/mm/transhuge.rst. Use the PMD
+  size so a fully assigned chunk can be made eligible at its boundary.
+  The normal 4 KiB Linux mappings on both targets use 2 MiB PMDs. A
+  container can hide sysfs while its mappings still use huge pages. }
+function BootHugePageMask: Integer;
+const
+  path = '/sys/kernel/mm/transparent_hugepage/hpage_pmd_size' + #0;
+var
+  fd, n, cursor, bytes: Integer;
+  data: array[0..31] of Char;
+begin
+  Result := -2097152;
+  fd := BootOpen(PChar(@path[1]));
+  if fd < 0 then
+    Exit;
+  n := BootRead(fd, Integer(@data[0]), SizeOf(data));
+  BootClose(fd);
+  if (n < 2) or (n = SizeOf(data)) or (data[n - 1] <> Chr(10)) then
+    Exit;
+  cursor := 0;
+  bytes := BootReadNumber(PChar(@data[0]), cursor, n - 1);
+  if (cursor = n - 1) and (bytes >= PageSize) and
+     ((bytes and (bytes - 1)) = 0) and (bytes <= TableReserve) then
+    Result := -bytes;
+end;
+
 function BootReadQuota(var Path: TBootPath; PathLen: Integer;
                        const Name: string; WithPeriod: Boolean; out Period: Integer): Integer;
 var
@@ -1234,6 +1265,8 @@ begin
   s := SysMmap(0, ((MCapacity(H0) * WorkerSize) + 4095) and (-4096), 3, 34);
   if MapFailed(s) then
     Exit;
+  { Worker records are touched only as their Ms start. }
+  SysMadvise(s, ((MCapacity(H0) * WorkerSize) + 4095) and (-4096), AdviseNoHugePage);
   MWorkers := s;
   WrW(H0 + HWorkers, s);
   MMaxWorkers := PasDefaultGcWorkers;
@@ -1291,6 +1324,8 @@ begin
     end;
   if base = 0 then
     Exit;
+  MHugePageMask := BootHugePageMask;
+  SysMadvise(base, MapStep, AdviseNoHugePage);
   WrW(h0 + HTable, base - TableReserve);
   WrW(h0 + HBase, base);
   WrW(h0 + HLimit, base + HeapReserve);
@@ -1350,6 +1385,7 @@ begin
       Exit;
     end;
   end;
+  SysMadvise(start, len, AdviseNoHugePage);
   WrW(H0 + HMapEnd, start + len);
   AtomicAdd(PInt(H0 + HMapped), len);
   Result := True;
@@ -1358,15 +1394,23 @@ end;
 { NPages fresh pages from the cursor, or 0. }
 function AllocPages(H0, NPages: Integer): Integer;
 var
-  need: Integer;
+  oldEnd, newEnd, oldFull, newFull: Integer;
 begin
   Result := 0;
-  need := NPages * PageSize;
-  if RdW(H0 + HCursor) + need > RdW(H0 + HMapEnd) then
-    if not MapMore(H0, need) then
+  oldEnd := RdW(H0 + HCursor);
+  newEnd := oldEnd + NPages * PageSize;
+  if newEnd > RdW(H0 + HMapEnd) then
+    if not MapMore(H0, newEnd - oldEnd) then
       Exit;
-  Result := RdW(H0 + HCursor);
-  WrW(H0 + HCursor, Result + need);
+  { A mapping can be several huge pages long even for one small
+    allocation. Let Linux use huge pages only for whole chunks the
+    heap has assigned to spans. Advise before their new pages fault. }
+  oldFull := oldEnd and MHugePageMask;
+  newFull := newEnd and MHugePageMask;
+  if newFull > oldFull then
+    SysMadvise(oldFull, newFull - oldFull, AdviseHugePage);
+  WrW(H0 + HCursor, newEnd);
+  Result := oldEnd;
 end;
 
 { A span record, zero: a freed one, else from the pool. }

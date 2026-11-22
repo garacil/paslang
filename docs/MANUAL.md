@@ -15061,6 +15061,11 @@ code, including inside an inlined island or a nested promoted region.
 The linked map table is in code-address order; the runtime retains its
 defensive startup sorting for compatible objects that need it.
 
+The main routine starts with a 1 MiB moving stack on both targets.
+The heap uses base pages for a partially assigned huge-page chunk.
+Once the allocator has assigned the whole chunk to spans, it makes
+that range eligible for Linux transparent huge pages.
+
 A routine that waits, on a channel, a mutex, a condition, `Sleep`, a
 socket or standard input, parks: its registers and stack pointer are
 saved in the G and the thread picks the next runnable routine. A

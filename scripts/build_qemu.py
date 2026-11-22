@@ -15,9 +15,9 @@ signal blocked (P302), changes gdb's breakpoints while the other
 threads walk them, dying of its own SIGSEGV (P349), and lets the other
 threads run, start and end while one is stopped under gdb, which lost
 gdb's breakpoint and corrupted the stub's own memory (P582;
-scripts/check_gdbstub_threads.py is the case alone). Only the tests need
-it; it needs a C compiler, Python, meson, ninja and glib's headers, as
-QEMU does.
+scripts/check_gdbstub_threads.py is the case alone). Its Linux-user
+madvise also rejects the heap's transparent huge-page advice (P239).
+The test build uses a C compiler, Python, meson, ninja and glib headers.
 usage: build_qemu.py BUILDDIR TARBALL
 """
 import hashlib
