@@ -15009,8 +15009,9 @@ the dates too.
 A running program is a set of routines, Gs, on OS threads, Ms. A P is
 the right to execute Pascal code, its run queue and allocation cache.
 The number of Ps counts every CPU in the kernel's affinity mask,
-with a floor of two and a ceiling of 32. If the syscall fails, the
-runtime starts with two Ps (P686). Each P belongs to at most one M.
+up to 32. A program restricted to one CPU starts with one P. If the
+affinity query fails or returns an empty mask, the runtime also uses
+one P. Each P belongs to at most one M.
 Only the first M
 starts with the program; others start as work requires them. The current
 G is in a register (`r14` on amd64, `x28` on arm64) and every routine
@@ -15094,7 +15095,7 @@ ownership or synchronization; scheduling compatibility is not permission
 for concurrent unsynchronized writes.
 
 [`examples/blockedio.paslang`](../examples/blockedio.paslang) uses
-deliberately blocking pipe reads. Even with one-CPU affinity (two Ps),
+deliberately blocking pipe reads. Even with one-CPU affinity (one P),
 main must run to release four readers; the output is `completed 4`.
 Higher-level units use the same runtime, not a private pool.
 

@@ -63,7 +63,7 @@ def link_variant(program, candidate, cc_prefix, assembly):
     run([cc_prefix + 'ld', *(replacements.get(arg, arg) for arg in link)])
 
 
-def check_one_p(compiler, units, working, cpu, launch, cc_prefix, allowed):
+def check_one_p(compiler, units, working, cpu, launch, allowed):
     root = Path(__file__).resolve().parent.parent
     check_blocked_writer = runpy.run_path(str(root / 'scripts/check_uncaught_reports.py'))['check_blocked_writer']
     command = ['taskset', '-c', str(min(allowed)), *launch]
@@ -72,22 +72,11 @@ def check_one_p(compiler, units, working, cpu, launch, cc_prefix, allowed):
         source = root / 'testdata' / 'fatal' / (name + '.paslang')
         run([compiler, '-target', cpu, '-cpu', 'base', '-Fu', str(units),
              '-o', str(program), str(source)])
-        assembly = program.with_suffix('.s').read_text()
-        start = assembly.index('rt_ncpu:\n')
-        end = assembly.index('\nrt_', start)
-        marker = '.nc_done:\n'
-        counter = assembly[start:end]
-        if counter.count(marker) != 1:
-            raise SystemExit(f'one-P fixture: {cpu} startup counter changed')
-        force_one = '  movl $1, %eax\n' if cpu == 'amd64' else '  mov x0, #1\n'
-        single_p = working / f'{cpu}-{name}-single-p'
-        changed = assembly[:start] + counter.replace(marker, marker + force_one) + assembly[end:]
-        link_variant(program, single_p, cc_prefix, changed)
         if name == 'reportparallel':
             for _ in range(8):
-                check_blocked_writer(command + [str(single_p)])
+                check_blocked_writer(command + [str(program)])
         else:
-            deadlock = subprocess.run(command + [str(single_p)], capture_output=True, timeout=30)
+            deadlock = subprocess.run(command + [str(program)], capture_output=True, timeout=30)
             expected = (root / 'testdata' / 'fatal' / 'expected.out').read_bytes()
             if (deadlock.returncode, deadlock.stdout, deadlock.stderr) != (
                 1, expected, b'paslang: all routines are asleep: deadlock\n'
@@ -107,8 +96,8 @@ def check_target(compiler, build, working, cpu, launch):
          '-o', str(program), str(source)])
 
     allowed = os.sched_getaffinity(0)
-    expect(launch + [str(program)], min(32, max(2, len(allowed))), f'{cpu} current mask')
-    expect(['taskset', '-c', str(min(allowed))] + launch + [str(program)], 2, f'{cpu} single CPU')
+    expect(launch + [str(program)], min(32, max(1, len(allowed))), f'{cpu} current mask')
+    expect(['taskset', '-c', str(min(allowed))] + launch + [str(program)], 1, f'{cpu} single CPU')
 
     assembly = program.with_suffix('.s').read_text()
     syscall = '  syscall\n' if native else '  svc #0\n'
@@ -119,16 +108,17 @@ def check_target(compiler, build, working, cpu, launch):
     raw = assembly.index(syscall, start)
     for name, words, result, expected in (
         ('upper-word', [1, 15], 16, 5),
+        ('single-high-cpu', [0, 1], 16, 1),
         ('clamp', [-1], 8, 32),
         ('short-mask', [7, -1], 8, 3),
-        ('failed', [-1], -1, 2),
-        ('empty', [-1], 0, 2),
+        ('failed', [-1], -1, 1),
+        ('empty', [-1], 0, 1),
     ):
         candidate = working / f'{cpu}-{name}'
         changed = assembly[:raw] + masked_syscall(cpu, words, result) + assembly[raw + len(syscall):]
         link_variant(program, candidate, cc_prefix, changed)
         expect(launch + [str(candidate)], expected, f'{cpu} {name}')
-    check_one_p(compiler, units, working, cpu, launch, cc_prefix, allowed)
+    check_one_p(compiler, units, working, cpu, launch, allowed)
 
 
 if __name__ == '__main__':
