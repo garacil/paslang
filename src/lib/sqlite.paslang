@@ -48330,8 +48330,8 @@ end;
   makes it: "unix" with POSIX advisory locks, "unix-none" with none,
   "unix-dotfile" with a lock directory and "unix-excl" with one
   exclusive lock the process takes once (SQLITE_ENABLE_LOCKING_STYLE
-  is 0 there). pread and pwrite (USE_PREAD), fsync for fdatasync (no
-  HAVE_FDATASYNC), writes in place of posix_fallocate, mremap
+  is 0 there). pread and pwrite (USE_PREAD), fdatasync for ordinary
+  file syncs, writes in place of posix_fallocate, mremap
   (HAVE_MREMAP with _GNU_SOURCE), O_TMPFILE for temporary files. Each
   system call is Syscall with the machine's number (Amd64), and fails
   as -errno; a lock that cannot be had returns its errno ---- }
@@ -48370,6 +48370,7 @@ const
   UxENOSPC = 28;
   UxERANGE = 34;
   UxENOLCK = 37;
+  UxENOSYS = 38;
   UxEOPNOTSUPP = 95;
   UxETIMEDOUT = 110;
 
@@ -48443,6 +48444,7 @@ type
     H: Integer;
     EFileLock: Integer;
     CtrlFlags: Integer;
+    RegularFile: Boolean;
     LastErrno: Integer;
     { lockingContext of dotfile locking: the lock directory's name }
     LockFile: string;
@@ -48986,13 +48988,17 @@ procedure UxVerifyDbFile(P: TSqlUxFile);
 var
   st: TSqlUxStat;
 begin
-  if (P.CtrlFlags and UNIXFILE_NOLOCK) <> 0 then
-    Exit;
+  { The type belongs to the open descriptor. Record it once, including
+    for WAL and journal files, so a commit needs no extra stat call. }
   if UxSysFstat(P.H, st) <> 0 then
   begin
-    SqlLog(SQLITE_WARNING, 'cannot fstat db file ' + P.ZPath);
+    if (P.CtrlFlags and UNIXFILE_NOLOCK) = 0 then
+      SqlLog(SQLITE_WARNING, 'cannot fstat db file ' + P.ZPath);
     Exit;
   end;
+  P.RegularFile := (st.Mode and UxSIfMt) = UxSIfReg;
+  if (P.CtrlFlags and UNIXFILE_NOLOCK) <> 0 then
+    Exit;
   if st.Nlink = 0 then
   begin
     SqlLog(SQLITE_WARNING, 'file unlinked while open: ' + P.ZPath);
@@ -49546,11 +49552,17 @@ begin
   Result := SQLITE_OK;
 end;
 
-{ full_fsync: fsync, the amalgamation's fdatasync without HAVE_FDATASYNC;
-  0 or -errno }
-function UxFullFsync(Fd: Integer; FullSync, DataOnly: Boolean): Integer;
+{ SQLite os_unix.c full_fsync on Linux uses fdatasync when available.
+  Linux fsync(2) includes metadata needed to read back the data, including
+  file length. Go's syscall.Fdatasync uses the same Linux entry points. }
+function UxDataSync(Fd: Integer): Integer;
 begin
-  Result := UxSysFsync(Fd);
+  if Amd64 = 1 then
+    Result := UxRet(Syscall(75, Fd))
+  else
+    Result := UxRet(Syscall(83, Fd));
+  if Result = -UxENOSYS then
+    Result := UxSysFsync(Fd);
 end;
 
 { openDirectory: a descriptor of the directory zFilename is in }
@@ -49588,7 +49600,12 @@ var
   r, dirfd: Integer;
 begin
   p := UxFileOf(F);
-  r := UxFullFsync(p.H, (Flags and $0F) = SQLITE_SYNC_FULL, (Flags and SQLITE_SYNC_DATAONLY) <> 0);
+  { The pager still selects when to sync. The explicit fullfsync
+    request keeps the stronger Linux fsync, as do non-regular files. }
+  if p.RegularFile and ((Flags and $0F) <> SQLITE_SYNC_FULL) then
+    r := UxDataSync(p.H)
+  else
+    r := UxSysFsync(p.H);
   if r <> 0 then
   begin
     p.LastErrno := -r;
@@ -49601,7 +49618,7 @@ begin
     Result := UxOpenDirectory(p.ZPath, dirfd);
     if Result = SQLITE_OK then
     begin
-      UxFullFsync(dirfd, False, False);
+      UxSysFsync(dirfd);
       UxRobustClose(p, dirfd, UxL + 3948);
     end
     else
@@ -50843,7 +50860,7 @@ begin
     Result := UxOpenDirectory(ZPath, fd);
     if Result = SQLITE_OK then
     begin
-      r := UxFullFsync(fd, False, False);
+      r := UxSysFsync(fd);
       if r <> 0 then
         Result := UxLogError(SQLITE_IOERR_DIR_FSYNC, 'fsync', ZPath, UxL + 6862, -r);
       UxRobustClose(nil, fd, UxL + 6864);

@@ -13908,6 +13908,13 @@ compare rows, types, result codes and messages with SQLite on UTF-8 and
 UTF-16 databases. See the [SQLite guide](SQLITE_GUIDE.md) for examples
 and the library's build options and extension coverage.
 
+On Linux the SQLite VFS uses `fdatasync` for regular files, including a
+growing WAL. It flushes the data and the metadata required to read it,
+including the file length. Directory syncs and explicit VFS full-sync
+requests use `fsync`. `PRAGMA synchronous` still selects when those
+barriers are required. If the kernel returns `ENOSYS` for `fdatasync`,
+the VFS uses `fsync`; other errors are returned to SQLite.
+
 SQL's math functions are there as the `sqlite3` program and the
 distributions build SQLite, with `SQLITE_ENABLE_MATH_FUNCTIONS` (1.1.255,
 P411): `ceil`, `ceiling`, `floor`, `trunc`, `ln`, `log`, `log10`, `log2`,
