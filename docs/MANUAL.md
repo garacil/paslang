@@ -2783,6 +2783,10 @@ also hide an enclosing routine, including one declared in its own unit
 or program (P691). Inside one scope a variable, a parameter, a
 constant, a type and a nested routine each need a distinct name (§20).
 
+Parameter names follow the reserved-name rules in §21. The same
+checks apply in procedural types, method declarations and operator
+signatures (P692).
+
 A routine takes up to 32 parameters. `var` passes the caller's variable,
 `out` the same but for results only, `const` promises not to change it.
 A `var` or `out` parameter takes a variable of its own type alone, as

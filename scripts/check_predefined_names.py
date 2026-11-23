@@ -74,6 +74,65 @@ def reject(compiler, sdk, target, program, source, expected):
     assert not program.with_suffix('.bin').exists(), (target, program)
 
 
+def check_parameters(compiler, sdk, target, work):
+    """One identifier rule for all formal-parameter parsers."""
+    signatures = {
+        'routine': """procedure Example(First, @: Integer);
+begin end;
+begin end.""",
+        'anonymous': """type TCallback = procedure(First, Other: Integer);
+var Callback: TCallback;
+begin
+  Callback := procedure(First, @: Integer) begin end;
+end.""",
+        'procedure-type': """type TCallback = procedure(First, @: Integer);
+begin end.""",
+        'method-type': """type TCallback = procedure(var First, @: Integer) of object;
+begin end.""",
+        'interface': """type IExample = interface
+  procedure Report(const First, @: Integer);
+end;
+begin end.""",
+        'record-method': """type TExample = record
+  procedure Report(out First, @: Integer);
+end;
+procedure TExample.Report(out First, Other: Integer);
+begin end;
+begin end.""",
+        'class-method': """type TExample = class
+  procedure Report(First, @: Integer);
+end;
+procedure TExample.Report(First, Other: Integer);
+begin end;
+begin end.""",
+        'operator': """type TMeasure = record Data: Integer; end;
+operator +(First, @: TMeasure): TMeasure;
+begin Result := First; end;
+begin end.""",
+        'record-operator': """type TMeasure = record
+  Data: Integer;
+  class operator +(First, Other: TMeasure): TMeasure;
+end;
+class operator TMeasure.+(First, @: TMeasure): TMeasure;
+begin Result := First; end;
+begin end.""",
+    }
+    for kind, signature in signatures.items():
+        before, after = ('program rejected;\n' + signature + '\n').split('@')
+        lines = before.split('\n')
+        where = f'{len(lines)}:{len(lines[-1]) + 1}'
+        for name, message in [('Send', "is a reserved word, not a parameter's name"),
+                              ('Single', PREDEFINED)]:
+            program = work / f'{target}-parameter-{kind}-{name}.paslang'
+            reject(compiler, sdk, target, program, before + name + after,
+                   f'{name} {message} at {where}')
+
+    reject(compiler, sdk, target, work / f'{target}-parameter-trailing-comma.paslang',
+           'program rejected;\ntype TCallback = procedure(First,: Integer);\nbegin end.\n',
+           "a parameter's name expected at 2:34")
+    print(f'ok parameter names {target}, {len(signatures)} signature forms and trailing comma')
+
+
 def main():
     compiler, build = (Path(arg).resolve() for arg in sys.argv[1:])
     work = Path(mkdtemp(prefix='predefined-names-', dir=build))
@@ -89,9 +148,7 @@ def main():
         reject(compiler, sdk, target, work / f'{target}-send.paslang',
                'program rejected;\nprocedure Send;\nbegin\nend;\nbegin\nend.\n',
                "Send is a reserved word, not a routine's name at 2:11")
-        reject(compiler, sdk, target, work / f'{target}-single-parameter.paslang',
-               'program rejected;\nprocedure Example(Single: Integer);\nbegin\nend;\nbegin\nend.\n',
-               f'Single {PREDEFINED} at 2:19')
+        check_parameters(compiler, sdk, target, work)
         positive = invoke(compiler, sdk, target, work / f'{target}-accepted.paslang',
                           'program accepted;\nvar LowerBound: Integer;\nbegin\n'
                           '  LowerBound := Low(Byte);\n  WriteLn(LowerBound);\nend.\n')
