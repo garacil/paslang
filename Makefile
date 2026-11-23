@@ -1407,6 +1407,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	@python3 -I scripts/check_reproducible.py "$(OUTDIR)/paslangc" "$(BUILDDIR)" "$(BUILDDIR)/qemu-aarch64"
 	@python3 -I scripts/check_int_prefix.py "$(OUTDIR)/paslangc" "$(BUILDDIR)" "$(BUILDDIR)/qemu-aarch64"
 	@python3 -I scripts/check_httpunixproxy.py "$(OUTDIR)/paslangc" "$(BUILDDIR)" "$(BUILDDIR)/qemu-aarch64"
+	@python3 -I scripts/check_routine_shadow.py "$(OUTDIR)/paslangc" "$(BUILDDIR)" "$(BUILDDIR)/qemu-aarch64"
 	@python3 -I scripts/check_inotify_failures.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64)
 	@python3 -I scripts/bench/check_harness.py
 	@python3 -I scripts/check_tls_interop_ready.py
@@ -5863,7 +5864,6 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  'constvar:duplicate identifier Limit (a constant of the name) at 7:3' \
 	  'enumconst:duplicate identifier Red (a constant of the name) at 7:20' \
 	  'localtwice:duplicate identifier b (the routine already has one) at 6:3' \
-	  'paramproc:duplicate identifier Format (a routine of the name) at 8:16' \
 	  'procproc:duplicate identifier Half (a routine with the same parameters) at 8:10' \
 	  'typetwice:duplicate type TPoint at 7:3' \
 	  'varconst:duplicate identifier Count (a variable of the name) at 7:3' \
@@ -5875,8 +5875,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  'vartype:duplicate identifier Count (a variable of the name) at 7:3' \
 	  'consttype:duplicate identifier Size (a constant of the name) at 7:3' \
 	  'typeproc:duplicate identifier TShow (a type of the name) at 6:11' \
-	  'enumvar:duplicate identifier Green (a constant of the name) at 7:3' \
-	  'nestprocvar:duplicate identifier X (a routine of the name) at 13:5'; do \
+	  'enumvar:duplicate identifier Green (a constant of the name) at 7:3'; do \
 	  n=$${f%%:*}; w=$${f#*:}; \
 	  if $(OUTDIR)/paslangc -o $(BUILDDIR)/dupw_$$n testdata/dupwhere/$$n.paslang >$(BUILDDIR)/dupw_$$n.err 2>&1; then \
 	    echo "$$n should fail"; exit 1; \

@@ -2778,10 +2778,10 @@ it and the program's, whatever the kinds of the two, as in Free Pascal:
 a nested function `X` is called where a global variable `X` is around
 it, and a constant or a type of a routine hides a routine, a variable
 or a constant around it (1.1.36, P159; the global variable was read in
-silence, and the other kinds were refused). Inside one routine a
-variable, a parameter, a constant, a type and a nested routine may not
-share a name, and a variable or a parameter may not take the name of a
-routine around it (§20).
+silence, and the other kinds were refused). A local or a parameter can
+also hide an enclosing routine, including one declared in its own unit
+or program (P691). Inside one scope a variable, a parameter, a
+constant, a type and a nested routine each need a distinct name (§20).
 
 A routine takes up to 32 parameters. `var` passes the caller's variable,
 `out` the same but for results only, `const` promises not to change it.
@@ -16068,13 +16068,10 @@ the commands on standard input, under `--debug-mode` and under
   (a routine with the same parameters) at 8:10` (1.1.26, P151),
   `duplicate identifier Count (a variable of the name) at 7:3` (1.1.30,
   P158; a type, a variable and a routine of one name compiled in
-  silence). A parameter or a local may not take the name of a routine
-  of its unit, its program or a routine around it either (`duplicate
-  identifier Format (a routine of the name) at 8:16`), where Free
-  Pascal lets it hide the routine
-  (its SysUtils calls a parameter of `FloatToStrF` `format`): inside, a
-  call of the routine would find the parameter, and paslang says so
-  where it is written.
+  silence). A parameter or a local hides an enclosing routine by name
+  (P691). Within that scope a call of the name requires a callable
+  value. A function's own name also denotes its result in its body
+  and is reserved there for that purpose.
 - A name a program declares hides a used unit's of that name, whatever
   the kind of either, as in Free Pascal: a program with SysUtils in its
   `uses` may have a variable `Date`, a constant `EmptyStr`, a type
