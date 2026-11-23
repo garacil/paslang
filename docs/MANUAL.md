@@ -12200,11 +12200,16 @@ set before it serves:
   the method, the route pattern and the exception, borrowed for the call.
   The default error line uses the method, route pattern and exception
   class. Default logs omit request paths, queries and exception messages.
-- `TrustProxy` (off) enables `X-Real-IP` for socket peers in
-  `TrustedProxies`. Configure exact IPv4 or IPv6 address literals
-  before `Serve`. A single valid address from such a peer supplies
-  `Forwarded` and the formatted IP column. The proxy must replace the
-  incoming client header.
+- Set `TrustProxy` (off by default) and `TrustedProxies` before `Serve`.
+  List exact IPv4 or IPv6 literals for TCP peers, or an exact Unix
+  listener path prefixed with `unix:` (for example,
+  `unix:/run/app/proxy.sock`). Use the path given to `ListenUnix` or
+  bound by systemd for `ListenSystemd`. Restrict access to each listed
+  Unix socket with filesystem permissions. Abstract sockets are
+  ineligible. The trusted proxy must replace the incoming client header.
+  One valid `X-Real-IP` from a trusted proxy supplies `Req.RealIP`,
+  `Forwarded` and the formatted IP column. `Req.RemoteAddr` reports the
+  transport peer address, which is empty for Unix sockets.
 
 `ListenUnix(path, mode, group)` listens on a Unix socket (a path, or an
 abstract `@name`): the file there is removed first, then given `mode`
