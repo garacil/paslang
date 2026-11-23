@@ -133,6 +133,29 @@ begin end.""",
     print(f'ok parameter names {target}, {len(signatures)} signature forms and trailing comma')
 
 
+def check_variables(compiler, sdk, target, work):
+    """Check variable lists in program and local scopes."""
+    declarations = {
+        'global': ('program rejected;\nvar First, ', '\nbegin end.\n'),
+        'local': ('program rejected;\nprocedure Inner;\nvar First, Second, ',
+                  '\nbegin end;\nbegin end.\n'),
+    }
+    cases = [
+        ('keyword', 'Send', "Send is a reserved word, not a variable's name"),
+        ('integer', '27', "a variable's name expected"),
+        ('predefined', 'Low', f'Low {PREDEFINED}'),
+        ('trailing-comma', '', "a variable's name expected"),
+    ]
+    for scope, (before, after) in declarations.items():
+        lines = before.split('\n')
+        where = f'{len(lines)}:{len(lines[-1]) + 1}'
+        for case, name, message in cases:
+            program = work / f'{target}-variable-{scope}-{case}.paslang'
+            reject(compiler, sdk, target, program, f'{before}{name}: Integer;{after}',
+                   f'{message} at {where}')
+    print(f'ok variable names {target}, {len(cases) * len(declarations)} invalid lists')
+
+
 def main():
     compiler, build = (Path(arg).resolve() for arg in sys.argv[1:])
     work = Path(mkdtemp(prefix='predefined-names-', dir=build))
@@ -149,9 +172,11 @@ def main():
                'program rejected;\nprocedure Send;\nbegin\nend;\nbegin\nend.\n',
                "Send is a reserved word, not a routine's name at 2:11")
         check_parameters(compiler, sdk, target, work)
+        check_variables(compiler, sdk, target, work)
         positive = invoke(compiler, sdk, target, work / f'{target}-accepted.paslang',
-                          'program accepted;\nvar LowerBound: Integer;\nbegin\n'
-                          '  LowerBound := Low(Byte);\n  WriteLn(LowerBound);\nend.\n')
+                          'program accepted;\nvar LowerBound, UpperBound: Integer;\nbegin\n'
+                          '  LowerBound := Low(Byte);\n  UpperBound := High(Byte);\n'
+                          '  WriteLn(LowerBound);\n  WriteLn(UpperBound);\nend.\n')
         assert positive.returncode == 0 and not positive.stderr, (target, positive.stderr)
         count = sum(diagnostic == PREDEFINED for _, diagnostic in names.values())
         print(f'ok predefined names {target}, {count} predefined identifiers and '
