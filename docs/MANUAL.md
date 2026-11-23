@@ -16126,6 +16126,9 @@ the commands on standard input, under `--debug-mode` and under
   of them are asleep and nothing can wake one, it stops with
   `paslang: all routines are asleep: deadlock` (§10).
 - The target is GNU/Linux only, kernel 6.13 or newer, amd64 and arm64.
+  If `madvise(MADV_GUARD_INSTALL)` fails, the runtime reports the Linux
+  error number and running kernel release on standard error and exits with
+  status 2. The release is shown as `unknown` if `uname` fails.
 
 ## 21. Reserved words
 

@@ -1403,6 +1403,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	@python3 -B scripts/check_fma_target.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64)
 	@python3 -I scripts/check_cpu_affinity.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64)
 	@python3 -I scripts/check_heap_hugepages.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64)
+	@python3 -I scripts/check_guard_diagnostics.py "$(OUTDIR)/paslangc" "$(BUILDDIR)" "$(BUILDDIR)/qemu-aarch64"
 	@python3 -I scripts/check_accept_registration.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64)
 	@python3 -I scripts/check_reproducible.py "$(OUTDIR)/paslangc" "$(BUILDDIR)" "$(BUILDDIR)/qemu-aarch64"
 	@python3 -I scripts/check_int_prefix.py "$(OUTDIR)/paslangc" "$(BUILDDIR)" "$(BUILDDIR)/qemu-aarch64"
