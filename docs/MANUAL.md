@@ -7895,6 +7895,12 @@ differs decides, and when one string is a prefix of the other the
 shorter one comes first, so a list of names sorts the way you expect.
 `IntToStr` and `StrToInt64` of `uses paslib` convert (§16).
 
+`paslib.IntToStrWithPrefix(prefix, value)` builds the prefix and the
+signed decimal number in one result string. In optimized builds,
+a nonempty literal followed by `+ paslib.IntToStr(value)` uses that
+routine when the compiled unit supplies it. With `-inline 0`, the
+expression makes the decimal string and then concatenates it.
+
 Pascal's string words are there, as Free Pascal has them (1.1.10):
 `Pos(sub, s)` and `Pos(sub, s, from)` give the place from 1 of `sub`
 in `s`, 0 when it is not there (a `Char` too); `Insert(src, s, i)` puts

@@ -177,6 +177,9 @@ PROBES = ["p1alloccap", "p2deeprec", "p3divzero", "p4nil", "p5bounds", "p6strbou
 # at 0.99, and its hito takes it under (b1loop 0.98/0.995, b2str 1.29/1.24,
 # b5map 1.00/0.95, b6smap 0.99/0.99, b8ptr 1.08/1.07, b9hash 1.01/2.44,
 # b10rot 1.43/1.43).
+# P229 b2str (2026-11-23, 40 alternating Go rounds): building the prefix
+# and decimal digits in one allocation put time at 0.675/0.701 of Go
+# (native/base) on the Ryzen 7 4800H and 0.704 native on the Ryzen 9 5950X.
 BUDGET = {"b1loop": 0.99, "b2str": 0.99, "b3spawn": 0.90, "b4chan": 0.30, "b5map": 0.99,
           "b6smap": 0.99, "b7narrow": 0.90, "b8ptr": 0.99, "b9hash": 0.99, "b10rot": 0.99,
           "b11tree": 0.95}
