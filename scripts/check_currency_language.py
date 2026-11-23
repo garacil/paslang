@@ -92,7 +92,7 @@ for target in ('amd64', 'arm64'):
         source.write_text(f'program rejected; uses sysutils; var {name}: Integer; begin end.\n')
         result = subprocess.run([compiler, '-target', target, '-Fu', str(core), '-o', str(directory / 'reserved'),
                                  str(source)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60)
-        if not result.returncode or b'is a reserved word, not a name' not in result.stdout:
+        if not result.returncode or b'is a predefined name of the language' not in result.stdout:
             raise RuntimeError(f'wrong reserved core rejection {name}/{target}: {result.stdout!r}')
     # The internal debugger's decimal code is not an integer or float code.
     binary = directory / 'debug-currency'

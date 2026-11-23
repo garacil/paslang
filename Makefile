@@ -1408,6 +1408,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	@python3 -I scripts/check_int_prefix.py "$(OUTDIR)/paslangc" "$(BUILDDIR)" "$(BUILDDIR)/qemu-aarch64"
 	@python3 -I scripts/check_httpunixproxy.py "$(OUTDIR)/paslangc" "$(BUILDDIR)" "$(BUILDDIR)/qemu-aarch64"
 	@python3 -I scripts/check_routine_shadow.py "$(OUTDIR)/paslangc" "$(BUILDDIR)" "$(BUILDDIR)/qemu-aarch64"
+	@python3 -I scripts/check_predefined_names.py "$(OUTDIR)/paslangc" "$(BUILDDIR)"
 	@python3 -I scripts/check_inotify_failures.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64)
 	@python3 -I scripts/bench/check_harness.py
 	@python3 -I scripts/check_tls_interop_ready.py
@@ -1855,7 +1856,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  'bindutf8:a json name is UTF-8 with no noncharacter (RFC 7493 2.1) at 4:16' \
 	  'jsonofargs:JsonOf takes a value at 5:11' \
 	  'jsonvar:json is a reserved word, not a name at 3:3' \
-	  'corename:JsonParse is a reserved word, not a name at 3:3' \
+	  'corename:JsonParse is a predefined name of the language at 3:3' \
 	  'decabstract:JsonDecode makes a TA with its Create, and TA is abstract at 9:3' \
 	  'decctor:JsonDecode makes a TA with Create, and TA.Create takes arguments at 14:3' \
 	  'decnotvar:JsonDecode(s, x): x needs a variable at 7:3' \
@@ -1866,7 +1867,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  'tryerr:TryJsonDecode(s, x, err): err is Integer, not EJsonError at 5:28' \
 	  'trygetform:TryGet of a json takes a v of a type with a JSON form, and Pointer has none at 6:21' \
 	  'decchan:TR.C has no JSON form (a channel): json ignore leaves it out at 10:3' \
-	  'decvar:JsonDecode is a reserved word, not a name at 3:3'; do \
+	  'decvar:JsonDecode is a predefined name of the language at 3:3'; do \
 	  n=$${f%%:*}; w=$${f#*:}; \
 	  if $(OUTDIR)/paslangc -o $(BUILDDIR)/jb_$$n testdata/jsonbad/$$n.paslang >$(BUILDDIR)/jb_$$n.err 2>&1; then \
 	    echo "jsonbad/$$n should fail"; exit 1; \
@@ -2527,8 +2528,8 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'Val(s, v, code): code is an integer variable, not string at 6:15' $(BUILDDIR)/strbad_valcode.err; \
 	grep -q 'StringOfChar takes a Char, not string at 3:24' $(BUILDDIR)/strbad_soc.err; \
 	grep -q 'a string or a Char goes here, not Integer at 3:18' $(BUILDDIR)/strbad_upint.err; \
-	grep -q 'Pos is a reserved word, not a name at 3:3' $(BUILDDIR)/strbad_posname.err; \
-	grep -q 'Val is a reserved word, not a name at 2:10' $(BUILDDIR)/strbad_valname.err; \
+	grep -q 'Pos is a predefined name of the language at 3:3' $(BUILDDIR)/strbad_posname.err; \
+	grep -q 'Val is a predefined name of the language at 2:10' $(BUILDDIR)/strbad_valname.err; \
 	echo ok strbad; \
 	echo "==== scope rejects (P137) ===="; \
 	for n in varproc constvar typeconst procparam twoconst outside constout; do \
@@ -2884,28 +2885,28 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  'funnelmix:FunnelLeft takes two values of one type, not TPair and Integer at 14:19' \
 	  'resop:rol is a reserved word, not a name at 5:3' \
 	  'resdecl:override is a reserved word, not a name at 5:6' \
-	  'respre:Carry is a reserved word, not a name at 6:3' \
-	  'resproc:PopCount is a reserved word, not a name at 4:10' \
-	  'resfield:VAdd8 is a reserved word, not a name at 6:5' \
-	  'resparam:MulHi is a reserved word, not a name at 4:13' \
-	  'restype:ShiftLeft is a reserved word, not a name at 5:3' \
-	  'resconst:LoadFence is a reserved word, not a name at 5:3' \
-	  'resmeth:Prefetch is a reserved word, not a name at 6:15' \
-	  'resvar:Length is a reserved word, not a name at 5:3' \
-	  'resfunc:Sin is a reserved word, not a name at 4:10' \
-	  'resclear:Clear is a reserved word, not a name at 7:15' \
-	  'resmax:Max is a reserved word, not a name at 4:19' \
-	  'rescopy:Copy is a reserved word, not a name at 6:5' \
-	  'respbyte:PByte is a reserved word, not a name at 5:3' \
-	  'respi:Pi is a reserved word, not a name at 5:3' \
-	  'reslow:Low is a reserved word, not a name at 9:14' \
-	  'resgoid:Goid is a reserved word, not a name at 8:3' \
+	  'respre:Carry is a predefined name of the language at 6:3' \
+	  'resproc:PopCount is a predefined name of the language at 4:10' \
+	  'resfield:VAdd8 is a predefined name of the language at 6:5' \
+	  'resparam:MulHi is a predefined name of the language at 4:13' \
+	  'restype:ShiftLeft is a predefined name of the language at 5:3' \
+	  'resconst:LoadFence is a predefined name of the language at 5:3' \
+	  'resmeth:Prefetch is a predefined name of the language at 6:15' \
+	  'resvar:Length is a predefined name of the language at 5:3' \
+	  'resfunc:Sin is a predefined name of the language at 4:10' \
+	  'resclear:Clear is a predefined name of the language at 7:15' \
+	  'resmax:Max is a predefined name of the language at 4:19' \
+	  'rescopy:Copy is a predefined name of the language at 6:5' \
+	  'respbyte:PByte is a predefined name of the language at 5:3' \
+	  'respi:Pi is a predefined name of the language at 5:3' \
+	  'reslow:Low is a predefined name of the language at 9:14' \
+	  'resgoid:Goid is a predefined name of the language at 8:3' \
 	  'sleepvar:sleep is a reserved word, not a name at 5:3' \
 	  'appendnot:Append takes a slice first, not Integer at 8:15' \
 	  'capnot:Cap takes a slice, not string at 9:12' \
 	  'appendelem:string does not go into Integer; x as T sees its bytes at 8:18' \
 	  'slicerange:a slice takes values, not a range at 8:9' \
-	  'resappend:Append is a reserved word, not a name at 4:11' \
+	  'resappend:Append is a predefined name of the language at 4:11' \
 	  'capvar:X is a var parameter of P, which has a closure inside: a closure may outlive the variable it points at; copy it to a local at 13:5' \
 	  'capresult:Result of F, which has a closure inside, is not shared with the routines in it: use a local at 12:5' \
 	  'capcounter:i is the counter a closure in this loop keeps: no loop inside may count with it at 18:5' \

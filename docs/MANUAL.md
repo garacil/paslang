@@ -16144,16 +16144,21 @@ The paslang additions: `pas chan makechan send recv close select map
 lock once mutex rwmutex waitgroup cond sleep safe tree heap store json`,
 and `package contains` (Delphi's, §2).
 
-Every predefined name is reserved as well (1.0.138; from 1.0.131 to
-1.0.137 only the words added since 1.0.131 were, and the older ones could
-be declared and hid the builtin, at times in silence and wrongly: a
-`function Length` was ignored). Each still means what it means only in
-its place:
+The parser also reserves the bit operators `nand nor xnor andnot sar rol ror`
+and the declaration words `forward overload override abstract public
+private published protected strict operator inline cdecl nostackframe`.
+The word `packed` is reserved (§20).
 
-- the bit operators `nand nor xnor andnot sar rol ror`;
-- the declaration words `forward overload override abstract public
-  private published protected strict operator inline cdecl nostackframe`,
-  and `packed`, which has no place at all: it is refused everywhere (§20);
+Predefined names are reserved for the language's routines, types and
+constants (P634). A declaration such as `var Low: Integer;` produces
+`Low is a predefined name of the language`, with its location. Choose
+a different identifier that describes what you are declaring, such as
+`LowerBound` for `Low`, `ParsedValue` for `Val`, or
+`Sample` for a parameter of type `Single`. Changing the case
+of a name still gives the same identifier.
+
+The predefined names include
+
 - the slice words `Append` and `Cap`;
 - the ordinal, string, slice, map and memory words `Ord Chr Succ Pred Low
   High Odd SizeOf Length Copy Delete Clear TryGet Default Assigned
