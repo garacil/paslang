@@ -156,6 +156,62 @@ def check_variables(compiler, sdk, target, work):
     print(f'ok variable names {target}, {len(cases) * len(declarations)} invalid lists')
 
 
+def check_fields(compiler, sdk, target, work):
+    declarations = {
+        'class': 'type TExample = class',
+        'class-var': 'type TExample = class\nclass var',
+        'generic': 'type generic TExample<T> = record',
+    }
+    cases = [
+        ('keyword', 'Send', "Send is a reserved word, not a field's name"),
+        ('integer', '27', "a field's name expected"),
+        ('predefined', 'Low', f'Low {PREDEFINED}'),
+        ('trailing-comma', '', "a field's name expected"),
+    ]
+    for scope, declaration in declarations.items():
+        before = f'program rejected;\n{declaration}\n  First, Second, '
+        lines = before.split('\n')
+        where = f'{len(lines)}:{len(lines[-1]) + 1}'
+        for case, name, message in cases:
+            program = work / f'{target}-field-{scope}-{case}.paslang'
+            reject(compiler, sdk, target, program,
+                   f'{before}{name}: Integer;\nend;\nbegin end.\n',
+                   f'{message} at {where}')
+    positive = invoke(compiler, sdk, target, work / f'{target}-field-accepted.paslang', """program fields;
+type
+  TExample = class
+    First, Second: Integer;
+    class var SharedFirst, SharedSecond: Integer;
+  end;
+  generic TPair<T> = record
+    First, Second: T;
+  end;
+  TIntPair = specialize TPair<Integer>;
+  TPlain = record
+    First, Send: Integer;
+  end;
+var
+  Instance: TExample;
+  Pair: TIntPair;
+  Plain: TPlain;
+begin
+  Instance := TExample.Create;
+  Instance.First := 1;
+  Instance.Second := 2;
+  TExample.SharedFirst := 3;
+  TExample.SharedSecond := 4;
+  Pair.First := 5;
+  Pair.Second := 6;
+  Plain.First := 7;
+  Plain.Send := 8;
+  WriteLn(Instance.First + Instance.Second + TExample.SharedFirst + TExample.SharedSecond +
+    Pair.First + Pair.Second + Plain.First + Plain.Send);
+end.
+""")
+    assert positive.returncode == 0 and not positive.stderr, (target, positive.stderr)
+    print(f'ok field names {target}, {len(declarations) * len(cases)} invalid lists and valid fields')
+
+
 def main():
     compiler, build = (Path(arg).resolve() for arg in sys.argv[1:])
     work = Path(mkdtemp(prefix='predefined-names-', dir=build))
@@ -173,6 +229,7 @@ def main():
                "Send is a reserved word, not a routine's name at 2:11")
         check_parameters(compiler, sdk, target, work)
         check_variables(compiler, sdk, target, work)
+        check_fields(compiler, sdk, target, work)
         positive = invoke(compiler, sdk, target, work / f'{target}-accepted.paslang',
                           'program accepted;\nvar LowerBound, UpperBound: Integer;\nbegin\n'
                           '  LowerBound := Low(Byte);\n  UpperBound := High(Byte);\n'

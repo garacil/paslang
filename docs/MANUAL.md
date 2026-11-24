@@ -16181,7 +16181,8 @@ a different identifier that describes what you are declaring, such as
 `LowerBound` for `Low`, `ParsedValue` for `Val`, or
 `Sample` for a parameter of type `Single`. Changing the case
 of a name still gives the same identifier. Each name in a comma-separated
-variable declaration must be a valid identifier (§4).
+variable, class field or generic record field declaration must be a
+valid identifier.
 
 The predefined names include
 
