@@ -1419,6 +1419,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	@python3 -I scripts/check_routine_shadow.py "$(OUTDIR)/paslangc" "$(BUILDDIR)" "$(BUILDDIR)/qemu-aarch64"
 	@python3 -I scripts/check_predefined_names.py "$(OUTDIR)/paslangc" "$(BUILDDIR)"
 	@python3 -I scripts/check_inotify_failures.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64)
+	@python3 -I scripts/check_rmall_parent.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64)
 	@python3 -I scripts/bench/check_harness.py
 	@python3 -I scripts/check_tls_interop_ready.py
 	@python3 -I scripts/bench/check_peak.py
