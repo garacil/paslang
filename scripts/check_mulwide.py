@@ -12,6 +12,14 @@ import sys
 from tempfile import TemporaryDirectory
 
 
+def routine_body(assembly, name, profile):
+    symbol = rf'^p_f\.0_{len(name)}_{name}:'
+    body = re.search(symbol + r'\n(.*?)^  \.cfi_endproc$', assembly, re.MULTILINE | re.DOTALL)
+    if body is None:
+        raise SystemExit(f'{profile}: no complete {name} body')
+    return body[1]
+
+
 def main():
     if len(sys.argv) != 4:
         raise SystemExit('usage: check_mulwide.py compiler builddir qemu')
@@ -31,13 +39,19 @@ def main():
                             '-Fu', units, '-o', binary, tests / 'wide.paslang'],
                            check=True, timeout=60)
             assembly = binary.with_suffix('.s').read_text()
-            body = re.search(r'^p_f\.0_15_readwideproduct:\n(.*?)^  \.cfi_endproc$',
-                             assembly, re.MULTILINE | re.DOTALL)
-            if body is None:
-                raise SystemExit(f'{target}/{cpu}: no complete product body')
-            emitted = re.findall(r'^  (mulq|mulxq|imulq|mul|umulh)\b', body[1], re.MULTILINE)
+            profile = target + '/' + cpu
+            body = routine_body(assembly, 'readwideproduct', profile)
+            emitted = re.findall(r'^  (mulq|mulxq|imulq|mul|umulh)\b', body, re.MULTILINE)
             if emitted != product:
                 raise SystemExit(f'{target}/{cpu}: expected {product!r}, emitted {emitted!r}')
+            if target == 'arm64':
+                loop = routine_body(assembly, 'widesum', profile)
+                upper = re.search(r'^  umulh (x[0-9]+),', loop, re.MULTILINE)
+                if upper is None:
+                    raise SystemExit(f'{profile}: no high word in WideSum')
+                stack_store = rf'^  (?:str|stur) {upper[1]},'
+                if re.search(stack_store, loop[upper.end():], re.MULTILINE):
+                    raise SystemExit(f'{profile}: WideSum spills the high word')
             if launch is not None:
                 got = subprocess.run([*launch, binary], capture_output=True, timeout=60)
                 if (got.returncode, got.stdout, got.stderr) != (0, expected, b''):
