@@ -1,0 +1,100 @@
+{ This file is part of paslang's tests.
+  Copyright (C) 2026 Germán Luis Aracil Boned.
+  GPL version 3 or later. See COPYING. }
+
+program pollgenerations;
+uses pasnet, pasroutines;
+
+procedure Require(Condition: Boolean; const Failure: string);
+begin
+  if Condition then Exit;
+  WriteLn(Failure);
+  Halt(1);
+end;
+
+procedure AwaitFlag(var Flag: Integer);
+var
+  due: Integer;
+begin
+  due := Nanotime + 5000000000;
+  while AtomicLoad(Flag) = 0 do
+  begin
+    Require(Nanotime < due, 'the wait did not reach its checkpoint');
+    Sleep(1);
+  end;
+end;
+
+procedure Waiter(Fd: Integer; Answer: chan of Integer);
+begin
+  Send(Answer, WaitIo(Fd, 1));
+end;
+
+procedure WatchSet(Fd: Integer; Answer: chan of Integer);
+begin
+  Send(Answer, WaitAny([Fd], 1, 1000));
+end;
+
+procedure WriteByte(Fd: Integer; Octet: Byte);
+var
+  written: Integer;
+begin
+  if Amd64 = 1 then
+    written := Syscall(1, Fd, @Octet, 1)
+  else
+    written := Syscall(64, Fd, @Octet, 1);
+  Require(written = 1, 'socketpair write failed');
+end;
+
+procedure CheckPromotedWait;
+var
+  oldFd, oldPeer, newFd, newPeer: Integer;
+  leader, queued: chan of Integer;
+begin
+  Require(UnixPair(oldFd, oldPeer), 'old socketpair failed');
+  PollTestFd := oldFd;
+  leader := MakeChan(1);
+  queued := MakeChan(1);
+  pas Waiter(oldFd, leader);
+  AwaitFlag(PollTestLeader);
+  pas Waiter(oldFd, queued);
+  AwaitFlag(PollTestQueued);
+  WriteByte(oldPeer, 7);
+  Require(Recv(leader) = 0, 'lead waiter did not see readiness');
+  AwaitFlag(PollTestPromoted);
+
+  UnixClose(oldFd);
+  Require(UnixPair(newFd, newPeer) and (newFd = oldFd), 'descriptor number was not reused');
+  WriteByte(newPeer, 9);
+  AtomicStore(PollTestResume, 1);
+  Require(Recv(queued) = -9, 'promoted waiter followed a reused descriptor');
+  Require(WaitMs(newFd, 1, 100) = 0, 'replacement socket lost readiness');
+  UnixClose(oldPeer);
+  UnixClose(newPeer);
+  UnixClose(newFd);
+end;
+
+procedure CheckWaitAnySetup;
+var
+  oldFd, oldPeer, newFd, newPeer: Integer;
+  replies: chan of Integer;
+begin
+  Require(UnixPair(oldFd, oldPeer), 'old socketpair failed');
+  PollTestFd := oldFd;
+  replies := MakeChan(1);
+  pas WatchSet(oldFd, replies);
+  AwaitFlag(PollTestSetup);
+
+  UnixClose(oldFd);
+  Require(UnixPair(newFd, newPeer) and (newFd = oldFd), 'descriptor number was not reused');
+  AtomicStore(PollTestResumeSetup, 1);
+  Require(Recv(replies) = -9, 'WaitAny missed a close during setup');
+  UnixClose(oldPeer);
+  UnixClose(newPeer);
+  UnixClose(newFd);
+end;
+
+begin
+  CheckPromotedWait;
+  CheckWaitAnySetup;
+  WriteLn('ok poll generations');
+end.

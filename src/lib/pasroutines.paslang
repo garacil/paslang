@@ -136,9 +136,9 @@ function PasNetConnect(Ip, Port: Integer): Integer;
   WaitMs are PasWaitIo and PasWaitMs, NetAccept is PasNetAccept: every
   wait goes through the record of its descriptor. A close of the
   descriptor, by NetClose or by Syscall, wakes every routine waiting on
-  it, which answers -9 (EBADF), and until that close has ended a wait on
-  it answers -9 at once; the runtime calls PasPollClosing before the
-  close and PasPollClosed after it. Any number of routines may wait on
+  it, which answers -9 (EBADF). A new wait that encounters a close in
+  progress waits for it to finish. The runtime calls PasPollClosing
+  before the close and PasPollClosed after it. Any number of routines may wait on
   one descriptor, for one direction or both: each is served.
   PasWaitSet parks on Ep, an epoll set of the caller's that holds Fds,
   until Ep can be read or Ms milliseconds pass (0 or less does not
@@ -150,6 +150,8 @@ function PasNetAccept(Fd: Integer): Integer;
 procedure PasPollClosing(Fd: Integer);
 procedure PasPollClosed(Fd: Integer);
 function PasWaitSet(Ep: Integer; const Fds: array of Integer; Ms: Integer): Integer;
+{ Set up each epoll member together with the watcher for its close. }
+function PasWaitEvents(Ep: Integer; const Fds: array of Integer; Ev, Ms: Integer): Integer;
 {$endif}
 
 implementation
@@ -1440,7 +1442,7 @@ var
   r: PPollRec;
   d, expect, tok, wake, rounds, pr: Integer;
   node, q: PPollNode;
-  turn: Boolean;
+  turn, haveGeneration: Boolean;
 begin
   Fd := PollFd(Fd);
   if Fd < 0 then
@@ -1460,16 +1462,28 @@ begin
     d := 0;
   node := nil;
   rounds := 0;
+  expect := 0;
+  haveGeneration := False;
   while True do
   begin
     SpinLock(@r^.Spin);
+    if haveGeneration and (r^.Gen <> expect) then
+    begin
+      SpinUnlock(@r^.Spin);
+      Result := -9;
+      Exit;
+    end;
     if r^.Closing <> 0 then
     begin
       SpinUnlock(@r^.Spin);
       PollYield(rounds);
       Continue;
     end;
+    { Keep the first generation when dropping the lock to allocate a
+      node or when a queued routine is promoted. Linux can reuse the
+      descriptor number before the routine gets its next turn. }
     expect := r^.Gen;
+    haveGeneration := True;
     tok := PollToken;
     if r^.Lead[d] = 0 then
     begin
@@ -1689,7 +1703,28 @@ end;
   word is a cell of the collector's that every node names, since a
   routine's stack may move while it is parked. The set is the caller's
   alone, so nobody closes it under this wait and it needs no record. }
-function PasWaitSet(Ep: Integer; const Fds: array of Integer; Ms: Integer): Integer;
+procedure PollAddMember(Ep, Fd, Ev, Index: Integer);
+var
+  evt: array[0..1] of Integer;
+  ignored: Integer;
+begin
+  if Amd64 = 1 then
+  begin
+    { Linux's amd64 epoll_event is packed. }
+    evt[0] := Ev or (Index shl 32);
+    evt[1] := Index shr 32;
+    ignored := Syscall(233, Ep, 1, Fd, @evt);
+  end
+  else
+  begin
+    evt[0] := Ev;
+    evt[1] := Index;
+    ignored := Syscall(21, Ep, 1, Fd, @evt);
+  end;
+end;
+
+function PollWaitSet(Ep: Integer; const Fds: array of Integer; Ev, Ms: Integer;
+                     AddMembers: Boolean): Integer;
 var
   nodes: array of PPollNode;
   cell: PPollCell;
@@ -1699,7 +1734,12 @@ var
 begin
   Result := 0;
   if Ms <= 0 then
+  begin
+    if AddMembers then
+      for i := 0 to High(Fds) do
+        PollAddMember(Ep, Fds[i], Ev, i);
     Exit;
+  end;
   if Ms > 1099511627776 then
     Ms := 1099511627776;
   n := Length(Fds);
@@ -1738,6 +1778,11 @@ begin
           nodes[i]^.Next := r^.Watch;
           nodes[i]^.Linked := 1;
           r^.Watch := nodes[i];
+          { Linux can silently remove the member on close. Arm the
+            watcher and register the member under the same lock so
+            a close can always cancel a registration that succeeded. }
+          if AddMembers then
+            PollAddMember(Ep, Fds[i], Ev, i);
           linked := True;
         end;
         SpinUnlock(@r^.Spin);
@@ -1756,6 +1801,15 @@ begin
     end;
   if AtomicLoad(cell^.V) <> 0 then
     Result := -9;
+end;
+function PasWaitSet(Ep: Integer; const Fds: array of Integer; Ms: Integer): Integer;
+begin
+  Result := PollWaitSet(Ep, Fds, 0, Ms, False);
+end;
+
+function PasWaitEvents(Ep: Integer; const Fds: array of Integer; Ev, Ms: Integer): Integer;
+begin
+  Result := PollWaitSet(Ep, Fds, Ev, Ms, True);
 end;
 {$endif}
 

@@ -11977,8 +11977,10 @@ word (`NetClose`, `TcpClose`, `UnixClose`, `UdpClose`, `FileClose`, a
 close made with `Syscall`). The wait answers -9 (`EBADF`), the transfer
 it belongs to gives that as its error (`NetRead` and `UdpRecvFrom` an
 empty string, `NetAccept`, `NetWrite` and `PasIoRead` -9), and the
-routine does not touch the descriptor again, whose number the next
-open may already have given to another file. Go's close does the same
+routine does not follow a descriptor number into a later open file.
+A routine that receives its turn after queueing retains the original
+generation. `WaitAny` arms each member's close watcher when it adds
+that member to its epoll set, so a close during setup also ends the wait. Go's close does the same
 to the routines blocked on a file (`internal/poll`: "use of closed
 file"). So a server ends by closing its listeners and its connections:
 the routines parked on them come back and end. Before, they stayed
