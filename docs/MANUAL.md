@@ -15083,9 +15083,13 @@ capacity of the scheduler's M table. With the variable unset or
 invalid, the runtime starts with the number of CPUs in the kernel's
 affinity mask, capped by the CPU quota from the process's cgroup and its
 visible ancestors. Fractional CPU quotas round up. A failed or empty
-affinity query falls back to one P. Each P belongs to at most one M.
-Only the first M
-starts with the program; others start as work requires them. The current
+affinity query falls back to one P. A service allowed five logical CPUs
+with systemd `CPUQuota=125%` starts with two Ps by default.
+`PASLANG_MAXPROCS=4` in that service selects four Ps while Linux still
+enforces the quota and affinity.
+
+Each P belongs to at most one M. Only the first M starts with the
+program; others start as work requires them. The current
 G is in a register (`r14` on amd64, `x28` on arm64) and every routine
 has its own stack that grows on demand: each routine entry checks the
 stack and calls the runtime when it needs more. A system monitor thread

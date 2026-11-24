@@ -174,6 +174,10 @@ def check_target(compiler, build, working, cpu, launch):
     affinity_only = working / f'{cpu}-current-mask'
     link_variant(program, affinity_only, cc_prefix, assembly)
     expect(clean_launch + [str(affinity_only)], min(10000, max(1, len(allowed))), f'{cpu} current mask')
+    if len(allowed) >= 5:
+        five_cpus = ','.join(str(number) for number in sorted(allowed)[:5])
+        expect(['taskset', '-c', five_cpus, *clean_launch, str(affinity_only)],
+               5, f'{cpu} five CPUs')
     syscall = '  syscall\n' if native else '  svc #0\n'
     start = assembly.index('rt_ncpu:\n')
     end = assembly.index('\nrt_', start)
