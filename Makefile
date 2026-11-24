@@ -1406,6 +1406,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	@python3 -B scripts/check_uint32.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64)
 	@python3 -B scripts/check_uint32_focus.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64)
 	@python3 -I scripts/check_mulwide.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64)
+	@python3 -I scripts/check_curve25519.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64)
 	@python3 -B scripts/check_fma_target.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64)
 	@python3 -I scripts/check_poll_generations.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64)
 	@python3 -I scripts/check_cpu_affinity.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64)

@@ -66,14 +66,15 @@ type
   TCachedPoint = record Plus, Minus, TwiceZ, TwiceDT: TFe; end;
   TNaf = array[0..255] of Int8;
   TScalar = array[0..31] of Integer;
-  TWide = array[0..63] of Integer;
   TScalarWords = array[0..3] of Integer;
+  TScalarWideWords = array[0..7] of Integer;
 
 const
   CurveD: TFe = (929955233495203, 466365720129213, 1662059464998953, 2033849074728123, 1442794654840575);
   SqrtM1: TFe = (1718705420411056, 234908883556509, 2233514472574048, 2117202627021982, 765476049583133);
   { L = 2^252 + 27742317777372353535851937790883648493. }
   ScalarOrder: TScalarWords = ($5812631A5CF5D3ED, $14DEF9DEA2F79CD6, 0, $1000000000000000);
+  ScalarReciprocal: array[0..4] of Integer = ($ED9CE5A30A2C131B, $2106215D086329A7, $FFFFFFFFFFFFFFEB, $FFFFFFFFFFFFFFFF, $000000000000000F);
 var
   basePoint: TPoint;
   baseOnce: once;
@@ -152,7 +153,7 @@ begin
   FeMul(V.Z, f, g);
 end;
 
-procedure PointDouble(var V: TPoint; const P: TPoint);
+procedure PointDouble(var V: TPoint; const P: TPoint; NeedT: Boolean = True);
 var
   a, b, c, e, f, g, h, t: TFe;
 begin
@@ -168,7 +169,7 @@ begin
   FeAdd(f, c, g);
   FeMul(V.X, e, f);
   FeMul(V.Y, g, h);
-  FeMul(V.T, e, h);
+  if NeedT then FeMul(V.T, e, h);
   FeMul(V.Z, f, g);
 end;
 
@@ -482,7 +483,9 @@ begin
     Dec(bitIndex);
   while bitIndex >= 0 do
   begin
-    PointDouble(V, V);
+    { The next doubling and the final comparison use only X, Y and Z.
+      As in Go's VarTimeDoubleScalarBaseMult, compute T for additions. }
+    PointDouble(V, V, (aDigits[bitIndex] <> 0) or (bDigits[bitIndex] <> 0));
     if aDigits[bitIndex] <> 0 then
       PointAddDigit(V, V, table, -Integer(aDigits[bitIndex]));
     if bDigits[bitIndex] <> 0 then
@@ -510,47 +513,77 @@ begin
   Result := difference = 0;
 end;
 
-{ Binary reduction with four 64-bit limbs. After each bit, the
-  accumulator is below L, so doubling and adding one needs at most
-  one subtraction. Keep the borrow and selection in arithmetic. }
-procedure ScalarReduce(const Wide: TWide; out S: TScalar);
+{ Little-endian word product, truncated to the output width.
+  The column carry is at most one word, since each accumulation
+  is bounded by (2^64-1)^2 + 2*(2^64-1). }
+procedure ScalarWordProduct(const A, B: array of Integer; Product: array of Integer);
 var
-  remainder, reduced: TScalarWords;
-  bitIndex, i, nextBit, wordValue, borrow, mask: Integer;
+  i, j, rowCarry, hi, lo, carryWord: Integer;
 begin
-  FillChar(remainder, SizeOf(remainder), 0);
-  for bitIndex := 511 downto 0 do
+  for i := 0 to High(Product) do
+    Product[i] := 0;
+  for i := 0 to High(A) do
   begin
-    nextBit := (Wide[bitIndex shr 3] shr (bitIndex and 7)) and 1;
-    for i := 0 to 3 do
+    rowCarry := 0;
+    for j := 0 to High(B) do
     begin
-      wordValue := remainder[i];
-      remainder[i] := (wordValue shl 1) or nextBit;
-      nextBit := wordValue shr 63;
+      if i+j > High(Product) then Break;
+      Mul128(A[i], B[j], hi, lo);
+      lo := AddCarry(lo, Product[i+j], 0, carryWord);
+      hi := hi + carryWord;
+      Product[i+j] := AddCarry(lo, rowCarry, 0, carryWord);
+      rowCarry := hi + carryWord;
     end;
-    borrow := 0;
-    for i := 0 to 3 do
-      reduced[i] := SubBorrow(remainder[i], ScalarOrder[i], borrow, borrow);
-    mask := borrow - 1;
-    for i := 0 to 3 do
-      remainder[i] := remainder[i] xor (mask and (remainder[i] xor reduced[i]));
+    if i+Length(B) <= High(Product) then
+      Product[i+Length(B)] := rowCarry;
   end;
+end;
+
+{ Barrett reduction with mu = floor(2^512 / L). For x < 2^512,
+  q = floor(x*mu/2^512) is at most one below floor(x/L). Thus
+  x - q*L is nonnegative and less than 2L, so its low 256 bits
+  suffice. The final subtraction uses a mask. }
+procedure ScalarReduce(const Words: TScalarWideWords; out S: TScalar);
+var
+  approximation: array[0..12] of Integer;
+  quotient, product, remainder, reduced: TScalarWords;
+  i, borrow, mask: Integer;
+begin
+  ScalarWordProduct(Words, ScalarReciprocal, approximation);
+  for i := 0 to 3 do
+    quotient[i] := approximation[8+i];
+  ScalarWordProduct(quotient, ScalarOrder, product);
+  borrow := 0;
+  for i := 0 to 3 do
+    remainder[i] := SubBorrow(Words[i], product[i], borrow, borrow);
+  borrow := 0;
+  for i := 0 to 3 do
+    reduced[i] := SubBorrow(remainder[i], ScalarOrder[i], borrow, borrow);
+  mask := borrow - 1;
+  for i := 0 to 3 do
+    remainder[i] := remainder[i] xor (mask and (remainder[i] xor reduced[i]));
   for i := 0 to 31 do
     S[i] := (remainder[i shr 3] shr ((i and 7) * 8)) and 255;
+  FillChar(approximation, SizeOf(approximation), 0);
+  FillChar(quotient, SizeOf(quotient), 0);
+  FillChar(product, SizeOf(product), 0);
   FillChar(remainder, SizeOf(remainder), 0);
   FillChar(reduced, SizeOf(reduced), 0);
 end;
 
 procedure ScalarFromBytes(const Text: string; out S: TScalar);
 var
-  wide: TWide;
-  i: Integer;
+  words: TScalarWideWords;
+  i, wordIndex: Integer;
 begin
-  FillChar(wide, SizeOf(wide), 0);
+  FillChar(words, SizeOf(words), 0);
   for i := 1 to Length(Text) do
-    wide[i-1] := Ord(Text[i]);
-  ScalarReduce(wide, S);
-  FillChar(wide, SizeOf(wide), 0);
+  begin
+    wordIndex := (i - 1) shr 3;
+    words[wordIndex] := words[wordIndex] or (Ord(Text[i]) shl (((i - 1) and 7) * 8));
+  end;
+  ScalarReduce(words, S);
+  FillChar(words, SizeOf(words), 0);
 end;
 
 function ScalarBytes(const S: TScalar): string;
@@ -564,22 +597,32 @@ end;
 
 procedure ScalarMultiplyAdd(const A, B, C: TScalar; out S: TScalar);
 var
-  wide: TWide;
-  i, j: Integer;
+  aWords, bWords, cWords: TScalarWords;
+  product: TScalarWideWords;
+  i, bitOffset, wordIndex, carryWord: Integer;
 begin
-  FillChar(wide, SizeOf(wide), 0);
+  FillChar(aWords, SizeOf(aWords), 0);
+  FillChar(bWords, SizeOf(bWords), 0);
+  FillChar(cWords, SizeOf(cWords), 0);
   for i := 0 to 31 do
-    wide[i] := C[i];
-  for i := 0 to 31 do
-    for j := 0 to 31 do
-      wide[i + j] := wide[i + j] + A[i] * B[j];
-  for i := 0 to 62 do
   begin
-    wide[i + 1] := wide[i + 1] + (wide[i] shr 8);
-    wide[i] := wide[i] and 255;
+    wordIndex := i shr 3;
+    bitOffset := (i and 7) * 8;
+    aWords[wordIndex] := aWords[wordIndex] or (A[i] shl bitOffset);
+    bWords[wordIndex] := bWords[wordIndex] or (B[i] shl bitOffset);
+    cWords[wordIndex] := cWords[wordIndex] or (C[i] shl bitOffset);
   end;
-  ScalarReduce(wide, S);
-  FillChar(wide, SizeOf(wide), 0);
+  ScalarWordProduct(aWords, bWords, product);
+  carryWord := 0;
+  for i := 0 to 3 do
+    product[i] := AddCarry(product[i], cWords[i], carryWord, carryWord);
+  for i := 4 to 7 do
+    product[i] := AddCarry(product[i], 0, carryWord, carryWord);
+  ScalarReduce(product, S);
+  FillChar(aWords, SizeOf(aWords), 0);
+  FillChar(bWords, SizeOf(bWords), 0);
+  FillChar(cWords, SizeOf(cWords), 0);
+  FillChar(product, SizeOf(product), 0);
 end;
 
 function SeedScalar(const Seed: string; out S: TScalar): string;
@@ -768,8 +811,13 @@ begin
     Exit;
   ScalarFromBytes(Sha512(encodedR + PublicKey + Message), k);
   VerifyMultiply(product, a, s, k);
-  { RFC 8032 5.1.7's permitted uncofactored equation. }
-  Result := PointBytes(product) = encodedR;
+  { Compare the uncofactored equation in projective coordinates, as
+    Go's edwards25519.Point.Equal does. The decoded R has Z = 1, so
+    multiplying its affine coordinates by the computed Z suffices. }
+  FeMul(r.X, r.X, product.Z);
+  FeMul(r.Y, r.Y, product.Z);
+  Result := (FeBytes(r.X) = FeBytes(product.X)) and
+            (FeBytes(r.Y) = FeBytes(product.Y));
 end;
 
 procedure Ed25519Keygen(out Seed, PublicKey: string);
