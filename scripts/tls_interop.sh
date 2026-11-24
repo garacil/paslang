@@ -60,6 +60,12 @@ if [ "$KIND" = go ]; then
   go_case tls12-c02b big
   go_case tls12-c02b only13
   go_case tls13 conc
+  go_case tls13ed25519 only13
+  go_case tls13ed25519-chain only13
+  go_case tls12-c02b-ed25519 only12
+  go_case tls13ed25519-badcert only13
+  go_case tls13ed25519-badsig only13
+  go_case tls12-c02b-ed25519-badsig only12
   if [ -n "$DOC" ]; then
     $SRV -case alpn -dir $T > $T/port 2> $T/err & pid=$!
     i=0; while [ ! -s $T/port ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done

@@ -12664,10 +12664,11 @@ scope. See Arm DDI 0487, B1.5.6 and the [kernel catalogue](KERNELS.md).
   not RSA are refused by name. The key is then checked whole by
   `pasrsa`, whose reason `err` carries.
 
-Signatures are checked by `pasnist` (ECDSA on P-256 and P-384) and
-`pasrsa` (PKCS #1 v1.5 and PSS on SHA-256, SHA-384, SHA-512); SHA-1 and
-MD5 are refused as Go refuses them, and Ed25519, ML-DSA and DSA keys are
-read but their signatures give Go's `algorithm unimplemented`.
+Signatures are checked by `pasnist` (ECDSA on P-256 and P-384),
+`pasrsa` (PKCS #1 v1.5 and PSS on SHA-256, SHA-384, SHA-512), and
+`pased25519` (pure Ed25519, RFC 8410). SHA-1 and MD5 are refused as
+Go refuses them. ML-DSA and DSA keys are read and their signatures
+give Go's `algorithm unimplemented`.
 `testdata/x509verify` gives Go's verdict and text on 1,237 cases (PKIs
 made by `CreateCertificate`, Go's own tables, NIST's PKITS, the chains of
 two real servers at fixed times), `x509pem` on 522 PEM texts, and
@@ -12679,9 +12680,11 @@ ChaCha20-Poly1305 over X25519, P-256 or P-384 (a HelloRetryRequest when
 the server wants another group, KeyUpdate both ways) and TLS 1.2 with
 ECDHE and the same ciphers (RFC 5289, RFC 7905), the extended master
 secret (RFC 7627) and the downgrade sentinel; SNI, ALPN, an empty
-certificate when the server asks for one; the server's chain checked by
-`pasx509` against the system's roots and its name, its signatures by
-`pasnist` and `pasrsa`. AES-GCM comes first when the unit is compiled
+certificate when the server asks for one. `pasx509` checks the server's
+chain against the trusted roots and verifies its name. `pasnist`,
+`pasrsa` and `pased25519` check its handshake signatures in TLS 1.2
+and TLS 1.3. Ed25519 uses signature scheme `0x0807` (RFC 8422 and
+RFC 8446). AES-GCM comes first when the unit is compiled
 for a processor with AES, ChaCha20 first without, as Go orders them. A
 program that uses it has `pasconn`'s `TlsDialer` and `TlsUpgrader` set,
 so `ImapDial(host, 993, ImapImplicit, ms)`, SMTPS and `https` work with

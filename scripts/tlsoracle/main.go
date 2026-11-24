@@ -15,6 +15,7 @@ import (
 	"bufio"
 	"crypto"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
@@ -24,9 +25,11 @@ import (
 	"encoding/pem"
 	"flag"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -43,39 +46,78 @@ func mkCert(tmpl, parent *x509.Certificate, pub, priv any) *x509.Certificate {
 	return c
 }
 
+func edKey() ed25519.PrivateKey {
+	_, key, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		panic(err)
+	}
+	return key
+}
+
+type badSignature struct{ crypto.Signer }
+
+func (s badSignature) Sign(random io.Reader, msg []byte, opts crypto.SignerOpts) ([]byte, error) {
+	sig, err := s.Signer.Sign(random, msg, opts)
+	if err == nil {
+		sig[len(sig)-1] ^= 1
+	}
+	return sig, err
+}
+
 func main() {
 	port := flag.Int("port", 0, "port")
 	name := flag.String("case", "tls13", "case")
 	dir := flag.String("dir", ".", "where ca.pem goes")
 	flag.Parse()
-	caKey, _ := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+	ed := strings.Contains(*name, "ed25519")
+	var caKey crypto.Signer
+	if ed {
+		caKey = edKey()
+	} else {
+		caKey, _ = ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+	}
 	caT := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "pastls test root"},
 		NotBefore: notBefore, NotAfter: notAfter, IsCA: true, BasicConstraintsValid: true,
 		KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageCRLSign}
-	ca := mkCert(caT, caT, &caKey.PublicKey, caKey)
+	ca := mkCert(caT, caT, caKey.Public(), caKey)
 	os.WriteFile(*dir+"/ca.pem", pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: ca.Raw}), 0644)
-	var leafPub any
+	issuer, issuerKey := ca, caKey
+	if ed {
+		issuerKey = edKey()
+		issuerT := *caT
+		issuerT.SerialNumber = big.NewInt(3)
+		issuerT.Subject = pkix.Name{CommonName: "pastls test intermediate"}
+		issuer = mkCert(&issuerT, ca, issuerKey.Public(), caKey)
+	}
 	var leafPriv crypto.Signer
 	switch {
+	case ed && *name != "tls13ed25519-chain":
+		leafPriv = edKey()
 	case len(*name) > 3 && (*name)[len(*name)-3:] == "rsa":
 		k, _ := rsa.GenerateKey(rand.Reader, 2048)
-		leafPub, leafPriv = &k.PublicKey, k
+		leafPriv = k
 	case len(*name) > 4 && (*name)[len(*name)-4:] == "p384":
 		k, _ := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
-		leafPub, leafPriv = &k.PublicKey, k
+		leafPriv = k
 	default:
 		k, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-		leafPub, leafPriv = &k.PublicKey, k
+		leafPriv = k
 	}
 	leafT := &x509.Certificate{SerialNumber: big.NewInt(2), Subject: pkix.Name{CommonName: "localhost"},
 		NotBefore: notBefore, NotAfter: notAfter, DNSNames: []string{"localhost", "*.pastls.test"},
 		IPAddresses: []net.IP{net.ParseIP("127.0.0.1")},
-		KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
-	leaf := mkCert(leafT, ca, leafPub, caKey)
-	cfg := &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{leaf.Raw, ca.Raw}, PrivateKey: leafPriv}},
+		KeyUsage:    x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
+	leaf := mkCert(leafT, issuer, leafPriv.Public(), issuerKey)
+	if strings.HasSuffix(*name, "-badcert") {
+		leaf.Raw[len(leaf.Raw)-1] ^= 1
+	}
+	if strings.HasSuffix(*name, "-badsig") {
+		leafPriv = badSignature{leafPriv}
+	}
+	cfg := &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{leaf.Raw, issuer.Raw}, PrivateKey: leafPriv}},
 		Time: func() time.Time { return time.Date(2027, 6, 1, 0, 0, 0, 0, time.UTC) }}
 	switch *name {
-	case "tls13", "tls13rsa", "tls13p384":
+	case "tls13", "tls13rsa", "tls13p384", "tls13ed25519", "tls13ed25519-chain", "tls13ed25519-badcert", "tls13ed25519-badsig":
 	case "hrr":
 		cfg.CurvePreferences = []tls.CurveID{tls.CurveP256}
 	case "hrr384":
@@ -84,7 +126,7 @@ func main() {
 		cfg.NextProtos = []string{"h2", "http/1.1"}
 	case "certreq":
 		cfg.ClientAuth = tls.RequestClientCert
-	case "tls12-c02b", "tls12-c02c", "tls12-cca9", "tls12-c02f-rsa", "tls12-c030-rsa", "tls12-cca8-rsa", "tls12-c02b-p384":
+	case "tls12-c02b", "tls12-c02c", "tls12-cca9", "tls12-c02f-rsa", "tls12-c030-rsa", "tls12-cca8-rsa", "tls12-c02b-p384", "tls12-c02b-ed25519", "tls12-c02b-ed25519-badsig":
 		cfg.MaxVersion = tls.VersionTLS12
 		var id uint16
 		fmt.Sscanf((*name)[6:10], "%x", &id)
