@@ -12473,8 +12473,15 @@ cryptographic implementations:
   the deterministic 64-byte signature. The seed is a 32-byte binary
   string. An invalid seed length returns an empty result. `Ed25519Keygen`
   obtains a new seed from the kernel CSPRNG and raises on entropy failure.
-  Supply distinct variables for its two outputs. Signing uses a fixed
-  sequence of point operations and scans each table entry for secret digits.
+  Supply distinct variables for its two outputs. Signing uses a shared
+  fixed-base table and reads every entry of the selected row for each
+  secret digit. For repeated signatures, call
+  `Ed25519PrepareSigningKey(seed, out key)` and pass the prepared
+  `TEd25519SigningKey` to `Ed25519SignPrepared(key, message)`.
+  `Ed25519PreparedPublicKey(key)` returns its public key. A prepared key
+  holds private key material and can be shared across pasroutines while
+  it is kept unmodified. A wrong seed length clears the prepared key and
+  returns `False`. A default key gives empty results.
   `Ed25519Verify(key, message, signature)` uses public width-5 and width-8
   signed digits together in one doubling loop and initializes the reusable
   base table once. It requires `S < L`, canonical encodings of both `A`
