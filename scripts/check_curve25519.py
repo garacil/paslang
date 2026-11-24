@@ -41,6 +41,8 @@ begin
       3: FeSquareN(c, a, rounds);
       4: begin FeSquareN(a, a, rounds); c := a; end;
     end;
+    for i := 0 to 4 do
+      if (c[i] < 0) or (c[i] >= (1 shl 52)) then Halt(2);
     WriteLn(LowerCase(Hex(FeBytes(c))));
     Dec(rows);
   end;
