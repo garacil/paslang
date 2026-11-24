@@ -78,6 +78,13 @@ def check(functions):
                     fail('secret carry-width selector', node)
                 assign(args[3]['l'], secret)
                 return secret
+            if symbol == 'rt_mulwide':
+                if len(args) != 3 or args[2]['kind'] != 17:
+                    fail('unexpected widening multiply intrinsic ABI', node)
+                left, right = expr(args[0]), expr(args[1])
+                secret = left or right
+                assign(args[2]['l'], secret)
+                return secret
             if symbol in helpers:
                 if len(args) < 3 or args[1]['kind'] != 17:
                     fail('unexpected order-helper ABI', node)
@@ -191,6 +198,8 @@ variants = {'production': source,
             'old-secret-final-branch': source.replace(current, original, 1),
             'secret-index': source.replace('Mul128(A[i], B[j], hi, lo);',
                 'Mul128(A[A[0] and 3], B[j], hi, lo);', 1),
+            'secret-wide-high-word': source.replace('Mul128(A[i], B[j], hi, lo);',
+                'Mul128(A[i], B[j], hi, lo); if hi <> 0 then lo := hi;', 1),
             'secret-loop': source.replace('for i := 0 to L - 1 do',
                 'for i := 0 to (A[0] and 3) do', 1),
             'secret-inverse-exponent': source.replace('C.NMinus2[i div 64]', 'A[i div 64]', 1)}

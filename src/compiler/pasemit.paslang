@@ -779,6 +779,7 @@ type
     function KeepsClean(E: PExpr): Boolean;
     function NarrowInPlace(S: PStmt): Boolean;
     procedure EmitBitChk(const R: string; Hi: Int64);
+    procedure EmitWideMul(E: PExpr);
     function EmitWideFn(E: PExpr): Boolean;
     function WideCarryOK(E: PExpr): Boolean;
     procedure WideCarryEmit(E: PExpr);
@@ -8368,7 +8369,7 @@ begin
           (E^.Name = 'rt_odd') or (E^.Name = 'rt_absint') or (E^.Name = 'rt_bitchk') or
           (E^.Name = 'rt_rot') or (E^.Name = 'rt_funnel') or (E^.Name = 'rt_carry') or
           (E^.Name = 'rt_addc') or (E^.Name = 'rt_subb') or (E^.Name = 'rt_mulhi') or
-          (E^.Name = 'rt_mulhis');
+          (E^.Name = 'rt_mulhis') or (E^.Name = 'rt_mulwide');
         for i := 0 to High(E^.Args) do
           if Result and not LeafE(E^.Args[i]) then
             Result := False;
@@ -27569,6 +27570,122 @@ begin
   end;
 end;
 
+{ Go's AMD64Ops MULQU2/MULXQ and rustc's widening u128 product.
+  Intel SDM Vol. 2B MUL and MULX give both words. ARM DDI 0487 M.c
+  C3.7.10.1 uses MUL and UMULH. Read both operands before either
+  output can overwrite an input, and return the low word to its
+  ordinary assignment. }
+procedure TEmitter.EmitWideMul(E: PExpr);
+var
+  dest, lhs, rhs: TSym;
+  a, b: PExpr;
+  left, right, implicit, lowReg, highReg: string;
+  av, bv: Int64;
+  plain, simple, bmi: Boolean;
+begin
+  a := E^.Args[0];
+  b := E^.Args[1];
+  plain := PlainOrd(E^.Args[2]^.L, dest);
+  bmi := (not FArm) and HasFeat(15);
+  if FArm then
+  begin
+    lowReg := 'x0';
+    highReg := 'x2';
+  end
+  else
+  begin
+    lowReg := 'rax';
+    highReg := 'rdx';
+  end;
+  if ConstOf(a, av) and ConstOf(b, bv) then
+  begin
+    if not plain then
+      EmitExpr(E^.Args[2]);
+    LoadImmR(highReg, FoldMulHi(av, bv, False));
+    if plain then
+      StoreWordVar(dest, highReg)
+    else
+      StoreWidth(highReg, lowReg, 8);
+    LoadImmR(lowReg, Int64(QWord(av) * QWord(bv)));
+    Exit;
+  end;
+  simple := plain and OrdSimple(a, 0) and OrdSimple(b, 1);
+  if simple then
+  begin
+    if FArm then
+    begin
+      EmitOrdTo(a, 0);
+      EmitOrdTo(b, 1);
+      left := OrdPool(0);
+      right := OrdPool(1);
+    end
+    else
+    begin
+      implicit := lowReg;
+      if bmi then
+        implicit := highReg;
+      if PlainOrd(b, rhs) and PlainOrd(a, lhs) then
+      begin
+        right := MemA(rhs);
+        LoadWordVar(lhs, implicit);
+      end
+      else
+      begin
+        EmitOrdTo(a, 0);
+        EmitOrdTo(b, 1);
+        right := '%' + OrdPool(1);
+        Line('  movq %' + OrdPool(0) + ', %' + implicit);
+      end;
+    end;
+  end
+  else
+  begin
+    EmitExpr(a);
+    if FArm then PshK('x0', 0) else PushK('rax', 0);
+    EmitExpr(b);
+    if FArm then PshK('x0', 0) else PushK('rax', 0);
+    if not plain then
+    begin
+      EmitExpr(E^.Args[2]);
+      if FArm then
+        Line('  mov x3, x0')
+      else
+        Line('  movq %rax, %r8');
+    end;
+    if FArm then
+    begin
+      Ppop('x1');
+      Ppop('x0');
+      left := 'x0';
+      right := 'x1';
+    end
+    else
+    begin
+      Line('  popq %rcx');
+      if bmi then
+        Line('  popq %rdx')
+      else
+        Line('  popq %rax');
+      right := '%rcx';
+    end;
+  end;
+  if FArm then
+  begin
+    Line('  umulh x2, ' + left + ', ' + right);
+    Line('  mul x0, ' + left + ', ' + right);
+  end
+  else if bmi then
+    Line('  mulxq ' + right + ', %rax, %rdx')
+  else
+    Line('  mulq ' + right);
+  if plain then
+    StoreWordVar(dest, highReg)
+  else if FArm then
+    StoreWidth(highReg, 'x3', 8)
+  else
+    StoreWidth(highReg, 'r8', 8);
+end;
+
 { The words of P106 put in line (1.0.121): AddCarry and SubBorrow with
   the carry in the flag (adc/sbb after neg sets it; adcs/sbcs after a
   compare), the carry out stored at the width of its variable; the
@@ -27583,6 +27700,11 @@ var
   t, sz: LongInt;
   lo, hi: Int64;
 begin
+  if E^.Name = 'rt_mulwide' then
+  begin
+    EmitWideMul(E);
+    Exit(True);
+  end;
   Result := False;
   if (E^.Name <> 'rt_addc') and (E^.Name <> 'rt_subb') and (E^.Name <> 'rt_addo') and
     (E^.Name <> 'rt_subo') and (E^.Name <> 'rt_mulo') and (E^.Name <> 'rt_addsat') and
@@ -33229,6 +33351,7 @@ end;
 function TEmitter.PromoExprOK(E: PExpr): Boolean;
 var
   i: SizeInt;
+  dest: TSym;
 begin
   Result := True;
   if E = nil then
@@ -33288,7 +33411,10 @@ begin
         Result := True;
       end;
     ekCall:
-      if (E^.Name = 'rt_length') or (E^.Name = 'rt_high') or
+      if E^.Name = 'rt_mulwide' then
+        Result := PlainOrd(E^.Args[2]^.L, dest) and
+          PromoExprOK(E^.Args[0]) and PromoExprOK(E^.Args[1])
+      else if (E^.Name = 'rt_length') or (E^.Name = 'rt_high') or
         (E^.Name = 'rt_low') or (E^.Name = 'rt_odd') or
         (E^.Name = 'rt_absint') or (E^.Name = 'rt_bitchk') or (E^.Name = 'rt_rot') or
         (E^.Name = 'rt_funnel') or (E^.Name = 'rt_carry') or
@@ -33768,6 +33894,13 @@ var
 begin
   if E = nil then
     Exit;
+  if (E^.Kind = ekCall) and (E^.Name = 'rt_mulwide') and (E^.Args[2]^.L^.Kind = ekVar) then
+  begin
+    PromoScanE(E^.Args[0], Weight);
+    PromoScanE(E^.Args[1], Weight);
+    PromoAdd(E^.Args[2]^.L^.Name, True, Weight);
+    Exit;
+  end;
   if E^.Kind = ekVar then
     PromoAdd(E^.Name, False, Weight);
   if (E^.Kind = ekCall) and (E^.Name = 'rt_carry') then

@@ -1698,12 +1698,15 @@ instructions (P106):
 | Word | Gives | amd64 | arm64 |
 |---|---|---|---|
 | `MulHi(a, b)`, `MulHiS(a, b)` | the high 64 bits of the 128-bit product, unsigned or signed | `mulq`/`imulq` (rdx) | `umulh`/`smulh` |
-| `Mul128(a, b, hi, lo)` | the whole unsigned product into two `Integer`s | the same and `imulq` | the same and `mul` |
+| `Mul128(a, b, hi, lo)` | the whole unsigned product into two `Integer`s | `mulq`, or `mulxq` with BMI2 | `mul` and `umulh` |
 | `DivMod128(hi, lo, d, q, r)` | `hi:lo` divided by `d`, unsigned, quotient and remainder | `divq` | 64 shifts and subtractions (it has no such division) |
 | `AddCarry(a, b, cin, cout)` | `a + b + cin`, the carry out in `cout` (0 or 1) | `adcq` | `adcs` |
 | `SubBorrow(a, b, bin, bout)` | `a - b - bin`, the borrow out in `bout` | `sbbq` | `sbcs` |
 | `AddOverflow(a, b, r)`, `SubOverflow`, `MulOverflow` | `r` gets the result in its type; `True` when it did not fit | `seto` | `cset vs`, `smulh` |
 | `AddSat(a, b)`, `SubSat(a, b)` | the sum or difference held at the ends of the operands' type | `cmov` | `csel` |
+
+`Mul128` evaluates the two inputs once, then writes `hi` followed by
+`lo`. Either output may name an input variable.
 
 A carry and a borrow are 0 or 1, and any other value in `cin` counts as
 1, so a chain of words adds numbers of any length:
