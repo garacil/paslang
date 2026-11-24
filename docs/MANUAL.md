@@ -7598,12 +7598,22 @@ never create it.
 `lock mu do stmt` takes the mutex, runs the statement and releases it on
 every way out: the end, `exit`, `break`, `continue` or a `raise`. A
 locked routine that must wait parks; the thread goes on running other
-routines. `rwmutex` lets any number of readers in together and one
-writer alone, and a waiting writer stops new readers. `waitgroup`
-counts routines: `Add` before starting them, `Done` in each, `Wait`
-parks until the count is zero. A `Done` that takes the count below
-zero stops the program with a `paslang:` message and exit status 1, or
-is an `ERangeError` where a `try` stands (§19); an `Unlock` of a mutex
+routines.
+
+An `rwmutex` admits concurrent readers or one writer. A writer takes
+the internal writer mutex, closes reader admission and waits for the
+admitted readers to finish. Readers that arrive while admission is
+closed park. On `Unlock` the writer reopens admission and wakes parked
+readers before releasing the writer mutex. Readers arriving before the
+next writer closes admission can also enter. The next writer may enter
+once the admitted readers have released their read locks. The scheduler
+decides when the awakened routines run.
+
+A `waitgroup` counts routines. Call `Add` before starting them and
+`Done` in each. `Wait` parks until the count is zero. A `Done` that takes
+the count below zero stops the program with a `paslang:` message and
+exit status 1, or is an `ERangeError` where a `try` stands (§19). An
+`Unlock` of a mutex
 nobody holds always stops it, as in Go. `cond.Wait(mu)` releases the mutex,
 parks until `Signal` wakes one waiter or `Broadcast` wakes all, and
 takes the mutex again before returning, so always test the condition in
