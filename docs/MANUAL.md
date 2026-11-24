@@ -8729,6 +8729,11 @@ that it is alive, and systemd restarts it when the pings stop.
 | `SdNotifyTo(address, state)` | the same to the socket `address` |
 | `SdWatchdogUsec` | the microseconds of `$WATCHDOG_USEC` when they are for this process (`$WATCHDOG_PID` unset or this process's number), else 0: unset, zero, not decimal digits, above `Int64`, or for another process |
 | `SdWatchdogOf(usec, havepid, pid, self)` | the same from the two texts and this process's number |
+| `SdJournalStderr` | whether the live standard error socket's device and inode match the decimal identity in `JOURNAL_STREAM` |
+
+For your own lines to that socket, `passystemd` provides the string
+prefixes `SD_EMERG`, `SD_ALERT`, `SD_CRIT`, `SD_ERR`, `SD_WARNING`,
+`SD_NOTICE`, `SD_INFO` and `SD_DEBUG` (`<0>` through `<7>`).
 
 A service that waits for work pings from the loop that does the work,
 at least every half of the time `SdWatchdogUsec` gives, so that a worker
@@ -15027,6 +15032,12 @@ and a year Free Pascal takes as a `Word` is an `Integer`, as §20 says of
 the dates too.
 
 ## 19. The runtime model
+
+When standard error matches the journal socket in `JOURNAL_STREAM`,
+fatal runtime diagnostics start with `<2>`. Uncaught exceptions and
+the default HTTP handler error log use `<3>`. The runtime checks the
+live descriptor so stderr redirected to a pipe, file or terminal
+keeps ordinary diagnostic text (§16).
 
 A running program is a set of routines, Gs, on OS threads, Ms. A P is
 the right to execute Pascal code, its run queue and allocation cache.

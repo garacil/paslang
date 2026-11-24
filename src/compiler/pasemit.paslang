@@ -1375,6 +1375,7 @@ type
     procedure EmitProc(const Pr: TProc);
     procedure EmitProcAt(const Pr: TProc);
     procedure LoadGlobals(const Prog: TProgram);
+    procedure EmitJournalRuntime;
     procedure EmitRuntime;
     procedure EmitRuntimeArm;
     procedure EmitXxh3X86;
@@ -44989,7 +44990,7 @@ begin
   Line('rt_glockbad:');
   Line('  leaq .Lglockbad(%rip), %rsi');
   Line('  movq $29, %rdx');
-  Line('  call rt_rawwrite');
+  Line('  call rt_writecrit');
   Line('  movq $111, %rdi');
   Line('  jmp rt_exit');
   Line('');
@@ -46154,7 +46155,7 @@ begin
   Line('  movq %rax, %rbx');
   Line('  leaq .Lclonefail(%rip), %rsi');
   Line('  movq $' + IntToStr(Length(MsgClone)) + ', %rdx');
-  Line('  call rt_rawwrite');
+  Line('  call rt_writecrit');
   Line('  movq %rbx, %rdi');
   Line('  movq $10, %rsi');
   Line('  call rt_fatalnum');
@@ -47922,7 +47923,7 @@ begin
   Line('  call rt_reportbegin');
   Line('  leaq .Luncaught(%rip), %rsi');
   Line('  movq $' + IntToStr(Length(MsgUncaught)) + ', %rdx');
-  Line('  call rt_rawwrite');
+  Line('  call rt_writeerr');
   Line('.uc_where:');
   Line('  leaq .Lraised(%rip), %rsi');
   Line('  movq $' + IntToStr(Length(MsgRaised)) + ', %rdx');
@@ -47948,9 +47949,12 @@ begin
   Line('  testl %r12d, %r12d');
   Line('  jz .uc_more');
   Line('  decl %r12d');
-  Line('  leaq .Lcalled(%rip), %rsi');
-  Line('  movq $' + IntToStr(Length(MsgCalled) + 1) + ', %rdx');
+  Line('  leaq .Lnl(%rip), %rsi');
+  Line('  movq $1, %rdx');
   Line('  call rt_rawwrite');
+  Line('  leaq .Lcalled(%rip), %rsi');
+  Line('  movq $' + IntToStr(Length(MsgCalled)) + ', %rdx');
+  Line('  call rt_writeerr');
   Line('  movq %r13, %rdi');
   Line('  call rt_fatalline');
   Line('.uc_up:');
@@ -47960,9 +47964,12 @@ begin
   Line('  movq %rax, %rbx');
   Line('  jmp .uc_call');
   Line('.uc_more:');
-  Line('  leaq .Lmore(%rip), %rsi');
-  Line('  movq $' + IntToStr(Length(MsgMore) + 1) + ', %rdx');
+  Line('  leaq .Lnl(%rip), %rsi');
+  Line('  movq $1, %rdx');
   Line('  call rt_rawwrite');
+  Line('  leaq .Lmore(%rip), %rsi');
+  Line('  movq $' + IntToStr(Length(MsgMore)) + ', %rdx');
+  Line('  call rt_writeerr');
   Line('  jmp rt_dieend');
   Line('.uc_exit:');
   Line('  movq $1, %rdi');
@@ -47988,7 +47995,7 @@ begin
   Line('  call rt_reportbegin');
   Line('  leaq .Luncaughtr(%rip), %rsi');
   Line('  movq $' + IntToStr(Length(MsgUncaughtR)) + ', %rdx');
-  Line('  call rt_rawwrite');
+  Line('  call rt_writeerr');
   Line('.uc_rwhere:');
   Line('  leaq .Lraised(%rip), %rsi');
   Line('  movq $' + IntToStr(Length(MsgRaised)) + ', %rdx');
@@ -48447,7 +48454,7 @@ begin
   Line('  movq %rsi, %r12');
   Line('  movq %rax, %rsi');
   Line('  movq %rcx, %rdx');
-  Line('  call rt_rawwrite');
+  Line('  call rt_writecrit');
   Line('.bf_tail:');
   Line('  movq %rbx, %rdi');
   Line('  call rt_fatalint');
@@ -49596,6 +49603,159 @@ begin
   Line('');
 end;
 
+{ systemd.exec(5) identifies the journal by the descriptor's device and
+  inode. Read the initial environment before any runtime errors can be
+  printed, but recheck descriptor 2 on each report in case it was replaced.
+  Linux's amd64 and asm-generic stat.h (also Go's syscall.Stat_t) put
+  device and inode first and put st_mode at 24 and 16 respectively.
+  Use raw calls as Go's runtime.writeErrData does so reporting needs
+  neither an allocator, a scheduler nor a runtime stream lock. }
+procedure TEmitter.EmitJournalRuntime;
+begin
+  Line('.globl rt_journalstderr');
+  Line('rt_journalstderr:');
+  if FArm then
+  begin
+    LeaS('rt_journalok', 'x9');
+    Line('  ldrb w9, [x9]');
+    Line('  cbz w9, .jstat_absent');
+    Line('  sub sp, sp, #128');
+    Line('  mov x0, #2');
+    Line('  mov x1, sp');
+    Line('  mov x8, #80');
+    Line('  svc #0');
+    Line('  cbnz x0, .jstat_no');
+    Line('  ldr w9, [sp, #16]');
+    Line('  and w9, w9, #0xf000');
+    Line('  cmp w9, #0xc000');
+    Line('  b.ne .jstat_no');
+    Line('  ldp x0, x1, [sp]');
+    LdS('rt_journaldev', 'x9');
+    Line('  cmp x0, x9');
+    Line('  b.ne .jstat_no');
+    LdS('rt_journalino', 'x9');
+    Line('  cmp x1, x9');
+    Line('  cset w0, eq');
+    Line('  add sp, sp, #128');
+    Line('  ret');
+    Line('.jstat_no:');
+    Line('  add sp, sp, #128');
+    Line('.jstat_absent:');
+    Line('  mov x0, xzr');
+    Line('  ret');
+  end
+  else
+  begin
+    Line('  cmpb $0, rt_journalok(%rip)');
+    Line('  je .jstat_absent');
+    Line('  subq $144, %rsp');
+    Line('  movl $2, %edi');
+    Line('  movq %rsp, %rsi');
+    Line('  movl $5, %eax');
+    Line('  syscall');
+    Line('  testq %rax, %rax');
+    Line('  jnz .jstat_no');
+    Line('  movl 24(%rsp), %eax');
+    Line('  andl $0xf000, %eax');
+    Line('  cmpl $0xc000, %eax');
+    Line('  jne .jstat_no');
+    Line('  movq (%rsp), %rax');
+    Line('  cmpq rt_journaldev(%rip), %rax');
+    Line('  jne .jstat_no');
+    Line('  movq 8(%rsp), %rax');
+    Line('  cmpq rt_journalino(%rip), %rax');
+    Line('  sete %al');
+    Line('  movzbl %al, %eax');
+    Line('  addq $144, %rsp');
+    Line('  ret');
+    Line('.jstat_no:');
+    Line('  addq $144, %rsp');
+    Line('.jstat_absent:');
+    Line('  xorl %eax, %eax');
+    Line('  ret');
+  end;
+  { These entries wrap rt_rawwrite for the fixed opening fragment of
+    a diagnostic. Include the three-byte prefix in that same write
+    and let the existing writer handle EINTR, short writes and EAGAIN. }
+  Line('rt_writecrit:');
+  if FArm then
+  begin
+    Line('  mov w0, #50');
+    Line('  b rt_writejournal');
+    Line('rt_writeerr:');
+    Line('  mov w0, #51');
+    Line('rt_writejournal:');
+    Line('  stp x0, x30, [sp, #-32]!');
+    Line('  stp x1, x2, [sp, #16]');
+    Line('  bl rt_journalstderr');
+    Line('  ldp x1, x2, [sp, #16]');
+    Line('  ldp x3, x30, [sp], #32');
+    Line('  cbz x0, rt_rawwrite');
+    Line('  add x9, x2, #18');
+    Line('  and x9, x9, #-16');
+    Line('  sub sp, sp, x9');
+    Line('  mov w8, #60');
+    Line('  strb w8, [sp]');
+    Line('  strb w3, [sp, #1]');
+    Line('  mov w8, #62');
+    Line('  strb w8, [sp, #2]');
+    Line('  add x3, sp, #3');
+    Line('  mov x0, xzr');
+    Line('.jwrite_copy:');
+    Line('  cmp x0, x2');
+    Line('  b.hs .jwrite_send');
+    Line('  ldrb w8, [x1, x0]');
+    Line('  strb w8, [x3, x0]');
+    Line('  add x0, x0, #1');
+    Line('  b .jwrite_copy');
+    Line('.jwrite_send:');
+    Line('  mov x1, sp');
+    Line('  add x2, x2, #3');
+    Line('  stp x9, x30, [sp, #-16]!');
+    Line('  bl rt_rawwrite');
+    Line('  ldp x9, x30, [sp], #16');
+    Line('  add sp, sp, x9');
+    Line('  ret');
+  end
+  else
+  begin
+    Line('  movl $50, %edi');
+    Line('  jmp rt_writejournal');
+    Line('rt_writeerr:');
+    Line('  movl $51, %edi');
+    Line('rt_writejournal:');
+    Line('  pushq %rdi');
+    Line('  pushq %rsi');
+    Line('  call rt_journalstderr');
+    Line('  popq %rsi');
+    Line('  popq %rdi');
+    Line('  testl %eax, %eax');
+    Line('  jz rt_rawwrite');
+    Line('  leaq 18(%rdx), %rcx');
+    Line('  andq $-16, %rcx');
+    Line('  subq %rcx, %rsp');
+    Line('  movb $60, (%rsp)');
+    Line('  movb %dil, 1(%rsp)');
+    Line('  movb $62, 2(%rsp)');
+    Line('  xorl %eax, %eax');
+    Line('.jwrite_copy:');
+    Line('  cmpq %rdx, %rax');
+    Line('  jae .jwrite_send');
+    Line('  movb (%rsi,%rax), %r11b');
+    Line('  movb %r11b, 3(%rsp,%rax)');
+    Line('  incq %rax');
+    Line('  jmp .jwrite_copy');
+    Line('.jwrite_send:');
+    Line('  movq %rsp, %rsi');
+    Line('  addq $3, %rdx');
+    Line('  pushq %rcx');
+    Line('  call rt_rawwrite');
+    Line('  popq %rcx');
+    Line('  addq %rcx, %rsp');
+    Line('  ret');
+  end;
+end;
+
 procedure TEmitter.EmitRuntime;
 begin
   Line('');
@@ -49638,7 +49798,7 @@ begin
   Line('  pushq %rax');
   Line('  leaq .Lguarderr(%rip), %rsi');
   Line('  movq $' + IntToStr(Length(MsgGuardErr)) + ', %rdx');
-  Line('  call rt_rawwrite');
+  Line('  call rt_writecrit');
   Line('  popq %rdi');
   Line('  negq %rdi');
   Line('  movq $10, %rsi');
@@ -49674,7 +49834,7 @@ begin
   Line('rt_gconstack:');
   Line('  leaq .Lgconstack(%rip), %rsi');
   Line('  movq $51, %rdx');
-  Line('  call rt_rawwrite');
+  Line('  call rt_writecrit');
   Line('  movq $2, %rdi');
   Line('  jmp rt_exit');
   Line('');
@@ -49912,7 +50072,7 @@ begin
   Line('  ret');
   Line('rt_diemsg:');
   Line('  pushq %rdi');
-  Line('  call rt_rawwrite');
+  Line('  call rt_writecrit');
   Line('  popq %rdi');
   Line('  call rt_fatalline');
   Line('rt_dieend:');
@@ -49924,7 +50084,7 @@ begin
   Line('rt_dieoomstk:');
   Line('  leaq .Loomstk(%rip), %rsi');
   Line('  movq $' + IntToStr(Length(MsgOomStack)) + ', %rdx');
-  Line('  call rt_rawwrite');
+  Line('  call rt_writecrit');
   Line('  movq rt_stacktot(%rip), %rdi');
   Line('  shrq $20, %rdi');
   Line('  movq $10, %rsi');
@@ -49936,7 +50096,7 @@ begin
   Line('rt_dieoom:');
   Line('  leaq .Loom(%rip), %rsi');
   Line('  movq $' + IntToStr(Length(MsgOom)) + ', %rdx');
-  Line('  call rt_rawwrite');
+  Line('  call rt_writecrit');
   Line('  movq rt_maptot(%rip), %rdi');
   Line('  shrq $20, %rdi');
   Line('  movq $10, %rsi');
@@ -50217,7 +50377,7 @@ begin
   Line('  movq %rdx, %r13');
   Line('  movq %rax, %rsi');
   Line('  movq %rcx, %rdx');
-  Line('  call rt_rawwrite');
+  Line('  call rt_writecrit');
   Line('  movq %rbx, %rdi');
   Line('  call rt_fatalint');
   Line('  leaq .Lbrange(%rip), %rsi');
@@ -50256,7 +50416,7 @@ begin
   Line('  movq %rdi, %rbx');
   Line('  leaq .Lchancap(%rip), %rsi');
   Line('  movq $' + IntToStr(Length(MsgChanCap)) + ', %rdx');
-  Line('  call rt_rawwrite');
+  Line('  call rt_writecrit');
   Line('  movq %rbx, %rdi');
   Line('  call rt_fatalint');
   Line('  leaq .Lchancap2(%rip), %rsi');
@@ -50548,7 +50708,7 @@ begin
   Line('  jae .sh_bad');
   Line('  leaq .Lstackovf(%rip), %rsi');
   Line('  movq $' + IntToStr(Length(MsgStack)) + ', %rdx');
-  Line('  call rt_rawwrite');
+  Line('  call rt_writecrit');
   Line('  leaq .Laddr(%rip), %rsi');
   Line('  movq $' + IntToStr(Length(MsgAddr)) + ', %rdx');
   Line('  call rt_rawwrite');
@@ -50567,7 +50727,7 @@ begin
   Line('.sh_bad:');
   Line('  leaq .Lbadaddr(%rip), %rsi');
   Line('  movq $' + IntToStr(Length(MsgBadAddr)) + ', %rdx');
-  Line('  call rt_rawwrite');
+  Line('  call rt_writecrit');
   Line('  movq %r12, %rdi');
   Line('  movq $16, %rsi');
   Line('  call rt_fatalnum');
@@ -50614,7 +50774,7 @@ begin
   Line('  leaq .Lsentfpe(%rip), %rsi');
   Line('  movq $' + IntToStr(Length(MsgSentFpe)) + ', %rdx');
   Line('.snt_say:');
-  Line('  call rt_rawwrite');
+  Line('  call rt_writecrit');
   Line('  cmpl $-1, %r13d');
   Line('  jge .snt_by');
   Line('  cmpl $-6, %r13d');
@@ -50721,7 +50881,7 @@ begin
   Line('rt_badstack:');
   Line('  leaq .Lbadstack(%rip), %rsi');
   Line('  movq $46, %rdx');
-  Line('  call rt_rawwrite');
+  Line('  call rt_writecrit');
   Line('  movq $2, %rdi');
   Line('  jmp rt_exit');
   Line('rt_asfail:');
@@ -50744,7 +50904,7 @@ begin
   Line('  jnz .bf_raise');
   Line('  movq %rax, %rsi');
   Line('  movq %rcx, %rdx');
-  Line('  call rt_rawwrite');
+  Line('  call rt_writecrit');
   Line('  movq $1, %rdi');
   Line('  jmp rt_exit');
   { A real out of Integer's range, NaN or an infinity given to Trunc,
@@ -51917,6 +52077,19 @@ begin
   Line('  .asciz "PASLANG_MAXPROCS="');
   Line('');
   Line('rt_boot:');
+  { Like PasCpuLimit below, use the initial G with a zero stack guard
+    for this fixed-storage Pascal parser before setting up the scheduler. }
+  Line('  movq rt_argc(%rip), %rax');
+  Line('  movq rt_argv(%rip), %rcx');
+  Line('  leaq 8(%rcx,%rax,8), %rdi');
+  Line('  leaq rt_journaldev(%rip), %rsi');
+  Line('  leaq rt_journalino(%rip), %rdx');
+  Line('  leaq rt_g(%rip), %r14');
+  Line('  subq $8, %rsp');
+  Line('  call p_f.7_pasheap18_pasjournalidentity');
+  Line('  addq $8, %rsp');
+  Line('  movb %al, rt_journalok(%rip)');
+  Line('  xorq %r14, %r14');
   Line('  call rt_vdsoinit');
   Line('  call rt_cpuinit');
   Line('  call rt_siginit');
@@ -56297,6 +56470,7 @@ begin
       EmitRuntimeArm
     else
       EmitRuntime;
+    EmitJournalRuntime;
     Line('.Ltextend:');
   end;
   Line('.Lcodeend:');
@@ -56562,9 +56736,9 @@ begin
     Line('.Lraised:');
     Line('  .ascii "' + MsgRaised + '"');
     Line('.Lcalled:');
-    Line('  .ascii "\n' + MsgCalled + '"');
+    Line('  .ascii "' + MsgCalled + '"');
     Line('.Lmore:');
-    Line('  .ascii "\n' + MsgMore + '"');
+    Line('  .ascii "' + MsgMore + '"');
     Line('.Lglockbad:');
     Line('  .ascii "paslang: unlock of free lock\n"');
     Line('.Lvdsocgt:');
@@ -57334,6 +57508,12 @@ begin
     Line('rt_argc:');
     Line('  .quad 0');
     Line('rt_argv:');
+    Line('  .quad 0');
+    Line('rt_journaldev:');
+    Line('  .quad 0');
+    Line('rt_journalino:');
+    Line('  .quad 0');
+    Line('rt_journalok:');
     Line('  .quad 0');
     Line('rt_vdsocgt:');
     Line('  .quad 0');
@@ -61140,7 +61320,7 @@ begin
   Line('  str x0, [sp, #-16]!');
   LeaS('.Lguarderr', 'x1');
   Imm('x2', Length(MsgGuardErr));
-  Line('  bl rt_rawwrite');
+  Line('  bl rt_writecrit');
   Line('  ldr x0, [sp], #16');
   Line('  neg x0, x0');
   Line('  mov x1, #10');
@@ -61175,7 +61355,7 @@ begin
   Line('rt_gconstack:');
   LeaS('.Lgconstack', 'x1');
   Line('  mov x2, #51');
-  Line('  bl rt_rawwrite');
+  Line('  bl rt_writecrit');
   Line('  mov x0, #2');
   Line('  b rt_exit');
   { P86 on arm64, the same shape as amd64: raw writes to standard error,
@@ -61378,7 +61558,7 @@ begin
   Line('  ret');
   Line('rt_diemsg:');
   Line('  mov x19, x0');
-  Line('  bl rt_rawwrite');
+  Line('  bl rt_writecrit');
   Line('  mov x0, x19');
   Line('  bl rt_fatalline');
   Line('rt_dieend:');
@@ -61390,7 +61570,7 @@ begin
   Line('rt_dieoomstk:');
   LeaS('.Loomstk', 'x1');
   Line('  mov x2, #' + IntToStr(Length(MsgOomStack)));
-  Line('  bl rt_rawwrite');
+  Line('  bl rt_writecrit');
   LdS('rt_stacktot', 'x0');
   Line('  lsr x0, x0, #20');
   Line('  mov x1, #10');
@@ -61407,7 +61587,7 @@ begin
     Line('  mov x19, x9');
     LeaS('.Lzva', 'x1');
     Line('  mov x2, #' + IntToStr(Length(ZvaMsg)));
-    Line('  bl rt_rawwrite');
+    Line('  bl rt_writecrit');
     Line('  mov x0, x19');
     Line('  mov x1, #10');
     Line('  bl rt_fatalnum');
@@ -61416,7 +61596,7 @@ begin
   Line('rt_dieoom:');
   LeaS('.Loom', 'x1');
   Line('  mov x2, #' + IntToStr(Length(MsgOom)));
-  Line('  bl rt_rawwrite');
+  Line('  bl rt_writecrit');
   LdS('rt_maptot', 'x0');
   Line('  lsr x0, x0, #20');
   Line('  mov x1, #10');
@@ -61663,7 +61843,7 @@ begin
   Line('  mov x21, x2');
   Line('  mov x1, x14');
   Line('  mov x2, x15');
-  Line('  bl rt_rawwrite');
+  Line('  bl rt_writecrit');
   Line('  mov x0, x19');
   Line('  bl rt_fatalint');
   LeaS('.Lbrange', 'x1');
@@ -61699,7 +61879,7 @@ begin
   Line('  mov x19, x0');
   LeaS('.Lchancap', 'x1');
   Line('  mov x2, #' + IntToStr(Length(MsgChanCap)));
-  Line('  bl rt_rawwrite');
+  Line('  bl rt_writecrit');
   Line('  mov x0, x19');
   Line('  bl rt_fatalint');
   LeaS('.Lchancap2', 'x1');
@@ -61919,7 +62099,7 @@ begin
   Line('.sh_stk:');
   LeaS('.Lstackovf', 'x1');
   Line('  mov x2, #' + IntToStr(Length(MsgStack)));
-  Line('  bl rt_rawwrite');
+  Line('  bl rt_writecrit');
   LeaS('.Laddr', 'x1');
   Line('  mov x2, #' + IntToStr(Length(MsgAddr)));
   Line('  bl rt_rawwrite');
@@ -61938,7 +62118,7 @@ begin
   Line('.sh_bad:');
   LeaS('.Lbadaddr', 'x1');
   Line('  mov x2, #' + IntToStr(Length(MsgBadAddr)));
-  Line('  bl rt_rawwrite');
+  Line('  bl rt_writecrit');
   Line('  mov x0, x20');
   Line('  mov x1, #16');
   Line('  bl rt_fatalnum');
@@ -61980,7 +62160,7 @@ begin
   LeaS('.Lsentfpe', 'x1');
   Line('  mov x2, #' + IntToStr(Length(MsgSentFpe)));
   Line('.snt_say:');
-  Line('  bl rt_rawwrite');
+  Line('  bl rt_writecrit');
   Line('  cmn w21, #1');
   Line('  b.ge .snt_by');
   Line('  cmn w21, #6');
@@ -62097,7 +62277,7 @@ begin
   Line('  cbnz x8, .abf_raise');
   Line('  mov x1, x14');
   Line('  mov x2, x15');
-  Line('  bl rt_rawwrite');
+  Line('  bl rt_writecrit');
   Line('  mov x0, #1');
   Line('  b rt_exit');
   Line('rt_realrange:');
@@ -64268,7 +64448,7 @@ begin
   Line('  neg x21, x0');
   LeaS('.Lclonefail', 'x1');
   Line('  mov x2, #' + IntToStr(Length(MsgClone)));
-  Line('  bl rt_rawwrite');
+  Line('  bl rt_writecrit');
   Line('  mov x0, x21');
   Line('  mov x1, #10');
   Line('  bl rt_fatalnum');
@@ -65351,7 +65531,7 @@ begin
   Line('  bl rt_reportbegin');
   LeaS('.Luncaught', 'x1');
   Line('  mov x2, #' + IntToStr(Length(MsgUncaught)));
-  Line('  bl rt_rawwrite');
+  Line('  bl rt_writeerr');
   { where it was raised, as on amd64 (P578) }
   Line('.uc_where:');
   LeaS('.Lraised', 'x1');
@@ -65380,9 +65560,12 @@ begin
   Line('  cbz x0, .uc_up');
   Line('  cbz x20, .uc_more');
   Line('  sub x20, x20, #1');
-  LeaS('.Lcalled', 'x1');
-  Line('  mov x2, #' + IntToStr(Length(MsgCalled) + 1));
+  LeaS('.Lnl', 'x1');
+  Line('  mov x2, #1');
   Line('  bl rt_rawwrite');
+  LeaS('.Lcalled', 'x1');
+  Line('  mov x2, #' + IntToStr(Length(MsgCalled)));
+  Line('  bl rt_writeerr');
   Line('  mov x0, x21');
   Line('  bl rt_fatalline');
   Line('.uc_up:');
@@ -65392,9 +65575,12 @@ begin
   Line('  mov x19, x9');
   Line('  b .uc_call');
   Line('.uc_more:');
-  LeaS('.Lmore', 'x1');
-  Line('  mov x2, #' + IntToStr(Length(MsgMore) + 1));
+  LeaS('.Lnl', 'x1');
+  Line('  mov x2, #1');
   Line('  bl rt_rawwrite');
+  LeaS('.Lmore', 'x1');
+  Line('  mov x2, #' + IntToStr(Length(MsgMore)));
+  Line('  bl rt_writeerr');
   Line('  b rt_dieend');
   Line('.uc_exit:');
   Line('  mov x0, #1');
@@ -65414,7 +65600,7 @@ begin
   Line('  bl rt_reportbegin');
   LeaS('.Luncaughtr', 'x1');
   Line('  mov x2, #' + IntToStr(Length(MsgUncaughtR)));
-  Line('  bl rt_rawwrite');
+  Line('  bl rt_writeerr');
   Line('.uc_rwhere:');
   LeaS('.Lraised', 'x1');
   Line('  mov x2, #' + IntToStr(Length(MsgRaised)));
@@ -65649,7 +65835,7 @@ begin
   Line('  mov x20, x1');
   Line('  mov x1, x14');
   Line('  mov x2, x15');
-  Line('  bl rt_rawwrite');
+  Line('  bl rt_writecrit');
   Line('.bf_tail:');
   Line('  mov x0, x19');
   Line('  bl rt_fatalint');
@@ -66484,6 +66670,17 @@ begin
   Line('  .asciz "PASLANG_MAXPROCS="');
   Line('  .p2align 2');
   Line('rt_boot:');
+  LdS('rt_argc', 'x9');
+  LdS('rt_argv', 'x0');
+  Line('  add x0, x0, x9, lsl #3');
+  Line('  add x0, x0, #8');
+  LeaS('rt_journaldev', 'x1');
+  LeaS('rt_journalino', 'x2');
+  LeaS('rt_g', 'x28');
+  Line('  bl p_f.7_pasheap18_pasjournalidentity');
+  LeaS('rt_journalok', 'x9');
+  Line('  strb w0, [x9]');
+  Line('  mov x28, xzr');
   Line('  bl rt_vdsoinit');
   Line('  bl rt_cpuinit');
   if CpuZvaBlock(FProgProc) = 64 then
