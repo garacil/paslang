@@ -713,8 +713,9 @@ function RemoveDir(const Directory: string): Boolean;
   changes nothing outside the tree: each step back up is checked to be
   the directory the walk came down from. A path that is not there is
   success. The walk keeps its place in memory, not on the stack, and
-  holds the descriptors of 64 levels at most whatever the depth: past
-  them it goes back up through '..', checked. An entry that
+  holds descriptors for up to 64 ancestor levels, releasing them sooner
+  if openat reports EMFILE. It goes back up through a checked '..' after
+  releasing an ancestor descriptor. An entry that
   cannot be removed gives the first error, with its path, after the
   rest was tried. DirectoryHandle is the base of a relative Path
   (CurrentDirectoryHandle for the current directory). }
@@ -6518,8 +6519,8 @@ end;
 
 type
   { a directory the walk went down into: its name in its parent, its
-    descriptor (-1 once let go, past RemoveHeld levels, with its inode
-    and device to check the way back up), the directories found in it
+    descriptor (-1 once released, with its inode and device to check
+    the way back up), the directories found in it
     that are still to be removed, the names that could not be, and
     whether its listing was read to the end }
   TRemoveFrame = record
@@ -6537,6 +6538,7 @@ const
   { the descriptors held down the tree: past this depth a parent's is
     let go, and the walk goes back up through '..', checked }
   RemoveHeld = 64;
+  RemoveEmfile = 24;
   { getdents64's d_type of a directory, and of an unknown kind }
   RemoveDtDir = 4;
   RemoveDtUnknown = 0;
@@ -6591,10 +6593,11 @@ end;
   after the other after the listing. Only a directory whose rmdir finds
   it not empty (an entry made meanwhile, or one a listing passed over
   as entries went, Go's issue 20841) is listed again. The descriptors
-  of the first RemoveHeld levels are held; past them a parent's is let
-  go with its inode and device noted, and the way back up opens '..' of
-  the directory just emptied and removes nothing until it is checked to
-  be that parent. So a directory swapped for a link while the walk runs
+  of the first RemoveHeld ancestor levels are held while the process
+  has room for new descriptors. On Linux open(2) EMFILE, release a held
+  ancestor and retry. A released ancestor keeps its inode and device.
+  The way back up opens '..' of the directory just emptied and checks
+  the identity before using it. So a directory swapped for a link while the walk runs
   changes nothing outside the tree, at any depth. }
 function RemoveTreeFrom(Parent: THandle; const Base, Shown: string; const UnlinkError: TSysError;
   out Error: TSysError): Boolean;
@@ -6607,7 +6610,40 @@ var
   name: string;
   e, first, ignored, ue: TSysError;
   info: TFileInfo;
-  done: Boolean;
+  done, fdPressure: Boolean;
+
+  function ReleaseAncestor(Level: Integer): Boolean;
+  var
+    entry: TFileInfo;
+    err: TSysError;
+  begin
+    Result := (frames[Level].Fd >= 0) and
+      TryHandleInfo(frames[Level].Fd, entry, err) and entry.Has(fiInode);
+    if Result then
+    begin
+      frames[Level].Inode := entry.Inode;
+      frames[Level].Major := entry.DeviceMajor;
+      frames[Level].Minor := entry.DeviceMinor;
+      TryFileClose(frames[Level].Fd, err);
+      frames[Level].Fd := -1;
+    end;
+  end;
+
+  function OpenWalkDir(Dir: THandle; const Name: string; Flags, LastAncestor: Integer;
+    out Fd: THandle; out Err: TSysError): Boolean;
+  begin
+    Result := TryOpenFileAt(Dir, Name, Flags, 0, Fd, Err);
+    { Neither the base descriptor nor the directory being opened from
+      can be released here. Keep the rest of this walk below the limit
+      once it has crossed it. }
+    while not Result and (Err.Code = RemoveEmfile) and (LastAncestor > 0) do
+    begin
+      fdPressure := True;
+      if ReleaseAncestor(LastAncestor) then
+        Result := TryOpenFileAt(Dir, Name, Flags, 0, Fd, Err);
+      Dec(LastAncestor);
+    end;
+  end;
 
   procedure Fail(const Name: string; const Err: TSysError);
   begin
@@ -6644,6 +6680,7 @@ begin
   frames[0].Fd := cur;
   depth := 0;
   again := 0;
+  fdPressure := False;
   while depth >= 0 do
   begin
     cur := frames[depth].Fd;
@@ -6740,7 +6777,7 @@ begin
         SystemError(ue, Ord(name[k + 1]), 'remove', '');
         SetLength(name, k - 1);
       end;
-      if not TryOpenFileAt(cur, name, ODirectory or RemoveNoFollow, 0, sub, e) then
+      if not OpenWalkDir(cur, name, ODirectory or RemoveNoFollow, depth - 1, sub, e) then
       begin
         if e.Code = 2 then
           Continue;
@@ -6758,24 +6795,14 @@ begin
         RemoveNote(frames[depth], name);
         Continue;
       end;
+      if (depth > 0) and (fdPressure or (depth >= RemoveHeld)) then
+        ReleaseAncestor(depth);
       Inc(depth);
       if depth > High(frames) then
         SetLength(frames, depth + 16);
       frames[depth] := Default(TRemoveFrame);
       frames[depth].Name := name;
       frames[depth].Fd := sub;
-      { deep enough: the parent's descriptor goes, its inode stays }
-      if (depth > RemoveHeld) and (frames[depth - 1].Fd >= 0) and (depth - 1 > 0) then
-      begin
-        if TryHandleInfo(frames[depth - 1].Fd, info, e) then
-        begin
-          frames[depth - 1].Inode := info.Inode;
-          frames[depth - 1].Major := info.DeviceMajor;
-          frames[depth - 1].Minor := info.DeviceMinor;
-          TryFileClose(frames[depth - 1].Fd, ignored);
-          frames[depth - 1].Fd := -1;
-        end;
-      end;
       Continue;
     end;
     { emptied: removed from its parent, which takes the walk again }
@@ -6801,7 +6828,8 @@ begin
     below := cur;
     if frames[depth - 1].Fd < 0 then
     begin
-      if not TryOpenFileAt(below, '..', ODirectory, 0, up, e) or not TryHandleInfo(up, info, e) or
+      if not OpenWalkDir(below, '..', ODirectory, depth - 2, up, e) or
+        not TryHandleInfo(up, info, e) or not info.Has(fiInode) or
         (info.Inode <> frames[depth - 1].Inode) or (info.DeviceMajor <> frames[depth - 1].Major) or
         (info.DeviceMinor <> frames[depth - 1].Minor) then
       begin
@@ -6824,7 +6852,7 @@ begin
     if not TryDeleteFileAt(up, frames[depth].Name, True, e) and (e.Code <> 2) then
     begin
       if (e.Code = 39) and (again < 8) and (first.Code = 0) and
-        TryOpenFileAt(up, frames[depth].Name, ODirectory or RemoveNoFollow, 0, cur, ignored) then
+        OpenWalkDir(up, frames[depth].Name, ODirectory or RemoveNoFollow, depth - 2, cur, ignored) then
       begin
         Inc(again);
         frames[depth].Fd := cur;

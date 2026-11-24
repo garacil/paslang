@@ -14546,13 +14546,13 @@ link removes the link itself. The tree is walked by descriptors
 `unlinkat`): a symbolic link is removed and never followed, and a
 directory swapped for a link while the walk runs changes nothing outside
 the tree: the walk acts through the descriptors of the directories it
-came down through, and past the 64 it holds each step back up is
-checked, by inode and device, to be the directory it came down from. A directory is listed once, its
-files unlinked by the kind its entry gives, as Rust's walk does; the
-walk keeps its place in memory and holds the descriptors of 64 levels
-at most, going back up past them through a checked `..`, so a tree
-deeper than the process's limit of descriptors goes too (Go's and
-Rust's walks hold one a level). An entry that cannot be removed gives the first
+came down through. When it releases a descriptor, the walk records
+the ancestor's inode and device and checks both on reopening `..`.
+A directory is listed once, with files unlinked by the kind its entry
+gives, as Rust's walk does. The walk keeps its place in memory and holds
+descriptors for up to 64 ancestor levels. If opening a directory reaches
+the process descriptor limit, it releases an ancestor and retries, as
+long as it has one to release. An entry that cannot be removed gives the first
 error with its path, after the rest was tried; `.` is refused, as
 `rmdir` refuses it. `testdata/rmall` removes trees with links out, a
 read-only directory, a depth of 10,000 and 20,000 entries, races a link
