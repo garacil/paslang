@@ -1434,6 +1434,8 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	: P616: the vectors of RSA signing worked out again from their keys, and faults written into the private operation; \
 	python3 -I scripts/rsasign_vectors.py --check; \
 	python3 -I scripts/check_rsa_faults.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64); \
+	python3 -I scripts/check_rsa_ct.py $(OUTDIR)/paslangc $(BUILDDIR); \
+	python3 -I scripts/check_dit_scope.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64); \
 	echo ok rsa-sign
 	@set -e; \
 	: P617: the tables of HPACK in pashttp2 are those kept from RFC 7541, and the unit at limits its own constants keep out of reach; \

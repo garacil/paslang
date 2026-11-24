@@ -105,6 +105,17 @@ after current Go's `atomic_arm64.s`; there is no runtime feature branch.
 The debugger gate decodes all five sites, and concurrency/GC gates run
 both CPU paths. AMD64 already uses locked `CMPXCHG`.
 
+
+On arm64, `rt_dit_enter`, `rt_dit_leave` and `rt_execute` use the DIT
+system register (Arm DDI 0487, B1.5.6 and MSR). The final program's
+`-cpu` selects these instructions through the `dit` feature. An ARMv8.0
+base program leaves the hardware setting alone. Each scope saves its
+current pasroutine's setting, and the scheduler reapplies that setting on
+resume, following Go's `runtime.execute`. `scripts/check_dit_scope.py`
+reads DIT inside the RSA operation and tests nesting, exceptions and
+migration. Its cost report times pairs of scope calls on the same QEMU
+CPU with `-cpu base` and `-cpu base+dit`.
+
 Words with no kernel yet (the Pascal body serves every processor):
 MD5 (no instruction exists), SHA-3 (arm64 FEAT_SHA3 could serve it),
 Adler-32, FNV-1a, MurmurHash3, SipHash, the B+ tree and the heap. `Pos` searches as Go's `strings.Index` does, `IndexByte` and `MemEq` above and Rabin-Karp when the first byte keeps matching in vain; Go's brute-force `IndexString` for needles under 64 bytes is not taken, the search stays linear without it.

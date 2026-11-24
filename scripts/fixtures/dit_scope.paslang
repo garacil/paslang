@@ -1,0 +1,141 @@
+{ Copyright (C) 2026 Germán Luis Aracil Boned. GPLv3 or later. See COPYING. }
+program ditscope;
+uses sysutils;
+
+const
+  Workers = 64;
+  Rounds = 24;
+  ScopePairs = 200000;
+{$ifdef CPU_DIT}
+  Expected = True;
+{$else}
+  Expected = False;
+{$endif}
+
+var
+  Gate: chan of Integer;
+  Joined: chan of Integer;
+  Migrations: Integer;
+
+function DitEnabled: Boolean;
+begin
+  Result := False;
+{$ifdef CPUAARCH64}
+  if CpuHas('dit') then
+  begin
+    asm arm64 (Result: out x0)
+      mrs x0, s3_3_c4_c2_5
+      ubfx x0, x0, #24, #1
+    end;
+  end;
+{$endif}
+end;
+
+procedure Need(State: Boolean; LabelText: string);
+begin
+  if DitEnabled <> State then
+    raise Exception.Create('wrong DIT state: ' + LabelText);
+end;
+
+function ThreadId: Integer;
+begin
+  if Amd64 = 0 then
+    Result := Syscall(178)
+  else
+    Result := Syscall(186);
+end;
+
+procedure Worker(Id: Integer);
+var
+  Old, Nested, Protect: Boolean;
+  I, Before: Integer;
+begin
+  Need(False, 'new G');
+  Protect := (Id and 1) = 0;
+  Old := False;
+  if Protect then
+    Old := PasDitEnter;
+  try
+    if Old then
+      Halt(5);
+    if Protect then
+    begin
+      Nested := PasDitEnter;
+      if Nested <> Expected then
+        Halt(6);
+      PasDitLeave(Nested);
+    end;
+    Need(Protect and Expected, 'before park');
+    if Recv(Gate) <> 1 then
+      Halt(7);
+    for I := 1 to Rounds do
+    begin
+      Before := ThreadId;
+      if (I and 1) = 0 then
+        Sleep(1)
+      else
+        Yield;
+      Need(Protect and Expected, 'after park');
+      if Protect and (ThreadId <> Before) then
+        AtomicAdd(@Migrations, 1);
+    end;
+  finally
+    if Protect then
+      PasDitLeave(Old);
+  end;
+  Need(False, 'after exit');
+  Send(Joined, 1);
+end;
+
+procedure ExceptionalScope;
+var
+  Old: Boolean;
+begin
+  Old := PasDitEnter;
+  try
+    Need(Expected, 'before exception');
+    raise Exception.Create('scope exception');
+  finally
+    PasDitLeave(Old);
+  end;
+end;
+
+var
+  I, T: Integer;
+  Old: Boolean;
+begin
+  if Expected and not CpuHas('dit') then
+    Halt(4);
+  if ParamStr(1) = 'cost' then
+  begin
+    T := Nanotime;
+    for I := 1 to ScopePairs do
+    begin
+      Old := PasDitEnter;
+      PasDitLeave(Old);
+    end;
+    WriteLn(Nanotime - T);
+    Exit;
+  end;
+  Need(False, 'main entry');
+  Gate := MakeChan(0);
+  Joined := MakeChan(0);
+  for I := 1 to Workers do
+    pas Worker(I);
+  for I := 1 to Workers do
+    Send(Gate, 1);
+  for I := 1 to Workers do
+    if Recv(Joined) <> 1 then
+      Halt(8);
+  Need(False, 'main resumes');
+  try
+    ExceptionalScope;
+    Halt(9);
+  except
+    on E: Exception do
+      if E.Message <> 'scope exception' then
+        Halt(10);
+  end;
+  Need(False, 'after exception');
+  WriteLn('ok DIT ', Expected, ' migrations ', Migrations);
+end.

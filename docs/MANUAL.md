@@ -12578,10 +12578,21 @@ different; eight routines sign with one key at once.
 private operation and finds no signature leaving, and with the last
 comparison taken out, a signature that factors the modulus; it also
 answers for the kernel's generator (an interrupted call, short reads,
-an error) and finds the salt whole or no signature at all. The
-compiler's code for the private operation was read on both machines for
-a branch or an index that depends on the key, and none was found; that
-reading is not yet repeated by `make check`.
+an error) and checks whether the signing operation obtained the full
+salt. `make check` follows the compiler's parsed private operation and
+its callees on amd64 and arm64. It checks branches, memory indices, loop
+bounds, division and shift counts. Negative controls insert a branch,
+index or bound derived from a limb. The final validity decisions for a
+faulted result or an integer that overflows its output bytes are
+observable through the operation's success or failure.
+
+On arm64, a program compiled for a processor with `dit` enables
+`PSTATE.DIT` for the private RSA operation, secret NIST and X25519 work,
+and the AEAD operations in `pascipher`. Each scope restores the
+enclosing scope's setting on return or exception. The scheduler applies
+the setting of the routine it resumes, including after it parks or
+moves to another thread. A new pasroutine begins outside the caller's
+scope. See Arm DDI 0487, B1.5.6 and the [kernel catalogue](KERNELS.md).
 
 `uses pasx509` reads and checks certificates as Go's `crypto/x509` does
 (1.1.293, P430), routine by routine:
