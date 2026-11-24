@@ -4583,7 +4583,17 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	if awk '/^pas_main:/,/cfi_endproc/' $(BUILDDIR)/methinl1.s | grep -qE 'call p_m[.]12_t_u[.]0_4_tbox(4_bump|3_add|5_twice)$$'; then echo "methinl.s: the main block calls Bump, Add or Twice"; exit 1; fi; \
 	test $$(awk '/^pas_main:/,/cfi_endproc/' $(BUILDDIR)/methinl1.s | grep -c 'call \*') -eq 4 || { echo "methinl.s: the main block does not make its four virtual calls"; exit 1; }; \
 	: the compiler, TypeOf put in place: IsStrTyp reads the Kind of the element of FTypes with no call; \
-	if awk '/^p_m[.]23_t_u[.]8_pasparse7_tparser8_isstrtyp:/,/cfi_endproc/' $(BUILDDIR)/stage/pasparse.s | grep -q 'call p_m[.]23_t_u[.]8_pasparse7_tparser6_typeof'; then echo "pasparse.s: IsStrTyp calls TypeOf"; exit 1; fi; \
+	isstrtyp=$$(awk '\
+	  NR == 1 && $$0 !~ /linux amd64 [*]\/$$/ { exit } \
+	  $$0 == "p_m.23_t_u.8_pasparse7_tparser8_isstrtyp:" { found = 1 } \
+	  found && /^[.]section/ { exit } \
+	  found && /^  [.]cfi_startproc$$/ { started = 1 } \
+	  started && /^  ret$$/ { returned = 1 } \
+	  found { print } \
+	  started && /^  [.]cfi_endproc$$/ { complete = returned; exit } \
+	  END { if (!complete) exit 1 }' "$(BUILDDIR)/stage/pasparse.s") || \
+	  { echo "pasparse.s: cannot read a complete IsStrTyp body" >&2; exit 1; }; \
+	case "$$isstrtyp" in *'call p_m.23_t_u.8_pasparse7_tparser6_typeof'*) echo "pasparse.s: IsStrTyp calls TypeOf"; exit 1;; esac; \
 	echo ok methinl-asm; \
 	: Result and the main block globals no routine names are operands a call put in place cannot change, so the call to their right goes in, and a global a routine writes or whose address is taken keeps its place, P371; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/aheadres1 testdata/aheadres.paslang; \
@@ -4607,7 +4617,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	  if grep -q 'set' $(BUILDDIR)/boundsidiom-$$f.s; then echo "boundsidiom.s: $$f makes a Boolean"; exit 1; fi; \
 	done; \
 	: the compiler, TypeOf put in place: its check in IsStrTyp makes no Boolean of its index against High, its own result the one setcc; \
-	if awk '/^p_m[.]23_t_u[.]8_pasparse7_tparser8_isstrtyp:/,/cfi_endproc/' $(BUILDDIR)/stage/pasparse.s | grep -q 'setg %al'; then echo "pasparse.s: the check in IsStrTyp makes a Boolean"; exit 1; fi; \
+	case "$$isstrtyp" in *'setg %al'*) echo "pasparse.s: the check in IsStrTyp makes a Boolean"; exit 1;; esac; \
 	echo ok boundsidiom-asm; \
 	: the hidden variables of bodies put in place share the frame slots their lives do not meet, a pointer slot with pointers only, P378; \
 	$(OUTDIR)/paslangc -o $(BUILDDIR)/hidshare1 testdata/hidshare.paslang; \
