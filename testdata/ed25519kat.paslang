@@ -1,0 +1,147 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+
+  paslang is free software: you can redistribute it and/or modify it
+  under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+
+  paslang is distributed in the hope that it will be useful, but
+  WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+  General Public License for more details.
+
+  Under Section 7 of GPL version 3, you are granted additional
+  permissions described in the paslang Runtime Library Exception,
+  version 1.0, in the file COPYING.RUNTIME.
+
+  You should have received a copy of the GNU General Public License
+  along with paslang.  If not, see <https://www.gnu.org/licenses/>. }
+
+{ RFC 8032 7.1 and Wycheproof, including strict encodings and lengths.
+  The first use of both base tables is from concurrent pasroutines. }
+program ed25519kat;
+
+uses paslib, sysutils, pased25519;
+
+var
+  firstSeed, firstKey, firstMessage, firstSignature: string;
+  start: chan of Boolean;
+  workers: waitgroup;
+  failures: Integer;
+
+function UnHex(const Encoded: string): string;
+var
+  i: Integer;
+begin
+  SetLength(Result, Length(Encoded) div 2);
+  for i := 1 to Length(Result) do
+    Result[i] := Chr(StrToInt('$' + Copy(Encoded, 2 * i - 1, 2)));
+end;
+
+procedure Require(Good: Boolean; const LabelText: string);
+begin
+  if Good then Exit;
+  WriteLn('Ed25519 check failed: ', LabelText);
+  Halt(1);
+end;
+
+function Load(const Path: string): json;
+var
+  text: string;
+begin
+  Require(ReadFile(Path, text), Path);
+  Result := JsonParse(text);
+end;
+
+procedure FirstUse;
+var ready: Boolean;
+begin
+  ready := Recv(start);
+  if not (ready and Ed25519Verify(firstKey, firstMessage, firstSignature) and
+          (Ed25519PublicKey(firstSeed) = firstKey) and
+          (Ed25519Sign(firstSeed, firstMessage) = firstSignature)) then
+    AtomicAdd(@failures, 1);
+  workers.Done;
+end;
+
+var
+  doc, vector, group: json;
+  seed, key, message, signature, name, changed: string;
+  i, rfcCount, wycheCount: Integer;
+
+begin
+  doc := Load('testdata/ed25519/rfc8032-7.1.json');
+  vector := doc['vectors'][0];
+  firstSeed := UnHex(vector['seed'].AsString);
+  firstKey := UnHex(vector['pk'].AsString);
+  firstMessage := UnHex(vector['message'].AsString);
+  firstSignature := UnHex(vector['sig'].AsString);
+  start := MakeChan(1);
+  workers.Add(12);
+  for i := 1 to 12 do
+    pas FirstUse;
+  for i := 1 to 12 do
+    Send(start, True);
+  workers.Wait;
+  Require(failures = 0, 'concurrent first use');
+
+  rfcCount := 0;
+  for vector in doc['vectors'] do
+  begin
+    name := vector['name'].AsString;
+    seed := UnHex(vector['seed'].AsString);
+    key := UnHex(vector['pk'].AsString);
+    message := UnHex(vector['message'].AsString);
+    signature := UnHex(vector['sig'].AsString);
+    Require(Ed25519PublicKey(seed) = key, 'public key ' + name);
+    Require(Ed25519Sign(seed, message) = signature, 'signature ' + name);
+    Require(Ed25519Verify(key, message, signature), 'RFC 8032 ' + name);
+    Require(not Ed25519Verify(key, message + #0, signature), 'altered message ' + name);
+    changed := Copy(signature, 1, 32) + UnHex('edd3f55c1a631258d69cf7a2def9de1400000000000000000000000000000010');
+    Require(not Ed25519Verify(key, message, changed), 'S = L ' + name);
+    Inc(rfcCount);
+  end;
+  Require(rfcCount = 5, 'RFC 8032 vector count');
+
+  doc := Load('testdata/wycheproof/ed25519_test.json');
+  wycheCount := 0;
+  for group in doc['testGroups'] do
+  begin
+    key := UnHex(group['publicKey']['pk'].AsString);
+    for vector in group['tests'] do
+    begin
+      message := UnHex(vector['msg'].AsString);
+      signature := UnHex(vector['sig'].AsString);
+      name := IntToStr(vector['tcId'].AsInteger);
+      Require(Ed25519Verify(key, message, signature) = (vector['result'].AsString = 'valid'), 'Wycheproof ' + name);
+      Inc(wycheCount);
+    end;
+  end;
+  Require(wycheCount = 150, 'Wycheproof vector count');
+
+  { The first value satisfies the group equation but has R of order one.
+    The mixed-order key is B + (0, -1). With R = B and S = 1 + k, the
+    uncofactored equation holds only when the reduced challenge is even. }
+  signature := UnHex('0100000000000000000000000000000000000000000000000000000000000000') +
+    UnHex('cb31e99a3154231387852f4fd83481101ef00930f414baa54fbdbfcd96306e09');
+  Require(not Ed25519Verify(firstKey, 'identity R', signature), 'small-order R');
+  changed := #1 + StringOfChar(#0, 31);
+  Require(not Ed25519Verify(changed, '', changed + StringOfChar(#0, 32)), 'small-order key');
+  key := UnHex('9599999999999999999999999999999999999999999999999999999999999999');
+  signature := UnHex('5866666666666666666666666666666666666666666666666666666666666666') +
+    UnHex('97c5bf139241222e5ba43bc19f5722f453dd58a0c66b76a0d851a6f69802b20c');
+  Require(Ed25519Verify(key, 'even challenge 0', signature), 'even mixed-order challenge');
+  signature := UnHex('5866666666666666666666666666666666666666666666666666666666666666') +
+    UnHex('bc7d1eb206762920c1a86858407bae1f83af798c0dadc30c745653c0fe173701');
+  Require(not Ed25519Verify(key, 'odd challenge 4', signature), 'odd mixed-order challenge');
+
+  Require(Ed25519PublicKey('bad seed') = '', 'bad seed for public key');
+  Require(Ed25519Sign('bad seed', '') = '', 'bad seed for signing');
+  Require(not Ed25519Verify(firstKey, '', ''), 'wrong signature length');
+  Require(not Ed25519Verify('', '', firstSignature), 'wrong public key length');
+  Ed25519Keygen(seed, key);
+  Require((Length(seed) = 32) and (Length(key) = 32), 'generated key lengths');
+  Require(Ed25519Verify(key, 'generated', Ed25519Sign(seed, 'generated')), 'generated key');
+  WriteLn('Ed25519 RFC 8032: ', rfcCount, ', Wycheproof: ', wycheCount);
+end.

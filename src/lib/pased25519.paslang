@@ -1,0 +1,588 @@
+{ This file is part of paslang.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+
+  paslang is free software: you can redistribute it and/or modify it
+  under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+
+  paslang is distributed in the hope that it will be useful, but
+  WITHOUT ANY WARRANTY;
+  without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+  General Public License for more details.
+
+  Under Section 7 of GPL version 3, you are granted additional
+  permissions described in the paslang Runtime Library Exception,
+  version 1.0, in the file COPYING.RUNTIME.
+
+  You should have received a copy of the GNU General Public License
+  along with paslang.  If not, see <https://www.gnu.org/licenses/>. }
+
+{ Ed25519 from the RFC 8032 formulas and the node's strict verifier.
+  The double-scalar path follows Go's edwards25519/scalarmult.go.
+  Go-derived portions: Copyright (c) 2016, 2017, 2019 The Go Authors.
+  All rights reserved. See LICENSE-GO for the BSD terms. }
+unit pased25519;
+
+interface
+
+const
+  Ed25519SeedSize = 32;
+  Ed25519PublicKeySize = 32;
+  Ed25519SignatureSize = 64;
+{ Binary strings. Private input is the RFC 8032 32-byte seed, never seed||public.
+  Bad lengths return empty output / False. Pure Ed25519 only, no ctx/ph. }
+function Ed25519PublicKey(const Seed: string): string;
+function Ed25519Sign(const Seed, Message: string): string;
+{ Verification of public inputs uses variable-time double-scalar
+  multiplication and RFC 8032 5.1.7's uncofactored equation. It requires
+  S < L and canonical A and R and rejects small-order A and R. }
+function Ed25519Verify(const PublicKey, Message, Signature: string): Boolean;
+procedure Ed25519Keygen(out Seed, PublicKey: string);
+
+implementation
+
+uses sysutils, pasfield25519;
+
+type
+  TPoint = record X, Y, Z, T: TFe; end;
+  TCachedPoint = record Plus, Minus, TwiceZ, TwiceDT: TFe; end;
+  TNaf = array[0..255] of Int8;
+  TScalar = array[0..31] of Integer;
+  TWide = array[0..63] of Integer;
+
+const
+  CurveD: TFe = (929955233495203, 466365720129213, 1662059464998953, 2033849074728123, 1442794654840575);
+  SqrtM1: TFe = (1718705420411056, 234908883556509, 2233514472574048, 2117202627021982, 765476049583133);
+  ScalarOrder: TScalar = (237, 211, 245, 92, 26, 99, 18, 88, 214, 156, 247, 162, 222, 249, 222, 20,
+                         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 16);
+var
+  basePoint: TPoint;
+  baseOnce: once;
+  verifyBase: array[0..63] of TCachedPoint;
+  verifyOnce: once;
+
+procedure FeNeg(var V: TFe; const A: TFe);
+var
+  zero: TFe;
+begin
+  FeZero(zero);
+  FeSub(V, zero, A);
+end;
+
+procedure FePow22523(var V: TFe; const X: TFe);
+var
+  t0, t1, t2: TFe;
+begin
+  FeSquare(t0, X);
+  FeMul(t1, X, t0);
+  FeSquare(t0, t1);
+  FeSquare(t0, t0);
+  FeMul(t0, t1, t0);
+  FeSquare(t0, t0);
+  FeMul(t0, X, t0);
+  FeSquareN(t1, t0, 5);
+  FeMul(t1, t1, t0);
+  FeSquareN(t2, t1, 5);
+  FeMul(t0, t2, t0);
+  FeSquareN(t2, t0, 15);
+  FeMul(t2, t2, t0);
+  FeSquareN(t0, t2, 30);
+  FeMul(t0, t0, t2);
+  FeSquareN(t2, t0, 60);
+  FeMul(t2, t2, t0);
+  FeSquareN(t0, t2, 120);
+  FeMul(t0, t0, t2);
+  FeSquareN(t0, t0, 10);
+  FeMul(t0, t0, t1);
+  FeSquareN(t0, t0, 2);
+  FeMul(V, t0, X);
+end;
+
+procedure PointIdentity(var P: TPoint);
+begin
+  FeZero(P.X);
+  FeOne(P.Y);
+  FeOne(P.Z);
+  FeZero(P.T);
+end;
+
+procedure PointAdd(var V: TPoint; const P, Q: TPoint);
+var
+  a, b, c, d, e, f, g, h, t, u: TFe;
+begin
+  FeSub(t, P.Y, P.X);
+  FeSub(u, Q.Y, Q.X);
+  FeMul(a, t, u);
+  FeAdd(t, P.Y, P.X);
+  FeAdd(u, Q.Y, Q.X);
+  FeMul(b, t, u);
+  FeMul(t, P.T, Q.T);
+  FeMul(c, t, CurveD);
+  FeAdd(c, c, c);
+  FeMul(d, P.Z, Q.Z);
+  FeAdd(d, d, d);
+  FeSub(e, b, a);
+  FeSub(f, d, c);
+  FeAdd(g, d, c);
+  FeAdd(h, b, a);
+  FeMul(V.X, e, f);
+  FeMul(V.Y, g, h);
+  FeMul(V.T, e, h);
+  FeMul(V.Z, f, g);
+end;
+
+procedure PointDouble(var V: TPoint; const P: TPoint);
+var
+  a, b, c, e, f, g, h, t: TFe;
+begin
+  FeSquare(a, P.X);
+  FeSquare(b, P.Y);
+  FeSquare(c, P.Z);
+  FeAdd(c, c, c);
+  FeAdd(h, a, b);
+  FeAdd(t, P.X, P.Y);
+  FeSquare(t, t);
+  FeSub(e, h, t);
+  FeSub(g, a, b);
+  FeAdd(f, c, g);
+  FeMul(V.X, e, f);
+  FeMul(V.Y, g, h);
+  FeMul(V.T, e, h);
+  FeMul(V.Z, f, g);
+end;
+
+procedure PointSelect(var V: TPoint; const P: TPoint; Bit: Integer);
+var
+  i, mask: Integer;
+begin
+  mask := 0 - Bit;
+  for i := 0 to 4 do
+  begin
+    V.X[i] := V.X[i] xor (mask and (V.X[i] xor P.X[i]));
+    V.Y[i] := V.Y[i] xor (mask and (V.Y[i] xor P.Y[i]));
+    V.Z[i] := V.Z[i] xor (mask and (V.Z[i] xor P.Z[i]));
+    V.T[i] := V.T[i] xor (mask and (V.T[i] xor P.T[i]));
+  end;
+end;
+
+function PointBytes(const P: TPoint): string;
+var
+  inv, x, y: TFe;
+  xb: string;
+begin
+  FeInvert(inv, P.Z);
+  FeMul(x, P.X, inv);
+  FeMul(y, P.Y, inv);
+  Result := FeBytes(y);
+  xb := FeBytes(x);
+  Result[32] := Chr(Ord(Result[32]) or ((Ord(xb[1]) and 1) shl 7));
+end;
+
+function PointDecode(const Encoded: string; out P: TPoint): Boolean;
+var
+  y2, u, v, v2, v3, v7, x, check, negative, one: TFe;
+  ys, xs: string;
+  sign: Integer;
+begin
+  Result := False;
+  if Length(Encoded) <> 32 then
+    Exit;
+  ys := Encoded;
+  sign := Ord(ys[32]) shr 7;
+  ys[32] := Chr(Ord(ys[32]) and 127);
+  FeSetBytes(P.Y, @ys[1]);
+  if FeBytes(P.Y) <> ys then Exit;
+  { RFC 8032 5.1.3: y < p. }
+  FeOne(one);
+  FeSquare(y2, P.Y);
+  FeSub(u, y2, one);
+  FeMul(v, y2, CurveD);
+  FeAdd(v, v, one);
+  FeSquare(v2, v);
+  FeMul(v3, v2, v);
+  FeMul(v3, u, v3);
+  FeSquare(v7, v2);
+  FeMul(v7, v3, v7);
+  FePow22523(x, v7);
+  FeMul(x, v3, x);
+  FeSquare(check, x);
+  FeMul(check, v, check);
+  if FeBytes(check) <> FeBytes(u) then
+  begin
+    FeNeg(negative, u);
+    if FeBytes(check) <> FeBytes(negative) then
+      Exit;
+    FeMul(x, x, SqrtM1);
+  end;
+  xs := FeBytes(x);
+  if (xs = StringOfChar(#0, 32)) and (sign = 1) then
+    Exit;
+  if (Ord(xs[1]) and 1) <> sign then
+    FeNeg(x, x);
+  P.X := x;
+  FeOne(P.Z);
+  FeMul(P.T, P.X, P.Y);
+  Result := True;
+end;
+
+procedure EnsureBase;
+var
+  encoded: string;
+begin
+  once baseOnce do
+  begin
+    encoded := #88 + StringOfChar(#102, 31);
+    if not PointDecode(encoded, basePoint) then
+      raise Exception.Create('Ed25519 base point');
+  end;
+end;
+
+procedure PointMultiply(var V: TPoint; const P: TPoint; const S: TScalar);
+var
+  table: array[0..15] of TPoint;
+  selected: TPoint;
+  i, j, k, nibble: Integer;
+begin
+  PointIdentity(table[0]);
+  table[1] := P;
+  for i := 2 to 15 do
+    PointAdd(table[i], table[i-1], P);
+  PointIdentity(V);
+  for i := 63 downto 0 do
+  begin
+    for k := 1 to 4 do
+      PointDouble(V, V);
+    nibble := (S[i shr 1] shr ((i and 1) * 4)) and 15;
+    PointIdentity(selected);
+    { Scan every entry; never index by the secret digit. ((x-1)>>63)=1 iff x=0, 0<=x<16. }
+    for j := 0 to 15 do
+      PointSelect(selected, table[j], ((j xor nibble)-1) shr 63);
+    PointAdd(V, V, selected);
+  end;
+end;
+{ The odd multiples for Straus verification. As in Go's
+  edwards25519/scalarmult.go, cache the additions by public digits. }
+procedure CacheOddMultiples(Table: array of TCachedPoint; const P: TPoint);
+var
+  doublePoint, current: TPoint;
+  i: Integer;
+begin
+  PointDouble(doublePoint, P);
+  current := P;
+  for i := 0 to High(Table) do
+  begin
+    FeAdd(Table[i].Plus, current.Y, current.X);
+    FeSub(Table[i].Minus, current.Y, current.X);
+    FeAdd(Table[i].TwiceZ, current.Z, current.Z);
+    FeMul(Table[i].TwiceDT, current.T, CurveD);
+    FeAdd(Table[i].TwiceDT, Table[i].TwiceDT, Table[i].TwiceDT);
+    if i < High(Table) then
+      PointAdd(current, current, doublePoint);
+  end;
+end;
+
+procedure PointAddDigit(var V: TPoint; const P: TPoint;
+                        const Table: array of TCachedPoint;
+                        Digit: Integer);
+var
+  a, b, c, d, e, f, g, h, minus, plus: TFe;
+  i: Integer;
+begin
+  i := (Abs(Digit) - 1) shr 1;
+  FeSub(minus, P.Y, P.X);
+  FeAdd(plus, P.Y, P.X);
+  FeMul(c, P.T, Table[i].TwiceDT);
+  if Digit < 0 then
+  begin
+    FeMul(a, minus, Table[i].Plus);
+    FeMul(b, plus, Table[i].Minus);
+    FeNeg(c, c);
+  end
+  else
+  begin
+    FeMul(a, minus, Table[i].Minus);
+    FeMul(b, plus, Table[i].Plus);
+  end;
+  FeMul(d, P.Z, Table[i].TwiceZ);
+  FeSub(e, b, a);
+  FeSub(f, d, c);
+  FeAdd(g, d, c);
+  FeAdd(h, b, a);
+  FeMul(V.X, e, f);
+  FeMul(V.Y, g, h);
+  FeMul(V.T, e, h);
+  FeMul(V.Z, f, g);
+end;
+
+{ Go's edwards25519/scalar.go nonAdjacentForm, with byte windows.
+  Fixed-width signed digits are sparse. Both scalars here are public. }
+procedure PublicNaf(const Scalar: TScalar; Width: Integer; out Digits: TNaf);
+var
+  bitIndex, octet, window, limit, digitCarry: Integer;
+begin
+  FillChar(Digits, SizeOf(Digits), 0);
+  bitIndex := 0;
+  digitCarry := 0;
+  limit := 1 shl Width;
+  while bitIndex < 256 do
+  begin
+    octet := bitIndex shr 3;
+    window := Scalar[octet];
+    if octet < 31 then
+      window := window or (Scalar[octet + 1] shl 8);
+    window := ((window shr (bitIndex and 7)) and (limit - 1)) + digitCarry;
+    if (window and 1) = 0 then
+      Inc(bitIndex)
+    else
+    begin
+      digitCarry := 0;
+      if window >= limit div 2 then
+      begin
+        window := window - limit;
+        digitCarry := 1;
+      end;
+      Digits[bitIndex] := Int8(window);
+      Inc(bitIndex, Width);
+    end;
+  end;
+end;
+
+{ [S]B - [K]A, a single doubling for each bit of either public scalar.
+  The higher width for B amortizes its table across calls. Signing
+  continues to use PointMultiply with its fixed sequence and scans. }
+procedure VerifyMultiply(var V: TPoint; const A: TPoint; const S, K: TScalar);
+var
+  table: array[0..7] of TCachedPoint;
+  aDigits, bDigits: TNaf;
+  bitIndex: Integer;
+begin
+  once verifyOnce do
+  begin
+    EnsureBase;
+    CacheOddMultiples(verifyBase, basePoint);
+  end;
+  CacheOddMultiples(table, A);
+  PublicNaf(K, 5, aDigits);
+  PublicNaf(S, 8, bDigits);
+  PointIdentity(V);
+  bitIndex := High(bDigits);
+  while (bitIndex >= 0) and (aDigits[bitIndex] = 0) and (bDigits[bitIndex] = 0) do
+    Dec(bitIndex);
+  while bitIndex >= 0 do
+  begin
+    PointDouble(V, V);
+    if aDigits[bitIndex] <> 0 then
+      PointAddDigit(V, V, table, -Integer(aDigits[bitIndex]));
+    if bDigits[bitIndex] <> 0 then
+      PointAddDigit(V, V, verifyBase, bDigits[bitIndex]);
+    Dec(bitIndex);
+  end;
+end;
+
+function PointSmallOrder(const P: TPoint): Boolean;
+var
+  q: TPoint;
+  yMinusZ: TFe;
+  i, difference: Integer;
+begin
+  q := P;
+  for i := 1 to 3 do
+    PointDouble(q, q);
+  { In projective coordinates the identity is X = 0 and Y = Z. }
+  FeSub(yMinusZ, q.Y, q.Z);
+  FeReduce(q.X);
+  FeReduce(yMinusZ);
+  difference := 0;
+  for i := 0 to 4 do
+    difference := difference or q.X[i] or yMinusZ[i];
+  Result := difference = 0;
+end;
+
+procedure ScalarReduce(const Wide: TWide; out S: TScalar);
+var
+  diff: TScalar;
+  bitpos, i, bitCarry, v, borrow, mask: Integer;
+begin
+  FillChar(S, SizeOf(S), 0);
+  for bitpos := 511 downto 0 do
+  begin
+    bitCarry := (Wide[bitpos shr 3] shr (bitpos and 7)) and 1;
+    for i := 0 to 31 do
+    begin
+      v := S[i] * 2 + bitCarry;
+      S[i] := v and 255;
+      bitCarry := v shr 8;
+    end;
+    borrow := 0;
+    for i := 0 to 31 do
+    begin
+      v := S[i]-ScalarOrder[i]-borrow;
+      diff[i] := v and 255;
+      borrow := (v shr 63) and 1;
+    end;
+    mask := 0-(1-borrow);
+    for i := 0 to 31 do
+      S[i] := S[i] xor (mask and (S[i] xor diff[i]));
+  end;
+  FillChar(diff, SizeOf(diff), 0);
+end;
+
+procedure ScalarFromBytes(const Text: string; out S: TScalar);
+var
+  wide: TWide;
+  i: Integer;
+begin
+  FillChar(wide, SizeOf(wide), 0);
+  for i := 1 to Length(Text) do
+    wide[i-1] := Ord(Text[i]);
+  ScalarReduce(wide, S);
+  FillChar(wide, SizeOf(wide), 0);
+end;
+
+function ScalarBytes(const S: TScalar): string;
+var
+  i: Integer;
+begin
+  SetLength(Result, 32);
+  for i := 0 to 31 do
+    Result[i + 1] := Chr(S[i]);
+end;
+
+procedure ScalarMultiplyAdd(const A, B, C: TScalar; out S: TScalar);
+var
+  wide: TWide;
+  i, j: Integer;
+begin
+  FillChar(wide, SizeOf(wide), 0);
+  for i := 0 to 31 do
+    wide[i] := C[i];
+  for i := 0 to 31 do
+    for j := 0 to 31 do
+      wide[i + j] := wide[i + j] + A[i] * B[j];
+  for i := 0 to 62 do
+  begin
+    wide[i + 1] := wide[i + 1] + (wide[i] shr 8);
+    wide[i] := wide[i] and 255;
+  end;
+  ScalarReduce(wide, S);
+  FillChar(wide, SizeOf(wide), 0);
+end;
+
+function SeedScalar(const Seed: string; out S: TScalar): string;
+var
+  h, clamped: string;
+begin
+  h := Sha512(Seed);
+  clamped := Copy(h, 1, 32);
+  clamped[1] := Chr(Ord(clamped[1]) and 248);
+  clamped[32] := Chr((Ord(clamped[32]) and 63) or 64);
+  ScalarFromBytes(clamped, S);
+  Result := Copy(h, 33, 32);
+end;
+
+function Ed25519PublicKey(const Seed: string): string;
+var
+  s: TScalar;
+  p: TPoint;
+  prefix: string;
+{$ifdef CPUAARCH64}
+  ditPrevious: Boolean;
+{$endif}
+begin
+{$ifdef CPUAARCH64}
+  ditPrevious := PasDitEnter;
+  try
+{$endif}
+  Result := '';
+  if Length(Seed) <> Ed25519SeedSize then Exit;
+  EnsureBase;
+  prefix := SeedScalar(Seed, s);
+  PointMultiply(p, basePoint, s);
+  Result := PointBytes(p);
+  FillChar(s, SizeOf(s), 0);
+{$ifdef CPUAARCH64}
+  finally
+    PasDitLeave(ditPrevious);
+  end;
+{$endif}
+end;
+
+function Ed25519Sign(const Seed, Message: string): string;
+var
+  s, r, k, sum: TScalar;
+  a, p: TPoint;
+  prefix, pk, encoded: string;
+{$ifdef CPUAARCH64}
+  ditPrevious: Boolean;
+{$endif}
+begin
+{$ifdef CPUAARCH64}
+  ditPrevious := PasDitEnter;
+  try
+{$endif}
+  Result := '';
+  if Length(Seed) <> Ed25519SeedSize then Exit;
+  EnsureBase;
+  prefix := SeedScalar(Seed, s);
+  PointMultiply(a, basePoint, s);
+  pk := PointBytes(a);
+  ScalarFromBytes(Sha512(prefix+Message), r);
+  PointMultiply(p, basePoint, r);
+  encoded := PointBytes(p);
+  ScalarFromBytes(Sha512(encoded+pk+Message), k);
+  ScalarMultiplyAdd(k, s, r, sum);
+  Result := encoded+ScalarBytes(sum);
+  FillChar(s, SizeOf(s), 0);
+  FillChar(r, SizeOf(r), 0);
+  FillChar(k, SizeOf(k), 0);
+  FillChar(sum, SizeOf(sum), 0);
+{$ifdef CPUAARCH64}
+  finally
+    PasDitLeave(ditPrevious);
+  end;
+{$endif}
+end;
+
+function Ed25519Verify(const PublicKey, Message, Signature: string): Boolean;
+var
+  a, r, product: TPoint;
+  s, k: TScalar;
+  encodedR: string;
+  i: Integer;
+begin
+  Result := False;
+  if (Length(PublicKey) <> Ed25519PublicKeySize) or (Length(Signature) <> Ed25519SignatureSize) then
+    Exit;
+  for i := 0 to 31 do
+    s[i] := Ord(Signature[33 + i]);
+  { Compare the public scalar with L from its most significant octet. }
+  i := 31;
+  while s[i] = ScalarOrder[i] do
+  begin
+    if i = 0 then
+      Exit;
+    Dec(i);
+  end;
+  if s[i] > ScalarOrder[i] then
+    Exit;
+  encodedR := Copy(Signature, 1, 32);
+  if not PointDecode(PublicKey, a) then
+    Exit;
+  if not PointDecode(encodedR, r) then
+    Exit;
+  if PointSmallOrder(a) or PointSmallOrder(r) then
+    Exit;
+  ScalarFromBytes(Sha512(encodedR + PublicKey + Message), k);
+  VerifyMultiply(product, a, s, k);
+  { RFC 8032 5.1.7's permitted uncofactored equation. }
+  Result := PointBytes(product) = encodedR;
+end;
+
+procedure Ed25519Keygen(out Seed, PublicKey: string);
+begin
+  Seed := StringOf(RandomBytes(Ed25519SeedSize));
+  PublicKey := Ed25519PublicKey(Seed);
+end;
+end.

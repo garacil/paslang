@@ -12461,13 +12461,29 @@ sealed := GcmSeal(g, nonce, 'text', ad);   { 4 bytes, then the 16 of the tag }
 if GcmOpen(g, nonce, sealed, ad, plain) then ...
 ```
 
-Three units hold the public-key side of TLS, in pure paslang (1.1.292,
-P429), each following Go's code routine by routine:
+The public-key units are written in pure paslang, following Go's
+cryptographic implementations:
 - `uses pasx25519` is X25519 (RFC 7748, Go's `crypto/ecdh` and the
   field of `edwards25519`): `X25519(scalar, u)` is the function itself,
   `X25519PublicKey(priv)` the scalar times the base point, and
   `X25519Shared(priv, peer, out shared)` the shared secret, `False` for a
   low-order peer whose result is all zeros, as Go refuses it.
+- `uses pased25519` provides pure Ed25519 (RFC 8032). `Ed25519PublicKey(seed)`
+  derives the 32-byte public key and `Ed25519Sign(seed, message)` returns
+  the deterministic 64-byte signature. The seed is a 32-byte binary
+  string. An invalid seed length returns an empty result. `Ed25519Keygen`
+  obtains a new seed from the kernel CSPRNG and raises on entropy failure.
+  Supply distinct variables for its two outputs. Signing uses a fixed
+  sequence of point operations and scans each table entry for secret digits.
+  `Ed25519Verify(key, message, signature)` uses public width-5 and width-8
+  signed digits together in one doubling loop and initializes the reusable
+  base table once. It requires `S < L`, canonical encodings of both `A`
+  and `R`, and rejects points of small order. It uses the uncofactored
+  equation `[S]B - [k]A = R` with `k = SHA512(R || A || message) mod L`,
+  matching the strict verifier profile. A mixed-order point can pass when
+  this equation holds. `testdata/ed25519kat` checks the
+  RFC vectors, the Wycheproof vectors, and simultaneous first use.
+
 - `uses pasnist` is P-256 and P-384 (`NistP256`, `NistP384`; Go's
   `nistec`, its fiat-crypto field code translated by
   `scripts/fiat2pas.py`): `NistPublicKey(curve, priv)` the uncompressed
