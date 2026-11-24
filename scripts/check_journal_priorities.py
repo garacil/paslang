@@ -78,13 +78,13 @@ def env_with(descriptor, variant):
     return env
 
 
-def invoke(command, destination, variant='match'):
+def invoke(command, destination, variant='match', *, cwd=None):
     if destination == 'socket':
         receiver, writer = socket.socketpair()
         with receiver, writer:
             env = env_with(writer.fileno(), variant)
             result = subprocess.run(command, env=env, stdout=subprocess.PIPE,
-                                    stderr=writer, timeout=90)
+                                    stderr=writer, cwd=cwd, timeout=90)
             writer.close()
             stderr = b''.join(iter(lambda: receiver.recv(4096), b''))
     else:
@@ -92,18 +92,18 @@ def invoke(command, destination, variant='match'):
         with os.fdopen(read_fd, 'rb') as reader, os.fdopen(write_fd, 'wb') as writer:
             env = env_with(writer.fileno(), variant)
             result = subprocess.run(command, env=env, stdout=subprocess.PIPE,
-                                    stderr=writer, timeout=90)
+                                    stderr=writer, cwd=cwd, timeout=90)
             writer.close()
             stderr = reader.read()
     return result.returncode, result.stdout, stderr
 
 
-def check_report(command, status, priority, marker):
-    baseline_status, _, terminal_style = invoke(command, 'pipe')
+def check_report(command, status, priority, marker, *, cwd):
+    baseline_status, _, terminal_style = invoke(command, 'pipe', cwd=cwd)
     assert baseline_status == status and marker in terminal_style, (command, terminal_style)
-    plain = invoke(command, 'socket', 'wrong-inode')
+    plain = invoke(command, 'socket', 'wrong-inode', cwd=cwd)
     assert plain[0] == status and plain[2] == terminal_style, (command, plain)
-    active = invoke(command, 'socket')
+    active = invoke(command, 'socket', cwd=cwd)
     expected = b''.join(priority + line for line in terminal_style.splitlines(keepends=True))
     assert active[0] == status and active[2] == expected, (command, expected, active)
 
@@ -142,8 +142,10 @@ def check_target(compiler, sdk, runner, work, target, link_variant):
         ('object', [], 1, b'<3>', b'first\nsecond'),
         ('http', [], 0, b'<3>', b'httpserver: GET /fail: Exception'),
     ]
+    # httpsrv names its Unix socket from ParamStr(0). A relative name
+    # keeps the socket within sun_path in a deeply nested build.
     for name, args, status, priority, marker in calls:
-        check_report([*runner, work / name, *args], status, priority, marker)
+        check_report([*runner, f'./{name}', *args], status, priority, marker, cwd=work)
     hello = work / 'hello'
     guard = work / 'guard'
     assembly = hello.with_suffix('.s').read_text()
@@ -152,7 +154,7 @@ def check_target(compiler, sdk, runner, work, target, link_variant):
     misalign = '  leaq 1(%rdi), %rdi\n' if target == 'amd64' else '  add x0, x0, #1\n'
     link_variant(hello, guard, '' if target == 'amd64' else 'aarch64-linux-gnu-',
                  assembly.replace(marker, marker + misalign))
-    check_report([*runner, guard], 2, b'<2>', b'madvise(MADV_GUARD_INSTALL)')
+    check_report([*runner, './guard'], 2, b'<2>', b'madvise(MADV_GUARD_INSTALL)', cwd=work)
     print(f'ok journal priorities {target}, socket identity and exact fallback output')
 
 
