@@ -14523,8 +14523,10 @@ and supports paths longer than one kernel pathname argument.
 `RemoveAll(path)` and `TryRemoveAllAt(base, path, out error)` remove a
 path and everything under it (1.3.21, P631), as Go's `os.RemoveAll` and
 Rust's `remove_dir_all`: a file or a link is unlinked, a directory
-emptied and removed, and a path that is not there is success. The tree
-is walked by descriptors (`openat` with `O_DIRECTORY` and `O_NOFOLLOW`,
+emptied and removed, and a path that is not there is success. Trailing
+slashes leave the final entry unchanged, so a path ending in a symbolic
+link removes the link itself. The tree is walked by descriptors
+(`openat` with `O_DIRECTORY` and `O_NOFOLLOW`,
 `unlinkat`): a symbolic link is removed and never followed, and a
 directory swapped for a link while the walk runs changes nothing outside
 the tree: the walk acts through the descriptors of the directories it
