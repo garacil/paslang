@@ -1739,6 +1739,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	mkdir -p $(BUILDDIR)/cipherk; \
 	$(OUTDIR)/paslangc -c -Fu $(BUILDDIR) -o $(BUILDDIR)/cipherk/pascipher src/lib/pascipher.paslang; \
 	grep -q 'aesenc %xmm1, %xmm0' $(BUILDDIR)/cipherk/pascipher.s; \
+	grep -qF 'aesenc %xmm0, %xmm8' $(BUILDDIR)/cipherk/pascipher.s; \
 	grep -q 'pclmulqdq' $(BUILDDIR)/cipherk/pascipher.s; \
 	if grep -q 'aesenc %xmm\|pclmulqdq' $(BUILDDIR)/pascipher.s; then echo "pascipher's base build carries AES-NI"; exit 1; fi; \
 	for t in cipherkat cipherwyche; do \
@@ -6964,6 +6965,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	fi; \
 	: pascipher at the arm64 level seals through aese and pmull, its base build through neither, P428; \
 	grep -q 'aese v0.16b, v1.16b' '$(A64DIR)/$(LVL_A64)/pascipher.s'; \
+	grep -qF 'aese v7.16b, v16.16b' '$(A64DIR)/$(LVL_A64)/pascipher.s'; \
 	grep -q 'pmull2 v6.1q' '$(A64DIR)/$(LVL_A64)/pascipher.s'; \
 	if grep -q 'aese v0\|pmull' $(A64DIR)/pascipher.s; then echo "pascipher's arm64 base build carries the crypto extension"; exit 1; fi; \
 	echo ok cpu-base-arm; \
