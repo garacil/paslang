@@ -19,7 +19,7 @@ import (
 
 // Check certificate authentication, the handshake and the HTTP exchange
 // with an independent TLS stack over TCP.
-func checkServer(addr, root string, version uint16) error {
+func checkServer(addr, root string, version uint16, resume bool) error {
 	pem, err := os.ReadFile(root)
 	if err != nil {
 		return err
@@ -30,6 +30,16 @@ func checkServer(addr, root string, version uint16) error {
 	}
 	cfg := &tls.Config{RootCAs: roots, ServerName: "localhost", NextProtos: []string{"http/1.1"},
 		MinVersion: version, MaxVersion: version}
+	if resume {
+		cfg.ClientSessionCache = tls.NewLRUClientSessionCache(1)
+		if err := checkConnection(addr, cfg, false); err != nil {
+			return err
+		}
+	}
+	return checkConnection(addr, cfg, resume)
+}
+
+func checkConnection(addr string, cfg *tls.Config, resumed bool) error {
 	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 5 * time.Second}, "tcp", addr, cfg)
 	if err != nil {
 		return err
@@ -39,8 +49,8 @@ func checkServer(addr, root string, version uint16) error {
 		return err
 	}
 	state := conn.ConnectionState()
-	if state.Version != version || state.NegotiatedProtocol != "http/1.1" {
-		return fmt.Errorf("unexpected TLS version or ALPN")
+	if state.Version != cfg.MaxVersion || state.NegotiatedProtocol != "http/1.1" || state.DidResume != resumed {
+		return fmt.Errorf("unexpected TLS version, ALPN or resumption")
 	}
 	if _, err := io.WriteString(conn, "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"); err != nil {
 		return err

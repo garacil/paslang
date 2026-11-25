@@ -12809,9 +12809,15 @@ its fields fixed while serving. For another TCP protocol, use
 `TlsServer(raw, config, deadline, out err)`. It owns `raw` on both
 success and failure. A standalone server can set `config.Alpn` in
 preference order and read `RequestedServerName` and `Protocol` from
-the resulting stream. The configuration serves one identity and each
-connection performs a full handshake. Early application data is discarded.
+the resulting stream. The configuration serves one identity.
 TLS 1.3 rotates its traffic keys before reaching the record limit.
+
+Set `config.SessionTickets := True` to enable TLS 1.3 resumption. Each
+connection can issue one single-use ticket after verifying the client's
+Finished. The config holds up to 1024 tickets, each valid for up to an
+hour. Resumption uses a fresh ephemeral key exchange and matches SNI,
+ALPN and the cipher suite's KDF hash. Early application data is discarded.
+[RFC 9846](https://www.rfc-editor.org/rfc/rfc9846.html#section-4.7.1)
 
 Set `config.MinVersion := TlsVersion12` before serving to also accept
 TLS 1.2. The default requires TLS 1.3. A client that offers both gets

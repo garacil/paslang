@@ -70,6 +70,7 @@ func main() {
 	dir := flag.String("dir", ".", "where ca.pem goes")
 	client := flag.String("client", "", "connect to a TLS server at this address")
 	clientVersion := flag.String("client-version", "1.3", "TLS version for the client")
+	clientResume := flag.Bool("client-resume", false, "verify a second, resumed connection")
 	root := flag.String("root", "", "PEM root trusted by the client")
 	flag.Parse()
 	if *client != "" {
@@ -83,7 +84,7 @@ func main() {
 			fmt.Fprintln(os.Stderr, "invalid -client-version")
 			os.Exit(1)
 		}
-		if err := checkServer(*client, *root, version); err != nil {
+		if err := checkServer(*client, *root, version, *clientResume); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}

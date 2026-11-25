@@ -72,6 +72,11 @@ type
     NowUnix: Integer;
   end;
 
+  TTlsServerTicket = record
+    Id, Psk, Name, Protocol: string;
+    Hash, ExpiresAt: Integer;
+  end;
+
   { Load a PEM identity once and keep it alive while it is used by Accept. }
   TTlsServerConfig = class(TNetAcceptor)
   private
@@ -80,11 +85,17 @@ type
     FRsa: TRsaPrivateKey;
     FEcSecret: string;
     FEd: TEd25519SigningKey;
+    FTicketMu: mutex;
+    FTicketSlots: array of TTlsServerTicket;
+    FTicketIndex: map[string] of Integer;
+    FNextTicket: Integer;
   public
     { Set before accepting. A protocol requested by the transport overrides this list. }
     Alpn: TStringArray;
     { 0 or TlsVersion13 requires TLS 1.3. TlsVersion12 also allows TLS 1.2. }
     MinVersion: Integer;
+    { Set before accepting to enable single-use TLS 1.3 session tickets. }
+    SessionTickets: Boolean;
     function LoadKeyPair(const CertPem, KeyPem: string; out Err: string): Boolean;
     function Accept(Raw: TNetStream; Deadline: Integer; const Protocol: string;
       out Err: string): TNetStream; override;
@@ -281,6 +292,9 @@ const
   { how many records of application data go in one write }
   RecordsAWrite = 4;
   MaxUselessRecords = 16;
+  Tls13TicketSlots = 1024;
+  Tls13TicketLifetime = 3600;
+  MaxTicketIdentities = 5;
 
 { ---- bytes in and out ---- }
 
@@ -297,6 +311,11 @@ end;
 function U24(V: Integer): string;
 begin
   Result := Chr((V shr 16) and $FF) + Chr((V shr 8) and $FF) + Chr(V and $FF);
+end;
+
+function U32(V: Integer): string;
+begin
+  Result := U8(V shr 24) + U24(V);
 end;
 
 function Vec8(const S: string): string;
@@ -1562,8 +1581,14 @@ const
   ServerGroups: array[0..2] of Integer = (GroupX25519, GroupP256, GroupP384);
 
 type
+  TOfferedPsk = record
+    Identity, Binder: string;
+  end;
+
   TClientHello = record
-    Legacy: Integer;
+    Legacy, BinderBytes: Integer;
+    PskDhe: Boolean;
+    Psks: array of TOfferedPsk;
     Prefix, Random, Session, Suites, Compression, Versions, Groups, Schemes, Alpn, Name: string;
     Extensions, Shares: TExtMap;
   end;
@@ -1650,16 +1675,40 @@ begin
   Result := 0;
 end;
 
+{ RFC 9846 §4.3.11.2 keeps the original length fields in the binder
+  transcript. Remember how many bytes to remove from the wire message. }
+function ParseOfferedPsks(const Data: string; var H: TClientHello): Integer;
+var
+  r, identities, binders: TRd;
+  psk: TOfferedPsk;
+begin
+  RdInit(r, Data);
+  RdInit(identities, RdVec16(r));
+  H.BinderBytes := RdLeft(r);
+  RdInit(binders, RdVec16(r));
+  if not (r.Ok and RdEmpty(r)) or RdEmpty(identities) or RdEmpty(binders) then Exit(AlertDecodeError);
+  while not RdEmpty(identities) and not RdEmpty(binders) do
+  begin
+    psk.Identity := RdVec16(identities);
+    RdBytes(identities, 4);
+    psk.Binder := RdVec8(binders);
+    if not (identities.Ok and binders.Ok) or (psk.Identity = '') or (Length(psk.Binder) < 32) then
+      Exit(AlertDecodeError);
+    H.Psks := Append(H.Psks, psk);
+  end;
+  if not RdEmpty(identities) or not RdEmpty(binders) then Exit(AlertIllegalParameter);
+  Result := 0;
+end;
+
 function ValidateHello13(var H: TClientHello): Integer;
 var
   r: TRd;
-  i, groupAt, group: Integer;
-  data, protocol: string;
+  i, groupAt, group, alert: Integer;
+  data, modes: string;
 begin
   Result := AlertDecodeError;
   if (H.Legacy <> TlsVersion12) or (H.Compression <> #0) then Exit(AlertIllegalParameter);
-  if (H.Schemes = '') or (H.Groups = '') or
-    not ExtGet(H.Extensions, ExtKeyShare, data) then Exit(AlertMissingExtension);
+  if (H.Groups = '') or not ExtGet(H.Extensions, ExtKeyShare, data) then Exit(AlertMissingExtension);
   RdInit(r, data);
   data := RdVec16(r);
   if not (r.Ok and RdEmpty(r)) or not ParseExts(data, H.Shares) then Exit;
@@ -1677,14 +1726,21 @@ begin
     end;
     if group <> H.Shares.Ids[i] then Exit(AlertIllegalParameter);
   end;
+  if ExtGet(H.Extensions, ExtPskModes, data) then
+  begin
+    RdInit(r, data);
+    modes := RdVec8(r);
+    if not (r.Ok and RdEmpty(r)) or (modes = '') then Exit;
+    H.PskDhe := Pos(#1, modes) > 0;
+  end;
   if ExtGet(H.Extensions, ExtPreSharedKey, data) then
   begin
     if H.Extensions.Ids[High(H.Extensions.Ids)] <> ExtPreSharedKey then Exit(AlertIllegalParameter);
-    if not ExtGet(H.Extensions, ExtPskModes, data) then Exit(AlertMissingExtension);
-    RdInit(r, data);
-    protocol := RdVec8(r);
-    if not (r.Ok and RdEmpty(r)) or (protocol = '') then Exit;
-  end;
+    if modes = '' then Exit(AlertMissingExtension);
+    alert := ParseOfferedPsks(data, H);
+    if alert <> 0 then Exit(alert);
+  end
+  else if H.Schemes = '' then Exit(AlertMissingExtension);
   if ExtGet(H.Extensions, ExtEarlyData, data) then
   begin
     if data <> '' then Exit;
@@ -1714,6 +1770,14 @@ var i, j: Integer; value: string;
 begin
   Result := False;
   if (Before.Prefix <> After.Prefix) or ExtGet(After.Extensions, ExtEarlyData, value) then Exit;
+  { RFC 9846 §4.2.2 permits removing PSK identities on retry. }
+  j := 0;
+  for i := 0 to High(After.Psks) do
+  begin
+    while (j < Length(Before.Psks)) and (Before.Psks[j].Identity <> After.Psks[i].Identity) do Inc(j);
+    if j = Length(Before.Psks) then Exit;
+    Inc(j);
+  end;
   i := 0;
   j := 0;
   while NextStableExtension(Before.Extensions, i) do
@@ -1832,10 +1896,11 @@ begin
 end;
 
 function ServerHello13(const Random, Session: string; Suite: Integer;
-  const Share: string): string;
+  const Share: string; PskIndex: Integer): string;
 var ext: string;
 begin
   ext := U16(ExtSupportedVersions) + Vec16(U16(TlsVersion13)) + U16(ExtKeyShare) + Vec16(Share);
+  if PskIndex >= 0 then ext := ext + U16(ExtPreSharedKey) + Vec16(U16(PskIndex));
   Result := U8(HsServerHello) + Vec24(U16($0303) + Random + Vec8(Session) + U16(Suite) + #0 + Vec16(ext));
 end;
 
@@ -2011,13 +2076,112 @@ begin
   Result := True;
 end;
 
+{ An opaque, single-use lookup key as in rustls server/tls13.rs.
+  The cache belongs to one loaded identity. The lock protects both the slots
+  and the index, and old entries are evicted in insertion order. }
+function RememberTicket(Config: TTlsServerConfig; const Ticket: TTlsServerTicket): Boolean;
+var i: Integer; previous: string;
+begin
+  lock Config.FTicketMu do
+  begin
+    if Length(Config.FTicketSlots) = 0 then
+    begin
+      SetLength(Config.FTicketSlots, Tls13TicketSlots);
+      New(Config.FTicketIndex);
+    end;
+    if Ticket.Id in Config.FTicketIndex then Exit(False);
+    i := Config.FNextTicket;
+    previous := Config.FTicketSlots[i].Id;
+    if previous <> '' then Delete(Config.FTicketIndex, previous);
+    Config.FTicketSlots[i] := Ticket;
+    Config.FTicketIndex[Ticket.Id] := i;
+    Config.FNextTicket := (i + 1) mod Tls13TicketSlots;
+  end;
+  Result := True;
+end;
+
+function FindTicket(Config: TTlsServerConfig; const Id, Name, Protocol: string; Hash: Integer;
+  out Psk: string): Boolean;
+var i: Integer; ticket: TTlsServerTicket;
+begin
+  Result := False;
+  Psk := '';
+  lock Config.FTicketMu do
+  begin
+    if not TryGet(Config.FTicketIndex, Id, i) then Exit;
+    ticket := Config.FTicketSlots[i];
+    if (ticket.Hash <> Hash) or (ticket.Name <> Name) or (ticket.Protocol <> Protocol) or
+      (ticket.ExpiresAt <= Nanotime) then Exit;
+    Psk := ticket.Psk;
+  end;
+  Result := True;
+end;
+
+function ConsumeTicket(Config: TTlsServerConfig; const Id, Psk: string): Boolean;
+var i: Integer;
+begin
+  Result := False;
+  lock Config.FTicketMu do
+  begin
+    if not TryGet(Config.FTicketIndex, Id, i) then Exit;
+    if (Config.FTicketSlots[i].ExpiresAt <= Nanotime) or
+      not CtEqualStr(Config.FTicketSlots[i].Psk, Psk) then Exit;
+    Delete(Config.FTicketIndex, Id);
+    Config.FTicketSlots[i] := Default(TTlsServerTicket);
+  end;
+  Result := True;
+end;
+
+function CheckPsk13(Config: TTlsServerConfig; const Hello: TClientHello; Hash: Integer;
+  const Protocol, BeforeHello, HelloRaw: string; out Selected: Integer; out EarlySecret: string): Integer;
+var
+  i, size: Integer;
+  psk, binderKey, finishedKey, truncated, expected: string;
+begin
+  Selected := -1;
+  size := CipherHashSize(Hash);
+  if Config.SessionTickets and Hello.PskDhe then
+    for i := 0 to Min(High(Hello.Psks), MaxTicketIdentities - 1) do
+      if FindTicket(Config, Hello.Psks[i].Identity, Hello.Name, Protocol, Hash, psk) then
+      begin
+        EarlySecret := HkdfExtract(Hash, '', psk);
+        binderKey := DeriveSecret(Hash, EarlySecret, 'res binder', '');
+        finishedKey := ExpandLabel(Hash, binderKey, 'finished', '', size);
+        truncated := Copy(HelloRaw, 1, Length(HelloRaw) - Hello.BinderBytes);
+        expected := CipherHmac(Hash, finishedKey, HashOf(Hash, BeforeHello + truncated));
+        if not CtEqualStr(expected, Hello.Psks[i].Binder) then Exit(AlertDecryptError);
+        if not ConsumeTicket(Config, Hello.Psks[i].Identity, psk) then Break;
+        Selected := i;
+        Exit(0);
+      end;
+  EarlySecret := HkdfExtract(Hash, '', ZeroString(size));
+  Result := 0;
+end;
+
+function SendTicket13(Stream: TTlsStream; Config: TTlsServerConfig; Hash: Integer;
+  const MainSecret, Transcript: string; Deadline: Integer): Boolean;
+var ticket: TTlsServerTicket; message, resumption: string;
+begin
+  resumption := DeriveSecret(Hash, MainSecret, 'res master', Transcript);
+  ticket.Id := RandomString(32);
+  { Go sends one ticket per connection and uses an empty per-connection nonce. }
+  ticket.Psk := ExpandLabel(Hash, resumption, 'resumption', '', CipherHashSize(Hash));
+  ticket.Hash := Hash;
+  ticket.Name := Stream.FServerName;
+  ticket.Protocol := Stream.FAlpn;
+  ticket.ExpiresAt := Nanotime + Tls13TicketLifetime * 1000000000;
+  if not RememberTicket(Config, ticket) then Exit(True);
+  message := U32(Tls13TicketLifetime) + RandomString(4) + Vec8('') + Vec16(ticket.Id) + Vec16('');
+  Result := Stream.WriteHandshake(U8(HsNewSessionTicket) + Vec24(message), Deadline);
+end;
+
 { TLS 1.3, RFC 9846 §§4 and 7 and Go's handshake_server_tls13.go. }
 function TTlsStream.HandshakeServer(Config: TTlsServerConfig; const RequiredProtocol: string;
   Deadline: Integer): Boolean;
 var
   hello, retryHello: TClientHello;
   r: TRd;
-  typ, alert, suite, group, i, scheme, hash, keyLen, aead: Integer;
+  typ, alert, suite, group, i, scheme, hash, keyLen, aead, pskIndex: Integer;
   body, raw, transcript, pref, peer, share, priv, shared, extensions, flight: string;
   earlySecret, hsSecret, master, clientHs, serverHs, clientAp, serverAp, finKey, verify, sig: string;
   dummyCcs: Boolean;
@@ -2057,7 +2221,7 @@ begin
   end;
   FVers := TlsVersion13;
   { Ignore offered early data, using the bounded skip and trial decryption
-    in RFC 9846 §4.3.10. This server has no tickets of its own. }
+    in RFC 9846 §4.3.10. All tickets are for 1-RTT resumption. }
   if ExtGet(hello.Extensions, ExtEarlyData, pref) then FEarlyDiscardLeft := 16384;
   RdInit(r, Suites13);
   while not RdEmpty(r) and (FSuite = 0) do
@@ -2065,10 +2229,9 @@ begin
     suite := Rd16(r);
     if ContainsWord(hello.Suites, suite) then FSuite := suite;
   end;
-  scheme := ChooseServerSignature(Config, hello.Schemes, True);
-  if (FSuite = 0) or (scheme = 0) then
+  if FSuite = 0 then
   begin
-    Fail(AlertHandshakeFailure, 'tls: no shared cipher suite or signature scheme', Deadline);
+    Fail(AlertHandshakeFailure, 'tls: no shared cipher suite', Deadline);
     Exit;
   end;
   SuiteParams(FSuite, aead, keyLen, hash);
@@ -2085,7 +2248,7 @@ begin
       group := ServerGroups[i];
       Break;
     end;
-  transcript := raw;
+  transcript := '';
   dummyCcs := hello.Session <> '';
   if group = 0 then
   begin
@@ -2100,9 +2263,9 @@ begin
       Fail(AlertHandshakeFailure, 'tls: no shared key exchange group', Deadline);
       Exit;
     end;
-    flight := ServerHello13(UnHex(HrrRandomHex), hello.Session, FSuite, U16(group));
+    flight := ServerHello13(UnHex(HrrRandomHex), hello.Session, FSuite, U16(group), -1);
     if not WriteHandshake(flight, Deadline) then Exit;
-    transcript := U8(HsMessageHash) + Vec24(HashOf(hash, transcript)) + flight;
+    transcript := U8(HsMessageHash) + Vec24(HashOf(hash, raw)) + flight;
     if dummyCcs and not WriteRecord(RecCcs, #1, Deadline) then Exit;
     dummyCcs := False;
     if not ReadMsg(Deadline, typ, body, raw) then Exit;
@@ -2121,20 +2284,41 @@ begin
       Fail(alert, 'tls: invalid retry client hello', Deadline);
       Exit;
     end;
-    transcript := transcript + raw;
+    hello := retryHello;
   end;
+  alert := CheckPsk13(Config, hello, hash, FAlpn, transcript, raw, pskIndex, earlySecret);
+  if alert <> 0 then
+  begin
+    Fail(alert, 'tls: invalid PSK binder', Deadline);
+    Exit;
+  end;
+  scheme := 0;
+  if pskIndex < 0 then
+  begin
+    if hello.Schemes = '' then
+    begin
+      Fail(AlertMissingExtension, 'tls: missing signature algorithms', Deadline);
+      Exit;
+    end;
+    scheme := ChooseServerSignature(Config, hello.Schemes, True);
+    if scheme = 0 then
+    begin
+      Fail(AlertHandshakeFailure, 'tls: no shared signature scheme', Deadline);
+      Exit;
+    end;
+  end;
+  transcript := transcript + raw;
   share := KeyShare(group, priv);
   if not SharedSecret(group, priv, peer, shared) then
   begin
     Fail(AlertIllegalParameter, 'tls: invalid client key share', Deadline);
     Exit;
   end;
-  flight := ServerHello13(RandomString(32), hello.Session, FSuite, U16(group) + Vec16(share));
+  flight := ServerHello13(RandomString(32), hello.Session, FSuite, U16(group) + Vec16(share), pskIndex);
   if not WriteHandshake(flight, Deadline) then Exit;
   transcript := transcript + flight;
   if dummyCcs and not WriteRecord(RecCcs, #1, Deadline) then Exit;
 
-  earlySecret := HkdfExtract(hash, '', ZeroString(CipherHashSize(hash)));
   hsSecret := HkdfExtract(hash, DeriveSecret(hash, earlySecret, 'derived', ''), shared);
   clientHs := DeriveSecret(hash, hsSecret, 'c hs traffic', transcript);
   serverHs := DeriveSecret(hash, hsSecret, 's hs traffic', transcript);
@@ -2143,19 +2327,21 @@ begin
   master := HkdfExtract(hash, DeriveSecret(hash, hsSecret, 'derived', ''), ZeroString(CipherHashSize(hash)));
 
   extensions := '';
-  if FServerName <> '' then extensions := U16(ExtServerName) + U16(0);
+  if (FServerName <> '') and (pskIndex < 0) then extensions := U16(ExtServerName) + U16(0);
   if FAlpn <> '' then extensions := extensions + U16(ExtAlpn) + Vec16(Vec16(Vec8(FAlpn)));
-  flight := U8(HsEncryptedExtensions) + Vec24(Vec16(extensions)) + Config.FCertificate;
-  transcript := transcript + flight;
-  pref := StringOfChar(' ', 64) + 'TLS 1.3, server CertificateVerify' + #0 + HashOf(hash, transcript);
-  if not ServerSignature(Config, scheme, pref, sig) then
+  flight := U8(HsEncryptedExtensions) + Vec24(Vec16(extensions));
+  if pskIndex < 0 then
   begin
-    Fail(AlertInternalError, 'tls: could not sign the handshake', Deadline);
-    Exit;
+    flight := flight + Config.FCertificate;
+    pref := StringOfChar(' ', 64) + 'TLS 1.3, server CertificateVerify' + #0 + HashOf(hash, transcript + flight);
+    if not ServerSignature(Config, scheme, pref, sig) then
+    begin
+      Fail(AlertInternalError, 'tls: could not sign the handshake', Deadline);
+      Exit;
+    end;
+    flight := flight + U8(HsCertificateVerify) + Vec24(U16(scheme) + Vec16(sig));
   end;
-  raw := U8(HsCertificateVerify) + Vec24(U16(scheme) + Vec16(sig));
-  transcript := transcript + raw;
-  flight := flight + raw;
+  transcript := transcript + flight;
   finKey := ExpandLabel(hash, serverHs, 'finished', '', CipherHashSize(hash));
   raw := U8(HsFinished) + Vec24(CipherHmac(hash, finKey, HashOf(hash, transcript)));
   transcript := transcript + raw;
@@ -2178,6 +2364,8 @@ begin
     Exit;
   end;
   SetTraffic13(True, clientAp);
+  if Config.SessionTickets and hello.PskDhe then
+    if not SendTicket13(Self, Config, hash, master, transcript + raw, Deadline) then Exit;
   FDone := True;
   Result := True;
 end;

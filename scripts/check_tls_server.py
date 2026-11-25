@@ -40,9 +40,10 @@ def run(command, timeout=45, **options):
 
 
 @contextmanager
-def server(command, cert, key, file, raw=False, tls12=False):
+def server(command, cert, key, file, raw=False, tls12=False, tickets=False):
     env = dict(os.environ, PASLANG_MAXPROCS='1')
-    args = [*command, cert, key, file, 'raw' if raw else '', 'tls12' if tls12 else '']
+    args = [*command, cert, key, file, 'raw' if raw else '', 'tls12' if tls12 else '',
+            'tickets' if tickets else '']
     with subprocess.Popen(args, stdout=subprocess.PIPE,
                           stderr=subprocess.PIPE, env=env) as process:
         try:
@@ -70,9 +71,10 @@ def client_context(root, protocols=('http/1.1',), version=ssl.TLSVersion.TLSv1_3
     return context
 
 
-def get_hello(port, context, protocol='http/1.1', version='TLSv1.3'):
+def get_hello(port, context, protocol='http/1.1', version='TLSv1.3', session=None):
     with socket.create_connection(('127.0.0.1', port), timeout=8) as connection:
-        with context.wrap_socket(connection, server_hostname='localhost', suppress_ragged_eofs=False) as stream:
+        with context.wrap_socket(connection, server_hostname='localhost', suppress_ragged_eofs=False,
+                                 session=session) as stream:
             require(stream.version() == version, 'TLS version')
             require(stream.selected_alpn_protocol() == protocol, 'ALPN')
             stream.sendall(REQUEST)
@@ -80,6 +82,7 @@ def get_hello(port, context, protocol='http/1.1', version='TLSv1.3'):
             response.begin()
             require((response.status, response.read()) == (200, HELLO), 'HTTPS response')
             require(stream.recv(1) == b'', 'expected TLS close_notify')
+            return stream.session, stream.session_reused
 
 
 def reject(port, context, reason, server_name='localhost'):
@@ -248,7 +251,8 @@ def check_profile(label, command, identities, file, folder, go_client, ticket, w
     for name, (cert, key, root) in identities.items():
         context = client_context(root)
         with server(command, cert, key, file) as port:
-            get_hello(port, context)
+            session, reused = get_hello(port, context)
+            require(not reused and not session.has_ticket, 'session tickets are opt-in')
             run([go_client, '-client', f'127.0.0.1:{port}', '-root', root])
             if name != 'p256':
                 continue
@@ -284,6 +288,52 @@ def check_profile(label, command, identities, file, folder, go_client, ticket, w
                 require(stream.selected_alpn_protocol() == 'pas-test', 'standalone ALPN preference')
                 require(stream.makefile('rb').read() == b'localhost pas-test', 'standalone SNI and ALPN')
     print(f'TLS 1.3 server {label}: verified five PEM identities, three suites, HRR, HTTPS and standalone TLS')
+
+
+def check_tls13_resumption(label, command, identity, file, folder, go_client):
+    cert, key, root = identity
+    with server(command, cert, key, file, tickets=True) as port:
+        context = client_context(root)
+        session, resumed = get_hello(port, context)
+        require(session.has_ticket and not resumed and session.ticket_lifetime_hint == 3600,
+                'full handshake must issue an hour-long ticket')
+
+        outgoing = ssl.MemoryBIO()
+        client = context.wrap_bio(ssl.MemoryBIO(), outgoing, server_hostname='localhost', session=session)
+        try:
+            client.do_handshake()
+        except ssl.SSLWantReadError:
+            pass
+        hello = outgoing.read()
+        require(len(hello) > 5 and hello[0] == 22 and int.from_bytes(hello[3:5], 'big') == len(hello) - 5,
+                'expected a single ClientHello record')
+        # The binder is the final field of the PSK extension, which is last.
+        with socket.create_connection(('127.0.0.1', port), timeout=8) as connection:
+            connection.sendall(hello[:-1] + bytes((hello[-1] ^ 1,)))
+            with connection.makefile('rb') as stream:
+                alert = stream.read(7)
+                require(alert == b'\x15\x03\x03\x00\x02\x02\x33', f'bad binder alert {alert.hex()}')
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            reuse = [used for _, used in pool.map(lambda _: get_hello(port, context, session=session), range(2))]
+        require(sorted(reuse) == [False, True], 'a valid ticket must work once, even across concurrent handshakes')
+        _, reused = get_hello(port, context, session=session)
+        require(not reused, 'a consumed ticket must fall back to certificate authentication')
+        run([go_client, '-client', f'127.0.0.1:{port}', '-root', root, '-client-resume'])
+
+        saved = folder / 'resume.pem'
+        trace = folder / 'resume-trace.txt'
+        args = ['openssl', 's_client', '-connect', f'127.0.0.1:{port}', '-tls1_3',
+                '-CAfile', root, '-verify_return_error', '-verify_hostname', 'localhost',
+                '-servername', 'localhost', '-alpn', 'http/1.1', '-ciphersuites', 'TLS_AES_256_GCM_SHA384', '-quiet']
+        run([*args, '-groups', 'X25519', '-sess_out', saved], input=REQUEST)
+        result = run([*args, '-groups', 'X448:P-256', '-sess_in', saved, '-msg', '-msgfile', trace], input=REQUEST)
+        handshake = trace.read_text()
+        require(result.stdout.startswith(b'HTTP/1.1 200 ') and result.stdout.endswith(HELLO),
+                'resumed HTTPS after HelloRetryRequest')
+        require(handshake.count('], ServerHello\n') == 2 and '], Certificate\n' not in handshake,
+                'expected retry and PSK instead of another certificate exchange')
+    print(f'TLS 1.3 resumption {label}: OpenSSL and Go, retry, binder alert, and single-use tickets')
 
 
 def tls12_client_hello(*, extensions=(), ems=b'', fallback=False):
@@ -413,6 +463,7 @@ def main():
             check_profile(label, [*runner, binary], identities, file, folder, go_client, ticket,
                           wrong_key, weak_rsa)
             check_tls12_profile(label, [*runner, binary], identities, file, go_client)
+            check_tls13_resumption(label, [*runner, binary], identities['p256'], file, folder, go_client)
             check_key_limits(compile_command, runner, folder / (binary.name + '-short-epoch'),
                              identities['p256'], file)
             print(f'TLS server {label}: TLS 1.3 KeyUpdate and TLS 1.2 read/write key limits')
