@@ -263,11 +263,12 @@ def check_profile(label, command, identities, file, folder, go_client, ticket, w
                               '--resolve', f'localhost:{port}:127.0.0.1', f'https://localhost:{port}/file'])
             require(run_result.stdout == FILE, 'curl file body')
             check_http(port, context)
+            check_tls13_alerts(port)
             get_hello(port, client_context(root, ()), protocol=None)
             with socket.create_connection(('127.0.0.1', port), timeout=8) as clear:
                 clear.sendall(REQUEST)
                 try:
-                    require(not clear.recv(64).startswith(b'HTTP/'), 'clear HTTP answered by TLS listener')
+                    require(clear.recv(1) == b'', 'clear HTTP answered by TLS listener')
                 except ConnectionResetError:
                     pass
             reject(port, client_context(root, ('h2',)), 'TLSV1_ALERT_NO_APPLICATION_PROTOCOL')
@@ -287,7 +288,7 @@ def check_profile(label, command, identities, file, folder, go_client, ticket, w
             with context.wrap_socket(connection, server_hostname='localhost') as stream:
                 require(stream.selected_alpn_protocol() == 'pas-test', 'standalone ALPN preference')
                 require(stream.makefile('rb').read() == b'localhost pas-test', 'standalone SNI and ALPN')
-    print(f'TLS 1.3 server {label}: verified five PEM identities, three suites, HRR, HTTPS and standalone TLS')
+    print(f'TLS 1.3 server {label}: verified five PEM identities, three suites, HRR, HTTPS, standalone TLS, and protocol alerts')
 
 
 def check_tls13_resumption(label, command, identity, file, folder, go_client):
@@ -384,34 +385,106 @@ def check_tls12_resumption(label, command, identities, file, folder, go_client):
     print(f'TLS 1.2 resumption {label}: OpenSSL and Go, ECDSA and RSA, tickets, session IDs and full fallback')
 
 
-def tls12_client_hello(*, extensions=(), ems=b'', fallback=False):
-    def vector(value, size=2):
-        return len(value).to_bytes(size, 'big') + value
+def vector(value, size=2):
+    return len(value).to_bytes(size, 'big') + value
 
+
+def record(content, value, version=b'\x03\x03'):
+    return bytes((content,)) + version + vector(value)
+
+
+def client_hello(extensions, *, legacy=b'\x03\x03', session=b'',
+                 suites=b'\x13\x01', compression=b'\0'):
+    params = b''.join(code.to_bytes(2, 'big') + vector(value) for code, value in extensions)
+    body = legacy + bytes(32) + vector(session, 1) + vector(suites) + vector(compression, 1)
+    return b'\x01' + vector(body + vector(params), 3)
+
+
+def tls12_client_hello(*, extensions=(), ems=b'', fallback=False):
     suites = bytes.fromhex('c02b00ff' + ('5600' if fallback else ''))
     params = [(10, vector(bytes.fromhex('001d0017'))), (13, vector(bytes.fromhex('0403')))]
     if ems is not None:
         params.append((23, ems))
     params.extend(extensions)
-    extensions = b''.join(code.to_bytes(2, 'big') + vector(value) for code, value in params)
-    body = b'\x03\x03' + bytes(32) + b'\0' + vector(suites) + b'\x01\0' + vector(extensions)
-    return b'\x16\x03\x01' + vector(b'\x01' + vector(body, 3))
+    return record(22, client_hello(params, suites=suites), b'\x03\x01')
+
+
+def expect_fatal_alert(stream, name, expected):
+    alert = stream.read(7)
+    require(alert == record(21, bytes((2, expected))),
+            f'{name}: expected fatal alert {expected}, got {alert.hex() or "EOF"}')
+
+
+def check_tls13_alerts(port):
+    # BoGo runner.go at 7e529d2b3971c10d63c6a980f3744f580321ff40:
+    # ExtraCompressionMethods, DuplicateExtensionServer, MissingKeyShare-Server
+    # and SecondClientHelloMissingKeyShare. RFC 9846 defines the alert bytes.
+    extensions = (
+        (43, vector(b'\x03\x04', 1)),  # supported_versions
+        (10, vector(b'\x00\x1d')),     # supported_groups (X25519)
+        (13, vector(b'\x04\x03')),     # signature_algorithms (ECDSA P-256)
+        (51, vector(b'')),             # key_share (request a retry)
+    )
+    hello = client_hello(extensions)
+    without_key_share = client_hello(extensions[:-1])
+    for name, request, expected in (
+        ('extra compression methods', record(22, client_hello(extensions, compression=b'\x01\x00')), 47),
+        ('duplicate extensions', record(22, client_hello(extensions + extensions[:1])), 50),
+        ('missing key_share', record(22, without_key_share), 109),
+        ('missing supported_groups', record(22, client_hello(extensions[:1] + extensions[2:])), 109),
+        ('missing signature_algorithms', record(22, client_hello(extensions[:2] + extensions[3:])), 109),
+        ('legacy session ID too long', record(22, client_hello(extensions, session=bytes(33))), 50),
+        ('odd cipher suite vector', record(22, client_hello(extensions, suites=b'\x13\x01\x00')), 50),
+        ('truncated extension vector', record(22, b'\x01' + vector(hello[4:-1], 3)), 50),
+        ('wrong legacy version', record(22, client_hello(extensions, legacy=b'\x03\x04')), 70),
+        ('wrong first handshake message', record(22, b'\x14\x00\x00\x00'), 10),
+        ('empty handshake record', record(22, b''), 10),
+        ('oversized plaintext record', record(22, bytes(16385)), 22),
+        ('premature change_cipher_spec', record(20, b'\x01'), 10),
+        ('premature application_data', record(23, b'\x00'), 10),
+        ('unrecognized record type', record(255, b''), 10),
+    ):
+        with socket.create_connection(('127.0.0.1', port), timeout=8) as connection:
+            connection.sendall(request)
+            with connection.makefile('rb') as stream:
+                expect_fatal_alert(stream, name, expected)
+
+    retry_random = bytes.fromhex('cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c')
+    for name, request, expected in (
+        ('second ClientHello missing key_share', record(22, without_key_share), 109),
+        ('second ClientHello after dummy CCS',
+         record(20, b'\x01') + record(22, without_key_share), 109),
+        ('second ClientHello wrong legacy version',
+         record(22, client_hello(extensions, legacy=b'\x03\x04')), 70),
+        ('invalid change_cipher_spec value', record(20, b'\x02'), 10),
+        ('invalid change_cipher_spec length', record(20, b'\x01\x01'), 10),
+        ('interleaved change_cipher_spec', record(22, hello[:8]) + record(20, b'\x01'), 10),
+    ):
+        with socket.create_connection(('127.0.0.1', port), timeout=8) as connection:
+            connection.sendall(record(22, hello, b'\x03\x01'))
+            with connection.makefile('rb') as stream:
+                header = stream.read(5)
+                require(header[:3] == b'\x16\x03\x03', f'{name}: expected HelloRetryRequest')
+                retry = stream.read(int.from_bytes(header[3:], 'big'))
+                require(retry[:1] == b'\x02' and retry[6:38] == retry_random,
+                        f'{name}: missing HelloRetryRequest random')
+                connection.sendall(request)
+                expect_fatal_alert(stream, name, expected)
 
 
 def check_tls12_alerts(port):
-    for options, expected in (
-        ({'ems': None}, 40),
-        ({'ems': b'\0'}, 50),
-        ({'fallback': True}, 86),
-        ({'extensions': [(43, bytes.fromhex('020302'))]}, 70),
-        ({'extensions': [(0xff01, b'\x01\xaa')]}, 40),
+    for name, options, expected in (
+        ('missing EMS', {'ems': None}, 40),
+        ('nonempty EMS', {'ems': b'\0'}, 50),
+        ('inappropriate fallback', {'fallback': True}, 86),
+        ('unsupported version', {'extensions': [(43, bytes.fromhex('020302'))]}, 70),
+        ('nonempty renegotiation', {'extensions': [(0xff01, b'\x01\xaa')]}, 40),
+        ('duplicate extensions', {'extensions': [(23, b'')]}, 50),
     ):
         with socket.create_connection(('127.0.0.1', port), timeout=8) as connection:
             connection.sendall(tls12_client_hello(**options))
             with connection.makefile('rb') as stream:
-                alert = stream.read(7)
-                require(len(alert) == 7 and alert[0] == 21 and alert[3:] == bytes((0, 2, 2, expected)),
-                        f'expected fatal alert {expected}, got {alert.hex()}')
+                expect_fatal_alert(stream, name, expected)
 
     with socket.create_connection(('127.0.0.1', port), timeout=8) as connection:
         # The explicit versions vector selects TLS 1.2. ServerHello
@@ -426,7 +499,7 @@ def check_tls12_alerts(port):
             require(b'\x0e\0\0\0' == response[-4:], 'incomplete TLS 1.2 server flight')
             # A ChangeCipherSpec cannot replace the client's key exchange.
             connection.sendall(b'\x14\x03\x03\x00\x01\x01')
-            require(stream.read(7) == b'\x15\x03\x03\x00\x02\x02\x0a', 'early change cipher spec')
+            expect_fatal_alert(stream, 'early TLS 1.2 change_cipher_spec', 10)
 
 
 def check_tls12_profile(label, command, identities, file, go_client):
