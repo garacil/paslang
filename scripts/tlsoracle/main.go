@@ -68,7 +68,16 @@ func main() {
 	port := flag.Int("port", 0, "port")
 	name := flag.String("case", "tls13", "case")
 	dir := flag.String("dir", ".", "where ca.pem goes")
+	client := flag.String("client", "", "connect to a TLS 1.3 server at this address")
+	root := flag.String("root", "", "PEM root trusted by the client")
 	flag.Parse()
+	if *client != "" {
+		if err := checkServer(*client, *root); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
 	ed := strings.Contains(*name, "ed25519")
 	var caKey crypto.Signer
 	if ed {

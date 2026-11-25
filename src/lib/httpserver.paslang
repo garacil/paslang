@@ -40,7 +40,7 @@ unit httpserver;
 interface
 
 uses
-  sysutils;
+  sysutils, pasconn;
 
 const
   { the defaults of a THttpServer }
@@ -331,6 +331,8 @@ type
     BodyTimeoutMs: Integer;
     WriteTimeoutMs: Integer;
     ShutdownTimeoutMs: Integer;
+    { Set before Serve. A TTlsServerConfig accepts TLS on each listener. }
+    Tls: TNetAcceptor;
     { One access entry per served request. AccessLogTo receives the entry
       when assigned. Otherwise LogTo or standard output receives
       'ip method route status bytes Nms'. }
@@ -378,6 +380,7 @@ type
   private
     Server: THttpServer;
     Fd: Integer;
+    Stream: TNetStream;
     Peer, PeerHost: string;
     PeerKnown, TrustedUnixProxy: Boolean;
     { its place in the server's FConns }
@@ -836,7 +839,10 @@ begin
   end;
   if Length(C.Buf) - C.BufEnd < 512 then
     SetLength(C.Buf, Length(C.Buf) * 2);
-  n := PasIoRead(C.Fd, @C.Buf[C.BufEnd], Length(C.Buf) - C.BufEnd, Deadline);
+  if C.Stream <> nil then
+    n := C.Stream.ReadInto(@C.Buf[C.BufEnd], Length(C.Buf) - C.BufEnd, Deadline)
+  else
+    n := PasIoRead(C.Fd, @C.Buf[C.BufEnd], Length(C.Buf) - C.BufEnd, Deadline);
   if n > 0 then
     C.BufEnd := C.BufEnd + n;
   Result := n;
@@ -910,6 +916,13 @@ begin
   Result := False;
   if C.Broken then
     Exit;
+  if C.Stream <> nil then
+  begin
+    Result := C.Stream.WriteAll(Data, C.WriteDeadline);
+    C.Broken := not Result;
+    if Result then C.OutWritten := C.OutWritten + Length(Data);
+    Exit;
+  end;
   p := 1;
   while p <= Length(Data) do
   begin
@@ -1840,6 +1853,14 @@ var
   p, n: Integer;
 begin
   Result := not C.Broken;
+  if (C.Stream <> nil) and Result and (C.OutLen > 0) then
+  begin
+    Result := C.Stream.WriteFrom(@C.OutBuf[0], C.OutLen, C.WriteDeadline);
+    C.Broken := not Result;
+    if Result then C.OutWritten := C.OutWritten + C.OutLen;
+    C.OutLen := 0;
+    Exit;
+  end;
   p := 0;
   while (p < C.OutLen) and not C.Broken do
   begin
@@ -2229,6 +2250,7 @@ var
   fd, n, r: Integer;
   st: array[0..31] of Int64;
   mode, size, off, left, want: Int64;
+  fileBuffer: TBytes;
 begin
   Result := False;
   c := FConn;
@@ -2270,14 +2292,23 @@ begin
       full; a file that grows shorter on the way breaks the connection }
     off := 0;
     left := size;
+    if c.Stream <> nil then SetLength(fileBuffer, 16384);
     while left > 0 do
     begin
       want := left;
       if want > 1073741824 then
         want := 1073741824;
-      repeat
-        n := Syscall(SysSendfile, c.Fd, fd, @off, want);
-      until not PasIoRetry(n, c.Fd, 4, c.WriteDeadline);
+      if c.Stream <> nil then
+      begin
+        if want > Length(fileBuffer) then want := Length(fileBuffer);
+        n := PasIoRead(fd, @fileBuffer[0], want, c.WriteDeadline);
+        if (n > 0) and not c.Stream.WriteFrom(@fileBuffer[0], n, c.WriteDeadline) then
+          n := -1;
+      end
+      else
+        repeat
+          n := Syscall(SysSendfile, c.Fd, fd, @off, want);
+        until not PasIoRetry(n, c.Fd, 4, c.WriteDeadline);
       if n <= 0 then
       begin
         c.Broken := True;
@@ -3118,6 +3149,7 @@ procedure ConnMain(S: THttpServer; Fd: Integer; TrustedUnixProxy: Boolean);
 var
   c: THttpConn;
   first: Boolean;
+  tlsError: string;
 begin
   c := THttpConn.Create;
   c.Server := S;
@@ -3127,10 +3159,20 @@ begin
   SetLength(c.OutBuf, 512);
   S.Track(c);
   try
+    if S.Tls <> nil then
+    begin
+      AtomicStore(c.Idle, 1);
+      if AtomicLoad(S.FClosing) <> 0 then Exit;
+      c.Stream := S.Tls.Accept(TTcpStream.Create(Fd, True), PasIoDeadline(S.HeaderTimeoutMs),
+        'http/1.1', tlsError);
+      if c.Stream = nil then Exit;
+      AtomicStore(c.Idle, 0);
+    end;
     first := True;
     while ServeOne(c, first) do
       first := False;
   finally
+    if c.Stream <> nil then c.Stream.Dispose;
     S.Untrack(c);
     TcpClose(Fd);
   end;

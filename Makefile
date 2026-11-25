@@ -1425,6 +1425,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	@python3 -I scripts/check_rmall_fd_pressure.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64)
 	@python3 -I scripts/bench/check_harness.py
 	@python3 -I scripts/check_tls_interop_ready.py
+	@python3 -I scripts/check_tls_server.py $(OUTDIR)/paslangc $(BUILDDIR) $(QEMU_A64)
 	@python3 -I scripts/bench/check_peak.py
 	@python3 -I scripts/bench/check_servers.py
 	@python3 -I scripts/bench/check_reference_caps.py

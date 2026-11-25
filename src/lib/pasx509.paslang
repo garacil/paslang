@@ -272,6 +272,9 @@ function PemDecodeAll(const Data: string): TPemBlocks;
 function X509ParsePkcs1RsaKey(const Der: string; out Key: TRsaPrivateKey; out Err: string): Boolean;
 function X509ParsePkcs8RsaKey(const Der: string; out Key: TRsaPrivateKey; out Err: string): Boolean;
 function X509ParsePemRsaKey(const Pem: string; out Key: TRsaPrivateKey; out Err: string): Boolean;
+{ Unencrypted PEM SEC 1 or PKCS #8. EC Curve is an X509Curve constant. }
+function X509ParsePemCurveKey(const Pem: string; out Algorithm, Curve: Integer;
+  out Secret, Err: string): Boolean;
 
 { Go's ParseCertificate: one DER certificate and nothing after it.
   False with Go's error text. }
@@ -4362,6 +4365,81 @@ begin
     else
       Err := 'x509: PEM block ' + kind + ' is not an RSA private key';
     Exit;
+  end;
+end;
+
+{ SEC 1 inside PEM or PKCS #8 and RFC 8410's nested OCTET STRING. Returning
+  the key bytes leaves public-key matching and preparation to its caller. }
+function X509ParsePemCurveKey(const Pem: string; out Algorithm, Curve: Integer;
+  out Secret, Err: string): Boolean;
+var
+  cur, nxt, ver, size, bits: Integer;
+  b: TPemBlock;
+  inp, seq, alg, oct, item: TDer;
+  oid, namedCurve, embeddedCurve, pub: string;
+begin
+  Result := False;
+  Algorithm := X509PkUnknown;
+  Curve := X509CurveNone;
+  Secret := '';
+  Err := 'x509: invalid or unsupported EC or Ed25519 private key';
+  cur := 1;
+  while PemDecodeAt(Pem, cur, b, nxt) do
+  begin
+    cur := nxt;
+    if (b.BlockType <> 'PRIVATE KEY') and (b.BlockType <> 'EC PRIVATE KEY') then
+      Continue;
+    if Length(b.Headers) <> 0 then Exit;
+    inp := DerOf(b.Bytes);
+    if not (DerRead(inp, seq, TagSequence) and DerEmpty(inp) and DerReadInt64(seq, ver)) then Exit;
+    namedCurve := '';
+    if b.BlockType = 'PRIVATE KEY' then
+    begin
+      if (ver <> 0) and (ver <> 1) then Exit;
+      if not (DerRead(seq, alg, TagSequence) and DerReadOid(alg, oid) and
+        DerRead(seq, oct, TagOctetString)) then Exit;
+      if not DerSkipOptional(seq, $A0) then Exit;
+      if (ver = 1) and not DerSkipOptional(seq, $81) then Exit;
+      if not DerEmpty(seq) then Exit;
+      if oid = OidPkEd25519 then
+      begin
+        if not (DerEmpty(alg) and DerRead(oct, item, TagOctetString) and DerEmpty(oct)) then Exit;
+        if DerLen(item) <> 32 then Exit;
+        Algorithm := X509PkEd25519;
+        Secret := DerStr(item);
+        Err := '';
+        Exit(True);
+      end;
+      if (oid <> OidPkECDSA) or not (DerReadOid(alg, namedCurve) and DerEmpty(alg)) then Exit;
+      if not (DerRead(oct, seq, TagSequence) and DerEmpty(oct) and DerReadInt64(seq, ver)) then Exit;
+    end;
+    if (ver <> 1) or not DerRead(seq, oct, TagOctetString) then Exit;
+    if DerPeek(seq, $A0) then
+    begin
+      if not (DerRead(seq, item, $A0) and DerReadOid(item, embeddedCurve) and DerEmpty(item)) then Exit;
+      if (namedCurve <> '') and (namedCurve <> embeddedCurve) then Exit;
+      namedCurve := embeddedCurve;
+    end;
+    if DerPeek(seq, $A1) then
+      if not (DerRead(seq, item, $A1) and DerReadBitString(item, pub, bits) and DerEmpty(item)) then Exit;
+    if not DerEmpty(seq) then Exit;
+    if namedCurve = OidCurveP256 then
+    begin
+      Curve := X509CurveP256;
+      size := 32;
+    end
+    else if namedCurve = OidCurveP384 then
+    begin
+      Curve := X509CurveP384;
+      size := 48;
+    end
+    else
+      Exit;
+    if (DerLen(oct) = 0) or (DerLen(oct) > size) then Exit;
+    Algorithm := X509PkECDSA;
+    Secret := StringOfChar(#0, size - DerLen(oct)) + DerStr(oct);
+    Err := '';
+    Exit(True);
   end;
 end;
 

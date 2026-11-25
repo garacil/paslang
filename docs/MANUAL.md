@@ -12202,7 +12202,8 @@ set before it serves:
   line and the header lines, and either past its bound is answered 431;
 - `MaxBody` (1 MiB) bounds a body, answered 413;
 - `HeaderTimeoutMs` (10 s) is the time from a request's first byte to
-  the end of its head, and from a new connection to its first byte;
+  the end of its head, and from a new connection to its first byte.
+  It also bounds the TLS handshake when `Tls` is set;
 - `IdleTimeoutMs` (60 s) is the time a kept connection waits for its
   next request;
 - `BodyTimeoutMs` (60 s) is the time from the end of the head to the
@@ -12210,6 +12211,8 @@ set before it serves:
 - `WriteTimeoutMs` (60 s) is the time from the end of the head to the
   end of the answer;
 - `ShutdownTimeoutMs` (10 s), below;
+- `Tls` accepts TLS on every listener when assigned a loaded
+  `TTlsServerConfig` from `pastls`. The default is `nil` for clear HTTP;
 - `AccessLog` (on) writes `ip method route status bytes Nms` for each
   served request. The route column contains the registered pattern or
   `-` when no route matched. The IP column uses the socket peer by
@@ -12771,6 +12774,43 @@ end.
 HelloRetryRequest, ALPN, a certificate request, a MiB each way, wrong
 names refused, eight routines at once) and `openssl s_server` (17
 cases), on both machines, in make check when Go and openssl are there.
+
+`pastls` also serves TLS 1.3 with a certificate (P628). Load PEM text
+with `TTlsServerConfig.LoadKeyPair(certPem, keyPem, out err)` before
+serving. Put the leaf first in the chain, followed by intermediates.
+An unencrypted PKCS #1 RSA, SEC 1 EC or PKCS #8 key is accepted when
+its public key matches the leaf. The server supports RSA-PSS,
+P-256 and P-384 ECDSA, and Ed25519 identities. Key establishment uses
+X25519, P-256 or P-384 and can retry when a client's first key share
+uses another group. The ciphers are AES-128-GCM, AES-256-GCM and
+ChaCha20-Poly1305. [RFC 9846](https://www.rfc-editor.org/info/rfc9846)
+
+```
+uses paslib, httpserver, pastls;
+
+{ router is configured and certPem and keyPem contain the PEM files. }
+config := TTlsServerConfig.Create;
+if not config.LoadKeyPair(certPem, keyPem, err) then
+begin
+  WriteLn(err);
+  Halt(1);
+end;
+server := THttpServer.Create(router);
+server.Tls := config;
+if not server.ListenTcp('0.0.0.0', 8443) then
+  Halt(1);
+server.ServeUntilSignal;
+```
+
+The HTTP server chooses `http/1.1` when a client offers ALPN. It accepts
+HTTP/1.1 from clients that omit ALPN. Keep the loaded config alive and
+its fields fixed while serving. For another TCP protocol, use
+`TlsServer(raw, config, deadline, out err)`. It owns `raw` on both
+success and failure. A standalone server can set `config.Alpn` in
+preference order and read `RequestedServerName` and `Protocol` from
+the resulting stream. The configuration serves one identity and each
+connection performs a full handshake. Early application data is discarded.
+The stream rotates its traffic keys before reaching the record limit.
 
 `uses pasconn` gives TCP and Unix streams the same reads and writes used by
 the protocol clients. `ReadSome(MaxN, Deadline, out Data)` returns the
