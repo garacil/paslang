@@ -11,6 +11,51 @@ b26slice, b31map and b44fma. The other 34 programs and 192 sections still
 need audited Rust twins. An explicitly requested unsupported Rust section is
 refused before building. It is never counted as a win.
 
+## TLS server comparison (P628)
+
+`tls_server.py` compares Paslang's HTTPS server and Go's `net/http` with
+`crypto/tls` over loopback. Each server uses one runtime worker on one
+logical CPU. The same verified Go client runs on a disjoint CPU set. The
+servers use the same P-256 certificate, X25519, HTTP/1.1 ALPN and TLS
+version. Native uses AES-128-GCM. Base uses ChaCha20-Poly1305 and disables
+Go's optional CPU features. The client checks the negotiated options and
+every response byte.
+
+The connections/s workload opens a new connection for each short HTTPS
+request and verifies that it completed a full handshake. The bytes/s
+workload warms a connection per client and verifies its reuse for
+4 MiB responses of the same file. Startup, warm-up and Go client setup
+are outside each timed round. Rounds alternate the server order.
+
+```sh
+python3 -I scripts/bench/tls_server.py --compiler "$(command -v paslangc)" \
+  --go-amd64 v3 --server-cpu 2 --client-cpus 4 6 8 10 \
+  --json build/bench/tls-server.json
+```
+
+The affinity and Go level in the example match the Ryzen 7 4800H run.
+Pass `--units build` with an uninstalled compiler built in the project.
+The JSON records the sample times and exact work counts, the fixture
+hashes and the TLS and cipher objects linked by Paslang. Exit 0 requires
+Paslang's median paired rate to exceed Go's in every requested row.
+Exit 1 records a valid comparison below that goal. Exit 2 records an
+invalid comparison. The TLS checks in `make check` exercise the client's
+response and connection validation on both architectures.
+
+The first comparison used source commit `91a1050` and Go 1.27.4 on
+the Ryzen 7 4800H. Each row has seven paired rounds. These are median
+rates for each side. The comparison returned exit 1.
+
+| Profile | TLS | Go connections/s | Paslang connections/s | Go MiB/s | Paslang MiB/s |
+|---|---|---:|---:|---:|---:|
+| native | 1.3 | 1817 | 1689 | 643 | 282 |
+| native | 1.2 | 1805 | 1729 | 674 | 298 |
+| base | 1.3 | 1791 | 1542 | 293 | 154 |
+| base | 1.2 | 1815 | 1625 | 303 | 163 |
+
+P628 still requires exceeding Go and testing thousands of concurrent
+pasroutines.
+
 ## Recorded integer-append comparison
 
 The [frozen 1.2.405 measurements](https://github.com/garacil/paslang/wiki/Benchmark-Results-P525-405)

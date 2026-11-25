@@ -8,6 +8,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import http.client
+import json
 import os
 from pathlib import Path
 import select
@@ -548,11 +549,35 @@ def check_tls12_profile(label, command, identities, file, go_client):
     print(f'TLS 1.2 server {label}: verified HTTPS, SNI, ALPN, six suites, and protocol alerts')
 
 
+
+def check_benchmark_client(label, command, identity, file, go_bench):
+    cert, key, root = identity
+    env = dict(os.environ, GODEBUG='cpu.all=off')
+    for version in ('1.3', '1.2'):
+        with server(command, cert, key, file, tls12=version == '1.2') as port:
+            load = [go_bench, 'load', f'127.0.0.1:{port}', root, file]
+            for mode, body in (('handshake', HELLO), ('transfer', FILE)):
+                result = run([*load, mode, version, 'base', '2', '2'], env=env)
+                row = json.loads(result.stdout)
+                require(not result.stderr and (row['requests'], row['bytes']) == (4, 4 * len(body)),
+                        'incorrect benchmark work counts')
+            bad = file.with_name('bench-wrong-payload')
+            bad.write_bytes(bytes(len(FILE)))
+            result = subprocess.run([*load[:-1], bad, 'transfer', version, 'base', '1', '1'],
+                                    env=env, capture_output=True, timeout=20)
+            require(result.returncode == 1 and not result.stdout and
+                    b'response body differs' in result.stderr, 'benchmark accepted incorrect response bytes')
+    print(f'TLS benchmark {label}: verified new and reused connections and exact payloads')
+
+
 def main():
     compiler, build, qemu = (Path(arg).resolve() for arg in sys.argv[1:])
     go_client = build / 'tlsoracle-server-check'
-    run(['go', 'build', '-o', go_client, '.'], timeout=180, cwd=ROOT / 'scripts/tlsoracle',
-        env=dict(os.environ, GOCACHE=str(build / 'gocache')))
+    go_env = dict(os.environ, GOCACHE=str(build / 'gocache'))
+    run(['go', 'build', '-o', go_client, '.'], timeout=180, cwd=ROOT / 'scripts/tlsoracle', env=go_env)
+    go_bench = build / 'tls-bench-check'
+    run(['go', 'build', '-o', go_bench, ROOT / 'scripts/bench/servers/tls.go'],
+        timeout=180, env=dict(go_env, GOAMD64='v1'))
     with TemporaryDirectory(prefix='paslang-tls-server-') as tmp:
         folder = Path(tmp)
         file = folder / 'file'
@@ -582,6 +607,8 @@ def main():
             compile_command = [compiler, '-target', arch, '-cpu', cpu, '-Fu', units]
             run([*compile_command, '-o', binary, ROOT / 'testdata/tlsserver13.paslang'])
             runner = [] if arch == 'amd64' else [qemu]
+            if cpu == 'base':
+                check_benchmark_client(label, [*runner, binary], identities['p256'], file, go_bench)
             check_profile(label, [*runner, binary], identities, file, folder, go_client, ticket,
                           wrong_key, weak_rsa)
             check_tls12_profile(label, [*runner, binary], identities, file, go_client)
