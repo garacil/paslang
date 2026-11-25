@@ -336,6 +336,54 @@ def check_tls13_resumption(label, command, identity, file, folder, go_client):
     print(f'TLS 1.3 resumption {label}: OpenSSL and Go, retry, binder alert, and single-use tickets')
 
 
+def check_tls12_resumption(label, command, identities, file, folder, go_client):
+    version = ssl.TLSVersion.TLSv1_2
+    for name in ('p256', 'rsa'):
+        cert, key, root = identities[name]
+        context = client_context(root, version=version)
+        with server(command, cert, key, file, tls12=True, tickets=True) as port:
+            session, reused = get_hello(port, context, version='TLSv1.2')
+            require(session.has_ticket and not reused and session.ticket_lifetime_hint == 3600,
+                    'TLS 1.2 full handshake must issue an hour-long ticket')
+            for _ in range(2):
+                _, reused = get_hello(port, context, version='TLSv1.2', session=session)
+                require(reused, 'TLS 1.2 must reuse a valid ticket')
+            context.set_alpn_protocols([])
+            _, reused = get_hello(port, context, protocol=None, version='TLSv1.2', session=session)
+            require(not reused, 'TLS 1.2 must use a full handshake when ALPN changes')
+            context.set_alpn_protocols(['http/1.1'])
+            _, reused = get_hello(port, context, version='TLSv1.2', session=session)
+            require(reused, 'TLS 1.2 ticket remains usable with the original ALPN')
+
+            id_context = client_context(root, version=version)
+            id_context.options |= ssl.OP_NO_TICKET
+            id_session, reused = get_hello(port, id_context, version='TLSv1.2')
+            require(len(id_session.id) == 32 and not id_session.has_ticket and not reused,
+                    'TLS 1.2 must issue a session ID to a client without tickets')
+            _, reused = get_hello(port, id_context, version='TLSv1.2', session=id_session)
+            require(reused, 'TLS 1.2 must resume a valid session ID')
+
+            run([go_client, '-client', f'127.0.0.1:{port}', '-root', root,
+                 '-client-version', '1.2', '-client-resume'])
+            saved, trace = folder / 'resume12.pem', folder / 'resume12-trace.txt'
+            args = ['openssl', 's_client', '-connect', f'127.0.0.1:{port}', '-tls1_2',
+                    '-CAfile', root, '-verify_return_error', '-verify_hostname', 'localhost',
+                    '-servername', 'localhost', '-alpn', 'http/1.1', '-quiet']
+            run([*args, '-sess_out', saved], input=REQUEST)
+            result = run([*args, '-sess_in', saved, '-msg', '-msgfile', trace], input=REQUEST)
+            handshake = trace.read_text()
+            require(result.stdout.startswith(b'HTTP/1.1 200 ') and result.stdout.endswith(HELLO),
+                    'TLS 1.2 abbreviated handshake must carry HTTPS')
+            require('], ServerHello\n' in handshake and '], Finished\n' in handshake and
+                    '], Certificate\n' not in handshake and '], NewSessionTicket\n' not in handshake,
+                    'TLS 1.2 abbreviated flight must reuse the original ticket')
+
+        with server(command, cert, key, file, tls12=True, tickets=True) as other:
+            _, reused = get_hello(other, context, version='TLSv1.2', session=session)
+            require(not reused, 'TLS 1.2 ticket belongs to the configuration that issued it')
+    print(f'TLS 1.2 resumption {label}: OpenSSL and Go, ECDSA and RSA, tickets, session IDs and full fallback')
+
+
 def tls12_client_hello(*, extensions=(), ems=b'', fallback=False):
     def vector(value, size=2):
         return len(value).to_bytes(size, 'big') + value
@@ -386,7 +434,8 @@ def check_tls12_profile(label, command, identities, file, go_client):
     for name, (cert, key, root) in identities.items():
         with server(command, cert, key, file, tls12=True) as port:
             if name != 'ed25519':
-                get_hello(port, client_context(root, version=version), version='TLSv1.2')
+                session, reused = get_hello(port, client_context(root, version=version), version='TLSv1.2')
+                require(not reused and not session.has_ticket, 'TLS 1.2 tickets are opt-in')
             run([go_client, '-client', f'127.0.0.1:{port}', '-root', root, '-client-version', '1.2'])
             if name not in ('p256', 'rsa'):
                 continue
@@ -463,6 +512,7 @@ def main():
             check_profile(label, [*runner, binary], identities, file, folder, go_client, ticket,
                           wrong_key, weak_rsa)
             check_tls12_profile(label, [*runner, binary], identities, file, go_client)
+            check_tls12_resumption(label, [*runner, binary], identities, file, folder, go_client)
             check_tls13_resumption(label, [*runner, binary], identities['p256'], file, folder, go_client)
             check_key_limits(compile_command, runner, folder / (binary.name + '-short-epoch'),
                              identities['p256'], file)

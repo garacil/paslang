@@ -73,8 +73,9 @@ type
   end;
 
   TTlsServerTicket = record
-    Id, Psk, Name, Protocol: string;
-    Hash, ExpiresAt: Integer;
+    Id, Secret, NameHash, Protocol: string;
+    Version, Suite, Hash, ExpiresAt: Integer;
+    IsSessionId: Boolean;
   end;
 
   { Load a PEM identity once and keep it alive while it is used by Accept. }
@@ -94,7 +95,7 @@ type
     Alpn: TStringArray;
     { 0 or TlsVersion13 requires TLS 1.3. TlsVersion12 also allows TLS 1.2. }
     MinVersion: Integer;
-    { Set before accepting to enable single-use TLS 1.3 session tickets. }
+    { Set before accepting to enable session resumption. }
     SessionTickets: Boolean;
     function LoadKeyPair(const CertPem, KeyPem: string; out Err: string): Boolean;
     function Accept(Raw: TNetStream; Deadline: Integer; const Protocol: string;
@@ -251,6 +252,7 @@ const
   ExtAlpn = 16;
   ExtPadding = 21;
   ExtExtendedMasterSecret = 23;
+  ExtSessionTicket = 35;
   ExtPreSharedKey = 41;
   ExtEarlyData = 42;
   ExtSupportedVersions = 43;
@@ -292,8 +294,8 @@ const
   { how many records of application data go in one write }
   RecordsAWrite = 4;
   MaxUselessRecords = 16;
-  Tls13TicketSlots = 1024;
-  Tls13TicketLifetime = 3600;
+  TlsTicketSlots = 1024;
+  TlsTicketLifetime = 3600;
   MaxTicketIdentities = 5;
 
 { ---- bytes in and out ---- }
@@ -1918,16 +1920,160 @@ begin
   Result := True;
 end;
 
+{ Opaque lookup keys as in rustls server/tls13.rs. The cache belongs to one
+  loaded identity and evicts in insertion order. Keep only a fixed-size
+  digest of the ClientHello name in each slot. }
+function RememberServerSession(Config: TTlsServerConfig; const Id, Name, Protocol, Secret: string;
+  Version, Suite, Hash: Integer; IsSessionId: Boolean): Boolean;
+var i: Integer; previous: string; ticket: TTlsServerTicket;
+begin
+  ticket.Id := Id;
+  ticket.NameHash := Sha256(Name);
+  ticket.Protocol := Protocol;
+  ticket.Secret := Secret;
+  ticket.Version := Version;
+  ticket.IsSessionId := IsSessionId;
+  ticket.Suite := Suite;
+  ticket.Hash := Hash;
+  ticket.ExpiresAt := Nanotime + TlsTicketLifetime * 1000000000;
+  lock Config.FTicketMu do
+  begin
+    if Length(Config.FTicketSlots) = 0 then
+    begin
+      SetLength(Config.FTicketSlots, TlsTicketSlots);
+      New(Config.FTicketIndex);
+    end;
+    if ticket.Id in Config.FTicketIndex then Exit(False);
+    i := Config.FNextTicket;
+    previous := Config.FTicketSlots[i].Id;
+    if previous <> '' then Delete(Config.FTicketIndex, previous);
+    Config.FTicketSlots[i] := ticket;
+    Config.FTicketIndex[ticket.Id] := i;
+    Config.FNextTicket := (i + 1) mod TlsTicketSlots;
+  end;
+  Result := True;
+end;
+
+function FindServerSession(Config: TTlsServerConfig; const Id, Name, Protocol: string; Version: Integer;
+  IsSessionId: Boolean; out Ticket: TTlsServerTicket): Boolean;
+var i: Integer;
+begin
+  Result := False;
+  if Length(Id) <> 32 then Exit;
+  lock Config.FTicketMu do
+  begin
+    if not TryGet(Config.FTicketIndex, Id, i) then Exit;
+    Ticket := Config.FTicketSlots[i];
+  end;
+  Result := (Ticket.Version = Version) and (Ticket.IsSessionId = IsSessionId) and
+    (Ticket.Protocol = Protocol) and (Ticket.ExpiresAt > Nanotime) and (Ticket.NameHash = Sha256(Name));
+end;
+
+function ConsumeTicket(Config: TTlsServerConfig; const Ticket: TTlsServerTicket): Boolean;
+var i: Integer;
+begin
+  Result := False;
+  lock Config.FTicketMu do
+  begin
+    if not TryGet(Config.FTicketIndex, Ticket.Id, i) then Exit;
+    if (Config.FTicketSlots[i].Version <> Ticket.Version) or
+      (Config.FTicketSlots[i].ExpiresAt <= Nanotime) or not CtEqualStr(Config.FTicketSlots[i].Secret, Ticket.Secret) then Exit;
+    Delete(Config.FTicketIndex, Ticket.Id);
+    Config.FTicketSlots[i] := Default(TTlsServerTicket);
+  end;
+  Result := True;
+end;
+
+type
+  TTlsServerFinished12 = record
+    Aead, KeyLen, IvLen, Hash: Integer;
+    MainSecret, Keys, Transcript: string;
+  end;
+
+procedure SetServerKeys12(var State: TTlsServerFinished12; const ServerRandom, ClientRandom: string);
+begin
+  if State.Aead = 1 then State.IvLen := 4
+  else State.IvLen := 12;
+  State.Keys := Tls12Prf(State.Hash, State.MainSecret, 'key expansion', ServerRandom + ClientRandom,
+                        2 * (State.KeyLen + State.IvLen));
+end;
+
+function ReadClientFinished12(Stream: TTlsStream; var State: TTlsServerFinished12; Deadline: Integer): Boolean;
+var typ: Integer; body, raw, verify: string;
+begin
+  Result := False;
+  if not Stream.ReadRecord(Deadline, True, typ, body) then Exit;
+  Stream.SetRead(State.Aead, Copy(State.Keys, 1, State.KeyLen),
+                 Copy(State.Keys, 2 * State.KeyLen + 1, State.IvLen));
+  if not Stream.ReadMsg(Deadline, typ, body, raw) then Exit;
+  if (typ <> HsFinished) or (Stream.FHand <> '') then
+  begin
+    Stream.Fail(AlertUnexpectedMessage, 'tls: expected client finished', Deadline);
+    Exit;
+  end;
+  verify := Tls12Prf(State.Hash, State.MainSecret, 'client finished', HashOf(State.Hash, State.Transcript), 12);
+  if not CtEqualStr(verify, body) then
+  begin
+    Stream.Fail(AlertDecryptError, 'tls: invalid client finished hash', Deadline);
+    Exit;
+  end;
+  State.Transcript := State.Transcript + raw;
+  Result := True;
+end;
+
+function WriteServerFinished12(Stream: TTlsStream; var State: TTlsServerFinished12; Deadline: Integer): Boolean;
+var verify, raw: string;
+begin
+  Result := False;
+  verify := Tls12Prf(State.Hash, State.MainSecret, 'server finished', HashOf(State.Hash, State.Transcript), 12);
+  raw := U8(HsFinished) + Vec24(verify);
+  if not Stream.WriteRecord(RecCcs, #1, Deadline) then Exit;
+  Stream.SetWrite(State.Aead, Copy(State.Keys, State.KeyLen + 1, State.KeyLen),
+                  Copy(State.Keys, 2 * State.KeyLen + State.IvLen + 1, State.IvLen));
+  if not Stream.WriteRecord(RecHandshake, raw, Deadline) then Exit;
+  State.Transcript := State.Transcript + raw;
+  Result := True;
+end;
+
+function ServerHello12(const Random, Session: string; Suite: Integer; const Extensions: string): string;
+begin
+  Result := U8(HsServerHello) + Vec24(U16(TlsVersion12) + Random + Vec8(Session) + U16(Suite) + #0 +
+                                    Vec16(Extensions));
+end;
+
+{ RFC 5246 §7.3, RFC 5077 §§3.1–3.4 and Go's doResumeHandshake.
+  Echo the session ID and
+  send server Finished first. Keep the original ticket expiry and derive
+  fresh record keys from this connection's two randoms. }
+function ResumeServer12(Stream: TTlsStream; const Hello: TClientHello;
+  const HelloRaw, Random, Extensions: string; const Ticket: TTlsServerTicket; Deadline: Integer): Boolean;
+var state: TTlsServerFinished12; flight: string;
+begin
+  Result := False;
+  Stream.FSuite := Ticket.Suite;
+  SuiteParams(Stream.FSuite, state.Aead, state.KeyLen, state.Hash);
+  state.MainSecret := Ticket.Secret;
+  flight := ServerHello12(Random, Hello.Session, Stream.FSuite, Extensions);
+  if not Stream.WriteHandshake(flight, Deadline) then Exit;
+  state.Transcript := HelloRaw + flight;
+  SetServerKeys12(state, Random, Hello.Random);
+  if not WriteServerFinished12(Stream, state, Deadline) then Exit;
+  if not ReadClientFinished12(Stream, state, Deadline) then Exit;
+  Stream.FDone := True;
+  Result := True;
+end;
+
 { TLS 1.2 full certificate handshake, Go's handshake_server.go,
   key_agreement.go and prf.go. Require the RFC 7627 transcript binding. }
 function HandshakeServer12(Stream: TTlsStream; Config: TTlsServerConfig;
   const Hello: TClientHello; const HelloRaw, RequiredProtocol: string; Deadline: Integer): Boolean;
 var
   r: TRd;
-  i, suite, scheme, group, aead, keyLen, ivLen, hash, typ: Integer;
-  data, exts, random, pub, priv, params, sig, flight, transcript, raw, body: string;
-  peer, shared, mainSecret, keys, verify: string;
-  ecdsaSuite, renegotiation: Boolean;
+  i, suite, scheme, group, typ: Integer;
+  data, exts, random, pub, priv, params, sig, flight, raw, body, peer, shared, sessionId: string;
+  ecdsaSuite, renegotiation, issueTicket, sessionFound: Boolean;
+  ticket: TTlsServerTicket;
+  finish: TTlsServerFinished12;
 begin
   Result := False;
   if ContainsWord(Hello.Suites, $5600) then
@@ -1985,13 +2131,34 @@ begin
     end;
     exts := exts + U16(ExtPointFormats) + Vec16(Vec8(#0));
   end;
-  if Hello.Name <> '' then exts := exts + U16(ExtServerName) + Vec16('');
   if not ChooseAlpn(Hello.Alpn, Config, RequiredProtocol, Stream.FAlpn) then
   begin
     Stream.Fail(AlertNoApplicationProtocol, 'tls: no application protocol', Deadline);
     Exit;
   end;
   if Stream.FAlpn <> '' then exts := exts + U16(ExtAlpn) + Vec16(Vec16(Vec8(Stream.FAlpn)));
+
+  { RFC 9846 §4.2.3. This server also supports TLS 1.3. }
+  random := RandomString(24) + 'DOWNGRD'#1;
+  issueTicket := False;
+  sessionId := '';
+  if Config.SessionTickets then
+  begin
+    issueTicket := ExtGet(Hello.Extensions, ExtSessionTicket, data);
+    if not issueTicket then data := Hello.Session;
+    { RFC 5077 §3.4 forbids falling back to the ClientHello ID when a
+      ticket is presented. Use only the lookup method the client offered. }
+    sessionFound := FindServerSession(Config, data, Hello.Name, Stream.FAlpn, TlsVersion12,
+                                      not issueTicket, ticket);
+    if sessionFound and ContainsWord(Hello.Suites, ticket.Suite) then
+      Exit(ResumeServer12(Stream, Hello, HelloRaw, random, exts, ticket, Deadline));
+    if issueTicket then exts := exts + U16(ExtSessionTicket) + Vec16('')
+    else
+      repeat
+        sessionId := RandomString(32);
+      until sessionId <> Hello.Session;
+  end;
+  if Hello.Name <> '' then exts := exts + U16(ExtServerName) + Vec16('');
 
   ecdsaSuite := Config.FKeyAlgorithm <> X509PkRSA;
   RdInit(r, Suites12);
@@ -2020,9 +2187,7 @@ begin
     Stream.Fail(AlertHandshakeFailure, 'tls: no shared cipher suite, signature scheme or key exchange group', Deadline);
     Exit;
   end;
-  SuiteParams(Stream.FSuite, aead, keyLen, hash);
-  { RFC 9846 §4.2.3. This server also supports TLS 1.3. }
-  random := RandomString(24) + 'DOWNGRD'#1;
+  SuiteParams(Stream.FSuite, finish.Aead, finish.KeyLen, finish.Hash);
   pub := KeyShare(group, priv);
   params := #3 + U16(group) + Vec8(pub);
   if not ServerSignature(Config, scheme, Hello.Random + random + params, sig) then
@@ -2030,11 +2195,11 @@ begin
     Stream.Fail(AlertInternalError, 'tls: could not sign the handshake', Deadline);
     Exit;
   end;
-  flight := U8(HsServerHello) + Vec24(U16(TlsVersion12) + random + #0 + U16(Stream.FSuite) + #0 + Vec16(exts)) +
+  flight := ServerHello12(random, sessionId, Stream.FSuite, exts) +
     Config.FCertificate12 + U8(HsServerKeyExchange) + Vec24(params + U16(scheme) + Vec16(sig)) +
     U8(HsServerHelloDone) + Vec24('');
   if not Stream.WriteHandshake(flight, Deadline) then Exit;
-  transcript := HelloRaw + flight;
+  finish.Transcript := HelloRaw + flight;
   if not Stream.ReadMsg(Deadline, typ, body, raw) then Exit;
   if typ <> HsClientKeyExchange then
   begin
@@ -2048,87 +2213,25 @@ begin
     Stream.Fail(AlertIllegalParameter, 'tls: invalid client key share', Deadline);
     Exit;
   end;
-  transcript := transcript + raw;
-  mainSecret := Tls12Prf(hash, shared, 'extended master secret', HashOf(hash, transcript), 48);
-  if aead = 1 then ivLen := 4
-  else ivLen := 12;
-  keys := Tls12Prf(hash, mainSecret, 'key expansion', random + Hello.Random, 2 * (keyLen + ivLen));
-
-  if not Stream.ReadRecord(Deadline, True, typ, data) then Exit;
-  Stream.SetRead(aead, Copy(keys, 1, keyLen), Copy(keys, 2 * keyLen + 1, ivLen));
-  if not Stream.ReadMsg(Deadline, typ, body, raw) then Exit;
-  if (typ <> HsFinished) or (Stream.FHand <> '') then
+  finish.Transcript := finish.Transcript + raw;
+  finish.MainSecret := Tls12Prf(finish.Hash, shared, 'extended master secret', HashOf(finish.Hash, finish.Transcript), 48);
+  SetServerKeys12(finish, random, Hello.Random);
+  if not ReadClientFinished12(Stream, finish, Deadline) then Exit;
+  if issueTicket then
   begin
-    Stream.Fail(AlertUnexpectedMessage, 'tls: expected client finished', Deadline);
-    Exit;
+    data := RandomString(32);
+    if not RememberServerSession(Config, data, Hello.Name, Stream.FAlpn, finish.MainSecret, TlsVersion12,
+                                 Stream.FSuite, finish.Hash, False) then data := '';
+    { RFC 5077 includes this plaintext handshake message in server Finished. }
+    raw := U8(HsNewSessionTicket) + Vec24(U32(TlsTicketLifetime) + Vec16(data));
+    if not Stream.WriteHandshake(raw, Deadline) then Exit;
+    finish.Transcript := finish.Transcript + raw;
   end;
-  verify := Tls12Prf(hash, mainSecret, 'client finished', HashOf(hash, transcript), 12);
-  if not CtEqualStr(verify, body) then
-  begin
-    Stream.Fail(AlertDecryptError, 'tls: invalid client finished hash', Deadline);
-    Exit;
-  end;
-  verify := Tls12Prf(hash, mainSecret, 'server finished', HashOf(hash, transcript + raw), 12);
-  if not Stream.WriteRecord(RecCcs, #1, Deadline) then Exit;
-  Stream.SetWrite(aead, Copy(keys, keyLen + 1, keyLen), Copy(keys, 2 * keyLen + ivLen + 1, ivLen));
-  if not Stream.WriteRecord(RecHandshake, U8(HsFinished) + Vec24(verify), Deadline) then Exit;
+  if sessionId <> '' then
+    RememberServerSession(Config, sessionId, Hello.Name, Stream.FAlpn, finish.MainSecret, TlsVersion12,
+                          Stream.FSuite, finish.Hash, True);
+  if not WriteServerFinished12(Stream, finish, Deadline) then Exit;
   Stream.FDone := True;
-  Result := True;
-end;
-
-{ An opaque, single-use lookup key as in rustls server/tls13.rs.
-  The cache belongs to one loaded identity. The lock protects both the slots
-  and the index, and old entries are evicted in insertion order. }
-function RememberTicket(Config: TTlsServerConfig; const Ticket: TTlsServerTicket): Boolean;
-var i: Integer; previous: string;
-begin
-  lock Config.FTicketMu do
-  begin
-    if Length(Config.FTicketSlots) = 0 then
-    begin
-      SetLength(Config.FTicketSlots, Tls13TicketSlots);
-      New(Config.FTicketIndex);
-    end;
-    if Ticket.Id in Config.FTicketIndex then Exit(False);
-    i := Config.FNextTicket;
-    previous := Config.FTicketSlots[i].Id;
-    if previous <> '' then Delete(Config.FTicketIndex, previous);
-    Config.FTicketSlots[i] := Ticket;
-    Config.FTicketIndex[Ticket.Id] := i;
-    Config.FNextTicket := (i + 1) mod Tls13TicketSlots;
-  end;
-  Result := True;
-end;
-
-function FindTicket(Config: TTlsServerConfig; const Id, Name, Protocol: string; Hash: Integer;
-  out Psk: string): Boolean;
-var i: Integer; ticket: TTlsServerTicket;
-begin
-  Result := False;
-  Psk := '';
-  lock Config.FTicketMu do
-  begin
-    if not TryGet(Config.FTicketIndex, Id, i) then Exit;
-    ticket := Config.FTicketSlots[i];
-    if (ticket.Hash <> Hash) or (ticket.Name <> Name) or (ticket.Protocol <> Protocol) or
-      (ticket.ExpiresAt <= Nanotime) then Exit;
-    Psk := ticket.Psk;
-  end;
-  Result := True;
-end;
-
-function ConsumeTicket(Config: TTlsServerConfig; const Id, Psk: string): Boolean;
-var i: Integer;
-begin
-  Result := False;
-  lock Config.FTicketMu do
-  begin
-    if not TryGet(Config.FTicketIndex, Id, i) then Exit;
-    if (Config.FTicketSlots[i].ExpiresAt <= Nanotime) or
-      not CtEqualStr(Config.FTicketSlots[i].Psk, Psk) then Exit;
-    Delete(Config.FTicketIndex, Id);
-    Config.FTicketSlots[i] := Default(TTlsServerTicket);
-  end;
   Result := True;
 end;
 
@@ -2136,21 +2239,24 @@ function CheckPsk13(Config: TTlsServerConfig; const Hello: TClientHello; Hash: I
   const Protocol, BeforeHello, HelloRaw: string; out Selected: Integer; out EarlySecret: string): Integer;
 var
   i, size: Integer;
-  psk, binderKey, finishedKey, truncated, expected: string;
+  ticket: TTlsServerTicket;
+  binderKey, finishedKey, truncated, expected: string;
 begin
   Selected := -1;
   size := CipherHashSize(Hash);
   if Config.SessionTickets and Hello.PskDhe then
     for i := 0 to Min(High(Hello.Psks), MaxTicketIdentities - 1) do
-      if FindTicket(Config, Hello.Psks[i].Identity, Hello.Name, Protocol, Hash, psk) then
+      if FindServerSession(Config, Hello.Psks[i].Identity, Hello.Name, Protocol, TlsVersion13,
+                           False, ticket) and
+        (ticket.Hash = Hash) then
       begin
-        EarlySecret := HkdfExtract(Hash, '', psk);
+        EarlySecret := HkdfExtract(Hash, '', ticket.Secret);
         binderKey := DeriveSecret(Hash, EarlySecret, 'res binder', '');
         finishedKey := ExpandLabel(Hash, binderKey, 'finished', '', size);
         truncated := Copy(HelloRaw, 1, Length(HelloRaw) - Hello.BinderBytes);
         expected := CipherHmac(Hash, finishedKey, HashOf(Hash, BeforeHello + truncated));
         if not CtEqualStr(expected, Hello.Psks[i].Binder) then Exit(AlertDecryptError);
-        if not ConsumeTicket(Config, Hello.Psks[i].Identity, psk) then Break;
+        if not ConsumeTicket(Config, ticket) then Break;
         Selected := i;
         Exit(0);
       end;
@@ -2160,18 +2266,15 @@ end;
 
 function SendTicket13(Stream: TTlsStream; Config: TTlsServerConfig; Hash: Integer;
   const MainSecret, Transcript: string; Deadline: Integer): Boolean;
-var ticket: TTlsServerTicket; message, resumption: string;
+var id, secret, message, resumption: string;
 begin
   resumption := DeriveSecret(Hash, MainSecret, 'res master', Transcript);
-  ticket.Id := RandomString(32);
   { Go sends one ticket per connection and uses an empty per-connection nonce. }
-  ticket.Psk := ExpandLabel(Hash, resumption, 'resumption', '', CipherHashSize(Hash));
-  ticket.Hash := Hash;
-  ticket.Name := Stream.FServerName;
-  ticket.Protocol := Stream.FAlpn;
-  ticket.ExpiresAt := Nanotime + Tls13TicketLifetime * 1000000000;
-  if not RememberTicket(Config, ticket) then Exit(True);
-  message := U32(Tls13TicketLifetime) + RandomString(4) + Vec8('') + Vec16(ticket.Id) + Vec16('');
+  secret := ExpandLabel(Hash, resumption, 'resumption', '', CipherHashSize(Hash));
+  id := RandomString(32);
+  if not RememberServerSession(Config, id, Stream.FServerName, Stream.FAlpn, secret, TlsVersion13,
+                               Stream.FSuite, Hash, False) then Exit(True);
+  message := U32(TlsTicketLifetime) + RandomString(4) + Vec8('') + Vec16(id) + Vec16('');
   Result := Stream.WriteHandshake(U8(HsNewSessionTicket) + Vec24(message), Deadline);
 end;
 

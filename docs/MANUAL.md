@@ -12812,11 +12812,12 @@ preference order and read `RequestedServerName` and `Protocol` from
 the resulting stream. The configuration serves one identity.
 TLS 1.3 rotates its traffic keys before reaching the record limit.
 
-Set `config.SessionTickets := True` to enable TLS 1.3 resumption. Each
-connection can issue one single-use ticket after verifying the client's
-Finished. The config holds up to 1024 tickets, each valid for up to an
-hour. Resumption uses a fresh ephemeral key exchange and matches SNI,
-ALPN and the cipher suite's KDF hash. Early application data is discarded.
+Set `config.SessionTickets := True` to enable session resumption. The
+config holds up to 1024 resumable sessions, each valid for up to an hour.
+Both versions check the SNI and negotiated ALPN against the saved session. TLS 1.3
+uses a fresh ephemeral key exchange and matches the cipher suite's KDF
+hash. Each connection can issue one single-use ticket after verifying the
+client's Finished. Early application data is discarded.
 [RFC 9846](https://www.rfc-editor.org/rfc/rfc9846.html#section-4.7.1)
 
 Set `config.MinVersion := TlsVersion12` before serving to also accept
@@ -12824,8 +12825,12 @@ TLS 1.2. The default requires TLS 1.3. A client that offers both gets
 TLS 1.3. TLS 1.2 requires the extended main secret extension and uses
 ECDHE with the same AEAD ciphers. It also accepts RSA PKCS #1 signatures
 with SHA-256, SHA-384 or SHA-512. Each TLS 1.2 connection uses fresh
-session keys and ends at its record limit. Renegotiation is disabled.
-[RFC 7627](https://www.rfc-editor.org/info/rfc7627), [RFC 9325](https://www.rfc-editor.org/info/rfc9325)
+record keys and ends at its record limit. Renegotiation is disabled.
+TLS 1.2 issues a ticket to clients that offer tickets and a session ID
+to other clients. Both come from a full handshake with the extended main
+secret. Abbreviated handshakes preserve the original cipher suite and
+expiry and derive fresh record keys from the new client and server randoms.
+[RFC 5077](https://www.rfc-editor.org/info/rfc5077), [RFC 7627](https://www.rfc-editor.org/info/rfc7627), [RFC 9325](https://www.rfc-editor.org/info/rfc9325)
 
 `uses pasconn` gives TCP and Unix streams the same reads and writes used by
 the protocol clients. `ReadSome(MaxN, Deadline, out Data)` returns the
