@@ -40,11 +40,9 @@ def run(command, timeout=45, **options):
 
 
 @contextmanager
-def server(command, cert, key, file, raw=False):
+def server(command, cert, key, file, raw=False, tls12=False):
     env = dict(os.environ, PASLANG_MAXPROCS='1')
-    args = [*command, cert, key, file]
-    if raw:
-        args.append('raw')
+    args = [*command, cert, key, file, 'raw' if raw else '', 'tls12' if tls12 else '']
     with subprocess.Popen(args, stdout=subprocess.PIPE,
                           stderr=subprocess.PIPE, env=env) as process:
         try:
@@ -65,18 +63,17 @@ def server(command, cert, key, file, raw=False):
                 f'server exit {process.returncode}: {out!r} {err!r}')
 
 
-def client_context(root, protocols=('http/1.1',)):
+def client_context(root, protocols=('http/1.1',), version=ssl.TLSVersion.TLSv1_3):
     context = ssl.create_default_context(cafile=root)
-    context.minimum_version = ssl.TLSVersion.TLSv1_3
-    context.maximum_version = ssl.TLSVersion.TLSv1_3
+    context.minimum_version = context.maximum_version = version
     context.set_alpn_protocols(list(protocols))
     return context
 
 
-def get_hello(port, context, protocol='http/1.1'):
+def get_hello(port, context, protocol='http/1.1', version='TLSv1.3'):
     with socket.create_connection(('127.0.0.1', port), timeout=8) as connection:
         with context.wrap_socket(connection, server_hostname='localhost', suppress_ragged_eofs=False) as stream:
-            require(stream.version() == 'TLSv1.3', 'TLS version')
+            require(stream.version() == version, 'TLS version')
             require(stream.selected_alpn_protocol() == protocol, 'ALPN')
             stream.sendall(REQUEST)
             response = http.client.HTTPResponse(stream, method='GET')
@@ -108,15 +105,17 @@ def check_openssl(port, root, folder):
         require('], Finished\n' in handshake, 'OpenSSL did not see a Finished message')
 
 
-def check_key_update(compile_command, runner, folder, identity, file):
-    # Compile the real record writer with a short epoch. OpenSSL must
-    # see KeyUpdate and still decrypt every byte across the boundary.
+def check_key_limits(compile_command, runner, folder, identity, file):
+    # Keep the real record layer and shorten only the limits. TLS 1.3
+    # must rekey in place. TLS 1.2 must close before exhausting its keys.
     source = (ROOT / 'src/lib/pastls.paslang').read_text()
-    limit = '  Tls13MaxEpochRecords = 16777216;'
-    require(source.count(limit) == 1, 'missing TLS 1.3 record limit')
+    for limit, reduced in (('Tls13MaxEpochRecords', 3), ('Tls12MaxRecords', 4)):
+        declaration = f'  {limit} = 16777216;'
+        require(source.count(declaration) == 1, f'missing {limit}')
+        source = source.replace(declaration, f'  {limit} = {reduced};')
     folder.mkdir()
     local_tls = folder / 'pastls.paslang'
-    local_tls.write_text(source.replace(limit, '  Tls13MaxEpochRecords = 3;'))
+    local_tls.write_text(source)
     run([*compile_command, '-c', '-o', folder / 'pastls', local_tls])
     binary = folder / 'server'
     run([compile_command[0], '-Fu', folder, *compile_command[1:], '-o', binary,
@@ -133,6 +132,27 @@ def check_key_update(compile_command, runner, folder, identity, file):
         status, body = result.stdout.split(b'\r\n\r\n', 1)
         require(status.startswith(b'HTTP/1.1 200 ') and body == FILE, 'data across KeyUpdate')
         require('], KeyUpdate\n' in trace.read_text(), 'missing server KeyUpdate')
+
+
+    with server([*runner, binary], cert, key, file, tls12=True) as port:
+        context = client_context(root, version=ssl.TLSVersion.TLSv1_2)
+        with socket.create_connection(('127.0.0.1', port), timeout=8) as connection:
+            with context.wrap_socket(connection, server_hostname='localhost', suppress_ragged_eofs=False) as stream:
+                stream.sendall(b'GET /file HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n')
+                response = stream.makefile('rb').read()
+                header, body = response.split(b'\r\n\r\n', 1)
+                require(header.startswith(b'HTTP/1.1 200 ') and 0 < len(body) < len(FILE) and FILE.startswith(body),
+                        'TLS 1.2 write key limit must end the stream with close_notify')
+        with socket.create_connection(('127.0.0.1', port), timeout=8) as connection:
+            with context.wrap_socket(connection, server_hostname='localhost') as stream:
+                for byte in REQUEST[:4]:
+                    stream.sendall(bytes((byte,)))
+                try:
+                    stream.recv(1)
+                except ssl.SSLError as error:
+                    require(error.reason == 'TLSV1_ALERT_INTERNAL_ERROR', str(error))
+                else:
+                    raise RuntimeError('TLS 1.2 read key limit did not alert')
 
 
 def save_early_ticket(cert, key, root, path):
@@ -216,11 +236,15 @@ def make_cert(folder, name, option, value):
     return cert, key, cert
 
 
-def check_profile(label, command, identities, file, folder, go_client, ticket, wrong_key):
+def check_profile(label, command, identities, file, folder, go_client, ticket, wrong_key, weak_rsa):
     mismatched = subprocess.run([*command, KEYS / 'ec.pem', wrong_key, file],
                                 capture_output=True, timeout=10)
     require(mismatched.returncode == 3 and b'does not match' in mismatched.stdout,
             'mismatched identity must fail before listening')
+    weak_cert, weak_key, _ = weak_rsa
+    weak = subprocess.run([*command, weak_cert, weak_key, file], capture_output=True, timeout=10)
+    require(weak.returncode == 3 and b'RSA key needs at least 2048 bits' in weak.stdout,
+            'weak RSA identity must fail before listening')
     for name, (cert, key, root) in identities.items():
         context = client_context(root)
         with server(command, cert, key, file) as port:
@@ -262,6 +286,96 @@ def check_profile(label, command, identities, file, folder, go_client, ticket, w
     print(f'TLS 1.3 server {label}: verified five PEM identities, three suites, HRR, HTTPS and standalone TLS')
 
 
+def tls12_client_hello(*, extensions=(), ems=b'', fallback=False):
+    def vector(value, size=2):
+        return len(value).to_bytes(size, 'big') + value
+
+    suites = bytes.fromhex('c02b00ff' + ('5600' if fallback else ''))
+    params = [(10, vector(bytes.fromhex('001d0017'))), (13, vector(bytes.fromhex('0403')))]
+    if ems is not None:
+        params.append((23, ems))
+    params.extend(extensions)
+    extensions = b''.join(code.to_bytes(2, 'big') + vector(value) for code, value in params)
+    body = b'\x03\x03' + bytes(32) + b'\0' + vector(suites) + b'\x01\0' + vector(extensions)
+    return b'\x16\x03\x01' + vector(b'\x01' + vector(body, 3))
+
+
+def check_tls12_alerts(port):
+    for options, expected in (
+        ({'ems': None}, 40),
+        ({'ems': b'\0'}, 50),
+        ({'fallback': True}, 86),
+        ({'extensions': [(43, bytes.fromhex('020302'))]}, 70),
+        ({'extensions': [(0xff01, b'\x01\xaa')]}, 40),
+    ):
+        with socket.create_connection(('127.0.0.1', port), timeout=8) as connection:
+            connection.sendall(tls12_client_hello(**options))
+            with connection.makefile('rb') as stream:
+                alert = stream.read(7)
+                require(len(alert) == 7 and alert[0] == 21 and alert[3:] == bytes((0, 2, 2, expected)),
+                        f'expected fatal alert {expected}, got {alert.hex()}')
+
+    with socket.create_connection(('127.0.0.1', port), timeout=8) as connection:
+        # The explicit versions vector selects TLS 1.2. ServerHello
+        # must carry the downgrade sentinel, including on the TLS 1.2 wire.
+        connection.sendall(tls12_client_hello(extensions=[(43, bytes.fromhex('020303'))]))
+        with connection.makefile('rb') as stream:
+            header = stream.read(5)
+            require(header[:3] == b'\x16\x03\x03', 'expected a TLS 1.2 handshake record')
+            response = stream.read(int.from_bytes(header[3:], 'big'))
+            require(response[:1] == b'\x02' and response[30:38] == b'DOWNGRD\x01',
+                    'missing TLS 1.2 downgrade sentinel')
+            require(b'\x0e\0\0\0' == response[-4:], 'incomplete TLS 1.2 server flight')
+            # A ChangeCipherSpec cannot replace the client's key exchange.
+            connection.sendall(b'\x14\x03\x03\x00\x01\x01')
+            require(stream.read(7) == b'\x15\x03\x03\x00\x02\x02\x0a', 'early change cipher spec')
+
+
+def check_tls12_profile(label, command, identities, file, go_client):
+    version = ssl.TLSVersion.TLSv1_2
+    for name, (cert, key, root) in identities.items():
+        with server(command, cert, key, file, tls12=True) as port:
+            if name != 'ed25519':
+                get_hello(port, client_context(root, version=version), version='TLSv1.2')
+            run([go_client, '-client', f'127.0.0.1:{port}', '-root', root, '-client-version', '1.2'])
+            if name not in ('p256', 'rsa'):
+                continue
+            for suffix, groups in (('AES128-GCM-SHA256', 'X25519:P-256'),
+                                   ('AES256-GCM-SHA384', 'P-384:P-256'),
+                                   ('CHACHA20-POLY1305', 'P-256')):
+                auth = 'RSA' if name == 'rsa' else 'ECDSA'
+                suite = f'ECDHE-{auth}-{suffix}'
+                args = ['openssl', 's_client', '-connect', f'127.0.0.1:{port}', '-tls1_2',
+                        '-CAfile', root, '-verify_return_error', '-verify_hostname', 'localhost',
+                        '-servername', 'localhost', '-alpn', 'http/1.1', '-cipher', suite,
+                        '-groups', groups, '-quiet']
+                if name == 'rsa':
+                    args += ['-sigalgs', 'rsa_pkcs1_sha256']
+                result = run(args, input=REQUEST)
+                require(result.stdout.startswith(b'HTTP/1.1 200 ') and result.stdout.endswith(HELLO), suite)
+            if name != 'p256':
+                continue
+            # This client offers both versions. The server must choose TLS 1.3.
+            both = client_context(root, version=version)
+            both.maximum_version = ssl.TLSVersion.TLSv1_3
+            get_hello(port, both)
+            check_http(port, client_context(root, version=version))
+            reject(port, client_context(root, ('h2',), version), 'TLSV1_ALERT_NO_APPLICATION_PROTOCOL')
+            check_tls12_alerts(port)
+            result = run(['curl', '--noproxy', '*', '--fail', '--silent', '--show-error',
+                          '--tls-max', '1.2', '--tlsv1.2', '--http1.1', '--cacert', root,
+                          '--resolve', f'localhost:{port}:127.0.0.1', f'https://localhost:{port}/file'])
+            require(result.stdout == FILE, 'curl TLS 1.2 file body')
+    cert, key, root = identities['p256']
+    with server(command, cert, key, file, raw=True, tls12=True) as port:
+        context = client_context(root, ('http/1.1', 'pas-test'), version)
+        with socket.create_connection(('127.0.0.1', port), timeout=8) as connection:
+            with context.wrap_socket(connection, server_hostname='localhost') as stream:
+                require(stream.selected_alpn_protocol() == 'pas-test', 'TLS 1.2 standalone ALPN')
+                require(stream.makefile('rb').read() == b'localhost pas-test', 'TLS 1.2 standalone SNI')
+    print(f'TLS 1.2 server {label}: verified HTTPS, SNI, ALPN, six suites, and protocol alerts')
+
+
 def main():
     compiler, build, qemu = (Path(arg).resolve() for arg in sys.argv[1:])
     go_client = build / 'tlsoracle-server-check'
@@ -286,6 +400,7 @@ def main():
             'ed25519': make_cert(folder, 'ed25519', 'ed25519', ''),
             'p384': make_cert(folder, 'p384', 'ec', 'ec_paramgen_curve:secp384r1'),
         }
+        weak_rsa = make_cert(folder, 'weak-rsa', 'rsa:1024', '')
         ticket = folder / 'session.pem'
         save_early_ticket(*identities['p256'], ticket)
         for arch, cpu in (('amd64', 'base'), ('amd64', 'native'), ('arm64', 'base'), ('arm64', 'max')):
@@ -295,10 +410,12 @@ def main():
             compile_command = [compiler, '-target', arch, '-cpu', cpu, '-Fu', units]
             run([*compile_command, '-o', binary, ROOT / 'testdata/tlsserver13.paslang'])
             runner = [] if arch == 'amd64' else [qemu]
-            check_profile(label, [*runner, binary], identities, file, folder, go_client, ticket, wrong_key)
-            check_key_update(compile_command, runner, folder / (binary.name + '-short-epoch'),
+            check_profile(label, [*runner, binary], identities, file, folder, go_client, ticket,
+                          wrong_key, weak_rsa)
+            check_tls12_profile(label, [*runner, binary], identities, file, go_client)
+            check_key_limits(compile_command, runner, folder / (binary.name + '-short-epoch'),
                              identities['p256'], file)
-            print(f'TLS 1.3 server {label}: OpenSSL verified traffic across KeyUpdate')
+            print(f'TLS server {label}: TLS 1.3 KeyUpdate and TLS 1.2 read/write key limits')
 
 
 if __name__ == '__main__':

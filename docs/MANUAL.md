@@ -12779,7 +12779,8 @@ cases), on both machines, in make check when Go and openssl are there.
 with `TTlsServerConfig.LoadKeyPair(certPem, keyPem, out err)` before
 serving. Put the leaf first in the chain, followed by intermediates.
 An unencrypted PKCS #1 RSA, SEC 1 EC or PKCS #8 key is accepted when
-its public key matches the leaf. The server supports RSA-PSS,
+its public key matches the leaf. RSA requires at least 2048 bits.
+The server supports RSA-PSS,
 P-256 and P-384 ECDSA, and Ed25519 identities. Key establishment uses
 X25519, P-256 or P-384 and can retry when a client's first key share
 uses another group. The ciphers are AES-128-GCM, AES-256-GCM and
@@ -12810,7 +12811,15 @@ success and failure. A standalone server can set `config.Alpn` in
 preference order and read `RequestedServerName` and `Protocol` from
 the resulting stream. The configuration serves one identity and each
 connection performs a full handshake. Early application data is discarded.
-The stream rotates its traffic keys before reaching the record limit.
+TLS 1.3 rotates its traffic keys before reaching the record limit.
+
+Set `config.MinVersion := TlsVersion12` before serving to also accept
+TLS 1.2. The default requires TLS 1.3. A client that offers both gets
+TLS 1.3. TLS 1.2 requires the extended main secret extension and uses
+ECDHE with the same AEAD ciphers. It also accepts RSA PKCS #1 signatures
+with SHA-256, SHA-384 or SHA-512. Each TLS 1.2 connection uses fresh
+session keys and ends at its record limit. Renegotiation is disabled.
+[RFC 7627](https://www.rfc-editor.org/info/rfc7627), [RFC 9325](https://www.rfc-editor.org/info/rfc9325)
 
 `uses pasconn` gives TCP and Unix streams the same reads and writes used by
 the protocol clients. `ReadSome(MaxN, Deadline, out Data)` returns the

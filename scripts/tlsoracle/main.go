@@ -68,11 +68,22 @@ func main() {
 	port := flag.Int("port", 0, "port")
 	name := flag.String("case", "tls13", "case")
 	dir := flag.String("dir", ".", "where ca.pem goes")
-	client := flag.String("client", "", "connect to a TLS 1.3 server at this address")
+	client := flag.String("client", "", "connect to a TLS server at this address")
+	clientVersion := flag.String("client-version", "1.3", "TLS version for the client")
 	root := flag.String("root", "", "PEM root trusted by the client")
 	flag.Parse()
 	if *client != "" {
-		if err := checkServer(*client, *root); err != nil {
+		var version uint16
+		switch *clientVersion {
+		case "1.2":
+			version = tls.VersionTLS12
+		case "1.3":
+			version = tls.VersionTLS13
+		default:
+			fmt.Fprintln(os.Stderr, "invalid -client-version")
+			os.Exit(1)
+		}
+		if err := checkServer(*client, *root, version); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}

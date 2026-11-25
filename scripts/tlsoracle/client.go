@@ -19,7 +19,7 @@ import (
 
 // Check certificate authentication, the handshake and the HTTP exchange
 // with an independent TLS stack over TCP.
-func checkServer(addr, root string) error {
+func checkServer(addr, root string, version uint16) error {
 	pem, err := os.ReadFile(root)
 	if err != nil {
 		return err
@@ -29,7 +29,7 @@ func checkServer(addr, root string) error {
 		return fmt.Errorf("cannot read test root")
 	}
 	cfg := &tls.Config{RootCAs: roots, ServerName: "localhost", NextProtos: []string{"http/1.1"},
-		MinVersion: tls.VersionTLS13, MaxVersion: tls.VersionTLS13}
+		MinVersion: version, MaxVersion: version}
 	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 5 * time.Second}, "tcp", addr, cfg)
 	if err != nil {
 		return err
@@ -38,8 +38,9 @@ func checkServer(addr, root string) error {
 	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		return err
 	}
-	if conn.ConnectionState().NegotiatedProtocol != "http/1.1" {
-		return fmt.Errorf("unexpected ALPN")
+	state := conn.ConnectionState()
+	if state.Version != version || state.NegotiatedProtocol != "http/1.1" {
+		return fmt.Errorf("unexpected TLS version or ALPN")
 	}
 	if _, err := io.WriteString(conn, "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"); err != nil {
 		return err

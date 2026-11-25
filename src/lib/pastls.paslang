@@ -25,10 +25,11 @@
   crypto/tls routine by routine: handshake_client.go,
   handshake_client_tls13.go, key_schedule.go and
   crypto/internal/fips140/tls13, conn.go's record layer,
-  handshake_messages.go, cipher_suites.go, prf.go, auth.go. The TLS 1.3
-  server (P628, RFC 9846) follows handshake_server_tls13.go for the full
-  certificate handshake. Resumption, 0-RTT and client authentication are
-  outside this handshake. The client sends an empty certificate on request.
+  handshake_messages.go, cipher_suites.go, prf.go, auth.go. The server
+  (P628) follows handshake_server_tls13.go and handshake_server.go for
+  the full certificate handshakes. The server defaults to TLS 1.3 and
+  can also accept TLS 1.2 with the extended main secret (RFC 7627 and
+  RFC 9846 Appendix D). The client sends an empty certificate on request.
 
   The keys come from X25519 (pasx25519) or P-256 and P-384 (pasnist),
   the records are sealed by pascipher, the server's chain is checked by
@@ -74,7 +75,7 @@ type
   { Load a PEM identity once and keep it alive while it is used by Accept. }
   TTlsServerConfig = class(TNetAcceptor)
   private
-    FCertificate: string;
+    FCertificate, FCertificate12: string;
     FKeyAlgorithm, FCurve: Integer;
     FRsa: TRsaPrivateKey;
     FEcSecret: string;
@@ -82,6 +83,8 @@ type
   public
     { Set before accepting. A protocol requested by the transport overrides this list. }
     Alpn: TStringArray;
+    { 0 or TlsVersion13 requires TLS 1.3. TlsVersion12 also allows TLS 1.2. }
+    MinVersion: Integer;
     function LoadKeyPair(const CertPem, KeyPem: string; out Err: string): Boolean;
     function Accept(Raw: TNetStream; Deadline: Integer; const Protocol: string;
       out Err: string): TNetStream; override;
@@ -140,7 +143,7 @@ type
     procedure SetTraffic13(ForRead: Boolean; const Secret: string);
     function Seal(Typ: Integer; const Data: string): string;
     function Open(Typ: Integer; const Header, Payload: string; out Plain: string; out PlainTyp: Integer): Boolean;
-    function HandshakeServer13(Config: TTlsServerConfig; const RequiredProtocol: string;
+    function HandshakeServer(Config: TTlsServerConfig; const RequiredProtocol: string;
       Deadline: Integer): Boolean;
     function WriteHandshake(const Message: string; Deadline: Integer): Boolean;
     function Handshake(Config: TTlsConfig; const Host: string; Deadline: Integer): Boolean;
@@ -185,7 +188,7 @@ function TlsClient(Raw: TNetStream; Config: TTlsConfig; const Host: string; Dead
   out Err: string): TTlsStream;
 { a TCP connection to Host:Port and the handshake, within ConnectMs (0 none) }
 function TlsDial(const Host: string; Port, ConnectMs: Integer; Config: TTlsConfig; out Err: string): TTlsStream;
-{ A full TLS 1.3 server handshake. Takes ownership of Raw, also on failure. }
+{ A full server handshake. Takes ownership of Raw, also on failure. }
 function TlsServer(Raw: TNetStream; Config: TTlsServerConfig; Deadline: Integer;
   out Err: string): TTlsStream;
 
@@ -224,6 +227,7 @@ const
   AlertDecryptError = 51;
   AlertProtocolVersion = 70;
   AlertInternalError = 80;
+  AlertInappropriateFallback = 86;
   AlertIllegalParameter = 47;
   AlertMissingExtension = 109;
   AlertUnsupportedExtension = 110;
@@ -268,6 +272,9 @@ const
   { RFC 9846 §5.5 bounds AES-GCM to 2^24.5 full records per key.
     Use the same conservative limit for every TLS 1.3 application key. }
   Tls13MaxEpochRecords = 16777216;
+  { RFC 9325 §4.4 applies the same bound to TLS 1.2 GCM. A TLS 1.2
+    server closes at this limit because it cannot rotate traffic keys. }
+  Tls12MaxRecords = 16777216;
   { what TakeHead reads ahead of a record's head }
   RawAhead = 4096;
   ReadTimeout = 'tls: read timeout';
@@ -836,6 +843,8 @@ end;
 
 function TTlsStream.WriteRecord(Typ: Integer; const Data: string; Deadline: Integer): Boolean;
 begin
+  if FServer and (FVers = TlsVersion12) and (FWrSeq >= Tls12MaxRecords) then
+    Exit(False);
   Result := FRaw.WriteAll(RecordOf(Typ, Data), Deadline);
   if not Result then
   begin
@@ -869,7 +878,7 @@ end;
   under this one. The caller holds FWMu }
 function TTlsStream.WritePlain(P: Pointer; N, Deadline: Integer): Boolean;
 var
-  done, n1, held, used, batchLimit: Integer;
+  done, n1, held, used, batchLimit, remaining: Integer;
   chunk, rec, batch: string;
 begin
   Result := False;
@@ -878,8 +887,21 @@ begin
   begin
     if not PrepareApplicationWrite(Deadline) then Exit;
     batchLimit := RecordsAWrite;
-    if (FVers = TlsVersion13) and (Tls13MaxEpochRecords - FWrSeq < batchLimit) then
-      batchLimit := Tls13MaxEpochRecords - FWrSeq;
+    if FVers = TlsVersion13 then
+      batchLimit := Min(batchLimit, Tls13MaxEpochRecords - FWrSeq)
+    else if FServer then
+    begin
+      { Reserve the final record for close_notify. The caller holds FWMu. }
+      remaining := Tls12MaxRecords - FWrSeq - 1;
+      if remaining <= 0 then
+      begin
+        WriteRecord(RecAlert, U8(1) + U8(AlertCloseNotify), Deadline);
+        FWriteClosed := True;
+        FErr := 'tls: TLS 1.2 write key limit reached';
+        Exit;
+      end;
+      batchLimit := Min(batchLimit, remaining);
+    end;
     held := 0;
     used := 0;
     batch := '';
@@ -1059,9 +1081,10 @@ begin
     Typ := Ord(hdr[1]);
     vers := (Ord(hdr[2]) shl 8) or Ord(hdr[3]);
     n := (Ord(hdr[4]) shl 8) or Ord(hdr[5]);
-    { RFC 9846 §5.1 deprecates the plaintext version field. Keep the
-      existing client checks and validate encrypted records on the server. }
-    if (FVers <> 0) and (vers <> $0303) and (not FServer or (Typ = RecData)) then
+    { RFC 9846 §5.1 deprecates the TLS 1.3 plaintext version field.
+      TLS 1.2 uses the negotiated version from ServerHello onward. }
+    if (FVers <> 0) and (vers <> $0303) and
+      (not FServer or (FVers = TlsVersion12) or (Typ = RecData)) then
     begin
       Fail(AlertProtocolVersion, 'tls: received record with version ' + IntToHex(vers, 0) + ' when expecting version 303', Deadline);
       Exit;
@@ -1099,6 +1122,11 @@ begin
       Exit;
     end;
     if (FRdAead = 0) and (Typ = RecData) and DiscardEarlyRecord(n) then Continue;
+    if FServer and (FVers = TlsVersion12) and (FRdSeq >= Tls12MaxRecords) then
+    begin
+      Fail(AlertInternalError, 'tls: TLS 1.2 read key limit reached', Deadline);
+      Exit;
+    end;
     if not Open(Typ, hdr, payload, plain, ptyp) then
     begin
       if (Typ = RecData) and DiscardEarlyRecord(n) then Continue;
@@ -1528,11 +1556,15 @@ begin
   Result := digitsDots;
 end;
 
-{ ---- TLS 1.3 server, RFC 9846 §§4 and 7 and Go's handshake_server_tls13.go ---- }
+{ ---- server negotiation, Go's readClientHello and clientHelloMsg.unmarshal ---- }
+
+const
+  ServerGroups: array[0..2] of Integer = (GroupX25519, GroupP256, GroupP384);
 
 type
-  TClientHello13 = record
-    Prefix, Session, Suites, Groups, Schemes, Alpn, Name: string;
+  TClientHello = record
+    Legacy: Integer;
+    Prefix, Random, Session, Suites, Compression, Versions, Groups, Schemes, Alpn, Name: string;
     Extensions, Shares: TExtMap;
   end;
 
@@ -1559,54 +1591,34 @@ begin
   Result := r.Ok and RdEmpty(r) and (Length(Words) >= 2) and ((Length(Words) and 1) = 0);
 end;
 
-function ParseClientHello13(const Body: string; var H: TClientHello13): Integer;
+function ParseClientHello(const Body: string; var H: TClientHello): Integer;
 var
   r, r2: TRd;
-  legacy, i, groupAt, nameByte: Integer;
-  data, names, versions, compression, protocol: string;
+  i, nameByte: Integer;
+  data, names, protocol: string;
 begin
-  H := Default(TClientHello13);
+  H := Default(TClientHello);
   Result := AlertDecodeError;
   RdInit(r, Body);
-  legacy := Rd16(r);
-  RdBytes(r, 32);
+  H.Legacy := Rd16(r);
+  H.Random := RdBytes(r, 32);
   H.Session := RdVec8(r);
   H.Suites := RdVec16(r);
-  compression := RdVec8(r);
+  H.Compression := RdVec8(r);
   H.Prefix := Copy(Body, 1, r.P - 1);
-  data := RdVec16(r);
+  data := '';
+  if not RdEmpty(r) then data := RdVec16(r);
   if not (r.Ok and RdEmpty(r)) or (Length(H.Session) > 32) or
-    (Length(H.Suites) < 2) or ((Length(H.Suites) and 1) <> 0) then Exit;
+    (Length(H.Suites) < 2) or ((Length(H.Suites) and 1) <> 0) or (H.Compression = '') then Exit;
   if not ParseExts(data, H.Extensions) then Exit;
-  if not ExtGet(H.Extensions, ExtSupportedVersions, versions) then Exit(AlertProtocolVersion);
-  if not ReadHelloWords(H.Extensions, ExtSupportedVersions, versions) then Exit;
-  if not ContainsWord(versions, TlsVersion13) then Exit(AlertProtocolVersion);
-  if (legacy <> $0303) or (compression <> #0) then Exit(AlertIllegalParameter);
-  if not ExtGet(H.Extensions, ExtSignatureAlgorithms, data) or
-    not ExtGet(H.Extensions, ExtSupportedGroups, data) or
-    not ExtGet(H.Extensions, ExtKeyShare, data) then Exit(AlertMissingExtension);
-  if not ReadHelloWords(H.Extensions, ExtSignatureAlgorithms, H.Schemes) or
+  if ExtGet(H.Extensions, ExtSupportedVersions, data) and
+    not ReadHelloWords(H.Extensions, ExtSupportedVersions, H.Versions) then Exit;
+  if ExtGet(H.Extensions, ExtSignatureAlgorithms, data) and
+    not ReadHelloWords(H.Extensions, ExtSignatureAlgorithms, H.Schemes) then Exit;
+  if ExtGet(H.Extensions, ExtSupportedGroups, data) and
     not ReadHelloWords(H.Extensions, ExtSupportedGroups, H.Groups) then Exit;
-  if ExtGet(H.Extensions, ExtSignatureAlgorithmsCert, data) then
-    if not ReadHelloWords(H.Extensions, ExtSignatureAlgorithmsCert, versions) then Exit;
-  ExtGet(H.Extensions, ExtKeyShare, data);
-  RdInit(r, data);
-  data := RdVec16(r);
-  if not (r.Ok and RdEmpty(r)) or not ParseExts(data, H.Shares) then Exit;
-  { Shares occur in the same order as in supported_groups. }
-  groupAt := 1;
-  for i := 0 to High(H.Shares.Ids) do
-  begin
-    if H.Shares.Vals[i] = '' then Exit;
-    legacy := -1;
-    while groupAt < Length(H.Groups) do
-    begin
-      legacy := (Ord(H.Groups[groupAt]) shl 8) or Ord(H.Groups[groupAt + 1]);
-      Inc(groupAt, 2);
-      if legacy = H.Shares.Ids[i] then Break;
-    end;
-    if legacy <> H.Shares.Ids[i] then Exit(AlertIllegalParameter);
-  end;
+  if ExtGet(H.Extensions, ExtSignatureAlgorithmsCert, data) and
+    not ReadHelloWords(H.Extensions, ExtSignatureAlgorithmsCert, data) then Exit;
   if ExtGet(H.Extensions, ExtServerName, data) then
   begin
     RdInit(r, data);
@@ -1634,6 +1646,36 @@ begin
       protocol := RdVec8(r2);
       if not r2.Ok or (protocol = '') then Exit;
     end;
+  end;
+  Result := 0;
+end;
+
+function ValidateHello13(var H: TClientHello): Integer;
+var
+  r: TRd;
+  i, groupAt, group: Integer;
+  data, protocol: string;
+begin
+  Result := AlertDecodeError;
+  if (H.Legacy <> TlsVersion12) or (H.Compression <> #0) then Exit(AlertIllegalParameter);
+  if (H.Schemes = '') or (H.Groups = '') or
+    not ExtGet(H.Extensions, ExtKeyShare, data) then Exit(AlertMissingExtension);
+  RdInit(r, data);
+  data := RdVec16(r);
+  if not (r.Ok and RdEmpty(r)) or not ParseExts(data, H.Shares) then Exit;
+  { Shares occur in the same order as in supported_groups. }
+  groupAt := 1;
+  for i := 0 to High(H.Shares.Ids) do
+  begin
+    if H.Shares.Vals[i] = '' then Exit;
+    group := -1;
+    while groupAt < Length(H.Groups) do
+    begin
+      group := (Ord(H.Groups[groupAt]) shl 8) or Ord(H.Groups[groupAt + 1]);
+      Inc(groupAt, 2);
+      if group = H.Shares.Ids[i] then Break;
+    end;
+    if group <> H.Shares.Ids[i] then Exit(AlertIllegalParameter);
   end;
   if ExtGet(H.Extensions, ExtPreSharedKey, data) then
   begin
@@ -1667,7 +1709,7 @@ begin
   Result := False;
 end;
 
-function SameHelloAfterRetry(const Before, After: TClientHello13): Boolean;
+function SameHelloAfterRetry(const Before, After: TClientHello): Boolean;
 var i, j: Integer; value: string;
 begin
   Result := False;
@@ -1721,19 +1763,8 @@ begin
   Result := False;
 end;
 
-function SignatureHashSize(Scheme: Integer): Integer;
-begin
-  case Scheme of
-    SigPssSha256: Result := 32;
-    SigPssSha384: Result := 48;
-    SigPssSha512: Result := 64;
-  else
-    Result := 0;
-  end;
-end;
-
-function ChooseServerSignature(Config: TTlsServerConfig; const Offered: string): Integer;
-var r: TRd; scheme, hashSize: Integer;
+function ChooseServerSignature(Config: TTlsServerConfig; const Offered: string; Tls13: Boolean): Integer;
+var r: TRd; scheme: Integer;
 begin
   Result := 0;
   if Config.FKeyAlgorithm = X509PkEd25519 then
@@ -1752,8 +1783,11 @@ begin
     while not RdEmpty(r) do
     begin
       scheme := Rd16(r);
-      hashSize := SignatureHashSize(scheme);
-      if (hashSize > 0) and (RsaPrivateKeySize(Config.FRsa) >= 2 * hashSize + 2) then Exit(scheme);
+      case scheme of
+        SigPssSha256, SigPssSha384, SigPssSha512: Exit(scheme);
+        SigPkcs1Sha256, SigPkcs1Sha384, SigPkcs1Sha512:
+          if not Tls13 then Exit(scheme);
+      end;
     end;
   end;
 end;
@@ -1782,6 +1816,9 @@ begin
     SigPssSha256: Result := RsaSignPss(Config.FRsa, RsaSha256, Sha256(Signed), RsaPssSaltEqualsHash, Sig);
     SigPssSha384: Result := RsaSignPss(Config.FRsa, RsaSha384, Sha384(Signed), RsaPssSaltEqualsHash, Sig);
     SigPssSha512: Result := RsaSignPss(Config.FRsa, RsaSha512, Sha512(Signed), RsaPssSaltEqualsHash, Sig);
+    SigPkcs1Sha256: Result := RsaSignPkcs1v15(Config.FRsa, RsaSha256, Sha256(Signed), Sig);
+    SigPkcs1Sha384: Result := RsaSignPkcs1v15(Config.FRsa, RsaSha384, Sha384(Signed), Sig);
+    SigPkcs1Sha512: Result := RsaSignPkcs1v15(Config.FRsa, RsaSha512, Sha512(Signed), Sig);
     SigEcdsaP256Sha256, SigEcdsaP384Sha384:
       begin
         if Scheme = SigEcdsaP256Sha256 then digest := Sha256(Signed)
@@ -1816,12 +1853,169 @@ begin
   Result := True;
 end;
 
-function TTlsStream.HandshakeServer13(Config: TTlsServerConfig; const RequiredProtocol: string;
-  Deadline: Integer): Boolean;
-const
-  Groups: array[0..2] of Integer = (GroupX25519, GroupP256, GroupP384);
+{ TLS 1.2 full certificate handshake, Go's handshake_server.go,
+  key_agreement.go and prf.go. Require the RFC 7627 transcript binding. }
+function HandshakeServer12(Stream: TTlsStream; Config: TTlsServerConfig;
+  const Hello: TClientHello; const HelloRaw, RequiredProtocol: string; Deadline: Integer): Boolean;
 var
-  hello, retryHello: TClientHello13;
+  r: TRd;
+  i, suite, scheme, group, aead, keyLen, ivLen, hash, typ: Integer;
+  data, exts, random, pub, priv, params, sig, flight, transcript, raw, body: string;
+  peer, shared, mainSecret, keys, verify: string;
+  ecdsaSuite, renegotiation: Boolean;
+begin
+  Result := False;
+  if ContainsWord(Hello.Suites, $5600) then
+  begin
+    Stream.Fail(AlertInappropriateFallback, 'tls: inappropriate fallback', Deadline);
+    Exit;
+  end;
+  if Pos(#0, Hello.Compression) = 0 then
+  begin
+    Stream.Fail(AlertIllegalParameter, 'tls: client does not support uncompressed connections', Deadline);
+    Exit;
+  end;
+  if not ExtGet(Hello.Extensions, ExtExtendedMasterSecret, data) then
+  begin
+    Stream.Fail(AlertHandshakeFailure, 'tls: TLS 1.2 requires the extended main secret extension', Deadline);
+    Exit;
+  end;
+  if data <> '' then
+  begin
+    Stream.Fail(AlertDecodeError, 'tls: malformed extended main secret extension', Deadline);
+    Exit;
+  end;
+  exts := U16(ExtExtendedMasterSecret) + Vec16('');
+  renegotiation := ExtGet(Hello.Extensions, ExtRenegotiationInfo, data);
+  if renegotiation then
+  begin
+    RdInit(r, data);
+    data := RdVec8(r);
+    if not (r.Ok and RdEmpty(r)) then
+    begin
+      Stream.Fail(AlertDecodeError, 'tls: malformed renegotiation extension', Deadline);
+      Exit;
+    end;
+    if data <> '' then
+    begin
+      Stream.Fail(AlertHandshakeFailure, 'tls: initial handshake had non-empty renegotiation extension', Deadline);
+      Exit;
+    end;
+  end;
+  if renegotiation or ContainsWord(Hello.Suites, $00ff) then
+    exts := exts + U16(ExtRenegotiationInfo) + Vec16(#0);
+  if ExtGet(Hello.Extensions, ExtPointFormats, data) then
+  begin
+    RdInit(r, data);
+    data := RdVec8(r);
+    if not (r.Ok and RdEmpty(r)) or (data = '') then
+    begin
+      Stream.Fail(AlertDecodeError, 'tls: malformed point formats extension', Deadline);
+      Exit;
+    end;
+    if Pos(#0, data) = 0 then
+    begin
+      Stream.Fail(AlertIllegalParameter, 'tls: client does not support uncompressed points', Deadline);
+      Exit;
+    end;
+    exts := exts + U16(ExtPointFormats) + Vec16(Vec8(#0));
+  end;
+  if Hello.Name <> '' then exts := exts + U16(ExtServerName) + Vec16('');
+  if not ChooseAlpn(Hello.Alpn, Config, RequiredProtocol, Stream.FAlpn) then
+  begin
+    Stream.Fail(AlertNoApplicationProtocol, 'tls: no application protocol', Deadline);
+    Exit;
+  end;
+  if Stream.FAlpn <> '' then exts := exts + U16(ExtAlpn) + Vec16(Vec16(Vec8(Stream.FAlpn)));
+
+  ecdsaSuite := Config.FKeyAlgorithm <> X509PkRSA;
+  RdInit(r, Suites12);
+  while not RdEmpty(r) and (Stream.FSuite = 0) do
+  begin
+    suite := Rd16(r);
+    if (Suite12Ecdsa(suite) = ecdsaSuite) and ContainsWord(Hello.Suites, suite) then
+      Stream.FSuite := suite;
+  end;
+  scheme := ChooseServerSignature(Config, Hello.Schemes, False);
+  group := 0;
+  for i := 0 to High(ServerGroups) do
+    if ContainsWord(Hello.Groups, ServerGroups[i]) then
+    begin
+      group := ServerGroups[i];
+      Break;
+    end;
+  if Config.FKeyAlgorithm = X509PkECDSA then
+  begin
+    if Config.FCurve = NistP256 then i := GroupP256
+    else i := GroupP384;
+    if not ContainsWord(Hello.Groups, i) then scheme := 0;
+  end;
+  if (Stream.FSuite = 0) or (scheme = 0) or (group = 0) then
+  begin
+    Stream.Fail(AlertHandshakeFailure, 'tls: no shared cipher suite, signature scheme or key exchange group', Deadline);
+    Exit;
+  end;
+  SuiteParams(Stream.FSuite, aead, keyLen, hash);
+  { RFC 9846 §4.2.3. This server also supports TLS 1.3. }
+  random := RandomString(24) + 'DOWNGRD'#1;
+  pub := KeyShare(group, priv);
+  params := #3 + U16(group) + Vec8(pub);
+  if not ServerSignature(Config, scheme, Hello.Random + random + params, sig) then
+  begin
+    Stream.Fail(AlertInternalError, 'tls: could not sign the handshake', Deadline);
+    Exit;
+  end;
+  flight := U8(HsServerHello) + Vec24(U16(TlsVersion12) + random + #0 + U16(Stream.FSuite) + #0 + Vec16(exts)) +
+    Config.FCertificate12 + U8(HsServerKeyExchange) + Vec24(params + U16(scheme) + Vec16(sig)) +
+    U8(HsServerHelloDone) + Vec24('');
+  if not Stream.WriteHandshake(flight, Deadline) then Exit;
+  transcript := HelloRaw + flight;
+  if not Stream.ReadMsg(Deadline, typ, body, raw) then Exit;
+  if typ <> HsClientKeyExchange then
+  begin
+    Stream.Fail(AlertUnexpectedMessage, 'tls: expected client key exchange', Deadline);
+    Exit;
+  end;
+  RdInit(r, body);
+  peer := RdVec8(r);
+  if not (r.Ok and RdEmpty(r)) or not SharedSecret(group, priv, peer, shared) then
+  begin
+    Stream.Fail(AlertIllegalParameter, 'tls: invalid client key share', Deadline);
+    Exit;
+  end;
+  transcript := transcript + raw;
+  mainSecret := Tls12Prf(hash, shared, 'extended master secret', HashOf(hash, transcript), 48);
+  if aead = 1 then ivLen := 4
+  else ivLen := 12;
+  keys := Tls12Prf(hash, mainSecret, 'key expansion', random + Hello.Random, 2 * (keyLen + ivLen));
+
+  if not Stream.ReadRecord(Deadline, True, typ, data) then Exit;
+  Stream.SetRead(aead, Copy(keys, 1, keyLen), Copy(keys, 2 * keyLen + 1, ivLen));
+  if not Stream.ReadMsg(Deadline, typ, body, raw) then Exit;
+  if (typ <> HsFinished) or (Stream.FHand <> '') then
+  begin
+    Stream.Fail(AlertUnexpectedMessage, 'tls: expected client finished', Deadline);
+    Exit;
+  end;
+  verify := Tls12Prf(hash, mainSecret, 'client finished', HashOf(hash, transcript), 12);
+  if not CtEqualStr(verify, body) then
+  begin
+    Stream.Fail(AlertDecryptError, 'tls: invalid client finished hash', Deadline);
+    Exit;
+  end;
+  verify := Tls12Prf(hash, mainSecret, 'server finished', HashOf(hash, transcript + raw), 12);
+  if not Stream.WriteRecord(RecCcs, #1, Deadline) then Exit;
+  Stream.SetWrite(aead, Copy(keys, keyLen + 1, keyLen), Copy(keys, 2 * keyLen + ivLen + 1, ivLen));
+  if not Stream.WriteRecord(RecHandshake, U8(HsFinished) + Vec24(verify), Deadline) then Exit;
+  Stream.FDone := True;
+  Result := True;
+end;
+
+{ TLS 1.3, RFC 9846 §§4 and 7 and Go's handshake_server_tls13.go. }
+function TTlsStream.HandshakeServer(Config: TTlsServerConfig; const RequiredProtocol: string;
+  Deadline: Integer): Boolean;
+var
+  hello, retryHello: TClientHello;
   r: TRd;
   typ, alert, suite, group, i, scheme, hash, keyLen, aead: Integer;
   body, raw, transcript, pref, peer, share, priv, shared, extensions, flight: string;
@@ -1835,7 +2029,26 @@ begin
     Fail(AlertUnexpectedMessage, 'tls: expected client hello', Deadline);
     Exit;
   end;
-  alert := ParseClientHello13(body, hello);
+  alert := ParseClientHello(body, hello);
+  if alert <> 0 then
+  begin
+    Fail(alert, 'tls: invalid client hello', Deadline);
+    Exit;
+  end;
+  FServerName := hello.Name;
+  if not ContainsWord(hello.Versions, TlsVersion13) then
+  begin
+    if (Config.MinVersion <> TlsVersion12) or
+      ((hello.Versions <> '') and not ContainsWord(hello.Versions, TlsVersion12)) or
+      ((hello.Versions = '') and (hello.Legacy < TlsVersion12)) then
+    begin
+      Fail(AlertProtocolVersion, 'tls: no shared protocol version', Deadline);
+      Exit;
+    end;
+    FVers := TlsVersion12;
+    Exit(HandshakeServer12(Self, Config, hello, raw, RequiredProtocol, Deadline));
+  end;
+  alert := ValidateHello13(hello);
   if (alert = 0) and ExtGet(hello.Extensions, ExtCookie, pref) then alert := AlertIllegalParameter;
   if alert <> 0 then
   begin
@@ -1846,14 +2059,13 @@ begin
   { Ignore offered early data, using the bounded skip and trial decryption
     in RFC 9846 §4.3.10. This server has no tickets of its own. }
   if ExtGet(hello.Extensions, ExtEarlyData, pref) then FEarlyDiscardLeft := 16384;
-  FServerName := hello.Name;
   RdInit(r, Suites13);
   while not RdEmpty(r) and (FSuite = 0) do
   begin
     suite := Rd16(r);
     if ContainsWord(hello.Suites, suite) then FSuite := suite;
   end;
-  scheme := ChooseServerSignature(Config, hello.Schemes);
+  scheme := ChooseServerSignature(Config, hello.Schemes, True);
   if (FSuite = 0) or (scheme = 0) then
   begin
     Fail(AlertHandshakeFailure, 'tls: no shared cipher suite or signature scheme', Deadline);
@@ -1867,20 +2079,20 @@ begin
     Exit;
   end;
   group := 0;
-  for i := 0 to High(Groups) do
-    if ExtGet(hello.Shares, Groups[i], peer) then
+  for i := 0 to High(ServerGroups) do
+    if ExtGet(hello.Shares, ServerGroups[i], peer) then
     begin
-      group := Groups[i];
+      group := ServerGroups[i];
       Break;
     end;
   transcript := raw;
   dummyCcs := hello.Session <> '';
   if group = 0 then
   begin
-    for i := 0 to High(Groups) do
-      if ContainsWord(hello.Groups, Groups[i]) then
+    for i := 0 to High(ServerGroups) do
+      if ContainsWord(hello.Groups, ServerGroups[i]) then
       begin
-        group := Groups[i];
+        group := ServerGroups[i];
         Break;
       end;
     if group = 0 then
@@ -1899,7 +2111,8 @@ begin
       Fail(AlertUnexpectedMessage, 'tls: expected retry client hello', Deadline);
       Exit;
     end;
-    alert := ParseClientHello13(body, retryHello);
+    alert := ParseClientHello(body, retryHello);
+    if alert = 0 then alert := ValidateHello13(retryHello);
     if (alert = 0) and (not SameHelloAfterRetry(hello, retryHello) or
       (Length(retryHello.Shares.Ids) <> 1) or not ExtGet(retryHello.Shares, group, peer)) then
       alert := AlertIllegalParameter;
@@ -2900,7 +3113,7 @@ var
   blocks: TPemBlocks;
   cert, leaf: TX509Cert;
   i, algorithm, curve, nistCurve: Integer;
-  chain, secret: string;
+  chain, chain12, secret: string;
   rsa: TRsaPrivateKey;
   ed: TEd25519SigningKey;
 begin
@@ -2913,6 +3126,7 @@ begin
   blocks := PemDecodeAll(CertPem);
   leaf := nil;
   chain := '';
+  chain12 := '';
   for i := 0 to High(blocks) do
   begin
     if (blocks[i].BlockType <> 'CERTIFICATE') or (Length(blocks[i].Headers) <> 0) then Continue;
@@ -2925,6 +3139,7 @@ begin
       Exit;
     end;
     chain := chain + Vec24(cert.Raw) + U16(0);
+    chain12 := chain12 + Vec24(cert.Raw);
   end;
   if (leaf = nil) or not leaf.HasPublicKey then
   begin
@@ -2939,6 +3154,12 @@ begin
       X509PkRSA:
         begin
           if not X509ParsePemRsaKey(KeyPem, rsa, Err) then Exit;
+          { RFC 9325 §4.5 sets the TLS server authentication minimum. }
+          if ModulusBitLen(rsa.Pub.N) < 2048 then
+          begin
+            Err := 'tls: server RSA key needs at least 2048 bits';
+            Exit;
+          end;
           Err := 'tls: private key does not match the certificate';
           if (rsa.Pub.E <> leaf.RsaE) or (NatBytes(rsa.Pub.N.Nat, rsa.Pub.N) <> leaf.RsaN) then Exit;
         end;
@@ -2971,6 +3192,7 @@ begin
     if leaf.PublicKeyAlgorithm = X509PkECDSA then FEcSecret := secret;
     FKeyAlgorithm := leaf.PublicKeyAlgorithm;
     FCertificate := U8(HsCertificate) + Vec24(#0 + Vec24(chain));
+    FCertificate12 := U8(HsCertificate) + Vec24(Vec24(chain12));
     Err := '';
     Result := True;
   finally
@@ -2986,7 +3208,7 @@ begin
   inherited Destroy;
 end;
 
-function AcceptTls13(Raw: TNetStream; Config: TTlsServerConfig; const RequiredProtocol: string;
+function AcceptTls(Raw: TNetStream; Config: TTlsServerConfig; const RequiredProtocol: string;
   Deadline: Integer; out Err: string): TTlsStream;
 var s: TTlsStream;
 begin
@@ -2997,10 +3219,17 @@ begin
     if Raw <> nil then Raw.Dispose;
     Exit;
   end;
+  if (Config.MinVersion <> 0) and (Config.MinVersion <> TlsVersion12) and
+    (Config.MinVersion <> TlsVersion13) then
+  begin
+    Err := 'tls: unsupported server MinVersion';
+    Raw.Dispose;
+    Exit;
+  end;
   s := TTlsStream.Create(Raw);
   s.FServer := True;
   try
-    if s.HandshakeServer13(Config, RequiredProtocol, Deadline) then
+    if s.HandshakeServer(Config, RequiredProtocol, Deadline) then
     begin
       Err := '';
       Result := s;
@@ -3020,13 +3249,13 @@ end;
 function TTlsServerConfig.Accept(Raw: TNetStream; Deadline: Integer; const Protocol: string;
   out Err: string): TNetStream;
 begin
-  Result := AcceptTls13(Raw, Self, Protocol, Deadline, Err);
+  Result := AcceptTls(Raw, Self, Protocol, Deadline, Err);
 end;
 
 function TlsServer(Raw: TNetStream; Config: TTlsServerConfig; Deadline: Integer;
   out Err: string): TTlsStream;
 begin
-  Result := AcceptTls13(Raw, Config, '', Deadline, Err);
+  Result := AcceptTls(Raw, Config, '', Deadline, Err);
 end;
 
 { ---- pasconn's dialer and upgrader ---- }
