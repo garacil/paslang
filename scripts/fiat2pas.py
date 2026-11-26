@@ -197,11 +197,13 @@ def translate(curve):
     text = []
     for name in WANT:
         params, body = funcs[name]
+        # Keep the generated Pascal base separate from the BMI2 kernel.
+        api_name = name + 'Base' if curve == 'p256' and name in ('Mul', 'Square') else name
         # the head
         if name in ('Mul', 'Add', 'Sub'):
-            head = 'procedure %s%s(var Out1: %s; const Arg1, Arg2: %s);' % (pre, name, fe, fe)
+            head = 'procedure %s%s(var Out1: %s; const Arg1, Arg2: %s);' % (pre, api_name, fe, fe)
         elif name in ('Square', 'FromMontgomery', 'ToMontgomery'):
-            head = 'procedure %s%s(var Out1: %s; const Arg1: %s);' % (pre, name, fe, fe)
+            head = 'procedure %s%s(var Out1: %s; const Arg1: %s);' % (pre, api_name, fe, fe)
         elif name == 'SetOne':
             head = 'procedure %s%s(var Out1: %s);' % (pre, name, fe)
         elif name == 'Selectznz':
@@ -322,7 +324,7 @@ def translate(curve):
                 row = '  '
             row += piece
         vs.append(row)
-        text.append('{ %s%s, as fiat-crypto\'s %s%s in Go\'s fiat/%s_fiat64.go }' % (pre, name, curve, name, curve))
+        text.append('{ %s%s, as fiat-crypto\'s %s%s in Go\'s fiat/%s_fiat64.go }' % (pre, api_name, curve, name, curve))
         text.append(head)
         if decl:
             text.append('var')

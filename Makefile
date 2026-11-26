@@ -1017,8 +1017,8 @@ LIB_UNITS := \
 	src/lib/argon2.paslang \
 	src/lib/pascipher.paslang \
 	src/lib/pasfield25519.paslang \
-	src/lib/pasx25519.paslang \
 	src/lib/pased25519.paslang \
+	src/lib/pasx25519.paslang \
 	src/lib/pasnist.paslang \
 	src/lib/pasrsa.paslang \
 	src/lib/pascodec.paslang \
@@ -5496,6 +5496,8 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'aesenc %xmm1, %xmm0' $(BUILDDIR)/$(LVL_X64)/pascipher.s; \
 	grep -q 'pclmulqdq' $(BUILDDIR)/$(LVL_X64)/pascipher.s; \
 	grep -qF 'vpclmulqdq $$0x00, 160(%rsi)' $(BUILDDIR)/$(LVL_X64)/pascipher.s; \
+	grep -qF 'mulxq %rax, %rax, %rbx' $(BUILDDIR)/$(LVL_X64)/pasnist.s; \
+	if grep -qw 'mulxq' $(BUILDDIR)/pasnist.s; then echo "pasnist's base build carries BMI2"; exit 1; fi; \
 	for c in base $(LVL_X64_CPU); do \
 	  $(OUTDIR)/paslangc -cpu $$c -o $(BUILDDIR)/sysutils1-$$c testdata/sysutils1.paslang; \
 	  $(BUILDDIR)/sysutils1-$$c > $(BUILDDIR)/sysutils1-$$c.got; \

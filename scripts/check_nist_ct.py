@@ -202,7 +202,7 @@ variants = {'production': source,
                 'Mul128(A[i], B[j], hi, lo); if hi <> 0 then lo := hi;', 1),
             'secret-loop': source.replace('for i := 0 to L - 1 do',
                 'for i := 0 to (A[0] and 3) do', 1),
-            'secret-inverse-exponent': source.replace('C.NMinus2[i div 64]', 'A[i div 64]', 1)}
+            'secret-inverse-exponent': source.replace('C.NMinus2[i div 16]', 'A[i div 16]', 1)}
 assert len(set(variants.values())) == len(variants)
 results = []
 for label, text in variants.items():

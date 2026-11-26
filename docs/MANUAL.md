@@ -12489,7 +12489,8 @@ The public-key units are written in pure paslang, following Go's
 cryptographic implementations:
 - `uses pasx25519` is X25519 (RFC 7748, Go's `crypto/ecdh` and the
   field of `edwards25519`): `X25519(scalar, u)` is the function itself,
-  `X25519PublicKey(priv)` the scalar times the base point, and
+  `X25519PublicKey(priv)` the scalar times the base point using the shared
+  Edwards25519 table and the RFC 7748 map to Montgomery coordinates, and
   `X25519Shared(priv, peer, out shared)` the shared secret, `False` for a
   low-order peer whose result is all zeros, as Go refuses it.
 - `uses pased25519` provides pure Ed25519 (RFC 8032). `Ed25519PublicKey(seed)`
