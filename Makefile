@@ -5495,6 +5495,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	: pascipher at the amd64 level seals through AES-NI and PCLMULQDQ, P465; \
 	grep -q 'aesenc %xmm1, %xmm0' $(BUILDDIR)/$(LVL_X64)/pascipher.s; \
 	grep -q 'pclmulqdq' $(BUILDDIR)/$(LVL_X64)/pascipher.s; \
+	grep -qF 'vpclmulqdq $$0x00, 160(%rsi)' $(BUILDDIR)/$(LVL_X64)/pascipher.s; \
 	for c in base $(LVL_X64_CPU); do \
 	  $(OUTDIR)/paslangc -cpu $$c -o $(BUILDDIR)/sysutils1-$$c testdata/sysutils1.paslang; \
 	  $(BUILDDIR)/sysutils1-$$c > $(BUILDDIR)/sysutils1-$$c.got; \
@@ -6966,7 +6967,7 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	: pascipher at the arm64 level seals through aese and pmull, its base build through neither, P428; \
 	grep -q 'aese v0.16b, v1.16b' '$(A64DIR)/$(LVL_A64)/pascipher.s'; \
 	grep -qF 'aese v7.16b, v16.16b' '$(A64DIR)/$(LVL_A64)/pascipher.s'; \
-	grep -q 'pmull2 v6.1q' '$(A64DIR)/$(LVL_A64)/pascipher.s'; \
+	grep -q 'pmull2 v28.1q' '$(A64DIR)/$(LVL_A64)/pascipher.s'; \
 	if grep -q 'aese v0\|pmull' $(A64DIR)/pascipher.s; then echo "pascipher's arm64 base build carries the crypto extension"; exit 1; fi; \
 	echo ok cpu-base-arm; \
 	: the json type on arm64, P203: every document of the oracle test as expect.txt holds it, the index and a byte at a time alike; \

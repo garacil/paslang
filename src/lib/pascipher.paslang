@@ -59,10 +59,12 @@ type
     DecK: array[0..239] of Byte;
   end;
 
-  { an AES-GCM key: its AES and H, E(K, 0^128), as two big-endian words }
+  { AES-GCM key. H is E(K, 0^128) as two big-endian words.
+    The hardware GHASH also prepares the first six powers of H. }
   TGcm = record
     Aes: TAes;
     H0, H1: Integer;
+    HashPowers: array[0..23] of Integer;
   end;
 
 { False for a key that is not 16, 24 or 32 bytes }
@@ -1052,130 +1054,131 @@ end;
 
 {$if defined(CPU_PMULL) and (defined(CPU_SSSE3) or defined(CPUAARCH64))}
 
-{ N blocks at P into Y, Y and H each held as the 128-bit value of their
-  bytes reversed (the low word the second big-endian half): the product
-  of four carry-less multiplies, shifted left by one for GCM's reflected
-  bits, and reduced modulo x^128 + x^7 + x^2 + x + 1 (Intel's white paper
-  on PCLMULQDQ and GCM, Gueron and Kounavis, 2014, its gfmul) }
-procedure GhashBlocksCpu(Y, H, P: Pointer; N: Integer);
+{ Fold a group with descending powers of H. Accumulate the unreduced
+  Karatsuba products and perform one Montgomery reduction, as in Go's
+  gcmAesData and ring's grouped AES-GCM kernels. State words are reversed
+  from wire byte order. The table begins with H and each power occupies
+  two vectors: the adjusted multiplier and its two halves xored. }
+procedure GhashBlocksCpu(Y, Powers, P: Pointer; N: Integer);
 begin
-  asm amd64 (Y: in rdi; H: in rsi; P: in rdx; N: in rcx)
+  asm amd64 (Y: in rdi; Powers: in rsi; P: in rdx; N: in rcx)
     movq $0x08090a0b0c0d0e0f, %rax
     movq %rax, %xmm15
     movq $0x0001020304050607, %rax
     movq %rax, %xmm14
     punpcklqdq %xmm14, %xmm15
+    movq $1, %rax
+    movq %rax, %xmm14
+    movq $0xc200000000000000, %rax
+    movq %rax, %xmm13
+    punpcklqdq %xmm13, %xmm14
     movdqu (%rdi), %xmm0
-    movdqu (%rsi), %xmm1
+    testq %rcx, %rcx
+    jz 3f
   .p2align 5
   1:
-    movdqu (%rdx), %xmm2
-    pshufb %xmm15, %xmm2
-    pxor %xmm2, %xmm0
-    movdqa %xmm0, %xmm3
-    pclmulqdq $0x00, %xmm1, %xmm3
-    movdqa %xmm0, %xmm4
-    pclmulqdq $0x10, %xmm1, %xmm4
-    movdqa %xmm0, %xmm5
-    pclmulqdq $0x01, %xmm1, %xmm5
-    movdqa %xmm0, %xmm6
-    pclmulqdq $0x11, %xmm1, %xmm6
-    pxor %xmm5, %xmm4
-    movdqa %xmm4, %xmm5
-    pslldq $8, %xmm5
-    psrldq $8, %xmm4
-    pxor %xmm5, %xmm3
-    pxor %xmm4, %xmm6
-    movdqa %xmm3, %xmm7
-    psrld $31, %xmm7
-    movdqa %xmm6, %xmm8
-    psrld $31, %xmm8
-    pslld $1, %xmm3
-    pslld $1, %xmm6
-    movdqa %xmm7, %xmm9
-    psrldq $12, %xmm9
-    pslldq $4, %xmm8
-    pslldq $4, %xmm7
-    por %xmm7, %xmm3
-    por %xmm8, %xmm6
-    por %xmm9, %xmm6
-    movdqa %xmm3, %xmm7
-    pslld $31, %xmm7
-    movdqa %xmm3, %xmm8
-    pslld $30, %xmm8
-    movdqa %xmm3, %xmm9
-    pslld $25, %xmm9
-    pxor %xmm8, %xmm7
-    pxor %xmm9, %xmm7
-    movdqa %xmm7, %xmm8
-    psrldq $4, %xmm8
-    pslldq $12, %xmm7
-    pxor %xmm7, %xmm3
-    movdqa %xmm3, %xmm2
-    psrld $1, %xmm2
-    movdqa %xmm3, %xmm4
-    psrld $2, %xmm4
-    movdqa %xmm3, %xmm5
-    psrld $7, %xmm5
-    pxor %xmm4, %xmm2
-    pxor %xmm5, %xmm2
-    pxor %xmm8, %xmm2
-    pxor %xmm2, %xmm3
-    pxor %xmm3, %xmm6
-    movdqa %xmm6, %xmm0
+    movq $6, %r8
+    cmpq %rcx, %r8
+    cmovaq %rcx, %r8
+    subq %r8, %rcx
+    movq %r8, %r9
+    decq %r9
+    shlq $5, %r9
+    addq %rsi, %r9
+    pxor %xmm8, %xmm8
+    pxor %xmm9, %xmm9
+    pxor %xmm10, %xmm10
+  2:
+    movdqu (%rdx), %xmm1
+    pshufb %xmm15, %xmm1
+    pxor %xmm1, %xmm0
+    movdqu (%r9), %xmm11
+    movdqa %xmm11, %xmm12
+    pshufd $0x4e, %xmm0, %xmm1
+    pclmulqdq $0x00, %xmm0, %xmm11
+    pclmulqdq $0x11, %xmm0, %xmm12
+    pxor %xmm1, %xmm0
+    movdqu 16(%r9), %xmm13
+    pclmulqdq $0x00, %xmm0, %xmm13
+    pxor %xmm11, %xmm8
+    pxor %xmm12, %xmm9
+    pxor %xmm13, %xmm10
+    pxor %xmm0, %xmm0
     addq $16, %rdx
-    decq %rcx
+    subq $32, %r9
+    decq %r8
+    jnz 2b
+    pxor %xmm8, %xmm10
+    pxor %xmm9, %xmm10
+    movdqa %xmm10, %xmm1
+    pslldq $8, %xmm1
+    psrldq $8, %xmm10
+    pxor %xmm1, %xmm8
+    pxor %xmm10, %xmm9
+    movdqa %xmm14, %xmm1
+    pclmulqdq $0x01, %xmm8, %xmm1
+    pshufd $0x4e, %xmm8, %xmm8
+    pxor %xmm1, %xmm8
+    movdqa %xmm14, %xmm1
+    pclmulqdq $0x01, %xmm8, %xmm1
+    pshufd $0x4e, %xmm8, %xmm0
+    pxor %xmm1, %xmm0
+    pxor %xmm9, %xmm0
+    testq %rcx, %rcx
     jnz 1b
+  3:
     movdqu %xmm0, (%rdi)
   end;
-  asm arm64 (Y: in x0; H: in x1; P: in x2; N: in x3)
+  asm arm64 (Y: in x0; Powers: in x1; P: in x2; N: in x3)
     movi v31.16b, #0
+    mov x6, #0xc200000000000000
+    mov v30.d[0], x6
     ld1 {v0.16b}, [x0]
-    ld1 {v1.16b}, [x1]
-    ext v17.16b, v1.16b, v1.16b, #8
+    cbz x3, 3f
   .p2align 5
   1:
-    ld1 {v2.16b}, [x2], #16
-    rev64 v2.16b, v2.16b
-    ext v2.16b, v2.16b, v2.16b, #8
-    eor v0.16b, v0.16b, v2.16b
-    pmull v3.1q, v0.1d, v1.1d
-    pmull2 v6.1q, v0.2d, v1.2d
-    pmull v4.1q, v0.1d, v17.1d
-    pmull2 v5.1q, v0.2d, v17.2d
-    eor v4.16b, v4.16b, v5.16b
-    ext v5.16b, v31.16b, v4.16b, #8
-    ext v4.16b, v4.16b, v31.16b, #8
-    eor v3.16b, v3.16b, v5.16b
-    eor v6.16b, v6.16b, v4.16b
-    ushr v7.4s, v3.4s, #31
-    ushr v16.4s, v6.4s, #31
-    shl v3.4s, v3.4s, #1
-    shl v6.4s, v6.4s, #1
-    ext v18.16b, v7.16b, v31.16b, #12
-    ext v16.16b, v31.16b, v16.16b, #12
-    ext v7.16b, v31.16b, v7.16b, #12
-    orr v3.16b, v3.16b, v7.16b
-    orr v6.16b, v6.16b, v16.16b
-    orr v6.16b, v6.16b, v18.16b
-    shl v7.4s, v3.4s, #31
-    shl v16.4s, v3.4s, #30
-    shl v18.4s, v3.4s, #25
-    eor v7.16b, v7.16b, v16.16b
-    eor v7.16b, v7.16b, v18.16b
-    ext v16.16b, v7.16b, v31.16b, #4
-    ext v7.16b, v31.16b, v7.16b, #4
-    eor v3.16b, v3.16b, v7.16b
-    ushr v2.4s, v3.4s, #1
-    ushr v4.4s, v3.4s, #2
-    ushr v5.4s, v3.4s, #7
-    eor v2.16b, v2.16b, v4.16b
-    eor v2.16b, v2.16b, v5.16b
-    eor v2.16b, v2.16b, v16.16b
-    eor v3.16b, v3.16b, v2.16b
-    eor v0.16b, v6.16b, v3.16b
-    subs x3, x3, #1
-    b.ne 1b
+    mov x4, #4
+    cmp x3, x4
+    csel x4, x3, x4, lo
+    sub x3, x3, x4
+    sub x5, x4, #1
+    add x5, x1, x5, lsl #5
+    movi v17.16b, #0
+    movi v18.16b, #0
+    movi v19.16b, #0
+  2:
+    ld1 {v1.16b}, [x2], #16
+    rev64 v1.16b, v1.16b
+    ext v1.16b, v1.16b, v1.16b, #8
+    eor v0.16b, v0.16b, v1.16b
+    ld1 {v2.16b, v3.16b}, [x5]
+    ext v1.16b, v0.16b, v0.16b, #8
+    pmull v4.1q, v0.1d, v2.1d
+    pmull2 v5.1q, v0.2d, v2.2d
+    eor v0.16b, v0.16b, v1.16b
+    pmull v6.1q, v0.1d, v3.1d
+    eor v17.16b, v17.16b, v4.16b
+    eor v18.16b, v18.16b, v5.16b
+    eor v19.16b, v19.16b, v6.16b
+    movi v0.16b, #0
+    sub x5, x5, #32
+    subs x4, x4, #1
+    b.ne 2b
+    eor v19.16b, v19.16b, v17.16b
+    eor v19.16b, v19.16b, v18.16b
+    ext v1.16b, v31.16b, v19.16b, #8
+    ext v2.16b, v19.16b, v31.16b, #8
+    eor v17.16b, v17.16b, v1.16b
+    eor v18.16b, v18.16b, v2.16b
+    pmull v1.1q, v30.1d, v17.1d
+    ext v17.16b, v17.16b, v17.16b, #8
+    eor v17.16b, v17.16b, v1.16b
+    pmull v1.1q, v30.1d, v17.1d
+    ext v0.16b, v17.16b, v17.16b, #8
+    eor v0.16b, v0.16b, v1.16b
+    eor v0.16b, v0.16b, v18.16b
+    cbnz x3, 1b
+  3:
     st1 {v0.16b}, [x0]
   end;
 end;
@@ -1383,7 +1386,7 @@ begin
       k := nb;
       if k > 1024 then
         k := 1024;
-      GhashBlocksCpu(@y[0], @G.H0, P, k);
+      GhashBlocksCpu(@y[0], @G.HashPowers[0], P, k);
       P := P + 16 * k;
       nb := nb - k;
     end;
@@ -1393,7 +1396,7 @@ begin
       FillChar(buf, SizeOf(buf), 0);
       for i := 0 to N - 1 do
         buf[i] := PByte(P + i)^;
-      GhashBlocksCpu(@y[0], @G.H0, @buf[0], 1);
+      GhashBlocksCpu(@y[0], @G.HashPowers[0], @buf[0], 1);
     end;
     Y0 := y[0];
     Y1 := y[1];
@@ -1424,6 +1427,10 @@ end;
 function GcmInit(var G: TGcm; const Key: string): Boolean;
 var
   z: array[0..15] of Byte;
+{$if defined(CPU_PMULL) and (defined(CPU_SSSE3) or defined(CPUAARCH64))}
+  h: array[0..1] of Integer;
+  i, reductionMask, lo, hi: Integer;
+{$endif}
 {$ifdef CPUAARCH64}
   ditPrevious: Boolean;
 {$endif}
@@ -1440,6 +1447,22 @@ begin
   G.H1 := LoadBE64(@z[0]);
   G.H0 := LoadBE64(@z[8]);
   FillChar(z, SizeOf(z), 0);
+{$if defined(CPU_PMULL) and (defined(CPU_SSSE3) or defined(CPUAARCH64))}
+  h[0] := G.H0;
+  h[1] := G.H1;
+  for i := 0 to 5 do
+  begin
+    { Multiply by x in the reflected representation used by reduction. }
+    reductionMask := 0 - (h[1] shr 63);
+    lo := (h[0] shl 1) xor (reductionMask and 1);
+    hi := (h[1] shl 1) xor (h[0] shr 63) xor (reductionMask and $c200000000000000);
+    G.HashPowers[4 * i] := lo;
+    G.HashPowers[4 * i + 1] := hi;
+    G.HashPowers[4 * i + 2] := lo xor hi;
+    G.HashPowers[4 * i + 3] := lo xor hi;
+    if i < 5 then GhashBlocksCpu(@h[0], @G.HashPowers[0], @z[0], 1);
+  end;
+{$endif}
 {$ifdef CPUAARCH64}
   finally
     PasDitLeave(ditPrevious);
@@ -1471,19 +1494,475 @@ begin
   end;
 end;
 
-{ the tag of Ad and the ciphertext C under J0 }
-procedure GcmTag(const G: TGcm; const J0: TBlock16; const Ad: string; C: Pointer; CLen: Integer; OutP: Pointer);
+{$if defined(CPU_AES) and defined(CPU_PMULL) and (defined(CPUAARCH64) or (defined(CPU_AVX) and defined(CPU_SSSE3)))}
+const
+{$ifdef CPUAARCH64}
+  GcmCpuGroup = 4;
+{$else}
+  GcmCpuGroup = 6;
+{$endif}
+
+{ AES-128 sealing uses the ring schedule: encrypt the current group
+  while authenticating the previous one. Final-group GHASH is done by
+  the caller. Groups is positive, at most 1024 div GcmCpuGroup, and
+  only complete 16-byte blocks enter here. Ctr supplies the first
+  counter, whose low 32 bits are advanced in registers. }
+procedure GcmSealBlocksCpu(Y, Powers, Key, Ctr, Src, Dst: Pointer; Groups: Integer);
+begin
+  asm amd64 (Y: in rdi; Powers: in rsi; Key: in rdx; Ctr: in r8; Src: in r9; Dst: in r10; Groups: in rcx)
+    vmovdqu (%rdi), %xmm8
+    vmovdqu 8f(%rip), %xmm15
+    vmovdqu (%r8), %xmm0
+    vpshufb 7f(%rip), %xmm0, %xmm0
+    xorl %r8d, %r8d
+  .p2align 5
+  1:
+    vmovdqu 7f(%rip), %xmm7
+    vpshufb %xmm7, %xmm0, %xmm1
+    vpaddd 6f(%rip), %xmm0, %xmm2
+    vpshufb %xmm7, %xmm2, %xmm2
+    vpaddd 6f+16(%rip), %xmm0, %xmm3
+    vpshufb %xmm7, %xmm3, %xmm3
+    vpaddd 6f+32(%rip), %xmm0, %xmm4
+    vpshufb %xmm7, %xmm4, %xmm4
+    vpaddd 6f+48(%rip), %xmm0, %xmm5
+    vpshufb %xmm7, %xmm5, %xmm5
+    vpaddd 6f+64(%rip), %xmm0, %xmm6
+    vpshufb %xmm7, %xmm6, %xmm6
+    vpaddd 6f+80(%rip), %xmm0, %xmm0
+    vmovdqu (%rdx), %xmm7
+    vpxor %xmm7, %xmm1, %xmm1
+    vpxor %xmm7, %xmm2, %xmm2
+    vpxor %xmm7, %xmm3, %xmm3
+    vpxor %xmm7, %xmm4, %xmm4
+    vpxor %xmm7, %xmm5, %xmm5
+    vpxor %xmm7, %xmm6, %xmm6
+    testl %r8d, %r8d
+    jz 2f
+    vpxor %xmm9, %xmm9, %xmm9
+    vpxor %xmm10, %xmm10, %xmm10
+    vpxor %xmm11, %xmm11, %xmm11
+    vmovdqu 16(%rdx), %xmm7
+    vmovdqu -96(%r10), %xmm12
+    vpshufb %xmm15, %xmm12, %xmm12
+    vpxor %xmm8, %xmm12, %xmm12
+    vaesenc %xmm7, %xmm1, %xmm1
+    vaesenc %xmm7, %xmm2, %xmm2
+    vpclmulqdq $0x00, 160(%rsi), %xmm12, %xmm14
+    vpxor %xmm14, %xmm9, %xmm9
+    vpshufd $0x4e, %xmm12, %xmm13
+    vaesenc %xmm7, %xmm3, %xmm3
+    vaesenc %xmm7, %xmm4, %xmm4
+    vpclmulqdq $0x11, 160(%rsi), %xmm12, %xmm14
+    vpxor %xmm14, %xmm10, %xmm10
+    vpxor %xmm12, %xmm13, %xmm13
+    vaesenc %xmm7, %xmm5, %xmm5
+    vaesenc %xmm7, %xmm6, %xmm6
+    vpclmulqdq $0x00, 176(%rsi), %xmm13, %xmm14
+    vpxor %xmm14, %xmm11, %xmm11
+
+    vmovdqu 32(%rdx), %xmm7
+    vmovdqu -80(%r10), %xmm12
+    vpshufb %xmm15, %xmm12, %xmm12
+    vaesenc %xmm7, %xmm1, %xmm1
+    vaesenc %xmm7, %xmm2, %xmm2
+    vpclmulqdq $0x00, 128(%rsi), %xmm12, %xmm14
+    vpxor %xmm14, %xmm9, %xmm9
+    vpshufd $0x4e, %xmm12, %xmm13
+    vaesenc %xmm7, %xmm3, %xmm3
+    vaesenc %xmm7, %xmm4, %xmm4
+    vpclmulqdq $0x11, 128(%rsi), %xmm12, %xmm14
+    vpxor %xmm14, %xmm10, %xmm10
+    vpxor %xmm12, %xmm13, %xmm13
+    vaesenc %xmm7, %xmm5, %xmm5
+    vaesenc %xmm7, %xmm6, %xmm6
+    vpclmulqdq $0x00, 144(%rsi), %xmm13, %xmm14
+    vpxor %xmm14, %xmm11, %xmm11
+
+    vmovdqu 48(%rdx), %xmm7
+    vmovdqu -64(%r10), %xmm12
+    vpshufb %xmm15, %xmm12, %xmm12
+    vaesenc %xmm7, %xmm1, %xmm1
+    vaesenc %xmm7, %xmm2, %xmm2
+    vpclmulqdq $0x00, 96(%rsi), %xmm12, %xmm14
+    vpxor %xmm14, %xmm9, %xmm9
+    vpshufd $0x4e, %xmm12, %xmm13
+    vaesenc %xmm7, %xmm3, %xmm3
+    vaesenc %xmm7, %xmm4, %xmm4
+    vpclmulqdq $0x11, 96(%rsi), %xmm12, %xmm14
+    vpxor %xmm14, %xmm10, %xmm10
+    vpxor %xmm12, %xmm13, %xmm13
+    vaesenc %xmm7, %xmm5, %xmm5
+    vaesenc %xmm7, %xmm6, %xmm6
+    vpclmulqdq $0x00, 112(%rsi), %xmm13, %xmm14
+    vpxor %xmm14, %xmm11, %xmm11
+
+    vmovdqu 64(%rdx), %xmm7
+    vmovdqu -48(%r10), %xmm12
+    vpshufb %xmm15, %xmm12, %xmm12
+    vaesenc %xmm7, %xmm1, %xmm1
+    vaesenc %xmm7, %xmm2, %xmm2
+    vpclmulqdq $0x00, 64(%rsi), %xmm12, %xmm14
+    vpxor %xmm14, %xmm9, %xmm9
+    vpshufd $0x4e, %xmm12, %xmm13
+    vaesenc %xmm7, %xmm3, %xmm3
+    vaesenc %xmm7, %xmm4, %xmm4
+    vpclmulqdq $0x11, 64(%rsi), %xmm12, %xmm14
+    vpxor %xmm14, %xmm10, %xmm10
+    vpxor %xmm12, %xmm13, %xmm13
+    vaesenc %xmm7, %xmm5, %xmm5
+    vaesenc %xmm7, %xmm6, %xmm6
+    vpclmulqdq $0x00, 80(%rsi), %xmm13, %xmm14
+    vpxor %xmm14, %xmm11, %xmm11
+
+    vmovdqu 80(%rdx), %xmm7
+    vmovdqu -32(%r10), %xmm12
+    vpshufb %xmm15, %xmm12, %xmm12
+    vaesenc %xmm7, %xmm1, %xmm1
+    vaesenc %xmm7, %xmm2, %xmm2
+    vpclmulqdq $0x00, 32(%rsi), %xmm12, %xmm14
+    vpxor %xmm14, %xmm9, %xmm9
+    vpshufd $0x4e, %xmm12, %xmm13
+    vaesenc %xmm7, %xmm3, %xmm3
+    vaesenc %xmm7, %xmm4, %xmm4
+    vpclmulqdq $0x11, 32(%rsi), %xmm12, %xmm14
+    vpxor %xmm14, %xmm10, %xmm10
+    vpxor %xmm12, %xmm13, %xmm13
+    vaesenc %xmm7, %xmm5, %xmm5
+    vaesenc %xmm7, %xmm6, %xmm6
+    vpclmulqdq $0x00, 48(%rsi), %xmm13, %xmm14
+    vpxor %xmm14, %xmm11, %xmm11
+
+    vmovdqu 96(%rdx), %xmm7
+    vmovdqu -16(%r10), %xmm12
+    vpshufb %xmm15, %xmm12, %xmm12
+    vaesenc %xmm7, %xmm1, %xmm1
+    vaesenc %xmm7, %xmm2, %xmm2
+    vpclmulqdq $0x00, 0(%rsi), %xmm12, %xmm14
+    vpxor %xmm14, %xmm9, %xmm9
+    vpshufd $0x4e, %xmm12, %xmm13
+    vaesenc %xmm7, %xmm3, %xmm3
+    vaesenc %xmm7, %xmm4, %xmm4
+    vpclmulqdq $0x11, 0(%rsi), %xmm12, %xmm14
+    vpxor %xmm14, %xmm10, %xmm10
+    vpxor %xmm12, %xmm13, %xmm13
+    vaesenc %xmm7, %xmm5, %xmm5
+    vaesenc %xmm7, %xmm6, %xmm6
+    vpclmulqdq $0x00, 16(%rsi), %xmm13, %xmm14
+    vpxor %xmm14, %xmm11, %xmm11
+
+    vpxor %xmm9, %xmm11, %xmm11
+    vpxor %xmm10, %xmm11, %xmm11
+    vpslldq $8, %xmm11, %xmm12
+    vpsrldq $8, %xmm11, %xmm13
+    vpxor %xmm12, %xmm9, %xmm9
+    vpxor %xmm13, %xmm10, %xmm10
+    vmovdqu 112(%rdx), %xmm7
+    vpclmulqdq $0x10, 9f(%rip), %xmm9, %xmm12
+    vpshufd $0x4e, %xmm9, %xmm9
+    vpxor %xmm12, %xmm9, %xmm9
+    vaesenc %xmm7, %xmm1, %xmm1
+    vaesenc %xmm7, %xmm2, %xmm2
+    vaesenc %xmm7, %xmm3, %xmm3
+    vaesenc %xmm7, %xmm4, %xmm4
+    vaesenc %xmm7, %xmm5, %xmm5
+    vaesenc %xmm7, %xmm6, %xmm6
+    vmovdqu 128(%rdx), %xmm7
+    vpclmulqdq $0x10, 9f(%rip), %xmm9, %xmm12
+    vpshufd $0x4e, %xmm9, %xmm8
+    vaesenc %xmm7, %xmm1, %xmm1
+    vaesenc %xmm7, %xmm2, %xmm2
+    vaesenc %xmm7, %xmm3, %xmm3
+    vaesenc %xmm7, %xmm4, %xmm4
+    vaesenc %xmm7, %xmm5, %xmm5
+    vaesenc %xmm7, %xmm6, %xmm6
+    vmovdqu 144(%rdx), %xmm7
+    vpxor %xmm12, %xmm8, %xmm8
+    vpxor %xmm10, %xmm8, %xmm8
+    vaesenc %xmm7, %xmm1, %xmm1
+    vaesenc %xmm7, %xmm2, %xmm2
+    vaesenc %xmm7, %xmm3, %xmm3
+    vaesenc %xmm7, %xmm4, %xmm4
+    vaesenc %xmm7, %xmm5, %xmm5
+    vaesenc %xmm7, %xmm6, %xmm6
+    jmp 4f
+  2:
+    movq $16, %rax
+  3:
+    vmovdqu (%rdx,%rax), %xmm7
+    vaesenc %xmm7, %xmm1, %xmm1
+    vaesenc %xmm7, %xmm2, %xmm2
+    vaesenc %xmm7, %xmm3, %xmm3
+    vaesenc %xmm7, %xmm4, %xmm4
+    vaesenc %xmm7, %xmm5, %xmm5
+    vaesenc %xmm7, %xmm6, %xmm6
+    addq $16, %rax
+    cmpq $160, %rax
+    jb 3b
+  4:
+    vmovdqu 160(%rdx), %xmm7
+    vaesenclast %xmm7, %xmm1, %xmm1
+    vpxor 0(%r9), %xmm1, %xmm1
+    vmovdqu %xmm1, 0(%r10)
+    vaesenclast %xmm7, %xmm2, %xmm2
+    vpxor 16(%r9), %xmm2, %xmm2
+    vmovdqu %xmm2, 16(%r10)
+    vaesenclast %xmm7, %xmm3, %xmm3
+    vpxor 32(%r9), %xmm3, %xmm3
+    vmovdqu %xmm3, 32(%r10)
+    vaesenclast %xmm7, %xmm4, %xmm4
+    vpxor 48(%r9), %xmm4, %xmm4
+    vmovdqu %xmm4, 48(%r10)
+    vaesenclast %xmm7, %xmm5, %xmm5
+    vpxor 64(%r9), %xmm5, %xmm5
+    vmovdqu %xmm5, 64(%r10)
+    vaesenclast %xmm7, %xmm6, %xmm6
+    vpxor 80(%r9), %xmm6, %xmm6
+    vmovdqu %xmm6, 80(%r10)
+    addq $96, %r9
+    addq $96, %r10
+    movl $1, %r8d
+    decq %rcx
+    jnz 1b
+    vmovdqu %xmm8, (%rdi)
+    jmp 10f
+  .p2align 4
+  6:
+    .long 0, 0, 0, 1
+    .long 0, 0, 0, 2
+    .long 0, 0, 0, 3
+    .long 0, 0, 0, 4
+    .long 0, 0, 0, 5
+    .long 0, 0, 0, 6
+  7:
+    .quad 0x0706050403020100, 0x0c0d0e0f0b0a0908
+  8:
+    .quad 0x08090a0b0c0d0e0f, 0x0001020304050607
+  9:
+    .quad 1, 0xc200000000000000
+  10:
+  end;
+  asm arm64 (Y: in x0; Powers: in x1; Key: in x2; Ctr: in x3; Src: in x4; Dst: in x5; Groups: in x6)
+    ld1 {v17.16b}, [x0]
+    ld1 {v20.16b}, [x3]
+    rev32 v20.16b, v20.16b
+    mov x3, #0
+    movi v31.16b, #0
+    mov x8, #0xc200000000000000
+    mov v30.d[0], x8
+    movi v29.16b, #0
+    mov w8, #1
+    mov v29.s[3], w8
+  .p2align 5
+  1:
+    rev32 v0.16b, v20.16b
+    add v20.4s, v20.4s, v29.4s
+    rev32 v1.16b, v20.16b
+    add v20.4s, v20.4s, v29.4s
+    rev32 v2.16b, v20.16b
+    add v20.4s, v20.4s, v29.4s
+    rev32 v3.16b, v20.16b
+    add v20.4s, v20.4s, v29.4s
+    cbz x3, 2f
+    sub x9, x5, #64
+    movi v18.16b, #0
+    movi v19.16b, #0
+    movi v22.16b, #0
+    ldr q16, [x2, #0]
+    ld1 {v21.16b}, [x9], #16
+    rev64 v21.16b, v21.16b
+    ext v21.16b, v21.16b, v21.16b, #8
+    eor v21.16b, v21.16b, v17.16b
+    aese v0.16b, v16.16b
+    aesmc v0.16b, v0.16b
+    aese v1.16b, v16.16b
+    aesmc v1.16b, v1.16b
+    ldp q24, q25, [x1, #96]
+    ext v26.16b, v21.16b, v21.16b, #8
+    pmull v27.1q, v21.1d, v24.1d
+    pmull2 v28.1q, v21.2d, v24.2d
+    aese v2.16b, v16.16b
+    aesmc v2.16b, v2.16b
+    aese v3.16b, v16.16b
+    aesmc v3.16b, v3.16b
+    eor v26.16b, v26.16b, v21.16b
+    pmull v26.1q, v26.1d, v25.1d
+    eor v18.16b, v18.16b, v27.16b
+    eor v19.16b, v19.16b, v28.16b
+    eor v22.16b, v22.16b, v26.16b
+
+    ldr q16, [x2, #16]
+    ld1 {v21.16b}, [x9], #16
+    rev64 v21.16b, v21.16b
+    ext v21.16b, v21.16b, v21.16b, #8
+    aese v0.16b, v16.16b
+    aesmc v0.16b, v0.16b
+    aese v1.16b, v16.16b
+    aesmc v1.16b, v1.16b
+    ldp q24, q25, [x1, #64]
+    ext v26.16b, v21.16b, v21.16b, #8
+    pmull v27.1q, v21.1d, v24.1d
+    pmull2 v28.1q, v21.2d, v24.2d
+    aese v2.16b, v16.16b
+    aesmc v2.16b, v2.16b
+    aese v3.16b, v16.16b
+    aesmc v3.16b, v3.16b
+    eor v26.16b, v26.16b, v21.16b
+    pmull v26.1q, v26.1d, v25.1d
+    eor v18.16b, v18.16b, v27.16b
+    eor v19.16b, v19.16b, v28.16b
+    eor v22.16b, v22.16b, v26.16b
+
+    ldr q16, [x2, #32]
+    ld1 {v21.16b}, [x9], #16
+    rev64 v21.16b, v21.16b
+    ext v21.16b, v21.16b, v21.16b, #8
+    aese v0.16b, v16.16b
+    aesmc v0.16b, v0.16b
+    aese v1.16b, v16.16b
+    aesmc v1.16b, v1.16b
+    ldp q24, q25, [x1, #32]
+    ext v26.16b, v21.16b, v21.16b, #8
+    pmull v27.1q, v21.1d, v24.1d
+    pmull2 v28.1q, v21.2d, v24.2d
+    aese v2.16b, v16.16b
+    aesmc v2.16b, v2.16b
+    aese v3.16b, v16.16b
+    aesmc v3.16b, v3.16b
+    eor v26.16b, v26.16b, v21.16b
+    pmull v26.1q, v26.1d, v25.1d
+    eor v18.16b, v18.16b, v27.16b
+    eor v19.16b, v19.16b, v28.16b
+    eor v22.16b, v22.16b, v26.16b
+
+    ldr q16, [x2, #48]
+    ld1 {v21.16b}, [x9], #16
+    rev64 v21.16b, v21.16b
+    ext v21.16b, v21.16b, v21.16b, #8
+    aese v0.16b, v16.16b
+    aesmc v0.16b, v0.16b
+    aese v1.16b, v16.16b
+    aesmc v1.16b, v1.16b
+    ldp q24, q25, [x1, #0]
+    ext v26.16b, v21.16b, v21.16b, #8
+    pmull v27.1q, v21.1d, v24.1d
+    pmull2 v28.1q, v21.2d, v24.2d
+    aese v2.16b, v16.16b
+    aesmc v2.16b, v2.16b
+    aese v3.16b, v16.16b
+    aesmc v3.16b, v3.16b
+    eor v26.16b, v26.16b, v21.16b
+    pmull v26.1q, v26.1d, v25.1d
+    eor v18.16b, v18.16b, v27.16b
+    eor v19.16b, v19.16b, v28.16b
+    eor v22.16b, v22.16b, v26.16b
+
+    eor v22.16b, v22.16b, v18.16b
+    eor v22.16b, v22.16b, v19.16b
+    ext v24.16b, v31.16b, v22.16b, #8
+    ext v25.16b, v22.16b, v31.16b, #8
+    eor v18.16b, v18.16b, v24.16b
+    eor v19.16b, v19.16b, v25.16b
+    ldr q16, [x2, #64]
+    pmull v24.1q, v30.1d, v18.1d
+    ext v18.16b, v18.16b, v18.16b, #8
+    aese v0.16b, v16.16b
+    aesmc v0.16b, v0.16b
+    aese v1.16b, v16.16b
+    aesmc v1.16b, v1.16b
+    aese v2.16b, v16.16b
+    aesmc v2.16b, v2.16b
+    aese v3.16b, v16.16b
+    aesmc v3.16b, v3.16b
+    ldr q16, [x2, #80]
+    eor v18.16b, v18.16b, v24.16b
+    pmull v24.1q, v30.1d, v18.1d
+    aese v0.16b, v16.16b
+    aesmc v0.16b, v0.16b
+    aese v1.16b, v16.16b
+    aesmc v1.16b, v1.16b
+    aese v2.16b, v16.16b
+    aesmc v2.16b, v2.16b
+    aese v3.16b, v16.16b
+    aesmc v3.16b, v3.16b
+    ldr q16, [x2, #96]
+    ext v17.16b, v18.16b, v18.16b, #8
+    eor v17.16b, v17.16b, v24.16b
+    eor v17.16b, v17.16b, v19.16b
+    aese v0.16b, v16.16b
+    aesmc v0.16b, v0.16b
+    aese v1.16b, v16.16b
+    aesmc v1.16b, v1.16b
+    aese v2.16b, v16.16b
+    aesmc v2.16b, v2.16b
+    aese v3.16b, v16.16b
+    aesmc v3.16b, v3.16b
+    ldr q16, [x2, #112]
+    aese v0.16b, v16.16b
+    aesmc v0.16b, v0.16b
+    aese v1.16b, v16.16b
+    aesmc v1.16b, v1.16b
+    aese v2.16b, v16.16b
+    aesmc v2.16b, v2.16b
+    aese v3.16b, v16.16b
+    aesmc v3.16b, v3.16b
+    ldr q16, [x2, #128]
+    aese v0.16b, v16.16b
+    aesmc v0.16b, v0.16b
+    aese v1.16b, v16.16b
+    aesmc v1.16b, v1.16b
+    aese v2.16b, v16.16b
+    aesmc v2.16b, v2.16b
+    aese v3.16b, v16.16b
+    aesmc v3.16b, v3.16b
+    add x9, x2, #144
+    b 4f
+  2:
+    mov x9, x2
+    mov x10, #9
+  3:
+    ld1 {v16.16b}, [x9], #16
+    aese v0.16b, v16.16b
+    aesmc v0.16b, v0.16b
+    aese v1.16b, v16.16b
+    aesmc v1.16b, v1.16b
+    aese v2.16b, v16.16b
+    aesmc v2.16b, v2.16b
+    aese v3.16b, v16.16b
+    aesmc v3.16b, v3.16b
+    subs x10, x10, #1
+    b.ne 3b
+  4:
+    ld1 {v16.16b}, [x9], #16
+    aese v0.16b, v16.16b
+    aese v1.16b, v16.16b
+    aese v2.16b, v16.16b
+    aese v3.16b, v16.16b
+    ld1 {v16.16b}, [x9]
+    ld1 {v24.16b-v27.16b}, [x4], #64
+    eor v0.16b, v0.16b, v16.16b
+    eor v0.16b, v0.16b, v24.16b
+    eor v1.16b, v1.16b, v16.16b
+    eor v1.16b, v1.16b, v25.16b
+    eor v2.16b, v2.16b, v16.16b
+    eor v2.16b, v2.16b, v26.16b
+    eor v3.16b, v3.16b, v16.16b
+    eor v3.16b, v3.16b, v27.16b
+    st1 {v0.16b-v3.16b}, [x5], #64
+    mov x3, #1
+    subs x6, x6, #1
+    b.ne 1b
+    st1 {v17.16b}, [x0]
+  end;
+end;
+{$endif}
+
+{ Final GHASH length block and the AES mask under J0. }
+procedure GcmTagFinish(const G: TGcm; const J0: TBlock16; Y1, Y0, AdLen, CLen: Integer; OutP: Pointer);
 var
-  y1, y0: Integer;
   lens, ek: array[0..15] of Byte;
 begin
-  y1 := 0;
-  y0 := 0;
-  if Ad <> '' then
-    GhashUpdate(G, y1, y0, @Ad[1], Length(Ad));
-  if CLen > 0 then
-    GhashUpdate(G, y1, y0, C, CLen);
-  StoreBE64(@lens[0], 8 * Length(Ad));
+  StoreBE64(@lens[0], 8 * AdLen);
   StoreBE64(@lens[8], 8 * CLen);
   GhashUpdate(G, y1, y0, @lens[0], 16);
   AesEncryptBlock(G.Aes, @J0[0], @ek[0]);
@@ -1491,6 +1970,52 @@ begin
   StoreBE64(OutP + 8, y0 xor LoadBE64(@ek[8]));
   FillChar(ek, SizeOf(ek), 0);
 end;
+
+{ the tag of Ad and the ciphertext C under J0 }
+procedure GcmTag(const G: TGcm; const J0: TBlock16; const Ad: string; C: Pointer; CLen: Integer; OutP: Pointer);
+var
+  y1, y0: Integer;
+begin
+  y1 := 0;
+  y0 := 0;
+  if Ad <> '' then GhashUpdate(G, y1, y0, @Ad[1], Length(Ad));
+  if CLen > 0 then GhashUpdate(G, y1, y0, C, CLen);
+  GcmTagFinish(G, J0, y1, y0, Length(Ad), CLen, OutP);
+end;
+
+{$if defined(CPU_AES) and defined(CPU_PMULL) and (defined(CPUAARCH64) or (defined(CPU_AVX) and defined(CPU_SSSE3)))}
+procedure GcmSealCpu(const G: TGcm; const J0: TBlock16; var Ctr: TBlock16;
+  const Plain, Ad: string; var Sealed: string);
+const GroupBytes = 16 * GcmCpuGroup;
+var
+  y: array[0..1] of Integer;
+  off, groups, used, n: Integer;
+begin
+  y[0] := 0;
+  y[1] := 0;
+  if Ad <> '' then GhashUpdate(G, y[1], y[0], @Ad[1], Length(Ad));
+  off := 0;
+  n := Length(Plain);
+  { Cap the native call at 1024 blocks, including its pending group.
+    Complete that last GHASH before the next call or the partial tail. }
+  while n - off >= 2 * GroupBytes do
+  begin
+    groups := Min((n - off) div GroupBytes, 1024 div GcmCpuGroup);
+    used := groups * GroupBytes;
+    GcmSealBlocksCpu(@y[0], @G.HashPowers[0], @G.Aes.EncK[0], @Ctr[0],
+      @Plain[off + 1], @Sealed[off + 1], groups);
+    off := off + used;
+    GhashUpdate(G, y[1], y[0], @Sealed[off - GroupBytes + 1], GroupBytes);
+    StoreBE32(@Ctr[12], UInt32(LoadBE32(@Ctr[12]) + groups * GcmCpuGroup));
+  end;
+  if off < n then
+  begin
+    CtrXor(G.Aes, Ctr, @Plain[off + 1], @Sealed[off + 1], n - off, True);
+    GhashUpdate(G, y[1], y[0], @Sealed[off + 1], n - off);
+  end;
+  GcmTagFinish(G, J0, y[1], y[0], Length(Ad), n, @Sealed[n + 1]);
+end;
+{$endif}
 
 function GcmSeal(const G: TGcm; const Nonce, Plain, Ad: string): string;
 var
@@ -1512,6 +2037,13 @@ begin
   SetLength(Result, n + 16);
   Move(j0[0], ctr[0], 16);
   StoreBE32(@ctr[12], UInt32(LoadBE32(@ctr[12]) + 1));
+{$if defined(CPU_AES) and defined(CPU_PMULL) and (defined(CPUAARCH64) or (defined(CPU_AVX) and defined(CPU_SSSE3)))}
+  if (G.Aes.Rounds = 10) and (n >= 32 * GcmCpuGroup) then
+  begin
+    GcmSealCpu(G, j0, ctr, Plain, Ad, Result);
+    Exit;
+  end;
+{$endif}
   if n > 0 then
   begin
     CtrXor(G.Aes, ctr, @Plain[1], @Result[1], n, True);
