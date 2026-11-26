@@ -12450,7 +12450,13 @@ Keys, nonces, messages and tags are strings of bytes.
   plain, ad)` gives the ciphertext followed by its 16-byte tag, and
   `GcmOpen(g, nonce, sealed, ad, plain)` gives `False`, with `plain`
   empty, when the tag does not match. The nonce is 12 bytes in TLS and
-  any length but empty otherwise.
+  any length but empty otherwise. `GcmSealInto(g, nonce, ad, src, n,
+  dst, capacity)` writes the ciphertext and its 16-byte tag into a caller
+  buffer of at least `n + 16` bytes. The source can equal the destination
+  for in-place sealing or be nil for empty plaintext. The written range
+  must otherwise be disjoint from the source and associated data. An
+  invalid size, empty nonce or overlapping range returns `False` before
+  writing. TLS seals into its reusable record buffer.
 - `ChaChaPolySeal(key, nonce, plain, ad)` and `ChaChaPolyOpen(key,
   nonce, sealed, ad, plain)` are RFC 8439's AEAD (a 32-byte key, a
   12-byte nonce); `ChaCha20Xor(key, nonce, counter, s)` and

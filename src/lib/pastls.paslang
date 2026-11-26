@@ -139,11 +139,15 @@ type
       in WriteAll, and the reading side when it answers a KeyUpdate or
       sends an alert }
     FWMu: mutex;
+    { Writer-owned record storage, allocated on demand under FWMu. }
+    FWriteBuffer: array of Byte;
     function TakeHead(Deadline: Integer; out Hdr: string; out Err: Integer): Boolean;
     function TakeBody(N, Deadline: Integer; out Data: string; out Err: Integer): Boolean;
     function DiscardEarlyRecord(CiphertextSize: Integer): Boolean;
     function ReadRecord(Deadline: Integer; ExpectCcs: Boolean; out Typ: Integer; out Data: string): Boolean;
     function RecordOf(Typ: Integer; const Data: string): string;
+    function AesRecordInto(Typ: Integer; P: Pointer; N: Integer; OutP: Pointer): Integer;
+    function CheckWrite(Ok: Boolean): Boolean;
     function WriteRecord(Typ: Integer; const Data: string; Deadline: Integer): Boolean;
     function SendKeyUpdate(Deadline: Integer): Boolean;
     function PrepareApplicationWrite(Deadline: Integer): Boolean;
@@ -293,6 +297,7 @@ const
   ReadTimeout = 'tls: read timeout';
   { how many records of application data go in one write }
   RecordsAWrite = 4;
+  AesRecordOverhead = 5 + 8 + 16; { header, TLS 1.2 explicit nonce, tag }
   MaxUselessRecords = 16;
   TlsTicketSlots = 1024;
   TlsTicketLifetime = 3600;
@@ -704,14 +709,6 @@ begin
     Result[5 + i] := Chr(Ord(Result[5 + i]) xor s[i]);
 end;
 
-function SealWith(Aead: Integer; const Gcm: TGcm; const Key, Nonce, Plain, Ad: string): string;
-begin
-  if Aead = 1 then
-    Result := GcmSeal(Gcm, Nonce, Plain, Ad)
-  else
-    Result := ChaChaPolySeal(Key, Nonce, Plain, Ad);
-end;
-
 function OpenWith(Aead: Integer; const Gcm: TGcm; const Key, Nonce, Sealed, Ad: string; out Plain: string): Boolean;
 begin
   if Aead = 1 then
@@ -720,8 +717,8 @@ begin
     Result := ChaChaPolyOpen(Key, Nonce, Sealed, Ad, Plain);
 end;
 
-{ a record's payload, sealed when the write side has keys (Go's
-  halfConn.encrypt) }
+{ The payload of a plaintext or ChaCha20-Poly1305 record.
+  AES-GCM writes through AesRecordInto. }
 function TTlsStream.Seal(Typ: Integer; const Data: string): string;
 var
   nonce, ad, seq: string;
@@ -737,16 +734,14 @@ begin
     { TLSInnerPlaintext: the content and its type, no padding; the outer
       type is application_data and the header is the additional data }
     ad := U8(RecData) + U16($0303) + U16(Length(Data) + 1 + 16);
-    Result := SealWith(FWrAead, FWrGcm, FWrKey, nonce, Data + U8(Typ), ad);
+    Result := ChaChaPolySeal(FWrKey, nonce, Data + U8(Typ), ad);
   end
   else
   begin
     SetLength(seq, 8);
     StoreBE64(@seq[1], FWrSeq);
     ad := seq + U8(Typ) + U16($0303) + U16(Length(Data));
-    Result := SealWith(FWrAead, FWrGcm, FWrKey, nonce, Data, ad);
-    if FWrAead = 1 then
-      Result := seq + Result;
+    Result := ChaChaPolySeal(FWrKey, nonce, Data, ad);
   end;
   Inc(FWrSeq);
 end;
@@ -863,17 +858,84 @@ begin
     Move(body[1], Result[6], n);
 end;
 
-function TTlsStream.WriteRecord(Typ: Integer; const Data: string; Deadline: Integer): Boolean;
+{ Seal directly into the final record with room for N + AesRecordOverhead.
+  As in Go's halfConn.encrypt, build TLS 1.3's inner plaintext in place.
+  TLS 1.2 can seal the input directly and prefixes an explicit nonce. }
+function TTlsStream.AesRecordInto(Typ: Integer; P: Pointer; N: Integer; OutP: Pointer): Integer;
+var
+  nonce, ad: string;
+  body: Pointer;
+  plainSize, bodySize: Integer;
 begin
-  if FServer and (FVers = TlsVersion12) and (FWrSeq >= Tls12MaxRecords) then
-    Exit(False);
-  Result := FRaw.WriteAll(RecordOf(Typ, Data), Deadline);
-  if not Result then
+  Result := 0;
+  nonce := RecNonce(1, FWrIv, FWrSeq, FVers = TlsVersion13);
+  if FVers = TlsVersion13 then
+  begin
+    plainSize := N + 1;
+    bodySize := plainSize + 16;
+    PByte(OutP)^ := Byte(RecData);
+    body := OutP + 5;
+    if N > 0 then Move(PByte(P)^, PByte(body)^, N);
+    PByte(body + N)^ := Byte(Typ);
+    P := body;
+  end
+  else
+  begin
+    plainSize := N;
+    bodySize := plainSize + 8 + 16;
+    PByte(OutP)^ := Byte(Typ);
+    StoreBE64(OutP + 5, FWrSeq);
+    body := OutP + 13;
+  end;
+  PByte(OutP + 1)^ := 3;
+  PByte(OutP + 2)^ := 3;
+  PByte(OutP + 3)^ := Byte(bodySize shr 8);
+  PByte(OutP + 4)^ := Byte(bodySize and 255);
+  if FVers = TlsVersion13 then
+  begin
+    SetLength(ad, 5);
+    Move(PByte(OutP)^, ad[1], 5);
+  end
+  else
+  begin
+    SetLength(ad, 13);
+    StoreBE64(@ad[1], FWrSeq);
+    Move(PByte(OutP)^, ad[9], 3);
+    ad[12] := Chr(N shr 8);
+    ad[13] := Chr(N and 255);
+  end;
+  if not GcmSealInto(FWrGcm, nonce, ad, P, plainSize, body, plainSize + 16) then Exit;
+  Inc(FWrSeq);
+  Result := 5 + bodySize;
+end;
+
+function TTlsStream.CheckWrite(Ok: Boolean): Boolean;
+begin
+  Result := Ok;
+  if not Ok then
   begin
     FBroken := True;
     if (FErr = '') or (FErr = ReadTimeout) then
       FErr := 'tls: write failed';
   end;
+end;
+
+function TTlsStream.WriteRecord(Typ: Integer; const Data: string; Deadline: Integer): Boolean;
+var
+  n, used: Integer;
+  src: Pointer;
+begin
+  if FServer and (FVers = TlsVersion12) and (FWrSeq >= Tls12MaxRecords) then
+    Exit(False);
+  if FWrAead <> 1 then
+    Exit(CheckWrite(FRaw.WriteAll(RecordOf(Typ, Data), Deadline)));
+  n := Length(Data);
+  if Length(FWriteBuffer) < n + AesRecordOverhead then
+    SetLength(FWriteBuffer, n + AesRecordOverhead);
+  src := nil;
+  if n > 0 then src := @Data[1];
+  used := AesRecordInto(Typ, src, n, @FWriteBuffer[0]);
+  Result := CheckWrite((used > 0) and FRaw.WriteFrom(@FWriteBuffer[0], used, Deadline));
 end;
 
 { The caller holds FWMu and has sent every record sealed with the old key. }
@@ -900,7 +962,7 @@ end;
   under this one. The caller holds FWMu }
 function TTlsStream.WritePlain(P: Pointer; N, Deadline: Integer): Boolean;
 var
-  done, n1, held, used, batchLimit, remaining: Integer;
+  done, n1, held, used, batchLimit, remaining, space, size: Integer;
   chunk, rec, batch: string;
 begin
   Result := False;
@@ -927,34 +989,51 @@ begin
     held := 0;
     used := 0;
     batch := '';
+    if FWrAead = 1 then
+    begin
+      batchLimit := Min(batchLimit, 1 + (N - done - 1) div MaxPlaintext);
+      space := Min(N - done, batchLimit * MaxPlaintext) + batchLimit * AesRecordOverhead;
+      if Length(FWriteBuffer) < space then
+        SetLength(FWriteBuffer, space);
+    end;
     while (done < N) and (held < batchLimit) do
     begin
       n1 := N - done;
       if n1 > MaxPlaintext then
         n1 := MaxPlaintext;
-      SetLength(chunk, n1);
-      Move(PByte(P + done)^, chunk[1], n1);
-      rec := RecordOf(RecData, chunk);
-      done := done + n1;
-      Inc(held);
-      if (held = 1) and (done = N) then
-        batch := rec
+      if FWrAead = 1 then
+      begin
+        size := AesRecordInto(RecData, P + done, n1, @FWriteBuffer[used]);
+        if size = 0 then Exit(CheckWrite(False));
+      end
       else
       begin
-        if batch = '' then
-          SetLength(batch, RecordsAWrite * (MaxPlaintext + 64));
-        Move(rec[1], batch[used + 1], Length(rec));
+        SetLength(chunk, n1);
+        Move(PByte(P + done)^, chunk[1], n1);
+        rec := RecordOf(RecData, chunk);
+        size := Length(rec);
+        if (held = 0) and (done + n1 = N) then
+          batch := rec
+        else
+        begin
+          if batch = '' then
+            SetLength(batch, RecordsAWrite * (MaxPlaintext + 64));
+          Move(rec[1], batch[used + 1], size);
+        end;
       end;
-      used := used + Length(rec);
+      done := done + n1;
+      Inc(held);
+      used := used + size;
     end;
-    if Length(batch) <> used then
-      SetLength(batch, used);
-    if not FRaw.WriteAll(batch, Deadline) then
+    if FWrAead = 1 then
     begin
-      FBroken := True;
-      if (FErr = '') or (FErr = ReadTimeout) then
-        FErr := 'tls: write failed';
-      Exit;
+      if not CheckWrite(FRaw.WriteFrom(@FWriteBuffer[0], used, Deadline)) then Exit;
+    end
+    else
+    begin
+      if Length(batch) <> used then
+        SetLength(batch, used);
+      if not CheckWrite(FRaw.WriteAll(batch, Deadline)) then Exit;
     end;
   end;
   Result := True;
@@ -3374,6 +3453,7 @@ begin
   FWrIv := '';
   FRdGcm := Default(TGcm);
   FWrGcm := Default(TGcm);
+  FWriteBuffer := nil;
   FPendingHeader := '';
   FPendingBody := '';
   FPendingRead := 0;
