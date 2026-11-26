@@ -161,6 +161,21 @@ def input_resolution_checks(folder):
     else:
         require(False, "an earlier interface shadowing the recorded unit was reused")
 
+    sha = unit_directory / "v3+sha" / "unit.o"
+    sha.parent.mkdir()
+    sha.write_text("controlled SHA unit")
+    program.with_suffix(".link").write_text("\n".join(
+        ["-o", "program", "--gc-sections", "-T", "program.ld", "program.o", "build/v3+sha/unit.o"]) + "\n")
+    arguments[2] = "native"
+    current = run_refs.paslang_inputs(arguments, "program", env={}, cwd=work)["units"][0]
+    require(current["object"]["path"] == str(sha.resolve()) and
+            current["cpu_object_selection"]["sha"]["not_older_than_fallback"],
+            "native SHA object was not recorded as the actual input")
+    os.utime(sha, ns=(0, 0))
+    stale = run_refs.paslang_inputs(arguments, "program", env={}, cwd=work)["units"][0]
+    require(not stale["cpu_object_selection"]["sha"]["not_older_than_fallback"],
+            "stale SHA object did not invalidate reuse evidence")
+
 
 def timed_checks(folder):
     a = executable(folder / 'a', "import os\nos.write(1,b'first\\nsecond\\n\\xff')\nos.write(2,b'diagnostic\\n')\n")

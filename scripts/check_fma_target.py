@@ -855,6 +855,12 @@ def sdk_paths(sdk, arch):
         if variant.stat().st_mtime_ns < base.stat().st_mtime_ns:
             raise RuntimeError("ordinary SDK variant is stale: " + str(variant))
         paths += [interface, base, variant]
+        if arch == "amd64":
+            sha = sdk / "v3+sha" / base.name
+            if sha.exists():
+                if not sha.is_file() or sha.stat().st_mtime_ns < variant.stat().st_mtime_ns:
+                    raise RuntimeError("ordinary SDK SHA variant is invalid or stale: " + str(sha))
+                paths.append(sha)
     return paths
 
 
@@ -872,9 +878,14 @@ def linked_inputs(program, sdk, arch, cpu):
         interface = sdk / (path.stem.lower() + ".pi")
         base = interface.with_suffix(".o")
         variant = sdk / level / path.name
-        if not interface.is_file() or path not in (base.resolve(), variant.resolve()):
+        eligible = {base.resolve(): "base", variant.resolve(): level}
+        if arch == "amd64" and cpu == "native":
+            sha = sdk / "v3+sha" / path.name
+            if sha.is_file():
+                eligible[sha.resolve()] = "v3+sha"
+        if not interface.is_file() or path not in eligible:
             raise RuntimeError("linked unit escaped explicit ordinary SDK: " + str(path))
-        selected[path.stem.lower()] = "base" if path == base.resolve() else level
+        selected[path.stem.lower()] = eligible[path]
         inputs.update(snapshot((path, interface)))
     if "pasnum" not in selected:
         raise RuntimeError("actual linked pasnum.o missing")

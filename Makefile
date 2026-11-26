@@ -139,6 +139,11 @@ endif
 # leaves out and pascipher's kernels need, in the directory v3.
 LVL_X64 := v3
 LVL_X64_CPU := v3+aes+pclmul
+LVL_X64_SHA := v3+sha
+LVL_X64_SHA_CPU := $(LVL_X64_CPU)+sha
+SHA_LIB_UNITS := src/lib/pascipher.paslang src/lib/pasnist.paslang src/lib/pastls.paslang src/lib/httpserver.paslang
+SHA_UNITS := src/lib/pashash.paslang $(SHA_LIB_UNITS)
+SHA_SDK_ARGS := $(foreach u,$(SHA_UNITS),--extra-level-object amd64 $(BUILDDIR) $(LVL_X64_SHA) $(notdir $(basename $(u))))
 LVL_A64 := v8.2+crypto
 A64_OBJDUMP ?= aarch64-linux-gnu-objdump
 
@@ -1068,6 +1073,11 @@ libs: $(OUTDIR)/paslangc core $(LIB_UNITS) | $(BUILDDIR)
 	  b=$$(basename $$u .paslang); \
 	  echo "lib $(LVL_X64) $$b"; \
 	  $(OUTDIR)/paslangc -cpu $(LVL_X64_CPU) -c -Fu $(BUILDDIR) -o $(BUILDDIR)/$(LVL_X64)/$$b $$u; \
+	done; \
+	for u in $(SHA_LIB_UNITS); do \
+	  b=$$(basename $$u .paslang); \
+	  echo "lib $(LVL_X64_SHA) $$b"; \
+	  $(OUTDIR)/paslangc -cpu $(LVL_X64_SHA_CPU) -c -Fu $(BUILDDIR) -o $(BUILDDIR)/$(LVL_X64_SHA)/$$b $$u; \
 	done
 
 # The library units for arm64 too (1.0.80): the installed compiler could
@@ -1102,7 +1112,9 @@ core: $(OUTDIR)/paslangc $(CORE_UNITS) | $(BUILDDIR)
 	  b=$$(basename $$u .paslang); \
 	  echo "core $(LVL_X64) $$b"; \
 	  $(OUTDIR)/paslangc -cpu $(LVL_X64_CPU) -c -Fu $(BUILDDIR) -o $(BUILDDIR)/$(LVL_X64)/$$b $$u; \
-	done
+	done; \
+	mkdir -p $(BUILDDIR)/$(LVL_X64_SHA); \
+	$(OUTDIR)/paslangc -cpu $(LVL_X64_SHA_CPU) -c -Fu $(BUILDDIR) -o $(BUILDDIR)/$(LVL_X64_SHA)/pashash src/lib/pashash.paslang
 
 core-arm64: $(OUTDIR)/paslangc $(CORE_UNITS) | $(BUILDDIR)
 	@if [ -z '$(ARM64)' ]; then \
@@ -1389,7 +1401,7 @@ bench-servers: $(OUTDIR)/paslangc core libs
 	PATH=$(OUTDIR):$$PATH python3 scripts/bench/servers.py -n 3 --json $(BUILDDIR)/bench/servers.json
 
 check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch64 $(OUTDIR)/pasdbg
-	@python3 -I scripts/check_sdk_state.py capture --manifest $(BUILDDIR)/sdk-state-check.json --profile amd64 $(BUILDDIR) $(LVL_X64) --profile arm64 $(A64DIR) $(LVL_A64) --debugger amd64 $(OUTDIR)/pasdbg -- $(CORE_UNITS) $(LIB_UNITS)
+	@python3 -I scripts/check_sdk_state.py capture --manifest $(BUILDDIR)/sdk-state-check.json --profile amd64 $(BUILDDIR) $(LVL_X64) --profile arm64 $(A64DIR) $(LVL_A64) --debugger amd64 $(OUTDIR)/pasdbg $(SHA_SDK_ARGS) -- $(CORE_UNITS) $(LIB_UNITS)
 	@set -e; \
 	for cpu in base native; do \
 	  p=$(BUILDDIR)/tlsdeadline-$$cpu; \
@@ -5497,6 +5509,12 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'pclmulqdq' $(BUILDDIR)/$(LVL_X64)/pascipher.s; \
 	grep -qF 'vpclmulqdq $$0x00, 160(%rsi)' $(BUILDDIR)/$(LVL_X64)/pascipher.s; \
 	grep -qF 'mulxq %rax, %rax, %rbx' $(BUILDDIR)/$(LVL_X64)/pasnist.s; \
+	grep -qw 'sha256rnds2' $(BUILDDIR)/$(LVL_X64_SHA)/pashash.s; \
+	if grep -qw 'sha256rnds2' $(BUILDDIR)/$(LVL_X64)/pashash.s; then echo "ordinary v3 pashash carries SHA-NI"; exit 1; fi; \
+	$(OUTDIR)/paslangc -cpu $(LVL_X64_CPU) -Fu $(BUILDDIR) -o $(BUILDDIR)/hash-level-v3 testdata/hmacstream.paslang; \
+	$(OUTDIR)/paslangc -cpu $(LVL_X64_SHA_CPU) -Fu $(BUILDDIR) -o $(BUILDDIR)/hash-level-sha testdata/hmacstream.paslang; \
+	grep -qF '/$(LVL_X64)/pashash.o' $(BUILDDIR)/hash-level-v3.link; \
+	grep -qF '/$(LVL_X64_SHA)/pashash.o' $(BUILDDIR)/hash-level-sha.link; \
 	if grep -qw 'mulxq' $(BUILDDIR)/pasnist.s; then echo "pasnist's base build carries BMI2"; exit 1; fi; \
 	for c in base $(LVL_X64_CPU); do \
 	  $(OUTDIR)/paslangc -cpu $$c -o $(BUILDDIR)/sysutils1-$$c testdata/sysutils1.paslang; \
@@ -6171,7 +6189,7 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	done; done; \
 	echo ok zippassword
 	@python3 -I scripts/check_environment_names.py --compiler $(OUTDIR)/paslangc --library $(BUILDDIR) --target amd64
-	@python3 -I scripts/check_sdk_state.py verify --manifest $(BUILDDIR)/sdk-state-check.json --profile amd64 $(BUILDDIR) $(LVL_X64) --profile arm64 $(A64DIR) $(LVL_A64) --debugger amd64 $(OUTDIR)/pasdbg -- $(CORE_UNITS) $(LIB_UNITS)
+	@python3 -I scripts/check_sdk_state.py verify --manifest $(BUILDDIR)/sdk-state-check.json --profile amd64 $(BUILDDIR) $(LVL_X64) --profile arm64 $(A64DIR) $(LVL_A64) --debugger amd64 $(OUTDIR)/pasdbg $(SHA_SDK_ARGS) -- $(CORE_UNITS) $(LIB_UNITS)
 
 # The arm64 tests run under QEMU's user mode built here, from the signed
 # 11.1.1 release in docs/ref/qemu (fetched once, checked by its SHA-256)
@@ -7828,6 +7846,11 @@ install: all installdirs
 	    b=$$(basename $$u .paslang); \
 	    $(INSTALL_DATA) $(BUILDDIR)/$(LVL_X64)/$$b.o $(DESTDIR)$(libdir)/paslang/$(LVL_X64)/; \
 	  done; \
+	  mkdir -p $(DESTDIR)$(libdir)/paslang/$(LVL_X64_SHA); \
+	  for u in $(SHA_UNITS); do \
+	    b=$$(basename $$u .paslang); \
+	    $(INSTALL_DATA) $(BUILDDIR)/$(LVL_X64_SHA)/$$b.o $(DESTDIR)$(libdir)/paslang/$(LVL_X64_SHA)/; \
+	  done; \
 	fi
 	: the arm64 units when make built them, ARM64; \
 	if [ -n '$(ARM64)' ]; then \
@@ -7878,6 +7901,11 @@ package: all compilers $(OUTDIR)/pasdbg
 	    for u in $(CORE_UNITS) $(LIB_UNITS); do \
 	      b=$$(basename $$u .paslang); cp $(BUILDDIR)/$$b.pi $(BUILDDIR)/$$b.o $$d/lib/paslang/; \
 	      cp $(BUILDDIR)/$(LVL_X64)/$$b.o $$d/lib/paslang/$(LVL_X64)/; \
+	    done; \
+	    mkdir -p $$d/lib/paslang/$(LVL_X64_SHA); \
+	    for u in $(SHA_UNITS); do \
+	      b=$$(basename $$u .paslang); \
+	      cp $(BUILDDIR)/$(LVL_X64_SHA)/$$b.o $$d/lib/paslang/$(LVL_X64_SHA)/; \
 	    done; \
 	  else \
 	    cp $(OUTDIR)/paslangc-arm64 $$d/bin/paslangc; \

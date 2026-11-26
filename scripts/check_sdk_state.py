@@ -34,6 +34,8 @@ def main():
     parser.add_argument('--manifest', type=Path, required=True)
     parser.add_argument('--profile', nargs=3, action='append', required=True,
                         metavar=('TARGET', 'BASE_DIRECTORY', 'LEVEL_DIRECTORY'))
+    parser.add_argument('--extra-level-object', nargs=4, action='append', default=[],
+                        metavar=('TARGET', 'BASE_DIRECTORY', 'LEVEL_DIRECTORY', 'UNIT'))
     parser.add_argument('--debugger', nargs=2, metavar=('TARGET', 'EXECUTABLE'))
     parser.add_argument('units', nargs='+', help='actual CORE_UNITS and LIB_UNITS source paths')
     args = parser.parse_args()
@@ -54,6 +56,22 @@ def main():
             files[str(optimized)] = identity(optimized, target)
             require(optimized.stat().st_mtime_ns >= plain.stat().st_mtime_ns,
                     'level object is older than its base and would not be selected: ' + str(optimized))
+    extra = []
+    for target, directory, level, unit in args.extra_level_object:
+        base = Path(directory).resolve()
+        require(unit in units and Path(level).name == level and level not in ('', '.', '..'),
+                'invalid extra unit or level directory')
+        fallback = [base / name_level / (unit + '.o')
+                    for name, root, name_level in profiles
+                    if target == name and str(base) == root]
+        require(fallback, 'extra level has no matching target baseline')
+        optimized = base / level / (unit + '.o')
+        require(str(optimized) not in files, 'duplicate extra level object: ' + str(optimized))
+        files[str(optimized)] = identity(optimized, target)
+        fallback.append(base / (unit + '.o'))
+        require(optimized.stat().st_mtime_ns >= max(path.stat().st_mtime_ns for path in fallback),
+                'extra level is older than its fallback: ' + str(optimized))
+        extra.append([target, str(base), level, unit])
     debugger = None
     if args.debugger:
         target, name = args.debugger
@@ -63,6 +81,8 @@ def main():
         debugger = [target, str(path)]
     state = {'format': 'paslang-sdk-state-v1', 'units': units, 'profiles': profiles,
              'debugger': debugger, 'files': files}
+    if extra:
+        state['extra_level_objects'] = extra
     if args.action == 'capture':
         args.manifest.write_text(json.dumps(state, indent=2) + '\n')
     else:

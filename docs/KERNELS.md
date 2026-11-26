@@ -22,14 +22,17 @@ preserve the original read width, evaluation order and fault location.
 `uint32memxor` and `uint32tune`, plus the independent integer model and
 ELF checks, exercise both architectures and CPU paths in `make check`.
 
-A unit chooses its kernels where it is compiled. So every installed unit
-is built twice (P143): for the base processor, and for one level of each
-machine, x86-64-v3 with AES-NI and PCLMULQDQ (`v3+aes+pclmul`, in the
+A unit chooses its kernels where it is compiled. Every installed unit
+has a base build and a build for its platform level (P143).
+The platform levels are x86-64-v3 with AES-NI and PCLMULQDQ (`v3+aes+pclmul`, in the
 directory `v3`; v3 alone has neither and pascipher's kernels need both,
 P465) and ARMv8.2 with crypto (`v8.2+crypto`, in a directory of that
 name), beside the base build. A program whose `-cpu` has
-every feature of the level links the level's objects; the interfaces are
-the same. A unit's `UpCase` of a string calls `PasUpperCpu` in a program
+every feature of the level links the level's objects. The SHA-NI build
+in `v3+sha` covers `pashash`, `pascipher`, `pasnist`, `pastls` and
+`httpserver`. The compiler uses it when the target enables SHA and the
+object is at least as recent as its fallback. The interface is shared
+by all builds. A unit's `UpCase` of a string calls `PasUpperCpu` in a program
 compiled `-cpu native` on an AVX2 machine and `PasUpperBase` under `-cpu
 base`, as Go compiles every package at the program's `GOAMD64`.
 

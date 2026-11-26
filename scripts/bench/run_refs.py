@@ -168,7 +168,11 @@ def paslang_inputs(arguments, executable, env=None, cwd=None):
             raise RuntimeError("stale executable: Paslang unit interface is absent: " + name)
         base = interface.with_suffix(".o")
         variant = interface.parent / ("v8.2+crypto" if arm else "v3") / (name + ".o")
-        if obj not in (base.resolve(), variant.resolve()):
+        eligible = [base.resolve(), variant.resolve()]
+        sha = interface.parent / "v3+sha" / (name + ".o")
+        if not arm and cpu != "base" and sha.is_file():
+            eligible.append(sha.resolve())
+        if obj not in eligible:
             raise RuntimeError("stale executable: Paslang unit resolution changed: " + name)
         selection = None
         if cpu != "base":
@@ -178,6 +182,11 @@ def paslang_inputs(arguments, executable, env=None, cwd=None):
             selection = {"variant": str(variant), "available": variant.is_file(),
                          "not_older_than_base": (variant.is_file() and base.is_file() and
                                                  variant.stat().st_mtime_ns >= base.stat().st_mtime_ns)}
+            if not arm and sha.is_file():
+                fallback = variant if selection["not_older_than_base"] else base
+                selection["sha"] = {"variant": str(sha),
+                                    "not_older_than_fallback": (fallback.is_file() and
+                                        sha.stat().st_mtime_ns >= fallback.stat().st_mtime_ns)}
         units.append({"name": name, "interface": identity(interface.resolve()),
                       "object": identity(obj), "cpu_object_selection": selection})
     return {"search_paths": list(map(str, paths)), "units": units}
