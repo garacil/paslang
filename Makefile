@@ -90,7 +90,7 @@ PASLANG_SRC := \
 	src/lib/paslinux.paslang \
 	cmd/paslangc/paslangc.paslang
 
-.PHONY: package distpkg release-assets check-release bench-rust bench-rust-rounds bench-rounds all hello check check-arm64 clean bootstrap-seed self self-arm64 stage compilers core core-arm64 libs libs-arm64 bench manual \
+.PHONY: package distpkg release-assets check-release bench-rust bench-rust-rounds bench-rounds all hello check check-arm64 check-sha-sdk clean bootstrap-seed self self-arm64 stage compilers core core-arm64 libs libs-arm64 bench manual \
 	install install-strip uninstall installdirs installcheck \
 	mostlyclean distclean maintainer-clean
 
@@ -1400,7 +1400,29 @@ bench-stages: $(OUTDIR)/paslangc core libs
 bench-servers: $(OUTDIR)/paslangc core libs
 	PATH=$(OUTDIR):$$PATH python3 scripts/bench/servers.py -n 3 --json $(BUILDDIR)/bench/servers.json
 
-check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch64 $(OUTDIR)/pasdbg
+# pashash exports the two kernels together. Inspect the linked TLS caller:
+# even a v3 executable can retain the SHA-NI body via the shared HMAC entry
+# point, which v3 uses with SHA-384 and SHA-512.
+check-sha-sdk: libs
+	@set -e; \
+	for level in $(LVL_X64) $(LVL_X64_SHA); do \
+	  case $$level in \
+	    $(LVL_X64)) cpu=$(LVL_X64_CPU); expected=base; other=cpu ;; \
+	    *) cpu=$(LVL_X64_SHA_CPU); expected=cpu; other=base ;; \
+	  esac; \
+	  bin=$(BUILDDIR)/tls-hash-$$level; \
+	  $(OUTDIR)/paslangc -cpu $$cpu -Fu $(BUILDDIR) -o $$bin testdata/tlsinterop.paslang; \
+	  for unit in pastls pashash; do \
+	    grep -qF "/$$level/$$unit.o" $$bin.link || { echo "$$cpu: wrong $$unit object"; exit 1; }; \
+	  done; \
+	  objdump -d --no-show-raw-insn --disassemble=p_f.6_pastls6_hashof $$bin > $$bin.hash; \
+	  grep -qE "call.*<p_f[.]7_pashash[0-9]+_passha256$$expected>" $$bin.hash || { echo "$$cpu: missing SHA-256 $$expected call"; exit 1; }; \
+	  if grep -qE "call.*<p_f[.]7_pashash[0-9]+_passha256$$other>" $$bin.hash; then echo "$$cpu: unexpected SHA-256 $$other call"; exit 1; fi; \
+	done; \
+	objdump -d --no-show-raw-insn --disassemble=p_f.7_pashash15_sha256blockscpu $$bin > $$bin.kernel; \
+	grep -qw sha256rnds2 $$bin.kernel
+
+check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 check-sha-sdk $(BUILDDIR)/qemu-aarch64 $(OUTDIR)/pasdbg
 	@python3 -I scripts/check_sdk_state.py capture --manifest $(BUILDDIR)/sdk-state-check.json --profile amd64 $(BUILDDIR) $(LVL_X64) --profile arm64 $(A64DIR) $(LVL_A64) --debugger amd64 $(OUTDIR)/pasdbg $(SHA_SDK_ARGS) -- $(CORE_UNITS) $(LIB_UNITS)
 	@set -e; \
 	for cpu in base native; do \
@@ -5509,12 +5531,6 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 $(BUILDDIR)/qemu-aarch
 	grep -q 'pclmulqdq' $(BUILDDIR)/$(LVL_X64)/pascipher.s; \
 	grep -qF 'vpclmulqdq $$0x00, 160(%rsi)' $(BUILDDIR)/$(LVL_X64)/pascipher.s; \
 	grep -qF 'mulxq %rax, %rax, %rbx' $(BUILDDIR)/$(LVL_X64)/pasnist.s; \
-	grep -qw 'sha256rnds2' $(BUILDDIR)/$(LVL_X64_SHA)/pashash.s; \
-	if grep -qw 'sha256rnds2' $(BUILDDIR)/$(LVL_X64)/pashash.s; then echo "ordinary v3 pashash carries SHA-NI"; exit 1; fi; \
-	$(OUTDIR)/paslangc -cpu $(LVL_X64_CPU) -Fu $(BUILDDIR) -o $(BUILDDIR)/hash-level-v3 testdata/hmacstream.paslang; \
-	$(OUTDIR)/paslangc -cpu $(LVL_X64_SHA_CPU) -Fu $(BUILDDIR) -o $(BUILDDIR)/hash-level-sha testdata/hmacstream.paslang; \
-	grep -qF '/$(LVL_X64)/pashash.o' $(BUILDDIR)/hash-level-v3.link; \
-	grep -qF '/$(LVL_X64_SHA)/pashash.o' $(BUILDDIR)/hash-level-sha.link; \
 	if grep -qw 'mulxq' $(BUILDDIR)/pasnist.s; then echo "pasnist's base build carries BMI2"; exit 1; fi; \
 	for c in base $(LVL_X64_CPU); do \
 	  $(OUTDIR)/paslangc -cpu $$c -o $(BUILDDIR)/sysutils1-$$c testdata/sysutils1.paslang; \
