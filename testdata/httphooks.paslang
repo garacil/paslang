@@ -1,0 +1,112 @@
+{ P625: HTTP fallback handlers, partial requests, and abort cleanup.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+  GPL version 3 or later. See COPYING. }
+program httphooks;
+
+uses sysutils, paslib, pasroutines, httpserver;
+
+var
+  Server: THttpServer;
+  Serving: waitgroup;
+
+procedure Ok(Req: THttpRequest; Resp: THttpResponse);
+begin
+  Resp.ReplyText(200, 'ok');
+end;
+
+procedure Drop(Req: THttpRequest; Resp: THttpResponse);
+begin
+  Resp.WriteData('discard me');
+  Resp.Abort;
+  Halt(41);
+end;
+
+procedure CutChunk(Req: THttpRequest; Resp: THttpResponse);
+begin
+  Resp.WriteData('prefix');
+  if not Resp.Flush then Halt(42);
+  Resp.Abort;
+  Halt(42);
+end;
+
+procedure Missing(Req: THttpRequest; Resp: THttpResponse);
+begin
+  if Req.Path = '/drop-missing' then
+    Drop(Req, Resp);
+  if Req.Path = '/moved' then
+    Resp.Redirect(307, '/ok')
+  else
+    Resp.ReplyText(404, Req.Method + ' ' + Req.Path);
+end;
+
+procedure WrongMethod(Req: THttpRequest; Resp: THttpResponse);
+begin
+  if Resp.Status <> 405 then Halt(43);
+  Resp.ReplyText(405, Req.Method + ' ' + Req.Target + ' ' + Resp.Header.Get('Allow'));
+end;
+
+procedure Rejected(Req: THttpRequest; Resp: THttpResponse);
+begin
+  if Req.Header.Get('X-Probe') = 'drop' then
+    Drop(Req, Resp);
+  if (Req.RawPath = '/bad-version') and (Req.Proto <> '') then Halt(44);
+  if Req.ReadAllBody <> '' then Halt(44);
+  Resp.ReplyText(Resp.Status, Req.Method + ' ' + Req.RawPath + ' ' +
+    Req.Header.Get('X-Probe') + ' ' + IntToStr(Req.ContentLength));
+end;
+
+procedure Access(const Entry: THttpAccessEntry);
+begin
+  if Entry.Aborted then
+    WriteLn('abort ', Entry.Pattern, ' ', Entry.Status, ' ', Entry.Bytes);
+end;
+
+procedure RunServer;
+begin
+  try
+    Server.Serve;
+  finally
+    Serving.Done;
+  end;
+end;
+
+var
+  Router: THttpRouter;
+  Expected, Deadline: Integer;
+  Command: string;
+
+begin
+  Router := THttpRouter.Create;
+  Router.Handle('GET', '/ok', @Ok);
+  Router.Handle('POST', '/upload', @Ok, 2);
+  Router.Handle('GET', '/drop', @Drop);
+  Router.Handle('GET', '/chunk', @CutChunk);
+  if ParamStr(1) = 'hooks' then
+  begin
+    Router.NotFound := @Missing;
+    Router.MethodNotAllowed := @WrongMethod;
+    Router.Rejected := @Rejected;
+  end;
+  Server := THttpServer.Create(Router);
+  if ParamStr(1) <> 'text' then
+    Server.AccessLogTo := @Access;
+  Server.HeaderTimeoutMs := 350;
+  Server.MaxHeaders := 4;
+  Server.MaxHeaderBytes := 256;
+  if not Server.ListenTcp('127.0.0.1', 0) then Halt(45);
+  Expected := NumGoroutine;
+  Serving.Add(1);
+  pas RunServer;
+  WriteLn(Server.Port);
+  ReadLn(Command);
+  if Command <> 'stop' then Halt(46);
+  Deadline := Nanotime + 2000000000;
+  while (Server.Active > 0) and (Nanotime < Deadline) do Sleep(1);
+  WriteLn('connections ', Server.Active);
+  Server.Shutdown;
+  Serving.Wait;
+  while (NumGoroutine > Expected) and (Nanotime < Deadline) do Sleep(1);
+  WriteLn('routines ', NumGoroutine - Expected);
+  ReadLn(Command);
+  if Command <> 'exit' then Halt(47);
+end.

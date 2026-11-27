@@ -1435,6 +1435,9 @@ check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 check-sha-sdk $(BUILDD
 	  p=$(BUILDDIR)/tlsservermany-$$cpu; \
 	  $(OUTDIR)/paslangc -cpu $$cpu -Fu $(BUILDDIR) -o $$p testdata/tlsservermany.paslang; \
 	  python3 -I scripts/check_tls_concurrency.py $$p; \
+	  p=$(BUILDDIR)/httphooks-$$cpu; \
+	  $(OUTDIR)/paslangc -cpu $$cpu -Fu $(BUILDDIR) -o $$p testdata/httphooks.paslang; \
+	  timeout 120 python3 -I scripts/check_http_hooks.py $$p; \
 	done
 	@python3 scripts/check_recipes.py
 	@python3 -I -B scripts/select_walkers.py --self-test
@@ -6238,6 +6241,9 @@ check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/
 	  p=$(BUILDDIR)/tlsservermany-$$cpu-arm; \
 	  $(OUTDIR)/paslangc -target arm64 -cpu $$cpu -Fu $(A64DIR) -o $$p testdata/tlsservermany.paslang; \
 	  python3 -I scripts/check_tls_concurrency.py $(QEMU_A64) -cpu $$model $$p; \
+	  p=$(BUILDDIR)/httphooks-$$cpu-arm; \
+	  $(OUTDIR)/paslangc -target arm64 -cpu $$cpu -Fu $(A64DIR) -o $$p testdata/httphooks.paslang; \
+	  timeout 120 python3 -I scripts/check_http_hooks.py $(QEMU_A64) -cpu $$model $$p; \
 	done
 	@python3 -I -B scripts/select_walkers.py --self-test
 	@python3 -I -B scripts/check_select_diagnostics.py "$(OUTDIR)/paslangc-arm64" "$(BUILDDIR)" "$(QEMU_A64)" --host-arm64

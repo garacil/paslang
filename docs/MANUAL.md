@@ -12196,6 +12196,24 @@ route's handler, the first used outermost: a `THttpMiddleware` is a
 (§5), which may answer by itself (a check of a token) or call `Next`.
 Routes and middleware are set before `Serve`.
 
+`router.NotFound`, `router.MethodNotAllowed` and `router.Rejected` can
+be assigned handlers before `Serve`. They receive the same request and
+response types as a route, with `Resp.Status` initialized to the status
+that selected the handler. `MethodNotAllowed` also receives the sorted
+`Allow` response header. `Rejected` runs for a refusal before the matched
+route handler and sees the validated portions of the request head. Its
+request body reads as empty and the connection closes after its response.
+Each handler can replace the response, redirect, or call `Resp.Abort`.
+An unassigned hook uses the built-in response. Route middleware wraps
+matched routes.
+
+`Resp.Abort` closes the connection and unwinds the handler. A response
+still buffered is discarded. Bytes already sent are followed by the end
+of the stream, including when a chunked response is still in progress.
+An abort is recorded with `Aborted` in `THttpAccessEntry` and with an
+`aborted` suffix in the formatted access log. Its status is zero if the
+response head had not gone out. It does not call the handler error log.
+
 `THttpServer.Create(router)` makes a server whose settings are fields,
 set before it serves:
 - `MaxHeaderBytes` (16384) and `MaxHeaders` (100) bound the request
@@ -12221,8 +12239,8 @@ set before it serves:
 - `AccessLogTo` can handle an access entry in place of the formatted
   line. Its `THttpAccessEntry` has `Method`, `Pattern`, `Path` (the raw
   path without its query), `Status`, `Bytes`, `Milliseconds`, `Peer`
-  (the socket address with its port) and `Forwarded` (the accepted
-  address, or an empty string). It runs only when `AccessLog` is on.
+  (the socket address with its port), `Forwarded` (the accepted address,
+  or an empty string) and `Aborted`. It runs only when `AccessLog` is on.
 - A handler exception goes to `ErrorLog` if assigned. The hook receives
   the method, the route pattern and the exception, borrowed for the call.
   The default error line uses the method, route pattern and exception

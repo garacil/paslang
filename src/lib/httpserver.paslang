@@ -211,6 +211,9 @@ type
     function Status: Integer;
     { whether the head has gone }
     function HeadSent: Boolean;
+    { Close the connection and unwind this handler (like Go's
+      http.ErrAbortHandler). Discard any response still buffered. }
+    procedure Abort;
     { a piece of the body: the head first, with Content-Length when the
       handler put one, chunked otherwise (HTTP/1.1); a small answer is
       held and sent whole with its length when the handler ends }
@@ -254,6 +257,7 @@ type
     Method, Pattern, Path: string;
     Status, Bytes, Milliseconds: Integer;
     Peer, Forwarded: string;
+    Aborted: Boolean;
   end;
   THttpAccessLog = procedure(const Entry: THttpAccessEntry);
 
@@ -276,6 +280,10 @@ type
     FRoutes: array of THttpRoute;
     FMiddleware: array of THttpMiddleware;
   public
+    { Optional handlers installed before Serve. A method mismatch comes
+      with Allow set. Rejected sees validated portions of the head and
+      the rejection status before a route handler could run. }
+    NotFound, MethodNotAllowed, Rejected: THttpHandler;
     { MaxBody -1 takes the server's }
     procedure Handle(const Method, Pattern: string; Handler: THttpHandler; MaxBody: Int64 = -1);
     { M around every route's handler, the first used outermost; routes
@@ -423,7 +431,7 @@ type
     { the handler set its own write deadline (SetWriteDeadline), which
       a Flush keeps }
     OwnDeadline: Boolean;
-    Broken: Boolean;
+    Broken, Aborted: Boolean;
     DateSec: Int64;
     DateText: string;
   end;
@@ -447,6 +455,9 @@ uses
 
 const
   CRLF = #13#10;
+
+type
+  EHttpAbort = class(Exception);
 
 { ---- helpers ---- }
 
@@ -2012,7 +2023,7 @@ end;
 
 procedure THttpResponse.SetStatus(Code: Integer);
 begin
-  if not FConn.Sent and (Code >= 100) and (Code <= 999) then
+  if not FConn.Sent and not FConn.Aborted and (Code >= 100) and (Code <= 999) then
     FConn.StatusCode := Code;
 end;
 
@@ -2026,12 +2037,31 @@ begin
   Result := FConn.Sent;
 end;
 
+procedure THttpResponse.Abort;
+var
+  c: THttpConn;
+begin
+  c := FConn;
+  c.Aborted := True;
+  c.Broken := True;
+  c.KeepAlive := False;
+  c.BodyEnded := True;
+  c.Held := '';
+  c.OutLen := 0;
+  { The access log needs the address even if shutdown detaches the peer. }
+  ReadPeer(c);
+  TcpShutdown(c.Fd, 2);
+  raise EHttpAbort.Create('httpserver: response aborted');
+end;
+
 procedure THttpResponse.WriteData(const Data: string);
 var
   c: THttpConn;
   held: string;
 begin
   c := FConn;
+  if c.Aborted then
+    Exit;
   if not c.Sent then
   begin
     c.Held := c.Held + Data;
@@ -2053,6 +2083,8 @@ var
   held: string;
 begin
   c := FConn;
+  if c.Aborted then
+    Exit(False);
   if not c.OwnDeadline then
     c.WriteDeadline := PasIoDeadline(c.Server.WriteTimeoutMs);
   if not c.Sent then
@@ -2254,6 +2286,8 @@ var
 begin
   Result := False;
   c := FConn;
+  if c.Aborted then
+    Exit;
   p := Path + #0;
   fd := Syscall(SysOpenAt, -100, @p[1], $80000, 0);
   if fd < 0 then
@@ -2595,6 +2629,10 @@ begin
   S := C.Server;
   ReadPeer(C);
   entry.Milliseconds := (Nanotime - Started) div 1000000;
+  entry.Aborted := C.Aborted;
+  entry.Status := C.StatusCode;
+  if C.Aborted and not C.Sent then
+    entry.Status := 0;
   S.FLogMu.Lock;
   try
     if Assigned(S.AccessLogTo) then
@@ -2602,7 +2640,6 @@ begin
       entry.Method := Method;
       entry.Pattern := Pattern;
       entry.Path := Path;
-      entry.Status := C.StatusCode;
       entry.Bytes := C.OutBody;
       entry.Peer := C.Peer;
       entry.Forwarded := Forwarded;
@@ -2618,8 +2655,10 @@ begin
       route := Pattern;
       if route = '' then
         route := '-';
-      line := address + ' ' + Method + ' ' + route + ' ' + IntToStr(C.StatusCode) + ' ' +
+      line := address + ' ' + Method + ' ' + route + ' ' + IntToStr(entry.Status) + ' ' +
         IntToStr(C.OutBody) + ' ' + IntToStr(entry.Milliseconds) + 'ms';
+      if C.Aborted then
+        line := line + ' aborted';
       if Assigned(S.LogTo) then
         S.LogTo(line)
       else
@@ -2666,6 +2705,95 @@ begin
   Emit(C, body);
 end;
 
+procedure RunHandler(C: THttpConn; Handler: THttpHandler; const Pattern: string);
+begin
+  { the handler: what it raises answers this request alone }
+  try
+    Handler(C.Req, C.Resp);
+    if C.Aborted then
+      Exit;
+    if not C.Sent then
+    begin
+      MakeHead(C, Length(C.Held));
+      Emit(C, C.Held);
+    end
+    else if C.OutChunked and not C.Broken then
+      SendAll(C, '0' + CRLF + CRLF);
+    if (C.OutLength >= 0) and (C.OutBody < C.OutLength) and not C.IsHead and
+      not NoBodyStatus(C.StatusCode) then
+      C.KeepAlive := False;
+  except
+    on E: EHttpAbort do ;
+    on E: EHttpError do
+    begin
+      if C.Aborted then
+        Exit;
+      if not C.Sent then
+      begin
+        C.Held := '';
+        C.Resp.Header := THttpHeaders.Create;
+        if (E.Status = 408) or (E.Status = 413) or (E.Status = 400) then
+          C.KeepAlive := False;
+        Plain(C, E.Status, E.Message);
+      end
+      else
+        C.Broken := True;
+    end;
+    on E: Exception do
+    begin
+      if C.Aborted then
+        Exit;
+      LogHandlerError(C.Server, C.Req.Method, Pattern, E);
+      if not C.Sent then
+      begin
+        C.Held := '';
+        C.Resp.Header := THttpHeaders.Create;
+        Plain(C, 500, 'Internal Server Error');
+      end
+      else
+        C.Broken := True;
+    end;
+  end;
+end;
+
+{ Separate router fallbacks as in axum's Router::fallback and
+  method_not_allowed_fallback. Both have the usual response writer. }
+procedure RouteFallback(C: THttpConn; Handler: THttpHandler; Code: Integer;
+  const Msg: string; const Allow: string = '');
+begin
+  if not Assigned(Handler) then
+  begin
+    Plain(C, Code, Msg, Allow);
+    Exit;
+  end;
+  C.StatusCode := Code;
+  if Allow <> '' then
+    C.Resp.Header.Put('Allow', Allow);
+  RunHandler(C, Handler, '');
+end;
+
+procedure RejectRequest(C: THttpConn; Code: Integer; const Msg, Pattern: string;
+  Started: Integer; LogDefault: Boolean);
+var
+  handler: THttpHandler;
+begin
+  handler := C.Server.FRouter.Rejected;
+  if not Assigned(handler) then
+    Plain(C, Code, Msg)
+  else
+  begin
+    C.StatusCode := Code;
+    C.IsHead := C.Req.Method = 'HEAD';
+    C.KeepAlive := False;
+    C.BodyEnded := True;
+    C.Continue100 := False;
+    C.WriteDeadline := PasIoDeadline(C.Server.WriteTimeoutMs);
+    RunHandler(C, handler, Pattern);
+  end;
+  if C.Server.AccessLog and (LogDefault or Assigned(handler)) then
+    LogAccess(C, C.Req.Method, Pattern, C.Req.RawPath, C.Req.RealIP, Started);
+end;
+
 { The end of the head in the buffer: the index past the empty line that
   ends it, -1 when it has not come; leading empty lines before the
   request line are dropped (RFC 9112 2.2) }
@@ -2704,8 +2832,8 @@ end;
 function ServeOne(C: THttpConn; First: Boolean): Boolean;
 var
   S: THttpServer;
-  n, e, i, j, k, best, hp, q, le, la, vs, ve: Integer;
-  value, target, te, conn, expect, allow, method, path, rawPath, pattern, forwarded: string;
+  n, e, i, j, k, best, hp, q, le, la, vs, ve, headCode: Integer;
+  value, target, protocol, te, conn, expect, allow, method, path, rawPath, pattern, forwarded: string;
   score, bestScore: Int64;
   cl, v: Int64;
   t0: Integer;
@@ -2713,9 +2841,18 @@ var
   resp: THttpResponse;
   ncl: Integer;
   headDeadline: Integer;
-  ok, failed, pathFound: Boolean;
+  ok, pathFound, validPath: Boolean;
   methods: TStringArray;
-  errMsg: string;
+  headError: string;
+
+  procedure Reject(Code: Integer; const Msg: string; LogDefault: Boolean = False);
+  begin
+    if headCode <> 0 then
+      RejectRequest(C, headCode, headError, pattern, t0, LogDefault)
+    else
+      RejectRequest(C, Code, Msg, pattern, t0, LogDefault);
+  end;
+
 begin
   Result := False;
   S := C.Server;
@@ -2753,6 +2890,7 @@ begin
   C.OutBody := 0;
   C.OutWritten := 0;
   C.Broken := False;
+  C.Aborted := False;
   C.KeepAlive := False;
   C.Proto11 := True;
   C.IsHead := False;
@@ -2764,29 +2902,45 @@ begin
   C.BodyEnded := True;
   C.WriteDeadline := PasIoDeadline(S.WriteTimeoutMs);
   C.OwnDeadline := False;
-  { the head, within MaxHeaderBytes and HeaderTimeoutMs }
+  { Read a bounded head. On a limit or a deadline a hook can inspect
+    the complete, validated lines that arrived within the bound. }
+  headCode := 0;
   e := HeadEnd(C);
-  while e < 0 do
+  while (e < 0) and (Avail(C) <= S.MaxHeaderBytes) do
   begin
-    if Avail(C) > S.MaxHeaderBytes then
-    begin
-      Plain(C, 431, '431 Request Header Fields Too Large');
-      Exit;
-    end;
     n := Fill(C, headDeadline);
     if n = -110 then
     begin
-      Plain(C, 408, '408 Request Timeout');
-      Exit;
+      headCode := 408;
+      headError := '408 Request Timeout';
+      Break;
     end;
     if n <= 0 then
       Exit;
     e := HeadEnd(C);
   end;
-  if e - C.BufPos > S.MaxHeaderBytes then
+  if (headCode = 0) and ((e < 0) or (e - C.BufPos > S.MaxHeaderBytes)) then
   begin
-    Plain(C, 431, '431 Request Header Fields Too Large');
-    Exit;
+    headCode := 431;
+    headError := '431 Request Header Fields Too Large';
+  end;
+  if headCode <> 0 then
+  begin
+    if not Assigned(S.FRouter.Rejected) then
+    begin
+      Plain(C, headCode, headError);
+      Exit;
+    end;
+    e := C.BufEnd;
+    if S.MaxHeaderBytes < e - C.BufPos then
+      e := C.BufPos + S.MaxHeaderBytes;
+    while (e > C.BufPos) and (C.Buf[e - 1] <> 10) do
+      Dec(e);
+    if e <= C.BufPos then
+    begin
+      Reject(headCode, headError);
+      Exit;
+    end;
   end;
   { the head is read where it lies in the buffer: the request line,
     then each header line, each without its CR (RFC 9112 2.2) }
@@ -2811,147 +2965,19 @@ begin
       ok := False;
   if not ok then
   begin
-    Plain(C, 400, '400 Bad Request: malformed request line');
+    Reject(400, '400 Bad Request: malformed request line');
     Exit;
   end;
   method := CommonOf(C, hp, i);
   target := BytesOf(C, i + 1, j);
-  req.Proto := CommonOf(C, j + 1, le);
+  protocol := CommonOf(C, j + 1, le);
   if not IsToken(method) or not ValidTarget(target) then
   begin
-    Plain(C, 400, '400 Bad Request: malformed request line');
+    Reject(400, '400 Bad Request: malformed request line');
     Exit;
-  end;
-  if req.Proto = 'HTTP/1.1' then
-    C.Proto11 := True
-  else if req.Proto = 'HTTP/1.0' then
-    C.Proto11 := False
-  else if (Length(req.Proto) = 8) and (Copy(req.Proto, 1, 5) = 'HTTP/') and (req.Proto[6] in ['0'..'9']) and
-    (req.Proto[7] = '.') and (req.Proto[8] in ['0'..'9']) then
-  begin
-    Plain(C, 505, '505 HTTP Version Not Supported: unsupported protocol version');
-    Exit;
-  end
-  else
-  begin
-    Plain(C, 400, '400 Bad Request: malformed HTTP version');
-    Exit;
-  end;
-  C.KeepAlive := C.Proto11;
-  { the header lines (RFC 9112 5): no space before the colon, no line
-    folded, no control byte in a value; MaxHeaders of them }
-  la := q + 1;
-  while la < e do
-  begin
-    q := la;
-    while C.Buf[q] <> 10 do
-      q := q + 1;
-    le := q;
-    if (le > la) and (C.Buf[le - 1] = 13) then
-      le := le - 1;
-    if le = la then
-      Break;
-    if (C.Buf[la] = 32) or (C.Buf[la] = 9) then
-    begin
-      Plain(C, 400, '400 Bad Request: obsolete line folding');
-      Exit;
-    end;
-    i := la;
-    while (i < le) and (C.Buf[i] <> 58) and IsTokenChar(Chr(C.Buf[i])) do
-      i := i + 1;
-    if (i = la) or (i >= le) or (C.Buf[i] <> 58) then
-    begin
-      Plain(C, 400, '400 Bad Request: invalid header name');
-      Exit;
-    end;
-    vs := i + 1;
-    while (vs < le) and ((C.Buf[vs] = 32) or (C.Buf[vs] = 9)) do
-      vs := vs + 1;
-    ve := le;
-    while (ve > vs) and ((C.Buf[ve - 1] = 32) or (C.Buf[ve - 1] = 9)) do
-      ve := ve - 1;
-    for k := vs to ve - 1 do
-      if ((C.Buf[k] < 32) and (C.Buf[k] <> 9)) or (C.Buf[k] = 127) then
-      begin
-        Plain(C, 400, '400 Bad Request: invalid header value');
-        Exit;
-      end;
-    if req.Header.Count >= S.MaxHeaders then
-    begin
-      Plain(C, 431, '431 Request Header Fields Too Large');
-      Exit;
-    end;
-    req.Header.Add(BytesOf(C, la, i), BytesOf(C, vs, ve));
-    la := q + 1;
   end;
   req.Method := method;
   req.Target := target;
-  k := CountOf(req.Header, 'Host');
-  if (C.Proto11 and (k = 0)) or (k > 1) then
-  begin
-    Plain(C, 400, '400 Bad Request: missing required Host header');
-    Exit;
-  end;
-  { the connection's options (RFC 9110 7.6.1) }
-  conn := LowerAscii(req.Header.Get('Connection'));
-  if Pos('close', conn) > 0 then
-    C.KeepAlive := False
-  else if not C.Proto11 and (Pos('keep-alive', conn) > 0) then
-    C.KeepAlive := True;
-  { the body's framing (RFC 9112 6.1 to 6.3) }
-  te := LowerAscii(TrimOws(req.Header.Get('Transfer-Encoding')));
-  ncl := CountOf(req.Header, 'Content-Length');
-  if req.Header.Has('Transfer-Encoding') then
-  begin
-    if not C.Proto11 or (ncl > 0) then
-    begin
-      Plain(C, 400, '400 Bad Request: Transfer-Encoding with Content-Length or on HTTP/1.0');
-      Exit;
-    end;
-    if te <> 'chunked' then
-    begin
-      Plain(C, 501, '501 Not Implemented: unsupported transfer encoding');
-      Exit;
-    end;
-    C.Chunked := True;
-    C.BodyEnded := False;
-    req.ContentLength := -1;
-  end
-  else if ncl > 0 then
-  begin
-    cl := -1;
-    for k := 0 to req.Header.FCount - 1 do
-    begin
-      if not EqualFold(req.Header.FNames[k], 'Content-Length') then
-        Continue;
-      value := TrimOws(req.Header.FValues[k]);
-      ok := value <> '';
-      for j := 1 to Length(value) do
-        if not (value[j] in ['0'..'9']) then
-          ok := False;
-      if not ok or (Length(value) > 18) or not TryStrToInt64(value, v) or ((cl >= 0) and (v <> cl)) then
-      begin
-        Plain(C, 400, '400 Bad Request: bad Content-Length');
-        Exit;
-      end;
-      cl := v;
-    end;
-    req.ContentLength := cl;
-    C.BodyLeft := cl;
-    C.BodyEnded := cl = 0;
-  end
-  else
-    req.ContentLength := 0;
-  expect := LowerAscii(TrimOws(req.Header.Get('Expect')));
-  if expect <> '' then
-  begin
-    if expect <> '100-continue' then
-    begin
-      Plain(C, 417, '417 Expectation Failed');
-      Exit;
-    end;
-    C.Continue100 := C.Proto11 and not C.BodyEnded;
-  end;
   { the target: origin form, or absolute form, whose path is taken
     (RFC 9112 3.2) }
   if Copy(LowerAscii(target), 1, 7) = 'http://' then
@@ -2979,6 +3005,145 @@ begin
   else
     req.RawPath := target;
   rawPath := req.RawPath;
+  validPath := (req.RawPath <> '') and (req.RawPath[1] = '/') and
+    HttpUnescape(req.RawPath, False, path);
+  if validPath then
+    req.Path := path;
+  if protocol = 'HTTP/1.1' then
+    C.Proto11 := True
+  else if protocol = 'HTTP/1.0' then
+    C.Proto11 := False
+  else if (Length(protocol) = 8) and (Copy(protocol, 1, 5) = 'HTTP/') and (protocol[6] in ['0'..'9']) and
+    (protocol[7] = '.') and (protocol[8] in ['0'..'9']) then
+  begin
+    req.Proto := protocol;
+    Reject(505, '505 HTTP Version Not Supported: unsupported protocol version');
+    Exit;
+  end
+  else
+  begin
+    Reject(400, '400 Bad Request: malformed HTTP version');
+    Exit;
+  end;
+  req.Proto := protocol;
+  C.KeepAlive := C.Proto11;
+  { the header lines (RFC 9112 5): no space before the colon, no line
+    folded, no control byte in a value; MaxHeaders of them }
+  la := q + 1;
+  while la < e do
+  begin
+    q := la;
+    while C.Buf[q] <> 10 do
+      q := q + 1;
+    le := q;
+    if (le > la) and (C.Buf[le - 1] = 13) then
+      le := le - 1;
+    if le = la then
+      Break;
+    if (C.Buf[la] = 32) or (C.Buf[la] = 9) then
+    begin
+      Reject(400, '400 Bad Request: obsolete line folding');
+      Exit;
+    end;
+    i := la;
+    while (i < le) and (C.Buf[i] <> 58) and IsTokenChar(Chr(C.Buf[i])) do
+      i := i + 1;
+    if (i = la) or (i >= le) or (C.Buf[i] <> 58) then
+    begin
+      Reject(400, '400 Bad Request: invalid header name');
+      Exit;
+    end;
+    vs := i + 1;
+    while (vs < le) and ((C.Buf[vs] = 32) or (C.Buf[vs] = 9)) do
+      vs := vs + 1;
+    ve := le;
+    while (ve > vs) and ((C.Buf[ve - 1] = 32) or (C.Buf[ve - 1] = 9)) do
+      ve := ve - 1;
+    for k := vs to ve - 1 do
+      if ((C.Buf[k] < 32) and (C.Buf[k] <> 9)) or (C.Buf[k] = 127) then
+      begin
+        Reject(400, '400 Bad Request: invalid header value');
+        Exit;
+      end;
+    if req.Header.Count >= S.MaxHeaders then
+    begin
+      Reject(431, '431 Request Header Fields Too Large');
+      Exit;
+    end;
+    req.Header.Add(BytesOf(C, la, i), BytesOf(C, vs, ve));
+    la := q + 1;
+  end;
+  if headCode <> 0 then
+  begin
+    Reject(headCode, headError);
+    Exit;
+  end;
+  k := CountOf(req.Header, 'Host');
+  if (C.Proto11 and (k = 0)) or (k > 1) then
+  begin
+    Reject(400, '400 Bad Request: missing required Host header');
+    Exit;
+  end;
+  { the connection's options (RFC 9110 7.6.1) }
+  conn := LowerAscii(req.Header.Get('Connection'));
+  if Pos('close', conn) > 0 then
+    C.KeepAlive := False
+  else if not C.Proto11 and (Pos('keep-alive', conn) > 0) then
+    C.KeepAlive := True;
+  { the body's framing (RFC 9112 6.1 to 6.3) }
+  te := LowerAscii(TrimOws(req.Header.Get('Transfer-Encoding')));
+  ncl := CountOf(req.Header, 'Content-Length');
+  if req.Header.Has('Transfer-Encoding') then
+  begin
+    if not C.Proto11 or (ncl > 0) then
+    begin
+      Reject(400, '400 Bad Request: Transfer-Encoding with Content-Length or on HTTP/1.0');
+      Exit;
+    end;
+    if te <> 'chunked' then
+    begin
+      Reject(501, '501 Not Implemented: unsupported transfer encoding');
+      Exit;
+    end;
+    C.Chunked := True;
+    C.BodyEnded := False;
+    req.ContentLength := -1;
+  end
+  else if ncl > 0 then
+  begin
+    cl := -1;
+    for k := 0 to req.Header.FCount - 1 do
+    begin
+      if not EqualFold(req.Header.FNames[k], 'Content-Length') then
+        Continue;
+      value := TrimOws(req.Header.FValues[k]);
+      ok := value <> '';
+      for j := 1 to Length(value) do
+        if not (value[j] in ['0'..'9']) then
+          ok := False;
+      if not ok or (Length(value) > 18) or not TryStrToInt64(value, v) or ((cl >= 0) and (v <> cl)) then
+      begin
+        Reject(400, '400 Bad Request: bad Content-Length');
+        Exit;
+      end;
+      cl := v;
+    end;
+    req.ContentLength := cl;
+    C.BodyLeft := cl;
+    C.BodyEnded := cl = 0;
+  end
+  else
+    req.ContentLength := 0;
+  expect := LowerAscii(TrimOws(req.Header.Get('Expect')));
+  if expect <> '' then
+  begin
+    if expect <> '100-continue' then
+    begin
+      Reject(417, '417 Expectation Failed');
+      Exit;
+    end;
+    C.Continue100 := C.Proto11 and not C.BodyEnded;
+  end;
   forwarded := ForwardedIP(C, req.Header);
   req.RealIP := forwarded;
   C.IsHead := method = 'HEAD';
@@ -2989,84 +3154,78 @@ begin
   C.BodyLimit := S.MaxBody;
   { the route }
   best := -1;
-  failed := False;
-  if (req.RawPath = '') or (req.RawPath[1] <> '/') or not HttpUnescape(req.RawPath, False, path) then
+  if not validPath then
   begin
     if not ((req.RawPath = '*') and (method = 'OPTIONS')) then
     begin
-      Plain(C, 400, '400 Bad Request: bad request path');
-      failed := True;
+      Reject(400, '400 Bad Request: bad request path', True);
+      Exit;
     end;
   end;
-  req.Path := path;
-  if not failed and not ViewPath(req.RawPath, C.PathV) then
+  if not ViewPath(req.RawPath, C.PathV) then
   begin
-    Plain(C, 400, '400 Bad Request: bad request path');
-    failed := True;
+    Reject(400, '400 Bad Request: bad request path', True);
+    Exit;
   end;
-  if not failed then
+  bestScore := -1;
+  methods := nil;
+  pathFound := False;
+  for k := 0 to High(S.FRouter.FRoutes) do
   begin
-    bestScore := -1;
-    methods := nil;
-    pathFound := False;
-    for k := 0 to High(S.FRouter.FRoutes) do
-    begin
-      score := RouteScore(S.FRouter.FRoutes[k], C.PathV);
-      if score < 0 then
-        Continue;
-      pathFound := True;
-      if (S.FRouter.FRoutes[k].Method = method) or
-        (C.IsHead and (S.FRouter.FRoutes[k].Method = 'GET')) then
-        if (best < 0) or (score > bestScore) or
-          ((score = bestScore) and (S.FRouter.FRoutes[k].Method = method)) then
-        begin
-          best := k;
-          bestScore := score;
-        end;
-    end;
-    if best < 0 then
-    begin
-      if not pathFound then
-        Plain(C, 404, '404 page not found')
-      else
+    score := RouteScore(S.FRouter.FRoutes[k], C.PathV);
+    if score < 0 then
+      Continue;
+    pathFound := True;
+    if (S.FRouter.FRoutes[k].Method = method) or
+      (C.IsHead and (S.FRouter.FRoutes[k].Method = 'GET')) then
+      if (best < 0) or (score > bestScore) or
+        ((score = bestScore) and (S.FRouter.FRoutes[k].Method = method)) then
       begin
-        for k := 0 to High(S.FRouter.FRoutes) do
-          if RouteScore(S.FRouter.FRoutes[k], C.PathV) >= 0 then
-          begin
-            SetLength(methods, Length(methods) + 1);
-            methods[High(methods)] := S.FRouter.FRoutes[k].Method;
-          end;
-        { Allow: the methods of the path, HEAD with GET, sorted (Go's
-          ServeMux) }
-        allow := '';
-        for k := 0 to High(methods) do
-          if methods[k] = 'GET' then
-          begin
-            SetLength(methods, Length(methods) + 1);
-            methods[High(methods)] := 'HEAD';
-            Break;
-          end;
-        for k := 0 to High(methods) do
-          for j := k + 1 to High(methods) do
-            if methods[j] < methods[k] then
-            begin
-              value := methods[k];
-              methods[k] := methods[j];
-              methods[j] := value;
-            end;
-        for k := 0 to High(methods) do
-          if (k = 0) or (methods[k] <> methods[k - 1]) then
-          begin
-            if allow <> '' then
-              allow := allow + ', ';
-            allow := allow + methods[k];
-          end;
-        Plain(C, 405, 'Method Not Allowed', allow);
+        best := k;
+        bestScore := score;
       end;
-      failed := True;
-    end;
   end;
-  if not failed then
+  if best < 0 then
+  begin
+    if not pathFound then
+      RouteFallback(C, S.FRouter.NotFound, 404, '404 page not found')
+    else
+    begin
+      for k := 0 to High(S.FRouter.FRoutes) do
+        if RouteScore(S.FRouter.FRoutes[k], C.PathV) >= 0 then
+        begin
+          SetLength(methods, Length(methods) + 1);
+          methods[High(methods)] := S.FRouter.FRoutes[k].Method;
+        end;
+      { Allow: the methods of the path, HEAD with GET, sorted (Go's
+        ServeMux) }
+      allow := '';
+      for k := 0 to High(methods) do
+        if methods[k] = 'GET' then
+        begin
+          SetLength(methods, Length(methods) + 1);
+          methods[High(methods)] := 'HEAD';
+          Break;
+        end;
+      for k := 0 to High(methods) do
+        for j := k + 1 to High(methods) do
+          if methods[j] < methods[k] then
+          begin
+            value := methods[k];
+            methods[k] := methods[j];
+            methods[j] := value;
+          end;
+      for k := 0 to High(methods) do
+        if (k = 0) or (methods[k] <> methods[k - 1]) then
+        begin
+          if allow <> '' then
+            allow := allow + ', ';
+          allow := allow + methods[k];
+        end;
+      RouteFallback(C, S.FRouter.MethodNotAllowed, 405, 'Method Not Allowed', allow);
+    end;
+  end
+  else
   begin
     pattern := S.FRouter.FRoutes[best].Pattern;
     BindParams(req, S.FRouter.FRoutes[best], C.PathV);
@@ -3074,53 +3233,10 @@ begin
       C.BodyLimit := S.FRouter.FRoutes[best].MaxBody;
     if req.ContentLength > C.BodyLimit then
     begin
-      C.KeepAlive := False;
-      Plain(C, 413, '413 Request Entity Too Large');
-      failed := True;
+      Reject(413, '413 Request Entity Too Large', True);
+      Exit;
     end;
-  end;
-  if not failed then
-  begin
-    { the handler: what it raises answers this request alone }
-    try
-      S.FRouter.FRoutes[best].Run(req, resp);
-      if not C.Sent then
-      begin
-        MakeHead(C, Length(C.Held));
-        Emit(C, C.Held);
-      end
-      else if C.OutChunked and not C.Broken then
-        SendAll(C, '0' + CRLF + CRLF);
-      if (C.OutLength >= 0) and (C.OutBody < C.OutLength) and not C.IsHead and
-        not NoBodyStatus(C.StatusCode) then
-        C.KeepAlive := False;
-    except
-      on E: EHttpError do
-      begin
-        if not C.Sent then
-        begin
-          C.Held := '';
-          resp.Header := THttpHeaders.Create;
-          if (E.Status = 408) or (E.Status = 413) or (E.Status = 400) then
-            C.KeepAlive := False;
-          Plain(C, E.Status, E.Message);
-        end
-        else
-          C.Broken := True;
-      end;
-      on E: Exception do
-      begin
-        LogHandlerError(S, method, pattern, E);
-        if not C.Sent then
-        begin
-          C.Held := '';
-          resp.Header := THttpHeaders.Create;
-          Plain(C, 500, 'Internal Server Error');
-        end
-        else
-          C.Broken := True;
-      end;
-    end;
+    RunHandler(C, S.FRouter.FRoutes[best].Run, pattern);
   end;
   { what is left of the body: read and dropped up to 256 KiB, as Go's
     server does before it keeps a connection, else the connection ends }
