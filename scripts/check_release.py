@@ -129,6 +129,10 @@ fixtures = ('systemerrors', 'blockedio', 'boundedfiles', 'filemetadata', 'direct
             'paths', 'environments', 'processes', 'temporaryresources', 'systempaths',
             'textbuilding', 'textencoding', 'textbuffers', 'valuehelpers', 'identifiers',
             'money', 'scopedtypes', 'signatures')
+# Exercise the debugger with an absolute pathname longer than Linux's
+# sockaddr_un.sun_path. Both processes use its basename in this directory.
+debug_work = work / ('debugger-' + 'long-path-' * 11)
+debug_work.mkdir()
 for target in ('amd64', 'arm64'):
     package = work / f'paslang-{version}-linux-{target}.tar.gz.extracted' / f'paslang-{version}-linux-{target}'
     launch = [qemu, '-cpu', 'max'] if target == 'arm64' else []
@@ -149,19 +153,23 @@ for target in ('amd64', 'arm64'):
     # compiler, program and debugger also run on a model without LSE.
     baseline = [qemu, '-cpu', 'cortex-a53'] if target == 'arm64' else []
     binary = work / f'debug-package-{target}'
-    socket = work / f'debug-package-{target}.sock'
+    socket = f'debug-package-{target}.sock'
     run([*baseline, compiler, '-cpu', 'base', '-debug', '-o', binary,
          package / 'share/paslang/examples/money.paslang'])
-    program = subprocess.Popen([*baseline, str(binary), '--debug-listen', str(socket)],
-                               cwd=work, env=stress, stdout=subprocess.PIPE,
+    program = subprocess.Popen([*baseline, str(binary), '--debug-listen', socket],
+                               cwd=debug_work, env=stress, stdout=subprocess.PIPE,
                                stderr=subprocess.STDOUT)
     try:
         deadline = time.monotonic() + 30
-        while not socket.exists():
-            if program.poll() is not None or time.monotonic() >= deadline:
+        while not (debug_work / socket).is_socket():
+            if program.poll() is not None:
+                output = program.stdout.read().decode(errors='replace')
+                raise RuntimeError(f'packaged debug program exited before listening: '
+                                   f'{target}: status {program.returncode}, output {output!r}')
+            if time.monotonic() >= deadline:
                 raise RuntimeError(f'packaged debug program did not listen: {target}')
             time.sleep(0.01)
-        reply = run([*baseline, package / 'bin/pasdbg', socket, 'help'], env=stress)
+        reply = run([*baseline, package / 'bin/pasdbg', socket, 'help'], cwd=debug_work, env=stress)
         if not reply.endswith(b'ok\n') or b'next' not in reply:
             raise RuntimeError(f'packaged debugger protocol failed: {target}: {reply!r}')
     finally:
