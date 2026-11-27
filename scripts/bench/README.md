@@ -53,8 +53,13 @@ rates for each side. The comparison returned exit 1.
 | base | 1.3 | 1791 | 1542 | 293 | 154 |
 | base | 1.2 | 1815 | 1625 | 303 | 163 |
 
-P628 still requires exceeding Go and testing thousands of concurrent
-pasroutines.
+P628 tracks the throughput requirement separately. The TLS concurrency
+check in `make check` keeps 2,048 established TLS 1.2 and 1.3 clients and 64
+stalled handshakes connected on one scheduler P. Every established client
+gets a second response after a forced collection. The check then disconnects
+some clients, shuts down the server with over 2,000 still connected, and
+verifies that its sockets and connection routines have been released before
+the process exits.
 
 ## Recorded integer-append comparison
 
