@@ -367,8 +367,11 @@ def invoke(command,folder,cwd,env,timeout,*,grace=2.0,cleanup_timeout=5.0):
      save(folder/'launched-supervisor.json',process_identity(supervisor.pid))
      fd=os.pidfd_open(supervisor.pid,0);forwarded=0
      outer_deadline=started+timeout+grace+cleanup_timeout+_SUPERVISOR_SLACK
+     ready=folder/'scope.json'
      while supervisor.poll() is None:
-      if len(_SIGNALS)>forwarded:
+      # The worker publishes its identity after installing its handlers.
+      # Keep cancellation queued while the new interpreter is starting.
+      if len(_SIGNALS)>forwarded and ready.exists():
        try:
         signal.pidfd_send_signal(fd,signal.SIGCONT,None,0)
         signal.pidfd_send_signal(fd,_SIGNALS[-1],None,0)

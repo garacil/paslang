@@ -26,6 +26,56 @@ def require(condition,message):
     if not condition:raise AssertionError('metadata scope control: '+message)
 
 
+def check_startup_signal(scope, work, environment, sig):
+    paused = work / 'startup-paused'
+    release = work / 'startup-release'
+    (work / 'sitecustomize.py').write_text(
+        "import sys, time\n"
+        "from pathlib import Path\n"
+        "if sys.argv[1:2] == ['--supervise']:\n"
+        f"    Path({str(paused)!r}).touch()\n"
+        "    deadline = time.monotonic() + 4\n"
+        f"    while not Path({str(release)!r}).exists():\n"
+        "        if time.monotonic() >= deadline:\n"
+        "            raise RuntimeError('startup control was not released')\n"
+        "        time.sleep(.005)\n"
+    )
+    environment['PYTHONPATH'] = str(work)
+    environment['PYTHONDONTWRITEBYTECODE'] = '1'
+    sleep = scope.time.sleep
+    sent = False
+
+    def interrupt_then_release(delay):
+        nonlocal sent
+        if paused.exists() and not release.exists():
+            if sent:
+                # Give the controller one full iteration to handle the
+                # queued signal before the supervisor can install handlers.
+                release.touch()
+            else:
+                signal.raise_signal(sig)
+                sent = True
+        sleep(delay)
+
+    folder = work / 'invocation'
+    scope.time.sleep = interrupt_then_release
+    try:
+        result = scope.invoke(
+            [sys.executable, '-I', '-c', 'import time; time.sleep(30)'],
+            folder, work, environment, 5, grace=.1, cleanup_timeout=1,
+        )
+    finally:
+        scope.time.sleep = sleep
+
+    require(sent and release.exists(), 'startup interruption was not exercised')
+    require(result['received_signals'] == [sig], 'caller did not record the startup signal')
+    diagnostics = (folder / 'supervisor-stderr').read_text()
+    require(result['cleanup']['ok'] and result.get('signals') == [sig] and not diagnostics,
+            f'supervisor lost startup {sig.name}: {result}; stderr={diagnostics!r}')
+    require(result['status'] == 'signal-' + str(int(sig)), 'startup cancellation became success')
+    return {'name': sig.name, 'ok': True, 'status': result['status']}
+
+
 def control(name,target,work):
     scope=load(target)
     if name in ('ready-stream','child-stream','no-children'):
@@ -61,6 +111,10 @@ def control(name,target,work):
         return {'name':name,'ticks':ticks[0],'ok':True}
 
     environment=dict(os.environ)
+    if name in ('startup-sigint', 'startup-sigterm'):
+        sig = signal.SIGINT if name == 'startup-sigint' else signal.SIGTERM
+        return check_startup_signal(scope, work, environment, sig)
+
     if name=='root-gone':
         child=subprocess.Popen([sys.executable,'-c','pass'])
         descriptor=os.pidfd_open(child.pid,0)
@@ -203,7 +257,8 @@ def main():
     guard=load(HERE/'metadata_scope.py')
     source=(HERE/'metadata_scope.py').read_text()
     modes=('ready-stream','child-stream','no-children','success','nonzero','timeout','signals','shutdown-signals',
-           'unresponsive','failed-cleanup','raised-cleanup','root-gone','cache-env','finite-cleanup')
+           'startup-sigint','startup-sigterm','unresponsive','failed-cleanup','raised-cleanup',
+           'root-gone','cache-env','finite-cleanup')
     with tempfile.TemporaryDirectory(prefix='paslang-metadata-scope-') as scratch:
         root=Path(scratch)
         def invoke(name,target,tag):
@@ -220,6 +275,9 @@ def main():
             result,error=invoke(name,HERE/'metadata_scope.py','positive-'+name)
             require(result['program_status']==0,'positive '+name+' failed: '+json.dumps(result)+' '+error)
         mutations=(
+            ('startup-forwarding','startup-sigint',
+             "      if len(_SIGNALS)>forwarded and ready.exists():",
+             "      if len(_SIGNALS)>forwarded:"),
             ('shutdown-mask','shutdown-signals',
              "  signal.pthread_sigmask(signal.SIG_BLOCK,{signal.SIGINT,signal.SIGTERM})\n",
              ""),
@@ -252,7 +310,7 @@ def main():
             result,error=invoke(mode,path,'mutant-'+name)
             require(result['program_status']!=0 and 'metadata scope control:' in error,
                     'actual-source mutant was not caught by its intended oracle: '+name+' '+json.dumps(result)+' '+error)
-    print('check_metadata_scope: fourteen compiler-free groups; eight actual-source mutants; '
+    print('check_metadata_scope: sixteen compiler-free groups; nine actual-source mutants; '
           'full byte output/status; bounded ready streams; detached timeout/signal/forced cleanup; '
           'supervisor reap, caller signals and unrelated children')
 
