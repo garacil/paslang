@@ -293,9 +293,13 @@ conservatively, word by word, and does not move what it finds that way.
    goes back to `mheap`. Pages that stay free are returned to the kernel
    with `madvise(MADV_DONTNEED)` (Go's scavenger), so the resident size
    falls again.
-8. **Pacing.** Go's rule: the next cycle when the heap in use reaches
-   the live heap times `1 + PASLANG_GC/100`, 4 MiB minimum;
-   `PASLANG_GC=100` by default, `off` to disable, like `GOGC`.
+8. **Pacing.** Each cycle sets the next goal from the surviving heap
+   times `1 + Percent/100`, with a minimum goal in bytes.
+   `PASLANG_GC` sets the startup percentage, 100 by default, or `off`.
+   `GcConfigure` in `pasheap` updates the percentage and the minimum
+   under the heap lock. The default minimum is 4 MiB. `GcReadStats`
+   reads the same policy and the last completed cycle under that lock.
+   This follows the locking approach in Go's `runtime/mgcpacer.go`.
 9. **Stack growth.** `rt_newstack` keeps copying stacks; with precise
    maps it adjusts only the words the maps call pointers.
 10. **What stays.** `FreeMem` stays a no-op, a destructor frees nothing,

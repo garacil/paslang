@@ -1,0 +1,166 @@
+{ This file is part of paslang's tests.
+  Copyright (C) 2026 Germán Luis Aracil Boned <garacilb@gmail.com>
+  SPDX-License-Identifier: GPL-3.0-or-later }
+program gcpolicy;
+
+uses pasheap;
+
+const MiB = 1048576;
+var
+  Keep: array of Byte;
+  Stats, Before: TGcStats;
+  Workers: waitgroup;
+  I, MaxPause, MaxMark: Integer;
+
+procedure Require(Value: Boolean; const LabelText: string);
+begin
+  if not Value then
+  begin
+    WriteLn('gcpolicy: ', LabelText);
+    Halt(1);
+  end;
+end;
+
+procedure Allocate(Bytes: Integer);
+var
+  Buffer: array of Byte;
+begin
+  SetLength(Buffer, Bytes);
+  Buffer[0] := 19;
+  Require(Buffer[0] = 19, 'allocated data');
+end;
+
+procedure CheckSnapshot(const S: TGcStats);
+var
+  Expected, Percent: Integer;
+begin
+  Percent := S.Percent;
+  if Percent < 0 then Percent := 100;
+  Expected := S.LiveBytes + S.LiveBytes * Percent div 100;
+  if Expected < S.MinHeapBytes then Expected := S.MinHeapBytes;
+  Require(S.GoalBytes = Expected, 'inconsistent policy and live heap');
+  Require(S.AllocatedBytes >= S.LiveBytes, 'allocation accounting');
+  Require(S.PauseTotalNs >= S.PauseMaxNs, 'accumulated pause');
+  Require(S.PauseMaxNs >= S.PauseLastNs, 'maximum pause');
+  Require(S.MarkMaxNs >= S.MarkLastNs, 'maximum mark');
+  Require(S.PauseLastNs >= S.MarkLastNs, 'mark inside the last pause');
+end;
+
+procedure ReadWhileCollecting;
+var
+  J, LastCycles, LastPauseMax, LastMarkMax: Integer;
+  S: TGcStats;
+begin
+  LastCycles := 0;
+  LastPauseMax := 0;
+  LastMarkMax := 0;
+  for J := 1 to 250 do
+  begin
+    GcReadStats(S);
+    CheckSnapshot(S);
+    Require(S.Cycles >= LastCycles, 'cycles went backwards');
+    Require(S.PauseMaxNs >= LastPauseMax, 'maximum pause went backwards');
+    Require(S.MarkMaxNs >= LastMarkMax, 'maximum mark went backwards');
+    LastCycles := S.Cycles;
+    LastPauseMax := S.PauseMaxNs;
+    LastMarkMax := S.MarkMaxNs;
+    Yield;
+  end;
+  Workers.Done;
+end;
+
+procedure ChangeWhileCollecting;
+var J: Integer;
+begin
+  for J := 1 to 250 do
+  begin
+    Require(GcConfigure(25, 32 * MiB), 'set first concurrent policy');
+    Yield;
+    Require(GcConfigure(200, 48 * MiB), 'set second concurrent policy');
+    Yield;
+  end;
+  Workers.Done;
+end;
+
+begin
+  GcReadStats(Stats);
+  if ParamStr(1) = 'off' then
+    Require(Stats.Percent = -1, 'environment off')
+  else if ParamStr(1) = '50' then
+    Require(Stats.Percent = 50, 'environment percentage')
+  else
+    Require(Stats.Percent = PasDefaultGcPercent, 'default percentage');
+  Require(Stats.MinHeapBytes = PasDefaultGcMinHeapBytes, 'default minimum');
+  CheckSnapshot(Stats);
+  MaxPause := Stats.PauseMaxNs;
+  MaxMark := Stats.MarkMaxNs;
+
+  Require(GcConfigure(50, 48 * MiB), 'configure the floor');
+  SetLength(Keep, 16 * MiB);
+  Keep[0] := 42;
+  Require(GcCollect = 1, 'initial forced cycle');
+  GcReadStats(Before);
+  Require(Before.GoalBytes = 48 * MiB, 'minimum heap goal');
+  Require(Before.LiveBytes >= 16 * MiB, 'retained bytes');
+  for I := 1 to 28 do Allocate(MiB);
+  GcReadStats(Stats);
+  Require(Stats.Cycles = Before.Cycles, 'collection below the floor');
+
+  Require(GcConfigure(50, 4 * MiB), 'lower the floor');
+  GcReadStats(Stats);
+  Require(Stats.Cycles = Before.Cycles, 'configuration ran a collection');
+  Require(Stats.GoalBytes = Stats.LiveBytes + Stats.LiveBytes div 2, '50 percent goal');
+  Allocate(MiB);
+  GcReadStats(Stats);
+  Require(Stats.Cycles = Before.Cycles + 1, 'next allocation honored the new goal');
+
+  Require(not GcConfigure(-2, 4 * MiB), 'invalid percentage');
+  Require(not GcConfigure(50, -1), 'invalid floor');
+  GcReadStats(Stats);
+  Require((Stats.Percent = 50) and (Stats.MinHeapBytes = 4 * MiB), 'rejected policy changed state');
+
+  Require(GcConfigure(High(Integer), 4 * MiB), 'large percentage');
+  GcReadStats(Stats);
+  Require(Stats.GoalBytes = High(Integer), 'goal saturation');
+  Require(GcConfigure(100, High(Integer)), 'large floor');
+  Require(GcCollect = 1, 'collect with a saturated scavenger goal');
+  GcReadStats(Stats);
+  Require(Stats.GoalBytes = High(Integer), 'large floor survived a cycle');
+
+  Require(GcConfigure(-1, 4 * MiB), 'disable automatic collection');
+  GcReadStats(Stats);
+  I := Stats.Cycles;
+  Allocate(8 * MiB);
+  Allocate(32 * MiB);
+  GcReadStats(Stats);
+  Require(Stats.Cycles = I, 'automatic collection ran with policy off');
+  Require(GcCollect = 1, 'forced collection with policy off');
+
+  GcReadStats(Stats);
+  MaxPause := Stats.PauseMaxNs;
+  MaxMark := Stats.MarkMaxNs;
+  for I := 1 to 10 do
+  begin
+    Require(GcCollect = 1, 'repeat forced cycle');
+    GcReadStats(Stats);
+    Require(Stats.PauseLastNs = HeapStat(9), 'pause matches HeapStat');
+    Require(Stats.MarkLastNs = HeapStat(17), 'mark matches HeapStat');
+    if Stats.PauseLastNs > MaxPause then MaxPause := Stats.PauseLastNs;
+    if Stats.MarkLastNs > MaxMark then MaxMark := Stats.MarkLastNs;
+    Require((Stats.PauseMaxNs = MaxPause) and (Stats.MarkMaxNs = MaxMark), 'maximum tracking');
+    CheckSnapshot(Stats);
+  end;
+  Require((MaxPause > 0) and (MaxMark > 0), 'cycle timings present');
+
+  Workers.Add(2);
+  pas ReadWhileCollecting;
+  pas ChangeWhileCollecting;
+  for I := 1 to 80 do
+  begin
+    Require(GcCollect = 1, 'concurrent forced cycle');
+    Yield;
+  end;
+  Workers.Wait;
+  Require((Keep[0] = 42) and (HeapCheck = 0), 'live heap intact');
+  WriteLn('ok gcpolicy');
+end.

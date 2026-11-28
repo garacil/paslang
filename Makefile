@@ -90,7 +90,7 @@ PASLANG_SRC := \
 	src/lib/paslinux.paslang \
 	cmd/paslangc/paslangc.paslang
 
-.PHONY: package distpkg release-assets check-release bench-rust bench-rust-rounds bench-rounds all hello check check-arm64 check-sha-sdk clean bootstrap-seed self self-arm64 stage compilers core core-arm64 libs libs-arm64 bench manual \
+.PHONY: package distpkg release-assets check-release bench-rust bench-rust-rounds bench-rounds all hello check check-arm64 check-sha-sdk check-gc-policy clean bootstrap-seed self self-arm64 stage compilers core core-arm64 libs libs-arm64 bench manual \
 	install install-strip uninstall installdirs installcheck \
 	mostlyclean distclean maintainer-clean
 
@@ -1422,7 +1422,7 @@ check-sha-sdk: libs
 	objdump -d --no-show-raw-insn --disassemble=p_f.7_pashash15_sha256blockscpu $$bin > $$bin.kernel; \
 	grep -qw sha256rnds2 $$bin.kernel
 
-check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 check-sha-sdk $(BUILDDIR)/qemu-aarch64 $(OUTDIR)/pasdbg
+check: $(OUTDIR)/paslangc core core-arm64 libs libs-arm64 check-sha-sdk check-gc-policy $(BUILDDIR)/qemu-aarch64 $(OUTDIR)/pasdbg
 	@python3 -I scripts/check_sdk_state.py capture --manifest $(BUILDDIR)/sdk-state-check.json --profile amd64 $(BUILDDIR) $(LVL_X64) --profile arm64 $(A64DIR) $(LVL_A64) --debugger amd64 $(OUTDIR)/pasdbg $(SHA_SDK_ARGS) -- $(CORE_UNITS) $(LIB_UNITS)
 	@set -e; \
 	for cpu in base native; do \
@@ -6226,6 +6226,24 @@ QEMU_A64 := $(BUILDDIR)/qemu-aarch64
 
 $(BUILDDIR)/qemu-aarch64: scripts/build_qemu.py $(wildcard scripts/qemu/*.patch) | $(BUILDDIR)
 	python3 scripts/build_qemu.py $(BUILDDIR) docs/ref/qemu/qemu-11.1.1.tar.xz
+
+# P698: runtime policy, completed-cycle statistics and concurrent readers.
+check-gc-policy: $(OUTDIR)/paslangc core core-arm64 $(QEMU_A64)
+	@set -e; \
+	for profile in amd64/base amd64/native arm64/base arm64/max; do \
+	  target=$${profile%/*}; cpu=$${profile#*/}; \
+	  p=$(BUILDDIR)/gcpolicy-$$target-$$cpu; \
+	  runner=; units=$(BUILDDIR); \
+	  if [ "$$target" = arm64 ]; then \
+	    model=max; if [ "$$cpu" = base ]; then model=cortex-a53; fi; \
+	    runner="$(QEMU_A64) -cpu $$model"; units=$(A64DIR); \
+	  fi; \
+	  $(OUTDIR)/paslangc -target $$target -cpu $$cpu -Fu $$units -o $$p testdata/gcpolicy.paslang; \
+	  env -u PASLANG_GC -u PASLANG_GCSTRESS -u PASLANG_GCVERIFY PASLANG_MAXPROCS=1 timeout 60 $$runner $$p; \
+	  for percent in 50 off; do \
+	    env -u PASLANG_GCSTRESS -u PASLANG_GCVERIFY PASLANG_MAXPROCS=4 PASLANG_GC=$$percent timeout 60 $$runner $$p $$percent; \
+	  done; \
+	done
 
 check-arm64: $(OUTDIR)/paslangc core-arm64 $(OUTDIR)/paslangc-arm64 $(BUILDDIR)/qemu-aarch64 libs-arm64
 	@python3 -I scripts/check_sdk_state.py capture --manifest $(BUILDDIR)/sdk-state-check-arm64.json --profile arm64 $(A64DIR) $(LVL_A64) -- $(CORE_UNITS) $(LIB_UNITS)

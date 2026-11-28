@@ -45,7 +45,18 @@ interface
 
 const
   PasDefaultGcPercent = 100;
+  PasDefaultGcMinHeapBytes = 4194304;
   PasDefaultGcWorkers = 16;
+
+type
+  TGcStats = record
+    Percent, MinHeapBytes, GoalBytes, AllocatedBytes: Integer;
+    Cycles, LiveBytes, PauseTotalNs, PauseLastNs, PauseMaxNs: Integer;
+    MarkLastNs, MarkMaxNs: Integer;
+  end;
+
+function GcConfigure(Percent, MinHeapBytes: Integer): Boolean;
+procedure GcReadStats(out Stats: TGcStats);
 
 function PasJournalIdentity(Env: Pointer; out Device, Inode: QWord): Boolean;
 function PasCpuLimit(NProc: Integer; CgroupFile, MountFile: PChar): Integer;
@@ -333,7 +344,6 @@ const
     the routine moves its stack, at the same size (P95c). }
   MoveAsked = -1315;
   GcStackSize = 262144;
-  MinGoal = 4194304;
   GreyMin = 65536;
   { $dededededededede }
   PoisonWord = -2314885530818453538;
@@ -392,6 +402,8 @@ var
   { The last cycle's parts in nanoseconds: stopping the world and
     taking the mcaches back, marking, sweeping (HeapStat 16 to 18). }
   MStopNs, MMarkNs, MSweepNs: Integer;
+  GcHeapState, GcMinHeapBytes: Integer;
+  MPauseMaxNs, MMarkMaxNs: Integer;
   { Mask for the PMD page size discovered when the heap is initialized. }
   MHugePageMask: Integer;
 
@@ -1336,13 +1348,15 @@ begin
   WrW(g + GLocks, 1);
   WrW(H0 + HGcG, g);
   WrW(H0 + HGcPercent, PasDefaultGcPercent);
-  WrW(H0 + HGoal, MinGoal);
+  GcMinHeapBytes := PasDefaultGcMinHeapBytes;
+  WrW(H0 + HGoal, GcMinHeapBytes);
   ReadEnv(H0);
   SortMaps(H0);
   s := RdW(H0 + HNProc);
   if (MMaxWorkers > 0) and (MMaxWorkers < s) then
     s := MMaxWorkers;
   WrW(H0 + HGcWant, s);
+  GcHeapState := H0;
   Result := True;
 end;
 
@@ -1894,9 +1908,9 @@ begin
     end;
     WrW(H0 + HStressLeft, left);
   end;
-  if RdW(H0 + HGcPercent) < 0 then
+  if AtomicLoad(PInt(H0 + HGcPercent)^) < 0 then
     Exit;
-  Result := RdW(H0 + HAllocated) >= RdW(H0 + HGoal);
+  Result := RdW(H0 + HAllocated) >= AtomicLoad(PInt(H0 + HGoal)^);
 end;
 
 { The mcache entry of span class SC (and 255) ran out: the next run of
@@ -3598,7 +3612,10 @@ procedure Scavenge(H0: Integer);
 var
   target, t, i, b, r, len: Integer;
 begin
-  target := RdW(H0 + HGoal) + RdW(H0 + HGoal) div 10;
+  target := RdW(H0 + HGoal);
+  if target >= RdW(H0 + HFreeDirty) then
+    Exit;
+  target := target + target div 10;
   if target < 1048576 then
     target := 1048576;
   t := RdW(H0 + HTables) + TRuns;
@@ -3627,12 +3644,54 @@ begin
   end;
 end;
 
+{ Recompute from the last live heap, like gcController.commit in Go's
+  runtime/mgcpacer.go. The remainder times Live fits even at HeapReserve.
+  A disabled automatic collector still uses a goal for scavenging after
+  a forced collection. }
+function GcGoal(Live, Percent, MinHeapBytes: Integer): Integer;
+var
+  whole, base: Integer;
+begin
+  Result := MinHeapBytes;
+  if Live = 0 then
+    Exit;
+  if Percent < 0 then
+    Percent := PasDefaultGcPercent;
+  whole := Percent div 100;
+  base := Live + Live * (Percent mod 100) div 100;
+  if whole > (High(Integer) - base) div Live then
+    Exit(High(Integer));
+  base := base + whole * Live;
+  if base > Result then
+    Result := base;
+end;
+
+{ Like Go's setGCPercent, update the goal under the heap lock. A cycle
+  updates it with the world stopped, after all holders of the lock
+  have left. Allocation checks the percentage and goal atomically.
+  A request for collection already made may complete after this call. }
+function GcConfigure(Percent, MinHeapBytes: Integer): Boolean;
+var
+  h0: Integer;
+begin
+  Result := False;
+  h0 := GcHeapState;
+  if (h0 = 0) or (Percent < -1) or (MinHeapBytes < 0) then
+    Exit;
+  SpinLock(PInt(h0 + HLock));
+  GcMinHeapBytes := MinHeapBytes;
+  AtomicStore(PInt(h0 + HGoal)^, GcGoal(RdW(h0 + HLive), Percent, MinHeapBytes));
+  AtomicStore(PInt(h0 + HGcPercent)^, Percent);
+  SpinUnlock(PInt(h0 + HLock));
+  Result := True;
+end;
+
 { One cycle, on the collector's own routine record (rt_gccollect put it
   there): stop the world, take back the mcaches' runs, mark from the
   roots, sweep, set the next goal, give memory back, start the world. }
 procedure PasGcCycle(H: Pointer);
 var
-  h0, t0, t1, live, pct, goal, dt: Integer;
+  h0, t0, t1, live, dt: Integer;
 begin
   h0 := Integer(H);
   t0 := Nanotime;
@@ -3653,14 +3712,8 @@ begin
   t1 := Nanotime;
   live := Sweep(h0);
   MSweepNs := Nanotime - t1;
-  pct := RdW(h0 + HGcPercent);
-  if pct < 0 then
-    pct := 100;
-  goal := live + (live div 100) * pct;
-  if goal < MinGoal then
-    goal := MinGoal;
   WrW(h0 + HLive, live);
-  WrW(h0 + HGoal, goal);
+  WrW(h0 + HGoal, GcGoal(live, RdW(h0 + HGcPercent), GcMinHeapBytes));
   WrW(h0 + HAllocated, live);
   Scavenge(h0);
   if MVerify <> 0 then
@@ -3669,6 +3722,10 @@ begin
   dt := Nanotime - t0;
   WrW(h0 + HPauseLast, dt);
   WrW(h0 + HPauseTotal, RdW(h0 + HPauseTotal) + dt);
+  if dt > MPauseMaxNs then
+    MPauseMaxNs := dt;
+  if MMarkNs > MMarkMaxNs then
+    MMarkMaxNs := MMarkNs;
   StartTheWorld(h0);
   { HGcBusy is let go by rt_gccollect once it is off the collector's
     stack: let go here, another M took the next cycle and that stack
@@ -4034,6 +4091,34 @@ begin
   if RdW(h0 + HGcOn) <> 0 then
     bad := bad + CheckGc(h0);
   Result := bad;
+end;
+
+{ Read the policy and last completed cycle together, like Go's
+  runtime/debug.ReadGCStats. The heap lock excludes a policy update.
+  Its holder also prevents the world from stopping to collect. }
+procedure GcReadStats(out Stats: TGcStats);
+var
+  h0: Integer;
+begin
+  h0 := GcHeapState;
+  if h0 = 0 then
+  begin
+    Stats := Default(TGcStats);
+    Exit;
+  end;
+  SpinLock(PInt(h0 + HLock));
+  Stats.Percent := RdW(h0 + HGcPercent);
+  Stats.MinHeapBytes := GcMinHeapBytes;
+  Stats.GoalBytes := RdW(h0 + HGoal);
+  Stats.AllocatedBytes := AtomicLoad(PInt(h0 + HAllocated)^);
+  Stats.Cycles := RdW(h0 + HNumGC);
+  Stats.LiveBytes := RdW(h0 + HLive);
+  Stats.PauseTotalNs := RdW(h0 + HPauseTotal);
+  Stats.PauseLastNs := RdW(h0 + HPauseLast);
+  Stats.PauseMaxNs := MPauseMaxNs;
+  Stats.MarkLastNs := MMarkNs;
+  Stats.MarkMaxNs := MMarkMaxNs;
+  SpinUnlock(PInt(h0 + HLock));
 end;
 
 { HeapStat(K) for programs and tests: 0 cycles run, 1 bytes alive after

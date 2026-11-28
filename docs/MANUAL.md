@@ -15315,10 +15315,12 @@ Memory is collected. A cycle of the collector stops the routines at
 their next safe point, marks every block the globals, the routines'
 records and their stacks reach, and frees the rest; pages that stay
 free go back to the kernel. Compiled code carries a map of its frame at
-every call, so a stack is read by the types of what it holds. The next
-cycle comes when what was handed out since the last one reaches twice
-what it left alive: `PASLANG_GC=100` is the default, a larger number
-trades memory for fewer cycles, and `PASLANG_GC=off` never collects.
+every call, so a stack is read by the types of what it holds. Automatic
+collection starts on the allocation slow path at the live bytes from
+the last cycle plus the configured percentage of those bytes, with a
+4 MiB minimum heap goal. `PASLANG_GC=100` is the default. A larger
+percentage trades memory for fewer cycles. `PASLANG_GC=off` disables
+automatic collection outside the runtime stress mode.
 `GcCollect` runs a cycle at once and answers 1 (0 when it cannot, under
 a runtime lock); a register the call may overwrite is dead there, as in
 Go, and keeps nothing alive (1.1.254, P423). `HeapStat(k)` reads the heap's figures: 0 cycles, 1
@@ -15340,6 +15342,29 @@ above the number of Ps, 0 one for each P, 1 the cycle's thread alone.
 `FreeMem` does nothing: a block goes
 when nothing points to it any more. An `Integer` holding an address
 does not keep a block alive, as in Go; keep the pointer too.
+
+With `uses pasheap`, programs can set the growth percentage and minimum
+heap goal in bytes and read a snapshot of the policy and completed cycles.
+
+```pascal
+if not GcConfigure(50, 64 * 1024 * 1024) then Halt(1);
+GcReadStats(Stats);  { Stats: TGcStats }
+WriteLn(Stats.Cycles, ' cycles, longest pause ', Stats.PauseMaxNs, ' ns');
+```
+
+`GcConfigure(Percent, MinHeapBytes)` updates the goal immediately from
+the last cycle's live bytes. A percentage of `-1` disables automatic
+collection and `GcCollect` still works. The function returns `False`
+for a percentage below `-1` or a negative minimum. A collection
+already requested can complete after a policy change.
+
+`GcReadStats` fills a `TGcStats` without allocating. `Percent`,
+`MinHeapBytes` and `GoalBytes` describe the current policy and goal.
+`AllocatedBytes` includes the last cycle's live bytes plus slots
+handed out to allocation caches since then. `Cycles` and `LiveBytes`
+report the completed cycle count and surviving bytes. `PauseTotalNs`,
+`PauseLastNs`, `PauseMaxNs`, `MarkLastNs` and `MarkMaxNs` report
+nanoseconds. Both maxima cover all completed cycles since startup.
 
 Three switches test the runtime itself. `PASLANG_GCSTRESS=n` runs a
 cycle every n-th time an allocation takes a new run of slots;
